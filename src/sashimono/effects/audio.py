@@ -112,6 +112,12 @@ def _impulse(sample_rate: int, decay: float, channels: int) -> np.ndarray:
     return noise.astype(np.float32)
 
 
+@lru_cache(maxsize=16)
+def _impulse_spectrum(sample_rate: int, decay: float, channels: int, fft_size: int) -> np.ndarray:
+    """響き方の周波数の形 塊ごとに求め直すと、残響 1 本で 1 塊の手間が 1.5 倍になる"""
+    return np.fft.rfft(_impulse(sample_rate, decay, channels), fft_size, axis=0)
+
+
 def _reverb(samples: np.ndarray, values: dict[str, float], context: AudioContext) -> np.ndarray:
     """リバーブ 元の音に、響き（:func:`_impulse`）を畳み込んだ音を ``量`` だけ足す
 
@@ -121,10 +127,12 @@ def _reverb(samples: np.ndarray, values: dict[str, float], context: AudioContext
     mix = float(np.clip(values.get("mix", 30.0), 0.0, 100.0)) / 100.0
     if mix <= 0.0 or len(samples) == 0:
         return samples
-    impulse = _impulse(context.sample_rate, _reverb_length(values), samples.shape[1])
-    size = len(samples) + len(impulse) - 1
+    decay = _reverb_length(values)
+    length = len(_impulse(context.sample_rate, decay, samples.shape[1]))
+    size = len(samples) + length - 1
     fft_size = 1 << (size - 1).bit_length()
-    spectrum = np.fft.rfft(samples, fft_size, axis=0) * np.fft.rfft(impulse, fft_size, axis=0)
+    response = _impulse_spectrum(context.sample_rate, decay, samples.shape[1], fft_size)
+    spectrum = np.fft.rfft(samples, fft_size, axis=0) * response
     wet = np.fft.irfft(spectrum, fft_size, axis=0)[: len(samples)]
     return np.asarray(samples + wet * mix, dtype=np.float32)
 
