@@ -1182,6 +1182,10 @@ class TimelineView(QWidget):
 
     def _drag_clip_to(self, position: QPoint) -> None:
         """クリップの移動とトリムを ``position`` まで進める 途中は枠を描くだけ"""
+        # 押しただけ（選ぶだけ）では断らない 動かし始めた所で断り、ドラッグをやめる
+        if not self._drag.moved and self._refuse_locked_group(self._selection, "動かす・伸び縮み"):
+            self._drag = DragState()
+            return
         self._drag.moved = True
         frame = self._layout.frame_at(position.x())
 
@@ -1684,6 +1688,24 @@ class TimelineView(QWidget):
                     seen.add(clip.link_group)
                 targets.append(clip)
 
+        blocked = self._locked_groups(clip.id for clip in targets)
+        if blocked:
+            if chosen:
+                self._refuse_locked_group((clip.id for clip in targets), "分割")
+                return
+            # 何も選ばずに切るときは、ほかのクリップは切る 断ったグループだけを知らせる
+            targets = [clip for clip in targets if clip.group_id not in blocked]
+            self._refuse_locked_group(
+                (
+                    c.id
+                    for t in self._project.timeline.tracks
+                    for c in t.clips
+                    if c.group_id in blocked
+                ),
+                "そのグループは分割",
+            )
+            if not targets:
+                return
         if chosen and not targets:
             # 黙って何もしないと、キーが効いていないのか選び方が違うのか分からない
             # ロックが理由なのに「位置にない」と出すと、再生ヘッドを動かし直すだけで終わる
@@ -1719,6 +1741,8 @@ class TimelineView(QWidget):
     def delete_selected(self, *, ripple: bool = False) -> None:
         if not self._selection:
             return
+        if self._refuse_locked_group(self._selection, "削除"):
+            return
         command: Command = (
             RemoveClips(self._selection, ripple=ripple)
             if len(self._selection) > 1
@@ -1743,6 +1767,8 @@ class TimelineView(QWidget):
 
     def cut_selected(self) -> bool:
         """コピーしてから消す 隙間は詰めない（詰めたければ「削除して詰める」）"""
+        if self._refuse_locked_group(self._selection, "切り取り"):
+            return False
         if not self.copy_selected() or self._clipboard is None:
             return False
         self._request(cut_commands(self._project, self._clipboard), "切り取り")
@@ -1890,6 +1916,34 @@ class TimelineView(QWidget):
             pulled=(self._pulled | set(caught)) - set(inside),
         )
         self.update()
+
+    def _locked_groups(self, clip_ids: Iterable[ClipId]) -> set[GroupId]:
+        """渡したクリップのグループのうち、ロックしたトラックのクリップを含む物
+
+        グループはまとめて割る・消す・動かす組 一部がロックで動かないまま残りだけに
+        当てると、束ねた物の頭や長さが食い違い、束ねた意味が崩れる（利用者の要望）
+        """
+        timeline = self._project.timeline
+        groups: set[GroupId] = set()
+        for clip_id in clip_ids:
+            located = timeline.locate_clip(clip_id)
+            if located is not None and located[1].group_id is not None:
+                groups.add(located[1].group_id)
+        return {
+            group
+            for group in groups
+            if any(track.locked for track, _ in timeline.grouped_clips(group))
+        }
+
+    def _refuse_locked_group(self, clip_ids: Iterable[ClipId], action: str) -> bool:
+        """ロックしたクリップを含むグループがあれば、理由を出して真を返す（何もしない）"""
+        if not self._locked_groups(clip_ids):
+            return False
+        self.status_message.emit(
+            f"グループの中にロックしたレイヤーのクリップがあるので{action}できません"
+            " ロックを外すか、グループを解除してください"
+        )
+        return True
 
     def _select_with_group(self, clip_id: ClipId) -> None:
         """押した 1 本をグループの仲間ごと選ぶ 押した 1 本が主 仲間は引き込んだ物として覚える"""
