@@ -132,7 +132,7 @@ class TestTrackHeight:
         # 範囲の外は端へ寄せる 頼んだ値を返すと、AI はそうなったと思い込む
         result = run(host, "set_track_height", height=1000)
         assert set(result["heights"].values()) == {240}
-        assert run(host, "list_tracks")[0]["height"] == 240
+        assert run(host, "list_tracks")["tracks"][0]["height"] == 240
 
     def test_an_unknown_track_is_refused(self, host: FakeHost) -> None:
         with pytest.raises(ToolError, match="list_tracks"):

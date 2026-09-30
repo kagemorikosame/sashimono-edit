@@ -23,7 +23,7 @@ class TestTrackState:
         # 一覧に出ないと、AI は切り替えた結果を確かめられず、同じ操作を繰り返す
         track = host.document.project.timeline.tracks[0]
         run(host, "set_track_state", track_id=str(track.id), muted=True, solo=True)
-        (listed,) = run(host, "list_tracks")
+        (listed,) = run(host, "list_tracks")["tracks"]
         assert listed["muted"] is True
         assert listed["solo"] is True
 
