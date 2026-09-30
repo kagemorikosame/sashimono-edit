@@ -49,10 +49,12 @@ from sashimono.engine.render.outline import (
 )
 from sashimono.engine.render.region_outline import RegionFrame, region_effects, region_frame
 from sashimono.ui.preview_handles import (
+    ALIGNMENTS,
     KEYFRAME_DRAG_AT_PLAYHEAD,
     Grip,
     Guide,
     Hit,
+    aligned_values,
     bounding_box,
     hit_test,
     moved_values,
@@ -620,6 +622,38 @@ class PreviewWidget(QOpenGLWidget):
         """位置を動かすときの磁石（設定） ``distance`` は画面の画素"""
         self._snap = enabled
         self._snap_distance = max(1, distance)
+
+    def align_selected(self, anchor: str) -> bool:
+        """選んだクリップを、見えている範囲ごと画面の ``anchor`` の所へ寄せる（配置のテンプレート）
+
+        枠を出せない物（今のコマに無い・絵を描かない）は寄せずに偽を返す 大きさは描く側と
+        同じ枠（:meth:`outline_of`）から取る 回した絵は見えている範囲で揃える
+        """
+        if self._selection is None:
+            return False
+        located = self._project.timeline.locate_clip(self._selection)
+        if located is None or located[0].locked:
+            return False
+        track, clip = located
+        if not self._project.draws_picture(track, clip):
+            return False
+        outline = self.outline_of(clip)
+        if outline is None:
+            return False
+        changes = aligned_values(
+            start_values(clip, self._frame - clip.timeline_start),
+            bounding_box(outline.corners),
+            self.canvas_size(),
+            anchor,
+            scale=self.canvas_scale(),
+        )
+        commands = transform_commands(
+            self._project, clip.id, changes, self._frame, keyframes=self._keyframe_drag
+        )
+        if commands:
+            label = next(a[1] for a in ALIGNMENTS if a[0] == anchor)
+            self.commands_requested.emit(commands, f"配置を{label}へ")
+        return True
 
     def _snap_targets(self, moving: ClipId) -> tuple[list[float], list[float]]:
         """掴んだ物のほかに今のコマで描いている物の枠と、画面の端と中央"""
