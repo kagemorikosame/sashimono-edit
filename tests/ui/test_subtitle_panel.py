@@ -412,6 +412,8 @@ class TestBurnAndExport:
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
         widget, issued = panel
+        # 焼き込む話し手を尋ねる窓は、全部を選んだものとして返す（窓を開くと試験が止まる）
+        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
         widget.burn()
         commands, label = issued[-1]
         assert label == "字幕を焼き込み"
