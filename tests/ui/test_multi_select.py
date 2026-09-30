@@ -499,3 +499,72 @@ class TestGroupedValues:
         assert {a, c} <= set(view.selected_clips)
         assert a in view.edit_targets
         assert c not in view.edit_targets
+
+
+class TestLockedGroup:
+    """ロックしたレイヤーのクリップを含むグループには、まとめて当てる操作をしない
+
+    ロックした仲間だけが残り、ほかだけが割れたり動いたりすると、束ねた物の頭や長さが
+    食い違う 黙って何もしないと効いていないのか分からないので理由を出す
+    """
+
+    def _locked_group(self, view: TimelineView) -> tuple[ClipId, ClipId, ClipId, list[str]]:
+        a, b, c = _ids(view)
+        project = GroupClips((a, c)).apply(view.project)
+        v2 = project.timeline.tracks[1]
+        view.set_project(
+            project.with_timeline(project.timeline.replace_track(replace(v2, locked=True)))
+        )
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        return a, b, c, messages
+
+    def test_splitting_is_refused(self, view: TimelineView) -> None:
+        # 壊れると、ロックしていない a だけが割れ、c とグループの頭がずれる
+        a, _b, _c, messages = self._locked_group(view)
+        view.select(a)
+        view.set_playhead(10)
+        received = _received(view)
+        view.split_at_playhead()
+        assert received == []
+        assert any("ロック" in m and "グループ" in m for m in messages)
+
+    def test_splitting_everything_skips_only_the_group(self, view: TimelineView) -> None:
+        # 何も選ばずに切るときは、グループの外のクリップは今までどおり切る
+        _a, _b, _c, messages = self._locked_group(view)
+        project = view.project
+        extra = Clip(timeline_start=0, duration=30, source=TEXT.create())
+        tracks = (*project.timeline.tracks, Track(TrackKind.VIDEO, "V3", (extra,)))
+        view.set_project(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        view.select(None)
+        view.set_playhead(10)
+        received = _received(view)
+        view.split_at_playhead()
+        (commands,) = received
+        assert [c.clip_id for c in commands] == [extra.id]
+        assert any("グループ" in m for m in messages)
+
+    def test_deleting_and_cutting_are_refused(self, view: TimelineView) -> None:
+        a, _b, _c, messages = self._locked_group(view)
+        view.select(a)
+        received = _received(view)
+        view.delete_selected()
+        assert not view.cut_selected()
+        assert received == []
+        assert len([m for m in messages if "ロック" in m]) == 2
+
+    def test_moving_is_refused(self, view: TimelineView) -> None:
+        # 前はロックした c を外して a だけを動かし、グループが裂けた
+        _a, _b, _c, messages = self._locked_group(view)
+        received = _received(view)
+        QTest.mousePress(view, _LEFT, pos=_point(view, 0, 10))
+        QTest.mouseMove(view, _point(view, 0, 60))
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 60))
+        assert received == []
+        assert any("ロック" in m for m in messages)
+
+    def test_selecting_alone_says_nothing(self, view: TimelineView) -> None:
+        # 押しただけで断りを出すと、選ぶたびにステータスバーが埋まる
+        _a, _b, _c, messages = self._locked_group(view)
+        QTest.mouseClick(view, _LEFT, pos=_point(view, 0, 10))
+        assert messages == []
