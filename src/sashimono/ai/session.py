@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import sys
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -406,6 +407,9 @@ def _summarize(value: object, limit: int = 160) -> str:
 
 def _explain(exc: BaseException) -> str:
     """例外を、次にどうすればよいか分かる文へ"""
+    missing = _missing_part(exc)
+    if missing is not None:
+        return missing
     name = type(exc).__name__
     if name == "CLINotFoundError":
         return (
@@ -415,6 +419,30 @@ def _explain(exc: BaseException) -> str:
     if name == "ProcessError":
         return with_login_hint(f"Claude Code の起動に失敗しました: {exc}")
     return with_login_hint(f"{name}: {exc}")
+
+
+#: 部品が読めないときの案内に書く、環境を入れ直す所
+REINSTALL_HINT = "アシスタント欄の「環境を更新」から入れ直してください"
+
+
+def _missing_part(exc: BaseException) -> str | None:
+    """部品が読めないための失敗なら、何が足りないかと次にすることを書いた文 違えば ``None``
+
+    ``ModuleNotFoundError`` のままでは、使う人は何をすればよいか分からない（利用者の画面）
+    標準ライブラリが無いのは配布版の不具合なので入れ直しでは直らない 新しい版を案内する
+    """
+    if not isinstance(exc, ImportError):
+        return None
+    module = exc.name or ""
+    head = module.split(".")[0]
+    if head and head in sys.stdlib_module_names:
+        return (
+            f"配布版に Python の標準の部品 {module} が入っていないため、アシスタントを動かせません"
+            " 配布版の不具合です お手数ですが新しい版への更新をお願いします"
+            f"（不具合の報告に「{module} が無い」と添えてください）"
+        )
+    what = module or str(exc)
+    return f"アシスタントの部品 {what} を読めませんでした {REINSTALL_HINT}"
 
 
 #: ログインが済んでいないときに Claude Code が返す文面の手掛かり（小文字で比べる）
