@@ -1700,7 +1700,9 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self, clip_id: str) -> None:
         selected = ClipId(clip_id) if clip_id else None
         # 何本も選んでいれば、設定パネルは主の 1 本を出しつつ、触った設定を全部へ当てる
-        chosen = self._timeline.selected_clips
+        # グループの仲間として引き込まれただけの物には当てない（AviUtl のグループ化と同じ
+        # 1 本の拡大率を変えただけで束ねた全部の拡大率が変わっていた）
+        chosen = self._timeline.edit_targets
         ordered = (selected, *(c for c in chosen if c != selected)) if selected else ()
         self._inspector.set_selection(tuple(c for c in ordered if c is not None))
         self._preview.set_selection(selected)
