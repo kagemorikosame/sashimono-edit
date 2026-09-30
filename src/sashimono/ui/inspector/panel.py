@@ -333,7 +333,10 @@ class InspectorPanel(QWidget):
             clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
         )
         shown: set[EffectId] = set()
-        if picture:
+        # 場面切り替えは下の絵をそのまま入れ替えて描き、不透明度・合成モード・クリッピングを
+        # 読まない（描画の欄も持たない） 出すと、動かしても何も変わらない欄が並ぶ
+        transition = clip.source is not None and clip.source.kind == "transition"
+        if picture and not transition:
             self._body_layout.addWidget(self._build_picture_group(clip, shown))
         if clip.source is not None:
             section = self._build_source_section(clip)
@@ -705,7 +708,10 @@ class InspectorPanel(QWidget):
                 " 部分モザイク・ぼかしと部分フィルタの範囲は、画面の中央から数えます"
                 "（右と上が正）"
             )
+        unused = definition.unused_names(clip.source.params)
         for spec in definition.parameters:
+            if spec.name in unused:
+                continue
             path = ParamPath.of_source(clip.id, spec.name)
             value = clip.source.params.get(spec.name)
             if clip.is_group:
