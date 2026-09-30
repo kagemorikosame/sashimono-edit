@@ -574,6 +574,40 @@ def _add_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"added": text}
 
 
+def _add_shape(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """図形を置く テロップの下に敷く帯や、目印の丸・矢印に使う
+
+    前は道具が無く、AI はテキストしか置けなかった（AI テスト #3 で分かった）
+    """
+    kind = str(arguments.get("shape", "rect"))
+    spec = SHAPE.spec("shape")
+    choices = [value for value, _ in getattr(spec, "choices", ())]
+    if kind not in choices:
+        raise ToolError(f"shape は {'、'.join(choices)} のどれかです: {kind}")
+    overrides: dict[str, ParamInput] = {"shape": kind}
+    for name in ("width", "height", "pos_x", "pos_y", "rotation", "line_width", "corner_radius"):
+        if name in arguments:
+            overrides[name] = float(arguments[name])
+    if "color" in arguments:
+        color = _parse_color(str(arguments["color"]))
+        if color is None:
+            raise ToolError(f"color は #RRGGBB か #RRGGBBAA で渡してください: {arguments['color']}")
+        overrides["color"] = color
+
+    duration = int(arguments.get("duration", 150))
+    if duration < 1:
+        raise ToolError("duration は 1 フレーム以上です")
+    at_frame = arguments.get("at_frame")
+    commands = insert_generated(
+        _project(host),
+        SHAPE.create(**overrides),
+        at_frame=int(at_frame) if at_frame is not None else host.playhead,
+        duration=duration,
+    )
+    host.apply_commands(commands, f"図形を追加: {kind}")
+    return {"added": kind}
+
+
 #: 場面切り替えの切り替え方 生成オブジェクトの選択肢と同じ並び
 _TRANSITION_STYLES = ("switch", "fade", "push", "slide", "overlay")
 
@@ -1289,6 +1323,31 @@ OPERATIONS: tuple[Operation, ...] = (
             ["text"],
         ),
         handler=_add_text,
+        writes=True,
+    ),
+    Operation(
+        name="add_shape",
+        description=(
+            "図形オブジェクトを置く テロップの下の帯や目印に使う shape は rect（矩形）"
+            "rounded（角丸）ellipse（楕円）triangle star arrow background（画面全体）など"
+        ),
+        schema=_schema(
+            {
+                "shape": _string("図形の種類 既定は rect"),
+                "width": _number("幅（画素）"),
+                "height": _number("高さ（画素）"),
+                "color": _string("色 #RRGGBB か #RRGGBBAA"),
+                "at_frame": _integer("置く位置 省略すると再生ヘッド"),
+                "duration": _integer("長さ（フレーム、既定 150）"),
+                "pos_x": _number("中央からの横位置"),
+                "pos_y": _number("中央からの縦位置 正が上"),
+                "rotation": _number("回転（度）"),
+                "line_width": _number("線の太さ"),
+                "corner_radius": _number("角丸の半径"),
+            },
+            [],
+        ),
+        handler=_add_shape,
         writes=True,
     ),
     Operation(
