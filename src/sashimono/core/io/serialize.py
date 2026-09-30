@@ -122,7 +122,11 @@ FORMAT_NAME = "sashimono-project"
 #: （Issue #27） 6 までの本体は種類を知らないので「未知のトラック種別」で開けないか、
 #: 項目を捨てて音の鳴らないクリップにする 3 と同じく「更新してください」で止める
 #: 6 までのファイルは混合トラックを持たないので、分ける方式のまま何も直さずに読める
-FORMAT_VERSION = 7
+#: 8 で字幕を音声ストリームごとに持つようにした（素材の ``transcripts`` 利用者の要望）
+#: 7 までの本体は項目を知らず、字幕の無い素材として開いて、保存し直すと字幕が消える
+#: 3 と同じく「更新してください」で止める 7 までのファイルの ``transcript`` は、1 本目の
+#: 音声の字幕として読む（前は素材に 1 つで、起こしたのは 1 本目の音だったため）
+FORMAT_VERSION = 8
 
 #: 映像の終わり（``end_time``）を素材の頭から数え始めた版 これより前の値は捨てる
 MEDIA_CLOCK_VERSION = 5
@@ -487,9 +491,10 @@ def _media_to_json(item: MediaItem) -> dict[str, Any]:
             }
             for stream in item.audio_streams
         ],
-        "transcript": (
-            _transcript_to_json(item.transcript) if item.transcript is not None else None
-        ),
+        "transcripts": [
+            {"stream": index, "transcript": _transcript_to_json(transcript)}
+            for index, transcript in item.transcripts
+        ],
     }
 
 
@@ -536,16 +541,24 @@ def _media_from_json(raw: object, version: int) -> MediaItem:
             )
         )
 
-    transcript_raw = data.get("transcript")
-    return MediaItem(
+    item = MediaItem(
         path=Path(_get_str(data, "path")),
         duration=_fraction_from_json(data.get("duration", 0), "duration"),
         video_streams=tuple(video_streams),
         audio_streams=tuple(audio_streams),
-        transcript=_transcript_from_json(transcript_raw) if transcript_raw is not None else None,
         display_name=_get_str(data, "display_name"),
         id=MediaId(_get_str(data, "id")),
     )
+    # 7 までは素材に 1 つ（1 本目の音声の字幕） 8 からは音声ストリームごと
+    legacy = data.get("transcript")
+    if legacy is not None:
+        item = item.with_transcript(_transcript_from_json(legacy))
+    for entry in _get_list(data, "transcripts"):
+        pair = _require(entry, "transcript")
+        item = item.with_transcript(
+            _transcript_from_json(pair.get("transcript")), _get_int(pair, "stream")
+        )
+    return item
 
 
 # --- タイムライン ---------------------------------------------------------

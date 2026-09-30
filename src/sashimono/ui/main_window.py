@@ -2522,8 +2522,8 @@ class MainWindow(QMainWindow):
         self._analyzer.request(media, on_ready=self._on_analysis_ready)
         self._request_proxy(media)
 
-    def waveform(self, media: MediaItem) -> Waveform | None:
-        return self._analyzer.waveform(media)
+    def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
+        return self._analyzer.waveform(media, stream)
 
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None

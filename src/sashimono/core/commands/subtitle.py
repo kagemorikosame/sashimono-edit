@@ -51,15 +51,17 @@ class SetSegmentText(Command):
     media_id: MediaId
     segment_id: SegmentId
     text: str
+    #: 音声ストリームの番号 ``None`` なら 1 本目（下のコマンドもすべて同じ）
+    stream: int | None = None
 
     @property
     def label(self) -> str:
         return "字幕を編集"
 
     def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id)
+        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         updated = transcript.replace_segment(segment.with_text(self.text))
-        return _store(project, self.media_id, updated)
+        return _store(project, self.media_id, updated, self.stream)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,17 +72,20 @@ class RetimeSegment(Command):
     segment_id: SegmentId
     start: Fraction
     end: Fraction
+    stream: int | None = None
 
     @property
     def label(self) -> str:
         return "字幕の時刻を変更"
 
     def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id)
+        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         if self.end <= self.start:
             raise ValueError(f"終了が開始以前: {self.start} .. {self.end}")
         moved = replace(segment, start=self.start, end=self.end, edited=True)
-        return _store(project, self.media_id, _rebuilt(transcript, _swap(transcript, moved)))
+        return _store(
+            project, self.media_id, _rebuilt(transcript, _swap(transcript, moved)), self.stream
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,15 +94,16 @@ class RemoveSegment(Command):
 
     media_id: MediaId
     segment_id: SegmentId
+    stream: int | None = None
 
     @property
     def label(self) -> str:
         return "字幕を削除"
 
     def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id)
+        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         remaining = [s for s in transcript.segments if s.id != segment.id]
-        return _store(project, self.media_id, _rebuilt(transcript, remaining))
+        return _store(project, self.media_id, _rebuilt(transcript, remaining), self.stream)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +114,7 @@ class AddSegment(Command):
     start: Fraction
     end: Fraction
     text: str = ""
+    stream: int | None = None
 
     @property
     def label(self) -> str:
@@ -115,9 +122,15 @@ class AddSegment(Command):
 
     def apply(self, project: Project) -> Project:
         item = project.require_media(self.media_id)
-        transcript = item.transcript if item.transcript is not None else Transcript()
+        found = item.transcript_for(self.stream)
+        transcript = found if found is not None else Transcript()
         added = TranscriptSegment(start=self.start, end=self.end, text=self.text, edited=True)
-        return _store(project, self.media_id, _rebuilt(transcript, [*transcript.segments, added]))
+        return _store(
+            project,
+            self.media_id,
+            _rebuilt(transcript, [*transcript.segments, added]),
+            self.stream,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,13 +145,14 @@ class SplitSegment(Command):
     media_id: MediaId
     segment_id: SegmentId
     at: Fraction
+    stream: int | None = None
 
     @property
     def label(self) -> str:
         return "字幕を分割"
 
     def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id)
+        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         if not (segment.start < self.at < segment.end):
             raise ValueError(f"分割位置が字幕の内側にない: {self.at}")
 
@@ -159,7 +173,9 @@ class SplitSegment(Command):
             speaker=segment.speaker,
         )
         others = [s for s in transcript.segments if s.id != segment.id]
-        return _store(project, self.media_id, _rebuilt(transcript, [*others, head, tail]))
+        return _store(
+            project, self.media_id, _rebuilt(transcript, [*others, head, tail]), self.stream
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,13 +184,14 @@ class MergeWithNext(Command):
 
     media_id: MediaId
     segment_id: SegmentId
+    stream: int | None = None
 
     @property
     def label(self) -> str:
         return "字幕を結合"
 
     def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id)
+        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         index = transcript.segments.index(segment)
         if index + 1 >= len(transcript.segments):
             raise ValueError("次の字幕が無い")
@@ -193,7 +210,9 @@ class MergeWithNext(Command):
             id=segment.id,
         )
         remaining = [s for s in transcript.segments if s.id not in (segment.id, following.id)]
-        return _store(project, self.media_id, _rebuilt(transcript, [*remaining, merged]))
+        return _store(
+            project, self.media_id, _rebuilt(transcript, [*remaining, merged]), self.stream
+        )
 
 
 def burn_subtitles(
@@ -257,14 +276,15 @@ def burn_subtitles(
 
 
 def _locate(
-    project: Project, media_id: MediaId, segment_id: SegmentId
+    project: Project, media_id: MediaId, segment_id: SegmentId, stream: int | None = None
 ) -> tuple[Transcript, TranscriptSegment]:
     item = project.require_media(media_id)
-    if item.transcript is None:
+    transcript = item.transcript_for(stream)
+    if transcript is None:
         raise KeyError(f"素材に字幕が無い: {item.name}")
-    for segment in item.transcript.segments:
+    for segment in transcript.segments:
         if segment.id == segment_id:
-            return item.transcript, segment
+            return transcript, segment
     raise KeyError(f"字幕が見つからない: {segment_id}")
 
 
@@ -282,9 +302,11 @@ def _rebuilt(transcript: Transcript, segments: list[TranscriptSegment]) -> Trans
     return Transcript(tuple(ordered), language=transcript.language, model=transcript.model)
 
 
-def _store(project: Project, media_id: MediaId, transcript: Transcript) -> Project:
+def _store(
+    project: Project, media_id: MediaId, transcript: Transcript, stream: int | None = None
+) -> Project:
     item = project.require_media(media_id)
-    return project.replace_media(item.with_transcript(transcript))
+    return project.replace_media(item.with_transcript(transcript, stream))
 
 
 def _split_text(segment: TranscriptSegment, at: Fraction) -> tuple[str, str]:
