@@ -51,13 +51,17 @@ from sashimono.engine.render.region_outline import RegionFrame, region_effects, 
 from sashimono.ui.preview_handles import (
     KEYFRAME_DRAG_AT_PLAYHEAD,
     Grip,
+    Guide,
     Hit,
+    bounding_box,
     hit_test,
     moved_values,
     pick_clip,
     rotated_values,
     rotation_knob,
     scaled_values,
+    snap_offset,
+    snap_targets,
     start_values,
     transform_commands,
     turn_between,
@@ -111,6 +115,9 @@ class _Drag:
     commands: list[Command] = field(default_factory=list)
     #: 部分フィルタの範囲を掴んでいれば、そのエフェクトと掴んだ時点の枠
     region: tuple[EffectId, RegionFrame] | None = None
+    #: 動かすときに吸い付く先（横, 縦） 掴んだときに 1 度だけ集める 動かすたびに
+    #: ほかの物の枠を作り直すと、テキストの多い画面で指に遅れる
+    snap: tuple[list[float], list[float]] | None = None
 
 
 #: 範囲の掴み所の色 クリップの枠（水色）と見分ける 再生ヘッド（赤）とも離す
@@ -222,6 +229,12 @@ class PreviewWidget(QOpenGLWidget):
         self._region_effect: EffectId | None = None
         #: 掴んだ途中の絵を頼んでいる最中 その頼みで届く中身は掴むのをやめる理由にならない
         self._showing_drag = False
+        #: 動かすときに画面の中央やほかの物の端へ吸い付くか（設定 タイムラインの磁石とは別）
+        self._snap = True
+        #: 吸い付く距離（画面の画素）
+        self._snap_distance = 8
+        #: 吸い付いた所に引く線 動かしている間だけ出す
+        self._guides: list[Guide] = []
         # 押していない間も矢印の形を変えるため 掴める所が見えるように
         self.setMouseTracking(True)
         # 押してもフォーカスを取らない 取ると、プレビューで選んだ後のコマ送りや削除の
@@ -603,6 +616,25 @@ class PreviewWidget(QOpenGLWidget):
     def handles_enabled(self) -> bool:
         return self._handles_enabled
 
+    def set_snap(self, enabled: bool, distance: int) -> None:
+        """位置を動かすときの磁石（設定） ``distance`` は画面の画素"""
+        self._snap = enabled
+        self._snap_distance = max(1, distance)
+
+    def _snap_targets(self, moving: ClipId) -> tuple[list[float], list[float]]:
+        """掴んだ物のほかに今のコマで描いている物の枠と、画面の端と中央"""
+        boxes = []
+        for track in self._project.timeline.active_picture_tracks():
+            clip = track.clip_at(self._frame)
+            if clip is None or clip.id == moving or not clip.enabled or not has_outline(clip):
+                continue
+            if not self._project.draws_picture(track, clip):
+                continue
+            outline = self.outline_of(clip)
+            if outline is not None:
+                boxes.append(bounding_box(outline.corners))
+        return snap_targets(self.canvas_size(), boxes)
+
     def set_keyframe_drag(self, mode: str) -> None:
         """キーフレームのある値を動かしたときの決まり（設定）"""
         self._keyframe_drag = mode
@@ -802,8 +834,22 @@ class PreviewWidget(QOpenGLWidget):
             painter.setPen(QPen(color, 1))
             painter.drawLine(pivot + QPointF(-4, 0), pivot + QPointF(4, 0))
             painter.drawLine(pivot + QPointF(0, -4), pivot + QPointF(0, 4))
+            self._paint_guides(painter)
         finally:
             painter.end()
+
+    def _paint_guides(self, painter: QPainter) -> None:
+        """吸い付いた所に線を引く（タイムラインの磁石と同じ黄色） 何に揃ったのかが見えるように"""
+        if not self._guides:
+            return
+        left, top, width, height = self.canvas_rect()
+        painter.setPen(QPen(QColor(255, 220, 60), 1))
+        for axis, value in self._guides:
+            point = self.to_widget((value, value))
+            if axis == "x":
+                painter.drawLine(QPointF(point.x(), top), QPointF(point.x(), top + height))
+            else:
+                painter.drawLine(QPointF(left, point.y()), QPointF(left + width, point.y()))
 
     def _region_corners(self, frame: RegionFrame) -> list[Point]:
         corners = []
@@ -946,14 +992,34 @@ class PreviewWidget(QOpenGLWidget):
         )
         event.accept()
 
+    def _snapped(self, drag: _Drag, current: Point, *, off: bool) -> Point:
+        """動かした先を、画面の中央やほかの物の端へ吸い付けた所
+
+        Shift を押している間は吸い付かない（タイムラインと同じ） 片方の向きだけに動かす
+        決まりも Shift なので、押している間は向きをそろえるだけになる
+        """
+        self._guides = []
+        if not self._snap or off or drag.snap is None:
+            return current
+        dx, dy = current[0] - drag.press[0], current[1] - drag.press[1]
+        left, top, right, bottom = bounding_box(drag.corners)
+        moving = (left + dx, top + dy, right + dx, bottom + dy)
+        _, _, shown_width, _ = self.canvas_rect()
+        reach = self._snap_distance * self.canvas_size()[0] / max(shown_width, 1.0)
+        shift_x, shift_y, self._guides = snap_offset(moving, drag.snap, reach)
+        return current[0] + shift_x, current[1] + shift_y
+
     def _begin_drag(self, drag: _Drag) -> None:
         """掴み始める 掴んでいる間だけキーボードを借りて Esc を受ける"""
+        if drag.region is None and drag.hit.grip is Grip.MOVE and self._snap:
+            drag.snap = self._snap_targets(drag.clip_id)
         self._drag = drag
         self.grabKeyboard()
 
     def _end_drag(self) -> _Drag | None:
         """掴むのをやめて、掴んでいた物を返す 借りたキーボードはタイムラインへ返す"""
         drag, self._drag = self._drag, None
+        self._guides = []
         if drag is not None:
             self.releaseKeyboard()
         return drag
@@ -972,6 +1038,7 @@ class PreviewWidget(QOpenGLWidget):
             event.accept()
             return
         if drag.hit.grip is Grip.MOVE:
+            current = self._snapped(drag, current, off=shift)
             changes = moved_values(
                 drag.start, drag.press, current, one_axis=shift, scale=self.canvas_scale()
             )

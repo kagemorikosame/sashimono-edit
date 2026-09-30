@@ -390,6 +390,7 @@ class MainWindow(QMainWindow):
         )
         self._preview.set_handles_enabled(self._preferences.preview_handles)
         self._preview.set_keyframe_drag(self._preferences.keyframe_drag)
+        self._preview.set_snap(self._preferences.preview_snap, self._preferences.snap_distance)
         self._transport = TransportBar(project.rate, self)
         self._timeline = TimelineView(project, self._analyzer, self)
         self._timeline.set_value_lines(self._preferences.value_lines)
@@ -801,6 +802,7 @@ class MainWindow(QMainWindow):
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
         self._preview.set_keyframe_drag(preferences.keyframe_drag)
+        self._preview.set_snap(preferences.preview_snap, preferences.snap_distance)
         if native.enabled() != preferences.native_modules:
             native.set_enabled(preferences.native_modules)
             # 汎用プラグインも同じ設定で入り切りする 切ったときに覚えている
