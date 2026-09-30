@@ -128,6 +128,10 @@ class TranscribeDialog(QDialog):
         form.addRow("モデル", self._model)
         if len(self._media.audio_streams) > 1:
             form.addRow("起こす音声", self._stream)
+        else:
+            # 行に置かない選びも窓の子なので、隠さないと窓の左上（0, 0）に浮いて
+            # 「モデル」の行を潰す（利用者の画面） 選ぶ物が 1 本なら要らない
+            self._stream.hide()
         form.addRow("言語", self._language)
         form.addRow("ヒント", self._prompt)
         form.addRow("", self._words)
