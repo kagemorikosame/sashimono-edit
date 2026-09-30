@@ -150,6 +150,58 @@ def start_values(clip: Clip, local_frame: int) -> dict[str, float]:
     }
 
 
+#: 範囲（左・上・右・下 合成の画素、Y は下が正）
+Box = tuple[float, float, float, float]
+
+#: 吸い付いた先 ``("x", 位置)`` は縦の線、``("y", 位置)`` は横の線
+Guide = tuple[str, float]
+
+
+def bounding_box(corners: Sequence[Point]) -> Box:
+    """四隅を囲む軸にそろった範囲 回した絵でも見えている端で揃える"""
+    xs = [x for x, _ in corners]
+    ys = [y for _, y in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def snap_targets(canvas: tuple[int, int], others: Sequence[Box]) -> tuple[list[float], list[float]]:
+    """吸い付く先 画面の端と中央、ほかの物の端と中央（横の位置の並び, 縦の位置の並び）"""
+    width, height = canvas
+    xs = [0.0, width / 2.0, float(width)]
+    ys = [0.0, height / 2.0, float(height)]
+    for left, top, right, bottom in others:
+        xs.extend((left, (left + right) / 2.0, right))
+        ys.extend((top, (top + bottom) / 2.0, bottom))
+    return xs, ys
+
+
+def snap_offset(
+    moving: Box, targets: tuple[Sequence[float], Sequence[float]], reach: float
+) -> tuple[float, float, list[Guide]]:
+    """``moving`` の端か中央を、``reach`` 以内で一番近い先へ寄せるずれ（横, 縦, 引く線）
+
+    横と縦は別々に決める 横だけ近ければ横だけ吸い付く 同じ近さなら先に並べた物（画面）を取る
+    """
+    left, top, right, bottom = moving
+    guides: list[Guide] = []
+
+    def nearest(own: Sequence[float], candidates: Sequence[float], axis: str) -> float:
+        best: tuple[float, float] | None = None
+        for target in candidates:
+            for edge in own:
+                distance = abs(target - edge)
+                if distance <= reach and (best is None or distance < abs(best[0])):
+                    best = (target - edge, target)
+        if best is None:
+            return 0.0
+        guides.append((axis, best[1]))
+        return best[0]
+
+    dx = nearest((left, (left + right) / 2.0, right), targets[0], "x")
+    dy = nearest((top, (top + bottom) / 2.0, bottom), targets[1], "y")
+    return dx, dy, guides
+
+
 def moved_values(
     start: dict[str, float],
     press: Point,

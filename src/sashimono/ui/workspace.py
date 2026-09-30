@@ -283,6 +283,10 @@ class Preferences:
     timeline_snap: bool = True
     #: 吸い付く距離（画面の画素） 画面の倍率で変わらない指の感覚で決める
     snap_distance: int = 8
+    #: プレビューの磁石 位置を動かすときに画面の中央・端やほかの物の端と中央へ吸い付く
+    #: タイムラインの磁石とは別に切れる（利用者の要望） 既定は入 知らない人ほど中央へ
+    #: 揃えにくい 1 画素ずつ自由に置きたい人は切る（Shift で一時的にも）
+    preview_snap: bool = True
     #: 新しく作るプロジェクトのトラックの方式（:class:`~sashimono.core.model.LayerMode`）
     #: 新規作成の窓の初期値と、起動した直後の空のプロジェクトに使う
     #: 既定は混合（YMM4・AviUtl と同じ 1 本のレイヤーに何でも置く 利用者の決定）
@@ -378,6 +382,7 @@ class PreferenceStore:
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
+            preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),
             new_project_layers=_choice(
                 data.get("new_project_layers"), LayerMode.ALL, plain.new_project_layers
             ),

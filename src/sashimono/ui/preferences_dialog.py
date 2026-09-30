@@ -340,6 +340,14 @@ class PreferencesDialog(QDialog):
         self._snap_distance.setValue(preferences.snap_distance)
         self._snap_distance.setToolTip("画面の画素で数える 拡大しても縮小しても同じ近さで吸い付く")
         form.addRow("吸い付く距離", self._snap_distance)
+        self._preview_snap = QCheckBox("プレビューで位置を動かすときに吸い付く（磁石）", self)
+        self._preview_snap.setChecked(preferences.preview_snap)
+        self._preview_snap.setToolTip(
+            "プレビューで絵を動かすときに、画面の端と中央・ほかの物の端と中央へ吸い付く"
+            " タイムラインの磁石とは別に切れる 距離は上の「吸い付く距離」 "
+            "動かしている途中で Shift を押している間は吸い付かない"
+        )
+        form.addRow(self._preview_snap)
 
         self._all_plugins = QCheckBox("AviUtl2 の汎用プラグインを全部読んで探す", self)
         self._all_plugins.setChecked(preferences.all_aviutl_plugins)
@@ -496,6 +504,7 @@ class PreferencesDialog(QDialog):
             double_click_reset=self._double_click_reset.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
+            preview_snap=self._preview_snap.isChecked(),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
         )
