@@ -32,6 +32,9 @@ __all__ = [
 #: 実体の型で書くと取り込みが輪になる
 AudioProcess = Callable[[Any, dict[str, float], Any], Any]
 
+#: 音のエフェクトが前の音をどれだけ（秒）読むか 引数は解いた値
+AudioHistory = Callable[[dict[str, float]], float]
+
 
 @dataclass(frozen=True, slots=True)
 class Pieces:
@@ -88,6 +91,12 @@ class EffectDefinition:
     #: ``(サンプル, 解いた値, 時間まわりの手がかり) -> サンプル`` の形
     #: これが入っていれば音のエフェクト、入っていなければ映像のエフェクト
     audio_process: AudioProcess | None = None
+    #: 前の音を読むエフェクト（残響・ディレイ・音程）が、塊の頭より前をどれだけ（秒）要るか
+    #:
+    #: ミキサは塊を細かく切って頼む 前の塊の音を覚えずに済むよう、要るだけ前から読み直して
+    #: 掛け、頭を捨てる 入っているエフェクトは塊を切らずに 1 度で掛ける（値は塊の頭の値）
+    #: 前の音を覚えて持ち越す作りにすると、シークや書き出しの並列で覚えた音が食い違う
+    audio_history: AudioHistory | None = None
     #: 絵の置かれた範囲（``u_object``）を広げるエフェクトの、上・下・左・右の項目名
     #:
     #: 領域拡張のように入れ物そのものを広げるものは、後ろに積んだエフェクト

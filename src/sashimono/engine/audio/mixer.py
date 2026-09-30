@@ -14,6 +14,7 @@ import numpy as np
 
 from sashimono.core.model import (
     Clip,
+    Effect,
     MediaId,
     ParamValue,
     Project,
@@ -23,8 +24,8 @@ from sashimono.core.model import (
     heard_stream,
 )
 from sashimono.core.timebase import FrameRate
-from sashimono.effects.audio import AudioContext
-from sashimono.effects.definition import registry
+from sashimono.effects.audio import MAX_HISTORY_SECONDS, AudioContext
+from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.spec import TrackSpec
 from sashimono.engine.decode import AudioDecoder, ProbeError
 
@@ -149,12 +150,23 @@ class AudioMixer:
                 continue
 
             stream = heard_stream(track, clip)
-            samples = self._read_clip(clip, begin - clip_start, end - begin, depth, stream=stream)
+            # 前の音を読むエフェクト（残響など）があれば、要るだけ前から読み、掛けてから頭を捨てる
+            inside = begin - clip_start
+            before = min(inside, lookback(clip, inside, self.sample_rate, rate))
+            samples = self._read_clip(
+                clip, inside - before, end - begin + before, depth, stream=stream
+            )
             if samples is None:
                 continue
             samples = _apply_effects(
-                clip, samples, begin - clip_start, self.sample_rate, clip_end - clip_start, rate
-            )
+                clip,
+                samples,
+                inside - before,
+                self.sample_rate,
+                clip_end - clip_start,
+                rate,
+                keep_from=before,
+            )[before:]
 
             offset = begin - start_sample
             out[offset : offset + len(samples)] += _apply_pan(samples * gain, float(pan))
@@ -245,6 +257,43 @@ class AudioMixer:
         return decoder
 
 
+def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
+    """クリップの ``offset`` サンプル目から掛けるのに、前の音をいくつ読み直すか
+
+    前の音を読むエフェクト（:attr:`EffectDefinition.audio_history`）の要る長さを足す
+    重ねて積むと、後ろのエフェクトが読む前の音も前のエフェクトを通した物が要る
+    値は塊の頭のフレームで解く 上限は :data:`MAX_HISTORY_SECONDS`
+    """
+    frame = _sample_to_frame(
+        _frame_to_sample(clip.timeline_start, rate, sample_rate) + offset, rate, sample_rate
+    )
+    seconds = 0.0
+    for definition, effect in _audio_stack(clip):
+        if definition.audio_history is not None:
+            seconds += definition.audio_history(
+                _values(definition, effect, frame - clip.timeline_start)
+            )
+    return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
+
+
+def _audio_stack(clip: Clip) -> list[tuple[EffectDefinition, Effect]]:
+    return [
+        (definition, effect)
+        for effect in clip.effects
+        if effect.enabled
+        and (definition := registry.get(effect.kind)) is not None
+        and definition.audio_process is not None
+    ]
+
+
+def _values(definition: EffectDefinition, effect: Effect, frame: int) -> dict[str, float]:
+    return {
+        spec.name: _as_number(spec, effect.params.get(spec.name), frame)
+        for spec in definition.parameters
+        if isinstance(spec, TrackSpec)
+    }
+
+
 def _apply_effects(
     clip: Clip,
     samples: np.ndarray,
@@ -252,6 +301,8 @@ def _apply_effects(
     sample_rate: int,
     duration: int,
     rate: FrameRate,
+    *,
+    keep_from: int = 0,
 ) -> np.ndarray:
     """クリップに積んだ音のエフェクトを、置いた順に掛ける
 
@@ -261,37 +312,41 @@ def _apply_effects(
     動く値は**映像のフレームの切れ目で区切って**解く 塊の先頭で 1 度だけ解くと、
     プレビューの細かい塊（1024 サンプル）がフレームの切れ目をまたいだときに、
     音量の変わる時刻がずれて書き出しと合わなくなる
+
+    前の音を読むエフェクトは塊を切らずに全体へ 1 度で掛け、値は ``keep_from``（呼ぶ側が
+    残す所の頭 その前は読み直した前の音）のフレームで解く 1 つずつ全体へ掛けてから
+    次へ進む（エフェクトの順に掛ける） 前の音を読むエフェクトが前のエフェクトを
+    通した音を読めるように
     """
-    stack = [
-        (definition, effect)
-        for effect in clip.effects
-        if effect.enabled
-        and (definition := registry.get(effect.kind)) is not None
-        and definition.audio_process is not None
-    ]
+    stack = _audio_stack(clip)
     if not stack:
         return samples
 
-    out = np.empty_like(samples)
     origin = _frame_to_sample(clip.timeline_start, rate, sample_rate)
-    for begin, end, frame in _frame_spans(
-        clip.timeline_start, origin + offset, len(samples), sample_rate, rate
-    ):
-        chunk = samples[begin:end]
-        for definition, effect in stack:
-            assert definition.audio_process is not None
-            values = {
-                spec.name: _as_number(spec, effect.params.get(spec.name), frame)
-                for spec in definition.parameters
-                if isinstance(spec, TrackSpec)
-            }
-            chunk = definition.audio_process(
-                chunk,
-                values,
+    spans = list(
+        _frame_spans(clip.timeline_start, origin + offset, len(samples), sample_rate, rate)
+    )
+    kept = min(max(keep_from, 0), max(len(samples) - 1, 0))
+    kept_frame = next((f for b, e, f in spans if b <= kept < e), spans[0][2] if spans else 0)
+    current = samples
+    for definition, effect in stack:
+        assert definition.audio_process is not None
+        if definition.audio_history is not None:
+            current = definition.audio_process(
+                current,
+                _values(definition, effect, kept_frame),
+                AudioContext(offset=offset, sample_rate=sample_rate, duration=duration),
+            )
+            continue
+        out = np.empty_like(current)
+        for begin, end, frame in spans:
+            out[begin:end] = definition.audio_process(
+                current[begin:end],
+                _values(definition, effect, frame),
                 AudioContext(offset=offset + begin, sample_rate=sample_rate, duration=duration),
             )
-        out[begin:end] = chunk
-    return out
+        current = out
+    return current
 
 
 def _frame_spans(
