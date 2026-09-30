@@ -37,6 +37,15 @@ MAX_OPEN_DECODERS = 8
 #: シーンの入れ子の深さの上限（映像のレンダラと同じ値）
 MAX_SCENE_DEPTH = 8
 
+#: 前の音を読むエフェクト（残響など）を掛ける区切り（クリップの頭から数えたサンプル）
+#: 再生の塊（1024）ごとに掛けると、そのたびに前の音（残響なら 1.5 秒）を読み直して解き直し、
+#: 圧縮した音では 1 塊 19ms（予算 21ms）掛かって再生が途切れた 区切りごとに 1 度だけ掛けて
+#: 覚えておき、塊はそこから切り出す 区切りの位置は頼まれ方に依らず決まるので、再生と
+#: 書き出しで同じ音になる 長くすると値の変わり目が粗くなる（0.34 秒）
+HISTORY_WINDOW = 16384
+#: 掛け終えた区切りを覚えておく数 再生の今の所と、シークで戻った所の分
+_KEPT_WINDOWS = 16
+
 
 class AudioMixer:
     """プロジェクトの音声を、指定したサンプル範囲について合成する
@@ -48,6 +57,14 @@ class AudioMixer:
         self._project = project
         self._decoders: OrderedDict[tuple[MediaId, int], AudioDecoder] = OrderedDict()
         self._closed = False
+        #: 前の音を読むエフェクトを掛け終えた区切り 鍵はクリップ・音・深さ・区切りの番号
+        #: クリップそのものも持ち、値を変えた（別のクリップになった）ら使わない
+        self._windows: OrderedDict[tuple[str, int | None, int, int], tuple[Clip, np.ndarray]] = (
+            OrderedDict()
+        )
+        #: 前の音を読むクリップの、読んだ元の音 続きを読むときは前に読んだ所から先だけを
+        #: 読む（前へ戻って読み直すと、圧縮した音は解き直しになる）
+        self._raw: dict[tuple[str, int | None, int], tuple[Clip, int, np.ndarray]] = {}
 
     @property
     def project(self) -> Project:
@@ -150,26 +167,115 @@ class AudioMixer:
                 continue
 
             stream = heard_stream(track, clip)
-            # 前の音を読むエフェクト（残響など）があれば、要るだけ前から読み、掛けてから頭を捨てる
             inside = begin - clip_start
-            before = min(inside, lookback(clip, inside, self.sample_rate, rate))
-            samples = self._read_clip(
-                clip, inside - before, end - begin + before, depth, stream=stream
-            )
+            duration = clip_end - clip_start
+            if _reads_history(clip):
+                # 前の音を読むエフェクト（残響など）は区切りごとに掛けて覚え、そこから切り出す
+                samples = self._windowed(clip, stream, depth, inside, end - begin, duration, rate)
+            else:
+                samples = self._read_clip(clip, inside, end - begin, depth, stream=stream)
+                if samples is not None:
+                    samples = _apply_effects(
+                        clip, samples, inside, self.sample_rate, duration, rate
+                    )
             if samples is None:
                 continue
-            samples = _apply_effects(
-                clip,
-                samples,
-                inside - before,
-                self.sample_rate,
-                clip_end - clip_start,
-                rate,
-                keep_from=before,
-            )[before:]
 
             offset = begin - start_sample
             out[offset : offset + len(samples)] += _apply_pan(samples * gain, float(pan))
+
+    def _windowed(
+        self,
+        clip: Clip,
+        stream: int | None,
+        depth: int,
+        offset: int,
+        count: int,
+        duration: int,
+        rate: FrameRate,
+    ) -> np.ndarray | None:
+        """前の音を読むエフェクトを掛けた音の ``[offset, offset + count)``（クリップの中の位置）"""
+        pieces: list[np.ndarray] = []
+        position = offset
+        stop = offset + count
+        while position < stop:
+            number = position // HISTORY_WINDOW
+            window = self._window(clip, stream, depth, number, duration, rate)
+            if window is None:
+                return None
+            head = number * HISTORY_WINDOW
+            upto = min(stop - head, len(window))
+            if upto <= position - head:
+                break
+            pieces.append(window[position - head : upto])
+            position = head + upto
+        if not pieces:
+            return None
+        joined = np.concatenate(pieces)
+        if len(joined) < count:
+            joined = np.concatenate(
+                [joined, np.zeros((count - len(joined), joined.shape[1]), dtype=np.float32)]
+            )
+        return joined
+
+    def _window(
+        self,
+        clip: Clip,
+        stream: int | None,
+        depth: int,
+        number: int,
+        duration: int,
+        rate: FrameRate,
+    ) -> np.ndarray | None:
+        """``number`` 番目の区切りに、前の音を読んでからエフェクトを掛けた音"""
+        key = (str(clip.id), stream, depth, number)
+        found = self._windows.get(key)
+        if found is not None and found[0] is clip:
+            self._windows.move_to_end(key)
+            return found[1]
+        start = number * HISTORY_WINDOW
+        end = min(start + HISTORY_WINDOW, duration)
+        if end <= start:
+            return None
+        before = min(start, lookback(clip, start, self.sample_rate, rate))
+        raw = self._raw_range(clip, stream, depth, start - before, end)
+        if raw is None:
+            return None
+        processed = _apply_effects(
+            clip, raw, start - before, self.sample_rate, duration, rate, keep_from=before
+        )[before:]
+        self._windows[key] = (clip, processed)
+        while len(self._windows) > _KEPT_WINDOWS:
+            self._windows.popitem(last=False)
+        return processed
+
+    def _raw_range(
+        self, clip: Clip, stream: int | None, depth: int, begin: int, end: int
+    ) -> np.ndarray | None:
+        """クリップの元の音の ``[begin, end)`` 前に読んだ所の続きなら、先だけを読み足す"""
+        key = (str(clip.id), stream, depth)
+        kept = self._raw.get(key)
+        if kept is not None and kept[0] is clip and kept[1] <= begin <= kept[1] + len(kept[2]):
+            _, origin, samples = kept
+            reach = origin + len(samples)
+            if end > reach:
+                more = self._read_clip(clip, reach, end - reach, depth, stream=stream)
+                if more is None:
+                    return None
+                samples = np.concatenate([samples, more])
+        else:
+            read = self._read_clip(clip, begin, end - begin, depth, stream=stream)
+            if read is None:
+                return None
+            origin, samples = begin, read
+        # 次の区切りが読み直す前の音の分だけ残す 全部残すと長いクリップで増え続ける
+        keep = int(MAX_HISTORY_SECONDS * self.sample_rate) + HISTORY_WINDOW
+        if len(samples) > keep:
+            cut = len(samples) - keep
+            origin += cut
+            samples = samples[cut:]
+        self._raw[key] = (clip, origin, samples)
+        return samples[begin - origin : end - origin]
 
     def _read_clip(
         self,
@@ -274,6 +380,11 @@ def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
                 effect_values(definition, effect, frame - clip.timeline_start)
             )
     return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
+
+
+def _reads_history(clip: Clip) -> bool:
+    """前の音を読むエフェクト（:attr:`EffectDefinition.audio_history`）が効いているか"""
+    return any(definition.audio_history is not None for definition, _ in audio_stack(clip))
 
 
 def audio_stack(clip: Clip) -> list[tuple[EffectDefinition, Effect]]:

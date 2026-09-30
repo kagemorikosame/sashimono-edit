@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import itertools
 import wave
 from pathlib import Path
 
@@ -155,3 +156,60 @@ def test_the_export_carries_the_echo(tmp_path: Path) -> None:
     quiet = np.abs(heard[first + rate // 20 : first + rate // 10])
     assert window.max() > 0.1
     assert window.max() > quiet.max() * 5
+
+
+class TestPlaybackBlocks:
+    """再生（1024 サンプルずつ）でリバーブの音がブチブチ途切れない（利用者の手元）
+
+    前は塊ごとに、前の音（リバーブなら 1.5 秒）を素材から読み直していた AAC のような
+    圧縮した音は読み直すたびに頭から解き直すので、1 塊 19ms（予算 21ms）掛かって再生が
+    間に合わず、読み直した所の音も塊ごとにわずかにずれて境目に段差が出た
+    """
+
+    @pytest.fixture
+    def voice(self, media_dir: Path) -> Path:
+        from tests.media_fixtures import make_sample
+
+        return make_sample(
+            media_dir, "reverb-voice.mp4", duration=5.0, sample_rate=48000, gain_db=8.0
+        ).path
+
+    @pytest.mark.parametrize(
+        ("kind", "values"),
+        [("audio_reverb", {}), ("audio_delay", {}), ("audio_pitch", {"semitones": 3.0})],
+    )
+    def test_small_blocks_match_one_long_render(
+        self, voice: Path, kind: str, values: dict[str, float]
+    ) -> None:
+        project = _project(voice, kind, **values)
+        whole_mixer = AudioMixer(project)
+        whole = whole_mixer.render(RATE, RATE * 2)[:, 0]
+        whole_mixer.close()
+        block_mixer = AudioMixer(project)
+        blocks = np.concatenate(
+            [block_mixer.render(RATE + start, 1024) for start in range(0, RATE * 2, 1024)]
+        )[: RATE * 2, 0]
+        block_mixer.close()
+        assert np.abs(blocks - whole).max() < 1e-4
+
+    def test_playing_on_reads_the_source_only_forward(
+        self, voice: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 塊ごとに前へ戻って読み直すと、圧縮した音は毎回解き直しになり再生が間に合わない
+        from sashimono.engine.decode import AudioDecoder
+
+        reads: list[tuple[int, int]] = []
+        original = AudioDecoder.read
+
+        def watching(self: AudioDecoder, start: int, count: int) -> np.ndarray:
+            reads.append((start, count))
+            return original(self, start, count)
+
+        monkeypatch.setattr(AudioDecoder, "read", watching)
+        mixer = AudioMixer(_project(voice, "audio_reverb"))
+        for start in range(RATE, RATE * 3, 1024):
+            mixer.render(start, 1024)
+        mixer.close()
+        # 始めの 1 回は前の音ごと読む その後は前に読んだ所の続きだけを読む
+        for (before, length), (after, _) in itertools.pairwise(reads):
+            assert after == before + length, f"{before + length} の続きではなく {after} を読んだ"
