@@ -238,6 +238,11 @@ class TimelineView(QWidget):
         #: 選んでいるクリップ 最後の 1 本が「主」で、設定パネルと AI の既定の
         #: 対象になる 何本選んでも、設定パネルに出せるのは 1 本だけのため
         self._selection: tuple[ClipId, ...] = ()
+        #: 選択のうち、グループの仲間として引き込まれただけのクリップ 自分で押したり
+        #: 囲んだりした物は入らない 設定パネルの値はこれを除いた物へ当てる
+        #: （AviUtl のグループ化と同じ 束ねるのは動かす・選ぶ所だけで、拡大率を 1 本
+        #: 変えただけで仲間の拡大率まで変わると、束ねた物ごとに大きさを合わせられない）
+        self._pulled: frozenset[ClipId] = frozenset()
         #: Shift+クリックで範囲を決めるときの起点 最後に選んだクリップ（選び方は
         #: 問わない AI が選んだものも含む） Shift での範囲選択そのものは起点を
         #: 動かさない 動かすと、Shift を押したまま範囲を広げ直せない
@@ -563,12 +568,26 @@ class TimelineView(QWidget):
         self.set_selection((clip_id,) if clip_id is not None else ())
         self._anchor = clip_id
 
-    def set_selection(self, clip_ids: Iterable[ClipId]) -> None:
-        """選択を丸ごと入れ替える 重なった ID は 1 つにする（最後の位置を残す）"""
+    @property
+    def edit_targets(self) -> tuple[ClipId, ...]:
+        """設定パネルの値を当てるクリップ 選んだ順 グループの仲間として引き込まれただけの物を除く
+
+        主のクリップは必ず入る（押した 1 本なので引き込まれた物ではない）
+        """
+        primary = self.selected_clip
+        return tuple(c for c in self._selection if c not in self._pulled or c == primary)
+
+    def set_selection(self, clip_ids: Iterable[ClipId], *, pulled: Iterable[ClipId] = ()) -> None:
+        """選択を丸ごと入れ替える 重なった ID は 1 つにする（最後の位置を残す）
+
+        ``pulled`` はグループの仲間として引き込んだだけのクリップ（:attr:`edit_targets`）
+        """
         ordered = tuple(reversed(dict.fromkeys(reversed(tuple(clip_ids)))))
-        if ordered == self._selection:
+        kept = frozenset(pulled) & frozenset(ordered)
+        if ordered == self._selection and kept == self._pulled:
             return
         self._selection = ordered
+        self._pulled = kept
         self._anchor = self.selected_clip
         # 主のクリップが同じでも知らせる 選択から外したクリップへ、設定パネルの
         # まとめ当てが届いてしまう
@@ -1048,11 +1067,11 @@ class TimelineView(QWidget):
             return
         elif clip.id in self._selection:
             # 選んだ何本かのうちの 1 本を掴んだ 選び直すと、まとめて動かせない
-            self.set_selection((*self._selection, clip.id))
+            self.set_selection((*self._selection, clip.id), pulled=self._pulled - {clip.id})
             self._anchor = clip.id
         else:
             # グループに入っていれば、仲間ごと選ぶ 掴んだ 1 本が主
-            self.set_selection((*self._group_of(clip.id), clip.id))
+            self._select_with_group(clip.id)
             self._anchor = clip.id
 
         edge = self._edge_at(position, clip)
@@ -1427,7 +1446,7 @@ class TimelineView(QWidget):
             # そのクリップだけを選び直す
             if hit[1].id not in self._selection:
                 # 左クリックと同じくグループは仲間ごと 1 本だけだと、削除や切り取りで束が裂ける
-                self.set_selection((*self._group_of(hit[1].id), hit[1].id))
+                self._select_with_group(hit[1].id)
             if len(self._selection) > 1:
                 count = f"（{len(self._selection)} 本）"
             _action(menu, "再生ヘッドで分割", self.split_at_playhead)
@@ -1805,9 +1824,15 @@ class TimelineView(QWidget):
         members = self._group_of(clip_id)
         if clip_id in self._selection:
             removed = set(members)
-            self.set_selection(c for c in self._selection if c not in removed)
+            self.set_selection(
+                (c for c in self._selection if c not in removed), pulled=self._pulled
+            )
         else:
-            self.set_selection((*self._selection, *(c for c in members if c != clip_id), clip_id))
+            joined = [c for c in members if c != clip_id]
+            self.set_selection(
+                (*self._selection, *joined, clip_id),
+                pulled=(self._pulled | set(joined)) - {clip_id},
+            )
 
     def _select_range(self, anchor: ClipId, target: ClipId) -> None:
         """Shift+クリック 起点と今のクリップを両隅にした範囲をまとめて選ぶ
@@ -1830,14 +1855,16 @@ class TimelineView(QWidget):
         start = min(first[1].timeline_start, last[1].timeline_start)
         end = max(first[1].timeline_end, last[1].timeline_end)
         # グループは仲間ごと入れる 一部だけ選ぶと、そのまま動かしたときに束が裂ける
-        chosen = [
-            member
+        inside = [
+            clip.id
             for track in shown[top : bottom + 1]
             for clip in track.clips
             if clip.overlaps(start, end)
-            for member in self._group_of(clip.id)
         ]
-        self.set_selection((*chosen, *self._group_of(target), target))
+        chosen = [member for clip_id in inside for member in self._group_of(clip_id)]
+        members = (*chosen, *self._group_of(target), target)
+        picked = {*inside, target}
+        self.set_selection(members, pulled=(c for c in members if c not in picked))
         self._anchor = anchor
 
     def _update_marquee(self, position: QPoint) -> None:
@@ -1850,11 +1877,24 @@ class TimelineView(QWidget):
             self._drag.moved = True
         self._drag.marquee_to = position
         rect = QRect(origin, position).normalized()
+        inside = self._clips_in_rect(rect)
+        # 枠に掛かった物は自分で選んだ物 掛かっていない仲間だけを引き込んだ物にする
+        # 掛かった物を後ろに並べる 主（最後の 1 本）が引き込んだ仲間になると、設定パネルが
+        # 枠に掛けていないクリップを出す
         caught = [
-            member for clip_id in self._clips_in_rect(rect) for member in self._group_of(clip_id)
+            *(m for clip_id in inside for m in self._group_of(clip_id) if m not in inside),
+            *inside,
         ]
-        self.set_selection((*self._drag.marquee_base, *caught))
+        self.set_selection(
+            (*self._drag.marquee_base, *caught),
+            pulled=(self._pulled | set(caught)) - set(inside),
+        )
         self.update()
+
+    def _select_with_group(self, clip_id: ClipId) -> None:
+        """押した 1 本をグループの仲間ごと選ぶ 押した 1 本が主 仲間は引き込んだ物として覚える"""
+        members = self._group_of(clip_id)
+        self.set_selection((*members, clip_id), pulled=(c for c in members if c != clip_id))
 
     def _group_of(self, clip_id: ClipId) -> tuple[ClipId, ...]:
         """グループの仲間（自分を含む） グループに入っていなければ自分だけ"""
@@ -1965,7 +2005,7 @@ class TimelineView(QWidget):
         if frame is None:
             return False
         if clip.id not in self._selection:
-            self.set_selection((*self._group_of(clip.id), clip.id))
+            self._select_with_group(clip.id)
             self._anchor = clip.id
         self.set_playhead(frame, follow=False)
         self.playhead_moved.emit(self._playhead)
@@ -1997,7 +2037,7 @@ class TimelineView(QWidget):
         if grab is None:
             return False
         if clip.id not in self._selection:
-            self.set_selection((*self._group_of(clip.id), clip.id))
+            self._select_with_group(clip.id)
             self._anchor = clip.id
         if grab is not ValueGrab.DONE:
             kind = DragKind.VALUE_KEY if grab is ValueGrab.KEY else DragKind.VALUE_LINE
