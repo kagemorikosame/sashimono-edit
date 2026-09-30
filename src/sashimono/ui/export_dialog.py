@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.commands import export_range
-from sashimono.core.model import Project
+from sashimono.core.model import Project, Scene, SceneId
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.encode import (
     DEFAULT_PIPELINE_DEPTH,
@@ -105,13 +106,22 @@ class ExportDialog(QDialog):
         decode_threads: int = DEFAULT_DECODE_THREADS,
         scene_name: str | None = None,
     ) -> None:
-        """``scene_name`` はシーンを開いているときのその名前 書き出すのはメインだと断るため"""
+        """``project`` はメインを持つプロジェクト全体
+
+        ``scene_name`` はシーンを開いているときのその名前 書き出す物の既定はメインのまま
+        （開いている物で出る物が変わると、書き出した物を取り違える） 選びにシーンを並べ、
+        どのシーンでも書き出せる
+        """
         super().__init__(parent)
         self.setWindowTitle("書き出し")
         self.setModal(True)
         self.resize(480, 260)
 
+        #: メインを持つプロジェクト全体 選んだシーンはここからタイムラインを差し替えて作る
+        self._whole = project
+        #: 書き出すプロジェクト 選んだシーンのタイムラインをメインの所へ差し込んだ物
         self._project = project
+        self._chosen: Scene | None = None
         # 画面には出さない 書き出しごとに変える物ではなく、その機械の持ち物なので
         # 本人の設定（表示 → 設定…）から来る
         self._pipeline_depth = pipeline_depth
@@ -145,28 +155,36 @@ class ExportDialog(QDialog):
         self._bitrate.setValue(12)
         self._bitrate.setSuffix(" Mbps")
 
-        width, height = project.settings.resolution
-        summary = (
-            f"{width}x{height} / {project.settings.frame_rate} fps / {project.duration} フレーム"
-        )
+        self._scene = QComboBox(self)
+        self._scene.addItem("メイン", None)
+        for scene in project.scenes:
+            self._scene.addItem(f"シーン「{scene.name}」", scene.id)
+        if not project.scenes:
+            self._scene.setToolTip("シーンを作ると、ここでシーンだけを書き出せる")
+
+        self._summary = QLabel(self)
+        self._range = QComboBox(self)
+        self._empty = QLabel("タイムラインが空なので書き出せない", self)
+        self._codecs_ready = bool(codecs)
 
         form = QFormLayout()
         form.addRow("出力先", path_row)
+        form.addRow("書き出す物", self._scene)
         form.addRow("コーデック", self._codec)
         form.addRow("ビットレート", self._bitrate)
-        form.addRow("内容", QLabel(summary, self))
-        self._range = self._range_choice(project)
+        form.addRow("内容", self._summary)
         form.addRow("書き出す範囲", self._range)
         if scene_name is not None:
-            # タイムラインに見えているのはシーンの範囲 書き出しはいつもメインなので、
+            # タイムラインに見えているのはシーンの範囲 既定で書き出すのはメインなので、
             # 見えている帯と違う所が出ても驚かないように、ここで言う
             note = QLabel(
-                f"シーン「{scene_name}」を編集中 書き出すのはメインのタイムラインで、"
-                "範囲もメインで指定したもの",
+                f"シーン「{scene_name}」を編集中 既定で書き出すのはメインのタイムライン"
+                " シーンを書き出すときは「書き出す物」で選ぶ",
                 self,
             )
             note.setWordWrap(True)
             form.addRow("", note)
+        form.addRow("", self._empty)
 
         self._progress = QProgressBar(self)
         self._progress.setRange(0, 1000)
@@ -188,14 +206,61 @@ class ExportDialog(QDialog):
         layout.addStretch(1)
         layout.addWidget(self._buttons)
 
-        if not codecs:
-            # 押せるままにすると、押しても何も起きず理由が分からない 理由はコーデックの欄に出ている
-            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
-        if project.duration <= 0:
-            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
-            form.addRow("", QLabel("タイムラインが空なので書き出せない", self))
+        self._scene.currentIndexChanged.connect(self._on_scene_changed)
+        self._on_scene_changed()
 
-    def _range_choice(self, project: Project) -> QComboBox:
+    def select_scene(self, scene_id: SceneId | None) -> None:
+        """書き出す物を選ぶ ``None`` ならメイン 無いシーンなら何もしない"""
+        index = self._scene.findData(scene_id)
+        if index >= 0:
+            self._scene.setCurrentIndex(index)
+
+    @property
+    def target(self) -> Project:
+        """書き出すプロジェクト 選んだシーンのタイムラインをメインの所へ差し込んだ物"""
+        return self._project
+
+    def _on_scene_changed(self) -> None:
+        """選んだシーンに合わせて、長さ・範囲・出力先の名前・押せるかを作り直す
+
+        範囲はシーンごとに持つ（シーンのタイムラインで指定した範囲） メインの範囲を
+        シーンへ当てると、シーンの長さの外を指して何も映らない
+        """
+        scene_id = self._scene.currentData()
+        scene = self._whole.find_scene(scene_id) if scene_id is not None else None
+        before = self._default_name(self._chosen)
+        self._chosen = scene
+        self._project = (
+            self._whole if scene is None else replace(self._whole, timeline=scene.timeline)
+        )
+        project = self._project
+        width, height = project.settings.resolution
+        self._summary.setText(
+            f"{width}x{height} / {project.settings.frame_rate} fps / {project.duration} フレーム"
+        )
+        self._fill_range(project)
+        # 出力先の名前を書き換えるのは、前の既定の名前のままのときだけ 手で決めた名前は残す
+        path = Path(self._path.text())
+        if path.name == before:
+            self._path.setText(str(path.with_name(self._default_name(scene))))
+        empty = project.duration <= 0
+        self._empty.setVisible(empty)
+        # 押せるままにすると、押しても何も起きず理由が分からない 理由はコーデックの欄と
+        # 空の断りに出ている
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            self._codecs_ready and not empty
+        )
+
+    def _default_name(self, scene: Scene | None) -> str:
+        """出力先の既定の名前 シーンならシーンの名前を後ろに付ける（メインと上書きし合わない）"""
+        if scene is None:
+            return f"{self._whole.name}.mp4"
+        # シーンの名前は自由に付けられる ファイル名に使えない文字を残すと、書き出しを
+        # 押してから開けないと断られる
+        safe = "".join("_" if c in '\\/:*?"<>|' else c for c in scene.name)
+        return f"{self._whole.name}_{safe}.mp4"
+
+    def _fill_range(self, project: Project) -> None:
         """全体か、タイムラインで指定した範囲か
 
         範囲があれば既定は範囲の側 目盛りに帯を引いた人は、その所を出したくて引いている
@@ -204,7 +269,9 @@ class ExportDialog(QDialog):
         範囲の位置と長さを選びの中に書いて、全体へ戻せるようにしておく
         """
         rate = project.settings.frame_rate
-        choice = QComboBox(self)
+        choice = self._range
+        choice.clear()
+        choice.setToolTip("")
         choice.addItem(f"全体（{project.duration} フレーム）", RANGE_ALL)
         area = export_range(project.timeline)
         if area is not None:
@@ -225,7 +292,6 @@ class ExportDialog(QDialog):
                 item.setEnabled(False)
         else:
             choice.setToolTip("タイムラインの目盛りを Shift+ドラッグすると範囲を指定できる")
-        return choice
 
     def _frame_range(self) -> tuple[int, int] | None:
         """選んだ範囲 全体なら ``None``（書き出し側がタイムラインの長さを使う）"""
