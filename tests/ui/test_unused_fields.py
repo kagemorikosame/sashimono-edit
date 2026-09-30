@@ -14,8 +14,8 @@ import shiboken6
 from PySide6.QtWidgets import QApplication, QWidget
 
 from sashimono.core.commands import insert_generated
-from sashimono.core.model import Clip, GeneratedSource, Project
-from sashimono.effects.sources import SHAPE, TRANSITION
+from sashimono.core.model import AnimatedValue, Clip, GeneratedSource, Keyframe, Project
+from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
 from sashimono.ui.inspector.panel import InspectorPanel
 
 
@@ -82,3 +82,36 @@ class TestTransition:
         # 切り替えは真ん中で入れ替わるだけで、進み具合を読まない
         shown = _shown(panel, TRANSITION.create(style="switch"))
         assert not {"easing", "easing_mode", "angle"} & shown
+
+
+class TestText:
+    def test_a_plain_text_hides_the_timer_and_bare_colours(self, panel: InspectorPanel) -> None:
+        # 壊れると、ふつうの文字にもタイマーの 4 つと、太さ 0 の縁・影の色が並ぶ
+        shown = _shown(panel, TEXT.create())
+        assert {"text", "size", "align", "layout", "border_width", "shadow_x"} <= shown
+        hidden = {"timer_start", "timer_rate", "timer_countdown", "timer_length"}
+        assert not (hidden | {"border_color", "shadow_color"}) & shown
+
+    def test_a_timer_hides_the_text_and_shows_its_settings(self, panel: InspectorPanel) -> None:
+        # タイマーは文字の代わりに時間を出す 数え下げを切っていれば長さは読まない
+        shown = _shown(panel, TEXT.create(timer_format="mm\\:ss"))
+        assert {"timer_format", "timer_start", "timer_rate", "timer_countdown"} <= shown
+        assert "text" not in shown and "timer_length" not in shown
+        counting = _shown(panel, TEXT.create(timer_format="ss", timer_countdown=True))
+        assert "timer_length" in counting
+
+    def test_vertical_text_hides_the_line_alignment(self, panel: InspectorPanel) -> None:
+        shown = _shown(panel, TEXT.create(vertical=True))
+        assert "align" not in shown and "layout" not in shown
+        assert {"anchor", "valign"} <= shown
+
+    def test_colours_come_back_with_their_width(self, panel: InspectorPanel) -> None:
+        # 太さや影のずらしを入れた・キーフレームで動かしたら色の欄が出る
+        assert "border_color" in _shown(panel, TEXT.create(border_width=4))
+        moving = AnimatedValue(keyframes=(Keyframe(0, 0.0), Keyframe(10, 5.0)))
+        assert "shadow_color" in _shown(panel, TEXT.create(shadow_x=moving))
+
+    def test_hidden_values_are_kept(self) -> None:
+        source = TEXT.create(text="残す", timer_format="ss")
+        assert source.params["text"] == "残す"
+        assert "text" in TEXT.unused_names(source.params)
