@@ -473,6 +473,9 @@ class SubtitlePanel(QWidget):
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript)], f"字幕を起こす: {media.name}"
             )
+            if dialog.notice:
+                # 窓は起こし終えたら閉じるので、GPU から CPU へ落とした理由などはここで出す
+                self.status_message.emit(dialog.notice)
 
     def start_transcription(self, media_id: MediaId, model: str) -> str:
         """起こしを始める AI からの依頼を受ける入口

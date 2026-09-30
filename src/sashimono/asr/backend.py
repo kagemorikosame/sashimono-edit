@@ -94,6 +94,9 @@ class TranscribeOptions:
     word_timestamps: bool = False
     #: 固有名詞などを与えると認識が寄る
     initial_prompt: str = ""
+    #: 起こす音声ストリームの番号（:attr:`AudioStreamInfo.index`） ``None`` なら 1 本目
+    #: ゲームの録画（ゲームの音とマイクの声）のように音声が何本もある素材で、声の方を選ぶ
+    audio_stream: int | None = None
 
     def __post_init__(self) -> None:
         if self.beam_size < 1:

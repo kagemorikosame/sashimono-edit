@@ -41,6 +41,8 @@ class JobEvent:
     ratio: float = 0.0
     message: str = ""
     transcript: Transcript | None = None
+    #: 起こせたが知らせておくこと（GPU の道具が読めず CPU で起こした など）
+    notice: str = ""
 
     @property
     def finished(self) -> bool:
@@ -144,15 +146,20 @@ class TranscriptionService:
         except Exception as exc:  # 予期しない失敗でアプリごと落とさない
             job._emit(JobEvent(JobKind.FAILED, message=f"想定外の失敗: {exc}"))
         else:
+            # 知らせを受け取れる実装だけが持つ（試験の代わりの実装などは持たない）
+            take = getattr(self._backend, "take_notice", None)
+            notice = str(take()) if callable(take) else ""
             if transcript is None:
                 job._emit(JobEvent(JobKind.CANCELLED, message="中断した"))
             else:
+                done = f"{len(transcript)} 文を起こした"
                 job._emit(
                     JobEvent(
                         JobKind.DONE,
                         ratio=1.0,
-                        message=f"{len(transcript)} 文を起こした",
+                        message=f"{done} {notice}" if notice else done,
                         transcript=transcript,
+                        notice=notice,
                     )
                 )
         finally:

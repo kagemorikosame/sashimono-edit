@@ -77,6 +77,9 @@ class TranscribeDialog(QDialog):
         self._service = service
         self._job: Job | None = None
         self.transcript: Transcript | None = None
+        #: 起こせたが知らせておくこと（GPU の道具が読めず CPU で起こした など） 窓を閉じた
+        #: 後に呼ぶ側が出す
+        self.notice = ""
 
         #: 導入ワーカーからのログ スレッドをまたぐのでキューで受ける
         self._install_log: queue.Queue[str] = queue.Queue()
@@ -112,8 +115,19 @@ class TranscribeDialog(QDialog):
         self._gpu.setChecked(True)
         self._gpu.toggled.connect(self._describe_install)
 
+        # 音声が何本もある素材（ゲームの音とマイクの声など）は、どれを起こすかを選ぶ
+        # 番号はタイムラインの札（音声 N）と同じく音声ストリームの並びで 1 から数える
+        self._stream = QComboBox(self)
+        for number, stream in enumerate(self._media.audio_streams, start=1):
+            detail = f"{stream.channels}ch {stream.sample_rate // 1000}kHz"
+            if stream.language:
+                detail += f" {stream.language}"
+            self._stream.addItem(f"音声 {number}（{detail}）", stream.index)
+
         form = QFormLayout()
         form.addRow("モデル", self._model)
+        if len(self._media.audio_streams) > 1:
+            form.addRow("起こす音声", self._stream)
         form.addRow("言語", self._language)
         form.addRow("ヒント", self._prompt)
         form.addRow("", self._words)
@@ -165,15 +179,15 @@ class TranscribeDialog(QDialog):
         status = runtime_status()
         self._run_button.setEnabled(status.installed)
         self._install_button.setEnabled(True)
-        # 未導入のときも触れるようにする ここが「GPU 版を入れるか」の選択を
-        # 兼ねていて、切れば CUDA ランタイム（2 GB 弱）を落とさずに済む
-        self._gpu.setEnabled(status.extra_installed or not status.installed)
+        # いつも触れるようにする ここが「GPU 版を入れるか」の選択を兼ねていて、切れば
+        # CUDA ランタイム（2 GB 弱）を落とさずに済む 導入済みで CUDA ランタイムが無いときも
+        # 印を付けて「環境を更新」を押せば足せる（前は押せず、後から GPU 版にする道が無かった）
 
         if status.installed:
             self._install_button.setText("環境を更新")
-            self._status.setText(status.summary())
             if not status.extra_installed:
                 self._gpu.setChecked(False)
+            self._describe_install()
             return
 
         self._install_button.setText("環境を導入")
@@ -182,9 +196,18 @@ class TranscribeDialog(QDialog):
     def _describe_install(self) -> None:
         """これから入るものを出す 何が落ちてくるのか分かってから始められるように"""
         status = runtime_status()
-        if status.installed:
-            return
         cuda = self._gpu.isChecked()
+        if status.installed:
+            if cuda and status.extras and not status.extra_installed:
+                gigabytes = status.pack.extra_size_mb / 1000
+                self._status.setText(
+                    f"{status.summary()}\nGPU で起こすには「環境を更新」で"
+                    f" {status.pack.extra_label}（約 {gigabytes:.1f} GB）を入れてください"
+                    " 入れずに起こすと CPU で起こします"
+                )
+            else:
+                self._status.setText(status.summary())
+            return
         packages = "、".join(status.missing(extra=cuda))
         size = "2 GB" if cuda else "300 MB"
         self._status.setText(
@@ -249,6 +272,7 @@ class TranscribeDialog(QDialog):
             compute_type="float16" if self._gpu.isChecked() else "int8",
             word_timestamps=self._words.isChecked(),
             initial_prompt=self._prompt.text().strip(),
+            audio_stream=self._stream.currentData(),
         )
         try:
             self._job = self._service.start(self._media.id, self._media.path, options)
@@ -302,6 +326,7 @@ class TranscribeDialog(QDialog):
             self._set_busy(False)
             if event.kind is JobKind.DONE and event.transcript is not None:
                 self.transcript = event.transcript
+                self.notice = event.notice
                 self.accept()
             else:
                 self._status.setText(event.message or "終了した")
