@@ -1140,6 +1140,12 @@ class InspectorPanel(QWidget):
             located = self._project.timeline.locate_clip(clip_id)
             if located is None:
                 continue
+            if primary.group_id is not None and located[1].group_id == primary.group_id:
+                # 同じグループの仲間には当てない（AviUtl のグループ化と同じ 束ねるのは選ぶ・
+                # 動かす所だけ） 選び方では見分けきれない 2 本を選んでからグループ化すると、
+                # どちらも自分で選んだ物のまま残り、1 本を押し直しても選びが変わらない
+                # そのせいで利用者の手元では拡大率が連動し続けた
+                continue
             copied = _for_clip(command, primary, located[1])
             if copied is not None:
                 extra.append(copied)
