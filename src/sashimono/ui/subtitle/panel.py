@@ -91,6 +91,8 @@ class SubtitlePanel(QWidget):
         self._project = project
         self._analyzer = analyzer
         self._media_id: MediaId | None = None
+        #: タイムラインで選んだクリップの素材と、それが鳴らす音声ストリーム
+        self._heard: tuple[MediaId, int | None] | None = None
         self._frame = 0
         #: 表示中の行に対応する字幕 行番号から引く
         self._rows: list[tuple[SegmentId, int, int]] = []
@@ -200,6 +202,15 @@ class SubtitlePanel(QWidget):
         index = self._media.findData(str(media_id))
         if index >= 0:
             self._media.setCurrentIndex(index)
+
+    def follow_clip(self, media_id: MediaId, stream: int | None) -> None:
+        """タイムラインで選んだクリップの素材を出す 起こすときはそのクリップが鳴らす音を選んでおく
+
+        前は字幕パネルが前に開いた素材（音声 4 本の動画など）のまま残り、音声 1 本の
+        クリップを選んで起こしても、前の素材の 4 つの音声が並んだ（利用者の画面）
+        """
+        self.select_media(media_id)
+        self._heard = (media_id, stream)
 
     # --- 一覧 ---
 
@@ -468,7 +479,9 @@ class SubtitlePanel(QWidget):
             # パネルは開けるようにしておく
             self._service = TranscriptionService(default_backend())
 
-        dialog = TranscribeDialog(media, self._service, self)
+        heard = self._heard
+        stream = heard[1] if heard is not None and heard[0] == media.id else None
+        dialog = TranscribeDialog(media, self._service, self, stream=stream)
         if dialog.exec() and dialog.transcript is not None:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript)], f"字幕を起こす: {media.name}"

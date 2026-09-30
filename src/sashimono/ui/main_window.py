@@ -101,6 +101,7 @@ from sashimono.core.model import (
     SceneId,
     TrackId,
     TrackKind,
+    heard_stream,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry as effect_registry
@@ -1418,10 +1419,29 @@ class MainWindow(QMainWindow):
         導入のボタンを出す（:mod:`sashimono.asr.environment` を参照）
         """
         self.show_subtitles()
-        selected = self._media_pool.selected_media_id()
-        if selected is not None:
-            self._subtitles.select_media(selected)
+        # タイムラインで選んだクリップの素材を先に見る 字幕パネルは選んだクリップに付いて
+        # いくので、選んでいればもう出ている メディア欄で選んだ素材は、クリップを選んで
+        # いないときだけ使う（前はこちらを先に見て、別の素材を起こしていた）
+        if self._selected_sound() is None:
+            selected = self._media_pool.selected_media_id()
+            if selected is not None:
+                self._subtitles.select_media(selected)
         self._subtitles.transcribe()
+
+    def _selected_sound(self) -> tuple[MediaId, int | None] | None:
+        """タイムラインで選んだクリップの、音のある素材と鳴らす音声ストリーム"""
+        primary = self._timeline.selected_clip
+        project = self.view_project
+        located = project.timeline.locate_clip(primary) if primary is not None else None
+        if located is None or located[1].media_id is None:
+            return None
+        track, clip = located
+        media = project.find_media(located[1].media_id)
+        if media is None or not media.has_audio:
+            return None
+        # 映像のクリップ（音を鳴らさない）は、素材の 1 本目の音を初めに選んでおく
+        stream = heard_stream(track, clip) if project.plays_sound(track, clip) else None
+        return media.id, stream
 
     def _transcribe_media(self, media_id: str) -> None:
         """メディアプールの右クリックから起こす その素材を字幕パネルで選んでから始める"""
@@ -1712,6 +1732,10 @@ class MainWindow(QMainWindow):
         # グラフエディタも選んだクリップに付いていく 付いていかないと、キーフレームを入れた
         # クリップを選んでもグラフエディタが何も出さず、◆ の右クリックの奥からしか開けない
         self._graph.set_clip(selected)
+        # 字幕パネルも選んだクリップの素材に付いていく（起こすときに別の素材を開かない）
+        sound = self._selected_sound()
+        if sound is not None:
+            self._subtitles.follow_clip(*sound)
 
     def _align_selected(self, anchor: str) -> None:
         """設定パネルの配置のテンプレート 選んだクリップを画面のその所へ寄せる

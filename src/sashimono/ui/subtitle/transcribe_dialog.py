@@ -67,13 +67,20 @@ class TranscribeDialog(QDialog):
     """
 
     def __init__(
-        self, media: MediaItem, service: TranscriptionService, parent: QWidget | None = None
+        self,
+        media: MediaItem,
+        service: TranscriptionService,
+        parent: QWidget | None = None,
+        *,
+        stream: int | None = None,
     ) -> None:
+        """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）"""
         super().__init__(parent)
         self.setWindowTitle(f"字幕起こし — {media.name}")
         self.resize(560, 420)
 
         self._media = media
+        self._first_stream = stream
         self._service = service
         self._job: Job | None = None
         self.transcript: Transcript | None = None
@@ -118,11 +125,15 @@ class TranscribeDialog(QDialog):
         # 音声が何本もある素材（ゲームの音とマイクの声など）は、どれを起こすかを選ぶ
         # 番号はタイムラインの札（音声 N）と同じく音声ストリームの並びで 1 から数える
         self._stream = QComboBox(self)
+        stream_choice = self._first_stream
         for number, stream in enumerate(self._media.audio_streams, start=1):
             detail = f"{stream.channels}ch {stream.sample_rate // 1000}kHz"
             if stream.language:
                 detail += f" {stream.language}"
             self._stream.addItem(f"音声 {number}（{detail}）", stream.index)
+        chosen = self._stream.findData(stream_choice) if stream_choice is not None else -1
+        if chosen >= 0:
+            self._stream.setCurrentIndex(chosen)
 
         form = QFormLayout()
         form.addRow("モデル", self._model)
