@@ -96,17 +96,15 @@ def seen(monkeypatch: pytest.MonkeyPatch) -> _Seen:
 
     class Recording(TranscribeDialog):
         def exec(self) -> int:
-            self.show()
-            QApplication.processEvents()
             record.opened.append(
                 (
                     self._media.name,
                     self._stream.count(),
                     self._stream.currentData(),
-                    self._stream.isVisible(),
+                    # 窓を出さずに見る 出すと窓の中のプレビューが GL を作り、後の試験に残る
+                    not self._stream.isHidden(),
                 )
             )
-            self.close()
             return 0
 
     monkeypatch.setattr(subtitle_panel, "TranscribeDialog", Recording)
