@@ -278,6 +278,8 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             "duration_seconds": round(float(item.duration), 3),
             "has_video": item.has_video,
             "has_audio": item.has_audio,
+            # 音声が何本もある素材（ゲームの音とマイクの声など） transcribe の audio で選ぶ
+            "audio_count": len(item.audio_streams),
             "subtitle_count": len(item.transcript) if item.transcript is not None else 0,
         }
         for item in project.media
@@ -1003,7 +1005,22 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
-    message = host.start_transcription(media.id, str(arguments.get("model", "large-v3")))
+    stream: int | None = None
+    if arguments.get("audio") is not None:
+        # 番号はタイムラインの札（音声 N）と同じく 1 から数える ffprobe の番号は映像を含み、
+        # AI が素材ごとに数え直すことになる
+        try:
+            number = int(arguments["audio"])
+        except (TypeError, ValueError) as exc:
+            raise ToolError("audio は 1 から数えた音声の番号です") from exc
+        if not 1 <= number <= len(media.audio_streams):
+            raise ToolError(
+                f"{media.name} の音声は {len(media.audio_streams)} 本です（audio は 1 から）"
+            )
+        stream = media.audio_streams[number - 1].index
+    message = host.start_transcription(
+        media.id, str(arguments.get("model", "large-v3")), audio_stream=stream
+    )
     return {
         "started": message,
         "next": "しばらく待ってから transcription_status を見てください"
@@ -1622,7 +1639,17 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="transcribe",
         description="素材の字幕起こしを始める 終わるまで数分かかる",
-        schema=_schema({"media_id": _string("素材"), "model": _string("モデル名")}, ["media_id"]),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "model": _string("モデル名"),
+                "audio": _integer(
+                    "起こす音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 音声の本数は list_media の audio_count"
+                ),
+            },
+            ["media_id"],
+        ),
         handler=_transcribe,
         writes=True,
     ),

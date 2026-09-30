@@ -299,6 +299,31 @@ class TestSubtitles:
         result = run(host, "transcribe", media_id=str(media.id))
         assert "transcription_status" in result["next"]
         assert run(host, "transcription_status")["status"] == "large-v3 で開始"
+        # 省くと今までどおり 1 本目
+        assert host.transcribed_stream is None
+
+    def test_transcribe_can_pick_the_second_voice(self, host: FakeHost) -> None:
+        # ゲームの録画のマイクの声（音声 2）を起こせないと、声ではなくゲームの音が字幕になる
+        from dataclasses import replace as _replace
+
+        from sashimono.core.commands import AddMedia
+        from sashimono.core.model import MediaId
+
+        first = host.document.project.media[0]
+        stream = first.audio_streams[0]
+        two = _replace(
+            first,
+            id=MediaId("two-voices"),
+            transcript=None,
+            audio_streams=(stream, _replace(stream, index=stream.index + 1)),
+        )
+        host.document.execute(AddMedia(two))
+        listed = {m["media_id"]: m for m in run(host, "list_media")}
+        assert listed["two-voices"]["audio_count"] == 2
+        run(host, "transcribe", media_id="two-voices", audio=2)
+        assert host.transcribed_stream == stream.index + 1
+        with pytest.raises(ToolError, match="2 本"):
+            run(host, "transcribe", media_id="two-voices", audio=3)
 
 
 def _forget_transcript(project: Project, media_id: str) -> object:

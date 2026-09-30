@@ -2501,8 +2501,10 @@ class MainWindow(QMainWindow):
     def waveform(self, media: MediaItem) -> Waveform | None:
         return self._analyzer.waveform(media)
 
-    def start_transcription(self, media_id: MediaId, model: str) -> str:
-        return self._subtitles.start_transcription(media_id, model)
+    def start_transcription(
+        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+    ) -> str:
+        return self._subtitles.start_transcription(media_id, model, audio_stream=audio_stream)
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()
