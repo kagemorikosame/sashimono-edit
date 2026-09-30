@@ -25,6 +25,7 @@ from sashimono.core.commands import (
     SetClipProperty,
     SetParam,
     SetTrackHeights,
+    SplitClip,
     TrimClips,
     insert_media,
 )
@@ -541,7 +542,8 @@ class TestLockedGroup:
         received = _received(view)
         view.split_at_playhead()
         (commands,) = received
-        assert [c.clip_id for c in commands] == [extra.id]
+        assert [c.clip_id for c in commands if isinstance(c, SplitClip)] == [extra.id]
+        assert len(commands) == 1
         assert any("グループ" in m for m in messages)
 
     def test_deleting_and_cutting_are_refused(self, view: TimelineView) -> None:
