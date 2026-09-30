@@ -477,7 +477,9 @@ class SubtitlePanel(QWidget):
                 # 窓は起こし終えたら閉じるので、GPU から CPU へ落とした理由などはここで出す
                 self.status_message.emit(dialog.notice)
 
-    def start_transcription(self, media_id: MediaId, model: str) -> str:
+    def start_transcription(
+        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+    ) -> str:
         """起こしを始める AI からの依頼を受ける入口
 
         ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
@@ -491,7 +493,7 @@ class SubtitlePanel(QWidget):
         if not self._service.backend.is_available():
             raise RuntimeError("起こしの実行環境が入っていません 字幕パネルから導入できます")
 
-        options = TranscribeOptions(model=model)
+        options = TranscribeOptions(model=model, audio_stream=audio_stream)
         self._job = self._service.start(media.id, media.path, options)
         self._job_media = media.id
         self._job_note = "始めた"
