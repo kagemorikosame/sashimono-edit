@@ -13,7 +13,16 @@ from dataclasses import replace
 from fractions import Fraction
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QIcon,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -80,6 +89,7 @@ from sashimono.engine.gpu import BlendMode
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
 from sashimono.ui.theme import Colors
+from sashimono.ui.timeline.add_menu import effects_for_clip
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
 
@@ -943,9 +953,25 @@ class InspectorPanel(QWidget):
         self._emit(SetClipProperty(clip.id, name, value), f"{label}を初期値に戻す")
 
     def _show_effect_menu(self) -> None:
-        clip = self._clip()
-        if clip is None:
+        menu = self.effect_menu()
+        if menu is None:
             return
+        chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
+        if chosen is None:
+            return
+        self._add_chosen_effect(chosen)
+
+    def effect_menu(self) -> QMenu | None:
+        """〔＋ エフェクト〕のメニュー 選んでいるクリップに効く物だけを並べる
+
+        音だけのクリップに映像のエフェクト、絵だけのクリップに音のエフェクトを並べると、
+        積めても何も起きない（タイムラインの右クリックと同じ決まり :func:`effects_for_clip`）
+        """
+        located = self._located()
+        if located is None or self._project is None:
+            return None
+        track, clip = located
+        definitions = effects_for_clip(self._project, track, clip)
 
         menu = QMenu(self)
         # 場面切り替えは、前の場面と後の場面で積む先が違う
@@ -955,16 +981,18 @@ class InspectorPanel(QWidget):
             roots = {False: menu.addMenu("前の場面へ"), True: menu.addMenu("後の場面へ")}
         submenus: dict[tuple[bool, str], QMenu] = {}
         for after, root in roots.items():
-            for definition in registry.all():
+            for definition in definitions:
                 submenu = submenus.get((after, definition.category))
                 if submenu is None:
                     submenu = root.addMenu(definition.category)
                     submenus[(after, definition.category)] = submenu
                 action = submenu.addAction(definition.label)
                 action.setData((definition.kind, after))
+        return menu
 
-        chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
-        if chosen is None:
+    def _add_chosen_effect(self, chosen: QAction) -> None:
+        clip = self._clip()
+        if clip is None:
             return
         kind, after = chosen.data()
         definition = registry.require(str(kind))

@@ -112,3 +112,45 @@ class TestInspector:
         panel.set_clip(audio.id)
         names = {name for _, name in panel._editors}
         assert {"volume", "pan"} <= names
+
+
+def _menu_categories(panel: InspectorPanel) -> set[str]:
+    menu = panel.effect_menu()
+    assert menu is not None
+    return {action.text() for action in menu.actions() if action.menu() is not None}
+
+
+class TestEffectMenu:
+    """〔＋ エフェクト〕に並ぶのは、選んだクリップに効く物だけ
+
+    前は音だけのクリップにも映像のエフェクト（ぼかし・色など）が並び、絵だけのクリップにも
+    「音」が並んだ 積めても何も起きない
+    """
+
+    @pytest.fixture
+    def panel(self, qt_application: QApplication) -> Iterator[InspectorPanel]:
+        del qt_application
+        created = InspectorPanel()
+        yield created
+        created.close()
+        shiboken6.delete(created)
+
+    def test_a_sound_clip_lists_only_sound_effects(
+        self, panel: InspectorPanel, audio_media: MediaItem
+    ) -> None:
+        project = _placed(audio_media)
+        (audio,) = _clips(project, TrackKind.AUDIO)
+        panel.set_project(project)
+        panel.set_clip(audio.id)
+        assert _menu_categories(panel) == {"音"}
+
+    def test_a_text_lists_no_sound_effects(self, panel: InspectorPanel) -> None:
+        project = Project.create()
+        for command in insert_generated(project, TEXT.create()):
+            project = command.apply(project)
+        (text,) = [c for t in project.timeline.tracks for c in t.clips]
+        panel.set_project(project)
+        panel.set_clip(text.id)
+        categories = _menu_categories(panel)
+        assert "音" not in categories
+        assert "ぼかし" in categories
