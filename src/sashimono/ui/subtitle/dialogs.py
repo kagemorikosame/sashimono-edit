@@ -29,7 +29,7 @@ from sashimono.core.model import Transcript
 from sashimono.engine.audio.silence import SilenceOptions
 from sashimono.ui.theme import Colors
 
-__all__ = ["CleanupDialog", "Estimator", "JetCutDialog"]
+__all__ = ["BurnDialog", "CleanupDialog", "Estimator", "JetCutDialog"]
 
 #: 削る量の見積もり 条件と「発話を守るか」を受け取り、(か所, 秒) を返す
 type Estimator = Callable[[SilenceOptions, bool], tuple[int, float]]
@@ -253,3 +253,39 @@ class JetCutDialog(QDialog):
 def _to_fraction(value: float) -> Fraction:
     """秒（float）を有理数へ 10ms 単位で十分"""
     return Fraction(round(value * 100), 100)
+
+
+class BurnDialog(QDialog):
+    """字幕の焼き込み 焼き込む話し手（素材と音声）を選び、見た目のひな形を示す
+
+    話し手ごとに別のレイヤーへ入れる 既定は全部 ひな形はタイムラインで選んでいる
+    テキストがあればそれ（フォント・色・位置・縁取り・エフェクトを写し、本文だけ差し替える）
+    無ければ既定の見た目 どちらで置くかを窓に書く（置いてから違うと気付くと戻す手間になる）
+    """
+
+    def __init__(
+        self,
+        voices: list[tuple[object, str]],
+        template_note: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("字幕を焼き込む")
+        self._voices: list[tuple[object, QCheckBox]] = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("焼き込む字幕（話し手ごとに別のレイヤーへ入れます）", self))
+        for voice, label in voices:
+            check = QCheckBox(label, self)
+            check.setChecked(True)
+            layout.addWidget(check)
+            self._voices.append((voice, check))
+        note = QLabel(template_note, self)
+        note.setObjectName("burn_template")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        layout.addWidget(note)
+        layout.addWidget(_confirm_buttons(self, "焼き込む"))
+
+    def chosen(self) -> list[object]:
+        """印の付いた話し手"""
+        return [voice for voice, check in self._voices if check.isChecked()]
