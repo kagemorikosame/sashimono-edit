@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 
@@ -41,19 +42,30 @@ from sashimono.core.commands import (
     SetSegmentText,
     SetTranscript,
     SplitSegment,
+    Voice,
     burn_subtitles,
     export_range,
+    subtitle_voices,
+    voice_label,
 )
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
 from sashimono.core.jetcut import plan_cuts
-from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, TranscriptSegment
+from sashimono.core.model import (
+    Clip,
+    GeneratedSource,
+    MediaId,
+    MediaItem,
+    Project,
+    SegmentId,
+    TranscriptSegment,
+)
 from sashimono.core.projection import project_clip, subtitle_stream
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
-from sashimono.ui.subtitle.dialogs import CleanupDialog, JetCutDialog
+from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog, JetCutDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors
@@ -107,6 +119,11 @@ class SubtitlePanel(QWidget):
         self._jobs: list[Job] = []
         #: 終わった起こしの知らせ 様子を聞かれたときに並べる
         self._job_notes: list[str] = []
+        #: 焼き込みのひな形にするクリップを返す（タイムラインで選んでいるテキスト）
+        #: 窓が差し込む 差し込まなければひな形は無い（既定の見た目）
+        self.template_provider: Callable[[], Clip | None] = lambda: None
+        #: 焼き込む話し手を尋ねる 試験で差し替える
+        self.ask_burn: Callable[[list[tuple[Voice, str]], str], list[Voice] | None] = self._ask_burn
         #: 起こしている物の最後の進み具合（依頼ごと）
         self._last_progress: dict[int, str] = {}
 
@@ -129,6 +146,10 @@ class SubtitlePanel(QWidget):
         self._clean_button = self._button("整形…", self.clean)
         self._cut_button = self._button("無音カット…", self.jet_cut)
         self._burn_button = self._button("焼き込み", self.burn)
+        self._place_rows_button = self._button("選んだ行を置く", self.place_selected_rows)
+        self._place_rows_button.setToolTip(
+            "選んだ字幕の行をテキストとしてタイムラインへ置く 選んでいなければ再生位置の 1 行"
+        )
         self._export_button = self._button("書き出し…", self.export_file)
 
         top = QHBoxLayout()
@@ -143,6 +164,7 @@ class SubtitlePanel(QWidget):
             self._clean_button,
             self._cut_button,
             self._burn_button,
+            self._place_rows_button,
             self._export_button,
         ):
             actions.addWidget(button)
@@ -152,7 +174,8 @@ class SubtitlePanel(QWidget):
         self._table.setHorizontalHeaderLabels(["時刻", "本文"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # 何行もまとめて選べる（選んだ行をテキストとして置くため）
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_menu)
         self._table.itemSelectionChanged.connect(self._on_row_selected)
@@ -445,6 +468,7 @@ class SubtitlePanel(QWidget):
         has_segments = bool(self._segments())
         self._clean_button.setEnabled(has_segments)
         self._burn_button.setEnabled(has_segments)
+        self._place_rows_button.setEnabled(has_segments)
         self._export_button.setEnabled(has_segments)
         media = self._current_media()
         self._cut_button.setEnabled(media is not None)
@@ -495,10 +519,15 @@ class SubtitlePanel(QWidget):
         jump = menu.addAction("ここへ移動")
         copy = menu.addAction("文字をコピー")
         menu.addSeparator()
+        place = menu.addAction("テキストとして置く")
+        menu.addSeparator()
         split = menu.addAction("再生ヘッドで分割")
         merge = menu.addAction("次と結合")
         remove = menu.addAction("削除")
         chosen = menu.exec(self._table.viewport().mapToGlobal(position))
+        if chosen is place:
+            self.place_selected_rows()
+            return
 
         if chosen is jump:
             start = self._rows[row][1]
@@ -700,13 +729,65 @@ class SubtitlePanel(QWidget):
             silences = keep_speech(silences, transcript)
         return plan_cuts(self._project, media.id, silences)
 
+    def _template(self) -> tuple[GeneratedSource | Clip, str]:
+        """焼き込みのひな形と、窓に出す説明 タイムラインで選んでいるテキストがあればそれ"""
+        clip = self.template_provider()
+        if clip is not None and clip.source is not None and clip.source.kind == "text":
+            text = str(clip.source.params.get("text", "")).splitlines()
+            head = text[0][:12] if text else ""
+            return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
+        return TEXT.create(**BURN_DEFAULTS), (
+            "見た目: 既定（大きさ 48・下寄せ・縁取り 4） タイムラインでテキストを選んでから"
+            "焼き込むと、そのテキストの見た目を写します"
+        )
+
     def burn(self) -> None:
-        template = TEXT.create(**BURN_DEFAULTS)
-        commands: list[Command] = burn_subtitles(self._project, template)
+        voices = subtitle_voices(self._project)
+        if not voices:
+            self.status_message.emit("焼き込む字幕がありません")
+            return
+        template, note = self._template()
+        labels = [(voice, voice_label(self._project, voice)) for voice in voices]
+        chosen = self.ask_burn(labels, note)
+        if chosen is None:
+            return
+        commands: list[Command] = burn_subtitles(
+            self._project, template, voices=[v for v in voices if v in chosen]
+        )
         if not commands:
             self.status_message.emit("焼き込む字幕がありません")
             return
         self.commands_requested.emit(commands, "字幕を焼き込み")
+
+    def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
+        dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
+        if not dialog.exec():
+            return None
+        return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
+
+    def place_selected_rows(self) -> None:
+        """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
+        media = self._current_media()
+        if media is None:
+            return
+        rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        if not rows:
+            rows = [
+                row for row, (_, start, end) in enumerate(self._rows) if start <= self._frame < end
+            ]
+        segments = {self._rows[row][0] for row in rows if 0 <= row < len(self._rows)}
+        if not segments:
+            self.status_message.emit("置く字幕の行を選んでください")
+            return
+        template, _note = self._template()
+        voice: Voice = (media.id, media.transcript_stream(self._stream))
+        commands: list[Command] = burn_subtitles(
+            self._project, template, voices=[voice], segments=segments
+        )
+        if not commands:
+            self.status_message.emit("選んだ行はタイムラインに出ていません")
+            return
+        self.commands_requested.emit(commands, f"字幕を置く: {len(segments)} 行")
 
     def export_file(self) -> None:
         frame_range = export_range(self._project.timeline)

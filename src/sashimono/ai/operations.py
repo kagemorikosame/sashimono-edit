@@ -44,10 +44,13 @@ from sashimono.core.commands import (
     SplitClip,
     TrimClip,
     UngroupClips,
+    Voice,
+    burn_subtitles,
     insert_generated,
     insert_media,
     insert_scene,
     new_scene,
+    subtitle_voices,
 )
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
@@ -57,6 +60,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     EffectId,
+    GeneratedSource,
     Interpolation,
     MediaId,
     MediaItem,
@@ -1013,6 +1017,41 @@ def _clean_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"changed": changed, "remaining": len(cleaned)}
 
 
+def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕をテキストのクリップとしてタイムラインへ置く（焼き込み） 話し手ごとに別のレイヤー
+
+    前は道具が無く、「字幕をテキストオブジェクトとして書き出して」と頼まれても AI には
+    できなかった 画面の〔焼き込み〕と同じ ``burn_subtitles`` を通す
+    """
+    project = _project(host)
+    voices: list[Voice] | None = None
+    if arguments.get("media_id"):
+        media = _require_media(project, str(arguments["media_id"]))
+        if arguments.get("audio") is not None:
+            voices = [(media.id, media.transcript_stream(_audio_stream(media, arguments)))]
+        else:
+            voices = [v for v in subtitle_voices(project) if v[0] == media.id]
+    raw_segments = arguments.get("segment_ids")
+    segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
+
+    template: GeneratedSource | Clip = TEXT.create(size=48.0, pos_y=-380.0, border_width=4.0)
+    if arguments.get("template_clip_id"):
+        located = project.timeline.locate_clip(ClipId(str(arguments["template_clip_id"])))
+        if located is None:
+            raise ToolError(f"ひな形のクリップが見つかりません: {arguments['template_clip_id']}")
+        clip = located[1]
+        if clip.source is None or clip.source.kind != "text":
+            raise ToolError("ひな形にできるのはテキストのクリップだけです")
+        template = clip
+    commands = burn_subtitles(project, template, voices=voices, segments=segments)
+    if not commands:
+        raise ToolError("置ける字幕がありません（タイムラインに出ている字幕が無い）")
+    host.apply_commands(commands, "字幕を焼き込み")
+    placed = sum(1 for c in commands if isinstance(c, AddClip))
+    tracks = [c.track.name for c in commands if isinstance(c, AddTrack)]
+    return {"placed": placed, "tracks": tracks}
+
+
 def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 
@@ -1678,6 +1717,28 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_clean_subtitles,
+        writes=True,
+    ),
+    Operation(
+        name="place_subtitles",
+        description=(
+            "字幕をテキストオブジェクトとしてタイムラインへ置く（焼き込み）"
+            " 話し手（素材と音声）ごとに別のレイヤーへ入れる 省けば出ている字幕を全部"
+            " 見た目はひな形のテキストのクリップを写す（省けば下寄せ・縁取りの既定）"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("絞り込む素材"),
+                "audio": _integer("絞り込む音声の番号（1 から） media_id と一緒に"),
+                "segment_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "置く字幕の ID（get_subtitles の segment_id） 省けば全部",
+                },
+                "template_clip_id": _string("見た目を写すテキストのクリップ"),
+            }
+        ),
+        handler=_place_subtitles,
         writes=True,
     ),
     Operation(

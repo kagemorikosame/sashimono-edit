@@ -90,6 +90,7 @@ from sashimono.core.io import (
     save_project,
 )
 from sashimono.core.model import (
+    Clip,
     ClipId,
     EffectId,
     GeneratedSource,
@@ -408,6 +409,8 @@ class MainWindow(QMainWindow):
         # 編集をするまで、キーフレームのあるクリップを選んでも曲線を引けない
         self._graph.set_project(self.view_project)
         self._subtitles = SubtitlePanel(project, self._analyzer, self)
+        # 焼き込みのひな形は、タイムラインで選んでいるテキストのクリップ
+        self._subtitles.template_provider = self._selected_text_clip
         self._chat = ChatPanel(self, self)
         self._playback = PlaybackController(project, self)
 
@@ -1427,6 +1430,15 @@ class MainWindow(QMainWindow):
             if selected is not None:
                 self._subtitles.select_media(selected)
         self._subtitles.transcribe()
+
+    def _selected_text_clip(self) -> Clip | None:
+        """タイムラインで選んでいるテキストのクリップ 字幕の焼き込みの見た目のひな形にする"""
+        primary = self._timeline.selected_clip
+        located = self.view_project.timeline.locate_clip(primary) if primary else None
+        if located is None:
+            return None
+        clip = located[1]
+        return clip if clip.source is not None and clip.source.kind == "text" else None
 
     def _selected_sound(self) -> tuple[MediaId, int | None] | None:
         """タイムラインで選んだクリップの、音のある素材と鳴らす音声ストリーム"""
