@@ -13,7 +13,8 @@ import bisect
 import math
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Hashable, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 
 import numpy as np
@@ -39,6 +40,7 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate, format_timecode
 from sashimono.effects.sources import source_registry
 from sashimono.engine.audio import Waveform
+from sashimono.engine.audio.shape import shape_envelope, shape_key
 from sashimono.engine.cache import Filmstrip
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
@@ -347,7 +349,10 @@ def draw_clip(
         if picture_rect is not None and filmstrip is not None:
             _draw_filmstrip(painter, picture_rect, clip, layout, rate, filmstrip)
         if sound_rect is not None and waveform is not None:
-            _draw_waveform(painter, sound_rect, clip, layout, rate, waveform)
+            # 音を鳴らすトラックの音量も波形に映す 映像トラックの音量は鳴らす所でも使わない
+            heard = band.track.kind is not TrackKind.VIDEO
+            gain = 10.0 ** (band.track.volume_db / 20.0) if heard else 1.0
+            _draw_waveform(painter, sound_rect, clip, layout, rate, waveform, track_gain=gain)
 
     _draw_clip_label(
         painter,
@@ -634,8 +639,10 @@ def _draw_waveform(
     layout: TimelineLayout,
     rate: FrameRate,
     waveform: Waveform,
+    *,
+    track_gain: float = 1.0,
 ) -> None:
-    """クリップの上に波形を描く
+    """クリップの上に波形を描く 音量やリバーブなどの効き方を大まかに映す（:mod:`shape`）
 
     1 ピクセル 1 本の縦線を塗った画像を作り、貯めておいて貼る 同じ倍率なら、
     再生ヘッドが動くたびの描き直しでもスクロールでも、束ねる所から作り直さずに済む
@@ -668,6 +675,7 @@ def _draw_waveform(
             int(end_seconds * waveform.sample_rate),
             total_columns,
             height,
+            _Shaping(clip, rate, 0.0, float(clip.duration), track_gain),
         )
         if image is None:
             return
@@ -694,6 +702,7 @@ def _draw_waveform(
         int(end_seconds * waveform.sample_rate),
         rect.width(),
         height,
+        _Shaping(clip, rate, float(start_frame), float(end_frame), track_gain),
     )
     if image is not None:
         painter.drawImage(rect.topLeft(), image)
@@ -708,6 +717,21 @@ WAVEFORM_IMAGE_MAX_COLUMNS = 8192
 WAVEFORM_CACHE_BYTES = 32 * 1024 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class _Shaping:
+    """波形に映す効き方（:func:`shape_envelope`） 列の両端はクリップの頭から数えたフレーム"""
+
+    clip: Clip
+    rate: FrameRate
+    first: float
+    last: float
+    track_gain: float
+
+    def key(self) -> Hashable:
+        found = shape_key(self.clip, self.track_gain)
+        return None if found is None else (found, self.first, self.last)
+
+
 class _WaveformImages:
     """作った波形の画像を、古く使った物から捨てながら貯める
 
@@ -719,14 +743,22 @@ class _WaveformImages:
         self._budget = budget
         self._used = 0
         self._entries: OrderedDict[
-            tuple[int, int, int, int, int, int], tuple[weakref.ref[Waveform], QImage]
+            tuple[int, int, int, int, int, int, Hashable], tuple[weakref.ref[Waveform], QImage]
         ] = OrderedDict()
 
     def get(
-        self, waveform: Waveform, start: int, end: int, columns: int, height: int
+        self,
+        waveform: Waveform,
+        start: int,
+        end: int,
+        columns: int,
+        height: int,
+        shaping: _Shaping | None = None,
     ) -> QImage | None:
         # 色も鍵に入れる 見た目を切り替えたのに前の色の画像が残らないように
-        key = (id(waveform), start, end, columns, height, Colors.WAVEFORM.rgba())
+        # 効き方も入れる 音量を変えたのに前の大きさの画像が残らないように
+        shaped = shaping.key() if shaping is not None else None
+        key = (id(waveform), start, end, columns, height, Colors.WAVEFORM.rgba(), shaped)
         entry = self._entries.get(key)
         # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
         if entry is not None and entry[0]() is waveform:
@@ -739,7 +771,18 @@ class _WaveformImages:
         envelope = waveform.envelope(start, end, columns)
         # チャンネルをまとめて 1 本の波形にする ステレオを上下に分けるのは
         # トラックを高くしたときの表示として P2 で入れる
-        image = waveform_image(envelope[:, :, 0].min(axis=1), envelope[:, :, 1].max(axis=1), height)
+        low, high = envelope[:, :, 0].min(axis=1), envelope[:, :, 1].max(axis=1)
+        if shaping is not None and shaped is not None:
+            low, high = shape_envelope(
+                low,
+                high,
+                shaping.clip,
+                shaping.rate,
+                shaping.first,
+                shaping.last,
+                track_gain=shaping.track_gain,
+            )
+        image = waveform_image(low, high, height)
         # 1 枚で上限を超える画像（高いトラックの幅の広いクリップ）は貯めずに返す
         # 貯めると、ほかを全部捨てても上限を超えたまま残る
         if image.sizeInBytes() > self._budget:
@@ -754,7 +797,7 @@ class _WaveformImages:
         self._entries.clear()
         self._used = 0
 
-    def _drop(self, key: tuple[int, int, int, int, int, int]) -> None:
+    def _drop(self, key: tuple[int, int, int, int, int, int, Hashable]) -> None:
         _, image = self._entries.pop(key)
         self._used -= image.sizeInBytes()
 

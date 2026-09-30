@@ -268,15 +268,16 @@ def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
         _frame_to_sample(clip.timeline_start, rate, sample_rate) + offset, rate, sample_rate
     )
     seconds = 0.0
-    for definition, effect in _audio_stack(clip):
+    for definition, effect in audio_stack(clip):
         if definition.audio_history is not None:
             seconds += definition.audio_history(
-                _values(definition, effect, frame - clip.timeline_start)
+                effect_values(definition, effect, frame - clip.timeline_start)
             )
     return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
 
 
-def _audio_stack(clip: Clip) -> list[tuple[EffectDefinition, Effect]]:
+def audio_stack(clip: Clip) -> list[tuple[EffectDefinition, Effect]]:
+    """クリップに積んだ、効いている音のエフェクト 積んだ順"""
     return [
         (definition, effect)
         for effect in clip.effects
@@ -286,7 +287,8 @@ def _audio_stack(clip: Clip) -> list[tuple[EffectDefinition, Effect]]:
     ]
 
 
-def _values(definition: EffectDefinition, effect: Effect, frame: int) -> dict[str, float]:
+def effect_values(definition: EffectDefinition, effect: Effect, frame: int) -> dict[str, float]:
+    """音のエフェクトの数の値を ``frame``（クリップの頭から数えた）で解く 鳴らす所と波形で共通"""
     return {
         spec.name: _as_number(spec, effect.params.get(spec.name), frame)
         for spec in definition.parameters
@@ -318,7 +320,7 @@ def _apply_effects(
     次へ進む（エフェクトの順に掛ける） 前の音を読むエフェクトが前のエフェクトを
     通した音を読めるように
     """
-    stack = _audio_stack(clip)
+    stack = audio_stack(clip)
     if not stack:
         return samples
 
@@ -334,7 +336,7 @@ def _apply_effects(
         if definition.audio_history is not None:
             current = definition.audio_process(
                 current,
-                _values(definition, effect, kept_frame),
+                effect_values(definition, effect, kept_frame),
                 AudioContext(offset=offset, sample_rate=sample_rate, duration=duration),
             )
             continue
@@ -342,7 +344,7 @@ def _apply_effects(
         for begin, end, frame in spans:
             out[begin:end] = definition.audio_process(
                 current[begin:end],
-                _values(definition, effect, frame),
+                effect_values(definition, effect, frame),
                 AudioContext(offset=offset + begin, sample_rate=sample_rate, duration=duration),
             )
         current = out
