@@ -61,28 +61,29 @@ class TestReading:
         assert result["duration_frames"] == 300
 
     def test_list_media_exposes_ids(self, host: FakeHost) -> None:
-        rows = run(host, "list_media")
+        rows = run(host, "list_media")["media"]
         assert len(rows) == 1
         assert rows[0]["subtitle_count"] == 3
         assert rows[0]["has_audio"] is True
 
     def test_list_clips_reports_positions(self, host: FakeHost) -> None:
-        rows = run(host, "list_clips")
+        rows = run(host, "list_clips")["clips"]
         assert rows[0]["start"] == 0
         assert rows[0]["duration"] == 300
         assert rows[0]["start_timecode"] == "00:00:00:00"
 
     def test_list_clips_can_filter_by_track(self, host: FakeHost) -> None:
-        assert run(host, "list_clips", track_id="そんなものは無い") == []
+        assert run(host, "list_clips", track_id="そんなものは無い")["clips"] == []
 
     def test_get_subtitles_returns_timeline_positions(self, host: FakeHost) -> None:
-        rows = run(host, "get_subtitles")
+        rows = run(host, "get_subtitles")["subtitles"]
         # 素材の 1 秒は 30 フレーム目 AI が見るのは編集後の位置
         assert [row["start"] for row in rows] == [30, 120, 210]
         assert rows[0]["text"] == "今日は"
 
     def test_list_effects_includes_ranges(self, host: FakeHost) -> None:
-        rows = run(host, "list_effects")
+        # パラメータまでは kind を渡したときだけ（全部並べると返事が長すぎる）
+        rows = run(host, "list_effects", kind="blur")["effects"]
         blur = next(row for row in rows if row["kind"] == "blur")
         radius = next(p for p in blur["parameters"] if p["name"] == "radius")
         assert radius["type"] == "number"
@@ -326,7 +327,7 @@ class TestSubtitles:
             audio_streams=(stream, _replace(stream, index=stream.index + 1)),
         )
         host.document.execute(AddMedia(two))
-        listed = {m["media_id"]: m for m in run(host, "list_media")}
+        listed = {m["media_id"]: m for m in run(host, "list_media")["media"]}
         assert listed["two-voices"]["audio_count"] == 2
         run(host, "transcribe", media_id="two-voices", audio=2)
         assert host.transcribed_stream == stream.index + 1
@@ -475,7 +476,7 @@ class TestParameterCoercion:
 
     def test_the_colour_format_is_advertised(self, host: FakeHost) -> None:
         # 形式を伝えておかないと、AI は色名や rgb() を送ってくる
-        rows = run(host, "list_effects")
+        rows = run(host, "list_effects", kind="text")["effects"]
         text = next(row for row in rows if row["kind"] == "text")
         color = next(p for p in text["parameters"] if p["name"] == "color")
         assert "#RRGGBB" in color["format"]

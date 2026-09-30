@@ -45,7 +45,7 @@ def _call(host: FakeHost, tool: str, /, **arguments: Any) -> Any:
 
 
 def _clips(host: FakeHost) -> list[dict[str, Any]]:
-    clips: list[dict[str, Any]] = _call(host, "list_clips")
+    clips: list[dict[str, Any]] = _call(host, "list_clips")["clips"]
     return clips
 
 

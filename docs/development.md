@@ -409,6 +409,17 @@ CUDA ランタイム無しで入れた後も「GPU を使う」に印を付け�
 ID は振り直す）、無ければ既定 どちらで置くかを窓に書く AI の道具は `place_subtitles`
 どれも 1 回の取り消しで全部戻る
 
+AI の道具の返事は打ち切られない長さに収める 配布版の Claude Code は MCP の道具の返事を
+25000 トークン（`MAX_MCP_OUTPUT_TOKENS` の既定）で打ち切ってファイルへ退け、アシスタントには
+ファイルを読む道具を渡していないので続きが読めない（字幕 328 行の get_subtitles がそうなった）
+一覧の道具（get_subtitles・list_clips・list_media・list_tracks・list_effects）は `offset` と
+`limit` で切り、JSON で 12000 字（`MAX_RESULT_CHARS` 日本語 1 文字 1〜2 トークンで上限の半分
+ほど）を超えないよう件数を減らし、続きがあれば `next_offset` と書き方を添える 字幕は言葉・
+時刻・素材と音声で絞れ、`compact` で行の番号・時刻・本文だけを返す list_effects は `kind` を
+渡したときだけパラメータまで返す `replace_subtitle_text` は「誤 → 正」の組をまとめて当て、
+字幕と、字幕から置いたテキスト（本文が直す前の字幕 1 枚と同じテキストのクリップ）を 1 回の
+取り消しで直し、置き換えた数と当たらなかった組を返す
+
 AI の道具 `transcribe` も `audio`（1 から タイムラインの「音声 N」と同じ番号）で選べる
 省くと 1 本目 本数は `list_media` の `audio_count`
 

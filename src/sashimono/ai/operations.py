@@ -54,6 +54,7 @@ from sashimono.core.commands import (
 )
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.io.serialize import json_text
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
     AnimatedValue,
@@ -247,6 +248,57 @@ def _clip_ids_schema() -> dict[str, Any]:
 # --- 読み取り ---
 
 
+#: 1 回の返事の長さの上限（JSON の文字数） 配布版の Claude Code（SDK が同梱する claude.exe）は
+#: MCP の道具の返事を 25000 トークン（``MAX_MCP_OUTPUT_TOKENS`` の既定）で打ち切り、残りを
+#: ファイルへ退ける アシスタントにはファイルを読む道具を渡していないので、退けた分は読めない
+#: （字幕 328 行の get_subtitles がそうなり、誤植を直せなかった 利用者の画面） 日本語は
+#: 1 文字が 1〜2 トークンになるので、字数で 12000 に収めれば 25000 トークンの半分ほどで済む
+MAX_RESULT_CHARS = 12000
+#: 一覧の既定の件数と上限 上限まで頼まれても :data:`MAX_RESULT_CHARS` で切る
+DEFAULT_PAGE = 50
+MAX_PAGE = 300
+
+
+def _paged(rows: list[Any], arguments: dict[str, Any], *, name: str = "items") -> dict[str, Any]:
+    """一覧を ``offset`` と ``limit`` で切り出す 返事が長すぎれば件数を減らす
+
+    続きがあれば ``next_offset`` と、次に呼ぶときの書き方を添える 無いときは添えない
+    （添えると、もう読み終えたのに続きを探しに行く）
+    """
+    total = len(rows)
+    try:
+        offset = max(0, int(arguments.get("offset", 0) or 0))
+        limit = int(arguments.get("limit", DEFAULT_PAGE) or DEFAULT_PAGE)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("offset と limit は整数で渡してください") from exc
+    limit = min(max(limit, 1), MAX_PAGE)
+    chosen = rows[offset : offset + limit]
+    while len(chosen) > 1 and len(json_text(chosen)) > MAX_RESULT_CHARS:
+        # 1 件ずつ減らすと長い一覧で遅い 4 分の 3 ずつ減らしてから残りを詰める
+        chosen = chosen[: max(1, len(chosen) * 3 // 4)]
+    end = offset + len(chosen)
+    result: dict[str, Any] = {name: chosen, "total": total, "offset": offset, "count": len(chosen)}
+    if end < total:
+        result["next_offset"] = end
+        result["note"] = f"続きがあります 次は offset={end} で呼んでください（全 {total} 件）"
+    return result
+
+
+def _paging() -> dict[str, Any]:
+    """一覧の道具の引数 何件目から・いくつ"""
+    return {
+        "offset": _integer("何件目から（0 から 続きは返事の next_offset）"),
+        "limit": _integer(f"いくつ（既定 {DEFAULT_PAGE} 返事が長ければ少なく返す）"),
+    }
+
+
+#: 一覧の道具の説明に足す文
+PAGING_NOTE = (
+    " 返事は長くなりすぎないよう切って返す 続きがあれば next_offset が付くので、"
+    "offset にその値を渡して続きを読む 多いときは絞り込みの引数で先に絞る"
+)
+
+
 def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     project = _project(host)
@@ -272,9 +324,9 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
     project = _project(host)
-    return [
+    wanted = str(arguments.get("contains") or "")
+    rows = [
         {
             "media_id": str(item.id),
             "name": item.name,
@@ -292,12 +344,13 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             },
         }
         for item in project.media
+        if not wanted or wanted in item.name
     ]
+    return _paged(rows, arguments, name="media")
 
 
 def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
-    return [
+    rows = [
         {
             "track_id": str(track.id),
             "kind": track.kind.value,
@@ -310,16 +363,20 @@ def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
         }
         for track in _project(host).timeline.tracks
     ]
+    return _paged(rows, arguments, name="tracks")
 
 
 def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     wanted = str(arguments.get("track_id") or "")
+    low, high = _frame_window(project, arguments)
     clips = []
     for track in project.timeline.tracks:
         if wanted and str(track.id) != wanted:
             continue
         for clip in track.clips:
+            if clip.timeline_end <= low or (high is not None and clip.timeline_start >= high):
+                continue
             media = project.find_media(clip.media_id) if clip.media_id is not None else None
             # 混合トラックのクリップは絵と音を 1 本で出すので、どちらを出すかも見せる
             # ほかの種類では読まない項目なので、出すと AI が効かない値を触りに行く
@@ -360,7 +417,20 @@ def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
                     ],
                 }
             )
-    return clips
+    return _paged(clips, arguments, name="clips")
+
+
+def _frame_window(project: Project, arguments: dict[str, Any]) -> tuple[int, int | None]:
+    """``from_seconds`` ``to_seconds``（タイムラインの秒）をフレームの範囲へ 省けば全体"""
+    fps = float(project.rate.fps)
+    try:
+        low = arguments.get("from_seconds")
+        high = arguments.get("to_seconds")
+        start = int(float(low) * fps) if low is not None else 0
+        end = int(float(high) * fps) + 1 if high is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ToolError("from_seconds と to_seconds は秒の数で渡してください") from exc
+    return max(0, start), end
 
 
 def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -376,27 +446,34 @@ def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _list_effects(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del host, arguments
-    definitions = []
-    for definition in registry.all():
-        definitions.append(
-            {
-                "kind": definition.kind,
-                "label": definition.label,
-                "category": definition.category,
-                "parameters": [_describe_spec(spec) for spec in definition.parameters],
-            }
-        )
-    definitions.extend(
-        {
-            "kind": source.kind,
-            "label": source.label,
-            "category": "オブジェクト",
-            "parameters": [_describe_spec(spec) for spec in source.parameters],
-        }
-        for source in (TEXT, SHAPE)
-    )
-    return definitions
+    """エフェクトの一覧 kind を渡したときだけパラメータまで出す
+
+    全部のパラメータを並べると、読み込んだ AviUtl のスクリプトまで含めて返事が長すぎ、
+    打ち切られる まず名前で探し、使うエフェクトだけ詳しく読む
+    """
+    del host
+    wanted_kind = str(arguments.get("kind") or "")
+    category = str(arguments.get("category") or "")
+    contains = str(arguments.get("contains") or "")
+    entries: list[tuple[str, str, str, tuple[Any, ...]]] = [
+        (d.kind, d.label, d.category, d.parameters) for d in registry.all()
+    ]
+    entries += [(s.kind, s.label, "オブジェクト", s.parameters) for s in (TEXT, SHAPE)]
+    rows: list[dict[str, Any]] = []
+    for kind, label, group, parameters in entries:
+        if wanted_kind and kind != wanted_kind:
+            continue
+        if category and group != category:
+            continue
+        if contains and contains not in kind and contains not in label:
+            continue
+        row: dict[str, Any] = {"kind": kind, "label": label, "category": group}
+        if wanted_kind:
+            row["parameters"] = [_describe_spec(spec) for spec in parameters]
+        else:
+            row["parameter_count"] = len(parameters)
+        rows.append(row)
+    return _paged(rows, arguments, name="effects")
 
 
 def _describe_spec(spec: object) -> dict[str, Any]:
@@ -448,11 +525,23 @@ def _audio_number(media: MediaItem | None, stream: int | None) -> int:
 
 
 def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """タイムラインに出る字幕 絞り込み（素材・音声・時刻・言葉）と、続きを辿る切り出し
+
+    ``compact`` なら行の番号・時刻・本文だけ（誤植を探す軽い形） 行の番号は絞り込んだ
+    後の通し番号で、offset に使える
+    """
     project = _project(host)
     wanted = str(arguments.get("media_id") or "")
     wanted_audio = arguments.get("audio")
+    contains = str(arguments.get("contains") or "")
+    compact = bool(arguments.get("compact", False))
+    low, high = _frame_window(project, arguments)
     rows = []
     for subtitle in project_timeline(project):
+        if subtitle.end_frame <= low or (high is not None and subtitle.start_frame >= high):
+            continue
+        if contains and contains not in subtitle.segment.text:
+            continue
         located = project.timeline.locate_clip(subtitle.clip_id)
         media_id = located[1].media_id if located is not None else None
         if wanted and str(media_id) != wanted:
@@ -477,7 +566,94 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "source_start_seconds": round(float(subtitle.segment.start), 3),
             }
         )
-    return rows
+    if compact:
+        rows = [
+            {"n": index, "time": row["start_timecode"], "text": row["text"]}
+            for index, row in enumerate(rows)
+        ]
+    return _paged(rows, arguments, name="subtitles")
+
+
+def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキストの両方
+
+    字幕から置いたテキスト（焼き込み）は、本文が置き換える前の字幕 1 枚と同じテキストの
+    クリップ 字幕だけを直すと、焼き込んだ文字に誤植が残る 1 回の取り消しで全部戻る
+    """
+    pairs_raw = arguments.get("pairs") or []
+    if not isinstance(pairs_raw, list) or not pairs_raw:
+        raise ToolError('pairs に [{"from": 誤, "to": 正}, …] を渡してください')
+    pairs: list[tuple[str, str]] = []
+    for entry in pairs_raw:
+        if not isinstance(entry, dict) or not str(entry.get("from") or ""):
+            raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は空にできません）')
+        pairs.append((str(entry["from"]), str(entry.get("to") or "")))
+
+    project = _project(host)
+    targets: list[tuple[MediaItem, int]] = []
+    if arguments.get("media_id"):
+        media = _require_media(project, str(arguments["media_id"]))
+        streams = (
+            [media.transcript_stream(_audio_stream(media, arguments))]
+            if arguments.get("audio") is not None
+            else [index for index, _ in media.transcripts]
+        )
+        targets = [(media, stream) for stream in streams]
+    else:
+        targets = [(item, index) for item in project.media for index, _ in item.transcripts]
+
+    counts = [0] * len(pairs)
+
+    def fixed(text: str) -> str:
+        for number, (before, after) in enumerate(pairs):
+            found = text.count(before)
+            if found:
+                counts[number] += found
+                text = text.replace(before, after)
+        return text
+
+    commands: list[Command] = []
+    renamed: dict[str, str] = {}
+    for media, stream in targets:
+        transcript = media.transcript_for(stream)
+        if transcript is None:
+            continue
+        segments = []
+        changed = False
+        for segment in transcript.segments:
+            text = fixed(segment.text)
+            if text != segment.text:
+                renamed[segment.text] = text
+                segment = segment.with_text(text)
+                changed = True
+            segments.append(segment)
+        if changed:
+            updated = replace(transcript, segments=tuple(segments))
+            commands.append(SetTranscript(media.id, updated, stream=stream))
+    # 焼き込んだテキスト 本文が直した字幕の前の本文と同じテキストのクリップ
+    burned = 0
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.source is None or clip.source.kind != "text":
+                continue
+            text = str(clip.source.params.get("text", ""))
+            if text in renamed:
+                path = ParamPath.of_source(clip.id, "text")
+                commands.append(SetParam(path, renamed[text]))
+                burned += 1
+    if commands:
+        host.apply_commands(commands, "字幕の誤植を直す")
+    return {
+        "replaced": sum(counts),
+        "per_pair": [
+            {"from": before, "to": after, "count": count}
+            for (before, after), count in zip(pairs, counts, strict=True)
+        ],
+        "unmatched": [
+            before for (before, _), count in zip(pairs, counts, strict=True) if not count
+        ],
+        "burned_text_clips": burned,
+    }
 
 
 def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -1244,20 +1420,27 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_media",
-        description="メディアプールの素材を一覧する media_id はここで得る",
-        schema=_schema({}),
+        description="メディアプールの素材を一覧する media_id はここで得る" + PAGING_NOTE,
+        schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
     ),
     Operation(
         name="list_tracks",
-        description="タイムラインのトラックを一覧する",
-        schema=_schema({}),
+        description="タイムラインのトラックを一覧する" + PAGING_NOTE,
+        schema=_schema(_paging()),
         handler=_list_tracks,
     ),
     Operation(
         name="list_clips",
-        description="クリップを一覧する track_id を省くと全トラックが対象",
-        schema=_schema({"track_id": _string("絞り込むトラック")}),
+        description="クリップを一覧する track_id を省くと全トラックが対象" + PAGING_NOTE,
+        schema=_schema(
+            {
+                "track_id": _string("絞り込むトラック"),
+                "from_seconds": _number("この秒より後に掛かるクリップだけ（タイムラインの秒）"),
+                "to_seconds": _number("この秒より前に掛かるクリップだけ"),
+                **_paging(),
+            }
+        ),
         handler=_list_clips,
     ),
     Operation(
@@ -1268,17 +1451,36 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_effects",
-        description="使えるエフェクトと生成オブジェクト、そのパラメータ名と範囲",
-        schema=_schema({}),
+        description=(
+            "使えるエフェクトと生成オブジェクトの一覧 パラメータ名と範囲は kind を渡したときだけ"
+            " 返す（全部を並べると長すぎる）" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "kind": _string("詳しく見るエフェクトの種類（パラメータまで返す）"),
+                "category": _string("分類で絞る（色・ぼかし・音 など）"),
+                "contains": _string("種類か名前に含む言葉で絞る"),
+                **_paging(),
+            }
+        ),
         handler=_list_effects,
     ),
     Operation(
         name="get_subtitles",
-        description="タイムラインに出る字幕を、表示位置つきで一覧する",
+        description=(
+            "タイムラインに出る字幕を、表示位置つきで一覧する 誤植を探すときは compact で"
+            "行の番号・時刻・本文だけを読み、contains（言葉）や時刻で絞る 直すときは"
+            " replace_subtitle_text で「誤 → 正」をまとめて渡す" + PAGING_NOTE
+        ),
         schema=_schema(
             {
                 "media_id": _string("絞り込む素材"),
                 "audio": _integer("絞り込む音声の番号（1 から）"),
+                "contains": _string("本文に含む言葉で絞る（部分一致）"),
+                "from_seconds": _number("この秒より後に出る字幕だけ（タイムラインの秒）"),
+                "to_seconds": _number("この秒より前に出る字幕だけ"),
+                "compact": _boolean("行の番号・時刻・本文だけを返す（軽い一覧）"),
+                **_paging(),
             }
         ),
         handler=_get_subtitles,
@@ -1698,6 +1900,31 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id", "segment_id", "text"],
         ),
         handler=_set_subtitle_text,
+        writes=True,
+    ),
+    Operation(
+        name="replace_subtitle_text",
+        description=(
+            "字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキスト"
+            "（焼き込み）の両方を直し、1 回の取り消しで戻る 置き換えた数と、当たらなかった組を返す"
+        ),
+        schema=_schema(
+            {
+                "pairs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"from": {"type": "string"}, "to": {"type": "string"}},
+                        "required": ["from", "to"],
+                    },
+                    "description": "置き換える組 [{from: 誤, to: 正}, …] 前から順に当てる",
+                },
+                "media_id": _string("絞り込む素材（省けば全部）"),
+                "audio": _integer("絞り込む音声の番号（1 から media_id と一緒に）"),
+            },
+            ["pairs"],
+        ),
+        handler=_replace_subtitle_text,
         writes=True,
     ),
     Operation(
