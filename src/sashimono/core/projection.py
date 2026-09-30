@@ -20,12 +20,24 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     Timeline,
+    Track,
     TrackId,
     TranscriptSegment,
+    heard_stream,
 )
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
-__all__ = ["ProjectedSubtitle", "project_clip", "project_timeline"]
+__all__ = ["ProjectedSubtitle", "project_clip", "project_timeline", "subtitle_stream"]
+
+
+def subtitle_stream(project: Project, track: Track, clip: Clip) -> int | None:
+    """クリップに出す字幕の音声ストリーム 音を鳴らすクリップはその音、絵だけのクリップは 1 本目
+
+    絵だけのクリップ（分けて置いた映像）は前と同じく 1 本目の字幕を出す
+    """
+    if not project.plays_sound(track, clip):
+        return None
+    return heard_stream(track, clip)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,14 +60,20 @@ class ProjectedSubtitle:
 
 
 def project_clip(
-    clip: Clip, media: MediaItem, rate: FrameRate, track_id: TrackId
+    clip: Clip,
+    media: MediaItem,
+    rate: FrameRate,
+    track_id: TrackId,
+    stream: int | None = None,
 ) -> Iterator[ProjectedSubtitle]:
     """1 つのクリップに現れる字幕を返す
 
     クリップが使っているソース範囲に重なるセグメントだけが対象で、はみ出した分は
-    クリップの端で切り詰められる
+    クリップの端で切り詰められる ``stream`` はクリップが鳴らす音声ストリーム
+    （``None`` と素材に無い番号は 1 本目） 音ごとに分けて置いたクリップには、その音の
+    字幕だけが出る
     """
-    transcript = media.transcript
+    transcript = media.transcript_for(stream)
     if transcript is None:
         return
 
@@ -119,9 +137,11 @@ def _project_tracks(
             if clip.media_id is None:
                 continue
             media = project.find_media(clip.media_id)
-            if media is None or media.transcript is None:
+            if media is None or not media.transcripts:
                 continue
-            yield from project_clip(clip, media, project.rate, track.id)
+            yield from project_clip(
+                clip, media, project.rate, track.id, subtitle_stream(project, track, clip)
+            )
 
 
 def _place_scene(

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -84,6 +86,10 @@ class TranscribeDialog(QDialog):
         self._service = service
         self._job: Job | None = None
         self.transcript: Transcript | None = None
+        #: 起こした音声ストリームの番号 呼ぶ側はこの音の字幕へ取り込む
+        self.chosen_stream: int | None = None
+        #: 既に字幕がある音を起こし直すときに、置き換えてよいかを尋ねる 試験で差し替える
+        self.confirm_replace: Callable[[str], bool] = self._ask_replace
         #: 起こせたが知らせておくこと（GPU の道具が読めず CPU で起こした など） 窓を閉じた
         #: 後に呼ぶ側が出す
         self.notice = ""
@@ -279,7 +285,27 @@ class TranscribeDialog(QDialog):
 
     # --- 起こし ---
 
+    def _ask_replace(self, name: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "字幕起こし",
+            f"{name} には字幕があります 起こした結果で置き換えますか"
+            "（直した字幕も置き換わります 取り消しで戻せます）",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _start_transcribe(self) -> None:
+        stream = self._stream.currentData()
+        if self._media.transcript_for(stream) is not None:
+            number = max(0, self._stream.currentIndex()) + 1
+            name = (
+                f"{self._media.name} の音声 {number}"
+                if len(self._media.audio_streams) > 1
+                else self._media.name
+            )
+            if not self.confirm_replace(name):
+                return
+        self.chosen_stream = stream
         options = TranscribeOptions(
             model=str(self._model.currentData()),
             language=self._language.currentData(),
@@ -289,14 +315,19 @@ class TranscribeDialog(QDialog):
             initial_prompt=self._prompt.text().strip(),
             audio_stream=self._stream.currentData(),
         )
-        try:
-            self._job = self._service.start(self._media.id, self._media.path, options)
-        except RuntimeError as exc:
-            self._status.setText(str(exc))
-            return
+        # 走っている起こし（AI から頼んだ物など）があれば順番待ちに入る 同時には走らせない
+        waiting = self._service.busy
+        self._job = self._service.start(self._media.id, self._media.path, options)
 
         self._progress.setRange(0, 1000)
-        self._set_busy(True, message="起こしています 初回はモデルの取得に時間がかかります")
+        self._set_busy(
+            True,
+            message=(
+                "順番待ちです 前の起こしが終わると始まります"
+                if waiting
+                else "起こしています 初回はモデルの取得に時間がかかります"
+            ),
+        )
         self._timer.start()
 
     # --- ワーカーの見張り ---

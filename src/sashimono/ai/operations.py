@@ -68,7 +68,7 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
 )
-from sashimono.core.projection import project_timeline
+from sashimono.core.projection import project_timeline, subtitle_stream
 from sashimono.core.timebase import format_timecode
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
@@ -281,6 +281,11 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             # 音声が何本もある素材（ゲームの音とマイクの声など） transcribe の audio で選ぶ
             "audio_count": len(item.audio_streams),
             "subtitle_count": len(item.transcript) if item.transcript is not None else 0,
+            # 字幕は音声ごとに別 音声の番号（1 から）ごとの字幕の数
+            "subtitle_counts": {
+                str(number): len(item.transcript_for(stream.index) or ())
+                for number, stream in enumerate(item.audio_streams, start=1)
+            },
         }
         for item in project.media
     ]
@@ -410,19 +415,57 @@ def _describe_spec(spec: object) -> dict[str, Any]:
     return described
 
 
+def _audio_stream(media: MediaItem, arguments: dict[str, Any]) -> int | None:
+    """引数 ``audio``（1 から数えた音声の番号）を音声ストリームの番号へ 省けば ``None``（1 本目）
+
+    番号はタイムラインの札（音声 N）と同じく 1 から数える ffprobe の番号は映像を含み、
+    AI が素材ごとに数え直すことになる
+    """
+    if arguments.get("audio") is None:
+        return None
+    try:
+        number = int(arguments["audio"])
+    except (TypeError, ValueError) as exc:
+        raise ToolError("audio は 1 から数えた音声の番号です") from exc
+    if not 1 <= number <= len(media.audio_streams):
+        raise ToolError(
+            f"{media.name} の音声は {len(media.audio_streams)} 本です（audio は 1 から）"
+        )
+    return media.audio_streams[number - 1].index
+
+
+def _audio_number(media: MediaItem | None, stream: int | None) -> int:
+    """音声ストリームの番号を 1 から数えた番号へ（:func:`_audio_stream` の逆）"""
+    if media is None:
+        return 1
+    key = media.transcript_stream(stream)
+    known = [s.index for s in media.audio_streams]
+    return known.index(key) + 1 if key in known else 1
+
+
 def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     wanted = str(arguments.get("media_id") or "")
+    wanted_audio = arguments.get("audio")
     rows = []
     for subtitle in project_timeline(project):
         located = project.timeline.locate_clip(subtitle.clip_id)
         media_id = located[1].media_id if located is not None else None
         if wanted and str(media_id) != wanted:
             continue
+        media = project.find_media(media_id) if media_id is not None else None
+        audio = _audio_number(
+            media,
+            subtitle_stream(project, located[0], located[1]) if located is not None else None,
+        )
+        if wanted_audio is not None and audio != int(wanted_audio):
+            continue
         rows.append(
             {
                 "segment_id": str(subtitle.segment.id),
                 "media_id": str(media_id) if media_id is not None else None,
+                # 字幕は音声ごとに別 set_subtitle_text と clean_subtitles へ同じ番号を渡す
+                "audio": audio,
                 "text": subtitle.segment.text,
                 "start": subtitle.start_frame,
                 "end": subtitle.end_frame,
@@ -938,7 +981,10 @@ def _set_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     segment_id = str(arguments.get("segment_id", ""))
     text = str(arguments.get("text", ""))
-    host.apply_commands([SetSegmentText(media.id, SegmentId(segment_id), text)], "字幕を編集")
+    stream = _audio_stream(media, arguments)
+    host.apply_commands(
+        [SetSegmentText(media.id, SegmentId(segment_id), text, stream=stream)], "字幕を編集"
+    )
     return {"segment_id": segment_id, "text": text}
 
 
@@ -947,7 +993,9 @@ def _clean_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
 
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
-    if media.transcript is None:
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None:
         raise ToolError(f"{media.name} にはまだ字幕がありません")
 
     options = CleanupOptions(
@@ -955,13 +1003,13 @@ def _clean_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         max_lines=int(arguments.get("max_lines", 2)),
         punctuation=str(arguments.get("punctuation", "keep")),
     )
-    cleaned = clean_transcript(media.transcript, options)
+    cleaned = clean_transcript(transcript, options)
     changed = sum(
         1
-        for before, after in zip(media.transcript.segments, cleaned.segments, strict=False)
+        for before, after in zip(transcript.segments, cleaned.segments, strict=False)
         if before.text != after.text
     )
-    host.apply_commands([SetTranscript(media.id, cleaned)], "字幕を整形")
+    host.apply_commands([SetTranscript(media.id, cleaned, stream=stream)], "字幕を整形")
     return {"changed": changed, "remaining": len(cleaned)}
 
 
@@ -970,7 +1018,8 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
 
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
-    waveform = host.waveform(media)
+    stream = _audio_stream(media, arguments)
+    waveform = host.waveform(media, stream)
     if waveform is None:
         raise ToolError(f"{media.name} の波形解析がまだ終わっていません 少し待ってください")
 
@@ -980,8 +1029,9 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         padding=_seconds(arguments.get("padding", 0.1)),
     )
     silences = detect_silence(waveform, options)
-    if bool(arguments.get("keep_speech", True)) and media.transcript is not None:
-        silences = keep_speech(silences, media.transcript)
+    transcript = media.transcript_for(stream)
+    if bool(arguments.get("keep_speech", True)) and transcript is not None:
+        silences = keep_speech(silences, transcript)
 
     ranges = plan_cuts(project, media.id, silences)
     if not ranges:
@@ -1005,22 +1055,19 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
-    stream: int | None = None
-    if arguments.get("audio") is not None:
-        # 番号はタイムラインの札（音声 N）と同じく 1 から数える ffprobe の番号は映像を含み、
-        # AI が素材ごとに数え直すことになる
-        try:
-            number = int(arguments["audio"])
-        except (TypeError, ValueError) as exc:
-            raise ToolError("audio は 1 から数えた音声の番号です") from exc
-        if not 1 <= number <= len(media.audio_streams):
-            raise ToolError(
-                f"{media.name} の音声は {len(media.audio_streams)} 本です（audio は 1 から）"
-            )
-        stream = media.audio_streams[number - 1].index
-    message = host.start_transcription(
-        media.id, str(arguments.get("model", "large-v3")), audio_stream=stream
-    )
+    stream = _audio_stream(media, arguments)
+    if media.transcript_for(stream) is not None and not bool(arguments.get("replace", False)):
+        # 黙って置き換えると、人が直した字幕まで消える 置き換えるかは頼む側が決める
+        raise ToolError(
+            f"{media.name} の音声 {_audio_number(media, stream)} には字幕があります"
+            " 置き換えるときは replace を true にしてください"
+        )
+    try:
+        message = host.start_transcription(
+            media.id, str(arguments.get("model", "large-v3")), audio_stream=stream
+        )
+    except RuntimeError as exc:
+        raise ToolError(str(exc)) from exc
     return {
         "started": message,
         "next": "しばらく待ってから transcription_status を見てください"
@@ -1189,7 +1236,12 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="get_subtitles",
         description="タイムラインに出る字幕を、表示位置つきで一覧する",
-        schema=_schema({"media_id": _string("絞り込む素材")}),
+        schema=_schema(
+            {
+                "media_id": _string("絞り込む素材"),
+                "audio": _integer("絞り込む音声の番号（1 から）"),
+            }
+        ),
         handler=_get_subtitles,
     ),
     Operation(
@@ -1599,6 +1651,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "media_id": _string("素材"),
                 "segment_id": _string("字幕"),
                 "text": _string("新しい本文"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id", "segment_id", "text"],
         ),
@@ -1614,6 +1670,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "max_line_chars": _integer("1 行の文字数（0 で折り返さない）"),
                 "max_lines": _integer("行数の上限"),
                 "punctuation": _string("keep / space / strip"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id"],
         ),
@@ -1630,6 +1690,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "min_silence": _number("最短の無音（秒、既定 0.5）"),
                 "padding": _number("前後に残す余白（秒、既定 0.1）"),
                 "keep_speech": _boolean("字幕のある区間は切らない（既定 true）"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id"],
         ),
@@ -1647,6 +1711,9 @@ OPERATIONS: tuple[Operation, ...] = (
                     "起こす音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
                     " 音声の本数は list_media の audio_count"
                 ),
+                "replace": _boolean(
+                    "その音声に字幕があるとき置き換える（既定 false 既にあれば断る）"
+                ),
             },
             ["media_id"],
         ),
@@ -1655,7 +1722,10 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="transcription_status",
-        description="走っている字幕起こしの様子を見る",
+        description=(
+            "字幕起こしの様子を見る 走っている物と順番待ちの物を並べる"
+            " 起こしは 1 本ずつ順に走り、終わった物はその素材と音声の字幕へ入る"
+        ),
         schema=_schema({}),
         handler=_transcription_status,
     ),

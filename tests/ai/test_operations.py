@@ -294,9 +294,17 @@ class TestSubtitles:
         with pytest.raises(ToolError, match="字幕がありません"):
             run(host, "clean_subtitles", media_id=str(media.id))
 
+    def test_transcribe_refuses_to_replace_by_default(self, host: FakeHost) -> None:
+        # 黙って起こし直すと、人が直した字幕まで置き換わる 既定は断って理由を返す
+        media = host.document.project.media[0]
+        assert media.transcript is not None
+        with pytest.raises(ToolError, match="replace"):
+            run(host, "transcribe", media_id=str(media.id))
+        assert host.transcription == "起こしは走っていません"
+
     def test_transcribe_hands_back_a_next_step(self, host: FakeHost) -> None:
         media = host.document.project.media[0]
-        result = run(host, "transcribe", media_id=str(media.id))
+        result = run(host, "transcribe", media_id=str(media.id), replace=True)
         assert "transcription_status" in result["next"]
         assert run(host, "transcription_status")["status"] == "large-v3 で開始"
         # 省くと今までどおり 1 本目
@@ -314,7 +322,7 @@ class TestSubtitles:
         two = _replace(
             first,
             id=MediaId("two-voices"),
-            transcript=None,
+            transcripts=(),
             audio_streams=(stream, _replace(stream, index=stream.index + 1)),
         )
         host.document.execute(AddMedia(two))

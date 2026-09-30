@@ -47,7 +47,7 @@ from sashimono.core.commands import (
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, TranscriptSegment
-from sashimono.core.projection import project_clip
+from sashimono.core.projection import project_clip, subtitle_stream
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
@@ -91,8 +91,8 @@ class SubtitlePanel(QWidget):
         self._project = project
         self._analyzer = analyzer
         self._media_id: MediaId | None = None
-        #: タイムラインで選んだクリップの素材と、それが鳴らす音声ストリーム
-        self._heard: tuple[MediaId, int | None] | None = None
+        #: 見ている字幕の音声ストリームの番号 ``None`` なら 1 本目 字幕は音声ごとに別
+        self._stream: int | None = None
         self._frame = 0
         #: 表示中の行に対応する字幕 行番号から引く
         self._rows: list[tuple[SegmentId, int, int]] = []
@@ -101,10 +101,14 @@ class SubtitlePanel(QWidget):
         self._updating = False
         #: 起こしの実行係 バックエンドの読み込みは重いので、初めて使うときに作る
         self._service: TranscriptionService | None = None
-        #: AI から始めた起こし ダイアログを開かずに走らせる経路
-        self._job: Job | None = None
-        self._job_media: MediaId | None = None
-        self._job_note = ""
+        #: AI から頼まれた起こし 窓を開かずに走らせる 1 本ずつ順番に走り
+        #: （:class:`TranscriptionService`）、
+        #: 終わった物はどれもその素材と音声の字幕へ取り込む
+        self._jobs: list[Job] = []
+        #: 終わった起こしの知らせ 様子を聞かれたときに並べる
+        self._job_notes: list[str] = []
+        #: 起こしている物の最後の進み具合（依頼ごと）
+        self._last_progress: dict[int, str] = {}
 
         self._build()
         self.set_project(project)
@@ -114,6 +118,12 @@ class SubtitlePanel(QWidget):
     def _build(self) -> None:
         self._media = QComboBox(self)
         self._media.currentIndexChanged.connect(self._on_media_changed)
+        # 音声が何本もある素材（ゲームの音とマイクの声など）は、どの音の字幕を見るかを選ぶ
+        # 1 本の素材では出さない（今までどおり素材だけ）
+        self._stream_box = QComboBox(self)
+        self._stream_box.setObjectName("subtitle_stream")
+        self._stream_box.currentIndexChanged.connect(self._on_stream_changed)
+        self._stream_box.hide()
 
         self._transcribe_button = self._button("起こす…", self.transcribe)
         self._clean_button = self._button("整形…", self.clean)
@@ -124,6 +134,7 @@ class SubtitlePanel(QWidget):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(self._media, 1)
+        top.addWidget(self._stream_box)
         top.addWidget(self._transcribe_button)
 
         actions = QHBoxLayout()
@@ -204,13 +215,53 @@ class SubtitlePanel(QWidget):
             self._media.setCurrentIndex(index)
 
     def follow_clip(self, media_id: MediaId, stream: int | None) -> None:
-        """タイムラインで選んだクリップの素材を出す 起こすときはそのクリップが鳴らす音を選んでおく
+        """タイムラインで選んだクリップの素材と、そのクリップが鳴らす音の字幕を出す
 
         前は字幕パネルが前に開いた素材（音声 4 本の動画など）のまま残り、音声 1 本の
         クリップを選んで起こしても、前の素材の 4 つの音声が並んだ（利用者の画面）
         """
         self.select_media(media_id)
-        self._heard = (media_id, stream)
+        self.select_stream(stream)
+
+    @property
+    def stream(self) -> int | None:
+        """見ている字幕の音声ストリームの番号 ``None`` なら 1 本目"""
+        return self._stream
+
+    def select_stream(self, stream: int | None) -> None:
+        """見る字幕の音声を選ぶ 素材に無い番号は 1 本目"""
+        media = self._current_media()
+        if media is None:
+            return
+        index = self._stream_box.findData(media.transcript_stream(stream))
+        if index >= 0:
+            self._stream_box.setCurrentIndex(index)
+
+    def _fill_streams(self) -> None:
+        """音声の選びを今の素材に合わせて作り直す 前に見ていた番号があれば残す"""
+        media = self._current_media()
+        previous = self._stream
+        self._updating = True
+        self._stream_box.clear()
+        streams = media.audio_streams if media is not None else ()
+        for number, info in enumerate(streams, start=1):
+            has = media is not None and media.transcript_for(info.index) is not None
+            self._stream_box.addItem(f"音声 {number}" + ("" if has else "（字幕なし）"), info.index)
+        self._updating = False
+        self._stream_box.setVisible(len(streams) > 1)
+        if media is None:
+            self._stream = None
+            return
+        chosen = media.transcript_stream(previous)
+        self._stream_box.setCurrentIndex(max(0, self._stream_box.findData(chosen)))
+        self._stream = chosen
+
+    def _on_stream_changed(self) -> None:
+        if self._updating:
+            return
+        data = self._stream_box.currentData()
+        self._stream = int(data) if data is not None else None
+        self._reload_rows()
 
     # --- 一覧 ---
 
@@ -259,6 +310,8 @@ class SubtitlePanel(QWidget):
             self._media_id = candidates[0].id
             self._media.setCurrentIndex(0)
 
+        # 字幕の有無の印（「字幕なし」）も素材の中身に合わせて付け直す
+        self._fill_streams()
         has_media = bool(candidates)
         self._transcribe_button.setEnabled(has_media)
         self._empty.setVisible(not has_media)
@@ -269,6 +322,7 @@ class SubtitlePanel(QWidget):
             return
         data = self._media.currentData()
         self._media_id = MediaId(str(data)) if data else None
+        self._fill_streams()
         self._reload_rows()
 
     def _current_media(self) -> MediaItem | None:
@@ -278,9 +332,10 @@ class SubtitlePanel(QWidget):
 
     def _segments(self) -> tuple[TranscriptSegment, ...]:
         media = self._current_media()
-        if media is None or media.transcript is None:
+        transcript = media.transcript_for(self._stream) if media is not None else None
+        if transcript is None:
             return ()
-        return media.transcript.segments
+        return transcript.segments
 
     def _rows_signature(self) -> tuple[object, ...]:
         """一覧の中身が変わったかを見るための印
@@ -298,7 +353,13 @@ class SubtitlePanel(QWidget):
             for clip in track.clips
             if clip.media_id == media.id
         )
-        return (str(media.id), id(media.transcript), self._project.rate, clips)
+        return (
+            str(media.id),
+            self._stream,
+            id(media.transcript_for(self._stream)),
+            self._project.rate,
+            clips,
+        )
 
     def _reload_rows(self) -> None:
         """一覧を作り直す
@@ -363,11 +424,17 @@ class SubtitlePanel(QWidget):
     def _placement(self, media: MediaItem) -> dict[SegmentId, tuple[int, int]]:
         """字幕がタイムラインのどこに出るか 最初に現れた位置だけを持つ"""
         found: dict[SegmentId, tuple[int, int]] = {}
+        wanted = media.transcript_stream(self._stream)
         for track in self._project.timeline.tracks:
             for clip in track.clips:
                 if clip.media_id != media.id:
                     continue
-                for projected in project_clip(clip, media, self._project.rate, track.id):
+                # 見ている音の字幕を出すクリップだけ 音声 2 のクリップの位置を、音声 1 の
+                # 字幕の位置として出さない
+                stream = subtitle_stream(self._project, track, clip)
+                if media.transcript_stream(stream) != wanted:
+                    continue
+                for projected in project_clip(clip, media, self._project.rate, track.id, stream):
                     key = projected.segment.id
                     span = (projected.start_frame, projected.end_frame)
                     if key not in found or span < found[key]:
@@ -414,7 +481,8 @@ class SubtitlePanel(QWidget):
             return
         segment_id = self._rows[row][0]
         self.commands_requested.emit(
-            [SetSegmentText(self._media_id, segment_id, item.text())], "字幕を編集"
+            [SetSegmentText(self._media_id, segment_id, item.text(), stream=self._stream)],
+            "字幕を編集",
         )
 
     def _show_menu(self, position: QPoint) -> None:
@@ -441,9 +509,13 @@ class SubtitlePanel(QWidget):
             if item is not None:
                 clipboard().setText(item.text())
         elif chosen is remove:
-            self.commands_requested.emit([RemoveSegment(self._media_id, segment_id)], "字幕を削除")
+            self.commands_requested.emit(
+                [RemoveSegment(self._media_id, segment_id, stream=self._stream)], "字幕を削除"
+            )
         elif chosen is merge:
-            self.commands_requested.emit([MergeWithNext(self._media_id, segment_id)], "字幕を結合")
+            self.commands_requested.emit(
+                [MergeWithNext(self._media_id, segment_id, stream=self._stream)], "字幕を結合"
+            )
         elif chosen is split:
             self._split_at_playhead(segment_id)
 
@@ -456,7 +528,9 @@ class SubtitlePanel(QWidget):
         if at is None:
             self.status_message.emit("再生ヘッドがこの素材の上にありません")
             return
-        self.commands_requested.emit([SplitSegment(self._media_id, segment_id, at)], "字幕を分割")
+        self.commands_requested.emit(
+            [SplitSegment(self._media_id, segment_id, at, stream=self._stream)], "字幕を分割"
+        )
 
     def _source_time(self, media: MediaItem, frame: int) -> Fraction | None:
         """タイムラインのフレームを、この素材のソース秒へ"""
@@ -479,13 +553,14 @@ class SubtitlePanel(QWidget):
             # パネルは開けるようにしておく
             self._service = TranscriptionService(default_backend())
 
-        heard = self._heard
-        stream = heard[1] if heard is not None and heard[0] == media.id else None
-        dialog = TranscribeDialog(media, self._service, self, stream=stream)
+        dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
         if dialog.exec() and dialog.transcript is not None:
             self.commands_requested.emit(
-                [SetTranscript(media.id, dialog.transcript)], f"字幕を起こす: {media.name}"
+                [SetTranscript(media.id, dialog.transcript, stream=dialog.chosen_stream)],
+                f"字幕を起こす: {media.name}",
             )
+            # 起こした音の字幕を見せる
+            self.select_stream(dialog.chosen_stream)
             if dialog.notice:
                 # 窓は起こし終えたら閉じるので、GPU から CPU へ落とした理由などはここで出す
                 self.status_message.emit(dialog.notice)
@@ -493,6 +568,10 @@ class SubtitlePanel(QWidget):
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
     ) -> str:
+        """起こしを頼む AI からの依頼を受ける入口 走っている物があれば順番待ちに入る
+
+        同じ素材の同じ音をすでに頼んでいれば断る（2 回起こしても同じ結果を 2 回取り込むだけ）
+        """
         """起こしを始める AI からの依頼を受ける入口
 
         ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
@@ -506,11 +585,14 @@ class SubtitlePanel(QWidget):
         if not self._service.backend.is_available():
             raise RuntimeError("起こしの実行環境が入っていません 字幕パネルから導入できます")
 
+        if self._service.find(media.id, audio_stream) is not None:
+            raise RuntimeError(f"{media.name} のその音声はもう起こしています（順番待ちを含む）")
         options = TranscribeOptions(model=model, audio_stream=audio_stream)
-        self._job = self._service.start(media.id, media.path, options)
-        self._job_media = media.id
-        self._job_note = "始めた"
+        waiting = self._service.busy
+        self._jobs.append(self._service.start(media.id, media.path, options))
         self.select_media(media.id)
+        if waiting:
+            return f"{media.name} の起こしを順番待ちに入れました 前の起こしが終わると始まります"
         return f"{media.name} の起こしを始めました"
 
     def transcription_status(self) -> str:
@@ -523,39 +605,63 @@ class SubtitlePanel(QWidget):
         定期的に呼ばれる AI が結果を聞きに来なかった場合でも、起こした内容が
         捨てられないようにするため
         """
-        job = self._job
-        if job is None:
-            return self._job_note or "起こしは走っていません"
-        for event in job.poll():
-            if event.kind is JobKind.PROGRESS:
-                self._job_note = f"{int(event.ratio * 100)}% — {event.message}"
-            elif event.kind is JobKind.DONE and event.transcript is not None:
-                self._job = None
-                self._job_note = event.message
-                if self._job_media is not None:
+        for job in list(self._jobs):
+            for event in job.poll():
+                if event.kind is JobKind.PROGRESS:
+                    self._last_progress[id(job)] = f"{int(event.ratio * 100)}% — {event.message}"
+                    continue
+                self._jobs.remove(job)
+                self._last_progress.pop(id(job), None)
+                name = self._describe_job(job)
+                if event.kind is JobKind.DONE and event.transcript is not None:
+                    # 頼んだ素材と音へ取り込む 表で見ている素材や音には依らない
                     self.commands_requested.emit(
-                        [SetTranscript(self._job_media, event.transcript)], "字幕を起こす"
+                        [SetTranscript(job.media_id, event.transcript, stream=job.stream)],
+                        f"字幕を起こす: {name}",
                     )
-            else:
-                self._job = None
-                self._job_note = event.message or "終了した"
-        return self._job_note
+                self._job_notes.append(f"{name}: {event.message or '終了した'}")
+                break
+
+        lines = []
+        if self._service is not None:
+            for job in self._service.jobs():
+                name = self._describe_job(job)
+                if job.waiting:
+                    lines.append(f"順番待ち: {name}")
+                else:
+                    detail = self._last_progress.get(id(job), "")
+                    lines.append(f"起こしている: {name}" + (f" {detail}" if detail else ""))
+        lines.extend(self._job_notes[-5:])
+        return "\n".join(lines) if lines else "起こしは走っていません"
+
+    def _describe_job(self, job: Job) -> str:
+        """起こしの依頼の名前 音声が何本もある素材は何本目の音かも添える"""
+        media = self._project.find_media(job.media_id)
+        if media is None:
+            return str(job.media_id)
+        if len(media.audio_streams) < 2:
+            return media.name
+        known = [s.index for s in media.audio_streams]
+        key = media.transcript_stream(job.stream)
+        return f"{media.name} 音声 {known.index(key) + 1}"
 
     def clean(self) -> None:
         media = self._current_media()
-        if media is None or media.transcript is None:
+        transcript = media.transcript_for(self._stream) if media is not None else None
+        if media is None or transcript is None:
             return
-        dialog = CleanupDialog(media.transcript, self)
+        dialog = CleanupDialog(transcript, self)
         if dialog.exec():
             self.commands_requested.emit(
-                [SetTranscript(media.id, dialog.result_transcript())], "字幕を整形"
+                [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
+                "字幕を整形",
             )
 
     def jet_cut(self) -> None:
         media = self._current_media()
         if media is None:
             return
-        waveform = self._analyzer.waveform(media)
+        waveform = self._analyzer.waveform(media, self._stream)
         if waveform is None:
             self.status_message.emit("波形の解析がまだ終わっていません")
             return
@@ -566,7 +672,9 @@ class SubtitlePanel(QWidget):
             return len(ranges), float(frames * self._project.rate.frame_duration)
 
         dialog = JetCutDialog(
-            has_transcript=media.transcript is not None, estimate=estimate, parent=self
+            has_transcript=media.transcript_for(self._stream) is not None,
+            estimate=estimate,
+            parent=self,
         )
         if not dialog.exec():
             return
@@ -581,12 +689,15 @@ class SubtitlePanel(QWidget):
         self, media: MediaItem, options: SilenceOptions, protect: bool
     ) -> tuple[tuple[int, int], ...]:
         """無音の検出からタイムライン上の切る範囲までを一続きに"""
-        waveform = self._analyzer.waveform(media)
+        # 見ている音の波形と字幕で決める マイクの声の無音で切りたいときに、ゲームの音で
+        # 決めると切れない
+        waveform = self._analyzer.waveform(media, self._stream)
         if waveform is None:
             return ()
         silences = detect_silence(waveform, options)
-        if protect and media.transcript is not None:
-            silences = keep_speech(silences, media.transcript)
+        transcript = media.transcript_for(self._stream)
+        if protect and transcript is not None:
+            silences = keep_speech(silences, transcript)
         return plan_cuts(self._project, media.id, silences)
 
     def burn(self) -> None:

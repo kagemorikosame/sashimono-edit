@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -86,7 +86,10 @@ class MediaItem:
     video_streams: tuple[VideoStreamInfo, ...] = ()
     audio_streams: tuple[AudioStreamInfo, ...] = ()
     #: 字幕起こしの結果 トラックではなくここに持たせるのが設計の要
-    transcript: Transcript | None = None
+    #: 音声ストリームごとに持つ（ストリームの番号 :attr:`AudioStreamInfo.index`, 字幕）
+    #: ゲームの録画のように音声が何本もある素材では、音ごとに別の字幕になる 前は素材に
+    #: 1 つだけで、音声 2 を起こすと音声 1 の字幕が置き換わった 並びは番号の昇順
+    transcripts: tuple[tuple[int, Transcript], ...] = ()
     #: 空ならファイル名を表示名として使う
     display_name: str = ""
     id: MediaId = field(default_factory=new_media_id)
@@ -112,14 +115,36 @@ class MediaItem:
         """静止画のように、任意の長さで使える素材か"""
         return self.duration == 0 and not self.has_audio
 
-    def with_transcript(self, transcript: Transcript | None) -> MediaItem:
-        """起こし結果を差し替えた新しい :class:`MediaItem` を返す"""
-        return MediaItem(
-            path=self.path,
-            duration=self.duration,
-            video_streams=self.video_streams,
-            audio_streams=self.audio_streams,
-            transcript=transcript,
-            display_name=self.display_name,
-            id=self.id,
-        )
+    def transcript_stream(self, stream: int | None = None) -> int:
+        """字幕を引く鍵にする音声ストリームの番号
+
+        ``None`` と素材に無い番号は 1 本目 デコーダも素材に無い番号では 1 本目を開くので、
+        鳴っている音と字幕の音が食い違わない 音声の無い素材は 0
+        """
+        known = [s.index for s in self.audio_streams]
+        if stream is not None and stream in known:
+            return stream
+        return known[0] if known else 0
+
+    def transcript_for(self, stream: int | None = None) -> Transcript | None:
+        """その音声ストリームの字幕 ``None`` なら 1 本目"""
+        key = self.transcript_stream(stream)
+        return next((t for index, t in self.transcripts if index == key), None)
+
+    @property
+    def transcript(self) -> Transcript | None:
+        """1 本目の音声の字幕 音声が 1 本の素材ではこれがその素材の字幕"""
+        return self.transcript_for(None)
+
+    def with_transcript(
+        self, transcript: Transcript | None, stream: int | None = None
+    ) -> MediaItem:
+        """その音声ストリーム（``None`` なら 1 本目）の字幕を差し替えた新しい素材
+
+        ほかの音の字幕は残す
+        """
+        key = self.transcript_stream(stream)
+        kept = [(index, t) for index, t in self.transcripts if index != key]
+        if transcript is not None:
+            kept.append((key, transcript))
+        return replace(self, transcripts=tuple(sorted(kept, key=lambda pair: pair[0])))

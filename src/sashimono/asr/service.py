@@ -52,17 +52,32 @@ class JobEvent:
 class Job:
     """走っている（または走り終わった）起こし 1 件"""
 
-    def __init__(self, media_id: MediaId, path: Path) -> None:
+    def __init__(
+        self, media_id: MediaId, path: Path, options: TranscribeOptions | None = None
+    ) -> None:
         self.media_id = media_id
         self.path = path
+        #: 起こす条件 音声ストリーム（``options.audio_stream``）で結果の取り込み先が決まる
+        self.options = options if options is not None else TranscribeOptions()
         self._events: queue.Queue[JobEvent] = queue.Queue()
         self._cancel = threading.Event()
+        self._started = threading.Event()
         self._done = threading.Event()
-        self._thread: threading.Thread | None = None
+
+    @property
+    def stream(self) -> int | None:
+        """起こす音声ストリームの番号 ``None`` なら 1 本目"""
+        return self.options.audio_stream
 
     @property
     def running(self) -> bool:
+        """まだ終わっていない（順番待ちも含む）"""
         return not self._done.is_set()
+
+    @property
+    def waiting(self) -> bool:
+        """順番待ち 前の起こしが終わるのを待っている"""
+        return not self._started.is_set() and not self._done.is_set()
 
     @property
     def cancelled(self) -> bool:
@@ -93,13 +108,17 @@ class TranscriptionService:
     """起こしの実行を受け付ける
 
     同時に走らせるのは 1 件だけ 音声認識は GPU とメモリを丸ごと使うので、
-    2 件並べても速くならず、どちらも落ちる可能性が上がるだけ
+    2 件並べても速くならず、どちらも落ちる可能性が上がるだけ 走っている間に来た依頼は
+    順番待ちに入れ、前が終わったら 1 本ずつ走らせる（窓からの依頼も AI の道具からの依頼も
+    同じ列） 前は走っている間の依頼を断っていて、AI が 2 本目を頼むと 1 本目の結果が
+    取り込まれずに消えることがあった
     """
 
     def __init__(self, backend: TranscriptionBackend) -> None:
         self._backend = backend
-        self._current: Job | None = None
+        self._queue: list[Job] = []
         self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
 
     @property
     def backend(self) -> TranscriptionBackend:
@@ -108,28 +127,49 @@ class TranscriptionService:
     @property
     def busy(self) -> bool:
         with self._lock:
-            return self._current is not None and self._current.running
+            return any(job.running for job in self._queue)
+
+    def jobs(self) -> list[Job]:
+        """走っている物と順番待ちの物 頼まれた順"""
+        with self._lock:
+            return [job for job in self._queue if job.running]
+
+    def find(self, media_id: MediaId, stream: int | None) -> Job | None:
+        """その素材と音声を起こしている（待っている）依頼"""
+        return next((j for j in self.jobs() if j.media_id == media_id and j.stream == stream), None)
 
     def start(self, media_id: MediaId, path: Path, options: TranscribeOptions) -> Job:
-        """起こしを始める すでに走っていれば :class:`RuntimeError`"""
+        """起こしを頼む 走っている物があれば順番待ちに入れる"""
+        job = Job(media_id, Path(path), options)
         with self._lock:
-            if self._current is not None and self._current.running:
-                raise RuntimeError("すでに起こしが走っている")
-            job = Job(media_id, Path(path))
-            self._current = job
-
-        thread = threading.Thread(
-            target=self._run, args=(job, options), name="sashimono-asr", daemon=True
-        )
-        job._thread = thread
-        thread.start()
+            self._queue = [j for j in self._queue if j.running]
+            self._queue.append(job)
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._drain, name="sashimono-asr", daemon=True
+                )
+                self._worker.start()
         return job
 
     def cancel(self) -> None:
-        with self._lock:
-            current = self._current
-        if current is not None:
-            current.cancel()
+        """走っている物と待っている物をすべて止める"""
+        for job in self.jobs():
+            job.cancel()
+
+    def _drain(self) -> None:
+        """列の頭から 1 本ずつ走らせる 列が空になったら終わる（次の依頼で作り直す）"""
+        while True:
+            with self._lock:
+                job = next((j for j in self._queue if not j._started.is_set()), None)
+                if job is None:
+                    self._worker = None
+                    return
+                job._started.set()
+            if job.cancelled:
+                job._emit(JobEvent(JobKind.CANCELLED, message="中断した"))
+                job._done.set()
+                continue
+            self._run(job, job.options)
 
     def _run(self, job: Job, options: TranscribeOptions) -> None:
         try:

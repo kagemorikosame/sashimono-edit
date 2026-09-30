@@ -112,8 +112,8 @@ class EditorHost(Protocol):
         """波形とサムネイルの用意を予約する"""
         ...
 
-    def waveform(self, media: MediaItem) -> Waveform | None:
-        """用意できていれば波形を返す 無ければ ``None``"""
+    def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
+        """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
         ...
 
     def start_transcription(

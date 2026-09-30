@@ -11,8 +11,6 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-import pytest
-
 from sashimono.asr.backend import AsrError, Progress, ShouldCancel, TranscribeOptions
 from sashimono.asr.service import JobEvent, JobKind, TranscriptionService
 from sashimono.core.model import MediaId, Transcript, TranscriptSegment
@@ -97,6 +95,9 @@ class TestTranscriptionService:
         job = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
 
         deadline = time.monotonic() + 5.0
+        # 走り出してから止める 順番待ちのまま止めた物は走らせない（別の試験）
+        while job.waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
         job.cancel()
         while job.running and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -104,15 +105,35 @@ class TestTranscriptionService:
         assert backend.cancelled is True
         assert [event.kind for event in job.poll()][-1] is JobKind.CANCELLED
 
-    def test_only_one_job_at_a_time(self) -> None:
-        backend = FakeBackend(block=threading.Event())
+    def test_a_second_request_waits_its_turn(self) -> None:
+        # 前は走っている間の依頼を断っていた 断ると AI の 2 本目の結果が取り込まれずに消える
+        # 同時には走らせない（GPU の取り合い） 1 本目が終わってから 2 本目が走る
+        gate = threading.Event()
+        backend = FakeBackend(block=gate)
         service = TranscriptionService(backend)
-        service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
-        try:
-            with pytest.raises(RuntimeError, match="すでに"):
-                service.start(MediaId("n"), Path("別.mp4"), TranscribeOptions())
-        finally:
-            service.cancel()
+        first = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
+        second = service.start(MediaId("n"), Path("別.mp4"), TranscribeOptions(audio_stream=2))
+        deadline = time.monotonic() + 5.0
+        while first.waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not first.waiting and second.waiting
+        assert [job.media_id for job in service.jobs()] == ["m", "n"]
+        assert service.find(MediaId("n"), 2) is second
+        gate.set()
+        assert first.wait(5.0) and second.wait(5.0)
+        assert first.poll()[-1].kind is JobKind.DONE
+        assert second.poll()[-1].kind is JobKind.DONE
+        assert service.jobs() == []
+
+    def test_a_cancelled_waiting_job_never_runs(self) -> None:
+        gate = threading.Event()
+        service = TranscriptionService(FakeBackend(block=gate))
+        first = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
+        second = service.start(MediaId("n"), Path("別.mp4"), TranscribeOptions())
+        second.cancel()
+        gate.set()
+        assert first.wait(5.0) and second.wait(5.0)
+        assert second.poll()[-1].kind is JobKind.CANCELLED
 
     def test_polling_an_idle_job_returns_nothing(self) -> None:
         service = TranscriptionService(FakeBackend())

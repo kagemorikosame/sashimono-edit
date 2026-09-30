@@ -122,8 +122,8 @@ class FakeHost:
     def analyze(self, media: MediaItem) -> None:
         self.analyzed.append(media.id)
 
-    def waveform(self, media: MediaItem) -> Waveform | None:
-        del media
+    def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
+        del media, stream
         return self.stub_waveform
 
     def start_transcription(
@@ -144,7 +144,7 @@ def make_loaded(video_media: MediaItem, transcript: Transcript) -> Project:
     fixture ではなく関数にしてあるのは、別のフォルダのテストからも使うため
     conftest の fixture は、そのフォルダの下からしか見えない
     """
-    with_transcript = replace(video_media, transcript=transcript)
+    with_transcript = video_media.with_transcript(transcript)
     base = Project.create(ProjectSettings(frame_rate=RATE_30), media=(with_transcript,))
     track = Track(kind=TrackKind.VIDEO, name="V1")
     base = base.with_timeline(replace(base.timeline, tracks=(track,)))
