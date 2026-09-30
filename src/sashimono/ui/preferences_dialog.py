@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QLabel,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -115,6 +117,21 @@ def _megabytes(size: int) -> float:
 
 class PreferencesDialog(QDialog):
     """プレビューの重さに関わる設定を変える"""
+
+    def _fit_to_screen(self, body: QWidget) -> None:
+        """中身が収まる大きさで開く ただし画面の 9 割より大きくはしない（残りは巻物で見る）
+
+        巻物にすると中身の大きさを窓が知らず、小さな窓で開く 横は項目が切れない幅にする
+        """
+        wanted = body.sizeHint()
+        width = wanted.width() + self._scroll.verticalScrollBar().sizeHint().width() + 24
+        height = wanted.height() + 64
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, int(available.width() * 0.9))
+            height = min(height, int(available.height() * 0.9))
+        self.resize(width, height)
 
     def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -405,10 +422,22 @@ class PreferencesDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # 項目は縦に長く、ノートの画面では下の項目と OK が画面の外へはみ出していた
+        # 項目と説明だけを巻物にし、OK と取り消しはいつも見える下に置く
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.addLayout(form)
+        body_layout.addWidget(note)
+        body_layout.addStretch(1)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidget(body)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(note)
+        layout.addWidget(self._scroll, 1)
         layout.addWidget(buttons)
+        self._fit_to_screen(body)
 
         self._use_proxy.toggled.connect(self._proxy_height.setEnabled)
         self._prefetch.toggled.connect(self._prefetch_budget.setEnabled)
