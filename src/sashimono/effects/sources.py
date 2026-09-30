@@ -17,6 +17,7 @@ from sashimono.core.model import (
     GROUP_AS_ONE,
     GROUP_KIND,
     GROUP_LAYERS,
+    AnimatedValue,
     GeneratedSource,
     ParamValue,
 )
@@ -80,9 +81,48 @@ class SourceDefinition:
         return GeneratedSource(kind=self.kind, params=params)
 
 
+def _still_zero(value: ParamValue | None) -> bool:
+    """動かない 0 か（キーフレームで動く値は、途中で 0 でなくなるので使う側に数える）"""
+    if value is None:
+        return True
+    if isinstance(value, AnimatedValue):
+        return not value.keyframes and value.static == 0
+    return False
+
+
+def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """テキストの設定で使わない項目
+
+    描く所（:mod:`sashimono.engine.sources` の ``_draw_text``）が読まない物だけ
+    - タイマーの書式が空なら、タイマーの初めの値・速さ・数え下げ・長さを読まない
+    - タイマーの書式があれば、文字の代わりに時間を出すので文字を読まない
+    - 数え下げを切っていれば、数え下げる長さを読まない
+    - 縦書きは行揃えと組み方を読まない（縦書きは標準の組み方で描く）
+    - 縁取りの太さが 0 なら縁取りの色、影のずらしとぼかしが 0 なら影の色を読まない
+      （文字の中の制御文字で縁や影を付けたときは、制御文字の色を使う）
+    """
+    unused: set[str] = set()
+    if not str(params.get("timer_format", "") or ""):
+        unused |= {"timer_start", "timer_rate", "timer_countdown", "timer_length"}
+    else:
+        unused.add("text")
+        countdown = params.get("timer_countdown")
+        if not (countdown is True or (isinstance(countdown, int) and countdown)):
+            unused.add("timer_length")
+    vertical = params.get("vertical")
+    if vertical is True or (isinstance(vertical, int) and vertical):
+        unused |= {"align", "layout"}
+    if _still_zero(params.get("border_width")):
+        unused.add("border_color")
+    if all(_still_zero(params.get(name)) for name in ("shadow_x", "shadow_y", "shadow_blur")):
+        unused.add("shadow_color")
+    return frozenset(unused)
+
+
 TEXT = SourceDefinition(
     kind="text",
     label="テキスト",
+    unused=_text_unused,
     parameters=(
         TextSpec("text", "文字", "テキスト"),
         FontSpec("font", "フォント"),
