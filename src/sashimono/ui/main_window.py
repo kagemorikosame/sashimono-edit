@@ -878,6 +878,7 @@ class MainWindow(QMainWindow):
         # ◆ や ◀ ▶ を押した値を、グラフエディタにも出す（開いていなければ開かない）
         self._inspector.param_focused.connect(self._graph.set_path)
         self._inspector.seek_requested.connect(self._seek)
+        self._inspector.align_requested.connect(self._align_selected)
         # 触ったのが部分フィルタなら、プレビューにその範囲の枠を出す
         self._inspector.effect_focused.connect(
             lambda effect_id: self._preview.set_region_effect(EffectId(effect_id))
@@ -1711,6 +1712,17 @@ class MainWindow(QMainWindow):
         # グラフエディタも選んだクリップに付いていく 付いていかないと、キーフレームを入れた
         # クリップを選んでもグラフエディタが何も出さず、◆ の右クリックの奥からしか開けない
         self._graph.set_clip(selected)
+
+    def _align_selected(self, anchor: str) -> None:
+        """設定パネルの配置のテンプレート 選んだクリップを画面のその所へ寄せる
+
+        大きさは描く側の枠から取るので、今のコマに映っていない物は寄せられない
+        黙って何もしないと、押しても効かない理由が分からない
+        """
+        if not self._preview.align_selected(anchor):
+            self.statusBar().showMessage(
+                "再生位置にこのクリップが映っていないので揃えられません", 4000
+            )
 
     def _show_curve(self, path: ParamPath) -> None:
         self._graph.set_path(path)

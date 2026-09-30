@@ -202,6 +202,47 @@ def snap_offset(
     return dx, dy, guides
 
 
+#: 配置のテンプレート 名前と、画面の横・縦のどこへ寄せるか（0 が左・上、1 が右・下）
+ALIGNMENTS: tuple[tuple[str, str, float, float], ...] = (
+    ("top_left", "左上", 0.0, 0.0),
+    ("top", "上の中央", 0.5, 0.0),
+    ("top_right", "右上", 1.0, 0.0),
+    ("left", "左の中央", 0.0, 0.5),
+    ("center", "中央", 0.5, 0.5),
+    ("right", "右の中央", 1.0, 0.5),
+    ("bottom_left", "左下", 0.0, 1.0),
+    ("bottom", "下の中央", 0.5, 1.0),
+    ("bottom_right", "右下", 1.0, 1.0),
+)
+
+
+def aligned_values(
+    start: dict[str, float],
+    box: Box,
+    canvas: tuple[int, int],
+    anchor: str,
+    *,
+    scale: float = 1.0,
+) -> dict[str, float]:
+    """見えている範囲 ``box`` を画面の ``anchor`` の所へ寄せる X と Y
+
+    範囲の端を画面の端へ付ける（中央なら範囲の中央を画面の中央へ） 回した絵は見えている
+    範囲で揃える ``scale`` は :func:`moved_values` と同じ（合成の画素を画面の画素へ直す）
+    """
+    found = next((a for a in ALIGNMENTS if a[0] == anchor), None)
+    if found is None:
+        raise ValueError(f"知らない配置: {anchor}")
+    _, _, across, down = found
+    left, top, right, bottom = box
+    width, height = canvas
+    want_x = across * (width - (right - left)) + (right - left) / 2.0
+    want_y = down * (height - (bottom - top)) + (bottom - top) / 2.0
+    dx = (want_x - (left + right) / 2.0) / scale
+    # 画面の Y は下が正、設定の Y は上が正
+    dy = ((top + bottom) / 2.0 - want_y) / scale
+    return {"pos_x": start.get("pos_x", 0.0) + dx, "pos_y": start.get("pos_y", 0.0) + dy}
+
+
 def moved_values(
     start: dict[str, float],
     press: Point,
