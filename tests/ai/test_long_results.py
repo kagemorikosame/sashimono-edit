@@ -16,9 +16,10 @@ import pytest
 
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
-from sashimono.core.io.serialize import json_text
+from sashimono.core.io.serialize import json_text, project_from_dict, project_to_dict
 from sashimono.core.model import (
     Clip,
+    GeneratedSource,
     MediaItem,
     Project,
     ProjectSettings,
@@ -138,6 +139,89 @@ class TestFixingTypos:
         # 字幕と焼き込んだ文字の両方が 1 回の取り消しで戻る
         host.document.undo()
         assert host.document.project == before
+
+    def test_a_hand_written_title_with_the_same_text_is_left_alone(
+        self, video_media: MediaItem
+    ) -> None:
+        # 前は本文の一致だけで焼き込みを探し、手で書いたタイトルがたまたま直す前の字幕と
+        # 同じ本文だと書き換えた（PR #231 の指摘） 印の無いテキストは直さず数だけ返す
+        host = _host(video_media)
+        project = host.document.project
+        transcript = project.media[0].transcript
+        assert transcript is not None
+        same = transcript.segments[10].text.strip()
+        title = Clip(
+            timeline_start=0,
+            duration=30,
+            source=GeneratedSource("text", {"text": same}),
+        )
+        titles = Track(TrackKind.VIDEO, "タイトル", (title,))
+        host = FakeHost(
+            project.with_timeline(
+                replace(project.timeline, tracks=(*project.timeline.tracks, titles))
+            )
+        )
+        result = _call(host, "replace_subtitle_text", pairs=[{"from": "誤字", "to": "正字"}])
+        assert result["replaced"] == 3
+        assert result["burned_text_clips"] == 0
+        assert result["unmarked_text_clips"] == 1
+        located = host.document.project.timeline.locate_clip(title.id)
+        assert located is not None
+        kept = located[1]
+        assert kept.source is not None
+        assert kept.source.params["text"] == same
+
+    def test_only_the_chosen_voice_moves_the_burned_text(self, video_media: MediaItem) -> None:
+        # 焼き込みは出どころの字幕の行で見分ける 別の素材の同じ本文の焼き込みは動かない
+        host = _host(video_media)
+        _call(host, "place_subtitles")
+        burned = [
+            c
+            for t in host.document.project.timeline.tracks
+            for c in t.clips
+            if c.source is not None
+        ]
+        assert burned and all(c.subtitle_origin is not None for c in burned)
+        media = host.document.project.media[0]
+        origin = burned[10].subtitle_origin
+        assert origin is not None
+        stranger = replace(
+            burned[10],
+            id=type(burned[10].id)("よその焼き込み"),
+            timeline_start=burned[-1].timeline_end + 30,
+            subtitle_origin=replace(origin, media_id=type(media.id)("よその素材")),
+        )
+        project = host.document.project
+        extra = Track(TrackKind.VIDEO, "よそ", (stranger,))
+        host = FakeHost(
+            project.with_timeline(
+                replace(project.timeline, tracks=(*project.timeline.tracks, extra))
+            )
+        )
+        result = _call(host, "replace_subtitle_text", pairs=[{"from": "誤字", "to": "正字"}])
+        assert result["burned_text_clips"] == 3
+        located = host.document.project.timeline.locate_clip(stranger.id)
+        assert located is not None
+        kept = located[1]
+        assert kept.source is not None
+        assert "誤字" in str(kept.source.params["text"])
+
+    def test_the_mark_survives_saving(self, video_media: MediaItem) -> None:
+        # 保存して開き直すと印が消えると、次に誤植を直したとき焼き込みが直らない
+        host = _host(video_media)
+        _call(host, "place_subtitles")
+        loaded = project_from_dict(project_to_dict(host.document.project))
+        origins = [
+            c.subtitle_origin
+            for t in loaded.timeline.tracks
+            for c in t.clips
+            if c.source is not None
+        ]
+        assert origins and all(o is not None for o in origins)
+        result = _call(
+            FakeHost(loaded), "replace_subtitle_text", pairs=[{"from": "誤字", "to": "正字"}]
+        )
+        assert result["burned_text_clips"] == 3
 
     def test_bad_pairs_are_refused(self, video_media: MediaItem) -> None:
         with pytest.raises(ToolError, match="pairs"):

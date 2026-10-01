@@ -41,6 +41,7 @@ from sashimono.core.model import (
     Scene,
     SceneId,
     SegmentId,
+    SubtitleOrigin,
     Timeline,
     Track,
     TrackId,
@@ -592,7 +593,31 @@ def clip_to_json(clip: Clip) -> dict[str, Any]:
         # 版は上げない 前の本体は知らない項目を捨てて開き、画面に収めて描く（見た目は
         # 変わるが開ける） 版を上げると、前の本体では開くことさえできなくなる
         written["native_size"] = True
+    if clip.subtitle_origin is not None:
+        # あるときだけ書く 版は上げない 前の本体は知らない項目を捨てて開き、ただの
+        # テキストとして扱う（字幕の誤植の直しで一緒に直らないだけ）
+        origin = clip.subtitle_origin
+        written["subtitle_origin"] = {
+            "media_id": origin.media_id,
+            "stream": origin.stream,
+            "segment_id": origin.segment_id,
+        }
     return written
+
+
+def _subtitle_origin_from_json(raw: object) -> SubtitleOrigin | None:
+    """:func:`clip_to_json` の ``subtitle_origin`` 無ければ ``None``（手で置いた物と前の版）"""
+    if raw is None:
+        return None
+    data = _require(raw, "subtitle_origin")
+    media_id = data.get("media_id")
+    if media_id is not None and not isinstance(media_id, str):
+        raise ProjectFileError(f"subtitle_origin.media_id が文字列ではない: {media_id!r}")
+    return SubtitleOrigin(
+        media_id=MediaId(media_id) if media_id is not None else None,
+        stream=_get_int(data, "stream", 0),
+        segment_id=SegmentId(_get_str(data, "segment_id")),
+    )
 
 
 def clip_from_json(raw: object, *, on_audio_track: bool = False) -> Clip:
@@ -661,6 +686,7 @@ def clip_from_json(raw: object, *, on_audio_track: bool = False) -> Clip:
         id=ClipId(_get_str(data, "id")),
         # 項目が無ければ画面に収める（:func:`clip_to_json`）
         native_size=_get_bool(data, "native_size", False),
+        subtitle_origin=_subtitle_origin_from_json(data.get("subtitle_origin")),
     )
 
 

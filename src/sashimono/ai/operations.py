@@ -577,8 +577,10 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     """字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキストの両方
 
-    字幕から置いたテキスト（焼き込み）は、本文が置き換える前の字幕 1 枚と同じテキストの
-    クリップ 字幕だけを直すと、焼き込んだ文字に誤植が残る 1 回の取り消しで全部戻る
+    字幕から置いたテキスト（焼き込み）は、出どころの印（:class:`SubtitleOrigin`）が直した
+    字幕の行を指すクリップだけ 字幕だけを直すと、焼き込んだ文字に誤植が残る 本文の一致で
+    探すと、手で書いたタイトルがたまたま同じ本文だと書き換えてしまう 印の無い前の版の
+    焼き込みは直さず、数を返事に添える 1 回の取り消しで全部戻る
     """
     pairs_raw = arguments.get("pairs") or []
     if not isinstance(pairs_raw, list) or not pairs_raw:
@@ -604,16 +606,19 @@ def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> objec
 
     counts = [0] * len(pairs)
 
-    def fixed(text: str) -> str:
+    def fixed(text: str, *, counted: bool = True) -> str:
         for number, (before, after) in enumerate(pairs):
             found = text.count(before)
             if found:
-                counts[number] += found
+                if counted:
+                    counts[number] += found
                 text = text.replace(before, after)
         return text
 
     commands: list[Command] = []
-    renamed: dict[str, str] = {}
+    # 直した字幕の行 ID から、その字幕の素材と音声へ
+    renamed: dict[SegmentId, tuple[MediaId, int]] = {}
+    old_texts: set[str] = set()
     for media, stream in targets:
         transcript = media.transcript_for(stream)
         if transcript is None:
@@ -623,23 +628,37 @@ def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> objec
         for segment in transcript.segments:
             text = fixed(segment.text)
             if text != segment.text:
-                renamed[segment.text] = text
+                renamed[segment.id] = (media.id, stream)
+                old_texts.add(segment.text.strip())
                 segment = segment.with_text(text)
                 changed = True
             segments.append(segment)
         if changed:
             updated = replace(transcript, segments=tuple(segments))
             commands.append(SetTranscript(media.id, updated, stream=stream))
-    # 焼き込んだテキスト 本文が直した字幕の前の本文と同じテキストのクリップ
+    # 焼き込んだテキスト 印が直した字幕の行を指すクリップの本文へ、同じ置き換えを掛ける
+    # 焼き込んだ後に手で足した言葉も残る（字幕の新しい本文で丸ごと上書きしない）
     burned = 0
+    unmarked = 0
     for track in project.timeline.tracks:
         for clip in track.clips:
             if clip.source is None or clip.source.kind != "text":
                 continue
             text = str(clip.source.params.get("text", ""))
-            if text in renamed:
-                path = ParamPath.of_source(clip.id, "text")
-                commands.append(SetParam(path, renamed[text]))
+            origin = clip.subtitle_origin
+            if origin is None:
+                # 印の無い前の版の焼き込みかもしれない 手で書いた物と見分けられないので直さない
+                if text.strip() in old_texts:
+                    unmarked += 1
+                continue
+            owner = renamed.get(origin.segment_id)
+            if owner is None:
+                continue
+            if origin.media_id is not None and owner != (origin.media_id, origin.stream):
+                continue
+            new_text = fixed(text, counted=False)
+            if new_text != text:
+                commands.append(SetParam(ParamPath.of_source(clip.id, "text"), new_text))
                 burned += 1
     if commands:
         host.apply_commands(commands, "字幕の誤植を直す")
@@ -653,6 +672,9 @@ def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> objec
             before for (before, _), count in zip(pairs, counts, strict=True) if not count
         ],
         "burned_text_clips": burned,
+        # 本文は直した字幕と同じだが、出どころの印が無いので直さなかったテキスト
+        # 印を付ける前の版で焼き込んだ物か、手で書いた物 要るなら set_param で直す
+        "unmarked_text_clips": unmarked,
     }
 
 
@@ -1907,6 +1929,8 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキスト"
             "（焼き込み）の両方を直し、1 回の取り消しで戻る 置き換えた数と、当たらなかった組を返す"
+            " 焼き込みは字幕から置いた印のあるテキストだけを直す 印の無い前の版の焼き込みは"
+            "直さず unmarked_text_clips に数える"
         ),
         schema=_schema(
             {

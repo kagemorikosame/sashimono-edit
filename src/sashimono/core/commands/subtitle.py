@@ -24,6 +24,7 @@ from sashimono.core.model import (
     MediaId,
     Project,
     SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
     Transcript,
@@ -316,23 +317,27 @@ def burn_subtitles(
         else:
             track = Track(kind=TrackKind.VIDEO, name=name)
             commands.append(AddTrack(track))
-        for start, end, text in _laid_out(grouped[voice]):
-            commands.append(AddClip(track.id, _text_clip(template, text_param, text, start, end)))
+        for start, end, text, segment_id in _laid_out(grouped[voice]):
+            clip = _text_clip(template, text_param, text, start, end)
+            # 出どころの印を付ける 字幕の誤植を直すとき、印のあるクリップだけを一緒に直す
+            # （本文の一致で探すと、手で書いた同じ本文のタイトルまで書き換わる）
+            origin = SubtitleOrigin(media_id=voice[0], stream=voice[1], segment_id=segment_id)
+            commands.append(AddClip(track.id, replace(clip, subtitle_origin=origin)))
     return commands
 
 
-def _laid_out(subtitles: list[ProjectedSubtitle]) -> list[tuple[int, int, str]]:
-    """1 本のトラックへ並べる 重なる字幕は前の方を切り詰める"""
-    placed: list[tuple[int, int, str]] = []
+def _laid_out(subtitles: list[ProjectedSubtitle]) -> list[tuple[int, int, str, SegmentId]]:
+    """1 本のトラックへ並べる 重なる字幕は前の方を切り詰める 字幕の行の ID を添える"""
+    placed: list[tuple[int, int, str, SegmentId]] = []
     for subtitle in sorted(subtitles, key=lambda s: (s.start_frame, s.end_frame)):
         text = subtitle.segment.text.strip()
         start, end = subtitle.start_frame, subtitle.end_frame
         if placed and start < placed[-1][1]:
-            previous_start, _, previous_text = placed[-1]
+            previous_start, _, previous_text, previous_id = placed[-1]
             if start <= previous_start:
                 continue
-            placed[-1] = (previous_start, start, previous_text)
-        placed.append((start, end, text))
+            placed[-1] = (previous_start, start, previous_text, previous_id)
+        placed.append((start, end, text, subtitle.segment.id))
     return placed
 
 
