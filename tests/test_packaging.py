@@ -1024,3 +1024,104 @@ def test_the_bundled_pictures_are_collected(builder: ModuleType) -> None:
     arguments = builder.pyinstaller_arguments(Path("work"), Path("dist"))
     index = arguments.index("--collect-data")
     assert arguments[index + 1] == "sashimono.resources"
+
+
+def _values(arguments: list[str], flag: str) -> set[str]:
+    return {arguments[i + 1] for i, value in enumerate(arguments) if value == flag}
+
+
+class TestTheStandardLibraryGoesIn:
+    """後から入れる部品（AI 連携・字幕起こし）が使う標準ライブラリを配布版に積む
+
+    PyInstaller は本体が import する物しか積まない AI 連携を入れて送った途端に
+    ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
+    """
+
+    def test_the_whole_library_is_asked_for(self, builder: ModuleType) -> None:
+        arguments = builder.pyinstaller_arguments(Path("w"), Path("d"))
+        asked = _values(arguments, "--hidden-import") | _values(arguments, "--collect-submodules")
+        assert {"zoneinfo", "email", "xml", "json", "asyncio", "sqlite3", "tomllib"} <= asked
+        # 包みは下の部品まで（email.mime.text など）
+        assert {"email", "xml", "concurrent"} <= _values(arguments, "--collect-submodules")
+        # 画面の部品（Tk）と Python 自身の試験は積まない
+        assert not {"tkinter", "test", "idlelib"} & asked
+
+    def _record(self, tmp_path: Path, pyz: list[str]) -> Path:
+        (tmp_path / "COLLECT-00.toc").write_text(
+            repr(([("select.pyd", r"C:\py\select.pyd", "EXTENSION")],)), encoding="utf-8"
+        )
+        entries = [(name, rf"C:\py\{name}.py", "PYMODULE") for name in pyz]
+        (tmp_path / "PYZ-00.toc").write_text(repr((r"C:\PYZ", entries)), encoding="utf-8")
+        with zipfile.ZipFile(tmp_path / "base_library.zip", "w") as base:
+            base.writestr("os.pyc", b"")
+        return tmp_path
+
+    def test_a_missing_one_stops_the_build(
+        self, builder: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 前の組み立ては zoneinfo を持たず、AI 連携が送った途端に落ちた
+        monkeypatch.setattr(builder, "runtime_distributions", lambda: ["x"])
+        monkeypatch.setattr(
+            builder, "imported_stdlib", lambda d: {"zoneinfo", "json", "os", "select", "fcntl"}
+        )
+        record = self._record(tmp_path, ["json"])
+        # fcntl は Windows に無いので数えない（積めず、Windows では読まれない）
+        assert builder.missing_stdlib(record) == ["zoneinfo"]
+        assert builder.missing_stdlib(self._record(tmp_path, ["json", "zoneinfo"])) == []
+
+    def test_the_imports_are_read_from_the_real_sdk(self, builder: ModuleType) -> None:
+        # この機械に入っている AI 連携の部品から、使う標準ライブラリを字面で集められる
+        found = builder.runtime_distributions()
+        if not found:
+            pytest.skip("AI 連携の部品がこの機械に入っていない")
+        needed = builder.imported_stdlib(found)
+        assert "zoneinfo" in needed and "asyncio" in needed
+
+
+class TestTheImportCheck:
+    """配布版の exe の中で部品を import してみる口（組み立ての道具が使う）"""
+
+    def test_the_path_files_of_the_runtime_are_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # pywin32 は .pth で win32/lib を探す道へ足す 入れた置き場の .pth を読まないと、
+        # 配布版では pywintypes が無いと言って AI 連携が動かなかった（組み立ての確かめで分かった）
+        from sashimono.runtime import read_path_files
+
+        inner = tmp_path / "win32" / "lib"
+        inner.mkdir(parents=True)
+        (inner / "sashimono_pth_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (tmp_path / "probe.pth").write_text("win32/lib\n", encoding="utf-8")
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        read_path_files(str(tmp_path))
+        assert str(inner) in sys.path
+
+    def test_a_readable_module_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "sashimono_import_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+        assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_probe"]) == 0
+
+    def test_a_missing_module_fails_and_says_which(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / "sashimono_import_broken.py").write_text(
+            "import no_such_stdlib_part\n", encoding="utf-8"
+        )
+        assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_broken"]) == 1
+        assert "no_such_stdlib_part" in capsys.readouterr().out
+
+
+class TestTheAssistantSaysWhatIsMissing:
+    """AI アシスタントの窓に ModuleNotFoundError のまま出さない（利用者の画面）"""
+
+    def test_a_missing_standard_part_points_to_an_update(self) -> None:
+        from sashimono.ai.session import _explain
+
+        text = _explain(ModuleNotFoundError("No module named 'zoneinfo'", name="zoneinfo"))
+        assert "zoneinfo" in text and "標準" in text and "更新" in text
+        assert "ModuleNotFoundError" not in text
+
+    def test_a_missing_add_on_points_to_reinstalling(self) -> None:
+        from sashimono.ai.session import REINSTALL_HINT, _explain
+
+        text = _explain(ModuleNotFoundError("No module named 'anyio'", name="anyio"))
+        assert "anyio" in text and REINSTALL_HINT in text

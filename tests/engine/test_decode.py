@@ -17,6 +17,7 @@ import pytest
 
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import AudioDecoder, ProbeError, VideoDecoder, probe_media
+from sashimono.engine.decode.rational import as_fraction
 from tests.media_fixtures import (
     SampleMedia,
     decode_all_frames,
@@ -395,7 +396,7 @@ class TestAudioDecoder:
             decoder._seek(4800)
             monkeypatch.setattr(decoder, "_container", real)
             assert decoder._stream.time_base is not None
-            time_base = Fraction(decoder._stream.time_base)
+            time_base = as_fraction(decoder._stream.time_base)
             origin = decoder._origin
         # 0.1 秒の所へ飛ぶなら、余らせる 0.25 秒を引いた原点の 0.15 秒手前から
         assert seeks == [int((origin + Fraction(1, 10) - Fraction(1, 4)) / time_base)]

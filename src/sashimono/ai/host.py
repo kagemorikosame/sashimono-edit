@@ -112,12 +112,17 @@ class EditorHost(Protocol):
         """波形とサムネイルの用意を予約する"""
         ...
 
-    def waveform(self, media: MediaItem) -> Waveform | None:
-        """用意できていれば波形を返す 無ければ ``None``"""
+    def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
+        """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
         ...
 
-    def start_transcription(self, media_id: MediaId, model: str) -> str:
-        """起こしを始める 戻り値は画面に出す短い文言"""
+    def start_transcription(
+        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+    ) -> str:
+        """起こしを始める 戻り値は画面に出す短い文言
+
+        ``audio_stream`` は起こす音声ストリームの番号 ``None`` なら 1 本目
+        """
         ...
 
     def transcription_status(self) -> str:

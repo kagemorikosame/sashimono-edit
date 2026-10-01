@@ -25,6 +25,7 @@ from sashimono.core.commands import (
     SetClipProperty,
     SetParam,
     SetTrackHeights,
+    SplitClip,
     TrimClips,
     insert_media,
 )
@@ -450,3 +451,122 @@ class TestTogether:
         assert set(window._inspector._selection) == {a, b}
         timeline.set_selection((b,))
         assert window._inspector._selection == (b,)
+
+
+class TestGroupedValues:
+    """グループの仲間として引き込まれたクリップへ、設定パネルの値を当てない
+
+    AviUtl のグループ化は動かす・選ぶ所だけを束ね、設定は押した 1 本だけが変わる
+    前は 1 本の拡大率を変えると束ねた全部の拡大率が一緒に変わり、束ねた物ごとに
+    大きさを合わせられなかった
+    """
+
+    def _grouped(self, window: MainWindow) -> tuple[ClipId, ClipId, ClipId]:
+        timeline = window._timeline
+        a, b, c = _ids(timeline)
+        window.execute_all([GroupClips((a, c))], "グループ化")
+        timeline.resize(900, 400)
+        return a, b, c
+
+    def test_clicking_a_member_sets_only_that_clip(self, window: MainWindow) -> None:
+        # 壊れると、1 本の拡大率を変えただけで仲間の拡大率まで変わる
+        timeline = window._timeline
+        a, _b, c = self._grouped(window)
+        QTest.mouseClick(timeline, _LEFT, pos=_point(timeline, 0, 10))
+        assert set(timeline.selected_clips) == {a, c}
+        received: list[list[Command]] = []
+        window._inspector.commands_requested.connect(lambda cs, _l: received.append(cs))
+        window._inspector._emit(SetClipProperty(a, "blend_mode", "add"))
+        (commands,) = received
+        assert [cmd.clip_id for cmd in commands if isinstance(cmd, SetClipProperty)] == [a]
+
+    def test_clips_chosen_by_hand_still_share_the_value(self, window: MainWindow) -> None:
+        # 仲間を除くのは引き込んだ物だけ Ctrl で足した別のクリップにはこれまでどおり当てる
+        timeline = window._timeline
+        a, b, c = self._grouped(window)
+        QTest.mouseClick(timeline, _LEFT, pos=_point(timeline, 0, 50))
+        QTest.mouseClick(timeline, _LEFT, _CTRL, _point(timeline, 0, 10))
+        assert set(timeline.selected_clips) == {a, b, c}
+        assert set(window._inspector._selection) == {a, b}
+
+    def test_a_marquee_counts_what_it_touched(self, view: TimelineView) -> None:
+        # 囲んで掛かった物は自分で選んだ物 仲間だけが引き込んだ物になる
+        a, _b, c = _ids(view)
+        view.set_project(GroupClips((a, c)).apply(view.project))
+        QTest.mousePress(view, _LEFT, pos=_point(view, 0, 35))
+        QTest.mouseMove(view, _point(view, 0, 20))
+        QTest.mouseMove(view, _point(view, 0, 5))
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 5))
+        assert {a, c} <= set(view.selected_clips)
+        assert a in view.edit_targets
+        assert c not in view.edit_targets
+
+
+class TestLockedGroup:
+    """ロックしたレイヤーのクリップを含むグループには、まとめて当てる操作をしない
+
+    ロックした仲間だけが残り、ほかだけが割れたり動いたりすると、束ねた物の頭や長さが
+    食い違う 黙って何もしないと効いていないのか分からないので理由を出す
+    """
+
+    def _locked_group(self, view: TimelineView) -> tuple[ClipId, ClipId, ClipId, list[str]]:
+        a, b, c = _ids(view)
+        project = GroupClips((a, c)).apply(view.project)
+        v2 = project.timeline.tracks[1]
+        view.set_project(
+            project.with_timeline(project.timeline.replace_track(replace(v2, locked=True)))
+        )
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        return a, b, c, messages
+
+    def test_splitting_is_refused(self, view: TimelineView) -> None:
+        # 壊れると、ロックしていない a だけが割れ、c とグループの頭がずれる
+        a, _b, _c, messages = self._locked_group(view)
+        view.select(a)
+        view.set_playhead(10)
+        received = _received(view)
+        view.split_at_playhead()
+        assert received == []
+        assert any("ロック" in m and "グループ" in m for m in messages)
+
+    def test_splitting_everything_skips_only_the_group(self, view: TimelineView) -> None:
+        # 何も選ばずに切るときは、グループの外のクリップは今までどおり切る
+        _a, _b, _c, messages = self._locked_group(view)
+        project = view.project
+        extra = Clip(timeline_start=0, duration=30, source=TEXT.create())
+        tracks = (*project.timeline.tracks, Track(TrackKind.VIDEO, "V3", (extra,)))
+        view.set_project(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        view.select(None)
+        view.set_playhead(10)
+        received = _received(view)
+        view.split_at_playhead()
+        (commands,) = received
+        assert [c.clip_id for c in commands if isinstance(c, SplitClip)] == [extra.id]
+        assert len(commands) == 1
+        assert any("グループ" in m for m in messages)
+
+    def test_deleting_and_cutting_are_refused(self, view: TimelineView) -> None:
+        a, _b, _c, messages = self._locked_group(view)
+        view.select(a)
+        received = _received(view)
+        view.delete_selected()
+        assert not view.cut_selected()
+        assert received == []
+        assert len([m for m in messages if "ロック" in m]) == 2
+
+    def test_moving_is_refused(self, view: TimelineView) -> None:
+        # 前はロックした c を外して a だけを動かし、グループが裂けた
+        _a, _b, _c, messages = self._locked_group(view)
+        received = _received(view)
+        QTest.mousePress(view, _LEFT, pos=_point(view, 0, 10))
+        QTest.mouseMove(view, _point(view, 0, 60))
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 60))
+        assert received == []
+        assert any("ロック" in m for m in messages)
+
+    def test_selecting_alone_says_nothing(self, view: TimelineView) -> None:
+        # 押しただけで断りを出すと、選ぶたびにステータスバーが埋まる
+        _a, _b, _c, messages = self._locked_group(view)
+        QTest.mouseClick(view, _LEFT, pos=_point(view, 0, 10))
+        assert messages == []

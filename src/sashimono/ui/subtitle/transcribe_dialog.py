@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -67,16 +69,30 @@ class TranscribeDialog(QDialog):
     """
 
     def __init__(
-        self, media: MediaItem, service: TranscriptionService, parent: QWidget | None = None
+        self,
+        media: MediaItem,
+        service: TranscriptionService,
+        parent: QWidget | None = None,
+        *,
+        stream: int | None = None,
     ) -> None:
+        """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）"""
         super().__init__(parent)
         self.setWindowTitle(f"字幕起こし — {media.name}")
         self.resize(560, 420)
 
         self._media = media
+        self._first_stream = stream
         self._service = service
         self._job: Job | None = None
         self.transcript: Transcript | None = None
+        #: 起こした音声ストリームの番号 呼ぶ側はこの音の字幕へ取り込む
+        self.chosen_stream: int | None = None
+        #: 既に字幕がある音を起こし直すときに、置き換えてよいかを尋ねる 試験で差し替える
+        self.confirm_replace: Callable[[str], bool] = self._ask_replace
+        #: 起こせたが知らせておくこと（GPU の道具が読めず CPU で起こした など） 窓を閉じた
+        #: 後に呼ぶ側が出す
+        self.notice = ""
 
         #: 導入ワーカーからのログ スレッドをまたぐのでキューで受ける
         self._install_log: queue.Queue[str] = queue.Queue()
@@ -112,8 +128,27 @@ class TranscribeDialog(QDialog):
         self._gpu.setChecked(True)
         self._gpu.toggled.connect(self._describe_install)
 
+        # 音声が何本もある素材（ゲームの音とマイクの声など）は、どれを起こすかを選ぶ
+        # 番号はタイムラインの札（音声 N）と同じく音声ストリームの並びで 1 から数える
+        self._stream = QComboBox(self)
+        stream_choice = self._first_stream
+        for number, stream in enumerate(self._media.audio_streams, start=1):
+            detail = f"{stream.channels}ch {stream.sample_rate // 1000}kHz"
+            if stream.language:
+                detail += f" {stream.language}"
+            self._stream.addItem(f"音声 {number}（{detail}）", stream.index)
+        chosen = self._stream.findData(stream_choice) if stream_choice is not None else -1
+        if chosen >= 0:
+            self._stream.setCurrentIndex(chosen)
+
         form = QFormLayout()
         form.addRow("モデル", self._model)
+        if len(self._media.audio_streams) > 1:
+            form.addRow("起こす音声", self._stream)
+        else:
+            # 行に置かない選びも窓の子なので、隠さないと窓の左上（0, 0）に浮いて
+            # 「モデル」の行を潰す（利用者の画面） 選ぶ物が 1 本なら要らない
+            self._stream.hide()
         form.addRow("言語", self._language)
         form.addRow("ヒント", self._prompt)
         form.addRow("", self._words)
@@ -165,15 +200,15 @@ class TranscribeDialog(QDialog):
         status = runtime_status()
         self._run_button.setEnabled(status.installed)
         self._install_button.setEnabled(True)
-        # 未導入のときも触れるようにする ここが「GPU 版を入れるか」の選択を
-        # 兼ねていて、切れば CUDA ランタイム（2 GB 弱）を落とさずに済む
-        self._gpu.setEnabled(status.extra_installed or not status.installed)
+        # いつも触れるようにする ここが「GPU 版を入れるか」の選択を兼ねていて、切れば
+        # CUDA ランタイム（2 GB 弱）を落とさずに済む 導入済みで CUDA ランタイムが無いときも
+        # 印を付けて「環境を更新」を押せば足せる（前は押せず、後から GPU 版にする道が無かった）
 
         if status.installed:
             self._install_button.setText("環境を更新")
-            self._status.setText(status.summary())
             if not status.extra_installed:
                 self._gpu.setChecked(False)
+            self._describe_install()
             return
 
         self._install_button.setText("環境を導入")
@@ -182,9 +217,18 @@ class TranscribeDialog(QDialog):
     def _describe_install(self) -> None:
         """これから入るものを出す 何が落ちてくるのか分かってから始められるように"""
         status = runtime_status()
-        if status.installed:
-            return
         cuda = self._gpu.isChecked()
+        if status.installed:
+            if cuda and status.extras and not status.extra_installed:
+                gigabytes = status.pack.extra_size_mb / 1000
+                self._status.setText(
+                    f"{status.summary()}\nGPU で起こすには「環境を更新」で"
+                    f" {status.pack.extra_label}（約 {gigabytes:.1f} GB）を入れてください"
+                    " 入れずに起こすと CPU で起こします"
+                )
+            else:
+                self._status.setText(status.summary())
+            return
         packages = "、".join(status.missing(extra=cuda))
         size = "2 GB" if cuda else "300 MB"
         self._status.setText(
@@ -241,7 +285,35 @@ class TranscribeDialog(QDialog):
 
     # --- 起こし ---
 
+    def _ask_replace(self, name: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "字幕起こし",
+            f"{name} には字幕があります 起こした結果で置き換えますか"
+            "（直した字幕も置き換わります 取り消しで戻せます）",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _start_transcribe(self) -> None:
+        stream = self._stream.currentData()
+        if self._media.transcript_for(stream) is not None:
+            number = max(0, self._stream.currentIndex()) + 1
+            name = (
+                f"{self._media.name} の音声 {number}"
+                if len(self._media.audio_streams) > 1
+                else self._media.name
+            )
+            if not self.confirm_replace(name):
+                return
+        # AI から頼んだ起こしと同じ音なら重ねない（同じ列で番号をそろえて見る）
+        key = self._media.transcript_stream(stream)
+        if self._service.find(self._media.id, key) is not None:
+            self._status.setText(
+                "その音声はもう起こしています（順番待ちを含む） 終わるのを待ってください"
+            )
+            return
+        stream = key
+        self.chosen_stream = stream
         options = TranscribeOptions(
             model=str(self._model.currentData()),
             language=self._language.currentData(),
@@ -249,15 +321,21 @@ class TranscribeDialog(QDialog):
             compute_type="float16" if self._gpu.isChecked() else "int8",
             word_timestamps=self._words.isChecked(),
             initial_prompt=self._prompt.text().strip(),
+            audio_stream=stream,
         )
-        try:
-            self._job = self._service.start(self._media.id, self._media.path, options)
-        except RuntimeError as exc:
-            self._status.setText(str(exc))
-            return
+        # 走っている起こし（AI から頼んだ物など）があれば順番待ちに入る 同時には走らせない
+        waiting = self._service.busy
+        self._job = self._service.start(self._media.id, self._media.path, options)
 
         self._progress.setRange(0, 1000)
-        self._set_busy(True, message="起こしています 初回はモデルの取得に時間がかかります")
+        self._set_busy(
+            True,
+            message=(
+                "順番待ちです 前の起こしが終わると始まります"
+                if waiting
+                else "起こしています 初回はモデルの取得に時間がかかります"
+            ),
+        )
         self._timer.start()
 
     # --- ワーカーの見張り ---
@@ -302,6 +380,7 @@ class TranscribeDialog(QDialog):
             self._set_busy(False)
             if event.kind is JobKind.DONE and event.transcript is not None:
                 self.transcript = event.transcript
+                self.notice = event.notice
                 self.accept()
             else:
                 self._status.setText(event.message or "終了した")
@@ -314,6 +393,14 @@ class TranscribeDialog(QDialog):
 
         起こしは GPU を占有する 閉じたのに裏で回り続けると、次の操作が刺さる
         """
+        if self._job is not None and self._job.waiting:
+            # 順番待ちのまま止めた物は走らせない（列が飛ばす） 知らせを待つと、前の起こしが
+            # 終わるまで（数分）窓を閉じられず、その間は編集もできない（PR #231 の指摘）
+            self._job.cancel()
+            self._job = None
+            self._timer.stop()
+            super().reject()
+            return
         if self._job is not None:
             self._job.cancel()
             self._status.setText("中断しています")

@@ -285,7 +285,7 @@ class TestSceneSubtitles:
     ) -> None:
         # 見なければ、シーンにまとめた途端に字幕パネル・焼き込み・字幕ファイルから消える
         project, scene_id = with_scene
-        media = replace(video_media, transcript=transcript)
+        media = video_media.with_transcript(transcript)
         project = AddMedia(media).apply(project)
         track = Track(TrackKind.VIDEO, "V1")
         project = InScene(scene_id, AddTrack(track)).apply(project)
@@ -317,7 +317,7 @@ class TestSceneSubtitles:
         # 端数の source_in を先にフレームへ落とすと、速度を掛けたときに 1 フレームずれる
         # 描画は秒のまま足してから 1 回だけフレームへ直している（そちらに合わせる）
         project, scene_id = with_scene
-        media = replace(video_media, transcript=transcript)
+        media = video_media.with_transcript(transcript)
         project = AddMedia(media).apply(project)
         track = Track(TrackKind.VIDEO, "V1")
         project = InScene(scene_id, AddTrack(track)).apply(project)

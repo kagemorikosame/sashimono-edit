@@ -90,6 +90,7 @@ from sashimono.core.io import (
     save_project,
 )
 from sashimono.core.model import (
+    Clip,
     ClipId,
     EffectId,
     GeneratedSource,
@@ -101,6 +102,7 @@ from sashimono.core.model import (
     SceneId,
     TrackId,
     TrackKind,
+    heard_stream,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry as effect_registry
@@ -390,6 +392,7 @@ class MainWindow(QMainWindow):
         )
         self._preview.set_handles_enabled(self._preferences.preview_handles)
         self._preview.set_keyframe_drag(self._preferences.keyframe_drag)
+        self._preview.set_snap(self._preferences.preview_snap, self._preferences.snap_distance)
         self._transport = TransportBar(project.rate, self)
         self._timeline = TimelineView(project, self._analyzer, self)
         self._timeline.set_value_lines(self._preferences.value_lines)
@@ -406,8 +409,12 @@ class MainWindow(QMainWindow):
         # 編集をするまで、キーフレームのあるクリップを選んでも曲線を引けない
         self._graph.set_project(self.view_project)
         self._subtitles = SubtitlePanel(project, self._analyzer, self)
+        # 焼き込みのひな形は、タイムラインで選んでいるテキストのクリップ
+        self._subtitles.template_provider = self._selected_text_clip
         self._chat = ChatPanel(self, self)
-        self._playback = PlaybackController(project, self)
+        self._playback = PlaybackController(
+            project, self, smooth_history=self._preferences.smooth_audio_motion
+        )
 
         viewer = QWidget(self)
         viewer_layout = QVBoxLayout(viewer)
@@ -790,6 +797,7 @@ class MainWindow(QMainWindow):
         self._media_pool.set_view_mode(preferences.media_view)
         self._chat.apply_preferences(preferences)
         self._timeline.set_value_lines(preferences.value_lines)
+        self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._scene_bar.set_snap(preferences.timeline_snap)
@@ -801,6 +809,7 @@ class MainWindow(QMainWindow):
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
         self._preview.set_keyframe_drag(preferences.keyframe_drag)
+        self._preview.set_snap(preferences.preview_snap, preferences.snap_distance)
         if native.enabled() != preferences.native_modules:
             native.set_enabled(preferences.native_modules)
             # 汎用プラグインも同じ設定で入り切りする 切ったときに覚えている
@@ -876,6 +885,7 @@ class MainWindow(QMainWindow):
         # ◆ や ◀ ▶ を押した値を、グラフエディタにも出す（開いていなければ開かない）
         self._inspector.param_focused.connect(self._graph.set_path)
         self._inspector.seek_requested.connect(self._seek)
+        self._inspector.align_requested.connect(self._align_selected)
         # 触ったのが部分フィルタなら、プレビューにその範囲の枠を出す
         self._inspector.effect_focused.connect(
             lambda effect_id: self._preview.set_region_effect(EffectId(effect_id))
@@ -1415,10 +1425,43 @@ class MainWindow(QMainWindow):
         導入のボタンを出す（:mod:`sashimono.asr.environment` を参照）
         """
         self.show_subtitles()
-        selected = self._media_pool.selected_media_id()
-        if selected is not None:
-            self._subtitles.select_media(selected)
+        # タイムラインで選んだクリップの素材を先に見る 字幕パネルは選んだクリップに付いて
+        # いくので、選んでいればもう出ている メディア欄で選んだ素材は、クリップを選んで
+        # いないときだけ使う（前はこちらを先に見て、別の素材を起こしていた）
+        sound = self._selected_sound()
+        if sound is not None:
+            # 選びが変わらないまま、メディア欄の右クリックで別の素材を起こしていると、字幕
+            # パネルはその素材のまま 選んだクリップへ合わせ直す（PR #231 の指摘）
+            self._subtitles.follow_clip(*sound)
+        else:
+            selected = self._media_pool.selected_media_id()
+            if selected is not None:
+                self._subtitles.select_media(selected)
         self._subtitles.transcribe()
+
+    def _selected_text_clip(self) -> Clip | None:
+        """タイムラインで選んでいるテキストのクリップ 字幕の焼き込みの見た目のひな形にする"""
+        primary = self._timeline.selected_clip
+        located = self.view_project.timeline.locate_clip(primary) if primary else None
+        if located is None:
+            return None
+        clip = located[1]
+        return clip if clip.source is not None and clip.source.kind == "text" else None
+
+    def _selected_sound(self) -> tuple[MediaId, int | None] | None:
+        """タイムラインで選んだクリップの、音のある素材と鳴らす音声ストリーム"""
+        primary = self._timeline.selected_clip
+        project = self.view_project
+        located = project.timeline.locate_clip(primary) if primary is not None else None
+        if located is None or located[1].media_id is None:
+            return None
+        track, clip = located
+        media = project.find_media(located[1].media_id)
+        if media is None or not media.has_audio:
+            return None
+        # 映像のクリップ（音を鳴らさない）は、素材の 1 本目の音を初めに選んでおく
+        stream = heard_stream(track, clip) if project.plays_sound(track, clip) else None
+        return media.id, stream
 
     def _transcribe_media(self, media_id: str) -> None:
         """メディアプールの右クリックから起こす その素材を字幕パネルで選んでから始める"""
@@ -1700,13 +1743,30 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self, clip_id: str) -> None:
         selected = ClipId(clip_id) if clip_id else None
         # 何本も選んでいれば、設定パネルは主の 1 本を出しつつ、触った設定を全部へ当てる
-        chosen = self._timeline.selected_clips
+        # グループの仲間として引き込まれただけの物には当てない（AviUtl のグループ化と同じ
+        # 1 本の拡大率を変えただけで束ねた全部の拡大率が変わっていた）
+        chosen = self._timeline.edit_targets
         ordered = (selected, *(c for c in chosen if c != selected)) if selected else ()
         self._inspector.set_selection(tuple(c for c in ordered if c is not None))
         self._preview.set_selection(selected)
         # グラフエディタも選んだクリップに付いていく 付いていかないと、キーフレームを入れた
         # クリップを選んでもグラフエディタが何も出さず、◆ の右クリックの奥からしか開けない
         self._graph.set_clip(selected)
+        # 字幕パネルも選んだクリップの素材に付いていく（起こすときに別の素材を開かない）
+        sound = self._selected_sound()
+        if sound is not None:
+            self._subtitles.follow_clip(*sound)
+
+    def _align_selected(self, anchor: str) -> None:
+        """設定パネルの配置のテンプレート 選んだクリップを画面のその所へ寄せる
+
+        大きさは描く側の枠から取るので、今のコマに映っていない物は寄せられない
+        黙って何もしないと、押しても効かない理由が分からない
+        """
+        if not self._preview.align_selected(anchor):
+            self.statusBar().showMessage(
+                "再生位置にこのクリップが映っていないので揃えられません", 4000
+            )
 
     def _show_curve(self, path: ParamPath) -> None:
         self._graph.set_path(path)
@@ -2055,6 +2115,7 @@ class MainWindow(QMainWindow):
             pipeline_depth=self._preferences.export_pipeline_depth,
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
+            smooth_history=self._preferences.smooth_audio_motion,
         ).exec()
 
     def _active_scene_name(self) -> str | None:
@@ -2482,11 +2543,13 @@ class MainWindow(QMainWindow):
         self._analyzer.request(media, on_ready=self._on_analysis_ready)
         self._request_proxy(media)
 
-    def waveform(self, media: MediaItem) -> Waveform | None:
-        return self._analyzer.waveform(media)
+    def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
+        return self._analyzer.waveform(media, stream)
 
-    def start_transcription(self, media_id: MediaId, model: str) -> str:
-        return self._subtitles.start_transcription(media_id, model)
+    def start_transcription(
+        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+    ) -> str:
+        return self._subtitles.start_transcription(media_id, model, audio_stream=audio_stream)
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()

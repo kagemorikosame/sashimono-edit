@@ -12,8 +12,16 @@ import av.error
 import pytest
 from PySide6.QtWidgets import QDialogButtonBox
 
-from sashimono.core.commands import AddClip, AddTrack
-from sashimono.core.model import Clip, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.commands import AddClip, AddScene, AddTrack
+from sashimono.core.model import (
+    Clip,
+    Project,
+    ProjectSettings,
+    Scene,
+    Timeline,
+    Track,
+    TrackKind,
+)
 from sashimono.engine.encode import exporter
 from sashimono.ui import export_dialog
 from sashimono.ui.export_dialog import AUTO_CODEC, ExportDialog
@@ -102,3 +110,72 @@ def test_without_any_codec_the_button_is_disabled_instead_of_doing_nothing(
         assert not dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
     finally:
         dialog.deleteLater()
+
+
+def _project_with_scene() -> tuple[Project, Scene]:
+    """メインに 30 コマ、シーン「OP」に 12 コマ（範囲 2〜8 を指定）を置いた作品"""
+    project = _non_empty_project()
+    track = Track(TrackKind.VIDEO, "V1", (Clip(timeline_start=0, duration=12),))
+    scene = Scene("OP", Timeline(rate=project.rate, tracks=(track,), work_area=(2, 8)))
+    return AddScene(scene).apply(project), scene
+
+
+class TestChoosingAScene:
+    """メイン以外のシーンを選んで書き出す
+
+    前はいつもメインを書き出し、シーンだけを動画にする道が無かった
+    """
+
+    def test_the_default_is_still_the_main_timeline(self) -> None:
+        # 開いているシーンで出る物が変わると、書き出した物を取り違える
+        project, _scene = _project_with_scene()
+        dialog = ExportDialog(project, scene_name="OP")
+        try:
+            assert dialog.target.duration == 30
+            assert dialog._scene.count() == 2
+        finally:
+            dialog.deleteLater()
+
+    def test_choosing_a_scene_exports_its_timeline_and_range(self) -> None:
+        # 壊れると、シーンを選んでもメインの 30 コマが出る 範囲もメインの物を当ててしまう
+        project, scene = _project_with_scene()
+        dialog = ExportDialog(project)
+        try:
+            dialog.select_scene(scene.id)
+            assert dialog.target.timeline is scene.timeline
+            assert dialog.target.duration == 12
+            settings = dialog._settings()
+            assert settings is not None
+            assert settings.frame_range == (2, 8)
+            assert settings.path.name == f"{project.name}_OP.mp4"
+        finally:
+            dialog.deleteLater()
+
+    def test_an_empty_main_does_not_block_a_scene(self) -> None:
+        # メインが空でもシーンに中身があれば書き出せる
+        empty = Project.create(ProjectSettings())
+        clip = Clip(timeline_start=0, duration=5)
+        scene = Scene(
+            "OP", Timeline(rate=empty.rate, tracks=(Track(TrackKind.VIDEO, "V1", (clip,)),))
+        )
+        project = AddScene(scene).apply(empty)
+        dialog = ExportDialog(project)
+        ok = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        try:
+            dialog.select_scene(scene.id)
+            assert ok.isEnabled() == dialog._codecs_ready
+            dialog.select_scene(None)
+            assert not ok.isEnabled()
+        finally:
+            dialog.deleteLater()
+
+    def test_a_path_typed_by_hand_is_kept(self) -> None:
+        # 手で決めた出力先をシーンの名前で書き換えると、選び直しただけで行き先が変わる
+        project, scene = _project_with_scene()
+        dialog = ExportDialog(project)
+        try:
+            dialog._path.setText("C:/out/mine.mp4")
+            dialog.select_scene(scene.id)
+            assert dialog._path.text() == "C:/out/mine.mp4"
+        finally:
+            dialog.deleteLater()

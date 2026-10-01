@@ -121,7 +121,9 @@ def _project(segments: int, seconds: Fraction) -> Project:
                 index=1, sample_rate=48000, channels=2, time_base=Fraction(1, 48000), codec="aac"
             ),
         ),
-        transcript=Transcript(
+    ).with_transcript(
+        # 字幕は音声ごとに持つ 番号を省くと 1 本目の音声の字幕になる
+        Transcript(
             segments=tuple(
                 TranscriptSegment(
                     start=step * index,
@@ -130,7 +132,7 @@ def _project(segments: int, seconds: Fraction) -> Project:
                 )
                 for index in range(segments)
             )
-        ),
+        )
     )
     project = Project.create(ProjectSettings(width=1920, height=1080, frame_rate=FrameRate(30)))
     project = AddMedia(media).apply(project)

@@ -15,6 +15,7 @@ import av.error
 
 from sashimono.core.model import AudioStreamInfo, MediaItem, VideoStreamInfo
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.decode.rational import as_fraction
 
 __all__ = [
     "PROBE_CACHE_SIZE",
@@ -307,7 +308,7 @@ def _stream_start(stream: av.stream.Stream) -> Fraction | None:
     """ストリームの頭の時刻（秒 PTS の数え方） 分からなければ ``None``"""
     if stream.start_time is None or stream.time_base is None:
         return None
-    return stream.start_time * Fraction(stream.time_base)
+    return stream.start_time * as_fraction(stream.time_base)
 
 
 def _container_duration(container: av.container.InputContainer, origin: Fraction) -> Fraction:
@@ -336,7 +337,7 @@ def _container_duration(container: av.container.InputContainer, origin: Fraction
     longest = Fraction(0)
     for stream in streams:
         if stream.duration is not None and stream.time_base is not None:
-            length = Fraction(stream.duration) * stream.time_base
+            length = Fraction(stream.duration) * as_fraction(stream.time_base)
             longest = max(longest, _relative_end(_stream_start(stream), length, origin))
     return longest
 
@@ -367,7 +368,7 @@ def _video_info(
         width=stream.codec_context.width,
         height=stream.codec_context.height,
         frame_rate=frame_rate,
-        time_base=Fraction(stream.time_base) if stream.time_base else Fraction(1, 1000),
+        time_base=as_fraction(stream.time_base) if stream.time_base else Fraction(1, 1000),
         codec=stream.codec_context.name,
         pixel_format=stream.format.name if stream.format else "",
         rotation=rotation,
@@ -389,10 +390,10 @@ def _stream_end(stream: av.video.stream.VideoStream, origin: Fraction) -> Fracti
     """
     if stream.duration is None or stream.time_base is None:
         return None
-    length = Fraction(stream.duration) * Fraction(stream.time_base)
+    length = Fraction(stream.duration) * as_fraction(stream.time_base)
     if stream.start_time is None:
         return length if length > 0 else None
-    end = Fraction(stream.start_time) * Fraction(stream.time_base) + length - origin
+    end = Fraction(stream.start_time) * as_fraction(stream.time_base) + length - origin
     return end if end > 0 else None
 
 
@@ -402,7 +403,7 @@ def _audio_info(stream: av.audio.stream.AudioStream) -> AudioStreamInfo:
         index=stream.index,
         sample_rate=context.sample_rate,
         channels=context.layout.nb_channels,
-        time_base=Fraction(stream.time_base) if stream.time_base else Fraction(1, 48000),
+        time_base=as_fraction(stream.time_base) if stream.time_base else Fraction(1, 48000),
         codec=context.name,
         language=stream.metadata.get("language") or None,
     )

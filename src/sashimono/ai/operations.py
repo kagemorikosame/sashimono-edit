@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -44,19 +46,24 @@ from sashimono.core.commands import (
     SplitClip,
     TrimClip,
     UngroupClips,
+    Voice,
+    burn_subtitles,
     insert_generated,
     insert_media,
     insert_scene,
     new_scene,
+    subtitle_voices,
 )
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.io.serialize import json_text
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
     EffectId,
+    GeneratedSource,
     Interpolation,
     MediaId,
     MediaItem,
@@ -243,6 +250,138 @@ def _clip_ids_schema() -> dict[str, Any]:
 # --- 読み取り ---
 
 
+#: 1 回の返事の長さの上限（JSON の文字数） 配布版の Claude Code（SDK が同梱する claude.exe）は
+#: MCP の道具の返事を 25000 トークン（``MAX_MCP_OUTPUT_TOKENS`` の既定）で打ち切り、残りを
+#: ファイルへ退ける アシスタントにはファイルを読む道具を渡していないので、退けた分は読めない
+#: （字幕 328 行の get_subtitles がそうなり、誤植を直せなかった 利用者の画面） 日本語は
+#: 1 文字が 1〜2 トークンになるので、字数で 12000 に収めれば 25000 トークンの半分ほどで済む
+MAX_RESULT_CHARS = 12000
+#: 一覧の既定の件数と上限 上限まで頼まれても :data:`MAX_RESULT_CHARS` で切る
+DEFAULT_PAGE = 50
+MAX_PAGE = 300
+
+
+def _paged(
+    rows: list[Any],
+    arguments: dict[str, Any],
+    *,
+    name: str = "items",
+    truncated_note: str = "",
+) -> dict[str, Any]:
+    """一覧を ``offset`` と ``limit`` で切り出す 返事が長すぎれば件数を減らす
+
+    1 件だけでも長すぎるときは中身を切り詰めて ``truncated`` を付け、``truncated_note``
+    （全文の取り方）を添える 返事はいつも :data:`MAX_RESULT_CHARS` に収まる
+
+    続きがあれば ``next_offset`` と、次に呼ぶときの書き方を添える 無いときは添えない
+    （添えると、もう読み終えたのに続きを探しに行く）
+    """
+    total = len(rows)
+    try:
+        offset = max(0, int(arguments.get("offset", 0) or 0))
+        limit = int(arguments.get("limit", DEFAULT_PAGE) or DEFAULT_PAGE)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("offset と limit は整数で渡してください") from exc
+    limit = min(max(limit, 1), MAX_PAGE)
+    chosen = rows[offset : offset + limit]
+    while len(chosen) > 1 and len(json_text(chosen)) > MAX_RESULT_CHARS - _ENVELOPE_CHARS:
+        # 1 件ずつ減らすと長い一覧で遅い 4 分の 3 ずつ減らしてから残りを詰める
+        chosen = chosen[: max(1, len(chosen) * 3 // 4)]
+    if len(chosen) == 1 and len(json_text(chosen)) > MAX_RESULT_CHARS - _ENVELOPE_CHARS:
+        # 1 件だけで上限を越える（長い字幕 1 行など） 件数ではもう減らせないので中身を
+        # 切り詰めて印を付ける 切らずに返すと打ち切られ、退けた分は読めない（PR #231 の指摘）
+        chosen = [_fit(chosen[0], MAX_RESULT_CHARS - _ENVELOPE_CHARS)]
+    result = _page(chosen, name, total, offset, truncated_note)
+    # 行だけで見積もると、外側（件数・続き・案内）の分で上限を越えうる（PR #231 の指摘）
+    # 組み上がった返事の長さで確かめ、越えれば件数を減らすか 1 件を詰め直す
+    budget = MAX_RESULT_CHARS - _ENVELOPE_CHARS
+    while len(json_text(result)) > MAX_RESULT_CHARS:
+        if len(chosen) > 1:
+            chosen = chosen[: max(1, min(len(chosen) - 1, len(chosen) * 3 // 4))]
+        else:
+            budget //= 2
+            if budget < _KEEP_CHARS:
+                break
+            chosen = [_fit(chosen[0], budget)]
+        result = _page(chosen, name, total, offset, truncated_note)
+    return result
+
+
+def _page(
+    chosen: list[Any], name: str, total: int, offset: int, truncated_note: str
+) -> dict[str, Any]:
+    """切り出した行に、件数・続き・案内を添えた返事"""
+    notes: list[str] = []
+    if any(isinstance(row, dict) and row.get("truncated") for row in chosen):
+        # 呼ぶ側が先に切り詰めた行（長い字幕の本文）も、全文の読み方を添える
+        notes.append(truncated_note or "長すぎる件は中身を切り詰めた（truncated）")
+    end = offset + len(chosen)
+    result: dict[str, Any] = {name: chosen, "total": total, "offset": offset, "count": len(chosen)}
+    if end < total:
+        result["next_offset"] = end
+        notes.append(f"続きがあります 次は offset={end} で呼んでください（全 {total} 件）")
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+#: 一覧の外側（件数・続きの案内）に取っておく字数
+_ENVELOPE_CHARS = 600
+#: 切り詰めても残す文字列の長さ これより短い文字列は切らない（ID や名前を壊さない）
+_KEEP_CHARS = 80
+
+
+def _fit(row: Any, limit: int) -> Any:
+    """1 件を ``limit`` 字（JSON）に収める 一番長い文字列から半分に切り、足りなければ
+    一番長い配列を半分にする 切った件には ``truncated`` を付ける"""
+    fitted = json.loads(json_text(row))
+    cut = False
+    while len(json_text(fitted)) > limit:
+        place = _longest(fitted, str, _KEEP_CHARS) or _longest(fitted, list, 1)
+        if place is None:
+            break
+        holder, key, value = place
+        if isinstance(value, str):
+            holder[key] = value[: len(value) // 2] + "…"
+        else:
+            holder[key] = value[: len(value) // 2]
+        cut = True
+    if cut and isinstance(fitted, dict):
+        fitted["truncated"] = True
+    return fitted
+
+
+def _longest(value: Any, kind: type, floor: int) -> tuple[Any, Any, Any] | None:
+    """``value`` の中で ``kind``（文字列か配列）の一番長い物と、その入れ物と鍵"""
+    best: tuple[Any, Any, Any] | None = None
+    stack = [value]
+    while stack:
+        holder = stack.pop()
+        items = holder.items() if isinstance(holder, dict) else enumerate(holder)
+        for key, child in items:
+            size = len(child) if isinstance(child, (str, list)) and isinstance(child, kind) else -1
+            if size > floor and (best is None or size > len(best[2])):
+                best = (holder, key, child)
+            if isinstance(child, (dict, list)):
+                stack.append(child)
+    return best
+
+
+def _paging() -> dict[str, Any]:
+    """一覧の道具の引数 何件目から・いくつ"""
+    return {
+        "offset": _integer("何件目から（0 から 続きは返事の next_offset）"),
+        "limit": _integer(f"いくつ（既定 {DEFAULT_PAGE} 返事が長ければ少なく返す）"),
+    }
+
+
+#: 一覧の道具の説明に足す文
+PAGING_NOTE = (
+    " 返事は長くなりすぎないよう切って返す 続きがあれば next_offset が付くので、"
+    "offset にその値を渡して続きを読む 多いときは絞り込みの引数で先に絞る"
+)
+
+
 def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     project = _project(host)
@@ -268,9 +407,9 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
     project = _project(host)
-    return [
+    wanted = str(arguments.get("contains") or "")
+    rows = [
         {
             "media_id": str(item.id),
             "name": item.name,
@@ -278,15 +417,23 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             "duration_seconds": round(float(item.duration), 3),
             "has_video": item.has_video,
             "has_audio": item.has_audio,
+            # 音声が何本もある素材（ゲームの音とマイクの声など） transcribe の audio で選ぶ
+            "audio_count": len(item.audio_streams),
             "subtitle_count": len(item.transcript) if item.transcript is not None else 0,
+            # 字幕は音声ごとに別 音声の番号（1 から）ごとの字幕の数
+            "subtitle_counts": {
+                str(number): len(item.transcript_for(stream.index) or ())
+                for number, stream in enumerate(item.audio_streams, start=1)
+            },
         }
         for item in project.media
+        if not wanted or wanted in item.name
     ]
+    return _paged(rows, arguments, name="media")
 
 
 def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
-    return [
+    rows = [
         {
             "track_id": str(track.id),
             "kind": track.kind.value,
@@ -299,16 +446,20 @@ def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
         }
         for track in _project(host).timeline.tracks
     ]
+    return _paged(rows, arguments, name="tracks")
 
 
 def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     wanted = str(arguments.get("track_id") or "")
+    low, high = _frame_window(project, arguments)
     clips = []
     for track in project.timeline.tracks:
         if wanted and str(track.id) != wanted:
             continue
         for clip in track.clips:
+            if clip.timeline_end <= low or (high is not None and clip.timeline_start >= high):
+                continue
             media = project.find_media(clip.media_id) if clip.media_id is not None else None
             # 混合トラックのクリップは絵と音を 1 本で出すので、どちらを出すかも見せる
             # ほかの種類では読まない項目なので、出すと AI が効かない値を触りに行く
@@ -349,7 +500,28 @@ def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
                     ],
                 }
             )
-    return clips
+    return _paged(clips, arguments, name="clips")
+
+
+def _frame_window(project: Project, arguments: dict[str, Any]) -> tuple[int, int | None]:
+    """``from_seconds`` ``to_seconds``（タイムラインの秒）をフレームの範囲 ``[start, end)`` へ
+
+    説明どおり「from より後に掛かり、to より前に始まる」物を残す 呼ぶ側は
+    ``終わり <= start`` と ``始まり >= end`` を外す ``start`` は from の秒を含むフレーム
+    （そこで終わる物は外れ、そこを越えて続く物は残る） ``end`` は to の秒以上で最初に
+    始まるフレーム 前は to のフレームに 1 を足していて、30fps で 1 秒ちょうどを渡すと
+    1 秒から始まる物まで返した（PR #231 の指摘） 秒は分数で掛けて、0.1 秒のような
+    値が浮動小数の誤差で 1 フレームずれないようにする 省けば全体
+    """
+    fps = project.rate.fps
+    try:
+        low = arguments.get("from_seconds")
+        high = arguments.get("to_seconds")
+        start = math.floor(Fraction(str(float(low))) * fps) if low is not None else 0
+        end = math.ceil(Fraction(str(float(high))) * fps) if high is not None else None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ToolError("from_seconds と to_seconds は秒の数で渡してください") from exc
+    return max(0, start), end
 
 
 def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -365,27 +537,34 @@ def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _list_effects(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del host, arguments
-    definitions = []
-    for definition in registry.all():
-        definitions.append(
-            {
-                "kind": definition.kind,
-                "label": definition.label,
-                "category": definition.category,
-                "parameters": [_describe_spec(spec) for spec in definition.parameters],
-            }
-        )
-    definitions.extend(
-        {
-            "kind": source.kind,
-            "label": source.label,
-            "category": "オブジェクト",
-            "parameters": [_describe_spec(spec) for spec in source.parameters],
-        }
-        for source in (TEXT, SHAPE)
-    )
-    return definitions
+    """エフェクトの一覧 kind を渡したときだけパラメータまで出す
+
+    全部のパラメータを並べると、読み込んだ AviUtl のスクリプトまで含めて返事が長すぎ、
+    打ち切られる まず名前で探し、使うエフェクトだけ詳しく読む
+    """
+    del host
+    wanted_kind = str(arguments.get("kind") or "")
+    category = str(arguments.get("category") or "")
+    contains = str(arguments.get("contains") or "")
+    entries: list[tuple[str, str, str, tuple[Any, ...]]] = [
+        (d.kind, d.label, d.category, d.parameters) for d in registry.all()
+    ]
+    entries += [(s.kind, s.label, "オブジェクト", s.parameters) for s in (TEXT, SHAPE)]
+    rows: list[dict[str, Any]] = []
+    for kind, label, group, parameters in entries:
+        if wanted_kind and kind != wanted_kind:
+            continue
+        if category and group != category:
+            continue
+        if contains and contains not in kind and contains not in label:
+            continue
+        row: dict[str, Any] = {"kind": kind, "label": label, "category": group}
+        if wanted_kind:
+            row["parameters"] = [_describe_spec(spec) for spec in parameters]
+        else:
+            row["parameter_count"] = len(parameters)
+        rows.append(row)
+    return _paged(rows, arguments, name="effects")
 
 
 def _describe_spec(spec: object) -> dict[str, Any]:
@@ -408,19 +587,74 @@ def _describe_spec(spec: object) -> dict[str, Any]:
     return described
 
 
+def _audio_stream(media: MediaItem, arguments: dict[str, Any]) -> int | None:
+    """引数 ``audio``（1 から数えた音声の番号）を音声ストリームの番号へ 省けば ``None``（1 本目）
+
+    番号はタイムラインの札（音声 N）と同じく 1 から数える ffprobe の番号は映像を含み、
+    AI が素材ごとに数え直すことになる
+    """
+    if arguments.get("audio") is None:
+        return None
+    try:
+        number = int(arguments["audio"])
+    except (TypeError, ValueError) as exc:
+        raise ToolError("audio は 1 から数えた音声の番号です") from exc
+    if not 1 <= number <= len(media.audio_streams):
+        raise ToolError(
+            f"{media.name} の音声は {len(media.audio_streams)} 本です（audio は 1 から）"
+        )
+    return media.audio_streams[number - 1].index
+
+
+def _audio_number(media: MediaItem | None, stream: int | None) -> int:
+    """音声ストリームの番号を 1 から数えた番号へ（:func:`_audio_stream` の逆）"""
+    if media is None:
+        return 1
+    key = media.transcript_stream(stream)
+    known = [s.index for s in media.audio_streams]
+    return known.index(key) + 1 if key in known else 1
+
+
 def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """タイムラインに出る字幕 絞り込み（素材・音声・時刻・言葉）と、続きを辿る切り出し
+
+    ``compact`` なら行の番号・時刻・本文だけ（誤植を探す軽い形） 行の番号は絞り込んだ
+    後の通し番号で、offset に使える
+    """
     project = _project(host)
     wanted = str(arguments.get("media_id") or "")
+    wanted_audio = arguments.get("audio")
+    contains = str(arguments.get("contains") or "")
+    compact = bool(arguments.get("compact", False))
+    one = str(arguments.get("segment_id") or "")
+    try:
+        text_offset = max(0, int(arguments.get("text_offset", 0) or 0))
+    except (TypeError, ValueError) as exc:
+        raise ToolError("text_offset は整数で渡してください") from exc
+    low, high = _frame_window(project, arguments)
     rows = []
     for subtitle in project_timeline(project):
-        located = project.timeline.locate_clip(subtitle.clip_id)
-        media_id = located[1].media_id if located is not None else None
+        if one and str(subtitle.segment.id) != one:
+            continue
+        if subtitle.end_frame <= low or (high is not None and subtitle.start_frame >= high):
+            continue
+        if contains and contains not in subtitle.segment.text:
+            continue
+        # 素材と音声は字幕の出どころから取る 置いたクリップからたどると、置いたシーンの
+        # 中の字幕は素材を持たないシーンのクリップに当たり、どの素材の字幕か分からない
+        media_id = subtitle.media_id
         if wanted and str(media_id) != wanted:
+            continue
+        media = project.find_media(media_id) if media_id is not None else None
+        audio = _audio_number(media, subtitle.stream)
+        if wanted_audio is not None and audio != int(wanted_audio):
             continue
         rows.append(
             {
                 "segment_id": str(subtitle.segment.id),
                 "media_id": str(media_id) if media_id is not None else None,
+                # 字幕は音声ごとに別 set_subtitle_text と clean_subtitles へ同じ番号を渡す
+                "audio": audio,
                 "text": subtitle.segment.text,
                 "start": subtitle.start_frame,
                 "end": subtitle.end_frame,
@@ -428,7 +662,152 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "source_start_seconds": round(float(subtitle.segment.start), 3),
             }
         )
-    return rows
+    for row in rows:
+        _clip_text(row, text_offset if one else None)
+    if compact:
+        rows = [
+            {"n": index, "time": row["start_timecode"], "text": row["text"]}
+            | ({"segment_id": row["segment_id"], "truncated": True} if "truncated" in row else {})
+            for index, row in enumerate(rows)
+        ]
+    return _paged(rows, arguments, name="subtitles", truncated_note=_FULL_TEXT_NOTE)
+
+
+#: 一覧で 1 行の本文を切り詰める長さ 1 行が長いと、ほかの行が 1 回の返事に入らない
+LONG_TEXT_CHARS = 2000
+#: segment_id で 1 行を読むときに 1 回で返す本文の長さ 返事の上限（12000）に収める
+TEXT_CHUNK_CHARS = 8000
+_FULL_TEXT_NOTE = (
+    "長い本文は切り詰めた（truncated） 全文は get_subtitles に segment_id を渡して読む"
+    "（それでも長ければ next_text_offset を text_offset に渡して続きを読む）"
+)
+
+
+def _clip_text(row: dict[str, Any], text_offset: int | None) -> None:
+    """字幕 1 行の本文を返事に収まる長さにする
+
+    ``text_offset`` が ``None``（一覧）なら長い本文の頭だけを残して ``truncated`` を付ける
+    数（segment_id で 1 行を読む）なら、そこから :data:`TEXT_CHUNK_CHARS` 字を返し、続きが
+    あれば ``next_text_offset`` を添える
+    """
+    text = str(row["text"])
+    if text_offset is None:
+        if len(text) > LONG_TEXT_CHARS:
+            row["text"] = text[:LONG_TEXT_CHARS] + "…"
+            row["truncated"] = True
+            row["text_length"] = len(text)
+        return
+    if text_offset == 0 and len(text) <= TEXT_CHUNK_CHARS:
+        return
+    row["text"] = text[text_offset : text_offset + TEXT_CHUNK_CHARS]
+    row["text_offset"] = text_offset
+    row["text_length"] = len(text)
+    if text_offset + TEXT_CHUNK_CHARS < len(text):
+        row["next_text_offset"] = text_offset + TEXT_CHUNK_CHARS
+
+
+def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキストの両方
+
+    字幕から置いたテキスト（焼き込み）は、出どころの印（:class:`SubtitleOrigin`）が直した
+    字幕の行を指すクリップだけ 字幕だけを直すと、焼き込んだ文字に誤植が残る 本文の一致で
+    探すと、手で書いたタイトルがたまたま同じ本文だと書き換えてしまう 印の無い前の版の
+    焼き込みは直さず、数を返事に添える 1 回の取り消しで全部戻る
+    """
+    pairs_raw = arguments.get("pairs") or []
+    if not isinstance(pairs_raw, list) or not pairs_raw:
+        raise ToolError('pairs に [{"from": 誤, "to": 正}, …] を渡してください')
+    pairs: list[tuple[str, str]] = []
+    for entry in pairs_raw:
+        if not isinstance(entry, dict) or not str(entry.get("from") or ""):
+            raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は空にできません）')
+        pairs.append((str(entry["from"]), str(entry.get("to") or "")))
+
+    project = _project(host)
+    targets: list[tuple[MediaItem, int]] = []
+    if arguments.get("media_id"):
+        media = _require_media(project, str(arguments["media_id"]))
+        streams = (
+            [media.transcript_stream(_audio_stream(media, arguments))]
+            if arguments.get("audio") is not None
+            else [index for index, _ in media.transcripts]
+        )
+        targets = [(media, stream) for stream in streams]
+    else:
+        targets = [(item, index) for item in project.media for index, _ in item.transcripts]
+
+    counts = [0] * len(pairs)
+
+    def fixed(text: str, *, counted: bool = True) -> str:
+        for number, (before, after) in enumerate(pairs):
+            found = text.count(before)
+            if found:
+                if counted:
+                    counts[number] += found
+                text = text.replace(before, after)
+        return text
+
+    commands: list[Command] = []
+    # 直した字幕の行 ID から、その字幕の素材と音声へ
+    renamed: dict[SegmentId, tuple[MediaId, int]] = {}
+    old_texts: set[str] = set()
+    for media, stream in targets:
+        transcript = media.transcript_for(stream)
+        if transcript is None:
+            continue
+        segments = []
+        changed = False
+        for segment in transcript.segments:
+            text = fixed(segment.text)
+            if text != segment.text:
+                renamed[segment.id] = (media.id, stream)
+                old_texts.add(segment.text.strip())
+                segment = segment.with_text(text)
+                changed = True
+            segments.append(segment)
+        if changed:
+            updated = replace(transcript, segments=tuple(segments))
+            commands.append(SetTranscript(media.id, updated, stream=stream))
+    # 焼き込んだテキスト 印が直した字幕の行を指すクリップの本文へ、同じ置き換えを掛ける
+    # 焼き込んだ後に手で足した言葉も残る（字幕の新しい本文で丸ごと上書きしない）
+    burned = 0
+    unmarked = 0
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.source is None or clip.source.kind != "text":
+                continue
+            text = str(clip.source.params.get("text", ""))
+            origin = clip.subtitle_origin
+            if origin is None:
+                # 印の無い前の版の焼き込みかもしれない 手で書いた物と見分けられないので直さない
+                if text.strip() in old_texts:
+                    unmarked += 1
+                continue
+            owner = renamed.get(origin.segment_id)
+            if owner is None:
+                continue
+            if origin.media_id is not None and owner != (origin.media_id, origin.stream):
+                continue
+            new_text = fixed(text, counted=False)
+            if new_text != text:
+                commands.append(SetParam(ParamPath.of_source(clip.id, "text"), new_text))
+                burned += 1
+    if commands:
+        host.apply_commands(commands, "字幕の誤植を直す")
+    return {
+        "replaced": sum(counts),
+        "per_pair": [
+            {"from": before, "to": after, "count": count}
+            for (before, after), count in zip(pairs, counts, strict=True)
+        ],
+        "unmatched": [
+            before for (before, _), count in zip(pairs, counts, strict=True) if not count
+        ],
+        "burned_text_clips": burned,
+        # 本文は直した字幕と同じだが、出どころの印が無いので直さなかったテキスト
+        # 印を付ける前の版で焼き込んだ物か、手で書いた物 要るなら set_param で直す
+        "unmarked_text_clips": unmarked,
+    }
 
 
 def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -572,6 +951,40 @@ def _add_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     )
     host.apply_commands(commands, f"テキストを追加: {text[:12]}")
     return {"added": text}
+
+
+def _add_shape(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """図形を置く テロップの下に敷く帯や、目印の丸・矢印に使う
+
+    前は道具が無く、AI はテキストしか置けなかった（AI テスト #3 で分かった）
+    """
+    kind = str(arguments.get("shape", "rect"))
+    spec = SHAPE.spec("shape")
+    choices = [value for value, _ in getattr(spec, "choices", ())]
+    if kind not in choices:
+        raise ToolError(f"shape は {'、'.join(choices)} のどれかです: {kind}")
+    overrides: dict[str, ParamInput] = {"shape": kind}
+    for name in ("width", "height", "pos_x", "pos_y", "rotation", "line_width", "corner_radius"):
+        if name in arguments:
+            overrides[name] = float(arguments[name])
+    if "color" in arguments:
+        color = _parse_color(str(arguments["color"]))
+        if color is None:
+            raise ToolError(f"color は #RRGGBB か #RRGGBBAA で渡してください: {arguments['color']}")
+        overrides["color"] = color
+
+    duration = int(arguments.get("duration", 150))
+    if duration < 1:
+        raise ToolError("duration は 1 フレーム以上です")
+    at_frame = arguments.get("at_frame")
+    commands = insert_generated(
+        _project(host),
+        SHAPE.create(**overrides),
+        at_frame=int(at_frame) if at_frame is not None else host.playhead,
+        duration=duration,
+    )
+    host.apply_commands(commands, f"図形を追加: {kind}")
+    return {"added": kind}
 
 
 #: 場面切り替えの切り替え方 生成オブジェクトの選択肢と同じ並び
@@ -902,7 +1315,10 @@ def _set_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     segment_id = str(arguments.get("segment_id", ""))
     text = str(arguments.get("text", ""))
-    host.apply_commands([SetSegmentText(media.id, SegmentId(segment_id), text)], "字幕を編集")
+    stream = _audio_stream(media, arguments)
+    host.apply_commands(
+        [SetSegmentText(media.id, SegmentId(segment_id), text, stream=stream)], "字幕を編集"
+    )
     return {"segment_id": segment_id, "text": text}
 
 
@@ -911,7 +1327,9 @@ def _clean_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
 
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
-    if media.transcript is None:
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None:
         raise ToolError(f"{media.name} にはまだ字幕がありません")
 
     options = CleanupOptions(
@@ -919,14 +1337,49 @@ def _clean_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         max_lines=int(arguments.get("max_lines", 2)),
         punctuation=str(arguments.get("punctuation", "keep")),
     )
-    cleaned = clean_transcript(media.transcript, options)
+    cleaned = clean_transcript(transcript, options)
     changed = sum(
         1
-        for before, after in zip(media.transcript.segments, cleaned.segments, strict=False)
+        for before, after in zip(transcript.segments, cleaned.segments, strict=False)
         if before.text != after.text
     )
-    host.apply_commands([SetTranscript(media.id, cleaned)], "字幕を整形")
+    host.apply_commands([SetTranscript(media.id, cleaned, stream=stream)], "字幕を整形")
     return {"changed": changed, "remaining": len(cleaned)}
+
+
+def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕をテキストのクリップとしてタイムラインへ置く（焼き込み） 話し手ごとに別のレイヤー
+
+    前は道具が無く、「字幕をテキストオブジェクトとして書き出して」と頼まれても AI には
+    できなかった 画面の〔焼き込み〕と同じ ``burn_subtitles`` を通す
+    """
+    project = _project(host)
+    voices: list[Voice] | None = None
+    if arguments.get("media_id"):
+        media = _require_media(project, str(arguments["media_id"]))
+        if arguments.get("audio") is not None:
+            voices = [(media.id, media.transcript_stream(_audio_stream(media, arguments)))]
+        else:
+            voices = [v for v in subtitle_voices(project) if v[0] == media.id]
+    raw_segments = arguments.get("segment_ids")
+    segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
+
+    template: GeneratedSource | Clip = TEXT.create(size=48.0, pos_y=-380.0, border_width=4.0)
+    if arguments.get("template_clip_id"):
+        located = project.timeline.locate_clip(ClipId(str(arguments["template_clip_id"])))
+        if located is None:
+            raise ToolError(f"ひな形のクリップが見つかりません: {arguments['template_clip_id']}")
+        clip = located[1]
+        if clip.source is None or clip.source.kind != "text":
+            raise ToolError("ひな形にできるのはテキストのクリップだけです")
+        template = clip
+    commands = burn_subtitles(project, template, voices=voices, segments=segments)
+    if not commands:
+        raise ToolError("置ける字幕がありません（タイムラインに出ている字幕が無い）")
+    host.apply_commands(commands, "字幕を焼き込み")
+    placed = sum(1 for c in commands if isinstance(c, AddClip))
+    tracks = [c.track.name for c in commands if isinstance(c, AddTrack)]
+    return {"placed": placed, "tracks": tracks}
 
 
 def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -934,7 +1387,8 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
 
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
-    waveform = host.waveform(media)
+    stream = _audio_stream(media, arguments)
+    waveform = host.waveform(media, stream)
     if waveform is None:
         raise ToolError(f"{media.name} の波形解析がまだ終わっていません 少し待ってください")
 
@@ -944,10 +1398,13 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         padding=_seconds(arguments.get("padding", 0.1)),
     )
     silences = detect_silence(waveform, options)
-    if bool(arguments.get("keep_speech", True)) and media.transcript is not None:
-        silences = keep_speech(silences, media.transcript)
+    transcript = media.transcript_for(stream)
+    if bool(arguments.get("keep_speech", True)) and transcript is not None:
+        silences = keep_speech(silences, transcript)
 
-    ranges = plan_cuts(project, media.id, silences)
+    # 省いた音（None）は 1 本目 そのまま渡すと plan_cuts は音で絞らず、別の位置へ置いた
+    # 音声 2 のクリップでも音声 1 の無音を切る（PR #231 の指摘）
+    ranges = plan_cuts(project, media.id, silences, stream=media.transcript_stream(stream))
     if not ranges:
         raise ToolError("切れる無音が見つかりません threshold_db を上げてみてください")
 
@@ -969,7 +1426,19 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
-    message = host.start_transcription(media.id, str(arguments.get("model", "large-v3")))
+    stream = _audio_stream(media, arguments)
+    if media.transcript_for(stream) is not None and not bool(arguments.get("replace", False)):
+        # 黙って置き換えると、人が直した字幕まで消える 置き換えるかは頼む側が決める
+        raise ToolError(
+            f"{media.name} の音声 {_audio_number(media, stream)} には字幕があります"
+            " 置き換えるときは replace を true にしてください"
+        )
+    try:
+        message = host.start_transcription(
+            media.id, str(arguments.get("model", "large-v3")), audio_stream=stream
+        )
+    except RuntimeError as exc:
+        raise ToolError(str(exc)) from exc
     return {
         "started": message,
         "next": "しばらく待ってから transcription_status を見てください"
@@ -1107,20 +1576,29 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_media",
-        description="メディアプールの素材を一覧する media_id はここで得る",
-        schema=_schema({}),
+        description="メディアプールの素材を一覧する media_id はここで得る" + PAGING_NOTE,
+        schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
     ),
     Operation(
         name="list_tracks",
-        description="タイムラインのトラックを一覧する",
-        schema=_schema({}),
+        description="タイムラインのトラックを一覧する" + PAGING_NOTE,
+        schema=_schema(_paging()),
         handler=_list_tracks,
     ),
     Operation(
         name="list_clips",
-        description="クリップを一覧する track_id を省くと全トラックが対象",
-        schema=_schema({"track_id": _string("絞り込むトラック")}),
+        description="クリップを一覧する track_id を省くと全トラックが対象" + PAGING_NOTE,
+        schema=_schema(
+            {
+                "track_id": _string("絞り込むトラック"),
+                "from_seconds": _number("この秒より後に掛かるクリップだけ（タイムラインの秒）"),
+                "to_seconds": _number(
+                    "この秒より前に始まるクリップだけ（ちょうどから始まる物は外す）"
+                ),
+                **_paging(),
+            }
+        ),
         handler=_list_clips,
     ),
     Operation(
@@ -1131,14 +1609,44 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_effects",
-        description="使えるエフェクトと生成オブジェクト、そのパラメータ名と範囲",
-        schema=_schema({}),
+        description=(
+            "使えるエフェクトと生成オブジェクトの一覧 パラメータ名と範囲は kind を渡したときだけ"
+            " 返す（全部を並べると長すぎる）" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "kind": _string("詳しく見るエフェクトの種類（パラメータまで返す）"),
+                "category": _string("分類で絞る（色・ぼかし・音 など）"),
+                "contains": _string("種類か名前に含む言葉で絞る"),
+                **_paging(),
+            }
+        ),
         handler=_list_effects,
     ),
     Operation(
         name="get_subtitles",
-        description="タイムラインに出る字幕を、表示位置つきで一覧する",
-        schema=_schema({"media_id": _string("絞り込む素材")}),
+        description=(
+            "タイムラインに出る字幕を、表示位置つきで一覧する 誤植を探すときは compact で"
+            "行の番号・時刻・本文だけを読み、contains（言葉）や時刻で絞る 直すときは"
+            " replace_subtitle_text で「誤 → 正」をまとめて渡す" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("絞り込む素材"),
+                "audio": _integer("絞り込む音声の番号（1 から）"),
+                "contains": _string("本文に含む言葉で絞る（部分一致）"),
+                "segment_id": _string(
+                    "この 1 行だけ 長くて切り詰められた（truncated）行の全文を読む"
+                ),
+                "text_offset": _integer(
+                    "segment_id の行の本文を何文字目から返すか（続きは返事の next_text_offset）"
+                ),
+                "from_seconds": _number("この秒より後に出る字幕だけ（タイムラインの秒）"),
+                "to_seconds": _number("この秒より前に出始める字幕だけ（ちょうどから出る物は外す）"),
+                "compact": _boolean("行の番号・時刻・本文だけを返す（軽い一覧）"),
+                **_paging(),
+            }
+        ),
         handler=_get_subtitles,
     ),
     Operation(
@@ -1289,6 +1797,31 @@ OPERATIONS: tuple[Operation, ...] = (
             ["text"],
         ),
         handler=_add_text,
+        writes=True,
+    ),
+    Operation(
+        name="add_shape",
+        description=(
+            "図形オブジェクトを置く テロップの下の帯や目印に使う shape は rect（矩形）"
+            "rounded（角丸）ellipse（楕円）triangle star arrow background（画面全体）など"
+        ),
+        schema=_schema(
+            {
+                "shape": _string("図形の種類 既定は rect"),
+                "width": _number("幅（画素）"),
+                "height": _number("高さ（画素）"),
+                "color": _string("色 #RRGGBB か #RRGGBBAA"),
+                "at_frame": _integer("置く位置 省略すると再生ヘッド"),
+                "duration": _integer("長さ（フレーム、既定 150）"),
+                "pos_x": _number("中央からの横位置"),
+                "pos_y": _number("中央からの縦位置 正が上"),
+                "rotation": _number("回転（度）"),
+                "line_width": _number("線の太さ"),
+                "corner_radius": _number("角丸の半径"),
+            },
+            [],
+        ),
+        handler=_add_shape,
         writes=True,
     ),
     Operation(
@@ -1523,10 +2056,41 @@ OPERATIONS: tuple[Operation, ...] = (
                 "media_id": _string("素材"),
                 "segment_id": _string("字幕"),
                 "text": _string("新しい本文"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id", "segment_id", "text"],
         ),
         handler=_set_subtitle_text,
+        writes=True,
+    ),
+    Operation(
+        name="replace_subtitle_text",
+        description=(
+            "字幕の本文の「誤 → 正」をまとめて置き換える 字幕と、字幕から置いたテキスト"
+            "（焼き込み）の両方を直し、1 回の取り消しで戻る 置き換えた数と、当たらなかった組を返す"
+            " 焼き込みは字幕から置いた印のあるテキストだけを直す 印の無い前の版の焼き込みは"
+            "直さず unmarked_text_clips に数える"
+        ),
+        schema=_schema(
+            {
+                "pairs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"from": {"type": "string"}, "to": {"type": "string"}},
+                        "required": ["from", "to"],
+                    },
+                    "description": "置き換える組 [{from: 誤, to: 正}, …] 前から順に当てる",
+                },
+                "media_id": _string("絞り込む素材（省けば全部）"),
+                "audio": _integer("絞り込む音声の番号（1 から media_id と一緒に）"),
+            },
+            ["pairs"],
+        ),
+        handler=_replace_subtitle_text,
         writes=True,
     ),
     Operation(
@@ -1538,10 +2102,36 @@ OPERATIONS: tuple[Operation, ...] = (
                 "max_line_chars": _integer("1 行の文字数（0 で折り返さない）"),
                 "max_lines": _integer("行数の上限"),
                 "punctuation": _string("keep / space / strip"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id"],
         ),
         handler=_clean_subtitles,
+        writes=True,
+    ),
+    Operation(
+        name="place_subtitles",
+        description=(
+            "字幕をテキストオブジェクトとしてタイムラインへ置く（焼き込み）"
+            " 話し手（素材と音声）ごとに別のレイヤーへ入れる 省けば出ている字幕を全部"
+            " 見た目はひな形のテキストのクリップを写す（省けば下寄せ・縁取りの既定）"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("絞り込む素材"),
+                "audio": _integer("絞り込む音声の番号（1 から） media_id と一緒に"),
+                "segment_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "置く字幕の ID（get_subtitles の segment_id） 省けば全部",
+                },
+                "template_clip_id": _string("見た目を写すテキストのクリップ"),
+            }
+        ),
+        handler=_place_subtitles,
         writes=True,
     ),
     Operation(
@@ -1554,6 +2144,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "min_silence": _number("最短の無音（秒、既定 0.5）"),
                 "padding": _number("前後に残す余白（秒、既定 0.1）"),
                 "keep_speech": _boolean("字幕のある区間は切らない（既定 true）"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
             },
             ["media_id"],
         ),
@@ -1563,13 +2157,29 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="transcribe",
         description="素材の字幕起こしを始める 終わるまで数分かかる",
-        schema=_schema({"media_id": _string("素材"), "model": _string("モデル名")}, ["media_id"]),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "model": _string("モデル名"),
+                "audio": _integer(
+                    "起こす音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 音声の本数は list_media の audio_count"
+                ),
+                "replace": _boolean(
+                    "その音声に字幕があるとき置き換える（既定 false 既にあれば断る）"
+                ),
+            },
+            ["media_id"],
+        ),
         handler=_transcribe,
         writes=True,
     ),
     Operation(
         name="transcription_status",
-        description="走っている字幕起こしの様子を見る",
+        description=(
+            "字幕起こしの様子を見る 走っている物と順番待ちの物を並べる"
+            " 起こしは 1 本ずつ順に走り、終わった物はその素材と音声の字幕へ入る"
+        ),
         schema=_schema({}),
         handler=_transcription_status,
     ),
