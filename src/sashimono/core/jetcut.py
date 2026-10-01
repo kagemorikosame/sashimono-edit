@@ -15,6 +15,7 @@ from collections.abc import Iterable, Sequence
 from fractions import Fraction
 
 from sashimono.core.model import Clip, MediaId, Project
+from sashimono.core.projection import subtitle_voice
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = ["FrameRange", "SourceRange", "merge_ranges", "plan_cuts"]
@@ -32,6 +33,7 @@ def plan_cuts(
     silences: Sequence[SourceRange],
     *,
     min_frames: int = 1,
+    stream: int | None = None,
 ) -> tuple[FrameRange, ...]:
     """素材の無音区間を、タイムライン上で切る範囲へ落とす
 
@@ -40,13 +42,26 @@ def plan_cuts(
 
     映像と音声がリンクしている場合、両方が同じ範囲を返すので、重なりをまとめた
     時点で 1 つになる
+
+    ``stream`` は無音を探した音声（素材の音声の番号） 渡せば、その音を鳴らすクリップの
+    位置だけで落とす リンクを外して音声 2 だけを切り詰めていると、音声 1 のクリップの
+    位置で音声 2 の無音を切ることになる（PR #231 の見直し） その音を鳴らすクリップが
+    1 本も無ければ（映像だけ残したなど）、前と同じく素材のクリップすべてで落とす
     """
+    media = project.find_media(media_id)
+    used = [
+        (track, clip)
+        for track in project.timeline.tracks
+        for clip in track.clips
+        if clip.media_id == media_id
+    ]
+    if stream is not None and media is not None:
+        wanted = media.transcript_stream(stream)
+        hearing = [(t, c) for t, c in used if subtitle_voice(project, t, c, media) == wanted]
+        used = hearing or used
     ranges: list[FrameRange] = []
-    for track in project.timeline.tracks:
-        for clip in track.clips:
-            if clip.media_id != media_id:
-                continue
-            ranges.extend(_project_clip(clip, silences, project.rate, min_frames))
+    for _, clip in used:
+        ranges.extend(_project_clip(clip, silences, project.rate, min_frames))
     return merge_ranges(ranges)
 
 

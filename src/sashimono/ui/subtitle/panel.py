@@ -59,7 +59,7 @@ from sashimono.core.model import (
     SegmentId,
     TranscriptSegment,
 )
-from sashimono.core.projection import project_clip, subtitle_stream
+from sashimono.core.projection import project_clip, subtitle_stream, subtitle_voice
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
@@ -370,8 +370,9 @@ class SubtitlePanel(QWidget):
         media = self._current_media()
         if media is None:
             return (None,)
-        # 鳴らす音の番号（音声トラックは stream_index 混合は audio_stream）も入れる
-        # 入れないと、クリップの音を替えても一覧が前の音の字幕の時刻のまま残る（PR #231 の指摘）
+        # クリップに出す字幕の音（:func:`subtitle_voice`）も入れる クリップの番号だけでなく
+        # トラックの種類（音声・映像・混合）でも聞こえる音が変わる 入れないと、クリップの音を
+        # 替えたり別の種類のトラックへ移したりしても、一覧が前の音の時刻のまま残る（PR #231）
         clips = tuple(
             (
                 str(clip.id),
@@ -379,8 +380,7 @@ class SubtitlePanel(QWidget):
                 clip.duration,
                 clip.source_in,
                 clip.speed,
-                clip.stream_index,
-                clip.audio_stream,
+                subtitle_voice(self._project, track, clip, media),
             )
             for track in self._project.timeline.tracks
             for clip in track.clips
@@ -465,7 +465,7 @@ class SubtitlePanel(QWidget):
                 # 見ている音の字幕を出すクリップだけ 音声 2 のクリップの位置を、音声 1 の
                 # 字幕の位置として出さない
                 stream = subtitle_stream(self._project, track, clip)
-                if media.transcript_stream(stream) != wanted:
+                if subtitle_voice(self._project, track, clip, media) != wanted:
                     continue
                 for projected in project_clip(clip, media, self._project.rate, track.id, stream):
                     key = projected.segment.id
@@ -572,10 +572,17 @@ class SubtitlePanel(QWidget):
         )
 
     def _source_time(self, media: MediaItem, frame: int) -> Fraction | None:
-        """タイムラインのフレームを、この素材のソース秒へ"""
+        """タイムラインのフレームを、この素材の見ている音のソース秒へ
+
+        見ている音の字幕を出すクリップから取る 最初に当たるクリップを使うと、リンクを外して
+        音声 2 だけを切り詰めたとき、音声 1 のクリップの時刻で音声 2 の字幕を割る（PR #231）
+        """
+        wanted = media.transcript_stream(self._stream)
         for track in self._project.timeline.tracks:
             for clip in track.clips:
                 if clip.media_id != media.id or not clip.contains(frame):
+                    continue
+                if subtitle_voice(self._project, track, clip, media) != wanted:
                     continue
                 elapsed = (frame - clip.timeline_start) * self._project.rate.frame_duration
                 return clip.source_in + elapsed * clip.speed
@@ -740,7 +747,7 @@ class SubtitlePanel(QWidget):
         transcript = media.transcript_for(self._stream)
         if protect and transcript is not None:
             silences = keep_speech(silences, transcript)
-        return plan_cuts(self._project, media.id, silences)
+        return plan_cuts(self._project, media.id, silences, stream=self._stream)
 
     def _template(self) -> tuple[GeneratedSource | Clip, str]:
         """焼き込みのひな形と、窓に出す説明 タイムラインで選んでいるテキストがあればそれ"""

@@ -1382,7 +1382,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     if bool(arguments.get("keep_speech", True)) and transcript is not None:
         silences = keep_speech(silences, transcript)
 
-    ranges = plan_cuts(project, media.id, silences)
+    ranges = plan_cuts(project, media.id, silences, stream=stream)
     if not ranges:
         raise ToolError("切れる無音が見つかりません threshold_db を上げてみてください")
 

@@ -304,6 +304,65 @@ class TestThePanel:
             panel.close()
             analyzer.close()
 
+    def test_moving_the_clip_to_a_picture_track_redoes_the_list(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、音声 2 の音のクリップを映像トラックへ移して音が 1 本目の扱いになっても、
+        # 一覧の印にトラックの種類が入っておらず、音声 2 の字幕の時刻が残った（PR #231）
+        del qt_application
+        said = Transcript((TranscriptSegment(Fraction(1), Fraction(2), "声"),))
+        media = _movie().with_transcript(said, 1).with_transcript(said, 2)
+        clip = Clip(timeline_start=0, duration=300, media_id=media.id, stream_index=2)
+        base = Project.create(media=(media,))
+        sound = Track(TrackKind.AUDIO, "A1", (clip,))
+        first = base.with_timeline(replace(base.timeline, tracks=(sound,)))
+        analyzer = MediaAnalyzer(sample_rate=48000, channels=2)
+        panel = SubtitlePanel(first, analyzer)
+        try:
+            panel.select_media(media.id)
+            panel.select_stream(2)
+            assert [start for _, start, _ in panel._rows] == [30]
+            moved = replace(sound, kind=TrackKind.VIDEO)
+            panel.set_project(first.with_timeline(replace(first.timeline, tracks=(moved,))))
+            assert [start for _, start, _ in panel._rows] == [-1]
+        finally:
+            panel.close()
+            analyzer.close()
+
+    def test_splitting_takes_the_time_from_the_voice_on_show(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、リンクを外して音声 2 だけを 2 秒切り詰めたとき、再生位置で最初に当たる
+        # 音声 1 のクリップの時刻（1 秒）で音声 2 の字幕を割った 正しくは 3 秒（PR #231）
+        del qt_application
+        said = Transcript((TranscriptSegment(Fraction(0), Fraction(5), "長い声"),))
+        media = _movie().with_transcript(said, 1).with_transcript(said, 2)
+        voice1 = Clip(timeline_start=0, duration=150, media_id=media.id, stream_index=1)
+        voice2 = Clip(
+            timeline_start=0,
+            duration=90,
+            media_id=media.id,
+            stream_index=2,
+            source_in=Fraction(2),
+        )
+        base = Project.create(media=(media,))
+        tracks = (
+            Track(TrackKind.AUDIO, "A1", (voice1,)),
+            Track(TrackKind.AUDIO, "A2", (voice2,)),
+        )
+        project = base.with_timeline(replace(base.timeline, tracks=tracks))
+        analyzer = MediaAnalyzer(sample_rate=48000, channels=2)
+        panel = SubtitlePanel(project, analyzer)
+        try:
+            panel.select_media(media.id)
+            panel.select_stream(2)
+            assert panel._source_time(media, 30) == Fraction(3)
+            panel.select_stream(1)
+            assert panel._source_time(media, 30) == Fraction(1)
+        finally:
+            panel.close()
+            analyzer.close()
+
     def test_a_single_voice_shows_no_choice(self, qt_application: QApplication) -> None:
         del qt_application
         single = _movie("一本", voices=1)

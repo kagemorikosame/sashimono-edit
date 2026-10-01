@@ -28,7 +28,13 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
-__all__ = ["ProjectedSubtitle", "project_clip", "project_timeline", "subtitle_stream"]
+__all__ = [
+    "ProjectedSubtitle",
+    "project_clip",
+    "project_timeline",
+    "subtitle_stream",
+    "subtitle_voice",
+]
 
 
 def subtitle_stream(project: Project, track: Track, clip: Clip) -> int | None:
@@ -39,6 +45,17 @@ def subtitle_stream(project: Project, track: Track, clip: Clip) -> int | None:
     if not project.plays_sound(track, clip):
         return None
     return heard_stream(track, clip)
+
+
+def subtitle_voice(project: Project, track: Track, clip: Clip, media: MediaItem) -> int:
+    """クリップに出す字幕の音声を、素材の字幕の番号（:meth:`MediaItem.transcript_stream`）で
+
+    字幕パネル・無音カット・分割の時刻など「どのクリップがこの音のクリップか」を決める所は
+    すべてこれで比べる 鳴らす音はトラックの種類で変わる（音声トラックは stream_index、
+    混合は audio_stream、映像トラックは鳴らさないので 1 本目） クリップの番号だけを見たり、
+    音を見ずに最初のクリップを使ったりすると、別の音の位置で字幕を割り、無音を切る
+    """
+    return media.transcript_stream(subtitle_stream(project, track, clip))
 
 
 @dataclass(frozen=True, slots=True)

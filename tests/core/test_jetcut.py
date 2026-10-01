@@ -212,3 +212,36 @@ class TestRippleCut:
         )
         cut = RippleCut(((90, 120),)).apply(marked)
         assert [m.frame for m in cut.timeline.markers] == [10, 170]
+
+
+def test_the_silence_of_voice_two_is_cut_where_voice_two_plays() -> None:
+    # 壊れると、リンクを外して音声 2 だけを 2 秒切り詰めたとき、音声 2 の無音を音声 1 の
+    # クリップの位置で切り、話している所を削る（PR #231 の見直し）
+    from dataclasses import replace
+    from pathlib import Path
+
+    from sashimono.core.model import AudioStreamInfo, Track, TrackKind
+
+    media = MediaItem(
+        path=Path("C:/素材/録画.mp4"),
+        duration=Fraction(10),
+        audio_streams=(
+            AudioStreamInfo(1, 48000, 2, Fraction(1, 48000), "aac"),
+            AudioStreamInfo(2, 48000, 2, Fraction(1, 48000), "aac"),
+        ),
+    )
+    voice1 = Clip(timeline_start=0, duration=300, media_id=media.id, stream_index=1)
+    voice2 = Clip(
+        timeline_start=0, duration=240, media_id=media.id, stream_index=2, source_in=Fraction(2)
+    )
+    base = Project.create(media=(media,))
+    tracks = (
+        Track(TrackKind.AUDIO, "A1", (voice1,)),
+        Track(TrackKind.AUDIO, "A2", (voice2,)),
+    )
+    project = base.with_timeline(replace(base.timeline, tracks=tracks))
+    quiet = ((Fraction(5, 2), Fraction(3)),)
+    # 音声 2 のクリップでは素材の 2.5 秒がタイムラインの 0.5 秒（15 コマ目）
+    assert plan_cuts(project, media.id, quiet, stream=2) == ((15, 30),)
+    # 音を渡さなければ前と同じく、素材のクリップすべての位置で切る
+    assert plan_cuts(project, media.id, quiet) == ((15, 30), (75, 90))
