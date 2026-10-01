@@ -217,6 +217,35 @@ class TestTheWindow:
             dialog.deleteLater()
 
 
+class TestCancellingWhileWaiting:
+    def test_the_window_closes_at_once(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 前は順番待ちのまま〔中断〕を押すと、前の起こしが終わる（数分）まで窓が閉じなかった
+        panel, _host, first, _second = setup
+        speaker.gate.clear()
+        panel.start_transcription(first.id, "tiny", audio_stream=1)
+        service = panel._service
+        assert service is not None
+        dialog = TranscribeDialog(first, service)
+        try:
+            dialog._stream.setCurrentIndex(1)
+            dialog._start_transcribe()
+            assert dialog._job is not None and dialog._job.waiting
+            dialog.reject()
+            assert dialog.result() == TranscribeDialog.DialogCode.Rejected
+            assert dialog._job is None
+        finally:
+            dialog.deleteLater()
+        speaker.gate.set()
+        _settle(panel)
+        deadline = time.monotonic() + 5.0
+        while service.busy and time.monotonic() < deadline:
+            time.sleep(0.02)
+        # 止めた依頼は走らない（音声 2 は起こされない）
+        assert speaker.order == [1]
+
+
 class TestThePanel:
     def test_the_panel_shows_the_chosen_voice(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem]

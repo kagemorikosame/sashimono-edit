@@ -393,6 +393,14 @@ class TranscribeDialog(QDialog):
 
         起こしは GPU を占有する 閉じたのに裏で回り続けると、次の操作が刺さる
         """
+        if self._job is not None and self._job.waiting:
+            # 順番待ちのまま止めた物は走らせない（列が飛ばす） 知らせを待つと、前の起こしが
+            # 終わるまで（数分）窓を閉じられず、その間は編集もできない（PR #231 の指摘）
+            self._job.cancel()
+            self._job = None
+            self._timer.stop()
+            super().reject()
+            return
         if self._job is not None:
             self._job.cancel()
             self._status.setText("中断しています")
