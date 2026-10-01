@@ -76,21 +76,36 @@ def shape_envelope(
             gain = np.maximum(gain, 0.0)
             low, high = low * gain, high * gain
             continue
-        values = effect_values(definition, effect, int(first))
+
+        # 動く値は列ごとのコマで解く（音量と同じ） 頭のコマの値だけで描くと、キーフレームで
+        # フェードの長さやディレイの量を動かしても、波形が頭の値のまま変わらなかった
+        # （PR #231 の指摘） 動かない値は 1 度だけ解く
         if kind == "audio_fade":
             gain = np.ones(columns)
-            fade_in = max(values.get("fade_in", 0.0), 0.0)
-            fade_out = max(values.get("fade_out", 0.0), 0.0)
-            if fade_in > 0:
-                gain = np.minimum(gain, seconds / fade_in)
-            if fade_out > 0:
-                gain = np.minimum(gain, (length - seconds) / fade_out)
+            fade_in = np.maximum(_animated(definition, effect, "fade_in", frames), 0.0)
+            fade_out = np.maximum(_animated(definition, effect, "fade_out", frames), 0.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gain = np.where(fade_in > 0, np.minimum(gain, seconds / fade_in), gain)
+                gain = np.where(fade_out > 0, np.minimum(gain, (length - seconds) / fade_out), gain)
             gain = np.clip(gain, 0.0, 1.0)
             low, high = low * gain, high * gain
         elif kind == "audio_delay":
-            low, high = _echoed(low, high, values, per_second)
+            low, high = _echoed(
+                low,
+                high,
+                _animated(definition, effect, "mix", frames),
+                _animated(definition, effect, "feedback", frames),
+                _animated(definition, effect, "time", frames),
+                per_second,
+            )
         else:
-            low, high = _tailed(low, high, values, per_second)
+            low, high = _tailed(
+                low,
+                high,
+                _animated(definition, effect, "mix", frames),
+                _animated(definition, effect, "decay", frames),
+                per_second,
+            )
     if track_gain != 1.0:
         low, high = low * track_gain, high * track_gain
     return low.astype(np.float32), high.astype(np.float32)
@@ -110,41 +125,68 @@ def _animated(
 
 
 def _echoed(
-    low: np.ndarray, high: np.ndarray, values: dict[str, float], per_second: float
+    low: np.ndarray,
+    high: np.ndarray,
+    mix_values: np.ndarray,
+    feedback_values: np.ndarray,
+    time_values: np.ndarray,
+    per_second: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """ディレイ ずらした波形を小さくして足す（鳴る音と同じく足し合わせる）"""
-    mix = float(np.clip(values.get("mix", 50.0), 0.0, 100.0)) / 100.0
-    feedback = float(np.clip(values.get("feedback", 40.0), 0.0, 90.0)) / 100.0
-    step = max(values.get("time", 250.0), 1.0) / 1000.0 * per_second
-    if mix <= 0.0 or step < 0.5:
+    """ディレイ ずらした波形を小さくして足す（鳴る音と同じく足し合わせる）
+
+    値は列ごと 列に届くやまびこは、その列の値（間隔・量・繰り返し）で前の列から取る
+    鳴る音もやまびこの出る所の値で掛けるので、同じ向きに合わせる
+    """
+    mix = np.clip(mix_values, 0.0, 100.0) / 100.0
+    feedback = np.clip(feedback_values, 0.0, 90.0) / 100.0
+    step = np.maximum(time_values, 1.0) / 1000.0 * per_second
+    count = len(high)
+    if not np.any(mix > 0.0) or np.all(step < 0.5):
         return low, high
     out_low, out_high = low.copy(), high.copy()
-    gain = mix
-    shift = step
-    while gain > 0.001 and round(shift) < len(high):
-        moved = round(shift)
-        out_low[moved:] += low[:-moved] * gain
-        out_high[moved:] += high[:-moved] * gain
-        gain *= feedback
-        shift += step
+    index = np.arange(count)
+    gain = mix.copy()
+    shift = step.copy()
+    usable = step >= 0.5
+    while True:
+        alive = usable & (gain > 0.001) & (np.round(shift) < count)
+        if not np.any(alive):
+            break
+        source = index - np.round(shift).astype(np.int64)
+        alive &= source >= 0
+        picked = np.clip(source, 0, count - 1)
+        out_low += np.where(alive, low[picked] * gain, 0.0)
+        out_high += np.where(alive, high[picked] * gain, 0.0)
+        gain = gain * feedback
+        shift = shift + step
     return out_low, out_high
 
 
 def _tailed(
-    low: np.ndarray, high: np.ndarray, values: dict[str, float], per_second: float
+    low: np.ndarray,
+    high: np.ndarray,
+    mix_values: np.ndarray,
+    decay_values: np.ndarray,
+    per_second: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """リバーブ ピークを残響の長さで 60 dB 減る尾として後ろへ伸ばし、量だけ足す
 
     尾は「前のどこかのピークが今まで減った値」の一番大きい物 対数にして積み上げの
-    最大を取れば、列を Python で回さずに求まる
+    最大を取れば、列を Python で回さずに求まる 長さが列ごとに違うときは、出てくる
+    長さ（0.1 秒刻み 設定の刻みと同じ）ごとに尾を作り、列ごとにその列の長さの尾を使う
     """
-    mix = float(np.clip(values.get("mix", 30.0), 0.0, 100.0)) / 100.0
-    decay = float(np.clip(values.get("decay", 1.5), 0.1, 5.0))
-    if mix <= 0.0:
+    mix = np.clip(mix_values, 0.0, 100.0) / 100.0
+    if not np.any(mix > 0.0):
         return low, high
-    fall = 6.91 / (decay * per_second)
+    decay = np.round(np.clip(decay_values, 0.1, 5.0), 1)
     index = np.arange(len(high), dtype=np.float64)
     level = np.maximum(np.abs(low), np.abs(high))
-    logged = np.log(np.maximum(level, 1e-9)) + index * fall
-    tail = np.exp(np.maximum.accumulate(logged) - index * fall) * mix
+    logged_level = np.log(np.maximum(level, 1e-9))
+    tail = np.zeros(len(high))
+    for length in np.unique(decay):
+        fall = 6.91 / (float(length) * per_second)
+        logged = logged_level + index * fall
+        reached = np.exp(np.maximum.accumulate(logged) - index * fall)
+        tail = np.where(decay == length, reached, tail)
+    tail = tail * mix
     return low - tail, high + tail
