@@ -1766,6 +1766,32 @@ enterprise 版だけのため
 - **同じ指摘が何役からも来る** 直すのは 1 回で、どのスレッドにも同じコミットを示して返す
 - 役どうしで言うことが食い違ったら、どちらを採ったかと理由を PR に残す
 
+#### Dependabot の PR
+
+CodeRabbit は契約の席を人にしか割り当てないので、Dependabot などボットが作った PR は
+「Review skipped」と書くだけで審査しない
+（[席の割り当て](https://docs.coderabbit.ai/management/seat-assignment)）
+Codex は枠が小さく、毎月届く更新すべてには使えない そこで扱いを次のように決めた
+
+- `.github/dependabot.yml` の `groups` で、種類（`package-ecosystem` GitHub Actions・pip）ごとに
+  1 本の PR へまとめる 1 部品 1 本だと、同じ確かめ方を何度も繰り返すことになる
+- 大きな版上げ（major）と小さい物（minor・patch）は別の PR に分ける 確かめる手間が違い、
+  混ぜると小さい物まで大きな版上げの確かめ方に巻き込まれる 分けても 1 つの種類で月に多くて 2 本
+- pip は版上げの PR を出させず（`open-pull-requests-limit: 0`）、脆弱性の修正だけが届く
+  そのまとめ方は `applies-to: security-updates` で指す
+- `.coderabbit.yaml` の `reviews.auto_review.ignore_usernames` に `dependabot[bot]` を入れ、
+  「Review skipped」の書き込みも出させない
+
+マージの前に確かめること
+
+1. CI がすべて通る（必須の `verify (3.12)`・`verify (3.14)` だけでなく、PR に付いた検査すべて）
+2. 変わったのが版の数字（とロックファイル）だけ ほかの行が変わっていたら、なぜかを読む
+3. 大きな版上げなら、部品の変更点（リリースノート・CHANGELOG）を読み、こちらの使い方
+   （workflow の `with:` の入力・呼んでいる関数・動く環境の下限）が変わる所が無いか見る
+
+大きな版上げのときだけ `@codex review` を 1 回頼む 小さい物は上の 1・2 で足りるので頼まない
+P0・P1 が出たときの扱いは人の PR と同じ（上の「Codex のレビューは最後に 1 回」）
+
 ### コミットメッセージ
 
 1 行目に何をしたか、空行を挟んで**なぜそうしたか** 日本語で書く
