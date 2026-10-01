@@ -167,6 +167,45 @@ class TestOneLongRow:
         assert page["rows"][0]["id"] == "x"
 
 
+def test_subtitles_inside_a_placed_scene_name_their_media_and_voice() -> None:
+    # 壊れると、置いたシーンの中の字幕は素材が null・音声が 1 で返り、AI が直す字幕を
+    # 素材と音声で指せない（シーンのクリップは素材を持たない PR #231）
+    from pathlib import Path
+
+    from sashimono.core.commands import AddScene, new_scene
+    from sashimono.core.model import AudioStreamInfo
+
+    media = MediaItem(
+        path=Path("C:/素材/録画.mp4"),
+        duration=Fraction(10),
+        audio_streams=(
+            AudioStreamInfo(1, 48000, 2, Fraction(1, 48000), "aac"),
+            AudioStreamInfo(2, 48000, 2, Fraction(1, 48000), "aac"),
+        ),
+    ).with_transcript(Transcript((TranscriptSegment(Fraction(1), Fraction(2), "声"),)), 2)
+    base = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(media,))
+    scene = new_scene(base, "中")
+    voice = Track(
+        TrackKind.AUDIO,
+        "A1",
+        (Clip(timeline_start=0, duration=150, media_id=media.id, stream_index=2),),
+    )
+    project = AddScene(replace(scene, timeline=replace(scene.timeline, tracks=(voice,)))).apply(
+        base
+    )
+    placed = Track(
+        TrackKind.VIDEO, "V1", (Clip(timeline_start=0, duration=150, scene_id=scene.id),)
+    )
+    host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(placed,))))
+    (row,) = _call(host, "get_subtitles")["subtitles"]
+    assert row["text"] == "声"
+    assert row["media_id"] == str(media.id)
+    assert row["audio"] == 2
+    # 返った素材と音声で絞っても同じ行が取れる
+    narrowed = _call(host, "get_subtitles", media_id=str(media.id), audio=2)
+    assert [r["text"] for r in narrowed["subtitles"]] == ["声"]
+
+
 class TestTheSecondsWindow:
     """秒で絞るときの境目 from より後に掛かり、to より前に始まる物（説明どおり）
 
