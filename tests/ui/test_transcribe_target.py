@@ -153,6 +153,18 @@ def test_the_media_list_still_opens_what_was_pressed(
     assert seen.opened[-1][:2] == (ONE.name, 1)
 
 
+def test_the_selected_clip_wins_even_without_a_new_selection(
+    window: tuple[MainWindow, dict[str, ClipId]], seen: _Seen
+) -> None:
+    # 選んだまま別の素材をメディア欄から起こすと、字幕パネルはその素材になる 選びは変わって
+    # いないので、Ctrl+U で前は別の素材（ゲーム録画）を開いていた（PR #231 の指摘）
+    main, placed = window
+    main._timeline.select(placed[ONE.name])
+    main._transcribe_media(str(FOUR.id))
+    main.transcribe()
+    assert seen.opened[-1][:2] == (ONE.name, 1)
+
+
 def test_the_subtitle_panel_follows_the_selected_clip(
     window: tuple[MainWindow, dict[str, ClipId]], seen: _Seen
 ) -> None:

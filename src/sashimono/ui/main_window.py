@@ -1425,7 +1425,12 @@ class MainWindow(QMainWindow):
         # タイムラインで選んだクリップの素材を先に見る 字幕パネルは選んだクリップに付いて
         # いくので、選んでいればもう出ている メディア欄で選んだ素材は、クリップを選んで
         # いないときだけ使う（前はこちらを先に見て、別の素材を起こしていた）
-        if self._selected_sound() is None:
+        sound = self._selected_sound()
+        if sound is not None:
+            # 選びが変わらないまま、メディア欄の右クリックで別の素材を起こしていると、字幕
+            # パネルはその素材のまま 選んだクリップへ合わせ直す（PR #231 の指摘）
+            self._subtitles.follow_clip(*sound)
+        else:
             selected = self._media_pool.selected_media_id()
             if selected is not None:
                 self._subtitles.select_media(selected)
