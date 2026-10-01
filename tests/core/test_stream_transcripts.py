@@ -62,6 +62,7 @@ class TestKeeping:
         assert _texts(kept.transcript) == ["ゲーム"]
 
     def test_other_media_are_left_alone(self) -> None:
+        # 壊れると、素材をまたいで字幕が入れ替わる（2 本目を起こすと 1 本目の字幕になる）
         first, second = _movie(name="一"), _movie(name="二")
         project = Project.create(media=(first, second))
         project = SetTranscript(first.id, _said("一の字幕")).apply(project)
@@ -70,6 +71,7 @@ class TestKeeping:
         assert _texts(project.require_media(second.id).transcript) == ["二の字幕"]
 
     def test_editing_one_voice_leaves_the_other(self) -> None:
+        # 壊れると、音声 2 の字幕を直しただけで音声 1 の字幕が消える
         media = _movie()
         project = Project.create(media=(media,))
         project = SetTranscript(media.id, _said("ゲーム"), stream=1).apply(project)
@@ -86,12 +88,14 @@ class TestKeeping:
 
 class TestSaving:
     def test_both_voices_survive_saving(self) -> None:
+        # 壊れると、保存して開き直したら音声 2 の字幕が消えている
         media = _movie().with_transcript(_said("ゲーム"), 1).with_transcript(_said("声"), 2)
         loaded = project_from_dict(project_to_dict(Project.create(media=(media,))))
         again = loaded.require_media(media.id)
         assert _texts(again.transcript_for(1)) == ["ゲーム"]
         assert _texts(again.transcript_for(2)) == ["声"]
-        assert FORMAT_VERSION == 8
+        # 8 で音声ごとにした 次に版を上げても、この試験は落ちないように下限で見る
+        assert FORMAT_VERSION >= 8
 
     def test_an_older_file_reads_its_subtitles_as_the_first_voice(self) -> None:
         # 7 までのファイルは素材に 1 つの ``transcript`` を持つ 捨てると字幕が消える

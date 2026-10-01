@@ -194,6 +194,8 @@ class TestFindingTheRuntime:
 
 def _two_voices(directory: Path) -> Path:
     """音声 1 に 440Hz、音声 2 に 1000Hz を持つ動画（ゲームの音とマイクの声の形）"""
+    # 映像は ffmpeg が自前で持つ mpeg4 で書く libx264 の無い ffmpeg（Linux の CI など）でも
+    # 作れる 絵の中身は見ないので形式は問わない（PR #231 の指摘）
     path = directory / "two-voices.mkv"
     subprocess.run(
         [
@@ -202,7 +204,7 @@ def _two_voices(directory: Path) -> Path:
             "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000",
             "-f", "lavfi", "-i", "sine=frequency=1000:duration=1:sample_rate=48000",
             "-map", "0:v", "-map", "1:a", "-map", "2:a",
-            "-c:v", "libx264", "-c:a", "pcm_s16le", str(path),
+            "-c:v", "mpeg4", "-c:a", "pcm_s16le", str(path),
         ],
         check=True,
         capture_output=True,
