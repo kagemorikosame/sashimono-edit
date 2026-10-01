@@ -312,3 +312,43 @@ class TestTheSoundShapesTheWave:
         quiet = _sound_clip(registry.require("audio_volume").create(volume=40.0))
         _paint(waveform, _RECT, _LAYOUT, quiet)
         assert len(calls) == 2
+
+
+class TestTheShapeOfAWideClip:
+    """見えている範囲だけを作る広いクリップでも、手前の音のやまびこを映す（PR #231 の指摘）
+
+    前は見える範囲だけを取ってからディレイの形を掛けたので、手前で鳴った音のやまびこが、
+    鳴った所が左端を越えて見えなくなると一緒に消えた（スクロールで出たり消えたりする）
+    """
+
+    @staticmethod
+    def _burst() -> Waveform:
+        """60 秒のうち 20〜21 秒だけ大きな音"""
+        peaks = np.zeros((48000 * 60 // 256, 2, 2), dtype=np.float32)
+        begin, end = 48000 * 20 // 256, 48000 * 21 // 256
+        peaks[begin:end, :, 0] = -0.8
+        peaks[begin:end, :, 1] = 0.8
+        return Waveform(48000, 2, 48000 * 60, (PeakLevel(256, peaks),))
+
+    def _column_at(self, clip: Clip, scroll: float, frame: int) -> int:
+        # 800 画素で 97 コマほど見える 590 からなら元の音もやまびこも、645 からならやまびこだけ
+        rect = QRect(Metrics.TRACK_HEADER_WIDTH, 10, 800, 42)
+        layout = TimelineLayout(
+            pixels_per_frame=WAVEFORM_IMAGE_MAX_COLUMNS / 1000, scroll_frame=scroll
+        )
+        heights = _tall(_paint(self._burst(), rect, layout, clip))
+        return int(heights[round(layout.frame_to_x(frame))])
+
+    def test_the_echo_stays_after_its_sound_scrolls_out(self) -> None:
+        delay = registry.require("audio_delay").create(time=2000, feedback=0, mix=100)
+        clip = Clip(timeline_start=0, duration=1800, effects=(delay,))
+        # やまびこは 22〜23 秒（660〜690 コマ） 元の音（600〜630 コマ）が見えているときと、
+        # 左端を越えて見えなくなったときで、22.5 秒の所の高さが変わらない
+        seen = self._column_at(clip, 590.0, 675)
+        scrolled = self._column_at(clip, 645.0, 675)
+        assert seen > 6
+        assert scrolled == seen
+
+    def test_without_an_echo_the_spot_stays_quiet(self) -> None:
+        clip = Clip(timeline_start=0, duration=1800)
+        assert self._column_at(clip, 645.0, 675) <= 2

@@ -40,7 +40,7 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate, format_timecode
 from sashimono.effects.sources import source_registry
 from sashimono.engine.audio import Waveform
-from sashimono.engine.audio.shape import shape_envelope, shape_key
+from sashimono.engine.audio.shape import shape_envelope, shape_history_frames, shape_key
 from sashimono.engine.cache import Filmstrip
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
@@ -694,23 +694,36 @@ def _draw_waveform(
     # 見えている左端・右端が、素材のどのサンプルにあたるかを求める
     start_frame = layout.frame_at(rect.left()) - clip.timeline_start
     end_frame = layout.frame_at(rect.right()) - clip.timeline_start
-    start_seconds = clip.source_in + start_frame * rate.frame_duration * clip.speed
+    # ディレイ・リバーブの形は手前の音から作る 見える所の手前も同じ列の幅で取って形を
+    # 掛け、見える列だけを貼る 手前を取らないと、見える範囲の手前で鳴った音のやまびこや
+    # 尾が、スクロールで左端を越えると消えた（PR #231 の指摘） 手前の列は上限までに抑える
+    # （大きく拡大して長いやまびこを掛けると、手前だけで何十万列にもなる）
+    span = max(end_frame - start_frame, 1)
+    per_frame = rect.width() / span
+    reach = min(float(start_frame), shape_history_frames(clip, rate))
+    extra = min(math.ceil(reach * per_frame), WAVEFORM_HISTORY_MAX_COLUMNS) if reach > 0 else 0
+    first_frame = start_frame - extra / per_frame
+    start_seconds = clip.source_in + Fraction(first_frame) * rate.frame_duration * clip.speed
     end_seconds = clip.source_in + end_frame * rate.frame_duration * clip.speed
     image = _WAVEFORM_IMAGES.get(
         waveform,
         int(start_seconds * waveform.sample_rate),
         int(end_seconds * waveform.sample_rate),
-        rect.width(),
+        rect.width() + extra,
         height,
-        _Shaping(clip, rate, float(start_frame), float(end_frame), track_gain),
+        _Shaping(clip, rate, float(first_frame), float(end_frame), track_gain),
     )
     if image is not None:
-        painter.drawImage(rect.topLeft(), image)
+        painter.drawImage(rect.topLeft(), image, QRect(extra, 0, rect.width(), height))
 
 
 #: クリップ全体の波形を 1 枚の画像にする幅の上限（画素） 1920 幅の画面で 4 画面分
 #: これより広いときは見えている範囲だけを作る
 WAVEFORM_IMAGE_MAX_COLUMNS = 8192
+
+#: 見えている範囲だけを作るとき、ディレイ・リバーブの形のために手前に取る列の上限
+#: 越えた分の手前の音の響きは映さない（大きく拡大して 100 秒を超えるやまびこを掛けたときだけ）
+WAVEFORM_HISTORY_MAX_COLUMNS = 16384
 
 #: 波形の画像を貯めておく量の上限（バイト） 高さ 40 画素で 1920 幅のクリップが 1 枚 300KB ほど
 #: 全体表示で見える数（数十枚）と、少し前の倍率の分が入れば足りる

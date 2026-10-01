@@ -21,13 +21,36 @@ import numpy as np
 
 from sashimono.core.model import AnimatedValue, Clip, Effect
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.audio import MAX_HISTORY_SECONDS
 from sashimono.effects.definition import EffectDefinition
 from sashimono.engine.audio.mixer import audio_stack, effect_values
 
-__all__ = ["shape_envelope", "shape_key"]
+__all__ = ["shape_envelope", "shape_history_frames", "shape_key"]
 
 #: 映す効果 ほかの音の効果は大きさを変えないとみなす
 _SHAPED = frozenset({"audio_volume", "audio_fade", "audio_delay", "audio_reverb"})
+
+
+def shape_history_frames(clip: Clip, rate: FrameRate) -> float:
+    """映す効果が前の音から作る形（ディレイのやまびこ・リバーブの尾）の届く長さ（フレーム）
+
+    見えている範囲だけの波形を作るとき、その手前にある元の山の響きも映すのに使う
+    手前を読まずに形を掛けると、見える範囲の手前で鳴った音の尾が、スクロールすると
+    消えたり出たりした（PR #231 の指摘） 値が動くときはキーフレームの所と両端で
+    一番長い物を取る（スクロールの位置で長さが変わると、同じ所の形が変わって見える）
+    """
+    seconds = 0.0
+    for definition, effect in audio_stack(clip):
+        if definition.kind not in ("audio_delay", "audio_reverb") or not definition.audio_history:
+            continue
+        frames = {0, max(clip.duration - 1, 0)}
+        for value in effect.params.values():
+            if isinstance(value, AnimatedValue):
+                frames.update(k.frame for k in value.keyframes if 0 <= k.frame < clip.duration)
+        seconds += max(
+            definition.audio_history(effect_values(definition, effect, frame)) for frame in frames
+        )
+    return min(seconds, MAX_HISTORY_SECONDS) * float(rate.fps)
 
 
 def shape_key(clip: Clip, track_gain: float = 1.0) -> Hashable:
