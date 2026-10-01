@@ -119,6 +119,9 @@ class ExportSettings:
     pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
     #: 重ねたレイヤーのデコードを、いくつまで同時に走らせてよいか 1 なら並べない
     decode_threads: int = DEFAULT_DECODE_THREADS
+    #: 前の音を読む音の効果の動く値を、区切りの中でもつなぐ（:class:`AudioMixer`）
+    #: 再生と同じ音にするため、本人の設定（プレビューと同じ値）を渡す
+    smooth_history: bool = True
 
 
 #: 開けるかを試すときの大きさ NVENC は小さすぎる画を断る（64x64 では開けない）ので、
@@ -249,7 +252,7 @@ def export_project(
     settings.path.parent.mkdir(parents=True, exist_ok=True)
     context = OffscreenGLContext()
     renderer = FrameRenderer(project, context=context, quality=FULL_QUALITY, decode_threads=threads)
-    mixer = AudioMixer(project)
+    mixer = AudioMixer(project, smooth_history=settings.smooth_history)
 
     try:
         for index, codec in enumerate(codecs):

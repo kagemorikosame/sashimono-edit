@@ -217,6 +217,18 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("レイヤーの並列デコード", self._decode_threads)
 
+        self._smooth_audio_motion = QCheckBox(
+            "リバーブ・ディレイ・音程のキーフレームをなめらかに動かす", self
+        )
+        self._smooth_audio_motion.setChecked(preferences.smooth_audio_motion)
+        self._smooth_audio_motion.setToolTip(
+            "前の音を読む音の効果は 0.34 秒ごとの区切りで掛ける 入れると区切りの中でも値を"
+            "少しずつ移す 切ると区切りの頭の値のまま掛け、動きが最大 0.34 秒遅れて段になる "
+            "値の動く所だけ手間が倍になるので、遅い機械で再生が途切れるときは切る "
+            "書き出しとプレビューの両方に効く"
+        )
+        form.addRow(self._smooth_audio_motion)
+
         self._native_modules = QCheckBox("AviUtl2 のスクリプトモジュール（DLL）を読み込む", self)
         self._native_modules.setChecked(preferences.native_modules)
         self._native_modules.setToolTip(
@@ -489,6 +501,7 @@ class PreferencesDialog(QDialog):
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
+            smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
             pool_progress=self._pool_progress.isChecked(),
             all_aviutl_plugins=self._all_plugins.isChecked(),

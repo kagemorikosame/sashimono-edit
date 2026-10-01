@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from sashimono.core.commands import AddEffect, Document, insert_media
-from sashimono.core.model import Project, ProjectSettings, TrackKind
+from sashimono.core.model import AnimatedValue, Keyframe, Project, ProjectSettings, TrackKind
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
 from sashimono.engine.audio import AudioMixer
@@ -198,6 +198,135 @@ class TestTheTapeGrowsAsNeeded:
         tape.trim(10)
         assert tape.capacity < big // 4
         assert tape.reach == _TAPE_SLACK * 10
+
+
+class TestTheTapesShareABudget:
+    """元の音の入れ物の合計に上限を置き、最近使っていない物から捨てる（PR #231 の指摘）
+
+    前は上限も捨てる決まりも無く、最も長いやまびこではクリップごとに 100 MB ほどを
+    ミキサが生きている間ずっと持った
+    """
+
+    def _two_clips(self, tmp_path: Path) -> Project:
+        project = _project(_click(tmp_path), "audio_reverb")
+        track = next(
+            t for t in project.timeline.tracks if t.clips and t.kind is not TrackKind.VIDEO
+        )
+        clip = track.clips[0]
+        other = replace(
+            track, id=type(track.id)("もう 1 本"), clips=(replace(clip, id=type(clip.id)("写し")),)
+        )
+        return project.with_timeline(
+            replace(project.timeline, tracks=(*project.timeline.tracks, other))
+        )
+
+    def test_the_oldest_goes_and_the_sound_stays(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.engine.audio import mixer as module
+
+        project = self._two_clips(tmp_path)
+        roomy = _render(project, 1024)
+        monkeypatch.setattr(module, "RAW_BUDGET_BYTES", 1)
+        mixer = AudioMixer(project)
+        try:
+            parts = [mixer.render(start, min(1024, RATE - start)) for start in range(0, RATE, 1024)]
+            # 上限を越えたら、今使った 1 本だけを残す
+            assert len(mixer._raw) == 1
+        finally:
+            mixer.close()
+        # 捨てた物は読み直すので、鳴る音は変わらない
+        assert np.allclose(np.concatenate(parts)[:, 0], roomy, atol=1e-6)
+
+    def test_both_stay_when_they_fit(self, tmp_path: Path) -> None:
+        mixer = AudioMixer(self._two_clips(tmp_path))
+        try:
+            mixer.render(0, RATE // 2)
+            assert len(mixer._raw) == 2
+        finally:
+            mixer.close()
+
+
+class TestMovingValuesOfAnEcho:
+    """前の音を読むエフェクトのキーフレームを、区切りの中でもつなぐ（PR #231 の指摘）
+
+    前は 16384 サンプル（0.34 秒）の区切りの頭でしか値を取らず、動きが最大 0.34 秒遅れて
+    段になった 一定の大きさの音（直流）にやまびこ 100ms・繰り返し 0 を掛けると、鳴る音が
+    ``元 × (1 + 量)`` になり、その時刻に効いている量がそのまま読める
+    """
+
+    def _rising(self, tmp_path: Path) -> Project:
+        path = _wav(tmp_path / "flat.wav", np.full(RATE, 0.25, dtype=np.float32))
+        project = _project(path, "audio_delay", time=100, feedback=0, mix=0)
+        clip = next(
+            c
+            for t in project.timeline.tracks
+            for c in t.clips
+            if c.effects and t.kind is not TrackKind.VIDEO
+        )
+        rising = AnimatedValue(keyframes=(Keyframe(0, 0.0), Keyframe(30, 100.0)))
+        changed = replace(
+            clip,
+            effects=tuple(
+                replace(e, params={**e.params, "mix": rising}) if e.kind == "audio_delay" else e
+                for e in clip.effects
+            ),
+        )
+        tracks = tuple(
+            replace(t, clips=tuple(changed if c.id == clip.id else c for c in t.clips))
+            for t in project.timeline.tracks
+        )
+        return project.with_timeline(replace(project.timeline, tracks=tracks))
+
+    def _heard_mix(self, project: Project, *, smooth: bool) -> np.ndarray:
+        mixer = AudioMixer(project, smooth_history=smooth)
+        try:
+            out = mixer.render(0, RATE)[:, 0]
+        finally:
+            mixer.close()
+        level = float(out[RATE // 20])
+        return out / level - 1.0
+
+    def test_the_mix_follows_the_keyframes_inside_a_window(self, tmp_path: Path) -> None:
+        project = self._rising(tmp_path)
+        times = np.arange(RATE) / RATE
+        part = slice(int(RATE * 0.15), int(RATE * 0.95))
+        smooth = self._heard_mix(project, smooth=True)
+        assert np.abs(smooth[part] - times[part]).max() < 0.05
+        # つながないと区切りの頭の値のまま（速さを取る設定） 0.3 ほど遅れる所がある
+        stepped = self._heard_mix(project, smooth=False)
+        assert np.abs(stepped[part] - times[part]).max() > 0.2
+
+    def test_small_blocks_hear_the_same_when_smooth(self, tmp_path: Path) -> None:
+        project = self._rising(tmp_path)
+        whole = AudioMixer(project, smooth_history=True)
+        blocks = AudioMixer(project, smooth_history=True)
+        try:
+            one = whole.render(0, RATE)
+            many = np.concatenate(
+                [blocks.render(start, min(1024, RATE - start)) for start in range(0, RATE, 1024)]
+            )
+        finally:
+            whole.close()
+            blocks.close()
+        assert np.abs(one - many).max() < 1e-6
+
+
+def test_the_reverb_of_the_kept_part_is_the_same_either_way() -> None:
+    # 残す所だけを輪で畳み込んでも（overlap-save）、全体を畳み込んだときと同じ響き
+    from sashimono.effects.audio import AudioContext, _reverb
+
+    rng = np.random.default_rng(3)
+    samples = rng.standard_normal((RATE * 3, 2)).astype(np.float32) * 0.1
+    values = {"decay": 1.5, "mix": 50.0}
+    whole = _reverb(samples, values, AudioContext(offset=0, sample_rate=RATE, duration=RATE * 3))
+    keep = RATE * 2
+    part = _reverb(
+        samples,
+        values,
+        AudioContext(offset=0, sample_rate=RATE, duration=RATE * 3, keep_from=keep, shared={}),
+    )
+    assert np.abs(part[keep:] - whole[keep:]).max() < 1e-5
 
 
 class TestReverb:

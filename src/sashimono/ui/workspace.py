@@ -221,6 +221,12 @@ class Preferences:
     #: メモリの少ない機械では減らせるようにする 実測は
     #: :data:`sashimono.engine.encode.MEASURED_DECODE_MS`
     decode_threads: int = DEFAULT_DECODE_THREADS
+    #: リバーブ・ディレイ・音程の調整のキーフレームを、0.34 秒の区切りの中でもつなぐ
+    #: 切ると区切りの頭の値で掛け、動きが最大 0.34 秒遅れて段になる（音程を動かすと階段に
+    #: 聞こえる） 既定は入 つないでも 1 塊の手間は予算（21ms）の中に収まり、知らない人ほど
+    #: 段を「壊れた音」と受け取る つなぐと値の動く区切りだけ 2 度掛けるので、遅い機械で
+    #: 再生が途切れる人は切れるようにする 再生と書き出しの両方に効く（同じ音にするため）
+    smooth_audio_motion: bool = True
     #: AviUtl2 のスクリプトモジュール（``.mod2`` の中身が DLL の物）を読む
     #: 既定は入 テレビ字幕のように、DLL が無いと絵が出ない配布スクリプトがある
     #: 読んだ DLL は Sashimono と同じ権限で動く（Lua の閉じ込めの外） 読むのは
@@ -379,6 +385,7 @@ class PreferenceStore:
                 data.get("keyframe_drag"), KEYFRAME_DRAG_MODES, plain.keyframe_drag
             ),
             value_lines=_flag(data.get("value_lines"), plain.value_lines),
+            smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),

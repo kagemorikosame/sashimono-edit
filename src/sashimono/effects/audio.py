@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 import numpy as np
@@ -44,6 +44,10 @@ class AudioContext:
     #: 前の音として読むだけの所 長い前の音を読む物（ディレイ）は、ここから先だけを
     #: 計算してよい 0 なら全部を使う
     keep_from: int = 0
+    #: 同じ音へ値だけ変えて続けて掛けるとき（区切りの中で値をつなぐ）に、値に依らない
+    #: 途中の結果（リバーブの元の音の周波数）を置いておく入れ物 呼ぶ側が 1 組ごとに渡す
+    #: ``None`` なら置かない
+    shared: dict[str, object] | None = field(default=None, compare=False)
 
 
 def _volume(samples: np.ndarray, values: dict[str, float], _context: AudioContext) -> np.ndarray:
@@ -101,7 +105,25 @@ _DELAY_FLOOR = 0.001
 
 
 def _reverb_length(values: dict[str, float]) -> float:
-    return float(np.clip(values.get("decay", 1.5), 0.1, 5.0))
+    """残響の長さ（秒） 0.1 秒刻み（設定の刻みと同じ）に丸める
+
+    キーフレームで動かすと区切りごとに長さが変わり、そのたびに響き方（24 万サンプルの
+    雑音）を作り直して 1 区切り 60ms 掛かった 刻みに丸めれば作り直すのは刻みが変わる
+    所だけで、作った物も :func:`_impulse` の貯めに残る
+    """
+    return round(float(np.clip(values.get("decay", 1.5), 0.1, 5.0)), 1)
+
+
+@lru_cache(maxsize=4)
+def _noise(sample_rate: int, channels: int) -> np.ndarray:
+    """響きの元の雑音（最も長い 5 秒ぶん） 乱数の種は決めておく
+
+    長さごとに乱数を引き直すと、キーフレームで長さを動かしたとき 24 万サンプルの乱数を
+    刻みごとに作り直すことになる 同じ種で引いた列の頭は長さに依らず同じなので、1 度だけ
+    引いて頭から切り出せば、長さごとに引いたときと同じ響きになる
+    """
+    rng = np.random.default_rng(20260930)
+    return rng.standard_normal((int(5.0 * sample_rate), channels))
 
 
 @lru_cache(maxsize=16)
@@ -112,9 +134,11 @@ def _impulse(sample_rate: int, decay: float, channels: int) -> np.ndarray:
     エネルギーを 1 にそろえ、長さを変えても響きの大きさが大きく変わらないようにする
     """
     length = max(1, int(decay * sample_rate))
-    rng = np.random.default_rng(20260930)
+    base = _noise(sample_rate, channels)
+    if length > len(base):
+        base = np.random.default_rng(20260930).standard_normal((length, channels))
     envelope = np.exp(-6.91 * np.arange(length) / length)
-    noise = rng.standard_normal((length, channels)) * envelope[:, None]
+    noise = base[:length] * envelope[:, None]
     noise /= np.sqrt(np.sum(noise**2, axis=0, keepdims=True)) + 1e-12
     return noise.astype(np.float32)
 
@@ -129,19 +153,52 @@ def _reverb(samples: np.ndarray, values: dict[str, float], context: AudioContext
     """リバーブ 元の音に、響き（:func:`_impulse`）を畳み込んだ音を ``量`` だけ足す
 
     前の音は呼ぶ側が読み直して渡す（:attr:`EffectDefinition.audio_history`） 塊の頭より前は
-    無音として数える
+    無音として数える ``keep_from`` から先だけが要るときは、そこから響きの長さぶん前からを
+    輪で畳み込み（overlap-save）、回り込みの無い所だけを使う 全体を畳み込むより FFT が
+    半分の長さで済む（長い残響で 1 区切りの手間が予算を越えていた）
     """
     mix = float(np.clip(values.get("mix", 30.0), 0.0, 100.0)) / 100.0
     if mix <= 0.0 or len(samples) == 0:
         return samples
     decay = _reverb_length(values)
     length = len(_impulse(context.sample_rate, decay, samples.shape[1]))
+    keep = min(max(context.keep_from, 0), len(samples))
+    if keep >= length - 1 and keep < len(samples):
+        begin = keep - (length - 1)
+        segment = samples[begin:]
+        fft_size = 1 << (len(segment) - 1).bit_length()
+        response = _impulse_spectrum(context.sample_rate, decay, samples.shape[1], fft_size)
+        spectrum = _input_spectrum(segment, fft_size, (begin, fft_size), context) * response
+        wet = np.fft.irfft(spectrum, fft_size, axis=0)[length - 1 : len(segment)]
+        out = np.zeros(samples.shape, dtype=np.float32)
+        out[keep:] = samples[keep:] + wet * mix
+        return out
     size = len(samples) + length - 1
     fft_size = 1 << (size - 1).bit_length()
     response = _impulse_spectrum(context.sample_rate, decay, samples.shape[1], fft_size)
-    spectrum = np.fft.rfft(samples, fft_size, axis=0) * response
+    spectrum = _input_spectrum(samples, fft_size, (0, fft_size), context) * response
     wet = np.fft.irfft(spectrum, fft_size, axis=0)[: len(samples)]
     return np.asarray(samples + wet * mix, dtype=np.float32)
+
+
+def _input_spectrum(
+    samples: np.ndarray, fft_size: int, key: tuple[int, int], context: AudioContext
+) -> np.ndarray:
+    """畳み込む元の音の周波数 値だけ変えて同じ音へもう 1 度掛けるときは使い回す
+
+    区切りの中で値をつなぐとき（:attr:`AudioContext.shared`）、残響の長さが変わると
+    畳み込みを 2 度する 元の音の FFT は値に依らないので 1 度で済ませる
+    """
+    shared = context.shared
+    name = f"reverb-input-{key[0]}-{key[1]}"
+    if shared is not None:
+        found = shared.get(name)
+        if isinstance(found, np.ndarray):
+            return found
+    spectrum = np.fft.rfft(samples, fft_size, axis=0)
+    if shared is not None:
+        shared[name] = spectrum
+    return spectrum
 
 
 def _delay_repeats(values: dict[str, float]) -> int:

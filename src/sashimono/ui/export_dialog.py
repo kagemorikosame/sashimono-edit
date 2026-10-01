@@ -105,6 +105,7 @@ class ExportDialog(QDialog):
         pipeline_depth: int = DEFAULT_PIPELINE_DEPTH,
         decode_threads: int = DEFAULT_DECODE_THREADS,
         scene_name: str | None = None,
+        smooth_history: bool = True,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
 
@@ -126,6 +127,7 @@ class ExportDialog(QDialog):
         # 本人の設定（表示 → 設定…）から来る
         self._pipeline_depth = pipeline_depth
         self._decode_threads = decode_threads
+        self._smooth_history = smooth_history
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
 
@@ -318,6 +320,7 @@ class ExportDialog(QDialog):
             frame_range=self._frame_range(),
             pipeline_depth=self._pipeline_depth,
             decode_threads=self._decode_threads,
+            smooth_history=self._smooth_history,
         )
 
     def _start(self) -> None:

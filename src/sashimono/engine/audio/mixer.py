@@ -46,6 +46,9 @@ MAX_SCENE_DEPTH = 8
 HISTORY_WINDOW = 16384
 #: 掛け終えた区切りを覚えておく数 再生の今の所と、シークで戻った所の分
 _KEPT_WINDOWS = 16
+#: 元の音の入れ物（:class:`_Tape`）の合計の上限（バイト） 最も長いやまびこ（1 本 100 MB ほど）
+#: でも 2 本は持てる 越えたら最近使っていない物から捨て、次に要るときに読み直す
+RAW_BUDGET_BYTES = 256 * 1024 * 1024
 #: 元の音の入れ物（:class:`_Tape`）に持たせる余裕 区切り 2 つ分あれば、続けて鳴らす間は
 #: 広げずに書き足せる
 _TAPE_SLACK = 2 * HISTORY_WINDOW
@@ -57,8 +60,11 @@ class AudioMixer:
     スレッドセーフではない 再生用と書き出し用で別インスタンスにすること
     """
 
-    def __init__(self, project: Project) -> None:
+    def __init__(self, project: Project, *, smooth_history: bool = True) -> None:
         self._project = project
+        #: 前の音を読むエフェクトの動く値を、区切りの中でもつなぐか（:func:`_apply_effects`）
+        #: 再生と書き出しで同じにする（本人の設定から両方へ渡す）
+        self._smooth_history = smooth_history
         self._decoders: OrderedDict[tuple[MediaId, int], AudioDecoder] = OrderedDict()
         self._closed = False
         #: 前の音を読むエフェクトを掛け終えた区切り 鍵はクリップ・音・深さ・区切りの番号
@@ -68,11 +74,24 @@ class AudioMixer:
         )
         #: 前の音を読むクリップの、読んだ元の音 続きを読むときは前に読んだ所から先だけを
         #: 読む（前へ戻って読み直すと、圧縮した音は解き直しになる）
-        self._raw: dict[tuple[str, int | None, int], tuple[Clip, _Tape]] = {}
+        #: 最近使った物が後ろ 合計が :data:`RAW_BUDGET_BYTES` を越えたら前から捨てる
+        self._raw: OrderedDict[tuple[str, int | None, int], tuple[Clip, _Tape]] = OrderedDict()
+        #: 値の動くクリップの、クリップ全体で最も長い読み戻し（:meth:`_steady_reach`）
+        self._reaches: dict[str, tuple[Clip, int]] = {}
 
     @property
     def project(self) -> Project:
         return self._project
+
+    @property
+    def smooth_history(self) -> bool:
+        return self._smooth_history
+
+    def set_smooth_history(self, smooth: bool) -> None:
+        """前の音を読むエフェクトの動く値を区切りの中でもつなぐか 掛け終えた区切りは捨てる"""
+        if smooth != self._smooth_history:
+            self._smooth_history = smooth
+            self._windows.clear()
 
     @property
     def sample_rate(self) -> int:
@@ -99,7 +118,9 @@ class AudioMixer:
         self._windows = OrderedDict(
             (key, value) for key, value in self._windows.items() if id(value[0]) in present
         )
-        self._raw = {key: value for key, value in self._raw.items() if id(value[0]) in present}
+        self._raw = OrderedDict(
+            (key, value) for key, value in self._raw.items() if id(value[0]) in present
+        )
 
     def close(self) -> None:
         if self._closed:
@@ -110,6 +131,7 @@ class AudioMixer:
         self._decoders.clear()
         self._windows.clear()
         self._raw.clear()
+        self._reaches.clear()
 
     def render(self, start_sample: int, count: int) -> np.ndarray:
         """``[start_sample, start_sample + count)`` のミックス結果を返す
@@ -251,13 +273,25 @@ class AudioMixer:
         end = min(start + HISTORY_WINDOW, duration)
         if end <= start:
             return None
-        reach = lookback(clip, start, self.sample_rate, rate)
+        reach = max(
+            lookback(
+                clip, start, self.sample_rate, rate, until=end if self._smooth_history else None
+            ),
+            self._steady_reach(clip, rate),
+        )
         before = min(start, reach)
         raw = self._raw_range(clip, stream, depth, start - before, end, keep=before, longest=reach)
         if raw is None:
             return None
         processed = _apply_effects(
-            clip, raw, start - before, self.sample_rate, duration, rate, keep_from=before
+            clip,
+            raw,
+            start - before,
+            self.sample_rate,
+            duration,
+            rate,
+            keep_from=before,
+            smooth=self._smooth_history,
         )[before:]
         if np.may_share_memory(processed, raw):
             # エフェクトが元の音をそのまま返した（量 0 など） 元の音の入れ物はやがて
@@ -267,6 +301,31 @@ class AudioMixer:
         while len(self._windows) > _KEPT_WINDOWS:
             self._windows.popitem(last=False)
         return processed
+
+    def _steady_reach(self, clip: Clip, rate: FrameRate) -> int:
+        """値の動く前の音を読むエフェクトの、クリップ全体で最も長い読み戻し（サンプル）
+
+        区切りごとの値で読み戻しを決めると、値が動いて長くなった区切りで、持っていた
+        元の音より前が要り、前の音を頭から読み直すことになる（最も長いやまびこで 1 区切り
+        90ms 予算は 21ms） クリップ全体の最も長い所にそろえておけば、続けて鳴らす間は
+        いつも続きだけを読む 値が動かなければ区切りの値と同じなので 0 を返す
+        """
+        key = str(clip.id)
+        found = self._reaches.get(key)
+        if found is not None and found[0] is clip:
+            return found[1]
+        reach = 0
+        if any(
+            _moves(effect) for definition, effect in audio_stack(clip) if definition.audio_history
+        ):
+            reach = max(
+                lookback(clip, offset, self.sample_rate, rate)
+                for offset in _sampled_offsets(clip, rate, self.sample_rate)
+            )
+        if len(self._reaches) > _KEPT_WINDOWS * 4:
+            self._reaches.clear()
+        self._reaches[key] = (clip, reach)
+        return reach
 
     def _raw_range(
         self,
@@ -302,7 +361,21 @@ class AudioMixer:
         # 長さは値から決まる（決め打ちの長さで切ると、長いやまびこの区切りが毎回読み直しになる）
         tape.trim(keep + HISTORY_WINDOW)
         self._raw[key] = (clip, tape)
+        self._raw.move_to_end(key)
+        self._let_go_of_raw()
         return tape.samples[begin - tape.origin : end - tape.origin]
+
+    def _let_go_of_raw(self) -> None:
+        """元の音の入れ物の合計を :data:`RAW_BUDGET_BYTES` に収める 最近使っていない物から捨てる
+
+        最も長いやまびこは 1 本 100 MB ほど持つ 何本も鳴らした後に持ち続けると、使わない
+        クリップの分までメモリを取ったままになる（PR #231 の指摘） 今使った 1 本は残す
+        捨てた物は、次に要るときに読み直す（前の音ごと読むので、その区切りだけ重い）
+        """
+        total = sum(tape.nbytes for _, tape in self._raw.values())
+        while total > RAW_BUDGET_BYTES and len(self._raw) > 1:
+            _, (_, tape) = self._raw.popitem(last=False)
+            total -= tape.nbytes
 
     def _read_clip(
         self,
@@ -427,6 +500,11 @@ class _Tape:
         return self.origin + self._length
 
     @property
+    def nbytes(self) -> int:
+        """取っている領域の大きさ（バイト）"""
+        return int(self._ring.nbytes)
+
+    @property
     def capacity(self) -> int:
         """輪 1 つの長さ（サンプル） 取っている領域はこの 2 倍"""
         return self._size
@@ -470,23 +548,73 @@ class _Tape:
         self._length += count
 
 
-def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
+def lookback(
+    clip: Clip, offset: int, sample_rate: int, rate: FrameRate, *, until: int | None = None
+) -> int:
     """クリップの ``offset`` サンプル目から掛けるのに、前の音をいくつ読み直すか
 
     前の音を読むエフェクト（:attr:`EffectDefinition.audio_history`）の要る長さを足す
     重ねて積むと、後ろのエフェクトが読む前の音も前のエフェクトを通した物が要る
-    値は塊の頭のフレームで解く 上限は :data:`MAX_HISTORY_SECONDS`
+    値は塊の頭のフレームで解く ``until``（区切りの終わり）を渡すと、動く値は終わりの値も
+    見て長い方を取る（区切りの中で値をつなぐとき :func:`_apply_effects`）
+    上限は :data:`MAX_HISTORY_SECONDS`
     """
-    frame = _sample_to_frame(
-        _frame_to_sample(clip.timeline_start, rate, sample_rate) + offset, rate, sample_rate
+    origin = _frame_to_sample(clip.timeline_start, rate, sample_rate)
+    frame = _sample_to_frame(origin + offset, rate, sample_rate) - clip.timeline_start
+    last = (
+        _sample_to_frame(origin + until, rate, sample_rate) - clip.timeline_start
+        if until is not None
+        else None
     )
     seconds = 0.0
     for definition, effect in audio_stack(clip):
         if definition.audio_history is not None:
-            seconds += definition.audio_history(
-                effect_values(definition, effect, frame - clip.timeline_start)
-            )
+            seconds += _history_seconds(definition, effect, frame, last)
     return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
+
+
+def _sampled_offsets(clip: Clip, rate: FrameRate, sample_rate: int) -> list[int]:
+    """クリップ全体の値を見る所（クリップの中のサンプル位置） キーフレームの所と、
+    その間をおおよそ 1 秒ごと（長いクリップでも 2000 か所まで）"""
+    frames = {0, clip.duration - 1}
+    for _, effect in audio_stack(clip):
+        for value in effect.params.values():
+            if isinstance(value, AnimatedValue):
+                frames.update(k.frame for k in value.keyframes if 0 <= k.frame < clip.duration)
+    step = max(1, int(rate.fps), clip.duration // 2000)
+    frames.update(range(0, clip.duration, step))
+    origin = _frame_to_sample(clip.timeline_start, rate, sample_rate)
+    return [
+        _frame_to_sample(clip.timeline_start + f, rate, sample_rate) - origin
+        for f in sorted(frames)
+    ]
+
+
+def _moves(effect: Effect) -> bool:
+    """キーフレームで動く値を持つか"""
+    return any(isinstance(v, AnimatedValue) and v.is_animated for v in effect.params.values())
+
+
+def _ends(
+    definition: EffectDefinition, effect: Effect, frame: int, last: int | None
+) -> tuple[dict[str, float], dict[str, float] | None]:
+    """区切りの頭の値と、つなぐときの終わりの値（つながない・同じなら ``None``）"""
+    head = effect_values(definition, effect, frame)
+    if last is None or last == frame or not _moves(effect):
+        return head, None
+    tail = effect_values(definition, effect, last)
+    return head, (tail if tail != head else None)
+
+
+def _history_seconds(
+    definition: EffectDefinition, effect: Effect, frame: int, last: int | None
+) -> float:
+    assert definition.audio_history is not None
+    head, tail = _ends(definition, effect, frame, last)
+    seconds = definition.audio_history(head)
+    if tail is not None:
+        seconds = max(seconds, definition.audio_history(tail))
+    return seconds
 
 
 def _clip_identities(project: Project) -> set[int]:
@@ -533,6 +661,7 @@ def _apply_effects(
     rate: FrameRate,
     *,
     keep_from: int = 0,
+    smooth: bool = False,
 ) -> np.ndarray:
     """クリップに積んだ音のエフェクトを、置いた順に掛ける
 
@@ -547,6 +676,11 @@ def _apply_effects(
     残す所の頭 その前は読み直した前の音）のフレームで解く 1 つずつ掛けてから
     次へ進む（エフェクトの順に掛ける） 前の音を読むエフェクトが前のエフェクトを
     通した音を読めるように ``keep_from`` があれば、返す音のそこより前は 0（掛けていない）
+
+    ``smooth`` なら、値の動く前の音を読むエフェクトは区切りの終わり（次の区切りの頭）の値でも
+    掛け、区切りの中で頭の値の音から終わりの値の音へ少しずつ移す 頭の値だけで掛けると、
+    キーフレームの動きが最大 0.34 秒遅れて段になる（PR #231 の指摘） 次の区切りは終わりの
+    値から始まるので、つなぎ目で音が跳ばない 値が動かない区切りでは 1 度しか掛けない
     """
     stack = audio_stack(clip)
     if not stack:
@@ -555,6 +689,11 @@ def _apply_effects(
     origin = _frame_to_sample(clip.timeline_start, rate, sample_rate)
     kept = min(max(keep_from, 0), max(len(samples) - 1, 0))
     kept_frame = _sample_to_frame(origin + offset + kept, rate, sample_rate) - clip.timeline_start
+    last_frame = (
+        _sample_to_frame(origin + offset + len(samples), rate, sample_rate) - clip.timeline_start
+        if smooth
+        else None
+    )
     # 各エフェクトの出力が要る所の頭（needs）と、読み始める所（starts） 後ろの前の音を読む
     # エフェクトが読む分だけ前へ広がる 頭から全部に掛けると、長いやまびこ（前の音 100 秒超）
     # の区切りごとに前のエフェクトも 100 秒ぶん掛け直して再生が間に合わない 使われない所は
@@ -566,7 +705,7 @@ def _apply_effects(
         definition, effect = stack[number]
         needs[number] = need
         if definition.audio_history is not None:
-            reach = definition.audio_history(effect_values(definition, effect, kept_frame))
+            reach = _history_seconds(definition, effect, kept_frame, last_frame)
             need = max(0, need - int(np.ceil(reach * sample_rate)))
         starts[number] = need
     current = samples
@@ -578,16 +717,27 @@ def _apply_effects(
         if definition.audio_history is not None:
             # 値は残す所の頭のフレームで解く 1 つずつ掛けてから次へ進む
             # （前の音を読むエフェクトが、前のエフェクトを通した音を読めるように）
-            done = definition.audio_process(
-                part,
-                effect_values(definition, effect, kept_frame),
-                AudioContext(
-                    offset=offset + start,
-                    sample_rate=sample_rate,
-                    duration=duration,
-                    keep_from=needs[number] - start,
-                ),
+            head, tail = _ends(definition, effect, kept_frame, last_frame)
+            context = AudioContext(
+                offset=offset + start,
+                sample_rate=sample_rate,
+                duration=duration,
+                keep_from=needs[number] - start,
+                # 同じ音へ 2 度掛けるときだけ、値に依らない途中の結果を使い回させる
+                shared={} if tail is not None else None,
             )
+            done = definition.audio_process(part, head, context)
+            if tail is not None:
+                ending = definition.audio_process(part, tail, context)
+                from_here = needs[number] - start
+                # 残す所の頭（kept）で 0、区切りの終わりで 1 その前（後ろのエフェクトが
+                # 読む前の音）は頭の値のまま
+                position = np.arange(needs[number], len(samples), dtype=np.float32)
+                weight = np.clip((position - kept) / max(len(samples) - kept, 1), 0.0, 1.0)
+                mixed = done[from_here:] + (ending[from_here:] - done[from_here:]) * weight[:, None]
+                current = np.asarray(mixed, dtype=np.float32)
+                base = needs[number]
+                continue
         else:
             done = _apply_spans(
                 definition,

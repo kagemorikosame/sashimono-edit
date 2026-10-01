@@ -412,7 +412,9 @@ class MainWindow(QMainWindow):
         # 焼き込みのひな形は、タイムラインで選んでいるテキストのクリップ
         self._subtitles.template_provider = self._selected_text_clip
         self._chat = ChatPanel(self, self)
-        self._playback = PlaybackController(project, self)
+        self._playback = PlaybackController(
+            project, self, smooth_history=self._preferences.smooth_audio_motion
+        )
 
         viewer = QWidget(self)
         viewer_layout = QVBoxLayout(viewer)
@@ -795,6 +797,7 @@ class MainWindow(QMainWindow):
         self._media_pool.set_view_mode(preferences.media_view)
         self._chat.apply_preferences(preferences)
         self._timeline.set_value_lines(preferences.value_lines)
+        self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._scene_bar.set_snap(preferences.timeline_snap)
@@ -2112,6 +2115,7 @@ class MainWindow(QMainWindow):
             pipeline_depth=self._preferences.export_pipeline_depth,
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
+            smooth_history=self._preferences.smooth_audio_motion,
         ).exec()
 
     def _active_scene_name(self) -> str | None:
