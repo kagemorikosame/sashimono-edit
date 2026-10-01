@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import wave
+from dataclasses import replace
 from pathlib import Path
 
 import av
@@ -213,3 +214,32 @@ class TestPlaybackBlocks:
         # 始めの 1 回は前の音ごと読む その後は前に読んだ所の続きだけを読む
         for (before, length), (after, _) in itertools.pairwise(reads):
             assert after == before + length, f"{before + length} の続きではなく {after} を読んだ"
+
+
+class TestTheCacheIsLetGo:
+    """前の音を読むエフェクトの貯めを、使わなくなったら捨てる（PR #231 の指摘）
+
+    捨てないと、消したクリップや値を変えたクリップの分（1 本 4 MB ほど）が、ミキサが
+    生きている間ずっと残り、長い編集で増え続ける
+    """
+
+    def test_a_removed_clip_is_forgotten(self, tmp_path: Path) -> None:
+        project = _project(_click(tmp_path), "audio_reverb")
+        mixer = AudioMixer(project)
+        try:
+            mixer.render(0, RATE // 2)
+            assert mixer._windows and mixer._raw
+            # 同じクリップのままなら残す（関係の無い編集で作り直さない）
+            mixer.set_project(project)
+            assert mixer._windows and mixer._raw
+            empty = project.with_timeline(replace(project.timeline, tracks=()))
+            mixer.set_project(empty)
+            assert not mixer._windows and not mixer._raw
+        finally:
+            mixer.close()
+
+    def test_closing_lets_it_all_go(self, tmp_path: Path) -> None:
+        mixer = AudioMixer(_project(_click(tmp_path), "audio_reverb"))
+        mixer.render(0, RATE // 2)
+        mixer.close()
+        assert not mixer._windows and not mixer._raw

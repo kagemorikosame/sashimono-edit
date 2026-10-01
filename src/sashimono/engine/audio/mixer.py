@@ -88,6 +88,14 @@ class AudioMixer:
         alive = {m.id for m in project.media}
         for key in [k for k in self._decoders if changed_format or k[0] not in alive]:
             self._decoders.pop(key).close()
+        # 前の音を読むエフェクトの貯めは、今のプロジェクトに同じクリップ（同じ物）がある分
+        # だけ残す 消したクリップや値を変えたクリップの分は二度と使われず、残すと 1 本
+        # 4 MB ほどずつ増え続ける（PR #231 の指摘） 形式が変われば中身ごと使えない
+        present = set() if changed_format else _clip_identities(project)
+        self._windows = OrderedDict(
+            (key, value) for key, value in self._windows.items() if id(value[0]) in present
+        )
+        self._raw = {key: value for key, value in self._raw.items() if id(value[0]) in present}
 
     def close(self) -> None:
         if self._closed:
@@ -96,6 +104,8 @@ class AudioMixer:
         for decoder in self._decoders.values():
             decoder.close()
         self._decoders.clear()
+        self._windows.clear()
+        self._raw.clear()
 
     def render(self, start_sample: int, count: int) -> np.ndarray:
         """``[start_sample, start_sample + count)`` のミックス結果を返す
@@ -380,6 +390,16 @@ def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
                 effect_values(definition, effect, frame - clip.timeline_start)
             )
     return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
+
+
+def _clip_identities(project: Project) -> set[int]:
+    """メインとシーンのタイムラインにあるクリップの物としての番号（``id``）
+
+    貯めはクリップそのもの（``is``）で照合している 同じ ID でも値を変えたクリップは
+    別の物なので、ここに無ければ貯めを捨てる
+    """
+    timelines = (project.timeline, *(scene.timeline for scene in project.scenes))
+    return {id(clip) for timeline in timelines for track in timeline.tracks for clip in track.clips}
 
 
 def _reads_history(clip: Clip) -> bool:
