@@ -360,6 +360,62 @@ class TestJetCut:
         assert host.document.project.duration < 300
 
 
+def _moved_voice_two() -> Project:
+    """音声 2 本の素材 音声 1 は頭に、リンクを外した音声 2 は 20 秒の所へ別に置いた"""
+    from dataclasses import replace
+
+    from sashimono.core.model import AudioStreamInfo, Clip, Track, TrackKind
+
+    media = MediaItem(
+        path=Path("C:/素材/録画.mp4"),
+        duration=Fraction(10),
+        audio_streams=(
+            AudioStreamInfo(1, 48000, 2, Fraction(1, 48000), "aac"),
+            AudioStreamInfo(2, 48000, 2, Fraction(1, 48000), "aac"),
+        ),
+    )
+    base = Project.create(media=(media,))
+    tracks = (
+        Track(
+            TrackKind.AUDIO,
+            "A1",
+            (Clip(timeline_start=0, duration=300, media_id=media.id, stream_index=1),),
+        ),
+        Track(
+            TrackKind.AUDIO,
+            "A2",
+            (Clip(timeline_start=600, duration=300, media_id=media.id, stream_index=2),),
+        ),
+    )
+    return base.with_timeline(replace(base.timeline, tracks=tracks))
+
+
+@pytest.mark.parametrize("audio", [None, 1])
+def test_jet_cut_of_voice_one_leaves_the_moved_voice_two_alone(audio: int | None) -> None:
+    # 壊れると、audio を省いたとき音で絞らず、別の所へ置いた音声 2 の位置でも音声 1 の無音を
+    # 切り、タイムライン全体から削った audio=1 と結果が違った（PR #231 の指摘）
+    from sashimono.core.commands import RippleCut
+    from tests.ui.test_subtitle_panel import make_waveform
+
+    host = FakeHost(_moved_voice_two())
+    host.stub_waveform = make_waveform([(0.0, 400), (0.5, 1500)])
+    media = host.document.project.media[0]
+    arguments: dict[str, Any] = {"media_id": str(media.id), "keep_speech": False}
+    if audio is not None:
+        arguments["audio"] = audio
+    cuts: list[tuple[int, int]] = []
+    original = host.apply_commands
+
+    def watching(commands: list[Any], label: str) -> None:
+        cuts.extend(r for c in commands if isinstance(c, RippleCut) for r in c.ranges)
+        original(commands, label)
+
+    host.apply_commands = watching  # type: ignore[method-assign]
+    result = run(host, "jet_cut", **arguments)
+    assert result["cuts"] == 1
+    assert all(end <= 600 for _, end in cuts)
+
+
 class TestImport:
     def test_import_probes_and_places(self, host: FakeHost, tmp_path: Path) -> None:
         target = tmp_path / "追加.mp4"

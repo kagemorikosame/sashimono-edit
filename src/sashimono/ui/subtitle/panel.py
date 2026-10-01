@@ -747,7 +747,10 @@ class SubtitlePanel(QWidget):
         transcript = media.transcript_for(self._stream)
         if protect and transcript is not None:
             silences = keep_speech(silences, transcript)
-        return plan_cuts(self._project, media.id, silences, stream=self._stream)
+        # 見ている音が 1 本目（None）でも番号にそろえて渡す None のままだと音で絞らない
+        return plan_cuts(
+            self._project, media.id, silences, stream=media.transcript_stream(self._stream)
+        )
 
     def _template(self) -> tuple[GeneratedSource | Clip, str]:
         """焼き込みのひな形と、窓に出す説明 タイムラインで選んでいるテキストがあればそれ"""

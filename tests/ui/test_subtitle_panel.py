@@ -560,3 +560,28 @@ class TestSourceTime:
     ) -> None:
         widget, _ = panel
         assert widget._source_time(video_media, 9999) is None
+
+
+def test_the_panels_jet_cut_of_the_first_voice_leaves_voice_two_alone(
+    qt_application: QApplication,
+) -> None:
+    # AI の jet_cut と同じ穴が画面に無いことを押さえる パネルの見ている音はいつも番号に
+    # そろっているが、None のまま渡ると音で絞らず、別の所へ置いた音声 2 の位置でも音声 1 の
+    # 無音を切る 最初に開いたときと音声 1 を選んだときで、切る所が同じになる（PR #231）
+    from sashimono.engine.audio.silence import SilenceOptions
+    from tests.ai.test_operations import _moved_voice_two
+
+    del qt_application
+    project = _moved_voice_two()
+    media = project.media[0]
+    widget = SubtitlePanel(project, StubAnalyzer(make_waveform([(0.0, 400), (0.5, 1500)])))
+    try:
+        widget.select_media(media.id)
+        options = SilenceOptions()
+        unchosen = widget._plan(media, options, False)
+        widget.select_stream(1)
+        chosen = widget._plan(media, options, False)
+        assert unchosen == chosen
+        assert unchosen and all(end <= 600 for _, end in unchosen)
+    finally:
+        widget.deleteLater()
