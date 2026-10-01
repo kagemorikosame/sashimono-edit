@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -22,8 +23,11 @@ from sashimono.asr.service import TranscriptionService
 from sashimono.core.commands import Command
 from sashimono.core.model import (
     AudioStreamInfo,
+    Clip,
     MediaItem,
     Project,
+    Track,
+    TrackKind,
     Transcript,
     TranscriptSegment,
     VideoStreamInfo,
@@ -260,6 +264,45 @@ class TestThePanel:
         assert [s.text for s in panel._segments()] == ["録画 の音声 1"]
         panel.select_stream(2)
         assert [s.text for s in panel._segments()] == ["録画 の音声 2"]
+
+    @pytest.mark.parametrize("kind", [TrackKind.AUDIO, TrackKind.MIXED])
+    def test_changing_the_clips_voice_redoes_the_list(
+        self, qt_application: QApplication, kind: TrackKind
+    ) -> None:
+        # 前は一覧の印に鳴らす音の番号が入っておらず、クリップの音を替えても作り直さず、
+        # 時刻が前の音の物（ここでは出ていない「—」）のまま残った（PR #231 の指摘）
+        del qt_application
+        said = Transcript((TranscriptSegment(Fraction(1), Fraction(2), "声"),))
+        media = _movie().with_transcript(said, 1).with_transcript(said, 2)
+
+        def placed(voice: int) -> Project:
+            if kind is TrackKind.AUDIO:
+                clip = Clip(timeline_start=0, duration=300, media_id=media.id, stream_index=voice)
+            else:
+                clip = Clip(timeline_start=0, duration=300, media_id=media.id, audio_stream=voice)
+            base = Project.create(media=(media,))
+            track = Track(kind, "音", (clip,))
+            return base.with_timeline(replace(base.timeline, tracks=(track,)))
+
+        first = placed(1)
+        analyzer = MediaAnalyzer(sample_rate=48000, channels=2)
+        panel = SubtitlePanel(first, analyzer)
+        try:
+            panel.select_media(media.id)
+            panel.select_stream(2)
+            assert [start for _, start, _ in panel._rows] == [-1]
+            clip = first.timeline.tracks[0].clips[0]
+            changed = (
+                replace(clip, stream_index=2)
+                if kind is TrackKind.AUDIO
+                else replace(clip, audio_stream=2)
+            )
+            track = replace(first.timeline.tracks[0], clips=(changed,))
+            panel.set_project(first.with_timeline(replace(first.timeline, tracks=(track,))))
+            assert [start for _, start, _ in panel._rows] == [30]
+        finally:
+            panel.close()
+            analyzer.close()
 
     def test_a_single_voice_shows_no_choice(self, qt_application: QApplication) -> None:
         del qt_application

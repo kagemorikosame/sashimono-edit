@@ -370,8 +370,18 @@ class SubtitlePanel(QWidget):
         media = self._current_media()
         if media is None:
             return (None,)
+        # 鳴らす音の番号（音声トラックは stream_index 混合は audio_stream）も入れる
+        # 入れないと、クリップの音を替えても一覧が前の音の字幕の時刻のまま残る（PR #231 の指摘）
         clips = tuple(
-            (str(clip.id), clip.timeline_start, clip.duration, clip.source_in, clip.speed)
+            (
+                str(clip.id),
+                clip.timeline_start,
+                clip.duration,
+                clip.source_in,
+                clip.speed,
+                clip.stream_index,
+                clip.audio_stream,
+            )
             for track in self._project.timeline.tracks
             for clip in track.clips
             if clip.media_id == media.id
