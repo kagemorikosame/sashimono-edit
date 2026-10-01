@@ -305,6 +305,14 @@ class TranscribeDialog(QDialog):
             )
             if not self.confirm_replace(name):
                 return
+        # AI から頼んだ起こしと同じ音なら重ねない（同じ列で番号をそろえて見る）
+        key = self._media.transcript_stream(stream)
+        if self._service.find(self._media.id, key) is not None:
+            self._status.setText(
+                "その音声はもう起こしています（順番待ちを含む） 終わるのを待ってください"
+            )
+            return
+        stream = key
         self.chosen_stream = stream
         options = TranscribeOptions(
             model=str(self._model.currentData()),
@@ -313,7 +321,7 @@ class TranscribeDialog(QDialog):
             compute_type="float16" if self._gpu.isChecked() else "int8",
             word_timestamps=self._words.isChecked(),
             initial_prompt=self._prompt.text().strip(),
-            audio_stream=self._stream.currentData(),
+            audio_stream=stream,
         )
         # 走っている起こし（AI から頼んだ物など）があれば順番待ちに入る 同時には走らせない
         waiting = self._service.busy

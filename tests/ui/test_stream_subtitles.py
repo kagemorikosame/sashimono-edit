@@ -162,6 +162,28 @@ class TestFromTheAssistant:
         speaker.gate.set()
         _settle(panel)
 
+    def test_the_first_voice_is_the_same_however_it_is_written(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 1 本目は「省く（None）」と「番号（1）」の 2 通りで届く 書き方で比べると、同じ音の
+        # 起こしが 2 回走り、同じ字幕を 2 回取り込んだ（PR #231 の指摘）
+        panel, _host, first, _second = setup
+        speaker.gate.clear()
+        panel.start_transcription(first.id, "tiny")
+        with pytest.raises(RuntimeError, match="もう起こしています"):
+            panel.start_transcription(first.id, "tiny", audio_stream=first.audio_streams[0].index)
+        # 窓から頼んでも同じ列で見分ける
+        dialog = TranscribeDialog(first, panel._service or TranscriptionService(_Speaker()))
+        try:
+            dialog._stream.setCurrentIndex(0)
+            dialog._start_transcribe()
+            assert dialog._job is None
+            assert "もう起こしています" in dialog._status.text()
+        finally:
+            dialog.deleteLater()
+        speaker.gate.set()
+        _settle(panel)
+
 
 class TestTheWindow:
     def test_redoing_a_voice_asks_before_replacing(

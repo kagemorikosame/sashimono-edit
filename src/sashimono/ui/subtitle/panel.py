@@ -614,9 +614,12 @@ class SubtitlePanel(QWidget):
         if not self._service.backend.is_available():
             raise RuntimeError("起こしの実行環境が入っていません 字幕パネルから導入できます")
 
-        if self._service.find(media.id, audio_stream) is not None:
+        # 番号をそろえてから比べる 1 本目は「省く（None）」と番号（AI の audio=1・窓）の
+        # 2 通りで届き、そのまま比べると同じ音の起こしが 2 回走る（PR #231 の指摘）
+        stream = media.transcript_stream(audio_stream)
+        if self._service.find(media.id, stream) is not None:
             raise RuntimeError(f"{media.name} のその音声はもう起こしています（順番待ちを含む）")
-        options = TranscribeOptions(model=model, audio_stream=audio_stream)
+        options = TranscribeOptions(model=model, audio_stream=stream)
         waiting = self._service.busy
         self._jobs.append(self._service.start(media.id, media.path, options))
         self.select_media(media.id)
