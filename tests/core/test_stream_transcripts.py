@@ -11,11 +11,18 @@ from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
-from sashimono.core.commands import SetSegmentText, SetTranscript
+from sashimono.core.commands import (
+    AddScene,
+    SetSegmentText,
+    SetTranscript,
+    burn_subtitles,
+    new_scene,
+)
 from sashimono.core.io.serialize import FORMAT_VERSION, project_from_dict, project_to_dict
 from sashimono.core.model import (
     AudioStreamInfo,
     Clip,
+    GeneratedSource,
     MediaItem,
     Project,
     Track,
@@ -26,6 +33,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.projection import project_timeline
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.sources import TEXT
 
 
 def _movie(voices: int = 2, name: str = "録画") -> MediaItem:
@@ -123,3 +131,45 @@ class TestShowing:
         project = base.with_timeline(replace(base.timeline, tracks=tracks))
         shown = {(p.clip_id, p.segment.text) for p in project_timeline(project)}
         assert shown == {(voice1.id, "ゲーム"), (voice2.id, "声")}
+
+    def test_voices_inside_a_placed_scene_burn_apart(self) -> None:
+        # 壊れると、シーンの中で同時に話す音声 1 と 2 が 1 本のレイヤーにまとまり、前の字幕が
+        # 切り詰められて欠ける（シーンのクリップは素材を持たないので話し手が分からなかった
+        # PR #231 の指摘）
+        media = _movie().with_transcript(_said("ゲーム"), 1).with_transcript(_said("声"), 2)
+        base = Project.create(media=(media,))
+        scene = new_scene(base, "中")
+        inner = (
+            Track(
+                TrackKind.AUDIO,
+                "A1",
+                (Clip(timeline_start=0, duration=150, media_id=media.id, stream_index=1),),
+            ),
+            Track(
+                TrackKind.AUDIO,
+                "A2",
+                (Clip(timeline_start=0, duration=150, media_id=media.id, stream_index=2),),
+            ),
+        )
+        project = AddScene(replace(scene, timeline=replace(scene.timeline, tracks=inner))).apply(
+            base
+        )
+        placed = Track(
+            TrackKind.VIDEO, "V1", (Clip(timeline_start=0, duration=150, scene_id=scene.id),)
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=(placed,)))
+        commands = burn_subtitles(project, GeneratedSource(TEXT.kind, {"text": ""}))
+        for command in commands:
+            project = command.apply(project)
+        burned = {
+            (str(c.source.params["text"]), c.subtitle_origin)
+            for t in project.timeline.tracks
+            for c in t.clips
+            if c.source is not None and c.subtitle_origin is not None
+        }
+        texts = {text for text, _ in burned}
+        assert texts == {"ゲーム", "声"}
+        origins = {(o.media_id, o.stream) for _, o in burned if o is not None}
+        assert origins == {(media.id, 1), (media.id, 2)}
+        # 話し手ごとに別のトラック
+        assert len([t for t in project.timeline.tracks if t.name.startswith("字幕")]) == 2

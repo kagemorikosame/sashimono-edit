@@ -32,7 +32,7 @@ from sashimono.core.model import (
     new_clip_id,
     new_effect_id,
 )
-from sashimono.core.projection import ProjectedSubtitle, project_timeline, subtitle_stream
+from sashimono.core.projection import ProjectedSubtitle, project_timeline
 
 __all__ = [
     "AddSegment",
@@ -249,17 +249,17 @@ def voice_label(project: Project, voice: Voice, *, with_media: bool = True) -> s
 
 
 def _voiced(project: Project) -> list[tuple[Voice, ProjectedSubtitle]]:
-    """タイムラインに出る字幕と、その話し手"""
+    """タイムラインに出る字幕と、その話し手
+
+    話し手は投影した字幕の出どころ（素材と音声）から取る 置いたクリップから素材を
+    たどると、置いたシーンの中の字幕はシーンのクリップ（素材を持たない）に当たり、
+    シーンの中の別々の話し手が (None, 0) の 1 本にまとまって欠けた（PR #231 の指摘）
+    """
     result: list[tuple[Voice, ProjectedSubtitle]] = []
     for subtitle in project_timeline(project):
         voice: Voice = (None, 0)
-        located = project.timeline.locate_clip(subtitle.clip_id)
-        if located is not None and located[1].media_id is not None:
-            track, clip = located
-            media = project.find_media(located[1].media_id)
-            if media is not None:
-                stream = media.transcript_stream(subtitle_stream(project, track, clip))
-                voice = (media.id, stream)
+        if subtitle.media_id is not None and project.find_media(subtitle.media_id) is not None:
+            voice = (subtitle.media_id, subtitle.stream)
         result.append((voice, subtitle))
     return result
 

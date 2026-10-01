@@ -17,6 +17,7 @@ from fractions import Fraction
 from sashimono.core.model import (
     Clip,
     ClipId,
+    MediaId,
     MediaItem,
     Project,
     Timeline,
@@ -53,6 +54,12 @@ class ProjectedSubtitle:
     #: クリップの端で切り詰められたか UI で「続きがある」表示に使う
     clipped_head: bool = False
     clipped_tail: bool = False
+    #: 字幕の出どころ（素材と、:meth:`MediaItem.transcript_stream` でそろえた音声の番号）
+    #: 置いたシーンの中の字幕は ``clip_id`` が外側のシーンのクリップに書き換わるので、
+    #: そこから素材をたどれない 出どころを持たせないと、焼き込みでシーンの中の別々の
+    #: 話し手が 1 本にまとまって欠けた（PR #231 の指摘）
+    media_id: MediaId | None = None
+    stream: int = 0
 
     @property
     def duration(self) -> int:
@@ -99,6 +106,8 @@ def project_clip(
             end_frame=clip.timeline_start + end_offset,
             clipped_head=segment.start < source_in,
             clipped_tail=segment.end > source_out,
+            media_id=media.id,
+            stream=media.transcript_stream(stream),
         )
 
 

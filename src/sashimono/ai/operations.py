@@ -75,7 +75,7 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
 )
-from sashimono.core.projection import project_timeline, subtitle_stream
+from sashimono.core.projection import project_timeline
 from sashimono.core.timebase import format_timecode
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
@@ -620,15 +620,13 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
             continue
         if contains and contains not in subtitle.segment.text:
             continue
-        located = project.timeline.locate_clip(subtitle.clip_id)
-        media_id = located[1].media_id if located is not None else None
+        # 素材と音声は字幕の出どころから取る 置いたクリップからたどると、置いたシーンの
+        # 中の字幕は素材を持たないシーンのクリップに当たり、どの素材の字幕か分からない
+        media_id = subtitle.media_id
         if wanted and str(media_id) != wanted:
             continue
         media = project.find_media(media_id) if media_id is not None else None
-        audio = _audio_number(
-            media,
-            subtitle_stream(project, located[0], located[1]) if located is not None else None,
-        )
+        audio = _audio_number(media, subtitle.stream)
         if wanted_audio is not None and audio != int(wanted_audio):
             continue
         rows.append(
