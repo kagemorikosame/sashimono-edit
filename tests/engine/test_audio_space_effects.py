@@ -93,6 +93,56 @@ class TestDelay:
         assert np.allclose(_render(project, 1024), _render(project, RATE), atol=1e-5)
 
 
+class TestALongEcho:
+    """10 秒を超えてまだ聞こえるやまびこを途切れさせない（PR #231 の指摘）
+
+    前は前の音を 10 秒で切って読み、繰り返しも 50 回で切っていた 2000ms・90% の
+    やまびこは 6 回目（12 秒後）でもまだ元の 6 割の大きさなのに、そこで消えた
+    """
+
+    SECONDS = 30
+
+    @pytest.fixture
+    def far(self, tmp_path: Path) -> Project:
+        samples = np.zeros(RATE * self.SECONDS, dtype=np.float32)
+        samples[0] = 0.5
+        path = _wav(tmp_path / "far-click.wav", samples)
+        return _project(path, "audio_delay", time=2000, feedback=90, mix=100)
+
+    def test_every_audible_repeat_is_counted(self) -> None:
+        from sashimono.effects.audio import _delay_repeats
+
+        # 量 100%・繰り返し 90% は 66 回目まで -60 dB より大きい
+        assert _delay_repeats({"time": 2000, "feedback": 90, "mix": 100}) == 66
+        # 小さい設定は今までどおり少ない数で済む
+        assert _delay_repeats({"time": 250, "feedback": 0, "mix": 50}) == 1
+
+    def test_the_echo_after_ten_seconds_is_still_heard(self, far: Project) -> None:
+        mixer = AudioMixer(far)
+        try:
+            first = float(mixer.render(0, 16)[0, 0])
+            at = RATE * 12
+            heard = mixer.render(at - 8, 16)[8, 0]
+        finally:
+            mixer.close()
+        assert first > 0.1
+        assert heard == pytest.approx(first * 0.9**5, rel=1e-3)
+
+    def test_playing_on_and_jumping_there_hear_the_same(self, far: Project) -> None:
+        # 区切りの頭から読むか、続けて再生してきたかで音が変わらない（再生と書き出しが同じ音）
+        at = RATE * 14
+        jumped_mixer = AudioMixer(far)
+        jumped = jumped_mixer.render(at, RATE)
+        jumped_mixer.close()
+        played_mixer = AudioMixer(far)
+        for start in range(RATE * 13, at, 1024):
+            played_mixer.render(start, min(1024, at - start))
+        played = played_mixer.render(at, RATE)
+        played_mixer.close()
+        assert np.abs(jumped - played).max() < 1e-5
+        assert np.abs(jumped).max() > 0.1
+
+
 class TestReverb:
     def test_it_leaves_a_tail(self, tmp_path: Path) -> None:
         project = _project(_click(tmp_path), "audio_reverb", decay=0.5, mix=50)

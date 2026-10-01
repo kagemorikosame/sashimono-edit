@@ -40,6 +40,10 @@ class AudioContext:
     sample_rate: int
     #: クリップの長さ（サンプル）
     duration: int
+    #: 渡した音のうち、この位置（渡した音の頭から数える）より前の出力は使われない
+    #: 前の音として読むだけの所 長い前の音を読む物（ディレイ）は、ここから先だけを
+    #: 計算してよい 0 なら全部を使う
+    keep_from: int = 0
 
 
 def _volume(samples: np.ndarray, values: dict[str, float], _context: AudioContext) -> np.ndarray:
@@ -85,8 +89,11 @@ def _monaural(samples: np.ndarray, values: dict[str, float], _context: AudioCont
     return mixed
 
 
-#: 前の音を読み直す長さの上限（秒） 長い残響や繰り返しの多いディレイでも、1 回に読む量を抑える
-MAX_HISTORY_SECONDS = 10.0
+#: 前の音を読み直す長さの上限（秒） 読む長さは値から決め（ディレイ 1 本なら最も長くて
+#: 間隔 2 秒・繰り返し 90%・量 100% の 132 秒）、これは何本も積んだときに読む量と覚えておく
+#: 量が際限なく増えないための歯止め 前は 10 秒で切っていて、2000ms・90% のやまびこが
+#: 10 秒を過ぎた所で、まだ聞こえるのに途切れた（PR #231 の指摘）
+MAX_HISTORY_SECONDS = 300.0
 #: 音程を変えるときの窓（秒） 短いほど遅れが小さく、長いほど低い音がうなりにくい
 PITCH_WINDOW_SECONDS = 0.05
 #: ディレイの繰り返しをここまで小さくなったら打ち切る（-60 dB）
@@ -138,10 +145,17 @@ def _reverb(samples: np.ndarray, values: dict[str, float], context: AudioContext
 
 
 def _delay_repeats(values: dict[str, float]) -> int:
+    """聞こえる（-60 dB より大きい）やまびこの数 量も含めて数える（波形の表示と同じ決まり）
+
+    前は 50 回で切っていて、繰り返しの多い設定ではまだ聞こえる所で途切れた
+    """
+    mix = float(np.clip(values.get("mix", 50.0), 0.0, 100.0)) / 100.0
     feedback = float(np.clip(values.get("feedback", 40.0), 0.0, 90.0)) / 100.0
-    if feedback <= 0.0:
+    if feedback <= 0.0 or mix <= _DELAY_FLOOR:
         return 1
-    return int(min(50, 1 + np.ceil(np.log(_DELAY_FLOOR) / np.log(feedback))))
+    # mix * feedback ** (r - 1) > floor を満たす最大の r
+    repeats = 1 + int(np.floor(np.log(_DELAY_FLOOR / mix) / np.log(feedback) - 1e-9))
+    return max(1, repeats)
 
 
 def _delay_history(values: dict[str, float]) -> float:
@@ -155,13 +169,23 @@ def _delay(samples: np.ndarray, values: dict[str, float], context: AudioContext)
     if mix <= 0.0 or step <= 0:
         return samples
     feedback = float(np.clip(values.get("feedback", 40.0), 0.0, 90.0)) / 100.0
-    out = samples.astype(np.float32, copy=True)
+    # 使われる所（keep_from から先）だけを作って足す 前の音は 100 秒を超えることがあり、全体を
+    # 写して繰り返しの数だけ足すと 1 区切りに 1 秒近く掛かって再生が間に合わない
+    # 1 サンプルごとに足す順は全体へ足すときと同じなので、値は変わらない 頭は 0 のまま
+    keep = min(max(context.keep_from, 0), len(samples))
+    if keep == 0:
+        out = samples.astype(np.float32, copy=True)
+    else:
+        out = np.zeros(samples.shape, dtype=np.float32)
+        out[keep:] = samples[keep:]
     gain = mix
     for repeat in range(1, _delay_repeats(values) + 1):
         shift = step * repeat
         if shift >= len(samples):
             break
-        out[shift:] += samples[:-shift] * gain
+        low = max(shift, keep)
+        if low < len(samples):
+            out[low:] += samples[low - shift : len(samples) - shift] * gain
         gain *= feedback
     return out
 

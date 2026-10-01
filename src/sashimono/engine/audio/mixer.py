@@ -13,6 +13,7 @@ from collections.abc import Iterator
 import numpy as np
 
 from sashimono.core.model import (
+    AnimatedValue,
     Clip,
     Effect,
     MediaId,
@@ -64,7 +65,7 @@ class AudioMixer:
         )
         #: 前の音を読むクリップの、読んだ元の音 続きを読むときは前に読んだ所から先だけを
         #: 読む（前へ戻って読み直すと、圧縮した音は解き直しになる）
-        self._raw: dict[tuple[str, int | None, int], tuple[Clip, int, np.ndarray]] = {}
+        self._raw: dict[tuple[str, int | None, int], tuple[Clip, _Tape]] = {}
 
     @property
     def project(self) -> Project:
@@ -247,45 +248,51 @@ class AudioMixer:
         end = min(start + HISTORY_WINDOW, duration)
         if end <= start:
             return None
-        before = min(start, lookback(clip, start, self.sample_rate, rate))
-        raw = self._raw_range(clip, stream, depth, start - before, end)
+        reach = lookback(clip, start, self.sample_rate, rate)
+        before = min(start, reach)
+        # 残す長さはクリップの頭で切る前の長さで見る 頭の近くで切った長さで入れ物を
+        # 作ると、区切りごとに広げ直して写すことになる
+        raw = self._raw_range(clip, stream, depth, start - before, end, keep=reach)
         if raw is None:
             return None
         processed = _apply_effects(
             clip, raw, start - before, self.sample_rate, duration, rate, keep_from=before
         )[before:]
+        if np.may_share_memory(processed, raw):
+            # エフェクトが元の音をそのまま返した（量 0 など） 元の音の入れ物はやがて
+            # 書き換わるので、覚えておく分は写しにする
+            processed = processed.copy()
         self._windows[key] = (clip, processed)
         while len(self._windows) > _KEPT_WINDOWS:
             self._windows.popitem(last=False)
         return processed
 
     def _raw_range(
-        self, clip: Clip, stream: int | None, depth: int, begin: int, end: int
+        self, clip: Clip, stream: int | None, depth: int, begin: int, end: int, *, keep: int
     ) -> np.ndarray | None:
-        """クリップの元の音の ``[begin, end)`` 前に読んだ所の続きなら、先だけを読み足す"""
+        """クリップの元の音の ``[begin, end)`` 前に読んだ所の続きなら、先だけを読み足す
+
+        ``keep`` はこの区切りが読み直した前の音の長さ 次の区切りも同じだけ要るので残す
+        """
         key = (str(clip.id), stream, depth)
         kept = self._raw.get(key)
-        if kept is not None and kept[0] is clip and kept[1] <= begin <= kept[1] + len(kept[2]):
-            _, origin, samples = kept
-            reach = origin + len(samples)
-            if end > reach:
-                more = self._read_clip(clip, reach, end - reach, depth, stream=stream)
+        tape = kept[1] if kept is not None and kept[0] is clip else None
+        if tape is not None and tape.origin <= begin <= tape.reach:
+            if end > tape.reach:
+                more = self._read_clip(clip, tape.reach, end - tape.reach, depth, stream=stream)
                 if more is None:
                     return None
-                samples = np.concatenate([samples, more])
+                tape.append(more)
         else:
             read = self._read_clip(clip, begin, end - begin, depth, stream=stream)
             if read is None:
                 return None
-            origin, samples = begin, read
+            tape = _Tape(begin, read, room=keep + 2 * HISTORY_WINDOW)
         # 次の区切りが読み直す前の音の分だけ残す 全部残すと長いクリップで増え続ける
-        keep = int(MAX_HISTORY_SECONDS * self.sample_rate) + HISTORY_WINDOW
-        if len(samples) > keep:
-            cut = len(samples) - keep
-            origin += cut
-            samples = samples[cut:]
-        self._raw[key] = (clip, origin, samples)
-        return samples[begin - origin : end - origin]
+        # 長さは値から決まる（決め打ちの長さで切ると、長いやまびこの区切りが毎回読み直しになる）
+        tape.trim(keep + HISTORY_WINDOW)
+        self._raw[key] = (clip, tape)
+        return tape.samples[begin - tape.origin : end - tape.origin]
 
     def _read_clip(
         self,
@@ -373,6 +380,66 @@ class AudioMixer:
         return decoder
 
 
+class _Tape:
+    """読んだ元の音を後ろへ足し、頭を捨てていく入れ物（同じ中身を 2 つ並べた輪）
+
+    足すたびに全体を繋ぎ直すと、長いやまびこ（前の音 100 秒超 50 MB）の区切りごとに
+    全体を写すことになり、再生の塊が間に合わない 広げてから写すやり方でも、広げる
+    区切りだけ 30ms を超えた 輪を 2 つ並べて同じ所へ 2 回書けば、どこから切り出しても
+    繋ぎ目の無い 1 本として読める 書くのは足した分だけで、全体を写すことは無い
+    書くのは今残している所の外だけなので、渡した切り出しの中身は書き換わらない
+    （捨てた所は書き換わる 切り出しを覚えておく側は写しを持つ）
+    """
+
+    __slots__ = ("_head", "_length", "_ring", "_size", "origin")
+
+    def __init__(self, origin: int, samples: np.ndarray, *, room: int) -> None:
+        #: ``samples`` の頭のサンプルの、クリップの中の位置
+        self.origin = origin
+        self._size = max(room, len(samples), 1)
+        self._ring = np.empty((self._size * 2, *samples.shape[1:]), dtype=samples.dtype)
+        self._head = 0
+        self._length = 0
+        self._write(samples)
+
+    @property
+    def samples(self) -> np.ndarray:
+        return self._ring[self._head : self._head + self._length]
+
+    @property
+    def reach(self) -> int:
+        """読んである所の終わり（クリップの中の位置 この位置は含まない）"""
+        return self.origin + self._length
+
+    def append(self, more: np.ndarray) -> None:
+        if self._length + len(more) > self._size:
+            # 残す長さが伸びた（値が動いた）ときだけ 輪を大きくして写し直す
+            kept = self.samples
+            self._size = (self._length + len(more)) * 3 // 2
+            self._ring = np.empty((self._size * 2, *kept.shape[1:]), dtype=kept.dtype)
+            self._head = 0
+            self._length = 0
+            self._write(kept)
+        self._write(more)
+
+    def trim(self, length: int) -> None:
+        """後ろの ``length`` サンプルだけ残す"""
+        cut = self._length - length
+        if cut > 0:
+            self._head = (self._head + cut) % self._size
+            self._length -= cut
+            self.origin += cut
+
+    def _write(self, more: np.ndarray) -> None:
+        count = len(more)
+        at = (self._head + self._length) % self._size
+        first = min(count, self._size - at)
+        for base in (0, self._size):
+            self._ring[base + at : base + at + first] = more[:first]
+            self._ring[base : base + count - first] = more[first:]
+        self._length += count
+
+
 def lookback(clip: Clip, offset: int, sample_rate: int, rate: FrameRate) -> int:
     """クリップの ``offset`` サンプル目から掛けるのに、前の音をいくつ読み直すか
 
@@ -446,40 +513,112 @@ def _apply_effects(
     プレビューの細かい塊（1024 サンプル）がフレームの切れ目をまたいだときに、
     音量の変わる時刻がずれて書き出しと合わなくなる
 
-    前の音を読むエフェクトは塊を切らずに全体へ 1 度で掛け、値は ``keep_from``（呼ぶ側が
-    残す所の頭 その前は読み直した前の音）のフレームで解く 1 つずつ全体へ掛けてから
+    前の音を読むエフェクトは塊を切らずに 1 度で掛け、値は ``keep_from``（呼ぶ側が
+    残す所の頭 その前は読み直した前の音）のフレームで解く 1 つずつ掛けてから
     次へ進む（エフェクトの順に掛ける） 前の音を読むエフェクトが前のエフェクトを
-    通した音を読めるように
+    通した音を読めるように ``keep_from`` があれば、返す音のそこより前は 0（掛けていない）
     """
     stack = audio_stack(clip)
     if not stack:
         return samples
 
     origin = _frame_to_sample(clip.timeline_start, rate, sample_rate)
-    spans = list(
-        _frame_spans(clip.timeline_start, origin + offset, len(samples), sample_rate, rate)
-    )
     kept = min(max(keep_from, 0), max(len(samples) - 1, 0))
-    kept_frame = next((f for b, e, f in spans if b <= kept < e), spans[0][2] if spans else 0)
-    current = samples
-    for definition, effect in stack:
-        assert definition.audio_process is not None
+    kept_frame = _sample_to_frame(origin + offset + kept, rate, sample_rate) - clip.timeline_start
+    # 各エフェクトの出力が要る所の頭（needs）と、読み始める所（starts） 後ろの前の音を読む
+    # エフェクトが読む分だけ前へ広がる 頭から全部に掛けると、長いやまびこ（前の音 100 秒超）
+    # の区切りごとに前のエフェクトも 100 秒ぶん掛け直して再生が間に合わない 使われない所は
+    # 掛けず、要る所から先だけを持ち回る（``keep_from`` が 0 なら全部 今までと同じ）
+    needs = [0] * len(stack)
+    starts = [0] * len(stack)
+    need = kept if keep_from > 0 else 0
+    for number in range(len(stack) - 1, -1, -1):
+        definition, effect = stack[number]
+        needs[number] = need
         if definition.audio_history is not None:
-            current = definition.audio_process(
-                current,
+            reach = definition.audio_history(effect_values(definition, effect, kept_frame))
+            need = max(0, need - int(np.ceil(reach * sample_rate)))
+        starts[number] = need
+    current = samples
+    base = 0
+    for number, (definition, effect) in enumerate(stack):
+        assert definition.audio_process is not None
+        start = starts[number]
+        part = current[start - base :]
+        if definition.audio_history is not None:
+            # 値は残す所の頭のフレームで解く 1 つずつ掛けてから次へ進む
+            # （前の音を読むエフェクトが、前のエフェクトを通した音を読めるように）
+            done = definition.audio_process(
+                part,
                 effect_values(definition, effect, kept_frame),
-                AudioContext(offset=offset, sample_rate=sample_rate, duration=duration),
+                AudioContext(
+                    offset=offset + start,
+                    sample_rate=sample_rate,
+                    duration=duration,
+                    keep_from=needs[number] - start,
+                ),
             )
-            continue
-        out = np.empty_like(current)
-        for begin, end, frame in spans:
-            out[begin:end] = definition.audio_process(
-                current[begin:end],
-                effect_values(definition, effect, frame),
-                AudioContext(offset=offset + begin, sample_rate=sample_rate, duration=duration),
+        else:
+            done = _apply_spans(
+                definition,
+                effect,
+                part,
+                clip,
+                origin + offset + start,
+                offset + start,
+                sample_rate,
+                duration,
+                rate,
             )
-        current = out
-    return current
+        # 次のエフェクトが読む所から先だけを持ち回る
+        current = done[needs[number] - start :]
+        base = needs[number]
+    if base == 0:
+        return current
+    # 頭（読み直した前の音）は呼ぶ側も使わない 長さだけそろえて 0 で埋める
+    # （np.zeros は触れない所の領域を実際には確保しないので、長くても軽い）
+    whole = np.zeros((len(samples), *samples.shape[1:]), dtype=current.dtype)
+    whole[base:] = current
+    return whole
+
+
+def _apply_spans(
+    definition: EffectDefinition,
+    effect: Effect,
+    samples: np.ndarray,
+    clip: Clip,
+    timeline_offset: int,
+    offset: int,
+    sample_rate: int,
+    duration: int,
+    rate: FrameRate,
+) -> np.ndarray:
+    """前の音を読まないエフェクトを、映像のフレームの切れ目ごとに値を解いて掛ける
+
+    値が動かない（キーフレームの無い）ときは 1 度で掛ける サンプルごとの計算なので
+    切っても切らなくても値は同じで、長い前の音（100 秒で 3000 コマ）を切って回す手間が省ける
+    """
+    assert definition.audio_process is not None
+    if not any(
+        isinstance(value, AnimatedValue) and value.is_animated for value in effect.params.values()
+    ):
+        frame = _sample_to_frame(timeline_offset, rate, sample_rate) - clip.timeline_start
+        whole: np.ndarray = definition.audio_process(
+            samples,
+            effect_values(definition, effect, frame),
+            AudioContext(offset=offset, sample_rate=sample_rate, duration=duration),
+        )
+        return whole
+    out = np.empty_like(samples)
+    for begin, end, frame in _frame_spans(
+        clip.timeline_start, timeline_offset, len(samples), sample_rate, rate
+    ):
+        out[begin:end] = definition.audio_process(
+            samples[begin:end],
+            effect_values(definition, effect, frame),
+            AudioContext(offset=offset + begin, sample_rate=sample_rate, duration=duration),
+        )
+    return out
 
 
 def _frame_spans(
