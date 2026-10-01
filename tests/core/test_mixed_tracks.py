@@ -425,10 +425,11 @@ class TestLayerMode:
 
 
 class TestSaving:
-    def test_the_format_is_7(self) -> None:
+    def test_the_format_is_at_least_7(self) -> None:
         # 上げ忘れると形式 6 の本体がこのファイルを開き、混合トラックで止まるか、
         # audio_stream と show_picture を黙って落として保存し直す
-        assert FORMAT_VERSION == 7
+        # 8 で字幕を音声ごとにした（test_stream_transcripts.py）
+        assert FORMAT_VERSION >= 7
 
     def test_layers_and_their_clips_round_trip(self, mixed_project: Project) -> None:
         # 落とすと、保存して開き直しただけで動画の音が消える・隠した絵が出る

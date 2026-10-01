@@ -17,15 +17,45 @@ from fractions import Fraction
 from sashimono.core.model import (
     Clip,
     ClipId,
+    MediaId,
     MediaItem,
     Project,
     Timeline,
+    Track,
     TrackId,
     TranscriptSegment,
+    heard_stream,
 )
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
-__all__ = ["ProjectedSubtitle", "project_clip", "project_timeline"]
+__all__ = [
+    "ProjectedSubtitle",
+    "project_clip",
+    "project_timeline",
+    "subtitle_stream",
+    "subtitle_voice",
+]
+
+
+def subtitle_stream(project: Project, track: Track, clip: Clip) -> int | None:
+    """クリップに出す字幕の音声ストリーム 音を鳴らすクリップはその音、絵だけのクリップは 1 本目
+
+    絵だけのクリップ（分けて置いた映像）は前と同じく 1 本目の字幕を出す
+    """
+    if not project.plays_sound(track, clip):
+        return None
+    return heard_stream(track, clip)
+
+
+def subtitle_voice(project: Project, track: Track, clip: Clip, media: MediaItem) -> int:
+    """クリップに出す字幕の音声を、素材の字幕の番号（:meth:`MediaItem.transcript_stream`）で
+
+    字幕パネル・無音カット・分割の時刻など「どのクリップがこの音のクリップか」を決める所は
+    すべてこれで比べる 鳴らす音はトラックの種類で変わる（音声トラックは stream_index、
+    混合は audio_stream、映像トラックは鳴らさないので 1 本目） クリップの番号だけを見たり、
+    音を見ずに最初のクリップを使ったりすると、別の音の位置で字幕を割り、無音を切る
+    """
+    return media.transcript_stream(subtitle_stream(project, track, clip))
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +71,12 @@ class ProjectedSubtitle:
     #: クリップの端で切り詰められたか UI で「続きがある」表示に使う
     clipped_head: bool = False
     clipped_tail: bool = False
+    #: 字幕の出どころ（素材と、:meth:`MediaItem.transcript_stream` でそろえた音声の番号）
+    #: 置いたシーンの中の字幕は ``clip_id`` が外側のシーンのクリップに書き換わるので、
+    #: そこから素材をたどれない 出どころを持たせないと、焼き込みでシーンの中の別々の
+    #: 話し手が 1 本にまとまって欠けた（PR #231 の指摘）
+    media_id: MediaId | None = None
+    stream: int = 0
 
     @property
     def duration(self) -> int:
@@ -48,14 +84,20 @@ class ProjectedSubtitle:
 
 
 def project_clip(
-    clip: Clip, media: MediaItem, rate: FrameRate, track_id: TrackId
+    clip: Clip,
+    media: MediaItem,
+    rate: FrameRate,
+    track_id: TrackId,
+    stream: int | None = None,
 ) -> Iterator[ProjectedSubtitle]:
     """1 つのクリップに現れる字幕を返す
 
     クリップが使っているソース範囲に重なるセグメントだけが対象で、はみ出した分は
-    クリップの端で切り詰められる
+    クリップの端で切り詰められる ``stream`` はクリップが鳴らす音声ストリーム
+    （``None`` と素材に無い番号は 1 本目） 音ごとに分けて置いたクリップには、その音の
+    字幕だけが出る
     """
-    transcript = media.transcript
+    transcript = media.transcript_for(stream)
     if transcript is None:
         return
 
@@ -81,6 +123,8 @@ def project_clip(
             end_frame=clip.timeline_start + end_offset,
             clipped_head=segment.start < source_in,
             clipped_tail=segment.end > source_out,
+            media_id=media.id,
+            stream=media.transcript_stream(stream),
         )
 
 
@@ -119,9 +163,11 @@ def _project_tracks(
             if clip.media_id is None:
                 continue
             media = project.find_media(clip.media_id)
-            if media is None or media.transcript is None:
+            if media is None or not media.transcripts:
                 continue
-            yield from project_clip(clip, media, project.rate, track.id)
+            yield from project_clip(
+                clip, media, project.rate, track.id, subtitle_stream(project, track, clip)
+            )
 
 
 def _place_scene(

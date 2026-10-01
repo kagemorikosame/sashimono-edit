@@ -44,7 +44,7 @@ def test_a_removed_layer_does_not_cause_a_twin(host: FakeHost) -> None:
 
 def test_the_list_says_mixed(host: FakeHost) -> None:
     run(host, "add_track", kind="mixed")
-    kinds = [entry["kind"] for entry in run(host, "list_tracks")]
+    kinds = [entry["kind"] for entry in run(host, "list_tracks")["tracks"]]
     assert kinds[-1] == "mixed"
 
 
@@ -61,10 +61,10 @@ def test_layer_clips_show_what_they_play(host: FakeHost) -> None:
     media = project.media[0]
     clip = Clip(0, 30, media_id=media.id, audio_stream=1, show_picture=False)
     host.apply_commands([AddClip(layer.id, clip)], "置く")
-    listed = next(c for c in run(host, "list_clips") if c["track_kind"] == "mixed")
+    listed = next(c for c in run(host, "list_clips")["clips"] if c["track_kind"] == "mixed")
     assert listed["audio_stream"] == 1
     assert listed["show_picture"] is False
-    others = [c for c in run(host, "list_clips") if c["track_kind"] != "mixed"]
+    others = [c for c in run(host, "list_clips")["clips"] if c["track_kind"] != "mixed"]
     assert all("audio_stream" not in c for c in others)
 
 
@@ -154,6 +154,6 @@ class TestPrompt:
             Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(video_media,))
         )
         run(host, "place_media", media_id=str(video_media.id))
-        video, audio = run(host, "list_clips")
+        video, audio = run(host, "list_clips")["clips"]
         assert video["link_group"] is not None
         assert video["link_group"] == audio["link_group"]

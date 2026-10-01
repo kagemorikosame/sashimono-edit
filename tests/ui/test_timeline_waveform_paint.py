@@ -18,8 +18,9 @@ import pytest
 from PySide6.QtCore import QLineF, QRect
 from PySide6.QtGui import QImage, QPainter, QPen
 
-from sashimono.core.model import Clip, Track, TrackKind
+from sashimono.core.model import Clip, Effect, Track, TrackKind
 from sashimono.core.timebase import FrameRate
+from sashimono.effects import registry
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import PeakLevel, Waveform
 from sashimono.ui.theme import Colors, Metrics
@@ -238,3 +239,116 @@ def test_the_cache_does_not_keep_a_discarded_waveform_alive() -> None:
     del waveform
     gc.collect()
     assert alive() is None
+
+
+def _tall(painted: np.ndarray) -> np.ndarray:
+    """列ごとに塗った行の数"""
+    return np.asarray((painted != 0).sum(axis=0))
+
+
+_RECT = QRect(Metrics.TRACK_HEADER_WIDTH, 10, 300, 82)
+_LAYOUT = TimelineLayout(pixels_per_frame=300 / 90)
+
+
+def _sound_clip(*effects: Effect) -> Clip:
+    return Clip(timeline_start=0, duration=90, effects=effects)
+
+
+class TestTheSoundShapesTheWave:
+    """音量やリバーブを変えたら、タイムラインの波形にも映す（利用者の要望）
+
+    前は素材を解析したピークをそのまま描き、音量を 0 にしても波形が同じ大きさだった
+    """
+
+    def test_half_the_volume_draws_half_the_wave(self) -> None:
+        waveform = _waveform(-0.8, 0.8)
+        full = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip()))
+        quiet = _sound_clip(registry.require("audio_volume").create(volume=50.0))
+        half = _tall(_paint(waveform, _RECT, _LAYOUT, quiet))
+        middle = full.shape[0] // 2
+        column = _RECT.left() + 150
+        assert half[column] == pytest.approx(full[column] / 2, abs=2)
+        assert middle > 0
+
+    def test_the_track_volume_also_counts(self) -> None:
+        waveform = _waveform(-0.8, 0.8)
+        canvas = QImage(_RECT.right() + 10, _RECT.bottom() + 10, QImage.Format.Format_ARGB32)
+        canvas.fill(0)
+        painter = QPainter(canvas)
+        _draw_waveform(painter, _RECT, _sound_clip(), _LAYOUT, RATE, waveform, track_gain=0.25)
+        painter.end()
+        quarter = _tall(_pixels(canvas))[_RECT.left() + 150]
+        full = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip()))[_RECT.left() + 150]
+        assert quarter == pytest.approx(full / 4, abs=2)
+
+    def test_a_fade_thins_the_start(self) -> None:
+        waveform = _waveform(-0.8, 0.8)
+        fade = registry.require("audio_fade").create(fade_in=1.0)
+        drawn = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip(fade)))
+        assert drawn[_RECT.left() + 2] < drawn[_RECT.left() + 250] / 4
+
+    def test_a_reverb_leaves_a_tail(self) -> None:
+        # 前半だけ鳴る素材 リバーブを掛けると、鳴り終えた後にも尾が残る
+        peaks = np.zeros((48000 * 4 // 256, 2, 2), dtype=np.float32)
+        peaks[: len(peaks) // 4, :, 0] = -0.8
+        peaks[: len(peaks) // 4, :, 1] = 0.8
+        waveform = Waveform(
+            sample_rate=48000, channels=2, total_samples=48000 * 4, levels=(PeakLevel(256, peaks),)
+        )
+        dry = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip()))
+        reverb = registry.require("audio_reverb").create(decay=2.0, mix=50.0)
+        wet = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip(reverb)))
+        after = _RECT.left() + 110
+        assert dry[after] <= 2
+        assert wet[after] > 6
+
+    def test_changing_the_volume_rebuilds_the_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 鍵に効き方を入れないと、音量を変えても前の大きさの画像が貼られる
+        waveform = _waveform(-0.8, 0.8)
+        calls = _count_envelopes(monkeypatch)
+        _paint(waveform, _RECT, _LAYOUT, _sound_clip())
+        _paint(waveform, _RECT, _LAYOUT, _sound_clip())
+        assert len(calls) == 1
+        quiet = _sound_clip(registry.require("audio_volume").create(volume=40.0))
+        _paint(waveform, _RECT, _LAYOUT, quiet)
+        assert len(calls) == 2
+
+
+class TestTheShapeOfAWideClip:
+    """見えている範囲だけを作る広いクリップでも、手前の音のやまびこを映す（PR #231 の指摘）
+
+    前は見える範囲だけを取ってからディレイの形を掛けたので、手前で鳴った音のやまびこが、
+    鳴った所が左端を越えて見えなくなると一緒に消えた（スクロールで出たり消えたりする）
+    """
+
+    @staticmethod
+    def _burst() -> Waveform:
+        """60 秒のうち 20〜21 秒だけ大きな音"""
+        peaks = np.zeros((48000 * 60 // 256, 2, 2), dtype=np.float32)
+        begin, end = 48000 * 20 // 256, 48000 * 21 // 256
+        peaks[begin:end, :, 0] = -0.8
+        peaks[begin:end, :, 1] = 0.8
+        return Waveform(48000, 2, 48000 * 60, (PeakLevel(256, peaks),))
+
+    def _column_at(self, clip: Clip, scroll: float, frame: int) -> int:
+        # 800 画素で 97 コマほど見える 590 からなら元の音もやまびこも、645 からならやまびこだけ
+        rect = QRect(Metrics.TRACK_HEADER_WIDTH, 10, 800, 42)
+        layout = TimelineLayout(
+            pixels_per_frame=WAVEFORM_IMAGE_MAX_COLUMNS / 1000, scroll_frame=scroll
+        )
+        heights = _tall(_paint(self._burst(), rect, layout, clip))
+        return int(heights[round(layout.frame_to_x(frame))])
+
+    def test_the_echo_stays_after_its_sound_scrolls_out(self) -> None:
+        delay = registry.require("audio_delay").create(time=2000, feedback=0, mix=100)
+        clip = Clip(timeline_start=0, duration=1800, effects=(delay,))
+        # やまびこは 22〜23 秒（660〜690 コマ） 元の音（600〜630 コマ）が見えているときと、
+        # 左端を越えて見えなくなったときで、22.5 秒の所の高さが変わらない
+        seen = self._column_at(clip, 590.0, 675)
+        scrolled = self._column_at(clip, 645.0, 675)
+        assert seen > 6
+        assert scrolled == seen
+
+    def test_without_an_echo_the_spot_stays_quiet(self) -> None:
+        clip = Clip(timeline_start=0, duration=1800)
+        assert self._column_at(clip, 645.0, 675) <= 2

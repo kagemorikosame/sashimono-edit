@@ -19,6 +19,7 @@ from sashimono.core.model.ids import (
     GroupId,
     MediaId,
     SceneId,
+    SegmentId,
     TrackId,
     new_clip_id,
     new_track_id,
@@ -141,6 +142,21 @@ def default_track_name(kind: TrackKind, number: int, taken: Collection[str] = ()
 
 
 @dataclass(frozen=True, slots=True)
+class SubtitleOrigin:
+    """字幕から置いた（焼き込んだ）テキストのクリップが、どの字幕の行から来たか
+
+    字幕の誤植をまとめて直すとき、焼き込んだ文字も一緒に直すのに使う 本文の一致だけで
+    探すと、手で書いたタイトルがたまたま直す前の字幕と同じ本文だと書き換えてしまう
+    """
+
+    #: 字幕を持つ素材 シーンの中の字幕（素材を持たない）は ``None``
+    media_id: MediaId | None
+    #: 字幕の音声ストリームの番号（:meth:`MediaItem.transcript_stream` でそろえた物）
+    stream: int
+    segment_id: SegmentId
+
+
+@dataclass(frozen=True, slots=True)
 class Clip:
     """タイムライン上に置かれた 1 つのクリップ
 
@@ -218,6 +234,9 @@ class Clip:
     #: 縮み、大きい素材が画面からはみ出す 素材を持たないクリップ（テキスト・図形）は
     #: 画面の大きさで作るので、どちらでも同じ
     native_size: bool = False
+    #: 字幕から置いたテキストなら、その字幕の行（:class:`SubtitleOrigin`） 手で置いた物と
+    #: 前の版で焼き込んだ物は ``None``
+    subtitle_origin: SubtitleOrigin | None = None
 
     def __post_init__(self) -> None:
         if self.duration <= 0:

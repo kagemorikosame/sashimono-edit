@@ -9,6 +9,7 @@ Qt の描画系に任せるのが現実的で、その依存をこの層に持�
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from sashimono.core.model import (
@@ -16,6 +17,7 @@ from sashimono.core.model import (
     GROUP_AS_ONE,
     GROUP_KIND,
     GROUP_LAYERS,
+    AnimatedValue,
     GeneratedSource,
     ParamValue,
 )
@@ -52,6 +54,14 @@ class SourceDefinition:
     kind: str
     label: str
     parameters: tuple[ParameterSpec, ...] = ()
+    #: 今の値で使わない項目の名前を返す 設定パネルはこれを出さない（値は消さずに残す）
+    #: 図形の種類や切り替え方で使う項目が変わる物だけが持つ 全部を並べると、図形の
+    #: 設定に 60 近い欄が並び、どれを動かせば変わるのかが分からない
+    unused: Callable[[Mapping[str, ParamValue]], frozenset[str]] | None = None
+
+    def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
+        """``params`` のときに使わない項目 :attr:`unused` が無ければ空"""
+        return self.unused(params) if self.unused is not None else frozenset()
 
     def spec(self, name: str) -> ParameterSpec | None:
         for parameter in self.parameters:
@@ -71,9 +81,48 @@ class SourceDefinition:
         return GeneratedSource(kind=self.kind, params=params)
 
 
+def _still_zero(value: ParamValue | None) -> bool:
+    """動かない 0 か（キーフレームで動く値は、途中で 0 でなくなるので使う側に数える）"""
+    if value is None:
+        return True
+    if isinstance(value, AnimatedValue):
+        return not value.keyframes and value.static == 0
+    return False
+
+
+def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """テキストの設定で使わない項目
+
+    描く所（:mod:`sashimono.engine.sources` の ``_draw_text``）が読まない物だけ
+    - タイマーの書式が空なら、タイマーの初めの値・速さ・数え下げ・長さを読まない
+    - タイマーの書式があれば、文字の代わりに時間を出すので文字を読まない
+    - 数え下げを切っていれば、数え下げる長さを読まない
+    - 縦書きは行揃えと組み方を読まない（縦書きは標準の組み方で描く）
+    - 縁取りの太さが 0 なら縁取りの色、影のずらしとぼかしが 0 なら影の色を読まない
+      （文字の中の制御文字で縁や影を付けたときは、制御文字の色を使う）
+    """
+    unused: set[str] = set()
+    if not str(params.get("timer_format", "") or ""):
+        unused |= {"timer_start", "timer_rate", "timer_countdown", "timer_length"}
+    else:
+        unused.add("text")
+        countdown = params.get("timer_countdown")
+        if not (countdown is True or (isinstance(countdown, int) and countdown)):
+            unused.add("timer_length")
+    vertical = params.get("vertical")
+    if vertical is True or (isinstance(vertical, int) and vertical):
+        unused |= {"align", "layout"}
+    if _still_zero(params.get("border_width")):
+        unused.add("border_color")
+    if all(_still_zero(params.get(name)) for name in ("shadow_x", "shadow_y", "shadow_blur")):
+        unused.add("shadow_color")
+    return frozenset(unused)
+
+
 TEXT = SourceDefinition(
     kind="text",
     label="テキスト",
+    unused=_text_unused,
     parameters=(
         TextSpec("text", "文字", "テキスト"),
         FontSpec("font", "フォント"),
@@ -154,9 +203,65 @@ _FIGURE_CHOICES = (
 )
 
 
+#: 図形の種類ごとの専用の項目 描く所（:mod:`sashimono.engine.sources`）が読む物だけ
+_SHAPE_OWN: dict[str, frozenset[str]] = {
+    "rounded": frozenset({"corner_radius"}),
+    "fan": frozenset({"span"}),
+    "arrow": frozenset({"bar_length", "bar_thickness"}),
+    "superformula": frozenset({"formula_m", "formula_n"}),
+    "polyline": frozenset(
+        {"points", "points_from", "line_type", "closed", "fill_color", "dash"}
+        | {"trim_start", "trim_end"}
+    ),
+    "concentration": frozenset(
+        {"density", "line_thickness", "line_length", "softness", "center_gap"}
+        | {"fill_frame", "flicker"}
+    ),
+    "motion_trail": frozenset(
+        {"trail_interval", "trail_min_step", "trail_core", "trail_band", "trail_speed"}
+        | {"trail_head_size", "trail_head_angle", "trail_head_offset", "trail_head_shape"}
+    ),
+    "starfield": frozenset(
+        {"star_count", "star_speed", "star_spread", "star_depth", "star_size", "star_shape"}
+        | {"star_fade_in", "star_fade_out"}
+    ),
+    "waveform": frozenset(
+        {"audio_path", "wave_volume", "wave_spectrum", "wave_mirror", "wave_columns"}
+        | {"wave_rows", "wave_gap_x", "wave_gap_y", "audio_end_ms"}
+    ),
+}
+#: 輪郭の形（パス）で描く図形だけが使う項目 線・集中線・軌跡・星空・音声波形は別の道で描く
+_OUTLINED = frozenset({"outline_only", "line_align", "rotation"})
+#: 専用の道で描く図形
+_OWN_WAY = frozenset({"polyline", "concentration", "motion_trail", "starfield", "waveform"})
+
+
+def _shape_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """図形の種類で使わない項目
+
+    ほかの種類の専用の項目を隠す 大きさ・位置・線の太さも、描く所が読まない種類では隠す
+    （背景は画面の全体、軌跡と星空は画面の座標、線は点の広がりで大きさが決まる）
+    """
+    shape = str(params.get("shape", "rect"))
+    unused = set().union(*(own for kind, own in _SHAPE_OWN.items() if kind != shape))
+    if shape in _OWN_WAY:
+        unused |= _OUTLINED
+    if shape in ("background", "polyline", "motion_trail", "starfield"):
+        unused |= {"width", "height"}
+    if shape == "concentration":
+        # 集中線の大きさは幅だけで決まる（円の直径）
+        unused |= {"height", "line_width"}
+    if shape in ("motion_trail", "starfield"):
+        unused |= {"pos_x", "pos_y"}
+    if shape in ("starfield", "waveform"):
+        unused.add("line_width")
+    return frozenset(unused)
+
+
 SHAPE = SourceDefinition(
     kind="shape",
     label="図形",
+    unused=_shape_unused,
     parameters=(
         SelectSpec(
             "shape",
@@ -330,12 +435,30 @@ GROUP = SourceDefinition(
 PREVIOUS_OBJECT = SourceDefinition(kind="previous_object", label="直前オブジェクト")
 
 
+def _transition_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """切り替え方で使わない項目
+
+    向きは押し出しとスライドだけが動かす向き 動かす・手前にする場面はスライドと重ねるだけ
+    イージングは進み具合を使う物だけ（切り替えは真ん中で入れ替わり、重ねるは進まない）
+    """
+    style = str(params.get("style", "fade"))
+    unused: set[str] = set()
+    if style not in ("push", "slide"):
+        unused.add("angle")
+    if style not in ("slide", "overlay"):
+        unused.add("target")
+    if style in ("switch", "overlay"):
+        unused |= {"easing", "easing_mode"}
+    return frozenset(unused)
+
+
 #: 下のトラックの絵を、前の場面から後の場面へ切り替える（YMM4 の ``TransitionItem``）
 #: 前の場面はクリップに掛けたエフェクト、後の場面は ``Clip.after_effects`` を通す
 #: 絵はレンダラが GPU の中で作る（:mod:`sashimono.engine.render.renderer`）
 TRANSITION = SourceDefinition(
     kind="transition",
     label="場面切り替え",
+    unused=_transition_unused,
     parameters=(
         SelectSpec(
             "style",
