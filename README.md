@@ -425,7 +425,7 @@ ruff・mypy・pytest をまとめて走らせます **CI もこれと同じも�
 | PR の送り方 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | 不具合・要望 | [Issue](../../issues/new/choose) |
 
-PR は**フェーズ単位**で、CodeRabbit・Copilot・Sourcery・Qodo の 4 つの AI にレビューを頼みます（頼み方は [docs/development.md](docs/development.md)）
+PR は**フェーズ単位**で、CodeRabbit・Copilot・Sourcery・Codex の 4 つの AI にレビューを頼みます（頼み方は [docs/development.md](docs/development.md)）
 
 ## ライセンス
 

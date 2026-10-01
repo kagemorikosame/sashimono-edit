@@ -268,7 +268,24 @@ def activate_runtime() -> Path | None:
         # 先頭へ入れる 同名の古いものが同梱されていた場合に、あとから入れた方を
         # 使わせるため
         sys.path.insert(0, path)
+    read_path_files(path)
     return target
+
+
+def read_path_files(place: str) -> None:
+    """置き場の ``.pth`` を読む（``site.addsitedir`` と同じ） 置き場そのものは足し直さない
+
+    pip の ``--target`` で入れた置き場は、Python が起動のときに読む場所ではないので、
+    ``.pth`` がそのままでは読まれない pywin32（mcp が Windows で頼む）は ``.pth`` で
+    ``win32`` ``win32/lib`` を探す道へ足し、DLL の置き場を登録する 読まないと
+    ``No module named 'pywintypes'`` で AI 連携が動かない（組み立ての確かめで分かった）
+    """
+    import site
+
+    try:
+        site.addsitedir(place)
+    except OSError:
+        return
 
 
 def refresh_runtime(before: Mapping[str, int] | None = None) -> tuple[str, ...]:

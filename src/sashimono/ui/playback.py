@@ -30,10 +30,12 @@ class PlaybackController(QObject):
     #: 音声出力を開けなかった等 引数はメッセージ
     failed = Signal(str)
 
-    def __init__(self, project: Project, parent: QObject | None = None) -> None:
+    def __init__(
+        self, project: Project, parent: QObject | None = None, *, smooth_history: bool = True
+    ) -> None:
         super().__init__(parent)
         self._project = project
-        self._mixer = AudioMixer(project)
+        self._mixer = AudioMixer(project, smooth_history=smooth_history)
         self._player = AudioPlayer(self._mixer)
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_INTERVAL_MS)
@@ -56,6 +58,21 @@ class PlaybackController(QObject):
             self.stop()
         self._project = project
         self._mixer.set_project(project)
+
+    def set_smooth_history(self, smooth: bool) -> None:
+        """前の音を読む音の効果の動く値を区切りの中でもつなぐか（本人の設定）
+
+        鳴らしている間にミキサを触ると、再生のスレッドと取り合う 鳴っていれば止めて
+        替え、同じ所から鳴らし直す
+        """
+        if smooth == self._mixer.smooth_history:
+            return
+        was_playing = self._playing
+        if was_playing:
+            self.stop()
+        self._mixer.set_smooth_history(smooth)
+        if was_playing:
+            self.play()
 
     def set_frame(self, frame: int) -> None:
         """再生ヘッドを動かす 再生中なら、その位置から再生し直す"""

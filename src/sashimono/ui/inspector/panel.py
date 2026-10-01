@@ -13,7 +13,16 @@ from dataclasses import replace
 from fractions import Fraction
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QIcon,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -79,7 +88,9 @@ from sashimono.effects.sources import source_registry
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
+from sashimono.ui.preview_handles import ALIGNMENTS
 from sashimono.ui.theme import Colors
+from sashimono.ui.timeline.add_menu import effects_for_clip
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
 
@@ -95,6 +106,10 @@ BLEND_LABELS = {
     BlendMode.DARKEN: "比較(暗)",
     **{mode: label for mode, label in BLEND_MODES if mode in BlendMode.EXTENDED},
 }
+
+
+#: 配置のテンプレートのボタンの印 :data:`ALIGNMENTS` と同じ並び（左上から右下へ）
+_ALIGN_MARKS = ("↖", "↑", "↗", "←", "●", "→", "↙", "↓", "↘")
 
 
 def _same_effect(
@@ -171,6 +186,9 @@ class InspectorPanel(QWidget):
     #: 触ったエフェクト（値を変えた・組を押した） プレビューが部分フィルタの範囲の枠を
     #: どのエフェクトについて出すかを決めるのに使う
     effect_focused = Signal(str)
+    #: 配置のテンプレート（左上・中央など）が押された 引数は :data:`ALIGNMENTS` の名前
+    #: 大きさは描く側の枠で決まるので、枠を持つプレビューが X・Y を決める
+    align_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -323,7 +341,10 @@ class InspectorPanel(QWidget):
             clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
         )
         shown: set[EffectId] = set()
-        if picture:
+        # 場面切り替えは下の絵をそのまま入れ替えて描き、不透明度・合成モード・クリッピングを
+        # 読まない（描画の欄も持たない） 出すと、動かしても何も変わらない欄が並ぶ
+        transition = clip.source is not None and clip.source.kind == "transition"
+        if picture and not transition:
             self._body_layout.addWidget(self._build_picture_group(clip, shown))
         if clip.source is not None:
             section = self._build_source_section(clip)
@@ -473,6 +494,7 @@ class InspectorPanel(QWidget):
         if transform is not None:
             self._effect_row(section, clip, transform, "scale", "拡大率")
             self._effect_row(section, clip, transform, "rotation", "回転角")
+            section.add_row("揃える", self._alignment_grid(section))
         # フィルタは下の絵を置き換えるだけで、合成方法も切り抜きも使わない 出しておくと、
         # 選んでも何も変わらない欄を触らせることになる グループ制御も自分の絵を持たない
         if not (clip.is_filter or clip.is_group):
@@ -502,6 +524,28 @@ class InspectorPanel(QWidget):
                 tooltip="拡大率 100% を素材の画素の大きさにします 外すと画面に収めます",
             )
         return section
+
+    def _alignment_grid(self, parent: QWidget) -> QWidget:
+        """配置のテンプレート 画面の 9 か所（四隅・辺の中央・中央）へ見えている範囲ごと寄せる
+
+        X・Y の数を打たなくても、上の中央や右下へ置ける（利用者の要望） 端に付けるので、
+        絵の大きさが変わっても押し直せば同じ所へ揃う
+        """
+        grid = QWidget(parent)
+        grid.setStyleSheet("border: none;")
+        layout = QGridLayout(grid)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        for index, (name, label, _across, _down) in enumerate(ALIGNMENTS):
+            button = QToolButton(grid)
+            button.setObjectName(f"align_{name}")
+            button.setText(_ALIGN_MARKS[index])
+            button.setToolTip(f"{label}へ揃える（見えている範囲の端を画面の端へ付ける）")
+            button.setFixedSize(22, 22)
+            button.clicked.connect(lambda _checked=False, n=name: self.align_requested.emit(n))
+            layout.addWidget(button, index // 3, index % 3)
+        layout.setColumnStretch(3, 1)
+        return grid
 
     def _clip_check(
         self,
@@ -695,7 +739,10 @@ class InspectorPanel(QWidget):
                 " 部分モザイク・ぼかしと部分フィルタの範囲は、画面の中央から数えます"
                 "（右と上が正）"
             )
+        unused = definition.unused_names(clip.source.params)
         for spec in definition.parameters:
+            if spec.name in unused:
+                continue
             path = ParamPath.of_source(clip.id, spec.name)
             value = clip.source.params.get(spec.name)
             if clip.is_group:
@@ -943,9 +990,25 @@ class InspectorPanel(QWidget):
         self._emit(SetClipProperty(clip.id, name, value), f"{label}を初期値に戻す")
 
     def _show_effect_menu(self) -> None:
-        clip = self._clip()
-        if clip is None:
+        menu = self.effect_menu()
+        if menu is None:
             return
+        chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
+        if chosen is None:
+            return
+        self._add_chosen_effect(chosen)
+
+    def effect_menu(self) -> QMenu | None:
+        """〔＋ エフェクト〕のメニュー 選んでいるクリップに効く物だけを並べる
+
+        音だけのクリップに映像のエフェクト、絵だけのクリップに音のエフェクトを並べると、
+        積めても何も起きない（タイムラインの右クリックと同じ決まり :func:`effects_for_clip`）
+        """
+        located = self._located()
+        if located is None or self._project is None:
+            return None
+        track, clip = located
+        definitions = effects_for_clip(self._project, track, clip)
 
         menu = QMenu(self)
         # 場面切り替えは、前の場面と後の場面で積む先が違う
@@ -955,16 +1018,18 @@ class InspectorPanel(QWidget):
             roots = {False: menu.addMenu("前の場面へ"), True: menu.addMenu("後の場面へ")}
         submenus: dict[tuple[bool, str], QMenu] = {}
         for after, root in roots.items():
-            for definition in registry.all():
+            for definition in definitions:
                 submenu = submenus.get((after, definition.category))
                 if submenu is None:
                     submenu = root.addMenu(definition.category)
                     submenus[(after, definition.category)] = submenu
                 action = submenu.addAction(definition.label)
                 action.setData((definition.kind, after))
+        return menu
 
-        chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
-        if chosen is None:
+    def _add_chosen_effect(self, chosen: QAction) -> None:
+        clip = self._clip()
+        if clip is None:
             return
         kind, after = chosen.data()
         definition = registry.require(str(kind))
@@ -1074,6 +1139,12 @@ class InspectorPanel(QWidget):
         for clip_id in others:
             located = self._project.timeline.locate_clip(clip_id)
             if located is None:
+                continue
+            if primary.group_id is not None and located[1].group_id == primary.group_id:
+                # 同じグループの仲間には当てない（AviUtl のグループ化と同じ 束ねるのは選ぶ・
+                # 動かす所だけ） 選び方では見分けきれない 2 本を選んでからグループ化すると、
+                # どちらも自分で選んだ物のまま残り、1 本を押し直しても選びが変わらない
+                # そのせいで利用者の手元では拡大率が連動し続けた
                 continue
             copied = _for_clip(command, primary, located[1])
             if copied is not None:

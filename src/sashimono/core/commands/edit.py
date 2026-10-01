@@ -115,6 +115,8 @@ class SetTranscript(Command):
 
     media_id: MediaId
     transcript: Transcript | None
+    #: 音声ストリームの番号 ``None`` なら 1 本目 ほかの音の字幕はそのまま残す
+    stream: int | None = None
 
     @property
     def label(self) -> str:
@@ -122,7 +124,7 @@ class SetTranscript(Command):
 
     def apply(self, project: Project) -> Project:
         item = project.require_media(self.media_id)
-        return project.replace_media(item.with_transcript(self.transcript))
+        return project.replace_media(item.with_transcript(self.transcript, self.stream))
 
 
 @dataclass(frozen=True, slots=True)

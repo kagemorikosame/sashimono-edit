@@ -19,6 +19,7 @@ from sashimono.core.model import VideoStreamInfo
 from sashimono.core.timebase import Rounding, seconds_to_pts
 from sashimono.engine.colorspace import to_rgb_array
 from sashimono.engine.decode.probe import ProbeError, media_origin, moving_pictures, probe_media
+from sashimono.engine.decode.rational import as_fraction
 
 __all__ = ["VideoDecoder"]
 
@@ -160,7 +161,7 @@ class VideoDecoder:
         目的フレームを飛び越してしまい、もう一度シークし直すことになる
         """
         time_base = self._stream.time_base or Fraction(1, 1000)
-        pts = seconds_to_pts(target + self._origin, Fraction(time_base), Rounding.FLOOR)
+        pts = seconds_to_pts(target + self._origin, as_fraction(time_base), Rounding.FLOOR)
         try:
             self._container.seek(pts, stream=self._stream, backward=True)
         except av.error.FFmpegError:
@@ -178,7 +179,7 @@ class VideoDecoder:
         """
         if frame.pts is None or frame.time_base is None:
             return Fraction(0)
-        return frame.pts * Fraction(frame.time_base) - self._origin
+        return frame.pts * as_fraction(frame.time_base) - self._origin
 
 
 def _to_rgba(frame: av.VideoFrame, rotation: int) -> np.ndarray:

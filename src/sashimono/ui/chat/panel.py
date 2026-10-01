@@ -32,7 +32,13 @@ from PySide6.QtWidgets import (
 from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
-from sashimono.ai.session import AgentEvent, AgentSession, EventKind, system_prompt
+from sashimono.ai.session import (
+    REINSTALL_HINT,
+    AgentEvent,
+    AgentSession,
+    EventKind,
+    system_prompt,
+)
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors
 from sashimono.ui.workspace import Preferences
@@ -439,6 +445,10 @@ class ChatPanel(QWidget):
                 self._note(f"　× {event.detail}")
         elif event.kind is EventKind.ERROR:
             self._say("エラー", event.text)
+            if REINSTALL_HINT in event.text:
+                # 入れ直す所（環境の導入の欄）は、導入済みのときは隠している 出さないと、
+                # 案内された「環境を更新」がどこにも無い
+                self._setup.setVisible(True)
         elif event.kind is EventKind.TURN_DONE or event.kind is EventKind.CLOSED:
             self._turns_done += 1
             self._close_checkpoint()

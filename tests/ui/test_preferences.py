@@ -11,7 +11,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QScrollArea
 
 from sashimono.core.commands import AddMedia
 from sashimono.core.model import MediaItem, Project, VideoStreamInfo
@@ -140,6 +140,27 @@ class TestTheDialog:
     def dialog(self, qt_application: QApplication) -> PreferencesDialog:
         del qt_application
         return PreferencesDialog(Preferences())
+
+    def test_the_items_scroll_and_the_buttons_stay_outside(self, dialog: PreferencesDialog) -> None:
+        """項目は巻物の中 OK と取り消しは外に置く
+
+        前は項目を並べたまま窓にしていて、画面より長くなると下の項目と OK が
+        画面の外にはみ出し、押せなかった
+        """
+        scroll = dialog.findChild(QScrollArea)
+        assert scroll is not None
+        body = scroll.widget()
+        assert body is not None
+        assert body.isAncestorOf(dialog._use_proxy)
+        buttons = dialog.findChild(QDialogButtonBox)
+        assert buttons is not None
+        assert not body.isAncestorOf(buttons)
+
+    def test_it_opens_no_taller_than_the_screen(self, dialog: PreferencesDialog) -> None:
+        # 中身に合わせて伸ばすと、また画面の外へはみ出す
+        screen = dialog.screen()
+        assert screen is not None
+        assert dialog.height() <= screen.availableGeometry().height()
 
     def test_it_shows_what_is_set(self, qt_application: QApplication) -> None:
         del qt_application

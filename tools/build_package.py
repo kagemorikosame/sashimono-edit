@@ -30,6 +30,7 @@ import ast
 import contextlib
 import hashlib
 import importlib.metadata
+import importlib.util
 import io
 import locale
 import os
@@ -49,7 +50,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from sashimono import __version__  # noqa: E402
-from sashimono.app import SELF_CHECK_FLAG  # noqa: E402
+from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
 
 #: exe と、zip を展開したときのフォルダの名前
@@ -74,6 +75,162 @@ EXCLUDED_MODULES = (
     "mypy",
     "PyInstaller",
 )
+
+#: 後から画面のボタンで入れる部品（:data:`EXCLUDED_MODULES` のうち、使う人の手元で pip が入れる物）
+#: 配布版に Python の本体は無いので、これらとその依存が使う標準ライブラリは配布版が持って
+#: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
+#: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
+RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2")
+#: 上の包みの import する名前（配布版の exe の中で import してみる）
+RUNTIME_MODULES = ("claude_agent_sdk", "faster_whisper", "ctranslate2")
+
+#: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
+#: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の
+#: 読み込み方が探す道より前に立つ） 本体が使う部品だけを積むと、mcp が読む
+#: ``cryptography.hazmat.primitives.ciphers.aead`` が無く、zoneinfo を足した次にそこで
+#: 落ちた（組み立ての確かめの exe の中での import で分かった）
+SHARED_WITH_ADD_ONS = ("cryptography", "attr", "attrs")
+
+#: 標準ライブラリで積まない物 画面の部品（Tk）・Python 自身の試験・開発の道具
+#: どれも Sashimono も後から入れる部品も使わない Tk は DLL と Tcl の書庫で 10 MB を超える
+STDLIB_LEFT_OUT = frozenset(
+    {
+        "tkinter",
+        "_tkinter",
+        "turtle",
+        "turtledemo",
+        "idlelib",
+        "test",
+        "lib2to3",
+        "pydoc_data",
+        "ensurepip",
+        "antigravity",
+        "this",
+    }
+)
+
+
+def stdlib_names() -> list[str]:
+    """配布版に積む標準ライブラリの名前（最上位） この機械で import できる物だけ
+
+    Windows に無い物（``fcntl`` ``curses`` など）は積めないので外す 後から入れる部品も
+    Windows では読まない（読む所は ``if sys.platform`` の向こう側）
+    """
+    names = []
+    for name in sorted(sys.stdlib_module_names):
+        if name in STDLIB_LEFT_OUT or name.startswith(("_test", "__")):
+            continue
+        try:
+            found = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            continue
+        if found is not None:
+            names.append(name)
+    return names
+
+
+def stdlib_arguments() -> list[str]:
+    """標準ライブラリを丸ごと積む PyInstaller の引数
+
+    1 つずつ足すと、足していない次の物で落ちる（zoneinfo の次は何か、を実物で探すことに
+    なる） 包み（``email`` ``xml`` など）は下の部品まで積む 包みの頭だけを積むと、
+    ``email.mime.text`` のような下の部品が無い
+    """
+    arguments: list[str] = []
+    for name in stdlib_names():
+        found = importlib.util.find_spec(name)
+        if found is not None and found.submodule_search_locations is not None:
+            arguments += ["--collect-submodules", name]
+        else:
+            arguments += ["--hidden-import", name]
+    return arguments
+
+
+def runtime_distributions() -> list[importlib.metadata.Distribution]:
+    """後から入れる部品と、その依存（この機械に入っている物だけ） 依存は辿れる所まで辿る"""
+    found: dict[str, importlib.metadata.Distribution] = {}
+    #: 包みと、頼まれた追加の組（``pyjwt[crypto]`` の crypto）
+    pending: list[tuple[str, frozenset[str]]] = [(name, frozenset()) for name in RUNTIME_PACKAGES]
+    seen: set[tuple[str, frozenset[str]]] = set()
+    while pending:
+        raw, extras = pending.pop()
+        name = canonical_name(raw)
+        if (name, extras) in seen:
+            continue
+        seen.add((name, extras))
+        try:
+            distribution = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        found[name] = distribution
+        for requirement in distribution.requires or ():
+            # 追加の組の依存（``; extra == "crypto"``）は、その組を頼まれたときだけ辿る
+            # 頼まれた組を見ないと、mcp が頼む pyjwt[crypto] の cryptography を落とす
+            marker = re.search(r"extra\s*==\s*['\"]([^'\"]+)['\"]", requirement)
+            if marker is not None and marker.group(1) not in extras:
+                continue
+            head = re.match(r"\s*([A-Za-z0-9_.\-]+)\s*(\[([^\]]*)\])?", requirement)
+            if head is None:
+                continue
+            wanted = frozenset(e.strip() for e in (head.group(3) or "").split(",") if e.strip())
+            pending.append((head.group(1), wanted))
+    return list(found.values())
+
+
+def imported_stdlib(distributions: Iterable[importlib.metadata.Distribution]) -> set[str]:
+    """包みの .py が import する標準ライブラリの名前（最上位） 字面で集める（読み込まない）"""
+    needed: set[str] = set()
+    for distribution in distributions:
+        for file in distribution.files or ():
+            if file.suffix != ".py":
+                continue
+            try:
+                tree = ast.parse(Path(str(distribution.locate_file(file))).read_bytes())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    heads = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    heads = [node.module.split(".")[0]]
+                else:
+                    continue
+                needed.update(head for head in heads if head in sys.stdlib_module_names)
+    return needed
+
+
+def bundled_modules(record: Path) -> set[str]:
+    """組み立てた配布版にある最上位のモジュールの名前（書庫の .pyc と、隣の .pyd）"""
+    collected = ast.literal_eval((record / "COLLECT-00.toc").read_text(encoding="utf-8"))[0]
+    _, modules = ast.literal_eval((record / "PYZ-00.toc").read_text(encoding="utf-8"))
+    names = {str(entry[0]).split(".")[0] for entry in modules}
+    # 書庫を開く前に要る物（struct）は exe の中の荷物（PKG）へ直に入る
+    package = record / "PKG-00.toc"
+    if package.exists():
+        entries = ast.literal_eval(package.read_text(encoding="utf-8"))[2]
+        names.update(str(e[0]).split(".")[0] for e in entries if e[2] == "PYMODULE")
+    # 起動に要る物（os re codecs など）は書庫ではなく base_library.zip に入る
+    base = record / "base_library.zip"
+    if base.exists():
+        with zipfile.ZipFile(base) as library:
+            names.update(PurePosixPath(item).parts[0].split(".")[0] for item in library.namelist())
+    for entry in collected:
+        name = PurePosixPath(str(entry[0]).replace("\\", "/"))
+        if name.suffix == ".pyd" and len(name.parts) == 1:
+            names.add(name.name.split(".")[0])
+    return names | set(sys.builtin_module_names)
+
+
+def missing_stdlib(record: Path) -> list[str]:
+    """後から入れる部品が import するのに、配布版に無い標準ライブラリ
+
+    この機械に部品が入っていなければ何も見ない（確かめる元が無い 試験のために落とさない）
+    Windows で import できない物は数えない（積めず、Windows では読まれない）
+    """
+    have = bundled_modules(record)
+    wanted = sorted(set(stdlib_names()) & imported_stdlib(runtime_distributions()))
+    return [name for name in wanted if name not in have]
+
 
 #: 読み込み方が動的で、PyInstaller が辿れないもの **まとめて積む**
 #: lupa は AviUtl に近い Lua を名前で選んで読む（``import_module("lupa.lua51")``）
@@ -168,6 +325,10 @@ def pyinstaller_arguments(work: Path, dist: Path) -> list[str]:
     ]
     for package in COLLECTED_PACKAGES:
         arguments += ["--collect-all", package]
+    arguments += stdlib_arguments()
+    for package in SHARED_WITH_ADD_ONS:
+        if importlib.util.find_spec(package) is not None:
+            arguments += ["--collect-submodules", package]
     for module in EXCLUDED_MODULES:
         arguments += ["--exclude-module", module]
     arguments.append(str(ROOT / "src" / "sashimono" / "__main__.py"))
@@ -657,6 +818,8 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         if beside not in checked.stdout:
             failures.append("exe の隣の置き場に置いたスクリプトが読まれていない")
 
+        failures += runtime_import_failures(executable, folder)
+
         wheel = write_sample_wheel(Path(folder))
         target = Path(folder) / "runtime"
         installed = _run(
@@ -675,6 +838,33 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         for failure in failures:
             print(f"[NG] {failure}")
         return 1 if failures else 0
+
+
+def runtime_import_failures(executable: Path, folder: str) -> list[str]:
+    """後から入れる部品を、配布版の exe の中で import してみる この機械に入っている物だけ
+
+    部品は開発の環境の置き場から読ませる 標準ライブラリは exe の持ち物しか見えないので、
+    配布版に無い物があればここで落ちる（利用者の手元で送った途端に落ちるのと同じ）
+    置き場は前へ足す 配布版は入れた部品の置き場を前へ足して読む（:func:`activate_runtime`）
+    後ろへ足すと、配布版が一部だけ積んでいる包み（cryptography）が先に読まれ、使う人の
+    手元では起きない失敗になる
+    """
+    found = {
+        name: spec
+        for name in RUNTIME_MODULES
+        if (spec := importlib.util.find_spec(name)) is not None and spec.origin is not None
+    }
+    if not found:
+        print("[--] 後から入れる部品がこの機械に無いので、exe の中での import は確かめない")
+        return []
+    places = sorted({str(Path(str(spec.origin)).parent.parent) for spec in found.values()})
+    result = _run(executable, [IMPORT_CHECK_FLAG, os.pathsep.join(places), *found], folder)
+    print(result.stdout.rstrip())
+    if result.returncode == 0:
+        return []
+    if result.stderr.strip():
+        print(result.stderr.rstrip())
+    return ["後から入れる部品を exe の中で import できない（標準ライブラリが足りない など）"]
 
 
 def package(bundle: Path, target: Path, *, check: bool = True) -> int:
@@ -756,6 +946,9 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
         print(f"{record} に組み立ての記録が無い --skip-build を外して組み立て直す")
         return 1
     problems = [f"組み立ての記録に無いファイルがある: {name}" for name in untracked]
+    problems += [
+        f"後から入れる部品が使う標準ライブラリが無い: {name}" for name in missing_stdlib(record)
+    ]
     problems += native_license_problems(bundle / "_internal")
     problems += collect_licenses(bundle, sources, (ROOT / "src", record))
     if problems:

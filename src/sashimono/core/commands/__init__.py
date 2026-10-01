@@ -84,7 +84,10 @@ from sashimono.core.commands.subtitle import (
     RetimeSegment,
     SetSegmentText,
     SplitSegment,
+    Voice,
     burn_subtitles,
+    subtitle_voices,
+    voice_label,
 )
 from sashimono.core.commands.track_order import MoveTrack, reorder_group
 from sashimono.core.commands.work_area import SetWorkArea, export_range
@@ -148,6 +151,7 @@ __all__ = [
     "TrimClips",
     "UngroupClips",
     "VideoFormat",
+    "Voice",
     "burn_subtitles",
     "convert_layers",
     "export_range",
@@ -162,5 +166,7 @@ __all__ = [
     "place_media",
     "reorder_group",
     "resolve_param",
+    "subtitle_voices",
     "switch_layer_mode",
+    "voice_label",
 ]

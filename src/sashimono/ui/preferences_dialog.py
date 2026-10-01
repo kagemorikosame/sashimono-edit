@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QLabel,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -116,6 +118,21 @@ def _megabytes(size: int) -> float:
 class PreferencesDialog(QDialog):
     """プレビューの重さに関わる設定を変える"""
 
+    def _fit_to_screen(self, body: QWidget) -> None:
+        """中身が収まる大きさで開く ただし画面の 9 割より大きくはしない（残りは巻物で見る）
+
+        巻物にすると中身の大きさを窓が知らず、小さな窓で開く 横は項目が切れない幅にする
+        """
+        wanted = body.sizeHint()
+        width = wanted.width() + self._scroll.verticalScrollBar().sizeHint().width() + 24
+        height = wanted.height() + 64
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, int(available.width() * 0.9))
+            height = min(height, int(available.height() * 0.9))
+        self.resize(width, height)
+
     def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("設定")
@@ -199,6 +216,18 @@ class PreferencesDialog(QDialog):
             "メモリの少ない機械では減らす 書き出しとプレビューの両方に効く"
         )
         form.addRow("レイヤーの並列デコード", self._decode_threads)
+
+        self._smooth_audio_motion = QCheckBox(
+            "リバーブ・ディレイ・音程のキーフレームをなめらかに動かす", self
+        )
+        self._smooth_audio_motion.setChecked(preferences.smooth_audio_motion)
+        self._smooth_audio_motion.setToolTip(
+            "前の音を読む音の効果は 0.34 秒ごとの区切りで掛ける 入れると区切りの中でも値を"
+            "少しずつ移す 切ると区切りの頭の値のまま掛け、動きが最大 0.34 秒遅れて段になる "
+            "値の動く所だけ手間が倍になるので、遅い機械で再生が途切れるときは切る "
+            "書き出しとプレビューの両方に効く"
+        )
+        form.addRow(self._smooth_audio_motion)
 
         self._native_modules = QCheckBox("AviUtl2 のスクリプトモジュール（DLL）を読み込む", self)
         self._native_modules.setChecked(preferences.native_modules)
@@ -323,6 +352,14 @@ class PreferencesDialog(QDialog):
         self._snap_distance.setValue(preferences.snap_distance)
         self._snap_distance.setToolTip("画面の画素で数える 拡大しても縮小しても同じ近さで吸い付く")
         form.addRow("吸い付く距離", self._snap_distance)
+        self._preview_snap = QCheckBox("プレビューで位置を動かすときに吸い付く（磁石）", self)
+        self._preview_snap.setChecked(preferences.preview_snap)
+        self._preview_snap.setToolTip(
+            "プレビューで絵を動かすときに、画面の端と中央・ほかの物の端と中央へ吸い付く"
+            " タイムラインの磁石とは別に切れる 距離は上の「吸い付く距離」 "
+            "動かしている途中で Shift を押している間は吸い付かない"
+        )
+        form.addRow(self._preview_snap)
 
         self._all_plugins = QCheckBox("AviUtl2 の汎用プラグインを全部読んで探す", self)
         self._all_plugins.setChecked(preferences.all_aviutl_plugins)
@@ -405,10 +442,22 @@ class PreferencesDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # 項目は縦に長く、ノートの画面では下の項目と OK が画面の外へはみ出していた
+        # 項目と説明だけを巻物にし、OK と取り消しはいつも見える下に置く
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.addLayout(form)
+        body_layout.addWidget(note)
+        body_layout.addStretch(1)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidget(body)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(note)
+        layout.addWidget(self._scroll, 1)
         layout.addWidget(buttons)
+        self._fit_to_screen(body)
 
         self._use_proxy.toggled.connect(self._proxy_height.setEnabled)
         self._prefetch.toggled.connect(self._prefetch_budget.setEnabled)
@@ -452,6 +501,7 @@ class PreferencesDialog(QDialog):
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
+            smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
             pool_progress=self._pool_progress.isChecked(),
             all_aviutl_plugins=self._all_plugins.isChecked(),
@@ -467,6 +517,7 @@ class PreferencesDialog(QDialog):
             double_click_reset=self._double_click_reset.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
+            preview_snap=self._preview_snap.isChecked(),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
         )

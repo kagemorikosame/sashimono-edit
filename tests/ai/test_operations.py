@@ -61,28 +61,29 @@ class TestReading:
         assert result["duration_frames"] == 300
 
     def test_list_media_exposes_ids(self, host: FakeHost) -> None:
-        rows = run(host, "list_media")
+        rows = run(host, "list_media")["media"]
         assert len(rows) == 1
         assert rows[0]["subtitle_count"] == 3
         assert rows[0]["has_audio"] is True
 
     def test_list_clips_reports_positions(self, host: FakeHost) -> None:
-        rows = run(host, "list_clips")
+        rows = run(host, "list_clips")["clips"]
         assert rows[0]["start"] == 0
         assert rows[0]["duration"] == 300
         assert rows[0]["start_timecode"] == "00:00:00:00"
 
     def test_list_clips_can_filter_by_track(self, host: FakeHost) -> None:
-        assert run(host, "list_clips", track_id="そんなものは無い") == []
+        assert run(host, "list_clips", track_id="そんなものは無い")["clips"] == []
 
     def test_get_subtitles_returns_timeline_positions(self, host: FakeHost) -> None:
-        rows = run(host, "get_subtitles")
+        rows = run(host, "get_subtitles")["subtitles"]
         # 素材の 1 秒は 30 フレーム目 AI が見るのは編集後の位置
         assert [row["start"] for row in rows] == [30, 120, 210]
         assert rows[0]["text"] == "今日は"
 
     def test_list_effects_includes_ranges(self, host: FakeHost) -> None:
-        rows = run(host, "list_effects")
+        # パラメータまでは kind を渡したときだけ（全部並べると返事が長すぎる）
+        rows = run(host, "list_effects", kind="blur")["effects"]
         blur = next(row for row in rows if row["kind"] == "blur")
         radius = next(p for p in blur["parameters"] if p["name"] == "radius")
         assert radius["type"] == "number"
@@ -294,11 +295,44 @@ class TestSubtitles:
         with pytest.raises(ToolError, match="字幕がありません"):
             run(host, "clean_subtitles", media_id=str(media.id))
 
+    def test_transcribe_refuses_to_replace_by_default(self, host: FakeHost) -> None:
+        # 黙って起こし直すと、人が直した字幕まで置き換わる 既定は断って理由を返す
+        media = host.document.project.media[0]
+        assert media.transcript is not None
+        with pytest.raises(ToolError, match="replace"):
+            run(host, "transcribe", media_id=str(media.id))
+        assert host.transcription == "起こしは走っていません"
+
     def test_transcribe_hands_back_a_next_step(self, host: FakeHost) -> None:
         media = host.document.project.media[0]
-        result = run(host, "transcribe", media_id=str(media.id))
+        result = run(host, "transcribe", media_id=str(media.id), replace=True)
         assert "transcription_status" in result["next"]
         assert run(host, "transcription_status")["status"] == "large-v3 で開始"
+        # 省くと今までどおり 1 本目
+        assert host.transcribed_stream is None
+
+    def test_transcribe_can_pick_the_second_voice(self, host: FakeHost) -> None:
+        # ゲームの録画のマイクの声（音声 2）を起こせないと、声ではなくゲームの音が字幕になる
+        from dataclasses import replace as _replace
+
+        from sashimono.core.commands import AddMedia
+        from sashimono.core.model import MediaId
+
+        first = host.document.project.media[0]
+        stream = first.audio_streams[0]
+        two = _replace(
+            first,
+            id=MediaId("two-voices"),
+            transcripts=(),
+            audio_streams=(stream, _replace(stream, index=stream.index + 1)),
+        )
+        host.document.execute(AddMedia(two))
+        listed = {m["media_id"]: m for m in run(host, "list_media")["media"]}
+        assert listed["two-voices"]["audio_count"] == 2
+        run(host, "transcribe", media_id="two-voices", audio=2)
+        assert host.transcribed_stream == stream.index + 1
+        with pytest.raises(ToolError, match="2 本"):
+            run(host, "transcribe", media_id="two-voices", audio=3)
 
 
 def _forget_transcript(project: Project, media_id: str) -> object:
@@ -324,6 +358,62 @@ class TestJetCut:
         result = run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
         assert result["cuts"] == 1
         assert host.document.project.duration < 300
+
+
+def _moved_voice_two() -> Project:
+    """音声 2 本の素材 音声 1 は頭に、リンクを外した音声 2 は 20 秒の所へ別に置いた"""
+    from dataclasses import replace
+
+    from sashimono.core.model import AudioStreamInfo, Clip, Track, TrackKind
+
+    media = MediaItem(
+        path=Path("C:/素材/録画.mp4"),
+        duration=Fraction(10),
+        audio_streams=(
+            AudioStreamInfo(1, 48000, 2, Fraction(1, 48000), "aac"),
+            AudioStreamInfo(2, 48000, 2, Fraction(1, 48000), "aac"),
+        ),
+    )
+    base = Project.create(media=(media,))
+    tracks = (
+        Track(
+            TrackKind.AUDIO,
+            "A1",
+            (Clip(timeline_start=0, duration=300, media_id=media.id, stream_index=1),),
+        ),
+        Track(
+            TrackKind.AUDIO,
+            "A2",
+            (Clip(timeline_start=600, duration=300, media_id=media.id, stream_index=2),),
+        ),
+    )
+    return base.with_timeline(replace(base.timeline, tracks=tracks))
+
+
+@pytest.mark.parametrize("audio", [None, 1])
+def test_jet_cut_of_voice_one_leaves_the_moved_voice_two_alone(audio: int | None) -> None:
+    # 壊れると、audio を省いたとき音で絞らず、別の所へ置いた音声 2 の位置でも音声 1 の無音を
+    # 切り、タイムライン全体から削った audio=1 と結果が違った（PR #231 の指摘）
+    from sashimono.core.commands import RippleCut
+    from tests.ui.test_subtitle_panel import make_waveform
+
+    host = FakeHost(_moved_voice_two())
+    host.stub_waveform = make_waveform([(0.0, 400), (0.5, 1500)])
+    media = host.document.project.media[0]
+    arguments: dict[str, Any] = {"media_id": str(media.id), "keep_speech": False}
+    if audio is not None:
+        arguments["audio"] = audio
+    cuts: list[tuple[int, int]] = []
+    original = host.apply_commands
+
+    def watching(commands: list[Any], label: str) -> None:
+        cuts.extend(r for c in commands if isinstance(c, RippleCut) for r in c.ranges)
+        original(commands, label)
+
+    host.apply_commands = watching  # type: ignore[method-assign]
+    result = run(host, "jet_cut", **arguments)
+    assert result["cuts"] == 1
+    assert all(end <= 600 for _, end in cuts)
 
 
 class TestImport:
@@ -442,7 +532,7 @@ class TestParameterCoercion:
 
     def test_the_colour_format_is_advertised(self, host: FakeHost) -> None:
         # 形式を伝えておかないと、AI は色名や rgb() を送ってくる
-        rows = run(host, "list_effects")
+        rows = run(host, "list_effects", kind="text")["effects"]
         text = next(row for row in rows if row["kind"] == "text")
         color = next(p for p in text["parameters"] if p["name"] == "color")
         assert "#RRGGBB" in color["format"]
