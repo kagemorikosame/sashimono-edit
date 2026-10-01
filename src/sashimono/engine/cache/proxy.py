@@ -88,6 +88,7 @@ from sashimono.engine.cache.progress import JobBoard, ProgressSnapshot
 from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
 from sashimono.engine.decode import ProbeError, VideoDecoder, probe_media
+from sashimono.engine.decode.rational import as_fraction
 
 __all__ = [
     "MEASURED_PREFETCH_MS",
@@ -316,7 +317,7 @@ def _transcode(
         # 拡張子から当てる作りだと「書式が分からない」で落ちる
         with av.open(str(target), mode="w", format="mp4") as output:
             video = cast(
-                "av.video.stream.VideoStream", output.add_stream(codec, rate=Fraction(rate))
+                "av.video.stream.VideoStream", output.add_stream(codec, rate=as_fraction(rate))
             )
             video.width = width
             video.height = scaled

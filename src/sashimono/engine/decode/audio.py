@@ -20,6 +20,7 @@ import numpy as np
 from sashimono.core.model import AudioStreamInfo
 from sashimono.core.timebase import Rounding, seconds_to_pts
 from sashimono.engine.decode.probe import ProbeError, media_origin, probe_media
+from sashimono.engine.decode.rational import as_fraction
 
 __all__ = ["AudioDecoder"]
 
@@ -224,7 +225,7 @@ class AudioDecoder:
             Fraction(0), self._origin + Fraction(cursor, self._sample_rate) - SEEK_PREROLL
         )
         time_base = self._stream.time_base or Fraction(1, self._sample_rate)
-        pts = seconds_to_pts(seconds, Fraction(time_base), Rounding.FLOOR)
+        pts = seconds_to_pts(seconds, as_fraction(time_base), Rounding.FLOOR)
         try:
             self._container.seek(pts, stream=self._stream, backward=True)
         except av.error.FFmpegError:
@@ -314,5 +315,5 @@ def _output_sample_index(frame: av.AudioFrame, sample_rate: int, origin: Fractio
     """
     if frame.pts is None:
         return None
-    time_base = Fraction(frame.time_base) if frame.time_base else Fraction(1, sample_rate)
+    time_base = as_fraction(frame.time_base) if frame.time_base else Fraction(1, sample_rate)
     return math.floor((frame.pts * time_base - origin) * sample_rate)
