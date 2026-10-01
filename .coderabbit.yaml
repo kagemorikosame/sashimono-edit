@@ -31,6 +31,13 @@ reviews:
     drafts: false
     base_branches:
       - main
+    # ボットの PR は黙って飛ばす CodeRabbit は契約の席を人にしか割り当てないので、
+    # ボットの PR は頼んでも「Review skipped」と書くだけで審査しない
+    # その書き込みが PR ごとに残ると、人の PR と見分けにくくなる
+    # 名前は完全一致で比べるので、GitHub の login の `[bot]` まで書く
+    # ボットの PR の確かめ方は docs/development.md の「Dependabot の PR」
+    ignore_usernames:
+      - "dependabot[bot]"
 
   path_filters:
     - "!**/*.png"

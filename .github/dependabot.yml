@@ -2,10 +2,22 @@
 #
 # 公開リポジトリなので、外から見える依存が古いままだと
 # 「既知の脆弱性が放置されている」状態がそのまま晒される
+#
+# 更新の PR は種類（package-ecosystem）ごとに 1 本へまとめる（groups）
+# CodeRabbit はボットの PR を審査しないので、確かめるのは人の手になる
+# 1 部品 1 本で来ると、同じ確かめ方を何度も繰り返すことになる
+#
+# 大きな版上げ（major）と小さい物（minor・patch）は別の PR に分ける
+# 確かめる手間が違うため 小さい物は CI が通って版の数字だけ変わっていればマージしてよいが、
+# 大きな版上げは部品の変更点を読み、`@codex review` を 1 回頼む
+# （docs/development.md の「Dependabot の PR」） 混ぜると小さい物まで大きな版上げの
+# 確かめ方に巻き込まれ、まとめた意味が薄れる 分けても 1 つの種類で月に多くて 2 本
 
 version: 2
 updates:
   # GitHub Actions ここを放置すると、CI が古い実行環境のまま動き続ける
+  # actions/* は @v7 のように大きな版だけで指すので major が主になり、
+  # setup-uv のように細かい版まで指す物には minor・patch が来る
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -13,6 +25,11 @@ updates:
     labels: ["dependencies"]
     commit-message:
       prefix: "ci"
+    groups:
+      actions-major:
+        update-types: ["major"]
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
 
   # pip は**脆弱性の修正だけ**を受ける（版上げの PR は出させない）
   #
@@ -22,6 +39,9 @@ updates:
   # 最初の push で 5 本来て、全部これだった
   #
   # 脆弱性の修正（security updates）はこの設定と関係なく届く
+  # open-pull-requests-limit の 0 も脆弱性の修正には掛からない
+  # そのため groups は applies-to: security-updates で脆弱性の修正をまとめる
+  # 書かないと版上げ向けの groups になり、出させていない PR にしか効かない
   # ロックファイルを入れたら（配布のパッケージングで要る）見直す
   - package-ecosystem: pip
     directory: "/"
@@ -31,3 +51,10 @@ updates:
     labels: ["dependencies"]
     commit-message:
       prefix: "deps"
+    groups:
+      pip-security-major:
+        applies-to: security-updates
+        update-types: ["major"]
+      pip-security-minor-patch:
+        applies-to: security-updates
+        update-types: ["minor", "patch"]

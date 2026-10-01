@@ -109,6 +109,20 @@ Codex は使う量を抑えるため、CodeRabbit の指摘を直して承認を
 - 同じ指摘が何役からも来たら、直すのは 1 回で構いません
 - 指摘に納得できないときは、そのコメントに返信すると会話できます
 
+### Dependabot の PR
+
+依存の更新は Dependabot が種類（GitHub Actions・pip）ごとにまとめて出します
+大きな版上げ（major）と小さい物（minor・patch）は別の PR です
+CodeRabbit は契約の席を人にしか割り当てないので、ボットの PR は審査しません
+（`.coderabbit.yaml` で黙って飛ばしています） 代わりに次を確かめてマージしてください
+
+- CI がすべて通る
+- 変わったのが版の数字（とロックファイル）だけ
+- 大きな版上げなら、部品の変更点（リリースノート）に、こちらの使い方が変わる所が無いか読む
+
+大きな版上げのときだけ `@codex review` を 1 回頼みます 詳しくは
+[docs/development.md](docs/development.md) の「Dependabot の PR」にあります
+
 ---
 
 ## ライセンス
