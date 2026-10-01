@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -421,14 +422,22 @@ def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _frame_window(project: Project, arguments: dict[str, Any]) -> tuple[int, int | None]:
-    """``from_seconds`` ``to_seconds``（タイムラインの秒）をフレームの範囲へ 省けば全体"""
-    fps = float(project.rate.fps)
+    """``from_seconds`` ``to_seconds``（タイムラインの秒）をフレームの範囲 ``[start, end)`` へ
+
+    説明どおり「from より後に掛かり、to より前に始まる」物を残す 呼ぶ側は
+    ``終わり <= start`` と ``始まり >= end`` を外す ``start`` は from の秒を含むフレーム
+    （そこで終わる物は外れ、そこを越えて続く物は残る） ``end`` は to の秒以上で最初に
+    始まるフレーム 前は to のフレームに 1 を足していて、30fps で 1 秒ちょうどを渡すと
+    1 秒から始まる物まで返した（PR #231 の指摘） 秒は分数で掛けて、0.1 秒のような
+    値が浮動小数の誤差で 1 フレームずれないようにする 省けば全体
+    """
+    fps = project.rate.fps
     try:
         low = arguments.get("from_seconds")
         high = arguments.get("to_seconds")
-        start = int(float(low) * fps) if low is not None else 0
-        end = int(float(high) * fps) + 1 if high is not None else None
-    except (TypeError, ValueError) as exc:
+        start = math.floor(Fraction(str(float(low))) * fps) if low is not None else 0
+        end = math.ceil(Fraction(str(float(high))) * fps) if high is not None else None
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ToolError("from_seconds と to_seconds は秒の数で渡してください") from exc
     return max(0, start), end
 
@@ -1459,7 +1468,9 @@ OPERATIONS: tuple[Operation, ...] = (
             {
                 "track_id": _string("絞り込むトラック"),
                 "from_seconds": _number("この秒より後に掛かるクリップだけ（タイムラインの秒）"),
-                "to_seconds": _number("この秒より前に掛かるクリップだけ"),
+                "to_seconds": _number(
+                    "この秒より前に始まるクリップだけ（ちょうどから始まる物は外す）"
+                ),
                 **_paging(),
             }
         ),
@@ -1500,7 +1511,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "audio": _integer("絞り込む音声の番号（1 から）"),
                 "contains": _string("本文に含む言葉で絞る（部分一致）"),
                 "from_seconds": _number("この秒より後に出る字幕だけ（タイムラインの秒）"),
-                "to_seconds": _number("この秒より前に出る字幕だけ"),
+                "to_seconds": _number("この秒より前に出始める字幕だけ（ちょうどから出る物は外す）"),
                 "compact": _boolean("行の番号・時刻・本文だけを返す（軽い一覧）"),
                 **_paging(),
             }

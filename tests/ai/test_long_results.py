@@ -110,6 +110,32 @@ class TestReadingSubtitles:
         ]
 
 
+class TestTheSecondsWindow:
+    """秒で絞るときの境目 from より後に掛かり、to より前に始まる物（説明どおり）
+
+    前は to のコマに 1 を足していて、30fps で 1 秒ちょうどを渡すと 1 秒から始まる物まで返した
+    （PR #231 の指摘）
+    """
+
+    def test_the_end_second_is_left_out(self, video_media: MediaItem) -> None:
+        host = _host(video_media)
+        rows = _call(host, "get_subtitles", from_seconds=0, to_seconds=1, compact=True)
+        assert [row["text"].split()[0] for row in rows["subtitles"]] == ["0"]
+
+    def test_a_little_past_the_second_takes_the_next(self, video_media: MediaItem) -> None:
+        host = _host(video_media)
+        rows = _call(host, "get_subtitles", from_seconds=0, to_seconds=1.01, compact=True)
+        assert [row["text"].split()[0] for row in rows["subtitles"]] == ["0", "1"]
+
+    def test_what_ends_at_the_start_second_is_left_out(self, video_media: MediaItem) -> None:
+        # 0 行目は 0.9 秒で終わる 0.9 秒から絞れば外れ、0.89 秒からなら残る
+        host = _host(video_media)
+        at = _call(host, "get_subtitles", from_seconds=0.9, to_seconds=2, compact=True)
+        assert [row["text"].split()[0] for row in at["subtitles"]] == ["1"]
+        before = _call(host, "get_subtitles", from_seconds=0.89, to_seconds=2, compact=True)
+        assert [row["text"].split()[0] for row in before["subtitles"]] == ["0", "1"]
+
+
 class TestFixingTypos:
     def test_pairs_fix_the_subtitles_and_the_burned_text(self, video_media: MediaItem) -> None:
         host = _host(video_media)
@@ -252,8 +278,9 @@ class TestOtherLists:
                 break
             offset = page["next_offset"]
         assert seen == 401
+        # 1 秒ちょうど（30 コマ目）から始まる 4 本目は「1 秒より前」に入らない
         window = _call(host, "list_clips", track_id=str(track.id), from_seconds=0, to_seconds=1)
-        assert window["total"] == 4
+        assert window["total"] == 3
 
     def test_the_effect_list_is_short_unless_one_is_asked(self) -> None:
         host = FakeHost(Project.create())
