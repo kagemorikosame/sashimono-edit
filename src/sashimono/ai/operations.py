@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -260,8 +261,17 @@ DEFAULT_PAGE = 50
 MAX_PAGE = 300
 
 
-def _paged(rows: list[Any], arguments: dict[str, Any], *, name: str = "items") -> dict[str, Any]:
+def _paged(
+    rows: list[Any],
+    arguments: dict[str, Any],
+    *,
+    name: str = "items",
+    truncated_note: str = "",
+) -> dict[str, Any]:
     """一覧を ``offset`` と ``limit`` で切り出す 返事が長すぎれば件数を減らす
+
+    1 件だけでも長すぎるときは中身を切り詰めて ``truncated`` を付け、``truncated_note``
+    （全文の取り方）を添える 返事はいつも :data:`MAX_RESULT_CHARS` に収まる
 
     続きがあれば ``next_offset`` と、次に呼ぶときの書き方を添える 無いときは添えない
     （添えると、もう読み終えたのに続きを探しに行く）
@@ -277,12 +287,64 @@ def _paged(rows: list[Any], arguments: dict[str, Any], *, name: str = "items") -
     while len(chosen) > 1 and len(json_text(chosen)) > MAX_RESULT_CHARS:
         # 1 件ずつ減らすと長い一覧で遅い 4 分の 3 ずつ減らしてから残りを詰める
         chosen = chosen[: max(1, len(chosen) * 3 // 4)]
+    notes: list[str] = []
+    if len(chosen) == 1 and len(json_text(chosen)) > MAX_RESULT_CHARS - _ENVELOPE_CHARS:
+        # 1 件だけで上限を越える（長い字幕 1 行など） 件数ではもう減らせないので中身を
+        # 切り詰めて印を付ける 切らずに返すと打ち切られ、退けた分は読めない（PR #231 の指摘）
+        chosen = [_fit(chosen[0], MAX_RESULT_CHARS - _ENVELOPE_CHARS)]
+    if any(isinstance(row, dict) and row.get("truncated") for row in chosen):
+        # 呼ぶ側が先に切り詰めた行（長い字幕の本文）も、全文の読み方を添える
+        notes.append(truncated_note or "長すぎる件は中身を切り詰めた（truncated）")
     end = offset + len(chosen)
     result: dict[str, Any] = {name: chosen, "total": total, "offset": offset, "count": len(chosen)}
     if end < total:
         result["next_offset"] = end
-        result["note"] = f"続きがあります 次は offset={end} で呼んでください（全 {total} 件）"
+        notes.append(f"続きがあります 次は offset={end} で呼んでください（全 {total} 件）")
+    if notes:
+        result["note"] = " ".join(notes)
     return result
+
+
+#: 一覧の外側（件数・続きの案内）に取っておく字数
+_ENVELOPE_CHARS = 600
+#: 切り詰めても残す文字列の長さ これより短い文字列は切らない（ID や名前を壊さない）
+_KEEP_CHARS = 80
+
+
+def _fit(row: Any, limit: int) -> Any:
+    """1 件を ``limit`` 字（JSON）に収める 一番長い文字列から半分に切り、足りなければ
+    一番長い配列を半分にする 切った件には ``truncated`` を付ける"""
+    fitted = json.loads(json_text(row))
+    cut = False
+    while len(json_text(fitted)) > limit:
+        place = _longest(fitted, str, _KEEP_CHARS) or _longest(fitted, list, 1)
+        if place is None:
+            break
+        holder, key, value = place
+        if isinstance(value, str):
+            holder[key] = value[: len(value) // 2] + "…"
+        else:
+            holder[key] = value[: len(value) // 2]
+        cut = True
+    if cut and isinstance(fitted, dict):
+        fitted["truncated"] = True
+    return fitted
+
+
+def _longest(value: Any, kind: type, floor: int) -> tuple[Any, Any, Any] | None:
+    """``value`` の中で ``kind``（文字列か配列）の一番長い物と、その入れ物と鍵"""
+    best: tuple[Any, Any, Any] | None = None
+    stack = [value]
+    while stack:
+        holder = stack.pop()
+        items = holder.items() if isinstance(holder, dict) else enumerate(holder)
+        for key, child in items:
+            size = len(child) if isinstance(child, (str, list)) and isinstance(child, kind) else -1
+            if size > floor and (best is None or size > len(best[2])):
+                best = (holder, key, child)
+            if isinstance(child, (dict, list)):
+                stack.append(child)
+    return best
 
 
 def _paging() -> dict[str, Any]:
@@ -544,9 +606,16 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     wanted_audio = arguments.get("audio")
     contains = str(arguments.get("contains") or "")
     compact = bool(arguments.get("compact", False))
+    one = str(arguments.get("segment_id") or "")
+    try:
+        text_offset = max(0, int(arguments.get("text_offset", 0) or 0))
+    except (TypeError, ValueError) as exc:
+        raise ToolError("text_offset は整数で渡してください") from exc
     low, high = _frame_window(project, arguments)
     rows = []
     for subtitle in project_timeline(project):
+        if one and str(subtitle.segment.id) != one:
+            continue
         if subtitle.end_frame <= low or (high is not None and subtitle.start_frame >= high):
             continue
         if contains and contains not in subtitle.segment.text:
@@ -575,12 +644,48 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "source_start_seconds": round(float(subtitle.segment.start), 3),
             }
         )
+    for row in rows:
+        _clip_text(row, text_offset if one else None)
     if compact:
         rows = [
             {"n": index, "time": row["start_timecode"], "text": row["text"]}
+            | ({"segment_id": row["segment_id"], "truncated": True} if "truncated" in row else {})
             for index, row in enumerate(rows)
         ]
-    return _paged(rows, arguments, name="subtitles")
+    return _paged(rows, arguments, name="subtitles", truncated_note=_FULL_TEXT_NOTE)
+
+
+#: 一覧で 1 行の本文を切り詰める長さ 1 行が長いと、ほかの行が 1 回の返事に入らない
+LONG_TEXT_CHARS = 2000
+#: segment_id で 1 行を読むときに 1 回で返す本文の長さ 返事の上限（12000）に収める
+TEXT_CHUNK_CHARS = 8000
+_FULL_TEXT_NOTE = (
+    "長い本文は切り詰めた（truncated） 全文は get_subtitles に segment_id を渡して読む"
+    "（それでも長ければ next_text_offset を text_offset に渡して続きを読む）"
+)
+
+
+def _clip_text(row: dict[str, Any], text_offset: int | None) -> None:
+    """字幕 1 行の本文を返事に収まる長さにする
+
+    ``text_offset`` が ``None``（一覧）なら長い本文の頭だけを残して ``truncated`` を付ける
+    数（segment_id で 1 行を読む）なら、そこから :data:`TEXT_CHUNK_CHARS` 字を返し、続きが
+    あれば ``next_text_offset`` を添える
+    """
+    text = str(row["text"])
+    if text_offset is None:
+        if len(text) > LONG_TEXT_CHARS:
+            row["text"] = text[:LONG_TEXT_CHARS] + "…"
+            row["truncated"] = True
+            row["text_length"] = len(text)
+        return
+    if text_offset == 0 and len(text) <= TEXT_CHUNK_CHARS:
+        return
+    row["text"] = text[text_offset : text_offset + TEXT_CHUNK_CHARS]
+    row["text_offset"] = text_offset
+    row["text_length"] = len(text)
+    if text_offset + TEXT_CHUNK_CHARS < len(text):
+        row["next_text_offset"] = text_offset + TEXT_CHUNK_CHARS
 
 
 def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -1510,6 +1615,12 @@ OPERATIONS: tuple[Operation, ...] = (
                 "media_id": _string("絞り込む素材"),
                 "audio": _integer("絞り込む音声の番号（1 から）"),
                 "contains": _string("本文に含む言葉で絞る（部分一致）"),
+                "segment_id": _string(
+                    "この 1 行だけ 長くて切り詰められた（truncated）行の全文を読む"
+                ),
+                "text_offset": _integer(
+                    "segment_id の行の本文を何文字目から返すか（続きは返事の next_text_offset）"
+                ),
                 "from_seconds": _number("この秒より後に出る字幕だけ（タイムラインの秒）"),
                 "to_seconds": _number("この秒より前に出始める字幕だけ（ちょうどから出る物は外す）"),
                 "compact": _boolean("行の番号・時刻・本文だけを返す（軽い一覧）"),

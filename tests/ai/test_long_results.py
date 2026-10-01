@@ -110,6 +110,63 @@ class TestReadingSubtitles:
         ]
 
 
+class TestOneLongRow:
+    """1 件だけで返事の上限を越える行も、上限に収めて返す（PR #231 の指摘）
+
+    前は件数を 1 件まで減らしたらそのまま返し、長い字幕 1 行で返事が打ち切られた
+    """
+
+    LONG = "長い字幕" * 6000
+
+    def _long_host(self, video_media: MediaItem) -> FakeHost:
+        segments = (
+            TranscriptSegment(Fraction(0), Fraction(1), "短い行"),
+            TranscriptSegment(Fraction(1), Fraction(2), self.LONG),
+        )
+        media = replace(video_media, duration=Fraction(5)).with_transcript(Transcript(segments))
+        base = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(media,))
+        clip = Clip(timeline_start=0, duration=150, media_id=media.id)
+        track = Track(TrackKind.VIDEO, "V1", (clip,))
+        return FakeHost(base.with_timeline(replace(base.timeline, tracks=(track,))))
+
+    @pytest.mark.parametrize("compact", [False, True])
+    def test_the_answer_stays_short_and_says_how_to_read_it_all(
+        self, video_media: MediaItem, compact: bool
+    ) -> None:
+        host = self._long_host(video_media)
+        page = _call(host, "get_subtitles", compact=compact)
+        assert len(json_text(page)) <= MAX_RESULT_CHARS
+        long_row = page["subtitles"][1]
+        assert long_row["truncated"] is True
+        assert "segment_id" in long_row["text"] or "segment_id" in page["note"]
+        # 全文は segment_id と text_offset で辿れば元どおり
+        whole = ""
+        text_offset = 0
+        for _ in range(20):
+            part = _call(
+                host,
+                "get_subtitles",
+                segment_id=long_row["segment_id"],
+                text_offset=text_offset,
+            )
+            assert len(json_text(part)) <= MAX_RESULT_CHARS
+            row = part["subtitles"][0]
+            whole += row["text"]
+            if "next_text_offset" not in row:
+                break
+            text_offset = row["next_text_offset"]
+        assert whole == self.LONG
+
+    def test_any_list_keeps_one_row_inside_the_limit(self) -> None:
+        from sashimono.ai.operations import _paged
+
+        row = {"id": "x", "name": "名前" * 9000, "items": list(range(5000))}
+        page = _paged([row], {}, name="rows")
+        assert len(json_text(page)) <= MAX_RESULT_CHARS
+        assert page["rows"][0]["truncated"] is True
+        assert page["rows"][0]["id"] == "x"
+
+
 class TestTheSecondsWindow:
     """秒で絞るときの境目 from より後に掛かり、to より前に始まる物（説明どおり）
 
