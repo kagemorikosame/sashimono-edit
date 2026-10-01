@@ -206,6 +206,24 @@ def test_subtitles_inside_a_placed_scene_name_their_media_and_voice() -> None:
     assert [r["text"] for r in narrowed["subtitles"]] == ["声"]
 
 
+def test_rows_just_under_the_limit_leave_room_for_the_page() -> None:
+    # 壊れると、行だけで上限ぎりぎりに収めたあと、件数・続き・案内を足した返事が上限を越え、
+    # 打ち切られて続きの読み方まで読めなくなる（PR #231 の指摘）
+    from sashimono.ai.operations import _paged
+
+    size = 1
+    while True:
+        rows = [{"id": n, "text": "x" * size} for n in range(3)]
+        if len(json_text(rows[:2])) > MAX_RESULT_CHARS - 5:
+            break
+        size += 50
+    rows = [{"id": n, "text": "x" * (size - 50)} for n in range(3)]
+    assert len(json_text(rows[:2])) <= MAX_RESULT_CHARS
+    page = _paged(rows, {}, name="rows", truncated_note="全文は id で読む" * 50)
+    assert len(json_text(page)) <= MAX_RESULT_CHARS
+    assert page["next_offset"] == page["count"]
+
+
 class TestTheSecondsWindow:
     """秒で絞るときの境目 from より後に掛かり、to より前に始まる物（説明どおり）
 

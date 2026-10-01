@@ -284,14 +284,34 @@ def _paged(
         raise ToolError("offset と limit は整数で渡してください") from exc
     limit = min(max(limit, 1), MAX_PAGE)
     chosen = rows[offset : offset + limit]
-    while len(chosen) > 1 and len(json_text(chosen)) > MAX_RESULT_CHARS:
+    while len(chosen) > 1 and len(json_text(chosen)) > MAX_RESULT_CHARS - _ENVELOPE_CHARS:
         # 1 件ずつ減らすと長い一覧で遅い 4 分の 3 ずつ減らしてから残りを詰める
         chosen = chosen[: max(1, len(chosen) * 3 // 4)]
-    notes: list[str] = []
     if len(chosen) == 1 and len(json_text(chosen)) > MAX_RESULT_CHARS - _ENVELOPE_CHARS:
         # 1 件だけで上限を越える（長い字幕 1 行など） 件数ではもう減らせないので中身を
         # 切り詰めて印を付ける 切らずに返すと打ち切られ、退けた分は読めない（PR #231 の指摘）
         chosen = [_fit(chosen[0], MAX_RESULT_CHARS - _ENVELOPE_CHARS)]
+    result = _page(chosen, name, total, offset, truncated_note)
+    # 行だけで見積もると、外側（件数・続き・案内）の分で上限を越えうる（PR #231 の指摘）
+    # 組み上がった返事の長さで確かめ、越えれば件数を減らすか 1 件を詰め直す
+    budget = MAX_RESULT_CHARS - _ENVELOPE_CHARS
+    while len(json_text(result)) > MAX_RESULT_CHARS:
+        if len(chosen) > 1:
+            chosen = chosen[: max(1, min(len(chosen) - 1, len(chosen) * 3 // 4))]
+        else:
+            budget //= 2
+            if budget < _KEEP_CHARS:
+                break
+            chosen = [_fit(chosen[0], budget)]
+        result = _page(chosen, name, total, offset, truncated_note)
+    return result
+
+
+def _page(
+    chosen: list[Any], name: str, total: int, offset: int, truncated_note: str
+) -> dict[str, Any]:
+    """切り出した行に、件数・続き・案内を添えた返事"""
+    notes: list[str] = []
     if any(isinstance(row, dict) and row.get("truncated") for row in chosen):
         # 呼ぶ側が先に切り詰めた行（長い字幕の本文）も、全文の読み方を添える
         notes.append(truncated_note or "長すぎる件は中身を切り詰めた（truncated）")
