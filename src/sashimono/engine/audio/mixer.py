@@ -46,6 +46,9 @@ MAX_SCENE_DEPTH = 8
 HISTORY_WINDOW = 16384
 #: 掛け終えた区切りを覚えておく数 再生の今の所と、シークで戻った所の分
 _KEPT_WINDOWS = 16
+#: 元の音の入れ物（:class:`_Tape`）に持たせる余裕 区切り 2 つ分あれば、続けて鳴らす間は
+#: 広げずに書き足せる
+_TAPE_SLACK = 2 * HISTORY_WINDOW
 
 
 class AudioMixer:
@@ -250,9 +253,7 @@ class AudioMixer:
             return None
         reach = lookback(clip, start, self.sample_rate, rate)
         before = min(start, reach)
-        # 残す長さはクリップの頭で切る前の長さで見る 頭の近くで切った長さで入れ物を
-        # 作ると、区切りごとに広げ直して写すことになる
-        raw = self._raw_range(clip, stream, depth, start - before, end, keep=reach)
+        raw = self._raw_range(clip, stream, depth, start - before, end, keep=before, longest=reach)
         if raw is None:
             return None
         processed = _apply_effects(
@@ -268,11 +269,20 @@ class AudioMixer:
         return processed
 
     def _raw_range(
-        self, clip: Clip, stream: int | None, depth: int, begin: int, end: int, *, keep: int
+        self,
+        clip: Clip,
+        stream: int | None,
+        depth: int,
+        begin: int,
+        end: int,
+        *,
+        keep: int,
+        longest: int,
     ) -> np.ndarray | None:
         """クリップの元の音の ``[begin, end)`` 前に読んだ所の続きなら、先だけを読み足す
 
         ``keep`` はこの区切りが読み直した前の音の長さ 次の区切りも同じだけ要るので残す
+        ``longest`` はクリップの頭で切る前の読み戻しの長さ 入れ物を広げる上限にする
         """
         key = (str(clip.id), stream, depth)
         kept = self._raw.get(key)
@@ -282,12 +292,12 @@ class AudioMixer:
                 more = self._read_clip(clip, tape.reach, end - tape.reach, depth, stream=stream)
                 if more is None:
                     return None
-                tape.append(more)
+                tape.append(more, longest=longest + HISTORY_WINDOW + _TAPE_SLACK)
         else:
             read = self._read_clip(clip, begin, end - begin, depth, stream=stream)
             if read is None:
                 return None
-            tape = _Tape(begin, read, room=keep + 2 * HISTORY_WINDOW)
+            tape = _Tape(begin, read)
         # 次の区切りが読み直す前の音の分だけ残す 全部残すと長いクリップで増え続ける
         # 長さは値から決まる（決め打ちの長さで切ると、長いやまびこの区切りが毎回読み直しになる）
         tape.trim(keep + HISTORY_WINDOW)
@@ -386,21 +396,26 @@ class _Tape:
     足すたびに全体を繋ぎ直すと、長いやまびこ（前の音 100 秒超 50 MB）の区切りごとに
     全体を写すことになり、再生の塊が間に合わない 広げてから写すやり方でも、広げる
     区切りだけ 30ms を超えた 輪を 2 つ並べて同じ所へ 2 回書けば、どこから切り出しても
-    繋ぎ目の無い 1 本として読める 書くのは足した分だけで、全体を写すことは無い
+    繋ぎ目の無い 1 本として読める 書くのは足した分だけで、ふだんは全体を写さない
     書くのは今残している所の外だけなので、渡した切り出しの中身は書き換わらない
     （捨てた所は書き換わる 切り出しを覚えておく側は写しを持つ）
+
+    輪は今持っている分（と区切り 2 つの余裕）から始め、足りなくなったら倍に広げる
+    最初から値で決まる最大の長さで取ると、クリップの頭の小さな区切りしか鳴らして
+    いなくても、最も長いやまびこで 100 MB を取った（PR #231 の指摘） 持つ長さが
+    大きく縮んだ（値を短くした）ときは小さく取り直し、使わない領域を持ち続けない
     """
 
     __slots__ = ("_head", "_length", "_ring", "_size", "origin")
 
-    def __init__(self, origin: int, samples: np.ndarray, *, room: int) -> None:
+    def __init__(self, origin: int, samples: np.ndarray) -> None:
         #: ``samples`` の頭のサンプルの、クリップの中の位置
         self.origin = origin
-        self._size = max(room, len(samples), 1)
-        self._ring = np.empty((self._size * 2, *samples.shape[1:]), dtype=samples.dtype)
+        self._ring = samples[:0]
+        self._size = 0
         self._head = 0
         self._length = 0
-        self._write(samples)
+        self._resize(len(samples) + _TAPE_SLACK, samples)
 
     @property
     def samples(self) -> np.ndarray:
@@ -411,15 +426,20 @@ class _Tape:
         """読んである所の終わり（クリップの中の位置 この位置は含まない）"""
         return self.origin + self._length
 
-    def append(self, more: np.ndarray) -> None:
-        if self._length + len(more) > self._size:
-            # 残す長さが伸びた（値が動いた）ときだけ 輪を大きくして写し直す
-            kept = self.samples
-            self._size = (self._length + len(more)) * 3 // 2
-            self._ring = np.empty((self._size * 2, *kept.shape[1:]), dtype=kept.dtype)
-            self._head = 0
-            self._length = 0
-            self._write(kept)
+    @property
+    def capacity(self) -> int:
+        """輪 1 つの長さ（サンプル） 取っている領域はこの 2 倍"""
+        return self._size
+
+    def append(self, more: np.ndarray, *, longest: int) -> None:
+        """後ろへ足す ``longest`` はこの先持つことのある最も長い量（値で決まる読み戻しと余裕）"""
+        needed = self._length + len(more)
+        if needed > self._size:
+            # 倍に広げる 足りない分だけ広げると、クリップの頭から鳴らしていく間（読む
+            # 長さが区切りごとに伸びる）に区切りごとに写し直すことになる ただし値で
+            # 決まる長さを越えては取らない（倍にした余りを持ち続けない）
+            size = max(min(self._size * 2, longest), needed)
+            self._resize(size, self.samples)
         self._write(more)
 
     def trim(self, length: int) -> None:
@@ -429,6 +449,16 @@ class _Tape:
             self._head = (self._head + cut) % self._size
             self._length -= cut
             self.origin += cut
+        # 倍に広げた分の余り（たかだか 2 倍）では取り直さない 何度も写し直すことになる
+        if self._size > 4 * (self._length + _TAPE_SLACK):
+            self._resize(self._length + _TAPE_SLACK, self.samples)
+
+    def _resize(self, size: int, kept: np.ndarray) -> None:
+        """輪を ``size`` で取り直し、``kept`` を頭から書く ``kept`` は前の輪の切り出しでもよい"""
+        self._size = max(size, 1)
+        ring = np.empty((self._size * 2, *kept.shape[1:]), dtype=kept.dtype)
+        self._ring, self._head, self._length = ring, 0, 0
+        self._write(kept)
 
     def _write(self, more: np.ndarray) -> None:
         count = len(more)

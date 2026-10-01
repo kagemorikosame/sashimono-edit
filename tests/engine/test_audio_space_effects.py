@@ -143,6 +143,63 @@ class TestALongEcho:
         assert np.abs(jumped).max() > 0.1
 
 
+class TestTheTapeGrowsAsNeeded:
+    """元の音の入れ物は要る分だけ取る（PR #231 の指摘）
+
+    前は値で決まる最も長い読み戻し（2000ms・90% で 132 秒）で最初から取り、クリップの
+    頭の小さな区切りしか鳴らしていなくても 100 MB を持った
+    """
+
+    def test_the_head_of_a_long_echo_takes_little(self, tmp_path: Path) -> None:
+        samples = np.zeros(RATE * 3, dtype=np.float32)
+        samples[0] = 0.5
+        project = _project(
+            _wav(tmp_path / "head.wav", samples), "audio_delay", time=2000, feedback=90, mix=100
+        )
+        mixer = AudioMixer(project)
+        try:
+            for start in range(0, RATE, 1024):
+                mixer.render(start, 1024)
+            taken = sum(value[1]._ring.nbytes for value in mixer._raw.values())
+        finally:
+            mixer.close()
+        # 1 秒鳴らすのに要るのは 1 秒と区切り数個ぶん 4 MB あれば足りる
+        assert 0 < taken < 4 * 1024 * 1024
+
+    def test_it_reads_back_what_was_written(self) -> None:
+        from sashimono.engine.audio.mixer import _Tape
+
+        rng = np.random.default_rng(7)
+        whole = rng.standard_normal((200_000, 2)).astype(np.float32)
+        tape = _Tape(0, whole[:100])
+        written = 100
+        keep = 40
+        first = tape.capacity
+        need = 0
+        for count in (7, 30_000, 13, 9_999, 1, 64, 20_000, 5, 15_000, 40_000, 333, 25_000):
+            need = max(need, len(tape.samples) + count)
+            tape.append(whole[written : written + count], longest=60_000)
+            written += count
+            tape.trim(keep)
+            keep = min(keep * 2, 30_000)
+            # 輪を回り込んで書いても、切り出しは繋ぎ目の無い元の並び
+            assert tape.reach == written
+            assert np.array_equal(tape.samples, whole[tape.origin : written])
+            # 上限（60000）より広くは取らない 一度に要る量が上限を越えたときだけその分まで
+            assert tape.capacity <= max(60_000, need)
+        # 足りなくなって広げた
+        assert tape.capacity > first
+
+    def test_it_shrinks_when_far_less_is_kept(self) -> None:
+        from sashimono.engine.audio.mixer import _TAPE_SLACK, _Tape
+
+        tape = _Tape(0, np.zeros((_TAPE_SLACK * 10, 2), dtype=np.float32))
+        big = tape.capacity
+        tape.trim(10)
+        assert tape.capacity < big // 4
+        assert tape.reach == _TAPE_SLACK * 10
+
+
 class TestReverb:
     def test_it_leaves_a_tail(self, tmp_path: Path) -> None:
         project = _project(_click(tmp_path), "audio_reverb", decay=0.5, mix=50)
