@@ -17,7 +17,16 @@ import numpy as np
 import pytest
 
 from sashimono.core.commands import AddEffect, Document, insert_media
-from sashimono.core.model import AnimatedValue, Keyframe, Project, ProjectSettings, TrackKind
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Keyframe,
+    Project,
+    ProjectSettings,
+    SceneId,
+    Track,
+    TrackKind,
+)
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
 from sashimono.engine.audio import AudioMixer
@@ -160,7 +169,7 @@ class TestTheTapeGrowsAsNeeded:
         try:
             for start in range(0, RATE, 1024):
                 mixer.render(start, 1024)
-            taken = sum(value[1]._ring.nbytes for value in mixer._raw.values())
+            taken = sum(value[-1]._ring.nbytes for value in mixer._raw.values())
         finally:
             mixer.close()
         # 1 秒鳴らすのに要るのは 1 秒と区切り数個ぶん 4 MB あれば足りる
@@ -198,6 +207,59 @@ class TestTheTapeGrowsAsNeeded:
         tape.trim(10)
         assert tape.capacity < big // 4
         assert tape.reach == _TAPE_SLACK * 10
+
+
+class TestEditingInsideAPlacedScene:
+    """置いたシーンの中を直したら、貯めた音を使わない（PR #231 の指摘）
+
+    前は貯めた区切りと元の音を、外側のシーンのクリップが同じ物かだけで見分けていた
+    シーンの中を直しても外側のクリップは同じ物のままなので、リバーブを掛けたシーンは
+    中の音を消しても前の音を鳴らし続けた
+    """
+
+    def _placed(self, tmp_path: Path) -> tuple[Project, SceneId]:
+        from sashimono.core.commands import AddScene, new_scene
+
+        project = _project(_click(tmp_path), "audio_volume")
+        sound = next(t for t in project.timeline.tracks if t.kind is not TrackKind.VIDEO)
+        scene = new_scene(project, "中")
+        project = AddScene(replace(scene, timeline=replace(scene.timeline, tracks=(sound,)))).apply(
+            project
+        )
+        reverb = registry.require("audio_reverb").create(decay=0.5, mix=50)
+        placed = Track(
+            TrackKind.VIDEO,
+            "V1",
+            (Clip(timeline_start=0, duration=30, scene_id=scene.id, effects=(reverb,)),),
+        )
+        return project.with_timeline(replace(project.timeline, tracks=(placed,))), scene.id
+
+    def test_emptying_the_scene_silences_it(self, tmp_path: Path) -> None:
+        project, scene_id = self._placed(tmp_path)
+        mixer = AudioMixer(project)
+        try:
+            assert np.abs(mixer.render(0, RATE // 2)).max() > 0.1
+            scene = project.find_scene(scene_id)
+            assert scene is not None
+            emptied = replace(scene, timeline=replace(scene.timeline, tracks=()))
+            changed = replace(
+                project, scenes=tuple(emptied if s.id == scene_id else s for s in project.scenes)
+            )
+            mixer.set_project(changed)
+            assert np.abs(mixer.render(0, RATE // 2)).max() == 0.0
+        finally:
+            mixer.close()
+
+    def test_unrelated_edits_keep_what_was_made(self, tmp_path: Path) -> None:
+        project, _ = self._placed(tmp_path)
+        mixer = AudioMixer(project)
+        try:
+            mixer.render(0, RATE // 2)
+            kept = dict(mixer._windows)
+            mixer.set_project(project)
+            assert kept and all(mixer._windows[key] is value for key, value in kept.items())
+        finally:
+            mixer.close()
 
 
 class TestTheTapesShareABudget:

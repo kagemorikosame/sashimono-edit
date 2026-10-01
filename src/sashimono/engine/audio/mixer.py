@@ -19,6 +19,7 @@ from sashimono.core.model import (
     MediaId,
     ParamValue,
     Project,
+    Scene,
     Timeline,
     Track,
     TrackKind,
@@ -69,13 +70,14 @@ class AudioMixer:
         self._closed = False
         #: 前の音を読むエフェクトを掛け終えた区切り 鍵はクリップ・音・深さ・区切りの番号
         #: クリップそのものも持ち、値を変えた（別のクリップになった）ら使わない
-        self._windows: OrderedDict[tuple[str, int | None, int, int], tuple[Clip, np.ndarray]] = (
+        #: 置いたシーンのクリップは、参照するシーン（入れ子の先まで）も一緒に持つ（:meth:`_owner`）
+        self._windows: OrderedDict[tuple[str, int | None, int, int], tuple[_Owner, np.ndarray]] = (
             OrderedDict()
         )
         #: 前の音を読むクリップの、読んだ元の音 続きを読むときは前に読んだ所から先だけを
         #: 読む（前へ戻って読み直すと、圧縮した音は解き直しになる）
         #: 最近使った物が後ろ 合計が :data:`RAW_BUDGET_BYTES` を越えたら前から捨てる
-        self._raw: OrderedDict[tuple[str, int | None, int], tuple[Clip, _Tape]] = OrderedDict()
+        self._raw: OrderedDict[tuple[str, int | None, int], tuple[_Owner, _Tape]] = OrderedDict()
         #: 値の動くクリップの、クリップ全体で最も長い読み戻し（:meth:`_steady_reach`）
         self._reaches: dict[str, tuple[Clip, int]] = {}
 
@@ -115,11 +117,18 @@ class AudioMixer:
         # だけ残す 消したクリップや値を変えたクリップの分は二度と使われず、残すと 1 本
         # 4 MB ほどずつ増え続ける（PR #231 の指摘） 形式が変われば中身ごと使えない
         present = set() if changed_format else _clip_identities(project)
+        # 置いたシーンのクリップは、シーンの中身が変わった（参照するシーンが別の物になった）
+        # 分も捨てる 外側のクリップは同じ物のままなので、クリップだけで見ると古い音を鳴らし
+        # 続ける（PR #231 の指摘）
         self._windows = OrderedDict(
-            (key, value) for key, value in self._windows.items() if id(value[0]) in present
+            (key, value)
+            for key, value in self._windows.items()
+            if id(value[0][0]) in present and self._still(value[0])
         )
         self._raw = OrderedDict(
-            (key, value) for key, value in self._raw.items() if id(value[0]) in present
+            (key, value)
+            for key, value in self._raw.items()
+            if id(value[0][0]) in present and self._still(value[0])
         )
 
     def close(self) -> None:
@@ -266,7 +275,8 @@ class AudioMixer:
         """``number`` 番目の区切りに、前の音を読んでからエフェクトを掛けた音"""
         key = (str(clip.id), stream, depth, number)
         found = self._windows.get(key)
-        if found is not None and found[0] is clip:
+        owner = self._owner(clip)
+        if found is not None and _same(found[0], owner):
             self._windows.move_to_end(key)
             return found[1]
         start = number * HISTORY_WINDOW
@@ -297,7 +307,7 @@ class AudioMixer:
             # エフェクトが元の音をそのまま返した（量 0 など） 元の音の入れ物はやがて
             # 書き換わるので、覚えておく分は写しにする
             processed = processed.copy()
-        self._windows[key] = (clip, processed)
+        self._windows[key] = (owner, processed)
         while len(self._windows) > _KEPT_WINDOWS:
             self._windows.popitem(last=False)
         return processed
@@ -345,7 +355,8 @@ class AudioMixer:
         """
         key = (str(clip.id), stream, depth)
         kept = self._raw.get(key)
-        tape = kept[1] if kept is not None and kept[0] is clip else None
+        owner = self._owner(clip)
+        tape = kept[1] if kept is not None and _same(kept[0], owner) else None
         if tape is not None and tape.origin <= begin <= tape.reach:
             if end > tape.reach:
                 more = self._read_clip(clip, tape.reach, end - tape.reach, depth, stream=stream)
@@ -360,10 +371,42 @@ class AudioMixer:
         # 次の区切りが読み直す前の音の分だけ残す 全部残すと長いクリップで増え続ける
         # 長さは値から決まる（決め打ちの長さで切ると、長いやまびこの区切りが毎回読み直しになる）
         tape.trim(keep + HISTORY_WINDOW)
-        self._raw[key] = (clip, tape)
+        self._raw[key] = (owner, tape)
         self._raw.move_to_end(key)
         self._let_go_of_raw()
         return tape.samples[begin - tape.origin : end - tape.origin]
+
+    def _owner(self, clip: Clip) -> _Owner:
+        """貯めた音を使ってよいかを見分ける物 クリップと、置いたシーンなら参照するシーン
+
+        シーンは入れ子の先までたどる 中のシーンだけを直すと、外側のシーンは同じ物のまま
+        モデルは作り替えでしか変わらないので、物として同じなら中身も同じ
+        """
+        if clip.scene_id is None:
+            return (clip, ())
+        found: list[Scene] = []
+        seen: set[str] = set()
+        stack = [(clip.scene_id, 0)]
+        while stack:
+            scene_id, depth = stack.pop()
+            if scene_id in seen or depth >= MAX_SCENE_DEPTH:
+                continue
+            seen.add(scene_id)
+            scene = self._project.find_scene(scene_id)
+            if scene is None:
+                continue
+            found.append(scene)
+            stack.extend(
+                (inner.scene_id, depth + 1)
+                for track in scene.timeline.tracks
+                for inner in track.clips
+                if inner.scene_id is not None
+            )
+        return (clip, tuple(found))
+
+    def _still(self, owner: _Owner) -> bool:
+        """今のプロジェクトでも同じ中身か（シーンのクリップだけ見直す）"""
+        return not owner[1] or _same(owner, self._owner(owner[0]))
 
     def _let_go_of_raw(self) -> None:
         """元の音の入れ物の合計を :data:`RAW_BUDGET_BYTES` に収める 最近使っていない物から捨てる
@@ -461,6 +504,19 @@ class AudioMixer:
             _, evicted = self._decoders.popitem(last=False)
             evicted.close()
         return decoder
+
+
+#: 貯めた音の持ち主 クリップと、置いたシーンなら参照するシーン（:meth:`AudioMixer._owner`）
+_Owner = tuple[Clip, tuple[Scene, ...]]
+
+
+def _same(stored: _Owner, owner: _Owner) -> bool:
+    """同じ物（``is``）か 値で比べると、大きなシーンを区切りごとに突き合わせることになる"""
+    return (
+        stored[0] is owner[0]
+        and len(stored[1]) == len(owner[1])
+        and all(a is b for a, b in zip(stored[1], owner[1], strict=True))
+    )
 
 
 class _Tape:
