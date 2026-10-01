@@ -56,7 +56,7 @@ jobs:
 
       - name: mutation の結果を残す
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: mutation-report
           path: coverage/gremlins/gremlins.json
