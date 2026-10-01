@@ -94,8 +94,10 @@ GPU が無い環境では OpenGL のテストが自動で飛びます ffmpeg が
 
 ### AI のレビュー
 
-PR には 4 つの AI（CodeRabbit・Copilot・Sourcery・Qodo）がレビューを付けます
-自動で走るかどうかは役によって違い、無料枠の回数でも止まるので、PR を出したら全員に頼んでください
+PR には 4 つの AI（CodeRabbit・Copilot・Sourcery・Codex）がレビューを付けます
+自動で走るかどうかは役によって違い、無料枠の回数でも止まるので、PR を出したら Codex 以外の全員に頼んでください
+Codex は使う量を抑えるため、CodeRabbit の指摘を直して承認を取ったあと、最後に `@codex review` を 1 回だけ頼みます
+頼み直すのは Codex の P0・P1 を直したときだけで、P2 は直して返信すれば締めて構いません
 たとえば CodeRabbit は、この公開リポジトリでは自動で走らず、PR に `@coderabbitai review` と
 書くと見てくれます ほかの頼み方は
 [docs/development.md](docs/development.md) の「AI のレビューを受ける」にあります

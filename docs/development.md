@@ -1516,21 +1516,22 @@ PR には必ず含める:
 - 外のライブラリの中（こちらのファイルからは包めない物）
 
 切り出したときは、直せなかった理由を Issue に書き、PR の本文からも示す
-レビューの道具（`.coderabbit.yaml`・`.pr_agent.toml`）にも、別の PR に分けるよう
+レビューの道具（`.coderabbit.yaml`・`AGENTS.md` の「Review guidelines」）にも、別の PR に分けるよう
 勧めず、この PR の中で直す前提で指摘するよう頼んである
 
 ### AI のレビューを受ける
 
 レビュー役は 4 つ どれも無料枠（Copilot は Pro の月の回数）で動かしているので、
-回数が切れる役が必ず出る **PR を出したら全員に頼み、指摘を突き合わせる** 枠が
-切れた役は飛ばしてよい
+回数が切れる役が必ず出る **PR を出したら Codex 以外の全員に頼み、指摘を突き合わせる** 枠が
+切れた役は飛ばしてよい Codex は使う量を抑えるため、最後に 1 回だけ頼む
+（下の「Codex のレビューは最後に 1 回」）
 
 | レビュー役 | 頼み方 | 設定 |
 |---|---|---|
 | [CodeRabbit](https://coderabbit.ai/) | PR で `@coderabbitai review`（公開リポジトリでは自動で走らない） | `.coderabbit.yaml` |
 | GitHub Copilot | `gh pr edit <番号> --add-reviewer @copilot`（自動にはしない 月の回数を守るため） | なし |
 | Sourcery | `@sourcery-ai review` | Web の画面（Review Settings） 言語は日本語、`tests/fixtures/**` を外す |
-| Qodo | `/agentic_review` | `.pr_agent.toml` |
+| Codex | `@codex review`（CodeRabbit の承認の後に 1 回） | `AGENTS.md` の「Review guidelines」 |
 
 #### 承認（Approved）の出し方
 
@@ -1543,12 +1544,10 @@ CodeRabbit と Sourcery は承認を出す 指摘が残っている間は「変�
 - Sourcery … Web の画面（Review Settings）の `Let Sourcery approve pull requests`
 - Copilot の承認は**有効にしない** 既定のまま（指摘だけ） 承認 1 つで必須承認を
   満たせてしまい、門として弱くなるため
-- Qodo の自動承認は指摘が 0 件のときだけ出る作りなので、今の進め方では出ない 使っていない
-  （`Qodo review` の status はこれとは別物 Qodo が最新のコミットを見たかだけを見ており、
-  指摘の数や承認は見ていない）
+- Codex は指摘のコメントを書くだけで、承認を門には使わない
 
 **承認はマージの門ではない**（`main` の必須承認は 0 のまま）
-門は今までどおり CI 2 本・`Qodo review`・会話の解決
+門は CI 2 本（`verify (3.12)`・`verify (3.14)`）と会話の解決
 
 ただし **CodeRabbit の「変更を求める」は、必須承認が 0 でもマージを止める**
 （PR #18 で確かめた `reviewDecision` が `CHANGES_REQUESTED` になり `BLOCKED` に変わる）
@@ -1564,48 +1563,28 @@ CodeRabbit と Sourcery は承認を出す 指摘が残っている間は「変�
 承認や解決ができてしまい、承認の表示と実際に見た範囲が食い違う
 
 約束（コメントの書き方・コア層の依存・テストの書き方）は、どの役にも同じものを渡す
-`.coderabbit.yaml` を直したら、`.pr_agent.toml` もそろえる
+`.coderabbit.yaml` を直したら、`AGENTS.md` の「Review guidelines」もそろえる
 
-#### Qodo のレビューはマージの必須条件
+#### Codex のレビューは最後に 1 回
 
-Qodo はコメントを書くだけで GitHub のチェックを出さないので、
-`.github/workflows/qodo-gate.yml` が Qodo のコメントを読み、代わりに `Qodo review` という
-status を出す（判定は `tools/qodo_gate.py`） main の保護でこれを必須にしてある
-**PR の先頭のコミットまで Qodo が見るまで、マージできない** 修正を push したら
-`/agentic_review` で頼み直す 見たかどうかは、Qodo のコメントにそのコミットの SHA が
-書かれているかだけで決める（時刻では決めない 手元で作れるうえ、別のブランチの push で
-ずれるので、見ていないコミットを通す穴になる） 指摘が 1 件も無いと SHA が書かれない
-ことがあるので、そのときも `/agentic_review` で頼み直す
-PR の向き先（base）を変えたときは、変えたあとに書かれた Qodo のコメントだけを数える
-（SHA は同じまま、比べる相手が変わって別の差分になるため） 変えたら頼み直す
+Codex（ChatGPT の `chatgpt-codex-connector`）は PR に `@codex review` と書くと見る
+指示は `AGENTS.md` の「Review guidelines」の節から読む（日本語で書く・重さ P0〜P2 を付ける・
+重い問題を中心に見る・書き方や言い回しは CodeRabbit に任せる） Codex は `AGENTS.md` を
+32KiB までしか読まないので、この節は短く保つ
 
-気を付けること
+使う量を抑えるため、頼む回数を決めてある
 
-- **Qodo は push のたびに自動で見直す** そのとき、指摘より先にまとめのコメントを書き換える
-  ので、`Qodo review` が通った数十秒後に新しい指摘が届くことがある マージの前に、
-  最後の push より後に届いた指摘が無いかを見る
-- 同じ PR の判定が重なると、新しい実行が古い実行を取り消す（古い判定で新しい結果を
-  上書きしないため） 取り消された実行はチェックの一覧に赤く残るが、判定の status は
-  最後の実行が書くので気にしなくてよい
-- **Git Bash から `/agentic_review` を書くときは `MSYS_NO_PATHCONV=1` を付ける** 付けないと
-  パスの変換で `C:/Program Files/Git/agentic_review` と書き込まれ、Qodo に届かない
+1. CodeRabbit の指摘を直し、承認を取る
+2. 最後に `@codex review` を 1 回だけ頼む
+3. Codex の P0・P1 を直したときだけ、もう一度 `@codex review` で頼み直す
+4. P2 は直してスレッドに返信し、締める（頼み直さない）
 
-```bash
-MSYS_NO_PATHCONV=1 gh pr comment <番号> --body "/agentic_review"
-```
+Codex はマージの必須条件にしていない（`main` の必須の検査は `verify (3.12)` と
+`verify (3.14)` だけ） 頼み忘れても止まらないので、マージの前に Codex の
+レビューが済み、P0・P1 が残っていないかを自分で見る
 
-**ほかの PR が入って main を取り込んだときは、判定が自動で通る** Qodo は中身の同じ差分を
-見直さず「No code changes since the last review」と返すので、SHA だけで見ると取り込みの
-たびに待ちへ戻る 判定は「先頭から親をたどる道がすべてマージで、取り込んだ相手が main に
-入っていて、変わったファイルがどれも main 側と同じ中身」のときだけ通す 衝突を手で直した
-ときは main 側とも枝側とも違う中身になるので通らず、Qodo の見直しを待つ
-
-Qodo が止まった、無料枠が切れたなどで返事が来ないときは、マージが止まったままになる
-その場合だけ、理由を書いて手で通す（管理者の操作 何を確かめたかを PR に残す）
-
-```
-gh api repos/kagemorikosame/sashimono-edit/statuses/<先頭のコミットの SHA> -f state=success -f context="Qodo review" -f description="手で通した: <理由>"
-```
+以前は Qodo を使い、`Qodo review` という status を必須にしていたが、試用が切れて
+レビューが止まったのでやめた（status を出す workflow と判定の道具も消した）
 
 Gemini Code Assist（GitHub の PR レビュー）は使わない GitHub 向けの無料 consumer version は
 2026-07-17 に提供を終え、GitHub のレビュー機能で残っているのは Google Cloud の有料契約が要る

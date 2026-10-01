@@ -1,7 +1,7 @@
 # Sashimono Edit — コーディングエージェント向けの指示
 
 Codex など、`AGENTS.md` を読む道具向け **内容は [CLAUDE.md](CLAUDE.md) と同じ** 直すときは両方と
-`.cursor/rules/sashimono.mdc` をそろえる
+`.cursor/rules/sashimono.mdc` をそろえる（末尾の「Review guidelines」だけは Codex のレビュー向けでここにしか無い）
 開発ルールの大本は [docs/development.md](docs/development.md) 作業前に読むこと
 
 ## 必ず守ること
@@ -43,6 +43,8 @@ PR はフェーズ単位 `phase/*` ブランチを切って `main` へ PR を出
 `main` へ直接 push しない PR には `tools/verify.py` の結果（テスト件数）を書く
 作業中やレビューで出た懸念点は、別の Issue や PR に分けず、できるだけ今のブランチで直す
 切り出すのは今のブランチで直せない物（実物のアプリの起動や利用者の判断が要る・外のライブラリの中など）だけ
+AI のレビューは CodeRabbit で直して承認を取ってから、最後に `@codex review` を 1 回頼む
+Codex の P0・P1 を直したときだけ頼み直す P2 は直して返信し、そのスレッドを締める（使う量を抑えるため）
 
 ## 覚えておくと早いこと
 
@@ -53,3 +55,20 @@ PR はフェーズ単位 `phase/*` ブランチを切って `main` へ PR を出
 - コア層（`src/sashimono/core/`）は PySide6 を import しない
 - 変更は必ず `Command` 経由 モデルを直接書き換えない
 - 配布物（他人が作った素材）はリポジトリに入れない
+
+## Review guidelines
+
+Codex の PR レビュー（`@codex review`）向け この節だけは `AGENTS.md` にしか置かない
+Codex は `AGENTS.md` を 32KiB までしか読まないので、短く保つ
+
+- レビューのコメントは日本語で書く 文章に句点（まる）を使わず、文の区切りは半角空白
+- 指摘には重さ（P0〜P2）を付ける
+- 重い問題を中心に見る 正しさの誤り・データの消失（保存や `.sme` の読み書き）・落ちる・固まる・安全
+- 書き方や細かい好み、テストや文書の言い回しは CodeRabbit が見ているので指摘しない
+- 次の決まりに反する物は指摘する
+  - コア層（`src/sashimono/core/`）が PySide6 を import している
+  - モデルを `Command` を通さず直接書き換えている
+  - Y 軸を下が正で扱っている（例外は `brush_fill` の模様と `particles` の放つ位置だけ）
+  - 互換層（AviUtl / YMM4）で未対応の物を `CompatibilityReport` に記録せず捨てている
+- 懸念は、この PR の中で直す前提で直し方と一緒に指摘する 別の PR や Issue に分けるよう
+  勧めない（外のライブラリの中や、実物のアプリの起動が要る物だけは理由を添えてよい）
