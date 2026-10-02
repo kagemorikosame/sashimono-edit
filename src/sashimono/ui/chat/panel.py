@@ -39,6 +39,7 @@ from sashimono.ai.session import (
     EventKind,
     system_prompt,
 )
+from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.workspace import Preferences
@@ -154,12 +155,17 @@ class ChatPanel(QWidget):
         self._model.currentIndexChanged.connect(self._on_choice_changed)
         self._effort.currentIndexChanged.connect(self._on_choice_changed)
 
-        choices = QHBoxLayout()
-        choices.setContentsMargins(0, 0, 0, 0)
-        choices.addWidget(QLabel("モデル", self))
-        choices.addWidget(self._model, 1)
-        choices.addWidget(QLabel("考える深さ", self))
-        choices.addWidget(self._effort)
+        # 名前と欄の組ごとに折り返す 1 列に並べると、モデルの名前の欄と深さの欄の幅の和が
+        # AI のパネルの最小の幅になり、設定パネルと重ねた右の列が 1366 の画面で広がりすぎた
+        # 組を崩さないのは、欄だけが次の行へ落ちると、どの名前の欄か読めなくなるため
+        choices = FlowLayout()
+        for text, box in (("モデル", self._model), ("考える深さ", self._effort)):
+            pair = QWidget(self)
+            pair_layout = QHBoxLayout(pair)
+            pair_layout.setContentsMargins(0, 0, 0, 0)
+            pair_layout.addWidget(QLabel(text, pair))
+            pair_layout.addWidget(box)
+            choices.addWidget(pair)
 
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない
@@ -217,6 +223,17 @@ class ChatPanel(QWidget):
         self._input = _Input(self)
         self._describe_send_key()
         self._input.setMaximumHeight(96)
+        # 最小は行の数で決める Qt の既定（巻物の欄の最小）は会話の欄と合わせて 140 画素あり、
+        # 設定パネルと重ねた右の列の最小の高さになって、1280x720 の画面に窓が収まらなかった
+        # 書体で行の高さが変わっても、会話は 2 行・入力は 1 行が必ず見える
+        areas: tuple[tuple[QTextBrowser | QPlainTextEdit, int], ...] = (
+            (self._view, 2),
+            (self._input, 1),
+        )
+        for area, lines in areas:
+            frame = 2 * area.frameWidth()
+            margin = round(2 * area.document().documentMargin())
+            area.setMinimumHeight(lines * area.fontMetrics().lineSpacing() + frame + margin)
         self._input.submitted.connect(self.send)
 
         self._auto = QCheckBox("変更を自動で承認", self)

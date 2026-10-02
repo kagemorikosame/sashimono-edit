@@ -42,9 +42,13 @@ from sashimono.effects import (
     TrackSpec,
     ValueSpec,
 )
+from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.theme import Colors, themed_style
 
-__all__ = ["ParameterEditor", "create_editor"]
+__all__ = ["NUMBER_WIDTH", "ParameterEditor", "TrackEditor", "create_editor"]
+
+#: 数値欄の幅の下限（画素） 中身がこれより狭くても、行ごとに欄の幅が揺れないようにそろえる
+NUMBER_WIDTH = 96
 
 #: スライダーは整数しか扱えないので、この倍率で小数を載せる
 _SLIDER_SCALE = 1000
@@ -187,7 +191,7 @@ class TrackEditor(ParameterEditor):
         self._number.setRange(spec.minimum, spec.maximum)
         self._number.setSingleStep(spec.step)
         self._number.setSuffix(f" {spec.unit}" if spec.unit else "")
-        self._number.setFixedWidth(96)
+        self._number.setFixedWidth(self.number_width())
         self._number.setKeyboardTracking(False)
         self._number.valueChanged.connect(self._on_number)
         self._number.installEventFilter(self)
@@ -201,6 +205,22 @@ class TrackEditor(ParameterEditor):
         layout.addWidget(self._number)
 
         self.set_value(spec.default_value())
+
+    def number_width(self) -> int:
+        """数値欄に範囲の端の値と単位が欠けずに入る幅
+
+        決め打ちの 96 画素では、書体の幅が広い所（Windows の表示の拡大・別の書体）で
+        「100.00 %」の後ろが切れた 範囲の端の値で測るのは、動かしても欄の幅が変わらない
+        ようにするため（今の値で測ると、桁が増えるたびに隣のスライダーが縮む）
+        """
+        return max(NUMBER_WIDTH, self._number.sizeHint().width())
+
+    def set_number_width(self, width: int) -> None:
+        """数値欄の幅をそろえる 設定パネルが組の中で一番広い欄に合わせる
+
+        行ごとに幅が違うと、スライダーの右端が行ごとにずれて読みにくい
+        """
+        self._number.setFixedWidth(max(width, self.number_width()))
 
     def set_value(self, value: ParamValue | None) -> None:
         animated = self._spec.coerce(value)
@@ -526,6 +546,9 @@ class FontEditor(ParameterEditor):
         super().__init__(spec, parent)
         self._spec = spec
         self._box = QFontComboBox(self)
+        # 入っている書体の中でいちばん長い名前の幅が、設定パネルの最小の幅になっていた
+        # （Windows で 247 画素） テキストを選んだだけで右の列が広がり、窓が画面からはみ出す
+        narrow_combo(self._box, 10)
         self._box.currentFontChanged.connect(lambda font: self._emit(font.family()))
 
         layout = QHBoxLayout(self)

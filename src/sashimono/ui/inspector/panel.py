@@ -86,6 +86,7 @@ from sashimono.effects import (
 from sashimono.effects.blending import BLEND_MODES
 from sashimono.effects.sources import source_registry
 from sashimono.engine.gpu import BlendMode
+from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
 from sashimono.ui.preview_handles import ALIGNMENTS
@@ -221,6 +222,11 @@ class InspectorPanel(QWidget):
         scroll.setWidget(self._body)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 横には巻物にしない 横に巻けると、パネルを狭めたときに中身が右へはみ出し、
+        # 見出しの ✕ と数値欄の単位が隠れたまま気付かれない 中身が入る幅を
+        # パネルの最小の幅にする（:meth:`_fit_width`）
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll = scroll
 
         self._add_button = QPushButton("エフェクトを追加…", self)
         self._add_button.clicked.connect(self._show_effect_menu)
@@ -318,6 +324,7 @@ class InspectorPanel(QWidget):
             self._add_button.setEnabled(False)
             self._preset_button.setEnabled(False)
             self._body_layout.addStretch(1)
+            self._fit_width()
             return
         track, clip = located
 
@@ -371,7 +378,32 @@ class InspectorPanel(QWidget):
                 )
 
         self._body_layout.addStretch(1)
+        self._fit_width()
         self._refresh_animated()
+
+    def _sections(self) -> list[_Section]:
+        """今出している組 作り直しで外した組（消えるのを待っている物）は入れない"""
+        found: list[_Section] = []
+        for index in range(self._body_layout.count()):
+            item = self._body_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, _Section):
+                found.append(widget)
+        return found
+
+    def _fit_width(self) -> None:
+        """数値欄の幅をそろえ、中身が欠けずに入る幅をパネルの最小の幅にする
+
+        最小の幅を中身から決めないと、窓を狭めたときに設定パネルが中身より狭くなり、
+        数値欄の「100.00 %」や見出しの ✕ が欠けた（1366 の画面）
+        """
+        numbers = [editor for section in self._sections() for editor in section.numbers()]
+        widest = max((editor.number_width() for editor in numbers), default=0)
+        for editor in numbers:
+            editor.set_number_width(widest)
+        bar = self._scroll.verticalScrollBar().sizeHint().width()
+        frame = 2 * self._scroll.frameWidth()
+        self._scroll.setMinimumWidth(self._body.minimumSizeHint().width() + bar + frame)
 
     def _show_identity(self, clip: Clip) -> None:
         identity = identify_clip(self._project, clip.id) if self._project is not None else None
@@ -1340,7 +1372,9 @@ class _Section(QFrame):
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(title)
+        # 長い名前（配布スクリプトなど）は「…」で省く そのまま出すと名前の幅が設定パネルの
+        # 最小の幅になり、窓が画面からはみ出す
+        label = ElidedLabel(title)
         themed_style(
             label, lambda: f"color: {Colors.TEXT.name()}; font-weight: bold; border: none;"
         )
@@ -1389,6 +1423,10 @@ class _Section(QFrame):
         if extra is not None:
             self._grid.addWidget(extra, self._row, 2)
         self._row += 1
+
+    def numbers(self) -> list[TrackEditor]:
+        """組の中の数値とスライダーの欄 幅をそろえるため"""
+        return self.findChildren(TrackEditor)
 
     def add_note(self, message: str) -> None:
         note = QLabel(message)

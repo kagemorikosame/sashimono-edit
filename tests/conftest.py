@@ -145,6 +145,25 @@ def decline_matching_video(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(media_match, "ask_to_match", lambda *_args: False)
 
 
+@pytest.fixture(autouse=True)
+def silent_hdr_notice(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """HDR の素材の知らせの窓を出さず、知らせた素材の名前を記録する
+
+    窓を出すと、閉じる人がいないまま試験が止まる 知らせ方そのものを試す試験は、
+    返す記録を見るか、その試験の中で差し替え直す
+    """
+    from sashimono.ui import hdr_notice
+
+    shown: list[list[str]] = []
+
+    def record(_parent: object, media: list[MediaItem]) -> bool:
+        shown.append([item.name for item in media])
+        return True
+
+    monkeypatch.setattr(hdr_notice, "ask_hdr_notice", record)
+    return shown
+
+
 #: 本物のクリップボードへ書く口 どれも見張りで塞ぐ
 _CLIPBOARD_WRITERS = ("setText", "setImage", "setPixmap", "setMimeData", "clear")
 

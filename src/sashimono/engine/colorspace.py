@@ -26,6 +26,7 @@ from av.video.reformatter import (
 
 __all__ = [
     "VideoReformatter",
+    "color_tags",
     "source_matrix",
     "tag_bt709",
     "to_bt709",
@@ -144,6 +145,29 @@ def to_bt709(
     converted.color_primaries = ColorPrimaries.BT709
     converted.color_trc = ColorTrc.BT709
     return converted
+
+
+def color_tags(stream: av.video.stream.VideoStream) -> tuple[str, str]:
+    """素材の映像の伝達特性と原色の印 FFmpeg の名前（``smpte2084`` ``bt2020`` など）
+
+    印が無い（指定なし）・PyAV が知らない番号のときは空 HDR の素材を見分けて知らせる
+    ために読む（:attr:`~sashimono.core.model.VideoStreamInfo.color_outside_sdr`）
+    名前は FFmpeg（ffprobe）と同じ綴りにする 列挙型の名前の ``_`` を ``-`` に替えれば揃う
+    """
+    context = stream.codec_context
+    return _tag_name(ColorTrc, context.color_trc), _tag_name(
+        ColorPrimaries, context.color_primaries
+    )
+
+
+def _tag_name(kind: type[ColorTrc] | type[ColorPrimaries], value: object) -> str:
+    try:
+        tag = kind(int(value))  # type: ignore[call-overload]  # PyAV の型は int を返すと書いていない
+    except (TypeError, ValueError):
+        return ""
+    if tag.name == "UNSPECIFIED":
+        return ""
+    return tag.name.lower().replace("_", "-")
 
 
 def tag_bt709(stream: av.video.stream.VideoStream) -> None:

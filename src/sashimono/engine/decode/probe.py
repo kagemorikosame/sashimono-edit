@@ -15,6 +15,7 @@ import av.error
 
 from sashimono.core.model import AudioStreamInfo, MediaItem, VideoStreamInfo
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.colorspace import color_tags
 from sashimono.engine.decode.rational import as_fraction
 
 __all__ = [
@@ -363,7 +364,10 @@ def _video_info(
 ) -> VideoStreamInfo:
     rate = stream.average_rate or stream.guessed_rate or stream.base_rate
     frame_rate = FrameRate(rate.numerator, rate.denominator) if rate else FALLBACK_FRAME_RATE
+    transfer, primaries = color_tags(stream)
     return VideoStreamInfo(
+        color_transfer=transfer,
+        color_primaries=primaries,
         index=stream.index,
         width=stream.codec_context.width,
         height=stream.codec_context.height,

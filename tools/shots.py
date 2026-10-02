@@ -35,6 +35,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono import __version__
 from sashimono.ai.host import ToolError
 from sashimono.compat.aviutl.catalog import (
     PORTABLE_SCRIPTS_DIR,
@@ -101,7 +103,7 @@ from sashimono.runtime import PackageStatus, PackStatus
 from sashimono.ui.compat_dialog import CompatibilityDialog
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.main_window import MainWindow
-from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.preferences_dialog import AUTO_QUALITY_TEXT, PreferencesDialog
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.subtitle import SubtitlePanel
 from sashimono.ui.template_dialog import TemplateDialog
@@ -114,7 +116,9 @@ ROOT = Path(__file__).resolve().parent.parent
 WINDOW_SIZE = (1280, 800)
 
 #: 素材一覧と設定パネルの幅 窓が狭いぶん、プレビューを詰めて設定パネルへ回す
-DOCK_WIDTHS = (300, 470)
+#: プレビューの列には下の帯が全部（全体の長さと「再生品質」の名前まで）入る幅を残す
+#: 残さないと帯がそれを隠し、手順書の〔再生品質〕が写真のどこにも書かれていない
+DOCK_WIDTHS = (250, 450)
 
 #: 見本の素材 小さすぎるとサムネイルが潰れ、長すぎるとタイムラインが余る
 SAMPLE_WIDTH, SAMPLE_HEIGHT, SAMPLE_SECONDS = 1280, 720, 8.0
@@ -1422,7 +1426,7 @@ def wiki_heavy_preferences(context: Context) -> QImage:
     image = grab(dialog)
     wanted = (
         "プレビューに低解像度の控えを使う",
-        "画面より大きい素材では、プレビューの画質を下げる",
+        AUTO_QUALITY_TEXT,
         "手が止まっている間に、先のコマを描いておく",
     )
     buttons = [b for b in dialog.findChildren(QAbstractButton) if b.text() in wanted]
@@ -1720,9 +1724,36 @@ def main(argv: list[str] | None = None) -> int:
                 script_root=work / "scripts",
                 template_root=write_sample_templates(Path(TEMPLATE_DIR)),
             )
-            return run(targets, context, output, wiki_images)
+            result = run(targets, context, output, wiki_images)
         finally:
             os.chdir(previous)
+    # 手順書の写真を全部撮り直せたときだけ、頭に書いた版を今の版にする 一部だけ撮った
+    # （--only・失敗した）のに書き換えると、古い版の写真が新しい版の物として残る
+    if result == 0 and names is None and wiki_images is not None:
+        for page in stamp_wiki_version(wiki_images.parent):
+            print(f"版を書き換えた {page.name}")
+    return result
+
+
+#: 手順書の頭の「この手順書の画面と文言は **Sashimono Edit 0.1.0** で撮りました」の版
+WIKI_VERSION = re.compile(r"(\*\*Sashimono Edit )([^*\s]+)(\*\* で撮りました)")
+
+
+def stamp_wiki_version(wiki: Path, version: str = __version__) -> list[Path]:
+    """Wiki の頁の頭に書いた、写真を撮った版を ``version`` に書き換える 書き換えた頁を返す
+
+    手で書き換えると、版を上げて撮り直したのに「0.0.1 で撮りました」のまま残った
+    改行は元のまま残す（文字として読んで書くと、Windows では改行の形が変わって頁全体が
+    差分になる）
+    """
+    changed: list[Path] = []
+    for page in sorted(wiki.glob("*.md")):
+        text = page.read_bytes().decode("utf-8")
+        stamped = WIKI_VERSION.sub(lambda found: f"{found[1]}{version}{found[3]}", text)
+        if stamped != text:
+            page.write_bytes(stamped.encode("utf-8"))
+            changed.append(page)
+    return changed
 
 
 def _media_or_none(directory: Path, *, needed: bool) -> Path | None:
