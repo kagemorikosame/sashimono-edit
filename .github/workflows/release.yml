@@ -1,0 +1,70 @@
+name: Release
+
+# 配る zip を Actions で組み立て、リリースの**下書き**へ上げる（自動更新 F-12-7）
+# 署名はしない 秘密鍵をリポジトリのシークレットに置くと、workflow を書き換えられる人なら
+# 誰でも取り出せる 目録（update.json）を作って署名するのは手元（tools/update_sign.py）
+# 下書きのままにするのは、署名を上げる前に releases/latest/download/… が動かないようにするため
+# 手順は docs/development.md の「自動更新のリリース」
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  # リリースの下書きを作り、zip を上げるのに要る これより広くしない
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          # 配る版の Python zip の中の build-info.json と update.json の python_abi になる
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: false
+
+      - name: 依存を入れる
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
+
+      - name: タグと版を照らす
+        # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
+        run: python tools/update_sign.py check-tag "$env:TAG"
+
+      - name: 配る zip を組み立てる
+        # zip からの確かめ（GL で描く・書き出す）は GPU の無い Actions では通らないので省く
+        # 下書きから落とした zip を、手元で --self-check まで確かめてから署名する
+        run: python tools/build_package.py --skip-check
+
+      - name: リリースの下書きへ上げる
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem dist -Filter 'SashimonoEdit-*-windows-x64.zip' | Select-Object -First 1
+          if (-not $zip) { throw '組み立てた zip が無い' }
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "SHA-256: $hash" | Add-Content $env:GITHUB_STEP_SUMMARY
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            # 下書きで作る 署名と目録を上げてから、人が公開する
+            $pre = @()
+            if ($env:TAG -match '(a|b|rc)\d+$') { $pre = @('--prerelease') }
+            gh release create $env:TAG --draft --verify-tag --title "Sashimono Edit $env:TAG" --notes "署名と目録はこれから上げる" @pre
+            if ($LASTEXITCODE -ne 0) { throw '下書きを作れない' }
+          }
+          gh release upload $env:TAG $zip.FullName --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'zip を上げられない' }

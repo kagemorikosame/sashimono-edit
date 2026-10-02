@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.asr import (
+    ASR_PACK,
     MODELS,
     JobKind,
     TranscribeOptions,
@@ -272,7 +273,10 @@ class TranscribeDialog(QDialog):
 
         def run() -> None:
             code = install_runtime(
-                command=command, on_output=self._install_log.put, should_cancel=cancel.is_set
+                pack=ASR_PACK,
+                command=command,
+                on_output=self._install_log.put,
+                should_cancel=cancel.is_set,
             )
             self._install_code = code
             self._install_log.put(

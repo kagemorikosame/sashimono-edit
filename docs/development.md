@@ -1927,12 +1927,122 @@ gh release upload <タグ> dist\SashimonoEdit-<版>-windows-x64.zip dist\sources
 新しく色を扱う処理を足すときも、この範囲を前提にしてよい 範囲の外の素材を正しく
 扱うふりはしない
 
+### 自動更新の仕組み
+
+配った zip（`Sashimono.exe`）は、自分で新しい版へ入れ替わる（Issue #36 設計は計画書の F-12）
+部品は `src/sashimono/update/`（Qt を読まない）と、画面の側の `ui/updates.py`
+
+| 段 | すること | 場所 |
+|---|---|---|
+| 確かめる | 起動して 3 秒後に裏で、目録（`update.json`）と署名（`update.json.sig`）を固定の URL から読む REST API は叩かない 数時間に 1 回まで 失敗は黙る | `update/check.py` |
+| 信じる | 埋め込んだ公開鍵（2 本）のどちらかで署名が通ったときだけ中身を読む **公開鍵が入っていない版は何もしない** | `update/signing.py` |
+| 落とす | 転送を追う 行き先は `github.com` と GitHub の CDN だけ（下の注） 大きさと SHA-256 を目録と照らす | `update/fetch.py` |
+| 置く | 今の版のフォルダの隣（`Sashimono.new`）へ展開し、中の `build-info.json` の版と Python の ABI を目録と照らす | `update/package.py` |
+| 入れる | 本人の合図（〔今すぐ再起動して入れる〕か〔次の起動で入れる〕）で、本体の外の PowerShell が改名で入れ替える | `update/swap.py` |
+| 戻す | 入れた版が 2 回続けて窓を出せなければ前の版へ戻す メニュー〔ヘルプ〕→〔前の版に戻す…〕でも戻せる | `update/swap.py` |
+
+- 固定の URL は `links.py` の `STABLE_MANIFEST_URL`（`releases/latest/download/update.json`）と
+  `BETA_MANIFEST_URL`（`releases/download/beta/update.json`） **配った版が読み続けるので変えない**
+- 転送先は計画書では `objects.githubusercontent.com` だったが、2025 年から GitHub は
+  `release-assets.githubusercontent.com` へ転送している（2026-10-02 に実物の転送先を見て確かめた）
+  両方を許す（`fetch.py` の `ALLOWED_HOSTS`）
+- 目録の形（`schema` `version` `minimum` `python_abi` `notes_url` `package{url size sha256}`）は契約
+  キーを消したり意味を変えたりしない 足すのは自由（古い版は知らないキーを読み飛ばす）
+  形を大きく変えるときは `minimum` を上げ、古い版には配布のページを案内させる
+- 入れ替えは同じ親の下の改名だけ（`Sashimono` → `Sashimono.previous`、`Sashimono.new` → `Sashimono`）
+  親に書けない場所（`Program Files`）では入れ替えず、配布のページを案内する 既定の置き場は
+  `%LOCALAPPDATA%\Programs\Sashimono`（zip の README に書いてある）
+- 入れ替え係は Windows に入っている PowerShell 5.1 に、`swap.py` の台本を毎回書いて渡す 別の
+  実行ファイルを作らないのは、Python を積んだ物をもう 1 つ配り、それ自身も入れ替える羽目になるため
+  場所は環境変数で渡す（日本語の名前でも化けない） 走り始めた印を見てから本体を終える
+  （台本の実行を止めた会社の機械で、本体だけ消えて誰も起こし直さない、を防ぐ）
+- 新しい版は窓を出したところで印のファイルを書く（`app.py` の `mark_started`） 書かずに落ちたら
+  入れ替え係が数え、2 回続けば `Sashimono.failed` へよけて前の版を起こす 戻した版は次から飛ばす
+- 編集・書き出し・AI の作業・字幕起こしの途中では再起動しない（`MainWindow.update_blockers`）
+  保存していない変更は、閉じるときにいつもどおり尋ねる 取り消されたら入れ替え係も止める
+- 本人の持ち物（設定・スクリプト・テンプレート・入れた実行環境）はフォルダの外にあるので消えない
+  exe の隣の `scripts` に置かれた物は、入れ替える前に新しい版へ写す
+- Python が上がる版（`python_abi` が変わる）では、入れてある字幕起こしと AI 連携の環境が読めなくなる
+  入れる前の確認でそう言い、入れた後は導入先を読まずに「入れ直してください」と出す
+  （`runtime.stale_runtime` 導入先の `.python-abi` に機能ごとの ABI を書いておく） 消しはしない
+- 古い形式のプロジェクトを今の形式で上書きする前に、横へ `名前.sme.bak` を残す
+  （前の版へ戻した人が、上げる前の作品を開けるように）
+- 好みは `Preferences` の `update_check`（起動時に確かめる 既定は入）・`update_beta`
+  （ベータも受け取る 既定は切）・`update_confirm`（入れる前に尋ねる 既定は入 切ると次の起動の頭で入れる）
+  確かめるのを切れば今の版に留まる（〔ヘルプ〕→〔更新を確かめる…〕で手で確かめられる）
+- 配る zip の確かめ（`tools/build_package.py`）は、配布版の exe の中で、使い捨ての鍵と見本の
+  リリースを使って署名・照合・展開・PowerShell の入れ替えまでを通す（自己診断の「自動更新」）
+  ネットワークへは出ない 試験も同じで、取り口は偽物（`MemoryTransport`）
+
 ### 自動更新の署名鍵
 
-自動更新（Issue #36）は β の間は保留 署名鍵も β の間は作らない
-作るときは **GitHub Actions の Secrets にだけ置き、組み立てる手元の機械には置かない**
-（Issue #32 で決めた） 手元に置くと、その機械が乗っ取られたときに偽の更新へ署名できる
-署名は Actions の中で行い、鍵をファイルとして書き出さない
+**Ed25519 の鍵を 2 本**（今使う鍵と予備の鍵）持つ 考え方は minisign と同じで、実装は cryptography
+ソフトに埋め込むのは公開鍵だけ（`src/sashimono/update/signing.py` の `TRUSTED_PUBLIC_KEYS`）
+どちらかで署名が通れば信じる
+
+秘密鍵は**本人がパスワード管理アプリ（原本）とオフラインの控え（USB や紙）に置く** ビルド機・
+リポジトリ・CI には置かない 署名はリリースのときだけ手元で行う
+（前は Actions の Secrets に置くと決めていた（Issue #32）が、workflow を書き換えられる人なら誰でも
+取り出せるので、2026-10 に利用者と決め直した）
+
+鍵を作る（1 度だけ）
+
+```
+.venv\Scripts\python.exe tools\update_keys.py generate --out <鍵を書くフォルダ>
+```
+
+1. 今使う鍵と予備の鍵の合言葉を尋ねられる（12 文字以上 別々にしてよい）
+2. `sashimono-update-current.key` と `sashimono-update-spare.key` ができる 中身は合言葉で包んである
+   （scrypt と AES-256-GCM） 画面に出るのは公開鍵だけ
+3. 出てきた 2 行を `src/sashimono/update/signing.py` の `TRUSTED_PUBLIC_KEYS` に貼り、PR で入れる
+   **貼った版を配るまで、配った版は更新を確かめない**（鍵の無い版は黙って何もしない）
+4. 鍵のファイルを、パスワード管理アプリの添付とオフラインの控えへ移し、書いたフォルダからは消す
+   合言葉もパスワード管理アプリに置く 予備の鍵は普段使わないので、控えだけに置いてもよい
+
+鍵を差し替える（今使う鍵を失くした・漏れたかもしれない）
+
+1. 予備の鍵で署名して出せば、配った版はそのまま受け取る（両方を埋め込んであるため）
+2. その版で `TRUSTED_PUBLIC_KEYS` を差し替える 漏れた鍵を外し、予備の鍵を 1 本目へ、
+   新しく作った鍵（`update_keys.py generate` で作り直し、要る方だけ使う）を 2 本目へ
+3. 差し替えた版を予備の鍵で署名して出す 配った版が受け取った後は、新しい組で回る
+4. 2 本とも失くすと、配った版へ更新を届ける道は無い（手で入れ直してもらう） 控えを 2 か所に置く
+
+公開鍵が手元の鍵と対になっているかは `tools\update_keys.py show <鍵のファイル>` で見る（合言葉は要らない）
+
+### 自動更新のリリース
+
+```
+1. __version__ を上げて main へ入れ、タグ v<版> を打って push する
+2. Actions（.github/workflows/release.yml）がタグと版を照らし、zip を組み立て、リリースの下書きへ上げる
+3. 下書きから zip を落とし、展開して Sashimono.exe --self-check | more で確かめる
+4. 目録を作る    .venv\Scripts\python.exe tools\update_sign.py manifest <zip> [--minimum <版>]
+5. 署名する      .venv\Scripts\python.exe tools\update_sign.py sign update.json --key <鍵のファイル>
+6. 確かめる      .venv\Scripts\python.exe tools\update_sign.py verify update.json
+7. 上げる        gh release upload v<版> update.json update.json.sig
+                 （ソースの添付は上の「リリースにソースを添付する」）
+8. 下書きを公開する（ここで初めて releases/latest/download/… が新しい版を指す）
+```
+
+- **6 が通るまで下書きのままにする** 公開した瞬間に固定の URL が切り替わるので、署名の無い
+  目録を誰かに見せない（署名が無ければ配った版は黙って飛ばすが、その間は誰も受け取れない）
+- workflow は秘密鍵を使わない（`contents: write` だけ） GPU が無いので zip からの確かめ
+  （`--skip-check` で省いている）は 3 で手元で行う
+- 目録は `update_sign.py manifest` が zip の中の `build-info.json` から版と Python を読んで作る
+  手で書き直すと署名が通らなくなる（署名は目録のバイト列そのものに付く） 直すなら作り直す
+- `minimum` は、この版へ自動では上げられない古い版の境 目録の形や入れ替えの手順を変えたときだけ上げる
+
+ベータ
+
+- ベータは `v1.3.0b1` のようなタグで出し、下書きをプレリリースとして公開する
+  （`latest` はプレリリースを飛ばすので、正式版を受け取る人には届かない）
+- ベータの目録は、動かすリリース `beta`（タグ `beta` プレリリース 1 つだけ作っておく）へ上げる
+
+```
+gh release upload beta update.json update.json.sig --clobber
+```
+
+- 正式版を出したら、`beta` にも正式版の目録を上げ直す（直し忘れても、ベータを受け取る人は
+  正式版の目録も読むので、新しい方を受け取る）
 
 ---
 

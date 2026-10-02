@@ -395,6 +395,16 @@ class ChatPanel(QWidget):
             self._session.interrupt()
             self._note("中断しています…")
 
+    @property
+    def working(self) -> bool:
+        """指示に応えている最中か、AI 連携の環境を入れている最中か
+
+        更新のための再起動を断るのに使う 送った直後（Claude Code の起動と接続の数秒）は
+        ``session.busy`` が立っていないので、残っている指示も見る
+        """
+        session = self._session
+        return bool(self._queued) or (session is not None and session.busy) or self._setup.busy
+
     def close_session(self) -> None:
         """会話を畳む ウィンドウを閉じるときに呼ぶ"""
         self._timer.stop()

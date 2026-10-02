@@ -32,6 +32,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import io
+import json
 import locale
 import os
 import re
@@ -52,6 +53,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from sashimono import __version__  # noqa: E402
 from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
+from sashimono.runtime import python_abi  # noqa: E402
+from sashimono.selfcheck import UPDATE_CHECK_NAME  # noqa: E402
+from sashimono.update.package import BUILD_INFO_NAME, write_build_info  # noqa: E402
 
 #: exe と、zip を展開したときのフォルダの名前
 #: 短い名前にする 空白を含むとコマンドから ``--self-check`` を打つときに括りが要る
@@ -242,6 +246,12 @@ README_TEXT = f"""Sashimono Edit {__version__}
 
 起動: Sashimono.exe
 
+置き場: %LOCALAPPDATA%\\Programs\\Sashimono へ展開するのがおすすめです 新しい版が出ると、
+ソフトが自分で落として確かめ、尋ねてから入れ替えます（〔表示〕→〔設定…〕で切れます）
+Program Files のように管理者でないと書けない場所では、自動では入れ替えられません
+入れ替えはこのフォルダを丸ごと替えるので、このフォルダの中に自分の物を置かないでください
+（設定・スクリプト・テンプレート・入れた実行環境は、別の場所に置かれていて消えません）
+
 AviUtl のスクリプト（.anm2 .obj2 など）は、ソフトの〔互換〕→〔スクリプトフォルダを開く〕で
 開くフォルダ（%APPDATA%\\Sashimono\\scripts）へ置けば読み込まれます AviUtl2 が入って
 いれば、そちらの Script フォルダも読みます
@@ -343,6 +353,9 @@ def assemble(bundle: Path) -> None:
     (bundle / "README.txt").write_text(README_TEXT, encoding="utf-8")
     shutil.copyfile(ROOT / "LICENSE", bundle / "LICENSE.txt")
     shutil.copyfile(NOTICES_SOURCE, bundle / NOTICES_NAME)
+    # 自動更新が、落として展開した物が目録の言う版と Python かを確かめるのに読む
+    # 組み立てた Python の印を書く 配った版の中の Python と同じ物
+    write_build_info(bundle, __version__, python_abi())
     for relative in repository_license_files():
         destination = bundle / LICENSES_DIR / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -608,6 +621,8 @@ def native_license_problems(internal: Path) -> list[str]:
 #: 組み立ての記録に載らないが、zip に入れてよい物（:func:`assemble` と
 #: :func:`collect_licenses` が置く物）
 ASSEMBLED = ("README.txt", "LICENSE.txt", NOTICES_NAME)
+#: 使用許諾ではないが :func:`assemble` が置く物（使用許諾の照合には混ぜない）
+ASSEMBLED_INFO = (BUILD_INFO_NAME,)
 ASSEMBLED_FOLDERS = (PORTABLE_SCRIPTS_DIR, LICENSES_DIR)
 
 
@@ -629,7 +644,10 @@ def untracked_files(bundle: Path, record: Path) -> list[str]:
         if not path.is_file():
             continue
         relative = path.relative_to(bundle)
-        if relative.parts[0] in ASSEMBLED_FOLDERS or relative.as_posix() in ASSEMBLED:
+        if (
+            relative.parts[0] in ASSEMBLED_FOLDERS
+            or relative.as_posix() in ASSEMBLED + ASSEMBLED_INFO
+        ):
             continue
         inner = (
             PurePosixPath(*relative.parts[1:]).as_posix()
@@ -817,6 +835,7 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         beside = f"{home / PORTABLE_SCRIPTS_DIR}（1 本）"
         if beside not in checked.stdout:
             failures.append("exe の隣の置き場に置いたスクリプトが読まれていない")
+        failures += update_failures(home, checked.stdout)
 
         failures += runtime_import_failures(executable, folder)
 
@@ -838,6 +857,27 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         for failure in failures:
             print(f"[NG] {failure}")
         return 1 if failures else 0
+
+
+def update_failures(home: Path, self_check_output: str) -> list[str]:
+    """展開した zip で、自動更新の部品が動くか ネットワークへは出ない
+
+    - 自己診断の「自動更新」の項目が通った（使い捨ての鍵と見本のリリースで、署名・照合・
+      展開・PowerShell の入れ替えまでを配布版の exe の中で通す）
+    - zip に版と Python の書き付けが入っていて、この版と同じ 無いと、配った版がこの zip を
+      新しい版として受け取れない（展開した物を確かめる所で止まる）
+    """
+    failures = []
+    if f"[ok] {UPDATE_CHECK_NAME}:" not in self_check_output:
+        failures.append("自動更新の部品が配布版の中で動かない（自己診断の項目が通らない）")
+    try:
+        written = json.loads((home / BUILD_INFO_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        written = None
+    expected = {"version": __version__, "python_abi": python_abi()}
+    if written != expected:
+        failures.append(f"{BUILD_INFO_NAME} が無いか違う（{written} / {expected}）")
+    return failures
 
 
 def runtime_import_failures(executable: Path, folder: str) -> list[str]:

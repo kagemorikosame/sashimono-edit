@@ -96,6 +96,14 @@ def _start_editor(arguments: list[str]) -> int:
         # 窓の無い配布版では誰も読まないが、コマンドから起動した人と開発者には手掛かりになる
         print(f"置き場の引き継ぎ: {note.action} {note.source} → {note.target} {note.detail}")
 
+    # 次の起動で入れると決めた新しい版があれば、編集画面を出す前に入れ替え係へ任せて終わる
+    # 入れ替え係が新しい版を起こし直す 画面を出してからだと、開いた作品を閉じさせることになる
+    # 配布版だけ（開発の環境では置き場が無いので何もしない）
+    from sashimono.update.flow import apply_on_start
+
+    if apply_on_start(arguments):
+        return 0
+
     # ソフト内から導入した字幕起こしの実行環境を import できるようにする
     # 通常の実行では何もしない（パッケージ版のためだけの手当て）
     activate_runtime()
@@ -110,6 +118,8 @@ def _start_editor(arguments: list[str]) -> int:
     from sashimono.ui.main_window import MainWindow
     from sashimono.ui.theme import STYLE_SHEET
     from sashimono.ui.translation import install_qt_translation
+    from sashimono.ui.updates import STARTUP_DELAY_MS
+    from sashimono.update.swap import mark_started
 
     # サーフェス形式は QApplication を作る前に決めておく必要がある
     # 後から設定しても、ウィジェットのコンテキストには反映されない
@@ -133,8 +143,13 @@ def _start_editor(arguments: list[str]) -> int:
 
     window = MainWindow(project, path=path)
     window.show()
+    # 窓を出せたことを入れ替え係へ知らせる 知らせないと、入れたばかりの版が起動できなかった
+    # ものとして前の版へ戻される（入れ替え係が起こしたときだけ書く）
+    QTimer.singleShot(0, mark_started)
     # 窓が描かれてから尋ねる 先に尋ねると、何のソフトの話かが分からない
     QTimer.singleShot(0, window.offer_recovery)
+    # 新しい版を確かめるのは、起動が落ち着いてから 起動を待たせない
+    QTimer.singleShot(STARTUP_DELAY_MS, window.start_updates)
     return application.exec()
 
 
