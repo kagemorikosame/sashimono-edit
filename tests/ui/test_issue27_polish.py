@@ -66,7 +66,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.snapshot import render_snapshot, snapshot_frame, snapshot_name, write_png
-from sashimono.ui.theme import STYLE_SHEET, Colors
+from sashimono.ui.theme import Colors, style_sheet
 from sashimono.ui.translation import install_qt_translation
 from sashimono.ui.workspace import (
     DOCK_TABS_BOTTOM,
@@ -185,7 +185,7 @@ class TestToolTip:
         try:
             qt_application.setPalette(dark)
             QToolTip.setPalette(dark)
-            qt_application.setStyleSheet(STYLE_SHEET)
+            qt_application.setStyleSheet(style_sheet())
             anchor = QPushButton("x")
             anchor.show()
             QToolTip.showText(QPoint(10, 10), "再生 / 停止 (Space)", anchor)

@@ -1,0 +1,28 @@
+# Discussions の「質問」（スラッグ q-a 最初からある Q&A のカテゴリ）の書き込み欄
+# ファイルの名前はカテゴリのスラッグと同じにする 違うと GitHub は欄を出さず、白紙の書き込みになる
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        使い方の質問、不具合か要望かはっきりしないことはここへどうぞ
+        答えが付いたら「Mark as answer」で印を付けてもらえると、同じことで困った人が見つけやすくなります
+
+        - 使い方の説明は [README の主な操作](https://github.com/kagemorikosame/sashimono-edit#主な操作) にもあります
+        - 明らかに動かない・落ちるときは [不具合の報告](https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=bug-reports) の方が、版や手順の欄があって早く片付きます
+
+  - type: input
+    id: version
+    attributes:
+      label: Sashimono Edit の版
+      description: 〔ヘルプ〕→〔バージョン情報…〕の 1 行目 分からなければ空のままで構いません
+      placeholder: 0.1.0
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 知りたいこと
+      description: 何をしようとしていて、どこで分からなくなったか 画面写真も貼れます
+      placeholder: 例）字幕だけを別のファイルに書き出したいが、どこから出せるのか分からない
+    validations:
+      required: true

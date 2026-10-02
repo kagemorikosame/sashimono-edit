@@ -23,9 +23,6 @@ LIST_ICON_SIZE = QSize(64, 36)
 #: アイコン表示の絵の大きさ サムネイルの元の高さ（72）と同じにして、拡大でぼかさない
 GRID_ICON_SIZE = QSize(128, 72)
 
-#: 絵の周りの地の色 映像の黒と見分けが付くよう、真っ黒より少し上げる
-_BACKDROP = QColor("#111114")
-
 
 def thumbnail_icon(tile: np.ndarray) -> QIcon:
     """RGBA の 1 コマ（``(高さ, 幅, 4)``）を、縦横比を保って 16:9 の枠へ収めた絵にする
@@ -42,7 +39,7 @@ def thumbnail_icon(tile: np.ndarray) -> QIcon:
     canvas = _canvas(GRID_ICON_SIZE)
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    painter.fillRect(canvas.rect(), _BACKDROP)
+    painter.fillRect(canvas.rect(), Colors.MEDIA_BACKDROP)
     scaled = image.scaled(
         GRID_ICON_SIZE,
         Qt.AspectRatioMode.KeepAspectRatio,

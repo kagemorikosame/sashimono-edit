@@ -68,7 +68,7 @@ from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
 from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog, JetCutDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["SubtitlePanel", "ask_subtitle_range"]
 
@@ -195,7 +195,7 @@ class SubtitlePanel(QWidget):
         header.sectionResized.connect(self._on_section_resized)
 
         self._empty = QLabel("音声を持つ素材を選んでください", self)
-        self._empty.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; padding: 8px;")
+        themed_style(self._empty, lambda: f"color: {Colors.TEXT_MUTED.name()}; padding: 8px;")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -204,6 +204,21 @@ class SubtitlePanel(QWidget):
         layout.addLayout(actions)
         layout.addWidget(self._empty)
         layout.addWidget(self._table, 1)
+        theme_signals().changed.connect(self._recolor_rows)
+
+    def _recolor_rows(self) -> None:
+        """テーマが変わった タイムラインに出ていない字幕の時刻を今の薄い色で塗り直す
+
+        行の文字の色は行を作った時点の色で持つので、塗り直さないと前のテーマの色が残る
+        """
+        self._updating = True
+        try:
+            for row, (_, start, _end) in enumerate(self._rows):
+                item = self._table.item(row, 0)
+                if item is not None and start < 0:
+                    item.setForeground(Colors.TEXT_MUTED)
+        finally:
+            self._updating = False
 
     def _button(self, text: str, slot: object) -> QPushButton:
         button = QPushButton(text, self)

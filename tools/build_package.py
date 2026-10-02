@@ -52,6 +52,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from sashimono import __version__  # noqa: E402
 from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
+from sashimono.links import REPORT_URL  # noqa: E402
 
 #: exe と、zip を展開したときのフォルダの名前
 #: 短い名前にする 空白を含むとコマンドから ``--self-check`` を打つときに括りが要る
@@ -256,6 +257,11 @@ AviUtl のスクリプト（.anm2 .obj2 など）は、ソフトの〔互換〕�
 
 字幕起こしと AI 連携は、ソフトの中のボタンから必要になったときに入れます
 （最初から入れると 2 GB を超えるため）
+
+不具合・要望・使い方の質問は、ソフトの〔ヘルプ〕→〔不具合・要望を送る〕か次から送れます
+上の自己診断の結果も一緒に貼ってもらえると助かります
+
+    {REPORT_URL}
 
 使用許諾: Sashimono 本体は MIT（LICENSE.txt） 一緒に入れている部品に GPL の物が
 あるため、この zip は全体として GPL の条件で配っています 部品ごとの使用許諾と

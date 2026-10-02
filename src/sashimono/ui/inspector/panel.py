@@ -89,7 +89,7 @@ from sashimono.engine.gpu import BlendMode
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
 from sashimono.ui.preview_handles import ALIGNMENTS
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.timeline.add_menu import effects_for_clip
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
@@ -1217,14 +1217,28 @@ def _heading(text: str) -> QLabel:
     """足したエフェクトの一覧の見出し（YMM4 の「映像エフェクト」「音声エフェクト」）"""
     label = QLabel(text)
     label.setObjectName("effects_heading")
-    label.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; font-weight: bold;")
+    themed_style(label, lambda: f"color: {Colors.TEXT_MUTED.name()}; font-weight: bold;")
     return label
 
 
+class _LockLabel(QLabel):
+    """鍵の印 印は文字の色で描いた絵なので、テーマが変わったら描き直す
+
+    描き直さないと、暗いテーマの白に近い鍵が明るい地の上で見えなくなる
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redraw()
+        theme_signals().changed.connect(self.redraw)
+
+    def redraw(self) -> None:
+        self.setPixmap(lock_pixmap(self.devicePixelRatioF()))
+
+
 def _lock_label() -> QLabel:
-    lock = QLabel()
+    lock = _LockLabel()
     lock.setObjectName("fixed_lock")
-    lock.setPixmap(lock_pixmap(lock.devicePixelRatioF()))
     lock.setAccessibleName("固定の項目")
     lock.setToolTip(
         "クリップが最初から持つ項目です 外すことと並べ替えはできません"
@@ -1303,9 +1317,12 @@ class _Section(QFrame):
         #: 見出しの言葉 組の並び（描画 → 中身 → 動画・音声 → エフェクト）を試験で見る
         self.heading = title
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            f"QFrame {{ background-color: {Colors.PANEL.name()};"
-            f" border: 1px solid {Colors.BORDER.name()}; border-radius: 4px; }}"
+        themed_style(
+            self,
+            lambda: (
+                f"QFrame {{ background-color: {Colors.PANEL.name()};"
+                f" border: 1px solid {Colors.BORDER.name()}; border-radius: 4px; }}"
+            ),
         )
 
         self._grid = QGridLayout(self)
@@ -1318,7 +1335,9 @@ class _Section(QFrame):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         label = QLabel(title)
-        label.setStyleSheet(f"color: {Colors.TEXT.name()}; font-weight: bold; border: none;")
+        themed_style(
+            label, lambda: f"color: {Colors.TEXT.name()}; font-weight: bold; border: none;"
+        )
         header.addWidget(label)
         header.addStretch(1)
         self._header = header
@@ -1355,7 +1374,7 @@ class _Section(QFrame):
     ) -> None:
         """1 行足す ``reset`` を渡すと、名前のダブルクリックで初期値へ戻す"""
         text = _RowLabel(label, reset)
-        text.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; border: none;")
+        themed_style(text, lambda: f"color: {Colors.TEXT_MUTED.name()}; border: none;")
         text.setFixedWidth(96)
         text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
@@ -1368,7 +1387,7 @@ class _Section(QFrame):
     def add_note(self, message: str) -> None:
         note = QLabel(message)
         note.setWordWrap(True)
-        note.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; border: none;")
+        themed_style(note, lambda: f"color: {Colors.TEXT_MUTED.name()}; border: none;")
         self._grid.addWidget(note, self._row, 0, 1, 3)
         self._row += 1
 
@@ -1505,7 +1524,7 @@ class KeyframeControls(QWidget):
         here = local in frames
         self.toggle.setText("◆" if here else "◇")
         colour = Colors.ACCENT if frames else Colors.TEXT_MUTED
-        self.toggle.setStyleSheet(_key_style(colour))
+        themed_style(self.toggle, lambda: _key_style(colour))
         self.toggle.setEnabled(inside)
         if not inside:
             tip = "再生位置がクリップの外なので打てません"
@@ -1517,7 +1536,7 @@ class KeyframeControls(QWidget):
             tip = "再生位置にキーを打つ 打つとこの値が時間で動くようになる"
         self.toggle.setToolTip(tip)
         for button in (self.previous, self.next):
-            button.setStyleSheet(_key_style(Colors.TEXT))
+            themed_style(button, lambda: _key_style(Colors.TEXT))
         self.previous.setEnabled(any(f < local for f in frames))
         self.next.setEnabled(any(f > local for f in frames))
 

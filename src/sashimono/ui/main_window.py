@@ -133,7 +133,7 @@ from sashimono.ui.progress_display import (
 )
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.subtitle import SubtitlePanel
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
 from sashimono.ui.timeline.view import HEIGHT_STEP
@@ -437,10 +437,10 @@ class MainWindow(QMainWindow):
             )
             notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
             notice.setWordWrap(True)
-            notice.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+            themed_style(notice, lambda: f"color: {Colors.TEXT_MUTED.name()};")
             viewer_layout.addWidget(notice, 1)
         viewer_layout.addWidget(self._transport)
-        viewer.setStyleSheet(f"background-color: {Colors.VIEWER_BACKGROUND.name()};")
+        themed_style(viewer, lambda: f"background-color: {Colors.VIEWER_BACKGROUND.name()};")
         self.setCentralWidget(viewer)
 
         pool_dock = self._dock("メディア", "media")
@@ -780,6 +780,7 @@ class MainWindow(QMainWindow):
         # 何が変わっても作り直すと、画質の設定を触っただけで進行中の変換が止まる
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
+        previous = self._preferences
         self._preferences = preferences
         try:
             PreferenceStore().save(preferences)
@@ -803,6 +804,11 @@ class MainWindow(QMainWindow):
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         apply_dock_tabs(self, preferences.dock_tabs)
+        application = QApplication.instance()
+        if isinstance(application, QApplication) and preferences.theme != previous.theme:
+            # 変えたときだけ当てる 当てるとアプリ全体のスタイルシートを作り直して全部の
+            # 部品を描き直すので、ほかの設定を触っただけで画面がちらつく
+            apply_theme(application, preferences.theme)
         self._preview.set_proxies(self._proxies.store if preferences.use_proxy else None)
         self._preview.set_prefetch_bytes(preferences.prefetch_bytes())
         self._preview.set_prefetch_thread(preferences.prefetch_thread)

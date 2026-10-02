@@ -42,12 +42,12 @@ from PySide6.QtWidgets import QApplication
 from sashimono.core.model import Project
 from sashimono.engine.gpu import preferred_surface_format
 from sashimono.ui.main_window import MainWindow
-from sashimono.ui.theme import STYLE_SHEET
+from sashimono.ui.theme import style_sheet
 from sashimono.ui.translation import install_qt_translation
 
 QSurfaceFormat.setDefaultFormat(preferred_surface_format())
 application = QApplication(sys.argv[:1])
-application.setStyleSheet(STYLE_SHEET)
+application.setStyleSheet(style_sheet())
 install_qt_translation(application)
 
 for _ in range(3):

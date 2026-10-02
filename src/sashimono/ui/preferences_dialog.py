@@ -41,6 +41,7 @@ from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
+from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
@@ -303,6 +304,17 @@ class PreferencesDialog(QDialog):
             "重ねたパネルを切り替えるタブをどちらの辺に出すか"
         )
         form.addRow("重ねたパネルのタブ", self._dock_tabs)
+        self._theme = QComboBox(self)
+        for value, text in THEME_CHOICES:
+            self._theme.addItem(text, value)
+        self._theme.setCurrentIndex(max(0, self._theme.findData(preferences.theme)))
+        self._theme.setToolTip(
+            "画面の色 OK を押すとその場で切り替わる（再起動は要らない） "
+            "「Windows の設定に合わせる」は、Windows の 設定 → 個人用設定 → 色 の"
+            "アプリの明るい・暗い（アプリ モード）に合わせ、変えたときも付いていく "
+            "プレビューの絵そのもの（書き出す色）はテーマで変わらない"
+        )
+        form.addRow("画面の色（テーマ）", self._theme)
         self._preview_handles = QCheckBox("プレビューで外枠を出して直接動かす", self)
         self._preview_handles.setChecked(preferences.preview_handles)
         self._preview_handles.setToolTip(
@@ -520,4 +532,5 @@ class PreferencesDialog(QDialog):
             preview_snap=self._preview_snap.isChecked(),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
+            theme=str(self._theme.currentData()),
         )

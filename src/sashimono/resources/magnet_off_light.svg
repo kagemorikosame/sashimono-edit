@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 明るいテーマで磁石が切のときの印 入の印と同じ形を灰色で 明るい地との差が残る濃さにする -->
+  <path d="M5 3 H9 V12 A3 3 0 0 0 15 12 V3 H19 V12 A7 7 0 0 1 5 12 Z" fill="#a6a6ae"/>
+  <rect x="5" y="3" width="4" height="4" fill="#74747d"/>
+  <rect x="15" y="3" width="4" height="4" fill="#74747d"/>
+</svg>

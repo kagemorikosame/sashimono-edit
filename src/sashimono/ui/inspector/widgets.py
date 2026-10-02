@@ -42,7 +42,7 @@ from sashimono.effects import (
     TrackSpec,
     ValueSpec,
 )
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["ParameterEditor", "create_editor"]
 
@@ -434,10 +434,9 @@ class ColorEditor(ParameterEditor):
         # 明るい色の上に黒、暗い色の上に白を置く どちらか一方だと必ず読めなくなる
         luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
         text = "#000000" if luminance > 140 else "#ffffff"
-        self._button.setStyleSheet(
-            f"background-color: rgba({red}, {green}, {blue}, {alpha});"
-            f"color: {text}; border: 1px solid {Colors.BORDER.name()};"
-        )
+        # 地と文字は選んだ色で決まり、枠だけテーマで変わる
+        swatch = f"background-color: rgba({red}, {green}, {blue}, {alpha}); color: {text};"
+        themed_style(self._button, lambda: f"{swatch} border: 1px solid {Colors.BORDER.name()};")
         self._button.setText(f"#{red:02X}{green:02X}{blue:02X}")
 
     def _choose(self) -> None:

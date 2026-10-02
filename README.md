@@ -403,7 +403,9 @@ python -m venv .venv
 | 書き出し | Ctrl+E |
 | 使い方を開く（〔ヘルプ〕→〔使い方〕） | F1 |
 
-不具合や要望は〔ヘルプ〕→〔不具合・要望を送る〕から送れます 版と置き場は〔ヘルプ〕→〔バージョン情報…〕に出ます
+不具合や要望、使い方の質問は〔ヘルプ〕→〔不具合・要望を送る〕から [Discussions](../../discussions) へ送れます
+「不具合の報告」「互換（AviUtl／YMM4）の報告」「要望」「質問」のカテゴリを選ぶと、版や再現手順の欄が出ます
+版と置き場は〔ヘルプ〕→〔バージョン情報…〕に出ます Issue は開発者が直す作業を管理する置き場で、報告は Discussions で確かめてから Issue に起こします
 
 ## 開発
 
@@ -423,7 +425,8 @@ ruff・mypy・pytest をまとめて走らせます **CI もこれと同じも�
 |---|---|
 | 開発ルール | [docs/development.md](docs/development.md) |
 | PR の送り方 | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| 不具合・要望 | [Issue](../../issues/new/choose) |
+| 不具合・要望・質問 | [Discussions](../../discussions/new/choose) |
+| 開発の作業 | [Issue](../../issues)（報告を確かめたあと開発者が起こす） |
 
 PR は**フェーズ単位**で、CodeRabbit・Copilot・Sourcery・Codex の 4 つの AI にレビューを頼みます（頼み方は [docs/development.md](docs/development.md)）
 
@@ -452,3 +455,12 @@ PR は**フェーズ単位**で、CodeRabbit・Copilot・Sourcery・Codex の 4 
 いま扱うのは **SDR の sRGB / Rec.709 だけ**です HDR（PQ / HLG）と広色域（Rec.2020・
 Display P3 など）は対象外で、今後の課題です そうした素材を読み込んでも、色を正しく
 写すことは約束しません
+
+| | |
+|---|---|
+| 書き出し | H.264・8 ビット（yuv420p） **BT.709・リミテッドレンジ**で変換し、同じ値の色の印（原色・伝達特性・行列 bt709、範囲 tv）を書きます |
+| 読み込み | 素材の色の印（行列と範囲）に従います 印の無い素材は、HD 以上を BT.709、SD を BT.601 とみなします |
+| HDR・10 ビットの素材 | 見分けず、SDR の 8 ビットとして出します（HDR は白っぽく褪せて見えます） |
+| 写真の ICC プロファイル | 読みません sRGB とみなします |
+
+詳しくは [docs/development.md](docs/development.md) の「色の範囲」にあります

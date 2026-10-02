@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 
 from sashimono.core.model import ProjectSettings
 from sashimono.ui.project_settings_dialog import ProjectSettingsDialog
-from sashimono.ui.theme import STYLE_SHEET, Colors
+from sashimono.ui.theme import Colors, style_sheet
 
 
 def _contrast(first: QColor, second: QColor) -> float:
@@ -75,7 +75,7 @@ class TestTabs:
     def tabs(self, qt_application: QApplication) -> Iterator[QTabWidget]:
         del qt_application
         host = QWidget()
-        host.setStyleSheet(STYLE_SHEET)
+        host.setStyleSheet(style_sheet())
         widget = QTabWidget(host)
         widget.addTab(QLabel("中身"), "メディア")
         widget.addTab(QLabel("中身"), "字幕")
@@ -130,7 +130,7 @@ class TestTabs:
         # QMainWindow なので、ここで確かめたい決まりは同じ
         del qt_application
         window = QMainWindow()
-        window.setStyleSheet(STYLE_SHEET)
+        window.setStyleSheet(style_sheet())
         window.setCentralWidget(QLabel("中央"))
         docks = [QDockWidget(title, window) for title in ("メディア", "字幕")]
         for dock in docks:
@@ -209,7 +209,7 @@ class TestSpinButtons:
         # しか空けずに広がり、上のボタンが数字の欄の下に隠れていた 押しても数字の欄が
         # 受け取るので、上だけ数が変わらなかった（Issue #27）
         dialog = ProjectSettingsDialog(ProjectSettings(), new=True)
-        dialog.setStyleSheet(STYLE_SHEET)
+        dialog.setStyleSheet(style_sheet())
         dialog.show()
         QApplication.processEvents()
         try:
@@ -228,7 +228,7 @@ class TestSpinButtons:
         # 数字の欄がボタンに掛かると、掛かった所を押しても増えも減りもしない
         # 小数の数値欄（設定パネルの音量など）も同じ決まりで並ぶ
         host = QWidget()
-        host.setStyleSheet(STYLE_SHEET)
+        host.setStyleSheet(style_sheet())
         layout = QVBoxLayout(host)
         spins: list[QSpinBox | QDoubleSpinBox] = [QSpinBox(host), QDoubleSpinBox(host)]
         for spin in spins:

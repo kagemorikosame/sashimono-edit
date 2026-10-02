@@ -31,6 +31,7 @@ from sashimono.ui.media_icons import (
     pending_icon,
     thumbnail_icon,
 )
+from sashimono.ui.theme import theme_signals
 
 __all__ = [
     "MEDIA_MIME",
@@ -129,6 +130,7 @@ class MediaPoolWidget(QWidget):
         self._icons: dict[MediaId, tuple[Path, QIcon]] = {}
         self._audio_icon = audio_icon()
         self._pending_icon = pending_icon()
+        theme_signals().changed.connect(self._redraw_icons)
 
         self._list = _MediaList(self)
         # 引いていけるのは外（タイムライン）だけ 一覧の中で並べ替えられると、
@@ -255,6 +257,17 @@ class MediaPoolWidget(QWidget):
         )
         self._list.setDragEnabled(True)
         self._list.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+
+    def _redraw_icons(self) -> None:
+        """テーマが変わった 印とサムネイルの周りの地を今の色で描き直す
+
+        絵はできた時点の色で焼き込んであり、描き直すだけでは前のテーマのまま残る
+        """
+        self._audio_icon = audio_icon()
+        self._pending_icon = pending_icon()
+        self._icons = {}
+        for item, media in self._rows():
+            item.setIcon(self._icon_for(media))
 
     def _icon_for(self, media: MediaItem) -> QIcon:
         cached = self._icons.get(media.id)

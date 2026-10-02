@@ -27,6 +27,7 @@ from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.media_match import MATCH_ASK, MATCH_MODES
 from sashimono.ui.media_pool import VIEW_LIST, VIEW_MODES
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_AT_PLAYHEAD, KEYFRAME_DRAG_MODES
+from sashimono.ui.theme import THEME_DARK, THEME_MODES
 
 __all__ = [
     "AUTO_QUALITY_HEIGHT",
@@ -308,6 +309,12 @@ class Preferences:
     #: 1 本にまとめると 2 本目以降の音がタイムラインのどこにも無く、鳴らす手段に気付けない
     #: レイヤーが増えるのを嫌う人・YMM4 のように 1 本で持ちたい人は切り替えられる
     media_split: str = MEDIA_SPLIT
+    #: 画面の色 暗い（``dark``）・明るい（``light``）・Windows の設定に合わせる（``system``）
+    #: 既定は暗い 明るいテーマを足す前からの見た目で、映像の色を見る作業では周りが暗い方が
+    #: 目が明るさに慣れない 明るい部屋で使う人・暗い画面の文字が読みにくい人は切り替えられる
+    #: 「合わせる」を既定にしないのは、Windows を明るくしている人の画面が、版を上げた
+    #: だけで黙って明るくなるため
+    theme: str = THEME_DARK
 
     @property
     def splits_media(self) -> bool:
@@ -398,6 +405,7 @@ class PreferenceStore:
                 MEDIA_SPLIT_MODES,
                 _LEGACY_MULTI_AUDIO.get(str(data.get("multi_audio")), plain.media_split),
             ),
+            theme=_choice(data.get("theme"), THEME_MODES, plain.theme),
         )
 
     def save(self, preferences: Preferences) -> None:

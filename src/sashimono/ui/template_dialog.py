@@ -43,7 +43,7 @@ from sashimono.compat.catalog import (
 from sashimono.compat.mapped import MappedObject
 from sashimono.ui.report_masking import marked_root_labels, mask_report, root_lines
 from sashimono.ui.system_clipboard import clipboard
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["TemplateDialog", "notes_text"]
 
@@ -135,11 +135,11 @@ class TemplateDialog(QDialog):
         self._preview = QLabel(self)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumSize(*_PREVIEW)
-        self._preview.setStyleSheet(f"background: {Colors.VIEWER_BACKGROUND.name()};")
+        themed_style(self._preview, lambda: f"background: {Colors.VIEWER_BACKGROUND.name()};")
 
         self._detail = QLabel(self)
         self._detail.setWordWrap(True)
-        self._detail.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._detail, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._notes = QListWidget(self)
         self._notes.setMaximumHeight(90)

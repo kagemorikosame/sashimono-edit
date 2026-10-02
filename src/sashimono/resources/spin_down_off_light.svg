@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 7" width="10" height="7">
+  <desc>数値欄の増減ボタンの矢印 下向き（明るいテーマで押せないとき）</desc>
+  <polygon points="1,1 9,1 5,6" fill="#a2a2ab"/>
+</svg>
