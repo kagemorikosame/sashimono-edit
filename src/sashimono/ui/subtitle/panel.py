@@ -615,10 +615,11 @@ class SubtitlePanel(QWidget):
             self._service = TranscriptionService(default_backend())
 
         dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
-        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
-        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
         dialog.deleteLater()
-        if dialog.exec() and dialog.transcript is not None:
+        if answer and dialog.transcript is not None:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript, stream=dialog.chosen_stream)],
                 f"字幕を起こす: {media.name}",
@@ -718,10 +719,11 @@ class SubtitlePanel(QWidget):
         if media is None or transcript is None:
             return
         dialog = CleanupDialog(transcript, self)
-        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
-        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
         dialog.deleteLater()
-        if dialog.exec():
+        if answer:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
                 "字幕を整形",
@@ -746,10 +748,11 @@ class SubtitlePanel(QWidget):
             estimate=estimate,
             parent=self,
         )
-        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
-        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
         dialog.deleteLater()
-        if not dialog.exec():
+        if not answer:
             return
 
         ranges = self._plan(media, dialog.options(), dialog.keep_speech)
@@ -810,10 +813,11 @@ class SubtitlePanel(QWidget):
 
     def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
         dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
-        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
-        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
         dialog.deleteLater()
-        if not dialog.exec():
+        if not answer:
             return None
         return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
 
@@ -870,9 +874,6 @@ def ask_subtitle_range(parent: QWidget | None, project: Project) -> str | None:
     rate = project.settings.frame_rate
     start, end = area
     box = QMessageBox(parent)
-    # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
-    # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
-    box.deleteLater()
     box.setIcon(QMessageBox.Icon.Question)
     box.setWindowTitle("字幕を書き出す")
     box.setText(
@@ -888,6 +889,9 @@ def ask_subtitle_range(parent: QWidget | None, project: Project) -> str | None:
     box.addButton(QMessageBox.StandardButton.Cancel)
     box.setDefaultButton(in_range)
     box.exec()
+    # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+    # この後で結果を読む間は残る
+    box.deleteLater()
     clicked = box.clickedButton()
     if clicked is in_range:
         return RANGE_WORK_AREA

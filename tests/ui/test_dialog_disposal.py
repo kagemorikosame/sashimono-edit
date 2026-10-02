@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog
 
@@ -60,6 +60,29 @@ def test_opening_and_closing_does_not_pile_up(
     # 窓が本当に開いたこと 開いていなければ、残らないのは当たり前で何も言えない
     assert opened == set(dialogs)
     assert window.findChildren(QDialog) == []
+
+
+def test_a_dialog_lives_through_its_own_exec(window: MainWindow) -> None:
+    """捨てる頼み（deleteLater）で、開いている最中の窓が消えないこと
+
+    頼みは、頼んだイベントループへ戻ったときに果たされる メインのループが回る前
+    （段 0）に exec の前で頼むと、窓自身の exec のループで果たされ、開いた途端に窓が
+    消えていた（手元で確かめた） 頼むのは exec から戻った後にする 試験はメインの
+    ループを回さずに呼ぶので、段 0 の形をそのまま見られる
+    """
+    seen: list[bool] = []
+
+    def inside() -> None:
+        dialog = QApplication.activeModalWidget()
+        seen.append(isinstance(dialog, PreferencesDialog))
+        if dialog is not None:
+            dialog.close()
+
+    QTimer.singleShot(100, inside)
+    window.edit_preferences()
+    assert seen == [True]
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    assert window.findChildren(PreferencesDialog) == []
 
 
 class _Worker:

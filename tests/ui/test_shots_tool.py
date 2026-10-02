@@ -212,6 +212,39 @@ class TestTranscribeShot:
             dialog.deleteLater()
 
 
+class TestDefaultWorkFolder:
+    """``--work`` を渡さないときの作業用のフォルダの置き場
+
+    標準の利用者はシステムのドライブの根に書けない 根だけを既定にしていると、
+    引数なしの撮影が権限の誤りで止まる
+    """
+
+    def test_the_drive_root_comes_first(
+        self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 根はどのフォルダの名前も含まないので、書けるならそこを使う
+        monkeypatch.setattr(shots, "_writable", lambda folder: True)
+        chosen = shots.work_folder_base(None, tmp_path / "ホーム")
+        assert chosen == Path(shots.ROOT.anchor).resolve()
+
+    def test_an_unwritable_root_falls_back_into_the_repository(
+        self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = Path(shots.ROOT.anchor).resolve()
+        monkeypatch.setattr(shots, "_writable", lambda folder: folder != root)
+        chosen = shots.work_folder_base(None, tmp_path / "ホーム")
+        assert chosen == (shots.ROOT / ".work" / "shots").resolve()
+
+    def test_a_repository_in_the_home_is_not_used(
+        self, shots: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 書けても、ホームの下は使わない 使える所が無ければ --work を求めて止める
+        root = Path(shots.ROOT.anchor).resolve()
+        monkeypatch.setattr(shots, "_writable", lambda folder: folder != root)
+        with pytest.raises(shots.ShotError, match="--work"):
+            shots.work_folder_base(None, shots.ROOT.resolve())
+
+
 class TestIsolation:
     def test_every_folder_the_app_reads_is_redirected(
         self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

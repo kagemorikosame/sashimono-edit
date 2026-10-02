@@ -1284,8 +1284,40 @@ def wiki_template_placed(context: Context) -> QImage:
 
 
 def wiki_template_restyle(context: Context) -> QImage:
-    """自分で打った字幕を選んでから棚を開き、〔選択中のクリップに適用〕"""
-    return _grab_dialog(_shelf(context, SAMPLE_ALIAS_NAME), marks=("選択中のクリップに適用",))
+    """自分で打った字幕を選んだ編集画面から棚を開き、〔選択中のクリップに適用〕
+
+    手順の前提（着せる字幕を先に選ぶ）が写るよう、字幕を選んだ編集画面の上に棚を
+    重ねる 棚だけを撮ると、何に着せるのかが絵から分からない
+    """
+    with editor(sample_project(*FULL_HD)) as window:
+        text = TEXT.create(text="自分で打った字幕です", size=72, pos_y=-380)
+        window.apply_commands(_place_text(window, text, at_frame=0, duration=150), "テキストを追加")
+        clip = top_text_clip(window)
+        window.select_clip(clip)
+        window.seek(10)
+        settle(window)
+        image = take_editor_shot(window)
+        shelf = _grab_dialog(_shelf(context, SAMPLE_ALIAS_NAME), marks=("選択中のクリップに適用",))
+        # 棚は右上に重ねる 真ん中に置くと、選んだ字幕のクリップ（タイムラインの左）が
+        # 隠れて、何を選んでから開いたのかが写らない
+        origin = QPoint(image.width() - shelf.width() - 12, 40)
+        _shade(image)
+        place = QRect(origin, shelf.size())
+        paste(image, place, shelf)
+        # 窓の縁を引く 地の色が編集画面と同じなので、引かないと境目が分からない
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor(150, 150, 160), 1))
+        painter.drawRect(place.adjusted(-1, -1, 0, 0))
+        painter.end()
+        return image
+
+
+def _shade(image: QImage) -> None:
+    """下の編集画面を少し暗くして、上に開いた棚と見分けが付くようにする"""
+    image.setDevicePixelRatio(1.0)
+    painter = QPainter(image)
+    painter.fillRect(QRect(0, 0, image.width(), image.height()), QColor(0, 0, 0, 90))
+    painter.end()
 
 
 def wiki_script_menu(context: Context) -> QImage:
@@ -1517,14 +1549,43 @@ def work_folder_base(requested: Path | None, home: Path) -> Path:
 
     ホームの下（既定の一時フォルダもそこ）に作ると、ユーザー名を含む場所が
     素材や設定の置き場として画面のどこかに出たとき、そのまま写真に写る
-    既定はリポジトリのあるドライブの根
+
+    渡されなければ、書ける場所を順に探す 先はリポジトリのあるドライブの根（どの
+    フォルダの名前も含まない） 標準の利用者ではシステムのドライブの根に書けないので、
+    次はリポジトリの中の ``.work/shots``（リポジトリは本人が書ける 中身は git に入らない）
+    どちらもホームの下は使わない 使える所が無ければ、``--work`` を求めて止める
     """
-    base = (requested if requested is not None else Path(ROOT.anchor)).resolve()
-    if base == home or home in base.parents:
-        raise ShotError(
-            f"作業用のフォルダを %USERPROFILE% の下には作らない: {base}（--work で別の場所を渡す）"
-        )
-    return base
+    if requested is not None:
+        base = requested.resolve()
+        if _under(base, home):
+            raise ShotError(
+                f"作業用のフォルダを %USERPROFILE% の下には作らない: {base}"
+                "（--work で別の場所を渡す）"
+            )
+        return base
+    for candidate in (Path(ROOT.anchor), ROOT / ".work" / "shots"):
+        base = candidate.resolve()
+        if not _under(base, home) and _writable(base):
+            return base
+    raise ShotError(
+        "作業用のフォルダを作れる場所が無い（ドライブの根に書けず、リポジトリは "
+        "%USERPROFILE% の下にある） --work で %USERPROFILE% の外の書ける場所を渡す"
+    )
+
+
+def _under(path: Path, home: Path) -> bool:
+    return path == home or home in path.parents
+
+
+def _writable(folder: Path) -> bool:
+    """そこに作業用のフォルダを作れるか 作って消してみる"""
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="sashimono-shots-", dir=folder):
+            pass
+    except OSError:
+        return False
+    return True
 
 
 def isolate_user_folders(base: Path) -> None:
@@ -1595,8 +1656,8 @@ def main(argv: list[str] | None = None) -> int:
         "--work",
         type=Path,
         default=None,
-        help="作業用のフォルダを作る場所 既定はリポジトリのあるドライブの根"
-        " %%USERPROFILE%% の下は断る",
+        help="作業用のフォルダを作る場所 既定はリポジトリのあるドライブの根、書けなければ"
+        "リポジトリの中の .work/shots %%USERPROFILE%% の下は断る",
     )
     arguments = parser.parse_args(argv)
 
