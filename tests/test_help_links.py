@@ -120,7 +120,7 @@ class TestDiscussions:
 
     def test_the_software_sends_reports_to_discussions(self) -> None:
         # Issue へ飛ばすと、確かめる前の報告と質問が開発の作業の一覧に混ざる
-        assert REPORT_URL == f"{REPOSITORY_URL}/discussions/new/choose"
+        assert f"{REPOSITORY_URL}/discussions/new/choose" == REPORT_URL
 
     def test_users_cannot_open_issues_around_discussions(self) -> None:
         # Issue の雛形か白紙の Issue が残っていると、使う人が Discussions を通らずに Issue を作れる
