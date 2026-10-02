@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import gc
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import shiboken6
 from PySide6.QtCore import QObject, Qt, Signal
@@ -624,11 +626,32 @@ def follow_system(application: QApplication, scheme: Qt.ColorScheme) -> None:
 
 
 def _activate(application: QApplication, theme: str) -> None:
-    use_palette(theme)
-    application.setStyleSheet(style_sheet())
-    _restyle()
-    theme_signals().changed.emit()
-    # 自前で描く部品（タイムライン・グラフ・波形）は、描くたびに Colors を読む
-    # 描き直しを頼まないと、次に何かが動くまで前のテーマの絵が残る
-    for widget in application.allWidgets():
-        widget.update()
+    with _no_collection():
+        use_palette(theme)
+        application.setStyleSheet(style_sheet())
+        _restyle()
+        theme_signals().changed.emit()
+        # 自前で描く部品（タイムライン・グラフ・波形）は、描くたびに Colors を読む
+        # 描き直しを頼まないと、次に何かが動くまで前のテーマの絵が残る
+        for widget in application.allWidgets():
+            widget.update()
+
+
+@contextmanager
+def _no_collection() -> Iterator[None]:
+    """全部の部品へ配っている間は、ごみ集めを止める
+
+    スタイルシートを当て直すと Qt は全部の部品へ知らせを配り、その途中で Python の受け手
+    （設定パネルの数値欄の eventFilter・テーマの知らせにつないだ関数）が動く そこで閾値を
+    越えてごみ集めが走ると、輪になって捨てられた Python 持ちの部品がその場で壊れ、Qt は
+    壊れた部品へ配り続けて access violation で落ちる（PR #236 の CI） 下の ``update`` の
+    繰り返しも、先に作った一覧の中の部品が途中で壊れると同じことになる
+    止めるのは配る間だけ 終わったら元に戻し、溜まった分は次の閾値で片付く
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()

@@ -548,6 +548,8 @@ class SubtitlePanel(QWidget):
         merge = menu.addAction("次と結合")
         remove = menu.addAction("削除")
         chosen = menu.exec(self._table.viewport().mapToGlobal(position))
+        # 右クリックのたびに作るメニュー 選んだ項目はこの後で比べるので、後で捨てる
+        menu.deleteLater()
         if chosen is place:
             self.place_selected_rows()
             return
