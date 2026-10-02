@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QLabel,
     QLayout,
+    QPushButton,
     QScrollArea,
     QToolButton,
     QWidget,
@@ -35,7 +36,7 @@ from sashimono.core.model import ClipId, Project
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.definition import registry
 from sashimono.effects.sources import TEXT
-from sashimono.ui.flow_layout import ElidedLabel
+from sashimono.ui.flow_layout import ElidedLabel, FlowLayout
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.inspector.panel import _Section
 from sashimono.ui.main_window import DEFAULT_SIZE, MainWindow, initial_size
@@ -319,6 +320,64 @@ def test_the_transport_hides_labels_before_cutting_them(qt_application: QApplica
     finally:
         holder.close()
         shiboken6.delete(holder)
+
+
+def test_the_transport_minimum_matches_its_layout_with_labels_hidden(
+    qt_application: QApplication,
+) -> None:
+    """帯が返す最小の幅は、隠せる物を隠したときの置き方の最小の幅とちょうど同じ
+
+    少なく返すと、その幅まで縮められたときに隠し切っても入らず、部品や時刻が欠ける
+    多く返すと、窓の最小の幅が要らない分だけ広がる 横の箱は隣どうしの間にだけ間隔を
+    入れるが、隠せる物はどれも先頭ではないので、隠すと 1 つにつき間隔も 1 つ消える
+    """
+    del qt_application
+    holder = QWidget()
+    holder.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    bar = TransportBar(FrameRate(30), holder)
+    holder.resize(2000, 100)
+    holder.show()
+    try:
+        bar.resize(1500, bar.sizeHint().height())
+        _settle()
+        assert all(w.isVisible() for group in bar._optional for w in group)
+        claimed = bar.minimumSizeHint().width()
+        for group in bar._optional:
+            for widget in group:
+                widget.hide()
+        layout = bar.layout()
+        assert layout is not None
+        layout.invalidate()
+        assert claimed == layout.totalMinimumSize().width()
+    finally:
+        holder.close()
+        shiboken6.delete(holder)
+
+
+def test_a_flow_never_gets_narrower_than_its_widest_item(qt_application: QApplication) -> None:
+    """折り返す置き方を持つ部品は、いちばん広い部品の最小の幅より狭くならない
+
+    狭くなると、その部品は最小の幅のまま置かれて親の外へはみ出す（切ると文字が欠ける）
+    置き方が最小の幅を返し、親の最小の幅になることで防いでいる
+    """
+    del qt_application
+    panel = QWidget()
+    panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    wide = QPushButton("とても長い名前のボタンでも欠けずに入ること", panel)
+    flow = FlowLayout(panel)
+    for widget in (QPushButton("短い", panel), wide, QPushButton("ふつう", panel)):
+        flow.addWidget(widget)
+    try:
+        panel.show()
+        panel.resize(10, 400)
+        _settle()
+        assert panel.minimumSizeHint().width() >= wide.minimumSizeHint().width()
+        assert panel.width() >= wide.minimumSizeHint().width()
+        assert panel.rect().contains(wide.geometry())
+        assert _overlaps(panel) == []
+    finally:
+        panel.close()
+        shiboken6.delete(panel)
 
 
 def test_a_long_effect_name_does_not_widen_the_panel(qt_application: QApplication) -> None:

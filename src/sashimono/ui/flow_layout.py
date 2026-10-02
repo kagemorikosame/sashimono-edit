@@ -154,6 +154,9 @@ class FlowLayout(QLayout):
         for item in self._visible():
             hint = item.sizeHint()
             # 1 つで幅を超える物は、その幅まで縮めて置く（最小の幅までは縮む）
+            # 最小の幅より狭い所へは来ない :meth:`minimumSize` がいちばん広い物の最小の幅を
+            # 返すので、置き方の親はそれより狭くならない（tests/ui/test_narrow_window.py）
+            # 使える幅で切って最小より縮めると、文字の欠けたボタンになる
             width = max(min(hint.width(), area.width()), item.minimumSize().width())
             if x > area.x() and x + width > area.right() + 1:
                 x = area.x()
