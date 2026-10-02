@@ -43,6 +43,7 @@ from sashimono.core.commands import (
     SetTranscript,
     SplitSegment,
     Voice,
+    burn_defaults,
     burn_subtitles,
     export_range,
     subtitle_voices,
@@ -71,9 +72,6 @@ from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["SubtitlePanel", "ask_subtitle_range"]
-
-#: 焼き込むテキストの既定 下寄せで、縁取りを付けて読めるようにする
-BURN_DEFAULTS = {"size": 48.0, "pos_y": -380.0, "border_width": 4.0}
 
 
 #: 時刻の列に足す余白（画素） 文字の幅ぴったりだと読みにくい
@@ -550,6 +548,8 @@ class SubtitlePanel(QWidget):
         merge = menu.addAction("次と結合")
         remove = menu.addAction("削除")
         chosen = menu.exec(self._table.viewport().mapToGlobal(position))
+        # 右クリックのたびに作るメニュー 選んだ項目はこの後で比べるので、後で捨てる
+        menu.deleteLater()
         if chosen is place:
             self.place_selected_rows()
             return
@@ -615,7 +615,11 @@ class SubtitlePanel(QWidget):
             self._service = TranscriptionService(default_backend())
 
         dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
-        if dialog.exec() and dialog.transcript is not None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer and dialog.transcript is not None:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript, stream=dialog.chosen_stream)],
                 f"字幕を起こす: {media.name}",
@@ -715,7 +719,11 @@ class SubtitlePanel(QWidget):
         if media is None or transcript is None:
             return
         dialog = CleanupDialog(transcript, self)
-        if dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
                 "字幕を整形",
@@ -740,7 +748,11 @@ class SubtitlePanel(QWidget):
             estimate=estimate,
             parent=self,
         )
-        if not dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if not answer:
             return
 
         ranges = self._plan(media, dialog.options(), dialog.keep_speech)
@@ -774,9 +786,11 @@ class SubtitlePanel(QWidget):
             text = str(clip.source.params.get("text", "")).splitlines()
             head = text[0][:12] if text else ""
             return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
-        return TEXT.create(**BURN_DEFAULTS), (
-            "見た目: 既定（大きさ 48・下寄せ・縁取り 4） タイムラインでテキストを選んでから"
-            "焼き込むと、そのテキストの見た目を写します"
+        # 既定の大きさと位置は作品の高さで縮める 画素のまま置くと、720p では画面の外に出る
+        look = burn_defaults(self._project.settings.height)
+        return TEXT.create(**look), (
+            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}）"
+            " タイムラインでテキストを選んでから焼き込むと、そのテキストの見た目を写します"
         )
 
     def burn(self) -> None:
@@ -799,7 +813,11 @@ class SubtitlePanel(QWidget):
 
     def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
         dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
-        if not dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if not answer:
             return None
         return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
 
@@ -871,6 +889,9 @@ def ask_subtitle_range(parent: QWidget | None, project: Project) -> str | None:
     box.addButton(QMessageBox.StandardButton.Cancel)
     box.setDefaultButton(in_range)
     box.exec()
+    # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+    # この後で結果を読む間は残る
+    box.deleteLater()
     clicked = box.clickedButton()
     if clicked is in_range:
         return RANGE_WORK_AREA

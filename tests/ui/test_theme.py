@@ -9,12 +9,13 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator
 
 import pytest
 import shiboken6
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QLabel,
     QMainWindow,
+    QMenu,
     QSpinBox,
     QStyle,
     QStyleOptionSpinBox,
@@ -253,3 +255,42 @@ class TestSpinButtons:
                 assert spin.value() == 101, type(spin).__name__
         finally:
             _dispose(host)
+
+
+class TestMenus:
+    def test_the_shortcut_does_not_run_into_the_text(self, qt_application: QApplication) -> None:
+        """メニューの項目の文言と、右に出るショートカットの間が空いていること
+
+        アプリ全体の文字の大きさをスタイルシートで決めていると、項目の幅が文言と
+        ショートカットの和に足りず、長い項目（〔互換〕→〔オブジェクトを読み込む…〕）では
+        文言の終わりに Ctrl+Shift+O が重なって読めなくなっていた（手順書の写真で見つけた）
+        描いた絵の 1 行で、字の無い列がいちばん長く続く所を測る
+        """
+        del qt_application
+        menu = QMenu()
+        menu.setStyleSheet(style_sheet())
+        menu.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        action = menu.addAction("オブジェクトを読み込む…")
+        action.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        menu.popup(QPoint(0, 0))
+        QApplication.processEvents()
+        try:
+            image = menu.grab().toImage()
+            ratio = image.width() / max(1, menu.width())
+            rect = menu.actionGeometry(action)
+            top, bottom = int(rect.top() * ratio), int(rect.bottom() * ratio)
+            background = image.pixelColor(int((rect.left() + 2) * ratio), top + 1).lightness()
+            inked = [
+                x
+                for x in range(int(rect.left() * ratio), int(rect.right() * ratio))
+                if any(
+                    abs(image.pixelColor(x, y).lightness() - background) > 40
+                    for y in range(top, bottom)
+                )
+            ]
+            gaps = [after - before for before, after in itertools.pairwise(inked)]
+            assert gaps
+            assert max(gaps) / ratio >= 12
+        finally:
+            menu.hide()
+            menu.deleteLater()

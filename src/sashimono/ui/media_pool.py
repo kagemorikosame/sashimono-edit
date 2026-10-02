@@ -393,6 +393,8 @@ class MediaPoolWidget(QWidget):
         self._list.setCurrentItem(item)
         menu = self.build_menu(MediaId(str(item.data(Qt.ItemDataRole.UserRole))))
         menu.exec(self._list.viewport().mapToGlobal(position))
+        # 右クリックのたびに作るメニュー 捨てないと一覧の子として残り続ける
+        menu.deleteLater()
 
     def build_menu(self, media_id: MediaId) -> QMenu:
         """素材 1 つに対する右クリックメニュー 表示と中身を分けてあるのはテストのため"""

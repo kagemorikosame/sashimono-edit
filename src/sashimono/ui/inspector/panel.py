@@ -927,6 +927,8 @@ class InspectorPanel(QWidget):
         clear.setEnabled(animated.is_animated)
 
         chosen = menu.exec(self.cursor().pos())
+        # 右クリックのたびに作るメニュー 捨てないと設定パネルの子として残り続ける
+        menu.deleteLater()
         if chosen is curve:
             self.curve_selected.emit(path)
         elif chosen is clear and clip is not None:
@@ -994,6 +996,8 @@ class InspectorPanel(QWidget):
         if menu is None:
             return
         chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
         if chosen is None:
             return
         self._add_chosen_effect(chosen)
@@ -1069,6 +1073,8 @@ class InspectorPanel(QWidget):
                 action.setData(preset.name)
 
         chosen = menu.exec(self._preset_button.mapToGlobal(self._preset_button.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
         if chosen is None:
             return
         if chosen is save:

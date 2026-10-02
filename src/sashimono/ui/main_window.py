@@ -749,7 +749,11 @@ class MainWindow(QMainWindow):
             for name, (action, default) in self._actions.items()
         ]
         dialog = ShortcutDialog(rows, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         bindings = dialog.bindings()
         self._apply_shortcuts(bindings)
@@ -764,7 +768,11 @@ class MainWindow(QMainWindow):
         from sashimono.ui.preferences_dialog import PreferencesDialog
 
         dialog = PreferencesDialog(self._preferences, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         self._apply_preferences(dialog.preferences())
 
@@ -1819,7 +1827,11 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         dialog = ProjectSettingsDialog(self._new_settings(), self, new=True)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         self._playback.stop()
         previous = self._document.project
@@ -1991,7 +2003,11 @@ class MainWindow(QMainWindow):
 
         settings = self._document.project.settings
         dialog = ProjectSettingsDialog(settings, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.settings()
         commands: list[Command] = []
@@ -2025,7 +2041,11 @@ class MainWindow(QMainWindow):
         dialog = LayerModeDialog(
             target, conversion.notices, self, convertible=conversion.project is not project
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.convert is None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted or dialog.convert is None:
             return False
         commands = switch_layer_mode(
             project, target, convert=dialog.convert, sound_kinds=sound_kinds
@@ -2069,7 +2089,11 @@ class MainWindow(QMainWindow):
 
         while entries := find_orphans():
             dialog = RecoveryDialog(entries, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
+            answer = dialog.exec()
+            # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+            # この後で結果を読む間は残る
+            dialog.deleteLater()
+            if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
                 return
             action, entry = dialog.choice
             if action == "discard":
@@ -2115,14 +2139,18 @@ class MainWindow(QMainWindow):
 
     def export(self) -> None:
         self._playback.stop()
-        ExportDialog(
+        dialog = ExportDialog(
             self._document.project,
             self,
             pipeline_depth=self._preferences.export_pipeline_depth,
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
-        ).exec()
+        )
+        dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
 
     def _active_scene_name(self) -> str | None:
         """開いているシーンの名前 メインなら ``None``"""
@@ -2218,7 +2246,11 @@ class MainWindow(QMainWindow):
         from sashimono.ui.template_dialog import TemplateDialog
 
         dialog = TemplateDialog(parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
             return
 
         action, objects = dialog.choice
@@ -2342,7 +2374,11 @@ class MainWindow(QMainWindow):
         """互換性レポートを出す"""
         from sashimono.ui.compat_dialog import CompatibilityDialog
 
-        CompatibilityDialog(parent=self).exec()
+        dialog = CompatibilityDialog(parent=self)
+        dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
 
     # --- ヘルプ ---
 

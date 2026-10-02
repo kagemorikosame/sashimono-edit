@@ -1427,7 +1427,10 @@ class TimelineView(QWidget):
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802 - Qt の命名規約
         if self._remove_value_key(event.pos()):
             return
-        self.build_context_menu(event.pos()).exec(event.globalPos())
+        menu = self.build_context_menu(event.pos())
+        menu.exec(event.globalPos())
+        # 右クリックのたびに作るメニュー 捨てないとタイムラインの子として残り続ける
+        menu.deleteLater()
 
     def _remove_value_key(self, position: QPoint) -> bool:
         """値の線の点の上の右クリックは、メニューを出さずにその点を消す"""
@@ -2230,7 +2233,9 @@ class TimelineView(QWidget):
         if places_mixed(self._project):
             self._add_menus.add_track(TrackKind.MIXED)
             return True
-        self.build_track_add_menu().exec(self.mapToGlobal(rect.bottomLeft()))
+        menu = self.build_track_add_menu()
+        menu.exec(self.mapToGlobal(rect.bottomLeft()))
+        menu.deleteLater()
         return True
 
     def _hover_add_button(self, position: QPoint) -> None:
