@@ -215,21 +215,33 @@ class TestTranscribeShot:
 class TestDefaultWorkFolder:
     """``--work`` を渡さないときの作業用のフォルダの置き場
 
-    標準の利用者はシステムのドライブの根に書けない 根だけを既定にしていると、
-    引数なしの撮影が権限の誤りで止まる
+    候補はドライブの根、次にリポジトリの中の ``.work/shots`` どちらもホームの下なら
+    使わず、書けるかは作って消してみて決める
     """
 
     def test_the_drive_root_comes_first(
         self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 根はどのフォルダの名前も含まないので、書けるならそこを使う
-        monkeypatch.setattr(shots, "_writable", lambda folder: True)
+        # 根はどのフォルダの名前も含まないので、どちらにも書けるなら根を使う
+        # 壊れて順番が入れ替わると、書ける根があってもリポジトリの中を使い、作業用の
+        # フォルダの場所にリポジトリのフォルダの名前が入る
+        asked: list[Path] = []
+
+        def writable(folder: Path) -> bool:
+            asked.append(folder)
+            return True
+
+        monkeypatch.setattr(shots, "_writable", writable)
         chosen = shots.work_folder_base(None, tmp_path / "ホーム")
         assert chosen == Path(shots.ROOT.anchor).resolve()
+        # 根で決まったら、リポジトリの中に .work/shots を作りに行かない
+        assert asked == [chosen]
 
     def test_an_unwritable_root_falls_back_into_the_repository(
         self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、システムのドライブの根に書けない標準の利用者は、リポジトリの中へ
+        # 落ちられず、引数なしの撮影が権限の誤りで止まる
         root = Path(shots.ROOT.anchor).resolve()
         monkeypatch.setattr(shots, "_writable", lambda folder: folder != root)
         chosen = shots.work_folder_base(None, tmp_path / "ホーム")
@@ -238,11 +250,36 @@ class TestDefaultWorkFolder:
     def test_a_repository_in_the_home_is_not_used(
         self, shots: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 書けても、ホームの下は使わない 使える所が無ければ --work を求めて止める
+        # 壊れると、リポジトリがホームの下にあるとき、書けるからと .work/shots を使い、
+        # ユーザー名を含む場所に作業用のフォルダを作る 使える所が無ければ --work を求めて止める
         root = Path(shots.ROOT.anchor).resolve()
         monkeypatch.setattr(shots, "_writable", lambda folder: folder != root)
         with pytest.raises(shots.ShotError, match="--work"):
             shots.work_folder_base(None, shots.ROOT.resolve())
+
+    def test_nothing_writable_stops_with_the_way_out(
+        self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、どちらにも書けないときに書けない場所を返し、撮り始めてから権限の
+        # 誤りで落ちる 止めて、--work で渡せばよいと告げる
+        monkeypatch.setattr(shots, "_writable", lambda folder: False)
+        with pytest.raises(shots.ShotError, match="--work"):
+            shots.work_folder_base(None, tmp_path / "ホーム")
+
+    def test_writable_is_judged_by_making_a_folder(self, shots: ModuleType, tmp_path: Path) -> None:
+        """書けるかの確かめが、実際に作れるかで決まり、確かめた跡を残さないこと
+
+        ほかの試験は確かめを差し替えるので、本物の確かめはここで見る 壊れて常に
+        書けると答えると、根に書けない利用者でも根が選ばれて撮影が止まる 跡を残すと、
+        撮るたびにドライブの根に空のフォルダが溜まる
+        """
+        folder = tmp_path / "書ける"
+        assert shots._writable(folder)
+        assert list(folder.iterdir()) == []
+        # フォルダの代わりにファイルがある所には作れない
+        blocked = tmp_path / "ファイル"
+        blocked.write_text("", encoding="utf-8")
+        assert not shots._writable(blocked)
 
 
 class TestIsolation:

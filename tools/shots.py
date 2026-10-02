@@ -18,6 +18,8 @@ r"""README と Wiki に載せる画面写真を、アプリ自身に撮らせる
 撮り終わったあとに本人の設定が見本の状態で上書きされることもない
 作業用のフォルダは ``%USERPROFILE%`` の外に作る（ユーザー名を含む場所が、
 読み込んだ素材の場所として画面のどこかに出ても、写真に名前が残らないように）
+既定はドライブの根、書けなければリポジトリの中の ``.work/shots`` リポジトリが
+ホームの下にあってドライブの根にも書けないときは ``--work`` が要る
 
 他人が作った配布物（AviUtl2 のエイリアス・YMM4 のアイテムテンプレート・
 スクリプト）は写さない 再配布の条件が作者ごとに違うので、棚やテンプレートの
@@ -1568,8 +1570,9 @@ def work_folder_base(requested: Path | None, home: Path) -> Path:
         if not _under(base, home) and _writable(base):
             return base
     raise ShotError(
-        "作業用のフォルダを作れる場所が無い（ドライブの根に書けず、リポジトリは "
-        "%USERPROFILE% の下にある） --work で %USERPROFILE% の外の書ける場所を渡す"
+        "作業用のフォルダを作れる場所が無い（ドライブの根に書けず、リポジトリの中の "
+        ".work/shots は %USERPROFILE% の下にあるか書けない） --work で "
+        "%USERPROFILE% の外の書ける場所を渡す"
     )
 
 
@@ -1657,7 +1660,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="作業用のフォルダを作る場所 既定はリポジトリのあるドライブの根、書けなければ"
-        "リポジトリの中の .work/shots %%USERPROFILE%% の下は断る",
+        "リポジトリの中の .work/shots %%USERPROFILE%% の下は使わないので、リポジトリが"
+        "その下にあってドライブの根にも書けないときは、ここでホームの外を渡す",
     )
     arguments = parser.parse_args(argv)
 
