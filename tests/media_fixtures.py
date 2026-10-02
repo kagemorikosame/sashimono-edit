@@ -24,6 +24,7 @@ __all__ = [
     "encoder_available",
     "ffmpeg_available",
     "libx264_available",
+    "make_color_tagged",
     "make_rotated",
     "make_sample",
     "make_silent_gap",
@@ -163,6 +164,47 @@ def make_rotated(directory: Path, name: str, source: Path, degrees: int) -> Path
             str(source),
             "-c",
             "copy",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def make_color_tagged(
+    directory: Path, name: str, *, transfer: str, primaries: str, matrix: str = "bt2020nc"
+) -> Path:
+    """伝達特性・原色・行列の色の印を付けた短い動画 画素は SDR のまま
+
+    印は ``setparams`` でフレームへ付け、符号化器にビットストリームと mp4 へ書かせる
+    ffmpeg の出力の設定（``-color_trc`` など）は、ffmpeg 8 の libx264 では行列しか
+    書かれなかった 中身まで HDR にしなくても、見分けるのは印だけなので試験には足りる
+    """
+    path = directory / name
+    if path.exists():
+        return path
+    if not libx264_available():
+        pytest.skip("ffmpeg に libx264 が無いので実素材のテストを飛ばす")
+    directory.mkdir(parents=True, exist_ok=True)
+    tags = f"setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30:duration=0.5",
+            "-vf",
+            tags,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             str(path),
         ],
         check=True,

@@ -340,6 +340,37 @@ class TestSettling:
         assert elapsed >= rounds * shots.SETTLE_MS * 0.8
 
 
+class TestWikiVersion:
+    """手順書の頭に書いた「この版で撮りました」を、撮り直したときに今の版へ書き換える"""
+
+    def test_the_version_line_follows_the_current_version(
+        self, shots: ModuleType, tmp_path: Path
+    ) -> None:
+        # 手で書き換えると、版を上げて撮り直したのに古い版のまま残る
+        page = tmp_path / "手順書-最初の1本.md"
+        page.write_bytes(
+            "# 最初の 1 本\r\n\r\n> この手順書の画面と文言は **Sashimono Edit 0.0.1** で撮りました"
+            " 版が上がって画面が違うときは、その版で変わった所です\r\n本文\r\n".encode()
+        )
+        other = tmp_path / "Home.md"
+        other.write_bytes(b"# Home\r\n")
+
+        changed = shots.stamp_wiki_version(tmp_path, "9.8.7")
+
+        assert changed == [page]
+        text = page.read_bytes().decode("utf-8")
+        assert "**Sashimono Edit 9.8.7** で撮りました" in text
+        assert "0.0.1" not in text
+        # 改行の形は変えない 変えると頁全体が差分になる
+        assert text.count("\r\n") == 4
+        assert other.read_bytes() == b"# Home\r\n"
+
+    def test_the_default_is_the_running_version(self, shots: ModuleType) -> None:
+        from sashimono import __version__
+
+        assert shots.stamp_wiki_version.__defaults__ == (__version__,)
+
+
 class TestPasting:
     def test_it_ignores_the_scaling_of_the_target(
         self, shots: ModuleType, qt_application: QApplication
@@ -513,12 +544,13 @@ class TestTakingTheEditorShot:
             shots.build_sample_timeline(window, context)
             image = shots.take_editor_shot(window)
             rect = shots.preview_rect(window)
-            # 窓は部品の最小の幅より狭くできないので、頼んだ幅より広がることがある
             # 撮った絵は窓の論理的な大きさそのもの（画面の拡大率に左右されない）
+            # 前は部品の最小の幅の和（1367）が頼んだ幅を超え、窓が勝手に広がっていた
+            # README の写真の幅が画面の作りで変わらないよう、頼んだ大きさのままを確かめる
             size = (window.width(), window.height())
 
         assert (image.width(), image.height()) == size
-        assert size[1] == shots.WINDOW_SIZE[1]
+        assert size == shots.WINDOW_SIZE
         assert rect is not None
         assert shots.brightest(image, rect) > shots.BLACK_LEVEL
 

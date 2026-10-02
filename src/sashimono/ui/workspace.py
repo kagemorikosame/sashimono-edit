@@ -191,7 +191,8 @@ class Preferences:
     use_proxy: bool = True
     #: 控えの縦の画素数
     proxy_height: int = 540
-    #: 画面より大きい素材を置いたら、プレビューの画質を自動で落とす
+    #: 高さが :data:`AUTO_QUALITY_HEIGHT` 以上の素材を読み込んだら、プレビューの画質を自動で落とす
+    #: 画面の大きさは見ない（設定画面の文言は ``preferences_dialog.AUTO_QUALITY_TEXT``）
     auto_quality: bool = True
     #: 自動で落とすときの分母
     auto_quality_divisor: int = 2
@@ -238,6 +239,11 @@ class Preferences:
     #: 作っている最中だからなのかを、知らない人ほど見て分かる必要がある
     #: 行の文字が 250ms ごとに変わるのが目障りな人は切れるようにする
     pool_progress: bool = True
+    #: HDR（PQ・HLG）や広色域（BT.2020）の素材を読み込んだときに、SDR として扱うので
+    #: 白っぽく出ると知らせる窓を出す（素材一覧の行の印はこの設定に関係なく出す）
+    #: 既定は入 HDR を知らない人ほど、褪せた絵をソフトの不具合だと受け取る
+    #: 知っていて HDR の素材を何度も読み込む人は、窓が邪魔なので切れるようにする
+    hdr_notice: bool = True
     #: AviUtl2 の汎用プラグイン（``.aux2``）を全部読んで、スクリプトが引くモジュールを探す
     #: 既定は切 切っている間は、名前を出すと確かめたプラグイン（合成フォントの
     #: ``comfont.aux2``）だけを読む 全部を読むと、関係の無いプラグインが初期化で
@@ -378,6 +384,7 @@ class PreferenceStore:
             decode_threads=_threads(data.get("decode_threads"), plain.decode_threads),
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
+            hdr_notice=_flag(data.get("hdr_notice"), plain.hdr_notice),
             all_aviutl_plugins=_flag(data.get("all_aviutl_plugins"), plain.all_aviutl_plugins),
             media_view=_choice(data.get("media_view"), VIEW_MODES, plain.media_view),
             ai_model=_choice(data.get("ai_model"), tuple(m.id for m in AI_MODELS), plain.ai_model),

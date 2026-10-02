@@ -43,6 +43,7 @@ from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
+    AUTO_QUALITY_HEIGHT,
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
     MEDIA_SPLIT,
@@ -52,6 +53,7 @@ from sashimono.ui.workspace import (
 )
 
 __all__ = [
+    "AUTO_QUALITY_TEXT",
     "DECODE_THREADS",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
@@ -65,6 +67,14 @@ PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
     ("360p（一番軽い）", 360),
     ("540p（既定）", 540),
     ("720p（きれい）", 720),
+)
+
+#: 自動で画質を落とす項目の文言 数は判定（:meth:`Preferences.quality_for`）の境目から作る
+#: 前は「画面より大きい素材では」と書いていたが、実際に見ているのは画面の大きさではなく
+#: 読み込んだ素材の高さで、1080 を超える物が 1 つでもあれば落とす 文言と動きが食い違うと、
+#: 1080p の画面で 1080p の素材を置いた人が「画面と同じなのに下がらない」と迷う
+AUTO_QUALITY_TEXT = (
+    f"高さが {AUTO_QUALITY_HEIGHT - 1} を超える素材があれば、プレビューの画質を下げる"
 )
 
 #: 自動で落とすときの分母
@@ -154,9 +164,12 @@ class PreferencesDialog(QDialog):
         self._select(self._proxy_height, preferences.proxy_height)
         form.addRow("控えの大きさ", self._proxy_height)
 
-        self._auto_quality = QCheckBox("画面より大きい素材では、プレビューの画質を下げる", self)
+        self._auto_quality = QCheckBox(AUTO_QUALITY_TEXT, self)
         self._auto_quality.setChecked(preferences.auto_quality)
         self._auto_quality.setToolTip(
+            f"読み込んだ素材のどれかの高さ（縦の画素数 縦撮りは回した後の高さ）が "
+            f"{AUTO_QUALITY_HEIGHT - 1} を超えると、プレビューを「下げたときの画質」で描く "
+            "書き出しは変わらない\n"
             "切ると、4K の素材でも等倍で描く 画質は上がるが、再生が追いつかなくなる"
         )
         form.addRow(self._auto_quality)
@@ -249,6 +262,15 @@ class PreferencesDialog(QDialog):
             "進み具合が出て、作れなかった理由も終わったときに出る"
         )
         form.addRow(self._pool_progress)
+
+        self._hdr_notice = QCheckBox("HDR の素材を読み込んだら知らせる", self)
+        self._hdr_notice.setChecked(preferences.hdr_notice)
+        self._hdr_notice.setToolTip(
+            "HDR（PQ・HLG）や広い色域（BT.2020）の印が付いた素材を読み込んだときに、"
+            "SDR（Rec.709）として扱うので白っぽく表示・書き出しされることを知らせる "
+            "切っても素材一覧の行には印が付く"
+        )
+        form.addRow(self._hdr_notice)
 
         # 一覧の上のボタンでも切り替えられる ここにも置くのは、設定を開いて OK を
         # 押したときに、ボタンで選んだ表示を黙って既定へ戻さないため
@@ -516,6 +538,7 @@ class PreferencesDialog(QDialog):
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
             pool_progress=self._pool_progress.isChecked(),
+            hdr_notice=self._hdr_notice.isChecked(),
             all_aviutl_plugins=self._all_plugins.isChecked(),
             media_view=str(self._media_view.currentData()),
             ai_model=str(self._ai_model.currentData()),

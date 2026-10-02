@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice, QPoint, Qt, QTimer, QUrl, Signal, qVersion
+from PySide6.QtCore import QBuffer, QIODevice, QPoint, QSize, Qt, QTimer, QUrl, Signal, qVersion
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -115,7 +115,7 @@ from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
-from sashimono.ui import media_match
+from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
@@ -150,7 +150,7 @@ from sashimono.ui.workspace import (
 if TYPE_CHECKING:
     from sashimono.compat.mapped import MappedObject
 
-__all__ = ["MainWindow", "about_text"]
+__all__ = ["MainWindow", "about_text", "initial_size"]
 
 #: 解析の完了を画面へ反映する間隔（ミリ秒）
 #: 解析はワーカースレッドで終わるので、その通知を待って毎回描き直すのではなく、
@@ -177,6 +177,26 @@ POOL_THUMBNAIL_SECONDS = Fraction(1)
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
+
+#: 初めて開いたときの窓の大きさ 画面がこれより狭ければ画面に合わせる（:func:`initial_size`）
+DEFAULT_SIZE = QSize(1440, 900)
+
+#: 窓の枠と題名の分（画素） 窓の大きさは中身の大きさで頼むので、画面の広さから引いておく
+#: 引かないと、1366x768 の画面で題名の帯や下の縁が画面の外へ出る
+WINDOW_FRAME = QSize(16, 40)
+
+#: 初めて開いたときの左（素材・字幕）と右（設定・AI）の列の幅 プレビューに残りを回す
+#: 中身がこれより広ければ中身に合わせて広がる（Qt が最小の幅で止める）
+DOCK_WIDTHS = (260, 360)
+
+
+def initial_size(available: QSize) -> QSize:
+    """画面の使える広さ（タスクバーを除く）に収まる、初めて開いたときの窓の大きさ
+
+    決め打ちの 1440x900 のままだと、1366x768 や 1280x720 のノート PC で窓の右と下が
+    画面の外に出て、設定パネルと状態の表示が見えなかった
+    """
+    return DEFAULT_SIZE.boundedTo(available - WINDOW_FRAME)
 
 
 def about_text() -> str:
@@ -267,7 +287,10 @@ class MainWindow(QMainWindow):
         """``confirm_unsaved`` を偽にすると、閉じるときに保存を尋ねない テスト用"""
         super().__init__()
         self.setWindowTitle("Sashimono Edit")
-        self.resize(1440, 900)
+        screen = QApplication.primaryScreen()
+        self.resize(
+            initial_size(screen.availableGeometry().size()) if screen is not None else DEFAULT_SIZE
+        )
 
         #: 本人の好みの設定 プロジェクトではなく本人に付く
         #: 最初の空のプロジェクトを作る前に読む 起動した直後のプロジェクトも、新規作成と
@@ -334,6 +357,9 @@ class MainWindow(QMainWindow):
         )
         #: 控えと解析の進み具合を出していたか 終わったことを 1 度だけ知らせるため
         self._background_shown = False
+        #: HDR の素材だと知らせたファイル 同じ素材を読み込み直すたびに窓を出さないため
+        #: 窓を閉じるまで覚える（次に起動したときに読み込めば、また 1 度だけ知らせる）
+        self._hdr_noticed: set[Path] = set()
 
         # タブの向きはパネルを重ねる前に決める Qt は重ねたときに使わないタブの並びを
         # 1 つ作って残し、それは作った時の向きのまま変わらない（ほかの部品の下に隠れて
@@ -456,7 +482,7 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, inspector_dock)
-        self.resizeDocks([inspector_dock], [320], Qt.Orientation.Horizontal)
+        self.resizeDocks([pool_dock, inspector_dock], list(DOCK_WIDTHS), Qt.Orientation.Horizontal)
 
         graph_dock = self._dock("グラフエディタ", "graph")
         graph_dock.setWidget(self._graph)
@@ -1378,6 +1404,25 @@ class MainWindow(QMainWindow):
             )
         elif commands:
             self.statusBar().showMessage(f"{batch.total} 件を読み込んだ", 3000)
+        self._notice_hdr(loaded)
+
+    def _notice_hdr(self, loaded: list[MediaItem]) -> None:
+        """HDR や広い色域の素材を読み込んだら、SDR として扱うことを 1 度だけ知らせる
+
+        まとめて読み込んだ分は 1 つの窓にまとめる 1 本ずつ出すと、10 本読み込んだときに
+        10 回閉じることになる 知らせた素材は窓を閉じるまで覚え、読み込み直しでは出さない
+        設定で切ってあれば窓は出さない（素材一覧の行の印は出る）
+        """
+        found = [
+            item for item in hdr_notice.outside_sdr(loaded) if item.path not in self._hdr_noticed
+        ]
+        if not found:
+            return
+        self._hdr_noticed.update(item.path for item in found)
+        if not self._preferences.hdr_notice:
+            return
+        if not hdr_notice.ask_hdr_notice(self, found):
+            self._remember_preferences(replace(self._preferences, hdr_notice=False))
 
     def add_text(self) -> None:
         """再生ヘッドの位置にテキストを置く"""

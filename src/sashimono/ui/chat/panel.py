@@ -39,6 +39,7 @@ from sashimono.ai.session import (
     EventKind,
     system_prompt,
 )
+from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.workspace import Preferences
@@ -154,12 +155,17 @@ class ChatPanel(QWidget):
         self._model.currentIndexChanged.connect(self._on_choice_changed)
         self._effort.currentIndexChanged.connect(self._on_choice_changed)
 
-        choices = QHBoxLayout()
-        choices.setContentsMargins(0, 0, 0, 0)
-        choices.addWidget(QLabel("モデル", self))
-        choices.addWidget(self._model, 1)
-        choices.addWidget(QLabel("考える深さ", self))
-        choices.addWidget(self._effort)
+        # 名前と欄の組ごとに折り返す 1 列に並べると、モデルの名前の欄と深さの欄の幅の和が
+        # AI のパネルの最小の幅になり、設定パネルと重ねた右の列が 1366 の画面で広がりすぎた
+        # 組を崩さないのは、欄だけが次の行へ落ちると、どの名前の欄か読めなくなるため
+        choices = FlowLayout()
+        for text, box in (("モデル", self._model), ("考える深さ", self._effort)):
+            pair = QWidget(self)
+            pair_layout = QHBoxLayout(pair)
+            pair_layout.setContentsMargins(0, 0, 0, 0)
+            pair_layout.addWidget(QLabel(text, pair))
+            pair_layout.addWidget(box)
+            choices.addWidget(pair)
 
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない

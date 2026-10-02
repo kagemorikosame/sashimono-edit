@@ -11,7 +11,6 @@ from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
-    QHBoxLayout,
     QListView,
     QListWidget,
     QListWidgetItem,
@@ -24,6 +23,8 @@ from PySide6.QtWidgets import (
 
 from sashimono.core.model import MediaId, MediaItem, Project
 from sashimono.core.timebase import FrameRate, format_timecode, seconds_to_frame
+from sashimono.ui.flow_layout import FlowLayout
+from sashimono.ui.hdr_notice import HDR_NOTE
 from sashimono.ui.media_icons import (
     GRID_ICON_SIZE,
     LIST_ICON_SIZE,
@@ -152,11 +153,11 @@ class MediaPoolWidget(QWidget):
 
         self._view_buttons = QButtonGroup(self)
         self._view_buttons.setExclusive(True)
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
+        # 狭い所では折り返す 1 列のままだと 4 つのボタンの幅の和が、字幕と重ねた左の列の
+        # 最小の幅になり、1366 の画面に窓が収まらなかった
+        buttons = FlowLayout()
         buttons.addWidget(import_button)
         buttons.addWidget(self._insert_button)
-        buttons.addStretch(1)
         for mode, text, tip in (
             (VIEW_LIST, "一覧", "名前・長さ・大きさを 1 行ずつ並べる"),
             (VIEW_ICONS, "アイコン", "サムネイルを大きく並べる"),
@@ -302,7 +303,9 @@ class MediaPoolWidget(QWidget):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, str(media.id))
             item.setData(_BASE_TEXT, _describe(media, project.rate))
-            item.setData(_NAME_TEXT, media.name)
+            # アイコン表示でも HDR の印は名前の下に出す 補足だけにすると、指すまで気付かない
+            outside = media.color_outside_sdr
+            item.setData(_NAME_TEXT, f"{media.name}\n{outside}" if outside else media.name)
             item.setIcon(self._icon_for(media))
             self._show_note(item, media)
             self._list.addItem(item)
@@ -342,6 +345,8 @@ class MediaPoolWidget(QWidget):
             base = str(item.data(_BASE_TEXT))
             text = f"{base}   [{note}]" if note else base
             tooltip = str(media.path)
+        if media.color_outside_sdr:
+            tooltip = f"{tooltip}\n{media.color_outside_sdr}: {HDR_NOTE}"
         if reason:
             tooltip = f"{tooltip}\n{reason}"
         if item.text() != text:
@@ -435,6 +440,10 @@ def _describe(media: MediaItem, rate: FrameRate) -> str:
         stream = media.video_streams[0]
         width, height = stream.display_size
         kinds.append(f"{width}x{height}")
+        # HDR と広色域は SDR として褪せて出る 読み込んだときの窓を閉じた後も、どの素材が
+        # そうなのかを一覧で見分けられるようにする
+        if media.color_outside_sdr:
+            kinds.append(media.color_outside_sdr)
     if media.has_audio:
         count = len(media.audio_streams)
         kinds.append(f"音声{count}本" if count > 1 else "音声")

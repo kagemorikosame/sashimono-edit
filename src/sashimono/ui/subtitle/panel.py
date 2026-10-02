@@ -66,6 +66,7 @@ from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
+from sashimono.ui.flow_layout import flow_of, narrow_combo
 from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog, JetCutDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
@@ -132,6 +133,9 @@ class SubtitlePanel(QWidget):
 
     def _build(self) -> None:
         self._media = QComboBox(self)
+        # 素材の名前の長さでパネルの最小の幅を決めない 長い名前の素材を読み込むたびに
+        # 窓の最小の幅が伸び、1366 の画面から窓がはみ出す 名前の全部は一覧を開けば読める
+        narrow_combo(self._media, 8)
         self._media.currentIndexChanged.connect(self._on_media_changed)
         # 音声が何本もある素材（ゲームの音とマイクの声など）は、どの音の字幕を見るかを選ぶ
         # 1 本の素材では出さない（今までどおり素材だけ）
@@ -156,17 +160,15 @@ class SubtitlePanel(QWidget):
         top.addWidget(self._stream_box)
         top.addWidget(self._transcribe_button)
 
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        for button in (
+        # 狭いパネルでは折り返す 1 列に並べると 5 つのボタンの幅の和がパネルの最小の幅になり、
+        # 字幕のパネルだけで 1366 の画面の 3 分の 1 を取った
+        actions = flow_of(
             self._clean_button,
             self._cut_button,
             self._burn_button,
             self._place_rows_button,
             self._export_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        )
 
         self._table = QTableWidget(0, 2, self)
         self._table.setHorizontalHeaderLabels(["時刻", "本文"])
