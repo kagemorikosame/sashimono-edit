@@ -253,6 +253,21 @@ def test_the_editor_fits_a_small_laptop_screen(window: MainWindow, screen: str) 
     _check_panels(window)
 
 
+#: 書体の違いで窓の最小の高さが伸びる分の余裕（画素） GitHub Actions の Windows では手元より
+#: 84 画素高く出て（562 → 646）、1280x720 の画面の中身（640）を超えた
+FONT_HEADROOM = 100
+
+
+def test_the_minimum_height_leaves_room_for_taller_fonts(window: MainWindow) -> None:
+    """窓の最小の高さは、1280x720 の画面の中身より、書体の違いの分だけ余裕を持って低い
+
+    手元でぎりぎり収まるだけだと、行の高さが高い書体の機械（CI・別の既定の書体）で窓が
+    画面から下へはみ出し、ステータスバーとタイムラインの下が見えなくなる 高さを決めて
+    いたのは、タイムラインの最小（160）と AI のパネルの会話・入力の欄の最小（Qt の既定）
+    """
+    assert window.minimumSizeHint().height() <= SCREENS["1280x720"].height() - FONT_HEADROOM
+
+
 @pytest.mark.parametrize("name", ["subtitles", "chat", "media", "inspector"])
 def test_every_panel_works_at_the_narrowest_window(window: MainWindow, name: str) -> None:
     """窓をいちばん狭くしても、どのパネルを前に出しても部品が重ならず欠けない

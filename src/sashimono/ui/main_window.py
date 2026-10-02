@@ -1416,11 +1416,11 @@ class MainWindow(QMainWindow):
         found = [
             item for item in hdr_notice.outside_sdr(loaded) if item.path not in self._hdr_noticed
         ]
-        if not found:
+        # 切ってある間は覚えない 覚えると、同じ窓のまま設定を入れ直して読み込み直しても、
+        # 1 度も知らせていない素材なのに知らせが出ない
+        if not found or not self._preferences.hdr_notice:
             return
         self._hdr_noticed.update(item.path for item in found)
-        if not self._preferences.hdr_notice:
-            return
         if not hdr_notice.ask_hdr_notice(self, found):
             self._remember_preferences(replace(self._preferences, hdr_notice=False))
 

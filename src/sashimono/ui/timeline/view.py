@@ -318,7 +318,10 @@ class TimelineView(QWidget):
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumHeight(160)
+        # 最小は目盛りとトラック 1 本ぶん 前の 160 は窓の最小の高さを押し上げ、CI の書体
+        # （行の高さが手元より高い）で 1280x720 の画面の中身（640）に窓が収まらなかった
+        # 狭い窓でも巻物で全部のトラックへ届く 広い窓では今までどおり伸びる
+        self.setMinimumHeight(Metrics.RULER_HEIGHT + Metrics.DEFAULT_TRACK_HEIGHT)
         # 中身は自前で描いているので、読み上げソフトにはこの名前しか伝わらない
         self.setAccessibleName("タイムライン")
         self.setAccessibleDescription(

@@ -140,6 +140,17 @@ class TestTheNoticeOnImport:
         _import(window, tagged["pq"])
         assert silent_hdr_notice == []
 
+    def test_turning_it_back_on_tells_material_read_while_it_was_off(
+        self, window: MainWindow, tagged: dict[str, Path], silent_hdr_notice: list[list[str]]
+    ) -> None:
+        # 切っている間に読み込んだ素材を「知らせた」と覚えると、同じ窓のまま設定を入れ直して
+        # 読み込み直しても、1 度も知らせていないのに知らせが出ない
+        window._apply_preferences(Preferences(hdr_notice=False))
+        _import(window, tagged["pq"])
+        window._apply_preferences(Preferences(hdr_notice=True))
+        _import(window, tagged["pq"])
+        assert silent_hdr_notice == [["hdr-pq.mp4"]]
+
     def test_dont_tell_again_turns_the_preference_off(
         self, window: MainWindow, tagged: dict[str, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -185,6 +196,11 @@ class TestThePreference:
         assert PreferenceStore(broken).load().hdr_notice is True
 
     def test_the_dialog_shows_and_returns_it(self, qt_application: QApplication) -> None:
+        """設定画面の印が今の値を映し、OK で返す値に入る
+
+        映さないと、切ってあるのに入に見える 返さないと、印を付け外しして OK を押しても
+        設定が変わらず、知らせを切りたい人が切れない（入れ直したい人が戻せない）
+        """
         del qt_application
         dialog = PreferencesDialog(Preferences(hdr_notice=False))
         try:

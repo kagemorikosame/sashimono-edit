@@ -223,6 +223,17 @@ class ChatPanel(QWidget):
         self._input = _Input(self)
         self._describe_send_key()
         self._input.setMaximumHeight(96)
+        # 最小は行の数で決める Qt の既定（巻物の欄の最小）は会話の欄と合わせて 140 画素あり、
+        # 設定パネルと重ねた右の列の最小の高さになって、1280x720 の画面に窓が収まらなかった
+        # 書体で行の高さが変わっても、会話は 2 行・入力は 1 行が必ず見える
+        areas: tuple[tuple[QTextBrowser | QPlainTextEdit, int], ...] = (
+            (self._view, 2),
+            (self._input, 1),
+        )
+        for area, lines in areas:
+            frame = 2 * area.frameWidth()
+            margin = round(2 * area.document().documentMargin())
+            area.setMinimumHeight(lines * area.fontMetrics().lineSpacing() + frame + margin)
         self._input.submitted.connect(self.send)
 
         self._auto = QCheckBox("変更を自動で承認", self)
