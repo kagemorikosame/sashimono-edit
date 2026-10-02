@@ -24,10 +24,14 @@ from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication, QLabel, QTreeWidget, QWidget
 
+from sashimono.asr import environment
+from sashimono.asr.service import TranscriptionService
+from sashimono.asr.whisper import FasterWhisperBackend
 from sashimono.compat.aviutl import catalog as catalog_module
 from sashimono.compat.aviutl.catalog import ScriptCatalog, script_catalog, set_script_catalog
 from sashimono.compat.catalog import TemplateCatalog
 from sashimono.core import userdirs
+from sashimono.core.model import MediaItem
 from sashimono.effects.definition import registry
 from tests.media_fixtures import libx264_available
 
@@ -137,9 +141,75 @@ class TestWorkFolder:
             shots.work_folder_base(home, home)
 
     def test_a_folder_outside_the_home_is_used(self, shots: ModuleType, tmp_path: Path) -> None:
+        """ホームの外の場所は、そのまま作業用のフォルダの置き場として使う
+
+        壊れてホームの外まで断るようになると、``--work`` でホームの外の場所を渡しても
+        撮影が始まらず、写真を 1 枚も撮り直せなくなる
+        """
         outside = tmp_path / "外"
         outside.mkdir()
         assert shots.work_folder_base(outside, tmp_path / "ホーム") == outside.resolve()
+
+
+class TestTranscribeShot:
+    """字幕起こしの環境が入っている機械でも、「環境を導入」の写真が撮れること
+
+    窓は導入済みならボタンを「環境を更新」にする 機械の状態のまま開くと、囲む
+    「環境を導入」が見つからずに撮影が失敗する 起こしの機能を使っている開発者の
+    機械ほど撮れなくなる
+    """
+
+    @pytest.fixture
+    def installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """この機械には字幕起こしの環境が入っている、ということにする"""
+        from sashimono.runtime import PackageStatus, PackStatus
+        from sashimono.ui.subtitle import transcribe_dialog
+
+        pack = environment.ASR_PACK
+        status = PackStatus(
+            pack=pack,
+            packages=tuple(PackageStatus(name, "99.0") for name in pack.required),
+            extras=tuple(PackageStatus(name, "99.0") for name in pack.extra),
+        )
+        monkeypatch.setattr(transcribe_dialog, "runtime_status", lambda: status)
+
+    @pytest.mark.usefixtures("installed")
+    def test_the_machine_state_says_update(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 前提の確かめ 状態を渡さなければ機械の状態（導入済み）で開く
+        del qt_application
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        dialog = TranscribeDialog(video_media, TranscriptionService(FasterWhisperBackend()))
+        try:
+            assert dialog._install_button.text() == "環境を更新"
+        finally:
+            dialog.deleteLater()
+
+    @pytest.mark.usefixtures("installed")
+    def test_the_shot_opens_the_first_time_state(
+        self, shots: ModuleType, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        del qt_application
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        dialog = TranscribeDialog(
+            video_media,
+            TranscriptionService(FasterWhisperBackend()),
+            status=shots.asr_not_installed,
+        )
+        shots.hide_from_screen(dialog)
+        dialog.show()
+        QApplication.processEvents()
+        try:
+            assert dialog._install_button.text() == "環境を導入"
+            # 撮影が囲むボタンを探す所を、そのまま通る
+            assert shots._buttons(dialog, ("環境を導入",))
+            assert not dialog._run_button.isEnabled()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
 
 
 class TestIsolation:

@@ -95,6 +95,7 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.definition import registry
 from sashimono.effects.sources import TEXT
+from sashimono.runtime import PackageStatus, PackStatus
 from sashimono.ui.compat_dialog import CompatibilityDialog
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.main_window import MainWindow
@@ -1188,15 +1189,44 @@ def wiki_subtitle_menu(context: Context) -> QImage:
 
 
 def wiki_subtitle_install(context: Context) -> QImage:
-    """起こしの環境が入っていないときの〔起こす…〕の窓"""
+    """起こしの環境が入っていないときの〔起こす…〕の窓
+
+    手順書が見せるのは初めて使う人の画面 撮る機械に環境が入っていても未導入の状態を
+    渡す 機械の状態のまま開くと、導入済みの機械ではボタンが「環境を更新」になり、
+    囲む「環境を導入」が見つからずに撮れない
+    """
     from sashimono.asr import TranscriptionService, default_backend
     from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 
     with editor(sample_project()) as window:
         import_sample(window, context)
         media = window.project.media[0]
-        dialog = TranscribeDialog(media, TranscriptionService(default_backend()), window)
+        dialog = TranscribeDialog(
+            media,
+            TranscriptionService(default_backend()),
+            window,
+            status=asr_not_installed,
+        )
         return _grab_dialog(dialog, marks=("環境を導入",))
+
+
+def asr_not_installed() -> PackStatus:
+    """字幕起こしの環境が 1 つも入っていない状態 初めて使う人の機械と同じ"""
+    from sashimono.asr import ASR_PACK
+
+    return PackStatus(
+        pack=ASR_PACK,
+        packages=tuple(_not_installed(name) for name in ASR_PACK.required),
+        extras=tuple(_not_installed(name) for name in ASR_PACK.extra),
+    )
+
+
+def _not_installed(requirement: str) -> PackageStatus:
+    """入っていないパッケージ 最低の版は条件の書き方（``>=``）から読む"""
+    minimum = (
+        requirement.split(">=", 1)[1].split(",", 1)[0].strip() if ">=" in requirement else None
+    )
+    return PackageStatus(requirement, None, minimum or None)
 
 
 def wiki_subtitle_clean(context: Context) -> QImage:
