@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QStandardItemModel
+from PySide6.QtGui import QCloseEvent, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -130,6 +130,8 @@ class ExportDialog(QDialog):
         self._smooth_history = smooth_history
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
+        #: 書き出し中に閉じるよう頼まれた 止まった知らせが来たら閉じる
+        self._closing = False
 
         default_name = f"{project.name}.mp4"
         self._path = QLineEdit(str(Path.home() / "Videos" / default_name), self)
@@ -355,41 +357,65 @@ class ExportDialog(QDialog):
 
     def _on_finished(self, path: str) -> None:
         self._teardown()
+        if self._closing:
+            # 閉じるよう頼まれて止めている間に書き終わった 頼まれたとおり閉じる
+            super().reject()
+            return
         QMessageBox.information(self, "書き出し", f"書き出しました\n{path}")
         self.accept()
 
     def _on_failed(self, message: str) -> None:
         self._teardown()
+        if self._closing:
+            # 止めた知らせ（中止）が届いた もうスレッドは走っていないので閉じてよい
+            super().reject()
+            return
         QMessageBox.warning(self, "書き出し", message)
 
     def _teardown(self) -> None:
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait(5000)
+            # 時間を区切らずに待つ ここへ来るのはワーカーが書き出しを終えて知らせた後で、
+            # スレッドはイベントループを抜けるだけ 区切って諦めると、走っている
+            # スレッドを持ったまま窓を捨てることになる
+            self._thread.wait()
             self._thread = None
         self._worker = None
         self._progress.setVisible(False)
         self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
         self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("閉じる")
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt の命名規約
-        # 書き出し中に閉じられたら、スレッドを畳んでから終わる
-        # 放置すると Qt がスレッドの生存中に破棄されたと言って落ちる
-        self._stop_worker()
-        super().closeEvent(event)  # type: ignore[arg-type]
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt の命名規約
+        # 書き出し中に閉じられたら、止めるよう頼むだけで今は閉じない 止まった知らせが
+        # 来てから閉じる 走っているスレッドを持ったまま窓が壊れると、Qt はスレッドの
+        # 生存中に破棄されたと言って落ちる
+        if self._worker is not None:
+            event.ignore()
+            self._close_when_stopped()
+            return
+        super().closeEvent(event)
 
     def reject(self) -> None:
-        """〔閉じる〕と Esc 窓の × と同じく、書き出し中ならスレッドを畳んでから閉じる
+        """〔閉じる〕と Esc 窓の × と同じく、書き出し中なら止まってから閉じる
 
-        reject は closeEvent を通らない 畳まずに閉じると、開いた側が窓を捨てたときに
-        走っているスレッドごと壊れて落ちる
+        reject は closeEvent を通らない ここでも止まったと確かめるまで閉じない
         """
-        self._stop_worker()
+        if self._worker is not None:
+            self._close_when_stopped()
+            return
         super().reject()
 
-    def _stop_worker(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-            if self._thread is not None:
-                self._thread.quit()
-                self._thread.wait(5000)
+    def _close_when_stopped(self) -> None:
+        """書き出しを止めるよう頼み、止まった知らせ（``_on_failed``）が来たら閉じる
+
+        その場で待たない 待つと止まるまで窓が固まり、時間を区切って諦めると走っている
+        スレッドを残したまま閉じることになる 止まるまでは〔中止〕を押せなくして、
+        止めている最中だと見せる
+        """
+        if self._worker is None:
+            return
+        self._closing = True
+        self._worker.cancel()
+        cancel = self._buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel.setText("止めています…")
+        cancel.setEnabled(False)

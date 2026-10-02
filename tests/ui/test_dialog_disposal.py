@@ -12,6 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 from PySide6.QtCore import QEvent
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog
 
 from sashimono.core.model import Project
@@ -61,34 +62,68 @@ def test_opening_and_closing_does_not_pile_up(
     assert window.findChildren(QDialog) == []
 
 
-def test_closing_the_export_window_stops_the_export(qt_application: QApplication) -> None:
-    """〔閉じる〕（reject）でも、書き出しを止めてから閉じること
+class _Worker:
+    """書き出しの途中のワーカーの代わり 止めるよう頼まれたかを覚える"""
 
-    reject は closeEvent を通らない 止めずに閉じると、開いた側が窓を捨てたときに
-    走っているスレッドごと壊れる
-    """
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _Thread:
+    """止まらないスレッドの代わり 止まったと言うのは、ワーカーの知らせの後だけ"""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def quit(self) -> None:
+        return None
+
+    def wait(self, timeout: int | None = None) -> bool:
+        del timeout
+        return self.stopped
+
+
+@pytest.fixture
+def exporting(qt_application: QApplication) -> Iterator[tuple[ExportDialog, _Worker, _Thread]]:
+    """書き出しの途中の窓 本物のスレッドは走らせない"""
     del qt_application
     dialog = ExportDialog(Project.create())
-    calls: list[str] = []
-
-    class Worker:
-        def cancel(self) -> None:
-            calls.append("cancel")
-
-    class Thread:
-        def quit(self) -> None:
-            calls.append("quit")
-
-        def wait(self, timeout: int) -> bool:
-            del timeout
-            calls.append("wait")
-            return True
-
-    # 書き出しの途中の形にする 本物のスレッドは走らせない
-    dialog._worker = Worker()  # type: ignore[assignment]
-    dialog._thread = Thread()  # type: ignore[assignment]
-    dialog.reject()
-    dialog._thread = None
+    worker, thread = _Worker(), _Thread()
+    dialog._worker = worker  # type: ignore[assignment]
+    dialog._thread = thread  # type: ignore[assignment]
+    yield dialog, worker, thread
     dialog._worker = None
+    dialog._thread = None
     dialog.deleteLater()
-    assert calls == ["cancel", "quit", "wait"]
+
+
+@pytest.mark.parametrize("closing", ["reject", "close"])
+def test_closing_while_exporting_waits_for_the_stop(
+    exporting: tuple[ExportDialog, _Worker, _Thread], closing: str
+) -> None:
+    """書き出し中に閉じても、止まった知らせが来るまで閉じないこと
+
+    止まったと確かめずに閉じると、開いた側が窓を捨てたときに走っているスレッドごと
+    壊れて落ちる 前は 5 秒だけ待ち、止まらなくても閉じていた 〔閉じる〕と Esc
+    （reject）は closeEvent を通らないので、どちらの道も見る
+    """
+    dialog, worker, thread = exporting
+    closed: list[bool] = []
+    dialog.rejected.connect(lambda: closed.append(True))
+    if closing == "reject":
+        dialog.reject()
+    else:
+        event = QCloseEvent()
+        dialog.closeEvent(event)
+        assert not event.isAccepted()
+    assert worker.cancelled
+    assert closed == []
+
+    # 止まった知らせ（中止は失敗として届く）が来たら、そこで閉じる
+    thread.stopped = True
+    dialog._on_failed("中止した")
+    assert closed == [True]
+    assert dialog._thread is None
