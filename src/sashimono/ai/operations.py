@@ -47,6 +47,7 @@ from sashimono.core.commands import (
     TrimClip,
     UngroupClips,
     Voice,
+    burn_defaults,
     burn_subtitles,
     insert_generated,
     insert_media,
@@ -1364,7 +1365,8 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     raw_segments = arguments.get("segment_ids")
     segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
 
-    template: GeneratedSource | Clip = TEXT.create(size=48.0, pos_y=-380.0, border_width=4.0)
+    # 画面の〔焼き込み〕と同じ既定 作品の高さに合わせて縮める
+    template: GeneratedSource | Clip = TEXT.create(**burn_defaults(project.settings.height))
     if arguments.get("template_clip_id"):
         located = project.timeline.locate_clip(ClipId(str(arguments["template_clip_id"])))
         if located is None:

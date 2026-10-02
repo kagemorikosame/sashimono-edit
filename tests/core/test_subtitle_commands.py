@@ -15,6 +15,7 @@ from sashimono.core.commands import (
     SetSegmentText,
     SetTranscript,
     SplitSegment,
+    burn_defaults,
     burn_subtitles,
 )
 from sashimono.core.model import (
@@ -192,6 +193,23 @@ class TestBurnSubtitles:
         assert first is not None
         assert first.params["text"] == "今日は"
         assert first.params["size"] == AnimatedValue(48.0)
+
+    def test_the_default_look_is_unchanged_at_1080p(self) -> None:
+        # 1080p では前の版と同じ見た目 変わると、前の版で焼いた字幕と並べたときに揃わない
+        assert burn_defaults(1080) == {"size": 48.0, "pos_y": -380.0, "border_width": 4.0}
+
+    @pytest.mark.parametrize("height", [480, 720, 1080, 2160])
+    def test_the_default_look_stays_inside_the_frame(self, height: int) -> None:
+        """既定の焼き込みが、どの高さの作品でも画面の中に出ること
+
+        画素のまま -380 に置いていたときは、720p（下端が -360）で字幕が丸ごと画面の
+        外に出て、焼き込んだのにプレビューにも書き出しにも何も出なかった
+        """
+        look = burn_defaults(height)
+        bottom = look["pos_y"] - look["size"] / 2 - look["border_width"]
+        assert bottom > -height / 2
+        # 下寄せのまま 真ん中より下に出る
+        assert look["pos_y"] < -height / 4
 
     def test_nothing_to_burn_returns_no_commands(self, project: Project) -> None:
         assert burn_subtitles(project, GeneratedSource(kind="text")) == []

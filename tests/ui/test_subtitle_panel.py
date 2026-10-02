@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from sashimono.core.commands import (
     SetWorkArea,
     TrimClip,
 )
-from sashimono.core.model import MediaItem, Project, Transcript
+from sashimono.core.model import AnimatedValue, MediaItem, Project, Transcript
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -419,6 +420,32 @@ class TestBurnAndExport:
         assert label == "字幕を焼き込み"
         # トラックを 1 本足して、字幕 3 枚をテキストとして置く
         assert len(commands) == 4
+
+    def test_burned_text_is_inside_a_720p_frame(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        """既定の見た目で焼いた字幕が、720p の作品でも画面の中に置かれること
+
+        前は 1080p 用の縦位置（-380）を画素のまま使い、720p の作品では画面の下端
+        （-360）より下に置かれて、焼き込んだ字幕がどこにも映らなかった
+        """
+        del qt_application
+        small = replace(placed, settings=replace(placed.settings, width=1280, height=720))
+        widget = SubtitlePanel(small, StubAnalyzer())
+        issued: list[tuple[list[Command], str]] = []
+        widget.commands_requested.connect(lambda commands, label: issued.append((commands, label)))
+        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.burn()
+        widget.deleteLater()
+        commands, _ = issued[-1]
+        half = 720 / 2
+        clips = [c.clip for c in commands if isinstance(c, AddClip)]
+        assert clips
+        for clip in clips:
+            assert clip.source is not None
+            position = clip.source.params["pos_y"]
+            assert isinstance(position, AnimatedValue)
+            assert -half < position.at(0) < 0
 
     def test_export_writes_the_file(
         self,

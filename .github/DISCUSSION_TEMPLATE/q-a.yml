@@ -8,7 +8,7 @@ body:
         使い方の質問、不具合か要望かはっきりしないことはここへどうぞ
         答えが付いたら「Mark as answer」で印を付けてもらえると、同じことで困った人が見つけやすくなります
 
-        - 使い方の説明は [README の主な操作](https://github.com/kagemorikosame/sashimono-edit#主な操作) にもあります
+        - 使い方の説明と画像付きの手順書は [Wiki](https://github.com/kagemorikosame/sashimono-edit/wiki) にあります
         - 明らかに動かない・落ちるときは [不具合の報告](https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=bug-reports) の方が、版や手順の欄があって早く片付きます
 
   - type: input

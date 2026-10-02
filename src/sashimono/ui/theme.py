@@ -485,6 +485,9 @@ QMenu {{
     background-color: {Colors.PANEL.name()};
     border: 1px solid {Colors.BORDER.name()};
 }}
+/* 項目の余白を決めておく 決めないと、文字の大きさをここで決めているせいで項目の幅が
+   文言とショートカットの和に足りず、長い項目では文言の終わりにショートカットが重なる */
+QMenu::item {{ padding: 4px 32px 4px 20px; }}
 QMenu::item:selected {{
     background-color: {Colors.ACCENT.name()};
     color: {Colors.ACCENT_TEXT.name()};

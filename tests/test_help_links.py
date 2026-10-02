@@ -27,9 +27,16 @@ def _headings(markdown: str) -> set[str]:
 
 
 class TestLinks:
+    def test_the_manual_is_the_wiki_home(self) -> None:
+        # 〔ヘルプ〕→〔使い方〕（F1）は Wiki のホームを開く ホームの目次と横の目次から
+        # 手順書へたどれる 壊れると、README の 1 節だけを見せて手順書へ行けない
+        parts = urlsplit(MANUAL_URL)
+        assert f"{REPOSITORY_URL}/wiki" == MANUAL_URL
+        assert not parts.fragment
+
     def test_the_manual_points_at_a_heading_that_exists(self) -> None:
-        # Wiki を公開するまでは README の節へ飛ばす 節の名前を変えると、GitHub は
-        # README の頭を出すだけで、何も言わずに案内先を失う
+        # 節を指すように戻したときの備え 節の名前を変えると、GitHub は README の頭を
+        # 出すだけで、何も言わずに案内先を失う
         parts = urlsplit(MANUAL_URL)
         if parts.fragment:
             readme = (ROOT / "README.md").read_text(encoding="utf-8")

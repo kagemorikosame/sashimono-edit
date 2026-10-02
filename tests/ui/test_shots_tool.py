@@ -10,7 +10,9 @@ GPU が要る検査は ``gpu`` フィクスチャを付けてある GPU の無�
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -87,27 +89,94 @@ class TestShelfRoots:
             dialog.close()
 
 
-class TestChoosingTemplates:
-    def test_the_named_template_wins(self, shots: ModuleType, tmp_path: Path) -> None:
-        # README の本文が名前を引き合いに出している どれが写るか分からないと、
-        # 本文と絵が食い違う
-        (tmp_path / "あ.object").write_text(SAMPLE_ALIAS, encoding="utf-8")
-        (tmp_path / "13_金ピカテキスト.object").write_text(SAMPLE_ALIAS, encoding="utf-8")
-        entries = TemplateCatalog().scan((tmp_path,))
+class TestSampleTemplates:
+    """写真に写すテンプレートは、道具が書いた見本だけ
 
-        chosen = shots._choose(entries, shots.PREFERRED_ALIAS, shots._has_text)
-        assert chosen is not None
-        assert chosen.name == "13_金ピカテキスト"
+    配布物は再配布の条件が作者ごとに違うので写さない 見本が読めなくなると、
+    棚とテンプレートの写真が撮れなくなる
+    """
 
-    def test_without_the_named_one_it_falls_back(self, shots: ModuleType, tmp_path: Path) -> None:
-        # 名指しの配布物が無い機械でも、文字を持つ物の先頭に落ちること 落ちないと
-        # 棚の写真は何も選ばれていない状態で写り、着せた写真は撮られずに飛ぶ
-        (tmp_path / "あ.object").write_text(SAMPLE_ALIAS, encoding="utf-8")
-        entries = TemplateCatalog().scan((tmp_path,))
+    def test_every_sample_is_on_the_shelf(self, shots: ModuleType, tmp_path: Path) -> None:
+        root = shots.write_sample_templates(tmp_path / "見本")
+        names = {entry.name.rsplit("/", 1)[-1] for entry in TemplateCatalog().scan((root,))}
+        expected = set(shots.SAMPLE_ALIASES) | {name for name, _ in shots.SAMPLE_YMM4}
+        assert names == expected
 
-        chosen = shots._choose(entries, shots.PREFERRED_ALIAS, shots._has_text)
-        assert chosen is not None
-        assert chosen.name == "あ"
+    def test_every_sample_carries_text(self, shots: ModuleType, tmp_path: Path) -> None:
+        # 文字を持たない見本は、着せる写真（自分で打った字幕に見た目を写す）に使えない
+        root = shots.write_sample_templates(tmp_path / "見本")
+        for entry in TemplateCatalog().scan((root,)):
+            kinds = {
+                inner.clip.source.kind
+                for item in entry.load()
+                for inner in item.walk()
+                if inner.clip.source is not None
+            }
+            assert "text" in kinds, entry.name
+
+    def test_the_named_samples_are_found(self, shots: ModuleType, tmp_path: Path) -> None:
+        # README の本文が名前を引き合いに出している 見つからないと写真が撮れない
+        root = shots.write_sample_templates(tmp_path / "見本")
+        context = shots.Context(media=None, script_root=tmp_path / "s", template_root=root)
+        for name in (shots.SAMPLE_ALIAS_NAME, shots.SAMPLE_YMM4_NAME):
+            assert shots._named(shots.find_template(context, name), name)
+
+
+class TestWorkFolder:
+    def test_the_home_is_refused(self, shots: ModuleType, tmp_path: Path) -> None:
+        """作業用のフォルダをホームの下に作らない
+
+        作ると、ユーザー名を含む場所が素材や設定の置き場として画面に出たとき、
+        そのまま写真に写る
+        """
+        home = tmp_path / "ホーム"
+        (home / "下").mkdir(parents=True)
+        with pytest.raises(shots.ShotError):
+            shots.work_folder_base(home / "下", home)
+        with pytest.raises(shots.ShotError):
+            shots.work_folder_base(home, home)
+
+    def test_a_folder_outside_the_home_is_used(self, shots: ModuleType, tmp_path: Path) -> None:
+        outside = tmp_path / "外"
+        outside.mkdir()
+        assert shots.work_folder_base(outside, tmp_path / "ホーム") == outside.resolve()
+
+
+class TestIsolation:
+    def test_every_folder_the_app_reads_is_redirected(
+        self, shots: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """設定・ProgramData・ホーム・一時フォルダのどれも作業用のフォルダへ向く
+
+        ProgramData が漏れると、AviUtl2 の配布エイリアスとスクリプトが棚と一覧に
+        並んで写真に写る ホームが漏れると、書き出し先の欄にユーザー名が出る
+        """
+        names = ("APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERPROFILE", "HOME", "TEMP", "TMP")
+        for name in names:
+            # 試験の後に元へ戻す印として、今の値を monkeypatch に覚えさせる
+            monkeypatch.setenv(name, os.environ.get(name, ""))
+        monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
+        base = tmp_path / "作業"
+        shots.isolate_user_folders(base)
+        for name in names:
+            assert Path(os.environ[name]).is_relative_to(base), name
+        assert Path(tempfile.gettempdir()).is_relative_to(base)
+
+
+class TestMarking:
+    def test_a_mark_at_the_edge_stays_visible(
+        self, shots: ModuleType, qt_application: QApplication
+    ) -> None:
+        """窓の端の部品を囲んでも、枠の辺が画像の中に残ること
+
+        広げたまま描くと、左の辺が画像の外（x が負）に出て、囲みが欠けて見える
+        """
+        del qt_application
+        image = QImage(100, 100, QImage.Format.Format_RGB32)
+        image.fill(QColor("black"))
+        shots.mark(image, [QRect(0, 0, 50, 50)])
+        column = [image.pixelColor(x, 25) for x in range(0, 5)]
+        assert any(color.red() > 200 and color.blue() < 80 for color in column)
 
 
 class TestSettling:
@@ -189,7 +258,7 @@ class TestCompatibilityShot:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("HOME", str(home))
         context = shots.Context(
-            media=None, alias_root=None, ymm4_root=None, script_root=home / "scripts"
+            media=None, script_root=home / "scripts", template_root=home / "templates"
         )
         with _restored_scripts():
             dialog = shots.compatibility_dialog(context)
@@ -246,7 +315,7 @@ class TestCompatibilityShot:
         """
         del qt_application
         context = shots.Context(
-            media=None, alias_root=None, ymm4_root=None, script_root=tmp_path / "scripts"
+            media=None, script_root=tmp_path / "scripts", template_root=tmp_path / "t"
         )
         kinds = {definition.kind for definition in registry.all()}
         with _restored_scripts():
@@ -297,15 +366,44 @@ class TestTakingTheEditorShot:
 
         context = shots.Context(
             media=shots.make_sample_media(tmp_path / "media"),
-            alias_root=None,
-            ymm4_root=None,
             script_root=tmp_path / "scripts",
+            template_root=tmp_path / "templates",
         )
         with shots.editor(shots.sample_project()) as window:
             shots.build_sample_timeline(window, context)
             image = shots.take_editor_shot(window)
             rect = shots.preview_rect(window)
+            # 窓は部品の最小の幅より狭くできないので、頼んだ幅より広がることがある
+            # 撮った絵は窓の論理的な大きさそのもの（画面の拡大率に左右されない）
+            size = (window.width(), window.height())
 
-        assert (image.width(), image.height()) == shots.WINDOW_SIZE
+        assert (image.width(), image.height()) == size
+        assert size[1] == shots.WINDOW_SIZE[1]
         assert rect is not None
         assert shots.brightest(image, rect) > shots.BLACK_LEVEL
+
+
+class TestAssistantShot:
+    def test_the_sample_conversation_is_never_sent(
+        self, shots: ModuleType, qt_application: QApplication
+    ) -> None:
+        """AI の写真の会話は見せるだけで、Claude には送らない
+
+        送ると、撮るたびに文面が変わり、課金の要る呼び出しになる 会話は本物と同じ
+        描き方で並び、会話の相手（セッション）は作られないままであること
+        """
+        del qt_application
+        from sashimono.ui.chat import ChatPanel
+        from sashimono.ui.main_window import MainWindow
+
+        window = MainWindow(shots.sample_project(), confirm_unsaved=False)
+        try:
+            panel = window.findChild(ChatPanel)
+            assert panel is not None
+            shots._fake_conversation(panel)
+            shown = panel._view.toPlainText()
+            assert panel._session is None
+            for _, text in shots.SAMPLE_CHAT:
+                assert text.replace("**", "") in shown
+        finally:
+            window.close()

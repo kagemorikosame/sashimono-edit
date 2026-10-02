@@ -43,6 +43,7 @@ from sashimono.core.commands import (
     SetTranscript,
     SplitSegment,
     Voice,
+    burn_defaults,
     burn_subtitles,
     export_range,
     subtitle_voices,
@@ -71,9 +72,6 @@ from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["SubtitlePanel", "ask_subtitle_range"]
-
-#: 焼き込むテキストの既定 下寄せで、縁取りを付けて読めるようにする
-BURN_DEFAULTS = {"size": 48.0, "pos_y": -380.0, "border_width": 4.0}
 
 
 #: 時刻の列に足す余白（画素） 文字の幅ぴったりだと読みにくい
@@ -774,9 +772,11 @@ class SubtitlePanel(QWidget):
             text = str(clip.source.params.get("text", "")).splitlines()
             head = text[0][:12] if text else ""
             return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
-        return TEXT.create(**BURN_DEFAULTS), (
-            "見た目: 既定（大きさ 48・下寄せ・縁取り 4） タイムラインでテキストを選んでから"
-            "焼き込むと、そのテキストの見た目を写します"
+        # 既定の大きさと位置は作品の高さで縮める 画素のまま置くと、720p では画面の外に出る
+        look = burn_defaults(self._project.settings.height)
+        return TEXT.create(**look), (
+            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}）"
+            " タイムラインでテキストを選んでから焼き込むと、そのテキストの見た目を写します"
         )
 
     def burn(self) -> None:
