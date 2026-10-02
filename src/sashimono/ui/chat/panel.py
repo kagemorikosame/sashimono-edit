@@ -40,7 +40,7 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.ui.setup import SetupSection
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.workspace import Preferences
 
 __all__ = ["ChatPanel"]
@@ -122,8 +122,12 @@ class ChatPanel(QWidget):
         #: 送ってまだ応答が終わっていない指示（送った順） 会話を繋ぎ直してよいかの
         #: 判断と、続けて送った指示の取り消しの段を、その指示の名前で開くのに使う
         self._queued: deque[str] = deque()
+        #: 出した会話（言った人、文） 補足は言った人が ``None`` テーマを切り替えたときに
+        #: 今の色で書き直すために持つ
+        self._log: list[tuple[str | None, str]] = []
 
         self._build()
+        theme_signals().changed.connect(self._redraw_log)
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self._poll)
@@ -167,7 +171,7 @@ class ChatPanel(QWidget):
             self._login_box,
         )
         self._login_text.setWordWrap(True)
-        self._login_text.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._login_text, lambda: f"color: {Colors.TEXT_MUTED.name()};")
         self._login_button = QPushButton("ログイン…", self._login_box)
         self._login_button.clicked.connect(self.open_login)
         login_layout = QHBoxLayout(self._login_box)
@@ -177,8 +181,12 @@ class ChatPanel(QWidget):
 
         self._view = QTextBrowser(self)
         self._view.setOpenExternalLinks(False)
-        self._view.setStyleSheet(
-            f"background-color: {Colors.PANEL_ALT.name()};border: 1px solid {Colors.BORDER.name()};"
+        themed_style(
+            self._view,
+            lambda: (
+                f"background-color: {Colors.PANEL_ALT.name()};"
+                f"border: 1px solid {Colors.BORDER.name()};"
+            ),
         )
 
         self._approval_box = QFrame(self)
@@ -502,26 +510,48 @@ class ChatPanel(QWidget):
     # --- 表示 ---
 
     def _say(self, who: str, text: str) -> None:
-        color = {
-            "あなた": Colors.TEXT.name(),
-            "Claude": Colors.ACCENT.name(),
-            "エラー": Colors.PLAYHEAD.name(),
-        }.get(who, Colors.TEXT_MUTED.name())
-        body = html.escape(text).replace("\n", "<br>")
-        self._view.append(f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>')
+        self._log.append((who, text))
+        self._view.append(_message_html(who, text))
         self._scroll_to_end()
 
     def _note(self, text: str) -> None:
         """ツールの呼び出しなど、会話の本体ではないもの"""
-        self._view.append(
-            f'<span style="color:{Colors.TEXT_MUTED.name()}">{html.escape(text)}</span>'
-        )
+        self._log.append((None, text))
+        self._view.append(_message_html(None, text))
+        self._scroll_to_end()
+
+    def _redraw_log(self) -> None:
+        """テーマが変わった 会話を今の色で書き直す
+
+        色は HTML に焼き込んであるので、描き直すだけでは前のテーマの色のまま残る
+        暗いテーマの白に近い文字が、明るい地の上で読めなくなる
+        """
+        self._view.clear()
+        for who, text in self._log:
+            self._view.append(_message_html(who, text))
         self._scroll_to_end()
 
     def _scroll_to_end(self) -> None:
         bar = self._view.verticalScrollBar()
         if bar is not None:
             bar.setValue(bar.maximum())
+
+
+def _message_html(who: str | None, text: str) -> str:
+    """会話の 1 件を HTML へ ``who`` が ``None`` なら会話の本体ではない補足
+
+    Claude の返事だけ太字と等幅を組む 本人の指示やエラーの文に ``**`` が
+    あっても、書いたとおりに見せる
+    """
+    if who is None:
+        return f'<span style="color:{Colors.TEXT_MUTED.name()}">{html.escape(text)}</span>'
+    color = {
+        "あなた": Colors.TEXT.name(),
+        "Claude": Colors.ACCENT.name(),
+        "エラー": Colors.PLAYHEAD.name(),
+    }.get(who, Colors.TEXT_MUTED.name())
+    body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
+    return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'
 
 
 def _to_html(text: str) -> str:

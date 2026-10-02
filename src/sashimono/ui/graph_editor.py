@@ -32,7 +32,7 @@ from sashimono.core.commands import (
 from sashimono.core.model import AnimatedValue, Clip, ClipId, Interpolation, Keyframe, Project
 from sashimono.effects import ParameterSpec, TrackSpec, registry
 from sashimono.effects.sources import source_registry
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["GraphEditor", "curve_choices"]
 
@@ -153,7 +153,7 @@ class GraphEditor(QWidget):
         self._dragging: int | None = None
 
         self._title = QLabel("パラメータを選んでください", self)
-        self._title.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._title, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         #: 曲線を出す値を選ぶ欄 並びは :func:`curve_choices` キーフレームのある値に ◆ を付ける
         self._params = QComboBox(self)

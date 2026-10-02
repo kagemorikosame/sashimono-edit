@@ -34,7 +34,7 @@ from sashimono.runtime import (
     restart_note,
     snapshot_runtime_modules,
 )
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["SetupSection"]
 
@@ -67,7 +67,7 @@ class SetupSection(QWidget):
 
         self._status = QLabel(self)
         self._status.setWordWrap(True)
-        self._status.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._status, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._extra = QCheckBox(pack.extra_label or "追加分も入れる", self)
         self._extra.setChecked(True)

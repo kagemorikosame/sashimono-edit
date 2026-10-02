@@ -33,9 +33,6 @@ __all__ = [
     "spot_at",
 ]
 
-#: 新しく作るトラックの仮の行 本物のトラックと見分けが付くよう、地より少しだけ明るくする
-_GHOST_ROW = QColor(255, 255, 255, 14)
-
 
 @dataclass(frozen=True, slots=True)
 class DropSpot:
@@ -178,7 +175,7 @@ def paint_drop_guide(
             continue
         # まだ無いトラックだと分かるように地を明るくし、名前の欄の下に添える
         row = QRectF(0, band.top, width, band.height)
-        painter.fillRect(row.adjusted(0, 1, 0, -1), _GHOST_ROW)
+        painter.fillRect(row.adjusted(0, 1, 0, -1), Colors.GHOST_ROW)
         painter.setPen(Colors.TEXT_MUTED)
         painter.drawText(
             QRectF(8, band.top, Metrics.TRACK_HEADER_WIDTH - 8, band.height - 4),

@@ -15,10 +15,11 @@ import pytest
 
 from sashimono.core import userdirs
 from sashimono.core.userdirs import APP_FOLDER
-from sashimono.links import MANUAL_URL, REPORT_URL, REPOSITORY_URL
+from sashimono.links import DISCUSSION_CATEGORIES, MANUAL_URL, REPORT_URL, REPOSITORY_URL
 
 ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES = ROOT / ".github" / "ISSUE_TEMPLATE"
+ISSUES = ROOT / ".github" / "ISSUE_TEMPLATE"
+TEMPLATES = ROOT / ".github" / "DISCUSSION_TEMPLATE"
 
 
 def _headings(markdown: str) -> set[str]:
@@ -40,10 +41,10 @@ class TestLinks:
             assert url.startswith(REPOSITORY_URL)
 
 
-class TestIssueTemplates:
+class TestReportTemplates:
     def test_the_contact_links_point_into_the_repository(self) -> None:
         # 壊れると、雛形を選ぶ画面の「質問はこちら」が別のリポジトリへ飛ぶ
-        config = (TEMPLATES / "config.yml").read_text(encoding="utf-8")
+        config = (ISSUES / "config.yml").read_text(encoding="utf-8")
         urls = re.findall(r"^\s*url:\s*(\S+)", config, re.M)
         assert urls
         assert all(url.startswith(REPOSITORY_URL) for url in urls)
@@ -51,7 +52,7 @@ class TestIssueTemplates:
     def test_the_bug_report_names_the_real_folders(self) -> None:
         # 置き場の名前は userdirs が決める 変えたのに雛形が古いままだと、
         # 報告する人は無いフォルダを探すことになる
-        text = (TEMPLATES / "bug_report.yml").read_text(encoding="utf-8")
+        text = (TEMPLATES / "bug-reports.yml").read_text(encoding="utf-8")
         assert f"%APPDATA%\\{APP_FOLDER}" in text
         assert f"%LOCALAPPDATA%\\{APP_FOLDER}\\recovery" in text
 
@@ -62,7 +63,7 @@ class TestIssueTemplates:
         # それ以外の機械の人は無いフォルダを探すことになる 場所は userdirs から求める
         for name in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME"):
             monkeypatch.delenv(name, raising=False)
-        text = (TEMPLATES / "bug_report.yml").read_text(encoding="utf-8")
+        text = (TEMPLATES / "bug-reports.yml").read_text(encoding="utf-8")
         for root in (userdirs.config_root(), userdirs.state_root()):
             assert f"~/{root.relative_to(Path.home()).as_posix()}" in text
         assert "XDG_CONFIG_HOME" in text
@@ -73,7 +74,7 @@ class TestIssueTemplates:
         # 案内された見出しが画面に無い
         from sashimono.ui.main_window import about_text
 
-        text = (TEMPLATES / "bug_report.yml").read_text(encoding="utf-8")
+        text = (TEMPLATES / "bug-reports.yml").read_text(encoding="utf-8")
         for label in ("設定・スクリプト・テンプレート", "退避・バックアップ"):
             assert f"{label}:" in about_text()
             assert f"「{label}」" in text
@@ -84,7 +85,7 @@ class TestIssueTemplates:
         from sashimono.compat.catalog import TemplateCatalog
         from sashimono.ui.template_dialog import TemplateDialog
 
-        text = (TEMPLATES / "compat_report.yml").read_text(encoding="utf-8")
+        text = (TEMPLATES / "compatibility.yml").read_text(encoding="utf-8")
         assert "書き写" not in text
         dialog = TemplateDialog(TemplateCatalog(), roots=(tmp_path,))
         try:
@@ -112,6 +113,48 @@ class TestIssueTemplates:
         assert "表示/設定…" in menu_paths
         assert _guided_paths("〔互換〕→〔設定…〕") == ["互換/設定…"]
         assert "互換/設定…" not in menu_paths
+
+
+class TestDiscussions:
+    """使う人の報告は Discussions で受ける Issue は開発者が直す作業の置き場"""
+
+    def test_the_software_sends_reports_to_discussions(self) -> None:
+        # Issue へ飛ばすと、確かめる前の報告と質問が開発の作業の一覧に混ざる
+        assert f"{REPOSITORY_URL}/discussions/new/choose" == REPORT_URL
+
+    def test_users_cannot_open_issues_around_discussions(self) -> None:
+        # Issue の雛形か白紙の Issue が残っていると、使う人が Discussions を通らずに Issue を作れる
+        # 開発者は書き込み権限があるので、閉じていても白紙で作れる
+        config = (ISSUES / "config.yml").read_text(encoding="utf-8")
+        assert re.search(r"^blank_issues_enabled:\s*false\s*$", config, re.M)
+        assert sorted(path.name for path in ISSUES.iterdir()) == ["config.yml"]
+
+    def test_every_category_has_a_form_and_a_way_in(self) -> None:
+        # 書き込み欄のファイルの名前がカテゴリのスラッグと違うと、GitHub は欄を出さず白紙になる
+        # 雛形を選ぶ画面に行き先が無いと、Issue から来た人がカテゴリに辿り着けない
+        assert {path.stem for path in TEMPLATES.glob("*.yml")} == set(DISCUSSION_CATEGORIES)
+        config = (ISSUES / "config.yml").read_text(encoding="utf-8")
+        linked = set(re.findall(r"discussions/new\?category=([\w-]+)", config))
+        assert linked == set(DISCUSSION_CATEGORIES)
+
+    def test_links_in_the_forms_name_real_categories(self) -> None:
+        # 書き込み欄の中から別のカテゴリへ案内する 名前を変えたのに古いスラッグのままだと、
+        # 案内した先で GitHub が「カテゴリが無い」と出す
+        for template in TEMPLATES.glob("*.yml"):
+            text = template.read_text(encoding="utf-8")
+            for slug in re.findall(r"discussions/new\?category=([\w-]+)", text):
+                assert slug in DISCUSSION_CATEGORIES, (template.name, slug)
+
+    def test_the_forms_use_only_keys_discussions_accept(self) -> None:
+        # Discussions の書き込み欄は body・labels・title だけを受け付け、Issue の雛形の
+        # name・description があると欄ごと読まれない 入力の欄が 1 つも無い物も読まれない
+        for template in TEMPLATES.glob("*.yml"):
+            text = template.read_text(encoding="utf-8")
+            keys = set(re.findall(r"^([A-Za-z_]+):", text, re.M))
+            assert keys <= {"body", "labels", "title"}, (template.name, keys)
+            assert "body" in keys
+            fields = re.findall(r"^\s*- type:\s*(\w+)", text, re.M)
+            assert any(kind != "markdown" for kind in fields), template.name
 
 
 def _guided_paths(text: str) -> list[str]:

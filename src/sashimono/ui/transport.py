@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QWidg
 
 from sashimono.core.timebase import FrameRate, format_timecode
 from sashimono.engine.render import RenderQuality
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["TransportBar", "transport_icon"]
 
@@ -42,6 +42,9 @@ class TransportBar(QWidget):
         self._play_icon = transport_icon("play")
         self._pause_icon = transport_icon("pause")
         self._playing = False
+        # 印は文字の色で描いた絵 テーマが変わったら描き直す 描き直さないと、暗いテーマの
+        # 白に近い印が明るい地の上で見えなくなる
+        theme_signals().changed.connect(self._redraw_icons)
 
         self._to_start.clicked.connect(lambda: self.jump_requested.emit(0))
         self._back.clicked.connect(lambda: self.step_requested.emit(-1))
@@ -54,11 +57,11 @@ class TransportBar(QWidget):
         monospace.setStyleHint(QFont.StyleHint.Monospace)
         monospace.setPointSizeF(11)
         self._timecode.setFont(monospace)
-        self._timecode.setStyleSheet(f"color: {Colors.TEXT.name()};")
+        themed_style(self._timecode, lambda: f"color: {Colors.TEXT.name()};")
 
         self._duration_label = QLabel(self)
         self._duration_label.setFont(monospace)
-        self._duration_label.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._duration_label, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._quality = QComboBox(self)
         for label, divisor in QUALITY_CHOICES:
@@ -100,6 +103,18 @@ class TransportBar(QWidget):
         self._playing = playing
         self._play.setIcon(self._pause_icon if playing else self._play_icon)
         self._play.setAccessibleName("一時停止" if playing else "再生")
+
+    def _redraw_icons(self) -> None:
+        self._play_icon = transport_icon("play")
+        self._pause_icon = transport_icon("pause")
+        for button, glyph in (
+            (self._to_start, "to_start"),
+            (self._back, "back"),
+            (self._forward, "forward"),
+            (self._to_end, "to_end"),
+        ):
+            button.setIcon(transport_icon(glyph))
+        self.set_playing(self._playing)
 
     def set_quality(self, divisor: int) -> None:
         """画質の選びを外から合わせる 一覧に無い分母なら何もしない

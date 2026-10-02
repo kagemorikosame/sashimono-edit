@@ -86,7 +86,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.subtitle import SubtitlePanel
 from sashimono.ui.template_dialog import TemplateDialog
-from sashimono.ui.theme import STYLE_SHEET
+from sashimono.ui.theme import style_sheet
 from sashimono.ui.workspace import Preferences, PreferenceStore
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -828,7 +828,7 @@ def build_application() -> QApplication:
     application = existing if isinstance(existing, QApplication) else QApplication([])
     application.setApplicationName("Sashimono")
     application.setWindowIcon(QIcon(str(path_to(ICON_FILE))))
-    application.setStyleSheet(STYLE_SHEET)
+    application.setStyleSheet(style_sheet())
     return application
 
 

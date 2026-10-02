@@ -27,7 +27,7 @@ from sashimono.compat.aviutl.catalog import script_catalog
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
 from sashimono.ui.report_masking import marked_root_labels, mask_report, root_lines
 from sashimono.ui.system_clipboard import clipboard
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["CompatibilityDialog", "report_text"]
 
@@ -71,7 +71,7 @@ class CompatibilityDialog(QDialog):
 
         self._scripts = QLabel(self)
         self._scripts.setWordWrap(True)
-        self._scripts.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._scripts, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._list = QListWidget(self)
 

@@ -12,9 +12,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QPainter, QPen, QPolygonF
 
 from sashimono.core.model import AnimatedValue, Clip, Effect
+from sashimono.ui.theme import Colors
 from sashimono.ui.timeline.layout import TimelineLayout
 
 __all__ = ["KEYFRAME_SIZE", "draw_keyframes", "keyframe_at", "keyframe_frames", "keyframe_marks"]
@@ -28,11 +29,6 @@ MIN_KEYFRAME_GAP = 9
 
 #: 押したとみなす距離（画素） ひし形より少し広くして、小さな印でも押しやすくする
 _HIT_SLOP = 2
-
-#: 選んでいないクリップの印は控えめにする 全部が明るいと、選んだクリップの印が埋もれる
-_MARK = QColor("#c9a640")
-_MARK_SELECTED = QColor("#ffd84a")
-_OUTLINE = QColor("#141417")
 
 
 def _animated(values: Iterator[object]) -> Iterator[AnimatedValue]:
@@ -101,8 +97,8 @@ def draw_keyframes(
     painter.save()
     painter.setClipRect(clip_rect)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setPen(QPen(_OUTLINE, 1))
-    painter.setBrush(_MARK_SELECTED if selected else _MARK)
+    painter.setPen(QPen(Colors.KEYFRAME_OUTLINE, 1))
+    painter.setBrush(Colors.KEYFRAME_SELECTED if selected else Colors.KEYFRAME)
     for _, centre in marks:
         painter.drawPolygon(
             QPolygonF(

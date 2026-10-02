@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 from sashimono.asr import DEFAULT_FILLERS, EXTRA_FILLERS, CleanupOptions, clean_transcript
 from sashimono.core.model import Transcript
 from sashimono.engine.audio.silence import SilenceOptions
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["BurnDialog", "CleanupDialog", "Estimator", "JetCutDialog"]
 
@@ -99,7 +99,7 @@ class CleanupDialog(QDialog):
 
         self._preview = QLabel(self)
         self._preview.setWordWrap(True)
-        self._preview.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._preview, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         form = QFormLayout()
         form.addRow("落とす語", self._fillers)
@@ -205,7 +205,7 @@ class JetCutDialog(QDialog):
 
         self._summary = QLabel(self)
         self._summary.setWordWrap(True)
-        self._summary.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._summary, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         form = QFormLayout()
         form.addRow("しきい値", self._threshold)
@@ -282,7 +282,7 @@ class BurnDialog(QDialog):
         note = QLabel(template_note, self)
         note.setObjectName("burn_template")
         note.setWordWrap(True)
-        note.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(note, lambda: f"color: {Colors.TEXT_MUTED.name()};")
         layout.addWidget(note)
         layout.addWidget(_confirm_buttons(self, "焼き込む"))
 

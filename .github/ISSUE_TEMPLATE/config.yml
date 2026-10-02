@@ -1,13 +1,27 @@
-# 白紙の Issue は閉じる 雛形を通らないと版や再現手順の欄が無く、聞き返しから始まる
-# 書き込み権限のある人（開発者本人）は、閉じていても白紙で作れる
+# 使う人の不具合の報告・要望・質問は Discussions で受ける Issue は開発者が直す作業を
+# 管理する置き場にする（Discussions で確かめた物を、開発者が Issue に起こす）
+#
+# 白紙の Issue は閉じ、Issue の雛形も置かない 置くと、使う人が Discussions を通らずに
+# Issue を作れてしまう 書き込み権限のある人（開発者）は、閉じていても白紙で作れる
+# 下の行き先は Discussions のカテゴリのスラッグ（.github/DISCUSSION_TEMPLATE の
+# ファイルの名前と同じ）を指す カテゴリの名前を変えるとスラッグも変わるので、一緒に直す
 blank_issues_enabled: false
 contact_links:
-  - name: 使い方の質問・相談
-    url: https://github.com/kagemorikosame/sashimono-edit/discussions
-    about: 不具合か要望かはっきりしないこと、使い方の質問はこちらへどうぞ
+  - name: 不具合の報告
+    url: https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=bug-reports
+    about: 動かない・落ちる・思った通りにならない（Discussions に書きます）
+  - name: 互換（AviUtl／YMM4）の報告
+    url: https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=compatibility
+    about: スクリプト・エイリアス・アイテムテンプレートが読めない、動かない、見た目が違う
+  - name: 要望
+    url: https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=ideas
+    about: こういうことができるようにしてほしい
+  - name: 質問
+    url: https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=q-a
+    about: 使い方の質問、不具合か要望かはっきりしないこと
   - name: 脆弱性の報告（非公開）
     url: https://github.com/kagemorikosame/sashimono-edit/security/advisories/new
-    about: 他人のファイルで勝手に何かが動く、など 公開の Issue には書かないでください
+    about: 他人のファイルで勝手に何かが動く、など 公開の場には書かないでください
   - name: 開発に参加する
     url: https://github.com/kagemorikosame/sashimono-edit/blob/main/CONTRIBUTING.md
     about: PR の送り方と開発ルール

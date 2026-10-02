@@ -28,6 +28,7 @@ from sashimono.ai.session import (
 from sashimono.core.commands import SetLayerMode, SplitClip
 from sashimono.core.model import LayerMode, MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
+from sashimono.ui.theme import PALETTES, THEME_DARK, THEME_LIGHT, theme_signals, use_palette
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
 
@@ -78,6 +79,38 @@ class TestConversationView:
         widget, _ = panel
         widget._handle(AgentEvent(EventKind.TOOL_RESULT, detail='{"ok": true}'))
         assert "ok" not in _text(widget)
+
+    def test_the_conversation_is_rewritten_in_the_new_theme(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 色は HTML に焼き込んである 書き直さないと、テーマを切り替えても前の色が残り、
+        # 暗いテーマの白に近い字が明るい地の上で読めなくなる
+        widget, _ = panel
+        widget._handle(AgentEvent(EventKind.TEXT, text="切りました"))
+        widget._handle(AgentEvent(EventKind.TOOL_USE, tool="split_clip", detail="frame=30"))
+        try:
+            use_palette(THEME_LIGHT)
+            theme_signals().changed.emit()
+            shown = widget._view.toHtml()
+            assert PALETTES[THEME_LIGHT]["ACCENT"].name() in shown
+            assert PALETTES[THEME_LIGHT]["TEXT_MUTED"].name() in shown
+            assert PALETTES[THEME_DARK]["ACCENT"].name() not in shown
+            assert "切りました" in _text(widget)
+            assert "split_clip" in _text(widget)
+        finally:
+            use_palette(THEME_DARK)
+
+    def test_bold_and_code_in_the_reply_are_formatted(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # Claude の返事は素の Markdown で来る 組まないと ** と ` がそのまま本文に混ざる
+        widget, _ = panel
+        widget._handle(AgentEvent(EventKind.TEXT, text="**強調** と `set_param`"))
+        assert "**" not in _text(widget)
+        assert "`" not in _text(widget)
+        # 本人の指示は書いたとおりに見せる 組むと、書いた ** が消えて伝わらない
+        widget._say("あなた", "**そのまま**")
+        assert "**そのまま**" in _text(widget)
 
     def test_errors_are_labelled(self, panel: tuple[ChatPanel, FakeHost]) -> None:
         widget, _ = panel

@@ -11,8 +11,8 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget
 
 from sashimono.core.model import Project, SceneId
-from sashimono.resources import MAGNET_ICONS, path_to
-from sashimono.ui.theme import Colors
+from sashimono.resources import path_to
+from sashimono.ui.theme import Colors, magnet_icons, theme_signals, themed_style
 
 __all__ = ["MAIN_SCENE_LABEL", "SceneBar"]
 
@@ -73,14 +73,21 @@ class SceneBar(QWidget):
         self._snap_button.setAccessibleName("磁石（吸着）")
         self._snap_button.setCheckable(True)
         self._snap_button.setIconSize(QSize(18, 18))
-        self._snap_button.setStyleSheet(
-            "QPushButton#snap_button { padding: 2px 6px; }"
-            f"QPushButton#snap_button:checked {{ background-color: {Colors.TAB_SELECTED.name()};"
-            f" border: 1px solid {Colors.ACCENT.name()}; }}"
+        themed_style(
+            self._snap_button,
+            lambda: (
+                "QPushButton#snap_button { padding: 2px 6px; }"
+                "QPushButton#snap_button:checked {"
+                f" background-color: {Colors.TAB_SELECTED.name()};"
+                f" border: 1px solid {Colors.ACCENT.name()}; }}"
+            ),
         )
         self._snap_button.setChecked(True)
         self._show_snap_state(True)
         self._snap_button.toggled.connect(self._on_snap_toggled)
+        # 印はテーマごとに別の絵 暗いテーマの印の白に近い極は、明るい地に溶ける
+        # 部品の関数（lambda ではなく）でつなぐ 部品が消えたときに Qt がつなぎを外す
+        theme_signals().changed.connect(self._redraw_snap_icon)
         layout.addWidget(self._snap_button)
 
     def _button(self, text: str, tip: str, signal: SignalInstance) -> QPushButton:
@@ -125,9 +132,12 @@ class SceneBar(QWidget):
         if not self._updating:
             self.snap_toggled.emit(checked)
 
+    def _redraw_snap_icon(self) -> None:
+        self._show_snap_state(self._snap_button.isChecked())
+
     def _show_snap_state(self, enabled: bool) -> None:
         """印と補足を入・切に合わせる 補足に今の状態と一時的に切るキーを書く"""
-        on, off = MAGNET_ICONS
+        on, off = magnet_icons()
         self._snap_button.setIcon(QIcon(str(path_to(on if enabled else off))))
         state = "入" if enabled else "切"
         self._snap_button.setToolTip(
