@@ -375,9 +375,21 @@ class ExportDialog(QDialog):
     def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt の命名規約
         # 書き出し中に閉じられたら、スレッドを畳んでから終わる
         # 放置すると Qt がスレッドの生存中に破棄されたと言って落ちる
+        self._stop_worker()
+        super().closeEvent(event)  # type: ignore[arg-type]
+
+    def reject(self) -> None:
+        """〔閉じる〕と Esc 窓の × と同じく、書き出し中ならスレッドを畳んでから閉じる
+
+        reject は closeEvent を通らない 畳まずに閉じると、開いた側が窓を捨てたときに
+        走っているスレッドごと壊れて落ちる
+        """
+        self._stop_worker()
+        super().reject()
+
+    def _stop_worker(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
             if self._thread is not None:
                 self._thread.quit()
                 self._thread.wait(5000)
-        super().closeEvent(event)  # type: ignore[arg-type]

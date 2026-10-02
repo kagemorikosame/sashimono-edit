@@ -615,6 +615,9 @@ class SubtitlePanel(QWidget):
             self._service = TranscriptionService(default_backend())
 
         dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() and dialog.transcript is not None:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript, stream=dialog.chosen_stream)],
@@ -715,6 +718,9 @@ class SubtitlePanel(QWidget):
         if media is None or transcript is None:
             return
         dialog = CleanupDialog(transcript, self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec():
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
@@ -740,6 +746,9 @@ class SubtitlePanel(QWidget):
             estimate=estimate,
             parent=self,
         )
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if not dialog.exec():
             return
 
@@ -801,6 +810,9 @@ class SubtitlePanel(QWidget):
 
     def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
         dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if not dialog.exec():
             return None
         return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
@@ -858,6 +870,9 @@ def ask_subtitle_range(parent: QWidget | None, project: Project) -> str | None:
     rate = project.settings.frame_rate
     start, end = area
     box = QMessageBox(parent)
+    # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+    # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+    box.deleteLater()
     box.setIcon(QMessageBox.Icon.Question)
     box.setWindowTitle("字幕を書き出す")
     box.setText(

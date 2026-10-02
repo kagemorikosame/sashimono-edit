@@ -13,7 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from sashimono.core.commands import (
     AddClip,
@@ -612,3 +613,36 @@ def test_the_panels_jet_cut_of_the_first_voice_leaves_voice_two_alone(
         assert unchosen and all(end <= 600 for _, end in unchosen)
     finally:
         widget.deleteLater()
+
+
+class TestDialogsAreFreed:
+    """字幕の窓（起こす・整形・無音カット・焼き込み）を、閉じたあとに捨てること
+
+    捨てないと、開くたびに窓が字幕パネルの子として残り続ける 起こすの窓は時計と
+    音声の選びを持ち、焼き込みの窓は話し手ごとの印を持つので、開くほど溜まる
+    """
+
+    def test_opening_and_closing_does_not_pile_up(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        del qt_application
+        from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        # 開く所だけを差し替える 開くと押す人を待って止まる 取り消したことにする
+        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog):
+            monkeypatch.setattr(dialog, "exec", lambda self: 0)
+        widget = SubtitlePanel(placed, StubAnalyzer(make_waveform([(0.5, 400)])))
+        try:
+            for _ in range(3):
+                widget.transcribe()
+                widget.clean()
+                widget.jet_cut()
+                widget.burn()
+            opened = {type(child).__name__ for child in widget.findChildren(QDialog)}
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+            # 窓が本当に開いたこと 開いていなければ、残らないのは当たり前で何も言えない
+            assert opened == {"TranscribeDialog", "CleanupDialog", "JetCutDialog", "BurnDialog"}
+            assert widget.findChildren(QDialog) == []
+        finally:
+            widget.deleteLater()

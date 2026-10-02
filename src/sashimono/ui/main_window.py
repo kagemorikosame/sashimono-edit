@@ -749,6 +749,9 @@ class MainWindow(QMainWindow):
             for name, (action, default) in self._actions.items()
         ]
         dialog = ShortcutDialog(rows, self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         bindings = dialog.bindings()
@@ -764,6 +767,9 @@ class MainWindow(QMainWindow):
         from sashimono.ui.preferences_dialog import PreferencesDialog
 
         dialog = PreferencesDialog(self._preferences, self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._apply_preferences(dialog.preferences())
@@ -1819,6 +1825,9 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         dialog = ProjectSettingsDialog(self._new_settings(), self, new=True)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._playback.stop()
@@ -1991,6 +2000,9 @@ class MainWindow(QMainWindow):
 
         settings = self._document.project.settings
         dialog = ProjectSettingsDialog(settings, self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.settings()
@@ -2025,6 +2037,9 @@ class MainWindow(QMainWindow):
         dialog = LayerModeDialog(
             target, conversion.notices, self, convertible=conversion.project is not project
         )
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.convert is None:
             return False
         commands = switch_layer_mode(
@@ -2069,6 +2084,9 @@ class MainWindow(QMainWindow):
 
         while entries := find_orphans():
             dialog = RecoveryDialog(entries, self)
+            # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+            # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+            dialog.deleteLater()
             if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
                 return
             action, entry = dialog.choice
@@ -2115,14 +2133,18 @@ class MainWindow(QMainWindow):
 
     def export(self) -> None:
         self._playback.stop()
-        ExportDialog(
+        dialog = ExportDialog(
             self._document.project,
             self,
             pipeline_depth=self._preferences.export_pipeline_depth,
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
-        ).exec()
+        )
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
+        dialog.exec()
 
     def _active_scene_name(self) -> str | None:
         """開いているシーンの名前 メインなら ``None``"""
@@ -2218,6 +2240,9 @@ class MainWindow(QMainWindow):
         from sashimono.ui.template_dialog import TemplateDialog
 
         dialog = TemplateDialog(parent=self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
             return
 
@@ -2342,7 +2367,11 @@ class MainWindow(QMainWindow):
         """互換性レポートを出す"""
         from sashimono.ui.compat_dialog import CompatibilityDialog
 
-        CompatibilityDialog(parent=self).exec()
+        dialog = CompatibilityDialog(parent=self)
+        # 開くたびに作る窓 親が残る限り一緒に残るので捨てる 消えるのは
+        # 呼んだイベントループへ戻ったとき（exec の中や、閉じて結果を読む間は残る）
+        dialog.deleteLater()
+        dialog.exec()
 
     # --- ヘルプ ---
 

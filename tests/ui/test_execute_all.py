@@ -60,6 +60,9 @@ class _Chosen:
     def exec(self) -> QDialog.DialogCode:
         return QDialog.DialogCode.Accepted
 
+    def deleteLater(self) -> None:  # noqa: N802 - 本物の棚（Qt の窓）と同じ名前
+        """開いた側は閉じたあとに捨てる 代わりの物には捨てる中身が無い"""
+
 
 def _refuse_everything(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch, choice: tuple[str, list[MappedObject]]
