@@ -21,10 +21,15 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 #: 捨てた部品（自分を指す輪があるのでごみ集めまで残る）に、Python の eventFilter を
-#: 持つ子を入れる テーマを当てている間に届いた知らせを数え、200 回目で閾値を 1 にして、
-#: 次に物を作った所でごみ集めが走るようにする（本物では閾値を越えた所で走る 走る所を
-#: 決めるため） 狙った道を通ったかを親が確かめられるよう、届いた回数・そのときごみ集めが
-#: 動ける状態だったか・知らせが届いている間にごみ集めが走った回数を、当てた回ごとに書き出す
+#: 持つ子を入れ、テーマを 3 回当てる 当てる回ごとに部品を捨て直し、閾値を戻してから当てる
+#: 配っている最中に届いた 200 回目の知らせで閾値を 1 にして、次に物を作った所でごみ集めが
+#: 走るようにする（本物では閾値を越えた所で走る 走る所を決めるため）
+#:
+#: 「配っている間」の始まりは ``_activate`` に入った所、終わりはごみ集めを動ける状態へ
+#: 戻した所（``gc.enable``） 戻す前に走ったごみ集めの始まりを ``gc.callbacks`` で直に数え、
+#: 当てた回ごとに、終わった時点の値を書き出す 知らせの受け取りの途中で数えると、最後の
+#: 知らせの後に始まったごみ集めを見逃す ごみ集めを止める作りが無ければ、閾値を下げた
+#: 直後に配っている最中のごみ集めが始まって数に出る（落ちなければ）
 _SCRIPT = """
 import gc
 import json
@@ -32,24 +37,47 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QSlider, QWidget
 
+from sashimono.ui import theme
 from sashimono.ui.theme import THEME_DARK, THEME_LIGHT, apply_theme
 
 application = QApplication(sys.argv[:1])
-applying = None
+handing_out = False
 calls = 0
 enabled = set()
-collections = 0
-# テーマを当てた回ごとに、知らせが届いた間に見えたごみ集めの回数
-seen = {}
+starts = 0
 
 
-def watch(phase, info):
-    global collections
-    if applying is not None and phase == "start":
-        collections += 1
+def count(phase, info):
+    global starts
+    if handing_out and phase == "start":
+        starts += 1
 
 
-gc.callbacks.append(watch)
+gc.callbacks.append(count)
+real_enable = gc.enable
+
+
+def enable():
+    # ごみ集めを動ける状態へ戻した所が、配り終えた所 戻してから走った分は数えない
+    global handing_out
+    handing_out = False
+    real_enable()
+
+
+gc.enable = enable
+real_activate = theme._activate
+
+
+def activate(app, name):
+    global handing_out
+    handing_out = True
+    try:
+        real_activate(app, name)
+    finally:
+        handing_out = False
+
+
+theme._activate = activate
 
 
 class Row(QWidget):
@@ -61,10 +89,9 @@ class Row(QWidget):
 
     def eventFilter(self, watched, event):
         global calls
-        if applying is not None:
+        if handing_out:
             calls += 1
             enabled.add(gc.isenabled())
-            seen.setdefault(applying, set()).add(collections)
             if calls == 200:
                 gc.set_threshold(1, 1, 1)
         self.seen = [event.type(), [0] * 8]
@@ -78,18 +105,18 @@ class Dropped(QWidget):
         self.rows = [Row(self) for _ in range(10)]
 
 
-gc.disable()
-for _ in range(300):
-    Dropped()
-gc.set_threshold(1_000_000, 100, 100)
-gc.enable()
-for index, mode in enumerate((THEME_LIGHT, THEME_DARK, THEME_LIGHT)):
-    applying = index
+rounds = []
+for mode in (THEME_LIGHT, THEME_DARK, THEME_LIGHT):
+    gc.disable()
+    for _ in range(300):
+        Dropped()
+    gc.set_threshold(1_000_000, 100, 100)
+    calls, starts = 0, 0
+    real_enable()
     apply_theme(application, mode)
-applying = None
+    rounds.append({"calls": calls, "starts": starts})
 gc.disable()
-during = {str(key): len(value) - 1 for key, value in seen.items()}
-print(json.dumps({"calls": calls, "enabled": sorted(enabled), "during": during}))
+print(json.dumps({"rounds": rounds, "enabled": sorted(enabled)}))
 """
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,10 +159,11 @@ def test_switching_survives_a_collection_while_it_hands_out_the_change(
     detail = f"終了コード {done.returncode:#x}\n{done.stdout}\n{done.stderr[-2000:]}"
     assert done.returncode == 0, detail
     result = json.loads(done.stdout.strip().splitlines()[-1])
-    # 狙った道を通ったこと テーマを当てている間に、閾値を下げる 200 回目まで知らせが届いた
+    # 狙った道を通ったこと どの回も、配っている間に閾値を下げる 200 回目まで知らせが届いた
     # 届かなければ、ごみ集めを走らせる所まで行っておらず、落ちないのは当たり前で何も言えない
-    assert result["calls"] >= 200, detail
-    # 配っている間はごみ集めが止まっていて、閾値を下げても配り終えるまで 1 度も走らなかった
-    # （配り終えた後に溜まった分が片付くのはよい）
+    assert len(result["rounds"]) == 3, detail
+    assert all(round_["calls"] >= 200 for round_ in result["rounds"]), detail
+    # 配っている間はごみ集めが止まっていて、閾値を下げても配り終えるまで 1 度も始まらなかった
+    # （配り終えて動ける状態へ戻した後に、溜まった分が片付くのはよい）
     assert result["enabled"] == [False], detail
-    assert set(result["during"].values()) == {0}, detail
+    assert [round_["starts"] for round_ in result["rounds"]] == [0, 0, 0], detail
