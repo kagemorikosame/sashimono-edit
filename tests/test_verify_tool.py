@@ -30,6 +30,7 @@ def verify() -> ModuleType:
 
 
 def test_the_counts_and_the_failed_names_are_kept(verify: ModuleType) -> None:
+    """集計の行と落ちたテストの名前を要約に写す 取り損ねると CI のどれが落ちたか分からない"""
     output = "\n".join(
         [
             "....F.",
@@ -170,6 +171,11 @@ class TestInParallel:
 
     @pytest.mark.parametrize("workers", ["auto", "1", "12"])
     def test_a_number_or_auto_is_accepted(self, verify: ModuleType, workers: str) -> None:
+        """正しい値（数と auto）は拒まずに ``-n`` へ渡す
+
+        拒む側の確かめを厳しくしすぎて正しい値まで拒むと、``_run_tests`` は pytest を
+        起こさずに段を落とし、CI の検証が値を直すまで毎回失敗する
+        """
         arguments = verify.pytest_arguments([], {verify.WORKERS_VARIABLE: workers})
         assert arguments[:2] == ["-n", workers]
 
@@ -193,7 +199,11 @@ class TestInParallel:
     def test_the_tests_asked_for_are_handed_to_pytest(
         self, verify: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """環境変数を読む所から pytest を起こす所まで、並列の指定が届くこと"""
+        """環境変数を読む所から pytest を起こす所まで、並列の指定が届くこと
+
+        引数を組み立てる所だけを試しても、``_run_tests`` が組み立てた物を使い忘れると
+        CI は黙って直列のまま走り、速くならないのに検証は通る
+        """
         seen: list[list[str]] = []
 
         def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
