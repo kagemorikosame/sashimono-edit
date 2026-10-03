@@ -20,7 +20,9 @@ r"""配る zip を作る
 開発機の ``PATH`` に FFmpeg や Python が載っていると、積み忘れがあっても通る
 
 **依存が何も入っていない機械での確認**は、ここではできない（VC++ ランタイムなど
-Windows 側の部品は開発機に入っている） 本人の確認に回す
+Windows 側の部品は開発機に入っている） CI のまっさらな Windows で、zip だけを持って
+確かめる（.github/workflows/package.yml と tools/check_clean_machine.ps1 Issue #33）
+CI には GPU が無いので、GL で描く確かめはここ（開発機）で行う
 """
 
 from __future__ import annotations

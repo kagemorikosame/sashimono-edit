@@ -13,6 +13,7 @@ import io
 import json
 import ssl
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -109,8 +110,17 @@ def rehearse(folder: Path, *, swap: bool = sys.platform == "win32") -> str:
 
     plan = SwapPlan("apply", layout, relaunch=False, check_start=False, wait_seconds=10)
     launched = launch(plan, folder / "update")
+    began = time.monotonic()
     if not wait_started(launched):
-        raise RuntimeError("入れ替え係（PowerShell）が走らない")
+        # 待ちきれなかったのか、すぐ終わったのかで原因が違う（遅い機械か、PowerShell が
+        # 台本を読めない・走らせてもらえないか） 結果のファイルに書けた所まで添える
+        # 理由が無いと、使う人の機械で落ちたときに貼ってもらっても直す所が分からない
+        elapsed = time.monotonic() - began
+        lines = " ".join(launched.lines()) or "結果のファイルに何も無い"
+        raise RuntimeError(
+            f"入れ替え係（PowerShell）が走らない（{elapsed:.0f} 秒 終了コード "
+            f"{launched.process.poll()} {lines}）"
+        )
     launched.process.wait(timeout=120)
     swapped = (install / BUILD_INFO_NAME).is_file() and (layout.previous / APP_EXE).is_file()
     if not swapped:

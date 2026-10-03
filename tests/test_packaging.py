@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -1298,6 +1299,32 @@ class TestTheEncodeCheckNeedsNoGL:
         monkeypatch.setattr("sashimono.engine.gpu.OffscreenGLContext", no_gl)
         monkeypatch.setattr("sashimono.engine.gpu.context.OffscreenGLContext", no_gl)
         assert "読み戻せた" in selfcheck._encode()
+
+
+class TestTheBuildIsPinnedToTheList:
+    """CI のまっさらな機械で組むときは、一覧（THIRD_PARTY_NOTICES.md）の版に留めて入れる
+
+    依存は下限だけなので、留めないとその日の最新が入る av 19 が出た日に、写しの無い
+    DLL（libvmaf）を積み、一覧と版が食い違って組み立てが止まった（Issue #33 の CI）
+    """
+
+    def test_the_listed_packages_are_pinned(self, builder: ModuleType) -> None:
+        lines = builder.constraints(builder.NOTICES_SOURCE.read_text(encoding="utf-8"))
+        names = {line.split("==")[0] for line in lines}
+        assert {"av", "pyside6-essentials", "cryptography", "pyinstaller"} <= names
+        assert all(re.fullmatch(r"[a-z0-9-]+==\d[0-9A-Za-z.!+]*", line) for line in lines), lines
+
+    def test_the_file_table_is_not_taken_for_packages(self, builder: ModuleType) -> None:
+        # 同梱のファイルの表（| `LICENSE.txt` | 説明 |）も 1 列目が ` で始まる 版の形でない
+        # 行まで制約にすると、uv が制約を読めずに止まる
+        notices = "| `LICENSE.txt` | 本体の使用許諾 |\n| `av`（PyAV） | 18.1.0 | BSD |\n"
+        assert builder.constraints(notices) == ["av==18.1.0"]
+
+    def test_they_are_written_without_building(self, builder: ModuleType, tmp_path: Path) -> None:
+        target = tmp_path / "build" / "constraints.txt"
+        assert builder.main(["--write-constraints", str(target)], dist=tmp_path) == 0
+        assert "av==" in target.read_text(encoding="utf-8")
+        assert not (tmp_path / "Sashimono").exists()
 
 
 class TestTheSoftwareGLIsLeftOut:

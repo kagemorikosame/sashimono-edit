@@ -179,6 +179,37 @@ function Get-NewDrops([int]$Before) {
     return @($all[$Before..($all.Count - 1)])
 }
 
+# --- 手掛かり 同じ環境で PowerShell 5.1 の台本が走るか ---
+# 自動更新の入れ替え係は Windows の PowerShell 5.1 で台本を走らせる 自己診断の自動更新の
+# 項目が落ちたときに、PowerShell そのものが走らないのか、入れ替え係の中で落ちたのかを分ける
+$probeFolder = Join-Path $Temp '台本 確かめ'
+New-Item -ItemType Directory -Force $probeFolder | Out-Null
+$probeScript = Join-Path $probeFolder 'probe.ps1'
+$probeResult = Join-Path $probeFolder 'result.txt'
+[IO.File]::WriteAllText($probeScript,
+    "Add-Content -LiteralPath `$env:PROBE_RESULT -Value 'holding' -Encoding UTF8`n",
+    [Text.UTF8Encoding]::new($true))
+$probeInfo = [System.Diagnostics.ProcessStartInfo]::new("$Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+foreach ($argument in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $probeScript)) {
+    $probeInfo.ArgumentList.Add($argument)
+}
+$probeInfo.UseShellExecute = $false
+$probeInfo.RedirectStandardOutput = $true
+$probeInfo.RedirectStandardError = $true
+$probeInfo.Environment.Clear()
+foreach ($entry in $Environment.GetEnumerator()) { $probeInfo.Environment[$entry.Key] = $entry.Value }
+$probeInfo.Environment['PROBE_RESULT'] = $probeResult
+$watch = [Diagnostics.Stopwatch]::StartNew()
+$probe = [System.Diagnostics.Process]::Start($probeInfo)
+$probeOut = $probe.StandardOutput.ReadToEndAsync()
+$probeErr = $probe.StandardError.ReadToEndAsync()
+[void]$probe.WaitForExit(120000)
+$probeText = if (Test-Path -LiteralPath $probeResult) { (Get-Content -LiteralPath $probeResult -Raw).Trim() } else { '（無い）' }
+Note ("PowerShell 5.1 の台本（日本語のフォルダ 同じ環境変数）: {0:N1} 秒 終了コード {1} 結果 {2}" -f
+    $watch.Elapsed.TotalSeconds, $probe.ExitCode, $probeText)
+if ($probeErr.Result.Trim()) { Note "PowerShell 5.1 の標準エラー: $($probeErr.Result.Trim())" }
+if ($probeOut.Result.Trim()) { Note "PowerShell 5.1 の標準出力: $($probeOut.Result.Trim())" }
+
 # --- 自己診断 ---
 $Scripts = Join-Path $AppHome 'scripts'
 New-Item -ItemType Directory -Force $Scripts | Out-Null

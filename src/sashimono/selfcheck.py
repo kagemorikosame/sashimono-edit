@@ -522,8 +522,9 @@ def vc_runtime_report(loaded: Iterable[Path], bundle: Path) -> str:
     missing = [path for path in borrowed if path.name.lower() not in own]
     if missing:
         raise RuntimeError(
-            "配布版に無い部品を外（Windows や開発の道具の置き場）から読んでいる（再頒布可能パッケージの無い機械では"
-            "起動しない）: " + "、".join(str(path) for path in missing)
+            "配布版に無い部品を外（Windows や開発の道具の置き場）から読んでいる"
+            "（再頒布可能パッケージの無い機械では起動しない）: "
+            + "、".join(str(path) for path in missing)
         )
     detail = f"配布版の中の {len(inside)} 個を読んだ"
     if borrowed:
