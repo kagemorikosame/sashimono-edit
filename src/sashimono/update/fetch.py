@@ -9,6 +9,7 @@ urllib に転送を任せると、どこへ飛ばされても付いていく 自
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import urllib.error
 import urllib.request
@@ -53,6 +54,10 @@ TIMEOUT_SECONDS = 30.0
 
 #: 読む塊の大きさ
 _CHUNK = 1024 * 1024
+
+#: 本文を読む途中で起きうる失敗 途中で切れた返事（IncompleteRead）は http.client の例外で、
+#: OSError ではない 拾わないと FetchError にならず、起動時の確認が黙らずに落ちる
+_READ_ERRORS = (OSError, http.client.HTTPException)
 
 
 class FetchError(Exception):
@@ -109,7 +114,8 @@ class UrllibTransport:
             location = error.headers.get("Location") if error.headers is not None else None
             error.close()
             return RawResponse(error.code, location)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # 返事の頭が壊れている（BadStatusLine など）のは OSError ではない
             raise FetchError(f"つながらない: {exc}") from exc
         return RawResponse(response.status, None, response)
 
@@ -182,7 +188,7 @@ def fetch_bytes(url: str, transport: Transport, *, limit: int) -> bytes:
     try:
         assert response.body is not None
         data = response.body.read(limit + 1)
-    except OSError as exc:
+    except _READ_ERRORS as exc:
         raise FetchError(f"読めない: {exc}") from exc
     finally:
         response.close()
@@ -230,7 +236,7 @@ def download(
         partial.replace(target)
     except BaseException as exc:
         partial.unlink(missing_ok=True)
-        if isinstance(exc, OSError):
+        if isinstance(exc, _READ_ERRORS):
             raise FetchError(f"書けない・読めない: {exc}") from exc
         raise
     finally:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.server
+import io
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -15,6 +17,7 @@ from sashimono.update.fetch import (
     MAX_REDIRECTS,
     FetchError,
     MemoryTransport,
+    RawResponse,
     UrllibTransport,
     check_url,
     download,
@@ -165,6 +168,59 @@ class TestDownloading:
         transport.pages["https://cdn.example.com/package.zip"] = self.BODY
         with pytest.raises(FetchError):
             self._download(transport, tmp_path / "package.zip")
+
+
+class _CutOff(io.RawIOBase):
+    """途中で切れる本文 http.client は OSError ではなく IncompleteRead を投げる"""
+
+    def __init__(self, head: bytes) -> None:
+        self._head = head
+
+    def read(self, size: int = -1) -> bytes:
+        if self._head:
+            head, self._head = self._head, b""
+            return head
+        raise http.client.IncompleteRead(b"", 100)
+
+
+class _CuttingTransport(MemoryTransport):
+    def get(self, url: str) -> RawResponse:
+        response = super().get(url)
+        if response.status == 200:
+            return RawResponse(200, None, _CutOff(b""))  # type: ignore[arg-type]
+        return response
+
+
+class TestACutOffAnswer:
+    """本文の途中で繋がりが切れても FetchError にする 起動時の確認は FetchError を黙って流す"""
+
+    def test_a_small_file(self) -> None:
+        transport = _CuttingTransport()
+        transport.pages[LATEST] = b"{}"
+        with pytest.raises(FetchError):
+            fetch_bytes(LATEST, transport, limit=100)
+
+    def test_a_download_leaves_nothing(self, tmp_path: Path) -> None:
+        transport = _CuttingTransport()
+        transport.pages[TAGGED] = b"body"
+        target = tmp_path / "package.zip"
+        with pytest.raises(FetchError):
+            download(TAGGED, transport, target, size=1000, sha256="0" * 64)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_the_check_stays_quiet(self) -> None:
+        """確かめる所まで例外が漏れると、起動時の裏の確認が黙らずに落ちる"""
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        from sashimono.links import STABLE_MANIFEST_URL
+        from sashimono.update.check import Outcome, check_for_update
+
+        key = Ed25519PrivateKey.generate()
+        transport = _CuttingTransport()
+        transport.pages[LATEST] = b"{}"
+        transport.redirects[STABLE_MANIFEST_URL] = LATEST
+        result = check_for_update("0.0.1", transport=transport, keys=[key.public_key()])
+        assert result.outcome is Outcome.FAILED
 
 
 class _Redirecting(http.server.BaseHTTPRequestHandler):

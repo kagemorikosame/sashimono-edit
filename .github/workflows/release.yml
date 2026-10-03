@@ -5,14 +5,17 @@ name: Release
 # 誰でも取り出せる 目録（update.json）を作って署名するのは手元（tools/update_sign.py）
 # 下書きのままにするのは、署名を上げる前に releases/latest/download/… が動かないようにするため
 # 手順は docs/development.md の「自動更新のリリース」
+#
+# 組み立てと上げるのはジョブを分ける 組み立ては PyPI から依存を入れて走らせるので、
+# 依存のどれかが悪さをしても、リリースを書き換えられるトークンに手が届かないようにする
+# （書ける権限は、依存を何も入れない publish のジョブだけが持つ）
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  # リリースの下書きを作り、zip を上げるのに要る これより広くしない
-  contents: write
+# 既定は何も持たせない 要る物はジョブごとに書く
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -21,10 +24,16 @@ concurrency:
 jobs:
   package:
     runs-on: windows-latest
+    permissions:
+      # ソースを読むだけ 依存を入れて走らせるジョブに書く権限を渡さない
+      contents: read
     env:
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # トークンを .git/config に残さない 残すと、後で走る依存のコードが読める
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         id: python
@@ -48,23 +57,45 @@ jobs:
         # 下書きから落とした zip を、手元で --self-check まで確かめてから署名する
         run: python tools/build_package.py --skip-check
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: dist/SashimonoEdit-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: package
+    # 依存を何も入れない 使うのは runner に入っている gh だけ
+    runs-on: ubuntu-latest
+    permissions:
+      # リリースの下書きを作り、zip を上げるのに要る これより広くしない
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: package
+          path: package
+
       - name: リリースの下書きへ上げる
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+          GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $zip = Get-ChildItem dist -Filter 'SashimonoEdit-*-windows-x64.zip' | Select-Object -First 1
-          if (-not $zip) { throw '組み立てた zip が無い' }
-          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "SHA-256: $hash" | Add-Content $env:GITHUB_STEP_SUMMARY
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -ne 0) {
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(package/SashimonoEdit-*-windows-x64.zip)
+          if [ "${#zips[@]}" -ne 1 ]; then echo "組み立てた zip が 1 つでない"; exit 1; fi
+          zip="${zips[0]}"
+          echo "SHA-256: $(sha256sum "$zip" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
             # 下書きで作る 署名と目録を上げてから、人が公開する
-            $pre = @()
-            if ($env:TAG -match '(a|b|rc)\d+$') { $pre = @('--prerelease') }
-            gh release create $env:TAG --draft --verify-tag --title "Sashimono Edit $env:TAG" --notes "署名と目録はこれから上げる" @pre
-            if ($LASTEXITCODE -ne 0) { throw '下書きを作れない' }
-          }
-          gh release upload $env:TAG $zip.FullName --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'zip を上げられない' }
+            pre=()
+            if [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]]; then pre=(--prerelease); fi
+            gh release create "$TAG" --draft --verify-tag --title "Sashimono Edit $TAG" \
+              --notes "署名と目録はこれから上げる" "${pre[@]}"
+          fi
+          gh release upload "$TAG" "$zip" --clobber

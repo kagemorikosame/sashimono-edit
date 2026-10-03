@@ -551,6 +551,8 @@ class MainWindow(QMainWindow):
             preferences=lambda: self._preferences,
             blockers=self.update_blockers,
             arguments=self._reopen_arguments,
+            confirm_close=self._confirm_discard,
+            close_window=self._close_for_update,
         )
         self.statusBar().addPermanentWidget(self._updates.button)
 
@@ -2476,6 +2478,15 @@ class MainWindow(QMainWindow):
         if self._subtitles.transcribing:
             found.append("字幕を起こしています")
         return found
+
+    def _close_for_update(self) -> bool:
+        """更新のために閉じる 保存の確認は入れ替え係を起こす前に済ませてあるので尋ねない
+
+        もう一度尋ねると、〔保存しない〕を選んだ人にまた同じことを聞き、そこで取り消されると
+        入れ替え係だけが残る
+        """
+        self._confirm_unsaved = False
+        return self.close()
 
     def _reopen_arguments(self) -> list[str]:
         """更新の後に起こし直すとき、開いていたプロジェクトを開き直す"""

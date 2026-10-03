@@ -62,6 +62,10 @@ class _Harness:
         self.store = UpdateStateStore(tmp_path / "state.json")
         self.preferences = preferences
         self.blockers: list[str] = []
+        #: 保存の確認の答え 偽なら取り消した
+        self.confirm = True
+        #: 確認と入れ替え係を起こした順
+        self.events: list[str] = []
         self.informed: list[tuple[str, str]] = []
         self.launched: list[SwapPlan] = []
         self.window = _Window()
@@ -78,6 +82,7 @@ class _Harness:
             threaded=False,
             launcher=self._launch,
             waiter=lambda _launched: True,
+            confirm_close=self._confirm,
         )
         self.controller._inform = self._inform  # type: ignore[method-assign]
         self.sleeper: subprocess.Popen[bytes] | None = None
@@ -89,7 +94,12 @@ class _Harness:
     def _inform(self, title: str, text: str) -> None:
         self.informed.append((title, text))
 
+    def _confirm(self) -> bool:
+        self.events.append("confirm")
+        return self.confirm
+
     def _launch(self, plan: SwapPlan) -> Launched:
+        self.events.append("launch")
         self.launched.append(plan)
         self.sleeper = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -283,16 +293,47 @@ class TestRestarting:
         assert (plan.mode, tuple(plan.arguments)) == ("apply", ("作品.sme",))
         assert quit_called == [True]
 
-    def test_a_cancelled_close_stops_the_swapper(self, ready: _Harness) -> None:
-        """保存を尋ねて取り消されたら入れ替えない 入れ替え係を残すと、後で閉じた所で入れ替わる"""
+    def test_the_save_question_comes_before_the_swapper(
+        self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れ替え係を先に起こすと、保存の確認で迷っている間に待ちを諦めて今の版を起こし、
+        本体が 2 つ動く 確認が済んでから起こす
+        """
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        assert ready.controller.restart_now()
+        assert ready.events == ["confirm", "launch"]
+
+    def test_a_cancelled_save_question_starts_nothing(self, ready: _Harness) -> None:
+        """保存の確認で取り消したら、入れ替え係を起こさない（起こしてから止めるのでもない）"""
+        ready.confirm = False
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.store.load().ready_version == NEWER
+
+    def test_a_cancelled_rollback_is_not_remembered(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """戻すのを取り消したのに、今の版が「飛ばす版」に残ると、次の更新を受け取れない"""
+        harness.layout.previous.mkdir()
+        (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
+        monkeypatch.setattr(
+            harness.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        harness.confirm = False
+        assert not harness.controller.roll_back()
+        assert __version__ not in harness.store.load().skipped
+        assert harness.launched == []
+
+    def test_a_refused_close_stops_the_swapper(self, ready: _Harness) -> None:
+        """確認の後でも窓が閉じられなければ、入れ替え係を止める 残すと後で閉じた所で入れ替わる"""
         ready.window.allow_close = False
         assert not ready.controller.restart_now()
         assert ready.sleeper is not None
         assert ready.sleeper.wait(timeout=10) is not None
 
     def test_a_helper_that_does_not_start_keeps_the_app(self, ready: _Harness) -> None:
-        ready.controller._waiter = lambda _launched: False
         """台本の実行が止められた機械で、本体だけ終わって誰も起こし直さない、を防ぐ"""
+        ready.controller._waiter = lambda _launched: False
         assert not ready.controller.restart_now()
         assert ready.informed and "PowerShell" in ready.informed[0][1]
 
@@ -335,6 +376,33 @@ class TestTheEditor:
     ) -> None:
         monkeypatch.setattr(type(window._chat), "working", property(lambda _self: True))
         assert window.update_blockers()
+
+    def test_closing_for_an_update_asks_only_once(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """保存の確認は入れ替え係を起こす前に済ませた 閉じるときにもう一度尋ねると、
+        そこで取り消されたとき入れ替え係だけが残る
+        """
+        del qt_application
+        from PySide6.QtWidgets import QMessageBox
+
+        from sashimono.core.commands import AddTrack
+        from sashimono.core.model import Track, TrackKind
+
+        window = MainWindow(Project.create(), confirm_unsaved=True)
+        window.document.execute(AddTrack(Track(TrackKind.VIDEO, "V9")))
+        assert window.is_modified
+
+        def asked(*_args: object) -> QMessageBox.StandardButton:
+            raise AssertionError("閉じるときにもう一度尋ねた")
+
+        monkeypatch.setattr(QMessageBox, "question", asked)
+        assert window._close_for_update()
+
+    def test_the_editor_asks_before_the_swapper(self, window: MainWindow) -> None:
+        """編集画面は保存の確認（_confirm_discard）を入れ替え係より先に渡している"""
+        assert window.updates._confirm_close == window._confirm_discard
+        assert window.updates._close_window == window._close_for_update
 
     def test_saving_an_older_file_keeps_a_copy(
         self, tmp_path: Path, qt_application: QApplication

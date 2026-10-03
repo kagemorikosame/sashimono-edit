@@ -87,8 +87,14 @@ class UpdateController(QObject):
         threaded: bool = True,
         launcher: Callable[[SwapPlan], Launched] = launch,
         waiter: Callable[[Launched], bool] = wait_started,
+        confirm_close: Callable[[], bool] | None = None,
+        close_window: Callable[[], bool] | None = None,
     ) -> None:
-        """``frozen_layout`` が真で ``layout`` が無ければ、配布版の置き場を自分で求める"""
+        """``frozen_layout`` が真で ``layout`` が無ければ、配布版の置き場を自分で求める
+
+        ``confirm_close`` は閉じてよいか（保存していない変更を尋ね、保存も済ませる）
+        ``close_window`` は尋ねずに閉じる 既定は窓の ``close``（尋ねる窓ならそこで尋ねる）
+        """
         super().__init__(window)
         self._window = window
         self._preferences = preferences
@@ -102,6 +108,8 @@ class UpdateController(QObject):
         self._threaded = threaded
         self._launcher = launcher
         self._waiter = waiter
+        self._confirm_close = confirm_close if confirm_close is not None else (lambda: True)
+        self._close_window = close_window if close_window is not None else window.close
         self._results: queue.SimpleQueue[_Finished] = queue.SimpleQueue()
         self._busy = False
         self._timer = QTimer(self)
@@ -333,9 +341,7 @@ class UpdateController(QObject):
         """今すぐ入れる 編集の途中で止めてはいけない作業が動いていれば断る"""
         if self._layout is None or self.ready_version() is None:
             return False
-        carry_user_files(self._layout.install, self._layout.staged)
-        plan = SwapPlan("apply", self._layout, pid=os.getpid(), arguments=self._arguments())
-        return self._restart(plan)
+        return self._restart("apply")
 
     def roll_back(self) -> bool:
         """ヘルプの〔前の版に戻す…〕"""
@@ -353,15 +359,21 @@ class UpdateController(QObject):
             + escape("戻した後は、この版を自動では入れません（手で確かめれば入れられます）"),
             confirm_only=True,
         )
-        if answer != ANSWER_NOW:
+        if answer != ANSWER_NOW or not self._restart("rollback"):
             return False
+        # 戻すと決まってから覚える 取り消したのに、今の版が「飛ばす版」に残らないように
         state = self._store.load()
         if __version__ not in state.skipped:
             self._store.save(replace(state, skipped=(*state.skipped, __version__)))
-        plan = SwapPlan("rollback", self._layout, pid=os.getpid(), arguments=self._arguments())
-        return self._restart(plan)
+        return True
 
-    def _restart(self, plan: SwapPlan) -> bool:
+    def _restart(self, mode: str) -> bool:
+        """保存の確認が済んでから入れ替え係を起こし、窓を閉じて終わる
+
+        入れ替え係を先に起こすと、保存の確認で取り消したり迷って待ちの 120 秒を過ぎたりしたとき、
+        入れ替え係が待つのを諦めて今の版を起こし、本体が 2 つ動く 確認で取り消されたら起こさない
+        """
+        assert self._layout is not None
         blockers = self._blockers()
         if blockers:
             self._inform(
@@ -369,6 +381,12 @@ class UpdateController(QObject):
                 "次の作業が終わってからもう一度選んでください\n" + "\n".join(blockers),
             )
             return False
+        if not self._confirm_close():
+            return False
+        if mode == "apply":
+            carry_user_files(self._layout.install, self._layout.staged)
+        # 開き直す作品は確認の後で決める 確認で名前を付けて保存したら、その作品を開き直す
+        plan = SwapPlan(mode, self._layout, pid=os.getpid(), arguments=self._arguments())
         try:
             launched = self._launcher(plan)
         except OSError as exc:
@@ -386,8 +404,9 @@ class UpdateController(QObject):
                 f"ことがあります） 配布のページから入れ直してください\n{RELEASES_URL}",
             )
             return False
-        # 入れ替え係は本体が終わるのを待っている 保存を尋ねて取り消されたら、入れ替え係を止める
-        if not self._window.close():
+        # 保存の確認はもう済んでいるので、閉じるときにもう一度は尋ねない
+        if not self._close_window():
+            # 閉じられなかった（窓の側が断った） 入れ替え係を残すと、後で閉じた所で入れ替わる
             launched.process.kill()
             return False
         QApplication.quit()
