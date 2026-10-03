@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -1182,3 +1183,129 @@ class TestTheUpdateParts:
         assert "公開鍵" in detail
         if sys.platform == "win32":
             assert "入れ替え（PowerShell）" in detail
+
+
+class TestTheSelfCheckOnAnEnglishWindows:
+    """英語の Windows（CI の Windows も同じ）では、パイプの文字コードが cp1252 になる
+
+    日本語を 1 文字も書けず、結果を出す前に落ちていた 終了コードだけが 1 になり、
+    どの部品が動かないのかを知る手段が無くなる
+    """
+
+    def test_a_narrow_pipe_is_switched_to_utf8(self) -> None:
+        from sashimono.selfcheck import _make_writable
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        text = "[ok] 版: 0.1.0（配布版）"
+        _make_writable(stream, text)
+        stream.write(text)
+        stream.flush()
+        assert stream.encoding == "utf-8"
+
+    def test_a_japanese_windows_keeps_its_own(self) -> None:
+        """書ける出口は変えない 変えると ``| more`` で読む人の画面が化ける"""
+        from sashimono.selfcheck import _make_writable
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp932")
+        _make_writable(stream, "[ok] 版: 0.1.0（配布版）")
+        assert stream.encoding == "cp932"
+
+
+class TestTheVcRuntimeCheck:
+    """配布版が Visual C++ の実行時の部品を、zip の外から借りていないか
+
+    開発機にも CI の Windows にも再頒布可能パッケージが入っていて、積み忘れても動いてしまう
+    入っていない機械では、自己診断にすらたどり着かずに起動の時点で落ちる
+    """
+
+    def _bundle(self, tmp_path: Path) -> Path:
+        bundle = tmp_path / "展開 先" / "Sashimono"
+        (bundle / "_internal" / "PySide6").mkdir(parents=True)
+        (bundle / "_internal" / "VCRUNTIME140.dll").write_bytes(b"MZ")
+        (bundle / "_internal" / "PySide6" / "MSVCP140.dll").write_bytes(b"MZ")
+        return bundle
+
+    def test_parts_from_inside_pass(self, tmp_path: Path) -> None:
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            bundle / "_internal" / "PySide6" / "MSVCP140.dll",
+            Path(r"C:\Windows\System32\kernel32.dll"),
+        ]
+        assert "中の 2 個" in vc_runtime_report(loaded, bundle)
+
+    def test_an_outside_copy_of_a_bundled_part_passes(self, tmp_path: Path) -> None:
+        """同じ名前を配布版が持っていれば、入っていない機械ではそちらが読まれる"""
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            Path(r"C:\Windows\System32\msvcp140.dll"),
+        ]
+        assert "msvcp140.dll" in vc_runtime_report(loaded, bundle)
+
+    def test_a_part_only_windows_has_fails(self, tmp_path: Path) -> None:
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            Path(r"C:\Windows\System32\concrt140.dll"),
+        ]
+        with pytest.raises(RuntimeError, match=r"concrt140\.dll"):
+            vc_runtime_report(loaded, bundle)
+
+    def test_nothing_counted_is_not_taken_as_fine(self, tmp_path: Path) -> None:
+        """配布版の Python 自身が vcruntime140.dll を読む 数えられないのに通すと何も見ていない"""
+        from sashimono.selfcheck import vc_runtime_report
+
+        with pytest.raises(RuntimeError, match="数えられない"):
+            vc_runtime_report([Path(r"C:\Windows\System32\kernel32.dll")], self._bundle(tmp_path))
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows の DLL の一覧を読む")
+    def test_this_process_is_counted(self) -> None:
+        from sashimono.selfcheck import VC_RUNTIME_PREFIXES, loaded_modules
+
+        names = [path.name.lower() for path in loaded_modules()]
+        assert any(name.startswith("python3") for name in names)
+        assert any(name.startswith(VC_RUNTIME_PREFIXES) for name in names)
+
+    def test_development_is_not_judged(self) -> None:
+        # 開発環境の Python は再頒布可能パッケージ込みで入っていて、照らす配布版が無い
+        from sashimono.selfcheck import _vc_runtime
+
+        assert "開発環境" in _vc_runtime()
+
+
+class TestTheEncodeCheckNeedsNoGL:
+    """GPU の無い機械でも FFmpeg の部品は確かめる 書き出す項目は GL で先に落ちる"""
+
+    def test_it_encodes_into_a_japanese_folder(self) -> None:
+        from sashimono.selfcheck import JAPANESE_FOLDER, _encode
+
+        assert " " in JAPANESE_FOLDER and not JAPANESE_FOLDER.isascii()
+        assert JAPANESE_FOLDER in _encode()
+
+    def test_it_does_not_touch_gl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sashimono import selfcheck
+
+        def no_gl(*args: object, **kwargs: object) -> None:
+            raise AssertionError("GL を使った")
+
+        monkeypatch.setattr("sashimono.engine.gpu.OffscreenGLContext", no_gl)
+        monkeypatch.setattr("sashimono.engine.gpu.context.OffscreenGLContext", no_gl)
+        assert "読み戻せた" in selfcheck._encode()
+
+
+class TestTheSoftwareGLIsLeftOut:
+    def test_qts_software_gl_is_not_shipped(self, builder: ModuleType) -> None:
+        """Qt のソフトウェアの GL（opengl32sw.dll 20 MB）は積まない
+
+        取れるのは OpenGL 3.0 までで描画に要る 4.3 に届かず、描く関数は PyOpenGL が
+        Windows の opengl32.dll から引くので、Qt がこちらで作ったコンテキストへ届かない
+        積んでいても GPU の無い機械で描けないことは変わらない
+        """
+        assert "PySide6/opengl32sw.dll" in builder.UNUSED_QT_PARTS

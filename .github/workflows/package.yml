@@ -58,6 +58,15 @@ jobs:
       - name: 依存を入れる
         run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
 
+      - name: 積む包みを一覧の版にそろえる
+        # 依存は下限だけなので、その日の最新が入る 一覧（THIRD_PARTY_NOTICES.md）と版が
+        # 食い違うと組み立てが止まる（使用許諾の写しとソースの添付を揃えた版で組む）
+        # 制約を書く道具が依存を読むので、入れてから留め直す
+        run: |
+          python tools/build_package.py --write-constraints build/constraints.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -c build/constraints.txt
+
       - name: タグと版を照らす
         # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
         # タグから呼ばれたときだけ（release.yml）

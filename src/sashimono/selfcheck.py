@@ -47,6 +47,11 @@ JAPANESE_FOLDER = "確かめる 日本語"
 #: （tools/check_clean_machine.ps1）が、GPU の無い機械でもこの項目は通ることを見る
 ENCODE_CHECK_NAME = "FFmpeg で符号化（日本語のパス）"
 
+#: GL を使う 2 項目の名前 GPU の無い機械では、この 2 つだけが GL の理由で落ちる
+#: まっさらな Windows で確かめる道具は、この 2 つが GL の理由で落ちたことを見分けて通す
+RENDER_CHECK_NAME = "GL で描く"
+EXPORT_CHECK_NAME = "書き出す（FFmpeg）"
+
 #: 符号化して読み戻すコマ数
 ENCODE_FRAMES = 3
 
@@ -76,9 +81,9 @@ def run_self_check() -> list[CheckResult]:
         ("Qt", _qt, False),
         ("Qt の日本語訳", _qt_translation, False),
         ("編集画面を組み立てる", _editor, False),
-        ("GL で描く", _render, False),
+        (RENDER_CHECK_NAME, _render, False),
         (ENCODE_CHECK_NAME, _encode, False),
-        ("書き出す（FFmpeg）", _export, False),
+        (EXPORT_CHECK_NAME, _export, False),
         ("AviUtl スクリプト（Lua）", _lua, False),
         ("音の出口", _sound, True),
         ("スクリプト置き場", _script_roots, False),
@@ -517,13 +522,13 @@ def vc_runtime_report(loaded: Iterable[Path], bundle: Path) -> str:
     missing = [path for path in borrowed if path.name.lower() not in own]
     if missing:
         raise RuntimeError(
-            "配布版に無い部品を Windows 側から読んでいる（再頒布可能パッケージの無い機械では"
+            "配布版に無い部品を外（Windows や開発の道具の置き場）から読んでいる（再頒布可能パッケージの無い機械では"
             "起動しない）: " + "、".join(str(path) for path in missing)
         )
     detail = f"配布版の中の {len(inside)} 個を読んだ"
     if borrowed:
         names = "、".join(sorted({path.name for path in borrowed}))
-        detail += f" Windows 側の物を先に読んだ物（配布版にもある）: {names}"
+        detail += f" 外の物を先に読んだ（配布版にも同じ名前がある）: {names}"
     return detail
 
 

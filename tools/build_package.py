@@ -471,6 +471,22 @@ def listed_versions(notices: str) -> dict[str, str]:
     return versions
 
 
+def constraints(notices: str) -> list[str]:
+    """一覧（THIRD_PARTY_NOTICES.md）の包みを、一覧の版に留める制約（``uv pip install -c`` の形）
+
+    依存は下限だけで書いてあるので、CI のまっさらな機械で入れるとその日の最新が入り、
+    一覧と版が食い違って組み立てが止まる（av 19 で DLL が増え、写しの無い部品になった）
+    一覧の版は、使用許諾の写しとソースの添付を揃えた版 組み立てる機械が変わっても、
+    この版で組む 上げるときは一覧と写しを先に直す
+    版の列が版の形でない行（同梱のファイルの表）は外す
+    """
+    return [
+        f"{name}=={version}"
+        for name, version in sorted(listed_versions(notices).items())
+        if re.fullmatch(r"\d[0-9A-Za-z.!+]*", version)
+    ]
+
+
 def collect_licenses(
     bundle: Path,
     sources: Iterable[Path],
@@ -954,7 +970,20 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
         action="store_true",
         help="zip からの確認を省く（できた zip は確かめていない物になる）",
     )
+    parser.add_argument(
+        "--write-constraints",
+        type=Path,
+        metavar="PATH",
+        help="積む包みを一覧の版に留める制約を書いて終わる（組み立てない CI で使う）",
+    )
     args = parser.parse_args(argv)
+
+    if args.write_constraints is not None:
+        lines = constraints(NOTICES_SOURCE.read_text(encoding="utf-8"))
+        args.write_constraints.parent.mkdir(parents=True, exist_ok=True)
+        args.write_constraints.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("\n".join(lines))
+        return 0
 
     work = ROOT / "build" / "pyinstaller"
     dist = dist if dist is not None else ROOT / "dist"
