@@ -167,7 +167,10 @@ class SetupSection(QWidget):
 
         def run() -> None:
             code = install_runtime(
-                command=argv, on_output=self._log_queue.put, should_cancel=cancel.is_set
+                pack=self._pack,
+                command=argv,
+                on_output=self._log_queue.put,
+                should_cancel=cancel.is_set,
             )
             self._code = code
             self._log_queue.put(

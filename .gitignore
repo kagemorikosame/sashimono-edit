@@ -25,3 +25,9 @@ htmlcov/
 
 # 比較などの作業フォルダ 配布物の絵が入るので入れない
 /.work/
+
+# 自動更新の署名鍵（tools/update_keys.py が書く） 合言葉で包んであっても入れない
+# 置き場は本人のパスワード管理アプリとオフラインの控え（docs/development.md）
+*.key
+/update.json
+/update.json.sig

@@ -19,6 +19,9 @@ dependencies = [
     # AviUtl スクリプトを動かす Lua 既定で入れる（互換機能の土台なので、
     # 追加導入にすると「スクリプトが動かない」が既定の状態になる）
     "lupa>=2.5",
+    # 自動更新の目録の署名（Ed25519）を確かめる 配る zip には前から入っている（AI 連携の
+    # 依存と分け合うため THIRD_PARTY_NOTICES.md にも載っている） 本体が使うのでここに書く
+    "cryptography>=44",
 ]
 
 [project.optional-dependencies]

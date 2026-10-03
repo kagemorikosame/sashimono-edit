@@ -321,6 +321,17 @@ class Preferences:
     #: 「合わせる」を既定にしないのは、Windows を明るくしている人の画面が、版を上げた
     #: だけで黙って明るくなるため
     theme: str = THEME_DARK
+    #: 起動したときに新しい版を確かめる（数時間に 1 回まで） 見つけたら裏で落として確かめておく
+    #: 既定は入 古い版のまま直った不具合に困り続ける人を作らない 締め切り前など、編集環境を
+    #: 変えたくない人は切る（切っている間は今の版に留まる ヘルプの〔更新を確かめる…〕で
+    #: 手で確かめられる）
+    update_check: bool = True
+    #: 正式版より先に出すベータ版も受け取る 既定は切 作りが大きく変わることがあり、
+    #: 知らない人がいきなり受け取ると困る
+    update_beta: bool = False
+    #: 落として確かめた新しい版を入れる前に尋ねる 既定は入（入れるには再起動が要り、
+    #: 編集の途中で勝手に再起動しないため） 切ると、尋ねずに次の起動の頭で入れる
+    update_confirm: bool = True
 
     @property
     def splits_media(self) -> bool:
@@ -413,6 +424,9 @@ class PreferenceStore:
                 _LEGACY_MULTI_AUDIO.get(str(data.get("multi_audio")), plain.media_split),
             ),
             theme=_choice(data.get("theme"), THEME_MODES, plain.theme),
+            update_check=_flag(data.get("update_check"), plain.update_check),
+            update_beta=_flag(data.get("update_beta"), plain.update_beta),
+            update_confirm=_flag(data.get("update_confirm"), plain.update_confirm),
         )
 
     def save(self, preferences: Preferences) -> None:

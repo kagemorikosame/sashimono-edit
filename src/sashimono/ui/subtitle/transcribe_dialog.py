@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.asr import (
+    ASR_PACK,
     MODELS,
     JobKind,
     TranscribeOptions,
@@ -215,7 +216,9 @@ class TranscribeDialog(QDialog):
     def _refresh_availability(self) -> None:
         """導入状況を見て、押せるボタンを決める"""
         status = self._runtime_status()
-        self._run_button.setEnabled(status.installed)
+        # installed ではなく ready を見る 別の Python 向けに入った物は名前の上では入っているが、
+        # 起こし始めた所で拡張モジュールが読めずに落ちる
+        self._run_button.setEnabled(status.ready)
         self._install_button.setEnabled(True)
         # いつも触れるようにする ここが「GPU 版を入れるか」の選択を兼ねていて、切れば
         # CUDA ランタイム（2 GB 弱）を落とさずに済む 導入済みで CUDA ランタイムが無いときも
@@ -289,7 +292,10 @@ class TranscribeDialog(QDialog):
 
         def run() -> None:
             code = install_runtime(
-                command=command, on_output=self._install_log.put, should_cancel=cancel.is_set
+                pack=ASR_PACK,
+                command=command,
+                on_output=self._install_log.put,
+                should_cancel=cancel.is_set,
             )
             self._install_code = code
             self._install_log.put(

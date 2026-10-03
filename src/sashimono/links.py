@@ -9,7 +9,15 @@ Qt を読まない 自己診断や配る zip を組み立てる道具からも�
 
 from __future__ import annotations
 
-__all__ = ["DISCUSSION_CATEGORIES", "MANUAL_URL", "REPORT_URL", "REPOSITORY_URL"]
+__all__ = [
+    "BETA_MANIFEST_URL",
+    "DISCUSSION_CATEGORIES",
+    "MANUAL_URL",
+    "RELEASES_URL",
+    "REPORT_URL",
+    "REPOSITORY_URL",
+    "STABLE_MANIFEST_URL",
+]
 
 #: 公開リポジトリ
 REPOSITORY_URL = "https://github.com/kagemorikosame/sashimono-edit"
@@ -35,3 +43,14 @@ DISCUSSION_CATEGORIES: dict[str, str] = {
     "ideas": "要望",
     "q-a": "質問",
 }
+
+#: 配布物の一覧 自動で入れ替えられないとき（置き場に書けない・目録が新しすぎる）に案内する
+RELEASES_URL = f"{REPOSITORY_URL}/releases"
+
+#: 自動更新の目録（正式版） **配った版が読み続ける契約なので変えない**
+#: ``releases/latest/download/…`` は、プレリリースでない最新のリリースの同じ名前の資産へ
+#: 転送される REST API（未認証で 1 時間 60 回）を使わないので、共有回線でも数え切られない
+STABLE_MANIFEST_URL = f"{RELEASES_URL}/latest/download/update.json"
+
+#: 自動更新の目録（ベータ） ``latest`` はプレリリースを飛ばすので、動かすタグ ``beta`` に充てる
+BETA_MANIFEST_URL = f"{RELEASES_URL}/download/beta/update.json"

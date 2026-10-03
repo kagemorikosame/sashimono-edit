@@ -439,6 +439,30 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._chat_enter_sends)
 
+        self._update_check = QCheckBox("起動したときに新しい版を確かめる", self)
+        self._update_check.setChecked(preferences.update_check)
+        self._update_check.setToolTip(
+            "確かめるのは数時間に 1 回まで 見つけたら裏で落とし、署名と中身を確かめてから"
+            "知らせる 繋がらないときは何も言わない 切ると今の版に留まる"
+            "（ヘルプの〔更新を確かめる…〕で手で確かめられる）"
+        )
+        form.addRow(self._update_check)
+
+        self._update_beta = QCheckBox("ベータ版も受け取る", self)
+        self._update_beta.setChecked(preferences.update_beta)
+        self._update_beta.setToolTip(
+            "正式版より先に出す版 新しい機能を早く使える代わりに、作りが大きく変わることがある"
+        )
+        form.addRow(self._update_beta)
+
+        self._update_confirm = QCheckBox("新しい版を入れる前に尋ねる", self)
+        self._update_confirm.setChecked(preferences.update_confirm)
+        self._update_confirm.setToolTip(
+            "入れるには再起動が要る 切ると、落として確かめた版を、尋ねずに次の起動の頭で入れる"
+            " どちらでも、編集や書き出しの途中で勝手に再起動はしない"
+        )
+        form.addRow(self._update_confirm)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -556,4 +580,7 @@ class PreferencesDialog(QDialog):
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
             theme=str(self._theme.currentData()),
+            update_check=self._update_check.isChecked(),
+            update_beta=self._update_beta.isChecked(),
+            update_confirm=self._update_confirm.isChecked(),
         )

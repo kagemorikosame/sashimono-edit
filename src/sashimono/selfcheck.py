@@ -69,6 +69,7 @@ def run_self_check() -> list[CheckResult]:
         ("スクリプト置き場", _script_roots, False),
         ("同梱の絵（アイコン・ボタンの印）", _bundled_files, False),
         ("追加機能の導入（pip）", _pip, False),
+        (UPDATE_CHECK_NAME, _update, False),
     ]
     results = []
     for name, check, optional in checks:
@@ -384,6 +385,28 @@ def _pip() -> str:
     from pip import __version__ as pip_version
 
     return f"pip {pip_version}"
+
+
+#: 自動更新の項目の名前 配る zip を組み立てる道具が、この項目が通ったかを見る
+UPDATE_CHECK_NAME = "自動更新"
+
+
+def _update() -> str:
+    """更新の部品（署名・照合・展開・入れ替え係）が、この実行環境で動くか
+
+    ネットワークには出ない その場で作った使い捨ての鍵と見本のリリースで通す
+    埋め込んだ公開鍵の数も出す 0 本の版は更新を確かめない（配る前に気付けるように）
+    """
+    from sashimono.update.rehearsal import rehearse
+    from sashimono.update.signing import TRUSTED_PUBLIC_KEYS, trusted_keys
+
+    with tempfile.TemporaryDirectory(prefix="sashimono-check-update-") as folder:
+        detail = rehearse(Path(folder))
+    keys = len(trusted_keys())
+    if keys != len(TRUSTED_PUBLIC_KEYS):
+        raise RuntimeError("埋め込んだ公開鍵に読めない物がある（貼り間違い）")
+    suffix = f"公開鍵 {keys} 本" if keys else "公開鍵が入っていない（この版は更新を確かめない）"
+    return f"{detail} {suffix}"
 
 
 if __name__ == "__main__":  # pragma: no cover - 入口は sashimono.app

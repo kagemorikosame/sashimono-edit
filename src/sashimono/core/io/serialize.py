@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -58,12 +59,14 @@ __all__ = [
     "FORMAT_NAME",
     "FORMAT_VERSION",
     "LEGACY_SUFFIXES",
+    "PRE_UPGRADE_SUFFIX",
     "ProjectFileError",
     "clip_from_json",
     "clip_to_json",
     "effect_from_json",
     "effect_to_json",
     "json_text",
+    "keep_pre_upgrade_copy",
     "load_project",
     "project_from_dict",
     "project_to_dict",
@@ -911,6 +914,31 @@ def save_project(project: Project, path: Path) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(path)
+
+
+#: 形式を上げる前の写しに足す尻（``名前.sme.bak``）
+PRE_UPGRADE_SUFFIX = ".bak"
+
+
+def keep_pre_upgrade_copy(path: Path) -> Path | None:
+    """上書きしようとしているファイルが古い形式なら、横に ``名前.sme.bak`` として写しを残す
+
+    写した場所を返す 古い形式でない・読めない・無いなら何もしない
+    自動更新で新しい版にしたあと、前の版へ戻した人のため 古い版は新しい形式を開けない
+    （「更新してください」で止まる）ので、上げる前の写しが無いと、保存し直した作品へ戻る道が無い
+    写しは上げるたびに書き直す 上げる前の最後の中身が要るので、前に上げたときの写しは古すぎる
+    """
+    path = Path(path)
+    try:
+        root = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    version = root.get("version") if isinstance(root, dict) else None
+    if not isinstance(version, int) or isinstance(version, bool) or version >= FORMAT_VERSION:
+        return None
+    copy = path.with_name(path.name + PRE_UPGRADE_SUFFIX)
+    shutil.copy2(path, copy)
+    return copy
 
 
 def load_project(path: Path) -> Project:
