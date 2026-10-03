@@ -41,6 +41,7 @@ __all__ = [
     "ManifestError",
     "PackageInfo",
     "is_newer",
+    "is_prerelease",
     "manifest_to_json",
     "parse_manifest",
     "parse_version",
@@ -98,6 +99,17 @@ def is_newer(candidate: str, current: str) -> bool:
         return Version(candidate) > Version(current)
     except InvalidVersion:
         return False
+
+
+def is_prerelease(version: str) -> bool:
+    """ベータなどの先行版か（``1.3.0b1`` ``1.3.0rc1``） 読めない版は先行版とする
+
+    読めない物を正式版と見ると、ベータを切った人に入れてしまう
+    """
+    try:
+        return Version(version).is_prerelease
+    except InvalidVersion:
+        return True
 
 
 def _text(data: dict[str, Any], key: str) -> str:

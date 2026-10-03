@@ -27,7 +27,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.updates import ANSWER_NEXT_START, ANSWER_SKIP, UpdateController
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from sashimono.update.fetch import MemoryTransport
-from sashimono.update.package import APP_EXE, Layout
+from sashimono.update.package import APP_EXE, Layout, write_build_info
 from sashimono.update.state import (
     STAGE_LOCK,
     SWAP_LOCK,
@@ -277,6 +277,39 @@ class TestOffering:
         assert NEWER in state.skipped and state.ready_version == ""
         assert not ready.layout.staged.exists()
         assert ready.controller.button.isHidden()
+
+
+class TestSwitchingSettings:
+    """設定を切り替えたとき、待っている版と予約を今の好みにそろえる（表は docs）"""
+
+    def test_stop_asking_reserves_the_ready_version(self, harness: _Harness) -> None:
+        """確認ありで落とした後に〔入れる前に尋ねる〕を切る 説明どおり次の起動の頭で入れる"""
+        harness.controller.start()
+        assert not harness.store.load().apply_on_start
+        harness.controller.apply_preferences(Preferences(update_confirm=False))
+        state = harness.store.load()
+        assert state.apply_on_start and not state.apply_chosen
+
+    def test_turning_beta_off_drops_a_ready_beta(self, harness: _Harness) -> None:
+        """ベータを待たせたままベータを切ると、次の起動でベータが入っていた"""
+        beta = "9000.0.0b1"
+        harness.layout.staged.mkdir()
+        (harness.layout.staged / APP_EXE).write_bytes(b"MZ")
+        write_build_info(harness.layout.staged, beta, "cp314")
+        harness.store.save(UpdateState(ready_version=beta, apply_on_start=True, apply_chosen=True))
+        harness.controller.apply_preferences(Preferences(update_beta=True))
+        assert harness.controller.ready_version() == beta
+
+        harness.controller.apply_preferences(Preferences(update_beta=False))
+        state = harness.store.load()
+        assert (state.ready_version, state.apply_on_start) == ("", False)
+        assert not harness.layout.staged.exists()
+        assert harness.controller.button.isHidden()
+
+    def test_turning_beta_off_keeps_a_release(self, harness: _Harness) -> None:
+        harness.controller.start()
+        harness.controller.apply_preferences(Preferences(update_beta=False))
+        assert harness.controller.ready_version() == NEWER
 
 
 class TestRestarting:

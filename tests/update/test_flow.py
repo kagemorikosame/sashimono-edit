@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from sashimono.update.flow import (
     UpdateChoices,
     apply_on_start,
     prepare,
+    reconcile,
     settle,
 )
 from sashimono.update.package import APP_EXE, Layout, write_build_info
@@ -159,6 +161,146 @@ class TestApplyingOnStart:
             held.release()
         # 予約は残す 落とし終えた後の起動で入れる
         assert store.load().apply_on_start
+
+
+#: 予約の 3 通り 無い・本人が選んだ・尋ねない設定が自動で付けた
+NONE = UpdateState(ready_version="1.2.0")
+CHOSEN = UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True)
+AUTOMATIC = UpdateState(ready_version="1.2.0", apply_on_start=True)
+BETA_CHOSEN = UpdateState(ready_version="1.3.0b1", apply_on_start=True, apply_chosen=True)
+BETA_AUTOMATIC = UpdateState(ready_version="1.3.0b1", apply_on_start=True)
+
+
+def _reserved(state: UpdateState) -> tuple[str, bool, bool]:
+    return state.ready_version, state.apply_on_start, state.apply_chosen
+
+
+class TestTheSwitchTable:
+    """3 つの設定の、どちらの向きの切り替えでも、予約が今の好みにそろう（docs の表と同じ）
+
+    切り替えた後の好み（``after``）だけで決まる 切り替える前が何だったかで答えが変わると、
+    画面で切り替えたときと起動の頭とで別の答えになる
+    """
+
+    @pytest.mark.parametrize(
+        ("before", "after", "expected"),
+        [
+            # 起動したときに確かめる 入 → 切 予約は全部外す 待っている版は残す
+            (CHOSEN, UpdateChoices(check=False), ("1.2.0", False, False)),
+            (AUTOMATIC, UpdateChoices(check=False, confirm=False), ("1.2.0", False, False)),
+            # 切 → 入 尋ねない設定なら自動で付ける 尋ねる設定なら付けない
+            (NONE, UpdateChoices(check=True, confirm=False), ("1.2.0", True, False)),
+            (NONE, UpdateChoices(check=True, confirm=True), ("1.2.0", False, False)),
+            # 入れる前に尋ねる 入 → 切 待っている版を自動で予約する（Codex P2）
+            (NONE, UpdateChoices(confirm=False), ("1.2.0", True, False)),
+            (CHOSEN, UpdateChoices(confirm=False), ("1.2.0", True, True)),
+            # 切 → 入 自動の予約だけ外す 選んだ予約は残す
+            (AUTOMATIC, UpdateChoices(confirm=True), ("1.2.0", False, False)),
+            (CHOSEN, UpdateChoices(confirm=True), ("1.2.0", True, True)),
+            # ベータ版も受け取る 入 → 切 先行版は予約ごと外す（Codex P2） 正式版は残す
+            (BETA_CHOSEN, UpdateChoices(beta=False), ("", False, False)),
+            (BETA_AUTOMATIC, UpdateChoices(beta=False, confirm=False), ("", False, False)),
+            (CHOSEN, UpdateChoices(beta=False), ("1.2.0", True, True)),
+            # 切 → 入 変えない
+            (BETA_CHOSEN, UpdateChoices(beta=True), ("1.3.0b1", True, True)),
+            (BETA_AUTOMATIC, UpdateChoices(beta=True, confirm=False), ("1.3.0b1", True, False)),
+        ],
+    )
+    def test_every_switch_lands_on_the_same_rule(
+        self, before: UpdateState, after: UpdateChoices, expected: tuple[str, bool, bool]
+    ) -> None:
+        assert _reserved(reconcile(before, after)) == expected
+
+    def test_a_failed_version_is_not_reserved_again(self) -> None:
+        """入れ替えに失敗した版を自動で予約し直すと、起動のたびに失敗して待たされる"""
+        blocked = replace(NONE, auto_blocked="1.2.0")
+        assert _reserved(reconcile(blocked, UpdateChoices(confirm=False))) == (
+            "1.2.0",
+            False,
+            False,
+        )
+        # 本人が選んだ予約は入れる
+        chosen = replace(CHOSEN, auto_blocked="1.2.0")
+        assert reconcile(chosen, UpdateChoices(confirm=False)).apply_on_start
+
+    def test_it_is_settled(self) -> None:
+        """2 度通しても変わらない（起動の頭と画面の両方が通しても食い違わない）"""
+        for state in (NONE, CHOSEN, AUTOMATIC, BETA_CHOSEN, BETA_AUTOMATIC):
+            for choices in (
+                UpdateChoices(check, confirm, beta)
+                for check in (True, False)
+                for confirm in (True, False)
+                for beta in (True, False)
+            ):
+                once = reconcile(state, choices)
+                assert reconcile(once, choices) == once
+
+
+class TestStartFollowsTheTable:
+    def test_turning_confirm_off_applies_on_the_next_start(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """確認ありで落とした後に〔入れる前に尋ねる〕を切った 説明どおり次の起動の頭で入れる"""
+        _stage(layout, "1.2.0")
+        store.save(NONE)
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        assert apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=swap,
+            current="1.1.0",
+            choices=lambda: UpdateChoices(confirm=False),
+        )
+        assert len(plans) == 1
+
+    def test_a_beta_is_not_applied_after_turning_beta_off(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """ベータを予約した後にベータを切った人に、次の起動でベータを入れない"""
+        _stage(layout, "1.3.0b1")
+        store.save(BETA_CHOSEN)
+        assert not apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=_never,
+            current="1.2.0",
+            choices=lambda: UpdateChoices(beta=False),
+        )
+        assert store.load().ready_version == ""
+
+    def test_a_failed_swap_is_not_retried_on_every_start(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        _stage(layout, "1.2.0")
+        store.save(NONE)
+        not_asking = lambda: UpdateChoices(confirm=False)  # noqa: E731
+        assert not apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=lambda _plan: False,
+            current="1.1.0",
+            choices=not_asking,
+        )
+        assert store.load().auto_blocked == "1.2.0"
+        assert not apply_on_start(
+            ["x"], layout=layout, store=store, swap=_never, current="1.1.0", choices=not_asking
+        )
+
+    def test_a_failure_in_the_results_blocks_the_automatic_retry(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        _stage(layout, "1.2.0")
+        store.save(NONE)
+        settle(layout=layout, store=store, current="1.1.0", results=["busy"])
+        assert store.load().auto_blocked == "1.2.0"
 
 
 class TestOneAtATime:

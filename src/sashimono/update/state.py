@@ -79,6 +79,9 @@ class UpdateState:
     #: 次の起動で入れるのを、本人が〔次の起動で入れる〕で選んだ 偽なら尋ねない設定が自動で
     #: 予約した物 後で〔入れる前に尋ねる〕を入れたら、自動の予約だけを外す（選んだ物は残す）
     apply_chosen: bool = False
+    #: 入れ替えに失敗した版 この版は尋ねない設定でも自動では予約しない（本人が選べば入れる）
+    #: 置かないと、入れ替えが毎回断られる機械で、起動のたびに入れ替えを試して待たされる
+    auto_blocked: str = ""
 
 
 class UpdateStateStore:
@@ -113,6 +116,7 @@ class UpdateStateStore:
             ready_python_abi=_text(data.get("ready_python_abi")),
             apply_on_start=data.get("apply_on_start") is True,
             apply_chosen=data.get("apply_chosen") is True,
+            auto_blocked=_text(data.get("auto_blocked")),
         )
 
     def save(self, state: UpdateState) -> None:

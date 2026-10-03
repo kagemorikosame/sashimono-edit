@@ -836,13 +836,9 @@ class MainWindow(QMainWindow):
             PreferenceStore().save(preferences)
         except OSError as exc:
             self.statusBar().showMessage(f"設定を保存できなかった: {exc}", 5000)
-        if not preferences.update_check:
-            # 今の版に留まりたい合図 前に予約した〔次の起動で入れる〕も外す
-            self._updates.cancel_reservation()
-        elif preferences.update_confirm:
-            # 入れる前に尋ねてほしい合図 尋ねない設定が自動で付けた予約だけを外す
-            # （本人が〔次の起動で入れる〕を選んだ予約は、もう尋ねて答えをもらってある）
-            self._updates.cancel_reservation(automatic_only=True)
+        # 更新の 3 つの設定のどれを、どちらの向きに切り替えても、待っている版と次の起動の
+        # 予約を今の好みにそろえる 決まりは起動の頭と同じ（update.flow.reconcile）
+        self._updates.apply_preferences(preferences)
 
         if resized or stopped:
             self._proxies.close()

@@ -21,7 +21,7 @@ from sashimono import __version__
 from sashimono.core import userdirs
 from sashimono.core.io.locks import try_hold
 from sashimono.update.fetch import Transport
-from sashimono.update.manifest import Manifest, is_newer
+from sashimono.update.manifest import Manifest, is_newer, is_prerelease
 from sashimono.update.package import Layout, carry_user_files, current_layout, stage
 from sashimono.update.state import (
     STAGE_LOCK,
@@ -38,6 +38,7 @@ __all__ = [
     "UpdateChoices",
     "apply_on_start",
     "prepare",
+    "reconcile",
     "settle",
     "start_swap",
     "update_choices",
@@ -78,17 +79,19 @@ PREFERENCES_FILE = "preferences.json"
 
 @dataclass(frozen=True, slots=True)
 class UpdateChoices:
-    """起動の頭で見る、本人の好みの 2 項目（``Preferences`` と同じ既定）"""
+    """更新に関わる本人の好みの 3 項目（``Preferences`` と同じ既定）"""
 
     #: 〔起動したときに新しい版を確かめる〕
     check: bool = True
     #: 〔新しい版を入れる前に尋ねる〕
     confirm: bool = True
+    #: 〔ベータ版も受け取る〕
+    beta: bool = False
 
 
 def update_choices() -> UpdateChoices:
     """起動の頭は Qt を読む前なので、``ui.workspace`` の読み手（Qt を読む）は使えない
-    設定のファイルのこの 2 項目だけを直に読む 読めない・無い・壊れた値は既定
+    設定のファイルのこの 3 項目だけを直に読む 読めない・無い・壊れた値は既定
     """
     try:
         data = json.loads((userdirs.config_root() / PREFERENCES_FILE).read_text(encoding="utf-8"))
@@ -97,11 +100,44 @@ def update_choices() -> UpdateChoices:
     if not isinstance(data, dict):
         return UpdateChoices()
     plain = UpdateChoices()
-    check, confirm = data.get("update_check"), data.get("update_confirm")
+
+    def flag(key: str, default: bool) -> bool:
+        value = data.get(key)
+        return value if isinstance(value, bool) else default
+
     return UpdateChoices(
-        check=check if isinstance(check, bool) else plain.check,
-        confirm=confirm if isinstance(confirm, bool) else plain.confirm,
+        check=flag("update_check", plain.check),
+        confirm=flag("update_confirm", plain.confirm),
+        beta=flag("update_beta", plain.beta),
     )
+
+
+def reconcile(state: UpdateState, choices: UpdateChoices) -> UpdateState:
+    """入れ替えを待つ版と次の起動の予約を、今の好みにそろえる
+
+    設定を変えたとき（画面の側）と起動の頭の両方がこれを通す 片方だけで決めると、
+    画面で切り替えた後に起動の頭が古い予約を当てる（またはその逆）ことになる
+    どの向きに切り替えても、結果は「今の好みで初めから決めた形」と同じになる
+
+    1. 〔ベータ版も受け取る〕が切で、待っている版が先行版 待っている版ごと外す
+       （予約も、入れるかを尋ねるボタンも出さない 正式版は次の確認で落とし直す）
+    2. 〔起動したときに新しい版を確かめる〕が切 今の版に留まりたい合図なので予約を全部外す
+       待っている版は残す（〔更新を確かめる…〕から手で入れられる）
+    3. 本人が〔次の起動で入れる〕を選んだ予約は残す（尋ねて答えをもらってある）
+    4. それ以外は〔入れる前に尋ねる〕で決める 切なら自動で予約し、入なら自動の予約を外す
+       ただし入れ替えに失敗した版は自動では予約しない（起動のたびに失敗し続けないため）
+    """
+    ready = state.ready_version
+    if not ready:
+        return replace(state, apply_on_start=False, apply_chosen=False)
+    if is_prerelease(ready) and not choices.beta:
+        return _clear_ready(state)
+    if not choices.check:
+        return replace(state, apply_on_start=False, apply_chosen=False)
+    if state.apply_on_start and state.apply_chosen:
+        return state
+    automatic = not choices.confirm and state.auto_blocked != ready
+    return replace(state, apply_on_start=automatic, apply_chosen=False)
 
 
 def updates_allowed() -> bool:
@@ -121,14 +157,12 @@ def apply_on_start(
     """次の起動で入れると決めた版があれば、入れ替え係を起こす 真なら呼んだ側はすぐ終わる
 
     編集画面を出す前に呼ぶ 出してからだと、開いたプロジェクトを閉じさせることになる
-    印は入れ替え係を起こす前に下ろす 入れ替えが毎回失敗する機械で、起動のたびに
-    入れ替えを試して起動できなくなるのを防ぐ（失敗は結果のファイルで次の起動が知らせる）
+    印は入れ替え係を起こす前に下ろす 失敗は結果のファイルで次の起動が知らせ、その版は
+    自動では予約し直さない（``auto_blocked``） 入れ替えが毎回失敗する機械で、起動のたびに
+    入れ替えを試して待たされるのを防ぐ
 
-    予約の後で本人が設定を変えていたら、それに従う（``choices`` 既定は設定のファイルを読む）
-
-    - 〔起動したときに新しい版を確かめる〕を切った 今の版に留まりたい合図なので入れない
-    - 〔新しい版を入れる前に尋ねる〕を入れた 尋ねない設定が自動で付けた予約は入れない
-      本人が〔次の起動で入れる〕を選んだ予約は、尋ねて答えをもらった物なので入れる
+    予約は今の好みにそろえてから見る（:func:`reconcile` ``choices`` 既定は設定のファイルを読む）
+    画面で設定を変えたときと同じ決まりで、起動の頭でも決める
 
     ほかの入れ替え係が走っていれば（2 つ目の起動）何も起こさずに真を返す 入れ替え係は
     窓が全部閉じるのを待って入れ替え、新しい版を起こし直す ここで画面を出すと、
@@ -142,23 +176,30 @@ def apply_on_start(
     busy = busy_with(store.path.parent)
     if busy == "swap":
         return True
-    state = store.load()
-    if not state.apply_on_start or not state.ready_version:
-        return False
     if busy is not None:
-        return False  # ほかの窓が新しい版を落としている 置き場が替わる途中なので入れない
+        return False  # ほかの窓が新しい版を落としている 置き場が替わる途中なので触らない
+    loaded = store.load()
+    state = reconcile(loaded, choices())
+    if not state.apply_on_start:
+        if state != loaded:
+            with contextlib.suppress(OSError):
+                store.save(state)
+        return False
     try:
         store.save(replace(state, apply_on_start=False, apply_chosen=False))
     except OSError:
         return False  # 印を下ろせない所で入れ替えると、失敗したときに毎回繰り返す
-    chosen = choices()
-    if not chosen.check or (chosen.confirm and not state.apply_chosen):
-        return False
     if layout.staged_version() != state.ready_version or not is_newer(state.ready_version, current):
         return False
     carry_user_files(layout.install, layout.staged)
     plan = SwapPlan("apply", layout, pid=os.getpid(), arguments=tuple(arguments[1:]))
-    return swap(plan)
+    if swap(plan):
+        return True
+    # 入れ替え係を起こせなかった（台本の実行が止められている など） 次の起動でまた
+    # 自動で予約して試すと、起動のたびに待たされる この版は本人が選ぶまで自動では入れない
+    with contextlib.suppress(OSError):
+        store.save(replace(store.load(), auto_blocked=state.ready_version))
+    return False
 
 
 def settle(
@@ -194,6 +235,9 @@ def settle(
             failure = next(
                 (line[len("error ") :] for line in lines if line.startswith("error ")), None
             )
+        if failure is not None and ready:
+            # 入れ替えに失敗した版は、尋ねない設定でも自動では予約し直さない（reconcile）
+            state = replace(state, auto_blocked=ready)
         if failure is not None:
             notice = (
                 f"更新を入れられませんでした（{failure}）"

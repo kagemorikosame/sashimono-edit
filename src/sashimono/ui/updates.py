@@ -33,7 +33,7 @@ from sashimono.runtime import python_abi, runtime_target_dir
 from sashimono.ui.workspace import Preferences
 from sashimono.update.check import CheckResult, Outcome, check_for_update, is_due
 from sashimono.update.fetch import FetchError, Transport, UrllibTransport
-from sashimono.update.flow import UpdateBusyError, prepare, settle
+from sashimono.update.flow import UpdateBusyError, UpdateChoices, prepare, reconcile, settle
 from sashimono.update.package import Layout, PackageError, carry_user_files, current_layout
 from sashimono.update.signing import trusted_keys
 from sashimono.update.state import UpdateStateStore, busy_with
@@ -143,21 +143,22 @@ class UpdateController(QObject):
             return state.ready_version
         return None
 
-    def cancel_reservation(self, *, automatic_only: bool = False) -> None:
-        """次の起動で入れる予約を外す 設定を変えたときに呼ぶ
+    def apply_preferences(self, preferences: Preferences) -> None:
+        """設定を変えたときに、待っている版と次の起動の予約を今の好みにそろえる
 
-        - 〔起動したときに新しい版を確かめる〕を切った 今の版に留まりたい合図なので全部外す
-        - 〔新しい版を入れる前に尋ねる〕を入れた（``automatic_only``） 尋ねない設定が自動で
-          付けた予約だけを外す 本人が〔次の起動で入れる〕を選んだ予約は、尋ねて答えた物なので残す
-
-        予約を残すと、次の起動で黙って入れ替わる 落としてある版はそのまま残す
-        （〔更新を確かめる…〕から手で入れられる）
+        決まりは起動の頭と同じ :func:`~sashimono.update.flow.reconcile`（表は docs の
+        「自動更新の仕組み」） ここで独自に決めると、画面で切り替えた後に起動の頭が
+        別の答えを出す
         """
         state = self._store.load()
-        if not state.apply_on_start or (automatic_only and state.apply_chosen):
-            return
-        with contextlib.suppress(OSError):
-            self._store.save(replace(state, apply_on_start=False, apply_chosen=False))
+        settled = reconcile(state, choices_of(preferences))
+        if settled != state:
+            with contextlib.suppress(OSError):
+                self._store.save(settled)
+        if not settled.ready_version and state.ready_version:
+            # 先行版をやめた 待っていた版の置き場を片付け、入れるかを尋ねるボタンも下げる
+            settle(layout=self._layout, store=self._store, results=())
+        self._refresh_button()
 
     def can_roll_back(self) -> bool:
         return self._layout is not None and self._layout.has_previous()
@@ -235,30 +236,27 @@ class UpdateController(QObject):
             return _Finished(manual, result)
         if not self._layout.writable():
             return _Finished(manual, result, not_replaceable=True)
-        apply_on_start = not preferences.update_confirm
         try:
             if self._layout.staged_version() == manifest.version:
-                # 前の起動で落とし終えている 覚え書きだけ直す 本人が選んだ予約は残す
+                # 前の起動で落とし終えている 覚え書きだけ直す 同じ版に本人が選んだ予約は残す
                 current = self._store.load()
-                kept = current.apply_chosen and current.ready_version == manifest.version
+                same = current.ready_version == manifest.version
                 self._store.save(
                     replace(
                         current,
                         ready_version=manifest.version,
                         ready_notes_url=manifest.notes_url,
                         ready_python_abi=manifest.python_abi,
-                        apply_on_start=apply_on_start or kept,
-                        apply_chosen=kept,
+                        apply_on_start=current.apply_on_start and same,
+                        apply_chosen=current.apply_chosen and same,
                     )
                 )
             else:
                 prepare(
-                    manifest,
-                    transport=self._transport(),
-                    layout=self._layout,
-                    store=self._store,
-                    apply_on_start=apply_on_start,
+                    manifest, transport=self._transport(), layout=self._layout, store=self._store
                 )
+            # 予約は設定を変えたときと同じ決まりで付ける（尋ねない設定なら自動で予約する）
+            self._store.save(reconcile(self._store.load(), choices_of(preferences)))
         except UpdateBusyError as exc:
             # ほかの窓が落としている・入れ替えている 待てば済むので起動時は黙る
             return _Finished(manual, result, error=f"ほかの窓で更新を進めています（{exc}）")
@@ -523,6 +521,15 @@ class UpdateController(QObject):
         box.setDefaultButton(later)
         box.exec()
         return answers.get(box.clickedButton(), ANSWER_LATER)
+
+
+def choices_of(preferences: Preferences) -> UpdateChoices:
+    """画面の設定から、更新の決まりが見る 3 項目を取り出す"""
+    return UpdateChoices(
+        check=preferences.update_check,
+        confirm=preferences.update_confirm,
+        beta=preferences.update_beta,
+    )
 
 
 def runtime_note(new_abi: str) -> str:
