@@ -100,6 +100,26 @@ $Environment = [ordered]@{
     TMP          = $Temp
     PATH         = @("$Windows\System32", $Windows, "$Windows\System32\Wbem") -join ';'
 }
+# 素の Windows の利用者なら誰でも持っている変数 中身は Windows の物で、開発の道具は指さない
+# 無いと PowerShell 5.1 の起動に 30 秒かかった（入れ替え係が走り始めるのを待ちきれない）
+# 使う人の機械には必ずあるので、外したまま確かめると使う人の機械で起きない失敗になる
+$WindowsDefaults = [ordered]@{}
+foreach ($name in @(
+        'ALLUSERSPROFILE', 'PUBLIC', 'ComSpec', 'PATHEXT', 'OS', 'NUMBER_OF_PROCESSORS',
+        'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION',
+        'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+        'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'DriverData'
+    )) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($value) { $WindowsDefaults[$name] = $value }
+}
+# runner の PSModulePath には pwsh や Azure のモジュールが載っている Windows の既定の並びにする
+$WindowsDefaults['PSModulePath'] = @(
+    "$env:ProgramFiles\WindowsPowerShell\Modules", "$Windows\system32\WindowsPowerShell\v1.0\Modules"
+) -join ';'
+$Minimal = [ordered]@{}
+foreach ($entry in $Environment.GetEnumerator()) { $Minimal[$entry.Key] = $entry.Value }
+foreach ($entry in $WindowsDefaults.GetEnumerator()) { $Environment[$entry.Key] = $entry.Value }
 
 function Read-Output([byte[]]$Bytes) {
     # 自己診断は、出口の文字コードで日本語を書けないとき UTF-8 へ切り替える
@@ -179,36 +199,64 @@ function Get-NewDrops([int]$Before) {
     return @($all[$Before..($all.Count - 1)])
 }
 
+# 止める規則と記録が本当に効いているかを、先に別の exe で確かめる
+# 効いていないと、自己診断が外へ出ても「止めた 0 件」で通ってしまう
+$curlCopy = Join-Path $Temp 'firewall-check.exe'
+Copy-Item -LiteralPath "$Windows\System32\curl.exe" -Destination $curlCopy
+New-NetFirewallRule -DisplayName 'Sashimono の確かめ 止まるか' -Direction Outbound -Program $curlCopy `
+    -Action Block | Out-Null
+$dropsBefore = @(Get-DroppedSends).Count
+& $curlCopy --silent --output NUL --max-time 15 https://api.github.com/zen
+$curlExit = $LASTEXITCODE
+$controlDrops = @(Get-NewDrops $dropsBefore)
+if ($curlExit -eq 0) {
+    Fail 'ファイアウォールの規則で exe を止められない（外へ出ないことを確かめられない）'
+} elseif ($controlDrops.Count -eq 0) {
+    $script:FirewallLogWorks = $false
+    Note "止めた送り出しが記録に残らない（curl は止まった 終了コード $curlExit） 出ようとした回数は数えられない"
+} else {
+    $script:FirewallLogWorks = $true
+    Note "ファイアウォールが効いている（見本の exe の送り出しを $($controlDrops.Count) 件止めて記録した）"
+}
+
 # --- 手掛かり 同じ環境で PowerShell 5.1 の台本が走るか ---
 # 自動更新の入れ替え係は Windows の PowerShell 5.1 で台本を走らせる 自己診断の自動更新の
 # 項目が落ちたときに、PowerShell そのものが走らないのか、入れ替え係の中で落ちたのかを分ける
 $probeFolder = Join-Path $Temp '台本 確かめ'
 New-Item -ItemType Directory -Force $probeFolder | Out-Null
 $probeScript = Join-Path $probeFolder 'probe.ps1'
-$probeResult = Join-Path $probeFolder 'result.txt'
 [IO.File]::WriteAllText($probeScript,
     "Add-Content -LiteralPath `$env:PROBE_RESULT -Value 'holding' -Encoding UTF8`n",
     [Text.UTF8Encoding]::new($true))
-$probeInfo = [System.Diagnostics.ProcessStartInfo]::new("$Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-foreach ($argument in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $probeScript)) {
-    $probeInfo.ArgumentList.Add($argument)
+
+function Measure-PowerShell([string]$Label, $Variables) {
+    $probeResult = Join-Path $probeFolder "result-$([guid]::NewGuid().ToString('N')).txt"
+    $probeInfo = [System.Diagnostics.ProcessStartInfo]::new("$Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    foreach ($argument in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $probeScript)) {
+        $probeInfo.ArgumentList.Add($argument)
+    }
+    $probeInfo.UseShellExecute = $false
+    $probeInfo.RedirectStandardOutput = $true
+    $probeInfo.RedirectStandardError = $true
+    $probeInfo.Environment.Clear()
+    foreach ($entry in $Variables.GetEnumerator()) { $probeInfo.Environment[$entry.Key] = $entry.Value }
+    $probeInfo.Environment['PROBE_RESULT'] = $probeResult
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $probe = [System.Diagnostics.Process]::Start($probeInfo)
+    $probeOut = $probe.StandardOutput.ReadToEndAsync()
+    $probeErr = $probe.StandardError.ReadToEndAsync()
+    [void]$probe.WaitForExit(120000)
+    $probeText = if (Test-Path -LiteralPath $probeResult) { (Get-Content -LiteralPath $probeResult -Raw).Trim() } else { '（無い）' }
+    Note ("PowerShell 5.1 の台本（{0}）: {1:N1} 秒 終了コード {2} 結果 {3}" -f
+        $Label, $watch.Elapsed.TotalSeconds, $probe.ExitCode, $probeText)
+    if ($probeErr.Result.Trim()) { Note "PowerShell 5.1 の標準エラー: $($probeErr.Result.Trim())" }
+    if ($probeOut.Result.Trim()) { Note "PowerShell 5.1 の標準出力: $($probeOut.Result.Trim())" }
+    return $watch.Elapsed.TotalSeconds
 }
-$probeInfo.UseShellExecute = $false
-$probeInfo.RedirectStandardOutput = $true
-$probeInfo.RedirectStandardError = $true
-$probeInfo.Environment.Clear()
-foreach ($entry in $Environment.GetEnumerator()) { $probeInfo.Environment[$entry.Key] = $entry.Value }
-$probeInfo.Environment['PROBE_RESULT'] = $probeResult
-$watch = [Diagnostics.Stopwatch]::StartNew()
-$probe = [System.Diagnostics.Process]::Start($probeInfo)
-$probeOut = $probe.StandardOutput.ReadToEndAsync()
-$probeErr = $probe.StandardError.ReadToEndAsync()
-[void]$probe.WaitForExit(120000)
-$probeText = if (Test-Path -LiteralPath $probeResult) { (Get-Content -LiteralPath $probeResult -Raw).Trim() } else { '（無い）' }
-Note ("PowerShell 5.1 の台本（日本語のフォルダ 同じ環境変数）: {0:N1} 秒 終了コード {1} 結果 {2}" -f
-    $watch.Elapsed.TotalSeconds, $probe.ExitCode, $probeText)
-if ($probeErr.Result.Trim()) { Note "PowerShell 5.1 の標準エラー: $($probeErr.Result.Trim())" }
-if ($probeOut.Result.Trim()) { Note "PowerShell 5.1 の標準出力: $($probeOut.Result.Trim())" }
+
+# 変数を削りすぎた環境と、確かめに使う環境（素の Windows の利用者と同じ変数）を比べる
+[void](Measure-PowerShell '削りすぎた環境変数' $Minimal)
+$PowerShellSeconds = Measure-PowerShell '確かめに使う環境変数' $Environment
 
 # --- 自己診断 ---
 $Scripts = Join-Path $AppHome 'scripts'
@@ -330,6 +378,33 @@ if ($window.HasExited) {
         Fail ('窓を出した後に落ちた（終了コード {0:X8}）' -f $window.ExitCode)
     } else {
         Note "窓が出た: $($window.MainWindowTitle)"
+        if ($glFailures -gt 0) {
+            # GL の無い機械では、プレビューの所に描けない理由を出す（main_window.py）
+            # 窓の中の文字を UI Automation で読む pwsh 7 から使えるとは限らないので、
+            # Windows に入っている PowerShell 5.1 で読む 型は Add-Type の後で文字列から引く
+            # （5.1 は型を書いた所を読む時点で解決しようとして見つけられない）
+            $find = @"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+`$element = 'System.Windows.Automation.AutomationElement' -as [type]
+`$scope = 'System.Windows.Automation.TreeScope' -as [type]
+`$condition = 'System.Windows.Automation.Condition' -as [type]
+`$root = `$element::FromHandle([IntPtr]::new($($window.MainWindowHandle.ToInt64())))
+foreach (`$item in `$root.FindAll(`$scope::Descendants, `$condition::TrueCondition)) {
+    `$name = `$item.Current.Name
+    if (`$name -and `$name.Contains('OpenGL 4.3')) { exit 0 }
+}
+exit 1
+"@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($find))
+            & "$Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive `
+                -EncodedCommand $encoded
+            if ($LASTEXITCODE -eq 0) {
+                Note '窓に GL を使えない理由（OpenGL 4.3 を使えないため…）が出ている'
+            } else {
+                Fail "GL の無い機械なのに、窓に描けない理由が出ていない（UI Automation の終了コード $LASTEXITCODE）"
+            }
+        }
         # 写真は手掛かりとして残すだけ 撮れなくても（画面の無い runner）落とさない
         try {
             $rect = [Sashimono.Native+Rect]::new()
