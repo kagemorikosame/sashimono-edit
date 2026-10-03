@@ -26,7 +26,9 @@ STEPS: list[tuple[str, list[str]]] = [
     ("mypy", ["-m", "mypy", "src", "tests"]),
     # -q は pyproject の addopts にもある 2 つ重ねると集計の行まで消えるので、ここでは
     # 足さない -rf は落ちたテストの名前を最後に並べる（CI の要約に写す）
-    ("pytest", ["-m", "pytest", "-rf"]),
+    # --durations は遅いテストの上位を出す 手元と CI で飛ぶテストが違い、手元の内訳では
+    # CI の時間を説明できなかった（#239） CI のログに残せば、遅くなったときに原因を追える
+    ("pytest", ["-m", "pytest", "-rf", "--durations=30"]),
     # 文章に句点を使わない約束 データとしての句点は見ない（tools/punctuation.py）
     ("句点", ["tools/punctuation.py"]),
 ]
