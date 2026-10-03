@@ -30,6 +30,7 @@ def verify() -> ModuleType:
 
 
 def test_the_counts_and_the_failed_names_are_kept(verify: ModuleType) -> None:
+    """集計の行と落ちたテストの名前を要約に写す 取り損ねると CI のどれが落ちたか分からない"""
     output = "\n".join(
         [
             "....F.",
@@ -66,6 +67,153 @@ def test_a_run_that_stopped_early_says_so(verify: ModuleType) -> None:
     # 集計の行が無いのに「通った」と読める要約を書くと、止まった CI を見落とす
     (line,) = verify.summarize("ImportError while loading conftest", "3.14")
     assert "見つからない" in line
+
+
+#: pytest-xdist で並べて走らせたときの出力（-rfE --max-worker-restart=0 で、落ちる・
+#: 準備で落ちる・プロセスごと落ちる試験を混ぜて手元で取った物を縮めた） 進み具合の
+#: 前にワーカーを上げる行が、落ちた試験の前にはワーカーの名前の行が入る
+XDIST_OUTPUT = """\
+bringing up nodes...
+
+.sFE[gw1] node down: Not properly terminated
+F                                                                        [100%]
+=================================== ERRORS ====================================
+________________________ ERROR at setup of test_error _________________________
+[gw0] win32 -- Python 3.14.6 J:\\venv\\Scripts\\python.exe
+E       RuntimeError: boom
+================================== FAILURES ===================================
+__________________________________ test_fail __________________________________
+[gw1] win32 -- Python 3.14.6 J:\\venv\\Scripts\\python.exe
+E       assert 1 == 2
+__________________________________ test_a.py __________________________________
+[gw1] win32 -- Python 3.14.6 J:\\venv\\Scripts\\python.exe
+worker 'gw1' crashed while running 'test_a.py::test_crash'
+============================= slowest 30 durations =============================
+3.54s call     tests/test_a.py::test_fail
+0.61s setup    tests/test_a.py::test_error
+=========================== short test summary info ===========================
+FAILED test_a.py::test_fail - assert 1 == 2
+FAILED test_a.py::test_crash - worker 'gw1' crashed while running 'test_a.py:...
+ERROR test_a.py::test_error - RuntimeError: boom
+2 failed, 1 passed, 1 skipped, 1 error in 0.99s
+"""
+
+
+class TestInParallel:
+    """CI だけ pytest-xdist で並べて走らせる（#239）"""
+
+    def test_the_counts_and_every_failed_name_are_read_from_xdist(self, verify: ModuleType) -> None:
+        """並列の出力から集計の行と、落ちた・準備で落ちた・ワーカーごと落ちた名前を取る
+
+        取り損ねると、CI の要約が「途中で止まった」や名前の無い失敗になり、どのテストが
+        落ちたのかをログの中から探すことになる
+        """
+        assert verify.summarize(XDIST_OUTPUT, "3.14") == [
+            "### Python 3.14: 2 failed, 1 passed, 1 skipped, 1 error in 0.99s",
+            "- FAILED test_a.py::test_fail - assert 1 == 2",
+            "- FAILED test_a.py::test_crash - worker 'gw1' crashed while running 'test_a.py:...",
+            "- ERROR test_a.py::test_error - RuntimeError: boom",
+        ]
+
+    def test_the_slowest_list_is_not_taken_for_the_counts(self, verify: ModuleType) -> None:
+        """--durations の行（秒と名前）を集計の行と取り違えない"""
+        output = "\n".join(
+            [
+                "3 passed in 0.10s",
+                "==== slowest 30 durations ====",
+                "1.00s call     tests/test_x.py::test_passed_twice",
+            ]
+        )
+        (line,) = verify.summarize(output, "3.12")
+        assert line == "### Python 3.12: 3 passed in 0.10s"
+
+    @pytest.mark.parametrize("workers", [None, "", "0", " 0 "])
+    def test_without_the_variable_it_runs_in_one_process(
+        self, verify: ModuleType, workers: str | None
+    ) -> None:
+        """手元の既定は直列 0 を入れれば CI でも直列へ戻せる（並列を疑うときの逃げ道）"""
+        environment = {} if workers is None else {verify.WORKERS_VARIABLE: workers}
+        assert verify.pytest_arguments(["-m", "pytest"], environment) == ["-m", "pytest"]
+
+    def test_the_variable_spreads_the_tests_over_workers(self, verify: ModuleType) -> None:
+        """xdist_group を効かせ、落ちたワーカーを立て直さない指定まで付ける
+
+        ``loadgroup`` を付け忘れると同じワーカーにまとめたはずの試験がばらけ、
+        立て直しを許すと Windows で落ちたあと pytest が戻らなかった
+        """
+        arguments = verify.pytest_arguments(["-m", "pytest"], {verify.WORKERS_VARIABLE: "4"})
+        assert arguments == [
+            "-m",
+            "pytest",
+            "-n",
+            "4",
+            "--dist",
+            "loadgroup",
+            "--max-worker-restart=0",
+        ]
+
+    def test_errors_are_listed_at_the_end(self, verify: ModuleType) -> None:
+        """-rf だけでは ERROR の行が出ず、準備で落ちた試験の名前が要約に載らない"""
+        (pytest_step,) = [arguments for name, arguments in verify.STEPS if name == "pytest"]
+        report = next(argument for argument in pytest_step if argument.startswith("-r"))
+        assert {"f", "E"} <= set(report[2:])
+
+    @pytest.mark.parametrize("workers", ["-1", "abc", "4x", "1.5", "auto4"])
+    def test_a_wrong_value_is_refused_with_its_name(self, verify: ModuleType, workers: str) -> None:
+        """数か auto 以外は、環境変数の名前と値を出して止める
+
+        そのまま ``-n`` へ渡すと pytest の引数の誤りとして止まり、どの設定が悪いのかが
+        出力から読めない
+        """
+        with pytest.raises(ValueError, match=verify.WORKERS_VARIABLE) as raised:
+            verify.pytest_arguments(["-m", "pytest"], {verify.WORKERS_VARIABLE: workers})
+        assert repr(workers) in str(raised.value)
+
+    @pytest.mark.parametrize("workers", ["auto", "1", "12"])
+    def test_a_number_or_auto_is_accepted(self, verify: ModuleType, workers: str) -> None:
+        """正しい値（数と auto）は拒まずに ``-n`` へ渡す
+
+        拒む側の確かめを厳しくしすぎて正しい値まで拒むと、``_run_tests`` は pytest を
+        起こさずに段を落とし、CI の検証が値を直すまで毎回失敗する
+        """
+        arguments = verify.pytest_arguments([], {verify.WORKERS_VARIABLE: workers})
+        assert arguments[:2] == ["-n", workers]
+
+    def test_a_wrong_value_stops_the_step_without_starting_pytest(
+        self,
+        verify: ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """値の誤りは pytest を起こさず、原因の 1 行を出して段を落とす
+
+        例外のまま抜けると、検証の残りの段も結果の一覧も出ずにトレースバックだけが残る
+        """
+        started: list[list[str]] = []
+        monkeypatch.setattr(verify.subprocess, "run", lambda command, **_: started.append(command))
+        returncode = verify._run_tests(ROOT, ["-m", "pytest"], {verify.WORKERS_VARIABLE: "-1"})
+        assert returncode != 0
+        assert started == []
+        assert verify.WORKERS_VARIABLE in capsys.readouterr().err
+
+    def test_the_tests_asked_for_are_handed_to_pytest(
+        self, verify: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """環境変数を読む所から pytest を起こす所まで、並列の指定が届くこと
+
+        引数を組み立てる所だけを試しても、``_run_tests`` が組み立てた物を使い忘れると
+        CI は黙って直列のまま走り、速くならないのに検証は通る
+        """
+        seen: list[list[str]] = []
+
+        def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 0, "1 passed in 0.01s\n", "")
+
+        monkeypatch.setattr(verify.subprocess, "run", run)
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        assert verify._run_tests(ROOT, ["-m", "pytest"], {verify.WORKERS_VARIABLE: "3"}) == 0
+        assert seen[0][1:5] == ["-m", "pytest", "-n", "3"]
 
 
 class TestReadingThisTree:

@@ -25,8 +25,11 @@ STEPS: list[tuple[str, list[str]]] = [
     ("ruff (規約)", ["-m", "ruff", "check", *TARGETS]),
     ("mypy", ["-m", "mypy", "src", "tests"]),
     # -q は pyproject の addopts にもある 2 つ重ねると集計の行まで消えるので、ここでは
-    # 足さない -rf は落ちたテストの名前を最後に並べる（CI の要約に写す）
-    ("pytest", ["-m", "pytest", "-rf"]),
+    # 足さない -rfE は落ちたテストと、準備で落ちたテスト（ERROR）の名前を最後に並べる
+    # （CI の要約に写す） -rf だけでは ERROR の行が出ず、要約に名前が載らなかった
+    # --durations は遅いテストの上位を出す 手元と CI で飛ぶテストが違い、手元の内訳では
+    # CI の時間を説明できなかった（#239） CI のログに残せば、遅くなったときに原因を追える
+    ("pytest", ["-m", "pytest", "-rfE", "--durations=30"]),
     # 文章に句点を使わない約束 データとしての句点は見ない（tools/punctuation.py）
     ("句点", ["tools/punctuation.py"]),
 ]
@@ -72,6 +75,35 @@ def main() -> int:
     return 0
 
 
+#: テストを並べて走らせる数（pytest-xdist の ``-n``） 数か ``auto`` を入れる
+#: 立てなければ（または 0 なら）直列 CI だけが立てる 手元で既定を直列にしておくのは、
+#: 落ちたときの出力が 1 本の流れで読め、ほかの作業と CPU を取り合わないため
+#: CI で並列を疑うときは、ci.yml のこの値を 0 にすれば元の直列へ戻せる
+WORKERS_VARIABLE = "SASHIMONO_TEST_WORKERS"
+
+
+def pytest_arguments(arguments: list[str], environment: dict[str, str]) -> list[str]:
+    """pytest の引数に、環境変数で頼まれた並列の指定を足す
+
+    ``--dist loadgroup`` にするのは ``xdist_group`` を効かせるため 既定の ``load`` は
+    印を見ずに 1 本ずつ配るので、同じワーカーにまとめたつもりの試験がばらける
+
+    ``--max-worker-restart=0`` は、試験がプロセスごと落ちた（access violation など）ときに
+    ワーカーを立て直さず、落ちた試験の名前を出して終えるため Windows で立て直させると、
+    落ちたあと次のワーカーが上がらず pytest が戻らなかった（手元で確かめた） 直列でも
+    プロセスが落ちればそこで止まるので、立て直さなくても失うものは無い
+
+    値は数か ``auto`` だけを受ける ほかの値（``-1`` や ``abc``）をそのまま ``-n`` へ渡すと、
+    pytest が引数の誤りとして止まり、どの環境変数が悪いのかが出力から読めない
+    """
+    workers = environment.get(WORKERS_VARIABLE, "").strip()
+    if workers in ("", "0"):
+        return arguments
+    if workers != "auto" and re.fullmatch(r"[0-9]+", workers) is None:
+        raise ValueError(f"{WORKERS_VARIABLE} は 0 以上の数か auto にする（0 で直列）: {workers!r}")
+    return [*arguments, "-n", workers, "--dist", "loadgroup", "--max-worker-restart=0"]
+
+
 def _run_tests(root: Path, arguments: list[str], base: dict[str, str]) -> int:
     """pytest を回し、件数と落ちたテストの名前を CI の要約にも残す
 
@@ -79,8 +111,15 @@ def _run_tests(root: Path, arguments: list[str], base: dict[str, str]) -> int:
     なるうえ、たまにだけ落ちるテストを踏む回数も倍になる（PR #12） 1 回で済ませる
     """
     environment = {**base, "PYTHONIOENCODING": "utf-8"}
+    # 値の誤りは pytest を起こす前に、何が悪いかを 1 行で出して止める 例外のまま
+    # 抜けると、ほかの段の結果より先にトレースバックが並び、原因の行が埋もれる
+    try:
+        command = pytest_arguments(arguments, environment)
+    except ValueError as exc:
+        print(f"pytest を起こせない: {exc}", file=sys.stderr)
+        return 2
     completed = subprocess.run(
-        [sys.executable, *arguments],
+        [sys.executable, *command],
         cwd=root,
         check=False,
         capture_output=True,

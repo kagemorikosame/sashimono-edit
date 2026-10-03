@@ -39,6 +39,9 @@ ai = [
 ]
 dev = [
     "pytest>=8.0",
+    # CI だけテストを並列に走らせる（tools/verify.py の SASHIMONO_TEST_WORKERS）
+    # 直列では pytest が CI の 9 割以上を占め、1 回に 6 分かかっていた（#239）
+    "pytest-xdist>=3.6",
     "hypothesis>=6.100",
     "ruff>=0.14",
     "mypy>=1.14",
