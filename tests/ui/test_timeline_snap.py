@@ -40,6 +40,7 @@ from sashimono.ui.timeline.layout import TimelineLayout
 from sashimono.ui.timeline.snap import nearest_snap, snap_targets
 from sashimono.ui.timeline.view import DragKind
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.conftest import release_modifier_keys
 
 _LEFT = Qt.MouseButton.LeftButton
 type Made = tuple[list[TimelineView], MediaAnalyzer]
@@ -176,6 +177,23 @@ class TestDragging:
             modifiers=Qt.KeyboardModifier.ShiftModifier,
         )
         assert _start(view, 1) == 62
+
+    def test_a_shift_left_by_an_earlier_test_is_released(self, made: Made) -> None:
+        """前の試験が Shift を押したまま終えても、次の試験では吸い付く（#239）
+
+        アプリが覚えている修飾キーは試験をまたいで残る Shift のクリックで終わった試験の
+        直後に磁石の試験が来ると、押したままに見えて吸い付かずに落ちた 並列で試験の
+        並びが変わって表に出た 試験の間で戻す所（conftest）が効いているかを、
+        間に挟む片付けと同じ関数を呼んで確かめる
+        """
+        view, _ = _open(made, _project((_text(0),), (_text(200),)))
+        QTest.mouseClick(view, _LEFT, Qt.KeyboardModifier.ShiftModifier, QPoint(1, 1))
+        assert QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+        release_modifier_keys()
+        assert QApplication.keyboardModifiers() == Qt.KeyboardModifier.NoModifier
+        view.set_selection(())
+        _drag(view, _point(view, 1, 220), _point(view, 1, 82))
+        assert _start(view, 1) == 60
 
     def test_the_toolbar_setting_turns_it_off(self, made: Made) -> None:
         view, _ = _open(made, _project((_text(0),), (_text(200),)))

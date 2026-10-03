@@ -12,9 +12,10 @@ from pathlib import Path
 
 import pytest
 import shiboken6
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QClipboard, QSurfaceFormat
-from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QWidget
 
 from sashimono.compat.aviutl import plugin
 from sashimono.compat.aviutl.native import NativeModule
@@ -115,6 +116,37 @@ def widgets_left_behind(qt_application: QApplication) -> Iterator[None]:
     QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
     gc.collect()
     QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+
+@pytest.fixture(autouse=True)
+def released_modifier_keys(qt_application: QApplication) -> Iterator[None]:
+    """試験が押したまま残した修飾キー（Shift など）を、次の試験へ持ち越さない
+
+    ``QApplication.keyboardModifiers()`` はアプリ全体で 1 つで、最後に配った入力の
+    キーを覚えている ``QTest.mouseClick(..., ShiftModifier, ...)`` で終わった試験の後は、
+    次の入力が来るまで Shift が押されたままに見える タイムラインの磁石はこれを見て
+    吸着を切るので、直後に走った磁石の試験が吸い付かずに落ちた 直列では間に挟まる試験が
+    たまたま戻していたが、並列（#239）で並びが変わると表に出た
+
+    押していない試験（大半）では何もしない
+    """
+    yield
+    release_modifier_keys()
+
+
+def release_modifier_keys() -> None:
+    """アプリが覚えている修飾キーを、どれも押していない状態へ戻す
+
+    修飾キーの無い離しを 1 つ配る Qt は配った入力のキーをそのまま覚え直す
+    カーソルを動かす ``mouseMove`` は使わない 画面ありで走らせると本人のカーソルが飛ぶ
+    """
+    if QApplication.keyboardModifiers() == Qt.KeyboardModifier.NoModifier:
+        return
+    widget = QWidget()
+    try:
+        QTest.keyRelease(widget, Qt.Key.Key_Shift, Qt.KeyboardModifier.NoModifier)
+    finally:
+        shiboken6.delete(widget)
 
 
 @pytest.fixture(autouse=True)
