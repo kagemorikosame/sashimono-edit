@@ -27,7 +27,14 @@ from sashimono.runtime import (
     stale_runtime,
 )
 
-OLD = "cp313"
+#: 前の Python の印 走らせている Python から 1 つ前を作る 決め打ちすると、その版の Python
+#: （対応している 3.12〜）で走らせたときに今の印と同じになり、古さを見分ける試験が通らない
+OLD = f"cp{sys.version_info.major}{sys.version_info.minor - 1}"
+
+
+def test_the_old_tag_is_really_old() -> None:
+    """試験の前提 OLD が今の Python の印と同じだと、どの試験も古さを見分けたことにならない"""
+    assert python_abi() != OLD
 
 
 @pytest.fixture
