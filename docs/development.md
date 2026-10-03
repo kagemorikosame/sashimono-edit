@@ -38,6 +38,19 @@ Sashimono の開発で守ることをここにまとめる **このファイル�
 ruff（書式・規約）→ mypy（strict）→ pytest をまとめて走らせる **1 つでも落ちたら
 終了コードが非 0** CI もこれと同じものを走らせるので、手元で通れば CI でも通る
 
+CI だけは pytest を 4 つのプロセスに分けて並べて走らせる（pytest-xdist）
+`verify.py` は環境変数 `SASHIMONO_TEST_WORKERS` に数（または `auto`）が入っていれば
+並列に、無いか `0` なら直列にする 手元の既定は直列で、試すときだけ立てる
+
+```
+$env:SASHIMONO_TEST_WORKERS = "4"; .venv\Scripts\python.exe tools\verify.py
+```
+
+並べると、同じワーカーで先に走った試験の状態に頼る試験や、時間を測る試験が
+CPU の取り合いで落ちることがある 同じワーカーにまとめたい試験には
+`@pytest.mark.xdist_group("名前")` を付ける（`--dist loadgroup` で効く）
+遅いテストの上位 30 本は、毎回 pytest の出力の最後（`slowest 30 durations`）に出る
+
 個別に走らせたいとき:
 
 ```
