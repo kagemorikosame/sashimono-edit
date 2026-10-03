@@ -157,6 +157,39 @@ class TestInParallel:
         report = next(argument for argument in pytest_step if argument.startswith("-r"))
         assert {"f", "E"} <= set(report[2:])
 
+    @pytest.mark.parametrize("workers", ["-1", "abc", "4x", "1.5", "auto4"])
+    def test_a_wrong_value_is_refused_with_its_name(self, verify: ModuleType, workers: str) -> None:
+        """数か auto 以外は、環境変数の名前と値を出して止める
+
+        そのまま ``-n`` へ渡すと pytest の引数の誤りとして止まり、どの設定が悪いのかが
+        出力から読めない
+        """
+        with pytest.raises(ValueError, match=verify.WORKERS_VARIABLE) as raised:
+            verify.pytest_arguments(["-m", "pytest"], {verify.WORKERS_VARIABLE: workers})
+        assert repr(workers) in str(raised.value)
+
+    @pytest.mark.parametrize("workers", ["auto", "1", "12"])
+    def test_a_number_or_auto_is_accepted(self, verify: ModuleType, workers: str) -> None:
+        arguments = verify.pytest_arguments([], {verify.WORKERS_VARIABLE: workers})
+        assert arguments[:2] == ["-n", workers]
+
+    def test_a_wrong_value_stops_the_step_without_starting_pytest(
+        self,
+        verify: ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """値の誤りは pytest を起こさず、原因の 1 行を出して段を落とす
+
+        例外のまま抜けると、検証の残りの段も結果の一覧も出ずにトレースバックだけが残る
+        """
+        started: list[list[str]] = []
+        monkeypatch.setattr(verify.subprocess, "run", lambda command, **_: started.append(command))
+        returncode = verify._run_tests(ROOT, ["-m", "pytest"], {verify.WORKERS_VARIABLE: "-1"})
+        assert returncode != 0
+        assert started == []
+        assert verify.WORKERS_VARIABLE in capsys.readouterr().err
+
     def test_the_tests_asked_for_are_handed_to_pytest(
         self, verify: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:

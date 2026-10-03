@@ -195,6 +195,46 @@ class TestDragging:
         _drag(view, _point(view, 1, 220), _point(view, 1, 82))
         assert _start(view, 1) == 60
 
+    @pytest.mark.parametrize(
+        "held",
+        [
+            Qt.KeyboardModifier.ShiftModifier,
+            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.AltModifier,
+            Qt.KeyboardModifier.MetaModifier,
+            Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier,
+        ],
+    )
+    def test_every_modifier_left_behind_is_released(
+        self, made: Made, held: Qt.KeyboardModifier
+    ) -> None:
+        """Shift 以外の修飾キーが残っても、試験の間で戻す
+
+        Control・Alt・Meta も同じ所に残る 戻せない物があると、それを見る操作の試験が
+        並びしだいで落ちる
+        """
+        view, _ = _open(made, _project((_text(0),)))
+        QTest.mouseClick(view, _LEFT, held, QPoint(1, 1))
+        assert QApplication.keyboardModifiers() == held
+        release_modifier_keys()
+        assert QApplication.keyboardModifiers() == Qt.KeyboardModifier.NoModifier
+
+    def test_a_modifier_that_cannot_be_released_stops_the_run(
+        self, made: Made, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """戻せなかったら黙って先へ進まない
+
+        Qt の版が変わって離しが効かなくなっても素通りすると、持ち越した修飾キーで別の
+        試験がたまにだけ落ち、原因を試験の間の片付けまで辿れない
+        """
+        view, _ = _open(made, _project((_text(0),)))
+        QTest.mouseClick(view, _LEFT, Qt.KeyboardModifier.ControlModifier, QPoint(1, 1))
+        with monkeypatch.context() as patch:
+            patch.setattr(QTest, "keyRelease", lambda *_arguments: None)
+            with pytest.raises(pytest.fail.Exception, match="戻せなかった"):
+                release_modifier_keys()
+        release_modifier_keys()
+
     def test_the_toolbar_setting_turns_it_off(self, made: Made) -> None:
         view, _ = _open(made, _project((_text(0),), (_text(200),)))
         view.set_snap(False)

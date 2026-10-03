@@ -128,6 +128,7 @@ def released_modifier_keys(qt_application: QApplication) -> Iterator[None]:
     吸着を切るので、直後に走った磁石の試験が吸い付かずに落ちた 直列では間に挟まる試験が
     たまたま戻していたが、並列（#239）で並びが変わると表に出た
 
+    Shift に限らず Control・Alt・Meta も同じ所に残るので、どれも戻す
     押していない試験（大半）では何もしない
     """
     yield
@@ -135,10 +136,19 @@ def released_modifier_keys(qt_application: QApplication) -> Iterator[None]:
 
 
 def release_modifier_keys() -> None:
-    """アプリが覚えている修飾キーを、どれも押していない状態へ戻す
+    """アプリが覚えている修飾キーを、どれも押していない状態へ戻す 戻らなければ落とす
 
-    修飾キーの無い離しを 1 つ配る Qt は配った入力のキーをそのまま覚え直す
+    修飾キーを付けない Shift の離しを 1 つ配る Qt は配った入力の修飾キーをそのまま
+    覚え直すので、Shift だけでなく Control・Alt・Meta とその組み合わせも消える
+    （PySide6 6.11 のオフスクリーンと Windows の画面ありの両方で確かめた） 離しに
+    ``ShiftModifier`` を付けると、それを押したままと覚え直して Shift が残る
+
+    配る相手は、ここで作って表示もフォーカスもしない部品 アプリの部品へ配ると、
+    その部品のキーの処理が試験の外で動く 配るのは試験が終わった後の片付けの中
     カーソルを動かす ``mouseMove`` は使わない 画面ありで走らせると本人のカーソルが飛ぶ
+
+    戻らなかったら黙らずに落とす Qt の版が変わって戻し方が効かなくなると、持ち越した
+    修飾キーで別の試験がたまにだけ落ち、原因がここだと分からなくなる
     """
     if QApplication.keyboardModifiers() == Qt.KeyboardModifier.NoModifier:
         return
@@ -147,6 +157,9 @@ def release_modifier_keys() -> None:
         QTest.keyRelease(widget, Qt.Key.Key_Shift, Qt.KeyboardModifier.NoModifier)
     finally:
         shiboken6.delete(widget)
+    left = QApplication.keyboardModifiers()
+    if left != Qt.KeyboardModifier.NoModifier:
+        pytest.fail(f"試験が残した修飾キーを戻せなかった: {left!r}")
 
 
 @pytest.fixture(autouse=True)
