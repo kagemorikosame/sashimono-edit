@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from sashimono import __version__
 from sashimono.core.io import load_project, save_project
+from sashimono.core.io.locks import try_hold
 from sashimono.core.io.serialize import FORMAT_VERSION, PRE_UPGRADE_SUFFIX
 from sashimono.core.model import Project
 from sashimono.ui import updates as updates_module
@@ -27,7 +28,13 @@ from sashimono.ui.updates import ANSWER_NEXT_START, ANSWER_SKIP, UpdateControlle
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from sashimono.update.fetch import MemoryTransport
 from sashimono.update.package import APP_EXE, Layout
-from sashimono.update.state import UpdateState, UpdateStateStore
+from sashimono.update.state import (
+    STAGE_LOCK,
+    SWAP_LOCK,
+    UpdateState,
+    UpdateStateStore,
+    lock_path,
+)
 from sashimono.update.swap import Launched, SwapPlan
 from tests.update.helpers import release
 
@@ -256,7 +263,9 @@ class TestOffering:
     ) -> None:
         monkeypatch.setattr(ready.controller, "_choose", lambda *_a, **_k: ANSWER_NEXT_START)
         ready.controller.offer()
-        assert ready.store.load().apply_on_start
+        state = ready.store.load()
+        # 本人が選んだ予約として覚える 後で〔入れる前に尋ねる〕を入れても外さない
+        assert state.apply_on_start and state.apply_chosen
         assert ready.launched == []
 
     def test_a_skipped_version_is_dropped(
@@ -324,6 +333,31 @@ class TestRestarting:
         assert __version__ not in harness.store.load().skipped
         assert harness.launched == []
 
+    @pytest.mark.parametrize(
+        ("lock", "title"),
+        [(SWAP_LOCK, "ほかの窓で入れ替えを始めています"), (STAGE_LOCK, "今は入れられません")],
+    )
+    def test_another_window_at_work_starts_nothing(
+        self, ready: _Harness, lock: str, title: str
+    ) -> None:
+        """2 つの窓で入れ替えを選ぶと、入れ替え係が 2 つ起きて .previous を消し合う 起こさない"""
+        held = try_hold(lock_path(lock, ready.store.path.parent))
+        assert held is not None
+        try:
+            assert not ready.controller.restart_now()
+        finally:
+            held.release()
+        assert ready.launched == []
+        assert ready.informed and ready.informed[0][0] == title
+
+    def test_losing_the_race_says_so(self, ready: _Harness) -> None:
+        """ほぼ同時に起こして、ほかの窓の入れ替え係が先に錠を取った この窓は閉じれば済む"""
+        result = ready.layout.install.parent / "result.txt"
+        result.write_text("started\nalready-running\n", encoding="utf-8")
+        ready.controller._waiter = lambda _launched: False
+        assert not ready.controller.restart_now()
+        assert ready.informed and ready.informed[0][0] == "ほかの窓で入れ替えを始めています"
+
     def test_a_refused_close_stops_the_swapper(self, ready: _Harness) -> None:
         """確認の後でも窓が閉じられなければ、入れ替え係を止める 残すと後で閉じた所で入れ替わる"""
         ready.window.allow_close = False
@@ -372,6 +406,19 @@ class TestTheEditor:
         assert not store.load().apply_on_start
         assert store.load().ready_version == NEWER
 
+    def test_asking_again_drops_only_the_automatic_reservation(self, window: MainWindow) -> None:
+        """〔入れる前に尋ねる〕を入れたら、尋ねない設定が自動で付けた予約は外す
+        本人が〔次の起動で入れる〕を選んだ予約は、もう答えてあるので残す
+        """
+        store = UpdateStateStore()
+        store.save(UpdateState(ready_version=NEWER, apply_on_start=True))
+        window._apply_preferences(Preferences(update_confirm=True))
+        assert not store.load().apply_on_start
+
+        store.save(UpdateState(ready_version=NEWER, apply_on_start=True, apply_chosen=True))
+        window._apply_preferences(Preferences(update_confirm=True))
+        assert store.load().apply_on_start
+
     def test_the_start_reads_the_same_setting(self) -> None:
         """起動の頭（Qt を読む前）は設定のファイルを直に読む 名前や読み方が食い違うと、
         切ったのに入れ替わる
@@ -385,6 +432,13 @@ class TestTheEditor:
         assert not updates_allowed()
         store.save(Preferences(update_check=True))
         assert updates_allowed()
+
+        from sashimono.update.flow import UpdateChoices, update_choices
+
+        store.save(Preferences(update_confirm=False))
+        assert update_choices() == UpdateChoices(check=True, confirm=False)
+        store.save(Preferences())
+        assert update_choices() == UpdateChoices()
 
     def test_the_help_menu_has_both(self, window: MainWindow) -> None:
         assert "ヘルプ/更新を確かめる…" in window._actions

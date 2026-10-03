@@ -91,7 +91,21 @@ jobs:
           if [ "${#zips[@]}" -ne 1 ]; then echo "組み立てた zip が 1 つでない"; exit 1; fi
           zip="${zips[0]}"
           echo "SHA-256: $(sha256sum "$zip" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
+          if info=$(gh release view "$TAG" --json isDraft,assets 2>/dev/null); then
+            # 公開済みのリリースの zip を差し替えない 組み立て直した zip は SHA-256 が変わり、
+            # 署名済みの update.json と食い違って、全員の自動更新が照合で止まる
+            if [ "$(jq -r '.isDraft' <<<"$info")" != "true" ]; then
+              echo "::error::$TAG は公開済み zip を差し替えない（新しい版はタグを上げて出す）"
+              exit 1
+            fi
+            # 下書きでも、目録と署名を上げた後なら差し替えない 署名した SHA-256 と食い違う
+            # 作り直すなら update.json と update.json.sig を消してから、もう一度走らせる
+            if jq -e '.assets[] | select(.name == "update.json" or .name == "update.json.sig")' \
+              <<<"$info" > /dev/null; then
+              echo "::error::$TAG には署名した目録がある zip を差し替えない"
+              exit 1
+            fi
+          else
             # 下書きで作る 署名と目録を上げてから、人が公開する
             pre=()
             if [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]]; then pre=(--prerelease); fi

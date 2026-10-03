@@ -14,13 +14,49 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sashimono.core import userdirs
+from sashimono.core.io.locks import is_held
 
-__all__ = ["UpdateState", "UpdateStateStore", "update_dir"]
+__all__ = [
+    "STAGE_LOCK",
+    "SWAP_LOCK",
+    "UpdateState",
+    "UpdateStateStore",
+    "busy_with",
+    "lock_path",
+    "update_dir",
+]
 
 
 def update_dir() -> Path:
     """覚え書き・入れ替えの道具・その結果を置く場所"""
     return userdirs.state_root() / "update"
+
+
+#: 新しい版を落として展開している間の錠（Python の窓が持つ ``core.io.locks``）
+#: 窓を 2 つ開くと、どちらも起動の後に確かめる 同時に落とすと、同じ ``.new`` を片方が
+#: 消しながら片方が展開する
+STAGE_LOCK = "stage.lock"
+
+#: 入れ替え係が走っている間の錠（PowerShell が誰にも開かせずに開いたまま持つ）
+#: 2 つの窓で〔今すぐ再起動して入れる〕を選ぶと入れ替え係が 2 つ起き、片方が作った
+#: ``.previous`` をもう片方が消して、戻す先まで失う
+SWAP_LOCK = "swap.lock"
+
+
+def lock_path(name: str, folder: Path | None = None) -> Path:
+    return (folder if folder is not None else update_dir()) / name
+
+
+def busy_with(folder: Path | None = None) -> str | None:
+    """ほかの窓か入れ替え係が更新を進めていれば、その段（``swap`` か ``stage``） 無ければ ``None``
+
+    持ち主の終わった錠は ``is_held`` が片付ける（落ちた窓の錠で、更新が止まったままにならない）
+    """
+    if is_held(lock_path(SWAP_LOCK, folder)):
+        return "swap"
+    if is_held(lock_path(STAGE_LOCK, folder)):
+        return "stage"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +76,9 @@ class UpdateState:
     ready_python_abi: str = ""
     #: 次の起動の頭で入れる（本人が「次の起動で」を選んだ・尋ねない設定）
     apply_on_start: bool = False
+    #: 次の起動で入れるのを、本人が〔次の起動で入れる〕で選んだ 偽なら尋ねない設定が自動で
+    #: 予約した物 後で〔入れる前に尋ねる〕を入れたら、自動の予約だけを外す（選んだ物は残す）
+    apply_chosen: bool = False
 
 
 class UpdateStateStore:
@@ -73,6 +112,7 @@ class UpdateStateStore:
             ready_notes_url=_text(data.get("ready_notes_url")),
             ready_python_abi=_text(data.get("ready_python_abi")),
             apply_on_start=data.get("apply_on_start") is True,
+            apply_chosen=data.get("apply_chosen") is True,
         )
 
     def save(self, state: UpdateState) -> None:

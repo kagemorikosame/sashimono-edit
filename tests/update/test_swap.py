@@ -151,6 +151,38 @@ class TestApplying:
         assert _wait_for(layout.install.parent / "old-started.txt")
 
 
+class TestTwoWindows:
+    def test_only_one_swapper_runs(self, layout: Layout, tmp_path: Path) -> None:
+        """2 つの窓で〔今すぐ再起動して入れる〕を選んでも、入れ替えるのは 1 つだけ
+
+        2 つ目も走ると、1 つ目が作った .previous を消し、戻す先まで失う
+        """
+        _folder(layout.staged, HEALTHY)
+        (layout.staged / "version.txt").write_text("new", encoding="ascii")
+        import subprocess
+
+        # 1 つ目の入れ替え係は、窓（の代わりの子）が終わるのを待っている間、錠を持ち続ける
+        window = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(4)"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        folder = tmp_path / "update"
+        try:
+            first = launch(_plan(layout, pid=window.pid), folder)
+            assert wait_started(first)
+            second = launch(_plan(layout), folder)
+            assert not wait_started(second)
+            assert second.lost_to_another()
+            second.process.wait(timeout=60)
+            first.process.wait(timeout=120)
+        finally:
+            window.kill()
+        lines = take_result(folder)
+        assert lines.count("holding") == 1 and lines.count("already-running") == 1, lines
+        assert (layout.install / "version.txt").read_text(encoding="ascii") == "new"
+        assert (layout.previous / "version.txt").read_text(encoding="ascii") == "old"
+
+
 class TestWhenEvenTheRestoreFails:
     def test_the_previous_version_is_started_where_it_is(
         self, layout: Layout, tmp_path: Path

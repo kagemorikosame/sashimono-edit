@@ -839,6 +839,10 @@ class MainWindow(QMainWindow):
         if not preferences.update_check:
             # 今の版に留まりたい合図 前に予約した〔次の起動で入れる〕も外す
             self._updates.cancel_reservation()
+        elif preferences.update_confirm:
+            # 入れる前に尋ねてほしい合図 尋ねない設定が自動で付けた予約だけを外す
+            # （本人が〔次の起動で入れる〕を選んだ予約は、もう尋ねて答えをもらってある）
+            self._updates.cancel_reservation(automatic_only=True)
 
         if resized or stopped:
             self._proxies.close()

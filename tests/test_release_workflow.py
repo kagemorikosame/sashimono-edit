@@ -42,6 +42,24 @@ def test_writing_jobs_install_nothing() -> None:
         assert "pip install" not in text and "actions/checkout" not in text, name
 
 
+def test_a_published_or_signed_release_is_not_replaced() -> None:
+    """同じタグを走らせ直して、公開済み・署名済みの zip を差し替えない
+
+    組み立て直した zip は SHA-256 が変わり、署名した update.json と食い違って、全員の
+    自動更新が照合で止まる 上げる（``gh release upload``）より前で止める
+    """
+    publish = _jobs()["publish"]
+    upload = publish.index("gh release upload")
+    draft = publish.find("isDraft")
+    signed = publish.find('"update.json"')
+    assert 0 <= draft < upload
+    assert 0 <= signed < upload
+    assert '.name == "update.json.sig"' in publish
+    # どちらも止める（exit 1）
+    guard = publish[draft:upload]
+    assert guard.count("exit 1") >= 2
+
+
 def test_checkout_leaves_no_token_behind() -> None:
     """checkout は既定でトークンを .git/config に残し、後で走る依存のコードが読める"""
     for name, text in _jobs().items():

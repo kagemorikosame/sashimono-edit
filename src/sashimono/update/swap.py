@@ -32,8 +32,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sashimono.core.io.locks import is_held
 from sashimono.update.package import APP_EXE, Layout
-from sashimono.update.state import update_dir
+from sashimono.update.state import SWAP_LOCK, lock_path, update_dir
 
 __all__ = [
     "HEALTH_ENV",
@@ -67,6 +68,7 @@ $relaunch = $env:SASHIMONO_UPDATE_RELAUNCH -eq '1'
 $hidden = $env:SASHIMONO_UPDATE_HIDDEN -eq '1'
 $waitSeconds = [int]$env:SASHIMONO_UPDATE_WAIT_SECONDS
 $healthSeconds = [int]$env:SASHIMONO_UPDATE_HEALTH_SECONDS
+$lock = $env:SASHIMONO_UPDATE_LOCK
 
 function Write-Result([string]$text) {
     Add-Content -LiteralPath $result -Value $text -Encoding UTF8
@@ -173,6 +175,17 @@ function Start-Old([string[]]$folders = @($install, $previous)) {
 
 try {
     Write-Result 'started'
+    # 入れ替え係は 1 つだけ 誰にも開かせずに錠を開いたまま持ち、終わるまで離さない
+    # 取れなければ、ほかの入れ替え係が同じフォルダを触っている 何もせずに終わる
+    # （起こした窓は閉じるだけでよい 先の入れ替え係が窓の終わるのを待って入れ替える）
+    $held = $null
+    try {
+        $held = [System.IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None')
+    } catch {
+        Write-Result 'already-running'
+        exit 8
+    }
+    Write-Result 'holding'
     if (-not (Wait-Exit)) {
         Write-Result 'busy'
         Start-Old
@@ -293,6 +306,13 @@ class Launched:
     process: subprocess.Popen[bytes]
     result: Path
 
+    def lines(self) -> list[str]:
+        return _lines(self.result)
+
+    def lost_to_another(self) -> bool:
+        """ほかの入れ替え係が先に錠を取っていた（2 つの窓で入れ替えを選んだ）"""
+        return "already-running" in self.lines()
+
 
 def _aside(layout: Layout) -> Path:
     """前の版へ戻すとき、今の版を一時的によけておく場所"""
@@ -306,12 +326,14 @@ def launch(plan: SwapPlan, folder: Path | None = None) -> Launched:
     """
     folder = folder if folder is not None else update_dir()
     folder.mkdir(parents=True, exist_ok=True)
-    script = folder / "swap.ps1"
+    # 台本と結果は起こすたびに別の名前にする 2 つの窓がほぼ同時に起こしたとき、片方の
+    # 結果をもう片方が消したり、片方の「走り始めた」をもう片方が自分の物と読んだりしない
+    token = uuid.uuid4().hex
+    script = folder / f"swap-{token}.ps1"
     # BOM 付きで書く PowerShell 5.1 は BOM の無い台本を本人の文字コード（cp932）で読む
     script.write_text(HELPER_SCRIPT, encoding="utf-8-sig")
-    result = folder / "result.txt"
-    result.unlink(missing_ok=True)
-    health = folder / f"started-{uuid.uuid4().hex}.txt"
+    result = folder / f"result-{token}.txt"
+    health = folder / f"started-{token}.txt"
     layout = plan.layout
     staged = layout.staged if plan.mode == "apply" else _aside(layout)
     environment = {
@@ -330,6 +352,7 @@ def launch(plan: SwapPlan, folder: Path | None = None) -> Launched:
         "SASHIMONO_UPDATE_HIDDEN": "1" if plan.hidden else "0",
         "SASHIMONO_UPDATE_WAIT_SECONDS": str(plan.wait_seconds),
         "SASHIMONO_UPDATE_HEALTH_SECONDS": str(plan.health_seconds),
+        "SASHIMONO_UPDATE_LOCK": str(lock_path(SWAP_LOCK, folder)),
     }
     environment.pop(HEALTH_ENV, None)
     command = [
@@ -375,19 +398,21 @@ def _lines(result: Path) -> list[str]:
 
 
 def wait_started(launched: Launched, timeout: float = START_SECONDS) -> bool:
-    """入れ替え係が走り始めたか 走り始めなければ止めて偽を返す
+    """入れ替え係が走り始め、錠を取れたか 取れなければ止めて偽を返す
 
     走り始めたのを見てから本体を終える 見ずに終えると、台本の実行が止められている
-    機械では、本体が消えたまま誰も起こし直さない
+    機械では、本体が消えたまま誰も起こし直さない ほかの入れ替え係が錠を持っていれば
+    偽（:meth:`Launched.lost_to_another` が真）
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if "started" in _lines(launched.result):
+        lines = launched.lines()
+        if "holding" in lines:
             return True
-        if launched.process.poll() is not None:
+        if "already-running" in lines or launched.process.poll() is not None:
             break
         time.sleep(0.1)
-    if "started" in _lines(launched.result):
+    if "holding" in launched.lines():
         return True
     if launched.process.poll() is None:
         launched.process.kill()
@@ -405,11 +430,16 @@ def mark_started() -> None:
 
 
 def take_result(folder: Path | None = None) -> list[str]:
-    """前の入れ替えの結果を読んで消す 1 回だけ知らせるため"""
+    """前の入れ替えの結果を読んで消す 1 回だけ知らせるため
+
+    入れ替え係がまだ走っている（起こした新しい版が窓を出すのを待っている）間は読まない
+    消すと、その後に書かれる結果が次の起動まで残り、片付けも途中の物を消すことになる
+    """
     folder = folder if folder is not None else update_dir()
-    result = folder / "result.txt"
-    lines = _lines(result)
-    result.unlink(missing_ok=True)
-    for stale in folder.glob("started-*.txt"):
-        stale.unlink(missing_ok=True)
+    if is_held(lock_path(SWAP_LOCK, folder)):
+        return []
+    results = sorted(folder.glob("result-*.txt"), key=lambda path: path.stat().st_mtime)
+    lines = [line for result in results for line in _lines(result)]
+    for leftover in (*results, *folder.glob("started-*.txt"), *folder.glob("swap-*.ps1")):
+        leftover.unlink(missing_ok=True)
     return lines

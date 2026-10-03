@@ -33,10 +33,10 @@ from sashimono.runtime import python_abi, runtime_target_dir
 from sashimono.ui.workspace import Preferences
 from sashimono.update.check import CheckResult, Outcome, check_for_update, is_due
 from sashimono.update.fetch import FetchError, Transport, UrllibTransport
-from sashimono.update.flow import prepare, settle
+from sashimono.update.flow import UpdateBusyError, prepare, settle
 from sashimono.update.package import Layout, PackageError, carry_user_files, current_layout
 from sashimono.update.signing import trusted_keys
-from sashimono.update.state import UpdateStateStore
+from sashimono.update.state import UpdateStateStore, busy_with
 from sashimono.update.swap import Launched, SwapPlan, launch, wait_started
 
 __all__ = ["STARTUP_DELAY_MS", "UpdateController"]
@@ -143,16 +143,21 @@ class UpdateController(QObject):
             return state.ready_version
         return None
 
-    def cancel_reservation(self) -> None:
-        """〔次の起動で入れる〕の予約を外す 本人が起動時に確かめるのを切ったときに呼ぶ
+    def cancel_reservation(self, *, automatic_only: bool = False) -> None:
+        """次の起動で入れる予約を外す 設定を変えたときに呼ぶ
 
-        切るのは「今の版に留まりたい」という合図 予約を残すと、次の起動で黙って入れ替わる
-        落としてある版はそのまま残す（〔更新を確かめる…〕から手で入れられる）
+        - 〔起動したときに新しい版を確かめる〕を切った 今の版に留まりたい合図なので全部外す
+        - 〔新しい版を入れる前に尋ねる〕を入れた（``automatic_only``） 尋ねない設定が自動で
+          付けた予約だけを外す 本人が〔次の起動で入れる〕を選んだ予約は、尋ねて答えた物なので残す
+
+        予約を残すと、次の起動で黙って入れ替わる 落としてある版はそのまま残す
+        （〔更新を確かめる…〕から手で入れられる）
         """
         state = self._store.load()
-        if state.apply_on_start:
-            with contextlib.suppress(OSError):
-                self._store.save(replace(state, apply_on_start=False))
+        if not state.apply_on_start or (automatic_only and state.apply_chosen):
+            return
+        with contextlib.suppress(OSError):
+            self._store.save(replace(state, apply_on_start=False, apply_chosen=False))
 
     def can_roll_back(self) -> bool:
         return self._layout is not None and self._layout.has_previous()
@@ -233,14 +238,17 @@ class UpdateController(QObject):
         apply_on_start = not preferences.update_confirm
         try:
             if self._layout.staged_version() == manifest.version:
-                # 前の起動で落とし終えている 覚え書きだけ直す
+                # 前の起動で落とし終えている 覚え書きだけ直す 本人が選んだ予約は残す
+                current = self._store.load()
+                kept = current.apply_chosen and current.ready_version == manifest.version
                 self._store.save(
                     replace(
-                        self._store.load(),
+                        current,
                         ready_version=manifest.version,
                         ready_notes_url=manifest.notes_url,
                         ready_python_abi=manifest.python_abi,
-                        apply_on_start=apply_on_start,
+                        apply_on_start=apply_on_start or kept,
+                        apply_chosen=kept,
                     )
                 )
             else:
@@ -251,6 +259,9 @@ class UpdateController(QObject):
                     store=self._store,
                     apply_on_start=apply_on_start,
                 )
+        except UpdateBusyError as exc:
+            # ほかの窓が落としている・入れ替えている 待てば済むので起動時は黙る
+            return _Finished(manual, result, error=f"ほかの窓で更新を進めています（{exc}）")
         except (FetchError, PackageError, OSError) as exc:
             return _Finished(manual, result, error=str(exc))
         except Exception as exc:  # 裏のスレッドで落ちると、確かめている印が立ったまま残る
@@ -332,7 +343,8 @@ class UpdateController(QObject):
         if answer == ANSWER_NOW:
             self.restart_now()
         elif answer == ANSWER_NEXT_START:
-            self._store.save(replace(self._store.load(), apply_on_start=True))
+            # 本人が選んだ予約 後で〔入れる前に尋ねる〕を入れても外さない（もう答えてある）
+            self._store.save(replace(self._store.load(), apply_on_start=True, apply_chosen=True))
             self._say(f"次の起動で {version} に更新します", 10000)
         elif answer == ANSWER_SKIP:
             self._store.save(
@@ -392,7 +404,12 @@ class UpdateController(QObject):
                 "次の作業が終わってからもう一度選んでください\n" + "\n".join(blockers),
             )
             return False
+        if self._busy_elsewhere():
+            return False
         if not self._confirm_close():
+            return False
+        # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
+        if self._busy_elsewhere():
             return False
         if mode == "apply":
             carry_user_files(self._layout.install, self._layout.staged)
@@ -408,6 +425,10 @@ class UpdateController(QObject):
             started = self._waiter(launched)
         finally:
             QApplication.restoreOverrideCursor()
+        if not started and launched.lost_to_another():
+            # ほぼ同時にほかの窓も入れ替え係を起こし、そちらが先に錠を取った
+            self._inform_other_swap()
+            return False
         if not started:
             self._inform(
                 "入れ替えを始められません",
@@ -422,6 +443,33 @@ class UpdateController(QObject):
             return False
         QApplication.quit()
         return True
+
+    def _busy_elsewhere(self) -> bool:
+        """ほかの窓か入れ替え係が更新を進めていれば、知らせて真
+
+        2 つの窓で〔今すぐ再起動して入れる〕を選ぶと入れ替え係が 2 つ起き、片方が作った
+        ``.previous`` をもう片方が消して戻す先まで失う 入れ替え係の側も錠で 1 つに絞るが、
+        起こす前に断る方が、本人に何が起きているかを言える
+        """
+        busy = busy_with(self._store.path.parent)
+        if busy == "swap":
+            self._inform_other_swap()
+            return True
+        if busy == "stage":
+            self._inform(
+                "今は入れられません",
+                "ほかの Sashimono の窓が新しい版を落としています"
+                " 終わってからもう一度選んでください",
+            )
+            return True
+        return False
+
+    def _inform_other_swap(self) -> None:
+        self._inform(
+            "ほかの窓で入れ替えを始めています",
+            "ほかの Sashimono の窓が新しい版への入れ替えを始めています"
+            " この窓を閉じると入れ替わり、新しい版が開きます",
+        )
 
     # --- 見せ方 ---
 

@@ -6,11 +6,26 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from sashimono.update.flow import apply_on_start, settle
+from sashimono.core.io.locks import try_hold
+from sashimono.update.flow import (
+    UpdateBusyError,
+    UpdateChoices,
+    apply_on_start,
+    prepare,
+    settle,
+)
 from sashimono.update.package import APP_EXE, Layout, write_build_info
-from sashimono.update.state import UpdateState, UpdateStateStore
-from sashimono.update.swap import SwapPlan
+from sashimono.update.state import (
+    STAGE_LOCK,
+    SWAP_LOCK,
+    UpdateState,
+    UpdateStateStore,
+    lock_path,
+)
+from sashimono.update.swap import SwapPlan, take_result
+from tests.update.helpers import release
 
 
 @pytest.fixture
@@ -37,7 +52,7 @@ class TestApplyingOnStart:
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
         _stage(layout, "1.2.0")
-        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         plans: list[SwapPlan] = []
 
         def swap(plan: SwapPlan) -> bool:
@@ -62,11 +77,145 @@ class TestApplyingOnStart:
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
         assert not apply_on_start(
-            ["x"], layout=layout, store=store, swap=_never, current="1.1.0", allowed=lambda: False
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=_never,
+            current="1.1.0",
+            choices=lambda: UpdateChoices(check=False),
         )
         assert not store.load().apply_on_start
         # 落としてある版は残す 手で確かめれば入れられる
         assert layout.staged_version() == "1.2.0"
+
+    def test_turning_confirm_on_drops_an_automatic_reservation(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """尋ねない設定が自動で付けた予約は、後で〔入れる前に尋ねる〕を入れたら入れない"""
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        assert not apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=_never,
+            current="1.1.0",
+            choices=lambda: UpdateChoices(confirm=True),
+        )
+        assert not store.load().apply_on_start
+
+    def test_an_automatic_reservation_applies_while_not_asking(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        assert apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=lambda _plan: True,
+            current="1.1.0",
+            choices=lambda: UpdateChoices(confirm=False),
+        )
+
+    def test_a_chosen_reservation_applies_while_asking(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """本人が〔次の起動で入れる〕を選んだ予約は、尋ねる設定でも入れる（もう答えてある）"""
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        assert apply_on_start(
+            ["x"],
+            layout=layout,
+            store=store,
+            swap=lambda _plan: True,
+            current="1.1.0",
+            choices=lambda: UpdateChoices(confirm=True),
+        )
+
+    def test_a_running_swapper_ends_this_start(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """入れ替え係が走っている間の起動は、画面を出さずに終わる（入れ替え係を待たせない）
+        2 つ目の入れ替え係も起こさない
+        """
+        held = try_hold(lock_path(SWAP_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            assert apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
+        finally:
+            held.release()
+
+    def test_staging_elsewhere_is_left_alone(self, layout: Layout, store: UpdateStateStore) -> None:
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        held = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            assert not apply_on_start(
+                ["x"], layout=layout, store=store, swap=_never, current="1.1.0"
+            )
+        finally:
+            held.release()
+        # 予約は残す 落とし終えた後の起動で入れる
+        assert store.load().apply_on_start
+
+
+class TestOneAtATime:
+    """窓を 2 つ開いていても、落とす・展開するのは 1 つだけ"""
+
+    def test_a_second_window_does_not_stage(self, layout: Layout, store: UpdateStateStore) -> None:
+        """同時に落とすと、片方が展開している .new をもう片方が消す"""
+        transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
+        held = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            with pytest.raises(UpdateBusyError):
+                prepare(manifest, transport=transport, layout=layout, store=store)
+        finally:
+            held.release()
+        assert transport.requested == []
+        prepare(manifest, transport=transport, layout=layout, store=store)
+        assert layout.staged_version() == "1.2.0"
+
+    def test_nothing_is_staged_while_swapping(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
+        held = try_hold(lock_path(SWAP_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            with pytest.raises(UpdateBusyError):
+                prepare(manifest, transport=transport, layout=layout, store=store)
+        finally:
+            held.release()
+
+    def test_settling_spares_a_stage_in_progress(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """ほかの窓が展開し終えて覚え書きを書く前の .new を、起動の片付けで消さない"""
+        _stage(layout, "1.2.0")
+        held = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            settle(layout=layout, store=store, current="1.1.0", results=[])
+        finally:
+            held.release()
+        assert layout.staged.exists()
+
+    def test_results_are_not_read_while_swapping(self, tmp_path: Path) -> None:
+        """走っている入れ替え係の結果を消すと、その後の結果が次の起動まで残る"""
+        folder = tmp_path / "update"
+        folder.mkdir()
+        (folder / "result-1.txt").write_text("started\nswapped\n", encoding="utf-8")
+        held = try_hold(lock_path(SWAP_LOCK, folder))
+        assert held is not None
+        try:
+            assert take_result(folder) == []
+        finally:
+            held.release()
+        assert take_result(folder) == ["started", "swapped"]
+        assert list(folder.glob("result-*.txt")) == []
 
     def test_nothing_happens_without_the_mark(
         self, layout: Layout, store: UpdateStateStore
@@ -77,14 +226,14 @@ class TestApplyingOnStart:
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
 
     def test_a_vanished_stage_is_not_applied(self, layout: Layout, store: UpdateStateStore) -> None:
-        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
         assert not store.load().apply_on_start
 
     def test_an_older_stage_is_not_applied(self, layout: Layout, store: UpdateStateStore) -> None:
         """入れ替え待ちの版が今より古い（手で新しい版を入れた） 戻してはいけない"""
         _stage(layout, "1.2.0")
-        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.3.0")
 
     def test_the_development_tree_is_left_alone(self, store: UpdateStateStore) -> None:
