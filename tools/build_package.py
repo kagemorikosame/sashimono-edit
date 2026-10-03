@@ -756,6 +756,22 @@ def minimal_environment(environ: Mapping[str, str]) -> dict[str, str]:
         "HOMEPATH",
         "USERNAME",
         "COMPUTERNAME",
+        # 素の Windows の利用者なら誰でも持っている変数 中身は Windows の物で開発の道具を
+        # 指さない 外すと PowerShell 5.1 の起動が倍ほど遅くなり（CI で 11 秒が 20 秒）、
+        # 使う人の機械では起きない遅さで入れ替え係の確かめが落ちる（Issue #33）
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "COMSPEC",
+        "PATHEXT",
+        "OS",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
     )
     upper = {key.upper(): value for key, value in environ.items()}
     minimal = {key: upper[key] for key in keep if key in upper}

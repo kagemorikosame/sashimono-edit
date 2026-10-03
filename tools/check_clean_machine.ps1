@@ -177,26 +177,23 @@ function Invoke-Exe([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds = 
 # runner は既定でファイアウォールを切っていることがある 切れていると規則が効かず、
 # 外へ出ても通ってしまう 送り出しの既定は許したまま（runner 自身の通信を止めない）にして、
 # Sashimono.exe だけを止める 止めた送り出しは記録に残す
-$FirewallLog = Join-Path $Windows 'System32\LogFiles\Firewall\pfirewall.log'
-Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Allow -LogBlocked True `
-    -LogFileName '%systemroot%\system32\LogFiles\Firewall\pfirewall.log' -LogMaxSizeKilobytes 32767
+Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Allow
 New-NetFirewallRule -DisplayName 'Sashimono を外へ出さない' -Direction Outbound -Program $Exe `
     -Action Block | Out-Null
+# 止めた接続を数えるため、Windows Filtering Platform の監査（接続を止めた 5157）を入れる
+# ファイアウォールの記録（pfirewall.log）は runner では止めた送り出しを 1 件も書かなかった
+# 監査の記録はどの exe が出ようとしたかまで残る 名前は言語で変わるので GUID で指す
+auditpol /set /subcategory:'{0CCE9226-69AE-11D9-BED3-505054503030}' /failure:enable | Out-Null
 
-function Get-DroppedSends {
-    # 止めた送り出しの行 Windows 11 系の記録は最後の列にプロセスの番号が付く
-    if (-not (Test-Path -LiteralPath $FirewallLog)) { return @() }
-    $lines = Get-Content -LiteralPath $FirewallLog -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match '\bDROP\b' -and $_ -match '\bSEND\b' }
-    return @($lines)
-}
-
-function Get-NewDrops([int]$Before) {
+function Get-Blocked([datetime]$Since, [string]$Program) {
     # 記録はすぐには書かれないことがある 少し待ってから読む
     Start-Sleep -Seconds 5
-    $all = @(Get-DroppedSends)
-    if ($all.Count -le $Before) { return @() }
-    return @($all[$Before..($all.Count - 1)])
+    $found = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 5157; StartTime = $Since } `
+            -ErrorAction SilentlyContinue)
+    # 1 番目が exe の場所（\device\harddiskvolume…\…\sashimono.exe） 2 番目が向き（%%14593 が外向き）
+    return @($found | Where-Object {
+            ([string]$_.Properties[1].Value) -like "*\$Program" -and ([string]$_.Properties[2].Value) -match '14593'
+        })
 }
 
 # 止める規則と記録が本当に効いているかを、先に別の exe で確かめる
@@ -205,18 +202,17 @@ $curlCopy = Join-Path $Temp 'firewall-check.exe'
 Copy-Item -LiteralPath "$Windows\System32\curl.exe" -Destination $curlCopy
 New-NetFirewallRule -DisplayName 'Sashimono の確かめ 止まるか' -Direction Outbound -Program $curlCopy `
     -Action Block | Out-Null
-$dropsBefore = @(Get-DroppedSends).Count
+$since = Get-Date
 & $curlCopy --silent --output NUL --max-time 15 https://api.github.com/zen
 $curlExit = $LASTEXITCODE
-$controlDrops = @(Get-NewDrops $dropsBefore)
+$controlDrops = @(Get-Blocked $since 'firewall-check.exe')
+$script:CountsBlocked = $controlDrops.Count -gt 0
 if ($curlExit -eq 0) {
     Fail 'ファイアウォールの規則で exe を止められない（外へ出ないことを確かめられない）'
-} elseif ($controlDrops.Count -eq 0) {
-    $script:FirewallLogWorks = $false
-    Note "止めた送り出しが記録に残らない（curl は止まった 終了コード $curlExit） 出ようとした回数は数えられない"
+} elseif (-not $script:CountsBlocked) {
+    Fail "止めた接続が監査の記録に残らない（curl は止まった 終了コード $curlExit） 自己診断が外へ出ようとしたかを数えられない"
 } else {
-    $script:FirewallLogWorks = $true
-    Note "ファイアウォールが効いている（見本の exe の送り出しを $($controlDrops.Count) 件止めて記録した）"
+    Note "ファイアウォールが効いている（見本の exe の外向きの接続を $($controlDrops.Count) 件止めて記録した）"
 }
 
 # --- 手掛かり 同じ環境で PowerShell 5.1 の台本が走るか ---
@@ -266,9 +262,9 @@ Set-Content -LiteralPath (Join-Path $Scripts '確かめる用.anm2') -Encoding u
     '--track@amount:量,0,100,50', 'obj.ox = amount'
 )
 
-$dropsBefore = @(Get-DroppedSends).Count
+$since = Get-Date
 $check = Invoke-Exe 'self-check' @('--self-check')
-$checkDrops = @(Get-NewDrops $dropsBefore)
+$checkDrops = @(Get-Blocked $since 'sashimono.exe')
 Write-Host $check.Out
 if ($check.Err.Trim()) { Write-Host $check.Err }
 
@@ -313,8 +309,8 @@ if ($items.Contains('スクリプト置き場') -and -not $items['スクリプ�
     Fail "exe の隣の置き場に置いたスクリプトが読まれていない: $($items['スクリプト置き場'].Detail)"
 }
 if ($checkDrops.Count -gt 0) {
-    Fail "自己診断が外へ出ようとした（止めた送り出し $($checkDrops.Count) 件）"
-    $checkDrops | ForEach-Object { Write-Host $_ }
+    Fail "自己診断が外へ出ようとした（止めた接続 $($checkDrops.Count) 件）"
+    $checkDrops | ForEach-Object { Write-Host $_.Message }
 }
 
 # --- 導入ボタンの pip 見本の wheel を日本語のフォルダへ入れる ---
@@ -358,7 +354,7 @@ public struct Rect { public int Left; public int Top; public int Right; public i
 public static extern bool GetWindowRect(System.IntPtr window, out Rect rect);
 '@
 
-$dropsBefore = @(Get-DroppedSends).Count
+$since = Get-Date
 $window =[System.Diagnostics.Process]::Start((New-StartInfo @() $false))
 $deadline = (Get-Date).AddSeconds(120)
 while ((Get-Date) -lt $deadline -and -not $window.HasExited) {
@@ -383,7 +379,9 @@ if ($window.HasExited) {
             # 窓の中の文字を UI Automation で読む pwsh 7 から使えるとは限らないので、
             # Windows に入っている PowerShell 5.1 で読む 型は Add-Type の後で文字列から引く
             # （5.1 は型を書いた所を読む時点で解決しようとして見つけられない）
+            # 進み具合の表示を止める 出力が端末でないと CLIXML でログに混ざる
             $find = @"
+`$ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 `$element = 'System.Windows.Automation.AutomationElement' -as [type]
@@ -432,9 +430,10 @@ exit 1
         }
     }
 }
-$windowDrops = @(Get-NewDrops $dropsBefore)
+$windowDrops = @(Get-Blocked $since 'sashimono.exe')
 # 起動の後に更新を確かめに行くのは正しい動き 止めても落ちずに動き続けたことを上で見ている
-Note "起動から閉じるまでに止めた送り出し: $($windowDrops.Count) 件（更新の確認は外へ出る）"
+# 起動の 3 秒後に新しい版を確かめに外へ出る 止められても落ちずに閉じられたことは上で見ている
+Note "起動から閉じるまでに止めた外向きの接続: $($windowDrops.Count) 件（更新の確認）"
 
 # --- 実の置き場に書いていないか ---
 $RealAfter = @($RealPlaces | Where-Object { Test-Path -LiteralPath $_ })
