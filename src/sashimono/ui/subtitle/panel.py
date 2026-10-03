@@ -43,6 +43,7 @@ from sashimono.core.commands import (
     SetTranscript,
     SplitSegment,
     Voice,
+    burn_defaults,
     burn_subtitles,
     export_range,
     subtitle_voices,
@@ -65,15 +66,13 @@ from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
+from sashimono.ui.flow_layout import flow_of, narrow_combo
 from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog, JetCutDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["SubtitlePanel", "ask_subtitle_range"]
-
-#: 焼き込むテキストの既定 下寄せで、縁取りを付けて読めるようにする
-BURN_DEFAULTS = {"size": 48.0, "pos_y": -380.0, "border_width": 4.0}
 
 
 #: 時刻の列に足す余白（画素） 文字の幅ぴったりだと読みにくい
@@ -134,6 +133,9 @@ class SubtitlePanel(QWidget):
 
     def _build(self) -> None:
         self._media = QComboBox(self)
+        # 素材の名前の長さでパネルの最小の幅を決めない 長い名前の素材を読み込むたびに
+        # 窓の最小の幅が伸び、1366 の画面から窓がはみ出す 名前の全部は一覧を開けば読める
+        narrow_combo(self._media, 8)
         self._media.currentIndexChanged.connect(self._on_media_changed)
         # 音声が何本もある素材（ゲームの音とマイクの声など）は、どの音の字幕を見るかを選ぶ
         # 1 本の素材では出さない（今までどおり素材だけ）
@@ -158,17 +160,15 @@ class SubtitlePanel(QWidget):
         top.addWidget(self._stream_box)
         top.addWidget(self._transcribe_button)
 
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        for button in (
+        # 狭いパネルでは折り返す 1 列に並べると 5 つのボタンの幅の和がパネルの最小の幅になり、
+        # 字幕のパネルだけで 1366 の画面の 3 分の 1 を取った
+        actions = flow_of(
             self._clean_button,
             self._cut_button,
             self._burn_button,
             self._place_rows_button,
             self._export_button,
-        ):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        )
 
         self._table = QTableWidget(0, 2, self)
         self._table.setHorizontalHeaderLabels(["時刻", "本文"])
@@ -195,7 +195,7 @@ class SubtitlePanel(QWidget):
         header.sectionResized.connect(self._on_section_resized)
 
         self._empty = QLabel("音声を持つ素材を選んでください", self)
-        self._empty.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; padding: 8px;")
+        themed_style(self._empty, lambda: f"color: {Colors.TEXT_MUTED.name()}; padding: 8px;")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -204,6 +204,21 @@ class SubtitlePanel(QWidget):
         layout.addLayout(actions)
         layout.addWidget(self._empty)
         layout.addWidget(self._table, 1)
+        theme_signals().changed.connect(self._recolor_rows)
+
+    def _recolor_rows(self) -> None:
+        """テーマが変わった タイムラインに出ていない字幕の時刻を今の薄い色で塗り直す
+
+        行の文字の色は行を作った時点の色で持つので、塗り直さないと前のテーマの色が残る
+        """
+        self._updating = True
+        try:
+            for row, (_, start, _end) in enumerate(self._rows):
+                item = self._table.item(row, 0)
+                if item is not None and start < 0:
+                    item.setForeground(Colors.TEXT_MUTED)
+        finally:
+            self._updating = False
 
     def _button(self, text: str, slot: object) -> QPushButton:
         button = QPushButton(text, self)
@@ -535,6 +550,8 @@ class SubtitlePanel(QWidget):
         merge = menu.addAction("次と結合")
         remove = menu.addAction("削除")
         chosen = menu.exec(self._table.viewport().mapToGlobal(position))
+        # 右クリックのたびに作るメニュー 選んだ項目はこの後で比べるので、後で捨てる
+        menu.deleteLater()
         if chosen is place:
             self.place_selected_rows()
             return
@@ -600,7 +617,11 @@ class SubtitlePanel(QWidget):
             self._service = TranscriptionService(default_backend())
 
         dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
-        if dialog.exec() and dialog.transcript is not None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer and dialog.transcript is not None:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.transcript, stream=dialog.chosen_stream)],
                 f"字幕を起こす: {media.name}",
@@ -705,7 +726,11 @@ class SubtitlePanel(QWidget):
         if media is None or transcript is None:
             return
         dialog = CleanupDialog(transcript, self)
-        if dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer:
             self.commands_requested.emit(
                 [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
                 "字幕を整形",
@@ -730,7 +755,11 @@ class SubtitlePanel(QWidget):
             estimate=estimate,
             parent=self,
         )
-        if not dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if not answer:
             return
 
         ranges = self._plan(media, dialog.options(), dialog.keep_speech)
@@ -764,9 +793,11 @@ class SubtitlePanel(QWidget):
             text = str(clip.source.params.get("text", "")).splitlines()
             head = text[0][:12] if text else ""
             return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
-        return TEXT.create(**BURN_DEFAULTS), (
-            "見た目: 既定（大きさ 48・下寄せ・縁取り 4） タイムラインでテキストを選んでから"
-            "焼き込むと、そのテキストの見た目を写します"
+        # 既定の大きさと位置は作品の高さで縮める 画素のまま置くと、720p では画面の外に出る
+        look = burn_defaults(self._project.settings.height)
+        return TEXT.create(**look), (
+            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}）"
+            " タイムラインでテキストを選んでから焼き込むと、そのテキストの見た目を写します"
         )
 
     def burn(self) -> None:
@@ -789,7 +820,11 @@ class SubtitlePanel(QWidget):
 
     def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
         dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
-        if not dialog.exec():
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if not answer:
             return None
         return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
 
@@ -861,6 +896,9 @@ def ask_subtitle_range(parent: QWidget | None, project: Project) -> str | None:
     box.addButton(QMessageBox.StandardButton.Cancel)
     box.setDefaultButton(in_range)
     box.exec()
+    # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+    # この後で結果を読む間は残る
+    box.deleteLater()
     clicked = box.clickedButton()
     if clicked is in_range:
         return RANGE_WORK_AREA

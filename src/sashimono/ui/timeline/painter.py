@@ -250,7 +250,7 @@ def draw_track_header(painter: QPainter, band: TrackBand, *, active: bool = True
             painter.fillRect(button, colour)
         painter.setPen(QPen(colour if on else Colors.BORDER, 1))
         painter.drawRect(button.adjusted(0, 0, -1, -1))
-        painter.setPen(QPen(Colors.WINDOW if on else Colors.TEXT_MUTED, 1))
+        painter.setPen(QPen(Colors.TRACK_TOGGLE_TEXT if on else Colors.TEXT_MUTED, 1))
         painter.drawText(button, Qt.AlignmentFlag.AlignCenter, letter)
     painter.restore()
 
@@ -541,7 +541,7 @@ def _draw_clip_label(
     label_rect = QRect(rect.left(), rect.top(), rect.width(), Metrics.CLIP_LABEL_HEIGHT)
     # 設定パネルが出しているクリップは名前の帯を色で塗る 枠が画面の外に切れていても
     # 名前の見えている所で見分けられる
-    shade = QColor(Colors.EDITING) if editing else QColor(0, 0, 0, 90)
+    shade = QColor(Colors.EDITING) if editing else QColor(Colors.CLIP_LABEL_SHADE)
     if editing:
         shade.setAlpha(170)
     painter.fillRect(label_rect, shade)

@@ -31,7 +31,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.sources import source_registry
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["ClipHeader", "ClipIdentity", "identify_clip"]
 
@@ -181,9 +181,9 @@ class ClipHeader(QWidget):
         self._band = QFrame(self)
         self._band.setFixedWidth(self.BAND_WIDTH)
         self._title = QLabel(self)
-        self._title.setStyleSheet(f"color: {Colors.CLIP_LABEL.name()}; font-weight: bold;")
+        themed_style(self._title, lambda: f"color: {Colors.CLIP_LABEL.name()}; font-weight: bold;")
         self._detail = QLabel(self)
-        self._detail.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._detail, lambda: f"color: {Colors.TEXT_MUTED.name()};")
         for label in (self._title, self._detail):
             # 長い名前で横に伸びてパネルの幅を押し広げない 収まらない分は切れて見える
             label.setMinimumWidth(1)
@@ -222,16 +222,19 @@ class ClipHeader(QWidget):
         """
         self._identity = identity
         if identity is None:
-            self._band.setStyleSheet("background: transparent;")
+            themed_style(self._band, lambda: "background: transparent;")
             self._title.setText("クリップを選んでください")
-            self._title.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+            themed_style(self._title, lambda: f"color: {Colors.TEXT_MUTED.name()};")
             self._detail.hide()
             self.setAccessibleName("クリップを選んでいない")
             # 前のクリップの名前が補足に残ると、選んでいないのに何かを開いているように見える
             self.setToolTip("")
             return
-        self._band.setStyleSheet(f"background-color: {identity.color.name()};")
-        self._title.setStyleSheet(f"color: {Colors.CLIP_LABEL.name()}; font-weight: bold;")
+        # 帯の色は Colors の QColor そのもの（写しではない） テーマを切り替えると中身が
+        # 書き換わるので、作り直すたびに読めば新しいテーマの色になる
+        band = identity.color
+        themed_style(self._band, lambda: f"background-color: {band.name()};")
+        themed_style(self._title, lambda: f"color: {Colors.CLIP_LABEL.name()}; font-weight: bold;")
         self._title.setText(identity.title)
         detail = f"トラック {identity.track}"
         if others:

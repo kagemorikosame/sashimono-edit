@@ -41,7 +41,9 @@ from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
+from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
+    AUTO_QUALITY_HEIGHT,
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
     MEDIA_SPLIT,
@@ -51,6 +53,7 @@ from sashimono.ui.workspace import (
 )
 
 __all__ = [
+    "AUTO_QUALITY_TEXT",
     "DECODE_THREADS",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
@@ -64,6 +67,14 @@ PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
     ("360p（一番軽い）", 360),
     ("540p（既定）", 540),
     ("720p（きれい）", 720),
+)
+
+#: 自動で画質を落とす項目の文言 数は判定（:meth:`Preferences.quality_for`）の境目から作る
+#: 前は「画面より大きい素材では」と書いていたが、実際に見ているのは画面の大きさではなく
+#: 読み込んだ素材の高さで、1080 を超える物が 1 つでもあれば落とす 文言と動きが食い違うと、
+#: 1080p の画面で 1080p の素材を置いた人が「画面と同じなのに下がらない」と迷う
+AUTO_QUALITY_TEXT = (
+    f"高さが {AUTO_QUALITY_HEIGHT - 1} を超える素材があれば、プレビューの画質を下げる"
 )
 
 #: 自動で落とすときの分母
@@ -153,9 +164,12 @@ class PreferencesDialog(QDialog):
         self._select(self._proxy_height, preferences.proxy_height)
         form.addRow("控えの大きさ", self._proxy_height)
 
-        self._auto_quality = QCheckBox("画面より大きい素材では、プレビューの画質を下げる", self)
+        self._auto_quality = QCheckBox(AUTO_QUALITY_TEXT, self)
         self._auto_quality.setChecked(preferences.auto_quality)
         self._auto_quality.setToolTip(
+            f"読み込んだ素材のどれかの高さ（縦の画素数 縦撮りは回した後の高さ）が "
+            f"{AUTO_QUALITY_HEIGHT - 1} を超えると、プレビューを「下げたときの画質」で描く "
+            "書き出しは変わらない\n"
             "切ると、4K の素材でも等倍で描く 画質は上がるが、再生が追いつかなくなる"
         )
         form.addRow(self._auto_quality)
@@ -249,6 +263,15 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._pool_progress)
 
+        self._hdr_notice = QCheckBox("HDR の素材を読み込んだら知らせる", self)
+        self._hdr_notice.setChecked(preferences.hdr_notice)
+        self._hdr_notice.setToolTip(
+            "HDR（PQ・HLG）や広い色域（BT.2020）の印が付いた素材を読み込んだときに、"
+            "SDR（Rec.709）として扱うので白っぽく表示・書き出しされることを知らせる "
+            "切っても素材一覧の行には印が付く"
+        )
+        form.addRow(self._hdr_notice)
+
         # 一覧の上のボタンでも切り替えられる ここにも置くのは、設定を開いて OK を
         # 押したときに、ボタンで選んだ表示を黙って既定へ戻さないため
         self._media_view = QComboBox(self)
@@ -303,6 +326,17 @@ class PreferencesDialog(QDialog):
             "重ねたパネルを切り替えるタブをどちらの辺に出すか"
         )
         form.addRow("重ねたパネルのタブ", self._dock_tabs)
+        self._theme = QComboBox(self)
+        for value, text in THEME_CHOICES:
+            self._theme.addItem(text, value)
+        self._theme.setCurrentIndex(max(0, self._theme.findData(preferences.theme)))
+        self._theme.setToolTip(
+            "画面の色 OK を押すとその場で切り替わる（再起動は要らない） "
+            "「Windows の設定に合わせる」は、Windows の 設定 → 個人用設定 → 色 の"
+            "アプリの明るい・暗い（アプリ モード）に合わせ、変えたときも付いていく "
+            "プレビューの絵そのもの（書き出す色）はテーマで変わらない"
+        )
+        form.addRow("画面の色（テーマ）", self._theme)
         self._preview_handles = QCheckBox("プレビューで外枠を出して直接動かす", self)
         self._preview_handles.setChecked(preferences.preview_handles)
         self._preview_handles.setToolTip(
@@ -528,6 +562,7 @@ class PreferencesDialog(QDialog):
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
             pool_progress=self._pool_progress.isChecked(),
+            hdr_notice=self._hdr_notice.isChecked(),
             all_aviutl_plugins=self._all_plugins.isChecked(),
             media_view=str(self._media_view.currentData()),
             ai_model=str(self._ai_model.currentData()),
@@ -544,6 +579,7 @@ class PreferencesDialog(QDialog):
             preview_snap=self._preview_snap.isChecked(),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
+            theme=str(self._theme.currentData()),
             update_check=self._update_check.isChecked(),
             update_beta=self._update_beta.isChecked(),
             update_confirm=self._update_confirm.isChecked(),

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import base64
 import importlib.util
 import json
 import sys
@@ -250,9 +249,29 @@ class TestSigning:
         manifest.write_bytes(manifest.read_bytes().replace(b'"minimum"', b'"minimum" '))
         assert sign_tool.main(["verify", str(manifest)]) == 1
 
-    def test_verify_without_keys_fails(self, sign_tool: ModuleType, manifest: Path) -> None:
+    def test_verify_without_keys_fails(
+        self,
+        sign_tool: ModuleType,
+        key: Ed25519PrivateKey,
+        manifest: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         """鍵を貼り忘れた版を配ると、誰も更新を受け取れない 上げる前に止める"""
-        manifest.with_name("update.json.sig").write_bytes(base64.b64encode(b"x" * 64))
+        from sashimono.update.signing import sign_manifest
+
+        manifest.with_name("update.json.sig").write_bytes(sign_manifest(manifest.read_bytes(), key))
+        monkeypatch.setattr(sign_tool, "trusted_keys", lambda: ())
+        assert sign_tool.main(["verify", str(manifest)]) == 1
+        assert "公開鍵が入っていない" in capsys.readouterr().out
+
+    def test_a_throwaway_key_does_not_pass_the_real_keys(
+        self, sign_tool: ModuleType, key: Ed25519PrivateKey, manifest: Path
+    ) -> None:
+        """埋め込んだ本物の公開鍵は、試験で作った使い捨ての鍵の署名を信じない"""
+        from sashimono.update.signing import sign_manifest
+
+        manifest.with_name("update.json.sig").write_bytes(sign_manifest(manifest.read_bytes(), key))
         assert sign_tool.main(["verify", str(manifest)]) == 1
 
 

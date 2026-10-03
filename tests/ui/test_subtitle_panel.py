@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from sashimono.core.commands import (
     AddClip,
@@ -24,7 +26,7 @@ from sashimono.core.commands import (
     SetWorkArea,
     TrimClip,
 )
-from sashimono.core.model import MediaItem, Project, Transcript
+from sashimono.core.model import AnimatedValue, MediaItem, Project, Transcript
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -420,6 +422,32 @@ class TestBurnAndExport:
         # トラックを 1 本足して、字幕 3 枚をテキストとして置く
         assert len(commands) == 4
 
+    def test_burned_text_is_inside_a_720p_frame(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        """既定の見た目で焼いた字幕が、720p の作品でも画面の中に置かれること
+
+        前は 1080p 用の縦位置（-380）を画素のまま使い、720p の作品では画面の下端
+        （-360）より下に置かれて、焼き込んだ字幕がどこにも映らなかった
+        """
+        del qt_application
+        small = replace(placed, settings=replace(placed.settings, width=1280, height=720))
+        widget = SubtitlePanel(small, StubAnalyzer())
+        issued: list[tuple[list[Command], str]] = []
+        widget.commands_requested.connect(lambda commands, label: issued.append((commands, label)))
+        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.burn()
+        widget.deleteLater()
+        commands, _ = issued[-1]
+        half = 720 / 2
+        clips = [c.clip for c in commands if isinstance(c, AddClip)]
+        assert clips
+        for clip in clips:
+            assert clip.source is not None
+            position = clip.source.params["pos_y"]
+            assert isinstance(position, AnimatedValue)
+            assert -half < position.at(0) < 0
+
     def test_export_writes_the_file(
         self,
         panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
@@ -585,3 +613,36 @@ def test_the_panels_jet_cut_of_the_first_voice_leaves_voice_two_alone(
         assert unchosen and all(end <= 600 for _, end in unchosen)
     finally:
         widget.deleteLater()
+
+
+class TestDialogsAreFreed:
+    """字幕の窓（起こす・整形・無音カット・焼き込み）を、閉じたあとに捨てること
+
+    捨てないと、開くたびに窓が字幕パネルの子として残り続ける 起こすの窓は時計と
+    音声の選びを持ち、焼き込みの窓は話し手ごとの印を持つので、開くほど溜まる
+    """
+
+    def test_opening_and_closing_does_not_pile_up(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        del qt_application
+        from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        # 開く所だけを差し替える 開くと押す人を待って止まる 取り消したことにする
+        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog):
+            monkeypatch.setattr(dialog, "exec", lambda self: 0)
+        widget = SubtitlePanel(placed, StubAnalyzer(make_waveform([(0.5, 400)])))
+        try:
+            for _ in range(3):
+                widget.transcribe()
+                widget.clean()
+                widget.jet_cut()
+                widget.burn()
+            opened = {type(child).__name__ for child in widget.findChildren(QDialog)}
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+            # 窓が本当に開いたこと 開いていなければ、残らないのは当たり前で何も言えない
+            assert opened == {"TranscribeDialog", "CleanupDialog", "JetCutDialog", "BurnDialog"}
+            assert widget.findChildren(QDialog) == []
+        finally:
+            widget.deleteLater()

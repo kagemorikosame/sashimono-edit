@@ -39,8 +39,9 @@ from sashimono.ai.session import (
     EventKind,
     system_prompt,
 )
+from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.workspace import Preferences
 
 __all__ = ["ChatPanel"]
@@ -122,8 +123,12 @@ class ChatPanel(QWidget):
         #: 送ってまだ応答が終わっていない指示（送った順） 会話を繋ぎ直してよいかの
         #: 判断と、続けて送った指示の取り消しの段を、その指示の名前で開くのに使う
         self._queued: deque[str] = deque()
+        #: 出した会話（言った人、文） 補足は言った人が ``None`` テーマを切り替えたときに
+        #: 今の色で書き直すために持つ
+        self._log: list[tuple[str | None, str]] = []
 
         self._build()
+        theme_signals().changed.connect(self._redraw_log)
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self._poll)
@@ -150,12 +155,17 @@ class ChatPanel(QWidget):
         self._model.currentIndexChanged.connect(self._on_choice_changed)
         self._effort.currentIndexChanged.connect(self._on_choice_changed)
 
-        choices = QHBoxLayout()
-        choices.setContentsMargins(0, 0, 0, 0)
-        choices.addWidget(QLabel("モデル", self))
-        choices.addWidget(self._model, 1)
-        choices.addWidget(QLabel("考える深さ", self))
-        choices.addWidget(self._effort)
+        # 名前と欄の組ごとに折り返す 1 列に並べると、モデルの名前の欄と深さの欄の幅の和が
+        # AI のパネルの最小の幅になり、設定パネルと重ねた右の列が 1366 の画面で広がりすぎた
+        # 組を崩さないのは、欄だけが次の行へ落ちると、どの名前の欄か読めなくなるため
+        choices = FlowLayout()
+        for text, box in (("モデル", self._model), ("考える深さ", self._effort)):
+            pair = QWidget(self)
+            pair_layout = QHBoxLayout(pair)
+            pair_layout.setContentsMargins(0, 0, 0, 0)
+            pair_layout.addWidget(QLabel(text, pair))
+            pair_layout.addWidget(box)
+            choices.addWidget(pair)
 
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない
@@ -167,7 +177,7 @@ class ChatPanel(QWidget):
             self._login_box,
         )
         self._login_text.setWordWrap(True)
-        self._login_text.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._login_text, lambda: f"color: {Colors.TEXT_MUTED.name()};")
         self._login_button = QPushButton("ログイン…", self._login_box)
         self._login_button.clicked.connect(self.open_login)
         login_layout = QHBoxLayout(self._login_box)
@@ -177,8 +187,12 @@ class ChatPanel(QWidget):
 
         self._view = QTextBrowser(self)
         self._view.setOpenExternalLinks(False)
-        self._view.setStyleSheet(
-            f"background-color: {Colors.PANEL_ALT.name()};border: 1px solid {Colors.BORDER.name()};"
+        themed_style(
+            self._view,
+            lambda: (
+                f"background-color: {Colors.PANEL_ALT.name()};"
+                f"border: 1px solid {Colors.BORDER.name()};"
+            ),
         )
 
         self._approval_box = QFrame(self)
@@ -209,6 +223,17 @@ class ChatPanel(QWidget):
         self._input = _Input(self)
         self._describe_send_key()
         self._input.setMaximumHeight(96)
+        # 最小は行の数で決める Qt の既定（巻物の欄の最小）は会話の欄と合わせて 140 画素あり、
+        # 設定パネルと重ねた右の列の最小の高さになって、1280x720 の画面に窓が収まらなかった
+        # 書体で行の高さが変わっても、会話は 2 行・入力は 1 行が必ず見える
+        areas: tuple[tuple[QTextBrowser | QPlainTextEdit, int], ...] = (
+            (self._view, 2),
+            (self._input, 1),
+        )
+        for area, lines in areas:
+            frame = 2 * area.frameWidth()
+            margin = round(2 * area.document().documentMargin())
+            area.setMinimumHeight(lines * area.fontMetrics().lineSpacing() + frame + margin)
         self._input.submitted.connect(self.send)
 
         self._auto = QCheckBox("変更を自動で承認", self)
@@ -512,26 +537,48 @@ class ChatPanel(QWidget):
     # --- 表示 ---
 
     def _say(self, who: str, text: str) -> None:
-        color = {
-            "あなた": Colors.TEXT.name(),
-            "Claude": Colors.ACCENT.name(),
-            "エラー": Colors.PLAYHEAD.name(),
-        }.get(who, Colors.TEXT_MUTED.name())
-        body = html.escape(text).replace("\n", "<br>")
-        self._view.append(f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>')
+        self._log.append((who, text))
+        self._view.append(_message_html(who, text))
         self._scroll_to_end()
 
     def _note(self, text: str) -> None:
         """ツールの呼び出しなど、会話の本体ではないもの"""
-        self._view.append(
-            f'<span style="color:{Colors.TEXT_MUTED.name()}">{html.escape(text)}</span>'
-        )
+        self._log.append((None, text))
+        self._view.append(_message_html(None, text))
+        self._scroll_to_end()
+
+    def _redraw_log(self) -> None:
+        """テーマが変わった 会話を今の色で書き直す
+
+        色は HTML に焼き込んであるので、描き直すだけでは前のテーマの色のまま残る
+        暗いテーマの白に近い文字が、明るい地の上で読めなくなる
+        """
+        self._view.clear()
+        for who, text in self._log:
+            self._view.append(_message_html(who, text))
         self._scroll_to_end()
 
     def _scroll_to_end(self) -> None:
         bar = self._view.verticalScrollBar()
         if bar is not None:
             bar.setValue(bar.maximum())
+
+
+def _message_html(who: str | None, text: str) -> str:
+    """会話の 1 件を HTML へ ``who`` が ``None`` なら会話の本体ではない補足
+
+    Claude の返事だけ太字と等幅を組む 本人の指示やエラーの文に ``**`` が
+    あっても、書いたとおりに見せる
+    """
+    if who is None:
+        return f'<span style="color:{Colors.TEXT_MUTED.name()}">{html.escape(text)}</span>'
+    color = {
+        "あなた": Colors.TEXT.name(),
+        "Claude": Colors.ACCENT.name(),
+        "エラー": Colors.PLAYHEAD.name(),
+    }.get(who, Colors.TEXT_MUTED.name())
+    body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
+    return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'
 
 
 def _to_html(text: str) -> str:

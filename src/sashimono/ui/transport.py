@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap, QPolygonF, QResizeEvent
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget
 
 from sashimono.core.timebase import FrameRate, format_timecode
 from sashimono.engine.render import RenderQuality
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["TransportBar", "transport_icon"]
 
@@ -42,6 +44,9 @@ class TransportBar(QWidget):
         self._play_icon = transport_icon("play")
         self._pause_icon = transport_icon("pause")
         self._playing = False
+        # 印は文字の色で描いた絵 テーマが変わったら描き直す 描き直さないと、暗いテーマの
+        # 白に近い印が明るい地の上で見えなくなる
+        theme_signals().changed.connect(self._redraw_icons)
 
         self._to_start.clicked.connect(lambda: self.jump_requested.emit(0))
         self._back.clicked.connect(lambda: self.step_requested.emit(-1))
@@ -54,16 +59,21 @@ class TransportBar(QWidget):
         monospace.setStyleHint(QFont.StyleHint.Monospace)
         monospace.setPointSizeF(11)
         self._timecode.setFont(monospace)
-        self._timecode.setStyleSheet(f"color: {Colors.TEXT.name()};")
+        themed_style(self._timecode, lambda: f"color: {Colors.TEXT.name()};")
 
         self._duration_label = QLabel(self)
         self._duration_label.setFont(monospace)
-        self._duration_label.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._duration_label, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._quality = QComboBox(self)
         for label, divisor in QUALITY_CHOICES:
             self._quality.addItem(label, divisor)
         self._quality.currentIndexChanged.connect(self._on_quality_changed)
+
+        self._slash = QLabel("/", self)
+        self._quality_label = QLabel("再生品質", self)
+        self._quality.setToolTip("再生品質 下げるとプレビューだけ軽くなる 書き出しは変わらない")
+        self._quality.setAccessibleName("再生品質")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
@@ -72,13 +82,52 @@ class TransportBar(QWidget):
             layout.addWidget(button)
         layout.addSpacing(12)
         layout.addWidget(self._timecode)
-        layout.addWidget(QLabel("/", self))
+        layout.addWidget(self._slash)
         layout.addWidget(self._duration_label)
         layout.addStretch(1)
-        layout.addWidget(QLabel("再生品質", self))
+        layout.addWidget(self._quality_label)
         layout.addWidget(self._quality)
+        #: 幅が足りないときに隠す物 先に並べた組ほど残す 再生の操作・今の位置・画質の欄は
+        #: 隠さない 隠すと操作できなくなる 全体の長さと欄の名前は、無くても操作はできる
+        #: 隠さずに縮めると、文字が欠けた時刻や名前が出る
+        self._optional: tuple[tuple[QWidget, ...], ...] = (
+            (self._slash, self._duration_label),
+            (self._quality_label,),
+        )
 
         self._refresh()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt の命名規約
+        """隠せる物を全部隠したときの幅 プレビューの列の最小の幅はここで決まる
+
+        並べた全部の幅にすると、窓の最小の幅が 1366 の画面を超える
+        """
+        hint = super().minimumSizeHint()
+        shown = [widget for group in self._optional for widget in group if not widget.isHidden()]
+        return QSize(hint.width() - self._width_of(shown), hint.height())
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt の命名規約
+        super().resizeEvent(event)
+        self._fit(event.size().width())
+
+    def _fit(self, width: int) -> None:
+        """入るだけ出す 入らない組は丸ごと隠す（組の片方だけ出すと「/」だけが残る）"""
+        room = width - self.minimumSizeHint().width()
+        for group in self._optional:
+            need = self._width_of(group)
+            fits = room >= need
+            for widget in group:
+                widget.setHidden(not fits)
+            if fits:
+                room -= need
+            else:
+                # 先の組を隠したのに後の組だけ出すと、隠す順の約束が崩れる
+                room = -1
+
+    def _width_of(self, widgets: Sequence[QWidget]) -> int:
+        layout = self.layout()
+        spacing = layout.spacing() if layout is not None else 0
+        return sum(widget.sizeHint().width() + spacing for widget in widgets)
 
     def set_rate(self, rate: FrameRate) -> None:
         self._rate = rate
@@ -101,6 +150,18 @@ class TransportBar(QWidget):
         self._play.setIcon(self._pause_icon if playing else self._play_icon)
         self._play.setAccessibleName("一時停止" if playing else "再生")
 
+    def _redraw_icons(self) -> None:
+        self._play_icon = transport_icon("play")
+        self._pause_icon = transport_icon("pause")
+        for button, glyph in (
+            (self._to_start, "to_start"),
+            (self._back, "back"),
+            (self._forward, "forward"),
+            (self._to_end, "to_end"),
+        ):
+            button.setIcon(transport_icon(glyph))
+        self.set_playing(self._playing)
+
     def set_quality(self, divisor: int) -> None:
         """画質の選びを外から合わせる 一覧に無い分母なら何もしない
 
@@ -120,6 +181,8 @@ class TransportBar(QWidget):
     def _refresh(self) -> None:
         self._timecode.setText(format_timecode(self._frame, self._rate))
         self._duration_label.setText(format_timecode(self._duration, self._rate))
+        # 時刻の桁が変わる（60fps の素材を置いて :59 になる・1 時間を超える）と要る幅も変わる
+        self._fit(self.width())
 
 
 #: ボタンの印の形 16 × 16 の枠の中の、縦棒 ``(左, 上, 幅, 高さ)`` と三角（3 点）

@@ -27,6 +27,7 @@ from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.media_match import MATCH_ASK, MATCH_MODES
 from sashimono.ui.media_pool import VIEW_LIST, VIEW_MODES
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_AT_PLAYHEAD, KEYFRAME_DRAG_MODES
+from sashimono.ui.theme import THEME_DARK, THEME_MODES
 
 __all__ = [
     "AUTO_QUALITY_HEIGHT",
@@ -190,7 +191,8 @@ class Preferences:
     use_proxy: bool = True
     #: 控えの縦の画素数
     proxy_height: int = 540
-    #: 画面より大きい素材を置いたら、プレビューの画質を自動で落とす
+    #: 高さが :data:`AUTO_QUALITY_HEIGHT` 以上の素材を読み込んだら、プレビューの画質を自動で落とす
+    #: 画面の大きさは見ない（設定画面の文言は ``preferences_dialog.AUTO_QUALITY_TEXT``）
     auto_quality: bool = True
     #: 自動で落とすときの分母
     auto_quality_divisor: int = 2
@@ -237,6 +239,11 @@ class Preferences:
     #: 作っている最中だからなのかを、知らない人ほど見て分かる必要がある
     #: 行の文字が 250ms ごとに変わるのが目障りな人は切れるようにする
     pool_progress: bool = True
+    #: HDR（PQ・HLG）や広色域（BT.2020）の素材を読み込んだときに、SDR として扱うので
+    #: 白っぽく出ると知らせる窓を出す（素材一覧の行の印はこの設定に関係なく出す）
+    #: 既定は入 HDR を知らない人ほど、褪せた絵をソフトの不具合だと受け取る
+    #: 知っていて HDR の素材を何度も読み込む人は、窓が邪魔なので切れるようにする
+    hdr_notice: bool = True
     #: AviUtl2 の汎用プラグイン（``.aux2``）を全部読んで、スクリプトが引くモジュールを探す
     #: 既定は切 切っている間は、名前を出すと確かめたプラグイン（合成フォントの
     #: ``comfont.aux2``）だけを読む 全部を読むと、関係の無いプラグインが初期化で
@@ -308,6 +315,12 @@ class Preferences:
     #: 1 本にまとめると 2 本目以降の音がタイムラインのどこにも無く、鳴らす手段に気付けない
     #: レイヤーが増えるのを嫌う人・YMM4 のように 1 本で持ちたい人は切り替えられる
     media_split: str = MEDIA_SPLIT
+    #: 画面の色 暗い（``dark``）・明るい（``light``）・Windows の設定に合わせる（``system``）
+    #: 既定は暗い 明るいテーマを足す前からの見た目で、映像の色を見る作業では周りが暗い方が
+    #: 目が明るさに慣れない 明るい部屋で使う人・暗い画面の文字が読みにくい人は切り替えられる
+    #: 「合わせる」を既定にしないのは、Windows を明るくしている人の画面が、版を上げた
+    #: だけで黙って明るくなるため
+    theme: str = THEME_DARK
     #: 起動したときに新しい版を確かめる（数時間に 1 回まで） 見つけたら裏で落として確かめておく
     #: 既定は入 古い版のまま直った不具合に困り続ける人を作らない 締め切り前など、編集環境を
     #: 変えたくない人は切る（切っている間は今の版に留まる ヘルプの〔更新を確かめる…〕で
@@ -382,6 +395,7 @@ class PreferenceStore:
             decode_threads=_threads(data.get("decode_threads"), plain.decode_threads),
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
+            hdr_notice=_flag(data.get("hdr_notice"), plain.hdr_notice),
             all_aviutl_plugins=_flag(data.get("all_aviutl_plugins"), plain.all_aviutl_plugins),
             media_view=_choice(data.get("media_view"), VIEW_MODES, plain.media_view),
             ai_model=_choice(data.get("ai_model"), tuple(m.id for m in AI_MODELS), plain.ai_model),
@@ -409,6 +423,7 @@ class PreferenceStore:
                 MEDIA_SPLIT_MODES,
                 _LEGACY_MULTI_AUDIO.get(str(data.get("multi_audio")), plain.media_split),
             ),
+            theme=_choice(data.get("theme"), THEME_MODES, plain.theme),
             update_check=_flag(data.get("update_check"), plain.update_check),
             update_beta=_flag(data.get("update_beta"), plain.update_beta),
             update_confirm=_flag(data.get("update_confirm"), plain.update_confirm),

@@ -44,7 +44,7 @@ from sashimono.core.model import (
     draws_picture,
     plays_sound,
 )
-from sashimono.ui.theme import Metrics
+from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.keyframes import KEYFRAME_SIZE, MIN_KEYFRAME_GAP
 from sashimono.ui.timeline.layout import TimelineLayout
 from sashimono.ui.timeline.painter import DETAIL_MIN_WIDTH, clip_rect_for
@@ -83,12 +83,6 @@ _BOTTOM_GAP = 2 * KEYFRAME_SIZE + 5
 #: 右クリックに出す名前 試験もこの名前で探す
 SHOW_OPACITY_TEXT = "線に不透明度を出す"
 SHOW_VOLUME_TEXT = "線に音量を出す"
-
-#: 線の色 不透明度は明るい灰、音量は緑 波形（青）やサムネイルの上でも見えるよう、
-#: 下に暗い縁を敷いてから描く
-_OPACITY_COLOR = QColor("#f0f0f4")
-_VOLUME_COLOR = QColor("#7de39c")
-_SHADOW = QColor(0, 0, 0, 150)
 
 
 class ValueKind(Enum):
@@ -362,7 +356,7 @@ class ValueLineEditor:
         if kind is None or area is None:
             return
         value = value_of(clip, kind)
-        color = _OPACITY_COLOR if kind is ValueKind.OPACITY else _VOLUME_COLOR
+        color = Colors.OPACITY_LINE if kind is ValueKind.OPACITY else Colors.VOLUME_LINE
         if value.is_animated:
             # 列ごとに値を引く 点と点の間の出方（イージング）も、再生したときの値と同じ形で見える
             line = QPolygonF(
@@ -384,13 +378,13 @@ class ValueLineEditor:
         painter.setClipRect(rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(_SHADOW, 3.5))
+        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 3.5))
         painter.drawPolyline(line)
         # 線は 2 画素で引く 1 画素半にすると、どの行にも半分ずつしか乗らず、画素の上では
         # 背景と混ざった灰色になって、サムネイルの上で見分けにくい
         painter.setPen(QPen(color, 2.0))
         painter.drawPolyline(line)
-        painter.setPen(QPen(_SHADOW, 1))
+        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 1))
         painter.setBrush(color)
         radius = _POINT_RADIUS + (0.5 if selected else 0.0)
         for _, centre in _points(clip, kind, value, layout, area):

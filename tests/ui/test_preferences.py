@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -207,6 +208,24 @@ class TestTheDialog:
     ) -> None:
         dialog._auto_quality.setChecked(False)
         assert not dialog._auto_divisor.isEnabled()
+
+    def test_the_auto_quality_names_the_height_it_really_uses(
+        self, dialog: PreferencesDialog
+    ) -> None:
+        """自動の画質の項目は、実際に見ている境目（高さ 1080 を超える素材）を書く
+
+        前は「画面より大きい素材では」と書いていたが、画面の大きさは見ていない 1080p の
+        画面で 1080p の素材を置いても下がらず、1440p の素材なら画面より小さくても下がる
+        書いた数と判定の境目が食い違えば落ちる
+        """
+        text = dialog._auto_quality.text()
+        assert "画面" not in text
+        found = re.search(r"高さが (\d+) を超える", text)
+        assert found is not None, text
+        boundary = int(found.group(1))
+        plain = Preferences()
+        assert plain.quality_for(boundary) == 1
+        assert plain.quality_for(boundary + 1) == plain.auto_quality_divisor
 
 
 class TestTheWindowFollowsThem:

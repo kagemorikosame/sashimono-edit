@@ -12,7 +12,7 @@ from dataclasses import replace
 
 import pytest
 import shiboken6
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import QContextMenuEvent, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
@@ -314,6 +314,38 @@ class TestKeyframes:
         (command,) = harness.received[0]
         assert isinstance(command, RemoveKeyframe)
         assert [k.frame for k in _opacity(view, clip).keyframes] == [10]
+
+    def test_the_right_click_menu_is_freed(
+        self,
+        made: list[TimelineArea],
+        analyzer: MediaAnalyzer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """右クリックのメニューを、閉じたあとに捨てること
+
+        捨てないと、右クリックのたびにメニューがタイムラインの子として残り続ける
+        試験の全体では 1900 を超えるメニューが溜まっていた
+        """
+        clip = _text(AnimatedValue(1.0))
+        view, _ = _open(made, analyzer, _project(Track(TrackKind.VIDEO, "V1", (clip,))))
+        built = view.build_context_menu
+
+        def quiet(position: QPoint) -> QMenu:
+            # 本物のメニューを組み、開く所だけを差し替える 開くと押す人を待って止まる
+            menu = built(position)
+            menu.exec = lambda *args, **kwargs: None  # type: ignore[method-assign,assignment]
+            return menu
+
+        monkeypatch.setattr(view, "build_context_menu", quiet)
+        before = len(view.findChildren(QMenu))
+        point = QPoint(5, view.height() - 5)
+        for _ in range(3):
+            event = QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse, point, view.mapToGlobal(point)
+            )
+            view.contextMenuEvent(event)
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        assert len(view.findChildren(QMenu)) == before
 
 
 class TestWhereTheLineIsNotGrabbed:

@@ -14,7 +14,21 @@ from sashimono.core.model.ids import MediaId, new_media_id
 from sashimono.core.model.transcript import Transcript
 from sashimono.core.timebase import FrameRate
 
-__all__ = ["AudioStreamInfo", "MediaItem", "VideoStreamInfo"]
+__all__ = [
+    "HDR_TRANSFERS",
+    "WIDE_GAMUT_PRIMARIES",
+    "AudioStreamInfo",
+    "MediaItem",
+    "VideoStreamInfo",
+]
+
+#: HDR の伝達特性（FFmpeg の名前） → 呼び名 PQ は HDR10 と Dolby Vision、HLG は放送と
+#: スマホの HDR 動画
+HDR_TRANSFERS = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
+
+#: SDR より広い色域の原色（FFmpeg の名前） → 呼び名 HDR の印が無くても、BT.2020 の原色の
+#: まま Rec.709 として出すと、色が淡く褪せる
+WIDE_GAMUT_PRIMARIES = {"bt2020": "広色域（BT.2020）"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +51,11 @@ class VideoStreamInfo:
     #: 終わりより後ろを指す 最後の絵で止める時刻（``Clip.hold_at``）をそこから決めると、
     #: 映像の最後のフレームより後ろを読みに行き、止めた後も毎フレームデコーダを動かす
     end_time: Fraction | None = None
+    #: 伝達特性の印（FFmpeg の名前 ``bt709`` ``smpte2084`` ``arib-std-b67`` など）
+    #: 印が無い・分からなければ空
+    color_transfer: str = ""
+    #: 原色の印（FFmpeg の名前 ``bt709`` ``bt2020`` など） 印が無い・分からなければ空
+    color_primaries: str = ""
 
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
@@ -45,6 +64,19 @@ class VideoStreamInfo:
             raise ValueError(f"回転角が不正: {self.rotation}")
         if self.end_time is not None and self.end_time < 0:
             raise ValueError(f"映像の終わりの時刻が負: {self.end_time}")
+
+    @property
+    def color_outside_sdr(self) -> str:
+        """SDR（Rec.709）の範囲の外の色なら、その呼び名（``HDR（PQ）`` など） 範囲の中なら空
+
+        Sashimono は HDR と広い色域を変換せずに SDR として描くので、この素材は白っぽく
+        褪せて出る（docs/development.md「色の範囲」） 見分けは印だけで行う 印の無い
+        素材の中身を推し量ると、SDR の素材まで HDR と言い当ててしまう
+        """
+        transfer = HDR_TRANSFERS.get(self.color_transfer)
+        if transfer is not None:
+            return f"HDR（{transfer}）"
+        return WIDE_GAMUT_PRIMARIES.get(self.color_primaries, "")
 
     @property
     def display_size(self) -> tuple[int, int]:
@@ -109,6 +141,17 @@ class MediaItem:
     @property
     def has_audio(self) -> bool:
         return len(self.audio_streams) > 0
+
+    @property
+    def color_outside_sdr(self) -> str:
+        """映像のどれかが SDR の範囲の外なら、その呼び名 無ければ空
+
+        映像を何本も持つ素材は、最初に見つかった物で呼ぶ どれか 1 本でも外なら、
+        その映像を置いたときに褪せて出る
+        """
+        return next(
+            (name for stream in self.video_streams if (name := stream.color_outside_sdr)), ""
+        )
 
     @property
     def is_still(self) -> bool:

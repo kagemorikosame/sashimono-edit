@@ -1,16 +1,18 @@
-name: 不具合の報告
-description: 動かない・落ちる・思った通りにならない
+# Discussions の「不具合の報告」（スラッグ bug-reports）の書き込み欄
+# ファイルの名前はカテゴリのスラッグと同じにする 違うと GitHub は欄を出さず、白紙の書き込みになる
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        報告ありがとうございます **再現する手順**が分かると直せる可能性がぐっと上がります
+        報告ありがとうございます 動かない・落ちる・思った通りにならない、はここへ書いてください
+        **再現する手順**が分かると直せる可能性がぐっと上がります 開発者が確かめて、直す作業は Issue に起こします
 
+        - タイトルには、何をしたら何が起きたかを短く書いてください（例: 4K の mp4 を置くとプレビューが黒くなる）
         - AviUtl / YMM4 の配布物（スクリプト・エイリアス・テンプレート）が読めない・違って見えるときは、
-          一つ前の画面の「AviUtl / YMM4 の配布物が読めない」の方が原因を追いやすくなります
-        - 使い方の質問は [Discussions](https://github.com/kagemorikosame/sashimono-edit/discussions) へどうぞ
-        - 脆弱性（他人のファイルで勝手に何かが動く、など）は公開の Issue に書かず、
+          [互換（AviUtl／YMM4）の報告](https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=compatibility)の方が原因を追いやすくなります
+        - 使い方の質問は [質問](https://github.com/kagemorikosame/sashimono-edit/discussions/new?category=q-a) へどうぞ
+        - 脆弱性（他人のファイルで勝手に何かが動く、など）は公開の場に書かず、
           [非公開の報告](https://github.com/kagemorikosame/sashimono-edit/security/advisories/new)から送ってください
 
   - type: input

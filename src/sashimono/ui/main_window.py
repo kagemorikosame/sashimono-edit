@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice, QPoint, Qt, QTimer, QUrl, Signal, qVersion
+from PySide6.QtCore import QBuffer, QIODevice, QPoint, QSize, Qt, QTimer, QUrl, Signal, qVersion
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -116,7 +116,7 @@ from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
-from sashimono.ui import media_match
+from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
@@ -134,7 +134,7 @@ from sashimono.ui.progress_display import (
 )
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.subtitle import SubtitlePanel
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
 from sashimono.ui.timeline.view import HEIGHT_STEP
@@ -152,7 +152,7 @@ from sashimono.ui.workspace import (
 if TYPE_CHECKING:
     from sashimono.compat.mapped import MappedObject
 
-__all__ = ["MainWindow", "about_text"]
+__all__ = ["MainWindow", "about_text", "initial_size"]
 
 #: 解析の完了を画面へ反映する間隔（ミリ秒）
 #: 解析はワーカースレッドで終わるので、その通知を待って毎回描き直すのではなく、
@@ -179,6 +179,26 @@ POOL_THUMBNAIL_SECONDS = Fraction(1)
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
+
+#: 初めて開いたときの窓の大きさ 画面がこれより狭ければ画面に合わせる（:func:`initial_size`）
+DEFAULT_SIZE = QSize(1440, 900)
+
+#: 窓の枠と題名の分（画素） 窓の大きさは中身の大きさで頼むので、画面の広さから引いておく
+#: 引かないと、1366x768 の画面で題名の帯や下の縁が画面の外へ出る
+WINDOW_FRAME = QSize(16, 40)
+
+#: 初めて開いたときの左（素材・字幕）と右（設定・AI）の列の幅 プレビューに残りを回す
+#: 中身がこれより広ければ中身に合わせて広がる（Qt が最小の幅で止める）
+DOCK_WIDTHS = (260, 360)
+
+
+def initial_size(available: QSize) -> QSize:
+    """画面の使える広さ（タスクバーを除く）に収まる、初めて開いたときの窓の大きさ
+
+    決め打ちの 1440x900 のままだと、1366x768 や 1280x720 のノート PC で窓の右と下が
+    画面の外に出て、設定パネルと状態の表示が見えなかった
+    """
+    return DEFAULT_SIZE.boundedTo(available - WINDOW_FRAME)
 
 
 def about_text() -> str:
@@ -269,7 +289,10 @@ class MainWindow(QMainWindow):
         """``confirm_unsaved`` を偽にすると、閉じるときに保存を尋ねない テスト用"""
         super().__init__()
         self.setWindowTitle("Sashimono Edit")
-        self.resize(1440, 900)
+        screen = QApplication.primaryScreen()
+        self.resize(
+            initial_size(screen.availableGeometry().size()) if screen is not None else DEFAULT_SIZE
+        )
 
         #: 本人の好みの設定 プロジェクトではなく本人に付く
         #: 最初の空のプロジェクトを作る前に読む 起動した直後のプロジェクトも、新規作成と
@@ -336,6 +359,9 @@ class MainWindow(QMainWindow):
         )
         #: 控えと解析の進み具合を出していたか 終わったことを 1 度だけ知らせるため
         self._background_shown = False
+        #: HDR の素材だと知らせたファイル 同じ素材を読み込み直すたびに窓を出さないため
+        #: 窓を閉じるまで覚える（次に起動したときに読み込めば、また 1 度だけ知らせる）
+        self._hdr_noticed: set[Path] = set()
 
         # タブの向きはパネルを重ねる前に決める Qt は重ねたときに使わないタブの並びを
         # 1 つ作って残し、それは作った時の向きのまま変わらない（ほかの部品の下に隠れて
@@ -439,10 +465,10 @@ class MainWindow(QMainWindow):
             )
             notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
             notice.setWordWrap(True)
-            notice.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+            themed_style(notice, lambda: f"color: {Colors.TEXT_MUTED.name()};")
             viewer_layout.addWidget(notice, 1)
         viewer_layout.addWidget(self._transport)
-        viewer.setStyleSheet(f"background-color: {Colors.VIEWER_BACKGROUND.name()};")
+        themed_style(viewer, lambda: f"background-color: {Colors.VIEWER_BACKGROUND.name()};")
         self.setCentralWidget(viewer)
 
         pool_dock = self._dock("メディア", "media")
@@ -458,7 +484,7 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, inspector_dock)
-        self.resizeDocks([inspector_dock], [320], Qt.Orientation.Horizontal)
+        self.resizeDocks([pool_dock, inspector_dock], list(DOCK_WIDTHS), Qt.Orientation.Horizontal)
 
         graph_dock = self._dock("グラフエディタ", "graph")
         graph_dock.setWidget(self._graph)
@@ -763,7 +789,11 @@ class MainWindow(QMainWindow):
             for name, (action, default) in self._actions.items()
         ]
         dialog = ShortcutDialog(rows, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         bindings = dialog.bindings()
         self._apply_shortcuts(bindings)
@@ -778,7 +808,11 @@ class MainWindow(QMainWindow):
         from sashimono.ui.preferences_dialog import PreferencesDialog
 
         dialog = PreferencesDialog(self._preferences, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         self._apply_preferences(dialog.preferences())
 
@@ -794,6 +828,7 @@ class MainWindow(QMainWindow):
         # 何が変わっても作り直すと、画質の設定を触っただけで進行中の変換が止まる
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
+        previous = self._preferences
         self._preferences = preferences
         try:
             PreferenceStore().save(preferences)
@@ -817,6 +852,11 @@ class MainWindow(QMainWindow):
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         apply_dock_tabs(self, preferences.dock_tabs)
+        application = QApplication.instance()
+        if isinstance(application, QApplication) and preferences.theme != previous.theme:
+            # 変えたときだけ当てる 当てるとアプリ全体のスタイルシートを作り直して全部の
+            # 部品を描き直すので、ほかの設定を触っただけで画面がちらつく
+            apply_theme(application, preferences.theme)
         self._preview.set_proxies(self._proxies.store if preferences.use_proxy else None)
         self._preview.set_prefetch_bytes(preferences.prefetch_bytes())
         self._preview.set_prefetch_thread(preferences.prefetch_thread)
@@ -1378,6 +1418,25 @@ class MainWindow(QMainWindow):
             )
         elif commands:
             self.statusBar().showMessage(f"{batch.total} 件を読み込んだ", 3000)
+        self._notice_hdr(loaded)
+
+    def _notice_hdr(self, loaded: list[MediaItem]) -> None:
+        """HDR や広い色域の素材を読み込んだら、SDR として扱うことを 1 度だけ知らせる
+
+        まとめて読み込んだ分は 1 つの窓にまとめる 1 本ずつ出すと、10 本読み込んだときに
+        10 回閉じることになる 知らせた素材は窓を閉じるまで覚え、読み込み直しでは出さない
+        設定で切ってあれば窓は出さない（素材一覧の行の印は出る）
+        """
+        found = [
+            item for item in hdr_notice.outside_sdr(loaded) if item.path not in self._hdr_noticed
+        ]
+        # 切ってある間は覚えない 覚えると、同じ窓のまま設定を入れ直して読み込み直しても、
+        # 1 度も知らせていない素材なのに知らせが出ない
+        if not found or not self._preferences.hdr_notice:
+            return
+        self._hdr_noticed.update(item.path for item in found)
+        if not hdr_notice.ask_hdr_notice(self, found):
+            self._remember_preferences(replace(self._preferences, hdr_notice=False))
 
     def add_text(self) -> None:
         """再生ヘッドの位置にテキストを置く"""
@@ -1827,7 +1886,11 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         dialog = ProjectSettingsDialog(self._new_settings(), self, new=True)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         self._playback.stop()
         previous = self._document.project
@@ -2002,7 +2065,11 @@ class MainWindow(QMainWindow):
 
         settings = self._document.project.settings
         dialog = ProjectSettingsDialog(settings, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.settings()
         commands: list[Command] = []
@@ -2036,7 +2103,11 @@ class MainWindow(QMainWindow):
         dialog = LayerModeDialog(
             target, conversion.notices, self, convertible=conversion.project is not project
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.convert is None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted or dialog.convert is None:
             return False
         commands = switch_layer_mode(
             project, target, convert=dialog.convert, sound_kinds=sound_kinds
@@ -2080,7 +2151,11 @@ class MainWindow(QMainWindow):
 
         while entries := find_orphans():
             dialog = RecoveryDialog(entries, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
+            answer = dialog.exec()
+            # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+            # この後で結果を読む間は残る
+            dialog.deleteLater()
+            if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
                 return
             action, entry = dialog.choice
             if action == "discard":
@@ -2126,14 +2201,18 @@ class MainWindow(QMainWindow):
 
     def export(self) -> None:
         self._playback.stop()
-        ExportDialog(
+        dialog = ExportDialog(
             self._document.project,
             self,
             pipeline_depth=self._preferences.export_pipeline_depth,
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
-        ).exec()
+        )
+        dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
 
     def _active_scene_name(self) -> str | None:
         """開いているシーンの名前 メインなら ``None``"""
@@ -2229,7 +2308,11 @@ class MainWindow(QMainWindow):
         from sashimono.ui.template_dialog import TemplateDialog
 
         dialog = TemplateDialog(parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
             return
 
         action, objects = dialog.choice
@@ -2353,7 +2436,11 @@ class MainWindow(QMainWindow):
         """互換性レポートを出す"""
         from sashimono.ui.compat_dialog import CompatibilityDialog
 
-        CompatibilityDialog(parent=self).exec()
+        dialog = CompatibilityDialog(parent=self)
+        dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
 
     # --- ヘルプ ---
 

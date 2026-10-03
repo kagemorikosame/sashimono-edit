@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import shutil
 import sys
 from collections.abc import Callable, Iterator
@@ -10,6 +11,8 @@ from fractions import Fraction
 from pathlib import Path
 
 import pytest
+import shiboken6
+from PySide6.QtCore import QEvent
 from PySide6.QtGui import QClipboard, QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 
@@ -79,6 +82,42 @@ def qt_application() -> Iterator[QApplication]:
 
 
 @pytest.fixture(autouse=True)
+def widgets_left_behind(qt_application: QApplication) -> Iterator[None]:
+    """試験が捨てた部品を、試験の切れ目（Qt が何も配っていない所）で壊す
+
+    閉じただけの窓や ``deleteLater`` した部品は、試験が終わっても残る
+    ``processEvents`` は ``deleteLater`` を片付けず、編集画面は参照を捨てても消えない
+    （下の後片付けの理由） 全体を通すと、test_theme に来た時点で 4 万を超える部品・
+    160 の編集画面・1900 のメニューが残り、Qt が溜めた知らせ（部品を整える頼みなど
+    2000 件近く）がその試験の最初の ``processEvents`` で一度に配られていた
+
+    配る途中で Python の受け手（設定パネルの数値欄の eventFilter・時計につないだ関数）が
+    動き、そこで閾値を越えてごみ集めが走ると、輪になって捨てられた Python 持ちの部品が
+    その場で壊れ、Qt は壊れた部品へ配り続けて access violation で落ちる（PR #236 の CI の
+    3.12 で test_theme の窓を出した所で落ちた ごみ集めの間合いで、落ちるかどうかが
+    版と走る速さで変わる） 試験の切れ目で片付けて溜めなければ、配る最中に壊れる物が無い
+    """
+    count = len(QApplication.allWidgets())
+    before = set(QApplication.topLevelWidgets())
+    yield
+    if len(QApplication.allWidgets()) <= count:
+        return
+    # 試験の中で作った窓を閉じて壊す 編集画面は自分の部品のシグナルに self を掴んだ
+    # lambda をつなぐので、参照を捨てても Python のごみ集めでは消えない（つないだ先は
+    # C++ の側にあって輪が見えない） 閉じるのは、走っている時計やスレッドを窓の作法で
+    # 畳ませてから壊すため
+    for widget in QApplication.topLevelWidgets():
+        if widget in before or not shiboken6.isValid(widget):
+            continue
+        widget.close()
+        widget.deleteLater()
+    # どちらも Qt が何も配っていないここで行う 部品を作らない試験（大半）では走らせない
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    gc.collect()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+
+@pytest.fixture(autouse=True)
 def isolated_user_folders(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -104,6 +143,25 @@ def decline_matching_video(monkeypatch: pytest.MonkeyPatch) -> None:
     from sashimono.ui import media_match
 
     monkeypatch.setattr(media_match, "ask_to_match", lambda *_args: False)
+
+
+@pytest.fixture(autouse=True)
+def silent_hdr_notice(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """HDR の素材の知らせの窓を出さず、知らせた素材の名前を記録する
+
+    窓を出すと、閉じる人がいないまま試験が止まる 知らせ方そのものを試す試験は、
+    返す記録を見るか、その試験の中で差し替え直す
+    """
+    from sashimono.ui import hdr_notice
+
+    shown: list[list[str]] = []
+
+    def record(_parent: object, media: list[MediaItem]) -> bool:
+        shown.append([item.name for item in media])
+        return True
+
+    monkeypatch.setattr(hdr_notice, "ask_hdr_notice", record)
+    return shown
 
 
 #: 本物のクリップボードへ書く口 どれも見張りで塞ぐ

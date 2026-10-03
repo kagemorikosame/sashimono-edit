@@ -86,10 +86,11 @@ from sashimono.effects import (
 from sashimono.effects.blending import BLEND_MODES
 from sashimono.effects.sources import source_registry
 from sashimono.engine.gpu import BlendMode
+from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
 from sashimono.ui.preview_handles import ALIGNMENTS
-from sashimono.ui.theme import Colors
+from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.timeline.add_menu import effects_for_clip
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
@@ -221,6 +222,11 @@ class InspectorPanel(QWidget):
         scroll.setWidget(self._body)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 横には巻物にしない 横に巻けると、パネルを狭めたときに中身が右へはみ出し、
+        # 見出しの ✕ と数値欄の単位が隠れたまま気付かれない 中身が入る幅を
+        # パネルの最小の幅にする（:meth:`_fit_width`）
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll = scroll
 
         self._add_button = QPushButton("エフェクトを追加…", self)
         self._add_button.clicked.connect(self._show_effect_menu)
@@ -318,6 +324,7 @@ class InspectorPanel(QWidget):
             self._add_button.setEnabled(False)
             self._preset_button.setEnabled(False)
             self._body_layout.addStretch(1)
+            self._fit_width()
             return
         track, clip = located
 
@@ -371,7 +378,32 @@ class InspectorPanel(QWidget):
                 )
 
         self._body_layout.addStretch(1)
+        self._fit_width()
         self._refresh_animated()
+
+    def _sections(self) -> list[_Section]:
+        """今出している組 作り直しで外した組（消えるのを待っている物）は入れない"""
+        found: list[_Section] = []
+        for index in range(self._body_layout.count()):
+            item = self._body_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, _Section):
+                found.append(widget)
+        return found
+
+    def _fit_width(self) -> None:
+        """数値欄の幅をそろえ、中身が欠けずに入る幅をパネルの最小の幅にする
+
+        最小の幅を中身から決めないと、窓を狭めたときに設定パネルが中身より狭くなり、
+        数値欄の「100.00 %」や見出しの ✕ が欠けた（1366 の画面）
+        """
+        numbers = [editor for section in self._sections() for editor in section.numbers()]
+        widest = max((editor.number_width() for editor in numbers), default=0)
+        for editor in numbers:
+            editor.set_number_width(widest)
+        bar = self._scroll.verticalScrollBar().sizeHint().width()
+        frame = 2 * self._scroll.frameWidth()
+        self._scroll.setMinimumWidth(self._body.minimumSizeHint().width() + bar + frame)
 
     def _show_identity(self, clip: Clip) -> None:
         identity = identify_clip(self._project, clip.id) if self._project is not None else None
@@ -927,6 +959,8 @@ class InspectorPanel(QWidget):
         clear.setEnabled(animated.is_animated)
 
         chosen = menu.exec(self.cursor().pos())
+        # 右クリックのたびに作るメニュー 捨てないと設定パネルの子として残り続ける
+        menu.deleteLater()
         if chosen is curve:
             self.curve_selected.emit(path)
         elif chosen is clear and clip is not None:
@@ -994,6 +1028,8 @@ class InspectorPanel(QWidget):
         if menu is None:
             return
         chosen = menu.exec(self._add_button.mapToGlobal(self._add_button.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
         if chosen is None:
             return
         self._add_chosen_effect(chosen)
@@ -1069,6 +1105,8 @@ class InspectorPanel(QWidget):
                 action.setData(preset.name)
 
         chosen = menu.exec(self._preset_button.mapToGlobal(self._preset_button.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
         if chosen is None:
             return
         if chosen is save:
@@ -1217,14 +1255,28 @@ def _heading(text: str) -> QLabel:
     """足したエフェクトの一覧の見出し（YMM4 の「映像エフェクト」「音声エフェクト」）"""
     label = QLabel(text)
     label.setObjectName("effects_heading")
-    label.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; font-weight: bold;")
+    themed_style(label, lambda: f"color: {Colors.TEXT_MUTED.name()}; font-weight: bold;")
     return label
 
 
+class _LockLabel(QLabel):
+    """鍵の印 印は文字の色で描いた絵なので、テーマが変わったら描き直す
+
+    描き直さないと、暗いテーマの白に近い鍵が明るい地の上で見えなくなる
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redraw()
+        theme_signals().changed.connect(self.redraw)
+
+    def redraw(self) -> None:
+        self.setPixmap(lock_pixmap(self.devicePixelRatioF()))
+
+
 def _lock_label() -> QLabel:
-    lock = QLabel()
+    lock = _LockLabel()
     lock.setObjectName("fixed_lock")
-    lock.setPixmap(lock_pixmap(lock.devicePixelRatioF()))
     lock.setAccessibleName("固定の項目")
     lock.setToolTip(
         "クリップが最初から持つ項目です 外すことと並べ替えはできません"
@@ -1303,9 +1355,12 @@ class _Section(QFrame):
         #: 見出しの言葉 組の並び（描画 → 中身 → 動画・音声 → エフェクト）を試験で見る
         self.heading = title
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            f"QFrame {{ background-color: {Colors.PANEL.name()};"
-            f" border: 1px solid {Colors.BORDER.name()}; border-radius: 4px; }}"
+        themed_style(
+            self,
+            lambda: (
+                f"QFrame {{ background-color: {Colors.PANEL.name()};"
+                f" border: 1px solid {Colors.BORDER.name()}; border-radius: 4px; }}"
+            ),
         )
 
         self._grid = QGridLayout(self)
@@ -1317,8 +1372,12 @@ class _Section(QFrame):
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(title)
-        label.setStyleSheet(f"color: {Colors.TEXT.name()}; font-weight: bold; border: none;")
+        # 長い名前（配布スクリプトなど）は「…」で省く そのまま出すと名前の幅が設定パネルの
+        # 最小の幅になり、窓が画面からはみ出す
+        label = ElidedLabel(title)
+        themed_style(
+            label, lambda: f"color: {Colors.TEXT.name()}; font-weight: bold; border: none;"
+        )
         header.addWidget(label)
         header.addStretch(1)
         self._header = header
@@ -1355,7 +1414,7 @@ class _Section(QFrame):
     ) -> None:
         """1 行足す ``reset`` を渡すと、名前のダブルクリックで初期値へ戻す"""
         text = _RowLabel(label, reset)
-        text.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; border: none;")
+        themed_style(text, lambda: f"color: {Colors.TEXT_MUTED.name()}; border: none;")
         text.setFixedWidth(96)
         text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
@@ -1365,10 +1424,14 @@ class _Section(QFrame):
             self._grid.addWidget(extra, self._row, 2)
         self._row += 1
 
+    def numbers(self) -> list[TrackEditor]:
+        """組の中の数値とスライダーの欄 幅をそろえるため"""
+        return self.findChildren(TrackEditor)
+
     def add_note(self, message: str) -> None:
         note = QLabel(message)
         note.setWordWrap(True)
-        note.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()}; border: none;")
+        themed_style(note, lambda: f"color: {Colors.TEXT_MUTED.name()}; border: none;")
         self._grid.addWidget(note, self._row, 0, 1, 3)
         self._row += 1
 
@@ -1505,7 +1568,7 @@ class KeyframeControls(QWidget):
         here = local in frames
         self.toggle.setText("◆" if here else "◇")
         colour = Colors.ACCENT if frames else Colors.TEXT_MUTED
-        self.toggle.setStyleSheet(_key_style(colour))
+        themed_style(self.toggle, lambda: _key_style(colour))
         self.toggle.setEnabled(inside)
         if not inside:
             tip = "再生位置がクリップの外なので打てません"
@@ -1517,7 +1580,7 @@ class KeyframeControls(QWidget):
             tip = "再生位置にキーを打つ 打つとこの値が時間で動くようになる"
         self.toggle.setToolTip(tip)
         for button in (self.previous, self.next):
-            button.setStyleSheet(_key_style(Colors.TEXT))
+            themed_style(button, lambda: _key_style(Colors.TEXT))
         self.previous.setEnabled(any(f < local for f in frames))
         self.next.setEnabled(any(f > local for f in frames))
 

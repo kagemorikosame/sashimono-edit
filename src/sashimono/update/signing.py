@@ -51,16 +51,14 @@ __all__ = [
 #
 # ここへ ``tools/update_keys.py generate`` が出した公開鍵（``sashimono-ed25519:`` で始まる行）を
 # 2 本貼る 1 本目が今使う鍵、2 本目が予備の鍵 秘密鍵（鍵のファイルの中身）は決して貼らない
-# 空のままの版は更新を確かめない（試験は試験の中で作る使い捨ての鍵を渡す）
-#
-# 例（形だけ この値は使わない）
-#     TRUSTED_PUBLIC_KEYS = (
-#         "sashimono-ed25519:AAAA…（今使う鍵）",
-#         "sashimono-ed25519:BBBB…（予備の鍵）",
-#     )
+# 空にした版は更新を確かめない（試験は試験の中で作る使い捨ての鍵を渡す）
+# 差し替えるときの手順は docs/development.md の「自動更新の署名鍵」
 
-#: 信じる公開鍵 今使う鍵と予備の鍵
-TRUSTED_PUBLIC_KEYS: tuple[str, ...] = ()
+#: 信じる公開鍵 今使う鍵と予備の鍵（2026-10-03 に利用者が手元で作った物）
+TRUSTED_PUBLIC_KEYS: tuple[str, ...] = (
+    "sashimono-ed25519:v2d5/0H/or7KRWp+RJ21dX7/bAVdcQlV0pVDBeL+OEw=",  # 今使う鍵
+    "sashimono-ed25519:YV85s19gl4PR5twXyKy24eoDY/EcrbOIlKu1iPmp+ZU=",  # 予備の鍵
+)
 
 # ------------------------------------------------------------------------------
 

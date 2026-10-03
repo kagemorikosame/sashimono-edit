@@ -481,6 +481,8 @@ def _media_to_json(item: MediaItem) -> dict[str, Any]:
                 "end_time": (
                     _fraction_to_json(stream.end_time) if stream.end_time is not None else None
                 ),
+                "color_transfer": stream.color_transfer,
+                "color_primaries": stream.color_primaries,
             }
             for stream in item.video_streams
         ],
@@ -525,6 +527,10 @@ def _media_from_json(raw: object, version: int) -> MediaItem:
                 end_time=(
                     _fraction_from_json(end_raw, "end_time") if end_raw is not None else None
                 ),
+                # 項目が無いのは、色の印を覚える前に取り込んだ素材 印が無い物として読む
+                # 描き方は印に関係なく同じなので、絵は変わらない（HDR の印が出ないだけ）
+                color_transfer=_get_str(stream_data, "color_transfer"),
+                color_primaries=_get_str(stream_data, "color_primaries"),
             )
         )
 

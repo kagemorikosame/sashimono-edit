@@ -116,9 +116,10 @@ def _start_editor(arguments: list[str]) -> int:
     from sashimono.engine.gpu import preferred_surface_format
     from sashimono.resources import ICON_FILE, path_to
     from sashimono.ui.main_window import MainWindow
-    from sashimono.ui.theme import STYLE_SHEET
+    from sashimono.ui.theme import apply_theme
     from sashimono.ui.translation import install_qt_translation
     from sashimono.ui.updates import STARTUP_DELAY_MS
+    from sashimono.ui.workspace import PreferenceStore
     from sashimono.update.swap import mark_started
 
     # サーフェス形式は QApplication を作る前に決めておく必要がある
@@ -128,7 +129,9 @@ def _start_editor(arguments: list[str]) -> int:
     application = QApplication(arguments)
     application.setApplicationName("Sashimono")
     application.setWindowIcon(QIcon(str(path_to(ICON_FILE))))
-    application.setStyleSheet(STYLE_SHEET)
+    # 窓を作る前に当てる 部品は作った時点のテーマの色で組み立てられるので、後から
+    # 当てると暗いテーマの色で一瞬描かれてから切り替わる
+    apply_theme(application, PreferenceStore().load().theme)
     # 窓を作る前に読む 後から読むと、先に作った部品の文言は英語のまま残る
     install_qt_translation(application)
 

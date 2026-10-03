@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 明るいテーマで磁石が入のときの印 形は magnet.svg と同じ 色は明るいテーマのアクセント（#4453c9）
+       極の先は暗くする 暗いテーマの白に近い先のままだと、明るい地に溶けて U の字の先が消える -->
+  <path d="M5 3 H9 V12 A3 3 0 0 0 15 12 V3 H19 V12 A7 7 0 0 1 5 12 Z" fill="#4453c9"/>
+  <rect x="5" y="3" width="4" height="4" fill="#23232b"/>
+  <rect x="15" y="3" width="4" height="4" fill="#23232b"/>
+</svg>

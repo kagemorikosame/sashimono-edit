@@ -27,6 +27,7 @@ from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION
 from sashimono.core.model import Blending, LayerMode, ProjectSettings
 from sashimono.core.timebase import FrameRate
 from sashimono.ui.project_presets import PresetStoreError, ProjectPreset, ProjectPresetStore
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = [
     "BLENDING_CHOICES",
@@ -192,7 +193,7 @@ class ProjectSettingsDialog(QDialog):
             )
 
         self._warning = QLabel(self)
-        self._warning.setStyleSheet("color: #e07a5f;")
+        themed_style(self._warning, lambda: f"color: {Colors.WARNING.name()};")
         self._warning.setWordWrap(True)
 
         form = QFormLayout()

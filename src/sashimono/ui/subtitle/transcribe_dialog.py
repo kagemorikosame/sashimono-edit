@@ -45,8 +45,13 @@ from sashimono.asr import (
 )
 from sashimono.asr.service import Job
 from sashimono.core.model import MediaItem, Transcript
-from sashimono.runtime import refresh_runtime, restart_note, snapshot_runtime_modules
-from sashimono.ui.theme import Colors
+from sashimono.runtime import (
+    PackStatus,
+    refresh_runtime,
+    restart_note,
+    snapshot_runtime_modules,
+)
+from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["TranscribeDialog"]
 
@@ -76,14 +81,26 @@ class TranscribeDialog(QDialog):
         parent: QWidget | None = None,
         *,
         stream: int | None = None,
+        status: Callable[[], PackStatus] | None = None,
     ) -> None:
-        """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）"""
+        """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）
+
+        ``status`` は起こしの環境の導入状況を返す関数 省けば今の機械を調べる
+        画面写真の道具は、導入済みの機械でも初めて使う人の画面（未導入）を撮るために
+        未導入の状態を返す関数を渡す 渡せないと、導入済みの機械ではボタンが
+        「環境を更新」になり、手順書の「環境を導入」の写真が撮れない
+        """
         super().__init__(parent)
         self.setWindowTitle(f"字幕起こし — {media.name}")
         self.resize(560, 420)
 
         self._media = media
         self._first_stream = stream
+        # 省いたときは呼ぶたびにこのモジュールの runtime_status を引く 引数の既定に
+        # 関数そのものを書くと定義した時点の物に固まり、試験が差し替えても効かない
+        self._runtime_status: Callable[[], PackStatus] = (
+            status if status is not None else lambda: runtime_status()
+        )
         self._service = service
         self._job: Job | None = None
         self.transcript: Transcript | None = None
@@ -157,7 +174,7 @@ class TranscribeDialog(QDialog):
 
         self._status = QLabel(self)
         self._status.setWordWrap(True)
-        self._status.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")
+        themed_style(self._status, lambda: f"color: {Colors.TEXT_MUTED.name()};")
 
         self._log = QPlainTextEdit(self)
         self._log.setReadOnly(True)
@@ -198,7 +215,7 @@ class TranscribeDialog(QDialog):
 
     def _refresh_availability(self) -> None:
         """導入状況を見て、押せるボタンを決める"""
-        status = runtime_status()
+        status = self._runtime_status()
         self._run_button.setEnabled(status.installed)
         self._install_button.setEnabled(True)
         # いつも触れるようにする ここが「GPU 版を入れるか」の選択を兼ねていて、切れば
@@ -217,7 +234,7 @@ class TranscribeDialog(QDialog):
 
     def _describe_install(self) -> None:
         """これから入るものを出す 何が落ちてくるのか分かってから始められるように"""
-        status = runtime_status()
+        status = self._runtime_status()
         cuda = self._gpu.isChecked()
         if status.installed:
             if cuda and status.extras and not status.extra_installed:
@@ -238,7 +255,7 @@ class TranscribeDialog(QDialog):
         )
 
     def _set_busy(self, busy: bool, *, message: str = "") -> None:
-        self._run_button.setEnabled(not busy and runtime_status().ready)
+        self._run_button.setEnabled(not busy and self._runtime_status().ready)
         self._install_button.setEnabled(not busy)
         self._model.setEnabled(not busy)
         self._language.setEnabled(not busy)
@@ -252,7 +269,7 @@ class TranscribeDialog(QDialog):
 
     def _start_install(self) -> None:
         command = install_command(
-            cuda=self._gpu.isChecked(), upgrade=runtime_status().needs_upgrade
+            cuda=self._gpu.isChecked(), upgrade=self._runtime_status().needs_upgrade
         )
         # pip が上書きする前の読み込み済みの物を、この導入の分として控える
         # 導入ごとに持つので、アシスタントの導入と重なっても控えが混ざらない
@@ -367,7 +384,7 @@ class TranscribeDialog(QDialog):
         self._set_busy(False)
         self._refresh_availability()
         if self._install_code == 0:
-            self._status.setText(restart_note(loaded, visible=runtime_status().installed))
+            self._status.setText(restart_note(loaded, visible=self._runtime_status().installed))
 
     def _drain_job(self) -> None:
         job = self._job
