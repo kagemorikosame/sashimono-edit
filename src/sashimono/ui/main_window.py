@@ -89,6 +89,7 @@ from sashimono.core.io import (
     project_presence_dir,
     save_project,
 )
+from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -138,6 +139,7 @@ from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
 from sashimono.ui.timeline.view import HEIGHT_STEP
 from sashimono.ui.transport import TransportBar
+from sashimono.ui.updates import UpdateController
 from sashimono.ui.workspace import (
     LAYOUT_VERSION,
     Preferences,
@@ -542,6 +544,17 @@ class MainWindow(QMainWindow):
             cancel.clicked.connect(self.cancel_import)
         self.statusBar().addPermanentWidget(self._background_indicator)
         self.statusBar().addPermanentWidget(self._import_indicator)
+        # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
+        # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
+        self._updates = UpdateController(
+            self,
+            preferences=lambda: self._preferences,
+            blockers=self.update_blockers,
+            arguments=self._reopen_arguments,
+            confirm_close=self._confirm_discard,
+            close_window=self._close_for_update,
+        )
+        self.statusBar().addPermanentWidget(self._updates.button)
 
     def _dock(self, title: str, name: str) -> QDockWidget:
         """パネルを 1 つ作る
@@ -740,6 +753,9 @@ class MainWindow(QMainWindow):
         self._add(help_menu, "使い方", QKeySequence("F1"), self.open_manual)
         self._add(help_menu, "不具合・要望を送る", QKeySequence(), self.open_report_page)
         help_menu.addSeparator()
+        self._add(help_menu, "更新を確かめる…", QKeySequence(), self._updates.check_now)
+        self._add(help_menu, "前の版に戻す…", QKeySequence(), self._updates.roll_back)
+        help_menu.addSeparator()
         self._add(help_menu, "バージョン情報…", QKeySequence(), self.show_about)
 
         self._update_history_actions()
@@ -820,6 +836,9 @@ class MainWindow(QMainWindow):
             PreferenceStore().save(preferences)
         except OSError as exc:
             self.statusBar().showMessage(f"設定を保存できなかった: {exc}", 5000)
+        # 更新の 3 つの設定のどれを、どちらの向きに切り替えても、待っている版と次の起動の
+        # 予約を今の好みにそろえる 決まりは起動の頭と同じ（update.flow.reconcile）
+        self._updates.apply_preferences(preferences)
 
         if resized or stopped:
             self._proxies.close()
@@ -1960,6 +1979,9 @@ class MainWindow(QMainWindow):
         project = self._document.project
         note = ""
         try:
+            # 古い形式のファイルを今の形式で上書きする前に、横へ写しを残す 自動更新の後で
+            # 前の版へ戻した人が、上げる前の作品を開けるように（前の版は新しい形式を読めない）
+            keep_pre_upgrade_copy(self._path)
             backup_before_save(self._path)
         except OSError as exc:
             # 控えが取れなくても保存は止めない 止めると、控えのために
@@ -2440,6 +2462,38 @@ class MainWindow(QMainWindow):
         # 起きないように見えるので、打ち込めるように URL を出しておく
         if not QDesktopServices.openUrl(QUrl(url)):
             self.statusBar().showMessage(f"ブラウザを開けませんでした: {url}", 10000)
+
+    # --- 自動更新（ui/updates.py） ---
+
+    @property
+    def updates(self) -> UpdateController:
+        return self._updates
+
+    def start_updates(self) -> None:
+        """前の入れ替えの結果を知らせ、頃合いなら裏で新しい版を確かめる 起動の後に 1 度呼ぶ"""
+        self._updates.start()
+
+    def update_blockers(self) -> list[str]:
+        """更新のために再起動してはいけない作業 書き出しは窓を占めるので、ここまで来ない"""
+        found = []
+        if self._chat.working:
+            found.append("AI アシスタントが作業しています（環境の導入を含む）")
+        if self._subtitles.transcribing:
+            found.append("字幕を起こしています")
+        return found
+
+    def _close_for_update(self) -> bool:
+        """更新のために閉じる 保存の確認は入れ替え係を起こす前に済ませてあるので尋ねない
+
+        もう一度尋ねると、〔保存しない〕を選んだ人にまた同じことを聞き、そこで取り消されると
+        入れ替え係だけが残る
+        """
+        self._confirm_unsaved = False
+        return self.close()
+
+    def _reopen_arguments(self) -> list[str]:
+        """更新の後に起こし直すとき、開いていたプロジェクトを開き直す"""
+        return [str(self._path)] if self._path is not None else []
 
     def show_about(self) -> None:
         """版と置き場を出す 不具合の報告で最初に聞くことを 1 か所で見られるようにする"""

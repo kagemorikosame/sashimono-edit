@@ -665,6 +665,11 @@ class SubtitlePanel(QWidget):
             return f"{media.name} の起こしを順番待ちに入れました 前の起こしが終わると始まります"
         return f"{media.name} の起こしを始めました"
 
+    @property
+    def transcribing(self) -> bool:
+        """起こしが走っているか・順番を待っているか 更新のための再起動を断るのに使う"""
+        return bool(self._jobs) or (self._service is not None and self._service.busy)
+
     def transcription_status(self) -> str:
         """走っている起こしの様子"""
         return self.poll_transcription()

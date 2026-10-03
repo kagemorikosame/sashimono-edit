@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,7 @@ from packaging.version import InvalidVersion, Version
 from sashimono.core import userdirs
 
 __all__ = [
+    "ABI_MARKER",
     "FeaturePack",
     "PackStatus",
     "PackageStatus",
@@ -39,16 +43,27 @@ __all__ = [
     "install_runtime",
     "is_frozen",
     "pip_arguments",
+    "python_abi",
     "refresh_runtime",
     "remove_stale_metadata",
     "restart_note",
     "run_pip",
+    "runtime_abi",
     "runtime_target_dir",
     "snapshot_runtime_modules",
+    "stale_runtime",
 ]
 
 #: 導入したものを置くフォルダの名前（パッケージ版のみ）
 _RUNTIME_DIR = "runtime"
+
+#: 導入したときの Python の ABI を書いておくファイル（導入先の中）
+#: 本体の更新で Python が上がると（3.14 → 3.15）、導入先の拡張モジュール（CTranslate2 など）は
+#: 読めなくなる 何向けに入れたかを覚えておかないと、import して落ちるまで分からない
+ABI_MARKER = ".python-abi"
+
+#: 拡張モジュールの名前に入る ABI の印（``_ext.cp314-win_amd64.pyd`` の ``cp314``）
+_ABI_TAG = re.compile(r"\.(cp3\d+)-")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +124,7 @@ class FeaturePack:
             packages=tuple(_package_status(n) for n in self.required),
             extras=tuple(_package_status(n) for n in self.extra),
             missing_commands=tuple(c for c in self.commands if self.locate(c) is None),
+            stale_abi=stale_runtime(self.key),
         )
 
     def requirements(self, *, extra: bool) -> tuple[str, ...]:
@@ -124,6 +140,10 @@ class PackStatus:
     extras: tuple[PackageStatus, ...] = ()
     #: PATH に見つからなかった外部コマンド
     missing_commands: tuple[str, ...] = field(default_factory=tuple)
+    #: 導入先が別の Python 向けに入っているときの、その ABI（``cp314``）
+    #: 本体の更新で Python が上がった後に立つ 立っている間は導入先を読まない
+    #: （:func:`activate_runtime`）
+    stale_abi: str | None = None
 
     @property
     def installed(self) -> bool:
@@ -136,17 +156,23 @@ class PackStatus:
 
     @property
     def ready(self) -> bool:
-        """実際に動かせるか 外部コマンドも含めて見る"""
-        return self.installed and not self.missing_commands
+        """実際に動かせるか 外部コマンドも含めて見る
+
+        別の Python 向けに入った物も動かせない 片方の機能だけを入れ直すと導入先は読まれる
+        ようになり、もう片方も名前の上では「入っている」に見えるが、古い拡張モジュールの
+        import で落ちる
+        """
+        return self.installed and not self.missing_commands and self.stale_abi is None
 
     @property
     def needs_upgrade(self) -> bool:
         """古い版を入れ替える必要があるか
 
         pip は ``--target`` に同じ名前が在ると、``--upgrade`` 無しでは入れ替えない
-        （配布版の導入先） 付けないと、入れ直しても古い版のまま残る
+        （配布版の導入先） 付けないと、入れ直しても古い版のまま残る 別の Python 向けに
+        入っている物も同じで、付けないと名前が在るだけで飛ばされ、読めない拡張モジュールが残る
         """
-        return any(p.outdated for p in self.packages + self.extras)
+        return self.stale_abi is not None or any(p.outdated for p in self.packages + self.extras)
 
     def missing(self, *, extra: bool) -> tuple[str, ...]:
         """まだ入っていないものの pip 指定"""
@@ -163,6 +189,12 @@ class PackStatus:
 
     def summary(self) -> str:
         """画面に 1 行で出す説明"""
+        if self.stale_abi is not None:
+            # 「未導入」と出すと、2 GB が消えたように見える 消してはいない 入れ直す理由を言う
+            return (
+                f"入っている環境は前の Python（{self.stale_abi}）向けで、この版では読み込めません"
+                " ここから入れ直してください"
+            )
         if any(p.outdated for p in self.packages):
             old = "、".join(f"{_name_of(p.name)} {p.version}" for p in self.packages if p.outdated)
             return f"古い版が入っています（{old}） ここから入れ直せます"
@@ -263,6 +295,11 @@ def activate_runtime() -> Path | None:
     target = runtime_target_dir()
     if target is None or not target.exists():
         return None
+    if stale_runtime() is not None:
+        # 別の Python 向けに入れた物は読まない 道へ足すと、import した所で拡張モジュールが
+        # 読めずに落ちる（字幕起こしを始めた瞬間・AI に送った瞬間） 消しもしない 2 GB を
+        # 黙って捨てて落とし直させないため 入れ直しの案内は導入の欄が出す（PackStatus.summary）
+        return None
     path = str(target)
     if path not in sys.path:
         # 先頭へ入れる 同名の古いものが同梱されていた場合に、あとから入れた方を
@@ -270,6 +307,100 @@ def activate_runtime() -> Path | None:
         sys.path.insert(0, path)
     read_path_files(path)
     return target
+
+
+def python_abi() -> str:
+    """動いている Python の ABI の印（``cp314``） 更新の目録の ``python_abi`` と同じ書き方
+
+    版の上 2 つだけで決まる 3.14.1 と 3.14.6 は同じ拡張モジュールを読める
+    """
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+#: 印を書くようになる前に入れた物（どの機能の物か分からない）をまとめて表す名前
+_EVERY_PACK = "*"
+
+
+def _read_marks(target: Path) -> dict[str, str]:
+    """導入先の印 機能（:attr:`FeaturePack.key`）→ ABI 読めなければ空"""
+    try:
+        data = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, str) and v}
+
+
+def _write_marks(target: Path, marks: Mapping[str, str]) -> None:
+    # 書けなくても、名前の印から読み直せる
+    with contextlib.suppress(OSError):
+        (target / ABI_MARKER).write_text(json.dumps(dict(sorted(marks.items()))), encoding="utf-8")
+
+
+def _scan_abi(target: Path) -> str | None:
+    """拡張モジュールの名前の印を数え、いちばん多い物 CTranslate2 も pydantic-core も
+    名前に ``cp314`` を持つ 無ければ分からない（``None``）
+    """
+    counts: dict[str, int] = {}
+    try:
+        # 包みの直下までで足りる 深く辿ると、数千のファイルを起動のたびに見ることになる
+        candidates = [*target.glob("*.pyd"), *target.glob("*/*.pyd")]
+    except OSError:
+        return None
+    for path in candidates:
+        found = _ABI_TAG.search(path.name)
+        if found is not None:
+            counts[found.group(1)] = counts.get(found.group(1), 0) + 1
+    if not counts:
+        return None
+    return max(sorted(counts), key=lambda tag: counts[tag])
+
+
+def runtime_abi(target: Path, key: str | None = None) -> str | None:
+    """導入先（``key`` を渡せばその機能）が何の Python 向けか 分からなければ ``None``
+
+    導入先は字幕起こしと AI 連携で 1 つを分け合う 機能ごとに印を持つのは、片方だけを
+    入れ直した後に、もう片方の古い拡張モジュールを「合っている」と見ないため
+
+    印を書くようになる前に入れた導入先は、名前の印を数えて決め、全部の機能の物として
+    書き残す 書き残さないと、片方を入れ直した後は新旧の拡張モジュールが混ざり、数えても
+    もう片方が古いことが分からない 分からない物を「別の Python 向け」と決めると、
+    動いている導入先を読まなくなるので ``None`` にする
+    """
+    marks = _read_marks(target)
+    if not marks:
+        scanned = _scan_abi(target)
+        if scanned is None:
+            return None
+        marks = {_EVERY_PACK: scanned}
+        _write_marks(target, marks)
+    if key is not None:
+        return marks.get(key, marks.get(_EVERY_PACK))
+    # 導入先そのものは、今の Python 向けの機能が 1 つでもあれば読める
+    current = python_abi()
+    return current if current in marks.values() else min(marks.values())
+
+
+def stale_runtime(key: str | None = None) -> str | None:
+    """導入先（``key`` を渡せばその機能）が今の Python と違う向けなら、その ABI
+
+    合っている・入っていない・分からないなら ``None``
+    """
+    target = runtime_target_dir()
+    if target is None or not target.is_dir():
+        return None
+    found = runtime_abi(target, key)
+    if found is None or found == python_abi():
+        return None
+    return found
+
+
+def _mark_installed(target: Path, key: str) -> None:
+    """入れ終えた機能に今の Python の印を付ける"""
+    marks = _read_marks(target)
+    marks[key] = python_abi()
+    _write_marks(target, marks)
 
 
 def read_path_files(place: str) -> None:
@@ -541,6 +672,9 @@ def install_runtime(
     target = runtime_target_dir()
     if target is not None:
         target.mkdir(parents=True, exist_ok=True)
+        # 入れる前の中身の印を書き残す（印が無い導入先だけ） 入れた後に数えると、
+        # 今入れた物の印と、入れ直していない機能の古い印が混ざって決められない
+        runtime_abi(target)
 
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     # 子プロセスの出力を UTF-8 に揃える Windows の既定は cp932 で、素材やユーザー名に
@@ -592,7 +726,12 @@ def install_runtime(
     finished.set()
     if cancelled.is_set() and on_output is not None:
         on_output("中断した")
-    return process.returncode if process.returncode is not None else 1
+    code = process.returncode if process.returncode is not None else 1
+    if code == 0 and target is not None and pack is not None:
+        # 入れ終えたときにだけ書く 途中で止めた導入先に今の印を書くと、前の Python 向けの
+        # 拡張モジュールが残ったまま「合っている」として読まれる
+        _mark_installed(target, pack.key)
+    return code
 
 
 #: 導入の中断の頼みを見る間隔（秒） 長いと、閉じるボタンを押してから止まるまでが延びる

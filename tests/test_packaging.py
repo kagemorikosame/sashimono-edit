@@ -1125,3 +1125,60 @@ class TestTheAssistantSaysWhatIsMissing:
 
         text = _explain(ModuleNotFoundError("No module named 'anyio'", name="anyio"))
         assert "anyio" in text and REINSTALL_HINT in text
+
+
+class TestTheUpdateParts:
+    """自動更新の部品が配布版の中で動くかを、zip からの確かめが見る（ネットワークへは出ない）"""
+
+    def test_the_build_info_goes_into_the_zip(self, builder: ModuleType, tmp_path: Path) -> None:
+        """書き付けが無いと、配った版がこの zip を新しい版として受け取れない"""
+        from sashimono import __version__
+        from sashimono.runtime import python_abi
+        from sashimono.update.package import read_build_info
+
+        bundle = tmp_path / "Sashimono"
+        bundle.mkdir()
+        builder.assemble(bundle)
+        info = read_build_info(bundle)
+        assert info is not None
+        assert (info.version, info.python_abi) == (__version__, python_abi())
+        # 使用許諾の照合には混ぜない（写しではない）
+        assert builder.BUILD_INFO_NAME not in builder.notice_digests(bundle)
+
+    def test_the_build_info_is_not_a_stray_file(self, builder: ModuleType, tmp_path: Path) -> None:
+        bundle = tmp_path / "Sashimono"
+        bundle.mkdir()
+        (bundle / "Sashimono.exe").write_bytes(b"MZ")
+        builder.assemble(bundle)
+        record = tmp_path / "record"
+        record.mkdir()
+        entries = [("Sashimono.exe", r"C:\work\Sashimono.exe", "EXECUTABLE")]
+        (record / "COLLECT-00.toc").write_text(repr((entries,)), encoding="utf-8")
+        assert builder.untracked_files(bundle, record) == []
+
+    def test_the_exe_name_matches(self, builder: ModuleType) -> None:
+        """入れ替え係が起こす名前と、組み立てる名前が食い違うと、入れた版を起こせない"""
+        from sashimono.update.package import APP_EXE
+
+        assert f"{builder.APP_NAME}.exe" == APP_EXE
+
+    def test_a_failing_update_item_fails_the_zip(self, builder: ModuleType, tmp_path: Path) -> None:
+        """自己診断の「自動更新」が通らない zip・書き付けの無い zip は配らない"""
+        home = tmp_path / "Sashimono"
+        home.mkdir()
+        builder.assemble(home)
+        passed = f"[ok] {builder.UPDATE_CHECK_NAME}: 確かめた"
+        assert builder.update_failures(home, passed) == []
+        assert builder.update_failures(home, f"[NG] {builder.UPDATE_CHECK_NAME}: 落ちた")
+        (home / builder.BUILD_INFO_NAME).unlink()
+        assert builder.update_failures(home, passed)
+
+    def test_the_self_check_rehearses_an_update(self) -> None:
+        """使い捨ての鍵と見本のリリースで、署名・照合・展開・入れ替えまでを通す"""
+        from sashimono.selfcheck import _update
+
+        detail = _update()
+        assert "署名・照合・展開" in detail
+        assert "公開鍵" in detail
+        if sys.platform == "win32":
+            assert "入れ替え（PowerShell）" in detail

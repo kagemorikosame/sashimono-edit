@@ -265,11 +265,12 @@ def _fake_installer(write: Callable[[], object], code: int = 0) -> Callable[...,
 
     def install(
         *,
+        pack: object = None,
         command: Sequence[str],
         on_output: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> int:
-        del command, should_cancel
+        del pack, command, should_cancel
         if on_output is not None:
             on_output("Successfully installed")
         if code == 0:
@@ -288,11 +289,12 @@ def _slow_cancelled_installer() -> Callable[..., int]:
 
     def install(
         *,
+        pack: object = None,
         command: Sequence[str],
         on_output: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> int:
-        del command, on_output
+        del pack, command, on_output
         assert should_cancel is not None
         for _ in range(500):
             if should_cancel():
