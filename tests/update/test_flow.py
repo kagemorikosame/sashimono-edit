@@ -53,6 +53,21 @@ class TestApplyingOnStart:
         # 印は入れ替え係を起こす前に下ろす 失敗し続ける機械で、起動のたびに試さない
         assert not store.load().apply_on_start
 
+    def test_turning_checks_off_cancels_the_reservation(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """予約の後に〔起動したときに新しい版を確かめる〕を切った人は、今の版に留まりたい
+        設定を読む前に入れ替えると、切ったのに次の起動で黙って入れ替わる
+        """
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
+        assert not apply_on_start(
+            ["x"], layout=layout, store=store, swap=_never, current="1.1.0", allowed=lambda: False
+        )
+        assert not store.load().apply_on_start
+        # 落としてある版は残す 手で確かめれば入れられる
+        assert layout.staged_version() == "1.2.0"
+
     def test_nothing_happens_without_the_mark(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
@@ -100,6 +115,30 @@ class TestSettling:
         state = store.load()
         assert state.skipped == ("1.2.0",)
         assert state.ready_version == ""
+
+    def test_a_failed_restore_says_where_it_runs(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """戻しまで失敗したら、前の版を隣のフォルダから起こしたことを言う（名前を戻す案内）"""
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0"))
+        notice = settle(
+            layout=layout,
+            store=store,
+            current="1.1.0",
+            results=["started", "staged-locked", "restore-failed", "started-from-aside"],
+        )
+        assert notice is not None and ".previous" in notice
+
+    def test_an_unfinished_rollback_still_skips_the_version(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        store.save(UpdateState(ready_version="1.2.0"))
+        notice = settle(
+            layout=layout, store=store, current="1.1.0", results=["swapped", "rollback-failed"]
+        )
+        assert notice is not None and "戻し切れなかった" in notice
+        assert "1.2.0" in store.load().skipped
 
     def test_a_failed_swap_is_told(self, layout: Layout, store: UpdateStateStore) -> None:
         _stage(layout, "1.2.0")

@@ -156,8 +156,13 @@ class PackStatus:
 
     @property
     def ready(self) -> bool:
-        """実際に動かせるか 外部コマンドも含めて見る"""
-        return self.installed and not self.missing_commands
+        """実際に動かせるか 外部コマンドも含めて見る
+
+        別の Python 向けに入った物も動かせない 片方の機能だけを入れ直すと導入先は読まれる
+        ようになり、もう片方も名前の上では「入っている」に見えるが、古い拡張モジュールの
+        import で落ちる
+        """
+        return self.installed and not self.missing_commands and self.stale_abi is None
 
     @property
     def needs_upgrade(self) -> bool:

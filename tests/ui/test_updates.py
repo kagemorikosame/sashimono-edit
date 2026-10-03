@@ -364,6 +364,28 @@ class TestTheEditor:
         yield created
         created.close()
 
+    def test_turning_checks_off_cancels_the_reservation(self, window: MainWindow) -> None:
+        """切った時点で〔次の起動で入れる〕の予約も外す 切ったのに次の起動で入れ替わらない"""
+        store = UpdateStateStore()
+        store.save(UpdateState(ready_version=NEWER, apply_on_start=True))
+        window._apply_preferences(Preferences(update_check=False))
+        assert not store.load().apply_on_start
+        assert store.load().ready_version == NEWER
+
+    def test_the_start_reads_the_same_setting(self) -> None:
+        """起動の頭（Qt を読む前）は設定のファイルを直に読む 名前や読み方が食い違うと、
+        切ったのに入れ替わる
+        """
+        from sashimono.update.flow import PREFERENCES_FILE, updates_allowed
+
+        store = PreferenceStore()
+        assert store.path.name == PREFERENCES_FILE
+        assert updates_allowed()
+        store.save(Preferences(update_check=False))
+        assert not updates_allowed()
+        store.save(Preferences(update_check=True))
+        assert updates_allowed()
+
     def test_the_help_menu_has_both(self, window: MainWindow) -> None:
         assert "ヘルプ/更新を確かめる…" in window._actions
         assert "ヘルプ/前の版に戻す…" in window._actions

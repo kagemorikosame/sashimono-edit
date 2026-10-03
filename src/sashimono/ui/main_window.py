@@ -836,6 +836,9 @@ class MainWindow(QMainWindow):
             PreferenceStore().save(preferences)
         except OSError as exc:
             self.statusBar().showMessage(f"設定を保存できなかった: {exc}", 5000)
+        if not preferences.update_check:
+            # 今の版に留まりたい合図 前に予約した〔次の起動で入れる〕も外す
+            self._updates.cancel_reservation()
 
         if resized or stopped:
             self._proxies.close()

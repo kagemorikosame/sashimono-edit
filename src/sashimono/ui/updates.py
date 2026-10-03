@@ -143,6 +143,17 @@ class UpdateController(QObject):
             return state.ready_version
         return None
 
+    def cancel_reservation(self) -> None:
+        """〔次の起動で入れる〕の予約を外す 本人が起動時に確かめるのを切ったときに呼ぶ
+
+        切るのは「今の版に留まりたい」という合図 予約を残すと、次の起動で黙って入れ替わる
+        落としてある版はそのまま残す（〔更新を確かめる…〕から手で入れられる）
+        """
+        state = self._store.load()
+        if state.apply_on_start:
+            with contextlib.suppress(OSError):
+                self._store.save(replace(state, apply_on_start=False))
+
     def can_roll_back(self) -> bool:
         return self._layout is not None and self._layout.has_previous()
 

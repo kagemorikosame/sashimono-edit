@@ -7,16 +7,25 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 from pathlib import Path
 
 import pytest
+from PySide6.QtWidgets import QApplication
 
 from sashimono import runtime as runtime_module
 from sashimono.ai.environment import AI_PACK
 from sashimono.asr.environment import ASR_PACK
-from sashimono.runtime import ABI_MARKER, install_runtime, python_abi, runtime_abi, stale_runtime
+from sashimono.runtime import (
+    ABI_MARKER,
+    FeaturePack,
+    install_runtime,
+    python_abi,
+    runtime_abi,
+    stale_runtime,
+)
 
 OLD = "cp313"
 
@@ -94,6 +103,51 @@ class TestWhatHappens:
         assert stale_runtime(AI_PACK.key) == OLD
         # 読める機能が 1 つでもあれば導入先は読む
         assert runtime_module.activate_runtime() == target
+
+
+class TestOnlyOnePackReinstalled:
+    """片方だけを入れ直すと導入先は読まれ、もう片方も名前の上では「入っている」に見える
+
+    そのまま動かせることにすると、古い拡張モジュールの import で落ちる
+    """
+
+    PACK = FeaturePack(key="ai", label="見本の機能", required=("sashimono-abi-probe",))
+
+    @pytest.fixture
+    def half(self, target: Path) -> Path:
+        info = target / "sashimono_abi_probe-1.0.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: sashimono-abi-probe\nVersion: 1.0\n", encoding="utf-8"
+        )
+        _extension(target, "pydantic_core", OLD)
+        runtime_abi(target)
+        runtime_module._mark_installed(target, ASR_PACK.key)
+        assert runtime_module.activate_runtime() == target
+        importlib.invalidate_caches()
+        return target
+
+    def test_the_other_pack_is_not_ready(self, half: Path) -> None:
+        status = self.PACK.status()
+        assert status.installed
+        assert status.stale_abi == OLD
+        assert not status.ready
+
+    def test_the_setup_asks_for_a_reinstall(self, half: Path, qt_application: QApplication) -> None:
+        """導入の欄が「入れ直して」と出し、動かせない（AI の送信・起こしを止める）と伝える"""
+        del qt_application
+        from sashimono.ui.setup import SetupSection
+
+        section = SetupSection(self.PACK)
+        seen: list[bool] = []
+        section.changed.connect(seen.append)
+        try:
+            section.refresh()
+            assert "入れ直して" in section._status.text()
+            assert seen == [False]
+            assert "--upgrade" in section.command_text()
+        finally:
+            section.deleteLater()
 
 
 class TestInstalling:

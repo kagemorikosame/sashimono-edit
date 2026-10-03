@@ -151,6 +151,36 @@ class TestApplying:
         assert _wait_for(layout.install.parent / "old-started.txt")
 
 
+class TestWhenEvenTheRestoreFails:
+    def test_the_previous_version_is_started_where_it_is(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """新しい版へ改名できず、元の名前へ戻すのも断られた（ウイルス対策・一時的な錠）
+
+        戻しの結果を見ずに元の場所を起こすと、そこは空で何も出ない 前の版は
+        ``.previous`` に在るので、そこから直に起こす
+        """
+        _folder(layout.staged, HEALTHY)
+        held = (layout.staged / APP).open("rb")  # 新しい版のフォルダを改名させない
+        blocker = layout.install
+        try:
+            launched = launch(_plan(layout), tmp_path / "update")
+            assert wait_started(launched)
+            # 今の版が previous へよけられたら、元の名前の所をふさいで戻しも断らせる
+            assert _wait_for(layout.previous / APP, 30)
+            blocker.write_text("ふさぐ", encoding="utf-8")
+            launched.process.wait(timeout=120)
+        finally:
+            held.close()
+        lines = take_result(tmp_path / "update")
+        assert "restore-failed" in lines and "started-from-aside" in lines, lines
+        assert "relaunch-failed" not in lines
+        assert _wait_for(layout.install.parent / "old-started.txt")
+        # 前の版も新しい版も消えていない
+        assert (layout.previous / "version.txt").read_text(encoding="ascii") == "old"
+        assert (layout.staged / APP).exists()
+
+
 class TestRollingBack:
     def test_the_previous_version_comes_back(self, layout: Layout, tmp_path: Path) -> None:
         """メニューから戻す 戻した版は previous へ入れ替わり、もう一度戻せる"""

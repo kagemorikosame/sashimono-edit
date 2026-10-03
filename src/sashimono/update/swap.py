@@ -119,15 +119,15 @@ function Remove-Folder([string]$path) {
     return -not (Test-Path -LiteralPath $path)
 }
 
-function Start-App {
-    $exe = Join-Path $install $exeName
+function Start-App([string]$folder = $install) {
+    $exe = Join-Path $folder $exeName
     $list = @()
     if ($argsText) {
         foreach ($item in ($argsText -split [char]10)) {
             if ($item) { $list += ([char]34 + $item + [char]34) }
         }
     }
-    $params = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $install }
+    $params = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $folder }
     if ($list.Count -gt 0) { $params.ArgumentList = $list }
     if ($hidden) { $params.WindowStyle = 'Hidden' }
     return Start-Process @params
@@ -156,11 +156,19 @@ function Test-Started {
     return $false
 }
 
-function Start-Old {
+# 前の版を起こし直す 渡した順に、本体の exe が在るフォルダを探して起こす
+# 改名の戻しまで失敗すると今の版の場所が空になる 空の場所を起こして何も出ないままにしない
+function Start-Old([string[]]$folders = @($install, $previous)) {
     Remove-Item Env:SASHIMONO_UPDATE_HEALTH_FILE -ErrorAction SilentlyContinue
-    if ($relaunch) {
-        try { Start-App | Out-Null } catch { Write-Result 'relaunch-failed' }
+    if (-not $relaunch) { return }
+    foreach ($folder in $folders) {
+        if ($folder -and (Test-Path -LiteralPath (Join-Path $folder $exeName))) {
+            if ($folder -ne $install) { Write-Result 'started-from-aside' }
+            try { Start-App $folder | Out-Null } catch { Write-Result 'relaunch-failed' }
+            return
+        }
     }
+    Write-Result 'relaunch-failed'
 }
 
 try {
@@ -182,8 +190,12 @@ try {
             exit 4
         }
         if (-not (Move-Folder $staged $install)) {
-            Move-Folder $previous $install | Out-Null
             Write-Result 'staged-locked'
+            if (-not (Move-Folder $previous $install)) {
+                # 戻しも断られた（ウイルス対策・一時的な錠） 今の版は previous に在るので、
+                # そこから直に起こす 次の起動は previous の名前のままでも動く
+                Write-Result 'restore-failed'
+            }
             Start-Old
             exit 5
         }
@@ -194,10 +206,13 @@ try {
         Remove-Folder $failed | Out-Null
         if ((Move-Folder $install $failed) -and (Move-Folder $previous $install)) {
             Write-Result 'rolled-back'
+            Start-Old
         } else {
+            # 戻し切れない 今の場所には起動できない新しい版が残っているか、空になっている
+            # 前の版は previous に在るので、そこから直に起こす
             Write-Result 'rollback-failed'
+            Start-Old @($previous)
         }
-        Start-Old
         exit 6
     }
     if ($mode -eq 'rollback') {
@@ -212,9 +227,10 @@ try {
             exit 4
         }
         if (-not (Move-Folder $previous $install)) {
-            Move-Folder $staged $install | Out-Null
             Write-Result 'previous-missing'
-            Start-Old
+            if (-not (Move-Folder $staged $install)) { Write-Result 'restore-failed' }
+            # 戻せなければ、よけておいた今の版から直に起こす
+            Start-Old @($install, $staged, $previous)
             exit 5
         }
         if (-not (Move-Folder $staged $previous)) { Write-Result 'aside-kept' }

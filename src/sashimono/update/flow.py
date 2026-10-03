@@ -11,27 +11,45 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 from sashimono import __version__
+from sashimono.core import userdirs
 from sashimono.update.fetch import Transport
 from sashimono.update.manifest import Manifest, is_newer
 from sashimono.update.package import Layout, carry_user_files, current_layout, stage
 from sashimono.update.state import UpdateState, UpdateStateStore, update_dir
 from sashimono.update.swap import SwapPlan, launch, take_result, wait_started
 
-__all__ = ["apply_on_start", "prepare", "settle", "start_swap"]
+__all__ = [
+    "PREFERENCES_FILE",
+    "apply_on_start",
+    "prepare",
+    "settle",
+    "start_swap",
+    "updates_allowed",
+]
 
 #: 入れ替え係が書く結果のうち、入れられなかったことを表すもの → 本人に言う理由
+#: 重い物から並べる 1 回の入れ替えで幾つも書かれたら、先に見つかった物を言う
+#: （戻しまで失敗した回は「新しい版を動かせなかった」より、今どこから動いているかが要る）
 _FAILURES = {
+    "restore-failed": (
+        "新しい版へ入れ替えられず、元の名前へも戻せなかったので、前の版を隣のフォルダ"
+        "（.previous か .rolling）から起こした 閉じてからフォルダの名前を元に戻してください"
+    ),
+    "rollback-failed": (
+        "新しい版が起動できず、元の名前へ戻し切れなかったので、前の版を隣のフォルダ"
+        "（.previous）から起こした 閉じてからフォルダの名前を元に戻してください"
+    ),
     "busy": "ほかの Sashimono の窓が開いていた",
     "previous-locked": "前の版のフォルダを片付けられなかった",
     "install-locked": "今の版のフォルダを動かせなかった（ほかのプログラムが開いている）",
     "staged-locked": "新しい版のフォルダを動かせなかった",
-    "rollback-failed": "新しい版が起動できず、前の版へも戻し切れなかった",
 }
 
 
@@ -44,6 +62,24 @@ def start_swap(plan: SwapPlan) -> bool:
     return wait_started(launched)
 
 
+#: 本人の好みの設定のファイルの名前（``ui.workspace.PreferenceStore`` と同じ 試験が照らす）
+PREFERENCES_FILE = "preferences.json"
+
+
+def updates_allowed() -> bool:
+    """本人が〔起動したときに新しい版を確かめる〕を切っていないか
+
+    起動の頭は Qt を読む前なので、``ui.workspace`` の読み手（Qt を読む）は使えない
+    設定のファイルのこの 1 項目だけを直に読む 読めない・無いなら既定（入）
+    """
+    try:
+        data = json.loads((userdirs.config_root() / PREFERENCES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    value = data.get("update_check") if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else True
+
+
 def apply_on_start(
     arguments: Sequence[str],
     *,
@@ -51,15 +87,20 @@ def apply_on_start(
     store: UpdateStateStore | None = None,
     swap: Callable[[SwapPlan], bool] = start_swap,
     current: str = __version__,
+    allowed: Callable[[], bool] | None = None,
 ) -> bool:
     """次の起動で入れると決めた版があれば、入れ替え係を起こす 起こしたら真（すぐ終わる）
 
     編集画面を出す前に呼ぶ 出してからだと、開いたプロジェクトを閉じさせることになる
     印は入れ替え係を起こす前に下ろす 入れ替えが毎回失敗する機械で、起動のたびに
     入れ替えを試して起動できなくなるのを防ぐ（失敗は結果のファイルで次の起動が知らせる）
+
+    予約した後で本人が〔起動したときに新しい版を確かめる〕を切っていたら入れない
+    （``allowed`` 既定は設定のファイルを読む） 切るのは「今の版に留まりたい」という合図
     """
     layout = layout if layout is not None else current_layout()
     store = store if store is not None else UpdateStateStore()
+    allowed = allowed if allowed is not None else updates_allowed
     if layout is None:
         return False
     state = store.load()
@@ -69,6 +110,8 @@ def apply_on_start(
         store.save(replace(state, apply_on_start=False))
     except OSError:
         return False  # 印を下ろせない所で入れ替えると、失敗したときに毎回繰り返す
+    if not allowed():
+        return False
     if layout.staged_version() != state.ready_version or not is_newer(state.ready_version, current):
         return False
     carry_user_files(layout.install, layout.staged)
@@ -104,7 +147,7 @@ def settle(
             notice = f"Sashimono Edit {current} に更新しました"
         state = _clear_ready(state)
     else:
-        failure = next((_FAILURES[line] for line in lines if line in _FAILURES), None)
+        failure = next((text for key, text in _FAILURES.items() if key in lines), None)
         if failure is None:
             failure = next(
                 (line[len("error ") :] for line in lines if line.startswith("error ")), None
@@ -114,6 +157,9 @@ def settle(
                 f"更新を入れられませんでした（{failure}）"
                 " ヘルプの〔更新を確かめる…〕から入れ直せます"
             )
+        if "rollback-failed" in lines and ready:
+            # 起動できなかった版は、戻し切れなかったときも次から飛ばす
+            state = _clear_ready(replace(state, skipped=(*state.skipped, ready)))
         if ready and (layout is None or layout.staged_version() != ready):
             # 入れ替えを待っていた版が無くなった（本人が消した・別の起動が入れた）
             state = _clear_ready(state)
