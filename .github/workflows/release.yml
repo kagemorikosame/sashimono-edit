@@ -23,46 +23,13 @@ concurrency:
 
 jobs:
   package:
-    runs-on: windows-latest
+    # 組み立てと、まっさらな Windows で zip から起動する確かめ（Issue #33）は package.yml
+    # main への push でも同じ物を走らせるので、ここへ写さずに呼ぶ 確かめが落ちれば
+    # このジョブが落ち、publish は走らない（動かない zip を下書きへ上げない）
+    uses: ./.github/workflows/package.yml
     permissions:
       # ソースを読むだけ 依存を入れて走らせるジョブに書く権限を渡さない
       contents: read
-    env:
-      TAG: ${{ github.ref_name }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # トークンを .git/config に残さない 残すと、後で走る依存のコードが読める
-          persist-credentials: false
-
-      - uses: actions/setup-python@v7
-        id: python
-        with:
-          # 配る版の Python zip の中の build-info.json と update.json の python_abi になる
-          python-version: "3.14"
-
-      - uses: astral-sh/setup-uv@v10.2.0
-        with:
-          enable-cache: false
-
-      - name: 依存を入れる
-        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
-
-      - name: タグと版を照らす
-        # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
-        run: python tools/update_sign.py check-tag "$env:TAG"
-
-      - name: 配る zip を組み立てる
-        # zip からの確かめ（GL で描く・書き出す）は GPU の無い Actions では通らないので省く
-        # 下書きから落とした zip を、手元で --self-check まで確かめてから署名する
-        run: python tools/build_package.py --skip-check
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: package
-          path: dist/SashimonoEdit-*-windows-x64.zip
-          if-no-files-found: error
-          retention-days: 7
 
   publish:
     needs: package

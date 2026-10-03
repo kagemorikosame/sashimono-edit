@@ -18,14 +18,16 @@ Windows のメッセージ窓で見せる
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO, cast
 
 __all__ = ["CheckResult", "format_results", "run_self_check"]
 
@@ -35,6 +37,18 @@ CPU_CODEC = "libx264"
 #: 見本を描く大きさ 小さくてよい 動くかどうかだけを見る
 #: 偶数にする h.264 は幅も高さも偶数でないと符号化できない
 SAMPLE_SIZE = 64
+
+#: 書き出す先のフォルダの名前 日本語と空白を含める
+#: 使う人の置き場（ユーザー名が日本語の人の一時フォルダ・書き出し先）はこういう名前になる
+#: ASCII の名前でだけ確かめると、パスを狭い文字コードで渡す部品の積み違えを見逃す
+JAPANESE_FOLDER = "確かめる 日本語"
+
+#: GL を使わずに符号化する項目の名前 配る zip をまっさらな Windows で確かめる道具
+#: （tools/check_clean_machine.ps1）が、GPU の無い機械でもこの項目は通ることを見る
+ENCODE_CHECK_NAME = "FFmpeg で符号化（日本語のパス）"
+
+#: 符号化して読み戻すコマ数
+ENCODE_FRAMES = 3
 
 #: Qt の日本語訳を読めたときの、取り消しのボタンの文言
 JAPANESE_CANCEL = "キャンセル"
@@ -63,6 +77,7 @@ def run_self_check() -> list[CheckResult]:
         ("Qt の日本語訳", _qt_translation, False),
         ("編集画面を組み立てる", _editor, False),
         ("GL で描く", _render, False),
+        (ENCODE_CHECK_NAME, _encode, False),
         ("書き出す（FFmpeg）", _export, False),
         ("AviUtl スクリプト（Lua）", _lua, False),
         ("音の出口", _sound, True),
@@ -70,6 +85,9 @@ def run_self_check() -> list[CheckResult]:
         ("同梱の絵（アイコン・ボタンの印）", _bundled_files, False),
         ("追加機能の導入（pip）", _pip, False),
         (UPDATE_CHECK_NAME, _update, False),
+        # 最後に置く ほかの項目が Qt・FFmpeg・Lua の DLL を読み終えてから数えないと、
+        # まだ読んでいない部品の分を見逃す
+        (VC_RUNTIME_CHECK_NAME, _vc_runtime, False),
     ]
     results = []
     for name, check, optional in checks:
@@ -118,8 +136,26 @@ def main() -> int:
         # 標準出力がある
         _show(text, passed)
     else:
+        _make_writable(sys.stdout, text)
         print(text, flush=True)
     return 0 if passed else 1
+
+
+def _make_writable(stream: TextIO, text: str) -> None:
+    """``text`` を書けない文字コードの出口なら UTF-8 へ切り替える
+
+    パイプへ書くときの文字コードは Windows の既定（日本語の Windows なら cp932）
+    英語の Windows（cp1252 CI の Windows も同じ）では日本語を 1 文字も書けず、結果を
+    出す前に ``UnicodeEncodeError`` で落ちる 結果は何も出ないまま終了コードだけが 1 になり、
+    どの部品が動かないのかを知る手段が無くなる UTF-8 ならファイルへ受けて読める
+    書ける出口（日本語の Windows）は変えない ``| more`` で読む人の画面が化ける
+    """
+    encoding = stream.encoding or "utf-8"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
 
 
 #: メッセージ窓の題
@@ -293,6 +329,39 @@ def _render() -> str:
     return f"{image.shape[1]}x{image.shape[0]} を描けた"
 
 
+def _encode() -> str:
+    """GL を通さずに FFmpeg で符号化し、読み戻す 置き場は日本語と空白を含むフォルダ
+
+    書き出す項目は合成に GL を使うので、GPU の無い機械では FFmpeg まで届かずに落ちる
+    それでは FFmpeg の DLL を積み忘れたのか GL が無いだけなのかを分けられない
+    FFmpeg だけをここで通しておけば、GL の無い機械でも符号化の部品は確かめられる
+    """
+    import av
+    import numpy as np
+
+    with tempfile.TemporaryDirectory(prefix="sashimono-check-") as folder:
+        target = Path(folder) / JAPANESE_FOLDER / "符号化.mp4"
+        target.parent.mkdir()
+        with av.open(str(target), mode="w") as container:
+            # add_stream は種類の union を返す 映像として扱うので型を確定させる
+            stream = cast("av.video.stream.VideoStream", container.add_stream(CPU_CODEC, rate=30))
+            stream.width = SAMPLE_SIZE
+            stream.height = SAMPLE_SIZE
+            stream.pix_fmt = "yuv420p"
+            for index in range(ENCODE_FRAMES):
+                # コマごとに明るさを変える 同じ絵が続くと符号化器が中身を省き、
+                # 読み戻す側の確かめが緩くなる
+                image = np.full((SAMPLE_SIZE, SAMPLE_SIZE, 3), 60 * index, dtype=np.uint8)
+                frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgb24")
+                container.mux(stream.encode(frame))
+            container.mux(stream.encode(None))
+        with av.open(str(target)) as container:
+            frames = sum(1 for _ in container.decode(video=0))
+    if frames != ENCODE_FRAMES:
+        raise RuntimeError(f"符号化した動画が {frames} コマ（{ENCODE_FRAMES} コマのはず）")
+    return f"{CPU_CODEC} で {frames} コマ書いて読み戻せた（{JAPANESE_FOLDER}）"
+
+
 def _export() -> str:
     import av
 
@@ -305,7 +374,8 @@ def _export() -> str:
     project = _sample_project()
     assert isinstance(project, Project)
     with tempfile.TemporaryDirectory(prefix="sashimono-check-") as folder:
-        target = Path(folder) / "check.mp4"
+        target = Path(folder) / JAPANESE_FOLDER / "書き出し.mp4"
+        target.parent.mkdir()
         # 実際の書き出しと同じ道を通す 符号化だけを試すと、書き出しが使う
         # 合成・音の混ぜ・mux のどこかで足りないものを見逃す
         # 符号化器は CPU のものを使う 機械ごとに有無が違う GPU の符号化器で
@@ -407,6 +477,100 @@ def _update() -> str:
         raise RuntimeError("埋め込んだ公開鍵に読めない物がある（貼り間違い）")
     suffix = f"公開鍵 {keys} 本" if keys else "公開鍵が入っていない（この版は更新を確かめない）"
     return f"{detail} {suffix}"
+
+
+#: Visual C++ の実行時の部品の項目の名前
+VC_RUNTIME_CHECK_NAME = "Visual C++ の実行時の部品"
+
+#: Visual C++ の実行時の部品の名前の頭（小文字） 再頒布可能パッケージが System32 へ入れる物
+#: ucrtbase と api-ms-win-crt-* は Windows 10 から Windows の一部なので数えない
+VC_RUNTIME_PREFIXES = ("vcruntime140", "msvcp140", "concrt140", "vcomp140")
+
+
+def _vc_runtime() -> str:
+    """読み込んだ Visual C++ の実行時の部品が、配布版の中から来ているか
+
+    開発機にも CI の Windows にも再頒布可能パッケージが入っていて、System32 に同じ名前の
+    DLL がある zip に積み忘れていても、そちらを読んで動いてしまう 入っていない機械では
+    起動の時点で「VCRUNTIME140.dll が見つからない」と出て、自己診断にすらたどり着かない
+    読み込んだ部品の場所を 1 つずつ見て、配布版に無い物を Windows 側から借りていれば落とす
+    """
+    if not getattr(sys, "frozen", False):
+        return "開発環境では見ない（配布版で確かめる）"
+    return vc_runtime_report(loaded_modules(), Path(sys.executable).parent)
+
+
+def vc_runtime_report(loaded: Iterable[Path], bundle: Path) -> str:
+    """``loaded``（読み込んだ DLL）のうち Visual C++ の実行時の部品を、``bundle`` と照らす
+
+    配布版の中から読んだ物は良し Windows 側から読んでいても、同じ名前の物を配布版が
+    持っていれば、入っていない機械ではそちらが読まれるので良し どちらでもない物があれば落とす
+    """
+    runtime = [path for path in loaded if path.name.lower().startswith(VC_RUNTIME_PREFIXES)]
+    if not runtime:
+        # 配布版の Python 自身が vcruntime140.dll を読む 1 つも無いのは数え方が壊れている
+        raise RuntimeError("読み込んだ部品を数えられない")
+    root = _normalized(bundle)
+    own = {path.name.lower() for path in bundle.rglob("*.dll")}
+    inside = [path for path in runtime if _normalized(path).startswith(root + os.sep)]
+    borrowed = [path for path in runtime if path not in inside]
+    missing = [path for path in borrowed if path.name.lower() not in own]
+    if missing:
+        raise RuntimeError(
+            "配布版に無い部品を Windows 側から読んでいる（再頒布可能パッケージの無い機械では"
+            "起動しない）: " + "、".join(str(path) for path in missing)
+        )
+    detail = f"配布版の中の {len(inside)} 個を読んだ"
+    if borrowed:
+        names = "、".join(sorted({path.name for path in borrowed}))
+        detail += f" Windows 側の物を先に読んだ物（配布版にもある）: {names}"
+    return detail
+
+
+def _normalized(path: Path) -> str:
+    # 大文字小文字と区切りを揃える Windows が返す綴りと sys.executable の綴りは揺れる
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def loaded_modules() -> list[Path]:
+    """このプロセスが読み込んでいる DLL の場所 Windows 以外では空"""
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.K32EnumProcessModules.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HMODULE),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel.K32EnumProcessModules.restype = wintypes.BOOL
+    kernel.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+    kernel.GetModuleFileNameW.restype = wintypes.DWORD
+
+    process = kernel.GetCurrentProcess()
+    count = 1024
+    while True:
+        handles = (wintypes.HMODULE * count)()
+        needed = wintypes.DWORD()
+        if not kernel.K32EnumProcessModules(
+            process, handles, ctypes.sizeof(handles), ctypes.byref(needed)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # 読み込んだ数が枠を超えたら、枠を広げて数え直す 切れた所までで返すと、
+        # 後ろに並んだ部品を見ないまま「良し」と言う
+        if needed.value <= ctypes.sizeof(handles):
+            break
+        count = needed.value // ctypes.sizeof(wintypes.HMODULE) + 64
+    paths = []
+    buffer = ctypes.create_unicode_buffer(32768)
+    for handle in handles[: needed.value // ctypes.sizeof(wintypes.HMODULE)]:
+        if kernel.GetModuleFileNameW(handle, buffer, len(buffer)):
+            paths.append(Path(buffer.value))
+    return paths
 
 
 if __name__ == "__main__":  # pragma: no cover - 入口は sashimono.app

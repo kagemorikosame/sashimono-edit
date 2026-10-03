@@ -1025,6 +1025,13 @@ UNUSED_QT_PARTS: dict[str, str] = {
     "PySide6/Qt6QmlMeta.dll": "Qt6Quick だけが読む",
     "PySide6/Qt6QmlModels.dll": "Qt6Quick と Qt6QmlMeta だけが読む",
     "PySide6/Qt6QmlWorkerScript.dll": "Qt6QmlMeta だけが読む",
+    "PySide6/opengl32sw.dll": (
+        "Qt が GPU の無い機械で使うソフトウェアの GL（Mesa llvmpipe 20 MB） Sashimono の"
+        "描画には使えない 取れるのは OpenGL 3.0 までで、描画に要る 4.3 に届かない うえに、"
+        "描く関数は PyOpenGL が Windows の opengl32.dll から引くので、Qt がこちらで作った"
+        "コンテキストへは届かない（2026-10 に手元で AA_UseSoftwareOpenGL を立てて確かめた）"
+        " GPU の無い機械では積んでいても描けず、プレビューの所に理由を出す（Issue #33）"
+    ),
 }
 
 
