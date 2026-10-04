@@ -23,6 +23,8 @@ CI のまっさらな Windows（.github/workflows/package.yml の clean-machine�
   6. 引数無しで起動して窓が出ること GL の無い機械で描けない理由を窓に出すこと
      閉じて終了コード 0 で終わること（#149 GL の無い機械で閉じた後に落ちた）を見る
   7. 実の利用者の置き場（runner の APPDATA など）に何も書いていないことを見る
+  8. ファイアウォールを戻した後で、後から入れる部品（AI 連携・字幕起こし）を exe の pip で
+     日本語のフォルダへ入れ、別の exe で import する（Sashimono.exe --add-on-check ネットにつなぐ）
 
 結果は -Report のフォルダ（ログと窓の写真）と、GITHUB_STEP_SUMMARY（あれば）へ書く
 1 つでも落ちたら終了コード 1
@@ -378,7 +380,9 @@ try {
     )
 
     $since = Get-Date
-    $check = Invoke-Exe 'self-check' @('--self-check')
+    # CI で 30 秒余り 待ちの合計がジョブの制限（package.yml の timeout-minutes）に収まるよう絞る
+    # 収まらないと、要約を書く前に Actions がジョブを取り消す（試験が合計を見張る）
+    $check = Invoke-Exe 'self-check' @('--self-check') 300
     $checkDrops = @(Get-Blocked $since 'sashimono.exe')
     Write-Host $check.Out
     if ($check.Err.Trim()) { Write-Host $check.Err }
@@ -451,7 +455,8 @@ try {
         $archive.Dispose()
     }
     $target = Join-Path $Local 'Sashimono\入れた 部品'
-    $pip = Invoke-Exe 'pip' @('-m', 'pip', 'install', '--no-index', '--target', $target, $wheel)
+    # ネットにつながない 1 行の見本 CI で 1 秒ほど
+    $pip = Invoke-Exe 'pip' @('-m', 'pip', 'install', '--no-index', '--target', $target, $wheel) 120
     if ($pip.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $target "$sample\__init__.py"))) {
         Note "exe の pip で日本語のフォルダへ入れられた: $target"
     } else {
@@ -540,6 +545,31 @@ try {
 } finally {
     # 落ちても（throw でも）設定を戻し、規則を消す
     Restore-NetworkGuard
+}
+
+# --- 後から入れる部品（AI 連携・字幕起こし）を exe の pip で入れて読む ネットにつなぐ ---
+# ファイアウォールの規則を戻した後で走らせる 前で走らせると pip が止められて落ち、外へ出ないことを
+# 数える所にも pip の接続が混ざる 0.1.0 は CI でここを見ておらず、AI 連携が読めない zip を組んだ
+# 入れ方と読み方は exe 自身が持つ（Sashimono.exe --add-on-check sashimono/addon_check.py）
+# ここへ書き写すと、導入ボタンの入れ方が変わったときに確かめだけが古いまま残る
+$addOns = Join-Path $Local 'Sashimono\後から 入れた 部品'
+# exe の側が子（AI 連携の pip・字幕起こしの pip・import する exe の 3 つ）を 1 つずつ待つ秒数
+# CI では合わせて 40 秒ほど 時間切れなら exe が [NG] を書いて終わり、下で要約まで書ける
+$AddOnStepSeconds = 300
+# exe 全体を待つ秒数 子 3 つ分と、exe の起動の分
+$AddOnSeconds = $AddOnStepSeconds * 3 + 60
+try {
+    $addOnCheck = Invoke-Exe 'add-on-check' @('--add-on-check', $addOns, "$AddOnStepSeconds") $AddOnSeconds
+    foreach ($line in ($addOnCheck.Out -split "`r?`n")) {
+        if ($line -match '^\[(ok|NG)\] ') { Note "後から入れる部品: $line" }
+    }
+    if ($addOnCheck.ExitCode -ne 0) {
+        Write-Host $addOnCheck.Out
+        Write-Host $addOnCheck.Err
+        Fail "後から入れる部品を exe の pip で入れて読めない（終了コード $($addOnCheck.ExitCode)）"
+    }
+} catch {
+    Fail "後から入れる部品の確かめが終わらない: $_"
 }
 
 # --- 結果 ---
