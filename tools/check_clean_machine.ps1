@@ -291,6 +291,38 @@ function Get-Blocked([datetime]$Since, [string]$Program) {
         })
 }
 
+function Measure-PowerShell([string]$Label, $Variables, [string]$Script, [int]$TimeoutSeconds = 120) {
+    # 手掛かりを書くだけ 時間切れでも止めて Note を書き、確かめの残りと要約へ進む
+    # 終わっていないプロセスの ExitCode は例外を投げ、確かめ全体が要約を書かずに止まる
+    # Windows PowerShell 5.1 からも呼べる形で書く（試験が 5.1 で取り出して走らせる）
+    $probeResult = Join-Path (Split-Path -Parent $Script) "result-$([guid]::NewGuid().ToString('N')).txt"
+    $probeInfo = New-Object System.Diagnostics.ProcessStartInfo "$Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $probeInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $Script + '"'
+    $probeInfo.UseShellExecute = $false
+    $probeInfo.RedirectStandardOutput = $true
+    $probeInfo.RedirectStandardError = $true
+    $probeInfo.Environment.Clear()
+    foreach ($entry in $Variables.GetEnumerator()) { $probeInfo.Environment[$entry.Key] = $entry.Value }
+    $probeInfo.Environment['PROBE_RESULT'] = $probeResult
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $probe = [System.Diagnostics.Process]::Start($probeInfo)
+    $probeOut = $probe.StandardOutput.ReadToEndAsync()
+    $probeErr = $probe.StandardError.ReadToEndAsync()
+    if (-not $probe.WaitForExit($TimeoutSeconds * 1000)) {
+        # 止めれば管が閉じて、標準出力・標準エラーの読み取りも終わる それでも待ち続けない
+        try { $probe.Kill() } catch { }
+        [void]$probe.WaitForExit(10000)
+        Note ('PowerShell 5.1 の台本（{0}）: {1} 秒で終わらないので止めた' -f $Label, $TimeoutSeconds)
+        return
+    }
+    $probeText = if (Test-Path -LiteralPath $probeResult) { (Get-Content -LiteralPath $probeResult -Raw).Trim() } else { '（無い）' }
+    Note ('PowerShell 5.1 の台本（{0}）: {1:N1} 秒 終了コード {2} 結果 {3}' -f
+        $Label, $watch.Elapsed.TotalSeconds, $probe.ExitCode, $probeText)
+    # 終わった後でも読み取りが残ることがある 待つのは少しだけ
+    if ($probeErr.Wait(5000) -and $probeErr.Result.Trim()) { Note "PowerShell 5.1 の標準エラー: $($probeErr.Result.Trim())" }
+    if ($probeOut.Wait(5000) -and $probeOut.Result.Trim()) { Note "PowerShell 5.1 の標準出力: $($probeOut.Result.Trim())" }
+}
+
 try {
     # 止める規則と記録が本当に効いているかを、先に別の exe（curl の写し）で確かめる
     # 効いていないと、自己診断が外へ出ても「止めた 0 件」で通ってしまう
@@ -323,34 +355,9 @@ try {
         "Add-Content -LiteralPath `$env:PROBE_RESULT -Value 'holding' -Encoding UTF8`n",
         [Text.UTF8Encoding]::new($true))
 
-    function Measure-PowerShell([string]$Label, $Variables) {
-        $probeResult = Join-Path $probeFolder "result-$([guid]::NewGuid().ToString('N')).txt"
-        $probeInfo = [System.Diagnostics.ProcessStartInfo]::new("$Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        foreach ($argument in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $probeScript)) {
-            $probeInfo.ArgumentList.Add($argument)
-        }
-        $probeInfo.UseShellExecute = $false
-        $probeInfo.RedirectStandardOutput = $true
-        $probeInfo.RedirectStandardError = $true
-        $probeInfo.Environment.Clear()
-        foreach ($entry in $Variables.GetEnumerator()) { $probeInfo.Environment[$entry.Key] = $entry.Value }
-        $probeInfo.Environment['PROBE_RESULT'] = $probeResult
-        $watch = [Diagnostics.Stopwatch]::StartNew()
-        $probe = [System.Diagnostics.Process]::Start($probeInfo)
-        $probeOut = $probe.StandardOutput.ReadToEndAsync()
-        $probeErr = $probe.StandardError.ReadToEndAsync()
-        [void]$probe.WaitForExit(120000)
-        $probeText = if (Test-Path -LiteralPath $probeResult) { (Get-Content -LiteralPath $probeResult -Raw).Trim() } else { '（無い）' }
-        Note ("PowerShell 5.1 の台本（{0}）: {1:N1} 秒 終了コード {2} 結果 {3}" -f
-            $Label, $watch.Elapsed.TotalSeconds, $probe.ExitCode, $probeText)
-        if ($probeErr.Result.Trim()) { Note "PowerShell 5.1 の標準エラー: $($probeErr.Result.Trim())" }
-        if ($probeOut.Result.Trim()) { Note "PowerShell 5.1 の標準出力: $($probeOut.Result.Trim())" }
-        return $watch.Elapsed.TotalSeconds
-    }
-
     # 変数を削りすぎた環境と、確かめに使う環境（素の Windows の利用者と同じ変数）を比べる
-    [void](Measure-PowerShell '削りすぎた環境変数' $Minimal)
-    $PowerShellSeconds = Measure-PowerShell '確かめに使う環境変数' $Environment
+    Measure-PowerShell '削りすぎた環境変数' $Minimal $probeScript
+    Measure-PowerShell '確かめに使う環境変数' $Environment $probeScript
 
     # --- 自己診断 ---
     $Scripts = Join-Path $AppHome 'scripts'

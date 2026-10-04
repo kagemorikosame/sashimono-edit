@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -232,6 +233,32 @@ def test_a_write_inside_an_existing_user_folder_is_caught(tmp_path: Path) -> Non
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "settings.json"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_a_hung_powershell_probe_does_not_stop_the_check(tmp_path: Path) -> None:
+    """手掛かりの PowerShell が時間内に終わらなくても、止めて書き残し、確かめを続ける
+
+    終わっていないプロセスの終了コードを読むと例外になり、確かめ全体が要約を書かずに
+    止まる（PR #241 のレビュー） 30 秒眠る台本を 2 秒で見切らせる
+    """
+    script = tmp_path / "眠る 台本.ps1"
+    script.write_text("Start-Sleep -Seconds 30\n", encoding="utf-8-sig")
+    body = (
+        "$script:notes = [System.Collections.Generic.List[string]]::new()\n"
+        "function Note([string]$Message) { $script:notes.Add($Message) }\n"
+        "$Windows = $env:SystemRoot\n"
+        "$variables = [ordered]@{ SYSTEMROOT = $env:SystemRoot }\n"
+        "Measure-PowerShell '眠る' $variables $env:PROBE 2\n"
+        # 5.1 の標準出力は日本語を化かすので、見分けた結果だけを ASCII で返す
+        "$stopped = @($script:notes | Where-Object { $_ -like '*終わらないので止めた*' }).Count\n"
+        "[Console]::Out.Write('stopped=' + $stopped)\n"
+    )
+    started = time.monotonic()
+    completed = _run_script_functions(("Measure-PowerShell",), body, {"PROBE": str(script)})
+    assert completed.returncode == 0, completed.stderr
+    assert time.monotonic() - started < 25
+    assert completed.stdout.strip() == "stopped=1"
 
 
 #: 機械の設定を触るコマンドの身代わり 呼ばれた引数を控えるだけで、何も変えない

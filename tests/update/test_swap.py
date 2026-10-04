@@ -268,7 +268,8 @@ def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None
     本体は走り始めたかを結果のファイルで待つ（何度も読む） 入れ替え係の書き足しが
     ちょうど重なると「ほかのプロセスが使用中」で断られ、入れ替え係が error で止まった
     （#241 の作業中に自己診断の試験で出た） 走り始めたのに走らないと取り違える
-    台本の Write-Result だけを取り出し、結果のファイルを 1 秒だけ誰にも開かせずに持つ
+    台本の Write-Result だけを取り出し、書き足しが 1 度断られるまで結果のファイルを
+    誰にも開かせずに持つ
     """
     import ctypes
     import re
@@ -293,31 +294,34 @@ def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None
     generic_read, no_sharing, open_existing = 0x80000000, 0, 3
     handle = kernel.CreateFileW(str(result), generic_read, no_sharing, None, open_existing, 0, None)
     assert handle not in (None, wintypes.HANDLE(-1).value)
+    # 書き足しが断られた所（catch）で合図を出させ、それを見てから手放す 書き足す前に合図を
+    # 出すと、PowerShell が遅れたときに手放した後で初めて書き足し、書き直さない作りでも通る
+    # 書き直さない作り（catch が無い）は合図を出さずに、手放す前に落ちて終わる
+    refused = tmp_path / "refused.txt"
+    function = match.group(0).replace(
+        "} catch {\n",
+        "} catch {\nSet-Content -LiteralPath $env:REFUSED -Value 'refused'\n",
+        1,
+    )
     try:
-        ready = tmp_path / "ready.txt"
         code = (
             "$ErrorActionPreference = 'Stop'\n"
-            "$result = $env:RESULT\n"
-            + match.group(0)
-            # 書き足す直前に知らせる PowerShell の起動の遅さで、錠を離した後に書くことにならない
-            + "Set-Content -LiteralPath $env:READY -Value 'ready'\n"
-            + "Write-Result 'holding'\n"
+            "$result = $env:RESULT\n" + function + "Write-Result 'holding'\n"
         )
         process = subprocess.Popen(
             [str(swap_module.powershell_path()), "-NoProfile", "-NonInteractive", "-Command", code],
-            env={**os.environ, "RESULT": str(result), "READY": str(ready)},
+            env={**os.environ, "RESULT": str(result), "REFUSED": str(refused)},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         deadline = time.monotonic() + 60
-        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        while not refused.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        # 断られる所まで進ませてから離す
-        time.sleep(0.7)
     finally:
         kernel.CloseHandle(handle)
     _, error = process.communicate(timeout=60)
     assert process.returncode == 0, error.decode("cp932", "replace")
+    assert refused.exists(), "書き足しが 1 度も断られずに通った（確かめになっていない）"
     assert "holding" in result.read_text(encoding="utf-8-sig")
 
 
