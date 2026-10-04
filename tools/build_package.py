@@ -20,7 +20,9 @@ r"""配る zip を作る
 開発機の ``PATH`` に FFmpeg や Python が載っていると、積み忘れがあっても通る
 
 **依存が何も入っていない機械での確認**は、ここではできない（VC++ ランタイムなど
-Windows 側の部品は開発機に入っている） 本人の確認に回す
+Windows 側の部品は開発機に入っている） CI のまっさらな Windows で、zip だけを持って
+確かめる（.github/workflows/package.yml と tools/check_clean_machine.ps1 Issue #33）
+CI には GPU が無いので、GL で描く確かめはここ（開発機）で行う
 """
 
 from __future__ import annotations
@@ -49,6 +51,10 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+# 一覧を読む部品は隣の道具（標準ライブラリだけで動く CI が依存を入れる前に使う）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from package_notices import canonical_name, listed_versions  # noqa: E402
 
 from sashimono import __version__  # noqa: E402
 from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
@@ -448,29 +454,6 @@ def license_files(
     return found, missing
 
 
-def canonical_name(name: str) -> str:
-    """配布名の表記揺れをそろえる（PEP 503）
-
-    ``PySide6_Essentials`` と ``PySide6-Essentials`` は同じ包み
-    """
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def listed_versions(notices: str) -> dict[str, str]:
-    """一覧（THIRD_PARTY_NOTICES.md）の Python の包みの表から、配布名と版を読む
-
-    表の行は ``| `配布名` | 版 | ...`` の形 1 列目の最初の ``` `...` ``` を配布名とする
-    """
-    versions: dict[str, str] = {}
-    for line in notices.splitlines():
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) < 2 or not cells[0].startswith("`"):
-            continue
-        name = cells[0].split("`")[1]
-        versions[canonical_name(name)] = cells[1]
-    return versions
-
-
 def collect_licenses(
     bundle: Path,
     sources: Iterable[Path],
@@ -738,6 +721,22 @@ def minimal_environment(environ: Mapping[str, str]) -> dict[str, str]:
         "HOMEPATH",
         "USERNAME",
         "COMPUTERNAME",
+        # 素の Windows の利用者なら誰でも持っている変数 中身は Windows の物で開発の道具を
+        # 指さない 外すと PowerShell 5.1 の起動が遅くなり（CI で 22 秒が 34 秒）、
+        # 使う人の機械では起きない遅さで入れ替え係の確かめが落ちる（Issue #33）
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "COMSPEC",
+        "PATHEXT",
+        "OS",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
     )
     upper = {key.upper(): value for key, value in environ.items()}
     minimal = {key: upper[key] for key in keep if key in upper}
@@ -1025,6 +1024,13 @@ UNUSED_QT_PARTS: dict[str, str] = {
     "PySide6/Qt6QmlMeta.dll": "Qt6Quick だけが読む",
     "PySide6/Qt6QmlModels.dll": "Qt6Quick と Qt6QmlMeta だけが読む",
     "PySide6/Qt6QmlWorkerScript.dll": "Qt6QmlMeta だけが読む",
+    "PySide6/opengl32sw.dll": (
+        "Qt が GPU の無い機械で使うソフトウェアの GL（Mesa llvmpipe 20 MB） Sashimono の"
+        "描画には使えない 取れるのは OpenGL 3.0 までで、描画に要る 4.3 に届かない うえに、"
+        "描く関数は PyOpenGL が Windows の opengl32.dll から引くので、Qt がこちらで作った"
+        "コンテキストへは届かない（2026-10 に手元で AA_UseSoftwareOpenGL を立てて確かめた）"
+        " GPU の無い機械では積んでいても描けず、プレビューの所に理由を出す（Issue #33）"
+    ),
 }
 
 

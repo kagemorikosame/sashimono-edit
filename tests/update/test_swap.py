@@ -260,3 +260,76 @@ class TestTheHandshake:
         ]
         assert all(line.isascii() for line in code)
         assert '"' not in "".join(code)
+
+
+def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None:
+    """本体が結果のファイルを読んでいる間に書き足しが断られても、書き直して残す
+
+    本体は走り始めたかを結果のファイルで待つ（何度も読む） 入れ替え係の書き足しが
+    ちょうど重なると「ほかのプロセスが使用中」で断られ、入れ替え係が error で止まった
+    （#241 の作業中に自己診断の試験で出た） 走り始めたのに走らないと取り違える
+    台本の Write-Result だけを取り出し、書き足しが 1 度断られるまで結果のファイルを
+    誰にも開かせずに持つ
+    """
+    import ctypes
+    import re
+    import subprocess
+    from ctypes import wintypes
+
+    match = re.search(r"^function Write-Result.*?^}\n", swap_module.HELPER_SCRIPT, re.M | re.S)
+    assert match is not None
+    result = tmp_path / "result.txt"
+    result.write_bytes(b"")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    generic_read, no_sharing, open_existing = 0x80000000, 0, 3
+    handle = kernel.CreateFileW(str(result), generic_read, no_sharing, None, open_existing, 0, None)
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+    # 書き足しが断られた所（catch）で合図を出させ、それを見てから手放す 書き足す前に合図を
+    # 出すと、PowerShell が遅れたときに手放した後で初めて書き足し、書き直さない作りでも通る
+    # 書き直さない作り（catch が無い）は合図を出さずに、手放す前に落ちて終わる
+    refused = tmp_path / "refused.txt"
+    function = match.group(0).replace(
+        "} catch {\n",
+        "} catch {\nSet-Content -LiteralPath $env:REFUSED -Value 'refused'\n",
+        1,
+    )
+    try:
+        code = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$result = $env:RESULT\n" + function + "Write-Result 'holding'\n"
+        )
+        process = subprocess.Popen(
+            [str(swap_module.powershell_path()), "-NoProfile", "-NonInteractive", "-Command", code],
+            env={**os.environ, "RESULT": str(result), "REFUSED": str(refused)},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 60
+        while not refused.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        kernel.CloseHandle(handle)
+    _, error = process.communicate(timeout=60)
+    assert process.returncode == 0, error.decode("cp932", "replace")
+    assert refused.exists(), "書き足しが 1 度も断られずに通った（確かめになっていない）"
+    assert "holding" in result.read_text(encoding="utf-8-sig")
+
+
+def test_a_first_powershell_start_is_waited_for() -> None:
+    """その利用者が初めて PowerShell 5.1 を起こすときの遅さを、動かないと取り違えない
+
+    CI のまっさらな Windows で、台本を 1 行走らせるだけで 11〜22 秒（変数を削ると 34 秒）
+    かかった（Issue #33） 20 秒で見切っていたので、自己診断の入れ替えの項目が落ち、
+    使う人の遅い機械では「PowerShell が動かない」と出て更新を入れられなくなる
+    """
+    assert swap_module.START_SECONDS >= 45

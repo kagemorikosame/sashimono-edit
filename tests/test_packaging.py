@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -1182,3 +1184,291 @@ class TestTheUpdateParts:
         assert "公開鍵" in detail
         if sys.platform == "win32":
             assert "入れ替え（PowerShell）" in detail
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="入れ替え係は Windows の PowerShell")
+    def test_a_swap_that_does_not_start_says_why(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れ替え係が走らないとき、待ちきれなかったのか、すぐ終わったのかを添える
+
+        理由の無い 1 行では、CI のまっさらな Windows で落ちたとき（PowerShell の初めての
+        起動が 20 秒を超えた Issue #33）に、遅いのか走れないのかを分けられなかった
+        """
+        from sashimono.update import rehearsal
+        from sashimono.update.swap import Launched
+
+        def gave_up(launched: Launched) -> bool:
+            # 本物の wait_started と同じく、見切った入れ替え係は止める 残すと試験の後に
+            # 一時フォルダの中で入れ替えを続ける
+            launched.process.kill()
+            launched.process.wait()
+            return False
+
+        monkeypatch.setattr(rehearsal, "wait_started", gave_up)
+        with pytest.raises(RuntimeError, match=r"走らない（\d+ 秒 終了コード"):
+            rehearsal.rehearse(tmp_path)
+
+    def test_the_exit_code_is_read_after_the_kill_finishes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """見切った入れ替え係の終了コードは、終わるのを待ってから読む
+
+        wait_started は kill するが待たない Windows の kill は終わらせる指示を出すだけで、
+        すぐ読むと終了コードが None になり、走れなかったのか見切ったのかが分からない
+        """
+        from sashimono.update import rehearsal
+        from sashimono.update.swap import Launched
+
+        class SlowToDie:
+            """kill の後、wait されるまで終わったことにならないプロセスの代わり"""
+
+            returncode: int | None = None
+
+            def kill(self) -> None:
+                pass
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 1
+                return 1
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        def fake_launch(plan: object, folder: Path) -> Launched:
+            return Launched(SlowToDie(), folder / "result.txt")  # type: ignore[arg-type]
+
+        def gave_up(launched: Launched) -> bool:
+            launched.process.kill()
+            return False
+
+        monkeypatch.setattr(rehearsal, "launch", fake_launch)
+        monkeypatch.setattr(rehearsal, "wait_started", gave_up)
+        with pytest.raises(RuntimeError, match="終了コード 1 ") as raised:
+            rehearsal.rehearse(tmp_path, swap=True)
+        assert "None" not in str(raised.value)
+
+
+class TestTheSelfCheckOnAnEnglishWindows:
+    """英語の Windows（CI の Windows も同じ）では、パイプの文字コードが cp1252 になる
+
+    日本語を 1 文字も書けず、結果を出す前に落ちていた 終了コードだけが 1 になり、
+    どの部品が動かないのかを知る手段が無くなる
+    """
+
+    def test_a_narrow_pipe_is_switched_to_utf8(self) -> None:
+        from sashimono.selfcheck import _make_writable
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        text = "[ok] 版: 0.1.0（配布版）"
+        _make_writable(stream, text)
+        stream.write(text)
+        stream.flush()
+        assert stream.encoding == "utf-8"
+
+    def test_a_japanese_windows_keeps_its_own(self) -> None:
+        """書ける出口は変えない 変えると ``| more`` で読む人の画面が化ける"""
+        from sashimono.selfcheck import _make_writable
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp932")
+        _make_writable(stream, "[ok] 版: 0.1.0（配布版）")
+        assert stream.encoding == "cp932"
+
+
+class TestTheVcRuntimeCheck:
+    """配布版が Visual C++ の実行時の部品を、zip の外から借りていないか
+
+    開発機にも CI の Windows にも再頒布可能パッケージが入っていて、積み忘れても動いてしまう
+    入っていない機械では、自己診断にすらたどり着かずに起動の時点で落ちる
+    """
+
+    def _bundle(self, tmp_path: Path) -> Path:
+        bundle = tmp_path / "展開 先" / "Sashimono"
+        (bundle / "_internal" / "PySide6").mkdir(parents=True)
+        (bundle / "_internal" / "VCRUNTIME140.dll").write_bytes(b"MZ")
+        (bundle / "_internal" / "PySide6" / "MSVCP140.dll").write_bytes(b"MZ")
+        return bundle
+
+    def test_parts_from_inside_pass(self, tmp_path: Path) -> None:
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            bundle / "_internal" / "PySide6" / "MSVCP140.dll",
+            Path(r"C:\Windows\System32\kernel32.dll"),
+        ]
+        assert "中の 2 個" in vc_runtime_report(loaded, bundle)
+
+    def test_an_outside_copy_of_a_bundled_part_passes(self, tmp_path: Path) -> None:
+        """同じ名前を配布版が持っていれば、入っていない機械ではそちらが読まれる"""
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            Path(r"C:\Windows\System32\msvcp140.dll"),
+        ]
+        assert "msvcp140.dll" in vc_runtime_report(loaded, bundle)
+
+    def test_a_part_only_windows_has_fails(self, tmp_path: Path) -> None:
+        from sashimono.selfcheck import vc_runtime_report
+
+        bundle = self._bundle(tmp_path)
+        loaded = [
+            bundle / "_internal" / "VCRUNTIME140.dll",
+            Path(r"C:\Windows\System32\concrt140.dll"),
+        ]
+        with pytest.raises(RuntimeError, match=r"concrt140\.dll"):
+            vc_runtime_report(loaded, bundle)
+
+    def test_nothing_counted_is_not_taken_as_fine(self, tmp_path: Path) -> None:
+        """配布版の Python 自身が vcruntime140.dll を読む 数えられないのに通すと何も見ていない"""
+        from sashimono.selfcheck import vc_runtime_report
+
+        with pytest.raises(RuntimeError, match="数えられない"):
+            vc_runtime_report([Path(r"C:\Windows\System32\kernel32.dll")], self._bundle(tmp_path))
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows の DLL の一覧を読む")
+    def test_this_process_is_counted(self) -> None:
+        from sashimono.selfcheck import VC_RUNTIME_PREFIXES, loaded_modules
+
+        names = [path.name.lower() for path in loaded_modules()]
+        assert any(name.startswith("python3") for name in names)
+        assert any(name.startswith(VC_RUNTIME_PREFIXES) for name in names)
+
+    def test_development_is_not_judged(self) -> None:
+        # 開発環境の Python は再頒布可能パッケージ込みで入っていて、照らす配布版が無い
+        from sashimono.selfcheck import _vc_runtime
+
+        assert "開発環境" in _vc_runtime()
+
+
+class TestTheEncodeCheckNeedsNoGL:
+    """GPU の無い機械でも FFmpeg の部品は確かめる 書き出す項目は GL で先に落ちる"""
+
+    def test_it_encodes_into_a_japanese_folder(self) -> None:
+        from sashimono.selfcheck import JAPANESE_FOLDER, _encode
+
+        assert " " in JAPANESE_FOLDER and not JAPANESE_FOLDER.isascii()
+        assert JAPANESE_FOLDER in _encode()
+
+    def test_it_does_not_touch_gl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sashimono import selfcheck
+
+        def no_gl(*args: object, **kwargs: object) -> None:
+            raise AssertionError("GL を使った")
+
+        monkeypatch.setattr("sashimono.engine.gpu.OffscreenGLContext", no_gl)
+        monkeypatch.setattr("sashimono.engine.gpu.context.OffscreenGLContext", no_gl)
+        assert "読み戻せた" in selfcheck._encode()
+
+
+class TestTheBuildIsPinnedToTheList:
+    """CI のまっさらな機械で組むときは、一覧（THIRD_PARTY_NOTICES.md）の版に留めて入れる
+
+    依存は下限だけなので、留めないとその日の最新が入る av 19 が出た日に、写しの無い
+    DLL（libvmaf）を積み、一覧と版が食い違って組み立てが止まった（Issue #33 の CI）
+    """
+
+    @pytest.fixture
+    def notices(self) -> ModuleType:
+        spec = importlib.util.spec_from_file_location(
+            "package_notices", ROOT / "tools" / "package_notices.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_listed_packages_are_pinned(self, notices: ModuleType) -> None:
+        lines = notices.constraints(notices.NOTICES_SOURCE.read_text(encoding="utf-8"))
+        names = {line.split("==")[0] for line in lines}
+        assert {"av", "pyside6-essentials", "cryptography", "pyinstaller"} <= names
+        assert all(re.fullmatch(r"[a-z0-9-]+==\d[0-9A-Za-z.!+]*", line) for line in lines), lines
+
+    def test_the_file_table_is_not_taken_for_packages(self, notices: ModuleType) -> None:
+        # 同梱のファイルの表（| `LICENSE.txt` | 説明 |）も 1 列目が ` で始まる 版の形でない
+        # 行まで制約にすると、uv が制約を読めずに止まる
+        table = "| `LICENSE.txt` | 本体の使用許諾 |\n| `av`（PyAV） | 18.1.0 | BSD |\n"
+        assert notices.constraints(table) == ["av==18.1.0"]
+
+    def test_they_are_written_before_any_dependency_is_installed(self, tmp_path: Path) -> None:
+        """制約は依存を何も入れていない Python で書ける
+
+        CI は最初の ``uv pip install`` から制約を使う 依存を読む道具で書くと、制約の無い
+        導入を先に通すことになり、その日の新しい依存が壊れていると制約まで届かない
+        依存を読めない Python（-I で site を切る）で走らせて確かめる
+        """
+        target = tmp_path / "build" / "constraints.txt"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(ROOT / "tools" / "package_notices.py"),
+                "--write-constraints",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "av==" in target.read_text(encoding="utf-8")
+
+    def test_pip_is_installed_at_the_listed_version_or_the_zip_build_stops(
+        self, notices: ModuleType
+    ) -> None:
+        """依存では入らないが積む pip を、一覧の版で入れる要件にする（PR #241 のレビュー P1）
+
+        pip は Python に最初から入っていて、制約では入れ直されない 一覧の版とずれたまま
+        積むと、使用許諾の版の照合で zip の組み立てが止まる
+        """
+        table = notices.NOTICES_SOURCE.read_text(encoding="utf-8")
+        wanted = notices.requirements(table)
+        assert wanted == [f"pip=={notices.listed_versions(table)['pip']}"]
+
+    def test_a_beside_package_missing_from_the_list_stops_it(self, notices: ModuleType) -> None:
+        # 版を決められない物を入れると、何を積んだかを一覧と照らせない
+        with pytest.raises(ValueError, match="pip"):
+            notices.requirements("| `av`（PyAV） | 18.1.0 | BSD |\n")
+
+    def test_every_bundled_package_is_pinned_or_a_dependency(
+        self, builder: ModuleType, notices: ModuleType
+    ) -> None:
+        """必ず積む包みは、依存（版は制約で留まる）か、一覧の版で明示して入れる物のどちらか
+
+        どちらでもない包み（Python に最初から入っている pip など）は、CI の機械が持っている
+        版のまま積まれ、一覧と食い違って組み立てが止まる 必ず積む包みを足したら、ここで分かる
+        SHARED_WITH_ADD_ONS は入っているときだけ積むので見ない
+        """
+        import tomllib
+
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        declared = [*project["dependencies"], *project["optional-dependencies"]["dev"]]
+        dependencies = {
+            notices.canonical_name(re.match(r"[A-Za-z0-9_.\-]+", spec).group(0))  # type: ignore[union-attr]
+            for spec in declared
+        }
+        for package in (*builder.COLLECTED_PACKAGES, *builder.ALWAYS_BUNDLED):
+            name = notices.canonical_name(package)
+            assert name in dependencies or name in notices.INSTALLED_BESIDE, package
+
+    def test_the_builder_reads_the_same_list(self, builder: ModuleType) -> None:
+        # 制約を書く道具と、組み立てで一覧と照らす道具が別々に読むと、表の読み方がずれる
+        assert builder.listed_versions.__module__ == "package_notices"
+        assert builder.canonical_name.__module__ == "package_notices"
+
+
+class TestTheSoftwareGLIsLeftOut:
+    def test_qts_software_gl_is_not_shipped(self, builder: ModuleType) -> None:
+        """Qt のソフトウェアの GL（opengl32sw.dll 20 MB）は積まない
+
+        取れるのは OpenGL 3.0 までで描画に要る 4.3 に届かず、描く関数は PyOpenGL が
+        Windows の opengl32.dll から引くので、Qt がこちらで作ったコンテキストへ届かない
+        積んでいても GPU の無い機械で描けないことは変わらない
+        """
+        assert "PySide6/opengl32sw.dll" in builder.UNUSED_QT_PARTS

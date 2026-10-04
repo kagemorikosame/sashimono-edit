@@ -1908,7 +1908,62 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   試験のためには落とさない（手元の .venv にある物で確かめる）
 
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での
-確認は、開発機ではできない 配る前に 1 度、別の機械かクリーンな環境で確かめる
+確認は、開発機ではできない **CI のまっさらな Windows で zip だけを持って確かめる**（Issue #33）
+
+### まっさらな Windows で zip から起動する（CI）
+
+`.github/workflows/package.yml` が zip を組み立て（build）、別の機械（clean-machine）へ zip だけを
+渡して `tools/check_clean_machine.ps1` を走らせる 確かめる機械には Python・uv・依存を入れない
+
+- 展開先と使う人の置き場（APPDATA・LOCALAPPDATA・USERPROFILE・TEMP）は `C:\テスト 利用者\…`
+  （日本語と空白） 環境変数は Windows の分と置き場だけにして、PATH から runner の Python・
+  uv・FFmpeg を外し、PYTHONHOME や PYTHONPATH も渡さない
+- **ファイアウォールと監査の設定に触るのは CI の runner（`GITHUB_ACTIONS` が true）だけ**
+  触る前の設定（各プロファイルの有効・無効と監査の設定）を控え、終わりに（落ちても）戻し、
+  足した規則も消す 送り出しの既定には触らない 手元で走らせると、この確かめは理由を出して飛ばす
+- `-Root` に前からあるフォルダを渡すと止まる 消すのは、この道具が作った印（`.sashimono-clean-check`）
+  のあるフォルダだけ
+- exe はファイアウォールで外へ出られなくする（CI） 自己診断（自動更新の項目を含む）は外へ出ずに
+  通らなければならない 止めた接続は Windows Filtering Platform の監査（イベント 5157）で exe ごとに
+  数え、自己診断の間に 1 件でもあれば落とす（ファイアウォールの記録 pfirewall.log は runner では
+  何も書かなかった） 先に別の exe（curl の写し）で、止まることと数えられることを確かめる
+- 環境変数は削りすぎない 素の Windows の利用者が持つ変数（ProgramFiles・PATHEXT・PSModulePath
+  など）は渡す 外すと PowerShell 5.1 の起動が遅くなり、使う人の機械では起きない失敗になる
+  その利用者が初めて PowerShell を起こすときは、CI で 11〜22 秒かかった 入れ替え係が走り始める
+  のを待つ時間（`swap.START_SECONDS`）はこれを見て 60 秒にしてある
+- 自己診断の結果を 1 項目ずつ実行の要約へ書く **GPU が無いので GL の 2 項目（描く・書き出す）
+  だけは、GL の理由（`GLContextError`）で落ちていれば通す** ほかの項目は全部通らなければ落とす
+  FFmpeg は GL を通さない項目（日本語のフォルダへ符号化して読み戻す）で確かめる
+- exe の pip で見本の wheel を日本語のフォルダへ入れる
+- 引数無しで起動して窓が出ること、GL の無い機械で描けない理由をプレビューの所に出したまま
+  動き続けること、閉じて終了コード 0 で終わること（#149）を見る 窓の写真とログは
+  `clean-machine-report` として残る
+- 実の利用者の置き場（runner の `%APPDATA%\Sashimono` など）に書いていないことを見る
+
+タグのとき（`release.yml` から呼ばれたとき）と手動のときだけ、組み立ての前に ffmpeg を入れて
+`tools/verify.py` も走らせる タグの push では ci.yml が走らないため main と PR では ci.yml が
+走らせるので二重にしない 本番のタグで初めて走らせて落ちると公開が止まるので、出す前に
+`gh workflow run package.yml --ref <ブランチ>` で同じ道を通しておける
+ffmpeg の版とハッシュは `.github/actions/ffmpeg` の 1 か所（ci.yml と package.yml が使う）
+走らせるのは main への push、タグの push（`release.yml` から呼ぶ 落ちたら下書きへ上げない）、
+手で（workflow_dispatch）、組み立てと確かめに関わるファイルを変える PR 組み立てだけで
+10 分ほどかかるので、ほかの PR では走らせない
+
+CI で組むときは、積む包みを `THIRD_PARTY_NOTICES.md` の一覧の版に留める
+（標準ライブラリだけで動く `tools/package_notices.py --write-constraints` で、依存を入れる前に
+制約を書き、最初の `uv pip install -c` から使う 制約の無い導入を先に通すと、その日の新しい
+依存が壊れていたときに制約まで届かずに止まる） 依存では入らないが積む包み（pip Python に最初から
+入っている）は制約では入れ直されないので、`--write-requirements` で一覧の版の要件を書き、
+同じ導入で `-r` で入れる（`package_notices.INSTALLED_BESIDE` 必ず積む包みを足したら、依存か
+ここのどちらかに入っていることを試験が見る）
+依存は下限だけで書いてあるので、留めないとその日の最新が入り、一覧と版が食い違って止まる
+（2026-10 に av 19 が出て、写しの無い DLL を積もうとして止まった） 包みを上げるときは、
+一覧と写しを先に直す
+
+CI には GPU が無いので、**GL で描く確かめは開発機の `build_package.py`（zip からの確かめ）**で行う
+Qt のソフトウェアの GL（`opengl32sw.dll` Mesa llvmpipe）は積まない 取れるのは OpenGL 3.0 までで、
+描く関数は PyOpenGL が Windows の `opengl32.dll` から引くので Qt がそちらで作った
+コンテキストへ届かず、積んでも GPU の無い機械では描けない（`UNUSED_QT_PARTS`）
 
 ### 使用許諾（配る zip は GPL の条件で配る）
 
@@ -2180,8 +2235,9 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
   4 からやり直す 公開した後に直すなら、版を上げて新しいタグで出す
 - **6 が通るまで下書きのままにする** 公開した瞬間に固定の URL が切り替わるので、署名の無い
   目録を誰かに見せない（署名が無ければ配った版は黙って飛ばすが、その間は誰も受け取れない）
-- workflow は秘密鍵を使わない（`contents: write` だけ） GPU が無いので zip からの確かめ
-  （`--skip-check` で省いている）は 3 で手元で行う
+- workflow は秘密鍵を使わない（`contents: write` だけ） まっさらな Windows で zip から起動する
+  確かめ（`package.yml` の clean-machine）が通らなければ下書きへ上げない GPU が無いので
+  GL で描く確かめは 3 で手元で行う
 - 目録は `update_sign.py manifest` が zip の中の `build-info.json` から版と Python を読んで作る
   手で書き直すと署名が通らなくなる（署名は目録のバイト列そのものに付く） 直すなら作り直す
 - `minimum` は、この版へ自動では上げられない古い版の境 目録の形や入れ替えの手順を変えたときだけ上げる

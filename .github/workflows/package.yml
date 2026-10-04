@@ -1,0 +1,149 @@
+name: Package
+
+# 配る zip を組み立て、まっさらな Windows で zip から起動して確かめる（Issue #33）
+#
+# 開発機には VC++ の実行時の部品・Python・FFmpeg が入っていて、zip に積み忘れても
+# そちらを拾って動いてしまう 組み立てと確かめはジョブ（＝別の機械）を分け、確かめる側では
+# Python も uv もリポジトリの依存も入れない 渡すのは zip だけ
+# 確かめる中身は tools/check_clean_machine.ps1 の頭に書いてある
+#
+# いつ走らせるか
+#   - main への push（入った変更で zip が組めなくなったら、次のリリースを待たずに分かる）
+#   - タグの push（release.yml から呼ぶ 通らなければリリースの下書きへ上げない）
+#   - 手で（workflow_dispatch）
+#   - 組み立てと確かめに関わるファイルを変える PR 組み立てだけで 10 分ほどかかるので、
+#     ほかの PR では走らせない
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - ".github/workflows/package.yml"
+      - ".github/workflows/release.yml"
+      - "tools/build_package.py"
+      - "tools/package_notices.py"
+      - "tools/check_clean_machine.ps1"
+      - ".github/actions/ffmpeg/**"
+      - "src/sashimono/selfcheck.py"
+      - "src/sashimono/app.py"
+      - "pyproject.toml"
+      - "THIRD_PARTY_NOTICES.md"
+      - "licenses/**"
+  workflow_dispatch:
+  workflow_call:
+
+# 既定は何も持たせない 要る物はジョブごとに書く
+permissions: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      # ソースを読むだけ 依存を入れて走らせるジョブに書く権限を渡さない
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # トークンを .git/config に残さない 残すと、後で走る依存のコードが読める
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          # 配る版の Python zip の中の build-info.json と update.json の python_abi になる
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: false
+
+      - name: 積む包みを一覧の版に留める制約を書く
+        # 依存は下限だけなので、留めないとその日の最新が入る 一覧（THIRD_PARTY_NOTICES.md）と
+        # 版が食い違うと組み立てが止まる（使用許諾の写しとソースの添付を揃えた版で組む）
+        # 書く道具は標準ライブラリだけで動くので、依存を入れる前に書ける 最初の導入から
+        # 制約を使う 制約の無い導入を先に通すと、その日の新しい依存が壊れていたときに
+        # 制約まで届かずに止まる
+        # 依存では入らないが積む包み（pip Python に最初から入っている）は、制約では入れ直されない
+        # ので、一覧の版で明示して入れる要件も書く（package_notices.INSTALLED_BESIDE）
+        run: python tools/package_notices.py --write-constraints build/constraints.txt --write-requirements build/bundled-beside.txt
+
+      - name: 依存を入れる
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -r build/bundled-beside.txt -c build/constraints.txt
+
+      - name: タグと版を照らす
+        # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
+        # タグから呼ばれたときだけ（release.yml）
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python tools/update_sign.py check-tag "$env:TAG"
+
+      - name: ffmpeg を入れる（検証のため）
+        # 素材を使う試験が要る ci.yml と同じ物（版とハッシュは .github/actions/ffmpeg の 1 か所）
+        # ci.yml と違い落ちたら止める ffmpeg が無いと試験が黙って飛び、確かめたことにならない
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: ./.github/actions/ffmpeg
+
+      - name: 検証（タグと手動のときだけ）
+        # ruff・mypy・pytest が落ちる状態のまま、リリースの下書きを作らない
+        # main への push と PR では ci.yml が同じ verify を走らせるので、ここでは二重にしない
+        # タグの push では ci.yml が走らない（release.yml から呼ばれたときだけ通る道）
+        # 手動（workflow_dispatch）でも同じ道を通す 本番のタグで初めて走らせて落ちると、
+        # 公開が止まる 前もって手で走らせて確かめられるようにする
+        # release.yml から呼ばれたとき、github.ref と github.event_name は呼び元の物（タグの push）
+        # 積む版（制約で留めた依存）のまま確かめるので、配る物と同じ組み合わせを見ることになる
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        env:
+          # ci.yml と同じく 4 コアで並べる 直列では 6 分を超える
+          SASHIMONO_TEST_WORKERS: "4"
+        run: python tools/verify.py
+
+      - name: 配る zip を組み立てる
+        # zip からの確かめは、ここ（依存を入れた機械）ではなく次の clean-machine で行う
+        # ここで確かめると、この機械の Python と DLL を拾って通ってしまう
+        run: python tools/build_package.py --skip-check
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: dist/SashimonoEdit-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  clean-machine:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      # 確かめる道具（PowerShell）だけを取る Python・uv・依存は入れない
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/check_clean_machine.ps1
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+
+      - name: まっさらな状態で zip から起動する
+        shell: pwsh
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/package
+          REPORT_DIR: ${{ runner.temp }}/clean-check
+        run: |
+          $zips = @(Get-ChildItem -LiteralPath $env:PACKAGE_DIR -Filter 'SashimonoEdit-*-windows-x64.zip')
+          if ($zips.Count -ne 1) { throw "組み立てた zip が 1 つでない（$($zips.Count) 個）" }
+          ./tools/check_clean_machine.ps1 -Zip $zips[0].FullName -Report $env:REPORT_DIR
+
+      - uses: actions/upload-artifact@v7
+        # 落ちたときこそ見たい ログと窓の写真を残す
+        if: always()
+        with:
+          name: clean-machine-report
+          path: ${{ runner.temp }}/clean-check
+          if-no-files-found: warn
+          retention-days: 14
