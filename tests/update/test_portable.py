@@ -320,6 +320,92 @@ class TestBundles:
         result = move_user_scripts(install, target)
         assert result.moved == () and result.held == (Path("効果.anm2"),)
 
+    def _bundle(self, install: Path) -> list[Path]:
+        return [
+            _put(install, "配布物/効果.anm2", 'local m = require("common")\nobj.ox = m.v\n'),
+            _put(install, "配布物/common.lua", "return { v = 1 }"),
+            _put(install, "配布物/画像/星.png", "png"),
+        ]
+
+    def test_a_copy_failing_midway_leaves_the_bundle_whole(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """束の 2 つ目で写せなくなっても、元は一式残り、移し先には何も残さない
+        （PR #245 の Codex の指摘 束が 2 つの置き場に割れると、相対で読む物が別れて描けない）
+        """
+        originals = self._bundle(install)
+        real_copy = shutil.copy2
+        calls: list[Path] = []
+
+        def flaky(source: Path, destination: Path) -> object:
+            calls.append(source)
+            if len(calls) == 2:
+                raise OSError("ディスクがいっぱい")
+            return real_copy(source, destination)
+
+        monkeypatch.setattr(shutil, "copy2", flaky)
+        result = move_user_scripts(install, target)
+        assert result.moved == () and len(result.failed) == 3
+        assert all(path.is_file() for path in originals)
+        assert not target.exists() or not any(target.rglob("*"))
+        assert not list(target.parent.glob(".scripts-moving-*"))
+
+    def test_a_placement_failing_midway_takes_back_what_was_placed(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """移し先へ確定している途中で断られても、置いた分を外し、元は一式残す"""
+        originals = self._bundle(install)
+        real_rename = Path.rename
+        renamed: list[Path] = []
+
+        def refuse_second(self: Path, destination: Path) -> Path:
+            if ".scripts-moving-" in str(self):
+                renamed.append(self)
+                if len(renamed) == 2:
+                    raise PermissionError("ほかのプログラムが掴んでいる")
+            return real_rename(self, destination)
+
+        monkeypatch.setattr(Path, "rename", refuse_second)
+        result = move_user_scripts(install, target)
+        assert result.moved == () and len(result.failed) == 3
+        assert all(path.is_file() for path in originals)
+        assert not target.exists() or not [p for p in target.rglob("*") if p.is_file()]
+
+    def test_a_half_placed_bundle_is_finished_next_time(self, install: Path, target: Path) -> None:
+        """確定の途中で落ちた（移し先に一部だけ入った）後の起動では、入った分を同じ中身と見て
+        束ごと移し直す 元は消していないので、それまでは exe の隣の一式が読まれる
+        """
+        self._bundle(install)
+        (target / "配布物").mkdir(parents=True)
+        (target / "配布物" / "common.lua").write_text("return { v = 1 }", encoding="utf-8")
+        result = move_user_scripts(install, target)
+        assert len(result.moved) == 3 and result.failed == () and result.held == ()
+        assert not (install / PORTABLE_SCRIPTS_DIR / "配布物").exists()
+
+    def test_originals_that_cannot_be_removed_still_read_the_whole_set(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """元を消す段で一部を消せなくても、移し先に一式そろっていて、後に読まれる
+        %APPDATA% が勝つ
+        """
+        originals = self._bundle(install)
+        real_unlink = Path.unlink
+
+        def refuse(self: Path, missing_ok: bool = False) -> None:
+            if self == originals[0]:
+                raise PermissionError("使用中")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+        result = move_user_scripts(install, target)
+        assert result.left == (Path("配布物/効果.anm2"),) and len(result.moved) == 2
+        monkeypatch.undo()
+        roots = (install / PORTABLE_SCRIPTS_DIR, target)
+        entry = ScriptCatalog(roots).scan()[0]
+        assert entry.path == Path("配布物/効果.anm2")
+        assert entry.folder == target / "配布物"
+        assert self._run(roots, target / "配布物" / "効果.anm2") == 1
+
     def test_the_bundles(self) -> None:
         found = bundles(
             [Path("a.anm2"), Path("b.lua"), Path("X/c.anm2"), Path("x/d/e.lua"), Path("Y/f")]

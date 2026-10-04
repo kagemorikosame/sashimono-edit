@@ -66,6 +66,27 @@ class TestMeasuring:
         ticks: Iterator[float] = iter(float(i) for i in range(100))
         assert folder_size(tmp_path, seconds=1.5, clock=lambda: next(ticks)) is None
 
+    def test_one_crowded_folder_gives_up_too(self, tmp_path: Path) -> None:
+        """1 つのフォルダに大量のファイルがあっても、途中で時間を見て諦める
+
+        PR #245 の Codex の指摘 フォルダへ入る前だけ時計を見ると、そのフォルダを
+        数え終えるまで窓が固まる
+        """
+        crowded = tmp_path / "nvidia"
+        crowded.mkdir()
+        for index in range(50):
+            (crowded / f"{index}.dll").write_bytes(b"x")
+        looked: list[int] = []
+
+        def clock() -> float:
+            looked.append(1)
+            # 測り始め・置き場・その中の 1 つ目・混んだフォルダへ入る所までは時間内
+            # 混んだフォルダの中を数えている間に時間切れ
+            return 0.0 if len(looked) <= 4 else 10.0
+
+        assert folder_size(tmp_path, seconds=1.0, clock=clock) is None
+        assert len(looked) < 10
+
 
 class TestEstimate:
     def test_a_measured_size_is_used(self, tmp_path: Path) -> None:

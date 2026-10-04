@@ -97,6 +97,10 @@ def folder_size(
         try:
             with os.scandir(folder) as entries:
                 for entry in entries:
+                    # 1 つのフォルダに数万のファイルがある導入先もある（CUDA の包み など）
+                    # フォルダへ入る前だけ見ると、そこで時間を超えて窓が固まる
+                    if clock() > deadline:
+                        return None
                     if entry.is_dir(follow_symlinks=False):
                         pending.append(Path(entry.path))
                     elif entry.is_file(follow_symlinks=False):

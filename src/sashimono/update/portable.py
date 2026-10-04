@@ -19,9 +19,10 @@ exe の隣の ``scripts`` は、前の版の案内どおりそこへ置いた人
   1 段下・深い所のどこにあっても見つかる 移し先に同じ名前の別のモジュールがあると、束を
   丸ごと移しても、移した先でどちらが先に見つかるかが変わりうる 残した束と同じ名前の
   モジュールを持つ束も残す（今まで exe の隣の中で決まっていた勝ち負けを変えない）
-- **写し終えて中身を照らしてから元を消す** 写す途中で止まっても元は残る 写しは作業用の
-  名前で書き、元と同じ中身かを確かめてから本来の名前を付ける 途中の物が本来の名前で
-  残ると、次から「もう在る」と見て移さず、しかも欠けた中身の方が読まれる（後の置き場が勝つ）
+- **束を一式写し終えて中身を照らしてから確定し、確定し終えてから元を消す**（:func:`_place_bundle`）
+  束の途中で写せなくなっても（ディスクの空き・権限）、束が 2 つの置き場に割れない 写しは
+  移し先と同じドライブの作業用のフォルダ（置き場の外）で作るので、途中の物は読まれない
+  途中の物が本来の名前で残ると、次から「もう在る」と見て移さず、しかも欠けた中身の方が読まれる
 - 元を消せなかった物は数えて知らせる 両方に在っても、読まれるのは ``%APPDATA%`` の側
 """
 
@@ -207,44 +208,82 @@ def move_user_scripts(install: Path, target: Path) -> ScriptMove:
             for relative in members:
                 (kept if relative in clashes else held).append(relative)
             continue
+        problem = _place_bundle(source, target, members)
+        if problem is not None:
+            # 束は一式 exe の隣に残る（元には触っていない） 束の全部を写せなかった物として数える
+            failed.extend((relative, problem) for relative in members)
+            continue
+        # 移し先に一式そろってから元を消す 一部を消せなくても、後に読まれる %APPDATA% の一式が勝つ
         for relative in members:
-            outcome = _move_one(source / relative, target / relative)
-            if outcome is None:
-                moved.append(relative)
-            elif outcome == "":
+            try:
+                (source / relative).unlink()
+            except OSError:
                 left.append(relative)
             else:
-                failed.append((relative, outcome))
+                moved.append(relative)
     _remove_empty_folders(source)
     return ScriptMove(tuple(moved), tuple(kept), tuple(held), tuple(left), tuple(failed))
 
 
-def _move_one(origin: Path, destination: Path) -> str | None:
-    """1 つ移す 移せたら ``None``、写せたが元を消せなければ ``""``、写せなければその理由"""
-    if destination.exists():
-        # 中身が同じ物が移し先にある（_plan が確かめた） 移す側を消すだけ
-        if not _same(origin, destination):
-            return "移し先に中身の違う物がある"
-    else:
-        # 作業用の名前は起動ごとに分ける 窓を 2 つ開くと、どちらも起動のときに移しに来る
-        writing = destination.with_name(f"{destination.name}.{os.getpid()}{_MOVING_SUFFIX}")
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(origin, writing)
-            # 大きさだけでなく中身を照らす 元を消した後では、欠けた写しに気付いても戻せない
-            if not filecmp.cmp(origin, writing, shallow=False):
-                raise OSError("写した中身が元と違う")
-            # 置き換えはしない Windows の rename は在る名前へは付けられないので、写している
-            # 間に本人かほかの窓が同じ名前を置いたら、そちらを残してここで止まる
-            writing.rename(destination)
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                writing.unlink(missing_ok=True)
-            return str(exc)
+#: 束を写している作業用のフォルダの名前の頭（移し先の親 ``%APPDATA%\Sashimono`` の下）
+#: 置き場（``scripts``）の外なので、途中の物がスクリプトとして読まれない
+_STAGING_PREFIX = ".scripts-moving-"
+
+
+def _place_bundle(source: Path, target: Path, members: list[Path]) -> str | None:
+    """束を一式、移し先へ置く 置けたら ``None``、置けなければ理由（元にも移し先にも何も残さない）
+
+    1. 作業用のフォルダ（移し先と同じドライブ）へ全部写し、元と中身を照らす
+    2. 全部そろってから、移し先へ 1 つずつ名前を付け替えて確定する（同じドライブなので一瞬）
+    3. 途中で失敗したら、確定した分を移し先から外し、作業用を片付ける
+
+    確定の途中で落ちても（電源が切れた など）元は消していないので exe の隣に一式残る 移し先に
+    入った分は元と同じ中身なので、次の起動では「同じ中身」と見て束ごと移し直す（:func:`_plan`）
+    移し先に同じ中身で在る物は写さない（元を消すだけ）
+    """
+    staging = target.parent / f"{_STAGING_PREFIX}{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    pending: list[Path] = []
     try:
-        origin.unlink()
-    except OSError:
-        return ""
+        for relative in members:
+            destination = target / relative
+            if destination.exists():
+                if not _same(source / relative, destination):
+                    return f"移し先に中身の違う物がある（{relative.as_posix()}）"
+                continue
+            staged = staging / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / relative, staged)
+            # 大きさだけでなく中身を照らす 元を消した後では、欠けた写しに気付いても戻せない
+            if not filecmp.cmp(source / relative, staged, shallow=False):
+                return f"写した中身が元と違う（{relative.as_posix()}）"
+            pending.append(relative)
+        placed: list[Path] = []
+        try:
+            for relative in pending:
+                destination = target / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # 置き換えはしない Windows の rename は在る名前へは付けられないので、写している
+                # 間に本人かほかの窓が同じ名前を置いたら、そちらを残してここで止まる
+                (staging / relative).rename(destination)
+                placed.append(destination)
+        except OSError:
+            for destination in placed:
+                # 外すのは今置いた写しだけ 元は exe の隣に残っている
+                with contextlib.suppress(OSError):
+                    destination.unlink()
+                # 置くために作って空になったフォルダも外す 本人が前から持っていた空の
+                # フォルダは消さないよう、置いた物の親だけを移し先の手前まで見る
+                for folder in destination.parents:
+                    if folder == target or not folder.is_relative_to(target):
+                        break
+                    with contextlib.suppress(OSError):
+                        folder.rmdir()
+            raise
+    except OSError as exc:
+        return str(exc) or type(exc).__name__
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return None
 
 
