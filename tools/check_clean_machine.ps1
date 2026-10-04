@@ -79,7 +79,21 @@ Note "展開した先: $Exe"
 # 走らせる前の実の置き場 終わった後に Sashimono の物が増えていないかを見る
 $RealPlaces = @($env:APPDATA, $env:LOCALAPPDATA) | Where-Object { $_ } |
     ForEach-Object { Join-Path $_ 'Sashimono' }
-$RealBefore = @($RealPlaces | Where-Object { Test-Path -LiteralPath $_ })
+function Get-RealSnapshot([string[]]$Places) {
+    # フォルダとその中の 1 つずつを、場所・大きさ・書いた時刻で控える 手元で走らせると
+    # 実の置き場が前からあることがあり、フォルダがあるかだけを見ると、その中へ書いても通ってしまう
+    foreach ($place in $Places) {
+        if (-not (Test-Path -LiteralPath $place)) { continue }
+        $place
+        Get-ChildItem -LiteralPath $place -Force -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { '{0}|{1}|{2}' -f $_.FullName, $(if ($_.PSIsContainer) { '' } else { $_.Length }), $_.LastWriteTimeUtc.Ticks }
+    }
+}
+function Get-RealWrites([string[]]$Before, [string[]]$After) {
+    # 増えた物と書き換わった物（大きさか時刻が変わった）の場所 消えた物は数えない
+    $After | Where-Object { $Before -notcontains $_ } | ForEach-Object { ($_ -split '\|')[0] }
+}
+$RealBefore = @(Get-RealSnapshot $RealPlaces)
 
 # 環境変数 Windows が動くのに要る分と、日本語の置き場だけ
 # PATH は Windows の分だけ（tools/build_package.py の minimal_environment と同じ）
@@ -436,10 +450,9 @@ $windowDrops = @(Get-Blocked $since 'sashimono.exe')
 Note "起動から閉じるまでに止めた外向きの接続: $($windowDrops.Count) 件（更新の確認）"
 
 # --- 実の置き場に書いていないか ---
-$RealAfter = @($RealPlaces | Where-Object { Test-Path -LiteralPath $_ })
-$written = @($RealAfter | Where-Object { $RealBefore -notcontains $_ })
+$written = @(Get-RealWrites $RealBefore @(Get-RealSnapshot $RealPlaces))
 if ($written.Count -gt 0) {
-    Fail "渡した置き場ではなく、実の利用者の置き場に書いた: $($written -join ', ')"
+    Fail "渡した置き場ではなく、実の利用者の置き場に書いた: $(($written | Select-Object -First 10) -join ', ')"
 }
 $own = @(Get-ChildItem -LiteralPath $Roaming, $Local -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -eq 'Sashimono' })

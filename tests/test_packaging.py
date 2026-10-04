@@ -1208,6 +1208,45 @@ class TestTheUpdateParts:
         with pytest.raises(RuntimeError, match=r"走らない（\d+ 秒 終了コード"):
             rehearsal.rehearse(tmp_path)
 
+    def test_the_exit_code_is_read_after_the_kill_finishes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """見切った入れ替え係の終了コードは、終わるのを待ってから読む
+
+        wait_started は kill するが待たない Windows の kill は終わらせる指示を出すだけで、
+        すぐ読むと終了コードが None になり、走れなかったのか見切ったのかが分からない
+        """
+        from sashimono.update import rehearsal
+        from sashimono.update.swap import Launched
+
+        class SlowToDie:
+            """kill の後、wait されるまで終わったことにならないプロセスの代わり"""
+
+            returncode: int | None = None
+
+            def kill(self) -> None:
+                pass
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 1
+                return 1
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        def fake_launch(plan: object, folder: Path) -> Launched:
+            return Launched(SlowToDie(), folder / "result.txt")  # type: ignore[arg-type]
+
+        def gave_up(launched: Launched) -> bool:
+            launched.process.kill()
+            return False
+
+        monkeypatch.setattr(rehearsal, "launch", fake_launch)
+        monkeypatch.setattr(rehearsal, "wait_started", gave_up)
+        with pytest.raises(RuntimeError, match="終了コード 1 ") as raised:
+            rehearsal.rehearse(tmp_path, swap=True)
+        assert "None" not in str(raised.value)
+
 
 class TestTheSelfCheckOnAnEnglishWindows:
     """英語の Windows（CI の Windows も同じ）では、パイプの文字コードが cp1252 になる

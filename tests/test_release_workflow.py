@@ -9,8 +9,13 @@ zip の確かめ（Issue #33）は、依存を入れた機械とは別の機械�
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -147,6 +152,59 @@ def test_the_check_script_knows_the_self_check_names() -> None:
         VC_RUNTIME_CHECK_NAME,
     ):
         assert f"'{name}'" in script, name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_a_write_inside_an_existing_user_folder_is_caught(tmp_path: Path) -> None:
+    """実の置き場（%APPDATA%\\Sashimono）が前からあっても、中へ書いたら見つける
+
+    手元で走らせると実の置き場があることが多い フォルダがあるかだけを見ると、その中へ
+    設定を書いても「書いていない」で通ってしまう 道具の関数だけを取り出して走らせる
+    """
+    place = tmp_path / "Sashimono"
+    place.mkdir()
+    (place / "前から.txt").write_text("before", encoding="utf-8")
+    code = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$language = 'System.Management.Automation.Language'\n"
+        '$parser = "$language.Parser" -as [type]\n'
+        '$definition = "$language.FunctionDefinitionAst" -as [type]\n'
+        "$ast = $parser::ParseFile($env:SCRIPT, [ref]$null, [ref]$null)\n"
+        "foreach ($name in 'Get-RealSnapshot', 'Get-RealWrites') {\n"
+        "    $found = $ast.Find({ param($node)\n"
+        "        $node -is $definition -and $node.Name -eq $name }, $true)\n"
+        "    if (-not $found) { exit 3 }\n"
+        "    Invoke-Expression $found.Extent.Text\n"
+        "}\n"
+        "$before = @(Get-RealSnapshot @($env:PLACE))\n"
+        "Set-Content -LiteralPath (Join-Path $env:PLACE 'settings.json') -Value '{}'\n"
+        "$written = @(Get-RealWrites $before @(Get-RealSnapshot @($env:PLACE)))\n"
+        "[Console]::Out.Write(($written | ForEach-Object { Split-Path -Leaf $_ }) -join ',')\n"
+    )
+    completed = subprocess.run(
+        [
+            str(
+                Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+                / "System32"
+                / "WindowsPowerShell"
+                / "v1.0"
+                / "powershell.exe"
+            ),
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            code,
+        ],
+        env={**os.environ, "SCRIPT": str(CHECK_SCRIPT), "PLACE": str(place)},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "settings.json"
 
 
 def test_a_published_or_signed_release_is_not_replaced() -> None:

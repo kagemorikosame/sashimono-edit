@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
 import ssl
+import subprocess
 import sys
 import time
 import zipfile
@@ -116,6 +118,11 @@ def rehearse(folder: Path, *, swap: bool = sys.platform == "win32") -> str:
         # 台本を読めない・走らせてもらえないか） 結果のファイルに書けた所まで添える
         # 理由が無いと、使う人の機械で落ちたときに貼ってもらっても直す所が分からない
         elapsed = time.monotonic() - began
+        # wait_started は見切った入れ替え係を kill するが、終わるのは待たない Windows の
+        # kill は終わらせる指示を出すだけなので、すぐ読むと終了コードが None になる
+        # 待ってから読む（待つのはここだけ 本体の更新の道は終わりを待たずに知らせる）
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            launched.process.wait(timeout=10)
         written = " ".join(launched.lines()) or "結果のファイルに何も無い"
         raise RuntimeError(
             f"入れ替え係（PowerShell）が走らない（{elapsed:.0f} 秒 終了コード "
