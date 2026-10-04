@@ -48,6 +48,9 @@ from sashimono.ui.workspace import (
     DOCK_TABS_TOP,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
+    SCRIPTS_MOVE_ASK,
+    SCRIPTS_MOVE_AUTO,
+    SCRIPTS_MOVE_OFF,
     SNAP_DISTANCES,
     Preferences,
 )
@@ -463,6 +466,25 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._update_confirm)
 
+        self._scripts_move = QComboBox(self)
+        for value, text in (
+            (SCRIPTS_MOVE_AUTO, "起動したときに自動で移す"),
+            (SCRIPTS_MOVE_ASK, "移すかを尋ねる（同じ物は 1 度だけ）"),
+            (SCRIPTS_MOVE_OFF, "何もしない"),
+        ):
+            self._scripts_move.addItem(text, value)
+        self._scripts_move.setCurrentIndex(
+            max(0, self._scripts_move.findData(preferences.scripts_move))
+        )
+        self._scripts_move.setToolTip(
+            "配布版の Sashimono.exe の隣の scripts に自分で置いた物を、"
+            "%APPDATA%\\Sashimono\\scripts へ移すか 自動更新では新しい版へ写すが、"
+            "zip を手で展開し直してフォルダごと入れ替えると消える 移し先に同じ名前の物があれば"
+            "上書きせずに残し、移した物と残した物を 1 度知らせる"
+            " どれを選んでも〔互換〕→〔exe の隣のスクリプトを移す…〕から移せる"
+        )
+        form.addRow("exe の隣の scripts に置いた物", self._scripts_move)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -583,4 +605,5 @@ class PreferencesDialog(QDialog):
             update_check=self._update_check.isChecked(),
             update_beta=self._update_beta.isChecked(),
             update_confirm=self._update_confirm.isChecked(),
+            scripts_move=str(self._scripts_move.currentData()),
         )

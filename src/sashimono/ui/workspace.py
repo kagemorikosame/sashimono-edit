@@ -40,6 +40,10 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "SCRIPTS_MOVE_ASK",
+    "SCRIPTS_MOVE_AUTO",
+    "SCRIPTS_MOVE_MODES",
+    "SCRIPTS_MOVE_OFF",
     "SNAP_DISTANCES",
     "PreferenceStore",
     "Preferences",
@@ -158,6 +162,13 @@ DOCK_TAB_POSITIONS = (DOCK_TABS_TOP, DOCK_TABS_BOTTOM)
 MEDIA_SPLIT = "split"
 MEDIA_TOGETHER = "together"
 MEDIA_SPLIT_MODES = (MEDIA_SPLIT, MEDIA_TOGETHER)
+
+#: exe の隣の ``scripts`` に自分で置いた物の扱い :attr:`Preferences.scripts_move` の値
+#: 自動で移す・移すかを尋ねる・何もしない
+SCRIPTS_MOVE_AUTO = "auto"
+SCRIPTS_MOVE_ASK = "ask"
+SCRIPTS_MOVE_OFF = "off"
+SCRIPTS_MOVE_MODES = (SCRIPTS_MOVE_AUTO, SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF)
 
 #: 前の版の設定の名前（``multi_audio`` 音声が 2 本以上ある動画だけの置き方）の値と、
 #: 今の値の対応 分けない（``first``）を選んでいた人は、音声が 1 本の動画も分けない側へ写す
@@ -332,6 +343,14 @@ class Preferences:
     #: 落として確かめた新しい版を入れる前に尋ねる 既定は入（入れるには再起動が要り、
     #: 編集の途中で勝手に再起動しないため） 切ると、尋ねずに次の起動の頭で入れる
     update_confirm: bool = True
+    #: 配布版の exe の隣の ``scripts`` に自分で置いた物を、起動のときに ``%APPDATA%`` の側へ
+    #: 移すか 自動で移す（``auto``）・移すかを尋ねる（``ask`` 同じ物については 1 度だけ）・
+    #: 何もしない（``off``） 既定は自動で移す（利用者の決定） zip を手で展開し直すと消える所に
+    #: 置いたままだと、知らない人ほど失くす 読む順は変わらない（exe の隣より ``%APPDATA%`` が
+    #: 後に読まれて勝つので、移しても同じ名前の勝ち負けは同じ） exe の隣にまとめておきたい
+    #: 人は尋ねる・何もしないへ切り替える（〔互換〕→〔exe の隣のスクリプトを移す…〕からは
+    #: いつでも移せる）
+    scripts_move: str = SCRIPTS_MOVE_AUTO
 
     @property
     def splits_media(self) -> bool:
@@ -427,6 +446,7 @@ class PreferenceStore:
             update_check=_flag(data.get("update_check"), plain.update_check),
             update_beta=_flag(data.get("update_beta"), plain.update_beta),
             update_confirm=_flag(data.get("update_confirm"), plain.update_confirm),
+            scripts_move=_choice(data.get("scripts_move"), SCRIPTS_MOVE_MODES, plain.scripts_move),
         )
 
     def save(self, preferences: Preferences) -> None:

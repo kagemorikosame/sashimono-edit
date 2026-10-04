@@ -525,6 +525,17 @@ try {
         Note "起動から閉じるまでに止めた外向きの接続: $($windowDrops.Count) 件（更新の確認）"
     }
 
+    # --- exe の隣の scripts に置いた見本が、起動したときに %APPDATA% 側へ移ったか（Issue #244） ---
+    # 既定は尋ねずに移す 移さないままだと、zip を手で展開し直した人の物が消える
+    # 移した知らせは窓を塞がない（塞ぐと上の「閉じる知らせ」が届かずに落ちる）
+    $movedSample = Join-Path $Roaming 'Sashimono\scripts\確かめる用.anm2'
+    $leftSample = Join-Path $Scripts '確かめる用.anm2'
+    if ((Test-Path -LiteralPath $movedSample) -and -not (Test-Path -LiteralPath $leftSample)) {
+        Note "exe の隣の見本が %APPDATA% 側へ移った: $movedSample"
+    } else {
+        Fail 'exe の隣の scripts に置いた見本が、起動しても %APPDATA% 側へ移っていない'
+    }
+
     # --- 実の置き場に書いていないか ---
     $written = @(Get-RealWrites $RealBefore @(Get-RealSnapshot $RealPlaces))
     if ($written.Count -gt 0) {

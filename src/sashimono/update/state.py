@@ -82,6 +82,10 @@ class UpdateState:
     #: 入れ替えに失敗した版 この版は尋ねない設定でも自動では予約しない（本人が選べば入れる）
     #: 置かないと、入れ替えが毎回断られる機械で、起動のたびに入れ替えを試して待たされる
     auto_blocked: str = ""
+    #: exe の隣の ``scripts`` にあった本人の物のうち、``%APPDATA%`` へ移すよう勧め終えた物
+    #: （``scripts`` からの相対の場所） 勧めるのは 1 度だけ 覚えないと、移さないと決めた
+    #: 人に起動のたびに尋ねる 後から新しく置いた物があれば、それについてだけもう 1 度勧める
+    scripts_offered: tuple[str, ...] = field(default_factory=tuple)
 
 
 class UpdateStateStore:
@@ -100,6 +104,7 @@ class UpdateStateStore:
         plain = UpdateState()
         checked = data.get("last_checked")
         skipped = data.get("skipped")
+        offered = data.get("scripts_offered")
         return UpdateState(
             last_checked=(
                 float(checked)
@@ -117,6 +122,11 @@ class UpdateStateStore:
             apply_on_start=data.get("apply_on_start") is True,
             apply_chosen=data.get("apply_chosen") is True,
             auto_blocked=_text(data.get("auto_blocked")),
+            scripts_offered=(
+                tuple(v for v in offered if isinstance(v, str))
+                if isinstance(offered, list)
+                else plain.scripts_offered
+            ),
         )
 
     def save(self, state: UpdateState) -> None:
@@ -124,6 +134,7 @@ class UpdateStateStore:
         temporary = self.path.with_name(self.path.name + ".writing")
         data = asdict(state)
         data["skipped"] = list(state.skipped)
+        data["scripts_offered"] = list(state.scripts_offered)
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
 

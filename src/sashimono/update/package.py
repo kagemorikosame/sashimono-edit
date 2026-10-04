@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
+from sashimono.update.portable import PORTABLE_SCRIPTS_DIR
 
 __all__ = [
     "APP_EXE",
@@ -54,10 +55,8 @@ BUILD_INFO_NAME = "build-info.json"
 #: 展開した中身の大きさの上限 zip 爆弾で本人のディスクを埋めない
 _MAX_EXTRACTED_BYTES = 2 * MAX_PACKAGE_BYTES
 
-#: exe の隣にある、本人がスクリプトを置いてよいフォルダ（compat.aviutl.catalog の
-#: PORTABLE_SCRIPTS_DIR） ここは読み込みが重い（効果の一覧を作る）ので名前だけ写す
-#: 名前が食い違えば試験が落とす
-_PORTABLE_SCRIPTS_DIR = "scripts"
+#: exe の隣にある、本人がスクリプトを置いてよいフォルダ 名前は移す側（.portable）と 1 つにする
+_PORTABLE_SCRIPTS_DIR = PORTABLE_SCRIPTS_DIR
 
 
 class PackageError(Exception):

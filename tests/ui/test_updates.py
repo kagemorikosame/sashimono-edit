@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,9 @@ class _Harness:
             confirm_close=self._confirm,
         )
         self.controller._inform = self._inform  # type: ignore[method-assign]
+        self.controller._notify = self._notify  # type: ignore[method-assign]
+        #: 手を止めさせない窓で知らせた物（尋ねずに済ませたこと）
+        self.notified: list[tuple[str, str]] = []
         self.sleeper: subprocess.Popen[bytes] | None = None
 
     def _transport(self) -> MemoryTransport:
@@ -100,6 +104,9 @@ class _Harness:
 
     def _inform(self, title: str, text: str) -> None:
         self.informed.append((title, text))
+
+    def _notify(self, title: str, text: str) -> None:
+        self.notified.append((title, text))
 
     def _confirm(self) -> bool:
         self.events.append("confirm")
@@ -531,3 +538,248 @@ class TestTheEditor:
         copy = tmp_path / f"作品.sme{PRE_UPGRADE_SUFFIX}"
         assert json.loads(copy.read_text(encoding="utf-8"))["version"] == FORMAT_VERSION - 1
         assert json.loads(path.read_text(encoding="utf-8"))["version"] == FORMAT_VERSION
+
+
+def _put_script(install: Path, relative: str, text: str = "@揺れ\n--track0:量,0,100,0\n") -> Path:
+    path = install / "scripts" / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _appdata_scripts() -> Path:
+    from sashimono.core import userdirs
+
+    return userdirs.config_root() / "scripts"
+
+
+class TestScriptsBesideTheExe:
+    """exe の隣の ``scripts`` に置いた物を ``%APPDATA%`` 側へ移す（Issue #244）
+
+    自動更新では写すが、zip を手で展開し直してフォルダごと入れ替えると消える 既定は起動の
+    ときに尋ねずに移し、何をどこへ移したかを 1 度知らせる（利用者の決定）
+    """
+
+    @pytest.fixture
+    def asked(self, harness: _Harness) -> list[str]:
+        """移すかを尋ねた文面 答えは「移す」"""
+        answers: list[str] = []
+
+        def ask(text: str) -> bool:
+            answers.append(text)
+            return True
+
+        harness.controller._ask_move = ask  # type: ignore[method-assign]
+        harness.preferences = Preferences(update_check=False)
+        return answers
+
+    def test_the_default_is_to_move(self) -> None:
+        assert Preferences().scripts_move == "auto"
+
+    def test_the_setting_comes_back_and_breaks_safely(self, tmp_path: Path) -> None:
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(scripts_move="ask"))
+        assert store.load().scripts_move == "ask"
+        (tmp_path / "preferences.json").write_text(
+            json.dumps({"scripts_move": "ぜんぶ消す"}), encoding="utf-8"
+        )
+        assert store.load().scripts_move == "auto"
+
+    def test_the_dialog_returns_it(self, qt_application: QApplication) -> None:
+        del qt_application
+        dialog = PreferencesDialog(Preferences(scripts_move="off"))
+        try:
+            assert dialog.preferences().scripts_move == "off"
+        finally:
+            dialog.deleteLater()
+
+    def test_they_are_moved_on_start_and_told_once(
+        self, harness: _Harness, asked: list[str]
+    ) -> None:
+        mine = _put_script(harness.layout.install, "自分の/効果.anm2")
+        rescanned: list[bool] = []
+        harness.controller._rescan_scripts = lambda: rescanned.append(True)
+        harness.controller.start()
+        # 尋ねない 移して、何をどこへ移したかを知らせる
+        assert asked == []
+        assert not mine.exists()
+        assert (_appdata_scripts() / "自分の" / "効果.anm2").is_file()
+        assert rescanned == [True]
+        # 手を止めさせない窓で知らせる（尋ねる窓ではない）
+        assert harness.informed == [] and len(harness.notified) == 1
+        assert "自分の/効果.anm2" in harness.notified[0][1]
+        assert str(_appdata_scripts()) in harness.notified[0][1]
+        # 2 回目の起動では何も言わない
+        harness.controller.start()
+        assert len(harness.notified) == 1
+
+    def test_a_name_taken_in_appdata_is_kept_and_told_once(
+        self, harness: _Harness, asked: list[str]
+    ) -> None:
+        mine = _put_script(harness.layout.install, "効果.anm2", "古い")
+        _appdata_scripts().mkdir(parents=True)
+        (_appdata_scripts() / "効果.anm2").write_text("新しい", encoding="utf-8")
+        harness.controller.start()
+        assert mine.read_text(encoding="utf-8") == "古い"
+        assert (_appdata_scripts() / "効果.anm2").read_text(encoding="utf-8") == "新しい"
+        assert len(harness.notified) == 1 and "上書きせず" in harness.notified[0][1]
+        harness.controller.start()
+        assert len(harness.notified) == 1
+
+    def test_the_notice_does_not_block_the_editor(
+        self, harness: _Harness, qt_application: QApplication
+    ) -> None:
+        """起動して黙って出す知らせが親の窓を塞ぐと、出ている間は編集画面を閉じられない
+        （配布版の確かめ check_clean_machine.ps1 が窓へ閉じる知らせを送って待つ）
+        """
+        del qt_application
+        controller = UpdateController(
+            harness.window,
+            preferences=Preferences,
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=False,
+        )
+        controller._notify("スクリプトの置き場", "見本")
+        boxes = [
+            w for w in QApplication.topLevelWidgets() if w.windowTitle() == "スクリプトの置き場"
+        ]
+        try:
+            assert boxes and all(box.isVisible() for box in boxes)
+            assert QApplication.activeModalWidget() is None
+        finally:
+            for box in boxes:
+                box.close()
+            controller.deleteLater()
+
+    def test_asking_is_once_for_the_same_files(self, harness: _Harness, asked: list[str]) -> None:
+        harness.preferences = Preferences(update_check=False, scripts_move="ask")
+
+        def decline(text: str) -> bool:
+            asked.append(text)
+            return False
+
+        harness.controller._ask_move = decline  # type: ignore[method-assign]
+        mine = _put_script(harness.layout.install, "効果.anm2")
+        harness.controller.start()
+        harness.controller.start()
+        assert len(asked) == 1 and "1 個" in asked[0]
+        assert mine.is_file()
+        # 新しく置いた物があれば、もう 1 度だけ尋ねる
+        _put_script(harness.layout.install, "次の.anm2")
+        harness.controller.start()
+        assert len(asked) == 2 and "2 個" in asked[1]
+
+    def test_off_does_nothing(self, harness: _Harness, asked: list[str]) -> None:
+        harness.preferences = Preferences(update_check=False, scripts_move="off")
+        mine = _put_script(harness.layout.install, "効果.anm2")
+        harness.controller.start()
+        assert mine.is_file() and asked == [] and harness.informed == [] and not harness.notified
+
+    def test_the_menu_asks_whatever_the_setting(self, harness: _Harness, asked: list[str]) -> None:
+        harness.preferences = Preferences(scripts_move="off")
+        _put_script(harness.layout.install, "効果.anm2")
+        assert harness.controller.offer_script_move(manual=True)
+        assert len(asked) == 1
+        assert (_appdata_scripts() / "効果.anm2").is_file()
+
+    def test_the_menu_says_when_there_is_nothing(self, harness: _Harness) -> None:
+        assert not harness.controller.offer_script_move(manual=True)
+        assert harness.informed and harness.informed[0][0] == "移す物はありません"
+
+    def test_the_bundled_readme_is_not_theirs(self, harness: _Harness, asked: list[str]) -> None:
+        _put_script(harness.layout.install, "README.txt", "同梱の説明")
+        harness.controller.start()
+        assert harness.informed == [] and harness.notified == [] and asked == []
+        assert (harness.layout.install / "scripts" / "README.txt").is_file()
+
+    def test_not_over_another_question(
+        self, harness: _Harness, asked: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """退避の復元などを尋ねている最中には動かない 次の起動へ回す"""
+        monkeypatch.setattr(QApplication, "activeModalWidget", lambda: harness.window)
+        mine = _put_script(harness.layout.install, "効果.anm2")
+        harness.controller.start()
+        assert mine.is_file() and harness.notified == [] and asked == []
+        assert harness.store.load().scripts_offered == ()
+
+    def test_the_editor_has_the_menu(self, qt_application: QApplication) -> None:
+        del qt_application
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            assert "互換/exe の隣のスクリプトを移す…" in window._actions
+            assert window.updates._rescan_scripts == window.rescan_scripts
+        finally:
+            window.close()
+
+    def test_rolling_back_carries_them_to_the_version_rolled_back_to(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """戻すと今の版は previous に回り、次の更新で消える 戻る先の版へ写しておく"""
+        harness.layout.previous.mkdir()
+        (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
+        _put_script(harness.layout.install, "効果.anm2")
+        monkeypatch.setattr(
+            harness.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        assert harness.controller.roll_back()
+        assert (harness.layout.previous / "scripts" / "効果.anm2").is_file()
+
+    def test_a_page_to_update_by_hand_warns_about_them(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """自動では入れ替えられない場所 配布のページから手で入れ替える前に、消える物を言う"""
+        monkeypatch.setattr(Layout, "writable", lambda _self: False)
+        harness.preferences = Preferences(scripts_move="off")
+        _put_script(harness.layout.install, "効果.anm2")
+        harness.controller.check_now()
+        assert harness.informed
+        text = harness.informed[0][1]
+        assert "配布のページ" in text and "1 個" in text
+        assert "フォルダごと入れ替えると消えます" in text
+
+
+class TestPythonChangeNote:
+    """Python が上がる版では、入れ直しの機能・大きさ・時間を入れる前の確認に添える"""
+
+    def test_the_note_says_what_and_how_much(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "runtime"
+        (target / "faster_whisper-1.1.0.dist-info").mkdir(parents=True)
+        (target / "faster_whisper").mkdir()
+        (target / "faster_whisper" / "_ext.cp314-win_amd64.pyd").write_bytes(b"x" * 4096)
+        monkeypatch.setattr(updates_module, "runtime_target_dir", lambda: target)
+        note = updates_module.runtime_note("cp399")
+        assert "cp399" in note and "入れ直しが要ります" in note
+        assert "入れ直しが要るのは 字幕起こし" in note
+        assert "今入れてある分を測った値" in note and "Mbps なら約" in note
+
+    def test_the_same_python_says_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.runtime import python_abi
+
+        (tmp_path / "x").mkdir()
+        monkeypatch.setattr(updates_module, "runtime_target_dir", lambda: tmp_path)
+        assert updates_module.runtime_note(python_abi()) == ""
+
+    def test_the_offer_shows_every_line(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れる前の確認は字を HTML で出す 改行のまま渡すと 1 行に潰れる"""
+        harness.controller.start()
+        harness.store.save(replace(harness.store.load(), ready_python_abi="cp399"))
+        monkeypatch.setattr(updates_module, "runtime_note", lambda abi: f"入れ直し {abi}\n2 行目")
+        shown: list[str] = []
+
+        def choose(_title: str, html: str, **_options: object) -> str:
+            shown.append(html)
+            return updates_module.ANSWER_LATER
+
+        monkeypatch.setattr(harness.controller, "_choose", choose)
+        harness.controller.offer()
+        assert shown and "入れ直し cp399<br>2 行目" in shown[0]

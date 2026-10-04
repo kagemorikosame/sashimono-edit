@@ -2144,15 +2144,24 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
   下書きへ上げる（依存を入れない `contents: write`）をジョブで分ける 依存のどれかが悪さをしても、
   リリースを書き換えられるトークンに届かない
 - 本人の持ち物（設定・スクリプト・テンプレート・入れた実行環境）はフォルダの外にあるので消えない
-  exe の隣の `scripts` に置かれた物は、入れ替える前に新しい版へ写す
+  （下の「更新で消えない置き場」） exe の隣の `scripts` に置かれた物は、入れ替える前に新しい版へ写す
+  （`carry_user_files`） 前の版へ戻すときも、戻る先の版へ写す（戻すと今の版は `.previous` へ回り、
+  次に新しい版を入れたときに消える）
 - Python が上がる版（`python_abi` が変わる）では、入れてある字幕起こしと AI 連携の環境が読めなくなる
   入れる前の確認でそう言い、入れた後は導入先を読まずに「入れ直してください」と出す
   （`runtime.stale_runtime` 導入先の `.python-abi` に機能ごとの ABI を書いておく） 消しはしない
+  確認には、入れ直しが要る機能と、落とし直す大きさと時間の目安を添える（`update/reinstall.py`）
+  大きさは今の導入先を実際に測る（入れ直すと同じ物をもう 1 度落とす） 1.5 秒で測り終えなければ
+  機能ごとの目安（`FeaturePack.size_mb`）を使い、目安だと書く 時間は 100 Mbps と 20 Mbps の 2 つで出す
+  配布のページから手で入れ替えるよう案内するとき（自動では入れ替えられない置き場・`minimum` より
+  古い版）も、手で確かめた窓に同じ案内と exe の隣の `scripts` の注意を添える
 - 古い形式のプロジェクトを今の形式で上書きする前に、横へ `名前.sme.bak` を残す
   （前の版へ戻した人が、上げる前の作品を開けるように）
 - 好みは `Preferences` の `update_check`（起動時に確かめる 既定は入）・`update_beta`
   （ベータも受け取る 既定は切）・`update_confirm`（入れる前に尋ねる 既定は入 切ると次の起動の頭で入れる）
   確かめるのを切れば今の版に留まる（〔ヘルプ〕→〔更新を確かめる…〕で手で確かめられる）
+  exe の隣の `scripts` の扱いは `scripts_move`（自動で移す 既定・尋ねる・何もしない 下の「exe の隣の
+  `scripts`」）
 
 設定を切り替えたときの、待っている版（落として展開した版）と次の起動の予約は、次の表で
 決める 画面で切り替えたとき（`UpdateController.apply_preferences`）も、起動の頭
@@ -2186,6 +2195,83 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 - 配る zip の確かめ（`tools/build_package.py`）は、配布版の exe の中で、使い捨ての鍵と見本の
   リリースを使って署名・照合・展開・PowerShell の入れ替えまでを通す（自己診断の「自動更新」）
   ネットワークへは出ない 試験も同じで、取り口は偽物（`MemoryTransport`）
+
+### 更新で消えない置き場
+
+本人が作った物・入れた物の置き場と、更新で残るか（Issue #244 2026-10-05 にコードを読んで確かめた）
+置き場の名前は `core/userdirs.py` の 1 か所から取る（4 章の「本人の置き場の名前は 1 か所」）
+新しく本人の物を書く所を足すときは、ここに行を足し、インストール先（exe の隣）には書かない
+
+| 持ち物 | 置き場 | 決めている所 | 自動更新 | 手で入れ替える |
+|---|---|---|---|---|
+| 設定・画面配置・ショートカット・新規作成の雛形 | `%APPDATA%\Sashimono`（`preferences.json` `workspace.ini` `shortcuts.json` `project_presets.json`） | `ui/workspace.py` `ui/project_presets.py` | 残る | 残る |
+| エフェクトのプリセット（`.smep`） | `%APPDATA%\Sashimono\presets` | `core/io/presets.py` | 残る | 残る |
+| エイリアス（右クリックの〔追加〕に並ぶ自分のクリップ `.smea`） | `%APPDATA%\Sashimono\aliases` | `core/io/aliases.py` | 残る | 残る |
+| 自分で足すテンプレート（`.exa` `.exa2` `.object` `.exo` `.exo2` `.ymmt`） | `%APPDATA%\Sashimono\templates` | `compat/catalog.py` の `default_template_roots` | 残る | 残る |
+| スクリプト | `%APPDATA%\Sashimono\scripts` | `compat/aviutl/catalog.py` の `default_script_roots` | 残る | 残る |
+| 退避・保存前のバックアップ | `%LOCALAPPDATA%\Sashimono\recovery` `backups` | `core/io/recovery.py` | 残る | 残る |
+| キャッシュ（波形・サムネイル・控え） | `%LOCALAPPDATA%\Sashimono\cache` | `engine/cache/store.py` | 残る | 残る |
+| 入れた字幕起こし・AI 連携 | `%LOCALAPPDATA%\Sashimono\runtime` | `runtime.py` の `runtime_target_dir` | 残る（Python が上がる版では読めなくなる 消しはしない） | 同じ |
+| 字幕起こしのモデル | `%USERPROFILE%\.cache\huggingface\hub`（`HF_HOME` があればその下） | `asr/environment.py` | 残る | 残る |
+| 自動更新の覚え書き | `%LOCALAPPDATA%\Sashimono\update` | `update/state.py` | 残る | 残る |
+| AviUtl2 の `Script` `Alias` `Plugin` と `.aux2` `.mod2` | `%PROGRAMDATA%\aviutl2` | 読むだけ | 触らない | 触らない |
+| YMM4 のアイテムテンプレート | `%LOCALAPPDATA%\YukkuriMovieMaker\ItemTemplate` | 読むだけ | 触らない | 触らない |
+| exe の隣の `scripts` に置いた物 | インストール先の中 | `update/portable.py` | 新しい版へ写す | **消える**（起動したときに `%APPDATA%` 側へ移す） |
+
+- テンプレートは読むだけで、Sashimono が書く所は無い 棚へ足すのは本人が `templates` へ置いた物
+- `.exa`（AviUtl のエイリアス）は読むだけで書き出さない Sashimono のエイリアスは `.smea` で、
+  `%APPDATA%` の側に保存する どちらもインストール先には書かない
+
+### exe の隣の `scripts`
+
+配布版の `Sashimono.exe` の隣の `scripts` は、**読む置き場として残す** 前の版の案内どおりそこへ
+置いた人がいて、読むのをやめるとその人のスクリプトが更新の前から使えなくなる
+ただし勧める置き場は `%APPDATA%\Sashimono\scripts`（〔互換〕→〔スクリプトフォルダを開く〕）
+
+- 自動更新は入れ替える前に新しい版へ写す（`carry_user_files`） 前の版へ戻すときも戻る先へ写す
+- zip を手で展開し直してフォルダごと入れ替えると消える（元のフォルダへ上書きで展開するだけなら残る）
+- そこで、起動したときに `%APPDATA%\Sashimono\scripts` へ移す（`UpdateController.offer_script_move`
+  起動の 3 秒後 `start_updates` の中） 好みは `Preferences.scripts_move`
+  自動で移す（`auto` 既定 利用者の決定）・移すかを尋ねる（`ask` 同じ物は 1 度だけ）・何もしない（`off`）
+  どれでも〔互換〕→〔exe の隣のスクリプトを移す…〕から移せる
+- 移す決まり（`update/portable.py`）
+  - 同梱の物（`BUNDLED_SCRIPT_FILES` 今は直下の `README.txt` だけ）は移さない 配る zip の `scripts` に
+    物を足したら、ここにも足す（`tests/update/test_portable.py` が `build_package.assemble` と照らす）
+  - 移し先に同じ名前があれば上書きせず、exe の隣に残して知らせる 別の名前で写すことはしない
+    別の名前にするとスクリプトの名前（`aviutl:相対の場所:名前`）が変わり、同じ物が棚に 2 つ並ぶ
+  - 作業用の名前（`<名前>.<プロセス番号>.moving`）へ写し、元と中身を照らしてから本来の名前を付け、
+    それから元を消す 途中で失敗しても元は消さない 元を消せなかった物は数えて知らせる
+  - 移して空になったフォルダは片付ける `scripts` そのものは残す
+- **読む順は変わらない** 読む順は exe の隣 → `%APPDATA%` → AviUtl2 で、後に読んだ方が同じ名前で勝つ
+  移すのはいちばん負ける exe の隣から次の `%APPDATA%` へだけで、`%APPDATA%` に同じ名前があれば
+  移さない（前から `%APPDATA%` の方が勝っている） 名前は置き場からの相対なので、作品の中の名前も変わらない
+- 知らせは 1 度だけ（`UpdateState.scripts_offered` に見た物を覚える） 自動で移した知らせは、窓を塞がない
+  窓（modeless）で出す 塞ぐと、出ている間は編集画面を閉じられない（Windows の閉じる知らせも
+  塞がれた窓には届かず、`check_clean_machine.ps1` の「閉じる知らせを送って待つ」が落ちる）
+  ほかの窓（退避の復元など）を尋ねている最中なら、何もせずに次の起動へ回す
+- まっさらな Windows の確かめ（`check_clean_machine.ps1`）は、exe の隣に見本を置いて起動し、閉じた後に
+  `%APPDATA%` 側へ移ったことを見る
+
+### リリースノート
+
+下書きの本文は Release の workflow（`release.yml`）が雛形で作る 公開する前に「変わった所」を書く
+雛形には「更新のしかた」（自動更新と手で入れ替えるときの違い、exe の隣の `scripts` が手で入れ替えると
+消えること）が毎回同じ言い方で入る 消さない
+
+#### Python が上がる版を出すとき
+
+`python_abi`（配布版の Python の上 2 桁 `cp314` など）が前の正式版から変わる版は、字幕起こしと AI 連携を
+入れた人が全員入れ直しになる（入れてある物は消さないが、入れ直すまで使えない 合わせて 2 GB を超える）
+
+- **リリースノートの先頭に書く** 雛形は、前の正式版の目録（固定の URL）と zip の `build-info.json` を
+  比べ、変わっていれば先頭に注意を入れる（初めての公開などで前の目録が読めなければ比べない）
+  書くのは、入れ直しが要る機能・落とし直す大きさ（数百 MB から 2 GB 超）・時間（回線で数分から 20 分ほど）・
+  締め切りの前は更新を後にすること
+- `tools/release.py` は公開を尋ねる前の要約で、この版が置き換える目録（正式版は固定の URL、ベータは `beta`）
+  と比べ、変わるなら目立つ注意を出す 読めなければ「確かめられない」と出す 先頭に書いたかを見てから y と答える
+- アプリの側は、入れる前の確認に入れ直しの機能・大きさ・時間を出す（上の「自動更新の仕組み」）
+- Python を上げる PR では、`build_package.py` の zip からの確かめ（後から入れる部品の読み込みまで）を
+  通してから出す 後から入れる部品が新しい Python 向けの wheel を出していなければ、入れ直せない
 
 ### 自動更新の署名鍵
 
