@@ -71,6 +71,16 @@ $healthSeconds = [int]$env:SASHIMONO_UPDATE_HEALTH_SECONDS
 $lock = $env:SASHIMONO_UPDATE_LOCK
 
 function Write-Result([string]$text) {
+    # 本体が結果を読んでいる間は、書き足しが断られることがある（ほかのプロセスが使用中）
+    # 書けずに止まると、走り始めたのに本体は走らないと取り違える 少し待って書き直す
+    for ($i = 0; $i -lt 50; $i++) {
+        try {
+            Add-Content -LiteralPath $result -Value $text -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
     Add-Content -LiteralPath $result -Value $text -Encoding UTF8
 }
 
@@ -265,8 +275,12 @@ WAIT_SECONDS = 120
 #: 新しい版が窓を出すのを待つ秒数 初めての起動はウイルス対策の検査で遅いことがある
 HEALTH_SECONDS = 90
 
-#: 入れ替え係が走り始めたことを待つ秒数 PowerShell の起動は遅い機械で数秒かかる
-START_SECONDS = 20.0
+#: 入れ替え係が走り始めたことを待つ秒数
+#: その利用者が初めて PowerShell 5.1 を起こすときは「Preparing modules for first use」で遅い
+#: CI のまっさらな Windows で 11〜22 秒、変数を削った環境では 20〜34 秒かかった（Issue #33）
+#: PowerShell を使わない人は多く、更新のときが初めての起動になる 20 秒では遅い機械で
+#: 「PowerShell が動かない」と取り違える 走り始めればすぐ返るので、長めに待っても速い機械は待たない
+START_SECONDS = 60.0
 
 
 def powershell_path() -> Path:
