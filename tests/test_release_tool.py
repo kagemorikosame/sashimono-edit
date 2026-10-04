@@ -7,6 +7,7 @@ git と gh は偽物に差し替える 本物の GitHub へは何も書かない
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import io
@@ -315,12 +316,12 @@ def world(tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     yield World(root=root, github=github, key=key, public=public)
 
 
-def _signed(world: World, tool: ModuleType, tmp_path: Path) -> None:
-    """下書きに目録と署名を上げた後の形にする"""
+def _signed(world: World, tool: ModuleType, tmp_path: Path, **options: str) -> None:
+    """下書きに目録と署名を上げた後の形にする ``options`` は目録を作るときの引数"""
     archive = tmp_path / ZIP
     archive.write_bytes(world.github.files[ZIP])
     manifest = tmp_path / "update.json"
-    manifest.write_bytes(tool.update_sign.build_manifest(archive))
+    manifest.write_bytes(tool.update_sign.build_manifest(archive, **options))
     tool.update_sign.sign_file(manifest, world.key, lambda _prompt: PASSPHRASE)
     world.github.files["update.json"] = manifest.read_bytes()
     world.github.files["update.json.sig"] = (tmp_path / "update.json.sig").read_bytes()
@@ -828,6 +829,89 @@ class TestTheCheckAndSignature:
         assert world.main(tool) == 1
         assert world.published
         assert len(world.fetched) == tool.LATEST_TRIES
+
+
+class TestReusedManifestsFollowTheArguments:
+    """前に作った目録を使い回すときは、今の引数で作り直した物と全部の項目を比べる
+
+    版と zip だけを見ると、--minimum を変えて打ち直したときに古い minimum の目録を通す
+    """
+
+    def test_a_draft_manifest_with_another_minimum_stops(
+        self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _signed(world, tool, tmp_path)
+        world.answers = ["y", "y"]
+        assert world.main(tool, "--minimum", "0.0.1") == 1
+        out = capsys.readouterr().out
+        assert "minimum が 0.0.0（今は 0.0.1）" in out
+        assert f"gh release delete-asset {TAG} update.json -y" in out
+        assert f"gh release delete-asset {TAG} update.json.sig -y" in out
+        assert "公開はしていない" in out
+        # 道具は消さない・上げない・公開しない
+        assert world.github.writes == [] and world.secrets == []
+
+    def test_other_items_are_compared_too(
+        self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _signed(world, tool, tmp_path, notes_url="https://example.invalid/notes")
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        assert "notes_url が https://example.invalid/notes" in capsys.readouterr().out
+        assert not world.published
+
+    def test_a_local_signed_copy_with_another_minimum_is_signed_again(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """上げる所で落ちて手元に残った目録も、引数が変われば作り直して署名し直す"""
+        world.github.fail_uploads = {"update.json"}
+        world.answers = ["y"]
+        assert world.main(tool) == 1
+        assert len(world.secrets) == 1
+        world.github.fail_uploads = set()
+        world.answers = ["n"]
+        assert world.main(tool, "--minimum", "0.0.1") == 0
+        assert len(world.secrets) == 2
+        uploaded = tool.parse_manifest(world.github.files["update.json"])
+        assert uploaded.minimum == "0.0.1"
+
+    def test_resuming_with_another_minimum_stops(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        world.github.beta_release = True
+        world.github.fail_uploads = {"beta"}
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        world.github.fail_uploads = set()
+        writes = list(world.github.writes)
+        capsys.readouterr()
+        world.answers = ["y"]
+        assert world.main(tool, "--minimum", "0.0.1") == 1
+        out = capsys.readouterr().out
+        assert "前と同じ引数で打ち直す" in out and "minimum が 0.0.0（今は 0.0.1）" in out
+        assert "公開はしていない" not in out and "gh release upload beta" not in out
+        assert world.github.writes == writes
+
+    def test_differences_cover_every_item_of_the_manifest(self, tool: ModuleType) -> None:
+        """目録に項目を足しても比べ漏れない 型から数える"""
+        base = tool.Manifest(
+            schema=1,
+            version=VERSION,
+            minimum="0.0.0",
+            python_abi="cp314",
+            notes_url="n",
+            package=tool.PackageInfo("u", 1, "s"),
+        )
+        names = [item.name for item in dataclasses.fields(tool.Manifest) if item.name != "package"]
+        for name in names:
+            changed = dataclasses.replace(base, **{name: 2 if name == "schema" else "x"})
+            assert tool.manifest_differences(changed, base)[0].startswith(f"{name} が ")
+        for part in ("url", "size", "sha256"):
+            value: object = 2 if part == "size" else "x"
+            package = dataclasses.replace(base.package, **{part: value})
+            changed = dataclasses.replace(base, package=package)
+            assert tool.manifest_differences(changed, base)[0].startswith(f"package.{part} が ")
+        assert tool.manifest_differences(base, base) == []
 
 
 class TestDryRun:

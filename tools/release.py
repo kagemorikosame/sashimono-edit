@@ -43,7 +43,7 @@ import time
 import urllib.request
 import zipfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +62,9 @@ from update_keys import KEY_FILES  # noqa: E402
 
 from sashimono.links import BETA_MANIFEST_URL, STABLE_MANIFEST_URL  # noqa: E402
 from sashimono.update.manifest import (  # noqa: E402
+    Manifest,
     ManifestError,
+    PackageInfo,
     is_prerelease,
     parse_manifest,
 )
@@ -236,6 +238,26 @@ def key_label(index: int | None) -> str:
     return f"TRUSTED_PUBLIC_KEYS の {index} 本目（{names.get(index, '鍵')}）"
 
 
+def manifest_differences(found: Manifest, expected: Manifest) -> list[str]:
+    """2 つの目録で違う項目 ``項目 が 値（今は 値）`` の形 項目は目録の型から数える
+
+    名前を手で並べると、目録に項目を足したときに比べ漏れる
+    """
+    differences = []
+    for item in fields(Manifest):
+        have, want = getattr(found, item.name), getattr(expected, item.name)
+        if item.name == "package":
+            for part in fields(PackageInfo):
+                if getattr(have, part.name) != getattr(want, part.name):
+                    differences.append(
+                        f"package.{part.name} が {getattr(have, part.name)}"
+                        f"（今は {getattr(want, part.name)}）"
+                    )
+        elif have != want:
+            differences.append(f"{item.name} が {have}（今は {want}）")
+    return differences
+
+
 def zip_name(version: str) -> str:
     return f"{build_package.ARCHIVE_PREFIX}-{version}-windows-x64.zip"
 
@@ -283,6 +305,8 @@ class Release:
     hint_after_stop: bool = True
     #: 公開済みで止まったとき、打ち直せば続きから進めるか
     rerun_helps: bool = True
+    #: 今の引数で作り直した目録（:meth:`expected_manifest` が 1 度だけ作る）
+    expected: Manifest | None = None
 
     # --- 小さな道具 ---------------------------------------------------------------
 
@@ -813,9 +837,18 @@ class Release:
                 )
             problem = self.manifest_problem(remote / MANIFEST_NAME)
             if problem:
+                # 道具が消して作り直すことはしない --minimum の打ち間違いのこともあり、消すと
+                # 戻せない（もう一度署名するしかない） どちらが正しいかは人が決める
+                local_copies = " ".join(
+                    str(path) for path in (local, local.with_name(SIGNATURE_NAME)) if path.exists()
+                )
+                tidy = f" と手元の写し（{local_copies}）" if local_copies else ""
                 raise StopError(
-                    f"下書きの目録が通らない: {problem}（gh release delete-asset {self.tag} "
-                    f"{MANIFEST_NAME} -y と {SIGNATURE_NAME} を消して、もう一度打つ）"
+                    f"下書きの目録が通らない: {problem}\n  引数が正しいなら、下書きの "
+                    f"{MANIFEST_NAME} と {SIGNATURE_NAME}{tidy}を消して、もう一度打つ\n"
+                    f"  gh release delete-asset {self.tag} {MANIFEST_NAME} -y\n"
+                    f"  gh release delete-asset {self.tag} {SIGNATURE_NAME} -y\n"
+                    "  引数を間違えたなら、前と同じ引数で打ち直す"
                 )
             self.done(f"下書きの目録と署名が通った（{key_label(self.signer)}）")
             return
@@ -863,6 +896,22 @@ class Release:
             raise StopError(f"署名した目録が通らない: {problem}")
         self.done(f"署名して確かめた（{key_label(self.signer)}）")
 
+    def expected_manifest(self) -> Manifest | None:
+        """手元の zip と今の引数で作り直した目録 zip が手元に無い・照らす zip と違えば None
+
+        署名する物と同じ ``update_sign.build_manifest`` で作る 比べる側だけ別に組むと、
+        目録に項目を足したときに比べ漏れる
+        """
+        if self.expected is not None:
+            return self.expected
+        if not self.archive.is_file() or self.archive.stat().st_size != self.zip_size:
+            return None
+        if sha256_of(self.archive) != self.zip_sha256:
+            return None
+        built = update_sign.build_manifest(self.archive, minimum=self.minimum)
+        self.expected = parse_manifest(built)
+        return self.expected
+
     def manifest_problem(self, manifest: Path) -> str | None:
         """目録と署名が、埋め込んだ鍵で通り、この版とこの zip を指しているか 通れば None"""
         signature = manifest.with_name(manifest.name + SIGNATURE_SUFFIX)
@@ -879,8 +928,14 @@ class Release:
             return f"目録の版が {version}"
         if parsed.package.sha256 != self.zip_sha256 or parsed.package.size != self.zip_size:
             return "目録の zip の sha256 か大きさが、下書きの zip と違う"
-        if not parsed.package.url.endswith("/" + zip_name(self.version)):
-            return f"目録の zip の URL が違う（{parsed.package.url}）"
+        # 今の引数（--minimum など）で作り直した目録と、全部の項目を比べる 版と zip だけを
+        # 見ると、--minimum を変えて打ち直したときに、古い minimum で署名した目録を通してしまう
+        expected = self.expected_manifest()
+        if expected is None:
+            return "zip が手元に無く、目録を作り直して比べられない"
+        differences = manifest_differences(parsed, expected)
+        if differences:
+            return "今の引数で作り直した目録と違う（" + "、".join(differences) + "）"
         self.signer = signer_index(manifest.read_bytes(), signature.read_bytes())
         self.manifest = manifest
         return None
@@ -994,11 +1049,44 @@ class Release:
             self.todo("公開した後の残り（beta の目録・固定の URL の確かめ）を続けられるかを見る")
             return 1 if self.problems else 0
         # 下書きのときに手元で確かめた写し（落とした物か、署名した物）
-        known = [
-            path
-            for path in (self.folder / "remote" / MANIFEST_NAME, self.folder / MANIFEST_NAME)
-            if self.manifest_problem(path) is None
-        ]
+        # 目録を今の引数で作り直して比べるのに、公開された zip そのものが要る
+        if not self.matches(self.archive, asset):
+            self.folder.mkdir(parents=True, exist_ok=True)
+            self.call(
+                "gh",
+                "release",
+                "download",
+                self.tag,
+                "--pattern",
+                zip_name(self.version),
+                "--dir",
+                str(self.folder),
+                "--clobber",
+                what="zip を落とすの",
+            )
+            if not self.matches(self.archive, asset):
+                raise StopError(
+                    "落とした zip が GitHub の digest・大きさと合わない（もう一度打つ）"
+                )
+        known: list[Path] = []
+        reasons: list[str] = []
+        for path in (self.folder / "remote" / MANIFEST_NAME, self.folder / MANIFEST_NAME):
+            if not path.is_file():
+                continue
+            problem = self.manifest_problem(path)
+            if problem is None:
+                known.append(path)
+            else:
+                reasons.append(f"{path}: {problem}")
+        if not known and reasons:
+            # 写しはあるが今の引数と合わない --minimum を変えて打ち直したなど 公開した物は
+            # 前の引数で作ってあるので、前と同じ引数で打ち直せば続けられる
+            self.hint_after_stop = False
+            raise StopError(
+                stop
+                + " 手元の写しが今の引数と合わない（前と同じ引数で打ち直す）\n  "
+                + "\n  ".join(reasons)
+            )
         if not known:
             # 打ち直しても同じ所で止まる 手で済ませる残りは main が並べる
             self.rerun_helps = False
