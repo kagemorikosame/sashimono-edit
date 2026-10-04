@@ -113,6 +113,10 @@ class FakeGitHub:
     listed: dict[str, int] = field(default_factory=dict)
     #: 上げるのを断る先（リリースのタグかファイルの名前）
     fail_uploads: set[str] = field(default_factory=set)
+    #: 落とすのを断るファイルの名前
+    fail_downloads: set[str] = field(default_factory=set)
+    #: ``gh release edit`` の結果（GitHub の側で公開まで済んだか, 終了コード）
+    edit_result: tuple[bool, int] = (True, 0)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -184,6 +188,8 @@ class FakeGitHub:
                     return "", 1
                 return self.files[name].decode("utf-8"), 0
             case ["gh", "release", "download", _, "--pattern", name, "--dir", folder, *_]:
+                if name in self.fail_downloads:
+                    return "", 1
                 Path(folder).mkdir(parents=True, exist_ok=True)
                 (Path(folder) / name).write_bytes(self.files[name])
                 return "", 0
@@ -200,8 +206,10 @@ class FakeGitHub:
                 return "", 0
             case ["gh", "release", "edit", *_]:
                 self.writes.append(args)
-                self.draft = False
-                return "", 0
+                published, code = self.edit_result
+                if published:
+                    self.draft = False
+                return "", code
         raise AssertionError(f"偽物が知らない呼び方: {args}")
 
 
@@ -537,7 +545,10 @@ class TestTheDraft:
         world.github.draft = False
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
-        assert "公開済み" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "公開済み" in out and "公開はしていない" not in out
+        # 目録の無い公開に、beta へ上げる手順を出しても上げる物が無い
+        assert "gh release upload beta" not in out
         assert world.github.writes == []
 
     def test_a_zip_that_differs_from_github_stops(self, tool: ModuleType, world: World) -> None:
@@ -665,7 +676,11 @@ class TestAfterPublishing:
         assert half_done.github.writes == writes
 
     def test_a_replaced_manifest_on_the_published_release_stops(
-        self, tool: ModuleType, half_done: World, tmp_path: Path
+        self,
+        tool: ModuleType,
+        half_done: World,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """公開した後に差し替えられた目録は、署名が通っても beta へ広げない"""
         other = tmp_path / "other"
@@ -678,9 +693,15 @@ class TestAfterPublishing:
         half_done.github.files["update.json"] = manifest.read_bytes()
         half_done.github.files["update.json.sig"] = (other / "update.json.sig").read_bytes()
         writes = list(half_done.github.writes)
+        capsys.readouterr()
         half_done.answers = ["y"]
         assert half_done.main(tool) == 1
         assert half_done.github.writes == writes
+        out = capsys.readouterr().out
+        assert "公開はしていない" not in out
+        assert f"{TAG} の公開は済んでいる 上の理由を確かめるまで" in out
+        # 差し替えられた目録を beta へ広げる手順は出さない
+        assert "gh release upload beta" not in out
 
     def test_without_the_checked_copy_it_prints_what_to_do_by_hand(
         self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
@@ -692,8 +713,43 @@ class TestAfterPublishing:
         half_done.answers = ["y"]
         assert half_done.main(tool) == 1
         out = capsys.readouterr().out
-        assert "残りは手で済ませる" in out and "gh release upload beta" in out
+        assert "公開はしていない" not in out
+        assert f"{TAG} の公開は済んでいる 残りは手で次を行う" in out
+        assert "gh release upload beta" in out
         assert half_done.github.writes == writes
+
+    def test_a_failed_download_of_the_published_manifest_says_it_is_published(
+        self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        half_done.github.fail_downloads = {"update.json.sig"}
+        capsys.readouterr()
+        writes = list(half_done.github.writes)
+        half_done.answers = ["y"]
+        assert half_done.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "公開はしていない" not in out
+        assert f"{TAG} の公開は済んでいる 残りは同じコマンドを打ち直すか" in out
+        assert half_done.github.writes == writes
+
+    def test_a_publish_call_that_fails_after_github_published_says_so(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """通信が切れても GitHub の側で公開まで済んでいれば、公開済みとして残りを出す"""
+        world.github.edit_result = (True, 1)
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "公開はしていない" not in out
+        assert f"{TAG} の公開は済んでいる" in out
+
+    def test_a_publish_call_that_fails_keeps_the_draft_message(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        world.github.edit_result = (False, 1)
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "公開はしていない" in out and "公開は済んでいる" not in out
 
     def test_dry_run_on_a_published_release_writes_nothing(
         self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]

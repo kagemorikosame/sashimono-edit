@@ -278,6 +278,11 @@ class Release:
     published: bool = False
     #: 公開した後に beta へも目録を上げ直すか
     has_beta: bool = False
+    #: 公開済みで止まったとき、手で打つ残りを出してよいか
+    #: 公開された目録が確かめられないときは出さない（違う目録を beta へ広げない）
+    hint_after_stop: bool = True
+    #: 公開済みで止まったとき、打ち直せば続きから進めるか
+    rerun_helps: bool = True
 
     # --- 小さな道具 ---------------------------------------------------------------
 
@@ -565,6 +570,10 @@ class Release:
                 f"リリース {self.tag} が無い（Release の workflow が下書きを作る 3 のログを見る）"
             )
         if not release.get("isDraft"):
+            # 通しでは公開済みを先に resume_published へ回す ここへ来るのは、見た直後に誰かが
+            # 公開したときだけ 何を公開したかが分からないので、手で打つ残りは出さない
+            self.published = True
+            self.hint_after_stop = False
             raise StopError(
                 f"{self.tag} は公開済み 公開した後の zip や目録は差し替えない"
                 "（直すなら版を上げて新しいタグで出す）"
@@ -907,12 +916,16 @@ class Release:
             print("公開しなかった 下書きのまま（もう一度打てば、ここから尋ねる）")
             return 0
         self.has_beta = has_beta
-        if self.beta:
-            self.call(
-                "gh", "release", "edit", self.tag, "--draft=false", "--prerelease", what="公開"
-            )
-        else:
-            self.call("gh", "release", "edit", self.tag, "--draft=false", "--latest", what="公開")
+        flag = "--prerelease" if self.beta else "--latest"
+        try:
+            self.call("gh", "release", "edit", self.tag, "--draft=false", flag, what="公開")
+        except StopError:
+            # 通信が切れただけで、GitHub の側では公開まで済んでいることがある 見直さずに
+            # 「公開はしていない」と出すと、公開された版の残り（beta の目録）が放っておかれる
+            after = self.load_release()
+            if after is not None and not after.get("isDraft"):
+                self.published = True
+            raise
         self.published = True
         print(f"公開した: {self.tag}")
         return self.after_publish()
@@ -957,6 +970,8 @@ class Release:
         手元で確かめた物とバイト列まで同じときだけ 違えば、公開した後に誰かが差し替えた
         """
         print("== 4. 公開済み ==")
+        # 公開済みと分かった時点で記録する この後どこで止まっても「公開はしていない」と出さない
+        self.published = True
         assets = self.assets()
         asset = assets.get(zip_name(self.version))
         stop = (
@@ -964,9 +979,12 @@ class Release:
             "（直すなら版を上げて新しいタグで出す）"
         )
         if asset is None or MANIFEST_NAME not in assets or SIGNATURE_NAME not in assets:
-            raise StopError(stop)
+            # 署名した目録の無い公開 beta へ上げる手順を出しても、上げる物が無い
+            self.hint_after_stop = False
+            raise StopError(stop + " 公開されているリリースに zip か目録か署名が無い")
         digest = str(asset.get("digest") or "")
         if not digest.startswith("sha256:"):
+            self.hint_after_stop = False
             raise StopError(stop + " zip の digest が無く、目録と照らせない")
         self.zip_sha256 = digest.removeprefix("sha256:")
         self.zip_size = int(asset.get("size", -1))
@@ -982,11 +1000,9 @@ class Release:
             if self.manifest_problem(path) is None
         ]
         if not known:
-            raise StopError(
-                stop
-                + " 下書きのときに確かめた目録が手元に無いので、残りは手で済ませる\n  "
-                + "\n  ".join(self.after_publish_hint())
-            )
+            # 打ち直しても同じ所で止まる 手で済ませる残りは main が並べる
+            self.rerun_helps = False
+            raise StopError(stop + " 下書きのときに確かめた目録が手元に無い")
         published = self.folder / "published"
         published.mkdir(parents=True, exist_ok=True)
         for name in (MANIFEST_NAME, SIGNATURE_NAME):
@@ -1010,11 +1026,12 @@ class Release:
             for path in known
         )
         if problem or not same:
+            # 違う目録を beta へ広げる手順は出さない 先に誰が差し替えたかを確かめる
+            self.hint_after_stop = False
             raise StopError(
                 f"公開されている目録が、下書きのときに確かめた物と違う（{problem or '中身が違う'}）"
                 " 誰が差し替えたかを確かめる（直すなら版を上げて新しいタグで出す）"
             )
-        self.published = True
         self.done(
             f"{self.tag} は公開済み 目録と署名は下書きのときと同じ（{key_label(self.signer)}）"
         )
@@ -1107,7 +1124,11 @@ def main(argv: list[str] | None = None, **overrides: Any) -> int:
     if release.published:
         # 公開した後で落ちた 「公開はしていない」と出すと、事実と違ううえに、打ち直しても
         # 公開済みで止まると思って残り（beta の目録）を放っておかれる
-        print(f"{release.tag} の公開は済んでいる 残りは同じコマンドを打ち直すか、手で次を行う")
+        if not release.hint_after_stop:
+            print(f"{release.tag} の公開は済んでいる 上の理由を確かめるまで、残りは進めない")
+            return 1
+        lead = "同じコマンドを打ち直すか、手で次を行う" if release.rerun_helps else "手で次を行う"
+        print(f"{release.tag} の公開は済んでいる 残りは{lead}")
         for line in release.after_publish_hint():
             print(f"  {line}")
         return 1
