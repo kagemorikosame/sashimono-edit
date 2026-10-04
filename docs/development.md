@@ -2011,10 +2011,19 @@ GPL と LGPL の部品（FFmpeg・x264・x265・LAME・libiconv・Qt・PySide6�
 対応するソースを渡せる状態を保たなければならない 上流の置き場は消えたり移ったりするので、
 **zip と同じ GitHub Release に、積んだのと同じ版のソースを添付する**
 
+リリースでは `tools/release.py`（下の「自動更新のリリース」）が、下書きから落とした zip を
+展開した物を数えてここを走らせ、下書きへ上げる 飛ばすのは、下書きの `sources-manifest.json` に
+載ったファイルが全部、同じ大きさと sha256 で下書きにあり、`sources-SHA256SUMS.txt` もあるときだけ
+欠けていれば足りない分だけ上げ直す 上げるときは本体を上げ終えてから、別の呼び出しで索引
+（`sources-manifest.json` と `sources-SHA256SUMS.txt`）を上げる 1 回で並べて上げると、途中で落ちた
+ときに索引だけが上がり、次に打ったときに揃ったと見て、ソースが欠けたまま公開まで進む
+手で行うときも、本体 → 索引の順に上げる
+
 ```
 .venv\Scripts\python.exe tools\collect_sources.py --check
 .venv\Scripts\python.exe tools\collect_sources.py
-gh release upload <タグ> dist\SashimonoEdit-<版>-windows-x64.zip dist\sources\*
+gh release upload <タグ> dist\sources\*.tar.* --clobber
+gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sources-manifest.json --clobber
 ```
 
 - `--check` は入手先に届くかだけを見る（中身は落とさない） 落とすと 100 MB ほど
@@ -2216,16 +2225,64 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 
 ### 自動更新のリリース
 
+`__version__` を上げた PR を main へ入れ、CI と Package が通ったら、main の手元で 1 コマンド打つ
+
+```
+.venv\Scripts\python.exe tools\release.py <版> --key <鍵のファイル>
+.venv\Scripts\python.exe tools\release.py <版> --key <鍵のファイル> --dry-run   （何も変えずに残りを見る）
+```
+
+`--key` に鍵を入れたフォルダを渡すと、中の `sashimono-update-current.key`（今使う鍵）を使う
+予備の鍵で署名するとき（鍵の差し替え）は、そのファイルを直に渡す
+
+道具（`tools/release.py`）は次の段を順に進める **どの段も済んでいれば飛ばす** 途中で落ちたら
+公開せずに止まり、次に何をするかを出す 直してから同じコマンドを打てば、続きから進む
+
+| 段 | すること | 済んでいれば |
+|---|---|---|
+| 1. 前提 | 引数の版と `__version__` が同じ 手元が main で汚れていない origin/main と同じ 出す commit の CI と Package が success（走っている途中なら待つ） gh が使える 鍵が `TRUSTED_PUBLIC_KEYS` にある | ─ |
+| 2. タグ | `v<版>` を注釈付きで打って push する | push 済みのタグが main の歴史の中で同じ版の commit を指せば飛ばす それ以外なら止まる |
+| 3. 組み立て | Actions の Release（`release.yml`）がそのタグで終わるのを待つ | success なら飛ばす 落ちていれば止まる |
+| 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、展開する | 落とした zip が同じなら落とし直さない 公開済みなら下の「公開済みに打ち直したとき」 |
+| 5. ソース | 足りない物を `collect_sources.py` で集め、本体を上げ終えてから別の呼び出しで索引を上げる | 下書きの `sources-manifest.json` に載ったファイルが全部、同じ大きさと sha256 で下書きにあり、`sources-SHA256SUMS.txt` もあれば飛ばす 欠けていれば足りない分だけ上げ直す |
+| 6. 自己診断 | 展開した zip を `build_package.py` と同じ確かめ（`--self-check` ほか）に掛け、アプリを起こして「GL で描けていたか y/N」と尋ねる（`--skip-launch` で起こさない） | 同じ zip で通した印（`dist\release\release-checked.json`）があれば飛ばす |
+| 7. 目録と署名 | `update_sign.py` の manifest → sign（合言葉を尋ねる）→ verify → 下書きへ上げる | 下書きにあれば落として verify し、今の引数（`--minimum` など）と zip で作り直した目録と全部の項目が同じなら飛ばす 違えば止まり、消して打ち直すか前と同じ引数で打ち直すかを出す（道具は消さない） 手元に上げ損ねた署名済みの目録があれば同じく比べ、同じなら上げるだけ 違えば作り直して署名し直す |
+| 8. 公開 | 版・zip の大きさと sha256・資産の数・署名した鍵を出し、**y と答えたときだけ**公開する 公開した後、固定の URL がこの版を指すかを見る | ─ |
+
+- 公開は必ず人が y と答える 確かめを全部飛ばす旗は作らない 取り返しが付かないのは公開だけで、
+  そこを機械に任せると、署名の通らない版や描けない版を配って全員の自動更新を止める
+- 秘密鍵と合言葉は画面にもファイルにも出さない 合言葉は `update_sign.py sign` と同じく
+  getpass で尋ねる 鍵を開くのは署名する一瞬だけ
+- タグの後に main へ文書の直しなどが入っていてもよい 出すのはタグの commit で、CI と Package も
+  その commit の物を見る（手元の HEAD は origin/main と同じであればよい）
+- `--dry-run` は git と gh の読み取りだけをする（タグ・落とす・上げる・署名・公開をしない）
+  zip が手元に無ければ、6 と 7 は「残り」として出る
+- ベータ（`1.3.0b1` のような版）は、プレリリースとして公開し、目録を `beta` へ上げ直す
+  正式版で `beta` のリリースがあれば、そちらにも正式版の目録を上げ直す
+- 公開した後（beta へ上げる所・固定の URL の確かめ）で落ちたときは「公開は済んでいる」と出し、
+  手で打つ残り（`gh release upload beta … --clobber` など）を並べる 公開の呼び出し自体が落ちた
+  ときも、GitHub の側で公開まで済んでいれば同じに扱う（通信が切れただけのことがある）
+- 公開済みに打ち直したとき zip や目録は差し替えない 公開されている目録と署名を落とし、下書きの
+  ときに手元で確かめた写し（`dist\release\update.json` か `dist\release\remote\update.json`）と
+  バイト列まで同じで、埋め込んだ鍵で通るときだけ、公開した後の残り（beta の目録・固定の URL の
+  確かめ）を y で続ける 公開済みと分かった後はどこで止まっても「公開はしていない」とは出さない
+  - 写しが無い・落とすのに失敗した：手で打つ残りを出す
+  - 公開されている目録が写しと違う・公開に目録が無い：残りの手順は出さない（違う目録を beta へ
+    広げない） 誰が差し替えたかを先に確かめる
+
+中で何をしているか・道具が使えないときの手作業
+
 ```
 1. __version__ を上げて main へ入れ、タグ v<版> を打って push する
 2. Actions（.github/workflows/release.yml）がタグと版を照らし、zip を組み立て、リリースの下書きへ上げる
-3. 下書きから zip を落とし、展開して Sashimono.exe --self-check | more で確かめる
+3. 下書きから zip を落とし、展開して Sashimono.exe --self-check | more で確かめ、起こして GL で描けるかを見る
 4. 目録を作る    .venv\Scripts\python.exe tools\update_sign.py manifest <zip> [--minimum <版>]
 5. 署名する      .venv\Scripts\python.exe tools\update_sign.py sign update.json --key <鍵のファイル>
 6. 確かめる      .venv\Scripts\python.exe tools\update_sign.py verify update.json
 7. 上げる        gh release upload v<版> update.json update.json.sig
                  （ソースの添付は上の「リリースにソースを添付する」）
 8. 下書きを公開する（ここで初めて releases/latest/download/… が新しい版を指す）
+                 gh release edit v<版> --draft=false --latest
 ```
 
 - **公開した後・署名を上げた後に zip を差し替えない** 組み立て直した zip は SHA-256 が変わり、
