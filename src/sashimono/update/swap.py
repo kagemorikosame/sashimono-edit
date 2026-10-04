@@ -267,7 +267,7 @@ HEALTH_SECONDS = 90
 
 #: 入れ替え係が走り始めたことを待つ秒数
 #: その利用者が初めて PowerShell 5.1 を起こすときは「Preparing modules for first use」で遅い
-#: CI のまっさらな Windows で 11 秒、変数を削った環境では 20 秒を超えた（Issue #33）
+#: CI のまっさらな Windows で 11〜22 秒、変数を削った環境では 20〜34 秒かかった（Issue #33）
 #: PowerShell を使わない人は多く、更新のときが初めての起動になる 20 秒では遅い機械で
 #: 「PowerShell が動かない」と取り違える 走り始めればすぐ返るので、長めに待っても速い機械は待たない
 START_SECONDS = 60.0

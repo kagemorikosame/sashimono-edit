@@ -13,7 +13,7 @@ CI のまっさらな Windows（.github/workflows/package.yml の clean-machine�
      外し、PYTHONHOME や PYTHONPATH も渡さない runner に元からある開発の道具を拾って
      通ってしまうと、zip の積み忘れに気付けない
   3. exe が外へ出られないようにファイアウォールで止める 自己診断（自動更新の項目を含む）は
-     外へ出ずに通らなければならない 止めた送り出しの記録も数える
+     外へ出ずに通らなければならない 止めた接続を監査の記録（5157）で数える
   4. Sashimono.exe --self-check の結果を 1 項目ずつ見る GPU が無いので GL の 2 項目
      （描く・書き出す）は落ちてよいが、落ちた理由が GL であること（GLContextError）を確かめる
      それ以外の項目は全部通らなければならない

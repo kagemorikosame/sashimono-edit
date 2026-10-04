@@ -96,7 +96,7 @@ def test_the_tag_and_version_are_compared_before_a_release() -> None:
     build = _jobs(PACKAGE)["build"]
     check = build.index("check-tag")
     assert "startsWith(github.ref, 'refs/tags/')" in build[:check]
-    assert check < build.index("build_package.py")
+    assert check < build.index("build_package.py --skip-check")
 
 
 def test_main_and_packaging_changes_run_it() -> None:

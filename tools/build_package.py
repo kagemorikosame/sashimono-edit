@@ -757,7 +757,7 @@ def minimal_environment(environ: Mapping[str, str]) -> dict[str, str]:
         "USERNAME",
         "COMPUTERNAME",
         # 素の Windows の利用者なら誰でも持っている変数 中身は Windows の物で開発の道具を
-        # 指さない 外すと PowerShell 5.1 の起動が倍ほど遅くなり（CI で 11 秒が 20 秒）、
+        # 指さない 外すと PowerShell 5.1 の起動が遅くなり（CI で 22 秒が 34 秒）、
         # 使う人の機械では起きない遅さで入れ替え係の確かめが落ちる（Issue #33）
         "ALLUSERSPROFILE",
         "PUBLIC",

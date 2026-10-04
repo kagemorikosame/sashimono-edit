@@ -1185,6 +1185,29 @@ class TestTheUpdateParts:
         if sys.platform == "win32":
             assert "入れ替え（PowerShell）" in detail
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="入れ替え係は Windows の PowerShell")
+    def test_a_swap_that_does_not_start_says_why(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れ替え係が走らないとき、待ちきれなかったのか、すぐ終わったのかを添える
+
+        理由の無い 1 行では、CI のまっさらな Windows で落ちたとき（PowerShell の初めての
+        起動が 20 秒を超えた Issue #33）に、遅いのか走れないのかを分けられなかった
+        """
+        from sashimono.update import rehearsal
+        from sashimono.update.swap import Launched
+
+        def gave_up(launched: Launched) -> bool:
+            # 本物の wait_started と同じく、見切った入れ替え係は止める 残すと試験の後に
+            # 一時フォルダの中で入れ替えを続ける
+            launched.process.kill()
+            launched.process.wait()
+            return False
+
+        monkeypatch.setattr(rehearsal, "wait_started", gave_up)
+        with pytest.raises(RuntimeError, match=r"走らない（\d+ 秒 終了コード"):
+            rehearsal.rehearse(tmp_path)
+
 
 class TestTheSelfCheckOnAnEnglishWindows:
     """英語の Windows（CI の Windows も同じ）では、パイプの文字コードが cp1252 になる

@@ -265,7 +265,7 @@ class TestTheHandshake:
 def test_a_first_powershell_start_is_waited_for() -> None:
     """その利用者が初めて PowerShell 5.1 を起こすときの遅さを、動かないと取り違えない
 
-    CI のまっさらな Windows で、台本を 1 行走らせるだけで 11 秒（変数を削ると 20 秒超）
+    CI のまっさらな Windows で、台本を 1 行走らせるだけで 11〜22 秒（変数を削ると 34 秒）
     かかった（Issue #33） 20 秒で見切っていたので、自己診断の入れ替えの項目が落ち、
     使う人の遅い機械では「PowerShell が動かない」と出て更新を入れられなくなる
     """

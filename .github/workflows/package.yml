@@ -15,7 +15,7 @@ name: Package
 #     ほかの PR では走らせない
 on:
   push:
-    branches: [main, phase/issue-33]
+    branches: [main]
   pull_request:
     paths:
       - ".github/workflows/package.yml"
