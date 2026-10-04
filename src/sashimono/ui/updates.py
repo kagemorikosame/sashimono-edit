@@ -509,11 +509,15 @@ class UpdateController(QObject):
         if self._busy_elsewhere():
             return False
         if mode == "apply":
-            carry_user_files(self._layout.install, self._layout.staged)
+            carry_user_files(
+                self._layout.install,
+                self._layout.staged,
+                aside=userdirs.config_root() / PORTABLE_SCRIPTS_DIR,
+            )
         elif mode == "rollback":
             # 戻すと今の版は previous へ回り、次に新しい版を入れたときに消える 今の版の
-            # exe の隣へ後から置いた物を、戻る先の版へも写しておく
-            carry_user_files(self._layout.install, self._layout.previous)
+            # exe の隣へ後から置いた物・直した物を、戻る先の版へ写す（今の側が正 上書きする）
+            carry_user_files(self._layout.install, self._layout.previous, overwrite=True)
         # 開き直す作品は確認の後で決める 確認で名前を付けて保存したら、その作品を開き直す
         plan = SwapPlan(mode, self._layout, pid=os.getpid(), arguments=self._arguments())
         try:

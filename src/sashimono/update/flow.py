@@ -191,7 +191,7 @@ def apply_on_start(
         return False  # 印を下ろせない所で入れ替えると、失敗したときに毎回繰り返す
     if layout.staged_version() != state.ready_version or not is_newer(state.ready_version, current):
         return False
-    carry_user_files(layout.install, layout.staged)
+    carry_user_files(layout.install, layout.staged, aside=userdirs.config_root() / "scripts")
     plan = SwapPlan("apply", layout, pid=os.getpid(), arguments=tuple(arguments[1:]))
     if swap(plan):
         return True

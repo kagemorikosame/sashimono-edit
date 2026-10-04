@@ -740,6 +740,23 @@ class TestScriptsBesideTheExe:
         assert harness.controller.roll_back()
         assert (harness.layout.previous / "scripts" / "効果.anm2").is_file()
 
+    def test_rolling_back_takes_the_edited_one(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """移さない設定で、更新した後に直した物は、戻した版でも直した中身になる"""
+        harness.preferences = Preferences(scripts_move="off")
+        harness.layout.previous.mkdir()
+        (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
+        _put_script(harness.layout.previous, "効果.anm2", "直す前")
+        _put_script(harness.layout.install, "効果.anm2", "直した")
+        monkeypatch.setattr(
+            harness.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        assert harness.controller.roll_back()
+        carried = harness.layout.previous / "scripts" / "効果.anm2"
+        assert carried.read_text(encoding="utf-8") == "直した"
+
     def test_a_page_to_update_by_hand_warns_about_them(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:

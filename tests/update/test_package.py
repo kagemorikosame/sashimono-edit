@@ -134,6 +134,57 @@ class TestUserScripts:
         # 新しい版が持っている物は新しい方を残す
         assert new_readme.read_text(encoding="utf-8") == "新しい説明"
 
+    @staticmethod
+    def _write(folder: Path, relative: str, text: str) -> Path:
+        path = folder / PORTABLE_SCRIPTS_DIR / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_rolling_back_takes_what_was_edited(self, layout: Layout) -> None:
+        """戻す先の previous には更新する前の古い中身が残る 今の側で直した物を飛ばすと、
+        直した中身が戻した版に入らず、次の自動更新で .previous ごと消える（PR #245 の Codex の指摘）
+        """
+        self._write(layout.install, "自分の/効果.anm2", "直した")
+        old = self._write(layout.previous, "自分の/効果.anm2", "直す前")
+        old_readme = self._write(layout.previous, "README.txt", "前の版の説明")
+        self._write(layout.install, "README.txt", "今の版の説明")
+
+        assert carry_user_files(layout.install, layout.previous, overwrite=True) == 1
+        assert old.read_text(encoding="utf-8") == "直した"
+        # 同梱の物は写さない（戻した版の説明はその版の物）
+        assert old_readme.read_text(encoding="utf-8") == "前の版の説明"
+        assert not list(layout.previous.rglob("*.moving"))
+
+    def test_the_same_content_is_left_alone(self, layout: Layout) -> None:
+        self._write(layout.install, "効果.anm2", "同じ")
+        self._write(layout.previous, "効果.anm2", "同じ")
+        assert carry_user_files(layout.install, layout.previous, overwrite=True) == 0
+
+    def test_a_name_the_new_version_bundles_goes_aside(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """新しい版が同じ名前の物を同梱していれば、同梱物は新しい版の物を残し、本人の物は
+        %APPDATA% の scripts へ写す %APPDATA% が後に読まれて勝つので、使われる物は変わらない
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        self._write(layout.install, "見本/揺れ.anm2", "本人が直した")
+        bundled = self._write(layout.staged, "見本/揺れ.anm2", "新しい版の見本")
+
+        assert carry_user_files(layout.install, layout.staged, aside=aside) == 1
+        assert bundled.read_text(encoding="utf-8") == "新しい版の見本"
+        assert (aside / "見本" / "揺れ.anm2").read_text(encoding="utf-8") == "本人が直した"
+
+    def test_aside_is_not_overwritten(self, layout: Layout, tmp_path: Path) -> None:
+        """%APPDATA% に前から在れば、前からそちらが使われている 上書きしない"""
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        (aside / "見本").mkdir(parents=True)
+        (aside / "見本" / "揺れ.anm2").write_text("前から置いた", encoding="utf-8")
+        self._write(layout.install, "見本/揺れ.anm2", "本人が直した")
+        self._write(layout.staged, "見本/揺れ.anm2", "新しい版の見本")
+        assert carry_user_files(layout.install, layout.staged, aside=aside) == 0
+        assert (aside / "見本" / "揺れ.anm2").read_text(encoding="utf-8") == "前から置いた"
+
     def test_the_folder_name_matches_the_catalog(self) -> None:
         """名前が食い違うと、写す先が読まれない場所になる"""
         assert package_module._PORTABLE_SCRIPTS_DIR == PORTABLE_SCRIPTS_DIR

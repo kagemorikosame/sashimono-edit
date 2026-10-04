@@ -18,7 +18,10 @@ r"""新しい版の zip を落とし、確かめ、入れ替える前のフォ�
 
 from __future__ import annotations
 
+import contextlib
+import filecmp
 import json
+import os
 import shutil
 import stat
 import zipfile
@@ -29,7 +32,7 @@ from pathlib import Path, PurePosixPath
 from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
-from sashimono.update.portable import PORTABLE_SCRIPTS_DIR
+from sashimono.update.portable import PORTABLE_SCRIPTS_DIR, user_script_files
 
 __all__ = [
     "APP_EXE",
@@ -253,27 +256,59 @@ def stage(
     return layout.staged
 
 
-def carry_user_files(install: Path, staged: Path) -> int:
-    """今の版の exe の隣のスクリプト置き場に本人が置いた物を、新しい版へ写す 写した数を返す
+def carry_user_files(
+    install: Path, destination: Path, *, overwrite: bool = False, aside: Path | None = None
+) -> int:
+    """今の版の exe の隣のスクリプト置き場に本人が置いた物を、入れ替え先の版へ写す 写した数を返す
 
     入れ替えはフォルダを丸ごと替えるので、写さないと前の版の案内どおりそこへ置いた
     スクリプトが 2 回目の入れ替えで消える（1 回目は ``previous`` に残るが、次で消える）
-    新しい版が同じ名前の物を持っていれば新しい方を残す（同梱の README など）
+    **本人の物は今の版の側が正** 同梱の物（``portable.BUNDLED_SCRIPT_FILES``）は写さない
+
+    - 前の版へ戻す（``overwrite``） 戻る先の ``previous`` には、更新する前に写した古い中身が
+      残っている 今の側で直した物を飛ばすと、直した中身が戻した版に入らず、次の自動更新で
+      ``.previous`` ごと消える 中身が違えば今の側で上書きする（古い中身は本人が直す前の物で、
+      直した側が正なので取っておかない）
+    - 新しい版を入れる（既定） 入れ替え先は展開したばかりの新しい版で、そこに在る物はすべて
+      新しい版の同梱物 同梱物は新しい版の物を残す 同じ名前で中身の違う本人の物は、``aside``
+      （``%APPDATA%`` の ``scripts``）の空いている所へ写す 読む順は ``%APPDATA%`` が後で勝つので、
+      今まで使われていた本人の物が使われ続ける ``aside`` に既に在れば、前からそちらが使われて
+      いるので写さない
     """
     source = install / _PORTABLE_SCRIPTS_DIR
-    if not source.is_dir():
-        return 0
     copied = 0
-    for path in sorted(source.rglob("*")):
-        if not path.is_file():
-            continue
-        destination = staged / _PORTABLE_SCRIPTS_DIR / path.relative_to(source)
-        if destination.exists():
-            continue
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-        except OSError:
-            continue  # 1 つ写せなくても入れ替えは止めない 元は previous に残る
-        copied += 1
+    for relative in user_script_files(install):
+        origin = source / relative
+        target = destination / _PORTABLE_SCRIPTS_DIR / relative
+        if target.exists():
+            if _same_file(origin, target):
+                continue
+            if not overwrite:
+                if aside is not None and not (aside / relative).exists():
+                    copied += _copy_over(origin, aside / relative)
+                continue
+        # 1 つ写せなくても入れ替えは止めない 元は今の版（previous か .new へよけた側）に残る
+        copied += _copy_over(origin, target)
     return copied
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return filecmp.cmp(first, second, shallow=False)
+    except OSError:
+        return False
+
+
+def _copy_over(origin: Path, target: Path) -> int:
+    """作業用の名前へ写してから置き換える 途中で止まっても、半分の中身が本来の名前で残らない"""
+    # 印は移す側（.portable）と同じ ``.moving`` 残っても本人の物と数えず、スクリプトとしても読まない
+    writing = target.with_name(f"{target.name}.{os.getpid()}.moving")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, writing)
+        writing.replace(target)
+    except OSError:
+        with contextlib.suppress(OSError):
+            writing.unlink(missing_ok=True)
+        return 0
+    return 1
