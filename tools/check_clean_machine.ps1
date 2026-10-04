@@ -60,6 +60,16 @@ function Note([string]$Message) {
 
 # 自己診断が GL の無い機械で落としてよい項目 名前は src/sashimono/selfcheck.py と揃える
 $GLItems = @('GL で描く', '書き出す（FFmpeg）')
+# 自己診断に必ずある項目 GL の 2 項目も含める 抜けると「GL で落ちた項目が 0」と
+# 見分けがつかず、GL の確かめも窓の知らせの確かめも黙って飛ぶ
+$RequiredItems = @('版', 'FFmpeg で符号化（日本語のパス）', '自動更新', 'Visual C++ の実行時の部品',
+    'スクリプト置き場') + $GLItems
+
+function Get-MissingItems($Items, [string[]]$Required) {
+    # 自己診断の結果（名前 → 結果）に無い必須の項目の名前
+    $Required | Where-Object { -not $Items.Contains($_) }
+}
+
 # 自己診断の最後の行 これが無ければ途中で落ちている
 $Passed = 'すべて動いた'
 
@@ -404,8 +414,8 @@ try {
         Fail "自己診断の終了コードが $($check.ExitCode)（$expectedExit のはず）"
     }
 
-    foreach ($required in @('版', 'FFmpeg で符号化（日本語のパス）', '自動更新', 'Visual C++ の実行時の部品', 'スクリプト置き場')) {
-        if (-not $items.Contains($required)) { Fail "自己診断に $required の項目が無い" }
+    foreach ($missing in @(Get-MissingItems $items $RequiredItems)) {
+        Fail "自己診断に $missing の項目が無い"
     }
     if ($items.Contains('版') -and $items['版'].Detail -notmatch '配布版') {
         Fail "配布版として動いていない: $($items['版'].Detail)"

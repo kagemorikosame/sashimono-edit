@@ -1419,6 +1419,38 @@ class TestTheBuildIsPinnedToTheList:
         assert completed.returncode == 0, completed.stderr
         assert "av==" in target.read_text(encoding="utf-8")
 
+    def test_pip_is_installed_at_the_listed_version(self, notices: ModuleType) -> None:
+        """依存では入らないが積む pip を、一覧の版で入れる要件にする（PR #241 のレビュー P1）"""
+        table = notices.NOTICES_SOURCE.read_text(encoding="utf-8")
+        wanted = notices.requirements(table)
+        assert wanted == [f"pip=={notices.listed_versions(table)['pip']}"]
+
+    def test_a_beside_package_missing_from_the_list_stops_it(self, notices: ModuleType) -> None:
+        # 版を決められない物を入れると、何を積んだかを一覧と照らせない
+        with pytest.raises(ValueError, match="pip"):
+            notices.requirements("| `av`（PyAV） | 18.1.0 | BSD |\n")
+
+    def test_every_bundled_package_is_pinned_or_a_dependency(
+        self, builder: ModuleType, notices: ModuleType
+    ) -> None:
+        """必ず積む包みは、依存（版は制約で留まる）か、一覧の版で明示して入れる物のどちらか
+
+        どちらでもない包み（Python に最初から入っている pip など）は、CI の機械が持っている
+        版のまま積まれ、一覧と食い違って組み立てが止まる 必ず積む包みを足したら、ここで分かる
+        SHARED_WITH_ADD_ONS は入っているときだけ積むので見ない
+        """
+        import tomllib
+
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        declared = [*project["dependencies"], *project["optional-dependencies"]["dev"]]
+        dependencies = {
+            notices.canonical_name(re.match(r"[A-Za-z0-9_.\-]+", spec).group(0))  # type: ignore[union-attr]
+            for spec in declared
+        }
+        for package in (*builder.COLLECTED_PACKAGES, *builder.ALWAYS_BUNDLED):
+            name = notices.canonical_name(package)
+            assert name in dependencies or name in notices.INSTALLED_BESIDE, package
+
     def test_the_builder_reads_the_same_list(self, builder: ModuleType) -> None:
         # 制約を書く道具と、組み立てで一覧と照らす道具が別々に読むと、表の読み方がずれる
         assert builder.listed_versions.__module__ == "package_notices"

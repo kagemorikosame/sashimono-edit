@@ -59,6 +59,33 @@ def constraints(notices: str) -> list[str]:
     ]
 
 
+#: プロジェクトの依存では入らないが、配布物へ積む包み（配布名を小文字で）
+#: pip は導入ボタンが使うので積む（build_package.py の COLLECTED_PACKAGES）が、Python に最初から
+#: 入っている物で依存には書いていない 制約（-c）は入れる物の版を縛るだけで、入っている物を
+#: 入れ直さない setup-python の同梱する pip が上がると、一覧の版と食い違って組み立てが止まる
+#: CI ではこれらを一覧の版で明示して入れる（PR #241 のレビュー）
+INSTALLED_BESIDE = ("pip",)
+
+
+def requirements(notices: str) -> list[str]:
+    """依存では入らないが配布物へ積む包みを、一覧の版で入れる要件（``uv pip install -r`` の形）
+
+    一覧に無ければ止める 版を決められない物を入れると、何を積んだかを一覧と照らせない
+    """
+    listed = listed_versions(notices)
+    missing = [name for name in INSTALLED_BESIDE if name not in listed]
+    if missing:
+        raise ValueError(f"一覧（THIRD_PARTY_NOTICES.md）に無い: {', '.join(missing)}")
+    return [f"{name}=={listed[name]}" for name in INSTALLED_BESIDE]
+
+
+def _write(target: Path, lines: list[str]) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"--- {target}")
+    print("\n".join(lines))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -68,11 +95,17 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="積む包みを一覧の版に留める制約を書く",
     )
+    parser.add_argument(
+        "--write-requirements",
+        type=Path,
+        metavar="PATH",
+        help="依存では入らないが積む包み（pip）を一覧の版で入れる要件を書く",
+    )
     args = parser.parse_args(argv)
-    lines = constraints(NOTICES_SOURCE.read_text(encoding="utf-8"))
-    args.write_constraints.parent.mkdir(parents=True, exist_ok=True)
-    args.write_constraints.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(lines))
+    notices = NOTICES_SOURCE.read_text(encoding="utf-8")
+    _write(args.write_constraints, constraints(notices))
+    if args.write_requirements is not None:
+        _write(args.write_requirements, requirements(notices))
     return 0
 
 

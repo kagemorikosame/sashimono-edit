@@ -121,6 +121,20 @@ def test_every_install_is_pinned_from_the_first() -> None:
         assert "-c build/constraints.txt" in line, line
 
 
+def test_packages_outside_the_dependencies_are_installed_at_the_listed_version() -> None:
+    """依存では入らないが積む包み（pip）を、一覧の版で明示して入れる（PR #241 のレビュー P1）
+
+    pip は Python に最初から入っていて、制約（-c）は版を縛るだけで入れ直さない
+    setup-python の同梱する pip が上がると、一覧の版と食い違って組み立てが止まる
+    """
+    build = _jobs(PACKAGE)["build"]
+    written = build.index("--write-requirements build/bundled-beside.txt")
+    install = build.index("uv pip install")
+    assert written < install
+    line = build[install : build.index("\n", install)]
+    assert "-r build/bundled-beside.txt" in line
+
+
 def test_main_and_packaging_changes_run_it() -> None:
     """main への push と、組み立てと確かめに関わるファイルを変える PR で走る
 
@@ -173,19 +187,31 @@ def test_the_check_script_knows_the_self_check_names() -> None:
 
 
 def _run_script_functions(
-    names: tuple[str, ...], body: str, environment: dict[str, str]
+    names: tuple[str, ...],
+    body: str,
+    environment: dict[str, str],
+    variables: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     """道具（check_clean_machine.ps1）から関数だけを取り出し、Windows の PowerShell 5.1 で走らせる
 
     道具を丸ごと走らせると、zip の展開や CI の機械の設定まで行う 確かめたい関数だけを読み、
-    ``body`` で呼ぶ 関数が無ければ終了コード 3
+    ``body`` で呼ぶ ``variables`` は道具の中で値を入れている変数（入れる文をそのまま走らせる
+    並べた順に） 関数か変数が無ければ終了コード 3
     """
+    listed = ", ".join(repr(name) for name in variables) or "@()"
     code = (
         "$ErrorActionPreference = 'Stop'\n"
         "$language = 'System.Management.Automation.Language'\n"
         '$parser = "$language.Parser" -as [type]\n'
         '$definition = "$language.FunctionDefinitionAst" -as [type]\n'
+        '$assignment = "$language.AssignmentStatementAst" -as [type]\n'
         "$ast = $parser::ParseFile($env:SCRIPT, [ref]$null, [ref]$null)\n"
+        f"foreach ($name in @({listed})) {{\n"
+        "    $found = $ast.Find({ param($node)\n"
+        "        $node -is $assignment -and $node.Left.Extent.Text -eq ('$' + $name) }, $true)\n"
+        "    if (-not $found) { exit 3 }\n"
+        "    Invoke-Expression $found.Extent.Text\n"
+        "}\n"
         f"foreach ($name in {', '.join(repr(name) for name in names)}) {{\n"
         "    $found = $ast.Find({ param($node)\n"
         "        $node -is $definition -and $node.Name -eq $name }, $true)\n"
@@ -259,6 +285,55 @@ def test_a_hung_powershell_probe_does_not_stop_the_check(tmp_path: Path) -> None
     assert completed.returncode == 0, completed.stderr
     assert time.monotonic() - started < 25
     assert completed.stdout.strip() == "stopped=1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+@pytest.mark.parametrize("dropped", ["GL で描く", "書き出す（FFmpeg）", "自動更新"])
+def test_a_self_check_item_that_went_missing_fails(dropped: str) -> None:
+    """自己診断から必須の項目が抜けたら落とす GL の 2 項目も必須（PR #241 のレビュー）
+
+    GL の 2 項目が抜けると「GL で落ちた項目が 0」と見分けがつかず、GL の確かめも
+    窓の知らせの確かめも黙って飛び、確かめは通ってしまう
+    """
+    from sashimono.selfcheck import (
+        ENCODE_CHECK_NAME,
+        EXPORT_CHECK_NAME,
+        RENDER_CHECK_NAME,
+        UPDATE_CHECK_NAME,
+        VC_RUNTIME_CHECK_NAME,
+    )
+
+    names = [
+        "版",
+        "スクリプト置き場",
+        ENCODE_CHECK_NAME,
+        EXPORT_CHECK_NAME,
+        RENDER_CHECK_NAME,
+        UPDATE_CHECK_NAME,
+        VC_RUNTIME_CHECK_NAME,
+    ]
+    present = [name for name in names if name != dropped]
+    listed = ", ".join(f"'{name}'" for name in present)
+    every = ", ".join(f"'{name}'" for name in names)
+    body = (
+        "$items = [ordered]@{}\n"
+        f"foreach ($name in @({listed})) {{ $items[$name] = 'ok' }}\n"
+        "$all = [ordered]@{}\n"
+        f"foreach ($name in @({every})) {{ $all[$name] = 'ok' }}\n"
+        # 5.1 の標準出力は日本語を化かすので、数だけを ASCII で返す
+        "$missing = @(Get-MissingItems $items $RequiredItems)\n"
+        "$none = @(Get-MissingItems $all $RequiredItems)\n"
+        "$hit = @($missing | Where-Object { $_ -eq $env:DROPPED }).Count\n"
+        '[Console]::Out.Write("missing=$($missing.Count) hit=$hit none=$($none.Count)")\n'
+    )
+    completed = _run_script_functions(
+        ("Get-MissingItems",),
+        body,
+        {"DROPPED": dropped},
+        variables=("GLItems", "RequiredItems"),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "missing=1 hit=1 none=0"
 
 
 #: 機械の設定を触るコマンドの身代わり 呼ばれた引数を控えるだけで、何も変えない

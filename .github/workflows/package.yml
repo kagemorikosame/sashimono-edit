@@ -62,10 +62,12 @@ jobs:
         # 書く道具は標準ライブラリだけで動くので、依存を入れる前に書ける 最初の導入から
         # 制約を使う 制約の無い導入を先に通すと、その日の新しい依存が壊れていたときに
         # 制約まで届かずに止まる
-        run: python tools/package_notices.py --write-constraints build/constraints.txt
+        # 依存では入らないが積む包み（pip Python に最初から入っている）は、制約では入れ直されない
+        # ので、一覧の版で明示して入れる要件も書く（package_notices.INSTALLED_BESIDE）
+        run: python tools/package_notices.py --write-constraints build/constraints.txt --write-requirements build/bundled-beside.txt
 
       - name: 依存を入れる
-        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -c build/constraints.txt
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -r build/bundled-beside.txt -c build/constraints.txt
 
       - name: タグと版を照らす
         # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
