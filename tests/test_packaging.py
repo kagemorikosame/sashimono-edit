@@ -87,6 +87,27 @@ class TestPipInsideThePackage:
         command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
         assert command[:4] == [str(frozen), "-m", "pip", "install"]
 
+    def test_the_install_button_takes_only_wheels(self, frozen: Path) -> None:
+        """配布版はソースの形（sdist）を選ばない
+
+        claude-agent-sdk 0.2.163 が sdist だけで出ていた日に、0.1.0 の zip の導入ボタンが
+        それを選び、pip が組むために Sashimono.exe で子を立て、編集画面が裏で立って導入が
+        終わらなかった wheel に絞れば wheel のある一番新しい版を選ぶ
+        """
+        from sashimono.runtime import FeaturePack
+
+        command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
+        index = command.index("--only-binary")
+        assert command[index + 1] == ":all:"
+        assert index < command.index("pkg")
+
+    def test_development_may_build_from_source(self) -> None:
+        """開発の環境の pip は本物の Python で動き、組む道具もあるので絞らない"""
+        from sashimono.runtime import FeaturePack
+
+        command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
+        assert "--only-binary" not in command
+
     def test_the_exe_hands_it_to_pip(self, frozen: Path) -> None:
         assert pip_arguments([str(frozen), "-m", "pip", "install", "pkg"]) == ["install", "pkg"]
 
@@ -314,6 +335,17 @@ class TestTheZip:
             arguments[i + 1] for i, value in enumerate(arguments) if value == "--exclude-module"
         }
         assert {"faster_whisper", "claude_agent_sdk"} <= excluded
+
+    def test_pywin32_is_left_out_on_any_machine(self, builder: ModuleType) -> None:
+        """pywin32 は組む機械に入っていても積まない
+
+        開発の .venv（AI 連携の依存で入っている）で組むと logging.handlers と numpy.testing から
+        拾われ、DLL を探す道へ足す差し込みまで積まれた その zip でだけ AI 連携が動き、
+        CI（pywin32 が無い）で組んで配った 0.1.0 の zip では動かないことを確かめで見落とした
+        """
+        arguments = builder.pyinstaller_arguments(Path("w"), Path("d"))
+        excluded = _values(arguments, "--exclude-module")
+        assert {"pywintypes", "pythoncom", "win32api", "win32evtlogutil", "win32pdh"} <= excluded
 
     def test_the_dynamically_loaded_parts_are_collected(self, builder: ModuleType) -> None:
         """名前で読む部品はまとめて積む
@@ -1098,6 +1130,25 @@ class TestTheImportCheck:
         read_path_files(str(tmp_path))
         assert str(inner) in sys.path
 
+    def test_the_pywin32_dlls_are_on_the_path_in_the_package(
+        self, frozen: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """配布版では入れた置き場の ``pywin32_system32`` を探す道へ足す
+
+        固めた exe の中の pywintypes は ``pywintypes314.dll`` を探す道の上でしか探さない
+        .pth はそこを DLL の置き場にするだけなので、0.1.0 の zip は AI 連携を入れても
+        ``Module 'pywintypes' isn't in frozen sys.path`` で読めなかった（展開した zip で確かめた）
+        """
+        from sashimono.runtime import read_path_files
+
+        place = tmp_path / "runtime"
+        dlls = place / "pywin32_system32"
+        dlls.mkdir(parents=True)
+        (dlls / "pywintypes314.dll").write_bytes(b"")
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        read_path_files(str(place))
+        assert str(dlls) in sys.path
+
     def test_a_readable_module_passes(self, tmp_path: Path) -> None:
         (tmp_path / "sashimono_import_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
         assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_probe"]) == 0
@@ -1110,6 +1161,64 @@ class TestTheImportCheck:
         )
         assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_broken"]) == 1
         assert "no_such_stdlib_part" in capsys.readouterr().out
+
+
+class TestTheAddOnsAreCheckedTheUsersWay:
+    """zip からの確かめは、後から入れる部品を使う人と同じ道で入れて読む
+
+    前は開発の .venv の置き場を足して読んだ pip の ``--target`` とは並びが違い、0.1.0 では
+    手元の zip で通って、配った zip では AI 連携が読めなかった
+    """
+
+    def _calls(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch, *, pip_code: int = 0
+    ) -> tuple[list[list[str]], list[str]]:
+        calls: list[list[str]] = []
+
+        def fake_run(
+            executable: Path, arguments: list[str], folder: str, **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(list(arguments))
+            code = pip_code if arguments[:2] == ["-m", "pip"] else 0
+            return subprocess.CompletedProcess(arguments, code, "", "")
+
+        monkeypatch.setattr(builder, "_run", fake_run)
+        failures = builder.runtime_import_failures(Path("Sashimono.exe"), "folder")
+        return calls, failures
+
+    def test_the_exe_pip_installs_what_the_buttons_install(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ai.environment import AI_PACK
+        from sashimono.asr.environment import ASR_PACK
+        from sashimono.runtime import install_arguments
+
+        calls, failures = self._calls(builder, monkeypatch)
+        target = Path("folder") / "add-ons"
+        assert failures == []
+        # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
+        assert calls[0] == ["-m", "pip", *install_arguments(AI_PACK, target, extra=False)]
+        assert calls[1] == ["-m", "pip", *install_arguments(ASR_PACK, target, extra=False)]
+        assert "--only-binary" in calls[0]
+        assert not set(ASR_PACK.extra) & set(calls[1])
+
+    def test_the_import_reads_only_what_was_installed(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """開発の .venv の置き場を足さない 入れた導入先だけを読む"""
+        calls, _ = self._calls(builder, monkeypatch)
+        flag, places, *modules = calls[-1]
+        assert flag == builder.IMPORT_CHECK_FLAG
+        assert places == str(Path("folder") / "add-ons")
+        assert modules == list(builder.RUNTIME_MODULES)
+
+    def test_a_failed_install_is_a_failure(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
+        calls, failures = self._calls(builder, monkeypatch, pip_code=1)
+        assert len(failures) == 1
+        assert all(call[:2] == ["-m", "pip"] for call in calls)
 
 
 class TestTheAssistantSaysWhatIsMissing:

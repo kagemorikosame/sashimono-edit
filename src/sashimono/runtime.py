@@ -39,6 +39,7 @@ __all__ = [
     "PackageStatus",
     "activate_runtime",
     "app_dir",
+    "install_arguments",
     "install_command",
     "install_runtime",
     "is_frozen",
@@ -417,6 +418,17 @@ def read_path_files(place: str) -> None:
         site.addsitedir(place)
     except OSError:
         return
+    if not is_frozen():
+        return
+    # pywin32 の pywintypes は、固めた exe の中では DLL（``pywintypes314.dll``）を
+    # **探す道の上でだけ**探す 入れた置き場では DLL が ``pywin32_system32`` にあり、``.pth`` は
+    # そこを DLL の置き場として登録するだけで探す道へは足さない 足さないと mcp の import で
+    # ``Module 'pywintypes' isn't in frozen sys.path`` と言って AI 連携が動かない（0.1.0 の zip）
+    # PyInstaller が pywin32 を積むときに足す差し込み（pyi_rth_pywintypes）と同じことをする
+    # 配布版は pywin32 を積まない（tools/build_package.py の EXCLUDED_MODULES）ので、ここで足す
+    dlls = Path(place) / "pywin32_system32"
+    if dlls.is_dir() and str(dlls) not in sys.path:
+        sys.path.append(str(dlls))
 
 
 def refresh_runtime(before: Mapping[str, int] | None = None) -> tuple[str, ...]:
@@ -638,14 +650,36 @@ def install_command(
     実行せずに文字列として得られるようにしてあるのは、画面に「これを実行します」と
     出すため 何が入るのか分からないままダウンロードが始まるのは不安が大きい
     """
-    command = [python or sys.executable, "-m", "pip", "install"]
+    return [
+        python or sys.executable,
+        "-m",
+        "pip",
+        *install_arguments(pack, runtime_target_dir(), extra=extra, upgrade=upgrade),
+    ]
+
+
+def install_arguments(
+    pack: FeaturePack, target: Path | None, *, extra: bool = True, upgrade: bool = False
+) -> list[str]:
+    """``pip`` へ渡す引数（``install`` から） ``target`` は配布版の導入先 開発の環境では ``None``
+
+    配布版の組み立ての確かめ（``tools/build_package.py``）も、ここで組んだ引数で exe の pip に
+    入れる 導入ボタンと違う入れ方で確かめると、使う人の手元で落ちる物を見落とす
+
+    配布版では、ソースの形（sdist）しか無い版を選ばせない（``--only-binary :all:``）
+    pip はソースから組むとき ``sys.executable`` に自分の起動部を渡して子を立てるが、
+    配布版の ``sys.executable`` は Sashimono.exe で、その起動を pip と見分けられず編集画面が
+    裏で立ち、導入が終わらなくなる（claude-agent-sdk 0.2.163 が sdist だけで出ていた日に
+    0.1.0 の zip で起きた） 組めたとしても、配布版の中には組むための道具が無い
+    wheel だけに絞れば、pip は wheel のある一番新しい版を選ぶ
+    """
+    arguments = ["install"]
     if upgrade:
-        command.append("--upgrade")
-    target = runtime_target_dir()
+        arguments.append("--upgrade")
     if target is not None:
-        command.extend(["--target", str(target)])
-    command.extend(pack.requirements(extra=extra))
-    return command
+        arguments.extend(["--only-binary", ":all:", "--target", str(target)])
+    arguments.extend(pack.requirements(extra=extra))
+    return arguments
 
 
 def install_runtime(
