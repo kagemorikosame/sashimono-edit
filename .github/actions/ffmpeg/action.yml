@@ -1,0 +1,68 @@
+name: ffmpeg を入れる
+description: 版を決めた ffmpeg の静的ビルドを取り、ハッシュを照らして PATH に足す（置き場を持ち越す）
+
+# ci.yml（検証）と package.yml（タグのときの検証）の両方がここを使う 版とハッシュを
+# 2 か所に書くと、片方だけ上げたときに、リリースの前の検証だけが別の ffmpeg で走る
+#
+# 版は手元の開発環境（README）と、配る zip の FFmpeg（PyAV の wheel）と同じ 8.1.2 にそろえる
+# 版とハッシュは置き場の鍵にもそのまま使うので、ここを変えれば取り直しと鍵が一緒に変わる
+# 取った zip はハッシュと照らしてから展開する 照らさないと、配布元のリリースが差し替え
+# られたときに、その実行ファイルを CI の中で動かすことになる
+# 値は GitHub のリリースの digest と gyan.dev の .sha256 の両方で一致を確かめた
+#
+# choco は毎回 35 秒ほどかかっていた 版を決めた静的ビルドを取り、置き場を持ち越す
+# 落ちたら呼んだ段が落ちる 落ちても止めたくない所（ci.yml）は呼ぶ側で continue-on-error にする
+
+runs:
+  using: composite
+  steps:
+    - name: ffmpeg の置き場を読み戻す
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}/ffmpeg
+        key: ffmpeg-${{ runner.os }}-8.1.2-essentials-db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec
+
+    - name: ffmpeg を入れる
+      id: install
+      shell: pwsh
+      env:
+        FFMPEG_VERSION: 8.1.2
+        FFMPEG_SHA256: db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec
+        FFMPEG_DIR: ${{ runner.temp }}/ffmpeg
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $exe = Join-Path $env:FFMPEG_DIR 'ffmpeg.exe'
+        $probe = Join-Path $env:FFMPEG_DIR 'ffprobe.exe'
+        $fresh = 'false'
+        # 読み戻したかどうかではなく、実行ファイルがそろっているかで決める 途中までの
+        # 置き場が読み戻されても、取り直せる
+        if (-not ((Test-Path $exe) -and (Test-Path $probe))) {
+          if (Test-Path $env:FFMPEG_DIR) { Remove-Item -Recurse -Force $env:FFMPEG_DIR }
+          $name = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/$name.zip" -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:FFMPEG_SHA256) { throw "ffmpeg の zip のハッシュが違う: $actual" }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          New-Item -ItemType Directory -Force $env:FFMPEG_DIR | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP "$name/bin/*.exe") $env:FFMPEG_DIR
+          $fresh = 'true'
+        }
+        # 出力を全部受けてから 1 行だけ出す パイプで先頭だけ取ると ffmpeg が途中で
+        # 止められて終了コードが 0 でなくなり、動いているのに入っていない扱いになる
+        $version = & $exe -hide_banner -version
+        if ($LASTEXITCODE -ne 0) { throw 'ffmpeg が動かない' }
+        $version | Select-Object -First 1
+        Add-Content $env:GITHUB_PATH $env:FFMPEG_DIR
+        "fresh=$fresh" | Add-Content $env:GITHUB_OUTPUT
+
+    - name: ffmpeg の置き場を保存する
+      # 照らして動いた物を取り直したときだけ保存する 取る途中で落ちた置き場を
+      # 保存すると、鍵を変えるまで壊れた置き場が読み戻され続ける
+      # （入れる段が落ちればここまで来ない）
+      if: steps.install.outputs.fresh == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}/ffmpeg
+        key: ${{ steps.cache.outputs.cache-primary-key }}

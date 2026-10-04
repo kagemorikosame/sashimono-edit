@@ -131,11 +131,52 @@ def test_a_release_is_verified_before_the_zip_is_built() -> None:
     build = _jobs(PACKAGE)["build"]
     verify = build.index("python tools/verify.py")
     step = build[build.rindex("- name:", 0, verify) : verify]
-    assert "if: startsWith(github.ref, 'refs/tags/')" in step
+    assert RELEASE_OR_MANUAL in step
     assert build.index("uv pip install") < verify < build.index("build_package.py --skip-check")
     ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     assert "python tools/verify.py" in ci
     assert "tags:" not in ci.split("\njobs:\n", 1)[0]
+
+
+#: package.yml の検証を走らせる条件 タグ（release.yml から呼ばれたとき github.ref と
+#: github.event_name は呼び元の物）と、前もって確かめる手動の実行
+RELEASE_OR_MANUAL = (
+    "if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'"
+)
+FFMPEG_ACTION = ROOT / ".github" / "actions" / "ffmpeg" / "action.yml"
+
+
+def test_the_release_verify_has_ffmpeg() -> None:
+    """タグのときの検証も ffmpeg を入れてから走らせる 無いと素材を使う試験が黙って飛ぶ
+
+    ci.yml と違い、入れられなければ止める（continue-on-error にしない）
+    """
+    build = _jobs(PACKAGE)["build"]
+    install = build.index("uses: ./.github/actions/ffmpeg")
+    step = build[build.rindex("- name:", 0, install) : install + 40]
+    assert RELEASE_OR_MANUAL in step
+    assert "continue-on-error" not in step
+    assert install < build.index("python tools/verify.py")
+
+
+def test_ffmpeg_is_pinned_in_one_place() -> None:
+    """ffmpeg の版とハッシュは .github/actions/ffmpeg の 1 か所に書く
+
+    ci.yml と package.yml に別々に書くと、片方だけ上げたときにリリースの前の検証だけが
+    別の ffmpeg で走る 中で 2 度書いている所（置き場の鍵と照らす値）もそろえる
+    版は配る zip の FFmpeg（collect_sources.FFMPEG_VERSION）と同じ
+    """
+    action = FFMPEG_ACTION.read_text(encoding="utf-8")
+    version = re.search(r"FFMPEG_VERSION: (\S+)", action)
+    digest = re.search(r"FFMPEG_SHA256: ([0-9a-f]{64})", action)
+    assert version is not None and digest is not None
+    assert f"-{version.group(1)}-essentials-{digest.group(1)}" in action
+    collect = (ROOT / "tools" / "collect_sources.py").read_text(encoding="utf-8")
+    assert f'FFMPEG_VERSION = "{version.group(1)}"' in collect
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    for workflow in (ci, PACKAGE):
+        assert "uses: ./.github/actions/ffmpeg" in workflow
+        assert "FFMPEG_SHA256" not in workflow and "codexffmpeg" not in workflow
 
 
 def test_packages_outside_the_dependencies_are_installed_at_the_listed_version() -> None:

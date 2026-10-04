@@ -23,6 +23,7 @@ on:
       - "tools/build_package.py"
       - "tools/package_notices.py"
       - "tools/check_clean_machine.ps1"
+      - ".github/actions/ffmpeg/**"
       - "src/sashimono/selfcheck.py"
       - "src/sashimono/app.py"
       - "pyproject.toml"
@@ -77,12 +78,21 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: python tools/update_sign.py check-tag "$env:TAG"
 
-      - name: 検証（タグのときだけ）
+      - name: ffmpeg を入れる（検証のため）
+        # 素材を使う試験が要る ci.yml と同じ物（版とハッシュは .github/actions/ffmpeg の 1 か所）
+        # ci.yml と違い落ちたら止める ffmpeg が無いと試験が黙って飛び、確かめたことにならない
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: ./.github/actions/ffmpeg
+
+      - name: 検証（タグと手動のときだけ）
         # ruff・mypy・pytest が落ちる状態のまま、リリースの下書きを作らない
         # main への push と PR では ci.yml が同じ verify を走らせるので、ここでは二重にしない
         # タグの push では ci.yml が走らない（release.yml から呼ばれたときだけ通る道）
+        # 手動（workflow_dispatch）でも同じ道を通す 本番のタグで初めて走らせて落ちると、
+        # 公開が止まる 前もって手で走らせて確かめられるようにする
+        # release.yml から呼ばれたとき、github.ref と github.event_name は呼び元の物（タグの push）
         # 積む版（制約で留めた依存）のまま確かめるので、配る物と同じ組み合わせを見ることになる
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         env:
           # ci.yml と同じく 4 コアで並べる 直列では 6 分を超える
           SASHIMONO_TEST_WORKERS: "4"

@@ -20,16 +20,6 @@ jobs:
     # Windows 専用のソフトなので、Windows で検証する
     runs-on: windows-latest
 
-    env:
-      # CI に入れる ffmpeg 手元の開発環境（README）と、配る zip の FFmpeg（PyAV の
-      # wheel）と同じ 8.1.2 にそろえる 版とハッシュは置き場の鍵にもそのまま使うので、
-      # ここを変えれば取り直しと鍵が一緒に変わる
-      FFMPEG_VERSION: 8.1.2
-      # 取った zip をこの値と照らしてから展開する 照らさないと、配布元のリリースが
-      # 差し替えられたときに、その実行ファイルを CI の中で動かすことになる
-      # 値は GitHub のリリースの digest と gyan.dev の .sha256 の両方で一致を確かめた
-      FFMPEG_SHA256: db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec
-
     strategy:
       fail-fast: false
       matrix:
@@ -57,57 +47,12 @@ jobs:
         # 仮想環境に入れると別の Python から見えなくなる
         run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
 
-      - name: ffmpeg の置き場を読み戻す
-        id: ffmpeg-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ runner.temp }}/ffmpeg
-          key: ffmpeg-${{ runner.os }}-${{ env.FFMPEG_VERSION }}-essentials-${{ env.FFMPEG_SHA256 }}
-
       - name: ffmpeg を入れる
-        id: ffmpeg
         # 素材を使うテストが要る 無くても各テストが自分で飛ばすので、
-        # ここが失敗しても CI 全体は止めない
-        # choco は毎回 35 秒ほどかかっていた 版を決めた静的ビルドを取り、置き場を持ち越す
+        # ここが失敗しても CI 全体は止めない 版とハッシュは .github/actions/ffmpeg の 1 か所
+        # （package.yml のタグのときの検証も同じ物を使う）
         continue-on-error: true
-        shell: pwsh
-        env:
-          FFMPEG_DIR: ${{ runner.temp }}/ffmpeg
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exe = Join-Path $env:FFMPEG_DIR 'ffmpeg.exe'
-          $probe = Join-Path $env:FFMPEG_DIR 'ffprobe.exe'
-          $fresh = 'false'
-          # 読み戻したかどうかではなく、実行ファイルがそろっているかで決める 途中までの
-          # 置き場が読み戻されても、取り直せる
-          if (-not ((Test-Path $exe) -and (Test-Path $probe))) {
-            if (Test-Path $env:FFMPEG_DIR) { Remove-Item -Recurse -Force $env:FFMPEG_DIR }
-            $name = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
-            $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
-            Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/$name.zip" -OutFile $zip
-            $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -ne $env:FFMPEG_SHA256) { throw "ffmpeg の zip のハッシュが違う: $actual" }
-            Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
-            New-Item -ItemType Directory -Force $env:FFMPEG_DIR | Out-Null
-            Copy-Item (Join-Path $env:RUNNER_TEMP "$name/bin/*.exe") $env:FFMPEG_DIR
-            $fresh = 'true'
-          }
-          # 出力を全部受けてから 1 行だけ出す パイプで先頭だけ取ると ffmpeg が途中で
-          # 止められて終了コードが 0 でなくなり、動いているのに入っていない扱いになる
-          $version = & $exe -hide_banner -version
-          if ($LASTEXITCODE -ne 0) { throw 'ffmpeg が動かない' }
-          $version | Select-Object -First 1
-          Add-Content $env:GITHUB_PATH $env:FFMPEG_DIR
-          "fresh=$fresh" | Add-Content $env:GITHUB_OUTPUT
-
-      - name: ffmpeg の置き場を保存する
-        # 照らして動いた物を取り直したときだけ保存する 取る途中で落ちた置き場を
-        # 保存すると、鍵を変えるまで壊れた置き場が読み戻され続ける
-        if: steps.ffmpeg.outcome == 'success' && steps.ffmpeg.outputs.fresh == 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ runner.temp }}/ffmpeg
-          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+        uses: ./.github/actions/ffmpeg
 
       - name: mypy の控えを持ち越す
         # strict の mypy は毎回まっさらな状態から全ファイルを読んでいた 控えがあれば
