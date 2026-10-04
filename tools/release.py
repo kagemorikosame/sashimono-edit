@@ -500,7 +500,7 @@ class Release:
             raise StopError(
                 f"タグ {self.tag} の commit（{commit[:7]}）の __version__ が {self.version} でない"
             )
-        print(f"タグは main の先頭より前の {commit[:7]} を指す（組み立てたのはこの commit）")
+        print(f"タグは手元の HEAD より前の {commit[:7]} を指す（組み立てたのはこの commit）")
 
     # --- 3. 組み立て ---------------------------------------------------------------
 

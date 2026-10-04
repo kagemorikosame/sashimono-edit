@@ -442,7 +442,7 @@ class TestTheTag:
         world.github.runs = {n: [_run(OLD, n)] for n in ("CI", "Package", "release.yml")}
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
-        assert "main の先頭より前の bbbbbbb" in capsys.readouterr().out
+        assert "手元の HEAD より前の bbbbbbb" in capsys.readouterr().out
 
     def test_a_local_tag_on_another_commit_stops(self, tool: ModuleType, world: World) -> None:
         world.github.remote_tag = None
