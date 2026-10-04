@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import zipfile
@@ -883,6 +884,75 @@ class TestAPythonChange:
         out = capsys.readouterr().out
         assert "Python が変わるかを確かめられない" in out
         assert not world.published
+
+    def _manifest(self, tool: ModuleType, folder: Path, version: str, abi: str) -> bytes:
+        folder.mkdir(parents=True, exist_ok=True)
+        archive = folder / f"SashimonoEdit-{version}-windows-x64.zip"
+        archive.write_bytes(_zip_bytes(version, abi=abi))
+        data: bytes = tool.update_sign.build_manifest(archive)
+        return data
+
+    @pytest.mark.parametrize(
+        ("beta_abi", "expected"),
+        [("cp315", ""), ("cp314", "cp314（1.3.0b1）→ cp315（1.3.0b2）"), (None, "cp313（1.2.3）")],
+    )
+    def test_a_beta_compares_with_the_beta_first(
+        self, tool: ModuleType, tmp_path: Path, beta_abi: str | None, expected: str
+    ) -> None:
+        """ベータを受け取る人が持っているのは beta の版 正式版と比べると、ベータで既に上げた
+        Python を毎回「変わる」と言い、ベータで初めて上げる時は黙る beta が無ければ正式版と比べる
+        """
+        pages = {tool.STABLE_MANIFEST_URL: self._manifest(tool, tmp_path / "s", "1.2.3", "cp313")}
+        if beta_abi is not None:
+            pages[tool.BETA_MANIFEST_URL] = self._manifest(
+                tool, tmp_path / "b", "1.3.0b1", beta_abi
+            )
+        asked: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            asked.append(url)
+            if url not in pages:
+                raise OSError("404")
+            return pages[url]
+
+        mine = tmp_path / "mine" / "update.json"
+        mine.parent.mkdir()
+        mine.write_bytes(self._manifest(tool, tmp_path / "m", "1.3.0b2", "cp315"))
+        release = tool.Release(version="1.3.0b2", fetch=fetch, manifest=mine)
+        text = release.python_change()
+        assert asked[0] == tool.BETA_MANIFEST_URL
+        if expected:
+            assert expected in text
+        else:
+            assert text == ""
+
+    def test_a_release_compares_only_with_the_stable_one(self, tool: ModuleType) -> None:
+        assert tool.previous_manifest_urls(False) == (tool.STABLE_MANIFEST_URL,)
+        assert tool.previous_manifest_urls(True) == (
+            tool.BETA_MANIFEST_URL,
+            tool.STABLE_MANIFEST_URL,
+        )
+
+    def test_the_draft_notes_use_the_same_order(self, tool: ModuleType) -> None:
+        """下書きの本文（release.yml）は依存を入れないジョブで作るので、この道具を呼べない
+        比べる目録の順が食い違うと、道具は黙るのに本文には注意が出る（またはその逆）
+        """
+        from sashimono.links import REPOSITORY_URL
+
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        base = r'"https://github\.com/\$GH_REPO/([^"]+)"'
+        stable = re.search(rf"previous=\({base}\)", workflow)
+        beta = re.search(rf'previous=\({base} "\$\{{previous\[@\]\}}"\)', workflow)
+        assert stable is not None and beta is not None
+        # ベータのときだけ前へ足す
+        guard = workflow.rfind('if [ "${#pre[@]}" -gt 0 ]; then', 0, beta.start())
+        assert guard >= 0 and stable.end() < guard
+        in_workflow_beta = (
+            f"{REPOSITORY_URL}/{beta.group(1)}",
+            f"{REPOSITORY_URL}/{stable.group(1)}",
+        )
+        assert tool.previous_manifest_urls(True) == in_workflow_beta
+        assert tool.previous_manifest_urls(False) == (f"{REPOSITORY_URL}/{stable.group(1)}",)
 
 
 class TestReusedManifestsFollowTheArguments:

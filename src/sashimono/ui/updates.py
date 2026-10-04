@@ -263,7 +263,10 @@ class UpdateController(QObject):
             self._rescan_scripts()
         # 自動で移すときは、移せた物があったときと、移せずに残った物を初めて見たときだけ知らせる
         # 残った物（同じ名前があった・写せなかった）は次の起動でも残るので、毎回は出さない
-        stayed = {path.as_posix() for path in (*result.kept, *(p for p, _r in result.failed))}
+        stayed = {
+            path.as_posix()
+            for path in (*result.kept, *result.held, *(p for p, _r in result.failed))
+        }
         if manual or mode == SCRIPTS_MOVE_ASK:
             self._inform("スクリプトの置き場", move_summary(result, target))
         elif result.moved or result.left or stayed & fresh:
@@ -703,11 +706,18 @@ def move_summary(result: ScriptMove, target: Path) -> str:
         lines.append(f"  ほか {len(result.moved) - _LISTED} 個")
     if result.kept:
         lines.append(
-            f"移し先に同じ名前の物があった {len(result.kept)} 個は、上書きせずに exe の隣へ"
-            "残しました 同じ名前では、前から移し先の物が読まれています（これまでと同じ）"
+            f"移し先に同じ名前で中身の違う物があった {len(result.kept)} 個は、上書きせずに"
+            " exe の隣へ残しました 同じ名前では、前から移し先の物が読まれています（これまでと同じ）"
             " 見比べて、要らない方を消してください"
         )
         lines.extend(f"  {path.as_posix()}" for path in result.kept[:_LISTED])
+    if result.held:
+        lines.append(
+            f"{len(result.held)} 個は、同じフォルダ（一式）に移せない物がある、または同じ名前の"
+            "モジュールが移し先にあるので、一式のまま exe の隣へ残しました"
+            "（一部だけ移すと、移した先で別のモジュールが読まれて描画が変わるため）"
+        )
+        lines.extend(f"  {path.as_posix()}" for path in result.held[:_LISTED])
     if result.left:
         lines.append(
             f"{len(result.left)} 個は写せましたが、元を消せませんでした"

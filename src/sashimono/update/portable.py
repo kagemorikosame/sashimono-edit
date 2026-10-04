@@ -3,12 +3,22 @@ r"""exe の隣のスクリプト置き場（``scripts``）に本人が置いた�
 exe の隣の ``scripts`` は、前の版の案内どおりそこへ置いた人のために今も読む
 （:func:`sashimono.compat.aviutl.catalog.default_script_roots`） 自動更新では新しい版へ写す
 （:func:`.package.carry_user_files`）が、zip を手で展開し直してフォルダごと入れ替えると
-中身が消える そこで、置いた物があれば ``%APPDATA%\Sashimono\scripts`` へ移すことを勧める
+中身が消える そこで、置いた物があれば ``%APPDATA%\Sashimono\scripts`` へ移す
 
 移すときの決まり
 
-- **上書きしない** 移し先に同じ名前があれば、その物は移さずに残す 移し先の物は本人が
-  後から置いた新しい物かもしれない 残した物は exe の隣から今までどおり読まれる
+- **一式（束）で移すか、一式で残す** スクリプトは同じフォルダのモジュール（``.mod2`` ``.lua``
+  ``.mod`` と DLL）を先に探す（``compat.aviutl.runtime`` の ``_find_module`` スクリプト自身の
+  フォルダ → 置き場の直下 → 置き場の 1 段下 → 深い所） 束の一部だけを移すと、移した先の同じ
+  フォルダにある別のモジュールが先に見つかり、更新しただけで描画が変わる 束の決め方は
+  :func:`bundles` を見る
+- **上書きしない** 移し先に同じ名前で中身の違う物があれば、その束は一式残す 移し先の物は
+  本人が後から置いた新しい物かもしれない 中身が同じ（バイト列が同じ）なら衝突ではないので、
+  移す側を消すだけにする
+- **モジュールの名前が移し先とぶつかる束は残す** モジュールは名前で探し、置き場の直下・
+  1 段下・深い所のどこにあっても見つかる 移し先に同じ名前の別のモジュールがあると、束を
+  丸ごと移しても、移した先でどちらが先に見つかるかが変わりうる 残した束と同じ名前の
+  モジュールを持つ束も残す（今まで exe の隣の中で決まっていた勝ち負けを変えない）
 - **写し終えて中身を照らしてから元を消す** 写す途中で止まっても元は残る 写しは作業用の
   名前で書き、元と同じ中身かを確かめてから本来の名前を付ける 途中の物が本来の名前で
   残ると、次から「もう在る」と見て移さず、しかも欠けた中身の方が読まれる（後の置き場が勝つ）
@@ -21,13 +31,16 @@ import contextlib
 import filecmp
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = [
     "BUNDLED_SCRIPT_FILES",
+    "MODULE_FILE_SUFFIXES",
     "PORTABLE_SCRIPTS_DIR",
     "ScriptMove",
+    "bundles",
     "move_user_scripts",
     "unoffered",
     "user_script_files",
@@ -42,8 +55,15 @@ PORTABLE_SCRIPTS_DIR = "scripts"
 #: Windows は大文字と小文字を区別しないので、比べるときは揃える
 BUNDLED_SCRIPT_FILES = frozenset({"README.txt"})
 
+#: 名前で探されるモジュールの拡張子（compat.aviutl.runtime の MODULE_SUFFIXES と
+#: C_MODULE_SUFFIX） runtime は Lua と numpy を読むので名前だけ持つ 食い違えば試験が落とす
+MODULE_FILE_SUFFIXES = (".lua", ".mod", ".mod2", ".dll")
+
 #: 写している途中の名前に付ける印 スクリプトの拡張子ではないので、途中の物は読まれない
 _MOVING_SUFFIX = ".moving"
+
+#: 置き場の直下に置かれた物の束の名前 フォルダの名前と取り違えないよう、パスに使えない文字にする
+ROOT_BUNDLE = "*"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +71,10 @@ class ScriptMove:
     """移した結果 どれも ``scripts`` からの相対の場所"""
 
     moved: tuple[Path, ...] = ()
-    #: 移し先に同じ名前があったので移さなかった物 exe の隣に残っている
+    #: 移し先に同じ名前で中身の違う物があったので移さなかった物 exe の隣に残っている
     kept: tuple[Path, ...] = ()
+    #: 一緒に残した物 同じ束の中に移せない物があった、またはモジュールの名前が移し先とぶつかる
+    held: tuple[Path, ...] = ()
     #: 写せたが元を消せなかった物 両方に在る
     left: tuple[Path, ...] = ()
     #: 写せなかった物と理由 元はそのまま
@@ -92,19 +114,118 @@ def unoffered(files: list[Path], offered: tuple[str, ...]) -> list[Path]:
     return [path for path in files if path.as_posix().casefold() not in seen]
 
 
+def bundles(files: Iterable[Path]) -> dict[str, list[Path]]:
+    """一緒に動かす束 置き場の直下のフォルダ 1 つが 1 束、直下に置かれたファイルは全部で 1 束
+
+    フォルダで分けるのは、スクリプトがモジュールを自分のフォルダから先に探すため
+    （``_find_module``） 配布物は 1 つのフォルダにまとめて置かれ、その中の階層ごと
+    束にする（1 段下へ分けて置く配布物もある） 直下のファイルは同じフォルダ（置き場の直下）を
+    分け合うので、ばらばらにすると同じ問題が起きる 名前は大文字小文字を揃えて比べる
+    """
+    grouped: dict[str, list[Path]] = {}
+    for relative in files:
+        key = relative.parts[0].casefold() if len(relative.parts) > 1 else ROOT_BUNDLE
+        grouped.setdefault(key, []).append(relative)
+    return grouped
+
+
+def _module_stem(path: Path) -> str | None:
+    return path.stem.casefold() if path.suffix.casefold() in MODULE_FILE_SUFFIXES else None
+
+
+def _modules_in(folder: Path) -> dict[str, list[Path]]:
+    """置き場にあるモジュール 名前 → 相対の場所 どの深さにあっても名前で見つかる"""
+    found: dict[str, list[Path]] = {}
+    try:
+        paths = [path for path in folder.rglob("*") if path.is_file()]
+    except OSError:
+        return found
+    for path in paths:
+        stem = _module_stem(path)
+        if stem is not None:
+            found.setdefault(stem, []).append(path.relative_to(folder))
+    return found
+
+
+def _same(first: Path, second: Path) -> bool:
+    try:
+        return filecmp.cmp(first, second, shallow=False)
+    except OSError:
+        return False
+
+
+def _plan(source: Path, target: Path, files: list[Path]) -> tuple[set[str], set[Path]]:
+    """残す束と、移し先と中身の違う同じ名前の物（衝突） 束はモジュールの名前をたどって広げる"""
+    grouped = bundles(files)
+    clashes = {
+        relative
+        for relative in files
+        if (target / relative).exists() and not _same(source / relative, target / relative)
+    }
+    stay = {key for key, members in grouped.items() if any(p in clashes for p in members)}
+    # 移し先に同じ名前のモジュールが、同じ場所で同じ中身でない形であれば、その束は残す
+    # 移した後に、どちらが先に見つかるかが変わりうる
+    there = _modules_in(target)
+    for key, members in grouped.items():
+        for relative in members:
+            stem = _module_stem(relative)
+            if stem is None:
+                continue
+            for other in there.get(stem, []):
+                elsewhere = other.as_posix().casefold() != relative.as_posix().casefold()
+                if elsewhere or not _same(source / relative, target / other):
+                    stay.add(key)
+    # 残した束と同じ名前のモジュールを持つ束も残す 片方だけ移すと、今まで exe の隣の中で
+    # 決まっていた勝ち負けが、置き場の順（exe の隣が先）で決まるように変わる
+    names = {
+        key: {stem for p in members if (stem := _module_stem(p)) is not None}
+        for key, members in grouped.items()
+    }
+    changed = True
+    while changed:
+        changed = False
+        held_names = set().union(*(names[key] for key in stay)) if stay else set()
+        for key in grouped:
+            if key not in stay and names[key] & held_names:
+                stay.add(key)
+                changed = True
+    return stay, clashes
+
+
 def move_user_scripts(install: Path, target: Path) -> ScriptMove:
     """exe の隣の ``scripts`` に本人が置いた物を ``target`` へ移す 決まりは上の説明のとおり"""
     source = install / PORTABLE_SCRIPTS_DIR
+    files = user_script_files(install)
+    stay, clashes = _plan(source, target, files)
     moved: list[Path] = []
     kept: list[Path] = []
+    held: list[Path] = []
     left: list[Path] = []
     failed: list[tuple[Path, str]] = []
-    for relative in user_script_files(install):
-        origin = source / relative
-        destination = target / relative
-        if destination.exists():
-            kept.append(relative)
+    for key, members in bundles(files).items():
+        if key in stay:
+            for relative in members:
+                (kept if relative in clashes else held).append(relative)
             continue
+        for relative in members:
+            outcome = _move_one(source / relative, target / relative)
+            if outcome is None:
+                moved.append(relative)
+            elif outcome == "":
+                left.append(relative)
+            else:
+                failed.append((relative, outcome))
+    _remove_empty_folders(source)
+    return ScriptMove(tuple(moved), tuple(kept), tuple(held), tuple(left), tuple(failed))
+
+
+def _move_one(origin: Path, destination: Path) -> str | None:
+    """1 つ移す 移せたら ``None``、写せたが元を消せなければ ``""``、写せなければその理由"""
+    if destination.exists():
+        # 中身が同じ物が移し先にある（_plan が確かめた） 移す側を消すだけ
+        if not _same(origin, destination):
+            return "移し先に中身の違う物がある"
+    else:
         # 作業用の名前は起動ごとに分ける 窓を 2 つ開くと、どちらも起動のときに移しに来る
         writing = destination.with_name(f"{destination.name}.{os.getpid()}{_MOVING_SUFFIX}")
         try:
@@ -119,16 +240,12 @@ def move_user_scripts(install: Path, target: Path) -> ScriptMove:
         except OSError as exc:
             with contextlib.suppress(OSError):
                 writing.unlink(missing_ok=True)
-            failed.append((relative, str(exc)))
-            continue
-        try:
-            origin.unlink()
-        except OSError:
-            left.append(relative)
-            continue
-        moved.append(relative)
-    _remove_empty_folders(source)
-    return ScriptMove(tuple(moved), tuple(kept), tuple(left), tuple(failed))
+            return str(exc)
+    try:
+        origin.unlink()
+    except OSError:
+        return ""
+    return None
 
 
 def _remove_empty_folders(source: Path) -> None:

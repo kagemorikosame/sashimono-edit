@@ -626,6 +626,18 @@ class TestScriptsBesideTheExe:
         harness.controller.start()
         assert len(harness.notified) == 1
 
+    def test_a_bundle_kept_together_is_told_once(self, harness: _Harness, asked: list[str]) -> None:
+        """モジュールがぶつかる配布物は効果ごと残し、そう知らせる（PR #245 の Codex の指摘）"""
+        effect = _put_script(harness.layout.install, "配布物/効果.anm2")
+        _put_script(harness.layout.install, "配布物/common.lua", "return { v = 1 }")
+        (_appdata_scripts() / "配布物").mkdir(parents=True)
+        (_appdata_scripts() / "配布物" / "common.lua").write_text("return {}", encoding="utf-8")
+        harness.controller.start()
+        assert effect.is_file()
+        assert len(harness.notified) == 1 and "一式のまま" in harness.notified[0][1]
+        harness.controller.start()
+        assert len(harness.notified) == 1
+
     def test_the_notice_does_not_block_the_editor(
         self, harness: _Harness, qt_application: QApplication
     ) -> None:

@@ -78,14 +78,25 @@ jobs:
             if [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]]; then pre=(--prerelease); fi
             # リリースノートの雛形 更新のしかた（自動と手で入れ替えるときの違い）を毎回同じ
             # 言い方で載せる 手で入れ替えると exe の隣の scripts が消えることを、書き忘れない
-            # Python が前の正式版から変わるなら、入れ直しの知らせを先頭に置く（読み飛ばされない所）
-            # 前の正式版は配った版と同じ固定の URL の目録から読む 読めなければ（初めての公開）比べない
+            # Python が前に公開した版から変わるなら、入れ直しの知らせを先頭に置く（読み飛ばされない所）
+            # 比べる目録の順は tools/release.py の previous_manifest_urls と同じ（ここは依存を入れない
+            # ジョブなので呼べない 揃っているかは tests/test_release_workflow.py が見る）
+            # ベータは beta の目録を先に見て、無ければ正式版 正式版は固定の URL だけ
+            # どれも読めなければ（初めての公開）比べない
             abi=$(unzip -p "$zip" 'Sashimono/build-info.json' | jq -r '.python_abi')
-            before=$( (curl -fsSL "https://github.com/$GH_REPO/releases/latest/download/update.json" \
-              | jq -r '.python_abi') 2>/dev/null || true)
+            previous=("https://github.com/$GH_REPO/releases/latest/download/update.json")
+            if [ "${#pre[@]}" -gt 0 ]; then
+              previous=("https://github.com/$GH_REPO/releases/download/beta/update.json" "${previous[@]}")
+            fi
+            before=""
+            for url in "${previous[@]}"; do
+              before=$( (curl -fsSL "$url" | jq -r '.python_abi') 2>/dev/null || true)
+              if [ -n "$before" ] && [ "$before" != "null" ]; then break; fi
+              before=""
+            done
             notes=$(mktemp)
             {
-              if [ -n "$before" ] && [ "$before" != "null" ] && [ "$before" != "$abi" ]; then
+              if [ -n "$before" ] && [ "$before" != "$abi" ]; then
                 cat <<EOF
           > [!WARNING]
           > **この版では Python が変わります（$before → $abi）**

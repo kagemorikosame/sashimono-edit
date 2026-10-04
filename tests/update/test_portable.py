@@ -20,7 +20,9 @@ from sashimono.compat.aviutl.catalog import ScriptCatalog
 from sashimono.update.package import carry_user_files
 from sashimono.update.portable import (
     BUNDLED_SCRIPT_FILES,
+    MODULE_FILE_SUFFIXES,
     PORTABLE_SCRIPTS_DIR,
+    bundles,
     move_user_scripts,
     unoffered,
     user_script_files,
@@ -180,14 +182,15 @@ class TestReadingOrder:
     def test_winners_stay_the_same(self, install: Path, target: Path, tmp_path: Path) -> None:
         aviutl = tmp_path / "ProgramData" / "aviutl2" / "Script"
         aviutl.mkdir(parents=True)
-        _put(install, "ひとつ.anm2", _script("ひとつ", 1))
+        _put(install, "一/ひとつ.anm2", _script("ひとつ", 1))
         # %APPDATA% と同じ名前 前から %APPDATA% が勝っている
-        _put(install, "重なる.anm2", _script("重なる", 2))
-        target.mkdir(parents=True)
-        (target / "重なる.anm2").write_text(_script("重なる", 3), encoding="utf-8")
+        _put(install, "重/重なる.anm2", _script("重なる", 2))
+        (target / "重").mkdir(parents=True)
+        (target / "重" / "重なる.anm2").write_text(_script("重なる", 3), encoding="utf-8")
         # AviUtl2 と同じ名前 前から AviUtl2 が勝っている
-        _put(install, "上がある.anm2", _script("上がある", 4))
-        (aviutl / "上がある.anm2").write_text(_script("上がある", 5), encoding="utf-8")
+        _put(install, "上/上がある.anm2", _script("上がある", 4))
+        (aviutl / "上").mkdir()
+        (aviutl / "上" / "上がある.anm2").write_text(_script("上がある", 5), encoding="utf-8")
         roots = (install / PORTABLE_SCRIPTS_DIR, target, aviutl)
 
         before = self._winners(roots)
@@ -195,8 +198,8 @@ class TestReadingOrder:
         after = self._winners(roots)
 
         assert after == before
-        assert sorted(p.as_posix() for p in result.moved) == ["ひとつ.anm2", "上がある.anm2"]
-        assert result.kept == (Path("重なる.anm2"),)
+        assert sorted(p.as_posix() for p in result.moved) == ["一/ひとつ.anm2", "上/上がある.anm2"]
+        assert result.kept == (Path("重/重なる.anm2"),)
 
     def test_the_order_of_roots_is_what_this_relies_on(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -206,6 +209,132 @@ class TestReadingOrder:
         roots = catalog_module.default_script_roots()
         assert roots[0] == tmp_path / "Sashimono" / PORTABLE_SCRIPTS_DIR
         assert roots[1].name == PORTABLE_SCRIPTS_DIR and roots[1].parent.name == "Sashimono"
+
+
+class TestBundles:
+    """一緒に動く物（束）は一式で移すか、一式で残す（PR #245 の Codex の指摘）
+
+    スクリプトはモジュールを自分のフォルダから先に探す 効果だけ移してモジュールを残すと、
+    移した先の同じフォルダにある別のモジュールを読み、更新しただけで描画が変わる
+    """
+
+    def _run(self, roots: tuple[Path, ...], script: Path) -> float:
+        """本物の Lua の実行で、スクリプトが読んだモジュールの値を返す"""
+        import numpy as np
+
+        from sashimono.compat.aviutl.objapi import ObjectState
+        from sashimono.compat.aviutl.report import CompatibilityReport
+        from sashimono.compat.aviutl.runtime import LuaScriptRuntime
+
+        runtime = LuaScriptRuntime(report=CompatibilityReport(), instruction_limit=200_000)
+        runtime.set_roots(roots)
+        state = ObjectState(image=np.zeros((1, 1, 4), np.uint8), screen_w=320, screen_h=180)
+        result = runtime.run(
+            script.read_text(encoding="utf-8"), state, script=script.name, folder=script.parent
+        )
+        assert not result.failed, result.message
+        return float(state.ox)
+
+    def _where(self, install: Path, target: Path, relative: str) -> Path:
+        for base in (target, install / PORTABLE_SCRIPTS_DIR):
+            if (base / relative).is_file():
+                return base / relative
+        raise AssertionError(relative)
+
+    def test_a_clashing_module_keeps_its_effect_beside_it(
+        self, install: Path, target: Path
+    ) -> None:
+        """移し先に中身の違う同じ名前のモジュールがあれば、効果もモジュールも一式残す"""
+        _put(install, "配布物/効果.anm2", 'local m = require("common")\nobj.ox = m.v\n')
+        _put(install, "配布物/common.lua", "return { v = 1 }")
+        (target / "配布物").mkdir(parents=True)
+        (target / "配布物" / "common.lua").write_text("return { v = 2 }", encoding="utf-8")
+        roots = (install / PORTABLE_SCRIPTS_DIR, target)
+        before = self._run(roots, self._where(install, target, "配布物/効果.anm2"))
+
+        result = move_user_scripts(install, target)
+
+        assert result.moved == ()
+        assert result.kept == (Path("配布物/common.lua"),)
+        assert result.held == (Path("配布物/効果.anm2"),)
+        assert self._run(roots, self._where(install, target, "配布物/効果.anm2")) == before == 1
+
+    def test_the_same_bytes_are_not_a_clash(self, install: Path, target: Path) -> None:
+        """移し先に同じ中身の物があれば一式移す 移す側の重なった物は消すだけ"""
+        _put(install, "配布物/効果.anm2", 'local m = require("common")\nobj.ox = m.v\n')
+        _put(install, "配布物/common.mod2", "return { v = 1 }")
+        (target / "配布物").mkdir(parents=True)
+        (target / "配布物" / "common.mod2").write_text("return { v = 1 }", encoding="utf-8")
+
+        result = move_user_scripts(install, target)
+
+        assert sorted(p.as_posix() for p in result.moved) == [
+            "配布物/common.mod2",
+            "配布物/効果.anm2",
+        ]
+        assert not (install / PORTABLE_SCRIPTS_DIR / "配布物").exists()
+        assert (target / "配布物" / "common.mod2").read_text(encoding="utf-8") == "return { v = 1 }"
+
+    def test_a_module_name_used_elsewhere_in_appdata_keeps_the_bundle(
+        self, install: Path, target: Path
+    ) -> None:
+        """モジュールは名前で探す 移し先の別のフォルダに同じ名前の物があれば、移した後で
+        どちらが先に見つかるかが変わりうる
+        """
+        _put(install, "配布物/効果.anm2", 'local m = require("common")\nobj.ox = m.v\n')
+        _put(install, "配布物/common.lua", "return { v = 1 }")
+        (target / "別の物").mkdir(parents=True)
+        (target / "別の物" / "common.mod2").write_text("return { v = 3 }", encoding="utf-8")
+
+        result = move_user_scripts(install, target)
+
+        assert result.moved == () and len(result.held) == 2
+
+    def test_a_bundle_sharing_a_module_name_with_a_kept_one_stays(
+        self, install: Path, target: Path
+    ) -> None:
+        """残した束と同じ名前のモジュールを持つ束も残す 片方だけ移すと、exe の隣の中で
+        決まっていた勝ち負けが置き場の順で決まるように変わる
+        """
+        _put(install, "甲/common.lua", "return { v = 1 }")
+        _put(install, "甲/効果.anm2", "obj.ox = 1\n")
+        _put(install, "乙/common.lua", "return { v = 2 }")
+        _put(install, "丙/単独.anm2", "obj.ox = 3\n")
+        (target / "甲").mkdir(parents=True)
+        (target / "甲" / "効果.anm2").write_text("obj.ox = 9\n", encoding="utf-8")
+
+        result = move_user_scripts(install, target)
+
+        assert [p.as_posix() for p in result.moved] == ["丙/単独.anm2"]
+        assert sorted(p.as_posix() for p in result.held) == [
+            "乙/common.lua",
+            "甲/common.lua",
+        ]
+
+    def test_loose_files_are_one_bundle(self, install: Path, target: Path) -> None:
+        """置き場の直下のファイルは同じフォルダを分け合うので、まとめて 1 束"""
+        _put(install, "効果.anm2", 'local m = require("common")\nobj.ox = m.v\n')
+        _put(install, "common.lua", "return { v = 1 }")
+        target.mkdir(parents=True)
+        (target / "common.lua").write_text("return { v = 2 }", encoding="utf-8")
+        result = move_user_scripts(install, target)
+        assert result.moved == () and result.held == (Path("効果.anm2"),)
+
+    def test_the_bundles(self) -> None:
+        found = bundles(
+            [Path("a.anm2"), Path("b.lua"), Path("X/c.anm2"), Path("x/d/e.lua"), Path("Y/f")]
+        )
+        assert found == {
+            "*": [Path("a.anm2"), Path("b.lua")],
+            "x": [Path("X/c.anm2"), Path("x/d/e.lua")],
+            "y": [Path("Y/f")],
+        }
+
+    def test_the_module_suffixes_match_the_runtime(self) -> None:
+        """名前が食い違うと、探される物をモジュールと見なさずに束を割る"""
+        from sashimono.compat.aviutl import runtime
+
+        assert set(MODULE_FILE_SUFFIXES) == {*runtime.MODULE_SUFFIXES, runtime.C_MODULE_SUFFIX}
 
 
 class TestSurvivingUpdates:

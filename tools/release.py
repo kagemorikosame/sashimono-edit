@@ -259,6 +259,16 @@ def manifest_differences(found: Manifest, expected: Manifest) -> list[str]:
     return differences
 
 
+def previous_manifest_urls(beta: bool) -> tuple[str, ...]:
+    """Python が変わるかを比べる、前に公開した版の目録の URL 読めた最初の物と比べる
+
+    ベータは ``beta`` の目録（ベータを受け取る人が今持っている版）を先に見て、無ければ正式版と
+    比べる 正式版は固定の URL だけ 下書きの本文を作る ``release.yml`` も同じ順で読む
+    （あちらは依存を入れないジョブで走るので、この関数を呼べない 揃っているかは試験が見る）
+    """
+    return (BETA_MANIFEST_URL, STABLE_MANIFEST_URL) if beta else (STABLE_MANIFEST_URL,)
+
+
 def zip_name(version: str) -> str:
     return f"{build_package.ARCHIVE_PREFIX}-{version}-windows-x64.zip"
 
@@ -995,7 +1005,7 @@ class Release:
 
         変わる版では、字幕起こしと AI 連携を入れた人が全員入れ直しになる（合わせて 2 GB を
         超える） 道具はリリースノートを書かないので、公開の直前に書いたかを人に確かめさせる
-        比べる相手は、この版が置き換える固定の URL（ベータは ``beta``）の目録
+        比べる相手は :func:`previous_manifest_urls` の順に読めた最初の目録
         """
         if self.manifest is None:
             return ""
@@ -1003,13 +1013,20 @@ class Release:
             new = parse_manifest(self.manifest.read_bytes()).python_abi
         except (OSError, ManifestError):
             return ""
-        url = BETA_MANIFEST_URL if self.beta else STABLE_MANIFEST_URL
-        try:
-            old = parse_manifest(self.fetch(url))
-        except (OSError, ManifestError) as exc:
+        old: Manifest | None = None
+        problem = ""
+        for url in previous_manifest_urls(self.beta):
+            try:
+                old = parse_manifest(self.fetch(url))
+            except (OSError, ManifestError) as exc:
+                problem = str(exc)
+                continue
+            break
+        if old is None:
             # 初めての公開では読めない 黙ると、変わる版でも確かめずに出してしまう
             return (
-                f"  [--] 前に公開した版の目録を読めず、Python が変わるかを確かめられない（{exc}）\n"
+                f"  [--] 前に公開した版の目録を読めず、Python が変わるかを確かめられない"
+                f"（{problem}）\n"
                 "       変わる版なら、リリースノートの先頭に入れ直しの案内を書く"
                 "（docs/development.md の「Python が上がる版を出すとき」）"
             )
