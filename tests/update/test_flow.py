@@ -70,6 +70,36 @@ class TestApplyingOnStart:
         # 印は入れ替え係を起こす前に下ろす 失敗し続ける機械で、起動のたびに試さない
         assert not store.load().apply_on_start
 
+    def test_files_that_cannot_be_carried_stop_the_swap(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """exe の隣の本人の物を新しい版へ写せなければ入れ替えない（PR #245 の CodeRabbit の指摘）
+
+        写せないまま入れ替えると、本人の物は次の更新で消える .previous にだけ残る
+        """
+        _stage(layout, "1.2.0")
+        mine = layout.install / "scripts" / "自分の" / "効果.anm2"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("--track", encoding="utf-8")
+        # 写す先にフォルダを作れない（同じ名前のファイルが塞いでいる）
+        (layout.staged / "scripts").mkdir()
+        (layout.staged / "scripts" / "自分の").write_text("塞ぐ", encoding="utf-8")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        assert not apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert plans == []
+        state = store.load()
+        assert state.auto_blocked == "1.2.0" and not state.apply_on_start
+        assert "自分の/効果.anm2" in state.pending_notice and "止めました" in state.pending_notice
+        # 落として確かめた新しい版は残す 今の版はそのまま動く
+        assert layout.staged_version() == "1.2.0"
+        assert mine.is_file() and (layout.install / APP_EXE).is_file()
+
     def test_turning_checks_off_cancels_the_reservation(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:

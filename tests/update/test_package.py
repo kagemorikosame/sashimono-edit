@@ -185,6 +185,31 @@ class TestUserScripts:
         assert carry_user_files(layout.install, layout.staged, aside=aside) == 0
         assert (aside / "見本" / "揺れ.anm2").read_text(encoding="utf-8") == "前から置いた"
 
+    def test_a_failure_is_raised_after_trying_everything(self, layout: Layout) -> None:
+        """写せなかった物を黙って飛ばすと、呼んだ側が気付かずに入れ替え、本人の物は次の更新で
+        消える版にだけ残る（PR #245 の CodeRabbit の指摘） 全部を試してから並べて上げる
+        """
+        self._write(layout.install, "塞がれた/効果.anm2", "写せない")
+        self._write(layout.install, "通る/効果.anm2", "写せる")
+        (layout.staged / PORTABLE_SCRIPTS_DIR).mkdir(parents=True)
+        (layout.staged / PORTABLE_SCRIPTS_DIR / "塞がれた").write_text("塞ぐ", encoding="utf-8")
+
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(layout.install, layout.staged)
+        assert [path.as_posix() for path, _ in raised.value.failed] == ["塞がれた/効果.anm2"]
+        assert "塞がれた/効果.anm2" in raised.value.explain()
+        assert (layout.staged / PORTABLE_SCRIPTS_DIR / "通る" / "効果.anm2").is_file()
+        assert not list(layout.staged.rglob("*.moving"))
+
+    def test_a_failure_to_put_it_aside_is_raised_too(self, layout: Layout, tmp_path: Path) -> None:
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        aside.mkdir(parents=True)
+        (aside / "見本").write_text("塞ぐ", encoding="utf-8")
+        self._write(layout.install, "見本/揺れ.anm2", "本人が直した")
+        self._write(layout.staged, "見本/揺れ.anm2", "新しい版の見本")
+        with pytest.raises(package_module.CarryError):
+            carry_user_files(layout.install, layout.staged, aside=aside)
+
     def test_the_folder_name_matches_the_catalog(self) -> None:
         """名前が食い違うと、写す先が読まれない場所になる"""
         assert package_module._PORTABLE_SCRIPTS_DIR == PORTABLE_SCRIPTS_DIR

@@ -740,6 +740,52 @@ class TestScriptsBesideTheExe:
         assert harness.controller.roll_back()
         assert (harness.layout.previous / "scripts" / "効果.anm2").is_file()
 
+    def test_files_that_cannot_be_carried_stop_the_update(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """写せないまま入れ替えると、本人の物は次の更新で消える版にだけ残る 入れ替え係を
+        起こさずに止め、何を写せなかったかを知らせる（PR #245 の CodeRabbit の指摘）
+        """
+        harness.preferences = Preferences(scripts_move="off")
+        harness.controller.start()
+        assert harness.controller.ready_version() == NEWER
+        _put_script(harness.layout.install, "自分の/効果.anm2")
+        (harness.layout.staged / "scripts").mkdir(exist_ok=True)
+        (harness.layout.staged / "scripts" / "自分の").write_text("塞ぐ", encoding="utf-8")
+        monkeypatch.setattr(QApplication, "quit", lambda: pytest.fail("終わってはいけない"))
+        assert not harness.controller.restart_now()
+        assert harness.launched == []
+        assert harness.informed and harness.informed[-1][0] == "入れ替えを止めました"
+        assert "自分の/効果.anm2" in harness.informed[-1][1]
+        assert harness.controller.ready_version() == NEWER
+
+    def test_files_that_cannot_be_carried_stop_the_rollback(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness.preferences = Preferences(scripts_move="off")
+        harness.layout.previous.mkdir()
+        (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
+        (harness.layout.previous / "scripts").mkdir()
+        (harness.layout.previous / "scripts" / "自分の").write_text("塞ぐ", encoding="utf-8")
+        _put_script(harness.layout.install, "自分の/効果.anm2")
+        monkeypatch.setattr(
+            harness.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        monkeypatch.setattr(QApplication, "quit", lambda: pytest.fail("終わってはいけない"))
+        assert not harness.controller.roll_back()
+        assert harness.launched == []
+        assert harness.informed[-1][0] == "入れ替えを止めました"
+        assert __version__ not in harness.store.load().skipped
+
+    def test_a_swap_stopped_before_the_window_is_told_once(self, harness: _Harness) -> None:
+        """起動の頭で止めた入れ替えは、窓を出した後に 1 度だけ、窓を塞がずに知らせる"""
+        harness.preferences = Preferences(update_check=False, scripts_move="off")
+        harness.store.save(UpdateState(pending_notice="写せなかったので止めました"))
+        harness.controller.start()
+        harness.controller.start()
+        assert harness.notified == [("入れ替えを止めました", "写せなかったので止めました")]
+        assert harness.informed == []
+
     def test_rolling_back_takes_the_edited_one(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:

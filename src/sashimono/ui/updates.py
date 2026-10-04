@@ -36,7 +36,13 @@ from sashimono.ui.workspace import SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF, Preferenc
 from sashimono.update.check import CheckResult, Outcome, check_for_update, is_due
 from sashimono.update.fetch import FetchError, Transport, UrllibTransport
 from sashimono.update.flow import UpdateBusyError, UpdateChoices, prepare, reconcile, settle
-from sashimono.update.package import Layout, PackageError, carry_user_files, current_layout
+from sashimono.update.package import (
+    CarryError,
+    Layout,
+    PackageError,
+    carry_user_files,
+    current_layout,
+)
 from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
     ScriptMove,
@@ -185,6 +191,13 @@ class UpdateController(QObject):
         notice = settle(layout=self._layout, store=self._store)
         if notice:
             self._say(notice, 20000)
+        stopped = self._store.load()
+        if stopped.pending_notice:
+            # 起動の頭で入れ替えを止めた（まだ窓が無かった） 1 度だけ知らせて消す 窓を塞がない
+            # 知らせにする 起動して黙って出る窓が編集画面を塞ぐと閉じられない
+            with contextlib.suppress(OSError):
+                self._store.save(replace(stopped, pending_notice=""))
+            self._notify("入れ替えを止めました", stopped.pending_notice)
         self._refresh_button()
         # 確かめるのを切っている人にも勧める 手で入れ替える人ほど消える側にいる
         self.offer_script_move()
@@ -508,16 +521,22 @@ class UpdateController(QObject):
         # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
         if self._busy_elsewhere():
             return False
-        if mode == "apply":
-            carry_user_files(
-                self._layout.install,
-                self._layout.staged,
-                aside=userdirs.config_root() / PORTABLE_SCRIPTS_DIR,
-            )
-        elif mode == "rollback":
-            # 戻すと今の版は previous へ回り、次に新しい版を入れたときに消える 今の版の
-            # exe の隣へ後から置いた物・直した物を、戻る先の版へ写す（今の側が正 上書きする）
-            carry_user_files(self._layout.install, self._layout.previous, overwrite=True)
+        try:
+            if mode == "apply":
+                carry_user_files(
+                    self._layout.install,
+                    self._layout.staged,
+                    aside=userdirs.config_root() / PORTABLE_SCRIPTS_DIR,
+                )
+            elif mode == "rollback":
+                # 戻すと今の版は previous へ回り、次に新しい版を入れたときに消える 今の版の
+                # exe の隣へ後から置いた物・直した物を、戻る先の版へ写す（今の側が正 上書きする）
+                carry_user_files(self._layout.install, self._layout.previous, overwrite=True)
+        except CarryError as exc:
+            # 写せないまま入れ替えると、本人の物は次の更新で消える版にだけ残る 入れ替え係を
+            # 起こさずに止める 窓はまだ閉じていないので、今の版のまま続けられる
+            self._inform("入れ替えを止めました", exc.explain())
+            return False
         # 開き直す作品は確認の後で決める 確認で名前を付けて保存したら、その作品を開き直す
         plan = SwapPlan(mode, self._layout, pid=os.getpid(), arguments=self._arguments())
         try:

@@ -86,6 +86,9 @@ class UpdateState:
     #: （``scripts`` からの相対の場所） 勧めるのは 1 度だけ 覚えないと、移さないと決めた
     #: 人に起動のたびに尋ねる 後から新しく置いた物があれば、それについてだけもう 1 度勧める
     scripts_offered: tuple[str, ...] = field(default_factory=tuple)
+    #: 起動の頭（画面を出す前）で入れ替えを止めたわけ 画面を出した後に 1 度知らせて消す
+    #: 起動の頭はまだ窓が無く、その場では知らせられない
+    pending_notice: str = ""
 
 
 class UpdateStateStore:
@@ -127,6 +130,7 @@ class UpdateStateStore:
                 if isinstance(offered, list)
                 else plain.scripts_offered
             ),
+            pending_notice=_text(data.get("pending_notice")),
         )
 
     def save(self, state: UpdateState) -> None:

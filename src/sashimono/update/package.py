@@ -38,6 +38,7 @@ __all__ = [
     "APP_EXE",
     "BUILD_INFO_NAME",
     "BuildInfo",
+    "CarryError",
     "Layout",
     "PackageError",
     "carry_user_files",
@@ -274,9 +275,15 @@ def carry_user_files(
       （``%APPDATA%`` の ``scripts``）の空いている所へ写す 読む順は ``%APPDATA%`` が後で勝つので、
       今まで使われていた本人の物が使われ続ける ``aside`` に既に在れば、前からそちらが使われて
       いるので写さない
+
+    **1 つでも写せなければ :class:`CarryError`** 全部を試してから、写せなかった物を並べて上げる
+    呼んだ側は入れ替えを止める 写せないまま入れ替えると、本人の物は次の更新で消える版
+    （``previous`` か ``.new`` へよけた側）にだけ残る 写せた物はそのまま置く（今の版の
+    本人の物と同じ中身で、入れ替え先の版がそのまま使える）
     """
     source = install / _PORTABLE_SCRIPTS_DIR
     copied = 0
+    failed: list[tuple[Path, str]] = []
     for relative in user_script_files(install):
         origin = source / relative
         target = destination / _PORTABLE_SCRIPTS_DIR / relative
@@ -285,11 +292,43 @@ def carry_user_files(
                 continue
             if not overwrite:
                 if aside is not None and not (aside / relative).exists():
-                    copied += _copy_over(origin, aside / relative)
-                continue
-        # 1 つ写せなくても入れ替えは止めない 元は今の版（previous か .new へよけた側）に残る
-        copied += _copy_over(origin, target)
+                    target = aside / relative
+                else:
+                    continue
+        problem = _copy_over(origin, target)
+        if problem is None:
+            copied += 1
+        else:
+            failed.append((relative, problem))
+    if failed:
+        raise CarryError(tuple(failed))
     return copied
+
+
+class CarryError(Exception):
+    """exe の隣の本人の物を、入れ替え先の版（か ``%APPDATA%``）へ写せなかった 入れ替えは止める"""
+
+    def __init__(self, failed: tuple[tuple[Path, str], ...]) -> None:
+        self.failed = failed
+        first, reason = failed[0]
+        super().__init__(
+            f"exe の隣の scripts の {len(failed)} 個を写せなかった（{first.as_posix()}: {reason}）"
+        )
+
+    def explain(self) -> str:
+        """本人に見せる文 止めたこと・今の版のまま動くこと・どうすれば入れられるか"""
+        lines = [
+            f"Sashimono.exe の隣の scripts に置いた物のうち {len(self.failed)} 個を"
+            "写せなかったので、入れ替えを止めました 今の版のまま動きます",
+        ]
+        lines.extend(f"  {path.as_posix()}（{reason}）" for path, reason in self.failed[:10])
+        if len(self.failed) > 10:
+            lines.append(f"  ほか {len(self.failed) - 10} 個")
+        lines.append(
+            "ディスクの空きと書き込みの権限を確かめるか、〔互換〕→〔exe の隣のスクリプトを移す…〕で"
+            " %APPDATA% へ移してから、〔ヘルプ〕→〔更新を確かめる…〕で入れ直してください"
+        )
+        return "\n".join(lines)
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -299,16 +338,19 @@ def _same_file(first: Path, second: Path) -> bool:
         return False
 
 
-def _copy_over(origin: Path, target: Path) -> int:
-    """作業用の名前へ写してから置き換える 途中で止まっても、半分の中身が本来の名前で残らない"""
+def _copy_over(origin: Path, target: Path) -> str | None:
+    """作業用の名前へ写してから置き換える 写せなければ理由を返す
+
+    途中で止まっても、半分の中身が本来の名前で残らない 作業用の写しは片付ける
+    """
     # 印は移す側（.portable）と同じ ``.moving`` 残っても本人の物と数えず、スクリプトとしても読まない
     writing = target.with_name(f"{target.name}.{os.getpid()}.moving")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(origin, writing)
         writing.replace(target)
-    except OSError:
+    except OSError as exc:
         with contextlib.suppress(OSError):
             writing.unlink(missing_ok=True)
-        return 0
-    return 1
+        return str(exc) or type(exc).__name__
+    return None
