@@ -1370,23 +1370,59 @@ class TestTheBuildIsPinnedToTheList:
     DLL（libvmaf）を積み、一覧と版が食い違って組み立てが止まった（Issue #33 の CI）
     """
 
-    def test_the_listed_packages_are_pinned(self, builder: ModuleType) -> None:
-        lines = builder.constraints(builder.NOTICES_SOURCE.read_text(encoding="utf-8"))
+    @pytest.fixture
+    def notices(self) -> ModuleType:
+        spec = importlib.util.spec_from_file_location(
+            "package_notices", ROOT / "tools" / "package_notices.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_listed_packages_are_pinned(self, notices: ModuleType) -> None:
+        lines = notices.constraints(notices.NOTICES_SOURCE.read_text(encoding="utf-8"))
         names = {line.split("==")[0] for line in lines}
         assert {"av", "pyside6-essentials", "cryptography", "pyinstaller"} <= names
         assert all(re.fullmatch(r"[a-z0-9-]+==\d[0-9A-Za-z.!+]*", line) for line in lines), lines
 
-    def test_the_file_table_is_not_taken_for_packages(self, builder: ModuleType) -> None:
+    def test_the_file_table_is_not_taken_for_packages(self, notices: ModuleType) -> None:
         # 同梱のファイルの表（| `LICENSE.txt` | 説明 |）も 1 列目が ` で始まる 版の形でない
         # 行まで制約にすると、uv が制約を読めずに止まる
-        notices = "| `LICENSE.txt` | 本体の使用許諾 |\n| `av`（PyAV） | 18.1.0 | BSD |\n"
-        assert builder.constraints(notices) == ["av==18.1.0"]
+        table = "| `LICENSE.txt` | 本体の使用許諾 |\n| `av`（PyAV） | 18.1.0 | BSD |\n"
+        assert notices.constraints(table) == ["av==18.1.0"]
 
-    def test_they_are_written_without_building(self, builder: ModuleType, tmp_path: Path) -> None:
+    def test_they_are_written_before_any_dependency_is_installed(self, tmp_path: Path) -> None:
+        """制約は依存を何も入れていない Python で書ける
+
+        CI は最初の ``uv pip install`` から制約を使う 依存を読む道具で書くと、制約の無い
+        導入を先に通すことになり、その日の新しい依存が壊れていると制約まで届かない
+        依存を読めない Python（-I で site を切る）で走らせて確かめる
+        """
         target = tmp_path / "build" / "constraints.txt"
-        assert builder.main(["--write-constraints", str(target)], dist=tmp_path) == 0
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(ROOT / "tools" / "package_notices.py"),
+                "--write-constraints",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
         assert "av==" in target.read_text(encoding="utf-8")
-        assert not (tmp_path / "Sashimono").exists()
+
+    def test_the_builder_reads_the_same_list(self, builder: ModuleType) -> None:
+        # 制約を書く道具と、組み立てで一覧と照らす道具が別々に読むと、表の読み方がずれる
+        assert builder.listed_versions.__module__ == "package_notices"
+        assert builder.canonical_name.__module__ == "package_notices"
 
 
 class TestTheSoftwareGLIsLeftOut:

@@ -71,6 +71,16 @@ $healthSeconds = [int]$env:SASHIMONO_UPDATE_HEALTH_SECONDS
 $lock = $env:SASHIMONO_UPDATE_LOCK
 
 function Write-Result([string]$text) {
+    # 本体が結果を読んでいる間は、書き足しが断られることがある（ほかのプロセスが使用中）
+    # 書けずに止まると、走り始めたのに本体は走らないと取り違える 少し待って書き直す
+    for ($i = 0; $i -lt 50; $i++) {
+        try {
+            Add-Content -LiteralPath $result -Value $text -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
     Add-Content -LiteralPath $result -Value $text -Encoding UTF8
 }
 

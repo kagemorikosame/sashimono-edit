@@ -21,6 +21,7 @@ on:
       - ".github/workflows/package.yml"
       - ".github/workflows/release.yml"
       - "tools/build_package.py"
+      - "tools/package_notices.py"
       - "tools/check_clean_machine.ps1"
       - "src/sashimono/selfcheck.py"
       - "src/sashimono/app.py"
@@ -55,17 +56,16 @@ jobs:
         with:
           enable-cache: false
 
-      - name: 依存を入れる
-        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
+      - name: 積む包みを一覧の版に留める制約を書く
+        # 依存は下限だけなので、留めないとその日の最新が入る 一覧（THIRD_PARTY_NOTICES.md）と
+        # 版が食い違うと組み立てが止まる（使用許諾の写しとソースの添付を揃えた版で組む）
+        # 書く道具は標準ライブラリだけで動くので、依存を入れる前に書ける 最初の導入から
+        # 制約を使う 制約の無い導入を先に通すと、その日の新しい依存が壊れていたときに
+        # 制約まで届かずに止まる
+        run: python tools/package_notices.py --write-constraints build/constraints.txt
 
-      - name: 積む包みを一覧の版にそろえる
-        # 依存は下限だけなので、その日の最新が入る 一覧（THIRD_PARTY_NOTICES.md）と版が
-        # 食い違うと組み立てが止まる（使用許諾の写しとソースの添付を揃えた版で組む）
-        # 制約を書く道具が依存を読むので、入れてから留め直す
-        run: |
-          python tools/build_package.py --write-constraints build/constraints.txt
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -c build/constraints.txt
+      - name: 依存を入れる
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -c build/constraints.txt
 
       - name: タグと版を照らす
         # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）

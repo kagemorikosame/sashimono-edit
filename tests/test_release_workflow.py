@@ -104,6 +104,22 @@ def test_the_tag_and_version_are_compared_before_a_release() -> None:
     assert check < build.index("build_package.py --skip-check")
 
 
+def test_every_install_is_pinned_from_the_first() -> None:
+    """依存を入れる最初の導入から、一覧の版に留める制約を使う
+
+    制約の無い導入を先に通すと、その日の新しい依存が壊れていたときに制約付きの
+    導入まで届かずに止まる 制約は依存を入れる前に、標準ライブラリだけの道具で書く
+    """
+    build = _jobs(PACKAGE)["build"]
+    installs = [m.start() for m in re.finditer(r"uv pip install", build)]
+    assert installs
+    written = build.index("tools/package_notices.py --write-constraints build/constraints.txt")
+    assert written < installs[0]
+    for start in installs:
+        line = build[start : build.index("\n", start)]
+        assert "-c build/constraints.txt" in line, line
+
+
 def test_main_and_packaging_changes_run_it() -> None:
     """main への push と、組み立てと確かめに関わるファイルを変える PR で走る
 
@@ -115,6 +131,7 @@ def test_main_and_packaging_changes_run_it() -> None:
     paths = re.findall(r'^      - "([^"]+)"$', head, flags=re.M)
     for path in (
         "tools/build_package.py",
+        "tools/package_notices.py",
         "tools/check_clean_machine.ps1",
         "src/sashimono/selfcheck.py",
         ".github/workflows/package.yml",
@@ -154,6 +171,46 @@ def test_the_check_script_knows_the_self_check_names() -> None:
         assert f"'{name}'" in script, name
 
 
+def _run_script_functions(
+    names: tuple[str, ...], body: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """道具（check_clean_machine.ps1）から関数だけを取り出し、Windows の PowerShell 5.1 で走らせる
+
+    道具を丸ごと走らせると、zip の展開や CI の機械の設定まで行う 確かめたい関数だけを読み、
+    ``body`` で呼ぶ 関数が無ければ終了コード 3
+    """
+    code = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$language = 'System.Management.Automation.Language'\n"
+        '$parser = "$language.Parser" -as [type]\n'
+        '$definition = "$language.FunctionDefinitionAst" -as [type]\n'
+        "$ast = $parser::ParseFile($env:SCRIPT, [ref]$null, [ref]$null)\n"
+        f"foreach ($name in {', '.join(repr(name) for name in names)}) {{\n"
+        "    $found = $ast.Find({ param($node)\n"
+        "        $node -is $definition -and $node.Name -eq $name }, $true)\n"
+        "    if (-not $found) { exit 3 }\n"
+        "    Invoke-Expression $found.Extent.Text\n"
+        "}\n" + body
+    )
+    powershell = (
+        Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    return subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", code],
+        env={**os.environ, "SCRIPT": str(CHECK_SCRIPT), **environment},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
 def test_a_write_inside_an_existing_user_folder_is_caught(tmp_path: Path) -> None:
     """実の置き場（%APPDATA%\\Sashimono）が前からあっても、中へ書いたら見つける
@@ -164,47 +221,123 @@ def test_a_write_inside_an_existing_user_folder_is_caught(tmp_path: Path) -> Non
     place = tmp_path / "Sashimono"
     place.mkdir()
     (place / "前から.txt").write_text("before", encoding="utf-8")
-    code = (
-        "$ErrorActionPreference = 'Stop'\n"
-        "$language = 'System.Management.Automation.Language'\n"
-        '$parser = "$language.Parser" -as [type]\n'
-        '$definition = "$language.FunctionDefinitionAst" -as [type]\n'
-        "$ast = $parser::ParseFile($env:SCRIPT, [ref]$null, [ref]$null)\n"
-        "foreach ($name in 'Get-RealSnapshot', 'Get-RealWrites') {\n"
-        "    $found = $ast.Find({ param($node)\n"
-        "        $node -is $definition -and $node.Name -eq $name }, $true)\n"
-        "    if (-not $found) { exit 3 }\n"
-        "    Invoke-Expression $found.Extent.Text\n"
-        "}\n"
+    body = (
         "$before = @(Get-RealSnapshot @($env:PLACE))\n"
         "Set-Content -LiteralPath (Join-Path $env:PLACE 'settings.json') -Value '{}'\n"
         "$written = @(Get-RealWrites $before @(Get-RealSnapshot @($env:PLACE)))\n"
         "[Console]::Out.Write(($written | ForEach-Object { Split-Path -Leaf $_ }) -join ',')\n"
     )
-    completed = subprocess.run(
-        [
-            str(
-                Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
-                / "System32"
-                / "WindowsPowerShell"
-                / "v1.0"
-                / "powershell.exe"
-            ),
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            code,
-        ],
-        env={**os.environ, "SCRIPT": str(CHECK_SCRIPT), "PLACE": str(place)},
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-        check=False,
+    completed = _run_script_functions(
+        ("Get-RealSnapshot", "Get-RealWrites"), body, {"PLACE": str(place)}
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "settings.json"
+
+
+#: 機械の設定を触るコマンドの身代わり 呼ばれた引数を控えるだけで、何も変えない
+#: 関数はコマンドレットや exe より先に引かれるので、本物には届かない
+_MACHINE_STUBS = (
+    "$script:calls = [System.Collections.Generic.List[string]]::new()\n"
+    "function Get-NetFirewallProfile {\n"
+    "    [pscustomobject]@{ Name = 'Domain'; Enabled = 'False' }\n"
+    "    [pscustomobject]@{ Name = 'Public'; Enabled = 'True' }\n"
+    "}\n"
+    "function Set-NetFirewallProfile { $script:calls.Add('Set ' + ($args -join ' ')) }\n"
+    "function New-NetFirewallRule { $script:calls.Add('New ' + ($args -join ' ')) }\n"
+    "function Remove-NetFirewallRule { $script:calls.Add('Remove ' + ($args -join ' ')) }\n"
+    "function auditpol {\n"
+    "    $script:calls.Add('auditpol ' + ($args -join ' '))\n"
+    "    if ($args[0] -eq '/get') {\n"
+    "        'Machine Name,Policy Target,Subcategory,Subcategory GUID,'"
+    " + 'Inclusion Setting,Exclusion Setting'\n"
+    "        'PC,System,Filtering Platform Connection,{X},No Auditing,'\n"
+    "    }\n"
+    "    $global:LASTEXITCODE = 0\n"
+    "}\n"
+    "$RuleGroup = 'G'\n"
+    "$AuditGuid = '{X}'\n"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_the_firewall_is_left_alone_outside_ci() -> None:
+    """手元（CI の runner でない機械）では、ファイアウォールと監査の設定に触らない
+
+    触ると、開発者の機械のファイアウォールの有効・無効と監査の設定を書き換えたまま残す
+    （PR #241 のレビュー P1）
+    """
+    body = (
+        _MACHINE_STUBS
+        + "$guarded = Enable-NetworkGuard @('C:\\a.exe')\n"
+        + "[Console]::Out.Write(\"$guarded|\" + ($script:calls -join ';'))\n"
+    )
+    environment = {key: value for key, value in os.environ.items() if key != "GITHUB_ACTIONS"}
+    environment["GITHUB_ACTIONS"] = ""
+    completed = _run_script_functions(
+        ("Enable-NetworkGuard", "Restore-NetworkGuard"), body, environment
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "False|"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_ci_puts_the_firewall_back() -> None:
+    """CI でも、触る前の設定を控えて戻し、足した規則を消す 送り出しの既定には触らない
+
+    既定が Block の機械で Allow へ書き換えると、守りを弱めたまま残す
+    """
+    body = (
+        _MACHINE_STUBS
+        + "$guarded = Enable-NetworkGuard @('C:\\a.exe', 'C:\\b.exe')\n"
+        + "Restore-NetworkGuard\n"
+        + "[Console]::Out.Write(\"$guarded|\" + ($script:calls -join ';'))\n"
+    )
+    completed = _run_script_functions(
+        ("Enable-NetworkGuard", "Restore-NetworkGuard"), body, {"GITHUB_ACTIONS": "true"}
+    )
+    assert completed.returncode == 0, completed.stderr
+    guarded, calls_text = completed.stdout.strip().split("|", 1)
+    calls = calls_text.split(";")
+    assert guarded == "True"
+    assert "DefaultOutboundAction" not in calls_text
+    # 触る前に控える
+    assert calls[0].startswith("auditpol /get")
+    assert "Set -All -Enabled True" in calls
+    rules = [call for call in calls if call.startswith("New ")]
+    assert len(rules) == 2 and all("-Group G" in rule for rule in rules)
+    assert "auditpol /set /subcategory:{X} /failure:enable" in calls
+    # 戻す 規則を消し、控えた有効・無効と監査の設定へ
+    restored = calls[calls.index("auditpol /set /subcategory:{X} /failure:enable") + 1 :]
+    assert "Remove -Group G -ErrorAction SilentlyContinue" in restored
+    assert "Set -Name Domain -Enabled False" in restored
+    assert "Set -Name Public -Enabled True" in restored
+    assert "auditpol /set /subcategory:{X} /success:disable /failure:disable" in restored
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_a_folder_the_tool_did_not_make_is_not_deleted(tmp_path: Path) -> None:
+    """-Root に前からあるフォルダを渡しても、中身を消さずに止まる（PR #241 のレビュー P2）
+
+    この道具が作った印のあるフォルダだけを消して作り直す
+    """
+    mine = tmp_path / "人のフォルダ"
+    mine.mkdir()
+    (mine / "大事.txt").write_text("keep", encoding="utf-8")
+    refused = _run_script_functions(
+        ("Initialize-Root",), "Initialize-Root $env:TARGET\n", {"TARGET": str(mine)}
+    )
+    assert refused.returncode != 0
+    assert (mine / "大事.txt").read_text(encoding="utf-8") == "keep"
+
+    made = tmp_path / "確かめ 用"
+    script = "Initialize-Root $env:TARGET\n"
+    first = _run_script_functions(("Initialize-Root",), script, {"TARGET": str(made)})
+    assert first.returncode == 0, first.stderr
+    (made / "前の確かめの残り.txt").write_text("old", encoding="utf-8")
+    again = _run_script_functions(("Initialize-Root",), script, {"TARGET": str(made)})
+    assert again.returncode == 0, again.stderr
+    assert not (made / "前の確かめの残り.txt").exists()
+    assert (made / ".sashimono-clean-check").is_file()
 
 
 def test_a_published_or_signed_release_is_not_replaced() -> None:

@@ -262,6 +262,65 @@ class TestTheHandshake:
         assert '"' not in "".join(code)
 
 
+def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None:
+    """本体が結果のファイルを読んでいる間に書き足しが断られても、書き直して残す
+
+    本体は走り始めたかを結果のファイルで待つ（何度も読む） 入れ替え係の書き足しが
+    ちょうど重なると「ほかのプロセスが使用中」で断られ、入れ替え係が error で止まった
+    （#241 の作業中に自己診断の試験で出た） 走り始めたのに走らないと取り違える
+    台本の Write-Result だけを取り出し、結果のファイルを 1 秒だけ誰にも開かせずに持つ
+    """
+    import ctypes
+    import re
+    import subprocess
+    from ctypes import wintypes
+
+    match = re.search(r"^function Write-Result.*?^}\n", swap_module.HELPER_SCRIPT, re.M | re.S)
+    assert match is not None
+    result = tmp_path / "result.txt"
+    result.write_bytes(b"")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    generic_read, no_sharing, open_existing = 0x80000000, 0, 3
+    handle = kernel.CreateFileW(str(result), generic_read, no_sharing, None, open_existing, 0, None)
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+    try:
+        ready = tmp_path / "ready.txt"
+        code = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$result = $env:RESULT\n"
+            + match.group(0)
+            # 書き足す直前に知らせる PowerShell の起動の遅さで、錠を離した後に書くことにならない
+            + "Set-Content -LiteralPath $env:READY -Value 'ready'\n"
+            + "Write-Result 'holding'\n"
+        )
+        process = subprocess.Popen(
+            [str(swap_module.powershell_path()), "-NoProfile", "-NonInteractive", "-Command", code],
+            env={**os.environ, "RESULT": str(result), "READY": str(ready)},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 60
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # 断られる所まで進ませてから離す
+        time.sleep(0.7)
+    finally:
+        kernel.CloseHandle(handle)
+    _, error = process.communicate(timeout=60)
+    assert process.returncode == 0, error.decode("cp932", "replace")
+    assert "holding" in result.read_text(encoding="utf-8-sig")
+
+
 def test_a_first_powershell_start_is_waited_for() -> None:
     """その利用者が初めて PowerShell 5.1 を起こすときの遅さを、動かないと取り違えない
 
