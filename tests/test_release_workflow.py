@@ -121,6 +121,23 @@ def test_every_install_is_pinned_from_the_first() -> None:
         assert "-c build/constraints.txt" in line, line
 
 
+def test_a_release_is_verified_before_the_zip_is_built() -> None:
+    """タグのとき（release.yml から呼ばれたとき）は、組み立てる前に verify を走らせる
+
+    タグの push では ci.yml が走らないので、ruff・mypy・pytest が落ちる状態のまま下書きが
+    作られうる（PR #241 のレビュー） main と PR では ci.yml が走らせるので、タグに絞って
+    二重にしない
+    """
+    build = _jobs(PACKAGE)["build"]
+    verify = build.index("python tools/verify.py")
+    step = build[build.rindex("- name:", 0, verify) : verify]
+    assert "if: startsWith(github.ref, 'refs/tags/')" in step
+    assert build.index("uv pip install") < verify < build.index("build_package.py --skip-check")
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    assert "python tools/verify.py" in ci
+    assert "tags:" not in ci.split("\njobs:\n", 1)[0]
+
+
 def test_packages_outside_the_dependencies_are_installed_at_the_listed_version() -> None:
     """依存では入らないが積む包み（pip）を、一覧の版で明示して入れる（PR #241 のレビュー P1）
 

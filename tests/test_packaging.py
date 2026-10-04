@@ -1419,8 +1419,14 @@ class TestTheBuildIsPinnedToTheList:
         assert completed.returncode == 0, completed.stderr
         assert "av==" in target.read_text(encoding="utf-8")
 
-    def test_pip_is_installed_at_the_listed_version(self, notices: ModuleType) -> None:
-        """依存では入らないが積む pip を、一覧の版で入れる要件にする（PR #241 のレビュー P1）"""
+    def test_pip_is_installed_at_the_listed_version_or_the_zip_build_stops(
+        self, notices: ModuleType
+    ) -> None:
+        """依存では入らないが積む pip を、一覧の版で入れる要件にする（PR #241 のレビュー P1）
+
+        pip は Python に最初から入っていて、制約では入れ直されない 一覧の版とずれたまま
+        積むと、使用許諾の版の照合で zip の組み立てが止まる
+        """
         table = notices.NOTICES_SOURCE.read_text(encoding="utf-8")
         wanted = notices.requirements(table)
         assert wanted == [f"pip=={notices.listed_versions(table)['pip']}"]

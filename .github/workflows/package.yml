@@ -77,6 +77,17 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: python tools/update_sign.py check-tag "$env:TAG"
 
+      - name: 検証（タグのときだけ）
+        # ruff・mypy・pytest が落ちる状態のまま、リリースの下書きを作らない
+        # main への push と PR では ci.yml が同じ verify を走らせるので、ここでは二重にしない
+        # タグの push では ci.yml が走らない（release.yml から呼ばれたときだけ通る道）
+        # 積む版（制約で留めた依存）のまま確かめるので、配る物と同じ組み合わせを見ることになる
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          # ci.yml と同じく 4 コアで並べる 直列では 6 分を超える
+          SASHIMONO_TEST_WORKERS: "4"
+        run: python tools/verify.py
+
       - name: 配る zip を組み立てる
         # zip からの確かめは、ここ（依存を入れた機械）ではなく次の clean-machine で行う
         # ここで確かめると、この機械の Python と DLL を拾って通ってしまう

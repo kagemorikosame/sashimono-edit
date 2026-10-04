@@ -1940,6 +1940,8 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   `clean-machine-report` として残る
 - 実の利用者の置き場（runner の `%APPDATA%\Sashimono` など）に書いていないことを見る
 
+タグのとき（`release.yml` から呼ばれたとき）だけ、組み立ての前に `tools/verify.py` も走らせる
+タグの push では ci.yml が走らないため main と PR では ci.yml が走らせるので二重にしない
 走らせるのは main への push、タグの push（`release.yml` から呼ぶ 落ちたら下書きへ上げない）、
 手で（workflow_dispatch）、組み立てと確かめに関わるファイルを変える PR 組み立てだけで
 10 分ほどかかるので、ほかの PR では走らせない
