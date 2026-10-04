@@ -45,7 +45,6 @@ GPL の条件で配ります** Sashimono 本体の MIT は GPL と両立する�
 | `packaging` | 26.3 | Apache-2.0 OR BSD-2-Clause | https://github.com/pypa/packaging |
 | `trove-classifiers` | 2026.6.1.19 | Apache Software License | https://github.com/pypa/trove-classifiers |
 | `typing_extensions` | 4.16.0 | PSF-2.0 | https://github.com/python/typing_extensions |
-| `pywin32` | 312 | PSF | https://github.com/mhammond/pywin32 |
 | `pyinstaller` | 6.22.3 | GPL-2.0 に配布物への例外付き（`Sashimono.exe` の起動部と実行時の差し込み） | https://github.com/pyinstaller/pyinstaller |
 
 版は開発機の組み立てで数えた物です 組み立てる機械の包みが変わると版も変わり、

@@ -57,7 +57,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_notices import canonical_name, listed_versions  # noqa: E402
 
 from sashimono import __version__  # noqa: E402
-from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
+from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT  # noqa: E402
+from sashimono.app import ADD_ON_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
 from sashimono.links import REPORT_URL  # noqa: E402
 from sashimono.runtime import python_abi  # noqa: E402
@@ -80,6 +81,20 @@ EXCLUDED_MODULES = (
     "torch",
     "nvidia",
     "claude_agent_sdk",
+    # pywin32 本体は使わない AI 連携（mcp）の依存として開発の .venv に入っていると、標準の
+    # logging.handlers と numpy.testing の import から拾われ、pywintypes の DLL と、それを
+    # 探す道へ足す差し込みまで積まれる CI（pywin32 が無い）で組んだ 0.1.0 の zip には無く、
+    # 手元で組んだ zip でだけ AI 連携が動いて、配った物の不具合を確かめで見落とした
+    # 組む機械に何が入っているかで中身が変わらないよう、どこで組んでも積まない
+    "pywintypes",
+    "pythoncom",
+    "win32api",
+    "win32con",
+    "win32evtlog",
+    "win32evtlogutil",
+    "win32pdh",
+    "win32com",
+    "winerror",
     # 開発の道具 動かすのに要らない
     "pytest",
     "hypothesis",
@@ -92,8 +107,6 @@ EXCLUDED_MODULES = (
 #: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
 #: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
 RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2")
-#: 上の包みの import する名前（配布版の exe の中で import してみる）
-RUNTIME_MODULES = ("claude_agent_sdk", "faster_whisper", "ctranslate2")
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
 #: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の
@@ -791,7 +804,9 @@ def write_sample_wheel(folder: Path) -> Path:
     return target
 
 
-def _run(executable: Path, arguments: list[str], folder: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    executable: Path, arguments: list[str], folder: str, *, timeout: float = 600
+) -> subprocess.CompletedProcess[str]:
     """展開した exe を走らせる
 
     渡すのは、この道具が展開した exe の場所と、この道具の中で決めた引数だけ
@@ -812,7 +827,7 @@ def _run(executable: Path, arguments: list[str], folder: str) -> subprocess.Comp
         # 動かすと UTF-8 を返し、exe の書いた cp932 を読み違える
         encoding=locale.getencoding(),
         errors="replace",
-        timeout=600,
+        timeout=timeout,
         check=False,
     )
 
@@ -825,6 +840,8 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
     1. 自己診断（描く・書き出す・Lua・pip の有無）
     2. exe の隣の置き場へ見本を置き、**読まれた**こと
     3. exe に pip を走らせ、導入ボタンと同じ入れ方で**実際に入る**こと
+    4. 後から入れる部品（AI 連携・字幕起こし）を exe の pip で入れ、exe の中で import できること
+       **ネットにつなぐ**（:func:`runtime_import_failures`）
     """
     with tempfile.TemporaryDirectory(prefix="sashimono-zip-check-") as folder:
         with zipfile.ZipFile(archive) as opened:
@@ -893,30 +910,40 @@ def update_failures(home: Path, self_check_output: str) -> list[str]:
 
 
 def runtime_import_failures(executable: Path, folder: str) -> list[str]:
-    """後から入れる部品を、配布版の exe の中で import してみる この機械に入っている物だけ
+    """後から入れる部品を、使う人と同じ道で入れて読む **ネットにつなぐ**
 
-    部品は開発の環境の置き場から読ませる 標準ライブラリは exe の持ち物しか見えないので、
-    配布版に無い物があればここで落ちる（利用者の手元で送った途端に落ちるのと同じ）
-    置き場は前へ足す 配布版は入れた部品の置き場を前へ足して読む（:func:`activate_runtime`）
-    後ろへ足すと、配布版が一部だけ積んでいる包み（cryptography）が先に読まれ、使う人の
-    手元では起きない失敗になる
+    入れ方と読み方は exe 自身が持つ（``--add-on-check`` :mod:`sashimono.addon_check`）
+    導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ、起動のときと同じ読み方で
+    別の exe の中で import する CI の確かめ（tools/check_clean_machine.ps1）も同じ口を使う
+
+    前は開発の .venv の置き場を足して読んでいた 開発の .venv は pip の ``--target`` とは
+    並びが違い（pywin32 の DLL の置き場など）、そこに入っている物で組んだ zip は、
+    CI で組んだ zip と中身まで違った 0.1.0 では手元の zip で通り、配った zip では AI 連携が
+    読めなかった 本物の道で入れれば、使う人の手元で落ちる物はここでも落ちる
+
+    落とした物は pip の控え（%LOCALAPPDATA%\\pip\\Cache）に残るので、2 回目からはほとんど
+    落とさない
     """
-    found = {
-        name: spec
-        for name in RUNTIME_MODULES
-        if (spec := importlib.util.find_spec(name)) is not None and spec.origin is not None
-    }
-    if not found:
-        print("[--] 後から入れる部品がこの機械に無いので、exe の中での import は確かめない")
-        return []
-    places = sorted({str(Path(str(spec.origin)).parent.parent) for spec in found.values()})
-    result = _run(executable, [IMPORT_CHECK_FLAG, os.pathsep.join(places), *found], folder)
-    print(result.stdout.rstrip())
+    target = Path(folder) / "add-ons"
+    # exe の側は子（機能ごとの pip と読む exe）を 1 つずつ待つ その全部と、exe の起動の分を待つ
+    # 先に待ちきれずに止めると、exe が書くはずの [NG] の行が残らない
+    children = len(ADD_ON_PACKS) + 1
+    result = _run(
+        executable,
+        [ADD_ON_CHECK_FLAG, str(target)],
+        folder,
+        timeout=children * INSTALL_TIMEOUT + 600,
+    )
     if result.returncode == 0:
+        # pip の進み具合は長いので、通ったときは結果の行だけを出す
+        print("\n".join(line for line in result.stdout.splitlines() if line.startswith("[")))
         return []
+    print(result.stdout.rstrip())
     if result.stderr.strip():
         print(result.stderr.rstrip())
-    return ["後から入れる部品を exe の中で import できない（標準ライブラリが足りない など）"]
+    return [
+        "後から入れる部品を exe の pip で入れて読めない（導入ボタンを押した人と同じ所で落ちる）"
+    ]
 
 
 def package(bundle: Path, target: Path, *, check: bool = True) -> int:

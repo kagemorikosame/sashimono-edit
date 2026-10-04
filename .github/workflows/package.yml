@@ -26,6 +26,11 @@ on:
       - ".github/actions/ffmpeg/**"
       - "src/sashimono/selfcheck.py"
       - "src/sashimono/app.py"
+      # 後から入れる部品の入れ方と読み方（clean-machine が exe の --add-on-check で確かめる）
+      - "src/sashimono/addon_check.py"
+      - "src/sashimono/runtime.py"
+      - "src/sashimono/ai/environment.py"
+      - "src/sashimono/asr/environment.py"
       - "pyproject.toml"
       - "THIRD_PARTY_NOTICES.md"
       - "licenses/**"
@@ -115,7 +120,9 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
-    timeout-minutes: 30
+    # check_clean_machine.ps1 の待ちの上限の合計より長くする 短いと、時間切れの段が要約を書く前に
+    # ジョブが取り消される 合計は試験が数える（tests/test_packaging.py どちらか一方だけ変えると落ちる）
+    timeout-minutes: 45
     steps:
       # 確かめる道具（PowerShell）だけを取る Python・uv・依存は入れない
       - uses: actions/checkout@v7

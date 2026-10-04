@@ -1902,10 +1902,27 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   `SHARED_WITH_ADD_ONS`）は下の部品まで全部積む 配布版に入った包みは、後から入れた置き場の
   同じ包みより先に読まれ、本体の使う部品だけでは mcp の読む物が無かった
 - 後から入れた置き場の `.pth` も読む（`runtime.read_path_files`） pywin32 が要る
+  配布版では、そのうえで置き場の `pywin32_system32` を探す道へ足す 固めた exe の中の
+  pywintypes は DLL を探す道の上でしか探さず、足さないと AI 連携が import で落ちる
+  （0.1.0 の zip で起きた）
+- pywin32 は積まない（`EXCLUDED_MODULES`） 開発の .venv に入っていると標準の
+  logging.handlers から拾われ、DLL を探す道へ足す PyInstaller の差し込みまで積まれる
+  手元で組んだ zip でだけ AI 連携が動き、CI で組んだ zip の不具合を見落とした
+- 配布版の導入ボタンは wheel しか入れない（`--only-binary :all:` `runtime.install_arguments`）
+  sdist しか無い版を選ぶと、pip がソースから組むために `sys.executable`（Sashimono.exe）で
+  子を立て、編集画面が裏で立って導入が終わらない 守りとして、配布版の exe は最初の引数が
+  `.py` なら編集画面を立てずに 1 で終わる（`app.refuse_script`） 台本は走らせない
+  配布版は `PYTHONPATH` を読まないので、走らせても pip の組み立ては通らない
 - 組み立てた後に、後から入れる部品が import する標準ライブラリが配布版に全部あるかを字面で
-  数える（`missing_stdlib`） zip からの確かめでは、この機械に部品が入っていれば、配布版の
-  exe の中で import してみる（`--import-check` 入れた置き場と同じく前へ足して読む）
-  試験のためには落とさない（手元の .venv にある物で確かめる）
+  数える（`missing_stdlib`） zip からの確かめでは、後から入れる部品を**使う人と同じ道で**
+  入れて読む 導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ（CUDA ランタイムは
+  除く）、起動のときと同じ読み方（`--import-check` 前へ足して `.pth` も読む）で import する
+  入れ方と読み方は exe 自身が持つ（`Sashimono.exe --add-on-check <置き場>`
+  `sashimono/addon_check.py`） 組み立ての道具も CI の clean-machine（ファイアウォールを
+  戻した後）も同じ口を呼ぶ
+  **ネットにつなぐ** 落とした物は pip の控えに残り、2 回目からはほとんど落とさない
+  つながらないと落ちる 開発の .venv から読ませる確かめは、pip の `--target` と並びが違い、
+  0.1.0 の不具合を手元で見落としたのでやめた
 
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での
 確認は、開発機ではできない **CI のまっさらな Windows で zip だけを持って確かめる**（Issue #33）

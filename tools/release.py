@@ -147,8 +147,9 @@ def launch_app(executable: Path) -> int:
 def smoke_test(archive: Path, home: Path) -> int:
     """``build_package.py`` が組み立てた直後に掛けるのと同じ、zip からの確かめ
 
-    自己診断（GL で描く・書き出す・Lua・自動更新）・置き場のスクリプト・pip・後から入れる部品の
-    import まで 使用許諾は展開した物を手本にする（組み立てた時の物はこの機械に無い）
+    自己診断（GL で描く・書き出す・Lua・自動更新）・置き場のスクリプト・pip・後から入れる部品を
+    exe の pip で入れて import するまで（ネットにつなぐ）
+    使用許諾は展開した物を手本にする（組み立てた時の物はこの機械に無い）
     """
     return build_package.smoke_test(archive, build_package.notice_digests(home))
 

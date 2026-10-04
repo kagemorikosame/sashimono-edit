@@ -87,6 +87,27 @@ class TestPipInsideThePackage:
         command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
         assert command[:4] == [str(frozen), "-m", "pip", "install"]
 
+    def test_the_install_button_takes_only_wheels(self, frozen: Path) -> None:
+        """配布版はソースの形（sdist）を選ばない
+
+        claude-agent-sdk 0.2.163 が sdist だけで出ていた日に、0.1.0 の zip の導入ボタンが
+        それを選び、pip が組むために Sashimono.exe で子を立て、編集画面が裏で立って導入が
+        終わらなかった wheel に絞れば wheel のある一番新しい版を選ぶ
+        """
+        from sashimono.runtime import FeaturePack
+
+        command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
+        index = command.index("--only-binary")
+        assert command[index + 1] == ":all:"
+        assert index < command.index("pkg")
+
+    def test_development_may_build_from_source(self) -> None:
+        """開発の環境の pip は本物の Python で動き、組む道具もあるので絞らない"""
+        from sashimono.runtime import FeaturePack
+
+        command = install_command(FeaturePack(key="x", label="x", required=("pkg",)))
+        assert "--only-binary" not in command
+
     def test_the_exe_hands_it_to_pip(self, frozen: Path) -> None:
         assert pip_arguments([str(frozen), "-m", "pip", "install", "pkg"]) == ["install", "pkg"]
 
@@ -314,6 +335,17 @@ class TestTheZip:
             arguments[i + 1] for i, value in enumerate(arguments) if value == "--exclude-module"
         }
         assert {"faster_whisper", "claude_agent_sdk"} <= excluded
+
+    def test_pywin32_is_left_out_on_any_machine(self, builder: ModuleType) -> None:
+        """pywin32 は組む機械に入っていても積まない
+
+        開発の .venv（AI 連携の依存で入っている）で組むと logging.handlers と numpy.testing から
+        拾われ、DLL を探す道へ足す差し込みまで積まれた その zip でだけ AI 連携が動き、
+        CI（pywin32 が無い）で組んで配った 0.1.0 の zip では動かないことを確かめで見落とした
+        """
+        arguments = builder.pyinstaller_arguments(Path("w"), Path("d"))
+        excluded = _values(arguments, "--exclude-module")
+        assert {"pywintypes", "pythoncom", "win32api", "win32evtlogutil", "win32pdh"} <= excluded
 
     def test_the_dynamically_loaded_parts_are_collected(self, builder: ModuleType) -> None:
         """名前で読む部品はまとめて積む
@@ -1098,6 +1130,25 @@ class TestTheImportCheck:
         read_path_files(str(tmp_path))
         assert str(inner) in sys.path
 
+    def test_the_pywin32_dlls_are_on_the_path_in_the_package(
+        self, frozen: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """配布版では入れた置き場の ``pywin32_system32`` を探す道へ足す
+
+        固めた exe の中の pywintypes は ``pywintypes314.dll`` を探す道の上でしか探さない
+        .pth はそこを DLL の置き場にするだけなので、0.1.0 の zip は AI 連携を入れても
+        ``Module 'pywintypes' isn't in frozen sys.path`` で読めなかった（展開した zip で確かめた）
+        """
+        from sashimono.runtime import read_path_files
+
+        place = tmp_path / "runtime"
+        dlls = place / "pywin32_system32"
+        dlls.mkdir(parents=True)
+        (dlls / "pywintypes314.dll").write_bytes(b"")
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        read_path_files(str(place))
+        assert str(dlls) in sys.path
+
     def test_a_readable_module_passes(self, tmp_path: Path) -> None:
         (tmp_path / "sashimono_import_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
         assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_probe"]) == 0
@@ -1110,6 +1161,210 @@ class TestTheImportCheck:
         )
         assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_broken"]) == 1
         assert "no_such_stdlib_part" in capsys.readouterr().out
+
+
+class TestTheAddOnsAreCheckedTheUsersWay:
+    """配る zip の確かめは、後から入れる部品を使う人と同じ道で入れて読む（``--add-on-check``）
+
+    前は開発の .venv の置き場を足して読んだ pip の ``--target`` とは並びが違い、0.1.0 では
+    手元の zip で通って、配った zip では AI 連携が読めなかった CI の確かめる機械には
+    Python が無いので、入れ方と読み方は exe 自身が持つ
+    """
+
+    def _calls(
+        self, monkeypatch: pytest.MonkeyPatch, *extra: str, pip_code: int = 0
+    ) -> tuple[list[list[str]], int, list[float]]:
+        from sashimono import addon_check
+
+        calls: list[list[str]] = []
+        waits: list[float] = []
+
+        def fake_call(arguments: list[str], lines: list[str], timeout: float) -> int:
+            calls.append(list(arguments))
+            waits.append(timeout)
+            return pip_code if arguments[1:3] == ["-m", "pip"] else 0
+
+        monkeypatch.setattr(addon_check, "_call", fake_call)
+        code = main(["sashimono", "--add-on-check", "add-ons", *extra])
+        return calls, code, waits
+
+    def test_the_caller_sets_how_long_each_child_may_take(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CI は子を待つ秒数を渡す 渡さないと 30 分ずつ待ち、ジョブの制限を超えて要約が残らない"""
+        from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT
+
+        _, code, waits = self._calls(monkeypatch, "300")
+        assert code == 0
+        assert waits == [300.0] * (len(ADD_ON_PACKS) + 1)
+        _, _, defaults = self._calls(monkeypatch)
+        assert set(defaults) == {INSTALL_TIMEOUT}
+
+    @pytest.mark.parametrize("seconds", ["abc", "0", "-5", "nan", "inf"])
+    def test_an_unreadable_wait_is_refused(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, seconds: str
+    ) -> None:
+        """読めない秒数を既定に置き換えて走らせない 何も入れずに 2 で終わる"""
+        calls, code, _ = self._calls(monkeypatch, seconds)
+        assert code == 2
+        assert calls == []
+
+    def test_a_child_that_takes_too_long_is_written_down(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """時間切れは [NG] の行を残して 1 で終わる 呼んだ側はその行を要約に書ける"""
+        from sashimono import addon_check
+
+        def too_long(*_: object, **__: object) -> subprocess.CompletedProcess[bytes]:
+            raise subprocess.TimeoutExpired("pip", 1)
+
+        monkeypatch.setattr(subprocess, "run", too_long)
+        lines: list[str] = []
+        assert addon_check._call(["Sashimono.exe", "-m", "pip"], lines, 7) == 1
+        assert lines[0].startswith("[NG] 7 秒で終わらない")
+
+    def test_the_exe_pip_installs_what_the_buttons_install(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ai.environment import AI_PACK
+        from sashimono.asr.environment import ASR_PACK
+        from sashimono.runtime import install_arguments
+
+        calls, code, _ = self._calls(monkeypatch)
+        target = Path("add-ons")
+        assert code == 0
+        # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
+        pip = [str(frozen), "-m", "pip"]
+        assert calls[0] == [*pip, *install_arguments(AI_PACK, target, extra=False)]
+        assert calls[1] == [*pip, *install_arguments(ASR_PACK, target, extra=False)]
+        assert "--only-binary" in calls[0]
+        assert not set(ASR_PACK.extra) & set(calls[1])
+
+    def test_the_import_reads_only_what_was_installed_in_a_new_exe(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れた導入先だけを、起動したばかりの別の exe で読む（起動のときと同じ読み方）"""
+        from sashimono.addon_check import ADD_ON_MODULES
+
+        calls, _, _ = self._calls(monkeypatch)
+        assert calls[-1] == [str(frozen), "--import-check", "add-ons", *ADD_ON_MODULES]
+        assert {"claude_agent_sdk", "faster_whisper"} <= set(ADD_ON_MODULES)
+
+    def test_a_failed_install_is_a_failure(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
+        calls, code, _ = self._calls(monkeypatch, pip_code=1)
+        assert code == 1
+        assert len(calls) == 1
+
+    def test_the_build_tool_asks_the_exe(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """組み立ての道具は入れ方を書き写さず、exe の ``--add-on-check`` に任せる"""
+        calls: list[list[str]] = []
+
+        def fake_run(
+            executable: Path, arguments: list[str], folder: str, **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(list(arguments))
+            return subprocess.CompletedProcess(arguments, 1, "[NG] x", "")
+
+        monkeypatch.setattr(builder, "_run", fake_run)
+        failures = builder.runtime_import_failures(Path("Sashimono.exe"), "folder")
+        assert calls == [["--add-on-check", str(Path("folder") / "add-ons")]]
+        assert len(failures) == 1
+
+    def test_the_clean_machine_check_asks_the_exe_after_the_firewall(self) -> None:
+        """CI のまっさらな機械でも同じ口で確かめる 外へ出ないことを数え終え、止めた規則を
+        戻した後で走らせる 前で走らせると、自己診断が外へ出たように数えられるか、pip が
+        止められて落ちる
+        """
+        text = (ROOT / "tools" / "check_clean_machine.ps1").read_text(encoding="utf-8-sig")
+        # 最後に出てくる Restore-NetworkGuard が、確かめ全体の finally で戻す所
+        restored = text.rindex("Restore-NetworkGuard")
+        asked = text.index("'--add-on-check'")
+        assert restored < asked
+
+    def test_the_clean_machine_waits_fit_in_the_job(self) -> None:
+        """clean-machine の待ちの上限を足した物が、ジョブの制限（timeout-minutes）より短い
+
+        長いと、時間切れの段が要約を書く前に Actions がジョブを取り消し、どこで止まったかが
+        残らない（PR #243 のレビュー） 待ちを 1 つ延ばすか、ジョブの制限を縮めると落ちる
+        """
+        from sashimono.addon_check import ADD_ON_PACKS
+
+        script = (ROOT / "tools" / "check_clean_machine.ps1").read_text(encoding="utf-8-sig")
+        workflow = (ROOT / ".github" / "workflows" / "package.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("  clean-machine:") :]
+        limit = int(re.search(r"timeout-minutes: (\d+)", job)[1]) * 60  # type: ignore[index]
+
+        def number(pattern: str) -> int:
+            found = re.search(pattern, script)
+            assert found is not None, pattern
+            return int(found[1])
+
+        step = number(r"\$AddOnStepSeconds = (\d+)")
+        # exe は子（機能ごとの pip と読む exe）を 1 つずつ step 秒まで待つ
+        # CI はその全部と起動の分を待つ
+        assert f"$AddOnSeconds = $AddOnStepSeconds * {len(ADD_ON_PACKS) + 1} + 60" in script
+        variables = {"$AddOnSeconds": step * (len(ADD_ON_PACKS) + 1) + 60}
+
+        default_exe = number(r"function Invoke-Exe\(.*\[int\]\$TimeoutSeconds = (\d+)\)")
+        exe_calls = re.findall(r"= Invoke-Exe '[^']+' @\(.*\)(?: (\S+))?\r?$", script, re.M)
+        assert len(exe_calls) == 3, exe_calls
+        exe_waits = [
+            default_exe if not wait else variables[wait] if wait in variables else int(wait)
+            for wait in exe_calls
+        ]
+
+        probe = number(r"function Measure-PowerShell\(.*\[int\]\$TimeoutSeconds = (\d+)\)")
+        probes = len(re.findall(r"^\s*Measure-PowerShell '", script, re.M))
+        # 窓が出るまで・出してから待つ・閉じるのを待つ
+        window = (
+            number(r"\$deadline = \(Get-Date\)\.AddSeconds\((\d+)\)")
+            + number(r"\[int\]\$WindowSeconds = (\d+)")
+            + number(r"\$window\.WaitForExit\((\d+)\)") // 1000
+        )
+        # 数えない段（取り出し・展開・ファイアウォールの見本・記録を待つ 5 秒・要約）の分
+        rest = 300
+        total = sum(exe_waits) + probe * probes + window + rest
+        assert total < limit, (exe_waits, probe * probes, window, rest, limit)
+
+
+class TestAScriptIsNotTakenForAProject:
+    """配布版の exe に Python の台本を渡されても、編集画面を立てずに失敗で終わる
+
+    pip はソースの形（sdist）から組むとき ``sys.executable`` に ``__pip-runner__.py`` を渡す
+    0.1.0 の exe はそれをプロジェクトとして開こうとして編集画面を裏で立て、導入が終わらなかった
+    """
+
+    def test_the_pip_runner_is_refused(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import sashimono.app as app
+
+        def no_editor(arguments: list[str]) -> int:
+            raise AssertionError("編集画面を立てた")
+
+        monkeypatch.setattr(app, "_start_editor", no_editor)
+        runner = r"C:\Sashimono\_internal\pip\__pip-runner__.py"
+        assert app.main([str(frozen), runner, "install", "hatchling"]) == 1
+        assert "__pip-runner__.py" in capsys.readouterr().err
+
+    def test_a_project_still_opens(self, frozen: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """プロジェクトの場所（``作品.sme``）は今までどおり編集画面へ渡す"""
+        import sashimono.app as app
+
+        opened: list[list[str]] = []
+
+        def editor(arguments: list[str]) -> int:
+            opened.append(arguments)
+            return 0
+
+        monkeypatch.setattr(app, "_start_editor", editor)
+        assert app.main([str(frozen), "作品.sme"]) == 0
+        assert opened == [[str(frozen), "作品.sme"]]
 
 
 class TestTheAssistantSaysWhatIsMissing:
