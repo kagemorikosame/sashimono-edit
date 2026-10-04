@@ -21,13 +21,16 @@ from sashimono.asr import activate_runtime
 from sashimono.core.userdirs import migrate_legacy_folders
 from sashimono.runtime import pip_arguments, run_pip
 
-__all__ = ["IMPORT_CHECK_FLAG", "SELF_CHECK_FLAG", "main"]
+__all__ = ["ADD_ON_CHECK_FLAG", "IMPORT_CHECK_FLAG", "SELF_CHECK_FLAG", "main"]
 
 #: 画面を出さずに、同梱した部品が動くかだけを確かめる
 SELF_CHECK_FLAG = "--self-check"
 #: 画面を出さずに、渡した置き場（``;`` 区切り）を足して部品を import してみる
 #: 配布版を組み立てる道具が、後から入れる部品に要る標準ライブラリが揃っているかを見る
 IMPORT_CHECK_FLAG = "--import-check"
+#: 画面を出さずに、後から入れる部品を導入ボタンと同じ入れ方で渡した置き場へ入れ、読んでみる
+#: 配る zip の確かめが使う（:mod:`sashimono.addon_check`） ネットにつなぐ
+ADD_ON_CHECK_FLAG = "--add-on-check"
 
 
 def import_check(places: str, modules: list[str]) -> int:
@@ -61,6 +64,39 @@ def import_check(places: str, modules: list[str]) -> int:
     return 1 if failed else 0
 
 
+def is_python_script_start(arguments: list[str]) -> bool:
+    """配布版の exe が ``Sashimono.exe 何か.py ...`` と、Python の台本を渡されて起こされたか
+
+    pip はソースの形（sdist）から組むとき、``sys.executable`` に自分の起動部
+    （``__pip-runner__.py``）や組み立ての係（``_in_process.py``）を渡して子を立てる
+    配布版の ``sys.executable`` はこの exe なので、受けないと台本の場所をプロジェクトとして
+    編集画面が裏で立ち、導入が終わらなくなる（0.1.0 の zip で起きた）
+    開発の環境では ``sys.executable`` が本物の Python なので、ここへは来ない
+    """
+    from sashimono.runtime import is_frozen
+
+    return is_frozen() and len(arguments) >= 2 and arguments[1].lower().endswith(".py")
+
+
+def refuse_script(script: str) -> int:
+    """台本は走らせずに、理由を出して 1 で終わる
+
+    ``python 台本.py`` と同じに走らせることはしない 走らせても、配布版は環境変数の
+    ``PYTHONPATH`` を読まない（PyInstaller が切り離している 0.1.0 の exe で確かめた）ので、
+    pip が組み立て用に入れた部品を係が見つけられず、組み立ては結局通らない そのうえ
+    exe へ落とした .py がそのまま動くことになる 失敗で終われば、pip は組めなかったと言って止まる
+    導入ボタンは wheel だけを入れる（``--only-binary :all:``）ので、ふだんはここへ来ない
+    """
+    message = (
+        f"Sashimono.exe は Python の台本を走らせない: {script}\n"
+        "配布版はソースの形の部品を組めないので、wheel のある版を入れる（--only-binary :all:）"
+    )
+    # 窓の無い配布版をコマンドから出力を受けずに起こすと sys.stderr が無い
+    if sys.stderr is not None:
+        print(message, file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv if argv is None else argv
 
@@ -76,6 +112,14 @@ def main(argv: list[str] | None = None) -> int:
     # プロジェクトが開かずに黙って終わる
     if len(arguments) >= 3 and arguments[1] == IMPORT_CHECK_FLAG:
         return import_check(arguments[2], arguments[3:])
+
+    if list(arguments[1:2]) == [ADD_ON_CHECK_FLAG] and len(arguments) == 3:
+        from sashimono.addon_check import main as add_on_check
+
+        return add_on_check(arguments[2])
+
+    if is_python_script_start(arguments):
+        return refuse_script(arguments[1])
 
     if list(arguments[1:]) == [SELF_CHECK_FLAG]:
         from sashimono.selfcheck import main as self_check

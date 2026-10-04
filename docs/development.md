@@ -1910,11 +1910,16 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   手元で組んだ zip でだけ AI 連携が動き、CI で組んだ zip の不具合を見落とした
 - 配布版の導入ボタンは wheel しか入れない（`--only-binary :all:` `runtime.install_arguments`）
   sdist しか無い版を選ぶと、pip がソースから組むために `sys.executable`（Sashimono.exe）で
-  子を立て、編集画面が裏で立って導入が終わらない
+  子を立て、編集画面が裏で立って導入が終わらない 守りとして、配布版の exe は最初の引数が
+  `.py` なら編集画面を立てずに 1 で終わる（`app.refuse_script`） 台本は走らせない
+  配布版は `PYTHONPATH` を読まないので、走らせても pip の組み立ては通らない
 - 組み立てた後に、後から入れる部品が import する標準ライブラリが配布版に全部あるかを字面で
   数える（`missing_stdlib`） zip からの確かめでは、後から入れる部品を**使う人と同じ道で**
   入れて読む 導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ（CUDA ランタイムは
   除く）、起動のときと同じ読み方（`--import-check` 前へ足して `.pth` も読む）で import する
+  入れ方と読み方は exe 自身が持つ（`Sashimono.exe --add-on-check <置き場>`
+  `sashimono/addon_check.py`） 組み立ての道具も CI の clean-machine（ファイアウォールを
+  戻した後）も同じ口を呼ぶ
   **ネットにつなぐ** 落とした物は pip の控えに残り、2 回目からはほとんど落とさない
   つながらないと落ちる 開発の .venv から読ませる確かめは、pip の `--target` と並びが違い、
   0.1.0 の不具合を手元で見落としたのでやめた

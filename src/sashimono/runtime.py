@@ -663,8 +663,9 @@ def install_arguments(
 ) -> list[str]:
     """``pip`` へ渡す引数（``install`` から） ``target`` は配布版の導入先 開発の環境では ``None``
 
-    配布版の組み立ての確かめ（``tools/build_package.py``）も、ここで組んだ引数で exe の pip に
-    入れる 導入ボタンと違う入れ方で確かめると、使う人の手元で落ちる物を見落とす
+    配る zip の確かめ（:mod:`sashimono.addon_check` 組み立ての道具と CI が呼ぶ）も、ここで
+    組んだ引数で exe の pip に入れる 導入ボタンと違う入れ方で確かめると、使う人の手元で
+    落ちる物を見落とす
 
     配布版では、ソースの形（sdist）しか無い版を選ばせない（``--only-binary :all:``）
     pip はソースから組むとき ``sys.executable`` に自分の起動部を渡して子を立てるが、

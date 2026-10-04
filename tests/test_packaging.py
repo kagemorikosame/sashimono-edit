@@ -1164,61 +1164,125 @@ class TestTheImportCheck:
 
 
 class TestTheAddOnsAreCheckedTheUsersWay:
-    """zip からの確かめは、後から入れる部品を使う人と同じ道で入れて読む
+    """配る zip の確かめは、後から入れる部品を使う人と同じ道で入れて読む（``--add-on-check``）
 
     前は開発の .venv の置き場を足して読んだ pip の ``--target`` とは並びが違い、0.1.0 では
-    手元の zip で通って、配った zip では AI 連携が読めなかった
+    手元の zip で通って、配った zip では AI 連携が読めなかった CI の確かめる機械には
+    Python が無いので、入れ方と読み方は exe 自身が持つ
     """
 
     def _calls(
-        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch, *, pip_code: int = 0
-    ) -> tuple[list[list[str]], list[str]]:
+        self, monkeypatch: pytest.MonkeyPatch, *, pip_code: int = 0
+    ) -> tuple[list[list[str]], int]:
+        from sashimono import addon_check
+
+        calls: list[list[str]] = []
+
+        def fake_call(arguments: list[str], lines: list[str]) -> int:
+            calls.append(list(arguments))
+            return pip_code if arguments[1:3] == ["-m", "pip"] else 0
+
+        monkeypatch.setattr(addon_check, "_call", fake_call)
+        code = main(["sashimono", "--add-on-check", "add-ons"])
+        return calls, code
+
+    def test_the_exe_pip_installs_what_the_buttons_install(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ai.environment import AI_PACK
+        from sashimono.asr.environment import ASR_PACK
+        from sashimono.runtime import install_arguments
+
+        calls, code = self._calls(monkeypatch)
+        target = Path("add-ons")
+        assert code == 0
+        # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
+        pip = [str(frozen), "-m", "pip"]
+        assert calls[0] == [*pip, *install_arguments(AI_PACK, target, extra=False)]
+        assert calls[1] == [*pip, *install_arguments(ASR_PACK, target, extra=False)]
+        assert "--only-binary" in calls[0]
+        assert not set(ASR_PACK.extra) & set(calls[1])
+
+    def test_the_import_reads_only_what_was_installed_in_a_new_exe(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れた導入先だけを、起動したばかりの別の exe で読む（起動のときと同じ読み方）"""
+        from sashimono.addon_check import ADD_ON_MODULES
+
+        calls, _ = self._calls(monkeypatch)
+        assert calls[-1] == [str(frozen), "--import-check", "add-ons", *ADD_ON_MODULES]
+        assert {"claude_agent_sdk", "faster_whisper"} <= set(ADD_ON_MODULES)
+
+    def test_a_failed_install_is_a_failure(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
+        calls, code = self._calls(monkeypatch, pip_code=1)
+        assert code == 1
+        assert len(calls) == 1
+
+    def test_the_build_tool_asks_the_exe(
+        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """組み立ての道具は入れ方を書き写さず、exe の ``--add-on-check`` に任せる"""
         calls: list[list[str]] = []
 
         def fake_run(
             executable: Path, arguments: list[str], folder: str, **_: object
         ) -> subprocess.CompletedProcess[str]:
             calls.append(list(arguments))
-            code = pip_code if arguments[:2] == ["-m", "pip"] else 0
-            return subprocess.CompletedProcess(arguments, code, "", "")
+            return subprocess.CompletedProcess(arguments, 1, "[NG] x", "")
 
         monkeypatch.setattr(builder, "_run", fake_run)
         failures = builder.runtime_import_failures(Path("Sashimono.exe"), "folder")
-        return calls, failures
-
-    def test_the_exe_pip_installs_what_the_buttons_install(
-        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from sashimono.ai.environment import AI_PACK
-        from sashimono.asr.environment import ASR_PACK
-        from sashimono.runtime import install_arguments
-
-        calls, failures = self._calls(builder, monkeypatch)
-        target = Path("folder") / "add-ons"
-        assert failures == []
-        # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
-        assert calls[0] == ["-m", "pip", *install_arguments(AI_PACK, target, extra=False)]
-        assert calls[1] == ["-m", "pip", *install_arguments(ASR_PACK, target, extra=False)]
-        assert "--only-binary" in calls[0]
-        assert not set(ASR_PACK.extra) & set(calls[1])
-
-    def test_the_import_reads_only_what_was_installed(
-        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """開発の .venv の置き場を足さない 入れた導入先だけを読む"""
-        calls, _ = self._calls(builder, monkeypatch)
-        flag, places, *modules = calls[-1]
-        assert flag == builder.IMPORT_CHECK_FLAG
-        assert places == str(Path("folder") / "add-ons")
-        assert modules == list(builder.RUNTIME_MODULES)
-
-    def test_a_failed_install_is_a_failure(
-        self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
-        calls, failures = self._calls(builder, monkeypatch, pip_code=1)
+        assert calls == [["--add-on-check", str(Path("folder") / "add-ons")]]
         assert len(failures) == 1
-        assert all(call[:2] == ["-m", "pip"] for call in calls)
+
+    def test_the_clean_machine_check_asks_the_exe_after_the_firewall(self) -> None:
+        """CI のまっさらな機械でも同じ口で確かめる 外へ出ないことを数え終え、止めた規則を
+        戻した後で走らせる 前で走らせると、自己診断が外へ出たように数えられるか、pip が
+        止められて落ちる
+        """
+        text = (ROOT / "tools" / "check_clean_machine.ps1").read_text(encoding="utf-8-sig")
+        # 最後に出てくる Restore-NetworkGuard が、確かめ全体の finally で戻す所
+        restored = text.rindex("Restore-NetworkGuard")
+        asked = text.index("'--add-on-check'")
+        assert restored < asked
+
+
+class TestAScriptIsNotTakenForAProject:
+    """配布版の exe に Python の台本を渡されても、編集画面を立てずに失敗で終わる
+
+    pip はソースの形（sdist）から組むとき ``sys.executable`` に ``__pip-runner__.py`` を渡す
+    0.1.0 の exe はそれをプロジェクトとして開こうとして編集画面を裏で立て、導入が終わらなかった
+    """
+
+    def test_the_pip_runner_is_refused(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import sashimono.app as app
+
+        def no_editor(arguments: list[str]) -> int:
+            raise AssertionError("編集画面を立てた")
+
+        monkeypatch.setattr(app, "_start_editor", no_editor)
+        runner = r"C:\Sashimono\_internal\pip\__pip-runner__.py"
+        assert app.main([str(frozen), runner, "install", "hatchling"]) == 1
+        assert "__pip-runner__.py" in capsys.readouterr().err
+
+    def test_a_project_still_opens(self, frozen: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """プロジェクトの場所（``作品.sme``）は今までどおり編集画面へ渡す"""
+        import sashimono.app as app
+
+        opened: list[list[str]] = []
+
+        def editor(arguments: list[str]) -> int:
+            opened.append(arguments)
+            return 0
+
+        monkeypatch.setattr(app, "_start_editor", editor)
+        assert app.main([str(frozen), "作品.sme"]) == 0
+        assert opened == [[str(frozen), "作品.sme"]]
 
 
 class TestTheAssistantSaysWhatIsMissing:

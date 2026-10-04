@@ -57,12 +57,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_notices import canonical_name, listed_versions  # noqa: E402
 
 from sashimono import __version__  # noqa: E402
-from sashimono.ai.environment import AI_PACK  # noqa: E402
-from sashimono.app import IMPORT_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
-from sashimono.asr.environment import ASR_PACK  # noqa: E402
+from sashimono.addon_check import INSTALL_TIMEOUT  # noqa: E402
+from sashimono.app import ADD_ON_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
 from sashimono.links import REPORT_URL  # noqa: E402
-from sashimono.runtime import install_arguments, python_abi  # noqa: E402
+from sashimono.runtime import python_abi  # noqa: E402
 from sashimono.selfcheck import UPDATE_CHECK_NAME  # noqa: E402
 from sashimono.update.package import BUILD_INFO_NAME, write_build_info  # noqa: E402
 
@@ -108,12 +107,6 @@ EXCLUDED_MODULES = (
 #: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
 #: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
 RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2")
-#: 上の包みの import する名前（配布版の exe の中で import してみる）
-RUNTIME_MODULES = ("claude_agent_sdk", "faster_whisper", "ctranslate2")
-#: zip からの確かめで、exe の pip に入れる機能 使う人が導入の欄で押す物と同じ
-ADD_ON_PACKS = (AI_PACK, ASR_PACK)
-#: 上を入れるのに待つ秒数 初めては合わせて 200 MB ほど落とす 遅い回線でも待てるよう長めに
-ADD_ON_INSTALL_TIMEOUT = 1800
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
 #: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の
@@ -912,43 +905,33 @@ def update_failures(home: Path, self_check_output: str) -> list[str]:
 def runtime_import_failures(executable: Path, folder: str) -> list[str]:
     """後から入れる部品を、使う人と同じ道で入れて読む **ネットにつなぐ**
 
-    1. 導入ボタンと同じ引数（:func:`~sashimono.runtime.install_arguments`）で、展開した exe の
-       pip に一時の導入先へ入れる 部品は使う人が押す順（AI 連携 → 字幕起こし）で 1 つずつ
-    2. 起動のときに導入先を読むのと同じ読み方（前へ足して ``.pth`` も読む
-       :func:`~sashimono.runtime.read_path_files`）で、exe の中で import する
+    入れ方と読み方は exe 自身が持つ（``--add-on-check`` :mod:`sashimono.addon_check`）
+    導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ、起動のときと同じ読み方で
+    別の exe の中で import する CI の確かめ（tools/check_clean_machine.ps1）も同じ口を使う
 
     前は開発の .venv の置き場を足して読んでいた 開発の .venv は pip の ``--target`` とは
     並びが違い（pywin32 の DLL の置き場など）、そこに入っている物で組んだ zip は、
     CI で組んだ zip と中身まで違った 0.1.0 では手元の zip で通り、配った zip では AI 連携が
     読めなかった 本物の道で入れれば、使う人の手元で落ちる物はここでも落ちる
 
-    字幕起こしの CUDA ランタイム（1.7 GB）は入れない 入るのは DLL で、import する Python の
-    部品は変わらない 落とした物は pip の控え（%LOCALAPPDATA%\\pip\\Cache）に残るので、
-    2 回目からはほとんど落とさない
+    落とした物は pip の控え（%LOCALAPPDATA%\\pip\\Cache）に残るので、2 回目からはほとんど
+    落とさない
     """
     target = Path(folder) / "add-ons"
-    for pack in ADD_ON_PACKS:
-        installed = _run(
-            executable,
-            ["-m", "pip", *install_arguments(pack, target, extra=False)],
-            folder,
-            timeout=ADD_ON_INSTALL_TIMEOUT,
-        )
-        if installed.returncode != 0:
-            print(installed.stdout.rstrip())
-            print(installed.stderr.rstrip())
-            return [
-                f"{pack.label}を exe の pip で入れられない（導入ボタンも同じ所で止まる"
-                " ネットにつながっているかも確かめる）"
-            ]
-        print(f"[ok] {pack.label}を exe の pip で入れた: {target}")
-    result = _run(executable, [IMPORT_CHECK_FLAG, str(target), *RUNTIME_MODULES], folder)
-    print(result.stdout.rstrip())
+    # 2 つの機能を順に入れるので、exe の側が 1 つずつ待つ秒数の 2 つ分と、読む分を待つ
+    result = _run(
+        executable, [ADD_ON_CHECK_FLAG, str(target)], folder, timeout=2 * INSTALL_TIMEOUT + 600
+    )
     if result.returncode == 0:
+        # pip の進み具合は長いので、通ったときは結果の行だけを出す
+        print("\n".join(line for line in result.stdout.splitlines() if line.startswith("[")))
         return []
+    print(result.stdout.rstrip())
     if result.stderr.strip():
         print(result.stderr.rstrip())
-    return ["後から入れた部品を exe の中で import できない（標準ライブラリが足りない など）"]
+    return [
+        "後から入れる部品を exe の pip で入れて読めない（導入ボタンを押した人と同じ所で落ちる）"
+    ]
 
 
 def package(bundle: Path, target: Path, *, check: bool = True) -> int:

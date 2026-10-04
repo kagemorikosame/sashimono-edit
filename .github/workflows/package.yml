@@ -26,6 +26,11 @@ on:
       - ".github/actions/ffmpeg/**"
       - "src/sashimono/selfcheck.py"
       - "src/sashimono/app.py"
+      # 後から入れる部品の入れ方と読み方（clean-machine が exe の --add-on-check で確かめる）
+      - "src/sashimono/addon_check.py"
+      - "src/sashimono/runtime.py"
+      - "src/sashimono/ai/environment.py"
+      - "src/sashimono/asr/environment.py"
       - "pyproject.toml"
       - "THIRD_PARTY_NOTICES.md"
       - "licenses/**"
@@ -115,7 +120,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
-    timeout-minutes: 30
+    # 最後に後から入れる部品（AI 連携・字幕起こし 合わせて 200 MB ほど）を落として入れる分を見込む
+    timeout-minutes: 45
     steps:
       # 確かめる道具（PowerShell）だけを取る Python・uv・依存は入れない
       - uses: actions/checkout@v7
