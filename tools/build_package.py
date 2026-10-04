@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_notices import canonical_name, listed_versions  # noqa: E402
 
 from sashimono import __version__  # noqa: E402
-from sashimono.addon_check import INSTALL_TIMEOUT  # noqa: E402
+from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT  # noqa: E402
 from sashimono.app import ADD_ON_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
 from sashimono.links import REPORT_URL  # noqa: E402
@@ -918,9 +918,14 @@ def runtime_import_failures(executable: Path, folder: str) -> list[str]:
     落とさない
     """
     target = Path(folder) / "add-ons"
-    # 2 つの機能を順に入れるので、exe の側が 1 つずつ待つ秒数の 2 つ分と、読む分を待つ
+    # exe の側は子（機能ごとの pip と読む exe）を 1 つずつ待つ その全部と、exe の起動の分を待つ
+    # 先に待ちきれずに止めると、exe が書くはずの [NG] の行が残らない
+    children = len(ADD_ON_PACKS) + 1
     result = _run(
-        executable, [ADD_ON_CHECK_FLAG, str(target)], folder, timeout=2 * INSTALL_TIMEOUT + 600
+        executable,
+        [ADD_ON_CHECK_FLAG, str(target)],
+        folder,
+        timeout=children * INSTALL_TIMEOUT + 600,
     )
     if result.returncode == 0:
         # pip の進み具合は長いので、通ったときは結果の行だけを出す

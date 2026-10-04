@@ -1172,19 +1172,56 @@ class TestTheAddOnsAreCheckedTheUsersWay:
     """
 
     def _calls(
-        self, monkeypatch: pytest.MonkeyPatch, *, pip_code: int = 0
-    ) -> tuple[list[list[str]], int]:
+        self, monkeypatch: pytest.MonkeyPatch, *extra: str, pip_code: int = 0
+    ) -> tuple[list[list[str]], int, list[float]]:
         from sashimono import addon_check
 
         calls: list[list[str]] = []
+        waits: list[float] = []
 
-        def fake_call(arguments: list[str], lines: list[str]) -> int:
+        def fake_call(arguments: list[str], lines: list[str], timeout: float) -> int:
             calls.append(list(arguments))
+            waits.append(timeout)
             return pip_code if arguments[1:3] == ["-m", "pip"] else 0
 
         monkeypatch.setattr(addon_check, "_call", fake_call)
-        code = main(["sashimono", "--add-on-check", "add-ons"])
-        return calls, code
+        code = main(["sashimono", "--add-on-check", "add-ons", *extra])
+        return calls, code, waits
+
+    def test_the_caller_sets_how_long_each_child_may_take(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CI は子を待つ秒数を渡す 渡さないと 30 分ずつ待ち、ジョブの制限を超えて要約が残らない"""
+        from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT
+
+        _, code, waits = self._calls(monkeypatch, "300")
+        assert code == 0
+        assert waits == [300.0] * (len(ADD_ON_PACKS) + 1)
+        _, _, defaults = self._calls(monkeypatch)
+        assert set(defaults) == {INSTALL_TIMEOUT}
+
+    @pytest.mark.parametrize("seconds", ["abc", "0", "-5", "nan", "inf"])
+    def test_an_unreadable_wait_is_refused(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, seconds: str
+    ) -> None:
+        """読めない秒数を既定に置き換えて走らせない 何も入れずに 2 で終わる"""
+        calls, code, _ = self._calls(monkeypatch, seconds)
+        assert code == 2
+        assert calls == []
+
+    def test_a_child_that_takes_too_long_is_written_down(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """時間切れは [NG] の行を残して 1 で終わる 呼んだ側はその行を要約に書ける"""
+        from sashimono import addon_check
+
+        def too_long(*_: object, **__: object) -> subprocess.CompletedProcess[bytes]:
+            raise subprocess.TimeoutExpired("pip", 1)
+
+        monkeypatch.setattr(subprocess, "run", too_long)
+        lines: list[str] = []
+        assert addon_check._call(["Sashimono.exe", "-m", "pip"], lines, 7) == 1
+        assert lines[0].startswith("[NG] 7 秒で終わらない")
 
     def test_the_exe_pip_installs_what_the_buttons_install(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
@@ -1193,7 +1230,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         from sashimono.asr.environment import ASR_PACK
         from sashimono.runtime import install_arguments
 
-        calls, code = self._calls(monkeypatch)
+        calls, code, _ = self._calls(monkeypatch)
         target = Path("add-ons")
         assert code == 0
         # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
@@ -1209,7 +1246,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         """入れた導入先だけを、起動したばかりの別の exe で読む（起動のときと同じ読み方）"""
         from sashimono.addon_check import ADD_ON_MODULES
 
-        calls, _ = self._calls(monkeypatch)
+        calls, _, _ = self._calls(monkeypatch)
         assert calls[-1] == [str(frozen), "--import-check", "add-ons", *ADD_ON_MODULES]
         assert {"claude_agent_sdk", "faster_whisper"} <= set(ADD_ON_MODULES)
 
@@ -1217,7 +1254,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
-        calls, code = self._calls(monkeypatch, pip_code=1)
+        calls, code, _ = self._calls(monkeypatch, pip_code=1)
         assert code == 1
         assert len(calls) == 1
 
@@ -1248,6 +1285,51 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         restored = text.rindex("Restore-NetworkGuard")
         asked = text.index("'--add-on-check'")
         assert restored < asked
+
+    def test_the_clean_machine_waits_fit_in_the_job(self) -> None:
+        """clean-machine の待ちの上限を足した物が、ジョブの制限（timeout-minutes）より短い
+
+        長いと、時間切れの段が要約を書く前に Actions がジョブを取り消し、どこで止まったかが
+        残らない（PR #243 のレビュー） 待ちを 1 つ延ばすか、ジョブの制限を縮めると落ちる
+        """
+        from sashimono.addon_check import ADD_ON_PACKS
+
+        script = (ROOT / "tools" / "check_clean_machine.ps1").read_text(encoding="utf-8-sig")
+        workflow = (ROOT / ".github" / "workflows" / "package.yml").read_text(encoding="utf-8")
+        job = workflow[workflow.index("  clean-machine:") :]
+        limit = int(re.search(r"timeout-minutes: (\d+)", job)[1]) * 60  # type: ignore[index]
+
+        def number(pattern: str) -> int:
+            found = re.search(pattern, script)
+            assert found is not None, pattern
+            return int(found[1])
+
+        step = number(r"\$AddOnStepSeconds = (\d+)")
+        # exe は子（機能ごとの pip と読む exe）を 1 つずつ step 秒まで待つ
+        # CI はその全部と起動の分を待つ
+        assert f"$AddOnSeconds = $AddOnStepSeconds * {len(ADD_ON_PACKS) + 1} + 60" in script
+        variables = {"$AddOnSeconds": step * (len(ADD_ON_PACKS) + 1) + 60}
+
+        default_exe = number(r"function Invoke-Exe\(.*\[int\]\$TimeoutSeconds = (\d+)\)")
+        exe_calls = re.findall(r"= Invoke-Exe '[^']+' @\(.*\)(?: (\S+))?\r?$", script, re.M)
+        assert len(exe_calls) == 3, exe_calls
+        exe_waits = [
+            default_exe if not wait else variables[wait] if wait in variables else int(wait)
+            for wait in exe_calls
+        ]
+
+        probe = number(r"function Measure-PowerShell\(.*\[int\]\$TimeoutSeconds = (\d+)\)")
+        probes = len(re.findall(r"^\s*Measure-PowerShell '", script, re.M))
+        # 窓が出るまで・出してから待つ・閉じるのを待つ
+        window = (
+            number(r"\$deadline = \(Get-Date\)\.AddSeconds\((\d+)\)")
+            + number(r"\[int\]\$WindowSeconds = (\d+)")
+            + number(r"\$window\.WaitForExit\((\d+)\)") // 1000
+        )
+        # 数えない段（取り出し・展開・ファイアウォールの見本・記録を待つ 5 秒・要約）の分
+        rest = 300
+        total = sum(exe_waits) + probe * probes + window + rest
+        assert total < limit, (exe_waits, probe * probes, window, rest, limit)
 
 
 class TestAScriptIsNotTakenForAProject:

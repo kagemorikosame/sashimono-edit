@@ -64,6 +64,28 @@ def import_check(places: str, modules: list[str]) -> int:
     return 1 if failed else 0
 
 
+def _add_on_check(place: str, rest: list[str]) -> int:
+    """``--add-on-check <置き場> [<子を 1 つ待つ秒数>]`` 秒数が読めなければ 2 で終わる
+
+    読めない秒数を既定に置き換えて走らせると、CI の待ちに収まらない長さで待ち、要約を
+    書く前にジョブが取り消される
+    """
+    from sashimono.addon_check import main as add_on_check
+
+    if not rest:
+        return add_on_check(place)
+    try:
+        seconds = float(rest[0])
+    except ValueError:
+        seconds = 0.0
+    # nan と inf も断る どちらも比べると外れる
+    if not 0 < seconds < float("inf"):
+        if sys.stderr is not None:
+            print(f"{ADD_ON_CHECK_FLAG} の秒数が読めない: {rest[0]}", file=sys.stderr)
+        return 2
+    return add_on_check(place, seconds)
+
+
 def is_python_script_start(arguments: list[str]) -> bool:
     """配布版の exe が ``Sashimono.exe 何か.py ...`` と、Python の台本を渡されて起こされたか
 
@@ -113,10 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) >= 3 and arguments[1] == IMPORT_CHECK_FLAG:
         return import_check(arguments[2], arguments[3:])
 
-    if list(arguments[1:2]) == [ADD_ON_CHECK_FLAG] and len(arguments) == 3:
-        from sashimono.addon_check import main as add_on_check
-
-        return add_on_check(arguments[2])
+    if list(arguments[1:2]) == [ADD_ON_CHECK_FLAG] and len(arguments) in (3, 4):
+        return _add_on_check(arguments[2], arguments[3:])
 
     if is_python_script_start(arguments):
         return refuse_script(arguments[1])

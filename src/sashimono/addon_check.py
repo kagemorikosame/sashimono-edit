@@ -31,7 +31,8 @@ __all__ = ["ADD_ON_MODULES", "ADD_ON_PACKS", "INSTALL_TIMEOUT", "main", "self_co
 ADD_ON_PACKS = (AI_PACK, ASR_PACK)
 #: 入れた後に import する名前 送った途端・起こし始めた途端に読まれる物
 ADD_ON_MODULES = ("claude_agent_sdk", "faster_whisper", "ctranslate2")
-#: 1 つの機能を入れるのに待つ秒数 初めては合わせて 200 MB ほど落とす 遅い回線でも待てるよう長めに
+#: 子を 1 つ待つ秒数の既定（手元の組み立ての道具） 初めては合わせて 200 MB ほど落とす
+#: 遅い回線でも待てるよう長めに CI は短い値を渡す（``--add-on-check <置き場> <秒数>``）
 INSTALL_TIMEOUT = 1800
 
 
@@ -45,7 +46,7 @@ def self_command() -> list[str]:
     return [sys.executable, "-m", "sashimono"]
 
 
-def _call(arguments: list[str], lines: list[str]) -> int:
+def _call(arguments: list[str], lines: list[str], timeout: float) -> int:
     """子を走らせ、子の出力を受けて ``lines`` へ足す
 
     受けずに引き継がせると、手元で組んだ配布版では子の書いた行（``[ok] claude_agent_sdk``
@@ -57,11 +58,11 @@ def _call(arguments: list[str], lines: list[str]) -> int:
             arguments,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=INSTALL_TIMEOUT,
+            timeout=timeout,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        lines.append(f"[NG] {INSTALL_TIMEOUT} 秒で終わらない: {' '.join(arguments[:4])} …")
+        lines.append(f"[NG] {timeout:g} 秒で終わらない: {' '.join(arguments[:4])} …")
         return 1
     # 子は同じ exe か Python なので、書く文字コードはこの機械の既定
     text = done.stdout.decode(locale.getencoding(), errors="replace").rstrip()
@@ -82,8 +83,14 @@ def _emit(lines: list[str]) -> None:
     print(text, flush=True)
 
 
-def main(target: str) -> int:
-    """``target`` へ入れて読む すべて通れば 0"""
+def main(target: str, timeout: float = INSTALL_TIMEOUT) -> int:
+    """``target`` へ入れて読む すべて通れば 0
+
+    ``timeout`` は子（機能ごとの pip と、読む exe）を 1 つずつ待つ秒数 子は
+    ``len(ADD_ON_PACKS) + 1`` 個 時間切れなら ``[NG]`` を書いて 1 で終わる 呼んだ側が
+    先に待ちきれずに止めると、何で止まったかが残らないので、呼ぶ側の待ちに収まる値を渡す
+    （CI の tools/check_clean_machine.ps1）
+    """
     from sashimono.app import IMPORT_CHECK_FLAG
 
     place = Path(target)
@@ -91,7 +98,9 @@ def main(target: str) -> int:
     try:
         for pack in ADD_ON_PACKS:
             code = _call(
-                [sys.executable, "-m", "pip", *install_arguments(pack, place, extra=False)], lines
+                [sys.executable, "-m", "pip", *install_arguments(pack, place, extra=False)],
+                lines,
+                timeout,
             )
             if code != 0:
                 lines.append(
@@ -100,6 +109,8 @@ def main(target: str) -> int:
                 )
                 return 1
             lines.append(f"[ok] {pack.label}を exe の pip で入れた: {place}")
-        return _call([*self_command(), IMPORT_CHECK_FLAG, str(place), *ADD_ON_MODULES], lines)
+        return _call(
+            [*self_command(), IMPORT_CHECK_FLAG, str(place), *ADD_ON_MODULES], lines, timeout
+        )
     finally:
         _emit(lines)

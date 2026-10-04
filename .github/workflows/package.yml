@@ -120,7 +120,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
-    # 最後に後から入れる部品（AI 連携・字幕起こし 合わせて 200 MB ほど）を落として入れる分を見込む
+    # check_clean_machine.ps1 の待ちの上限の合計より長くする 短いと、時間切れの段が要約を書く前に
+    # ジョブが取り消される 合計は試験が数える（tests/test_packaging.py どちらか一方だけ変えると落ちる）
     timeout-minutes: 45
     steps:
       # 確かめる道具（PowerShell）だけを取る Python・uv・依存は入れない

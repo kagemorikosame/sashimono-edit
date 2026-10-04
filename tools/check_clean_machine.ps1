@@ -380,7 +380,9 @@ try {
     )
 
     $since = Get-Date
-    $check = Invoke-Exe 'self-check' @('--self-check')
+    # CI で 30 秒余り 待ちの合計がジョブの制限（package.yml の timeout-minutes）に収まるよう絞る
+    # 収まらないと、要約を書く前に Actions がジョブを取り消す（試験が合計を見張る）
+    $check = Invoke-Exe 'self-check' @('--self-check') 300
     $checkDrops = @(Get-Blocked $since 'sashimono.exe')
     Write-Host $check.Out
     if ($check.Err.Trim()) { Write-Host $check.Err }
@@ -453,7 +455,8 @@ try {
         $archive.Dispose()
     }
     $target = Join-Path $Local 'Sashimono\入れた 部品'
-    $pip = Invoke-Exe 'pip' @('-m', 'pip', 'install', '--no-index', '--target', $target, $wheel)
+    # ネットにつながない 1 行の見本 CI で 1 秒ほど
+    $pip = Invoke-Exe 'pip' @('-m', 'pip', 'install', '--no-index', '--target', $target, $wheel) 120
     if ($pip.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $target "$sample\__init__.py"))) {
         Note "exe の pip で日本語のフォルダへ入れられた: $target"
     } else {
@@ -550,9 +553,13 @@ try {
 # 入れ方と読み方は exe 自身が持つ（Sashimono.exe --add-on-check sashimono/addon_check.py）
 # ここへ書き写すと、導入ボタンの入れ方が変わったときに確かめだけが古いまま残る
 $addOns = Join-Path $Local 'Sashimono\後から 入れた 部品'
+# exe の側が子（AI 連携の pip・字幕起こしの pip・import する exe の 3 つ）を 1 つずつ待つ秒数
+# CI では合わせて 40 秒ほど 時間切れなら exe が [NG] を書いて終わり、下で要約まで書ける
+$AddOnStepSeconds = 300
+# exe 全体を待つ秒数 子 3 つ分と、exe の起動の分
+$AddOnSeconds = $AddOnStepSeconds * 3 + 60
 try {
-    # exe の側が機能ごとに 30 分まで待つ その 2 つ分と読む分を待つ
-    $addOnCheck = Invoke-Exe 'add-on-check' @('--add-on-check', $addOns) 4200
+    $addOnCheck = Invoke-Exe 'add-on-check' @('--add-on-check', $addOns, "$AddOnStepSeconds") $AddOnSeconds
     foreach ($line in ($addOnCheck.Out -split "`r?`n")) {
         if ($line -match '^\[(ok|NG)\] ') { Note "後から入れる部品: $line" }
     }
