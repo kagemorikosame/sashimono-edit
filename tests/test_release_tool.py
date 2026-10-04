@@ -34,7 +34,28 @@ HEAD = "a" * 40
 OLD = "b" * 40
 STRANGER = "c" * 40
 PASSPHRASE = "試験の合言葉はこれですよね"
-SOURCES = ("sources-manifest.json", "sources-SHA256SUMS.txt", "ffmpeg-8.1.2.tar.xz")
+INDEXES = ("sources-manifest.json", "sources-SHA256SUMS.txt")
+BODIES = {
+    "ffmpeg-8.1.2.tar.xz": b"ffmpeg source " * 10,
+    "qtbase-everywhere-src-6.11.2.tar.xz": b"qtbase source " * 10,
+}
+
+
+def _sources(bodies: dict[str, bytes] = BODIES) -> dict[str, bytes]:
+    """collect_sources.py が書くのと同じ形（本体・sha256 の一覧・索引）"""
+    entries = [
+        {"file": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        for name, data in bodies.items()
+    ]
+    sums = "".join(f"{entry['sha256']}  {entry['file']}\n" for entry in entries)
+    return {
+        **bodies,
+        INDEXES[0]: json.dumps(entries).encode(),
+        INDEXES[1]: sums.encode(),
+    }
+
+
+SOURCES = _sources()
 
 
 @pytest.fixture(scope="module")
@@ -86,9 +107,12 @@ class FakeGitHub:
     files: dict[str, bytes] = field(default_factory=dict)
     calls: list[list[str]] = field(default_factory=list)
     writes: list[list[str]] = field(default_factory=list)
-    #: 何回目の ``gh run list`` で run を終えたことにするか（待つ試験）
-    finish_after: int = 0
-    listed: int = 0
+    #: workflow ごとに、何回目の ``gh run list`` までは run が無い・走っている途中か（待つ試験）
+    appear_after: dict[str, int] = field(default_factory=dict)
+    finish_after: dict[str, int] = field(default_factory=dict)
+    listed: dict[str, int] = field(default_factory=dict)
+    #: 上げるのを断る先（リリースのタグかファイルの名前）
+    fail_uploads: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -134,10 +158,12 @@ class FakeGitHub:
                 self.remote_tag = self.local_tag
                 return "", 0
             case ["gh", "run", "list", *rest]:
-                self.listed += 1
                 name = rest[rest.index("--workflow") + 1]
+                count = self.listed[name] = self.listed.get(name, 0) + 1
                 runs = self.runs.get(name, [])
-                if self.listed <= self.finish_after:
+                if count <= self.appear_after.get(name, 0):
+                    runs = []
+                elif count <= self.finish_after.get(name, 0):
                     runs = [{**run, "status": "in_progress", "conclusion": ""} for run in runs]
                 return json.dumps(runs), 0
             case ["gh", "release", "view", "beta"]:
@@ -153,12 +179,20 @@ class FakeGitHub:
                     "url": "https://example.invalid/release",
                 }
                 return json.dumps(info), 0
+            case ["gh", "release", "download", _, "--pattern", name, "--output", "-"]:
+                if name not in self.files:
+                    return "", 1
+                return self.files[name].decode("utf-8"), 0
             case ["gh", "release", "download", _, "--pattern", name, "--dir", folder, *_]:
                 Path(folder).mkdir(parents=True, exist_ok=True)
                 (Path(folder) / name).write_bytes(self.files[name])
                 return "", 0
             case ["gh", "release", "upload", tag, *paths]:
                 self.writes.append(args)
+                if tag in self.fail_uploads or any(
+                    Path(path).name in self.fail_uploads for path in paths
+                ):
+                    return "", 1
                 if tag == TAG:
                     for path in paths:
                         if not path.startswith("--"):
@@ -220,15 +254,15 @@ class World:
         self.collected.append(dist)
         folder = dist / "sources"
         folder.mkdir(parents=True, exist_ok=True)
-        for name in SOURCES:
-            (folder / name).write_bytes(name.encode())
+        for name, data in SOURCES.items():
+            (folder / name).write_bytes(data)
         return 0
 
     def fetch(self, url: str) -> bytes:
         self.fetched.append(url)
         return self.latest or self.github.files["update.json"]
 
-    def main(self, tool: ModuleType, *extra: str, key: bool = True) -> int:
+    def main(self, tool: ModuleType, *extra: str, key: bool = True, **overrides: Any) -> int:
         argv = [VERSION, *extra]
         if key:
             argv += ["--key", str(self.key)]
@@ -243,6 +277,7 @@ class World:
             smoke=self.smoke,
             launch=self.launch,
             collect=self.collect,
+            **overrides,
         )
         return code
 
@@ -267,7 +302,7 @@ def world(tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     spare = public_key_text(Ed25519PrivateKey.generate().public_key())
     monkeypatch.setattr(tool, "TRUSTED_PUBLIC_KEYS", (public, spare))
     monkeypatch.setattr(tool.update_sign, "trusted_keys", lambda: (secret.public_key(),))
-    files = {ZIP: _zip_bytes(), **{name: name.encode() for name in SOURCES}}
+    files = {ZIP: _zip_bytes(), **SOURCES}
     github = FakeGitHub(head=HEAD, remote_main=HEAD, remote_tag=HEAD, ancestors=set(), files=files)
     yield World(root=root, github=github, key=key, public=public)
 
@@ -302,7 +337,7 @@ class TestTheWholeRun:
         assert world.smoked and world.launched
         assert len(world.secrets) == 1
         assert "TRUSTED_PUBLIC_KEYS の 1 本目" in out
-        assert "資産      6 個" in out
+        assert "資産      7 個" in out
         assert world.fetched == [tool.STABLE_MANIFEST_URL]
         # 合言葉は画面に出さない
         assert PASSPHRASE not in out
@@ -452,11 +487,37 @@ class TestTheTag:
 
 
 class TestTheReleaseWorkflow:
-    def test_it_waits_until_the_run_finishes(self, tool: ModuleType, world: World) -> None:
-        world.github.finish_after = 4
+    def test_it_waits_until_the_run_appears_and_finishes(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """タグを push した直後は run がまだ無く、現れても走っている途中 終わるまで待つ"""
+        world.github.appear_after = {"release.yml": 2}
+        world.github.finish_after = {"release.yml": 5}
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
-        assert world.github.listed > 4
+        out = capsys.readouterr().out
+        assert world.github.listed["release.yml"] == 6
+        # CI と Package は 1 回で済んでいる 待ったのは Release の分だけ
+        assert world.github.listed["CI"] == 1 and world.github.listed["Package"] == 1
+        assert "待つ: Release（v1.2.3） まだ無い" in out
+        assert "待つ: Release（v1.2.3） in_progress" in out
+        assert "[済] Release（v1.2.3） が success" in out
+
+    def test_it_waits_for_ci_that_is_still_running(self, tool: ModuleType, world: World) -> None:
+        world.github.finish_after = {"CI": 3}
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert world.github.listed["CI"] == 4
+        assert world.github.listed["release.yml"] == 1
+
+    def test_a_release_run_that_never_appears_stops(self, tool: ModuleType, world: World) -> None:
+        """待つのには限りがある 現れない run を待ち続けず、公開もしない"""
+        world.github.runs["release.yml"] = []
+        ticks = iter(range(0, 10**6, 60))
+        world.answers = ["y", "y"]
+        assert world.main(tool, clock=lambda: float(next(ticks))) == 1
+        assert world.github.listed["release.yml"] > 1
+        assert not world.published
 
     def test_a_failed_run_stops(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
@@ -498,13 +559,160 @@ class TestTheDraft:
     def test_missing_sources_are_collected_and_uploaded(
         self, tool: ModuleType, world: World
     ) -> None:
+        """本体を上げ終えてから、別の呼び出しで索引を上げる"""
         for name in SOURCES:
             del world.github.files[name]
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
         assert len(world.collected) == 1
-        uploaded = [a for a in world.github.writes if a[:3] == ["gh", "release", "upload"]]
-        assert sorted(Path(p).name for p in uploaded[0][4:-1]) == sorted(SOURCES)
+        uploads = _uploads(world)
+        assert sorted(uploads[0]) == sorted(BODIES)
+        assert sorted(uploads[1]) == sorted(INDEXES)
+
+    def test_indexes_without_a_body_are_not_taken_as_done(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """前に上げる途中で落ちて索引だけがある 揃ったと見ると GPL のソースが欠けたまま出る"""
+        del world.github.files["qtbase-everywhere-src-6.11.2.tar.xz"]
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert "足りない物: qtbase-everywhere-src-6.11.2.tar.xz" in capsys.readouterr().out
+        uploads = _uploads(world)
+        # 上げ直すのは足りない分だけ その後で索引
+        assert uploads[0] == ["qtbase-everywhere-src-6.11.2.tar.xz"]
+        assert sorted(uploads[1]) == sorted(INDEXES)
+        assert (
+            world.github.files["qtbase-everywhere-src-6.11.2.tar.xz"]
+            == SOURCES["qtbase-everywhere-src-6.11.2.tar.xz"]
+        )
+
+    def test_a_body_of_the_wrong_size_is_uploaded_again(
+        self, tool: ModuleType, world: World
+    ) -> None:
+        world.github.files["ffmpeg-8.1.2.tar.xz"] = b"half"
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert _uploads(world)[0] == ["ffmpeg-8.1.2.tar.xz"]
+
+    def test_indexes_are_not_uploaded_when_the_bodies_fail(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """本体が上がらなかったのに索引を上げると、次に打ったとき揃ったと見る"""
+        for name in SOURCES:
+            del world.github.files[name]
+        world.github.fail_uploads = {"ffmpeg-8.1.2.tar.xz"}
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        assert "公開はしていない" in capsys.readouterr().out
+        assert not any(name in world.github.files for name in INDEXES)
+        assert len(_uploads(world)) == 1 and not world.published
+
+    def test_dry_run_names_the_missing_sources_without_writing(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        del world.github.files["ffmpeg-8.1.2.tar.xz"]
+        assert world.main(tool, "--dry-run") == 0
+        out = capsys.readouterr().out
+        assert "[残] ソースを集めて下書きへ上げる（足りない物: ffmpeg-8.1.2.tar.xz）" in out
+        assert world.github.writes == [] and world.collected == []
+        assert not (world.root / "dist").exists()
+
+
+class TestAfterPublishing:
+    @pytest.fixture
+    def half_done(self, tool: ModuleType, world: World) -> World:
+        """公開した直後に beta へ目録を上げる所で落ちた形"""
+        world.github.beta_release = True
+        world.github.fail_uploads = {"beta"}
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        assert world.published
+        world.github.fail_uploads = set()
+        return world
+
+    def test_a_failure_after_publishing_says_it_is_published(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """公開した後で落ちたのに「公開はしていない」と出すと、残りが放っておかれる"""
+        world.github.beta_release = True
+        world.github.fail_uploads = {"beta"}
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "公開はしていない" not in out
+        assert f"{TAG} の公開は済んでいる" in out
+        assert "gh release upload beta " in out and "update.json.sig --clobber" in out
+
+    def test_a_second_run_finishes_only_the_rest(
+        self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """公開済みでも、目録が下書きのときと同じなら、beta と固定の URL の確かめだけ続ける"""
+        capsys.readouterr()
+        edits = [a for a in half_done.github.writes if a[:3] == ["gh", "release", "edit"]]
+        half_done.answers = ["y"]
+        assert half_done.main(tool) == 0
+        out = capsys.readouterr().out
+        assert "目録と署名は下書きのときと同じ" in out
+        assert [a for a in half_done.github.writes if a[:3] == ["gh", "release", "edit"]] == edits
+        assert _uploads(half_done, "beta")[-1] == ["update.json", "update.json.sig"]
+        assert len(_uploads(half_done)) == 1
+        assert len(half_done.secrets) == 1
+
+    def test_the_rest_is_not_done_without_yes(self, tool: ModuleType, half_done: World) -> None:
+        writes = list(half_done.github.writes)
+        half_done.answers = ["n"]
+        assert half_done.main(tool) == 0
+        assert half_done.github.writes == writes
+
+    def test_a_replaced_manifest_on_the_published_release_stops(
+        self, tool: ModuleType, half_done: World, tmp_path: Path
+    ) -> None:
+        """公開した後に差し替えられた目録は、署名が通っても beta へ広げない"""
+        other = tmp_path / "other"
+        other.mkdir()
+        archive = other / ZIP
+        archive.write_bytes(half_done.github.files[ZIP])
+        manifest = other / "update.json"
+        manifest.write_bytes(tool.update_sign.build_manifest(archive, minimum="0.0.1"))
+        tool.update_sign.sign_file(manifest, half_done.key, lambda _prompt: PASSPHRASE)
+        half_done.github.files["update.json"] = manifest.read_bytes()
+        half_done.github.files["update.json.sig"] = (other / "update.json.sig").read_bytes()
+        writes = list(half_done.github.writes)
+        half_done.answers = ["y"]
+        assert half_done.main(tool) == 1
+        assert half_done.github.writes == writes
+
+    def test_without_the_checked_copy_it_prints_what_to_do_by_hand(
+        self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        for path in (half_done.root / "dist" / "release").rglob("update.json"):
+            path.unlink()
+        capsys.readouterr()
+        writes = list(half_done.github.writes)
+        half_done.answers = ["y"]
+        assert half_done.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "残りは手で済ませる" in out and "gh release upload beta" in out
+        assert half_done.github.writes == writes
+
+    def test_dry_run_on_a_published_release_writes_nothing(
+        self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        capsys.readouterr()
+        writes = list(half_done.github.writes)
+        assert half_done.main(tool, "--dry-run") == 0
+        out = capsys.readouterr().out
+        assert "[済] v1.2.3 は公開済み" in out and "[残] 公開した後の残り" in out
+        assert half_done.github.writes == writes
+
+
+def _uploads(world: World, tag: str = TAG) -> list[list[str]]:
+    """``gh release upload`` で上げたファイルの名前 呼び出しごと"""
+    return [
+        [Path(path).name for path in args[4:] if not path.startswith("--")]
+        for args in world.github.writes
+        if args[:4] == ["gh", "release", "upload", tag]
+    ]
 
 
 class TestTheCheckAndSignature:
@@ -575,12 +783,13 @@ class TestDryRun:
         out = capsys.readouterr().out
         assert world.github.writes == []
         assert world.smoked == [] and world.launched == [] and world.secrets == []
+        # 落とすのはソースの索引を標準出力へ読むだけ ファイルには落とさない
         downloads = [a for a in world.github.calls if a[:3] == ["gh", "release", "download"]]
-        assert downloads == []
+        assert downloads and all(a[-2:] == ["--output", "-"] for a in downloads)
         assert not (world.root / "dist").exists()
         assert f"[済] {TAG} は push 済み" in out
         assert "[済] Release（v1.2.3） が success" in out
-        assert "[済] 下書きに sources-manifest.json" in out
+        assert "[済] 下書きに索引（sources-manifest.json）の載せたソースが全部ある" in out
         assert "[残] zip を落とす" in out
         assert "[残] 目録を作り" in out
         assert "[残] 要約を出して" in out
@@ -592,7 +801,7 @@ class TestDryRun:
         world.github.branch = "phase/x"
         assert world.main(tool, "--dry-run") == 1
         out = capsys.readouterr().out
-        assert "[NG] 手元が main でない" in out and "[済] 下書きに" in out
+        assert "[NG] 手元が main でない" in out and "[済] 下書きに索引" in out
         assert world.github.writes == []
 
     def test_without_a_tag_it_says_the_tag_would_be_made(

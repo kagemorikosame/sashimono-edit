@@ -2012,13 +2012,18 @@ GPL と LGPL の部品（FFmpeg・x264・x265・LAME・libiconv・Qt・PySide6�
 **zip と同じ GitHub Release に、積んだのと同じ版のソースを添付する**
 
 リリースでは `tools/release.py`（下の「自動更新のリリース」）が、下書きから落とした zip を
-展開した物を数えてここを走らせ、下書きへ上げる（下書きに `sources-manifest.json` があれば飛ばす）
-手で行うときは次のとおり
+展開した物を数えてここを走らせ、下書きへ上げる 飛ばすのは、下書きの `sources-manifest.json` に
+載ったファイルが全部、同じ大きさと sha256 で下書きにあり、`sources-SHA256SUMS.txt` もあるときだけ
+欠けていれば足りない分だけ上げ直す 上げるときは本体を上げ終えてから、別の呼び出しで索引
+（`sources-manifest.json` と `sources-SHA256SUMS.txt`）を上げる 1 回で並べて上げると、途中で落ちた
+ときに索引だけが上がり、次に打ったときに揃ったと見て、ソースが欠けたまま公開まで進む
+手で行うときも、本体 → 索引の順に上げる
 
 ```
 .venv\Scripts\python.exe tools\collect_sources.py --check
 .venv\Scripts\python.exe tools\collect_sources.py
-gh release upload <タグ> dist\SashimonoEdit-<版>-windows-x64.zip dist\sources\*
+gh release upload <タグ> dist\sources\*.tar.* --clobber
+gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sources-manifest.json --clobber
 ```
 
 - `--check` は入手先に届くかだけを見る（中身は落とさない） 落とすと 100 MB ほど
@@ -2238,8 +2243,8 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 | 1. 前提 | 引数の版と `__version__` が同じ 手元が main で汚れていない origin/main と同じ 出す commit の CI と Package が success（走っている途中なら待つ） gh が使える 鍵が `TRUSTED_PUBLIC_KEYS` にある | ─ |
 | 2. タグ | `v<版>` を注釈付きで打って push する | push 済みのタグが main の歴史の中で同じ版の commit を指せば飛ばす それ以外なら止まる |
 | 3. 組み立て | Actions の Release（`release.yml`）がそのタグで終わるのを待つ | success なら飛ばす 落ちていれば止まる |
-| 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、展開する | 公開済みなら止まる 落とした zip が同じなら落とし直さない |
-| 5. ソース | `collect_sources.py` で集めて下書きへ上げる | 下書きに `sources-manifest.json` があれば飛ばす |
+| 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、展開する | 落とした zip が同じなら落とし直さない 公開済みなら下の「公開済みに打ち直したとき」 |
+| 5. ソース | 足りない物を `collect_sources.py` で集め、本体を上げ終えてから別の呼び出しで索引を上げる | 下書きの `sources-manifest.json` に載ったファイルが全部、同じ大きさと sha256 で下書きにあり、`sources-SHA256SUMS.txt` もあれば飛ばす 欠けていれば足りない分だけ上げ直す |
 | 6. 自己診断 | 展開した zip を `build_package.py` と同じ確かめ（`--self-check` ほか）に掛け、アプリを起こして「GL で描けていたか y/N」と尋ねる（`--skip-launch` で起こさない） | 同じ zip で通した印（`dist\release\release-checked.json`）があれば飛ばす |
 | 7. 目録と署名 | `update_sign.py` の manifest → sign（合言葉を尋ねる）→ verify → 下書きへ上げる | 下書きにあれば落として verify し、通れば飛ばす 通らなければ止まる |
 | 8. 公開 | 版・zip の大きさと sha256・資産の数・署名した鍵を出し、**y と答えたときだけ**公開する 公開した後、固定の URL がこの版を指すかを見る | ─ |
@@ -2254,6 +2259,12 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
   zip が手元に無ければ、6 と 7 は「残り」として出る
 - ベータ（`1.3.0b1` のような版）は、プレリリースとして公開し、目録を `beta` へ上げ直す
   正式版で `beta` のリリースがあれば、そちらにも正式版の目録を上げ直す
+- 公開した後（beta へ上げる所・固定の URL の確かめ）で落ちたときは「公開は済んでいる」と出し、
+  手で打つ残り（`gh release upload beta … --clobber` など）を並べる
+- 公開済みに打ち直したとき zip や目録は差し替えない 公開されている目録と署名を落とし、下書きの
+  ときに手元で確かめた写し（`dist\release\update.json` か `dist\release\remote\update.json`）と
+  バイト列まで同じで、埋め込んだ鍵で通るときだけ、公開した後の残り（beta の目録・固定の URL の
+  確かめ）を y で続ける 写しが無い・違うときは止まり、手で打つ残りを出す
 
 中で何をしているか・道具が使えないときの手作業
 

@@ -11,7 +11,9 @@ r"""リリースを 1 コマンドで終える（タグ → 下書きの確か�
 2. タグ ``v<版>`` 無ければ注釈付きで打って push する あれば、指す commit を確かめて飛ばす
 3. Actions の Release（release.yml）がそのタグで終わるのを待つ
 4. 下書き リリースが下書きであること zip を ``dist\release`` へ落とし、GitHub の digest と照らす
-5. ソース 下書きに ``sources-manifest.json`` が無ければ ``collect_sources.py`` で集めて上げる
+   公開済みなら差し替えず、目録が下書きのときと同じことを確かめて、公開した後の残りだけ続ける
+5. ソース 索引（``sources-manifest.json``）に載った物が全部下書きにあるか照らし、足りなければ
+   ``collect_sources.py`` で集めて、本体 → 索引の順に上げる
 6. 自己診断 展開した zip を ``build_package.py`` と同じ確かめに掛け、アプリを起こして
    GL で描けているかを人に尋ねる（``--skip-launch`` で起こさない）
 7. 目録と署名 ``update_sign.py`` の manifest → sign → verify で作って上げる
@@ -270,6 +272,12 @@ class Release:
     signer: int | None = None
     #: 確かめた目録の場所（署名はその隣） ベータの置き場へ上げ直すときに同じ物を使う
     manifest: Path | None = None
+    #: 照らす zip の大きさ（下書きなら落とした物、公開済みなら資産の値）
+    zip_size: int = -1
+    #: 公開まで済んだ 後で落ちても「公開はしていない」と出さない
+    published: bool = False
+    #: 公開した後に beta へも目録を上げ直すか
+    has_beta: bool = False
 
     # --- 小さな道具 ---------------------------------------------------------------
 
@@ -598,6 +606,7 @@ class Release:
                 )
             self.done(f"zip を落とし、GitHub の物と照らした: {self.archive}")
         self.zip_sha256 = sha256_of(self.archive)
+        self.zip_size = self.archive.stat().st_size
         self.extract()
         return True
 
@@ -633,21 +642,96 @@ class Release:
 
     def ensure_sources(self) -> None:
         print("== 5. ソース ==")
-        names = self.assets()
-        wanted = (collect_sources.MANIFEST_NAME, collect_sources.SUMS_NAME)
-        if all(name in names for name in wanted):
-            self.done(f"下書きに {' と '.join(wanted)} がある")
+        missing = self.missing_sources()
+        if not missing:
+            self.done(f"下書きに索引（{collect_sources.MANIFEST_NAME}）の載せたソースが全部ある")
             return
         if self.dry_run:
-            self.todo("ソースを集めて下書きへ上げる（collect_sources.py 100 MB ほど落とす）")
+            self.todo(
+                f"ソースを集めて下書きへ上げる（足りない物: {'、'.join(missing)}）"
+                "（collect_sources.py 落とすのは足りない分だけ 全部なら 100 MB ほど）"
+            )
             return
+        print(f"足りない物: {'、'.join(missing)}")
         if self.collect(self.extracted) != 0:
             raise StopError("ソースを集められなかった（上の [NG] を直してから、もう一度打つ）")
         folder = self.extracted / "sources"
-        files = sorted(str(path) for path in folder.iterdir() if path.is_file())
-        self.call("gh", "release", "upload", self.tag, *files, "--clobber", what="ソースを上げるの")
+        indexes = (collect_sources.MANIFEST_NAME, collect_sources.SUMS_NAME)
+        assets = self.assets()
+        bodies = [
+            path
+            for path in sorted(folder.iterdir())
+            if path.is_file()
+            and path.name not in indexes
+            and not self.matches(path, assets.get(path.name, {}))
+        ]
+        # 本体を上げ終えてから索引を上げる 1 回で並べて上げると、途中で落ちたときに索引だけが
+        # 上がり、次に打ったときに揃ったと見て、GPL のソースが欠けたまま公開まで進む
+        if bodies:
+            self.call(
+                "gh",
+                "release",
+                "upload",
+                self.tag,
+                *(str(path) for path in bodies),
+                "--clobber",
+                what="ソースを上げるの",
+            )
+        self.call(
+            "gh",
+            "release",
+            "upload",
+            self.tag,
+            *(str(folder / name) for name in indexes),
+            "--clobber",
+            what="ソースの索引を上げるの",
+        )
         self.load_release()
-        self.done(f"ソース {len(files)} 個を上げた")
+        left = self.missing_sources()
+        if left:
+            raise StopError(f"上げた後もソースが欠けている: {'、'.join(left)}（もう一度打つ）")
+        self.done(f"ソース {len(bodies)} 個と索引を上げた")
+
+    def missing_sources(self) -> list[str]:
+        """下書きに無い・中身の違うソース 索引に載った物を、名前と大きさと sha256 で照らす
+
+        索引が 2 つあるだけでは揃ったと見ない 前に上げる途中で落ちていると、索引だけが
+        あって本体が欠けている
+        """
+        assets = self.assets()
+        indexes = (collect_sources.MANIFEST_NAME, collect_sources.SUMS_NAME)
+        missing = [name for name in indexes if name not in assets]
+        if collect_sources.MANIFEST_NAME in missing:
+            return missing
+        # 標準出力へ落とす 読むだけなので手元にファイルを作らない（--dry-run でも使える）
+        out = self.call(
+            "gh",
+            "release",
+            "download",
+            self.tag,
+            "--pattern",
+            collect_sources.MANIFEST_NAME,
+            "--output",
+            "-",
+            what="ソースの索引を読むの",
+        )
+        try:
+            entries = json.loads(out)
+            listed = [(str(e["file"]), int(e["size"]), str(e["sha256"])) for e in entries]
+        except (ValueError, TypeError, KeyError) as exc:
+            return [f"{collect_sources.MANIFEST_NAME}（読めない: {exc}）"]
+        if not listed:
+            return [f"{collect_sources.MANIFEST_NAME}（空）"]
+        for name, size, sha256 in listed:
+            asset = assets.get(name)
+            digest = str((asset or {}).get("digest") or "")
+            if (
+                asset is None
+                or int(asset.get("size", -1)) != size
+                or (digest.startswith("sha256:") and digest.removeprefix("sha256:") != sha256)
+            ):
+                missing.append(name)
+        return missing
 
     # --- 6. 自己診断 ----------------------------------------------------------------
 
@@ -784,10 +868,7 @@ class Release:
             return str(exc)
         if version != self.version:
             return f"目録の版が {version}"
-        if (
-            parsed.package.sha256 != self.zip_sha256
-            or parsed.package.size != self.archive.stat().st_size
-        ):
+        if parsed.package.sha256 != self.zip_sha256 or parsed.package.size != self.zip_size:
             return "目録の zip の sha256 か大きさが、下書きの zip と違う"
         if not parsed.package.url.endswith("/" + zip_name(self.version)):
             return f"目録の zip の URL が違う（{parsed.package.url}）"
@@ -825,15 +906,24 @@ class Release:
         if answer not in {"y", "yes"}:
             print("公開しなかった 下書きのまま（もう一度打てば、ここから尋ねる）")
             return 0
+        self.has_beta = has_beta
         if self.beta:
             self.call(
                 "gh", "release", "edit", self.tag, "--draft=false", "--prerelease", what="公開"
             )
         else:
             self.call("gh", "release", "edit", self.tag, "--draft=false", "--latest", what="公開")
+        self.published = True
         print(f"公開した: {self.tag}")
+        return self.after_publish()
+
+    def after_publish(self) -> int:
+        """公開した後の残り beta の目録を上げ直し、固定の URL がこの版を指すかを見る
+
+        ここで落ちても公開は済んでいる 呼び手は :meth:`after_publish_hint` で残りを出す
+        """
         manifest = self.manifest
-        if has_beta and manifest is not None:
+        if self.has_beta and manifest is not None:
             self.call(
                 "gh",
                 "release",
@@ -846,6 +936,94 @@ class Release:
             )
             print(f"{BETA_TAG} へ目録と署名を上げた")
         return self.check_latest(BETA_MANIFEST_URL if self.beta else STABLE_MANIFEST_URL)
+
+    def after_publish_hint(self) -> list[str]:
+        """公開した後で止まったときに、手で済ませる残り"""
+        lines = []
+        manifest = self.manifest or self.folder / MANIFEST_NAME
+        if self.has_beta:
+            lines.append(
+                f"gh release upload {BETA_TAG} {manifest} "
+                f"{manifest.with_name(SIGNATURE_NAME)} --clobber"
+            )
+        url = BETA_MANIFEST_URL if self.beta else STABLE_MANIFEST_URL
+        lines.append(f"{url} を開き、version が {self.version} かを見る")
+        return lines
+
+    def resume_published(self) -> int:
+        """公開済みのリリースに打ち直したとき、公開した後の残りだけを続ける
+
+        zip や目録は差し替えない 続けるのは、公開されている目録と署名が、下書きのときに
+        手元で確かめた物とバイト列まで同じときだけ 違えば、公開した後に誰かが差し替えた
+        """
+        print("== 4. 公開済み ==")
+        assets = self.assets()
+        asset = assets.get(zip_name(self.version))
+        stop = (
+            f"{self.tag} は公開済み 公開した後の zip や目録は差し替えない"
+            "（直すなら版を上げて新しいタグで出す）"
+        )
+        if asset is None or MANIFEST_NAME not in assets or SIGNATURE_NAME not in assets:
+            raise StopError(stop)
+        digest = str(asset.get("digest") or "")
+        if not digest.startswith("sha256:"):
+            raise StopError(stop + " zip の digest が無く、目録と照らせない")
+        self.zip_sha256 = digest.removeprefix("sha256:")
+        self.zip_size = int(asset.get("size", -1))
+        self.has_beta = self.beta or self.run(["gh", "release", "view", BETA_TAG]).returncode == 0
+        if self.dry_run:
+            self.done(f"{self.tag} は公開済み")
+            self.todo("公開した後の残り（beta の目録・固定の URL の確かめ）を続けられるかを見る")
+            return 1 if self.problems else 0
+        # 下書きのときに手元で確かめた写し（落とした物か、署名した物）
+        known = [
+            path
+            for path in (self.folder / "remote" / MANIFEST_NAME, self.folder / MANIFEST_NAME)
+            if self.manifest_problem(path) is None
+        ]
+        if not known:
+            raise StopError(
+                stop
+                + " 下書きのときに確かめた目録が手元に無いので、残りは手で済ませる\n  "
+                + "\n  ".join(self.after_publish_hint())
+            )
+        published = self.folder / "published"
+        published.mkdir(parents=True, exist_ok=True)
+        for name in (MANIFEST_NAME, SIGNATURE_NAME):
+            self.call(
+                "gh",
+                "release",
+                "download",
+                self.tag,
+                "--pattern",
+                name,
+                "--dir",
+                str(published),
+                "--clobber",
+                what="公開した目録を落とすの",
+            )
+        problem = self.manifest_problem(published / MANIFEST_NAME)
+        same = any(
+            (published / MANIFEST_NAME).read_bytes() == path.read_bytes()
+            and (published / SIGNATURE_NAME).read_bytes()
+            == path.with_name(SIGNATURE_NAME).read_bytes()
+            for path in known
+        )
+        if problem or not same:
+            raise StopError(
+                f"公開されている目録が、下書きのときに確かめた物と違う（{problem or '中身が違う'}）"
+                " 誰が差し替えたかを確かめる（直すなら版を上げて新しいタグで出す）"
+            )
+        self.published = True
+        self.done(
+            f"{self.tag} は公開済み 目録と署名は下書きのときと同じ（{key_label(self.signer)}）"
+        )
+        rest = f"{BETA_TAG} へ目録を上げ直し、" if self.has_beta else ""
+        answer = self.ask(f"公開した後の残り（{rest}固定の URL の確かめ）を続けますか y/N: ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("続けなかった")
+            return 0
+        return self.after_publish()
 
     def check_latest(self, url: str) -> int:
         """公開した後、配った版が読む固定の URL がこの版を指すか"""
@@ -878,6 +1056,10 @@ class Release:
             print("（前提が欠けているので、以下は今の様子だけ）")
         self.ensure_tag()
         self.wait_release_workflow()
+        current = self.load_release()
+        if current is not None and not current.get("isDraft"):
+            # 公開済み 差し替えはしない 公開した後の残りだけを、確かめた上で続けられる
+            return self.resume_published()
         if not self.check_draft() and not self.release:
             # 試しに見ていて、下書きがまだ無い 残りは全部これから
             self.todo("5 から先（ソース・自己診断・目録と署名・公開）は下書きができてから")
@@ -922,6 +1104,13 @@ def main(argv: list[str] | None = None, **overrides: Any) -> int:
         print(f"[止めた] {type(exc).__name__}: {exc}")
     except KeyboardInterrupt:
         print("[止めた] 中断した")
+    if release.published:
+        # 公開した後で落ちた 「公開はしていない」と出すと、事実と違ううえに、打ち直しても
+        # 公開済みで止まると思って残り（beta の目録）を放っておかれる
+        print(f"{release.tag} の公開は済んでいる 残りは同じコマンドを打ち直すか、手で次を行う")
+        for line in release.after_publish_hint():
+            print(f"  {line}")
+        return 1
     print("公開はしていない 直してから同じコマンドを打てば、済んだ段は飛ばして続きから進む")
     return 1
 
