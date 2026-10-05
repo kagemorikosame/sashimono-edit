@@ -20,7 +20,7 @@ body:
     attributes:
       label: Sashimono Edit の版
       description: 〔ヘルプ〕→〔バージョン情報…〕の 1 行目 配った zip なら、zip の名前（`SashimonoEdit-<版>-windows-x64.zip`）にも入っています
-      placeholder: 0.1.1
+      placeholder: 0.1.2
     validations:
       required: true
 
