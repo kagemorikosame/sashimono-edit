@@ -193,6 +193,23 @@ def test_packages_outside_the_dependencies_are_installed_at_the_listed_version()
     assert "-r build/bundled-beside.txt" in line
 
 
+def test_pyinstaller_bootloader_is_rebuilt_and_checked() -> None:
+    """PyInstaller の起動部を sdist から組み直し、既成の物と違うことを組み立ての前に確かめる
+
+    既成の起動部のまま配った 0.1.1 は、Windows Defender の機械学習の推測
+    （Trojan:Win32/Bearfoos.A!ml）で exe ごと消された 組み直しを外す変更や、
+    制約の外で別に入れ直す変更を止める
+    """
+    build = _jobs(PACKAGE)["build"]
+    install = build.index("uv pip install")
+    step = build[build.rindex("- name:", 0, install) : build.index("\n", install)]
+    assert 'PYINSTALLER_COMPILE_BOOTLOADER: "1"' in step
+    assert "--no-binary pyinstaller" in step
+    assert len(re.findall(r"uv pip install", build)) == 1
+    check = build.index("python tools/check_bootloader.py")
+    assert install < check < build.index("build_package.py --skip-check")
+
+
 def test_main_and_packaging_changes_run_it() -> None:
     """main への push と、組み立てと確かめに関わるファイルを変える PR で走る
 
@@ -205,6 +222,7 @@ def test_main_and_packaging_changes_run_it() -> None:
     for path in (
         "tools/build_package.py",
         "tools/package_notices.py",
+        "tools/check_bootloader.py",
         "tools/check_clean_machine.ps1",
         "src/sashimono/selfcheck.py",
         ".github/workflows/package.yml",

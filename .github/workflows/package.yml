@@ -22,6 +22,7 @@ on:
       - ".github/workflows/release.yml"
       - "tools/build_package.py"
       - "tools/package_notices.py"
+      - "tools/check_bootloader.py"
       - "tools/check_clean_machine.ps1"
       - ".github/actions/ffmpeg/**"
       - "src/sashimono/selfcheck.py"
@@ -73,7 +74,18 @@ jobs:
         run: python tools/package_notices.py --write-constraints build/constraints.txt --write-requirements build/bundled-beside.txt
 
       - name: 依存を入れる
-        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -r build/bundled-beside.txt -c build/constraints.txt
+        # PyInstaller だけは sdist から入れ、起動部（bootloader）をこの機械の MSVC で組み直す
+        # wheel の既成の起動部は多くのマルウェアと同じ物で、Windows Defender の機械学習の推測
+        # （Trojan:Win32/Bearfoos.A!ml）に引っ掛かり、0.1.1 の exe は AI 連携を入れる途中で消された
+        # 導入を分けると制約の無い導入が先に走りうるので、同じ 1 回の導入のまま --no-binary を足す
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -r build/bundled-beside.txt -c build/constraints.txt --no-binary pyinstaller
+
+      - name: 起動部が既成の物と違うことを確かめる
+        # 組み直したつもりで既成の wheel が入っていても、組み立ては黙って通ってしまう
+        # 同じ版の既成の wheel とハッシュを比べ、要約へ記録する
+        run: python tools/check_bootloader.py
 
       - name: タグと版を照らす
         # 食い違ったまま配ると、更新したのに「最新です」と言い続ける版ができる（F-12-8）
