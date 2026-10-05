@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import contextlib
 import filecmp
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -382,7 +384,11 @@ def clean_leftovers(install: Path, target: Path) -> list[Path]:
             if relative.name.endswith(_MOVING_SUFFIX):
                 with contextlib.suppress(OSError):
                     remove_file(target / relative)  # 捨て損ねても読まれない
-    return _recover_removed(install, target)
+    stuck = _recover_removed(install, target)
+    # よけた元を戻してから、確定の途中で止まった束を巻き戻す（元が戻っていないと、元を片付け
+    # 始めていたと見て巻き戻さない）
+    _roll_back_journals(target)
+    return stuck
 
 
 def move_user_scripts(
@@ -547,6 +553,8 @@ def _move_all(install: Path, target: Path, should_stop: Callable[[], bool]) -> S
             problem, gone, stuck = _retire(install, target, members, placed)
             moved.extend(gone)
             left.extend(stuck)
+            # 確定し終えて元を片付けた（か、書き換わっていて巻き戻した） 記録は要らない
+            _drop_journal(target)
         if problem is not None:
             # 束は一式 exe の隣に残る（元には触っていない） 束の全部を写せなかった物として数える
             failed.extend((relative, problem) for relative in members)
@@ -742,6 +750,11 @@ def _place_bundle(source: Path, target: Path, members: list[Path]) -> tuple[str 
             # 大きさだけでなく中身を照らす 元を消した後では、欠けた写しに気付いても戻せない
             if not filecmp.cmp(source / relative, staged, shallow=False):
                 return f"写した中身が元と違う（{relative.as_posix()}）", []
+        # 確定の前に「この束をこれから置く」記録を書く 確定の途中で落ちると移し先に束の一部だけが
+        # 残り、その後に元を書き直すと、次の計画は中身の衝突として束を残すだけで、後に読まれる
+        # 移し先の古い写しが書き直した中身を隠し続ける（PR #245 の Codex の指摘） 次に錠を
+        # 取ったときに記録を見て巻き戻す（:func:`_roll_back_journals`） 書けなければこの束は移さない
+        _write_journal(target, source, {p: _digest(staging / p) for p in pending})
         try:
             for relative in pending:
                 destination = target / relative
@@ -752,12 +765,95 @@ def _place_bundle(source: Path, target: Path, members: list[Path]) -> tuple[str 
                 placed.append(relative)
         except OSError:
             _take_back(source, target, placed)
+            _drop_journal(target)
             raise
     except OSError as exc:
         return str(exc) or type(exc).__name__, []
     finally:
         _remove_tree(staging)
     return None, placed
+
+
+def _journal(target: Path) -> Path:
+    """この起動の「この束をこれから置く」記録（``%APPDATA%\\Sashimono`` の下 置き場の外）"""
+    return target.parent / f"{_JOURNAL_PREFIX}{os.getpid()}.json"
+
+
+#: 「この束をこれから置く」記録の名前の頭
+_JOURNAL_PREFIX = "scripts-move.journal."
+
+
+def _digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _write_journal(target: Path, source: Path, entries: dict[Path, str]) -> None:
+    """記録を書いて読み戻す 書けなければ OSError（この束は移さない）"""
+    journal = _journal(target)
+    data = {
+        "source": str(source),
+        "entries": {path.as_posix(): digest for path, digest in entries.items()},
+    }
+    writing = journal.with_name(journal.name + _MOVING_SUFFIX)
+    writing.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    writing.replace(journal)
+    if json.loads(journal.read_text(encoding="utf-8")) != data:
+        raise OSError("これから置く記録を書けない")
+
+
+def _drop_journal(target: Path) -> None:
+    """束を確定し終えて元を片付けた・巻き戻し終えた 消し損ねても、次の巻き戻しは元の在る物しか
+    外さず、元の無い物（確定して元まで片付けた物）は外さないので害は無い
+    """
+    with contextlib.suppress(OSError):
+        _journal(target).unlink(missing_ok=True)
+
+
+def _roll_back_journals(target: Path) -> None:
+    """落ちた起動が残した「これから置く」記録を見て、確定の途中で止まった束を巻き戻す
+
+    記録にある物のうち、移し先にあって記録のハッシュと同じ（自分が置いた写しのまま）で、元が
+    exe の隣に残っている物だけを外す（移す側の巻き戻しと同じ規則） 元が無い物は、確定して元まで
+    片付けた物か、誰かが当てにした物なので外さない 外せば、次の移しが元から一式移し直す
+    錠を持って、よけた元を戻した後に呼ぶ（よけた元が戻っていないと、元が無いと見て外さない）
+    """
+    for journal in target.parent.glob(f"{_JOURNAL_PREFIX}*.json"):
+        try:
+            data = json.loads(journal.read_text(encoding="utf-8"))
+            source = Path(data["source"])
+            entries = {Path(path): str(digest) for path, digest in data["entries"].items()}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # 書きかけの記録 確定は記録を書き終えてから始めるので、何も置いていない
+            with contextlib.suppress(OSError):
+                journal.unlink()
+            continue
+        if not all((source / relative).is_file() for relative in entries):
+            # 元を片付け始めていた（確定し終えていた） 移し先に一式そろっているので外さない
+            # 一部を外すと束が割れる 残った元は、次の移しで同じ中身と見て片付く
+            with contextlib.suppress(OSError):
+                journal.unlink()
+            continue
+        for relative, digest in entries.items():
+            placed = target / relative
+            try:
+                if not (source / relative).is_file() or not placed.is_file():
+                    continue
+                if _digest(placed) != digest:
+                    continue  # 置いた後に書き換えられた 本人の物かもしれない 外さない
+                remove_file(placed)
+            except OSError:
+                continue  # 外せなくても、元が残っているので次の移しで同じ中身と見て片付く
+            for folder in placed.parents:
+                if folder == target or not folder.is_relative_to(target):
+                    break
+                with contextlib.suppress(OSError):
+                    folder.rmdir()
+        with contextlib.suppress(OSError):
+            journal.unlink()
 
 
 def _remove_empty_folders(source: Path) -> None:

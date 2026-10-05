@@ -390,6 +390,56 @@ class TestBundles:
         assert all(path.is_file() for path in originals)
         assert not target.exists() or not [p for p in target.rglob("*") if p.is_file()]
 
+    def test_a_bundle_cut_off_midway_is_rolled_back_before_an_edit_is_hidden(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """確定の途中で落ち（電源断・強制終了）、その後に元を書き直しても、次の移しで古い写しを外し、
+        書き直した中身が使われる（PR #245 の Codex の指摘） 記録が無いと、次の計画は中身の衝突と
+        して束を残すだけで、後に読まれる移し先の古い写しが書き直した中身を隠し続けていた
+        """
+        originals = self._bundle(install)
+        real_rename = Path.rename
+
+        class PowerCut(BaseException):
+            pass
+
+        def cut_after_the_first(self: Path, destination: Path) -> Path:
+            moved = real_rename(self, destination)
+            if ".scripts-moving-" in str(self):
+                raise PowerCut
+            return moved
+
+        monkeypatch.setattr(Path, "rename", cut_after_the_first)
+        with pytest.raises(PowerCut):
+            move_user_scripts(install, target)
+        monkeypatch.undo()
+        placed = [p for p in target.rglob("*") if p.is_file()]
+        assert len(placed) == 1  # 束の一部だけが移し先にある
+        relative = placed[0].relative_to(target)
+        edited = install / PORTABLE_SCRIPTS_DIR / relative
+        edited.write_text("書き直した中身", encoding="utf-8")
+
+        result = move_user_scripts(install, target)
+
+        assert (target / relative).read_text(encoding="utf-8") == "書き直した中身"
+        assert len(result.moved) == len(originals) and result.failed == ()
+        assert not list(target.parent.glob("scripts-move.journal.*"))
+
+    def test_a_journal_that_cannot_be_written_moves_nothing(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """「これから置く」記録を書けなければ、その束は移さない（落ちたときに巻き戻せない）"""
+        originals = self._bundle(install)
+
+        def unwritable(*_args: object) -> None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(portable_module, "_write_journal", unwritable)
+        result = move_user_scripts(install, target)
+        assert result.moved == () and len(result.failed) == 3
+        assert all(path.is_file() for path in originals)
+        assert not target.exists() or not [p for p in target.rglob("*") if p.is_file()]
+
     def test_a_half_placed_bundle_is_finished_next_time(self, install: Path, target: Path) -> None:
         """確定の途中で落ちた（移し先に一部だけ入った）後の起動では、入った分を同じ中身と見て
         束ごと移し直す 元は消していないので、それまでは exe の隣の一式が読まれる
