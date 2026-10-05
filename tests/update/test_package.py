@@ -365,6 +365,8 @@ class TestUserScripts:
         with pytest.raises(package_module.CarryError) as raised:
             carry_user_files(layout.install, layout.staged)
         assert "戻せない" in raised.value.failed[0][1]
+        # 名前だけだと隠れた作業用のフォルダのどこにあるか分からず、手で片付けられない
+        assert raised.value.failed[0][0] == parked.relative_to(layout.install)
         assert parked.read_text(encoding="utf-8") == "前の中身"
 
     def test_an_unreadable_folder_stops_the_carry(

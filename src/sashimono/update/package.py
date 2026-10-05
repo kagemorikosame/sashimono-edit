@@ -271,6 +271,17 @@ def stage(
     return layout.staged
 
 
+def _under(root: Path, path: Path) -> Path:
+    """``path`` を ``root`` からの相対にする ``root`` の外なら元のまま（場所を知らせから落とさない）
+
+    隠れた作業用のフォルダの中の物を名前だけで知らせると、利用者が探せない
+    """
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return path
+
+
 def carry_user_files(
     install: Path,
     destination: Path,
@@ -334,10 +345,14 @@ def carry_user_files(
         stuck = clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
         if stuck:
             # よけたまま戻せない元がある このまま入れ替えると、今の版のフォルダごと .previous へ
-            # 回り、次の更新で消える 入れ替えを止めて知らせる
+            # 回り、次の更新で消える 入れ替えを止めて知らせる 場所は install からの相対で出す
+            # 名前だけだと、隠れた作業用のフォルダのどこにあるかが分からず手で片付けられない
             raise CarryError(
                 tuple(
-                    (Path(p.name), "よけたまま元の場所へ戻せない（前に移している途中で止まった）")
+                    (
+                        _under(install, p),
+                        "よけたまま元の場所へ戻せない（前に移している途中で止まった）",
+                    )
                     for p in stuck
                 )
             )
