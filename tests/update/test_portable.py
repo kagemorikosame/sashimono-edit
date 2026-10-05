@@ -811,6 +811,50 @@ class TestEdgeCases:
         assert result.moved == (Path("a/効果.anm2"),) and result.failed == ()
         assert (moved_away / PORTABLE_SCRIPTS_DIR / "b" / "効果.anm2").is_file()
 
+    def test_a_parked_original_older_than_a_rewrite_is_kept_outside_the_install(
+        self, install: Path, target: Path
+    ) -> None:
+        """よけた元が、元の場所に書き直された物とも移し先とも違えば、%APPDATA% の
+        scripts-recovered へ取っておく exe の隣のフォルダの中に残すと、自動更新で .previous へ
+        回って次の更新で消える
+        """
+        parked = install / ".scripts-removing-4242" / "自分の" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("前の中身", encoding="utf-8")
+        _put(install, "自分の/効果.anm2", "書き直した中身")
+        assert portable_module.clean_leftovers(install, target) == []
+        kept = target.parent / portable_module.RECOVERED_DIR / "自分の" / "効果.anm2"
+        assert kept.read_text(encoding="utf-8") == "前の中身"
+        assert not (install / ".scripts-removing-4242").exists()
+
+    def test_an_unreadable_folder_keeps_its_bundle(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """読めないフォルダを黙って飛ばすと、その中の物を数えないまま束を移して割る 束ごと残す"""
+        effect = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        _put(install, "配布物/画像/星.png", "png")
+        _put(install, "別/単独.anm2", "obj.ox = 2\n")
+        blocked = install / PORTABLE_SCRIPTS_DIR / "配布物" / "画像"
+        real_scandir = os.scandir
+
+        def refuse(path: object) -> object:
+            if Path(str(path)) == blocked:
+                raise PermissionError("権限が無い")
+            return real_scandir(path)  # type: ignore[call-overload]
+
+        monkeypatch.setattr(os, "scandir", refuse)
+        result = move_user_scripts(install, target)
+        assert result.moved == (Path("別/単独.anm2"),)
+        assert Path("配布物/画像") in result.held and effect.is_file()
+
+    def test_a_marker_is_read_back_after_writing(
+        self, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """印を書いたつもりで残っていなければ OSError（黙って先へ進まない）"""
+        monkeypatch.setattr(Path, "write_text", lambda *_a, **_k: 0)
+        with pytest.raises(OSError, match="印を書けない"):
+            portable_module.mark_swap_pending(target.parent, "0.1.0", "甲")
+
     def test_leftovers_of_a_power_cut_are_cleared(self, install: Path, target: Path) -> None:
         """電源が切れた後の起動 作業用のフォルダと写しの途中の物（.moving）を片付け、元から移す"""
         _put(install, "配布物/効果.anm2", "obj.ox = 1\n")

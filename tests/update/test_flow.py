@@ -123,6 +123,22 @@ class TestApplyingOnStart:
         assert (layout.install / "scripts" / "自分の" / "効果.anm2").is_file()
         assert (layout.staged / "scripts" / "自分の" / "効果.anm2").is_file()
 
+    def test_a_marker_that_cannot_be_written_starts_no_swapper(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """印を書けなければ入れ替え係を起こさない（PR #245 の CodeRabbit の指摘）"""
+        from sashimono.update import package as package_module
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+
+        def unwritable(*_args: object) -> None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(package_module, "mark_swap_pending", unwritable)
+        assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
+        assert "印を書けない" in store.load().pending_notice
+
     def test_the_swap_pending_marker_follows_the_swapper(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -321,6 +322,70 @@ class TestUserScripts:
         with pytest.raises(package_module.CarryError):
             carry_user_files(layout.install, layout.staged, aside=aside)
         assert (aside / "配布物" / "common.mod2").read_text(encoding="utf-8") == "本人の common"
+
+    def test_a_marker_that_cannot_be_written_stops_the_carry(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """「入れ替え係を待っている」印を書けなければ止める（PR #245 の CodeRabbit の指摘）
+        黙って先へ進むと、印の無いまま錠を放して入れ替え係を起こし、別の窓の移しと重なる
+        %APPDATA% へ写した物は、写せなかったときと同じく外す
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        self._write(layout.install, "配布物/common.mod2", "本人の common")
+        self._write(layout.staged, "配布物/common.mod2", "新しい版の common")
+
+        def unwritable(*_args: object) -> None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(package_module, "mark_swap_pending", unwritable)
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(layout.install, layout.staged, aside=aside, swap_mark=("0.1.0", "甲"))
+        assert "印を書けない" in raised.value.failed[0][1]
+        assert not (aside / "配布物" / "common.mod2").exists()
+
+    def test_originals_that_cannot_be_put_back_stop_the_carry(
+        self, layout: Layout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """よけたまま元の場所へ戻せない元があれば入れ替えない
+
+        入れ替えると .previous へ回って次の更新で消える
+        """
+        parked = layout.install / ".scripts-removing-4242" / "自分の" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("前の中身", encoding="utf-8")
+        self._write(layout.install, "自分の/効果.anm2", "書き直した中身")
+        real_copy = shutil.copy2
+
+        def refuse_recovered(source: Path, destination: Path) -> object:
+            if "scripts-recovered" in str(destination):
+                raise PermissionError("書けない")
+            return real_copy(source, destination)
+
+        monkeypatch.setattr(shutil, "copy2", refuse_recovered)
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(layout.install, layout.staged)
+        assert "戻せない" in raised.value.failed[0][1]
+        assert parked.read_text(encoding="utf-8") == "前の中身"
+
+    def test_an_unreadable_folder_stops_the_carry(
+        self, layout: Layout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """読めないフォルダの中の物は写せない 黙って飛ばすと新しい版に入らず、次の更新で消える"""
+        import os
+
+        self._write(layout.install, "読めない/効果.anm2", "obj.ox = 1")
+        blocked = layout.install / PORTABLE_SCRIPTS_DIR / "読めない"
+        real_scandir = os.scandir
+
+        def refuse(path: object) -> object:
+            if Path(str(path)) == blocked:
+                raise PermissionError("権限が無い")
+            return real_scandir(path)  # type: ignore[call-overload]
+
+        monkeypatch.setattr(os, "scandir", refuse)
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(layout.install, layout.staged)
+        assert raised.value.failed[0][0] == Path("読めない")
 
     def test_the_folder_name_matches_the_catalog(self) -> None:
         """名前が食い違うと、写す先が読まれない場所になる"""

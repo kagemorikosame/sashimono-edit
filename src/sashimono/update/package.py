@@ -45,6 +45,7 @@ from sashimono.update.portable import (
     remove_file,
     script_links,
     user_script_files,
+    walk_all,
 )
 
 __all__ = [
@@ -330,13 +331,32 @@ def carry_user_files(
             )
         )
     try:
-        clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
-        copied = _carry(install, destination, overwrite=overwrite, aside=aside)
+        stuck = clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
+        if stuck:
+            # よけたまま戻せない元がある このまま入れ替えると、今の版のフォルダごと .previous へ
+            # 回り、次の更新で消える 入れ替えを止めて知らせる
+            raise CarryError(
+                tuple(
+                    (Path(p.name), "よけたまま元の場所へ戻せない（前に移している途中で止まった）")
+                    for p in stuck
+                )
+            )
+        copied, placed_aside, linked = _carry(
+            install, destination, overwrite=overwrite, aside=aside
+        )
         if swap_mark is not None:
             # 錠を放す前に「入れ替え係を待っている」印を置く 放してから入れ替え係が swap.lock を
             # 取るまでの隙に、別の窓が移し始めないようにする（PR #245 の CodeRabbit の指摘）
-            # 入れ替え係を起こせなければ、呼んだ側が同じ識別子で外す
-            mark_swap_pending(folder, *swap_mark)
+            # 書けなければ入れ替えを止める（印の無いまま錠を放さない） %APPDATA% へ写した物は
+            # 写せなかったときと同じく外す 入れ替え係を起こせなければ、呼んだ側が同じ識別子で外す
+            try:
+                mark_swap_pending(folder, *swap_mark)
+            except OSError as exc:
+                failed = [
+                    (Path(PORTABLE_SCRIPTS_DIR), f"入れ替え係を待っている印を書けない（{exc}）")
+                ]
+                failed += _take_back_aside(install, aside, placed_aside, linked)
+                raise CarryError(tuple(failed)) from exc
         return copied
     finally:
         lock.release()
@@ -347,7 +367,10 @@ def carry_user_files(
 CARRY_LOCK_WAIT = 10.0
 
 
-def _carry(install: Path, destination: Path, *, overwrite: bool, aside: Path | None) -> int:
+def _carry(
+    install: Path, destination: Path, *, overwrite: bool, aside: Path | None
+) -> tuple[int, list[Path], set[Path]]:
+    """写す ``(写した数, %APPDATA% へ置いた物, リンク)`` 1 つでも写せなければ CarryError"""
     source = install / _PORTABLE_SCRIPTS_DIR
     root = destination / _PORTABLE_SCRIPTS_DIR
     files = user_script_files(install)
@@ -356,7 +379,11 @@ def _carry(install: Path, destination: Path, *, overwrite: bool, aside: Path | N
     # 新しい版が同梱しているモジュール（名前で探されるので、場所が違っても重なる）
     bundled = {} if overwrite else modules_in(root)
     copied = 0
-    failed: list[tuple[Path, str]] = []
+    # 読めなかった物（フォルダ・ファイル）は写せない 黙って飛ばすと新しい版に入らず、
+    # 今の版のフォルダが .previous へ回った後の次の更新で消える 入れ替えを止める
+    failed: list[tuple[Path, str]] = [
+        (p, "読めない（権限・ほかのプログラムが掴んでいる）") for p in walk_all(source)[2]
+    ]
     placed_aside: list[Path] = []
     for members in bundles([*files, *links]).values():
         where = root
@@ -389,20 +416,36 @@ def _carry(install: Path, destination: Path, *, overwrite: bool, aside: Path | N
             else:
                 failed.append((relative, problem))
     if failed:
-        assert aside is not None or not placed_aside
-        for relative in placed_aside:
-            # 外すのは自分が置いた写しで、元が exe の隣に同じ中身で残っているときだけ（移す側の
-            # 巻き戻しと同じ） 元が無ければ誰かがこの写しを当てにした 外すと両方から失われる
-            target = aside / relative if aside is not None else relative
-            origin = source / relative
-            with contextlib.suppress(OSError):
-                if relative in linked:
-                    if _same_link(origin, target):
-                        _remove_link(target)
-                elif origin.is_file() and _same_file(origin, target):
-                    remove_file(target)
+        failed += _take_back_aside(install, aside, placed_aside, linked)
         raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in linked))
-    return copied
+    return copied, placed_aside, linked
+
+
+def _take_back_aside(
+    install: Path, aside: Path | None, placed: list[Path], linked: set[Path]
+) -> list[tuple[Path, str]]:
+    """止めるときに ``%APPDATA%`` へ置いた写しを外す 外せなかった物を返す（知らせに足す）
+
+    外すのは自分が置いた写しで、元が exe の隣に同じ中身で残っているときだけ（移す側の巻き戻しと
+    同じ） 元が無ければ誰かがこの写しを当てにした 外すと両方から失われる 外せなかった物を
+    黙って残すと、%APPDATA% は今の版でも読まれるので、束の一部だけが読まれて描画が変わる
+    """
+    if aside is None:
+        return []
+    source = install / _PORTABLE_SCRIPTS_DIR
+    left: list[tuple[Path, str]] = []
+    for relative in placed:
+        target = aside / relative
+        origin = source / relative
+        try:
+            if relative in linked:
+                if _same_link(origin, target):
+                    _remove_link(target)
+            elif origin.is_file() and _same_file(origin, target):
+                remove_file(target)
+        except OSError as exc:
+            left.append((relative, f"%APPDATA% へ写した物を外せない（{exc}） 手で消してください"))
+    return left
 
 
 def _differs(origin: Path, target: Path, link: bool) -> bool:

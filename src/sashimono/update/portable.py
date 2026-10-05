@@ -47,6 +47,7 @@ __all__ = [
     "MODULE_FILE_SUFFIXES",
     "MOVE_LOCK",
     "PORTABLE_SCRIPTS_DIR",
+    "RECOVERED_DIR",
     "SWAP_PENDING",
     "ScriptMove",
     "bundles",
@@ -66,6 +67,7 @@ __all__ = [
     "swap_pending",
     "unoffered",
     "user_script_files",
+    "walk_all",
 ]
 
 #: exe の隣のスクリプト置き場の名前（compat.aviutl.catalog の PORTABLE_SCRIPTS_DIR）
@@ -148,8 +150,23 @@ def is_link(path: Path) -> bool:
 
 def _walk(source: Path) -> tuple[list[Path], list[Path]]:
     """置き場の中のファイルとリンク（相対の場所） リンクの先へは入らない"""
+    files, links, _unreadable = walk_all(source)
+    return files, links
+
+
+def walk_all(source: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    """置き場の中のファイル・リンク・読めなかった物（相対の場所） リンクの先へは入らない
+
+    読めなかったフォルダや物は、黙って飛ばさずに返す 飛ばすと、その中の物を数えないまま束を
+    移して束が割れる（移した側で見つからない）、自動更新の引き継ぎで写し漏れる、が起きる
+    呼び手は、読めなかった物を含む束を移さず、引き継ぎなら入れ替えを止める
+    置き場そのものが無いのは「何も無い」で、読めなかった物には数えない
+    """
     files: list[Path] = []
     links: list[Path] = []
+    unreadable: list[Path] = []
+    if not source.is_dir():
+        return files, links, unreadable
     pending = [source]
     while pending:
         folder = pending.pop()
@@ -157,7 +174,8 @@ def _walk(source: Path) -> tuple[list[Path], list[Path]]:
             with os.scandir(folder) as entries:
                 listed = list(entries)
         except OSError:
-            continue  # 読めないフォルダは数えない 中の物は今までどおり exe の隣に残る
+            unreadable.append(folder.relative_to(source))
+            continue
         for entry in listed:
             path = Path(entry.path)
             relative = path.relative_to(source)
@@ -169,8 +187,8 @@ def _walk(source: Path) -> tuple[list[Path], list[Path]]:
                 elif entry.is_file(follow_symlinks=False):
                     files.append(relative)
             except OSError:
-                continue
-    return sorted(files), sorted(links)
+                unreadable.append(relative)
+    return sorted(files), sorted(links), sorted(unreadable)
 
 
 def user_script_files(install: Path) -> list[Path]:
@@ -345,19 +363,20 @@ def hold_move_lock(
         sleep(0.1)
 
 
-def clean_leftovers(install: Path, target: Path) -> None:
+def clean_leftovers(install: Path, target: Path) -> list[Path]:
     """落ちた起動（電源が切れた・移している途中で閉じた）が残した物を片付ける 錠を持って呼ぶ
 
     作業用のフォルダ・写しの途中の物（``.moving``）を捨て、よけたまま残った元を元の場所へ戻す
     （:func:`_recover_removed`） 自動更新は入れ替える前に呼ぶ 呼ばずに今の版のフォルダを
     ``.previous`` へ回すと、よけた元は戻らずに次の更新で消える（PR #245 の Codex の指摘）
+    よけたまま扱えなかった物を返す（作業用の写しは作り直せるので、捨て損ねても返さない）
     """
     for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
         _remove_tree(leftover)
     for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
         with contextlib.suppress(OSError):
-            remove_file(leftover)
-    _recover_removed(install, target)
+            remove_file(leftover)  # 捨て損ねても読まれない（スクリプトの拡張子ではない）
+    return _recover_removed(install, target)
 
 
 def move_user_scripts(
@@ -431,10 +450,16 @@ def mark_swap_pending(folder: Path, version: str, token: str) -> None:
     """引き継ぎを終えて入れ替え係を起こす前に置く ``version`` は入れ替える前の版
 
     ``token`` は :func:`new_swap_token` で作った、この引き継ぎの識別子 外すときに同じ物を渡す
+
+    **書けなければ OSError** 書けたかは読み戻して確かめる 黙って先へ進むと、印の無いまま
+    錠を放して入れ替え係を起こし、その隙に別の窓の移しと重なる（PR #245 の CodeRabbit の指摘）
     """
-    with contextlib.suppress(OSError):
-        folder.mkdir(parents=True, exist_ok=True)
-        _marker(folder, token).write_text(f"{version}\n{time.time()}", encoding="utf-8")
+    marker = _marker(folder, token)
+    folder.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{version}\n{time.time()}", encoding="utf-8")
+    read = _read_marker(marker)
+    if read is None or read[0] != version:
+        raise OSError(f"入れ替え係を待っている印を書けない: {marker.name}")
 
 
 def clear_swap_pending(folder: Path, token: str) -> None:
@@ -481,9 +506,15 @@ def _swapping() -> bool:
 
 def _move_all(install: Path, target: Path, should_stop: Callable[[], bool]) -> ScriptMove:
     source = install / PORTABLE_SCRIPTS_DIR
-    walked, links = _walk(source)
+    walked, links, unreadable = walk_all(source)
     files = [p for p in walked if not _bundled(p) and not p.name.endswith(_MOVING_SUFFIX)]
     stay, clashes = _plan(source, target, files, links)
+    # 読めなかった物を含む束は移さない 中の物を数えないまま移すと束が割れる
+    # 置き場そのもの（``.``）が読めなければ、どの束も移さない
+    if any(p == Path() for p in unreadable):
+        return ScriptMove(failed=((Path(), "exe の隣の scripts を読めない"),))
+    stay.update(bundles(unreadable))
+    files = [*files, *unreadable]
     moved: list[Path] = []
     kept: list[Path] = []
     held: list[Path] = []
@@ -586,27 +617,56 @@ def _remove_tree_if_empty(folder: Path) -> None:
     _remove_tree(folder)
 
 
-def _recover_removed(install: Path, target: Path) -> None:
-    """落ちた起動がよけたまま残した元を扱う 錠を持っているときだけ呼ぶ
+#: よけた元が、元の場所の新しい物とも移し先とも違ったときに取っておく所（``%APPDATA%\\Sashimono``
+#: の下 置き場の外なので読まれない） exe の隣のフォルダの中に残すと、自動更新で .previous へ回り、
+#: 次の更新で消える
+RECOVERED_DIR = "scripts-recovered"
+
+
+def _recover_removed(install: Path, target: Path) -> list[Path]:
+    """落ちた起動がよけたまま残した元を扱う 錠を持っているときだけ呼ぶ 扱えずに残った物を返す
 
     元の場所が空いていれば戻す（移し先に同じ中身があれば、次の移しで同じ中身と見て片付く）
-    元の場所に物があり、よけた物がそれか移し先と同じ中身なら捨てる 違えば残す（本人の物）
+    元の場所に物があり、よけた物がそれか移し先と同じ中身なら捨てる 違えば（本人が後から書き直した
+    物より前の中身） ``%APPDATA%\\Sashimono\\scripts-recovered`` へ取っておく
+    どれもできなかった物は返す 自動更新の引き継ぎは、これが空でなければ入れ替えを止める
+    （exe の隣のフォルダに残ったまま入れ替えると、.previous へ回って次の更新で消える）
     """
     source = install / PORTABLE_SCRIPTS_DIR
+    stuck: list[Path] = []
     for parking in install.glob(f"{_REMOVING_PREFIX}*"):
-        files, _links = _walk(parking)
+        files, links, unreadable = walk_all(parking)
+        stuck.extend(parking / p for p in (*links, *unreadable))
         for relative in files:
             parked = parking / relative
             back = source / relative
-            if not back.exists() and not is_link(back):
-                with contextlib.suppress(OSError):
+            try:
+                if not back.exists() and not is_link(back):
                     back.parent.mkdir(parents=True, exist_ok=True)
                     parked.rename(back)
-                continue
-            if _same(parked, back) or _same(parked, target / relative):
-                with contextlib.suppress(OSError):
+                elif _same(parked, back) or _same(parked, target / relative):
                     remove_file(parked)
+                else:
+                    kept = _free_name(target.parent / RECOVERED_DIR / relative)
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(parked, kept)
+                    if not _same(parked, kept):
+                        raise OSError("取っておく写しが元と違う")
+                    remove_file(parked)
+            except OSError:
+                stuck.append(parked)
         _remove_tree_if_empty(parking)
+    return stuck
+
+
+def _free_name(path: Path) -> Path:
+    """在る名前なら「名前 (2).拡張子」のように空いている名前にする"""
+    candidate = path
+    number = 2
+    while candidate.exists() or is_link(candidate):
+        candidate = path.with_name(f"{path.stem} ({number}){path.suffix}")
+        number += 1
+    return candidate
 
 
 def _take_back(source: Path, target: Path, placed: list[Path]) -> None:
