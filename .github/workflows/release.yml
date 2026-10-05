@@ -76,7 +76,50 @@ jobs:
             # 下書きで作る 署名と目録を上げてから、人が公開する
             pre=()
             if [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]]; then pre=(--prerelease); fi
+            # リリースノートの雛形 更新のしかた（自動と手で入れ替えるときの違い）を毎回同じ
+            # 言い方で載せる 手で入れ替えると exe の隣の scripts が消えることを、書き忘れない
+            # Python が前に公開した版から変わるなら、入れ直しの知らせを先頭に置く（読み飛ばされない所）
+            # 比べる目録の順は tools/release.py の previous_manifest_urls と同じ（ここは依存を入れない
+            # ジョブなので呼べない 揃っているかは tests/test_release_tool.py が見る）
+            # ベータは beta の目録を先に見て、無ければ正式版 正式版は固定の URL だけ
+            # どれも読めなければ（初めての公開）比べない
+            abi=$(unzip -p "$zip" 'Sashimono/build-info.json' | jq -r '.python_abi')
+            previous=("https://github.com/$GH_REPO/releases/latest/download/update.json")
+            if [ "${#pre[@]}" -gt 0 ]; then
+              previous=("https://github.com/$GH_REPO/releases/download/beta/update.json" "${previous[@]}")
+            fi
+            before=""
+            for url in "${previous[@]}"; do
+              before=$( (curl -fsSL "$url" | jq -r '.python_abi') 2>/dev/null || true)
+              if [ -n "$before" ] && [ "$before" != "null" ]; then break; fi
+              before=""
+            done
+            notes=$(mktemp)
+            {
+              if [ -n "$before" ] && [ "$before" != "$abi" ]; then
+                cat <<EOF
+          > [!WARNING]
+          > **この版では Python が変わります（$before → $abi）**
+          > 字幕起こし・AI 連携を入れている人は、更新した後に入れ直しが要ります 入れてある物は消えませんが、
+          > 入れ直すまでその機能は使えません 落とし直す量は入れた機能によって数百 MB から 2 GB を超え、回線によって
+          > 数分から 20 分ほど掛かります（入れる前の確認に、今入れてある大きさと時間の目安を出します）
+          > 締め切りの前は、更新を後にしてください
+
+          EOF
+              fi
+              cat <<'EOF'
+          <!-- 署名と目録はこれから上げる 公開する前に「変わった所」を書く 手順は docs/development.md の「リリースノート」 -->
+          ## 変わった所
+
+          -
+
+          ## 更新のしかた
+
+          - **自動更新**（〔ヘルプ〕→〔更新を確かめる…〕 起動したときにも確かめます） 設定・スクリプト・テンプレート・入れた字幕起こしや AI 連携はそのまま残ります `Sashimono.exe` の隣の `scripts` に置いた物も、新しい版へ写します
+          - **手で入れ替えるとき**（zip を落として展開し直す） `Sashimono.exe` の隣の `scripts` に自分で置いた物は、フォルダごと入れ替えると消えます 入れ替える前に、〔互換〕→〔スクリプトフォルダを開く〕で開く `%APPDATA%\Sashimono\scripts` へ移してください（〔互換〕→〔exe の隣のスクリプトを移す…〕がある版なら、それで移せます） zip を元のフォルダへ上書きで展開するだけなら消えません `%APPDATA%\Sashimono` と `%LOCALAPPDATA%\Sashimono` にある物（設定・テンプレート・エイリアス・退避・入れた実行環境）は、どちらの入れ替えでも消えません
+          EOF
+            } > "$notes"
             gh release create "$TAG" --draft --verify-tag --title "Sashimono Edit $TAG" \
-              --notes "署名と目録はこれから上げる" "${pre[@]}"
+              --notes-file "$notes" "${pre[@]}"
           fi
           gh release upload "$TAG" "$zip" --clobber

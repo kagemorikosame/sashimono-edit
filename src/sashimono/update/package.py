@@ -18,7 +18,10 @@ r"""新しい版の zip を落とし、確かめ、入れ替える前のフォ�
 
 from __future__ import annotations
 
+import contextlib
+import filecmp
 import json
+import os
 import shutil
 import stat
 import zipfile
@@ -26,14 +29,31 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from sashimono.core import userdirs
 from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
+from sashimono.update.portable import (
+    BUNDLED_SCRIPT_FILES,
+    PORTABLE_SCRIPTS_DIR,
+    bundles,
+    clean_leftovers,
+    hold_move_lock,
+    is_link,
+    mark_swap_pending,
+    module_stem,
+    modules_in,
+    remove_file,
+    script_links,
+    user_script_files,
+    walk_all,
+)
 
 __all__ = [
     "APP_EXE",
     "BUILD_INFO_NAME",
     "BuildInfo",
+    "CarryError",
     "Layout",
     "PackageError",
     "carry_user_files",
@@ -54,10 +74,8 @@ BUILD_INFO_NAME = "build-info.json"
 #: 展開した中身の大きさの上限 zip 爆弾で本人のディスクを埋めない
 _MAX_EXTRACTED_BYTES = 2 * MAX_PACKAGE_BYTES
 
-#: exe の隣にある、本人がスクリプトを置いてよいフォルダ（compat.aviutl.catalog の
-#: PORTABLE_SCRIPTS_DIR） ここは読み込みが重い（効果の一覧を作る）ので名前だけ写す
-#: 名前が食い違えば試験が落とす
-_PORTABLE_SCRIPTS_DIR = "scripts"
+#: exe の隣にある、本人がスクリプトを置いてよいフォルダ 名前は移す側（.portable）と 1 つにする
+_PORTABLE_SCRIPTS_DIR = PORTABLE_SCRIPTS_DIR
 
 
 class PackageError(Exception):
@@ -254,27 +272,415 @@ def stage(
     return layout.staged
 
 
-def carry_user_files(install: Path, staged: Path) -> int:
-    """今の版の exe の隣のスクリプト置き場に本人が置いた物を、新しい版へ写す 写した数を返す
+def _under(root: Path, path: Path) -> Path:
+    """``path`` を ``root`` からの相対にする ``root`` の外なら元のまま（場所を知らせから落とさない）
+
+    隠れた作業用のフォルダの中の物を名前だけで知らせると、利用者が探せない
+    """
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return path
+
+
+def carry_user_files(
+    install: Path,
+    destination: Path,
+    *,
+    overwrite: bool = False,
+    aside: Path | None = None,
+    config: Path | None = None,
+    swap_mark: tuple[str, str] | None = None,
+) -> int:
+    """今の版の exe の隣のスクリプト置き場に本人が置いた物を、入れ替え先の版へ写す 写した数を返す
 
     入れ替えはフォルダを丸ごと替えるので、写さないと前の版の案内どおりそこへ置いた
     スクリプトが 2 回目の入れ替えで消える（1 回目は ``previous`` に残るが、次で消える）
-    新しい版が同じ名前の物を持っていれば新しい方を残す（同梱の README など）
+    **本人の物は今の版の側が正** 同梱の物（``portable.BUNDLED_SCRIPT_FILES``）は写さない
+
+    - 前の版へ戻す（``overwrite``） 戻る先の ``previous`` には、更新する前に写した古い中身が
+      残っている 今の側で直した物を飛ばすと、直した中身が戻した版に入らず、次の自動更新で
+      ``.previous`` ごと消える 中身が違えば今の側で上書きする（古い中身は本人が直す前の物で、
+      直した側が正なので取っておかない）
+    - 新しい版を入れる（既定） 入れ替え先は展開したばかりの新しい版で、そこに在る物はすべて
+      新しい版の同梱物 同梱物は新しい版の物を残す
+
+    **束（:func:`.portable.bundles` 移す側と同じ単位）で振り分ける** スクリプトはモジュールを
+    自分のフォルダから先に探すので、束の一部だけを別の置き場へ写すと、残った側が同じフォルダの
+    別のモジュールを読み、更新しただけで描画が変わる（PR #245 の Codex の指摘）
+    新しい版を入れるとき、束の中に新しい版の同梱物とぶつかる物（同じ名前で中身が違う、または
+    モジュールの名前が同梱物と重なる）が 1 つでもあれば、束ごと ``aside``（``%APPDATA%`` の
+    ``scripts``）へ写す 読む順は ``%APPDATA%`` が後で勝つので、今まで使われていた本人の物が
+    使われ続ける ``aside`` にも同じ名前で中身の違う物があれば、どこへ写しても束が割れるか
+    本人の物が落ちるので、写さずに :class:`CarryError` にする（入れ替えを止め、手で片付けてもらう）
+
+    **1 つでも写せなければ :class:`CarryError`** 全部を試してから、写せなかった物を並べて上げる
+    呼んだ側は入れ替えを止める 写せないまま入れ替えると、本人の物は次の更新で消える版
+    （``previous`` か ``.new`` へよけた側）にだけ残る 止めるときは ``aside`` へ写した物を外す
+    （``%APPDATA%`` は今の版でも読まれるので、束の一部だけが残ると今の版の描画が変わる）
+    入れ替え先の版（``.new`` ``previous``）へ写した物はそのまま置く（今は読まれない）
+
+    **移す側と同じ錠（``portable.MOVE_LOCK``）を、計画から止めるときの巻き戻しまで持つ**
+    （``config`` は ``%APPDATA%\\Sashimono`` 既定は本人の置き場） 別の窓が移している最中に
+    写すと、巻き戻しで写しが外れて両方から失われる（PR #245 の Codex の指摘） 移しは束ごとに
+    短いので ``CARRY_LOCK_WAIT`` 秒まで待ち、取れなければ止める 錠を持ったら、落ちた起動が
+    よけたまま残した元を元の場所へ戻してから写す（戻さずに入れ替えると、今の版のフォルダごと
+    ``.previous`` へ回り、次の更新で消える）
+
+    ``swap_mark``（入れ替える前の版と、``portable.new_swap_token`` で作った識別子）を渡すと、
+    写し終えて錠を放す前に「入れ替え係を待っている」印（``portable.SWAP_PENDING``）を置く
+    この後に入れ替え係を起こす呼び手が渡し、起こせなければ同じ識別子で外す
     """
-    source = install / _PORTABLE_SCRIPTS_DIR
-    if not source.is_dir():
+    folder = config if config is not None else userdirs.config_root()
+    lock = hold_move_lock(folder, wait=CARRY_LOCK_WAIT)
+    if lock is None:
+        raise CarryError(
+            (
+                (
+                    Path(PORTABLE_SCRIPTS_DIR),
+                    "ほかの Sashimono の窓が exe の隣のスクリプトを移している",
+                ),
+            )
+        )
+    try:
+        stuck = clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
+        if stuck:
+            # よけたまま戻せない元がある このまま入れ替えると、今の版のフォルダごと .previous へ
+            # 回り、次の更新で消える 入れ替えを止めて知らせる 場所は install からの相対で出す
+            # 名前だけだと、隠れた作業用のフォルダのどこにあるかが分からず手で片付けられない
+            raise CarryError(
+                tuple(
+                    (
+                        _under(install, p),
+                        "よけたまま元の場所へ戻せない（前に移している途中で止まった）",
+                    )
+                    for p in stuck
+                )
+            )
+        placed_aside: list[Path]
+        linked: set[Path]
+        if is_link(install / _PORTABLE_SCRIPTS_DIR):
+            # exe の隣の scripts そのものがリンク 中身を辿って写さず（消しもしない）、同じ先を
+            # 指すリンクとして入れ替え先に作り直す（PR #245 の Codex の指摘）
+            copied, placed_aside, linked = _carry_linked_root(install, destination), [], set()
+        else:
+            copied, placed_aside, linked = _carry(
+                install, destination, overwrite=overwrite, aside=aside
+            )
+        if swap_mark is not None:
+            # 錠を放す前に「入れ替え係を待っている」印を置く 放してから入れ替え係が swap.lock を
+            # 取るまでの隙に、別の窓が移し始めないようにする（PR #245 の CodeRabbit の指摘）
+            # 書けなければ入れ替えを止める（印の無いまま錠を放さない） %APPDATA% へ写した物は
+            # 写せなかったときと同じく外す 入れ替え係を起こせなければ、呼んだ側が同じ識別子で外す
+            try:
+                mark_swap_pending(folder, *swap_mark)
+            except OSError as exc:
+                failed = [
+                    (Path(PORTABLE_SCRIPTS_DIR), f"入れ替え係を待っている印を書けない（{exc}）")
+                ]
+                failed += _take_back_aside(install, aside, placed_aside, linked)
+                raise CarryError(tuple(failed)) from exc
+        return copied
+    finally:
+        lock.release()
+
+
+#: 引き継ぐ前に、移している別の窓が錠を放すのを待つ長さ（秒） 移しは束 1 つずつ錠を
+#: 持ち直さないので、全部を移し終えるまで待つことになる 長く待たせるより止めて知らせる
+CARRY_LOCK_WAIT = 10.0
+
+
+def _carry_linked_root(install: Path, destination: Path) -> int:
+    """exe の隣の scripts そのものがリンクのとき 入れ替え先の scripts を同じ先を指すリンクにする
+
+    入れ替え先の scripts は、新しい版（か戻る先の版）の同梱物だけを持つ本当のフォルダか、前に
+    作り直したリンク 同梱物だけなら外してリンクにする（同梱の説明はリンクの先に要らない）
+    本人の物が入った本当のフォルダは外さない（前の版へ戻すとき、更新の前に写した物が入っている
+    ことがある） そのときは止める 前に作ったリンクなら、同じ先ならそのまま、違えば付け直す
+    """
+    origin = install / _PORTABLE_SCRIPTS_DIR
+    target = destination / _PORTABLE_SCRIPTS_DIR
+    if _same_link(origin, target):
         return 0
+    if not is_link(target) and target.is_dir():
+        files, links, unreadable = walk_all(target)
+        bundled_names = {name.casefold() for name in BUNDLED_SCRIPT_FILES}
+        theirs = [p for p in files if len(p.parts) > 1 or p.name.casefold() not in bundled_names]
+        if theirs or links or unreadable:
+            raise CarryError(
+                (
+                    (
+                        Path(_PORTABLE_SCRIPTS_DIR),
+                        "exe の隣の scripts はリンクだが、入れ替え先の scripts に本人の物がある",
+                    ),
+                ),
+                links=(Path(_PORTABLE_SCRIPTS_DIR),),
+            )
+        _remove_tree_strict(target)
+    problem = _carry_link(origin, target, overwrite=True)
+    if problem is not None:
+        raise CarryError(
+            ((Path(_PORTABLE_SCRIPTS_DIR), problem),), links=(Path(_PORTABLE_SCRIPTS_DIR),)
+        )
+    return 1
+
+
+def _remove_tree_strict(folder: Path) -> None:
+    """同梱物だけのフォルダを消す リンクの先は辿らない（walk_all で確かめた後に呼ぶ）"""
+    for relative in walk_all(folder)[0]:
+        remove_file(folder / relative)
+    for path in sorted(folder.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        path.rmdir()
+    folder.rmdir()
+
+
+def _carry(
+    install: Path, destination: Path, *, overwrite: bool, aside: Path | None
+) -> tuple[int, list[Path], set[Path]]:
+    """写す ``(写した数, %APPDATA% へ置いた物, リンク)`` 1 つでも写せなければ CarryError"""
+    source = install / _PORTABLE_SCRIPTS_DIR
+    root = destination / _PORTABLE_SCRIPTS_DIR
+    files = user_script_files(install)
+    links = script_links(install)
+    linked = set(links)
+    # 新しい版が同梱しているモジュール（名前で探されるので、場所が違っても重なる）
+    bundled = {} if overwrite else modules_in(root)
     copied = 0
-    for path in sorted(source.rglob("*")):
-        if not path.is_file():
-            continue
-        destination = staged / _PORTABLE_SCRIPTS_DIR / path.relative_to(source)
-        if destination.exists():
-            continue
+    # 読めなかった物（フォルダ・ファイル）は写せない 黙って飛ばすと新しい版に入らず、
+    # 今の版のフォルダが .previous へ回った後の次の更新で消える 入れ替えを止める
+    failed: list[tuple[Path, str]] = [
+        (p, "読めない（権限・ほかのプログラムが掴んでいる）") for p in walk_all(source)[2]
+    ]
+    placed_aside: list[Path] = []
+    for members in bundles([*files, *links]).values():
+        where = root
+        if not overwrite and _clashes(source, root, members, linked, bundled):
+            if aside is None:
+                failed.extend((p, "新しい版の同梱物と同じ名前の物がある") for p in members)
+                continue
+            if any(_differs(source / p, aside / p, p in linked) for p in members):
+                failed.extend(
+                    (p, "新しい版の同梱物と %APPDATA% の両方に、同じ名前の別の物がある")
+                    for p in members
+                )
+                continue
+            where = aside
+        for relative in members:
+            target = where / relative
+            present = target.exists() or is_link(target)
+            if present and not _differs(source / relative, target, relative in linked):
+                continue  # 同じ物が在る
+            if relative in linked:
+                problem = _carry_link(source / relative, target, overwrite=overwrite)
+            else:
+                # %APPDATA% へは置き換えない 確かめた後に本人やほかの窓が同じ名前を置いていれば、
+                # そちらを残して止める（%APPDATA% は今の版でも読まれる）
+                problem = _copy_over(source / relative, target, replace=where is not aside)
+            if problem is None:
+                copied += 1
+                if where is aside:
+                    placed_aside.append(relative)
+            else:
+                failed.append((relative, problem))
+    if failed:
+        failed += _take_back_aside(install, aside, placed_aside, linked)
+        raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in linked))
+    return copied, placed_aside, linked
+
+
+def _take_back_aside(
+    install: Path, aside: Path | None, placed: list[Path], linked: set[Path]
+) -> list[tuple[Path, str]]:
+    """止めるときに ``%APPDATA%`` へ置いた写しを外す 外せなかった物を返す（知らせに足す）
+
+    外すのは自分が置いた写しで、元が exe の隣に同じ中身で残っているときだけ（移す側の巻き戻しと
+    同じ） 元が無ければ誰かがこの写しを当てにした 外すと両方から失われる 外せなかった物を
+    黙って残すと、%APPDATA% は今の版でも読まれるので、束の一部だけが読まれて描画が変わる
+    """
+    if aside is None:
+        return []
+    source = install / _PORTABLE_SCRIPTS_DIR
+    left: list[tuple[Path, str]] = []
+    for relative in placed:
+        target = aside / relative
+        origin = source / relative
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-        except OSError:
-            continue  # 1 つ写せなくても入れ替えは止めない 元は previous に残る
-        copied += 1
-    return copied
+            if relative in linked:
+                if _same_link(origin, target):
+                    _remove_link(target)
+            elif origin.is_file() and _same_file(origin, target):
+                remove_file(target)
+        except OSError as exc:
+            left.append((relative, f"%APPDATA% へ写した物を外せない（{exc}） 手で消してください"))
+    return left
+
+
+def _differs(origin: Path, target: Path, link: bool) -> bool:
+    """入れ替え先に、同じ名前の別の物が在るか 無ければ偽（写せばよい）"""
+    if not target.exists() and not is_link(target):
+        return False
+    if link:
+        return not _same_link(origin, target)
+    return is_link(target) or not _same_file(origin, target)
+
+
+def _clashes(
+    source: Path,
+    root: Path,
+    members: list[Path],
+    linked: set[Path],
+    bundled: dict[str, list[Path]],
+) -> bool:
+    """束が新しい版の同梱物とぶつかるか 同じ名前で中身が違う物か、名前の重なるモジュールがある"""
+    for relative in members:
+        if _differs(source / relative, root / relative, relative in linked):
+            return True
+        stem = module_stem(relative)
+        for other in bundled.get(stem, []) if stem is not None else []:
+            if other.as_posix().casefold() != relative.as_posix().casefold():
+                return True
+    return False
+
+
+def _same_link(origin: Path, target: Path) -> bool:
+    """両方がリンクで、同じ先を指しているか"""
+    if not is_link(target):
+        return False
+    try:
+        return origin.readlink() == target.readlink()
+    except OSError:
+        return False
+
+
+def _remove_link(path: Path) -> None:
+    """リンクそのものだけを外す 先は辿らない（先の中身は消えない）
+
+    外す前に本当にリンクかを確かめる 普通のフォルダを rmdir やファイルの unlink で消すと、
+    本人の物を消すことになる ジャンクションとフォルダを指すシンボリックリンクは rmdir、
+    ファイルを指すシンボリックリンクは unlink で外す どちらもリンクの先には触らない
+    """
+    if not is_link(path):
+        raise OSError(f"リンクではないので外さない: {path.name}")
+    if path.is_junction() or path.is_dir():
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _carry_link(origin: Path, target: Path, *, overwrite: bool = False) -> str | None:
+    """リンクを入れ替え先に作り直す 作ったら ``None``、作れなければ理由
+
+    ``overwrite``（前の版へ戻す）では、入れ替え先に別の先を指すリンクがあれば、リンクそのもの
+    だけを外して今の版の先へ付け直す（今の版の側が正 本人がジャンクションを付け替えた）
+    リンクではない物（本当のフォルダやファイル）は外さない 本人の物かもしれない
+    """
+    try:
+        pointed = origin.readlink()
+    except OSError as exc:
+        return str(exc) or type(exc).__name__
+    if is_link(target):
+        if not overwrite:
+            return "入れ替え先に同じ名前の別のリンクがある"
+        try:
+            _remove_link(target)
+        except OSError as exc:
+            return str(exc) or type(exc).__name__
+    elif target.exists():
+        return "入れ替え先に同じ名前の、リンクではない物がある"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if origin.is_junction():
+            # ジャンクションは本人の権限で作れる（シンボリックリンクは開発者モードか管理者が要る）
+            import _winapi  # type: ignore[import-not-found,unused-ignore]
+
+            text = str(pointed)
+            _winapi.CreateJunction(text.removeprefix("\\\\?\\"), str(target))
+        else:
+            target.symlink_to(pointed, target_is_directory=origin.is_dir())
+    except (OSError, ImportError) as exc:
+        return str(exc) or type(exc).__name__
+    return None
+
+
+class CarryError(Exception):
+    """exe の隣の本人の物を、入れ替え先の版（か ``%APPDATA%``）へ写せなかった 入れ替えは止める"""
+
+    def __init__(
+        self, failed: tuple[tuple[Path, str], ...], *, links: tuple[Path, ...] = ()
+    ) -> None:
+        self.failed = failed
+        #: 写せなかった物のうちリンク（シンボリックリンク・ジャンクション） 直し方が違う
+        self.links = links
+        first, reason = failed[0]
+        super().__init__(
+            f"exe の隣の scripts の {len(failed)} 個を写せなかった（{first.as_posix()}: {reason}）"
+        )
+
+    def explain(self) -> str:
+        """本人に見せる文 止めたこと・今の版のまま動くこと・どうすれば入れられるか"""
+        lines = [
+            f"Sashimono.exe の隣の scripts に置いた物のうち {len(self.failed)} 個を"
+            "写せなかったので、入れ替えを止めました 今の版のまま動きます",
+        ]
+        lines.extend(f"  {path.as_posix()}（{reason}）" for path, reason in self.failed[:10])
+        if len(self.failed) > 10:
+            lines.append(f"  ほか {len(self.failed) - 10} 個")
+        if len(self.links) < len(self.failed):
+            lines.append(
+                "ディスクの空きと書き込みの権限を確かめるか、"
+                "〔互換〕→〔exe の隣のスクリプトを移す…〕で %APPDATA% へ移してから、"
+                "〔ヘルプ〕→〔更新を確かめる…〕で入れ直してください"
+            )
+        if self.links:
+            # リンクを含む束は自動では移さないので、「移してから」では片付かない 本人が外せる
+            # 手順を出す リンクを消しても先の中身は消えない
+            lines.append(
+                "リンク（ジャンクション・シンボリックリンク）は入れ替え先で作り直せませんでした"
+                " exe の隣の scripts でそのリンクを消し（エクスプローラで消しても、リンクの先の"
+                "中身は消えません）、入れ替えた後に作り直してください"
+                " または、リンクの先の物を〔互換〕→〔スクリプトフォルダを開く〕で開く所へ写して、"
+                "リンクを消してください"
+            )
+        return "\n".join(lines)
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return filecmp.cmp(first, second, shallow=False)
+    except OSError:
+        return False
+
+
+def _copy_over(origin: Path, target: Path, *, replace: bool = True) -> str | None:
+    """作業用の名前へ写してから置き換える 写せなければ理由を返す
+
+    途中で止まっても、半分の中身が本来の名前で残らない 作業用の写しは片付ける
+    ``replace`` が偽なら置き換えない（在る名前へは付けない Windows の rename は断る）
+    """
+    # 印は移す側（.portable）と同じ ``.moving`` 残っても本人の物と数えず、スクリプトとしても読まない
+    writing = target.with_name(f"{target.name}.{os.getpid()}.moving")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, writing)
+        # 写した物を照らしてから本来の名前を付ける 写している間に書き換わった・欠けた写しを
+        # 入れ替え先へ置かない
+        if not _same_file(origin, writing):
+            raise OSError("写した中身が元と違う（写している間に書き換わった）")
+        if not replace:
+            if target.exists() or is_link(target):
+                raise FileExistsError("写す先に同じ名前の物が置かれた")
+            writing.rename(target)
+            return None
+        try:
+            writing.replace(target)
+        except PermissionError:
+            # 置き換える先に読み取り専用の印が付いていると、Windows は置き換えさせない
+            if not target.exists() or target.stat().st_mode & stat.S_IWRITE:
+                raise
+            target.chmod(target.stat().st_mode | stat.S_IWRITE)
+            writing.replace(target)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            remove_file(writing)
+        return str(exc) or type(exc).__name__
+    return None

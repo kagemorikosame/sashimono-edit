@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import zipfile
@@ -69,12 +70,12 @@ def tool() -> ModuleType:
     return module
 
 
-def _zip_bytes(version: str = VERSION) -> bytes:
+def _zip_bytes(version: str = VERSION, abi: str = "cp314") -> bytes:
     path_like = io.BytesIO()
     with zipfile.ZipFile(path_like, "w") as archive:
         archive.writestr("Sashimono/Sashimono.exe", b"MZ")
         archive.writestr(
-            "Sashimono/build-info.json", json.dumps({"version": version, "python_abi": "cp314"})
+            "Sashimono/build-info.json", json.dumps({"version": version, "python_abi": abi})
         )
         archive.writestr("Sashimono/_internal/PySide6/Qt6Core.dll", b"dll")
     return path_like.getvalue()
@@ -347,7 +348,9 @@ class TestTheWholeRun:
         assert len(world.secrets) == 1
         assert "TRUSTED_PUBLIC_KEYS の 1 本目" in out
         assert "資産      7 個" in out
-        assert world.fetched == [tool.STABLE_MANIFEST_URL]
+        # 1 回目は公開の前に、前の版から Python が変わるかを見る 2 回目は公開した後の確かめ
+        assert world.fetched == [tool.STABLE_MANIFEST_URL, tool.STABLE_MANIFEST_URL]
+        assert "Python が変わる" not in out
         # 合言葉は画面に出さない
         assert PASSPHRASE not in out
 
@@ -828,7 +831,128 @@ class TestTheCheckAndSignature:
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
         assert world.published
-        assert len(world.fetched) == tool.LATEST_TRIES
+        # 公開の前に前の版を 1 回読み、公開した後は決めた回数だけ見直す
+        assert len(world.fetched) == 1 + tool.LATEST_TRIES
+
+
+class TestAPythonChange:
+    """前に公開した版から Python が変わる版は、公開を尋ねる前に目立つ注意を出す
+
+    変わる版では字幕起こしと AI 連携を入れた人が全員入れ直しになる 道具はリリースノートを
+    書かないので、先頭に書いたかを人に確かめさせる 出さないと、知らせずに配ってしまう
+    """
+
+    def _published_before(self, tool: ModuleType, world: World, tmp_path: Path, abi: str) -> None:
+        """固定の URL が、``abi`` で組んだ 1.0.0 の目録を返す形にする"""
+        old = tmp_path / "old"
+        old.mkdir()
+        archive = old / "SashimonoEdit-1.0.0-windows-x64.zip"
+        archive.write_bytes(_zip_bytes("1.0.0", abi=abi))
+        world.latest = tool.update_sign.build_manifest(archive)
+
+    def test_a_changed_python_is_warned_before_the_question(
+        self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._published_before(tool, world, tmp_path, "cp313")
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        out = capsys.readouterr().out
+        assert "[注意] Python が変わる cp313（1.0.0）→ cp314（1.2.3）" in out
+        assert "リリースノートの先頭" in out
+        assert not world.published
+
+    def test_the_same_python_says_nothing(
+        self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._published_before(tool, world, tmp_path, "cp314")
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert "Python が変わる" not in capsys.readouterr().out
+
+    def test_an_unreadable_previous_release_is_said(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """初めての公開などで前の目録が読めないときも黙らない 変わる版を確かめずに出さない"""
+
+        def unreachable(url: str) -> bytes:
+            world.fetched.append(url)
+            raise OSError("404")
+
+        world.fetch = unreachable  # type: ignore[method-assign]
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        out = capsys.readouterr().out
+        assert "Python が変わるかを確かめられない" in out
+        assert not world.published
+
+    def _manifest(self, tool: ModuleType, folder: Path, version: str, abi: str) -> bytes:
+        folder.mkdir(parents=True, exist_ok=True)
+        archive = folder / f"SashimonoEdit-{version}-windows-x64.zip"
+        archive.write_bytes(_zip_bytes(version, abi=abi))
+        data: bytes = tool.update_sign.build_manifest(archive)
+        return data
+
+    @pytest.mark.parametrize(
+        ("beta_abi", "expected"),
+        [("cp315", ""), ("cp314", "cp314（1.3.0b1）→ cp315（1.3.0b2）"), (None, "cp313（1.2.3）")],
+    )
+    def test_a_beta_compares_with_the_beta_first(
+        self, tool: ModuleType, tmp_path: Path, beta_abi: str | None, expected: str
+    ) -> None:
+        """ベータを受け取る人が持っているのは beta の版 正式版と比べると、ベータで既に上げた
+        Python を毎回「変わる」と言い、ベータで初めて上げる時は黙る beta が無ければ正式版と比べる
+        """
+        pages = {tool.STABLE_MANIFEST_URL: self._manifest(tool, tmp_path / "s", "1.2.3", "cp313")}
+        if beta_abi is not None:
+            pages[tool.BETA_MANIFEST_URL] = self._manifest(
+                tool, tmp_path / "b", "1.3.0b1", beta_abi
+            )
+        asked: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            asked.append(url)
+            if url not in pages:
+                raise OSError("404")
+            return pages[url]
+
+        mine = tmp_path / "mine" / "update.json"
+        mine.parent.mkdir()
+        mine.write_bytes(self._manifest(tool, tmp_path / "m", "1.3.0b2", "cp315"))
+        release = tool.Release(version="1.3.0b2", fetch=fetch, manifest=mine)
+        text = release.python_change()
+        assert asked[0] == tool.BETA_MANIFEST_URL
+        if expected:
+            assert expected in text
+        else:
+            assert text == ""
+
+    def test_a_release_compares_only_with_the_stable_one(self, tool: ModuleType) -> None:
+        assert tool.previous_manifest_urls(False) == (tool.STABLE_MANIFEST_URL,)
+        assert tool.previous_manifest_urls(True) == (
+            tool.BETA_MANIFEST_URL,
+            tool.STABLE_MANIFEST_URL,
+        )
+
+    def test_the_draft_notes_use_the_same_order(self, tool: ModuleType) -> None:
+        """下書きの本文（release.yml）は依存を入れないジョブで作るので、この道具を呼べない
+        比べる目録の順が食い違うと、道具は黙るのに本文には注意が出る（またはその逆）
+        """
+        from sashimono.links import REPOSITORY_URL
+
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        base = r'"https://github\.com/\$GH_REPO/([^"]+)"'
+        stable = re.search(rf"previous=\({base}\)", workflow)
+        beta = re.search(rf'previous=\({base} "\$\{{previous\[@\]\}}"\)', workflow)
+        assert stable is not None and beta is not None
+        # ベータのときだけ前へ足す
+        guard = workflow.rfind('if [ "${#pre[@]}" -gt 0 ]; then', 0, beta.start())
+        assert guard >= 0 and stable.end() < guard
+        in_workflow_beta = (
+            f"{REPOSITORY_URL}/{beta.group(1)}",
+            f"{REPOSITORY_URL}/{stable.group(1)}",
+        )
+        assert tool.previous_manifest_urls(True) == in_workflow_beta
+        assert tool.previous_manifest_urls(False) == (f"{REPOSITORY_URL}/{stable.group(1)}",)
 
 
 class TestReusedManifestsFollowTheArguments:

@@ -70,6 +70,128 @@ class TestApplyingOnStart:
         # 印は入れ替え係を起こす前に下ろす 失敗し続ける機械で、起動のたびに試さない
         assert not store.load().apply_on_start
 
+    def test_files_that_cannot_be_carried_stop_the_swap(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """exe の隣の本人の物を新しい版へ写せなければ入れ替えない（PR #245 の CodeRabbit の指摘）
+
+        写せないまま入れ替えると、本人の物は次の更新で消える .previous にだけ残る
+        """
+        _stage(layout, "1.2.0")
+        mine = layout.install / "scripts" / "自分の" / "効果.anm2"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("--track", encoding="utf-8")
+        # 写す先にフォルダを作れない（同じ名前のファイルが塞いでいる）
+        (layout.staged / "scripts").mkdir()
+        (layout.staged / "scripts" / "自分の").write_text("塞ぐ", encoding="utf-8")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        assert not apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert plans == []
+        state = store.load()
+        assert state.auto_blocked == "1.2.0" and not state.apply_on_start
+        assert "自分の/効果.anm2" in state.pending_notice and "止めました" in state.pending_notice
+        # 落として確かめた新しい版は残す 今の版はそのまま動く
+        assert layout.staged_version() == "1.2.0"
+        assert mine.is_file() and (layout.install / APP_EXE).is_file()
+
+    def test_parked_originals_return_before_the_swap(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """移している途中で閉じて元をよけたまま残っても、起動の頭の入れ替えの前に元の場所へ
+        戻して新しい版へ写す（PR #245 の Codex の指摘 戻さずに入れ替えると .previous へ
+        回って消える）
+        """
+        _stage(layout, "1.2.0")
+        parked = layout.install / ".scripts-removing-4242" / "自分の" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("--track", encoding="utf-8")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert plans
+        assert (layout.install / "scripts" / "自分の" / "効果.anm2").is_file()
+        assert (layout.staged / "scripts" / "自分の" / "効果.anm2").is_file()
+
+    def test_a_marker_that_cannot_be_written_starts_no_swapper(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """印を書けなければ入れ替え係を起こさない（PR #245 の CodeRabbit の指摘）"""
+        from sashimono.update import package as package_module
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+
+        def unwritable(*_args: object) -> None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(package_module, "mark_swap_pending", unwritable)
+        assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
+        assert "印を書けない" in store.load().pending_notice
+
+    def test_the_swap_pending_marker_follows_the_swapper(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """引き継ぎは錠を放す前に「入れ替え係を待っている」印を置く（移しがその隙に始まらない）
+        入れ替え係を起こせなければ外す
+        """
+        from sashimono.core import userdirs
+        from sashimono.update.portable import swap_pending
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        seen: list[bool] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            seen.append(swap_pending(userdirs.config_root()))
+            return True
+
+        assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert seen == [True] and swap_pending(userdirs.config_root())
+
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+
+        def cannot_start(plan: SwapPlan) -> bool:
+            return False  # 台本の実行が止められている など
+
+        assert not apply_on_start(
+            ["x"], layout=layout, store=store, swap=cannot_start, current="1.1.0"
+        )
+        # 起こせなかった 2 回目は自分の印だけを外す 1 回目（起こせた）の印は残る
+        markers = list(userdirs.config_root().glob("scripts-move.swap-pending.*"))
+        assert len(markers) == 1
+        markers[0].unlink()
+        assert not swap_pending(userdirs.config_root())
+
+    def test_a_move_in_another_window_stops_the_swap(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """別の窓が移している（錠を持っている）間は、起動の頭でも入れ替えない 次の起動で試す"""
+        from sashimono.core import userdirs
+        from sashimono.update import package as package_module
+        from sashimono.update.portable import MOVE_LOCK
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        monkeypatch.setattr(package_module, "CARRY_LOCK_WAIT", 0.2)
+        held = try_hold(userdirs.config_root() / MOVE_LOCK)
+        assert held is not None
+        try:
+            assert not apply_on_start(["x"], layout=layout, store=store, swap=_never)
+        finally:
+            held.release()
+        assert "移している" in store.load().pending_notice
+
     def test_turning_checks_off_cancels_the_reservation(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:

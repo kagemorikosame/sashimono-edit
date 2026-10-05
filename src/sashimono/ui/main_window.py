@@ -553,6 +553,7 @@ class MainWindow(QMainWindow):
             arguments=self._reopen_arguments,
             confirm_close=self._confirm_discard,
             close_window=self._close_for_update,
+            rescan_scripts=self.rescan_scripts,
         )
         self.statusBar().addPermanentWidget(self._updates.button)
 
@@ -704,6 +705,12 @@ class MainWindow(QMainWindow):
         compat_menu.addSeparator()
         self._add(compat_menu, "スクリプトを読み直す", QKeySequence(), self.rescan_scripts)
         self._add(compat_menu, "スクリプトフォルダを開く", QKeySequence(), self.open_script_folder)
+        self._add(
+            compat_menu,
+            "exe の隣のスクリプトを移す…",
+            QKeySequence(),
+            lambda: self._updates.offer_script_move(manual=True),
+        )
         self._add(compat_menu, "互換性レポート…", QKeySequence(), self.show_compatibility)
 
         ai_menu = self._menu("AI")
@@ -2470,7 +2477,9 @@ class MainWindow(QMainWindow):
         return self._updates
 
     def start_updates(self) -> None:
-        """前の入れ替えの結果を知らせ、頃合いなら裏で新しい版を確かめる 起動の後に 1 度呼ぶ"""
+        """前の入れ替えの結果を知らせ、exe の隣のスクリプトを移すかを尋ね、頃合いなら裏で
+        新しい版を確かめる 起動の後に 1 度呼ぶ
+        """
         self._updates.start()
 
     def update_blockers(self) -> list[str]:
@@ -2706,6 +2715,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        # exe の隣のスクリプトを裏で移していれば、今の束を終えるまで待つ（束の途中で止めない）
+        self._updates.shutdown()
         # 並びを保存できなくても終了は止めない 次の起動が既定の並びになるだけ
         with contextlib.suppress(OSError):
             self._workspace.save(self)
