@@ -1923,6 +1923,25 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   **ネットにつなぐ** 落とした物は pip の控えに残り、2 回目からはほとんど落とさない
   つながらないと落ちる 開発の .venv から読ませる確かめは、pip の `--target` と並びが違い、
   0.1.0 の不具合を手元で見落としたのでやめた
+- **PyInstaller の起動部（bootloader）は組み直した物を使う** PyPI の wheel に入った既成の
+  起動部は多くのマルウェアと同じ物で、Windows Defender の機械学習の推測に引っ掛かりやすい
+  0.1.1 の zip は展開しただけで `Trojan:Win32/Bearfoos.A!ml` として exe ごと消された
+  CI（package.yml）は依存を入れる 1 回の導入で PyInstaller だけを sdist から入れ
+  （`--no-binary pyinstaller` と `PYINSTALLER_COMPILE_BOOTLOADER=1` MSVC で組む）、
+  `tools/check_bootloader.py` で同じ版の既成の wheel とハッシュを比べ、1 つでも同じなら止める
+  比べた結果は Actions の要約に残る 配る zip は CI で組んだ物なので、ここが守り
+  手元で組むときも同じにする MSVC（Visual Studio Build Tools の「C++ によるデスクトップ開発」）が
+  要る 無ければ入れてから
+
+  ```
+  $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+  uv pip install --python .venv\Scripts\python.exe --reinstall-package pyinstaller --no-binary pyinstaller "pyinstaller==<THIRD_PARTY_NOTICES.md の版>"
+  .venv\Scripts\python.exe tools\check_bootloader.py
+  ```
+
+  起動部の中身が毎回少しずつ違っても構わない（既成の物と同じでなければよい）
+  検出されたかは `"%ProgramFiles%\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File <展開した Sashimono.exe> -DisableRemediation`
+  で見る（読むだけ 設定も除外も変えない）
 
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での
 確認は、開発機ではできない **CI のまっさらな Windows で zip だけを持って確かめる**（Issue #33）

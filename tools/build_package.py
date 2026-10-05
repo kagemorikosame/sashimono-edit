@@ -23,6 +23,10 @@ r"""配る zip を作る
 Windows 側の部品は開発機に入っている） CI のまっさらな Windows で、zip だけを持って
 確かめる（.github/workflows/package.yml と tools/check_clean_machine.ps1 Issue #33）
 CI には GPU が無いので、GL で描く確かめはここ（開発機）で行う
+
+PyInstaller の起動部は、既成の物のままだと Windows Defender に exe ごと消される（0.1.1）
+手元で組むときも sdist から組み直して入れ、``tools\check_bootloader.py`` で確かめてから走らせる
+（手順は docs/development.md の「配る zip を作る」）
 """
 
 from __future__ import annotations

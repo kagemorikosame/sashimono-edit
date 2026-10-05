@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a", encoding="utf-8") as stream:
+        with Path(summary).open("a", encoding="utf-8") as stream:
             stream.write(text)
 
     problems = compare(installed, stock)
