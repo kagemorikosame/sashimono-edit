@@ -123,6 +123,36 @@ class TestApplyingOnStart:
         assert (layout.install / "scripts" / "自分の" / "効果.anm2").is_file()
         assert (layout.staged / "scripts" / "自分の" / "効果.anm2").is_file()
 
+    def test_the_swap_pending_marker_follows_the_swapper(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """引き継ぎは錠を放す前に「入れ替え係を待っている」印を置く（移しがその隙に始まらない）
+        入れ替え係を起こせなければ外す
+        """
+        from sashimono.core import userdirs
+        from sashimono.update.portable import swap_pending
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        seen: list[bool] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            seen.append(swap_pending(userdirs.config_root()))
+            return True
+
+        assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert seen == [True] and swap_pending(userdirs.config_root())
+
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+
+        def cannot_start(plan: SwapPlan) -> bool:
+            return False  # 台本の実行が止められている など
+
+        assert not apply_on_start(
+            ["x"], layout=layout, store=store, swap=cannot_start, current="1.1.0"
+        )
+        assert not swap_pending(userdirs.config_root())
+
     def test_a_move_in_another_window_stops_the_swap(
         self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:

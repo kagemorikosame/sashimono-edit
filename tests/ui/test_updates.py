@@ -861,6 +861,33 @@ class TestScriptsBesideTheExe:
             controller.deleteLater()
             qt_application.processEvents()
 
+    def test_a_swapper_that_cannot_start_clears_the_marker(self, harness: _Harness) -> None:
+        """画面から入れ替えるとき、入れ替え係を起こせなければ「入れ替え係を待っている」印を外す
+        （残すと移しが印の切れるまで止まる） 起こせたら残す（入れ替え係が swap.lock を取るまでの隙）
+        """
+        from sashimono.core import userdirs
+        from sashimono.update.portable import swap_pending
+
+        harness.controller.start()
+
+        def refuse(plan: SwapPlan) -> Launched:
+            raise OSError("台本の実行が止められている")
+
+        harness.controller._launcher = refuse
+        assert not harness.controller.restart_now()
+        assert not swap_pending(userdirs.config_root())
+
+    def test_the_marker_is_cleared_once_the_version_changed(self, harness: _Harness) -> None:
+        from sashimono.core import userdirs
+        from sashimono.update.portable import mark_swap_pending, swap_pending
+
+        mark_swap_pending(userdirs.config_root(), __version__)
+        harness.controller.start()
+        assert swap_pending(userdirs.config_root())  # まだ入れ替えていない
+        mark_swap_pending(userdirs.config_root(), "0.0.1")
+        harness.controller.start()
+        assert not swap_pending(userdirs.config_root())  # 入れ替えが済んだ
+
     def test_no_move_while_the_swapper_runs(self, harness: _Harness) -> None:
         """入れ替え係が今の版のフォルダを付け替えている間は移さない（swap.lock）"""
         mine = _put_script(harness.layout.install, "自分の/効果.anm2")

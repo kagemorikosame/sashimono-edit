@@ -730,6 +730,61 @@ class TestEdgeCases:
         assert second.is_file() and not (target / "b").exists()
         assert not list(install.glob(".scripts-removing-*"))
 
+    def test_no_move_while_a_swap_is_pending(self, install: Path, target: Path) -> None:
+        """引き継ぎが錠を放してから入れ替え係が swap.lock を取るまでの隙に移さない
+        （PR #245 の CodeRabbit の指摘 よけた元が今の版のフォルダごと .previous へ回って失われる）
+        印が古くなれば（入れ替えに失敗して残った）また移す
+        """
+        mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        portable_module.mark_swap_pending(target.parent, "0.1.0")
+        assert move_user_scripts(install, target).busy
+        assert mine.is_file()
+        marker = target.parent / portable_module.SWAP_PENDING
+        marker.write_text("0.1.0\n0", encoding="utf-8")  # 古い印
+        assert move_user_scripts(install, target).moved == (Path("配布物/効果.anm2"),)
+
+    def test_no_move_while_the_swapper_holds_its_lock(self, install: Path, target: Path) -> None:
+        """移しの錠を取った後にもう 1 度、入れ替え係が走っていないかを見る"""
+        from sashimono.core.io.locks import try_hold
+        from sashimono.update.state import SWAP_LOCK, lock_path
+
+        mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        held = try_hold(lock_path(SWAP_LOCK))
+        assert held is not None
+        try:
+            assert move_user_scripts(install, target).busy
+        finally:
+            held.release()
+        assert mine.is_file()
+
+    def test_the_marker_is_kept_until_the_version_changes(self, target: Path) -> None:
+        """印は入れ替えが済んだ（今の版が印の版と違う）ときに外す 同じ版ならまだ入れ替えていない"""
+        folder = target.parent
+        portable_module.mark_swap_pending(folder, "0.1.0")
+        portable_module.clear_swap_pending(folder, unless_version="0.1.0")
+        assert portable_module.swap_pending(folder)
+        portable_module.clear_swap_pending(folder, unless_version="0.1.1")
+        assert not portable_module.swap_pending(folder)
+
+    def test_a_folder_swapped_away_stops_before_the_next_bundle(
+        self, install: Path, target: Path, tmp_path: Path
+    ) -> None:
+        """今の版のフォルダが付け替えられたら（入れ替え係が先に動いた）、次の束には入らない"""
+        _put(install, "a/効果.anm2", "obj.ox = 1\n")
+        _put(install, "b/効果.anm2", "obj.ox = 2\n")
+        moved_away = tmp_path / "Programs" / "Sashimono.previous"
+        asked: list[bool] = []
+
+        def swap_after_the_first() -> bool:
+            asked.append(True)
+            if len(asked) == 2:
+                install.rename(moved_away)
+            return False
+
+        result = move_user_scripts(install, target, should_stop=swap_after_the_first)
+        assert result.moved == (Path("a/効果.anm2"),) and result.failed == ()
+        assert (moved_away / PORTABLE_SCRIPTS_DIR / "b" / "効果.anm2").is_file()
+
     def test_leftovers_of_a_power_cut_are_cleared(self, install: Path, target: Path) -> None:
         """電源が切れた後の起動 作業用のフォルダと写しの途中の物（.moving）を片付け、元から移す"""
         _put(install, "配布物/効果.anm2", "obj.ox = 1\n")

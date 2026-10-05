@@ -47,6 +47,7 @@ from sashimono.update.package import (
 from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
     ScriptMove,
+    clear_swap_pending,
     in_synced_folder,
     move_user_scripts,
     unoffered,
@@ -209,6 +210,9 @@ class UpdateController(QObject):
         notice = settle(layout=self._layout, store=self._store)
         if notice:
             self._say(notice, 20000)
+        # 入れ替え係を待っている印は、入れ替えが済んだ（印の版と今の版が違う）なら外す 同じ版なら
+        # まだ入れ替えていないか失敗して戻った 失敗した印は時間が過ぎれば効かなくなる
+        clear_swap_pending(userdirs.config_root(), unless_version=__version__)
         stopped = self._store.load()
         if stopped.pending_notice:
             # 起動の頭で入れ替えを止めた（まだ窓が無かった） 1 度だけ知らせて消す 窓を塞がない
@@ -706,11 +710,17 @@ class UpdateController(QObject):
                     self._layout.install,
                     self._layout.staged,
                     aside=userdirs.config_root() / PORTABLE_SCRIPTS_DIR,
+                    swap_from=__version__,
                 )
             elif mode == "rollback":
                 # 戻すと今の版は previous へ回り、次に新しい版を入れたときに消える 今の版の
                 # exe の隣へ後から置いた物・直した物を、戻る先の版へ写す（今の側が正 上書きする）
-                carry_user_files(self._layout.install, self._layout.previous, overwrite=True)
+                carry_user_files(
+                    self._layout.install,
+                    self._layout.previous,
+                    overwrite=True,
+                    swap_from=__version__,
+                )
         except CarryError as exc:
             stopped = exc
         finally:
@@ -720,6 +730,16 @@ class UpdateController(QObject):
             # 起こさずに止める 窓はまだ閉じていないので、今の版のまま続けられる
             self._inform("入れ替えを止めました", stopped.explain())
             return False
+        if self._launch_swap(mode):
+            return True
+        # 入れ替え係を起こせなかった・閉じられなかった 引き継ぎが置いた「入れ替え係を待っている」
+        # 印を外す（残すと、移しが印の切れるまで止まる）
+        clear_swap_pending(userdirs.config_root())
+        return False
+
+    def _launch_swap(self, mode: str) -> bool:
+        """入れ替え係を起こし、走り出したら窓を閉じて終わる 起こせなければ知らせて偽"""
+        assert self._layout is not None
         # 開き直す作品は確認の後で決める 確認で名前を付けて保存したら、その作品を開き直す
         plan = SwapPlan(mode, self._layout, pid=os.getpid(), arguments=self._arguments())
         try:

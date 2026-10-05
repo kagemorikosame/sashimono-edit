@@ -2357,13 +2357,19 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 
   錠は 3 つ `scripts-move.lock`（`%APPDATA%\Sashimono` M と C が持つ）・`stage.lock`（落として展開する間）・
   `swap.lock`（入れ替え係が持つ） どれも持ち主が落ちれば次に取るときに片付く
+  入れ替え係は別のプロセス（PowerShell）で `scripts-move.lock` を受け取れない そこで C は、写し終えて
+  錠を放す**前に** `%APPDATA%\Sashimono\scripts-move.swap-pending`（入れ替える前の版と時刻）を置く
+  M は錠を取った後に、この印が新しい（10 分以内）か `swap.lock` が持たれていれば始めない（受け渡しの
+  隙を塞ぐ PR #245 の CodeRabbit の指摘） 印は、入れ替え係を起こせなければ呼び手がすぐ外し、
+  入れ替えが済めば次の起動（印の版と今の版が違う）で外す 失敗して残っても 10 分で効かなくなる
+  M は束ごとに今の版のフォルダが在るかも確かめ、付け替えられていれば次の束に入らない
 
   | 重なり | 錠と順番 | 試験 |
   |---|---|---|
   | M と M（2 つの窓） | `scripts-move.lock` 後の方は何もせず次の起動へ 巻き戻しは自分が置いて元が残る物だけ | `test_two_moves_at_once_do_not_lose_anything` `test_a_rollback_never_takes_back_a_copy_someone_relied_on` |
   | M と C（別の窓の移しの最中に入れ替え・戻す・起動時の更新） | C も `scripts-move.lock` を計画から巻き戻しまで持つ 10 秒まで待ち、取れなければ入れ替えを止めて知らせる | `test_carrying_waits_for_a_move_and_stops_if_it_does_not_end` `test_a_move_in_another_window_stops_the_swap` |
   | M と C（同じ窓） | 移している間は〔今すぐ再起動して入れる〕〔前の版に戻す〕を断る | `test_restarting_waits_for_the_move` |
-  | M と S | 入れ替え係が走っている（`swap.lock`）間は移さない 窓を閉じるときは移しが今の束を終えるのを待ち（10 秒まで）、新しい束には入らない | `test_no_move_while_the_swapper_runs` `test_closing_waits_for_the_bundle_being_moved` `test_stopping_finishes_the_bundle_and_starts_no_new_one` |
+  | M と S | 入れ替え係が走っている（`swap.lock`）間は移さない（画面で始める前と、錠を取った後の 2 度見る） C が錠を放してから入れ替え係が `swap.lock` を取るまでは「入れ替え係を待っている」印で移さない 束ごとに今の版のフォルダが在るかを見る 窓を閉じるときは移しが今の束を終えるのを待ち（10 秒まで）、新しい束には入らない | `test_no_move_while_the_swapper_runs` `test_no_move_while_the_swapper_holds_its_lock` `test_no_move_while_a_swap_is_pending` `test_the_swap_pending_marker_follows_the_swapper` `test_a_swapper_that_cannot_start_clears_the_marker` `test_the_marker_is_cleared_once_the_version_changed` `test_the_marker_is_kept_until_the_version_changes` `test_a_folder_swapped_away_stops_before_the_next_bundle` `test_closing_waits_for_the_bundle_being_moved` `test_stopping_finishes_the_bundle_and_starts_no_new_one` |
   | M が途中で止まった後の A・R・C | C は錠を取ったら、まずよけたまま残った元を元の場所へ戻し、作業用の物を片付けてから写す（入れ替え先へ回る前に戻す） | `test_originals_left_parked_are_put_back_before_carrying` `test_parked_originals_return_before_the_swap` |
   | M が途中で止まった後の M | 錠を取ったら同じく戻し・片付けてから移す | `test_originals_left_parked_by_a_crash_are_put_back` `test_leftovers_of_a_power_cut_are_cleared` |
   | C と C（2 つの窓） | `scripts-move.lock` で 1 つずつ 入れ替え係は `swap.lock` で 1 つ（起こす前にも確かめて断る） | `test_carrying_waits_for_a_move_and_stops_if_it_does_not_end` `test_another_window_at_work_starts_nothing` |

@@ -23,6 +23,7 @@ from sashimono.core.io.locks import try_hold
 from sashimono.update.fetch import Transport
 from sashimono.update.manifest import Manifest, is_newer, is_prerelease
 from sashimono.update.package import CarryError, Layout, carry_user_files, current_layout, stage
+from sashimono.update.portable import clear_swap_pending
 from sashimono.update.state import (
     STAGE_LOCK,
     UpdateState,
@@ -192,7 +193,12 @@ def apply_on_start(
     if layout.staged_version() != state.ready_version or not is_newer(state.ready_version, current):
         return False
     try:
-        carry_user_files(layout.install, layout.staged, aside=userdirs.config_root() / "scripts")
+        carry_user_files(
+            layout.install,
+            layout.staged,
+            aside=userdirs.config_root() / "scripts",
+            swap_from=current,
+        )
     except CarryError as exc:
         # 写せないまま入れ替えると、本人の物は次の更新で消える版にだけ残る 入れ替えずに今の版で
         # 起動し、画面を出した後に知らせる（UpdateController.start） 落として確かめた .new は
@@ -208,6 +214,8 @@ def apply_on_start(
     plan = SwapPlan("apply", layout, pid=os.getpid(), arguments=tuple(arguments[1:]))
     if swap(plan):
         return True
+    # 入れ替え係を起こせなかった 待っている印を外す（残すと、移しが印の切れるまで止まる）
+    clear_swap_pending(userdirs.config_root())
     # 入れ替え係を起こせなかった（台本の実行が止められている など） 次の起動でまた
     # 自動で予約して試すと、起動のたびに待たされる この版は本人が選ぶまで自動では入れない
     with contextlib.suppress(OSError):

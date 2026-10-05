@@ -46,17 +46,21 @@ __all__ = [
     "MODULE_FILE_SUFFIXES",
     "MOVE_LOCK",
     "PORTABLE_SCRIPTS_DIR",
+    "SWAP_PENDING",
     "ScriptMove",
     "bundles",
     "clean_leftovers",
+    "clear_swap_pending",
     "hold_move_lock",
     "in_synced_folder",
     "is_link",
+    "mark_swap_pending",
     "module_stem",
     "modules_in",
     "move_user_scripts",
     "remove_file",
     "script_links",
+    "swap_pending",
     "unoffered",
     "user_script_files",
 ]
@@ -369,11 +373,72 @@ def move_user_scripts(
     if lock is None:
         return ScriptMove(busy=True)
     try:
+        if swap_pending(target.parent) or _swapping():
+            # 引き継ぎを終えて入れ替え係を待っている・入れ替え係が走っている 今の版のフォルダが
+            # .previous へ回る途中なので触らない（よけた元が .previous へ行って失われる）
+            return ScriptMove(busy=True)
         # 錠を持てた ほかに移している人はいない 落ちた起動が残した物を片付ける
         clean_leftovers(install, target)
         return _move_all(install, target, should_stop or (lambda: False))
     finally:
         lock.release()
+
+
+#: 引き継ぎを終えて入れ替え係を起こすまでの印（``%APPDATA%\\Sashimono`` の下）
+#: 引き継ぎは錠（``MOVE_LOCK``）を放してから入れ替え係を起こす 入れ替え係は別のプロセス
+#: （PowerShell）で、この錠を受け取れない 放してから入れ替え係が ``swap.lock`` を取るまでの
+#: 隙に別の窓が移し始めると、よけた元が今の版のフォルダごと .previous へ回って失われる
+#: （PR #245 の CodeRabbit の指摘） そこで錠を放す前にこの印を置き、移しは印が新しい間は始めない
+SWAP_PENDING = "scripts-move.swap-pending"
+
+#: 印が効く長さ（秒） 入れ替え係は窓が全部閉じるのを待ち（120 秒まで）、新しい版が起動できたかを
+#: 確かめる 入れ替えに失敗して印が残っても、この長さを過ぎれば移しは再び始まる
+SWAP_PENDING_SECONDS = 10 * 60
+
+
+def mark_swap_pending(folder: Path, version: str) -> None:
+    """引き継ぎを終えて入れ替え係を起こす前に置く ``version`` は入れ替える前の版"""
+    marker = folder / SWAP_PENDING
+    with contextlib.suppress(OSError):
+        folder.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{version}\n{time.time()}", encoding="utf-8")
+
+
+def clear_swap_pending(folder: Path, *, unless_version: str | None = None) -> None:
+    """印を外す 入れ替え係を起こせなかったとき・入れ替えが済んだと分かったときに呼ぶ
+
+    ``unless_version`` を渡すと、印がその版（入れ替える前の版）のものなら外さない まだ入れ替えて
+    いない（入れ替え係が窓の閉じるのを待っている）か、入れ替えに失敗して戻った 失敗した印は
+    :data:`SWAP_PENDING_SECONDS` を過ぎれば効かなくなる
+    """
+    marker = folder / SWAP_PENDING
+    if unless_version is not None:
+        try:
+            recorded = marker.read_text(encoding="utf-8").split("\n", 1)[0]
+        except OSError:
+            return
+        if recorded == unless_version:
+            return
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+
+
+def swap_pending(folder: Path, *, clock: Callable[[], float] = time.time) -> bool:
+    """入れ替え係を待っている印が新しいか"""
+    try:
+        written = float((folder / SWAP_PENDING).read_text(encoding="utf-8").split("\n")[1])
+    except (OSError, ValueError, IndexError):
+        return False
+    return 0 <= clock() - written < SWAP_PENDING_SECONDS
+
+
+def _swapping() -> bool:
+    """入れ替え係が走っているか（``swap.lock``） 移しの錠を取った後にもう 1 度見る"""
+    # update.state は userdirs と錠しか読まないが、ここから上で読むと package との読み込みの
+    # 順に縛られるので、要る所で読む
+    from sashimono.update.state import busy_with
+
+    return busy_with() == "swap"
 
 
 def _move_all(install: Path, target: Path, should_stop: Callable[[], bool]) -> ScriptMove:
@@ -393,6 +458,9 @@ def _move_all(install: Path, target: Path, should_stop: Callable[[], bool]) -> S
             continue
         if should_stop():
             break  # 閉じる 新しい束には入らない 残りは次の起動で移す
+        if not source.is_dir():
+            # 今の版のフォルダが付け替えられた（入れ替え係が先に動いた） 次の束には入らない
+            break
         problem, placed = _place_bundle(source, target, members)
         if problem is None:
             problem, gone, stuck = _retire(install, target, members, placed)
