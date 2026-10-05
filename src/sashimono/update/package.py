@@ -34,7 +34,10 @@ from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
 from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
+    bundles,
     is_link,
+    module_stem,
+    modules_in,
     remove_file,
     script_links,
     user_script_files,
@@ -277,57 +280,99 @@ def carry_user_files(
       ``.previous`` ごと消える 中身が違えば今の側で上書きする（古い中身は本人が直す前の物で、
       直した側が正なので取っておかない）
     - 新しい版を入れる（既定） 入れ替え先は展開したばかりの新しい版で、そこに在る物はすべて
-      新しい版の同梱物 同梱物は新しい版の物を残す 同じ名前で中身の違う本人の物は、``aside``
-      （``%APPDATA%`` の ``scripts``）の空いている所へ写す 読む順は ``%APPDATA%`` が後で勝つので、
-      今まで使われていた本人の物が使われ続ける ``aside`` に既に在れば、前からそちらが使われて
-      いるので写さない
+      新しい版の同梱物 同梱物は新しい版の物を残す
+
+    **束（:func:`.portable.bundles` 移す側と同じ単位）で振り分ける** スクリプトはモジュールを
+    自分のフォルダから先に探すので、束の一部だけを別の置き場へ写すと、残った側が同じフォルダの
+    別のモジュールを読み、更新しただけで描画が変わる（PR #245 の Codex の指摘）
+    新しい版を入れるとき、束の中に新しい版の同梱物とぶつかる物（同じ名前で中身が違う、または
+    モジュールの名前が同梱物と重なる）が 1 つでもあれば、束ごと ``aside``（``%APPDATA%`` の
+    ``scripts``）へ写す 読む順は ``%APPDATA%`` が後で勝つので、今まで使われていた本人の物が
+    使われ続ける ``aside`` にも同じ名前で中身の違う物があれば、どこへ写しても束が割れるか
+    本人の物が落ちるので、写さずに :class:`CarryError` にする（入れ替えを止め、手で片付けてもらう）
 
     **1 つでも写せなければ :class:`CarryError`** 全部を試してから、写せなかった物を並べて上げる
     呼んだ側は入れ替えを止める 写せないまま入れ替えると、本人の物は次の更新で消える版
-    （``previous`` か ``.new`` へよけた側）にだけ残る 写せた物はそのまま置く（今の版の
-    本人の物と同じ中身で、入れ替え先の版がそのまま使える）
+    （``previous`` か ``.new`` へよけた側）にだけ残る 止めるときは ``aside`` へ写した物を外す
+    （``%APPDATA%`` は今の版でも読まれるので、束の一部だけが残ると今の版の描画が変わる）
+    入れ替え先の版（``.new`` ``previous``）へ写した物はそのまま置く（今は読まれない）
     """
     source = install / _PORTABLE_SCRIPTS_DIR
+    root = destination / _PORTABLE_SCRIPTS_DIR
+    files = user_script_files(install)
+    links = script_links(install)
+    linked = set(links)
+    # 新しい版が同梱しているモジュール（名前で探されるので、場所が違っても重なる）
+    bundled = {} if overwrite else modules_in(root)
     copied = 0
     failed: list[tuple[Path, str]] = []
-    for relative in user_script_files(install):
-        origin = source / relative
-        target = destination / _PORTABLE_SCRIPTS_DIR / relative
-        if target.exists():
-            if _same_file(origin, target):
+    placed_aside: list[Path] = []
+    for members in bundles([*files, *links]).values():
+        where = root
+        if not overwrite and _clashes(source, root, members, linked, bundled):
+            if aside is None:
+                failed.extend((p, "新しい版の同梱物と同じ名前の物がある") for p in members)
                 continue
-            if not overwrite:
-                if aside is not None and not (aside / relative).exists():
-                    target = aside / relative
-                else:
-                    continue
-        problem = _copy_over(origin, target)
-        if problem is None:
-            copied += 1
-        else:
-            failed.append((relative, problem))
-    links = script_links(install)
-    for relative in links:
-        # リンク（シンボリックリンク・ジャンクション）は先を写さず、同じ先を指すリンクを作り直す
-        # 先は置き場の外のことがあり、写すと外の物を新しい版の中へ抱え込む
-        # 扱いは普通のファイルと揃える（今の版の側が正 新しい版の同梱物は残して aside へ）
-        target = destination / _PORTABLE_SCRIPTS_DIR / relative
-        if target.exists() or is_link(target):
-            if _same_link(source / relative, target):
+            if any(_differs(source / p, aside / p, p in linked) for p in members):
+                failed.extend(
+                    (p, "新しい版の同梱物と %APPDATA% の両方に、同じ名前の別の物がある")
+                    for p in members
+                )
                 continue
-            if not overwrite and not is_link(target):
-                # 新しい版の同梱物と同じ名前 同梱物を残し、リンクは %APPDATA% の空いている所へ
-                if aside is None or (aside / relative).exists() or is_link(aside / relative):
-                    continue
-                target = aside / relative
-        problem = _carry_link(source / relative, target, overwrite=overwrite)
-        if problem is None:
-            copied += 1
-        else:
-            failed.append((relative, problem))
+            where = aside
+        for relative in members:
+            target = where / relative
+            present = target.exists() or is_link(target)
+            if present and not _differs(source / relative, target, relative in linked):
+                continue  # 同じ物が在る
+            if relative in linked:
+                problem = _carry_link(source / relative, target, overwrite=overwrite)
+            else:
+                # %APPDATA% へは置き換えない 確かめた後に本人やほかの窓が同じ名前を置いていれば、
+                # そちらを残して止める（%APPDATA% は今の版でも読まれる）
+                problem = _copy_over(source / relative, target, replace=where is not aside)
+            if problem is None:
+                copied += 1
+                if where is aside:
+                    placed_aside.append(target)
+            else:
+                failed.append((relative, problem))
     if failed:
-        raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in links))
+        for target in placed_aside:
+            with contextlib.suppress(OSError):
+                if is_link(target):
+                    _remove_link(target)
+                else:
+                    remove_file(target)
+        raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in linked))
     return copied
+
+
+def _differs(origin: Path, target: Path, link: bool) -> bool:
+    """入れ替え先に、同じ名前の別の物が在るか 無ければ偽（写せばよい）"""
+    if not target.exists() and not is_link(target):
+        return False
+    if link:
+        return not _same_link(origin, target)
+    return is_link(target) or not _same_file(origin, target)
+
+
+def _clashes(
+    source: Path,
+    root: Path,
+    members: list[Path],
+    linked: set[Path],
+    bundled: dict[str, list[Path]],
+) -> bool:
+    """束が新しい版の同梱物とぶつかるか 同じ名前で中身が違う物か、名前の重なるモジュールがある"""
+    for relative in members:
+        if _differs(source / relative, root / relative, relative in linked):
+            return True
+        stem = module_stem(relative)
+        for other in bundled.get(stem, []) if stem is not None else []:
+            if other.as_posix().casefold() != relative.as_posix().casefold():
+                return True
+    return False
 
 
 def _same_link(origin: Path, target: Path) -> bool:
@@ -439,16 +484,26 @@ def _same_file(first: Path, second: Path) -> bool:
         return False
 
 
-def _copy_over(origin: Path, target: Path) -> str | None:
+def _copy_over(origin: Path, target: Path, *, replace: bool = True) -> str | None:
     """作業用の名前へ写してから置き換える 写せなければ理由を返す
 
     途中で止まっても、半分の中身が本来の名前で残らない 作業用の写しは片付ける
+    ``replace`` が偽なら置き換えない（在る名前へは付けない Windows の rename は断る）
     """
     # 印は移す側（.portable）と同じ ``.moving`` 残っても本人の物と数えず、スクリプトとしても読まない
     writing = target.with_name(f"{target.name}.{os.getpid()}.moving")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(origin, writing)
+        # 写した物を照らしてから本来の名前を付ける 写している間に書き換わった・欠けた写しを
+        # 入れ替え先へ置かない
+        if not _same_file(origin, writing):
+            raise OSError("写した中身が元と違う（写している間に書き換わった）")
+        if not replace:
+            if target.exists() or is_link(target):
+                raise FileExistsError("写す先に同じ名前の物が置かれた")
+            writing.rename(target)
+            return None
         try:
             writing.replace(target)
         except PermissionError:

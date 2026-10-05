@@ -138,6 +138,8 @@ class UpdateController(QObject):
         self._timer.timeout.connect(self._poll)
         #: exe の隣のスクリプトを裏で移している間は真 終わった後に画面で行うことを受け取る
         self._moving = False
+        #: 走っている裏の仕事の数 0 になったら見に行く時計を止める
+        self._background_jobs = 0
         self._move_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._move_timer = QTimer(self)
         self._move_timer.setInterval(_POLL_MS)
@@ -323,29 +325,44 @@ class UpdateController(QObject):
             lambda result: self._moved(result, target, loud=loud, fresh=fresh),
         )
 
-    def _in_background(self, work: Callable[[], Any], then: Callable[[Any], None]) -> None:
+    def _in_background(
+        self,
+        work: Callable[[], Any],
+        then: Callable[[Any], None],
+        failed: Callable[[Exception], None] | None = None,
+    ) -> None:
         """``work`` を裏のスレッドで行い、終わったら ``then`` を画面の側で呼ぶ
 
-        裏で触るのはファイルだけ 試験（``threaded`` が偽）ではその場で呼ぶ
+        裏で触るのはファイルだけ（scripts を辿る・写す・導入先の大きさを測る） 画面の部品には
+        触らない 試験（``threaded`` が偽）ではその場で呼ぶ ``failed`` を渡さなければ、
+        exe の隣のスクリプトを移す仕事の失敗として知らせる
         """
+        on_error = failed if failed is not None else self._moved_failure
         if not self._threaded:
-            then(work())
+            try:
+                value = work()
+            except Exception as exc:  # 裏で行う物と同じく、画面の側へ例外を出さない
+                on_error(exc)
+                return
+            then(value)
             return
 
         def run() -> None:
             try:
                 value = work()
             except Exception as exc:  # 裏のスレッドで落ちると、移している印が立ったまま残る
-                failure = ScriptMove(failed=((Path(), f"{type(exc).__name__}: {exc}"),))
-                self._move_results.put(lambda: self._moved_failure(failure))
+                error = exc
+                self._move_results.put(lambda: on_error(error))
                 return
             self._move_results.put(lambda: then(value))
 
-        threading.Thread(target=run, name="sashimono-scripts-move", daemon=True).start()
+        self._background_jobs += 1
+        threading.Thread(target=run, name="sashimono-background", daemon=True).start()
         self._move_timer.start()
 
-    def _moved_failure(self, failure: ScriptMove) -> None:
+    def _moved_failure(self, exc: Exception) -> None:
         self._moving = False
+        failure = ScriptMove(failed=((Path(), f"{type(exc).__name__}: {exc}"),))
         self._notify("スクリプトの置き場", move_summary(failure, Path()))
 
     def _poll_moves(self) -> None:
@@ -353,7 +370,11 @@ class UpdateController(QObject):
             done = self._move_results.get_nowait()
         except queue.Empty:
             return
-        self._move_timer.stop()
+        self._background_jobs -= 1
+        if self._background_jobs <= 0:
+            # 裏の仕事が 2 つ重なっていれば（移しと入れ直しの見積もり）、両方が終わるまで回す
+            self._background_jobs = 0
+            self._move_timer.stop()
         # 続きの仕事（一覧の後の移し）は done の中で、また裏のスレッドへ出して時計を回し直す
         done()
 
@@ -503,8 +524,7 @@ class UpdateController(QObject):
                     if self._layout is not None
                     else f"新しい版 {manifest.version} があります（開発の環境では入れ替えません）"
                 )
-                details = self._by_hand_notes(manifest.python_abi) if self._layout else ""
-                self._say_or_inform(finished.manual, text, manifest.notes_url, details)
+                self._tell_by_hand(finished.manual, text, manifest.notes_url, manifest.python_abi)
                 return
             if finished.manual:
                 self._inform("新しい版を落とせませんでした", finished.error or "理由が分からない")
@@ -514,8 +534,7 @@ class UpdateController(QObject):
                 f"新しい版 {manifest.version} があります この版からは自動では入れられないので、"
                 "配布のページから入れ直してください"
             )
-            details = self._by_hand_notes(manifest.python_abi) if self._layout else ""
-            self._say_or_inform(finished.manual, text, manifest.notes_url, details)
+            self._tell_by_hand(finished.manual, text, manifest.notes_url, manifest.python_abi)
             return
         if not finished.manual:
             return  # 最新・繋がらない・署名が通らない 起動時は黙る
@@ -529,18 +548,49 @@ class UpdateController(QObject):
 
     # --- 入れる ---
 
+    def _tell_by_hand(self, manual: bool, text: str, url: str, new_abi: str) -> None:
+        """配布のページから手で入れ替えるよう言う 起動時の確認はステータスバーに 1 行で、
+        詳しい注意（exe の隣の scripts・入れ直し）は作らない 手で確かめたときは、注意を
+        作るのに scripts を辿り導入先の大きさを測るので、裏のスレッドで作ってから窓で出す
+        """
+        if not manual:
+            self._say(text, 20000)
+            return
+        if self._layout is None:
+            self._say_or_inform(True, text, url)
+            return
+        self._in_background(
+            lambda: self._by_hand_notes(new_abi),
+            lambda details: self._say_or_inform(True, text, url, details),
+            lambda _exc: self._say_or_inform(True, text, url),
+        )
+
     def offer(self) -> None:
-        """入れ替えを待つ版を、入れるかどうか尋ねる"""
+        """入れ替えを待つ版を、入れるかどうか尋ねる
+
+        Python が変わる版なら、入れ直しの見積もり（導入先の大きさを測る 最大 1.5 秒）を裏の
+        スレッドで作ってから尋ねる 測る間、編集画面を固めない
+        """
         version = self.ready_version()
         if version is None or self._layout is None:
             self._refresh_button()
             return
+        abi = self._store.load().ready_python_abi
+        self._in_background(
+            lambda: runtime_note(abi),
+            lambda note: self._offer_with(version, note),
+            lambda _exc: self._offer_with(version, ""),
+        )
+
+    def _offer_with(self, version: str, note: str) -> None:
+        if self.ready_version() != version:
+            self._refresh_button()
+            return  # 見積もっている間に片付いた（ほかの窓が入れた・ベータを切った）
         state = self._store.load()
         lines = [f"新しい版 {escape(version)} を入れる準備ができました（今は {__version__}）"]
         if state.ready_notes_url:
             url = escape(state.ready_notes_url, quote=True)
             lines.append(f'変わった所: <a href="{url}">{url}</a>')
-        note = runtime_note(state.ready_python_abi)
         if note:
             lines.extend(escape(part) for part in note.split("\n"))
         lines.append("入れるには再起動が要ります 保存していない変更があれば、閉じる前に尋ねます")
@@ -620,6 +670,11 @@ class UpdateController(QObject):
         # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
         if self._busy_elsewhere():
             return False
+        # 写すのはこの場で行う（裏へ出さない） 保存の確認はもう済んでいて、裏へ出すと写している
+        # 間に編集でき、閉じるときにその変更を尋ねずに捨てる 入れ替え係が始まるのを待つのと同じく、
+        # 待つ印の形の矢印を出して待たせる（すぐ後に窓を閉じて終わる）
+        stopped: CarryError | None = None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             if mode == "apply":
                 carry_user_files(
@@ -632,9 +687,13 @@ class UpdateController(QObject):
                 # exe の隣へ後から置いた物・直した物を、戻る先の版へ写す（今の側が正 上書きする）
                 carry_user_files(self._layout.install, self._layout.previous, overwrite=True)
         except CarryError as exc:
+            stopped = exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        if stopped is not None:
             # 写せないまま入れ替えると、本人の物は次の更新で消える版にだけ残る 入れ替え係を
             # 起こさずに止める 窓はまだ閉じていないので、今の版のまま続けられる
-            self._inform("入れ替えを止めました", exc.explain())
+            self._inform("入れ替えを止めました", stopped.explain())
             return False
         # 開き直す作品は確認の後で決める 確認で名前を付けて保存したら、その作品を開き直す
         plan = SwapPlan(mode, self._layout, pid=os.getpid(), arguments=self._arguments())

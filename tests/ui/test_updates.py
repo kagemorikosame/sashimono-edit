@@ -705,6 +705,107 @@ class TestScriptsBesideTheExe:
         assert len(asked) == 1 and "同期フォルダ" in asked[0]
         assert not mine.exists()
 
+    def test_startup_does_not_walk_scripts_for_a_page_to_update_by_hand(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """起動時の自動の確認では詳しい注意を作らない
+
+        scripts を辿らない（PR #245 の Codex の指摘）
+        """
+        monkeypatch.setattr(Layout, "writable", lambda _self: False)
+        walked: list[str] = []
+
+        def notes(new_abi: str) -> str:
+            walked.append(new_abi)
+            return ""
+
+        monkeypatch.setattr(harness.controller, "_by_hand_notes", notes)
+        harness.preferences = Preferences(scripts_move="off")
+        harness.controller.start()
+        assert walked == []
+        assert "配布のページ" in harness.window.statusBar().currentMessage()
+
+    def test_a_page_to_update_by_hand_is_prepared_off_the_ui_thread(
+        self, harness: _Harness, qt_application: QApplication
+    ) -> None:
+        """手で確かめたときの注意（scripts を辿る・導入先を測る）は裏のスレッドで作る"""
+        import threading
+        import time
+
+        controller = UpdateController(
+            harness.window,
+            preferences=Preferences,
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=True,
+        )
+        threads: list[str] = []
+        shown: list[str] = []
+
+        def notes(abi: str) -> str:
+            threads.append(threading.current_thread().name)
+            return "注意"
+
+        def inform(title: str, text: str) -> None:
+            shown.append(text)
+
+        controller._inform = inform  # type: ignore[method-assign]
+        setattr(controller, "_by_hand_notes", notes)  # noqa: B010 - 型の上では別の関数
+        try:
+            controller._tell_by_hand(True, "新しい版があります", "https://example.invalid", "cp314")
+            deadline = time.monotonic() + 10
+            while not shown and time.monotonic() < deadline:
+                qt_application.processEvents()
+                time.sleep(0.02)
+            assert threads and threads[0] != threading.main_thread().name
+            assert shown and "注意" in shown[0]
+        finally:
+            controller.deleteLater()
+
+    def test_the_reinstall_estimate_is_measured_off_the_ui_thread(
+        self, harness: _Harness, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """入れる前の確認の見積もり（導入先の大きさを最大 1.5 秒測る）は裏のスレッドで作る"""
+        import threading
+        import time
+
+        harness.controller.start()
+        threads: list[str] = []
+
+        def note(abi: str) -> str:
+            threads.append(threading.current_thread().name)
+            return ""
+
+        monkeypatch.setattr(updates_module, "runtime_note", note)
+        controller = UpdateController(
+            harness.window,
+            preferences=Preferences,
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=True,
+        )
+        asked: list[str] = []
+
+        def choose(_title: str, html: str, **_options: object) -> str:
+            asked.append(html)
+            return updates_module.ANSWER_LATER
+
+        setattr(controller, "_choose", choose)  # noqa: B010 - 型の上では別の関数
+        try:
+            controller.offer()
+            deadline = time.monotonic() + 10
+            while not asked and time.monotonic() < deadline:
+                qt_application.processEvents()
+                time.sleep(0.02)
+            assert threads and threads[0] != threading.main_thread().name
+            assert asked
+        finally:
+            controller.deleteLater()
+
     def test_restarting_waits_for_the_move(self, harness: _Harness) -> None:
         """移している最中に入れ替えると、写す側と移す側が同じファイルを同時に触る"""
         harness.controller.start()

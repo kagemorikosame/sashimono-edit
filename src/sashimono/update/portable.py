@@ -49,6 +49,8 @@ __all__ = [
     "bundles",
     "in_synced_folder",
     "is_link",
+    "module_stem",
+    "modules_in",
     "move_user_scripts",
     "remove_file",
     "script_links",
@@ -220,16 +222,17 @@ def bundles(files: Iterable[Path]) -> dict[str, list[Path]]:
     return grouped
 
 
-def _module_stem(path: Path) -> str | None:
+def module_stem(path: Path) -> str | None:
+    """モジュールとして名前で探される物なら、その名前（大文字小文字を揃える） 違えば ``None``"""
     return path.stem.casefold() if path.suffix.casefold() in MODULE_FILE_SUFFIXES else None
 
 
-def _modules_in(folder: Path) -> dict[str, list[Path]]:
+def modules_in(folder: Path) -> dict[str, list[Path]]:
     """置き場にあるモジュール 名前 → 相対の場所 どの深さにあっても名前で見つかる"""
     found: dict[str, list[Path]] = {}
     files, _links = _walk(folder)
     for relative in files:
-        stem = _module_stem(relative)
+        stem = module_stem(relative)
         if stem is not None:
             found.setdefault(stem, []).append(relative)
     return found
@@ -283,10 +286,10 @@ def _plan(
     stay.update(bundles(links))
     # 移し先に同じ名前のモジュールが、同じ場所で同じ中身でない形であれば、その束は残す
     # 移した後に、どちらが先に見つかるかが変わりうる
-    there = _modules_in(target)
+    there = modules_in(target)
     for key, members in grouped.items():
         for relative in members:
-            stem = _module_stem(relative)
+            stem = module_stem(relative)
             if stem is None:
                 continue
             for other in there.get(stem, []):
@@ -296,7 +299,7 @@ def _plan(
     # 残した束と同じ名前のモジュールを持つ束も残す 片方だけ移すと、今まで exe の隣の中で
     # 決まっていた勝ち負けが、置き場の順（exe の隣が先）で決まるように変わる
     names = {
-        key: {stem for p in members if (stem := _module_stem(p)) is not None}
+        key: {stem for p in members if (stem := module_stem(p)) is not None}
         for key, members in grouped.items()
     }
     changed = True
@@ -330,6 +333,7 @@ def move_user_scripts(install: Path, target: Path) -> ScriptMove:
         for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
             with contextlib.suppress(OSError):
                 remove_file(leftover)
+        _recover_removed(install, target)
         return _move_all(install, target)
     finally:
         lock.release()
@@ -352,28 +356,112 @@ def _move_all(install: Path, target: Path) -> ScriptMove:
             continue
         problem, placed = _place_bundle(source, target, members)
         if problem is None:
-            # 消す直前にもう 1 度照らす 移している間に外のエディタや同期ソフトが元を書き換えて
-            # いれば、移し先の古い写しが後に読まれて勝ち、書き換えた中身が使われなくなる
-            # （PR #245 の Codex の指摘） 写しを外して元の側に戻し、次の起動で改めて移す
-            changed = [p for p in members if not _same(source / p, target / p)]
-            if changed:
-                _take_back(source, target, placed)
-                problem = f"移している間に書き換わった（{changed[0].as_posix()}）"
+            problem, gone, stuck = _retire(install, target, members, placed)
+            moved.extend(gone)
+            left.extend(stuck)
         if problem is not None:
             # 束は一式 exe の隣に残る（元には触っていない） 束の全部を写せなかった物として数える
             failed.extend((relative, problem) for relative in members)
-            continue
-        # 移し先に一式そろってから元を消す 一部を消せなくても（ほかのプログラムが開いている
-        # など）、後に読まれる %APPDATA% の一式が勝つ 次の起動では同じ中身と見て消し直す
-        for relative in members:
-            try:
-                remove_file(source / relative)
-            except OSError:
-                left.append(relative)
-            else:
-                moved.append(relative)
     _remove_empty_folders(source)
     return ScriptMove(tuple(moved), tuple(kept), tuple(held), tuple(left), tuple(failed))
+
+
+#: 消す元をいったんよける作業用のフォルダの名前の頭（exe の隣のフォルダ ``install`` の直下）
+#: 元と同じドライブなので名前の付け替えだけで済む 置き場（``scripts``）の外なので読まれない
+_REMOVING_PREFIX = ".scripts-removing-"
+
+
+def _retire(
+    install: Path, target: Path, members: list[Path], placed: list[Path]
+) -> tuple[str | None, list[Path], list[Path]]:
+    """移し先に一式そろった束の元を消す ``(書き換わっていればその理由, 消した物, 消せなかった物)``
+
+    照らしてから消すまでの間に書き換わると、新しい中身を消してしまう（PR #245 の Codex の指摘）
+    そこで消す代わりに、元を作業用のフォルダへ名前を付け替えてよける よけた物は、外のエディタや
+    同期ソフトが元の場所へ書いても変わらない よけた物を移し先と照らし、全部一致したら消す
+    1 つでも違えば（よける前に書き換わった）、または元の場所に新しい物が置かれていれば、
+    よけた物を元の場所へ戻し、移し先へ置いた写しを外して、束を元の側に戻す（次の起動で移し直す）
+
+    よけられなかった物（ほかのプログラムが開いている）は元の場所で照らす 一致すれば「消せなかった」
+    として数える（移し先の一式が勝つ 次の起動で同じ中身と見て消し直す） 違えば束を戻す
+    途中で落ちても、よけた物は次に錠を取ったときに :func:`_recover_removed` が元へ戻すか片付ける
+    """
+    source = install / PORTABLE_SCRIPTS_DIR
+    parking = install / f"{_REMOVING_PREFIX}{os.getpid()}"
+    parked: list[Path] = []
+    stuck: list[Path] = []
+    for relative in members:
+        try:
+            (parking / relative).parent.mkdir(parents=True, exist_ok=True)
+            (source / relative).rename(parking / relative)
+        except OSError:
+            stuck.append(relative)
+        else:
+            parked.append(relative)
+    changed = [p for p in parked if not _same(parking / p, target / p)]
+    changed += [p for p in stuck if not _same(source / p, target / p)]
+    changed += [p for p in parked if (source / p).exists() or is_link(source / p)]
+    if not changed:
+        gone: list[Path] = []
+        for relative in parked:
+            try:
+                remove_file(parking / relative)
+            except OSError:
+                # よけた所で消せない 元の場所へ戻せば、次の起動で同じ中身と見て消し直す
+                with contextlib.suppress(OSError):
+                    (parking / relative).rename(source / relative)
+                stuck.append(relative)
+            else:
+                gone.append(relative)
+        _remove_tree_if_empty(parking)
+        return None, gone, stuck
+    for relative in parked:
+        back = source / relative
+        if back.exists() or is_link(back):
+            # 元の場所に新しい物が置かれた（本人が書き直した） そちらが正 よけた古い物は、
+            # 移し先の写しと同じ中身なら捨て、違えば消さずによけたまま残す（次の片付けで扱う）
+            if _same(parking / relative, target / relative):
+                with contextlib.suppress(OSError):
+                    remove_file(parking / relative)
+            continue
+        with contextlib.suppress(OSError):
+            back.parent.mkdir(parents=True, exist_ok=True)
+            (parking / relative).rename(back)
+    _take_back(source, target, placed)
+    _remove_tree_if_empty(parking)
+    return f"移している間に書き換わった（{changed[0].as_posix()}）", [], []
+
+
+def _remove_tree_if_empty(folder: Path) -> None:
+    """中にファイルが残っていなければ片付ける 残っていれば触らない（本人の物かもしれない）"""
+    if not folder.exists():
+        return
+    if any(path.is_file() for path in folder.rglob("*")):
+        return
+    _remove_tree(folder)
+
+
+def _recover_removed(install: Path, target: Path) -> None:
+    """落ちた起動がよけたまま残した元を扱う 錠を持っているときだけ呼ぶ
+
+    元の場所が空いていれば戻す（移し先に同じ中身があれば、次の移しで同じ中身と見て片付く）
+    元の場所に物があり、よけた物がそれか移し先と同じ中身なら捨てる 違えば残す（本人の物）
+    """
+    source = install / PORTABLE_SCRIPTS_DIR
+    for parking in install.glob(f"{_REMOVING_PREFIX}*"):
+        files, _links = _walk(parking)
+        for relative in files:
+            parked = parking / relative
+            back = source / relative
+            if not back.exists() and not is_link(back):
+                with contextlib.suppress(OSError):
+                    back.parent.mkdir(parents=True, exist_ok=True)
+                    parked.rename(back)
+                continue
+            if _same(parked, back) or _same(parked, target / relative):
+                with contextlib.suppress(OSError):
+                    remove_file(parked)
+        _remove_tree_if_empty(parking)
 
 
 def _take_back(source: Path, target: Path, placed: list[Path]) -> None:

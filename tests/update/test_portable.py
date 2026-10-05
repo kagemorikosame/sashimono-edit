@@ -56,6 +56,18 @@ def target(tmp_path: Path) -> Path:
     return tmp_path / "roaming" / "Sashimono" / PORTABLE_SCRIPTS_DIR
 
 
+def _refuse_rename(monkeypatch: pytest.MonkeyPatch, held: Path) -> None:
+    """``held`` をほかのプログラムが開いている形にする（名前も付け替えられない）"""
+    real_rename = Path.rename
+
+    def refuse(self: Path, destination: Path) -> Path:
+        if self == held:
+            raise PermissionError("使用中")
+        return real_rename(self, destination)
+
+    monkeypatch.setattr(Path, "rename", refuse)
+
+
 def _put(folder: Path, relative: str, text: str) -> Path:
     path = folder / PORTABLE_SCRIPTS_DIR / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,6 +181,7 @@ class TestMoving:
             real_unlink(self, missing_ok=missing_ok)
 
         monkeypatch.setattr(Path, "unlink", refuse)
+        _refuse_rename(monkeypatch, mine)
         result = move_user_scripts(install, target)
         assert result.left == (Path("効果.anm2"),) and result.moved == ()
         assert mine.is_file() and (target / "効果.anm2").is_file()
@@ -403,6 +416,7 @@ class TestBundles:
             real_unlink(self, missing_ok=missing_ok)
 
         monkeypatch.setattr(Path, "unlink", refuse)
+        _refuse_rename(monkeypatch, originals[0])
         result = move_user_scripts(install, target)
         assert result.left == (Path("配布物/効果.anm2"),) and len(result.moved) == 2
         monkeypatch.undo()
@@ -658,6 +672,44 @@ class TestEdgeCases:
         assert result.moved == () and "空きが足りない" in result.failed[0][1]
         assert mine.is_file()
         assert not list(target.parent.glob(".scripts-moving-*"))
+
+    def test_an_edit_between_checking_and_removing_is_kept(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """照らしてから消すまでの間に元の場所へ書かれても、新しい中身を消さない
+        （PR #245 の Codex の指摘） 元は消す代わりに作業用の場所へよけてから照らすので、
+        元の場所に新しい物が現れれば束を元の側へ戻す
+        """
+        effect = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        _put(install, "配布物/common.lua", "return {}")
+        real_rename = Path.rename
+
+        def edited_right_after_parking(self: Path, destination: Path) -> Path:
+            moved = real_rename(self, destination)
+            if self == effect and ".scripts-removing-" in str(destination):
+                effect.write_text("obj.ox = 2\n", encoding="utf-8")
+            return moved
+
+        monkeypatch.setattr(Path, "rename", edited_right_after_parking)
+        result = move_user_scripts(install, target)
+        monkeypatch.undo()
+        assert result.moved == () and "書き換わった" in result.failed[0][1]
+        assert effect.read_text(encoding="utf-8") == "obj.ox = 2\n"
+        assert (install / PORTABLE_SCRIPTS_DIR / "配布物" / "common.lua").is_file()
+        assert not (target / "配布物" / "効果.anm2").exists()
+        assert not list(install.glob(".scripts-removing-*"))
+
+    def test_originals_left_parked_by_a_crash_are_put_back(
+        self, install: Path, target: Path
+    ) -> None:
+        """よけた所で落ちた後の起動 よけた物を元の場所へ戻し、改めて移す"""
+        parked = install / ".scripts-removing-4242" / "配布物" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("obj.ox = 1\n", encoding="utf-8")
+        result = move_user_scripts(install, target)
+        assert result.moved == (Path("配布物/効果.anm2"),)
+        assert (target / "配布物" / "効果.anm2").read_text(encoding="utf-8") == "obj.ox = 1\n"
+        assert not (install / ".scripts-removing-4242").exists()
 
     def test_leftovers_of_a_power_cut_are_cleared(self, install: Path, target: Path) -> None:
         """電源が切れた後の起動 作業用のフォルダと写しの途中の物（.moving）を片付け、元から移す"""

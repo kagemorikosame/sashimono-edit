@@ -176,14 +176,64 @@ class TestUserScripts:
         assert (aside / "見本" / "揺れ.anm2").read_text(encoding="utf-8") == "本人が直した"
 
     def test_aside_is_not_overwritten(self, layout: Layout, tmp_path: Path) -> None:
-        """%APPDATA% に前から在れば、前からそちらが使われている 上書きしない"""
+        """新しい版の同梱物と %APPDATA% の両方に同じ名前の別の物があれば、どこへ写しても束が
+        割れるか本人の物が落ちる %APPDATA% は上書きせず、入れ替えを止める（手で片付けてもらう）
+        前は黙って飛ばし、exe の隣の本人の物は次の更新で消える .previous にだけ残っていた
+        """
         aside = tmp_path / "roaming" / "Sashimono" / "scripts"
         (aside / "見本").mkdir(parents=True)
         (aside / "見本" / "揺れ.anm2").write_text("前から置いた", encoding="utf-8")
         self._write(layout.install, "見本/揺れ.anm2", "本人が直した")
         self._write(layout.staged, "見本/揺れ.anm2", "新しい版の見本")
-        assert carry_user_files(layout.install, layout.staged, aside=aside) == 0
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(layout.install, layout.staged, aside=aside)
+        assert "%APPDATA% の両方" in raised.value.failed[0][1]
         assert (aside / "見本" / "揺れ.anm2").read_text(encoding="utf-8") == "前から置いた"
+
+    def test_a_bundle_goes_aside_as_a_whole(self, layout: Layout, tmp_path: Path) -> None:
+        """束の 1 つが新しい版の同梱物とぶつかれば、束ごと %APPDATA% へ写す
+
+        PR #245 の Codex の指摘 効果だけ新しい版へ写すと、効果のフォルダの新しい版の
+        同梱モジュールを読んで描画が変わる
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        self._write(layout.install, "配布物/効果.anm2", 'local m = require("common")\n')
+        self._write(layout.install, "配布物/common.mod2", "本人の common")
+        bundled = self._write(layout.staged, "配布物/common.mod2", "新しい版の common")
+
+        assert carry_user_files(layout.install, layout.staged, aside=aside) == 2
+        assert (aside / "配布物" / "効果.anm2").is_file()
+        assert (aside / "配布物" / "common.mod2").read_text(encoding="utf-8") == "本人の common"
+        assert not (layout.staged / PORTABLE_SCRIPTS_DIR / "配布物" / "効果.anm2").exists()
+        assert bundled.read_text(encoding="utf-8") == "新しい版の common"
+
+    def test_a_module_name_the_new_version_bundles_elsewhere_moves_the_bundle(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """モジュールは名前で探す 新しい版が別の場所に同じ名前のモジュールを同梱していれば、
+        束ごと %APPDATA% へ写す
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        self._write(layout.install, "配布物/common.lua", "本人の common")
+        self._write(layout.staged, "common.lua", "新しい版の common")
+        carry_user_files(layout.install, layout.staged, aside=aside)
+        assert (aside / "配布物" / "common.lua").is_file()
+        assert not (layout.staged / PORTABLE_SCRIPTS_DIR / "配布物").exists()
+
+    def test_a_stopped_carry_takes_back_what_went_aside(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """入れ替えを止めるときは %APPDATA% へ写した物を外す %APPDATA% は今の版でも読まれるので、
+        束の一部だけが残ると今の版の描画が変わる
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        self._write(layout.install, "配布物/common.mod2", "本人の common")
+        self._write(layout.staged, "配布物/common.mod2", "新しい版の common")
+        self._write(layout.install, "塞がれた/効果.anm2", "写せない")
+        (layout.staged / PORTABLE_SCRIPTS_DIR / "塞がれた").write_text("塞ぐ", encoding="utf-8")
+        with pytest.raises(package_module.CarryError):
+            carry_user_files(layout.install, layout.staged, aside=aside)
+        assert not (aside / "配布物" / "common.mod2").exists()
 
     def test_a_failure_is_raised_after_trying_everything(self, layout: Layout) -> None:
         """写せなかった物を黙って飛ばすと、呼んだ側が気付かずに入れ替え、本人の物は次の更新で
