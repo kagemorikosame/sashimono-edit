@@ -306,32 +306,75 @@ def carry_user_files(
             copied += 1
         else:
             failed.append((relative, problem))
-    for relative in script_links(install):
+    links = script_links(install)
+    for relative in links:
         # リンク（シンボリックリンク・ジャンクション）は先を写さず、同じ先を指すリンクを作り直す
         # 先は置き場の外のことがあり、写すと外の物を新しい版の中へ抱え込む
-        problem = _carry_link(source / relative, destination / _PORTABLE_SCRIPTS_DIR / relative)
+        # 扱いは普通のファイルと揃える（今の版の側が正 新しい版の同梱物は残して aside へ）
+        target = destination / _PORTABLE_SCRIPTS_DIR / relative
+        if target.exists() or is_link(target):
+            if _same_link(source / relative, target):
+                continue
+            if not overwrite and not is_link(target):
+                # 新しい版の同梱物と同じ名前 同梱物を残し、リンクは %APPDATA% の空いている所へ
+                if aside is None or (aside / relative).exists() or is_link(aside / relative):
+                    continue
+                target = aside / relative
+        problem = _carry_link(source / relative, target, overwrite=overwrite)
         if problem is None:
             copied += 1
-        elif problem:
+        else:
             failed.append((relative, problem))
     if failed:
-        raise CarryError(tuple(failed))
+        raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in links))
     return copied
 
 
-def _carry_link(origin: Path, target: Path) -> str | None:
-    """リンクを入れ替え先に作り直す 作ったら ``None``、要らなければ ``""``、作れなければ理由"""
+def _same_link(origin: Path, target: Path) -> bool:
+    """両方がリンクで、同じ先を指しているか"""
+    if not is_link(target):
+        return False
+    try:
+        return origin.readlink() == target.readlink()
+    except OSError:
+        return False
+
+
+def _remove_link(path: Path) -> None:
+    """リンクそのものだけを外す 先は辿らない（先の中身は消えない）
+
+    外す前に本当にリンクかを確かめる 普通のフォルダを rmdir やファイルの unlink で消すと、
+    本人の物を消すことになる ジャンクションとフォルダを指すシンボリックリンクは rmdir、
+    ファイルを指すシンボリックリンクは unlink で外す どちらもリンクの先には触らない
+    """
+    if not is_link(path):
+        raise OSError(f"リンクではないので外さない: {path.name}")
+    if path.is_junction() or path.is_dir():
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _carry_link(origin: Path, target: Path, *, overwrite: bool = False) -> str | None:
+    """リンクを入れ替え先に作り直す 作ったら ``None``、作れなければ理由
+
+    ``overwrite``（前の版へ戻す）では、入れ替え先に別の先を指すリンクがあれば、リンクそのもの
+    だけを外して今の版の先へ付け直す（今の版の側が正 本人がジャンクションを付け替えた）
+    リンクではない物（本当のフォルダやファイル）は外さない 本人の物かもしれない
+    """
     try:
         pointed = origin.readlink()
     except OSError as exc:
         return str(exc) or type(exc).__name__
     if is_link(target):
-        with contextlib.suppress(OSError):
-            if target.readlink() == pointed:
-                return ""
-        return "入れ替え先に同じ名前の別のリンクがある"
-    if target.exists():
-        return "入れ替え先に同じ名前の物がある"
+        if not overwrite:
+            return "入れ替え先に同じ名前の別のリンクがある"
+        try:
+            _remove_link(target)
+        except OSError as exc:
+            return str(exc) or type(exc).__name__
+    elif target.exists():
+        return "入れ替え先に同じ名前の、リンクではない物がある"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         if origin.is_junction():
@@ -350,8 +393,12 @@ def _carry_link(origin: Path, target: Path) -> str | None:
 class CarryError(Exception):
     """exe の隣の本人の物を、入れ替え先の版（か ``%APPDATA%``）へ写せなかった 入れ替えは止める"""
 
-    def __init__(self, failed: tuple[tuple[Path, str], ...]) -> None:
+    def __init__(
+        self, failed: tuple[tuple[Path, str], ...], *, links: tuple[Path, ...] = ()
+    ) -> None:
         self.failed = failed
+        #: 写せなかった物のうちリンク（シンボリックリンク・ジャンクション） 直し方が違う
+        self.links = links
         first, reason = failed[0]
         super().__init__(
             f"exe の隣の scripts の {len(failed)} 個を写せなかった（{first.as_posix()}: {reason}）"
@@ -366,10 +413,22 @@ class CarryError(Exception):
         lines.extend(f"  {path.as_posix()}（{reason}）" for path, reason in self.failed[:10])
         if len(self.failed) > 10:
             lines.append(f"  ほか {len(self.failed) - 10} 個")
-        lines.append(
-            "ディスクの空きと書き込みの権限を確かめるか、〔互換〕→〔exe の隣のスクリプトを移す…〕で"
-            " %APPDATA% へ移してから、〔ヘルプ〕→〔更新を確かめる…〕で入れ直してください"
-        )
+        if len(self.links) < len(self.failed):
+            lines.append(
+                "ディスクの空きと書き込みの権限を確かめるか、"
+                "〔互換〕→〔exe の隣のスクリプトを移す…〕で %APPDATA% へ移してから、"
+                "〔ヘルプ〕→〔更新を確かめる…〕で入れ直してください"
+            )
+        if self.links:
+            # リンクを含む束は自動では移さないので、「移してから」では片付かない 本人が外せる
+            # 手順を出す リンクを消しても先の中身は消えない
+            lines.append(
+                "リンク（ジャンクション・シンボリックリンク）は入れ替え先で作り直せませんでした"
+                " exe の隣の scripts でそのリンクを消し（エクスプローラで消しても、リンクの先の"
+                "中身は消えません）、入れ替えた後に作り直してください"
+                " または、リンクの先の物を〔互換〕→〔スクリプトフォルダを開く〕で開く所へ写して、"
+                "リンクを消してください"
+            )
         return "\n".join(lines)
 
 

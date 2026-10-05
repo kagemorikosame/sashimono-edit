@@ -19,6 +19,7 @@ import pytest
 
 from sashimono.compat.aviutl import catalog as catalog_module
 from sashimono.compat.aviutl.catalog import ScriptCatalog
+from sashimono.update import package as package_module
 from sashimono.update import portable as portable_module
 from sashimono.update.package import carry_user_files
 from sashimono.update.portable import (
@@ -590,6 +591,61 @@ class TestEdgeCases:
         carried = staged / PORTABLE_SCRIPTS_DIR / "素材"
         assert carried.is_junction()
         assert (carried / "大事.png").read_text(encoding="utf-8") == "png"
+
+    @windows_only
+    def test_rolling_back_takes_a_retargeted_junction(self, install: Path, tmp_path: Path) -> None:
+        """戻す先の版に別の先を指すジャンクションがあっても、リンクそのものだけを外して今の先へ
+        付け直す（PR #245 の CodeRabbit の指摘 付け替えた人が前の版へ戻れなくなっていた）
+        外したリンクの先の中身は残る
+        """
+        old_place = tmp_path / "前の素材"
+        old_place.mkdir()
+        (old_place / "前.png").write_text("前", encoding="utf-8")
+        new_place = tmp_path / "今の素材"
+        new_place.mkdir()
+        (new_place / "今.png").write_text("今", encoding="utf-8")
+        _junction(install / PORTABLE_SCRIPTS_DIR / "素材", new_place)
+        previous = tmp_path / "Programs" / "Sashimono.previous"
+        _junction(previous / PORTABLE_SCRIPTS_DIR / "素材", old_place)
+
+        assert carry_user_files(install, previous, overwrite=True) == 1
+        carried = previous / PORTABLE_SCRIPTS_DIR / "素材"
+        assert carried.is_junction()
+        assert (carried / "今.png").read_text(encoding="utf-8") == "今"
+        assert (old_place / "前.png").read_text(encoding="utf-8") == "前"
+
+    @windows_only
+    def test_a_real_folder_is_never_removed_as_a_link(self, install: Path, tmp_path: Path) -> None:
+        """リンクではない本当のフォルダは外さない 本人の物かもしれない 理由を挙げて止める"""
+        new_place = tmp_path / "今の素材"
+        new_place.mkdir()
+        _junction(install / PORTABLE_SCRIPTS_DIR / "素材", new_place)
+        previous = tmp_path / "Programs" / "Sashimono.previous"
+        real = previous / PORTABLE_SCRIPTS_DIR / "素材"
+        real.mkdir(parents=True)
+        (real / "本人の.png").write_text("残す", encoding="utf-8")
+        with pytest.raises(package_module.CarryError) as raised:
+            carry_user_files(install, previous, overwrite=True)
+        assert (real / "本人の.png").read_text(encoding="utf-8") == "残す"
+        assert raised.value.links == (Path("素材"),)
+        assert "リンクの先の中身は消えません" in raised.value.explain()
+
+    @windows_only
+    def test_a_junction_named_like_a_new_bundled_folder_goes_aside(
+        self, install: Path, tmp_path: Path
+    ) -> None:
+        """新しい版を入れるとき、同梱物と同じ名前のリンクは、普通のファイルと同じく %APPDATA% の
+        空いている所へ作り直す（同梱物を残し、入れ替えは止めない）
+        """
+        new_place = tmp_path / "今の素材"
+        new_place.mkdir()
+        _junction(install / PORTABLE_SCRIPTS_DIR / "見本", new_place)
+        staged = tmp_path / "Programs" / "Sashimono.new"
+        (staged / PORTABLE_SCRIPTS_DIR / "見本").mkdir(parents=True)
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        assert carry_user_files(install, staged, aside=aside) == 1
+        assert (aside / "見本").is_junction()
+        assert not (staged / PORTABLE_SCRIPTS_DIR / "見本").is_junction()
 
     def test_a_full_disk_is_found_before_copying(
         self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
