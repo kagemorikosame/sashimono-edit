@@ -29,14 +29,26 @@ def tool() -> ModuleType:
     return module
 
 
+REBUILT = {"run.exe": "a", "run_d.exe": "b", "runw.exe": "c", "runw_d.exe": "d"}
+STOCK = {"run.exe": "w", "run_d.exe": "x", "runw.exe": "y", "runw_d.exe": "z"}
+
+
 def test_rebuilt_bootloaders_pass(tool: ModuleType) -> None:
-    """全部のハッシュが既成の物と違えば通る"""
-    assert tool.compare({"run.exe": "a", "runw.exe": "b"}, {"run.exe": "x", "runw.exe": "y"}) == []
+    """要る 4 つが両側にあり、全部のハッシュが既成の物と違えば通る"""
+    assert tool.compare(REBUILT, STOCK) == []
+
+
+def test_a_bootloader_missing_on_both_sides_is_caught(tool: ModuleType) -> None:
+    """両側から同じ起動部が欠けても、残りが違えば通ってしまうと、配る exe の使う物を見落とす"""
+    installed = {name: digest for name, digest in REBUILT.items() if name != "runw.exe"}
+    stock = {name: digest for name, digest in STOCK.items() if name != "runw.exe"}
+    problems = tool.compare(installed, stock)
+    assert problems and all("runw.exe" in problem for problem in problems)
 
 
 def test_a_stock_bootloader_is_caught(tool: ModuleType) -> None:
     """1 つでも既成の物と同じなら止める 配る exe がどれを使うかに頼らない"""
-    problems = tool.compare({"run.exe": "a", "runw.exe": "y"}, {"run.exe": "x", "runw.exe": "y"})
+    problems = tool.compare({**REBUILT, "runw.exe": "y"}, STOCK)
     assert len(problems) == 1 and "runw.exe" in problems[0]
 
 

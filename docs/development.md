@@ -1940,7 +1940,7 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   ```
 
   起動部の中身が毎回少しずつ違っても構わない（既成の物と同じでなければよい）
-  検出されたかは `"%ProgramFiles%\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File <展開した Sashimono.exe> -DisableRemediation`
+  検出されたかは PowerShell で `& "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "<展開した Sashimono.exe の絶対パス>" -DisableRemediation`
   で見る（読むだけ 設定も除外も変えない）
 
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での

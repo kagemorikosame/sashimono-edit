@@ -32,6 +32,10 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 #: 配る exe が使う起動部の置き場（PyInstaller の包みの中）
 BOOTLOADER_DIR = PurePosixPath("PyInstaller/bootloader/Windows-64bit-intel")
 
+#: 必ず比べる起動部 窓あり・窓なしと、それぞれの調べる用（PyInstaller 6 の置き場の中身）
+#: どれを配る exe が使うかは組み立ての引数で変わるので、全部を見る
+REQUIRED = ("run.exe", "run_d.exe", "runw.exe", "runw_d.exe")
+
 
 def digests_in_wheel(wheel: Path) -> dict[str, str]:
     """既成の wheel の中の起動部 名前 → sha256"""
@@ -56,11 +60,13 @@ def compare(installed: Mapping[str, str], stock: Mapping[str, str]) -> list[str]
     """既成の物と同じ・比べられない起動部を挙げる 空なら全部組み直されている
 
     片方にしか無い物も問題に数える 名前が変わった版で比べ漏れて「違う」と通るのを防ぐ
+    要る名前（``REQUIRED``）は両側に無くても数える 両側から同じ物が欠けると、
+    比べる相手が無いまま残りだけで通ってしまう
     """
     problems: list[str] = []
     if not installed:
         problems.append("入っている起動部が見つからない")
-    for name in sorted(set(installed) | set(stock)):
+    for name in sorted(set(installed) | set(stock) | set(REQUIRED)):
         if name not in stock:
             problems.append(f"{name} が既成の wheel に無く比べられない")
         elif name not in installed:
@@ -78,7 +84,7 @@ def report(version: str, installed: Mapping[str, str], stock: Mapping[str, str])
         "| ファイル | 組み直した物 | 既成の wheel |",
         "| --- | --- | --- |",
     ]
-    for name in sorted(set(installed) | set(stock)):
+    for name in sorted(set(installed) | set(stock) | set(REQUIRED)):
         lines.append(f"| {name} | {installed.get(name, '-')} | {stock.get(name, '-')} |")
     return "\n".join(lines) + "\n"
 
