@@ -131,6 +131,8 @@ class ScriptMove:
     failed: tuple[tuple[Path, str], ...] = ()
     #: ほかの Sashimono が移している最中だったので、何もしなかった
     busy: bool = False
+    #: exe の隣の scripts そのものがリンクなので、何もしなかった（リンクの先の物を消さない）
+    linked: bool = False
 
 
 def _bundled(relative: Path) -> bool:
@@ -373,9 +375,13 @@ def clean_leftovers(install: Path, target: Path) -> list[Path]:
     """
     for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
         _remove_tree(leftover)
-    for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
-        with contextlib.suppress(OSError):
-            remove_file(leftover)  # 捨て損ねても読まれない（スクリプトの拡張子ではない）
+    # 写しの途中の物を探すのはリンクを辿らない走査で行い、移し先そのものがリンクなら探さない
+    # リンクの先（AviUtl と分け合うフォルダなど）の物を、名前だけで消さない
+    if not is_link(target):
+        for relative in walk_all(target)[0]:
+            if relative.name.endswith(_MOVING_SUFFIX):
+                with contextlib.suppress(OSError):
+                    remove_file(target / relative)  # 捨て損ねても読まれない
     return _recover_removed(install, target)
 
 
@@ -399,6 +405,12 @@ def move_user_scripts(
             # 引き継ぎを終えて入れ替え係を待っている・入れ替え係が走っている 今の版のフォルダが
             # .previous へ回る途中なので触らない（よけた元が .previous へ行って失われる）
             return ScriptMove(busy=True)
+        if is_link(install / PORTABLE_SCRIPTS_DIR):
+            # exe の隣の scripts そのものがリンク（ジャンクション・シンボリックリンク）
+            # AviUtl と分け合う Script フォルダや同期先を指していることがある 辿って移すと、
+            # 元を消す段でリンクの先の物を消し、起動しただけで共有のフォルダが空になる
+            # （PR #245 の Codex の指摘） 何も移さずに残す 本人の置き場はリンクの先にある
+            return ScriptMove(linked=True)
         # 錠を持てた ほかに移している人はいない 落ちた起動が残した物を片付ける
         clean_leftovers(install, target)
         return _move_all(install, target, should_stop or (lambda: False))

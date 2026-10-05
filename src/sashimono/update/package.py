@@ -34,6 +34,7 @@ from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
 from sashimono.update.portable import (
+    BUNDLED_SCRIPT_FILES,
     PORTABLE_SCRIPTS_DIR,
     bundles,
     clean_leftovers,
@@ -356,9 +357,16 @@ def carry_user_files(
                     for p in stuck
                 )
             )
-        copied, placed_aside, linked = _carry(
-            install, destination, overwrite=overwrite, aside=aside
-        )
+        placed_aside: list[Path]
+        linked: set[Path]
+        if is_link(install / _PORTABLE_SCRIPTS_DIR):
+            # exe の隣の scripts そのものがリンク 中身を辿って写さず（消しもしない）、同じ先を
+            # 指すリンクとして入れ替え先に作り直す（PR #245 の Codex の指摘）
+            copied, placed_aside, linked = _carry_linked_root(install, destination), [], set()
+        else:
+            copied, placed_aside, linked = _carry(
+                install, destination, overwrite=overwrite, aside=aside
+            )
         if swap_mark is not None:
             # 錠を放す前に「入れ替え係を待っている」印を置く 放してから入れ替え係が swap.lock を
             # 取るまでの隙に、別の窓が移し始めないようにする（PR #245 の CodeRabbit の指摘）
@@ -380,6 +388,50 @@ def carry_user_files(
 #: 引き継ぐ前に、移している別の窓が錠を放すのを待つ長さ（秒） 移しは束 1 つずつ錠を
 #: 持ち直さないので、全部を移し終えるまで待つことになる 長く待たせるより止めて知らせる
 CARRY_LOCK_WAIT = 10.0
+
+
+def _carry_linked_root(install: Path, destination: Path) -> int:
+    """exe の隣の scripts そのものがリンクのとき 入れ替え先の scripts を同じ先を指すリンクにする
+
+    入れ替え先の scripts は、新しい版（か戻る先の版）の同梱物だけを持つ本当のフォルダか、前に
+    作り直したリンク 同梱物だけなら外してリンクにする（同梱の説明はリンクの先に要らない）
+    本人の物が入った本当のフォルダは外さない（前の版へ戻すとき、更新の前に写した物が入っている
+    ことがある） そのときは止める 前に作ったリンクなら、同じ先ならそのまま、違えば付け直す
+    """
+    origin = install / _PORTABLE_SCRIPTS_DIR
+    target = destination / _PORTABLE_SCRIPTS_DIR
+    if _same_link(origin, target):
+        return 0
+    if not is_link(target) and target.is_dir():
+        files, links, unreadable = walk_all(target)
+        bundled_names = {name.casefold() for name in BUNDLED_SCRIPT_FILES}
+        theirs = [p for p in files if len(p.parts) > 1 or p.name.casefold() not in bundled_names]
+        if theirs or links or unreadable:
+            raise CarryError(
+                (
+                    (
+                        Path(_PORTABLE_SCRIPTS_DIR),
+                        "exe の隣の scripts はリンクだが、入れ替え先の scripts に本人の物がある",
+                    ),
+                ),
+                links=(Path(_PORTABLE_SCRIPTS_DIR),),
+            )
+        _remove_tree_strict(target)
+    problem = _carry_link(origin, target, overwrite=True)
+    if problem is not None:
+        raise CarryError(
+            ((Path(_PORTABLE_SCRIPTS_DIR), problem),), links=(Path(_PORTABLE_SCRIPTS_DIR),)
+        )
+    return 1
+
+
+def _remove_tree_strict(folder: Path) -> None:
+    """同梱物だけのフォルダを消す リンクの先は辿らない（walk_all で確かめた後に呼ぶ）"""
+    for relative in walk_all(folder)[0]:
+        remove_file(folder / relative)
+    for path in sorted(folder.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        path.rmdir()
+    folder.rmdir()
 
 
 def _carry(

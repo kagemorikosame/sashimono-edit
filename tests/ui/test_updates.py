@@ -919,6 +919,28 @@ class TestScriptsBesideTheExe:
         source = inspect.getsource(MainWindow.closeEvent)
         assert "self._updates.shutdown()" in source
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="ジャンクションは Windows の物")
+    def test_a_linked_scripts_folder_is_told_once_and_left_alone(
+        self, harness: _Harness, asked: list[str], tmp_path: Path
+    ) -> None:
+        """exe の隣の scripts そのものがリンクなら移さず、そう 1 度だけ知らせる
+
+        PR #245 の Codex の指摘
+        """
+        import _winapi  # type: ignore[import-not-found,unused-ignore]
+        import shutil
+
+        shared = tmp_path / "分け合うフォルダ"
+        shared.mkdir()
+        (shared / "効果.anm2").write_text("obj.ox = 1\n", encoding="utf-8")
+        scripts = harness.layout.install / "scripts"
+        shutil.rmtree(scripts, ignore_errors=True)
+        _winapi.CreateJunction(str(shared), str(scripts))
+        harness.controller.start()
+        harness.controller.start()
+        assert (shared / "効果.anm2").is_file()
+        assert len(harness.notified) == 1 and "リンク" in harness.notified[0][1]
+
     def test_restarting_waits_for_the_move(self, harness: _Harness) -> None:
         """移している最中に入れ替えると、写す側と移す側が同じファイルを同時に触る"""
         harness.controller.start()

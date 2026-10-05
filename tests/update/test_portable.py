@@ -661,6 +661,91 @@ class TestEdgeCases:
         assert (aside / "見本").is_junction()
         assert not (staged / PORTABLE_SCRIPTS_DIR / "見本").is_junction()
 
+    def _linked_scripts(self, install: Path, tmp_path: Path) -> Path:
+        """exe の隣の scripts そのものを、AviUtl と分け合うフォルダを指すジャンクションにする"""
+        shared = tmp_path / "ProgramData" / "aviutl2" / "Script"
+        (shared / "配布物").mkdir(parents=True)
+        (shared / "配布物" / "効果.anm2").write_text("obj.ox = 1\n", encoding="utf-8")
+        (shared / "単独.obj2").write_text("--track\n", encoding="utf-8")
+        shutil.rmtree(install / PORTABLE_SCRIPTS_DIR)
+        _junction(install / PORTABLE_SCRIPTS_DIR, shared)
+        return shared
+
+    @windows_only
+    def test_a_linked_scripts_folder_is_never_emptied(
+        self, install: Path, target: Path, tmp_path: Path
+    ) -> None:
+        """exe の隣の scripts そのものがジャンクションなら何も移さない 辿って移すと、元を消す段で
+        リンクの先（AviUtl と分け合う Script フォルダや同期先）が空になる（PR #245 の Codex の指摘）
+        """
+        shared = self._linked_scripts(install, tmp_path)
+        before = sorted(p.relative_to(shared) for p in shared.rglob("*") if p.is_file())
+        result = move_user_scripts(install, target)
+        assert result.linked and result.moved == ()
+        after = sorted(p.relative_to(shared) for p in shared.rglob("*") if p.is_file())
+        assert after == before == [Path("単独.obj2"), Path("配布物/効果.anm2")]
+        assert (install / PORTABLE_SCRIPTS_DIR).is_junction()
+        assert not target.exists() or not any(target.rglob("*"))
+
+    @windows_only
+    def test_a_linked_scripts_folder_is_carried_as_a_link(
+        self, install: Path, tmp_path: Path
+    ) -> None:
+        """自動更新は、リンクの先を辿って写さず、同じ先を指すジャンクションとして作り直す
+        新しい版の scripts（同梱の説明だけ）は外す 戻すときも同じ
+        """
+        shared = self._linked_scripts(install, tmp_path)
+        staged = tmp_path / "Programs" / "Sashimono.new"
+        (staged / PORTABLE_SCRIPTS_DIR).mkdir(parents=True)
+        (staged / PORTABLE_SCRIPTS_DIR / "README.txt").write_text("新しい説明", encoding="utf-8")
+        assert carry_user_files(install, staged) == 1
+        carried = staged / PORTABLE_SCRIPTS_DIR
+        assert carried.is_junction()
+        assert (carried / "単独.obj2").read_text(encoding="utf-8") == "--track\n"
+        assert (shared / "配布物" / "効果.anm2").is_file()
+        # 戻すとき（前の版の scripts が別の先を指すリンク）も、リンクだけを付け直す
+        previous = tmp_path / "Programs" / "Sashimono.previous"
+        elsewhere = tmp_path / "前の先"
+        elsewhere.mkdir()
+        (elsewhere / "前.anm2").write_text("前", encoding="utf-8")
+        _junction(previous / PORTABLE_SCRIPTS_DIR, elsewhere)
+        assert carry_user_files(install, previous, overwrite=True) == 1
+        assert (previous / PORTABLE_SCRIPTS_DIR / "単独.obj2").is_file()
+        assert (elsewhere / "前.anm2").read_text(encoding="utf-8") == "前"
+
+    @windows_only
+    def test_a_linked_scripts_folder_never_replaces_their_real_folder(
+        self, install: Path, tmp_path: Path
+    ) -> None:
+        """戻る先の scripts が本人の物の入った本当のフォルダなら外さずに止める"""
+        self._linked_scripts(install, tmp_path)
+        previous = tmp_path / "Programs" / "Sashimono.previous"
+        (previous / PORTABLE_SCRIPTS_DIR).mkdir(parents=True)
+        mine = previous / PORTABLE_SCRIPTS_DIR / "前に写した.anm2"
+        mine.write_text("本人の", encoding="utf-8")
+        with pytest.raises(package_module.CarryError):
+            carry_user_files(install, previous, overwrite=True)
+        assert mine.read_text(encoding="utf-8") == "本人の"
+
+    @windows_only
+    def test_a_linked_destination_keeps_what_is_there(
+        self, install: Path, target: Path, tmp_path: Path
+    ) -> None:
+        """移し先（%APPDATA% の scripts）がリンクでも、先にある物を消さない 写しの途中の物を
+        名前だけで探して消す片付けも、リンクの先では行わない
+        """
+        elsewhere = tmp_path / "同期先"
+        elsewhere.mkdir()
+        (elsewhere / "前から.anm2").write_text("前から", encoding="utf-8")
+        (elsewhere / "名前が似ている.anm2.1.moving").write_text("本人の", encoding="utf-8")
+        _junction(target, elsewhere)
+        _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        result = move_user_scripts(install, target)
+        assert result.moved == (Path("配布物/効果.anm2"),)
+        assert (elsewhere / "前から.anm2").read_text(encoding="utf-8") == "前から"
+        assert (elsewhere / "名前が似ている.anm2.1.moving").is_file()
+        assert (elsewhere / "配布物" / "効果.anm2").is_file()
+
     def test_a_full_disk_is_found_before_copying(
         self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -50,6 +50,7 @@ from sashimono.update.portable import (
     clear_finished_swaps,
     clear_swap_pending,
     in_synced_folder,
+    is_link,
     move_user_scripts,
     new_swap_token,
     unoffered,
@@ -419,6 +420,19 @@ class UpdateController(QObject):
                     "スクリプトの置き場",
                     "ほかの Sashimono の窓が移しています 終わってからもう一度選んでください",
                 )
+            return
+        if result.linked:
+            # exe の隣の scripts そのものがリンク 何も移していない 1 度だけ知らせる
+            text = (
+                "Sashimono.exe の隣の scripts フォルダは、別の場所を指すリンク（ジャンクション・"
+                "シンボリックリンク）なので、自動では移しません（リンクの先は AviUtl と分け合う"
+                "フォルダや同期先のことがあり、移すと先の物を消してしまうため） リンクの先の物は"
+                "これまでどおり読み込みます 自動更新でもリンクとして引き継ぎます"
+            )
+            if loud:
+                self._inform("スクリプトの置き場", text)
+            elif fresh:
+                self._notify("スクリプトの置き場", text)
             return
         if (result.moved or result.left) and self._rescan_scripts is not None:
             self._rescan_scripts()
@@ -828,7 +842,9 @@ class UpdateController(QObject):
     def _by_hand_notes(self, new_abi: str) -> str:
         """配布のページから手で入れ替える人への注意 消える物と、入れ直しが要る物"""
         notes = []
-        if self._layout is not None:
+        # exe の隣の scripts そのものがリンクなら、フォルダごと入れ替えても消えるのはリンクだけで、
+        # 先の物は残る 「消えます」とは言わない
+        if self._layout is not None and not is_link(self._layout.install / PORTABLE_SCRIPTS_DIR):
             mine = user_script_files(self._layout.install)
             if mine:
                 notes.append(
