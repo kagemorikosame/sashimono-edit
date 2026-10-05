@@ -736,10 +736,10 @@ class TestEdgeCases:
         印が古くなれば（入れ替えに失敗して残った）また移す
         """
         mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
-        portable_module.mark_swap_pending(target.parent, "0.1.0")
+        portable_module.mark_swap_pending(target.parent, "0.1.0", "甲")
         assert move_user_scripts(install, target).busy
         assert mine.is_file()
-        marker = target.parent / portable_module.SWAP_PENDING
+        marker = target.parent / f"{portable_module.SWAP_PENDING}.甲"
         marker.write_text("0.1.0\n0", encoding="utf-8")  # 古い印
         assert move_user_scripts(install, target).moved == (Path("配布物/効果.anm2"),)
 
@@ -760,11 +760,37 @@ class TestEdgeCases:
     def test_the_marker_is_kept_until_the_version_changes(self, target: Path) -> None:
         """印は入れ替えが済んだ（今の版が印の版と違う）ときに外す 同じ版ならまだ入れ替えていない"""
         folder = target.parent
-        portable_module.mark_swap_pending(folder, "0.1.0")
-        portable_module.clear_swap_pending(folder, unless_version="0.1.0")
+        portable_module.mark_swap_pending(folder, "0.1.0", "甲")
+        portable_module.clear_finished_swaps(folder, "0.1.0")
         assert portable_module.swap_pending(folder)
-        portable_module.clear_swap_pending(folder, unless_version="0.1.1")
+        portable_module.clear_finished_swaps(folder, "0.1.1")
         assert not portable_module.swap_pending(folder)
+
+    def test_clearing_one_window_s_marker_keeps_the_other(self, target: Path) -> None:
+        """2 つの窓が続けて引き継いでも、先の窓が入れ替え係を起こせずに外すのは自分の印だけ
+        （PR #245 の CodeRabbit の指摘 1 つのファイルを分け合っていた頃は、後の窓の印まで消え、
+        後の窓の入れ替え係が swap.lock を取るまでの隙に移しが始まった）
+        """
+        folder = target.parent
+        first, second = portable_module.new_swap_token(), portable_module.new_swap_token()
+        assert first != second
+        portable_module.mark_swap_pending(folder, "0.1.0", first)
+        portable_module.mark_swap_pending(folder, "0.1.0", second)
+        portable_module.clear_swap_pending(folder, first)
+        assert portable_module.swap_pending(folder)
+        portable_module.clear_swap_pending(folder, second)
+        assert not portable_module.swap_pending(folder)
+
+    def test_finished_and_stale_markers_are_cleared_per_window(self, target: Path) -> None:
+        """起動の後の片付けは印ごとに見る 済んだ印（版が違う）と古い印を外し、待っている印は残す"""
+        folder = target.parent
+        portable_module.mark_swap_pending(folder, "0.1.0", "済んだ")
+        portable_module.mark_swap_pending(folder, "0.1.1", "待っている")
+        stale = folder / f"{portable_module.SWAP_PENDING}.古い"
+        stale.write_text("0.1.1\n0", encoding="utf-8")
+        portable_module.clear_finished_swaps(folder, "0.1.1")
+        left = sorted(p.name for p in folder.glob(f"{portable_module.SWAP_PENDING}.*"))
+        assert left == [f"{portable_module.SWAP_PENDING}.待っている"]
 
     def test_a_folder_swapped_away_stops_before_the_next_bundle(
         self, install: Path, target: Path, tmp_path: Path

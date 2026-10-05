@@ -277,7 +277,7 @@ def carry_user_files(
     overwrite: bool = False,
     aside: Path | None = None,
     config: Path | None = None,
-    swap_from: str | None = None,
+    swap_mark: tuple[str, str] | None = None,
 ) -> int:
     """今の版の exe の隣のスクリプト置き場に本人が置いた物を、入れ替え先の版へ写す 写した数を返す
 
@@ -314,8 +314,9 @@ def carry_user_files(
     よけたまま残した元を元の場所へ戻してから写す（戻さずに入れ替えると、今の版のフォルダごと
     ``.previous`` へ回り、次の更新で消える）
 
-    ``swap_from``（入れ替える前の版）を渡すと、写し終えて錠を放す前に「入れ替え係を待っている」
-    印（``portable.SWAP_PENDING``）を置く この後に入れ替え係を起こす呼び手が渡す
+    ``swap_mark``（入れ替える前の版と、``portable.new_swap_token`` で作った識別子）を渡すと、
+    写し終えて錠を放す前に「入れ替え係を待っている」印（``portable.SWAP_PENDING``）を置く
+    この後に入れ替え係を起こす呼び手が渡し、起こせなければ同じ識別子で外す
     """
     folder = config if config is not None else userdirs.config_root()
     lock = hold_move_lock(folder, wait=CARRY_LOCK_WAIT)
@@ -331,11 +332,11 @@ def carry_user_files(
     try:
         clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
         copied = _carry(install, destination, overwrite=overwrite, aside=aside)
-        if swap_from is not None:
+        if swap_mark is not None:
             # 錠を放す前に「入れ替え係を待っている」印を置く 放してから入れ替え係が swap.lock を
             # 取るまでの隙に、別の窓が移し始めないようにする（PR #245 の CodeRabbit の指摘）
-            # 入れ替え係を起こせなければ、呼んだ側が外す
-            mark_swap_pending(folder, swap_from)
+            # 入れ替え係を起こせなければ、呼んだ側が同じ識別子で外す
+            mark_swap_pending(folder, *swap_mark)
         return copied
     finally:
         lock.release()

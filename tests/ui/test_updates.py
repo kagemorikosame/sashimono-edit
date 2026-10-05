@@ -861,30 +861,43 @@ class TestScriptsBesideTheExe:
             controller.deleteLater()
             qt_application.processEvents()
 
-    def test_a_swapper_that_cannot_start_clears_the_marker(self, harness: _Harness) -> None:
-        """画面から入れ替えるとき、入れ替え係を起こせなければ「入れ替え係を待っている」印を外す
-        （残すと移しが印の切れるまで止まる） 起こせたら残す（入れ替え係が swap.lock を取るまでの隙）
+    def test_a_failed_launch_clears_only_its_own_marker_so_moves_are_not_held_10_minutes(
+        self, harness: _Harness
+    ) -> None:
+        """画面から入れ替えるとき、入れ替え係を起こせなければ自分の「入れ替え係を待っている」印を
+        外す 壊れて外れないと、exe の隣のスクリプトの移しが印の期限（10 分）まで止まる
+        ほかの窓が置いた印は外さない（PR #245 の CodeRabbit の指摘 外すと、その窓の入れ替え係が
+        swap.lock を取るまでの隙に移しが始まる）
         """
         from sashimono.core import userdirs
-        from sashimono.update.portable import swap_pending
+        from sashimono.update.portable import SWAP_PENDING, mark_swap_pending, swap_pending
 
         harness.controller.start()
+        mark_swap_pending(userdirs.config_root(), __version__, "ほかの窓")
 
         def refuse(plan: SwapPlan) -> Launched:
             raise OSError("台本の実行が止められている")
 
         harness.controller._launcher = refuse
         assert not harness.controller.restart_now()
-        assert not swap_pending(userdirs.config_root())
+        left = sorted(p.name for p in userdirs.config_root().glob(f"{SWAP_PENDING}.*"))
+        assert left == [f"{SWAP_PENDING}.ほかの窓"]
+        assert swap_pending(userdirs.config_root())
 
-    def test_the_marker_is_cleared_once_the_version_changed(self, harness: _Harness) -> None:
+    def test_a_finished_swap_s_marker_is_cleared_so_moves_are_not_held_10_minutes(
+        self, harness: _Harness
+    ) -> None:
+        """入れ替えが済んだ（印の版と今の版が違う）印は起動の後に外す 外れないと、移しが印の
+        期限（10 分）まで止まる 同じ版の印はまだ入れ替えていないので残す
+        """
         from sashimono.core import userdirs
         from sashimono.update.portable import mark_swap_pending, swap_pending
 
-        mark_swap_pending(userdirs.config_root(), __version__)
+        mark_swap_pending(userdirs.config_root(), __version__, "待っている")
         harness.controller.start()
         assert swap_pending(userdirs.config_root())  # まだ入れ替えていない
-        mark_swap_pending(userdirs.config_root(), "0.0.1")
+        (userdirs.config_root() / "scripts-move.swap-pending.待っている").unlink()
+        mark_swap_pending(userdirs.config_root(), "0.0.1", "済んだ")
         harness.controller.start()
         assert not swap_pending(userdirs.config_root())  # 入れ替えが済んだ
 

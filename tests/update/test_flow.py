@@ -151,6 +151,10 @@ class TestApplyingOnStart:
         assert not apply_on_start(
             ["x"], layout=layout, store=store, swap=cannot_start, current="1.1.0"
         )
+        # 起こせなかった 2 回目は自分の印だけを外す 1 回目（起こせた）の印は残る
+        markers = list(userdirs.config_root().glob("scripts-move.swap-pending.*"))
+        assert len(markers) == 1
+        markers[0].unlink()
         assert not swap_pending(userdirs.config_root())
 
     def test_a_move_in_another_window_stops_the_swap(

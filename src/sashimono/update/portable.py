@@ -35,6 +35,7 @@ import os
 import shutil
 import stat
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ __all__ = [
     "ScriptMove",
     "bundles",
     "clean_leftovers",
+    "clear_finished_swaps",
     "clear_swap_pending",
     "hold_move_lock",
     "in_synced_folder",
@@ -58,6 +60,7 @@ __all__ = [
     "module_stem",
     "modules_in",
     "move_user_scripts",
+    "new_swap_token",
     "remove_file",
     "script_links",
     "swap_pending",
@@ -389,6 +392,9 @@ def move_user_scripts(
 #: （PowerShell）で、この錠を受け取れない 放してから入れ替え係が ``swap.lock`` を取るまでの
 #: 隙に別の窓が移し始めると、よけた元が今の版のフォルダごと .previous へ回って失われる
 #: （PR #245 の CodeRabbit の指摘） そこで錠を放す前にこの印を置き、移しは印が新しい間は始めない
+#: 印は引き継ぎごとに別のファイル（``scripts-move.swap-pending.<識別子>``）にする 1 つのファイルを
+#: 分け合うと、2 つの窓が続けて引き継いだとき、先の窓が入れ替え係を起こせずに外した所で後の窓の
+#: 印まで消える（PR #245 の CodeRabbit の指摘） 移しは、どれか 1 つでも新しければ始めない
 SWAP_PENDING = "scripts-move.swap-pending"
 
 #: 印が効く長さ（秒） 入れ替え係は窓が全部閉じるのを待ち（120 秒まで）、新しい版が起動できたかを
@@ -396,40 +402,72 @@ SWAP_PENDING = "scripts-move.swap-pending"
 SWAP_PENDING_SECONDS = 10 * 60
 
 
-def mark_swap_pending(folder: Path, version: str) -> None:
-    """引き継ぎを終えて入れ替え係を起こす前に置く ``version`` は入れ替える前の版"""
-    marker = folder / SWAP_PENDING
+def new_swap_token() -> str:
+    """引き継ぎごとの識別子 プロセス番号と乱数（同じプロセスで 2 度引き継いでも重ならない）"""
+    return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def _marker(folder: Path, token: str) -> Path:
+    return folder / f"{SWAP_PENDING}.{token}"
+
+
+def _markers(folder: Path) -> list[Path]:
+    try:
+        return list(folder.glob(f"{SWAP_PENDING}.*"))
+    except OSError:
+        return []
+
+
+def _read_marker(marker: Path) -> tuple[str, float] | None:
+    """印の中身（入れ替える前の版・置いた時刻） 読めなければ ``None``"""
+    try:
+        version, written = marker.read_text(encoding="utf-8").split("\n")[:2]
+        return version, float(written)
+    except (OSError, ValueError):
+        return None
+
+
+def mark_swap_pending(folder: Path, version: str, token: str) -> None:
+    """引き継ぎを終えて入れ替え係を起こす前に置く ``version`` は入れ替える前の版
+
+    ``token`` は :func:`new_swap_token` で作った、この引き継ぎの識別子 外すときに同じ物を渡す
+    """
     with contextlib.suppress(OSError):
         folder.mkdir(parents=True, exist_ok=True)
-        marker.write_text(f"{version}\n{time.time()}", encoding="utf-8")
+        _marker(folder, token).write_text(f"{version}\n{time.time()}", encoding="utf-8")
 
 
-def clear_swap_pending(folder: Path, *, unless_version: str | None = None) -> None:
-    """印を外す 入れ替え係を起こせなかったとき・入れ替えが済んだと分かったときに呼ぶ
-
-    ``unless_version`` を渡すと、印がその版（入れ替える前の版）のものなら外さない まだ入れ替えて
-    いない（入れ替え係が窓の閉じるのを待っている）か、入れ替えに失敗して戻った 失敗した印は
-    :data:`SWAP_PENDING_SECONDS` を過ぎれば効かなくなる
-    """
-    marker = folder / SWAP_PENDING
-    if unless_version is not None:
-        try:
-            recorded = marker.read_text(encoding="utf-8").split("\n", 1)[0]
-        except OSError:
-            return
-        if recorded == unless_version:
-            return
+def clear_swap_pending(folder: Path, token: str) -> None:
+    """自分の引き継ぎの印だけを外す 入れ替え係を起こせなかったときに呼ぶ ほかの窓の印は残す"""
     with contextlib.suppress(OSError):
-        marker.unlink(missing_ok=True)
+        _marker(folder, token).unlink(missing_ok=True)
+
+
+def clear_finished_swaps(
+    folder: Path, current_version: str, *, clock: Callable[[], float] = time.time
+) -> None:
+    """入れ替えが済んだ印と、古くなった印を外す 起動の後に呼ぶ
+
+    印の版（入れ替える前の版）が今の版と違えば、その入れ替えは済んだ 同じ版の印は、まだ入れ替えて
+    いない（入れ替え係がほかの窓の閉じるのを待っている）か、入れ替えに失敗して戻った物 前者を外すと
+    受け渡しの隙が開くので残す 後者は :data:`SWAP_PENDING_SECONDS` を過ぎたら外す（効かなくなった
+    印を溜めない）
+    """
+    for marker in _markers(folder):
+        read = _read_marker(marker)
+        stale = read is None or not 0 <= clock() - read[1] < SWAP_PENDING_SECONDS
+        if stale or (read is not None and read[0] != current_version):
+            with contextlib.suppress(OSError):
+                marker.unlink(missing_ok=True)
 
 
 def swap_pending(folder: Path, *, clock: Callable[[], float] = time.time) -> bool:
-    """入れ替え係を待っている印が新しいか"""
-    try:
-        written = float((folder / SWAP_PENDING).read_text(encoding="utf-8").split("\n")[1])
-    except (OSError, ValueError, IndexError):
-        return False
-    return 0 <= clock() - written < SWAP_PENDING_SECONDS
+    """入れ替え係を待っている印が 1 つでも新しいか"""
+    for marker in _markers(folder):
+        read = _read_marker(marker)
+        if read is not None and 0 <= clock() - read[1] < SWAP_PENDING_SECONDS:
+            return True
+    return False
 
 
 def _swapping() -> bool:
