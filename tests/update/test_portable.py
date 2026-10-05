@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -17,11 +18,13 @@ import pytest
 
 from sashimono.compat.aviutl import catalog as catalog_module
 from sashimono.compat.aviutl.catalog import ScriptCatalog
+from sashimono.update import portable as portable_module
 from sashimono.update.package import carry_user_files
 from sashimono.update.portable import (
     BUNDLED_SCRIPT_FILES,
     MODULE_FILE_SUFFIXES,
     PORTABLE_SCRIPTS_DIR,
+    ScriptMove,
     bundles,
     move_user_scripts,
     unoffered,
@@ -405,6 +408,71 @@ class TestBundles:
         assert entry.path == Path("配布物/効果.anm2")
         assert entry.folder == target / "配布物"
         assert self._run(roots, target / "配布物" / "効果.anm2") == 1
+
+    def _interleave(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[list[Path], list[object]]:
+        """1 つ目の移しが確定の 1 つ目を置いた所で、2 つ目の移しを最後まで走らせる
+
+        2 つの Sashimono が同時に起動して移すのをまねる
+        """
+        originals = self._bundle(install)
+        real_rename = Path.rename
+        second: list[object] = []
+
+        def interleaved(self: Path, destination: Path) -> Path:
+            moved = real_rename(self, destination)
+            if ".scripts-moving-" in str(self) and not second:
+                second.append(None)
+                second[0] = portable_module.move_user_scripts(install, target)
+            return moved
+
+        monkeypatch.setattr(Path, "rename", interleaved)
+        # 2 つ目は別の起動なので、作業用のフォルダの名前（プロセス番号）も別にする
+        pids = iter((101, 202))
+        monkeypatch.setattr(os, "getpid", lambda: next(pids, 303))
+        return originals, second
+
+    def test_two_moves_at_once_do_not_lose_anything(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同時に移すと、片方の写しを当てにしてもう片方が元を消し、最初の方の巻き戻しで写しが
+        外れて両方の置き場から失われていた（PR #245 の Codex の指摘） 錠で 1 つずつにする
+        """
+        _originals, second = self._interleave(install, target, monkeypatch)
+        first = move_user_scripts(install, target)
+        monkeypatch.undo()
+        assert isinstance(second[0], ScriptMove) and second[0].busy
+        assert len(first.moved) == 3
+        for relative in ("配布物/効果.anm2", "配布物/common.lua", "配布物/画像/星.png"):
+            assert (target / relative).is_file(), relative
+
+    def test_a_rollback_never_takes_back_a_copy_someone_relied_on(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """錠を持たない移し（古い版など）と重なっても、元が消えた写しは巻き戻しで外さない"""
+
+        class Granted:
+            def release(self) -> None:
+                pass
+
+        monkeypatch.setattr(portable_module, "try_hold", lambda _path: Granted())
+        self._interleave(install, target, monkeypatch)
+        move_user_scripts(install, target)
+        monkeypatch.undo()
+        for relative in ("配布物/効果.anm2", "配布物/common.lua", "配布物/画像/星.png"):
+            here = (install / PORTABLE_SCRIPTS_DIR / relative).is_file()
+            there = (target / relative).is_file()
+            assert here or there, f"{relative} がどちらの置き場からも失われた"
+
+    def test_leftovers_of_a_crashed_move_are_cleared(self, install: Path, target: Path) -> None:
+        """落ちた起動の作業用のフォルダは、錠を取れた次の移しが片付ける"""
+        leftover = target.parent / ".scripts-moving-99999"
+        (leftover / "配布物").mkdir(parents=True)
+        (leftover / "配布物" / "効果.anm2").write_text("途中", encoding="utf-8")
+        self._bundle(install)
+        move_user_scripts(install, target)
+        assert not leftover.exists()
 
     def test_the_bundles(self) -> None:
         found = bundles(

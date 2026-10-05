@@ -36,9 +36,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from sashimono.core.io.locks import try_hold
+
 __all__ = [
     "BUNDLED_SCRIPT_FILES",
     "MODULE_FILE_SUFFIXES",
+    "MOVE_LOCK",
     "PORTABLE_SCRIPTS_DIR",
     "ScriptMove",
     "bundles",
@@ -60,6 +63,10 @@ BUNDLED_SCRIPT_FILES = frozenset({"README.txt"})
 #: C_MODULE_SUFFIX） runtime は Lua と numpy を読むので名前だけ持つ 食い違えば試験が落とす
 MODULE_FILE_SUFFIXES = (".lua", ".mod", ".mod2", ".dll")
 
+#: 移している間に持つ錠の名前（移し先の親 ``%APPDATA%\Sashimono`` の下）
+#: 自動更新の ``stage.lock`` ``swap.lock`` と同じく :mod:`sashimono.core.io.locks` の錠
+MOVE_LOCK = "scripts-move.lock"
+
 #: 写している途中の名前に付ける印 スクリプトの拡張子ではないので、途中の物は読まれない
 _MOVING_SUFFIX = ".moving"
 
@@ -80,6 +87,8 @@ class ScriptMove:
     left: tuple[Path, ...] = ()
     #: 写せなかった物と理由 元はそのまま
     failed: tuple[tuple[Path, str], ...] = ()
+    #: ほかの Sashimono が移している最中だったので、何もしなかった
+    busy: bool = False
 
 
 def _bundled(relative: Path) -> bool:
@@ -194,7 +203,27 @@ def _plan(source: Path, target: Path, files: list[Path]) -> tuple[set[str], set[
 
 
 def move_user_scripts(install: Path, target: Path) -> ScriptMove:
-    """exe の隣の ``scripts`` に本人が置いた物を ``target`` へ移す 決まりは上の説明のとおり"""
+    """exe の隣の ``scripts`` に本人が置いた物を ``target`` へ移す 決まりは上の説明のとおり
+
+    **移すのは 1 つずつ** 移し先の親（``%APPDATA%\\Sashimono``）の錠（``MOVE_LOCK``）を持って
+    行う 2 つの Sashimono が同じ束を同時に移すと、片方が置いた写しをもう片方が「同じ中身」と
+    見て元を消し、その後に最初の方が名前の衝突で巻き戻して写しを外し、両方の置き場から失われる
+    （PR #245 の Codex の指摘） 錠を取れなければ何もせずに ``busy`` を返す（次の起動で移す）
+    錠の持ち主が落ちていれば、次に取るときに片付く（:mod:`sashimono.core.io.locks`）
+    """
+    lock = try_hold(target.parent / MOVE_LOCK)
+    if lock is None:
+        return ScriptMove(busy=True)
+    try:
+        # 錠を持てた ほかに移している人はいない 落ちた起動が残した作業用のフォルダを片付ける
+        for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
+            shutil.rmtree(leftover, ignore_errors=True)
+        return _move_all(install, target)
+    finally:
+        lock.release()
+
+
+def _move_all(install: Path, target: Path) -> ScriptMove:
     source = install / PORTABLE_SCRIPTS_DIR
     files = user_script_files(install)
     stay, clashes = _plan(source, target, files)
@@ -266,10 +295,15 @@ def _place_bundle(source: Path, target: Path, members: list[Path]) -> str | None
                 # 置き換えはしない Windows の rename は在る名前へは付けられないので、写している
                 # 間に本人かほかの窓が同じ名前を置いたら、そちらを残してここで止まる
                 (staging / relative).rename(destination)
-                placed.append(destination)
+                placed.append(relative)
         except OSError:
-            for destination in placed:
-                # 外すのは今置いた写しだけ 元は exe の隣に残っている
+            for relative in placed:
+                destination = target / relative
+                # 外すのは自分が名前を付けて置いた写しだけ さらに元が exe の隣に残っているときに
+                # 限る 元が無ければ、ほかの誰か（錠を持たない古い版の移し・本人）がこの写しを
+                # 当てにして元を消した 外すと両方の置き場から失われる（PR #245 の Codex の指摘）
+                if not _same(source / relative, destination):
+                    continue
                 with contextlib.suppress(OSError):
                     destination.unlink()
                 # 置くために作って空になったフォルダも外す 本人が前から持っていた空の

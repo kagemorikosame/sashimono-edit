@@ -638,6 +638,64 @@ class TestScriptsBesideTheExe:
         harness.controller.start()
         assert len(harness.notified) == 1
 
+    def test_moving_runs_off_the_ui_thread(
+        self, harness: _Harness, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """走査・写し・照らし・元を消すのは裏のスレッド 大きな配布物で編集画面を固めない
+        （PR #245 の Codex の指摘） 知らせとスクリプトの読み直しだけ画面の側へ戻す
+        """
+        import threading
+        import time
+
+        from sashimono.update.portable import move_user_scripts as real_move
+
+        release_move = threading.Event()
+        threads: list[str] = []
+
+        def slow_move(install: Path, target: Path) -> object:
+            threads.append(threading.current_thread().name)
+            release_move.wait(10)
+            return real_move(install, target)
+
+        monkeypatch.setattr(updates_module, "move_user_scripts", slow_move)
+        mine = _put_script(harness.layout.install, "自分の/効果.anm2")
+        controller = UpdateController(
+            harness.window,
+            preferences=lambda: Preferences(update_check=False),
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=True,
+        )
+        notified: list[str] = []
+        rescanned: list[str] = []
+
+        def notify(title: str, text: str) -> None:
+            notified.append(text)
+
+        controller._notify = notify  # type: ignore[method-assign]
+        controller._rescan_scripts = lambda: rescanned.append(threading.current_thread().name)
+        try:
+            began = time.monotonic()
+            assert controller.offer_script_move()
+            # 移し終えるのを待たずに戻る（画面は動き続ける）
+            assert time.monotonic() - began < 2
+            assert mine.is_file() and notified == []
+            # 移している間にもう一度呼んでも、2 つ目は始めない
+            assert not controller.offer_script_move()
+            release_move.set()
+            deadline = time.monotonic() + 10
+            while not notified and time.monotonic() < deadline:
+                qt_application.processEvents()
+                time.sleep(0.02)
+            assert threads and threads[0] != threading.main_thread().name
+            assert len(notified) == 1 and not mine.exists()
+            assert rescanned == [threading.main_thread().name]
+        finally:
+            release_move.set()
+            controller.deleteLater()
+
     def test_the_notice_does_not_block_the_editor(
         self, harness: _Harness, qt_application: QApplication
     ) -> None:

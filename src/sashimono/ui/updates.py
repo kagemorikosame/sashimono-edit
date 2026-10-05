@@ -134,6 +134,12 @@ class UpdateController(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(_POLL_MS)
         self._timer.timeout.connect(self._poll)
+        #: exe の隣のスクリプトを裏で移している間は真 終わった後に画面で行うことを受け取る
+        self._moving = False
+        self._move_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._move_timer = QTimer(self)
+        self._move_timer.setInterval(_POLL_MS)
+        self._move_timer.timeout.connect(self._poll_moves)
         #: 入れ替えを待っている版があるときだけ、ステータスバーに出すボタン
         self.button = QPushButton(window)
         self.button.setFlat(True)
@@ -231,7 +237,9 @@ class UpdateController(QObject):
     # --- exe の隣のスクリプト ---
 
     def offer_script_move(self, *, manual: bool = False) -> bool:
-        """exe の隣の ``scripts`` に本人の物があれば、``%APPDATA%`` 側へ移す 移せば真
+        """exe の隣の ``scripts`` に本人の物があれば、``%APPDATA%`` 側へ移す 移し始めたら真
+
+        移すのは裏のスレッド（:meth:`_moved` が終わった後に画面の側で知らせる）
 
         起動のときは設定（``scripts_move``）に従う 既定は尋ねずに移し、何をどこへ移したかを
         1 度知らせる 尋ねる設定では、同じ物については 1 度だけ尋ねる 移し先に同じ名前があって
@@ -271,7 +279,53 @@ class UpdateController(QObject):
                 self._say("後からでも〔互換〕→〔exe の隣のスクリプトを移す…〕で移せます", 15000)
             return False
         target = userdirs.config_root() / PORTABLE_SCRIPTS_DIR
-        result = move_user_scripts(install, target)
+        if self._moving:
+            if manual:
+                self._inform("スクリプトの置き場", "今 exe の隣のスクリプトを移しています")
+            return False
+        loud = manual or mode == SCRIPTS_MOVE_ASK
+
+        def finish(result: ScriptMove) -> None:
+            self._moved(result, target, loud=loud, fresh=fresh)
+
+        if not self._threaded:
+            finish(move_user_scripts(install, target))
+            return True
+        # 走査・写し・照らし・元を消すのは裏のスレッドで行う 大きな配布物で編集画面を固めない
+        # 裏で触るのはファイルだけ 知らせとスクリプトの読み直しは、終わってから画面の側で行う
+        # 途中でアプリを閉じても、元は確定し終えてから消すので失われない（daemon で待たせない）
+        self._moving = True
+
+        def work() -> None:
+            try:
+                result = move_user_scripts(install, target)
+            except Exception as exc:  # 裏のスレッドで落ちると、移している印が立ったまま残る
+                result = ScriptMove(failed=((Path(), f"{type(exc).__name__}: {exc}"),))
+            self._move_results.put(lambda: finish(result))
+
+        threading.Thread(target=work, name="sashimono-scripts-move", daemon=True).start()
+        self._move_timer.start()
+        return True
+
+    def _poll_moves(self) -> None:
+        try:
+            done = self._move_results.get_nowait()
+        except queue.Empty:
+            return
+        self._move_timer.stop()
+        self._moving = False
+        done()
+
+    def _moved(self, result: ScriptMove, target: Path, *, loud: bool, fresh: set[str]) -> None:
+        """移し終えた後に画面の側で行うこと スクリプトの読み直しと知らせ"""
+        if result.busy:
+            # ほかの Sashimono が移している 何もしていないので、起動のときは黙って次へ回す
+            if loud:
+                self._inform(
+                    "スクリプトの置き場",
+                    "ほかの Sashimono の窓が移しています 終わってからもう一度選んでください",
+                )
+            return
         if (result.moved or result.left) and self._rescan_scripts is not None:
             self._rescan_scripts()
         # 自動で移すときは、移せた物があったときと、移せずに残った物を初めて見たときだけ知らせる
@@ -280,11 +334,10 @@ class UpdateController(QObject):
             path.as_posix()
             for path in (*result.kept, *result.held, *(p for p, _r in result.failed))
         }
-        if manual or mode == SCRIPTS_MOVE_ASK:
+        if loud:
             self._inform("スクリプトの置き場", move_summary(result, target))
         elif result.moved or result.left or stayed & fresh:
             self._notify("スクリプトの置き場", move_summary(result, target))
-        return bool(result.moved or result.left)
 
     def _notify(self, title: str, text: str) -> None:
         """尋ねずに済ませたことを知らせる 試験では差し替える
