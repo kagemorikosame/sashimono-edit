@@ -638,6 +638,81 @@ class TestScriptsBesideTheExe:
         harness.controller.start()
         assert len(harness.notified) == 1
 
+    def test_listing_runs_off_the_ui_thread_too(
+        self, harness: _Harness, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """scripts 全体を辿って一覧を作るのも裏のスレッド（PR #245 の Codex の指摘）
+        尋ねる設定では、一覧ができてから画面の側で尋ね、答えを受けてから裏で移す
+        """
+        import threading
+        import time
+
+        from sashimono.update.portable import user_script_files as real_list
+
+        threads: dict[str, str] = {}
+
+        def listing(install: Path) -> list[Path]:
+            threads["list"] = threading.current_thread().name
+            return real_list(install)
+
+        def ask(text: str) -> bool:
+            threads["ask"] = threading.current_thread().name
+            return True
+
+        monkeypatch.setattr(updates_module, "user_script_files", listing)
+        mine = _put_script(harness.layout.install, "自分の/効果.anm2")
+        controller = UpdateController(
+            harness.window,
+            preferences=lambda: Preferences(update_check=False, scripts_move="ask"),
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=True,
+        )
+        controller._ask_move = ask  # type: ignore[method-assign]
+        informed: list[str] = []
+
+        def inform(title: str, text: str) -> None:
+            informed.append(text)
+
+        controller._inform = inform  # type: ignore[method-assign]
+        try:
+            assert controller.offer_script_move()
+            deadline = time.monotonic() + 10
+            while not informed and time.monotonic() < deadline:
+                qt_application.processEvents()
+                time.sleep(0.02)
+            main = threading.main_thread().name
+            assert threads["list"] != main and threads["ask"] == main
+            assert informed and not mine.exists()
+        finally:
+            controller.deleteLater()
+
+    def test_a_synced_folder_is_not_moved_automatically(
+        self, harness: _Harness, asked: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exe の隣が OneDrive などの中なら自動では移さない 元を消すと、ほかの機械からも消える
+        1 度だけ知らせる 手で選んだときは、そのことも添えて尋ねてから移す
+        """
+        monkeypatch.setenv("OneDrive", str(harness.layout.install.parent))
+        mine = _put_script(harness.layout.install, "自分の/効果.anm2")
+        harness.controller.start()
+        harness.controller.start()
+        assert mine.is_file() and asked == []
+        assert len(harness.notified) == 1 and "同期フォルダ" in harness.notified[0][1]
+        assert harness.controller.offer_script_move(manual=True)
+        assert len(asked) == 1 and "同期フォルダ" in asked[0]
+        assert not mine.exists()
+
+    def test_restarting_waits_for_the_move(self, harness: _Harness) -> None:
+        """移している最中に入れ替えると、写す側と移す側が同じファイルを同時に触る"""
+        harness.controller.start()
+        harness.controller._moving = True
+        assert not harness.controller.restart_now()
+        assert harness.launched == []
+        assert "移しています" in harness.informed[-1][1]
+
     def test_moving_runs_off_the_ui_thread(
         self, harness: _Harness, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -756,7 +831,7 @@ class TestScriptsBesideTheExe:
         assert (_appdata_scripts() / "効果.anm2").is_file()
 
     def test_the_menu_says_when_there_is_nothing(self, harness: _Harness) -> None:
-        assert not harness.controller.offer_script_move(manual=True)
+        harness.controller.offer_script_move(manual=True)
         assert harness.informed and harness.informed[0][0] == "移す物はありません"
 
     def test_the_bundled_readme_is_not_theirs(self, harness: _Harness, asked: list[str]) -> None:

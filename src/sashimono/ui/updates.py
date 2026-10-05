@@ -23,6 +23,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from html import escape
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from PySide6.QtCore import QObject, Qt, QTimer
@@ -46,6 +47,7 @@ from sashimono.update.package import (
 from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
     ScriptMove,
+    in_synced_folder,
     move_user_scripts,
     unoffered,
     user_script_files,
@@ -252,60 +254,99 @@ class UpdateController(QObject):
                     "移す物はありません", "開発の環境では exe の隣のスクリプト置き場を使いません"
                 )
             return False
-        install = self._layout.install
-        mine = user_script_files(install)
-        mode = SCRIPTS_MOVE_ASK if manual else self._preferences().scripts_move
-        if manual and not mine:
-            self._inform(
-                "移す物はありません",
-                f"{install / PORTABLE_SCRIPTS_DIR} に、自分で置いた物はありません",
-            )
-            return False
-        if mode == SCRIPTS_MOVE_OFF or not mine:
-            return False
-        state = self._store.load()
-        fresh = {path.as_posix() for path in unoffered(mine, state.scripts_offered)}
-        if not manual:
-            if mode == SCRIPTS_MOVE_ASK and not fresh:
-                return False  # 尋ねた物だけが残っている 答えはもう聞いた
-            if QApplication.activeModalWidget() is not None:
-                # 退避の復元などを尋ねている最中に重ねない 何もせずに次の起動へ回す
-                return False
-            offered = {*state.scripts_offered, *(path.as_posix() for path in mine)}
-            with contextlib.suppress(OSError):
-                self._store.save(replace(state, scripts_offered=tuple(sorted(offered))))
-        if mode == SCRIPTS_MOVE_ASK and not self._ask_move(portable_scripts_text(len(mine))):
-            if not manual:
-                self._say("後からでも〔互換〕→〔exe の隣のスクリプトを移す…〕で移せます", 15000)
-            return False
-        target = userdirs.config_root() / PORTABLE_SCRIPTS_DIR
         if self._moving:
             if manual:
                 self._inform("スクリプトの置き場", "今 exe の隣のスクリプトを移しています")
             return False
-        loud = manual or mode == SCRIPTS_MOVE_ASK
-
-        def finish(result: ScriptMove) -> None:
-            self._moved(result, target, loud=loud, fresh=fresh)
-
-        if not self._threaded:
-            finish(move_user_scripts(install, target))
-            return True
-        # 走査・写し・照らし・元を消すのは裏のスレッドで行う 大きな配布物で編集画面を固めない
-        # 裏で触るのはファイルだけ 知らせとスクリプトの読み直しは、終わってから画面の側で行う
-        # 途中でアプリを閉じても、元は確定し終えてから消すので失われない（daemon で待たせない）
+        mode = SCRIPTS_MOVE_ASK if manual else self._preferences().scripts_move
+        if mode == SCRIPTS_MOVE_OFF:
+            return False
+        if busy_with(self._store.path.parent) == "swap":
+            # 入れ替え係が今の版のフォルダを付け替えている 触ると付け替えを邪魔する 次の起動で移す
+            return False
+        install = self._layout.install
+        # 一覧を作る（scripts 全体を辿る）ところから裏のスレッドで行う 大きな配布物で編集画面を
+        # 固めない 尋ねる必要があるときだけ、一覧を画面の側へ返して尋ねる
         self._moving = True
-
-        def work() -> None:
-            try:
-                result = move_user_scripts(install, target)
-            except Exception as exc:  # 裏のスレッドで落ちると、移している印が立ったまま残る
-                result = ScriptMove(failed=((Path(), f"{type(exc).__name__}: {exc}"),))
-            self._move_results.put(lambda: finish(result))
-
-        threading.Thread(target=work, name="sashimono-scripts-move", daemon=True).start()
-        self._move_timer.start()
+        self._in_background(
+            lambda: (user_script_files(install), in_synced_folder(install)),
+            lambda listed: self._listed(install, *listed, manual=manual, mode=mode),
+        )
         return True
+
+    def _listed(
+        self, install: Path, mine: list[Path], synced: bool, *, manual: bool, mode: str
+    ) -> None:
+        """一覧ができた後に画面の側で決めること 移すなら裏のスレッドで移す"""
+        if manual and not mine:
+            self._moving = False
+            self._inform(
+                "移す物はありません",
+                f"{install / PORTABLE_SCRIPTS_DIR} に、自分で置いた物はありません",
+            )
+            return
+        if not mine:
+            self._moving = False
+            return
+        state = self._store.load()
+        fresh = {path.as_posix() for path in unoffered(mine, state.scripts_offered)}
+        if not manual:
+            if (mode == SCRIPTS_MOVE_ASK or synced) and not fresh:
+                self._moving = False
+                return  # 尋ねた・知らせた物だけが残っている 答えはもう聞いた
+            if QApplication.activeModalWidget() is not None:
+                # 退避の復元などを尋ねている最中に重ねない 何もせずに次の起動へ回す
+                self._moving = False
+                return
+            offered = {*state.scripts_offered, *(path.as_posix() for path in mine)}
+            with contextlib.suppress(OSError):
+                self._store.save(replace(state, scripts_offered=tuple(sorted(offered))))
+            if synced:
+                # 同期フォルダの中では自動で移さない 元を消すと、ほかの機械の exe の隣からも消え、
+                # その機械の %APPDATA% には写っていない 1 度だけ知らせ、移すのは本人に任せる
+                self._moving = False
+                self._notify("スクリプトの置き場", synced_scripts_text(len(mine)))
+                return
+        text = portable_scripts_text(len(mine))
+        if synced:
+            text += "\n\n" + synced_scripts_text(len(mine))
+        if mode == SCRIPTS_MOVE_ASK and not self._ask_move(text):
+            self._moving = False
+            if not manual:
+                self._say("後からでも〔互換〕→〔exe の隣のスクリプトを移す…〕で移せます", 15000)
+            return
+        target = userdirs.config_root() / PORTABLE_SCRIPTS_DIR
+        loud = manual or mode == SCRIPTS_MOVE_ASK
+        # 途中でアプリを閉じても、元は確定し終えてから消すので失われない（daemon で待たせない）
+        self._in_background(
+            lambda: move_user_scripts(install, target),
+            lambda result: self._moved(result, target, loud=loud, fresh=fresh),
+        )
+
+    def _in_background(self, work: Callable[[], Any], then: Callable[[Any], None]) -> None:
+        """``work`` を裏のスレッドで行い、終わったら ``then`` を画面の側で呼ぶ
+
+        裏で触るのはファイルだけ 試験（``threaded`` が偽）ではその場で呼ぶ
+        """
+        if not self._threaded:
+            then(work())
+            return
+
+        def run() -> None:
+            try:
+                value = work()
+            except Exception as exc:  # 裏のスレッドで落ちると、移している印が立ったまま残る
+                failure = ScriptMove(failed=((Path(), f"{type(exc).__name__}: {exc}"),))
+                self._move_results.put(lambda: self._moved_failure(failure))
+                return
+            self._move_results.put(lambda: then(value))
+
+        threading.Thread(target=run, name="sashimono-scripts-move", daemon=True).start()
+        self._move_timer.start()
+
+    def _moved_failure(self, failure: ScriptMove) -> None:
+        self._moving = False
+        self._notify("スクリプトの置き場", move_summary(failure, Path()))
 
     def _poll_moves(self) -> None:
         try:
@@ -313,11 +354,12 @@ class UpdateController(QObject):
         except queue.Empty:
             return
         self._move_timer.stop()
-        self._moving = False
+        # 続きの仕事（一覧の後の移し）は done の中で、また裏のスレッドへ出して時計を回し直す
         done()
 
     def _moved(self, result: ScriptMove, target: Path, *, loud: bool, fresh: set[str]) -> None:
         """移し終えた後に画面の側で行うこと スクリプトの読み直しと知らせ"""
+        self._moving = False
         if result.busy:
             # ほかの Sashimono が移している 何もしていないので、起動のときは黙って次へ回す
             if loud:
@@ -560,7 +602,11 @@ class UpdateController(QObject):
         入れ替え係が待つのを諦めて今の版を起こし、本体が 2 つ動く 確認で取り消されたら起こさない
         """
         assert self._layout is not None
-        blockers = self._blockers()
+        blockers = [*self._blockers()]
+        if self._moving:
+            # exe の隣のスクリプトを移している最中に入れ替えると、写す側（carry_user_files）と
+            # 移す側が同じファイルを同時に触る 入れ替え係もフォルダを付け替えられない
+            blockers.append("exe の隣のスクリプトを %APPDATA% へ移しています")
         if blockers:
             self._inform(
                 "今は再起動できません",
@@ -806,6 +852,18 @@ def move_summary(result: ScriptMove, target: Path) -> str:
             f"（{first.as_posix()}: {reason}）"
         )
     return "\n".join(lines)
+
+
+def synced_scripts_text(count: int) -> str:
+    """exe の隣が OneDrive などの同期フォルダの中にあるときの案内 自動では移さない理由"""
+    return (
+        f"Sashimono.exe の隣の scripts フォルダに、自分で置いた物が {count} 個あります\n"
+        "このフォルダは OneDrive などの同期フォルダの中なので、自動では移しません"
+        "（元を消すと、同期しているほかの機械からも消えます"
+        " ほかの機械の %APPDATA% には写っていません）\n"
+        "移すときは、それぞれの機械で〔互換〕→〔スクリプトフォルダを開く〕で開く所へ写してから、"
+        "exe の隣の物を消してください"
+    )
 
 
 def portable_scripts_text(count: int) -> str:

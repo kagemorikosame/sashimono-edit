@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -26,6 +27,7 @@ from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
     ScriptMove,
     bundles,
+    in_synced_folder,
     move_user_scripts,
     unoffered,
     user_script_files,
@@ -489,6 +491,146 @@ class TestBundles:
         from sashimono.compat.aviutl import runtime
 
         assert set(MODULE_FILE_SUFFIXES) == {*runtime.MODULE_SUFFIXES, runtime.C_MODULE_SUFFIX}
+
+
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows の振る舞いを見る")
+
+
+def _junction(link: Path, pointed: Path) -> None:
+    import _winapi  # type: ignore[import-not-found,unused-ignore]
+
+    link.parent.mkdir(parents=True, exist_ok=True)
+    _winapi.CreateJunction(str(pointed), str(link))
+
+
+class TestEdgeCases:
+    """自動で移すときの隅の場合（PR #245 で洗い出した）"""
+
+    def test_an_original_changed_while_moving_stays_and_the_copy_is_taken_back(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """移している間に外のエディタや同期ソフトが元を書き換えたら、元を消さず、移し先の古い
+        写しも外す（PR #245 の Codex の指摘） 古い写しが後に読まれて勝つと、書き換えた中身が
+        使われなくなる
+        """
+        effect = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        _put(install, "配布物/common.lua", "return {}")
+        real_rename = Path.rename
+
+        def edited_meanwhile(self: Path, destination: Path) -> Path:
+            moved = real_rename(self, destination)
+            if ".scripts-moving-" in str(self):
+                effect.write_text("obj.ox = 2\n", encoding="utf-8")
+            return moved
+
+        monkeypatch.setattr(Path, "rename", edited_meanwhile)
+        result = move_user_scripts(install, target)
+        monkeypatch.undo()
+        assert result.moved == () and len(result.failed) == 2
+        assert "書き換わった" in result.failed[0][1]
+        assert effect.read_text(encoding="utf-8") == "obj.ox = 2\n"
+        assert not (target / "配布物" / "効果.anm2").exists()
+        assert not (target / "配布物" / "common.lua").exists()
+
+    @windows_only
+    def test_a_read_only_original_is_moved(self, install: Path, target: Path) -> None:
+        """読み取り専用の印が付いていると Windows は消させず、毎回 exe の隣に残っていた"""
+        mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        mine.chmod(stat.S_IREAD)
+        result = move_user_scripts(install, target)
+        assert result.moved == (Path("配布物/効果.anm2"),) and result.left == ()
+        assert not mine.exists()
+        moved = target / "配布物" / "効果.anm2"
+        assert moved.read_text(encoding="utf-8") == "obj.ox = 1\n"
+        moved.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @windows_only
+    def test_a_file_held_open_by_another_program_is_left(self, install: Path, target: Path) -> None:
+        """消せない（ほかのプログラムが開いている）物は数えて残す 移し先に一式そろっていて勝つ"""
+        mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        _put(install, "配布物/common.lua", "return {}")
+        with mine.open(encoding="utf-8"):
+            result = move_user_scripts(install, target)
+        assert result.left == (Path("配布物/効果.anm2"),)
+        assert (target / "配布物" / "効果.anm2").is_file()
+        assert (target / "配布物" / "common.lua").is_file()
+        # 次の起動では同じ中身と見て、元を消すだけ
+        again = move_user_scripts(install, target)
+        assert again.moved == (Path("配布物/効果.anm2"),) and not mine.exists()
+
+    @windows_only
+    def test_a_junction_is_not_followed_and_its_bundle_stays(
+        self, install: Path, target: Path, tmp_path: Path
+    ) -> None:
+        """ジャンクションの先は置き場の外のことがある 辿って写さず、消さず、束ごと残す"""
+        outside = tmp_path / "外の素材"
+        outside.mkdir()
+        (outside / "大事.png").write_text("png", encoding="utf-8")
+        _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        _junction(install / PORTABLE_SCRIPTS_DIR / "配布物" / "素材", outside)
+
+        result = move_user_scripts(install, target)
+
+        assert result.moved == ()
+        assert sorted(p.as_posix() for p in result.held) == ["配布物/効果.anm2", "配布物/素材"]
+        assert (outside / "大事.png").is_file()
+        assert (install / PORTABLE_SCRIPTS_DIR / "配布物" / "素材").is_junction()
+        assert not (target / "配布物").exists()
+
+    @windows_only
+    def test_a_junction_is_carried_as_a_junction(self, install: Path, tmp_path: Path) -> None:
+        """自動更新は、ジャンクションの先を写さずに、同じ先を指すジャンクションを作り直す"""
+        outside = tmp_path / "外の素材"
+        outside.mkdir()
+        (outside / "大事.png").write_text("png", encoding="utf-8")
+        _junction(install / PORTABLE_SCRIPTS_DIR / "素材", outside)
+        staged = tmp_path / "Programs" / "Sashimono.new"
+        (staged / PORTABLE_SCRIPTS_DIR).mkdir(parents=True)
+        assert carry_user_files(install, staged) == 1
+        carried = staged / PORTABLE_SCRIPTS_DIR / "素材"
+        assert carried.is_junction()
+        assert (carried / "大事.png").read_text(encoding="utf-8") == "png"
+
+    def test_a_full_disk_is_found_before_copying(
+        self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """空きが足りなければ写し始めない 途中で一杯にして、ほかの保存（作品・退避）を落とさない"""
+        mine = _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        usage = shutil.disk_usage(install)
+        monkeypatch.setattr(shutil, "disk_usage", lambda _path: usage._replace(free=1024))
+        result = move_user_scripts(install, target)
+        assert result.moved == () and "空きが足りない" in result.failed[0][1]
+        assert mine.is_file()
+        assert not list(target.parent.glob(".scripts-moving-*"))
+
+    def test_leftovers_of_a_power_cut_are_cleared(self, install: Path, target: Path) -> None:
+        """電源が切れた後の起動 作業用のフォルダと写しの途中の物（.moving）を片付け、元から移す"""
+        _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
+        (target / "配布物").mkdir(parents=True)
+        half = target / "配布物" / "効果.anm2.4242.moving"
+        half.write_text("途中", encoding="utf-8")
+        staging = target.parent / ".scripts-moving-4242" / "配布物"
+        staging.mkdir(parents=True)
+        (staging / "効果.anm2").write_text("途中", encoding="utf-8")
+        result = move_user_scripts(install, target)
+        assert result.moved == (Path("配布物/効果.anm2"),)
+        assert not half.exists() and not staging.parent.exists()
+        assert (target.parent / "scripts-move.lock").exists() is False
+
+    def test_names_differing_only_in_case_are_one_bundle(self) -> None:
+        """Windows では大文字小文字だけ違う名前は同じフォルダ 束を割らない"""
+        assert list(bundles([Path("Pack/a.anm2"), Path("pack/b.lua")])) == ["pack"]
+
+    def test_a_synced_folder_is_recognised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同期フォルダの中では自動で移さない 元を消すと、ほかの機械からも消える"""
+        for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            monkeypatch.delenv(variable, raising=False)
+        assert not in_synced_folder(tmp_path / "Programs" / "Sashimono")
+        monkeypatch.setenv("OneDrive", str(tmp_path / "同期"))
+        assert in_synced_folder(tmp_path / "同期" / "道具" / "Sashimono")
+        assert in_synced_folder(tmp_path / "Dropbox" / "Sashimono")
 
 
 class TestSurvivingUpdates:

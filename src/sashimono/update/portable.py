@@ -5,25 +5,26 @@ exe の隣の ``scripts`` は、前の版の案内どおりそこへ置いた人
 （:func:`.package.carry_user_files`）が、zip を手で展開し直してフォルダごと入れ替えると
 中身が消える そこで、置いた物があれば ``%APPDATA%\Sashimono\scripts`` へ移す
 
-移すときの決まり
+移すときの決まり（詳しくは docs/development.md の「exe の隣の scripts」）
 
 - **一式（束）で移すか、一式で残す** スクリプトは同じフォルダのモジュール（``.mod2`` ``.lua``
   ``.mod`` と DLL）を先に探す（``compat.aviutl.runtime`` の ``_find_module`` スクリプト自身の
   フォルダ → 置き場の直下 → 置き場の 1 段下 → 深い所） 束の一部だけを移すと、移した先の同じ
   フォルダにある別のモジュールが先に見つかり、更新しただけで描画が変わる 束の決め方は
   :func:`bundles` を見る
-- **上書きしない** 移し先に同じ名前で中身の違う物があれば、その束は一式残す 移し先の物は
-  本人が後から置いた新しい物かもしれない 中身が同じ（バイト列が同じ）なら衝突ではないので、
-  移す側を消すだけにする
-- **モジュールの名前が移し先とぶつかる束は残す** モジュールは名前で探し、置き場の直下・
-  1 段下・深い所のどこにあっても見つかる 移し先に同じ名前の別のモジュールがあると、束を
-  丸ごと移しても、移した先でどちらが先に見つかるかが変わりうる 残した束と同じ名前の
-  モジュールを持つ束も残す（今まで exe の隣の中で決まっていた勝ち負けを変えない）
+- **上書きしない** 移し先に同じ名前で中身の違う物があれば、その束は一式残す 中身が同じ
+  （バイト列が同じ）なら衝突ではないので、移す側を消すだけにする
+- **モジュールの名前が移し先とぶつかる束は残す** 残した束と同じ名前のモジュールを持つ束も残す
+- **リンクは辿らず、消さず、その束は残す** シンボリックリンクとジャンクションは、置き場の外を
+  指していることがある 辿って写すと外の物を写し、消すとリンクの先まで消したように見える
 - **束を一式写し終えて中身を照らしてから確定し、確定し終えてから元を消す**（:func:`_place_bundle`）
-  束の途中で写せなくなっても（ディスクの空き・権限）、束が 2 つの置き場に割れない 写しは
-  移し先と同じドライブの作業用のフォルダ（置き場の外）で作るので、途中の物は読まれない
-  途中の物が本来の名前で残ると、次から「もう在る」と見て移さず、しかも欠けた中身の方が読まれる
-- 元を消せなかった物は数えて知らせる 両方に在っても、読まれるのは ``%APPDATA%`` の側
+  消す直前にもう 1 度、元と移し先を照らす 移している間に外のエディタや同期ソフトが元を
+  書き換えていれば、移し先の写しを外して元の側に戻す（移し先の方が後に読まれて勝つので、
+  古い写しを残すと書き換えた中身が使われなくなる）
+- **1 つずつ** 移し先の親の錠（``MOVE_LOCK``）を持って行う
+- **同期フォルダの中では自動で移さない**（:func:`in_synced_folder`） exe の隣が OneDrive などの
+  中にあると、元を消すとほかの機械からも消える ほかの機械の ``%APPDATA%`` には写っていない
+- 読み取り専用の印は、消す直前に外す（付いたままだと Windows は消させず、毎回残る）
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ import contextlib
 import filecmp
 import os
 import shutil
-from collections.abc import Iterable
+import stat
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,7 +47,11 @@ __all__ = [
     "PORTABLE_SCRIPTS_DIR",
     "ScriptMove",
     "bundles",
+    "in_synced_folder",
+    "is_link",
     "move_user_scripts",
+    "remove_file",
+    "script_links",
     "unoffered",
     "user_script_files",
 ]
@@ -73,6 +79,27 @@ _MOVING_SUFFIX = ".moving"
 #: 置き場の直下に置かれた物の束の名前 フォルダの名前と取り違えないよう、パスに使えない文字にする
 ROOT_BUNDLE = "*"
 
+#: 束を写している作業用のフォルダの名前の頭（移し先の親 ``%APPDATA%\Sashimono`` の下）
+#: 置き場（``scripts``）の外なので、途中の物がスクリプトとして読まれない
+_STAGING_PREFIX = ".scripts-moving-"
+
+#: 写す前に残しておく空き 写し終えた直後にディスクが一杯になると、ほかの保存（作品・退避）が落ちる
+_FREE_MARGIN = 64 * 1024 * 1024
+
+#: 同期ソフトの置き場を示す環境変数（OneDrive は個人用と会社用で別の変数を置く）
+_SYNC_VARIABLES = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+
+#: 同期ソフトの置き場によく付く名前 環境変数を置かない同期ソフト（Dropbox・Google ドライブ・
+#: iCloud）は名前で見分ける 外れても移さないだけで、物は失われない
+_SYNC_FOLDER_NAMES = (
+    "dropbox",
+    "google drive",
+    "googledrive",
+    "icloud drive",
+    "iclouddrive",
+    "box",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ScriptMove:
@@ -81,7 +108,8 @@ class ScriptMove:
     moved: tuple[Path, ...] = ()
     #: 移し先に同じ名前で中身の違う物があったので移さなかった物 exe の隣に残っている
     kept: tuple[Path, ...] = ()
-    #: 一緒に残した物 同じ束の中に移せない物があった、またはモジュールの名前が移し先とぶつかる
+    #: 一緒に残した物 同じ束の中に移せない物（リンクも）があった、またはモジュールの名前が
+    #: 移し先とぶつかる
     held: tuple[Path, ...] = ()
     #: 写せたが元を消せなかった物 両方に在る
     left: tuple[Path, ...] = ()
@@ -98,24 +126,76 @@ def _bundled(relative: Path) -> bool:
     return any(folded == name.casefold() for name in BUNDLED_SCRIPT_FILES)
 
 
+def is_link(path: Path) -> bool:
+    """シンボリックリンクかジャンクション（Windows のフォルダの付け替え）か"""
+    try:
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        return False
+
+
+def _walk(source: Path) -> tuple[list[Path], list[Path]]:
+    """置き場の中のファイルとリンク（相対の場所） リンクの先へは入らない"""
+    files: list[Path] = []
+    links: list[Path] = []
+    pending = [source]
+    while pending:
+        folder = pending.pop()
+        try:
+            with os.scandir(folder) as entries:
+                listed = list(entries)
+        except OSError:
+            continue  # 読めないフォルダは数えない 中の物は今までどおり exe の隣に残る
+        for entry in listed:
+            path = Path(entry.path)
+            relative = path.relative_to(source)
+            try:
+                if entry.is_symlink() or entry.is_junction():
+                    links.append(relative)
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append(relative)
+            except OSError:
+                continue
+    return sorted(files), sorted(links)
+
+
 def user_script_files(install: Path) -> list[Path]:
-    """exe の隣の ``scripts`` に本人が置いた物（相対の場所） 同梱の物と写しの途中の物は除く
+    """exe の隣の ``scripts`` に本人が置いた物（相対の場所） 同梱の物・写しの途中の物・リンクは除く
 
     スクリプトに限らず全部数える 共通処理（``.mod2`` ``.lua``）や画像もスクリプトが読む
     片方だけ移すと、移した側で見つからなくなる
     """
-    source = install / PORTABLE_SCRIPTS_DIR
+    files, _links = _walk(install / PORTABLE_SCRIPTS_DIR)
+    return [p for p in files if not _bundled(p) and not p.name.endswith(_MOVING_SUFFIX)]
+
+
+def script_links(install: Path) -> list[Path]:
+    """exe の隣の ``scripts`` の中のリンク（相対の場所） 先へは入らない"""
+    return _walk(install / PORTABLE_SCRIPTS_DIR)[1]
+
+
+def in_synced_folder(path: Path) -> bool:
+    """OneDrive などの同期フォルダの中か
+
+    中なら自動では移さない 元を消すと、同期しているほかの機械からも消える
+    """
     try:
-        found = sorted(path for path in source.rglob("*") if path.is_file())
+        resolved = path.resolve()
     except OSError:
-        return []
-    files = []
-    for path in found:
-        relative = path.relative_to(source)
-        if _bundled(relative) or path.name.endswith(_MOVING_SUFFIX):
-            continue
-        files.append(relative)
-    return files
+        resolved = path
+    for variable in _SYNC_VARIABLES:
+        value = os.environ.get(variable)
+        if value:
+            with contextlib.suppress(OSError, ValueError):
+                if resolved.is_relative_to(Path(value).resolve()):
+                    return True
+    for part in resolved.parts:
+        folded = part.casefold()
+        if folded.startswith("onedrive") or folded in _SYNC_FOLDER_NAMES:
+            return True
+    return False
 
 
 def unoffered(files: list[Path], offered: tuple[str, ...]) -> list[Path]:
@@ -131,6 +211,7 @@ def bundles(files: Iterable[Path]) -> dict[str, list[Path]]:
     （``_find_module``） 配布物は 1 つのフォルダにまとめて置かれ、その中の階層ごと
     束にする（1 段下へ分けて置く配布物もある） 直下のファイルは同じフォルダ（置き場の直下）を
     分け合うので、ばらばらにすると同じ問題が起きる 名前は大文字小文字を揃えて比べる
+    （Windows では大文字小文字だけ違う名前は同じフォルダ）
     """
     grouped: dict[str, list[Path]] = {}
     for relative in files:
@@ -146,25 +227,49 @@ def _module_stem(path: Path) -> str | None:
 def _modules_in(folder: Path) -> dict[str, list[Path]]:
     """置き場にあるモジュール 名前 → 相対の場所 どの深さにあっても名前で見つかる"""
     found: dict[str, list[Path]] = {}
-    try:
-        paths = [path for path in folder.rglob("*") if path.is_file()]
-    except OSError:
-        return found
-    for path in paths:
-        stem = _module_stem(path)
+    files, _links = _walk(folder)
+    for relative in files:
+        stem = _module_stem(relative)
         if stem is not None:
-            found.setdefault(stem, []).append(path.relative_to(folder))
+            found.setdefault(stem, []).append(relative)
     return found
 
 
 def _same(first: Path, second: Path) -> bool:
+    """中身が同じか 読めなければ（ほかのプログラムが掴んでいる など）違うと見る"""
     try:
         return filecmp.cmp(first, second, shallow=False)
     except OSError:
         return False
 
 
-def _plan(source: Path, target: Path, files: list[Path]) -> tuple[set[str], set[Path]]:
+def remove_file(path: Path) -> None:
+    """ファイルを消す 読み取り専用の印が付いていれば外してから消す（消せなければ OSError）"""
+    try:
+        path.unlink()
+    except PermissionError:
+        mode = path.stat().st_mode
+        if mode & stat.S_IWRITE:
+            raise  # 印のせいではない（ほかのプログラムが開いている） 印を外しても変わらない
+        path.chmod(mode | stat.S_IWRITE)
+        path.unlink()
+
+
+def _remove_tree(folder: Path) -> None:
+    """作業用のフォルダを片付ける 読み取り専用の印が付いた写しも消す"""
+
+    def clear_and_retry(function: Callable[..., object], name: str, _exc: BaseException) -> None:
+        with contextlib.suppress(OSError):
+            Path(name).chmod(stat.S_IWRITE)
+            function(name)
+
+    if folder.exists():
+        shutil.rmtree(folder, onexc=clear_and_retry)
+
+
+def _plan(
+    source: Path, target: Path, files: list[Path], links: list[Path]
+) -> tuple[set[str], set[Path]]:
     """残す束と、移し先と中身の違う同じ名前の物（衝突） 束はモジュールの名前をたどって広げる"""
     grouped = bundles(files)
     clashes = {
@@ -173,6 +278,9 @@ def _plan(source: Path, target: Path, files: list[Path]) -> tuple[set[str], set[
         if (target / relative).exists() and not _same(source / relative, target / relative)
     }
     stay = {key for key, members in grouped.items() if any(p in clashes for p in members)}
+    # リンクを含む束は残す 辿って写すと置き場の外の物を写し、元を消すとリンクの先が
+    # 消えたように見える リンクだけ残して束の残りを移すと、相対で読む物が別れる
+    stay.update(bundles(links))
     # 移し先に同じ名前のモジュールが、同じ場所で同じ中身でない形であれば、その束は残す
     # 移した後に、どちらが先に見つかるかが変わりうる
     there = _modules_in(target)
@@ -194,7 +302,7 @@ def _plan(source: Path, target: Path, files: list[Path]) -> tuple[set[str], set[
     changed = True
     while changed:
         changed = False
-        held_names = set().union(*(names[key] for key in stay)) if stay else set()
+        held_names = set().union(*(names[key] for key in stay if key in names)) if stay else set()
         for key in grouped:
             if key not in stay and names[key] & held_names:
                 stay.add(key)
@@ -215,9 +323,13 @@ def move_user_scripts(install: Path, target: Path) -> ScriptMove:
     if lock is None:
         return ScriptMove(busy=True)
     try:
-        # 錠を持てた ほかに移している人はいない 落ちた起動が残した作業用のフォルダを片付ける
+        # 錠を持てた ほかに移している人はいない 落ちた起動（電源が切れた など）が残した
+        # 作業用のフォルダと、写しの途中の物（``.moving``）を片付ける
         for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
-            shutil.rmtree(leftover, ignore_errors=True)
+            _remove_tree(leftover)
+        for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
+            with contextlib.suppress(OSError):
+                remove_file(leftover)
         return _move_all(install, target)
     finally:
         lock.release()
@@ -225,27 +337,37 @@ def move_user_scripts(install: Path, target: Path) -> ScriptMove:
 
 def _move_all(install: Path, target: Path) -> ScriptMove:
     source = install / PORTABLE_SCRIPTS_DIR
-    files = user_script_files(install)
-    stay, clashes = _plan(source, target, files)
+    walked, links = _walk(source)
+    files = [p for p in walked if not _bundled(p) and not p.name.endswith(_MOVING_SUFFIX)]
+    stay, clashes = _plan(source, target, files, links)
     moved: list[Path] = []
     kept: list[Path] = []
     held: list[Path] = []
     left: list[Path] = []
     failed: list[tuple[Path, str]] = []
-    for key, members in bundles(files).items():
+    for key, members in bundles([*files, *links]).items():
         if key in stay:
             for relative in members:
                 (kept if relative in clashes else held).append(relative)
             continue
-        problem = _place_bundle(source, target, members)
+        problem, placed = _place_bundle(source, target, members)
+        if problem is None:
+            # 消す直前にもう 1 度照らす 移している間に外のエディタや同期ソフトが元を書き換えて
+            # いれば、移し先の古い写しが後に読まれて勝ち、書き換えた中身が使われなくなる
+            # （PR #245 の Codex の指摘） 写しを外して元の側に戻し、次の起動で改めて移す
+            changed = [p for p in members if not _same(source / p, target / p)]
+            if changed:
+                _take_back(source, target, placed)
+                problem = f"移している間に書き換わった（{changed[0].as_posix()}）"
         if problem is not None:
             # 束は一式 exe の隣に残る（元には触っていない） 束の全部を写せなかった物として数える
             failed.extend((relative, problem) for relative in members)
             continue
-        # 移し先に一式そろってから元を消す 一部を消せなくても、後に読まれる %APPDATA% の一式が勝つ
+        # 移し先に一式そろってから元を消す 一部を消せなくても（ほかのプログラムが開いている
+        # など）、後に読まれる %APPDATA% の一式が勝つ 次の起動では同じ中身と見て消し直す
         for relative in members:
             try:
-                (source / relative).unlink()
+                remove_file(source / relative)
             except OSError:
                 left.append(relative)
             else:
@@ -254,40 +376,67 @@ def _move_all(install: Path, target: Path) -> ScriptMove:
     return ScriptMove(tuple(moved), tuple(kept), tuple(held), tuple(left), tuple(failed))
 
 
-#: 束を写している作業用のフォルダの名前の頭（移し先の親 ``%APPDATA%\Sashimono`` の下）
-#: 置き場（``scripts``）の外なので、途中の物がスクリプトとして読まれない
-_STAGING_PREFIX = ".scripts-moving-"
+def _take_back(source: Path, target: Path, placed: list[Path]) -> None:
+    """自分が移し先へ置いた写しを外す 元が exe の隣に残っているときだけ
+
+    元が無ければ、ほかの誰か（錠を持たない古い版の移し・本人）がこの写しを当てにして元を消した
+    外すと両方の置き場から失われる（PR #245 の Codex の指摘）
+    """
+    for relative in placed:
+        destination = target / relative
+        if not (source / relative).is_file():
+            continue
+        with contextlib.suppress(OSError):
+            remove_file(destination)
+        # 置くために作って空になったフォルダも外す 本人が前から持っていた空の
+        # フォルダは消さないよう、置いた物の親だけを移し先の手前まで見る
+        for folder in destination.parents:
+            if folder == target or not folder.is_relative_to(target):
+                break
+            with contextlib.suppress(OSError):
+                folder.rmdir()
 
 
-def _place_bundle(source: Path, target: Path, members: list[Path]) -> str | None:
-    """束を一式、移し先へ置く 置けたら ``None``、置けなければ理由（元にも移し先にも何も残さない）
+def _place_bundle(source: Path, target: Path, members: list[Path]) -> tuple[str | None, list[Path]]:
+    """束を一式、移し先へ置く 置けたら ``(None, 置いた物)``、置けなければ ``(理由, [])``
+    （置けなかったときは元にも移し先にも何も残さない）
 
-    1. 作業用のフォルダ（移し先と同じドライブ）へ全部写し、元と中身を照らす
-    2. 全部そろってから、移し先へ 1 つずつ名前を付け替えて確定する（同じドライブなので一瞬）
-    3. 途中で失敗したら、確定した分を移し先から外し、作業用を片付ける
+    1. 空きを確かめる（足りなければ写し始めない 途中で一杯にして、ほかの保存を落とさない）
+    2. 作業用のフォルダ（移し先と同じドライブ）へ全部写し、元と中身を照らす
+    3. 全部そろってから、移し先へ 1 つずつ名前を付け替えて確定する（同じドライブなので一瞬）
+    4. 途中で失敗したら、確定した分を移し先から外し、作業用を片付ける
 
     確定の途中で落ちても（電源が切れた など）元は消していないので exe の隣に一式残る 移し先に
     入った分は元と同じ中身なので、次の起動では「同じ中身」と見て束ごと移し直す（:func:`_plan`）
     移し先に同じ中身で在る物は写さない（元を消すだけ）
     """
     staging = target.parent / f"{_STAGING_PREFIX}{os.getpid()}"
-    shutil.rmtree(staging, ignore_errors=True)
+    _remove_tree(staging)
     pending: list[Path] = []
+    placed: list[Path] = []
     try:
         for relative in members:
             destination = target / relative
             if destination.exists():
                 if not _same(source / relative, destination):
-                    return f"移し先に中身の違う物がある（{relative.as_posix()}）"
+                    return f"移し先に中身の違う物がある（{relative.as_posix()}）", []
                 continue
+            pending.append(relative)
+        need = sum((source / relative).stat().st_size for relative in pending)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(target.parent).free
+        if need + _FREE_MARGIN > free:
+            return (
+                f"移し先の空きが足りない（{need // 1024**2} MB 要る 空きは {free // 1024**2} MB）",
+                [],
+            )
+        for relative in pending:
             staged = staging / relative
             staged.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / relative, staged)
             # 大きさだけでなく中身を照らす 元を消した後では、欠けた写しに気付いても戻せない
             if not filecmp.cmp(source / relative, staged, shallow=False):
-                return f"写した中身が元と違う（{relative.as_posix()}）"
-            pending.append(relative)
-        placed: list[Path] = []
+                return f"写した中身が元と違う（{relative.as_posix()}）", []
         try:
             for relative in pending:
                 destination = target / relative
@@ -297,35 +446,25 @@ def _place_bundle(source: Path, target: Path, members: list[Path]) -> str | None
                 (staging / relative).rename(destination)
                 placed.append(relative)
         except OSError:
-            for relative in placed:
-                destination = target / relative
-                # 外すのは自分が名前を付けて置いた写しだけ さらに元が exe の隣に残っているときに
-                # 限る 元が無ければ、ほかの誰か（錠を持たない古い版の移し・本人）がこの写しを
-                # 当てにして元を消した 外すと両方の置き場から失われる（PR #245 の Codex の指摘）
-                if not _same(source / relative, destination):
-                    continue
-                with contextlib.suppress(OSError):
-                    destination.unlink()
-                # 置くために作って空になったフォルダも外す 本人が前から持っていた空の
-                # フォルダは消さないよう、置いた物の親だけを移し先の手前まで見る
-                for folder in destination.parents:
-                    if folder == target or not folder.is_relative_to(target):
-                        break
-                    with contextlib.suppress(OSError):
-                        folder.rmdir()
+            _take_back(source, target, placed)
             raise
     except OSError as exc:
-        return str(exc) or type(exc).__name__
+        return str(exc) or type(exc).__name__, []
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return None
+        _remove_tree(staging)
+    return None, placed
 
 
 def _remove_empty_folders(source: Path) -> None:
-    """移して空になったフォルダを片付ける ``scripts`` そのものは残す（同梱の説明が入る所）"""
+    """移して空になったフォルダを片付ける ``scripts`` そのものは残す（同梱の説明が入る所）
+
+    リンクの先へは入らない（``os.walk`` はシンボリックリンクを辿らず、ジャンクションは中身が
+    あれば rmdir が断る 空のフォルダを指すジャンクションの rmdir はリンクだけを外す）
+    """
     folders = []
     with contextlib.suppress(OSError):
-        for path, _names, _files in os.walk(source):
+        for path, names, _files in os.walk(source):
+            names[:] = [name for name in names if not is_link(Path(path) / name)]
             folders.append(Path(path))
     for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
         if folder == source:

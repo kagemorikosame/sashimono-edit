@@ -32,7 +32,13 @@ from pathlib import Path, PurePosixPath
 from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
-from sashimono.update.portable import PORTABLE_SCRIPTS_DIR, user_script_files
+from sashimono.update.portable import (
+    PORTABLE_SCRIPTS_DIR,
+    is_link,
+    remove_file,
+    script_links,
+    user_script_files,
+)
 
 __all__ = [
     "APP_EXE",
@@ -300,9 +306,45 @@ def carry_user_files(
             copied += 1
         else:
             failed.append((relative, problem))
+    for relative in script_links(install):
+        # リンク（シンボリックリンク・ジャンクション）は先を写さず、同じ先を指すリンクを作り直す
+        # 先は置き場の外のことがあり、写すと外の物を新しい版の中へ抱え込む
+        problem = _carry_link(source / relative, destination / _PORTABLE_SCRIPTS_DIR / relative)
+        if problem is None:
+            copied += 1
+        elif problem:
+            failed.append((relative, problem))
     if failed:
         raise CarryError(tuple(failed))
     return copied
+
+
+def _carry_link(origin: Path, target: Path) -> str | None:
+    """リンクを入れ替え先に作り直す 作ったら ``None``、要らなければ ``""``、作れなければ理由"""
+    try:
+        pointed = origin.readlink()
+    except OSError as exc:
+        return str(exc) or type(exc).__name__
+    if is_link(target):
+        with contextlib.suppress(OSError):
+            if target.readlink() == pointed:
+                return ""
+        return "入れ替え先に同じ名前の別のリンクがある"
+    if target.exists():
+        return "入れ替え先に同じ名前の物がある"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if origin.is_junction():
+            # ジャンクションは本人の権限で作れる（シンボリックリンクは開発者モードか管理者が要る）
+            import _winapi  # type: ignore[import-not-found,unused-ignore]
+
+            text = str(pointed)
+            _winapi.CreateJunction(text.removeprefix("\\\\?\\"), str(target))
+        else:
+            target.symlink_to(pointed, target_is_directory=origin.is_dir())
+    except (OSError, ImportError) as exc:
+        return str(exc) or type(exc).__name__
+    return None
 
 
 class CarryError(Exception):
@@ -348,9 +390,16 @@ def _copy_over(origin: Path, target: Path) -> str | None:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(origin, writing)
-        writing.replace(target)
+        try:
+            writing.replace(target)
+        except PermissionError:
+            # 置き換える先に読み取り専用の印が付いていると、Windows は置き換えさせない
+            if not target.exists() or target.stat().st_mode & stat.S_IWRITE:
+                raise
+            target.chmod(target.stat().st_mode | stat.S_IWRITE)
+            writing.replace(target)
     except OSError as exc:
         with contextlib.suppress(OSError):
-            writing.unlink(missing_ok=True)
+            remove_file(writing)
         return str(exc) or type(exc).__name__
     return None
