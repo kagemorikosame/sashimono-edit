@@ -11,6 +11,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -806,6 +807,78 @@ class TestScriptsBesideTheExe:
         finally:
             controller.deleteLater()
 
+    def test_closing_waits_for_the_bundle_being_moved(
+        self, harness: _Harness, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """閉じるときは、裏の移しが今の束を終えるのを待ち、新しい束には入らせない
+        （PR #245 の Codex の指摘 元をよけたまま止まると、次の起動で入れ替えが先に走って消える）
+        """
+        import threading
+        import time
+
+        from sashimono.update.portable import move_user_scripts as real_move
+
+        first = _put_script(harness.layout.install, "甲/効果.anm2")
+        second = _put_script(harness.layout.install, "乙/効果.anm2")
+        inside = threading.Event()
+        release_move = threading.Event()
+
+        def slow_move(install: Path, target: Path, **options: Any) -> object:
+            stop = options["should_stop"]
+
+            def checked() -> bool:
+                inside.set()
+                release_move.wait(10)
+                return bool(stop())
+
+            return real_move(install, target, should_stop=checked)
+
+        monkeypatch.setattr(updates_module, "move_user_scripts", slow_move)
+        controller = UpdateController(
+            harness.window,
+            preferences=lambda: Preferences(update_check=False),
+            blockers=list,
+            arguments=list,
+            layout=harness.layout,
+            store=harness.store,
+            threaded=True,
+        )
+        try:
+            assert controller.offer_script_move()
+            # 一覧を作り終えた知らせは画面の側で受け取って、移しを裏へ出す
+            deadline = time.monotonic() + 10
+            while not inside.is_set() and time.monotonic() < deadline:
+                qt_application.processEvents()
+                time.sleep(0.02)
+            assert inside.is_set()
+            threading.Timer(0.3, release_move.set).start()
+            assert controller.shutdown(timeout=10)
+            # 閉じると決めた後は新しい束に入らない 1 つ目の束は入る前に止まったので残る
+            assert first.is_file() and second.is_file()
+            assert not list(harness.layout.install.glob(".scripts-removing-*"))
+        finally:
+            release_move.set()
+            controller.deleteLater()
+            qt_application.processEvents()
+
+    def test_no_move_while_the_swapper_runs(self, harness: _Harness) -> None:
+        """入れ替え係が今の版のフォルダを付け替えている間は移さない（swap.lock）"""
+        mine = _put_script(harness.layout.install, "自分の/効果.anm2")
+        held = try_hold(lock_path(SWAP_LOCK, harness.store.path.parent))
+        assert held is not None
+        try:
+            assert not harness.controller.offer_script_move()
+        finally:
+            held.release()
+        assert mine.is_file()
+
+    def test_the_editor_waits_for_the_move_when_closing(self) -> None:
+        """編集画面は閉じるときに裏の移しを待つ（shutdown を呼ぶ）"""
+        import inspect
+
+        source = inspect.getsource(MainWindow.closeEvent)
+        assert "self._updates.shutdown()" in source
+
     def test_restarting_waits_for_the_move(self, harness: _Harness) -> None:
         """移している最中に入れ替えると、写す側と移す側が同じファイルを同時に触る"""
         harness.controller.start()
@@ -828,10 +901,10 @@ class TestScriptsBesideTheExe:
         release_move = threading.Event()
         threads: list[str] = []
 
-        def slow_move(install: Path, target: Path) -> object:
+        def slow_move(install: Path, target: Path, **options: Any) -> object:
             threads.append(threading.current_thread().name)
             release_move.wait(10)
-            return real_move(install, target)
+            return real_move(install, target, **options)
 
         monkeypatch.setattr(updates_module, "move_user_scripts", slow_move)
         mine = _put_script(harness.layout.install, "自分の/効果.anm2")

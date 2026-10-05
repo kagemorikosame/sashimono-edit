@@ -260,6 +260,68 @@ class TestUserScripts:
         with pytest.raises(package_module.CarryError):
             carry_user_files(layout.install, layout.staged, aside=aside)
 
+    def test_carrying_waits_for_a_move_and_stops_if_it_does_not_end(
+        self, layout: Layout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """引き継ぎは移す側と同じ錠を持つ 別の窓が移している間に写すと、巻き戻しで写しが外れて
+        両方から失われる（PR #245 の Codex の指摘） 少し待ち、取れなければ入れ替えを止める
+        """
+        from sashimono.core import userdirs
+        from sashimono.core.io.locks import try_hold
+        from sashimono.update.portable import MOVE_LOCK
+
+        self._write(layout.install, "自分の/効果.anm2", "obj.ox = 1")
+        monkeypatch.setattr(package_module, "CARRY_LOCK_WAIT", 0.3)
+        held = try_hold(userdirs.config_root() / MOVE_LOCK)
+        assert held is not None
+        try:
+            with pytest.raises(package_module.CarryError) as raised:
+                carry_user_files(layout.install, layout.staged)
+            assert "移している" in raised.value.failed[0][1]
+            assert not (layout.staged / PORTABLE_SCRIPTS_DIR / "自分の").exists()
+        finally:
+            held.release()
+        assert carry_user_files(layout.install, layout.staged) == 1
+
+    def test_originals_left_parked_are_put_back_before_carrying(self, layout: Layout) -> None:
+        """移している途中で閉じて、元をよけたまま残った 次の起動の入れ替えの前に元の場所へ戻して
+        から写す 戻さずに入れ替えると、今の版のフォルダごと .previous へ回り、次の更新で消える
+        （PR #245 の Codex の指摘）
+        """
+        parked = layout.install / ".scripts-removing-4242" / "自分の" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("obj.ox = 1", encoding="utf-8")
+        assert carry_user_files(layout.install, layout.staged) == 1
+        back = layout.install / PORTABLE_SCRIPTS_DIR / "自分の" / "効果.anm2"
+        assert back.read_text(encoding="utf-8") == "obj.ox = 1"
+        carried = layout.staged / PORTABLE_SCRIPTS_DIR / "自分の" / "効果.anm2"
+        assert carried.read_text(encoding="utf-8") == "obj.ox = 1"
+        assert not (layout.install / ".scripts-removing-4242").exists()
+
+    def test_a_stopped_carry_keeps_an_aside_copy_whose_original_is_gone(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """止めるときの巻き戻しで外すのは、自分が置いた写しで元が残っているときだけ（移す側と同じ）
+        元が無ければ誰かがその写しを当てにした 外すと両方から失われる
+        """
+        aside = tmp_path / "roaming" / "Sashimono" / "scripts"
+        mine = self._write(layout.install, "配布物/common.mod2", "本人の common")
+        self._write(layout.staged, "配布物/common.mod2", "新しい版の common")
+        self._write(layout.install, "塞がれた/効果.anm2", "写せない")
+        (layout.staged / PORTABLE_SCRIPTS_DIR / "塞がれた").write_text("塞ぐ", encoding="utf-8")
+        real_copy = package_module._copy_over
+
+        def copy_then_lose_origin(origin: Path, target: Path, *, replace: bool = True) -> object:
+            problem = real_copy(origin, target, replace=replace)
+            if origin == mine:
+                mine.unlink()
+            return problem
+
+        monkeypatch.setattr(package_module, "_copy_over", copy_then_lose_origin)
+        with pytest.raises(package_module.CarryError):
+            carry_user_files(layout.install, layout.staged, aside=aside)
+        assert (aside / "配布物" / "common.mod2").read_text(encoding="utf-8") == "本人の common"
+
     def test_the_folder_name_matches_the_catalog(self) -> None:
         """名前が食い違うと、写す先が読まれない場所になる"""
         assert package_module._PORTABLE_SCRIPTS_DIR == PORTABLE_SCRIPTS_DIR

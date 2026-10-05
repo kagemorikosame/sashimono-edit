@@ -34,11 +34,12 @@ import filecmp
 import os
 import shutil
 import stat
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from sashimono.core.io.locks import try_hold
+from sashimono.core.io.locks import HeldLock, try_hold
 
 __all__ = [
     "BUNDLED_SCRIPT_FILES",
@@ -47,6 +48,8 @@ __all__ = [
     "PORTABLE_SCRIPTS_DIR",
     "ScriptMove",
     "bundles",
+    "clean_leftovers",
+    "hold_move_lock",
     "in_synced_folder",
     "is_link",
     "module_stem",
@@ -313,33 +316,67 @@ def _plan(
     return stay, clashes
 
 
-def move_user_scripts(install: Path, target: Path) -> ScriptMove:
+def hold_move_lock(
+    folder: Path,
+    *,
+    wait: float = 0.0,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> HeldLock | None:
+    """exe の隣の ``scripts`` と ``%APPDATA%`` の ``scripts`` を触る間の錠を取る
+
+    ``folder`` は ``%APPDATA%\\Sashimono`` 移す（:func:`move_user_scripts`）も、自動更新の
+    引き継ぎ（``package.carry_user_files``）も同じ錠を持つ 重なると、片方が置いた写しを
+    もう片方が当てにして元を消し、巻き戻しで写しが外れて両方から失われる（PR #245 の Codex の
+    指摘） ``wait`` 秒まで取り直す 取れなければ ``None``
+    """
+    deadline = clock() + wait
+    while True:
+        lock = try_hold(folder / MOVE_LOCK)
+        if lock is not None or clock() >= deadline:
+            return lock
+        sleep(0.1)
+
+
+def clean_leftovers(install: Path, target: Path) -> None:
+    """落ちた起動（電源が切れた・移している途中で閉じた）が残した物を片付ける 錠を持って呼ぶ
+
+    作業用のフォルダ・写しの途中の物（``.moving``）を捨て、よけたまま残った元を元の場所へ戻す
+    （:func:`_recover_removed`） 自動更新は入れ替える前に呼ぶ 呼ばずに今の版のフォルダを
+    ``.previous`` へ回すと、よけた元は戻らずに次の更新で消える（PR #245 の Codex の指摘）
+    """
+    for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
+        _remove_tree(leftover)
+    for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
+        with contextlib.suppress(OSError):
+            remove_file(leftover)
+    _recover_removed(install, target)
+
+
+def move_user_scripts(
+    install: Path, target: Path, *, should_stop: Callable[[], bool] | None = None
+) -> ScriptMove:
     """exe の隣の ``scripts`` に本人が置いた物を ``target`` へ移す 決まりは上の説明のとおり
 
     **移すのは 1 つずつ** 移し先の親（``%APPDATA%\\Sashimono``）の錠（``MOVE_LOCK``）を持って
-    行う 2 つの Sashimono が同じ束を同時に移すと、片方が置いた写しをもう片方が「同じ中身」と
-    見て元を消し、その後に最初の方が名前の衝突で巻き戻して写しを外し、両方の置き場から失われる
-    （PR #245 の Codex の指摘） 錠を取れなければ何もせずに ``busy`` を返す（次の起動で移す）
+    行う（:func:`hold_move_lock`） 取れなければ何もせずに ``busy`` を返す（次の起動で移す）
     錠の持ち主が落ちていれば、次に取るときに片付く（:mod:`sashimono.core.io.locks`）
+
+    ``should_stop`` が真を返したら、次の束へは入らずに終える（束の途中では止めない）
+    アプリを閉じるときに、元をよけたまま止まらないようにするため
     """
-    lock = try_hold(target.parent / MOVE_LOCK)
+    lock = hold_move_lock(target.parent)
     if lock is None:
         return ScriptMove(busy=True)
     try:
-        # 錠を持てた ほかに移している人はいない 落ちた起動（電源が切れた など）が残した
-        # 作業用のフォルダと、写しの途中の物（``.moving``）を片付ける
-        for leftover in target.parent.glob(f"{_STAGING_PREFIX}*"):
-            _remove_tree(leftover)
-        for leftover in target.rglob(f"*{_MOVING_SUFFIX}") if target.is_dir() else ():
-            with contextlib.suppress(OSError):
-                remove_file(leftover)
-        _recover_removed(install, target)
-        return _move_all(install, target)
+        # 錠を持てた ほかに移している人はいない 落ちた起動が残した物を片付ける
+        clean_leftovers(install, target)
+        return _move_all(install, target, should_stop or (lambda: False))
     finally:
         lock.release()
 
 
-def _move_all(install: Path, target: Path) -> ScriptMove:
+def _move_all(install: Path, target: Path, should_stop: Callable[[], bool]) -> ScriptMove:
     source = install / PORTABLE_SCRIPTS_DIR
     walked, links = _walk(source)
     files = [p for p in walked if not _bundled(p) and not p.name.endswith(_MOVING_SUFFIX)]
@@ -354,6 +391,8 @@ def _move_all(install: Path, target: Path) -> ScriptMove:
             for relative in members:
                 (kept if relative in clashes else held).append(relative)
             continue
+        if should_stop():
+            break  # 閉じる 新しい束には入らない 残りは次の起動で移す
         problem, placed = _place_bundle(source, target, members)
         if problem is None:
             problem, gone, stuck = _retire(install, target, members, placed)

@@ -29,12 +29,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from sashimono.core import userdirs
 from sashimono.runtime import app_dir
 from sashimono.update.fetch import Transport, download
 from sashimono.update.manifest import MAX_PACKAGE_BYTES, Manifest
 from sashimono.update.portable import (
     PORTABLE_SCRIPTS_DIR,
     bundles,
+    clean_leftovers,
+    hold_move_lock,
     is_link,
     module_stem,
     modules_in,
@@ -267,7 +270,12 @@ def stage(
 
 
 def carry_user_files(
-    install: Path, destination: Path, *, overwrite: bool = False, aside: Path | None = None
+    install: Path,
+    destination: Path,
+    *,
+    overwrite: bool = False,
+    aside: Path | None = None,
+    config: Path | None = None,
 ) -> int:
     """今の版の exe の隣のスクリプト置き場に本人が置いた物を、入れ替え先の版へ写す 写した数を返す
 
@@ -296,7 +304,38 @@ def carry_user_files(
     （``previous`` か ``.new`` へよけた側）にだけ残る 止めるときは ``aside`` へ写した物を外す
     （``%APPDATA%`` は今の版でも読まれるので、束の一部だけが残ると今の版の描画が変わる）
     入れ替え先の版（``.new`` ``previous``）へ写した物はそのまま置く（今は読まれない）
+
+    **移す側と同じ錠（``portable.MOVE_LOCK``）を、計画から止めるときの巻き戻しまで持つ**
+    （``config`` は ``%APPDATA%\\Sashimono`` 既定は本人の置き場） 別の窓が移している最中に
+    写すと、巻き戻しで写しが外れて両方から失われる（PR #245 の Codex の指摘） 移しは束ごとに
+    短いので ``CARRY_LOCK_WAIT`` 秒まで待ち、取れなければ止める 錠を持ったら、落ちた起動が
+    よけたまま残した元を元の場所へ戻してから写す（戻さずに入れ替えると、今の版のフォルダごと
+    ``.previous`` へ回り、次の更新で消える）
     """
+    folder = config if config is not None else userdirs.config_root()
+    lock = hold_move_lock(folder, wait=CARRY_LOCK_WAIT)
+    if lock is None:
+        raise CarryError(
+            (
+                (
+                    Path(PORTABLE_SCRIPTS_DIR),
+                    "ほかの Sashimono の窓が exe の隣のスクリプトを移している",
+                ),
+            )
+        )
+    try:
+        clean_leftovers(install, folder / PORTABLE_SCRIPTS_DIR)
+        return _carry(install, destination, overwrite=overwrite, aside=aside)
+    finally:
+        lock.release()
+
+
+#: 引き継ぐ前に、移している別の窓が錠を放すのを待つ長さ（秒） 移しは束 1 つずつ錠を
+#: 持ち直さないので、全部を移し終えるまで待つことになる 長く待たせるより止めて知らせる
+CARRY_LOCK_WAIT = 10.0
+
+
+def _carry(install: Path, destination: Path, *, overwrite: bool, aside: Path | None) -> int:
     source = install / _PORTABLE_SCRIPTS_DIR
     root = destination / _PORTABLE_SCRIPTS_DIR
     files = user_script_files(install)
@@ -334,15 +373,21 @@ def carry_user_files(
             if problem is None:
                 copied += 1
                 if where is aside:
-                    placed_aside.append(target)
+                    placed_aside.append(relative)
             else:
                 failed.append((relative, problem))
     if failed:
-        for target in placed_aside:
+        assert aside is not None or not placed_aside
+        for relative in placed_aside:
+            # 外すのは自分が置いた写しで、元が exe の隣に同じ中身で残っているときだけ（移す側の
+            # 巻き戻しと同じ） 元が無ければ誰かがこの写しを当てにした 外すと両方から失われる
+            target = aside / relative if aside is not None else relative
+            origin = source / relative
             with contextlib.suppress(OSError):
-                if is_link(target):
-                    _remove_link(target)
-                else:
+                if relative in linked:
+                    if _same_link(origin, target):
+                        _remove_link(target)
+                elif origin.is_file() and _same_file(origin, target):
                     remove_file(target)
         raise CarryError(tuple(failed), links=tuple(p for p, _r in failed if p in linked))
     return copied

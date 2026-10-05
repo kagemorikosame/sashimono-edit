@@ -2345,7 +2345,31 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
   | 移している最中の電源断 | 元は確定し終えてから消す 作業用のフォルダと写しの途中の物（`.moving`）は、次に錠を取れたときに片付ける 錠は持ち主が落ちていれば取り直せる |
   | 移し先の空き不足 | 写す前に空きを見る（写す量と 64 MB の余り） 足りなければ写し始めない |
   | ファイルがとても多い | 裏のスレッドで行う 走査はリンクを辿らない |
-  | 自動更新の入れ替えと同時 | 起動の頭の入れ替えは窓を出す前に済む 画面からの入れ替えは移している間は断る 入れ替え係が走っている間は移さない |
+  | 自動更新の入れ替えと同時 | 下の「重なったときの錠と順番」 |
+
+  重なったときの錠と順番（PR #245 で決めた 5 つの仕事 それぞれ試験で押さえる）
+
+  - 移す（M） 窓を出した後に裏のスレッドで exe の隣の物を `%APPDATA%` へ移す `move_user_scripts`
+  - 引き継ぐ（C） 入れ替える・戻す前に、exe の隣の物を入れ替え先の版（と `%APPDATA%`）へ写す `carry_user_files`
+  - 入れ替え（S） PowerShell の入れ替え係がフォルダを付け替える（全部の窓が閉じるのを待つ）
+  - 戻す（R） 〔前の版に戻す…〕 C（上書き）の後に S
+  - 起動時の更新（A） 窓を出す前の `apply_on_start` C の後に S
+
+  錠は 3 つ `scripts-move.lock`（`%APPDATA%\Sashimono` M と C が持つ）・`stage.lock`（落として展開する間）・
+  `swap.lock`（入れ替え係が持つ） どれも持ち主が落ちれば次に取るときに片付く
+
+  | 重なり | 錠と順番 | 試験 |
+  |---|---|---|
+  | M と M（2 つの窓） | `scripts-move.lock` 後の方は何もせず次の起動へ 巻き戻しは自分が置いて元が残る物だけ | `test_two_moves_at_once_do_not_lose_anything` `test_a_rollback_never_takes_back_a_copy_someone_relied_on` |
+  | M と C（別の窓の移しの最中に入れ替え・戻す・起動時の更新） | C も `scripts-move.lock` を計画から巻き戻しまで持つ 10 秒まで待ち、取れなければ入れ替えを止めて知らせる | `test_carrying_waits_for_a_move_and_stops_if_it_does_not_end` `test_a_move_in_another_window_stops_the_swap` |
+  | M と C（同じ窓） | 移している間は〔今すぐ再起動して入れる〕〔前の版に戻す〕を断る | `test_restarting_waits_for_the_move` |
+  | M と S | 入れ替え係が走っている（`swap.lock`）間は移さない 窓を閉じるときは移しが今の束を終えるのを待ち（10 秒まで）、新しい束には入らない | `test_no_move_while_the_swapper_runs` `test_closing_waits_for_the_bundle_being_moved` `test_stopping_finishes_the_bundle_and_starts_no_new_one` |
+  | M が途中で止まった後の A・R・C | C は錠を取ったら、まずよけたまま残った元を元の場所へ戻し、作業用の物を片付けてから写す（入れ替え先へ回る前に戻す） | `test_originals_left_parked_are_put_back_before_carrying` `test_parked_originals_return_before_the_swap` |
+  | M が途中で止まった後の M | 錠を取ったら同じく戻し・片付けてから移す | `test_originals_left_parked_by_a_crash_are_put_back` `test_leftovers_of_a_power_cut_are_cleared` |
+  | C と C（2 つの窓） | `scripts-move.lock` で 1 つずつ 入れ替え係は `swap.lock` で 1 つ（起こす前にも確かめて断る） | `test_carrying_waits_for_a_move_and_stops_if_it_does_not_end` `test_another_window_at_work_starts_nothing` |
+  | C と S | C を終えてから入れ替え係を起こす C で写せなければ起こさない 入れ替え係はこの窓が閉じるのを待つ | `test_files_that_cannot_be_carried_stop_the_update` `test_files_that_cannot_be_carried_stop_the_swap` |
+  | S と S | `swap.lock` | `test_another_window_at_work_starts_nothing` `test_losing_the_race_says_so` |
+  | R と A・S | R は C（上書き）を終えてから入れ替え係を起こす 写せなければ戻さず、飛ばす版にも記録しない A は窓を出す前に済み、走っている入れ替え係があれば画面を出さずに終わる | `test_files_that_cannot_be_carried_stop_the_rollback` `test_rolling_back_takes_the_edited_one` |
   - 移して空になったフォルダは片付ける `scripts` そのものは残す
 - **読む順は変わらない** 読む順は exe の隣 → `%APPDATA%` → AviUtl2 で、後に読んだ方が同じ名前で勝つ
   移すのはいちばん負ける exe の隣から次の `%APPDATA%` へだけで、`%APPDATA%` に同じ名前があれば

@@ -65,6 +65,10 @@ STARTUP_DELAY_MS = 3000
 #: 裏の仕事を見に行く間隔
 _POLL_MS = 200
 
+#: 閉じるときに、裏の移しが今の束を終えるのを待つ長さ（秒） 束は普通は数 MB で 1 秒もかからない
+#: 超えたら待たずに閉じる（よけた元は次の移しか引き継ぎが戻す）
+SHUTDOWN_WAIT = 10.0
+
 #: 選べる答え
 ANSWER_NOW = "now"
 ANSWER_NEXT_START = "next-start"
@@ -140,6 +144,10 @@ class UpdateController(QObject):
         self._moving = False
         #: 走っている裏の仕事の数 0 になったら見に行く時計を止める
         self._background_jobs = 0
+        #: 裏の仕事のスレッド 閉じるときに今の束を終えるのを待つ（:meth:`shutdown`）
+        self._threads: list[threading.Thread] = []
+        #: 閉じる 裏の移しは新しい束に入らない
+        self._stopping = threading.Event()
         self._move_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._move_timer = QTimer(self)
         self._move_timer.setInterval(_POLL_MS)
@@ -321,7 +329,7 @@ class UpdateController(QObject):
         loud = manual or mode == SCRIPTS_MOVE_ASK
         # 途中でアプリを閉じても、元は確定し終えてから消すので失われない（daemon で待たせない）
         self._in_background(
-            lambda: move_user_scripts(install, target),
+            lambda: move_user_scripts(install, target, should_stop=self._stopping.is_set),
             lambda result: self._moved(result, target, loud=loud, fresh=fresh),
         )
 
@@ -357,8 +365,25 @@ class UpdateController(QObject):
             self._move_results.put(lambda: then(value))
 
         self._background_jobs += 1
-        threading.Thread(target=run, name="sashimono-background", daemon=True).start()
+        thread = threading.Thread(target=run, name="sashimono-background", daemon=True)
+        self._threads = [t for t in self._threads if t.is_alive()]
+        self._threads.append(thread)
+        thread.start()
         self._move_timer.start()
+
+    def shutdown(self, timeout: float = SHUTDOWN_WAIT) -> bool:
+        """窓を閉じるときに呼ぶ 裏の仕事が今の束を終えるのを待つ 終われば真
+
+        移しは束の途中で止めない（元をよけたまま止まると、次の起動で更新の入れ替えが先に走った
+        ときに戻らない PR #245 の Codex の指摘） 新しい束には入らないよう知らせ、``timeout`` 秒まで
+        待つ 超えたら待たずに閉じる よけた元は、次に錠を取った移しか引き継ぎ（自動更新の入れ替えの
+        前に必ず走る）が元の場所へ戻す
+        """
+        self._stopping.set()
+        deadline = time.monotonic() + timeout
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in self._threads)
 
     def _moved_failure(self, exc: Exception) -> None:
         self._moving = False

@@ -2715,6 +2715,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        # exe の隣のスクリプトを裏で移していれば、今の束を終えるまで待つ（束の途中で止めない）
+        self._updates.shutdown()
         # 並びを保存できなくても終了は止めない 次の起動が既定の並びになるだけ
         with contextlib.suppress(OSError):
             self._workspace.save(self)

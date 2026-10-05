@@ -711,6 +711,25 @@ class TestEdgeCases:
         assert (target / "配布物" / "効果.anm2").read_text(encoding="utf-8") == "obj.ox = 1\n"
         assert not (install / ".scripts-removing-4242").exists()
 
+    def test_stopping_finishes_the_bundle_and_starts_no_new_one(
+        self, install: Path, target: Path
+    ) -> None:
+        """閉じるときは束の途中で止めない（元をよけたまま残さない） 新しい束には入らない"""
+        # 束は名前の順に移す 1 つ目（a）を移し終えた後に閉じると決まる
+        _put(install, "a/効果.anm2", "obj.ox = 1\n")
+        _put(install, "a/common.lua", "return {}")
+        second = _put(install, "b/効果.anm2", "obj.ox = 2\n")
+        asked: list[bool] = []
+
+        def stop_after_the_first() -> bool:
+            asked.append(True)
+            return len(asked) > 1
+
+        result = move_user_scripts(install, target, should_stop=stop_after_the_first)
+        assert sorted(p.as_posix() for p in result.moved) == ["a/common.lua", "a/効果.anm2"]
+        assert second.is_file() and not (target / "b").exists()
+        assert not list(install.glob(".scripts-removing-*"))
+
     def test_leftovers_of_a_power_cut_are_cleared(self, install: Path, target: Path) -> None:
         """電源が切れた後の起動 作業用のフォルダと写しの途中の物（.moving）を片付け、元から移す"""
         _put(install, "配布物/効果.anm2", "obj.ox = 1\n")
@@ -772,6 +791,23 @@ class TestSurvivingUpdates:
         (staged / PORTABLE_SCRIPTS_DIR / "README.txt").write_text("新しい説明", encoding="utf-8")
         assert carry_user_files(install, staged) == 0
         assert (target / "自分の" / "効果.anm2").is_file()
+
+
+def test_the_overlap_table_names_real_tests() -> None:
+    """docs の「重なったときの錠と順番」の表に書いた試験が在る 名前を変えたら表も直す
+    書いた試験が無くなると、表は押さえていない組み合わせを押さえたと言い続ける
+    """
+    import re
+
+    docs = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+    table = docs.split("重なったときの錠と順番", 1)[1].split("### ", 1)[0]
+    named = set(re.findall(r"`(test_[a-z0-9_]+)`", table))
+    assert len(named) >= 15
+    sources = "".join(
+        path.read_text(encoding="utf-8") for path in (ROOT / "tests").rglob("test_*.py")
+    )
+    missing = sorted(name for name in named if f"def {name}(" not in sources)
+    assert missing == []
 
 
 class TestNames:

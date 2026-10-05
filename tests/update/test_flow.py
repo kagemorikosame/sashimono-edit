@@ -100,6 +100,48 @@ class TestApplyingOnStart:
         assert layout.staged_version() == "1.2.0"
         assert mine.is_file() and (layout.install / APP_EXE).is_file()
 
+    def test_parked_originals_return_before_the_swap(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """移している途中で閉じて元をよけたまま残っても、起動の頭の入れ替えの前に元の場所へ
+        戻して新しい版へ写す（PR #245 の Codex の指摘 戻さずに入れ替えると .previous へ
+        回って消える）
+        """
+        _stage(layout, "1.2.0")
+        parked = layout.install / ".scripts-removing-4242" / "自分の" / "効果.anm2"
+        parked.parent.mkdir(parents=True)
+        parked.write_text("--track", encoding="utf-8")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert plans
+        assert (layout.install / "scripts" / "自分の" / "効果.anm2").is_file()
+        assert (layout.staged / "scripts" / "自分の" / "効果.anm2").is_file()
+
+    def test_a_move_in_another_window_stops_the_swap(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """別の窓が移している（錠を持っている）間は、起動の頭でも入れ替えない 次の起動で試す"""
+        from sashimono.core import userdirs
+        from sashimono.update import package as package_module
+        from sashimono.update.portable import MOVE_LOCK
+
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        monkeypatch.setattr(package_module, "CARRY_LOCK_WAIT", 0.2)
+        held = try_hold(userdirs.config_root() / MOVE_LOCK)
+        assert held is not None
+        try:
+            assert not apply_on_start(["x"], layout=layout, store=store, swap=_never)
+        finally:
+            held.release()
+        assert "移している" in store.load().pending_notice
+
     def test_turning_checks_off_cancels_the_reservation(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
