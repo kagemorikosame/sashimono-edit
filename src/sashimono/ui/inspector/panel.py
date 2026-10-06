@@ -232,8 +232,9 @@ class InspectorPanel(QWidget):
         #: 値だけ入れ直すときに、入力欄以外（合成モード・組の有効の切り替えなど）を
         #: 今のクリップに合わせる手
         self._refreshers: list[Callable[[Clip], None]] = []
-        #: スライダーを押している最中に構成の変わる更新が来た 離すまで作り直しを待つ
-        self._rebuild_pending = False
+        #: スライダーを押している最中に更新が来た 構成が変わるなら作り直しを、変わらない
+        #: なら押している欄への値の入れ直しを、離すまで待っている
+        self._update_pending = False
 
         #: 何のクリップの設定を見ているか（種類・名前・トラック）
         self._title = ClipHeader(self)
@@ -288,14 +289,18 @@ class InspectorPanel(QWidget):
         self._show_project()
 
     def _show_project(self) -> None:
+        busy = self._busy()
         if self._layout_key() == self._shown_layout:
-            self._rebuild_pending = False
             self._refresh_values()
+            # 押している欄は値の入れ直しを飛ばした（つまみが跳ねる） 離したときにもう 1 度
+            # 入れ直す 待たないと、押している間に取り消しや AI が値を変え、動かさずに
+            # 離した（確定が出ない）とき、モデルは外の値なのに欄は押す前の値のまま残る
+            self._update_pending = busy
             return
-        if self._busy():
+        if busy:
             # スライダーを押している最中 作り直すと掴んでいた部品が消えてドラッグが切れる
             # 離したとき（:meth:`_after_interaction`）に作り直す
-            self._rebuild_pending = True
+            self._update_pending = True
             return
         self._rebuild()
 
@@ -306,16 +311,16 @@ class InspectorPanel(QWidget):
         )
 
     def _after_interaction(self) -> None:
-        """押している最中の操作が終わった 待っていた作り直しを済ませる
+        """押している最中の操作が終わった 待っていた作り直しか値の入れ直しを済ませる
 
         離した知らせはスライダーが離したことを受け取る前に来ることがある その場では
         まだ押している扱いなので、受け取り終えた後（次の巡り）に確かめる
         """
-        if self._rebuild_pending:
+        if self._update_pending:
             QTimer.singleShot(0, self, self._settle)
 
     def _settle(self) -> None:
-        if self._rebuild_pending and not self._busy():
+        if self._update_pending and not self._busy():
             self._show_project()
 
     def set_clip(self, clip_id: ClipId | None) -> None:
@@ -459,7 +464,7 @@ class InspectorPanel(QWidget):
         戻さないと、構成の変わる 1 文字（タイマーの書式の 1 文字目など）で打てなくなる
         """
         focus = self._focused_place()
-        self._rebuild_pending = False
+        self._update_pending = False
         self._editors.clear()
         self._key_controls.clear()
         self._virtual.clear()

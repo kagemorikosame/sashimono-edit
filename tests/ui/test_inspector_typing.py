@@ -305,6 +305,33 @@ class TestOtherFields:
         # 離したら、待っていた作り直しを済ませる（縁取りの色の欄が出る）
         assert ("source", "border_color") in window._inspector._editors
 
+    def test_a_value_changed_while_pressing_shows_after_release(self, window: MainWindow) -> None:
+        # 押している間に外（取り消し・AI）から同じ構成のまま値が変わったら、押している欄は
+        # つまみが跳ねないよう入れ直しを待つ 動かさずに離す（確定が出ない）と、待っていた
+        # 値を入れ直さない限り、モデルは外の値なのに欄は押す前の値を出し続ける
+        editor = window._inspector._editors[("source", "size")]
+        assert isinstance(editor, TrackEditor)
+        slider = editor.findChild(QSlider)
+        box = editor.findChild(QDoubleSpinBox)
+        assert slider is not None and box is not None
+        handle = _handle_center(slider)
+        clip_id = _clip_ids(window)[0]
+        QTest.mousePress(slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle)
+        try:
+            window.execute_all(
+                [SetParam(ParamPath.of_source(clip_id, "size"), AnimatedValue(100.0))], "外から"
+            )
+            _flush()
+            # 押している間は押す前の値のまま（跳ねさせない）
+            assert box.value() == 64
+        finally:
+            QTest.mouseRelease(
+                slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle
+            )
+            _flush()
+        assert _source(window, clip_id, "size") == AnimatedValue(100.0)
+        assert box.value() == 100
+
     def test_the_keyframe_button_keeps_its_widget(self, window: MainWindow) -> None:
         # ◆ を押すたびに作り直すと、続けて ◀ ▶ を押す前にボタンが入れ替わる
         controls = window._inspector._key_controls[("source", "size")]
