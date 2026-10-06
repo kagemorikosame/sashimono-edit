@@ -103,7 +103,7 @@ def _install_here(arguments: list[str], lines: list[str], timeout: float) -> int
     code = run_pip_in_worker(arguments, on_output=lines.append, should_cancel=too_late)
     if late.is_set():
         lines.append(f"[NG] {timeout:g} 秒で終わらない: pip {' '.join(arguments[:3])} …")
-        return code or 1
+        return 1
     return code
 
 

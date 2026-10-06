@@ -46,6 +46,8 @@ from sashimono.core import userdirs
 
 __all__ = [
     "ABI_MARKER",
+    "LEFT_RUNNING_NOTE",
+    "PIP_LEFT_RUNNING",
     "FeaturePack",
     "PackStatus",
     "PackageStatus",
@@ -53,9 +55,11 @@ __all__ = [
     "app_dir",
     "install_arguments",
     "install_command",
+    "install_result_text",
     "install_runtime",
     "is_frozen",
     "pip_arguments",
+    "pip_left_running",
     "python_abi",
     "refresh_runtime",
     "remove_stale_metadata",
@@ -1138,6 +1142,37 @@ _CANCEL_POLL_SECONDS = 0.1
 #: 同期の読み書き（ネットの読み込みなど）の中にいる間は届かない 待ちきれなければ戻らずに返す
 _CANCEL_GRACE_SECONDS = 10.0
 
+#: 中断を投げても pip が戻らず、作業スレッドを残して返したときの終了コード
+#: pip の終了コードは 0 以上なので、負の数なら取り違えない
+PIP_LEFT_RUNNING = -2
+
+#: pip が残っている間に出す案内 残った pip は標準出力・logging・警告を pip の物のまま持ち、
+#: 錠も握っているので、同じ起動の中では入れ直せない
+LEFT_RUNNING_NOTE = "pip が止まらずに残っています アプリを再起動してから導入し直してください"
+
+#: 戻らずに残した pip の作業スレッド 戻れば（標準出力などを戻して錠を返せば）消える
+_LEFTOVERS: list[threading.Thread] = []
+
+
+def pip_left_running() -> bool:
+    """前の導入の pip が戻らずに残っているか
+
+    残っている間は導入の操作を押せなくする 押せると、錠を待つだけの導入が始まり、
+    pip が書き換えたままの標準出力やログの上で次の pip が走る（PR #254 のレビュー）
+    戻れば偽になり、もう一度押せる
+    """
+    _LEFTOVERS[:] = [thread for thread in _LEFTOVERS if thread.is_alive()]
+    return bool(_LEFTOVERS)
+
+
+def install_result_text(code: int) -> str:
+    """導入の終わりに導入のログへ出す 1 行"""
+    if code == 0:
+        return "導入が完了しました"
+    if code == PIP_LEFT_RUNNING:
+        return LEFT_RUNNING_NOTE
+    return f"導入に失敗しました（コード {code}）"
+
 
 def run_pip_in_worker(
     arguments: Sequence[str],
@@ -1154,11 +1189,16 @@ def run_pip_in_worker(
     止まったかが残らない（PR #254 のレビュー）
 
     中断を頼まれたら pip へ中断を投げ、``grace`` 秒（省けば ``_CANCEL_GRACE_SECONDS``）だけ
-    戻るのを待つ 戻らなければ 1 を返す 残った pip は届いた所で止まり、錠を返す
-    （次の導入はそれまで待つ） daemon なので、``--add-on-check`` のように返した後で
-    プロセスが終われば一緒に消える
+    戻るのを待つ 戻らなければ :data:`PIP_LEFT_RUNNING` を返す 普通の失敗と分けるのは、
+    残った pip が戻るまで（標準出力などを戻して錠を返すまで）次の導入をさせないため
+    （:func:`pip_left_running`） 残った pip は届いた所で止まる daemon なので、
+    ``--add-on-check`` のように返した後でプロセスが終われば一緒に消える
+    残っている間に頼まれたら、走らせずに :data:`PIP_LEFT_RUNNING` を返す
     """
     write = on_output if on_output is not None else _ignore
+    if pip_left_running():
+        write(LEFT_RUNNING_NOTE)
+        return PIP_LEFT_RUNNING
     wait = _CANCEL_GRACE_SECONDS if grace is None else grace
     asked = threading.Event()
     result: list[int] = []
@@ -1177,6 +1217,7 @@ def run_pip_in_worker(
     asked.set()
     worker.join(wait)
     if worker.is_alive():
+        _LEFTOVERS.append(worker)
         write(f"中断を頼んだが pip が {wait:g} 秒で戻らない 待たずに止めた")
-        return 1
+        return PIP_LEFT_RUNNING
     return result[0] if result else 1

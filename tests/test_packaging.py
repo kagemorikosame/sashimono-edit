@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import io
@@ -70,26 +71,44 @@ def _refuse_children(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     return tried
 
 
+@dataclasses.dataclass
+class StuckPip:
+    """戻らない pip ``entered`` は pip に入った知らせ ``release`` を立てると戻る"""
+
+    entered: threading.Event
+    release: threading.Event
+
+
+def _wait_until_the_pip_is_back() -> None:
+    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ"""
+    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
+    runtime_module._PIP_HERE.release()
+    for _ in range(1000):
+        if not runtime_module.pip_left_running():
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("残った pip の作業スレッドが終わらない")
+
+
 @pytest.fixture
-def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Event]:
+def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[StuckPip]:
     """呼ぶと戻らない pip 同期の読み書きの中で止まった pip の代わり
 
     錠の待ちの中で止まるので、投げ込んだ中断の例外も届かない 試験の後で放して、
-    作業スレッドが錠と標準出力を返すまで待つ 返さないと、後の試験の pip が錠を待ち続ける
+    作業スレッドが錠と標準出力を返すまで待つ 返さないと、後の試験の pip が錠を待ち続け、
+    残った pip がいるとして導入を断られる
     """
-    release = threading.Event()
-    entered = threading.Event()
+    stuck_one = StuckPip(threading.Event(), threading.Event())
 
     def stuck(arguments: list[str]) -> int:
-        entered.set()
-        release.wait()
+        stuck_one.entered.set()
+        stuck_one.release.wait()
         return 1
 
     monkeypatch.setattr("pip._internal.cli.main.main", stuck)
-    yield entered
-    release.set()
-    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
-    runtime_module._PIP_HERE.release()
+    yield stuck_one
+    stuck_one.release.set()
+    _wait_until_the_pip_is_back()
 
 
 @pytest.fixture(scope="module")
@@ -254,13 +273,15 @@ class TestPipRunsInsideTheApp:
     def test_a_stuck_pip_does_not_hold_the_install_button(
         self,
         frozen: Path,
-        stuck_pip: threading.Event,
+        stuck_pip: StuckPip,
         monkeypatch: pytest.MonkeyPatch,
         pack: FeaturePack,
     ) -> None:
         """導入ボタンの中断は、pip が同期の読み書きの中で戻らなくても少し待って返る
 
         返らないと、導入の欄は「中断しています」のまま、閉じることも入れ直すこともできない
+        返すときは普通の失敗と分ける（PIP_LEFT_RUNNING） 残った pip は錠と標準出力を
+        握ったままなので、戻るまで次の導入をさせない 戻れば入れ直せる
         """
         monkeypatch.setattr(runtime_module, "_CANCEL_GRACE_SECONDS", 0.3)
         lines: list[str] = []
@@ -278,12 +299,23 @@ class TestPipRunsInsideTheApp:
             daemon=True,
         )
         worker.start()
-        assert stuck_pip.wait(10.0)
+        assert stuck_pip.entered.wait(10.0)
         asked.set()
         worker.join(timeout=10.0)
         assert not worker.is_alive(), "戻らない pip を待ち続け、導入の欄が返らない"
-        assert codes == [1]
+        assert codes == [runtime_module.PIP_LEFT_RUNNING]
         assert any("戻らない" in line for line in lines)
+        assert runtime_module.pip_left_running()
+        # 残っている間の導入は走らせずに断る 錠を待つだけの導入を始めない
+        again: list[str] = []
+        assert runtime_module.run_pip_in_worker(["install"], on_output=again.append) == (
+            runtime_module.PIP_LEFT_RUNNING
+        )
+        assert again == [runtime_module.LEFT_RUNNING_NOTE]
+        # 戻れば入れ直せる
+        stuck_pip.release.set()
+        _wait_until_the_pip_is_back()
+        assert not runtime_module.pip_left_running()
 
     def test_a_pip_crash_is_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """pip が中で落ちても、導入の作業スレッドごと落とさず、失敗の終了コードで返す
@@ -1509,7 +1541,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         assert lines[0].startswith("[NG] 7 秒で終わらない")
 
     def test_a_pip_in_the_app_that_takes_too_long_is_stopped_and_written_down(
-        self, frozen: Path, stuck_pip: threading.Event, monkeypatch: pytest.MonkeyPatch
+        self, frozen: Path, stuck_pip: StuckPip, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """配布版の pip は同じプロセスで走る 同期の読み書きの中で戻らなくても、期限で [NG] を
         書いて返す
