@@ -26,7 +26,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
-    QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -224,6 +223,9 @@ class InspectorPanel(QWidget):
         #: 今出している欄の構成の指紋（:meth:`_layout_key`） 同じなら作り直さずに値だけ
         #: 入れ直す 作り直すと、打っている欄が消えてフォーカスが外れる（Issue #251）
         self._shown_layout: object = None
+        #: 今出している欄がどのクリップの物か 選び替えでは :attr:`_clip_id` が作り直しより
+        #: 先に変わるので、作り直す前の欄の持ち主はこちらで覚える
+        self._shown_clip: ClipId | None = None
         #: フォーカスを持てる部品を、何の値の物かで引く 作り直した後に同じ欄へ戻すため
         #: 入力欄（:attr:`_editors`）のほか、合成モードやクリップの入り切りも入る
         self._focus_owners: dict[tuple[str, str], QWidget] = {}
@@ -465,12 +467,19 @@ class InspectorPanel(QWidget):
                 widget.deleteLater()
         self._build()
         self._shown_layout = self._layout_key()
+        self._shown_clip = self._clip_id
         if focus is not None:
             self._restore_focus(focus)
 
     def _focused_place(self) -> _FocusPlace | None:
-        """フォーカスのある欄（何の値の欄か・中のどの部品か・カーソル）"""
-        focus = QApplication.focusWidget()
+        """フォーカスのある欄（何の値の欄か・中のどの部品か・カーソル）
+
+        アプリ全体のフォーカス（``QApplication.focusWidget``）ではなく窓の中のフォーカスを見る
+        窓が活性でない間（ほかのアプリを前に出している間に AI や素材の解析で更新が来た）は
+        アプリ全体のフォーカスが無く、戻す欄を見失う 窓の中のフォーカスなら、戻ったときに
+        受ける欄が分かり、:meth:`_restore_focus` の ``setFocus`` もその欄を窓の中で指し直す
+        """
+        focus = self.window().focusWidget()
         if focus is None or not self._body.isAncestorOf(focus):
             return None
         for key, owner in self._focus_owners.items():
@@ -486,7 +495,7 @@ class InspectorPanel(QWidget):
                 position = focus.cursorPosition()
                 cursor = (position, position)
             typing = owner.typing_since if isinstance(owner, TextEditor) else None
-            return _FocusPlace(key, kind, index, cursor, typing)
+            return _FocusPlace(key, kind, index, cursor, typing, self._shown_clip)
         return None
 
     def _restore_focus(self, place: _FocusPlace) -> None:
@@ -502,7 +511,11 @@ class InspectorPanel(QWidget):
             return
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         if isinstance(owner, TextEditor):
-            owner.continue_typing(place.typing)
+            # 打ち続けを引き継ぐのは同じクリップの作り直しだけ フォーカスを変えずに別の
+            # クリップへ選び替わった（AI の select_clip など）ときに引き継ぐと、次の 1 文字が
+            # 前のクリップの段へまとめられ、1 回の取り消しで別のクリップの編集まで戻る
+            same_clip = place.clip_id == self._clip_id
+            owner.continue_typing(place.typing if same_clip else None)
         if place.cursor is None:
             return
         anchor, position = place.cursor
@@ -1757,6 +1770,8 @@ class _FocusPlace:
     cursor: tuple[int, int] | None
     #: 打ち続けの始まり（:attr:`TextEditor.typing_since`） 取り消しの段を分けないため
     typing: float | None
+    #: どのクリップの欄だったか 違うクリップの欄へは打ち続けを引き継がない
+    clip_id: ClipId | None
 
 
 def _editor_key(path: ParamPath) -> tuple[str, str]:

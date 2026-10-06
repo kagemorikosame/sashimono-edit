@@ -16,7 +16,7 @@ from dataclasses import replace
 
 import pytest
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QFocusEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -65,13 +65,25 @@ def _flush() -> None:
     QApplication.processEvents()
 
 
+def _shown(window: MainWindow) -> MainWindow:
+    """窓を出す 前面には出さない（活性にしない）
+
+    CI の Windows の実行機では窓が前面に出られず、活性になる時とならない時がある
+    活性でない窓では ``QApplication.focusWidget()`` が ``None`` のままなので、
+    試験はどちらでも同じに見える窓の中のフォーカス（``window.focusWidget()``、
+    活性になったときにフォーカスを受ける部品）で見る 手元でも CI と同じ条件にするため、
+    わざと活性にしない
+    """
+    window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    window.show()
+    _flush()
+    return window
+
+
 @pytest.fixture
 def window(qt_application: QApplication) -> Iterator[MainWindow]:
     del qt_application
-    created = MainWindow(_project(), confirm_unsaved=False)
-    created.show()
-    created.activateWindow()
-    QTest.qWaitForWindowActive(created)
+    created = _shown(MainWindow(_project(), confirm_unsaved=False))
     created._timeline.select(_clip_ids(created)[0])
     yield created
     created.close()
@@ -83,23 +95,41 @@ def _editor(window: MainWindow, name: str) -> TextEditor:
     return editor
 
 
-def _focus_end(widget: QWidget) -> None:
+def _focused(window: MainWindow) -> QWidget | None:
+    """窓の中でフォーカスを持つ部品 窓が活性でなくても、活性になったときに受ける物が分かる
+
+    フォーカスのあった部品が消えると ``None`` になる（Qt が窓の中のフォーカスを外す）
+    """
+    return window.focusWidget()
+
+
+def _focus_end(window: MainWindow, widget: QWidget) -> None:
     widget.setFocus(Qt.FocusReason.OtherFocusReason)
     if isinstance(widget, QPlainTextEdit):
         widget.moveCursor(QTextCursor.MoveOperation.End)
     elif isinstance(widget, QLineEdit):
         widget.end(False)
     _flush()
-    assert QApplication.focusWidget() is widget
+    assert _focused(window) is widget
 
 
-def _type(text: str) -> None:
+def _leave(window: MainWindow, widget: QWidget) -> None:
+    """欄を離れる 活性でない窓ではフォーカスを移しても離れた知らせが来ないので、自分で送る
+    （活性の窓では 2 度目の知らせになるが、欄は区切るだけなので同じ結果）"""
+    window._timeline.setFocus(Qt.FocusReason.OtherFocusReason)
+    QApplication.sendEvent(
+        widget, QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.OtherFocusReason)
+    )
+    _flush()
+
+
+def _type(window: MainWindow, text: str) -> None:
     """フォーカスのある欄へ 1 文字ずつ打つ 毎回、今フォーカスのある物へ送る
 
     消えた欄へ送り続けると、実機で起きる「次のキーが欄へ入らない」が見えない
     """
     for character in text:
-        target = QApplication.focusWidget()
+        target = _focused(window)
         assert isinstance(target, QPlainTextEdit | QLineEdit), (
             f"{character!r} を打つ前にフォーカスが欄から外れた（{type(target).__name__}）"
         )
@@ -112,10 +142,10 @@ class TestTyping:
         # 作り直すと 1 文字目で欄が消え、2 文字目からは S の分割やスペースの再生に届く
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("abc S d")
+        _focus_end(window, area)
+        _type(window, "abc S d")
         assert _source(window, _clip_ids(window)[0], "text") == "テキストabc S d"
-        focused = QApplication.focusWidget()
+        focused = _focused(window)
         assert isinstance(focused, QPlainTextEdit)
         assert focused.toPlainText() == "テキストabc S d"
         assert focused.textCursor().position() == len("テキストabc S d")
@@ -125,10 +155,10 @@ class TestTyping:
         # 作り直す道でも、打っていた欄とカーソルの位置へ戻す
         line = _editor(window, "timer_format").findChild(QLineEdit)
         assert line is not None
-        _focus_end(line)
-        _type("hh:mm")
+        _focus_end(window, line)
+        _type(window, "hh:mm")
         assert _source(window, _clip_ids(window)[0], "timer_format") == "hh:mm"
-        focused = QApplication.focusWidget()
+        focused = _focused(window)
         assert isinstance(focused, QLineEdit)
         assert focused is _editor(window, "timer_format").findChild(QLineEdit)
         assert focused.text() == "hh:mm"
@@ -139,19 +169,19 @@ class TestTyping:
         editor = _editor(window, "text")
         area = editor.findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("xy")
+        _focus_end(window, area)
+        _type(window, "xy")
         assert _editor(window, "text") is editor
 
     def test_an_undo_from_outside_keeps_the_cursor_near(self, window: MainWindow) -> None:
         # 取り消しで本文が変わったら入れ直す 頭へ飛ぶと、続きを打つ所を探し直すことになる
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("ab")
+        _focus_end(window, area)
+        _type(window, "ab")
         window.undo()
         _flush()
-        focused = QApplication.focusWidget()
+        focused = _focused(window)
         assert isinstance(focused, QPlainTextEdit)
         assert focused.toPlainText() == "テキスト"
         assert focused.textCursor().position() == len("テキスト")
@@ -163,8 +193,8 @@ class TestUndoSteps:
         before = len(window.document.history_labels)
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("hello")
+        _focus_end(window, area)
+        _type(window, "hello")
         assert len(window.document.history_labels) == before + 1
         window.undo()
         assert _source(window, _clip_ids(window)[0], "text") == "テキスト"
@@ -174,14 +204,13 @@ class TestUndoSteps:
         before = len(window.document.history_labels)
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("ab")
-        window._timeline.setFocus(Qt.FocusReason.OtherFocusReason)
-        _flush()
+        _focus_end(window, area)
+        _type(window, "ab")
+        _leave(window, area)
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("cd")
+        _focus_end(window, area)
+        _type(window, "cd")
         assert len(window.document.history_labels) == before + 2
 
     def test_a_long_burst_is_split_after_a_while(
@@ -194,10 +223,10 @@ class TestUndoSteps:
         before = len(window.document.history_labels)
         area = _editor(window, "text").findChild(QPlainTextEdit)
         assert area is not None
-        _focus_end(area)
-        _type("ab")
+        _focus_end(window, area)
+        _type(window, "ab")
         now[0] += widgets_module.TYPING_MERGE_SECONDS + 0.1
-        _type("cd")
+        _type(window, "cd")
         assert len(window.document.history_labels) == before + 2
 
 
@@ -211,7 +240,7 @@ class TestOtherFields:
         slider.setFocus(Qt.FocusReason.OtherFocusReason)
         _flush()
         for _ in range(3):
-            target = QApplication.focusWidget()
+            target = _focused(window)
             assert isinstance(target, QSlider)
             QTest.keyClick(target, Qt.Key.Key_Right)
             _flush()
@@ -221,7 +250,7 @@ class TestOtherFields:
         assert value == AnimatedValue(3.0)
         # 構成が変わった（縁取りの色の欄が出た）うえで、同じ欄のスライダーへ戻っている
         assert ("source", "border_color") in window._inspector._editors
-        focused = QApplication.focusWidget()
+        focused = _focused(window)
         assert isinstance(focused, QSlider)
         assert focused is window._inspector._editors[("source", "border_width")].findChild(QSlider)
 
@@ -238,7 +267,7 @@ class TestOtherFields:
         _flush()
         assert _source(window, _clip_ids(window)[0], "size") == AnimatedValue(100.0)
         assert window._inspector._editors[("source", "size")] is editor
-        assert QApplication.focusWidget() is box
+        assert _focused(window) is box
 
     def test_a_slider_drag_is_not_cut_by_an_update(self, window: MainWindow) -> None:
         # ドラッグの最中に別の所から更新が来ても（素材の解析が終わったなど）、掴んだ
@@ -297,7 +326,7 @@ class TestOtherFields:
         _flush()
         assert _source(window, _clip_ids(window)[0], name) == expected
         assert window._inspector._editors[("source", name)] is editor
-        assert QApplication.focusWidget() is box
+        assert _focused(window) is box
 
 
 class TestValuesFromOutside:
@@ -322,22 +351,50 @@ class TestValuesFromOutside:
         assert window.document.can_redo
 
 
+class TestAnotherClip:
+    def test_switching_clips_starts_a_new_step(self, qt_application: QApplication) -> None:
+        # フォーカスを変えずに選ぶクリップが変わった（AI の select_clip など）ら、
+        # 打ち続けを引き継がない 引き継ぐと、次の 1 文字が前のクリップの段へまとめられ、
+        # 1 回の取り消しで別のクリップの編集まで戻る
+        del qt_application
+        window = _shown(MainWindow(_project(clips=2), confirm_unsaved=False))
+        try:
+            first, second = _clip_ids(window)
+            window._timeline.select(first)
+            before = len(window.document.history_labels)
+            area = _editor(window, "text").findChild(QPlainTextEdit)
+            assert area is not None
+            _focus_end(window, area)
+            _type(window, "ab")
+            window._timeline.select(second)
+            _flush()
+            # 欄は次のクリップの同じ欄へ移っている（構成が同じなので作り直してフォーカスを戻す）
+            focused = _focused(window)
+            assert isinstance(focused, QPlainTextEdit)
+            focused.moveCursor(QTextCursor.MoveOperation.End)
+            _type(window, "c")
+            assert _source(window, second, "text") == "テキストc"
+            assert len(window.document.history_labels) == before + 2
+            window.undo()
+            assert _source(window, second, "text") == "テキスト"
+            assert _source(window, first, "text") == "テキストab"
+        finally:
+            window.close()
+
+
 class TestSeveralClips:
     def test_typing_reaches_every_selected_clip(self, qt_application: QApplication) -> None:
         # 何本も選んでいれば、打った本文は選んだ全部へ入り、1 回の取り消しで全部戻る
         del qt_application
-        window = MainWindow(_project(clips=2), confirm_unsaved=False)
+        window = _shown(MainWindow(_project(clips=2), confirm_unsaved=False))
         try:
-            window.show()
-            window.activateWindow()
-            QTest.qWaitForWindowActive(window)
             first, second = _clip_ids(window)
             window._inspector.set_selection((first, second))
             before = len(window.document.history_labels)
             area = _editor(window, "text").findChild(QPlainTextEdit)
             assert area is not None
-            _focus_end(area)
-            _type("xyz")
+            _focus_end(window, area)
+            _type(window, "xyz")
             assert _source(window, first, "text") == "テキストxyz"
             assert _source(window, second, "text") == "テキストxyz"
             assert len(window.document.history_labels) == before + 1
