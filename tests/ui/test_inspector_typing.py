@@ -278,23 +278,28 @@ class TestOtherFields:
         assert slider is not None
         handle = _handle_center(slider)
         QTest.mousePress(slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle)
-        QTest.mouseMove(slider, handle + QPoint(30, 0))
-        assert slider.isSliderDown()
-        # 構成の変わる更新（縁取りの色が出る）を外から入れる
         clip_id = _clip_ids(window)[0]
-        window.execute_all(
-            [SetParam(ParamPath.of_source(clip_id, "border_width"), AnimatedValue(4.0))], "外から"
-        )
-        _flush()
-        assert window._inspector._editors[("source", "size")] is editor
-        assert slider.isSliderDown()
-        QTest.mouseRelease(
-            slider,
-            Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.NoModifier,
-            handle + QPoint(30, 0),
-        )
-        _flush()
+        try:
+            QTest.mouseMove(slider, handle + QPoint(30, 0))
+            assert slider.isSliderDown()
+            # 構成の変わる更新（縁取りの色が出る）を外から入れる
+            window.execute_all(
+                [SetParam(ParamPath.of_source(clip_id, "border_width"), AnimatedValue(4.0))],
+                "外から",
+            )
+            _flush()
+            assert window._inspector._editors[("source", "size")] is editor
+            assert slider.isSliderDown()
+        finally:
+            # 途中で落ちても必ず離す 押したままにすると、後に同じワーカーで走る試験に
+            # 押したボタンが残って見える
+            QTest.mouseRelease(
+                slider,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+                handle + QPoint(30, 0),
+            )
+            _flush()
         size = _source(window, clip_id, "size")
         assert isinstance(size, AnimatedValue) and size.static != 64
         # 離したら、待っていた作り直しを済ませる（縁取りの色の欄が出る）

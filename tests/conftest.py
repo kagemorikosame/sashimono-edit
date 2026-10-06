@@ -82,17 +82,6 @@ def qt_application() -> Iterator[QApplication]:
     yield application
 
 
-#: 調べるための一時の控え 同じワーカーで直前に走った試験
-RECENT: list[str] = []
-
-
-@pytest.fixture(autouse=True)
-def _recent_tests(request: pytest.FixtureRequest) -> Iterator[None]:
-    yield
-    RECENT.append(request.node.nodeid)
-    del RECENT[:-6]
-
-
 @pytest.fixture(autouse=True)
 def widgets_left_behind(qt_application: QApplication) -> Iterator[None]:
     """試験が捨てた部品を、試験の切れ目（Qt が何も配っていない所）で壊す
