@@ -881,7 +881,8 @@ def _no_rustc_probe() -> None:
     except ImportError:
         return
     if hasattr(session, "shutil"):
-        session.shutil = types.SimpleNamespace(which=lambda *_args, **_kwargs: None)  # type: ignore[assignment]
+        # setattr で書く pip の型の見え方は機械ごとに違い、直に書くと型の確かめが割れる
+        setattr(session, "shutil", types.SimpleNamespace(which=lambda *_args, **_kwargs: None))  # noqa: B010
 
 
 def _forget_pip() -> None:
