@@ -144,6 +144,25 @@ def _open(
     return area.view, harness
 
 
+def _diag(view: TimelineView) -> str:
+    import os
+
+    from tests import conftest
+
+    area = view.window()
+    handle = area.windowHandle()
+    return (
+        f"view={view.size()} area={area.size()} visible={view.isVisible()}"
+        f" mapped={view.testAttribute(Qt.WidgetAttribute.WA_Mapped)}"
+        f" exposed={handle.isExposed() if handle else None}"
+        f" updates={view.updatesEnabled()} active={QApplication.activeWindow()}"
+        f" grab={view.mouseGrabber()} buttons={QApplication.mouseButtons()}"
+        f" tops={[(type(w).__name__, w.isVisible()) for w in QApplication.topLevelWidgets()]}"
+        f" bands={[(b.track.name, b.top, b.height) for b in view.view_layout.bands(view.project.timeline)]}"
+        f" worker={os.environ.get('PYTEST_XDIST_WORKER')} recent={list(conftest.RECENT)}"
+    )
+
+
 def _band(view: TimelineView, name: str) -> tuple[int, int]:
     for band in view.view_layout.bands(view.project.timeline):
         if band.track.name == name:
@@ -390,7 +409,7 @@ class TestClipContent:
         muted = replace(_layer(2), muted=True)
         view, _ = _open(made, analyzer, _project(_layer(1), muted))
         view.repaint()
-        assert seen == {"レイヤー 1": True, "レイヤー 2": False}
+        assert seen == {"レイヤー 1": True, "レイヤー 2": False}, _diag(view)
 
 
 # --- 動かす ---
@@ -436,7 +455,7 @@ class TestMovingOnLayers:
         QTest.mouseMove(view, QPoint(start.x(), (start.y() + end.y()) // 2))
         QTest.mouseMove(view, end)
         view.repaint()
-        assert dashed and set(dashed) == {"レイヤー 2"}
+        assert dashed and set(dashed) == {"レイヤー 2"}, _diag(view)
         QTest.mouseRelease(view, _LEFT, _NONE, end)
         ((command,),) = harness.received
         assert isinstance(command, MoveClips)
