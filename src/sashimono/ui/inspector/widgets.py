@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+
 from PySide6.QtCore import QEvent, QObject, QPointF, Qt, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -45,10 +48,26 @@ from sashimono.effects import (
 from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.theme import Colors, themed_style
 
-__all__ = ["NUMBER_WIDTH", "ParameterEditor", "TrackEditor", "create_editor"]
+__all__ = [
+    "NUMBER_WIDTH",
+    "TYPING_MERGE_SECONDS",
+    "ParameterEditor",
+    "TextEditor",
+    "TrackEditor",
+    "create_editor",
+]
 
 #: 数値欄の幅の下限（画素） 中身がこれより狭くても、行ごとに欄の幅が揺れないようにそろえる
 NUMBER_WIDTH = 96
+
+#: 文字の欄で、打ち始めからこの秒数までの打鍵を取り消しの 1 段にまとめる
+#: 1 文字ごとに段を積むと、打った言葉を戻すのに文字の数だけ取り消すことになる
+#: 欄を離れたら（フォーカスが外れたら）秒数に関わらず区切る 長い文を打ち続けた
+#: ときに、1 回の取り消しで全部が消えないよう、時間でも区切る
+TYPING_MERGE_SECONDS = 3.0
+
+#: 打鍵の時刻を測る時計 試験で時間を進めるために差し替えられるようにしておく
+_clock: Callable[[], float] = time.monotonic
 
 #: スライダーは整数しか扱えないので、この倍率で小数を載せる
 _SLIDER_SCALE = 1000
@@ -106,6 +125,12 @@ class ParameterEditor(QWidget):
     #: 初期値へ戻したい（数値のスライダーのダブルクリック） 戻し方はパネルが決める
     #: （キーフレームのある値は再生位置のキーだけを戻す）
     reset_requested = Signal()
+    #: 値が確定した 直前の確定の続き（文字の欄で続けて打った分）で、履歴の同じ段へ
+    #: まとめてよい :attr:`value_changed` と分けるのは、まとめてよいかを欄しか知らないから
+    value_continued = Signal(object)
+    #: 押している最中の操作（スライダーのドラッグ・増減のボタンの長押し）が終わった
+    #: 設定パネルは、操作の最中に来た作り直しをここまで待つ
+    interaction_finished = Signal()
 
     def __init__(self, spec: ParameterSpec, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -119,6 +144,10 @@ class ParameterEditor(QWidget):
         プロジェクトの更新、と回り続ける
         """
         raise NotImplementedError
+
+    def is_busy(self) -> bool:
+        """マウスで押している最中か 最中に作り直すと、掴んでいた部品が消えて操作が切れる"""
+        return False
 
     def _emit(self, value: ParamValue) -> None:
         if not self._updating:
@@ -151,6 +180,12 @@ class TrackEditor(ParameterEditor):
             self._slider.setRange(0, _INT_MAX)
         else:
             self._slider.setRange(int(low), int(high))
+        # 矢印キーとページのキーで動く幅を、仕様の刻みにする Qt の既定（1 目盛り）は
+        # 1000 倍した 1 で、仕様では 0.001 にしかならない 整数の欄では表示の桁で 0 へ
+        # 丸められ、矢印キーを何度押しても値が動かなかった
+        step = self._to_slider(spec.minimum + spec.step) - self._to_slider(spec.minimum)
+        self._slider.setSingleStep(max(1, step))
+        self._slider.setPageStep(max(1, _qt_int(step * 10)))
         self._slider.valueChanged.connect(self._on_slider)
         self._slider.sliderPressed.connect(self._on_press)
         self._slider.sliderReleased.connect(self._on_release)
@@ -230,6 +265,9 @@ class TrackEditor(ParameterEditor):
         """キーフレームで決まった現在値を表示に反映する"""
         self._apply(value)
 
+    def is_busy(self) -> bool:
+        return self._held or self._slider.isSliderDown() or self._arrow_from is not None
+
     def _apply(self, number: float) -> None:
         self._updating = True
         try:
@@ -272,8 +310,9 @@ class TrackEditor(ParameterEditor):
         if self._skip_release:
             self._skip_release = False
             self._pressed_at = None
-            return
-        self._commit_if_changed()
+        else:
+            self._commit_if_changed()
+        self.interaction_finished.emit()
 
     def _commit_if_changed(self) -> None:
         """押す前の値から変わっていれば確定する 同じ値を確定すると、戻しても何も変わらない
@@ -335,6 +374,7 @@ class TrackEditor(ParameterEditor):
                 # 離した知らせは来ない ここで 1 度だけ確定する
                 self._commit_if_changed()
             self._double = False
+            self.interaction_finished.emit()
         return super().eventFilter(watched, event)
 
     def _watch_arrows(self, event: QMouseEvent) -> None:
@@ -350,6 +390,7 @@ class TrackEditor(ParameterEditor):
             number = self._spec.clamp(self._number.value())
             if number != self._spec.clamp(before):
                 self._emit(AnimatedValue(static=number))
+            self.interaction_finished.emit()
 
     def _still(self) -> bool:
         """押してから離すまで値を動かしていないか
@@ -507,10 +548,18 @@ class SelectEditor(ParameterEditor):
 
 
 class TextEditor(ParameterEditor):
+    """文字の欄 打つたびに確定する（打った結果をすぐプレビューで見たい）
+
+    続けて打った分は :attr:`value_continued` で知らせ、取り消しの 1 段にまとめさせる
+    区切るのは、欄を離れたときと、打ち始めから :data:`TYPING_MERGE_SECONDS` 経ったとき
+    """
+
     def __init__(self, spec: TextSpec, parent: QWidget | None = None) -> None:
         super().__init__(spec, parent)
         self._spec = spec
         self._multiline = spec.multiline
+        #: 今の打ち続けの始まり（:data:`_clock` の時刻） 打っていなければ ``None``
+        self._typing_since: float | None = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -518,25 +567,69 @@ class TextEditor(ParameterEditor):
         if spec.multiline:
             self._area = QPlainTextEdit(self)
             self._area.setFixedHeight(72)
-            # 入力のたびに確定させる テキストは打った結果をすぐ見たい
-            self._area.textChanged.connect(lambda: self._emit(self._area.toPlainText()))
+            self._area.textChanged.connect(lambda: self._on_text(self._area.toPlainText()))
+            self._area.installEventFilter(self)
             layout.addWidget(self._area, 1)
         else:
             self._line = QLineEdit(self)
-            self._line.textChanged.connect(self._emit)
+            self._line.textChanged.connect(self._on_text)
+            self._line.installEventFilter(self)
             layout.addWidget(self._line, 1)
 
         self.set_value(spec.default_value())
 
+    @property
+    def typing_since(self) -> float | None:
+        """今の打ち続けの始まり 設定パネルが作り直すときに新しい欄へ引き継ぐ"""
+        return self._typing_since
+
+    def continue_typing(self, since: float | None) -> None:
+        """作り直す前の欄の打ち続けを引き継ぐ 引き継がないと、欄の構成が変わる 1 文字
+        （タイマーの書式の 1 文字目など）の前後で取り消しの段が分かれる"""
+        self._typing_since = since
+
+    def _on_text(self, text: str) -> None:
+        if self._updating:
+            return
+        now = _clock()
+        since = self._typing_since
+        if since is not None and now - since < TYPING_MERGE_SECONDS:
+            self.value_continued.emit(text)
+            return
+        self._typing_since = now
+        self.value_changed.emit(text)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt の命名規約
+        """欄を離れたら打ち続けを区切る 戻ってきて打った分まで前の段へまとめると、
+        別々に直した物が 1 回の取り消しで一緒に戻る"""
+        if event.type() == QEvent.Type.FocusOut:
+            self._typing_since = None
+        return super().eventFilter(watched, event)
+
     def set_value(self, value: ParamValue | None) -> None:
+        """本文が同じなら触らない 打っている欄へ同じ本文を入れ直すと、カーソルが頭へ
+        飛び、日本語入力の変換中の文字と欄の中の取り消しが消える
+
+        違う本文（取り消しなど外から来た物）は入れ直し、カーソルは同じ位置
+        （本文が短くなったら末尾）に置く
+        """
         text = self._spec.coerce(value)
         self._updating = True
         try:
             if self._multiline:
                 if self._area.toPlainText() != text:
+                    cursor = self._area.textCursor()
+                    anchor, position = cursor.anchor(), cursor.position()
                     self._area.setPlainText(text)
+                    restored = self._area.textCursor()
+                    length = len(self._area.toPlainText())
+                    restored.setPosition(min(anchor, length))
+                    restored.setPosition(min(position, length), QTextCursor.MoveMode.KeepAnchor)
+                    self._area.setTextCursor(restored)
             elif self._line.text() != text:
+                position = self._line.cursorPosition()
                 self._line.setText(text)
+                self._line.setCursorPosition(min(position, len(text)))
         finally:
             self._updating = False
 
@@ -584,9 +677,13 @@ class FileEditor(ParameterEditor):
         self.set_value(spec.default_value())
 
     def set_value(self, value: ParamValue | None) -> None:
+        """同じ場所なら触らない 入れ直すとカーソルが末尾へ飛び、直している途中の欄が乱れる"""
+        text = self._spec.coerce(value)
+        if self._line.text() == text:
+            return
         self._updating = True
         try:
-            self._line.setText(self._spec.coerce(value))
+            self._line.setText(text)
         finally:
             self._updating = False
 
