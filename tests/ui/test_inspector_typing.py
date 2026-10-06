@@ -381,6 +381,34 @@ class TestAnotherClip:
         finally:
             window.close()
 
+    def test_changing_the_other_clips_starts_a_new_step(self, qt_application: QApplication) -> None:
+        # 主のクリップが同じでも、まとめて当てるほかのクリップが変わったら（(A, B) から
+        # (A, C)）引き継がない 引き継ぐと、B へ打った段と C へ打った分が 1 段にまとまり、
+        # 1 回の取り消しで両方が戻る
+        del qt_application
+        window = _shown(MainWindow(_project(clips=3), confirm_unsaved=False))
+        try:
+            first, second, third = _clip_ids(window)
+            window._inspector.set_selection((first, second))
+            before = len(window.document.history_labels)
+            area = _editor(window, "text").findChild(QPlainTextEdit)
+            assert area is not None
+            _focus_end(window, area)
+            _type(window, "ab")
+            window._inspector.set_selection((first, third))
+            _flush()
+            focused = _focused(window)
+            assert isinstance(focused, QPlainTextEdit)
+            focused.moveCursor(QTextCursor.MoveOperation.End)
+            _type(window, "c")
+            assert _source(window, third, "text") == "テキストabc"
+            assert len(window.document.history_labels) == before + 2
+            window.undo()
+            assert _source(window, second, "text") == "テキストab"
+            assert _source(window, third, "text") == "テキスト"
+        finally:
+            window.close()
+
 
 class TestSeveralClips:
     def test_typing_reaches_every_selected_clip(self, qt_application: QApplication) -> None:

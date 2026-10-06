@@ -223,9 +223,9 @@ class InspectorPanel(QWidget):
         #: 今出している欄の構成の指紋（:meth:`_layout_key`） 同じなら作り直さずに値だけ
         #: 入れ直す 作り直すと、打っている欄が消えてフォーカスが外れる（Issue #251）
         self._shown_layout: object = None
-        #: 今出している欄がどのクリップの物か 選び替えでは :attr:`_clip_id` が作り直しより
-        #: 先に変わるので、作り直す前の欄の持ち主はこちらで覚える
-        self._shown_clip: ClipId | None = None
+        #: 今出している欄を作ったときの選択（:meth:`_selection_key`） 選び替えでは
+        #: :attr:`_selection` が作り直しより先に変わるので、作り直す前の選択はこちらで覚える
+        self._shown_selection: _SelectionKey = (None, frozenset())
         #: フォーカスを持てる部品を、何の値の物かで引く 作り直した後に同じ欄へ戻すため
         #: 入力欄（:attr:`_editors`）のほか、合成モードやクリップの入り切りも入る
         self._focus_owners: dict[tuple[str, str], QWidget] = {}
@@ -332,6 +332,11 @@ class InspectorPanel(QWidget):
         self._selection = tuple(clip_ids)
         self._clip_id = primary
         self._rebuild()
+
+    def _selection_key(self) -> _SelectionKey:
+        """今の選択を比べる形 主のクリップと、まとめて当てるほかのクリップの集まり"""
+        others = frozenset(c for c in self._selection if c != self._clip_id)
+        return self._clip_id, others
 
     def set_double_click_reset(self, enabled: bool) -> None:
         """名前（数はスライダーも）のダブルクリックで初期値へ戻すか 設定から
@@ -467,7 +472,7 @@ class InspectorPanel(QWidget):
                 widget.deleteLater()
         self._build()
         self._shown_layout = self._layout_key()
-        self._shown_clip = self._clip_id
+        self._shown_selection = self._selection_key()
         if focus is not None:
             self._restore_focus(focus)
 
@@ -495,7 +500,7 @@ class InspectorPanel(QWidget):
                 position = focus.cursorPosition()
                 cursor = (position, position)
             typing = owner.typing_since if isinstance(owner, TextEditor) else None
-            return _FocusPlace(key, kind, index, cursor, typing, self._shown_clip)
+            return _FocusPlace(key, kind, index, cursor, typing, self._shown_selection)
         return None
 
     def _restore_focus(self, place: _FocusPlace) -> None:
@@ -511,11 +516,12 @@ class InspectorPanel(QWidget):
             return
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         if isinstance(owner, TextEditor):
-            # 打ち続けを引き継ぐのは同じクリップの作り直しだけ フォーカスを変えずに別の
-            # クリップへ選び替わった（AI の select_clip など）ときに引き継ぐと、次の 1 文字が
-            # 前のクリップの段へまとめられ、1 回の取り消しで別のクリップの編集まで戻る
-            same_clip = place.clip_id == self._clip_id
-            owner.continue_typing(place.typing if same_clip else None)
+            # 打ち続けを引き継ぐのは同じ選択のままの作り直しだけ フォーカスを変えずに選びが
+            # 変わった（AI の select_clip など）ときに引き継ぐと、次の 1 文字が前の選択への段へ
+            # まとめられ、1 回の取り消しで別のクリップの編集まで戻る 主のクリップが同じでも、
+            # まとめて当てるほかのクリップが変われば（(A, B) から (A, C)）当たる先が違う
+            same = place.selection == self._selection_key()
+            owner.continue_typing(place.typing if same else None)
         if place.cursor is None:
             return
         anchor, position = place.cursor
@@ -1757,6 +1763,10 @@ def _show_toggle(button: QAbstractButton, enabled: bool) -> None:
     button.setText("有効" if enabled else "無効")
 
 
+#: 選択を比べる形 主のクリップと、まとめて当てるほかのクリップの集まり（選んだ順は問わない）
+_SelectionKey = tuple[ClipId | None, frozenset[ClipId]]
+
+
 @dataclass(frozen=True)
 class _FocusPlace:
     """作り直す前にフォーカスのあった所 :meth:`InspectorPanel._restore_focus` で戻す"""
@@ -1770,8 +1780,9 @@ class _FocusPlace:
     cursor: tuple[int, int] | None
     #: 打ち続けの始まり（:attr:`TextEditor.typing_since`） 取り消しの段を分けないため
     typing: float | None
-    #: どのクリップの欄だったか 違うクリップの欄へは打ち続けを引き継がない
-    clip_id: ClipId | None
+    #: 欄を出したときの選択（:meth:`InspectorPanel._selection_key`） 違う選択の欄へは
+    #: 打ち続けを引き継がない
+    selection: _SelectionKey
 
 
 def _editor_key(path: ParamPath) -> tuple[str, str]:
