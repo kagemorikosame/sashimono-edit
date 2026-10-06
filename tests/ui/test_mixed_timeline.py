@@ -151,6 +151,7 @@ def _diag(view: TimelineView) -> str:
 
     area = view.window()
     handle = area.windowHandle()
+    bands = view.view_layout.bands(view.project.timeline)
     return (
         f"view={view.size()} area={area.size()} visible={view.isVisible()}"
         f" mapped={view.testAttribute(Qt.WidgetAttribute.WA_Mapped)}"
@@ -158,7 +159,7 @@ def _diag(view: TimelineView) -> str:
         f" updates={view.updatesEnabled()} active={QApplication.activeWindow()}"
         f" grab={view.mouseGrabber()} buttons={QApplication.mouseButtons()}"
         f" tops={[(type(w).__name__, w.isVisible()) for w in QApplication.topLevelWidgets()]}"
-        f" bands={[(b.track.name, b.top, b.height) for b in view.view_layout.bands(view.project.timeline)]}"
+        f" bands={[(b.track.name, b.top, b.height) for b in bands]}"
         f" worker={os.environ.get('PYTEST_XDIST_WORKER')} recent={list(conftest.RECENT)}"
     )
 
