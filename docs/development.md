@@ -1915,8 +1915,8 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   配布版は `PYTHONPATH` を読まないので、走らせても pip の組み立ては通らない
 - 組み立てた後に、後から入れる部品が import する標準ライブラリが配布版に全部あるかを字面で
   数える（`missing_stdlib`） zip からの確かめでは、後から入れる部品を**使う人と同じ道で**
-  入れて読む 導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ（CUDA ランタイムは
-  除く）、起動のときと同じ読み方（`--import-check` 前へ足して `.pth` も読む）で import する
+  入れて読む 導入ボタンと同じ引数と走らせ方で exe の中の pip に一時の導入先へ入れ（CUDA
+  ランタイムは除く）、起動のときと同じ読み方（`--import-check` 前へ足して `.pth` も読む）で import する
   入れ方と読み方は exe 自身が持つ（`Sashimono.exe --add-on-check <置き場>`
   `sashimono/addon_check.py`） 組み立ての道具も CI の clean-machine（ファイアウォールを
   戻した後）も同じ口を呼ぶ
@@ -1942,6 +1942,24 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   起動部の中身が毎回少しずつ違っても構わない（既成の物と同じでなければよい）
   検出されたかは PowerShell で `& "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "<展開した Sashimono.exe の絶対パス>" -DisableRemediation`
   で見る（読むだけ 設定も除外も変えない）
+- **配布版の pip は子を起こさず、アプリのプロセスの中で走らせる**（`runtime.run_pip_here`）
+  起動部を組み直した 0.1.3 も、利用者の機械（見本を送る既定の設定）では `tools/release.py` の
+  段 6 の `--add-on-check` の途中で `Bearfoos.A!ml` として消された 消されたのは毎回、exe が
+  自分自身を `-m pip` で子として起こし、PyPI から落とした物を置き場へ書き、さらに別の exe で
+  `--import-check` を走らせる所 CI の実行機では同じ exe が検出されなかった 導入ボタンも
+  同じ流れなので、流れそのものを無くした
+  - 導入ボタンが組むコマンド（`Sashimono.exe -m pip ...`）は画面に見せるためにそのまま組み、
+    走らせる所（`install_runtime`）で exe 自身の pip と分かれば作業スレッドで
+    `pip._internal.cli.main.main` を呼ぶ 開発の環境は今までどおり `python -m pip` を子で走らせる
+  - pip は 1 回で終わるプロセスのつもりで、標準出力・logging の根・警告の出し方・ロケール・
+    環境変数（`PIP_NO_INPUT`）を書き換えて戻さない 走らせる前に控えて戻し、読み込んだ pip は
+    `sys.modules` から捨てる（2 回目もまっさらな pip で走る） 標準出力は書いたスレッドで振り分け、
+    pip の作業スレッドの分だけを導入の欄へ 1 行ずつ渡す
+  - 2 本は重ねない（錠で 1 本ずつ） 中断は作業スレッドへ `KeyboardInterrupt` の仲間を投げ込む
+    （pip に止める口が無い pip はそれを「利用者が止めた」として片付けてから返す）
+    pip が落ちても `sys.exit` で抜けても、例外は外へ出さず 0 でない終了コードで返す
+  - `--add-on-check` も同じプロセスの中で入れて読む（`--import-check` と同じ読み方を
+    `app.import_check` で） 段を 1 つ待つ秒数を過ぎた pip は中断して `[NG]` を書く
 
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での
 確認は、開発機ではできない **CI のまっさらな Windows で zip だけを持って確かめる**（Issue #33）

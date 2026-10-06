@@ -14,6 +14,7 @@ r"""アプリケーションの入口
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # この 2 つは Qt を読まない（読まないことを試験で押さえている）
@@ -33,8 +34,11 @@ IMPORT_CHECK_FLAG = "--import-check"
 ADD_ON_CHECK_FLAG = "--add-on-check"
 
 
-def import_check(places: str, modules: list[str]) -> int:
+def import_check(places: str, modules: list[str], write: Callable[[str], None] = print) -> int:
     """``places`` を探す道の前へ足して ``modules`` を import する 読めない物があれば 1
+
+    結果の行は ``write`` へ渡す 配る zip の確かめ（``--add-on-check``）は、別の exe を起こさずに
+    同じプロセスの中で読み、行を自分の要約へまとめる（:mod:`sashimono.addon_check`）
 
     前へ足す 配布版は、画面のボタンで入れた部品の置き場を前へ足して読む
     （:func:`~sashimono.runtime.activate_runtime`） 同じ順で読まないと、使う人の手元とは
@@ -58,9 +62,9 @@ def import_check(places: str, modules: list[str]) -> int:
             importlib.import_module(name)
         except Exception as exc:
             failed += 1
-            print(f"[NG] {name}: {type(exc).__name__}: {exc}")
+            write(f"[NG] {name}: {type(exc).__name__}: {exc}")
         else:
-            print(f"[ok] {name}")
+            write(f"[ok] {name}")
     return 1 if failed else 0
 
 
@@ -122,9 +126,10 @@ def refuse_script(script: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv if argv is None else argv
 
-    # 配布版は自分自身が pip の代わりになる 導入ボタンは ``sys.executable -m pip`` を
-    # 呼ぶが、配布版の sys.executable はこの exe なので、ここで受けないと
-    # 導入するつもりで Sashimono がもう 1 つ起動する
+    # 配布版は自分自身が pip の代わりになる 導入ボタンと --add-on-check はもう子を起こさず
+    # このプロセスの中で pip を走らせる（runtime.run_pip_here） ここは手で
+    # ``Sashimono.exe -m pip ...`` と起こされたときのために残す 受けないと
+    # pip のつもりで Sashimono がもう 1 つ起動する
     pip_args = pip_arguments(arguments)
     if pip_args is not None:
         return run_pip(pip_args)
