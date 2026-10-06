@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import types
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -852,6 +853,7 @@ def _pip_code(arguments: Sequence[str], write: Callable[[str], None]) -> int:
     同じプロセスなので、受けないと導入の作業スレッドごと落ち、画面は導入中のまま止まる
     """
     try:
+        _no_rustc_probe()
         return run_pip([*_HERE_OPTIONS, *arguments])
     except SystemExit as exc:
         if exc.code is not None and not isinstance(exc.code, int):
@@ -862,6 +864,24 @@ def _pip_code(arguments: Sequence[str], write: Callable[[str], None]) -> int:
         for line in traceback.format_exc().splitlines():
             write(line)
         return 1
+
+
+def _no_rustc_probe() -> None:
+    """pip が名乗りに Rust の版を添えるために ``rustc --version`` を子で起こすのを止める
+
+    pip は PyPI へつなぐ前に名乗り（User-Agent）を作り、PATH に rustc があれば子として
+    起こして版を読む 子を起こさないために同じプロセスで走らせているので、ここで子が立つと
+    意味が薄れる（Rust を入れた機械で確かめたら exe の子として 2 回立った） 名乗りに版が
+    無くても導入は変わらない pip の session の部品の ``shutil`` はこの探しにしか使われて
+    いないので、探しても見つからない物へ差し替える 部品は走り終えたら捨てる
+    （:func:`_forget_pip`）ので、差し替えは残らない pip の作りが変われば何もしない
+    """
+    try:
+        from pip._internal.network import session
+    except ImportError:
+        return
+    if hasattr(session, "shutil"):
+        session.shutil = types.SimpleNamespace(which=lambda *_args, **_kwargs: None)  # type: ignore[assignment]
 
 
 def _forget_pip() -> None:

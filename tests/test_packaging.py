@@ -51,14 +51,21 @@ def frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return executable
 
 
-def _refuse_children(monkeypatch: pytest.MonkeyPatch) -> None:
-    """子のプロセスを起こしたら落とす 配布版の導入と確かめは、もう子を起こさない"""
+def _refuse_children(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """子のプロセスを起こしたら落とす 配布版の導入と確かめは、もう子を起こさない
+
+    起こそうとした物を返す pip は起こした子の失敗を黙って捨てる所がある（名乗りの rustc）ので、
+    落ちたことだけでなく、起こそうとしたことも見られるようにする
+    """
+    tried: list[object] = []
 
     def refuse(*arguments: object, **_: object) -> None:
+        tried.append(arguments)
         raise AssertionError(f"子のプロセスを起こした: {arguments}")
 
     monkeypatch.setattr(subprocess, "Popen", refuse)
     monkeypatch.setattr(subprocess, "run", refuse)
+    return tried
 
 
 @pytest.fixture(scope="module")
@@ -311,6 +318,30 @@ class TestPipRunsInsideTheApp:
         assert warnings.showwarning is showwarning
         assert sys.stdout is stdout
         assert "PIP_NO_INPUT" not in os.environ
+
+    def test_pip_does_not_start_rustc_for_its_user_agent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """pip は名乗りを作るときに PATH の rustc を子として起こす 同じプロセスで走らせても
+        子が立つ（Rust を入れた機械で確かめたら exe の子として 2 回立った）ので止める
+        """
+        # どの機械でも rustc が見つかる状態を作る 止めなければ下で子を起こして落ちる
+        rustc = tmp_path / "rustc.exe"
+        rustc.write_bytes(b"")
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+        agents: list[str] = []
+
+        def ask_for_the_name(arguments: list[str]) -> int:
+            from pip._internal.network.session import user_agent
+
+            agents.append(user_agent())
+            return 0
+
+        tried = _refuse_children(monkeypatch)
+        monkeypatch.setattr("pip._internal.cli.main.main", ask_for_the_name)
+        assert run_pip_here(["install", "pkg"]) == 0
+        assert agents and "rustc_version" not in agents[0]
+        assert tried == []
 
     def test_other_threads_do_not_write_into_the_install_log(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1379,7 +1410,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         _refuse_children(monkeypatch)
         monkeypatch.setattr(addon_check, "run_pip_here", fake_pip)
-        monkeypatch.setattr("sashimono.app.import_check", fake_read)
+        monkeypatch.setattr(addon_check, "import_check", fake_read)
         code = main(["sashimono", "--add-on-check", "add-ons", *extra])
         return pips, reads, code
 

@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from sashimono.ai.environment import AI_PACK
+from sashimono.app import IMPORT_CHECK_FLAG, import_check
 from sashimono.asr.environment import ASR_PACK
 from sashimono.runtime import FeaturePack, install_arguments, is_frozen, run_pip_here
 
@@ -112,8 +113,6 @@ def _install(pack: FeaturePack, place: Path, lines: list[str], timeout: float) -
 
 
 def _read(place: Path, lines: list[str], timeout: float) -> int:
-    from sashimono.app import IMPORT_CHECK_FLAG, import_check
-
     if is_frozen():
         return import_check(str(place), list(ADD_ON_MODULES), write=lines.append)
     return _call([*self_command(), IMPORT_CHECK_FLAG, str(place), *ADD_ON_MODULES], lines, timeout)
