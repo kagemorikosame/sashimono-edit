@@ -15,11 +15,13 @@ import subprocess
 import sys
 import threading
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from sashimono import runtime as runtime_module
 from sashimono.app import SELF_CHECK_FLAG, main
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR, default_script_roots
 from sashimono.core.model import Project
@@ -66,6 +68,28 @@ def _refuse_children(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     monkeypatch.setattr(subprocess, "Popen", refuse)
     monkeypatch.setattr(subprocess, "run", refuse)
     return tried
+
+
+@pytest.fixture
+def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Event]:
+    """呼ぶと戻らない pip 同期の読み書きの中で止まった pip の代わり
+
+    錠の待ちの中で止まるので、投げ込んだ中断の例外も届かない 試験の後で放して、
+    作業スレッドが錠と標準出力を返すまで待つ 返さないと、後の試験の pip が錠を待ち続ける
+    """
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stuck(arguments: list[str]) -> int:
+        entered.set()
+        release.wait()
+        return 1
+
+    monkeypatch.setattr("pip._internal.cli.main.main", stuck)
+    yield entered
+    release.set()
+    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
+    runtime_module._PIP_HERE.release()
 
 
 @pytest.fixture(scope="module")
@@ -226,6 +250,40 @@ class TestPipRunsInsideTheApp:
         code = install_runtime(command=[REAL_PYTHON, "-c", "print('子')"], on_output=lines.append)
         assert code == 0
         assert lines[1:] == ["子"]
+
+    def test_a_stuck_pip_does_not_hold_the_install_button(
+        self,
+        frozen: Path,
+        stuck_pip: threading.Event,
+        monkeypatch: pytest.MonkeyPatch,
+        pack: FeaturePack,
+    ) -> None:
+        """導入ボタンの中断は、pip が同期の読み書きの中で戻らなくても少し待って返る
+
+        返らないと、導入の欄は「中断しています」のまま、閉じることも入れ直すこともできない
+        """
+        monkeypatch.setattr(runtime_module, "_CANCEL_GRACE_SECONDS", 0.3)
+        lines: list[str] = []
+        codes: list[int] = []
+        asked = threading.Event()
+        worker = threading.Thread(
+            target=lambda: codes.append(
+                install_runtime(
+                    pack,
+                    command=install_command(pack),
+                    on_output=lines.append,
+                    should_cancel=asked.is_set,
+                )
+            ),
+            daemon=True,
+        )
+        worker.start()
+        assert stuck_pip.wait(10.0)
+        asked.set()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "戻らない pip を待ち続け、導入の欄が返らない"
+        assert codes == [1]
+        assert any("戻らない" in line for line in lines)
 
     def test_a_pip_crash_is_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """pip が中で落ちても、導入の作業スレッドごと落とさず、失敗の終了コードで返す
@@ -1409,7 +1467,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
             return 0
 
         _refuse_children(monkeypatch)
-        monkeypatch.setattr(addon_check, "run_pip_here", fake_pip)
+        monkeypatch.setattr(addon_check, "run_pip_in_worker", fake_pip)
         monkeypatch.setattr(addon_check, "import_check", fake_read)
         code = main(["sashimono", "--add-on-check", "add-ons", *extra])
         return pips, reads, code
@@ -1451,24 +1509,27 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         assert lines[0].startswith("[NG] 7 秒で終わらない")
 
     def test_a_pip_in_the_app_that_takes_too_long_is_stopped_and_written_down(
-        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+        self, frozen: Path, stuck_pip: threading.Event, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """配布版の pip は同じプロセスで走るので、時間切れでは中断して [NG] を書く
+        """配布版の pip は同じプロセスで走る 同期の読み書きの中で戻らなくても、期限で [NG] を
+        書いて返す
 
-        止めずに待ち続けると、CI のジョブが先に取り消され、どの段で止まったかが残らない
+        pip が戻るまで期限を見ないと、[NG] を書く前に外の待ちの制限で exe ごと止められ、
+        CI と組み立ての道具がどの段で止まったかを読めない（PR #254 のレビュー）
         """
         from sashimono import addon_check
 
-        def silent_pip(arguments: list[str], **options: object) -> int:
-            ask = options["should_cancel"]
-            assert callable(ask)
-            while not ask():
-                threading.Event().wait(0.01)
-            return 1
-
-        monkeypatch.setattr(addon_check, "run_pip_here", silent_pip)
+        monkeypatch.setattr(runtime_module, "_CANCEL_GRACE_SECONDS", 0.3)
         lines: list[str] = []
-        assert addon_check._install_here(["install", "x"], lines, 0.2) == 1
+        codes: list[int] = []
+        caller = threading.Thread(
+            target=lambda: codes.append(addon_check._install_here(["install", "x"], lines, 0.2)),
+            daemon=True,
+        )
+        caller.start()
+        caller.join(timeout=10.0)
+        assert not caller.is_alive(), "戻らない pip を期限で切らずに待ち続けた"
+        assert codes == [1]
         assert lines[-1].startswith("[NG] 0.2 秒で終わらない")
 
     def test_the_exe_pip_installs_what_the_buttons_install(
@@ -1513,7 +1574,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         _refuse_children(monkeypatch)
         monkeypatch.setattr(sys, "path", list(sys.path))
-        monkeypatch.setattr(addon_check, "run_pip_here", lambda arguments, **_: 0)
+        monkeypatch.setattr(addon_check, "run_pip_in_worker", lambda arguments, **_: 0)
         monkeypatch.setattr(addon_check, "ADD_ON_MODULES", ("sashimono_no_such_add_on",))
         assert main(["sashimono", "--add-on-check", "add-ons"]) == 1
         assert "[NG] sashimono_no_such_add_on" in capsys.readouterr().out

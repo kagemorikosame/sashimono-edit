@@ -62,6 +62,7 @@ __all__ = [
     "restart_note",
     "run_pip",
     "run_pip_here",
+    "run_pip_in_worker",
     "runtime_abi",
     "runtime_target_dir",
     "snapshot_runtime_modules",
@@ -701,6 +702,11 @@ class _PipOutput(io.TextIOBase):
         self._owner = owner
         self._pending = ""
 
+    @property
+    def fallback(self) -> TextIO | None:
+        """元の出口 pip を残して返した後に、ほかの所が直に書くため"""
+        return self._fallback
+
     def writable(self) -> bool:
         return True
 
@@ -1046,7 +1052,7 @@ def install_runtime(
 
     own = _own_pip_arguments(argv)
     if own is not None:
-        code = run_pip_here(own, on_output=on_output, should_cancel=should_cancel)
+        code = run_pip_in_worker(own, on_output=on_output, should_cancel=should_cancel)
     else:
         code = _run_child(argv, on_output, should_cancel)
     if code == 0 and target is not None and pack is not None:
@@ -1127,3 +1133,50 @@ def _run_child(
 
 #: 導入の中断の頼みを見る間隔（秒） 長いと、閉じるボタンを押してから止まるまでが延びる
 _CANCEL_POLL_SECONDS = 0.1
+
+#: 中断を投げ込んでから pip が戻るのを待つ秒数 投げた例外は Python の行が進んだ所で届くので、
+#: 同期の読み書き（ネットの読み込みなど）の中にいる間は届かない 待ちきれなければ戻らずに返す
+_CANCEL_GRACE_SECONDS = 10.0
+
+
+def run_pip_in_worker(
+    arguments: Sequence[str],
+    *,
+    on_output: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    grace: float | None = None,
+) -> int:
+    """:func:`run_pip_here` を作業スレッド（daemon）で走らせ、中断を頼まれたら待ちを切って返す
+
+    子のプロセスは起こさない 同じスレッドで走らせると、pip が同期の読み書きの中で戻らない間は
+    中断の例外が届かず、呼んだ側（導入の欄・``--add-on-check`` の時間切れ）も一緒に待ち続ける
+    ``--add-on-check`` では [NG] を書く前に外の待ちの制限で exe ごと止められ、どの段で
+    止まったかが残らない（PR #254 のレビュー）
+
+    中断を頼まれたら pip へ中断を投げ、``grace`` 秒（省けば ``_CANCEL_GRACE_SECONDS``）だけ
+    戻るのを待つ 戻らなければ 1 を返す 残った pip は届いた所で止まり、錠を返す
+    （次の導入はそれまで待つ） daemon なので、``--add-on-check`` のように返した後で
+    プロセスが終われば一緒に消える
+    """
+    write = on_output if on_output is not None else _ignore
+    wait = _CANCEL_GRACE_SECONDS if grace is None else grace
+    asked = threading.Event()
+    result: list[int] = []
+
+    def work() -> None:
+        result.append(run_pip_here(arguments, on_output=write, should_cancel=asked.is_set))
+
+    worker = threading.Thread(target=work, name="sashimono-pip", daemon=True)
+    worker.start()
+    while True:
+        worker.join(_CANCEL_POLL_SECONDS)
+        if not worker.is_alive():
+            return result[0] if result else 1
+        if should_cancel is not None and should_cancel():
+            break
+    asked.set()
+    worker.join(wait)
+    if worker.is_alive():
+        write(f"中断を頼んだが pip が {wait:g} 秒で戻らない 待たずに止めた")
+        return 1
+    return result[0] if result else 1

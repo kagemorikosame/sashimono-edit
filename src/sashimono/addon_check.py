@@ -34,7 +34,7 @@ from pathlib import Path
 from sashimono.ai.environment import AI_PACK
 from sashimono.app import IMPORT_CHECK_FLAG, import_check
 from sashimono.asr.environment import ASR_PACK
-from sashimono.runtime import FeaturePack, install_arguments, is_frozen, run_pip_here
+from sashimono.runtime import FeaturePack, install_arguments, is_frozen, run_pip_in_worker
 
 __all__ = ["ADD_ON_MODULES", "ADD_ON_PACKS", "INSTALL_TIMEOUT", "main", "self_command"]
 
@@ -98,7 +98,9 @@ def _install_here(arguments: list[str], lines: list[str], timeout: float) -> int
             late.set()
         return late.is_set()
 
-    code = run_pip_here(arguments, on_output=lines.append, should_cancel=too_late)
+    # 作業スレッドで走らせる 同じスレッドで走らせると、pip が同期の読み書きの中で戻らない間は
+    # 期限を見られず、[NG] を書く前に外の待ちの制限で exe ごと止められる（PR #254 のレビュー）
+    code = run_pip_in_worker(arguments, on_output=lines.append, should_cancel=too_late)
     if late.is_set():
         lines.append(f"[NG] {timeout:g} 秒で終わらない: pip {' '.join(arguments[:3])} …")
         return code or 1
@@ -120,14 +122,18 @@ def _read(place: Path, lines: list[str], timeout: float) -> int:
 
 def _emit(lines: list[str]) -> None:
     """まとめて書く 英語の Windows（CI）でも日本語の行で落ちないよう、自己診断と同じ手当てをする"""
-    if sys.stdout is None:
+    # 時間切れで戻らない pip を残して返したときは、標準出力がまだ pip の受け口のまま
+    # 元の出口へ書く 受け口へ書くと文字コードの手当てが元の出口に届かない
+    stream = getattr(sys.stdout, "fallback", sys.stdout)
+    if stream is None:
         # 窓の無い配布版を、出力を受けずに起こした 書いても誰にも届かない
         return
     from sashimono.selfcheck import _make_writable
 
-    text = "\n".join(lines)
-    _make_writable(sys.stdout, text)
-    print(text, flush=True)
+    # pip の作業スレッドがまだ足しているかもしれないので、写してから書く
+    text = "\n".join(list(lines))
+    _make_writable(stream, text)
+    print(text, file=stream, flush=True)
 
 
 def main(target: str, timeout: float = INSTALL_TIMEOUT) -> int:
