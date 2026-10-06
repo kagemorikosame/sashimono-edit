@@ -16,6 +16,10 @@ r"""リリースを 1 コマンドで終える（タグ → 下書きの確か�
    ``collect_sources.py`` で集めて、本体 → 索引の順に上げる
 6. 自己診断 展開した zip を ``build_package.py`` と同じ確かめに掛け、アプリを起こして
    GL で描けているかを人に尋ねる（``--skip-launch`` で起こさない）
+   この機械の Windows Defender に誤検出されたら（起こせない・exe が消えた・検出の記録が増えた）、
+   普通の失敗と分けて出し、検出された zip の場所と SHA-256 を記録に残す 人が y と答えれば、
+   下書きの zip を外して Release の run を走らせ直し（組み直し）、4 から続ける 上限は
+   ``REBUILD_LIMIT`` 回 Defender の設定と除外には触らない 隔離された物も戻さない
 7. 目録と署名 ``update_sign.py`` の manifest → sign → verify で作って上げる
    上げてあれば落として確かめ、通れば飛ばす
 8. 要約を出し、人が y と答えたときだけ公開する 公開した後、固定の URL が新しい版を指すかを見る
@@ -91,6 +95,17 @@ BETA_TAG = "beta"
 CHECKED_NAME = "release-checked.json"
 #: 展開した印 これが今の zip の sha256 と同じなら展開し直さない
 EXTRACTED_NAME = "extracted-from.txt"
+#: Defender に誤検出された zip の記録（場所・SHA-256・検出名） Microsoft へ報告するときに使う
+DETECTIONS_NAME = "defender-detections.json"
+#: 誤検出された zip を残す所 組み直すと下書きの zip は入れ替わり、手元の写しは落とし直される
+DETECTED_DIR = "detected"
+#: 誤検出のたびに組み直してよい回数 組み直しても通らない exe はコード署名か Microsoft への
+#: 報告でしか直らない 打ち続けると Actions の時間だけが減る
+REBUILD_LIMIT = 5
+#: Windows が「ウイルスが含まれている」としてファイルを開かせないときの番号（ERROR_VIRUS_INFECTED）
+VIRUS_WINERROR = 225
+#: 誤検出を Microsoft へ報告する所（利用者が手で送る 道具は送らない）
+SUBMISSION_URL = "https://www.microsoft.com/wdsi/filesubmission"
 
 #: Actions の run を見に行く間隔と、諦めるまでの長さ 組み立てと、まっさらな Windows での
 #: 確かめで 30 分ほど掛かる 待つのを短くすると、通る run を落ちたと取り違える
@@ -152,6 +167,88 @@ def smoke_test(archive: Path, home: Path) -> int:
     使用許諾は展開した物を手本にする（組み立てた時の物はこの機械に無い）
     """
     return build_package.smoke_test(archive, build_package.notice_digests(home))
+
+
+#: Defender の検出の記録を読む 読むだけで、設定・除外・隔離には触らない
+#: 名前（Get-MpThreat）は取れなければ空 標準出力は UTF-8 にする（パスに日本語が入る）
+_DETECTIONS_SCRIPT = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$names = @{}
+foreach ($t in @(Get-MpThreat)) { $names["$($t.ThreatID)"] = "$($t.ThreatName)" }
+$rows = @(Get-MpThreatDetection | ForEach-Object {
+    [pscustomobject]@{
+        id = "$($_.DetectionID)"
+        threat_id = "$($_.ThreatID)"
+        threat = $names["$($_.ThreatID)"]
+        time = if ($_.InitialDetectionTime) { $_.InitialDetectionTime.ToString('o') } else { '' }
+        resources = @($_.Resources | ForEach-Object { "$_" })
+    }
+})
+ConvertTo-Json -InputObject $rows -Depth 4 -Compress
+"""
+
+
+def read_detections() -> list[dict[str, Any]]:
+    """この機械の Defender の検出の記録 読めなければ空（Defender の無い機械・止めた機械）
+
+    ``Get-MpThreatDetection`` を読むだけ 設定・除外・隔離した物には触らない
+    """
+    try:
+        # 監査済み 走らせるのはこの道具の中に書いた読み取りだけの台本
+        done = (
+            subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", _DETECTIONS_SCRIPT],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    try:
+        rows = json.loads(done.stdout.strip() or "[]")
+    except ValueError:
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def ours(detection: dict[str, Any]) -> bool:
+    """検出の記録が、配る exe（どこへ展開した物でも）を指しているか"""
+    resources = detection.get("resources") or []
+    if isinstance(resources, str):
+        resources = [resources]
+    return any(APP_EXE.lower() in str(item).lower() for item in resources)
+
+
+class DefenderDetectionError(StopError):
+    """6 の確かめの途中で、この機械の Defender に配る exe が誤検出された
+
+    普通の失敗（自己診断の [NG]）と分ける 誤検出は exe の中身を直しても消えるとは限らず、
+    組み直して通る exe が出るまで繰り返すか、コード署名・Microsoft への報告で直す
+    """
+
+    def __init__(self, reasons: list[str], detections: list[dict[str, Any]]) -> None:
+        super().__init__("Defender に誤検出された: " + " / ".join(reasons))
+        self.reasons = reasons
+        self.detections = detections
+
+    @property
+    def names(self) -> list[str]:
+        """検出名（同じ物は 1 つ） 名前が取れなければ ThreatID"""
+        found: list[str] = []
+        for item in self.detections:
+            name = str(item.get("threat") or f"ThreatID {item.get('threat_id', '?')}")
+            if name not in found:
+                found.append(name)
+        return found
 
 
 def fetch_url(url: str) -> bytes:
@@ -296,6 +393,8 @@ class Release:
     smoke: Callable[[Path, Path], int] = smoke_test
     launch: Callable[[Path], int] = launch_app
     collect: Callable[[Path], int] = field(default=lambda dist: collect_sources.main([], dist=dist))
+    #: Defender の検出の記録を読む（読むだけ） 試験では差し替える
+    detections: Callable[[], list[dict[str, Any]]] = read_detections
     #: 試しに見た（--dry-run）ときの、済んでいない前提
     problems: list[str] = field(default_factory=list)
     #: 出す commit（タグが指す物 タグが無ければ手元の HEAD）
@@ -460,7 +559,7 @@ class Release:
             "--limit",
             "20",
             "--json",
-            "databaseId,workflowName,status,conclusion,headSha,url,event",
+            "databaseId,workflowName,status,conclusion,headSha,url,event,attempt",
             what="Actions の確かめ",
         )
         runs = [run for run in json.loads(out or "[]") if run.get("headSha") == self.commit]
@@ -788,7 +887,15 @@ class Release:
         if self.dry_run:
             self.todo("展開した zip で自己診断を走らせ、アプリを起こして GL で描けるかを見る")
             return
-        if self.smoke(self.archive, self.home) != 0:
+        before = self.detection_ids()
+        try:
+            code = self.smoke(self.archive, self.home)
+        except OSError as exc:
+            # 隔離された exe を起こそうとすると WinError 225、消された後なら見つからない
+            self.raise_if_detected(before, exc)
+            raise
+        self.raise_if_detected(before)
+        if code != 0:
             raise StopError(
                 "zip からの確かめが通らない（上の [NG] を見る この zip は出せない"
                 " 直して版を上げるか、下書きとタグを消して打ち直す）"
@@ -798,7 +905,12 @@ class Release:
             executable = self.home / APP_EXE
             print(f"アプリを起こす: {executable}")
             print("プレビューに絵が出るか（GL で描けているか）を見て、見終えたらアプリを閉じる")
-            self.launch(executable)
+            try:
+                self.launch(executable)
+            except OSError as exc:
+                self.raise_if_detected(before, exc)
+                raise
+            self.raise_if_detected(before)
             answer = self.ask("GL で描けていましたか y/N: ").strip().lower()
             if answer not in {"y", "yes"}:
                 raise StopError(
@@ -811,6 +923,32 @@ class Release:
         )
         self.done(f"自己診断が通った（GL は{gl}）")
 
+    def detection_ids(self) -> set[str]:
+        """今ある検出の記録の番号 確かめの後に増えた物だけを、この zip の検出と見る"""
+        return {str(item.get("id", "")) for item in self.detections()}
+
+    def raise_if_detected(self, before: set[str], failure: OSError | None = None) -> None:
+        """誤検出の印があれば :class:`DefenderDetectionError` で止める 無ければ何もしない
+
+        印は 3 つ 起こせない（WinError 225）・展開した exe が消えた・検出の記録が増えて
+        exe を指している 確かめが通った後でも見る 終わった直後に隔離されることがある
+        （0.1.4 の作り直しの 1 つは、--add-on-check が 0 で終わった後に消された）
+        """
+        reasons: list[str] = []
+        if failure is not None and getattr(failure, "winerror", None) == VIRUS_WINERROR:
+            reasons.append(f"exe を起こせない（{failure}）")
+        if not (self.home / APP_EXE).is_file():
+            reasons.append(f"展開した exe が消えた（{self.home / APP_EXE}）")
+        found = [
+            item
+            for item in self.detections()
+            if str(item.get("id", "")) not in before and ours(item)
+        ]
+        if found:
+            reasons.append(f"検出の記録が {len(found)} 件増えた")
+        if reasons:
+            raise DefenderDetectionError(reasons, found)
+
     def checked(self, marker: Path) -> bool:
         try:
             data = json.loads(marker.read_text(encoding="utf-8"))
@@ -820,6 +958,157 @@ class Release:
             return False
         # 前は起こさずに通した印なら、起こして見るよう言われたときに見直す
         return bool(self.skip_launch or data.get("gl") == "見た")
+
+    # --- 6'. 誤検出からの組み直し ------------------------------------------------------
+
+    def record_detection(self, found: DefenderDetectionError) -> tuple[int, Path]:
+        """検出された zip を残して記録に足す 戻り値はこの版の検出の回数と、残した zip の場所
+
+        下書きの zip は組み直すと入れ替わり、手元の写しは落とし直される 残さないと、
+        Microsoft へ報告するときに出す物が無い
+        """
+        record = self.folder / DETECTIONS_NAME
+        try:
+            entries = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            entries = []
+        if not isinstance(entries, list):
+            entries = []
+        kept = self.archive
+        if self.archive.is_file():
+            target = self.folder / DETECTED_DIR / f"{self.zip_sha256[:12]}-{self.archive.name}"
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(self.archive, target)
+                kept = target
+            except OSError as exc:
+                # 動かせなくても記録は残す 場所は落とした所のまま
+                print(f"検出された zip を動かせない（{exc}） 落とした所のまま記録する")
+        entries.append(
+            {
+                "version": self.version,
+                "zip": str(kept),
+                "sha256": self.zip_sha256,
+                "size": self.zip_size,
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "reasons": found.reasons,
+                "threats": found.names,
+                "detections": found.detections,
+            }
+        )
+        self.folder.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        count = sum(1 for entry in entries if entry.get("version") == self.version)
+        return count, kept
+
+    def rebuild_after_detection(self, found: DefenderDetectionError) -> None:
+        """誤検出を出し、人が y と答えたら組み直す 組み直さないときは止める（公開しない）
+
+        Defender の設定・除外には触らない 隔離された物も戻さない
+        """
+        count, kept = self.record_detection(found)
+        names = "、".join(found.names) or "名前は取れなかった"
+        print(f"[誤検出] Defender に誤検出された（{count} 回目）: {names}")
+        for reason in found.reasons:
+            print(f"  {reason}")
+        for item in found.detections:
+            resources = item.get("resources") or []
+            print(f"  記録 {item.get('time', '')} ThreatID {item.get('threat_id', '')} {resources}")
+        print(f"  zip     {kept}")
+        print(f"  sha256  {self.zip_sha256}")
+        print(f"  記録    {self.folder / DETECTIONS_NAME}")
+        if count > REBUILD_LIMIT:
+            raise StopError(
+                f"{REBUILD_LIMIT} 回組み直しても誤検出された これ以上は組み直さない"
+                f"（コード署名を入れるか、上の zip を {SUBMISSION_URL} から Microsoft へ"
+                " 誤検出として報告し、定義が直ってから打ち直す）"
+            )
+        answer = self.ask(
+            f"組み直しますか（{count} 回目の検出 組み直しは {REBUILD_LIMIT} 回まで） y/N: "
+        )
+        if answer.strip().lower() not in {"y", "yes"}:
+            raise StopError(
+                "組み直さずに止めた（誤検出された zip は出さない 打ち直せば 4 から確かめ直す"
+                f" 報告するなら上の zip を {SUBMISSION_URL} から）"
+            )
+        self.rebuild(count)
+
+    def rebuild(self, count: int) -> None:
+        """下書きの zip を外し、タグの Release の run を走らせ直して、終わるまで待つ
+
+        署名した目録が上がっていれば組み直さない 組み直すと zip の SHA-256 が変わり、署名と
+        食い違う（release.yml も、目録のある下書きや公開済みの zip は差し替えを断る）
+        """
+        release = self.load_release()
+        if release is None:
+            raise StopError(f"リリース {self.tag} が見えない 組み直さない")
+        if not release.get("isDraft"):
+            self.published = True
+            self.hint_after_stop = False
+            raise StopError(f"{self.tag} は公開済み 組み直さない（直すなら版を上げて出す）")
+        assets = self.assets()
+        if MANIFEST_NAME in assets or SIGNATURE_NAME in assets:
+            raise StopError(
+                "下書きに署名した目録がある 組み直すと署名と食い違うので組み直さない"
+                f"（組み直すなら gh release delete-asset {self.tag} {MANIFEST_NAME} -y と"
+                f" {SIGNATURE_NAME} を消してから打ち直す）"
+            )
+        run = self.latest_run(["--workflow", RELEASE_WORKFLOW, "--branch", self.tag])
+        if run is None:
+            raise StopError(f"Release（{self.tag}）の run が見つからない 組み直せない")
+        attempt = int(run.get("attempt") or 1)
+        print(f"== 組み直し {count} 回目（Release の run を走らせ直す）==")
+        if zip_name(self.version) in assets:
+            # 先に外す 走らせ直しが落ちたときに、誤検出された zip を下書きに残さない
+            self.call(
+                "gh",
+                "release",
+                "delete-asset",
+                self.tag,
+                zip_name(self.version),
+                "-y",
+                what="誤検出された zip を下書きから外すの",
+            )
+        self.call("gh", "run", "rerun", str(run["databaseId"]), what="Release の走らせ直し")
+        done = self.wait_rerun(str(run["databaseId"]), attempt)
+        if done.get("conclusion") != "success":
+            raise StopError(
+                f"走らせ直した Release が {done.get('conclusion')}（{done.get('url', '')}）"
+                " 下書きに zip が無いので、直してから打ち直す"
+            )
+        # 新しい zip で 4 からやり直す 前の zip で作った物は使わない
+        self.expected = None
+        self.zip_sha256 = ""
+        self.zip_size = -1
+        self.done(f"組み直した（Release の {attempt + 1} 回目の試み）")
+
+    def wait_rerun(self, run_id: str, attempt: int) -> dict[str, Any]:
+        """走らせ直した run が終わるまで待つ 前の試みの「済」を、終わったと取り違えない"""
+        started = self.clock()
+        last = ""
+        while True:
+            out = self.call(
+                "gh",
+                "run",
+                "view",
+                run_id,
+                "--json",
+                "status,conclusion,attempt,url",
+                what="Release の走らせ直しの確かめ",
+            )
+            view: dict[str, Any] = json.loads(out or "{}")
+            fresh = int(view.get("attempt") or 0) > attempt
+            if fresh and view.get("status") == "completed":
+                return view
+            if self.clock() - started > WAIT_LIMIT_SECONDS:
+                raise StopError(
+                    f"走らせ直した Release が {WAIT_LIMIT_SECONDS // 60:.0f} 分たっても終わらない"
+                )
+            status = str(view.get("status", "")) if fresh else "走らせ直しを待つ"
+            if status != last:
+                print(f"待つ: Release（{self.tag}）{status}")
+                last = status
+            self.sleep(POLL_SECONDS)
 
     # --- 7. 目録と署名 ---------------------------------------------------------------
 
@@ -1232,7 +1521,16 @@ class Release:
             self.todo("5 から先（ソース・自己診断・目録と署名・公開）は下書きができてから")
             return 1 if self.problems else 0
         self.ensure_sources()
-        self.self_check()
+        while True:
+            try:
+                self.self_check()
+            except DefenderDetectionError as found:
+                # 誤検出なら、人が y と答えたときだけ組み直して 4 から確かめ直す
+                self.rebuild_after_detection(found)
+                self.check_draft()
+                self.ensure_sources()
+                continue
+            break
         self.ensure_signature()
         if self.dry_run:
             self.todo("要約を出して「公開しますか y/N」と尋ねる")
