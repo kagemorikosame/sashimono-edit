@@ -946,6 +946,10 @@ class MainWindow(QMainWindow):
         self._scene_bar.remove_requested.connect(self.remove_active_scene)
         self._scene_bar.place_requested.connect(self._ask_place_scene)
         self._inspector.commands_requested.connect(self.execute_all)
+        # 文字の欄で続けて打った分は、直前の段へまとめる（1 文字ごとに段を積まない）
+        self._inspector.commands_continued.connect(
+            lambda commands, label: self.execute_all(commands, label, merge=True)
+        )
         self._inspector.preview_requested.connect(self._preview_command)
         self._inspector.curve_selected.connect(self._show_curve)
         # ◆ や ◀ ▶ を押した値を、グラフエディタにも出す（開いていなければ開かない）

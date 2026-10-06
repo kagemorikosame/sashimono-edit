@@ -137,11 +137,24 @@ def _open(
     area = TimelineArea(TimelineView(project, analyzer))
     area.resize(900, 400)
     area.show()
+    # 窓が画面に出る（OS が描ける状態にする）まで待つ 出る前の repaint は何も描かない
+    # CI の Windows では 1 回の processEvents で間に合わないことがあり、描いた記録が空のまま
+    # 見出しや枠の試験が落ちた（#253 窓の状態を記録すると exposed=False だった）
+    QTest.qWaitForWindowExposed(area)
     QApplication.processEvents()
     areas.append(area)
     harness = _Harness(area.view)
     area.view.setProperty("harness", harness)
     return area.view, harness
+
+
+def _paint(view: TimelineView) -> None:
+    """ビューを今すぐ描かせる 画面に出ているかに関わらず paintEvent を通す
+
+    ``repaint`` は窓が描ける状態（exposed）でないと何もしない 出るのを待っても
+    CI の実行機では間に合わないことが残るので、描いた絵を取る ``grab`` で描かせる
+    """
+    view.grab()
 
 
 def _band(view: TimelineView, name: str) -> tuple[int, int]:
@@ -389,7 +402,7 @@ class TestClipContent:
         monkeypatch.setattr(view_module, "draw_track_header", record)
         muted = replace(_layer(2), muted=True)
         view, _ = _open(made, analyzer, _project(_layer(1), muted))
-        view.repaint()
+        _paint(view)
         assert seen == {"レイヤー 1": True, "レイヤー 2": False}
 
 
@@ -435,7 +448,7 @@ class TestMovingOnLayers:
         QTest.mousePress(view, _LEFT, _NONE, start)
         QTest.mouseMove(view, QPoint(start.x(), (start.y() + end.y()) // 2))
         QTest.mouseMove(view, end)
-        view.repaint()
+        _paint(view)
         assert dashed and set(dashed) == {"レイヤー 2"}
         QTest.mouseRelease(view, _LEFT, _NONE, end)
         ((command,),) = harness.received
@@ -476,7 +489,7 @@ class TestMovingOnLayers:
         QTest.mousePress(view, _LEFT, _NONE, start)
         QTest.mouseMove(view, QPoint(start.x(), (start.y() + end.y()) // 2))
         QTest.mouseMove(view, end)
-        view.repaint()
+        _paint(view)
         assert sorted(dashed) == ["レイヤー 1", "レイヤー 2"], "枠が元のレイヤーに出ていない"
         QTest.mouseRelease(view, _LEFT, _NONE, end)
         ((command,),) = harness.received

@@ -9,10 +9,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from fractions import Fraction
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -22,8 +22,10 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -31,7 +33,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QToolButton,
@@ -88,7 +92,12 @@ from sashimono.effects.sources import source_registry
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
-from sashimono.ui.inspector.widgets import ParameterEditor, TrackEditor, create_editor
+from sashimono.ui.inspector.widgets import (
+    ParameterEditor,
+    TextEditor,
+    TrackEditor,
+    create_editor,
+)
 from sashimono.ui.preview_handles import ALIGNMENTS
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.timeline.add_menu import effects_for_clip
@@ -175,6 +184,9 @@ class InspectorPanel(QWidget):
 
     #: 編集操作 引数はコマンドの一覧と、履歴に出す操作名
     commands_requested = Signal(list, str)
+    #: 直前の操作の続き（文字の欄で続けて打った分） 直前の段がまだ一番上に残っていれば、
+    #: 同じ段へまとめてよい 1 文字ごとに段を積むと、打った言葉を戻すのに文字の数だけ取り消す
+    commands_continued = Signal(list, str)
     #: ドラッグ中の途中経過 履歴に残さずプレビューだけ更新する
     preview_requested = Signal(object)
     #: グラフエディタで開くパラメータが選ばれた
@@ -208,6 +220,21 @@ class InspectorPanel(QWidget):
         self._virtual: dict[EffectId, tuple[ClipId, Effect]] = {}
         #: ダブルクリックで初期値へ戻すか（設定 :attr:`Preferences.double_click_reset`）
         self._double_click_reset = True
+        #: 今出している欄の構成の指紋（:meth:`_layout_key`） 同じなら作り直さずに値だけ
+        #: 入れ直す 作り直すと、打っている欄が消えてフォーカスが外れる（Issue #251）
+        self._shown_layout: object = None
+        #: 今出している欄を作ったときの選択（:meth:`_selection_key`） 選び替えでは
+        #: :attr:`_selection` が作り直しより先に変わるので、作り直す前の選択はこちらで覚える
+        self._shown_selection: _SelectionKey = (None, frozenset())
+        #: フォーカスを持てる部品を、何の値の物かで引く 作り直した後に同じ欄へ戻すため
+        #: 入力欄（:attr:`_editors`）のほか、合成モードやクリップの入り切りも入る
+        self._focus_owners: dict[tuple[str, str], QWidget] = {}
+        #: 値だけ入れ直すときに、入力欄以外（合成モード・組の有効の切り替えなど）を
+        #: 今のクリップに合わせる手
+        self._refreshers: list[Callable[[Clip], None]] = []
+        #: スライダーを押している最中に更新が来た 構成が変わるなら作り直しを、変わらない
+        #: なら押している欄への値の入れ直しを、離すまで待っている
+        self._update_pending = False
 
         #: 何のクリップの設定を見ているか（種類・名前・トラック）
         self._title = ClipHeader(self)
@@ -252,8 +279,49 @@ class InspectorPanel(QWidget):
     # --- 外から差し替えるもの ---
 
     def set_project(self, project: Project) -> None:
+        """新しいプロジェクトを見る 編集のたびに呼ばれる
+
+        欄の構成が同じなら、作り直さずに値だけ入れ直す 入力欄の値を 1 文字確定する
+        たびにここへ来るので、作り直すと打っている欄が消え、2 文字目からはウィンドウ本体
+        （S の分割・スペースの再生）へ届いていた（Issue #251）
+        """
         self._project = project
+        self._show_project()
+
+    def _show_project(self) -> None:
+        busy = self._busy()
+        if self._layout_key() == self._shown_layout:
+            self._refresh_values()
+            # 押している欄は値の入れ直しを飛ばした（つまみが跳ねる） 離したときにもう 1 度
+            # 入れ直す 待たないと、押している間に取り消しや AI が値を変え、動かさずに
+            # 離した（確定が出ない）とき、モデルは外の値なのに欄は押す前の値のまま残る
+            self._update_pending = busy
+            return
+        if busy:
+            # スライダーを押している最中 作り直すと掴んでいた部品が消えてドラッグが切れる
+            # 離したとき（:meth:`_after_interaction`）に作り直す
+            self._update_pending = True
+            return
         self._rebuild()
+
+    def _busy(self) -> bool:
+        return any(
+            isinstance(owner, ParameterEditor) and owner.is_busy()
+            for owner in self._focus_owners.values()
+        )
+
+    def _after_interaction(self) -> None:
+        """押している最中の操作が終わった 待っていた作り直しか値の入れ直しを済ませる
+
+        離した知らせはスライダーが離したことを受け取る前に来ることがある その場では
+        まだ押している扱いなので、受け取り終えた後（次の巡り）に確かめる
+        """
+        if self._update_pending:
+            QTimer.singleShot(0, self, self._settle)
+
+    def _settle(self) -> None:
+        if self._update_pending and not self._busy():
+            self._show_project()
 
     def set_clip(self, clip_id: ClipId | None) -> None:
         self.set_selection((clip_id,) if clip_id is not None else ())
@@ -269,6 +337,11 @@ class InspectorPanel(QWidget):
         self._selection = tuple(clip_ids)
         self._clip_id = primary
         self._rebuild()
+
+    def _selection_key(self) -> _SelectionKey:
+        """今の選択を比べる形 主のクリップと、まとめて当てるほかのクリップの集まり"""
+        others = frozenset(c for c in self._selection if c != self._clip_id)
+        return self._clip_id, others
 
     def set_double_click_reset(self, enabled: bool) -> None:
         """名前（数はスライダーも）のダブルクリックで初期値へ戻すか 設定から
@@ -302,22 +375,172 @@ class InspectorPanel(QWidget):
             return None
         return self._project.timeline.locate_clip(self._clip_id)
 
+    def _picture_and_sound(self, track: Track, clip: Clip) -> tuple[bool, bool]:
+        """絵を描くクリップか・音を鳴らすクリップか
+
+        混合トラックはクリップが絵と音の両方を持てるので、トラックの種類ではなく
+        draws_picture と plays_sound で決める
+        """
+        media = (
+            self._project.find_media(clip.media_id)
+            if self._project is not None and clip.media_id is not None
+            else None
+        )
+        picture = draws_picture(track, clip, media)
+        sound = (
+            clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
+        )
+        return picture, sound
+
+    def _layout_key(self) -> object:
+        """欄の構成を決める物を並べた指紋 値は入れない
+
+        ここに無い物が変わっても作り直さないので、:meth:`_rebuild` で行や組を出すか
+        決める条件を足したら、ここにも足す 足し忘れると、出るはずの行が出ないまま残る
+        作り直す道は残してあるので、迷ったら入れる（多く入れても作り直しが増えるだけ）
+        """
+        located = self._located()
+        if located is None:
+            return None
+        track, clip = located
+        picture, sound = self._picture_and_sound(track, clip)
+        source: tuple[str, frozenset[str]] | None = None
+        if clip.source is not None:
+            definition = source_registry.get(clip.source.kind)
+            unused = (
+                definition.unused_names(clip.source.params)
+                if definition is not None
+                else frozenset()
+            )
+            source = (clip.source.kind, unused)
+        return (
+            clip.id,
+            picture,
+            sound,
+            source,
+            clip.media_id,
+            clip.is_filter,
+            clip.is_group,
+            takes_picture_items(clip),
+            self._is_movie(clip),
+            self._native_capable(clip),
+            clip.hold_at,
+            self._start_maximum(clip),
+            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.effects),
+            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.after_effects),
+            self._double_click_reset,
+        )
+
+    def _refresh_values(self) -> None:
+        """作り直さずに、出ている欄へ今の値を入れ直す 欄は信号を出さずに受け取る
+
+        押している最中の欄は飛ばす ドラッグ中のスライダーへ値を入れると、つまみが
+        掴んだ所から跳ねる
+        """
+        clip = self._clip()
+        if clip is None:
+            return
+        self._show_identity(clip)
+        for (owner, name), editor in self._editors.items():
+            if editor.is_busy():
+                continue
+            pending = self._virtual.get(EffectId(owner))
+            if pending is not None:
+                editor.set_value(pending[1].params.get(name))
+                continue
+            editor.set_value(self._lookup(clip, owner, name))
+        for refresh in self._refreshers:
+            refresh(clip)
+        self._refresh_animated()
+
     def _rebuild(self) -> None:
         """中身を作り直す
 
-        値だけ入れ直せば済む場合も多いが、エフェクトの増減や並べ替えを
-        差分で追うと取りこぼしが出る 組み直す方が確実で、選択中の 1 クリップ
-        ぶんなら十分に速い
+        構成が変わったとき（クリップの切り替え・エフェクトの増減や並べ替え）だけ
+        :meth:`set_project` から来る 変わった所を差分で追うと取りこぼしが出るので、
+        組み直す 選択中の 1 クリップぶんなら十分に速い
+
+        フォーカスのあった欄は、作り直した後も同じ値の欄へ戻す（カーソルの位置も）
+        戻さないと、構成の変わる 1 文字（タイマーの書式の 1 文字目など）で打てなくなる
         """
+        focus = self._focused_place()
+        self._update_pending = False
         self._editors.clear()
         self._key_controls.clear()
         self._virtual.clear()
+        self._focus_owners.clear()
+        self._refreshers.clear()
         while self._body_layout.count():
             item = self._body_layout.takeAt(0)
             widget = item.widget() if item is not None else None
             if widget is not None:
                 widget.deleteLater()
+        self._build()
+        self._shown_layout = self._layout_key()
+        self._shown_selection = self._selection_key()
+        if focus is not None:
+            self._restore_focus(focus)
 
+    def _focused_place(self) -> _FocusPlace | None:
+        """フォーカスのある欄（何の値の欄か・中のどの部品か・カーソル）
+
+        アプリ全体のフォーカス（``QApplication.focusWidget``）ではなく窓の中のフォーカスを見る
+        窓が活性でない間（ほかのアプリを前に出している間に AI や素材の解析で更新が来た）は
+        アプリ全体のフォーカスが無く、戻す欄を見失う 窓の中のフォーカスなら、戻ったときに
+        受ける欄が分かり、:meth:`_restore_focus` の ``setFocus`` もその欄を窓の中で指し直す
+        """
+        focus = self.window().focusWidget()
+        if focus is None or not self._body.isAncestorOf(focus):
+            return None
+        for key, owner in self._focus_owners.items():
+            if owner is not focus and not owner.isAncestorOf(focus):
+                continue
+            kind = type(focus)
+            index = -1 if owner is focus else owner.findChildren(kind).index(focus)
+            cursor: tuple[int, int] | None = None
+            if isinstance(focus, QPlainTextEdit):
+                text_cursor = focus.textCursor()
+                cursor = (text_cursor.anchor(), text_cursor.position())
+            elif isinstance(focus, QLineEdit):
+                position = focus.cursorPosition()
+                cursor = (position, position)
+            typing = owner.typing_since if isinstance(owner, TextEditor) else None
+            return _FocusPlace(key, kind, index, cursor, typing, self._shown_selection)
+        return None
+
+    def _restore_focus(self, place: _FocusPlace) -> None:
+        """作り直した後、同じ値の欄の同じ部品へフォーカスを戻す 欄が消えていれば戻さない"""
+        owner = self._focus_owners.get(place.key)
+        if owner is None:
+            return
+        target: QWidget | None = owner
+        if place.index >= 0:
+            found = owner.findChildren(place.kind)
+            target = found[place.index] if place.index < len(found) else None
+        if target is None:
+            return
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        if isinstance(owner, TextEditor):
+            # 打ち続けを引き継ぐのは同じ選択のままの作り直しだけ フォーカスを変えずに選びが
+            # 変わった（AI の select_clip など）ときに引き継ぐと、次の 1 文字が前の選択への段へ
+            # まとめられ、1 回の取り消しで別のクリップの編集まで戻る 主のクリップが同じでも、
+            # まとめて当てるほかのクリップが変われば（(A, B) から (A, C)）当たる先が違う
+            same = place.selection == self._selection_key()
+            owner.continue_typing(place.typing if same else None)
+        if place.cursor is None:
+            return
+        anchor, position = place.cursor
+        if isinstance(target, QPlainTextEdit):
+            length = len(target.toPlainText())
+            cursor = target.textCursor()
+            cursor.setPosition(min(anchor, length))
+            cursor.setPosition(min(position, length), QTextCursor.MoveMode.KeepAnchor)
+            target.setTextCursor(cursor)
+        elif isinstance(target, QLineEdit):
+            target.setCursorPosition(min(position, len(target.text())))
+
+    def _build(self) -> None:
+        """今のクリップの欄を組み立てる 空にした後の :meth:`_rebuild` から呼ぶ"""
         located = self._located()
         if located is None:
             self._title.show_identity(None)
@@ -336,17 +559,7 @@ class InspectorPanel(QWidget):
         # 絵を描かないクリップ（音声トラック）には描画の組を出さない（出すと、動かしても
         # 何も変わらない合成方法や不透明度が並ぶ） 音を鳴らさないクリップ（映像トラック）には
         # 音量を出さない（リンクした音は音声トラックのクリップの側にある）
-        # 混合トラックはクリップが絵と音の両方を持てるので、トラックの種類ではなく
-        # draws_picture と plays_sound で決める
-        media = (
-            self._project.find_media(clip.media_id)
-            if self._project is not None and clip.media_id is not None
-            else None
-        )
-        picture = draws_picture(track, clip, media)
-        sound = (
-            clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
-        )
+        picture, sound = self._picture_and_sound(track, clip)
         shown: set[EffectId] = set()
         # 場面切り替えは下の絵をそのまま入れ替えて描き、不透明度・合成モード・クリッピングを
         # 読まない（描画の欄も持たない） 出すと、動かしても何も変わらない欄が並ぶ
@@ -435,6 +648,15 @@ class InspectorPanel(QWidget):
                 SetClipProperty(clip.id, "blend_mode", str(blend.itemData(index)))
             )
         )
+
+        def refresh(current: Clip) -> None:
+            # 入れ直しで選び替えの知らせを出すと、取り消しのたびに同じ値の段が積まれる
+            blocked = blend.blockSignals(True)
+            blend.setCurrentIndex(max(0, blend.findData(current.blend_mode)))
+            blend.blockSignals(blocked)
+
+        self._refreshers.append(refresh)
+        self._focus_owners[("clip", "blend_mode")] = blend
         return blend
 
     # --- 最初から持つ欄（YMM4 の描画・動画・音声の組） ---
@@ -505,6 +727,16 @@ class InspectorPanel(QWidget):
         )
         section.add_header_widget(toggle)
         section.add_header_widget(_lock_label())
+
+        def refresh(current: Clip) -> None:
+            # まだクリップに無い欄（前の版のファイル）は、作ったときの物の入り切りを見る
+            states = [
+                next((e.enabled for e in current.effects if e.id == effect.id), effect.enabled)
+                for effect in effects
+            ]
+            _show_toggle(toggle, all(states))
+
+        self._refreshers.append(refresh)
 
     def _build_picture_group(self, clip: Clip, shown: set[EffectId]) -> QWidget:
         """描画の組 YMM4 の並び（X・Y・不透明度・拡大率・回転角・合成モード・左右反転・
@@ -604,6 +836,8 @@ class InspectorPanel(QWidget):
         )
         reset = (lambda: self._reset_clip(clip, name, False, label)) if resettable else None
         section.add_row(label, editor, reset=self._if_resettable(reset) if reset else None)
+        self._refreshers.append(lambda current: editor.set_value(bool(getattr(current, name))))
+        self._focus_owners[("clip", name)] = editor
 
     def _native_capable(self, clip: Clip) -> bool:
         """素材の画素の大きさで置けるクリップか（素材の絵を描くもの）"""
@@ -684,14 +918,11 @@ class InspectorPanel(QWidget):
             reset=self._if_resettable(lambda: self._reset_linked(clip, "speed", Fraction(1))),
         )
 
-        media = self._project.find_media(clip.media_id) if self._project and clip.media_id else None
-        # 上限は素材の長さ 分からない素材は 10 時間まで（スライダーが整数で持てる範囲）
-        length = float(media.duration) if media is not None and media.duration > 0 else 36000.0
         start_spec = TrackSpec(
             "source_in",
             "再生開始位置",
             0,
-            max(length, float(clip.source_in)),
+            self._start_maximum(clip),
             0,
             step=0.01,
             unit="秒",
@@ -710,6 +941,26 @@ class InspectorPanel(QWidget):
             start,
             reset=self._if_resettable(lambda: self._reset_linked(clip, "source_in", Fraction(0))),
         )
+        self._focus_owners[("clip", "speed")] = speed
+        self._focus_owners[("clip", "source_in")] = start
+
+        def refresh(current: Clip) -> None:
+            # 押している最中の欄は飛ばす（:meth:`_refresh_values` と同じ理由）
+            if not speed.is_busy():
+                speed.set_value(AnimatedValue(float(current.speed * 100)))
+            if not start.is_busy():
+                start.set_value(AnimatedValue(float(current.source_in)))
+
+        self._refreshers.append(refresh)
+        for editor in (speed, start):
+            editor.interaction_finished.connect(self._after_interaction)
+
+    def _start_maximum(self, clip: Clip) -> float:
+        """再生開始位置の欄の上限 素材の長さ 分からない素材は 10 時間まで
+        （スライダーが整数で持てる範囲） 今の値がそれより後ろなら今の値まで広げる"""
+        media = self._project.find_media(clip.media_id) if self._project and clip.media_id else None
+        length = float(media.duration) if media is not None and media.duration > 0 else 36000.0
+        return max(length, float(clip.source_in))
 
     def _reset_linked(self, clip: Clip, name: str, value: Fraction) -> None:
         """再生速度・再生開始位置を初期値へ戻す 相手にも入れる（:meth:`_set_linked`）"""
@@ -820,6 +1071,14 @@ class InspectorPanel(QWidget):
         section.action_requested.connect(self._emit)
         section.pressed.connect(lambda: self.effect_focused.emit(str(effect.id)))
 
+        def refresh(current: Clip) -> None:
+            mine = current.after_effects if after else current.effects
+            found = next((e for e in mine if e.id == effect.id), None)
+            if found is not None:
+                section.show_enabled(found.enabled)
+
+        self._refreshers.append(refresh)
+
         if definition is None:
             # 定義の無いエフェクトは触らせない 値の意味が分からないまま
             # 書き換えると、対応する版で開いたときに壊れて見える
@@ -837,9 +1096,14 @@ class InspectorPanel(QWidget):
         editor = create_editor(spec)
         editor.set_value(value)
         editor.value_changed.connect(lambda new: self._on_value_changed(path, new))
+        editor.value_continued.connect(
+            lambda new: self._on_value_changed(path, new, continued=True)
+        )
         editor.value_previewed.connect(lambda new: self._on_value_previewed(path, new))
         editor.reset_requested.connect(lambda: self._reset(spec, path))
+        editor.interaction_finished.connect(self._after_interaction)
         self._editors[_editor_key(path)] = editor
+        self._focus_owners[_editor_key(path)] = editor
         return editor
 
     def _keyframe_controls(
@@ -881,7 +1145,10 @@ class InspectorPanel(QWidget):
         current = self._current_value(path)
         return current if isinstance(current, AnimatedValue) else base
 
-    def _on_value_changed(self, path: ParamPath, value: ParamValue) -> None:
+    def _on_value_changed(
+        self, path: ParamPath, value: ParamValue, *, continued: bool = False
+    ) -> None:
+        """入力欄の値が確定した ``continued`` なら直前の確定の続き（続けて打った文字）"""
         if path.effect_id is not None:
             self.effect_focused.emit(str(path.effect_id))
         current = self._current_value(path)
@@ -890,9 +1157,9 @@ class InspectorPanel(QWidget):
         if animating and isinstance(value, AnimatedValue) and clip is not None:
             # アニメーション中の値を触ったら、再生位置のキーフレームの値を変える（無ければ打つ）
             # 静的値で上書きすると、打ったキーフレームが黙って消える
-            self._emit(SetKeyframe(path, self._key_frame(clip), value.static))
+            self._emit(SetKeyframe(path, self._key_frame(clip), value.static), continued=continued)
             return
-        self._emit(SetParam(path, value))
+        self._emit(SetParam(path, value), continued=continued)
 
     def _on_value_previewed(self, path: ParamPath, value: ParamValue) -> None:
         if path.effect_id is not None:
@@ -1128,19 +1395,21 @@ class InspectorPanel(QWidget):
             return
         self._presets.save(Preset(name=name.strip(), effects=_loose(clip)))
 
-    def _emit(self, command: Command, label: str | None = None) -> None:
+    def _emit(self, command: Command, label: str | None = None, *, continued: bool = False) -> None:
         commands = [command, *self._also_for_others(command)]
         text = label or command.label
         if len(commands) > 1:
             text = f"{text}（{len(commands)} 本）"
-        self._send(commands, text)
+        self._send(commands, text, continued=continued)
 
-    def _send(self, commands: list[Command], label: str) -> None:
+    def _send(self, commands: list[Command], label: str, *, continued: bool = False) -> None:
         """コマンドをまとめて出す（1 回の取り消しで戻る）
 
         まだクリップに無い欄（:attr:`_virtual`）を指すものがあれば、その前に欄を足す
         足すのと値を入れるのを別々に出すと、取り消しが 2 段になり、1 回戻しただけでは
         既定の値の欄が残る
+
+        ``continued`` なら :attr:`commands_continued` で出し、直前の段へまとめさせる
         """
         materialized: list[Command] = []
         added: set[EffectId] = set()
@@ -1152,6 +1421,9 @@ class InspectorPanel(QWidget):
                 materialized.append(AddEffect(clip_id, effect))
                 added.add(effect.id)
             materialized.append(command)
+        if continued:
+            self.commands_continued.emit(materialized, label)
+            return
         self.commands_requested.emit(materialized, label)
 
     def _also_for_others(self, command: Command) -> list[Command]:
@@ -1197,7 +1469,8 @@ class InspectorPanel(QWidget):
 
         local = self._frame - clip.timeline_start
         for (owner, name), editor in self._editors.items():
-            if not isinstance(editor, TrackEditor):
+            if not isinstance(editor, TrackEditor) or editor.is_busy():
+                # ドラッグ中に再生位置が動いても、掴んだつまみを跳ねさせない
                 continue
             value = self._lookup(clip, owner, name)
             if isinstance(value, AnimatedValue) and value.is_animated:
@@ -1383,8 +1656,10 @@ class _Section(QFrame):
         self._header = header
 
         self._after = after
+        self._enabled_toggle: QToolButton | None = None
         if effect is not None and clip_id is not None:
-            header.addWidget(self._toggle(effect, clip_id))
+            self._enabled_toggle = self._toggle(effect, clip_id)
+            header.addWidget(self._enabled_toggle)
             if effect.fixed:
                 # 外すことも並べ替えることもできない 押せないボタンを並べるより、
                 # 鍵の印で「最初からある欄」だと示す方が、押せない理由まで伝わる
@@ -1449,6 +1724,11 @@ class _Section(QFrame):
         )
         return button
 
+    def show_enabled(self, enabled: bool) -> None:
+        """有効の切り替えを今の値に合わせる（知らせは出さない） 作り直さない更新で使う"""
+        if self._enabled_toggle is not None:
+            _show_toggle(self._enabled_toggle, enabled)
+
     def _move(
         self, effect: Effect, clip_id: ClipId, index: int, text: str, enabled: bool
     ) -> QToolButton:
@@ -1477,6 +1757,37 @@ class _Section(QFrame):
             lambda: self.action_requested.emit(RemoveEffect(clip_id, effect.id, after=self._after))
         )
         return button
+
+
+def _show_toggle(button: QAbstractButton, enabled: bool) -> None:
+    """有効・無効の切り替えを、知らせを出さずに今の値へ合わせる 知らせを出すと、
+    取り消しで値を戻すたびに切り替えのコマンドが出て、戻した段の上に新しい段が積まれる"""
+    blocked = button.blockSignals(True)
+    button.setChecked(enabled)
+    button.blockSignals(blocked)
+    button.setText("有効" if enabled else "無効")
+
+
+#: 選択を比べる形 主のクリップと、まとめて当てるほかのクリップの集まり（選んだ順は問わない）
+_SelectionKey = tuple[ClipId | None, frozenset[ClipId]]
+
+
+@dataclass(frozen=True)
+class _FocusPlace:
+    """作り直す前にフォーカスのあった所 :meth:`InspectorPanel._restore_focus` で戻す"""
+
+    #: 何の値の欄か（:func:`_editor_key` と同じ形）
+    key: tuple[str, str]
+    #: 欄の中でフォーカスを持っていた部品の型と、欄の中の同じ型の何番目か（欄そのものなら -1）
+    kind: type[QWidget]
+    index: int
+    #: 文字の欄のカーソル（選んだ範囲の起点, カーソル） 文字の欄でなければ ``None``
+    cursor: tuple[int, int] | None
+    #: 打ち続けの始まり（:attr:`TextEditor.typing_since`） 取り消しの段を分けないため
+    typing: float | None
+    #: 欄を出したときの選択（:meth:`InspectorPanel._selection_key`） 違う選択の欄へは
+    #: 打ち続けを引き継がない
+    selection: _SelectionKey
 
 
 def _editor_key(path: ParamPath) -> tuple[str, str]:

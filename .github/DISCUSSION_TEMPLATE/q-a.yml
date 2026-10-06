@@ -16,7 +16,7 @@ body:
     attributes:
       label: Sashimono Edit の版
       description: 〔ヘルプ〕→〔バージョン情報…〕の 1 行目 分からなければ空のままで構いません
-      placeholder: 0.1.2
+      placeholder: 0.1.3
 
   - type: textarea
     id: question
