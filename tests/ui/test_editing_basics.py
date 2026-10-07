@@ -272,6 +272,33 @@ class TestKeysWhileTyping:
         field.setReadOnly(True)
         assert not _held(field, Qt.Key.Key_V, CTRL_SHIFT)
 
+    def test_a_rebound_insert_key_also_stays_in_a_field(self, shown: MainWindow) -> None:
+        # 設定で挿入貼り付けを別のキーへ変えた人だけ、欄に打っている途中でクリップが貼られた
+        # （CodeRabbit の指摘） 欄が受け取れば、Qt は窓のショートカットを探さない
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        assert _held(QLineEdit(shown), Qt.Key.Key_B, CTRL_SHIFT)
+        # 書式なしの貼り付けのキーは、割り当てから外れても欄のまま
+        assert _held(QLineEdit(shown), Qt.Key.Key_V, CTRL_SHIFT)
+        # 欄の外では窓へ回す 回さないと、変えたキーで挿入貼り付けが使えない
+        assert not _held(shown._timeline, Qt.Key.Key_B, CTRL_SHIFT)
+
+    def test_a_key_given_back_is_left_to_the_window_again(self, shown: MainWindow) -> None:
+        # 前の割り当てを覚えたままだと、ほかの操作へ割り当て直したキーが欄の中で効かなくなる
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+V"})
+        assert not _held(QLineEdit(shown), Qt.Key.Key_B, CTRL_SHIFT)
+
+    def test_a_rebound_key_does_not_paste_into_the_field(
+        self, shown: MainWindow, fake_clipboard: FakeClipboard
+    ) -> None:
+        # 変えた先のキーは欄の既定の動きに任せる 貼り付けを勝手に足すと、欄で別の意味を
+        # 持つキーの動きまで変わる
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        field = QLineEdit(shown)
+        fake_clipboard.setText("12")
+        QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_B, CTRL_SHIFT))
+        assert "12" not in field.text()
+
     def test_the_window_action_still_inserts(self, shown: MainWindow) -> None:
         # 欄の外で押したときに動く窓の項目 活性に依らないように項目を直に引く
         timeline = shown._timeline

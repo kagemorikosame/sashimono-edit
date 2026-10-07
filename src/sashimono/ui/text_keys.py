@@ -11,8 +11,14 @@ Ctrl+Shift+V は Qt の標準のキーに無いので守られず、文字を打
 ここでは同じ ShortcutOverride の仕組みで、入力欄がこのキーを受け取るようにし、
 欄の中に書式なしで貼る
 
+挿入貼り付けをショートカットの設定で別のキーへ変えた人は、そのキーでも同じことが起きる
+窓が今の割り当てを :meth:`TextFieldKeys.hold` で渡し、入力欄ではそのキーも欄が受け取る
+欄に貼るのは Ctrl+Shift+V だけで、変えた先のキーは欄の既定の動きに任せる（多くは何も
+しない） 変えた先は人によって何でもあり得て、そこへ貼り付けを勝手に足すと、欄で別の
+意味を持つキーの動きまで変わる
+
 Ctrl+T（テキストを追加）のように、欄が使わないキーの窓のショートカットはそのまま動かす
-欄の中では何も起きないキーなので、取り上げても打ち手の得にならない
+クリップを足すだけで、打っていた文字を壊さない 押せば何が起きるかが欄の外と同じ方が分かりやすい
 """
 
 from __future__ import annotations
@@ -85,18 +91,44 @@ def paste_plain(widget: QWidget) -> None:
 class TextFieldKeys(QObject):
     """入力欄に来た ShortcutOverride を見て、欄が使うキーなら欄に取らせる見張り"""
 
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        #: 窓ごとの、入力欄では欄に取らせるキー（挿入貼り付けの今の割り当て）
+        #: 鍵は窓の ``id`` 窓を何枚開いても見張りは 1 つなので、窓ごとに分けて持つ
+        self._held: dict[int, tuple[QKeySequence, ...]] = {}
+
+    def hold(self, owner: QObject, keys: list[QKeySequence]) -> None:
+        """``owner`` の窓で、入力欄に打っている間は ``keys`` も欄が受け取るようにする
+
+        割り当てが変わるたびに呼び直す（前の分は捨てる） 窓が消えれば外す
+        """
+        key = id(owner)
+        if key not in self._held:
+            owner.destroyed.connect(lambda _owner=None, key=key: self._held.pop(key, None))
+        self._held[key] = tuple(sequence for sequence in keys if not sequence.isEmpty())
+
+    def holds(self, pressed: QKeySequence) -> bool:
+        """入力欄ではこのキーを欄が受け取るか"""
+        if pressed == PLAIN_PASTE:
+            return True
+        return any(pressed == held for keys in self._held.values() for held in keys)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         kind = event.type()
         if kind not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
             return False
         if not isinstance(event, QKeyEvent) or not is_text_field(watched):
             return False
-        if QKeySequence(event.keyCombination()) != PLAIN_PASTE:
-            return False
+        pressed = QKeySequence(event.keyCombination())
         if kind is QEvent.Type.ShortcutOverride:
+            if not self.holds(pressed):
+                return False
             # 受け取ったと印を付けると、Qt は窓のショートカットを探さずにキーを欄へ送る
             event.accept()
             return True
+        if pressed != PLAIN_PASTE:
+            # 変えた先のキーは欄の既定の動きに任せる
+            return False
         assert isinstance(watched, QWidget)
         paste_plain(watched)
         return True

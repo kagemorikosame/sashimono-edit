@@ -292,8 +292,9 @@ class MainWindow(QMainWindow):
         # 入力欄に打っている間の Ctrl+Shift+V は欄の書式なしの貼り付け 入れないと、
         # 窓の挿入貼り付けが動いてタイムラインへクリップが貼られる
         application = QApplication.instance()
-        if isinstance(application, QApplication):
-            install_text_field_keys(application)
+        self._text_keys = (
+            install_text_field_keys(application) if isinstance(application, QApplication) else None
+        )
         self.setWindowTitle("Sashimono Edit")
         screen = QApplication.primaryScreen()
         self.resize(
@@ -629,12 +630,17 @@ class MainWindow(QMainWindow):
             self._timeline.paste_at_playhead,
         )
         # Premiere Pro と同じ割り当て 再生ヘッドから後ろを押し出して間に入れる
-        self._add(
+        insert_paste = self._add(
             edit_menu,
             "貼り付け（挿入）",
             QKeySequence("Ctrl+Shift+V"),
             self._timeline.insert_paste_at_playhead,
         )
+        # ショートカットの設定で変えた先のキーも、入力欄に打っている間は欄に渡す 渡さないと、
+        # 変えた人だけ欄の中で押したときにクリップが貼られる 割り当ての変わり方（設定の窓・
+        # 起動時の読み込み）を問わず追うため、項目の変化の知らせにつなぐ
+        insert_paste.changed.connect(lambda: self._hold_insert_keys(insert_paste))
+        self._hold_insert_keys(insert_paste)
         self._add(
             edit_menu, "すべて選択", QKeySequence.StandardKey.SelectAll, self._timeline.select_all
         )
@@ -796,6 +802,11 @@ class MainWindow(QMainWindow):
         # あとから変わる項目があり、そちらで引くと保存した割り当てが外れる
         self._actions[f"{menu.title()}/{text}"] = (action, action.shortcut().toString(_PORTABLE))
         return action
+
+    def _hold_insert_keys(self, action: QAction) -> None:
+        """挿入貼り付けの今のキーを入力欄の見張りへ渡す"""
+        if self._text_keys is not None:
+            self._text_keys.hold(self, action.shortcuts())
 
     def _apply_shortcuts(self, bindings: dict[str, str]) -> None:
         """割り当てを当てる 知らない名前は飛ばす（版が変わって消えた項目など）"""
