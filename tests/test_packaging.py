@@ -90,6 +90,23 @@ _CLEANUP_SECONDS = 120.0
 _CLEANUP_PATIENCE_SECONDS = 2.0
 
 
+def _running_pip(thread_id: int) -> bool:
+    """そのスレッドが今 ``run_pip_here`` の中にいるか（錠を待っている所も含む）
+
+    中断を投げるのは pip を走らせている作業スレッドだけにする 中断の見張り
+    （``sashimono-pip-cancel`` の ``_CancelGuard.watch``）はこの例外を受けないので、投げると
+    未処理のスレッド例外の警告が出る（PR #267 のレビュー） 名前ではなく、いま積まれている
+    呼び出しで見分ける 試験が起こした名前の無いスレッドも、pip に入っていれば拾える
+    """
+    frame = sys._current_frames().get(thread_id)
+    target = runtime_module.run_pip_here.__code__
+    while frame is not None:
+        if frame.f_code is target:
+            return True
+        frame = frame.f_back
+    return False
+
+
 def _wait_until_the_pip_is_back(
     started: Collection[threading.Thread] = (), seconds: float = _CLEANUP_SECONDS
 ) -> None:
@@ -98,7 +115,9 @@ def _wait_until_the_pip_is_back(
     ``started`` は試験の中で起こしたスレッド 名前で選ばずに全部待つ 試験が自分で起こした
     名前の無いスレッドが ``run_pip_here`` を呼び、錠を取る前に試験が落ちると、名前でも錠でも
     見えないまま後始末を抜け、偽の pip と ``PIP_NO_INDEX`` が戻った後で本物の pip を
-    走らせうる（PR #267 のレビュー） 少し待っても終わらなければ、中断を投げ込んでから待つ
+    走らせうる（PR #267 のレビュー） 少し待っても終わらなければ、pip を走らせている
+    スレッドだけに中断を投げ込んでから待つ（:func:`_running_pip`） 中断の見張りなど
+    ほかのスレッドは、投げずに終わるのを待つ
     """
     deadline = time.monotonic() + seconds
     patience = time.monotonic() + _CLEANUP_PATIENCE_SECONDS
@@ -116,7 +135,7 @@ def _wait_until_the_pip_is_back(
             # 片付けて返り、錠を待っている所なら錠を取らずに抜ける
             asked = True
             for thread in workers:
-                if thread.ident is not None:
+                if thread.ident is not None and _running_pip(thread.ident):
                     runtime_module._throw_into(thread.ident, runtime_module._PipCancelled)
         if time.monotonic() > deadline:
             raise AssertionError(f"残ったスレッドが終わらない: {[t.name for t in workers]}")
