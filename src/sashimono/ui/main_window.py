@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
         self._timeline = TimelineView(project, self._analyzer, self)
         self._timeline.set_value_lines(self._preferences.value_lines)
         self._timeline.set_split_audio(self._preferences.splits_media)
+        self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._media_pool = MediaPoolWidget(project, self)
         self._inspector = InspectorPanel(self)
@@ -620,6 +621,13 @@ class MainWindow(QMainWindow):
             "貼り付け（再生ヘッドの位置）",
             QKeySequence.StandardKey.Paste,
             self._timeline.paste_at_playhead,
+        )
+        # Premiere Pro と同じ割り当て 再生ヘッドから後ろを押し出して間に入れる
+        self._add(
+            edit_menu,
+            "貼り付け（挿入）",
+            QKeySequence("Ctrl+Shift+V"),
+            self._timeline.insert_paste_at_playhead,
         )
         self._add(
             edit_menu, "すべて選択", QKeySequence.StandardKey.SelectAll, self._timeline.select_all
@@ -860,6 +868,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_value_lines(preferences.value_lines)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
+        self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)

@@ -31,7 +31,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QGridLayout, QMenu, QWidget
 
-from sashimono.core.clipboard import ClipboardContent, copy_clips, cut_commands, paste_commands
+from sashimono.core.clipboard import (
+    ClipboardContent,
+    copy_clips,
+    cut_commands,
+    insert_paste_commands,
+    paste_commands,
+)
 from sashimono.core.commands import (
     AddClip,
     Command,
@@ -306,6 +312,9 @@ class TimelineView(QWidget):
         #: 動画の映像と音声を分けて置くか（:meth:`set_split_audio`）
         #: 既定は設定の既定と同じ 窓が渡す前に落とされても、落とした後と同じ目安を出す
         self._split_audio = True
+        #: 挿入貼り付けで全トラックを押し出すか（:meth:`set_insert_all_tracks`）
+        #: 既定は設定の既定と同じ
+        self._insert_all_tracks = True
         #: ヘッダを掴んでトラックの順を入れ替えるドラッグ
         self._track_mover = TrackDragger(self._request)
         #: ドラッグ中に端へ寄ったら表示を送る
@@ -1467,6 +1476,8 @@ class TimelineView(QWidget):
             self._add_empty_items(menu, position)
         paste = _action(menu, "貼り付け（再生ヘッドの位置）", self.paste_at_playhead)
         paste.setEnabled(self._clipboard is not None)
+        insert = _action(menu, "挿入して貼り付け", self.insert_paste_at_playhead)
+        insert.setEnabled(self._clipboard is not None)
         if hit is not None:
             menu.addSeparator()
             _action(menu, f"削除{count}", self.delete_selected)
@@ -1780,17 +1791,40 @@ class TimelineView(QWidget):
         self._request(cut_commands(self._project, self._clipboard), "切り取り")
         return True
 
+    def set_insert_all_tracks(self, all_tracks: bool) -> None:
+        """挿入貼り付けで全トラックを押し出すか 設定（:attr:`Preferences.insert_paste`）から"""
+        self._insert_all_tracks = all_tracks
+
     def paste_at_playhead(self) -> bool:
         """再生ヘッドの位置へ貼り付けて、貼ったクリップを選ぶ"""
+        return self._paste(insert=False)
+
+    def insert_paste_at_playhead(self) -> bool:
+        """再生ヘッドから後ろを貼る長さぶん押し出して貼り付け、貼ったクリップを選ぶ（Ctrl+Shift+V）
+
+        押し出しと貼り付けは 1 回の取り消しで戻る ロックしたトラックに押す物があれば、
+        何もせずに理由を状態の表示へ出す
+        """
+        return self._paste(insert=True)
+
+    def _paste(self, *, insert: bool) -> bool:
         if self._clipboard is None:
             self.status_message.emit("コピーしたクリップがありません")
             return False
         try:
-            commands = paste_commands(self._project, self._clipboard, self._playhead)
+            if insert:
+                commands = insert_paste_commands(
+                    self._project,
+                    self._clipboard,
+                    self._playhead,
+                    all_tracks=self._insert_all_tracks,
+                )
+            else:
+                commands = paste_commands(self._project, self._clipboard, self._playhead)
         except ValueError as exc:
             self.status_message.emit(str(exc))
             return False
-        self._request(commands, "貼り付け")
+        self._request(commands, "貼り付け（挿入）" if insert else "貼り付け")
         # 実行は受け取った側で済んでいる 貼ったものを全部選んでおくと、そのまま
         # まとめて動かせる 1 本だけ選ぶと、残りを探して選び直すことになる
         pasted = [c.clip.id for c in commands if isinstance(c, AddClip)]

@@ -15,15 +15,22 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from sashimono.core.commands import AddClip, Command, SetTrackHeights
+from sashimono.core.commands import AddClip, Command, InsertGap, SetTrackHeights
 from sashimono.core.io import others_holding, project_presence_dir
 from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind
 from sashimono.effects.sources import TEXT
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.media_pool import MediaPoolWidget
+from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.theme import Metrics
 from sashimono.ui.timeline import TimelineView
+from sashimono.ui.workspace import (
+    INSERT_ALL_TRACKS,
+    INSERT_TARGET_TRACKS,
+    Preferences,
+    PreferenceStore,
+)
 
 
 def _project() -> Project:
@@ -105,6 +112,81 @@ class TestCopyPaste:
         assert messages
 
 
+class TestInsertPaste:
+    def test_the_menu_offers_it_once_something_is_copied(self, view: TimelineView) -> None:
+        # 右クリックに無いと、挿入貼り付けを知らない人は Ctrl+V の後に手で詰め直す
+        empty = QPoint(800, _clip_point(view).y())
+        assert _labels(view, empty)["挿入して貼り付け"] is False
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        assert view.copy_selected()
+        assert _labels(view, empty)["挿入して貼り付け"] is True
+
+    def test_it_pushes_what_is_behind_the_playhead(self, view: TimelineView) -> None:
+        # 壊れると、後ろのクリップが動かず、貼った物が新しいトラックへ逃げる
+        received = _received(view)
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        view.set_playhead(10)
+        assert view.insert_paste_at_playhead()
+        (commands,) = received
+        assert isinstance(commands[0], InsertGap)
+        assert commands[0].length == 30
+        assert [c.clip.timeline_start for c in commands if isinstance(c, AddClip)] == [10]
+
+    def test_the_preference_narrows_the_pushed_tracks(self, view: TimelineView) -> None:
+        # 設定で貼り先だけを選んでも全トラックを押すと、設定が効いていない
+        received = _received(view)
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        view.set_insert_all_tracks(False)
+        assert view.insert_paste_at_playhead()
+        gap = received[0][0]
+        assert isinstance(gap, InsertGap)
+        assert gap.track_ids == (view.project.timeline.tracks[0].id,)
+
+    def test_a_locked_track_is_reported(self, view: TimelineView) -> None:
+        # ロックで断ったのに黙っていると、何が起きなかったのか分からない
+        timeline = view.project.timeline
+        view.set_project(
+            view.project.with_timeline(
+                timeline.replace_track(replace(timeline.tracks[0], locked=True))
+            )
+        )
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        received = _received(view)
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        assert not view.insert_paste_at_playhead()
+        assert not received
+        assert any("ロック" in message for message in messages)
+
+
+class TestInsertPastePreference:
+    def test_the_default_pushes_every_track(self) -> None:
+        # Premiere の既定と同じ 貼り先だけを既定にすると、別のトラックの字幕や BGM が黙ってずれる
+        assert Preferences().insert_paste == INSERT_ALL_TRACKS
+        assert Preferences().inserts_on_all_tracks
+
+    def test_it_is_kept_and_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 次の起動で戻ると、選び直すたびに設定画面を開くことになる
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(insert_paste=INSERT_TARGET_TRACKS))
+        assert not store.load().inserts_on_all_tracks
+        store.path.write_text('{"insert_paste": "sideways"}', encoding="utf-8")
+        assert store.load().insert_paste == INSERT_ALL_TRACKS
+
+    @pytest.mark.parametrize("mode", [INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS])
+    def test_the_dialog_carries_it(self, qt_application: QApplication, mode: str) -> None:
+        # 画面が値を返さないと、設定を開いて OK を押しただけで既定へ戻る
+        del qt_application
+        dialog = PreferencesDialog(Preferences(insert_paste=mode))
+        try:
+            assert dialog.preferences().insert_paste == mode
+        finally:
+            dialog.deleteLater()
+
+
 class TestTrackHeight:
     def test_dragging_the_border_resizes_that_track(self, view: TimelineView) -> None:
         received = _received(view)
@@ -167,6 +249,31 @@ class TestWindow:
         assert len(window.document.project.timeline.tracks[0].clips) == 2
         window.undo()
         assert len(window.document.project.timeline.tracks[0].clips) == 1
+
+    def test_ctrl_shift_v_inserts_as_one_undo_step(self, window: MainWindow) -> None:
+        # 押し出しと貼り付けが別の段だと、1 回取り消すと間だけ空いたまま残る
+        action, default = window._actions["編集/貼り付け（挿入）"]
+        assert default == "Ctrl+Shift+V"
+        timeline = window._timeline
+        before = window.document.project
+        timeline.select(before.timeline.tracks[0].clips[0].id)
+        timeline.copy_selected()
+        window.seek(10)
+        action.trigger()
+        spans = sorted(
+            (c.timeline_start, c.timeline_end)
+            for c in window.document.project.timeline.tracks[0].clips
+        )
+        assert spans == [(0, 10), (10, 40), (40, 60)]
+        window.undo()
+        assert window.document.project == before
+
+    def test_the_preference_reaches_the_timeline(self, window: MainWindow) -> None:
+        # 設定画面で選んでも窓が渡さないと、挿入貼り付けは既定のまま全トラックを押す
+        window._apply_preferences(replace(window._preferences, insert_paste=INSERT_TARGET_TRACKS))
+        assert window._timeline._insert_all_tracks is False
+        window._apply_preferences(replace(window._preferences, insert_paste=INSERT_ALL_TRACKS))
+        assert window._timeline._insert_all_tracks is True
 
     def test_a_file_open_in_another_window_is_noticed(
         self, qt_application: QApplication, tmp_path: Path
