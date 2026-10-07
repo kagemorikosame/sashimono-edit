@@ -435,6 +435,14 @@ class ProxyBuilder:
         self._progress: dict[MediaId, float] = {}
         self._running: set[MediaId] = set()
         self._cancelled: set[MediaId] = set()
+        #: 取り消し印の付いた変換が走っている間に、また頼まれた物（素材と知らせ先）
+        #: 走っている変換は控えを残さずに終わるので、終わってから作り直す
+        #: （:class:`~sashimono.engine.cache.analyzer.MediaAnalyzer` と同じ） 捨てると、
+        #: 素材一覧から消してすぐ取り消したときに、控えがいつまでも作られない
+        self._again: dict[
+            MediaId,
+            tuple[MediaItem, Callable[[MediaId], None] | None, Callable[[MediaId], None] | None],
+        ] = {}
         self._closed = False
         #: 画面へ出す進み具合 ``_progress`` は描画の側が 1 本ずつ引くためのもので、
         #: 何本のうち何本目か・失敗したかは持たない
@@ -472,12 +480,25 @@ class ProxyBuilder:
             return
 
         with self._lock:
-            if self._closed or media.id in self._running:
+            if self._closed:
+                return
+            if media.id in self._running:
+                if media.id in self._cancelled:
+                    self._again[media.id] = (media, on_ready, on_progress)
                 return
             self._cancelled.discard(media.id)
             self._running.add(media.id)
             self._progress[media.id] = 0.0
             self._board.start(media.id, media.id)
+        self._launch(media, on_ready, on_progress)
+
+    def _launch(
+        self,
+        media: MediaItem,
+        on_ready: Callable[[MediaId], None] | None,
+        on_progress: Callable[[MediaId], None] | None,
+    ) -> None:
+        """``_running`` に載せた変換を投げる 載せるのは呼ぶ側（:meth:`request` と作り直し）"""
 
         def report(value: float) -> None:
             with self._lock:
@@ -514,9 +535,14 @@ class ProxyBuilder:
             finally:
                 with self._lock:
                     stopped = self._closed or media.id in self._cancelled
-                    self._running.discard(media.id)
                     self._cancelled.discard(media.id)
                     self._progress.pop(media.id, None)
+                    again = self._again.pop(media.id, None)
+                    # 作り直すなら ``_running`` に載せたまま次へ渡す 1 度外してから頼み直すと、
+                    # その間に素材を外された（forget）とき、forget は旧い変換も次の変換も
+                    # 見つけられず、外した素材の控えを作り始める（解析と同じ）
+                    if again is None:
+                        self._running.discard(media.id)
             if stopped:
                 self._board.drop(media.id)
             elif made is None:
@@ -529,12 +555,19 @@ class ProxyBuilder:
             # 控えを切った直後に「控えができた」として描き直しが走る
             if made is not None and not stopped and on_ready is not None:
                 on_ready(media.id)
+            if again is not None:
+                with self._lock:
+                    # 間に外されていれば ``_cancelled`` に入っている 次の変換はすぐ止まる
+                    self._progress[media.id] = 0.0
+                    self._board.start(media.id, media.id)
+                self._launch(*again)
 
         with self._lock:
             # close と同じロックの中で投げる 外で投げると、止めた直後の
             # executor へ投げて RuntimeError になる
             if self._closed:
                 self._running.discard(media.id)
+                self._cancelled.discard(media.id)
                 self._progress.pop(media.id, None)
                 self._board.drop(media.id)
                 return
@@ -545,6 +578,8 @@ class ProxyBuilder:
         with self._lock:
             if media_id in self._running:
                 self._cancelled.add(media_id)
+            # 外した素材を、取り消し中の変換が終わった後に作り直さない
+            self._again.pop(media_id, None)
         self._board.forget(media_id)
 
     def close(self) -> None:
@@ -553,4 +588,5 @@ class ProxyBuilder:
                 return
             self._closed = True
             self._cancelled.update(self._running)
+            self._again.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)
