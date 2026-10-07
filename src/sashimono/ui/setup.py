@@ -26,10 +26,13 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.runtime import (
+    LEFT_RUNNING_NOTE,
     FeaturePack,
     PackStatus,
     install_command,
+    install_result_text,
     install_runtime,
+    pip_left_running,
     refresh_runtime,
     restart_note,
     snapshot_runtime_modules,
@@ -40,6 +43,8 @@ __all__ = ["SetupSection"]
 
 #: 導入ログを拾う間隔（ミリ秒）
 POLL_MS = 120
+#: 戻らずに残った pip が戻ったかを見る間隔（ミリ秒）
+LEFTOVER_POLL_MS = 500
 
 
 class SetupSection(QWidget):
@@ -104,6 +109,10 @@ class SetupSection(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self._poll)
+        #: 前の導入の pip が残っている間だけ回し、戻ったら導入のボタンを押せるように戻す
+        self._leftover_timer = QTimer(self)
+        self._leftover_timer.setInterval(LEFTOVER_POLL_MS)
+        self._leftover_timer.timeout.connect(self._check_leftover)
         self.refresh()
 
     # --- 状態 ---
@@ -135,7 +144,30 @@ class SetupSection(QWidget):
             if size:
                 lines.append(f"ダウンロードは {_readable(size)} ほどです")
         self._status.setText("\n".join(lines))
+        self._block_while_pip_is_left()
         self.changed.emit(status.ready)
+
+    def _block_while_pip_is_left(self) -> bool:
+        """前の導入の pip が残っていれば、導入のボタンを押せなくして再起動を頼む
+
+        押せると、錠を待つだけの導入が始まり、pip が書き換えたままの標準出力やログの上で
+        次の pip が走る 戻れば :meth:`_check_leftover` が押せる状態へ戻す
+        """
+        if not pip_left_running():
+            return False
+        self._button.setEnabled(False)
+        self._extra.setEnabled(False)
+        if LEFT_RUNNING_NOTE not in self._status.text():
+            self._status.setText(f"{self._status.text()}\n{LEFT_RUNNING_NOTE}".strip())
+        self._leftover_timer.start()
+        return True
+
+    def _check_leftover(self) -> None:
+        if pip_left_running() or self.busy:
+            return
+        self._leftover_timer.stop()
+        self._button.setEnabled(True)
+        self.refresh()
 
     def command_text(self) -> str:
         """これから実行するコマンド 画面に見せるため"""
@@ -144,7 +176,7 @@ class SetupSection(QWidget):
     # --- 導入 ---
 
     def start(self) -> None:
-        if self.busy:
+        if self.busy or self._block_while_pip_is_left():
             return
         argv = self._command()
         # pip が上書きする前の読み込み済みの物を、この導入の分として控える
@@ -173,9 +205,7 @@ class SetupSection(QWidget):
                 should_cancel=cancel.is_set,
             )
             self._code = code
-            self._log_queue.put(
-                "導入が完了しました" if code == 0 else f"導入に失敗しました（コード {code}）"
-            )
+            self._log_queue.put(install_result_text(code))
             done.set()
 
         threading.Thread(

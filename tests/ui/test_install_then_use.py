@@ -16,9 +16,12 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono.asr import TranscriptionService
 from sashimono.core.model import MediaItem, Project, Transcript
+from sashimono.runtime import LEFT_RUNNING_NOTE
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.test_runtime_after_install import (
     _fake_installer,
+    _left_running_installer,
+    _LeftPip,
     _slow_cancelled_installer,
     _wait_for,
     frozen,
@@ -93,6 +96,38 @@ class TestTranscribeInstallCancelled:
 
         assert "使えます" not in dialog._status.text()
         assert "導入に失敗しました" in dialog._log.toPlainText()
+        dialog.deleteLater()
+
+
+class TestTranscribeInstallLeftRunning:
+    def test_a_pip_left_running_blocks_the_button_until_it_comes_back(
+        self,
+        frozen: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        qt_application: QApplication,
+        video_media: MediaItem,
+    ) -> None:
+        """字幕起こしの導入の窓も、pip が戻らずに残っている間は導入を押せなくして再起動を頼む"""
+        from sashimono.ui.subtitle import transcribe_dialog
+
+        left = _LeftPip()
+        monkeypatch.setattr(transcribe_dialog, "pip_left_running", left)
+        monkeypatch.setattr(transcribe_dialog, "install_runtime", _left_running_installer(left))
+        service = cast(TranscriptionService, _IdleService())
+        dialog = transcribe_dialog.TranscribeDialog(video_media, service)
+
+        dialog._start_install()
+        _wait_for(lambda: dialog._install_done is None, qt_application)
+
+        assert dialog._install_button.isEnabled() is False
+        assert LEFT_RUNNING_NOTE in dialog._status.text()
+        dialog._start_install()
+        assert dialog._install_done is None
+
+        left.left = False
+        dialog._check_leftover()
+        assert dialog._install_button.isEnabled() is True
+        assert LEFT_RUNNING_NOTE not in dialog._status.text()
         dialog.deleteLater()
 
 

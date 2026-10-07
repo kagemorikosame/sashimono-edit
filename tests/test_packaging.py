@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import io
@@ -13,19 +14,33 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from sashimono import runtime as runtime_module
 from sashimono.app import SELF_CHECK_FLAG, main
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR, default_script_roots
 from sashimono.core.model import Project
-from sashimono.runtime import app_dir, install_command, pip_arguments, run_pip
+from sashimono.runtime import (
+    _HERE_OPTIONS,
+    FeaturePack,
+    app_dir,
+    install_command,
+    install_runtime,
+    pip_arguments,
+    run_pip,
+    run_pip_here,
+)
 from sashimono.selfcheck import CheckResult, format_results, run_self_check
 
 ROOT = Path(__file__).resolve().parent.parent
+#: 試験が子として起こす本物の Python frozen の試験は sys.executable を exe へ差し替える
+REAL_PYTHON = sys.executable
 
 
 @pytest.fixture
@@ -37,6 +52,63 @@ def frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(executable))
     return executable
+
+
+def _refuse_children(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """子のプロセスを起こしたら落とす 配布版の導入と確かめは、もう子を起こさない
+
+    起こそうとした物を返す pip は起こした子の失敗を黙って捨てる所がある（名乗りの rustc）ので、
+    落ちたことだけでなく、起こそうとしたことも見られるようにする
+    """
+    tried: list[object] = []
+
+    def refuse(*arguments: object, **_: object) -> None:
+        tried.append(arguments)
+        raise AssertionError(f"子のプロセスを起こした: {arguments}")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    monkeypatch.setattr(subprocess, "run", refuse)
+    return tried
+
+
+@dataclasses.dataclass
+class StuckPip:
+    """戻らない pip ``entered`` は pip に入った知らせ ``release`` を立てると戻る"""
+
+    entered: threading.Event
+    release: threading.Event
+
+
+def _wait_until_the_pip_is_back() -> None:
+    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ"""
+    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
+    runtime_module._PIP_HERE.release()
+    for _ in range(1000):
+        if not runtime_module.pip_left_running():
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("残った pip の作業スレッドが終わらない")
+
+
+@pytest.fixture
+def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[StuckPip]:
+    """呼ぶと戻らない pip 同期の読み書きの中で止まった pip の代わり
+
+    錠の待ちの中で止まるので、投げ込んだ中断の例外も届かない 試験の後で放して、
+    作業スレッドが錠と標準出力を返すまで待つ 返さないと、後の試験の pip が錠を待ち続け、
+    残った pip がいるとして導入を断られる
+    """
+    stuck_one = StuckPip(threading.Event(), threading.Event())
+
+    def stuck(arguments: list[str]) -> int:
+        stuck_one.entered.set()
+        stuck_one.release.wait()
+        return 1
+
+    monkeypatch.setattr("pip._internal.cli.main.main", stuck)
+    yield stuck_one
+    stuck_one.release.set()
+    _wait_until_the_pip_is_back()
 
 
 @pytest.fixture(scope="module")
@@ -157,6 +229,226 @@ class TestPipInsideThePackage:
 
         assert run_pip(["--version"]) == 0
         assert resources._finder_registry.get(FrozenLoader) is resources.ResourceFinder
+
+
+class TestPipRunsInsideTheApp:
+    """配布版の導入は、exe が自分自身を子として起こさず、このプロセスの中で pip を走らせる
+
+    0.1.3 は導入のたびに exe が自分を ``-m pip`` で子として起こし、子が PyPI から落とした物を
+    書き込んだ 利用者の機械の Windows Defender はこの流れの途中で exe を
+    ``Trojan:Win32/Bearfoos.A!ml`` と見て消した
+    """
+
+    @pytest.fixture
+    def pack(self) -> FeaturePack:
+        return FeaturePack(key="x", label="x", required=("pkg",))
+
+    def test_the_install_button_does_not_start_a_child(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, pack: FeaturePack
+    ) -> None:
+        """導入ボタンのコマンド（exe -m pip）は子を起こさずに pip へ渡す"""
+        called: list[list[str]] = []
+
+        def fake_pip(arguments: list[str]) -> int:
+            called.append(list(arguments))
+            print("Successfully installed pkg")
+            return 0
+
+        _refuse_children(monkeypatch)
+        monkeypatch.setattr("pip._internal.cli.main.main", fake_pip)
+        lines: list[str] = []
+        command = install_command(pack)
+        assert install_runtime(pack, command=command, on_output=lines.append) == 0
+        assert called == [[*_HERE_OPTIONS, *command[3:]]]
+        # pip の出力は今までどおり 1 行ずつ導入の欄へ届く
+        assert "Successfully installed pkg" in lines
+
+    def test_another_program_still_runs_as_a_child(self, frozen: Path) -> None:
+        """exe 自身の pip ではないコマンドは、頼まれたとおり子で走らせる"""
+        lines: list[str] = []
+        code = install_runtime(command=[REAL_PYTHON, "-c", "print('子')"], on_output=lines.append)
+        assert code == 0
+        assert lines[1:] == ["子"]
+
+    def test_a_stuck_pip_does_not_hold_the_install_button(
+        self,
+        frozen: Path,
+        stuck_pip: StuckPip,
+        monkeypatch: pytest.MonkeyPatch,
+        pack: FeaturePack,
+    ) -> None:
+        """導入ボタンの中断は、pip が同期の読み書きの中で戻らなくても少し待って返る
+
+        返らないと、導入の欄は「中断しています」のまま、閉じることも入れ直すこともできない
+        返すときは普通の失敗と分ける（PIP_LEFT_RUNNING） 残った pip は錠と標準出力を
+        握ったままなので、戻るまで次の導入をさせない 戻れば入れ直せる
+        """
+        monkeypatch.setattr(runtime_module, "_CANCEL_GRACE_SECONDS", 0.3)
+        lines: list[str] = []
+        codes: list[int] = []
+        asked = threading.Event()
+        worker = threading.Thread(
+            target=lambda: codes.append(
+                install_runtime(
+                    pack,
+                    command=install_command(pack),
+                    on_output=lines.append,
+                    should_cancel=asked.is_set,
+                )
+            ),
+            daemon=True,
+        )
+        worker.start()
+        assert stuck_pip.entered.wait(10.0)
+        asked.set()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "戻らない pip を待ち続け、導入の欄が返らない"
+        assert codes == [runtime_module.PIP_LEFT_RUNNING]
+        assert any("戻らない" in line for line in lines)
+        assert runtime_module.pip_left_running()
+        # 残っている間の導入は走らせずに断る 錠を待つだけの導入を始めない
+        again: list[str] = []
+        assert runtime_module.run_pip_in_worker(["install"], on_output=again.append) == (
+            runtime_module.PIP_LEFT_RUNNING
+        )
+        assert again == [runtime_module.LEFT_RUNNING_NOTE]
+        # 戻れば入れ直せる
+        stuck_pip.release.set()
+        _wait_until_the_pip_is_back()
+        assert not runtime_module.pip_left_running()
+
+    def test_a_pip_crash_is_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """pip が中で落ちても、導入の作業スレッドごと落とさず、失敗の終了コードで返す
+
+        受けないと例外がスレッドを抜け、導入の欄は導入中のまま止まる
+        """
+
+        def broken(arguments: list[str]) -> int:
+            raise RuntimeError("部品が欠けた")
+
+        monkeypatch.setattr("pip._internal.cli.main.main", broken)
+        lines: list[str] = []
+        assert run_pip_here(["install", "pkg"], on_output=lines.append) != 0
+        assert any("部品が欠けた" in line for line in lines)
+
+    @pytest.mark.parametrize(("exit_code", "expected"), [(2, 2), ("読めない引数", 1)])
+    def test_pip_leaving_with_exit_is_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch, exit_code: object, expected: int
+    ) -> None:
+        """pip は引数が読めないと sys.exit で抜ける 同じプロセスなので受けて終了コードにする"""
+
+        def leave(arguments: list[str]) -> int:
+            raise SystemExit(exit_code)
+
+        monkeypatch.setattr("pip._internal.cli.main.main", leave)
+        assert run_pip_here(["install"]) == expected
+
+    def test_a_failing_pip_is_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("pip._internal.cli.main.main", lambda arguments: 1)
+        assert run_pip_here(["install", "pkg"]) == 1
+
+    def test_a_silent_pip_can_be_cancelled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """黙って落としている pip も、中断を頼めば止まる
+
+        子なら止めれば済んだ 同じプロセスでは作業スレッドへ投げ込まないと、閉じるボタンを
+        押しても導入が終わらない
+        """
+        started = threading.Event()
+
+        def silent(arguments: list[str]) -> int:
+            started.set()
+            for _ in range(6000):
+                threading.Event().wait(0.01)
+            return 0
+
+        monkeypatch.setattr("pip._internal.cli.main.main", silent)
+        lines: list[str] = []
+        codes: list[int] = []
+        asked = threading.Event()
+
+        def run() -> None:
+            codes.append(
+                run_pip_here(["install", "pkg"], on_output=lines.append, should_cancel=asked.is_set)
+            )
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        assert started.wait(10.0)
+        asked.set()
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), "中断を頼んでも導入が終わらない"
+        assert codes and codes[0] != 0
+        assert lines[-1] == "中断した"
+
+    def test_the_process_is_put_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """pip が書き換えるプロセス全体の物を戻す
+
+        pip は 1 回で終わるプロセスのつもりで、logging の根の出力先・警告の出し方・
+        環境変数を書き換えて戻さない 戻さないと、導入の後も編集画面のログや警告が
+        もう誰も読まない pip の出力先へ流れる
+        """
+        import logging
+        import warnings
+
+        root = logging.getLogger()
+        handlers = list(root.handlers)
+        showwarning = warnings.showwarning
+        stdout = sys.stdout
+        monkeypatch.delenv("PIP_NO_INPUT", raising=False)
+
+        def rude(arguments: list[str]) -> int:
+            root.handlers[:] = [logging.StreamHandler(sys.stdout)]
+            warnings.showwarning = lambda *_args, **_kwargs: None
+            os.environ["PIP_NO_INPUT"] = "1"
+            return 0
+
+        monkeypatch.setattr("pip._internal.cli.main.main", rude)
+        assert run_pip_here(["install", "pkg"]) == 0
+        assert root.handlers == handlers
+        assert warnings.showwarning is showwarning
+        assert sys.stdout is stdout
+        assert "PIP_NO_INPUT" not in os.environ
+
+    def test_pip_does_not_start_rustc_for_its_user_agent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """pip は名乗りを作るときに PATH の rustc を子として起こす 同じプロセスで走らせても
+        子が立つ（Rust を入れた機械で確かめたら exe の子として 2 回立った）ので止める
+        """
+        # どの機械でも rustc が見つかる状態を作る 止めなければ下で子を起こして落ちる
+        rustc = tmp_path / "rustc.exe"
+        rustc.write_bytes(b"")
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+        agents: list[str] = []
+
+        def ask_for_the_name(arguments: list[str]) -> int:
+            from pip._internal.network.session import user_agent
+
+            agents.append(user_agent())
+            return 0
+
+        tried = _refuse_children(monkeypatch)
+        monkeypatch.setattr("pip._internal.cli.main.main", ask_for_the_name)
+        assert run_pip_here(["install", "pkg"]) == 0
+        assert agents and "rustc_version" not in agents[0]
+        assert tried == []
+
+    def test_other_threads_do_not_write_into_the_install_log(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pip の間にほかのスレッドが書いた物は導入のログへ混ぜない 標準出力はプロセスに 1 つ"""
+
+        def pip_and_a_neighbour(arguments: list[str]) -> int:
+            neighbour = threading.Thread(target=print, args=("再生の行",))
+            neighbour.start()
+            neighbour.join()
+            print("pip の行")
+            return 0
+
+        monkeypatch.setattr("pip._internal.cli.main.main", pip_and_a_neighbour)
+        lines: list[str] = []
+        assert run_pip_here(["install", "pkg"], on_output=lines.append) == 0
+        assert lines == ["pip の行"]
 
 
 class TestTheSelfCheck:
@@ -1174,6 +1466,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
     def _calls(
         self, monkeypatch: pytest.MonkeyPatch, *extra: str, pip_code: int = 0
     ) -> tuple[list[list[str]], int, list[float]]:
+        """開発の環境の道（子で走らせる）の呼び出しを集める"""
         from sashimono import addon_check
 
         calls: list[list[str]] = []
@@ -1188,10 +1481,33 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         code = main(["sashimono", "--add-on-check", "add-ons", *extra])
         return calls, code, waits
 
+    def _frozen_calls(
+        self, monkeypatch: pytest.MonkeyPatch, *extra: str, pip_code: int = 0
+    ) -> tuple[list[list[str]], list[tuple[str, list[str]]], int]:
+        """配布版の道の pip と読む所の呼び出しを集める 子を起こしたら落とす"""
+        from sashimono import addon_check
+
+        pips: list[list[str]] = []
+        reads: list[tuple[str, list[str]]] = []
+
+        def fake_pip(arguments: list[str], **_: object) -> int:
+            pips.append(list(arguments))
+            return pip_code
+
+        def fake_read(places: str, modules: list[str], write: object = None) -> int:
+            reads.append((places, list(modules)))
+            return 0
+
+        _refuse_children(monkeypatch)
+        monkeypatch.setattr(addon_check, "run_pip_in_worker", fake_pip)
+        monkeypatch.setattr(addon_check, "import_check", fake_read)
+        code = main(["sashimono", "--add-on-check", "add-ons", *extra])
+        return pips, reads, code
+
     def test_the_caller_sets_how_long_each_child_may_take(
-        self, frozen: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """CI は子を待つ秒数を渡す 渡さないと 30 分ずつ待ち、ジョブの制限を超えて要約が残らない"""
+        """CI は段を待つ秒数を渡す 渡さないと 30 分ずつ待ち、ジョブの制限を超えて要約が残らない"""
         from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT
 
         _, code, waits = self._calls(monkeypatch, "300")
@@ -1205,9 +1521,10 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, seconds: str
     ) -> None:
         """読めない秒数を既定に置き換えて走らせない 何も入れずに 2 で終わる"""
-        calls, code, _ = self._calls(monkeypatch, seconds)
+        pips, reads, code = self._frozen_calls(monkeypatch, seconds)
         assert code == 2
-        assert calls == []
+        assert pips == []
+        assert reads == []
 
     def test_a_child_that_takes_too_long_is_written_down(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1220,8 +1537,32 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         monkeypatch.setattr(subprocess, "run", too_long)
         lines: list[str] = []
-        assert addon_check._call(["Sashimono.exe", "-m", "pip"], lines, 7) == 1
+        assert addon_check._call(["python", "-m", "pip"], lines, 7) == 1
         assert lines[0].startswith("[NG] 7 秒で終わらない")
+
+    def test_a_pip_in_the_app_that_takes_too_long_is_stopped_and_written_down(
+        self, frozen: Path, stuck_pip: StuckPip, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """配布版の pip は同じプロセスで走る 同期の読み書きの中で戻らなくても、期限で [NG] を
+        書いて返す
+
+        pip が戻るまで期限を見ないと、[NG] を書く前に外の待ちの制限で exe ごと止められ、
+        CI と組み立ての道具がどの段で止まったかを読めない（PR #254 のレビュー）
+        """
+        from sashimono import addon_check
+
+        monkeypatch.setattr(runtime_module, "_CANCEL_GRACE_SECONDS", 0.3)
+        lines: list[str] = []
+        codes: list[int] = []
+        caller = threading.Thread(
+            target=lambda: codes.append(addon_check._install_here(["install", "x"], lines, 0.2)),
+            daemon=True,
+        )
+        caller.start()
+        caller.join(timeout=10.0)
+        assert not caller.is_alive(), "戻らない pip を期限で切らずに待ち続けた"
+        assert codes == [1]
+        assert lines[-1].startswith("[NG] 0.2 秒で終わらない")
 
     def test_the_exe_pip_installs_what_the_buttons_install(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
@@ -1230,33 +1571,70 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         from sashimono.asr.environment import ASR_PACK
         from sashimono.runtime import install_arguments
 
-        calls, code, _ = self._calls(monkeypatch)
+        pips, _, code = self._frozen_calls(monkeypatch)
         target = Path("add-ons")
         assert code == 0
         # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
-        pip = [str(frozen), "-m", "pip"]
-        assert calls[0] == [*pip, *install_arguments(AI_PACK, target, extra=False)]
-        assert calls[1] == [*pip, *install_arguments(ASR_PACK, target, extra=False)]
-        assert "--only-binary" in calls[0]
-        assert not set(ASR_PACK.extra) & set(calls[1])
+        assert pips[0] == install_arguments(AI_PACK, target, extra=False)
+        assert pips[1] == install_arguments(ASR_PACK, target, extra=False)
+        assert "--only-binary" in pips[0]
+        assert not set(ASR_PACK.extra) & set(pips[1])
 
-    def test_the_import_reads_only_what_was_installed_in_a_new_exe(
+    def test_the_exe_checks_without_starting_itself_again(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """入れた導入先だけを、起動したばかりの別の exe で読む（起動のときと同じ読み方）"""
+        """配布版の確かめは、exe が自分自身を子として起こさない
+
+        自分を ``-m pip`` で起こして PyPI から落とした物を書き込み、さらに別の exe で読む流れの
+        途中で、利用者の機械の Windows Defender が 0.1.3 の exe を Bearfoos.A!ml と見て消した
+        子を起こすと _refuse_children が落とす
+        """
         from sashimono.addon_check import ADD_ON_MODULES
 
-        calls, _, _ = self._calls(monkeypatch)
-        assert calls[-1] == [str(frozen), "--import-check", "add-ons", *ADD_ON_MODULES]
+        pips, reads, code = self._frozen_calls(monkeypatch)
+        assert code == 0
+        assert len(pips) == 2
+        # 入れた導入先だけを、起動のときと同じ読み方でこのプロセスの中で読む
+        assert reads == [("add-ons", list(ADD_ON_MODULES))]
         assert {"claude_agent_sdk", "faster_whisper"} <= set(ADD_ON_MODULES)
+
+    def test_the_read_lines_reach_the_summary(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """同じプロセスで読んだ結果の行も、確かめの要約へ出る 出ないと CI が何で落ちたか読めない"""
+        from sashimono import addon_check
+
+        _refuse_children(monkeypatch)
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        monkeypatch.setattr(addon_check, "run_pip_in_worker", lambda arguments, **_: 0)
+        monkeypatch.setattr(addon_check, "ADD_ON_MODULES", ("sashimono_no_such_add_on",))
+        assert main(["sashimono", "--add-on-check", "add-ons"]) == 1
+        assert "[NG] sashimono_no_such_add_on" in capsys.readouterr().out
+
+    def test_development_still_uses_python_children(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """開発の環境は本物の Python があるので、今までどおり子で入れて、別のプロセスで読む"""
+        from sashimono.addon_check import ADD_ON_MODULES
+
+        calls, code, _ = self._calls(monkeypatch)
+        assert code == 0
+        assert calls[0][:3] == [sys.executable, "-m", "pip"]
+        assert calls[-1] == [
+            sys.executable,
+            "-m",
+            "sashimono",
+            "--import-check",
+            "add-ons",
+            *ADD_ON_MODULES,
+        ]
 
     def test_a_failed_install_is_a_failure(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """入らなければ落とす 確かめずに通すと、導入ボタンが止まる zip を配ることになる"""
-        calls, code, _ = self._calls(monkeypatch, pip_code=1)
+        pips, reads, code = self._frozen_calls(monkeypatch, pip_code=1)
         assert code == 1
-        assert len(calls) == 1
+        assert len(pips) == 1
+        assert reads == []
 
     def test_the_build_tool_asks_the_exe(
         self, builder: ModuleType, monkeypatch: pytest.MonkeyPatch

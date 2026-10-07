@@ -26,6 +26,8 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono import runtime
 from sashimono.runtime import (
+    LEFT_RUNNING_NOTE,
+    PIP_LEFT_RUNNING,
     FeaturePack,
     install_runtime,
     refresh_runtime,
@@ -318,7 +320,62 @@ def _wait_for(done: Callable[[], bool], app: QApplication) -> None:
     assert finished.is_set(), "導入が終わらなかった"
 
 
+class _LeftPip:
+    """前の導入の pip が戻らずに残っているかの差し替え ``left`` を倒すと戻ったことになる"""
+
+    def __init__(self) -> None:
+        self.left = False
+
+    def __call__(self) -> bool:
+        return self.left
+
+
+def _left_running_installer(left: _LeftPip) -> Callable[..., int]:
+    """中断しても pip が戻らず、作業スレッドを残して返す ``install_runtime`` の差し替え"""
+
+    def install(**_: object) -> int:
+        left.left = True
+        return PIP_LEFT_RUNNING
+
+    return install
+
+
 class TestSetupSection:
+    def test_a_pip_left_running_blocks_the_button_until_it_comes_back(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, qt_application: QApplication
+    ) -> None:
+        """中断しても pip が戻らなかったら、戻るまで導入を押せなくして再起動を頼む
+
+        普通の失敗と同じにボタンを戻すと、押した導入は錠を待つだけで、pip が書き換えたままの
+        標準出力やログの上で次の pip が走る（PR #254 のレビュー） 戻れば押せる
+        """
+        from sashimono.ui import setup
+
+        left = _LeftPip()
+        monkeypatch.setattr(setup, "pip_left_running", left)
+        monkeypatch.setattr(setup, "install_runtime", _left_running_installer(left))
+        dist, _module = _unique()
+        section = setup.SetupSection(FeaturePack(key="fake", label="偽物", required=(dist,)))
+        results: list[bool] = []
+        section.finished.connect(results.append)
+
+        section.start()
+        _wait_for(lambda: bool(results), qt_application)
+
+        assert results == [False]
+        assert section._button.isEnabled() is False
+        assert LEFT_RUNNING_NOTE in section._status.text()
+        assert LEFT_RUNNING_NOTE in section._log.toPlainText()
+        # 押せないまま start を呼んでも始めない
+        section.start()
+        assert section.busy is False
+
+        left.left = False
+        section._check_leftover()
+        assert section._button.isEnabled() is True
+        assert LEFT_RUNNING_NOTE not in section._status.text()
+        section.deleteLater()
+
     def test_the_section_reports_ready_right_after_installing(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, qt_application: QApplication
     ) -> None:

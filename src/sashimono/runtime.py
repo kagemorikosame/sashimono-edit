@@ -10,23 +10,35 @@
 パッケージ版（PyInstaller）では ``sys.executable`` がアプリ本体になり、そこへは
 書き込めない その場合は ``--target`` で専用フォルダへ入れ、起動時にそのフォルダを
 ``sys.path`` へ足す :func:`activate_runtime` がその役目を負う
+
+パッケージ版の pip は子を起こさず、アプリのプロセスの中で走らせる（:func:`run_pip_here`）
+前は exe が自分自身を ``-m pip`` で子として起こし、その子が PyPI から落とした物を置き場へ
+書いていた 利用者の機械の Windows Defender はこの動き（自分を子として起こし、落とした物を
+書き込む）の途中で 0.1.3 の exe を ``Trojan:Win32/Bearfoos.A!ml`` と見て消した
 """
 
 from __future__ import annotations
 
 import contextlib
 import importlib
+import io
 import json
+import locale
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import traceback
+import types
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
+from typing import TextIO, cast
 
 from packaging.version import InvalidVersion, Version
 
@@ -34,6 +46,8 @@ from sashimono.core import userdirs
 
 __all__ = [
     "ABI_MARKER",
+    "LEFT_RUNNING_NOTE",
+    "PIP_LEFT_RUNNING",
     "FeaturePack",
     "PackStatus",
     "PackageStatus",
@@ -41,14 +55,18 @@ __all__ = [
     "app_dir",
     "install_arguments",
     "install_command",
+    "install_result_text",
     "install_runtime",
     "is_frozen",
     "pip_arguments",
+    "pip_left_running",
     "python_abi",
     "refresh_runtime",
     "remove_stale_metadata",
     "restart_note",
     "run_pip",
+    "run_pip_here",
+    "run_pip_in_worker",
     "runtime_abi",
     "runtime_target_dir",
     "snapshot_runtime_modules",
@@ -266,9 +284,11 @@ def app_dir() -> Path | None:
 def pip_arguments(argv: Sequence[str]) -> list[str] | None:
     """``Sashimono.exe -m pip ...`` と呼ばれたときの pip への引数 それ以外は ``None``
 
-    パッケージ版には Python の本体が無い 導入ボタンは ``sys.executable -m pip`` を
-    呼ぶが、パッケージ版の ``sys.executable`` は ``Sashimono.exe`` 自身なので、
-    ここで受けて pip を動かさないと、**導入するつもりで Sashimono がもう 1 つ起動する**
+    パッケージ版には Python の本体が無い 導入ボタンが組むコマンドは ``sys.executable -m pip``
+    で、パッケージ版の ``sys.executable`` は ``Sashimono.exe`` 自身 導入ボタンはそれを子として
+    起こさずに読み替えて、このプロセスの中で走らせる（:func:`install_runtime`）
+    手でそう起こされたときも、ここで受けて pip を動かさないと、**pip のつもりで
+    Sashimono がもう 1 つ起動する**
 
     通常の実行では受けない ``sys.executable`` が本物の Python なので、そちらが
     pip を動かす
@@ -619,7 +639,8 @@ def _module_name(entry: Path) -> str | None:
 
 
 def run_pip(arguments: Sequence[str]) -> int:
-    """配布版の中で pip を走らせる :func:`pip_arguments` が受けたときに使う
+    """配布版の中で pip を走らせる 導入（:func:`run_pip_here`）と、:func:`pip_arguments` が
+    受けたとき（``Sashimono.exe -m pip`` と手で起こされた）に使う
 
     pip が中で使う distlib は、同梱の部品（``t64.exe`` など）を
     **読み込み方式ごとの探し方**で見つける PyInstaller の読み込み方式は
@@ -640,6 +661,323 @@ def run_pip(arguments: Sequence[str]) -> int:
     from pip._internal.cli.main import main as pip_main
 
     return int(pip_main(list(arguments)))
+
+
+#: 同じプロセスの中で pip を 1 本ずつ走らせる錠 pip は標準出力・logging の根・警告の出し方・
+#: ロケールをプロセス全体で差し替えるので、字幕起こしと AI 連携の導入を続けて押して 2 本が
+#: 重なると、出力が混ざり、先に終わった方が戻した設定をもう片方が書き換える
+_PIP_HERE = threading.Lock()
+
+#: 同じプロセスで走らせるときに足す pip の指定
+#: 版の確かめは PyPI へもう 1 度つなぎ、控えのファイルを書くだけで、導入には要らない
+#: 尋ねない指定は、配布版に標準入力が無いため 認証を尋ねられると input() が落ちる
+_HERE_OPTIONS = ("--disable-pip-version-check", "--no-input")
+
+#: pip が自分で書く環境変数（``--no-input`` などから） 走り終えたら元に戻す
+_PIP_ENVIRONMENT = ("PIP_NO_INPUT", "PIP_EXISTS_ACTION")
+
+
+class _PipCancelled(KeyboardInterrupt):
+    """中断の頼みを pip の作業スレッドへ投げ込む例外
+
+    KeyboardInterrupt の仲間にするのは、pip がこれを「利用者が止めた」として受け、
+    作業用の一時フォルダを片付けてから終了コードで返すため ほかの型だと、pip は
+    落ちた扱いにして長い traceback をログへ出す
+    """
+
+
+class _PipOutput(io.TextIOBase):
+    """pip の作業スレッドが書いた物だけを 1 行ずつ ``write_line`` へ渡す、標準出力の代わり
+
+    標準出力はプロセスに 1 つなので、書いたスレッドで振り分ける 振り分けないと、pip の間に
+    ほかのスレッド（再生・控え作り）が書いた物まで導入のログへ混ざる ほかのスレッドの分は
+    元の出力へ渡す（窓の無い配布版では元の出力が無いので捨てる）
+    """
+
+    #: pip が使う rich は、これで書ける文字を決める 無いと日本語や罫線を書けない物と見る
+    encoding = "utf-8"
+
+    def __init__(
+        self, fallback: TextIO | None, write_line: Callable[[str], None], owner: int
+    ) -> None:
+        super().__init__()
+        self._fallback = fallback
+        self._write_line = write_line
+        self._owner = owner
+        self._pending = ""
+
+    @property
+    def fallback(self) -> TextIO | None:
+        """元の出口 pip を残して返した後に、ほかの所が直に書くため"""
+        return self._fallback
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, text: str) -> int:
+        if threading.get_ident() != self._owner:
+            if self._fallback is not None:
+                self._fallback.write(text)
+            return len(text)
+        # 子の出力を文字として読んでいた頃と同じく \r も行の終わりに数える
+        self._pending += text.replace("\r\n", "\n").replace("\r", "\n")
+        *lines, self._pending = self._pending.split("\n")
+        for line in lines:
+            self._write_line(line.rstrip())
+        return len(text)
+
+    def flush(self) -> None:
+        if threading.get_ident() != self._owner and self._fallback is not None:
+            self._fallback.flush()
+
+    def finish(self) -> None:
+        """改行で終わらなかった最後の行も渡す 渡さないと、落ちた理由の行が消えることがある"""
+        if self._pending.strip():
+            self._write_line(self._pending.rstrip())
+        self._pending = ""
+
+
+@dataclass(slots=True)
+class _PipLeftovers:
+    """pip がプロセス全体で書き換える物の、走らせる前の値
+
+    pip は 1 回走って終わるプロセスのために書かれていて、走るたびに logging の根の
+    出力先・警告の出し方・ロケール・環境変数を書き換え、戻さない 同じプロセスで走らせると、
+    戻さなければ編集画面のログや警告が pip の出力先（もう誰も読まない）へ流れ続ける
+    """
+
+    stdout: TextIO | None
+    stderr: TextIO | None
+    handlers: list[logging.Handler]
+    level: int
+    showwarning: Callable[..., None]
+    locale_name: str | None
+    environment: dict[str, str | None]
+
+    @classmethod
+    def capture(cls) -> _PipLeftovers:
+        root = logging.getLogger()
+        try:
+            current = locale.setlocale(locale.LC_ALL)
+        except locale.Error:
+            current = None
+        return cls(
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            handlers=list(root.handlers),
+            level=root.level,
+            showwarning=warnings.showwarning,
+            locale_name=current,
+            environment={name: os.environ.get(name) for name in _PIP_ENVIRONMENT},
+        )
+
+    def restore(self) -> None:
+        sys.stdout = cast(TextIO, self.stdout)
+        sys.stderr = cast(TextIO, self.stderr)
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            if handler not in self.handlers:
+                root.removeHandler(handler)
+        for handler in self.handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(self.level)
+        warnings.showwarning = self.showwarning
+        if self.locale_name is not None:
+            # 戻せなくても導入は済んでいる pip が選んだのは機械の既定のロケールで、
+            # 数の書き方が変わるような害は小さい
+            with contextlib.suppress(locale.Error):
+                locale.setlocale(locale.LC_ALL, self.locale_name)
+        for name, value in self.environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _throw_into(thread_id: int, exception: type[BaseException] | None) -> bool:
+    """``thread_id`` のスレッドへ例外を投げ込む ``None`` ならまだ届いていない物を取り消す
+
+    pip は止める口を持たない 子のプロセスなら止めれば済んだが、同じプロセスでは
+    スレッドを外から止めるしかない 投げた例外は Python の行を進めた所で届くので、
+    ネットからの読み込みを待っている間（読み込みには時間切れがある）でも、次の塊で止まる
+    """
+    import ctypes
+
+    payload = ctypes.py_object(exception) if exception is not None else None
+    changed = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), payload)
+    return int(changed) == 1
+
+
+class _CancelGuard:
+    """中断の頼みを見張り、pip が走っている間だけ作業スレッドへ投げ込む
+
+    走り終えた後に投げると、導入の後の片付け（印を書く・状態を見直す）の途中で落ちる
+    投げるのと走り終えるのを同じ錠で並べ、届く前に終わったら取り消す
+    """
+
+    def __init__(self, owner: int) -> None:
+        self._owner = owner
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._finished = False
+        self._thrown = False
+        self.cancelled = False
+
+    def watch(self, ask: Callable[[], bool]) -> None:
+        while not self._done.wait(_CANCEL_POLL_SECONDS):
+            if not ask():
+                continue
+            with self._lock:
+                if self._finished:
+                    return
+                self.cancelled = True
+                self._thrown = _throw_into(self._owner, _PipCancelled)
+            return
+
+    def finish(self) -> None:
+        self._done.set()
+        with self._lock:
+            self._finished = True
+            if self._thrown:
+                _throw_into(self._owner, None)
+                self._thrown = False
+
+
+def _exit_code(code: object) -> int:
+    """``sys.exit`` に渡された物を終了コードにする（Python が終わるときと同じ読み方）"""
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
+def _pip_code(arguments: Sequence[str], write: Callable[[str], None]) -> int:
+    """pip を走らせて終了コードを返す 落ちても例外を外へ出さない
+
+    pip は引数が読めないと ``sys.exit`` で抜け、読み込みで欠けた部品があれば import で落ちる
+    同じプロセスなので、受けないと導入の作業スレッドごと落ち、画面は導入中のまま止まる
+    """
+    try:
+        _no_rustc_probe()
+        return run_pip([*_HERE_OPTIONS, *arguments])
+    except SystemExit as exc:
+        if exc.code is not None and not isinstance(exc.code, int):
+            write(str(exc.code))
+        return _exit_code(exc.code)
+    except Exception as exc:
+        write(f"pip が途中で落ちた: {type(exc).__name__}: {exc}")
+        for line in traceback.format_exc().splitlines():
+            write(line)
+        return 1
+
+
+def _no_rustc_probe() -> None:
+    """pip が名乗りに Rust の版を添えるために ``rustc --version`` を子で起こすのを止める
+
+    pip は PyPI へつなぐ前に名乗り（User-Agent）を作り、PATH に rustc があれば子として
+    起こして版を読む 子を起こさないために同じプロセスで走らせているので、ここで子が立つと
+    意味が薄れる（Rust を入れた機械で確かめたら exe の子として 2 回立った） 名乗りに版が
+    無くても導入は変わらない pip の session の部品の ``shutil`` はこの探しにしか使われて
+    いないので、探しても見つからない物へ差し替える 部品は走り終えたら捨てる
+    （:func:`_forget_pip`）ので、差し替えは残らない pip の作りが変われば何もしない
+    """
+    try:
+        from pip._internal.network import session
+    except ImportError:
+        return
+    if hasattr(session, "shutil"):
+        # setattr で書く pip の型の見え方は機械ごとに違い、直に書くと型の確かめが割れる
+        setattr(session, "shutil", types.SimpleNamespace(which=lambda *_args, **_kwargs: None))  # noqa: B010
+
+
+def _forget_pip() -> None:
+    """読み込んだ pip を捨てる 次の導入は、まっさらに起動した pip と同じ状態で始まる
+
+    pip の部品は、1 回走って終わるつもりで覚えた物（作った出力先・読んだ設定・登録した
+    部品の探し方）を持つ 残したまま 2 回目を走らせると、前の導入で覚えた物で動く
+    """
+    for name in [n for n in sys.modules if n == "pip" or n.startswith("pip.")]:
+        sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+
+
+def _ignore(_: str) -> None:
+    """出力を受けない呼び出しの受け口"""
+
+
+def run_pip_here(
+    arguments: Sequence[str],
+    *,
+    on_output: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> int:
+    """pip を子を起こさずに、呼んだスレッドの中で走らせる 戻り値は終了コード（0 が成功）
+
+    配布版の導入（:func:`install_runtime`）と配る zip の確かめ（``--add-on-check``）が使う
+    前は exe が自分自身を ``-m pip`` で子として起こしていた 自分を子として起こし、PyPI から
+    落とした物を書き込む流れの途中で、利用者の機械の Windows Defender が 0.1.3 の exe を
+    ``Trojan:Win32/Bearfoos.A!ml`` と見て消した 子を起こさなければ、その流れが無くなる
+
+    pip の出力は 1 行ずつ ``on_output`` へ渡す 中断は ``should_cancel`` が真になった所で
+    作業スレッドへ例外を投げ込んで止める（pip に止める口が無いため） pip が落ちても
+    例外は外へ出さず、0 でない終了コードで返す 走った後は、pip が書き換えたプロセス全体の
+    物（標準出力・logging・警告・ロケール・環境変数）を戻し、読み込んだ pip を捨てる
+    """
+    write = on_output if on_output is not None else _ignore
+    waited = False
+    while not _PIP_HERE.acquire(timeout=_CANCEL_POLL_SECONDS):
+        if not waited:
+            waited = True
+            write("ほかの導入が終わるのを待っています")
+        if should_cancel is not None and should_cancel():
+            write("中断した")
+            return 1
+    try:
+        return _run_pip_locked(arguments, write, should_cancel)
+    finally:
+        _PIP_HERE.release()
+
+
+def _run_pip_locked(
+    arguments: Sequence[str],
+    write: Callable[[str], None],
+    should_cancel: Callable[[], bool] | None,
+) -> int:
+    owner = threading.get_ident()
+    saved = _PipLeftovers.capture()
+    stdout = _PipOutput(saved.stdout, write, owner)
+    stderr = _PipOutput(saved.stderr, write, owner)
+    # pip は logging の出力先を、走り始めた時の sys.stdout と sys.stderr で作る
+    sys.stdout = cast(TextIO, stdout)
+    sys.stderr = cast(TextIO, stderr)
+    guard = _CancelGuard(owner)
+    if should_cancel is not None:
+        threading.Thread(
+            target=guard.watch, args=(should_cancel,), name="sashimono-pip-cancel", daemon=True
+        ).start()
+    code = 1
+    try:
+        try:
+            code = _pip_code(arguments, write)
+        finally:
+            guard.finish()
+    except _PipCancelled:
+        # pip の外（部品を読み込んでいる途中など）で届いた 止まったので失敗として返す
+        code = 1
+    finally:
+        stdout.finish()
+        stderr.finish()
+        saved.restore()
+        _forget_pip()
+    if guard.cancelled:
+        write("中断した")
+        return code or 1
+    return code
 
 
 def install_command(
@@ -691,10 +1029,15 @@ def install_runtime(
     should_cancel: Callable[[], bool] | None = None,
     command: Sequence[str] | None = None,
 ) -> int:
-    """``pip`` を子プロセスで走らせる 戻り値は終了コード（0 が成功）
+    """``pip`` を走らせる 戻り値は終了コード（0 が成功）
 
     出力は 1 行ずつ ``on_output`` へ渡す まとめて最後に渡すと、数分間なにも
     起きていないように見える
+
+    配布版で exe 自身の pip を指すコマンド（導入ボタンが組む ``Sashimono.exe -m pip ...``）は、
+    子を起こさずにこのプロセスの中で走らせる（:func:`run_pip_here`） 画面に見せるコマンドは
+    そのまま残す 何を入れるかは同じで、見せ方を変えると開発の環境と食い違う
+    それ以外（開発の環境の ``python -m pip`` など）は子プロセスで走らせる
     """
     if command is None:
         if pack is None:
@@ -711,6 +1054,34 @@ def install_runtime(
         # 今入れた物の印と、入れ直していない機能の古い印が混ざって決められない
         runtime_abi(target)
 
+    own = _own_pip_arguments(argv)
+    if own is not None:
+        code = run_pip_in_worker(own, on_output=on_output, should_cancel=should_cancel)
+    else:
+        code = _run_child(argv, on_output, should_cancel)
+    if code == 0 and target is not None and pack is not None:
+        # 入れ終えたときにだけ書く 途中で止めた導入先に今の印を書くと、前の Python 向けの
+        # 拡張モジュールが残ったまま「合っている」として読まれる
+        _mark_installed(target, pack.key)
+    return code
+
+
+def _own_pip_arguments(argv: Sequence[str]) -> list[str] | None:
+    """配布版で exe 自身の pip を指すコマンドなら、pip への引数 それ以外は ``None``
+
+    先頭が exe 自身のときに限る 別のプログラムを渡されたら、頼まれたとおり子で走らせる
+    """
+    if not argv or argv[0] != sys.executable:
+        return None
+    return pip_arguments(argv)
+
+
+def _run_child(
+    argv: list[str],
+    on_output: Callable[[str], None] | None,
+    should_cancel: Callable[[], bool] | None,
+) -> int:
+    """子プロセスで走らせる 開発の環境の ``python -m pip`` が使う"""
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     # 子プロセスの出力を UTF-8 に揃える Windows の既定は cp932 で、素材やユーザー名に
     # 日本語が入っているとログが文字化けし、失敗の原因が読めなくなる
@@ -761,13 +1132,92 @@ def install_runtime(
     finished.set()
     if cancelled.is_set() and on_output is not None:
         on_output("中断した")
-    code = process.returncode if process.returncode is not None else 1
-    if code == 0 and target is not None and pack is not None:
-        # 入れ終えたときにだけ書く 途中で止めた導入先に今の印を書くと、前の Python 向けの
-        # 拡張モジュールが残ったまま「合っている」として読まれる
-        _mark_installed(target, pack.key)
-    return code
+    return process.returncode if process.returncode is not None else 1
 
 
 #: 導入の中断の頼みを見る間隔（秒） 長いと、閉じるボタンを押してから止まるまでが延びる
 _CANCEL_POLL_SECONDS = 0.1
+
+#: 中断を投げ込んでから pip が戻るのを待つ秒数 投げた例外は Python の行が進んだ所で届くので、
+#: 同期の読み書き（ネットの読み込みなど）の中にいる間は届かない 待ちきれなければ戻らずに返す
+_CANCEL_GRACE_SECONDS = 10.0
+
+#: 中断を投げても pip が戻らず、作業スレッドを残して返したときの終了コード
+#: pip の終了コードは 0 以上なので、負の数なら取り違えない
+PIP_LEFT_RUNNING = -2
+
+#: pip が残っている間に出す案内 残った pip は標準出力・logging・警告を pip の物のまま持ち、
+#: 錠も握っているので、同じ起動の中では入れ直せない
+LEFT_RUNNING_NOTE = "pip が止まらずに残っています アプリを再起動してから導入し直してください"
+
+#: 戻らずに残した pip の作業スレッド 戻れば（標準出力などを戻して錠を返せば）消える
+_LEFTOVERS: list[threading.Thread] = []
+
+
+def pip_left_running() -> bool:
+    """前の導入の pip が戻らずに残っているか
+
+    残っている間は導入の操作を押せなくする 押せると、錠を待つだけの導入が始まり、
+    pip が書き換えたままの標準出力やログの上で次の pip が走る（PR #254 のレビュー）
+    戻れば偽になり、もう一度押せる
+    """
+    _LEFTOVERS[:] = [thread for thread in _LEFTOVERS if thread.is_alive()]
+    return bool(_LEFTOVERS)
+
+
+def install_result_text(code: int) -> str:
+    """導入の終わりに導入のログへ出す 1 行"""
+    if code == 0:
+        return "導入が完了しました"
+    if code == PIP_LEFT_RUNNING:
+        return LEFT_RUNNING_NOTE
+    return f"導入に失敗しました（コード {code}）"
+
+
+def run_pip_in_worker(
+    arguments: Sequence[str],
+    *,
+    on_output: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    grace: float | None = None,
+) -> int:
+    """:func:`run_pip_here` を作業スレッド（daemon）で走らせ、中断を頼まれたら待ちを切って返す
+
+    子のプロセスは起こさない 同じスレッドで走らせると、pip が同期の読み書きの中で戻らない間は
+    中断の例外が届かず、呼んだ側（導入の欄・``--add-on-check`` の時間切れ）も一緒に待ち続ける
+    ``--add-on-check`` では [NG] を書く前に外の待ちの制限で exe ごと止められ、どの段で
+    止まったかが残らない（PR #254 のレビュー）
+
+    中断を頼まれたら pip へ中断を投げ、``grace`` 秒（省けば ``_CANCEL_GRACE_SECONDS``）だけ
+    戻るのを待つ 戻らなければ :data:`PIP_LEFT_RUNNING` を返す 普通の失敗と分けるのは、
+    残った pip が戻るまで（標準出力などを戻して錠を返すまで）次の導入をさせないため
+    （:func:`pip_left_running`） 残った pip は届いた所で止まる daemon なので、
+    ``--add-on-check`` のように返した後でプロセスが終われば一緒に消える
+    残っている間に頼まれたら、走らせずに :data:`PIP_LEFT_RUNNING` を返す
+    """
+    write = on_output if on_output is not None else _ignore
+    if pip_left_running():
+        write(LEFT_RUNNING_NOTE)
+        return PIP_LEFT_RUNNING
+    wait = _CANCEL_GRACE_SECONDS if grace is None else grace
+    asked = threading.Event()
+    result: list[int] = []
+
+    def work() -> None:
+        result.append(run_pip_here(arguments, on_output=write, should_cancel=asked.is_set))
+
+    worker = threading.Thread(target=work, name="sashimono-pip", daemon=True)
+    worker.start()
+    while True:
+        worker.join(_CANCEL_POLL_SECONDS)
+        if not worker.is_alive():
+            return result[0] if result else 1
+        if should_cancel is not None and should_cancel():
+            break
+    asked.set()
+    worker.join(wait)
+    if worker.is_alive():
+        _LEFTOVERS.append(worker)
+        write(f"中断を頼んだが pip が {wait:g} 秒で戻らない 待たずに止めた")
+        return PIP_LEFT_RUNNING
+    return result[0] if result else 1

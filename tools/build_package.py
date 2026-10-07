@@ -917,8 +917,8 @@ def runtime_import_failures(executable: Path, folder: str) -> list[str]:
     """後から入れる部品を、使う人と同じ道で入れて読む **ネットにつなぐ**
 
     入れ方と読み方は exe 自身が持つ（``--add-on-check`` :mod:`sashimono.addon_check`）
-    導入ボタンと同じ引数で exe の pip に一時の導入先へ入れ、起動のときと同じ読み方で
-    別の exe の中で import する CI の確かめ（tools/check_clean_machine.ps1）も同じ口を使う
+    導入ボタンと同じ引数と走らせ方（exe の中の pip 子は起こさない）で一時の導入先へ入れ、
+    起動のときと同じ読み方で import する CI の確かめ（tools/check_clean_machine.ps1）も同じ口を使う
 
     前は開発の .venv の置き場を足して読んでいた 開発の .venv は pip の ``--target`` とは
     並びが違い（pywin32 の DLL の置き場など）、そこに入っている物で組んだ zip は、
@@ -929,7 +929,7 @@ def runtime_import_failures(executable: Path, folder: str) -> list[str]:
     落とさない
     """
     target = Path(folder) / "add-ons"
-    # exe の側は子（機能ごとの pip と読む exe）を 1 つずつ待つ その全部と、exe の起動の分を待つ
+    # exe の側は段（機能ごとの pip と読む所）を 1 つずつ待つ その全部と、exe の起動の分を待つ
     # 先に待ちきれずに止めると、exe が書くはずの [NG] の行が残らない
     children = len(ADD_ON_PACKS) + 1
     result = _run(

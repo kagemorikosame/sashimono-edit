@@ -46,7 +46,10 @@ from sashimono.asr import (
 from sashimono.asr.service import Job
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.runtime import (
+    LEFT_RUNNING_NOTE,
     PackStatus,
+    install_result_text,
+    pip_left_running,
     refresh_runtime,
     restart_note,
     snapshot_runtime_modules,
@@ -125,7 +128,12 @@ class TranscribeDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self._poll)
+        #: 前の導入の pip が残っている間だけ回し、戻ったら導入のボタンを押せるように戻す
+        self._leftover_timer = QTimer(self)
+        self._leftover_timer.setInterval(500)
+        self._leftover_timer.timeout.connect(self._check_leftover)
         self._refresh_availability()
+        self._block_while_pip_is_left()
 
     # --- 組み立て ---
 
@@ -219,7 +227,7 @@ class TranscribeDialog(QDialog):
         # installed ではなく ready を見る 別の Python 向けに入った物は名前の上では入っているが、
         # 起こし始めた所で拡張モジュールが読めずに落ちる
         self._run_button.setEnabled(status.ready)
-        self._install_button.setEnabled(True)
+        self._install_button.setEnabled(not pip_left_running())
         # いつも触れるようにする ここが「GPU 版を入れるか」の選択を兼ねていて、切れば
         # CUDA ランタイム（2 GB 弱）を落とさずに済む 導入済みで CUDA ランタイムが無いときも
         # 印を付けて「環境を更新」を押せば足せる（前は押せず、後から GPU 版にする道が無かった）
@@ -233,6 +241,26 @@ class TranscribeDialog(QDialog):
 
         self._install_button.setText("環境を導入")
         self._describe_install()
+
+    def _block_while_pip_is_left(self) -> bool:
+        """前の導入の pip が残っていれば、導入のボタンを押せなくして再起動を頼む
+
+        押せると、錠を待つだけの導入が始まり、pip が書き換えたままの標準出力やログの上で
+        次の pip が走る 戻れば :meth:`_check_leftover` が押せる状態へ戻す
+        """
+        if not pip_left_running():
+            return False
+        self._install_button.setEnabled(False)
+        if LEFT_RUNNING_NOTE not in self._status.text():
+            self._status.setText(f"{self._status.text()}\n{LEFT_RUNNING_NOTE}".strip())
+        self._leftover_timer.start()
+        return True
+
+    def _check_leftover(self) -> None:
+        if pip_left_running() or self._install_done is not None:
+            return
+        self._leftover_timer.stop()
+        self._refresh_availability()
 
     def _describe_install(self) -> None:
         """これから入るものを出す 何が落ちてくるのか分かってから始められるように"""
@@ -258,7 +286,7 @@ class TranscribeDialog(QDialog):
 
     def _set_busy(self, busy: bool, *, message: str = "") -> None:
         self._run_button.setEnabled(not busy and self._runtime_status().ready)
-        self._install_button.setEnabled(not busy)
+        self._install_button.setEnabled(not busy and not pip_left_running())
         self._model.setEnabled(not busy)
         self._language.setEnabled(not busy)
         self._progress.setVisible(busy)
@@ -270,6 +298,8 @@ class TranscribeDialog(QDialog):
     # --- 導入 ---
 
     def _start_install(self) -> None:
+        if self._block_while_pip_is_left():
+            return
         command = install_command(
             cuda=self._gpu.isChecked(), upgrade=self._runtime_status().needs_upgrade
         )
@@ -298,9 +328,7 @@ class TranscribeDialog(QDialog):
                 should_cancel=cancel.is_set,
             )
             self._install_code = code
-            self._install_log.put(
-                "導入が完了しました" if code == 0 else f"導入に失敗しました（コード {code}）"
-            )
+            self._install_log.put(install_result_text(code))
             done.set()
 
         threading.Thread(target=run, name="sashimono-asr-install", daemon=True).start()
@@ -387,6 +415,7 @@ class TranscribeDialog(QDialog):
         self._refresh_availability()
         if self._install_code == 0:
             self._status.setText(restart_note(loaded, visible=self._runtime_status().installed))
+        self._block_while_pip_is_left()
 
     def _drain_job(self) -> None:
         job = self._job

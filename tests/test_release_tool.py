@@ -70,10 +70,11 @@ def tool() -> ModuleType:
     return module
 
 
-def _zip_bytes(version: str = VERSION, abi: str = "cp314") -> bytes:
+def _zip_bytes(version: str = VERSION, abi: str = "cp314", build: int = 0) -> bytes:
+    """``build`` は組み直した回数 組み直すと exe の中身が変わり、zip の SHA-256 も変わる"""
     path_like = io.BytesIO()
     with zipfile.ZipFile(path_like, "w") as archive:
-        archive.writestr("Sashimono/Sashimono.exe", b"MZ")
+        archive.writestr("Sashimono/Sashimono.exe", b"MZ" + bytes([build]))
         archive.writestr(
             "Sashimono/build-info.json", json.dumps({"version": version, "python_abi": abi})
         )
@@ -119,6 +120,9 @@ class FakeGitHub:
     fail_downloads: set[str] = field(default_factory=set)
     #: ``gh release edit`` の結果（GitHub の側で公開まで済んだか, 終了コード）
     edit_result: tuple[bool, int] = (True, 0)
+    #: Release の run の何回目の試みか ``gh run rerun`` で 1 つ進み、下書きの zip が入れ替わる
+    attempt: int = 1
+    rerun_conclusion: str = "success"
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -171,7 +175,26 @@ class FakeGitHub:
                     runs = []
                 elif count <= self.finish_after.get(name, 0):
                     runs = [{**run, "status": "in_progress", "conclusion": ""} for run in runs]
+                if name == "release.yml":
+                    runs = [{**run, "attempt": self.attempt} for run in runs]
                 return json.dumps(runs), 0
+            case ["gh", "run", "rerun", _]:
+                self.writes.append(args)
+                self.attempt += 1
+                self.files[ZIP] = _zip_bytes(build=self.attempt)
+                return "", 0
+            case ["gh", "run", "view", _, "--json", _]:
+                view = {
+                    "status": "completed",
+                    "conclusion": self.rerun_conclusion,
+                    "attempt": self.attempt,
+                    "url": "https://example.invalid/rerun",
+                }
+                return json.dumps(view), 0
+            case ["gh", "release", "delete-asset", _, name, "-y"]:
+                self.writes.append(args)
+                self.files.pop(name, None)
+                return "", 0
             case ["gh", "release", "view", "beta"]:
                 return "", 0 if self.beta_release else 1
             case ["gh", "release", "view", tag, *_] if tag == TAG:
@@ -215,6 +238,10 @@ class FakeGitHub:
         raise AssertionError(f"偽物が知らない呼び方: {args}")
 
 
+def tool_exe() -> str:
+    return "Sashimono.exe"
+
+
 def _run(commit: str, name: str, conclusion: str = "success") -> dict[str, Any]:
     return {
         "databaseId": 1,
@@ -244,6 +271,9 @@ class World:
     smoke_result: int = 0
     latest: bytes = b""
     passphrase: str = PASSPHRASE
+    #: Defender の検出の記録（読むだけの偽物） ``detect`` の順に、確かめのたびに増やす
+    defender: list[dict[str, Any]] = field(default_factory=list)
+    detect: list[bool] = field(default_factory=list)
 
     def ask(self, prompt: str) -> str:
         return self.answers.pop(0) if self.answers else ""
@@ -254,7 +284,23 @@ class World:
 
     def smoke(self, archive: Path, home: Path) -> int:
         self.smoked.append(archive)
+        if self.detect and self.detect.pop(0):
+            self.defender.append(
+                {
+                    "id": f"{{{len(self.defender)}}}",
+                    "threat_id": "2147731250",
+                    "threat": "Trojan:Win32/Bearfoos.A!ml",
+                    "time": "2026-10-07T07:48:03+09:00",
+                    "resources": [
+                        f"file:_C:\\temp\\sashimono-zip-check-x\\Sashimono\\{tool_exe()}"
+                    ],
+                }
+            )
+            return 1
         return self.smoke_result
+
+    def detections(self) -> list[dict[str, Any]]:
+        return list(self.defender)
 
     def launch(self, executable: Path) -> int:
         self.launched.append(executable)
@@ -276,19 +322,20 @@ class World:
         argv = [VERSION, *extra]
         if key:
             argv += ["--key", str(self.key)]
-        code: int = tool.main(
-            argv,
-            root=self.root,
-            run=self.github,
-            ask=self.ask,
-            secret=self.secret,
-            sleep=lambda _seconds: None,
-            fetch=self.fetch,
-            smoke=self.smoke,
-            launch=self.launch,
-            collect=self.collect,
-            **overrides,
-        )
+        parts: dict[str, Any] = {
+            "root": self.root,
+            "run": self.github,
+            "ask": self.ask,
+            "secret": self.secret,
+            "sleep": lambda _seconds: None,
+            "fetch": self.fetch,
+            "smoke": self.smoke,
+            "launch": self.launch,
+            "collect": self.collect,
+            # 本物の Defender の記録は読まない
+            "detections": self.detections,
+        }
+        code: int = tool.main(argv, **{**parts, **overrides})
         return code
 
     @property
@@ -773,6 +820,147 @@ def _uploads(world: World, tag: str = TAG) -> list[list[str]]:
         for args in world.github.writes
         if args[:4] == ["gh", "release", "upload", tag]
     ]
+
+
+def _rebuilds(world: World) -> list[list[str]]:
+    return [args for args in world.github.writes if args[:3] == ["gh", "run", "rerun"]]
+
+
+class TestAFalseDetectionByDefender:
+    """6 の確かめで Defender に誤検出されたら、普通の失敗と分け、y なら組み直して 4 から続ける
+
+    利用者の機械（見本を送る既定の設定）で通った exe は、ほかの人の機械でも通る見込みが高い
+    0.1.3 と 0.1.4 の作り直しの 1 つは、ここで Bearfoos.A!ml として消された
+    """
+
+    def test_a_detection_is_rebuilt_on_yes_and_the_clean_build_is_published(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        first = world.github.files[ZIP]
+        world.detect = [True, False]
+        # 組み直す・GL で描けた・公開する
+        world.answers = ["y", "y", "y"]
+        assert world.main(tool) == 0
+        out = capsys.readouterr().out
+        assert "[誤検出] Defender に誤検出された（1 回目）: Trojan:Win32/Bearfoos.A!ml" in out
+        writes = world.github.writes
+        assert ["gh", "release", "delete-asset", TAG, ZIP, "-y"] in writes
+        assert len(_rebuilds(world)) == 1
+        assert len(world.smoked) == 2
+        assert world.published
+        # 署名したのは組み直した zip
+        manifest = json.loads(world.github.files["update.json"])
+        assert manifest["package"]["sha256"] == hashlib.sha256(world.github.files[ZIP]).hexdigest()
+        assert world.github.files[ZIP] != first
+        # 検出された zip は消さずに残し、場所と SHA-256 を記録に書く（Microsoft への報告に使う）
+        record = json.loads(
+            (world.root / "dist" / "release" / tool.DETECTIONS_NAME).read_text(encoding="utf-8")
+        )
+        assert record[0]["sha256"] == hashlib.sha256(first).hexdigest()
+        assert Path(record[0]["zip"]).read_bytes() == first
+        assert record[0]["threats"] == ["Trojan:Win32/Bearfoos.A!ml"]
+        assert record[0]["sha256"] in out
+
+    def test_no_to_the_rebuild_question_stops_without_publishing(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        world.detect = [True]
+        world.answers = ["n", "y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "組み直さずに止めた" in out
+        assert _rebuilds(world) == [] and not world.published and world.secrets == []
+
+    def test_it_stops_after_the_limit_and_points_to_the_report(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """組み直しても通らない exe はコード署名か報告でしか直らない 上限で尋ねずに止める"""
+        folder = world.root / "dist" / "release"
+        folder.mkdir(parents=True)
+        earlier = [{"version": VERSION, "sha256": str(n)} for n in range(tool.REBUILD_LIMIT)]
+        (folder / tool.DETECTIONS_NAME).write_text(json.dumps(earlier), encoding="utf-8")
+        world.detect = [True]
+        world.answers = ["y", "y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert f"{tool.REBUILD_LIMIT} 回組み直しても誤検出された" in out
+        assert tool.SUBMISSION_URL in out
+        assert world.answers == ["y", "y", "y"]
+        assert _rebuilds(world) == [] and not world.published
+
+    def test_an_ordinary_failure_does_not_offer_a_rebuild(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """自己診断の [NG] は組み直しても直らない 組み直しを勧めずに止める"""
+        world.smoke_result = 1
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "誤検出" not in out and "zip からの確かめが通らない" in out
+        assert world.answers == ["y", "y"]
+        assert _rebuilds(world) == []
+
+    def test_a_signed_draft_is_not_rebuilt(
+        self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """署名した目録が上がった下書きは組み直さない 組み直すと署名と SHA-256 が食い違う"""
+        _signed(world, tool, tmp_path)
+        world.detect = [True]
+        world.answers = ["y", "y", "y"]
+        assert world.main(tool, key=False) == 1
+        out = capsys.readouterr().out
+        assert "署名した目録がある" in out
+        assert _rebuilds(world) == []
+        assert not any(
+            args[:3] == ["gh", "release", "delete-asset"] for args in world.github.writes
+        )
+        assert not world.published
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="WinError は Windows だけ")
+    def test_an_exe_windows_refuses_to_start_is_a_detection(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """隔離された exe を起こすと WinError 225 検出の記録が読めなくても誤検出と見る"""
+
+        def refused(archive: Path, home: Path) -> int:
+            raise OSError(22, "ウイルスが含まれている", str(home), tool.VIRUS_WINERROR)
+
+        world.answers = ["n"]
+        assert world.main(tool, smoke=refused) == 1
+        out = capsys.readouterr().out
+        assert "[誤検出]" in out and "exe を起こせない" in out
+
+    def test_an_exe_that_disappeared_is_a_detection(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def quarantined(archive: Path, home: Path) -> int:
+            (home / tool_exe()).unlink()
+            return 1
+
+        world.answers = ["n"]
+        assert world.main(tool, smoke=quarantined) == 1
+        assert "展開した exe が消えた" in capsys.readouterr().out
+
+    def test_a_detection_after_a_passing_check_still_stops(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """確かめが通った直後に隔離されることがある 通っても記録が増えていれば出さない"""
+
+        def passes_then_detected(archive: Path, home: Path) -> int:
+            world.detect = [True]
+            world.smoke(archive, home)
+            return 0
+
+        world.answers = ["n", "y", "y"]
+        assert world.main(tool, smoke=passes_then_detected) == 1
+        assert "[誤検出]" in capsys.readouterr().out
+        assert not world.published
+
+    def test_other_detections_are_not_taken_for_ours(self, tool: ModuleType) -> None:
+        """前からある・ほかのファイルの検出の記録は数えない"""
+        assert tool.ours({"resources": ["file:_C:\\x\\Sashimono\\Sashimono.exe"]})
+        assert not tool.ours({"resources": ["file:_C:\\Downloads\\crack.exe"]})
+        assert not tool.ours({})
 
 
 class TestTheCheckAndSignature:
