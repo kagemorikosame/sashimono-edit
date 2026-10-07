@@ -906,6 +906,7 @@ def _fake_conversation(panel: QWidget) -> None:
     if not isinstance(panel, ChatPanel):
         raise ShotError("AI パネルではない")
     panel._show_parts(False)
+    panel._choices.setVisible(True)
     panel._login_box.setVisible(False)
     panel._input.setEnabled(True)
     panel._send_button.setEnabled(True)

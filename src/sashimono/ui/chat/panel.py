@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTextBrowser,
     QToolButton,
@@ -260,7 +261,12 @@ class ChatPanel(QWidget):
         # 名前と欄の組ごとに折り返す 1 列に並べると、モデルの名前の欄と深さの欄の幅の和が
         # AI のパネルの最小の幅になり、設定パネルと重ねた右の列が 1366 の画面で広がりすぎた
         # 組を崩さないのは、欄だけが次の行へ落ちると、どの名前の欄か読めなくなるため
-        choices = FlowLayout()
+        # 並びは部品に入れて、AI の部品が入っていない間は隠す 入れる前はモデルを選んでも
+        # 送れず、導入の欄と並びの両方が開いていると、窓の最小の高さが 1280x720 の画面で
+        # 大きい書体の余白を食う（並びは狭い所で折り返し、その行の分まで高さを取る）
+        self._choices = QWidget(self)
+        choices = FlowLayout(self._choices)
+        choices.setContentsMargins(0, 0, 0, 0)
         for text, box in (("モデル", self._model), ("考える深さ", self._effort)):
             pair = QWidget(self)
             pair_layout = QHBoxLayout(pair)
@@ -303,11 +309,20 @@ class ChatPanel(QWidget):
         parts_header.addWidget(parts_title)
         parts_header.addStretch(1)
         parts_header.addWidget(self._parts_close)
+        # 導入の欄は巻物に入れる 未導入の間は欄が開いたままで、説明の行とボタンの全部の
+        # 高さが窓の最小の高さに足され、1280x720 の画面で大きい書体の余白を食った（CI で
+        # 窓の最小が 556 画素） 広い所では全部が見え、狭い所ではボタン 1 行分まで縮んで巻ける
+        self._parts_scroll = QScrollArea(self._parts_box)
+        self._parts_scroll.setWidgetResizable(True)
+        self._parts_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._parts_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._parts_scroll.setWidget(self._setup)
+        self._parts_scroll.setMinimumHeight(self._parts_close.sizeHint().height())
         parts_layout = QVBoxLayout(self._parts_box)
-        parts_layout.setContentsMargins(8, 4, 8, 8)
-        parts_layout.setSpacing(4)
+        parts_layout.setContentsMargins(6, 2, 6, 4)
+        parts_layout.setSpacing(2)
         parts_layout.addLayout(parts_header)
-        parts_layout.addWidget(self._setup)
+        parts_layout.addWidget(self._parts_scroll)
         # 開け閉めは覚えない 毎回閉じた状態で始める（使えない間だけは開いたまま）
         self._parts_box.setVisible(False)
 
@@ -428,7 +443,7 @@ class ChatPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-        layout.addLayout(choices)
+        layout.addWidget(self._choices)
         layout.addWidget(self._parts_box)
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
@@ -446,6 +461,7 @@ class ChatPanel(QWidget):
         # 使えない間は導入の欄が入口なので開いたままにし、閉じられないようにする
         self._parts_close.setVisible(ready)
         self._parts_button.setEnabled(ready)
+        self._choices.setVisible(ready)
         self._show_parts(not ready)
         self._input.setEnabled(ready)
         self._send_button.setEnabled(ready)
