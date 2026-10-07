@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -86,19 +86,40 @@ class StuckPip:
 _CLEANUP_SECONDS = 120.0
 
 
-def _wait_until_the_pip_is_back(seconds: float = _CLEANUP_SECONDS) -> None:
-    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ"""
+#: 後始末で、待つだけで終わらないスレッドへ中断を投げ込むまでの秒数
+_CLEANUP_PATIENCE_SECONDS = 2.0
+
+
+def _wait_until_the_pip_is_back(
+    started: Collection[threading.Thread] = (), seconds: float = _CLEANUP_SECONDS
+) -> None:
+    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ
+
+    ``started`` は試験の中で起こしたスレッド 名前で選ばずに全部待つ 試験が自分で起こした
+    名前の無いスレッドが ``run_pip_here`` を呼び、錠を取る前に試験が落ちると、名前でも錠でも
+    見えないまま後始末を抜け、偽の pip と ``PIP_NO_INDEX`` が戻った後で本物の pip を
+    走らせうる（PR #267 のレビュー） 少し待っても終わらなければ、中断を投げ込んでから待つ
+    """
     deadline = time.monotonic() + seconds
+    patience = time.monotonic() + _CLEANUP_PATIENCE_SECONDS
+    asked = False
     while True:
         workers = [
             thread
-            for thread in threading.enumerate()
-            if thread.name == "sashimono-pip" and thread.is_alive()
+            for thread in (*started, *threading.enumerate())
+            if thread.is_alive() and (thread in started or thread.name == "sashimono-pip")
         ]
         if not workers and not runtime_module.pip_left_running():
             break
+        if not asked and time.monotonic() > patience:
+            # 中断の要求を出してから待つ 導入ボタンの中断と同じ例外なので、pip の中なら
+            # 片付けて返り、錠を待っている所なら錠を取らずに抜ける
+            asked = True
+            for thread in workers:
+                if thread.ident is not None:
+                    runtime_module._throw_into(thread.ident, runtime_module._PipCancelled)
         if time.monotonic() > deadline:
-            raise AssertionError("残った pip の作業スレッドが終わらない")
+            raise AssertionError(f"残ったスレッドが終わらない: {[t.name for t in workers]}")
         threading.Event().wait(0.01)
     assert runtime_module._PIP_HERE.acquire(timeout=max(0.0, deadline - time.monotonic())), (
         "止まった pip が錠を返さない"
@@ -118,8 +139,9 @@ def no_pip_left_behind(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     本物の pip が走ったときに外へ取りに行かせない守り
     """
     monkeypatch.setenv("PIP_NO_INDEX", "1")
+    before = set(threading.enumerate())
     yield
-    _wait_until_the_pip_is_back()
+    _wait_until_the_pip_is_back([t for t in threading.enumerate() if t not in before])
 
 
 #: 同じプロセスで走らせる道が、偽の pip（``pip._internal.cli.main.main``）に入る前に読む部品
