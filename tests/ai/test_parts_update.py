@@ -624,7 +624,7 @@ class TestPanelGuidance:
         assert started == [True]
         assert _Session.made[0].closed is True
         assert widget._update_box.isHidden() is True
-        assert widget._setup.isHidden() is False
+        assert widget._parts_box.isHidden() is False
 
     def test_the_setup_section_forces_an_upgrade_when_asked(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch

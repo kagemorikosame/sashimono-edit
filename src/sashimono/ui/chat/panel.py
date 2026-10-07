@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -48,6 +49,7 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.ui.chat.parts_updater import PartsUpdater
+from sashimono.ui.disclosure import DisclosureButton
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors, theme_signals, themed_style
@@ -268,10 +270,46 @@ class ChatPanel(QWidget):
             choices.addWidget(pair)
         # 使える間は導入の欄を隠しているので、手で更新を確かめる入口をここに置く
         # 組と同じく折り返すので、狭い窓でもパネルの最小の幅は広がらない
-        self._parts_button = QPushButton("AI の部品…", self)
-        self._parts_button.setToolTip("入れてある AI の部品の版を見て、新しい版を確かめる・入れる")
-        self._parts_button.clicked.connect(self._toggle_setup)
+        # 開け閉めのボタンだと分かる見た目にする（押し込まれた見た目・▸ ▾ の印）
+        self._parts_button = DisclosureButton(
+            "AI の部品", "AI の部品の版と更新を開く / 閉じる", self
+        )
+        self._parts_button.toggled.connect(self._on_parts_toggled)
         choices.addWidget(self._parts_button)
+
+        # 導入の欄を「AI の部品」のまとまりとして枠で囲み、見出しと閉じる印を付ける
+        # 枠が無いと、開いた欄がどのボタンの物か・どこまでが欄かが分からない
+        self._parts_box = QFrame(self)
+        self._parts_box.setObjectName("ai_parts_box")
+        themed_style(
+            self._parts_box,
+            lambda: (
+                f"QFrame#ai_parts_box {{ border: 1px solid {Colors.BORDER.name()};"
+                " border-radius: 3px; }"
+            ),
+        )
+        parts_title = QLabel("AI の部品", self._parts_box)
+        title_font = parts_title.font()
+        title_font.setBold(True)
+        parts_title.setFont(title_font)
+        self._parts_close = QToolButton(self._parts_box)
+        self._parts_close.setText("×")
+        self._parts_close.setToolTip("閉じる")
+        self._parts_close.setAccessibleName("AI の部品を閉じる")
+        self._parts_close.setAutoRaise(True)
+        self._parts_close.clicked.connect(lambda: self._show_parts(False))
+        parts_header = QHBoxLayout()
+        parts_header.setContentsMargins(0, 0, 0, 0)
+        parts_header.addWidget(parts_title)
+        parts_header.addStretch(1)
+        parts_header.addWidget(self._parts_close)
+        parts_layout = QVBoxLayout(self._parts_box)
+        parts_layout.setContentsMargins(8, 4, 8, 8)
+        parts_layout.setSpacing(4)
+        parts_layout.addLayout(parts_header)
+        parts_layout.addWidget(self._setup)
+        # 開け閉めは覚えない 毎回閉じた状態で始める（使えない間だけは開いたまま）
+        self._parts_box.setVisible(False)
 
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない
@@ -391,7 +429,7 @@ class ChatPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         layout.addLayout(choices)
-        layout.addWidget(self._setup)
+        layout.addWidget(self._parts_box)
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._approval_box)
@@ -405,7 +443,10 @@ class ChatPanel(QWidget):
     def _refresh_availability(self) -> None:
         status = self._setup.status
         ready = status.ready
-        self._setup.setVisible(not ready)
+        # 使えない間は導入の欄が入口なので開いたままにし、閉じられないようにする
+        self._parts_close.setVisible(ready)
+        self._parts_button.setEnabled(ready)
+        self._show_parts(not ready)
         self._input.setEnabled(ready)
         self._send_button.setEnabled(ready)
         # 入っていない間はログインの話をしない 導入の案内と重なって読みにくい
@@ -417,19 +458,25 @@ class ChatPanel(QWidget):
         self._refresh_availability()
         if not succeeded:
             # 使える状態のまま失敗すると欄ごと隠れ、何が起きたかのログが読めなくなる
-            self._setup.setVisible(True)
+            self._show_parts(True)
         elif self._setup.note:
             # 使える状態になると導入欄ごと隠れるので、再起動の要る・要らないの
             # 案内は会話の欄へ写す 写さないと、読めないまま消える
             self._say("案内", self._setup.note)
         self._refresh_status()
 
-    def _toggle_setup(self) -> None:
-        """導入の欄を出し入れする 使える間も、版を見て更新を確かめられるように"""
-        showing = not self._setup.isHidden()
-        if showing and not self._setup.status.ready:
-            return  # 使えない間は導入の欄が入口なので隠さない
-        self._setup.setVisible(not showing)
+    def _on_parts_toggled(self, opened: bool) -> None:
+        """〔AI の部品〕を押した 使える間も、版を見て更新を確かめられるように欄を出し入れする"""
+        if not opened and not self._setup.status.ready:
+            # 使えない間は導入の欄が入口なので閉じさせない
+            self._show_parts(True)
+            return
+        self._parts_box.setVisible(opened)
+
+    def _show_parts(self, opened: bool) -> None:
+        """「AI の部品」の欄を開く・閉じる ボタンの押下の見た目と印も合わせる"""
+        self._parts_box.setVisible(opened)
+        self._parts_button.set_open(opened)
 
     def update_parts(self) -> None:
         """AI の部品を新しい版へ入れ替える（手で押した〔AI の部品を更新〕）
@@ -451,7 +498,7 @@ class ChatPanel(QWidget):
         self._retrying = False
         self._stop_button.setEnabled(False)
         self._update_box.setVisible(False)
-        self._setup.setVisible(True)
+        self._show_parts(True)
         self._setup.start(upgrade=True)
         if self._setup.busy:
             self._input.setEnabled(False)
@@ -772,7 +819,7 @@ class ChatPanel(QWidget):
             if REINSTALL_HINT in event.text:
                 # 入れ直す所（環境の導入の欄）は、導入済みのときは隠している 出さないと、
                 # 案内された「環境を更新」がどこにも無い
-                self._setup.setVisible(True)
+                self._show_parts(True)
         elif event.kind is EventKind.TURN_DONE or event.kind is EventKind.CLOSED:
             self._turns_done += 1
             self._close_checkpoint()

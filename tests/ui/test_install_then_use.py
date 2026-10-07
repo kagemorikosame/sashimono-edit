@@ -191,7 +191,7 @@ class TestAssistantAfterInstall:
         assert results == [True]
         assert panel._input.isEnabled() is True
         assert panel._send_button.isEnabled() is True
-        assert panel._setup.isHidden() is True
+        assert panel._parts_box.isHidden() is True
         # ログインがまだなので、その案内が出る
         assert panel._login_box.isHidden() is False
         # 導入欄は隠れるので、再起動の要る・要らないの案内は会話の欄に残す
