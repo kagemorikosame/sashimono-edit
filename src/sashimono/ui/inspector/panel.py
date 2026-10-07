@@ -81,6 +81,8 @@ from sashimono.core.model import (
 from sashimono.effects import (
     CheckSpec,
     FileSpec,
+    FontSpec,
+    FontStyleSpec,
     GridSpec,
     ParameterSpec,
     TextSpec,
@@ -93,6 +95,7 @@ from sashimono.engine.gpu import BlendMode
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import (
+    FontStyleEditor,
     ParameterEditor,
     TextEditor,
     TrackEditor,
@@ -404,7 +407,7 @@ class InspectorPanel(QWidget):
             return None
         track, clip = located
         picture, sound = self._picture_and_sound(track, clip)
-        source: tuple[str, frozenset[str], frozenset[str]] | None = None
+        source: tuple[str, frozenset[str], frozenset[tuple[str, str]]] | None = None
         if clip.source is not None:
             definition = source_registry.get(clip.source.kind)
             unused = (
@@ -412,10 +415,11 @@ class InspectorPanel(QWidget):
                 if definition is not None
                 else frozenset()
             )
-            # 灰色にする欄も構成に入れる 組み方を変えたときに欄を作り直さないと、
-            # 折り返しの幅が灰色のまま（または使えないのに触れるまま）残る
+            # 灰色にする欄と理由も構成に入れる 組み方やスタイルを変えたときに欄を作り直さないと、
+            # 折り返しの幅や太字が灰色のまま（または使えないのに触れるまま）残る
+            # 理由まで入れるのは、同じ欄の理由だけが変わったときに添え書きを古いまま残さないため
             locked = (
-                frozenset(definition.locked_reasons(clip.source.params))
+                frozenset(definition.locked_reasons(clip.source.params).items())
                 if definition is not None
                 else frozenset()
             )
@@ -699,11 +703,14 @@ class InspectorPanel(QWidget):
         path: ParamPath,
         value: ParamValue | None,
         locked: str | None = None,
+        *,
+        note: bool = True,
     ) -> None:
         """パラメータ 1 つの行 名前（ダブルクリックで初期値）・入力欄・キーフレームの ◀ ◆ ▶
 
         ``locked`` は今の設定では効かない理由 欄を灰色にして、理由を吹き出しと欄の下に出す
         触れるままにすると、動かしても絵が変わらず壊れたように見える
+        ``note`` が偽なら欄の下の添え書きは出さない（続く欄が同じ理由で、そちらに出すとき）
         """
         editor = self._make_editor(spec, path, value)
         controls = self._keyframe_controls(spec, path, value)
@@ -713,7 +720,7 @@ class InspectorPanel(QWidget):
             if controls is not None:
                 controls.setEnabled(False)
         section.add_row(label, editor, controls, reset=self._resetter(spec, path))
-        if locked is not None:
+        if locked is not None and note:
             section.add_note(locked)
 
     def _fixed_header(self, section: _Section, clip: Clip, effects: Sequence[Effect]) -> None:
@@ -1040,16 +1047,38 @@ class InspectorPanel(QWidget):
             )
         unused = definition.unused_names(clip.source.params)
         locked = definition.locked_reasons(clip.source.params)
-        for spec in definition.parameters:
-            if spec.name in unused:
-                continue
+        shown = _styles_under_fonts([s for s in definition.parameters if s.name not in unused])
+        for index, spec in enumerate(shown):
             path = ParamPath.of_source(clip.id, spec.name)
             value = clip.source.params.get(spec.name)
             if clip.is_group:
                 self._group_row(section, spec, path, value)
                 continue
-            self._param_row(section, spec.label, spec, path, value, locked.get(spec.name))
+            reason = locked.get(spec.name)
+            # 続く欄（太字と斜体）が同じ理由なら、添え書きは最後の 1 つの下にだけ出す
+            # 1 行ずつ出すと、同じ文が 2 度並ぶ
+            following = shown[index + 1].name if index + 1 < len(shown) else None
+            note = reason is not None and locked.get(following or "") != reason
+            self._param_row(section, spec.label, spec, path, value, reason, note=note)
+            editor = self._editors[_editor_key(path)]
+            family = definition.spec(spec.font) if isinstance(spec, FontStyleSpec) else None
+            if isinstance(family, FontSpec) and isinstance(editor, FontStyleEditor):
+                self._follow_family(editor, family, clip)
         return section
+
+    def _follow_family(self, editor: FontStyleEditor, family: FontSpec, clip: Clip) -> None:
+        """スタイルの欄の一覧を、今のフォントのファミリに合わせ続ける
+
+        フォントを替えても欄の構成は変わらない（作り直さない）ので、値を入れ直す道で
+        ファミリも渡す 渡さないと、前のファミリのスタイルが並んだまま残る
+        """
+
+        def refresh(current: Clip) -> None:
+            if current.source is not None:
+                editor.set_family(family.coerce(current.source.params.get(family.name)))
+
+        refresh(clip)
+        self._refreshers.append(refresh)
 
     def _group_row(
         self, section: _Section, spec: ParameterSpec, path: ParamPath, value: ParamValue | None
@@ -1810,6 +1839,24 @@ class _FocusPlace:
 def _editor_key(path: ParamPath) -> tuple[str, str]:
     """入力欄と ◀ ◆ ▶ を引く鍵（エフェクトの ID か持ち主の種類, 名前）"""
     return str(path.effect_id or path.target.value), path.name
+
+
+def _styles_under_fonts(specs: Sequence[ParameterSpec]) -> list[ParameterSpec]:
+    """スタイルの欄を、選ぶ元のフォントの欄のすぐ下へ動かした並び
+
+    定義ではスタイルを末尾に置いている（足した項目で既存の並びを動かさないため）
+    そのまま並べると、フォントの欄から 20 行ほど離れた底に出て、見つけられない
+    フォントの欄が無い（隠れている）ときは定義の位置のまま
+    """
+    names = {spec.name for spec in specs}
+    moved = [s for s in specs if isinstance(s, FontStyleSpec) and s.font in names]
+    ordered: list[ParameterSpec] = []
+    for spec in specs:
+        if spec in moved:
+            continue
+        ordered.append(spec)
+        ordered.extend(s for s in moved if s.font == spec.name)
+    return ordered
 
 
 class _RowLabel(QLabel):

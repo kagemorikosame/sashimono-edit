@@ -21,6 +21,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontDatabase,
     QFontMetricsF,
     QImage,
     QPainter,
@@ -532,12 +533,7 @@ def _text_layers(
     text = _revealed(raw, values)
     if not text:
         return None
-    font = QFont(str(values.get("font", "Yu Gothic UI")))
-    font.setPixelSize(size)
-    # AviUtl2 の組み方の太字は、細字の輪郭を自分で太らせる（:func:`_emboldened`）
-    # Qt に太字を頼むと太り方も送り幅も AviUtl2 と違う
-    font.setBold(bold and not aviutl)
-    font.setItalic(bool(values.get("italic", False)))
+    font = _text_font(values, size)
     letter_spacing = float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
     # AviUtl2 の字間は文字と文字の間にだけ入る（自分で足す） Qt に頼むと最後の字の
     # 後ろにも入り、3 文字の行が字間 1 つ分広く、中央揃えで半分だけ左へ寄る
@@ -589,7 +585,8 @@ def _text_layers(
         baseline = top + line_height * index + metrics.ascent()
         placed = QPainterPath()
         placed.addText(QPointF(x, baseline), font, line)
-        if bold:
+        # 太字の欄ではなくフォントを見る スタイルを選んでいると太字の欄は読まない
+        if font.bold():
             plain = QPainterPath()
             plain_x = start(plain_metrics.horizontalAdvance(line), plain_widest)
             plain.addText(QPointF(plain_x, baseline), plain_font, line)
@@ -623,6 +620,31 @@ def _bold_drift(plain: QPainterPath, bold: QPainterPath) -> float:
     if plain_box.isEmpty() or bold_box.isEmpty():
         return 0.0
     return plain_box.center().x() - bold_box.center().x()
+
+
+def _text_font(values: Mapping[str, object], size: int) -> QFont:
+    """標準の組み方（横書きと縦書き）で使うフォント
+
+    スタイル（``font_style``）が空なら、ファミリ名に太字と斜体を掛ける今までの描き方
+    空でなければスタイルの名前で字を選び、太字と斜体は読まない（設定パネルも灰色にする
+    :func:`sashimono.effects.sources._text_locked`） 太さを持つスタイルへ太字を重ねると
+    二重に太くなる
+
+    そのファミリに無いスタイル（フォントを入れていない機械で開いた・ファミリを替えた）は
+    渡さずに既定のスタイルで描く Qt へそのまま渡すと、名前の似た別のスタイルを探したり
+    ファミリごと別の書体へ替えたりして、どの字で出るかが機械ごとに変わる
+    """
+    family = str(values.get("font", "Yu Gothic UI"))
+    font = QFont(family)
+    font.setPixelSize(size)
+    style = str(values.get("font_style", "") or "")
+    if style:
+        if style in QFontDatabase.styles(family):
+            font.setStyleName(style)
+        return font
+    font.setBold(bool(values.get("bold", False)))
+    font.setItalic(bool(values.get("italic", False)))
+    return font
 
 
 #: AviUtl2 の既定の書体 書体名が見つからないときもこれで描く

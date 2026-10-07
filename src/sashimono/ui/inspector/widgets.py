@@ -38,6 +38,7 @@ from sashimono.effects import (
     ColorSpec,
     FileSpec,
     FontSpec,
+    FontStyleSpec,
     GridSpec,
     ParameterSpec,
     SelectSpec,
@@ -49,8 +50,10 @@ from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = [
+    "FONT_STYLE_DEFAULT_LABEL",
     "NUMBER_WIDTH",
     "TYPING_MERGE_SECONDS",
+    "FontStyleEditor",
     "ParameterEditor",
     "TextEditor",
     "TrackEditor",
@@ -659,6 +662,70 @@ class FontEditor(ParameterEditor):
             self._updating = False
 
 
+#: スタイルの欄の先頭 空文字（ファミリ名だけで選ぶ今までの描き方）に当たる
+FONT_STYLE_DEFAULT_LABEL = "既定"
+#: 選んでいるスタイルが今のファミリに無いときに名前へ添える
+_MISSING_STYLE_SUFFIX = "（このフォントに無い）"
+
+
+class FontStyleEditor(ParameterEditor):
+    """フォントのファミリの中のスタイル（太さの段階など）を選ぶ欄 先頭は「既定」
+
+    選べるスタイルはファミリで決まるので、設定パネルが :meth:`set_family` で今の
+    ファミリを渡す 値だけを持つ欄にすると、ファミリを替えたときに一覧が古いまま残る
+    """
+
+    def __init__(self, spec: FontStyleSpec, parent: QWidget | None = None) -> None:
+        super().__init__(spec, parent)
+        self._spec = spec
+        self._family = ""
+        self._value = spec.default_value()
+        self._box = QComboBox(self)
+        # フォントの欄と同じく、長いスタイル名（Sitka の「Subheading Semibold Italic」など）で
+        # 設定パネルの最小の幅を広げない
+        narrow_combo(self._box, 10)
+        self._box.currentIndexChanged.connect(
+            lambda index: self._emit(str(self._box.itemData(index)))
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._box, 1)
+        self._fill()
+
+    def set_family(self, family: str) -> None:
+        """一覧を ``family`` のスタイルで作り直す 同じファミリなら触らない（開いた一覧が閉じる）"""
+        if family == self._family:
+            return
+        self._family = family
+        self._fill()
+
+    def set_value(self, value: ParamValue | None) -> None:
+        text = self._spec.coerce(value)
+        if text == self._value:
+            return
+        self._value = text
+        self._fill()
+
+    def _fill(self) -> None:
+        from PySide6.QtGui import QFontDatabase
+
+        # 可変フォント（源ノ角ゴシック VF など）は同じ名前のスタイルを 2 度返す
+        styles = list(dict.fromkeys(QFontDatabase.styles(self._family))) if self._family else []
+        self._updating = True
+        try:
+            self._box.clear()
+            self._box.addItem(FONT_STYLE_DEFAULT_LABEL, "")
+            for style in styles:
+                self._box.addItem(style, style)
+            if self._value and self._value not in styles:
+                # 消すと、開いただけで選んでいたスタイルが分からなくなる 描く所は既定で描く
+                self._box.addItem(self._value + _MISSING_STYLE_SUFFIX, self._value)
+            self._box.setCurrentIndex(max(0, self._box.findData(self._value)))
+        finally:
+            self._updating = False
+
+
 class FileEditor(ParameterEditor):
     def __init__(self, spec: FileSpec, parent: QWidget | None = None) -> None:
         super().__init__(spec, parent)
@@ -764,6 +831,8 @@ def create_editor(spec: ParameterSpec, parent: QWidget | None = None) -> Paramet
         return TextEditor(spec, parent)
     if isinstance(spec, FontSpec):
         return FontEditor(spec, parent)
+    if isinstance(spec, FontStyleSpec):
+        return FontStyleEditor(spec, parent)
     if isinstance(spec, FileSpec):
         return FileEditor(spec, parent)
     if isinstance(spec, GridSpec):
