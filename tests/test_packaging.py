@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -80,15 +81,45 @@ class StuckPip:
     release: threading.Event
 
 
-def _wait_until_the_pip_is_back() -> None:
+#: 試験の後で、残った pip が戻るのを待つ秒数 試験の中身の待ちではなく後始末の待ちなので
+#: 長めに取る 待ちきれずに次の試験へ進むと、残った pip が次の試験の差し替えの上で走る
+_CLEANUP_SECONDS = 120.0
+
+
+def _wait_until_the_pip_is_back(seconds: float = _CLEANUP_SECONDS) -> None:
     """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ"""
-    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
-    runtime_module._PIP_HERE.release()
-    for _ in range(1000):
-        if not runtime_module.pip_left_running():
-            return
+    deadline = time.monotonic() + seconds
+    while True:
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "sashimono-pip" and thread.is_alive()
+        ]
+        if not workers and not runtime_module.pip_left_running():
+            break
+        if time.monotonic() > deadline:
+            raise AssertionError("残った pip の作業スレッドが終わらない")
         threading.Event().wait(0.01)
-    raise AssertionError("残った pip の作業スレッドが終わらない")
+    assert runtime_module._PIP_HERE.acquire(timeout=max(0.0, deadline - time.monotonic())), (
+        "止まった pip が錠を返さない"
+    )
+    runtime_module._PIP_HERE.release()
+
+
+@pytest.fixture(autouse=True)
+def no_pip_left_behind(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """試験どうしで pip の作業スレッドと錠を持ち越させない 本物の PyPI へもつながせない
+
+    混んだ CI で、戻らない pip の試験が待ちきれずに落ちると、残った作業スレッドが次の試験の
+    錠の待ちに割り込み、走り終えて pip を ``sys.modules`` から捨てた（Issue #264）
+    次の試験が差し替えた偽の pip は捨てた方の部品に付いていたので、次の試験は本物の pip で
+    PyPI から ``pkg`` を開発の環境へ入れてしまった ``monkeypatch`` を頼むので、差し替えを
+    戻す前に（偽の pip のまま）残った pip が戻るのを待てる ``PIP_NO_INDEX`` は、それでも
+    本物の pip が走ったときに外へ取りに行かせない守り
+    """
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    yield
+    _wait_until_the_pip_is_back()
 
 
 #: 同じプロセスで走らせる道が、偽の pip（``pip._internal.cli.main.main``）に入る前に読む部品
