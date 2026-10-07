@@ -271,6 +271,9 @@ class ValueLineEditor:
         self._redraw = redraw
         #: 線を出すか 設定（:attr:`Preferences.value_lines`）で切れる
         self.enabled = True
+        #: これより細いクリップには線を描かず、掴ませもしない ビューが設定から合わせる
+        #: （:meth:`TimelineView.set_detail_min_width`）
+        self.detail_min_width = DETAIL_MIN_WIDTH
         #: 音量の線に切り替えたクリップ 画面の都合なのでプロジェクトには残さない
         self._volume_shown: set[ClipId] = set()
         self._drag: _Drag | None = None
@@ -400,7 +403,7 @@ class ValueLineEditor:
         self, project: Project, layout: TimelineLayout, width: int, clip: Clip, position: QPoint
     ) -> tuple[ValueKind, QRect] | None:
         """押せる線があれば、出している値と線の範囲"""
-        if clip.duration * layout.pixels_per_frame < DETAIL_MIN_WIDTH:
+        if clip.duration * layout.pixels_per_frame < self.detail_min_width:
             # 細いクリップは名前も線も描かない（:meth:`TimelineView.paintEvent`）
             return None
         band = layout.band_at(project.timeline, position.y())

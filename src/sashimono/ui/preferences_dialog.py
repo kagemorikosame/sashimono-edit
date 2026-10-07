@@ -44,6 +44,7 @@ from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
     AUTO_QUALITY_HEIGHT,
+    DETAIL_MIN_WIDTHS,
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
     MEDIA_SPLIT,
@@ -366,6 +367,16 @@ class PreferencesDialog(QDialog):
             "音付きの動画は右クリックでどちらの線を出すか切り替える"
         )
         form.addRow(self._value_lines)
+        self._detail_min_width = QSpinBox(self)
+        self._detail_min_width.setRange(*DETAIL_MIN_WIDTHS)
+        self._detail_min_width.setSuffix(" px")
+        self._detail_min_width.setValue(preferences.detail_min_width)
+        self._detail_min_width.setToolTip(
+            "タイムラインでこれより細いクリップは、名前・サムネイル・波形を描かず細い帯にする "
+            "細い帯には絵の平均の色と音の大きさだけを描き、マウスを載せると名前と長さが出る "
+            "下げると引いた表示でも中身を細かく見られ、上げると短いクリップが多いときに描くのが軽い"
+        )
+        form.addRow("中身を描くクリップの最小の幅", self._detail_min_width)
 
         self._double_click_reset = QCheckBox("設定パネルの名前のダブルクリックで初期値に戻す", self)
         self._double_click_reset.setChecked(preferences.double_click_reset)
@@ -617,6 +628,7 @@ class PreferencesDialog(QDialog):
             preview_handles=self._preview_handles.isChecked(),
             keyframe_drag=str(self._keyframe_drag.currentData()),
             value_lines=self._value_lines.isChecked(),
+            detail_min_width=self._detail_min_width.value(),
             double_click_reset=self._double_click_reset.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
