@@ -27,6 +27,8 @@ CI のまっさらな Windows（.github/workflows/package.yml の clean-machine�
      日本語のフォルダへ入れて import する（Sashimono.exe --add-on-check ネットにつなぐ）
      導入ボタンと同じく exe は自分を子として起こさず、自分の中で走らせる 0.1.3 は自分を子として
      起こす流れの途中で、利用者の機械の Defender に消された
+  9. exe のプロパティ（版情報）に製品名と版が入っていること 版は zip の build-info.json と同じ
+     （コード署名の条件で、署名する exe の製品名と版をそろえる Issue #255）
 
 結果は -Report のフォルダ（ログと窓の写真）と、GITHUB_STEP_SUMMARY（あれば）へ書く
 1 つでも落ちたら終了コード 1
@@ -105,6 +107,32 @@ $AppHome = Join-Path $Place 'Sashimono'
 $Exe = Join-Path $AppHome 'Sashimono.exe'
 if (-not (Test-Path -LiteralPath $Exe)) { throw "展開した zip に Sashimono.exe が無い: $Exe" }
 Note "展開した先: $Exe"
+
+# --- exe のプロパティ（版情報） ---
+# コード署名（SignPath Issue #255）の条件で、署名する exe の製品名と版をそろえる 組み立てで
+# 入れ忘れても exe は動くので、配る zip の exe を読んで確かめる
+# 版は zip の build-info.json（組み立てが __version__ から書いた物）と比べる 製品名は
+# tools/build_package.py の PRODUCT_NAME と同じ（揃っているかは tests/test_packaging.py が見る）
+$ExpectedProduct = 'Sashimono Edit'
+$BuildInfo = Get-Content -LiteralPath (Join-Path $AppHome 'build-info.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$VersionInfo = (Get-Item -LiteralPath $Exe).VersionInfo
+$ExpectedVersionInfo = [ordered]@{
+    ProductName      = $ExpectedProduct
+    ProductVersion   = $BuildInfo.version
+    FileVersion      = $BuildInfo.version
+    OriginalFilename = 'Sashimono.exe'
+    InternalName     = 'Sashimono'
+}
+foreach ($entry in $ExpectedVersionInfo.GetEnumerator()) {
+    $actual = $VersionInfo.($entry.Key)
+    if ($actual -cne $entry.Value) { Fail "exe の版情報の $($entry.Key) が '$actual'（'$($entry.Value)' のはず）" }
+}
+foreach ($name in @('FileDescription', 'CompanyName', 'LegalCopyright')) {
+    if (-not $VersionInfo.$name) { Fail "exe の版情報の $name が空" }
+}
+Note ('exe の版情報: ' + ((@('ProductName', 'ProductVersion', 'FileVersion', 'FileDescription', 'CompanyName',
+                'LegalCopyright', 'OriginalFilename', 'InternalName') |
+            ForEach-Object { "$_=$($VersionInfo.$_)" }) -join ' / '))
 
 # 走らせる前の実の置き場 終わった後に Sashimono の物が増えていないかを見る
 $RealPlaces = @($env:APPDATA, $env:LOCALAPPDATA) | Where-Object { $_ } |

@@ -6,6 +6,7 @@ r"""配る zip を作る
 やること
 
 1. PyInstaller で ``Sashimono.exe`` と部品一式（``_internal``）を組み立てる
+   exe のプロパティには製品名と版（``__version__``）を入れる（``version_info_text``）
 2. PyInstaller がプラグインごと積んだ Qt の部品のうち、使わない物を外す
    （``UNUSED_QT_PARTS`` 外した物を読む物が残っていれば止まる）
 3. 組み立ての記録から、積んだファイルがどの包みから来たかを辿り、包みごとの
@@ -76,6 +77,115 @@ APP_NAME = "Sashimono"
 #: 配る zip の名前の頭 ダウンロードのフォルダで見つけやすいよう製品名（Sashimono Edit）
 #: から付ける 展開したフォルダ（APP_NAME）とは別に持つ
 ARCHIVE_PREFIX = "SashimonoEdit"
+
+#: exe のプロパティ（版情報）に出す製品名 コード署名（SignPath Issue #255）の条件で、
+#: 署名する exe の製品名と版をそろえる clean-machine（check_clean_machine.ps1）も同じ名前を
+#: 照らすので、変えるときは両方を直す（揃っているかは試験が見る）
+PRODUCT_NAME = "Sashimono Edit"
+
+#: タスク マネージャーやエクスプローラーで、製品名の代わりに出ることがある説明
+FILE_DESCRIPTION = "Sashimono Edit video editor"
+
+#: 版情報の置き場 ``--clean`` が消すのは作業フォルダの下の ``Sashimono`` だけなので、
+#: その外（作業フォルダの直下）へ書く
+VERSION_FILE_NAME = "version_info.txt"
+
+#: 版情報の言語と文字コード 英語（米国 0x0409）と Unicode（1200） 文言を英語で書くので、
+#: 日本語の Windows でも同じ文言が出る
+_VERSION_LANGUAGE = 0x0409
+_VERSION_CODEPAGE = 1200
+
+#: 版情報の印 試験版（``0.2.0b1`` など）は「プレリリース」を立てる（VS_FF_PRERELEASE）
+_VS_FF_PRERELEASE = 0x2
+
+
+def copyright_line(license_text: str) -> str:
+    """LICENSE の著作権の行 版情報の LegalCopyright と CompanyName の出どころ
+
+    個人名を書かず、LICENSE の持ち主（プロジェクトの貢献者）に揃える 二か所に書くと、
+    LICENSE を直したときに exe のプロパティだけ古いまま残る
+    """
+    found = re.search(r"^Copyright \(c\) \d{4}(?:-\d{4})? (.+)$", license_text, re.MULTILINE)
+    if found is None:
+        raise ValueError("LICENSE に Copyright (c) <年> <持ち主> の行が無い")
+    return found[0].strip()
+
+
+def version_numbers(version: str) -> tuple[int, int, int, int]:
+    """版の数字を、版情報の固定の欄（4 つの 16 ビット）へ写す
+
+    固定の欄は数字しか持てないので、試験版の印（b1 など）は落とし、文字の欄
+    （ProductVersion・FileVersion）にタグと同じ形で残す
+    """
+    from packaging.version import Version
+
+    release = Version(version).release
+    if len(release) > 4 or any(part > 0xFFFF for part in release):
+        raise ValueError(f"{version} は版情報の 4 つの 16 ビットの欄に入らない")
+    padded = (*release, 0, 0, 0, 0)[:4]
+    return (padded[0], padded[1], padded[2], padded[3])
+
+
+def version_info_text(version: str, license_text: str) -> str:
+    """PyInstaller の ``--version-file`` に渡す版情報（VSVersionInfo の書き方）
+
+    入れないと exe のプロパティが空のまま配られ、署名した後の発行元の表示と製品名・版が
+    食い違う 版の出どころは ``__version__`` の 1 か所なので、ここで書き写さずに引数で受ける
+    """
+    from packaging.version import Version
+
+    numbers = version_numbers(version)
+    flags = _VS_FF_PRERELEASE if Version(version).is_prerelease else 0
+    notice = copyright_line(license_text)
+    owner = notice.split(maxsplit=3)[3]
+    strings = [
+        ("CompanyName", owner),
+        ("FileDescription", FILE_DESCRIPTION),
+        ("FileVersion", version),
+        ("InternalName", APP_NAME),
+        ("LegalCopyright", notice),
+        ("OriginalFilename", f"{APP_NAME}.exe"),
+        ("ProductName", PRODUCT_NAME),
+        ("ProductVersion", version),
+    ]
+    table = f"{_VERSION_LANGUAGE:04X}{_VERSION_CODEPAGE:04X}"
+    translation = f"[{_VERSION_LANGUAGE}, {_VERSION_CODEPAGE}]"
+    # 文字の欄は repr で書く PyInstaller はこの書き方を Python の式として読むので、
+    # 引用符や逆斜線を含む値でも壊れない
+    entries = ",\n".join(f"          StringStruct({key!r}, {value!r})" for key, value in strings)
+    return (
+        "VSVersionInfo(\n"
+        "  ffi=FixedFileInfo(\n"
+        f"    filevers={numbers!r},\n"
+        f"    prodvers={numbers!r},\n"
+        "    mask=0x3f,\n"
+        f"    flags={flags:#x},\n"
+        # Windows 用の 32 ビットの窓のアプリ（VOS_NT_WINDOWS32）で、アプリ（VFT_APP）
+        "    OS=0x40004,\n"
+        "    fileType=0x1,\n"
+        "    subtype=0x0,\n"
+        "    date=(0, 0),\n"
+        "  ),\n"
+        "  kids=[\n"
+        "    StringFileInfo([\n"
+        f"      StringTable({table!r}, [\n"
+        f"{entries},\n"
+        "      ])\n"
+        "    ]),\n"
+        f"    VarFileInfo([VarStruct('Translation', {translation})]),\n"
+        "  ],\n"
+        ")\n"
+    )
+
+
+def write_version_file(work: Path) -> Path:
+    """版情報を作業フォルダへ書く 組み立てのたびに ``__version__`` と LICENSE から作り直す"""
+    path = work / VERSION_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = version_info_text(__version__, (ROOT / "LICENSE").read_text(encoding="utf-8"))
+    path.write_text(text, encoding="utf-8")
+    return path
+
 
 #: 同梱しないもの 追加機能（字幕起こし・AI 連携）は画面のボタンから後で入れる
 #: 開発機に入っていると PyInstaller が拾ってしまい、zip が 2 GB を超える
@@ -356,6 +466,9 @@ def pyinstaller_arguments(work: Path, dist: Path) -> list[str]:
         APP_NAME,
         "--icon",
         str(ROOT / "src" / "sashimono" / "resources" / "sashimono.ico"),
+        # 製品名と版を exe のプロパティへ入れる 中身は main が組み立ての前に書く
+        "--version-file",
+        str(work / VERSION_FILE_NAME),
         "--paths",
         str(ROOT / "src"),
         "--workpath",
@@ -1006,6 +1119,7 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
     if not args.skip_build:
         import PyInstaller.__main__
 
+        write_version_file(work)
         with _without_developer_path():
             PyInstaller.__main__.run(pyinstaller_arguments(work, dist))
     if not (bundle / f"{APP_NAME}.exe").exists():

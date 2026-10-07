@@ -19,6 +19,7 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -1350,6 +1351,76 @@ def test_the_bundled_pictures_are_collected(builder: ModuleType) -> None:
     arguments = builder.pyinstaller_arguments(Path("work"), Path("dist"))
     index = arguments.index("--collect-data")
     assert arguments[index + 1] == "sashimono.resources"
+
+
+class TestTheExeCarriesItsVersion:
+    """exe のプロパティ（版情報）に製品名と版が入る
+
+    コード署名（SignPath Issue #255）の条件で、署名する exe の製品名と版をそろえる
+    抜けると exe のプロパティが空のまま配られ、署名した後の表示と食い違う
+    """
+
+    @staticmethod
+    def _strings(builder: ModuleType, version: str, tmp_path: Path) -> tuple[Any, dict[str, str]]:
+        # PyInstaller が組み立てで読むのと同じ読み方で読む 書き方を誤れば組み立てで初めて落ちる
+        versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")
+        path = tmp_path / "version_info.txt"
+        path.write_text(
+            builder.version_info_text(version, (ROOT / "LICENSE").read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        info = versioninfo.load_version_info_from_text_file(str(path))
+        table = info.kids[0].kids[0]
+        return info, {entry.name: entry.val for entry in table.kids}
+
+    def test_the_version_comes_from_the_single_source(
+        self, builder: ModuleType, tmp_path: Path
+    ) -> None:
+        """版は ``__version__`` と同じ形（タグから ``v`` を除いた物） 製品名は固定"""
+        from sashimono import __version__
+
+        info, strings = self._strings(builder, __version__, tmp_path)
+        assert strings["ProductVersion"] == __version__
+        assert strings["FileVersion"] == __version__
+        assert strings["ProductName"] == "Sashimono Edit"
+        assert strings["OriginalFilename"] == "Sashimono.exe"
+        assert strings["InternalName"] == "Sashimono"
+        assert strings["FileDescription"]
+        numbers = builder.version_numbers(__version__)
+        assert info.ffi.fileVersionMS == (numbers[0] << 16) | numbers[1]
+        assert info.ffi.productVersionLS == (numbers[2] << 16) | numbers[3]
+
+    def test_the_owner_follows_the_license(self, builder: ModuleType, tmp_path: Path) -> None:
+        """著作権の表記と会社名は LICENSE の持ち主 個人名を書かず、二か所に書き写さない"""
+        _, strings = self._strings(builder, "1.0.0", tmp_path)
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        assert strings["LegalCopyright"] in license_text.splitlines()
+        assert strings["LegalCopyright"].endswith(strings["CompanyName"])
+
+    def test_a_beta_keeps_its_mark_in_the_text(self, builder: ModuleType, tmp_path: Path) -> None:
+        """試験版は文字の欄にタグと同じ形を残し、固定の欄はプレリリースの印を立てる"""
+        info, strings = self._strings(builder, "0.2.0b1", tmp_path)
+        assert strings["ProductVersion"] == "0.2.0b1"
+        assert builder.version_numbers("0.2.0b1") == (0, 2, 0, 0)
+        assert info.ffi.fileFlags & 0x2
+
+    def test_a_version_too_long_for_the_fields_is_refused(self, builder: ModuleType) -> None:
+        """固定の欄は 4 つの 16 ビット 入らない版を黙って切り詰めない"""
+        with pytest.raises(ValueError):
+            builder.version_numbers("1.2.3.4.5")
+        with pytest.raises(ValueError):
+            builder.version_numbers("70000.0")
+
+    def test_the_build_asks_for_the_version_file(self, builder: ModuleType) -> None:
+        arguments = builder.pyinstaller_arguments(Path("work"), Path("dist"))
+        index = arguments.index("--version-file")
+        assert Path(arguments[index + 1]) == Path("work") / builder.VERSION_FILE_NAME
+
+    def test_the_clean_machine_checks_the_same_name(self, builder: ModuleType) -> None:
+        """CI のまっさらな機械は、配る zip の exe の版情報を同じ製品名で照らす"""
+        script = (ROOT / "tools" / "check_clean_machine.ps1").read_text(encoding="utf-8-sig")
+        assert f"$ExpectedProduct = '{builder.PRODUCT_NAME}'" in script
+        assert "(Get-Item -LiteralPath $Exe).VersionInfo" in script
 
 
 def _values(arguments: list[str], flag: str) -> set[str]:

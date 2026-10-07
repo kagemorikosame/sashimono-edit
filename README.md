@@ -482,6 +482,13 @@ PR は**フェーズ単位**で、CodeRabbit・Copilot・Sourcery・Codex の 4 
 入っています GPL と LGPL の部品（FFmpeg・x264・x265・Qt など）の対応するソースは、zip と
 同じ [Release](../../releases) に添付します
 
+## コード署名と個人情報の扱い
+
+配る `Sashimono.exe` のコード署名の方針（署名する物・役割）と、アプリが通信する所の一覧
+（更新の確かめ・後から入れる部品の導入・字幕起こしのモデル・AI アシスタント 何を送り、どう切るか）は
+[Code signing policy（コード署名の方針）](docs/code-signing-policy.md) にあります
+使い方の統計や利用者を見分ける値は集めません
+
 ## 色の扱い
 
 いま扱うのは **SDR の sRGB / Rec.709 だけ**です HDR（PQ / HLG）と広色域（Rec.2020・
