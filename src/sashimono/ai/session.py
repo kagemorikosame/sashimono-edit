@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -26,7 +27,16 @@ from sashimono.ai.models import effort_for
 from sashimono.ai.server import SERVER_NAME, build_server
 from sashimono.core.model import LayerMode
 
-__all__ = ["SYSTEM_PROMPT", "AgentEvent", "AgentSession", "EventKind", "system_prompt"]
+__all__ = [
+    "SYSTEM_PROMPT",
+    "UPDATE_PARTS_LABEL",
+    "AgentEvent",
+    "AgentSession",
+    "EventKind",
+    "OutdatedClaudeCode",
+    "outdated_claude_code",
+    "system_prompt",
+]
 
 #: 置き方の方式ごとの、素材の絵と音の持ち方の説明 :func:`system_prompt` が差し込む
 #: 方式を取り違えて伝えると、混合の作品で AI がリンクした音声クリップを探し回ったり、
@@ -235,6 +245,16 @@ class AgentSession:
         thread = self._thread
         if wait and thread is not None:
             thread.join(timeout=5.0)
+
+    def wait_closed(self, timeout: float = 30.0) -> None:
+        """畳み終わる（Claude Code が終わる）のを待つ 画面のスレッドからは呼ばない
+
+        部品の入れ替えの前に、裏のスレッドから呼ぶ Windows では動いている claude.exe を
+        動かせないので、待たないと入れ替えが失敗する
+        """
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
 
     # --- エージェントスレッド ---
 
@@ -447,6 +467,51 @@ def _missing_part(exc: BaseException) -> str | None:
         )
     what = module or str(exc)
     return f"アシスタントの部品 {what} を読めませんでした {REINSTALL_HINT}"
+
+
+#: 同梱の Claude Code が古くて選んだモデルを使えないときの文面（Claude Code 2.1.259 で実際に出た）
+#: 「API Error: 400 Claude Code 2.1.259 does not support this model; version 2.1.280 or newer
+#: is required Run 'claude update', ...」 版の数字は拾えれば拾い、拾えなくても見分ける
+_OUTDATED_CLI = re.compile(
+    r"Claude Code\s+(?P<current>\d+(?:\.\d+)+)?\s*does not support this model"
+    r"(?:.*?version\s+(?P<required>\d+(?:\.\d+)+)\s+or newer)?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: 古い部品を入れ替えるボタンの名前 案内の文と画面のボタンで同じ言葉を使う
+UPDATE_PARTS_LABEL = "AI の部品を更新"
+
+
+@dataclass(frozen=True, slots=True)
+class OutdatedClaudeCode:
+    """同梱の Claude Code が古く、選んだモデルを使えなかった"""
+
+    #: 入っている版と、求められた版 文面から拾えなければ空
+    current: str = ""
+    required: str = ""
+
+    def message(self) -> str:
+        """利用者へ出す文 Claude Code の英語の文面は「claude update を打て」と言うが、
+        同梱の物はそれでは上がらない（SDK ごと入れ替える）ので、ソフトの中の手順を言う
+        """
+        versions = []
+        if self.current:
+            versions.append(f"入っている版 {self.current}")
+        if self.required:
+            versions.append(f"必要な版 {self.required} 以上")
+        detail = f"（{' '.join(versions)}）" if versions else ""
+        return (
+            "AI の部品（Claude Agent SDK に同梱の Claude Code）が古く、選んだモデルに対応して"
+            f"いません{detail} 〔{UPDATE_PARTS_LABEL}〕で新しくしてください"
+        )
+
+
+def outdated_claude_code(text: str) -> OutdatedClaudeCode | None:
+    """Claude Code の版が足りないための失敗なら、その版を 違えば ``None``"""
+    match = _OUTDATED_CLI.search(text)
+    if match is None:
+        return None
+    return OutdatedClaudeCode(match.group("current") or "", match.group("required") or "")
 
 
 #: ログインが済んでいないときに Claude Code が返す文面の手掛かり（小文字で比べる）

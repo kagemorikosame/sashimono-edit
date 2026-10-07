@@ -152,7 +152,7 @@ def without_installed_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
 
 def write_sdk(site: Path) -> Path:
     """claude-agent-sdk を pip で入れたときの形 Claude Code 本体を同梱している"""
-    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.152")
+    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.158")
     bundled = site / "claude_agent_sdk" / "_bundled" / "claude.exe"
     bundled.parent.mkdir(parents=True, exist_ok=True)
     bundled.write_bytes(b"")

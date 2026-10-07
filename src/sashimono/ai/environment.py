@@ -32,8 +32,18 @@ __all__ = [
     "runtime_status",
 ]
 
-#: 0.2.152 はモデルとエフォートの指定・Claude Code 本体の同梱を確かめた版
-REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.152",)
+#: 一覧（:data:`sashimono.ai.models.MODELS`）のモデルがすべて使える、同梱の Claude Code の版
+#: Claude Opus 5.5 は 2.1.280 より前の Claude Code では「does not support this model」で
+#: 断られる（0.2.152 に同梱の 2.1.259 で、利用者の画面で起きた）
+#: 新しいモデルを一覧へ足すときは、ここと下の SDK の下限を一緒に上げる
+MINIMUM_CLAUDE_CODE = "2.1.280"
+
+#: SDK の下限 0.2.158 は Claude Code 2.1.280 を同梱する最初の版（PyPI の Windows の
+#: wheel の ``_cli_version.py`` で確かめた 0.2.156 は 2.1.276 0.2.157 は Windows の
+#: wheel が無く、配布版の pip は選べない） モデルとエフォートの指定は 0.2.152 から使える
+#: 上限は試した系列（0.2）の外へ自動で上がらないため 0.3 で使い方が変わっても、
+#: 自動の更新が入れて会話が始まらなくなる、ということが起きない 新しい系列は試してから上げる
+REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.158,<0.3",)
 
 
 def bundled_claude_cli() -> Path | None:

@@ -58,6 +58,8 @@ __all__ = [
     "install_result_text",
     "install_runtime",
     "is_frozen",
+    "is_newer_version",
+    "mark_installed",
     "pip_arguments",
     "pip_left_running",
     "python_abi",
@@ -258,6 +260,18 @@ def _is_older(version: str, minimum: str) -> bool:
         return False
 
 
+def is_newer_version(candidate: str, installed: str) -> bool:
+    """``candidate`` が ``installed`` より新しいか（PEP 440 で比べる）
+
+    読めない版は新しいと見ない 入らないかもしれない版を勧めて入れ替えを試すより、
+    今の版を使い続ける方が害が小さい
+    """
+    try:
+        return Version(candidate) > Version(installed)
+    except InvalidVersion:
+        return False
+
+
 def _version(name: str) -> str | None:
     try:
         return metadata.version(name)
@@ -415,6 +429,13 @@ def stale_runtime(key: str | None = None) -> str | None:
     if found is None or found == python_abi():
         return None
     return found
+
+
+def mark_installed(target: Path, key: str) -> None:
+    """入れ終えた機能に今の Python の印を付ける 導入のボタンを通らない入れ替え
+    （AI の部品の自動の更新）からも呼ぶ
+    """
+    _mark_installed(target, key)
 
 
 def _mark_installed(target: Path, key: str) -> None:

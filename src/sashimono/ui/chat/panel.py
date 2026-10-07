@@ -39,11 +39,15 @@ from sashimono.ai.environment import claude_cli, credentials_found, open_login_w
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.session import (
     REINSTALL_HINT,
+    UPDATE_PARTS_LABEL,
     AgentEvent,
     AgentSession,
     EventKind,
+    OutdatedClaudeCode,
+    outdated_claude_code,
     system_prompt,
 )
+from sashimono.ui.chat.parts_updater import PartsUpdater
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors, theme_signals, themed_style
@@ -164,7 +168,13 @@ class ChatPanel(QWidget):
     #: 本人の好みとして覚えるのは受け取る側（設定の置き場を 1 か所にするため）
     choices_changed = Signal(str, str)
 
-    def __init__(self, host: EditorHost, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        host: EditorHost,
+        parent: QWidget | None = None,
+        *,
+        updater: PartsUpdater | None = None,
+    ) -> None:
         super().__init__(parent)
         self._host = host
         self._bridge = EditorBridge(host)
@@ -203,6 +213,18 @@ class ChatPanel(QWidget):
         #: 指示がすべて終わったらタスクバーで知らせるか（設定）
         self._alert_when_done = False
 
+        # --- 部品が古くて断られたとき ---
+        #: いまの指示で「Claude Code が古くて、このモデルを使えない」と断られた
+        self._outdated: OutdatedClaudeCode | None = None
+        #: 部品を新しくしてから、いまの指示を送り直すところ
+        self._retrying = False
+        #: いまの指示は 1 度送り直した 送り直しても断られたら、もう送り直さず案内を出す
+        self._retried = False
+        #: 部品を裏で新しくする物 自動の更新（設定で切れる）と、断られたときの立て直しに使う
+        self._updater = updater if updater is not None else PartsUpdater(AI_PACK, self)
+        self._updater.prepare = self._release_session
+        self._updater.finished.connect(self._on_parts_updated)
+
         self._build()
         theme_signals().changed.connect(self._redraw_log)
         self._timer = QTimer(self)
@@ -211,6 +233,7 @@ class ChatPanel(QWidget):
         self._timer.start()
         self._refresh_availability()
         self._refresh_status()
+        self._updater.schedule()
 
     # --- 組み立て ---
 
@@ -243,6 +266,12 @@ class ChatPanel(QWidget):
             pair_layout.addWidget(QLabel(text, pair))
             pair_layout.addWidget(box)
             choices.addWidget(pair)
+        # 使える間は導入の欄を隠しているので、手で更新を確かめる入口をここに置く
+        # 組と同じく折り返すので、狭い窓でもパネルの最小の幅は広がらない
+        self._parts_button = QPushButton("AI の部品…", self)
+        self._parts_button.setToolTip("入れてある AI の部品の版を見て、新しい版を確かめる・入れる")
+        self._parts_button.clicked.connect(self._toggle_setup)
+        choices.addWidget(self._parts_button)
 
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない
@@ -296,6 +325,20 @@ class ChatPanel(QWidget):
         approval_layout.setContentsMargins(8, 6, 8, 6)
         approval_layout.addWidget(self._approval_text)
         approval_layout.addLayout(approval_buttons)
+
+        # 部品が古くて断られたときの案内 その場で押せる更新のボタンを添える
+        # 案内の文だけだと、どこで更新するのかを探させることになる
+        self._update_box = QFrame(self)
+        self._update_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self._update_box.setVisible(False)
+        self._update_text = QLabel(self._update_box)
+        self._update_text.setWordWrap(True)
+        self._update_button = QPushButton(UPDATE_PARTS_LABEL, self._update_box)
+        self._update_button.clicked.connect(self.update_parts)
+        update_layout = QHBoxLayout(self._update_box)
+        update_layout.setContentsMargins(8, 6, 8, 6)
+        update_layout.addWidget(self._update_text, 1)
+        update_layout.addWidget(self._update_button)
 
         self._input = _Input(self)
         self._describe_send_key()
@@ -352,6 +395,7 @@ class ChatPanel(QWidget):
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._approval_box)
+        layout.addWidget(self._update_box)
         layout.addLayout(status_row)
         layout.addWidget(self._input)
         layout.addLayout(controls)
@@ -371,10 +415,48 @@ class ChatPanel(QWidget):
 
     def _on_setup_finished(self, succeeded: bool) -> None:
         self._refresh_availability()
-        if succeeded and self._setup.note:
+        if not succeeded:
+            # 使える状態のまま失敗すると欄ごと隠れ、何が起きたかのログが読めなくなる
+            self._setup.setVisible(True)
+        elif self._setup.note:
             # 使える状態になると導入欄ごと隠れるので、再起動の要る・要らないの
             # 案内は会話の欄へ写す 写さないと、読めないまま消える
             self._say("案内", self._setup.note)
+        self._refresh_status()
+
+    def _toggle_setup(self) -> None:
+        """導入の欄を出し入れする 使える間も、版を見て更新を確かめられるように"""
+        showing = not self._setup.isHidden()
+        if showing and not self._setup.status.ready:
+            return  # 使えない間は導入の欄が入口なので隠さない
+        self._setup.setVisible(not showing)
+
+    def update_parts(self) -> None:
+        """AI の部品を新しい版へ入れ替える（手で押した〔AI の部品を更新〕）
+
+        導入の欄の pip（配布版では同じプロセスの pip）で入れ、ログを見せる 走っている
+        会話は先に畳む Windows では動いている claude.exe を書き換えられず、pip が失敗する
+        """
+        if self._setup.busy:
+            return
+        session = self._session
+        self._session = None
+        if session is not None:
+            session.close()
+        if self._queued:
+            # 待っていた指示はもう返ってこない 区切りを付けて終わらせる
+            self._finish_turn()
+            self._queued.clear()
+            self._close_checkpoint()
+        self._retrying = False
+        self._stop_button.setEnabled(False)
+        self._update_box.setVisible(False)
+        self._setup.setVisible(True)
+        self._setup.start(upgrade=True)
+        if self._setup.busy:
+            self._input.setEnabled(False)
+            self._send_button.setEnabled(False)
+        self._refresh_status()
 
     def open_login(self) -> None:
         """Claude Code を別の窓で開き、そこでログインしてもらう"""
@@ -406,6 +488,8 @@ class ChatPanel(QWidget):
         self._select_choices(preferences.ai_model, preferences.ai_effort)
         self._animate = preferences.ai_busy_animation
         self._alert_when_done = preferences.ai_done_alert
+        self._updater.set_enabled(preferences.ai_auto_update)
+        self._updater.schedule()
         self._refresh_status()
 
     def _select_choices(self, model: str, effort: str) -> None:
@@ -500,6 +584,25 @@ class ChatPanel(QWidget):
             self._open_checkpoint(prompt)
             self._begin_turn()
 
+        self._stop_button.setEnabled(True)
+        if not self._holding:
+            self._dispatch(prompt)
+        # 送った直後に「接続しています…」へ変える Claude Code の起動に数秒かかり、
+        # その間に何も変わらないと、送れたのか分からない 部品を入れ替えている間は
+        # 「更新しています…」と待ちの件数を出す
+        self._refresh_status()
+
+    @property
+    def _holding(self) -> bool:
+        """指示を会話へ渡さずに持っておく間か（部品を入れ替えている・入れ替えを待っている）
+
+        入れ替えの最中に会話を始めると、入れ替える途中の Claude Code を起動してしまう
+        持っておいた指示は、入れ替えが終わった所（:meth:`_on_parts_updated`）で順に渡す
+        """
+        return self._retrying or self._updater.installing
+
+    def _dispatch(self, prompt: str) -> None:
+        """指示を会話へ渡す 会話がまだ無ければ作る"""
         if self._session is None:
             self._connected = False
             model, effort = self._wanted()
@@ -514,10 +617,48 @@ class ChatPanel(QWidget):
                 system_prompt=system_prompt(layer_mode),
             )
         self._session.send(prompt)
-        self._stop_button.setEnabled(True)
-        # 送った直後に「接続しています…」へ変える Claude Code の起動に数秒かかり、
-        # その間に何も変わらないと、送れたのか分からない
+
+    def _release_session(self) -> Callable[[], None]:
+        """部品を入れ替える前に会話を畳む 戻り値は、畳み終わるのを待つ物（裏のスレッドで呼ぶ）
+
+        ここで待つと画面が固まる（Claude Code が終わるまで数秒かかる）ので、待つのは
+        入れ替えの直前、裏のスレッドで行う
+        """
+        session = self._session
+        self._session = None
+        if session is None:
+            return _nothing
+        session.close(wait=False)
+        return session.wait_closed
+
+    def _on_parts_updated(self, succeeded: bool, installed: str) -> None:
+        """部品の入れ替えが終わった 持っておいた指示を新しい会話へ渡す"""
+        retrying = self._retrying
+        self._retrying = False
+        if succeeded and installed:
+            self.status_message.emit(f"AI の部品を新しくしました（{installed}）")
+        if retrying:
+            if succeeded:
+                self._note("AI の部品を更新して送り直しました")
+                # 送り直しの応答で、もう一度断られたかどうかを見分けられるように
+                # 断られた分の「失敗」も持ち越さない 送り直しが通れば「完了」と出す
+                self._outdated = None
+                self._turn_error = False
+            else:
+                # 自動では直せなかった ここで初めて、何が起きたかと手での直し方を見せる
+                self._show_outdated(self._outdated or OutdatedClaudeCode())
+                self._give_up_turn()
+                self._refresh_status()
+                return
+        for prompt in self._queued:
+            self._dispatch(prompt)
         self._refresh_status()
+
+    def _show_outdated(self, found: OutdatedClaudeCode) -> None:
+        message = found.message()
+        self._say("エラー", message)
+        self._update_text.setText(message)
+        self._update_box.setVisible(True)
 
     def interrupt(self) -> None:
         if self._session is not None:
@@ -535,11 +676,17 @@ class ChatPanel(QWidget):
         ``session.busy`` が立っていないので、残っている指示も見る
         """
         session = self._session
-        return bool(self._queued) or (session is not None and session.busy) or self._setup.busy
+        return (
+            bool(self._queued)
+            or (session is not None and session.busy)
+            or self._setup.busy
+            or self._updater.installing
+        )
 
     def close_session(self) -> None:
         """会話を畳む ウィンドウを閉じるときに呼ぶ"""
         self._timer.stop()
+        self._updater.stop()
         self._setup.cancel()
         if self._session is not None:
             self._session.close()
@@ -575,6 +722,11 @@ class ChatPanel(QWidget):
         if session is not None:
             for event in session.poll():
                 self._handle(event)
+        # 部品の入れ替えは AI が応えていない間だけ 送り直しを待っている間は、前の会話は
+        # 次の指示を始めずに止まっている（区切りを付け終えるのを待っている）ので暇と見る
+        session = self._session
+        idle = self._retrying or session is None or not (self._queued or session.busy)
+        self._updater.tick(idle)
         # 秒の進みと承認の箱の出入りを拾う 変わった所だけを書き換えるので、毎回呼んでも軽い
         self._refresh_status()
         if not self._busy_mark.isHidden():
@@ -589,7 +741,22 @@ class ChatPanel(QWidget):
             # 何か返ってきたら繋がっている 起動の失敗はエラーで来るので数えない
             self._connected = True
 
-        if event.kind is EventKind.TEXT:
+        if event.kind in (EventKind.TEXT, EventKind.ERROR):
+            found = outdated_claude_code(event.text)
+            if found is not None:
+                # 部品が古くて選んだモデルを使えない 英語の文面は出さない（「claude update を
+                # 打て」と言うが、同梱の物はそれでは上がらない） 自動で直せるなら黙って直し、
+                # 直せないときだけ案内とボタンを出す
+                self._turn_error = True
+                if self._outdated is None and not self._can_retry():
+                    self._show_outdated(found)
+                self._outdated = found
+                self._refresh_status()
+                return
+
+        if event.kind is EventKind.TURN_DONE and self._outdated is not None and self._can_retry():
+            self._retry_after_update()
+        elif event.kind is EventKind.TEXT:
             self._say("Claude", event.text)
         elif event.kind is EventKind.TOOL_USE:
             self._turn_tools += 1
@@ -633,6 +800,32 @@ class ChatPanel(QWidget):
         self._refresh_status()
         if was_working and not self._queued:
             self._alert_done()
+
+    def _can_retry(self) -> bool:
+        """部品を自動で新しくして、いまの指示を送り直せるか 送り直すのは 1 度だけ"""
+        return not self._retried and self._updater.available
+
+    def _retry_after_update(self) -> None:
+        """部品が古くて断られた指示を、部品を新しくしてから送り直す
+
+        区切りの行も段（取り消しの 1 回分）も閉じない 送り直した応答までを 1 つの
+        指示として数える 前の会話は区切りを付け終える知らせ（acknowledge_turn）を
+        待って止まっているので、続けて送った指示を先に始めてしまうことも無い
+        """
+        self._retried = True
+        self._retrying = True
+        if not self._updater.request_now():
+            self._retrying = False
+            self._show_outdated(self._outdated or OutdatedClaudeCode())
+            self._give_up_turn()
+
+    def _give_up_turn(self) -> None:
+        """いまの指示を失敗として終える 待っていた指示も前の会話と一緒に畳む"""
+        self._release_session()
+        self._finish_turn()
+        self._queued.clear()
+        self._close_checkpoint()
+        self._stop_button.setEnabled(False)
 
     def _alert_done(self) -> None:
         """送った指示がすべて終わった 頼まれていれば、別の窓を触っている人に知らせる"""
@@ -683,6 +876,8 @@ class ChatPanel(QWidget):
         self._turn_error = False
         self._stopping = False
         self._tool = ""
+        self._outdated = None
+        self._retried = False
 
     def _finish_turn(self) -> None:
         """1 回の応答が終わった 会話の欄へ区切りの行を足す
@@ -707,10 +902,27 @@ class ChatPanel(QWidget):
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
         self._stopping = False
 
+    @property
+    def _updating(self) -> bool:
+        """部品を入れ替えている（手で押した更新・自動の更新・断られた後の立て直し）"""
+        return self._setup.busy or self._updater.installing or self._retrying
+
     def _status_line(self) -> str:
         """状態の行の文 色だけに頼らず、文字で今の状態を言う"""
+        if self._updating:
+            # 送った指示は入れ替えが終わってから渡す 待たされている理由をここで言う
+            line = "AI の部品を更新しています…"
+            if self._queued:
+                line += f"・待ち {len(self._queued)} 件"
+            return line
         approval = self._approval
         if not self._queued and approval is None:
+            if self._updater.struggling:
+                # 1 回ごとには言わない（たまたま繋がらなかっただけの人を驚かせない）
+                return (
+                    "待機中（AI の部品の自動の更新がうまくいっていません"
+                    " 〔AI の部品…〕から手で更新できます）"
+                )
             return "待機中"
         session = self._session
         if self._stopping:
@@ -740,7 +952,7 @@ class ChatPanel(QWidget):
         if self._status_text.text() != line:
             self._status_text.setText(line)
         working = bool(self._queued)
-        show_mark = working and self._animate
+        show_mark = (working or self._updating) and self._animate
         if self._busy_mark.isHidden() == show_mark:
             self._busy_mark.setVisible(show_mark)
         # 前の指示が終わるまで待たされることを、押す前に分かるようにする
@@ -816,6 +1028,10 @@ def _message_html(who: str | None, text: str) -> str:
     }.get(who, Colors.TEXT_MUTED.name())
     body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
     return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'
+
+
+def _nothing() -> None:
+    """待つ物が無いときの、待つ物"""
 
 
 def _duration(seconds: float) -> str:

@@ -282,6 +282,11 @@ class Preferences:
     #: アシスタントが指示をすべて終えたとき、別の窓を触っていたらタスクバーで知らせる
     #: 既定は切 頼んでいないのにタスクバーが光ると驚く 待つ間に別の作業をする人だけが入れる
     ai_done_alert: bool = False
+    #: AI の部品（claude-agent-sdk と同梱の Claude Code）を自動で新しくする（配布版だけ）
+    #: 既定は入 新しいモデルは新しい Claude Code でないと断られ、知らない人はエラーの
+    #: 意味が分からず困る 1 日に 1 回まで PyPI を確かめ、試した範囲の中の版だけを裏で入れる
+    #: 通信を増やしたくない人は切れる 切っても導入の欄の〔更新を確かめる〕〔環境を更新〕は使える
+    ai_auto_update: bool = True
     #: 空のプロジェクトへ最初の動画を置いたとき、プロジェクトの解像度とフレームレートを
     #: 動画に合わせるか 尋ねる（``ask``）・常に合わせる（``always``）・合わせない（``never``）
     #: 既定は尋ねる 黙って合わせると決まった形で作る人が困り、黙って合わせないと
@@ -431,6 +436,7 @@ class PreferenceStore:
             chat_enter_sends=_flag(data.get("chat_enter_sends"), plain.chat_enter_sends),
             ai_busy_animation=_flag(data.get("ai_busy_animation"), plain.ai_busy_animation),
             ai_done_alert=_flag(data.get("ai_done_alert"), plain.ai_done_alert),
+            ai_auto_update=_flag(data.get("ai_auto_update"), plain.ai_auto_update),
             match_video=_choice(data.get("match_video"), MATCH_MODES, plain.match_video),
             dock_tabs=_choice(data.get("dock_tabs"), DOCK_TAB_POSITIONS, plain.dock_tabs),
             preview_handles=_flag(data.get("preview_handles"), plain.preview_handles),

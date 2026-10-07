@@ -456,6 +456,15 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._ai_done_alert)
 
+        self._ai_auto_update = QCheckBox("AI の部品を自動で新しくする", self)
+        self._ai_auto_update.setChecked(preferences.ai_auto_update)
+        self._ai_auto_update.setToolTip(
+            "配布版で、1 日に 1 回まで PyPI に AI の部品（Claude Agent SDK と同梱の Claude Code）の"
+            "新しい版を確かめ、試した範囲の中の版を裏で入れる 新しいモデルは古い部品では使えない"
+            " 切ると確かめも入れ替えもしない（導入の欄から手で更新できる）"
+        )
+        form.addRow(self._ai_auto_update)
+
         self._update_check = QCheckBox("起動したときに新しい版を確かめる", self)
         self._update_check.setChecked(preferences.update_check)
         self._update_check.setToolTip(
@@ -606,6 +615,7 @@ class PreferencesDialog(QDialog):
             chat_enter_sends=self._chat_enter_sends.isChecked(),
             ai_busy_animation=self._ai_busy_animation.isChecked(),
             ai_done_alert=self._ai_done_alert.isChecked(),
+            ai_auto_update=self._ai_auto_update.isChecked(),
             match_video=str(self._match_video.currentData()),
             dock_tabs=str(self._dock_tabs.currentData()),
             preview_handles=self._preview_handles.isChecked(),

@@ -49,7 +49,7 @@ def machine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 
 def _install_sdk(site: Path, *, bundled: bool = True) -> Path:
-    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.152")
+    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.158")
     cli = site / "claude_agent_sdk" / "_bundled" / "claude.exe"
     if bundled:
         cli.parent.mkdir(parents=True)
@@ -92,8 +92,8 @@ class TestBundledClaudeCode:
         assert "--upgrade" in command
 
     def test_a_prerelease_of_the_required_version_is_older(self, machine: Path) -> None:
-        # 0.2.152rc1 は 0.2.152 より前の版 同じと読むと、足りない SDK で入力欄が開く
-        write_distribution(machine, "claude-agent-sdk", "claude_agent_sdk", "0.2.152rc1")
+        # 0.2.158rc1 は 0.2.158 より前の版 同じと読むと、足りない SDK で入力欄が開く
+        write_distribution(machine, "claude-agent-sdk", "claude_agent_sdk", "0.2.158rc1")
         status = environment.runtime_status()
         assert status.needs_upgrade is True
         assert status.ready is False
@@ -101,7 +101,7 @@ class TestBundledClaudeCode:
     def test_a_newer_version_is_accepted(self, machine: Path) -> None:
         # 新しい版まで古いと読むと、入れ直しても入力欄が開かない
         _install_sdk(machine)
-        (machine / "claude_agent_sdk-0.2.152.dist-info").rename(
+        (machine / "claude_agent_sdk-0.2.158.dist-info").rename(
             machine / "claude_agent_sdk-0.10.0.dist-info"
         )
         (machine / "claude_agent_sdk-0.10.0.dist-info" / "METADATA").write_text(

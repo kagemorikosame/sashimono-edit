@@ -270,7 +270,7 @@ def _ready(monkeypatch: pytest.MonkeyPatch) -> None:
     from sashimono.runtime import PackageStatus, PackStatus
     from sashimono.ui.setup import SetupSection
 
-    status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.152"),))
+    status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.158"),))
     monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
 
 
