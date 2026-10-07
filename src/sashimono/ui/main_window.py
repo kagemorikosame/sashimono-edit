@@ -134,6 +134,7 @@ from sashimono.ui.progress_display import (
 )
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
@@ -288,6 +289,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         """``confirm_unsaved`` を偽にすると、閉じるときに保存を尋ねない テスト用"""
         super().__init__()
+        # 入力欄に打っている間の Ctrl+Shift+V は欄の書式なしの貼り付け 入れないと、
+        # 窓の挿入貼り付けが動いてタイムラインへクリップが貼られる
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            install_text_field_keys(application)
         self.setWindowTitle("Sashimono Edit")
         screen = QApplication.primaryScreen()
         self.resize(

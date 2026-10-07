@@ -13,7 +13,14 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QLineEdit,
+    QPlainTextEdit,
+    QSpinBox,
+    QTextEdit,
+    QWidget,
+)
 
 from sashimono.core.commands import AddClip, Command, InsertGap, SetTrackHeights
 from sashimono.core.io import others_holding, project_presence_dir
@@ -31,6 +38,9 @@ from sashimono.ui.workspace import (
     Preferences,
     PreferenceStore,
 )
+from tests.fake_clipboard import FakeClipboard
+
+CTRL_SHIFT = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
 
 
 def _project() -> Project:
@@ -160,6 +170,97 @@ class TestInsertPaste:
         assert not view.insert_paste_at_playhead()
         assert not received
         assert any("ロック" in message for message in messages)
+
+
+_FIELDS = (QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox)
+
+
+def _clip_count(window: MainWindow) -> int:
+    return sum(len(track.clips) for track in window.document.project.timeline.tracks)
+
+
+def _press(widget: QWidget, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> None:
+    QTest.keyClick(widget, key, modifiers)
+    QApplication.processEvents()
+
+
+def _field_text(field: QWidget) -> str:
+    if isinstance(field, (QPlainTextEdit, QTextEdit)):
+        return field.toPlainText()
+    if isinstance(field, QSpinBox):
+        return field.text()
+    assert isinstance(field, QLineEdit)
+    return field.text()
+
+
+class TestKeysWhileTyping:
+    """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない"""
+
+    @pytest.fixture
+    def shown(self, window: MainWindow) -> MainWindow:
+        window.show()
+        window.activateWindow()
+        timeline = window._timeline
+        timeline.select(window.document.project.timeline.tracks[0].clips[0].id)
+        assert timeline.copy_selected()
+        window.seek(10)
+        QApplication.processEvents()
+        return window
+
+    @pytest.mark.parametrize("kind", _FIELDS)
+    def test_ctrl_shift_v_in_a_field_pastes_into_the_field(
+        self, shown: MainWindow, kind: type[QWidget], fake_clipboard: FakeClipboard
+    ) -> None:
+        # 直す前は窓の挿入貼り付けが動き、字幕や設定の欄に打っている途中でクリップが増えた
+        field = kind(shown)
+        field.show()
+        field.setFocus()
+        if isinstance(field, QSpinBox):
+            # 数の欄は入っている 0 を選んだ所へ貼る（後ろへ足すと 012 で範囲の外になる）
+            field.selectAll()
+        fake_clipboard.setText("12")
+        before = _clip_count(shown)
+        _press(field, Qt.Key.Key_V, CTRL_SHIFT)
+        assert _clip_count(shown) == before
+        assert "12" in _field_text(field)
+
+    @pytest.mark.parametrize(
+        ("key", "modifiers"),
+        [
+            (Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier),
+            (Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
+            (Qt.Key.Key_S, Qt.KeyboardModifier.NoModifier),
+            (Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
+        ],
+    )
+    def test_the_other_editing_keys_stay_in_the_field(
+        self, shown: MainWindow, key: Qt.Key, modifiers: Qt.KeyboardModifier
+    ) -> None:
+        # Qt の入力欄が自分で受け取るキー 守りが外れると、文字を消すつもりでクリップが消える
+        field = QLineEdit(shown)
+        field.show()
+        field.setFocus()
+        before = shown.document.project
+        _press(field, key, modifiers)
+        assert shown.document.project == before
+
+    def test_outside_a_field_ctrl_shift_v_still_inserts(self, shown: MainWindow) -> None:
+        # 欄を守るついでに窓のショートカットまで止めると、挿入貼り付けが使えない
+        shown._timeline.setFocus()
+        before = _clip_count(shown)
+        _press(shown._timeline, Qt.Key.Key_V, CTRL_SHIFT)
+        # 再生ヘッドの下のクリップが割れて 1 本、貼った物で 1 本増える
+        assert _clip_count(shown) == before + 2
+
+    def test_a_read_only_field_does_not_hold_the_key(self, shown: MainWindow) -> None:
+        # 読むだけの欄は貼れない 欄が取ると、押しても何も起きない
+        field = QPlainTextEdit(shown)
+        field.setReadOnly(True)
+        field.show()
+        field.setFocus()
+        before = _clip_count(shown)
+        _press(field, Qt.Key.Key_V, CTRL_SHIFT)
+        assert _clip_count(shown) == before + 2
 
 
 class TestInsertPastePreference:
