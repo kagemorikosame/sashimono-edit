@@ -12,18 +12,23 @@ from __future__ import annotations
 
 import html
 import re
+import time
 from collections import deque
+from collections.abc import Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QInputMethodEvent, QKeyEvent
+from PySide6.QtGui import QColor, QInputMethodEvent, QKeyEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -54,6 +59,56 @@ _CODE = re.compile(r"`([^`]+)`")
 #: ワーカーからの知らせを拾う間隔（ミリ秒）
 #: ここを長くすると、AI の操作が画面へ反映されるまでの間が空く
 POLL_MS = 80
+
+#: 実行中にドックのタブの名前の頭へ付ける印 パネルが別のタブの裏にあっても動いていると分かる
+RUNNING_MARK = "● "
+
+#: 会話の欄の区切りの行（1 回の応答の終わり）を表す、言った人の代わりの印
+#: 本人や Claude の発言と取り違えないよう、名前に使わない制御文字で始める
+_DIVIDER = "\0divider"
+
+
+class _BusyMark(QWidget):
+    """実行中に回る印
+
+    色は描くたびにテーマから読む 作ったときの色を持つと、テーマを替えたとき
+    地の色に溶けて見えなくなる 回すのは見張りの時計（``POLL_MS``）に任せ、
+    この部品のための時計は持たない（閉じるときに止め忘れる時計を増やさない）
+    """
+
+    #: 1 回の進みで回す角度（度） 80 ミリ秒ごとに 30 度でおよそ 1 秒に 1 周
+    STEP = 30
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        side = self.fontMetrics().height()
+        self.setFixedSize(side, side)
+        self._angle = 0
+        # 読み上げでは色も動きも伝わらないので、名前で状態を言う
+        self.setAccessibleName("実行中")
+
+    def advance(self) -> None:
+        self._angle = (self._angle + self.STEP) % 360
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt の命名規約
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 線は太めにする 細いと縁がぼけて、明るいテーマの地では色が薄く見える
+        width = max(3, self.width() // 5)
+        half = (width + 1) // 2
+        ring = self.rect().adjusted(half, half, -half, -half)
+        track = QColor(Colors.TEXT_MUTED)
+        track.setAlpha(80)
+        painter.setPen(QPen(track, width))
+        painter.drawEllipse(ring)
+        arc = QPen(Colors.ACCENT, width)
+        arc.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(arc)
+        # Qt の角度は 1/16 度で、正が反時計回り 時計回りに進めたいので負にする
+        painter.drawArc(ring, -self._angle * 16, 120 * 16)
+        painter.end()
 
 
 class _Input(QPlainTextEdit):
@@ -127,6 +182,27 @@ class ChatPanel(QWidget):
         #: 今の色で書き直すために持つ
         self._log: list[tuple[str | None, str]] = []
 
+        # --- いま応えている指示（状態の行と区切りの行に使う） ---
+        #: 経過秒を測る時計 試験で差し替える（本物の時計だと秒の境目で揺れる）
+        self._clock: Callable[[], float] = time.monotonic
+        #: いまの指示に取りかかった時刻 応えている指示が無ければ ``None``
+        self._turn_started: float | None = None
+        #: いまの指示で AI が呼んだ道具の数と、そのうち失敗した数
+        self._turn_tools = 0
+        self._turn_failures = 0
+        #: いまの指示でエラーが出たか 区切りの行を「失敗」にする
+        self._turn_error = False
+        #: 中断を頼んだか 区切りの行を「中断」にし、状態の行で中断の途中だと見せる
+        self._stopping = False
+        #: いま使っている道具の名前
+        self._tool = ""
+        #: 会話が Claude Code に繋がったか 繋がるまでは「接続しています…」と出す
+        self._connected = False
+        #: 実行中に回る印を出すか（設定） 切っても文字の状態は出す
+        self._animate = True
+        #: 指示がすべて終わったらタスクバーで知らせるか（設定）
+        self._alert_when_done = False
+
         self._build()
         theme_signals().changed.connect(self._redraw_log)
         self._timer = QTimer(self)
@@ -134,6 +210,7 @@ class ChatPanel(QWidget):
         self._timer.timeout.connect(self._poll)
         self._timer.start()
         self._refresh_availability()
+        self._refresh_status()
 
     # --- 組み立て ---
 
@@ -236,6 +313,22 @@ class ChatPanel(QWidget):
             area.setMinimumHeight(lines * area.fontMetrics().lineSpacing() + frame + margin)
         self._input.submitted.connect(self.send)
 
+        # 状態の行 文字で出し、色だけに頼らない 秒が進むたびに書き換えるのはこの
+        # 行の文字だけで、ほかの部品は作り直さない（#251 のように入力の途中で
+        # 打っている位置が飛ばないように）
+        self._busy_mark = _BusyMark(self)
+        self._busy_mark.setVisible(False)
+        self._status_text = QLabel(self)
+        # 幅は文字に合わせて広げない 長い道具の名前で右の列の最小の幅が広がり、
+        # 1366 の画面で窓に収まらなくなる 収まらない分は切れて見えるだけにする
+        self._status_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        themed_style(self._status_text, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
+        status_row.addWidget(self._busy_mark)
+        status_row.addWidget(self._status_text, 1)
+
         self._auto = QCheckBox("変更を自動で承認", self)
         self._auto.toggled.connect(self._set_auto_approve)
         self._send_button = QPushButton("送信", self)
@@ -259,6 +352,7 @@ class ChatPanel(QWidget):
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._approval_box)
+        layout.addLayout(status_row)
         layout.addWidget(self._input)
         layout.addLayout(controls)
 
@@ -310,6 +404,9 @@ class ChatPanel(QWidget):
         self._input.enter_sends = preferences.chat_enter_sends
         self._describe_send_key()
         self._select_choices(preferences.ai_model, preferences.ai_effort)
+        self._animate = preferences.ai_busy_animation
+        self._alert_when_done = preferences.ai_done_alert
+        self._refresh_status()
 
     def _select_choices(self, model: str, effort: str) -> None:
         # 当てるだけで「選び直した」と知らせない 知らせると、設定を読んだだけで
@@ -360,6 +457,8 @@ class ChatPanel(QWidget):
             return
         self._session = None
         self._queued.clear()
+        self._turn_started = None
+        self._refresh_status()
         session.close(wait=False)
         label = self._model.currentText()
         self._note(
@@ -399,8 +498,10 @@ class ChatPanel(QWidget):
             # 応答待ちの指示が他に無いときだけ段を開く 残っているときは、前の
             # 指示が終わった所（_handle）で、この指示の段を開く
             self._open_checkpoint(prompt)
+            self._begin_turn()
 
         if self._session is None:
+            self._connected = False
             model, effort = self._wanted()
             # 会話を始めた時点の方式で指示を書く 分ける方式の説明のまま混合の作品を
             # 触らせると、リンクした音声クリップを探し回る
@@ -414,11 +515,17 @@ class ChatPanel(QWidget):
             )
         self._session.send(prompt)
         self._stop_button.setEnabled(True)
+        # 送った直後に「接続しています…」へ変える Claude Code の起動に数秒かかり、
+        # その間に何も変わらないと、送れたのか分からない
+        self._refresh_status()
 
     def interrupt(self) -> None:
         if self._session is not None:
             self._session.interrupt()
             self._note("中断しています…")
+            if self._queued:
+                self._stopping = True
+                self._refresh_status()
 
     @property
     def working(self) -> bool:
@@ -465,20 +572,35 @@ class ChatPanel(QWidget):
         self._check_approval()
 
         session = self._session
-        if session is None:
-            return
-        for event in session.poll():
-            self._handle(event)
+        if session is not None:
+            for event in session.poll():
+                self._handle(event)
+        # 秒の進みと承認の箱の出入りを拾う 変わった所だけを書き換えるので、毎回呼んでも軽い
+        self._refresh_status()
+        if not self._busy_mark.isHidden():
+            self._busy_mark.advance()
 
     def _handle(self, event: AgentEvent) -> None:
+        was_working = bool(self._queued)
+        if event.kind is EventKind.CLOSED:
+            # 次に送るときは Claude Code の起動からやり直す
+            self._connected = False
+        elif event.kind is not EventKind.ERROR:
+            # 何か返ってきたら繋がっている 起動の失敗はエラーで来るので数えない
+            self._connected = True
+
         if event.kind is EventKind.TEXT:
             self._say("Claude", event.text)
         elif event.kind is EventKind.TOOL_USE:
+            self._turn_tools += 1
+            self._tool = event.tool
             self._note(f"▸ {event.tool} {event.detail}")
         elif event.kind is EventKind.TOOL_RESULT:
             if event.text == "失敗":
+                self._turn_failures += 1
                 self._note(f"　× {event.detail}")
         elif event.kind is EventKind.ERROR:
+            self._turn_error = True
             self._say("エラー", event.text)
             if REINSTALL_HINT in event.text:
                 # 入れ直す所（環境の導入の欄）は、導入済みのときは隠している 出さないと、
@@ -487,12 +609,15 @@ class ChatPanel(QWidget):
         elif event.kind is EventKind.TURN_DONE or event.kind is EventKind.CLOSED:
             self._turns_done += 1
             self._close_checkpoint()
+            # 終わった印を会話の欄に残す 中断ボタンが灰色に戻るだけだと気付かない
+            self._finish_turn()
             if event.kind is EventKind.TURN_DONE:
                 if self._queued:
                     self._queued.popleft()
                 if self._queued:
                     # 続けて送った指示の段を、その指示が始まる前に開く
                     self._open_checkpoint(self._queued[0])
+                    self._begin_turn()
                 if self._session is not None:
                     # 段を付け替え終えてから次の指示を始めさせる 先に始めると、
                     # 次の指示の編集が前の段へ混ざる
@@ -505,6 +630,19 @@ class ChatPanel(QWidget):
                 self._stop_button.setEnabled(False)
             # 応答の途中で選び直した分を、送った指示が全部終わった所で当てる
             self._restart_when_idle()
+        self._refresh_status()
+        if was_working and not self._queued:
+            self._alert_done()
+
+    def _alert_done(self) -> None:
+        """送った指示がすべて終わった 頼まれていれば、別の窓を触っている人に知らせる"""
+        if not self._alert_when_done:
+            return
+        window = self.window()
+        if window.isActiveWindow():
+            # 見ている人のタスクバーを光らせても、気が散るだけ
+            return
+        QApplication.alert(window)
 
     def _check_approval(self) -> None:
         showing = self._approval
@@ -533,18 +671,113 @@ class ChatPanel(QWidget):
             approval.allow()
         else:
             approval.deny()
+        self._refresh_status()
+
+    # --- 状態の行 ---
+
+    def _begin_turn(self) -> None:
+        """次の指示に取りかかった 秒と数を数え直す"""
+        self._turn_started = self._clock()
+        self._turn_tools = 0
+        self._turn_failures = 0
+        self._turn_error = False
+        self._stopping = False
+        self._tool = ""
+
+    def _finish_turn(self) -> None:
+        """1 回の応答が終わった 会話の欄へ区切りの行を足す
+
+        送っていないのに終わりの知らせが来たとき（会話だけが閉じたときなど）は足さない
+        何かが終わったように見えて紛らわしい
+        """
+        started = self._turn_started
+        if started is None:
+            return
+        self._turn_started = None
+        if self._stopping:
+            outcome = "中断"
+        elif self._turn_error:
+            outcome = "失敗"
+        else:
+            outcome = "完了"
+        counts = f"操作 {self._turn_tools} 件"
+        if self._turn_failures:
+            counts += f"・失敗 {self._turn_failures} 件"
+        elapsed = _duration(self._clock() - started)
+        self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
+        self._stopping = False
+
+    def _status_line(self) -> str:
+        """状態の行の文 色だけに頼らず、文字で今の状態を言う"""
+        approval = self._approval
+        if not self._queued and approval is None:
+            return "待機中"
+        session = self._session
+        if self._stopping:
+            head = "中断しています…"
+        elif approval is not None:
+            head = f"許可待ち: {approval.tool}"
+        elif not self._connected and not (session is not None and session.busy):
+            head = "接続しています…"
+        elif self._tool:
+            head = f"実行中: {self._tool}"
+        else:
+            head = "実行中"
+        started = self._turn_started
+        line = head if started is None else f"{head}（{_duration(self._clock() - started)}）"
+        waiting = len(self._queued) - 1
+        if waiting > 0:
+            line += f"・待ち {waiting} 件"
+        return line
+
+    def _refresh_status(self) -> None:
+        """状態の行・回る印・送信ボタン・ドックの名前を今の状態に合わせる
+
+        見張りの時計から 80 ミリ秒ごとに呼ばれるので、変わった所だけを書き換える
+        同じ文を書き直すだけでも、文字の欄は大きさを測り直して窓の配置をやり直す
+        """
+        line = self._status_line()
+        if self._status_text.text() != line:
+            self._status_text.setText(line)
+        working = bool(self._queued)
+        show_mark = working and self._animate
+        if self._busy_mark.isHidden() == show_mark:
+            self._busy_mark.setVisible(show_mark)
+        # 前の指示が終わるまで待たされることを、押す前に分かるようにする
+        label = "追加で送る" if working else "送信"
+        if self._send_button.text() != label:
+            self._send_button.setText(label)
+        self._mark_dock(working)
+
+    def _mark_dock(self, working: bool) -> None:
+        """入れてあるドックのタブの名前に、実行中だけ印を付ける
+
+        パネルが別のタブの裏に隠れていても、動いているかどうかが分かる ドックは
+        窓の側が作るので、親をたどって探す（パネルの外に作り方を知らせずに済む）
+        """
+        parent = self.parentWidget()
+        while parent is not None and not isinstance(parent, QDockWidget):
+            parent = parent.parentWidget()
+        if parent is None:
+            return
+        title = parent.windowTitle()
+        plain = title.removeprefix(RUNNING_MARK)
+        wanted = RUNNING_MARK + plain if working else plain
+        if title != wanted:
+            parent.setWindowTitle(wanted)
 
     # --- 表示 ---
 
     def _say(self, who: str, text: str) -> None:
-        self._log.append((who, text))
-        self._view.append(_message_html(who, text))
-        self._scroll_to_end()
+        self._append(who, text)
 
     def _note(self, text: str) -> None:
         """ツールの呼び出しなど、会話の本体ではないもの"""
-        self._log.append((None, text))
-        self._view.append(_message_html(None, text))
+        self._append(None, text)
+
+    def _append(self, who: str | None, text: str) -> None:
+        self._log.append((who, text))
+        self._view.append(_message_html(who, text))
         self._scroll_to_end()
 
     def _redraw_log(self) -> None:
@@ -572,6 +805,10 @@ def _message_html(who: str | None, text: str) -> str:
     """
     if who is None:
         return f'<span style="color:{Colors.TEXT_MUTED.name()}">{html.escape(text)}</span>'
+    if who == _DIVIDER:
+        # 線の文字で挟み、色を落としても区切りだと読めるようにする
+        muted = Colors.TEXT_MUTED.name()
+        return f'<p align="center" style="color:{muted}">──── {html.escape(text)} ────</p>'
     color = {
         "あなた": Colors.TEXT.name(),
         "Claude": Colors.ACCENT.name(),
@@ -579,6 +816,13 @@ def _message_html(who: str | None, text: str) -> str:
     }.get(who, Colors.TEXT_MUTED.name())
     body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
     return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'
+
+
+def _duration(seconds: float) -> str:
+    """経過した時間を読みやすく 1 分を超えたら分も出す（125 秒より 2 分 5 秒の方が掴みやすい）"""
+    whole = max(0, int(seconds))
+    minutes, rest = divmod(whole, 60)
+    return f"{minutes} 分 {rest} 秒" if minutes else f"{rest} 秒"
 
 
 def _to_html(text: str) -> str:

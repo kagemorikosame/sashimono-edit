@@ -442,6 +442,20 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._chat_enter_sends)
 
+        self._ai_busy_animation = QCheckBox("アシスタントの実行中を動く印で見せる", self)
+        self._ai_busy_animation.setChecked(preferences.ai_busy_animation)
+        self._ai_busy_animation.setToolTip(
+            "入力欄の上の状態の行に、回る印を添える 切っても「実行中」などの文字は出る"
+        )
+        form.addRow(self._ai_busy_animation)
+
+        self._ai_done_alert = QCheckBox("アシスタントが終えたらタスクバーで知らせる", self)
+        self._ai_done_alert.setChecked(preferences.ai_done_alert)
+        self._ai_done_alert.setToolTip(
+            "送った指示がすべて終わったとき、別の窓を触っていたらタスクバーのボタンを光らせる"
+        )
+        form.addRow(self._ai_done_alert)
+
         self._update_check = QCheckBox("起動したときに新しい版を確かめる", self)
         self._update_check.setChecked(preferences.update_check)
         self._update_check.setToolTip(
@@ -590,6 +604,8 @@ class PreferencesDialog(QDialog):
             ai_model=str(self._ai_model.currentData()),
             ai_effort=str(self._ai_effort.currentData()),
             chat_enter_sends=self._chat_enter_sends.isChecked(),
+            ai_busy_animation=self._ai_busy_animation.isChecked(),
+            ai_done_alert=self._ai_done_alert.isChecked(),
             match_video=str(self._match_video.currentData()),
             dock_tabs=str(self._dock_tabs.currentData()),
             preview_handles=self._preview_handles.isChecked(),
