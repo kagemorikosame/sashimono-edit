@@ -70,6 +70,7 @@ from sashimono.core.model import (
     heard_stream,
     new_group_id,
 )
+from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.media_pool import media_ids_in
 from sashimono.ui.theme import Colors, Metrics
@@ -92,8 +93,10 @@ from sashimono.ui.timeline.painter import (
     ADD_TRACK_BUTTON_SPACE,
     ADD_TRACK_BUTTON_TEXT,
     DETAIL_MIN_WIDTH,
+    ClipGlance,
     clip_content,
     clip_rect_for,
+    clip_summary,
     clips_in_range,
     draw_dense_clips,
     draw_playhead,
@@ -101,9 +104,11 @@ from sashimono.ui.timeline.painter import (
     draw_track_add_button,
     draw_track_background,
     draw_track_header,
+    filmstrip_tint,
     track_add_button_rect,
     track_button_rects,
     track_name_rect,
+    waveform_level,
 )
 from sashimono.ui.timeline.painter import draw_clip as paint_clip
 from sashimono.ui.timeline.snap import DEFAULT_SNAP_DISTANCE, nearest_snap, snap_targets
@@ -112,6 +117,7 @@ from sashimono.ui.timeline.track_name import TrackNameEditor
 from sashimono.ui.timeline.value_line import ValueGrab, ValueLineEditor
 from sashimono.ui.timeline.work_area import WorkAreaEditor
 from sashimono.ui.timeline.zoom_scrollbar import ZoomScrollBar
+from sashimono.ui.workspace import DETAIL_MIN_WIDTHS
 
 __all__ = ["TimelineArea", "TimelineView"]
 
@@ -141,6 +147,10 @@ HEIGHT_MERGE_SECONDS = 1.0
 #: 囲んで選ぶと決めるまでに動かす距離（画素） クリックのつもりの手ぶれで
 #: 選択が消えないようにする
 MARQUEE_THRESHOLD = 4
+
+#: 細い帯の目安を覚えておく本数の上限 超えたら全部捨てて覚え直す 古い物だけを選んで
+#: 捨てる手間を掛けるほどではない（捨てても次の描画で 1 度ずつ求め直すだけ）
+_GLANCE_CACHE_LIMIT = 50_000
 
 #: ヘッダのボタン（TRACK_BUTTONS）の説明は長いので、メニュー用の短い名前を別に持つ
 _TRACK_TOGGLES = (("muted", "ミュート"), ("solo", "ソロ"), ("locked", "ロック"))
@@ -314,6 +324,12 @@ class TimelineView(QWidget):
         self._value_lines = ValueLineEditor(
             self._request, self.preview_requested.emit, self._show_project, self.update
         )
+        #: これより細いクリップは名前もサムネイルも描かず細い帯にする
+        #: （:meth:`set_detail_min_width`）
+        self._detail_min_width = DETAIL_MIN_WIDTH
+        #: 細い帯の目安の控え クリップ ID →（クリップ, 素材, 音量, フレームレート, 目安）
+        #: （:meth:`_glance`）
+        self._glance_cache: dict[ClipId, tuple[Clip, MediaItem, float, FrameRate, ClipGlance]] = {}
 
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
@@ -356,6 +372,23 @@ class TimelineView(QWidget):
     def set_value_lines(self, shown: bool) -> None:
         """クリップの上に不透明度・音量の線を出すか 設定（:attr:`Preferences.value_lines`）から"""
         self._value_lines.enabled = shown
+        self.update()
+
+    @property
+    def detail_min_width(self) -> int:
+        return self._detail_min_width
+
+    def set_detail_min_width(self, width: int) -> None:
+        """これより細いクリップを細い帯にする幅（画素）
+
+        設定（:attr:`Preferences.detail_min_width`）から渡される
+        範囲（:data:`DETAIL_MIN_WIDTHS`）へ丸める 0 や負の値を通すと、1 画素の
+        クリップまで 1 本ずつ名前と絵を描き、全体表示の描画が 60fps の予算を超える
+        値の線とキーフレームを掴める幅も同じ値にそろえる（描いていない物は掴めない）
+        """
+        low, high = DETAIL_MIN_WIDTHS
+        self._detail_min_width = min(max(width, low), high)
+        self._value_lines.detail_min_width = self._detail_min_width
         self.update()
 
     def _show_project(self, project: Project) -> None:
@@ -643,7 +676,7 @@ class TimelineView(QWidget):
             # 全体表示で数千本を描くことになり、60fps の予算に収まらない
             dense: list[Clip] = []
             for clip in clips_in_range(band.track, start_frame, end_frame):
-                if clip.duration * scale < DETAIL_MIN_WIDTH:
+                if clip.duration * scale < self._detail_min_width:
                     dense.append(clip)
                     continue
                 rect = clip_rect_for(clip, band, self._layout, width)
@@ -651,15 +684,25 @@ class TimelineView(QWidget):
                     self._paint_detailed(
                         painter, band, clip, rect, clip.id in selected, clip.id == editing
                     )
-            sound_only = None
-            if dense and band.track.kind is TrackKind.MIXED:
-                # 素材の引き表は、細い帯のあるレイヤーが出たときに 1 度だけ作って使い回す
-                # レイヤーごとに作ると、素材とレイヤーが多い作品で描くたびに掛け算で重くなる
-                if media is None:
-                    media = {item.id: item for item in self._project.media}
-                sound_only = self._sound_only(band.track, media)
+            if not dense:
+                continue
+            # 素材の引き表は、細い帯が出たときに 1 度だけ作って使い回す トラックごとに
+            # 作ると、素材とトラックが多い作品で描くたびに掛け算で重くなる
+            if media is None:
+                media = {item.id: item for item in self._project.media}
+            sound_only = (
+                self._sound_only(band.track, media) if band.track.kind is TrackKind.MIXED else None
+            )
             draw_dense_clips(
-                painter, band, dense, self._layout, width, selected, sound_only, editing
+                painter,
+                band,
+                dense,
+                self._layout,
+                width,
+                selected,
+                sound_only,
+                editing,
+                self._glance(band.track, media),
             )
 
         # グループ制御の受け持ちは、クリップの上に薄く重ねる（中身が隠れない濃さ）
@@ -703,6 +746,62 @@ class TimelineView(QWidget):
             return sound and not picture
 
         return judge
+
+    def _glance(
+        self, track: Track, media: dict[MediaId, MediaItem]
+    ) -> Callable[[Clip], ClipGlance | None]:
+        """細い帯に描く中身の目安（絵の平均の色・音の大きさ）を、クリップごとに引く
+
+        解析（サムネイル・波形）がまだの素材は目安を出さない 無地の帯のまま描き、
+        できたら描き直しで出る（:meth:`MainWindow._on_analysis_ready`） 絵と音の両方を
+        持つクリップは絵を出す 1 本の細い帯に両方を重ねると、どちらも読めない
+        """
+        rate = self._project.rate
+        heard = track.kind is not TrackKind.VIDEO
+        gain = 10.0 ** (track.volume_db / 20.0) if heard else 1.0
+        cache = self._glance_cache
+
+        def look(clip: Clip) -> ClipGlance | None:
+            item = media.get(clip.media_id) if clip.media_id is not None else None
+            if item is None:
+                return None
+            # クリップ・素材・トラックの音量が同じ物なら前に求めた目安を使う 素材の時刻は
+            # 分数で数えるので、細い帯 2000 本で毎回求めると全体表示の描画が 2.4ms から
+            # 12ms まで延びた クリップは書き換えると別の物になるので、同じ物かで見れば足りる
+            cached = cache.get(clip.id)
+            if (
+                cached is not None
+                and cached[0] is clip
+                and cached[1] is item
+                and cached[2] == gain
+                and cached[3] == rate
+            ):
+                return cached[4]
+            found = self._look_up_glance(track, clip, item, rate, gain)
+            # 解析がまだの物は貯めない できたら次の描き直しで出す
+            if found is not None:
+                if len(cache) >= _GLANCE_CACHE_LIMIT:
+                    cache.clear()
+                cache[clip.id] = (clip, item, gain, rate, found)
+            return found
+
+        return look
+
+    def _look_up_glance(
+        self, track: Track, clip: Clip, item: MediaItem, rate: FrameRate, gain: float
+    ) -> ClipGlance | None:
+        """:meth:`_glance` の中身 解析の結果から目安を求める"""
+        picture, sound = clip_content(track, clip, item)
+        if picture:
+            strip = self._analyzer.filmstrip(item)
+            tint = filmstrip_tint(strip, clip, rate) if strip is not None else None
+            if tint is not None:
+                return ClipGlance(tint=tint)
+        if sound:
+            wave = self._analyzer.waveform(item, heard_stream(track, clip))
+            if wave is not None:
+                return ClipGlance(level=waveform_level(wave, clip, rate, track_gain=gain))
+        return None
 
     def _highlighted(self) -> frozenset[ClipId]:
         """選んだ枠を描くクリップ 選んだものと、リンクした相手（映像と音声の組）
@@ -1103,8 +1202,28 @@ class TimelineView(QWidget):
             return
         self._update_cursor(position, event.modifiers())
         button = self._track_button_at(position)
-        self.setToolTip(button[1] if button is not None else "")
+        self.setToolTip(button[1] if button is not None else self._narrow_clip_tip(position))
         self._hover_add_button(position)
+
+    def _narrow_clip_tip(self, position: QPoint) -> str:
+        """マウスの下が細い帯のクリップなら、名前と長さ それ以外は空
+
+        細い帯には名前を描かない（:func:`draw_dense_clips`） 選ばずに何のクリップかを
+        確かめる手段が無いと、引いた表示で中身を探すたびに拡大することになる（#247）
+        名前の入る幅のクリップには出さない 名前が見えているのに同じ物が重なって邪魔になる
+        """
+        hit = self._clip_at(position)
+        if hit is None:
+            return ""
+        _, clip = hit
+        if clip.duration * self._layout.pixels_per_frame >= self._detail_min_width:
+            return ""
+        media = self._project.find_media(clip.media_id) if clip.media_id is not None else None
+        scene = self._project.find_scene(clip.scene_id) if clip.scene_id is not None else None
+        scene_name = (
+            scene.name if scene is not None else ("（消えたシーン）" if clip.scene_id else None)
+        )
+        return clip_summary(clip, media, self._project.rate, scene_name)
 
     def _drag_to(self, position: QPoint) -> bool:
         """ドラッグ中なら ``position`` まで進めて真を返す 端で表示を送った後にも呼ぶ"""
@@ -2057,7 +2176,7 @@ class TimelineView(QWidget):
         if hit is None:
             return False
         _, clip = hit
-        if clip.duration * self._layout.pixels_per_frame < DETAIL_MIN_WIDTH:
+        if clip.duration * self._layout.pixels_per_frame < self._detail_min_width:
             return False
         band = self._layout.band_at(self._project.timeline, position.y())
         rect = clip_rect_for(clip, band, self._layout, self.width()) if band else None
