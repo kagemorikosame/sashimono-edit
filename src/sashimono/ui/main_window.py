@@ -330,6 +330,10 @@ class MainWindow(QMainWindow):
         #: 渡すと、画面では気付かないまま低解像度の絵が最終出力に入る
         self._proxies = ProxyBuilder(ProxyStore(height=self._preferences.proxy_height))
         self._analysis_dirty = False
+        #: 解析ができた素材 次の間隔でタイムラインの細い帯の目安を求め直させる
+        #: ワーカースレッドが足し、画面のスレッドが取り出すので錠で守る（``_proxied`` と同じ）
+        self._analyzed: set[MediaId] = set()
+        self._analyzed_lock = threading.Lock()
         #: 素材一覧から外して解析と控えを捨てた素材 取り消しで戻ったら頼み直す
         #: （:meth:`_reanalyze_returned`）
         self._forgotten: set[MediaId] = set()
@@ -1753,7 +1757,9 @@ class MainWindow(QMainWindow):
     def _on_analysis_ready(self, media_id: MediaId) -> None:
         # ワーカースレッドから呼ばれる ここでウィジェットに触ると Qt が落ちるので、
         # 印だけ付けてメインスレッドのタイマーに描き直させる
-        del media_id
+        # どの素材かも覚える タイムラインの細い帯の目安を、その素材のぶんだけ求め直させる
+        with self._analyzed_lock:
+            self._analyzed.add(media_id)
         self._analysis_dirty = True
 
     def _request_proxy(self, media: MediaItem) -> None:
@@ -1806,6 +1812,9 @@ class MainWindow(QMainWindow):
         if not self._analysis_dirty:
             return
         self._analysis_dirty = False
+        with self._analyzed_lock:
+            analyzed, self._analyzed = self._analyzed, set()
+        self._timeline.forget_glances(analyzed)
         self._media_pool.refresh_thumbnails()
         self._timeline.update()
 

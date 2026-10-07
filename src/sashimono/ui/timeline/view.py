@@ -351,6 +351,11 @@ class TimelineView(QWidget):
         return self._project
 
     def set_project(self, project: Project) -> None:
+        if project.media is not self._project.media:
+            # 一覧から外れた素材の目安は捨てる 残すと、外して取り消したときに同じクリップと
+            # 素材が戻り、解析を作り直した後も前の目安を使い続ける
+            present = {item.id for item in project.media}
+            self.forget_glances({cached[1].id for cached in self._glance_cache.values()} - present)
         self._project = project
         # 消えたクリップは選択から外す 存在しない ID を持ち続けると、次の操作で
         # 「見つからない」例外になる
@@ -389,6 +394,19 @@ class TimelineView(QWidget):
         low, high = DETAIL_MIN_WIDTHS
         self._detail_min_width = min(max(width, low), high)
         self._value_lines.detail_min_width = self._detail_min_width
+        self.update()
+
+    def forget_glances(self, media_ids: Iterable[MediaId]) -> None:
+        """その素材のクリップの、細い帯の目安の控えを捨てる 解析ができ直したときに窓が呼ぶ
+
+        目安はクリップと素材が同じ物なら使い回す（:meth:`_glance`） 解析の結果は見ない
+        ので、作り直した結果を映すには捨てるしかない
+        """
+        dropped = set(media_ids)
+        if not dropped:
+            return
+        for clip_id in [k for k, v in self._glance_cache.items() if v[1].id in dropped]:
+            del self._glance_cache[clip_id]
         self.update()
 
     def _show_project(self, project: Project) -> None:

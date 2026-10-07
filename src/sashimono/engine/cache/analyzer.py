@@ -188,6 +188,17 @@ class MediaAnalyzer:
             self._cancelled.discard(key)
             self._running.add(key)
             self._board.start(key, media.id)
+        self._launch(key, media, work, on_ready)
+
+    def _launch(
+        self,
+        key: _JobKey,
+        media: MediaItem,
+        work: Callable[[MediaItem, _JobKey, Callable[[float], None]], bool],
+        on_ready: Callable[[MediaId], None] | None,
+    ) -> None:
+        """``_running`` に載せた仕事を投げる 載せるのは呼ぶ側（:meth:`_submit` と走らせ直し）"""
+        kind = key[0]
 
         def report(value: float) -> None:
             self._board.report(key, value)
@@ -204,9 +215,13 @@ class MediaAnalyzer:
             finally:
                 with self._lock:
                     stopped = self._closed or key in self._cancelled
-                    self._running.discard(key)
                     self._cancelled.discard(key)
                     again = self._again.pop(key, None)
+                    # 走らせ直すなら、鍵を ``_running`` に載せたまま次へ渡す 1 度外してから
+                    # 投げ直すと、その間に素材を外された（forget）とき、forget は旧い仕事も
+                    # 次の仕事も見つけられず、外した素材の解析が始まって結果が載る
+                    if again is None:
+                        self._running.discard(key)
             if stopped:
                 self._board.drop(key)
             elif produced:
@@ -218,12 +233,17 @@ class MediaAnalyzer:
             if produced and not stopped and on_ready is not None:
                 on_ready(media.id)
             if again is not None:
-                self._submit(key, *again)
+                with self._lock:
+                    # 間に外されていれば ``_cancelled`` に入っている 次の仕事はすぐ止まり、
+                    # 結果も載せない（:meth:`_publish`）
+                    self._board.start(key, again[0].id)
+                self._launch(key, *again)
 
         with self._lock:
             # close と同じロックの中で投げる（close の説明を参照）
             if self._closed:
                 self._running.discard(key)
+                self._cancelled.discard(key)
                 self._board.drop(key)
                 return
             self._executor.submit(run)

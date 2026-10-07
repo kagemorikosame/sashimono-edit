@@ -490,6 +490,15 @@ class ProxyBuilder:
             self._running.add(media.id)
             self._progress[media.id] = 0.0
             self._board.start(media.id, media.id)
+        self._launch(media, on_ready, on_progress)
+
+    def _launch(
+        self,
+        media: MediaItem,
+        on_ready: Callable[[MediaId], None] | None,
+        on_progress: Callable[[MediaId], None] | None,
+    ) -> None:
+        """``_running`` に載せた変換を投げる 載せるのは呼ぶ側（:meth:`request` と作り直し）"""
 
         def report(value: float) -> None:
             with self._lock:
@@ -526,10 +535,14 @@ class ProxyBuilder:
             finally:
                 with self._lock:
                     stopped = self._closed or media.id in self._cancelled
-                    self._running.discard(media.id)
                     self._cancelled.discard(media.id)
                     self._progress.pop(media.id, None)
                     again = self._again.pop(media.id, None)
+                    # 作り直すなら ``_running`` に載せたまま次へ渡す 1 度外してから頼み直すと、
+                    # その間に素材を外された（forget）とき、forget は旧い変換も次の変換も
+                    # 見つけられず、外した素材の控えを作り始める（解析と同じ）
+                    if again is None:
+                        self._running.discard(media.id)
             if stopped:
                 self._board.drop(media.id)
             elif made is None:
@@ -543,13 +556,18 @@ class ProxyBuilder:
             if made is not None and not stopped and on_ready is not None:
                 on_ready(media.id)
             if again is not None:
-                self.request(again[0], on_ready=again[1], on_progress=again[2])
+                with self._lock:
+                    # 間に外されていれば ``_cancelled`` に入っている 次の変換はすぐ止まる
+                    self._progress[media.id] = 0.0
+                    self._board.start(media.id, media.id)
+                self._launch(*again)
 
         with self._lock:
             # close と同じロックの中で投げる 外で投げると、止めた直後の
             # executor へ投げて RuntimeError になる
             if self._closed:
                 self._running.discard(media.id)
+                self._cancelled.discard(media.id)
                 self._progress.pop(media.id, None)
                 self._board.drop(media.id)
                 return

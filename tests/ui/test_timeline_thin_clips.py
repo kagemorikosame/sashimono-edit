@@ -290,6 +290,46 @@ class TestChosenThinBands:
             analyzer.close()
 
 
+#: 解析をやり直した後の絵の平均の色
+BLUE = QColor(30, 40, 220)
+
+
+class TestGlanceAfterReanalysis:
+    """目安はクリップと素材が同じなら使い回す 解析をやり直したときは古い物を使わない（PR #263）"""
+
+    def _middle(self, scene: _Scene) -> QColor:
+        clip = scene.clip(0, 0)
+        band = scene.band(0)
+        x = scene.left(clip) + int(THIN * SCALE) // 2
+        return scene.render().pixelColor(x, band.top + band.height // 2)
+
+    def test_removing_and_undoing_the_material_draws_the_new_analysis(self, scene: _Scene) -> None:
+        # 外して取り消すと同じクリップと素材が戻る 控えを捨てないと、解析を作り直しても
+        # 外す前の色のまま描き続ける
+        assert _close(self._middle(scene), RED)
+        without = tuple(m for m in scene.project.media if m.id != scene.video.id)
+        scene.view.set_project(replace(scene.project, media=without))
+        scene.view.set_project(scene.project)
+        scene.analyzer._fixed_filmstrips[scene.video.id] = _filmstrip(BLUE)
+        assert _close(self._middle(scene), BLUE)
+
+    def test_a_new_analysis_of_the_material_replaces_the_glance(self, scene: _Scene) -> None:
+        # 解析ができたと知らされても控えを使い続けると、作り直した結果が細い帯に出ない
+        assert _close(self._middle(scene), RED)
+        scene.analyzer._fixed_filmstrips[scene.video.id] = _filmstrip(BLUE)
+        scene.view.forget_glances([scene.video.id])
+        assert _close(self._middle(scene), BLUE)
+
+    def test_other_materials_keep_their_glance(self, scene: _Scene) -> None:
+        # 1 本の解析ができるたびに全部を求め直すと、素材の多い作品で描くのが重くなる
+        scene.render()
+        kept = dict(scene.view._glance_cache)
+        scene.view.forget_glances([scene.video.id])
+        left = scene.view._glance_cache
+        assert all(v[1].id != scene.video.id for v in left.values())
+        assert {k for k, v in kept.items() if v[1].id != scene.video.id} == set(left)
+
+
 def _hover(view: TimelineView, position: QPoint) -> str:
     event = QMouseEvent(
         QMouseEvent.Type.MouseMove,

@@ -115,8 +115,94 @@ class TestAnalyzerRequestWhileCancelling:
             gate.set()
             analyzer.close()
 
+    def test_forgetting_between_the_old_job_and_the_rerun_stops_the_rerun(
+        self, tmp_path: Path, audio_media: MediaItem
+    ) -> None:
+        # 旧い仕事が鍵を外してから走らせ直すまでの間に外されると、forget はどちらの仕事も
+        # 見つけられず、外した素材の波形が載った（PR #263 の指摘）
+        analyzer = MediaAnalyzer(CacheStore(tmp_path / "cache"))
+        gate = threading.Event()
+        started = threading.Event()
+        runs: list[int] = []
+
+        def work(media: MediaItem, job: tuple[str, MediaId, int | None], report: object) -> bool:
+            del report
+            runs.append(1)
+            if len(runs) == 1:
+                started.set()
+                gate.wait(WAIT)
+            return analyzer._publish("waveform", media.id, _waveform(), job[2])
+
+        analyzer._analyze_waveform = work  # type: ignore[method-assign]  # 素材を開かずに試す
+        board = analyzer._board
+        original_drop = board.drop
+
+        def drop_then_forget(key: object) -> None:
+            # 旧い仕事が終わりを書いた直後（走らせ直す前）に素材を外す
+            original_drop(key)
+            analyzer.forget(audio_media.id)
+
+        board.drop = drop_then_forget  # type: ignore[method-assign]  # 割り込む所を差し込む
+        try:
+            analyzer.request(audio_media)
+            assert started.wait(WAIT)
+            analyzer.forget(audio_media.id)
+            analyzer.request(audio_media)
+            gate.set()
+            assert _wait_for(lambda: len(runs) >= 2 and not analyzer._running)
+            assert analyzer.waveform(audio_media) is None
+        finally:
+            gate.set()
+            analyzer.close()
+
 
 class TestProxyRequestWhileCancelling:
+    def test_forgetting_between_the_old_proxy_and_the_rerun_stops_the_rerun(
+        self, tmp_path: Path, video_media: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 解析と同じ 間に外されると、外した素材の控えを作り始めた（PR #263 の指摘）
+        gate = threading.Event()
+        started = threading.Event()
+        calls: list[Path] = []
+
+        def fake(source: Path, target: Path, **kwargs: object) -> Path | None:
+            del source
+            calls.append(target)
+            if len(calls) == 1:
+                started.set()
+                gate.wait(WAIT)
+                return None
+            stop = kwargs["should_cancel"]
+            assert callable(stop)
+            if stop():
+                return None
+            target.write_bytes(b"proxy")
+            return target
+
+        monkeypatch.setattr(proxy_module, "create_proxy", fake)
+        stream = replace(video_media.video_streams[0], width=3840, height=2160)
+        video_media = replace(video_media, video_streams=(stream,))
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path / "cache")))
+        board = builder._board
+        original_drop = board.drop
+
+        def drop_then_forget(key: object) -> None:
+            original_drop(key)
+            builder.forget(video_media.id)
+
+        board.drop = drop_then_forget  # type: ignore[method-assign]  # 割り込む所を差し込む
+        try:
+            builder.request(video_media)
+            assert started.wait(WAIT)
+            builder.forget(video_media.id)
+            builder.request(video_media)
+            gate.set()
+            assert _wait_for(lambda: len(calls) >= 2 and not builder._running)
+            assert builder.store.find(video_media) is None
+        finally:
+            gate.set()
+            builder.close()
+
     def test_a_request_while_a_cancelled_proxy_runs_is_done_after_it(
         self, tmp_path: Path, video_media: MediaItem, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -219,6 +305,22 @@ class TestWindowAsksAgain:
         main.redo()
         main.undo()
         assert analyzed.count(video_media.id) == 1
+
+
+class TestWindowRefreshesTheGlance:
+    def test_a_finished_analysis_drops_only_that_material_s_glance(
+        self,
+        window: tuple[MainWindow, list[MediaId], list[MediaId]],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 知らせを受けても細い帯の目安を捨てないと、作り直した解析が帯に出ない
+        main, _, _ = window
+        dropped: list[set[MediaId]] = []
+        monkeypatch.setattr(main._timeline, "forget_glances", lambda ids: dropped.append(set(ids)))
+        main._on_analysis_ready(video_media.id)
+        main._flush_analysis()
+        assert dropped == [{video_media.id}]
 
 
 class TestWindowAppliesTheWidth:
