@@ -271,7 +271,28 @@ MAX_SCENE_DEPTH = 8
 MAX_OPEN_DECODERS = 8
 
 #: 作った絵を覚えておくクリップの数 1 枚で画面 1 枚ぶんのメモリを使う
+#: 画面より大きく作った絵（はみ出す図形やテキスト）は、画面何枚ぶんかで数える（:func:`_make_room`）
 MAX_GENERATED_CACHE = 48
+
+
+def _make_room(cache: OrderedDict[ClipId, _Made], image: np.ndarray, screen_bytes: int) -> None:
+    """``image`` を覚える前に、古い絵から捨てて画面 :data:`MAX_GENERATED_CACHE` 枚ぶんに収める
+
+    数ではなく大きさで数える 画面より大きい絵は 1 枚で画面の何倍にもなり（一辺 8192 まで
+    広げると 256MB）、数だけで数えると長いテロップを並べたタイムラインでメモリを食い潰す
+    画面と同じ大きさ以下の絵は 1 枚で 1 つ分なので、今までと同じ数だけ覚える
+    入れ替える絵は呼ぶ側が先に外しておく（入れ替えでは関係ないクリップの絵を捨てない）
+    """
+
+    def weight(picture: np.ndarray) -> int:
+        return max(1, -(-int(picture.nbytes) // max(1, screen_bytes)))
+
+    used = sum(weight(made.image) for made in cache.values())
+    needed = weight(image)
+    while cache and used + needed > MAX_GENERATED_CACHE:
+        _, dropped = cache.popitem(last=False)
+        used -= weight(dropped.image)
+
 
 #: レイヤーごとの並列デコードに使うスレッドの数の既定 1 なら並べない
 #: PyAV のデコードは GIL を解放するので、別の素材どうしなら本当に重なる
@@ -1218,8 +1239,8 @@ class FrameRenderer:
     ) -> tuple[tuple[float, float, float, float], tuple[int, int]] | None:
         """生成オブジェクトの入れ物（画素 左・上・右・下）と絵の大きさ 外枠を出すため
 
-        描く道と同じ入れ物を返す 画面に収まる絵は :meth:`_object_box_of`（文字の枠も含む）、
-        画面より大きい絵は色の付いた範囲だけ（:meth:`_draw_oversized`）
+        描く道と同じ入れ物（:meth:`_object_box_of` 文字の枠も含む）を返す 画面より大きい絵
+        （:meth:`_draw_oversized`）も同じ はみ出す長さのテキストだけ入れ物が変わらないように
 
         **GL を使わない** 絵は CPU で作り、同じ設定なら描いたときに覚えた物を使う 別のスレッドの
         先読みが出した絵には、画面の側のレンダラはまだ何も作っていない 選んだクリップの
@@ -1236,10 +1257,7 @@ class FrameRenderer:
         if image is None:
             return None
         height, width = int(image.shape[0]), int(image.shape[1])
-        if width > self._compositor.width or height > self._compositor.height:
-            box = _merged_box(self._content_box_of(clip, image), None)
-        else:
-            box = self._object_box_of(clip, image)
+        box = self._object_box_of(clip, image)
         if box is None:
             return None
         return box, (width, height)
@@ -1252,11 +1270,7 @@ class FrameRenderer:
         if image is None:
             return None
         height, width = int(image.shape[0]), int(image.shape[1])
-        screen_width, screen_height = self._project.settings.resolution
-        if width > screen_width or height > screen_height:
-            box = _merged_box(self._content_box_of(clip, image), None)
-        else:
-            box = self._object_box_of(clip, image)
+        box = self._object_box_of(clip, image)
         if box is None:
             return None
         scale_x, scale_y = self._scale
@@ -1374,7 +1388,9 @@ class FrameRenderer:
                 frame=local_frame,
                 fps=float(rate.fps),
                 duration=clip.duration,
-                bounds=_merged_box(self._content_box_of(clip, image), None),
+                # 画面に収まる絵と同じ入れ物（AviUtl2 の組み方のテキストなら文字の枠も入れる）
+                # 色の付いた範囲だけにすると、はみ出す長さの字だけ効果の基準が変わる
+                bounds=self._object_box_of(clip, image),
             )
             self._compositor.draw_handle(
                 result.color, placed, opacity=opacity, flip=False, blend=clip.blend_mode
@@ -2269,7 +2285,9 @@ class FrameRenderer:
             canvas, scale = self._project.settings.resolution, (1.0, 1.0)
         else:
             canvas, scale = (self._compositor.width, self._compositor.height), self._scale
-        width, height = source_canvas(source, *canvas, frame=local_frame, scale=scale)
+        width, height = source_canvas(
+            source, *canvas, frame=local_frame, scale=scale, fps=float(rate.fps)
+        )
         # 同じ絵をもう一度作らない テキストは 1 枚で数ミリ秒かかり、動かない字幕を
         # 何本も重ねたタイムラインでは、そこが再生の足を引っ張る
         # 時間で変わらない絵は、フレームを鍵に入れない（毎フレーム作り直さない）
@@ -2308,13 +2326,13 @@ class FrameRenderer:
             audio_rate=heard[1] if heard is not None else 44100,
             trail_paths=self._trail_paths,
             scale=scale,
+            screen=canvas,
         )
         if image is not None:
-            # 入れ替えのときは減らない 先に捨てると、関係ないクリップの絵が消える
-            if clip.id not in self._generated and len(self._generated) >= MAX_GENERATED_CACHE:
-                self._generated.popitem(last=False)
+            self._generated.pop(clip.id, None)
+            screen_width, screen_height = self._project.settings.resolution
+            _make_room(self._generated, image, screen_width * screen_height * 4)
             self._generated[clip.id] = _Made(key, image, framed)
-            self._generated.move_to_end(clip.id)
         return image
 
     def _content_box_of(self, clip: Clip, image: np.ndarray) -> _Box | None:

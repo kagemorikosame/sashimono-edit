@@ -120,6 +120,7 @@ def render_source_framed(
     audio_rate: int = 44100,
     trail_paths: TrailPaths | None = None,
     scale: tuple[float, float] = (1.0, 1.0),
+    screen: tuple[int, int] | None = None,
 ) -> tuple[np.ndarray | None, Frame | None]:
     """:func:`render_source` と同じ絵と、オブジェクトの枠
 
@@ -132,6 +133,9 @@ def render_source_framed(
     値を 1 つずつ縮めるのではなく描く座標ごと縮めるのは、文字の中の制御文字
     （``<s大きさ>``）のように設定の欄に無い画素の値まで漏れなく縮めるため
     枠も絵の画素で返す
+
+    ``screen`` は広げる前の大きさ（合成の画素 :func:`source_canvas` に渡した物）
+    絵がそれより大きければ、文字の影は影の周りだけで作る（:func:`_shadow_layer`）
     """
     definition = source_registry.get(source.kind)
     if definition is None:
@@ -150,6 +154,7 @@ def render_source_framed(
     # 巻き込んで捨てないように） 無ければ移動軌跡を描くときだけその場で作る
     # （文字や普通の図形のたびに作らない）
     values["_trail_paths"] = trail_paths
+    values["_crop_shadow"] = screen is not None and (width > screen[0] or height > screen[1])
     image = QImage(width, height, QImage.Format.Format_RGBA8888)
     image.fill(Qt.GlobalColor.transparent)
 
@@ -206,15 +211,21 @@ def source_canvas(
     *,
     frame: int = 0,
     scale: tuple[float, float] = (1.0, 1.0),
+    fps: float = 30.0,
 ) -> tuple[int, int]:
-    """生成オブジェクトを描く絵の大きさ 画面より大きい図形なら、はみ出す分まで広げる
+    """生成オブジェクトを描く絵の大きさ 画面からはみ出す図形とテキストは、はみ出す分まで広げる
 
     中心は画面の中心のまま広げる（描く位置の計算は変えない） 画面の大きさで
     切ってしまうと、画面より大きい図形を回したり動かしたりしたときに、切れた端が
     見えてしまう（YMM4 の斜めの帯のトランジションは高さ 2160 の図形を 45 度回す）
+    テキストも同じで、画面の幅を超える 1 行や、位置をずらして画面の外へ寄せた字が
+    端で切れていた（#256）
 
     ``width`` と ``height`` は合成の大きさ ``scale`` は :func:`render_source_framed` と同じ
+    ``fps`` はタイマーの文字を数えるため（:func:`render_source_framed` と同じ値を渡す）
     """
+    if source.kind == "text":
+        return _text_canvas(source, width, height, frame, scale, fps)
     if source.kind != "shape":
         return width, height
     definition = source_registry.get(source.kind)
@@ -245,12 +256,108 @@ def source_canvas(
     # 絵で足りる 縮めずに見積もると、画面より大きいと見なして毎フレーム余分に広い絵を作る
     needed_width = 2.0 * (abs(_number(values, "pos_x", 0.0)) + reach) * scale[0]
     needed_height = 2.0 * (abs(_number(values, "pos_y", 0.0)) + reach) * scale[1]
+    return _grown(width, height, needed_width, needed_height)
+
+
+def _grown(width: int, height: int, needed_width: float, needed_height: float) -> tuple[int, int]:
+    """画面 ``width`` x ``height`` を、中心を変えずに ``needed`` まで広げた大きさ
+
+    収まるなら画面のまま（今までと同じ絵） 一辺は :data:`MAX_CANVAS` まで それより外は切れる
+    """
     grown_width = min(MAX_CANVAS, max(width, int(np.ceil(needed_width))))
     grown_height = min(MAX_CANVAS, max(height, int(np.ceil(needed_height))))
     # 画面と偶奇をそろえる 差が奇数だと、中心が半画素ずれて輪郭がにじむ
-    grown_width += (grown_width - width) % 2
-    grown_height += (grown_height - height) % 2
-    return grown_width, grown_height
+    # 上限が画面と偶奇の違う数でも上限を超えないよう、そのときは 1 つ減らす
+    grown_width += (grown_width - width) % 2 * (1 if grown_width < MAX_CANVAS else -1)
+    grown_height += (grown_height - height) % 2 * (1 if grown_height < MAX_CANVAS else -1)
+    return max(width, grown_width), max(height, grown_height)
+
+
+#: 字の広がりに足す余白（画面の画素） 輪郭の滑らかにした端の 1 画素と、Qt が字の形の
+#: 外へ少しだけ塗る分 足りないと、ちょうど画面の端に届く字の端が 1 画素だけ欠ける
+_TEXT_MARGIN = 2.0
+
+
+def _text_canvas(
+    source: GeneratedSource,
+    width: int,
+    height: int,
+    frame: int,
+    scale: tuple[float, float],
+    fps: float,
+) -> tuple[int, int]:
+    """テキストを描く絵の大きさ 字・縁取り・影が画面からはみ出すなら、その分まで広げる"""
+    definition = source_registry.get(source.kind)
+    if definition is None:
+        return width, height
+    values = _resolve(definition, source.params, frame)
+    if str(values.get("timer_format", "")):
+        # タイマーは描く所（:func:`_text_layers`）と同じ文字を、ここで先に作っておく
+        values["_seconds"] = frame / max(fps, 1e-6)
+        values["_fps"] = fps
+        values["text"] = timer_text(values)[:200]
+        values["timer_format"] = ""
+    pos_x = _number(values, "pos_x", 0.0)
+    pos_y = _number(values, "pos_y", 0.0)
+    # 位置と文字送りは鍵から外す 位置は広がりをずらすだけで、文字送りは全部を出した字の
+    # 広がりに収まる（出ている字は全体の頭の部分） 鍵に入れると、流れるテロップや
+    # 文字送りの字幕で毎フレーム字を組み直し、絵の大きさもフレームごとに揺れる
+    values["pos_x"], values["pos_y"], values["reveal"] = 0.0, 0.0, 100.0
+    reach = _text_reach(
+        tuple(sorted((name, value) for name, value in values.items() if not name.startswith("_")))
+    )
+    if reach is None:
+        return width, height
+    left, top, right, bottom = reach
+    # 画面の Y は下が正 設定の Y は上が正なので、上へずらすと字の上端は小さくなる
+    needed_width = 2.0 * max(abs(left + pos_x), abs(right + pos_x)) * scale[0]
+    needed_height = 2.0 * max(abs(top - pos_y), abs(bottom - pos_y)) * scale[1]
+    return _grown(width, height, needed_width, needed_height)
+
+
+@lru_cache(maxsize=256)
+def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
+    """位置 0 に置いた字が、置いた所からどこまで届くか（画面の画素 左・上・右・下）
+
+    字の輪郭に縁取りの太さ、影のずれとぼかしを足す AviUtl2 の組み方の文字の枠も入れる
+    （効果はこの枠を入れ物にするので、絵の外に出ると入れ物が切れる） 字が無ければ ``None``
+
+    同じ設定なら同じ答え 動かない字幕を描くたびに字を組み直さないよう覚えておく
+    """
+    values = dict(items)
+    laid = _text_layers(values, 0, 0)
+    if laid is None:
+        return None
+    layers, framed = laid
+    reach = QRectF()
+    for path, look, clip in layers:
+        box = path.boundingRect()
+        if clip is not None:
+            box = box.intersected(clip.boundingRect())
+        if box.isEmpty():
+            continue
+        border = max(0.0, _number(look, "border_width", 0.0))
+        inked = box.adjusted(-border, -border, border, border)
+        reach = reach.united(inked)
+        shift_x = _number(look, "shadow_x", 0.0)
+        shift_y = _number(look, "shadow_y", 0.0)
+        blur = max(0.0, _number(look, "shadow_blur", 0.0))
+        if (shift_x, shift_y, blur) != (0.0, 0.0, 0.0) and _color(look.get("shadow_color")).alpha():
+            # 箱ぼかしを 2 回掛けるので、影はぼかしの幅の 2 倍まで広がる（:func:`_blur_alpha`）
+            spread = 2.0 * blur + 1.0
+            shadow = inked.translated(shift_x, -shift_y)
+            reach = reach.united(shadow.adjusted(-spread, -spread, spread, spread))
+    if framed is not None:
+        reach = reach.united(QRectF(QPointF(framed[0], framed[1]), QPointF(framed[2], framed[3])))
+    if reach.isEmpty():
+        return None
+    margin = _TEXT_MARGIN
+    return (
+        reach.left() - margin,
+        reach.top() - margin,
+        reach.right() + margin,
+        reach.bottom() + margin,
+    )
 
 
 def _resolve(
@@ -375,10 +482,30 @@ def format_time(value: float, pattern: str) -> str:
 _AVIUTL_BOLD = 1.0 / 48.0
 
 
+#: 描く字の 1 層 字の輪郭・その字の飾りの値・切る形（変形した字だけ文字の枠 ほかは ``None``）
+_Layer = tuple[QPainterPath, dict[str, object], QPainterPath | None]
+
+
 def _draw_text(
     painter: QPainter, values: dict[str, object], width: int, height: int
 ) -> Frame | None:
     """横書きと縦書きを描き分ける AviUtl2 の組み方なら文字の枠を返す"""
+    laid = _text_layers(values, width, height)
+    if laid is None:
+        return None
+    layers, framed = laid
+    _paint_layers(painter, layers)
+    return framed
+
+
+def _text_layers(
+    values: dict[str, object], width: int, height: int
+) -> tuple[list[_Layer], Frame | None] | None:
+    """字を組んで、描く層と文字の枠を返す 字が無ければ ``None``
+
+    組むのと塗るのを分けておくのは、描く前に字の広がりを測るため（:func:`source_canvas`）
+    同じ組み方を 2 つ書くと、測った広がりと描いた字が食い違って端が切れる
+    """
     raw = str(values.get("text", ""))
     if str(values.get("timer_format", "")):
         raw = timer_text(values)[:200]
@@ -399,8 +526,7 @@ def _draw_text(
         centre_y = height / 2.0 - _number(values, "pos_y", 0.0)
         family = aviutl_font_family(str(values.get("font", AVIUTL_DEFAULT_FONT)))
         groups, framed = _aviutl_lines(tagged, family, size, bold, values, centre_x, centre_y)
-        _paint_groups(painter, groups, values)
-        return framed
+        return _group_layers(groups, values), framed
 
     text = _revealed(raw, values)
     if not text:
@@ -419,8 +545,8 @@ def _draw_text(
 
     metrics = QFontMetricsF(font)
     if bool(values.get("vertical", False)):
-        _draw_vertical_text(painter, text, font, metrics, values, width, height)
-        return None
+        vertical = _vertical_text_path(text, font, metrics, values, width, height)
+        return [(vertical, values, None)], None
 
     lines = text.split(chr(10))
     centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
@@ -464,8 +590,7 @@ def _draw_text(
             placed.translate(_bold_drift(plain, placed), 0.0)
         path.addPath(placed)
 
-    _paint_glyphs(painter, path, values)
-    return None
+    return [(path, values, None)], None
 
 
 def _bold_drift(plain: QPainterPath, bold: QPainterPath) -> float:
@@ -831,16 +956,15 @@ def _revealed(text: str, values: dict[str, object]) -> str:
     return "".join(shown)
 
 
-def _draw_vertical_text(
-    painter: QPainter,
+def _vertical_text_path(
     text: str,
     font: QFont,
     metrics: QFontMetricsF,
     values: dict[str, object],
     width: int,
     height: int,
-) -> None:
-    """縦書き 行は右から左へ並べる
+) -> QPainterPath:
+    """縦書きの字の輪郭 行は右から左へ並べる
 
     Qt に縦書きの組版は無いので、1 文字ずつ縦に置く 日本語のテロップでは
     使う場面がはっきりあるので、簡素でも入れておく
@@ -871,36 +995,15 @@ def _draw_vertical_text(
             baseline = top + advance * row_index + metrics.ascent()
             offset = metrics.horizontalAdvance(character) / 2.0
             path.addText(QPointF(x - offset, baseline), font, character)
-
-    _paint_glyphs(painter, path, values)
-
-
-def _paint_glyphs(
-    painter: QPainter,
-    path: QPainterPath,
-    values: dict[str, object],
-) -> None:
-    """組み上がった文字の輪郭を、影・縁取り・塗りの順に描く
-
-    縦書きでも横書きでも飾りの付け方は同じなので、ここに 1 つだけ置く
-    順番は下から影・縁・塗り 入れ替えると縁が影を隠す
-    """
-    _paint_layers(painter, [(path, values, None)])
+    return path
 
 
-def _paint_groups(
-    painter: QPainter,
-    groups: list[_Group],
-    values: dict[str, object],
-) -> None:
-    """制御文字で色や装飾を変えた字を、見た目ごとに塗る 影・縁・塗りの順は全体で守る"""
-    _paint_layers(
-        painter,
-        [
-            (path, _redecorated(_recoloured(values, look.color, look.edge), look), clip)
-            for path, look, clip in groups
-        ],
-    )
+def _group_layers(groups: list[_Group], values: dict[str, object]) -> list[_Layer]:
+    """制御文字で色や装飾を変えた字を、見た目ごとの層にする 影・縁・塗りの順は全体で守る"""
+    return [
+        (path, _redecorated(_recoloured(values, look.color, look.edge), look), clip)
+        for path, look, clip in groups
+    ]
 
 
 #: 文字装飾の飾りの項目 ``<@書体,番号>`` で装飾を変えるときに一度外してから付け直す
@@ -949,8 +1052,9 @@ def _paint_layers(
     3 つ目の形があれば、影・縁・塗りのどれもその内側だけに描く（変形した字を文字の枠で切る）
     """
     for path, look, clip in layers:
-        shadow = _shadow_layer(path, look, painter)
-        if shadow is not None:
+        made = _shadow_layer(path, look, painter)
+        if made is not None:
+            shadow, (shadow_left, shadow_top) = made
             # 影の面は絵の画素で作ってある 描く座標の縮め方を外してから重ねる
             # 外さないと、画質を落としたプレビューで影の面がもう 1 度縮む
             # 切る形は縮め方を外す前に当てる（当てたときの座標で持たれる）
@@ -958,7 +1062,7 @@ def _paint_layers(
             if clip is not None:
                 painter.setClipPath(clip)
             painter.resetTransform()
-            painter.drawImage(0, 0, shadow)
+            painter.drawImage(shadow_left, shadow_top, shadow)
             painter.restore()
     for path, look, clip in layers:
         border_width = float(look.get("border_width", 0.0))  # type: ignore[arg-type]
@@ -1017,8 +1121,8 @@ def _stroke(path: QPainterPath, width: float) -> QPainterPath:
 
 def _shadow_layer(
     path: QPainterPath, values: dict[str, object], painter: QPainter
-) -> QImage | None:
-    """文字の影を別の面に描いて返す 影が無ければ ``None``
+) -> tuple[QImage, tuple[int, int]] | None:
+    """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
     ぼかしのために 1 枚離す 影は単色なので、ぼかすのは不透明度だけでよく、
     色の 3 成分はそのままにできる RGB ごとぼかすと、縁で色がにじむ
@@ -1026,6 +1130,11 @@ def _shadow_layer(
     面は ``painter`` の描く先と同じ大きさ（絵の画素）で作り、同じ縮め方で描く
     ぼかしの幅も絵の画素へ直す 画面の画素のままぼかすと、画質を落としたプレビューで
     影だけ 2 倍・4 倍にぼける
+
+    画面より大きく広げた絵（``_crop_shadow``）では、面を影の周りだけにする 広げた絵は
+    流れるテロップで一辺 8000 近くになり、全体をぼかすと 1 枚で 0.4 秒かかった
+    画面に収まる絵は今までどおり絵の全体で作る ぼかしの足し算の順が変わると、
+    端の濃さが 1 だけ変わることがあり、収まる字の見た目を 1 画素も変えないため
     """
     offset_x = float(values.get("shadow_x", 0.0))  # type: ignore[arg-type]
     offset_y = float(values.get("shadow_y", 0.0))  # type: ignore[arg-type]
@@ -1037,27 +1146,41 @@ def _shadow_layer(
     device = painter.device()
     assert device is not None
     transform = painter.transform()
-    layer = QImage(device.width(), device.height(), QImage.Format.Format_RGBA8888)
-    layer.fill(Qt.GlobalColor.transparent)
     shifted = QPainterPath(path)
     # 画面の Y は下向き 設定の Y は上向きなので符号を反転する
     shifted.translate(offset_x, -offset_y)
     blur *= math.sqrt(abs(transform.determinant()))
+    border_width = float(values.get("border_width", 0.0))  # type: ignore[arg-type]
+    outline = _stroke(shifted, border_width) if border_width > 0 else None
+
+    left, top, right, bottom = 0, 0, device.width(), device.height()
+    if bool(values.get("_crop_shadow", False)):
+        drawn = transform.mapRect((outline if outline is not None else shifted).boundingRect())
+        # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる 端の 0 の所も同じ値に
+        # なるよう、さらに少し余らせる
+        margin = 2.0 * math.ceil(blur) + 4.0
+        left = max(left, math.floor(drawn.left() - margin))
+        top = max(top, math.floor(drawn.top() - margin))
+        right = min(right, math.ceil(drawn.right() + margin))
+        bottom = min(bottom, math.ceil(drawn.bottom() + margin))
+        if right <= left or bottom <= top:
+            return None
+    layer = QImage(right - left, bottom - top, QImage.Format.Format_RGBA8888)
+    layer.fill(Qt.GlobalColor.transparent)
 
     shadow_painter = QPainter(layer)
-    shadow_painter.setTransform(transform)
+    shadow_painter.setTransform(transform * QTransform.fromTranslate(-left, -top))
     shadow_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    border_width = float(values.get("border_width", 0.0))  # type: ignore[arg-type]
-    if border_width > 0:
+    if outline is not None:
         # 縁取りがあるときは、その外形の影が落ちる 塗りだけの影にすると
         # 縁の分だけ影が細く見える
-        shadow_painter.fillPath(_stroke(shifted, border_width), colour)
+        shadow_painter.fillPath(outline, colour)
     shadow_painter.fillPath(shifted, colour)
     shadow_painter.end()
 
     if blur <= 0.0:
-        return layer
-    return _blur_alpha(layer, blur)
+        return layer, (left, top)
+    return _blur_alpha(layer, blur), (left, top)
 
 
 def _blur_alpha(image: QImage, radius: float) -> QImage:
