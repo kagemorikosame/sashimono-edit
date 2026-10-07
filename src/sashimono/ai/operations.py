@@ -54,6 +54,7 @@ from sashimono.core.commands import (
     insert_scene,
     new_scene,
     subtitle_voices,
+    subtitle_wrap_width,
 )
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
@@ -1366,7 +1367,9 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
 
     # 画面の〔焼き込み〕と同じ既定 作品の高さに合わせて縮める
-    template: GeneratedSource | Clip = TEXT.create(**burn_defaults(project.settings.height))
+    settings = project.settings
+    wrap = subtitle_wrap_width(settings.width, host.subtitle_wrap_share)
+    template: GeneratedSource | Clip = TEXT.create(**burn_defaults(settings.height, wrap))
     if arguments.get("template_clip_id"):
         located = project.timeline.locate_clip(ClipId(str(arguments["template_clip_id"])))
         if located is None:

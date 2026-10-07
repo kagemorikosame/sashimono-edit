@@ -60,6 +60,7 @@ from sashimono.engine.motion_shapes import (
     trail,
     unit_randoms,
 )
+from sashimono.engine.text_wrap import wrap_lines
 
 __all__ = ["Frame", "render_source", "render_source_framed", "waveform_points"]
 
@@ -544,6 +545,11 @@ def _text_layers(
         font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter_spacing)
 
     metrics = QFontMetricsF(font)
+    wrap_width = _number(values, "wrap_width", 0.0)
+    if wrap_width > 0.0:
+        # 折り返しは全部を出した文で決めてから文字送りを掛ける 出ている字だけで決めると、
+        # 送っている途中で英単語が行をまたいで飛ぶ
+        text = _revealed(_wrapped(raw, wrap_width, metrics, values), values)
     if bool(values.get("vertical", False)):
         vertical = _vertical_text_path(text, font, metrics, values, width, height)
         return [(vertical, values, None)], None
@@ -591,6 +597,18 @@ def _text_layers(
         path.addPath(placed)
 
     return [(path, values, None)], None
+
+
+def _wrapped(text: str, width: float, metrics: QFontMetricsF, values: dict[str, object]) -> str:
+    """``width``（画面の画素）で折り返した本文 手で入れた改行は残す（#249）
+
+    横書きは字の実寸（字間と太字も入った送り幅）で測る 縦書きは列の高さで折り返す
+    縦書きの字は 1 字ずつ同じ送りで並ぶ（:func:`_vertical_text_path`）ので、字数 x 送りで測る
+    """
+    if bool(values.get("vertical", False)):
+        step = metrics.height() + _number(values, "letter_spacing", 0.0)
+        return chr(10).join(wrap_lines(text, width, lambda line: step * len(line)))
+    return chr(10).join(wrap_lines(text, width, metrics.horizontalAdvance))
 
 
 def _bold_drift(plain: QPainterPath, bold: QPainterPath) -> float:
