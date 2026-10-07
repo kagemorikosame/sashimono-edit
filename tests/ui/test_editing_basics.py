@@ -11,7 +11,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -179,9 +180,20 @@ def _clip_count(window: MainWindow) -> int:
     return sum(len(track.clips) for track in window.document.project.timeline.tracks)
 
 
-def _press(widget: QWidget, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> None:
-    QTest.keyClick(widget, key, modifiers)
-    QApplication.processEvents()
+def _held(widget: QWidget, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> bool:
+    """``widget`` にフォーカスがあるときに押したキーを、部品が受け取るか
+
+    受け取れば、窓のショートカットは動かない
+
+    Qt がキーを窓のショートカットへ回す前に部品へ送る ShortcutOverride を、そのまま送って見る
+    キーを打って窓のショートカットが動いたかで見ると、窓が活性にならない機械（CI の
+    Windows）では、守りが外れていても動かずに通り、守りが効いていても欄の外の試験が落ちる
+    """
+    event = QKeyEvent(QEvent.Type.ShortcutOverride, key, modifiers)
+    # Qt もショートカットを探す前に受け取っていない印にしてから送る
+    event.ignore()
+    QApplication.sendEvent(widget, event)
+    return event.isAccepted()
 
 
 def _field_text(field: QWidget) -> str:
@@ -194,40 +206,51 @@ def _field_text(field: QWidget) -> str:
 
 
 class TestKeysWhileTyping:
-    """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない"""
+    """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない
+
+    どれも窓が活性でない形で見る（CI の Windows の実行機では窓が活性にならないことがある）
+    """
 
     @pytest.fixture
-    def shown(self, window: MainWindow) -> MainWindow:
+    def shown(self, window: MainWindow) -> Iterator[MainWindow]:
+        # 別の窓を前に出して、編集の窓を活性にしない 手元のオフスクリーンでは出した窓が
+        # 活性になるので、そのままだと CI と違う形で通る
+        window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         window.show()
-        window.activateWindow()
-        timeline = window._timeline
-        timeline.select(window.document.project.timeline.tracks[0].clips[0].id)
-        assert timeline.copy_selected()
-        window.seek(10)
+        cover = QWidget()
+        cover.show()
+        cover.activateWindow()
         QApplication.processEvents()
-        return window
+        assert not window.isActiveWindow()
+        yield window
+        cover.close()
 
     @pytest.mark.parametrize("kind", _FIELDS)
-    def test_ctrl_shift_v_in_a_field_pastes_into_the_field(
+    def test_ctrl_shift_v_stays_in_a_field(self, shown: MainWindow, kind: type[QWidget]) -> None:
+        # 直す前は欄が受け取らず、窓の挿入貼り付けが動いて、字幕や設定の欄に打っている
+        # 途中でクリップが増えた
+        assert _held(kind(shown), Qt.Key.Key_V, CTRL_SHIFT)
+
+    @pytest.mark.parametrize("kind", _FIELDS)
+    def test_ctrl_shift_v_pastes_plain_text_into_the_field(
         self, shown: MainWindow, kind: type[QWidget], fake_clipboard: FakeClipboard
     ) -> None:
-        # 直す前は窓の挿入貼り付けが動き、字幕や設定の欄に打っている途中でクリップが増えた
+        # 欄が受け取っても何も入らないと、押したのに何も起きないように見える
         field = kind(shown)
-        field.show()
-        field.setFocus()
         if isinstance(field, QSpinBox):
             # 数の欄は入っている 0 を選んだ所へ貼る（後ろへ足すと 012 で範囲の外になる）
             field.selectAll()
         fake_clipboard.setText("12")
-        before = _clip_count(shown)
-        _press(field, Qt.Key.Key_V, CTRL_SHIFT)
-        assert _clip_count(shown) == before
+        before = shown.document.project
+        QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, CTRL_SHIFT))
         assert "12" in _field_text(field)
+        assert shown.document.project == before
 
     @pytest.mark.parametrize(
         ("key", "modifiers"),
         [
             (Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier),
+            (Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier),
             (Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
             (Qt.Key.Key_S, Qt.KeyboardModifier.NoModifier),
             (Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
@@ -237,29 +260,27 @@ class TestKeysWhileTyping:
         self, shown: MainWindow, key: Qt.Key, modifiers: Qt.KeyboardModifier
     ) -> None:
         # Qt の入力欄が自分で受け取るキー 守りが外れると、文字を消すつもりでクリップが消える
-        field = QLineEdit(shown)
-        field.show()
-        field.setFocus()
-        before = shown.document.project
-        _press(field, key, modifiers)
-        assert shown.document.project == before
+        assert _held(QLineEdit(shown), key, modifiers)
 
-    def test_outside_a_field_ctrl_shift_v_still_inserts(self, shown: MainWindow) -> None:
-        # 欄を守るついでに窓のショートカットまで止めると、挿入貼り付けが使えない
-        shown._timeline.setFocus()
-        before = _clip_count(shown)
-        _press(shown._timeline, Qt.Key.Key_V, CTRL_SHIFT)
-        # 再生ヘッドの下のクリップが割れて 1 本、貼った物で 1 本増える
-        assert _clip_count(shown) == before + 2
+    def test_outside_a_field_ctrl_shift_v_is_left_to_the_window(self, shown: MainWindow) -> None:
+        # 欄を守るついでにタイムラインでも取ると、挿入貼り付けが使えない
+        assert not _held(shown._timeline, Qt.Key.Key_V, CTRL_SHIFT)
 
     def test_a_read_only_field_does_not_hold_the_key(self, shown: MainWindow) -> None:
         # 読むだけの欄は貼れない 欄が取ると、押しても何も起きない
         field = QPlainTextEdit(shown)
         field.setReadOnly(True)
-        field.show()
-        field.setFocus()
+        assert not _held(field, Qt.Key.Key_V, CTRL_SHIFT)
+
+    def test_the_window_action_still_inserts(self, shown: MainWindow) -> None:
+        # 欄の外で押したときに動く窓の項目 活性に依らないように項目を直に引く
+        timeline = shown._timeline
+        timeline.select(shown.document.project.timeline.tracks[0].clips[0].id)
+        assert timeline.copy_selected()
+        shown.seek(10)
         before = _clip_count(shown)
-        _press(field, Qt.Key.Key_V, CTRL_SHIFT)
+        shown._actions["編集/貼り付け（挿入）"][0].trigger()
+        # 再生ヘッドの下のクリップが割れて 1 本、貼った物で 1 本増える
         assert _clip_count(shown) == before + 2
 
 
