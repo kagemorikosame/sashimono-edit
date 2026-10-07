@@ -320,6 +320,51 @@ class TestInsertPaste:
         document.undo()
         assert document.project is linked
 
+    @pytest.mark.parametrize(
+        ("at", "expected"),
+        [(10, (70, 90)), (40, (70, 90)), (50, (40, 90)), (60, (40, 60)), (80, (40, 60))],
+    )
+    def test_the_export_range_follows_the_push(self, at: int, expected: tuple[int, int]) -> None:
+        # 範囲だけ古いフレームに残すと、書き出しの頭に意図しない部分が入り末尾が欠ける
+        # 範囲の前（頭ちょうども）なら両端を押し、途中なら終わりだけ延ばす 後ろなら動かさない
+        project = _texts(("V1", ((0, 30), (100, 10))))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, at))
+        assert pasted.timeline.work_area == expected
+
+    def test_target_mode_leaves_the_export_range_alone(self) -> None:
+        # ほかのトラックの中身は動かないので、範囲を押すと書き出す中身がずれる
+        project = _texts(("V1", ((0, 30),)), ("V2", ((50, 10),)))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 10, all_tracks=False))
+        assert pasted.timeline.work_area == (40, 60)
+
+    def test_the_export_range_comes_back_with_one_undo(self) -> None:
+        # 範囲だけ押したまま残ると、取り消した後の書き出しがずれる
+        project = _texts(("V1", ((0, 30),)))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        document = Document(project)
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        with document.checkpoint("貼り付け（挿入）"):
+            for command in insert_paste_commands(project, content, 10):
+                document.execute(command)
+        assert document.project.timeline.work_area == (70, 90)
+        document.undo()
+        assert document.project.timeline.work_area == (40, 60)
+
+    def test_target_mode_pushes_where_a_copy_from_another_scene_lands(self) -> None:
+        # 別のシーンでコピーした物はコピー元のトラックが今のタイムラインに無い その ID のまま
+        # 押すと何も押さず、普通の貼り付けと同じく新しいトラックへ逃げた
+        elsewhere = _texts(("V1", ((0, 30),)))
+        content = copy_clips(elsewhere, [elsewhere.timeline.tracks[0].clips[0].id])
+        project = _texts(("V1", ((0, 30), (60, 30))))
+        commands = insert_paste_commands(project, content, 60, all_tracks=False)
+        assert not any(isinstance(command, AddTrack) for command in commands)
+        pasted = apply(project, commands)
+        assert _spans(pasted, 0) == [(0, 30), (60, 90), (90, 120)]
+
     def test_nothing_copied_does_nothing(self, linked: Project) -> None:
         assert insert_paste_commands(linked, ClipboardContent(()), 0) == []
 

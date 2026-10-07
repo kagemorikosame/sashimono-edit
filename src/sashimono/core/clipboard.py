@@ -174,13 +174,41 @@ def insert_paste_commands(
     if not content.clips:
         return []
     at = max(0, at_frame)
-    targets = None if all_tracks else tuple(dict.fromkeys(c.track_id for c in content.clips))
+    targets = None if all_tracks else _insert_targets(project, content)
     gap = InsertGap(at, content.length, targets)
     # 貼る先は押し出した後の姿で決める 押す前の姿で決めると、元のトラックの再生ヘッドの
     # 後ろが塞がって見え、空けた所ではなく新しいトラックへ置かれる
     # 押し出しは純関数で、実行したときも同じ姿になる（割った後ろ半分の ID だけは変わるが、
     # 貼り付けのコマンドはそれを指さない）
     return [gap, *paste_commands(gap.apply(project), content, at)]
+
+
+def _insert_targets(project: Project, content: ClipboardContent) -> tuple[TrackId, ...]:
+    """挿入貼り付けで押すトラック 今のタイムラインで実際に貼る先になるトラック
+
+    コピー元のトラックが今のタイムラインにあればそれ 無ければ（別のシーンでコピーした物）
+    :func:`_landing_track` が次に選ぶ、同じ種類のロックしていないトラックを並びの順に
+    割り当てる（コピー元のトラックごとに別の 1 本） コピー元の ID のまま渡すと、
+    :class:`InsertGap` が何も押さず、普通の貼り付けと同じく別のトラックへ逃げる
+    """
+    tracks = project.timeline.tracks
+    known = {track.id for track in tracks}
+    chosen: dict[TrackId, TrackId] = {}
+    used = {copied.track_id for copied in content.clips if copied.track_id in known}
+    for copied in content.clips:
+        if copied.track_id in chosen:
+            continue
+        if copied.track_id in known:
+            chosen[copied.track_id] = copied.track_id
+            continue
+        spare = [t.id for t in tracks if t.kind is copied.kind and not t.locked]
+        # 同じ種類が足りなければ、ほかのコピー元と同じトラックを使う（:func:`_landing_track` も
+        # 重ならなければ同じトラックへ置く） 1 本も無ければ貼り付けが作るので押す物は無い
+        pick = next((t for t in spare if t not in used), spare[0] if spare else None)
+        if pick is not None:
+            chosen[copied.track_id] = pick
+            used.add(pick)
+    return tuple(dict.fromkeys(chosen.values()))
 
 
 def _landing_track(

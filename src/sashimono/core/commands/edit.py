@@ -548,8 +548,10 @@ class InsertGap(Command):
     同じ） 割らずに丸ごと押すと、再生ヘッドより前に見えていた絵まで後ろへ逃げる
     ちょうど ``frame`` から始まるクリップもずらす（貼った物の後ろに来る）
 
-    ``track_ids`` が ``None`` なら全トラックとマーカーをずらす（Premiere の同期ロックを
-    全部入れたときと同じ） トラックを渡せば、そのトラックに加えて、そこでずれるクリップの
+    ``track_ids`` が ``None`` なら全トラックとマーカーをずらし、書き出し範囲も合わせる
+    （Premiere の同期ロックを全部入れたときと同じ :func:`_pushed_area`） トラックを渡したときは
+    範囲を動かさない（ほかのトラックの中身が動かないので）
+    トラックを渡せば、そのトラックに加えて、そこでずれるクリップの
     リンクの相手・グループの仲間・焼き込んだ字幕がいるトラックもずらす 相手を置いていくと、
     映像と音声の組や、話している所と字幕が貼った長さぶんずれる
 
@@ -647,7 +649,11 @@ class InsertGap(Command):
                 else marker
                 for marker in timeline.markers
             )
-            timeline = replace(timeline, markers=markers)
+            timeline = replace(
+                timeline,
+                markers=markers,
+                work_area=_pushed_area(timeline.work_area, frame, self.length),
+            )
         return project.with_timeline(timeline)
 
     def _shifted_tracks(self, timeline: Timeline) -> set[TrackId]:
@@ -669,6 +675,26 @@ class InsertGap(Command):
                         shifted.add(partner_track.id)
                         frontier.append(partner_track.id)
         return shifted
+
+
+def _pushed_area(area: tuple[int, int] | None, frame: int, length: int) -> tuple[int, int] | None:
+    """全トラックを ``frame`` から ``length`` 押したときの書き出し範囲
+
+    範囲の前（頭ちょうども含む クリップやマーカーと同じく ``frame`` から後ろは押す）なら
+    両端を押し、途中なら終わりだけを延ばす（Premiere Pro の挿入と同じ） 範囲を残すと、
+    中身だけが後ろへ移り、書き出しの頭に意図しない部分が入って末尾が欠ける
+
+    ジェットカット（:class:`RippleCut`）は範囲を外すが、こちらは外さない 挿入は押した後の
+    位置がどこへ移ったかが 1 通りに決まり、外すと決めた範囲を黙って捨てることになる
+    """
+    if area is None:
+        return None
+    start, end = area
+    if frame <= start:
+        return start + length, end + length
+    if frame < end:
+        return start, end + length
+    return area
 
 
 def _companions(timeline: Timeline, clip: Clip) -> list[tuple[Track, Clip]]:
