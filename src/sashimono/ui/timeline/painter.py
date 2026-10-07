@@ -49,12 +49,15 @@ __all__ = [
     "ADD_TRACK_BUTTON_HEIGHT",
     "ADD_TRACK_BUTTON_SPACE",
     "ADD_TRACK_BUTTON_TEXT",
+    "DENSE_MARK_WIDTH",
     "DETAIL_MIN_WIDTH",
     "TRACK_BUTTONS",
     "WAVEFORM_CACHE_BYTES",
     "WAVEFORM_IMAGE_MAX_COLUMNS",
+    "ClipGlance",
     "clear_waveform_images",
     "clip_content",
+    "clip_summary",
     "clips_in_range",
     "draw_clip",
     "draw_dense_clips",
@@ -63,12 +66,14 @@ __all__ = [
     "draw_track_add_button",
     "draw_track_background",
     "draw_track_header",
+    "filmstrip_tint",
     "shown_track_name",
     "to_qimage",
     "track_add_button_rect",
     "track_button_rects",
     "track_name_rect",
     "voice_label",
+    "waveform_level",
 ]
 
 #: 目盛りの間隔として使える値（フレーム数の基準となる秒数）
@@ -429,11 +434,35 @@ def _split_content(content: QRect, picture: bool, sound: bool) -> tuple[QRect | 
 
 
 #: これより細いクリップは名前もサムネイルも描かない 字が 1 文字も入らない幅
+#: 既定の値 設定（:attr:`Preferences.detail_min_width`）で変えられる
 DETAIL_MIN_WIDTH = 24
 
 
 #: これより細いクリップには境目の線も引かない 線だけが縞模様になって読めない
 _EDGE_MIN_WIDTH = 3
+
+#: 細い帯に中身の目安（絵の平均の色・音の大きさ）を描く幅の下限（画素） 1 画素の帯まで
+#: 1 本ずつ塗ると、全体表示の 1 万本で矩形を作るだけで描く予算を超える（:func:`draw_dense_clips`）
+_GLANCE_MIN_WIDTH = 2
+
+#: 細い帯で、選んだ・設定パネルが出している枠の太さ（画素） 隣の帯の境目の線（1 画素）と
+#: 見分けられる太さ 2 では、細い帯が並んだ所で境目と同じ縞に見えた（#247）
+DENSE_MARK_WIDTH = 3
+
+#: 細い帯の枠を描くときの最小の幅（画素） 1 画素の帯でも枠が潰れて線に見えないようにする
+_DENSE_MARK_MIN_SPAN = 6
+
+
+@dataclass(frozen=True, slots=True)
+class ClipGlance:
+    """細い帯に描く、クリップの中身の目安 名前やサムネイルが入らない幅でも中身が分かる
+
+    ``tint`` は絵のクリップのサムネイルの平均の色 ``level`` は音のクリップの範囲の
+    いちばん大きい音（0..1） どちらも無ければ描かない（解析がまだ・生成オブジェクト）
+    """
+
+    tint: QColor | None = None
+    level: float | None = None
 
 
 def clips_in_range(track: Track, start: int, end: int) -> Sequence[Clip]:
@@ -458,19 +487,25 @@ def draw_dense_clips(
     selected: Collection[ClipId],
     sound_only: Callable[[Clip], bool] | None = None,
     editing: ClipId | None = None,
+    glance: Callable[[Clip], ClipGlance | None] | None = None,
 ) -> None:
     """名前も入らない細いクリップを、色の帯としてまとめて塗る
 
     ``editing`` はオブジェクト設定が今出しているクリップ（:func:`draw_clip` と同じ）
-    細い帯でも、選んだ白い枠の内側に色の枠を重ねて仲間と見分けられるようにする
+    細い帯でも、選んだ白い枠の上下に色の帯を重ねて仲間と見分けられるようにする
 
     ``sound_only`` はレイヤー（混合）で音だけのクリップか レイヤーは 1 本の中に絵と音の
     クリップが混ざるので、音だけの物を音声の色で塗る 渡さなければトラックの種類で決める
 
+    ``glance`` はクリップの中身の目安（:class:`ClipGlance`）を返す 絵はサムネイルの平均の
+    色で帯を塗り、音はいちばん大きい音の高さの棒を立てる 無地の帯だけだと、引いた表示で
+    数秒のクリップを選んだときに中身が無いように見え、読み込みに失敗したのかと迷った（#247）
+    名前とサムネイルそのものは描かない 細い所に詰めても読めない
+
     全体を表示すると数千本が数画素ずつになる 1 本ずつ名前・枠・切り抜きを描くと
     3000 本で 58ms（60fps の予算の 3 倍半）かかった さらに 1 万本では、描く前の
     矩形作りだけで予算を超えた ここは整数の計算だけで済ませ、隙間なく続く
-    クリップを 1 本の帯にまとめてから塗る
+    クリップを 1 本の帯にまとめてから塗る 中身の目安も 2 画素に満たない帯には描かない
     """
     top, height = band.top + 1, band.height - 3
     if height <= 0 or not clips:
@@ -487,6 +522,7 @@ def draw_dense_clips(
     # 組にすると、クリップ 1 本ごとに帯を作り直すことになる
     runs: list[list[int]] = []
     edges: list[tuple[int, int]] = []
+    glances: list[tuple[int, int, bool, ClipGlance]] = []
     marked: list[tuple[int, int]] = []
     focused: tuple[int, int] | None = None
     for clip in clips:
@@ -501,6 +537,21 @@ def draw_dense_clips(
             runs.append([left, right, enabled, colour])
         if right - left >= _EDGE_MIN_WIDTH:
             edges.append((left, colour))
+        if glance is not None and right - left >= _GLANCE_MIN_WIDTH:
+            found = glance(clip)
+            if found is not None:
+                # 隣と同じ目安（同じ素材の続きの所など）は 1 つの塗りにまとめる 境目の線は
+                # あとから引くので見た目はほぼ変わらず、塗る回数が減る
+                previous = glances[-1] if glances else None
+                if (
+                    previous is not None
+                    and previous[2] == clip.enabled
+                    and previous[3] == found
+                    and left <= previous[1]
+                ):
+                    glances[-1] = (previous[0], max(previous[1], right), clip.enabled, found)
+                else:
+                    glances.append((left, right, clip.enabled, found))
         if clip.id in selected:
             marked.append((left, right))
         if clip.id == editing:
@@ -510,18 +561,243 @@ def draw_dense_clips(
     for left, right, enabled, colour in runs:
         fill = bodies[colour] if enabled else dims[colour]
         painter.fillRect(left, top, right - left, height, fill)
+    if glances:
+        _draw_glances(painter, glances, top, height)
     for left, colour in edges:
         painter.fillRect(left, top, 1, height, borders[colour])
-    if marked:
-        painter.setPen(QPen(Colors.SELECTION, 2))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for left, right in marked:
-            painter.drawRect(left, top, max(2, right - left), height - 1)
+    for left, right in marked:
+        _outline(painter, _mark_span(left, right), top, height, Colors.SELECTION)
     if focused is not None:
-        left, right = focused
-        painter.setPen(QPen(Colors.EDITING, 2))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(left + 2, top + 2, max(1, right - left - 4), height - 5)
+        # 選んだ枠の上下に色の帯を渡す 枠の内側に細い色の枠を描いていたときは、
+        # 数画素の帯では潰れて仲間の白い枠と見分けられなかった
+        left, right = _mark_span(*focused)
+        bar = min(_DENSE_EDITING_BAR, max(1, (height - 2 * DENSE_MARK_WIDTH) // 3))
+        painter.fillRect(left, top + DENSE_MARK_WIDTH, right - left, bar, Colors.EDITING)
+        painter.fillRect(
+            left, top + height - DENSE_MARK_WIDTH - bar, right - left, bar, Colors.EDITING
+        )
+
+
+#: 設定パネルが出している細い帯の、枠の上下に渡す色の帯の高さ（画素）
+_DENSE_EDITING_BAR = 4
+
+#: 細い帯の中身の目安を、帯の頭から空けて描く高さ（画素） 頭に地の色を残して、絵の
+#: 平均の色が地の色と似ていても、ほかの帯と同じ種類の物だと分かるようにする
+_GLANCE_TOP = 3
+
+
+def _mark_span(left: int, right: int) -> tuple[int, int]:
+    """枠を描く左右 細すぎる帯は真ん中を軸に :data:`_DENSE_MARK_MIN_SPAN` まで広げる"""
+    if right - left >= _DENSE_MARK_MIN_SPAN:
+        return left, right
+    middle = (left + right) // 2
+    start = middle - _DENSE_MARK_MIN_SPAN // 2
+    return start, start + _DENSE_MARK_MIN_SPAN
+
+
+def _outline(
+    painter: QPainter, span: tuple[int, int], top: int, height: int, colour: QColor
+) -> None:
+    """帯の内側に :data:`DENSE_MARK_WIDTH` 画素の枠を塗る
+
+    ペンで矩形を描くと線が帯の外へ半分はみ出し、隣の帯の上に乗って、どちらの帯の枠
+    なのかが分かりにくい 内側へ塗れば、枠はその帯の中に収まる（:func:`_mark_span` で
+    広げた数画素の帯だけは隣へ掛かるが、そうしないと枠が線 1 本に潰れる）
+    """
+    left, right = span
+    thick = DENSE_MARK_WIDTH
+    width = right - left
+    painter.fillRect(left, top, width, thick, colour)
+    painter.fillRect(left, top + height - thick, width, thick, colour)
+    painter.fillRect(left, top, min(thick, width), height, colour)
+    painter.fillRect(max(left, right - thick), top, min(thick, width), height, colour)
+
+
+def _draw_glances(
+    painter: QPainter,
+    glances: Sequence[tuple[int, int, bool, ClipGlance]],
+    top: int,
+    height: int,
+) -> None:
+    """細い帯に中身の目安を描く 絵は平均の色で塗り、音は大きさの棒を立てる
+
+    音の棒は無音でも 1 画素の線を残す（波形と同じ） 何も描かないと、解析がまだの
+    音と無音の音を見分けられない 棒の高さが 1 画素なら無音だと分かる
+    """
+    inner_top = top + _GLANCE_TOP
+    inner = height - _GLANCE_TOP
+    if inner <= 0:
+        return
+    wave = Colors.WAVEFORM
+    wave_dim = _dimmed(wave)
+    for left, right, enabled, found in glances:
+        span = right - left
+        if found.tint is not None:
+            painter.fillRect(
+                left, inner_top, span, inner, found.tint if enabled else _dimmed(found.tint)
+            )
+        if found.level is not None:
+            level = min(max(found.level, 0.0), 1.0)
+            bar = max(1, round(level * (inner - 2)))
+            painter.fillRect(
+                left + (1 if span > 2 else 0),
+                inner_top + (inner - bar) // 2,
+                max(1, span - 2),
+                bar,
+                wave if enabled else wave_dim,
+            )
+
+
+def filmstrip_tint(filmstrip: Filmstrip, clip: Clip, rate: FrameRate) -> QColor | None:
+    """クリップの真ん中の時刻のサムネイルの平均の色 細い帯を塗るのに使う
+
+    サムネイルごとの平均は素材ごとに 1 度だけ求めて貯める 描くたびに画素を数えると、
+    細い帯が数百本ある全体表示で予算を超える 真ん中を取るのは、頭の 1 枚だと
+    フェードインの黒や場面転換の前の絵になりやすいため
+    """
+    colours = _FILMSTRIP_TINTS.colours(filmstrip)
+    if not colours:
+        return None
+    seconds = clip.picture_time(clip.duration // 2, rate)
+    if filmstrip.interval <= 0:
+        return colours[0]
+    index = int(max(Fraction(0), seconds) / filmstrip.interval)
+    return colours[min(index, len(colours) - 1)]
+
+
+class _FilmstripTints:
+    """サムネイルごとの平均の色を、素材のサムネイルの束ごとに貯める
+
+    サムネイルの束（:class:`Filmstrip`）は弱参照を取れないので、束の画素の配列を弱参照で
+    持つ 束を強く持つと、素材を外して解析を捨てても、ここがサムネイルを抱えてメモリが空かない
+    """
+
+    #: 貯める束の数の上限 素材の数だけあれば足りる 古く使った物から捨てる
+    LIMIT = 512
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[int, tuple[weakref.ref[np.ndarray], tuple[QColor, ...]]] = (
+            OrderedDict()
+        )
+
+    def colours(self, filmstrip: Filmstrip) -> tuple[QColor, ...]:
+        sheet = filmstrip.sheet
+        key = id(sheet)
+        entry = self._entries.get(key)
+        # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
+        if entry is not None and entry[0]() is sheet:
+            self._entries.move_to_end(key)
+            return entry[1]
+        found = _tile_means(filmstrip)
+        self._entries[key] = (weakref.ref(sheet), found)
+        while len(self._entries) > self.LIMIT:
+            self._entries.popitem(last=False)
+        return found
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+#: 平均を取るときに飛ばす画素の間隔 細い帯の 1 色に全部の画素は要らない 全部を数えると
+#: 600 枚の素材で 1 度に数十 ms 掛かり、その描画 1 回が引っかかって見える
+_TINT_STRIDE = 4
+
+
+def _tile_means(filmstrip: Filmstrip) -> tuple[QColor, ...]:
+    count, tile = filmstrip.count, filmstrip.tile_width
+    if count == 0 or filmstrip.height == 0:
+        return ()
+    sheet = filmstrip.sheet[::_TINT_STRIDE, : count * tile, :3]
+    tiles = sheet.reshape(sheet.shape[0], count, tile, 3)[:, :, ::_TINT_STRIDE, :]
+    means = tiles.mean(axis=(0, 2))
+    return tuple(QColor(int(r), int(g), int(b)) for r, g, b in means)
+
+
+_FILMSTRIP_TINTS = _FilmstripTints()
+
+
+def waveform_level(
+    waveform: Waveform, clip: Clip, rate: FrameRate, *, track_gain: float = 1.0
+) -> float:
+    """クリップの範囲のいちばん大きい音（0..1） 細い帯に立てる棒の高さに使う
+
+    音量・フェード・トラックの音量を波形と同じく掛ける（:func:`shape_envelope`）
+    掛けないと、音量を 0 にしたクリップも鳴っているように見え、無音かどうかが分からない
+    求めた値はクリップの範囲と効き方ごとに貯める（:class:`_WaveformLevels`）
+    """
+    end_seconds = clip.source_in + clip.duration * rate.frame_duration * clip.speed
+    return _WAVEFORM_LEVELS.get(
+        waveform,
+        int(clip.source_in * waveform.sample_rate),
+        int(end_seconds * waveform.sample_rate),
+        _Shaping(clip, rate, 0.0, float(clip.duration), track_gain),
+    )
+
+
+#: 音の大きさを求めるときに束ねる列の数 1 列にすると、フェードの掛け方を真ん中の
+#: 1 点で見ることになり、頭と終わりだけ鳴る音が拾えない
+_LEVEL_COLUMNS = 16
+
+
+class _WaveformLevels:
+    """求めた音の大きさを、古く使った物から捨てながら貯める
+
+    :class:`_WaveformImages` と同じ作り 解析の結果は弱参照で持つ
+    """
+
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[
+            tuple[int, int, int, Hashable], tuple[weakref.ref[Waveform], float]
+        ] = OrderedDict()
+
+    def get(self, waveform: Waveform, start: int, end: int, shaping: _Shaping) -> float:
+        shaped = shaping.key()
+        key = (id(waveform), start, end, shaped)
+        entry = self._entries.get(key)
+        if entry is not None and entry[0]() is waveform:
+            self._entries.move_to_end(key)
+            return entry[1]
+        if end <= start:
+            return 0.0
+        envelope = waveform.envelope(start, end, _LEVEL_COLUMNS)
+        low, high = envelope[:, :, 0].min(axis=1), envelope[:, :, 1].max(axis=1)
+        if shaped is not None:
+            low, high = shape_envelope(
+                low,
+                high,
+                shaping.clip,
+                shaping.rate,
+                shaping.first,
+                shaping.last,
+                track_gain=shaping.track_gain,
+            )
+        level = float(max(np.abs(low).max(), np.abs(high).max()))
+        self._entries[key] = (weakref.ref(waveform), level)
+        while len(self._entries) > self.LIMIT:
+            self._entries.popitem(last=False)
+        return level
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_WAVEFORM_LEVELS = _WaveformLevels()
+
+
+def clip_summary(
+    clip: Clip, media: MediaItem | None, rate: FrameRate, scene_name: str | None = None
+) -> str:
+    """細い帯に載せたときのツールチップ 名前と長さ
+
+    細い帯には名前を描かないので、何のクリップかを確かめる手段がここしかない
+    長さは秒と、タイムラインの目盛りと同じタイムコードの両方で出す（短いクリップは
+    秒の方が分かりやすく、目盛りと見比べるならタイムコードの方が早い）
+    """
+    name = f"シーン: {scene_name}" if clip.scene_id is not None else _clip_name(clip, media)
+    seconds = float(clip.duration * rate.frame_duration)
+    return f"{name}\n長さ {seconds:.2f} 秒（{format_timecode(clip.duration, rate)}）"
 
 
 def _is_hex(text: str) -> bool:
@@ -819,8 +1095,14 @@ _WAVEFORM_IMAGES = _WaveformImages(WAVEFORM_CACHE_BYTES)
 
 
 def clear_waveform_images() -> None:
-    """貯めた波形の画像を捨てる 貯めていないときの速さを測る道具と試験が使う"""
+    """貯めた波形の画像と、細い帯の目安（音の大きさ・絵の平均の色）を捨てる
+
+    貯めていないときの速さを測る道具と試験が使う 目安も一緒に捨てる 残すと、倍率を
+    変えた直後の 1 回の重さを測ったつもりで、細い帯の目安を求める分が抜ける
+    """
     _WAVEFORM_IMAGES.clear()
+    _WAVEFORM_LEVELS.clear()
+    _FILMSTRIP_TINTS.clear()
 
 
 def waveform_image(minimum: np.ndarray, maximum: np.ndarray, height: int) -> QImage:
