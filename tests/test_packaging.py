@@ -91,8 +91,31 @@ def _wait_until_the_pip_is_back() -> None:
     raise AssertionError("残った pip の作業スレッドが終わらない")
 
 
+#: 同じプロセスで走らせる道が、偽の pip（``pip._internal.cli.main.main``）に入る前に読む部品
+#: ``_no_rustc_probe`` の session と、``run_pip`` の distlib
+_PIP_PARTS = (
+    "pip._internal.cli.main",
+    "pip._internal.network.session",
+    "pip._vendor.distlib",
+    "pip._vendor.distlib.resources",
+)
+
+
 @pytest.fixture
-def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[StuckPip]:
+def pip_loaded() -> None:
+    """偽の pip に入る前に読む pip の部品を、試験が待ち始める前に読んでおく
+
+    同じプロセスで走らせる道は、走り終えるたびに pip を ``sys.modules`` から捨てる
+    （``runtime._forget_pip``） 読んでおかないと、作業スレッドは偽の pip に入る前に
+    session（urllib3・rich など）を読み直し、混んだ CI ではそれだけで待ちの 10 秒を超えて
+    落ちた（Issue #264） 待つのを偽の pip に入るまでだけにする
+    """
+    for name in _PIP_PARTS:
+        importlib.import_module(name)
+
+
+@pytest.fixture
+def stuck_pip(monkeypatch: pytest.MonkeyPatch, pip_loaded: None) -> Iterator[StuckPip]:
     """呼ぶと戻らない pip 同期の読み書きの中で止まった pip の代わり
 
     錠の待ちの中で止まるので、投げ込んだ中断の例外も届かない 試験の後で放して、
@@ -232,6 +255,7 @@ class TestPipInsideThePackage:
         assert resources._finder_registry.get(FrozenLoader) is resources.ResourceFinder
 
 
+@pytest.mark.usefixtures("pip_loaded")
 class TestPipRunsInsideTheApp:
     """配布版の導入は、exe が自分自身を子として起こさず、このプロセスの中で pip を走らせる
 
