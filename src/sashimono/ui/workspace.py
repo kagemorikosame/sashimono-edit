@@ -31,6 +31,7 @@ from sashimono.ui.theme import THEME_DARK, THEME_MODES
 
 __all__ = [
     "AUTO_QUALITY_HEIGHT",
+    "DETAIL_MIN_WIDTHS",
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
     "DOCK_TAB_POSITIONS",
@@ -297,6 +298,11 @@ class Preferences:
     #: 見て気付く サムネイルや波形に線が重なるのが目障りな人、クリップの真ん中を掴んで動かす
     #: つもりで線を掴んでしまう人は切れるようにする
     value_lines: bool = True
+    #: タイムラインで、これより細いクリップは名前・サムネイル・波形を描かず細い帯にする（画素）
+    #: 細い帯には絵の平均の色と音の大きさだけを描く 既定は 24（名前の頭の 1 字が入る幅
+    #: 今までの値） 細かく見たい人は 8 まで下げ、短いクリップが数千本あって描くのが重い
+    #: 機械では上げる 狭くすると読めない切れ端が並び、広くすると拡大しても中身が出ない
+    detail_min_width: int = 24
     #: 設定パネルで、行の名前（数はスライダーも）のダブルクリックで値を初期値へ戻す
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
@@ -429,6 +435,9 @@ class PreferenceStore:
                 data.get("keyframe_drag"), KEYFRAME_DRAG_MODES, plain.keyframe_drag
             ),
             value_lines=_flag(data.get("value_lines"), plain.value_lines),
+            detail_min_width=_detail_min_width(
+                data.get("detail_min_width"), plain.detail_min_width
+            ),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
@@ -467,6 +476,23 @@ def _snap_distance(value: object, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if SNAP_DISTANCES[0] <= value <= SNAP_DISTANCES[1] else default
+
+
+#: 細い帯にする幅として受け付ける範囲（画素） タイムラインもこの範囲へ丸める
+#: 下は線 1 本ぶんの枠と名前の頭の 1 字が入る幅 それより細くすると、名前も絵も切れ端
+#: だけが縞のように並んで読めない 上は 1 本ずつ描く本数を減らして軽くしたい人のため
+#: 広すぎると拡大しても中身が出ない
+DETAIL_MIN_WIDTHS = (8, 96)
+
+
+def _detail_min_width(value: object, default: int) -> int:
+    """細い帯にする幅 範囲の外や壊れた値は既定へ戻す
+
+    0 を通すと、1 画素のクリップまで 1 本ずつ名前と絵を描いて重い
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    return value if DETAIL_MIN_WIDTHS[0] <= value <= DETAIL_MIN_WIDTHS[1] else default
 
 
 def _flag(value: object, default: bool) -> bool:
