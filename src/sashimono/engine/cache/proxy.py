@@ -435,6 +435,14 @@ class ProxyBuilder:
         self._progress: dict[MediaId, float] = {}
         self._running: set[MediaId] = set()
         self._cancelled: set[MediaId] = set()
+        #: 取り消し印の付いた変換が走っている間に、また頼まれた物（素材と知らせ先）
+        #: 走っている変換は控えを残さずに終わるので、終わってから作り直す
+        #: （:class:`~sashimono.engine.cache.analyzer.MediaAnalyzer` と同じ） 捨てると、
+        #: 素材一覧から消してすぐ取り消したときに、控えがいつまでも作られない
+        self._again: dict[
+            MediaId,
+            tuple[MediaItem, Callable[[MediaId], None] | None, Callable[[MediaId], None] | None],
+        ] = {}
         self._closed = False
         #: 画面へ出す進み具合 ``_progress`` は描画の側が 1 本ずつ引くためのもので、
         #: 何本のうち何本目か・失敗したかは持たない
@@ -472,7 +480,11 @@ class ProxyBuilder:
             return
 
         with self._lock:
-            if self._closed or media.id in self._running:
+            if self._closed:
+                return
+            if media.id in self._running:
+                if media.id in self._cancelled:
+                    self._again[media.id] = (media, on_ready, on_progress)
                 return
             self._cancelled.discard(media.id)
             self._running.add(media.id)
@@ -517,6 +529,7 @@ class ProxyBuilder:
                     self._running.discard(media.id)
                     self._cancelled.discard(media.id)
                     self._progress.pop(media.id, None)
+                    again = self._again.pop(media.id, None)
             if stopped:
                 self._board.drop(media.id)
             elif made is None:
@@ -529,6 +542,8 @@ class ProxyBuilder:
             # 控えを切った直後に「控えができた」として描き直しが走る
             if made is not None and not stopped and on_ready is not None:
                 on_ready(media.id)
+            if again is not None:
+                self.request(again[0], on_ready=again[1], on_progress=again[2])
 
         with self._lock:
             # close と同じロックの中で投げる 外で投げると、止めた直後の
@@ -545,6 +560,8 @@ class ProxyBuilder:
         with self._lock:
             if media_id in self._running:
                 self._cancelled.add(media_id)
+            # 外した素材を、取り消し中の変換が終わった後に作り直さない
+            self._again.pop(media_id, None)
         self._board.forget(media_id)
 
     def close(self) -> None:
@@ -553,4 +570,5 @@ class ProxyBuilder:
                 return
             self._closed = True
             self._cancelled.update(self._running)
+            self._again.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)

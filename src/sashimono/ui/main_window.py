@@ -330,6 +330,9 @@ class MainWindow(QMainWindow):
         #: 渡すと、画面では気付かないまま低解像度の絵が最終出力に入る
         self._proxies = ProxyBuilder(ProxyStore(height=self._preferences.proxy_height))
         self._analysis_dirty = False
+        #: 素材一覧から外して解析と控えを捨てた素材 取り消しで戻ったら頼み直す
+        #: （:meth:`_reanalyze_returned`）
+        self._forgotten: set[MediaId] = set()
         #: 控えができた素材 次の間隔でこのぶんだけ開き直す
         #: ワーカースレッドが足し、画面のスレッドが取り出すので錠で守る
         #: 守らないと、取り出した直後に足されたぶんが次の回にも残らず、
@@ -1187,9 +1190,26 @@ class MainWindow(QMainWindow):
         # 素材が増えたら画質を見直す 4K を 1 本置いた時点で重くなるので、
         # 置いたあとに自分で下げてもらうのでは遅い
         self._apply_auto_quality()
+        self._reanalyze_returned(root)
         self._update_history_actions()
         self._update_title()
         self.project_changed.emit(project)
+
+    def _reanalyze_returned(self, root: Project) -> None:
+        """素材一覧から外して解析を捨てた素材が、取り消し・やり直しで戻ってきたら頼み直す
+
+        外したときに波形・サムネイル・控えを捨てる（:meth:`_remove_media`） 取り消して素材が
+        戻っても誰も頼み直さないと、クリップの名前は出るのにサムネイルと波形がいつまでも
+        出なかった 頼むのは捨てた素材だけにする 全部の素材を毎回頼むと、開けずに失敗した
+        素材の解析を、編集するたびに走らせ直すことになる
+        """
+        if not self._forgotten:
+            return
+        for media in root.media:
+            if media.id in self._forgotten:
+                self._forgotten.discard(media.id)
+                self._analyzer.request(media, on_ready=self._on_analysis_ready)
+                self._request_proxy(media)
 
     def _retime_playhead(self, rate: FrameRate) -> None:
         """フレームレートが変わったら、再生ヘッドを同じ時刻（秒）のまま数え直す
@@ -1312,6 +1332,9 @@ class MainWindow(QMainWindow):
             if media.id not in kept:
                 self._analyzer.forget(media.id)
                 self._proxies.forget(media.id)
+        # 前のプロジェクトで外した素材の覚えは捨てる 差し替えると取り消しの履歴も消え、
+        # 戻ってくることは無い 新しいプロジェクトの素材は、開く所で全部頼んでいる
+        self._forgotten.clear()
         # 前のプロジェクトで出していた進み具合の続きとして「終わった」と出さない
         self._background_shown = False
         self._background_indicator.hide()
@@ -1571,6 +1594,8 @@ class MainWindow(QMainWindow):
         if self._document.project.find_media(target) is None:
             self._analyzer.forget(target)
             self._proxies.forget(target)
+            # 取り消しで戻ったときに頼み直す（:meth:`_reanalyze_returned`）
+            self._forgotten.add(target)
 
     # --- タイムラインへの落とし込みと、素材一覧の表示 ---
 

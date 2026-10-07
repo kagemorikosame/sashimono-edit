@@ -86,6 +86,17 @@ class MediaAnalyzer:
         #: 入れ直す形にすると、投入前に完了した場合に消し損ねる
         self._running: set[_JobKey] = set()
         self._cancelled: set[_JobKey] = set()
+        #: 取り消し印の付いた仕事が走っている間に、同じ鍵でまた頼まれた物 走っている仕事は
+        #: 結果を載せずに終わるので、終わってから走らせ直す 捨てると、素材一覧から消して
+        #: すぐ取り消したときに、名前は出るのにサムネイルと波形がいつまでも出なかった
+        self._again: dict[
+            _JobKey,
+            tuple[
+                MediaItem,
+                Callable[[MediaItem, _JobKey, Callable[[float], None]], bool],
+                Callable[[MediaId], None] | None,
+            ],
+        ] = {}
         self._closed = False
         #: 画面へ出す進み具合 数えるのは裏のスレッド、読むのは画面のタイマー
         self._board = JobBoard()
@@ -134,6 +145,9 @@ class MediaAnalyzer:
                 del self._waveforms[owned]
             self._filmstrips.pop(media_id, None)
             self._cancelled.update(key for key in self._running if key[1] == media_id)
+            # 走らせ直す約束も捨てる 外した素材を、取り消し中の仕事が終わった後に解析し直さない
+            for job in [key for key in self._again if key[1] == media_id]:
+                del self._again[job]
         self._board.forget(media_id)
 
     def close(self) -> None:
@@ -145,6 +159,7 @@ class MediaAnalyzer:
                 return
             self._closed = True
             self._cancelled.update(self._running)
+            self._again.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _submit(
@@ -163,7 +178,12 @@ class MediaAnalyzer:
                 if kind == "waveform"
                 else media.id in self._filmstrips
             )
-            if done or key in self._running:
+            if done:
+                return
+            if key in self._running:
+                if key in self._cancelled:
+                    # 取り消した仕事はまだ走っているが、結果を載せない 終わってから頼み直す
+                    self._again[key] = (media, work, on_ready)
                 return
             self._cancelled.discard(key)
             self._running.add(key)
@@ -186,14 +206,19 @@ class MediaAnalyzer:
                     stopped = self._closed or key in self._cancelled
                     self._running.discard(key)
                     self._cancelled.discard(key)
+                    again = self._again.pop(key, None)
             if stopped:
                 self._board.drop(key)
             elif produced:
                 self._board.finish(key)
             else:
                 self._board.finish(key, failure or f"{_KIND_NAMES[kind]}を作れなかった")
-            if produced and on_ready is not None:
+            # 取り消された仕事の結果は載っていない（:meth:`_publish`） 載せていないのに
+            # 「できた」と伝えると、描き直しても空のまま
+            if produced and not stopped and on_ready is not None:
                 on_ready(media.id)
+            if again is not None:
+                self._submit(key, *again)
 
         with self._lock:
             # close と同じロックの中で投げる（close の説明を参照）
