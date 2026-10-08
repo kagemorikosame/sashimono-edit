@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from packaging.requirements import Requirement
 from PySide6.QtCore import QTimer, Signal
@@ -85,6 +85,9 @@ class SetupSection(QWidget):
         self._update_note = ""
         #: ほかが導入先へ書いている間は導入を始めさせない（:meth:`hold`）
         self._held = False
+        #: 導入を始める直前に画面のスレッドで呼ぶ 入れる物を使っている所を畳み、畳み終わる
+        #: のを待つ物を返す（裏のスレッドで pip より先に呼ぶ） 使う側が無ければ ``None``
+        self.prepare: Callable[[], Callable[[], None]] | None = None
 
         self._status = QLabel(self)
         self._status.setWordWrap(True)
@@ -244,22 +247,33 @@ class SetupSection(QWidget):
             self._force_upgrade = True
         self.refresh()
 
-    def hold(self, held: bool) -> None:
-        """ほかが導入先へ書いている間（AI の部品の自動の入れ替え）、導入を始めさせない
+    def hold(self, reason: str) -> None:
+        """今は導入を始めさせない ``reason`` はそのわけ（ボタンのツールチップに出す） 空なら許す
 
-        押せると同じ導入先へ同時に書いて新旧が混ざる 錠（runtime.writing_runtime）でも
-        並べてあるが、押せたのに待たされるより、押せない方が何が起きているか分かる
+        使う所: AI の部品の自動の入れ替えの最中（同じ導入先へ同時に書くと新旧が混ざる
+        錠 runtime.writing_runtime でも並べてある）と、AI が応えている最中（動いている
+        Claude Code を置き換えられず失敗する） 押せたのに待たされるより、押せない方が
+        何が起きているか分かる
         """
-        if held == self._held:
+        held = bool(reason)
+        if held == self._held and reason == self._button.toolTip():
             return
         self._held = held
-        self._button.setToolTip("AI の部品を入れ替えています 終わると押せます" if held else "")
+        self._button.setToolTip(reason)
         self._button.setEnabled(not held and not self.busy and not pip_left_running())
 
-    def start(self, *, upgrade: bool = False) -> None:
-        """導入を始める ``upgrade`` を立てると、入っている版も新しい版へ入れ替える"""
+    def start(self, *, upgrade: bool = False, before: Callable[[], None] | None = None) -> None:
+        """導入を始める ``upgrade`` を立てると、入っている版も新しい版へ入れ替える
+
+        ``before`` は pip より先に裏のスレッドで走らせる 畳んだ会話の Claude Code が
+        終わるのを待つのに使う（画面のスレッドで待つと固まる）
+        """
         if self.busy or self._held or self._block_while_pip_is_left():
             return
+        if before is None and self.prepare is not None:
+            # 入れる物を使っている所（AI の会話）を先に畳ませ、畳み終わるのを裏で待つ
+            # 導入ボタンを直に押したときも〔AI の部品を更新〕と同じにする
+            before = self.prepare()
         if upgrade:
             self._force_upgrade = True
         argv = self._command()
@@ -286,6 +300,8 @@ class SetupSection(QWidget):
             # 同じく終わった印は finally で立てる 立たないと導入中のまま押せなくなる
             code = 1
             try:
+                if before is not None:
+                    before()
                 code = install_runtime(
                     pack=self._pack,
                     command=argv,

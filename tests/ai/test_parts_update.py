@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import tomllib
 import urllib.request
@@ -516,11 +517,13 @@ class _Session:
         return []
 
     def close(self, *, wait: bool = True) -> None:
-        del wait
         self.closed = True
+        #: 畳んで待ったか 画面のスレッドで待つと最長 5 秒固まる
+        self.closed_waiting = wait
 
     def wait_closed(self, timeout: float = 30.0) -> None:
         del timeout
+        self.waited_in = threading.current_thread()
 
     def interrupt(self) -> None:
         return
@@ -612,19 +615,66 @@ class TestPanelGuidance:
     def test_the_button_updates_the_parts(
         self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from sashimono.ui import setup as setup_module
+
         widget = unavailable
-        started: list[bool] = []
-        monkeypatch.setattr(
-            SetupSection, "start", lambda _self, *, upgrade=False: started.append(upgrade)
-        )
+        commands: list[list[str]] = []
+        order: list[str] = []
+
+        def install(**kwargs: Any) -> int:
+            session = _Session.made[0]
+            # 畳み終わるのを待ってから pip を始める 待たないと使用中の claude.exe を置き換えられない
+            order.append("waited" if getattr(session, "waited_in", None) else "not waited")
+            commands.append(list(kwargs["command"]))
+            return 0
+
+        monkeypatch.setattr(setup_module, "install_runtime", install)
         _send(widget, "切って")
         _outdated_turn(widget)
         widget._update_button.click()
+        done = widget._setup._done
+        assert done is not None and done.wait(5.0) is True
         # 入っている版のままでも入れ替える（--upgrade） 付けないと名前が在るだけで飛ばされる
-        assert started == [True]
-        assert _Session.made[0].closed is True
+        assert "--upgrade" in commands[0]
+        session = _Session.made[0]
+        assert session.closed is True
+        # 画面のスレッドでは待たない 待つのは導入の裏のスレッド
+        assert session.closed_waiting is False
+        assert session.waited_in is not threading.main_thread()
+        assert order == ["waited"]
         assert widget._update_box.isHidden() is True
         assert widget._parts_box.isHidden() is False
+        widget._setup._poll()
+
+    def test_updating_waits_until_the_answer_ends(
+        self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AI が応えている間は手の更新も押せない（PR #265 の Codex の指摘）
+
+        押せると、会話を畳む所で画面が止まり、終わりきらない Claude Code を置き換えられずに
+        pip が失敗する 自動の更新と同じく、応え終わるのを待ってもらう
+        """
+        widget = unavailable
+        started: list[bool] = []
+        monkeypatch.setattr(
+            SetupSection,
+            "start",
+            lambda _self, *, upgrade=False, before=None: started.append(upgrade),
+        )
+        _send(widget, "切って")
+        widget._poll()
+        assert widget._update_button.isEnabled() is False
+        assert "応えている間" in widget._update_button.toolTip()
+        assert widget._setup._button.isEnabled() is False
+        assert "応えている間" in widget._setup._button.toolTip()
+        widget.update_parts()
+        assert started == []
+        assert _Session.made[0].closed is False
+
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        widget._poll()
+        assert widget._update_button.isEnabled() is True
+        assert widget._setup._button.isEnabled() is True
 
     def test_the_setup_section_forces_an_upgrade_when_asked(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
@@ -792,7 +842,9 @@ class TestOneWriterAtATime:
         updater.phase = Phase.INSTALLING
         started: list[bool] = []
         monkeypatch.setattr(
-            SetupSection, "start", lambda _self, *, upgrade=False: started.append(upgrade)
+            SetupSection,
+            "start",
+            lambda _self, *, upgrade=False, before=None: started.append(upgrade),
         )
         widget._poll()
         assert widget._setup._button.isEnabled() is False

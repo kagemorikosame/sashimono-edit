@@ -239,9 +239,23 @@ class AgentSession:
         if not self.running:
             return
         self._closed.set()
+        # まだ渡していない指示を捨ててから終わりの印を入れる 残すと、区切り待ちから
+        # 起きたスレッドが終わりの印より先に次の指示を取り出し、誰も見ていない会話で
+        # 編集だけが進む（画面は畳んだ会話の知らせを拾わない PR #265 の Codex の指摘）
+        # 画面は送った指示を自分で持っていて、次の会話へ渡し直す
+        while True:
+            try:
+                self._prompts.get_nowait()
+            except queue.Empty:
+                break
         self._boundary.set()  # 区切り待ちのまま畳まれずに残らないように
         self._bridge.cancel()
         self._prompts.put(None)
+        loop, client = self._loop, self._client
+        if self.busy and loop is not None and client is not None:
+            # 応えている最中なら止める 止めないと応答が終わるまで Claude Code が動き続け、
+            # 部品の入れ替えが使用中の claude.exe を置き換えられずに失敗する
+            asyncio.run_coroutine_threadsafe(_safe_interrupt(client), loop)
         thread = self._thread
         if wait and thread is not None:
             thread.join(timeout=5.0)
@@ -286,8 +300,11 @@ class AgentSession:
             self._emit(AgentEvent(EventKind.READY))
             while not self._closed.is_set():
                 await asyncio.to_thread(self._boundary.wait)
+                # 区切り待ちから起きたのが畳むためなら、次の指示を取り出さずに終わる
+                if self._closed.is_set():
+                    break
                 prompt = await asyncio.to_thread(self._prompts.get)
-                if prompt is None:
+                if prompt is None or self._closed.is_set():
                     break
                 # TURN_DONE を出す前に下ろす 出した後だと、画面が先に区切りを
                 # 付け終えて立てた旗を、ここで消してしまうことがある

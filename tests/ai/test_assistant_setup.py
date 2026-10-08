@@ -9,8 +9,10 @@ import json
 import shutil
 import subprocess
 import sys
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import pytest
 
@@ -271,6 +273,71 @@ class TestReconnect:
         session.send("次の指示")
         session._thread.join(timeout=5.0)
         assert queried == ["次の指示"]
+
+
+class _FakeClient:
+    """ClaudeSDKClient の代わり 受けた指示を覚え、すぐに応え終える"""
+
+    queried: ClassVar[list[str]] = []
+
+    def __init__(self, options: object) -> None:
+        del options
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def query(self, prompt: str) -> None:
+        _FakeClient.queried.append(prompt)
+
+    async def receive_response(self) -> AsyncIterator[object]:
+        return
+        yield
+
+    async def interrupt(self) -> None:
+        return
+
+
+class TestClosingDropsPendingPrompts:
+    def test_a_closed_session_does_not_run_the_next_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """畳んだ会話が、区切り待ちの間に積まれた次の指示を走らせない（PR #265 の Codex の指摘）
+
+        部品が古くて断られた指示の後に 2 つ目を送ってあると、畳んだ後に古い会話が
+        2 つ目を取り出して走らせていた 画面はもうその会話を見ていないので、返事も
+        区切りも拾われず、編集だけが古い部品で進む 2 つ目は画面が新しい会話へ渡し直す
+        """
+        import types
+
+        from sashimono.ai import session as session_module
+
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.ClaudeAgentOptions = lambda **_kwargs: object()  # type: ignore[attr-defined]
+        fake.ClaudeSDKClient = _FakeClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+        monkeypatch.setattr(session_module, "build_server", lambda _bridge: None)
+        monkeypatch.setattr(session_module, "hide_cli_console", lambda: None)
+        monkeypatch.setattr(AgentSession, "option_values", lambda _self: {})
+        _FakeClient.queried = []
+
+        session = AgentSession(cast(EditorBridge, _QuietBridge()))
+        session.send("1 つ目")
+        deadline = time.monotonic() + 5.0
+        events: list[EventKind] = []
+        while EventKind.TURN_DONE not in events and time.monotonic() < deadline:
+            events.extend(event.kind for event in session.poll())
+            time.sleep(0.01)
+        assert EventKind.TURN_DONE in events
+        # 画面はまだ区切りを付け終えていない（acknowledge_turn を呼んでいない）所で 2 つ目
+        session.send("2 つ目")
+        session.close(wait=False)
+        assert session._thread is not None
+        session._thread.join(timeout=5.0)
+        assert session._thread.is_alive() is False
+        assert _FakeClient.queried == ["1 つ目"]
 
 
 class TestPreferences:

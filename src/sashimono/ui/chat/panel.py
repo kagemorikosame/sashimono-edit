@@ -229,6 +229,8 @@ class ChatPanel(QWidget):
         self._updater.finished.connect(self._on_parts_updated)
 
         self._build()
+        # 導入の欄から入れるときも、会話を先に畳ませて畳み終わるのを裏で待つ
+        self._setup.prepare = self._release_session
         theme_signals().changed.connect(self._redraw_log)
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
@@ -500,23 +502,15 @@ class ChatPanel(QWidget):
         導入の欄の pip（配布版では同じプロセスの pip）で入れ、ログを見せる 走っている
         会話は先に畳む Windows では動いている claude.exe を書き換えられず、pip が失敗する
         """
-        if self._setup.busy or self._updater.installing:
-            # 自動の入れ替えの最中に入れると、同じ導入先へ同時に書いて新旧が混ざる
-            # 終われば次の指示から新しい版を使うので、押し直す必要も無い
+        if self._hold_reason():
+            # 自動の入れ替えの最中・AI が応えている最中は入れない ボタンも押せなくしてある
+            # （同じ導入先へ同時に書く・動いている Claude Code を置き換えられない）
             return
-        session = self._session
-        self._session = None
-        if session is not None:
-            session.close()
-        if self._queued:
-            # 待っていた指示はもう返ってこない 区切りを付けて終わらせる
-            self._finish_turn()
-            self._queued.clear()
-            self._close_checkpoint()
         self._retrying = False
         self._stop_button.setEnabled(False)
         self._update_box.setVisible(False)
         self._show_parts(True)
+        # 会話は導入の欄が畳む（prepare = _release_session） 畳み終わるのを待つのは裏のスレッド
         self._setup.start(upgrade=True)
         if self._setup.busy:
             self._input.setEnabled(False)
@@ -796,8 +790,13 @@ class ChatPanel(QWidget):
         # 導入の欄が入れている間も入れ替えない 同じ導入先へ同時に書くと新旧が混ざる
         # （導入先へ書く所は runtime.writing_runtime の錠でも並べてある）
         self._updater.tick(idle and not self._setup.busy)
-        # 自動の入れ替えの間は、導入の欄から入れられないようにする
-        self._setup.hold(self._updater.installing)
+        # 自動の入れ替えの間と AI が応えている間は、導入の欄からも〔AI の部品を更新〕からも
+        # 入れられないようにする わけはツールチップで言う
+        reason = self._hold_reason()
+        self._setup.hold(reason)
+        if self._update_button.isEnabled() == bool(reason):
+            self._update_button.setEnabled(not reason)
+            self._update_button.setToolTip(reason)
         # 秒の進みと承認の箱の出入りを拾う 変わった所だけを書き換えるので、毎回呼んでも軽い
         self._refresh_status()
         if not self._busy_mark.isHidden():
@@ -871,6 +870,20 @@ class ChatPanel(QWidget):
         self._refresh_status()
         if was_working and not self._queued:
             self._alert_done()
+
+    def _hold_reason(self) -> str:
+        """今は部品を手で入れ替えさせないわけ 入れ替えてよければ空
+
+        応えている間に入れると、会話を畳む所で画面が止まり、終わりきらない Claude Code の
+        claude.exe を置き換えられずに pip が失敗する（PR #265 の Codex の指摘） 自動の更新と
+        同じく、応え終わるのを待ってもらう
+        """
+        if self._updater.installing:
+            return "AI の部品を入れ替えています 終わると押せます"
+        session = self._session
+        if self._queued or (session is not None and session.busy):
+            return "AI が応えている間は更新できません 応え終わると押せます"
+        return ""
 
     def _can_retry(self) -> bool:
         """部品を自動で新しくして、いまの指示を送り直せるか 送り直すのは 1 度だけ"""
