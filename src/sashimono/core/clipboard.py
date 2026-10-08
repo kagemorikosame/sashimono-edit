@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
-from sashimono.core.commands import AddClip, AddTrack, Command, RemoveClip
+from sashimono.core.commands import AddClip, AddTrack, Command, InsertGap, RemoveClip
 from sashimono.core.commands.layers import shows_picture_on_layer, solo_for_new_track
 from sashimono.core.model import (
     Clip,
@@ -28,7 +28,14 @@ from sashimono.core.model import (
     new_group_id,
 )
 
-__all__ = ["ClipboardContent", "CopiedClip", "copy_clips", "cut_commands", "paste_commands"]
+__all__ = [
+    "ClipboardContent",
+    "CopiedClip",
+    "copy_clips",
+    "cut_commands",
+    "insert_paste_commands",
+    "paste_commands",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +57,15 @@ class ClipboardContent:
     def origin(self) -> int:
         """いちばん早い開始位置 貼り付けではここを再生ヘッドに合わせる"""
         return min(copied.clip.timeline_start for copied in self.clips)
+
+    @property
+    def length(self) -> int:
+        """いちばん早い頭からいちばん遅い尻までの長さ 挿入貼り付けで後ろを押す量
+
+        トラックごとの長さ（映像だけ長い、など）で押さないのは、押す量がトラックで
+        違うと、リンクした映像と音声やほかのトラックの字幕が貼った後ろでずれるため
+        """
+        return max(copied.clip.timeline_end for copied in self.clips) - self.origin
 
 
 def copy_clips(project: Project, clip_ids: Iterable[ClipId]) -> ClipboardContent:
@@ -137,6 +153,64 @@ def paste_commands(project: Project, content: ClipboardContent, at_frame: int) -
         )
         commands.append(AddClip(track.id, pasted))
     return commands
+
+
+def insert_paste_commands(
+    project: Project, content: ClipboardContent, at_frame: int, *, all_tracks: bool = True
+) -> list[Command]:
+    """``at_frame`` から後ろを貼る長さぶん押し出してから貼り付けるコマンド（挿入貼り付け）
+
+    先頭は :class:`InsertGap`（再生ヘッドをまたぐクリップは割ってから押す）、続けて
+    空いた所へ :func:`paste_commands` と同じ決まりで置く 呼び出し側が 1 つの
+    チェックポイントで括れば、押し出しと貼り付けが 1 回の取り消しで戻る
+
+    ``all_tracks`` が真なら全トラックとマーカーを押す（Premiere Pro の既定 全トラックの
+    同期ロックが入っている） 偽なら、コピー元のトラックと、そこで押されるクリップの
+    リンクの相手・グループの仲間・焼き込んだ字幕のトラックだけを押す
+
+    押す中身のあるトラックがロックされていれば ``ValueError`` で断る 何も実行しないので、
+    タイムラインは元のまま
+    """
+    if not content.clips:
+        return []
+    at = max(0, at_frame)
+    targets = None if all_tracks else _insert_targets(project, content)
+    gap = InsertGap(at, content.length, targets)
+    # 貼る先は押し出した後の姿で決める 押す前の姿で決めると、元のトラックの再生ヘッドの
+    # 後ろが塞がって見え、空けた所ではなく新しいトラックへ置かれる
+    # 押し出しは純関数で、実行したときも同じ姿になる（割った後ろ半分の ID だけは変わるが、
+    # 貼り付けのコマンドはそれを指さない）
+    return [gap, *paste_commands(gap.apply(project), content, at)]
+
+
+def _insert_targets(project: Project, content: ClipboardContent) -> tuple[TrackId, ...]:
+    """挿入貼り付けで押すトラック 今のタイムラインで実際に貼る先になるトラック
+
+    コピー元のトラックが今のタイムラインにあり、ロックしていなければそれ 無いか（別の
+    シーンでコピーした物）ロックしていれば、:func:`_landing_track` が次に選ぶ、同じ種類の
+    ロックしていないトラックを並びの順に割り当てる（コピー元のトラックごとに別の 1 本）
+    条件は :func:`_landing_track` と同じにする コピー元の ID のまま渡すと、無ければ
+    :class:`InsertGap` が何も押さずに新しいトラックへ逃げ、ロックしていれば貼りもしない
+    トラックの後ろを押そうとして断られる
+    """
+    tracks = project.timeline.tracks
+    usable = {track.id for track in tracks if not track.locked}
+    chosen: dict[TrackId, TrackId] = {}
+    used = {copied.track_id for copied in content.clips if copied.track_id in usable}
+    for copied in content.clips:
+        if copied.track_id in chosen:
+            continue
+        if copied.track_id in usable:
+            chosen[copied.track_id] = copied.track_id
+            continue
+        spare = [t.id for t in tracks if t.kind is copied.kind and not t.locked]
+        # 同じ種類が足りなければ、ほかのコピー元と同じトラックを使う（:func:`_landing_track` も
+        # 重ならなければ同じトラックへ置く） 1 本も無ければ貼り付けが作るので押す物は無い
+        pick = next((t for t in spare if t not in used), spare[0] if spare else None)
+        if pick is not None:
+            chosen[copied.track_id] = pick
+            used.add(pick)
+    return tuple(dict.fromkeys(chosen.values()))
 
 
 def _landing_track(

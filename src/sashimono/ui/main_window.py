@@ -134,6 +134,7 @@ from sashimono.ui.progress_display import (
 )
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
@@ -288,6 +289,12 @@ class MainWindow(QMainWindow):
     ) -> None:
         """``confirm_unsaved`` を偽にすると、閉じるときに保存を尋ねない テスト用"""
         super().__init__()
+        # 入力欄に打っている間の Ctrl+Shift+V は欄の書式なしの貼り付け 入れないと、
+        # 窓の挿入貼り付けが動いてタイムラインへクリップが貼られる
+        application = QApplication.instance()
+        self._text_keys = (
+            install_text_field_keys(application) if isinstance(application, QApplication) else None
+        )
         self.setWindowTitle("Sashimono Edit")
         screen = QApplication.primaryScreen()
         self.resize(
@@ -433,6 +440,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_value_lines(self._preferences.value_lines)
         self._timeline.set_detail_min_width(self._preferences.detail_min_width)
         self._timeline.set_split_audio(self._preferences.splits_media)
+        self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._media_pool = MediaPoolWidget(project, self)
         self._inspector = InspectorPanel(self)
@@ -630,6 +638,18 @@ class MainWindow(QMainWindow):
             QKeySequence.StandardKey.Paste,
             self._timeline.paste_at_playhead,
         )
+        # Premiere Pro と同じ割り当て 再生ヘッドから後ろを押し出して間に入れる
+        insert_paste = self._add(
+            edit_menu,
+            "貼り付け（挿入）",
+            QKeySequence("Ctrl+Shift+V"),
+            self._timeline.insert_paste_at_playhead,
+        )
+        # ショートカットの設定で変えた先のキーも、入力欄に打っている間は欄に渡す 渡さないと、
+        # 変えた人だけ欄の中で押したときにクリップが貼られる 割り当ての変わり方（設定の窓・
+        # 起動時の読み込み）を問わず追うため、項目の変化の知らせにつなぐ
+        insert_paste.changed.connect(lambda: self._hold_insert_keys(insert_paste))
+        self._hold_insert_keys(insert_paste)
         self._add(
             edit_menu, "すべて選択", QKeySequence.StandardKey.SelectAll, self._timeline.select_all
         )
@@ -792,6 +812,11 @@ class MainWindow(QMainWindow):
         self._actions[f"{menu.title()}/{text}"] = (action, action.shortcut().toString(_PORTABLE))
         return action
 
+    def _hold_insert_keys(self, action: QAction) -> None:
+        """挿入貼り付けの今のキーを入力欄の見張りへ渡す"""
+        if self._text_keys is not None:
+            self._text_keys.hold(self, action.shortcuts())
+
     def _apply_shortcuts(self, bindings: dict[str, str]) -> None:
         """割り当てを当てる 知らない名前は飛ばす（版が変わって消えた項目など）"""
         for name, key in bindings.items():
@@ -871,6 +896,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_detail_min_width(preferences.detail_min_width)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
+        self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
