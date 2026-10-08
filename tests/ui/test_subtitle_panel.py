@@ -26,7 +26,8 @@ from sashimono.core.commands import (
     SetWorkArea,
     TrimClip,
 )
-from sashimono.core.model import AnimatedValue, MediaItem, Project, Transcript
+from sashimono.core.model import AnimatedValue, Clip, MediaItem, Project, Transcript
+from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -447,6 +448,50 @@ class TestBurnAndExport:
             position = clip.source.params["pos_y"]
             assert isinstance(position, AnimatedValue)
             assert -half < position.at(0) < 0
+
+    @pytest.mark.parametrize(("share", "expected"), [(90, 1920 * 0.9), (100, 1920.0), (0, 0.0)])
+    def test_burned_text_wraps_at_the_chosen_share(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        share: int,
+        expected: float,
+    ) -> None:
+        """既定の見た目で焼いた字幕に、設定の割合の折り返しの幅が入る（#249）
+
+        入らないと、長い字幕が画面の端で切れる 設定で切ったら（0）入れない
+        """
+        widget, issued = panel
+        widget.wrap_share = share
+        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.burn()
+        clips = [c.clip for c in issued[-1][0] if isinstance(c, AddClip)]
+        assert clips
+        for clip in clips:
+            assert clip.source is not None
+            width = clip.source.params["wrap_width"]
+            assert isinstance(width, AnimatedValue)
+            assert width.static == pytest.approx(expected)
+
+    def test_a_template_keeps_its_own_wrap(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
+    ) -> None:
+        # ひな形に選んだテキストの見た目は、折り返しの幅も含めてそのまま写す 設定で上書きすると、
+        # 手で決めた幅が焼き込むたびに戻る
+        widget, issued = panel
+        template = Clip(
+            timeline_start=0,
+            duration=30,
+            source=TEXT.create(text="ひな形", wrap_width=500),
+        )
+        widget.template_provider = lambda: template
+        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.burn()
+        clips = [c.clip for c in issued[-1][0] if isinstance(c, AddClip)]
+        assert clips
+        for clip in clips:
+            assert clip.source is not None
+            width = clip.source.params["wrap_width"]
+            assert isinstance(width, AnimatedValue) and width.static == 500
 
     def test_export_writes_the_file(
         self,

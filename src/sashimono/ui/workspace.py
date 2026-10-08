@@ -357,6 +357,18 @@ class Preferences:
     #: 人は尋ねる・何もしないへ切り替える（〔互換〕→〔exe の隣のスクリプトを移す…〕からは
     #: いつでも移せる）
     scripts_move: str = SCRIPTS_MOVE_AUTO
+    #: 新しく作る字幕（焼き込み）のテキストを、画面の幅に合わせて自動で折り返す（#249）
+    #: 既定は入 知らない人ほど、長い字幕が画面からはみ出して切れるのに困る 改行を手で
+    #: 決めたい人・字幕の整形の文字数だけで分けたい人は切れる 既にあるテキストには触らない
+    subtitle_wrap: bool = True
+    #: 折り返す幅（画面の幅の何 %） 既定 90 は左右に 5% ずつの余白で、縁取りと影が画面の
+    #: 端に掛からない 端まで使いたい人は 100、狭くまとめたい人は下げる
+    subtitle_wrap_percent: int = 90
+
+    @property
+    def subtitle_wrap_share(self) -> int:
+        """字幕の折り返しの幅（画面の幅の %） 切ってあれば 0（折り返さない）"""
+        return self.subtitle_wrap_percent if self.subtitle_wrap else 0
 
     @property
     def splits_media(self) -> bool:
@@ -456,6 +468,10 @@ class PreferenceStore:
             update_beta=_flag(data.get("update_beta"), plain.update_beta),
             update_confirm=_flag(data.get("update_confirm"), plain.update_confirm),
             scripts_move=_choice(data.get("scripts_move"), SCRIPTS_MOVE_MODES, plain.scripts_move),
+            subtitle_wrap=_flag(data.get("subtitle_wrap"), plain.subtitle_wrap),
+            subtitle_wrap_percent=_wrap_percent(
+                data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
+            ),
         )
 
     def save(self, preferences: Preferences) -> None:
@@ -476,6 +492,21 @@ def _snap_distance(value: object, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if SNAP_DISTANCES[0] <= value <= SNAP_DISTANCES[1] else default
+
+
+#: 字幕の折り返しの幅として受け付ける範囲（画面の幅の %）
+SUBTITLE_WRAP_PERCENTS = (20, 100)
+
+
+def _wrap_percent(value: object, default: int) -> int:
+    """字幕の折り返しの幅（%） 範囲の外は既定へ戻す
+
+    狭すぎると 1 行に数文字しか入らず字幕が縦に積み上がり、100 を超えると画面からはみ出す
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    low, high = SUBTITLE_WRAP_PERCENTS
+    return value if low <= value <= high else default
 
 
 #: 細い帯にする幅として受け付ける範囲（画素） タイムラインもこの範囲へ丸める

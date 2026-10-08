@@ -447,6 +447,7 @@ class MainWindow(QMainWindow):
         self._subtitles = SubtitlePanel(project, self._analyzer, self)
         # 焼き込みのひな形は、タイムラインで選んでいるテキストのクリップ
         self._subtitles.template_provider = self._selected_text_clip
+        self._subtitles.wrap_share = self._preferences.subtitle_wrap_share
         self._chat = ChatPanel(self, self)
         self._playback = PlaybackController(
             project, self, smooth_history=self._preferences.smooth_audio_motion
@@ -866,6 +867,7 @@ class MainWindow(QMainWindow):
         self._media_pool.set_view_mode(preferences.media_view)
         self._chat.apply_preferences(preferences)
         self._timeline.set_value_lines(preferences.value_lines)
+        self._subtitles.wrap_share = preferences.subtitle_wrap_share
         self._timeline.set_detail_min_width(preferences.detail_min_width)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
@@ -2605,6 +2607,11 @@ class MainWindow(QMainWindow):
     def splits_media(self) -> bool:
         """AI が素材を置くときも、画面から置くときと同じ設定に従う"""
         return self._preferences.splits_media
+
+    @property
+    def subtitle_wrap_share(self) -> int:
+        """AI が焼き込む字幕も、画面の〔焼き込み〕と同じ幅で折り返す"""
+        return self._preferences.subtitle_wrap_share
 
     def set_active_scene(self, scene_id: SceneId | None) -> None:
         self.open_scene(scene_id)

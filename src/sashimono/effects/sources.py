@@ -58,10 +58,17 @@ class SourceDefinition:
     #: 図形の種類や切り替え方で使う項目が変わる物だけが持つ 全部を並べると、図形の
     #: 設定に 60 近い欄が並び、どれを動かせば変わるのかが分からない
     unused: Callable[[Mapping[str, ParamValue]], frozenset[str]] | None = None
+    #: 今の値では効かない項目と、その理由 設定パネルは欄を灰色にして理由を添える（値は残す）
+    #: 隠さないのは、別の設定（組み方など）を変えれば使える項目だと分かるようにするため
+    locked: Callable[[Mapping[str, ParamValue]], Mapping[str, str]] | None = None
 
     def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
         """``params`` のときに使わない項目 :attr:`unused` が無ければ空"""
         return self.unused(params) if self.unused is not None else frozenset()
+
+    def locked_reasons(self, params: Mapping[str, ParamValue]) -> Mapping[str, str]:
+        """``params`` のときに効かない項目と理由 :attr:`locked` が無ければ空"""
+        return self.locked(params) if self.locked is not None else {}
 
     def spec(self, name: str) -> ParameterSpec | None:
         for parameter in self.parameters:
@@ -117,6 +124,29 @@ def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
     if all(_still_zero(params.get(name)) for name in ("shadow_x", "shadow_y", "shadow_blur")):
         unused.add("shadow_color")
     return frozenset(unused)
+
+
+#: AviUtl2 の組み方で折り返しの欄を使えない理由 設定パネルの欄に添える
+AVIUTL_NO_WRAP = (
+    "AviUtl2 の組み方は折り返しません AviUtl2 のテキストに自動で折り返す項目が無いため"
+    "（標準の組み方にすると使えます）"
+)
+
+
+def _text_locked(params: Mapping[str, ParamValue]) -> Mapping[str, str]:
+    """テキストの設定で、今は効かない項目とその理由
+
+    AviUtl2 の組み方（横書き）は折り返さない AviUtl2 のテキストには折り返しの項目が無く、
+    長い文は画面からはみ出す（PSDToolKit の自動折り返しのような追加の部品で補う物）
+    合わせる相手に無い動きを足すと、読み込んだ AviUtl2 の作品の行が変わる
+    縦書きは AviUtl2 の組み方でも標準の縦書きで描くので、折り返しが効く
+    """
+    vertical = params.get("vertical")
+    if params.get("layout") == "aviutl" and not (
+        vertical is True or (isinstance(vertical, int) and vertical)
+    ):
+        return {"wrap_width": AVIUTL_NO_WRAP}
+    return {}
 
 
 TEXT = SourceDefinition(
@@ -187,7 +217,12 @@ TEXT = SourceDefinition(
             (("native", "標準"), ("aviutl", "AviUtl2 と同じ")),
             "native",
         ),
+        # 折り返しの幅（画面の画素 #249） 行がこの幅に届く前に、禁則と英単語の切れ目を守って
+        # 折り返す 縦書きは列の高さで折り返す 0 は折り返さない（既定） 既にある作品と、
+        # 手で改行したテキストの見た目を変えない YMM4 の MaxWidth と WordWrap に当たる
+        TrackSpec("wrap_width", "折り返しの幅", 0, 8000, 0, step=1, unit="px"),
     ),
+    locked=_text_locked,
 )
 
 
