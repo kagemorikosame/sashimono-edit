@@ -83,6 +83,8 @@ class SetupSection(QWidget):
         self._latest: dict[str, Latest | None] = {}
         #: 尋ねた結果を言う文 状態を出し直しても消えないように持つ
         self._update_note = ""
+        #: ほかが導入先へ書いている間は導入を始めさせない（:meth:`hold`）
+        self._held = False
 
         self._status = QLabel(self)
         self._status.setWordWrap(True)
@@ -192,7 +194,7 @@ class SetupSection(QWidget):
         if pip_left_running() or self.busy:
             return
         self._leftover_timer.stop()
-        self._button.setEnabled(True)
+        self._button.setEnabled(not self._held)
         self.refresh()
 
     def command_text(self) -> str:
@@ -219,9 +221,16 @@ class SetupSection(QWidget):
         self.refresh()
 
         def run() -> None:
-            for requirement in requirements:
-                found[requirement] = latest_release(requirement)
-            done.set()
+            # 終わった印は finally で立てる 尋ねる所が思わぬ例外で落ちると、印が立たず
+            # 「確かめています…」とボタンの押せない状態と時計がいつまでも残る
+            # 落ちた部品は答えが無いまま（確かめられなかった）として出す
+            try:
+                for requirement in requirements:
+                    found[requirement] = latest_release(requirement)
+            except Exception:  # 裏のスレッドの例外は画面へ出さない
+                return
+            finally:
+                done.set()
 
         threading.Thread(target=run, name=f"sashimono-check-{self._pack.key}", daemon=True).start()
         self._timer.start()
@@ -235,9 +244,21 @@ class SetupSection(QWidget):
             self._force_upgrade = True
         self.refresh()
 
+    def hold(self, held: bool) -> None:
+        """ほかが導入先へ書いている間（AI の部品の自動の入れ替え）、導入を始めさせない
+
+        押せると同じ導入先へ同時に書いて新旧が混ざる 錠（runtime.writing_runtime）でも
+        並べてあるが、押せたのに待たされるより、押せない方が何が起きているか分かる
+        """
+        if held == self._held:
+            return
+        self._held = held
+        self._button.setToolTip("AI の部品を入れ替えています 終わると押せます" if held else "")
+        self._button.setEnabled(not held and not self.busy and not pip_left_running())
+
     def start(self, *, upgrade: bool = False) -> None:
         """導入を始める ``upgrade`` を立てると、入っている版も新しい版へ入れ替える"""
-        if self.busy or self._block_while_pip_is_left():
+        if self.busy or self._held or self._block_while_pip_is_left():
             return
         if upgrade:
             self._force_upgrade = True
@@ -262,15 +283,21 @@ class SetupSection(QWidget):
         self._code = -1
 
         def run() -> None:
-            code = install_runtime(
-                pack=self._pack,
-                command=argv,
-                on_output=self._log_queue.put,
-                should_cancel=cancel.is_set,
-            )
-            self._code = code
-            self._log_queue.put(install_result_text(code))
-            done.set()
+            # 同じく終わった印は finally で立てる 立たないと導入中のまま押せなくなる
+            code = 1
+            try:
+                code = install_runtime(
+                    pack=self._pack,
+                    command=argv,
+                    on_output=self._log_queue.put,
+                    should_cancel=cancel.is_set,
+                )
+            except Exception as exc:  # 失敗として出す 画面のスレッドへは出さない
+                self._log_queue.put(f"導入の途中で落ちました: {type(exc).__name__}: {exc}")
+            finally:
+                self._code = code
+                self._log_queue.put(install_result_text(code))
+                done.set()
 
         threading.Thread(
             target=run, name=f"sashimono-install-{self._pack.key}", daemon=True
@@ -302,7 +329,7 @@ class SetupSection(QWidget):
         if self._checking is None:
             self._timer.stop()
         self._progress.setVisible(False)
-        self._button.setEnabled(True)
+        self._button.setEnabled(not self._held)
         succeeded = self._code == 0
         if succeeded:
             # 入れ替え終えた 前に尋ねた「更新があります」は古い話になる

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import sysconfig
@@ -76,8 +77,9 @@ def latest_release(requirement: str, *, opener: Opener | None = None) -> Latest 
     try:
         with (opener or _open)(request) as response:
             data = json.load(response)
-    except (OSError, ValueError):
-        # 繋がらない・返事が壊れている どちらも「確かめられなかった」と扱うだけにする
+    except (OSError, ValueError, http.client.HTTPException):
+        # 繋がらない・返事が壊れている・途中で切れた（IncompleteRead など HTTPException は
+        # OSError ではない） どれも「確かめられなかった」と扱うだけにする
         return None
     tag = platform_tag()
     return Latest(

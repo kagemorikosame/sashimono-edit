@@ -26,7 +26,13 @@ from packaging.requirements import InvalidRequirement, Requirement
 
 from sashimono.core import userdirs
 from sashimono.package_index import Latest, latest_release
-from sashimono.runtime import FeaturePack, is_newer_version, mark_installed, run_pip_in_worker
+from sashimono.runtime import (
+    FeaturePack,
+    is_newer_version,
+    mark_installed,
+    run_pip_in_worker,
+    writing_runtime,
+)
 
 __all__ = [
     "CHECK_INTERVAL_SECONDS",
@@ -153,11 +159,15 @@ def install_staged(
             return False
         if before_swap is not None:
             before_swap()
-        if not swap_in(staging, target):
-            return False
+        # 導入先へ書く所は導入のボタンと同じ錠で並べる 同時に書くと新旧が混ざる
+        # 会話が畳み終わるのを待つ（before_swap）のは錠の外 持ったまま待つと、その間ずっと
+        # 導入のボタンを待たせる
+        with writing_runtime(on_output, should_cancel) as granted:
+            if not granted or not swap_in(staging, target):
+                return False
+            mark_installed(target, key)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    mark_installed(target, key)
     return True
 
 

@@ -34,7 +34,7 @@ import threading
 import traceback
 import types
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -73,6 +73,7 @@ __all__ = [
     "runtime_target_dir",
     "snapshot_runtime_modules",
     "stale_runtime",
+    "writing_runtime",
 ]
 
 #: 導入したものを置くフォルダの名前（パッケージ版のみ）
@@ -1067,7 +1068,51 @@ def install_runtime(
     argv = list(command)
     if on_output is not None:
         on_output("> " + " ".join(argv))
+    with writing_runtime(on_output, should_cancel) as granted:
+        if not granted:
+            return 1
+        return _install_runtime_locked(pack, argv, on_output, should_cancel)
 
+
+#: 導入先（配布版の ``runtime``）へ書く物を 1 本ずつにする錠 導入のボタン（字幕起こしと
+#: AI 連携）と AI の部品の自動の入れ替え（:mod:`sashimono.ai.parts_update`）が同時に書くと、
+#: 新旧の部品が混ざる pip の錠（``_PIP_HERE``）は pip が走る間しか並べず、自動の入れ替えの
+#: 「別の置き場から移す」所は pip の外なので、それだけでは防げない
+_RUNTIME_WRITE = threading.Lock()
+
+
+@contextlib.contextmanager
+def writing_runtime(
+    on_output: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Iterator[bool]:
+    """導入先へ書く間だけ錠を持つ 待っている間に中断を頼まれたら偽で入る（書かずに戻る）
+
+    錠を持ったまま pip の錠を待つ順はここだけにする 逆の順で持つ所を作ると、互いに待って止まる
+    """
+    waited = False
+    while not _RUNTIME_WRITE.acquire(timeout=_CANCEL_POLL_SECONDS):
+        if not waited:
+            waited = True
+            if on_output is not None:
+                on_output("ほかの導入か AI の部品の入れ替えが終わるのを待っています")
+        if should_cancel is not None and should_cancel():
+            if on_output is not None:
+                on_output("中断した")
+            yield False
+            return
+    try:
+        yield True
+    finally:
+        _RUNTIME_WRITE.release()
+
+
+def _install_runtime_locked(
+    pack: FeaturePack | None,
+    argv: list[str],
+    on_output: Callable[[str], None] | None,
+    should_cancel: Callable[[], bool] | None,
+) -> int:
     target = runtime_target_dir()
     if target is not None:
         target.mkdir(parents=True, exist_ok=True)

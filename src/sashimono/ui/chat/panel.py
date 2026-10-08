@@ -500,7 +500,9 @@ class ChatPanel(QWidget):
         導入の欄の pip（配布版では同じプロセスの pip）で入れ、ログを見せる 走っている
         会話は先に畳む Windows では動いている claude.exe を書き換えられず、pip が失敗する
         """
-        if self._setup.busy:
+        if self._setup.busy or self._updater.installing:
+            # 自動の入れ替えの最中に入れると、同じ導入先へ同時に書いて新旧が混ざる
+            # 終われば次の指示から新しい版を使うので、押し直す必要も無い
             return
         session = self._session
         self._session = None
@@ -709,6 +711,8 @@ class ChatPanel(QWidget):
                 self._turn_error = False
             else:
                 # 自動では直せなかった ここで初めて、何が起きたかと手での直し方を見せる
+                # 入れ替えをやめた（設定で切った）ときも同じ 送り直しはやめ、続けて送って
+                # 持っていた指示は今の版の会話へ渡す（持ったままだと、いつまでも応えない）
                 self._show_outdated(self._outdated or OutdatedClaudeCode())
                 self._give_up_turn()
                 self._refresh_status()
@@ -789,7 +793,11 @@ class ChatPanel(QWidget):
         # 次の指示を始めずに止まっている（区切りを付け終えるのを待っている）ので暇と見る
         session = self._session
         idle = self._retrying or session is None or not (self._queued or session.busy)
-        self._updater.tick(idle)
+        # 導入の欄が入れている間も入れ替えない 同じ導入先へ同時に書くと新旧が混ざる
+        # （導入先へ書く所は runtime.writing_runtime の錠でも並べてある）
+        self._updater.tick(idle and not self._setup.busy)
+        # 自動の入れ替えの間は、導入の欄から入れられないようにする
+        self._setup.hold(self._updater.installing)
         # 秒の進みと承認の箱の出入りを拾う 変わった所だけを書き換えるので、毎回呼んでも軽い
         self._refresh_status()
         if not self._busy_mark.isHidden():
@@ -883,12 +891,23 @@ class ChatPanel(QWidget):
             self._give_up_turn()
 
     def _give_up_turn(self) -> None:
-        """いまの指示を失敗として終える 待っていた指示も前の会話と一緒に畳む"""
+        """断られた指示を失敗として終え、続けて送ってあった指示は今の版の会話へ渡し直す
+
+        前の会話は区切りを付け終える知らせを待って止まっているので畳み、新しい会話を作る
+        続けて送った指示まで捨てると、送ったのに何も起きない指示が残る
+        """
         self._release_session()
         self._finish_turn()
-        self._queued.clear()
         self._close_checkpoint()
-        self._stop_button.setEnabled(False)
+        if self._queued:
+            self._queued.popleft()
+        if not self._queued:
+            self._stop_button.setEnabled(False)
+            return
+        self._open_checkpoint(self._queued[0])
+        self._begin_turn()
+        for prompt in self._queued:
+            self._dispatch(prompt)
 
     def _alert_done(self) -> None:
         """送った指示がすべて終わった 頼まれていれば、別の窓を触っている人に知らせる"""

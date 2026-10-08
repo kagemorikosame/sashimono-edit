@@ -728,3 +728,193 @@ class TestPreference:
         dialog = PreferencesDialog(Preferences(ai_auto_update=False))
         assert dialog.preferences().ai_auto_update is False
         dialog.deleteLater()
+
+
+# --- PR #265 のレビューで見つかった物 ---
+
+
+class TestOneWriterAtATime:
+    """自動の入れ替えと導入の欄が、同じ導入先へ同時に書かない（新旧が混ざる）"""
+
+    def test_the_swap_waits_for_the_install_button(self, runtime: Path) -> None:
+        import threading
+
+        from sashimono.runtime import writing_runtime
+
+        finished = threading.Event()
+        result: list[bool] = []
+
+        def work() -> None:
+            result.append(
+                install_staged((f"{SDK}==0.2.164",), target=runtime, key="ai", run_pip=_fake_pip())
+            )
+            finished.set()
+
+        with writing_runtime():  # 導入の欄が書いている所
+            threading.Thread(target=work, daemon=True).start()
+            assert finished.wait(0.5) is False
+            assert "old sdk" in _sdk_marker(runtime)
+        assert finished.wait(5.0) is True
+        assert result == [True]
+        assert "new sdk" in _sdk_marker(runtime)
+
+    def test_the_install_button_holds_the_same_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sashimono import runtime as runtime_module
+
+        seen: list[bool] = []
+
+        def child(argv: list[str], *_args: object) -> int:
+            del argv
+            seen.append(runtime_module._RUNTIME_WRITE.locked())
+            return 0
+
+        monkeypatch.setattr(runtime_module, "_run_child", child)
+        monkeypatch.setattr(runtime_module, "runtime_target_dir", lambda: None)
+        assert runtime_module.install_runtime(command=["python", "-m", "pip", "install", "x"]) == 0
+        assert seen == [True]
+        assert runtime_module._RUNTIME_WRITE.locked() is False
+
+    def test_the_panel_blocks_both_directions(
+        self, automatic: tuple[ChatPanel, PartsUpdater, _Installer], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        widget, updater, installer = automatic
+        # 導入の欄が入れている間は、自動の入れ替えを始めない
+        updater._check(asked=False)
+        _settle(updater)
+        assert updater.phase is Phase.PENDING
+        monkeypatch.setattr(SetupSection, "busy", property(lambda _self: True))
+        widget._poll()
+        assert updater.phase is Phase.PENDING
+        assert installer.calls == []
+        monkeypatch.setattr(SetupSection, "busy", property(lambda _self: False))
+
+        # 自動の入れ替えの間は、導入の欄から入れられず、〔AI の部品を更新〕も始まらない
+        updater.phase = Phase.INSTALLING
+        started: list[bool] = []
+        monkeypatch.setattr(
+            SetupSection, "start", lambda _self, *, upgrade=False: started.append(upgrade)
+        )
+        widget._poll()
+        assert widget._setup._button.isEnabled() is False
+        widget.update_parts()
+        assert started == []
+        updater.phase = Phase.IDLE
+        widget._poll()
+        assert widget._setup._button.isEnabled() is True
+
+
+class TestCancelledRetry:
+    """頼まれた更新を取りやめたときも知らせる 知らせないとパネルが待ち続ける"""
+
+    def test_turning_it_off_while_pending_reports_a_failure(self, tmp_path: Path) -> None:
+        updater, _, installer = _updater(tmp_path)
+        heard: list[tuple[bool, str]] = []
+        updater.finished.connect(lambda ok, pins: heard.append((ok, pins)))
+        assert updater.request_now() is True
+        _settle(updater)
+        assert updater.phase is Phase.PENDING
+        updater.set_enabled(False)
+        assert heard == [(False, "")]
+        assert updater.installing is False
+        assert installer.calls == []
+        updater.stop()
+
+    def test_losing_the_target_while_pending_reports_a_failure(self, tmp_path: Path) -> None:
+        updater, _, _ = _updater(tmp_path)
+        heard: list[bool] = []
+        updater.finished.connect(lambda ok, _pins: heard.append(ok))
+        updater.request_now()
+        _settle(updater)
+        updater._target = lambda: None
+        updater.tick(idle=True)
+        assert heard == [False]
+        updater.stop()
+
+    def test_the_panel_passes_the_held_prompts_on(
+        self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
+    ) -> None:
+        """送り直しを取りやめたら、続けて送って持っていた指示は今の版の会話へ渡す
+
+        渡さないと、状態の行が「更新しています…」のまま、指示がいつまでも応えられない
+        """
+        widget, updater, installer = automatic
+        _send(widget, "切って")
+        _outdated_turn(widget)
+        _settle(updater)
+        assert updater.phase is Phase.PENDING
+        _send(widget, "続けて")
+        assert all("続けて" not in session.prompts for session in _Session.made[1:])
+
+        widget.apply_preferences(Preferences(ai_auto_update=False))
+        assert installer.calls == []
+        assert widget._retrying is False
+        assert "AI の部品（" in _text(widget)
+        assert _Session.made[-1].prompts == ["続けて"]
+        assert _Session.made[-1] is not _Session.made[0]
+        assert widget._status_text.text().startswith("接続しています…")
+
+
+class TestCheckFailures:
+    """確かめが落ちても、確かめている途中のまま止まらない"""
+
+    def test_a_cut_off_reply_is_not_known(self) -> None:
+        import http.client
+
+        def opener(request: urllib.request.Request) -> IO[bytes]:
+            del request
+            raise http.client.IncompleteRead(b"{")
+
+        assert latest_release(REQUIRED_PACKAGES[0], opener=opener) is None
+
+    def test_a_crash_in_the_check_thread_ends_the_check(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ui import setup as setup_module
+
+        del qt_application
+        status = PackStatus(pack=AI_PACK, packages=(PackageStatus(SDK, "0.2.158"),))
+        monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+
+        def broken(requirement: str) -> Latest | None:
+            raise RuntimeError(requirement)
+
+        monkeypatch.setattr(setup_module, "latest_release", broken)
+        section = SetupSection(AI_PACK)
+        try:
+            section.check_updates()
+            checking = section._checking
+            assert checking is not None
+            assert checking.wait(5.0) is True
+            section._poll()
+            assert section._checking is None
+            assert section._check_button.isEnabled() is True
+            assert "確かめられませんでした" in section._status.text()
+        finally:
+            section.deleteLater()
+
+    def test_a_crash_in_the_install_thread_ends_the_install(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ui import setup as setup_module
+
+        del qt_application
+        status = PackStatus(pack=AI_PACK, packages=(PackageStatus(SDK, "0.2.158"),))
+        monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+
+        def broken(**_kwargs: object) -> int:
+            raise RuntimeError("落ちた")
+
+        monkeypatch.setattr(setup_module, "install_runtime", broken)
+        section = SetupSection(AI_PACK)
+        heard: list[bool] = []
+        section.finished.connect(heard.append)
+        try:
+            section.start()
+            done = section._done
+            assert done is not None
+            assert done.wait(5.0) is True
+            section._poll()
+            assert heard == [False]
+            assert section.busy is False
+        finally:
+            section.deleteLater()

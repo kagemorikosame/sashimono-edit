@@ -321,15 +321,22 @@ class TranscribeDialog(QDialog):
         self._install_code = -1
 
         def run() -> None:
-            code = install_runtime(
-                pack=ASR_PACK,
-                command=command,
-                on_output=self._install_log.put,
-                should_cancel=cancel.is_set,
-            )
-            self._install_code = code
-            self._install_log.put(install_result_text(code))
-            done.set()
+            # 終わった印は finally で立てる 導入が思わぬ例外で落ちると印が立たず、
+            # 導入中の表示のまま閉じることも起こすこともできなくなる
+            code = 1
+            try:
+                code = install_runtime(
+                    pack=ASR_PACK,
+                    command=command,
+                    on_output=self._install_log.put,
+                    should_cancel=cancel.is_set,
+                )
+            except Exception as exc:  # 失敗として出す 画面のスレッドへは出さない
+                self._install_log.put(f"導入の途中で落ちました: {type(exc).__name__}: {exc}")
+            finally:
+                self._install_code = code
+                self._install_log.put(install_result_text(code))
+                done.set()
 
         threading.Thread(target=run, name="sashimono-asr-install", daemon=True).start()
         self._timer.start()

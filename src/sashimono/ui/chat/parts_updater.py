@@ -127,7 +127,7 @@ class PartsUpdater(QObject):
         if not enabled:
             self._start_timer.stop()
             if self.phase is Phase.PENDING:
-                self.phase = Phase.IDLE
+                self._abandon()
 
     def schedule(self) -> None:
         """起動から少し後に確かめる"""
@@ -147,9 +147,20 @@ class PartsUpdater(QObject):
         """パネルの見張りから呼ぶ ``idle`` は AI が応えていないか"""
         if self.phase is Phase.PENDING and idle:
             if not self.available:
-                self.phase = Phase.IDLE
+                self._abandon()
                 return
             self._install()
+
+    def _abandon(self) -> None:
+        """入れずにやめる 頼まれた更新なら、できなかったと知らせる
+
+        知らせずにやめると、パネルは送り直しを待ったまま、持っている指示をいつまでも
+        会話へ渡さず、状態の行も「更新しています…」のまま残る
+        """
+        self.phase = Phase.IDLE
+        if self._asked:
+            self._asked = False
+            self.finished.emit(False, "")
 
     def stop(self) -> None:
         """窓を閉じる 時計を止める（裏の pip は daemon なので、プロセスと一緒に終わる）"""
@@ -160,6 +171,8 @@ class PartsUpdater(QObject):
 
     def _check(self, *, asked: bool) -> None:
         if not self.available or self.phase is not Phase.IDLE:
+            if asked and self.phase is Phase.IDLE:
+                self._abandon()
             return
         state = self._store.load()
         now = self._clock()
@@ -170,11 +183,13 @@ class PartsUpdater(QObject):
         found: list[tuple[str, ...]] = []
 
         def run() -> None:
+            # 終わった印は finally で立てる 立たないと、確かめている途中のまま止まる
             try:
                 found.append(find_update(self._pack, self._lookup))
             except Exception:  # 確かめの失敗で画面へ例外を出さない 次の機会に確かめる
                 found.append(())
-            done.set()
+            finally:
+                done.set()
 
         self.phase = Phase.CHECKING
         self._work = done
@@ -185,7 +200,7 @@ class PartsUpdater(QObject):
     def _install(self) -> None:
         target = self._target()
         if target is None:
-            self.phase = Phase.IDLE
+            self._abandon()
             return
         wait = self.prepare() if self.prepare is not None else None
         pins = self._pins
@@ -199,7 +214,8 @@ class PartsUpdater(QObject):
                 )
             except Exception:  # 落ちても今の版は残っている 次の機会に試す
                 result.append(False)
-            done.set()
+            finally:
+                done.set()
 
         self.phase = Phase.INSTALLING
         self._work = done
