@@ -698,7 +698,14 @@ def _pushed_area(area: tuple[int, int] | None, frame: int, length: int) -> tuple
 
 
 def _companions(timeline: Timeline, clip: Clip) -> list[tuple[Track, Clip]]:
-    """``clip`` と一緒にずれないと困る物 リンクの相手・グループの仲間・焼き込んだ字幕"""
+    """``clip`` と一緒にずれないと困る物 リンクの相手・グループの仲間・焼き込んだ字幕
+
+    どの関係も両向きにたどる リンクとグループは同じ値を共に持つので、どちらから引いても
+    同じ仲間が返る 焼き込んだ字幕は字幕の側だけが素材を指す（:attr:`Clip.subtitle_origin`
+    字幕のクリップは ``media_id`` を持たない）ので、素材から字幕と、字幕から素材の
+    クリップを別々に探す 片向きだと、字幕のトラックへ貼ったときに字幕だけが押され、
+    話している映像と音声から貼った長さぶんずれる
+    """
     found: list[tuple[Track, Clip]] = []
     if clip.link_group is not None:
         found.extend(timeline.linked_clips(clip.link_group))
@@ -710,6 +717,14 @@ def _companions(timeline: Timeline, clip: Clip) -> list[tuple[Track, Clip]]:
             for track in timeline.tracks
             for other in track.clips
             if other.subtitle_origin is not None and other.subtitle_origin.media_id == clip.media_id
+        )
+    origin = clip.subtitle_origin
+    if origin is not None and origin.media_id is not None:
+        found.extend(
+            (track, other)
+            for track in timeline.tracks
+            for other in track.clips
+            if other.media_id == origin.media_id
         )
     return found
 

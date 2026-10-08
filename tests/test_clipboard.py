@@ -284,6 +284,27 @@ class TestInsertPaste:
         pasted = apply(project, insert_paste_commands(project, content, 100, all_tracks=False))
         assert _spans(pasted, 2) == [(420, 450)]
 
+    def test_pasting_onto_the_subtitles_also_pushes_the_source(self, linked: Project) -> None:
+        # 焼き込んだ字幕は字幕の側だけが素材を指す 素材から字幕の向きしか見ないと、字幕の
+        # トラックへ貼ったときに字幕だけが押され、話している映像と音声からずれた（CodeRabbit）
+        media_id = linked.timeline.tracks[0].clips[0].media_id
+        assert media_id is not None
+        line = Clip(
+            timeline_start=120,
+            duration=30,
+            source=GeneratedSource(kind="text"),
+            subtitle_origin=SubtitleOrigin(media_id=media_id, stream=1, segment_id=SegmentId("s")),
+        )
+        subtitles = Track(TrackKind.VIDEO, "字幕", (line,))
+        project = linked.with_timeline(
+            replace(linked.timeline, tracks=(*linked.timeline.tracks, subtitles))
+        )
+        content = copy_clips(project, [line.id])
+        pasted = apply(project, insert_paste_commands(project, content, 100, all_tracks=False))
+        assert _spans(pasted, 2) == [(100, 130), (150, 180)]
+        assert _spans(pasted, 0) == [(0, 100), (130, 330)]
+        assert _spans(pasted, 1) == [(0, 100), (130, 330)]
+
     def test_a_locked_track_with_clips_behind_refuses(self, linked: Project) -> None:
         # ロックしたトラックだけ残して押すと、そこから後ろの同期がすべて崩れる
         audio_track = linked.timeline.tracks[1]
