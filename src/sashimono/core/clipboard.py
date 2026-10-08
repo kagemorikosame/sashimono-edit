@@ -186,19 +186,21 @@ def insert_paste_commands(
 def _insert_targets(project: Project, content: ClipboardContent) -> tuple[TrackId, ...]:
     """挿入貼り付けで押すトラック 今のタイムラインで実際に貼る先になるトラック
 
-    コピー元のトラックが今のタイムラインにあればそれ 無ければ（別のシーンでコピーした物）
-    :func:`_landing_track` が次に選ぶ、同じ種類のロックしていないトラックを並びの順に
-    割り当てる（コピー元のトラックごとに別の 1 本） コピー元の ID のまま渡すと、
-    :class:`InsertGap` が何も押さず、普通の貼り付けと同じく別のトラックへ逃げる
+    コピー元のトラックが今のタイムラインにあり、ロックしていなければそれ 無いか（別の
+    シーンでコピーした物）ロックしていれば、:func:`_landing_track` が次に選ぶ、同じ種類の
+    ロックしていないトラックを並びの順に割り当てる（コピー元のトラックごとに別の 1 本）
+    条件は :func:`_landing_track` と同じにする コピー元の ID のまま渡すと、無ければ
+    :class:`InsertGap` が何も押さずに新しいトラックへ逃げ、ロックしていれば貼りもしない
+    トラックの後ろを押そうとして断られる
     """
     tracks = project.timeline.tracks
-    known = {track.id for track in tracks}
+    usable = {track.id for track in tracks if not track.locked}
     chosen: dict[TrackId, TrackId] = {}
-    used = {copied.track_id for copied in content.clips if copied.track_id in known}
+    used = {copied.track_id for copied in content.clips if copied.track_id in usable}
     for copied in content.clips:
         if copied.track_id in chosen:
             continue
-        if copied.track_id in known:
+        if copied.track_id in usable:
             chosen[copied.track_id] = copied.track_id
             continue
         spare = [t.id for t in tracks if t.kind is copied.kind and not t.locked]

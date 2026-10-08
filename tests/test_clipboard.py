@@ -386,6 +386,22 @@ class TestInsertPaste:
         pasted = apply(project, commands)
         assert _spans(pasted, 0) == [(0, 30), (60, 90), (90, 120)]
 
+    @pytest.mark.parametrize("behind", [True, False])
+    def test_target_mode_skips_a_source_track_locked_after_copying(self, behind: bool) -> None:
+        # コピーの後に元のトラックをロックすると、貼る先は別のトラックになる 元のトラックを
+        # 押す先にしたままだと、後ろがあれば貼りもしないトラックのロックで断られ、
+        # 無ければ貼る先を押さずに新しいトラックへ逃げた（Codex の指摘）
+        first = ((0, 30), (60, 30)) if behind else ((0, 30),)
+        project = _texts(("V1", first), ("V2", ((60, 30),)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        v1 = project.timeline.tracks[0]
+        project = project.with_timeline(project.timeline.replace_track(replace(v1, locked=True)))
+        commands = insert_paste_commands(project, content, 60, all_tracks=False)
+        assert not any(isinstance(command, AddTrack) for command in commands)
+        pasted = apply(project, commands)
+        assert _spans(pasted, 0) == sorted((s, s + n) for s, n in first)
+        assert _spans(pasted, 1) == [(60, 90), (90, 120)]
+
     def test_nothing_copied_does_nothing(self, linked: Project) -> None:
         assert insert_paste_commands(linked, ClipboardContent(()), 0) == []
 
