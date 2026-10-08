@@ -1250,3 +1250,83 @@ class TestRecoveryOnTheNextStart:
 
         monkeypatch.setattr(runtime_module, "runtime_target_dir", lambda: None)
         assert recover_runtime_swap() is False
+
+
+class TestUnreadableJournal:
+    """記録が空・壊れていても、退けた古い物を消さない（PR #265 の CodeRabbit の指摘）
+
+    電源が切れると、退けた名前の付け替えだけが残り、記録は空か壊れた形で残ることがある
+    直す前は「何も動かしていない」と見て退けた物ごと消し、導入先から SDK が欠けた
+    """
+
+    @staticmethod
+    def _crashed_after_moving_the_sdk(runtime: Path, journal_text: str | None) -> Path:
+        """古い SDK を退け、新しい dist-info だけを置いた所で電源が切れた形を作る"""
+        backup = runtime.parent / "runtime-previous"
+        backup.mkdir()
+        (runtime / "claude_agent_sdk").replace(backup / "claude_agent_sdk")
+        _write_dist(runtime, "claude_agent_sdk", "claude_agent_sdk", "0.2.164", "new sdk")
+        shutil.rmtree(runtime / "claude_agent_sdk")
+        journal = runtime.parent / "runtime-swap.json"
+        if journal_text is not None:
+            journal.write_text(journal_text, encoding="utf-8")
+        return backup
+
+    @pytest.mark.parametrize("journal_text", ["", "{壊れている", "[]", '{"replaced": 1}'])
+    def test_the_moved_sdk_comes_back(self, runtime: Path, journal_text: str) -> None:
+        backup = self._crashed_after_moving_the_sdk(runtime, journal_text)
+        assert not (runtime / "claude_agent_sdk").exists()
+        assert recover_runtime_swap(runtime) is True
+        assert "old sdk" in _sdk_marker(runtime)
+        assert not backup.exists()
+        assert not (runtime.parent / "runtime-swap.json").exists()
+
+    def test_a_journal_that_never_reached_the_disk(self, runtime: Path) -> None:
+        # 記録の名前すら残らず、付け替えだけが残った 片付けの途中と見て捨てると SDK が欠ける
+        backup = self._crashed_after_moving_the_sdk(runtime, None)
+        assert recover_runtime_swap(runtime) is True
+        assert "old sdk" in _sdk_marker(runtime)
+        assert not backup.exists()
+
+    def test_what_is_in_both_places_is_kept_aside(self, runtime: Path) -> None:
+        # 新しい SDK も置いた後なら導入先の方を使う 退けた古い方は消さずに別の名前で残す
+        backup = runtime.parent / "runtime-previous"
+        backup.mkdir()
+        (runtime / "claude_agent_sdk").replace(backup / "claude_agent_sdk")
+        _write_dist(runtime, "claude_agent_sdk", "claude_agent_sdk", "0.2.164", "new sdk")
+        journal = runtime.parent / "runtime-swap.json"
+        journal.write_text("{壊れている", encoding="utf-8")
+        assert recover_runtime_swap(runtime) is False
+        assert "new sdk" in _sdk_marker(runtime)
+        kept = runtime.parent / "runtime-previous.broken" / "claude_agent_sdk" / "__init__.py"
+        assert "old sdk" in kept.read_text(encoding="utf-8")
+        assert (runtime.parent / "runtime-swap.broken.json").is_file()
+        # 退けて残したので、次の入れ替えは止まらない
+        assert not journal.exists()
+        assert not backup.exists()
+        staging = runtime.parent / "staging"
+        _fake_pip()(["install", "--target", str(staging)])
+        assert swap_in(staging, runtime) is True
+
+    def test_the_journal_is_written_to_the_disk(
+        self, runtime: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 読み戻しは OS のキャッシュから読む ディスクへ書き切ってから名前を付ける
+        import os
+
+        from sashimono.runtime import write_swap_journal
+
+        synced: list[int] = []
+        original = os.fsync
+
+        def fsync(handle: int) -> None:
+            synced.append(handle)
+            original(handle)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        write_swap_journal(runtime, ["claude_agent_sdk"], [])
+        assert synced
+        assert json.loads((runtime.parent / "runtime-swap.json").read_text(encoding="utf-8")) == {
+            "replaced": ["claude_agent_sdk"],
+            "added": [],
+        }

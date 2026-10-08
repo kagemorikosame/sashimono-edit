@@ -1154,14 +1154,38 @@ def write_swap_journal(target: Path, replaced: Sequence[str], added: Sequence[st
     """これから入れ替える物（``replaced`` 今ある物）と足す物（``added``）を書く
 
     書いて読み戻せなければ OSError 記録の無いまま動かすと、途中で落ちたときに戻せない
+
+    中身はディスクへ書き切って（fsync）から名前を付ける 読み戻しは OS のキャッシュから読むので、
+    それだけでは書き切ったか分からない 書き切らずに動かし始めると、電源が切れたときに
+    退けた名前の付け替えだけが残り、記録は空か壊れた形で残る（PR #265 の CodeRabbit の指摘）
     """
     journal = swap_journal(target)
     data = {"replaced": list(replaced), "added": list(added)}
     writing = journal.with_name(journal.name + ".writing")
-    writing.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with writing.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(data, ensure_ascii=False))
+        stream.flush()
+        os.fsync(stream.fileno())
     writing.replace(journal)
+    _sync_folder(journal.parent)
     if json.loads(journal.read_text(encoding="utf-8")) != data:
         raise OSError("入れ替えの記録を書けない")
+
+
+def _sync_folder(folder: Path) -> None:
+    """名前の付け替えをディスクへ書き切る
+
+    POSIX では名前はフォルダの中身なので、フォルダを fsync しないと付け替えが残らないことがある
+    Windows ではフォルダを開いて fsync できない（os.open がフォルダを断る） NTFS は名前の
+    付け替えをメタデータの記録で守るので、ファイルの fsync だけにする
+    """
+    if sys.platform == "win32":
+        return
+    handle = os.open(folder, os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
 
 
 def finish_swap(target: Path) -> None:
@@ -1229,23 +1253,89 @@ def recover_runtime_swap(target: Path | None = None) -> bool:
 def recover_swap_locked(target: Path) -> bool:
     """:func:`recover_runtime_swap` の中身 :func:`hold_swap_lock` を持って呼ぶ"""
     journal = swap_journal(target)
+    backup = swap_backup(target)
     if not journal.exists():
-        # 終えた後の片付け（退けた物を捨てる所）の途中で落ちた 入れ替えは済んでいる
-        shutil.rmtree(swap_backup(target), ignore_errors=True)
-        return False
+        # たいていは終えた後の片付け（退けた物を捨てる所）の途中で落ちた物 ただ電源が切れると
+        # 記録が残らずに退けた名前の付け替えだけが残ることもあるので、導入先に無い物は戻す
+        # 導入先にもある物は入れ替え終えた後の古い物なので捨ててよい 戻せなかった物があれば
+        # 退けた物を残し、次の起動でもう一度戻す
+        restored, _, failed = _salvage_backup(target)
+        if not failed:
+            shutil.rmtree(backup, ignore_errors=True)
+        return restored
     try:
         data = json.loads(journal.read_text(encoding="utf-8"))
         replaced = _entry_names(data["replaced"])
         added = _entry_names(data["added"])
     except (OSError, ValueError, KeyError, TypeError):
-        # 読めない記録 動かし始めるのは記録を読み戻せてからなので、何も動かしていない
-        finish_swap(target)
-        return False
+        return _recover_without_journal(target)
     if not roll_back_swap(target, replaced, added):
         # 戻せない物（使用中など）が残った 記録と退けた物は残し、次の起動でもう一度戻す
         return False
     finish_swap(target)
     return True
+
+
+def _recover_without_journal(target: Path) -> bool:
+    """記録が読めない（空・壊れている）ときの戻し 戻した物があれば真
+
+    記録は書き切ってから動かし始めるが、それでも読めないなら、何をどこまで動かしたかは
+    分からない 退けた物は消さない 消すと、退けた古い SDK ごと失い、導入先から SDK が欠ける
+    （PR #265 の CodeRabbit の指摘）
+
+    - 退けた物のうち導入先に同じ名前が無い物は戻す（退けた直後に落ちた）
+    - 両方にある物は導入先の方を使い、退けた方は残す どちらも名前を付け替えて丸ごと置いた
+      物なので、導入先の方も欠けてはいない
+    - 残した物があれば、記録と退けた物を別の名前（``.broken``）へ退けて残す 記録を残したままに
+      すると、次の入れ替えが前の分を戻せないと見て、自動の更新がいつまでも止まる
+    """
+    journal = swap_journal(target)
+    backup = swap_backup(target)
+    restored, left, failed = _salvage_backup(target)
+    if failed:
+        # 導入先に無いのに戻せなかった物がある 記録も退けた物もそのまま残し、次の起動で戻す
+        return restored
+    if not left:
+        finish_swap(target)
+        return restored
+    kept_journal = journal.with_name(f"{target.name}-swap.broken.json")
+    kept_backup = backup.with_name(f"{backup.name}.broken")
+    try:
+        # 前に残した物は、その後に入れ替えを終えている（導入先は使えている）ので今回の物と替える
+        _remove_entry(kept_backup)
+        backup.replace(kept_backup)
+        journal.replace(kept_journal)
+    except OSError:
+        pass  # 退けられなければそのまま 次の起動でもう一度試す
+    return restored
+
+
+def _salvage_backup(target: Path) -> tuple[bool, list[str], list[str]]:
+    """退けた物のうち導入先に無い物を戻す
+
+    戻り値は、戻した物があったか・両方にあって残した物・戻せなかった物
+    """
+    backup = swap_backup(target)
+    try:
+        entries = sorted(backup.iterdir())
+    except OSError:
+        return False, [], []
+    restored = False
+    left: list[str] = []
+    failed: list[str] = []
+    for kept in entries:
+        original = target / kept.name
+        if os.path.lexists(original):
+            left.append(kept.name)
+            continue
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            kept.replace(original)
+        except OSError:
+            failed.append(kept.name)
+            continue
+        restored = True
+    return restored, left, failed
 
 
 def _entry_names(value: object) -> list[str]:
