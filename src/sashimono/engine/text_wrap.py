@@ -84,31 +84,49 @@ def _wrap_paragraph(paragraph: str, width: float, measure: Callable[[str], float
             lines.append(line.rstrip())
             line = chunk.lstrip()
         # 1 つの塊だけで幅を超えるなら、塊の中を字で切る 切った残りは次の塊とつなげる
-        while line and measure(line.rstrip()) > width:
-            head, line = _split_long(line, width, measure)
-            lines.append(head)
+        if line and measure(line.rstrip()) > width:
+            *heads, line = _split_long(line, width, measure)
+            lines.extend(heads)
     if line.strip() or not lines:
         lines.append(line.rstrip())
     return lines
 
 
-def _split_long(line: str, width: float, measure: Callable[[str], float]) -> tuple[str, str]:
-    """幅を超える 1 塊を、収まる所までの頭と残りに分ける 頭は少なくとも 1 字
+def _split_long(line: str, width: float, measure: Callable[[str], float]) -> list[str]:
+    """幅を超える 1 塊を、幅に収まる行に分ける 最後は残り（次の塊とつなげる） 各行は少なくとも 1 字
 
     切るのは見た目の 1 字の間だけ 長い英単語はここで切れるが、結合文字の付いた字や
     つないだ絵文字の中では切らない
+
+    書記素へは 1 度だけ分け、行の頭を進めながら測る 切るたびに残り全部を分け直して
+    測ると、数千字の 1 語で字数の二乗だけ測ることになり、描くのが止まったように重くなる
+    測るのは今の行の頭からの字だけなので、全体で字数にほぼ比例する
     """
     parts = graphemes(line)
-    cut = 1
-    while cut < len(parts) and measure("".join(parts[: cut + 1])) <= width:
-        cut += 1
-    if cut >= len(parts):
-        return line.rstrip(), ""
-    # 切った所でも禁則は守る 収まる所まで詰めた結果が禁則に当たるなら、前へ寄せる
-    # 寄せられない（頭の 1 字しか無い）ときは、字を捨てないことを優先して切る
-    while cut > 1 and (_head(parts[cut]) in NO_LINE_START or _head(parts[cut - 1]) in NO_LINE_END):
-        cut -= 1
-    return "".join(parts[:cut]), "".join(parts[cut:]).lstrip()
+    pieces: list[str] = []
+    begin = 0
+    while True:
+        cut = begin + 1
+        while cut < len(parts) and measure("".join(parts[begin : cut + 1])) <= width:
+            cut += 1
+        if cut >= len(parts):
+            # 残りが幅に収まった 空白は次の塊とつなげるために残す
+            pieces.append("".join(parts[begin:]))
+            return pieces
+        # 切った所でも禁則は守る 収まる所まで詰めた結果が禁則に当たるなら、前へ寄せる
+        # 寄せられない（頭の 1 字しか無い）ときは、字を捨てないことを優先して切る
+        while cut > begin + 1 and (
+            _head(parts[cut]) in NO_LINE_START or _head(parts[cut - 1]) in NO_LINE_END
+        ):
+            cut -= 1
+        pieces.append("".join(parts[begin:cut]))
+        begin = cut
+        # 折り返した所の空白は次の行の頭に置かない
+        while begin < len(parts) and parts[begin].isspace():
+            begin += 1
+        if begin >= len(parts):
+            pieces.append("")
+            return pieces
 
 
 def _chunks(paragraph: str) -> list[str]:

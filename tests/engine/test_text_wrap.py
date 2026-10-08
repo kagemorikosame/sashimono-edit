@@ -140,8 +140,34 @@ class TestGraphemes:
         assert wrap_lines(KUZU * 3, 20, by_grapheme) == [KUZU * 2, KUZU]
 
     def test_a_long_plain_word_is_still_split(self) -> None:
-        # 1 語が幅より長いときに切る約束は変えない
+        # 1 語が幅より長いときに切る約束は変えない 分けられないと、幅 30 を超える
+        # 「abcdefgh」（80）が 1 行のまま残り、画面の端からはみ出す
         assert wrap_lines("abcdefgh", 30, by_grapheme) == ["abc", "def", "gh"]
+
+
+class TestLongWordCost:
+    """幅を超える長い 1 語を切る手間が、字数にほぼ比例する（CodeRabbit の指摘 #266）
+
+    前は 1 行切るたびに残り全部を書記素へ分け直して測っていて、字数の二乗だけ測った
+    数千字の 1 語（区切りの無い URL や貼り付けた記号の列）で描くのが止まったように重くなる
+    """
+
+    def test_twice_the_length_costs_about_twice(self) -> None:
+        def cost(length: int) -> int:
+            measured = 0
+
+            def counting(text: str) -> float:
+                nonlocal measured
+                measured += len(text)
+                return 10.0 * len(text)
+
+            lines = wrap_lines("a" * length, 100, counting)
+            assert all(len(line) <= 10 for line in lines)
+            assert "".join(lines) == "a" * length
+            return measured
+
+        # 二乗なら 4 倍になる 測る量は行の幅の分だけなので、ほぼ 2 倍で収まる
+        assert cost(8000) <= cost(4000) * 2.5
 
 
 class TestRevealByGraphemes:
