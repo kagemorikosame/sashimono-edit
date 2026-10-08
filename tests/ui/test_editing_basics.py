@@ -11,19 +11,37 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QLineEdit,
+    QPlainTextEdit,
+    QSpinBox,
+    QTextEdit,
+    QWidget,
+)
 
-from sashimono.core.commands import AddClip, Command, SetTrackHeights
+from sashimono.core.commands import AddClip, Command, InsertGap, SetTrackHeights
 from sashimono.core.io import others_holding, project_presence_dir
 from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind
 from sashimono.effects.sources import TEXT
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.media_pool import MediaPoolWidget
+from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.theme import Metrics
 from sashimono.ui.timeline import TimelineView
+from sashimono.ui.workspace import (
+    INSERT_ALL_TRACKS,
+    INSERT_TARGET_TRACKS,
+    Preferences,
+    PreferenceStore,
+)
+from tests.fake_clipboard import FakeClipboard
+
+CTRL_SHIFT = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
 
 
 def _project() -> Project:
@@ -105,6 +123,219 @@ class TestCopyPaste:
         assert messages
 
 
+class TestInsertPaste:
+    def test_the_menu_offers_it_once_something_is_copied(self, view: TimelineView) -> None:
+        # 右クリックに無いと、挿入貼り付けを知らない人は Ctrl+V の後に手で詰め直す
+        empty = QPoint(800, _clip_point(view).y())
+        assert _labels(view, empty)["挿入して貼り付け"] is False
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        assert view.copy_selected()
+        assert _labels(view, empty)["挿入して貼り付け"] is True
+
+    def test_it_pushes_what_is_behind_the_playhead(self, view: TimelineView) -> None:
+        # 壊れると、後ろのクリップが動かず、貼った物が新しいトラックへ逃げる
+        received = _received(view)
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        view.set_playhead(10)
+        assert view.insert_paste_at_playhead()
+        (commands,) = received
+        assert isinstance(commands[0], InsertGap)
+        assert commands[0].length == 30
+        assert [c.clip.timeline_start for c in commands if isinstance(c, AddClip)] == [10]
+
+    def test_the_preference_narrows_the_pushed_tracks(self, view: TimelineView) -> None:
+        # 設定で貼り先だけを選んでも全トラックを押すと、設定が効いていない
+        received = _received(view)
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        view.set_insert_all_tracks(False)
+        assert view.insert_paste_at_playhead()
+        gap = received[0][0]
+        assert isinstance(gap, InsertGap)
+        assert gap.track_ids == (view.project.timeline.tracks[0].id,)
+
+    def test_a_locked_track_is_reported(self, view: TimelineView) -> None:
+        # ロックで断ったのに黙っていると、何が起きなかったのか分からない
+        timeline = view.project.timeline
+        view.set_project(
+            view.project.with_timeline(
+                timeline.replace_track(replace(timeline.tracks[0], locked=True))
+            )
+        )
+        view.select(view.project.timeline.tracks[0].clips[0].id)
+        view.copy_selected()
+        received = _received(view)
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        assert not view.insert_paste_at_playhead()
+        assert not received
+        assert any("ロック" in message for message in messages)
+
+
+_FIELDS = (QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox)
+
+
+def _clip_count(window: MainWindow) -> int:
+    return sum(len(track.clips) for track in window.document.project.timeline.tracks)
+
+
+def _held(widget: QWidget, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> bool:
+    """``widget`` にフォーカスがあるときに押したキーを、部品が受け取るか
+
+    受け取れば、窓のショートカットは動かない
+
+    Qt がキーを窓のショートカットへ回す前に部品へ送る ShortcutOverride を、そのまま送って見る
+    キーを打って窓のショートカットが動いたかで見ると、窓が活性にならない機械（CI の
+    Windows）では、守りが外れていても動かずに通り、守りが効いていても欄の外の試験が落ちる
+    """
+    event = QKeyEvent(QEvent.Type.ShortcutOverride, key, modifiers)
+    # Qt もショートカットを探す前に受け取っていない印にしてから送る
+    event.ignore()
+    QApplication.sendEvent(widget, event)
+    return event.isAccepted()
+
+
+def _field_text(field: QWidget) -> str:
+    if isinstance(field, (QPlainTextEdit, QTextEdit)):
+        return field.toPlainText()
+    if isinstance(field, QSpinBox):
+        return field.text()
+    assert isinstance(field, QLineEdit)
+    return field.text()
+
+
+class TestKeysWhileTyping:
+    """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない
+
+    どれも窓が活性でない形で見る（CI の Windows の実行機では窓が活性にならないことがある）
+    """
+
+    @pytest.fixture
+    def shown(self, window: MainWindow) -> Iterator[MainWindow]:
+        # 別の窓を前に出して、編集の窓を活性にしない 手元のオフスクリーンでは出した窓が
+        # 活性になるので、そのままだと CI と違う形で通る
+        window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        window.show()
+        cover = QWidget()
+        cover.show()
+        cover.activateWindow()
+        QApplication.processEvents()
+        assert not window.isActiveWindow()
+        yield window
+        cover.close()
+
+    @pytest.mark.parametrize("kind", _FIELDS)
+    def test_ctrl_shift_v_stays_in_a_field(self, shown: MainWindow, kind: type[QWidget]) -> None:
+        # 直す前は欄が受け取らず、窓の挿入貼り付けが動いて、字幕や設定の欄に打っている
+        # 途中でクリップが増えた
+        assert _held(kind(shown), Qt.Key.Key_V, CTRL_SHIFT)
+
+    @pytest.mark.parametrize("kind", _FIELDS)
+    def test_ctrl_shift_v_pastes_plain_text_into_the_field(
+        self, shown: MainWindow, kind: type[QWidget], fake_clipboard: FakeClipboard
+    ) -> None:
+        # 欄が受け取っても何も入らないと、押したのに何も起きないように見える
+        field = kind(shown)
+        if isinstance(field, QSpinBox):
+            # 数の欄は入っている 0 を選んだ所へ貼る（後ろへ足すと 012 で範囲の外になる）
+            field.selectAll()
+        fake_clipboard.setText("12")
+        before = shown.document.project
+        QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, CTRL_SHIFT))
+        assert "12" in _field_text(field)
+        assert shown.document.project == before
+
+    @pytest.mark.parametrize(
+        ("key", "modifiers"),
+        [
+            (Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier),
+            (Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier),
+            (Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
+            (Qt.Key.Key_S, Qt.KeyboardModifier.NoModifier),
+            (Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
+        ],
+    )
+    def test_the_other_editing_keys_stay_in_the_field(
+        self, shown: MainWindow, key: Qt.Key, modifiers: Qt.KeyboardModifier
+    ) -> None:
+        # Qt の入力欄が自分で受け取るキー 守りが外れると、文字を消すつもりでクリップが消える
+        assert _held(QLineEdit(shown), key, modifiers)
+
+    def test_outside_a_field_ctrl_shift_v_is_left_to_the_window(self, shown: MainWindow) -> None:
+        # 欄を守るついでにタイムラインでも取ると、挿入貼り付けが使えない
+        assert not _held(shown._timeline, Qt.Key.Key_V, CTRL_SHIFT)
+
+    def test_a_read_only_field_does_not_hold_the_key(self, shown: MainWindow) -> None:
+        # 読むだけの欄は貼れない 欄が取ると、押しても何も起きない
+        field = QPlainTextEdit(shown)
+        field.setReadOnly(True)
+        assert not _held(field, Qt.Key.Key_V, CTRL_SHIFT)
+
+    def test_a_rebound_insert_key_also_stays_in_a_field(self, shown: MainWindow) -> None:
+        # 設定で挿入貼り付けを別のキーへ変えた人だけ、欄に打っている途中でクリップが貼られた
+        # （CodeRabbit の指摘） 欄が受け取れば、Qt は窓のショートカットを探さない
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        assert _held(QLineEdit(shown), Qt.Key.Key_B, CTRL_SHIFT)
+        # 書式なしの貼り付けのキーは、割り当てから外れても欄のまま
+        assert _held(QLineEdit(shown), Qt.Key.Key_V, CTRL_SHIFT)
+        # 欄の外では窓へ回す 回さないと、変えたキーで挿入貼り付けが使えない
+        assert not _held(shown._timeline, Qt.Key.Key_B, CTRL_SHIFT)
+
+    def test_a_key_given_back_is_left_to_the_window_again(self, shown: MainWindow) -> None:
+        # 前の割り当てを覚えたままだと、ほかの操作へ割り当て直したキーが欄の中で効かなくなる
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+V"})
+        assert not _held(QLineEdit(shown), Qt.Key.Key_B, CTRL_SHIFT)
+
+    def test_a_rebound_key_does_not_paste_into_the_field(
+        self, shown: MainWindow, fake_clipboard: FakeClipboard
+    ) -> None:
+        # 変えた先のキーは欄の既定の動きに任せる 貼り付けを勝手に足すと、欄で別の意味を
+        # 持つキーの動きまで変わる
+        shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
+        field = QLineEdit(shown)
+        fake_clipboard.setText("12")
+        QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_B, CTRL_SHIFT))
+        assert "12" not in field.text()
+
+    def test_the_window_action_still_inserts(self, shown: MainWindow) -> None:
+        # 欄の外で押したときに動く窓の項目 活性に依らないように項目を直に引く
+        timeline = shown._timeline
+        timeline.select(shown.document.project.timeline.tracks[0].clips[0].id)
+        assert timeline.copy_selected()
+        shown.seek(10)
+        before = _clip_count(shown)
+        shown._actions["編集/貼り付け（挿入）"][0].trigger()
+        # 再生ヘッドの下のクリップが割れて 1 本、貼った物で 1 本増える
+        assert _clip_count(shown) == before + 2
+
+
+class TestInsertPastePreference:
+    def test_the_default_pushes_every_track(self) -> None:
+        # Premiere の既定と同じ 貼り先だけを既定にすると、別のトラックの字幕や BGM が黙ってずれる
+        assert Preferences().insert_paste == INSERT_ALL_TRACKS
+        assert Preferences().inserts_on_all_tracks
+
+    def test_it_is_kept_and_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 次の起動で戻ると、選び直すたびに設定画面を開くことになる
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(insert_paste=INSERT_TARGET_TRACKS))
+        assert not store.load().inserts_on_all_tracks
+        store.path.write_text('{"insert_paste": "sideways"}', encoding="utf-8")
+        assert store.load().insert_paste == INSERT_ALL_TRACKS
+
+    @pytest.mark.parametrize("mode", [INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS])
+    def test_the_dialog_carries_it(self, qt_application: QApplication, mode: str) -> None:
+        # 画面が値を返さないと、設定を開いて OK を押しただけで既定へ戻る
+        del qt_application
+        dialog = PreferencesDialog(Preferences(insert_paste=mode))
+        try:
+            assert dialog.preferences().insert_paste == mode
+        finally:
+            dialog.deleteLater()
+
+
 class TestTrackHeight:
     def test_dragging_the_border_resizes_that_track(self, view: TimelineView) -> None:
         received = _received(view)
@@ -167,6 +398,31 @@ class TestWindow:
         assert len(window.document.project.timeline.tracks[0].clips) == 2
         window.undo()
         assert len(window.document.project.timeline.tracks[0].clips) == 1
+
+    def test_ctrl_shift_v_inserts_as_one_undo_step(self, window: MainWindow) -> None:
+        # 押し出しと貼り付けが別の段だと、1 回取り消すと間だけ空いたまま残る
+        action, default = window._actions["編集/貼り付け（挿入）"]
+        assert default == "Ctrl+Shift+V"
+        timeline = window._timeline
+        before = window.document.project
+        timeline.select(before.timeline.tracks[0].clips[0].id)
+        timeline.copy_selected()
+        window.seek(10)
+        action.trigger()
+        spans = sorted(
+            (c.timeline_start, c.timeline_end)
+            for c in window.document.project.timeline.tracks[0].clips
+        )
+        assert spans == [(0, 10), (10, 40), (40, 60)]
+        window.undo()
+        assert window.document.project == before
+
+    def test_the_preference_reaches_the_timeline(self, window: MainWindow) -> None:
+        # 設定画面で選んでも窓が渡さないと、挿入貼り付けは既定のまま全トラックを押す
+        window._apply_preferences(replace(window._preferences, insert_paste=INSERT_TARGET_TRACKS))
+        assert window._timeline._insert_all_tracks is False
+        window._apply_preferences(replace(window._preferences, insert_paste=INSERT_ALL_TRACKS))
+        assert window._timeline._insert_all_tracks is True
 
     def test_a_file_open_in_another_window_is_noticed(
         self, qt_application: QApplication, tmp_path: Path

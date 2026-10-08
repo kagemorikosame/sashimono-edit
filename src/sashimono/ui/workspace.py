@@ -164,6 +164,12 @@ MEDIA_SPLIT = "split"
 MEDIA_TOGETHER = "together"
 MEDIA_SPLIT_MODES = (MEDIA_SPLIT, MEDIA_TOGETHER)
 
+#: 挿入貼り付け（Ctrl+Shift+V）で押し出すトラック :attr:`Preferences.insert_paste` の値
+#: 全トラック・貼り先と一緒に動く相手のトラックだけ
+INSERT_ALL_TRACKS = "all"
+INSERT_TARGET_TRACKS = "target"
+INSERT_PASTE_MODES = (INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS)
+
 #: exe の隣の ``scripts`` に自分で置いた物の扱い :attr:`Preferences.scripts_move` の値
 #: 自動で移す・移すかを尋ねる・何もしない
 SCRIPTS_MOVE_AUTO = "auto"
@@ -322,6 +328,12 @@ class Preferences:
     #: タイムラインの磁石とは別に切れる（利用者の要望） 既定は入 知らない人ほど中央へ
     #: 揃えにくい 1 画素ずつ自由に置きたい人は切る（Shift で一時的にも）
     preview_snap: bool = True
+    #: 挿入貼り付け（Ctrl+Shift+V）で、再生ヘッドから後ろを押し出すトラック 全トラック
+    #: （``all``）か、貼り先と、そこで押すクリップのリンクの相手・グループの仲間・焼き込んだ
+    #: 字幕のトラックだけ（``target``）か 既定は全トラック（Premiere Pro の既定 全トラックの
+    #: 同期ロックが入っている） 知らない人ほど、別のトラックに置いた字幕や BGM が貼った
+    #: 長さぶんずれたことに後で気付く ほかのトラックを動かしたくない人は切り替えられる
+    insert_paste: str = INSERT_ALL_TRACKS
     #: 新しく作るプロジェクトのトラックの方式（:class:`~sashimono.core.model.LayerMode`）
     #: 新規作成の窓の初期値と、起動した直後の空のプロジェクトに使う
     #: 既定は混合（YMM4・AviUtl と同じ 1 本のレイヤーに何でも置く 利用者の決定）
@@ -374,6 +386,11 @@ class Preferences:
     def subtitle_wrap_share(self) -> int:
         """字幕の折り返しの幅（画面の幅の %） 切ってあれば 0（折り返さない）"""
         return self.subtitle_wrap_percent if self.subtitle_wrap else 0
+
+    @property
+    def inserts_on_all_tracks(self) -> bool:
+        """挿入貼り付け（:func:`~sashimono.core.clipboard.insert_paste_commands`）へ渡す値"""
+        return self.insert_paste == INSERT_ALL_TRACKS
 
     @property
     def splits_media(self) -> bool:
@@ -461,6 +478,7 @@ class PreferenceStore:
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
             preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),
+            insert_paste=_choice(data.get("insert_paste"), INSERT_PASTE_MODES, plain.insert_paste),
             new_project_layers=_choice(
                 data.get("new_project_layers"), LayerMode.ALL, plain.new_project_layers
             ),
