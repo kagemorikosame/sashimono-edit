@@ -8,8 +8,8 @@
 
 Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-> Status: the project is preparing its application to the SignPath Foundation.
-> Releases up to and including 0.1.4 are **not** signed.
+> Status: the project has applied to the SignPath Foundation and is waiting for the review.
+> Releases up to and including 0.2.0 are **not** signed.
 > This page will be updated when signed releases begin.
 
 ### What is signed
@@ -92,7 +92,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io/), certifi
 
 （SignPath.io の無料のコード署名を使い、証明書は SignPath Foundation が持つ）
 
-> いまは SignPath Foundation への申し込みを準備している 0.1.4 までの版は署名していない
+> いまは SignPath Foundation へ申し込み、審査を待っている 0.2.0 までの版は署名していない
 > 署名した版を出し始めたら、このページを直す
 
 ### 署名する物
