@@ -152,7 +152,7 @@ def without_installed_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
 
 def write_sdk(site: Path) -> Path:
     """claude-agent-sdk を pip で入れたときの形 Claude Code 本体を同梱している"""
-    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.152")
+    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.158")
     bundled = site / "claude_agent_sdk" / "_bundled" / "claude.exe"
     bundled.parent.mkdir(parents=True, exist_ok=True)
     bundled.write_bytes(b"")
@@ -191,7 +191,7 @@ class TestAssistantAfterInstall:
         assert results == [True]
         assert panel._input.isEnabled() is True
         assert panel._send_button.isEnabled() is True
-        assert panel._setup.isHidden() is True
+        assert panel._parts_box.isHidden() is True
         # ログインがまだなので、その案内が出る
         assert panel._login_box.isHidden() is False
         # 導入欄は隠れるので、再起動の要る・要らないの案内は会話の欄に残す
