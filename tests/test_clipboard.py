@@ -11,16 +11,28 @@ from dataclasses import replace
 
 import pytest
 
-from sashimono.core.clipboard import copy_clips, cut_commands, paste_commands
+from sashimono.core.clipboard import (
+    ClipboardContent,
+    copy_clips,
+    cut_commands,
+    insert_paste_commands,
+    paste_commands,
+)
 from sashimono.core.commands import AddClip, AddTrack, Command, Document, insert_media
 from sashimono.core.model import (
+    AnimatedValue,
     Clip,
     GeneratedSource,
+    Keyframe,
+    Marker,
     MediaItem,
     Project,
     ProjectSettings,
+    SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
+    new_group_id,
 )
 from sashimono.core.timebase import FrameRate
 
@@ -126,6 +138,272 @@ class TestPaste:
                 document.execute(command)
         document.undo()
         assert document.project is linked
+
+
+def _texts(*tracks: tuple[str, tuple[tuple[int, int], ...]]) -> Project:
+    """テキストのクリップだけを並べたプロジェクト 中身は (トラック名, ((頭, 長さ), ...))"""
+    base = Project.create(ProjectSettings(frame_rate=FrameRate(30)))
+    built = tuple(
+        Track(
+            TrackKind.VIDEO,
+            name,
+            tuple(
+                Clip(timeline_start=start, duration=length, source=GeneratedSource(kind="text"))
+                for start, length in spans
+            ),
+        )
+        for name, spans in tracks
+    )
+    return base.with_timeline(replace(base.timeline, tracks=built))
+
+
+def _spans(project: Project, index: int) -> list[tuple[int, int]]:
+    track = project.timeline.tracks[index]
+    return sorted((clip.timeline_start, clip.timeline_end) for clip in track.clips)
+
+
+class TestInsertPaste:
+    """挿入貼り付け（Ctrl+Shift+V） 再生ヘッドの後ろを貼る長さぶん押し出してから貼る"""
+
+    def test_clips_behind_the_playhead_move_by_the_pasted_length(self) -> None:
+        # 壊れると、後ろのクリップが動かず、貼った物が別のトラックへ逃げる（普通の貼り付けと同じ）
+        project = _texts(("V1", ((0, 30), (60, 30))))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        commands = insert_paste_commands(project, content, 60)
+        assert not any(isinstance(command, AddTrack) for command in commands)
+        pasted = apply(project, commands)
+        assert _spans(pasted, 0) == [(0, 30), (60, 90), (90, 120)]
+
+    def test_clips_in_front_of_the_playhead_stay(self) -> None:
+        # 壊れると、再生ヘッドより前の編集まで崩れる
+        project = _texts(("V1", ((0, 30), (40, 10))))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 50))
+        assert _spans(pasted, 0)[:2] == [(0, 30), (40, 50)]
+
+    def test_a_clip_under_the_playhead_is_split_and_its_tail_pushed(self) -> None:
+        # Premiere と同じく割ってから押す 丸ごと押すと、再生ヘッドより前に見えていた絵が消える
+        project = _texts(("V1", ((0, 20), (40, 60))))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 50))
+        assert _spans(pasted, 0) == [(0, 20), (40, 50), (50, 70), (70, 120)]
+
+    def test_the_split_tail_keeps_its_keyframes_in_place(self) -> None:
+        # 割った後ろのキーを頭から数え直さないと、押しただけで動きの時刻がずれる
+        project = _texts(("V1", ((0, 20), (40, 60))))
+        long = project.timeline.tracks[0].clips[1]
+        keyed = replace(
+            long,
+            opacity=AnimatedValue(static=1.0, keyframes=(Keyframe(0, 0.0), Keyframe(40, 1.0))),
+        )
+        project = project.with_timeline(
+            project.timeline.replace_track(
+                project.timeline.tracks[0].with_clips((project.timeline.tracks[0].clips[0], keyed))
+            )
+        )
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 50))
+        tail = next(c for c in pasted.timeline.tracks[0].clips if c.timeline_start == 70)
+        # 元のキー 40（タイムラインの 80）は、割った所（50）から 30 後 押した後は 70 + 30
+        assert tail.opacity.keyframes[-1].frame == 30
+
+    def test_a_linked_pair_moves_together(self, linked: Project) -> None:
+        # 映像と音声で押す量が違うと、貼った後ろの口と声がずれる
+        content = copy_clips(linked, [linked.timeline.tracks[0].clips[0].id])
+        pasted = apply(linked, insert_paste_commands(linked, content, 0, all_tracks=False))
+        assert _spans(pasted, 0) == [(0, 300), (300, 600)]
+        assert _spans(pasted, 1) == [(0, 300), (300, 600)]
+
+    def test_a_split_pair_keeps_its_tails_linked_apart_from_the_heads(
+        self, linked: Project
+    ) -> None:
+        # 前後が同じ組のままだと、後ろを動かすと間を越えて前まで動く
+        content = copy_clips(linked, [linked.timeline.tracks[0].clips[0].id])
+        pasted = apply(linked, insert_paste_commands(linked, content, 100))
+        clips = [c for t in pasted.timeline.tracks for c in t.clips]
+        heads = {c.link_group for c in clips if c.timeline_start == 0}
+        tails = {c.link_group for c in clips if c.timeline_start == 400}
+        assert len(heads) == 1
+        assert len(tails) == 1
+        assert heads != tails
+        assert {(c.timeline_start, c.timeline_end) for c in clips} == {
+            (0, 100),
+            (100, 400),
+            (400, 600),
+        }
+
+    def test_all_tracks_mode_pushes_every_track_and_the_markers(self) -> None:
+        # Premiere の既定（全トラックの同期ロック） ほかのトラックの字幕や BGM が置いていかれない
+        project = _texts(("V1", ((0, 30),)), ("V2", ((50, 10),)))
+        project = project.with_timeline(replace(project.timeline, markers=(Marker(10), Marker(70))))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 40))
+        assert _spans(pasted, 1) == [(80, 90)]
+        assert [marker.frame for marker in pasted.timeline.markers] == [10, 100]
+
+    def test_target_mode_leaves_unrelated_tracks_alone(self) -> None:
+        # 貼り先だけを押す設定で全部動くと、設定が効いていない
+        project = _texts(("V1", ((0, 30), (40, 10))), ("V2", ((50, 10),)))
+        project = project.with_timeline(replace(project.timeline, markers=(Marker(70),)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 40, all_tracks=False))
+        assert _spans(pasted, 0) == [(0, 30), (40, 70), (70, 80)]
+        assert _spans(pasted, 1) == [(50, 60)]
+        assert [marker.frame for marker in pasted.timeline.markers] == [70]
+
+    def test_target_mode_still_pushes_the_group(self) -> None:
+        # グループの仲間を置いていくと、束ねたテロップと絵がずれる
+        project = _texts(("V1", ((0, 30), (40, 10))), ("V2", ((45, 10),)))
+        bundle = new_group_id()
+        timeline = project.timeline
+        v1, v2 = timeline.tracks
+        timeline = timeline.replace_track(
+            v1.with_clips((v1.clips[0], replace(v1.clips[1], group_id=bundle)))
+        )
+        timeline = timeline.replace_track(v2.with_clips((replace(v2.clips[0], group_id=bundle),)))
+        project = project.with_timeline(timeline)
+        content = copy_clips(project, [v1.clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 40, all_tracks=False))
+        assert _spans(pasted, 1) == [(75, 85)]
+
+    def test_target_mode_still_pushes_burned_subtitles(self, linked: Project) -> None:
+        # 焼き込んだ字幕を置いていくと、話している所と字幕が貼った長さぶんずれる
+        media_id = linked.timeline.tracks[0].clips[0].media_id
+        assert media_id is not None
+        line = Clip(
+            timeline_start=120,
+            duration=30,
+            source=GeneratedSource(kind="text"),
+            subtitle_origin=SubtitleOrigin(media_id=media_id, stream=1, segment_id=SegmentId("s")),
+        )
+        subtitles = Track(TrackKind.VIDEO, "字幕", (line,))
+        project = linked.with_timeline(
+            replace(linked.timeline, tracks=(*linked.timeline.tracks, subtitles))
+        )
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 100, all_tracks=False))
+        assert _spans(pasted, 2) == [(420, 450)]
+
+    def test_pasting_onto_the_subtitles_also_pushes_the_source(self, linked: Project) -> None:
+        # 焼き込んだ字幕は字幕の側だけが素材を指す 素材から字幕の向きしか見ないと、字幕の
+        # トラックへ貼ったときに字幕だけが押され、話している映像と音声からずれた（CodeRabbit）
+        media_id = linked.timeline.tracks[0].clips[0].media_id
+        assert media_id is not None
+        line = Clip(
+            timeline_start=120,
+            duration=30,
+            source=GeneratedSource(kind="text"),
+            subtitle_origin=SubtitleOrigin(media_id=media_id, stream=1, segment_id=SegmentId("s")),
+        )
+        subtitles = Track(TrackKind.VIDEO, "字幕", (line,))
+        project = linked.with_timeline(
+            replace(linked.timeline, tracks=(*linked.timeline.tracks, subtitles))
+        )
+        content = copy_clips(project, [line.id])
+        pasted = apply(project, insert_paste_commands(project, content, 100, all_tracks=False))
+        assert _spans(pasted, 2) == [(100, 130), (150, 180)]
+        assert _spans(pasted, 0) == [(0, 100), (130, 330)]
+        assert _spans(pasted, 1) == [(0, 100), (130, 330)]
+
+    def test_a_locked_track_with_clips_behind_refuses(self, linked: Project) -> None:
+        # ロックしたトラックだけ残して押すと、そこから後ろの同期がすべて崩れる
+        audio_track = linked.timeline.tracks[1]
+        locked = linked.with_timeline(
+            linked.timeline.replace_track(replace(audio_track, locked=True))
+        )
+        content = copy_clips(locked, [locked.timeline.tracks[0].clips[0].id])
+        with pytest.raises(ValueError, match="ロック"):
+            insert_paste_commands(locked, content, 0)
+
+    def test_a_locked_track_with_nothing_behind_is_no_obstacle(self) -> None:
+        # 押す物の無いロックしたトラックで止めると、BGM を固めておくだけで挿入が使えない
+        project = _texts(("V1", ((0, 30), (60, 30))), ("V2", ((0, 20),)))
+        v2 = project.timeline.tracks[1]
+        project = project.with_timeline(project.timeline.replace_track(replace(v2, locked=True)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 60))
+        assert _spans(pasted, 0) == [(0, 30), (60, 90), (90, 120)]
+
+    def test_the_pasted_clips_land_where_the_gap_was_opened(self, linked: Project) -> None:
+        # 押す前の姿で行き先を決めると、空けた所ではなく新しいトラックへ置かれる
+        content = copy_clips(linked, [linked.timeline.tracks[0].clips[0].id])
+        commands = insert_paste_commands(linked, content, 0)
+        targets = {command.track_id for command in added(commands)}
+        assert targets == {track.id for track in linked.timeline.tracks}
+
+    def test_an_insert_paste_is_one_undo_step(self, linked: Project) -> None:
+        # 押し出しと貼り付けが別の段だと、取り消すと間だけ空いたまま残る
+        document = Document(linked)
+        content = copy_clips(linked, [linked.timeline.tracks[0].clips[0].id])
+        with document.checkpoint("貼り付け（挿入）"):
+            for command in insert_paste_commands(linked, content, 100):
+                document.execute(command)
+        document.undo()
+        assert document.project is linked
+
+    @pytest.mark.parametrize(
+        ("at", "expected"),
+        [(10, (70, 90)), (40, (70, 90)), (50, (40, 90)), (60, (40, 60)), (80, (40, 60))],
+    )
+    def test_the_export_range_follows_the_push(self, at: int, expected: tuple[int, int]) -> None:
+        # 範囲だけ古いフレームに残すと、書き出しの頭に意図しない部分が入り末尾が欠ける
+        # 範囲の前（頭ちょうども）なら両端を押し、途中なら終わりだけ延ばす 後ろなら動かさない
+        project = _texts(("V1", ((0, 30), (100, 10))))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, at))
+        assert pasted.timeline.work_area == expected
+
+    def test_target_mode_leaves_the_export_range_alone(self) -> None:
+        # ほかのトラックの中身は動かないので、範囲を押すと書き出す中身がずれる
+        project = _texts(("V1", ((0, 30),)), ("V2", ((50, 10),)))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        pasted = apply(project, insert_paste_commands(project, content, 10, all_tracks=False))
+        assert pasted.timeline.work_area == (40, 60)
+
+    def test_the_export_range_comes_back_with_one_undo(self) -> None:
+        # 範囲だけ押したまま残ると、取り消した後の書き出しがずれる
+        project = _texts(("V1", ((0, 30),)))
+        project = project.with_timeline(replace(project.timeline, work_area=(40, 60)))
+        document = Document(project)
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        with document.checkpoint("貼り付け（挿入）"):
+            for command in insert_paste_commands(project, content, 10):
+                document.execute(command)
+        assert document.project.timeline.work_area == (70, 90)
+        document.undo()
+        assert document.project.timeline.work_area == (40, 60)
+
+    def test_target_mode_pushes_where_a_copy_from_another_scene_lands(self) -> None:
+        # 別のシーンでコピーした物はコピー元のトラックが今のタイムラインに無い その ID のまま
+        # 押すと何も押さず、普通の貼り付けと同じく新しいトラックへ逃げた
+        elsewhere = _texts(("V1", ((0, 30),)))
+        content = copy_clips(elsewhere, [elsewhere.timeline.tracks[0].clips[0].id])
+        project = _texts(("V1", ((0, 30), (60, 30))))
+        commands = insert_paste_commands(project, content, 60, all_tracks=False)
+        assert not any(isinstance(command, AddTrack) for command in commands)
+        pasted = apply(project, commands)
+        assert _spans(pasted, 0) == [(0, 30), (60, 90), (90, 120)]
+
+    @pytest.mark.parametrize("behind", [True, False])
+    def test_target_mode_skips_a_source_track_locked_after_copying(self, behind: bool) -> None:
+        # コピーの後に元のトラックをロックすると、貼る先は別のトラックになる 元のトラックを
+        # 押す先にしたままだと、後ろがあれば貼りもしないトラックのロックで断られ、
+        # 無ければ貼る先を押さずに新しいトラックへ逃げた（Codex の指摘）
+        first = ((0, 30), (60, 30)) if behind else ((0, 30),)
+        project = _texts(("V1", first), ("V2", ((60, 30),)))
+        content = copy_clips(project, [project.timeline.tracks[0].clips[0].id])
+        v1 = project.timeline.tracks[0]
+        project = project.with_timeline(project.timeline.replace_track(replace(v1, locked=True)))
+        commands = insert_paste_commands(project, content, 60, all_tracks=False)
+        assert not any(isinstance(command, AddTrack) for command in commands)
+        pasted = apply(project, commands)
+        assert _spans(pasted, 0) == sorted((s, s + n) for s, n in first)
+        assert _spans(pasted, 1) == [(60, 90), (90, 120)]
+
+    def test_nothing_copied_does_nothing(self, linked: Project) -> None:
+        assert insert_paste_commands(linked, ClipboardContent(()), 0) == []
 
 
 class TestLockedRemoval:

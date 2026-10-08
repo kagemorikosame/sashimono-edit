@@ -47,6 +47,8 @@ from sashimono.ui.workspace import (
     DETAIL_MIN_WIDTHS,
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
+    INSERT_ALL_TRACKS,
+    INSERT_TARGET_TRACKS,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
     SCRIPTS_MOVE_ASK,
@@ -409,6 +411,20 @@ class PreferencesDialog(QDialog):
             "動かしている途中で Shift を押している間は吸い付かない"
         )
         form.addRow(self._preview_snap)
+        self._insert_paste = QComboBox(self)
+        self._insert_paste.addItem("全トラック（既定）", INSERT_ALL_TRACKS)
+        self._insert_paste.addItem("貼り先と、一緒に動く相手のトラックだけ", INSERT_TARGET_TRACKS)
+        self._insert_paste.setCurrentIndex(
+            max(0, self._insert_paste.findData(preferences.insert_paste))
+        )
+        self._insert_paste.setToolTip(
+            "貼り付け（挿入 Ctrl+Shift+V）で、再生ヘッドから後ろを貼る長さぶん押し出すトラック "
+            "全トラックなら、ほかのトラックの字幕や BGM とマーカーも一緒に押す "
+            "貼り先だけなら、コピー元のトラックと、そこで押すクリップのリンクの相手・"
+            "グループの仲間・焼き込んだ字幕のトラックだけを押す どちらもロックしたトラックに"
+            "押す物があれば貼らずに止める"
+        )
+        form.addRow("挿入貼り付けで押し出す", self._insert_paste)
 
         self._all_plugins = QCheckBox("AviUtl2 の汎用プラグインを全部読んで探す", self)
         self._all_plugins.setChecked(preferences.all_aviutl_plugins)
@@ -633,6 +649,7 @@ class PreferencesDialog(QDialog):
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
             preview_snap=self._preview_snap.isChecked(),
+            insert_paste=str(self._insert_paste.currentData()),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
             theme=str(self._theme.currentData()),
