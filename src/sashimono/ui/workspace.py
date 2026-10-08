@@ -307,6 +307,11 @@ class Preferences:
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
     double_click_reset: bool = True
+    #: 設定パネルで、焦点の無い欄（クリックしていない選択の欄・数値の欄・スライダー）でも
+    #: ホイールで値を変える 既定は切 切っていると、焦点の無い欄の上のホイールはパネルを送る
+    #: 入れていると、パネルを送る途中で通った欄の値が変わり、気付かずに取り消しの段が積まれる
+    #: 欄にカーソルを載せて回すだけで値を変えたい人は入れられるようにする
+    wheel_unfocused: bool = False
     #: タイムラインの磁石 クリップを動かす・端を伸び縮みさせる・置くときに、ほかのクリップの
     #: 端・再生位置・キーフレーム・書き出し範囲の端へ吸い付く 既定は入（利用者の決定）
     #: 1 コマずつ自由に置きたい人は、タイムラインの上の〔磁石〕で切れる（Shift で一時的にも）
@@ -452,6 +457,7 @@ class PreferenceStore:
             ),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
+            wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
             preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),

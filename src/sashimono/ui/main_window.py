@@ -440,6 +440,7 @@ class MainWindow(QMainWindow):
         # （渡さないと、最初の編集まで何本も選んだときのまとめ当てが効かない）
         self._inspector.set_project(self.view_project)
         self._inspector.set_double_click_reset(self._preferences.double_click_reset)
+        self._inspector.set_wheel_unfocused(self._preferences.wheel_unfocused)
         self._graph = GraphEditor(self)
         # グラフエディタも起動直後にプロジェクトを持たせる 持たせないと、開いた作品で最初の
         # 編集をするまで、キーフレームのあるクリップを選んでも曲線を引けない
@@ -874,6 +875,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
+        self._inspector.set_wheel_unfocused(preferences.wheel_unfocused)
         apply_dock_tabs(self, preferences.dock_tabs)
         application = QApplication.instance()
         if isinstance(application, QApplication) and preferences.theme != previous.theme:

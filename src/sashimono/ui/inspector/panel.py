@@ -104,6 +104,7 @@ from sashimono.ui.inspector.widgets import (
 from sashimono.ui.preview_handles import ALIGNMENTS
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.timeline.add_menu import effects_for_clip
+from sashimono.ui.wheel_guard import WheelGuard
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
 
@@ -257,6 +258,8 @@ class InspectorPanel(QWidget):
         # パネルの最小の幅にする（:meth:`_fit_width`）
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll = scroll
+        #: 焦点の無い欄へのホイールを送りへ回す（設定 :attr:`Preferences.wheel_unfocused`）
+        self._wheel_guard = WheelGuard(scroll, self)
 
         self._add_button = QPushButton("エフェクトを追加…", self)
         self._add_button.clicked.connect(self._show_effect_menu)
@@ -355,6 +358,10 @@ class InspectorPanel(QWidget):
             return
         self._double_click_reset = enabled
         self._rebuild()
+
+    def set_wheel_unfocused(self, enabled: bool) -> None:
+        """焦点の無い欄でもホイールで値を変えるか 設定から 欄は作り直さずに効く"""
+        self._wheel_guard.enabled = not enabled
 
     def _if_resettable(self, reset: Callable[[], None]) -> Callable[[], None] | None:
         """ダブルクリックで戻す手 設定で切ってあれば ``None``（行に付けない）"""
@@ -487,6 +494,7 @@ class InspectorPanel(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self._build()
+        self._wheel_guard.watch(self._body)
         self._shown_layout = self._layout_key()
         self._shown_selection = self._selection_key()
         if focus is not None:
