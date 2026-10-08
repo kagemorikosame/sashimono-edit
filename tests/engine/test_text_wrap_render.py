@@ -135,3 +135,10 @@ class TestDrawing:
         # 折り返して画面に収まる字は、画面の大きさの絵で描く（#256 の広げる道を通らない）
         assert source_canvas(text(wrap_width=1600), *SCREEN) == SCREEN
         assert source_canvas(text(), *SCREEN)[0] > SCREEN[0]
+
+    def test_vertical_text_keeps_a_voiced_kana_in_one_cell(self) -> None:
+        # 縦書きは 1 字ずつ縦に置く 結合の濁点をコードポイントで数えると、濁点だけが
+        # 1 マス使って列が倍に伸びる
+        combined = ink(drawn(text(text=("か" + chr(0x3099)) * 3, vertical=True)))
+        composed = ink(drawn(text(text="が" * 3, vertical=True)))
+        assert abs((combined[3] - combined[1]) - (composed[3] - composed[1])) <= 4

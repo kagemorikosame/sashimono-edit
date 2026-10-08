@@ -6,8 +6,12 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 from sashimono.asr.cleanup import wrap_text
-from sashimono.engine.text_wrap import wrap_lines
+from sashimono.compat.aviutl.text_tags import parse_tags
+from sashimono.engine.sources import _revealed, _revealed_lines
+from sashimono.engine.text_wrap import graphemes, wrap_lines
 
 
 def measure(text: str) -> float:
@@ -84,3 +88,72 @@ class TestWithCharacterWrap:
         wrapped = wrap_lines(cleaned, 60, measure)
         assert all(measure(line) <= 60 for line in wrapped)
         assert "".join(wrapped) == cleaned.replace("\n", "")
+
+
+def by_grapheme(text: str) -> float:
+    """見た目の 1 字を 10 で測る 結合文字や絵文字のつなぎを幅に数えない（字の実寸と同じ向き）"""
+    return 10.0 * len(graphemes(text))
+
+
+#: 1 字として見えるのに、コードポイントでは 2 つ以上になる字
+ACCENTED = "e" + chr(0x0301)  # é（e と結合アクセント）
+FAMILY = chr(0x1F468) + chr(0x200D) + chr(0x1F469) + chr(0x200D) + chr(0x1F467)  # ZWJ の家族
+THUMB = chr(0x1F44D) + chr(0x1F3FD)  # 肌の色を付けた絵文字
+JAPAN, FRANCE = chr(0x1F1EF) + chr(0x1F1F5), chr(0x1F1EB) + chr(0x1F1F7)  # 国旗（地域指示子の組）
+KUZU = "葛" + chr(0xE0100)  # 異体字セレクタの付いた字
+VOICED = "か" + chr(0x3099)  # 結合の濁点
+
+
+def unjoined(text: str) -> float:
+    """つなぎの字形を持たない書体の物差し 結合文字・ZWJ・異体字セレクタは幅 0 で、
+    ほかのコードポイントは 1 つ 10 ZWJ の家族は 3 人並んで 30、国旗は 2 字の記号で 20、
+    肌の色は色の四角が並んで 20 になる（書体が組を 1 字に描けないときの実際の出方）
+    幅を超える 1 字が出るので、1 字の中で切るかどうかが分かる
+    """
+    zero = {0x200D} | set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
+    return 10.0 * sum(1 for c in text if not unicodedata.combining(c) and ord(c) not in zero)
+
+
+class TestGraphemes:
+    """見た目の 1 字の中では折り返さない（CodeRabbit の指摘 #266）
+
+    前はコードポイントで切っていて、幅を超えた所で基の字と結合文字・ZWJ の前後・国旗の
+    2 字・絵文字と肌の色が別の行に分かれた
+    """
+
+    def test_a_long_accented_word_is_split_between_letters(self) -> None:
+        # 幅を超える 1 語はなお切る ただし é の e とアクセントは離さない
+        lines = wrap_lines(ACCENTED * 7, 30, by_grapheme)
+        assert lines == [ACCENTED * 3, ACCENTED * 3, ACCENTED]
+
+    def test_a_zwj_sequence_stays_whole(self) -> None:
+        # 1 字で幅を超えても割らない 割ると家族の 1 人ずつが別の行に出る
+        assert wrap_lines(FAMILY * 2, 20, unjoined) == [FAMILY, FAMILY]
+
+    def test_a_skin_tone_stays_with_its_emoji(self) -> None:
+        assert wrap_lines(THUMB * 2, 10, unjoined) == [THUMB, THUMB]
+
+    def test_a_flag_is_not_halved(self) -> None:
+        assert wrap_lines(JAPAN + FRANCE, 10, unjoined) == [JAPAN, FRANCE]
+
+    def test_a_variation_selector_stays_with_its_kanji(self) -> None:
+        assert wrap_lines(KUZU * 3, 20, by_grapheme) == [KUZU * 2, KUZU]
+
+    def test_a_long_plain_word_is_still_split(self) -> None:
+        # 1 語が幅より長いときに切る約束は変えない
+        assert wrap_lines("abcdefgh", 30, by_grapheme) == ["abc", "def", "gh"]
+
+
+class TestRevealByGraphemes:
+    """文字送りも見た目の 1 字で数える 途中で止まったときに基の字だけ・国旗の片方が出ない"""
+
+    def test_a_voiced_kana_appears_whole(self) -> None:
+        # 前はコードポイントの 3 割（3 つのうち 1 つ）で、濁点の無い「か」が出た
+        assert _revealed(VOICED + "き", {"reveal": 34.0}) == VOICED
+
+    def test_a_flag_appears_whole(self) -> None:
+        assert _revealed(JAPAN + FRANCE, {"reveal": 30.0}) == JAPAN
+
+    def test_the_aviutl_layout_counts_the_same_way(self) -> None:
+        lines = _revealed_lines(parse_tags(VOICED + "き", 64.0), {"reveal": 34.0})
+        assert "".join(run.text for line in lines for run in line.runs) == VOICED

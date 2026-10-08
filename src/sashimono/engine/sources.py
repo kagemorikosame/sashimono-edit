@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
-from PySide6.QtCore import QLocale, QPointF, QRectF, Qt, QTextBoundaryFinder
+from PySide6.QtCore import QLocale, QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -60,7 +60,7 @@ from sashimono.engine.motion_shapes import (
     trail,
     unit_randoms,
 )
-from sashimono.engine.text_wrap import wrap_lines
+from sashimono.engine.text_wrap import graphemes, wrap_lines
 
 __all__ = ["Frame", "render_source", "render_source_framed", "waveform_points"]
 
@@ -607,7 +607,7 @@ def _wrapped(text: str, width: float, metrics: QFontMetricsF, values: dict[str, 
     """
     if bool(values.get("vertical", False)):
         step = metrics.height() + _number(values, "letter_spacing", 0.0)
-        return chr(10).join(wrap_lines(text, width, lambda line: step * len(line)))
+        return chr(10).join(wrap_lines(text, width, lambda line: step * len(graphemes(line))))
     return chr(10).join(wrap_lines(text, width, metrics.horizontalAdvance))
 
 
@@ -791,7 +791,7 @@ def _aviutl_lines(
                 1.0 if style.scale_y is None else style.scale_y,
                 0.0 if style.turn is None else style.turn,
             )
-            for part in _graphemes(run.text):
+            for part in graphemes(run.text):
                 step = metrics.horizontalAdvance(part) + embolden
                 # 字間は行の最初の字の前には入れない（文字の間にだけ入る）
                 parts.append((part, font, step, look, gap if parts else 0.0, shape))
@@ -876,7 +876,8 @@ def _revealed_lines(lines: list[TaggedLine], values: dict[str, object]) -> list[
         return lines
     if ratio <= 0.0:
         return []
-    total = sum(len(line.text) for line in lines)
+    # 見た目の 1 字で数える（:func:`_revealed` と同じ）
+    total = sum(len(graphemes(line.text)) for line in lines)
     visible = round(total * ratio)
     shown: list[TaggedLine] = []
     for line in lines:
@@ -889,10 +890,11 @@ def _revealed_lines(lines: list[TaggedLine], values: dict[str, object]) -> list[
                 # 次の字に当たった所で止める 空の行になったときは、止まった所の見た目の高さ
                 kept.end = run.style
                 return shown
-            piece = run.text[:visible]
+            parts = graphemes(run.text)
+            piece = parts[:visible]
             visible -= len(piece)
-            kept.runs.append(TextRun(piece, run.style))
-            if len(piece) < len(run.text):
+            kept.runs.append(TextRun("".join(piece), run.style))
+            if len(piece) < len(parts):
                 return shown
     return shown
 
@@ -915,25 +917,6 @@ def _external_leading(font: QFont) -> float:
     return max(0.0, float(extra) * float(raw.pixelSize()) / float(raw.unitsPerEm()))
 
 
-def _graphemes(line: str) -> list[str]:
-    """見た目の 1 文字ずつに分ける
-
-    コードポイントで分けると、サロゲートペアや結合文字（濁点の付く仮名、絵文字の
-    修飾）が 2 つに割れ、別々に置かれて崩れる
-    """
-    finder = QTextBoundaryFinder(QTextBoundaryFinder.BoundaryType.Grapheme, line)
-    # 境目の位置は UTF-16 の数え方で返る Python の文字列の添字（コードポイント）で
-    # 切ると、絵文字より後ろの位置が 1 つずつずれる
-    units = line.encode("utf-16-le")
-    parts: list[str] = []
-    start = 0
-    while (end := finder.toNextBoundary()) != -1:
-        if end > start:
-            parts.append(units[2 * start : 2 * end].decode("utf-16-le"))
-        start = end
-    return parts
-
-
 def _emboldened(path: QPainterPath, amount: float) -> QPainterPath:
     """字の輪郭を右と上へ ``amount`` だけ太らせる（AviUtl2 の太字）
 
@@ -953,7 +936,8 @@ def _revealed(text: str, values: dict[str, object]) -> str:
 
     テロップを 1 文字ずつ出す表現は AviUtl でも定番で、こちらでもキーフレームを
     打てば同じことができる 改行は文字数に数えない 数えると、行が変わる瞬間に
-    見た目の速度が変わる
+    見た目の速度が変わる 数えるのは見た目の 1 字（:func:`graphemes`） コードポイントで
+    数えると、濁点の付いた字や絵文字が途中まで出て、基の字だけや半分の国旗が見える
     """
     ratio = float(values.get("reveal", 100.0)) / 100.0  # type: ignore[arg-type]
     if ratio >= 1.0:
@@ -961,9 +945,10 @@ def _revealed(text: str, values: dict[str, object]) -> str:
     if ratio <= 0.0:
         return ""
 
-    visible = round(len([c for c in text if c != chr(10)]) * ratio)
+    parts = graphemes(text)
+    visible = round(len([c for c in parts if c != chr(10)]) * ratio)
     shown: list[str] = []
-    for character in text:
+    for character in parts:
         if character == chr(10):
             shown.append(character)
             continue
@@ -993,7 +978,9 @@ def _vertical_text_path(
 
     centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
     centre_y = height / 2.0 - float(values.get("pos_y", 0.0))  # type: ignore[arg-type]
-    tallest = max((len(column) for column in columns), default=0)
+    # 1 字ずつ縦に置く 1 字は見た目の 1 字（結合文字や絵文字を割らない）
+    cells = [graphemes(column) for column in columns]
+    tallest = max((len(column) for column in cells), default=0)
     # 塊の基準は横書きと同じ ``anchor`` と ``valign`` 既定（中・中）は塊の真ん中が位置で、
     # 前の置き方と同じ 見ずにいると、左上を基準にした縦書きも真ん中に置かれる
     block_width = column_width * len(columns)
@@ -1007,7 +994,7 @@ def _vertical_text_path(
     )
 
     path = QPainterPath()
-    for column_index, column in enumerate(columns):
+    for column_index, column in enumerate(cells):
         x = left - column_width * column_index
         for row_index, character in enumerate(column):
             baseline = top + advance * row_index + metrics.ascent()

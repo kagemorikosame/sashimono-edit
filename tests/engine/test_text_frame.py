@@ -30,7 +30,8 @@ from sashimono.effects.definition import registry
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.engine.render import FrameRenderer
 from sashimono.engine.render.renderer import _object_box, _object_sized
-from sashimono.engine.sources import _graphemes, render_source_framed
+from sashimono.engine.sources import render_source_framed
+from sashimono.engine.text_wrap import graphemes
 
 SCREEN = (640, 360)
 
@@ -224,7 +225,7 @@ class TestGraphemes:
     def test_surrogate_pairs_and_combining_marks_stay_whole(self) -> None:
         # 1 文字ずつ置くので、割れると絵文字や濁点が崩れて別々に並ぶ
         word = "か" + chr(0x3099) + chr(0x1F44D) + "a"
-        assert _graphemes(word) == ["か" + chr(0x3099), chr(0x1F44D), "a"]
+        assert graphemes(word) == ["か" + chr(0x3099), chr(0x1F44D), "a"]
 
 
 class TestObjectBox:
