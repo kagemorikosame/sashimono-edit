@@ -389,6 +389,17 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._double_click_reset)
 
+        self._wheel_unfocused = QCheckBox(
+            "設定パネルで、クリックしていない欄でもホイールで値を変える", self
+        )
+        self._wheel_unfocused.setChecked(preferences.wheel_unfocused)
+        self._wheel_unfocused.setToolTip(
+            "切っていると、選択の欄・数値の欄・スライダーはクリックしてからホイールで値を変え、"
+            "クリックしていない欄の上のホイールはパネルを送る "
+            "入れると、カーソルを載せて回すだけで値が変わる（パネルを送る途中で通った欄も変わる）"
+        )
+        form.addRow(self._wheel_unfocused)
+
         self._timeline_snap = QCheckBox("タイムラインで近くの位置へ吸い付く（磁石）", self)
         self._timeline_snap.setChecked(preferences.timeline_snap)
         self._timeline_snap.setToolTip(
@@ -672,6 +683,7 @@ class PreferencesDialog(QDialog):
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),
             double_click_reset=self._double_click_reset.isChecked(),
+            wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
             preview_snap=self._preview_snap.isChecked(),

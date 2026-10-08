@@ -45,15 +45,16 @@ def drawn(source: GeneratedSource, scale: float = 1.0) -> np.ndarray:
 class TestSpec:
     def test_the_width_is_the_last_item_and_off_by_default(self) -> None:
         # 既定 0 は折り返さない 古いファイルは項目が無く、既定で開くので見た目が変わらない
-        assert TEXT.parameters[-1].name == "wrap_width"
+        # 末尾に足す（既存の項目の位置を動かさない） 後ろはスタイルの欄（#248）だけ
+        assert [spec.name for spec in TEXT.parameters[-2:]] == ["wrap_width", "font_style"]
         width = TEXT.create().params["wrap_width"]
         assert isinstance(width, AnimatedValue) and width.static == 0
 
     def test_the_aviutl_layout_locks_the_width(self) -> None:
         # AviUtl2 のテキストに折り返しは無い 欄は灰色にして理由を出す
-        assert TEXT.locked_reasons(TEXT.create(layout="aviutl").params) == {
-            "wrap_width": AVIUTL_NO_WRAP
-        }
+        # スタイルの欄（#248）も同じ組み方で灰色になるので、折り返しの幅だけを見る
+        locked = TEXT.locked_reasons(TEXT.create(layout="aviutl").params)
+        assert locked["wrap_width"] == AVIUTL_NO_WRAP
         assert TEXT.locked_reasons(TEXT.create().params) == {}
         # 縦書きは AviUtl2 の組み方でも標準の縦書きで描くので折り返せる
         assert TEXT.locked_reasons(TEXT.create(layout="aviutl", vertical=True).params) == {}

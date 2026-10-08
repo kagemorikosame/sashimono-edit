@@ -26,6 +26,7 @@ from sashimono.effects.spec import (
     CheckSpec,
     ColorSpec,
     FontSpec,
+    FontStyleSpec,
     ParameterSpec,
     ParamInput,
     SelectSpec,
@@ -59,7 +60,8 @@ class SourceDefinition:
     #: 設定に 60 近い欄が並び、どれを動かせば変わるのかが分からない
     unused: Callable[[Mapping[str, ParamValue]], frozenset[str]] | None = None
     #: 今の値では効かない項目と、その理由 設定パネルは欄を灰色にして理由を添える（値は残す）
-    #: 隠さないのは、別の設定（組み方など）を変えれば使える項目だと分かるようにするため
+    #: 隠さないのは、別の設定（組み方・スタイルなど）を変えれば使える項目だと分かるようにするため
+    #: 隠すと「太字が消えた」と見え、スタイルを既定に戻せば使えることに気付けない
     locked: Callable[[Mapping[str, ParamValue]], Mapping[str, str]] | None = None
 
     def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
@@ -131,21 +133,35 @@ AVIUTL_NO_WRAP = (
     "AviUtl2 の組み方は折り返しません AviUtl2 のテキストに自動で折り返す項目が無いため"
     "（標準の組み方にすると使えます）"
 )
+#: AviUtl2 の組み方でスタイルの欄を使えない理由
+AVIUTL_NO_STYLE = (
+    "AviUtl2 の組み方はスタイルを使いません AviUtl2 はファミリ名と太字・斜体だけで字を選ぶため"
+    "（標準の組み方にすると使えます）"
+)
+#: スタイルを選んでいる間、太字と斜体を使えない理由
+STYLE_DECIDES_WEIGHT = "スタイルを選んでいる間は使いません（太さと傾きはスタイルが決めます）"
 
 
 def _text_locked(params: Mapping[str, ParamValue]) -> Mapping[str, str]:
     """テキストの設定で、今は効かない項目とその理由
 
-    AviUtl2 の組み方（横書き）は折り返さない AviUtl2 のテキストには折り返しの項目が無く、
-    長い文は画面からはみ出す（PSDToolKit の自動折り返しのような追加の部品で補う物）
-    合わせる相手に無い動きを足すと、読み込んだ AviUtl2 の作品の行が変わる
-    縦書きは AviUtl2 の組み方でも標準の縦書きで描くので、折り返しが効く
+    描く所（:mod:`sashimono.engine.sources` の ``_draw_text`` と ``_text_font``）と同じ条件にする
+    - AviUtl2 の組み方（横書き）は折り返さない AviUtl2 のテキストには折り返しの項目が無く、
+      長い文は画面からはみ出す（PSDToolKit の自動折り返しのような追加の部品で補う物）
+      合わせる相手に無い動きを足すと、読み込んだ AviUtl2 の作品の行が変わる
+    - AviUtl2 の組み方（横書き）はスタイルも読まない AviUtl2 の太字は輪郭を自前で太らせる
+      作りで、太さを持つスタイルと重ねたときの見た目を測っていない
+    - 縦書きは AviUtl2 の組み方でも標準の縦書きで描くので、折り返しもスタイルも効く
+    - 標準の組み方でスタイルを選んでいれば、太字と斜体を読まない スタイルが太さを
+      持つ所へ太字を重ねると二重に太くなる
     """
     vertical = params.get("vertical")
     if params.get("layout") == "aviutl" and not (
         vertical is True or (isinstance(vertical, int) and vertical)
     ):
-        return {"wrap_width": AVIUTL_NO_WRAP}
+        return {"wrap_width": AVIUTL_NO_WRAP, "font_style": AVIUTL_NO_STYLE}
+    if str(params.get("font_style", "") or ""):
+        return {"bold": STYLE_DECIDES_WEIGHT, "italic": STYLE_DECIDES_WEIGHT}
     return {}
 
 
@@ -221,6 +237,9 @@ TEXT = SourceDefinition(
         # 折り返す 縦書きは列の高さで折り返す 0 は折り返さない（既定） 既にある作品と、
         # 手で改行したテキストの見た目を変えない YMM4 の MaxWidth と WordWrap に当たる
         TrackSpec("wrap_width", "折り返しの幅", 0, 8000, 0, step=1, unit="px"),
+        # フォントのファミリの中のスタイル（#248） 設定パネルはフォントの欄のすぐ下に出す
+        # 並びの末尾に置いたのは、保存した値の並びと既存の項目の位置を動かさないため
+        FontStyleSpec("font_style", "スタイル"),
     ),
     locked=_text_locked,
 )

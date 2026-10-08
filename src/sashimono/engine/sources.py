@@ -21,6 +21,8 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontDatabase,
+    QFontInfo,
     QFontMetricsF,
     QImage,
     QPainter,
@@ -62,7 +64,7 @@ from sashimono.engine.motion_shapes import (
 )
 from sashimono.engine.text_wrap import graphemes, wrap_lines
 
-__all__ = ["Frame", "render_source", "render_source_framed", "waveform_points"]
+__all__ = ["Frame", "drawn_bold_italic", "render_source", "render_source_framed", "waveform_points"]
 
 #: 縦の基準ごとに、指定した位置より上へ出す割合 ``下`` なら全部が上に出る
 _VERTICAL_SHARE = {"top": 0.0, "middle": 0.5, "bottom": 1.0}
@@ -532,12 +534,7 @@ def _text_layers(
     text = _revealed(raw, values)
     if not text:
         return None
-    font = QFont(str(values.get("font", "Yu Gothic UI")))
-    font.setPixelSize(size)
-    # AviUtl2 の組み方の太字は、細字の輪郭を自分で太らせる（:func:`_emboldened`）
-    # Qt に太字を頼むと太り方も送り幅も AviUtl2 と違う
-    font.setBold(bold and not aviutl)
-    font.setItalic(bool(values.get("italic", False)))
+    font = _text_font(values, size)
     letter_spacing = float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
     # AviUtl2 の字間は文字と文字の間にだけ入る（自分で足す） Qt に頼むと最後の字の
     # 後ろにも入り、3 文字の行が字間 1 つ分広く、中央揃えで半分だけ左へ寄る
@@ -567,7 +564,20 @@ def _text_layers(
     # 文字を輪郭（パス）として組み立てる 縁取りを外側だけに出すには、
     # 塗りとは別に輪郭を太らせる必要があり、それはパスでしかできない
     # 太字は、同じ揃え方で細字を置いたときの字の外形の中心へ戻す（:func:`_bold_drift`）
+    # 太さは実際に選ばれた書体で見る（スタイルの Bold や Semibold は QFont の太さを持たない）
+    # 中間の太さ（Semibold 600）も太字に数える 戻す量は細字と比べて測るだけなので、
+    # 寄っていない書体では 0 に近く、寄っていれば太字と同じ理由で戻すのが正しい
+    # 比べる細字からはスタイル名も外す 残すとスタイルが勝ち、比べる字まで太いままになる
+    # スタイルを選んでいないときは今までどおり太字の欄で決める（書体の既定の面が太い
+    # ファミリで、前の版に無かった補正が掛かって字がずれないように）
     plain_font = QFont(font)
+    if font.styleName():
+        resolved = QFontInfo(font)
+        emboldened = resolved.bold()
+        plain_font.setStyleName("")
+        plain_font.setItalic(resolved.italic())
+    else:
+        emboldened = font.bold()
     plain_font.setBold(False)
     plain_metrics = QFontMetricsF(plain_font)
     plain_widest = max((plain_metrics.horizontalAdvance(line) for line in lines), default=0.0)
@@ -589,7 +599,7 @@ def _text_layers(
         baseline = top + line_height * index + metrics.ascent()
         placed = QPainterPath()
         placed.addText(QPointF(x, baseline), font, line)
-        if bold:
+        if emboldened:
             plain = QPainterPath()
             plain_x = start(plain_metrics.horizontalAdvance(line), plain_widest)
             plain.addText(QPointF(plain_x, baseline), plain_font, line)
@@ -623,6 +633,53 @@ def _bold_drift(plain: QPainterPath, bold: QPainterPath) -> float:
     if plain_box.isEmpty() or bold_box.isEmpty():
         return 0.0
     return plain_box.center().x() - bold_box.center().x()
+
+
+def _text_font(values: Mapping[str, object], size: int) -> QFont:
+    """標準の組み方（横書きと縦書き）で使うフォント
+
+    スタイル（``font_style``）が空なら、ファミリ名に太字と斜体を掛ける今までの描き方
+    空でなければスタイルの名前で字を選び、太字と斜体は読まない（設定パネルも灰色にする
+    :func:`sashimono.effects.sources._text_locked`） 太さを持つスタイルへ太字を重ねると
+    二重に太くなる
+
+    そのファミリに無いスタイル（フォントを入れていない機械で開いた・ファミリを替えた）は
+    渡さずに既定のスタイルで描く Qt へそのまま渡すと、名前の似た別のスタイルを探したり
+    ファミリごと別の書体へ替えたりして、どの字で出るかが機械ごとに変わる
+    """
+    family = str(values.get("font", "Yu Gothic UI"))
+    font = QFont(family)
+    font.setPixelSize(size)
+    style = str(values.get("font_style", "") or "")
+    if style:
+        if style in QFontDatabase.styles(family):
+            font.setStyleName(style)
+        return font
+    font.setBold(bool(values.get("bold", False)))
+    font.setItalic(bool(values.get("italic", False)))
+    return font
+
+
+def drawn_bold_italic(values: Mapping[str, object], bold: bool, italic: bool) -> tuple[bool, bool]:
+    """描く字が太字か・斜体か ``bold`` ``italic`` は太字と斜体の欄の値
+
+    埋め込み Lua の ``obj.getfont`` へ渡す値に使う 描く所（:func:`_text_font`）と同じ
+    フォントから求めるので、描いた字と食い違わない
+    - スタイルを選んでいなければ、欄の値のまま（前の版と同じ値を渡す）
+    - AviUtl2 の組み方の横書きはスタイルを読まないので、欄の値のまま
+    - スタイルを選んでいれば、欄（灰色で効かない古い値）ではなく、実際に選ばれた書体の
+      太さと傾きを渡す AviUtl2 の太字と斜体は「この字は太いか・傾いているか」の印で、
+      Bold のスタイルで描いた字を太字でないと返すと、それを読んで飾りを足すスクリプトが
+      描いた字と違う前提で動く スタイルがそのファミリに無ければ既定の字で描くので、
+      その字の太さと傾きになる
+    """
+    style = str(values.get("font_style", "") or "")
+    aviutl = values.get("layout") == "aviutl" and not bool(values.get("vertical", False))
+    if not style or aviutl:
+        return bold, italic
+    # 太さと傾きは大きさで変わらない 大きさは時間で動く値のこともあるので、決めて渡す
+    info = QFontInfo(_text_font(values, 64))
+    return info.bold(), info.italic()
 
 
 #: AviUtl2 の既定の書体 書体名が見つからないときもこれで描く

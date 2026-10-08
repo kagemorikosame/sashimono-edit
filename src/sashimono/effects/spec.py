@@ -33,6 +33,7 @@ __all__ = [
     "ColorSpec",
     "FileSpec",
     "FontSpec",
+    "FontStyleSpec",
     "GridSpec",
     "ParamInput",
     "ParameterKind",
@@ -320,6 +321,31 @@ class FontSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class FontStyleSpec:
+    """フォントのファミリの中のスタイルの名前（``Light`` ``Bold`` ルイカの ``０９`` など）
+
+    空文字は「既定」で、ファミリ名だけで選んだ今までの描き方になる 既定を空にしたのは、
+    この項目を持たない前の版のプロジェクトを開いても見た目を変えないため
+    選べるスタイルはファミリで決まるので、どの :class:`FontSpec` の項目から選ぶかを
+    ``font`` に持つ 一覧を作るのは画面の側（ここは Qt を持ち込まない層）
+    """
+
+    name: str
+    label: str
+    #: スタイルを選ぶ元のファミリを持つ項目の名前
+    font: str = "font"
+    default: str = ""
+
+    kind = ParameterKind.TEXT
+
+    def default_value(self) -> str:
+        return self.default
+
+    def coerce(self, value: ParamInput) -> str:
+        return value if isinstance(value, str) else self.default
+
+
+@dataclass(frozen=True, slots=True)
 class ValueSpec:
     """スライダーを持たない数値 時間で変化させられない
 
@@ -458,6 +484,7 @@ type ParameterSpec = (
     | TextSpec
     | FileSpec
     | FontSpec
+    | FontStyleSpec
     | ValueSpec
     | GridSpec
 )

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 import shiboken6
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -398,6 +398,55 @@ class TestTheResetSetting:
             dialog.deleteLater()
 
 
+#: 試験の間、本物の機器から来る入力 試験が送る物（``sendEvent``）は自然に起きた物ではない
+_REAL_INPUT = frozenset(
+    {
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease,
+        QEvent.Type.MouseButtonDblClick,
+        QEvent.Type.MouseMove,
+        QEvent.Type.Wheel,
+        QEvent.Type.KeyPress,
+        QEvent.Type.KeyRelease,
+        QEvent.Type.TabletPress,
+        QEvent.Type.TabletMove,
+        QEvent.Type.TabletRelease,
+        QEvent.Type.TouchBegin,
+        QEvent.Type.TouchUpdate,
+        QEvent.Type.TouchEnd,
+    }
+)
+
+
+class _RealInputShield(QObject):
+    """本物のマウス・キーボードの入力を止める 止めた数を数える
+
+    窓を画面に出して待つ（``qWait``）間に、手元のマウスが窓の上でホイールを回したり
+    押したりすると、試験と関係の無い値（スタイルや拡大率）が変わって段が積まれ、
+    手元でだけ落ちた（#269） 試験は ``sendEvent`` で送るので、自然に起きた入力
+    （``spontaneous``）だけを止めれば試験の操作は通る
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked = 0
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt の命名規約
+        if event.spontaneous() and event.type() in _REAL_INPUT:
+            self.blocked += 1
+            return True
+        return super().eventFilter(watched, event)
+
+
+@pytest.fixture
+def shielded(qt_application: QApplication) -> Iterator[_RealInputShield]:
+    shield = _RealInputShield()
+    qt_application.installEventFilter(shield)
+    yield shield
+    qt_application.removeEventFilter(shield)
+
+
+@pytest.mark.usefixtures("shielded")
 class TestHoldingTheSlider:
     """押したまま動かす調整（利用者の言う長押し）と、ダブルクリックで戻すのを両立させる"""
 
