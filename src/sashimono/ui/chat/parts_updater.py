@@ -39,6 +39,13 @@ STARTUP_DELAY_MS = 60_000
 #: 裏の作業の終わりを見る間隔（ミリ秒）
 POLL_MS = 200
 
+#: 窓を閉じるときに、入れている最中の作業の終わりを待つ長さ（秒） pip へは中断を頼むので、
+#: pip は runtime の _CANCEL_GRACE_SECONDS（10 秒）までに戻るか、戻らない pip を残して返る
+#: （PIP_LEFT_RUNNING） 入れ替えを始めていれば、入れ替えそのものは数秒で終わる 待たずに
+#: 終わると、古い部品を退けた直後でプロセスが消え、次の起動まで SDK が欠ける（PR #265 の
+#: Codex の指摘） 待ちきれなかったときは、次の起動が記録を見て戻す（recover_runtime_swap）
+SHUTDOWN_WAIT_SECONDS = 20.0
+
 #: 入れ替えたら読み込み直す部品 古い方が読み込まれたままだと、新しい Claude Code に
 #: 古い SDK の決まりで話しかける 拡張モジュールを持つ部品（pydantic-core など）は
 #: 読み込み直せないので含めない（版が変わったら再起動まで古いまま動く）
@@ -93,6 +100,9 @@ class PartsUpdater(QObject):
         #: 裏の作業の答え 作業ごとに新しい入れ物を渡し、前の作業の答えと混ざらないようにする
         self._results: list[tuple[str, ...]] = []
         self._install_result: list[bool] = []
+        #: 入れている作業のスレッドと、その中断の頼み 窓を閉じるときに中断を頼んで終わりを待つ
+        self._install_thread: threading.Thread | None = None
+        self._cancel = threading.Event()
         self._failures = self._store.load().failures
         #: 入れ替える直前にパネルが走らせる物 会話を畳み、畳み終わるのを待つ物を返す
         self.prepare: Callable[[], Callable[[], None]] | None = None
@@ -162,10 +172,22 @@ class PartsUpdater(QObject):
             self._asked = False
             self.finished.emit(False, "")
 
-    def stop(self) -> None:
-        """窓を閉じる 時計を止める（裏の pip は daemon なので、プロセスと一緒に終わる）"""
+    def stop(self, wait: float = SHUTDOWN_WAIT_SECONDS) -> bool:
+        """窓を閉じる 時計を止め、入れている最中なら中断を頼んで ``wait`` 秒まで終わりを待つ
+
+        終わったか（入れていなかったときも真）を返す 入れているスレッドは daemon なので、
+        待たずに戻るとプロセスと一緒に消える 導入先の中身を入れ替えている最中に消えると、
+        退けた古い部品が戻らない 中断を頼めば、pip の途中・入れ替えの前ならすぐに戻り、
+        入れ替えを始めていれば終えてから戻る
+        """
         self._start_timer.stop()
         self._poll_timer.stop()
+        thread = self._install_thread
+        if thread is None or not thread.is_alive():
+            return True
+        self._cancel.set()
+        thread.join(wait)
+        return not thread.is_alive()
 
     # --- 裏の作業 ---
 
@@ -206,11 +228,20 @@ class PartsUpdater(QObject):
         pins = self._pins
         done = threading.Event()
         result: list[bool] = []
+        # 作業ごとに新しい頼みを渡す 前の作業の中断の頼みが立ったまま残ると、次の作業が
+        # 始まってすぐ止まる
+        cancel = threading.Event()
 
         def run() -> None:
             try:
                 result.append(
-                    self._installer(pins, target=target, key=self._pack.key, before_swap=wait)
+                    self._installer(
+                        pins,
+                        target=target,
+                        key=self._pack.key,
+                        before_swap=wait,
+                        should_cancel=cancel.is_set,
+                    )
                 )
             except Exception:  # 落ちても今の版は残っている 次の機会に試す
                 result.append(False)
@@ -220,7 +251,10 @@ class PartsUpdater(QObject):
         self.phase = Phase.INSTALLING
         self._work = done
         self._install_result = result
-        threading.Thread(target=run, name="sashimono-ai-parts-install", daemon=True).start()
+        self._cancel = cancel
+        thread = threading.Thread(target=run, name="sashimono-ai-parts-install", daemon=True)
+        self._install_thread = thread
+        thread.start()
         self._poll_timer.start()
 
     def _poll(self) -> None:

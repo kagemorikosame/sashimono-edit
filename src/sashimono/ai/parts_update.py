@@ -8,7 +8,8 @@
 入れ方は 2 段 新しい版をまず別の置き場（``runtime-staging``）へ入れ、入れ終えてから導入先の
 中身と入れ替える 導入先へ直に入れると、途中で落ちたとき（ネットが切れた・Defender に
 止められた・pip が落ちた）に新旧が混ざり、今まで動いていた版まで壊れる 入れ替えの途中で
-失敗したら、動かした物を元へ戻す
+失敗したら、動かした物を元へ戻す 入れ替えの途中でプロセスごと終わったときは、次の起動が
+記録を見て戻す（:func:`sashimono.runtime.recover_runtime_swap`）
 
 ここは Qt を使わない 時計とスレッドと画面への知らせは :mod:`sashimono.ui.chat.parts_updater`
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
@@ -28,9 +30,16 @@ from sashimono.core import userdirs
 from sashimono.package_index import Latest, latest_release
 from sashimono.runtime import (
     FeaturePack,
+    finish_swap,
+    hold_swap_lock,
     is_newer_version,
     mark_installed,
+    recover_swap_locked,
+    roll_back_swap,
     run_pip_in_worker,
+    swap_backup,
+    swap_journal,
+    write_swap_journal,
     writing_runtime,
 )
 
@@ -149,6 +158,9 @@ def install_staged(
 
     ``before_swap`` は入れ替える直前に呼ぶ 走っている Claude Code が終わるのを待つのに使う
     Windows では動いている exe を動かせないので、待たないと入れ替えが失敗する
+
+    ``should_cancel`` が真を返したら（窓を閉じる）、入れ替えを始めずに偽で返す 始めた
+    入れ替えは途中で止めない（止めると新旧が混ざる 入れ替えそのものは数秒で終わる）
     """
     staging = target.parent / f"{target.name}-staging"
     shutil.rmtree(staging, ignore_errors=True)
@@ -159,6 +171,10 @@ def install_staged(
             return False
         if before_swap is not None:
             before_swap()
+        if should_cancel is not None and should_cancel():
+            # 会話が畳み終わるのを待つ間に閉じられた 今から入れ替えると、終了の待ちが切れた
+            # 所で入れ替えの途中のままプロセスが終わることがある
+            return False
         # 導入先へ書く所は導入のボタンと同じ錠で並べる 同時に書くと新旧が混ざる
         # 会話が畳み終わるのを待つ（before_swap）のは錠の外 持ったまま待つと、その間ずっと
         # 導入のボタンを待たせる
@@ -177,39 +193,52 @@ def swap_in(staging: Path, target: Path) -> bool:
     版の変わらなかった部品（``*.dist-info`` の名前が同じ物）は動かさない 読み込み済みの
     拡張モジュール（pydantic-core など）は Windows では動かせず、動かそうとすると毎回
     入れ替えが失敗する 変わった物だけを動かせば、たいていは SDK とその同梱の Claude Code だけで済む
+
+    動かす前に、何を入れ替えて何を足すかの記録を導入先の隣へ書く（:func:`write_swap_journal`）
+    どの瞬間に落ちても、次の起動が記録のとおりに元へ戻す（:func:`recover_runtime_swap`）
     """
     try:
         target.mkdir(parents=True, exist_ok=True)
         entries = sorted(staging.iterdir())
     except OSError:
         return False
-    keep = _unchanged(staging, target)
-    backup = target.parent / f"{target.name}-previous"
-    shutil.rmtree(backup, ignore_errors=True)
-    moved: list[tuple[Path, Path]] = []
-    placed: list[Path] = []
-    try:
-        backup.mkdir(parents=True, exist_ok=True)
-        for entry in entries:
-            if entry.name in keep or entry.name == "__pycache__":
-                continue
-            destination = target / entry.name
-            if destination.exists():
-                kept = backup / entry.name
-                destination.replace(kept)
-                moved.append((destination, kept))
-            entry.replace(destination)
-            placed.append(destination)
-    except OSError:
-        # 置いた新しい物を下げ、退けた古い物を戻す 戻せない物が残っても、ほかは戻す
-        for destination in reversed(placed):
-            _remove(destination)
-        for original, kept in reversed(moved):
-            with contextlib.suppress(OSError):
-                kept.replace(original)
-        shutil.rmtree(backup, ignore_errors=True)
+    release = hold_swap_lock(target)
+    if release is None:
+        # ほかの窓が入れ替えている 次の機会に試す
         return False
+    try:
+        return _swap_locked(staging, target, entries)
+    finally:
+        release()
+
+
+def _swap_locked(staging: Path, target: Path, entries: list[Path]) -> bool:
+    # 前に落ちた入れ替えが残っていれば先に戻す 戻せないまま重ねると、記録も退けた物も
+    # 今回の物で上書きされ、前の古い物が戻らなくなる
+    recover_swap_locked(target)
+    if swap_journal(target).exists():
+        return False
+    keep = _unchanged(staging, target)
+    names = [e.name for e in entries if e.name not in keep and e.name != "__pycache__"]
+    replaced = [name for name in names if os.path.lexists(target / name)]
+    added = [name for name in names if name not in replaced]
+    backup = swap_backup(target)
     shutil.rmtree(backup, ignore_errors=True)
+    try:
+        write_swap_journal(target, replaced, added)
+        backup.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            destination = target / name
+            if name in replaced:
+                destination.replace(backup / name)
+            (staging / name).replace(destination)
+    except OSError:
+        # 置いた新しい物を下げ、退けた古い物を戻す 戻せない物が残ったら記録と退けた物を
+        # 残し、次の起動でもう一度戻す（捨てると、退けた古い物ごと失う）
+        if roll_back_swap(target, replaced, added):
+            finish_swap(target)
+        return False
+    finish_swap(target)
     return True
 
 
@@ -241,11 +270,3 @@ def _top_levels(info: Path) -> set[str]:
             continue
         tops.add(path.replace("\\", "/").split("/", 1)[0])
     return tops
-
-
-def _remove(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            path.unlink()

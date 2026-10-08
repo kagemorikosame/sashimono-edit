@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import threading
 import time
 import tomllib
@@ -50,7 +51,13 @@ from sashimono.ai.session import (
 )
 from sashimono.core.model import MediaItem, Project, Transcript
 from sashimono.package_index import Latest, latest_release, newest_installable
-from sashimono.runtime import ABI_MARKER, FeaturePack, PackageStatus, PackStatus
+from sashimono.runtime import (
+    ABI_MARKER,
+    FeaturePack,
+    PackageStatus,
+    PackStatus,
+    recover_runtime_swap,
+)
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.parts_updater import PartsUpdater, Phase
 from sashimono.ui.setup import SetupSection, describe_updates
@@ -366,8 +373,9 @@ class _Installer:
         target: Path,
         key: str,
         before_swap: Callable[[], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> bool:
-        del key
+        del key, should_cancel
         if before_swap is not None:
             before_swap()
         self.calls.append((tuple(pins), target))
@@ -970,3 +978,275 @@ class TestCheckFailures:
             assert section.busy is False
         finally:
             section.deleteLater()
+
+
+# --- PR #265 の Codex の指摘（2 回目） ---
+
+
+class TestHeldWhileTheSetupInstalls:
+    """導入の欄の〔環境を更新〕の間に送った指示は、入れ終えてから会話へ渡す
+
+    渡すと、数分かかる pip の間に新しい会話が同じ導入先から SDK と claude.exe を読み始め、
+    使用中の exe を置き換えられずに pip が失敗するか、書き換えている途中の部品を import する
+    """
+
+    def test_a_prompt_waits_for_the_setup_and_then_goes(
+        self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.ui import setup as setup_module
+
+        widget = unavailable
+        release = threading.Event()
+
+        def install(**_kwargs: Any) -> int:
+            release.wait(5.0)
+            return 0
+
+        monkeypatch.setattr(setup_module, "install_runtime", install)
+        widget._setup.start(upgrade=True)
+        assert widget._setup.busy is True
+        # 入力欄は閉じない 送った指示は持っておき、何を待っているかを状態の行で言う
+        assert widget._input.isEnabled() is True
+        _send(widget, "切って")
+        widget._poll()
+        assert all(not session.prompts for session in _Session.made)
+        assert widget._status_text.text() == "AI の部品を更新しています…・待ち 1 件"
+
+        release.set()
+        done = widget._setup._done
+        assert done is not None and done.wait(5.0) is True
+        widget._setup._poll()
+        assert _Session.made[-1].prompts == ["切って"]
+        assert widget._status_text.text().startswith("接続しています…")
+
+    def test_the_held_prompts_are_dropped_when_the_setup_breaks_it(
+        self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 入れ直しに失敗して使えなくなったら、送れなかったと言って終える 持ったままだと
+        # 状態の行が待ちのまま残る
+        widget = unavailable
+        monkeypatch.setattr(SetupSection, "busy", property(lambda _self: True))
+        _send(widget, "切って")
+        assert all(not session.prompts for session in _Session.made)
+        monkeypatch.setattr(SetupSection, "busy", property(lambda _self: False))
+        broken = PackStatus(pack=AI_PACK, packages=(PackageStatus(SDK, None),))
+        monkeypatch.setattr(SetupSection, "status", property(lambda _self: broken))
+        widget._on_setup_finished(False)
+        assert all(not session.prompts for session in _Session.made)
+        assert "待っていた指示は送りませんでした" in _text(widget)
+        assert not widget._queued
+        assert widget._status_text.text() == "待機中"
+
+
+class _Crash(BaseException):
+    """プロセスが落ちた代わり ``except OSError`` でも ``except Exception`` でも拾われない"""
+
+
+def _state(target: Path) -> tuple[list[str], str]:
+    """導入先の中身（直下の名前）と SDK の中身"""
+    names = sorted(entry.name for entry in target.iterdir() if entry.name != ABI_MARKER)
+    return names, _sdk_marker(target) if (target / "claude_agent_sdk").is_dir() else ""
+
+
+class TestShutdownWhileInstalling:
+    """入れている最中に閉じても、入れ替えの途中でプロセスを終わらせない"""
+
+    def test_closing_cancels_and_waits_for_the_install(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        del qt_application
+        updater, _, _ = _updater(tmp_path)
+        started = threading.Event()
+        finished = threading.Event()
+
+        def installer(
+            pins: tuple[str, ...],
+            *,
+            target: Path,
+            key: str,
+            before_swap: Callable[[], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> bool:
+            del pins, target, key, before_swap
+            assert should_cancel is not None
+            started.set()
+            # pip の代わり 中断を頼まれるまで走り続け、頼まれたら片付けてから戻る
+            while not should_cancel():
+                time.sleep(0.01)
+            time.sleep(0.2)
+            finished.set()
+            return False
+
+        updater._installer = installer
+        updater.prepare = lambda: lambda: None
+        updater._check(asked=False)
+        _settle(updater)
+        updater.tick(idle=True)
+        assert started.wait(5.0) is True
+        assert updater.stop(wait=5.0) is True
+        # 待たずに戻ると、daemon のスレッドは入れ替えの途中でもプロセスと一緒に消える
+        assert finished.is_set() is True
+
+    def test_stopping_with_nothing_running_does_not_wait(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        del qt_application
+        updater, _, _ = _updater(tmp_path)
+        started = time.monotonic()
+        assert updater.stop() is True
+        assert time.monotonic() - started < 1.0
+
+    def test_no_swap_starts_after_closing(self, runtime: Path) -> None:
+        # 会話が畳み終わるのを待つ間に閉じられたら入れ替えを始めない 始めると、終了の待ちが
+        # 切れた所で入れ替えの途中のままプロセスが終わることがある
+        closing = threading.Event()
+        ok = install_staged(
+            (f"{SDK}==0.2.164",),
+            target=runtime,
+            key="ai",
+            run_pip=_fake_pip(),
+            before_swap=closing.set,
+            should_cancel=closing.is_set,
+        )
+        assert ok is False
+        assert "old sdk" in _sdk_marker(runtime)
+        assert not (runtime.parent / "runtime-swap.json").exists()
+
+
+def _crash_on(call: int) -> Callable[[Path, Path], Path]:
+    """``call`` 回目の Path.replace でプロセスが落ちたことにする"""
+    original = Path.replace
+    seen = 0
+
+    def crashing(self: Path, destination: Path) -> Path:
+        nonlocal seen
+        seen += 1
+        if seen == call:
+            raise _Crash
+        return original(self, destination)
+
+    return crashing
+
+
+class TestRecoveryOnTheNextStart:
+    """入れ替えの途中で落ちても、次の起動で使える導入先へ戻す"""
+
+    @staticmethod
+    def _replace_calls(runtime: Path, staging: Path) -> int:
+        """落ちずに入れ替えたときの Path.replace の回数（記録を書く所も数える）"""
+        probe = runtime.parent / "probe"
+        shutil.copytree(runtime, probe / "runtime")
+        shutil.copytree(staging, probe / "staging")
+        original = Path.replace
+        count = 0
+
+        def counting(self: Path, target: Path) -> Path:
+            nonlocal count
+            count += 1
+            return original(self, target)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "replace", counting)
+            assert swap_in(probe / "staging", probe / "runtime") is True
+        return count
+
+    def test_a_crash_at_any_moment_is_put_back(self, runtime: Path) -> None:
+        """どの Path.replace の所で落ちても、次の起動で入れ替える前の中身へ戻る
+
+        直す前は、古い SDK を ``runtime-previous`` へ退けた直後に落ちると、戻す所が走らず、
+        次の起動で SDK が欠けた
+        """
+        staging = runtime.parent / "staging"
+        _fake_pip()(["install", "--target", str(staging)])
+        before = _state(runtime)
+        calls = self._replace_calls(runtime, staging)
+        assert calls >= 4  # 記録・SDK を退ける・置く・dist-info を置く
+
+        for crash_at in range(1, calls + 1):
+            target = runtime.parent / f"case-{crash_at}" / "runtime"
+            shutil.copytree(runtime, target)
+            source = target.parent / "staging"
+            shutil.copytree(staging, source)
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(Path, "replace", _crash_on(crash_at))
+                with pytest.raises(_Crash):
+                    swap_in(source, target)
+            recover_runtime_swap(target)
+            assert _state(target) == before, crash_at
+            assert not (target.parent / "runtime-swap.json").exists(), crash_at
+            assert not (target.parent / "runtime-previous").exists(), crash_at
+
+    def test_a_crash_while_cleaning_up_keeps_the_new_version(self, runtime: Path) -> None:
+        # 記録を消した後、退けた物を捨てる途中で落ちた 入れ替えは済んでいるので戻さない
+        staging = runtime.parent / "staging"
+        _fake_pip()(["install", "--target", str(staging)])
+        assert swap_in(staging, runtime) is True
+        leftover = runtime.parent / "runtime-previous" / "claude_agent_sdk"
+        leftover.mkdir(parents=True)
+        assert recover_runtime_swap(runtime) is False
+        assert "new sdk" in _sdk_marker(runtime)
+        assert not leftover.parent.exists()
+
+    def test_a_later_swap_puts_the_earlier_one_back_first(self, runtime: Path) -> None:
+        # 起動で戻せなかった（ほかの窓が入れ替えていた）記録が残っていても、次の入れ替えが
+        # 先に戻す 重ねると、前に退けた古い物が今回の物で上書きされて戻らない
+        staging = runtime.parent / "staging"
+        _fake_pip()(["install", "--target", str(staging)])
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "replace", _crash_on(3))
+            with pytest.raises(_Crash):
+                swap_in(staging, runtime)
+        assert (runtime.parent / "runtime-swap.json").exists()
+
+        assert not (runtime / "claude_agent_sdk").exists()  # 古い SDK は退けたまま
+
+        # 次の入れ替えも途中で失敗する 先に前の分を戻していないと、戻す先の古い SDK が無い
+        again = runtime.parent / "again"
+        _fake_pip()(["install", "--target", str(again)])
+        original = Path.replace
+
+        def flaky(self: Path, destination: Path) -> Path:
+            if self.name.endswith(".dist-info") and self.parent == again:
+                raise PermissionError("使用中")
+            return original(self, destination)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "replace", flaky)
+            assert swap_in(again, runtime) is False
+        assert "old sdk" in _sdk_marker(runtime)
+        assert not (runtime.parent / "runtime-swap.json").exists()
+        assert not (runtime.parent / "runtime-previous").exists()
+
+    def test_another_window_swapping_is_left_alone(self, runtime: Path) -> None:
+        # 窓を 2 つ起動したとき、片方の入れ替えの最中にもう片方の起動が戻すと入れ替えを壊す
+        from sashimono.core.io.locks import try_hold
+
+        journal = runtime.parent / "runtime-swap.json"
+        journal.write_text(json.dumps({"replaced": [], "added": ["pydantic"]}), encoding="utf-8")
+        lock = try_hold(runtime.parent / "runtime-swap.lock")
+        assert lock is not None
+        try:
+            assert recover_runtime_swap(runtime) is False
+            assert (runtime / "pydantic").is_dir()
+            assert journal.exists()
+        finally:
+            lock.release()
+
+    def test_a_broken_journal_touches_nothing_outside(self, runtime: Path) -> None:
+        # 壊れた記録の ``..`` を通すと、導入先の外の物を消してしまう
+        outside = runtime.parent / "keep-me"
+        outside.mkdir()
+        journal = runtime.parent / "runtime-swap.json"
+        journal.write_text(json.dumps({"replaced": [], "added": ["../keep-me"]}), encoding="utf-8")
+        assert recover_runtime_swap(runtime) is False
+        assert outside.is_dir()
+        assert not journal.exists()
+        assert "old sdk" in _sdk_marker(runtime)
+
+    def test_the_development_environment_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono import runtime as runtime_module
+
+        monkeypatch.setattr(runtime_module, "runtime_target_dir", lambda: None)
+        assert recover_runtime_swap() is False

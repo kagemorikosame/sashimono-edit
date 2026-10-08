@@ -481,6 +481,17 @@ class ChatPanel(QWidget):
             # 使える状態になると導入欄ごと隠れるので、再起動の要る・要らないの
             # 案内は会話の欄へ写す 写さないと、読めないまま消える
             self._say("案内", self._setup.note)
+        if self._setup.status.ready:
+            # 入れている間に送って持っておいた指示を、入れ終えた部品の会話へ渡す
+            self._pass_held()
+        elif self._queued:
+            # 入れ直しに失敗して使えなくなった 持っておいた指示は渡せないので、送れなかったと
+            # 言って終える 持ったままだと、状態の行が実行中のまま待ち続ける
+            self._note("AI 連携の環境が使えないため、待っていた指示は送りませんでした")
+            self._finish_turn()
+            self._close_checkpoint()
+            self._queued.clear()
+            self._stop_button.setEnabled(False)
         self._refresh_status()
 
     def _on_parts_toggled(self, opened: bool) -> None:
@@ -511,10 +522,9 @@ class ChatPanel(QWidget):
         self._update_box.setVisible(False)
         self._show_parts(True)
         # 会話は導入の欄が畳む（prepare = _release_session） 畳み終わるのを待つのは裏のスレッド
+        # 入れている間に送った指示は会話へ渡さずに持ち、終わってから渡す（_holding）
+        # 入力欄は閉じない 導入の欄の〔環境を更新〕を直に押したときと同じにする
         self._setup.start(upgrade=True)
-        if self._setup.busy:
-            self._input.setEnabled(False)
-            self._send_button.setEnabled(False)
         self._refresh_status()
 
     def open_login(self) -> None:
@@ -656,9 +666,24 @@ class ChatPanel(QWidget):
         """指示を会話へ渡さずに持っておく間か（部品を入れ替えている・入れ替えを待っている）
 
         入れ替えの最中に会話を始めると、入れ替える途中の Claude Code を起動してしまう
-        持っておいた指示は、入れ替えが終わった所（:meth:`_on_parts_updated`）で順に渡す
+        導入の欄の〔環境を更新〕も同じ 数分かかる pip の間に会話を始めると、同じ導入先から
+        SDK と claude.exe を読み始め、使用中の exe を置き換えられずに pip が失敗するか、
+        書き換えている途中の部品を import する（PR #265 の Codex の指摘）
+        持っておいた指示は、入れ替えが終わった所（:meth:`_on_parts_updated` と
+        :meth:`_on_setup_finished`）で順に渡す（:meth:`_pass_held`）
         """
-        return self._retrying or self._updater.installing
+        return self._retrying or self._updater.installing or self._setup.busy
+
+    def _pass_held(self) -> None:
+        """持っておいた指示を会話へ渡す まだ持っておく間なら何もしない
+
+        自動の入れ替えと導入の欄の終わりはどちらが先に来るか分からない 先に終わった方で
+        渡すと、まだ入れている方の途中で会話を始めてしまう
+        """
+        if self._holding:
+            return
+        for prompt in self._queued:
+            self._dispatch(prompt)
 
     def _dispatch(self, prompt: str) -> None:
         """指示を会話へ渡す 会話がまだ無ければ作る"""
@@ -711,8 +736,7 @@ class ChatPanel(QWidget):
                 self._give_up_turn()
                 self._refresh_status()
                 return
-        for prompt in self._queued:
-            self._dispatch(prompt)
+        self._pass_held()
         self._refresh_status()
 
     def _show_outdated(self, found: OutdatedClaudeCode) -> None:
@@ -919,8 +943,7 @@ class ChatPanel(QWidget):
             return
         self._open_checkpoint(self._queued[0])
         self._begin_turn()
-        for prompt in self._queued:
-            self._dispatch(prompt)
+        self._pass_held()
 
     def _alert_done(self) -> None:
         """送った指示がすべて終わった 頼まれていれば、別の窓を触っている人に知らせる"""

@@ -53,6 +53,8 @@ __all__ = [
     "PackageStatus",
     "activate_runtime",
     "app_dir",
+    "finish_swap",
+    "hold_swap_lock",
     "install_arguments",
     "install_command",
     "install_result_text",
@@ -63,9 +65,12 @@ __all__ = [
     "pip_arguments",
     "pip_left_running",
     "python_abi",
+    "recover_runtime_swap",
+    "recover_swap_locked",
     "refresh_runtime",
     "remove_stale_metadata",
     "restart_note",
+    "roll_back_swap",
     "run_pip",
     "run_pip_here",
     "run_pip_in_worker",
@@ -73,6 +78,9 @@ __all__ = [
     "runtime_target_dir",
     "snapshot_runtime_modules",
     "stale_runtime",
+    "swap_backup",
+    "swap_journal",
+    "write_swap_journal",
     "writing_runtime",
 ]
 
@@ -1105,6 +1113,165 @@ def writing_runtime(
         yield True
     finally:
         _RUNTIME_WRITE.release()
+
+
+# --- 導入先の中身の入れ替え（AI の部品の自動の更新）の途中の記録 ---
+#
+# 入れ替えは「今の物を ``runtime-previous`` へ退ける → 新しい物を置く」を部品ごとに繰り返す
+# 途中で落ちる（電源が切れた・終了の待ちが切れた）と、退けた古い物が戻らず、次の起動で SDK が
+# 欠ける 動かし始める前に、何を入れ替えて何を足すかを導入先の外へ書き、終えてから消す
+# 起動のときに記録が残っていれば、記録のとおりに元へ戻す（:func:`recover_runtime_swap`）
+# 退けた物と記録はどちらも導入先の外に置く 導入先の中に置くと import の道に載る
+
+
+def swap_journal(target: Path) -> Path:
+    """入れ替えの途中の記録（導入先の隣）"""
+    return target.parent / f"{target.name}-swap.json"
+
+
+def swap_backup(target: Path) -> Path:
+    """入れ替えで退けた古い物の置き場（導入先の隣）"""
+    return target.parent / f"{target.name}-previous"
+
+
+def hold_swap_lock(target: Path) -> Callable[[], None] | None:
+    """入れ替えと起動の戻しを、プロセスをまたいで 1 つずつにする錠 取れなければ ``None``
+
+    戻り値は錠を放す物 :data:`_RUNTIME_WRITE` は同じプロセスの中しか並べない 窓を 2 つ
+    起動したとき、片方の入れ替えの最中にもう片方の起動が記録を見て戻すと、入れ替えを壊す
+    """
+    # 錠の仕組みはコア層の物を使う 読むのはここだけなので、起動の頭で読む物を増やさない
+    from sashimono.core.io.locks import try_hold
+
+    try:
+        held = try_hold(target.parent / f"{target.name}-swap.lock")
+    except OSError:
+        return None
+    return None if held is None else held.release
+
+
+def write_swap_journal(target: Path, replaced: Sequence[str], added: Sequence[str]) -> None:
+    """これから入れ替える物（``replaced`` 今ある物）と足す物（``added``）を書く
+
+    書いて読み戻せなければ OSError 記録の無いまま動かすと、途中で落ちたときに戻せない
+    """
+    journal = swap_journal(target)
+    data = {"replaced": list(replaced), "added": list(added)}
+    writing = journal.with_name(journal.name + ".writing")
+    writing.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    writing.replace(journal)
+    if json.loads(journal.read_text(encoding="utf-8")) != data:
+        raise OSError("入れ替えの記録を書けない")
+
+
+def finish_swap(target: Path) -> None:
+    """入れ替え（か戻し）を終えた 記録を先に消し、それから退けた物を捨てる
+
+    逆の順だと、捨てている途中で落ちたときに記録だけが残り、次の起動で退けた物の欠けた
+    記録を見て戻そうとする 記録が無くて退けた物だけが残っていれば、終えた後の片付けの
+    途中と分かる（:func:`recover_runtime_swap` が捨てる）
+    """
+    with contextlib.suppress(OSError):
+        swap_journal(target).unlink(missing_ok=True)
+    shutil.rmtree(swap_backup(target), ignore_errors=True)
+
+
+def roll_back_swap(target: Path, replaced: Sequence[str], added: Sequence[str]) -> bool:
+    """記録のとおりに元へ戻す 全部戻せたか
+
+    何度呼んでも同じ所へ着く（戻している途中で落ちても、次の起動でもう一度呼べばよい）
+
+    - 足した物は、導入先にあれば下げる 足す前には無かった物なので、あるのは置いた新しい物
+    - 入れ替えた物は、退けた古い物が残っていれば、導入先の物（置いた新しい物）を下げて戻す
+      退けた物が無ければ、まだ退けていない（導入先にあるのは古い物）ので触らない
+    """
+    complete = True
+    backup = swap_backup(target)
+    for name in added:
+        placed = target / name
+        _remove_entry(placed)
+        if os.path.lexists(placed):
+            complete = False
+    for name in replaced:
+        kept = backup / name
+        if not os.path.lexists(kept):
+            continue
+        original = target / name
+        _remove_entry(original)
+        try:
+            kept.replace(original)
+        except OSError:
+            complete = False
+    return complete
+
+
+def recover_runtime_swap(target: Path | None = None) -> bool:
+    """前の起動の入れ替えが途中で終わっていたら元へ戻す 戻したら真
+
+    起動の頭（:func:`activate_runtime` より前）で呼ぶ 戻さずに道へ足すと、古い部品の欠けた
+    導入先から SDK を読もうとして AI 連携が動かない ``target`` を省けば配布版の導入先
+    （開発の環境では何もしない）
+    """
+    if target is None:
+        target = runtime_target_dir()
+    if target is None:
+        return False
+    release = hold_swap_lock(target)
+    if release is None:
+        # ほかの窓が入れ替えている その窓が終えるか、落ちていれば次の起動で戻す
+        return False
+    try:
+        return recover_swap_locked(target)
+    finally:
+        release()
+
+
+def recover_swap_locked(target: Path) -> bool:
+    """:func:`recover_runtime_swap` の中身 :func:`hold_swap_lock` を持って呼ぶ"""
+    journal = swap_journal(target)
+    if not journal.exists():
+        # 終えた後の片付け（退けた物を捨てる所）の途中で落ちた 入れ替えは済んでいる
+        shutil.rmtree(swap_backup(target), ignore_errors=True)
+        return False
+    try:
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        replaced = _entry_names(data["replaced"])
+        added = _entry_names(data["added"])
+    except (OSError, ValueError, KeyError, TypeError):
+        # 読めない記録 動かし始めるのは記録を読み戻せてからなので、何も動かしていない
+        finish_swap(target)
+        return False
+    if not roll_back_swap(target, replaced, added):
+        # 戻せない物（使用中など）が残った 記録と退けた物は残し、次の起動でもう一度戻す
+        return False
+    finish_swap(target)
+    return True
+
+
+def _entry_names(value: object) -> list[str]:
+    """記録の名前の並び 導入先の直下の名前だけを受ける
+
+    壊れた記録の ``..`` や区切りを含む名前を通すと、導入先の外の物を消してしまう
+    """
+    if not isinstance(value, list):
+        raise TypeError("名前の並びではない")
+    names: list[str] = []
+    for name in value:
+        if not isinstance(name, str) or name in ("", ".", "..") or Path(name).name != name:
+            raise ValueError(f"導入先の直下の名前ではない: {name!r}")
+        if "/" in name or "\\" in name:
+            raise ValueError(f"導入先の直下の名前ではない: {name!r}")
+        names.append(name)
+    return names
+
+
+def _remove_entry(path: Path) -> None:
+    """ファイルかフォルダを下げる 無ければ何もしない 下げられなくても止めない（呼ぶ側が確かめる）"""
+    with contextlib.suppress(OSError):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif os.path.lexists(path):
+            path.unlink()
 
 
 def _install_runtime_locked(
