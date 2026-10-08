@@ -15,8 +15,9 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -80,19 +81,113 @@ class StuckPip:
     release: threading.Event
 
 
-def _wait_until_the_pip_is_back() -> None:
-    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ"""
-    assert runtime_module._PIP_HERE.acquire(timeout=10.0), "止まった pip が錠を返さない"
-    runtime_module._PIP_HERE.release()
-    for _ in range(1000):
-        if not runtime_module.pip_left_running():
-            return
+#: 試験の後で、残った pip が戻るのを待つ秒数 試験の中身の待ちではなく後始末の待ちなので
+#: 長めに取る 待ちきれずに次の試験へ進むと、残った pip が次の試験の差し替えの上で走る
+_CLEANUP_SECONDS = 120.0
+
+
+#: 後始末で、待つだけで終わらないスレッドへ中断を投げ込むまでの秒数
+_CLEANUP_PATIENCE_SECONDS = 2.0
+
+
+def _running_pip(thread_id: int) -> bool:
+    """そのスレッドが今 ``run_pip_here`` の中にいるか（錠を待っている所も含む）
+
+    中断を投げるのは pip を走らせている作業スレッドだけにする 中断の見張り
+    （``sashimono-pip-cancel`` の ``_CancelGuard.watch``）はこの例外を受けないので、投げると
+    未処理のスレッド例外の警告が出る（PR #267 のレビュー） 名前ではなく、いま積まれている
+    呼び出しで見分ける 試験が起こした名前の無いスレッドも、pip に入っていれば拾える
+    """
+    frame = sys._current_frames().get(thread_id)
+    target = runtime_module.run_pip_here.__code__
+    while frame is not None:
+        if frame.f_code is target:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _wait_until_the_pip_is_back(
+    started: Collection[threading.Thread] = (), seconds: float = _CLEANUP_SECONDS
+) -> None:
+    """残った pip が錠と標準出力を返し、作業スレッドが終わるまで待つ
+
+    ``started`` は試験の中で起こしたスレッド 名前で選ばずに全部待つ 試験が自分で起こした
+    名前の無いスレッドが ``run_pip_here`` を呼び、錠を取る前に試験が落ちると、名前でも錠でも
+    見えないまま後始末を抜け、偽の pip と ``PIP_NO_INDEX`` が戻った後で本物の pip を
+    走らせうる（PR #267 のレビュー） 少し待っても終わらなければ、pip を走らせている
+    スレッドだけに中断を投げ込んでから待つ（:func:`_running_pip`） 中断の見張りなど
+    ほかのスレッドは、投げずに終わるのを待つ
+    """
+    deadline = time.monotonic() + seconds
+    patience = time.monotonic() + _CLEANUP_PATIENCE_SECONDS
+    asked = False
+    while True:
+        workers = [
+            thread
+            for thread in (*started, *threading.enumerate())
+            if thread.is_alive() and (thread in started or thread.name == "sashimono-pip")
+        ]
+        if not workers and not runtime_module.pip_left_running():
+            break
+        if not asked and time.monotonic() > patience:
+            # 中断の要求を出してから待つ 導入ボタンの中断と同じ例外なので、pip の中なら
+            # 片付けて返り、錠を待っている所なら錠を取らずに抜ける
+            asked = True
+            for thread in workers:
+                if thread.ident is not None and _running_pip(thread.ident):
+                    runtime_module._throw_into(thread.ident, runtime_module._PipCancelled)
+        if time.monotonic() > deadline:
+            raise AssertionError(f"残ったスレッドが終わらない: {[t.name for t in workers]}")
         threading.Event().wait(0.01)
-    raise AssertionError("残った pip の作業スレッドが終わらない")
+    assert runtime_module._PIP_HERE.acquire(timeout=max(0.0, deadline - time.monotonic())), (
+        "止まった pip が錠を返さない"
+    )
+    runtime_module._PIP_HERE.release()
+
+
+@pytest.fixture(autouse=True)
+def no_pip_left_behind(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """試験どうしで pip の作業スレッドと錠を持ち越させない 本物の PyPI へもつながせない
+
+    混んだ CI で、戻らない pip の試験が待ちきれずに落ちると、残った作業スレッドが次の試験の
+    錠の待ちに割り込み、走り終えて pip を ``sys.modules`` から捨てた（Issue #264）
+    次の試験が差し替えた偽の pip は捨てた方の部品に付いていたので、次の試験は本物の pip で
+    PyPI から ``pkg`` を開発の環境へ入れてしまった ``monkeypatch`` を頼むので、差し替えを
+    戻す前に（偽の pip のまま）残った pip が戻るのを待てる ``PIP_NO_INDEX`` は、それでも
+    本物の pip が走ったときに外へ取りに行かせない守り
+    """
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    before = set(threading.enumerate())
+    yield
+    _wait_until_the_pip_is_back([t for t in threading.enumerate() if t not in before])
+
+
+#: 同じプロセスで走らせる道が、偽の pip（``pip._internal.cli.main.main``）に入る前に読む部品
+#: ``_no_rustc_probe`` の session と、``run_pip`` の distlib
+_PIP_PARTS = (
+    "pip._internal.cli.main",
+    "pip._internal.network.session",
+    "pip._vendor.distlib",
+    "pip._vendor.distlib.resources",
+)
 
 
 @pytest.fixture
-def stuck_pip(monkeypatch: pytest.MonkeyPatch) -> Iterator[StuckPip]:
+def pip_loaded() -> None:
+    """偽の pip に入る前に読む pip の部品を、試験が待ち始める前に読んでおく
+
+    同じプロセスで走らせる道は、走り終えるたびに pip を ``sys.modules`` から捨てる
+    （``runtime._forget_pip``） 読んでおかないと、作業スレッドは偽の pip に入る前に
+    session（urllib3・rich など）を読み直し、混んだ CI ではそれだけで待ちの 10 秒を超えて
+    落ちた（Issue #264） 待つのを偽の pip に入るまでだけにする
+    """
+    for name in _PIP_PARTS:
+        importlib.import_module(name)
+
+
+@pytest.fixture
+def stuck_pip(monkeypatch: pytest.MonkeyPatch, pip_loaded: None) -> Iterator[StuckPip]:
     """呼ぶと戻らない pip 同期の読み書きの中で止まった pip の代わり
 
     錠の待ちの中で止まるので、投げ込んだ中断の例外も届かない 試験の後で放して、
@@ -232,6 +327,7 @@ class TestPipInsideThePackage:
         assert resources._finder_registry.get(FrozenLoader) is resources.ResourceFinder
 
 
+@pytest.mark.usefixtures("pip_loaded")
 class TestPipRunsInsideTheApp:
     """配布版の導入は、exe が自分自身を子として起こさず、このプロセスの中で pip を走らせる
 
