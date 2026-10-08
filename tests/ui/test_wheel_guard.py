@@ -30,7 +30,7 @@ def panel(qt_application: QApplication) -> Iterator[InspectorPanel]:
     created.resize(420, 260)
     created.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
     project = Project.create()
-    for command in insert_generated(project, TEXT.create(font_style="")):
+    for command in insert_generated(project, TEXT.create(align="center")):
         project = command.apply(project)
     clip: Clip = next(c for t in project.timeline.tracks for c in t.clips)
     created.set_project(project)
@@ -61,8 +61,12 @@ def _wheel(widget: QWidget, steps: int = -1) -> None:
     )
 
 
-def _style_box(panel: InspectorPanel) -> QComboBox:
-    box = panel._editors[("source", "font_style")].findChild(QComboBox)
+def _choice_box(panel: InspectorPanel) -> QComboBox:
+    """行揃えの選択の欄 選択肢（左・中央・右）が書体に頼らないので、どの機械でも試せる
+
+    スタイルの欄で試すと、そのフォントのスタイルが入っていない機械では次の選択肢が無い
+    """
+    box = panel._editors[("source", "align")].findChild(QComboBox)
     assert box is not None
     return box
 
@@ -75,14 +79,14 @@ def _size_slider(panel: InspectorPanel) -> QSlider:
 
 class TestUnfocusedFields:
     def test_a_choice_keeps_its_value_and_the_panel_scrolls(self, panel: InspectorPanel) -> None:
-        # 壊れると、送る途中で通ったスタイルの欄が「既定」から別のスタイルへ変わる
-        box = _style_box(panel)
+        # 壊れると、送る途中で通った行揃えが「中央」から「右」へ変わる（スタイルの欄なども同じ）
+        box = _choice_box(panel)
         assert not box.hasFocus() and box.count() > 1
         bar = panel._scroll.verticalScrollBar()
         assert bar.maximum() > 0, "パネルが送れる高さになっていない"
         before = bar.value()
         _wheel(box)
-        assert box.currentIndex() == 0
+        assert box.currentData() == "center"
         assert bar.value() > before
 
     def test_a_slider_keeps_its_value(self, panel: InspectorPanel) -> None:
@@ -93,14 +97,14 @@ class TestUnfocusedFields:
 
     def test_wheel_does_not_take_the_focus(self, panel: InspectorPanel) -> None:
         # ホイールで焦点を取ると、次の 1 刻みから値が変わる 焦点はクリックと Tab で取る
-        assert _style_box(panel).focusPolicy() == Qt.FocusPolicy.StrongFocus
+        assert _choice_box(panel).focusPolicy() == Qt.FocusPolicy.StrongFocus
 
     def test_the_setting_lets_the_wheel_change_values(self, panel: InspectorPanel) -> None:
         # 焦点の無い欄でも回して変えたい人のための設定 入れたら今までの動きに戻る
         panel.set_wheel_unfocused(True)
-        box = _style_box(panel)
+        box = _choice_box(panel)
         _wheel(box)
-        assert box.currentIndex() == 1
+        assert box.currentData() == "right"
         slider = _size_slider(panel)
         before = slider.value()
         _wheel(slider, steps=1)
@@ -113,11 +117,11 @@ class TestUnfocusedFields:
 
 class TestFocusedFields:
     def test_a_focused_choice_still_follows_the_wheel(self, panel: InspectorPanel) -> None:
-        box = _style_box(panel)
+        box = _choice_box(panel)
         panel.activateWindow()
         box.setFocus(Qt.FocusReason.MouseFocusReason)
         QApplication.processEvents()
         if not box.hasFocus():
             pytest.skip("窓が前に出られず、欄に焦点を置けない（CI の実行機など）")
         _wheel(box)
-        assert box.currentIndex() == 1
+        assert box.currentData() == "right"
