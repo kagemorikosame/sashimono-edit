@@ -64,7 +64,7 @@ from sashimono.engine.motion_shapes import (
 )
 from sashimono.engine.text_wrap import graphemes, wrap_lines
 
-__all__ = ["Frame", "render_source", "render_source_framed", "waveform_points"]
+__all__ = ["Frame", "drawn_bold_italic", "render_source", "render_source_framed", "waveform_points"]
 
 #: 縦の基準ごとに、指定した位置より上へ出す割合 ``下`` なら全部が上に出る
 _VERTICAL_SHARE = {"top": 0.0, "middle": 0.5, "bottom": 1.0}
@@ -658,6 +658,28 @@ def _text_font(values: Mapping[str, object], size: int) -> QFont:
     font.setBold(bool(values.get("bold", False)))
     font.setItalic(bool(values.get("italic", False)))
     return font
+
+
+def drawn_bold_italic(values: Mapping[str, object], bold: bool, italic: bool) -> tuple[bool, bool]:
+    """描く字が太字か・斜体か ``bold`` ``italic`` は太字と斜体の欄の値
+
+    埋め込み Lua の ``obj.getfont`` へ渡す値に使う 描く所（:func:`_text_font`）と同じ
+    フォントから求めるので、描いた字と食い違わない
+    - スタイルを選んでいなければ、欄の値のまま（前の版と同じ値を渡す）
+    - AviUtl2 の組み方の横書きはスタイルを読まないので、欄の値のまま
+    - スタイルを選んでいれば、欄（灰色で効かない古い値）ではなく、実際に選ばれた書体の
+      太さと傾きを渡す AviUtl2 の太字と斜体は「この字は太いか・傾いているか」の印で、
+      Bold のスタイルで描いた字を太字でないと返すと、それを読んで飾りを足すスクリプトが
+      描いた字と違う前提で動く スタイルがそのファミリに無ければ既定の字で描くので、
+      その字の太さと傾きになる
+    """
+    style = str(values.get("font_style", "") or "")
+    aviutl = values.get("layout") == "aviutl" and not bool(values.get("vertical", False))
+    if not style or aviutl:
+        return bold, italic
+    # 太さと傾きは大きさで変わらない 大きさは時間で動く値のこともあるので、決めて渡す
+    info = QFontInfo(_text_font(values, 64))
+    return info.bold(), info.italic()
 
 
 #: AviUtl2 の既定の書体 書体名が見つからないときもこれで描く

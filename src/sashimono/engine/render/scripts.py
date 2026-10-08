@@ -25,7 +25,7 @@ from sashimono.compat.aviutl.runtime import LuaScriptRuntime, blank_image
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND
 from sashimono.core.model import AnimatedValue, Clip, Effect, GeneratedSource, ParamValue
 from sashimono.effects.definition import registry
-from sashimono.engine.sources import render_source
+from sashimono.engine.sources import drawn_bold_italic, render_source
 
 __all__ = [
     "ScriptStage",
@@ -289,11 +289,14 @@ def text_font(params: Mapping[str, ParamValue], frame: int) -> dict[str, Any]:
 
     color = params.get("color")
     name = params.get("font")
+    # 太字と斜体は描く字に合わせる スタイルを選んでいると欄の値は灰色で効かず、そのまま
+    # 渡すと展開した結果だけが古い値で変わる（:func:`drawn_bold_italic`）
+    bold, italic = drawn_bold_italic(params, bool(number("bold")), bool(number("italic")))
     return {
         "name": str(name) if isinstance(name, str) else "",
         "size": number("size", 48.0),
-        "bold": bool(number("bold")),
-        "italic": bool(number("italic")),
+        "bold": bold,
+        "italic": italic,
         "color": color,
         "given": (
             str(name) if isinstance(name, str) else "",
@@ -303,8 +306,8 @@ def text_font(params: Mapping[str, ParamValue], frame: int) -> dict[str, Any]:
             0,
             _number_color(color),
             0x000000,
-            bool(number("bold")),
-            bool(number("italic")),
+            bold,
+            italic,
             number("letter_spacing"),
             number("line_spacing"),
         ),

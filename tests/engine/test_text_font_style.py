@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono.core.model import GeneratedSource
 from sashimono.effects.sources import TEXT
+from sashimono.engine.render.scripts import text_font
 from sashimono.engine.sources import render_source
 
 WIDTH, HEIGHT = 480, 200
@@ -98,6 +99,39 @@ class TestOldLookIsKept:
     def test_the_aviutl_layout_ignores_the_style(self) -> None:
         # AviUtl2 の組み方はファミリ名と太字・斜体だけで字を選ぶ（設定パネルも欄を灰色にする）
         assert np.array_equal(_image(layout="aviutl", font_style=LIGHT), _image(layout="aviutl"))
+
+
+class TestEmbeddedLuaSeesTheDrawnFont:
+    """埋め込み Lua の ``obj.getfont`` へ渡す太字と斜体を、描いた字に合わせる
+
+    スタイルを選んでいると太字と斜体の欄は灰色で効かない その古い値を渡すと、
+    描いた字は変わらないのに展開した結果だけが変わる
+    """
+
+    @staticmethod
+    def _font(**params: object) -> tuple[bool, bool, bool, bool]:
+        font = text_font(TEXT.create(font=FAMILY, **params).params, 0)  # type: ignore[arg-type]
+        given = font["given"]
+        return font["bold"], font["italic"], given[5], given[6]
+
+    def test_greyed_bold_and_italic_are_not_passed(self) -> None:
+        assert self._font(font_style=LIGHT, bold=True, italic=True) == (False,) * 4
+
+    def test_a_bold_style_is_passed_as_bold(self) -> None:
+        assert self._font(font_style=BOLD) == (True, False, True, False)
+
+    def test_without_a_style_the_checks_are_passed_as_before(self) -> None:
+        assert self._font(bold=True, italic=True) == (True,) * 4
+        assert self._font() == (False,) * 4
+
+    def test_the_aviutl_layout_passes_the_checks(self) -> None:
+        # AviUtl2 の組み方の横書きはスタイルを読まず、欄の太字と斜体で描く
+        assert self._font(layout="aviutl", font_style=LIGHT, bold=True) == (
+            True,
+            False,
+            True,
+            False,
+        )
 
 
 class TestRealFamilyWithNumberedStyles:
