@@ -269,6 +269,40 @@ def test_the_minimum_height_leaves_room_for_taller_fonts(window: MainWindow) -> 
     assert window.minimumSizeHint().height() <= SCREENS["1280x720"].height() - FONT_HEADROOM
 
 
+@pytest.fixture
+def ai_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AI の部品が入っていないことにする CI の機械と同じ 窓を作る前に当てる
+
+    入っていない間は AI パネルの導入の欄が開いたままで、窓の最小の高さに足される
+    手元の開発の環境は入っているので、当てないと CI でしか落ちない
+    """
+    from sashimono.ai import AI_PACK
+    from sashimono.ai.environment import REQUIRED_PACKAGES
+    from sashimono.runtime import PackageStatus, PackStatus
+    from sashimono.ui.setup import SetupSection
+
+    status = PackStatus(pack=AI_PACK, packages=(PackageStatus(REQUIRED_PACKAGES[0], None),))
+    monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+
+
+def test_the_minimum_height_leaves_room_without_the_ai_parts(
+    ai_missing: None, window: MainWindow
+) -> None:
+    """AI の部品が入っていなくても、窓の最小の高さが書体の余白を残す
+
+    導入の欄を枠と見出しで囲んだとき（#250）に、説明の行とボタンの全部が最小の高さへ
+    足され、CI（部品の無い機械）で 556 画素になった 欄は巻物に入れて縮むようにした
+    """
+    del ai_missing
+    assert window.minimumSizeHint().height() <= SCREENS["1280x720"].height() - FONT_HEADROOM
+    narrowest = QSize(window.minimumSizeHint().width(), SCREENS["1280x720"].height())
+    window.resize(narrowest)
+    _dock(window, "chat").raise_()
+    _settle()
+    assert _regions_overlap(window) == []
+    _check_panels(window)
+
+
 @pytest.mark.parametrize("name", ["subtitles", "chat", "media", "inspector"])
 def test_every_panel_works_at_the_narrowest_window(window: MainWindow, name: str) -> None:
     """窓をいちばん狭くしても、どのパネルを前に出しても部品が重ならず欠けない

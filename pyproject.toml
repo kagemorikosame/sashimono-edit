@@ -35,7 +35,9 @@ asr = [
 ai = [
     # AI 連携 既定では入れない Claude Code 本体は SDK に同梱されている
     # （0.2.152 で確かめた） 動かすには Claude へのログインか API キーが要る
-    "claude-agent-sdk>=0.2.152",
+    # 下限は src/sashimono/ai/environment.py の REQUIRED_PACKAGES と揃える
+    # 0.2.158 は Claude Opus 5.5 が求める Claude Code 2.1.280 を同梱する最初の版
+    "claude-agent-sdk>=0.2.158,<0.3",
 ]
 dev = [
     "pytest>=8.0",

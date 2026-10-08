@@ -301,6 +301,13 @@ class Metrics:
     #: 数値欄の増減ボタンの幅 ボタンの置き場をスタイルシートで決め打ちにするのに使う
     SPIN_BUTTON_WIDTH = 16
 
+    #: 入力欄（数値欄・一覧の選び・文字の欄）の縁の太さと、縁の内側の余白（左右と上下）
+    #: 数値欄の文字の欄の左端を直すのにも使う（:mod:`sashimono.ui.spin_fields`）
+    #: スタイルシートと別に書くと、片方だけ変えたときに文字の欄が縁に掛かる
+    FIELD_BORDER = 1
+    FIELD_PADDING_X = 6
+    FIELD_PADDING_Y = 3
+
 
 def _url(name: str) -> str:
     """同梱素材をスタイルシートの ``url()`` へ書ける形にする
@@ -513,9 +520,9 @@ QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
 QComboBox, QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit {{
     background-color: {Colors.PANEL_ALT.name()};
-    border: 1px solid {Colors.BORDER.name()};
+    border: {Metrics.FIELD_BORDER}px solid {Colors.BORDER.name()};
     border-radius: 3px;
-    padding: 3px 6px;
+    padding: {Metrics.FIELD_PADDING_Y}px {Metrics.FIELD_PADDING_X}px;
 }}
 QComboBox QAbstractItemView {{
     background-color: {Colors.PANEL_ALT.name()};
@@ -609,6 +616,11 @@ def apply_theme(application: QApplication, mode: str) -> str:
         _following = True
     theme = resolve_theme(_mode)
     _activate(application, theme)
+    # 数値欄の文字の欄を、スタイルシートの縁と余白の内側へ置き直す見張り Qt 6.12 の
+    # スタイルシートの見た目が縁を見ずに置くため 読み込みはここで（あちらが Metrics を読む）
+    from sashimono.ui.spin_fields import install_spin_field_fit
+
+    install_spin_field_fit(application)
     return theme
 
 

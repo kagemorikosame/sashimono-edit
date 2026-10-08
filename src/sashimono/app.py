@@ -20,7 +20,7 @@ from pathlib import Path
 # この 2 つは Qt を読まない（読まないことを試験で押さえている）
 from sashimono.asr import activate_runtime
 from sashimono.core.userdirs import migrate_legacy_folders
-from sashimono.runtime import pip_arguments, run_pip
+from sashimono.runtime import pip_arguments, recover_runtime_swap, run_pip
 
 __all__ = ["ADD_ON_CHECK_FLAG", "IMPORT_CHECK_FLAG", "SELF_CHECK_FLAG", "main"]
 
@@ -173,6 +173,9 @@ def _start_editor(arguments: list[str]) -> int:
     if apply_on_start(arguments):
         return 0
 
+    # 前の起動が AI の部品の入れ替えの途中で終わっていたら、道へ足す前に元へ戻す
+    # 戻さずに足すと、古い部品を退けたままの導入先から SDK を読もうとして AI 連携が動かない
+    recover_runtime_swap()
     # ソフト内から導入した字幕起こしの実行環境を import できるようにする
     # 通常の実行では何もしない（パッケージ版のためだけの手当て）
     activate_runtime()

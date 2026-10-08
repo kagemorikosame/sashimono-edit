@@ -14,7 +14,7 @@ from collections.abc import Iterator
 
 import pytest
 import shiboken6
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -35,7 +35,8 @@ from PySide6.QtWidgets import (
 
 from sashimono.core.model import ProjectSettings
 from sashimono.ui.project_settings_dialog import ProjectSettingsDialog
-from sashimono.ui.theme import Colors, style_sheet
+from sashimono.ui.spin_fields import fitted_edit_field, install_spin_field_fit
+from sashimono.ui.theme import Colors, Metrics, style_sheet
 
 
 def _contrast(first: QColor, second: QColor) -> float:
@@ -204,7 +205,15 @@ class TestSpinButtons:
     試験の中で見た目を差し替えない アプリ全体を切り替えても、部品ごとに当てても、
     差し替えた見た目と部品の壊れる順がずれ、あとのごみ集めで消えた見た目を触って
     CI がプロセスごと落ちた（access violation）
+
+    文字の欄の置き直し（:mod:`sashimono.ui.spin_fields`）は、アプリと同じく入れてから試す
+    アプリではテーマを当てる所（apply_theme）が入れる 入れずに試すと、Qt 6.12 では
+    Qt の置き方そのものを試すことになる
     """
+
+    @pytest.fixture(autouse=True)
+    def _fitted(self, qt_application: QApplication) -> None:
+        install_spin_field_fit(qt_application)
 
     def test_the_up_button_of_the_resolution_steps_up(self) -> None:
         # Windows 11 の見た目では上下のボタンが横に並ぶのに、数字の欄がボタン 1 つぶん
@@ -250,9 +259,55 @@ class TestSpinButtons:
                         QStyle.ComplexControl.CC_SpinBox, option, control, spin
                     )
                     assert not spin.lineEdit().geometry().intersects(button), type(spin).__name__
+                # 数字が縁と余白の内側に描かれる Qt 6.12 は左端を 0 に置き、数字が縁に掛かった
+                left = Metrics.FIELD_BORDER + Metrics.FIELD_PADDING_X
+                assert spin.lineEdit().geometry().left() >= left, type(spin).__name__
                 up, _ = _button_rects(spin)
                 _click_like_a_mouse(spin, up)
                 assert spin.value() == 101, type(spin).__name__
+        finally:
+            _dispose(host)
+
+    def test_a_field_placed_over_the_border_and_buttons_is_put_back(self) -> None:
+        # Qt 6.12 の置き方（左端 0・右端がボタンの左端の列）を、どの版でも同じに作って確かめる
+        # 置き直さないと、数字が縁に掛かり、ボタンの左端の列を押しても数が変わらない
+        host = QWidget()
+        host.setStyleSheet(style_sheet())
+        layout = QVBoxLayout(host)
+        spin = QSpinBox(host)
+        layout.addWidget(spin)
+        host.show()
+        QApplication.processEvents()
+        try:
+            option = QStyleOptionSpinBox()
+            spin.initStyleOption(option)
+            buttons = min(
+                spin.style()
+                .subControlRect(QStyle.ComplexControl.CC_SpinBox, option, control, spin)
+                .left()
+                for control in (QStyle.SubControl.SC_SpinBoxUp, QStyle.SubControl.SC_SpinBoxDown)
+            )
+            field = spin.lineEdit()
+            wrong = QRect(QPoint(0, field.y()), QPoint(buttons, field.geometry().bottom()))
+            field.setGeometry(wrong)
+            placed = field.geometry()
+            assert placed.left() == Metrics.FIELD_BORDER + Metrics.FIELD_PADDING_X
+            assert placed.right() < buttons
+            assert placed.top() == wrong.top() and placed.bottom() == wrong.bottom()
+        finally:
+            _dispose(host)
+
+    def test_a_field_without_the_style_sheet_is_left_alone(self) -> None:
+        # 元の見た目（Windows 11）は自分で正しく置く 縮めると数字の欄が狭くなるだけ
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        spin = QSpinBox(host)
+        layout.addWidget(spin)
+        host.show()
+        QApplication.processEvents()
+        try:
+            placed = spin.lineEdit().geometry()
+            assert fitted_edit_field(spin, placed) == placed
         finally:
             _dispose(host)
 
