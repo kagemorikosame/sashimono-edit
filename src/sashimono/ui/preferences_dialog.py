@@ -53,6 +53,7 @@ from sashimono.ui.workspace import (
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
     SNAP_DISTANCES,
+    SUBTITLE_WRAP_PERCENTS,
     Preferences,
 )
 
@@ -519,6 +520,27 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("exe の隣の scripts に置いた物", self._scripts_move)
 
+        self._subtitle_wrap = QCheckBox("新しい字幕を画面の幅で自動で折り返す", self)
+        self._subtitle_wrap.setChecked(preferences.subtitle_wrap)
+        self._subtitle_wrap.setToolTip(
+            "字幕の〔焼き込み〕で作るテキストに、画面の幅に合わせた折り返しの幅を入れる"
+            " 長い字幕が画面の端で切れず、字の大きさや書体を変えても折り返し直す"
+            " 句読点や閉じ括弧を行の頭に置かず、英単語は途中で切らない"
+            " 既にあるテキストは変えない（テキストの設定の「折り返しの幅」で 1 本ずつ変えられる）"
+            " 字幕の整形で入れた改行はそのまま残し、それでも幅を超える行だけをさらに折り返す"
+        )
+        form.addRow(self._subtitle_wrap)
+        self._subtitle_wrap_percent = QSpinBox(self)
+        self._subtitle_wrap_percent.setRange(*SUBTITLE_WRAP_PERCENTS)
+        self._subtitle_wrap_percent.setSuffix(" %")
+        self._subtitle_wrap_percent.setValue(preferences.subtitle_wrap_percent)
+        self._subtitle_wrap_percent.setToolTip(
+            "画面の幅の何 % で折り返すか 90 で左右に 5% ずつ余白が残り、縁取りや影が端に掛からない"
+        )
+        form.addRow("字幕を折り返す幅", self._subtitle_wrap_percent)
+        self._subtitle_wrap.toggled.connect(self._subtitle_wrap_percent.setEnabled)
+        self._subtitle_wrap_percent.setEnabled(preferences.subtitle_wrap)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -644,4 +666,6 @@ class PreferencesDialog(QDialog):
             update_beta=self._update_beta.isChecked(),
             update_confirm=self._update_confirm.isChecked(),
             scripts_move=str(self._scripts_move.currentData()),
+            subtitle_wrap=self._subtitle_wrap.isChecked(),
+            subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
         )

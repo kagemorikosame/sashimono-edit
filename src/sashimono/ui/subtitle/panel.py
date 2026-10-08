@@ -47,6 +47,7 @@ from sashimono.core.commands import (
     burn_subtitles,
     export_range,
     subtitle_voices,
+    subtitle_wrap_width,
     voice_label,
 )
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
@@ -121,6 +122,9 @@ class SubtitlePanel(QWidget):
         #: 焼き込みのひな形にするクリップを返す（タイムラインで選んでいるテキスト）
         #: 窓が差し込む 差し込まなければひな形は無い（既定の見た目）
         self.template_provider: Callable[[], Clip | None] = lambda: None
+        #: 既定の見た目で焼き込む字幕を折り返す幅（画面の幅の % 0 は折り返さない #249）
+        #: 窓が本人の設定（``Preferences.subtitle_wrap_share``）から入れる 既定は設定の既定と同じ
+        self.wrap_share = 90
         #: 焼き込む話し手を尋ねる 試験で差し替える
         self.ask_burn: Callable[[list[tuple[Voice, str]], str], list[Voice] | None] = self._ask_burn
         #: 起こしている物の最後の進み具合（依頼ごと）
@@ -794,9 +798,12 @@ class SubtitlePanel(QWidget):
             head = text[0][:12] if text else ""
             return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
         # 既定の大きさと位置は作品の高さで縮める 画素のまま置くと、720p では画面の外に出る
-        look = burn_defaults(self._project.settings.height)
+        settings = self._project.settings
+        look = burn_defaults(settings.height, subtitle_wrap_width(settings.width, self.wrap_share))
+        wrap = f"・幅 {self.wrap_share}% で折り返し" if self.wrap_share > 0 else ""
         return TEXT.create(**look), (
-            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}）"
+            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}"
+            f"{wrap}）"
             " タイムラインでテキストを選んでから焼き込むと、そのテキストの見た目を写します"
         )
 

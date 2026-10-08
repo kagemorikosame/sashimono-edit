@@ -108,6 +108,15 @@ class EditorHost(Protocol):
         """
         ...
 
+    @property
+    def subtitle_wrap_share(self) -> int:
+        """既定の見た目で焼き込む字幕を折り返す幅（画面の幅の % 0 は折り返さない #249）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.subtitle_wrap_share`）
+
+        画面の〔焼き込み〕と同じにする 頼み方で字幕が折り返したり切れたりしないように
+        """
+        ...
+
     def analyze(self, media: MediaItem) -> None:
         """波形とサムネイルの用意を予約する"""
         ...
