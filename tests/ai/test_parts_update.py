@@ -91,6 +91,7 @@ class TestOutdatedMessage:
         assert "2.1.259" in message and "2.1.280" in message
 
     def test_without_versions_it_is_still_recognised(self) -> None:
+        # 版の書いていない文面を見落とすと、英語のエラーのまま更新のボタンも出ない
         found = outdated_claude_code("Claude Code does not support this model")
         assert found is not None
         assert "入っている版" not in found.message()
@@ -163,6 +164,7 @@ class TestPackageIndex:
         assert newest_installable(data, "win_amd64") == "0.2.159"
 
     def test_the_range_is_respected(self) -> None:
+        # 取り下げた版や前触れの版を選ぶと、壊れた SDK を黙って入れて会話が始まらない
         from packaging.specifiers import SpecifierSet
 
         within = newest_installable(INDEX, "win_amd64", SpecifierSet(">=0.2.158,<0.3"))
@@ -170,6 +172,7 @@ class TestPackageIndex:
         assert newest_installable(INDEX, "win_amd64") == "0.3.1"
 
     def test_asking_reads_the_json_and_names_the_app(self) -> None:
+        # 尋ね先や読み方を誤ると新しい版が見つからず、新しいモデルを選ぶと断られ続ける
         asked: list[urllib.request.Request] = []
 
         def opener(request: urllib.request.Request) -> IO[bytes]:
@@ -183,6 +186,7 @@ class TestPackageIndex:
         assert "SashimonoEdit/" in str(asked[0].get_header("User-agent"))
 
     def test_no_network_is_not_an_error(self) -> None:
+        # 繋がらない機械で例外にすると、起動のたびに確かめが落ちてエラーを見せる
         def opener(request: urllib.request.Request) -> IO[bytes]:
             raise OSError("繋がらない")
 
@@ -213,6 +217,7 @@ def _lookup(allowed: str | None, newest: str | None = None) -> Callable[[str], L
 
 class TestFindUpdate:
     def test_a_newer_version_in_range_is_pinned(self) -> None:
+        # 範囲の中の新しい版を選べないと、部品が古いまま新しいモデルを断られ続ける
         pins = find_update(cast(FeaturePack, _Pack("0.2.158")), _lookup("0.2.164", "0.3.1"))
         assert pins == (f"{SDK}==0.2.164",)
 
@@ -226,6 +231,7 @@ class TestFindUpdate:
         assert find_update(cast(FeaturePack, _Pack(None)), _lookup("0.2.164")) == ()
 
     def test_the_settings_text_mentions_versions_out_of_range(self) -> None:
+        # 範囲の外の版を書かないと、更新したのに新しい版が入らない理由が分からない
         note, upgradable = describe_updates(
             _status("0.2.164").packages, {REQUIRED_PACKAGES[0]: Latest("0.2.164", "0.3.1")}
         )
@@ -282,6 +288,7 @@ def _sdk_marker(target: Path) -> str:
 
 class TestStagedInstall:
     def test_the_new_version_replaces_the_old_one(self, runtime: Path) -> None:
+        # 入れ替えが効かないと、更新したと出ても古い Claude Code のままモデルを断られる
         swapped: list[bool] = []
         ok = install_staged(
             (f"{SDK}==0.2.164",),
@@ -341,6 +348,7 @@ class TestStagedInstall:
 
 class TestSchedule:
     def test_once_a_day(self) -> None:
+        # 間隔を誤ると、起動のたびに PyPI へ尋ねるか、何日も確かめなくなる
         day = 24 * 60 * 60
         assert is_due(0.0, float(day)) is True  # 確かめたことが無い
         assert is_due(1000.0, 1000.0 + day - 1) is False
@@ -349,6 +357,7 @@ class TestSchedule:
         assert is_due(5000.0, 1000.0) is True
 
     def test_a_broken_state_file_is_ignored(self, tmp_path: Path) -> None:
+        # 壊れた状態のファイルで止まると、自動の更新が二度と動かず起動も落ちかねない
         path = tmp_path / "ai-parts.json"
         path.write_text("{壊れている", encoding="utf-8")
         assert PartsStateStore(path).load() == PartsState()
@@ -450,6 +459,7 @@ class TestPartsUpdater:
         updater.stop()
 
     def test_it_asks_at_most_once_a_day(self, tmp_path: Path) -> None:
+        # 回数を数え損ねると、繋がらない機械で起動のたびに待たされる
         updater, lookup, _ = _updater(tmp_path)
         updater._check(asked=False)
         _settle(updater)
@@ -607,6 +617,7 @@ def _run_update(widget: ChatPanel, updater: PartsUpdater) -> None:
 
 class TestPanelGuidance:
     def test_the_error_becomes_a_japanese_guide_with_a_button(self, unavailable: ChatPanel) -> None:
+        # 英語の文面のままだと、どこで何を更新すればよいかが分からない
         widget = unavailable
         _send(widget, "切って")
         _outdated_turn(widget)
@@ -623,6 +634,7 @@ class TestPanelGuidance:
     def test_the_button_updates_the_parts(
         self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # ボタンが更新を始めないと、案内に従っても部品が古いまま断られ続ける
         from sashimono.ui import setup as setup_module
 
         widget = unavailable
@@ -687,6 +699,7 @@ class TestPanelGuidance:
     def test_the_setup_section_forces_an_upgrade_when_asked(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # --upgrade を付けないと、名前が入っているだけで飛ばされ〔環境を更新〕を押しても古いまま
         del qt_application
         status = PackStatus(pack=AI_PACK, packages=(PackageStatus(SDK, "0.2.158"),))
         monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
@@ -721,6 +734,7 @@ class TestPanelAutomatic:
     def test_a_failed_update_falls_back_to_the_guide(
         self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
     ) -> None:
+        # 自動の更新に失敗して黙ると、手で直す案内も出ずに指示が失敗したまま終わる
         widget, updater, installer = automatic
         installer.result = False
         _send(widget, "切って")
@@ -762,6 +776,7 @@ class TestPanelAutomatic:
     def test_the_setting_turns_off_the_retry(
         self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
     ) -> None:
+        # 切っても入れ替えると、通信や書き換えを止めたい人の設定が効かない
         widget, _, installer = automatic
         widget.apply_preferences(Preferences(ai_auto_update=False))
         _send(widget, "切って")
@@ -795,6 +810,7 @@ class TestOneWriterAtATime:
     """自動の入れ替えと導入の欄が、同じ導入先へ同時に書かない（新旧が混ざる）"""
 
     def test_the_swap_waits_for_the_install_button(self, runtime: Path) -> None:
+        # 導入のボタンと同時に書くと新旧の部品が混ざり、AI 連携が読めなくなる
         import threading
 
         from sashimono.runtime import writing_runtime
@@ -817,6 +833,7 @@ class TestOneWriterAtATime:
         assert "new sdk" in _sdk_marker(runtime)
 
     def test_the_install_button_holds_the_same_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 導入のボタンが錠を持たないと、自動の入れ替えと重なって新旧の部品が混ざる
         from sashimono import runtime as runtime_module
 
         seen: list[bool] = []
@@ -867,6 +884,7 @@ class TestCancelledRetry:
     """頼まれた更新を取りやめたときも知らせる 知らせないとパネルが待ち続ける"""
 
     def test_turning_it_off_while_pending_reports_a_failure(self, tmp_path: Path) -> None:
+        # 知らせずにやめると、パネルが送り直しを待ち続けて指示が応えられない
         updater, _, installer = _updater(tmp_path)
         heard: list[tuple[bool, str]] = []
         updater.finished.connect(lambda ok, pins: heard.append((ok, pins)))
@@ -880,6 +898,7 @@ class TestCancelledRetry:
         updater.stop()
 
     def test_losing_the_target_while_pending_reports_a_failure(self, tmp_path: Path) -> None:
+        # 知らせずにやめると、状態の行が更新中のまま指示がいつまでも渡らない
         updater, _, _ = _updater(tmp_path)
         heard: list[bool] = []
         updater.finished.connect(lambda ok, _pins: heard.append(ok))
@@ -918,6 +937,7 @@ class TestCheckFailures:
     """確かめが落ちても、確かめている途中のまま止まらない"""
 
     def test_a_cut_off_reply_is_not_known(self) -> None:
+        # 途中で切れた返事を例外のまま通すと、確かめの所で落ちて更新が止まる
         import http.client
 
         def opener(request: urllib.request.Request) -> IO[bytes]:
@@ -929,6 +949,7 @@ class TestCheckFailures:
     def test_a_crash_in_the_check_thread_ends_the_check(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 終わった印が立たないと「確かめています…」のまま確かめのボタンが押せなくなる
         from sashimono.ui import setup as setup_module
 
         del qt_application
@@ -955,6 +976,7 @@ class TestCheckFailures:
     def test_a_crash_in_the_install_thread_ends_the_install(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 終わった印が立たないと導入中のまま残り、導入のボタンが二度と押せない
         from sashimono.ui import setup as setup_module
 
         del qt_application
@@ -993,6 +1015,7 @@ class TestHeldWhileTheSetupInstalls:
     def test_a_prompt_waits_for_the_setup_and_then_goes(
         self, unavailable: ChatPanel, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # pip の間に会話を始めると、使用中の claude.exe を置き換えられず更新が失敗する
         from sashimono.ui import setup as setup_module
 
         widget = unavailable
@@ -1054,6 +1077,7 @@ class TestShutdownWhileInstalling:
     def test_closing_cancels_and_waits_for_the_install(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 待たずに閉じると入れ替えの途中でプロセスが消え、次の起動で SDK が欠ける
         del qt_application
         updater, _, _ = _updater(tmp_path)
         started = threading.Event()
@@ -1090,6 +1114,7 @@ class TestShutdownWhileInstalling:
     def test_stopping_with_nothing_running_does_not_wait(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 何も入れていないのに待つと、窓を閉じるたびに固まる
         del qt_application
         updater, _, _ = _updater(tmp_path)
         started = time.monotonic()
@@ -1246,6 +1271,7 @@ class TestRecoveryOnTheNextStart:
     def test_the_development_environment_is_left_alone(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 開発の環境で戻しが走ると、開発者の .venv の隣の物を書き換えかねない
         from sashimono import runtime as runtime_module
 
         monkeypatch.setattr(runtime_module, "runtime_target_dir", lambda: None)
@@ -1274,6 +1300,7 @@ class TestUnreadableJournal:
 
     @pytest.mark.parametrize("journal_text", ["", "{壊れている", "[]", '{"replaced": 1}'])
     def test_the_moved_sdk_comes_back(self, runtime: Path, journal_text: str) -> None:
+        # 読めない記録で退けた物を捨てると、導入先から SDK が欠けて AI 連携が動かない
         backup = self._crashed_after_moving_the_sdk(runtime, journal_text)
         assert not (runtime / "claude_agent_sdk").exists()
         assert recover_runtime_swap(runtime) is True

@@ -113,6 +113,7 @@ class TestPartsSection:
         assert panel._parts_button.toolTip() == "AI の部品の版と更新を開く / 閉じる"
 
     def test_the_button_opens_and_closes_the_section(self, panel: ChatPanel) -> None:
+        # 開け閉めと印が合わないと、どちらの状態か分からず欄を探し回る
         panel._parts_button.click()
         assert panel._parts_box.isHidden() is False
         assert panel._parts_button.text().startswith(OPEN_MARK)

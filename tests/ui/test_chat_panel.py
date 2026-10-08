@@ -750,6 +750,7 @@ class TestRunningStatus:
     def test_running_shows_the_tool_and_the_seconds(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
     ) -> None:
+        # 道具と秒が出ないと、止まっているのか動いているのかが分からない
         widget, _, clock = timed
         _send(widget, "切って")
         widget._handle(AgentEvent(EventKind.READY))
@@ -787,6 +788,7 @@ class TestRunningStatus:
     def test_failed_operations_are_counted_in_the_divider(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
     ) -> None:
+        # 失敗を数えないと、一部の操作が効いていないことに気付かず書き出してしまう
         widget, _, _ = timed
         _send(widget, "切って")
         widget._handle(AgentEvent(EventKind.TOOL_USE, tool="split_clip"))
@@ -797,6 +799,7 @@ class TestRunningStatus:
     def test_an_error_ends_with_a_failure_divider(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
     ) -> None:
+        # エラーで終わった指示を「完了」と出すと、編集が済んだと思い込む
         widget, _, _ = timed
         _send(widget, "切って")
         widget._handle(AgentEvent(EventKind.ERROR, text="接続が切れました"))
@@ -827,6 +830,7 @@ class TestRunningStatus:
     def test_interrupting_shows_stopping_then_an_interrupted_divider(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
     ) -> None:
+        # 中断の途中と終わりが出ないと、止まったのか分からず中断を押し続ける
         widget, _, _ = timed
         _send(widget, "切って")
         widget._handle(AgentEvent(EventKind.READY))
