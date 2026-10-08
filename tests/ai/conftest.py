@@ -50,10 +50,16 @@ class FakeHost:
         self.transcribed_stream: int | None = None
         #: 本人の設定の「動画の映像と音声」 既定は設定と同じく分ける
         self.split_audio = True
+        #: 本人の設定の「新しい字幕を自動で折り返す」の幅（%） 既定は設定と同じく 90
+        self.wrap_share = 90
 
     @property
     def splits_media(self) -> bool:
         return self.split_audio
+
+    @property
+    def subtitle_wrap_share(self) -> int:
+        return self.wrap_share
 
     @property
     def document(self) -> Document:

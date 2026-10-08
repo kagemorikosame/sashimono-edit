@@ -1294,7 +1294,7 @@ def _content(
     item: dict[str, Any], name: str, log: CompatibilityReport
 ) -> tuple[GeneratedSource | None, str, str]:
     if name in ("TextItem", "Text"):
-        return _text(item), "", "text"
+        return _text(item, log), "", "text"
     if name in ("ShapeItem", "Shape"):
         return _shape(item, log), "", "shape"
 
@@ -1325,7 +1325,7 @@ def _content(
     return None, "", name
 
 
-def _text(item: dict[str, Any]) -> GeneratedSource:
+def _text(item: dict[str, Any], log: CompatibilityReport) -> GeneratedSource:
     length = max(1, int(number(item.get("Length"), 1.0)))
     keyframes = item.get("KeyFrames")
     size = number(item.get("FontSize"), 64.0)
@@ -1354,6 +1354,15 @@ def _text(item: dict[str, Any]) -> GeneratedSource:
     font = item.get("Font")
     if isinstance(font, str) and font:
         params["font"] = font
+    wrap = str(item.get("WordWrap") or "NoWrap")
+    if wrap != "NoWrap":
+        # 折り返す物だけ MaxWidth を折り返しの幅にする（#249） 実物の 114 本・テキスト 310 個は
+        # どれも NoWrap と MaxWidth 1920 で、折り返す見本はまだ無い 位置の決まり（禁則・
+        # 英単語）を YMM4 と描き比べていないので、読んだことを互換性レポートに残して数える
+        params["wrap_width"] = animated(
+            item.get("MaxWidth"), 1920.0, length=length, keyframes=keyframes
+        )
+        log.note_missing(f"YMM4 のテキストの折り返し（位置の決まりは実物で未確認）: {wrap}")
     return GeneratedSource(kind="text", params=params)
 
 

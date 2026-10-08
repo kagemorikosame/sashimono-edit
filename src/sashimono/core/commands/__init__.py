@@ -89,6 +89,7 @@ from sashimono.core.commands.subtitle import (
     burn_defaults,
     burn_subtitles,
     subtitle_voices,
+    subtitle_wrap_width,
     voice_label,
 )
 from sashimono.core.commands.track_order import MoveTrack, reorder_group
@@ -171,6 +172,7 @@ __all__ = [
     "reorder_group",
     "resolve_param",
     "subtitle_voices",
+    "subtitle_wrap_width",
     "switch_layer_mode",
     "voice_label",
 ]

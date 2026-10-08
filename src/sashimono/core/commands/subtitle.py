@@ -45,6 +45,7 @@ __all__ = [
     "burn_defaults",
     "burn_subtitles",
     "subtitle_voices",
+    "subtitle_wrap_width",
     "voice_label",
 ]
 
@@ -56,15 +57,27 @@ TEXT_PARAM = "text"
 _BURN_AT_1080 = {"size": 48.0, "pos_y": -380.0, "border_width": 4.0}
 
 
-def burn_defaults(height: int) -> dict[str, float]:
+def burn_defaults(height: int, wrap_width: float = 0.0) -> dict[str, float]:
     """焼き込むテキストの既定の見た目 画面の高さ ``height`` に合わせて縮める
 
     画素の値のまま使うと、720p の作品では縦位置 -380 が画面の下端（-360）より下になり、
     焼き込んだ字幕がプレビューにも書き出しにも出ない 1080p の値を高さの比で縮めて、
     どの解像度でも画面の同じ所に同じ大きさで出す
+
+    ``wrap_width`` は折り返しの幅（画面の画素 #249） 0 なら折り返さない 字幕として作る
+    クリップだけが画面の幅に合わせた値を渡す（本人の設定 ``Preferences.subtitle_wrap``）
+    長い字幕が画面からはみ出して切れるのを、知らない人ほど困るため
     """
     scale = max(1, height) / 1080
-    return {name: value * scale for name, value in _BURN_AT_1080.items()}
+    look = {name: value * scale for name, value in _BURN_AT_1080.items()}
+    if wrap_width > 0:
+        look["wrap_width"] = float(wrap_width)
+    return look
+
+
+def subtitle_wrap_width(width: int, percent: int) -> float:
+    """字幕の折り返しの幅 画面の幅 ``width`` の ``percent`` % 0 以下なら折り返さない"""
+    return max(0.0, float(width) * percent / 100.0)
 
 
 @dataclass(frozen=True, slots=True)

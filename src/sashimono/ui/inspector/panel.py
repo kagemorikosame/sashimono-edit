@@ -404,7 +404,7 @@ class InspectorPanel(QWidget):
             return None
         track, clip = located
         picture, sound = self._picture_and_sound(track, clip)
-        source: tuple[str, frozenset[str]] | None = None
+        source: tuple[str, frozenset[str], frozenset[str]] | None = None
         if clip.source is not None:
             definition = source_registry.get(clip.source.kind)
             unused = (
@@ -412,7 +412,14 @@ class InspectorPanel(QWidget):
                 if definition is not None
                 else frozenset()
             )
-            source = (clip.source.kind, unused)
+            # 灰色にする欄も構成に入れる 組み方を変えたときに欄を作り直さないと、
+            # 折り返しの幅が灰色のまま（または使えないのに触れるまま）残る
+            locked = (
+                frozenset(definition.locked_reasons(clip.source.params))
+                if definition is not None
+                else frozenset()
+            )
+            source = (clip.source.kind, unused, locked)
         return (
             clip.id,
             picture,
@@ -691,14 +698,23 @@ class InspectorPanel(QWidget):
         spec: ParameterSpec,
         path: ParamPath,
         value: ParamValue | None,
+        locked: str | None = None,
     ) -> None:
-        """パラメータ 1 つの行 名前（ダブルクリックで初期値）・入力欄・キーフレームの ◀ ◆ ▶"""
-        section.add_row(
-            label,
-            self._make_editor(spec, path, value),
-            self._keyframe_controls(spec, path, value),
-            reset=self._resetter(spec, path),
-        )
+        """パラメータ 1 つの行 名前（ダブルクリックで初期値）・入力欄・キーフレームの ◀ ◆ ▶
+
+        ``locked`` は今の設定では効かない理由 欄を灰色にして、理由を吹き出しと欄の下に出す
+        触れるままにすると、動かしても絵が変わらず壊れたように見える
+        """
+        editor = self._make_editor(spec, path, value)
+        controls = self._keyframe_controls(spec, path, value)
+        if locked is not None:
+            editor.setEnabled(False)
+            editor.setToolTip(locked)
+            if controls is not None:
+                controls.setEnabled(False)
+        section.add_row(label, editor, controls, reset=self._resetter(spec, path))
+        if locked is not None:
+            section.add_note(locked)
 
     def _fixed_header(self, section: _Section, clip: Clip, effects: Sequence[Effect]) -> None:
         """組の見出しに、欄をまとめて切る切り替えと鍵の印を出す
@@ -1023,6 +1039,7 @@ class InspectorPanel(QWidget):
                 "（右と上が正）"
             )
         unused = definition.unused_names(clip.source.params)
+        locked = definition.locked_reasons(clip.source.params)
         for spec in definition.parameters:
             if spec.name in unused:
                 continue
@@ -1031,7 +1048,7 @@ class InspectorPanel(QWidget):
             if clip.is_group:
                 self._group_row(section, spec, path, value)
                 continue
-            self._param_row(section, spec.label, spec, path, value)
+            self._param_row(section, spec.label, spec, path, value, locked.get(spec.name))
         return section
 
     def _group_row(
