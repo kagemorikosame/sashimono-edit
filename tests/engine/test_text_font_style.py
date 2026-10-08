@@ -65,6 +65,14 @@ class TestStyleChangesTheGlyphs:
         default = _ink(vertical=True)
         assert _ink(vertical=True, font_style=LIGHT) < default * 0.9
 
+    def test_a_bold_style_is_placed_like_the_bold_check(self) -> None:
+        # 太字は細字で置いたときの字の外形の中心へ戻す（``_bold_drift``） スタイルで太くしたとき
+        # だけ戻さないと、同じ Bold の字が太字の欄で選んだときと横にずれて出る
+        for align in ("left", "center", "right"):
+            assert np.array_equal(
+                _image(font_style=BOLD, align=align), _image(bold=True, align=align)
+            ), align
+
     def test_the_style_wins_over_the_bold_check(self) -> None:
         # 太さを持つスタイルへ太字を重ねると二重に太くなる 選んだスタイルのまま描く
         assert np.array_equal(

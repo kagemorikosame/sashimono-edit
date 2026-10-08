@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
+    QFontInfo,
     QFontMetricsF,
     QImage,
     QPainter,
@@ -563,7 +564,20 @@ def _text_layers(
     # 文字を輪郭（パス）として組み立てる 縁取りを外側だけに出すには、
     # 塗りとは別に輪郭を太らせる必要があり、それはパスでしかできない
     # 太字は、同じ揃え方で細字を置いたときの字の外形の中心へ戻す（:func:`_bold_drift`）
+    # 太さは実際に選ばれた書体で見る（スタイルの Bold や Semibold は QFont の太さを持たない）
+    # 中間の太さ（Semibold 600）も太字に数える 戻す量は細字と比べて測るだけなので、
+    # 寄っていない書体では 0 に近く、寄っていれば太字と同じ理由で戻すのが正しい
+    # 比べる細字からはスタイル名も外す 残すとスタイルが勝ち、比べる字まで太いままになる
+    # スタイルを選んでいないときは今までどおり太字の欄で決める（書体の既定の面が太い
+    # ファミリで、前の版に無かった補正が掛かって字がずれないように）
     plain_font = QFont(font)
+    if font.styleName():
+        resolved = QFontInfo(font)
+        emboldened = resolved.bold()
+        plain_font.setStyleName("")
+        plain_font.setItalic(resolved.italic())
+    else:
+        emboldened = font.bold()
     plain_font.setBold(False)
     plain_metrics = QFontMetricsF(plain_font)
     plain_widest = max((plain_metrics.horizontalAdvance(line) for line in lines), default=0.0)
@@ -585,8 +599,7 @@ def _text_layers(
         baseline = top + line_height * index + metrics.ascent()
         placed = QPainterPath()
         placed.addText(QPointF(x, baseline), font, line)
-        # 太字の欄ではなくフォントを見る スタイルを選んでいると太字の欄は読まない
-        if font.bold():
+        if emboldened:
             plain = QPainterPath()
             plain_x = start(plain_metrics.horizontalAdvance(line), plain_widest)
             plain.addText(QPointF(plain_x, baseline), plain_font, line)
