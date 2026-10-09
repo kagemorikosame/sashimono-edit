@@ -369,6 +369,8 @@ def _signed(world: World, tool: ModuleType, tmp_path: Path, **options: str) -> N
     archive = tmp_path / ZIP
     archive.write_bytes(world.github.files[ZIP])
     manifest = tmp_path / "update.json"
+    # 道具が --minimum の既定で作る目録と同じにする 違えば道具は作り直しを求めて止まる
+    options = {"minimum": tool.OLDEST_SWAPPABLE, **options}
     manifest.write_bytes(tool.update_sign.build_manifest(archive, **options))
     tool.update_sign.sign_file(manifest, world.key, lambda _prompt: PASSPHRASE)
     world.github.files["update.json"] = manifest.read_bytes()
@@ -1154,9 +1156,9 @@ class TestReusedManifestsFollowTheArguments:
     ) -> None:
         _signed(world, tool, tmp_path)
         world.answers = ["y", "y"]
-        assert world.main(tool, "--minimum", "0.0.1") == 1
+        assert world.main(tool, "--minimum", "0.3.0") == 1
         out = capsys.readouterr().out
-        assert "minimum が 0.0.0（今は 0.0.1）" in out
+        assert "minimum が 0.2.1（今は 0.3.0）" in out
         assert f"gh release delete-asset {TAG} update.json -y" in out
         assert f"gh release delete-asset {TAG} update.json.sig -y" in out
         assert "公開はしていない" in out
@@ -1182,10 +1184,10 @@ class TestReusedManifestsFollowTheArguments:
         assert len(world.secrets) == 1
         world.github.fail_uploads = set()
         world.answers = ["n"]
-        assert world.main(tool, "--minimum", "0.0.1") == 0
+        assert world.main(tool, "--minimum", "0.3.0") == 0
         assert len(world.secrets) == 2
         uploaded = tool.parse_manifest(world.github.files["update.json"])
-        assert uploaded.minimum == "0.0.1"
+        assert uploaded.minimum == "0.3.0"
 
     def test_resuming_with_another_minimum_stops(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
@@ -1198,11 +1200,31 @@ class TestReusedManifestsFollowTheArguments:
         writes = list(world.github.writes)
         capsys.readouterr()
         world.answers = ["y"]
-        assert world.main(tool, "--minimum", "0.0.1") == 1
+        assert world.main(tool, "--minimum", "0.3.0") == 1
         out = capsys.readouterr().out
-        assert "前と同じ引数で打ち直す" in out and "minimum が 0.0.0（今は 0.0.1）" in out
+        assert "前と同じ引数で打ち直す" in out and "minimum が 0.2.1（今は 0.3.0）" in out
         assert "公開はしていない" not in out and "gh release upload beta" not in out
         assert world.github.writes == writes
+
+    def test_the_minimum_defaults_to_the_oldest_swappable_version(
+        self, tool: ModuleType, world: World
+    ) -> None:
+        """--minimum を付け忘れても、0.2.0 以前の版に失敗する入れ替えを試させない（#279）"""
+        world.answers = ["y"]
+        assert world.main(tool) == 0
+        uploaded = tool.parse_manifest(world.github.files["update.json"])
+        assert uploaded.minimum == tool.OLDEST_SWAPPABLE == "0.2.1"
+
+    @pytest.mark.parametrize("minimum", ["0.0.0", "0.2.0"])
+    def test_a_minimum_below_the_oldest_swappable_version_is_refused(
+        self, tool: ModuleType, world: World, minimum: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """下げる指定は署名の前に断る 古い版が失敗する目録を作らない"""
+        with pytest.raises(SystemExit) as stopped:
+            world.main(tool, "--minimum", minimum)
+        assert stopped.value.code == 2
+        assert "#279" in capsys.readouterr().err
+        assert world.github.writes == [] and world.secrets == []
 
     def test_differences_cover_every_item_of_the_manifest(self, tool: ModuleType) -> None:
         """目録に項目を足しても比べ漏れない 型から数える"""

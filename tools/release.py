@@ -71,6 +71,7 @@ from sashimono.update.manifest import (  # noqa: E402
     PackageInfo,
     is_prerelease,
     parse_manifest,
+    parse_version,
 )
 from sashimono.update.package import APP_EXE  # noqa: E402
 from sashimono.update.signing import (  # noqa: E402
@@ -102,6 +103,11 @@ DETECTED_DIR = "detected"
 #: 誤検出のたびに組み直してよい回数 組み直しても通らない exe はコード署名か Microsoft への
 #: 報告でしか直らない 打ち続けると Actions の時間だけが減る
 REBUILD_LIMIT = 5
+#: 自動で上げてよいいちばん古い版（目録の minimum の既定） 0.2.0 までの版は自分の中の古い
+#: 入れ替え係を使い、作業場所がインストール先のままフォルダの名前を変えようとして必ず断られる
+#: （#279） minimum をこれより下げると、失敗すると分かっている入れ替えを古い版に試させる
+#: --minimum を付け忘れても守れるよう既定にし、下げる指定は断る
+OLDEST_SWAPPABLE = "0.2.1"
 #: Windows が「ウイルスが含まれている」としてファイルを開かせないときの番号（ERROR_VIRUS_INFECTED）
 VIRUS_WINERROR = 225
 #: 誤検出を Microsoft へ報告する所（利用者が手で送る 道具は送らない）
@@ -382,7 +388,7 @@ class Release:
     key: Path | None = None
     dry_run: bool = False
     skip_launch: bool = False
-    minimum: str = "0.0.0"
+    minimum: str = OLDEST_SWAPPABLE
     root: Path = ROOT
     run: Runner = run_command
     ask: Callable[[str], str] = ask_line
@@ -1545,13 +1551,29 @@ def main(argv: list[str] | None = None, **overrides: Any) -> int:
     parser.add_argument("version", help="出す版（__version__ と同じ 例 0.1.0）")
     parser.add_argument("--key", type=Path, help="署名する鍵のファイルか、それを入れたフォルダ")
     parser.add_argument(
-        "--minimum", default="0.0.0", help="これより古い版は自動では上げられない（目録の minimum）"
+        "--minimum",
+        default=OLDEST_SWAPPABLE,
+        help=(
+            "これより古い版は自動では上げられない（目録の minimum） "
+            f"既定と下限は {OLDEST_SWAPPABLE}（それより古い版の入れ替え係は失敗する #279）"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="何も変えずに、済んだ段と残りを出す")
     parser.add_argument(
         "--skip-launch", action="store_true", help="自己診断の後にアプリを起こして見る所を飛ばす"
     )
     args = parser.parse_args(argv)
+    try:
+        too_low = parse_version(args.minimum) < parse_version(OLDEST_SWAPPABLE)
+    except ValueError as exc:
+        parser.error(f"--minimum が版の形でない: {exc}")
+    if too_low:
+        # 署名まで進んでから気付くと、古い版が失敗する目録を公開しかねない 打った時点で止める
+        parser.error(
+            f"--minimum {args.minimum} は {OLDEST_SWAPPABLE} より古い "
+            f"{OLDEST_SWAPPABLE} より古い版は入れ替えに失敗する（#279） "
+            f"付けなければ {OLDEST_SWAPPABLE}"
+        )
 
     release = Release(
         version=args.version,
