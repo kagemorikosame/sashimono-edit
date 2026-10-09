@@ -514,20 +514,25 @@ def test_a_result_is_written_while_the_app_holds_it_open(tmp_path: Path) -> None
     いると必ず断られ、書き直しも 0.1 秒ごとなので、重い機械（CI の 4 並列）では毎回重なり、
     走り始めの印を書く前に 5 秒で諦めて止まった（終了コード 9） 本体と同じ開き方
     （Python の open）で開いたまま、台本の Write-Result を走らせる
+
+    時間では見ない 1 回目で通っても、重い CI では 100 ミリ秒を超えることがある 取り出した
+    Write-Result の catch（書き直し）の頭で数を足させ、1 度も入らなかったことを見る 数を
+    足すのはこの試験が取り出した写しだけで、本番の台本は変えない
     """
     import re
     import subprocess
 
     match = re.search(r"^function Write-Result.*?^}\n", swap_module.HELPER_SCRIPT, re.M | re.S)
     assert match is not None
+    assert match.group(0).count("} catch {\n") == 1
+    function = match.group(0).replace("} catch {\n", "} catch {\n$script:retries++\n")
     result = tmp_path / "result.txt"
     result.write_text("started\n", encoding="utf-8")
     code = (
-        "$ErrorActionPreference = 'Stop'\n$result = $env:RESULT\n"
-        + match.group(0)
-        + "$watch = [Diagnostics.Stopwatch]::StartNew()\n"
-        "Write-Result 'holding'\n"
-        "[Console]::Out.Write([int]$watch.Elapsed.TotalMilliseconds)\n"
+        "$ErrorActionPreference = 'Stop'\n$result = $env:RESULT\n$script:retries = 0\n"
+        + function
+        + "Write-Result 'holding'\n"
+        "[Console]::Out.Write($script:retries)\n"
     )
     with result.open("r", encoding="utf-8-sig"):
         done = subprocess.run(
@@ -538,8 +543,8 @@ def test_a_result_is_written_while_the_app_holds_it_open(tmp_path: Path) -> None
             check=False,
         )
     assert done.returncode == 0, done.stderr.decode("cp932", "replace")
-    # 書き直しを待たずに通る（断られて待つと 100 ミリ秒を超える）
-    assert int(done.stdout) < 100, done.stdout
+    # 1 回目で通る 書き直しに入っていれば、本体が読んでいる間は断られる開き方のまま
+    assert done.stdout.strip() == b"0", done.stdout
     assert result.read_text(encoding="utf-8-sig").split() == ["started", "holding"]
 
 
