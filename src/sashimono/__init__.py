@@ -1,3 +1,3 @@
 """Sashimono Edit — Python 製の動画編集ソフト"""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
