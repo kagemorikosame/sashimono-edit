@@ -542,3 +542,37 @@ def test_checkout_leaves_no_token_behind() -> None:
         for step in text.split("- uses: ")[1:]:
             if step.startswith("actions/checkout"):
                 assert "persist-credentials: false" in step.split("\n      - ")[0], name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows の PowerShell 5.1 で走らせる")
+def test_an_unreadable_previous_release_is_not_softened(tmp_path: Path) -> None:
+    """公開版の書き付けを読めなくても、必須の確かめを警告に下げない（PR #280 の指摘）
+
+    読めないのを握りつぶして「台本を持たない版」と見ると、0.2.1 から先の公開版でも
+    入れ替えの失敗が警告で済む 読めないときは例外にして呼ぶ側が落とし、必ず通すかは
+    zip の名前の版でも決める
+    """
+    import zipfile
+
+    empty = tmp_path / "SashimonoEdit-0.2.1-windows-x64.zip"
+    with zipfile.ZipFile(empty, "w") as archive:
+        archive.writestr("Sashimono/README.txt", "書き付けの無い zip")
+    body = (
+        "$a = Test-PreviousMustPass $null '0.2.0'\n"
+        "$b = Test-PreviousMustPass $null '0.2.1'\n"
+        "$c = Test-PreviousMustPass ([pscustomobject]@{ version = '0.2.0'; swap_contract = 1 })"
+        " ''\n"
+        "$d = Test-PreviousMustPass ([pscustomobject]@{ version = '0.2.0' }) '0.2.0'\n"
+        "$e = Test-PreviousMustPass $null ''\n"
+        "$f = Get-ZipVersion $env:EMPTY_ZIP\n"
+        "$g = try { Read-ZipBuildInfo $env:EMPTY_ZIP | Out-Null; 'read' } catch { 'threw' }\n"
+        '[Console]::Out.Write("$a $b $c $d $e $f $g")\n'
+    )
+    completed = _run_script_functions(
+        ("Test-PreviousMustPass", "Get-ZipVersion", "Read-ZipBuildInfo"),
+        body,
+        {"EMPTY_ZIP": str(empty)},
+        ("ScriptSince",),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "False True True False True 0.2.1 threw"

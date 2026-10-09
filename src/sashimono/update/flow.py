@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -282,7 +283,8 @@ def settle(
             # 入れ替えに失敗した版は、尋ねない設定でも自動では予約し直さない（reconcile）
             state = replace(state, auto_blocked=ready)
         if found is not None:
-            key, failure = found
+            reason, failure = found
+            key = _failure_key(ready, reason, failure)
             count = state.failure_count + 1 if state.last_failure == key else 1
             state = replace(state, last_failure=key, failure_count=count)
             if count >= MANUAL_AFTER:
@@ -342,6 +344,10 @@ def prepare(
     try:
         stage(manifest, transport, layout, should_cancel=should_cancel)
         state = store.load()
+        if state.ready_version != manifest.version:
+            # 待たせる版が替わったら、前の版の失敗の続きを忘れる 残すと、版 A で 1 回失敗した
+            # 後、版 B の最初の失敗で手で入れ替える案内を出す（印にも版を含めて比べる）
+            state = replace(state, last_failure="", failure_count=0)
         store.save(
             replace(
                 state,
@@ -358,6 +364,25 @@ def prepare(
 
 class UpdateBusyError(Exception):
     """ほかの窓か入れ替え係が更新を進めている 待てば済むので、起動時の確認では黙る"""
+
+
+#: 一般のエラー（``error ...``）の文面を比べるときに見る長さ 例外の文面は長いことがあり、
+#: 覚え書きを大きくしない 頭が同じなら同じ原因と見てよい
+_ERROR_TEXT_CHARS = 120
+
+
+def _failure_key(ready: str, reason: str, text: str) -> str:
+    """続けて失敗したかを比べる印 版と、失敗のわけ
+
+    版を含める 版 A で 1 回失敗した後、版 B の最初の失敗を「2 回続けて」と数えない
+    一般のエラー（``error``）は言葉が 1 つなので、文面も含める 別の原因の失敗 2 回を
+    同じ理由と数えない 数字（時刻・PID・行の番号など）は毎回変わりうるので落とし、
+    空白をそろえ、頭の :data:`_ERROR_TEXT_CHARS` 文字だけを見る
+    """
+    if reason == "error":
+        text = re.sub(r"\s+", " ", re.sub(r"\d+", "#", text)).strip()[:_ERROR_TEXT_CHARS]
+        reason = f"error {text}"
+    return f"{ready} {reason}"
 
 
 def _manual_steps(layout: Layout | None) -> str:

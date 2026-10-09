@@ -727,8 +727,38 @@ $SwapVersion = '9999.0.0'
 # 0.2.0 までの版は、作業場所を受け継いだ入れ替え係が自分で改名を断らせるので、この条件では
 # 必ず失敗する（#279） 失敗を記録して知らせるだけにする 入れ替え係の台本を持つ版（書き付けに
 # swap_contract がある 0.2.1 から）が 1 つ前の公開版になったら、必ず通す扱いへ自動で切り替わる
-function Test-PreviousMustPass($PreviousInfo) {
-    return $null -ne $PreviousInfo.swap_contract
+# 書き付けを読めなくても、zip の名前の版が 0.2.1 以上なら必ず通す（読めないだけで警告に下げない）
+$ScriptSince = [version]'0.2.1'
+function Test-PreviousMustPass($PreviousInfo, [string]$ZipVersion) {
+    if ($null -ne $PreviousInfo -and $null -ne $PreviousInfo.swap_contract) { return $true }
+    if ($ZipVersion -match '^(\d+)\.(\d+)\.(\d+)') {
+        return [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" -ge $ScriptSince
+    }
+    # 名前からも版が分からない 分からない物を警告に下げると、必須の確かめが黙って抜ける
+    return $true
+}
+
+function Read-ZipBuildInfo([string]$Path) {
+    # zip の中の書き付けを読む 無い・読めない・版が無いときは例外（呼ぶ側が理由を残して落とす）
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $opened = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $entry = $opened.GetEntry('Sashimono/build-info.json')
+        if ($null -eq $entry) { throw 'zip に Sashimono/build-info.json が無い' }
+        $reader = New-Object IO.StreamReader ($entry.Open())
+        try { $info = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    } finally {
+        $opened.Dispose()
+    }
+    if ($null -eq $info -or -not $info.version) { throw 'build-info.json に版が無い' }
+    return $info
+}
+
+function Get-ZipVersion([string]$Path) {
+    # 配る zip の名前（SashimonoEdit-<版>-windows-x64.zip tools/build_package.py）から版を読む
+    $name = [IO.Path]::GetFileName($Path)
+    if ($name -match '^SashimonoEdit-(.+)-windows-x64\.zip$') { return $Matches[1] }
+    return ''
 }
 
 function Get-PreviousZip {
@@ -760,23 +790,19 @@ try {
         Note '1 つ前の公開版の zip が無いので、公開版からの入れ替えを飛ばした（CI の runner でだけ落とす）'
     } else {
         $previousInfo = $null
+        $zipVersion = Get-ZipVersion $previous
         try {
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $opened = [IO.Compression.ZipFile]::OpenRead($previous)
-            try {
-                $entry = $opened.GetEntry('Sashimono/build-info.json')
-                $reader = New-Object IO.StreamReader ($entry.Open())
-                $previousInfo = $reader.ReadToEnd() | ConvertFrom-Json
-                $reader.Dispose()
-            } finally {
-                $opened.Dispose()
-            }
-        } catch { }
-        $previousVersion = if ($previousInfo) { $previousInfo.version } else { '版が読めない' }
+            $previousInfo = Read-ZipBuildInfo $previous
+        } catch {
+            # 0.1.0 から配った zip はどれも書き付けを持つ 読めないのは zip か落とし方の異常で、
+            # 黙ると必須の確かめが警告に下がりうる 理由を残して落とす
+            Fail "公開版の zip（$([IO.Path]::GetFileName($previous))）の build-info.json を読めない: $_"
+        }
+        $previousVersion = if ($previousInfo) { $previousInfo.version } elseif ($zipVersion) { $zipVersion } else { '版が読めない' }
         $previousSwap = Test-Swap '公開版から' $previous
         if ($previousSwap.Passed) {
             Note "作業場所をインストール先にして、公開版 $previousVersion から今組んだ版へ入れ替わった（$($previousSwap.Detail)）"
-        } elseif (Test-PreviousMustPass $previousInfo) {
+        } elseif (Test-PreviousMustPass $previousInfo $zipVersion) {
             Fail "公開版 $previousVersion から今組んだ版へ入れ替わらない（作業場所はインストール先）: $($previousSwap.Detail)"
         } else {
             Write-Host "::warning::公開版 $previousVersion から今組んだ版へ入れ替わらない（この版の入れ替え係の不具合 #279 で分かっている）: $($previousSwap.Detail)"

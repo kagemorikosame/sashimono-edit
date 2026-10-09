@@ -680,14 +680,74 @@ class TestSettling:
         store.save(UpdateState(ready_version="1.2.0", last_failure="busy", failure_count=3))
         notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
         assert notice is not None and "続けて" not in notice
-        assert (store.load().last_failure, store.load().failure_count) == ("install-locked", 1)
+        assert store.load().failure_count == 1
+
+    def test_different_errors_are_not_the_same_reason(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """一般のエラーは言葉が 1 つ（error） 文面の違う 2 回を「同じ理由で 2 回」と数えない
+
+        別の原因なら入れ直しで通るかもしれず、手で入れ替える案内は早すぎる（PR #280 の指摘）
+        """
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0"))
+        settle(layout=layout, store=store, current="1.1.0", results=["error ディスクが一杯"])
+        notice = settle(
+            layout=layout, store=store, current="1.1.0", results=["error 台本を読めない"]
+        )
+        assert notice is not None and "続けて" not in notice
+        assert store.load().failure_count == 1
+
+    def test_the_same_error_with_other_numbers_is_the_same_reason(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """時刻や番号だけが違う文面は同じ原因 数字を比べると、いつまでも 1 回目になる"""
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0"))
+        settle(
+            layout=layout, store=store, current="1.1.0", results=["error 番号 1234 で  断られた"]
+        )
+        notice = settle(
+            layout=layout, store=store, current="1.1.0", results=["error 番号 98 で 断られた"]
+        )
+        assert notice is not None and "2 回続けて" in notice
+
+    def test_a_failure_of_another_version_is_not_continued(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """版 A で 1 回失敗した後、版 B の最初の失敗を「2 回続けて」と数えない（PR #280 の指摘）"""
+        _stage(layout, "1.3.0")
+        store.save(
+            UpdateState(ready_version="1.3.0", last_failure="1.2.0 install-locked", failure_count=1)
+        )
+        notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert notice is not None and "続けて" not in notice
+
+    def test_staging_another_version_forgets_the_failures(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """新しい版を待たせた時点で、前の版の失敗の続きを消す"""
+        store.save(UpdateState(ready_version="1.2.0", last_failure="1.2.0 busy", failure_count=1))
+        transport, manifest = release(Ed25519PrivateKey.generate(), "1.3.0")
+        prepare(manifest, transport=transport, layout=layout, store=store)
+        state = store.load()
+        assert (state.ready_version, state.last_failure, state.failure_count) == ("1.3.0", "", 0)
+
+    def test_staging_the_same_version_keeps_the_failures(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """同じ版を落とし直しても、続いた失敗は数え続ける（入れ直しで同じ失敗を繰り返さない）"""
+        store.save(UpdateState(ready_version="1.2.0", last_failure="1.2.0 busy", failure_count=1))
+        transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
+        prepare(manifest, transport=transport, layout=layout, store=store)
+        assert store.load().failure_count == 1
 
     def test_without_the_new_version_only_the_page_is_shown(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
         """展開した新しい版が無ければ、名前を変える手順は書かない（変える物が無い）"""
         store.save(
-            UpdateState(ready_version="1.2.0", last_failure="install-locked", failure_count=1)
+            UpdateState(ready_version="1.2.0", last_failure="1.2.0 install-locked", failure_count=1)
         )
         notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
         assert notice is not None and "/releases" in notice and "Sashimono.new" not in notice
