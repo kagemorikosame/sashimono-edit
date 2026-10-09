@@ -29,6 +29,11 @@ CI のまっさらな Windows（.github/workflows/package.yml の clean-machine�
      起こす流れの途中で、利用者の機械の Defender に消された
   9. exe のプロパティ（版情報）に製品名と版が入っていること 版は zip の build-info.json と同じ
      （コード署名の条件で、署名する exe の製品名と版をそろえる Issue #255）
+ 10. 自動更新の入れ替えを本物の exe で通す 作業場所をインストール先にして（Explorer から起こしたのと
+     同じ）起こし、展開済みの新しい版（今組んだ zip）へ入れ替わって窓を出すまでを見る（#279）
+     今組んだ版からは必ず通す 1 つ前に公開した版（GitHub Releases の latest CI でだけ落とす）からは、
+     その版が入れ替え係の台本を持つ（0.2.1 から）なら必ず通し、持たなければ失敗を記録するだけ
+     （切り替えは Test-PreviousMustPass の 1 か所）
 
 結果は -Report のフォルダ（ログと窓の写真）と、GITHUB_STEP_SUMMARY（あれば）へ書く
 1 つでも落ちたら終了コード 1
@@ -46,7 +51,9 @@ param(
     # 窓が出てから閉じるまで待つ秒数 起動の 3 秒後に更新を確かめに行く所まで通したい
     [int]$WindowSeconds = 10,
     # GL の 2 項目が GL の理由で落ちるのを許す GPU のある機械で走らせるなら外す
-    [switch]$RequireGL
+    [switch]$RequireGL,
+    # 1 つ前に公開した版の zip 渡さなければ、CI の runner でだけ GitHub Releases の latest から落とす
+    [string]$PreviousZip = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -611,6 +618,199 @@ try {
     }
 } catch {
     Fail "後から入れる部品の確かめが終わらない: $_"
+}
+
+# --- 自動更新の入れ替えを、本物の exe と Explorer から起こしたのと同じ作業場所で通す（#279） ---
+# 自己診断の予行は使い捨ての見本で入れ替えるだけで、本物の exe が入れ替え係を起こし、入れた版が
+# 窓を出すまでは通らない 0.2.0 までの版は、作業場所（インストール先）を受け継いだ入れ替え係が
+# 自分で改名を断らせ、使う人の機械で毎回失敗した 試験と予行はその条件を作っていなかった
+# 目録の署名は CI では本物の鍵が無いので、落として確かめ終えた後の形（.new と覚え書き）を
+# 置いてから起こす 本人が〔次の起動で入れる〕を選んで起こし直したのと同じ道（apply_on_start）
+# 書き出しの後に走らせる ファイアウォールの規則を戻した後なので、入れた版の更新の確認が外へ出ても
+# 数えない（自己診断が外へ出ないことは上で見てある）
+function Test-Swap([string]$Label, [string]$FromZip, [int]$TimeoutSeconds = 300) {
+    # 返すのは [pscustomobject]@{ Passed; Detail } 落ちても止めずに理由を返す
+    # Windows PowerShell 5.1 からも呼べる形で書く（手元で zip を組んで確かめるときに 5.1 で走らせる）
+    $base = Join-Path $Root "入れ替え $Label"
+    $swapLocal = Join-Path $base 'AppData\Local'
+    $swapRoaming = Join-Path $base 'AppData\Roaming'
+    $swapTemp = Join-Path $swapLocal 'Temp'
+    foreach ($folder in @($swapLocal, $swapRoaming, $swapTemp)) {
+        New-Item -ItemType Directory -Force $folder | Out-Null
+    }
+    Expand-Archive -LiteralPath $FromZip -DestinationPath $base
+    $install = Join-Path $base 'Sashimono'
+    $staged = "$install.new"
+    $unpack = Join-Path $base '新しい版'
+    Expand-Archive -LiteralPath $Zip -DestinationPath $unpack
+    Move-Item -LiteralPath (Join-Path $unpack 'Sashimono') -Destination $staged
+    # 入れるのは今の版より新しい版だけなので、新しい版の書き付けの版を上げる（中身は今組んだ物）
+    $infoPath = Join-Path $staged 'build-info.json'
+    $info = Get-Content -LiteralPath $infoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $info.version = $SwapVersion
+    # BOM を付けない 本体は書き付けを BOM の無い UTF-8 として読む
+    $noBom = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText($infoPath, ($info | ConvertTo-Json), $noBom)
+    $updateDir = Join-Path $swapLocal 'Sashimono\update'
+    New-Item -ItemType Directory -Force $updateDir | Out-Null
+    $state = [ordered]@{ ready_version = $SwapVersion; apply_on_start = $true; apply_chosen = $true }
+    [IO.File]::WriteAllText((Join-Path $updateDir 'state.json'), ($state | ConvertTo-Json), $noBom)
+
+    $start = New-Object System.Diagnostics.ProcessStartInfo (Join-Path $install 'Sashimono.exe')
+    # Explorer やショートカットから起こしたのと同じく、作業場所をインストール先にする
+    $start.WorkingDirectory = $install
+    $start.UseShellExecute = $false
+    $start.Environment.Clear()
+    foreach ($entry in $Environment.GetEnumerator()) { $start.Environment[$entry.Key] = $entry.Value }
+    $start.Environment['APPDATA'] = $swapRoaming
+    $start.Environment['LOCALAPPDATA'] = $swapLocal
+    $start.Environment['TEMP'] = $swapTemp
+    $start.Environment['TMP'] = $swapTemp
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $detail = ''
+    $passed = $false
+    try {
+        $first = [System.Diagnostics.Process]::Start($start)
+        # 起こした版は入れ替え係を起こし、走り始めたのを見て終わる（swap.START_SECONDS まで待つ）
+        if (-not $first.WaitForExit(120000)) {
+            $detail = '起こした版が入れ替え係を起こさずに 120 秒動き続けた（覚え書きを読んでいない）'
+        } else {
+            # 入れ替え係が終わる（錠が空く）まで待つ 結果のファイルは、入れ替え係が起こし直した
+            # 版が読んで消すことがあるので、待つ間に読み続けて控える
+            $lock = Join-Path $updateDir 'swap.lock'
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            $finished = $false
+            while ((Get-Date) -lt $deadline) {
+                foreach ($file in @(Get-ChildItem -LiteralPath $updateDir -Filter 'result-*.txt' -ErrorAction SilentlyContinue)) {
+                    try {
+                        foreach ($line in [IO.File]::ReadAllLines($file.FullName)) {
+                            $text = $line.Trim()
+                            if ($text -and -not $lines.Contains($text)) { $lines.Add($text) }
+                        }
+                    } catch { }
+                }
+                if (-not (Test-Path -LiteralPath $lock)) { $finished = $true; break }
+                try {
+                    $held = [IO.File]::Open($lock, 'Open', 'ReadWrite', 'None')
+                    $held.Dispose()
+                    $finished = $true
+                    break
+                } catch {
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+            if (-not $finished) { $detail = "入れ替え係が $TimeoutSeconds 秒で終わらない" }
+        }
+        $now = Get-Content -LiteralPath (Join-Path $install 'build-info.json') -Raw -Encoding UTF8 -ErrorAction SilentlyContinue | ConvertFrom-Json
+        $passed = (-not $detail) -and $lines.Contains('healthy') -and $now -and ($now.version -eq $SwapVersion)
+        if (-not $detail) {
+            $detail = '結果: ' + ($lines -join ' ') + ' / 入れた後のインストール先の版: ' + $(if ($now) { $now.version } else { '読めない' })
+        }
+    } catch {
+        $passed = $false
+        $detail = "確かめの途中で止まった: $_"
+    } finally {
+        # 起こし直された版（入れた版か、失敗して起こし直された前の版）を閉じる 残すと、後の
+        # 片付けと次の確かめが、そのフォルダを消せない
+        $prefix = $base.TrimEnd('\') + '\'
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } catch { $false }
+        } | ForEach-Object { try { $_.Kill(); [void]$_.WaitForExit(30000) } catch { } }
+    }
+    return [pscustomobject]@{ Passed = [bool]$passed; Detail = $detail }
+}
+
+# 新しい版の書き付けに書く版 本物の版と取り違えない大きな数（update/rehearsal.py の見本と同じ）
+$SwapVersion = '9999.0.0'
+
+# 1 つ前に公開した版 → 今組んだ版 を必ず通す扱いにするかを決める所（ここだけ）
+# 0.2.0 までの版は、作業場所を受け継いだ入れ替え係が自分で改名を断らせるので、この条件では
+# 必ず失敗する（#279） 失敗を記録して知らせるだけにする 入れ替え係の台本を持つ版（書き付けに
+# swap_contract がある 0.2.1 から）が 1 つ前の公開版になったら、必ず通す扱いへ自動で切り替わる
+# 書き付けを読めなくても、zip の名前の版が 0.2.1 以上なら必ず通す（読めないだけで警告に下げない）
+$ScriptSince = [version]'0.2.1'
+function Test-PreviousMustPass($PreviousInfo, [string]$ZipVersion) {
+    if ($null -ne $PreviousInfo -and $null -ne $PreviousInfo.swap_contract) { return $true }
+    if ($ZipVersion -match '^(\d+)\.(\d+)\.(\d+)') {
+        return [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" -ge $ScriptSince
+    }
+    # 名前からも版が分からない 分からない物を警告に下げると、必須の確かめが黙って抜ける
+    return $true
+}
+
+function Read-ZipBuildInfo([string]$Path) {
+    # zip の中の書き付けを読む 無い・読めない・版が無いときは例外（呼ぶ側が理由を残して落とす）
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $opened = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $entry = $opened.GetEntry('Sashimono/build-info.json')
+        if ($null -eq $entry) { throw 'zip に Sashimono/build-info.json が無い' }
+        $reader = New-Object IO.StreamReader ($entry.Open())
+        try { $info = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    } finally {
+        $opened.Dispose()
+    }
+    if ($null -eq $info -or -not $info.version) { throw 'build-info.json に版が無い' }
+    return $info
+}
+
+function Get-ZipVersion([string]$Path) {
+    # 配る zip の名前（SashimonoEdit-<版>-windows-x64.zip tools/build_package.py）から版を読む
+    $name = [IO.Path]::GetFileName($Path)
+    if ($name -match '^SashimonoEdit-(.+)-windows-x64\.zip$') { return $Matches[1] }
+    return ''
+}
+
+function Get-PreviousZip {
+    # 1 つ前に公開した版（GitHub Releases の latest）の zip CI の runner でだけ落とす
+    # 手元では -PreviousZip に渡した物を使い、渡さなければ飛ばす
+    if ($PreviousZip) { return $PreviousZip }
+    if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:GH_TOKEN -or -not $env:GITHUB_REPOSITORY) { return $null }
+    $folder = Join-Path ([IO.Path]::GetTempPath()) 'sashimono-previous-release'
+    if (Test-Path -LiteralPath $folder) { Remove-Item -LiteralPath $folder -Recurse -Force }
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    & gh release download --repo $env:GITHUB_REPOSITORY --pattern 'SashimonoEdit-*-windows-x64.zip' --dir $folder 2>&1 | Write-Host
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $found = @(Get-ChildItem -LiteralPath $folder -Filter 'SashimonoEdit-*-windows-x64.zip')
+    if ($found.Count -ne 1) { return $null }
+    return $found[0].FullName
+}
+
+try {
+    # 今組んだ版 → 今組んだ版 必ず通す この版の入れ替え係と、入れ替え係に起こされた版の起動を見る
+    $selfSwap = Test-Swap '今の版から' $Zip
+    if ($selfSwap.Passed) {
+        Note "作業場所をインストール先にして、今組んだ版から今組んだ版へ入れ替わった（$($selfSwap.Detail)）"
+    } else {
+        Fail "作業場所をインストール先にした入れ替えが通らない（今組んだ版から）: $($selfSwap.Detail)"
+    }
+
+    $previous = Get-PreviousZip
+    if (-not $previous) {
+        Note '1 つ前の公開版の zip が無いので、公開版からの入れ替えを飛ばした（CI の runner でだけ落とす）'
+    } else {
+        $previousInfo = $null
+        $zipVersion = Get-ZipVersion $previous
+        try {
+            $previousInfo = Read-ZipBuildInfo $previous
+        } catch {
+            # 0.1.0 から配った zip はどれも書き付けを持つ 読めないのは zip か落とし方の異常で、
+            # 黙ると必須の確かめが警告に下がりうる 理由を残して落とす
+            Fail "公開版の zip（$([IO.Path]::GetFileName($previous))）の build-info.json を読めない: $_"
+        }
+        $previousVersion = if ($previousInfo) { $previousInfo.version } elseif ($zipVersion) { $zipVersion } else { '版が読めない' }
+        $previousSwap = Test-Swap '公開版から' $previous
+        if ($previousSwap.Passed) {
+            Note "作業場所をインストール先にして、公開版 $previousVersion から今組んだ版へ入れ替わった（$($previousSwap.Detail)）"
+        } elseif (Test-PreviousMustPass $previousInfo $zipVersion) {
+            Fail "公開版 $previousVersion から今組んだ版へ入れ替わらない（作業場所はインストール先）: $($previousSwap.Detail)"
+        } else {
+            Write-Host "::warning::公開版 $previousVersion から今組んだ版へ入れ替わらない（この版の入れ替え係の不具合 #279 で分かっている）: $($previousSwap.Detail)"
+            Note "公開版 $previousVersion からの入れ替えは失敗した（#279 で分かっている古い版の不具合 落とさずに記録だけ）: $($previousSwap.Detail)"
+        }
+    }
+} catch {
+    Fail "自動更新の入れ替えの確かめが終わらない: $_"
 }
 
 # --- 結果 ---

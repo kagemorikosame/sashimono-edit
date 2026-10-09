@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -20,6 +21,7 @@ from dataclasses import dataclass, replace
 from sashimono import __version__
 from sashimono.core import userdirs
 from sashimono.core.io.locks import try_hold
+from sashimono.links import RELEASES_URL
 from sashimono.update.fetch import Transport
 from sashimono.update.manifest import Manifest, is_newer, is_prerelease
 from sashimono.update.package import CarryError, Layout, carry_user_files, current_layout, stage
@@ -31,7 +33,13 @@ from sashimono.update.state import (
     busy_with,
     lock_path,
 )
-from sashimono.update.swap import SwapPlan, launch, take_result, wait_started
+from sashimono.update.swap import (
+    SwapPlan,
+    launch,
+    started_by_swapper,
+    take_result,
+    wait_started,
+)
 
 __all__ = [
     "PREFERENCES_FILE",
@@ -60,9 +68,18 @@ _FAILURES = {
     ),
     "busy": "ほかの Sashimono の窓が開いていた",
     "previous-locked": "前の版のフォルダを片付けられなかった",
-    "install-locked": "今の版のフォルダを動かせなかった（ほかのプログラムが開いている）",
+    # 断ったプログラムは名前を出せない 作業場所として持っているだけのプロセスは、開いた
+    # ファイルを調べる Windows の仕組み（Restart Manager）にも出てこない よくある例を挙げる
+    "install-locked": (
+        "今の版のフォルダの名前を変えるのを断られた Explorer やターミナルでこのフォルダを"
+        "開いていないか、ウイルス対策が検査していないかを確かめてください"
+    ),
     "staged-locked": "新しい版のフォルダを動かせなかった",
 }
+
+#: 同じわけで続けて失敗したら、手で入れ替える手順を案内する回数
+#: 1 回目は一時的な錠（ウイルス対策の検査など）かもしれないので、入れ直しを勧める
+MANUAL_AFTER = 2
 
 
 def start_swap(plan: SwapPlan) -> bool:
@@ -176,7 +193,10 @@ def apply_on_start(
         return False
     busy = busy_with(store.path.parent)
     if busy == "swap":
-        return True
+        # 入れ替え係に起こされた版は、その入れ替え係が錠を持ったまま窓を待っている相手
+        # ここで終わると、入れ替えたばかりの版が起動できなかったと数えられて前の版へ戻される
+        # 0.2.0 までの入れ替え係が起こした版でも、起動できた印の場所が渡るので見分けられる
+        return not started_by_swapper()
     if busy is not None:
         return False  # ほかの窓が新しい版を落としている 置き場が替わる途中なので触らない
     loaded = store.load()
@@ -253,19 +273,30 @@ def settle(
             notice = f"Sashimono Edit {current} に更新しました"
         state = _clear_ready(state)
     else:
-        failure = next((text for key, text in _FAILURES.items() if key in lines), None)
-        if failure is None:
-            failure = next(
-                (line[len("error ") :] for line in lines if line.startswith("error ")), None
+        found = next(((key, text) for key, text in _FAILURES.items() if key in lines), None)
+        if found is None:
+            found = next(
+                (("error", line[len("error ") :]) for line in lines if line.startswith("error ")),
+                None,
             )
-        if failure is not None and ready:
+        if found is not None and ready:
             # 入れ替えに失敗した版は、尋ねない設定でも自動では予約し直さない（reconcile）
             state = replace(state, auto_blocked=ready)
-        if failure is not None:
-            notice = (
-                f"更新を入れられませんでした（{failure}）"
-                " ヘルプの〔更新を確かめる…〕から入れ直せます"
-            )
+        if found is not None:
+            reason, failure = found
+            key = _failure_key(ready, reason, failure)
+            count = state.failure_count + 1 if state.last_failure == key else 1
+            state = replace(state, last_failure=key, failure_count=count)
+            if count >= MANUAL_AFTER:
+                notice = (
+                    f"更新を入れられませんでした（{failure}）"
+                    f" 同じ理由で {count} 回続けて入れられませんでした {_manual_steps(layout)}"
+                )
+            else:
+                notice = (
+                    f"更新を入れられませんでした（{failure}）"
+                    " ヘルプの〔更新を確かめる…〕から入れ直せます"
+                )
         if "rollback-failed" in lines and ready:
             # 起動できなかった版は、戻し切れなかったときも次から飛ばす
             state = _clear_ready(replace(state, skipped=(*state.skipped, ready)))
@@ -313,6 +344,10 @@ def prepare(
     try:
         stage(manifest, transport, layout, should_cancel=should_cancel)
         state = store.load()
+        if state.ready_version != manifest.version:
+            # 待たせる版が替わったら、前の版の失敗の続きを忘れる 残すと、版 A で 1 回失敗した
+            # 後、版 B の最初の失敗で手で入れ替える案内を出す（印にも版を含めて比べる）
+            state = replace(state, last_failure="", failure_count=0)
         store.save(
             replace(
                 state,
@@ -331,7 +366,45 @@ class UpdateBusyError(Exception):
     """ほかの窓か入れ替え係が更新を進めている 待てば済むので、起動時の確認では黙る"""
 
 
+#: 一般のエラー（``error ...``）の文面を比べるときに見る長さ 例外の文面は長いことがあり、
+#: 覚え書きを大きくしない 頭が同じなら同じ原因と見てよい
+_ERROR_TEXT_CHARS = 120
+
+
+def _failure_key(ready: str, reason: str, text: str) -> str:
+    """続けて失敗したかを比べる印 版と、失敗のわけ
+
+    版を含める 版 A で 1 回失敗した後、版 B の最初の失敗を「2 回続けて」と数えない
+    一般のエラー（``error``）は言葉が 1 つなので、文面も含める 別の原因の失敗 2 回を
+    同じ理由と数えない 数字（時刻・PID・行の番号など）は毎回変わりうるので落とし、
+    空白をそろえ、頭の :data:`_ERROR_TEXT_CHARS` 文字だけを見る
+    """
+    if reason == "error":
+        text = re.sub(r"\s+", " ", re.sub(r"\d+", "#", text)).strip()[:_ERROR_TEXT_CHARS]
+        reason = f"error {text}"
+    return f"{ready} {reason}"
+
+
+def _manual_steps(layout: Layout | None) -> str:
+    """入れ直しても同じ失敗を繰り返すときに、手で入れ替える手順
+
+    展開し終えた新しい版（``.new``）が残っていれば、名前を 2 回変えるだけで入れ替えられる
+    無ければ配布のページから入れ直してもらう
+    """
+    page = f"配布のページ（{RELEASES_URL}）から zip を落として入れ直すこともできます"
+    if layout is None or layout.staged_version() is None:
+        return f"入れ直しても同じ所で止まります {page}"
+    install, previous, staged = layout.install.name, layout.previous.name, layout.staged.name
+    return (
+        f"手で入れ替えるには、Sashimono を閉じてから、{layout.install.parent} を Explorer で開き、"
+        f"「{install}」を「{previous}」へ、「{staged}」を「{install}」へ名前を変えてください"
+        f"（「{previous}」が前からあれば、先に消すか別の名前にする） {page}"
+    )
+
+
 def _clear_ready(state: UpdateState) -> UpdateState:
+    # 失敗の続いた回数も消す 次に待つ版は別の版で、前の版の失敗を数えると、1 回目から
+    # 手で入れ替える案内を出すことになる
     return replace(
         state,
         ready_version="",
@@ -339,4 +412,6 @@ def _clear_ready(state: UpdateState) -> UpdateState:
         ready_python_abi="",
         apply_on_start=False,
         apply_chosen=False,
+        last_failure="",
+        failure_count=0,
     )

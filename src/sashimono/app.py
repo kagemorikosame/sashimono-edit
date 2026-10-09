@@ -154,8 +154,30 @@ def main(argv: list[str] | None = None) -> int:
     return _start_editor(arguments)
 
 
+def absolute_project_argument(arguments: list[str]) -> list[str]:
+    """開くプロジェクト（1 つ目の引数）を絶対の場所にした引数
+
+    起動の頭で作業場所をインストール先の外へ移す（:func:`_start_editor`）ので、移す前に
+    直しておく 相対のまま移すと、コマンドの行で ``Sashimono.exe 作品.sme`` と渡された物を
+    移した先で探して開けず、更新で起こし直すときにも別の場所を渡す ``-`` で始まる物は
+    Qt の引数なので触らない
+    """
+    if len(arguments) < 2 or not arguments[1] or arguments[1].startswith("-"):
+        return list(arguments)
+    return [arguments[0], str(Path(arguments[1]).resolve()), *arguments[2:]]
+
+
 def _start_editor(arguments: list[str]) -> int:
     """いつもの起動 Qt と編集画面はここで初めて読む"""
+    from sashimono.runtime import app_dir
+    from sashimono.update.swap import leave_install_folder
+
+    # 作業場所をインストール先の外へ移す 何より先に行う Explorer やショートカットから
+    # 起こすと作業場所がインストール先になり、この後に起こす子（入れ替え係・pip・AI）が
+    # 受け継いで、更新の入れ替えでフォルダの名前を変えるのを断らせる（#279）
+    # 配布版だけ（開発の環境ではインストール先が無い）
+    arguments = absolute_project_argument(arguments)
+    leave_install_folder(app_dir())
     # 改名前の置き場（設定・退避・導入した実行環境）を引き継ぐ 何より先に行う
     # 設定を読んだあとでは、既定の設定で新しい置き場ができてしまい、引き継ぎが
     # 「もう在る」と見て何もしなくなる 実行環境の置き場も、次の行で探す前に移しておく

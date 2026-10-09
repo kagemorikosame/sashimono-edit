@@ -86,15 +86,31 @@ class PackageError(Exception):
 class BuildInfo:
     version: str
     python_abi: str
+    #: 入れ替え係の台本と本体の受け渡しの版（``swap.SWAP_CONTRACT``） 0 なら台本を持たない版
+    swap_contract: int = 0
+    #: その版の入れ替え係の台本の場所（フォルダからの相対 ``/`` 区切り） 空なら持たない
+    swap_script: str = ""
 
 
-def write_build_info(folder: Path, version: str, python_abi: str) -> Path:
-    """書き付けを置く 配る zip を組み立てる道具が使う"""
+def write_build_info(
+    folder: Path,
+    version: str,
+    python_abi: str,
+    *,
+    swap_contract: int = 0,
+    swap_script: str = "",
+) -> Path:
+    """書き付けを置く 配る zip を組み立てる道具が使う
+
+    台本を持つ版は、受け渡しの版と台本の場所も書く 古い版（0.2.0 まで）は知らないキーを
+    読み飛ばすので、足しても古い版の確かめは通る
+    """
     path = folder / BUILD_INFO_NAME
-    path.write_text(
-        json.dumps({"version": version, "python_abi": python_abi}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    data: dict[str, object] = {"version": version, "python_abi": python_abi}
+    if swap_contract and swap_script:
+        data["swap_contract"] = swap_contract
+        data["swap_script"] = swap_script
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return path
 
 
@@ -108,7 +124,11 @@ def read_build_info(folder: Path) -> BuildInfo | None:
     version, abi = data.get("version"), data.get("python_abi")
     if not isinstance(version, str) or not isinstance(abi, str):
         return None
-    return BuildInfo(version, abi)
+    contract, script = data.get("swap_contract"), data.get("swap_script")
+    # 読めない値は「台本を持たない版」として扱う 入れ替え係は今の版の台本に戻る
+    if isinstance(contract, bool) or not isinstance(contract, int) or not isinstance(script, str):
+        return BuildInfo(version, abi)
+    return BuildInfo(version, abi, contract, script)
 
 
 @dataclass(frozen=True, slots=True)

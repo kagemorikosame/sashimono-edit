@@ -114,6 +114,28 @@ class TestTheLayout:
         package_module.write_build_info(layout.install, "1.2.3", "cp314")
         info = read_build_info(layout.install)
         assert info is not None and (info.version, info.python_abi) == ("1.2.3", "cp314")
+        # 台本を持たない版（0.2.0 まで）は受け渡しの版が 0
+        assert (info.swap_contract, info.swap_script) == (0, "")
+
+    def test_the_swap_script_is_read_from_the_build_info(self, layout: Layout) -> None:
+        package_module.write_build_info(
+            layout.install, "1.2.3", "cp314", swap_contract=4, swap_script="_internal/x.ps1"
+        )
+        info = read_build_info(layout.install)
+        assert info is not None and (info.swap_contract, info.swap_script) == (4, "_internal/x.ps1")
+
+    @pytest.mark.parametrize(
+        "extra", ['"swap_contract": true', '"swap_contract": "1"', '"swap_script": 3']
+    )
+    def test_a_broken_swap_entry_means_no_script(self, layout: Layout, extra: str) -> None:
+        """読めない値は台本を持たない版として扱う 入れ替え係は今の版の台本に戻る"""
+        (layout.install / "build-info.json").write_text(
+            '{"version": "1.2.3", "python_abi": "cp314", "swap_script": "a.ps1",'
+            f' "swap_contract": 1, {extra}}}',
+            encoding="utf-8",
+        )
+        info = read_build_info(layout.install)
+        assert info is not None and info.version == "1.2.3" and info.swap_contract == 0
 
 
 class TestUserScripts:

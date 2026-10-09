@@ -19,6 +19,14 @@ r"""フォルダの入れ替えと、入れた版が起動できなかったと�
    :func:`mark_started`） 2 回続けて起動できなければ、新しい版を ``.failed`` へよけて
    前の版へ戻し、前の版を起こす
 4. 何をしたかを結果のファイルへ書く 次に起動した本体が読んで本人に知らせる（:func:`take_result`）
+
+**台本は新しい版の物を使う**（#279） 入れ替え係を起こすのは今の版なので、今の版の中の台本を
+使うと、台本の不具合を直しても 1 つ前の版からの更新には効かない（0.2.0 までの版は、作業場所を
+受け継いだ入れ替え係が自分で改名を断らせる不具合を、直した版へ上げるときにも起こす）
+新しい版は、zip の中に台本（:data:`BUNDLED_SCRIPT`）と、本体との受け渡しの版の数字
+（:data:`SWAP_CONTRACT` ``build-info.json`` に書く）を持つ 数字が今の版と同じときだけ、
+目録の SHA-256 で確かめて展開した新しい版の台本を使い、合わない・無い・読めないときは今の版の
+台本に戻す 受け渡し（環境変数の名前・結果の言葉・錠の持ち方）を変えるときは数字を上げる
 """
 
 from __future__ import annotations
@@ -33,22 +41,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sashimono.core.io.locks import is_held
-from sashimono.update.package import APP_EXE, Layout
+from sashimono.update.package import APP_EXE, Layout, read_build_info
 from sashimono.update.state import SWAP_LOCK, lock_path, update_dir
 
 __all__ = [
+    "BUNDLED_SCRIPT",
     "HEALTH_ENV",
     "HELPER_SCRIPT",
+    "RELAUNCHED_ENV",
+    "SWAP_CONTRACT",
     "SwapPlan",
+    "helper_script",
     "launch",
+    "leave_install_folder",
     "mark_started",
     "powershell_path",
+    "started_by_swapper",
     "take_result",
     "wait_started",
 ]
 
 #: 入れ替え係が新しい版に渡す、起動できた印のファイルの場所
 HEALTH_ENV = "SASHIMONO_UPDATE_HEALTH_FILE"
+
+#: 入れ替え係が起こし直した本体に立てる印（台本の ``Start-App`` が立てる）
+RELAUNCHED_ENV = "SASHIMONO_UPDATE_RELAUNCHED"
+
+#: 本体と台本の受け渡しの版 環境変数の名前・結果のファイルに書く言葉・錠の持ち方のどれかを
+#: 変えたら上げる 上げると、1 つ前の版はこの版の台本を使わず自分の台本で入れ替える
+#: （受け渡しの合わない台本を走らせて、結果を読み違えたり錠を取り合ったりしない）
+SWAP_CONTRACT = 1
+
+#: 配る zip の中の台本の場所（``Sashimono`` からの相対） ``build-info.json`` にも書くので、
+#: 読む側はこの名前ではなく書き付けの場所を使う（後の版で置き場を変えても読める）
+BUNDLED_SCRIPT = "_internal/sashimono-update-helper.ps1"
+
+#: 新しい版の台本として読む大きさの上限 書き付けが壊れて大きな物を指していても読み込まない
+_MAX_SCRIPT_BYTES = 1024 * 1024
 
 #: 入れ替え係の台本 ここに書いた物しか走らない（落とした物は走らせない）
 #: 文字列は単引用符だけで書く 二重引用符は PowerShell の中で展開の意味を持つ
@@ -70,18 +99,46 @@ $waitSeconds = [int]$env:SASHIMONO_UPDATE_WAIT_SECONDS
 $healthSeconds = [int]$env:SASHIMONO_UPDATE_HEALTH_SECONDS
 $lock = $env:SASHIMONO_UPDATE_LOCK
 
+# 作業場所を、入れ替えるフォルダの外（台本の置き場 = 更新の置き場）へ移す
+# Windows は、どれかのプロセスの作業場所になっているフォルダの名前を変えさせない 起こした側の
+# 作業場所を受け継いだままだと、インストール先を作業場所にした本体（Explorer やショートカットから
+# 起こすとそうなる）に起こされたとき、入れ替え係が自分で改名を断らせる（#279）
+# 起こす側（launch）も外を渡すが、ほかの道で起こされても守れるよう台本の側でも移す
+# PowerShell の Set-Location はプロセスの作業場所を変えないので、.NET の側でも変える
+$outside = $PSScriptRoot
+if (-not $outside) { $outside = [System.IO.Path]::GetTempPath() }
+try {
+    Set-Location -LiteralPath $outside
+    [System.IO.Directory]::SetCurrentDirectory($outside)
+} catch {
+}
+# 起こし直す本体の作業場所 本体が自分で移す先（利用者のホーム）と同じにする
+# インストール先にすると、起こした版が古い版（前の版へ戻したとき）なら自分では外へ移さず、
+# 次の更新でまた同じ所で断られる ファイルを開く窓の最初の場所も作業場所になる
+$appFolder = [System.Environment]::GetFolderPath('UserProfile')
+if (-not $appFolder -or -not (Test-Path -LiteralPath $appFolder)) { $appFolder = $outside }
+# 起こし直した本体へ、入れ替え係が起こしたことを知らせる 入れ替え係はこの後も錠を持ったまま
+# 新しい版の窓を待つ 知らせないと、本体は錠を見て「入れ替えの最中」と思い、窓を出さずに終わる
+$env:SASHIMONO_UPDATE_RELAUNCHED = '1'
+
 function Write-Result([string]$text) {
-    # 本体が結果を読んでいる間は、書き足しが断られることがある（ほかのプロセスが使用中）
-    # 書けずに止まると、走り始めたのに本体は走らないと取り違える 少し待って書き直す
-    for ($i = 0; $i -lt 50; $i++) {
+    # 書き足しは .NET で、ほかのプロセスの読み書きを許して開く Add-Content は、本体が結果を
+    # 読んで開いている間は必ず断られる（試して確かめた） 本体は走り始めの印を 0.1 秒ごとに
+    # 読むので、重いと書き直しの度に重なり、走り始めの印を書く前に止まった（PR #280 の CI）
+    # 許して開いても、ウイルス対策の検査などで断られることはあるので、少し待って書き直す
+    # 回数ではなく時間で区切る（遅い機械では 1 回の試しが長い）
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text + [char]13 + [char]10)
+    $deadline = (Get-Date).AddSeconds(15)
+    while ($true) {
         try {
-            Add-Content -LiteralPath $result -Value $text -Encoding UTF8 -ErrorAction Stop
+            $stream = [System.IO.File]::Open($result, 'Append', 'Write', 'ReadWrite, Delete')
+            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
             return
         } catch {
+            if ((Get-Date) -ge $deadline) { throw }
             Start-Sleep -Milliseconds 100
         }
     }
-    Add-Content -LiteralPath $result -Value $text -Encoding UTF8
 }
 
 # 本体と、同じフォルダから動いているほかの窓が終わるのを待つ
@@ -139,7 +196,7 @@ function Start-App([string]$folder = $install) {
             if ($item) { $list += ([char]34 + $item + [char]34) }
         }
     }
-    $params = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $folder }
+    $params = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $appFolder }
     if ($list.Count -gt 0) { $params.ArgumentList = $list }
     if ($hidden) { $params.WindowStyle = 'Hidden' }
     return Start-Process @params
@@ -319,6 +376,8 @@ class Launched:
 
     process: subprocess.Popen[bytes]
     result: Path
+    #: 新しい版の台本で走らせたか（偽なら今の版の台本）
+    from_staged: bool = False
 
     def lines(self) -> list[str]:
         return _lines(self.result)
@@ -333,10 +392,57 @@ def _aside(layout: Layout) -> Path:
     return layout.install.with_name(layout.install.name + ".rolling")
 
 
+def _normalized(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    """``path`` が ``folder`` そのものか、その中か（大文字小文字を区別しない Windows に合わせる）"""
+    inner, outer = _normalized(path), _normalized(folder).rstrip("\\/")
+    return inner == outer or inner.startswith(outer + os.sep)
+
+
+def helper_script(plan: SwapPlan) -> tuple[str, bool]:
+    """走らせる台本と、それが新しい版の物か
+
+    新しい版を入れる（``apply``）ときだけ、展開し終えた新しい版（``.new``）の台本を使う
+    ``.new`` は目録の署名と zip の SHA-256 を確かめてから展開した物で（:func:`~.package.stage`）、
+    入れ替え係を起こす側は、その版が覚え書きの版と同じときだけここへ来る
+    受け渡しの版（:data:`SWAP_CONTRACT`）が合わない・書き付けや台本が無い・読めない・
+    ``.new`` の外を指すときは今の版の台本に戻す 戻す（``rollback``）ときは今ある版の台本でよい
+    """
+    if plan.mode != "apply":
+        return HELPER_SCRIPT, False
+    staged = plan.layout.staged
+    info = read_build_info(staged)
+    if info is None or info.swap_contract != SWAP_CONTRACT or not info.swap_script:
+        return HELPER_SCRIPT, False
+    path = staged / info.swap_script
+    # 書き付けが .new の外（..\ や別のドライブ）を指していたら使わない 確かめた中身ではない
+    if not _inside(path, staged) or _normalized(path) == _normalized(staged):
+        return HELPER_SCRIPT, False
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_SCRIPT_BYTES:
+            return HELPER_SCRIPT, False
+        # 行の終わりはそろえておく 書くとき（write_text）に \n を \r\n へ直すので、そのまま
+        # 渡すと \r\r\n になる
+        text = path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+    except (OSError, UnicodeDecodeError):
+        return HELPER_SCRIPT, False
+    if not text.strip():
+        return HELPER_SCRIPT, False
+    return text, True
+
+
 def launch(plan: SwapPlan, folder: Path | None = None) -> Launched:
     """入れ替え係を起こす 本体はこの後に終わる（待つのは入れ替え係の側）
 
     台本は毎回書き直す 置いてある台本を走らせると、誰かが書き換えた物を走らせることになる
+    台本は新しい版の物を使えればそれを使う（:func:`helper_script`）
     """
     folder = folder if folder is not None else update_dir()
     folder.mkdir(parents=True, exist_ok=True)
@@ -344,8 +450,11 @@ def launch(plan: SwapPlan, folder: Path | None = None) -> Launched:
     # 結果をもう片方が消したり、片方の「走り始めた」をもう片方が自分の物と読んだりしない
     token = uuid.uuid4().hex
     script = folder / f"swap-{token}.ps1"
+    text, from_staged = helper_script(plan)
     # BOM 付きで書く PowerShell 5.1 は BOM の無い台本を本人の文字コード（cp932）で読む
-    script.write_text(HELPER_SCRIPT, encoding="utf-8-sig")
+    # 新しい版の台本も、.new の中から直に走らせず写してから走らせる .new は入れ替えの途中で
+    # 名前が変わり、走らせている物の場所が動く
+    script.write_text(text, encoding="utf-8-sig")
     result = folder / f"result-{token}.txt"
     health = folder / f"started-{token}.txt"
     layout = plan.layout
@@ -396,10 +505,14 @@ def launch(plan: SwapPlan, folder: Path | None = None) -> Launched:
                 stderr=subprocess.DEVNULL,
                 creationflags=flags,
                 close_fds=True,
+                # 作業場所は台本の置き場（インストール先の外） 渡さないと本体の作業場所を
+                # 受け継ぐ Explorer から起こした本体の作業場所はインストール先で、入れ替え係が
+                # 自分でインストール先の改名を断らせる（#279）
+                cwd=folder,
             )
         except PermissionError:
             continue
-        return Launched(process, result)
+        return Launched(process, result, from_staged)
     raise OSError("入れ替え係を起こせない")
 
 
@@ -431,6 +544,48 @@ def wait_started(launched: Launched, timeout: float = START_SECONDS) -> bool:
     if launched.process.poll() is None:
         launched.process.kill()
     return False
+
+
+def started_by_swapper() -> bool:
+    """この起動は入れ替え係が起こした物か
+
+    入れ替え係は、新しい版を起こした後も錠を持ったまま窓が出るのを待つ 起こされた本体が
+    錠を見て「入れ替えの最中」と思って終わると、新しい版は起動できなかったと数えられ、
+    前の版へ戻される 起動できた印の場所（:data:`HEALTH_ENV` 0.2.0 までの台本も渡す）か、
+    起こし直した印（:data:`RELAUNCHED_ENV`）があれば、入れ替え係に起こされた
+    """
+    return bool(os.environ.get(HEALTH_ENV)) or os.environ.get(RELAUNCHED_ENV) == "1"
+
+
+def leave_install_folder(install: Path | None, home: Path | None = None) -> Path | None:
+    """本体の作業場所がインストール先の中なら外へ移す 移した先を返す（移さなければ ``None``）
+
+    Windows は、どれかのプロセスの作業場所になっているフォルダの名前を変えさせない
+    Explorer やショートカットから起こした本体は、作業場所がインストール先になる 本体が起こす
+    子（入れ替え係・pip・AI・FFmpeg）はそれを受け継ぎ、本体より長く残る物が次の更新の
+    入れ替えを断らせる（#279） 移す先は利用者のホーム ファイルを開く窓が最初に出す場所も
+    作業場所なので、更新で消えるインストール先へ保存させないことにもなる
+
+    ``install`` が ``None``（開発の環境）なら何もしない 開発では作業場所に相対の場所で
+    触ることがあり、入れ替えも起きない 作業場所がインストール先の外なら移さない
+    コマンドの行から起こした人は、そこを基準に相対の場所を渡している
+    """
+    if install is None:
+        return None
+    try:
+        here = Path.cwd()
+    except OSError:
+        here = None  # 作業場所が消されている どこかへ移しておく
+    if here is not None and not _inside(here, install):
+        return None
+    for target in (home if home is not None else Path.home(), update_dir()):
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            os.chdir(target)
+        except OSError:
+            continue
+        return target
+    return None
 
 
 def mark_started() -> None:
