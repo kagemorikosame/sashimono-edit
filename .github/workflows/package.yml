@@ -134,7 +134,7 @@ jobs:
       contents: read
     # check_clean_machine.ps1 の待ちの上限の合計より長くする 短いと、時間切れの段が要約を書く前に
     # ジョブが取り消される 合計は試験が数える（tests/test_packaging.py どちらか一方だけ変えると落ちる）
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       # 確かめる道具（PowerShell）だけを取る Python・uv・依存は入れない
       - uses: actions/checkout@v7
@@ -153,6 +153,9 @@ jobs:
         env:
           PACKAGE_DIR: ${{ runner.temp }}/package
           REPORT_DIR: ${{ runner.temp }}/clean-check
+          # 1 つ前に公開した版の zip を落とし、そこからの自動更新の入れ替えも確かめる（#279）
+          # 読むだけ（このジョブの権限は contents: read）
+          GH_TOKEN: ${{ github.token }}
         run: |
           $zips = @(Get-ChildItem -LiteralPath $env:PACKAGE_DIR -Filter 'SashimonoEdit-*-windows-x64.zip')
           if ($zips.Count -ne 1) { throw "組み立てた zip が 1 つでない（$($zips.Count) 個）" }

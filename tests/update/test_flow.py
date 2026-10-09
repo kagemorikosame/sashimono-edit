@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,7 +27,15 @@ from sashimono.update.state import (
     UpdateStateStore,
     lock_path,
 )
-from sashimono.update.swap import SwapPlan, take_result
+from sashimono.update.swap import (
+    HEALTH_ENV,
+    RELAUNCHED_ENV,
+    Launched,
+    SwapPlan,
+    launch,
+    take_result,
+    wait_started,
+)
 from tests.update.helpers import release
 
 
@@ -269,6 +278,82 @@ class TestApplyingOnStart:
             assert apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
         finally:
             held.release()
+
+    @pytest.mark.parametrize(
+        ("name", "value"), [(HEALTH_ENV, "started.txt"), (RELAUNCHED_ENV, "1")]
+    )
+    def test_the_version_the_swapper_started_opens_its_window(
+        self,
+        layout: Layout,
+        store: UpdateStateStore,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+    ) -> None:
+        """入れ替え係が起こした新しい版は、錠が持たれていても窓を出す（#279 の作業中に見つけた）
+
+        入れ替え係は新しい版を起こした後も錠を持ったまま窓を待つ 錠を見て終わると、
+        新しい版が 2 回続けて起動できなかったと数えられ、入れたばかりの版を前の版へ戻す
+        0.2.0 までの入れ替え係は起動できた印の場所だけを渡すので、それでも見分ける
+        """
+        monkeypatch.delenv(HEALTH_ENV, raising=False)
+        monkeypatch.delenv(RELAUNCHED_ENV, raising=False)
+        monkeypatch.setenv(name, value)
+        held = try_hold(lock_path(SWAP_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            assert not apply_on_start(
+                ["x"], layout=layout, store=store, swap=_never, current="1.1.0"
+            )
+        finally:
+            held.release()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="入れ替え係は Windows の PowerShell")
+    def test_a_start_from_inside_the_install_folder_still_swaps(
+        self,
+        tmp_path: Path,
+        store: UpdateStateStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explorer から起こした（作業場所がインストール先の）本体でも、起動の頭で入れ替わる
+
+        入れ替え係は本物の PowerShell で走らせる 本体の代わりに .cmd を置き、本体（この
+        試験のプロセス）の終わりは待たせない（終わらないので） 起こした直後に作業場所を外へ
+        戻すのも同じ理由（本物の本体はこの後に終わる）
+        """
+        install = tmp_path / "利用者" / "Sashimono"
+        install.mkdir(parents=True)
+        (install / "app.cmd").write_text("@exit /b 0\r\n", encoding="ascii")
+        (install / "version.txt").write_text("old", encoding="ascii")
+        layout = Layout(install)
+        layout.staged.mkdir()
+        (layout.staged / "app.cmd").write_text(f'@echo ok> "%{HEALTH_ENV}%"\r\n', encoding="ascii")
+        (layout.staged / "version.txt").write_text("new", encoding="ascii")
+        # 本体の在り処の印 apply_on_start は exe ではなく書き付けの版を見る
+        (layout.staged / APP_EXE).write_bytes(b"MZ new")
+        write_build_info(layout.staged, "1.2.0", "cp314")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        folder = tmp_path / "update"
+        launched: list[Launched] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plan = replace(
+                plan, exe_name="app.cmd", pid=0, hidden=True, wait_seconds=10, health_seconds=10
+            )
+            launched.append(launch(plan, folder))
+            os.chdir(tmp_path)
+            return wait_started(launched[0])
+
+        monkeypatch.delenv(HEALTH_ENV, raising=False)
+        monkeypatch.delenv(RELAUNCHED_ENV, raising=False)
+        monkeypatch.chdir(install)
+        assert apply_on_start(
+            ["Sashimono.exe"], layout=layout, store=store, swap=swap, current="1.1.0"
+        )
+        launched[0].process.wait(timeout=120)
+        lines = take_result(folder)
+        assert "install-locked" not in lines and "healthy" in lines, lines
+        assert (install / "version.txt").read_text(encoding="ascii") == "new"
 
     def test_staging_elsewhere_is_left_alone(self, layout: Layout, store: UpdateStateStore) -> None:
         _stage(layout, "1.2.0")
@@ -561,6 +646,61 @@ class TestSettling:
         # 待っている版はそのまま 手で入れ直せる
         assert store.load().ready_version == "1.2.0"
 
+    def test_a_locked_install_names_likely_holders(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """「ほかのプログラムが開いている」だけでは何を閉じればよいか分からない（#279）"""
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0"))
+        notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert notice is not None and "Explorer" in notice and "ターミナル" in notice
+
+    def test_the_same_failure_twice_shows_the_manual_steps(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """同じわけで 2 回続けば、入れ直しを勧めず手で入れ替える手順を出す
+
+        0.2.0 までの入れ替え係は、作業場所の不具合で毎回同じ所で断られた（#279）
+        入れ直しを勧め続けると、本人は同じ失敗を繰り返すだけになる
+        """
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0"))
+        first = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert first is not None and "入れ直せます" in first
+        assert "Sashimono.new" not in first
+        second = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert second is not None and "2 回続けて" in second
+        assert "「Sashimono.new」を「Sashimono」へ" in second and "/releases" in second
+        assert store.load().failure_count == 2
+
+    def test_a_different_failure_starts_counting_again(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", last_failure="busy", failure_count=3))
+        notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert notice is not None and "続けて" not in notice
+        assert (store.load().last_failure, store.load().failure_count) == ("install-locked", 1)
+
+    def test_without_the_new_version_only_the_page_is_shown(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """展開した新しい版が無ければ、名前を変える手順は書かない（変える物が無い）"""
+        store.save(
+            UpdateState(ready_version="1.2.0", last_failure="install-locked", failure_count=1)
+        )
+        notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
+        assert notice is not None and "/releases" in notice and "Sashimono.new" not in notice
+
+    def test_a_finished_update_forgets_the_failures(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        store.save(
+            UpdateState(ready_version="1.2.0", last_failure="install-locked", failure_count=2)
+        )
+        settle(layout=layout, store=store, current="1.2.0", results=["swapped"])
+        assert (store.load().last_failure, store.load().failure_count) == ("", 0)
+
     def test_nothing_to_tell(self, layout: Layout, store: UpdateStateStore) -> None:
         assert settle(layout=layout, store=store, current="1.1.0", results=[]) is None
 
@@ -586,13 +726,21 @@ class TestTheState:
             ready_notes_url="https://x",
             ready_python_abi="cp314",
             apply_on_start=True,
+            last_failure="install-locked",
+            failure_count=2,
         )
         store.save(state)
         assert store.load() == state
 
     @pytest.mark.parametrize(
         "text",
-        ['{"last_checked": "昨日", "skipped": "1.0", "apply_on_start": 1}', "[]", "壊れた"],
+        [
+            '{"last_checked": "昨日", "skipped": "1.0", "apply_on_start": 1}',
+            '{"failure_count": true, "last_failure": 3}',
+            '{"failure_count": -1}',
+            "[]",
+            "壊れた",
+        ],
     )
     def test_broken_values_fall_back(self, store: UpdateStateStore, text: str) -> None:
         store.path.write_text(text, encoding="utf-8")

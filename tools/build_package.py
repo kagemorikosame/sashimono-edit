@@ -69,6 +69,7 @@ from sashimono.links import REPORT_URL  # noqa: E402
 from sashimono.runtime import python_abi  # noqa: E402
 from sashimono.selfcheck import UPDATE_CHECK_NAME  # noqa: E402
 from sashimono.update.package import BUILD_INFO_NAME, write_build_info  # noqa: E402
+from sashimono.update.swap import BUNDLED_SCRIPT, HELPER_SCRIPT, SWAP_CONTRACT  # noqa: E402
 
 #: exe と、zip を展開したときのフォルダの名前
 #: 短い名前にする 空白を含むとコマンドから ``--self-check`` を打つときに括りが要る
@@ -504,7 +505,18 @@ def assemble(bundle: Path) -> None:
     shutil.copyfile(NOTICES_SOURCE, bundle / NOTICES_NAME)
     # 自動更新が、落として展開した物が目録の言う版と Python かを確かめるのに読む
     # 組み立てた Python の印を書く 配った版の中の Python と同じ物
-    write_build_info(bundle, __version__, python_abi())
+    # 入れ替え係の台本も積み、受け渡しの版と場所を書く 1 つ前の版がこの版を入れるとき、自分の
+    # 台本ではなくこの台本を使う（#279 台本の直しが、1 つ前の版からの更新にも効くように）
+    script = bundle / BUNDLED_SCRIPT
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(HELPER_SCRIPT, encoding="utf-8-sig")
+    write_build_info(
+        bundle,
+        __version__,
+        python_abi(),
+        swap_contract=SWAP_CONTRACT,
+        swap_script=BUNDLED_SCRIPT,
+    )
     for relative in repository_license_files():
         destination = bundle / LICENSES_DIR / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -748,7 +760,7 @@ def native_license_problems(internal: Path) -> list[str]:
 #: :func:`collect_licenses` が置く物）
 ASSEMBLED = ("README.txt", "LICENSE.txt", NOTICES_NAME)
 #: 使用許諾ではないが :func:`assemble` が置く物（使用許諾の照合には混ぜない）
-ASSEMBLED_INFO = (BUILD_INFO_NAME,)
+ASSEMBLED_INFO = (BUILD_INFO_NAME, BUNDLED_SCRIPT)
 ASSEMBLED_FOLDERS = (PORTABLE_SCRIPTS_DIR, LICENSES_DIR)
 
 
@@ -1012,6 +1024,8 @@ def update_failures(home: Path, self_check_output: str) -> list[str]:
       展開・PowerShell の入れ替えまでを配布版の exe の中で通す）
     - zip に版と Python の書き付けが入っていて、この版と同じ 無いと、配った版がこの zip を
       新しい版として受け取れない（展開した物を確かめる所で止まる）
+    - 入れ替え係の台本が書き付けの言う場所にあり、この版の台本と同じ 無いと、1 つ前の版は
+      自分の台本で入れ替え、台本の直しが効かない
     """
     failures = []
     if f"[ok] {UPDATE_CHECK_NAME}:" not in self_check_output:
@@ -1020,9 +1034,20 @@ def update_failures(home: Path, self_check_output: str) -> list[str]:
         written = json.loads((home / BUILD_INFO_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         written = None
-    expected = {"version": __version__, "python_abi": python_abi()}
+    expected = {
+        "version": __version__,
+        "python_abi": python_abi(),
+        "swap_contract": SWAP_CONTRACT,
+        "swap_script": BUNDLED_SCRIPT,
+    }
     if written != expected:
         failures.append(f"{BUILD_INFO_NAME} が無いか違う（{written} / {expected}）")
+    try:
+        script = (home / BUNDLED_SCRIPT).read_text(encoding="utf-8-sig")
+    except OSError:
+        script = None
+    if script != HELPER_SCRIPT:
+        failures.append(f"入れ替え係の台本（{BUNDLED_SCRIPT}）が無いか、この版の物と違う")
     return failures
 
 

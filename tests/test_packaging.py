@@ -1871,10 +1871,43 @@ class TestTheAddOnsAreCheckedTheUsersWay:
             + number(r"\[int\]\$WindowSeconds = (\d+)")
             + number(r"\$window\.WaitForExit\((\d+)\)") // 1000
         )
-        # 数えない段（取り出し・展開・ファイアウォールの見本・記録を待つ 5 秒・要約）の分
-        rest = 300
-        total = sum(exe_waits) + probe * probes + window + rest
-        assert total < limit, (exe_waits, probe * probes, window, rest, limit)
+        # 自動更新の入れ替え（#279） 起こした版が終わるまでと、入れ替え係が終わるまで
+        swap = number(r"function Test-Swap\(.*\[int\]\$TimeoutSeconds = (\d+)\)") + (
+            number(r"\$first\.WaitForExit\((\d+)\)") // 1000
+        )
+        swaps = len(re.findall(r"= Test-Swap '", script))
+        assert swaps == 2, swaps
+        # 数えない段（取り出し・展開・ファイアウォールの見本・記録を待つ 5 秒・公開版を落とす・
+        # 入れ替えの展開・要約）の分
+        rest = 420
+        total = sum(exe_waits) + probe * probes + window + swap * swaps + rest
+        assert total < limit, (exe_waits, probe * probes, window, swap * swaps, rest, limit)
+
+
+class TestTheProjectArgumentBeforeLeavingTheFolder:
+    """起動の頭で作業場所をインストール先の外へ移す前に、開くプロジェクトを絶対の場所にする（#279）
+
+    相対のまま移すと、``Sashimono.exe 作品.sme`` と渡した物を移した先で探して開けず、
+    保存も別の場所へ書く
+    """
+
+    def test_a_relative_project_becomes_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.app import absolute_project_argument
+
+        monkeypatch.chdir(tmp_path)
+        assert absolute_project_argument(["Sashimono.exe", "作品.sme", "-x"]) == [
+            "Sashimono.exe",
+            str((tmp_path / "作品.sme").resolve()),
+            "-x",
+        ]
+
+    @pytest.mark.parametrize("arguments", [["Sashimono.exe"], ["Sashimono.exe", "-platform"]])
+    def test_other_arguments_are_left_alone(self, arguments: list[str]) -> None:
+        from sashimono.app import absolute_project_argument
+
+        assert absolute_project_argument(arguments) == arguments
 
 
 class TestAScriptIsNotTakenForAProject:
@@ -1973,6 +2006,31 @@ class TestTheUpdateParts:
         assert builder.update_failures(home, passed) == []
         assert builder.update_failures(home, f"[NG] {builder.UPDATE_CHECK_NAME}: 落ちた")
         (home / builder.BUILD_INFO_NAME).unlink()
+        assert builder.update_failures(home, passed)
+
+    def test_the_zip_carries_its_own_swap_script(self, builder: ModuleType, tmp_path: Path) -> None:
+        """入れ替え係の台本を zip に積み、書き付けに受け渡しの版と場所を書く（#279）
+
+        積まないと、1 つ前の版は自分の台本で入れ替え、台本の直しが 1 つ前の版からの更新に
+        効かない 古い版の台本の不具合（作業場所）で入れ替えが断られ続けたのが #279
+        """
+        from sashimono.update.package import Layout, read_build_info
+        from sashimono.update.swap import HELPER_SCRIPT, SwapPlan, helper_script
+
+        home = tmp_path / "Sashimono.new"
+        home.mkdir()
+        builder.assemble(home)
+        (home / "Sashimono.exe").write_bytes(b"MZ")
+        info = read_build_info(home)
+        assert info is not None and info.swap_script == builder.BUNDLED_SCRIPT
+        assert helper_script(SwapPlan("apply", Layout(tmp_path / "Sashimono"))) == (
+            HELPER_SCRIPT,
+            True,
+        )
+        passed = f"[ok] {builder.UPDATE_CHECK_NAME}: 確かめた"
+        (home / builder.BUNDLED_SCRIPT).write_text("exit 1", encoding="utf-8")
+        assert builder.update_failures(home, passed)
+        (home / builder.BUNDLED_SCRIPT).unlink()
         assert builder.update_failures(home, passed)
 
     def test_the_self_check_rehearses_an_update(self) -> None:

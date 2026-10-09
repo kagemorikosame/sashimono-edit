@@ -10,15 +10,21 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from sashimono.update import swap as swap_module
-from sashimono.update.package import Layout
+from sashimono.update.package import Layout, write_build_info
 from sashimono.update.swap import (
+    BUNDLED_SCRIPT,
     HEALTH_ENV,
+    HELPER_SCRIPT,
+    SWAP_CONTRACT,
     SwapPlan,
+    helper_script,
     launch,
+    leave_install_folder,
     mark_started,
     take_result,
     wait_started,
@@ -149,6 +155,182 @@ class TestApplying:
         assert (layout.install / "version.txt").read_text(encoding="ascii") == "old"
         assert layout.staged.exists()
         assert _wait_for(layout.install.parent / "old-started.txt")
+
+
+#: 起動できた印を書き、自分の作業場所と、起こし直した印を隣に書き残す新しい版
+HEALTHY_WHERE = (
+    '@cd> "%~dp0..\\new-cwd.txt"\r\n'
+    # 振り向けを前に書く 後ろに書くと、値の 1 が「1>」として振り向けの番号に読まれる
+    '@> "%~dp0..\\new-relaunched.txt" echo %SASHIMONO_UPDATE_RELAUNCHED%\r\n' + HEALTHY
+)
+
+
+def _read_line(path: Path) -> str:
+    # cmd の echo は本人の文字コード（日本語の Windows では cp932）で書く
+    return path.read_bytes().decode("mbcs", "replace").strip()
+
+
+class TestTheWorkingFolder:
+    """入れ替え係の作業場所がインストール先の中になっても入れ替わる（#279）
+
+    Windows は、どれかのプロセスの作業場所になっているフォルダの名前を変えさせない
+    Explorer から起こした本体は作業場所がインストール先で、それを受け継いだ入れ替え係が、
+    20 回（10 秒）続けて自分で改名を断らせ、install-locked で終わっていた
+    """
+
+    def test_an_app_working_in_the_install_folder_can_still_update(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """本体の作業場所がインストール先のまま入れ替え係を起こしても入れ替わる"""
+        _folder(layout.staged, HEALTHY_WHERE)
+        (layout.staged / "version.txt").write_text("new", encoding="ascii")
+        folder = tmp_path / "update"
+        monkeypatch.chdir(layout.install)
+        launched = launch(_plan(layout), folder)
+        # 試験のプロセスは終わらないので、起こした直後に作業場所を外へ戻す（本物の本体は終わる）
+        # 戻さないと、試験のプロセスが改名を断らせ、入れ替え係の作業場所を確かめられない
+        os.chdir(tmp_path)
+        assert wait_started(launched)
+        launched.process.wait(timeout=120)
+        lines = take_result(folder)
+        assert "install-locked" not in lines and "healthy" in lines, lines
+        assert (layout.install / "version.txt").read_text(encoding="ascii") == "new"
+
+    def test_the_script_leaves_the_install_folder_by_itself(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """起こす側が作業場所を渡さない道（ほかの起こし方）でも、台本が自分で外へ移る"""
+        _folder(layout.staged, HEALTHY)
+        (layout.staged / "version.txt").write_text("new", encoding="ascii")
+        import subprocess
+
+        real_popen = subprocess.Popen
+
+        def inside_install(*arguments: Any, **options: Any) -> Any:
+            options["cwd"] = layout.install
+            return real_popen(*arguments, **options)
+
+        monkeypatch.setattr(subprocess, "Popen", inside_install)
+        lines = _run(_plan(layout, relaunch=False), tmp_path / "update")
+        assert "install-locked" not in lines and lines[-1] == "swapped", lines
+
+    def test_the_new_version_is_started_outside_the_install_folder(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """起こし直した本体の作業場所もインストール先の外 入れ替え係に起こされた印も渡る
+
+        インストール先で起こすと、前の版へ戻したときの古い版（自分では外へ移さない）が、
+        次の更新でまた改名を断らせる 印が無いと、新しい版は入れ替え係の錠を見て終わる
+        """
+        _folder(layout.staged, HEALTHY_WHERE)
+        lines = _run(_plan(layout), tmp_path / "update")
+        assert "healthy" in lines, lines
+        where = Path(_read_line(layout.install.parent / "new-cwd.txt"))
+        assert not str(where).lower().startswith(str(layout.install).lower()), where
+        assert _read_line(layout.install.parent / "new-relaunched.txt") == "1"
+
+
+class TestTheNewVersionsScript:
+    """入れ替え係の台本は新しい版の物を使う（#279）
+
+    今の版の台本を使うと、台本の不具合を直しても 1 つ前の版からの更新には効かない
+    """
+
+    def _stage_script(self, layout: Layout, script: str, *, contract: int = SWAP_CONTRACT) -> None:
+        _folder(layout.staged, HEALTHY)
+        (layout.staged / "version.txt").write_text("new", encoding="ascii")
+        path = layout.staged / BUNDLED_SCRIPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(script, encoding="utf-8-sig")
+        write_build_info(
+            layout.staged, "9.0.0", "cp314", swap_contract=contract, swap_script=BUNDLED_SCRIPT
+        )
+
+    def test_the_staged_script_runs_the_swap(self, layout: Layout, tmp_path: Path) -> None:
+        marked = HELPER_SCRIPT.replace(
+            "Write-Result 'holding'\n", "Write-Result 'holding'\n    Write-Result 'new-script'\n", 1
+        )
+        assert marked != HELPER_SCRIPT
+        self._stage_script(layout, marked)
+        folder = tmp_path / "update"
+        launched = launch(_plan(layout), folder)
+        assert launched.from_staged
+        assert wait_started(launched)
+        launched.process.wait(timeout=120)
+        lines = take_result(folder)
+        assert "new-script" in lines and "healthy" in lines, lines
+        assert (layout.install / "version.txt").read_text(encoding="ascii") == "new"
+
+    def test_a_different_contract_keeps_the_current_script(self, layout: Layout) -> None:
+        """受け渡し（環境変数・結果の言葉・錠）の合わない台本は走らせない"""
+        self._stage_script(layout, "exit 1", contract=SWAP_CONTRACT + 1)
+        assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
+
+    def test_a_version_without_a_script_keeps_the_current_script(self, layout: Layout) -> None:
+        """0.2.0 までの版は台本を持たない その版へ戻すときも、今の版の台本で入れ替える"""
+        _folder(layout.staged, HEALTHY)
+        write_build_info(layout.staged, "9.0.0", "cp314")
+        assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
+
+    def test_a_missing_or_empty_script_keeps_the_current_script(self, layout: Layout) -> None:
+        self._stage_script(layout, "  \n")
+        assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
+        (layout.staged / BUNDLED_SCRIPT).unlink()
+        assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
+
+    def test_a_script_outside_the_new_version_is_not_run(
+        self, layout: Layout, tmp_path: Path
+    ) -> None:
+        """書き付けが .new の外を指していたら使わない 確かめた中身ではない"""
+        self._stage_script(layout, HELPER_SCRIPT)
+        outside = tmp_path / "outside.ps1"
+        outside.write_text("exit 1", encoding="utf-8")
+        for pointed in ("../outside.ps1", str(outside), "."):
+            write_build_info(
+                layout.staged, "9.0.0", "cp314", swap_contract=SWAP_CONTRACT, swap_script=pointed
+            )
+            assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False), pointed
+
+    def test_rolling_back_uses_the_current_script(self, layout: Layout) -> None:
+        self._stage_script(layout, "exit 1")
+        assert helper_script(_plan(layout, "rollback")) == (HELPER_SCRIPT, False)
+
+
+class TestLeavingTheInstallFolder:
+    """本体は起動の頭で、作業場所をインストール先の外へ移す（#279）"""
+
+    def test_an_app_started_from_explorer_moves_out(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(layout.install / ".")
+        assert leave_install_folder(layout.install, home) == home
+        assert Path.cwd() == home
+
+    def test_a_folder_inside_the_install_folder_also_moves_out(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inner = layout.install / "SCRIPTS"
+        inner.mkdir()
+        monkeypatch.chdir(inner)
+        # Windows は大文字小文字を区別しない 綴りが違っても中と見る
+        assert leave_install_folder(Path(str(layout.install).upper()), tmp_path) == tmp_path
+
+    def test_a_command_line_start_elsewhere_stays(
+        self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """コマンドの行から別の所で起こした人は、そこを基準に相対の場所を渡している"""
+        monkeypatch.chdir(tmp_path)
+        assert leave_install_folder(layout.install, tmp_path / "home") is None
+        assert Path.cwd() == tmp_path
+
+    def test_the_development_tree_stays(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert leave_install_folder(None, tmp_path / "home") is None
+        assert Path.cwd() == tmp_path
 
 
 class TestTwoWindows:

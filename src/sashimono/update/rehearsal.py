@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -27,7 +28,14 @@ from sashimono.update.fetch import MemoryTransport
 from sashimono.update.manifest import Manifest, PackageInfo, manifest_to_json
 from sashimono.update.package import APP_EXE, BUILD_INFO_NAME, Layout, stage
 from sashimono.update.signing import SIGNATURE_SUFFIX, sign_manifest
-from sashimono.update.swap import SwapPlan, launch, wait_started
+from sashimono.update.swap import (
+    BUNDLED_SCRIPT,
+    HELPER_SCRIPT,
+    SWAP_CONTRACT,
+    SwapPlan,
+    launch,
+    wait_started,
+)
 
 __all__ = ["REHEARSAL_VERSION", "build_release", "rehearse"]
 
@@ -47,8 +55,19 @@ def build_release(
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w") as archive:
         archive.writestr(f"Sashimono/{APP_EXE}", b"MZ rehearsal")
+        # 本物の zip と同じく、入れ替え係の台本と受け渡しの版を持たせる 入れ替えの予行で、
+        # 新しい版の台本を使う道（swap.helper_script）も通す
+        archive.writestr(f"Sashimono/{BUNDLED_SCRIPT}", HELPER_SCRIPT.encode("utf-8-sig"))
         archive.writestr(
-            f"Sashimono/{BUILD_INFO_NAME}", json.dumps({"version": version, "python_abi": abi})
+            f"Sashimono/{BUILD_INFO_NAME}",
+            json.dumps(
+                {
+                    "version": version,
+                    "python_abi": abi,
+                    "swap_contract": SWAP_CONTRACT,
+                    "swap_script": BUNDLED_SCRIPT,
+                }
+            ),
         )
     body = payload.getvalue()
 
@@ -111,7 +130,17 @@ def rehearse(folder: Path, *, swap: bool = sys.platform == "win32") -> str:
         return f"署名・照合・展開を確かめた（証明書 {authorities} 枚）"
 
     plan = SwapPlan("apply", layout, relaunch=False, check_start=False, wait_seconds=10)
-    launched = launch(plan, folder / "update")
+    # 本体の作業場所をインストール先にして起こす Explorer やショートカットから起こした本体は
+    # こうなる 入れ替え係がそれを受け継ぐと、自分で改名を断らせて入れ替えられない（#279）
+    # 予行では本体（このプロセス）が終わらないので、起こした直後に作業場所を戻す 戻さないと
+    # このプロセスが改名を断らせる 入れ替え係が改名に掛かるのは PowerShell が立ち上がって
+    # 錠を取った後なので、戻すのはそれより十分に早い
+    here = Path.cwd()
+    os.chdir(install)
+    try:
+        launched = launch(plan, folder / "update")
+    finally:
+        os.chdir(here)
     began = time.monotonic()
     if not wait_started(launched):
         # 待ちきれなかったのか、すぐ終わったのかで原因が違う（遅い機械か、PowerShell が
@@ -133,4 +162,11 @@ def rehearse(folder: Path, *, swap: bool = sys.platform == "win32") -> str:
     if not swapped:
         lines = launched.result.read_text(encoding="utf-8-sig", errors="replace").split()
         raise RuntimeError(f"入れ替えられない（{' '.join(lines)}）")
-    return f"署名・照合・展開・入れ替え（PowerShell）を確かめた（証明書 {authorities} 枚）"
+    if not launched.from_staged:
+        # 入れ替えられても、新しい版の台本を使わない版は、台本の直しを 1 つ前の版からの更新に
+        # 効かせられない
+        raise RuntimeError("新しい版の入れ替え係の台本を使わなかった（書き付けか台本が読めない）")
+    return (
+        "署名・照合・展開・入れ替え（PowerShell）を確かめた"
+        f"（本体の作業場所はインストール先 新しい版の台本 証明書 {authorities} 枚）"
+    )

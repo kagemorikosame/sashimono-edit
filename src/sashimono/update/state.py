@@ -89,6 +89,11 @@ class UpdateState:
     #: 起動の頭（画面を出す前）で入れ替えを止めたわけ 画面を出した後に 1 度知らせて消す
     #: 起動の頭はまだ窓が無く、その場では知らせられない
     pending_notice: str = ""
+    #: 最後に入れ替えに失敗したわけ（結果のファイルの言葉）と、同じわけで続けて失敗した回数
+    #: 同じわけで 2 回続けば、入れ直しても同じ失敗を繰り返すだけなので、手で入れ替える
+    #: 手順を案内する（#279 古い版の入れ替え係は、作業場所の不具合で毎回同じ所で断られる）
+    last_failure: str = ""
+    failure_count: int = 0
 
 
 class UpdateStateStore:
@@ -108,6 +113,7 @@ class UpdateStateStore:
         checked = data.get("last_checked")
         skipped = data.get("skipped")
         offered = data.get("scripts_offered")
+        count = data.get("failure_count")
         return UpdateState(
             last_checked=(
                 float(checked)
@@ -131,6 +137,10 @@ class UpdateStateStore:
                 else plain.scripts_offered
             ),
             pending_notice=_text(data.get("pending_notice")),
+            last_failure=_text(data.get("last_failure")),
+            failure_count=(
+                count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+            ),
         )
 
     def save(self, state: UpdateState) -> None:
