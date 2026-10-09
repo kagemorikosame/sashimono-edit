@@ -122,17 +122,23 @@ if (-not $appFolder -or -not (Test-Path -LiteralPath $appFolder)) { $appFolder =
 $env:SASHIMONO_UPDATE_RELAUNCHED = '1'
 
 function Write-Result([string]$text) {
-    # 本体が結果を読んでいる間は、書き足しが断られることがある（ほかのプロセスが使用中）
-    # 書けずに止まると、走り始めたのに本体は走らないと取り違える 少し待って書き直す
-    for ($i = 0; $i -lt 50; $i++) {
+    # 書き足しは .NET で、ほかのプロセスの読み書きを許して開く Add-Content は、本体が結果を
+    # 読んで開いている間は必ず断られる（試して確かめた） 本体は走り始めの印を 0.1 秒ごとに
+    # 読むので、重いと書き直しの度に重なり、走り始めの印を書く前に止まった（PR #280 の CI）
+    # 許して開いても、ウイルス対策の検査などで断られることはあるので、少し待って書き直す
+    # 回数ではなく時間で区切る（遅い機械では 1 回の試しが長い）
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text + [char]13 + [char]10)
+    $deadline = (Get-Date).AddSeconds(15)
+    while ($true) {
         try {
-            Add-Content -LiteralPath $result -Value $text -Encoding UTF8 -ErrorAction Stop
+            $stream = [System.IO.File]::Open($result, 'Append', 'Write', 'ReadWrite, Delete')
+            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
             return
         } catch {
+            if ((Get-Date) -ge $deadline) { throw }
             Start-Sleep -Milliseconds 100
         }
     }
-    Add-Content -LiteralPath $result -Value $text -Encoding UTF8
 }
 
 # 本体と、同じフォルダから動いているほかの窓が終わるのを待つ

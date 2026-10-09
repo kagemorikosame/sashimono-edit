@@ -60,7 +60,7 @@ def layout(tmp_path: Path) -> Layout:
 
 def _run(plan: SwapPlan, folder: Path) -> list[str]:
     launched = launch(plan, folder)
-    assert wait_started(launched)
+    assert wait_started(launched), launched.lines()
     launched.process.wait(timeout=120)
     return take_result(folder)
 
@@ -190,7 +190,7 @@ class TestTheWorkingFolder:
         # 試験のプロセスは終わらないので、起こした直後に作業場所を外へ戻す（本物の本体は終わる）
         # 戻さないと、試験のプロセスが改名を断らせ、入れ替え係の作業場所を確かめられない
         os.chdir(tmp_path)
-        assert wait_started(launched)
+        assert wait_started(launched), launched.lines()
         launched.process.wait(timeout=120)
         lines = take_result(folder)
         assert "install-locked" not in lines and "healthy" in lines, lines
@@ -255,7 +255,7 @@ class TestTheNewVersionsScript:
         folder = tmp_path / "update"
         launched = launch(_plan(layout), folder)
         assert launched.from_staged
-        assert wait_started(launched)
+        assert wait_started(launched), launched.lines()
         launched.process.wait(timeout=120)
         lines = take_result(folder)
         assert "new-script" in lines and "healthy" in lines, lines
@@ -351,7 +351,7 @@ class TestTwoWindows:
         folder = tmp_path / "update"
         try:
             first = launch(_plan(layout, pid=window.pid), folder)
-            assert wait_started(first)
+            assert wait_started(first), first.lines()
             second = launch(_plan(layout), folder)
             assert not wait_started(second)
             assert second.lost_to_another()
@@ -379,7 +379,7 @@ class TestWhenEvenTheRestoreFails:
         blocker = layout.install
         try:
             launched = launch(_plan(layout), tmp_path / "update")
-            assert wait_started(launched)
+            assert wait_started(launched), launched.lines()
             # 今の版が previous へよけられたら、元の名前の所をふさいで戻しも断らせる
             assert _wait_for(layout.previous / APP, 30)
             blocker.write_text("ふさぐ", encoding="utf-8")
@@ -505,6 +505,42 @@ def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None
     assert process.returncode == 0, error.decode("cp932", "replace")
     assert refused.exists(), "書き足しが 1 度も断られずに通った（確かめになっていない）"
     assert "holding" in result.read_text(encoding="utf-8-sig")
+
+
+def test_a_result_is_written_while_the_app_holds_it_open(tmp_path: Path) -> None:
+    """本体が結果のファイルを読んで開いたままでも、書き足しは 1 回で通る（PR #280 の CI）
+
+    本体（wait_started）は走り始めの印を 0.1 秒ごとに読む Add-Content は読んでいる相手が
+    いると必ず断られ、書き直しも 0.1 秒ごとなので、重い機械（CI の 4 並列）では毎回重なり、
+    走り始めの印を書く前に 5 秒で諦めて止まった（終了コード 9） 本体と同じ開き方
+    （Python の open）で開いたまま、台本の Write-Result を走らせる
+    """
+    import re
+    import subprocess
+
+    match = re.search(r"^function Write-Result.*?^}\n", swap_module.HELPER_SCRIPT, re.M | re.S)
+    assert match is not None
+    result = tmp_path / "result.txt"
+    result.write_text("started\n", encoding="utf-8")
+    code = (
+        "$ErrorActionPreference = 'Stop'\n$result = $env:RESULT\n"
+        + match.group(0)
+        + "$watch = [Diagnostics.Stopwatch]::StartNew()\n"
+        "Write-Result 'holding'\n"
+        "[Console]::Out.Write([int]$watch.Elapsed.TotalMilliseconds)\n"
+    )
+    with result.open("r", encoding="utf-8-sig"):
+        done = subprocess.run(
+            [str(swap_module.powershell_path()), "-NoProfile", "-NonInteractive", "-Command", code],
+            env={**os.environ, "RESULT": str(result)},
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    assert done.returncode == 0, done.stderr.decode("cp932", "replace")
+    # 書き直しを待たずに通る（断られて待つと 100 ミリ秒を超える）
+    assert int(done.stdout) < 100, done.stdout
+    assert result.read_text(encoding="utf-8-sig").split() == ["started", "holding"]
 
 
 def test_a_first_powershell_start_is_waited_for() -> None:
