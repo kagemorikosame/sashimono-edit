@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import pytest
@@ -80,15 +80,22 @@ def _paint(
 
 
 def _count_envelopes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """``Waveform.envelope`` が呼ばれるたびに列の数を書き留める"""
+    """範囲を束ねるたびに列の数を書き留める まとめて束ねる :meth:`Waveform.envelopes` は
+    範囲ごとに 1 回と数える（#260 で画像をまとめて作るようにした）"""
     calls: list[int] = []
     original = Waveform.envelope
+    many = Waveform.envelopes
 
     def counting(self: Waveform, start: int, end: int, columns: int) -> np.ndarray:
         calls.append(columns)
         return original(self, start, end, columns)
 
+    def counting_many(self: Waveform, segments: Sequence[tuple[int, int, int]]) -> np.ndarray:
+        calls.extend(columns for _, _, columns in segments)
+        return many(self, segments)
+
     monkeypatch.setattr(Waveform, "envelope", counting)
+    monkeypatch.setattr(Waveform, "envelopes", counting_many)
     return calls
 
 

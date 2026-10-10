@@ -208,22 +208,25 @@ def _field_text(field: QWidget) -> str:
 class TestKeysWhileTyping:
     """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない
 
-    どれも窓が活性でない形で見る（CI の Windows の実行機では窓が活性にならないことがある）
+    見張り（:class:`TextFieldKeys`）はアプリに入れ、窓が活性かどうかを見ない どの試験も
+    窓が活性でない形と、出した形（活性になるかは機械しだい）の両方で見る
     """
 
-    @pytest.fixture
-    def shown(self, window: MainWindow) -> Iterator[MainWindow]:
-        # 別の窓を前に出して、編集の窓を活性にしない 手元のオフスクリーンでは出した窓が
-        # 活性になるので、そのままだと CI と違う形で通る
-        window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        window.show()
-        cover = QWidget()
-        cover.show()
-        cover.activateWindow()
-        QApplication.processEvents()
-        assert not window.isActiveWindow()
+    @pytest.fixture(params=["hidden", "shown"])
+    def shown(self, window: MainWindow, request: pytest.FixtureRequest) -> Iterator[MainWindow]:
+        # 活性でない形は、窓を出さずに作る 出した窓は、ほかの窓を前に出しても Windows の
+        # 実行機では活性のまま残ることがあり（CI の 60 本のうち 2 本）、活性でない形を
+        # 確かに作れなかった 出していない窓は活性にならないので、ここは必ず活性でない
+        # 出した形は活性になってもならなくてもよい どちらでも欄が同じにキーを受け取ることを見る
+        # 出した形では窓のショートカットもキーを取りに来るので、欄が取らなければ貼り付けの試験も
+        # 落ちる（見張りを壊すと、出していない形では欄が取る試験だけ、出した形では貼り付けも落ちる）
+        if request.param == "shown":
+            window.show()
+            QApplication.processEvents()
+        else:
+            assert not window.isVisible()
+            assert not window.isActiveWindow()
         yield window
-        cover.close()
 
     @pytest.mark.parametrize("kind", _FIELDS)
     def test_ctrl_shift_v_stays_in_a_field(self, shown: MainWindow, kind: type[QWidget]) -> None:
