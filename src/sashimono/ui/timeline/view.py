@@ -117,13 +117,18 @@ from sashimono.ui.timeline.painter import (
     waveform_level,
 )
 from sashimono.ui.timeline.painter import draw_clip as paint_clip
-from sashimono.ui.timeline.snap import DEFAULT_SNAP_DISTANCE, nearest_snap, snap_targets
+from sashimono.ui.timeline.snap import (
+    DEFAULT_SNAP_DISTANCE,
+    PlayheadSnap,
+    nearest_snap,
+    snap_targets,
+)
 from sashimono.ui.timeline.track_drag import TrackDragger
 from sashimono.ui.timeline.track_name import TrackNameEditor
 from sashimono.ui.timeline.value_line import ValueGrab, ValueLineEditor
 from sashimono.ui.timeline.work_area import WorkAreaEditor
 from sashimono.ui.timeline.zoom_scrollbar import ZoomScrollBar
-from sashimono.ui.workspace import DETAIL_MIN_WIDTHS
+from sashimono.ui.workspace import DETAIL_MIN_WIDTHS, PLAYHEAD_SNAP_ALWAYS, PLAYHEAD_SNAP_SHIFT
 
 __all__ = ["TimelineArea", "TimelineView"]
 
@@ -309,6 +314,11 @@ class TimelineView(QWidget):
         #: 吸い付く先の覚え（プロジェクト・動かしている物・再生位置, フレームの並び）
         #: マウスが動くたびに全クリップを舐めないため
         self._snap_cache: tuple[object, list[int]] | None = None
+        #: 目盛りで再生ヘッドを動かすときの吸い付き（:meth:`set_playhead_snap`） 既定は設定の既定
+        self._playhead_snap = PlayheadSnap()
+        #: 再生ヘッドの吸い付く先の覚え（プロジェクト・設定, フレームの並び） クリップの磁石の
+        #: 覚えとは先が違う（再生位置を入れない）ので別に持つ
+        self._playhead_snap_cache: tuple[object, list[int]] | None = None
         #: 吸い付いた所に出す縦の線 少しして消す（:data:`SNAP_LINE_MS`）
         self._snap_line: int | None = None
         self._snap_timer = QTimer(self)
@@ -1156,6 +1166,9 @@ class TimelineView(QWidget):
 
         if position.y() < Metrics.RULER_HEIGHT:
             self._drag = DragState(kind=DragKind.PLAYHEAD)
+            # 押したときのキーで吸い付きを決める 前のマウスの動きで覚えたキーが残っていると、
+            # 離した Shift で吸い付いてしまう
+            self._drag_modifiers = event.modifiers()
             self._scrub(position)
             return
 
@@ -1371,9 +1384,62 @@ class TimelineView(QWidget):
         self._snap_distance = max(1, distance)
         self._snap_cache = None
 
+    def set_playhead_snap(self, settings: PlayheadSnap) -> None:
+        """目盛りで再生ヘッドを動かすときの吸い付き方と吸い付く先 設定から"""
+        self._playhead_snap = settings
+        self._playhead_snap_cache = None
+
     @property
     def snap_enabled(self) -> bool:
         return self._snap_enabled
+
+    def _playhead_snap_shift(self, frame: int) -> int:
+        """目盛りで動かしている再生ヘッドを、近くの吸い付く先へずらす量 吸い付かなければ 0
+
+        Shift の向きはクリップの磁石と逆で、既定は押している間だけ吸い付く（Premiere Pro と
+        同じ） 再生ヘッドは 1 コマずつ自由に動かすことの方が多く、常に吸い付くと
+        クリップの端の近くで細かく合わせられない 押す前から Shift を押していると目盛りの
+        押下は書き出し範囲のドラッグになるので、ここへ来るのは掴んでから押したときだけ
+
+        キーはマウスの知らせが運んだ物だけを見る（``QApplication.keyboardModifiers`` は
+        混ぜない） 日本語入力や別の窓で押した Shift をアプリが覚えたまま残すことがあり、
+        押していないのに吸い付く
+        """
+        settings = self._playhead_snap
+        held = bool(self._drag_modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if settings.mode == PLAYHEAD_SNAP_SHIFT:
+            # 磁石のボタンを切っていても効かせる Shift を押すのは、いま吸い付かせたいと
+            # 本人が言ったのと同じ ボタンは何もしないときの動き（常に吸い付くか）を決める物
+            wanted = held
+        elif settings.mode == PLAYHEAD_SNAP_ALWAYS:
+            # 常に吸い付く側は、クリップの磁石と同じく〔磁石〕のボタンで切れる 切っても
+            # 吸い付くと、ボタンを押した意味が無い
+            wanted = self._snap_enabled and not held
+        else:
+            wanted = False
+        if not wanted:
+            return 0
+        found = nearest_snap(
+            (frame,), self._playhead_targets(), self._snap_distance / self._layout.pixels_per_frame
+        )
+        self._show_snap(found[1] if found is not None else None)
+        return found[0] if found is not None else 0
+
+    def _playhead_targets(self) -> list[int]:
+        """再生ヘッドの吸い付く先 再生位置そのものは入れない 同じ中身の間は覚える"""
+        settings = self._playhead_snap
+        key = (self._project, settings)
+        if self._playhead_snap_cache is None or self._playhead_snap_cache[0] != key:
+            targets = snap_targets(
+                self._project,
+                None,
+                clip_edges=settings.clip_edges,
+                keyframes=settings.keyframes,
+                work_area=settings.work_area,
+                markers=settings.markers,
+            )
+            self._playhead_snap_cache = (key, targets)
+        return self._playhead_snap_cache[1]
 
     @property
     def snap_line(self) -> int | None:
@@ -2155,7 +2221,12 @@ class TimelineView(QWidget):
         # スクラブ中は追従を切る 追従したままだと、掴んだ位置が画面中央へ
         # 逃げ続けて操作にならない
         self._follow_playhead = False
-        self.set_playhead(self._layout.frame_at(position.x()), follow=False)
+        frame = self._layout.frame_at(position.x())
+        if self._drag.kind is DragKind.PLAYHEAD:
+            # 吸い付くのは目盛りを掴んだときだけ 空いた所の押下は囲んで選ぶ操作の始まりで、
+            # 押した所から再生ヘッドがずれると、どこを押したのか分からなくなる
+            frame += self._playhead_snap_shift(frame)
+        self.set_playhead(frame, follow=False)
         self._follow_playhead = True
         self.playhead_moved.emit(self._playhead)
 

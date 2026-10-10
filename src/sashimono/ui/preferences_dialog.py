@@ -37,6 +37,7 @@ from sashimono.engine.encode import (
 )
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
@@ -51,6 +52,9 @@ from sashimono.ui.workspace import (
     INSERT_TARGET_TRACKS,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
+    PLAYHEAD_SNAP_ALWAYS,
+    PLAYHEAD_SNAP_OFF,
+    PLAYHEAD_SNAP_SHIFT,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -68,6 +72,14 @@ __all__ = [
     "QUALITY_DIVISORS",
     "PreferencesDialog",
 ]
+
+#: 目盛りで再生ヘッドを動かすときの吸い付き方の名前 Shift の向きがクリップの磁石と
+#: 逆になるので、名前に Shift で何が起きるかまで書く
+PLAYHEAD_SNAP_CHOICES: tuple[tuple[str, str], ...] = (
+    (PLAYHEAD_SNAP_SHIFT, "Shift を押している間だけ吸い付く（既定）"),
+    (PLAYHEAD_SNAP_ALWAYS, "常に吸い付き、Shift を押している間は外す"),
+    (PLAYHEAD_SNAP_OFF, "吸い付かない"),
+)
 
 #: 控えの大きさ 小さいほど軽いが、文字の読みやすさが落ちる
 PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
@@ -405,7 +417,9 @@ class PreferencesDialog(QDialog):
         self._timeline_snap.setToolTip(
             "クリップを動かす・端を伸び縮みさせる・置くときに、ほかのクリップの頭と終わり・"
             "再生位置・キーフレーム・書き出し範囲の端へ吸い付く タイムラインの上の〔磁石〕と同じ "
-            "動かしている途中で Shift を押している間は吸い付かない"
+            "動かしている途中で Shift を押している間は吸い付かない "
+            "目盛りで再生ヘッドを動かすときは下の「再生ヘッドの吸い付き」に従う"
+            "（既定では Shift の向きが逆で、押している間だけ吸い付く）"
         )
         form.addRow(self._timeline_snap)
         self._snap_distance = QSpinBox(self)
@@ -422,6 +436,46 @@ class PreferencesDialog(QDialog):
             "動かしている途中で Shift を押している間は吸い付かない"
         )
         form.addRow(self._preview_snap)
+        self._playhead_snap = QComboBox(self)
+        for value, text in PLAYHEAD_SNAP_CHOICES:
+            self._playhead_snap.addItem(text, value)
+        self._playhead_snap.setCurrentIndex(
+            max(0, self._playhead_snap.findData(preferences.playhead_snap))
+        )
+        self._playhead_snap.setToolTip(
+            "目盛りで再生ヘッドをドラッグするときに、近くのクリップの端などへ吸い付くか "
+            "Shift はドラッグを始めてから押す（押してから目盛りを押すと書き出し範囲の指定になる） "
+            "「Shift の間だけ」は〔磁石〕を切っていても効き、「常に」は〔磁石〕を切ると止まる "
+            "距離は上の「吸い付く距離」"
+        )
+        form.addRow("再生ヘッドの吸い付き", self._playhead_snap)
+        # 吸い付く先は 1 行に並べる 4 行に分けると、設定の窓が縦に伸びて狭い画面で欠ける
+        self._playhead_snap_clips = QCheckBox("クリップの端", self)
+        self._playhead_snap_clips.setChecked(preferences.playhead_snap_clips)
+        self._playhead_snap_keyframes = QCheckBox("キーフレーム", self)
+        self._playhead_snap_keyframes.setChecked(preferences.playhead_snap_keyframes)
+        self._playhead_snap_work_area = QCheckBox("書き出し範囲の端", self)
+        self._playhead_snap_work_area.setChecked(preferences.playhead_snap_work_area)
+        self._playhead_snap_markers = QCheckBox("目印（マーカー）", self)
+        self._playhead_snap_markers.setChecked(preferences.playhead_snap_markers)
+        self._playhead_snap_markers.setToolTip(
+            "読み込んだ作品などに付いている目印 いまのタイムラインには描かないので、"
+            "入れると見えない所でも吸い付く"
+        )
+        targets = QWidget(self)
+        target_row = FlowLayout(targets)
+        target_row.setContentsMargins(0, 0, 0, 0)
+        self._playhead_snap_targets = (
+            self._playhead_snap_clips,
+            self._playhead_snap_keyframes,
+            self._playhead_snap_work_area,
+            self._playhead_snap_markers,
+        )
+        for box in self._playhead_snap_targets:
+            target_row.addWidget(box)
+        form.addRow("再生ヘッドの吸い付く先", targets)
+        self._playhead_snap.currentIndexChanged.connect(self._show_playhead_snap_targets)
+        self._show_playhead_snap_targets()
         self._insert_paste = QComboBox(self)
         self._insert_paste.addItem("全トラック（既定）", INSERT_ALL_TRACKS)
         self._insert_paste.addItem("貼り先と、一緒に動く相手のトラックだけ", INSERT_TARGET_TRACKS)
@@ -638,6 +692,12 @@ class PreferencesDialog(QDialog):
         choice = find_model(str(self._ai_model.currentData()))
         self._ai_effort.setEnabled(choice is None or choice.effort)
 
+    def _show_playhead_snap_targets(self) -> None:
+        """吸い付かないを選んだら、吸い付く先を触れなくする 選んでも何も変わらない欄を残さない"""
+        active = self._playhead_snap.currentData() != PLAYHEAD_SNAP_OFF
+        for box in self._playhead_snap_targets:
+            box.setEnabled(active)
+
     @staticmethod
     def _select(box: QComboBox, value: int) -> None:
         """その値の項目を選ぶ 一覧に無ければ、その値の項目を足してから選ぶ
@@ -687,6 +747,11 @@ class PreferencesDialog(QDialog):
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
             preview_snap=self._preview_snap.isChecked(),
+            playhead_snap=str(self._playhead_snap.currentData()),
+            playhead_snap_clips=self._playhead_snap_clips.isChecked(),
+            playhead_snap_keyframes=self._playhead_snap_keyframes.isChecked(),
+            playhead_snap_work_area=self._playhead_snap_work_area.isChecked(),
+            playhead_snap_markers=self._playhead_snap_markers.isChecked(),
             insert_paste=str(self._insert_paste.currentData()),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
