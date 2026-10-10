@@ -22,11 +22,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
+from sashimono.core.commands import AddClip, AddEffect, AddMedia, AddTrack
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.io.aliases import Alias, AliasStore
 from sashimono.core.io.library import ALIAS, PRESET, Library, LibraryEntry, TrashEntry
-from sashimono.core.model import Clip, Project, Track, TrackKind
+from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind
+from sashimono.effects import registry
 from sashimono.effects.sources import TEXT
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.ui import library_dialog
@@ -42,6 +44,7 @@ from sashimono.ui.library_view import LibraryOptions
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.conftest import make_clip
 
 RED = (1.0, 0.0, 0.0, 1.0)
 
@@ -463,6 +466,51 @@ class TestEntrances:
         created._timeline.add_sources.aliases = library.aliases
         yield created
         created.close()
+
+    def test_a_sound_clip_keeps_its_effects_when_picked_from_the_window(
+        self,
+        window: MainWindow,
+        library: Library,
+        monkeypatch: pytest.MonkeyPatch,
+        audio_media: MediaItem,
+    ) -> None:
+        # 〔当てる〕もメニューと同じ決まり（#288） 映像のプリセットは音のクリップへ当たらず、
+        # 音のクリップの残響は消えない 映像のクリップは入れ替わる
+        glowing = replace(_clip("光"), effects=(registry.require("glow").create(),))
+        library.presets.save(Preset.capture("光", glowing))
+        text = window.document.project.timeline.tracks[0].clips[0]
+        audio_track = Track(TrackKind.AUDIO, "A1")
+        sound = make_clip(0, 60, audio_media)
+        assert window.execute_all(
+            [
+                AddMedia(audio_media),
+                AddTrack(audio_track),
+                AddClip(audio_track.id, sound),
+                AddEffect(sound.id, registry.require("audio_reverb").create()),
+                AddEffect(text.id, registry.require("blur").create()),
+            ],
+            "下ごしらえ",
+        )
+        window._timeline.set_selection((text.id, sound.id))
+        QApplication.processEvents()
+
+        def fake_open(
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+        ) -> LibraryEntry:
+            return next(e for e in shown.entries(PRESET) if e.name == "光")
+
+        monkeypatch.setattr(library_dialog, "open_library", fake_open)
+        menu = window._inspector.preset_menu()
+        assert menu is not None
+        manage = next(a for a in menu.actions() if a.data() == "manage_presets")
+        window._inspector.run_preset_action(manage)
+        QApplication.processEvents()
+        timeline = window.document.project.timeline
+        placed_text = timeline.locate_clip(text.id)
+        placed_sound = timeline.locate_clip(sound.id)
+        assert placed_text is not None and placed_sound is not None
+        assert [e.kind for e in placed_text[1].effects if not e.fixed] == ["glow"]
+        assert [e.kind for e in placed_sound[1].effects if not e.fixed] == ["audio_reverb"]
 
     def test_the_preset_menu_opens_the_window_and_applies_the_pick(
         self, window: MainWindow, library: Library, monkeypatch: pytest.MonkeyPatch
