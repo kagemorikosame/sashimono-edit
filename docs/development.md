@@ -2335,7 +2335,7 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 | エイリアス（右クリックの〔追加〕に並ぶ自分のクリップ `.smea`） | `%APPDATA%\Sashimono\aliases` | `core/io/aliases.py` | 残る | 残る |
 | 自分で足すテンプレート（`.exa` `.exa2` `.object` `.exo` `.exo2` `.ymmt`） | `%APPDATA%\Sashimono\templates` | `compat/catalog.py` の `default_template_roots` | 残る | 残る |
 | スクリプト | `%APPDATA%\Sashimono\scripts` | `compat/aviutl/catalog.py` の `default_script_roots` | 残る | 残る |
-| 退避・保存前のバックアップ | `%LOCALAPPDATA%\Sashimono\recovery` `backups` | `core/io/recovery.py` | 残る | 残る |
+| 退避・保存前のバックアップ | `%LOCALAPPDATA%\Sashimono\recovery` `backups`（設定で別の置き場も選べる 下の注） | `core/io/recovery.py` `ui/backup_settings.py` | 残る | 残る |
 | キャッシュ（波形・サムネイル・控え） | `%LOCALAPPDATA%\Sashimono\cache` | `engine/cache/store.py` | 残る | 残る |
 | 入れた字幕起こし・AI 連携 | `%LOCALAPPDATA%\Sashimono\runtime` | `runtime.py` の `runtime_target_dir` | 残る（Python が上がる版では読めなくなる 消しはしない） | 同じ |
 | 字幕起こしのモデル | `%USERPROFILE%\.cache\huggingface\hub`（`HF_HOME` があればその下） | `asr/environment.py` | 残る | 残る |
@@ -2344,6 +2344,10 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 | YMM4 のアイテムテンプレート | `%LOCALAPPDATA%\YukkuriMovieMaker\ItemTemplate` | 読むだけ | 触らない | 触らない |
 | exe の隣の `scripts` に置いた物 | インストール先の中 | `update/portable.py` | 新しい版へ写す | **消える**（起動したときに `%APPDATA%` 側へ移す） |
 
+- 退避とバックアップの置き場は設定（#271）で本人が選べる 選べないのはインストール先（exe の隣）の中
+  （`ui/backup_settings.py` の `folder_refusal`） 同期フォルダとネットワークの場所は確かめてから使う
+  選んだ置き場へ書けないときは、その起動の間は既定の置き場へ書いて知らせ、落ちた作業は
+  両方の置き場から探す 窓ごとの錠（`open`）は動かさない（同じ機械の窓どうしが同じ所を見るため）
 - テンプレートは読むだけで、Sashimono が書く所は無い 棚へ足すのは本人が `templates` へ置いた物
 - `.exa`（AviUtl のエイリアス）は読むだけで書き出さない Sashimono のエイリアスは `.smea` で、
   `%APPDATA%` の側に保存する どちらもインストール先には書かない

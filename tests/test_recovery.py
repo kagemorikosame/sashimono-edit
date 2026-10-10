@@ -15,8 +15,11 @@ from sashimono.core.io import (
     RecoverySession,
     backup_before_save,
     backup_folder,
+    backups_over,
     discard,
     find_orphans,
+    find_orphans_in,
+    folder_problem,
     load_project,
     recovery,
 )
@@ -198,3 +201,63 @@ class TestBackup:
         folder = backup_folder(tmp_path / name, tmp_path / "state")
         folder.mkdir(parents=True)
         assert folder.is_dir()
+
+
+class TestChosenFolders:
+    """退避とバックアップの置き場を設定で変えた人のための道具（#271）"""
+
+    def test_orphans_are_found_in_every_folder(self, tmp_path: Path) -> None:
+        # 選んだ置き場へ書けずに既定へ戻した起動が落ちると、退避は既定の側に残る
+        chosen, default = tmp_path / "選んだ", tmp_path / "既定"
+        for root, name in ((chosen, "こちら"), (default, "あちら")):
+            session = RecoverySession(root)
+            session.save(Project.create(name=name), None)
+            crash(session)
+        found = find_orphans_in([chosen, default])
+        assert sorted(entry.name for entry in found) == ["あちら", "こちら"]
+
+    def test_the_same_folder_is_not_counted_twice(self, tmp_path: Path) -> None:
+        # 既定を選んだ人のところでは 2 つの置き場が同じ 2 度数えると同じ退避を 2 回勧める
+        session = RecoverySession(tmp_path)
+        session.save(Project.create(), None)
+        crash(session)
+        assert len(find_orphans_in([tmp_path, tmp_path / "."])) == 1
+
+    def test_a_writable_folder_has_no_problem(self, tmp_path: Path) -> None:
+        assert folder_problem(tmp_path / "新しい") is None
+        # 確かめに書いた物を残さない
+        assert list((tmp_path / "新しい").iterdir()) == []
+
+    def test_an_unwritable_folder_says_why(self, tmp_path: Path) -> None:
+        blocker = tmp_path / "ファイル"
+        blocker.write_text("x", "utf-8")
+        assert folder_problem(blocker / "置き場") is not None
+
+    def test_the_backups_over_a_smaller_count_are_counted(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        for name, count in (("一.sme", 5), ("二.sme", 2)):
+            target = tmp_path / name
+            for number in range(count):
+                target.write_text(str(number), "utf-8")
+                backup_before_save(target, state)
+        assert backups_over(3, state) == 2
+        assert backups_over(20, state) == 0
+        # 数えるだけで消さない
+        assert len(list(backup_folder(tmp_path / "一.sme", state).iterdir())) == 5
+
+    def test_no_backups_yet_counts_nothing(self, tmp_path: Path) -> None:
+        assert backups_over(1, tmp_path / "無い") == 0
+
+    def test_close_lets_go_of_the_lock_even_when_clearing_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 置き場のドライブを抜いたあとに閉じても、錠のファイルを開いたままにしない
+        session = RecoverySession(tmp_path)
+
+        def unplugged() -> None:
+            raise OSError("抜いた")
+
+        monkeypatch.setattr(session, "clear", unplugged)
+        with pytest.raises(OSError):
+            session.close()
+        assert session._lock is None

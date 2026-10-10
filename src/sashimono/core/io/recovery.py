@@ -7,7 +7,8 @@
 
 どちらもプロジェクトの隣ではなく ``%LOCALAPPDATA%\\Sashimono`` に置く 隣に置くと、
 プロジェクトを同期フォルダ（OneDrive など）に置いている人のところで、数十秒おきの
-退避がそのまま同期されて回線と相手のフォルダを埋める
+退避がそのまま同期されて回線と相手のフォルダを埋める 本人が設定で別の置き場を選べるが
+（``ui/backup_settings.py``）、ここは置き場を引数で受け取るだけで、選び方は知らない
 
 Qt を使わない 退避の判断はテストで直接確かめたいので、ここは素の Python で書く
 """
@@ -35,9 +36,12 @@ __all__ = [
     "RecoverySession",
     "backup_before_save",
     "backup_folder",
+    "backups_over",
     "default_state_root",
     "discard",
     "find_orphans",
+    "find_orphans_in",
+    "folder_problem",
     "project_presence_dir",
 ]
 
@@ -114,11 +118,17 @@ class RecoverySession:
             path.unlink(missing_ok=True)
 
     def close(self) -> None:
-        """正常に終わる 退避も錠も残さない"""
-        self.clear()
-        if self._lock is not None:
-            self._lock.release()
-            self._lock = None
+        """正常に終わる 退避も錠も残さない
+
+        退避を消せなくても（置き場のドライブを抜いた など）錠は手放す 手放さないと、
+        この起動が終わるまで錠のファイルを開いたままになる
+        """
+        try:
+            self.clear()
+        finally:
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
 
     @staticmethod
     def _lock_path(folder: Path, session: str) -> Path:
@@ -177,6 +187,41 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
             )
         )
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
+    """いくつかの置き場の退避をまとめて 新しい順 同じ置き場を 2 度数えない
+
+    置き場を設定で変えた人のところでは、退避は選んだ置き場と既定の置き場の両方にありうる
+    選んだ置き場へ書けずに既定へ戻した起動が落ちると、退避は既定の側に残る
+    片方しか見ないと、その作業は復元を勧められずに埋もれる
+    """
+    seen: set[str] = set()
+    found: list[RecoveryEntry] = []
+    for root in roots:
+        key = os.path.normcase(str(Path(root).resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.extend(find_orphans(root))
+    return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+def folder_problem(root: Path) -> str | None:
+    """退避とバックアップの置き場として書けるか 書けなければその理由 書ければ ``None``
+
+    フォルダがあるかどうかではなく、実際に 1 つ書いて消して確かめる 読み取り専用の
+    フォルダ・抜いたドライブ・切れたネットワークの置き場は、あるように見えても書けない
+    書けない所を選んだまま気付かないと、退避が黙って止まる
+    """
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / f".sashimono-write-test-{uuid.uuid4().hex}"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as exc:
+        return str(exc) or type(exc).__name__
+    return None
 
 
 def discard(entry: RecoveryEntry) -> None:
@@ -282,3 +327,21 @@ def backup_before_save(
     for old in generations[: max(0, len(generations) - keep)]:
         old.unlink(missing_ok=True)
     return copied
+
+
+def backups_over(keep: int, root: Path | None = None) -> int:
+    """世代数を ``keep`` に減らしたとき、次の上書き保存で消える控えの数（全部のプロジェクトの合計）
+
+    消すのはそのプロジェクトを次に上書き保存したときで、ここでは数えるだけ 減らす前に
+    本人へ数を見せて確かめるため 取り返せない物を黙ってまとめて消さない
+    """
+    base = (root if root is not None else default_state_root()) / "backups"
+    try:
+        folders = [folder for folder in base.iterdir() if folder.is_dir()]
+    except OSError:
+        return 0
+    total = 0
+    for folder in folders:
+        count = sum(1 for suffix in (SUFFIX, *LEGACY_SUFFIXES) for _ in folder.glob(f"*{suffix}"))
+        total += max(0, count - keep)
+    return total
