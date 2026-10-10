@@ -69,10 +69,19 @@ class Filmstrip:
 
     def at(self, source_seconds: Fraction) -> np.ndarray | None:
         """素材内の時刻に最も近いサムネイルを返す"""
+        index = self.index_at(source_seconds)
+        return None if index is None else self.tile(index)
+
+    def index_at(self, source_seconds: Fraction) -> int | None:
+        """素材内の時刻に最も近いサムネイルの番号 無ければ ``None``
+
+        タイムラインは番号ごとに画像を貯めて使い回す :meth:`at` と同じ選び方にしないと、
+        貯めた絵と描くはずの絵が食い違う
+        """
         if self.count == 0 or self.interval <= 0:
             return None
         index = int(max(Fraction(0), source_seconds) / self.interval)
-        return self.tile(min(index, self.count - 1))
+        return min(index, self.count - 1)
 
     def tile(self, index: int) -> np.ndarray | None:
         if not 0 <= index < self.count:

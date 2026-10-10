@@ -14,12 +14,22 @@ import math
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QFontMetricsF,
+    QImage,
+    QPainter,
+    QPen,
+    QStaticText,
+    QTransform,
+)
 
 from sashimono.compat.aviutl.custom_object import (
     CUSTOM_OBJECT_LABEL,
@@ -55,6 +65,7 @@ __all__ = [
     "WAVEFORM_CACHE_BYTES",
     "WAVEFORM_IMAGE_MAX_COLUMNS",
     "ClipGlance",
+    "cached_pen",
     "clear_waveform_images",
     "clip_content",
     "clip_summary",
@@ -385,7 +396,7 @@ def draw_clip(
         painter.setPen(QPen(Colors.EDITING, 2))
         painter.drawRect(clip_rect.adjusted(4, 4, -5, -5))
     else:
-        painter.setPen(QPen(Colors.SELECTION if selected else border, 2 if selected else 1))
+        painter.setPen(cached_pen(Colors.SELECTION if selected else border, 2 if selected else 1))
         painter.drawRect(clip_rect.adjusted(0, 0, -1, -1))
     painter.restore()
 
@@ -827,15 +838,93 @@ def _draw_clip_label(
         name = f"{name}  {voice}"
     if clip.speed != 1:
         name = f"{name}  ×{float(clip.speed):g}"
-    painter.setPen(QPen(Colors.CLIP_LABEL, 1))
-    font = QFont(painter.font())
-    font.setPointSizeF(8.5)
-    painter.setFont(font)
-    painter.drawText(
-        label_rect.adjusted(4, 0, -4, 0),
-        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-        name,
-    )
+    painter.setPen(cached_pen(Colors.CLIP_LABEL))
+    _LABEL_TEXTS.draw(painter, label_rect.adjusted(4, 0, -4, 0), name, clip_rect=rect)
+
+
+class _LabelTexts:
+    """名前の帯の字を、並べた結果を貯めて描く
+
+    ``drawText`` は呼ぶたびに字を並べ直す 細い帯との境の辺りで拡大すると、名前を描く
+    クリップが 1 回で 400 本を超え、名前だけで 17ms ほど掛かった（#260 60fps の予算の
+    ほぼ 1 コマ分） 並べた結果（``QStaticText``）を字と書体ごとに使い回せば、描くのは
+    字の絵を置く所だけになる 置く位置は ``drawText`` の上下中央・左寄せと同じ所にし、
+    矩形の外は ``drawText`` と同じく切り落とす（同じ画素になることを試験で押さえる）
+
+    書体は画面の字を 8.5 ポイントにした物 元の字が同じ間は作った物と行の高さを使い回す
+    クリップごとに写して大きさを変えるのも、400 本では 1ms を超える
+    """
+
+    #: 貯める並べ方の数の上限 名前の種類の数だけあれば足りる 超えたら全部捨てて貯め直す
+    LIMIT = 4096
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], QStaticText] = {}
+        self._base: str | None = None
+        self._font = QFont()
+        self._font_key = ""
+        self._height = 0.0
+        #: 並べ直した回数 試験が、同じ名前を描き直しても並べ直さないことを数える
+        self.prepared = 0
+
+    def draw(self, painter: QPainter, rect: QRect, text: str, *, clip_rect: QRect) -> None:
+        # 書体は中身（key）で見分ける QFont の hash と == は中身の一部しか見ないことがあり、
+        # 同じ書体を別の物と見て並べ直したり、違う書体を同じ物と見たりする
+        base = painter.font()
+        base_key = base.key()
+        if base_key != self._base:
+            font = QFont(base)
+            font.setPointSizeF(8.5)
+            self._base, self._font = base_key, font
+            self._height = QFontMetricsF(font).height()
+            self._font_key = font.key()
+        font = self._font
+        painter.setFont(font)
+        if rect.width() <= 0 or not text:
+            return
+        key = (text, self._font_key)
+        static = self._entries.get(key)
+        if static is None:
+            if len(self._entries) >= self.LIMIT:
+                self._entries.clear()
+            static = QStaticText(text)
+            # 既定は字の中身で書式を決める 「<」で始まる名前が HTML として読まれないように
+            static.setTextFormat(Qt.TextFormat.PlainText)
+            static.prepare(QTransform(), font)
+            self._entries[key] = static
+            self.prepared += 1
+        painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
+        painter.drawStaticText(
+            QPointF(rect.left(), rect.top() + (rect.height() - self._height) / 2), static
+        )
+        # 切り落とす範囲をクリップの矩形へ戻す（draw_clip が掛けた物と同じ）
+        painter.setClipRect(clip_rect)
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._base = None
+
+
+_LABEL_TEXTS = _LabelTexts()
+
+
+def cached_pen(colour: QColor, width: float = 1) -> QPen:
+    """色と太さの決まったペン 同じ組の間は作った物を使い回す
+
+    クリップ 1 本ごとにペンを作ると、境の辺りの 400 本で数百 µs になる 色はテーマを
+    切り替えると変わるので、色の値（rgba）も鍵に入れる
+    """
+    key = (colour.rgba(), width)
+    pen = _PENS.get(key)
+    if pen is None:
+        if len(_PENS) >= 256:
+            _PENS.clear()
+        pen = QPen(colour, width)
+        _PENS[key] = pen
+    return pen
+
+
+_PENS: dict[tuple[int, float], QPen] = {}
 
 
 def voice_label(track: Track, clip: Clip, media: MediaItem | None) -> str | None:
@@ -901,11 +990,68 @@ def _draw_filmstrip(
         # 秒の計算に float を混ぜないよう、まずフレーム番号（整数）へ落とす
         frame = layout.frame_at(x)
         # 描画と同じ式で引く 絵を止めたクリップで、止めた後の所に動く絵が並ばないように
-        tile = filmstrip.at(clip.picture_time(frame - clip.timeline_start, rate))
-        if tile is None:
+        index = filmstrip.index_at(clip.picture_time(frame - clip.timeline_start, rate))
+        image = _FILMSTRIP_TILES.image(filmstrip, index) if index is not None else None
+        if image is None:
             break
-        painter.drawImage(QRectF(x, rect.top(), tile_width, rect.height()), to_qimage(tile))
+        painter.drawImage(QRectF(x, rect.top(), tile_width, rect.height()), image)
         x += tile_width
+
+
+#: サムネイルの画像を貯めておく量の上限（バイト） 1 枚は高さ 72 画素で 40KB ほど
+#: 画面に並ぶ数（数百枚）と、少し前に見た所の分が入れば足りる
+FILMSTRIP_CACHE_BYTES = 32 * 1024 * 1024
+
+
+class _FilmstripTiles:
+    """サムネイルを 1 枚ずつ画像（``QImage``）にした物を、古く使った物から捨てながら貯める
+
+    描くたびに配列から画像を作ると、写しを 2 度取る 細い帯との境の辺りで拡大すると
+    サムネイルを描くクリップが 1 回で 200 本を超え、それだけで数 ms 掛かった（#260）
+    束は弱参照を取れないので、:class:`_FilmstripTints` と同じく画素の配列を弱参照で持つ
+    束を強く持つと、素材を外して解析を捨てても、ここがサムネイルを抱えてメモリが空かない
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._used = 0
+        self._entries: OrderedDict[tuple[int, int], tuple[weakref.ref[np.ndarray], QImage]] = (
+            OrderedDict()
+        )
+        #: 配列から画像を作った回数 試験が、描き直しで作り直さないことを数える
+        self.converted = 0
+
+    def image(self, filmstrip: Filmstrip, index: int) -> QImage | None:
+        sheet = filmstrip.sheet
+        key = (id(sheet), index)
+        entry = self._entries.get(key)
+        # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
+        if entry is not None and entry[0]() is sheet:
+            self._entries.move_to_end(key)
+            return entry[1]
+        if entry is not None:
+            self._drop(key)
+        tile = filmstrip.tile(index)
+        if tile is None:
+            return None
+        image = to_qimage(tile)
+        self.converted += 1
+        self._entries[key] = (weakref.ref(sheet), image)
+        self._used += image.sizeInBytes()
+        while self._used > self._budget and self._entries:
+            self._drop(next(iter(self._entries)))
+        return image
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._used = 0
+
+    def _drop(self, key: tuple[int, int]) -> None:
+        _, image = self._entries.pop(key)
+        self._used -= image.sizeInBytes()
+
+
+_FILMSTRIP_TILES = _FilmstripTiles(FILMSTRIP_CACHE_BYTES)
 
 
 def _draw_waveform(
@@ -944,15 +1090,8 @@ def _draw_waveform(
     if total_columns <= WAVEFORM_IMAGE_MAX_COLUMNS:
         # クリップの頭から数えた列で作る 見えている左端から数えると、スクロールで
         # 1 画素動くたびに列の区切りが変わり、画像を使い回せないうえ波形が揺れて見える
-        end_seconds = clip.source_in + clip.duration * rate.frame_duration * clip.speed
-        image = _WAVEFORM_IMAGES.get(
-            waveform,
-            int(clip.source_in * waveform.sample_rate),
-            int(end_seconds * waveform.sample_rate),
-            total_columns,
-            height,
-            _Shaping(clip, rate, 0.0, float(clip.duration), track_gain),
-        )
+        start, end, shaping = _WAVE_SPANS.get(clip, rate, waveform.sample_rate, track_gain)
+        image = _WAVEFORM_IMAGES.get(waveform, start, end, total_columns, height, shaping)
         if image is None:
             return
         # クリップの矩形（clip_rect_for）と同じく画素へ切り捨てた左端に揃える
@@ -1015,10 +1154,58 @@ class _Shaping:
     first: float
     last: float
     track_gain: float
+    #: :meth:`key` の値 作るときに 1 度だけ求める（エフェクトを全部なめるので軽くない）
+    _key: Hashable = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        found = shape_key(self.clip, self.track_gain)
+        # 凍った dataclass なので object 経由で入れる
+        object.__setattr__(self, "_key", None if found is None else (found, self.first, self.last))
 
     def key(self) -> Hashable:
-        found = shape_key(self.clip, self.track_gain)
-        return None if found is None else (found, self.first, self.last)
+        return self._key
+
+
+class _WaveSpans:
+    """クリップ全体の波形に使う、素材の範囲（サンプル）と効き方を、クリップごとに貯める
+
+    範囲は分数で数え、効き方の鍵はエフェクトを全部なめて作る 描くたびに求めると、
+    細い帯との境の辺りで拡大したときの 200 本を超える波形で 1ms を超えた（#260）
+    クリップは書き換えると別の物になるので、同じ物（``is``）かで見れば足りる
+    """
+
+    #: 貯めるクリップの数の上限 超えたら全部捨てて貯め直す
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._entries: dict[ClipId, tuple[Clip, FrameRate, int, float, int, int, _Shaping]] = {}
+
+    def get(
+        self, clip: Clip, rate: FrameRate, sample_rate: int, track_gain: float
+    ) -> tuple[int, int, _Shaping]:
+        entry = self._entries.get(clip.id)
+        if (
+            entry is not None
+            and entry[0] is clip
+            and entry[1] == rate
+            and entry[2] == sample_rate
+            and entry[3] == track_gain
+        ):
+            return entry[4], entry[5], entry[6]
+        end_seconds = clip.source_in + clip.duration * rate.frame_duration * clip.speed
+        start = int(clip.source_in * sample_rate)
+        end = int(end_seconds * sample_rate)
+        shaping = _Shaping(clip, rate, 0.0, float(clip.duration), track_gain)
+        if len(self._entries) >= self.LIMIT:
+            self._entries.clear()
+        self._entries[clip.id] = (clip, rate, sample_rate, track_gain, start, end, shaping)
+        return start, end, shaping
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_WAVE_SPANS = _WaveSpans()
 
 
 class _WaveformImages:
@@ -1101,6 +1288,7 @@ def clear_waveform_images() -> None:
     変えた直後の 1 回の重さを測ったつもりで、細い帯の目安を求める分が抜ける
     """
     _WAVEFORM_IMAGES.clear()
+    _WAVE_SPANS.clear()
     _WAVEFORM_LEVELS.clear()
     _FILMSTRIP_TINTS.clear()
 

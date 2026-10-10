@@ -374,10 +374,11 @@ class TestDetailWidthSetting:
             clip: Clip,
             rect: QRect,
             selected: bool,
-            editing: bool = False,
+            editing: bool,
+            table: dict[MediaId, MediaItem],
         ) -> None:
             detailed.append(clip)
-            original(painter, band, clip, rect, selected, editing)
+            original(painter, band, clip, rect, selected, editing, table)
 
         monkeypatch.setattr(scene.view, "_paint_detailed", record)
         scene.render()

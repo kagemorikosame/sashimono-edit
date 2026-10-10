@@ -41,13 +41,11 @@ from sashimono.core.model import (
     Project,
     Track,
     TrackKind,
-    draws_picture,
-    plays_sound,
 )
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.keyframes import KEYFRAME_SIZE, MIN_KEYFRAME_GAP
 from sashimono.ui.timeline.layout import TimelineLayout
-from sashimono.ui.timeline.painter import DETAIL_MIN_WIDTH, clip_rect_for
+from sashimono.ui.timeline.painter import DETAIL_MIN_WIDTH, cached_pen, clip_rect_for
 
 __all__ = [
     "LINE_GRAB",
@@ -130,11 +128,13 @@ def value_kinds(track: Track, clip: Clip, project: Project) -> tuple[ValueKind, 
     クリップの音量調整を通らない（シーンの中のミキサで決まる）ので、線を出しても効かない
     音声トラックは音量だけ 混合トラックは、絵を描くなら不透明度、音を鳴らすなら音量
     """
-    media = project.find_media(clip.media_id) if clip.media_id is not None else None
+    # 素材は混合トラックのときだけ引く（Project の draws_picture と plays_sound） 描くたびに
+    # クリップごとに素材の一覧をなめると、細い帯との境の辺りで拡大したときの 400 本を超える
+    # 線で、素材の多い作品ほど重くなる（#260）
     kinds: list[ValueKind] = []
-    if track.kind is not TrackKind.AUDIO and draws_picture(track, clip, media):
+    if track.kind is not TrackKind.AUDIO and project.draws_picture(track, clip):
         kinds.append(ValueKind.OPACITY)
-    if track.kind is not TrackKind.VIDEO and plays_sound(track, clip, media):
+    if track.kind is not TrackKind.VIDEO and project.plays_sound(track, clip):
         kinds.append(ValueKind.VOLUME)
     return tuple(kinds)
 
@@ -381,13 +381,13 @@ class ValueLineEditor:
         painter.setClipRect(rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 3.5))
+        painter.setPen(cached_pen(Colors.VALUE_LINE_SHADOW, 3.5))
         painter.drawPolyline(line)
         # 線は 2 画素で引く 1 画素半にすると、どの行にも半分ずつしか乗らず、画素の上では
         # 背景と混ざった灰色になって、サムネイルの上で見分けにくい
-        painter.setPen(QPen(color, 2.0))
+        painter.setPen(cached_pen(color, 2.0))
         painter.drawPolyline(line)
-        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 1))
+        painter.setPen(cached_pen(Colors.VALUE_LINE_SHADOW, 1))
         painter.setBrush(color)
         radius = _POINT_RADIUS + (0.5 if selected else 0.0)
         for _, centre in _points(clip, kind, value, layout, area):

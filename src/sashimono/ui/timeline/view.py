@@ -695,7 +695,9 @@ class TimelineView(QWidget):
         selected = self._highlighted()
         # 設定パネルが出している 1 本 選んだ仲間と見分けて描く（主の選択は最後に選んだ物）
         editing = self.selected_clip
-        media: dict[MediaId, MediaItem] | None = None
+        # 素材の引き表は描くたびに 1 度だけ作る クリップごとに素材の一覧をなめると、細い帯との
+        # 境の辺りで拡大して 400 本を超えるクリップを描くとき、素材の多い作品ほど重くなる（#260）
+        media = {item.id: item for item in self._project.media}
         for band in self._layout.bands(timeline):
             if band.bottom <= Metrics.RULER_HEIGHT or band.top >= self.height():
                 continue
@@ -709,14 +711,10 @@ class TimelineView(QWidget):
                 rect = clip_rect_for(clip, band, self._layout, width)
                 if rect is not None:
                     self._paint_detailed(
-                        painter, band, clip, rect, clip.id in selected, clip.id == editing
+                        painter, band, clip, rect, clip.id in selected, clip.id == editing, media
                     )
             if not dense:
                 continue
-            # 素材の引き表は、細い帯が出たときに 1 度だけ作って使い回す トラックごとに
-            # 作ると、素材とトラックが多い作品で描くたびに掛け算で重くなる
-            if media is None:
-                media = {item.id: item for item in self._project.media}
             sound_only = (
                 self._sound_only(band.track, media) if band.track.kind is TrackKind.MIXED else None
             )
@@ -895,9 +893,10 @@ class TimelineView(QWidget):
         clip: Clip,
         rect: QRect,
         selected: bool,
-        editing: bool = False,
+        editing: bool,
+        table: dict[MediaId, MediaItem],
     ) -> None:
-        media = self._project.find_media(clip.media_id) if clip.media_id is not None else None
+        media = table.get(clip.media_id) if clip.media_id is not None else None
         scene = self._project.find_scene(clip.scene_id) if clip.scene_id is not None else None
         paint_clip(
             painter,
