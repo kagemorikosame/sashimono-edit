@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -65,6 +66,7 @@ from sashimono.core.commands.fixed import (
     fixed_effect,
     takes_picture_items,
 )
+from sashimono.core.commands.preset import PresetOptions, preset_commands
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.model import (
     AnimatedValue,
@@ -121,6 +123,9 @@ BLEND_LABELS = {
     **{mode: label for mode, label in BLEND_MODES if mode in BlendMode.EXTENDED},
 }
 
+
+#: 〔プリセット…〕のメニューで「保存」の項目に持たせる印 一覧の項目はプリセットそのものを持つ
+_SAVE_PRESET = "save_preset"
 
 #: 配置のテンプレートのボタンの印 :data:`ALIGNMENTS` と同じ並び（左上から右下へ）
 _ALIGN_MARKS = ("↖", "↑", "↗", "←", "●", "→", "↙", "↓", "↘")
@@ -213,6 +218,8 @@ class InspectorPanel(QWidget):
         self._clip_id: ClipId | None = None
         self._selection: tuple[ClipId, ...] = ()
         self._presets = PresetStore()
+        #: プリセットの当て方（設定 :attr:`Preferences.preset_options`）
+        self._preset_options = PresetOptions()
         self._frame = 0
         #: パラメータごとの入力欄 プロジェクトが変わったときに値を入れ直す
         self._editors: dict[tuple[str, str], ParameterEditor] = {}
@@ -268,6 +275,10 @@ class InspectorPanel(QWidget):
         self._preset_button = QPushButton("プリセット…", self)
         self._preset_button.clicked.connect(self._show_preset_menu)
         self._preset_button.setEnabled(False)
+        self._preset_button.setToolTip(
+            "選んでいるクリップの見た目を保存し、ほかのクリップへ当てる\n"
+            "クリップごと置き直すのはエイリアス（タイムラインの右クリックの追加）"
+        )
 
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
@@ -1396,19 +1407,50 @@ class InspectorPanel(QWidget):
             f"{definition.label}を追加{where}",
         )
 
-    def _show_preset_menu(self) -> None:
-        """プリセットの保存と適用
+    def set_preset_options(self, options: PresetOptions) -> None:
+        """プリセットの当て方（文字・位置を当てるか、エフェクトを残すか） 設定から"""
+        self._preset_options = options
 
-        保存するのはエフェクトの列ごと 見た目のほとんどは複数のエフェクトの
-        組み合わせでできているので、1 つずつ保存しても使い物にならない
+    def set_preset_store(self, store: PresetStore) -> None:
+        """プリセットの置き場を差し替える 試験と、置き場を選べるようにするときのため"""
+        self._presets = store
+
+    def _show_preset_menu(self) -> None:
+        menu = self.preset_menu()
+        if menu is None:
+            return
+        chosen = menu.exec(self._preset_button.mapToGlobal(self._preset_button.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
+        if chosen is not None:
+            self.run_preset_action(chosen)
+
+    def preset_menu(self) -> QMenu | None:
+        """〔プリセット…〕のメニュー 保存と、保存したプリセットの一覧
+
+        項目に持たせるのはプリセットそのもの 名前だけを持たせると、別の分類に同じ名前が
+        あるときに、選んだのとは違う方が当たった（#275） 一覧の管理（#276）や見本の絵
+        （#277）を足すときも、項目から引くのはここで持たせた物だけにする
         """
         clip = self._clip()
-        if clip is None:
-            return
+        located = self._located()
+        if clip is None or located is None:
+            return None
+        picture, _ = self._picture_and_sound(*located)
 
         menu = QMenu(self)
-        save = menu.addAction("この構成を保存…")
-        save.setEnabled(bool(_loose(clip)))
+        menu.setToolTipsVisible(True)
+        save = menu.addAction("この見た目を保存…")
+        save.setData(_SAVE_PRESET)
+        if Preset.capture("", clip, picture=picture).has_look:
+            save.setToolTip(
+                "文字の見た目・足したエフェクト・描画と音声の欄・不透明度・合成モードを保存する"
+            )
+        else:
+            # 押せない理由を出す 灰色の項目だけでは、何をすれば押せるのか分からない
+            save.setText("この見た目を保存…（保存できる設定がありません）")
+            save.setEnabled(False)
+            save.setToolTip("足したエフェクトも、描画・音声の欄も、テキストや図形の中身も無い")
         menu.addSeparator()
 
         presets = self._presets.all()
@@ -1421,33 +1463,102 @@ class InspectorPanel(QWidget):
                 submenu = submenus.get(preset.category)
                 if submenu is None:
                     submenu = menu.addMenu(preset.category)
+                    submenu.setToolTipsVisible(True)
                     submenus[preset.category] = submenu
                 action = submenu.addAction(preset.name)
-                action.setData(preset.name)
+                action.setData(preset)
+                if preset.span is None:
+                    action.setToolTip("前の版で保存したプリセット 足したエフェクトだけを足す")
 
-        chosen = menu.exec(self._preset_button.mapToGlobal(self._preset_button.rect().bottomLeft()))
-        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
-        menu.deleteLater()
-        if chosen is None:
-            return
-        if chosen is save:
-            self._save_preset(clip)
-            return
+        menu.addSeparator()
+        # エイリアスとの住み分けと、当て方の置き場を書いておく 当てて文字が変わらないのを
+        # 不具合と思われないように、変え方まで添える
+        hint = menu.addAction("いまのクリップに見た目を当てる（文字・位置の当て方は 設定 で）")
+        hint.setEnabled(False)
+        hint.setToolTip(
+            "クリップごと置き直すのはエイリアス（右クリックの追加）\n"
+            "文字や位置も当てるか、足してあるエフェクトを残すかは 表示 → 設定… で変える"
+        )
+        return menu
 
-        selected = next((p for p in presets if p.name == chosen.data()), None)
-        if selected is not None:
-            self.commands_requested.emit(
-                [AddEffect(clip.id, effect) for effect in selected.instantiate()],
-                f"プリセット: {selected.name}",
-            )
+    def run_preset_action(self, chosen: QAction) -> None:
+        """:meth:`preset_menu` で選んだ項目を行う"""
+        data = chosen.data()
+        if data == _SAVE_PRESET:
+            clip = self._clip()
+            located = self._located()
+            if clip is not None and located is not None:
+                picture, _ = self._picture_and_sound(*located)
+                self._save_preset(clip, picture=picture)
+        elif isinstance(data, Preset):
+            self._apply_preset(data)
 
-    def _save_preset(self, clip: Clip) -> None:
+    def _save_preset(self, clip: Clip, *, picture: bool) -> None:
         name, accepted = QInputDialog.getText(
             self, "プリセットを保存", "名前", text=self._describe(clip)
         )
         if not accepted or not name.strip():
             return
-        self._presets.save(Preset(name=name.strip(), effects=_loose(clip)))
+        preset = Preset.capture(name.strip(), clip, picture=picture)
+        if self._presets.exists(preset):
+            # 黙って書き換えると、前に作ったプリセットが戻せないまま消える
+            answer = QMessageBox.question(
+                self,
+                "プリセットを保存",
+                f"「{preset.category}」に「{preset.name}」がもうある 上書きする？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            self._presets.save(preset)
+        except OSError as exc:
+            QMessageBox.warning(self, "プリセットを保存", f"保存できなかった: {exc}")
+
+    def _apply_preset(self, preset: Preset) -> None:
+        """選んでいるクリップすべてへ当てる 1 回の取り消しで全部戻る
+
+        主の 1 本だけに当てると、何本も選んで当てたつもりが残りは前の見た目のまま残る
+        当てる先は :attr:`_selection`（タイムラインの ``edit_targets``） グループの仲間として
+        引き込まれただけの物は入らないので、値の欄と同じく自分で選んだ物にだけ当たる
+        """
+        if self._project is None:
+            return
+        commands: list[Command] = []
+        touched = 0
+        targets = self._selection or ((self._clip_id,) if self._clip_id is not None else ())
+        for clip_id in dict.fromkeys(targets):
+            located = self._project.timeline.locate_clip(clip_id)
+            if located is None:
+                continue
+            track, clip = located
+            picture, sound = self._picture_and_sound(track, clip)
+            allowed = frozenset(d.kind for d in effects_for_clip(self._project, track, clip))
+            made = preset_commands(
+                preset,
+                clip,
+                picture=picture,
+                sound=sound,
+                options=self._preset_options,
+                # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
+                accepts=allowed.__contains__,
+            )
+            if made:
+                commands.extend(made)
+                touched += 1
+        if not commands:
+            QMessageBox.information(
+                self,
+                "プリセット",
+                f"「{preset.name}」を当てても変わる所がなかった"
+                "（中身の種類が違うか、もう同じ見た目になっている）",
+            )
+            return
+        label = f"プリセット: {preset.name}"
+        if touched > 1:
+            label = f"{label}（{touched} 本）"
+        self.commands_requested.emit(commands, label)
 
     def _emit(self, command: Command, label: str | None = None, *, continued: bool = False) -> None:
         commands = [command, *self._also_for_others(command)]
@@ -1557,15 +1668,6 @@ def _effect_of(command: Command) -> EffectId | None:
     if isinstance(command, SetEffectEnabled):
         return command.effect_id
     return None
-
-
-def _loose(clip: Clip) -> tuple[Effect, ...]:
-    """足したエフェクト（最初から持つ欄を除く）
-
-    プリセットには欄を入れない 入れると当てるたびに既定のままの配置や反転が
-    ふつうのエフェクトとして増え、足した物の一覧が読めなくなる
-    """
-    return tuple(effect for effect in clip.effects if not effect.fixed)
 
 
 def _fraction(value: ParamValue, scale: int) -> Fraction:
