@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -38,16 +38,15 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     Effect,
+    MediaItem,
     Project,
     Track,
     TrackKind,
-    draws_picture,
-    plays_sound,
 )
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.keyframes import KEYFRAME_SIZE, MIN_KEYFRAME_GAP
 from sashimono.ui.timeline.layout import TimelineLayout
-from sashimono.ui.timeline.painter import DETAIL_MIN_WIDTH, clip_rect_for
+from sashimono.ui.timeline.painter import DETAIL_MIN_WIDTH, cached_pen, clip_rect_for
 
 __all__ = [
     "LINE_GRAB",
@@ -79,6 +78,9 @@ _TOP_GAP = 3
 #: 下の端はひし形の列（中心が下端から KEYFRAME_SIZE + 2、選ぶと 1 画素大きい）の上で止める
 #: 値が 0 の線がひし形に重なると、どちらを押したのか分からない
 _BOTTOM_GAP = 2 * KEYFRAME_SIZE + 5
+
+#: 線の種類を貯めるクリップの数の上限 超えたら全部捨てて貯め直す
+_SHAPES_LIMIT = 8192
 
 #: 右クリックに出す名前 試験もこの名前で探す
 SHOW_OPACITY_TEXT = "線に不透明度を出す"
@@ -130,11 +132,13 @@ def value_kinds(track: Track, clip: Clip, project: Project) -> tuple[ValueKind, 
     クリップの音量調整を通らない（シーンの中のミキサで決まる）ので、線を出しても効かない
     音声トラックは音量だけ 混合トラックは、絵を描くなら不透明度、音を鳴らすなら音量
     """
-    media = project.find_media(clip.media_id) if clip.media_id is not None else None
+    # 素材は混合トラックのときだけ引く（Project の draws_picture と plays_sound） 描くたびに
+    # クリップごとに素材の一覧をなめると、細い帯との境の辺りで拡大したときの 400 本を超える
+    # 線で、素材の多い作品ほど重くなる（#260）
     kinds: list[ValueKind] = []
-    if track.kind is not TrackKind.AUDIO and draws_picture(track, clip, media):
+    if track.kind is not TrackKind.AUDIO and project.draws_picture(track, clip):
         kinds.append(ValueKind.OPACITY)
-    if track.kind is not TrackKind.VIDEO and plays_sound(track, clip, media):
+    if track.kind is not TrackKind.VIDEO and project.plays_sound(track, clip):
         kinds.append(ValueKind.VOLUME)
     return tuple(kinds)
 
@@ -277,6 +281,11 @@ class ValueLineEditor:
         #: 音量の線に切り替えたクリップ 画面の都合なのでプロジェクトには残さない
         self._volume_shown: set[ClipId] = set()
         self._drag: _Drag | None = None
+        #: 線の種類と平らな線の高さの割合を、クリップごとに貯める（:meth:`_shape`）
+        self._shapes: dict[
+            ClipId,
+            tuple[Clip, Track, tuple[MediaItem, ...], bool, tuple[ValueKind, float | None] | None],
+        ] = {}
 
     @property
     def dragging(self) -> bool:
@@ -381,13 +390,13 @@ class ValueLineEditor:
         painter.setClipRect(rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 3.5))
+        painter.setPen(cached_pen(Colors.VALUE_LINE_SHADOW, 3.5))
         painter.drawPolyline(line)
         # 線は 2 画素で引く 1 画素半にすると、どの行にも半分ずつしか乗らず、画素の上では
         # 背景と混ざった灰色になって、サムネイルの上で見分けにくい
-        painter.setPen(QPen(color, 2.0))
+        painter.setPen(cached_pen(color, 2.0))
         painter.drawPolyline(line)
-        painter.setPen(QPen(Colors.VALUE_LINE_SHADOW, 1))
+        painter.setPen(cached_pen(Colors.VALUE_LINE_SHADOW, 1))
         painter.setBrush(color)
         radius = _POINT_RADIUS + (0.5 if selected else 0.0)
         for _, centre in _points(clip, kind, value, layout, area):
@@ -396,6 +405,110 @@ class ValueLineEditor:
         if drag is not None and drag.clip_id == clip.id and drag.at is not None:
             _draw_tag(painter, rect, drag.at, f"{kind.title} {kind.percent(drag.shown):.0f}%")
         painter.restore()
+
+    def paint_many(
+        self,
+        painter: QPainter,
+        project: Project,
+        track: Track,
+        clips: Sequence[tuple[Clip, QRect, bool]],
+        layout: TimelineLayout,
+        band_height: int,
+    ) -> None:
+        """1 本のトラックの ``(クリップ, 見えている矩形, 選んだか)`` に線をまとめて描く
+
+        描く絵は :meth:`paint` を 1 本ずつ呼んだときと同じ 境を越えて拡大すると線を
+        描くクリップが 400 本を超え、1 本ずつ状態を保存して戻すと 14ms ほど掛かった（#260）
+        点の無い平らな線（ほとんど）は、影と線をそれぞれまとめて引く クリップは重ならず、
+        線はクリップの矩形で切り落とすので、影と線の順がクリップごとに守られれば同じ絵になる
+        点のある線・動かしている線は今までの描き方で描く
+        """
+        if band_height < MIN_LINE_TRACK_HEIGHT or not self.enabled:
+            return
+        # 平らな線（左端, 右端の次の画素, 高さ, 色） 隙間なく続き、高さと色が同じ物は 1 本に繋ぐ
+        flat: list[tuple[int, int, float, QColor]] = []
+        drag = self._drag
+        colours = {ValueKind.OPACITY: Colors.OPACITY_LINE, ValueKind.VOLUME: Colors.VOLUME_LINE}
+        top_gap = Metrics.CLIP_LABEL_HEIGHT + _TOP_GAP
+        for clip, rect, selected in clips:
+            shape = self._shape(project, track, clip)
+            if shape is None:
+                continue
+            kind, share = shape
+            # line_area と value_to_y と同じ式 矩形を作らずに求める（area の下端は
+            # bottom - 1、高さは bottom - top）
+            top = rect.top() + top_gap
+            bottom = rect.bottom() - _BOTTOM_GAP
+            if bottom - top < 8:
+                continue
+            if share is None or (drag is not None and drag.clip_id == clip.id):
+                self.paint(
+                    painter, project, track, clip, layout, rect, band_height, selected=selected
+                )
+                continue
+            y = (bottom - 1) - share * (bottom - top)
+            colour = colours[kind]
+            left, right = rect.left(), rect.right() + 1
+            last = flat[-1] if flat else None
+            if last is not None and last[1] == left and last[2] == y and last[3] is colour:
+                flat[-1] = (last[0], right, y, colour)
+            else:
+                flat.append((left, right, y, colour))
+        if not flat:
+            return
+        # paint は四角い端のペンで矩形の外まで引き、クリップの矩形で切り落とす 端を切りっぱなしに
+        # して矩形の左右ちょうどで止めれば、切り落とさなくても同じ画素になる 切り落とさなければ、
+        # 隣り合うクリップの同じ高さの線を 1 本にまとめて引ける
+        lines = [
+            (QPolygonF([QPointF(left, y), QPointF(right, y)]), colour)
+            for left, right, y, colour in flat
+        ]
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(cached_pen(Colors.VALUE_LINE_SHADOW, 3.5, flat=True))
+        for line, _ in lines:
+            painter.drawPolyline(line)
+        # 線は 2 画素で引く（paint と同じ）
+        for line, colour in lines:
+            painter.setPen(cached_pen(colour, 2.0, flat=True))
+            painter.drawPolyline(line)
+        painter.restore()
+
+    def forget_shapes(self) -> None:
+        """貯めた線の種類と高さを捨てる クリップとトラックと素材の一覧を強く持つので、
+        別のプロジェクトを開いたときに捨てる（:meth:`TimelineView.forget_drawing`）"""
+        self._shapes.clear()
+
+    def _shape(
+        self, project: Project, track: Track, clip: Clip
+    ) -> tuple[ValueKind, float | None] | None:
+        """線に出す値と、平らな線ならその高さの割合（``clamp(値) / 上限``） 点のある線は
+        割合を ``None`` にする 線を出さなければ ``None``
+
+        クリップ・トラック・素材の一覧・音量の線に切り替えたかが同じ間は前に求めた物を使う
+        1 本ごとに値の種類と値を求め直すと、境を越えて拡大したときの 400 本で数 ms になる
+        """
+        shown = clip.id in self._volume_shown
+        entry = self._shapes.get(clip.id)
+        if (
+            entry is not None
+            and entry[0] is clip
+            and entry[1] is track
+            and entry[2] is project.media
+            and entry[3] == shown
+        ):
+            return entry[4]
+        kind = self.kind_for(project, track, clip)
+        found: tuple[ValueKind, float | None] | None = None
+        if kind is not None:
+            value = value_of(clip, kind)
+            flat = not (value.is_animated or value.keyframes)
+            found = (kind, kind.clamp(value.static) / kind.maximum if flat else None)
+        if len(self._shapes) >= _SHAPES_LIMIT:
+            self._shapes.clear()
+        self._shapes[clip.id] = (clip, track, project.media, shown, found)
+        return found
 
     # --- 押す・動かす・離す ---
 
