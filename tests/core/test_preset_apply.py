@@ -168,6 +168,19 @@ class TestApply:
         )
         assert not any(isinstance(c, AddEffect) and c.effect.kind == "blur" for c in commands)
 
+    def test_nothing_to_add_leaves_the_clips_own_effects(self) -> None:
+        # 1 つも当たらないのに先に消すと、当てる先のエフェクトだけが消える
+        saved = replace(_text(), effects=(Effect(kind="glow"), *_text().effects))
+        target = replace(_text(), effects=(Effect(kind="blur"), *_text().effects))
+        after = _applied(target, Preset.capture("光る", saved), accepts=lambda kind: False)
+        assert [e.kind for e in after.effects if not e.fixed] == ["blur"]
+
+    def test_a_preset_without_effects_still_clears_them(self) -> None:
+        # エフェクトの無い見た目を保存した物 当てると同じくエフェクトの無い見た目になる
+        target = replace(_text(), effects=(Effect(kind="blur"), *_text().effects))
+        after = _applied(target, Preset.capture("素", _text()), accepts=lambda kind: False)
+        assert [e for e in after.effects if not e.fixed] == []
+
     def test_a_transition_ignores_the_picture_values(self) -> None:
         # 場面切り替えは不透明度・合成モードを読まない 当てても何も変わらない段が積まれる
         saved = replace(_text(), opacity=AnimatedValue(0.3), blend_mode="add")

@@ -161,23 +161,25 @@ def _effect_commands(
     # 入れ替えると、今まで足して重ねていた人の手元でエフェクトが消える
     replacing = preset.span is not None and not options.keep_effects
     commands: list[Command] = []
-    if replacing:
-        # 固定の項目（最初から持つ欄）は外せないので残す 外そうとすると命令が断られ、
-        # 当てる操作ごと取り消しになる
-        commands.extend(RemoveEffect(clip.id, e.id) for e in clip.effects if not e.fixed)
-        if transition:
-            commands.extend(
-                RemoveEffect(clip.id, e.id, after=True) for e in clip.after_effects if not e.fixed
-            )
     for after, stack in ((False, preset.effects), (True, preset.after_effects)):
         if after and not transition:
             # 後の場面の列は場面切り替えだけが読む ほかのクリップへ足しても描かれず、
             # 設定パネルにも出ないので、消すこともできない列が残る
             continue
-        for effect in stack:
-            if accepts is not None and not accepts(effect.kind):
-                continue
-            commands.append(AddEffect(clip.id, _fresh(effect, fit), after=after))
+        added = [effect for effect in stack if accepts is None or accepts(effect.kind)]
+        # 入れ替えるのは、プリセットの列がこのクリップへ当たるときだけ（列ごとに決める）
+        # プリセットにエフェクトがあるのに 1 つも当たらない（映像のプリセットを音のクリップへ
+        # 当てたなど）とき、消してから何も足さないと、当てる先のエフェクトだけが消える
+        # プリセットの列がもともと空なら入れ替える 足したエフェクトの無い見た目を保存した
+        # 物なので、当てると同じくエフェクトの無い見た目になるのが保存した通り
+        # 種類ごとに入れ替える形は取らない ぼかしを当てたら影も消えた、のように何が残るかが
+        # プリセットの中身しだいで読めなくなる
+        if replacing and (added or not stack):
+            own = clip.after_effects if after else clip.effects
+            # 固定の項目（最初から持つ欄）は外せないので残す 外そうとすると命令が断られ、
+            # 当てる操作ごと取り消しになる
+            commands.extend(RemoveEffect(clip.id, e.id, after=after) for e in own if not e.fixed)
+        commands.extend(AddEffect(clip.id, _fresh(e, fit), after=after) for e in added)
     return commands
 
 
