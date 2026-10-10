@@ -22,10 +22,13 @@ from sashimono.core.io import (
     find_orphans,
     find_orphans_in,
     folder_problem,
+    forget_empty_roots,
     load_project,
     mark_offered,
     plan_trim,
     recovery,
+    remember_root,
+    remembered_roots,
     state_usage,
     tidy_orphans,
     trim_state,
@@ -389,3 +392,51 @@ class TestTheSizeLimit:
         (item,) = plan_trim(1, state)
         assert item.label == "バックアップ 本編"
         assert item.size == 1000
+
+    def test_only_the_confirmed_items_go(self, tmp_path: Path) -> None:
+        # 確かめた後に置き場の中身が変わっても、確かめに出していない物は消さない
+        state = tmp_path / "state"
+        made = self._backups(state, "本編.sme", 4)
+        confirmed = plan_trim(state_usage(state) - 500, state)
+        assert [item.paths for item in confirmed] == [(made[0],)]
+        trimmed = trim_state(1, state, allowed=[p for item in confirmed for p in item.paths])
+        assert [item.paths for item in trimmed] == [(made[0],)]
+        assert made[1].is_file() and made[2].is_file()
+
+    def test_nothing_confirmed_means_nothing_goes(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        made = self._backups(state, "本編.sme", 4)
+        assert trim_state(1, state, allowed=[]) == []
+        assert all(path.is_file() for path in made)
+
+
+class TestRememberedFolders:
+    """退避を書いた置き場を覚える（置き場を変えた後に落ちた作業を見失わない）"""
+
+    def test_they_come_back_newest_first(self, tmp_path: Path) -> None:
+        registry = tmp_path / "既定"
+        remember_root(tmp_path / "A", registry)
+        remember_root(tmp_path / "B", registry)
+        remember_root(tmp_path / "A", registry)
+        assert remembered_roots(registry) == [tmp_path / "A", tmp_path / "B"]
+
+    def test_nothing_remembered_is_empty(self, tmp_path: Path) -> None:
+        assert remembered_roots(tmp_path) == []
+
+    def test_a_broken_file_is_empty(self, tmp_path: Path) -> None:
+        # 読めないからと復元の検索を止めない
+        (tmp_path / "places.json").write_text("{壊れている", "utf-8")
+        assert remembered_roots(tmp_path) == []
+
+    def test_a_folder_with_work_left_is_not_forgotten(self, tmp_path: Path) -> None:
+        registry = tmp_path / "既定"
+        crashed = RecoverySession(tmp_path / "A")
+        crashed.save(Project.create(name="落ちた"), None)
+        crash(crashed)
+        RecoverySession(tmp_path / "B").close()
+        remember_root(tmp_path / "A", registry)
+        remember_root(tmp_path / "B", registry)
+        remember_root(tmp_path / "C", registry)
+        forget_empty_roots([tmp_path / "C"], registry)
+        # B は空なので忘れる A は落ちた作業が残っている C は今使っている
+        assert remembered_roots(registry) == [tmp_path / "C", tmp_path / "A"]

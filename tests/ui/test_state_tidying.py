@@ -22,7 +22,7 @@ from sashimono.core.io import (
     default_state_root,
 )
 from sashimono.core.model import Project
-from sashimono.ui.backup_settings import confirm_backup_changes
+from sashimono.ui.backup_settings import confirm_backup_changes, plan_trim_all
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.recovery_dialog import RecoveryDialog
@@ -223,7 +223,8 @@ class TestTheSizeLimit:
         unseen = _crash_in(default_state_root(), "見せていない")
         window.execute(RenameProject("作業中"))
         window.autosave()
-        window._apply_preferences(Preferences(state_limit_mb=1))
+        chosen = Preferences(state_limit_mb=1)
+        window._apply_preferences(chosen, plan_trim_all(chosen))
         assert not made[0].exists()
         # 消さない物 いちばん新しい控え・開いている作業の今の退避・まだ勧めていない落ちた作業
         assert made[-1].is_file()
@@ -262,3 +263,104 @@ class TestTheSizeLimit:
         _fill(tmp_path / "本編.sme", 6)
         before = Preferences(state_limit_mb=1)
         assert confirm_backup_changes(None, before, Preferences(state_limit_mb=2))
+
+    def test_only_what_was_confirmed_goes_when_applied(
+        self, window: MainWindow, tmp_path: Path
+    ) -> None:
+        # 確かめた後に退避を移すなどで置き場の中身が変わると、計画が変わる 計画どおりに
+        # 消すと、確かめに出していない控えまで消える
+        made = _fill(tmp_path / "本編.sme", 5)
+        chosen = Preferences(state_limit_mb=1)
+        confirmed = plan_trim_all(chosen)[:1]
+        window._apply_preferences(chosen, confirmed)
+        assert not made[0].exists()
+        assert all(path.is_file() for path in made[1:])
+
+    def test_nothing_confirmed_means_nothing_goes_when_applied(
+        self, window: MainWindow, tmp_path: Path
+    ) -> None:
+        made = _fill(tmp_path / "本編.sme", 5)
+        window._apply_preferences(Preferences(state_limit_mb=1))
+        assert all(path.is_file() for path in made)
+
+    def test_the_dialog_hands_over_what_was_confirmed(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 設定画面で見せた一覧が、そのまま当てる側へ渡る 渡らないと何も消えないか、
+        # 見せていない物まで消える
+        del qt_application
+        _fill(tmp_path / "本編.sme", 5)
+        shown = {p for item in plan_trim_all(Preferences(state_limit_mb=1)) for p in item.paths}
+        assert shown
+        monkeypatch.setattr(QMessageBox, "question", lambda *_a: QMessageBox.StandardButton.Yes)
+        dialog = PreferencesDialog(Preferences())
+        dialog._backups.state_limit_mb.setValue(1)
+        dialog.accept()
+        assert {p for item in dialog.approved_trim for p in item.paths} == shown
+
+
+class TestReducingGenerationsCountsEveryFolder:
+    def test_the_default_folder_is_counted_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 選んだ置き場へ書けなかった保存の控えは既定の側にある 次にまた書けなければ、
+        # そちらにも同じ世代数を当てて消す 数えないと、確かめに出していない控えが消える
+        _fill(tmp_path / "本編.sme", 6)
+        asked: list[str] = []
+
+        def say_no(_parent: QWidget, _title: str, text: str, *_args: object) -> object:
+            asked.append(text)
+            return QMessageBox.StandardButton.No
+
+        monkeypatch.setattr(QMessageBox, "question", say_no)
+        chosen = str(tmp_path / "選んだ置き場")
+        before = Preferences(state_folder=chosen)
+        after = Preferences(state_folder=chosen, backup_generations=2)
+        assert not confirm_backup_changes(None, before, after)
+        assert asked and "4 本" in asked[0]
+
+
+class TestFindingWorkAfterAMove:
+    def test_work_left_in_the_old_folder_is_found_next_time(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A から B へ変えたが B に書けず A の退避のまま続け、その後に落ちた 設定は B のまま
+        # 次の起動が B と既定しか探さないと、その作業を復元に出せない
+        del qt_application
+        old_root, new_root = tmp_path / "A", tmp_path / "B"
+        first = _window(Preferences(state_folder=str(old_root)))
+        first.execute(RenameProject("移せなかった作業"))
+        first.autosave()
+        plain_save = RecoverySession.save
+
+        def refuse_new(self: RecoverySession, project: Project, source: Path | None) -> None:
+            if self.path.is_relative_to(new_root):
+                raise OSError("書けない")
+            plain_save(self, project, source)
+
+        monkeypatch.setattr(RecoverySession, "save", refuse_new)
+        first._apply_preferences(Preferences(state_folder=str(new_root)))
+        assert first._recovery.path.is_relative_to(old_root)
+        assert PreferenceStore().load().state_folder == str(new_root)
+        # 落ちたことにする 錠を手放し、閉じても退避を消さない
+        crashed = first._recovery
+        lock = crashed._lock
+        assert lock is not None
+        lock.abandon()
+        crashed._lock = None
+        monkeypatch.setattr(crashed, "clear", lambda: None)
+        first.close()
+
+        offered: list[str] = []
+
+        def look(dialog: RecoveryDialog) -> int:
+            offered.extend(entry.name for entry in dialog._entries)
+            return QDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(RecoveryDialog, "exec", look)
+        second = _window()
+        try:
+            second.offer_recovery()
+            assert "移せなかった作業" in offered
+        finally:
+            second.close()

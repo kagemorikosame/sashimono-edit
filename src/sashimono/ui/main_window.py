@@ -13,7 +13,7 @@ import platform
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -84,15 +84,18 @@ from sashimono.core.io import (
     default_state_root,
     discard,
     find_orphans_in,
+    forget_empty_roots,
     hold_new,
     load_project,
     mark_offered,
     others_holding,
     project_presence_dir,
+    remember_root,
     save_project,
     tidy_orphans,
     trim_state,
 )
+from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
     Clip,
@@ -121,7 +124,12 @@ from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
-from sashimono.ui.backup_settings import describe_trim, state_root_for, state_roots
+from sashimono.ui.backup_settings import (
+    describe_trim,
+    recovery_roots,
+    state_root_for,
+    state_roots,
+)
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
@@ -866,13 +874,17 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         if answer != QDialog.DialogCode.Accepted:
             return
-        self._apply_preferences(dialog.preferences())
+        self._apply_preferences(dialog.preferences(), dialog.approved_trim)
 
-    def _apply_preferences(self, preferences: Preferences) -> None:
+    def _apply_preferences(
+        self, preferences: Preferences, approved_trim: Sequence[TrimItem] = ()
+    ) -> None:
         """設定を今の画面へ反映して保存する
 
         控えの大きさを変えたら別の鍵になるので、作り直しを頼む
         古い控えは残るが、掴むことはない（鍵に大きさを混ぜてある）
+
+        ``approved_trim`` は設定画面で消してよいと確かめた物（容量の上限） この中だけを消す
         """
         # 作り直すのは大きさが変わったときと、控えを切ったとき
         # 大きさは置き場の鍵が変わるため 切ったときは**走っている変換を止める**ため
@@ -941,11 +953,12 @@ class MainWindow(QMainWindow):
         self._apply_autosave_timer(preferences)
         if state_root_for(preferences) != state_root_for(previous):
             self._move_recovery(state_root_for(preferences))
-        if preferences.state_limit_mb != previous.state_limit_mb or state_roots(
-            preferences
-        ) != state_roots(previous):
-            # 上限を入れた・下げた 消える物は設定画面の OK で見せて確かめてある
-            trimmed = self._trim_state()
+        if approved_trim:
+            # 上限を入れた・下げた 消すのは設定画面の OK で見せて確かめた物だけ
+            # 確かめた後に退避を新しい置き場へ移すと、置き場の中身が変わって計画が変わる
+            # 計画どおりに消すと、確かめに出していない控えまで消える 収まりきらない分は
+            # 次の上書き保存のときの片付け（消した物を知らせる）に任せる
+            trimmed = self._trim_state(allowed=[p for item in approved_trim for p in item.paths])
             if trimmed:
                 self.statusBar().showMessage(trimmed, 15000)
 
@@ -976,6 +989,10 @@ class MainWindow(QMainWindow):
                 self._tell_state_fallback(root, default, exc)
             else:
                 self._recovery_root = root
+                # 書く置き場を覚える 設定を後で別の置き場へ変えても、次の起動はここも探す
+                # 覚えられなくても退避は書ける（既定の置き場が書けないときだけ起こる）
+                with contextlib.suppress(OSError):
+                    remember_root(root)
                 return session
         self._recovery_root = default
         return RecoverySession(default)
@@ -1003,9 +1020,13 @@ class MainWindow(QMainWindow):
             try:
                 self._recovery.save(self._document.project, self._path)
             except OSError as exc:
-                # 新しい方へ書けなければ、前の置き場の退避のまま続ける 先に前のセッションへ
-                # 戻してから閉じる 閉じるのが失敗して例外が上がると、閉じたセッションを
-                # 指したまま残り、次の退避が書けない
+                # 新しい方へ書けなければ、前の置き場の退避のまま続ける
+                # 既定の置き場へ移す案もあるが採らない 前の置き場にはもう今の作業の退避があり、
+                # 移すと退避が 3 つ目の場所に散る 前の置き場は退避を書いたときに覚えてあり
+                # （:func:`remember_root`）、設定が新しい置き場のままでも次の起動の復元はここを
+                # 探すので、この後に落ちても見失わない
+                # 先に前のセッションへ戻してから閉じる 閉じるのが失敗して例外が上がると、
+                # 閉じたセッションを指したまま残り、次の退避が書けない
                 failed = self._recovery
                 self._recovery, self._recovery_root = previous, previous_root
                 with contextlib.suppress(OSError):
@@ -2388,9 +2409,15 @@ class MainWindow(QMainWindow):
         尋ね終えてから、日数と容量の上限で片付ける 先に片付けると、本人が一度も
         見ていない落ちた作業を消しうる
         """
-        roots = state_roots(self._preferences)
+        # 設定の置き場と既定の置き場に加え、前に退避を書いた置き場も探す 置き場を変えた後に
+        # 古い置き場へ書いた退避（新しい置き場へ書けずに戻した など）を見失わないため
+        roots = recovery_roots(self._preferences)
         self._ask_recovery(roots)
         self._tidy_state(roots)
+        # 退避が 1 つも残っていない古い置き場は忘れる 覚えたままだと、使わなくなった
+        # 置き場（抜いたドライブなど）を起動のたびに探しに行く
+        with contextlib.suppress(OSError):
+            forget_empty_roots([*state_roots(self._preferences), self._recovery_root])
 
     def _ask_recovery(self, roots: list[Path]) -> None:
         from sashimono.ui.recovery_dialog import RecoveryDialog
@@ -2433,15 +2460,18 @@ class MainWindow(QMainWindow):
         if notes:
             self.statusBar().showMessage(" ／ ".join(notes), 15000)
 
-    def _trim_state(self) -> str:
-        """容量の上限を超えていれば古い物から片付ける 知らせる言葉を返す（無ければ空）"""
+    def _trim_state(self, allowed: Sequence[Path] | None = None) -> str:
+        """容量の上限を超えていれば古い物から片付ける 知らせる言葉を返す（無ければ空）
+
+        ``allowed`` を渡すと、その中の物だけを消す（設定画面で確かめた一覧）
+        """
         limit_mb = self._preferences.state_limit_mb
         if limit_mb <= 0:
             return ""
         items = []
         for root in state_roots(self._preferences):
             with contextlib.suppress(OSError):
-                items.extend(trim_state(limit_mb * 1024 * 1024, root))
+                items.extend(trim_state(limit_mb * 1024 * 1024, root, allowed=allowed))
         if not items:
             return ""
         return f"容量の上限 {limit_mb}MB を超えたので片付けた: " + describe_trim(items).replace(

@@ -43,6 +43,7 @@ from sashimono.core.io import (
     default_state_root,
     folder_problem,
     plan_trim,
+    remembered_roots,
 )
 from sashimono.core.io.recovery import TrimItem
 from sashimono.runtime import app_dir
@@ -61,6 +62,8 @@ __all__ = [
     "describe_trim",
     "folder_caution",
     "folder_refusal",
+    "plan_trim_all",
+    "recovery_roots",
     "state_root_for",
     "state_roots",
 ]
@@ -84,6 +87,21 @@ def state_roots(preferences: Preferences) -> list[Path]:
     """
     chosen, default = state_root_for(preferences), default_state_root()
     return [chosen] if chosen == default else [chosen, default]
+
+
+def recovery_roots(preferences: Preferences) -> list[Path]:
+    """起動したときに落ちた作業を探す置き場 設定の置き場・既定の置き場・前に退避を書いた置き場
+
+    前に書いた置き場も見るのは、置き場を変えた後に古い置き場へ書いた退避（新しい置き場へ
+    書けずに戻した、別の窓が古い設定のまま動いていた など）を見失わないため
+    """
+    roots = state_roots(preferences)
+    try:
+        remembered = remembered_roots()
+    except OSError:
+        remembered = []
+    keys = {str(root) for root in roots}
+    return [*roots, *(root for root in remembered if str(root) not in keys)]
 
 
 def describe_trim(items: list[TrimItem]) -> str:
@@ -270,11 +288,19 @@ class BackupSection:
         form.addRow("置き場の容量の上限", self.state_limit_mb)
 
 
-def confirm_backup_changes(parent: QWidget | None, before: Preferences, after: Preferences) -> bool:
+def confirm_backup_changes(
+    parent: QWidget | None,
+    before: Preferences,
+    after: Preferences,
+    approved: list[TrimItem] | None = None,
+) -> bool:
     """設定画面の OK で、退避とバックアップの変更を確かめる 進めてよければ真
 
     書けない置き場はここで止める OK の後で書けないと分かると、本人は設定が効いたと思ったまま
     退避が既定の側へ戻り続ける
+
+    ``approved`` を渡すと、容量の上限で消してよいと確かめた物をそこへ足す 設定を当てるときは
+    この一覧に入っている物だけを消す（確かめに出していない物は消さない）
     """
     if after.state_folder and after.state_folder != before.state_folder:
         folder = Path(after.state_folder)
@@ -294,7 +320,10 @@ def confirm_backup_changes(parent: QWidget | None, before: Preferences, after: P
             if answer != QMessageBox.StandardButton.Yes:
                 return False
     if after.backup and after.backup_generations < before.backup_generations:
-        doomed = backups_over(after.backup_generations, state_root_for(after))
+        # 既定の置き場も数える 選んだ置き場へ書けなかった保存の控えは既定の側にあり、
+        # 次にまた書けなければ、そちらにも同じ世代数を当てて消す 数えずにいると、
+        # 確かめに出していない控えが消える
+        doomed = sum(backups_over(after.backup_generations, root) for root in state_roots(after))
         if doomed > 0:
             answer = QMessageBox.question(
                 parent,
@@ -330,4 +359,6 @@ def confirm_backup_changes(parent: QWidget | None, before: Preferences, after: P
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return False
+            if approved is not None:
+                approved.extend(doomed_items)
     return True

@@ -30,6 +30,7 @@ from sashimono.ui.backup_settings import (
     confirm_backup_changes,
     folder_caution,
     folder_refusal,
+    plan_trim_all,
     state_root_for,
 )
 from sashimono.ui.main_window import MainWindow
@@ -469,7 +470,8 @@ class TestTheRecoveryFolder:
             oldest = oldest or copied
         assert oldest is not None
         root = tmp_path / "新しい置き場"
-        window._apply_preferences(Preferences(state_folder=str(root), state_limit_mb=1))
+        chosen = Preferences(state_folder=str(root), state_limit_mb=1)
+        window._apply_preferences(chosen, plan_trim_all(chosen))
         assert window._recovery.path.parent == root / "recovery"
         assert window._recovery.path.is_file()
         # 後の片付けも最後まで走る

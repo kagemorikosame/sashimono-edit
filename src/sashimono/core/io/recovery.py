@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,9 +44,12 @@ __all__ = [
     "find_orphans",
     "find_orphans_in",
     "folder_problem",
+    "forget_empty_roots",
     "mark_offered",
     "plan_trim",
     "project_presence_dir",
+    "remember_root",
+    "remembered_roots",
     "state_usage",
     "tidy_orphans",
     "trim_state",
@@ -216,6 +220,75 @@ def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
         seen.add(key)
         found.extend(find_orphans(root))
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+#: 退避を書いたことのある置き場を覚えるファイル（既定の置き場の中） 名前は 1 か所で持つ
+_PLACES = "places.json"
+
+#: 覚えておく置き場の数 置き場を何度も変える人でも、ファイルが際限なく伸びない
+_PLACES_KEPT = 20
+
+
+def remember_root(root: Path, registry: Path | None = None) -> None:
+    """退避を書く置き場を覚える 次の起動の復元はここに挙げた置き場もすべて探す
+
+    設定の置き場だけを探すと、置き場を A から B へ変えた後に A へ書いた退避（B へ書けずに
+    A へ戻した、別の窓が A のまま動いていた など）が、落ちた後に見つからない
+    覚えるのは既定の置き場の中 既定の置き場は設定で動かないので、どの設定でも同じ所を読める
+    """
+    places = remembered_roots(registry)
+    key = _root_key(root)
+    places = [Path(root), *(place for place in places if _root_key(place) != key)]
+    _write_places(places[:_PLACES_KEPT], registry)
+
+
+def remembered_roots(registry: Path | None = None) -> list[Path]:
+    """覚えている置き場 新しく使った順 読めなければ空（復元の検索を止めない）"""
+    path = (registry if registry is not None else default_state_root()) / _PLACES
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [Path(item) for item in data if isinstance(item, str) and Path(item).is_absolute()]
+
+
+def forget_empty_roots(keep: list[Path], registry: Path | None = None) -> None:
+    """覚えている置き場のうち、退避が 1 つも無い所を忘れる ``keep`` は残す
+
+    動いている窓の錠も退避の置き場にあるので、錠が残っている置き場は忘れない
+    （その窓が後で落ちたときに、探す所から外れないように）
+    """
+    kept = {_root_key(root) for root in keep}
+    places = remembered_roots(registry)
+    remaining = [
+        place for place in places if _root_key(place) in kept or _has_files(place / "recovery")
+    ]
+    if len(remaining) != len(places):
+        _write_places(remaining, registry)
+
+
+def _root_key(root: Path) -> str:
+    return os.path.normcase(str(Path(root).resolve()))
+
+
+def _has_files(folder: Path) -> bool:
+    try:
+        return any(path.is_file() for path in folder.iterdir())
+    except FileNotFoundError:
+        # フォルダが無い ドライブごと見えない（抜いた・回線が切れた）ときは忘れない
+        # 挿し直せば退避が戻ってくる ドライブはあるのにフォルダが無いなら、何も残っていない
+        return not Path(folder.anchor).exists()
+    except OSError:
+        # 読めないだけでは忘れない
+        return True
+
+
+def _write_places(places: list[Path], registry: Path | None) -> None:
+    base = registry if registry is not None else default_state_root()
+    base.mkdir(parents=True, exist_ok=True)
+    _write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
 
 
 def folder_problem(root: Path) -> str | None:
@@ -466,12 +539,19 @@ def plan_trim(limit: int, root: Path | None = None) -> list[TrimItem]:
     return chosen
 
 
-def trim_state(limit: int, root: Path | None = None) -> list[TrimItem]:
+def trim_state(
+    limit: int, root: Path | None = None, *, allowed: Iterable[Path] | None = None
+) -> list[TrimItem]:
     """容量を ``limit`` バイトに収めるよう古い物から片付ける 片付けた物を返す
 
-    何を消すかの決まりは :func:`plan_trim`
+    何を消すかの決まりは :func:`plan_trim` ``allowed`` を渡すと、その中にある物だけを消す
+    本人に見せて確かめた一覧を渡す 確かめた後に置き場の中身が変わっても（退避を移した、
+    など）、確かめに出していない物は消さない
     """
     items = plan_trim(limit, root)
+    if allowed is not None:
+        approved = {_root_key(path) for path in allowed}
+        items = [item for item in items if all(_root_key(path) in approved for path in item.paths)]
     for item in items:
         for path in item.paths:
             path.unlink(missing_ok=True)

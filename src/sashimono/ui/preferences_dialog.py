@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
+from sashimono.core.io.recovery import TrimItem
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     MEASURED_ONE_LAYER_MS,
@@ -626,6 +627,8 @@ class PreferencesDialog(QDialog):
         # 退避とバックアップの欄は塊ごと別のファイルに置く（決めたことも向こうの説明にある）
         self._backups = BackupSection(preferences, self)
         self._backups.add_rows(form)
+        #: OK で消してよいと確かめた物（容量の上限） 設定を当てる側はこの中だけを消す
+        self.approved_trim: list[TrimItem] = []
 
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
@@ -781,6 +784,8 @@ class PreferencesDialog(QDialog):
 
         断られたら窓を開いたままにして、選び直せるようにする
         """
-        if not confirm_backup_changes(self, self._backups.before, self.preferences()):
+        approved: list[TrimItem] = []
+        if not confirm_backup_changes(self, self._backups.before, self.preferences(), approved):
             return
+        self.approved_trim = approved
         super().accept()
