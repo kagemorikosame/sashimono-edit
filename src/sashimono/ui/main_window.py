@@ -1003,12 +1003,26 @@ class MainWindow(QMainWindow):
             try:
                 self._recovery.save(self._document.project, self._path)
             except OSError as exc:
-                # 新しい方へ書けなければ、前の置き場の退避のまま続ける
-                self._recovery.close()
+                # 新しい方へ書けなければ、前の置き場の退避のまま続ける 先に前のセッションへ
+                # 戻してから閉じる 閉じるのが失敗して例外が上がると、閉じたセッションを
+                # 指したまま残り、次の退避が書けない
+                failed = self._recovery
                 self._recovery, self._recovery_root = previous, previous_root
+                with contextlib.suppress(OSError):
+                    failed.close()
                 self._tell_state_fallback(root, previous_root, exc)
                 return
-        previous.close()
+        try:
+            previous.close()
+        except OSError as exc:
+            # 前の置き場（回線の切れたネットワークなど）の退避を消せなかった 錠は手放して
+            # あるので、残った退避は次の起動で復元を勧められる 例外を上げると設定の反映が
+            # 途中で止まり、後の片付けと知らせが走らない 黙らずに知らせる
+            self.statusBar().showMessage(
+                f"前の置き場 {previous_root} の退避を消せなかった"
+                f"（次の起動で復元を勧めます）: {exc}",
+                15000,
+            )
 
     def _apply_auto_quality(self) -> None:
         """置いてある素材の大きさに合わせて、プレビューの画質を決める

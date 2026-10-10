@@ -445,6 +445,85 @@ class TestTheRecoveryFolder:
         assert window._recovery.path == old
         assert "書けない" in window.statusBar().currentMessage()
 
+    def test_an_unreachable_old_folder_does_not_stop_the_move(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 前の置き場が回線の切れたネットワークだと、閉じるときに退避を消せず OSError が上がる
+        # 上げたままだと設定の反映が途中で止まり、後の片付けと知らせが走らない
+        window.execute(RenameProject("作業中"))
+        window.autosave()
+        unreachable = window._recovery
+        plain_close = RecoverySession.close
+
+        def cut_off(self: RecoverySession) -> None:
+            plain_close(self)
+            if self is unreachable:
+                raise OSError("回線が切れた")
+
+        monkeypatch.setattr(RecoverySession, "close", cut_off)
+        target = tmp_path / "本編.sme"
+        oldest = None
+        for number in range(5):
+            target.write_bytes(bytes([number]) * 400_000)
+            copied = backup_before_save(target, tmp_path / "新しい置き場")
+            oldest = oldest or copied
+        assert oldest is not None
+        root = tmp_path / "新しい置き場"
+        window._apply_preferences(Preferences(state_folder=str(root), state_limit_mb=1))
+        assert window._recovery.path.parent == root / "recovery"
+        assert window._recovery.path.is_file()
+        # 後の片付けも最後まで走る
+        assert not oldest.exists()
+        assert "容量の上限" in window.statusBar().currentMessage()
+
+    def test_an_unreachable_old_folder_is_told(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 消せなかった退避が残ることを黙らない
+        window.execute(RenameProject("作業中"))
+        window.autosave()
+        unreachable = window._recovery
+        plain_close = RecoverySession.close
+
+        def cut_off(self: RecoverySession) -> None:
+            plain_close(self)
+            if self is unreachable:
+                raise OSError("回線が切れた")
+
+        monkeypatch.setattr(RecoverySession, "close", cut_off)
+        window._apply_preferences(Preferences(state_folder=str(tmp_path / "新しい置き場")))
+        assert "消せなかった" in window.statusBar().currentMessage()
+
+    def test_a_failed_move_with_an_unclosable_new_folder_keeps_the_old_session(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 新しい置き場へ書けず、その錠を閉じるのも失敗したとき 前のセッションへ戻す前に
+        # 例外が上がると、閉じたセッションを指したまま次の退避が書けない
+        window.execute(RenameProject("作業中"))
+        window.autosave()
+        old = window._recovery
+        root = tmp_path / "新しい置き場"
+        plain_save, plain_close = RecoverySession.save, RecoverySession.close
+
+        def refuse_new(self: RecoverySession, project: Project, source: Path | None) -> None:
+            if self.path.is_relative_to(root):
+                raise OSError("書けない")
+            plain_save(self, project, source)
+
+        def cut_off(self: RecoverySession) -> None:
+            plain_close(self)
+            if self.path.is_relative_to(root):
+                raise OSError("回線が切れた")
+
+        monkeypatch.setattr(RecoverySession, "save", refuse_new)
+        monkeypatch.setattr(RecoverySession, "close", cut_off)
+        window._apply_preferences(Preferences(state_folder=str(root)))
+        assert window._recovery is old
+        assert "書けない" in window.statusBar().currentMessage()
+        window.execute(RenameProject("続き"))
+        window.autosave()
+        assert old.path.is_file()
+
 
 class TestOfferingRecovery:
     def _crash_in(self, root: Path, name: str) -> None:
