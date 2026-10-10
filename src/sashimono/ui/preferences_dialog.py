@@ -401,6 +401,32 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._double_click_reset)
 
+        # プリセットの当て方 どれも既定は切（当てる先の文字・位置・エフェクトを残す側）
+        self._preset_with_text = QCheckBox("プリセットを当てるとき、文字も一緒に当てる", self)
+        self._preset_with_text.setChecked(preferences.preset_with_text)
+        self._preset_with_text.setToolTip(
+            "切っていると、見た目（書体・色・大きさ・縁取り・影など）だけを当て、"
+            "打ってある文字はそのまま残す 入れると、保存したときの文字に置き換える"
+        )
+        form.addRow(self._preset_with_text)
+        self._preset_with_position = QCheckBox("プリセットを当てるとき、位置（X・Y）も当てる", self)
+        self._preset_with_position.setChecked(preferences.preset_with_position)
+        self._preset_with_position.setToolTip(
+            "切っていると、当てる先のクリップの画面の中の位置はそのまま残す "
+            "入れると、保存したクリップと同じ所へ動かす（クリップの長さはどちらでも変えない）"
+        )
+        form.addRow(self._preset_with_position)
+        self._preset_keep_effects = QCheckBox(
+            "プリセットを当てるとき、足してあるエフェクトを残して足す", self
+        )
+        self._preset_keep_effects.setChecked(preferences.preset_keep_effects)
+        self._preset_keep_effects.setToolTip(
+            "切っていると、当てる先に足してあるエフェクトをプリセットの物と入れ替え、"
+            "保存したクリップと同じ見た目にする 入れると、残したまま後ろへ足す "
+            "前の版で保存したプリセット（エフェクトだけの物）は、どちらでも足す"
+        )
+        form.addRow(self._preset_keep_effects)
+
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
         )
@@ -743,6 +769,9 @@ class PreferencesDialog(QDialog):
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),
             double_click_reset=self._double_click_reset.isChecked(),
+            preset_with_text=self._preset_with_text.isChecked(),
+            preset_with_position=self._preset_with_position.isChecked(),
+            preset_keep_effects=self._preset_keep_effects.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

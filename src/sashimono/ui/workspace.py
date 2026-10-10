@@ -21,6 +21,7 @@ from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.core import userdirs
+from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.model import LayerMode
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
@@ -336,6 +337,17 @@ class Preferences:
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
     double_click_reset: bool = True
+    #: 設定パネルの〔プリセット…〕で当てるとき、文字そのもの（タイマーの書式なども）も
+    #: 当てる 既定は切（利用者の決定） 見た目だけを当て、打った文字は残す（テンプレートの
+    #: 棚の着せ替えと同じ） 決まった文言の見出しを丸ごと当てたい人は入れる
+    preset_with_text: bool = False
+    #: 同じく、画面の中の位置（X と Y）も当てる 既定は切 位置は置いた場所の事情で、
+    #: 字幕の見た目を当てたら全部が保存した所へ寄ってしまう 決まった所に出す物を作る人は入れる
+    preset_with_position: bool = False
+    #: 同じく、当てる先に足してあるエフェクトを残してプリセットの物を足す 既定は切（入れ替える）
+    #: 入れ替えると保存したクリップと同じ見た目になり、試しに当て比べても前のエフェクトが
+    #: 重ならない グローと影のように別々に作ったプリセットを重ねて使う人は入れる
+    preset_keep_effects: bool = False
     #: 設定パネルで、焦点の無い欄（クリックしていない選択の欄・数値の欄・スライダー）でも
     #: ホイールで値を変える 既定は切 切っていると、焦点の無い欄の上のホイールはパネルを送る
     #: 入れていると、パネルを送る途中で通った欄の値が変わり、気付かずに取り消しの段が積まれる
@@ -432,6 +444,15 @@ class Preferences:
         """素材を置く所（:func:`~sashimono.core.commands.insert_media`）へ渡す値"""
         return self.media_split == MEDIA_SPLIT
 
+    @property
+    def preset_options(self) -> PresetOptions:
+        """プリセットの当て方 設定パネル（:meth:`InspectorPanel.set_preset_options`）へ渡す"""
+        return PresetOptions(
+            with_text=self.preset_with_text,
+            with_position=self.preset_with_position,
+            keep_effects=self.preset_keep_effects,
+        )
+
     def prefetch_bytes(self) -> int:
         """先読みに使えるバイト数 切ってあれば 0
 
@@ -512,6 +533,11 @@ class PreferenceStore:
             ),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
+            preset_with_text=_flag(data.get("preset_with_text"), plain.preset_with_text),
+            preset_with_position=_flag(
+                data.get("preset_with_position"), plain.preset_with_position
+            ),
+            preset_keep_effects=_flag(data.get("preset_keep_effects"), plain.preset_keep_effects),
             wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
