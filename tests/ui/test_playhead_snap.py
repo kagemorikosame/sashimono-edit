@@ -135,6 +135,21 @@ class TestShiftMode:
         assert 100 not in view._playhead_targets()
         assert _scrub(view, 100, 102, _SHIFT) == 102
 
+    def test_it_can_come_back_to_the_edge_it_started_on(self, made: Made) -> None:
+        # 掴んだ所がクリップの終わりでも、そこは吸い付く先のまま残す 外すと、行き過ぎて
+        # 戻したいときにドラッグの間ずっとその端へ合わせられない（Premiere Pro も戻せる）
+        # 掴んだ直後に戻されるのは Shift を押している間だけで、押していなければ自由に動く
+        view = _open(made, _project(_text(0), _text(200)))
+        QTest.mousePress(view, _LEFT, _NONE, _ruler(view, 60))
+        assert view.playhead == 60
+        _move(view, _ruler(view, 62), _NONE)
+        assert view.playhead == 62
+        _move(view, _ruler(view, 80), _SHIFT)
+        assert view.playhead == 80
+        _move(view, _ruler(view, 62), _SHIFT)
+        assert view.playhead == 60
+        QTest.mouseRelease(view, _LEFT, _NONE, _ruler(view, 62))
+
     def test_nothing_near_means_no_snap(self, made: Made) -> None:
         # 6 フレームは 12 画素 吸い付く距離（8 画素）の外
         view = _open(made, _project(_text(0), _text(200)))
