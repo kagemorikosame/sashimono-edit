@@ -120,6 +120,19 @@ class TestCategory:
         assert _names(library) == [("見出し", "赤")]
         assert library.categories(PRESET) == ("見出し",)
 
+    def test_the_same_name_in_the_target_category_is_not_crushed(self, library: Library) -> None:
+        # 移す先の分類に同じ名前があると、黙って書くと向こうのプリセットが消える
+        library.presets.save(Preset.capture("赤", _clip("こちら")))
+        library.presets.save(Preset.capture("赤", _clip("向こう"), category="見出し"))
+        mine = next(e for e in library.entries(PRESET) if e.category == "ユーザー")
+        with pytest.raises(LibraryConflictError):
+            library.recategorize(mine, "見出し")
+        assert _names(library) == [("ユーザー", "赤"), ("見出し", "赤")]
+
+        library.recategorize(mine, "見出し", overwrite=True)
+        assert _names(library) == [("見出し", "赤")]
+        assert [t.category for t in library.trashed(PRESET)] == ["見出し"]
+
     def test_an_alias_keeps_its_file_and_carries_the_category(self, library: Library) -> None:
         saved = library.aliases.save(Alias.of("テロップ", _clip()))
         moved = library.recategorize(_entry(library, "テロップ", ALIAS), "字幕")

@@ -13,7 +13,14 @@ from pathlib import Path
 
 import pytest
 import shiboken6
-from PySide6.QtWidgets import QApplication, QListView, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QListView,
+    QMessageBox,
+)
 
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import Preset, PresetStore
@@ -46,13 +53,24 @@ def _clip(text: str = "見出し", **params: object) -> Clip:
 
 @pytest.fixture(autouse=True)
 def no_modal_boxes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """問いの小窓を開かせない 思わぬ所で出ると、CI は時間切れまで止まる"""
+    """小窓を開かせない 思わぬ所で出ると、CI は時間切れまで止まる 開いたらその場で落とす
 
-    def refuse(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+    知らせと問いのほか、名前の窓・分類の窓・ファイルの窓・読み込みの重なりの問い
+    （``QMessageBox`` を組んで ``exec``）・一覧の窓そのもの（``QDialog.exec``）も止める
+    答える試験は、窓の ``ask_*`` ``confirm`` ``choose_*`` を自分で差し替える
+    """
+
+    def refuse(*args: object, **_kwargs: object) -> object:
         pytest.fail(f"思わぬ小窓が出た: {args[2] if len(args) > 2 else args}")
 
-    for name in ("information", "warning", "question"):
+    for name in ("information", "warning", "question", "critical"):
         monkeypatch.setattr(QMessageBox, name, refuse)
+    monkeypatch.setattr(QMessageBox, "exec", refuse)
+    monkeypatch.setattr(QDialog, "exec", refuse)
+    for name in ("getText", "getItem"):
+        monkeypatch.setattr(QInputDialog, name, refuse)
+    for name in ("getExistingDirectory", "getOpenFileNames"):
+        monkeypatch.setattr(QFileDialog, name, refuse)
 
 
 @pytest.fixture
@@ -238,6 +256,22 @@ class TestDelete:
             # 戻せなくなる操作は、確かめを切っていても尋ねる
             assert asked
             assert len(library.trashed(PRESET)) == 1
+            # 選んだ物だけをごみ箱から消すときも同じ
+            dialog.select("赤")
+            dialog.purge_selected()
+            assert len(asked) == 2
+            assert len(library.trashed(PRESET)) == 1
+        finally:
+            _close(dialog)
+
+    def test_the_trash_is_counted_apart(self, library: Library, thumbnails: LookThumbnails) -> None:
+        # ごみ箱の物が一覧や分類に混ざると、消したはずの物が当てる候補に戻ってくる
+        library.delete(next(e for e in library.entries(PRESET) if e.name == "赤"))
+        dialog = _dialog(library, thumbnails)
+        try:
+            assert _names(dialog) == ["青"]
+            labels = [dialog._folders.item(r).text() for r in range(dialog._folders.count())]
+            assert labels == ["すべて", "ユーザー", "ごみ箱（1）"]
         finally:
             _close(dialog)
 
