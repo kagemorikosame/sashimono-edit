@@ -45,7 +45,13 @@ from sashimono.compat.aviutl.text_tags import (
 from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.core.model import AnimatedValue, Effect, GeneratedSource, ParamValue
 from sashimono.effects.sources import SourceDefinition, source_registry
-from sashimono.effects.strokes import STROKE, pixel_reach, takes_stroke_effect
+from sashimono.effects.strokes import (
+    STROKE,
+    pixel_reach,
+    takes_stroke_effect,
+    turned_reach,
+    turns_of,
+)
 from sashimono.engine.audio_shapes import (
     WAVEFORM_LINE,
     bar_mask,
@@ -357,6 +363,9 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
         return None
     layers, framed = laid
     reach = QRectF()
+    #: 縁取りの層ごとの、字すべてにわたる層の絵の範囲 層のエフェクトはこの範囲の絵へ掛かる
+    #: （影の拡大と回転はこの範囲の真ん中が支点） 字の見た目ごとに見積もると支点がずれる
+    planes: dict[int, tuple[_Ring, QRectF]] = {}
     for path, look, clip in layers:
         box = path.boundingRect()
         if clip is not None:
@@ -367,11 +376,14 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
         # 影は一番外へ出る縁の外形から落ちる（:func:`_shadow_layer`） 層のエフェクト（ぼかし
         # など）の広がりは層の絵だけのもので、影には入らない
         border = max((ring.outward for ring in rings), default=0.0)
-        spread = max((ring.outward + ring.reach for ring in rings), default=0.0)
         inked = box.adjusted(-border, -border, border, border)
         reach = reach.united(inked)
-        if spread > border:
-            reach = reach.united(box.adjusted(-spread, -spread, spread, spread))
+        for index, ring in enumerate(rings):
+            if ring.effects < 0:
+                continue
+            band = box.adjusted(-ring.outward, -ring.outward, ring.outward, ring.outward)
+            held = planes.get(index)
+            planes[index] = (ring, band if held is None else held[1].united(band))
         shift_x = _number(look, "shadow_x", 0.0)
         shift_y = _number(look, "shadow_y", 0.0)
         blur = max(0.0, _number(look, "shadow_blur", 0.0))
@@ -380,6 +392,9 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
             spread = 2.0 * blur + 1.0
             shadow = inked.translated(shift_x, -shift_y)
             reach = reach.united(shadow.adjusted(-spread, -spread, spread, spread))
+    for ring, band in planes.values():
+        spread_x, spread_y = ring.spread(band.width() / 2.0, band.height() / 2.0)
+        reach = reach.united(band.adjusted(-spread_x, -spread_y, spread_x, spread_y))
     if framed is not None:
         reach = reach.united(QRectF(QPointF(framed[0], framed[1]), QPointF(framed[2], framed[3])))
     if reach.isEmpty():
@@ -1189,6 +1204,16 @@ class _Ring:
     reach: float = 0.0
     #: 層のエフェクトの並びの番号（値の ``_stroke_effects`` の何番目か） 無ければ -1
     effects: int = -1
+    #: 層のエフェクトが絵を中心の周りで拡大・回転する（倍率, 度） 広がりは範囲の大きさで
+    #: 変わるので、量ではなく値のまま持つ（:func:`~sashimono.effects.strokes.turned_reach`）
+    turns: tuple[tuple[float, float], ...] = ()
+
+    def spread(
+        self, half_width: float, half_height: float, scale: float = 1.0
+    ) -> tuple[float, float]:
+        """半分の大きさ ``half_width`` x ``half_height`` の層の絵から、層のエフェクトが外へ運ぶ量
+        （横, 縦） ``scale`` は画面の画素を描く先の画素へ直す倍率"""
+        return turned_reach(self.reach * scale, self.turns, half_width, half_height)
 
     @property
     def outward(self) -> float:
@@ -1229,10 +1254,12 @@ def _resolve_strokes(values: dict[str, object], source: GeneratedSource, frame: 
         usable = tuple(e for e in stroke.effects if e.enabled and takes_stroke_effect(e.kind))
         index = -1
         reach = 0.0
+        turns: tuple[tuple[float, float], ...] = ()
         if usable:
             index = len(stacks)
             stacks.append(usable)
             reach = pixel_reach(usable, frame)
+            turns = turns_of(usable, frame)
         rings.append(
             _Ring(
                 width=width,
@@ -1241,6 +1268,7 @@ def _resolve_strokes(values: dict[str, object], source: GeneratedSource, frame: 
                 join=str(resolved.get("join", "round")),
                 reach=reach,
                 effects=index,
+                turns=turns,
             )
         )
     values["strokes"] = tuple(rings)
@@ -1322,11 +1350,14 @@ def _paint_ring(
     drawn = QRectF()
     for band, _, _ in bands:
         drawn = drawn.united(transform.mapRect(band.boundingRect()))
-    spread = first.reach * math.sqrt(abs(transform.determinant())) + 2.0
-    left = max(0, math.floor(drawn.left() - spread))
-    top = max(0, math.floor(drawn.top() - spread))
-    right = min(device.width(), math.ceil(drawn.right() + spread))
-    bottom = min(device.height(), math.ceil(drawn.bottom() + spread))
+    # 層のエフェクトが運ぶ量は描く先の画素で 影の拡大と回転は面の範囲の大きさで決まる
+    spread_x, spread_y = first.spread(
+        drawn.width() / 2.0, drawn.height() / 2.0, math.sqrt(abs(transform.determinant()))
+    )
+    left = max(0, math.floor(drawn.left() - spread_x - 2.0))
+    top = max(0, math.floor(drawn.top() - spread_y - 2.0))
+    right = min(device.width(), math.ceil(drawn.right() + spread_x + 2.0))
+    bottom = min(device.height(), math.ceil(drawn.bottom() + spread_y + 2.0))
     if right <= left or bottom <= top:
         return
     placed = transform * QTransform.fromTranslate(-left, -top)

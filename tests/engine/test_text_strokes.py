@@ -280,6 +280,19 @@ class TestLayerEffects:
         )
         assert blurred[0] >= plain[0] + 2 * 50
 
+    def test_a_zoomed_shadow_widens_the_picture(self) -> None:
+        # 影の拡大は画素の項目に出ない 見積もりに入れないと、画面の端に寄せた字の大きくした
+        # 影が絵の端で切れる
+        near_edge = {"pos_x": AnimatedValue(120.0)}
+
+        def shadowed(zoom: float) -> tuple[int, int]:
+            shadow = registry.require("shadow").create(zoom=zoom, blur=0)
+            return source_canvas(
+                text(replace(layer(8.0, BLACK), effects=(shadow,)), **near_edge), *SIZE
+            )
+
+        assert shadowed(300.0)[0] > shadowed(100.0)[0] + 200
+
     def test_the_layer_is_handed_over_around_the_border_only(self) -> None:
         # 層の絵は縁のある所の周りだけ 字の絵の全体を渡すと、字幕 1 本ごとに画面 1 枚ぶんを
         # GPU へ送って読み戻すことになる 周りにはエフェクトが広げる分を空けておく
@@ -386,6 +399,44 @@ def test_baking_a_layer_keeps_what_is_already_drawn(gl_context: object) -> None:
     )
     corner = image[:8, :8].reshape(-1, 3)
     assert (corner == np.array([0, 0, 255])).all()
+
+
+def _extent(mask: np.ndarray) -> tuple[int, int]:
+    """色の付いた所の（幅, 高さ）"""
+    rows = np.flatnonzero(mask.any(axis=1))
+    columns = np.flatnonzero(mask.any(axis=0))
+    if rows.size == 0:
+        return 0, 0
+    return int(columns[-1] - columns[0] + 1), int(rows[-1] - rows[0] + 1)
+
+
+@pytest.mark.parametrize(
+    ("words", "zoom", "angle", "axis", "factor"),
+    [("字", 300.0, 0.0, 0, 2.5), ("字字字字", 100.0, 90.0, 1, 1.5)],
+    ids=["拡大した影", "回した影"],
+)
+def test_a_zoomed_or_turned_shadow_is_not_cut(
+    gl_context: object, words: str, zoom: float, angle: float, axis: int, factor: float
+) -> None:
+    # 層の影は層の絵の真ん中を支点に拡大・回転する 画素の項目だけで作業面を切ると、大きくした
+    # 影や回した影の外側が四角の端で欠け、書き出しで影が途中で切れて見える
+    shadow = registry.require("shadow").create(
+        offset_x=0,
+        offset_y=0,
+        blur=0,
+        opacity=100,
+        color=(0.0, 0.0, 1.0, 1.0),
+        zoom=zoom,
+        angle=angle,
+    )
+    size = AnimatedValue(36.0)
+    image = _rendered(
+        text(replace(layer(4.0, RED), effects=(shadow,)), text=words, size=size), gl_context
+    )
+    plain = _rendered(text(layer(4.0, RED), text=words, size=size), gl_context)
+    drawn = _extent(plain.max(axis=2) > 0)
+    shadowed = _extent(image[..., 2] > 40)
+    assert shadowed[axis] > drawn[axis] * factor
 
 
 def test_a_layer_effect_without_change_matches_the_plain_layer(gl_context: object) -> None:

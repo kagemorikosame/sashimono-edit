@@ -17,7 +17,7 @@ import numpy as np
 
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
 from sashimono.core.model import Effect
-from sashimono.effects.strokes import pixel_reach
+from sashimono.effects.strokes import effect_reach, pixel_reach
 from sashimono.engine.gpu import Compositor, EffectProcessor, Placement, Texture
 
 __all__ = ["BAKE_CANVAS_LIMIT", "BAKE_MARGIN", "ScriptEffectBaker", "bake_margin", "fitted_margin"]
@@ -150,12 +150,22 @@ class ScriptEffectBaker:
         if rows.size == 0:
             return image
         columns = np.flatnonzero(alpha.any(axis=0))
-        reach = math.ceil(pixel_reach(effects, frame) * pixel_scale) + 2
-        top, bottom = max(0, int(rows[0]) - reach), min(height, int(rows[-1]) + 1 + reach)
-        left, right = max(0, int(columns[0]) - reach), min(width, int(columns[-1]) + 1 + reach)
+        # 影の拡大と回転は中身の範囲の大きさで広がる（:func:`effect_reach`） 画素の項目だけで
+        # 切ると、大きくした影や回した影の外側が四角の端で欠ける
+        spread_x, spread_y = effect_reach(
+            effects,
+            frame,
+            (int(columns[-1]) + 1 - int(columns[0])) / 2.0,
+            (int(rows[-1]) + 1 - int(rows[0])) / 2.0,
+            pixel_scale=pixel_scale,
+        )
+        reach_x, reach_y = math.ceil(spread_x) + 2, math.ceil(spread_y) + 2
+        top, bottom = max(0, int(rows[0]) - reach_y), min(height, int(rows[-1]) + 1 + reach_y)
+        left = max(0, int(columns[0]) - reach_x)
+        right = min(width, int(columns[-1]) + 1 + reach_x)
         piece = np.ascontiguousarray(image[top:bottom, left:right])
         piece_h, piece_w = piece.shape[:2]
-        margin = fitted_margin(piece_w, piece_h, reach)
+        margin = fitted_margin(piece_w, piece_h, max(reach_x, reach_y))
         canvas_w, canvas_h = piece_w + 2 * margin, piece_h + 2 * margin
         if max(piece_w, piece_h) > BAKE_CANVAS_LIMIT or max(canvas_w, canvas_h) > self._gpu_limit():
             global_report.note_missing(

@@ -30,10 +30,13 @@ __all__ = [
     "STROKE",
     "STROKE_EFFECT_KINDS",
     "STROKE_EFFECT_NOTE",
+    "effect_reach",
     "next_stroke",
     "pixel_reach",
     "stroke_effect_definitions",
     "takes_stroke_effect",
+    "turned_reach",
+    "turns_of",
 ]
 
 #: 線を引く所 外側は前からの縁取りと同じ（字の輪郭から外へ太さぶん）
@@ -136,6 +139,71 @@ def pixel_reach(effects: Iterable[Effect], frame: int) -> float:
                 reach += amount
         reach += growth
     return reach
+
+
+#: 画素の項目のほかに、絵を中心の周りで拡大・回転する項目を持つエフェクト（拡大率 % と回転 度）
+#: 層に掛けられるエフェクトでは影だけ（影の拡大と回転は絵の中心が支点）
+_TURNING: dict[str, tuple[str, str]] = {"shadow": ("zoom", "angle")}
+
+
+def turns_of(effects: Iterable[Effect], frame: int) -> tuple[tuple[float, float], ...]:
+    """``effects`` のうち絵を拡大・回転する物の（倍率, 度） 何もしない値の物は入れない"""
+    found: list[tuple[float, float]] = []
+    for effect in effects:
+        names = _TURNING.get(effect.kind)
+        definition = registry.get(effect.kind)
+        if names is None or definition is None or not effect.enabled:
+            continue
+        zoom_spec, angle_spec = (definition.spec(name) for name in names)
+        if not isinstance(zoom_spec, TrackSpec) or not isinstance(angle_spec, TrackSpec):
+            continue
+        zoom = max(0.0, _pixels(zoom_spec, effect, frame)) / 100.0
+        angle = _pixels(angle_spec, effect, frame)
+        if not (math.isfinite(zoom) and math.isfinite(angle)):
+            continue
+        if zoom != 1.0 or angle % 360.0 != 0.0:
+            found.append((zoom, angle))
+    return tuple(found)
+
+
+def turned_reach(
+    pixel: float, turns: Iterable[tuple[float, float]], half_width: float, half_height: float
+) -> tuple[float, float]:
+    """絵を外へ運ぶ量（横, 縦） ``pixel`` は画素の項目の量（:func:`pixel_reach`）
+
+    影の拡大と回転は、絵の中心（中身の範囲の真ん中）の周りで範囲ごと動かす 拡大すると範囲の
+    半分の倍率ぶん、回すと範囲の対角の向きへ外へ出る 画素の項目だけで見積もると、大きくした影や
+    回した影の外側が作業面の端で欠ける 範囲は画素の項目が広げた後の大きさで回す（縁取りや
+    ぼかしの後に掛かっても足りるように）
+    """
+    reach_x = reach_y = pixel
+    width, height = half_width + pixel, half_height + pixel
+    for zoom, angle in turns:
+        radians = math.radians(angle)
+        cos, sin = abs(math.cos(radians)), abs(math.sin(radians))
+        turned_x = zoom * (width * cos + height * sin)
+        turned_y = zoom * (width * sin + height * cos)
+        reach_x = max(reach_x, turned_x - half_width + pixel)
+        reach_y = max(reach_y, turned_y - half_height + pixel)
+    return reach_x, reach_y
+
+
+def effect_reach(
+    effects: tuple[Effect, ...],
+    frame: int,
+    half_width: float,
+    half_height: float,
+    *,
+    pixel_scale: float = 1.0,
+) -> tuple[float, float]:
+    """中身の範囲の半分の大きさが ``half_width`` x ``half_height`` の絵へ ``effects`` を掛けたとき、
+    範囲の外へ出る量（横, 縦） 画素の項目は ``pixel_scale`` で縮める（画質を落としたプレビュー）"""
+    return turned_reach(
+        pixel_reach(effects, frame) * pixel_scale,
+        turns_of(effects, frame),
+        half_width,
+        half_height,
+    )
 
 
 def _pixels(spec: TrackSpec, effect: Effect, frame: int) -> float:
