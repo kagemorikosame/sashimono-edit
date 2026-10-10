@@ -8,15 +8,18 @@ Semibold を探して描いた）
 
 from __future__ import annotations
 
+import numpy as np
+
 from sashimono.compat.aviutl.exo import parse_exo
 from sashimono.compat.aviutl.mapping import map_object
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import restyle
 from sashimono.compat.mapped import MappedObject
 from sashimono.core.commands import SetSource
-from sashimono.core.model import AnimatedValue, Clip, GeneratedSource
+from sashimono.core.model import AnimatedValue, Clip, GeneratedSource, ParamValue
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
+from sashimono.engine.sources import render_source
 
 #: 手元の字幕テンプレート（01_Premiere風_標準字幕.object）の骨組み 縁取りも影も
 #: スタイルも折り返しの幅も持たない
@@ -67,7 +70,7 @@ def _styled() -> Clip:
     )
 
 
-def _params(clip: Clip, *, keep_wrap: bool = False) -> dict[str, object]:
+def _params(clip: Clip, *, keep_wrap: bool = False) -> dict[str, ParamValue]:
     commands = restyle(_template(), clip, keep_wrap=keep_wrap)
     source = next(c for c in commands if isinstance(c, SetSource)).source
     assert source is not None
@@ -130,6 +133,45 @@ class TestKeepWrap:
     def test_keeping_the_width_does_not_keep_the_style(self) -> None:
         # 残すのは幅だけ スタイルは別のファミリでは当たらないので、設定に関係なく空に戻す
         assert _params(_styled(), keep_wrap=True)["font_style"] == ""
+
+
+#: 1 行では 640 の幅に収まらない字幕
+LONG = "今日はとてもいい天気なので、みんなで近くの公園まで歩いて出かけることにしました"
+
+
+def _ink_height(params: dict[str, ParamValue]) -> int:
+    image = render_source(GeneratedSource(kind="text", params=params), 1920, 1080)
+    assert image is not None
+    rows = np.nonzero(image[..., 3].max(axis=1) > 0)[0]
+    assert len(rows), "何も描かれていない"
+    return int(rows.max() - rows.min() + 1)
+
+
+class TestKeepWrapDrawing:
+    def wrapping(self) -> Clip:
+        return Clip(
+            timeline_start=0,
+            duration=90,
+            source=TEXT.create(text=LONG, font="Segoe UI", size=48, wrap_width=640),
+        )
+
+    def test_an_aviutl_template_still_wraps_when_the_width_is_kept(self) -> None:
+        # AviUtl のテンプレートは組み方「AviUtl2 と同じ」を持ち、その組み方は折り返さない
+        # 幅だけ残して組み方を取ると、設定を入れても字幕が 1 行のまま画面からはみ出す
+        kept = _params(self.wrapping(), keep_wrap=True)
+        dropped = _params(self.wrapping())
+        assert kept["layout"] == "native"
+        assert dropped["layout"] == "aviutl"
+        assert _ink_height(kept) > _ink_height(dropped) * 2.5
+
+    def test_without_the_width_the_template_layout_is_taken(self) -> None:
+        # 幅を使っていないテキストなら、残す物が無いので見本と同じ組み方になる
+        plain = Clip(
+            timeline_start=0,
+            duration=90,
+            source=TEXT.create(text=LONG, font="Segoe UI"),
+        )
+        assert _params(plain, keep_wrap=True)["layout"] == "aviutl"
 
 
 class TestTimer:

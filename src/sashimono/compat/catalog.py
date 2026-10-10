@@ -57,6 +57,7 @@ from sashimono.core.model import (
     Clip,
     GeneratedSource,
     MediaItem,
+    ParamValue,
     Project,
     SceneId,
     Track,
@@ -819,8 +820,9 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
       重ねるだけだと、テンプレートの形式に無い項目（フォントのスタイル・折り返しの幅
       など）が前の値のまま残り、テンプレートと違う見た目になる ファミリを替えても
       前のファミリのスタイル名が残り、標準の組み方ではそのスタイルで描かれた
-      ``keep_wrap`` を立てると折り返しの幅だけは今の値を残す（本人の設定
+      ``keep_wrap`` を立てると折り返しの幅は今の値を残す（本人の設定
       ``Preferences.restyle_keep_wrap`` 字幕の枠の幅を決めてから着せ替える人向け）
+      幅を使っていれば、幅が効くように組み方も今のまま残す
     * **エフェクトだけのテンプレート** — YMM4 の「アニメーション効果」のように
       中身を持たないもの 今のクリップに**エフェクトを足す**だけで、
       中身には触らない だからテキスト以外のクリップにも着せられる
@@ -867,13 +869,20 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
             if name not in _KEPT_ON_RESTYLE
         },
     }
+    current = clip.source.params
     staying = set(_KEPT_ON_RESTYLE)
     if keep_wrap:
         staying.add("wrap_width")
+        if _in_use(current.get("wrap_width")):
+            # 組み方も今のまま残す AviUtl2 の組み方（AviUtl のテンプレートが持つ ``aviutl``）は
+            # 折り返さない（AviUtl2 に折り返しが無く、足すと読み込んだ作品の行が変わる #249）
+            # テンプレートの組み方を取ると、幅を残しても字幕が 1 行のままになり設定が効かない
+            # 幅を残すと決めた人が求めているのは折り返す字幕なので、幅が効く今の組み方を選ぶ
+            # 代わりに、字の入れ物と太字の太らせ方は AviUtl2 の決まりではなく今の組み方になる
+            staying.add("layout")
     # 項目があっても空なら時間を出さないテンプレート（TEXT.create で作る物は空の書式を持つ）
     if not str(given.get("timer_format", "") or ""):
         staying |= _TIMER_ON_RESTYLE
-    current = clip.source.params
     params.update({name: current[name] for name in staying if name in current})
 
     commands: list[Command] = [SetSource(clip.id, GeneratedSource(kind="text", params=params))]
@@ -902,6 +911,13 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
             continue
         commands.append(AddEffect(clip.id, replace(fitted, fixed=False)))
     return commands
+
+
+def _in_use(value: ParamValue | None) -> bool:
+    """折り返しの幅を使っているか キーフレームで動く値は、途中で 0 でなくなるので使う側"""
+    if not isinstance(value, AnimatedValue):
+        return False
+    return bool(value.keyframes) or value.static > 0
 
 
 def _tracks_for(project: Project, layers: set[int], commands: list[Command]) -> dict[int, Track]:
