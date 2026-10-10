@@ -246,6 +246,18 @@ class TestAPreviewAtLowerQualityIsTheExportShrunk:
         clip = _source("shape", _effect("blur", radius=16), shape="rect", width=96, height=64)
         assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE / 2
 
+    def test_an_emboss(self, gl_context: OffscreenGLContext, divisor: int) -> None:
+        # エンボスの取り込み幅（画素） 小さい合成の画素で離して読むと、なだらかな坂の高さの差が
+        # 2 倍・4 倍に出て、面全体の明暗が書き出しより強くなる
+        # 縮めないと差の平均が 1/2 で 33・1/4 で 81 ほど、縮めると 0.3 より小さい
+        # グラデーションの 90 度は横へ変わる坂 光も横（0 度）から当てて、面全体に明暗を出す
+        ramp = _effect("gradient", angle=90, span=320)
+        emboss = _effect("emboss", angle=0, height=300, reach=12)
+        clip = _source(
+            "shape", ramp, emboss, shape="rect", width=320, height=176, color=(1.0, 1.0, 1.0, 1.0)
+        )
+        assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE / 5
+
     def test_a_shadow_and_a_border(self, gl_context: OffscreenGLContext, divisor: int) -> None:
         clip = _source(
             "shape",
