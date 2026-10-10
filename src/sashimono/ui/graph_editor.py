@@ -32,6 +32,7 @@ from sashimono.core.commands import (
 from sashimono.core.model import AnimatedValue, Clip, ClipId, Interpolation, Keyframe, Project
 from sashimono.effects import ParameterSpec, TrackSpec, registry
 from sashimono.effects.sources import source_registry
+from sashimono.effects.strokes import STROKE
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["GraphEditor", "curve_choices"]
@@ -68,6 +69,31 @@ def curve_choices(clip: Clip) -> list[tuple[str, ParamPath, bool]]:
                         animated(clip.source.params.get(spec.name)),
                     )
                 )
+    # テキストの縁取りの層（#272）と層のエフェクト（#273） 設定パネルと同じく中身のすぐ後ろ
+    strokes = clip.source.strokes if clip.source is not None else ()
+    for number, stroke in enumerate(strokes, start=1):
+        for spec in STROKE.parameters:
+            if isinstance(spec, TrackSpec):
+                choices.append(
+                    (
+                        f"縁取り {number}: {spec.label}",
+                        ParamPath.of_stroke(clip.id, stroke.id, spec.name),
+                        animated(stroke.params.get(spec.name)),
+                    )
+                )
+        for effect in stroke.effects:
+            definition = registry.get(effect.kind)
+            if definition is None:
+                continue
+            for spec in definition.parameters:
+                if isinstance(spec, TrackSpec):
+                    choices.append(
+                        (
+                            f"{definition.label}（縁取り {number}）: {spec.label}",
+                            ParamPath.of_stroke_effect(clip.id, stroke.id, effect.id, spec.name),
+                            animated(effect.params.get(spec.name)),
+                        )
+                    )
     for after, effects in ((False, clip.effects), (True, clip.after_effects)):
         for effect in effects:
             definition = registry.get(effect.kind)
@@ -347,14 +373,26 @@ class GraphEditor(QWidget):
         # エフェクトと生成オブジェクトは別の型だが、spec() の形は同じ
         # 欲しいのはパラメータ仕様だけなので、ここで 1 本にまとめる
         spec: ParameterSpec | None = None
+        stroke = (
+            clip.source.find_stroke(self._path.stroke_id)
+            if self._path.stroke_id is not None and clip.source is not None
+            else None
+        )
+        if self._path.stroke_id is not None and stroke is None:
+            return None
         if self._path.target is ParamTarget.SOURCE:
-            if clip.source is not None:
+            if stroke is not None:
+                spec = STROKE.spec(self._path.name)
+            elif clip.source is not None:
                 source = source_registry.get(clip.source.kind)
                 spec = source.spec(self._path.name) if source is not None else None
         else:
             # 場面切り替えの後の場面のエフェクトは別の列にある 前の列だけを探すと、
-            # 後の場面の値を選んでも曲線が出ない
-            stack = clip.after_effects if self._path.after else clip.effects
+            # 後の場面の値を選んでも曲線が出ない 縁取りの層のエフェクトは層の列にある
+            if stroke is not None:
+                stack = stroke.effects
+            else:
+                stack = clip.after_effects if self._path.after else clip.effects
             effect = next((e for e in stack if e.id == self._path.effect_id), None)
             definition = registry.get(effect.kind) if effect is not None else None
             spec = definition.spec(self._path.name) if definition is not None else None

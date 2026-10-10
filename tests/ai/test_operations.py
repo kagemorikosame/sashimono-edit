@@ -295,6 +295,86 @@ class TestText:
             run(host, "add_text", text="   ")
 
 
+def _text_clip(host: FakeHost) -> Any:
+    return next(
+        clip
+        for track in host.document.project.timeline.tracks
+        for clip in track.clips
+        if clip.source is not None and clip.source.kind == "text"
+    )
+
+
+class TestStrokes:
+    """縁取りの層（#272）と層のエフェクト（#273）も AI の道具から扱える"""
+
+    def test_layers_can_be_added_listed_and_edited(self, host: FakeHost) -> None:
+        # AI の道具が層を指せないと、AI に縁を足させても前の縁が消えたり別の縁が変わったりする
+        run(host, "add_text", text="縁", at_frame=0, duration=60, border_width=4)
+        clip = _text_clip(host)
+        added = run(host, "add_stroke", clip_id=str(clip.id), width=12, color="#FF0000")
+        listed = run(host, "list_clips")["clips"]
+        strokes = next(row["strokes"] for row in listed if row["clip_id"] == str(clip.id))
+        # 前からの縁（太さ 4）が 1 つ目の層になり、足した層が 2 つ目
+        assert [row["width"] for row in strokes] == [4.0, 12.0]
+        assert strokes[1]["stroke_id"] == added["stroke_id"]
+        stroke = added["stroke_id"]
+        run(
+            host,
+            "set_param",
+            clip_id=str(clip.id),
+            stroke_id=stroke,
+            name="position",
+            value="inside",
+        )
+        run(host, "set_stroke_enabled", clip_id=str(clip.id), stroke_id=stroke, enabled=False)
+        run(host, "move_stroke", clip_id=str(clip.id), stroke_id=stroke, index=0)
+        source = _text_clip(host).source
+        assert source.strokes[0].id == stroke
+        assert source.strokes[0].params["position"] == "inside"
+        assert source.strokes[0].enabled is False
+        assert source.strokes[0].params["color"] == pytest.approx((1.0, 0.0, 0.0, 1.0))
+        run(host, "remove_stroke", clip_id=str(clip.id), stroke_id=stroke)
+        assert len(_text_clip(host).source.strokes) == 1
+
+    def test_effects_go_onto_a_layer(self, host: FakeHost) -> None:
+        # 層に掛けたエフェクトがクリップへ入ると、縁だけをぼかすよう頼んでも字全体がぼける
+        run(host, "add_text", text="縁", at_frame=0, duration=60)
+        clip = _text_clip(host)
+        stroke = run(host, "add_stroke", clip_id=str(clip.id))["stroke_id"]
+        added = run(
+            host,
+            "add_effect",
+            clip_id=str(clip.id),
+            stroke_id=stroke,
+            kind="blur",
+            params={"radius": 6},
+        )
+        run(
+            host,
+            "add_keyframe",
+            clip_id=str(clip.id),
+            stroke_id=stroke,
+            effect_id=added["effect_id"],
+            name="radius",
+            frame=30,
+            value=12,
+        )
+        held = _text_clip(host).source.strokes[0]
+        assert [effect.kind for effect in held.effects] == ["blur"]
+        radius = held.effects[0].params["radius"]
+        assert isinstance(radius, AnimatedValue) and radius.at(30) == 12.0
+        # 層の絵だけで決まらない物（時間で動く・位置を使う）は断る 理由と使える物を返す
+        with pytest.raises(ToolError, match="縁取りの層に掛けられません"):
+            run(host, "add_effect", clip_id=str(clip.id), stroke_id=stroke, kind="noise")
+
+    def test_an_unknown_layer_is_explained(self, host: FakeHost) -> None:
+        # 無い層を指したときに ID の調べ方を返さないと、AI が同じ誤りを繰り返す
+        run(host, "add_text", text="縁", at_frame=0, duration=60)
+        clip = _text_clip(host)
+        with pytest.raises(ToolError, match="list_clips"):
+            run(host, "remove_stroke", clip_id=str(clip.id), stroke_id="無い")
+
+
 class TestSubtitles:
     def test_text_can_be_rewritten(self, host: FakeHost) -> None:
         media = host.document.project.media[0]

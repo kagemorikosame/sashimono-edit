@@ -28,6 +28,7 @@ from sashimono.core.model import (
     ParamValue,
     Project,
     ProjectSettings,
+    Stroke,
     Track,
     TrackKind,
 )
@@ -36,6 +37,7 @@ from sashimono.effects import ParamInput, registry
 from sashimono.effects.region import REGION_BLUR
 from sashimono.effects.sources import source_registry
 from sashimono.effects.spec import TrackSpec
+from sashimono.effects.strokes import STROKE
 from sashimono.engine.decode import probe_media
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.engine.render import FrameRenderer, RenderQuality
@@ -164,7 +166,7 @@ def test_every_pixel_setting_is_marked() -> None:
         (definition.kind, spec) for definition in registry.all() for spec in definition.parameters
     ] + [
         (definition.kind, spec)
-        for definition in source_registry.all()
+        for definition in (*source_registry.all(), STROKE)
         for spec in definition.parameters
     ]
     forgotten = [
@@ -306,6 +308,39 @@ class TestAPreviewAtLowerQualityIsTheExportShrunk:
     ) -> None:
         clip = _placed(_source("text", text="字", size=64), pos_x=-64, pos_y=32, scale=150)
         assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE
+
+    def test_text_with_stroke_layers(self, gl_context: OffscreenGLContext, divisor: int) -> None:
+        # 縁取りの層の太さは画面の画素（#272） 縮めずに描くと、層の縁だけ 2 倍・4 倍の太さに出る
+        clip = _stroked(
+            Stroke(params={"width": AnimatedValue(4.0), "color": (1.0, 1.0, 1.0, 1.0)}),
+            Stroke(params={"width": AnimatedValue(12.0), "color": (1.0, 0.0, 0.0, 1.0)}),
+            Stroke(
+                params={
+                    "width": AnimatedValue(5.0),
+                    "color": (0.0, 0.0, 1.0, 1.0),
+                    "position": "inside",
+                }
+            ),
+        )
+        assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE
+
+    def test_a_blurred_stroke_layer(self, gl_context: OffscreenGLContext, divisor: int) -> None:
+        # 層に掛けたぼかしの強さも画面の画素（#273） 層の絵は縮めて描くので、ぼかしも同じだけ
+        # 縮めて掛ける 縮めないと、プレビューだけ縁が 2 倍・4 倍にぼける
+        clip = _stroked(
+            Stroke(
+                params={"width": AnimatedValue(16.0), "color": (1.0, 0.0, 0.0, 1.0)},
+                effects=(_effect("blur", radius=24),),
+            )
+        )
+        assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE / 2
+
+
+def _stroked(*strokes: Stroke) -> Clip:
+    """縁取りの層を持つテキストのクリップ"""
+    clip = _source("text", text="字あA", size=56, pos_x=24)
+    assert clip.source is not None
+    return replace(clip, source=clip.source.with_strokes(strokes))
 
 
 @pytest.mark.parametrize("divisor", DIVISORS)

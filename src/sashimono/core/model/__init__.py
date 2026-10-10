@@ -22,6 +22,7 @@ from sashimono.core.model.ids import (
     MediaId,
     SceneId,
     SegmentId,
+    StrokeId,
     TrackId,
     new_clip_id,
     new_effect_id,
@@ -29,10 +30,19 @@ from sashimono.core.model.ids import (
     new_media_id,
     new_scene_id,
     new_segment_id,
+    new_stroke_id,
     new_track_id,
 )
 from sashimono.core.model.media import AudioStreamInfo, MediaItem, VideoStreamInfo
 from sashimono.core.model.project import Blending, LayerMode, Project, ProjectSettings, Scene
+from sashimono.core.model.stroke import (
+    LEGACY_BORDER_COLOR,
+    LEGACY_BORDER_WIDTH,
+    MAX_STROKES,
+    Stroke,
+    legacy_in_use,
+    legacy_stroke,
+)
 from sashimono.core.model.timeline import (
     FILTER_KIND,
     GROUP_AS_ONE,
@@ -61,6 +71,9 @@ __all__ = [
     "GROUP_AS_ONE",
     "GROUP_KIND",
     "GROUP_LAYERS",
+    "LEGACY_BORDER_COLOR",
+    "LEGACY_BORDER_WIDTH",
+    "MAX_STROKES",
     "AnimatedValue",
     "AudioStreamInfo",
     "Blending",
@@ -82,6 +95,8 @@ __all__ = [
     "Scene",
     "SceneId",
     "SegmentId",
+    "Stroke",
+    "StrokeId",
     "SubtitleOrigin",
     "Timeline",
     "Track",
@@ -98,12 +113,15 @@ __all__ = [
     "group_layers",
     "group_reaches",
     "heard_stream",
+    "legacy_in_use",
+    "legacy_stroke",
     "new_clip_id",
     "new_effect_id",
     "new_group_id",
     "new_media_id",
     "new_scene_id",
     "new_segment_id",
+    "new_stroke_id",
     "new_track_id",
     "plays_sound",
 ]

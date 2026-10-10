@@ -419,13 +419,107 @@ class TestVideoEffects:
         assert source.params["border_color"] == pytest.approx((1.0, 1.0, 1.0, 1.0))
 
     def test_two_outlines_stack(self) -> None:
-        item = text_item(VideoEffects=[outline(4.0), outline(12.0)])
+        """2 つの縁取りは縁取りの層になる（#272） YMM4 の 2 つ目の縁取りは 1 つ目を付けた絵の
+        外側に付くので、層の太さは字の輪郭からの和 並びの頭（内側）が上
+
+        前は太いほうだけを文字に載せ、細いほうをエフェクトとして外へ積んでいた 和にしないと
+        外側の層が内側の層の下に隠れ、内と外の色が入れ替わる
+        """
+        inner, outer = outline(4.0), outline(12.0)
+        outer["StrokeBrush"] = {
+            "Type": BRUSH["Type"],
+            "Parameter": {**BRUSH["Parameter"], "Color": "#FF000000"},
+        }
+        item = text_item(VideoEffects=[inner, outer])
         mapped = map_template([item], report=CompatibilityReport())[0]
         source = mapped.clip.source
         assert source is not None
-        # 太いほうを文字に、細いほうをエフェクトとして外側に積む
-        assert value_at(source.params["border_width"]) == pytest.approx(12.0)
-        assert [e.kind for e in mapped.clip.effects] == ["border"]
+        assert "border_width" not in source.params
+        assert [e.kind for e in mapped.clip.effects if e.kind == "border"] == []
+        widths = [value_at(stroke.params["width"]) for stroke in source.strokes]
+        assert widths == pytest.approx([4.0, 16.0])
+        colours = [stroke.params["color"] for stroke in source.strokes]
+        assert colours == [pytest.approx((1.0, 1.0, 1.0, 1.0)), pytest.approx((0.0, 0.0, 0.0, 1.0))]
+
+    @pytest.mark.parametrize("where", ["前", "間"])
+    def test_outlines_after_a_picture_effect_stay_in_place(self, where: str) -> None:
+        """縁取りの前や間に絵を変えるエフェクトがあれば、縁取りを層にせず並びの位置に残す
+
+        層はテキストと一緒に描くので、前のエフェクトが縁にも掛かる 実物のポップおこ（前景の
+        塗り 2 つ → 縁取り 2 つ）は字だけを塗るはずが縁まで塗られ、YMM4 との差が並びの位置に
+        残したとき（1.92）の倍あった（ポップおこ濃緑 4.48）
+        """
+        fill = {
+            "$type": "YukkuriMovieMaker.Project.Effects.FillForegroundEffect, YukkuriMovieMaker",
+            "Brush": BRUSH,
+            "IsEnabled": True,
+        }
+        chain = (
+            [fill, outline(4.0), outline(8.0)]
+            if where == "前"
+            else [outline(4.0), fill, outline(8.0)]
+        )
+        mapped = map_template([text_item(VideoEffects=chain)], report=CompatibilityReport())[0]
+        source = mapped.clip.source
+        assert source is not None
+        assert source.strokes == ()
+        assert "border_width" not in source.params
+        kinds = [e.kind for e in mapped.clip.effects if not e.fixed]
+        assert kinds.count("border") == 2
+        # 並びの順のまま（塗りの位置と縁取りの位置が入れ替わらない）
+        first_border = kinds.index("border")
+        assert first_border == (1 if where == "前" else 0)
+
+    def test_a_pivot_before_the_outlines_still_stacks(self) -> None:
+        """中心点は絵を変えないので、前にあっても層にする 層にしないと、中心点を置いた
+        テンプレートの縁だけが字の設定に出ない"""
+        pivot = {
+            "$type": "YukkuriMovieMaker.Project.Effects.CenterPointEffect, YukkuriMovieMaker",
+            "IsEnabled": True,
+        }
+        item = text_item(VideoEffects=[pivot, outline(4.0), outline(8.0)])
+        source = map_template([item], report=CompatibilityReport())[0].clip.source
+        assert source is not None and len(source.strokes) == 2
+
+    def test_outlines_after_a_lazy_marker_stay_in_place(self) -> None:
+        """描画を遅らせる印の後ろの縁取りは層にしない 層にすると、印の所で先に当てる配置より
+        前へ縁取りが動き、配置の後に付くはずの縁が字と一緒に動く"""
+        marker = {
+            "$type": "YukkuriMovieMaker.Project.Effects.DrawLazyEffectEffect, YukkuriMovieMaker",
+            "IsEnabled": True,
+            "IsZoom": True,
+        }
+        item = text_item(VideoEffects=[marker, outline(4.0), outline(8.0)], Zoom=still(150.0))
+        mapped = map_template([item], report=CompatibilityReport())[0]
+        source = mapped.clip.source
+        assert source is not None and source.strokes == ()
+        kinds = [e.kind for e in mapped.clip.effects if not e.fixed]
+        # 先に当てる拡大（transform）の後ろに縁取りが 2 つ
+        assert kinds[-2:] == ["border", "border"]
+        assert "transform" in kinds[: kinds.index("border")]
+
+    def test_one_moving_outline_still_stacks(self) -> None:
+        """動く太さが 1 つなら、動く側の点ごとに内側の太さを足して層にできる"""
+        moving_edge = outline(4.0)
+        moving_edge["StrokeThickness"] = moving(2.0, 10.0)
+        item = text_item(VideoEffects=[outline(3.0), moving_edge], Length=100)
+        source = map_template([item], report=CompatibilityReport())[0].clip.source
+        assert source is not None
+        outer = source.strokes[1].params["width"]
+        assert value_at(outer, 0) == pytest.approx(5.0)
+        assert value_at(outer, 99) == pytest.approx(13.0, abs=0.2)
+
+    def test_two_moving_outlines_stay_effects(self) -> None:
+        """動く太さどうしの和は 1 つの動く値で表せない 前と同じく太いほうを字に、残りを
+        エフェクトにする（実物には無い） 無理に足すと、キーの位置が違う所で縁の太さが
+        YMM4 と食い違う"""
+        first, second = outline(4.0), outline(4.0)
+        first["StrokeThickness"] = moving(2.0, 10.0)
+        second["StrokeThickness"] = moving(8.0, 1.0)
+        item = text_item(VideoEffects=[first, second], Length=100)
+        mapped = map_template([item], report=CompatibilityReport())[0]
+        assert mapped.clip.source is not None and mapped.clip.source.strokes == ()
+        assert [e.kind for e in mapped.clip.effects if e.kind == "border"] == ["border"]
 
     def test_an_outline_only_shape_keeps_just_the_edge(self) -> None:
         """図形の縁取りの「縁だけ」は、塗りを消して縁の輪だけを残すエフェクトになる

@@ -12,9 +12,11 @@
 だから ``Decorations`` だけを見ていると、**縁取りが 1 つも出ない** ここでは
 3 つとも読む
 
-こちらのテキストオブジェクトが自前で持てる飾りは縁取りと影の 1 つずつなので、
-縁取りが複数あるときは**一番太いもの**をテキストに載せ、残りは縁取りエフェクト
-として外側に積む 重ね順は YMM4 と同じ「内側から外側へ」になる
+YMM4 の縁取りは映像エフェクトなので、2 つ目の縁取りは 1 つ目の縁取りを付けた絵の外側に
+付く（太さが足し合わさる） テキストに載せられる縁取りが 2 つ以上あるときは、縁取りの層
+（#272）として内側から順に並べ、層の太さを字の輪郭からの和にする 1 つだけのときは前と同じく
+テキストの縁取りの項目へ載せる（前からの作品と同じ絵のまま） 縁取りの前や間に絵を変える
+エフェクトがあるときは層にせず、並びの位置に残す（:func:`layers_keep_order`）
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from sashimono.compat.ymm4.values import (
     reporting,
     type_name,
 )
-from sashimono.core.model import AnimatedValue, Effect, ParamValue
+from sashimono.core.model import MAX_STROKES, AnimatedValue, Effect, ParamValue, Stroke
 from sashimono.effects.definition import registry
 
 __all__ = [
@@ -76,6 +78,8 @@ class DecorationResult:
     effects: list[Effect] = field(default_factory=list)
     #: 最後に効いている中心点 アイテムの位置・拡大・回転の支点にもなる
     pivot: CenterPoint | None = None
+    #: テキストの縁取りの層（並びの頭が一番内側で一番上） 縁取りが 2 つ以上あるときだけ
+    strokes: list[Stroke] = field(default_factory=list)
 
 
 def map_decorations(
@@ -153,20 +157,65 @@ def map_video_effects(
     length: int = 1,
     keyframes: Any = None,
     text: bool = False,
+    placed_before: bool = False,
 ) -> DecorationResult:
     """``VideoEffects`` の列を読む
 
     ``text`` が真なら、縁取り（``OutlineEffect``）をテキストの飾りとして
     :class:`DecorationResult` の ``params`` へ分けて返す 偽なら並びの位置のまま
     縁取りのエフェクトにする
+    ``placed_before`` は、この列より前で描画を遅らせる印の配置を先に当てること
+    （印の後ろの区間） そこの縁取りは縁取りの層にしない（:func:`layers_keep_order`）
     """
     # 知らない移動方法の形を、渡された記録へ書く（値を読む所は記録を受け取らない）
     with reporting(report):
-        return _map_video_effects(effects, report, length=length, keyframes=keyframes, text=text)
+        return _map_video_effects(
+            effects,
+            report,
+            length=length,
+            keyframes=keyframes,
+            text=text,
+            placed_before=placed_before,
+        )
+
+
+#: 絵を変えない列の項目 縁取りの前にあっても、縁取りを層にしてよい
+#: 中心点は後ろの変形の支点を決めるだけ プレビューだけの印はアイテムごと書き出しから外す
+_NOT_PICTURE = frozenset({"CenterPointEffect", "ShowOnlyPreviewEffect"})
+
+
+def layers_keep_order(effects: Any, *, placed_before: bool = False) -> bool:
+    """縁取りを層にしても、YMM4 と掛かる順が変わらないか
+
+    縁取りの層はテキストと一緒に描くので、列の後ろのエフェクトは層にも掛かる 縁取りより
+    前や縁取りの間に絵を変えるエフェクト（前景の塗り・描画を遅らせる印など）があると、
+    YMM4 ではそれが字にだけ掛かり、後から付く縁取りには掛からない 層にすると縁まで塗られる
+    印の後ろの区間（``placed_before``）も、先に当てた配置より前へ縁取りを動かすことになる
+    どちらのときは層にせず、縁取りのエフェクトを並びの位置に残す
+    """
+    if not isinstance(effects, list):
+        return True
+    names = [
+        type_name(entry)
+        for entry in effects
+        if isinstance(entry, dict) and entry.get("IsEnabled") is not False
+    ]
+    outlines = [index for index, name in enumerate(names) if name == "OutlineEffect"]
+    if not outlines:
+        return True
+    if placed_before:
+        return False
+    return all(name in _NOT_PICTURE or name == "OutlineEffect" for name in names[: outlines[-1]])
 
 
 def _map_video_effects(
-    effects: Any, report: CompatibilityReport, *, length: int, keyframes: Any, text: bool
+    effects: Any,
+    report: CompatibilityReport,
+    *,
+    length: int,
+    keyframes: Any,
+    text: bool,
+    placed_before: bool = False,
 ) -> DecorationResult:
     result = DecorationResult()
     if not isinstance(effects, list):
@@ -180,6 +229,11 @@ def _map_video_effects(
     # すべてをエフェクトにする 一部だけをテキストへ載せると、載せた方が並びの頭へ動いて
     # 重なり順が YMM4 と変わる
     in_place = not text or not outlines_fit_text(effects, length=length, keyframes=keyframes)
+    # 縁取りが 2 つ以上で層にする（:func:`_place_borders`）とき、前に絵を変える物があれば
+    # 層にせず並びの位置に残す（:func:`layers_keep_order`） 1 つだけのときは前と同じく
+    # テキストの縁取りの項目へ載せる（前からの作品の絵を変えない）
+    if not in_place and _outline_count(effects) >= 2:
+        in_place = not layers_keep_order(effects, placed_before=placed_before)
     pivot: CenterPoint | None = None
     for entry in effects:
         if not isinstance(entry, dict):
@@ -242,7 +296,7 @@ def _map_video_effects(
             built = with_pivot(built, pivot)
         result.effects.append(built)
 
-    _place_borders(borders, result)
+    _place_borders(borders, result, layered=True)
     result.pivot = pivot
     return result
 
@@ -478,6 +532,19 @@ def outlines_fit_text(effects: Any, *, length: int = 1, keyframes: Any = None) -
     )
 
 
+def _outline_count(effects: Any) -> int:
+    """列の中の効いている縁取りの数"""
+    if not isinstance(effects, list):
+        return 0
+    return sum(
+        1
+        for entry in effects
+        if isinstance(entry, dict)
+        and entry.get("IsEnabled") is not False
+        and type_name(entry) == "OutlineEffect"
+    )
+
+
 def has_outline(effects: Any) -> bool:
     """列に効いている縁取りがあるか"""
     return isinstance(effects, list) and any(
@@ -543,15 +610,31 @@ def _peak(value: AnimatedValue) -> float:
 def _place_borders(
     borders: list[tuple[AnimatedValue, Colour]],
     result: DecorationResult,
+    *,
+    layered: bool = False,
 ) -> None:
-    """縁取りを、テキスト側 1 本とエフェクト側の残りに分ける
+    """縁取りをテキストへ載せる
 
-    一番太いものをテキストに持たせるのは、それが文字の形をいちばん強く決めるから
-    細いほうをテキストに載せると、太いほうをエフェクトで足したときに二重の縁の
-    間隔が変わる
+    ``layered`` なら（映像エフェクトの縁取り）、2 つ以上の縁取りを縁取りの層にする
+    YMM4 の縁取りは前の縁取りを付けた絵の外側に付くので、層の太さは字の輪郭から数えた和
+    （1 つ目 7.3 と 2 つ目 1.0 なら 7.3 と 8.3） 並びの頭が一番内側で、上に描かれる
+    太さが動く縁取りが 2 つ以上あるときは層にしない 動く値どうしの和はキーの位置が違うと
+    1 つの動く値で表せない 層の数の上限を超えるときも同じ（どちらも実物には無い）
+
+    層にしないときは、一番太いものをテキストに持たせ、残りを縁取りエフェクトにする
+    一番太いものを選ぶのは、それが文字の形をいちばん強く決めるから 細いほうをテキストに
+    載せると、太いほうをエフェクトで足したときに二重の縁の間隔が変わる
+    文字装飾（``Decorations``）の縁取りは実物に 1 つも無く、重なり方を確かめていないので層にしない
     """
     usable = [item for item in borders if _peak(item[0]) > 0.0]
     if not usable:
+        return
+    moving = sum(1 for thickness, _ in usable if thickness.keyframes)
+    if layered and 2 <= len(usable) <= MAX_STROKES and moving <= 1:
+        reach = AnimatedValue(0.0)
+        for thickness, tint in usable:
+            reach = _plus(reach, thickness)
+            result.strokes.append(Stroke(params={"width": reach, "color": tint}))
         return
 
     widest = max(usable, key=lambda item: _peak(item[0]))
@@ -564,6 +647,17 @@ def _place_borders(
             seen_widest = True
             continue
         result.effects.append(_border_effect(thickness, tint))
+
+
+def _plus(first: AnimatedValue, second: AnimatedValue) -> AnimatedValue:
+    """2 つの太さの和 動くのはどちらか 1 つまで（動く側の点ごとに、動かない側を足す）"""
+    if first.keyframes and second.keyframes:
+        raise ValueError("動く値どうしは足せない")
+    moving, still = (first, second) if first.keyframes else (second, first)
+    return AnimatedValue(
+        first.static + second.static,
+        tuple(replace(key, value=key.value + still.static) for key in moving.keyframes),
+    )
 
 
 def _border_effect(
