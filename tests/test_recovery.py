@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, tzinfo
+import os
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
 
 from sashimono.core.io import (
+    RecoveryEntry,
     RecoverySession,
     backup_before_save,
     backup_folder,
@@ -21,7 +23,12 @@ from sashimono.core.io import (
     find_orphans_in,
     folder_problem,
     load_project,
+    mark_offered,
+    plan_trim,
     recovery,
+    state_usage,
+    tidy_orphans,
+    trim_state,
 )
 from sashimono.core.model import Project
 
@@ -261,3 +268,124 @@ class TestChosenFolders:
         with pytest.raises(OSError):
             session.close()
         assert session._lock is None
+
+
+def _offered_orphan(root: Path, name: str) -> RecoveryEntry:
+    """落ちた作業を 1 つ作り、復元を勧めた印を付ける"""
+    session = RecoverySession(root)
+    session.save(Project.create(name=name), None)
+    crash(session)
+    (entry,) = [found for found in find_orphans(root) if found.name == name]
+    mark_offered(entry)
+    return entry
+
+
+class TestTidyingOldOrphans:
+    """残った退避を日数で片付ける（#271） 消してはいけない物が残ることを中心に見る"""
+
+    later = datetime.now() + timedelta(days=10)
+
+    def test_marking_is_remembered(self, tmp_path: Path) -> None:
+        _offered_orphan(tmp_path, "見せた")
+        assert [entry.offered for entry in find_orphans(tmp_path)] == [True]
+
+    def test_an_old_offered_orphan_is_tidied(self, tmp_path: Path) -> None:
+        _offered_orphan(tmp_path, "見せた")
+        tidied = tidy_orphans([tmp_path], 7, now=self.later)
+        assert [entry.name for entry in tidied] == ["見せた"]
+        assert find_orphans(tmp_path) == []
+        # 印も一緒に消す 残ると、同じ名前の起動は無いので印だけが溜まる
+        assert list((tmp_path / "recovery").iterdir()) == []
+
+    def test_zero_days_tidies_nothing(self, tmp_path: Path) -> None:
+        # 既定は片付けない（前からの動き）
+        _offered_orphan(tmp_path, "見せた")
+        assert tidy_orphans([tmp_path], 0, now=self.later) == []
+        assert len(find_orphans(tmp_path)) == 1
+
+    def test_a_never_offered_orphan_is_kept_however_old(self, tmp_path: Path) -> None:
+        # 長く起動しなかった人のところで、一度も見ていない落ちた作業を消さない
+        session = RecoverySession(tmp_path)
+        session.save(Project.create(name="見せていない"), None)
+        crash(session)
+        assert tidy_orphans([tmp_path], 1, now=self.later) == []
+        assert [entry.name for entry in find_orphans(tmp_path)] == ["見せていない"]
+
+    def test_a_recent_offered_orphan_is_kept(self, tmp_path: Path) -> None:
+        _offered_orphan(tmp_path, "見せた")
+        assert tidy_orphans([tmp_path], 30, now=self.later) == []
+        assert len(find_orphans(tmp_path)) == 1
+
+    def test_a_live_session_is_kept(self, tmp_path: Path) -> None:
+        session = RecoverySession(tmp_path)
+        session.save(Project.create(name="作業中"), None)
+        try:
+            assert tidy_orphans([tmp_path], 1, now=self.later) == []
+            assert session.path.is_file()
+        finally:
+            session.close()
+
+
+class TestTheSizeLimit:
+    """置き場の容量の上限（#271） 消してはいけない物が残ることを中心に見る"""
+
+    def _backups(self, state: Path, name: str, count: int, size: int = 1000) -> list[Path]:
+        target = state.parent / name
+        made = []
+        for number in range(count):
+            target.write_bytes(bytes([number]) * size)
+            copied = backup_before_save(target, state)
+            assert copied is not None
+            made.append(copied)
+        return made
+
+    def test_under_the_limit_nothing_goes(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        self._backups(state, "本編.sme", 3)
+        assert plan_trim(10_000, state) == []
+
+    def test_the_oldest_goes_first(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        made = self._backups(state, "本編.sme", 4)
+        # 時刻はファイルの更新時刻ではなく名前で見る 控えは元の更新時刻を写すので、
+        # 更新時刻で並べると作った順と食い違う
+        os.utime(made[0], (made[-1].stat().st_mtime + 100,) * 2)
+        items = plan_trim(state_usage(state) - 500, state)
+        assert [item.paths for item in items] == [(made[0],)]
+        # 数えるだけでは消さない
+        assert made[0].is_file()
+
+    def test_the_newest_backup_of_each_project_is_kept(self, tmp_path: Path) -> None:
+        # 最後の保存の前の中身 これが消えると「さっきの保存で壊した」を戻せない
+        state = tmp_path / "state"
+        first = self._backups(state, "一.sme", 3)
+        second = self._backups(state, "二.sme", 1)
+        trimmed = trim_state(1, state)
+        assert sorted(path for item in trimmed for path in item.paths) == sorted(first[:-1])
+        assert first[-1].is_file()
+        assert second[-1].is_file()
+
+    def test_live_and_unoffered_recovery_are_kept(self, tmp_path: Path) -> None:
+        # 開いている作業の今の退避と、まだ勧めていない落ちた作業は、超えていても消さない
+        state = tmp_path / "state"
+        live = RecoverySession(state)
+        live.save(Project.create(name="作業中"), None)
+        unseen = RecoverySession(state)
+        unseen.save(Project.create(name="見せていない"), None)
+        crash(unseen)
+        offered = _offered_orphan(state, "見せた")
+        try:
+            trimmed = trim_state(1, state)
+            assert [item.label for item in trimmed] == ["落ちた作業 見せた"]
+            assert live.path.is_file()
+            assert unseen.path.is_file()
+            assert not offered.path.exists()
+        finally:
+            live.close()
+
+    def test_the_items_say_what_they_are(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        self._backups(state, "本編.sme", 2)
+        (item,) = plan_trim(1, state)
+        assert item.label == "バックアップ 本編"
+        assert item.size == 1000

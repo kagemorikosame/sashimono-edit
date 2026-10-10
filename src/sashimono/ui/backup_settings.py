@@ -15,6 +15,11 @@
 - 同期フォルダ（OneDrive など）とネットワークの置き場は、選べるが確かめる 数十秒おきの退避が
   そのまま同期され、回線が切れると書けなくなる
 - 世代数を減らすときは、次の上書き保存で消える数を見せて確かめる その場では消さない
+- 残った退避を日数で片付けるのは、起動して復元を尋ねた後だけ 一度も勧めていない退避は消さない
+- 容量の上限は、選んだ置き場と既定の置き場のそれぞれに掛ける 世代数の上限とは別に効き、
+  先に当たった方で消える 開いている作業の今の退避・まだ勧めていない落ちた作業・
+  各プロジェクトのいちばん新しいバックアップは、超えていても消さない 上限を入れる・下げるときは
+  消える物を見せて確かめ、超えて消したときはステータスバーで何を消したかを知らせる
 """
 
 from __future__ import annotations
@@ -33,11 +38,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sashimono.core.io import backups_over, default_state_root, folder_problem
+from sashimono.core.io import (
+    backups_over,
+    default_state_root,
+    folder_problem,
+    plan_trim,
+)
+from sashimono.core.io.recovery import TrimItem
 from sashimono.runtime import app_dir
 from sashimono.ui.workspace import (
     AUTOSAVE_SECONDS_RANGE,
     BACKUP_GENERATIONS_RANGE,
+    RECOVERY_KEEP_DAYS_RANGE,
+    STATE_LIMIT_MB_RANGE,
     Preferences,
 )
 from sashimono.update.portable import in_synced_folder
@@ -45,10 +58,15 @@ from sashimono.update.portable import in_synced_folder
 __all__ = [
     "BackupSection",
     "confirm_backup_changes",
+    "describe_trim",
     "folder_caution",
     "folder_refusal",
     "state_root_for",
+    "state_roots",
 ]
+
+#: 消える物の名前を並べる数 多すぎると確かめの窓が画面からはみ出す
+_LISTED = 8
 
 
 def state_root_for(preferences: Preferences) -> Path:
@@ -56,6 +74,37 @@ def state_root_for(preferences: Preferences) -> Path:
     if preferences.state_folder:
         return Path(preferences.state_folder)
     return default_state_root()
+
+
+def state_roots(preferences: Preferences) -> list[Path]:
+    """片付けと復元で見る置き場 選んだ置き場と既定の置き場（同じなら 1 つ）
+
+    書けずに既定へ戻した起動の退避と控えは既定の側にある 選んだ側だけ見ると、
+    そちらは上限も日数も効かないまま溜まり続ける
+    """
+    chosen, default = state_root_for(preferences), default_state_root()
+    return [chosen] if chosen == default else [chosen, default]
+
+
+def describe_trim(items: list[TrimItem]) -> str:
+    """片付ける物の一覧 名前ごとに数をまとめ、多ければ残りの数だけ書く"""
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item.label] = counts.get(item.label, 0) + 1
+    lines = [f"{label}（{count} 件）" for label, count in list(counts.items())[:_LISTED]]
+    rest = len(counts) - _LISTED
+    if rest > 0:
+        lines.append(f"ほか {rest} 種類")
+    size = sum(item.size for item in items) / (1024 * 1024)
+    return f"{len(items)} 件 {size:.1f}MB\n" + "\n".join(lines)
+
+
+def plan_trim_all(preferences: Preferences) -> list[TrimItem]:
+    """容量の上限で片付ける物（全部の置き場） 上限が無ければ空"""
+    if preferences.state_limit_mb <= 0:
+        return []
+    limit = preferences.state_limit_mb * 1024 * 1024
+    return [item for root in state_roots(preferences) for item in plan_trim(limit, root)]
 
 
 def folder_refusal(folder: Path, install: Path | None = None) -> str | None:
@@ -185,12 +234,40 @@ class BackupSection:
             " 落ちた作業は、選んだ場所と既定の場所の両方から探す"
         )
 
+        self.recovery_keep_days = QSpinBox(parent)
+        self.recovery_keep_days.setRange(*RECOVERY_KEEP_DAYS_RANGE)
+        self.recovery_keep_days.setSuffix(" 日")
+        self.recovery_keep_days.setSpecialValueText("片付けない（既定）")
+        self.recovery_keep_days.setValue(preferences.recovery_keep_days)
+        self.recovery_keep_days.setToolTip(
+            "起動したときに復元を尋ね、復元も破棄もしないまま残った落ちた作業を、退避してから"
+            "この日数がたったら片付ける 片付けるのは起動して復元を尋ねた後だけで、まだ一度も"
+            "尋ねていない物は古くても消さない 片付けた数はステータスバーで知らせる"
+        )
+
+        self.state_limit_mb = QSpinBox(parent)
+        self.state_limit_mb.setRange(*STATE_LIMIT_MB_RANGE)
+        self.state_limit_mb.setSingleStep(100)
+        self.state_limit_mb.setSuffix(" MB")
+        self.state_limit_mb.setSpecialValueText("上限なし（既定）")
+        self.state_limit_mb.setValue(preferences.state_limit_mb)
+        self.state_limit_mb.setToolTip(
+            "退避とバックアップが置き場で使う大きさの上限 選んだ置き場と既定の置き場の"
+            "それぞれに掛ける 超えたら古い物から片付け、何を消したかをステータスバーで知らせる"
+            " 残すバックアップの数とは別に効き、先に当たった方で消える"
+            " 開いている作業の退避・まだ復元を尋ねていない落ちた作業・各プロジェクトの"
+            "いちばん新しいバックアップは、超えていても消さない"
+            " 上限を入れる・下げるときは、消える物を見せて確かめる"
+        )
+
     def add_rows(self, form: QFormLayout) -> None:
         form.addRow(self.autosave)
         form.addRow("退避の間隔", self.autosave_seconds)
         form.addRow(self.backup)
         form.addRow("残すバックアップの数", self.backup_generations)
         form.addRow("退避とバックアップの置き場", self.state_folder)
+        form.addRow("残った退避を片付ける", self.recovery_keep_days)
+        form.addRow("置き場の容量の上限", self.state_limit_mb)
 
 
 def confirm_backup_changes(parent: QWidget | None, before: Preferences, after: Preferences) -> bool:
@@ -225,6 +302,29 @@ def confirm_backup_changes(parent: QWidget | None, before: Preferences, after: P
                 f"残す数を {after.backup_generations} 世代にすると、今あるバックアップのうち "
                 f"{doomed} 本が、それぞれのプロジェクトを次に上書き保存したときに消えます"
                 "（古い物から 消したバックアップは戻せません）\n\n減らしますか",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+    tightened = after.state_limit_mb > 0 and (
+        before.state_limit_mb == 0
+        or after.state_limit_mb < before.state_limit_mb
+        or state_roots(after) != state_roots(before)
+    )
+    if tightened:
+        doomed_items = plan_trim_all(after)
+        if doomed_items:
+            # OK を押すとその場で片付ける 何が消えるかを先に見せないと、本人は上限を
+            # 入れただけのつもりで控えを失う
+            answer = QMessageBox.question(
+                parent,
+                "容量の上限",
+                f"上限を {after.state_limit_mb}MB にすると、古い物から次を片付けます"
+                "（消した物は戻せません）\n\n"
+                f"{describe_trim(doomed_items)}\n\n"
+                "開いている作業の退避・まだ復元を尋ねていない落ちた作業・"
+                "各プロジェクトのいちばん新しいバックアップは消しません\n\n上限を入れますか",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

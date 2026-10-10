@@ -707,6 +707,8 @@ class PreferencesDialog(QDialog):
             backup=self._backups.backup.isChecked(),
             backup_generations=self._backups.backup_generations.value(),
             state_folder=self._backups.state_folder.folder(),
+            recovery_keep_days=self._backups.recovery_keep_days.value(),
+            state_limit_mb=self._backups.state_limit_mb.value(),
         )
 
     def accept(self) -> None:

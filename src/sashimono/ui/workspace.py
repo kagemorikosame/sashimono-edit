@@ -411,6 +411,15 @@ class Preferences:
     #: 既定を空で持つのは、ユーザー名やドライブが変わった機械でも既定の置き場を指し続けるため
     #: 書けない所を選んでいたら、その起動は既定の置き場へ戻して知らせる（黙って退避を止めない）
     state_folder: str = ""
+    #: 復元を勧めたのに残っている落ちた作業の退避を、何日たったら片付けるか 0 は片付けない
+    #: 既定は 0（前からの動き） 片付けるのは起動して復元を尋ねた後だけで、まだ一度も
+    #: 勧めていない退避は古くても消さない
+    recovery_keep_days: int = 0
+    #: 退避とバックアップの置き場の容量の上限（MB） 0 は上限なし（既定 前からの動き）
+    #: 超えたら古い物から片付ける 世代数の上限とは別に効き、先に当たった方で消える
+    #: 開いている作業の今の退避・まだ勧めていない落ちた作業・各プロジェクトのいちばん
+    #: 新しいバックアップは、上限を超えていても消さない
+    state_limit_mb: int = 0
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -538,6 +547,12 @@ class PreferenceStore:
                 data.get("backup_generations"), BACKUP_GENERATIONS_RANGE, plain.backup_generations
             ),
             state_folder=_folder(data.get("state_folder"), plain.state_folder),
+            recovery_keep_days=_within(
+                data.get("recovery_keep_days"), RECOVERY_KEEP_DAYS_RANGE, plain.recovery_keep_days
+            ),
+            state_limit_mb=_within(
+                data.get("state_limit_mb"), STATE_LIMIT_MB_RANGE, plain.state_limit_mb
+            ),
         )
 
     def save(self, preferences: Preferences) -> None:
@@ -666,6 +681,14 @@ AUTOSAVE_SECONDS_RANGE = (10, 600)
 #: バックアップの世代数として受け付ける範囲 0 は「作らない」と同じなので入り切りの側で持つ
 #: 200 を超えると 1 本数百 KB でもプロジェクトごとに数十 MB になり、置き場を食う
 BACKUP_GENERATIONS_RANGE = (1, 200)
+
+#: 残った退避を片付けるまでの日数として受け付ける範囲 0 は片付けない
+RECOVERY_KEEP_DAYS_RANGE = (0, 365)
+
+#: 置き場の容量の上限として受け付ける範囲（MB） 0 は上限なし 上は 1TB
+#: 小さくしても大事な物（今の退避と各プロジェクトのいちばん新しい控え）は消さないので、
+#: 下は 1MB まで許す
+STATE_LIMIT_MB_RANGE = (0, 1_000_000)
 
 
 def _within(value: object, bounds: tuple[int, int], default: int) -> int:

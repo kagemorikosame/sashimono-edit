@@ -86,9 +86,12 @@ from sashimono.core.io import (
     find_orphans_in,
     hold_new,
     load_project,
+    mark_offered,
     others_holding,
     project_presence_dir,
     save_project,
+    tidy_orphans,
+    trim_state,
 )
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
@@ -118,7 +121,7 @@ from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
-from sashimono.ui.backup_settings import state_root_for
+from sashimono.ui.backup_settings import describe_trim, state_root_for, state_roots
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
@@ -935,6 +938,13 @@ class MainWindow(QMainWindow):
         self._apply_autosave_timer(preferences)
         if state_root_for(preferences) != state_root_for(previous):
             self._move_recovery(state_root_for(preferences))
+        if preferences.state_limit_mb != previous.state_limit_mb or state_roots(
+            preferences
+        ) != state_roots(previous):
+            # 上限を入れた・下げた 消える物は設定画面の OK で見せて確かめてある
+            trimmed = self._trim_state()
+            if trimmed:
+                self.statusBar().showMessage(trimmed, 15000)
 
     def _apply_autosave_timer(self, preferences: Preferences) -> None:
         """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
@@ -2157,14 +2167,17 @@ class MainWindow(QMainWindow):
         keep = preferences.backup_generations
         root = state_root_for(preferences)
         default = default_state_root()
+        note = ""
         try:
             backup_before_save(target, root, keep=keep)
         except OSError as exc:
             if root == default:
                 raise
             backup_before_save(target, default, keep=keep)
-            return f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
-        return ""
+            note = f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
+        # 控えを足したぶん上限を超えうる 超えたら古い物から片付けて、何を消したかを添える
+        trimmed = self._trim_state()
+        return f"{note}（{trimmed}）" if trimmed else note
 
     def save_as(self) -> bool:
         suggested = self._path or Path(f"{self._document.project.name}{SUFFIX}")
@@ -2353,16 +2366,29 @@ class MainWindow(QMainWindow):
         return True
 
     def offer_recovery(self) -> None:
-        """前回落ちた作業が残っていれば、復元するか尋ねる 起動の直後に呼ぶ"""
+        """前回落ちた作業が残っていれば、復元するか尋ねる 起動の直後に呼ぶ
+
+        尋ね終えてから、日数と容量の上限で片付ける 先に片付けると、本人が一度も
+        見ていない落ちた作業を消しうる
+        """
+        roots = state_roots(self._preferences)
+        self._ask_recovery(roots)
+        self._tidy_state(roots)
+
+    def _ask_recovery(self, roots: list[Path]) -> None:
         from sashimono.ui.recovery_dialog import RecoveryDialog
 
-        roots = [state_root_for(self._preferences), default_state_root()]
         while entries := find_orphans_in(roots):
             dialog = RecoveryDialog(entries, self)
             answer = dialog.exec()
             # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
             # この後で結果を読む間は残る
             dialog.deleteLater()
+            # 一覧に出した物は勧めた 印を付けられなくても（置き場が書けない）片付けの側が
+            # 消さないだけで困らない
+            for shown in entries:
+                with contextlib.suppress(OSError):
+                    mark_offered(shown)
             if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
                 return
             action, entry = dialog.choice
@@ -2371,6 +2397,39 @@ class MainWindow(QMainWindow):
                 continue
             self.restore_recovery(entry)
             return
+
+    def _tidy_state(self, roots: list[Path]) -> None:
+        """日数を過ぎた残りの退避と、容量の上限を超えた古い物を片付けて知らせる"""
+        try:
+            tidied = tidy_orphans(roots, self._preferences.recovery_keep_days)
+        except OSError:
+            tidied = []
+        notes = []
+        if tidied:
+            notes.append(
+                f"{self._preferences.recovery_keep_days} 日より前に落ちた作業の退避を "
+                f"{len(tidied)} 件片付けた"
+            )
+        trimmed = self._trim_state()
+        if trimmed:
+            notes.append(trimmed)
+        if notes:
+            self.statusBar().showMessage(" ／ ".join(notes), 15000)
+
+    def _trim_state(self) -> str:
+        """容量の上限を超えていれば古い物から片付ける 知らせる言葉を返す（無ければ空）"""
+        limit_mb = self._preferences.state_limit_mb
+        if limit_mb <= 0:
+            return ""
+        items = []
+        for root in state_roots(self._preferences):
+            with contextlib.suppress(OSError):
+                items.extend(trim_state(limit_mb * 1024 * 1024, root))
+        if not items:
+            return ""
+        return f"容量の上限 {limit_mb}MB を超えたので片付けた: " + describe_trim(items).replace(
+            "\n", " "
+        )
 
     def restore_recovery(self, entry: RecoveryEntry) -> bool:
         """退避を開く 保存はしないので、開いた直後は「変更あり」になる
