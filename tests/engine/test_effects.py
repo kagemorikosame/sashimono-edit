@@ -683,6 +683,19 @@ class TestEmboss:
         flat = draw(plate, (ramp, _emboss(height=0, keep_color=True))).astype(int)
         assert np.abs(flat - plain).max() <= 1
 
+    def test_zero_height_keeps_a_colour_brighter_than_white(
+        self, draw: Callable[..., np.ndarray]
+    ) -> None:
+        # 途中の絵は 1 を超える明るさを持てる 露出で白を 2 倍にしてから掛け、半分に戻して見る
+        # 元の色を sRGB へ直して置き換えると 2 が 1 に詰められ、戻した後は白でなく灰色になる
+        square = white_square(120)
+        brighter = registry.require("exposure").create(amount=200)
+        back = registry.require("exposure").create(amount=50)
+        plain = draw(square, (brighter, back))
+        kept = draw(square, (brighter, _emboss(height=0, keep_color=True), back))
+        assert centre(plain)[0] > 250
+        assert np.abs(kept.astype(int) - plain.astype(int)).max() <= 1
+
     def test_keep_colour_adds_the_relief_to_the_picture(
         self, draw: Callable[..., np.ndarray]
     ) -> None:

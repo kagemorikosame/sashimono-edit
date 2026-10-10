@@ -800,13 +800,20 @@ void main() {
                 * (height / 100.0) * 0.5;
     vec3 embossed;
     if (keep_color) {
-        embossed = to_srgb(base.rgb) + relief;
+        // 元の色へは、凹凸で変わった分だけをリニアの差で足す sRGB へ直した値で置き換えると、
+        // 露出などで 1 を超えた明るさが 1 に詰められ、高さ 0 でも元の絵から変わる
+        // 1 を超える所に照る側の凹凸を足しても sRGB の 1 で止まるので明るくはならず、
+        // 陰の側だけが差の分暗くなる
+        vec3 shown = to_srgb(base.rgb);
+        embossed = base.rgb + (to_linear(clamp(shown + relief, 0.0, 1.0)) - to_linear(shown));
     } else {
-        embossed = vec3(0.5) + relief;
+        // 灰色の浮き彫りは元の色を残さない新しい面なので 0..1 に収める 高さも to_srgb で
+        // 1 に詰めて読む 画面に出る白より明るい所は、白と同じ高さの平らな所に見える
+        embossed = to_linear(clamp(vec3(0.5) + relief, 0.0, 1.0));
     }
     // なじませるのはリニアで行う 量 0 で元の値がそのまま残り、1 を超える明るさも切れない
     float weight = clamp(amount / 100.0, 0.0, 1.0);
-    vec3 rgb = mix(base.rgb, to_linear(clamp(embossed, 0.0, 1.0)), weight);
+    vec3 rgb = mix(base.rgb, embossed, weight);
     frag_color = vec4(rgb, base.a);
 }
 """
