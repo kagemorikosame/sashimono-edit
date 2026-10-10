@@ -68,6 +68,8 @@ from sashimono.core.commands.fixed import (
 )
 from sashimono.core.commands.preset import PresetOptions, preset_commands
 from sashimono.core.io import Preset, PresetStore
+from sashimono.core.io.aliases import AliasStore
+from sashimono.core.io.library import PRESET, Library
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -94,6 +96,7 @@ from sashimono.effects import (
 from sashimono.effects.blending import BLEND_MODES
 from sashimono.effects.sources import source_registry
 from sashimono.engine.gpu import BlendMode
+from sashimono.ui import library_dialog
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import (
@@ -126,6 +129,8 @@ BLEND_LABELS = {
 
 #: 〔プリセット…〕のメニューで「保存」の項目に持たせる印 一覧の項目はプリセットそのものを持つ
 _SAVE_PRESET = "save_preset"
+#: 同じく「一覧で整理・見本で選ぶ」の項目の印（#276 #277）
+_MANAGE_PRESETS = "manage_presets"
 
 #: 配置のテンプレートのボタンの印 :data:`ALIGNMENTS` と同じ並び（左上から右下へ）
 _ALIGN_MARKS = ("↖", "↑", "↗", "←", "●", "→", "↙", "↓", "↘")
@@ -218,6 +223,8 @@ class InspectorPanel(QWidget):
         self._clip_id: ClipId | None = None
         self._selection: tuple[ClipId, ...] = ()
         self._presets = PresetStore()
+        #: 自作のエイリアスの置き場 一覧の窓（#276）でプリセットと並べて整理するのに使う
+        self._aliases = AliasStore()
         #: プリセットの当て方（設定 :attr:`Preferences.preset_options`）
         self._preset_options = PresetOptions()
         self._frame = 0
@@ -1415,6 +1422,10 @@ class InspectorPanel(QWidget):
         """プリセットの置き場を差し替える 試験と、置き場を選べるようにするときのため"""
         self._presets = store
 
+    def set_alias_store(self, store: AliasStore) -> None:
+        """一覧の窓で並べるエイリアスの置き場を差し替える 試験のため"""
+        self._aliases = store
+
     def _show_preset_menu(self) -> None:
         menu = self.preset_menu()
         if menu is None:
@@ -1451,6 +1462,9 @@ class InspectorPanel(QWidget):
             save.setText("この見た目を保存…（保存できる設定がありません）")
             save.setEnabled(False)
             save.setToolTip("足したエフェクトも、描画・音声の欄も、テキストや図形の中身も無い")
+        manage = menu.addAction("管理…（見本で選ぶ・名前や分類を変える・消す）")
+        manage.setData(_MANAGE_PRESETS)
+        manage.setToolTip("保存したプリセットを見本の絵つきの一覧で整理し、選んで当てる")
         menu.addSeparator()
 
         presets = self._presets.all()
@@ -1490,8 +1504,17 @@ class InspectorPanel(QWidget):
             if clip is not None and located is not None:
                 picture, _ = self._picture_and_sound(*located)
                 self._save_preset(clip, picture=picture)
+        elif data == _MANAGE_PRESETS:
+            self._manage_presets()
         elif isinstance(data, Preset):
             self._apply_preset(data)
+
+    def _manage_presets(self) -> None:
+        """一覧の窓を開く 〔当てる〕で選んだ物を、メニューで選んだときと同じく当てる"""
+        library = Library(presets=self._presets, aliases=self._aliases)
+        chosen = library_dialog.open_library(self, library, kind=PRESET, pick=PRESET)
+        if chosen is not None and isinstance(chosen.item, Preset):
+            self._apply_preset(chosen.item)
 
     def _save_preset(self, clip: Clip, *, picture: bool) -> None:
         name, accepted = QInputDialog.getText(

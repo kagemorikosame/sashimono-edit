@@ -40,6 +40,7 @@ from sashimono.core.io.serialize import (
 from sashimono.core.model import Clip, Effect, new_clip_id
 
 __all__ = [
+    "DEFAULT_CATEGORY",
     "FORMAT_NAME",
     "FORMAT_VERSION",
     "SUFFIX",
@@ -51,6 +52,8 @@ __all__ = [
 
 FORMAT_NAME = "sashimono-alias"
 FORMAT_VERSION = 1
+#: 分類の既定 プリセットの既定（``ユーザー``）とそろえ、管理の画面で 2 つを同じ並びで見せる
+DEFAULT_CATEGORY = "ユーザー"
 SUFFIX = ".smea"
 
 #: ファイル名に使えない文字 Windows の制限に合わせる（プリセットと同じ）
@@ -81,9 +84,13 @@ class Alias:
 
     name: str
     clip: Clip
+    #: 分類 管理の画面（#276）のフォルダ分けと、〔追加〕→〔エイリアス〕の並べ方に使う
+    #: ファイルの置き場は名前だけで決める（分類で分けない） 名前がエイリアスを指す 1 つの
+    #: 鍵で、分類ごとに同じ名前を許すと、置き場と上書きの確かめが食い違う
+    category: str = DEFAULT_CATEGORY
 
     @classmethod
-    def of(cls, name: str, clip: Clip) -> Alias:
+    def of(cls, name: str, clip: Clip, *, category: str = DEFAULT_CATEGORY) -> Alias:
         """クリップから作る 置いた場所の事情（位置・リンク・グループ・字幕の出どころ）は外す
 
         字幕の出どころ（:attr:`Clip.subtitle_origin`）は、字幕から焼き込んだテキストが
@@ -99,6 +106,7 @@ class Alias:
             clip=replace(
                 clip, timeline_start=0, link_group=None, group_id=None, subtitle_origin=None
             ),
+            category=category,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,6 +115,8 @@ class Alias:
             "version": FORMAT_VERSION,
             "clip_version": CLIP_FORMAT_VERSION,
             "name": self.name,
+            # 項目を足しただけなので版は上げない 前の版の本体は読み飛ばして置ける
+            "category": self.category,
             "clip": clip_to_json(self.clip),
         }
 
@@ -128,7 +138,11 @@ class Alias:
             raise ProjectFileError(f"エイリアスのクリップが読めない: {exc}") from exc
         if alias_refusal(clip) is not None:
             raise ProjectFileError("素材やシーンを使うクリップはエイリアスとして読まない")
-        return cls(name=str(data.get("name", "無題")), clip=clip)
+        category = data.get("category")
+        if not isinstance(category, str) or not category.strip():
+            # 前の版が保存した物は分類を持たない 既定の分類にまとめる
+            category = DEFAULT_CATEGORY
+        return cls(name=str(data.get("name", "無題")), clip=clip, category=category)
 
     def instantiate(self, at_frame: int = 0) -> Clip:
         """置くためのクリップ クリップとエフェクトの ID を振り直す

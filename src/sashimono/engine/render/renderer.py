@@ -625,11 +625,11 @@ class FrameRenderer:
         """合成結果を直接画面へ出したいときの逃げ道 プレビューが使う"""
         return self._compositor
 
-    def compose(self, frame: int) -> None:
+    def compose(self, frame: int, *, underlay: bool = True) -> None:
         """``frame`` を合成する 結果は CPU へ戻さず GPU 上に残る
 
         画面に出すだけなら往復が要らない :meth:`render` はこれを呼んでから
-        読み出しているだけ
+        読み出しているだけ ``underlay`` が偽なら最後の黒を敷かず、透けたまま残す
         """
         if self._closed:
             raise RuntimeError("閉じたレンダラは使えない")
@@ -648,7 +648,8 @@ class FrameRenderer:
         # 使われなかった先読みを必ず回収する 置き去りにすると、次のフレームで
         # 同じデコーダへ頼んだときに前の走りと重なり、例外も誰も受け取らない
         self._drain_decodes()
-        self._compositor.underlay((0.0, 0.0, 0.0, 1.0))
+        if underlay:
+            self._compositor.underlay((0.0, 0.0, 0.0, 1.0))
 
     def _compose_timeline(self, timeline: Timeline, frame: int, *, depth: int) -> None:
         """1 本のタイムラインを、いまの合成先へ重ねる シーンの入れ子でも同じ道を通る
@@ -1067,15 +1068,18 @@ class FrameRenderer:
         done.draw_handle(result.color, full, flip=False)
         return done
 
-    def render(self, frame: int) -> np.ndarray:
+    def render(self, frame: int, *, transparent: bool = False) -> np.ndarray:
         """``frame`` の合成結果を sRGB の ``(高さ, 幅, 4)`` uint8 で返す
 
         映像トラックを下から順に重ねる タイムラインの下のトラックが奥、
         上のトラックが手前という Premiere / AviUtl と同じ並び
+
+        ``transparent`` なら黒を敷かず、ストレートアルファで返す プリセットの見本の絵（#277）は
+        地を表示の側で選べる（暗い地・明るい地・市松）ので、黒を焼き込むと白以外の地で見られない
         """
         with self._context:
-            self.compose(frame)
-            return self._compositor.read()
+            self.compose(frame, underlay=not transparent)
+            return self._compositor.read(straight=transparent)
 
     def close(self) -> None:
         if self._closed:

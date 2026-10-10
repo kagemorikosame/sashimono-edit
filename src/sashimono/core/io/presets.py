@@ -40,6 +40,7 @@ __all__ = [
     "LEGACY_FORMAT_NAMES",
     "LEGACY_SUFFIXES",
     "SUFFIX",
+    "TRASH_FOLDER",
     "Preset",
     "PresetStore",
     "default_preset_root",
@@ -56,6 +57,11 @@ SUFFIX = ".smep"
 LEGACY_FORMAT_NAMES = ("kumiki-preset", "novaedit-preset")
 LEGACY_SUFFIXES = (".kmkp", ".nvpreset")
 # 旧名を残す: ここまで
+
+#: 置き場の中のごみ箱 管理の画面（#276）で消した物をここへ移し、戻せるようにする
+#: 置き場の中に置くのは、置き場を別の所へ移したり試験で差し替えたりしても、ごみ箱が
+#: 一緒に付いて行くため 点で始まる名前は分類の名前に使えない（:func:`_safe_name` が外す）
+TRASH_FOLDER = ".trash"
 
 #: ファイル名に使えない文字 Windows の制限に合わせる
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -240,7 +246,11 @@ class PresetStore:
     root: Path = field(default_factory=default_preset_root)
 
     def path_for(self, preset: Preset) -> Path:
-        return self.root / preset.category / f"{_safe_name(preset.name)}{SUFFIX}"
+        # 分類もファイル名と同じ決まりで整える 管理の画面（#276）から打った分類に ``..`` や
+        # ``/`` が入ると、置き場の外やごみ箱（:data:`TRASH_FOLDER`）へ書いてしまう
+        # 前からある ``ユーザー`` は整えても変わらない
+        folder = _safe_name(preset.category)
+        return self.root / folder / f"{_safe_name(preset.name)}{SUFFIX}"
 
     def exists(self, preset: Preset) -> bool:
         """同じ分類に同じ名前（同じファイル）のプリセットがもうあるか 旧い拡張子の物も見る
@@ -271,6 +281,10 @@ class PresetStore:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except OSError as exc:
             raise ProjectFileError(f"プリセットを開けない: {path}") from exc
+        except UnicodeDecodeError as exc:
+            # JSONDecodeError とは別の ValueError 変えないと、管理の画面の読み込み（#276）で
+            # 違うファイルを選んだときに、知らせではなく落ちる
+            raise ProjectFileError(f"プリセットが UTF-8 として読めない: {path}") from exc
         except json.JSONDecodeError as exc:
             raise ProjectFileError(f"プリセットが JSON として読めない: {path} ({exc})") from exc
         return Preset.from_dict(data)
@@ -281,9 +295,7 @@ class PresetStore:
         壊れた 1 つで一覧全体が出なくなると、他のプリセットまで使えなくなる
         """
         found: list[Preset] = []
-        if not self.root.exists():
-            return ()
-        for path in self._files():
+        for path in self.files():
             try:
                 found.append(self.load(path))
             except ProjectFileError:
@@ -296,21 +308,27 @@ class PresetStore:
         for path in (current, *(current.with_suffix(suffix) for suffix in LEGACY_SUFFIXES)):
             path.unlink(missing_ok=True)
 
-    def _files(self) -> list[Path]:
-        """一覧に出すファイル 旧い拡張子のものも拾う
+    def files(self) -> list[Path]:
+        """一覧に出すファイル 旧い拡張子のものも拾う 管理の画面（#276）も同じ物を並べる
 
         同じ名前が新旧両方にあるときは新しい方だけを出す 改名前のプリセットを
         上書き保存すると新しい拡張子で書かれ、旧いファイルは残る 両方出すと、
         同じ名前が 2 つ並び、選んだ方によって中身が違う
         """
-        current = set(self.root.rglob(f"*{SUFFIX}"))
+        if not self.root.is_dir():
+            return []
+        current = {path for path in self.root.rglob(f"*{SUFFIX}") if not self._trashed(path)}
         legacy = {
             path
             for suffix in LEGACY_SUFFIXES
             for path in self.root.rglob(f"*{suffix}")
-            if path.with_suffix(SUFFIX) not in current
+            if path.with_suffix(SUFFIX) not in current and not self._trashed(path)
         }
         return sorted(current | legacy)
+
+    def _trashed(self, path: Path) -> bool:
+        """ごみ箱（:data:`TRASH_FOLDER`）の中の物か 一覧に出すと、消したはずの物が戻って見える"""
+        return TRASH_FOLDER in path.relative_to(self.root).parts
 
 
 def _safe_name(name: str) -> str:

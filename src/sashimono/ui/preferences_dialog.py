@@ -36,7 +36,10 @@ from sashimono.engine.encode import (
     MEASURED_EXPORT_TOTAL_MS,
 )
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
+from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
+from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT
 from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
@@ -415,6 +418,45 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._preset_keep_effects)
 
+        # プリセットとエイリアスの一覧（#276 #277）の見せ方
+        gpu_ms, simple_ms = MEASURED_LOOK_MS
+        self._library_thumbnails = QComboBox(self)
+        self._library_thumbnails.addItem("エフェクトも描く（GPU 既定）", THUMBNAILS_FULL)
+        self._library_thumbnails.addItem("文字と図形だけ（軽い）", THUMBNAILS_SIMPLE)
+        self._library_thumbnails.addItem("出さない（名前だけ）", THUMBNAILS_OFF)
+        self._library_thumbnails.setCurrentIndex(
+            max(0, self._library_thumbnails.findData(preferences.library_thumbnails))
+        )
+        self._library_thumbnails.setToolTip(
+            "プリセットとエイリアスの一覧に出す見本の絵 どちらも別のスレッドで、"
+            "見えている物から描くので、一覧はすぐ開く "
+            f"1 枚描くのに GPU で {gpu_ms}ms、文字と図形だけで {simple_ms}ms（RTX 5060 Ti） "
+            "GPU の方は描き始めの 1 回だけ 0.4 秒ほど準備に掛かる "
+            "文字と図形だけにすると、縁取りやグローなどのエフェクトは見本に出ない "
+            "描いた絵は覚えておき、中身が変わったときだけ描き直す"
+        )
+        form.addRow("プリセットの見本", self._library_thumbnails)
+        self._library_backdrop = QComboBox(self)
+        self._library_backdrop.addItem("市松模様（既定）", BACKDROP_CHECKER)
+        self._library_backdrop.addItem("暗い地", BACKDROP_DARK)
+        self._library_backdrop.addItem("明るい地", BACKDROP_LIGHT)
+        self._library_backdrop.setCurrentIndex(
+            max(0, self._library_backdrop.findData(preferences.library_backdrop))
+        )
+        self._library_backdrop.setToolTip(
+            "見本の絵の下に敷く地 市松模様なら白い文字も黒い文字も見え、透けている所も分かる"
+        )
+        form.addRow("見本の地", self._library_backdrop)
+        self._library_confirm_delete = QCheckBox(
+            "プリセットやエイリアスを一覧から消すときに確かめる", self
+        )
+        self._library_confirm_delete.setChecked(preferences.library_confirm_delete)
+        self._library_confirm_delete.setToolTip(
+            "消した物はどちらでも一覧のごみ箱へ移り、〔元に戻す〕で戻せる "
+            "続けて何件も整理するときに確かめが煩わしければ切る"
+        )
+        form.addRow(self._library_confirm_delete)
+
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
         )
@@ -712,6 +754,9 @@ class PreferencesDialog(QDialog):
             preset_with_text=self._preset_with_text.isChecked(),
             preset_with_position=self._preset_with_position.isChecked(),
             preset_keep_effects=self._preset_keep_effects.isChecked(),
+            library_thumbnails=str(self._library_thumbnails.currentData()),
+            library_backdrop=str(self._library_backdrop.currentData()),
+            library_confirm_delete=self._library_confirm_delete.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

@@ -114,11 +114,18 @@ class OffscreenGLContext:
     プレビューウィジェットが作ったテクスチャを書き出し側から読む、といった用途向け
     """
 
-    def __init__(self, share: QOpenGLContext | None = None) -> None:
+    def __init__(self, share: QOpenGLContext | None = None, *, deferred: bool = False) -> None:
+        """``deferred`` なら、コンテキストはまだ作らない（サーフェスだけ作る）
+
+        コンテキストを作るのは重い（RTX 5060 Ti で 1 つ 280ms 最初の 1 つは 700ms）
+        使うスレッドへ移してから、そこで :meth:`complete` を呼ぶと、画面のスレッドを
+        その間止めずに済む サーフェスは画面のスレッドで作る決まりなので、ここで作る
+        """
         ensure_qt_application()
         fmt = preferred_surface_format()
 
         self._depth = 0
+        self._created = False
         self._surface = QOffscreenSurface()
         self._context = QOpenGLContext()
         try:
@@ -130,15 +137,26 @@ class OffscreenGLContext:
             self._context.setFormat(fmt)
             if share is not None:
                 self._context.setShareContext(share)
-            if not self._context.create():
-                raise GLContextError(
-                    f"OpenGL {REQUIRED_GL_VERSION[0]}.{REQUIRED_GL_VERSION[1]} "
-                    "のコンテキストを作れない GPU ドライバを確認すること"
-                )
-            self._require_usable_gl()
+            if not deferred:
+                self.complete()
         except BaseException:
             self._discard()
             raise
+
+    def complete(self) -> None:
+        """コンテキストを作って使えるかを確かめる ``deferred`` で作った物は、使うスレッドで呼ぶ
+
+        作れなければ :class:`GLContextError` 後片付けは呼んだ側が :meth:`release` で行う
+        """
+        if self._created:
+            return
+        if not self._context.create():
+            raise GLContextError(
+                f"OpenGL {REQUIRED_GL_VERSION[0]}.{REQUIRED_GL_VERSION[1]} "
+                "のコンテキストを作れない GPU ドライバを確認すること"
+            )
+        self._require_usable_gl()
+        self._created = True
 
     def _discard(self) -> None:
         """作りかけのコンテキストとサーフェスを、その場で壊す（#149）
