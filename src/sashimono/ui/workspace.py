@@ -321,6 +321,12 @@ class Preferences:
     #: 今までの値） 細かく見たい人は 8 まで下げ、短いクリップが数千本あって描くのが重い
     #: 機械では上げる 狭くすると読めない切れ端が並び、広くすると拡大しても中身が出ない
     detail_min_width: int = 24
+    #: ズームの途中で、初めて見る倍率の波形を作らず、近い倍率で作った波形を伸ばして仮に描く
+    #: ズームが止まってから作り直す 既定は切（今の見た目） 伸ばした波形は列の束ね方が違うので
+    #: 細かい山が少しずれて見える 境を越えた先の初めての倍率の 1 段で、波形を作る分（短い
+    #: クリップ 2000 本の手元の計測で 3〜6ms 遅い機械ではその数倍）を省ける ズームの
+    #: 引っかかりが気になる遅い機械の人は入れる
+    stretch_waves: bool = False
     #: 設定パネルで、行の名前（数はスライダーも）のダブルクリックで値を初期値へ戻す
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
@@ -487,6 +493,7 @@ class PreferenceStore:
             detail_min_width=_detail_min_width(
                 data.get("detail_min_width"), plain.detail_min_width
             ),
+            stretch_waves=_flag(data.get("stretch_waves"), plain.stretch_waves),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
             wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),

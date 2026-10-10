@@ -18,7 +18,7 @@ from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication
 
-from sashimono.core.model import Clip, MediaId, MediaItem, Project, Track, TrackKind
+from sashimono.core.model import Clip, ClipId, MediaId, MediaItem, Project, Track, TrackKind
 from sashimono.core.model.ids import new_media_id
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import PeakLevel, Waveform
@@ -371,14 +371,15 @@ class TestDetailWidthSetting:
         def record(
             painter: QPainter,
             band: TrackBand,
-            clip: Clip,
-            rect: QRect,
-            selected: bool,
-            editing: bool,
+            clips: list[tuple[Clip, QRect]],
+            selected: frozenset[ClipId],
+            editing: ClipId | None,
             table: dict[MediaId, MediaItem],
-        ) -> None:
-            detailed.append(clip)
-            original(painter, band, clip, rect, selected, editing, table)
+            *,
+            stretch: bool = False,
+        ) -> int:
+            detailed.extend(clip for clip, _ in clips)
+            return original(painter, band, clips, selected, editing, table, stretch=stretch)
 
         monkeypatch.setattr(scene.view, "_paint_detailed", record)
         scene.render()

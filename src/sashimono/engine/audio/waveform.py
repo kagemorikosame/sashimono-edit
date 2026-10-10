@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -126,6 +126,71 @@ class Waveform:
         out[filled, :, 0] = minima[filled]
         out[filled, :, 1] = maxima[filled]
         return out
+
+    def envelopes(self, segments: Sequence[tuple[int, int, int]]) -> np.ndarray:
+        """``(頭, 終わり, 列の数)`` の並びを、それぞれ :meth:`envelope` と同じく束ねて縦に繋げた物
+
+        形は ``(列の数の合計, チャンネル数, 2)`` 並びの順に置く 値は 1 本ずつ
+        :meth:`envelope` を呼んだときと同じ（最小・最大は束ね方で変わらない）
+
+        タイムラインは、拡大して初めて見る倍率で何百本ものクリップの波形を作り直す
+        1 本ずつ呼ぶと numpy を 20 回ほど呼ぶ所が本数分になり、200 本で 6ms ほど掛かった
+        （#260） 同じ段階を使う範囲をまとめれば、numpy を呼ぶ回数は段階の数で済む
+        """
+        sizes = [max(columns, 0) for _, _, columns in segments]
+        offsets = np.concatenate([[0], np.cumsum(sizes, dtype=np.int64)]).astype(np.int64)
+        out = np.zeros((int(offsets[-1]), self.channels, 2), dtype=np.float32)
+        groups: dict[int, list[int]] = {}
+        for number, (start, end, columns) in enumerate(segments):
+            if columns <= 0 or end <= start:
+                continue
+            # 段階は番号で分ける 段階どうしを == で比べると、中の配列を比べてしまう
+            level = self.level_for((end - start) / columns)
+            index = next(n for n, found in enumerate(self.levels) if found is level)
+            groups.setdefault(index, []).append(number)
+        for level_number, numbers in groups.items():
+            self._envelopes_on(self.levels[level_number], segments, numbers, offsets, out)
+        return out
+
+    def _envelopes_on(
+        self,
+        level: PeakLevel,
+        segments: Sequence[tuple[int, int, int]],
+        numbers: list[int],
+        offsets: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        """同じ段階 ``level`` を使う範囲をまとめて束ね、``out`` のそれぞれの所へ書く"""
+        # 列の区切りは 1 本ずつ envelope と同じ式（linspace）で求める まとめて作ると
+        # 浮動小数の丸めが変わり、区切りの 1 ピークがずれることがある
+        edges = [
+            start + np.linspace(0, end - start, columns + 1)
+            for start, end, columns in (segments[n] for n in numbers)
+        ]
+        spp = level.samples_per_peak
+        starts = np.concatenate([np.floor(e[:-1] / spp) for e in edges]).astype(np.int64)
+        stops = np.concatenate([np.ceil(e[1:] / spp) for e in edges]).astype(np.int64)
+        count = level.count
+        starts = np.clip(starts, 0, count)
+        stops = np.clip(np.maximum(stops, starts + 1), 0, count)
+        places = np.concatenate([np.arange(offsets[n], offsets[n + 1]) for n in numbers])
+        filled = starts < stops
+        if not filled.any():
+            return
+        first, last = starts[filled], stops[filled]
+        # reduceat は配列の外の番号を受けない 終わりが末尾（count）の列は 1 つ手前で止め、
+        # 末尾の 1 行を後から足す 頭が末尾の 1 行なら、reduceat はその行をそのまま返す
+        ends_at_tail = last >= count
+        bounds = np.stack([first, np.minimum(last, count - 1)], axis=1).ravel()
+        peaks = level.peaks
+        minima = np.minimum.reduceat(peaks[:, :, 0], bounds, axis=0)[0::2]
+        maxima = np.maximum.reduceat(peaks[:, :, 1], bounds, axis=0)[0::2]
+        if ends_at_tail.any():
+            minima[ends_at_tail] = np.minimum(minima[ends_at_tail], peaks[count - 1, :, 0])
+            maxima[ends_at_tail] = np.maximum(maxima[ends_at_tail], peaks[count - 1, :, 1])
+        target = places[filled]
+        out[target, :, 0] = minima
+        out[target, :, 1] = maxima
 
 
 def analyze_waveform(

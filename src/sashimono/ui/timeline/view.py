@@ -77,7 +77,8 @@ from sashimono.core.model import (
     new_group_id,
 )
 from sashimono.core.timebase import FrameRate
-from sashimono.engine.cache import MediaAnalyzer
+from sashimono.engine.audio import Waveform
+from sashimono.engine.cache import Filmstrip, MediaAnalyzer
 from sashimono.ui.media_pool import media_ids_in
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline.add_menu import AddSources, TimelineAddMenus
@@ -93,17 +94,19 @@ from sashimono.ui.timeline.drop import (
     spot_at,
 )
 from sashimono.ui.timeline.group_reach import draw_group_reach
-from sashimono.ui.timeline.keyframes import draw_keyframes, keyframe_at
+from sashimono.ui.timeline.keyframes import draw_keyframes, keyframe_at, keyframe_frames
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
 from sashimono.ui.timeline.painter import (
     ADD_TRACK_BUTTON_SPACE,
     ADD_TRACK_BUTTON_TEXT,
     DETAIL_MIN_WIDTH,
     ClipGlance,
+    DetailedClip,
     clip_content,
     clip_rect_for,
     clip_summary,
     clips_in_range,
+    draw_clips,
     draw_dense_clips,
     draw_playhead,
     draw_ruler,
@@ -116,7 +119,6 @@ from sashimono.ui.timeline.painter import (
     track_name_rect,
     waveform_level,
 )
-from sashimono.ui.timeline.painter import draw_clip as paint_clip
 from sashimono.ui.timeline.snap import DEFAULT_SNAP_DISTANCE, nearest_snap, snap_targets
 from sashimono.ui.timeline.track_drag import TrackDragger
 from sashimono.ui.timeline.track_name import TrackNameEditor
@@ -129,6 +131,11 @@ __all__ = ["TimelineArea", "TimelineView"]
 
 #: ホイール 1 段で拡大する倍率
 ZOOM_STEP = 1.25
+
+#: 倍率がこの間（ミリ秒）変わらなければズームが止まったと見て、伸ばして仮に描いた波形を
+#: 作り直す（:attr:`Preferences.stretch_waves`） ホイールを続けて回す間隔（数十 ms）より長く、
+#: 止めてから正しい波形になるまでを待たされたと感じない長さ
+WAVE_SETTLE_MS = 200
 
 #: 全トラックの高さを 1 段で変える量（画素） 細かいと何度も回すことになり、
 #: 粗いと最小（28）から最大（240）までが数段で終わって合わせにくい
@@ -339,6 +346,16 @@ class TimelineView(QWidget):
         #: 細い帯の目安の控え クリップ ID →（クリップ, 素材, 音量, フレームレート, 目安）
         #: （:meth:`_glance`）
         self._glance_cache: dict[ClipId, tuple[Clip, MediaItem, float, FrameRate, ClipGlance]] = {}
+        #: ズーム中は波形を伸ばして仮に描くか（:meth:`set_stretch_waves`）
+        self._stretch_waves = False
+        #: 倍率が変わってから :data:`WAVE_SETTLE_MS` の間動いている 止まったら描き直す
+        self._wave_settle = QTimer(self)
+        self._wave_settle.setSingleShot(True)
+        self._wave_settle.setInterval(WAVE_SETTLE_MS)
+        self._wave_settle.timeout.connect(self._settle_waves)
+        #: 前に描いたときの倍率と、そのとき伸ばして仮に描いた波形の本数
+        self._painted_scale: float | None = None
+        self._stretched = 0
 
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
@@ -404,6 +421,26 @@ class TimelineView(QWidget):
         self._detail_min_width = min(max(width, low), high)
         self._value_lines.detail_min_width = self._detail_min_width
         self.update()
+
+    @property
+    def stretch_waves(self) -> bool:
+        return self._stretch_waves
+
+    def set_stretch_waves(self, stretch: bool) -> None:
+        """ズーム中は初めて見る倍率の波形を作らず、近い倍率の波形を伸ばして仮に描くか
+
+        設定（:attr:`Preferences.stretch_waves`）から渡される 伸ばしたときは、倍率が
+        :data:`WAVE_SETTLE_MS` の間変わらなければ描き直して正しい波形にする
+        """
+        self._stretch_waves = stretch
+        if not stretch:
+            self._wave_settle.stop()
+        self.update()
+
+    def _settle_waves(self) -> None:
+        """ズームが止まった 伸ばして仮に描いた波形があれば、作り直して描き直す"""
+        if self._stretched:
+            self.update()
 
     def forget_glances(self, media_ids: Iterable[MediaId]) -> None:
         """その素材のクリップの、細い帯の目安の控えを捨てる 解析ができ直したときに窓が呼ぶ
@@ -698,21 +735,30 @@ class TimelineView(QWidget):
         # 素材の引き表は描くたびに 1 度だけ作る クリップごとに素材の一覧をなめると、細い帯との
         # 境の辺りで拡大して 400 本を超えるクリップを描くとき、素材の多い作品ほど重くなる（#260）
         media = {item.id: item for item in self._project.media}
+        # 倍率が変わったらズームの途中と見る 止まるまでは波形を伸ばして仮に描く（設定で入れたとき）
+        if self._stretch_waves and self._painted_scale is not None and scale != self._painted_scale:
+            self._wave_settle.start()
+        self._painted_scale = scale
+        stretch = self._stretch_waves and self._wave_settle.isActive()
+        self._stretched = 0
         for band in self._layout.bands(timeline):
             if band.bottom <= Metrics.RULER_HEIGHT or band.top >= self.height():
                 continue
             # 名前が入らない幅のクリップは、まとめて色の帯にする 1 本ずつ描くと
             # 全体表示で数千本を描くことになり、60fps の予算に収まらない
             dense: list[Clip] = []
+            detailed: list[tuple[Clip, QRect]] = []
             for clip in clips_in_range(band.track, start_frame, end_frame):
                 if clip.duration * scale < self._detail_min_width:
                     dense.append(clip)
                     continue
                 rect = clip_rect_for(clip, band, self._layout, width)
                 if rect is not None:
-                    self._paint_detailed(
-                        painter, band, clip, rect, clip.id in selected, clip.id == editing, media
-                    )
+                    detailed.append((clip, rect))
+            if detailed:
+                self._stretched += self._paint_detailed(
+                    painter, band, detailed, selected, editing, media, stretch=stretch
+                )
             if not dense:
                 continue
             sound_only = (
@@ -890,45 +936,76 @@ class TimelineView(QWidget):
         self,
         painter: QPainter,
         band: TrackBand,
-        clip: Clip,
-        rect: QRect,
-        selected: bool,
-        editing: bool,
+        clips: list[tuple[Clip, QRect]],
+        selected: frozenset[ClipId],
+        editing: ClipId | None,
         table: dict[MediaId, MediaItem],
-    ) -> None:
-        media = table.get(clip.media_id) if clip.media_id is not None else None
-        scene = self._project.find_scene(clip.scene_id) if clip.scene_id is not None else None
-        paint_clip(
-            painter,
-            clip,
-            band,
-            self._layout,
-            self._project.rate,
-            media=media,
-            filmstrip=self._analyzer.filmstrip(media) if media is not None else None,
-            # 鳴らす音の波形を出す 素材だけで引くと、音声が何本もある動画を音ごとに分けて
-            # 置いたとき、どのレイヤーにも 1 本目の波形が出る
-            waveform=self._analyzer.waveform(media, heard_stream(band.track, clip))
-            if media is not None
-            else None,
-            selected=selected,
-            clip_rect=rect,
-            scene_name=scene.name
-            if scene is not None
-            else ("（消えたシーン）" if clip.scene_id else None),
-            editing=editing,
+        *,
+        stretch: bool = False,
+    ) -> int:
+        """名前まで描くクリップを、トラック 1 本分まとめて描く 伸ばして仮に描いた波形の本数を返す
+
+        ``stretch`` が真なら、初めて見る倍率の波形を作らず伸ばして仮に描く（:func:`draw_clips`）
+
+        中身・ひし形・値の線の順に、それぞれをまとめて描く どれもクリップの矩形の中だけを
+        塗り、トラックの中のクリップは重ならないので、1 本ずつ順に描いたときと同じ絵になる
+        1 本ずつ描くと、境を越えて拡大したときの 400 本で状態の保存と戻しや求め直しが
+        本数分になり、1 回の描画が 60fps の予算を超えた（#260）
+        """
+        track = band.track
+        entries: list[DetailedClip] = []
+        # 解析は素材と音声の番号ごとに 1 度だけ引く 同じ素材のクリップが並ぶことが多い
+        found: dict[tuple[MediaId, int | None], tuple[Filmstrip | None, Waveform | None]] = {}
+        scenes: dict[SceneId, str] | None = None
+        for clip, rect in clips:
+            media = table.get(clip.media_id) if clip.media_id is not None else None
+            strip: Filmstrip | None = None
+            wave: Waveform | None = None
+            if media is not None:
+                # 鳴らす音の波形を出す 素材だけで引くと、音声が何本もある動画を音ごとに分けて
+                # 置いたとき、どのレイヤーにも 1 本目の波形が出る
+                stream = heard_stream(track, clip)
+                pair = found.get((media.id, stream))
+                if pair is None:
+                    pair = (self._analyzer.filmstrip(media), self._analyzer.waveform(media, stream))
+                    found[(media.id, stream)] = pair
+                strip, wave = pair
+            scene_name: str | None = None
+            if clip.scene_id is not None:
+                if scenes is None:
+                    # find_scene と同じく、同じ番号が並べば先の物を使う
+                    scenes = {scene.id: scene.name for scene in reversed(self._project.scenes)}
+                scene_name = scenes.get(clip.scene_id)
+                if scene_name is None and clip.scene_id:
+                    scene_name = "（消えたシーン）"
+            entries.append(
+                (
+                    clip,
+                    rect,
+                    media,
+                    strip,
+                    wave,
+                    clip.id in selected,
+                    clip.id == editing,
+                    scene_name,
+                )
+            )
+        stretched = draw_clips(
+            painter, band, self._layout, self._project.rate, entries, stretch_waves=stretch
         )
-        draw_keyframes(painter, clip, self._layout, rect, selected=selected)
-        self._value_lines.paint(
+        for clip, rect in clips:
+            # ひし形の無いクリップ（ほとんど）は、描く所へ入らずに済ませる
+            if keyframe_frames(clip):
+                draw_keyframes(painter, clip, self._layout, rect, selected=clip.id in selected)
+        self._value_lines.paint_many(
             painter,
             self._project,
-            band.track,
-            clip,
+            track,
+            [(clip, rect, clip.id in selected) for clip, rect in clips],
             self._layout,
-            rect,
             band.height,
-            selected=selected,
         )
+        return stretched
 
     def _draw_drag_preview(self, painter: QPainter) -> None:
         """ドラッグ中の落下先を枠線で示す

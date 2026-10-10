@@ -439,6 +439,7 @@ class MainWindow(QMainWindow):
         self._timeline = TimelineView(project, self._analyzer, self)
         self._timeline.set_value_lines(self._preferences.value_lines)
         self._timeline.set_detail_min_width(self._preferences.detail_min_width)
+        self._timeline.set_stretch_waves(self._preferences.stretch_waves)
         self._timeline.set_split_audio(self._preferences.splits_media)
         self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
@@ -895,6 +896,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_value_lines(preferences.value_lines)
         self._subtitles.wrap_share = preferences.subtitle_wrap_share
         self._timeline.set_detail_min_width(preferences.detail_min_width)
+        self._timeline.set_stretch_waves(preferences.stretch_waves)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)

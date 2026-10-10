@@ -24,24 +24,43 @@ from PySide6.QtCore import QPoint, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QApplication
 
-from sashimono.core.model import Clip, MediaId, MediaItem, Project, Track, TrackKind
+from sashimono.core.commands.fixed import VOLUME_EFFECT_KIND, fixed_effect
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    ClipId,
+    Effect,
+    GroupId,
+    Keyframe,
+    MediaId,
+    MediaItem,
+    Project,
+    Track,
+    TrackKind,
+    heard_stream,
+)
 from sashimono.core.model.ids import new_media_id
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.cache.thumbnails import Filmstrip
+from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.theme import THEME_DARK, THEME_LIGHT, Colors, Metrics, use_palette
 from sashimono.ui.timeline import TimelineView
 from sashimono.ui.timeline import painter as painter_module
-from sashimono.ui.timeline.layout import TimelineLayout
+from sashimono.ui.timeline.keyframes import draw_keyframes
+from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
 from sashimono.ui.timeline.painter import (
     DETAIL_MIN_WIDTH,
     _draw_clip_label,
     _draw_filmstrip,
     _draw_waveform,
     clear_waveform_images,
+    draw_clip,
     to_qimage,
 )
+from sashimono.ui.workspace import Preferences, PreferenceStore
 
 RATE = FrameRate(30)
 #: 1 本の長さ（フレーム） 30 フレームを境の手前と先の倍率で描く
@@ -226,14 +245,32 @@ class TestZoomingDoesNotRedoTheSameWork:
         self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 行き来するズームで同じ倍率へ戻ったら、波形の画像は 1 枚も作り直さない
-        built = _count(monkeypatch, painter_module, "waveform_image")
+        del monkeypatch
+        images = painter_module._WAVEFORM_IMAGES
+        before = images.built
         for scale in SCALES:
             scene.render(scale)
-        first = built[0]
-        assert first > 0
+        first = images.built
+        assert first > before
         for scale in reversed(SCALES):
             scene.render(scale)
-        assert built[0] == first
+        assert images.built == first
+
+    def test_new_waves_are_painted_together(
+        self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 1 本ずつ束ねて塗ると、初めて見る倍率の 1 段で numpy を本数分呼び、200 本で 6ms
+        # ほど掛かった 同じ解析・同じ高さの波形は、1 回の描画で 1 度にまとめて塗る
+        painted = _count(monkeypatch, painter_module, "waveform_image")
+        bundled = _count(monkeypatch, Waveform, "envelopes")
+        single = _count(monkeypatch, Waveform, "envelope")
+        before = painter_module._WAVEFORM_IMAGES.built
+        scene.render(SCALES[-1])
+        made = painter_module._WAVEFORM_IMAGES.built - before
+        assert made > 3
+        assert painted[0] == 1
+        assert bundled[0] == 1
+        assert single[0] == 0
 
 
 def _old_label(painter: QPainter, rect: QRect, name: str, *, editing: bool) -> None:
@@ -367,3 +404,239 @@ class TestTheLookStaysTheSame:
         )
         assert lit(quiet) < lit(loud) / 2
         assert again == loud
+
+
+def _old_paint_detailed(
+    view: TimelineView,
+    painter: QPainter,
+    band: TrackBand,
+    clips: list[tuple[Clip, QRect]],
+    selected: frozenset[ClipId],
+    editing: ClipId | None,
+    table: dict[MediaId, MediaItem],
+    *,
+    stretch: bool = False,
+) -> int:
+    """直す前の描き方（1 本ずつ draw_clip・ひし形・値の線） まとめて描く物と画素まで比べる相手"""
+    del stretch
+    project = view.project
+    for clip, rect in clips:
+        media = table.get(clip.media_id) if clip.media_id is not None else None
+        scene = project.find_scene(clip.scene_id) if clip.scene_id is not None else None
+        draw_clip(
+            painter,
+            clip,
+            band,
+            view._layout,
+            project.rate,
+            media=media,
+            filmstrip=view._analyzer.filmstrip(media) if media is not None else None,
+            waveform=view._analyzer.waveform(media, heard_stream(band.track, clip))
+            if media is not None
+            else None,
+            selected=clip.id in selected,
+            clip_rect=rect,
+            scene_name=scene.name if scene is not None else None,
+            editing=clip.id == editing,
+        )
+        draw_keyframes(painter, clip, view._layout, rect, selected=clip.id in selected)
+        view._value_lines.paint(
+            painter,
+            project,
+            band.track,
+            clip,
+            view._layout,
+            rect,
+            band.height,
+            selected=clip.id in selected,
+        )
+    return 0
+
+
+def _volume(percent: float) -> Effect:
+    volume = fixed_effect(VOLUME_EFFECT_KIND)
+    return replace(volume, params={**volume.params, "volume": AnimatedValue(percent)})
+
+
+class _Mixed:
+    """色々なクリップを並べた 3 本のトラック（映像・音声・レイヤー）
+
+    無効・グループ・速さ・不透明度の違い・キーフレーム・素材の無いクリップ・音量の違い・
+    隙間・絵と音の両方を描くレイヤーを混ぜる まとめて描く所が 1 つでも順や色を
+    取り違えれば、1 本ずつ描いた物と画素が変わる
+    """
+
+    def __init__(self, video: MediaItem, audio: MediaItem) -> None:
+        base = Project.create(media=(video, audio))
+        fade = AnimatedValue(1.0, (Keyframe(0, 0.2), Keyframe(20, 1.0)))
+        pictures = []
+        sounds = []
+        layers = []
+        for n in range(30):
+            # 9 本ごとに半分の長さの隙間を空ける（隙間の前後はまとめて描かない）
+            start = n * LENGTH + (n // 9) * (LENGTH // 2)
+            clip = Clip(
+                timeline_start=start,
+                duration=LENGTH,
+                media_id=video.id,
+                stream_index=0,
+                source_in=Fraction(n % 5, 10),
+                enabled=n % 7 != 3,
+                group_id=GroupId(f"{n:06x}") if n % 6 == 1 else None,
+                speed=Fraction(2) if n % 8 == 2 else Fraction(1),
+                opacity=fade if n % 10 == 4 else AnimatedValue(0.4 + (n % 3) * 0.3),
+            )
+            if n % 11 == 5:
+                clip = Clip(timeline_start=start, duration=LENGTH, source=TEXT.create())
+            pictures.append(clip)
+            sounds.append(
+                Clip(
+                    timeline_start=start,
+                    duration=LENGTH,
+                    media_id=audio.id,
+                    stream_index=0,
+                    source_in=Fraction(n % 4, 10),
+                    effects=(_volume(40.0 + (n % 4) * 37.5),),
+                )
+            )
+            layers.append(
+                Clip(
+                    timeline_start=start,
+                    duration=LENGTH,
+                    media_id=video.id,
+                    stream_index=0,
+                    audio_stream=video.audio_streams[0].index,
+                    source_in=Fraction(n % 3, 10),
+                )
+            )
+        tracks = (
+            Track(TrackKind.VIDEO, "V1", tuple(pictures)),
+            replace(Track(TrackKind.AUDIO, "A1", tuple(sounds)), volume_db=-6.0),
+            Track(TrackKind.MIXED, "L1", tuple(layers)),
+        )
+        self.project = base.with_timeline(replace(base.timeline, tracks=tracks))
+        self.analyzer = _Analyzer(
+            {video.id: _filmstrip()}, {video.id: _waveform(), audio.id: _waveform()}
+        )
+        self.view = TimelineView(self.project, self.analyzer)
+        self.view.resize(1200, 300)
+        chosen = [clip.id for track in tracks for clip in track.clips][::5]
+        self.view._selection = tuple(chosen)
+
+    def render(self, scale: float) -> QImage:
+        self.view._layout = TimelineLayout(pixels_per_frame=scale, scroll_frame=17.0)
+        image = QImage(self.view.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(0)
+        painter = QPainter(image)
+        self.view.render(painter, QPoint())
+        painter.end()
+        return image
+
+
+@pytest.fixture
+def mixed(
+    qt_application: QApplication, video_media: MediaItem, audio_media: MediaItem
+) -> Iterator[_Mixed]:
+    del qt_application
+    made = _Mixed(video_media, audio_media)
+    yield made
+    made.analyzer.close()
+
+
+class TestDrawingABandAtOnce:
+    @pytest.mark.parametrize("theme", [THEME_DARK, THEME_LIGHT])
+    def test_the_band_looks_like_drawing_one_by_one(
+        self, mixed: _Mixed, theme: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 段ごとにまとめて描くと、1 本の中の順（地・サムネイル・波形・名前・線・枠・ひし形・
+        # 値の線）や色・切り落とす範囲を 1 つでも取り違えれば、画素が変わる
+        use_palette(theme)
+        together = []
+        for scale in SCALES[1:]:
+            _forget()
+            together.append(mixed.render(scale))
+        view = mixed.view
+
+        def old(*args: Any, **kwargs: Any) -> int:
+            return _old_paint_detailed(view, *args, **kwargs)
+
+        monkeypatch.setattr(view, "_paint_detailed", old)
+        for scale, drawn in zip(SCALES[1:], together, strict=True):
+            _forget()
+            assert drawn == mixed.render(scale), scale
+
+    def test_flat_lines_of_neighbours_are_drawn_as_one(
+        self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 隣り合う同じ高さの線を 1 本ずつ引くと、400 本で線だけで数 ms 掛かる 平らな線は
+        # 続く所をまとめて引く（影と線で 2 回） 並んだクリップの線の高さはどれも同じ
+        lines = _count(monkeypatch, QPainter, "drawPolyline")
+        scene.render(SCALES[-1])
+        tracks = len(scene.project.timeline.tracks)
+        assert lines[0] == 2 * tracks
+
+
+class TestStretchingWavesWhileZooming:
+    def test_by_default_a_new_zoom_draws_the_exact_wave_at_once(self, mixed: _Mixed) -> None:
+        # 既定は今の見た目 伸ばして仮に描くと、細かい山がずれた波形が一瞬出る
+        assert Preferences().stretch_waves is False
+        assert mixed.view.stretch_waves is False
+        images = painter_module._WAVEFORM_IMAGES
+        mixed.render(SCALES[1])
+        before = images.built
+        mixed.render(SCALES[2])
+        assert images.built > before
+        assert mixed.view._stretched == 0
+        assert not mixed.view._wave_settle.isActive()
+
+    def test_while_zooming_a_nearby_wave_is_stretched_then_rebuilt(
+        self, mixed: _Mixed, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 入れると、ズームの途中では波形を作らず、止まってから正しい波形に描き直す
+        exact = mixed.render(SCALES[2])
+        _forget()
+        mixed.view.set_stretch_waves(True)
+        images = painter_module._WAVEFORM_IMAGES
+        mixed.render(SCALES[1])
+        before = images.built
+        rough = mixed.render(SCALES[2])
+        # 前の倍率で見えていなかったクリップ（近い倍率の絵が無い）だけは作る
+        assert mixed.view._stretched > 0
+        assert images.built - before < mixed.view._stretched
+        assert mixed.view._wave_settle.isActive()
+        assert rough != exact
+        # 止まった（倍率が変わらないまま時間が過ぎた）ら描き直しを頼み、作り直す
+        updates = _count(monkeypatch, mixed.view, "update")
+        mixed.view._wave_settle.stop()
+        mixed.view._settle_waves()
+        assert updates[0] == 1
+        settled = mixed.render(SCALES[2])
+        assert images.built > before
+        assert mixed.view._stretched == 0
+        assert settled == exact
+
+    def test_turning_it_off_stops_stretching(self, mixed: _Mixed) -> None:
+        # 切ったのに伸ばしたままだと、設定がある方が質が悪い
+        mixed.view.set_stretch_waves(True)
+        mixed.render(SCALES[1])
+        mixed.view.set_stretch_waves(False)
+        before = painter_module._WAVEFORM_IMAGES.built
+        mixed.render(SCALES[2])
+        assert mixed.view._stretched == 0
+        assert painter_module._WAVEFORM_IMAGES.built > before
+
+    def test_the_setting_is_saved_and_shown(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        # 設定の窓に出ていないと、好みが分かれるのに変える手段が無い 壊れた値は既定へ戻す
+        del qt_application
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(replace(Preferences(), stretch_waves=True))
+        assert store.load().stretch_waves is True
+        (tmp_path / "preferences.json").write_text('{"stretch_waves": "yes"}', encoding="utf-8")
+        assert store.load().stretch_waves is False
+        dialog = PreferencesDialog(replace(Preferences(), stretch_waves=True))
+        try:
+            assert dialog.preferences().stretch_waves is True
+        finally:
+            dialog.deleteLater()

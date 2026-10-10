@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QPainter, QPen, QPolygonF
 
-from sashimono.core.model import AnimatedValue, Clip, Effect
+from sashimono.core.model import AnimatedValue, Clip, ClipId, Effect
 from sashimono.ui.theme import Colors
 from sashimono.ui.timeline.layout import TimelineLayout
 
@@ -49,7 +49,27 @@ def keyframe_frames(clip: Clip) -> tuple[int, ...]:
     場面に掛けるものも）・テキストや図形の中身 1 か所でも数え漏らすと、その値だけ
     キーフレームを打っても印が出ない
     クリップの外（トリムで外れた所）のキーフレームは描く所が無いので外す
+
+    求めた位置はクリップごとに貯める 値を全部なめるので、境を越えて拡大したときの
+    400 本で毎回求めると 1ms を超える（#260） クリップは書き換えると別の物になるので、
+    同じ物（``is``）かで見れば足りる
     """
+    entry = _FRAMES.get(clip.id)
+    if entry is not None and entry[0] is clip:
+        return entry[1]
+    found = _collect_frames(clip)
+    if len(_FRAMES) >= _FRAMES_LIMIT:
+        _FRAMES.clear()
+    _FRAMES[clip.id] = (clip, found)
+    return found
+
+
+#: 貯めるクリップの数の上限 超えたら全部捨てて貯め直す
+_FRAMES_LIMIT = 8192
+_FRAMES: dict[ClipId, tuple[Clip, tuple[int, ...]]] = {}
+
+
+def _collect_frames(clip: Clip) -> tuple[int, ...]:
     values: list[object] = [clip.opacity]
     values.extend(_effect_values(clip.effects))
     values.extend(_effect_values(clip.after_effects))

@@ -379,6 +379,17 @@ class PreferencesDialog(QDialog):
             "下げると引いた表示でも中身を細かく見られ、上げると短いクリップが多いときに描くのが軽い"
         )
         form.addRow("中身を描くクリップの最小の幅", self._detail_min_width)
+        self._stretch_waves = QCheckBox(
+            "ズーム中は波形を伸ばして仮に描き、止まってから描き直す", self
+        )
+        self._stretch_waves.setChecked(preferences.stretch_waves)
+        self._stretch_waves.setToolTip(
+            "初めて見る倍率の波形を作らず、近い倍率で作った波形を伸ばして描く 止まってから"
+            "（0.2 秒）正しい波形に描き直す 伸ばした間は細かい山が少しずれて見える "
+            "短いクリップ 2000 本で細い帯との境を越えた先の初めての倍率の 1 段で、波形を作る "
+            "3〜6ms（遅い機械ではその数倍）を省ける"
+        )
+        form.addRow(self._stretch_waves)
 
         self._double_click_reset = QCheckBox("設定パネルの名前のダブルクリックで初期値に戻す", self)
         self._double_click_reset.setChecked(preferences.double_click_reset)
@@ -682,6 +693,7 @@ class PreferencesDialog(QDialog):
             keyframe_drag=str(self._keyframe_drag.currentData()),
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),
+            stretch_waves=self._stretch_waves.isChecked(),
             double_click_reset=self._double_click_reset.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
