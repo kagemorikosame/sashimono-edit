@@ -416,6 +416,33 @@ class Preferences:
     #: 折り返す幅（画面の幅の何 %） 既定 90 は左右に 5% ずつの余白で、縁取りと影が画面の
     #: 端に掛からない 端まで使いたい人は 100、狭くまとめたい人は下げる
     subtitle_wrap_percent: int = 90
+    #: 保存していない変更を一定の間隔で退避し、落ちた後の起動で復元を勧める（#271）
+    #: 既定は入（前からの動き） 切ると、落ちたときに最後に保存した所までしか戻らない
+    #: 書き込みを減らしたい人・自分でこまめに保存する人は切れる
+    autosave: bool = True
+    #: 退避の間隔（秒） 既定 30 は前からの値 落ちたときに失うのは最大でこの長さの作業
+    #: 短くするほど書き込みが増える（1 回は数百 KB の JSON）
+    autosave_seconds: int = 30
+    #: 上書き保存の前に、前の中身をバックアップとして残す（#271）
+    #: 既定は入（前からの動き） 切ると「さっきの保存で壊した」を戻せない
+    backup: bool = True
+    #: 1 つのプロジェクトについて残すバックアップの数 既定 20 は前からの値
+    #: 減らすと、次にそのプロジェクトを上書き保存したときに古い物から消える
+    #: （設定画面で消える数を見せて確かめる）
+    backup_generations: int = 20
+    #: 退避とバックアップの置き場 空は既定（``%LOCALAPPDATA%\Sashimono``）
+    #: 既定を空で持つのは、ユーザー名やドライブが変わった機械でも既定の置き場を指し続けるため
+    #: 書けない所を選んでいたら、その起動は既定の置き場へ戻して知らせる（黙って退避を止めない）
+    state_folder: str = ""
+    #: 復元を勧めたのに残っている落ちた作業の退避を、何日たったら片付けるか 0 は片付けない
+    #: 既定は 0（前からの動き） 片付けるのは起動して復元を尋ねた後だけで、まだ一度も
+    #: 勧めていない退避は古くても消さない
+    recovery_keep_days: int = 0
+    #: 退避とバックアップの置き場の容量の上限（MB） 0 は上限なし（既定 前からの動き）
+    #: 超えたら古い物から片付ける 世代数の上限とは別に効き、先に当たった方で消える
+    #: 開いている作業の今の退避・まだ勧めていない落ちた作業・各プロジェクトのいちばん
+    #: 新しいバックアップは、上限を超えていても消さない
+    state_limit_mb: int = 0
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -547,6 +574,21 @@ class PreferenceStore:
             subtitle_wrap_percent=_wrap_percent(
                 data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
             ),
+            autosave=_flag(data.get("autosave"), plain.autosave),
+            autosave_seconds=_within(
+                data.get("autosave_seconds"), AUTOSAVE_SECONDS_RANGE, plain.autosave_seconds
+            ),
+            backup=_flag(data.get("backup"), plain.backup),
+            backup_generations=_within(
+                data.get("backup_generations"), BACKUP_GENERATIONS_RANGE, plain.backup_generations
+            ),
+            state_folder=_folder(data.get("state_folder"), plain.state_folder),
+            recovery_keep_days=_within(
+                data.get("recovery_keep_days"), RECOVERY_KEEP_DAYS_RANGE, plain.recovery_keep_days
+            ),
+            state_limit_mb=_within(
+                data.get("state_limit_mb"), STATE_LIMIT_MB_RANGE, plain.state_limit_mb
+            ),
         )
 
     def save(self, preferences: Preferences) -> None:
@@ -666,3 +708,39 @@ def _divisor(value: object, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if value in (1, 2, 4) else default
+
+
+#: 退避の間隔として受け付ける範囲（秒） 10 秒より短いと、編集の手を止めるたびに書き込みが走る
+#: 10 分を超えると、落ちたときに失う作業が退避の無いのとほとんど変わらない
+AUTOSAVE_SECONDS_RANGE = (10, 600)
+
+#: バックアップの世代数として受け付ける範囲 0 は「作らない」と同じなので入り切りの側で持つ
+#: 200 を超えると 1 本数百 KB でもプロジェクトごとに数十 MB になり、置き場を食う
+BACKUP_GENERATIONS_RANGE = (1, 200)
+
+#: 残った退避を片付けるまでの日数として受け付ける範囲 0 は片付けない
+RECOVERY_KEEP_DAYS_RANGE = (0, 365)
+
+#: 置き場の容量の上限として受け付ける範囲（MB） 0 は上限なし 上は 1TB
+#: 小さくしても大事な物（今の退避と各プロジェクトのいちばん新しい控え）は消さないので、
+#: 下は 1MB まで許す
+STATE_LIMIT_MB_RANGE = (0, 1_000_000)
+
+
+def _within(value: object, bounds: tuple[int, int], default: int) -> int:
+    """範囲の中の整数 範囲の外や壊れた値は既定へ戻す（bool も整数として通さない）"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    return value if bounds[0] <= value <= bounds[1] else default
+
+
+def _folder(value: object, default: str) -> str:
+    """置き場のフォルダ 絶対の場所だけ通す
+
+    相対の場所は起動したときの作業フォルダで行き先が変わり、退避が毎回違う所へ散る
+    """
+    if not isinstance(value, str):
+        return default
+    if value == "":
+        return value
+    return value if Path(value).is_absolute() else default

@@ -7,7 +7,8 @@
 
 どちらもプロジェクトの隣ではなく ``%LOCALAPPDATA%\\Sashimono`` に置く 隣に置くと、
 プロジェクトを同期フォルダ（OneDrive など）に置いている人のところで、数十秒おきの
-退避がそのまま同期されて回線と相手のフォルダを埋める
+退避がそのまま同期されて回線と相手のフォルダを埋める 本人が設定で別の置き場を選べるが
+（``ui/backup_settings.py``）、ここは置き場を引数で受け取るだけで、選び方は知らない
 
 Qt を使わない 退避の判断はテストで直接確かめたいので、ここは素の Python で書く
 """
@@ -20,8 +21,9 @@ import os
 import re
 import shutil
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sashimono.core import userdirs
@@ -33,12 +35,26 @@ __all__ = [
     "BACKUP_GENERATIONS",
     "RecoveryEntry",
     "RecoverySession",
+    "TrimItem",
     "backup_before_save",
     "backup_folder",
+    "backups_over",
     "default_state_root",
     "discard",
+    "discard_items",
     "find_orphans",
+    "find_orphans_in",
+    "folder_problem",
+    "forget_empty_roots",
+    "mark_offered",
+    "plan_prune",
+    "plan_trim",
     "project_presence_dir",
+    "remember_root",
+    "remembered_roots",
+    "state_usage",
+    "tidy_orphans",
+    "trim_state",
 ]
 
 #: 1 つのプロジェクトについて残すバックアップの数
@@ -69,6 +85,9 @@ class RecoveryEntry:
     source: Path | None
     name: str
     saved_at: datetime
+    #: 起動したときに復元を 1 度でも勧めたか（:func:`mark_offered`） 勧めていない退避は、
+    #: 日数や容量で片付けない 本人が一度も見ていない作業を黙って消すことになる
+    offered: bool = False
 
 
 class RecoverySession:
@@ -114,11 +133,17 @@ class RecoverySession:
             path.unlink(missing_ok=True)
 
     def close(self) -> None:
-        """正常に終わる 退避も錠も残さない"""
-        self.clear()
-        if self._lock is not None:
-            self._lock.release()
-            self._lock = None
+        """正常に終わる 退避も錠も残さない
+
+        退避を消せなくても（置き場のドライブを抜いた など）錠は手放す 手放さないと、
+        この起動が終わるまで錠のファイルを開いたままになる
+        """
+        try:
+            self.clear()
+        finally:
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
 
     @staticmethod
     def _lock_path(folder: Path, session: str) -> Path:
@@ -156,6 +181,7 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
         project_path = _saved_project(folder, session)
         if project_path is None:
             meta_path.unlink(missing_ok=True)
+            _offered_path(folder, session).unlink(missing_ok=True)
             continue
         if meta_path.is_file():
             try:
@@ -174,20 +200,161 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
                 source=Path(source) if isinstance(source, str) else None,
                 name=str(meta.get("name") or "無題"),
                 saved_at=saved_at,
+                offered=_offered_path(folder, session).is_file(),
             )
         )
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
 
 
+def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
+    """いくつかの置き場の退避をまとめて 新しい順 同じ置き場を 2 度数えない
+
+    置き場を設定で変えた人のところでは、退避は選んだ置き場と既定の置き場の両方にありうる
+    選んだ置き場へ書けずに既定へ戻した起動が落ちると、退避は既定の側に残る
+    片方しか見ないと、その作業は復元を勧められずに埋もれる
+    """
+    seen: set[str] = set()
+    found: list[RecoveryEntry] = []
+    for root in roots:
+        key = os.path.normcase(str(Path(root).resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.extend(find_orphans(root))
+    return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+#: 退避を書いたことのある置き場を覚えるファイル（既定の置き場の中） 名前は 1 か所で持つ
+_PLACES = "places.json"
+
+#: 覚えておく置き場の数 置き場を何度も変える人でも、ファイルが際限なく伸びない
+_PLACES_KEPT = 20
+
+
+def remember_root(root: Path, registry: Path | None = None) -> None:
+    """退避を書く置き場を覚える 次の起動の復元はここに挙げた置き場もすべて探す
+
+    設定の置き場だけを探すと、置き場を A から B へ変えた後に A へ書いた退避（B へ書けずに
+    A へ戻した、別の窓が A のまま動いていた など）が、落ちた後に見つからない
+    覚えるのは既定の置き場の中 既定の置き場は設定で動かないので、どの設定でも同じ所を読める
+    """
+    places = remembered_roots(registry)
+    key = _root_key(root)
+    places = [Path(root), *(place for place in places if _root_key(place) != key)]
+    _write_places(places[:_PLACES_KEPT], registry)
+
+
+def remembered_roots(registry: Path | None = None) -> list[Path]:
+    """覚えている置き場 新しく使った順 読めなければ空（復元の検索を止めない）"""
+    path = (registry if registry is not None else default_state_root()) / _PLACES
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [Path(item) for item in data if isinstance(item, str) and Path(item).is_absolute()]
+
+
+def forget_empty_roots(keep: list[Path], registry: Path | None = None) -> None:
+    """覚えている置き場のうち、退避が 1 つも無い所を忘れる ``keep`` は残す
+
+    動いている窓の錠も退避の置き場にあるので、錠が残っている置き場は忘れない
+    （その窓が後で落ちたときに、探す所から外れないように）
+    """
+    kept = {_root_key(root) for root in keep}
+    places = remembered_roots(registry)
+    remaining = [
+        place for place in places if _root_key(place) in kept or _has_files(place / "recovery")
+    ]
+    if len(remaining) != len(places):
+        _write_places(remaining, registry)
+
+
+def _root_key(root: Path) -> str:
+    return os.path.normcase(str(Path(root).resolve()))
+
+
+def _has_files(folder: Path) -> bool:
+    try:
+        return any(path.is_file() for path in folder.iterdir())
+    except FileNotFoundError:
+        # フォルダが無い ドライブごと見えない（抜いた・回線が切れた）ときは忘れない
+        # 挿し直せば退避が戻ってくる ドライブはあるのにフォルダが無いなら、何も残っていない
+        return not Path(folder.anchor).exists()
+    except OSError:
+        # 読めないだけでは忘れない
+        return True
+
+
+def _write_places(places: list[Path], registry: Path | None) -> None:
+    base = registry if registry is not None else default_state_root()
+    base.mkdir(parents=True, exist_ok=True)
+    _write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
+
+
+def folder_problem(root: Path) -> str | None:
+    """退避とバックアップの置き場として書けるか 書けなければその理由 書ければ ``None``
+
+    フォルダがあるかどうかではなく、実際に 1 つ書いて消して確かめる 読み取り専用の
+    フォルダ・抜いたドライブ・切れたネットワークの置き場は、あるように見えても書けない
+    書けない所を選んだまま気付かないと、退避が黙って止まる
+    """
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / f".sashimono-write-test-{uuid.uuid4().hex}"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as exc:
+        return str(exc) or type(exc).__name__
+    return None
+
+
 def discard(entry: RecoveryEntry) -> None:
     """退避を捨てる 復元し終えたときと、要らないと言われたときに呼ぶ"""
+    for path in _session_files(entry):
+        path.unlink(missing_ok=True)
+
+
+def _session_files(entry: RecoveryEntry) -> tuple[Path, ...]:
+    """その退避に属するファイル 中身・メモ・錠・勧めた印"""
     folder = entry.path.parent
-    for path in (
+    return (
         entry.path,
         folder / f"{entry.session}.json",
         folder / f"{entry.session}.lock",
-    ):
-        path.unlink(missing_ok=True)
+        _offered_path(folder, entry.session),
+    )
+
+
+def _offered_path(folder: Path, session: str) -> Path:
+    return folder / f"{session}.offered"
+
+
+def mark_offered(entry: RecoveryEntry) -> None:
+    """起動したときに復元を勧めた印を付ける 日数と容量の片付けは、印の付いた退避だけを見る
+
+    メモ（``.json``）に書き足さず別のファイルにするのは、メモが無い退避（最初の退避の
+    途中で落ちた物）にも印を付けるため
+    """
+    _offered_path(entry.path.parent, entry.session).touch()
+
+
+def tidy_orphans(roots: list[Path], days: int, now: datetime | None = None) -> list[RecoveryEntry]:
+    """復元を勧めたのに残っている退避のうち、``days`` 日より前の物を片付ける 片付けた物を返す
+
+    ``days`` が 0 なら何もしない（既定 前からの動き） 勧めていない退避は古くても残す
+    長く起動しなかった人のところで、一度も見ていない落ちた作業が消えないように
+    """
+    if days <= 0:
+        return []
+    limit = (now if now is not None else datetime.now()) - timedelta(days=days)
+    tidied: list[RecoveryEntry] = []
+    for entry in find_orphans_in(roots):
+        if entry.offered and entry.saved_at <= limit:
+            discard(entry)
+            tidied.append(entry)
+    return tidied
 
 
 def _is_alive(folder: Path, session: str) -> bool:
@@ -245,12 +412,21 @@ def backup_folder(target: Path, root: Path | None = None) -> Path:
 
 
 def backup_before_save(
-    target: Path, root: Path | None = None, *, keep: int = BACKUP_GENERATIONS
+    target: Path,
+    root: Path | None = None,
+    *,
+    keep: int = BACKUP_GENERATIONS,
+    most: int | None = None,
 ) -> Path | None:
     """上書きする前の中身を控える ``target`` がまだ無ければ何もしない
 
     古いものから消して ``keep`` 本に保つ 名前に時刻を入れてあるので、並べれば
-    そのまま古い順になる
+    そのまま古い順になる 消すのは新しい控えを書き終えてから
+
+    ``most`` を渡すと、1 回で消すのはその本数まで 画面からの保存は 1 を渡す
+    世代の入れ替え（1 本作って 1 本消す）は決まりとして消してよいが、それより多く
+    消すのは、本人に見せて確かめた時（:func:`plan_prune`）だけにするため 置き場を
+    変えた先や別の窓の設定のせいで ``keep`` を超えていても、保存のたびに黙ってまとめて消さない
     """
     target = Path(target)
     if not target.is_file():
@@ -276,9 +452,198 @@ def backup_before_save(
 
     # 旧い拡張子の控えも世代に数える 数えないと、改名前の控えはいつまでも消えずに残り、
     # 20 本に保つ約束が崩れる 名前は時刻から始まるので、拡張子が混ざっても古い順に並ぶ
-    generations = sorted(
-        path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
-    )
-    for old in generations[: max(0, len(generations) - keep)]:
+    generations = _generations(folder)
+    doomed = generations[: max(0, len(generations) - keep)]
+    if most is not None:
+        doomed = doomed[:most]
+    for old in doomed:
         old.unlink(missing_ok=True)
     return copied
+
+
+def _generations(folder: Path) -> list[Path]:
+    """そのプロジェクトの控え 古い順"""
+    return sorted(
+        path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
+    )
+
+
+def _backup_folders(root: Path | None) -> list[Path]:
+    base = (root if root is not None else default_state_root()) / "backups"
+    try:
+        return [folder for folder in base.iterdir() if folder.is_dir()]
+    except OSError:
+        return []
+
+
+def _backup_label(folder: Path) -> str:
+    return f"バックアップ {folder.name.rsplit('-', 1)[0]}"
+
+
+def plan_prune(keep: int, root: Path | None = None) -> list[TrimItem]:
+    """世代数を ``keep`` に詰めるために消す控え（全部のプロジェクト） 古い順 消しはしない
+
+    確かめで見せた物をそのまま消す（:func:`discard_items`） 見せた数と消える数を一致させる
+    詰めた後の保存は、1 本作って 1 本消す入れ替えだけになる
+    """
+    items: list[TrimItem] = []
+    for folder in _backup_folders(root):
+        generations = _generations(folder)
+        label = _backup_label(folder)
+        items.extend(
+            TrimItem(label, (path,), _size(path), _backup_stamp(path))
+            for path in generations[: max(0, len(generations) - keep)]
+        )
+    return sorted(items, key=lambda item: item.stamp)
+
+
+def backups_over(keep: int, root: Path | None = None) -> int:
+    """世代数を ``keep`` に詰めると消える控えの数（全部のプロジェクトの合計 :func:`plan_prune`）"""
+    return len(plan_prune(keep, root))
+
+
+def discard_items(items: Iterable[TrimItem]) -> list[TrimItem]:
+    """確かめた物を消す 消せた物を返す 消せなかった物（置き場が書けない）は飛ばす
+
+    同じファイルが 2 つの一覧（世代数と容量）に入っていても 1 度だけ数える
+    """
+    done: list[TrimItem] = []
+    seen: set[str] = set()
+    for item in items:
+        keys = [_root_key(path) for path in item.paths]
+        if all(key in seen for key in keys):
+            continue
+        seen.update(keys)
+        try:
+            for path in item.paths:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        done.append(item)
+    return done
+
+
+# --- 容量の上限 -------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TrimItem:
+    """容量の上限で片付ける物 1 つ（バックアップ 1 本か、落ちた作業の退避 1 件）"""
+
+    #: 何が消えるのかを本人へ見せる名前
+    label: str
+    paths: tuple[Path, ...]
+    size: int
+    #: 古い順に並べる時刻
+    stamp: float
+
+
+def state_usage(root: Path | None = None) -> int:
+    """置き場の退避とバックアップが使っている大きさ（バイト）"""
+    base = root if root is not None else default_state_root()
+    return sum(_size(path) for name in ("recovery", "backups") for path in _files(base / name))
+
+
+def plan_trim(
+    limit: int, root: Path | None = None, *, already: Iterable[Path] = ()
+) -> list[TrimItem]:
+    """容量を ``limit`` バイトに収めるために片付ける物 古い順 収まっていれば空 消しはしない
+
+    ``already`` は同じ確かめで先に消すと決めた物（世代数で詰める控え） その分は使っている
+    大きさから引き、候補からも外す 引かないと、世代数で空く分を知らずに余計に挙げる
+
+    消さない物
+    - 動いている起動の退避（開いている作業の今の退避）
+    - 復元をまだ勧めていない落ちた作業の退避（本人が一度も見ていない）
+    - 各プロジェクトのいちばん新しいバックアップ（最後の保存の前の中身 これが無いと
+      「さっきの保存で壊した」を戻せない）
+
+    消さない物だけで上限を超えるときは、消せる物を全部挙げて止める 上限を守るために
+    大事な物まで消すと、上限を入れた意味が逆になる
+    """
+    base = root if root is not None else default_state_root()
+    gone = {_root_key(path) for path in already}
+    freed = sum(
+        _size(path)
+        for name in ("recovery", "backups")
+        for path in _files(base / name)
+        if _root_key(path) in gone
+    )
+    excess = state_usage(base) - freed - limit
+    if excess <= 0:
+        return []
+    candidates: list[TrimItem] = []
+    for folder in _backup_folders(base):
+        # いちばん新しい控えは数から外す 世代数で消える物を除いた後のいちばん新しい物
+        remaining = [path for path in _generations(folder) if _root_key(path) not in gone]
+        label = _backup_label(folder)
+        candidates.extend(
+            TrimItem(label, (path,), _size(path), _backup_stamp(path)) for path in remaining[:-1]
+        )
+    for entry in find_orphans(base):
+        if not entry.offered:
+            continue
+        files = tuple(path for path in _session_files(entry) if path.is_file())
+        candidates.append(
+            TrimItem(
+                f"落ちた作業 {entry.name}",
+                files,
+                sum(_size(path) for path in files),
+                entry.saved_at.timestamp(),
+            )
+        )
+    chosen: list[TrimItem] = []
+    for item in sorted(candidates, key=lambda item: item.stamp):
+        if excess <= 0:
+            break
+        chosen.append(item)
+        excess -= item.size
+    return chosen
+
+
+def trim_state(
+    limit: int, root: Path | None = None, *, allowed: Iterable[Path] | None = None
+) -> list[TrimItem]:
+    """容量を ``limit`` バイトに収めるよう古い物から片付ける 片付けた物を返す
+
+    何を消すかの決まりは :func:`plan_trim` ``allowed`` を渡すと、その中にある物だけを消す
+    本人に見せて確かめた一覧を渡す 確かめた後に置き場の中身が変わっても（退避を移した、
+    など）、確かめに出していない物は消さない
+    """
+    items = plan_trim(limit, root)
+    if allowed is not None:
+        approved = {_root_key(path) for path in allowed}
+        items = [item for item in items if all(_root_key(path) in approved for path in item.paths)]
+    for item in items:
+        for path in item.paths:
+            path.unlink(missing_ok=True)
+    return items
+
+
+def _files(folder: Path) -> list[Path]:
+    try:
+        return [path for path in folder.rglob("*") if path.is_file()]
+    except OSError:
+        return []
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _backup_stamp(path: Path) -> float:
+    """控えを作った時刻 名前の頭から読む
+
+    ファイルの更新時刻は使わない 控えは元の更新時刻を写す（``copystat``）ので、
+    「前に保存した時刻」になり、控えを作った順と食い違う
+    """
+    try:
+        return datetime.strptime(path.name[:22], "%Y%m%d-%H%M%S-%f").timestamp()
+    except ValueError:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0

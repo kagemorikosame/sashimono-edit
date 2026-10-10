@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
+from sashimono.core.io.recovery import TrimItem
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     MEASURED_ONE_LAYER_MS,
@@ -37,6 +38,7 @@ from sashimono.engine.encode import (
 )
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
@@ -622,6 +624,12 @@ class PreferencesDialog(QDialog):
         self._subtitle_wrap.toggled.connect(self._subtitle_wrap_percent.setEnabled)
         self._subtitle_wrap_percent.setEnabled(preferences.subtitle_wrap)
 
+        # 退避とバックアップの欄は塊ごと別のファイルに置く（決めたことも向こうの説明にある）
+        self._backups = BackupSection(preferences, self)
+        self._backups.add_rows(form)
+        #: OK で消してよいと確かめた物（容量の上限） 設定を当てる側はこの中だけを消す
+        self.approved_trim: list[TrimItem] = []
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -762,4 +770,22 @@ class PreferencesDialog(QDialog):
             scripts_move=str(self._scripts_move.currentData()),
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
+            autosave=self._backups.autosave.isChecked(),
+            autosave_seconds=self._backups.autosave_seconds.value(),
+            backup=self._backups.backup.isChecked(),
+            backup_generations=self._backups.backup_generations.value(),
+            state_folder=self._backups.state_folder.folder(),
+            recovery_keep_days=self._backups.recovery_keep_days.value(),
+            state_limit_mb=self._backups.state_limit_mb.value(),
         )
+
+    def accept(self) -> None:
+        """書けない置き場や、バックアップを消す減らし方は、閉じる前に確かめる
+
+        断られたら窓を開いたままにして、選び直せるようにする
+        """
+        approved: list[TrimItem] = []
+        if not confirm_backup_changes(self, self._backups.before, self.preferences(), approved):
+            return
+        self.approved_trim = approved
+        super().accept()
