@@ -119,6 +119,35 @@ def widgets_left_behind(qt_application: QApplication) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def theme_left_behind(qt_application: QApplication) -> Iterator[None]:
+    """試験が変えたまま終わったテーマ（色・スタイルシート・選び方）を、次の試験へ持ち越さない
+
+    色（``Colors``）とテーマの選び方はアプリ全体で 1 つ 窓に明るいテーマの設定を当てたまま
+    終わった試験（#271 のブランチの test_no_limit_trims_nothing）の後に、同じワーカーで
+    test_work_area_ui が走ると、帯の色を明るいテーマの目盛りの色と比べて落ちた（CI の
+    run 38041203074 ``assert 158 > 222``） 並列（xdist）でどの試験が同じワーカーに並ぶかで
+    落ちたり通ったりする 試験の前の形と違っていたら、前の形へ戻す
+    """
+    from sashimono.ui import theme
+
+    mode, current, sheet = theme._mode, theme.current_theme(), qt_application.styleSheet()
+    yield
+    if (theme._mode, theme.current_theme()) != (mode, current):
+        if sheet:
+            # 前もテーマを当てた形（スタイルシートあり） 同じ選び方で当て直す
+            theme.apply_theme(qt_application, mode)
+        else:
+            # 前はテーマを当てていない形 色だけを戻し、当てた物を外す
+            theme._mode = mode
+            theme.use_palette(current)
+            qt_application.styleHints().setColorScheme(Qt.ColorScheme.Unknown)
+    # スタイルシートだけを書き換えて終えた試験は、テーマの選び方も色も変わらない 選び方と
+    # 色だけを見ると、書き換えた見た目（縁や余白）が後の試験に残る 最後に元の物と比べて戻す
+    if qt_application.styleSheet() != sheet:
+        qt_application.setStyleSheet(sheet)
+
+
+@pytest.fixture(autouse=True)
 def released_modifier_keys(qt_application: QApplication) -> Iterator[None]:
     """試験が押したまま残した修飾キー（Shift など）を、次の試験へ持ち越さない
 

@@ -14,11 +14,18 @@ from collections.abc import Iterator
 from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QPainter, QPen, QPolygonF
 
-from sashimono.core.model import AnimatedValue, Clip, Effect
+from sashimono.core.model import AnimatedValue, Clip, ClipId, Effect
 from sashimono.ui.theme import Colors
 from sashimono.ui.timeline.layout import TimelineLayout
 
-__all__ = ["KEYFRAME_SIZE", "draw_keyframes", "keyframe_at", "keyframe_frames", "keyframe_marks"]
+__all__ = [
+    "KEYFRAME_SIZE",
+    "draw_keyframes",
+    "forget_keyframe_frames",
+    "keyframe_at",
+    "keyframe_frames",
+    "keyframe_marks",
+]
 
 #: ひし形の対角線の半分（画素）
 KEYFRAME_SIZE = 4
@@ -49,7 +56,33 @@ def keyframe_frames(clip: Clip) -> tuple[int, ...]:
     場面に掛けるものも）・テキストや図形の中身 1 か所でも数え漏らすと、その値だけ
     キーフレームを打っても印が出ない
     クリップの外（トリムで外れた所）のキーフレームは描く所が無いので外す
+
+    求めた位置はクリップごとに貯める 値を全部なめるので、境を越えて拡大したときの
+    400 本で毎回求めると 1ms を超える（#260） クリップは書き換えると別の物になるので、
+    同じ物（``is``）かで見れば足りる
     """
+    entry = _FRAMES.get(clip.id)
+    if entry is not None and entry[0] is clip:
+        return entry[1]
+    found = _collect_frames(clip)
+    if len(_FRAMES) >= _FRAMES_LIMIT:
+        _FRAMES.clear()
+    _FRAMES[clip.id] = (clip, found)
+    return found
+
+
+#: 貯めるクリップの数の上限 超えたら全部捨てて貯め直す
+_FRAMES_LIMIT = 8192
+_FRAMES: dict[ClipId, tuple[Clip, tuple[int, ...]]] = {}
+
+
+def forget_keyframe_frames() -> None:
+    """貯めたキーフレームの位置を捨てる 貯めた物はクリップを強く持つので、別のプロジェクトを
+    開いたときに捨てる（:meth:`TimelineView.forget_drawing`）"""
+    _FRAMES.clear()
+
+
+def _collect_frames(clip: Clip) -> tuple[int, ...]:
     values: list[object] = [clip.opacity]
     values.extend(_effect_values(clip.effects))
     values.extend(_effect_values(clip.after_effects))
