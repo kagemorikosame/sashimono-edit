@@ -870,7 +870,8 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
     staying = set(_KEPT_ON_RESTYLE)
     if keep_wrap:
         staying.add("wrap_width")
-    if "timer_format" not in given:
+    # 項目があっても空なら時間を出さないテンプレート（TEXT.create で作る物は空の書式を持つ）
+    if not str(given.get("timer_format", "") or ""):
         staying |= _TIMER_ON_RESTYLE
     current = clip.source.params
     params.update({name: current[name] for name in staying if name in current})

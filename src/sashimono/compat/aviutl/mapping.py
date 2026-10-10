@@ -1405,13 +1405,12 @@ def _note_unread_text(entry: ExoEntry, log: CompatibilityReport) -> None:
     """読んでいないテキストの項目のうち、0 以外の物を未対応として記録する
 
     表示速度はトラックバーなので動きが付きうる 始めの値だけ見ると、0 から動かす行を
-    見落とす
+    見落とす 生の値で見る 数として読めない値（``表示速度=速い`` など）を
+    「使っていない」と捨てると、知らない書き方の実物が数に上がらない
     """
     for label, keys in _UNREAD_TEXT:
-        motion = entry.motion(*keys)
-        if motion is None:
-            continue
-        if any(value != 0.0 for value in motion.values) or _varies(motion):
+        raw = entry.value(*keys)
+        if not _is_off(raw):
             log.note_missing(f"テキストの{label}")
 
 

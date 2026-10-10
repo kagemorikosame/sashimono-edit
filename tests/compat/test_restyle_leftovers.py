@@ -144,3 +144,20 @@ class TestTimer:
         params = _params(timer)
         assert params["timer_format"] == "mm\\:ss"
         assert params["timer_countdown"] is True
+
+    def test_an_empty_format_in_the_template_keeps_the_timer(self) -> None:
+        # 画面で作ったテキストは空の書式を持つ 項目の有無で決めると、そういうテンプレートを
+        # 着せただけでタイマーの時間が消える
+        timer = Clip(
+            timeline_start=0,
+            duration=90,
+            source=TEXT.create(text="", timer_format="mm\\:ss"),
+        )
+        plain = TEXT.create(text="字幕", font="Noto Sans JP")
+        assert plain.params["timer_format"] == ""
+        template = [MappedObject(clip=Clip(timeline_start=0, duration=30, source=plain), layer=1)]
+        commands = restyle(template, timer)
+        source = next(c for c in commands if isinstance(c, SetSource)).source
+        assert source is not None
+        assert source.params["timer_format"] == "mm\\:ss"
+        assert source.params["font"] == "Noto Sans JP"

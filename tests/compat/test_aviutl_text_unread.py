@@ -123,6 +123,14 @@ class TestAviUtl2:
         report = _missing(_aviutl2(表示速度="0.00,20.00,直線移動,0"))
         assert _unread(report) == {"テキストの表示速度": 1}
 
+    def test_a_value_that_is_not_a_number_is_recorded(self) -> None:
+        # 数として読めない値を「使っていない」と捨てると、知らない書き方の実物が数に上がらない
+        assert _unread(_missing(_aviutl2(表示速度="速い"))) == {"テキストの表示速度": 1}
+
+    def test_a_still_zero_with_a_method_records_nothing(self) -> None:
+        # 移動方法の名前が付いていても、値が動かなければ見た目は変わらない
+        assert _unread(_missing(_aviutl2(表示速度="0.00,0.00,直線移動,0"))) == {}
+
 
 class TestAviUtl1:
     def test_all_zero_records_nothing(self) -> None:
@@ -171,9 +179,10 @@ REAL = _real_files()
 
 @pytest.mark.skipif(not REAL, reason="このマシンに AviUtl の配布エイリアスが無い")
 class TestRealFiles:
-    def test_the_real_files_use_none_of_them(self) -> None:
-        # 2026-10-10 に数えると、手元の AviUtl2 の 36 本も AviUtl1 の配布物も全部 0 だった
-        # ここで記録が出たら、使っている実物が見つかったということ 数えて対応を決める（#284）
+    def test_the_real_files_are_read_and_counted_per_text(self) -> None:
+        # 実物の中身が 0 だとは決めつけない 0 以外の実物が来たら、記録に出るのが正しい
+        # 見るのは、落ちずに読めることと、1 つのテキストで 1 項目が 1 回より多く数えられないこと
+        # （2026-10-10 に数えた手元の 132 個は 5 つとも全部 0 だった 0 と 0 以外は上の見本で見る）
         report = CompatibilityReport()
         texts = 0
         for path in REAL:
@@ -181,5 +190,6 @@ class TestRealFiles:
                 if obj.entries and obj.entries[0].name == "テキスト":
                     texts += 1
                 map_object(obj, RATE, report=report)
-        assert texts > 0
-        assert _unread(report) == {}
+        if texts == 0:
+            pytest.skip("手元の実物にテキストが無い")
+        assert all(count <= texts for count in _unread(report).values())
