@@ -41,6 +41,10 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "PLAYHEAD_SNAP_ALWAYS",
+    "PLAYHEAD_SNAP_MODES",
+    "PLAYHEAD_SNAP_OFF",
+    "PLAYHEAD_SNAP_SHIFT",
     "SCRIPTS_MOVE_ASK",
     "SCRIPTS_MOVE_AUTO",
     "SCRIPTS_MOVE_MODES",
@@ -169,6 +173,13 @@ MEDIA_SPLIT_MODES = (MEDIA_SPLIT, MEDIA_TOGETHER)
 INSERT_ALL_TRACKS = "all"
 INSERT_TARGET_TRACKS = "target"
 INSERT_PASTE_MODES = (INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS)
+
+#: 目盛りで再生ヘッドを動かすときの吸い付き方 :attr:`Preferences.playhead_snap` の値
+#: Shift を押している間だけ吸い付く・常に吸い付いて Shift で外す・吸い付かない
+PLAYHEAD_SNAP_SHIFT = "shift"
+PLAYHEAD_SNAP_ALWAYS = "always"
+PLAYHEAD_SNAP_OFF = "off"
+PLAYHEAD_SNAP_MODES = (PLAYHEAD_SNAP_SHIFT, PLAYHEAD_SNAP_ALWAYS, PLAYHEAD_SNAP_OFF)
 
 #: exe の隣の ``scripts`` に自分で置いた物の扱い :attr:`Preferences.scripts_move` の値
 #: 自動で移す・移すかを尋ねる・何もしない
@@ -340,6 +351,18 @@ class Preferences:
     #: タイムラインの磁石とは別に切れる（利用者の要望） 既定は入 知らない人ほど中央へ
     #: 揃えにくい 1 画素ずつ自由に置きたい人は切る（Shift で一時的にも）
     preview_snap: bool = True
+    #: 目盛りで再生ヘッドを動かすときの吸い付き方（Issue #278） 距離は上の ``snap_distance``
+    #: 既定は Shift を押している間だけ吸い付く（Premiere Pro と同じ） 再生ヘッドは 1 コマずつ
+    #: 自由に動かすことの方が多く、常に吸い付くと知らない人はクリップの端の近くで合わせられない
+    #: クリップの磁石（Shift で外す）と向きを揃えたい人は「常に」、要らない人は切れる
+    playhead_snap: str = PLAYHEAD_SNAP_SHIFT
+    #: 再生ヘッドが吸い付く先 クリップの頭と終わり・キーフレームのコマ・書き出し範囲の端・
+    #: 目印（マーカー） 既定はクリップの磁石と同じ先で、目印は切 いまのタイムラインは目印を
+    #: 描かないので、見えない所で引っ掛かったように見える
+    playhead_snap_clips: bool = True
+    playhead_snap_keyframes: bool = True
+    playhead_snap_work_area: bool = True
+    playhead_snap_markers: bool = False
     #: 挿入貼り付け（Ctrl+Shift+V）で、再生ヘッドから後ろを押し出すトラック 全トラック
     #: （``all``）か、貼り先と、そこで押すクリップのリンクの相手・グループの仲間・焼き込んだ
     #: 字幕のトラックだけ（``target``）か 既定は全トラック（Premiere Pro の既定 全トラックの
@@ -493,6 +516,19 @@ class PreferenceStore:
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
             preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),
+            playhead_snap=_choice(
+                data.get("playhead_snap"), PLAYHEAD_SNAP_MODES, plain.playhead_snap
+            ),
+            playhead_snap_clips=_flag(data.get("playhead_snap_clips"), plain.playhead_snap_clips),
+            playhead_snap_keyframes=_flag(
+                data.get("playhead_snap_keyframes"), plain.playhead_snap_keyframes
+            ),
+            playhead_snap_work_area=_flag(
+                data.get("playhead_snap_work_area"), plain.playhead_snap_work_area
+            ),
+            playhead_snap_markers=_flag(
+                data.get("playhead_snap_markers"), plain.playhead_snap_markers
+            ),
             insert_paste=_choice(data.get("insert_paste"), INSERT_PASTE_MODES, plain.insert_paste),
             new_project_layers=_choice(
                 data.get("new_project_layers"), LayerMode.ALL, plain.new_project_layers
