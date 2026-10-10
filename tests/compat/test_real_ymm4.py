@@ -93,6 +93,28 @@ def test_the_outlines_survive(loaded: Loaded) -> None:
     assert bordered
 
 
+def test_stacked_outlines_become_layers(loaded: Loaded) -> None:
+    """2 つ重ねた縁取りは縁取りの層になり、外側の層ほど太い（#272）
+
+    実物（あおもや式のポップおこ・ポップグラデ 18 本）は、内側の縁取りの外へ 2 つ目を付ける
+    層の太さを字の輪郭からの和にしないと、外側の層が内側の層の下に隠れる
+    """
+    layered = [
+        item.clip.source
+        for _, objects in loaded
+        for item in objects
+        if item.clip.source is not None and item.clip.source.strokes
+    ]
+    if not layered:
+        pytest.skip("縁取りを 2 つ重ねたテンプレートが置かれていない")
+    for source in layered:
+        widths = [stroke.params["width"] for stroke in source.strokes]
+        assert all(isinstance(width, AnimatedValue) for width in widths)
+        statics = [width.static for width in widths if isinstance(width, AnimatedValue)]
+        assert statics == sorted(statics)
+        assert "border_width" not in source.params
+
+
 def test_the_animations_span_the_whole_item(loaded: Loaded) -> None:
     """動くパラメータが、2 フレームで終わっていないこと
 

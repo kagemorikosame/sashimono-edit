@@ -232,9 +232,9 @@ class TestUndoSteps:
 
 class TestOtherFields:
     def test_the_slider_keys_keep_focus(self, window: MainWindow) -> None:
-        # 縁取りの太さは 0 から動かすと縁取りの色の欄が出る（構成が変わる）
+        # 影の X は 0 から動かすと影の色の欄が出る（構成が変わる）
         # 作り直しても、矢印キーで続けて動かせる
-        editor = window._inspector._editors[("source", "border_width")]
+        editor = window._inspector._editors[("source", "shadow_x")]
         slider = editor.findChild(QSlider)
         assert slider is not None
         slider.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -246,13 +246,13 @@ class TestOtherFields:
             _flush()
         # 矢印キー 1 回で仕様の刻み（1 px）だけ動く 1000 倍した目盛りの 1 では表示の桁で
         # 0 へ丸められ、何度押しても動かなかった
-        value = _source(window, _clip_ids(window)[0], "border_width")
+        value = _source(window, _clip_ids(window)[0], "shadow_x")
         assert value == AnimatedValue(3.0)
-        # 構成が変わった（縁取りの色の欄が出た）うえで、同じ欄のスライダーへ戻っている
-        assert ("source", "border_color") in window._inspector._editors
+        # 構成が変わった（影の色の欄が出た）うえで、同じ欄のスライダーへ戻っている
+        assert ("source", "shadow_color") in window._inspector._editors
         focused = _focused(window)
         assert isinstance(focused, QSlider)
-        assert focused is window._inspector._editors[("source", "border_width")].findChild(QSlider)
+        assert focused is window._inspector._editors[("source", "shadow_x")].findChild(QSlider)
 
     def test_the_number_box_keeps_focus_after_enter(self, window: MainWindow) -> None:
         # 数値欄に打って Enter で確定したあとも、続けて打ち直せる
@@ -282,9 +282,9 @@ class TestOtherFields:
         try:
             QTest.mouseMove(slider, handle + QPoint(30, 0))
             assert slider.isSliderDown()
-            # 構成の変わる更新（縁取りの色が出る）を外から入れる
+            # 構成の変わる更新（影の色が出る）を外から入れる
             window.execute_all(
-                [SetParam(ParamPath.of_source(clip_id, "border_width"), AnimatedValue(4.0))],
+                [SetParam(ParamPath.of_source(clip_id, "shadow_x"), AnimatedValue(4.0))],
                 "外から",
             )
             _flush()
@@ -302,8 +302,8 @@ class TestOtherFields:
             _flush()
         size = _source(window, clip_id, "size")
         assert isinstance(size, AnimatedValue) and size.static != 64
-        # 離したら、待っていた作り直しを済ませる（縁取りの色の欄が出る）
-        assert ("source", "border_color") in window._inspector._editors
+        # 離したら、待っていた作り直しを済ませる（影の色の欄が出る）
+        assert ("source", "shadow_color") in window._inspector._editors
 
     def test_a_value_changed_while_pressing_shows_after_release(self, window: MainWindow) -> None:
         # 押している間に外（取り消し・AI）から同じ構成のまま値が変わったら、押している欄は

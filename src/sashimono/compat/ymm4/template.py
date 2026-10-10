@@ -56,7 +56,15 @@ from sashimono.compat.ymm4.values import (
     timespan,
     type_name,
 )
-from sashimono.core.model import AnimatedValue, Clip, Effect, GeneratedSource, ParamValue
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Effect,
+    GeneratedSource,
+    ParamValue,
+    Stroke,
+    legacy_in_use,
+)
 from sashimono.effects.definition import registry
 from sashimono.effects.sources import source_registry
 
@@ -630,7 +638,7 @@ def _group_effects(item: dict[str, Any], log: CompatibilityReport) -> list[Effec
     """
     length = max(1, int(number(item.get("Length"), 1.0)))
     keyframes = item.get("KeyFrames")
-    _, chain, final = _video_chain(item, log, length, keyframes)
+    _, chain, final, _ = _video_chain(item, log, length, keyframes)
     return [*chain, *final]
 
 
@@ -650,12 +658,13 @@ def _video_chain(
     keyframes: Any,
     *,
     text: bool = False,
-) -> tuple[dict[str, ParamValue], list[Effect], list[Effect]]:
+) -> tuple[dict[str, ParamValue], list[Effect], list[Effect], list[Stroke]]:
     """映像エフェクトの並びと、最後に当てる配置（反転と位置・拡大・回転）
 
     YMM4 はエフェクトを掛けた絵を最後に置く ただし描画を遅らせる印があれば、印の場所で
     印が指す分（位置・拡大・回転）だけを先に当て、残りを最後に当てる（試験で確かめた）
-    ``text`` が真なら、縁取りをテキストの設定（1 つ目の戻り値）へ分ける
+    ``text`` が真なら、縁取りをテキストの設定（1 つ目の戻り値）か、2 つ以上なら縁取りの層
+    （4 つ目の戻り値 #272）へ分ける
     """
     raw = item.get("VideoEffects")
     entries = raw if isinstance(raw, list) else []
@@ -673,7 +682,7 @@ def _video_chain(
     if lazy is None:
         video = map_video_effects(entries, log, length=length, keyframes=keyframes, text=text)
         final = _fixed([*flip, *_placement(item, length, keyframes, video.pivot)])
-        return video.params, list(video.effects), final
+        return video.params, list(video.effects), final, list(video.strokes)
 
     marker = entries[lazy]
     # テキストの設定へ縁取りを載せるかは、分ける前の列全体で決める 区間ごとに決めると、
@@ -698,7 +707,9 @@ def _video_chain(
     placed_early = _placement(early, length, keyframes, first.pivot)
     final = _fixed([*flip, *_placement(late, length, keyframes, rest.pivot or first.pivot)])
     params = {**first.params, **rest.params}
-    return params, [*first.effects, *placed_early, *rest.effects], final
+    # 両側に縁取りがあるときはテキストへ載せない（上の ``text``）ので、層はどちらか片側にしか無い
+    strokes = [*first.strokes, *rest.strokes]
+    return params, [*first.effects, *placed_early, *rest.effects], final, strokes
 
 
 def _fixed(final: list[Effect]) -> list[Effect]:
@@ -822,7 +833,7 @@ def _map_item(item: dict[str, Any], log: CompatibilityReport) -> MappedObject | 
             else:
                 source = _patterned_fill(source, fill, log, length, keyframes, effects)
     is_text = source is not None and source.kind == "text"
-    params, chain, final = _video_chain(item, log, length, keyframes, text=is_text)
+    params, chain, final, strokes = _video_chain(item, log, length, keyframes, text=is_text)
     if source is not None and is_text:
         decorations = map_decorations(
             item.get("Decorations"),
@@ -832,7 +843,12 @@ def _map_item(item: dict[str, Any], log: CompatibilityReport) -> MappedObject | 
             style_colour=item.get("StyleColor"),
         )
         merged = {**source.params, **decorations.params, **params}
-        source = GeneratedSource(kind="text", params=merged)
+        if strokes and legacy_in_use(merged):
+            # 文字装飾（Style）の縁と映像エフェクトの縁取りの層が両方ある 1 つの縁だけを載せて
+            # いた前と同じく映像エフェクトの側を描く（層を持つ字は前からの項目を読まない）
+            # 実物の 88 本には無い組み合わせなので、重なり方は確かめずに記録へ残す
+            log.note_missing("YMM4 の文字装飾の縁と、2 つ以上の縁取りエフェクトの組み合わせ")
+        source = GeneratedSource(kind="text", params=merged, strokes=tuple(strokes))
         effects.extend(decorations.effects)
     effects.extend(chain)
 

@@ -45,17 +45,22 @@ from PySide6.QtWidgets import (
 
 from sashimono.core.commands import (
     AddEffect,
+    AddStroke,
+    AdoptLegacyStroke,
     ClearKeyframes,
     Command,
     MoveEffect,
+    MoveStroke,
     ParamPath,
     ParamTarget,
     RemoveEffect,
     RemoveKeyframe,
+    RemoveStroke,
     SetClipProperty,
     SetEffectEnabled,
     SetKeyframe,
     SetParam,
+    SetStrokeEnabled,
 )
 from sashimono.core.commands.fixed import (
     FADE_EFFECT_KIND,
@@ -67,6 +72,9 @@ from sashimono.core.commands.fixed import (
 )
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.model import (
+    LEGACY_BORDER_COLOR,
+    LEGACY_BORDER_WIDTH,
+    MAX_STROKES,
     AnimatedValue,
     Clip,
     ClipId,
@@ -74,8 +82,12 @@ from sashimono.core.model import (
     EffectId,
     ParamValue,
     Project,
+    Stroke,
+    StrokeId,
     Track,
     draws_picture,
+    legacy_in_use,
+    legacy_stroke,
     plays_sound,
 )
 from sashimono.effects import (
@@ -91,6 +103,13 @@ from sashimono.effects import (
 )
 from sashimono.effects.blending import BLEND_MODES
 from sashimono.effects.sources import source_registry
+from sashimono.effects.strokes import (
+    STROKE,
+    STROKE_EFFECT_NOTE,
+    next_stroke,
+    stroke_effect_definitions,
+    takes_stroke_effect,
+)
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
@@ -149,6 +168,10 @@ def _same_effect(
 
 
 def _moved_path(path: ParamPath, primary: Clip, other: Clip) -> ParamPath | None:
+    if path.stroke_id is not None:
+        # 縁取りの層は主のクリップだけに当てる 層の数も並びもクリップごとに違い、何番目で
+        # 相手を探すと、違う太さの層の値まで同じにしてしまう
+        return None
     if path.target is ParamTarget.CLIP:
         return replace(path, clip_id=other.id)
     if path.target is ParamTarget.SOURCE:
@@ -175,6 +198,8 @@ def _for_clip(command: Command, primary: Clip, other: Clip) -> Command | None:
         path = _moved_path(command.path, primary, other)
         return None if path is None else replace(command, path=path)
     if isinstance(command, SetEffectEnabled):
+        if command.stroke_id is not None:
+            return None
         # 描画・音声の組の切り替えは選んだ全部へ 主だけ切り替わると、一緒に値を変えた
         # ほかのクリップと欄の効き方が食い違う
         twin = _same_effect(primary, other, command.effect_id, after=command.after)
@@ -222,6 +247,10 @@ class InspectorPanel(QWidget):
         #: 触ったときに :class:`AddEffect` で足してから値を入れる（1 回の取り消しで戻る）
         #: 開いただけで足すと、見ただけのクリップまで変更が入り、保存を促される
         self._virtual: dict[EffectId, tuple[ClipId, Effect]] = {}
+        #: 層を持たないテキストの縁を見せる仮の縁取りの層と、そのクリップ 触ったときに
+        #: :class:`AdoptLegacyStroke` で本物の層へ移してから値を入れる
+        #: （:attr:`_virtual` と同じ考え）
+        self._virtual_strokes: dict[StrokeId, ClipId] = {}
         #: ダブルクリックで初期値へ戻すか（設定 :attr:`Preferences.double_click_reset`）
         self._double_click_reset = True
         #: 今出している欄の構成の指紋（:meth:`_layout_key`） 同じなら作り直さずに値だけ
@@ -447,6 +476,24 @@ class InspectorPanel(QWidget):
             tuple((effect.id, effect.kind, effect.fixed) for effect in clip.effects),
             tuple((effect.id, effect.kind, effect.fixed) for effect in clip.after_effects),
             self._double_click_reset,
+            self._stroke_layout(clip),
+        )
+
+    @staticmethod
+    def _stroke_layout(clip: Clip) -> object:
+        """縁取りの層の組の構成 層の並びと、層ごとのエフェクトの並び
+
+        仮の層（層を持たない字の縁）は ID が作り直しのたびに変わるので、ID ではなく
+        「前からの縁がある」ことだけを入れる 入り切りは作り直さずに入れ直す（refresher）
+        """
+        source = clip.source
+        if source is None or source.kind != "text":
+            return None
+        if not source.strokes:
+            return ("legacy", legacy_in_use(source.params))
+        return tuple(
+            (stroke.id, tuple((effect.id, effect.kind) for effect in stroke.effects))
+            for stroke in source.strokes
         )
 
     def _refresh_values(self) -> None:
@@ -486,6 +533,7 @@ class InspectorPanel(QWidget):
         self._editors.clear()
         self._key_controls.clear()
         self._virtual.clear()
+        self._virtual_strokes.clear()
         self._focus_owners.clear()
         self._refreshers.clear()
         while self._body_layout.count():
@@ -589,6 +637,8 @@ class InspectorPanel(QWidget):
             section = self._build_source_section(clip)
             if section is not None:
                 self._body_layout.addWidget(section)
+            if clip.source.kind == "text":
+                self._build_strokes(clip)
         if picture and self._is_movie(clip):
             self._body_layout.addWidget(self._build_movie_group(clip, shown, sound=sound))
         elif sound:
@@ -1054,6 +1104,10 @@ class InspectorPanel(QWidget):
                 "（右と上が正）"
             )
         unused = definition.unused_names(clip.source.params)
+        if clip.source.kind == "text":
+            # 縁取りの太さと色は、縁取りの層の組（:meth:`_build_strokes`）で見せる 層を持たない字の
+            # 縁も仮の層として同じ所に出す 2 か所に出すと、どちらを動かせばよいか分からない
+            unused = unused | {LEGACY_BORDER_WIDTH, LEGACY_BORDER_COLOR}
         locked = definition.locked_reasons(clip.source.params)
         shown = _styles_under_fonts([s for s in definition.parameters if s.name not in unused])
         for index, spec in enumerate(shown):
@@ -1105,13 +1159,27 @@ class InspectorPanel(QWidget):
         section.add_row("対象レイヤー数", editor, reset=self._resetter(spec, path))
 
     def _build_effect_section(
-        self, clip: Clip, effect: Effect, index: int, *, after: bool = False
+        self,
+        clip: Clip,
+        effect: Effect,
+        index: int,
+        *,
+        after: bool = False,
+        stroke: Stroke | None = None,
+        stroke_number: int = 0,
     ) -> QWidget:
+        """足したエフェクトの組 ``stroke`` なら縁取りの層に掛けたエフェクト（#273）"""
         definition = registry.get(effect.kind)
         label = definition.label if definition is not None else f"{effect.kind}（未知）"
         if after:
             label = f"{label}（後の場面）"
-        stack = clip.after_effects if after else clip.effects
+        if stroke is not None:
+            label = f"{label}（縁取り {stroke_number}）"
+        if stroke is not None:
+            stack = stroke.effects
+        else:
+            stack = clip.after_effects if after else clip.effects
+        stroke_id = stroke.id if stroke is not None else None
         # 隣が固定の項目なら、その向きへは動かせない（命令がまたぐ動きを断る）
         section = _Section(
             label,
@@ -1121,12 +1189,17 @@ class InspectorPanel(QWidget):
             up_movable=index > 0 and not stack[index - 1].fixed,
             down_movable=index < len(stack) - 1 and not stack[index + 1].fixed,
             after=after,
+            stroke_id=stroke_id,
         )
         section.action_requested.connect(self._emit)
         section.pressed.connect(lambda: self.effect_focused.emit(str(effect.id)))
 
         def refresh(current: Clip) -> None:
-            mine = current.after_effects if after else current.effects
+            if stroke_id is not None:
+                held = current.source.find_stroke(stroke_id) if current.source else None
+                mine = held.effects if held is not None else ()
+            else:
+                mine = current.after_effects if after else current.effects
             found = next((e for e in mine if e.id == effect.id), None)
             if found is not None:
                 section.show_enabled(found.enabled)
@@ -1138,11 +1211,165 @@ class InspectorPanel(QWidget):
             # 書き換えると、対応する版で開いたときに壊れて見える
             section.add_note("このエフェクトの定義が見つかりません 設定は保持されます")
             return section
+        if stroke is not None and not takes_stroke_effect(effect.kind):
+            # 手で書いたファイルなどで、層に掛けられないエフェクトが入っている 描く所は
+            # 掛けずに飛ばすので、そのことを言う 黙っていると、値を動かしても絵が変わらない
+            section.add_note("このエフェクトは縁取りの層には掛かりません " + STROKE_EFFECT_NOTE)
 
         for spec in definition.parameters:
-            path = ParamPath.of_effect(clip.id, effect.id, spec.name, after=after)
+            if stroke_id is not None:
+                path = ParamPath.of_stroke_effect(clip.id, stroke_id, effect.id, spec.name)
+            else:
+                path = ParamPath.of_effect(clip.id, effect.id, spec.name, after=after)
             self._param_row(section, spec.label, spec, path, effect.params.get(spec.name))
         return section
+
+    # --- 縁取りの層（#272 #273） ---
+
+    def _shown_strokes(self, clip: Clip) -> list[Stroke]:
+        """設定パネルに出す縁取りの層 層を持たない字で前からの縁があれば、それを仮の層で見せる
+
+        仮の層は触ったときに初めて本物の層へ移す（:meth:`_send`） 開いただけで移すと、
+        見ただけのクリップまで変更が入り、保存を促される
+        """
+        source = clip.source
+        if source is None or source.kind != "text":
+            return []
+        if source.strokes or not legacy_in_use(source.params):
+            return list(source.strokes)
+        virtual = legacy_stroke(source.params)
+        self._virtual_strokes[virtual.id] = clip.id
+        return [virtual]
+
+    def _build_strokes(self, clip: Clip) -> None:
+        """縁取りの層の組と、層に掛けたエフェクトの組と、層を足すボタンを並べる"""
+        strokes = self._shown_strokes(clip)
+        for index, stroke in enumerate(strokes):
+            self._body_layout.addWidget(self._build_stroke_section(clip, stroke, index, strokes))
+            for position, effect in enumerate(stroke.effects):
+                self._body_layout.addWidget(
+                    self._build_effect_section(
+                        clip, effect, position, stroke=stroke, stroke_number=index + 1
+                    )
+                )
+        add = QPushButton("＋ 縁取りを追加", self._body)
+        add.setObjectName("add_stroke")
+        full = len(strokes) >= MAX_STROKES
+        add.setEnabled(not full)
+        add.setToolTip(
+            f"縁取りは {MAX_STROKES} つまでです"
+            if full
+            else "今の縁の外側に縁取りを足します 上の層ほど手前に描き、太さは字の輪郭から数えます"
+        )
+        add.clicked.connect(lambda: self._add_stroke(clip.id))
+        self._body_layout.addWidget(add)
+
+    def _add_stroke(self, clip_id: ClipId) -> None:
+        clip = self._clip()
+        if clip is None or clip.id != clip_id or clip.source is None:
+            return
+        self._emit(AddStroke(clip.id, next_stroke(clip.source)), "縁取りを追加")
+
+    def _build_stroke_section(
+        self, clip: Clip, stroke: Stroke, index: int, strokes: Sequence[Stroke]
+    ) -> QWidget:
+        """縁取りの層 1 つの組 見出しに入り切り・並べ替え・エフェクト・外すを並べる"""
+        section = _Section(f"縁取り {index + 1}")
+        section.setToolTip(
+            "上の層ほど手前に描きます 太さは字の輪郭から数えます"
+            " 外側の層は字の下に、中央と内側の層は字の上に描きます"
+        )
+        toggle = QToolButton()
+        toggle.setCheckable(True)
+        toggle.setAutoRaise(True)
+        toggle.setToolTip("この縁取りを描くかどうか 消さずに隠して見比べる")
+        _show_toggle(toggle, stroke.enabled)
+        toggle.toggled.connect(
+            lambda state: self._emit(SetStrokeEnabled(clip.id, stroke.id, bool(state)))
+        )
+        section.add_header_widget(toggle)
+        for text, target, enabled, tip in (
+            ("▲", index - 1, index > 0, "上へ（手前に描く）"),
+            ("▼", index + 1, index < len(strokes) - 1, "下へ（奥に描く）"),
+        ):
+            move = QToolButton()
+            move.setText(text)
+            move.setAutoRaise(True)
+            move.setToolTip(tip)
+            move.setEnabled(enabled)
+            move.clicked.connect(
+                lambda _=False, to=target: self._emit(MoveStroke(clip.id, stroke.id, to))
+            )
+            section.add_header_widget(move)
+        effects = QToolButton()
+        effects.setText("効果")
+        effects.setAutoRaise(True)
+        effects.setToolTip("この縁取りだけにエフェクトを掛ける（ぼかし・グロー・色など）")
+        effects.clicked.connect(lambda: self._show_stroke_effect_menu(clip.id, stroke.id, effects))
+        section.add_header_widget(effects)
+        remove = QToolButton()
+        remove.setText("✕")
+        remove.setAutoRaise(True)
+        remove.setToolTip("この縁取りを外す 掛けたエフェクトも一緒に外れる")
+        remove.clicked.connect(lambda: self._emit(RemoveStroke(clip.id, stroke.id)))
+        section.add_header_widget(remove)
+
+        def refresh(current: Clip) -> None:
+            held = current.source.find_stroke(stroke.id) if current.source else None
+            _show_toggle(toggle, held.enabled if held is not None else stroke.enabled)
+
+        self._refreshers.append(refresh)
+        for spec in STROKE.parameters:
+            path = ParamPath.of_stroke(clip.id, stroke.id, spec.name)
+            self._param_row(section, spec.label, spec, path, stroke.params.get(spec.name))
+        return section
+
+    def stroke_effect_menu(self, clip_id: ClipId, stroke_id: StrokeId) -> QMenu:
+        """縁取りの層に掛けられるエフェクトのメニュー 掛けられない物があることも書いておく"""
+        menu = QMenu(self)
+        submenus: dict[str, QMenu] = {}
+        for definition in stroke_effect_definitions():
+            submenu = submenus.get(definition.category)
+            if submenu is None:
+                submenu = menu.addMenu(definition.category)
+                submenus[definition.category] = submenu
+            action = submenu.addAction(definition.label)
+            action.setData((str(clip_id), str(stroke_id), definition.kind))
+        menu.addSeparator()
+        note = menu.addAction("時間で動く物や、下の絵・位置を使う物は掛けられません")
+        note.setEnabled(False)
+        note.setToolTip(STROKE_EFFECT_NOTE)
+        return menu
+
+    def _show_stroke_effect_menu(
+        self, clip_id: ClipId, stroke_id: StrokeId, anchor: QWidget
+    ) -> None:
+        menu = self.stroke_effect_menu(clip_id, stroke_id)
+        chosen = menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        # 押すたびに作るメニュー 選んだ項目はこの後で読むので、その場ではなく後で捨てる
+        menu.deleteLater()
+        if chosen is None or chosen.data() is None:
+            return
+        self._add_stroke_effect(chosen)
+
+    def _add_stroke_effect(self, chosen: QAction) -> None:
+        clip_id, stroke_id, kind = chosen.data()
+        definition = registry.require(str(kind))
+        self._emit(
+            AddEffect(ClipId(clip_id), definition.create(), stroke_id=StrokeId(stroke_id)),
+            f"{definition.label}を縁取りに追加",
+        )
+
+    def _stroke_value(self, clip: Clip, stroke_id: StrokeId, name: str) -> ParamValue | None:
+        """縁取りの層の項目の今の値 仮の層（:meth:`_shown_strokes`）は前からの縁の値"""
+        if clip.source is None:
+            return None
+        held = clip.source.find_stroke(stroke_id)
+        if held is not None:
+            return held.params.get(name)
+        if stroke_id in self._virtual_strokes:
+            return legacy_stroke(clip.source.params).params.get(name)
+        return None
 
     def _make_editor(
         self, spec: ParameterSpec, path: ParamPath, value: ParamValue | None
@@ -1225,6 +1452,12 @@ class InspectorPanel(QWidget):
             clip_id, effect = pending
             self.preview_requested.emit(AddEffect(clip_id, effect.with_param(path.name, value)))
             return
+        owner = self._virtual_strokes.get(path.stroke_id) if path.stroke_id is not None else None
+        if owner is not None and path.stroke_id is not None:
+            self.preview_requested.emit(
+                _Together((AdoptLegacyStroke(owner, path.stroke_id), SetParam(path, value)))
+            )
+            return
         self.preview_requested.emit(SetParam(path, value))
 
     def _current_value(self, path: ParamPath) -> ParamValue | None:
@@ -1232,6 +1465,13 @@ class InspectorPanel(QWidget):
 
         if self._project is None:
             return None
+        if path.stroke_id is not None and path.stroke_id in self._virtual_strokes:
+            # まだ層へ移していない前からの縁 値は前からの項目から読む 読まないと、動く太さに
+            # 値を入れたとき打ったキーが消え、初期値へ戻す操作も「もう初期値」と見誤る
+            clip = self._clip()
+            if clip is None:
+                return None
+            return self._lookup(clip, _editor_key(path)[0], path.name)
         return resolve_param(self._project, path)
 
     def _toggle_keyframe(self, path: ParamPath, base: AnimatedValue) -> None:
@@ -1467,6 +1707,7 @@ class InspectorPanel(QWidget):
         """
         materialized: list[Command] = []
         added: set[EffectId] = set()
+        adopted: set[StrokeId] = set()
         for command in commands:
             target = _effect_of(command)
             pending = self._virtual.get(target) if target is not None else None
@@ -1474,6 +1715,12 @@ class InspectorPanel(QWidget):
                 clip_id, effect = pending
                 materialized.append(AddEffect(clip_id, effect))
                 added.add(effect.id)
+            stroke = _stroke_of_command(command)
+            owner = self._virtual_strokes.get(stroke) if stroke is not None else None
+            if owner is not None and stroke is not None and stroke not in adopted:
+                # 仮の縁取りの層を触った 前からの縁を同じ ID の層へ移してから当てる
+                materialized.append(AdoptLegacyStroke(owner, stroke))
+                adopted.add(stroke)
             materialized.append(command)
         if continued:
             self.commands_continued.emit(materialized, label)
@@ -1544,8 +1791,16 @@ class InspectorPanel(QWidget):
             return getattr(clip, name, None)
         if owner == "source":
             return clip.source.params.get(name) if clip.source is not None else None
+        if owner.startswith(_STROKE_OWNER):
+            return self._stroke_value(clip, StrokeId(owner[len(_STROKE_OWNER) :]), name)
         # 場面切り替えは前の場面と後の場面の 2 列を持つ どちらに積んだものも拾う
-        both = (*clip.effects, *clip.after_effects)
+        # 縁取りの層に掛けたエフェクトも同じ鍵（エフェクトの ID）で引く
+        held = clip.source.strokes if clip.source is not None else ()
+        both = (
+            *clip.effects,
+            *clip.after_effects,
+            *(effect for stroke in held for effect in stroke.effects),
+        )
         effect = next((e for e in both if e.id == owner), None)
         return effect.params.get(name) if effect is not None else None
 
@@ -1557,6 +1812,44 @@ def _effect_of(command: Command) -> EffectId | None:
     if isinstance(command, SetEffectEnabled):
         return command.effect_id
     return None
+
+
+def _stroke_of_command(command: Command) -> StrokeId | None:
+    """コマンドが指す縁取りの層（層の値・層のエフェクト・層の入り切りや並べ替え）"""
+    if isinstance(command, SetParam | SetKeyframe | RemoveKeyframe | ClearKeyframes):
+        return command.path.stroke_id
+    if isinstance(
+        command,
+        AddEffect
+        | RemoveEffect
+        | MoveEffect
+        | SetEffectEnabled
+        | SetStrokeEnabled
+        | MoveStroke
+        | RemoveStroke,
+    ):
+        return command.stroke_id
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _Together(Command):
+    """いくつかの命令を順に当てる プレビューへ 1 つの命令として渡すため
+
+    仮の縁取りの層のつまみを動かしている間は、層へ移す命令と値を入れる命令の組を見せる
+    値を入れる命令だけだと層が見つからず、ドラッグ中の絵が動かない
+    """
+
+    commands: tuple[Command, ...]
+
+    @property
+    def label(self) -> str:
+        return self.commands[-1].label if self.commands else ""
+
+    def apply(self, project: Project) -> Project:
+        for command in self.commands:
+            project = command.apply(project)
+        return project
 
 
 def _loose(clip: Clip) -> tuple[Effect, ...]:
@@ -1677,10 +1970,13 @@ class _Section(QFrame):
         up_movable: bool = False,
         down_movable: bool = False,
         after: bool = False,
+        stroke_id: StrokeId | None = None,
     ) -> None:
         super().__init__()
         #: 見出しの言葉 組の並び（描画 → 中身 → 動画・音声 → エフェクト）を試験で見る
         self.heading = title
+        #: 縁取りの層に掛けたエフェクトの組なら、その層（入り切り・並べ替え・外すの命令に渡す）
+        self._stroke_id = stroke_id
         self.setFrameShape(QFrame.Shape.StyledPanel)
         themed_style(
             self,
@@ -1773,7 +2069,9 @@ class _Section(QFrame):
         button.setAutoRaise(True)
         button.toggled.connect(
             lambda state: self.action_requested.emit(
-                SetEffectEnabled(clip_id, effect.id, bool(state), after=self._after)
+                SetEffectEnabled(
+                    clip_id, effect.id, bool(state), after=self._after, stroke_id=self._stroke_id
+                )
             )
         )
         return button
@@ -1793,7 +2091,7 @@ class _Section(QFrame):
         button.setEnabled(enabled)
         button.clicked.connect(
             lambda: self.action_requested.emit(
-                MoveEffect(clip_id, effect.id, index, after=self._after)
+                MoveEffect(clip_id, effect.id, index, after=self._after, stroke_id=self._stroke_id)
             )
         )
         return button
@@ -1808,7 +2106,9 @@ class _Section(QFrame):
         button.setToolTip("このエフェクトを外す")
         button.setAutoRaise(True)
         button.clicked.connect(
-            lambda: self.action_requested.emit(RemoveEffect(clip_id, effect.id, after=self._after))
+            lambda: self.action_requested.emit(
+                RemoveEffect(clip_id, effect.id, after=self._after, stroke_id=self._stroke_id)
+            )
         )
         return button
 
@@ -1844,8 +2144,18 @@ class _FocusPlace:
     selection: _SelectionKey
 
 
+#: 縁取りの層の項目の欄の持ち主の頭（後ろに層の ID が付く）
+_STROKE_OWNER = "stroke:"
+
+
 def _editor_key(path: ParamPath) -> tuple[str, str]:
-    """入力欄と ◀ ◆ ▶ を引く鍵（エフェクトの ID か持ち主の種類, 名前）"""
+    """入力欄と ◀ ◆ ▶ を引く鍵（エフェクトの ID か持ち主の種類, 名前）
+
+    縁取りの層の項目は層ごとに持ち主を分ける 中身の項目と同じ鍵にすると、2 つの層の
+    太さの欄が 1 つの鍵を取り合い、片方の欄に値が入らない
+    """
+    if path.stroke_id is not None and path.effect_id is None:
+        return f"{_STROKE_OWNER}{path.stroke_id}", path.name
     return str(path.effect_id or path.target.value), path.name
 
 

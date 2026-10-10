@@ -12,9 +12,10 @@
 だから ``Decorations`` だけを見ていると、**縁取りが 1 つも出ない** ここでは
 3 つとも読む
 
-こちらのテキストオブジェクトが自前で持てる飾りは縁取りと影の 1 つずつなので、
-縁取りが複数あるときは**一番太いもの**をテキストに載せ、残りは縁取りエフェクト
-として外側に積む 重ね順は YMM4 と同じ「内側から外側へ」になる
+YMM4 の縁取りは映像エフェクトなので、2 つ目の縁取りは 1 つ目の縁取りを付けた絵の外側に
+付く（太さが足し合わさる） テキストに載せられる縁取りが 2 つ以上あるときは、縁取りの層
+（#272）として内側から順に並べ、層の太さを字の輪郭からの和にする 1 つだけのときは前と同じく
+テキストの縁取りの項目へ載せる（前からの作品と同じ絵のまま）
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from sashimono.compat.ymm4.values import (
     reporting,
     type_name,
 )
-from sashimono.core.model import AnimatedValue, Effect, ParamValue
+from sashimono.core.model import MAX_STROKES, AnimatedValue, Effect, ParamValue, Stroke
 from sashimono.effects.definition import registry
 
 __all__ = [
@@ -76,6 +77,8 @@ class DecorationResult:
     effects: list[Effect] = field(default_factory=list)
     #: 最後に効いている中心点 アイテムの位置・拡大・回転の支点にもなる
     pivot: CenterPoint | None = None
+    #: テキストの縁取りの層（並びの頭が一番内側で一番上） 縁取りが 2 つ以上あるときだけ
+    strokes: list[Stroke] = field(default_factory=list)
 
 
 def map_decorations(
@@ -242,7 +245,7 @@ def _map_video_effects(
             built = with_pivot(built, pivot)
         result.effects.append(built)
 
-    _place_borders(borders, result)
+    _place_borders(borders, result, layered=True)
     result.pivot = pivot
     return result
 
@@ -543,15 +546,31 @@ def _peak(value: AnimatedValue) -> float:
 def _place_borders(
     borders: list[tuple[AnimatedValue, Colour]],
     result: DecorationResult,
+    *,
+    layered: bool = False,
 ) -> None:
-    """縁取りを、テキスト側 1 本とエフェクト側の残りに分ける
+    """縁取りをテキストへ載せる
 
-    一番太いものをテキストに持たせるのは、それが文字の形をいちばん強く決めるから
-    細いほうをテキストに載せると、太いほうをエフェクトで足したときに二重の縁の
-    間隔が変わる
+    ``layered`` なら（映像エフェクトの縁取り）、2 つ以上の縁取りを縁取りの層にする
+    YMM4 の縁取りは前の縁取りを付けた絵の外側に付くので、層の太さは字の輪郭から数えた和
+    （1 つ目 7.3 と 2 つ目 1.0 なら 7.3 と 8.3） 並びの頭が一番内側で、上に描かれる
+    太さが動く縁取りが 2 つ以上あるときは層にしない 動く値どうしの和はキーの位置が違うと
+    1 つの動く値で表せない 層の数の上限を超えるときも同じ（どちらも実物には無い）
+
+    層にしないときは、一番太いものをテキストに持たせ、残りを縁取りエフェクトにする
+    一番太いものを選ぶのは、それが文字の形をいちばん強く決めるから 細いほうをテキストに
+    載せると、太いほうをエフェクトで足したときに二重の縁の間隔が変わる
+    文字装飾（``Decorations``）の縁取りは実物に 1 つも無く、重なり方を確かめていないので層にしない
     """
     usable = [item for item in borders if _peak(item[0]) > 0.0]
     if not usable:
+        return
+    moving = sum(1 for thickness, _ in usable if thickness.keyframes)
+    if layered and 2 <= len(usable) <= MAX_STROKES and moving <= 1:
+        reach = AnimatedValue(0.0)
+        for thickness, tint in usable:
+            reach = _plus(reach, thickness)
+            result.strokes.append(Stroke(params={"width": reach, "color": tint}))
         return
 
     widest = max(usable, key=lambda item: _peak(item[0]))
@@ -564,6 +583,17 @@ def _place_borders(
             seen_widest = True
             continue
         result.effects.append(_border_effect(thickness, tint))
+
+
+def _plus(first: AnimatedValue, second: AnimatedValue) -> AnimatedValue:
+    """2 つの太さの和 動くのはどちらか 1 つまで（動く側の点ごとに、動かない側を足す）"""
+    if first.keyframes and second.keyframes:
+        raise ValueError("動く値どうしは足せない")
+    moving, still = (first, second) if first.keyframes else (second, first)
+    return AnimatedValue(
+        first.static + second.static,
+        tuple(replace(key, value=key.value + still.static) for key in moving.keyframes),
+    )
 
 
 def _border_effect(

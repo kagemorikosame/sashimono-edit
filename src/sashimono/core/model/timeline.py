@@ -20,11 +20,13 @@ from sashimono.core.model.ids import (
     MediaId,
     SceneId,
     SegmentId,
+    StrokeId,
     TrackId,
     new_clip_id,
     new_track_id,
 )
 from sashimono.core.model.media import MediaItem
+from sashimono.core.model.stroke import Stroke
 from sashimono.core.timebase import FrameRate
 
 __all__ = [
@@ -98,9 +100,20 @@ class GeneratedSource:
 
     kind: str
     params: dict[str, ParamValue] = field(default_factory=dict)
+    #: テキストの縁取りの層（#272） 並びの頭が一番上 空なら ``params`` の縁取りの項目で描く
+    #: （:mod:`sashimono.core.model.stroke`） テキスト以外の種類は持たない
+    strokes: tuple[Stroke, ...] = ()
 
     def with_param(self, name: str, value: ParamValue) -> GeneratedSource:
-        return GeneratedSource(kind=self.kind, params={**self.params, name: value})
+        # ``replace`` で作る 欄を並べて作り直すと、縁取りの層のような後で足した欄が
+        # 値を 1 つ触っただけで落ちる
+        return replace(self, params={**self.params, name: value})
+
+    def with_strokes(self, strokes: Sequence[Stroke]) -> GeneratedSource:
+        return replace(self, strokes=tuple(strokes))
+
+    def find_stroke(self, stroke_id: StrokeId) -> Stroke | None:
+        return next((stroke for stroke in self.strokes if stroke.id == stroke_id), None)
 
 
 class TrackKind(Enum):

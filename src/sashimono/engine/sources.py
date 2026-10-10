@@ -43,8 +43,9 @@ from sashimono.compat.aviutl.text_tags import (
     parse_tags,
 )
 from sashimono.compat.decoration import decoration_params, find_decoration
-from sashimono.core.model import AnimatedValue, GeneratedSource, ParamValue
+from sashimono.core.model import AnimatedValue, Effect, GeneratedSource, ParamValue
 from sashimono.effects.sources import SourceDefinition, source_registry
+from sashimono.effects.strokes import STROKE, pixel_reach, takes_stroke_effect
 from sashimono.engine.audio_shapes import (
     WAVEFORM_LINE,
     bar_mask,
@@ -64,7 +65,15 @@ from sashimono.engine.motion_shapes import (
 )
 from sashimono.engine.text_wrap import graphemes, wrap_lines
 
-__all__ = ["Frame", "drawn_bold_italic", "render_source", "render_source_framed", "waveform_points"]
+__all__ = [
+    "Frame",
+    "StrokeEffects",
+    "drawn_bold_italic",
+    "has_stroke_effects",
+    "render_source",
+    "render_source_framed",
+    "waveform_points",
+]
 
 #: 縦の基準ごとに、指定した位置より上へ出す割合 ``下`` なら全部が上に出る
 _VERTICAL_SHARE = {"top": 0.0, "middle": 0.5, "bottom": 1.0}
@@ -110,6 +119,9 @@ def render_source(
 #: 絵の中のオブジェクトの枠（画素、左・上・右・下 小数のまま）
 Frame = tuple[float, float, float, float]
 
+#: 縁取りの層の絵（ストレートアルファの RGBA）に、その層のエフェクトを掛けて同じ大きさで返す手
+StrokeEffects = Callable[[np.ndarray, tuple[Effect, ...]], np.ndarray]
+
 
 def render_source_framed(
     source: GeneratedSource,
@@ -124,6 +136,7 @@ def render_source_framed(
     trail_paths: TrailPaths | None = None,
     scale: tuple[float, float] = (1.0, 1.0),
     screen: tuple[int, int] | None = None,
+    stroke_effects: StrokeEffects | None = None,
 ) -> tuple[np.ndarray | None, Frame | None]:
     """:func:`render_source` と同じ絵と、オブジェクトの枠
 
@@ -139,12 +152,20 @@ def render_source_framed(
 
     ``screen`` は広げる前の大きさ（合成の画素 :func:`source_canvas` に渡した物）
     絵がそれより大きければ、文字の影は影の周りだけで作る（:func:`_shadow_layer`）
+
+    ``stroke_effects`` は縁取りの層の絵にその層のエフェクトを掛ける手（#273）
+    エフェクトは GPU のシェーダなので、ここでは持たずにレンダラから受け取る 渡さなければ
+    層のエフェクトを掛けずに描く
     """
     definition = source_registry.get(source.kind)
     if definition is None:
         return None, None
 
     values = _resolve(definition, source.params, frame)
+    _resolve_strokes(values, source, frame)
+    # 縁取りの層に掛けるエフェクトの掛け手 GPU で掛けるのでレンダラが渡す 無ければ層の
+    # エフェクトを飛ばして描く（素材の一覧の見本のように、GPU を持たない所で描くとき）
+    values["_stroke_baker"] = stroke_effects
     values["_seconds"] = frame / max(fps, 1e-6)
     values["_fps"] = fps
     values["_frame"] = frame
@@ -294,6 +315,9 @@ def _text_canvas(
     if definition is None:
         return width, height
     values = _resolve(definition, source.params, frame)
+    # 縁取りの層の太さと、層のエフェクトの広がりも見積もりに入れる 入れないと、層を
+    # 重ねた太い縁やぼかした縁が絵の端で切れる
+    _resolve_strokes(values, source, frame)
     if str(values.get("timer_format", "")):
         # タイマーは描く所（:func:`_text_layers`）と同じ文字を、ここで先に作っておく
         values["_seconds"] = frame / max(fps, 1e-6)
@@ -339,9 +363,15 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
             box = box.intersected(clip.boundingRect())
         if box.isEmpty():
             continue
-        border = max(0.0, _number(look, "border_width", 0.0))
+        rings = _rings(look)
+        # 影は一番外へ出る縁の外形から落ちる（:func:`_shadow_layer`） 層のエフェクト（ぼかし
+        # など）の広がりは層の絵だけのもので、影には入らない
+        border = max((ring.outward for ring in rings), default=0.0)
+        spread = max((ring.outward + ring.reach for ring in rings), default=0.0)
         inked = box.adjusted(-border, -border, border, border)
         reach = reach.united(inked)
+        if spread > border:
+            reach = reach.united(box.adjusted(-spread, -spread, spread, spread))
         shift_x = _number(look, "shadow_x", 0.0)
         shift_y = _number(look, "shadow_y", 0.0)
         blur = max(0.0, _number(look, "shadow_blur", 0.0))
@@ -1112,6 +1142,12 @@ def _paint_layers(
     色が 1 つのときと同じ順にする 色ごとに影・縁・塗りを描き切ると、字が近い所で
     後の色の縁が前の色の塗りに被さり、色を変えただけで前の字が欠ける
     3 つ目の形があれば、影・縁・塗りのどれもその内側だけに描く（変形した字を文字の枠で切る）
+
+    縁取りの層（#272）は、外側に引く層を塗りの下へ、中央と内側に引く層を塗りの上へ描く
+    どちらも並びの後ろ（下の層）から描き、頭の層が一番上に来る 内側と中央は塗りの上に
+    描かないと、塗りに隠れて見えない（Photoshop の境界線も字の上に描く） 外側の層を塗りの
+    上にすると、前からの縁取り（輪郭をまたいで描き、内側半分を塗りで隠す）と縁の滑らかな所が
+    変わり、層が 1 つの字の見た目が前と 1 画素ずれる
     """
     for path, look, clip in layers:
         made = _shadow_layer(path, look, painter)
@@ -1126,14 +1162,214 @@ def _paint_layers(
             painter.resetTransform()
             painter.drawImage(shadow_left, shadow_top, shadow)
             painter.restore()
-    for path, look, clip in layers:
-        border_width = float(look.get("border_width", 0.0))  # type: ignore[arg-type]
-        if border_width > 0:
-            _fill_within(
-                painter, _stroke(path, border_width), _color(look.get("border_color")), clip
-            )
+    rings = [_rings(look) for _, look, _ in layers]
+    depth = max((len(found) for found in rings), default=0)
+    for index in reversed(range(depth)):
+        _paint_ring(painter, layers, rings, index, under=True)
     for path, look, clip in layers:
         _fill_within(painter, path, _color(look.get("color")), clip)
+    for index in reversed(range(depth)):
+        _paint_ring(painter, layers, rings, index, under=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _Ring:
+    """縁取りの層 1 つの、その時刻の値（画面の画素）
+
+    字の広がりの見積もり（:func:`_text_reach`）の鍵に入るので、比べられて覚えられる値だけを持つ
+    層のエフェクトそのものは持たず、何番目の並びか（:attr:`effects`）だけを持つ
+    """
+
+    width: float
+    #: 層の不透明度を掛けた色（``(R, G, B, A)`` の 0..1）
+    colour: tuple[float, ...]
+    position: str = "outside"
+    join: str = "round"
+    #: 層のエフェクトが層の絵を外へ運ぶ量（画面の画素） 絵の大きさの見積もりに足す
+    reach: float = 0.0
+    #: 層のエフェクトの並びの番号（値の ``_stroke_effects`` の何番目か） 無ければ -1
+    effects: int = -1
+
+    @property
+    def outward(self) -> float:
+        """字の輪郭から外へ出る幅 内側に引く層は外へ出ない"""
+        if self.position == "inside":
+            return 0.0
+        if self.position == "center":
+            return self.width / 2.0
+        return self.width
+
+
+def _resolve_strokes(values: dict[str, object], source: GeneratedSource, frame: int) -> None:
+    """縁取りの層を ``frame`` の値にして ``values`` へ入れる
+
+    層を持たないテキストは ``strokes`` を ``None`` にする 描く所は前からの縁取りの項目を
+    1 つの層として描く（:func:`_rings`） 文字の中の制御文字で太さや色を変えた字も、
+    これまでどおりその値で描ける
+    切ってある層と太さ 0 の層は入れない 掛けてよくないエフェクト（時刻で動く物など）は
+    手で書いたファイルにあっても掛けない（:func:`~sashimono.effects.strokes.takes_stroke_effect`）
+    """
+    if not source.strokes or source.kind != "text":
+        values["strokes"] = None
+        values["_stroke_effects"] = ()
+        return
+    rings: list[_Ring] = []
+    stacks: list[tuple[Effect, ...]] = []
+    for stroke in source.strokes:
+        if not stroke.enabled:
+            continue
+        resolved = _resolve(STROKE, stroke.params, frame)
+        width = max(0.0, _number(resolved, "width", 0.0))
+        if width <= 0.0:
+            continue
+        colour = resolved.get("color")
+        rgba = tuple(float(v) for v in colour) if isinstance(colour, tuple) else (0.0, 0.0, 0.0)
+        rgba = (*rgba[:3], rgba[3] if len(rgba) > 3 else 1.0)
+        opacity = min(max(_number(resolved, "opacity", 100.0) / 100.0, 0.0), 1.0)
+        usable = tuple(e for e in stroke.effects if e.enabled and takes_stroke_effect(e.kind))
+        index = -1
+        reach = 0.0
+        if usable:
+            index = len(stacks)
+            stacks.append(usable)
+            reach = pixel_reach(usable, frame)
+        rings.append(
+            _Ring(
+                width=width,
+                colour=(*rgba[:3], rgba[3] * opacity),
+                position=str(resolved.get("position", "outside")),
+                join=str(resolved.get("join", "round")),
+                reach=reach,
+                effects=index,
+            )
+        )
+    values["strokes"] = tuple(rings)
+    values["_stroke_effects"] = tuple(stacks)
+
+
+def has_stroke_effects(source: GeneratedSource) -> bool:
+    """縁取りの層のどれかに、掛けるエフェクトがあるか（レンダラが GPU の掛け手を渡すか決める）"""
+    return source.kind == "text" and any(
+        stroke.enabled and any(e.enabled and takes_stroke_effect(e.kind) for e in stroke.effects)
+        for stroke in source.strokes
+    )
+
+
+def _rings(look: Mapping[str, object]) -> tuple[_Ring, ...]:
+    """字 1 つの見た目で描く縁取りの層 並びの頭が一番上
+
+    層を持たない字は前からの縁取りの項目（太さと色）を外側・丸い角の 1 層として返す
+    描き方は前と同じ（輪郭をまたいで太さの 2 倍で引き、内側半分は塗りで隠す）
+    """
+    strokes = look.get("strokes")
+    if isinstance(strokes, tuple):
+        return tuple(ring for ring in strokes if isinstance(ring, _Ring))
+    width = _number(dict(look), "border_width", 0.0)
+    if width <= 0.0:
+        return ()
+    colour = look.get("border_color")
+    return (_Ring(width=width, colour=colour if isinstance(colour, tuple) else ()),)
+
+
+def _ring_path(path: QPainterPath, ring: _Ring) -> QPainterPath:
+    """層の線の形 外側と内側は輪郭から太さぶん（内側は後で塗りの内側だけに切る）、中央は半分ずつ"""
+    if ring.position == "center":
+        return _stroke(path, ring.width / 2.0, ring.join)
+    return _stroke(path, ring.width, ring.join)
+
+
+def _paint_ring(
+    painter: QPainter,
+    layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
+    rings: list[tuple[_Ring, ...]],
+    index: int,
+    *,
+    under: bool,
+) -> None:
+    """``index`` 番目の層を、字の見た目ごとの輪郭すべてに描く
+
+    ``under`` なら外側に引く層だけ（塗りの下）、偽なら中央と内側の層だけ（塗りの上）
+    層にエフェクトがあるか内側に引く層なら、別の面に描いてから重ねる 内側は字の形で
+    切り抜く（切り抜きの形で塗ると縁が滑らかにならない） エフェクトは面の絵に掛ける（#273）
+    """
+    entries = [
+        (path, found[index], clip, look)
+        for (path, look, clip), found in zip(layers, rings, strict=True)
+        if index < len(found) and (found[index].position == "outside") == under
+    ]
+    if not entries:
+        return
+    first = entries[0][1]
+    look = entries[0][3]
+    stacks = look.get("_stroke_effects")
+    baker = look.get("_stroke_baker")
+    effects: tuple[Effect, ...] = ()
+    if first.effects >= 0 and isinstance(stacks, tuple) and first.effects < len(stacks):
+        effects = stacks[first.effects]
+    apply = baker if callable(baker) and effects else None
+    inside = any(ring.position == "inside" for _, ring, _, _ in entries)
+    bands = [(_ring_path(path, ring), ring, clip) for path, ring, clip, _ in entries]
+    if apply is None and not inside:
+        for band, ring, clip in bands:
+            _fill_within(painter, band, _color(ring.colour), clip)
+        return
+
+    # 面は縁のある所の周り（層のエフェクトが広げる分を足した四角）だけで作る 字の絵の全体で
+    # 作ると、字幕 1 本ごとに画面 1 枚ぶんの絵を何度も写すことになる
+    device = painter.device()
+    assert device is not None
+    transform = painter.transform()
+    drawn = QRectF()
+    for band, _, _ in bands:
+        drawn = drawn.united(transform.mapRect(band.boundingRect()))
+    spread = first.reach * math.sqrt(abs(transform.determinant())) + 2.0
+    left = max(0, math.floor(drawn.left() - spread))
+    top = max(0, math.floor(drawn.top() - spread))
+    right = min(device.width(), math.ceil(drawn.right() + spread))
+    bottom = min(device.height(), math.ceil(drawn.bottom() + spread))
+    if right <= left or bottom <= top:
+        return
+    placed = transform * QTransform.fromTranslate(-left, -top)
+    plane = QImage(right - left, bottom - top, QImage.Format.Format_RGBA8888)
+    plane.fill(Qt.GlobalColor.transparent)
+    plane_painter = QPainter(plane)
+    plane_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    plane_painter.setTransform(placed)
+    for band, ring, clip in bands:
+        _fill_within(plane_painter, band, _color(ring.colour), clip)
+    plane_painter.end()
+    if inside:
+        plane = _within_glyphs(plane, [path for path, _, _, _ in entries], placed)
+    if apply is not None:
+        baked = apply(_to_array(plane), effects)
+        plane = QImage(
+            np.ascontiguousarray(baked).tobytes(),
+            plane.width(),
+            plane.height(),
+            QImage.Format.Format_RGBA8888,
+        ).copy()
+    painter.save()
+    painter.resetTransform()
+    painter.drawImage(left, top, plane)
+    painter.restore()
+
+
+def _within_glyphs(plane: QImage, paths: list[QPainterPath], transform: QTransform) -> QImage:
+    """``plane`` を字の塗りの内側だけに切り抜く 縁は塗りと同じく滑らかにする"""
+    mask = QImage(plane.width(), plane.height(), QImage.Format.Format_RGBA8888)
+    mask.fill(Qt.GlobalColor.transparent)
+    mask_painter = QPainter(mask)
+    mask_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    mask_painter.setTransform(transform)
+    for path in paths:
+        mask_painter.fillPath(path, QColor(255, 255, 255, 255))
+    mask_painter.end()
+    cut = QPainter(plane)
+    # 面の全体へ重ねる 字の形を塗るだけだと、塗った所の外は元のまま残る
+    cut.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+    cut.drawImage(0, 0, mask)
+    cut.end()
+    return plane
 
 
 def _fill_within(
@@ -1170,14 +1406,23 @@ def _recoloured(
     return changed
 
 
-def _stroke(path: QPainterPath, width: float) -> QPainterPath:
+#: 縁取りの層の角（:data:`sashimono.effects.strokes.JOINS`）と Qt の線のつなぎ方
+_JOINS = {
+    "round": Qt.PenJoinStyle.RoundJoin,
+    "miter": Qt.PenJoinStyle.MiterJoin,
+    "bevel": Qt.PenJoinStyle.BevelJoin,
+}
+
+
+def _stroke(path: QPainterPath, width: float, join: str = "round") -> QPainterPath:
     """輪郭を太らせたパス
 
     太さは輪郭の中心から両側へ広がるので、指定の 2 倍にして外側に指定幅を出す
+    知らない角の名前（手で書いたファイル）は丸にする 前からの縁取りと同じ
     """
     stroker = QPainterPathStroker()
     stroker.setWidth(width * 2.0)
-    stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    stroker.setJoinStyle(_JOINS.get(join, Qt.PenJoinStyle.RoundJoin))
     return stroker.createStroke(path)
 
 
@@ -1212,8 +1457,9 @@ def _shadow_layer(
     # 画面の Y は下向き 設定の Y は上向きなので符号を反転する
     shifted.translate(offset_x, -offset_y)
     blur *= math.sqrt(abs(transform.determinant()))
-    border_width = float(values.get("border_width", 0.0))  # type: ignore[arg-type]
-    outline = _stroke(shifted, border_width) if border_width > 0 else None
+    # 一番外へ出る縁取りの層の外形から影を落とす 層を持たない字は前からの縁取りの太さ
+    outer = max(_rings(values), key=lambda ring: ring.outward, default=None)
+    outline = _ring_path(shifted, outer) if outer is not None and outer.outward > 0.0 else None
 
     left, top, right, bottom = 0, 0, device.width(), device.height()
     if bool(values.get("_crop_shadow", False)):

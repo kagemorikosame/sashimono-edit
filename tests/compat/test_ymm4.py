@@ -419,13 +419,50 @@ class TestVideoEffects:
         assert source.params["border_color"] == pytest.approx((1.0, 1.0, 1.0, 1.0))
 
     def test_two_outlines_stack(self) -> None:
-        item = text_item(VideoEffects=[outline(4.0), outline(12.0)])
+        """2 つの縁取りは縁取りの層になる（#272） YMM4 の 2 つ目の縁取りは 1 つ目を付けた絵の
+        外側に付くので、層の太さは字の輪郭からの和 並びの頭（内側）が上
+
+        前は太いほうだけを文字に載せ、細いほうをエフェクトとして外へ積んでいた 実物の
+        ポップおこ・ポップグラデ（18 本）は内側と外側の色が入れ替わり、YMM4 の書き出しとの
+        差が倍ほどあった（ポップおこ紫 7.83 → 4.18）
+        """
+        inner, outer = outline(4.0), outline(12.0)
+        outer["StrokeBrush"] = {
+            "Type": BRUSH["Type"],
+            "Parameter": {**BRUSH["Parameter"], "Color": "#FF000000"},
+        }
+        item = text_item(VideoEffects=[inner, outer])
         mapped = map_template([item], report=CompatibilityReport())[0]
         source = mapped.clip.source
         assert source is not None
-        # 太いほうを文字に、細いほうをエフェクトとして外側に積む
-        assert value_at(source.params["border_width"]) == pytest.approx(12.0)
-        assert [e.kind for e in mapped.clip.effects] == ["border"]
+        assert "border_width" not in source.params
+        assert [e.kind for e in mapped.clip.effects if e.kind == "border"] == []
+        widths = [value_at(stroke.params["width"]) for stroke in source.strokes]
+        assert widths == pytest.approx([4.0, 16.0])
+        colours = [stroke.params["color"] for stroke in source.strokes]
+        assert colours == [pytest.approx((1.0, 1.0, 1.0, 1.0)), pytest.approx((0.0, 0.0, 0.0, 1.0))]
+
+    def test_one_moving_outline_still_stacks(self) -> None:
+        """動く太さが 1 つなら、動く側の点ごとに内側の太さを足して層にできる"""
+        moving_edge = outline(4.0)
+        moving_edge["StrokeThickness"] = moving(2.0, 10.0)
+        item = text_item(VideoEffects=[outline(3.0), moving_edge], Length=100)
+        source = map_template([item], report=CompatibilityReport())[0].clip.source
+        assert source is not None
+        outer = source.strokes[1].params["width"]
+        assert value_at(outer, 0) == pytest.approx(5.0)
+        assert value_at(outer, 99) == pytest.approx(13.0, abs=0.2)
+
+    def test_two_moving_outlines_stay_effects(self) -> None:
+        """動く太さどうしの和は 1 つの動く値で表せない 前と同じく太いほうを字に、残りを
+        エフェクトにする（実物には無い）"""
+        first, second = outline(4.0), outline(4.0)
+        first["StrokeThickness"] = moving(2.0, 10.0)
+        second["StrokeThickness"] = moving(8.0, 1.0)
+        item = text_item(VideoEffects=[first, second], Length=100)
+        mapped = map_template([item], report=CompatibilityReport())[0]
+        assert mapped.clip.source is not None and mapped.clip.source.strokes == ()
+        assert [e.kind for e in mapped.clip.effects if e.kind == "border"] == ["border"]
 
     def test_an_outline_only_shape_keeps_just_the_edge(self) -> None:
         """図形の縁取りの「縁だけ」は、塗りを消して縁の輪だけを残すエフェクトになる

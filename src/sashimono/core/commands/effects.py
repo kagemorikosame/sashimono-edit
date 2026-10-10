@@ -30,6 +30,8 @@ from sashimono.core.model import (
     Keyframe,
     ParamValue,
     Project,
+    Stroke,
+    StrokeId,
 )
 
 __all__ = [
@@ -72,10 +74,16 @@ class ParamPath:
     effect_id: EffectId | None = None
     #: 場面切り替えの「後の場面」に積んだエフェクトを指すか
     after: bool = False
+    #: テキストの縁取りの層（#272） ``SOURCE`` なら層の項目、``EFFECT`` なら層に掛けた
+    #: エフェクト（#273）の項目を指す 指す先を同じ形にしておくと、値の変更・キーフレーム・
+    #: 初期値へ戻す操作を、層のために別に書かずに済む
+    stroke_id: StrokeId | None = None
 
     def __post_init__(self) -> None:
         if self.target is ParamTarget.EFFECT and self.effect_id is None:
             raise ValueError("エフェクトのパラメータには effect_id が要る")
+        if self.stroke_id is not None and (self.target is ParamTarget.CLIP or self.after):
+            raise ValueError("縁取りの層はテキストの中身にだけある")
 
     @classmethod
     def of_effect(
@@ -91,14 +99,48 @@ class ParamPath:
     def of_clip(cls, clip_id: ClipId, name: str) -> ParamPath:
         return cls(clip_id, ParamTarget.CLIP, name)
 
+    @classmethod
+    def of_stroke(cls, clip_id: ClipId, stroke_id: StrokeId, name: str) -> ParamPath:
+        """縁取りの層の項目（太さ・色・位置など）"""
+        return cls(clip_id, ParamTarget.SOURCE, name, stroke_id=stroke_id)
 
-def stack_of(clip: Clip, after: bool) -> tuple[Effect, ...]:
-    """エフェクトの置き場 場面切り替えの「後の場面」だけ別に持つ"""
+    @classmethod
+    def of_stroke_effect(
+        cls, clip_id: ClipId, stroke_id: StrokeId, effect_id: EffectId, name: str
+    ) -> ParamPath:
+        """縁取りの層に掛けたエフェクトの項目"""
+        return cls(clip_id, ParamTarget.EFFECT, name, effect_id, stroke_id=stroke_id)
+
+
+def stack_of(clip: Clip, after: bool, stroke_id: StrokeId | None = None) -> tuple[Effect, ...]:
+    """エフェクトの置き場 場面切り替えの「後の場面」と、縁取りの層ごとの物は別に持つ"""
+    if stroke_id is not None:
+        return stroke_of(clip, stroke_id).effects
     return clip.after_effects if after else clip.effects
 
 
-def with_stack(clip: Clip, after: bool, effects: tuple[Effect, ...]) -> Clip:
+def with_stack(
+    clip: Clip, after: bool, effects: tuple[Effect, ...], stroke_id: StrokeId | None = None
+) -> Clip:
+    if stroke_id is not None:
+        stroke = stroke_of(clip, stroke_id)
+        return with_stroke(clip, replace(stroke, effects=effects))
     return replace(clip, after_effects=effects) if after else replace(clip, effects=effects)
+
+
+def stroke_of(clip: Clip, stroke_id: StrokeId) -> Stroke:
+    """クリップの縁取りの層 無ければ ``KeyError``"""
+    found = clip.source.find_stroke(stroke_id) if clip.source is not None else None
+    if found is None:
+        raise KeyError(f"縁取りの層が見つからない: {stroke_id}")
+    return found
+
+
+def with_stroke(clip: Clip, stroke: Stroke) -> Clip:
+    """同じ ID の層を ``stroke`` に差し替えたクリップ"""
+    assert clip.source is not None  # 層を引けた（:func:`stroke_of`）クリップだけが来る
+    strokes = tuple(stroke if s.id == stroke.id else s for s in clip.source.strokes)
+    return replace(clip, source=clip.source.with_strokes(strokes))
 
 
 def resolve_param(project: Project, path: ParamPath) -> ParamValue | None:
@@ -110,10 +152,20 @@ def resolve_param(project: Project, path: ParamPath) -> ParamValue | None:
 
     if path.target is ParamTarget.CLIP:
         return getattr(clip, path.name, None)
+    stroke = (
+        clip.source.find_stroke(path.stroke_id)
+        if path.stroke_id is not None and clip.source is not None
+        else None
+    )
+    if path.stroke_id is not None and stroke is None:
+        return None
     if path.target is ParamTarget.SOURCE:
+        if stroke is not None:
+            return stroke.params.get(path.name)
         return clip.source.params.get(path.name) if clip.source is not None else None
 
-    effect = next((e for e in stack_of(clip, path.after) if e.id == path.effect_id), None)
+    stack = stroke.effects if stroke is not None else stack_of(clip, path.after)
+    effect = next((e for e in stack if e.id == path.effect_id), None)
     return effect.params.get(path.name) if effect is not None else None
 
 
@@ -283,22 +335,31 @@ class AddEffect(Command):
     index: int | None = None
     #: 場面切り替えの「後の場面」へ積むか
     after: bool = False
+    #: 縁取りの層へ積むか（#273） 層の列は固定の項目を持たないので、位置を渡さなければ末尾
+    #: どのエフェクトを層に掛けてよいかは定義を読む側（設定パネルと AI の道具）が決める
+    #: コア層はエフェクトの定義を読まない
+    stroke_id: StrokeId | None = None
 
     @property
     def label(self) -> str:
         return "エフェクトを追加"
 
     def apply(self, project: Project) -> Project:
+        if self.stroke_id is not None and self.effect.fixed:
+            raise ValueError("縁取りの層にクリップの欄（固定の項目）は積めない")
+
         def update(clip: Clip) -> Clip:
-            effects = list(stack_of(clip, self.after))
+            effects = list(stack_of(clip, self.after, self.stroke_id))
             if self.index is not None:
                 position = self.index
+            elif self.stroke_id is not None:
+                position = len(effects)
             elif self.effect.fixed:
                 position = fixed_slot(effects, self.effect.kind)
             else:
                 position = loose_slot(effects)
             effects.insert(position, self.effect)
-            return with_stack(clip, self.after, tuple(effects))
+            return with_stack(clip, self.after, tuple(effects), self.stroke_id)
 
         return _update_clip(project, self.clip_id, update)
 
@@ -314,6 +375,7 @@ class RemoveEffect(Command):
     clip_id: ClipId
     effect_id: EffectId
     after: bool = False
+    stroke_id: StrokeId | None = None
 
     @property
     def label(self) -> str:
@@ -321,7 +383,7 @@ class RemoveEffect(Command):
 
     def apply(self, project: Project) -> Project:
         def update(clip: Clip) -> Clip:
-            stack = stack_of(clip, self.after)
+            stack = stack_of(clip, self.after, self.stroke_id)
             target = next((e for e in stack if e.id == self.effect_id), None)
             if target is None:
                 raise KeyError(f"エフェクトが見つからない: {self.effect_id}")
@@ -330,7 +392,7 @@ class RemoveEffect(Command):
                     f"{target.kind} はクリップが最初から持つ項目なので外せない 無効にはできる"
                 )
             remaining = tuple(e for e in stack if e.id != self.effect_id)
-            return with_stack(clip, self.after, remaining)
+            return with_stack(clip, self.after, remaining, self.stroke_id)
 
         return _update_clip(project, self.clip_id, update)
 
@@ -351,6 +413,7 @@ class MoveEffect(Command):
     effect_id: EffectId
     index: int
     after: bool = False
+    stroke_id: StrokeId | None = None
 
     @property
     def label(self) -> str:
@@ -358,7 +421,7 @@ class MoveEffect(Command):
 
     def apply(self, project: Project) -> Project:
         def update(clip: Clip) -> Clip:
-            effects = list(stack_of(clip, self.after))
+            effects = list(stack_of(clip, self.after, self.stroke_id))
             for position, effect in enumerate(effects):
                 if effect.id == self.effect_id:
                     if effect.fixed:
@@ -372,7 +435,7 @@ class MoveEffect(Command):
                     if any(e.fixed for e in effects[low:high]):
                         raise ValueError("最初から持つ項目をまたいで並べ替えられない")
                     effects.insert(destination, effect)
-                    return with_stack(clip, self.after, tuple(effects))
+                    return with_stack(clip, self.after, tuple(effects), self.stroke_id)
             raise KeyError(f"エフェクトが見つからない: {self.effect_id}")
 
         return _update_clip(project, self.clip_id, update)
@@ -389,6 +452,7 @@ class SetEffectEnabled(Command):
     effect_id: EffectId
     enabled: bool
     after: bool = False
+    stroke_id: StrokeId | None = None
 
     @property
     def label(self) -> str:
@@ -398,9 +462,9 @@ class SetEffectEnabled(Command):
         def update(clip: Clip) -> Clip:
             effects = tuple(
                 replace(e, enabled=self.enabled) if e.id == self.effect_id else e
-                for e in stack_of(clip, self.after)
+                for e in stack_of(clip, self.after, self.stroke_id)
             )
-            return with_stack(clip, self.after, effects)
+            return with_stack(clip, self.after, effects, self.stroke_id)
 
         return _update_clip(project, self.clip_id, update)
 
@@ -522,15 +586,19 @@ def _update_param(
         if path.target is ParamTarget.SOURCE:
             if clip.source is None:
                 raise KeyError("生成オブジェクトを持たないクリップ")
+            if path.stroke_id is not None:
+                stroke = stroke_of(clip, path.stroke_id)
+                changed = stroke.with_param(path.name, update(stroke.params.get(path.name)))
+                return with_stroke(clip, changed)
             current = clip.source.params.get(path.name)
             return replace(clip, source=clip.source.with_param(path.name, update(current)))
 
-        stack = stack_of(clip, path.after)
+        stack = stack_of(clip, path.after, path.stroke_id)
         effect = next((e for e in stack if e.id == path.effect_id), None)
         if effect is None:
             raise KeyError(f"エフェクトが見つからない: {path.effect_id}")
         updated = effect.with_param(path.name, update(effect.params.get(path.name)))
         effects = tuple(updated if e.id == effect.id else e for e in stack)
-        return with_stack(clip, path.after, effects)
+        return with_stack(clip, path.after, effects, path.stroke_id)
 
     return _update_clip(project, path.clip_id, change)
