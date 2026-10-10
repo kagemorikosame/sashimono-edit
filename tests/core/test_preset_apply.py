@@ -208,3 +208,74 @@ class TestApply:
         after = _applied(_text(duration=90), Preset.capture("出る", saved))
         assert after.opacity == fitted_value(moving, 30, 89)
         assert [k.frame for k in after.opacity.keyframes] == [0, 89]
+
+
+def _body_of(clip: Clip) -> Effect | None:
+    """カスタムオブジェクトの見分けを写した物 空のテキストの最初のふつうのエフェクトが本体"""
+    if clip.source is None or clip.source.params.get("text"):
+        return None
+    first = next((e for e in clip.effects if not e.fixed), None)
+    return first if first is not None and first.kind == "本体" else None
+
+
+def _custom(body: str = "円", *extra: Effect) -> Clip:
+    base = _text(text="")
+    return replace(base, effects=(Effect(kind="本体", params={"形": body}), *extra, *base.effects))
+
+
+def _loose_kinds(clip: Clip) -> list[str]:
+    return [e.kind for e in clip.effects if not e.fixed]
+
+
+class TestBody:
+    """カスタムオブジェクトの本体（中身を作るスクリプト）は見た目ではなく中身として扱う"""
+
+    def test_replacing_keeps_the_body(self) -> None:
+        # 前は入れ替えで本体まで消え、何も描かないクリップが残った
+        target = _custom("円", Effect(kind="blur"))
+        after = _applied(target, Preset.capture("素の字", _text()), body_of=_body_of)
+        assert _loose_kinds(after) == ["本体"]
+        assert _body_of(after) is not None
+
+    def test_the_text_of_a_plain_preset_is_not_put_into_the_body(self) -> None:
+        # 文字を入れると空のテキストでなくなり、本体として読まれなくなる
+        after = _applied(
+            _custom(),
+            Preset.capture("見出し", _text(text="見出し")),
+            options=PresetOptions(with_text=True),
+            body_of=_body_of,
+        )
+        assert _body_of(after) is not None
+
+    def test_the_saved_body_stays_out_without_the_text_option(self) -> None:
+        saved = _custom("星", Effect(kind="glow"))
+        after = _applied(_custom("円"), Preset.capture("星", saved), body_of=_body_of)
+        body = _body_of(after)
+        assert body is not None
+        assert body.params["形"] == "円"
+        assert _loose_kinds(after) == ["本体", "glow"]
+
+    def test_the_text_option_swaps_the_body(self) -> None:
+        # 同じカスタムオブジェクトを作り直したいときの当て方 本体は 1 つのまま入れ替わる
+        saved = _custom("星", Effect(kind="glow"))
+        after = _applied(
+            _custom("円", Effect(kind="blur")),
+            Preset.capture("星", saved),
+            options=PresetOptions(with_text=True),
+            body_of=_body_of,
+        )
+        body = _body_of(after)
+        assert body is not None
+        assert body.params["形"] == "星"
+        assert _loose_kinds(after) == ["本体", "glow"]
+
+    def test_a_plain_text_becomes_the_custom_object_only_with_the_text_option(self) -> None:
+        saved = Preset.capture("星", _custom("星"))
+        plain = _applied(_text(text="字"), saved, body_of=_body_of)
+        assert _loose_kinds(plain) == []
+        made = _applied(
+            _text(text="字"), saved, options=PresetOptions(with_text=True), body_of=_body_of
+        )
+        body = _body_of(made)
+        assert body is not None
+        assert body.params["形"] == "星"

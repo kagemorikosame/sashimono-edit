@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.compat.aviutl.custom_object import custom_object_script
 from sashimono.core.commands import (
     AddEffect,
     ClearKeyframes,
@@ -1543,6 +1544,9 @@ class InspectorPanel(QWidget):
                 options=self._preset_options,
                 # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
                 accepts=allowed.__contains__,
+                # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
+                # 見た目の入れ替えで消すと、何も描かないクリップが残る
+                body_of=custom_object_script,
             )
             if made:
                 commands.extend(made)

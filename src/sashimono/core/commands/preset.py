@@ -44,7 +44,7 @@ from sashimono.core.io.presets import Preset
 from sashimono.core.model import Clip, Effect, GeneratedSource, ParamValue
 from sashimono.core.model.fitting import fitted_value
 
-__all__ = ["CONTENT_PARAMS", "POSITION_PARAMS", "PresetOptions", "preset_commands"]
+__all__ = ["CONTENT_PARAMS", "POSITION_PARAMS", "BodyOf", "PresetOptions", "preset_commands"]
 
 #: 中身の値 当てる先のクリップの持ち物なので、既定では当てない
 #:
@@ -68,6 +68,9 @@ CONTENT_PARAMS = frozenset(
 #: 画面の中の位置 テキスト・図形の中身と、描画の欄（配置）の X と Y
 #: 拡大率・回転・中心は見た目なので当てる
 POSITION_PARAMS = frozenset({"pos_x", "pos_y"})
+
+#: クリップの中身を作っているエフェクト（本体）を返す手 :func:`preset_commands` を見る
+BodyOf = Callable[[Clip], Effect | None]
 
 #: 場面切り替えの中身の種類 後の場面の列を持つのはこれだけ
 _TRANSITION = "transition"
@@ -95,6 +98,7 @@ def preset_commands(
     sound: bool = False,
     options: PresetOptions | None = None,
     accepts: Callable[[str], bool] | None = None,
+    body_of: BodyOf | None = None,
 ) -> list[Command]:
     """``preset`` を ``clip`` へ当てるコマンド 変わる所が無ければ空
 
@@ -102,12 +106,32 @@ def preset_commands(
     音声の組を出すかと同じ） 出さない組の欄の値は当てない
     ``accepts`` はエフェクトの種類を足してよいか 渡さなければ全部足す（コア層はエフェクトの
     定義を読めないので、音だけのクリップに映像のエフェクトを足さないのは画面の側で決める）
+    ``body_of`` はクリップの中身を作っているエフェクト（本体）を返す手 AviUtl の
+    カスタムオブジェクトは空のテキストの最初のエフェクトにスクリプトを置いて中身にする
+    （``compat.aviutl.custom_object.custom_object_script``） 見分けるのに互換層とエフェクトの
+    定義が要るので、画面の側から渡す
+
+    本体は見た目ではなく中身として扱う（文字と同じ）
+    * 当てる先の本体は入れ替えでも消さない 消すと何も描かないクリップが残る
+    * プリセットの本体は「文字も一緒に」のときだけ当てる そのとき当てる先の本体は入れ替える
+      （同じクリップを作り直したいときの当て方 テキストへ当てるとカスタムオブジェクトになる）
+    * 本体を持つクリップへ本体の無いプリセットを当てても、文字は当てない 文字を入れると
+      空のテキストでなくなり、本体がカスタムオブジェクトの中身として読まれなくなる
+    当てる前に断る形は取らない 本体を残せば、足したエフェクト・欄の値・不透明度は
+    カスタムオブジェクトにもそのまま意味を持つ
     """
     chosen = options if options is not None else PresetOptions()
     fit = _fitter(preset, clip)
+    target_body = body_of(clip) if body_of is not None else None
+    saved_body = _saved_body(preset, body_of)
     commands: list[Command] = []
-    commands.extend(_source_commands(preset, clip, chosen, fit))
-    commands.extend(_effect_commands(preset, clip, chosen, fit, accepts))
+    keep_content = target_body is not None and saved_body is None
+    commands.extend(_source_commands(preset, clip, chosen, fit, keep_content=keep_content))
+    commands.extend(
+        _effect_commands(
+            preset, clip, chosen, fit, accepts, target_body=target_body, saved_body=saved_body
+        )
+    )
     commands.extend(_fixed_commands(preset, clip, chosen, fit, picture=picture, sound=sound))
     if picture and takes_picture_items(clip):
         # 場面切り替えとフィルタは不透明度・合成モード・切り抜きを読まない（設定パネルも
@@ -128,8 +152,27 @@ def _fitter(preset: Preset, clip: Clip) -> Callable[[ParamValue], ParamValue]:
     return lambda value: fitted_value(value, span, last)
 
 
+def _saved_body(preset: Preset, body_of: BodyOf | None) -> Effect | None:
+    """プリセットを保存したクリップの本体 保存したときのクリップの形へ組み直して見分ける"""
+    if body_of is None or preset.source is None:
+        return None
+    return body_of(
+        Clip(
+            timeline_start=0,
+            duration=preset.span or 1,
+            source=preset.source,
+            effects=preset.effects,
+        )
+    )
+
+
 def _source_commands(
-    preset: Preset, clip: Clip, options: PresetOptions, fit: Callable[[ParamValue], ParamValue]
+    preset: Preset,
+    clip: Clip,
+    options: PresetOptions,
+    fit: Callable[[ParamValue], ParamValue],
+    *,
+    keep_content: bool,
 ) -> list[Command]:
     saved = preset.source
     current = clip.source
@@ -139,7 +182,7 @@ def _source_commands(
         return []
     params = dict(current.params)
     for name, value in saved.params.items():
-        if not options.with_text and name in CONTENT_PARAMS:
+        if (keep_content or not options.with_text) and name in CONTENT_PARAMS:
             continue
         if not options.with_position and name in POSITION_PARAMS:
             continue
@@ -155,17 +198,36 @@ def _effect_commands(
     options: PresetOptions,
     fit: Callable[[ParamValue], ParamValue],
     accepts: Callable[[str], bool] | None,
+    *,
+    target_body: Effect | None,
+    saved_body: Effect | None,
 ) -> list[Command]:
     transition = clip.source is not None and clip.source.kind == _TRANSITION
     # 前の版のプリセットは長さを持たない それは足すだけの当て方で作られた物なので、
     # 入れ替えると、今まで足して重ねていた人の手元でエフェクトが消える
     replacing = preset.span is not None and not options.keep_effects
+    # 中身の種類が違えば本体も当てない（中身と同じ決まり） 図形に本体を足しても、
+    # 空のテキストでないのでカスタムオブジェクトにならず、ふつうのエフェクトとして残る
+    same_kind = (
+        clip.source is not None
+        and preset.source is not None
+        and clip.source.kind == preset.source.kind
+    )
+    swap_body = options.with_text and saved_body is not None and same_kind
     commands: list[Command] = []
-    for after, stack in ((False, preset.effects), (True, preset.after_effects)):
+    if swap_body and saved_body is not None:
+        if target_body is not None:
+            commands.append(RemoveEffect(clip.id, target_body.id))
+        # 本体は列の頭（カスタムオブジェクトは最初のエフェクトを本体として読む）
+        # 足してよい種類かは見ない 中身なので、エフェクトの一覧に出るかとは関係ない
+        commands.append(AddEffect(clip.id, _fresh(saved_body, fit), index=0))
+    for after, raw in ((False, preset.effects), (True, preset.after_effects)):
         if after and not transition:
             # 後の場面の列は場面切り替えだけが読む ほかのクリップへ足しても描かれず、
             # 設定パネルにも出ないので、消すこともできない列が残る
             continue
+        # 本体は上で中身として扱ったので、見た目の列からは外す
+        stack = [e for e in raw if after or saved_body is None or e.id != saved_body.id]
         added = [effect for effect in stack if accepts is None or accepts(effect.kind)]
         # 入れ替えるのは、プリセットの列がこのクリップへ当たるときだけ（列ごとに決める）
         # プリセットにエフェクトがあるのに 1 つも当たらない（映像のプリセットを音のクリップへ
@@ -177,8 +239,12 @@ def _effect_commands(
         if replacing and (added or not stack):
             own = clip.after_effects if after else clip.effects
             # 固定の項目（最初から持つ欄）は外せないので残す 外そうとすると命令が断られ、
-            # 当てる操作ごと取り消しになる
-            commands.extend(RemoveEffect(clip.id, e.id, after=after) for e in own if not e.fixed)
+            # 当てる操作ごと取り消しになる 本体も残す（入れ替えるときは上で外してある）
+            commands.extend(
+                RemoveEffect(clip.id, e.id, after=after)
+                for e in own
+                if not e.fixed and (after or target_body is None or e.id != target_body.id)
+            )
         commands.extend(AddEffect(clip.id, _fresh(e, fit), after=after) for e in added)
     return commands
 

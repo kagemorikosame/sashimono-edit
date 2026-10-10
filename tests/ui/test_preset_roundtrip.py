@@ -18,6 +18,9 @@ from PySide6.QtCore import QEvent
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox
 
+from sashimono.compat.aviutl import catalog as catalog_module
+from sashimono.compat.aviutl.catalog import ScriptCatalog, set_script_catalog
+from sashimono.compat.aviutl.custom_object import custom_object_clip, custom_object_script
 from sashimono.core.commands import (
     AddClip,
     AddEffect,
@@ -44,6 +47,8 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.sources import TEXT, TRANSITION
+from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+from sashimono.engine.render import FrameRenderer
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
@@ -406,6 +411,85 @@ class TestManyClips:
         # 映像のクリップは入れ替わり、音のクリップは自分のエフェクトのまま
         assert [e.kind for e in text.effects if not e.fixed] == ["glow"]
         assert [e.kind for e in located[1].effects if not e.fixed] == ["audio_reverb"]
+
+
+#: 画面の真ん中に白い円を描くだけのカスタムオブジェクト
+_CIRCLE = """@円
+--track0:大きさ,0,500,200,1
+obj.load("figure", "円", 0xffffff, obj.track0)
+"""
+_CIRCLE_KIND = "aviutl:試験/@図形集.obj:円"
+
+
+@pytest.fixture
+def circle_script() -> Iterator[str]:
+    """``@図形集.obj`` の ``@円`` だけを持つスクリプトの一覧 終わったら元へ戻す"""
+    saved = catalog_module._catalog
+    catalog = ScriptCatalog(roots=())
+    catalog.add_text(_CIRCLE_KIND, _CIRCLE, kind="obj")
+    set_script_catalog(catalog)
+    yield _CIRCLE_KIND
+    catalog_module._catalog = saved
+    if saved is not None:
+        saved.register_all()
+
+
+@pytest.fixture(scope="module")
+def gl_context() -> Iterator[OffscreenGLContext]:
+    try:
+        context = OffscreenGLContext()
+    except GLContextError as exc:
+        pytest.skip(f"OpenGL コンテキストを作れない: {exc}")
+    yield context
+    context.release()
+
+
+class TestCustomObject:
+    def test_the_script_survives_and_still_draws(
+        self,
+        window: MainWindow,
+        monkeypatch: pytest.MonkeyPatch,
+        circle_script: str,
+        gl_context: OffscreenGLContext,
+    ) -> None:
+        # カスタムオブジェクトは空のテキストの最初のエフェクトが本体のスクリプト 前は
+        # 入れ替えでふつうのエフェクトとして消え、エフェクトの無いテキストの見た目を
+        # 当てただけで何も描かなくなった
+        definition = registry.require(circle_script)
+        made = with_fixed_items(
+            custom_object_clip(definition.create(), duration=60, timeline_start=300),
+            picture=True,
+        )
+        source_clip, _, _ = _clips(window)
+        v2 = window.document.project.timeline.tracks[1]
+        transform = _fixed(source_clip, TRANSFORM_EFFECT_KIND)
+        _run(
+            window,
+            AddClip(v2.id, made),
+            # 足したエフェクトは無く、拡大率だけを持つ見た目 当てると拡大率が変わる
+            SetParam(
+                ParamPath.of_effect(source_clip.id, transform.id, "scale"), AnimatedValue(150.0)
+            ),
+        )
+        _select(window, source_clip.id)
+        _save(window, monkeypatch, "素の字")
+
+        _select(window, made.id)
+        _apply(window, "ユーザー", "素の字")
+        located = window.document.project.timeline.locate_clip(made.id)
+        assert located is not None
+        body = custom_object_script(located[1])
+        assert body is not None
+        assert body.kind == circle_script
+        assert _fixed(located[1], TRANSFORM_EFFECT_KIND).params["scale"] == AnimatedValue(150.0)
+
+        renderer = FrameRenderer(window.document.project, context=gl_context)
+        try:
+            image = renderer.render(310)
+        finally:
+            renderer.close()
+        height, width = image.shape[:2]
+        assert image[height // 2, width // 2, 0] > 200, image[height // 2, width // 2]
 
 
 class TestOptions:
