@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 
 from PySide6.QtCore import QCoreApplication, QPoint, QRect
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 
 from sashimono.ui.library_thumbnails import THUMBNAIL_SIZE, THUMBNAILS_FULL, LookThumbnails
 
@@ -21,7 +22,9 @@ __all__ = [
     "BACKDROP_DARK",
     "BACKDROP_LIGHT",
     "BACKDROP_MODES",
+    "VISIBLE_DELAY_MS",
     "LibraryOptions",
+    "failed_pixmap",
     "library_options",
     "set_library_options",
     "shared_thumbnails",
@@ -39,6 +42,8 @@ BACKDROP_MODES = (BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT)
 _DARK = QColor("#202020")
 _LIGHT = QColor("#f2f2f2")
 _CHECKER = (QColor("#9a9a9a"), QColor("#6e6e6e"))
+#: 読めなかった配布物の印の色 暗い地の上で目立つ赤
+_FAILED = QColor("#e05a5a")
 #: 市松の 1 目の大きさ（置いておく絵の画素）
 _CHECKER_CELL = 16
 
@@ -53,7 +58,15 @@ class LibraryOptions:
     backdrop: str = BACKDROP_CHECKER
     #: 消すときに確かめる
     confirm_delete: bool = True
+    #: テンプレートの棚の一覧にも見本の絵を出す（描き方は :attr:`thumbnails` と同じ）
+    shelf: bool = True
 
+
+#: 見えている項目の見本を頼むまで待つ長さ（ミリ秒）
+#: 0 にすると、窓を出したのと同じイベントの回りで走り係が動き出し、GIL を取り合って窓が
+#: 出るのが遅れる（手元の棚 266 本で 0.16 秒が 0.47 秒） 送り続けている間に通り過ぎた
+#: 項目まで頼まないためにもまとめる
+VISIBLE_DELAY_MS = 40
 
 _options = LibraryOptions()
 _thumbnails: LookThumbnails | None = None
@@ -80,7 +93,26 @@ def shared_thumbnails() -> LookThumbnails:
         if application is not None:
             # 走り係が動いたままプロセスを閉じると、スレッドごと壊れて落ちる
             application.aboutToQuit.connect(_thumbnails.release)
+        # イベントループを回さずに終わるとき（試験・道具の台本）は aboutToQuit が来ない
+        atexit.register(_thumbnails.release)
     return _thumbnails
+
+
+def failed_pixmap() -> QPixmap:
+    """読めなかった配布物の印 暗い地に赤い × 地だけにすると、描いている途中と見分けが付かない"""
+    pixmap = QPixmap(THUMBNAIL_SIZE)
+    painter = QPainter(pixmap)
+    try:
+        painter.fillRect(QRect(QPoint(0, 0), THUMBNAIL_SIZE), _DARK)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(_FAILED, 10))
+        middle_x, middle_y = THUMBNAIL_SIZE.width() // 2, THUMBNAIL_SIZE.height() // 2
+        arm = THUMBNAIL_SIZE.height() // 4
+        painter.drawLine(middle_x - arm, middle_y - arm, middle_x + arm, middle_y + arm)
+        painter.drawLine(middle_x - arm, middle_y + arm, middle_x + arm, middle_y - arm)
+    finally:
+        painter.end()
+    return pixmap
 
 
 def thumbnail_pixmap(image: QImage | None, backdrop: str) -> QPixmap:

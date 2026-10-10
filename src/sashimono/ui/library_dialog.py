@@ -63,6 +63,7 @@ from sashimono.core.io.presets import Preset
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import LookThumbnails, Thumbnail
 from sashimono.ui.library_view import (
+    VISIBLE_DELAY_MS,
     LibraryOptions,
     library_options,
     shared_thumbnails,
@@ -219,7 +220,7 @@ class LibraryDialog(QDialog):
 
         self._visible_timer = QTimer(self)
         self._visible_timer.setSingleShot(True)
-        self._visible_timer.setInterval(0)
+        self._visible_timer.setInterval(VISIBLE_DELAY_MS)
         self._visible_timer.timeout.connect(self._request_visible)
         self.refresh()
 

@@ -264,6 +264,10 @@ class ScriptResult:
     state: ObjectState | None = field(default=None, repr=False)
 
 
+#: DLL のモジュールを読んだランタイム 手放さずに持ち続ける（``_native_module`` を参照）
+_PINNED_RUNTIMES: list[LuaScriptRuntime] = []
+
+
 def lua_available() -> bool:
     """Lua ランタイムを用意できるか"""
     return _load_module() is not None
@@ -732,6 +736,16 @@ class LuaScriptRuntime:
             self._report.note_missing(f'モジュール "{name}" を読めない: {exc}')
             return None
         functions = {function: self._native_function(module, function) for function in module.names}
+        # DLL のモジュールを読んだランタイムは、プロセスが終わるまで手放さない
+        # 手放すと Lua の片付けの中で落ちる（アクセス違反 描画係を閉じた後のごみ集めで
+        # 起きた #277 棚の見本で AviUtl2 のエイリアスを続けて描いたとき） DLL の側が
+        # 片付けの順を前提にしているらしく、Python の側では順を決められない
+        # 持ち続けるのは DLL を読んだランタイムだけ（描画係 1 つに 1 つ）
+        if self not in _PINNED_RUNTIMES:
+            _PINNED_RUNTIMES.append(self)
+            # 一覧に入れるだけでは、プロセスの終わりの片付けで一覧ごと手放されて落ちる
+            # 参照を 1 つ余分に持たせ、終わりの片付けでも壊させない（OS が後で全部返す）
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(self))
         return self._lua.table_from(functions)
 
     def _native_function(self, module: native.NativeModule, name: str) -> Any:

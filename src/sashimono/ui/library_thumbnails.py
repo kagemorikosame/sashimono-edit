@@ -30,7 +30,12 @@ from sashimono.core.io.aliases import Alias
 from sashimono.core.io.library import look_fingerprint
 from sashimono.core.io.presets import Preset
 from sashimono.engine.cache.store import default_cache_root
-from sashimono.engine.render.look_preview import LookPicture, LookWorker
+from sashimono.engine.render.look_preview import (
+    LookFailure,
+    LookPicture,
+    LookWorker,
+    SampleSource,
+)
 
 __all__ = [
     "THUMBNAILS_FULL",
@@ -67,13 +72,20 @@ _MEMORY_LIMIT = 300
 #: 見えた物がなかったことを PNG に書いておく印
 _EMPTY_KEY = "sashimono-empty"
 
-Item = Preset | Alias
+#: 読めなかった配布物の印のファイル 中身は理由 同じ中身のまま開くたびに読み直さない
+_FAILED_SUFFIX = ".failed"
+
+Item = Preset | Alias | SampleSource
 
 
 class Thumbnail:
-    """配る 1 枚 ``image`` は ``None`` なら描けなかった（``error`` に理由）"""
+    """配る 1 枚 ``image`` は ``None`` なら描けなかった（``error`` に理由）
 
-    __slots__ = ("empty", "error", "image", "simple")
+    ``failed`` は中身が変わるまで何度やっても描けない物（読めない配布物） 見る側は失敗の
+    印の絵を出す
+    """
+
+    __slots__ = ("empty", "error", "failed", "image", "simple")
 
     def __init__(
         self,
@@ -82,11 +94,13 @@ class Thumbnail:
         simple: bool = False,
         empty: bool = False,
         error: str = "",
+        failed: bool = False,
     ) -> None:
         self.image = image
         self.simple = simple
         self.empty = empty
         self.error = error
+        self.failed = failed
 
 
 class LookThumbnails(QObject):
@@ -137,7 +151,8 @@ class LookThumbnails(QObject):
 
     def key_for(self, item: Item) -> str:
         drawing = "cpu" if self.simple else "gpu"
-        text = f"{_FORMAT}|{__version__}|{drawing}|{look_fingerprint(item)}"
+        fingerprint = item.fingerprint if isinstance(item, SampleSource) else look_fingerprint(item)
+        text = f"{_FORMAT}|{__version__}|{drawing}|{fingerprint}"
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
     def cached(self, item: Item) -> Thumbnail | None:
@@ -227,9 +242,19 @@ class LookThumbnails(QObject):
                 # GPU で頼んだのに簡易で描いた物（GPU が使えなかった）は置き場へ書かない
                 # 書くと、GPU の使える機械へ移ったときに、エフェクトの無い絵を掴み続ける
                 self._save(key, thumbnail.image, empty=result.empty)
-        else:
-            self._remember(key, Thumbnail(None, error=str(result)))
+        elif isinstance(result, LookFailure):
+            self._remember(key, Thumbnail(None, error=result.reason, failed=result.lasting))
+            if result.lasting:
+                # 読めない配布物は、中身が変わるまで読み直さない（鍵は中身の指紋）
+                # 覚えないと、棚を開くたびに何百もの壊れたファイルを読み直す
+                self._save_failure(key, result.reason)
         self.ready.emit(key)
+
+    def _save_failure(self, key: str, reason: str) -> None:
+        path = self._path(key).with_suffix(_FAILED_SUFFIX)
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(reason, encoding="utf-8")
 
     def _remember(self, key: str, thumbnail: Thumbnail) -> None:
         self._memory[key] = thumbnail
@@ -244,7 +269,12 @@ class LookThumbnails(QObject):
     def _load(self, key: str) -> Thumbnail | None:
         path = self._path(key)
         if not path.is_file():
-            return None
+            failure = path.with_suffix(_FAILED_SUFFIX)
+            try:
+                reason = failure.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
+            return Thumbnail(None, error=reason, failed=True)
         image = QImage(str(path))
         if image.isNull() or image.size() != THUMBNAIL_SIZE:
             # 壊れた絵（書きかけ・別の版の大きさ）は掴まずに描き直す
@@ -280,7 +310,8 @@ class LookThumbnails(QObject):
             return
         self._pruned = True
         try:
-            files = [path for path in folder.rglob("*.png") if path.is_file()]
+            # 失敗の印も数える 棚から消えた配布物の印が残り続けないように
+            files = [path for path in folder.rglob("*") if path.is_file()]
             if len(files) <= _DISK_LIMIT:
                 return
             files.sort(key=lambda path: path.stat().st_mtime)

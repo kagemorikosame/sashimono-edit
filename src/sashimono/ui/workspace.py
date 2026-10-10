@@ -349,6 +349,10 @@ class Preferences:
     #: 一覧から消すときに確かめる 既定は入 消した物はごみ箱から戻せるが、戻せることを
     #: 知らない人には黙って消えたように見える 何件も続けて整理する人は切れる
     library_confirm_delete: bool = True
+    #: テンプレートの棚の一覧にも見本の絵を出す 既定は入（利用者の決定） 描き方は上の
+    #: 「プリセットの見本」と同じ 棚は数が多く、GPU や置き場を使わせたくない人は切れる
+    #: 切っても選んだ 1 本の大きな下絵は出る
+    shelf_thumbnails: bool = True
     #: 設定パネルで、焦点の無い欄（クリックしていない選択の欄・数値の欄・スライダー）でも
     #: ホイールで値を変える 既定は切 切っていると、焦点の無い欄の上のホイールはパネルを送る
     #: 入れていると、パネルを送る途中で通った欄の値が変わり、気付かずに取り消しの段が積まれる
@@ -449,6 +453,7 @@ class Preferences:
             thumbnails=self.library_thumbnails,
             backdrop=self.library_backdrop,
             confirm_delete=self.library_confirm_delete,
+            shelf=self.shelf_thumbnails,
         )
 
     def prefetch_bytes(self) -> int:
@@ -545,6 +550,7 @@ class PreferenceStore:
             library_confirm_delete=_flag(
                 data.get("library_confirm_delete"), plain.library_confirm_delete
             ),
+            shelf_thumbnails=_flag(data.get("shelf_thumbnails"), plain.shelf_thumbnails),
             wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),

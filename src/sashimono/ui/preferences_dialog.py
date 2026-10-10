@@ -456,6 +456,14 @@ class PreferencesDialog(QDialog):
             "続けて何件も整理するときに確かめが煩わしければ切る"
         )
         form.addRow(self._library_confirm_delete)
+        self._shelf_thumbnails = QCheckBox("テンプレートの棚にも見本の絵を出す", self)
+        self._shelf_thumbnails.setChecked(preferences.shelf_thumbnails)
+        self._shelf_thumbnails.setToolTip(
+            "棚の一覧の名前の横に小さな見本を出す 描き方は「プリセットの見本」と同じで、"
+            "見えている物から別のスレッドで描き、描いた絵と読めなかった印は覚えておく "
+            "切っても、選んだ 1 本の大きな下絵は出る"
+        )
+        form.addRow(self._shelf_thumbnails)
 
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
@@ -757,6 +765,7 @@ class PreferencesDialog(QDialog):
             library_thumbnails=str(self._library_thumbnails.currentData()),
             library_backdrop=str(self._library_backdrop.currentData()),
             library_confirm_delete=self._library_confirm_delete.isChecked(),
+            shelf_thumbnails=self._shelf_thumbnails.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

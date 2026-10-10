@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import queue
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -47,9 +48,12 @@ __all__ = [
     "CANVAS",
     "MEASURED_LOOK_MS",
     "SAMPLE_TEXT",
+    "LookFailure",
     "LookPicture",
     "LookRenderer",
     "LookWorker",
+    "SampleError",
+    "SampleSource",
     "crop_to_content",
     "sample_project",
 ]
@@ -69,7 +73,37 @@ _MARGIN = 0.08
 #: 見えていると数える不透明度（0〜255） 影のぼかしの裾まで数えると、切り出しが広がりすぎる
 _VISIBLE = 8
 
-Item = Preset | Alias
+
+class SampleError(Exception):
+    """見本に置く物を作れなかった（配布物が読めない など） 中身が変わるまで何度やっても同じ"""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SampleSource:
+    """プリセット・エイリアス以外の見本（テンプレートの棚の配布物）
+
+    ``build`` は置いたプロジェクトと描くコマを返す 中身を読む重さごと走り係のスレッドで
+    呼ぶ 読めなければ :class:`SampleError` を投げる ``fingerprint`` は中身の指紋で、
+    見本の絵の鍵に使う（場所や更新時刻ではなく中身 同じ中身なら描き直さない）
+    """
+
+    fingerprint: str
+    build: Callable[[], tuple[Project, int]]
+
+
+@dataclass(frozen=True, slots=True)
+class LookFailure:
+    """描けなかった理由 ``lasting`` は中身が変わるまで何度やっても同じ失敗（読めない配布物）
+
+    続く失敗は見る側が覚えておき、開くたびに読み直さない GPU の都合のような一時の
+    失敗は覚えない（次に開いたときに描き直す）
+    """
+
+    reason: str
+    lasting: bool = False
+
+
+Item = Preset | Alias | SampleSource
 
 #: 見本 1 枚を描くのにかかった時間（ミリ秒） GPU（描画係を作った後）と簡易の描き方
 #: 設定の画面に出す RTX 5060 Ti で、グローを積んだテキストのプリセット 30 本の中央値
@@ -96,6 +130,8 @@ def sample_project(item: Item) -> tuple[Project, int]:
     プリセットは文字と位置も当てる（設定の当て方に関係なく） 見本は保存した見た目
     そのものを見せる物で、当てる先の事情は無い 文字を持たないプリセットは見本の文字に当てる
     """
+    if isinstance(item, SampleSource):
+        return item.build()
     project = Project.create()
     if isinstance(item, Alias):
         clip = item.instantiate(0)
@@ -196,6 +232,21 @@ def _render_simple(item: Item) -> np.ndarray:
 
     source: GeneratedSource | None
     duration = DEFAULT_GENERATED_FRAMES
+    if isinstance(item, SampleSource):
+        # 置いたプロジェクトの、中身を持つ最初のクリップを描く（棚の下絵と同じ考え）
+        project, frame = item.build()
+        clip = next(
+            (c for t in project.timeline.tracks for c in t.clips if c.source is not None), None
+        )
+        if clip is None or clip.source is None:
+            return np.zeros((CANVAS[1], CANVAS[0], 4), dtype=np.uint8)
+        image = render_source(
+            clip.source,
+            *CANVAS,
+            frame=max(0, frame - clip.timeline_start),
+            duration=clip.duration,
+        )
+        return image if image is not None else np.zeros((CANVAS[1], CANVAS[0], 4), np.uint8)
     if isinstance(item, Alias):
         source = item.clip.source
         duration = item.clip.duration
@@ -226,7 +277,7 @@ class LookWorker(QThread):
     止めた後は :meth:`stop` が画面のスレッドへ戻して捨てる
     """
 
-    #: 描き終えた（鍵, :class:`LookPicture` か描けなかった理由の文）
+    #: 描き終えた（鍵, :class:`LookPicture` か :class:`LookFailure`）
     drawn = Signal(str, object)
     #: GPU のコンテキストを作れなかった（理由） 以後は簡易の描き方で描く
     gpu_failed = Signal(str)
@@ -276,11 +327,14 @@ class LookWorker(QThread):
                     return
                 key, item = request
                 try:
-                    picture: LookPicture | str = renderer.render(item)
+                    picture: LookPicture | LookFailure = renderer.render(item)
+                except SampleError as exc:
+                    # 配布物が読めない 中身が変わるまで何度やっても同じなので、続く失敗と印す
+                    picture = LookFailure(f"読み込めません: {exc}", lasting=True)
                 except Exception as exc:
                     # 1 枚が描けなくても走り係は止めない 知らないエフェクトを持つ 1 件の
                     # せいで、ほかの見本まで出なくなる
-                    picture = f"見本を描けなかった: {exc}"
+                    picture = LookFailure(f"見本を描けなかった: {exc}")
                 self.drawn.emit(key, picture)
         finally:
             try:

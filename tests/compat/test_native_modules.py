@@ -468,3 +468,30 @@ class TestEditSection:
         seen = self._seen_by_dll()
         assert seen["last_function"] == seen["first_function"]
         assert seen["returned"] == 0
+
+
+class TestKeepingTheRuntime:
+    def test_a_runtime_that_read_a_dll_is_never_let_go(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # DLL のモジュールを読んだ Lua を手放すと、片付けの中でアクセス違反で落ちた
+        # （AviUtl2 の配布物の DLL 棚の見本で続けて描いた後のごみ集め #277）
+        from sashimono.compat.aviutl import runtime as runtime_module
+
+        module, keep = _module({"noop": lambda _param: None})
+        monkeypatch.setattr(native, "load", lambda _path: module)
+        runtime = LuaScriptRuntime(instruction_limit=200_000)
+        assert runtime._native_module(tmp_path / "試験.mod2", "試験") is not None
+        assert runtime in runtime_module._PINNED_RUNTIMES
+        # 2 度読んでも 1 つだけ持つ
+        runtime._native_module(tmp_path / "試験.mod2", "試験")
+        assert runtime_module._PINNED_RUNTIMES.count(runtime) == 1
+        assert keep
+
+    def test_a_plain_runtime_is_let_go(self) -> None:
+        # DLL を読まないランタイムまで持ち続けると、書き出しや静止画のたびに溜まっていく
+        from sashimono.compat.aviutl import runtime as runtime_module
+
+        runtime = LuaScriptRuntime(instruction_limit=200_000)
+        runtime.run("x = 1", _state())
+        assert runtime not in runtime_module._PINNED_RUNTIMES

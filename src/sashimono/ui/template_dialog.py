@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QIcon, QImage, QPixmap, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -41,7 +42,17 @@ from sashimono.compat.catalog import (
     template_catalog,
 )
 from sashimono.compat.mapped import MappedObject
+from sashimono.ui.library_thumbnails import LookThumbnails, Thumbnail
+from sashimono.ui.library_view import (
+    VISIBLE_DELAY_MS,
+    LibraryOptions,
+    failed_pixmap,
+    library_options,
+    shared_thumbnails,
+    thumbnail_pixmap,
+)
 from sashimono.ui.report_masking import marked_root_labels, mask_report, root_lines
+from sashimono.ui.shelf_looks import shelf_look
 from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, themed_style
 
@@ -52,6 +63,11 @@ _PREVIEW = (384, 216)
 
 #: 下絵を描くときの実寸 配布物は 1080p を前提にしている
 _CANVAS = (1920, 1080)
+
+#: 一覧の小さな見本の大きさ（論理の画素） 名前の行の高さに収まる程度
+_ICON = QSize(64, 36)
+#: 一覧の項目に持たせる見本の鍵 頼んだ物は 2 度頼まない（空は覚えた絵を貼った）
+_KEY = Qt.ItemDataRole.UserRole + 1
 
 
 def notes_text(
@@ -108,13 +124,26 @@ class TemplateDialog(QDialog):
         parent: QWidget | None = None,
         *,
         roots: tuple[Path, ...] | None = None,
+        thumbnails: LookThumbnails | None = None,
+        options: LibraryOptions | None = None,
     ) -> None:
         """``roots`` を渡すと、既定のフォルダではなくその置き場だけを並べる
 
         渡せないと「読み直す」が必ず本人のフォルダを見に行く 写真を撮る道具
         （``tools/shots.py``）は決まった置き場だけを並べたいので、その口を開ける
+        ``thumbnails`` と ``options`` は一覧の小さな見本（#277） 省くとプリセットの一覧と
+        同じ係と設定を使う
         """
         super().__init__(parent)
+        self._options = options if options is not None else library_options()
+        self._thumbnails = thumbnails if thumbnails is not None else shared_thumbnails()
+        self._thumbnails.ready.connect(self._on_thumbnail)
+        #: 見本の鍵ごとの一覧の項目 絵ができたら同じ鍵の項目へ貼る
+        self._waiting: dict[str, list[QTreeWidgetItem]] = {}
+        self._visible_timer = QTimer(self)
+        self._visible_timer.setSingleShot(True)
+        self._visible_timer.setInterval(VISIBLE_DELAY_MS)
+        self._visible_timer.timeout.connect(self._request_visible)
         self.setWindowTitle("テンプレート")
         self.resize(820, 520)
         self._catalog = catalog if catalog is not None else template_catalog()
@@ -131,6 +160,11 @@ class TemplateDialog(QDialog):
         self._tree.setHeaderLabels(["名前"])
         self._tree.setColumnCount(1)
         self._tree.currentItemChanged.connect(lambda *_: self._on_selected())
+        if self._shows_thumbnails():
+            self._tree.setIconSize(_ICON)
+        # 送ったり畳みを開いたりすると見える項目が変わる その見本を頼む
+        self._tree.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_visible())
+        self._tree.itemExpanded.connect(lambda _item: self._schedule_visible())
 
         self._preview = QLabel(self)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -222,9 +256,13 @@ class TemplateDialog(QDialog):
             # 読めない物ばかりの棚で 1 つずつ選んで確かめることになる
             node = QTreeWidgetItem([f"{entry.name}（読めません）" if entry.error else entry.name])
             node.setData(0, Qt.ItemDataRole.UserRole, entry)
+            if self._shows_thumbnails():
+                node.setIcon(0, self._backdrop_icon)
             group.addChild(node)
 
+        self._waiting.clear()
         self._tree.expandAll()
+        self._schedule_visible()
         if not groups:
             self._detail.setText(
                 # 区切りの空白が無いと、2 つの文が 1 つにつながって読める
@@ -232,6 +270,90 @@ class TemplateDialog(QDialog):
                 "AviUtl2 の Alias フォルダか、YMM4 の ItemTemplate フォルダを探します"
             )
         self._on_selected()
+
+    # --- 一覧の見本（#277） ---
+
+    def _shows_thumbnails(self) -> bool:
+        return self._options.shelf and self._thumbnails.enabled
+
+    @functools.cached_property
+    def _backdrop_icon(self) -> QIcon:
+        return QIcon(thumbnail_pixmap(None, self._options.backdrop))
+
+    def _schedule_visible(self) -> None:
+        if self._shows_thumbnails():
+            self._visible_timer.start()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt の名前
+        super().resizeEvent(event)
+        self._schedule_visible()
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt の名前
+        super().showEvent(event)
+        self._schedule_visible()
+
+    def _leaves(self) -> list[QTreeWidgetItem]:
+        found: list[QTreeWidgetItem] = []
+        for top in range(self._tree.topLevelItemCount()):
+            group = self._tree.topLevelItem(top)
+            if group is None:
+                continue
+            for row in range(group.childCount()):
+                child = group.child(row)
+                if child is not None:
+                    found.append(child)
+        return found
+
+    def _request_visible(self) -> None:
+        """見えている項目の見本だけを出す 棚は数百本あり、全部を頼むと開くのが遅れる"""
+        if not self._shows_thumbnails():
+            return
+        viewport = self._tree.viewport().rect()
+        for node in self._leaves():
+            if node.data(0, _KEY) is not None:
+                continue
+            if not self._tree.visualItemRect(node).intersects(viewport):
+                continue
+            entry = node.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(entry, TemplateEntry):
+                continue
+            look = shelf_look(entry)
+            cached = self._thumbnails.cached(look)
+            if cached is not None:
+                node.setData(0, _KEY, "")
+                self._show_thumbnail(node, cached)
+                continue
+            key = self._thumbnails.request(look)
+            if key is None:
+                continue
+            node.setData(0, _KEY, key)
+            self._waiting.setdefault(key, []).append(node)
+
+    def _on_thumbnail(self, key: str) -> None:
+        waiting = self._waiting.pop(key, [])
+        found = self._thumbnails.thumbnail(key)
+        if found is None:
+            return
+        for node in waiting:
+            self._show_thumbnail(node, found)
+
+    def _show_thumbnail(self, node: QTreeWidgetItem, thumbnail: Thumbnail) -> None:
+        if thumbnail.failed or (thumbnail.image is None and thumbnail.error):
+            # 読めない配布物は失敗の印 地だけにすると、描いている途中と見分けが付かない
+            node.setIcon(0, QIcon(failed_pixmap()))
+            node.setToolTip(0, thumbnail.error)
+        elif thumbnail.image is not None:
+            node.setIcon(0, QIcon(thumbnail_pixmap(thumbnail.image, self._options.backdrop)))
+            if thumbnail.empty:
+                # 画像を使う物・動きで後から出る物・エフェクトだけの物など 地だけの見本の理由
+                node.setToolTip(0, "見本のコマに見える物がない（素材の画像は見本では読まない）")
+            elif thumbnail.simple:
+                node.setToolTip(0, "見本は文字と図形だけ（エフェクトは出ていない）")
+
+    def done(self, result: int) -> None:
+        # 走り係は止めない（プリセットの一覧と同じ） 知らせだけ外す
+        self._thumbnails.ready.disconnect(self._on_thumbnail)
+        super().done(result)
 
     def _selected_entry(self) -> TemplateEntry | None:
         item = self._tree.currentItem()
