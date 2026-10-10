@@ -16,6 +16,7 @@ import pytest
 
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
+from sashimono.core.io.aliases import Alias
 from sashimono.core.io.serialize import json_text, project_from_dict, project_to_dict
 from sashimono.core.model import (
     Clip,
@@ -341,6 +342,35 @@ class TestFixingTypos:
         result = _call(host, "replace_subtitle_text", pairs=[{"from": "誤字", "to": "正字"}])
         assert result["burned_text_clips"] == 3
         located = host.document.project.timeline.locate_clip(stranger.id)
+        assert located is not None
+        kept = located[1]
+        assert kept.source is not None
+        assert "誤字" in str(kept.source.params["text"])
+
+    def test_a_copy_placed_from_an_alias_is_left_alone(self, video_media: MediaItem) -> None:
+        # 焼き込んだテキストをエイリアスにして置いた写しは、見た目を借りただけの別の文字
+        # 前は字幕の行の印が写しにも残り、誤植を直すと写しの文字まで書き換えた（#282）
+        host = _host(video_media)
+        _call(host, "place_subtitles")
+        burned = [
+            c
+            for t in host.document.project.timeline.tracks
+            for c in t.clips
+            if c.source is not None
+        ]
+        copy = Alias.of("焼き込み", burned[10]).instantiate(at_frame=burned[-1].timeline_end + 30)
+        project = host.document.project
+        extra = Track(TrackKind.VIDEO, "写し", (copy,))
+        host = FakeHost(
+            project.with_timeline(
+                replace(project.timeline, tracks=(*project.timeline.tracks, extra))
+            )
+        )
+        result = _call(host, "replace_subtitle_text", pairs=[{"from": "誤字", "to": "正字"}])
+        assert result["burned_text_clips"] == 3
+        # 本文は直す前の字幕と同じなので、印の無いテキストとして数だけ返す
+        assert result["unmarked_text_clips"] == 1
+        located = host.document.project.timeline.locate_clip(copy.id)
         assert located is not None
         kept = located[1]
         assert kept.source is not None
