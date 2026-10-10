@@ -93,6 +93,42 @@ class TestShelfRoots:
             dialog.close()
 
 
+class TestShelfThumbnailsInShots:
+    """棚の写真は、一覧の見本が描き終わってから撮る
+
+    見本は別のスレッドで後から埋まる 待たずに撮ると、地だけの小さな見本が写る
+    """
+
+    def test_it_waits_for_the_pictures_not_for_time(
+        self, shots: ModuleType, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        del qt_application
+        from sashimono.ui.library_thumbnails import THUMBNAILS_SIMPLE, LookThumbnails
+        from sashimono.ui.library_view import LibraryOptions
+        from sashimono.ui.shelf_looks import shelf_look
+        from sashimono.ui.template_dialog import TemplateDialog
+
+        for number in range(3):
+            (tmp_path / f"見本{number}.object").write_text(SAMPLE_ALIAS, encoding="utf-8")
+        thumbnails = LookThumbnails(tmp_path / "cache", mode=THUMBNAILS_SIMPLE)
+        dialog = TemplateDialog(
+            TemplateCatalog(),
+            roots=(tmp_path,),
+            thumbnails=thumbnails,
+            options=LibraryOptions(thumbnails=THUMBNAILS_SIMPLE),
+        )
+        try:
+            dialog.show()
+            shots.wait_for_thumbnails(dialog)
+            assert dialog.thumbnails_settled()
+            for node in dialog._leaves():
+                found = thumbnails.cached(shelf_look(node.data(0, 256)))
+                assert found is not None and found.image is not None
+        finally:
+            dialog.close()
+            thumbnails.release()
+
+
 class TestSampleTemplates:
     """写真に写すテンプレートは、道具が書いた見本だけ
 

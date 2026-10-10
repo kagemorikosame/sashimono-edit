@@ -100,6 +100,25 @@ class TestSimple:
 
 
 @pytest.mark.usefixtures("gpu")
+def test_closing_the_renderer_hands_the_lua_back() -> None:
+    # 返さないと、配布物の DLL を読んだランタイム（手放せない）が描画係の数だけ積み上がる
+    # 書き出し 20 回で 5.9GB 増えた
+    from sashimono.engine.render.renderer import FrameRenderer
+
+    project, _ = sample_project(Preset.capture("見出し", _clip()))
+    renderer = FrameRenderer(project)
+    closed: list[bool] = []
+
+    class Stage:
+        def close(self) -> None:
+            closed.append(True)
+
+    renderer._scripts = Stage()  # type: ignore[assignment]
+    renderer.close()
+    assert closed == [True]
+
+
+@pytest.mark.usefixtures("gpu")
 class TestGpu:
     def test_effects_reach_the_picture(self) -> None:
         # 簡易の描き方ではグローが出ない GPU の見本はグローの分だけ見える所が広がる

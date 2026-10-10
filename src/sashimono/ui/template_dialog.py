@@ -18,7 +18,7 @@ import functools
 from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QDialog,
@@ -117,6 +117,9 @@ def notes_text(
 
 class TemplateDialog(QDialog):
     """テンプレートを選んで、置くか着せるかを決める"""
+
+    #: 見えている項目の見本がそろった（:meth:`thumbnails_settled` が真になった）
+    thumbnails_done = Signal()
 
     def __init__(
         self,
@@ -328,14 +331,26 @@ class TemplateDialog(QDialog):
                 continue
             node.setData(0, _KEY, key)
             self._waiting.setdefault(key, []).append(node)
+        self._tell_if_settled()
 
     def _on_thumbnail(self, key: str) -> None:
         waiting = self._waiting.pop(key, [])
         found = self._thumbnails.thumbnail(key)
-        if found is None:
-            return
-        for node in waiting:
-            self._show_thumbnail(node, found)
+        if found is not None:
+            for node in waiting:
+                self._show_thumbnail(node, found)
+        if waiting:
+            self._tell_if_settled()
+
+    def thumbnails_settled(self) -> bool:
+        """見えている項目の見本がそろったか（出さない設定なら常に真） 写真を撮る道具が待つ"""
+        if not self._shows_thumbnails():
+            return True
+        return not self._waiting and not self._visible_timer.isActive()
+
+    def _tell_if_settled(self) -> None:
+        if self.thumbnails_settled():
+            self.thumbnails_done.emit()
 
     def _show_thumbnail(self, node: QTreeWidgetItem, thumbnail: Thumbnail) -> None:
         if thumbnail.failed or (thumbnail.image is None and thumbnail.error):

@@ -1112,6 +1112,10 @@ class FrameRenderer:
             self._compositor.release()
         if self._owns_context:
             self._context.release()
+        if self._scripts is not None:
+            # Lua のランタイムを返す 配布物の DLL を読んだ物は次の描画係が使い回す
+            self._scripts.close()
+            self._scripts = None
 
     def _draw_clip(
         self,

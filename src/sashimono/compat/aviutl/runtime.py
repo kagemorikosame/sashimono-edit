@@ -266,6 +266,32 @@ class ScriptResult:
 
 #: DLL のモジュールを読んだランタイム 手放さずに持ち続ける（``_native_module`` を参照）
 _PINNED_RUNTIMES: list[LuaScriptRuntime] = []
+#: 手放せないランタイムのうち、いま誰も使っていない物 次に描画係が要るときに使い回す
+#: 使い回さないと、書き出し・静止画・見本の描画係を作るたびに 1 つずつ積み上がる
+#: （描画係ごと握られて 1 つ 300MB 近く 書き出し 20 回で 5.9GB 増えた）
+_IDLE_RUNTIMES: list[LuaScriptRuntime] = []
+_IDLE_LOCK = threading.Lock()
+
+
+def acquire_runtime(*, render_source: Any = None, apply_effects: Any = None) -> LuaScriptRuntime:
+    """ランタイムを借りる 手の空いている手放せないランタイムがあれば、それを使い回す"""
+    with _IDLE_LOCK:
+        idle = _IDLE_RUNTIMES.pop() if _IDLE_RUNTIMES else None
+    if idle is None:
+        return LuaScriptRuntime(render_source=render_source, apply_effects=apply_effects)
+    idle.rebind(render_source=render_source, apply_effects=apply_effects)
+    return idle
+
+
+def release_runtime(runtime: LuaScriptRuntime) -> None:
+    """借りたランタイムを返す 手放せない物は状態を消して取っておく ほかは手放す"""
+    runtime.rebind()
+    if not runtime.pinned:
+        return
+    runtime.reset()
+    with _IDLE_LOCK:
+        if runtime not in _IDLE_RUNTIMES:
+            _IDLE_RUNTIMES.append(runtime)
 
 
 def lua_available() -> bool:
@@ -350,6 +376,61 @@ class LuaScriptRuntime:
         self._found: dict[tuple[object, ...], Path | None] = {}
         #: 置き場ごとの深い所のモジュールの索引（:meth:`_deep_index`）
         self._deep: dict[Path, dict[tuple[str, str], Path]] = {}
+        #: 用意したての大域変数 使い回すとき（:meth:`reset`）にここへ戻す
+        self._baseline: dict[Any, Any] = dict(self._lua.globals().items())
+        #: 用意したての標準の表の中身（``string`` ``math`` など） スクリプトが標準の表へ
+        #: 関数を足すと、大域変数を戻すだけでは次の描画に残る
+        self._baseline_tables: dict[Any, dict[Any, Any]] = {
+            key: dict(value.items())
+            for key, value in self._baseline.items()
+            if self._lua_type(value) == "table"
+        }
+
+    # --- 使い回し ---
+
+    @property
+    def pinned(self) -> bool:
+        """DLL のモジュールを読み、手放せなくなったか（:meth:`_native_module`）"""
+        return self in _PINNED_RUNTIMES
+
+    def rebind(
+        self,
+        *,
+        render_source: Any = None,
+        apply_effects: Any = None,
+        report: CompatibilityReport | None = None,
+    ) -> None:
+        """描く側の手を付け替える 使い回すときに、前の描画係を握ったままにしない"""
+        self._render_source = render_source
+        self._apply_effects = apply_effects
+        self._report = report if report is not None else global_report
+
+    def reset(self) -> None:
+        """前の描画の状態を消す スクリプトが置いた大域変数と、標準の表へ足した物を捨てる
+
+        使い回したランタイムで、前の書き出しのスクリプトが残した値が次の描画に見えると、
+        同じプロジェクトでも描くたびに絵が変わる 読んだモジュールは残す（1 つの描画係の
+        中で描画をまたいで使っていたのと同じ扱い）
+        """
+        with self._lock:
+            # 大域変数の表そのもの（_G）も用意したての表に入っているので、足された
+            # 大域変数もここで消える
+            for name, contents in self._baseline_tables.items():
+                table = self._baseline[name]
+                for key in list(table.keys()):
+                    if key not in contents:
+                        table[key] = None
+                for key, value in contents.items():
+                    table[key] = value
+            # 中身を足された package は作り直す（:meth:`_install_globals` と同じ形）
+            self._lua.execute("package = { loaded = {} }")
+            self._injected.clear()
+            self._folder = None
+            # 読んだモジュールの表（_modules）は残す DLL の関数の表を手放して Lua に
+            # 片付けさせると、片付けの中で落ちる（手放せない理由と同じ） モジュールは
+            # 1 つの描画係の中でも描画をまたいで同じ表を使っていた
+            self._found.clear()
+            self._deep.clear()
 
     # --- 準備 ---
 
