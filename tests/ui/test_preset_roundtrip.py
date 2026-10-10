@@ -75,6 +75,21 @@ def _flush() -> None:
     QApplication.processEvents()
 
 
+@pytest.fixture(autouse=True)
+def no_modal_boxes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """知らせと問いの小窓を開かせない 開くと試験が止まったまま返らない
+
+    当てて何も変わらなかったときの知らせや、上書きの問いが思わぬ所で出ると、CI は落ちずに
+    時間切れまで待つ 出たら試験を落とす 問いに答える試験は、自分で差し替える
+    """
+
+    def refuse(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        pytest.fail(f"思わぬ小窓が出た: {args[2] if len(args) > 2 else args}")
+
+    for name in ("information", "warning", "question"):
+        monkeypatch.setattr(QMessageBox, name, refuse)
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> PresetStore:
     return PresetStore(tmp_path / "presets")
