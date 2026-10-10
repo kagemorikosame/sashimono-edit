@@ -132,17 +132,19 @@ def theme_left_behind(qt_application: QApplication) -> Iterator[None]:
 
     mode, current, sheet = theme._mode, theme.current_theme(), qt_application.styleSheet()
     yield
-    if (theme._mode, theme.current_theme()) == (mode, current):
-        return
-    if sheet:
-        # 前もテーマを当てた形（スタイルシートあり） 同じ選び方で当て直す
-        theme.apply_theme(qt_application, mode)
-        return
-    # 前はテーマを当てていない形 色だけを戻し、当てた物を外す
-    theme._mode = mode
-    theme.use_palette(current)
-    qt_application.setStyleSheet("")
-    qt_application.styleHints().setColorScheme(Qt.ColorScheme.Unknown)
+    if (theme._mode, theme.current_theme()) != (mode, current):
+        if sheet:
+            # 前もテーマを当てた形（スタイルシートあり） 同じ選び方で当て直す
+            theme.apply_theme(qt_application, mode)
+        else:
+            # 前はテーマを当てていない形 色だけを戻し、当てた物を外す
+            theme._mode = mode
+            theme.use_palette(current)
+            qt_application.styleHints().setColorScheme(Qt.ColorScheme.Unknown)
+    # スタイルシートだけを書き換えて終えた試験は、テーマの選び方も色も変わらない 選び方と
+    # 色だけを見ると、書き換えた見た目（縁や余白）が後の試験に残る 最後に元の物と比べて戻す
+    if qt_application.styleSheet() != sheet:
+        qt_application.setStyleSheet(sheet)
 
 
 @pytest.fixture(autouse=True)
