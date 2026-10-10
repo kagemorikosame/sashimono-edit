@@ -16,9 +16,12 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     GroupId,
+    MediaId,
     MediaItem,
     Project,
     SceneId,
+    SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
     new_clip_id,
@@ -128,6 +131,10 @@ class TestPlacingOnAChosenTrack:
         assert add.track_id == project.timeline.tracks[1].id
 
 
+#: 字幕から焼き込んだテキストが持つ印 素材 1 本の音声 1 の 1 行を指す
+_ORIGIN = SubtitleOrigin(media_id=MediaId("本編"), stream=1, segment_id=SegmentId("行"))
+
+
 def _styled_text() -> Clip:
     blur = registry.get("blur")
     assert blur is not None
@@ -164,6 +171,30 @@ class TestAliases:
         clip = replace(_styled_text(), group_id=GroupId("g1"), link_group=GroupId("l1"))
         alias = Alias.of("束", clip)
         assert alias.clip.group_id is None and alias.clip.link_group is None
+
+    def test_the_subtitle_mark_is_not_carried(self, tmp_path: Path) -> None:
+        # 字幕から焼き込んだテキストの印を持ち込むと、置いた写しが素材と一緒にずれる仲間に
+        # 数えられ、字幕の誤植を直すと写しの文字まで書き換わる（#282）
+        clip = replace(_styled_text(), subtitle_origin=_ORIGIN)
+        alias = Alias.of("焼き込み", clip)
+        assert alias.clip.subtitle_origin is None
+        store = AliasStore(tmp_path)
+        store.save(alias)
+        (loaded,) = store.all()
+        assert loaded.instantiate(at_frame=10).subtitle_origin is None
+
+    def test_an_old_file_with_the_mark_places_without_it(self, tmp_path: Path) -> None:
+        # 印を外す前の版で保存したエイリアスには印が書いてある 置くときに外さないと、
+        # 古いファイルから置いた写しだけ字幕の仲間のまま残る
+        old = Alias("焼き込み", replace(_styled_text(), timeline_start=0, subtitle_origin=_ORIGIN))
+        path = tmp_path / "焼き込み.smea"
+        path.write_text(json.dumps(old.to_dict(), ensure_ascii=False), "utf-8")
+        assert "subtitle_origin" in json.loads(path.read_text("utf-8"))["clip"]
+        loaded = AliasStore(tmp_path).load(path)
+        placed = loaded.instantiate(at_frame=10)
+        assert placed.subtitle_origin is None
+        # 印のほかは前のまま置く
+        assert placed.source == old.clip.source
 
     def test_clips_with_media_or_scenes_are_refused(self, video_media: MediaItem) -> None:
         # 素材の道は本人の機械にしか無く、シーンの中身は元のプロジェクトにしか無い

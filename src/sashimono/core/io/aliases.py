@@ -3,7 +3,8 @@
 AviUtl のエイリアスと同じ使い方をする 作り込んだテロップ（書体・色・縁・動き）を
 保存しておけば、右クリックの〔追加〕→〔エイリアス〕から同じ物を置ける
 
-保存するのはクリップの中身だけ 置いた位置・リンク・グループはその場所の事情なので持たない
+保存するのはクリップの中身だけ 置いた位置・リンク・グループ・字幕の出どころはその場所の
+事情なので持たない
 長さは持つ（置き直したときに同じ長さで出る方が、作った時の動きと合う）
 
 クリップの書き方はプロジェクトファイルと同じ（:func:`~sashimono.core.io.serialize.clip_to_json`）
@@ -83,13 +84,21 @@ class Alias:
 
     @classmethod
     def of(cls, name: str, clip: Clip) -> Alias:
-        """クリップから作る 置いた場所の事情（位置・リンク・グループ）は外す"""
+        """クリップから作る 置いた場所の事情（位置・リンク・グループ・字幕の出どころ）は外す
+
+        字幕の出どころ（:attr:`Clip.subtitle_origin`）は、字幕から焼き込んだテキストが
+        どの字幕の行から来たかの印 エイリアスは見た目を持ち運ぶ物で、置いた写しは字幕の
+        行とつながらない 残すと、写しが素材と一緒にずれる仲間に数えられ、字幕の誤植を
+        直すと写しの文字まで書き換わる（#282）
+        """
         reason = alias_refusal(clip)
         if reason is not None:
             raise ValueError(reason)
         return cls(
             name=name,
-            clip=replace(clip, timeline_start=0, link_group=None, group_id=None),
+            clip=replace(
+                clip, timeline_start=0, link_group=None, group_id=None, subtitle_origin=None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +135,9 @@ class Alias:
 
         同じエイリアスを 2 回置いたときに ID が重なると、片方を消したつもりで両方を
         探し当てたり、プロジェクトの検査に断られたりする
+
+        字幕の出どころもここで外す :meth:`of` で外すより前の版が保存したエイリアスには
+        印が残っていて、読み込んだだけでは消えない（#282）
         """
         clip = self.clip
         return replace(
@@ -134,6 +146,7 @@ class Alias:
             effects=_fresh(clip.effects),
             after_effects=_fresh(clip.after_effects),
             id=new_clip_id(),
+            subtitle_origin=None,
         )
 
 
