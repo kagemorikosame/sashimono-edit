@@ -83,6 +83,7 @@ from sashimono.core.io import (
     backup_folder,
     default_state_root,
     discard,
+    discard_items,
     find_orphans_in,
     forget_empty_roots,
     hold_new,
@@ -954,13 +955,15 @@ class MainWindow(QMainWindow):
         if state_root_for(preferences) != state_root_for(previous):
             self._move_recovery(state_root_for(preferences))
         if approved_trim:
-            # 上限を入れた・下げた 消すのは設定画面の OK で見せて確かめた物だけ
-            # 確かめた後に退避を新しい置き場へ移すと、置き場の中身が変わって計画が変わる
-            # 計画どおりに消すと、確かめに出していない控えまで消える 収まりきらない分は
-            # 次の上書き保存のときの片付け（消した物を知らせる）に任せる
-            trimmed = self._trim_state(allowed=[p for item in approved_trim for p in item.paths])
-            if trimmed:
-                self.statusBar().showMessage(trimmed, 15000)
+            # 世代数で詰める控えと容量の上限で片付ける物 消すのは設定画面の OK で見せて
+            # 確かめた物そのもの 当てる時に計画を立て直すと、確かめた後に退避を移したなどで
+            # 中身が変わり、見せていない物まで消える 見せた数と消える数をそろえる
+            # 上限に収まりきらない分は、次の上書き保存のときの片付け（消した物を知らせる）に任せる
+            done = discard_items(approved_trim)
+            if done:
+                self.statusBar().showMessage(
+                    "確かめた物を片付けた: " + describe_trim(done).replace("\n", " "), 15000
+                )
 
     def _apply_autosave_timer(self, preferences: Preferences) -> None:
         """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
@@ -2206,12 +2209,14 @@ class MainWindow(QMainWindow):
         root = state_root_for(preferences)
         default = default_state_root()
         note = ""
+        # 1 回の保存で消すのは入れ替えの 1 本まで 世代数を超えた分は、設定画面で見せて
+        # 確かめたときにだけ詰める（置き場を変えた先や、別の窓の設定で超えていても黙って消さない）
         try:
-            backup_before_save(target, root, keep=keep)
+            backup_before_save(target, root, keep=keep, most=1)
         except OSError as exc:
             if root == default:
                 raise
-            backup_before_save(target, default, keep=keep)
+            backup_before_save(target, default, keep=keep, most=1)
             note = f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
         # 控えを足したぶん上限を超えうる 超えたら古い物から片付けて、何を消したかを添える
         trimmed = self._trim_state()
@@ -2366,27 +2371,27 @@ class MainWindow(QMainWindow):
         try:
             self._write_recovery(project)
         except OSError as exc:
-            if not self._fall_back_recovery(exc):
+            if not self._fall_back_recovery(exc, project):
                 self.statusBar().showMessage(f"自動退避に失敗した: {exc}", 5000)
-                return
-            try:
-                self._write_recovery(project)
-            except OSError as again:
-                self.statusBar().showMessage(f"自動退避に失敗した: {again}", 5000)
                 return
         self._autosaved = project
 
-    def _write_recovery(self, project: Project) -> None:
+    def _write_recovery(self, project: Project, session: RecoverySession | None = None) -> None:
+        target = session if session is not None else self._recovery
         if self.is_modified:
-            self._recovery.save(project, self._path)
+            target.save(project, self._path)
         else:
-            self._recovery.clear()
+            target.clear()
 
-    def _fall_back_recovery(self, exc: OSError) -> bool:
-        """選んだ置き場へ退避を書けなくなった（ドライブを抜いた・回線が切れた）
+    def _fall_back_recovery(self, exc: OSError, project: Project) -> bool:
+        """選んだ置き場へ退避を書けなくなった（ドライブを抜いた・回線が切れた・満杯）
 
-        この起動の残りは既定の置き場へ書く 戻せたら真 もう既定の置き場なら偽
+        この起動の残りは既定の置き場へ書く 既定の置き場へ書けたら真 書けなければ偽
         書けない所へ 30 秒ごとに書きに行き続けると、退避が黙って止まったままになる
+
+        既定の置き場へ ``project`` を書き終えてから、前の置き場のセッションを閉じる
+        閉じると前の置き場の退避（最後に書けた中身）を消すので、先に閉じて既定の側も
+        書けないと、どちらにも何も残らない
         """
         default = default_state_root()
         if self._recovery_root == default:
@@ -2395,9 +2400,17 @@ class MainWindow(QMainWindow):
             replacement = RecoverySession(default)
         except (OSError, RuntimeError):
             return False
+        try:
+            self._write_recovery(project, replacement)
+        except OSError:
+            # 既定の側にも書けない 前の置き場のセッション（最後に書けた退避）を残して続ける
+            with contextlib.suppress(OSError):
+                replacement.close()
+            return False
         failed, self._recovery = self._recovery, replacement
         failed_root, self._recovery_root = self._recovery_root, default
-        # 書けない置き場の錠は手放すだけ 消しに行っても書けない所なので失敗する
+        # 書けない置き場の錠を手放す 古い退避を消しに行って失敗しても（書けない所なので）
+        # 既定の側に新しい退避があるので困らない
         with contextlib.suppress(OSError):
             failed.close()
         self._tell_state_fallback(failed_root, default, exc)
@@ -2460,10 +2473,11 @@ class MainWindow(QMainWindow):
         if notes:
             self.statusBar().showMessage(" ／ ".join(notes), 15000)
 
-    def _trim_state(self, allowed: Sequence[Path] | None = None) -> str:
+    def _trim_state(self) -> str:
         """容量の上限を超えていれば古い物から片付ける 知らせる言葉を返す（無ければ空）
 
-        ``allowed`` を渡すと、その中の物だけを消す（設定画面で確かめた一覧）
+        上限を入れた後の、上書き保存と起動のときの片付け 上限は入れるときに消える物を
+        見せて確かめてあり、その後は決まりとして古い物から消し、消した物を必ず知らせる
         """
         limit_mb = self._preferences.state_limit_mb
         if limit_mb <= 0:
@@ -2471,7 +2485,7 @@ class MainWindow(QMainWindow):
         items = []
         for root in state_roots(self._preferences):
             with contextlib.suppress(OSError):
-                items.extend(trim_state(limit_mb * 1024 * 1024, root, allowed=allowed))
+                items.extend(trim_state(limit_mb * 1024 * 1024, root))
         if not items:
             return ""
         return f"容量の上限 {limit_mb}MB を超えたので片付けた: " + describe_trim(items).replace(

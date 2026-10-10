@@ -19,12 +19,14 @@ from sashimono.core.io import (
     backup_folder,
     backups_over,
     discard,
+    discard_items,
     find_orphans,
     find_orphans_in,
     folder_problem,
     forget_empty_roots,
     load_project,
     mark_offered,
+    plan_prune,
     plan_trim,
     recovery,
     remember_root,
@@ -440,3 +442,51 @@ class TestRememberedFolders:
         forget_empty_roots([tmp_path / "C"], registry)
         # B は空なので忘れる A は落ちた作業が残っている C は今使っている
         assert remembered_roots(registry) == [tmp_path / "C", tmp_path / "A"]
+
+
+class TestPruningGenerations:
+    """世代数で消す控え 見せた数と消える数を一致させる"""
+
+    def _made(self, state: Path, count: int) -> list[Path]:
+        target = state.parent / "本編.sme"
+        made = []
+        for number in range(count):
+            target.write_bytes(bytes([number]) * 100)
+            copied = backup_before_save(target, state, keep=200)
+            assert copied is not None
+            made.append(copied)
+        return made
+
+    def test_a_save_drops_at_most_what_it_is_told(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 6)
+        target = tmp_path / "本編.sme"
+        backup_before_save(target, state, keep=2, most=1)
+        assert not made[0].exists()
+        assert all(path.is_file() for path in made[1:])
+
+    def test_the_plan_matches_the_count(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 6)
+        plan = plan_prune(2, state)
+        assert [item.paths for item in plan] == [(path,) for path in made[:4]]
+        assert backups_over(2, state) == len(plan)
+        assert all(path.is_file() for path in made)
+
+    def test_discarding_the_plan_removes_exactly_it(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 6)
+        plan = plan_prune(2, state)
+        # 同じ物が 2 つの一覧（世代数と容量）に入っていても 1 度だけ数える
+        done = discard_items([*plan, plan[0]])
+        assert len(done) == 4
+        assert [path.exists() for path in made] == [False] * 4 + [True] * 2
+
+    def test_the_size_plan_leaves_out_what_pruning_frees(self, tmp_path: Path) -> None:
+        # 世代数で空く分を知らずに容量の計画を立てると、余計な物まで挙げる
+        state = tmp_path / "state"
+        made = self._made(state, 6)
+        pruned = [path for item in plan_prune(2, state) for path in item.paths]
+        assert plan_trim(state_usage(state) - 300, state, already=pruned) == []
+        extra = plan_trim(state_usage(state) - 450, state, already=pruned)
+        assert [item.paths for item in extra] == [(made[4],)]

@@ -489,7 +489,7 @@ class TestTheRecoveryFolder:
         assert window._recovery.path.is_file()
         # 後の片付けも最後まで走る
         assert not oldest.exists()
-        assert "容量の上限" in window.statusBar().currentMessage()
+        assert "確かめた物を片付けた" in window.statusBar().currentMessage()
 
     def test_an_unreachable_old_folder_is_told(
         self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

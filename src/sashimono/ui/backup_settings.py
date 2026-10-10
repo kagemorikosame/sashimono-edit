@@ -14,7 +14,9 @@
   書けなくなったら、その起動は既定の置き場へ戻して知らせる（黙って退避を止めない）
 - 同期フォルダ（OneDrive など）とネットワークの置き場は、選べるが確かめる 数十秒おきの退避が
   そのまま同期され、回線が切れると書けなくなる
-- 世代数を減らすときは、次の上書き保存で消える数を見せて確かめる その場では消さない
+- 世代数を減らす・バックアップを入れ直す・置き場を変えるときは、当てる先で世代数を超えた
+  控えを見せて確かめ、OK でその場で見せた物だけを消す 保存のときは 1 本作って 1 本消す
+  入れ替えだけにして、それより多くは消さない（見せた数と消える数を一致させる）
 - 残った退避を日数で片付けるのは、起動して復元を尋ねた後だけ 一度も勧めていない退避は消さない
 - 容量の上限は、選んだ置き場と既定の置き場のそれぞれに掛ける 世代数の上限とは別に効き、
   先に当たった方で消える 開いている作業の今の退避・まだ勧めていない落ちた作業・
@@ -24,6 +26,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -39,9 +42,9 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.io import (
-    backups_over,
     default_state_root,
     folder_problem,
+    plan_prune,
     plan_trim,
     remembered_roots,
 )
@@ -62,6 +65,7 @@ __all__ = [
     "describe_trim",
     "folder_caution",
     "folder_refusal",
+    "plan_prune_all",
     "plan_trim_all",
     "recovery_roots",
     "state_root_for",
@@ -117,12 +121,29 @@ def describe_trim(items: list[TrimItem]) -> str:
     return f"{len(items)} 件 {size:.1f}MB\n" + "\n".join(lines)
 
 
-def plan_trim_all(preferences: Preferences) -> list[TrimItem]:
-    """容量の上限で片付ける物（全部の置き場） 上限が無ければ空"""
+def plan_trim_all(preferences: Preferences, already: Iterable[Path] = ()) -> list[TrimItem]:
+    """容量の上限で片付ける物（全部の置き場） 上限が無ければ空
+
+    ``already`` は同じ確かめで先に消すと決めた物（:func:`plan_prune_all`）
+    """
     if preferences.state_limit_mb <= 0:
         return []
     limit = preferences.state_limit_mb * 1024 * 1024
-    return [item for root in state_roots(preferences) for item in plan_trim(limit, root)]
+    gone = list(already)
+    return [
+        item for root in state_roots(preferences) for item in plan_trim(limit, root, already=gone)
+    ]
+
+
+def plan_prune_all(preferences: Preferences) -> list[TrimItem]:
+    """世代数を超えた控え（全部の置き場） バックアップを切っていれば空"""
+    if not preferences.backup:
+        return []
+    return [
+        item
+        for root in state_roots(preferences)
+        for item in plan_prune(preferences.backup_generations, root)
+    ]
 
 
 def folder_refusal(folder: Path, install: Path | None = None) -> str | None:
@@ -239,8 +260,9 @@ class BackupSection:
         self.backup_generations.setSuffix(" 世代")
         self.backup_generations.setValue(preferences.backup_generations)
         self.backup_generations.setToolTip(
-            "1 つのプロジェクトについて残す数 超えたら古い物から消す 減らしたときは、"
-            "次にそのプロジェクトを上書き保存したときに消える（OK を押す前に数を見せて確かめる）"
+            "1 つのプロジェクトについて残す数 上書き保存のたびに 1 本作って、超えた古い 1 本を消す"
+            " 減らしたとき・置き場を変えたときに超えている分は、OK を押す前に消える物を見せて"
+            "確かめ、その場で消す"
         )
         self.backup.toggled.connect(self.backup_generations.setEnabled)
         self.backup_generations.setEnabled(preferences.backup)
@@ -319,30 +341,40 @@ def confirm_backup_changes(
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return False
-    if after.backup and after.backup_generations < before.backup_generations:
-        # 既定の置き場も数える 選んだ置き場へ書けなかった保存の控えは既定の側にあり、
-        # 次にまた書けなければ、そちらにも同じ世代数を当てて消す 数えずにいると、
-        # 確かめに出していない控えが消える
-        doomed = sum(backups_over(after.backup_generations, root) for root in state_roots(after))
-        if doomed > 0:
+    pruned: list[TrimItem] = []
+    if after.backup and (
+        after.backup_generations < before.backup_generations
+        or not before.backup
+        or state_roots(after) != state_roots(before)
+    ):
+        # 世代数を減らした・バックアップを入れ直した・置き場を変えたときは、当てる先の置き場に
+        # 世代数を超えた控えがあれば、OK でその場で詰める（見せた物だけを消す）
+        # 置き場を変えた先に控えが多くても世代数は同じなので、減らしたときだけ見ると
+        # 次の保存で黙って詰めてしまう（保存のときは 1 本ずつの入れ替えだけにしてある）
+        # 既定の置き場も数える 選んだ置き場へ書けなかった保存の控えは既定の側にある
+        pruned = plan_prune_all(after)
+        if pruned:
             answer = QMessageBox.question(
                 parent,
                 "バックアップを減らす",
-                f"残す数を {after.backup_generations} 世代にすると、今あるバックアップのうち "
-                f"{doomed} 本が、それぞれのプロジェクトを次に上書き保存したときに消えます"
-                "（古い物から 消したバックアップは戻せません）\n\n減らしますか",
+                f"残す数を {after.backup_generations} 世代にすると、OK を押したときに"
+                f"今あるバックアップのうち {len(pruned)} 本を消します"
+                "（古い物から 消したバックアップは戻せません）\n\n"
+                f"{describe_trim(pruned)}\n\n減らしますか",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return False
+            if approved is not None:
+                approved.extend(pruned)
     tightened = after.state_limit_mb > 0 and (
         before.state_limit_mb == 0
         or after.state_limit_mb < before.state_limit_mb
         or state_roots(after) != state_roots(before)
     )
     if tightened:
-        doomed_items = plan_trim_all(after)
+        doomed_items = plan_trim_all(after, already=[p for item in pruned for p in item.paths])
         if doomed_items:
             # OK を押すとその場で片付ける 何が消えるかを先に見せないと、本人は上限を
             # 入れただけのつもりで控えを失う

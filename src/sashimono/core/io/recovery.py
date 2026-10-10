@@ -41,11 +41,13 @@ __all__ = [
     "backups_over",
     "default_state_root",
     "discard",
+    "discard_items",
     "find_orphans",
     "find_orphans_in",
     "folder_problem",
     "forget_empty_roots",
     "mark_offered",
+    "plan_prune",
     "plan_trim",
     "project_presence_dir",
     "remember_root",
@@ -410,12 +412,21 @@ def backup_folder(target: Path, root: Path | None = None) -> Path:
 
 
 def backup_before_save(
-    target: Path, root: Path | None = None, *, keep: int = BACKUP_GENERATIONS
+    target: Path,
+    root: Path | None = None,
+    *,
+    keep: int = BACKUP_GENERATIONS,
+    most: int | None = None,
 ) -> Path | None:
     """上書きする前の中身を控える ``target`` がまだ無ければ何もしない
 
     古いものから消して ``keep`` 本に保つ 名前に時刻を入れてあるので、並べれば
-    そのまま古い順になる
+    そのまま古い順になる 消すのは新しい控えを書き終えてから
+
+    ``most`` を渡すと、1 回で消すのはその本数まで 画面からの保存は 1 を渡す
+    世代の入れ替え（1 本作って 1 本消す）は決まりとして消してよいが、それより多く
+    消すのは、本人に見せて確かめた時（:func:`plan_prune`）だけにするため 置き場を
+    変えた先や別の窓の設定のせいで ``keep`` を超えていても、保存のたびに黙ってまとめて消さない
     """
     target = Path(target)
     if not target.is_file():
@@ -441,30 +452,75 @@ def backup_before_save(
 
     # 旧い拡張子の控えも世代に数える 数えないと、改名前の控えはいつまでも消えずに残り、
     # 20 本に保つ約束が崩れる 名前は時刻から始まるので、拡張子が混ざっても古い順に並ぶ
-    generations = sorted(
-        path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
-    )
-    for old in generations[: max(0, len(generations) - keep)]:
+    generations = _generations(folder)
+    doomed = generations[: max(0, len(generations) - keep)]
+    if most is not None:
+        doomed = doomed[:most]
+    for old in doomed:
         old.unlink(missing_ok=True)
     return copied
 
 
-def backups_over(keep: int, root: Path | None = None) -> int:
-    """世代数を ``keep`` に減らしたとき、次の上書き保存で消える控えの数（全部のプロジェクトの合計）
+def _generations(folder: Path) -> list[Path]:
+    """そのプロジェクトの控え 古い順"""
+    return sorted(
+        path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
+    )
 
-    消すのはそのプロジェクトを次に上書き保存したときで、ここでは数えるだけ 減らす前に
-    本人へ数を見せて確かめるため 取り返せない物を黙ってまとめて消さない
-    """
+
+def _backup_folders(root: Path | None) -> list[Path]:
     base = (root if root is not None else default_state_root()) / "backups"
     try:
-        folders = [folder for folder in base.iterdir() if folder.is_dir()]
+        return [folder for folder in base.iterdir() if folder.is_dir()]
     except OSError:
-        return 0
-    total = 0
-    for folder in folders:
-        count = sum(1 for suffix in (SUFFIX, *LEGACY_SUFFIXES) for _ in folder.glob(f"*{suffix}"))
-        total += max(0, count - keep)
-    return total
+        return []
+
+
+def _backup_label(folder: Path) -> str:
+    return f"バックアップ {folder.name.rsplit('-', 1)[0]}"
+
+
+def plan_prune(keep: int, root: Path | None = None) -> list[TrimItem]:
+    """世代数を ``keep`` に詰めるために消す控え（全部のプロジェクト） 古い順 消しはしない
+
+    確かめで見せた物をそのまま消す（:func:`discard_items`） 見せた数と消える数を一致させる
+    詰めた後の保存は、1 本作って 1 本消す入れ替えだけになる
+    """
+    items: list[TrimItem] = []
+    for folder in _backup_folders(root):
+        generations = _generations(folder)
+        label = _backup_label(folder)
+        items.extend(
+            TrimItem(label, (path,), _size(path), _backup_stamp(path))
+            for path in generations[: max(0, len(generations) - keep)]
+        )
+    return sorted(items, key=lambda item: item.stamp)
+
+
+def backups_over(keep: int, root: Path | None = None) -> int:
+    """世代数を ``keep`` に詰めると消える控えの数（全部のプロジェクトの合計 :func:`plan_prune`）"""
+    return len(plan_prune(keep, root))
+
+
+def discard_items(items: Iterable[TrimItem]) -> list[TrimItem]:
+    """確かめた物を消す 消せた物を返す 消せなかった物（置き場が書けない）は飛ばす
+
+    同じファイルが 2 つの一覧（世代数と容量）に入っていても 1 度だけ数える
+    """
+    done: list[TrimItem] = []
+    seen: set[str] = set()
+    for item in items:
+        keys = [_root_key(path) for path in item.paths]
+        if all(key in seen for key in keys):
+            continue
+        seen.update(keys)
+        try:
+            for path in item.paths:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        done.append(item)
+    return done
 
 
 # --- 容量の上限 -------------------------------------------------------------
@@ -488,8 +544,13 @@ def state_usage(root: Path | None = None) -> int:
     return sum(_size(path) for name in ("recovery", "backups") for path in _files(base / name))
 
 
-def plan_trim(limit: int, root: Path | None = None) -> list[TrimItem]:
+def plan_trim(
+    limit: int, root: Path | None = None, *, already: Iterable[Path] = ()
+) -> list[TrimItem]:
     """容量を ``limit`` バイトに収めるために片付ける物 古い順 収まっていれば空 消しはしない
+
+    ``already`` は同じ確かめで先に消すと決めた物（世代数で詰める控え） その分は使っている
+    大きさから引き、候補からも外す 引かないと、世代数で空く分を知らずに余計に挙げる
 
     消さない物
     - 動いている起動の退避（開いている作業の今の退避）
@@ -501,22 +562,23 @@ def plan_trim(limit: int, root: Path | None = None) -> list[TrimItem]:
     大事な物まで消すと、上限を入れた意味が逆になる
     """
     base = root if root is not None else default_state_root()
-    excess = state_usage(base) - limit
+    gone = {_root_key(path) for path in already}
+    freed = sum(
+        _size(path)
+        for name in ("recovery", "backups")
+        for path in _files(base / name)
+        if _root_key(path) in gone
+    )
+    excess = state_usage(base) - freed - limit
     if excess <= 0:
         return []
     candidates: list[TrimItem] = []
-    backups = base / "backups"
-    try:
-        folders = [folder for folder in backups.iterdir() if folder.is_dir()]
-    except OSError:
-        folders = []
-    for folder in folders:
-        generations = sorted(
-            path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
-        )
-        label = f"バックアップ {folder.name.rsplit('-', 1)[0]}"
+    for folder in _backup_folders(base):
+        # いちばん新しい控えは数から外す 世代数で消える物を除いた後のいちばん新しい物
+        remaining = [path for path in _generations(folder) if _root_key(path) not in gone]
+        label = _backup_label(folder)
         candidates.extend(
-            TrimItem(label, (path,), _size(path), _backup_stamp(path)) for path in generations[:-1]
+            TrimItem(label, (path,), _size(path), _backup_stamp(path)) for path in remaining[:-1]
         )
     for entry in find_orphans(base):
         if not entry.offered:

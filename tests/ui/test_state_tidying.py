@@ -242,7 +242,7 @@ class TestTheSizeLimit:
         assert made[-1].is_file()
         assert window._recovery.path.is_file()
         assert unseen.is_file()
-        assert "容量の上限" in window.statusBar().currentMessage()
+        assert "確かめた物を片付けた" in window.statusBar().currentMessage()
 
     def test_no_limit_trims_nothing(self, window: MainWindow, tmp_path: Path) -> None:
         made = _fill(tmp_path / "本編.sme", 5)
