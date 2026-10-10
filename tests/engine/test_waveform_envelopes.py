@@ -48,6 +48,25 @@ def test_many_ranges_match_one_by_one(seed: int) -> None:
     assert np.array_equal(wave.envelopes(segments), _one_by_one(wave, segments))
 
 
+@pytest.mark.parametrize("columns", [1, 3, 5, 7])
+def test_a_column_over_many_peaks_keeps_its_last_peak(columns: int) -> None:
+    # 1 列が何ピークにもまたがり、素材の末尾より前で終わる列 終わりの番号を 1 つ手前で
+    # 渡すと、列の最後のピークが落ちて、新しい倍率で波形の山が欠ける 最後のピークだけを
+    # 大きくして、どの列でも 1 本ずつ束ねた値と同じになるかを見る
+    count = 400
+    peaks = np.zeros((count, 2, 2), dtype=np.float32)
+    span = 50 // columns
+    for column in range(columns):
+        last = (column + 1) * span - 1
+        peaks[last, :, 1] = 0.9
+        peaks[last, :, 0] = -0.7
+    wave = Waveform(48000, 2, count * 256, (PeakLevel(256, peaks),))
+    segments = [(0, columns * span * 256, columns), (256, columns * span * 256 + 256, columns)]
+    found = wave.envelopes(segments)
+    assert np.array_equal(found, _one_by_one(wave, segments))
+    assert found[:columns, :, 1].min() == pytest.approx(0.9)
+
+
 def test_an_empty_list_gives_no_columns() -> None:
     # 形が (0, チャンネル, 2) で無くなると、呼んだ側の envelope[:, :, 0] が IndexError になり、
     # タイムラインの描画がそこで止まる（今の描く所は空の並びで呼ばないが、呼べる約束は守る）

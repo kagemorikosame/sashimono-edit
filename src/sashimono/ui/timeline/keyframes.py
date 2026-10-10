@@ -18,7 +18,14 @@ from sashimono.core.model import AnimatedValue, Clip, ClipId, Effect
 from sashimono.ui.theme import Colors
 from sashimono.ui.timeline.layout import TimelineLayout
 
-__all__ = ["KEYFRAME_SIZE", "draw_keyframes", "keyframe_at", "keyframe_frames", "keyframe_marks"]
+__all__ = [
+    "KEYFRAME_SIZE",
+    "draw_keyframes",
+    "forget_keyframe_frames",
+    "keyframe_at",
+    "keyframe_frames",
+    "keyframe_marks",
+]
 
 #: ひし形の対角線の半分（画素）
 KEYFRAME_SIZE = 4
@@ -67,6 +74,12 @@ def keyframe_frames(clip: Clip) -> tuple[int, ...]:
 #: 貯めるクリップの数の上限 超えたら全部捨てて貯め直す
 _FRAMES_LIMIT = 8192
 _FRAMES: dict[ClipId, tuple[Clip, tuple[int, ...]]] = {}
+
+
+def forget_keyframe_frames() -> None:
+    """貯めたキーフレームの位置を捨てる 貯めた物はクリップを強く持つので、別のプロジェクトを
+    開いたときに捨てる（:meth:`TimelineView.forget_drawing`）"""
+    _FRAMES.clear()
 
 
 def _collect_frames(clip: Clip) -> tuple[int, ...]:

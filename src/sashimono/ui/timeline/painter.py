@@ -78,6 +78,7 @@ __all__ = [
     "draw_track_background",
     "draw_track_header",
     "filmstrip_tint",
+    "forget_clip_drawing",
     "shown_track_name",
     "to_qimage",
     "track_add_button_rect",
@@ -1827,6 +1828,18 @@ def _paint_strips(
 
 
 _WAVEFORM_IMAGES = _WaveformImages(WAVEFORM_CACHE_BYTES)
+
+
+def forget_clip_drawing() -> None:
+    """クリップごとに貯めた描き方（見た目・サムネイルの番号の求め方・波形の範囲と効き方）を捨てる
+
+    どれもクリップ（と素材・トラック）を強く持つ 別のプロジェクトを開いたときに捨てないと、
+    新しいクリップで上限まで埋まるまで、前のプロジェクトがまるごとメモリに残る
+    （:meth:`TimelineView.forget_drawing` から呼ぶ）
+    """
+    _CLIP_LOOKS.clear()
+    _TILE_STEPS.clear()
+    _WAVE_SPANS.clear()
 
 
 def clear_waveform_images() -> None:

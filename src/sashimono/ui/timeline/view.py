@@ -94,7 +94,12 @@ from sashimono.ui.timeline.drop import (
     spot_at,
 )
 from sashimono.ui.timeline.group_reach import draw_group_reach
-from sashimono.ui.timeline.keyframes import draw_keyframes, keyframe_at, keyframe_frames
+from sashimono.ui.timeline.keyframes import (
+    draw_keyframes,
+    forget_keyframe_frames,
+    keyframe_at,
+    keyframe_frames,
+)
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
 from sashimono.ui.timeline.painter import (
     ADD_TRACK_BUTTON_SPACE,
@@ -114,6 +119,7 @@ from sashimono.ui.timeline.painter import (
     draw_track_background,
     draw_track_header,
     filmstrip_tint,
+    forget_clip_drawing,
     track_add_button_rect,
     track_button_rects,
     track_name_rect,
@@ -401,6 +407,18 @@ class TimelineView(QWidget):
         # 長さやトラックの数が変わると、スクロールできる幅と高さも変わる
         self._sync_scroll_bars()
         self.update()
+
+    def forget_drawing(self) -> None:
+        """クリップごとに貯めた描き方を全部捨てる 別のプロジェクトへ差し替えるときに窓が呼ぶ
+
+        描き方の控え（見た目・波形の範囲・ひし形の位置・値の線・細い帯の目安）はクリップや
+        素材を強く持つ 編集では同じクリップの番号で上書きされるが、別のプロジェクトでは
+        番号が重ならず、上限で捨てるまで前のプロジェクトがまるごとメモリに残る
+        """
+        forget_clip_drawing()
+        forget_keyframe_frames()
+        self._value_lines.forget_shapes()
+        self._glance_cache.clear()
 
     def set_split_audio(self, split: bool) -> None:
         """動画の映像と音声を分けて置くか 設定（:attr:`Preferences.media_split`）から

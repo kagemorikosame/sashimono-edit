@@ -475,6 +475,11 @@ class ValueLineEditor:
             painter.drawPolyline(line)
         painter.restore()
 
+    def forget_shapes(self) -> None:
+        """貯めた線の種類と高さを捨てる クリップとトラックと素材の一覧を強く持つので、
+        別のプロジェクトを開いたときに捨てる（:meth:`TimelineView.forget_drawing`）"""
+        self._shapes.clear()
+
     def _shape(
         self, project: Project, track: Track, clip: Clip
     ) -> tuple[ValueKind, float | None] | None:

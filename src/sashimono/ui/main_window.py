@@ -1374,6 +1374,9 @@ class MainWindow(QMainWindow):
         # 前のプロジェクトで外した素材の覚えは捨てる 差し替えると取り消しの履歴も消え、
         # 戻ってくることは無い 新しいプロジェクトの素材は、開く所で全部頼んでいる
         self._forgotten.clear()
+        # タイムラインがクリップごとに貯めた描き方は前のプロジェクトのクリップを強く持つ
+        # 捨てないと、新しいクリップで上限まで埋まるまで前のプロジェクトが解放されない
+        self._timeline.forget_drawing()
         # 前のプロジェクトで出していた進み具合の続きとして「終わった」と出さない
         self._background_shown = False
         self._background_indicator.hide()

@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -43,11 +43,14 @@ from sashimono.core.model.ids import new_media_id
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import PeakLevel, Waveform
+from sashimono.engine.audio.shape import shape_key
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.cache.thumbnails import Filmstrip
+from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.theme import THEME_DARK, THEME_LIGHT, Colors, Metrics, use_palette
 from sashimono.ui.timeline import TimelineView
+from sashimono.ui.timeline import keyframes as keyframes_module
 from sashimono.ui.timeline import painter as painter_module
 from sashimono.ui.timeline.keyframes import draw_keyframes
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
@@ -222,15 +225,50 @@ class TestZoomingDoesNotRedoTheSameWork:
         assert painter_module._FILMSTRIP_TILES.converted == first
 
     def test_the_wave_range_and_its_shaping_are_worked_out_once_per_clip(
-        self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
+        self, mixed: _Mixed, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 範囲は分数で数え、効き方の鍵はエフェクトを全部なめる 200 本の波形で毎回求めると
         # 1ms を超えた クリップが同じ物なら、倍率を変えても求め直さない
-        calls = _count(monkeypatch, painter_module, "shape_key")
+        # 音量の違うクリップが並ぶので、1 本分を全部に使い回すと 1 回しか求めずに済んでしまう
+        # クリップごとにちょうど 1 回ずつ求めたかを見る
+        asked: list[ClipId] = []
+        # 描く所が引く名前を差し替えるので、元の関数は形を求める所から取る
+        original = shape_key
+
+        def recording(clip: Clip, track_gain: float = 1.0) -> Hashable:
+            asked.append(clip.id)
+            return original(clip, track_gain)
+
+        monkeypatch.setattr(painter_module, "shape_key", recording)
         for scale in SCALES[1:] * 3:
-            scene.render(scale)
-        sounds = len(scene.project.timeline.tracks[1].clips)
-        assert 0 < calls[0] <= sounds
+            mixed.render(scale)
+        volumes = {
+            repr(clip.effects[0].params["volume"])
+            for clip in mixed.project.timeline.tracks[1].clips
+            if clip.id in asked
+        }
+        assert len(volumes) > 1
+        assert len(asked) == len(set(asked))
+
+    def test_each_clip_keeps_its_own_wave_shape(
+        self, mixed: _Mixed, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 範囲と効き方をクリップごとに貯める所を取り違えると、音量の違うクリップに別の
+        # クリップの大きさの波形が出る 貯めずに毎回求めたときの絵と比べる
+        for scale in SCALES[1:]:
+            mixed.render(scale)
+        drawn = mixed.render(SCALES[-1])
+
+        class Fresh(painter_module._WaveSpans):
+            def get(
+                self, clip: Clip, rate: FrameRate, sample_rate: int, track_gain: float
+            ) -> tuple[int, int, painter_module._Shaping]:
+                self.clear()
+                return super().get(clip, rate, sample_rate, track_gain)
+
+        monkeypatch.setattr(painter_module, "_WAVE_SPANS", Fresh())
+        clear_waveform_images()
+        assert mixed.render(SCALES[-1]) == drawn
 
     def test_painting_does_not_search_the_media_list_per_clip(
         self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
@@ -642,3 +680,52 @@ class TestStretchingWavesWhileZooming:
             assert dialog.preferences().stretch_waves is True
         finally:
             dialog.deleteLater()
+
+
+def _held_clips(view: TimelineView) -> set[int]:
+    """クリップごとの描き方の控えが持っているクリップ（id）"""
+    held: set[int] = set()
+    held.update(id(entry[0]) for entry in painter_module._CLIP_LOOKS._entries.values())
+    held.update(id(entry[0]) for entry in painter_module._TILE_STEPS._entries.values())
+    for entry in painter_module._WAVE_SPANS._entries.values():
+        held.update((id(entry[0]), id(entry[6].clip)))
+    held.update(id(entry[0]) for entry in keyframes_module._FRAMES.values())
+    held.update(id(entry[0]) for entry in view._value_lines._shapes.values())
+    held.update(id(entry[0]) for entry in view._glance_cache.values())
+    return held
+
+
+class TestSwitchingProjects:
+    def test_the_old_project_is_let_go(
+        self, mixed: _Mixed, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        # 控えはクリップを強く持つ 別のプロジェクトを開いても捨てないと、新しいクリップで
+        # 上限（8192 本）まで埋まるまで、前のプロジェクトがまるごとメモリに残る
+        for scale in (SCALES[0], SCALES[-1]):
+            mixed.render(scale)
+        old = {id(clip) for track in mixed.project.timeline.tracks for clip in track.clips}
+        assert old & _held_clips(mixed.view)
+        other = _Mixed(replace(video_media, id=new_media_id()), audio_media)
+        try:
+            mixed.view.forget_drawing()
+            mixed.view.set_project(other.project)
+            for scale in (SCALES[0], SCALES[-1]):
+                mixed.render(scale)
+            assert _held_clips(mixed.view)
+            assert not old & _held_clips(mixed.view)
+        finally:
+            other.analyzer.close()
+
+    def test_the_window_forgets_the_drawing_when_it_swaps_the_project(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 新規・開く・復元の差し替え（_leave_project）で捨てないと、上と同じく前の
+        # プロジェクトが残る
+        del qt_application
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            calls = _count(monkeypatch, window._timeline, "forget_drawing")
+            window._leave_project(window.document.project)
+            assert calls[0] == 1
+        finally:
+            window.close()
