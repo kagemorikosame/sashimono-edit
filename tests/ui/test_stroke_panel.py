@@ -28,7 +28,9 @@ from sashimono.core.model import (
     MAX_STROKES,
     AnimatedValue,
     Clip,
+    Effect,
     GeneratedSource,
+    Keyframe,
     Project,
     Stroke,
     StrokeId,
@@ -36,6 +38,7 @@ from sashimono.core.model import (
 from sashimono.effects.sources import TEXT
 from sashimono.effects.strokes import STROKE_EFFECT_KINDS
 from sashimono.ui.inspector.panel import InspectorPanel
+from sashimono.ui.timeline.keyframes import keyframe_frames
 
 
 class _Harness:
@@ -224,3 +227,18 @@ class TestLayerEffects:
         effect_id = stroke.effects[0].id
         panel._editors[(str(effect_id), "radius")].value_changed.emit(AnimatedValue(12.0))
         assert harness.strokes[0].effects[0].params["radius"] == AnimatedValue(12.0)
+
+
+class TestTimelineMarks:
+    def test_layer_keyframes_show_on_the_timeline(self) -> None:
+        # 縁取りの層の値と層のエフェクトの値のキーも、タイムラインの印に数える
+        # 数え漏らすと、縁の太さや色にキーを打っても印が出ない
+        def moving(*frames: int) -> AnimatedValue:
+            return AnimatedValue(1.0, tuple(Keyframe(frame, 1.0) for frame in frames))
+
+        stroke = Stroke(
+            params={"width": moving(10), "opacity": moving(30)},
+            effects=(Effect("blur", {"radius": moving(50)}),),
+        )
+        clip = Clip(timeline_start=0, duration=60, source=TEXT.create().with_strokes((stroke,)))
+        assert keyframe_frames(clip) == (10, 30, 50)

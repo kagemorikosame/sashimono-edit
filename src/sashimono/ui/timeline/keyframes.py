@@ -55,6 +55,11 @@ def keyframe_frames(clip: Clip) -> tuple[int, ...]:
     values.extend(_effect_values(clip.after_effects))
     if clip.source is not None:
         values.extend(clip.source.params.values())
+        # テキストの縁取りの層の値と、層に掛けたエフェクトの値（#272 #273） 数え漏らすと、
+        # 縁の太さや色にキーを打ってもタイムラインに印が出ない
+        for stroke in clip.source.strokes:
+            values.extend(stroke.params.values())
+            values.extend(_effect_values(stroke.effects))
     frames = {
         keyframe.frame
         for value in _animated(iter(values))
