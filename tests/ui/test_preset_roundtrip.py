@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox
 from sashimono.core.commands import (
     AddClip,
     AddEffect,
+    AddMedia,
     Command,
     ParamPath,
     SetClipProperty,
@@ -36,6 +37,7 @@ from sashimono.core.model import (
     ClipId,
     Effect,
     Keyframe,
+    MediaItem,
     Project,
     Track,
     TrackKind,
@@ -45,6 +47,7 @@ from sashimono.effects.sources import TEXT, TRANSITION
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.conftest import make_clip
 
 RED = (1.0, 0.0, 0.0, 1.0)
 BLUE = (0.0, 0.0, 1.0, 1.0)
@@ -375,6 +378,34 @@ class TestManyClips:
         window.undo()
         _, first, second = _clips(window)
         assert (first, second) == (target, other)
+
+    def test_a_sound_clip_in_the_mix_keeps_its_own_effects(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, audio_media: MediaItem
+    ) -> None:
+        # 映像のプリセット（グロー）は音のクリップへ足せない 前は入れ替えのために音の
+        # クリップのエフェクトを先に消し、何も足さないので、音の残響だけが消えた
+        _dress_up(window)
+        source_clip, target, _ = _clips(window)
+        audio_track = window.document.project.timeline.tracks[2]
+        sound = make_clip(100, 60, audio_media)
+        _run(
+            window,
+            AddMedia(audio_media),
+            AddClip(audio_track.id, sound),
+            AddEffect(sound.id, registry.require("audio_reverb").create()),
+            AddEffect(target.id, registry.require("blur").create()),
+        )
+        _select(window, source_clip.id)
+        _save(window, monkeypatch, "見出し")
+
+        _select(window, target.id, sound.id)
+        _apply(window, "ユーザー", "見出し")
+        _, text, _ = _clips(window)
+        located = window.document.project.timeline.locate_clip(sound.id)
+        assert located is not None
+        # 映像のクリップは入れ替わり、音のクリップは自分のエフェクトのまま
+        assert [e.kind for e in text.effects if not e.fixed] == ["glow"]
+        assert [e.kind for e in located[1].effects if not e.fixed] == ["audio_reverb"]
 
 
 class TestOptions:
