@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QWidget
 
 from sashimono.core.commands import RenameProject
 from sashimono.core.io import (
@@ -34,6 +34,7 @@ from sashimono.ui.backup_settings import (
 )
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.recovery_dialog import RecoveryDialog
 from sashimono.ui.workspace import (
     AUTOSAVE_SECONDS_RANGE,
     BACKUP_GENERATIONS_RANGE,
@@ -53,6 +54,24 @@ def _window(preferences: Preferences | None = None) -> MainWindow:
     if preferences is not None:
         PreferenceStore().save(preferences)
     return MainWindow(Project.create(), confirm_unsaved=False)
+
+
+@pytest.fixture(autouse=True)
+def no_popups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """尋ねる窓・知らせる窓・フォルダを選ぶ窓が開いたらその場で落とす
+
+    開いたまま待つと、試験は誰も押さないボタンを待って止まる 尋ねることを確かめる
+    試験は、この後で自分の答えに差し替える
+    """
+
+    def popped(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("試験の途中で窓が開いた")
+
+    for name in ("question", "warning", "information", "critical"):
+        monkeypatch.setattr(QMessageBox, name, popped)
+    monkeypatch.setattr(QMessageBox, "exec", popped)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", popped)
+    monkeypatch.setattr(RecoveryDialog, "exec", popped)
 
 
 @pytest.fixture
@@ -109,6 +128,8 @@ class TestSaving:
             ("backup_generations", 0),
             ("backup_generations", BACKUP_GENERATIONS_RANGE[1] + 1),
             ("backup_generations", "20"),
+            # True は 1 と等しく範囲の中に入る 数として通すと 1 世代だけになる
+            ("backup_generations", True),
         ],
     )
     def test_an_absurd_number_falls_back(self, tmp_path: Path, key: str, value: object) -> None:
@@ -329,6 +350,12 @@ class TestTheBackups:
             backup_before_save(created._path)
             created.open_backup_folder()
             assert opened == [QUrl.fromLocalFile(str(backup_folder(created._path)))]
+            # 選んだ置き場に控えがあれば、そちらを先に開く 既定の側だけ見ると、
+            # 設定の置き場へ書いた新しい控えに辿り着けない
+            chosen = tmp_path / "退避"
+            backup_before_save(created._path, chosen)
+            created.open_backup_folder()
+            assert opened[-1] == QUrl.fromLocalFile(str(backup_folder(created._path, chosen)))
         finally:
             created.close()
 
@@ -396,3 +423,57 @@ class TestTheRecoveryFolder:
         assert window._recovery.path.parent == root / "recovery"
         assert window._recovery.path.is_file()
         assert not old.exists()
+
+    def test_a_failed_move_keeps_the_old_unsaved_work(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 新しい置き場へ書けないまま前の退避を消すと、その間に落ちたときに何も残らない
+        window.execute(RenameProject("作業中"))
+        window.autosave()
+        old = window._recovery.path
+        root = tmp_path / "新しい置き場"
+        plain_save = RecoverySession.save
+
+        def refuse_new(self: RecoverySession, project: Project, source: Path | None) -> None:
+            if self.path.is_relative_to(root):
+                raise OSError("書けない")
+            plain_save(self, project, source)
+
+        monkeypatch.setattr(RecoverySession, "save", refuse_new)
+        window._apply_preferences(Preferences(state_folder=str(root)))
+        assert old.is_file()
+        assert window._recovery.path == old
+        assert "書けない" in window.statusBar().currentMessage()
+
+
+class TestOfferingRecovery:
+    def _crash_in(self, root: Path, name: str) -> None:
+        crashed = RecoverySession(root)
+        crashed.save(Project.create(name=name), None)
+        lock = crashed._lock
+        assert lock is not None
+        lock.abandon()
+        crashed._lock = None
+
+    def test_both_folders_are_searched(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 選んだ置き場へ書けずに既定へ戻した起動が落ちると、退避は既定の側に残る
+        # 片方しか見ないと、その作業は復元を勧められずに埋もれる
+        del qt_application
+        chosen = tmp_path / "退避"
+        self._crash_in(chosen, "選んだ側")
+        self._crash_in(default_state_root(), "既定の側")
+        offered: list[str] = []
+
+        def look(dialog: RecoveryDialog) -> int:
+            offered.extend(entry.name for entry in dialog._entries)
+            return QDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(RecoveryDialog, "exec", look)
+        created = _window(Preferences(state_folder=str(chosen)))
+        try:
+            created.offer_recovery()
+            assert sorted(offered) == ["既定の側", "選んだ側"]
+        finally:
+            created.close()
