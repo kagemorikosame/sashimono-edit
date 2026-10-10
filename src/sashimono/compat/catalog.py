@@ -66,6 +66,7 @@ from sashimono.core.model import (
     new_group_id,
 )
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.sources import TEXT
 
 __all__ = [
     "MediaPlan",
@@ -92,6 +93,13 @@ _YMM4_SUFFIXES = (".ymmt",)
 #: 文字そのものと文字送りは、今のクリップの持ち物 見た目を変えたいだけなのに
 #: 中身まで置き換わったら、それは着せ替えではない
 _KEPT_ON_RESTYLE = frozenset({"text", "reveal"})
+
+#: 時間を出すテキスト（YMM4 のタイマー）の項目 テンプレートが時間の書式を持たなければ
+#: 今のクリップのまま残す 何が出るかを決める中身で、見た目ではない 既定へ戻すと、
+#: タイマーに字幕の見た目を着せただけで時間が消えて文字が出る
+_TIMER_ON_RESTYLE = frozenset(
+    {"timer_format", "timer_start", "timer_rate", "timer_countdown", "timer_length"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,13 +808,19 @@ def _scene_for(
     return scene.id
 
 
-def restyle(objects: list[MappedObject], clip: Clip) -> list[Command]:
+def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False) -> list[Command]:
     """テンプレートの見た目を、今あるクリップへ着せる
 
     2 通りある
 
     * **中身のあるテンプレート** — テキストオブジェクトを持つ最初の 1 つを使い、
       文字と時間は今のまま、見た目だけを入れ替える 字幕テンプレートはこれ
+      テンプレートが持たない項目はテキストの既定値で埋める（#283） 今の値の上に
+      重ねるだけだと、テンプレートの形式に無い項目（フォントのスタイル・折り返しの幅
+      など）が前の値のまま残り、テンプレートと違う見た目になる ファミリを替えても
+      前のファミリのスタイル名が残り、標準の組み方ではそのスタイルで描かれた
+      ``keep_wrap`` を立てると折り返しの幅だけは今の値を残す（本人の設定
+      ``Preferences.restyle_keep_wrap`` 字幕の枠の幅を決めてから着せ替える人向け）
     * **エフェクトだけのテンプレート** — YMM4 の「アニメーション効果」のように
       中身を持たないもの 今のクリップに**エフェクトを足す**だけで、
       中身には触らない だからテキスト以外のクリップにも着せられる
@@ -844,14 +858,22 @@ def restyle(objects: list[MappedObject], clip: Clip) -> list[Command]:
         return []
 
     span = template.clip.duration
+    given = template.clip.source.params
     params = {
-        **clip.source.params,
+        **TEXT.default_params(),
         **{
             name: fitted_value(value, span, clip.duration - 1)
-            for name, value in template.clip.source.params.items()
+            for name, value in given.items()
             if name not in _KEPT_ON_RESTYLE
         },
     }
+    staying = set(_KEPT_ON_RESTYLE)
+    if keep_wrap:
+        staying.add("wrap_width")
+    if "timer_format" not in given:
+        staying |= _TIMER_ON_RESTYLE
+    current = clip.source.params
+    params.update({name: current[name] for name in staying if name in current})
 
     commands: list[Command] = [SetSource(clip.id, GeneratedSource(kind="text", params=params))]
     # 固定の項目（クリップが最初から持つ欄）は外せないので残す 外そうとすると

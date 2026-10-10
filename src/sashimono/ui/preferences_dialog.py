@@ -568,6 +568,19 @@ class PreferencesDialog(QDialog):
         self._subtitle_wrap.toggled.connect(self._subtitle_wrap_percent.setEnabled)
         self._subtitle_wrap_percent.setEnabled(preferences.subtitle_wrap)
 
+        self._restyle_keep_wrap = QCheckBox(
+            "テンプレートを着せ替えても、テキストの折り返しの幅を残す", self
+        )
+        self._restyle_keep_wrap.setChecked(preferences.restyle_keep_wrap)
+        self._restyle_keep_wrap.setToolTip(
+            "テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの「折り返しの幅」を"
+            "そのまま残す 切っていると、テンプレートが持たない項目はどれも既定に戻り、"
+            "棚の見本と同じ見た目になる（AviUtl と YMM4 のテンプレートの多くは折り返しの幅を"
+            "持たないので、折り返さない） 字幕の枠の幅を先に決めてから着せ替える人は入れる"
+            " 文字と文字送りは、どちらでも今のまま残す"
+        )
+        form.addRow(self._restyle_keep_wrap)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -697,4 +710,5 @@ class PreferencesDialog(QDialog):
             scripts_move=str(self._scripts_move.currentData()),
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
+            restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
         )
