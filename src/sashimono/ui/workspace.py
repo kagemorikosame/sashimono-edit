@@ -416,6 +416,13 @@ class Preferences:
     #: 折り返す幅（画面の幅の何 %） 既定 90 は左右に 5% ずつの余白で、縁取りと影が画面の
     #: 端に掛からない 端まで使いたい人は 100、狭くまとめたい人は下げる
     subtitle_wrap_percent: int = 90
+    #: テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの折り返しの幅を残す（#283）
+    #: 既定は切（テンプレートと同じ見た目になる側） AviUtl と YMM4 のテンプレートの多くは
+    #: 折り返しの幅を持たないので、残すと棚の見本と違う行の分かれ方になり、知らない人ほど
+    #: 着せ替えが効いていないと受け取る 字幕の枠の幅を先に決めてから着せ替える人は入れる
+    #: 入れると、幅を使っているテキストは組み方も残す（AviUtl2 の組み方は折り返さないので、
+    #: テンプレートの組み方を取ると幅を残しても 1 行のままになる）
+    restyle_keep_wrap: bool = False
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -547,6 +554,7 @@ class PreferenceStore:
             subtitle_wrap_percent=_wrap_percent(
                 data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
             ),
+            restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
         )
 
     def save(self, preferences: Preferences) -> None:

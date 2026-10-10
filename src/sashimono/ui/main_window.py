@@ -2409,7 +2409,7 @@ class MainWindow(QMainWindow):
             if located is None:
                 self.statusBar().showMessage("先にテキストのクリップを選んでください", 5000)
                 return
-            commands = restyle(objects, located[1])
+            commands = restyle(objects, located[1], keep_wrap=self._preferences.restyle_keep_wrap)
             if not commands:
                 self.statusBar().showMessage("テキストのクリップにしか適用できません", 5000)
                 return
