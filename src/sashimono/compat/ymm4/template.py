@@ -696,7 +696,11 @@ def _video_chain(
         and not (has_outline(head) and has_outline(tail))
     )
     first = map_video_effects(head, log, length=length, keyframes=keyframes, text=text)
-    rest = map_video_effects(tail, log, length=length, keyframes=keyframes, text=text)
+    # 印の後ろの縁取りは、印の所で先に当てる配置（``placed_early``）の後に付く 層にすると
+    # 字と一緒に配置の前へ動くので、層にせず並びの位置に残す
+    rest = map_video_effects(
+        tail, log, length=length, keyframes=keyframes, text=text, placed_before=True
+    )
     early = {key: _RESTING[key] for key in _RESTING}
     late = dict(item)
     for flag, keys in _LAZY_PARTS:

@@ -15,7 +15,8 @@
 YMM4 の縁取りは映像エフェクトなので、2 つ目の縁取りは 1 つ目の縁取りを付けた絵の外側に
 付く（太さが足し合わさる） テキストに載せられる縁取りが 2 つ以上あるときは、縁取りの層
 （#272）として内側から順に並べ、層の太さを字の輪郭からの和にする 1 つだけのときは前と同じく
-テキストの縁取りの項目へ載せる（前からの作品と同じ絵のまま）
+テキストの縁取りの項目へ載せる（前からの作品と同じ絵のまま） 縁取りの前や間に絵を変える
+エフェクトがあるときは層にせず、並びの位置に残す（:func:`layers_keep_order`）
 """
 
 from __future__ import annotations
@@ -156,20 +157,65 @@ def map_video_effects(
     length: int = 1,
     keyframes: Any = None,
     text: bool = False,
+    placed_before: bool = False,
 ) -> DecorationResult:
     """``VideoEffects`` の列を読む
 
     ``text`` が真なら、縁取り（``OutlineEffect``）をテキストの飾りとして
     :class:`DecorationResult` の ``params`` へ分けて返す 偽なら並びの位置のまま
     縁取りのエフェクトにする
+    ``placed_before`` は、この列より前で描画を遅らせる印の配置を先に当てること
+    （印の後ろの区間） そこの縁取りは縁取りの層にしない（:func:`layers_keep_order`）
     """
     # 知らない移動方法の形を、渡された記録へ書く（値を読む所は記録を受け取らない）
     with reporting(report):
-        return _map_video_effects(effects, report, length=length, keyframes=keyframes, text=text)
+        return _map_video_effects(
+            effects,
+            report,
+            length=length,
+            keyframes=keyframes,
+            text=text,
+            placed_before=placed_before,
+        )
+
+
+#: 絵を変えない列の項目 縁取りの前にあっても、縁取りを層にしてよい
+#: 中心点は後ろの変形の支点を決めるだけ プレビューだけの印はアイテムごと書き出しから外す
+_NOT_PICTURE = frozenset({"CenterPointEffect", "ShowOnlyPreviewEffect"})
+
+
+def layers_keep_order(effects: Any, *, placed_before: bool = False) -> bool:
+    """縁取りを層にしても、YMM4 と掛かる順が変わらないか
+
+    縁取りの層はテキストと一緒に描くので、列の後ろのエフェクトは層にも掛かる 縁取りより
+    前や縁取りの間に絵を変えるエフェクト（前景の塗り・描画を遅らせる印など）があると、
+    YMM4 ではそれが字にだけ掛かり、後から付く縁取りには掛からない 層にすると縁まで塗られる
+    印の後ろの区間（``placed_before``）も、先に当てた配置より前へ縁取りを動かすことになる
+    どちらのときは層にせず、縁取りのエフェクトを並びの位置に残す
+    """
+    if not isinstance(effects, list):
+        return True
+    names = [
+        type_name(entry)
+        for entry in effects
+        if isinstance(entry, dict) and entry.get("IsEnabled") is not False
+    ]
+    outlines = [index for index, name in enumerate(names) if name == "OutlineEffect"]
+    if not outlines:
+        return True
+    if placed_before:
+        return False
+    return all(name in _NOT_PICTURE or name == "OutlineEffect" for name in names[: outlines[-1]])
 
 
 def _map_video_effects(
-    effects: Any, report: CompatibilityReport, *, length: int, keyframes: Any, text: bool
+    effects: Any,
+    report: CompatibilityReport,
+    *,
+    length: int,
+    keyframes: Any,
+    text: bool,
+    placed_before: bool = False,
 ) -> DecorationResult:
     result = DecorationResult()
     if not isinstance(effects, list):
@@ -183,6 +229,11 @@ def _map_video_effects(
     # すべてをエフェクトにする 一部だけをテキストへ載せると、載せた方が並びの頭へ動いて
     # 重なり順が YMM4 と変わる
     in_place = not text or not outlines_fit_text(effects, length=length, keyframes=keyframes)
+    # 縁取りが 2 つ以上で層にする（:func:`_place_borders`）とき、前に絵を変える物があれば
+    # 層にせず並びの位置に残す（:func:`layers_keep_order`） 1 つだけのときは前と同じく
+    # テキストの縁取りの項目へ載せる（前からの作品の絵を変えない）
+    if not in_place and _outline_count(effects) >= 2:
+        in_place = not layers_keep_order(effects, placed_before=placed_before)
     pivot: CenterPoint | None = None
     for entry in effects:
         if not isinstance(entry, dict):
@@ -474,6 +525,19 @@ def outlines_fit_text(effects: Any, *, length: int = 1, keyframes: Any = None) -
         return True
     return all(
         _outline(entry, length, keyframes).fits_text
+        for entry in effects
+        if isinstance(entry, dict)
+        and entry.get("IsEnabled") is not False
+        and type_name(entry) == "OutlineEffect"
+    )
+
+
+def _outline_count(effects: Any) -> int:
+    """列の中の効いている縁取りの数"""
+    if not isinstance(effects, list):
+        return 0
+    return sum(
+        1
         for entry in effects
         if isinstance(entry, dict)
         and entry.get("IsEnabled") is not False

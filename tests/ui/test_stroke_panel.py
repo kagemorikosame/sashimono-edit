@@ -116,6 +116,7 @@ class TestALegacyBorder:
         assert ("source", "border_width") not in panel._editors
 
     def test_touching_it_moves_it_into_a_layer_in_one_step(self, panel: InspectorPanel) -> None:
+        # 移す命令と値の命令が別の段になると、1 回の取り消しで値だけ戻り、縁が層に移ったまま残る
         harness = _Harness(panel, TEXT.create(border_width=6))
         (owner,) = _stroke_editor_owner(panel)
         editor = panel._editors[(owner, "width")]
@@ -128,6 +129,7 @@ class TestALegacyBorder:
         assert harness.clip.source.params["border_width"] == AnimatedValue(0.0)
 
     def test_the_layer_shows_the_old_values(self, panel: InspectorPanel) -> None:
+        # 仮の層に前からの縁の値が出ないと、太さ 0 と見えて、触っただけで縁が消える
         _Harness(panel, TEXT.create(border_width=6, border_color=(1.0, 0.0, 0.0, 1.0)))
         (owner,) = _stroke_editor_owner(panel)
         clip = panel._clip()
@@ -138,6 +140,7 @@ class TestALegacyBorder:
 
 class TestLayers:
     def test_adding_a_layer(self, panel: InspectorPanel) -> None:
+        # 前の縁を移さずに足すと、前の縁が層の一覧の外で描かれ続けて消せなくなる
         harness = _Harness(panel, TEXT.create(border_width=6))
         add = panel.findChild(QPushButton, "add_stroke")
         assert add is not None and add.isEnabled()
@@ -151,6 +154,7 @@ class TestLayers:
         assert harness.headings().count("縁取り 1") == 1 and "縁取り 2" in harness.headings()
 
     def test_moving_hiding_and_removing(self, panel: InspectorPanel) -> None:
+        # 見出しのボタンが別の命令を出すと、▲ や ✕ を押しても思った縁が動かず、別の縁が消える
         harness = _Harness(panel, TEXT.create())
         add = panel.findChild(QPushButton, "add_stroke")
         assert add is not None
@@ -171,6 +175,7 @@ class TestLayers:
         assert [stroke.id for stroke in harness.strokes] == [first]
 
     def test_the_limit_disables_the_button(self, panel: InspectorPanel) -> None:
+        # 上限で押せるままだと、押しても命令が断られて何も起きないように見える
         strokes = tuple(
             Stroke(params={"width": AnimatedValue(1.0 + n)}, id=StrokeId(f"s{n}"))
             for n in range(MAX_STROKES)
@@ -201,6 +206,7 @@ class TestLayers:
 
 class TestLayerEffects:
     def test_the_menu_offers_only_layer_effects(self, panel: InspectorPanel) -> None:
+        # 掛けられない物まで並ぶと、選んでも縁が変わらず壊れたように見える
         harness = _Harness(panel, TEXT.create(border_width=6))
         menu = panel.stroke_effect_menu(harness.clip_id, StrokeId("どれでも"))
         kinds = [action.data()[2] for action in _choices(menu)]
@@ -209,6 +215,7 @@ class TestLayerEffects:
         assert "noise" not in kinds and "transform" not in kinds
 
     def test_adding_an_effect_to_the_old_border(self, panel: InspectorPanel) -> None:
+        # 移さずにエフェクトを足すと、仮の層が見つからず効果を足しても何も起きない
         # 仮の層へエフェクトを足すと、先に層へ移してから足す
         harness = _Harness(panel, TEXT.create(border_width=6))
         menu = panel.stroke_effect_menu(

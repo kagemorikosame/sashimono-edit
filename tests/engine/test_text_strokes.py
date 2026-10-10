@@ -117,6 +117,7 @@ class TestALegacyBorderLooksTheSame:
     def test_moving_the_border_into_a_layer_changes_no_pixel(
         self, params: dict[str, object], scale: float
     ) -> None:
+        # 前からの縁を層へ移すだけで絵が変わると、開いて縁を触っただけの作品の見た目が変わる
         # 前からの縁を 1 つ目の層へ移す（設定パネルで縁を触る・層を足す）だけで絵が 1 画素でも
         # 変わると、開いて触っただけの作品の見た目が変わる
         legacy = text(**params)
@@ -174,6 +175,7 @@ class TestTwoOutsideLayers:
         assert mostly(image, outer, BLACK) > 0.95
 
     def test_a_hidden_layer_draws_nothing(self) -> None:
+        # 隠した層が描かれると、隠したつもりの縁がプレビューにも書き出しにも残る
         shown = draw(text(layer(4.0, WHITE)))
         hidden = draw(text(layer(4.0, WHITE), replace(layer(12.0, BLACK), enabled=False)))
         assert np.array_equal(shown, hidden)
@@ -294,6 +296,7 @@ class TestLayerEffects:
 
     def test_a_preview_at_half_quality_hands_a_half_sized_layer(self) -> None:
         # 画質を落としたプレビューは層の絵も縮めて描く（ぼかしの強さはレンダラが縮める）
+        # 縮めずに渡すと、プレビューだけ層の縁が字からずれた大きさで重なる
         full, half = _Painter(), _Painter()
         source = text(replace(layer(8.0, BLACK), effects=(blur(),)))
         draw(source, baker=full)
@@ -359,6 +362,7 @@ def _rendered(
 
 def test_a_blurred_layer_softens_only_the_border(gl_context: object) -> None:
     # 書き出しと同じ道（レンダラ）で、層のぼかしが縁だけをぼかし、字の塗りに掛からないこと
+    # 壊れると、縁だけをぼかしたつもりの字幕が書き出しで字までぼけるか、縁がぼけないまま出る
     fill, _, outer = bands()
     sharp = _rendered(text(layer(12.0, RED)), gl_context)
     soft = _rendered(text(replace(layer(12.0, RED), effects=(blur(8.0),))), gl_context)

@@ -308,6 +308,7 @@ class TestStrokes:
     """縁取りの層（#272）と層のエフェクト（#273）も AI の道具から扱える"""
 
     def test_layers_can_be_added_listed_and_edited(self, host: FakeHost) -> None:
+        # AI の道具が層を指せないと、AI に縁を足させても前の縁が消えたり別の縁が変わったりする
         run(host, "add_text", text="縁", at_frame=0, duration=60, border_width=4)
         clip = _text_clip(host)
         added = run(host, "add_stroke", clip_id=str(clip.id), width=12, color="#FF0000")
@@ -336,6 +337,7 @@ class TestStrokes:
         assert len(_text_clip(host).source.strokes) == 1
 
     def test_effects_go_onto_a_layer(self, host: FakeHost) -> None:
+        # 層に掛けたエフェクトがクリップへ入ると、縁だけをぼかすよう頼んでも字全体がぼける
         run(host, "add_text", text="縁", at_frame=0, duration=60)
         clip = _text_clip(host)
         stroke = run(host, "add_stroke", clip_id=str(clip.id))["stroke_id"]
@@ -366,6 +368,7 @@ class TestStrokes:
             run(host, "add_effect", clip_id=str(clip.id), stroke_id=stroke, kind="noise")
 
     def test_an_unknown_layer_is_explained(self, host: FakeHost) -> None:
+        # 無い層を指したときに ID の調べ方を返さないと、AI が同じ誤りを繰り返す
         run(host, "add_text", text="縁", at_frame=0, duration=60)
         clip = _text_clip(host)
         with pytest.raises(ToolError, match="list_clips"):

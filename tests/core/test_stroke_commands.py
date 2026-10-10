@@ -112,11 +112,14 @@ class TestAddingLayers:
     def test_a_text_without_a_border_gets_only_the_new_layer(
         self, project: tuple[Project, ClipId]
     ) -> None:
+        # 縁の無い字に層を足して空の層まで増えると、一覧に描かれない層が並び、
+        # どれを触ればよいか分からない
         state, clip_id = project
         state = AddStroke(clip_id, _layer(4.0, "一")).apply(state)
         assert [stroke.id for stroke in _source(state, clip_id).strokes] == ["一"]
 
     def test_the_index_places_the_layer(self, project: tuple[Project, ClipId]) -> None:
+        # 入れる位置を読まないと、上に足したつもりの層が一番下に入り、ほかの縁に隠れて見えない
         state, clip_id = project
         state = _apply(
             state,
@@ -135,11 +138,13 @@ class TestAddingLayers:
             AddStroke(clip_id, _layer(20.0, "多すぎ")).apply(state)
 
     def test_only_text_takes_layers(self) -> None:
+        # 図形に層を持たせると、描かれない縁が保存だけされて残り、触っても絵が変わらない
         state, clip_id = _project(GeneratedSource(kind="shape"))
         with pytest.raises(ValueError, match="テキスト"):
             AddStroke(clip_id, _layer(4.0, "a")).apply(state)
 
     def test_adopting_twice_is_refused(self) -> None:
+        # 2 度目の移しを通すと、層の並びが前からの縁 1 つで上書きされ、足した層が消える
         state, clip_id = _project(_text(border_width=AnimatedValue(5.0)))
         state = AdoptLegacyStroke(clip_id, StrokeId("移した")).apply(state)
         assert _source(state, clip_id).strokes[0].id == "移した"
@@ -157,11 +162,13 @@ class TestEditingLayers:
         return state, clip_id
 
     def test_moving_a_layer(self, layered: tuple[Project, ClipId]) -> None:
+        # 並べ替えが効かないと、▲ ▼ を押しても縁の上下が変わらない
         state, clip_id = layered
         state = MoveStroke(clip_id, StrokeId("b"), 0).apply(state)
         assert [stroke.id for stroke in _source(state, clip_id).strokes] == ["b", "a"]
 
     def test_hiding_a_layer(self, layered: tuple[Project, ClipId]) -> None:
+        # 隠す操作が別の層に当たると、隠したつもりの縁が残り、別の縁が消える
         state, clip_id = layered
         state = SetStrokeEnabled(clip_id, StrokeId("a"), False).apply(state)
         assert [stroke.enabled for stroke in _source(state, clip_id).strokes] == [False, True]
@@ -169,6 +176,7 @@ class TestEditingLayers:
     def test_values_and_keyframes_go_through_the_usual_commands(
         self, layered: tuple[Project, ClipId]
     ) -> None:
+        # 層の値が別の層や中身へ入ると、太さを変えた縁と違う縁が太くなる
         # 層の値も中身の値と同じ命令で変えられる 別の命令にすると、キーフレームや初期値へ
         # 戻す操作を層のために書き直すことになる
         state, clip_id = layered
@@ -185,6 +193,7 @@ class TestEditingLayers:
     def test_layer_effects_go_through_the_usual_commands(
         self, layered: tuple[Project, ClipId]
     ) -> None:
+        # 層のエフェクトがクリップや別の層へ入ると、縁だけをぼかしたつもりが字全体や別の縁がぼける
         state, clip_id = layered
         stroke = StrokeId("b")
         blur = Effect("blur", {"radius": AnimatedValue(4.0)})
@@ -211,12 +220,14 @@ class TestEditingLayers:
         assert [effect.kind for effect in _source(state, clip_id).strokes[1].effects] == ["blur"]
 
     def test_removing_a_layer_takes_its_effects(self, layered: tuple[Project, ClipId]) -> None:
+        # 層を消しても層のエフェクトが残ると、見えないエフェクトが保存されたまま残り続ける
         state, clip_id = layered
         state = AddEffect(clip_id, Effect("blur"), stroke_id=StrokeId("a")).apply(state)
         state = RemoveStroke(clip_id, StrokeId("a")).apply(state)
         assert [stroke.id for stroke in _source(state, clip_id).strokes] == ["b"]
 
     def test_a_fixed_effect_is_refused(self, layered: tuple[Project, ClipId]) -> None:
+        # クリップの欄（配置など）を層に積めると、縁の層の中で配置が二重に掛かり縁だけずれる
         state, clip_id = layered
         with pytest.raises(ValueError, match="固定"):
             AddEffect(clip_id, Effect("transform", fixed=True), stroke_id=StrokeId("a")).apply(
@@ -224,6 +235,7 @@ class TestEditingLayers:
             )
 
     def test_an_unknown_layer_is_an_error(self, layered: tuple[Project, ClipId]) -> None:
+        # 無い層への変更を黙って通すと、取り消しの段だけ積まれて何も変わらない
         state, clip_id = layered
         with pytest.raises(KeyError):
             SetParam(
@@ -263,6 +275,7 @@ class TestEditingLayers:
 
 class TestSaving:
     def test_layers_come_back(self, tmp_path: Path) -> None:
+        # 層を保存に書き忘れると、保存して開き直しただけで縁が全部消える
         source = _text(border_width=AnimatedValue(0.0)).with_strokes(
             (
                 Stroke(

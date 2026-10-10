@@ -93,26 +93,40 @@ def test_the_outlines_survive(loaded: Loaded) -> None:
     assert bordered
 
 
-def test_stacked_outlines_become_layers(loaded: Loaded) -> None:
-    """2 つ重ねた縁取りは縁取りの層になり、外側の層ほど太い（#272）
+def test_outlines_after_a_fill_stay_in_place(loaded: Loaded) -> None:
+    """前景の塗りの後ろに 2 つ重ねた縁取り（ポップおこ・ポップグラデ 18 本）は層にしない（#272）
 
-    実物（あおもや式のポップおこ・ポップグラデ 18 本）は、内側の縁取りの外へ 2 つ目を付ける
-    層の太さを字の輪郭からの和にしないと、外側の層が内側の層の下に隠れる
+    層は字と一緒に描くので、前の塗りが縁まで塗る 並びの位置に残すと YMM4 との差が
+    層にしたとき（ポップおこ濃緑 4.48）の半分より小さい（1.92）
     """
+    pops = [
+        item.clip
+        for entry, objects in loaded
+        if "ポップおこ" in entry.name or "ポップグラデ" in entry.name
+        for item in objects
+        if item.clip.source is not None and item.clip.source.kind == "text"
+    ]
+    if not pops:
+        pytest.skip("ポップおこ・ポップグラデのテンプレートが置かれていない")
+    for clip in pops:
+        assert clip.source is not None and clip.source.strokes == ()
+        assert sum(1 for effect in clip.effects if effect.kind == "border") == 2
+
+
+def test_layers_widen_outwards(loaded: Loaded) -> None:
+    """縁取りの層になった物は、外側の層ほど太い 太さを字の輪郭からの和にしないと、外側の層が
+    内側の層の下に隠れる（層になる実物が無ければ何も見ない）"""
     layered = [
         item.clip.source
         for _, objects in loaded
         for item in objects
         if item.clip.source is not None and item.clip.source.strokes
     ]
-    if not layered:
-        pytest.skip("縁取りを 2 つ重ねたテンプレートが置かれていない")
     for source in layered:
         widths = [stroke.params["width"] for stroke in source.strokes]
         assert all(isinstance(width, AnimatedValue) for width in widths)
         statics = [width.static for width in widths if isinstance(width, AnimatedValue)]
         assert statics == sorted(statics)
-        assert "border_width" not in source.params
 
 
 def test_the_animations_span_the_whole_item(loaded: Loaded) -> None:
