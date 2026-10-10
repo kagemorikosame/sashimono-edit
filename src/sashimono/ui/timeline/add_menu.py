@@ -46,6 +46,8 @@ from sashimono.core.commands import (
 from sashimono.core.commands.insert import DEFAULT_GENERATED_FRAMES, is_effect_track, new_track
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.io.aliases import Alias, AliasStore, alias_refusal
+from sashimono.core.io.library import ALIAS, Library, LibraryEntry
+from sashimono.core.io.presets import PresetStore
 from sashimono.core.io.serialize import ProjectFileError
 from sashimono.core.model import (
     Clip,
@@ -59,6 +61,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.sources import GROUP, SHAPE, TEXT, TRANSITION, source_registry
+from sashimono.ui import library_dialog
 
 if TYPE_CHECKING:
     from sashimono.ui.timeline.view import TimelineView
@@ -142,6 +145,10 @@ class AddSources:
     ask_name: Callable[[QWidget, str], str | None] = _ask_name
     #: 同じ名前のエイリアスを上書きしてよいか 断られたら偽
     confirm_overwrite: Callable[[QWidget, str], bool] = _confirm_overwrite
+    #: 保存したプリセット 一覧の窓（#276）でエイリアスと並べて整理するのに使う
+    presets: PresetStore = field(default_factory=PresetStore)
+    #: 一覧の窓を開いて、〔置く〕で選ばれた物を返す 試験では窓を開かない物へ差し替える
+    open_library: Callable[..., LibraryEntry | None] = library_dialog.open_library
 
 
 def effects_for(kind: TrackKind) -> tuple[EffectDefinition, ...]:
@@ -302,11 +309,23 @@ class TimelineAddMenus:
     def _fill_aliases(self, menu: QMenu, frame: int, track_id: TrackId | None) -> None:
         sources = self._view.add_sources
         saved = sources.aliases.all()
+        _action(
+            menu,
+            "管理…（見本で選ぶ・名前や分類を変える・消す）",
+            functools.partial(self.manage_aliases, frame, track_id),
+        )
         mine = menu.addMenu("保存したもの")
         if saved:
+            # 分類が 1 つだけなら段を作らない（前と同じ並び） 開く手間が増えるだけになる
+            categories = {alias.category for alias in saved}
+            groups: dict[str, QMenu] = {}
             for alias in saved:
+                target = mine
+                if len(categories) > 1:
+                    target = groups.get(alias.category) or mine.addMenu(alias.category)
+                    groups[alias.category] = target
                 _action(
-                    mine, alias.name, functools.partial(self.place_alias, alias, frame, track_id)
+                    target, alias.name, functools.partial(self.place_alias, alias, frame, track_id)
                 )
         else:
             _placeholder(mine, "（まだありません 右クリックの〔エイリアスとして保存…〕で作れます）")
@@ -394,6 +413,14 @@ class TimelineAddMenus:
             insert_clip(self._project, alias.instantiate(), at_frame=frame, track_id=track_id),
             f"エイリアスを置く: {alias.name}",
         )
+
+    def manage_aliases(self, frame: int, track_id: TrackId | None) -> None:
+        """一覧の窓を開く 〔置く〕で選んだ物を、右クリックした所へ置く（メニューと同じ）"""
+        sources = self._view.add_sources
+        library = Library(presets=sources.presets, aliases=sources.aliases)
+        chosen = sources.open_library(self._view, library, kind=ALIAS, pick=ALIAS)
+        if chosen is not None and isinstance(chosen.item, Alias):
+            self.place_alias(chosen.item, frame, track_id)
 
     def place_scene(self, scene_id: SceneId, frame: int, track_id: TrackId | None) -> None:
         scene = self._project.find_scene(scene_id)

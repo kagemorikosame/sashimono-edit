@@ -468,3 +468,80 @@ class TestEditSection:
         seen = self._seen_by_dll()
         assert seen["last_function"] == seen["first_function"]
         assert seen["returned"] == 0
+
+
+class TestKeepingTheRuntime:
+    def test_a_runtime_that_read_a_dll_is_never_let_go(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # DLL のモジュールを読んだ Lua を手放すと、片付けの中でアクセス違反で落ちた
+        # （AviUtl2 の配布物の DLL 棚の見本で続けて描いた後のごみ集め #277）
+        from sashimono.compat.aviutl import runtime as runtime_module
+
+        module, keep = _module({"noop": lambda _param: None})
+        monkeypatch.setattr(native, "load", lambda _path: module)
+        runtime = LuaScriptRuntime(instruction_limit=200_000)
+        assert runtime._native_module(tmp_path / "試験.mod2", "試験") is not None
+        assert runtime in runtime_module._PINNED_RUNTIMES
+        # 2 度読んでも 1 つだけ持つ
+        runtime._native_module(tmp_path / "試験.mod2", "試験")
+        assert runtime_module._PINNED_RUNTIMES.count(runtime) == 1
+        assert keep
+
+    def test_a_kept_runtime_is_reused_without_the_last_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 手放せないランタイムを描画係ごとに作ると、書き出し 20 回で 5.9GB 積み上がった
+        # 使い回すなら、前の描画のスクリプトが置いた値が次の描画に見えてはいけない
+        from sashimono.compat.aviutl import runtime as runtime_module
+        from sashimono.compat.aviutl.catalog import ScriptCatalog
+        from sashimono.engine.render.scripts import ScriptStage
+
+        module, keep = _module({"noop": lambda _param: None})
+        monkeypatch.setattr(native, "load", lambda _path: module)
+        monkeypatch.setattr(runtime_module, "_IDLE_RUNTIMES", [])
+        catalog = ScriptCatalog(roots=(tmp_path,))
+        first = ScriptStage(catalog, screen=(64, 64))
+        runtime = first._runtime
+        runtime._native_module(tmp_path / "試験.mod2", "試験")
+        runtime.run("leaked = 42 package.loaded.mine = 1 string.leaked = 1", _state())
+        assert runtime._lua.globals()["leaked"] == 42
+        pinned = len(runtime_module._PINNED_RUNTIMES)
+        first.close()
+        # 返したランタイムは閉じた描画係の手を放す 握ったままだと描画係ごと残る
+        assert runtime._render_source is None
+        assert runtime._apply_effects is None
+
+        for _ in range(5):
+            stage = ScriptStage(catalog, screen=(64, 64))
+            # 同じランタイムを使い回し、手放せない物は増えない
+            assert stage._runtime is runtime
+            assert len(runtime_module._PINNED_RUNTIMES) == pinned
+            lua = runtime._lua.globals()
+            assert lua["leaked"] is None
+            assert lua["package"]["loaded"]["mine"] is None
+            # 標準の表へ足した物も残さない
+            assert lua["string"]["leaked"] is None
+            # 前の描画係の手は握っていない（新しい係の手に付け替わる）
+            assert runtime._render_source == stage._render_source
+            stage.close()
+        assert keep
+
+    def test_a_plain_runtime_is_not_kept_for_reuse(self, tmp_path: Path) -> None:
+        # DLL を読まないランタイムは手放せる 取っておくと、使わない Lua が残り続ける
+        from sashimono.compat.aviutl import runtime as runtime_module
+        from sashimono.compat.aviutl.catalog import ScriptCatalog
+        from sashimono.engine.render.scripts import ScriptStage
+
+        stage = ScriptStage(ScriptCatalog(roots=(tmp_path,)), screen=(64, 64))
+        runtime = stage._runtime
+        stage.close()
+        assert runtime not in runtime_module._IDLE_RUNTIMES
+
+    def test_a_plain_runtime_is_let_go(self) -> None:
+        # DLL を読まないランタイムまで持ち続けると、書き出しや静止画のたびに溜まっていく
+        from sashimono.compat.aviutl import runtime as runtime_module
+
+        runtime = LuaScriptRuntime(instruction_limit=200_000)
+        runtime.run("x = 1", _state())
+        assert runtime not in runtime_module._PINNED_RUNTIMES

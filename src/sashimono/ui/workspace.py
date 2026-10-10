@@ -21,9 +21,12 @@ from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.core import userdirs
+from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.model import LayerMode
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
+from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
+from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryOptions
 from sashimono.ui.media_match import MATCH_ASK, MATCH_MODES
 from sashimono.ui.media_pool import VIEW_LIST, VIEW_MODES
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_AT_PLAYHEAD, KEYFRAME_DRAG_MODES
@@ -325,6 +328,31 @@ class Preferences:
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
     double_click_reset: bool = True
+    #: 設定パネルの〔プリセット…〕で当てるとき、文字そのもの（タイマーの書式なども）も
+    #: 当てる 既定は切（利用者の決定） 見た目だけを当て、打った文字は残す（テンプレートの
+    #: 棚の着せ替えと同じ） 決まった文言の見出しを丸ごと当てたい人は入れる
+    preset_with_text: bool = False
+    #: 同じく、画面の中の位置（X と Y）も当てる 既定は切 位置は置いた場所の事情で、
+    #: 字幕の見た目を当てたら全部が保存した所へ寄ってしまう 決まった所に出す物を作る人は入れる
+    preset_with_position: bool = False
+    #: 同じく、当てる先に足してあるエフェクトを残してプリセットの物を足す 既定は切（入れ替える）
+    #: 入れ替えると保存したクリップと同じ見た目になり、試しに当て比べても前のエフェクトが
+    #: 重ならない グローと影のように別々に作ったプリセットを重ねて使う人は入れる
+    preset_keep_effects: bool = False
+    #: プリセットとエイリアスの一覧（管理の窓 #276 #277）の見本の絵の描き方
+    #: 既定はエフェクトも描く（GPU 別のスレッドで描くので一覧を開く速さには響かない）
+    #: GPU を使わせたくない人・古い機械の人は文字と図形だけ（軽い）か、出さない（名前だけ）
+    library_thumbnails: str = THUMBNAILS_FULL
+    #: 見本の絵の地 既定は市松模様 白い文字も黒い文字も見え、透けている所も分かる
+    #: 実際に重ねる映像に近い地で見たい人は暗い地か明るい地にする
+    library_backdrop: str = BACKDROP_CHECKER
+    #: 一覧から消すときに確かめる 既定は入 消した物はごみ箱から戻せるが、戻せることを
+    #: 知らない人には黙って消えたように見える 何件も続けて整理する人は切れる
+    library_confirm_delete: bool = True
+    #: テンプレートの棚の一覧にも見本の絵を出す 既定は入（利用者の決定） 描き方は上の
+    #: 「プリセットの見本」と同じ 棚は数が多く、GPU や置き場を使わせたくない人は切れる
+    #: 切っても選んだ 1 本の大きな下絵は出る
+    shelf_thumbnails: bool = True
     #: 設定パネルで、焦点の無い欄（クリックしていない選択の欄・数値の欄・スライダー）でも
     #: ホイールで値を変える 既定は切 切っていると、焦点の無い欄の上のホイールはパネルを送る
     #: 入れていると、パネルを送る途中で通った欄の値が変わり、気付かずに取り消しの段が積まれる
@@ -409,6 +437,25 @@ class Preferences:
         """素材を置く所（:func:`~sashimono.core.commands.insert_media`）へ渡す値"""
         return self.media_split == MEDIA_SPLIT
 
+    @property
+    def preset_options(self) -> PresetOptions:
+        """プリセットの当て方 設定パネル（:meth:`InspectorPanel.set_preset_options`）へ渡す"""
+        return PresetOptions(
+            with_text=self.preset_with_text,
+            with_position=self.preset_with_position,
+            keep_effects=self.preset_keep_effects,
+        )
+
+    @property
+    def library_options(self) -> LibraryOptions:
+        """プリセットとエイリアスの一覧の見せ方 一覧の窓（``ui/library_dialog.py``）へ渡す"""
+        return LibraryOptions(
+            thumbnails=self.library_thumbnails,
+            backdrop=self.library_backdrop,
+            confirm_delete=self.library_confirm_delete,
+            shelf=self.shelf_thumbnails,
+        )
+
     def prefetch_bytes(self) -> int:
         """先読みに使えるバイト数 切ってあれば 0
 
@@ -489,6 +536,21 @@ class PreferenceStore:
             ),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
+            preset_with_text=_flag(data.get("preset_with_text"), plain.preset_with_text),
+            preset_with_position=_flag(
+                data.get("preset_with_position"), plain.preset_with_position
+            ),
+            preset_keep_effects=_flag(data.get("preset_keep_effects"), plain.preset_keep_effects),
+            library_thumbnails=_choice(
+                data.get("library_thumbnails"), THUMBNAIL_MODES, plain.library_thumbnails
+            ),
+            library_backdrop=_choice(
+                data.get("library_backdrop"), BACKDROP_MODES, plain.library_backdrop
+            ),
+            library_confirm_delete=_flag(
+                data.get("library_confirm_delete"), plain.library_confirm_delete
+            ),
+            shelf_thumbnails=_flag(data.get("shelf_thumbnails"), plain.shelf_thumbnails),
             wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),

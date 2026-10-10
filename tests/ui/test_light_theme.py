@@ -358,6 +358,9 @@ _FIXED_COLORS = {
     "inspector/widgets.py",
     # 値を動かしている間の吹き出し 自分で黒い地を敷いてから白い字を載せる
     "timeline/value_line.py",
+    # プリセットとエイリアスの見本の地 地は映像の代わりで、選ぶのは設定の「見本の地」
+    # テーマに合わせると、明るいテーマで白い字幕のプリセットが見えなくなる
+    "library_view.py",
 }
 
 _LITERAL = re.compile(r"""QColor\(\s*(["']#|\d)|["']#[0-9a-fA-F]{3,8}["']|color:\s*#""")

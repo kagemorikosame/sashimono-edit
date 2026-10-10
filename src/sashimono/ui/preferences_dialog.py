@@ -36,7 +36,10 @@ from sashimono.engine.encode import (
     MEASURED_EXPORT_TOTAL_MS,
 )
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
+from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
+from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT
 from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
@@ -389,6 +392,79 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._double_click_reset)
 
+        # プリセットの当て方 どれも既定は切（当てる先の文字・位置・エフェクトを残す側）
+        self._preset_with_text = QCheckBox("プリセットを当てるとき、文字も一緒に当てる", self)
+        self._preset_with_text.setChecked(preferences.preset_with_text)
+        self._preset_with_text.setToolTip(
+            "切っていると、見た目（書体・色・大きさ・縁取り・影など）だけを当て、"
+            "打ってある文字はそのまま残す 入れると、保存したときの文字に置き換える"
+        )
+        form.addRow(self._preset_with_text)
+        self._preset_with_position = QCheckBox("プリセットを当てるとき、位置（X・Y）も当てる", self)
+        self._preset_with_position.setChecked(preferences.preset_with_position)
+        self._preset_with_position.setToolTip(
+            "切っていると、当てる先のクリップの画面の中の位置はそのまま残す "
+            "入れると、保存したクリップと同じ所へ動かす（クリップの長さはどちらでも変えない）"
+        )
+        form.addRow(self._preset_with_position)
+        self._preset_keep_effects = QCheckBox(
+            "プリセットを当てるとき、足してあるエフェクトを残して足す", self
+        )
+        self._preset_keep_effects.setChecked(preferences.preset_keep_effects)
+        self._preset_keep_effects.setToolTip(
+            "切っていると、当てる先に足してあるエフェクトをプリセットの物と入れ替え、"
+            "保存したクリップと同じ見た目にする 入れると、残したまま後ろへ足す "
+            "前の版で保存したプリセット（エフェクトだけの物）は、どちらでも足す"
+        )
+        form.addRow(self._preset_keep_effects)
+
+        # プリセットとエイリアスの一覧（#276 #277）の見せ方
+        gpu_ms, simple_ms = MEASURED_LOOK_MS
+        self._library_thumbnails = QComboBox(self)
+        self._library_thumbnails.addItem("エフェクトも描く（GPU 既定）", THUMBNAILS_FULL)
+        self._library_thumbnails.addItem("文字と図形だけ（軽い）", THUMBNAILS_SIMPLE)
+        self._library_thumbnails.addItem("出さない（名前だけ）", THUMBNAILS_OFF)
+        self._library_thumbnails.setCurrentIndex(
+            max(0, self._library_thumbnails.findData(preferences.library_thumbnails))
+        )
+        self._library_thumbnails.setToolTip(
+            "プリセットとエイリアスの一覧に出す見本の絵 どちらも別のスレッドで、"
+            "見えている物から描くので、一覧はすぐ開く "
+            f"1 枚描くのに GPU で {gpu_ms}ms、文字と図形だけで {simple_ms}ms（RTX 5060 Ti） "
+            "GPU の方は描き始めの 1 回だけ 0.4 秒ほど準備に掛かる "
+            "文字と図形だけにすると、縁取りやグローなどのエフェクトは見本に出ない "
+            "描いた絵は覚えておき、中身が変わったときだけ描き直す"
+        )
+        form.addRow("プリセットの見本", self._library_thumbnails)
+        self._library_backdrop = QComboBox(self)
+        self._library_backdrop.addItem("市松模様（既定）", BACKDROP_CHECKER)
+        self._library_backdrop.addItem("暗い地", BACKDROP_DARK)
+        self._library_backdrop.addItem("明るい地", BACKDROP_LIGHT)
+        self._library_backdrop.setCurrentIndex(
+            max(0, self._library_backdrop.findData(preferences.library_backdrop))
+        )
+        self._library_backdrop.setToolTip(
+            "見本の絵の下に敷く地 市松模様なら白い文字も黒い文字も見え、透けている所も分かる"
+        )
+        form.addRow("見本の地", self._library_backdrop)
+        self._library_confirm_delete = QCheckBox(
+            "プリセットやエイリアスを一覧から消すときに確かめる", self
+        )
+        self._library_confirm_delete.setChecked(preferences.library_confirm_delete)
+        self._library_confirm_delete.setToolTip(
+            "消した物はどちらでも一覧のごみ箱へ移り、〔元に戻す〕で戻せる "
+            "続けて何件も整理するときに確かめが煩わしければ切る"
+        )
+        form.addRow(self._library_confirm_delete)
+        self._shelf_thumbnails = QCheckBox("テンプレートの棚にも見本の絵を出す", self)
+        self._shelf_thumbnails.setChecked(preferences.shelf_thumbnails)
+        self._shelf_thumbnails.setToolTip(
+            "棚の一覧の名前の横に小さな見本を出す 描き方は「プリセットの見本」と同じで、"
+            "見えている物から別のスレッドで描き、描いた絵と読めなかった印は覚えておく "
+            "切っても、選んだ 1 本の大きな下絵は出る"
+        )
+        form.addRow(self._shelf_thumbnails)
+
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
         )
@@ -683,6 +759,13 @@ class PreferencesDialog(QDialog):
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),
             double_click_reset=self._double_click_reset.isChecked(),
+            preset_with_text=self._preset_with_text.isChecked(),
+            preset_with_position=self._preset_with_position.isChecked(),
+            preset_keep_effects=self._preset_keep_effects.isChecked(),
+            library_thumbnails=str(self._library_thumbnails.currentData()),
+            library_backdrop=str(self._library_backdrop.currentData()),
+            library_confirm_delete=self._library_confirm_delete.isChecked(),
+            shelf_thumbnails=self._shelf_thumbnails.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
