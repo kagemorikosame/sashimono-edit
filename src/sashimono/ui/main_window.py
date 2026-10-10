@@ -138,6 +138,7 @@ from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
+from sashimono.ui.timeline.snap import PlayheadSnap
 from sashimono.ui.timeline.view import HEIGHT_STEP
 from sashimono.ui.transport import TransportBar
 from sashimono.ui.updates import UpdateController
@@ -442,6 +443,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_split_audio(self._preferences.splits_media)
         self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
+        self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
@@ -900,6 +902,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
+        self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         self._inspector.set_preset_options(preferences.preset_options)
