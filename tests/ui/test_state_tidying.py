@@ -26,6 +26,7 @@ from sashimono.ui.backup_settings import confirm_backup_changes, plan_trim_all
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.recovery_dialog import RecoveryDialog
+from sashimono.ui.theme import current_theme
 from sashimono.ui.workspace import Preferences, PreferenceStore
 
 
@@ -40,6 +41,17 @@ def no_popups(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(QMessageBox, name, popped)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", popped)
     monkeypatch.setattr(RecoveryDialog, "exec", popped)
+
+
+@pytest.fixture(autouse=True)
+def same_theme(qt_application: QApplication) -> Iterator[None]:
+    """試験の前後でアプリ全体のテーマが変わらないことを見る
+
+    色とテーマはアプリに 1 つだけで、変えたまま終わると同じワーカーの後の試験が落ちる
+    """
+    before = (current_theme(), qt_application.styleSheet())
+    yield
+    assert (current_theme(), qt_application.styleSheet()) == before, "テーマを変えたまま終えた"
 
 
 def _window(preferences: Preferences | None = None) -> MainWindow:
@@ -234,7 +246,9 @@ class TestTheSizeLimit:
 
     def test_no_limit_trims_nothing(self, window: MainWindow, tmp_path: Path) -> None:
         made = _fill(tmp_path / "本編.sme", 5)
-        window._apply_preferences(Preferences(theme="light"))
+        # 上限と関係の無い設定だけを変える テーマのようにアプリ全体に掛かる物を変えると、
+        # 同じワーカーで後に走る別の試験（目盛りの色など）まで変わる
+        window._apply_preferences(Preferences(autosave_seconds=45))
         assert all(path.is_file() for path in made)
 
     def test_setting_it_asks_with_what_will_go(

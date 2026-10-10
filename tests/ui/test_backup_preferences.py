@@ -36,6 +36,7 @@ from sashimono.ui.backup_settings import (
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.recovery_dialog import RecoveryDialog
+from sashimono.ui.theme import current_theme
 from sashimono.ui.workspace import (
     AUTOSAVE_SECONDS_RANGE,
     BACKUP_GENERATIONS_RANGE,
@@ -73,6 +74,18 @@ def no_popups(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(QMessageBox, "exec", popped)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", popped)
     monkeypatch.setattr(RecoveryDialog, "exec", popped)
+
+
+@pytest.fixture(autouse=True)
+def same_theme(qt_application: QApplication) -> Iterator[None]:
+    """試験の前後でアプリ全体のテーマが変わらないことを見る
+
+    設定を当てる試験が多い テーマはアプリに 1 つだけで、変えたまま終わると同じワーカーの
+    後の試験（目盛りの色など）が落ちる
+    """
+    before = (current_theme(), qt_application.styleSheet())
+    yield
+    assert (current_theme(), qt_application.styleSheet()) == before, "テーマを変えたまま終えた"
 
 
 @pytest.fixture
