@@ -766,6 +766,53 @@ void main() {
 """)
 
 
+_EMBOSS = _shader(
+    _SRGB
+    + """
+uniform float angle;
+uniform float height;
+uniform float amount;
+uniform int basis;
+uniform bool keep_color;
+uniform float reach;
+
+// 高さは見た目（sRGB）の値で取る リニアのままだと暗い所の段差がつぶれ、明るい所ばかり
+// 浮き上がって、Photoshop や Premiere のエンボスと凹凸の付き方が変わる
+// 色に α を掛けて、透明な所を一番低い所と見る 掛けないと、透明な画素に残った色
+// （多くは黒）の段差が縁に出たり出なかったりする
+vec3 height_at(vec2 pixel) {
+    vec4 c = sample_pixel(pixel);
+    if (basis == 2) return vec3(c.a);
+    vec3 s = to_srgb(c.rgb) * c.a;
+    if (basis == 1) return s;
+    return vec3(dot(s, LUMA));
+}
+
+void main() {
+    vec4 base = texture(u_texture, v_uv);
+    // 光の方向は右が 0 度で反時計回り（Y は上が正） Photoshop の角度と同じ数え方
+    vec2 light = vec2(cos(radians(angle)), sin(radians(angle)));
+    vec2 pixel = v_uv * u_size;
+    vec2 step_to_light = light * max(reach, 0.0);
+    // 光から遠い側が高いほど、光の方を向いた斜面になって明るい 1 画素の隣だけ見ると
+    // 取り込み幅を広げても線が太らないので、幅だけ離れた 2 点の差を取る
+    vec3 relief = (height_at(pixel - step_to_light) - height_at(pixel + step_to_light))
+                * (height / 100.0) * 0.5;
+    vec3 embossed;
+    if (keep_color) {
+        embossed = to_srgb(base.rgb) + relief;
+    } else {
+        embossed = vec3(0.5) + relief;
+    }
+    // なじませるのはリニアで行う 量 0 で元の値がそのまま残り、1 を超える明るさも切れない
+    float weight = clamp(amount / 100.0, 0.0, 1.0);
+    vec3 rgb = mix(base.rgb, to_linear(clamp(embossed, 0.0, 1.0)), weight);
+    frag_color = vec4(rgb, base.a);
+}
+"""
+)
+
+
 def register_stylize_effects() -> None:
     """加工のエフェクトを一覧へ登録する 何度呼んでも 1 回だけ"""
     if "morphology" in registry:
@@ -1157,6 +1204,36 @@ def register_stylize_effects() -> None:
                 CheckSpec("overlay", "元の絵に重ねる", False),
             ),
             fragment_shader=_EDGE_DETECT,
+        ),
+        # 絵の明るさを高さと見て、光を当てた凹凸を灰色の面で出す（Photoshop・Premiere の
+        # エンボス） 縁の反射（bevel_light）は不透明度の境目を高さと見るので、写真や模様の
+        # 中の凹凸は出ない
+        EffectDefinition(
+            kind="emboss",
+            label="エンボス",
+            category="装飾",
+            # α は触らず、透明な所に色を置かない 印が無いと後ろの粒を探す範囲が広がる
+            keeps_content=True,
+            parameters=(
+                # 既定の 135 度（左上から光）は Photoshop の既定と同じ 浮き彫りの見本で
+                # いちばん見慣れた向き
+                TrackSpec("angle", "光の方向", -360, 360, 135, unit="度"),
+                # 1 段の白黒の差を 100% で白（黒）まで振り切る Photoshop の「量」と同じ割合で、
+                # 500% まであれば淡い写真の凹凸も強められる
+                TrackSpec("height", "高さ", 0, 500, 100, unit="%"),
+                TrackSpec("amount", "量", 0, 100, 100, unit="%"),
+                SelectSpec(
+                    "basis",
+                    "高さの基準",
+                    (("luma", "明るさ"), ("rgb", "各色"), ("alpha", "不透明度")),
+                    "luma",
+                ),
+                CheckSpec("keep_color", "元の色を残す", False),
+                # 画面の画素で数えるので、画質を落としたプレビューでは縮めて渡す（単位が px）
+                # 既定の 3 は Photoshop の「高さ」の既定 1 だと線画の縁しか拾えない
+                TrackSpec("reach", "取り込み幅", 0.5, 64, 3, unit="px"),
+            ),
+            fragment_shader=_EMBOSS,
         ),
     )
     for definition in definitions:

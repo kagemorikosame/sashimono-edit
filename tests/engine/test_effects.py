@@ -23,7 +23,7 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.timebase import FrameRate
-from sashimono.effects import ColorSpec, TrackSpec, registry
+from sashimono.effects import ColorSpec, ParamInput, TrackSpec, registry
 from sashimono.effects.definition import EffectDefinition
 from sashimono.effects.sources import SHAPE, TEXT, source_registry
 from sashimono.engine.gpu import BlendMode, GLContextError, OffscreenGLContext, srgb_to_linear
@@ -601,6 +601,111 @@ class TestDecorationEffects:
         square = white_square(120)
         effect = registry.require("noise").create(strength=60, animate=False)
         assert np.array_equal(draw(square, (effect,), frame=0), draw(square, (effect,), frame=7))
+
+
+def _emboss(**values: ParamInput) -> Effect:
+    return registry.require("emboss").create(**values)
+
+
+def diagonal_slope() -> tuple[GeneratedSource, Effect]:
+    """画面いっぱいの、左下が暗く右上へ向かって明るくなる坂
+
+    グラデーションの角度 45 度は、始めの色が右上・終わりの色が左下に来る（試験の中で前提を確かめる）
+    """
+    plate = SHAPE.create(shape="rect", width=WIDTH, height=HEIGHT, color=(1.0, 1.0, 1.0, 1.0))
+    ramp = registry.require("gradient").create(
+        start_color=(1.0, 1.0, 1.0, 1.0),
+        end_color=(0.0, 0.0, 0.0, 1.0),
+        angle=45,
+        span=400,
+    )
+    return plate, ramp
+
+
+class TestEmboss:
+    # 白い四角は 50..149 の画素に載る 縁から 2 画素内側を見る
+    LEFT, RIGHT, TOP, BOTTOM = 52, 147, 52, 147
+    MIDDLE = HEIGHT // 2
+
+    def test_flat_picture_is_mid_grey_from_every_direction(
+        self, draw: Callable[..., np.ndarray]
+    ) -> None:
+        # 平らな所に凹凸は無い 光の向きで明るさが変わると、ただの色の付け替えになる
+        grey = SHAPE.create(shape="rect", width=WIDTH, height=HEIGHT, color=(0.3, 0.3, 0.3, 1.0))
+        values = {
+            angle: centre(draw(grey, (_emboss(angle=angle),)))[0] for angle in (0, 90, 135, -45)
+        }
+        assert len(set(values.values())) == 1, values
+        assert 120 <= values[0] <= 136, "平らな所が中間の灰色にならない"
+
+    def test_the_side_facing_the_light_is_bright(self, draw: Callable[..., np.ndarray]) -> None:
+        # 浮き上がった四角に左から光を当てると、左の縁が照り、右の縁が陰になる
+        # 逆だと、浮き彫りではなくへこみに見える
+        lit = draw(white_square(), (_emboss(angle=180),))
+        assert lit[self.MIDDLE, self.LEFT, 0] > 200
+        assert lit[self.MIDDLE, self.RIGHT, 0] < 60
+        assert 120 <= lit[self.MIDDLE, self.MIDDLE, 0] <= 136, "四角の中の平らな所は灰色のまま"
+
+    def test_the_angle_turns_the_light(self, draw: Callable[..., np.ndarray]) -> None:
+        # Y は上が正 90 度は上から光が来る 向きが逆だと、上下の陰影が入れ替わる
+        square = white_square()
+        from_right = draw(square, (_emboss(angle=0),))
+        assert from_right[self.MIDDLE, self.RIGHT, 0] > 200
+        assert from_right[self.MIDDLE, self.LEFT, 0] < 60
+        from_above = draw(square, (_emboss(angle=90),))
+        assert from_above[self.TOP, self.MIDDLE, 0] > 200
+        assert from_above[self.BOTTOM, self.MIDDLE, 0] < 60
+
+    def test_a_slope_is_bright_or_dark_by_the_light(self, draw: Callable[..., np.ndarray]) -> None:
+        # 右上へ上る坂は、右上を向いた光から見ると陰になり、左下からの光で照る
+        # 坂を横から照らすと（坂の向きと直交）、凹凸が出ず中間の灰色になる
+        plate, ramp = diagonal_slope()
+        plain = draw(plate, (ramp,))
+        assert plain[60, 140, 0] > plain[140, 60, 0], "前提の坂が右上へ上っていない"
+        strong = {"height": 500, "reach": 8}
+        towards_top = centre(draw(plate, (ramp, _emboss(angle=45, **strong))))[0]
+        towards_bottom = centre(draw(plate, (ramp, _emboss(angle=225, **strong))))[0]
+        across = centre(draw(plate, (ramp, _emboss(angle=135, **strong))))[0]
+        assert towards_bottom > 140
+        assert towards_top < 116
+        assert abs(across - 128) <= 6
+
+    def test_zero_amount_keeps_the_picture(self, draw: Callable[..., np.ndarray]) -> None:
+        # 量 0 は元の絵 リニアのまま混ぜるので、色の往復で 1 段ずれることもない
+        plate, ramp = diagonal_slope()
+        plain = draw(plate, (ramp,))
+        assert np.array_equal(draw(plate, (ramp, _emboss(amount=0))), plain)
+
+    def test_zero_height_keeps_the_colour(self, draw: Callable[..., np.ndarray]) -> None:
+        # 元の色を残すときは、高さ 0 で凹凸が無くなり元の絵に戻る
+        plate, ramp = diagonal_slope()
+        plain = draw(plate, (ramp,)).astype(int)
+        flat = draw(plate, (ramp, _emboss(height=0, keep_color=True))).astype(int)
+        assert np.abs(flat - plain).max() <= 1
+
+    def test_keep_colour_adds_the_relief_to_the_picture(
+        self, draw: Callable[..., np.ndarray]
+    ) -> None:
+        # 元の色を残すと、平らな所は元の色のまま、照る縁だけ明るくなる
+        orange = SHAPE.create(shape="rect", width=100, height=100, color=(0.9, 0.3, 0.1, 1.0))
+        plain = draw(orange)
+        kept = draw(orange, (_emboss(angle=180, keep_color=True),))
+        middle = (self.MIDDLE, self.MIDDLE)
+        assert np.abs(kept[middle][:3].astype(int) - plain[middle][:3].astype(int)).max() <= 1
+        assert kept[self.MIDDLE, self.LEFT, 1] > plain[self.MIDDLE, self.LEFT, 1] + 40
+
+    def test_alpha_basis_ignores_the_colour_inside(self, draw: Callable[..., np.ndarray]) -> None:
+        # 不透明度を高さにすると、中の明暗の坂は平らに見え、外形の縁だけが浮く
+        plate, ramp = diagonal_slope()
+        by_alpha = draw(plate, (ramp, _emboss(basis="alpha", height=500, reach=8)))
+        assert abs(centre(by_alpha)[0] - 128) <= 1
+
+    def test_transparent_area_stays_transparent(self, draw: Callable[..., np.ndarray]) -> None:
+        # 透明な所に灰色の面を敷くと、下の絵が隠れる 形は元の絵のまま残す
+        # 書き出しの地は黒なので、外が黒のままなら何も置いていない
+        embossed = draw(white_square(), (_emboss(),))
+        assert embossed[10, 10, :3].max() == 0
+        assert embossed[self.MIDDLE, self.MIDDLE, 0] > 100
 
 
 class TestChromaKey:
