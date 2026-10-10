@@ -244,7 +244,8 @@ class TestZoomingDoesNotRedoTheSameWork:
     def test_revisiting_a_zoom_does_not_rebuild_any_waveform(
         self, scene: _Scene, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 行き来するズームで同じ倍率へ戻ったら、波形の画像は 1 枚も作り直さない
+        # 作り直すと、行き来するズームで同じ倍率へ戻るたびに境の先の 1 段で 200 枚を作り直し、
+        # そのたびに数 ms 引っかかる 同じ倍率へ戻ったら、波形の画像は 1 枚も作り直さない
         del monkeypatch
         images = painter_module._WAVEFORM_IMAGES
         before = images.built
@@ -592,7 +593,8 @@ class TestStretchingWavesWhileZooming:
     def test_while_zooming_a_nearby_wave_is_stretched_then_rebuilt(
         self, mixed: _Mixed, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 入れると、ズームの途中では波形を作らず、止まってから正しい波形に描き直す
+        # 入れても作ってしまえば設定の意味が無く、止まった後に描き直さなければ、伸ばした
+        # ずれた波形がいつまでも残る ズームの途中は作らず、止まったら正しい波形に描き直す
         exact = mixed.render(SCALES[2])
         _forget()
         mixed.view.set_stretch_waves(True)

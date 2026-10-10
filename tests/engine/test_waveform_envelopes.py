@@ -30,6 +30,8 @@ def _one_by_one(wave: Waveform, segments: list[tuple[int, int, int]]) -> np.ndar
 
 @pytest.mark.parametrize("seed", range(12))
 def test_many_ranges_match_one_by_one(seed: int) -> None:
+    # 値が 1 つでもずれると、初めての倍率でまとめて作った波形と、同じ倍率へ戻って 1 本ずつ
+    # 作った波形の山が食い違い、ズームの行き来で波形が揺れて見える
     # 段階の違う範囲・素材の末尾に掛かる範囲・素材の外の範囲・空の範囲を混ぜる
     rng = np.random.default_rng(seed)
     wave = _waveform(int(rng.integers(1, 4000)), seed)
@@ -47,11 +49,14 @@ def test_many_ranges_match_one_by_one(seed: int) -> None:
 
 
 def test_an_empty_list_gives_no_columns() -> None:
+    # 形が (0, チャンネル, 2) で無くなると、呼んだ側の envelope[:, :, 0] が IndexError になり、
+    # タイムラインの描画がそこで止まる（今の描く所は空の並びで呼ばないが、呼べる約束は守る）
     assert wave_shape(_waveform(10).envelopes([])) == (0, 2, 2)
 
 
 def test_a_silent_material_gives_zeros() -> None:
-    # 中身の無い素材（ピーク 0 個）でも落ちない
+    # 中身の無い素材（ピーク 0 個）で reduceat に番号を渡すと IndexError になり、その素材の
+    # クリップが見えている間はタイムラインが描けなくなる 0 で埋めた列を返して落ちない
     empty = Waveform(48000, 2, 0, (PeakLevel(256, np.zeros((0, 2, 2), dtype=np.float32)),))
     found = empty.envelopes([(0, 48000, 5), (100, 200, 3)])
     assert np.array_equal(found, _one_by_one(empty, [(0, 48000, 5), (100, 200, 3)]))
