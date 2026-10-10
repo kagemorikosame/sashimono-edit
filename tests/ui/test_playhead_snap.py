@@ -153,13 +153,38 @@ class TestShiftMode:
         view.set_snap(False)
         assert _scrub(view, 10, 62, _SHIFT) == 60
 
-    def test_a_shift_the_app_remembers_does_not_snap(self, made: Made) -> None:
+    def test_a_shift_the_app_remembers_does_not_snap(
+        self, made: Made, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # 日本語入力や別の窓で押した Shift をアプリが覚えていても、マウスの知らせに
         # 載っていなければ吸い付かない 押していないのに吸い付くと、壊れたように見える
+        # 覚えを Qt の入力で作ると、試験が配る押下（キー無し）で覚えが消えてしまい、
+        # アプリの覚えを見る作りに戻しても落ちない なので覚えの方を差し替える
         view = _open(made, _project(_text(0), _text(200)))
-        QTest.mouseClick(view, _LEFT, _SHIFT, QPoint(1, 1))
-        assert QApplication.keyboardModifiers() & _SHIFT
-        assert _scrub(view, 10, 62) == 62
+        with monkeypatch.context() as patch:
+            patch.setattr(QApplication, "keyboardModifiers", staticmethod(lambda: _SHIFT))
+            assert QApplication.keyboardModifiers() & _SHIFT
+            assert _scrub(view, 10, 62) == 62
+
+    def test_a_shift_from_the_hover_before_the_press_does_not_snap(self, made: Made) -> None:
+        # 掴む前のマウスの動きで覚えた Shift を押下に持ち越すと、離したはずの Shift で
+        # 押した所から再生ヘッドがずれる
+        view = _open(made, _project(_text(0), _text(200)))
+        hover = _ruler(view, 30)
+        QApplication.sendEvent(
+            view,
+            QMouseEvent(
+                QEvent.Type.MouseMove,
+                QPointF(hover),
+                QPointF(hover),
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+                _SHIFT,
+            ),
+        )
+        QTest.mousePress(view, _LEFT, _NONE, _ruler(view, 62))
+        assert view.playhead == 62
+        QTest.mouseRelease(view, _LEFT, _NONE, _ruler(view, 62))
 
     def test_pressing_an_empty_track_area_does_not_snap(self, made: Made) -> None:
         # 空いた所の押下は囲んで選ぶ操作の始まり 押した所から再生ヘッドがずれると戸惑う
@@ -231,6 +256,21 @@ class TestTargets:
         view.set_playhead_snap(PlayheadSnap(clip_edges=False))
         assert _scrub(view, 10, 62, _SHIFT) == 62
 
+    def test_keyframes_can_be_left_out(self, made: Made) -> None:
+        keyed = _text(0, duration=120, opacity=AnimatedValue(1.0, keyframes=(Keyframe(90, 0.5),)))
+        view = _open(made, _project(keyed))
+        assert _scrub(view, 10, 92, _SHIFT) == 90
+        view.set_playhead_snap(PlayheadSnap(keyframes=False))
+        assert _scrub(view, 10, 92, _SHIFT) == 92
+
+    def test_the_work_area_can_be_left_out(self, made: Made) -> None:
+        project = _project(_text(0))
+        project = project.with_timeline(replace(project.timeline, work_area=(150, 300)))
+        view = _open(made, project)
+        assert _scrub(view, 100, 152, _SHIFT) == 150
+        view.set_playhead_snap(PlayheadSnap(work_area=False))
+        assert _scrub(view, 100, 152, _SHIFT) == 152
+
     def test_the_clip_magnet_keeps_the_playhead_as_a_target(self) -> None:
         # 再生ヘッドの吸い付きを足しても、クリップを動かすときは今までどおり再生位置へ吸い付く
         assert 123 in snap_targets(_project(_text(0)), 123)
@@ -241,6 +281,26 @@ class TestPreferences:
         plain = Preferences()
         assert plain.playhead_snap == PLAYHEAD_SNAP_SHIFT
         assert PlayheadSnap.from_preferences(plain) == PlayheadSnap()
+
+    @pytest.mark.parametrize(
+        ("preferences", "expected"),
+        [
+            (Preferences(playhead_snap_clips=False), PlayheadSnap(clip_edges=False)),
+            (Preferences(playhead_snap_keyframes=False), PlayheadSnap(keyframes=False)),
+            (Preferences(playhead_snap_work_area=False), PlayheadSnap(work_area=False)),
+            (Preferences(playhead_snap_markers=True), PlayheadSnap(markers=True)),
+            (
+                Preferences(playhead_snap=PLAYHEAD_SNAP_ALWAYS),
+                PlayheadSnap(mode=PLAYHEAD_SNAP_ALWAYS),
+            ),
+        ],
+    )
+    def test_each_setting_reaches_the_timeline(
+        self, preferences: Preferences, expected: PlayheadSnap
+    ) -> None:
+        # 1 つだけ既定と逆にして、その旗だけが逆になることを見る 取り違えると、
+        # 設定でキーフレームを切ったのにクリップの端が切れる
+        assert PlayheadSnap.from_preferences(preferences) == expected
 
     def test_it_is_kept_and_shown(self, qt_application: QApplication, tmp_path: Path) -> None:
         del qt_application
