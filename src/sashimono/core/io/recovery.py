@@ -91,6 +91,8 @@ class RecoveryEntry:
     #: 起動したときに復元を 1 度でも勧めたか（:func:`mark_offered`） 勧めていない退避は、
     #: 日数や容量で片付けない 本人が一度も見ていない作業を黙って消すことになる
     offered: bool = False
+    #: 初めて勧めた時刻 勧めていなければ ``None`` 日数の片付けはここからも数える
+    offered_at: datetime | None = None
 
 
 class RecoverySession:
@@ -207,7 +209,8 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
                 source=Path(source) if isinstance(source, str) else None,
                 name=str(meta.get("name") or "無題"),
                 saved_at=saved_at,
-                offered=_offered_path(folder, session).is_file(),
+                offered=(offered_at := _offered_at(folder, session)) is not None,
+                offered_at=offered_at,
             )
         )
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
@@ -351,13 +354,29 @@ def _offered_path(folder: Path, session: str) -> Path:
     return folder / f"{session}.offered"
 
 
+def _offered_at(folder: Path, session: str) -> datetime | None:
+    """初めて勧めた時刻（印を作った時刻） 印が無ければ ``None``"""
+    try:
+        return datetime.fromtimestamp(_offered_path(folder, session).stat().st_mtime)
+    except OSError:
+        return None
+
+
 def mark_offered(entry: RecoveryEntry) -> None:
     """起動したときに復元を勧めた印を付ける 日数と容量の片付けは、印の付いた退避だけを見る
 
     メモ（``.json``）に書き足さず別のファイルにするのは、メモが無い退避（最初の退避の
     途中で落ちた物）にも印を付けるため
+
+    印が既にあれば触らない 印の更新時刻が「初めて勧めた時刻」で、日数の片付けはそこから
+    数える 勧めるたびに付け直すと、いつまでも片付かない（逆に古い退避を初めて見せた直後に
+    片付けないための時刻でもある）
     """
-    _offered_path(entry.path.parent, entry.session).touch()
+    with (
+        contextlib.suppress(FileExistsError),
+        _offered_path(entry.path.parent, entry.session).open("xb"),
+    ):
+        pass
 
 
 def tidy_orphans(
@@ -380,7 +399,10 @@ def tidy_orphans(
     limit = (now if now is not None else datetime.now()) - timedelta(days=days)
     tidied: list[RecoveryEntry] = []
     for entry in find_orphans_in(roots):
-        if entry.offered and entry.saved_at <= limit:
+        # 退避した時刻と初めて勧めた時刻の遅い方から数える 退避した時刻だけで数えると、
+        # 長く起動しなかった人が初めて見た古い退避に〔あとで決める〕を選んでも、
+        # その直後の片付けで消える（「次の起動でまた出る」が守られない）
+        if entry.offered_at is not None and max(entry.saved_at, entry.offered_at) <= limit:
             try:
                 discard(entry)
             except OSError:
@@ -654,7 +676,11 @@ def state_usage(root: Path | None = None) -> int:
 
 
 def plan_trim(
-    limit: int, root: Path | None = None, *, already: Iterable[Path] = ()
+    limit: int,
+    root: Path | None = None,
+    *,
+    already: Iterable[Path] = (),
+    spare: Iterable[Path] = (),
 ) -> list[TrimItem]:
     """容量を ``limit`` バイトに収めるために片付ける物 古い順 収まっていれば空 消しはしない
 
@@ -689,8 +715,11 @@ def plan_trim(
         candidates.extend(
             TrimItem(label, (path,), _size(path), _backup_stamp(path)) for path in remaining[:-1]
         )
+    # この起動で初めて勧めた退避（``spare`` 中身の場所）は外す 〔あとで決める〕を選んだ
+    # 直後に容量で消すと、「次の起動でまた出る」が守られない
+    spared = {_root_key(path) for path in spare}
     for entry in find_orphans(base):
-        if not entry.offered:
+        if not entry.offered or _root_key(entry.path) in spared:
             continue
         files = tuple(path for path in _session_files(entry) if path.is_file())
         candidates.append(
@@ -716,14 +745,17 @@ def trim_state(
     *,
     allowed: Iterable[Path] | None = None,
     failed: list[TrimItem] | None = None,
+    spare: Iterable[Path] = (),
 ) -> list[TrimItem]:
     """容量を ``limit`` バイトに収めるよう古い物から片付ける 片付けた物を返す
+
+    ``spare`` はこの起動で初めて勧めた退避の場所（:func:`plan_trim`）
 
     何を消すかの決まりは :func:`plan_trim` ``allowed`` を渡すと、その中にある物だけを消す
     本人に見せて確かめた一覧を渡す 確かめた後に置き場の中身が変わっても（退避を移した、
     など）、確かめに出していない物は消さない 消せなかった物は飛ばして ``failed`` へ足す
     """
-    items = plan_trim(limit, root)
+    items = plan_trim(limit, root, spare=spare)
     if allowed is not None:
         approved = {_root_key(path) for path in allowed}
         items = [item for item in items if all(_root_key(path) in approved for path in item.paths)]

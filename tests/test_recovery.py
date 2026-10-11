@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from datetime import datetime, timedelta, tzinfo
@@ -243,16 +244,20 @@ class TestChosenFolders:
         assert len(find_orphans_in([tmp_path, tmp_path / "."])) == 1
 
     def test_a_writable_folder_has_no_problem(self, tmp_path: Path) -> None:
+        # 書ける置き場を書けないと言うと、選びたい置き場を選べない
+        # 確かめに書いた物を残すと置き場が散らかる
         assert folder_problem(tmp_path / "新しい") is None
         # 確かめに書いた物を残さない
         assert list((tmp_path / "新しい").iterdir()) == []
 
     def test_an_unwritable_folder_says_why(self, tmp_path: Path) -> None:
+        # 書けない置き場を通すと、OK の後で退避が黙って既定の置き場へ戻り続ける
         blocker = tmp_path / "ファイル"
         blocker.write_text("x", "utf-8")
         assert folder_problem(blocker / "置き場") is not None
 
     def test_the_backups_over_a_smaller_count_are_counted(self, tmp_path: Path) -> None:
+        # 数え違えると、確かめの窓で見せた数より多くの控えが消える
         state = tmp_path / "state"
         for name, count in (("一.sme", 5), ("二.sme", 2)):
             target = tmp_path / name
@@ -265,6 +270,7 @@ class TestChosenFolders:
         assert len(list(backup_folder(tmp_path / "一.sme", state).iterdir())) == 5
 
     def test_no_backups_yet_counts_nothing(self, tmp_path: Path) -> None:
+        # 控えの無い置き場で数え損ねて止まると、設定画面の OK が押せない
         assert backups_over(1, tmp_path / "無い") == 0
 
     def test_close_lets_go_of_the_lock_even_when_clearing_fails(
@@ -298,10 +304,35 @@ class TestTidyingOldOrphans:
     later = datetime.now() + timedelta(days=10)
 
     def test_marking_is_remembered(self, tmp_path: Path) -> None:
+        # 印を覚えていないと、勧めた退避も日数で片付かず置き場に溜まり続ける
         _offered_orphan(tmp_path, "見せた")
         assert [entry.offered for entry in find_orphans(tmp_path)] == [True]
 
+    def test_marking_again_keeps_the_first_time(self, tmp_path: Path) -> None:
+        # 勧めるたびに印の時刻を付け直すと、日数をいつまでも数え直して片付かない
+        entry = _offered_orphan(tmp_path, "見せた")
+        mark = tmp_path / "recovery" / f"{entry.session}.offered"
+        old = (datetime.now() - timedelta(days=9)).timestamp()
+        os.utime(mark, (old, old))
+        mark_offered(entry)
+        assert mark.stat().st_mtime == pytest.approx(old)
+        (found,) = find_orphans(tmp_path)
+        assert found.offered_at is not None
+        assert found.offered_at.timestamp() == pytest.approx(old)
+
+    def test_an_old_orphan_offered_just_now_waits(self, tmp_path: Path) -> None:
+        # 30 日前に落ちて今日初めて見せた退避を、退避した時刻だけで数えてすぐに片付けると、
+        # 〔あとで決める〕を選んでも次の起動で出ない
+        entry = _offered_orphan(tmp_path, "久しぶり")
+        meta = tmp_path / "recovery" / f"{entry.session}.json"
+        data = json.loads(meta.read_text("utf-8"))
+        data["saved_at"] = (datetime.now() - timedelta(days=30)).isoformat()
+        meta.write_text(json.dumps(data), "utf-8")
+        assert tidy_orphans([tmp_path], 7) == []
+        assert entry.path.is_file()
+
     def test_an_old_offered_orphan_is_tidied(self, tmp_path: Path) -> None:
+        # 片付かないと、日数を入れても古い退避が置き場に溜まり続ける
         _offered_orphan(tmp_path, "見せた")
         tidied = tidy_orphans([tmp_path], 7, now=self.later)
         assert [entry.name for entry in tidied] == ["見せた"]
@@ -324,11 +355,13 @@ class TestTidyingOldOrphans:
         assert [entry.name for entry in find_orphans(tmp_path)] == ["見せていない"]
 
     def test_a_recent_offered_orphan_is_kept(self, tmp_path: Path) -> None:
+        # 日数に届かない退避を消すと、本人が後で戻すつもりだった作業を失う
         _offered_orphan(tmp_path, "見せた")
         assert tidy_orphans([tmp_path], 30, now=self.later) == []
         assert len(find_orphans(tmp_path)) == 1
 
     def test_a_live_session_is_kept(self, tmp_path: Path) -> None:
+        # 動いている窓の退避を消すと、その窓が落ちたときに何も残らない
         session = RecoverySession(tmp_path)
         session.save(Project.create(name="作業中"), None)
         try:
@@ -352,11 +385,13 @@ class TestTheSizeLimit:
         return made
 
     def test_under_the_limit_nothing_goes(self, tmp_path: Path) -> None:
+        # 上限に収まっているのに消すと、要らないのに控えを失う
         state = tmp_path / "state"
         self._backups(state, "本編.sme", 3)
         assert plan_trim(10_000, state) == []
 
     def test_the_oldest_goes_first(self, tmp_path: Path) -> None:
+        # 新しい方から消すと、いちばん戻したい直前の控えから無くなる
         state = tmp_path / "state"
         made = self._backups(state, "本編.sme", 4)
         # 時刻はファイルの更新時刻ではなく名前で見る 控えは元の更新時刻を写すので、
@@ -395,7 +430,15 @@ class TestTheSizeLimit:
         finally:
             live.close()
 
+    def test_a_first_offer_this_run_is_spared(self, tmp_path: Path) -> None:
+        # この起動で初めて見せた落ちた作業を容量で消すと、〔あとで決める〕が守られない
+        state = tmp_path / "state"
+        offered = _offered_orphan(state, "見せたばかり")
+        assert trim_state(1, state, spare=[offered.path]) == []
+        assert offered.path.is_file()
+
     def test_the_items_say_what_they_are(self, tmp_path: Path) -> None:
+        # 名前と大きさが違うと、確かめの窓で本人が何が消えるのか分からない
         state = tmp_path / "state"
         self._backups(state, "本編.sme", 2)
         (item,) = plan_trim(1, state)
@@ -413,6 +456,7 @@ class TestTheSizeLimit:
         assert made[1].is_file() and made[2].is_file()
 
     def test_nothing_confirmed_means_nothing_goes(self, tmp_path: Path) -> None:
+        # 確かめていない物を消すと、窓で見せていない控えを失う
         state = tmp_path / "state"
         made = self._backups(state, "本編.sme", 4)
         assert trim_state(1, state, allowed=[]) == []
@@ -423,6 +467,7 @@ class TestRememberedFolders:
     """退避を書いた置き場を覚える（置き場を変えた後に落ちた作業を見失わない）"""
 
     def test_they_come_back_newest_first(self, tmp_path: Path) -> None:
+        # 覚えた置き場を読み違えると、置き場を変えた後に落ちた作業を復元に出せない
         registry = tmp_path / "既定"
         remember_root(tmp_path / "A", registry)
         remember_root(tmp_path / "B", registry)
@@ -430,6 +475,7 @@ class TestRememberedFolders:
         assert remembered_roots(registry) == [tmp_path / "A", tmp_path / "B"]
 
     def test_nothing_remembered_is_empty(self, tmp_path: Path) -> None:
+        # 覚えが無いときに止まると、起動して復元を尋ねる所で落ちる
         assert remembered_roots(tmp_path) == []
 
     def test_a_broken_file_is_empty(self, tmp_path: Path) -> None:
@@ -438,6 +484,7 @@ class TestRememberedFolders:
         assert remembered_roots(tmp_path) == []
 
     def test_a_folder_with_work_left_is_not_forgotten(self, tmp_path: Path) -> None:
+        # 退避の残る置き場を忘れると、その落ちた作業を二度と復元に出せない
         registry = tmp_path / "既定"
         crashed = RecoverySession(tmp_path / "A")
         crashed.save(Project.create(name="落ちた"), None)
@@ -465,6 +512,7 @@ class TestPruningGenerations:
         return made
 
     def test_a_save_drops_at_most_what_it_is_told(self, tmp_path: Path) -> None:
+        # 保存のたびに超えた分をまとめて消すと、確かめていない控えを黙って失う
         state = tmp_path / "state"
         made = self._made(state, 6)
         target = tmp_path / "本編.sme"
@@ -473,6 +521,7 @@ class TestPruningGenerations:
         assert all(path.is_file() for path in made[1:])
 
     def test_the_plan_matches_the_count(self, tmp_path: Path) -> None:
+        # 見せた一覧と数が違うと、窓で見せたより多くの控えが消える
         state = tmp_path / "state"
         made = self._made(state, 6)
         plan = plan_prune(2, state)
@@ -481,6 +530,7 @@ class TestPruningGenerations:
         assert all(path.is_file() for path in made)
 
     def test_discarding_the_plan_removes_exactly_it(self, tmp_path: Path) -> None:
+        # 一覧の外まで消したり同じ物を 2 度数えたりすると、知らせた数と消えた数が合わない
         state = tmp_path / "state"
         made = self._made(state, 6)
         plan = plan_prune(2, state)
@@ -531,6 +581,7 @@ class TestAFailureMidwayDoesNotHideWhatWent:
     def test_trimming_goes_on_past_a_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で止まると、それまでに消した物が知らされず、本人は消えたことを知らない
         state = tmp_path / "state"
         made = self._made(state, 5)
         _refuse(monkeypatch, made[1])
@@ -543,6 +594,7 @@ class TestAFailureMidwayDoesNotHideWhatWent:
     def test_discarding_goes_on_past_a_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で止まると、確かめた残りが消えずに上限を超えたままになり、消えた物も知らされない
         state = tmp_path / "state"
         made = self._made(state, 4)
         _refuse(monkeypatch, made[0])
@@ -554,6 +606,7 @@ class TestAFailureMidwayDoesNotHideWhatWent:
     def test_tidying_goes_on_past_a_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で止まると、片付けた退避の数が知らされない
         entries = [_offered_orphan(tmp_path, name) for name in ("一", "二", "三")]
         _refuse(monkeypatch, entries[1].path)
         left: list[RecoveryEntry] = []
@@ -586,6 +639,7 @@ class TestAFailureMidwayDoesNotHideWhatWent:
     def test_a_rotation_that_cannot_remove_still_reports_the_copy(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 作れた控えを作れなかったことにすると、本人はバックアップが無いと思い込む
         state = tmp_path / "state"
         made = self._made(state, 2)
         _refuse(monkeypatch, made[0])
@@ -638,6 +692,7 @@ class TestABrokenCopyLeavesNothingHalfWritten:
     def test_older_copies_are_left_alone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 失敗の片付けで前からある控えまで消すと、戻せる物が無くなる
         target = tmp_path / "本編.sme"
         target.write_text("前の中身", "utf-8")
         state = tmp_path / "state"
@@ -652,6 +707,7 @@ class TestABrokenCopyLeavesNothingHalfWritten:
 
 class TestTheLatestBackupFolder:
     def test_the_newer_one_wins(self, tmp_path: Path) -> None:
+        # 古い方の置き場を開くと、本人は最新の控えへたどり着けない
         target = tmp_path / "本編.sme"
         target.write_text("中身", "utf-8")
         first, second = tmp_path / "一", tmp_path / "二"
@@ -673,6 +729,7 @@ class TestTheLatestBackupFolder:
         assert latest_backup_folder(target, [chosen, default]) == backup_folder(target, default)
 
     def test_nothing_usable_is_none(self, tmp_path: Path) -> None:
+        # 控えが無いのに空のフォルダを開くと、本人は控えがあると勘違いする
         assert latest_backup_folder(tmp_path / "本編.sme", [tmp_path]) is None
 
     def _freeze(self, monkeypatch: pytest.MonkeyPatch) -> None:

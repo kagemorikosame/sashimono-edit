@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -84,6 +85,14 @@ def _crash_in(root: Path, name: str, days_ago: int = 0) -> Path:
     return crashed.path
 
 
+def _offered_days_ago(path: Path, days: int) -> None:
+    """その退避を ``days`` 日前に初めて勧めたことにする（勧めた印の時刻を戻す）"""
+    mark = path.with_suffix(".offered")
+    mark.touch()
+    stamp = (datetime.now() - timedelta(days=days)).timestamp()
+    os.utime(mark, (stamp, stamp))
+
+
 def _decline(monkeypatch: pytest.MonkeyPatch) -> None:
     """復元の窓で何も選ばずに閉じたことにする"""
     monkeypatch.setattr(RecoveryDialog, "exec", lambda _dialog: QDialog.DialogCode.Rejected)
@@ -108,6 +117,7 @@ class TestTheSettings:
         assert plain.state_limit_mb == 0
 
     def test_they_come_back(self, tmp_path: Path) -> None:
+        # 保存した日数と上限が戻らないと、再起動のたびに片付けの設定が消える
         store = PreferenceStore(tmp_path / "preferences.json")
         chosen = Preferences(recovery_keep_days=30, state_limit_mb=500)
         store.save(chosen)
@@ -131,6 +141,7 @@ class TestTheSettings:
         assert getattr(PreferenceStore(path).load(), key) == 0
 
     def test_the_dialog_shows_them(self, qt_application: QApplication) -> None:
+        # 画面が今の値を映さないと、OK を押しただけで片付けの設定が黙って変わる
         del qt_application
         dialog = PreferencesDialog(Preferences(recovery_keep_days=14, state_limit_mb=300))
         result = dialog.preferences()
@@ -141,11 +152,14 @@ class TestTidyingAtStart:
     def test_an_old_orphan_goes_only_after_it_was_offered(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 前の起動で勧めてから日数を過ぎた退避は、もう 1 度勧めた後に片付ける
+        # 片付かないと、設定を入れても古い退避が置き場に溜まり続ける
         del qt_application
         old = _crash_in(default_state_root(), "古い", days_ago=10)
+        _offered_days_ago(old, 10)
         created = _window(Preferences(recovery_keep_days=7))
         try:
-            # 起動しただけでは片付けない まだ一度も勧めていない
+            # 起動しただけでは片付けない 尋ねる前に消すと、本人は最後にもう 1 度見られない
             assert old.is_file()
             _decline(monkeypatch)
             created.offer_recovery()
@@ -154,9 +168,70 @@ class TestTidyingAtStart:
         finally:
             created.close()
 
+    def test_an_old_orphan_seen_for_the_first_time_waits(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 30 日起動しなかった人が初めて見た 30 日前の退避に〔あとで決める〕を選んだ
+        # 退避した時刻だけで数えると直後の片付けで消え、「次の起動でまた出る」が守られない
+        del qt_application
+        old = _crash_in(default_state_root(), "久しぶり", days_ago=30)
+        _decline(monkeypatch)
+        preferences = Preferences(recovery_keep_days=7)
+        first = _window(preferences)
+        try:
+            first.offer_recovery()
+            assert old.is_file()
+        finally:
+            first.close()
+        shown: list[str] = []
+
+        def look(dialog: RecoveryDialog) -> int:
+            shown.extend(entry.name for entry in dialog._entries)
+            return QDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(RecoveryDialog, "exec", look)
+        second = _window()
+        try:
+            # 次の起動でまた出る 勧めてからまだ 7 日たっていないので消えない
+            second.offer_recovery()
+            assert shown == ["久しぶり"]
+            assert old.is_file()
+        finally:
+            second.close()
+        # 初めて勧めてから 8 日たった もう 1 度勧めた後で、初めて片付く
+        _offered_days_ago(old, 8)
+        third = _window()
+        try:
+            third.offer_recovery()
+            assert shown == ["久しぶり", "久しぶり"]
+            assert not old.exists()
+        finally:
+            third.close()
+
+    def test_a_first_offer_is_spared_from_the_size_limit(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 初めて見せた落ちた作業を、同じ起動の容量の片付けで消さない（後の保存のときも）
+        del qt_application
+        old = _crash_in(default_state_root(), "見せたばかり", days_ago=30)
+        old.write_bytes(old.read_bytes() + b" " * 2_000_000)
+        _decline(monkeypatch)
+        created = _window(Preferences(state_limit_mb=1))
+        try:
+            created.offer_recovery()
+            assert old.is_file()
+            created._path = tmp_path / "本編.sme"
+            created._path.write_text("前の中身", encoding="utf-8")
+            created.execute(RenameProject("作業中"))
+            assert created.save_project()
+            assert old.is_file()
+        finally:
+            created.close()
+
     def test_a_recent_orphan_stays(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 日数に届かない退避を消すと、本人が後で戻すつもりだった作業を失う
         del qt_application
         recent = _crash_in(default_state_root(), "新しい", days_ago=2)
         _decline(monkeypatch)
@@ -170,6 +245,7 @@ class TestTidyingAtStart:
     def test_turned_off_keeps_everything(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 切っているのに片付けると、既定の動き（片付けない）が守られない
         del qt_application
         old = _crash_in(default_state_root(), "古い", days_ago=300)
         _decline(monkeypatch)
@@ -211,6 +287,7 @@ class TestTheSizeLimit:
     def test_saving_over_the_limit_trims_the_oldest_and_says_so(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 保存の後に片付けないか知らせないと、上限を超えたまま、または消えたことを知らないままになる
         del qt_application
         target = tmp_path / "本編.sme"
         made = _fill(target, 4)
@@ -231,6 +308,7 @@ class TestTheSizeLimit:
     def test_setting_the_limit_trims_now_but_keeps_what_matters(
         self, window: MainWindow, tmp_path: Path
     ) -> None:
+        # 上限を入れても今ある分を片付けないか、大事な物まで消すと、どちらも本人の期待と違う
         made = _fill(tmp_path / "本編.sme", 5)
         unseen = _crash_in(default_state_root(), "見せていない")
         window.execute(RenameProject("作業中"))
@@ -245,6 +323,7 @@ class TestTheSizeLimit:
         assert "確かめた物を片付けた" in window.statusBar().currentMessage()
 
     def test_no_limit_trims_nothing(self, window: MainWindow, tmp_path: Path) -> None:
+        # 上限なしで消すと、既定の動き（消さない）が守られない
         made = _fill(tmp_path / "本編.sme", 5)
         # 上限と関係の無い設定だけを変える テーマのようにアプリ全体に掛かる物を変えると、
         # 同じワーカーで後に走る別の試験（目盛りの色など）まで変わる
@@ -254,6 +333,7 @@ class TestTheSizeLimit:
     def test_setting_it_asks_with_what_will_go(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 尋ねずに上限を入れると、本人は何が消えたか知らない
         made = _fill(tmp_path / "本編.sme", 5)
         asked: list[str] = []
 
@@ -268,6 +348,7 @@ class TestTheSizeLimit:
         assert all(path.is_file() for path in made)
 
     def test_nothing_to_lose_means_no_question(self, tmp_path: Path) -> None:
+        # 消える物が無いのに尋ねると、本人は何かが消えると思って上限を入れるのをやめる
         _fill(tmp_path / "本編.sme", 2)
         assert confirm_backup_changes(None, Preferences(), Preferences(state_limit_mb=100))
 
@@ -293,6 +374,7 @@ class TestTheSizeLimit:
     def test_nothing_confirmed_means_nothing_goes_when_applied(
         self, window: MainWindow, tmp_path: Path
     ) -> None:
+        # 確かめていないのに当てる時に消すと、窓で見せていない控えを失う
         made = _fill(tmp_path / "本編.sme", 5)
         window._apply_preferences(Preferences(state_limit_mb=1))
         assert all(path.is_file() for path in made)

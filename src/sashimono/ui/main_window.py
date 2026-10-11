@@ -344,6 +344,9 @@ class MainWindow(QMainWindow):
         #: 選んだ置き場へ書けずに戻したことの知らせ 起動の途中で出すと、窓を組み立てる
         #: 間の知らせ（「素材を読み込んでください」）に上書きされるので、組み立て終えてから出し直す
         self._state_fallback_message = ""
+        #: この起動で初めて復元を勧めた落ちた作業（中身の場所） 容量の片付けから外す
+        #: 〔あとで決める〕を選んだ直後に消すと、「次の起動でまた出る」が守られない
+        self._first_offered: set[Path] = set()
         self._recovery = self._open_recovery(state_root_for(self._preferences))
         #: 開いているプロジェクトの錠 同じファイルを別の窓で開いたことに気付くため
         self._project_lock: HeldLock | None = None
@@ -2470,6 +2473,8 @@ class MainWindow(QMainWindow):
             # 一覧に出した物は勧めた 印を付けられなくても（置き場が書けない）片付けの側が
             # 消さないだけで困らない
             for shown in entries:
+                if not shown.offered:
+                    self._first_offered.add(shown.path)
                 with contextlib.suppress(OSError):
                     mark_offered(shown)
             if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
@@ -2525,7 +2530,11 @@ class MainWindow(QMainWindow):
             # 1 件消せなくても trim_state は続けて、消せた物を返す ここで包むのは、
             # 置き場そのものを読めない（消す前に止まり、何も消していない）ときだけ
             with contextlib.suppress(OSError):
-                items.extend(trim_state(limit_mb * 1024 * 1024, root, failed=failed))
+                items.extend(
+                    trim_state(
+                        limit_mb * 1024 * 1024, root, failed=failed, spare=self._first_offered
+                    )
+                )
         return _removal_note(f"容量の上限 {limit_mb}MB を超えたので片付けた", items, failed)
 
     def restore_recovery(self, entry: RecoveryEntry) -> bool:

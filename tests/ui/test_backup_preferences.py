@@ -121,6 +121,7 @@ class TestTheDefaults:
 
 class TestSaving:
     def test_it_comes_back(self, tmp_path: Path) -> None:
+        # 保存した設定が戻らないと、再起動のたびに退避とバックアップの設定が既定に戻る
         store = PreferenceStore(tmp_path / "preferences.json")
         chosen = Preferences(
             autosave=False,
@@ -161,6 +162,7 @@ class TestSaving:
 
 class TestTheDialog:
     def test_it_shows_what_is_set(self, qt_application: QApplication, tmp_path: Path) -> None:
+        # 画面が今の設定を映さないと、OK を押しただけで設定が黙って変わる
         del qt_application
         chosen = Preferences(
             autosave=False,
@@ -192,6 +194,7 @@ class TestTheDialog:
     def test_a_refused_folder_keeps_the_dialog_open(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 書けない置き場で窓を閉じると、OK の後で退避が黙って既定の置き場へ戻り続ける
         del qt_application
         warned: list[str] = []
         monkeypatch.setattr(QMessageBox, "warning", lambda _p, _t, text, *_a: warned.append(text))
@@ -204,9 +207,11 @@ class TestTheDialog:
 
 class TestTheFolderChecks:
     def test_a_writable_folder_is_fine(self, tmp_path: Path) -> None:
+        # 書ける置き場を断ると、本人が選びたい置き場を選べない
         assert folder_refusal(tmp_path / "退避", install=tmp_path / "exe") is None
 
     def test_an_unwritable_folder_is_refused(self, tmp_path: Path) -> None:
+        # 書けない置き場を通すと、退避が黙って止まるか既定へ戻り続ける
         assert folder_refusal(_unwritable(tmp_path), install=None) is not None
 
     def test_the_install_folder_is_refused(self, tmp_path: Path) -> None:
@@ -223,6 +228,7 @@ class TestTheFolderChecks:
         assert folder_caution(tmp_path / "local") is None
 
     def test_a_network_place_is_questioned(self) -> None:
+        # ネットワークの置き場を黙って使うと、回線が切れたときに退避が 2 か所に散る
         assert folder_caution(Path("\\\\server\\share\\退避")) is not None
 
 
@@ -258,6 +264,7 @@ class TestReducingTheGenerations:
     def test_nothing_to_lose_means_no_question(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 消える物が無いのに尋ねると、本人は何かが消えると思って設定をやめる
         root = tmp_path / "退避"
         self._make_backups(root, 2)
         monkeypatch.setattr(QMessageBox, "question", lambda *_a: pytest.fail("尋ねた"))
@@ -267,16 +274,19 @@ class TestReducingTheGenerations:
         )
 
     def test_raising_it_asks_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 増やすだけで尋ねると、本人は控えが消えると思って増やすのをやめる
         monkeypatch.setattr(QMessageBox, "question", lambda *_a: pytest.fail("尋ねた"))
         assert confirm_backup_changes(None, Preferences(), Preferences(backup_generations=50))
 
 
 class TestTheTimer:
     def test_the_default_is_every_thirty_seconds(self, window: MainWindow) -> None:
+        # 既定が変わると、設定を開いたことのない人の退避の間隔が黙って変わる
         assert window._autosave_timer.isActive()
         assert window._autosave_timer.interval() == 30_000
 
     def test_a_new_interval_works_without_a_restart(self, window: MainWindow) -> None:
+        # 間隔がその場で効かないと、短くしても再起動するまで長いまま作業を失いうる
         window._apply_preferences(Preferences(autosave_seconds=10))
         assert window._autosave_timer.interval() == 10_000
         assert window._autosave_timer.isActive()
@@ -289,6 +299,7 @@ class TestTheTimer:
         assert window._autosave_timer.isActive()
 
     def test_it_starts_off_when_set_off(self, qt_application: QApplication) -> None:
+        # 切った設定で起動しても退避が動くと、切った意味が無い
         del qt_application
         created = _window(Preferences(autosave=False))
         try:
@@ -301,6 +312,7 @@ class TestTheBackups:
     def test_they_go_to_the_chosen_folder_with_the_chosen_count(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 選んだ置き場と世代数が効かないと、控えが思っていない所に思っていない数だけ溜まる
         del qt_application
         root = tmp_path / "退避"
         created = _window(Preferences(state_folder=str(root), backup_generations=2))
@@ -318,6 +330,7 @@ class TestTheBackups:
     def test_turning_them_off_makes_none(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 切ってもバックアップを作ると、切った意味が無く置き場を使い続ける
         del qt_application
         created = _window(Preferences(backup=False))
         try:
@@ -378,6 +391,7 @@ class TestTheRecoveryFolder:
     def test_it_goes_to_the_chosen_folder(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 選んだ置き場に退避が行かないと、置き場を変えた意味が無い
         del qt_application
         root = tmp_path / "退避"
         created = _window(Preferences(state_folder=str(root)))

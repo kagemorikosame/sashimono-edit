@@ -134,6 +134,7 @@ class TestConfirmingGenerations:
     def test_turning_backups_back_on_asks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 入れ直したときに確かめないと、次の保存で超えていた控えを黙ってまとめて失う
         _fill(tmp_path / "本編.sme", 6)
         asked = _answer(monkeypatch, yes=False)
         before = Preferences(backup=False, backup_generations=2)
@@ -197,6 +198,7 @@ class TestRecoveryIsWrittenBeforeTheOldGoes:
     def test_the_new_recovery_exists_before_the_old_is_closed(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 既定へ書く前に古い退避を消すと、その間に落ちたときに何も残らない
         del qt_application
         chosen = tmp_path / "選んだ置き場"
         created = _window(Preferences(state_folder=str(chosen)))
@@ -329,6 +331,7 @@ class TestAFailureMidwayIsStillTold:
     def test_trimming_after_a_save(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で 1 件消せないだけで知らせが出ないと、本人は消えた控えを知らない
         del qt_application
         target = tmp_path / "本編.sme"
         made = _fill(target, 4)
@@ -347,6 +350,7 @@ class TestAFailureMidwayIsStillTold:
     def test_applying_what_was_confirmed(
         self, window_with_backups: tuple[MainWindow, list[Path]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で 1 件消せないだけで知らせが出ないと、本人は確かめた控えがどれだけ消えたか知らない
         created, made = window_with_backups
         asked = _answer(monkeypatch, yes=True)
         approved: list[TrimItem] = []
@@ -362,8 +366,15 @@ class TestAFailureMidwayIsStillTold:
     def test_tidying_at_start(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 途中で 1 件消せないだけで知らせが出ないと、本人は片付いた退避を知らない
         del qt_application
         paths = [_crash_in(default_state_root(), name, 10) for name in ("一", "二", "三")]
+        # 前の起動で勧めてから日数を過ぎたことにする（初めて見せた起動では片付けない）
+        stamp = (datetime.now() - timedelta(days=10)).timestamp()
+        for path in paths:
+            mark = path.with_suffix(".offered")
+            mark.touch()
+            os.utime(mark, (stamp, stamp))
         monkeypatch.setattr(RecoveryDialog, "exec", lambda _dialog: 0)
         created = _window(Preferences(recovery_keep_days=7))
         try:
