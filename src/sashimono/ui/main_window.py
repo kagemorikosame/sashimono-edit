@@ -1057,7 +1057,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self._state_fallback_message, 15000)
 
     def _move_recovery(self, root: Path) -> None:
-        """退避を新しい置き場へ移る 前の置き場の退避は、新しい方へ書けてから消す
+        """この起動の退避を新しい置き場へ移る 前の置き場にあったこの起動の退避は、
+        新しい方へ書けてから消す 前の置き場に前からある退避と控えには触らない
 
         先に消すと、新しい置き場へ書く前に落ちたときに何も残らない
         """
