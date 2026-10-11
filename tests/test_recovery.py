@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from sashimono.core.io import (
     find_orphans_in,
     folder_problem,
     forget_empty_roots,
+    latest_backup_folder,
     load_project,
     mark_offered,
     plan_prune,
@@ -604,3 +606,67 @@ class TestAFailureMidwayDoesNotHideWhatWent:
         assert find_orphans(tmp_path) == []
         assert meta.is_file()
         assert not mark.exists()
+
+
+def _break_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """控えを写す途中で書けなくなったことにする 途中まで書いてから上げる"""
+
+    def partial(source: Path, destination: Path, **_kwargs: object) -> Path:
+        Path(destination).write_bytes(b"half")
+        raise OSError("書いている途中でドライブを抜いた")
+
+    monkeypatch.setattr(shutil, "copyfile", partial)
+
+
+class TestABrokenCopyLeavesNothingHalfWritten:
+    """控えを写す途中で失敗したら、今作った途中の物だけを片付けて上げる"""
+
+    def test_a_new_folder_is_removed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 空のフォルダや途中の控えが残ると、〔バックアップのフォルダを開く〕がそちらを開く
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        state = tmp_path / "state"
+        _break_copy(monkeypatch)
+        with pytest.raises(OSError):
+            backup_before_save(target, state)
+        assert not backup_folder(target, state).exists()
+
+    def test_older_copies_are_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "本編.sme"
+        target.write_text("前の中身", "utf-8")
+        state = tmp_path / "state"
+        older = backup_before_save(target, state)
+        assert older is not None
+        _break_copy(monkeypatch)
+        with pytest.raises(OSError):
+            backup_before_save(target, state)
+        assert list(backup_folder(target, state).iterdir()) == [older]
+        assert older.read_text("utf-8") == "前の中身"
+
+
+class TestTheLatestBackupFolder:
+    def test_the_newer_one_wins(self, tmp_path: Path) -> None:
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        first, second = tmp_path / "一", tmp_path / "二"
+        backup_before_save(target, first)
+        backup_before_save(target, second)
+        assert latest_backup_folder(target, [first, second]) == backup_folder(target, second)
+        backup_before_save(target, first)
+        assert latest_backup_folder(target, [first, second]) == backup_folder(target, first)
+
+    def test_an_empty_folder_or_an_empty_copy_does_not_count(self, tmp_path: Path) -> None:
+        # フォルダがあるだけで選ぶと、正しい控えのある方へたどり着けない
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        chosen, default = tmp_path / "選んだ", tmp_path / "既定"
+        backup_before_save(target, default)
+        hollow = backup_folder(target, chosen)
+        hollow.mkdir(parents=True)
+        (hollow / "29991231-235959-999999-000.sme").write_bytes(b"")
+        assert latest_backup_folder(target, [chosen, default]) == backup_folder(target, default)
+
+    def test_nothing_usable_is_none(self, tmp_path: Path) -> None:
+        assert latest_backup_folder(tmp_path / "本編.sme", [tmp_path]) is None

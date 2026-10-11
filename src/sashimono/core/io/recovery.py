@@ -47,6 +47,7 @@ __all__ = [
     "find_orphans_in",
     "folder_problem",
     "forget_empty_roots",
+    "latest_backup_folder",
     "mark_offered",
     "plan_prune",
     "plan_trim",
@@ -465,6 +466,7 @@ def backup_before_save(
     if not target.is_file():
         return None
     folder = backup_folder(target, root)
+    existed = folder.is_dir()
     folder.mkdir(parents=True, exist_ok=True)
     # 時刻が同じなら連番を足す Windows の Python 3.12 は時刻の刻みが約 15ms と粗く、
     # 続けて保存すると同じ名前になって前の控えを上書きしていた（CI で 3.12 だけ落ちた）
@@ -473,15 +475,30 @@ def backup_before_save(
     # 同じプロジェクトを 2 つの窓で開いて同時に保存したとき、同じ名前を選んで上書きしうる
     stamp = f"{datetime.now():%Y%m%d-%H%M%S-%f}"
     number = 0
-    while True:
-        copied = folder / f"{stamp}-{number:03d}{SUFFIX}"
-        try:
-            with copied.open("xb"):
-                break
-        except FileExistsError:
-            number += 1
-    shutil.copyfile(target, copied)
-    shutil.copystat(target, copied)
+    copied: Path | None = None
+    try:
+        while True:
+            candidate = folder / f"{stamp}-{number:03d}{SUFFIX}"
+            try:
+                with candidate.open("xb"):
+                    copied = candidate
+                    break
+            except FileExistsError:
+                number += 1
+        shutil.copyfile(target, candidate)
+        shutil.copystat(target, candidate)
+    except OSError:
+        # 途中まで写した控えと、今作った空のフォルダを片付けてから上げる 残すと、
+        # 〔バックアップのフォルダを開く〕が不完全な控えのある方を開き、呼ぶ側が既定の
+        # 置き場へ控え直した正しい物へたどり着けない 消すのは今この場で作った物だけ
+        # （前からある控えとフォルダには触らない）
+        if copied is not None:
+            with contextlib.suppress(OSError):
+                copied.unlink(missing_ok=True)
+        if not existed:
+            with contextlib.suppress(OSError):
+                folder.rmdir()
+        raise
 
     # 旧い拡張子の控えも世代に数える 数えないと、改名前の控えはいつまでも消えずに残り、
     # 20 本に保つ約束が崩れる 名前は時刻から始まるので、拡張子が混ざっても古い順に並ぶ
@@ -498,7 +515,25 @@ def backup_before_save(
         except OSError:
             if failed is not None:
                 failed.append(old)
-    return copied
+    return candidate
+
+
+def latest_backup_folder(target: Path, roots: list[Path]) -> Path | None:
+    """そのプロジェクトの控えがある置き場のうち、いちばん新しい控えのある方のフォルダ
+
+    フォルダがあるかでは決めない 中身の無い控え（途中で書けなかった物）しか無いフォルダを
+    開くと、別の置き場にある正しい控えへたどり着けない 使える控えが無ければ ``None``
+    """
+    best: tuple[float, Path] | None = None
+    for root in roots:
+        folder = backup_folder(target, root)
+        usable = [path for path in _generations(folder) if _size(path) > 0]
+        if not usable:
+            continue
+        stamp = _backup_stamp(usable[-1])
+        if best is None or stamp > best[0]:
+            best = (stamp, folder)
+    return best[1] if best is not None else None
 
 
 def _generations(folder: Path) -> list[Path]:

@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
 
 from sashimono.core.commands import RenameProject
@@ -408,3 +411,41 @@ def window_with_backups(
     created = _window()
     yield created, made
     created.close()
+
+
+class TestABrokenCopyInTheChosenFolder:
+    def test_the_folder_menu_opens_the_good_copy(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 選んだ置き場へ写す途中で失敗し、既定の置き場へ控え直した 途中の物や空のフォルダが
+        # 選んだ置き場に残ると、そちらを開いて正しい控えへたどり着けない
+        del qt_application
+        chosen = tmp_path / "選んだ置き場"
+        plain_copy = shutil.copyfile
+
+        def copy(source: Path, destination: Path, **kwargs: bool) -> Path:
+            if Path(destination).is_relative_to(chosen):
+                Path(destination).write_bytes(b"half")
+                raise OSError("書いている途中でドライブを抜いた")
+            return Path(plain_copy(source, destination, **kwargs))
+
+        monkeypatch.setattr(shutil, "copyfile", copy)
+        opened: list[QUrl] = []
+
+        def fake_open(url: QUrl) -> bool:
+            opened.append(url)
+            return True
+
+        monkeypatch.setattr(QDesktopServices, "openUrl", fake_open)
+        target = tmp_path / "本編.sme"
+        target.write_text("前の中身", encoding="utf-8")
+        created = _window(Preferences(state_folder=str(chosen)))
+        try:
+            created._path = target
+            created.execute(RenameProject("作業中"))
+            assert created.save_project()
+            assert not backup_folder(target, chosen).exists()
+            created.open_backup_folder()
+            assert opened == [QUrl.fromLocalFile(str(backup_folder(target)))]
+        finally:
+            created.close()

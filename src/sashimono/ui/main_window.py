@@ -80,13 +80,13 @@ from sashimono.core.io import (
     RecoveryEntry,
     RecoverySession,
     backup_before_save,
-    backup_folder,
     default_state_root,
     discard,
     discard_items,
     find_orphans_in,
     forget_empty_roots,
     hold_new,
+    latest_backup_folder,
     load_project,
     mark_offered,
     others_holding,
@@ -2306,13 +2306,14 @@ class MainWindow(QMainWindow):
         if self._path is None:
             self.statusBar().showMessage("まだ保存していないので、バックアップはありません", 5000)
             return
-        # 設定の置き場を先に見て、無ければ既定の置き場を見る 設定の置き場へ書けなかった
-        # 保存の控えは既定の側にある 片方しか見ないと「無い」と言ってしまう
-        for root in (state_root_for(self._preferences), default_state_root()):
-            folder = backup_folder(self._path, root)
-            if folder.is_dir():
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
-                return
+        # 設定の置き場と既定の置き場のうち、使える控えのいちばん新しい方を開く 設定の置き場へ
+        # 書けなかった保存の控えは既定の側にある フォルダがあるかで決めると、空のフォルダや
+        # 古い控えしか無い方を開き、正しい控えへたどり着けない
+        roots = [state_root_for(self._preferences), default_state_root()]
+        folder = latest_backup_folder(self._path, roots)
+        if folder is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+            return
         self.statusBar().showMessage("バックアップは上書き保存したときに作られます", 5000)
 
     def edit_settings(self) -> None:
