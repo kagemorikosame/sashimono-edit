@@ -17,8 +17,7 @@ import numpy as np
 
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
 from sashimono.core.model import Effect
-from sashimono.effects.definition import registry
-from sashimono.effects.spec import TrackSpec
+from sashimono.effects.strokes import effect_reach, pixel_reach
 from sashimono.engine.gpu import Compositor, EffectProcessor, Placement, Texture
 
 __all__ = ["BAKE_CANVAS_LIMIT", "BAKE_MARGIN", "ScriptEffectBaker", "bake_margin", "fitted_margin"]
@@ -120,6 +119,95 @@ class ScriptEffectBaker:
         baked = compositor.read(straight=True)
         return _trimmed(baked, margin)
 
+    def apply_within(
+        self,
+        image: np.ndarray,
+        effects: tuple[Effect, ...],
+        *,
+        frame: int,
+        fps: float,
+        duration: int,
+        pixel_scale: float = 1.0,
+    ) -> np.ndarray:
+        """``image`` と同じ大きさのまま ``effects`` を掛けた絵 縁取りの層の絵に使う（#273）
+
+        層の絵は字の絵と同じ大きさで、広がる分は字の絵の大きさの見積もり（``source_canvas``）が
+        もう入れてある 大きさを変えて返すと、重ねる位置が層ごとにずれる
+        周りには広がる分だけ余白を足して掛け、真ん中を切り出す 余白無しで掛けると、絵の端に
+        届いたぼかしが端の色を引き伸ばして濃くなる
+
+        ``pixel_scale`` は画質を落としたプレビューの縮め方 層の絵は合成の画素で描いてあるので、
+        画素で決める設定（ぼかしの範囲など）も同じだけ縮めないとプレビューだけ 2 倍にぼける
+
+        掛けるのは縁のある所の周りだけ（広がる分を足した四角） 字の絵は画面の大きさか、流れる
+        テロップでは一辺 8000 近くになり、全体を作業場にすると字幕 1 本ごとに画面何枚ぶんも
+        GPU を通す 作業場が GPU の作れる大きさを超えるときは、掛けずにそのまま返す
+        （互換性レポートに残す）
+        """
+        height, width = image.shape[:2]
+        alpha = image[..., 3] > 0
+        rows = np.flatnonzero(alpha.any(axis=1))
+        if rows.size == 0:
+            return image
+        columns = np.flatnonzero(alpha.any(axis=0))
+        # 影の拡大と回転は中身の範囲の大きさで広がる（:func:`effect_reach`） 画素の項目だけで
+        # 切ると、大きくした影や回した影の外側が四角の端で欠ける
+        spread_x, spread_y = effect_reach(
+            effects,
+            frame,
+            (int(columns[-1]) + 1 - int(columns[0])) / 2.0,
+            (int(rows[-1]) + 1 - int(rows[0])) / 2.0,
+            pixel_scale=pixel_scale,
+        )
+        reach_x, reach_y = math.ceil(spread_x) + 2, math.ceil(spread_y) + 2
+        top, bottom = max(0, int(rows[0]) - reach_y), min(height, int(rows[-1]) + 1 + reach_y)
+        left = max(0, int(columns[0]) - reach_x)
+        right = min(width, int(columns[-1]) + 1 + reach_x)
+        piece = np.ascontiguousarray(image[top:bottom, left:right])
+        piece_h, piece_w = piece.shape[:2]
+        margin = fitted_margin(piece_w, piece_h, max(reach_x, reach_y))
+        canvas_w, canvas_h = piece_w + 2 * margin, piece_h + 2 * margin
+        if max(piece_w, piece_h) > BAKE_CANVAS_LIMIT or max(canvas_w, canvas_h) > self._gpu_limit():
+            global_report.note_missing(
+                f"縁取りの層のエフェクト（絵 {piece_w}x{piece_h} が作業場の上限を超える）"
+            )
+            return image
+        compositor, processor, texture = self._prepared(canvas_w, canvas_h)
+        if not processor.has_work(effects):
+            return image
+        texture.upload(piece)
+        placed = Placement(float(margin), float(margin), float(piece_w), float(piece_h))
+        processor.pixel_scale = pixel_scale
+        try:
+            result = processor.apply(
+                texture,
+                effects,
+                frame=frame,
+                fps=fps,
+                source_rect=placed.to_clip(canvas_w, canvas_h),
+                duration=duration,
+                # 層の絵の中身のある所を入れ物にする グラデーションや角丸が縁の広がりに合う
+                bounds=(
+                    float(margin - left + int(columns[0])),
+                    float(margin - top + int(rows[0])),
+                    float(margin - left + int(columns[-1]) + 1),
+                    float(margin - top + int(rows[-1]) + 1),
+                ),
+            )
+        finally:
+            # スクリプトの焼き込み（:meth:`apply`）は画面の画素で掛ける 戻さないと、画質を
+            # 落としたプレビューの後に走ったスクリプトの効果だけ小さく掛かる
+            processor.pixel_scale = 1.0
+        compositor.begin((0.0, 0.0, 0.0, 0.0))
+        compositor.draw_handle(
+            result.color, Placement(0.0, 0.0, float(canvas_w), float(canvas_h)), flip=False
+        )
+        baked = compositor.read(straight=True)
+        # 切り出した四角の外は層の絵でも透明 広がる分は四角に入れてあるので、外へは出ない
+        whole = np.zeros_like(image)
+        whole[top:bottom, left:right] = baked[margin : margin + piece_h, margin : margin + piece_w]
+        return whole
+
     def _gpu_limit(self) -> int:
         """テクスチャとレンダーターゲットの両方で作れる一辺の上限 GL のコンテキストの中で読む"""
         if self.gpu_limit is None:
@@ -174,27 +262,9 @@ def bake_margin(effects: tuple[Effect, ...], frame: int) -> int:
     どの効果の項目か分からない物（範囲を画素で持たない光など）のために、
     :data:`BAKE_MARGIN` より狭くはしない ここでは上限で丸めない 丸めると、足りない余白で
     掛けたことが分からなくなる 作業場に収まるかは :func:`fitted_margin` が見る
+    量の数え方は縁取りの層の絵の広がり（:func:`~sashimono.effects.strokes.pixel_reach`）と同じ
     """
-    reach = 0.0
-    for effect in effects:
-        definition = registry.get(effect.kind)
-        if definition is None or not effect.enabled:
-            continue
-        grows = set(definition.expands_object or ())
-        growth = 0.0
-        for spec in definition.parameters:
-            if not isinstance(spec, TrackSpec) or not (spec.in_pixels or spec.name in grows):
-                continue
-            amount = abs(_pixels(spec, effect, frame))
-            if not math.isfinite(amount):
-                continue
-            if spec.name in grows:
-                # 上と下は別の側へ広げる 足すと 1 つの側に要る量の倍を取る
-                growth = max(growth, amount)
-            else:
-                reach += amount
-        reach += growth
-    return max(BAKE_MARGIN, math.ceil(reach))
+    return max(BAKE_MARGIN, math.ceil(pixel_reach(effects, frame)))
 
 
 def fitted_margin(
@@ -213,14 +283,3 @@ def fitted_margin(
         f"収めるため {room} 画素にした）"
     )
     return room
-
-
-def _pixels(spec: TrackSpec, effect: Effect, frame: int) -> float:
-    """項目の値を、シェーダへ渡すのと同じ読み方で（画面の画素のまま）
-
-    読み方を :func:`~sashimono.engine.gpu.effects._number` と揃えないと、壊れた値や
-    キーフレームで余白と実際の動く量が食い違う
-    """
-    raw = effect.params.get(spec.name)
-    value = spec.default_value() if raw is None else raw
-    return float(spec.scaled_at(spec.coerce(value), frame, 1.0))
