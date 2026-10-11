@@ -42,6 +42,8 @@ from sashimono.core.model import (
     Scene,
     SceneId,
     SegmentId,
+    Stroke,
+    StrokeId,
     SubtitleOrigin,
     Timeline,
     Track,
@@ -130,7 +132,11 @@ FORMAT_NAME = "sashimono-project"
 #: 7 までの本体は項目を知らず、字幕の無い素材として開いて、保存し直すと字幕が消える
 #: 3 と同じく「更新してください」で止める 7 までのファイルの ``transcript`` は、1 本目の
 #: 音声の字幕として読む（前は素材に 1 つで、起こしたのは 1 本目の音だったため）
-FORMAT_VERSION = 8
+#: 9 でテキストの縁取りの層（生成オブジェクトの ``strokes`` #272 #273）を足した 8 までの本体は
+#: 項目を捨てて開くうえ、層へ移したテキストは前からの縁取りの太さを 0 にしてあるので、
+#: 縁が 1 本も無い字になり、保存し直すと層ごと消える 3 と同じく「更新してください」で止める
+#: 8 までのファイルは層を持たないので、何も直さずに読める（前からの項目のまま同じ絵で描く）
+FORMAT_VERSION = 9
 
 #: 映像の終わり（``end_time``）を素材の頭から数え始めた版 これより前の値は捨てる
 MEDIA_CLOCK_VERSION = 5
@@ -385,7 +391,15 @@ def _promote_placed_volume(
 
 
 def source_to_json(source: GeneratedSource) -> dict[str, Any]:
-    return {"kind": source.kind, "params": _params_to_json(source.params)}
+    """生成オブジェクトを辞書へ プリセットとエイリアスの保存でも使う
+
+    縁取りの層は持つときだけ書く 層の無いテキスト（ほとんどの作品）の書き物を前と同じにして、
+    差分を見たときに関係の無い行が増えないようにする
+    """
+    written: dict[str, Any] = {"kind": source.kind, "params": _params_to_json(source.params)}
+    if source.strokes:
+        written["strokes"] = [_stroke_to_json(stroke) for stroke in source.strokes]
+    return written
 
 
 def source_from_json(raw: object) -> GeneratedSource:
@@ -393,6 +407,31 @@ def source_from_json(raw: object) -> GeneratedSource:
     return GeneratedSource(
         kind=_get_str(data, "kind"),
         params=_params_from_json(data.get("params", {}), "source.params"),
+        # 版 8 までは項目が無い 層を持たないテキストは前からの縁取りの項目で描くので、
+        # 何も移さずに読めば前と同じ絵になる
+        strokes=tuple(_stroke_from_json(entry) for entry in _get_list(data, "strokes")),
+    )
+
+
+def _stroke_to_json(stroke: Stroke) -> dict[str, Any]:
+    return {
+        "id": stroke.id,
+        "enabled": stroke.enabled,
+        "params": _params_to_json(stroke.params),
+        "effects": [effect_to_json(effect) for effect in stroke.effects],
+    }
+
+
+def _stroke_from_json(raw: object) -> Stroke:
+    data = _require(raw, "stroke")
+    stroke_id = _get_str(data, "id")
+    return Stroke(
+        params=_params_from_json(data.get("params", {}), "stroke.params"),
+        enabled=_get_bool(data, "enabled", True),
+        effects=tuple(effect_from_json(entry) for entry in _get_list(data, "effects")),
+        # 手で書いたファイルで ID が無いときは振る 空の ID が 2 つあると、片方を消したつもりで
+        # 両方消える
+        **({"id": StrokeId(stroke_id)} if stroke_id else {}),
     )
 
 
