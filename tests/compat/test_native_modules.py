@@ -527,6 +527,58 @@ class TestKeepingTheRuntime:
             stage.close()
         assert keep
 
+    @pytest.mark.parametrize(
+        ("file", "load"),
+        [
+            pytest.param("助け.lua", 'require("助け")', id="require の .lua"),
+            pytest.param("助け.mod2", 'obj.module("助け")', id="Lua のソースの .mod2"),
+        ],
+    )
+    def test_a_module_that_sets_globals_runs_again_on_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file: str, load: str
+    ) -> None:
+        # 読み込むときに大域へ関数を置くモジュール 使い回すときに大域を消したのに、
+        # モジュールの控えの値だけを返すと走り直さず、次の描画係で helper が nil になった
+        # （スクリプトは LuaError で素通しになる 書き出しの後のプレビュー・静止画・見本）
+        from sashimono.compat.aviutl import runtime as runtime_module
+        from sashimono.compat.aviutl.catalog import ScriptCatalog
+        from sashimono.engine.render.scripts import ScriptStage
+
+        (tmp_path / file).write_text("function helper() return 7 end return {}", "utf-8")
+        module, keep = _module({"noop": lambda _param: None})
+        monkeypatch.setattr(native, "load", lambda _path: module)
+        monkeypatch.setattr(runtime_module, "_IDLE_RUNTIMES", [])
+        catalog = ScriptCatalog(roots=(tmp_path,))
+        first = ScriptStage(catalog, screen=(64, 64))
+        runtime = first._runtime
+        runtime._native_module(tmp_path / "試験.mod2", "試験")
+        runtime.run(f"{load} first = helper()", _state())
+        assert runtime._lua.globals()["first"] == 7
+        first.close()
+
+        second = ScriptStage(catalog, screen=(64, 64))
+        assert second._runtime is runtime
+        result = runtime.run(f"{load} second = helper()", _state())
+        assert not result.failed, result.message
+        assert runtime._lua.globals()["second"] == 7
+        second.close()
+        assert keep
+
+    def test_dll_tables_stay_and_lua_sources_go_on_reset(self, tmp_path: Path) -> None:
+        # 手放してはいけないのは DLL の関数の表だけ ほかの控えと印は捨てて読み直させる
+        from sashimono.compat.aviutl.runtime import _keeps_dll_table
+
+        dll = tmp_path / "本物.mod2"
+        dll.write_bytes(b"MZ" + bytes(62))
+        lua = tmp_path / "ソース.mod2"
+        lua.write_text("return {}", "utf-8")
+        assert _keeps_dll_table(("mod2", dll.resolve(), True))
+        assert _keeps_dll_table(("aux2", tmp_path / "x.aux2", "名前"))
+        assert not _keeps_dll_table(("mod2", lua.resolve(), True))
+        assert not _keeps_dll_table(("lua", lua.resolve()))
+        assert not _keeps_dll_table(("missing", None, "名前"))
+        assert not _keeps_dll_table(("unsearched", None, "名前"))
+
     def test_a_plain_runtime_is_not_kept_for_reuse(self, tmp_path: Path) -> None:
         # DLL を読まないランタイムは手放せる 取っておくと、使わない Lua が残り続ける
         from sashimono.compat.aviutl import runtime as runtime_module

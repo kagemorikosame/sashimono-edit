@@ -273,6 +273,18 @@ _IDLE_RUNTIMES: list[LuaScriptRuntime] = []
 _IDLE_LOCK = threading.Lock()
 
 
+def _keeps_dll_table(key: tuple[object, ...]) -> bool:
+    """使い回すときに残すモジュールの控えか DLL の関数の表だけ（:meth:`LuaScriptRuntime.reset`）"""
+    kind = key[0] if key else None
+    if kind == "aux2":
+        return True
+    if kind == "mod2":
+        # .mod2 は DLL のことも Lua のソースのこともある 鍵は（種類, 場所, 設定）
+        location = key[1]
+        return isinstance(location, Path) and _is_native(location)
+    return False
+
+
 def acquire_runtime(*, render_source: Any = None, apply_effects: Any = None) -> LuaScriptRuntime:
     """ランタイムを借りる 手の空いている手放せないランタイムがあれば、それを使い回す"""
     with _IDLE_LOCK:
@@ -409,8 +421,8 @@ class LuaScriptRuntime:
         """前の描画の状態を消す スクリプトが置いた大域変数と、標準の表へ足した物を捨てる
 
         使い回したランタイムで、前の書き出しのスクリプトが残した値が次の描画に見えると、
-        同じプロジェクトでも描くたびに絵が変わる 読んだモジュールは残す（1 つの描画係の
-        中で描画をまたいで使っていたのと同じ扱い）
+        同じプロジェクトでも描くたびに絵が変わる 読んだモジュールは DLL の関数の表だけを
+        残し、Lua のソースのモジュールは次の require で走り直させる
         """
         with self._lock:
             # 大域変数の表そのもの（_G）も用意したての表に入っているので、足された
@@ -426,9 +438,17 @@ class LuaScriptRuntime:
             self._lua.execute("package = { loaded = {} }")
             self._injected.clear()
             self._folder = None
-            # 読んだモジュールの表（_modules）は残す DLL の関数の表を手放して Lua に
-            # 片付けさせると、片付けの中で落ちる（手放せない理由と同じ） モジュールは
-            # 1 つの描画係の中でも描画をまたいで同じ表を使っていた
+            # 残すのは DLL の関数の表（.mod2 の DLL と汎用プラグインの控え）だけ 手放して
+            # Lua に片付けさせると落ちる（手放せない理由と同じ） DLL は Lua の大域変数に
+            # 触れない（表の関数で値を受け取って返すだけ）ので、残しても大域を消した後と
+            # 食い違わない
+            # Lua のソースのモジュール（require の .lua と、DLL ではない .mod2）は捨てて、
+            # 次の require で走り直させる 読み込むときに大域へ関数を置くモジュールがあり、
+            # 控えの値だけを返すと、上で消した大域の関数が無いままになる
+            # 見つからない・探さなかった印も捨てる（記録は描画係ごとに 1 度に戻る）
+            self._modules = {
+                key: value for key, value in self._modules.items() if _keeps_dll_table(key)
+            }
             self._found.clear()
             self._deep.clear()
 
