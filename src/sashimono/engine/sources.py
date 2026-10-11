@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import struct
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 
 import numpy as np
@@ -1127,6 +1127,10 @@ def _redecorated(values: dict[str, object], look: _Look) -> dict[str, object]:
     if look.decoration is None and look.edge_width is None:
         return values
     changed = dict(values)
+    # 縁取りの層を持つ字では、前からの太さは層へ移すときに 0 にしてある 縁があるかは層で見る
+    layered = isinstance(values.get("strokes"), tuple)
+    rings = values.get("strokes") if layered else ()
+    has_edge = bool(rings) if layered else _number(values, "border_width", 0.0) > 0.0
     if look.decoration is not None:
         decoration = find_decoration(DECORATION_NAMES[look.decoration])
         if decoration is not None:
@@ -1142,9 +1146,15 @@ def _redecorated(values: dict[str, object], look: _Look) -> dict[str, object]:
                     for key, value in params.items()
                 }
             )
-    if look.edge_width is not None and _number(changed, "border_width", 0.0) > 0.0:
+            has_edge = _number(changed, "border_width", 0.0) > 0.0
+            if layered:
+                # 層を持つ字は、文字装飾の縁の太さを層の頭へ当てる（:func:`_edge_tagged`）
+                changed[_EDGE_WIDTH] = _number(changed, "border_width", 0.0)
+    if look.edge_width is not None and has_edge:
         # 縁は片側に指定の半分ずつ付いた（見本 tag44 0・4・8・20 で字の幅が 0・4・8・19 広がった）
         changed["border_width"] = look.edge_width / 2.0
+        if layered:
+            changed[_EDGE_WIDTH] = look.edge_width / 2.0
     return changed
 
 
@@ -1291,12 +1301,46 @@ def _rings(look: Mapping[str, object]) -> tuple[_Ring, ...]:
     """
     strokes = look.get("strokes")
     if isinstance(strokes, tuple):
-        return tuple(ring for ring in strokes if isinstance(ring, _Ring))
+        rings = [ring for ring in strokes if isinstance(ring, _Ring)]
+        return tuple(_edge_tagged(rings, look))
     width = _number(dict(look), "border_width", 0.0)
     if width <= 0.0:
         return ()
     colour = look.get("border_color")
     return (_Ring(width=width, colour=colour if isinstance(colour, tuple) else ()),)
+
+
+#: 制御文字で変えた縁の色（3 成分）と太さ（画面の画素） :func:`_recoloured` と
+#: :func:`_redecorated` が字の見た目の値へ入れ、縁取りの層を持つ字は :func:`_edge_tagged` が読む
+_EDGE_COLOUR = "_edge_colour"
+_EDGE_WIDTH = "_edge_width"
+
+
+def _edge_tagged(rings: list[_Ring], look: Mapping[str, object]) -> list[_Ring]:
+    """AviUtl2 の制御文字（``<#文字色,影・縁色>`` ``<s,,,太さ>`` ``<@書体,番号>``）で変えた縁を、
+    縁取りの層の頭（描く層の 1 つ目）へ当てる
+
+    層を持たない字の縁は前からの項目（``border_color`` ``border_width``）を制御文字が字ごとに
+    書き換える 前からの縁を層へ移す（:func:`~sashimono.core.commands.adopted_source`）と
+    縁は 1 つ目の層になるので、同じ書き換えを 1 つ目の層へ当てる 当てないと、移した瞬間に
+    字ごとの縁の色や太さが消え、全部の字が設定欄の縁になる
+    2 つ目以降の層には当てない AviUtl2 の縁は 1 つで、足した層への効き方を決める物が無い
+    全部の層へ当てると、層ごとに色を分けた縁が制御文字の 1 色に揃ってしまう 色は 3 成分だけを
+    差し替え、層の濃さ（色の不透明度と層の不透明度）は残す（前からの縁と同じ）
+    太さ 0 にした字は描かないが、層は並びから外さない 外すと字ごとに層の番号がずれ、2 つ目の層の
+    絵へ 3 つ目の層を重ねる
+    """
+    colour = look.get(_EDGE_COLOUR)
+    width = look.get(_EDGE_WIDTH)
+    if not rings or (colour is None and width is None):
+        return rings
+    first = rings[0]
+    if isinstance(colour, tuple) and len(colour) >= 3:
+        alpha = first.colour[3] if len(first.colour) > 3 else 1.0
+        first = replace(first, colour=(*colour[:3], alpha))
+    if isinstance(width, int | float) and not isinstance(width, bool):
+        first = replace(first, width=max(0.0, float(width)))
+    return [first, *rings[1:]]
 
 
 def _ring_path(path: QPainterPath, ring: _Ring) -> QPainterPath:
@@ -1323,7 +1367,10 @@ def _paint_ring(
     entries = [
         (path, found[index], clip, look)
         for (path, look, clip), found in zip(layers, rings, strict=True)
-        if index < len(found) and (found[index].position == "outside") == under
+        if index < len(found)
+        and (found[index].position == "outside") == under
+        # 制御文字で太さ 0 にした字（:func:`_edge_tagged`）は描かない
+        and found[index].width > 0.0
     ]
     if not entries:
         return
@@ -1434,6 +1481,9 @@ def _recoloured(
         alpha = float(old[3]) if isinstance(old, tuple) and len(old) >= 4 else 1.0
         rgb = tuple(int(hex_value[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
         changed[name] = (*rgb, alpha)
+        if name == "border_color":
+            # 縁取りの層を持つ字は前からの項目を読まないので、層の頭へ当てる色として残す
+            changed[_EDGE_COLOUR] = rgb
     return changed
 
 

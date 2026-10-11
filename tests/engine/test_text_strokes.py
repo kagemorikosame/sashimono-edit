@@ -110,8 +110,30 @@ class TestALegacyBorderLooksTheSame:
             {"border_width": AnimatedValue(5.0), "vertical": True},
             {"border_width": AnimatedValue(7.0), "layout": "aviutl", "bold": True},
             {"border_width": AnimatedValue(6.0), "color": (1.0, 1.0, 1.0, 0.5)},
+            # AviUtl2 の制御文字で字ごとに縁の色・太さ・文字装飾を変えた字 層の頭へ当てないと、
+            # 移した瞬間に字ごとの縁が設定欄の縁 1 つに揃う
+            {
+                "layout": "aviutl",
+                "text": "<#ffff00,00ff00>縁<#>字<s110,,,16>大<s>\n<s,,,0>無<s>有",
+                "border_width": AnimatedValue(6.0),
+                "border_color": (1.0, 0.0, 0.0, 0.8),
+            },
+            {
+                "layout": "aviutl",
+                "text": "<@MS UI Gothic,2>装飾<@>字",
+                "border_width": AnimatedValue(3.0),
+                "shadow_x": AnimatedValue(4.0),
+            },
         ],
-        ids=["縁", "縁と影", "縦書き", "AviUtl2 の組み方", "半透明の字"],
+        ids=[
+            "縁",
+            "縁と影",
+            "縦書き",
+            "AviUtl2 の組み方",
+            "半透明の字",
+            "制御文字の縁の色と太さ",
+            "制御文字の文字装飾",
+        ],
     )
     @pytest.mark.parametrize("scale", [1.0, 0.5])
     def test_moving_the_border_into_a_layer_changes_no_pixel(
@@ -141,6 +163,21 @@ class TestALegacyBorderLooksTheSame:
         rounded = alpha(draw(text(border_width=AnimatedValue(14.0))))
         assert np.array_equal(rounded > 0, alpha(draw(text(layer(14.0, RED)))) > 0)
         assert mostly(image, inner, RED) > 0.95
+
+    def test_the_edge_tags_reach_only_the_first_layer(self) -> None:
+        # 制御文字の縁の色は層の頭にだけ当たる 全部の層へ当てると、層ごとに分けた縁の色が
+        # 制御文字の 1 色に揃い、足した外側の層が消えたように見える
+        tagged = {"layout": "aviutl", "text": "<#ffff00,00ff00>縁"}
+        two = text(layer(4.0, RED), layer(12.0, BLACK), **tagged)
+        image = draw(two)
+        # 内側の帯は緑（制御文字の縁色） 外側の帯は黒のまま
+        thin = alpha(draw(text(border_width=AnimatedValue(4.0), **tagged)))
+        thick = alpha(draw(text(border_width=AnimatedValue(12.0), **tagged)))
+        plain = alpha(draw(text(**tagged)))
+        inner = (thin == 255) & (plain == 0)
+        outer = (thick == 255) & (thin == 0)
+        assert mostly(image, inner, (0.0, 1.0, 0.0, 1.0)) > 0.95
+        assert mostly(image, outer, BLACK) > 0.95
 
     def test_a_text_without_layers_still_draws_the_old_border(self) -> None:
         # 層を持たない字が前からの項目を読まなくなると、前の作品の縁が全部消える
