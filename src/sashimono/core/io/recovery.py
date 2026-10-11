@@ -182,8 +182,10 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
         project_path = _saved_project(folder, session)
         if project_path is None:
             # 中身の無いメモと印 消せなくても検索は止めない（次の検索でまた消しに行く）
+            # 1 つずつ包む まとめて包むと、メモを消せないときに印を消しに進まず、印だけが残る
             with contextlib.suppress(OSError):
                 meta_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
                 _offered_path(folder, session).unlink(missing_ok=True)
             continue
         if meta_path.is_file():
@@ -447,6 +449,7 @@ def backup_before_save(
     *,
     keep: int = BACKUP_GENERATIONS,
     most: int | None = None,
+    failed: list[Path] | None = None,
 ) -> Path | None:
     """上書きする前の中身を控える ``target`` がまだ無ければ何もしない
 
@@ -489,8 +492,12 @@ def backup_before_save(
     for old in doomed:
         # 入れ替えで古い 1 本を消せなくても、新しい控えは書けている 上げると保存の知らせが
         # 「バックアップは作れなかった」になり、作れた控えが無いことにされる
-        with contextlib.suppress(OSError):
+        # 消せなかった物は ``failed`` へ足し、呼ぶ側が保存の知らせに添える（黙らない）
+        try:
             old.unlink(missing_ok=True)
+        except OSError:
+            if failed is not None:
+                failed.append(old)
     return copied
 
 

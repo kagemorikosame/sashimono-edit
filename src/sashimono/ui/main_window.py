@@ -2230,13 +2230,17 @@ class MainWindow(QMainWindow):
         note = ""
         # 1 回の保存で消すのは入れ替えの 1 本まで 世代数を超えた分は、設定画面で見せて
         # 確かめたときにだけ詰める（置き場を変えた先や、別の窓の設定で超えていても黙って消さない）
+        # 入れ替えで消せなかった古い控え 黙らない決まりで、保存の知らせに添える
+        stuck: list[Path] = []
         try:
-            backup_before_save(target, root, keep=keep, most=1)
+            backup_before_save(target, root, keep=keep, most=1, failed=stuck)
         except OSError as exc:
             if root == default:
                 raise
-            backup_before_save(target, default, keep=keep, most=1)
+            backup_before_save(target, default, keep=keep, most=1, failed=stuck)
             note = f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
+        if stuck:
+            note += f"（古いバックアップ {len(stuck)} 本は消せなかったので残した）"
         # 控えを足したぶん上限を超えうる 超えたら古い物から片付けて、何を消したかを添える
         trimmed = self._trim_state()
         return f"{note}（{trimmed}）" if trimmed else note

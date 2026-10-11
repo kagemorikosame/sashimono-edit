@@ -583,6 +583,24 @@ class TestAFailureMidwayDoesNotHideWhatWent:
         state = tmp_path / "state"
         made = self._made(state, 2)
         _refuse(monkeypatch, made[0])
-        copied = backup_before_save(tmp_path / "本編.sme", state, keep=2, most=1)
+        stuck: list[Path] = []
+        copied = backup_before_save(tmp_path / "本編.sme", state, keep=2, most=1, failed=stuck)
         assert copied is not None and copied.is_file()
         assert made[0].is_file()
+        # 消せなかった物を呼ぶ側へ返す 黙ると保存の知らせに出せない
+        assert stuck == [made[0]]
+
+    def test_a_note_that_cannot_go_does_not_keep_the_mark(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 中身の無いメモを消せなくても、勧めた印は消しに進む 進まないと印だけが残る
+        entry = _offered_orphan(tmp_path, "中身が無い")
+        entry.path.unlink()
+        folder = tmp_path / "recovery"
+        meta = folder / f"{entry.session}.json"
+        mark = folder / f"{entry.session}.offered"
+        assert mark.is_file()
+        _refuse(monkeypatch, meta)
+        assert find_orphans(tmp_path) == []
+        assert meta.is_file()
+        assert not mark.exists()

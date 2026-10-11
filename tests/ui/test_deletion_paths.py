@@ -302,6 +302,27 @@ def _crash_in(root: Path, name: str, days_ago: int) -> Path:
 class TestAFailureMidwayIsStillTold:
     """途中の 1 件で失敗しても、消せた物を知らせ、残りも続けて片付ける"""
 
+    def test_a_rotation_that_cannot_remove_is_told_on_save(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 入れ替えで古い控えを消せなかったことを、保存の知らせに出す 黙ると、本人は世代数を
+        # 守れていると思ったまま控えが増えていく
+        del qt_application
+        target = tmp_path / "本編.sme"
+        made = _fill(target, 2)
+        created = _window(Preferences(backup_generations=2))
+        try:
+            created._path = target
+            created.execute(RenameProject("作業中"))
+            _refuse(monkeypatch, made[0])
+            assert created.save_project()
+            message = created.statusBar().currentMessage()
+            assert "保存した" in message and "1 本は消せなかった" in message
+            assert made[0].is_file()
+        finally:
+            monkeypatch.undo()
+            created.close()
+
     def test_trimming_after_a_save(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
