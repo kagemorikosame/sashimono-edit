@@ -111,7 +111,7 @@ from sashimono.ui.inspector.widgets import (
 )
 from sashimono.ui.preview_handles import ALIGNMENTS
 from sashimono.ui.theme import Colors, theme_signals, themed_style
-from sashimono.ui.timeline.add_menu import effects_for_clip
+from sashimono.ui.timeline.add_menu import clip_roles, effects_for_clip
 from sashimono.ui.wheel_guard import WheelGuard
 
 __all__ = ["InspectorPanel", "KeyframeControls"]
@@ -1684,9 +1684,16 @@ def picture_and_sound(project: Project | None, track: Track, clip: Clip) -> tupl
 
 
 def capture_preset(name: str, project: Project | None, track: Track, clip: Clip) -> Preset:
-    """画面から保存するときのプリセット 絵と音の見分けは設定パネルと同じ"""
-    picture, sound = picture_and_sound(project, track, clip)
-    return Preset.capture(name, clip, picture=picture, sound=sound)
+    """画面から保存するときのプリセット
+
+    不透明度などを持つかは描くかで決め、どちらの側のエフェクトを持つかは〔＋ エフェクト〕と
+    同じ :func:`clip_roles` で決める 設定パネルが音声の欄を出すか（素材の音だけ）で決めると、
+    混合のトラックに置いたシーンのように欄は無いのに音のエフェクトを持つクリップの音の側が
+    「持っていない」扱いになり、当てた先の音のエフェクトと重なる
+    """
+    picture, _ = picture_and_sound(project, track, clip)
+    _, sound_effects = _effect_roles(project, track, clip)
+    return Preset.capture(name, clip, picture=picture, sound=sound_effects)
 
 
 def apply_preset_commands(
@@ -1698,12 +1705,16 @@ def apply_preset_commands(
     見分け）をここで渡す 試験も同じ入口を通し、画面と同じ当て方を確かめる
     """
     picture, sound = picture_and_sound(project, track, clip)
+    effect_picture, effect_sound = _effect_roles(project, track, clip)
     allowed = frozenset(d.kind for d in effects_for_clip(project, track, clip))
     return preset_commands(
         preset,
         clip,
         picture=picture,
         sound=sound,
+        # どちらの側のエフェクトを入れ替えるかは、欄を出すかではなく掛けられるかで決める
+        # （:func:`capture_preset` と同じ理由）
+        effect_sides=(effect_picture, effect_sound),
         options=options,
         # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
         accepts=allowed.__contains__,
@@ -1713,6 +1724,13 @@ def apply_preset_commands(
         side_of=_effect_side,
         defaults_of=_source_defaults,
     )
+
+
+def _effect_roles(project: Project | None, track: Track, clip: Clip) -> tuple[bool, bool]:
+    """絵のエフェクトと音のエフェクトが効くか（〔＋ エフェクト〕と同じ :func:`clip_roles`）"""
+    if project is None:
+        return picture_and_sound(project, track, clip)
+    return clip_roles(project, track, clip)
 
 
 def _effect_side(kind: str) -> str:

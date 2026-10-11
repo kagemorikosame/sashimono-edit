@@ -2,14 +2,15 @@
 
 レビューで「保存元に無い物まで当て先から消える」「保存元が読まない既定の値で当て先を
 上書きする」という指摘が種類の組み合わせを変えて何度も来た 1 つずつ直すのではなく、
-画面と同じ入口（:func:`apply_preset_commands`）で :data:`KINDS` の 9 x 9 の組み合わせを当て、
-どの組でも次の 2 つが成り立つことを見る
+画面と同じ入口（:func:`apply_preset_commands`）で :data:`KINDS` の全部（10 x 10）の
+組み合わせを当て、どの組でも次の 2 つが成り立つことを見る
 
 * 保存元に無い物は、当てる先から消えない・変わらない
 * 当たるのは保存元にある物だけ（保存元が読まない値はそもそも保存しない）
 
 種類は テキスト・図形・映像・音・カスタムオブジェクト・場面切り替え・フィルタ・グループ制御・
-音付き映像（レイヤーの動画 1 本で絵と音の両方を持つ）
+音付き映像（レイヤーの動画 1 本で絵と音の両方を持つ）・混合のシーン（レイヤーに置いたシーン
+音のエフェクトは効くが、素材の音ではないので音声の欄は出ない）
 どれも足したエフェクト・最初から持つ欄・不透明度などを既定と違う値にして作り込む 保存元と
 当てる先で値を変えておくと、当たったかどうかが値で分かる
 """
@@ -47,6 +48,7 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     ProjectSettings,
+    Scene,
     Track,
     TrackKind,
 )
@@ -70,7 +72,11 @@ KINDS = (
     "フィルタ",
     "グループ制御",
     "音付き映像",
+    "混合のシーン",
 )
+
+#: 混合のシーンが置く中身 空のタイムラインでよい（音を鳴らすかは中身ではなく置き方で決まる）
+_SCENE = Scene(name="入れ子", timeline=Project.create().timeline)
 
 #: カスタムオブジェクトの本体 手元に無いスクリプトでも識別子で見分ける
 _SCRIPT = "aviutl:試験/@図形集.obj:円"
@@ -140,6 +146,17 @@ def _make(
         return TrackKind.MIXED, _with_loose(
             clip, _effect(look.picture_effect), _effect(look.sound_effect)
         )
+    if kind == "混合のシーン":
+        # 混合のトラックに置いたシーンは音を鳴らし、音のエフェクトも掛けられるが、素材の音では
+        # ないので設定パネルに音声の欄は出ない 欄を出すかで側を決めると、音の側が入れ替わらない
+        clip = with_fixed_items(
+            _picture_values(Clip(timeline_start=start, duration=60, scene_id=_SCENE.id), look),
+            picture=True,
+        )
+        clip = _set_fixed(clip, TRANSFORM_EFFECT_KIND, "scale", look.scale)
+        return TrackKind.MIXED, _with_loose(
+            clip, _effect(look.picture_effect), _effect(look.sound_effect)
+        )
     if kind == "映像":
         base = make_clip(start, 60, video)
     elif kind == "テキスト":
@@ -187,7 +204,8 @@ def _project(
         Track(kinds[0], "保存元", (saved[1],)),
         Track(kinds[1], "当て先", (target[1],)),
     )
-    return base.with_timeline(replace(base.timeline, tracks=tracks))
+    with_scene = replace(base, scenes=(_SCENE,))
+    return with_scene.with_timeline(replace(base.timeline, tracks=tracks))
 
 
 def _loose(effects: tuple[Effect, ...], body: Effect | None) -> list[Effect]:
@@ -320,6 +338,8 @@ def test_the_same_kind_takes_the_saved_look(
     expected = {
         "音": [A.sound_effect],
         "音付き映像": [A.picture_effect, A.sound_effect],
+        # 前は音の側が入れ替わらず、当て先の残響と保存元の遅延が重なった
+        "混合のシーン": [A.picture_effect, A.sound_effect],
     }.get(kind, [A.picture_effect])
     assert loose == expected
     if kind in ("音", "音付き映像"):

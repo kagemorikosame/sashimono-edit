@@ -119,6 +119,7 @@ def preset_commands(
     accepts: Callable[[str], bool] | None = None,
     body_of: BodyOf | None = None,
     side_of: Callable[[str], str] | None = None,
+    effect_sides: tuple[bool, bool] | None = None,
     defaults_of: Callable[[str], dict[str, ParamValue] | None] | None = None,
 ) -> list[Command]:
     """``preset`` を ``clip`` へ当てるコマンド 変わる所が無ければ空
@@ -144,6 +145,9 @@ def preset_commands(
     ``side_of`` はエフェクトの種類が絵（:data:`PICTURE_SIDE`）と音（:data:`SOUND_SIDE`）の
     どちらに掛かるか 渡さなければどれも絵 入れ替えは側ごとに、保存したクリップと当てる先の
     両方が持つ側だけ（:func:`_effect_commands`）
+    ``effect_sides`` は当てる先に（絵のエフェクト, 音のエフェクト）が効くか 渡さなければ
+    ``picture`` と ``sound`` と同じ ``sound`` は音声の欄を出すか（素材の音だけ）で、
+    音のエフェクトが効くかとは違うことがある（混合のトラックのシーン）
     ``defaults_of`` は中身の種類の既定の値 中身を当てるときの土台にする 渡さなければ
     当てる先の値を土台にする（保存したクリップが持たない項目は当てる先の値のまま残る）
     """
@@ -158,8 +162,12 @@ def preset_commands(
             preset, clip, chosen, fit, keep_content=keep_content, defaults_of=defaults_of
         )
     )
+    # 入れ替えてよい側は、エフェクトが効くかで決める（渡されなければ欄を出すかと同じ）
+    # 欄を出すかで決めると、混合のトラックのシーンのように音声の欄は無いが音のエフェクトは
+    # 効くクリップで、音の側が入れ替わらずに保存元の物と重なる
+    fx_picture, fx_sound = effect_sides if effect_sides is not None else (picture, sound)
     target_sides = frozenset(
-        side for side, on in ((PICTURE_SIDE, picture), (SOUND_SIDE, sound)) if on
+        side for side, on in ((PICTURE_SIDE, fx_picture), (SOUND_SIDE, fx_sound)) if on
     )
     commands.extend(
         _effect_commands(
