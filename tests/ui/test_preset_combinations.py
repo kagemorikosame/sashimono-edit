@@ -60,6 +60,7 @@ from sashimono.ui.inspector.panel import (
     capture_preset,
     picture_and_sound,
 )
+from sashimono.ui.timeline.add_menu import clip_roles
 from tests.conftest import make_clip
 
 KINDS = (
@@ -352,3 +353,34 @@ def test_the_same_kind_takes_the_saved_look(
         assert after.opacity == AnimatedValue(A.opacity)
     if "blend_mode" in reads:
         assert after.blend_mode == A.blend
+
+
+#: 定義の無いエフェクト 別の機械で作ったプリセットや、読み込んだ後にスクリプトを外したもの
+_UNKNOWN = "aviutl:無い/@外した.anm:消えた"
+
+
+@pytest.mark.parametrize("target_kind", KINDS)
+def test_an_unknown_effect_reaches_every_picture_target(
+    target_kind: str, video_media: MediaItem, audio_media: MediaItem
+) -> None:
+    # 前は〔＋ エフェクト〕の一覧に無いからと黙って捨てていた 設定パネルは未知の
+    # エフェクトを残して見せ、絵の側として扱うので、絵の側が効く先には足す 音だけの先には足さない
+    assert registry.get(_UNKNOWN) is None
+    kind, clip = _make("テキスト", A, 0, video_media, audio_media)
+    unknown = Effect(kind=_UNKNOWN, params={"track0": AnimatedValue(5.0)})
+    saved = (kind, _with_loose(clip, unknown))
+    target = _make(target_kind, B, 100, video_media, audio_media)
+    project = _project(saved, target, [video_media, audio_media])
+    saved_track, target_track = project.timeline.tracks
+    preset = capture_preset("未知", project, saved_track, saved[1])
+    applied = project
+    for command in apply_preset_commands(
+        project, target_track, target[1], preset, options=PresetOptions()
+    ):
+        applied = command.apply(applied)
+    located = applied.timeline.locate_clip(target[1].id)
+    assert located is not None
+    _check(saved[1], target[1], located[1], preset, project)
+    picture_effects, _ = clip_roles(project, target_track, target[1])
+    reached = any(e.kind == _UNKNOWN for e in located[1].effects)
+    assert reached == picture_effects

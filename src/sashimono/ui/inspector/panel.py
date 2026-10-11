@@ -1707,6 +1707,16 @@ def apply_preset_commands(
     picture, sound = picture_and_sound(project, track, clip)
     effect_picture, effect_sound = _effect_roles(project, track, clip)
     allowed = frozenset(d.kind for d in effects_for_clip(project, track, clip))
+
+    def accepts(kind: str) -> bool:
+        # 定義の無い種類（別の機械で作った・スクリプトを外した AviUtl のエフェクト）は、
+        # 絵の側が効く先なら足す 設定パネルは未知のエフェクトを残して見せ、側も絵として
+        # 扱う（:func:`_effect_side`） 一覧に無いからと捨てると、プリセットの見た目が黙って欠ける
+        # 音だけの先には今までどおり足さない
+        if kind in allowed:
+            return True
+        return effect_picture and registry.get(kind) is None
+
     return preset_commands(
         preset,
         clip,
@@ -1717,7 +1727,7 @@ def apply_preset_commands(
         effect_sides=(effect_picture, effect_sound),
         options=options,
         # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
-        accepts=allowed.__contains__,
+        accepts=accepts,
         # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
         # 見た目の入れ替えで消すと、何も描かないクリップが残る
         body_of=custom_object_script,
