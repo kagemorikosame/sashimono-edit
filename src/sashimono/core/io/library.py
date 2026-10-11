@@ -332,7 +332,17 @@ class Library:
         いたら :class:`LibraryChangedError`（見せた物と違う物を消さない） 頼まずに同じ名前が
         あれば :class:`LibraryConflictError`
         """
+        return self.save_keeping(kind, item, replacing=replacing)[0]
+
+    def save_keeping(
+        self, kind: LibraryKind, item: Item, *, replacing: LibraryEntry | None = None
+    ) -> tuple[LibraryEntry, TrashEntry | None]:
+        """:meth:`save` と同じ 上書きしたときは、前の内容を移したごみ箱の 1 件も返す
+
+        保存した知らせの〔元に戻す〕（:meth:`undo_overwrite`）が、どれを戻すかに使う
+        """
         occupants = self._occupants(kind, item, keep=())
+        trashed: TrashEntry | None = None
         if occupants:
             if replacing is None:
                 where = f"「{item.category}」に" if kind == PRESET else ""
@@ -340,8 +350,17 @@ class Library:
             self._require(replacing)
             if not any(_same_file(path, replacing.path) for path in occupants):
                 raise LibraryChangedError(f"「{item.name}」はほかの窓で別の物に変わった")
-            self._to_trash(kind, replacing.item, occupants)
-        return self._entry(kind, item, self._save(item))
+            trashed = self._to_trash(kind, replacing.item, occupants)
+        return self._entry(kind, item, self._save(item)), trashed
+
+    def undo_overwrite(self, saved: LibraryEntry, trashed: TrashEntry) -> LibraryEntry:
+        """上書きして保存した物を、上書きの前の内容に戻す 上書きした新しい方はごみ箱へ移す
+
+        保存した後でほかの窓が同じ名前を変えていたら :class:`LibraryChangedError`（そちらの
+        変更を、戻すつもりで消さない） 前の内容がごみ箱から無くなっていても同じ
+        """
+        self._require(saved)
+        return self.restore(trashed, overwrite=True)
 
     # --- 中の手順 ---
 

@@ -30,7 +30,16 @@ from sashimono.core.model import Clip
 from sashimono.effects.sources import TEXT
 from sashimono.ui import library_save
 from sashimono.ui.library_dialog import LibraryDialog
-from sashimono.ui.library_save import SaveChoice, SaveDialog, save_look
+from sashimono.ui.library_save import (
+    UNDO_NOTICE_MS,
+    OverwriteUndo,
+    SaveChoice,
+    SaveDialog,
+    UndoNotice,
+    offer_undo,
+    save_look,
+    undo_offers,
+)
 from sashimono.ui.library_thumbnails import THUMBNAILS_SIMPLE, LookThumbnails
 from sashimono.ui.library_view import LibraryOptions
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -422,3 +431,151 @@ class TestPreference:
             assert dialog.preferences().save_overwrite_without_asking
         finally:
             shiboken6.delete(dialog)
+
+
+class TestUndoNotice:
+    """上書きして保存した直後に、知らせの〔元に戻す〕で前の内容へ戻す（利用者の決定）"""
+
+    @pytest.fixture
+    def offers(self) -> Iterator[list[OverwriteUndo]]:
+        found: list[OverwriteUndo] = []
+        undo_offers().offered.connect(found.append)
+        yield found
+        undo_offers().offered.disconnect(found.append)
+
+    def _overwrite(self, library: Library) -> None:
+        item = Preset.capture("赤", _clip(color=BLUE), category="見出し")
+        shown = library.occupant(PRESET, item)
+        assert shown is not None
+
+        def ask(*_a: object, **_k: object) -> SaveChoice:
+            return SaveChoice(name="赤", category="見出し", replacing=shown)
+
+        saved = save_look(
+            None,
+            library,
+            PRESET,
+            make=lambda name, category: Preset.capture(name, _clip(color=BLUE), category=category),
+            suggestion="",
+            ask=ask,
+        )
+        assert saved is not None
+
+    def _color(self, library: Library) -> object:
+        (now,) = library.presets.all()
+        assert now.source is not None
+        return now.source.params["color"]
+
+    def test_the_button_brings_the_old_one_back_once(
+        self, library: Library, offers: list[OverwriteUndo]
+    ) -> None:
+        self._overwrite(library)
+        (offer,) = offers
+        notice = UndoNotice()
+        try:
+            notice.offer(offer)
+            assert notice.isVisible() and notice.button.isEnabled()
+            results: list[str] = []
+            notice.finished.connect(results.append)
+            notice.button.click()
+            assert self._color(library) == RED
+            # 上書きした新しい方はごみ箱へ（そこからまた戻せる）
+            assert [t.name for t in library.trashed(PRESET)] == ["赤"]
+            assert results and "戻した" in results[0]
+            # 戻した後はもう押せない 押せると、戻した物をまた戻して行き来する
+            assert not notice.isVisible()
+            assert notice.current is None
+            assert "もう" in offer.undo()
+            assert self._color(library) == RED
+        finally:
+            shiboken6.delete(notice)
+
+    def test_a_new_save_offers_nothing(self, library: Library, offers: list[OverwriteUndo]) -> None:
+        saved = save_look(
+            None,
+            library,
+            PRESET,
+            make=_preset_maker(),
+            suggestion="",
+            ask=lambda *_a, **_k: SaveChoice(name="新しい", category="ユーザー", replacing=None),
+        )
+        assert saved is not None
+        assert offers == []
+
+    def test_a_change_elsewhere_after_saving_is_not_undone(
+        self, library: Library, offers: list[OverwriteUndo]
+    ) -> None:
+        # 保存した後でほかの窓が同じ名前を変えた そちらの変更を戻すつもりで消さない
+        self._overwrite(library)
+        (offer,) = offers
+        library.presets.save(Preset.capture("赤", _clip("ほかの窓"), category="見出し"))
+        text = offer.undo()
+        assert "戻さなかった" in text
+        (now,) = library.presets.all()
+        assert now.source is not None and now.source.params["text"] == "ほかの窓"
+
+    def test_the_notice_goes_away_and_cannot_be_used_after(
+        self, library: Library, offers: list[OverwriteUndo]
+    ) -> None:
+        self._overwrite(library)
+        notice = UndoNotice()
+        try:
+            notice.offer(offers[0])
+            assert notice._timer.interval() == UNDO_NOTICE_MS
+            notice._timer.timeout.emit()
+            assert not notice.isVisible()
+            assert notice.current is None
+            notice.button.click()
+            assert self._color(library) == BLUE
+        finally:
+            shiboken6.delete(notice)
+
+    def test_replacing_from_the_list_also_offers_it(
+        self,
+        library: Library,
+        thumbnails: LookThumbnails,
+        offers: list[OverwriteUndo],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def capture(kind: LibraryKind, name: str, category: str) -> Alias:
+            return Alias.of(name, _clip("いまの文字"), category=category)
+
+        dialog = LibraryDialog(
+            library,
+            kind=ALIAS,
+            capture=capture,
+            thumbnails=thumbnails,
+            options=LibraryOptions(thumbnails=thumbnails.mode, overwrite_without_asking=True),
+        )
+        try:
+            dialog.show()
+            QApplication.processEvents()
+            dialog.select("テロップ")
+            dialog.replace_with_current()
+            (offer,) = offers
+            assert offer.kind == ALIAS
+            offer.undo()
+            (back,) = library.aliases.all()
+            assert back.clip.source is not None
+            assert back.clip.source.params["text"] == "前の文字"
+        finally:
+            dialog.reject()
+            shiboken6.delete(dialog)
+
+    def test_the_main_window_shows_it_in_the_status_bar(self, library: Library) -> None:
+        from sashimono.core.model import Project
+        from sashimono.ui.main_window import MainWindow
+
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            window.show()
+            item = Preset.capture("赤", _clip(color=BLUE), category="見出し")
+            shown = library.occupant(PRESET, item)
+            saved, trashed = library.save_keeping(PRESET, item, replacing=shown)
+            assert trashed is not None
+            offer_undo(library, PRESET, saved, trashed)
+            assert window._undo_notice.isVisible()
+            window._undo_notice.button.click()
+            assert self._color(library) == RED
+        finally:
+            window.close()

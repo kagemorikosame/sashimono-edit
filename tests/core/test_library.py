@@ -323,6 +323,38 @@ class TestSave:
         assert now.source is not None and now.source.params["text"] == "ほかの窓"
 
 
+class TestUndoOverwrite:
+    def test_the_old_one_comes_back_and_the_new_one_goes_to_the_trash(
+        self, library: Library
+    ) -> None:
+        library.presets.save(Preset.capture("赤", _clip("前")))
+        item = Preset.capture("赤", _clip("後"))
+        saved, trashed = library.save_keeping(
+            PRESET, item, replacing=library.occupant(PRESET, item)
+        )
+        assert trashed is not None
+        library.undo_overwrite(saved, trashed)
+        (now,) = library.presets.all()
+        assert now.source is not None and now.source.params["text"] == "前"
+        (moved,) = library.trashed(PRESET)
+        library.restore(moved, overwrite=True)
+        (again,) = library.presets.all()
+        assert again.source is not None and again.source.params["text"] == "後"
+
+    def test_a_change_elsewhere_is_kept(self, library: Library) -> None:
+        library.presets.save(Preset.capture("赤", _clip("前")))
+        item = Preset.capture("赤", _clip("後"))
+        saved, trashed = library.save_keeping(
+            PRESET, item, replacing=library.occupant(PRESET, item)
+        )
+        assert trashed is not None
+        library.presets.save(Preset.capture("赤", _clip("ほかの窓")))
+        with pytest.raises(LibraryChangedError):
+            library.undo_overwrite(saved, trashed)
+        (now,) = library.presets.all()
+        assert now.source is not None and now.source.params["text"] == "ほかの窓"
+
+
 class TestExchange:
     def test_export_then_import_on_another_machine(self, library: Library, tmp_path: Path) -> None:
         library.presets.save(Preset.capture("赤", _clip(), category="見出し"))

@@ -121,6 +121,7 @@ from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.inspector import InspectorPanel
+from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.playback import PlaybackController
@@ -455,6 +456,11 @@ class MainWindow(QMainWindow):
         self._inspector.set_preset_options(self._preferences.preset_options)
         # 一覧の窓（プリセットとエイリアス）の見せ方 窓は開くたびに作るので、ここで渡しておく
         set_library_options(self._preferences.library_options)
+        # プリセットやエイリアスを上書きして保存した直後に、ステータスバーへ〔元に戻す〕を出す
+        self._undo_notice = UndoNotice(self)
+        self.statusBar().addPermanentWidget(self._undo_notice)
+        self._undo_notice.finished.connect(lambda text: self.statusBar().showMessage(text, 8000))
+        undo_offers().offered.connect(self._undo_notice.offer)
         self._inspector.set_wheel_unfocused(self._preferences.wheel_unfocused)
         self._graph = GraphEditor(self)
         # グラフエディタも起動直後にプロジェクトを持たせる 持たせないと、開いた作品で最初の

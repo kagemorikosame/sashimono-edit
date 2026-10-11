@@ -60,6 +60,7 @@ from sashimono.core.io.library import (
     TrashEntry,
 )
 from sashimono.core.io.presets import Preset
+from sashimono.ui import library_save
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import LookThumbnails, Thumbnail
 from sashimono.ui.library_view import (
@@ -539,12 +540,15 @@ class LibraryDialog(QDialog):
         ):
             return
         done = self._run(
-            functools.partial(self._library.save, entry.kind, item, replacing=entry),
+            functools.partial(self._library.save_keeping, entry.kind, item, replacing=entry),
             overwritable=False,
         )
         if done is not None:
+            saved, trashed = done
+            # 保存の窓で上書きしたときと同じく、知らせに〔元に戻す〕を出す
+            library_save.offer_undo(self._library, entry.kind, saved, trashed)
             self.refresh()
-            self.select(done.name)
+            self.select(saved.name)
 
     def duplicate_selected(self) -> None:
         chosen = self._selected()

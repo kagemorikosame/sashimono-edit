@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -48,6 +48,7 @@ from sashimono.core.io.library import (
     LibraryEntry,
     LibraryError,
     LibraryKind,
+    TrashEntry,
 )
 from sashimono.core.io.presets import Preset
 from sashimono.core.model import Clip, Project, Track
@@ -62,11 +63,17 @@ from sashimono.ui.library_view import (
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = [
+    "UNDO_NOTICE_MS",
+    "OverwriteUndo",
     "SaveChoice",
     "SaveDialog",
+    "UndoNotice",
+    "UndoOffers",
     "ask_save",
     "capture_look",
+    "offer_undo",
     "save_look",
+    "undo_offers",
 ]
 
 Item = Preset | Alias
@@ -366,7 +373,9 @@ def save_look(
     telling = tell if tell is not None else (lambda text: _inform(parent, kind, text))
     item = make(chosen.name, chosen.category)
     try:
-        return library.save(kind, item, replacing=chosen.replacing)
+        saved, trashed = library.save_keeping(kind, item, replacing=chosen.replacing)
+        offer_undo(library, kind, saved, trashed)
+        return saved
     except LibraryChangedError as exc:
         telling(
             f"{exc}\nほかで変わったので保存しなかった 一覧を読み直して、もう一度保存してください"
@@ -377,6 +386,118 @@ def save_look(
     except (LibraryError, OSError) as exc:
         telling(f"保存できなかった: {exc}")
     return None
+
+
+#: 上書きして保存した知らせの〔元に戻す〕を出しておく長さ（ミリ秒） 押す気になるまでの間は
+#: 出し、ほかの作業へ移った後まで残して押し間違えさせない 消えた後も管理の窓のごみ箱から戻せる
+UNDO_NOTICE_MS = 15_000
+
+
+class OverwriteUndo:
+    """上書きして保存した 1 回ぶんの〔元に戻す〕 1 度だけ使える"""
+
+    def __init__(
+        self, library: Library, kind: LibraryKind, saved: LibraryEntry, trashed: TrashEntry
+    ) -> None:
+        self.library = library
+        self.kind = kind
+        self.saved = saved
+        self.trashed = trashed
+        self.used = False
+
+    @property
+    def label(self) -> str:
+        return f"{_KIND_LABELS[self.kind]}「{self.saved.name}」を上書きした（前の内容はごみ箱）"
+
+    def undo(self) -> str:
+        """上書きの前に戻す 戻した結果の知らせの文を返す 2 度目は何もしない"""
+        if self.used:
+            return "もう元に戻してある"
+        self.used = True
+        try:
+            self.library.undo_overwrite(self.saved, self.trashed)
+        except LibraryChangedError as exc:
+            # 保存した後でほかの窓が変えていた そちらの変更を戻すつもりで消さない
+            return f"{exc} 戻さなかった（管理の窓のごみ箱から戻せる）"
+        except (LibraryError, OSError) as exc:
+            return f"戻せなかった: {exc}"
+        return f"「{self.saved.name}」を上書きの前に戻した（上書きした方はごみ箱へ移した）"
+
+
+class UndoOffers(QObject):
+    """上書きして保存したことを、知らせの帯（:class:`UndoNotice`）へ伝える"""
+
+    offered = Signal(object)
+
+
+_offers = UndoOffers()
+
+
+def undo_offers() -> UndoOffers:
+    """保存した所（設定パネル・タイムライン・一覧の窓）と、知らせを出す窓をつなぐ"""
+    return _offers
+
+
+def offer_undo(
+    library: Library, kind: LibraryKind, saved: LibraryEntry, trashed: TrashEntry | None
+) -> None:
+    """上書きしたときだけ〔元に戻す〕を出す 新しく保存しただけなら戻す前の内容が無い"""
+    if trashed is not None:
+        _offers.offered.emit(OverwriteUndo(library, kind, saved, trashed))
+
+
+class UndoNotice(QWidget):
+    """ステータスバーの知らせ 上書きした直後に〔元に戻す〕をしばらく出す"""
+
+    #: 戻した結果の文 窓はステータスバーに出す
+    finished = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._label = QLabel(self)
+        self.button = QPushButton("元に戻す", self)
+        self.button.setAutoDefault(False)
+        self.button.clicked.connect(self._undo)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._label)
+        layout.addWidget(self.button)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(UNDO_NOTICE_MS)
+        self._timer.timeout.connect(self._expire)
+        self._current: OverwriteUndo | None = None
+        self.hide()
+
+    @property
+    def current(self) -> OverwriteUndo | None:
+        """いま〔元に戻す〕で戻せる物 出ていなければ ``None``"""
+        return self._current
+
+    def offer(self, undo: object) -> None:
+        """新しい上書きの〔元に戻す〕を出す 前の物は差し替える（戻すのは直前の 1 回）"""
+        if not isinstance(undo, OverwriteUndo):
+            return
+        self._current = undo
+        self._label.setText(undo.label)
+        self.button.setEnabled(True)
+        self.show()
+        self._timer.start()
+
+    def _expire(self) -> None:
+        # 消えた後は押せない（ごみ箱からは戻せる）
+        self._current = None
+        self.hide()
+
+    def _undo(self) -> None:
+        undo = self._current
+        # 押したらすぐ消す もう一度押して、戻した物をまた戻すことをさせない
+        self._current = None
+        self.button.setEnabled(False)
+        self._timer.stop()
+        self.hide()
+        if undo is not None:
+            self.finished.emit(undo.undo())
 
 
 def _inform(parent: QWidget | None, kind: LibraryKind, text: str) -> None:
