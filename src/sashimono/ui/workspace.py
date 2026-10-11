@@ -433,8 +433,8 @@ class Preferences:
     #: 既定は入（前からの動き） 切ると「さっきの保存で壊した」を戻せない
     backup: bool = True
     #: 1 つのプロジェクトについて残すバックアップの数 既定 20 は前からの値
-    #: 減らすと、次にそのプロジェクトを上書き保存したときに古い物から消える
-    #: （設定画面で消える数を見せて確かめる）
+    #: 減らしたとき（置き場を変えた・入れ直したときも）超えた分は、設定画面で消える物を
+    #: 見せて確かめ、OK でその場で消す 上書き保存のときは 1 本作って 1 本消すだけ
     backup_generations: int = 20
     #: 退避とバックアップの置き場 空は既定（``%LOCALAPPDATA%\Sashimono``）
     #: 既定を空で持つのは、ユーザー名やドライブが変わった機械でも既定の置き場を指し続けるため
@@ -449,6 +449,13 @@ class Preferences:
     #: 開いている作業の今の退避・まだ勧めていない落ちた作業・各プロジェクトのいちばん
     #: 新しいバックアップは、上限を超えていても消さない
     state_limit_mb: int = 0
+    #: テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの折り返しの幅を残す（#283）
+    #: 既定は切（テンプレートと同じ見た目になる側） AviUtl と YMM4 のテンプレートの多くは
+    #: 折り返しの幅を持たないので、残すと棚の見本と違う行の分かれ方になり、知らない人ほど
+    #: 着せ替えが効いていないと受け取る 字幕の枠の幅を先に決めてから着せ替える人は入れる
+    #: 入れると、幅を使っているテキストは組み方も残す（AviUtl2 の組み方は折り返さないので、
+    #: テンプレートの組み方を取ると幅を残しても 1 行のままになる）
+    restyle_keep_wrap: bool = False
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -596,6 +603,7 @@ class PreferenceStore:
             state_limit_mb=_within(
                 data.get("state_limit_mb"), STATE_LIMIT_MB_RANGE, plain.state_limit_mb
             ),
+            restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
         )
 
     def save(self, preferences: Preferences) -> None:

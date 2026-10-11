@@ -640,6 +640,20 @@ class PreferencesDialog(QDialog):
         self._backups.add_rows(form)
         #: OK で消してよいと確かめた物（容量の上限） 設定を当てる側はこの中だけを消す
         self.approved_trim: list[TrimItem] = []
+        self._restyle_keep_wrap = QCheckBox(
+            "テンプレートを着せ替えても、テキストの折り返しの幅を残す", self
+        )
+        self._restyle_keep_wrap.setChecked(preferences.restyle_keep_wrap)
+        self._restyle_keep_wrap.setToolTip(
+            "テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの「折り返しの幅」を"
+            "そのまま残す 切っていると、テンプレートが持たない項目はどれも既定に戻り、"
+            "棚の見本と同じ見た目になる（AviUtl と YMM4 のテンプレートの多くは折り返しの幅を"
+            "持たないので、折り返さない） 字幕の枠の幅を先に決めてから着せ替える人は入れる"
+            " 幅を使っているテキストでは、折り返しが効くように組み方も今のまま残す"
+            "（AviUtl のテンプレートの組み方「AviUtl2 と同じ」は折り返さないため）"
+            " 文字と文字送りは、どちらでも今のまま残す"
+        )
+        form.addRow(self._restyle_keep_wrap)
 
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
@@ -789,6 +803,7 @@ class PreferencesDialog(QDialog):
             state_folder=self._backups.state_folder.folder(),
             recovery_keep_days=self._backups.recovery_keep_days.value(),
             state_limit_mb=self._backups.state_limit_mb.value(),
+            restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
         )
 
     def accept(self) -> None:
