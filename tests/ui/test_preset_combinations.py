@@ -49,6 +49,7 @@ from sashimono.core.model import (
     Project,
     ProjectSettings,
     Scene,
+    Stroke,
     Track,
     TrackKind,
 )
@@ -74,7 +75,31 @@ KINDS = (
     "グループ制御",
     "音付き映像",
     "混合のシーン",
+    "縁取りの層付きテキスト",
 )
+
+
+def _strokes(look: _Look) -> tuple[Stroke, ...]:
+    """縁取りの層（#272） 保存元は層 1 つに層のぼかし、当て先は層 2 つ"""
+    if look is A:
+        return (
+            Stroke(
+                params={"width": AnimatedValue(5.0), "color": look.color},
+                effects=(_effect("blur"),),
+            ),
+        )
+    return (
+        Stroke(params={"width": AnimatedValue(9.0), "color": look.color}),
+        Stroke(params={"width": AnimatedValue(2.0), "color": (1.0, 1.0, 1.0, 1.0)}),
+    )
+
+
+def _stroke_shape(strokes: tuple[Stroke, ...]) -> list[object]:
+    """層の並びの、ID を除いた中身"""
+    return [
+        (s.params, s.enabled, [(e.kind, e.params, e.enabled) for e in s.effects]) for s in strokes
+    ]
+
 
 #: 混合のシーンが置く中身 空のタイムラインでよい（音を鳴らすかは中身ではなく置き方で決まる）
 _SCENE = Scene(name="入れ子", timeline=Project.create().timeline)
@@ -160,6 +185,11 @@ def _make(
         )
     if kind == "映像":
         base = make_clip(start, 60, video)
+    elif kind == "縁取りの層付きテキスト":
+        # 設定パネルで縁取りの層を足したテキスト 層は保存元の物で置き換わり、層の無い
+        # テキストから保存したプリセットを当てると層が消える（_check）
+        source = TEXT.create(text=look.words, color=look.color).with_strokes(_strokes(look))
+        base = Clip(timeline_start=start, duration=60, source=source)
     elif kind == "テキスト":
         # 保存元は AviUtl や YMM4 から読んだテキストと同じく持つ項目が少ない形にする
         # 当て先の値を土台にすると、無い項目（折り返しの幅など）が当て先のまま残る
@@ -240,6 +270,11 @@ def _check(saved: Clip, before: Clip, after: Clip, preset: Preset, project: Proj
                 assert got == preset.source.params[name], name
             else:
                 assert got == defaults.get(name, before.source.params.get(name)), name
+        # 縁取りの層（#272）は保存元の物で置き換わる 保存元に層が無ければ消える 当て先の層を
+        # 残すと、層を持つ字は保存元の縁取りの項目を読まず、保存した見た目にならない
+        assert _stroke_shape(after.source.strokes) == _stroke_shape(preset.source.strokes)
+        held = {s.id for s in preset.source.strokes}
+        assert not {s.id for s in after.source.strokes} & held
 
     # 足したエフェクト 増えたのは保存元の物だけ 消えたのは保存元が持つ側の物だけ
     sides = origin_sides(preset)

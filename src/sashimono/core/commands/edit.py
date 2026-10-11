@@ -762,8 +762,27 @@ def _split_animation(clip: Clip, cut: int) -> tuple[Clip, Clip]:
     source_before = source_after = clip.source
     if clip.source is not None:
         params_before, params_after = params(clip.source.params)
-        source_before = replace(clip.source, params=params_before)
-        source_after = replace(clip.source, params=params_after)
+        # 縁取りの層の値と、層に掛けたエフェクトも同じく分ける 分けないと、後ろのクリップの
+        # 層だけキーが割る前の位置のまま残り、縁の太さが割った所で跳ぶ
+        strokes = [
+            (params(stroke.params), effects(stroke.effects)) for stroke in clip.source.strokes
+        ]
+        source_before = replace(
+            clip.source,
+            params=params_before,
+            strokes=tuple(
+                replace(stroke, params=values[0], effects=stack[0])
+                for stroke, (values, stack) in zip(clip.source.strokes, strokes, strict=True)
+            ),
+        )
+        source_after = replace(
+            clip.source,
+            params=params_after,
+            strokes=tuple(
+                replace(stroke, params=values[1], effects=stack[1])
+                for stroke, (values, stack) in zip(clip.source.strokes, strokes, strict=True)
+            ),
+        )
     return (
         replace(
             clip,

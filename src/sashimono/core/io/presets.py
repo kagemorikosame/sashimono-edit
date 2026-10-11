@@ -48,7 +48,14 @@ __all__ = [
 ]
 
 FORMAT_NAME = "sashimono-preset"
-FORMAT_VERSION = 1
+#: 読める一番新しい版 2 でテキストの縁取りの層（中身の ``strokes`` #272）を足した
+#: 版 1 の本体は知らない項目を捨てて読むので、層を持つプリセットを版 1 のまま書くと、
+#: 前の版では縁が 1 本も無い見た目を黙って当てる（層へ移した字は前からの縁の太さが 0）
+#: 層を持つプリセットだけを版 2 で書き、前の版には「新しい形式」で読ませない
+#: 層を持たないプリセットは版 1 のまま書く 前の版でも今までどおり読める（#288 の決まり）
+FORMAT_VERSION = 2
+#: 縁取りの層を持たないプリセットを書く版
+_PLAIN_VERSION = 1
 SUFFIX = ".smep"
 
 #: 読むときだけ受け付ける、昔の名前と拡張子 書くときは常に新しい名前で書く
@@ -197,7 +204,9 @@ class Preset:
             values["clip_to_below"] = self.clip_to_below
         return {
             "format": FORMAT_NAME,
-            "version": FORMAT_VERSION,
+            "version": FORMAT_VERSION
+            if self.source is not None and self.source.strokes
+            else _PLAIN_VERSION,
             "name": self.name,
             "category": self.category,
             # 前の版の本体はこの 2 つだけを読む 版の数字を上げずに項目を足したので、

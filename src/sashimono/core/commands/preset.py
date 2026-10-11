@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sashimono.core.commands.base import Command
 from sashimono.core.commands.effects import (
@@ -41,7 +41,15 @@ from sashimono.core.commands.fixed import (
     takes_picture_items,
 )
 from sashimono.core.io.presets import Preset, clip_values_for
-from sashimono.core.model import GROUP_LAYERS, Clip, Effect, GeneratedSource, ParamValue
+from sashimono.core.model import (
+    GROUP_LAYERS,
+    Clip,
+    Effect,
+    GeneratedSource,
+    ParamValue,
+    Stroke,
+    new_stroke_id,
+)
 from sashimono.core.model.fitting import fitted_value
 
 __all__ = [
@@ -268,9 +276,35 @@ def _source_commands(
         **{name: fit(value) for name, value in saved.params.items() if name not in kept},
     }
     params.update({name: current.params[name] for name in kept if name in current.params})
-    if params == {**defaults, **current.params}:
+    # 縁取りの層（#272）も保存したクリップの物で置き換える 保存元に層が無ければ層を消す
+    # 当てる先の層を残すと、層を持つ字は保存元の縁取りの項目を読まないので、保存した見た目に
+    # ならない 層の値と層のエフェクトの動きはほかの値と同じく長さへ合わせ、ID は振り直す
+    strokes = tuple(
+        replace(
+            stroke,
+            params={name: fit(value) for name, value in stroke.params.items()},
+            effects=tuple(_fresh(effect, fit) for effect in stroke.effects),
+            id=new_stroke_id(),
+        )
+        for stroke in saved.strokes
+    )
+    if params == {**defaults, **current.params} and _stroke_shape(strokes) == _stroke_shape(
+        current.strokes
+    ):
         return []
-    return [SetSource(clip.id, GeneratedSource(kind=current.kind, params=params))]
+    return [SetSource(clip.id, GeneratedSource(kind=current.kind, params=params, strokes=strokes))]
+
+
+def _stroke_shape(strokes: tuple[Stroke, ...]) -> tuple[object, ...]:
+    """層の並びの、ID を除いた中身 当てても見た目の変わらない層を「変わる所が無い」に数える"""
+    return tuple(
+        (
+            stroke.params,
+            stroke.enabled,
+            tuple((e.kind, e.params, e.enabled) for e in stroke.effects),
+        )
+        for stroke in strokes
+    )
 
 
 def _effect_commands(

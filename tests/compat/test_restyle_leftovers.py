@@ -8,7 +8,10 @@ Semibold を探して描いた）
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
+import pytest
 
 from sashimono.compat.aviutl.exo import parse_exo
 from sashimono.compat.aviutl.mapping import map_object
@@ -16,7 +19,16 @@ from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import restyle
 from sashimono.compat.mapped import MappedObject
 from sashimono.core.commands import SetSource
-from sashimono.core.model import AnimatedValue, Clip, GeneratedSource, ParamValue
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Effect,
+    GeneratedSource,
+    Keyframe,
+    ParamValue,
+    Stroke,
+    StrokeId,
+)
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
 from sashimono.engine.sources import render_source
@@ -203,3 +215,79 @@ class TestTimer:
         assert source is not None
         assert source.params["timer_format"] == "mm\\:ss"
         assert source.params["font"] == "Noto Sans JP"
+
+
+def _layered_template() -> list[MappedObject]:
+    """設定パネルで縁取りの層を 2 つ足した字（30 フレーム）を棚の元にした物
+
+    外側の層の太さは頭から終わりへ 4 から 12 へ動き、内側の層にはぼかしが掛かって動く
+    今の実物の YMM4 テンプレートは縁取りの層にならないので、手で作る
+    """
+    blur = Effect("blur", {"radius": AnimatedValue(0.0, (Keyframe(0, 0.0), Keyframe(29, 8.0)))})
+    strokes = (
+        Stroke(
+            params={"width": AnimatedValue(3.0), "color": (1.0, 1.0, 1.0, 1.0)},
+            effects=(blur,),
+            id=StrokeId("内"),
+        ),
+        Stroke(
+            params={
+                "width": AnimatedValue(4.0, (Keyframe(0, 4.0), Keyframe(29, 12.0))),
+                "color": (0.0, 0.0, 0.0, 1.0),
+            },
+            id=StrokeId("外"),
+        ),
+    )
+    source = TEXT.create(text="見本", font="Noto Sans JP").with_strokes(strokes)
+    return [MappedObject(clip=Clip(timeline_start=0, duration=30, source=source), layer=1)]
+
+
+def _restyled(template: list[MappedObject], clip: Clip) -> GeneratedSource:
+    commands = restyle(template, clip)
+    source = next(c for c in commands if isinstance(c, SetSource)).source
+    assert source is not None
+    return source
+
+
+class TestStrokeLayers:
+    """縁取りの層（#272）もテンプレートの物で置き換え、動きを着せる先の長さへ合わせる"""
+
+    def test_the_template_layers_are_carried(self) -> None:
+        # 層を落とすと、層で縁を付けたテンプレートを着せても縁が 1 本も付かない
+        source = _restyled(_layered_template(), _styled())
+        assert [stroke.params["color"] for stroke in source.strokes] == [
+            (1.0, 1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0, 1.0),
+        ]
+        assert [len(stroke.effects) for stroke in source.strokes] == [1, 0]
+
+    def test_the_layer_motion_fits_the_clip(self) -> None:
+        # 動きを尺に合わせないと、30 フレームのテンプレートを 90 フレームの字幕に着せたとき、
+        # 縁が太くなる動きとぼけていく動きが頭の 3 分の 1 で止まる
+        source = _restyled(_layered_template(), _styled())
+        width = source.strokes[1].params["width"]
+        radius = source.strokes[0].effects[0].params["radius"]
+        assert isinstance(width, AnimatedValue) and isinstance(radius, AnimatedValue)
+        assert width.keyframes[-1].frame == 89 and radius.keyframes[-1].frame == 89
+        assert width.at(44) == pytest.approx(8.0, abs=0.2)
+
+    def test_the_layers_get_new_ids(self) -> None:
+        # 棚の元と同じ ID のまま何本にも着せると、層や層のエフェクトを指す操作がどれを指して
+        # いるのか見分けが付かない
+        template = _layered_template()
+        source = _restyled(template, _styled())
+        held = template[0].clip.source
+        assert held is not None
+        assert {s.id for s in source.strokes}.isdisjoint({s.id for s in held.strokes})
+        assert source.strokes[0].effects[0].id != held.strokes[0].effects[0].id
+
+    def test_a_template_without_layers_clears_them(self) -> None:
+        # 今のクリップの層を残すと、層を持つ字はテンプレートの縁取りの項目を読まないので、
+        # テンプレートと違う縁のまま残る
+        styled = _styled()
+        assert styled.source is not None
+        layered = replace(
+            styled,
+            source=styled.source.with_strokes((Stroke(params={"width": AnimatedValue(9.0)}),)),
+        )
+        assert _restyled(_template(), layered).strokes == ()

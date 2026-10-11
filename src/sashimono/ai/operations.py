@@ -25,21 +25,25 @@ from sashimono.core.commands import (
     AddClip,
     AddEffect,
     AddScene,
+    AddStroke,
     AddTrack,
     Command,
     GroupClips,
     MoveClip,
     MoveClips,
+    MoveStroke,
     ParamPath,
     ParamTarget,
     RemoveClip,
     RemoveClips,
+    RemoveStroke,
     RippleCut,
     SetClipProperty,
     SetKeyframe,
     SetParam,
     SetResolution,
     SetSegmentText,
+    SetStrokeEnabled,
     SetTrackHeights,
     SetTrackState,
     SetTranscript,
@@ -73,6 +77,8 @@ from sashimono.core.model import (
     Project,
     SceneId,
     SegmentId,
+    Stroke,
+    StrokeId,
     Track,
     TrackId,
     TrackKind,
@@ -88,6 +94,12 @@ from sashimono.effects.spec import (
     ParamInput,
     SelectSpec,
     TrackSpec,
+)
+from sashimono.effects.strokes import (
+    STROKE,
+    STROKE_EFFECT_KINDS,
+    next_stroke,
+    takes_stroke_effect,
 )
 
 __all__ = ["OPERATIONS", "ImageResult", "Operation", "find_operation"]
@@ -470,6 +482,10 @@ def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
                 if track.kind is TrackKind.MIXED
                 else {}
             )
+            # テキストの縁取りの層 ID が見えないと、層の値も層のエフェクトも指せない
+            strokes = _strokes_of(clip)
+            if strokes is not None:
+                mixed["strokes"] = strokes
             clips.append(
                 {
                     **mixed,
@@ -551,7 +567,7 @@ def _list_effects(host: EditorHost, arguments: dict[str, Any]) -> object:
     entries: list[tuple[str, str, str, tuple[Any, ...]]] = [
         (d.kind, d.label, d.category, d.parameters) for d in registry.all()
     ]
-    entries += [(s.kind, s.label, "オブジェクト", s.parameters) for s in (TEXT, SHAPE)]
+    entries += [(s.kind, s.label, "オブジェクト", s.parameters) for s in (TEXT, SHAPE, STROKE)]
     rows: list[dict[str, Any]] = []
     for kind, label, group, parameters in entries:
         if wanted_kind and kind != wanted_kind:
@@ -1190,8 +1206,111 @@ def _add_effect(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not isinstance(raw, dict):
         raise ToolError("params はオブジェクトで渡してください")
     effect = definition.create(**{str(k): v for k, v in raw.items()})
+    stroke_id = str(arguments.get("stroke_id") or "")
+    if stroke_id:
+        # 縁取りの層に掛ける（#273） 掛けられる種類は設定パネルのメニューと同じ
+        _require_stroke(clip, stroke_id)
+        if not takes_stroke_effect(kind):
+            allowed = "、".join(STROKE_EFFECT_KINDS)
+            raise ToolError(f"{kind} は縁取りの層に掛けられません（使えるのは {allowed}）")
+        host.apply_commands(
+            [AddEffect(clip.id, effect, stroke_id=StrokeId(stroke_id))],
+            f"エフェクトを縁取りに追加: {definition.label}",
+        )
+        return {"effect_id": str(effect.id), "kind": kind, "stroke_id": stroke_id}
     host.apply_commands([AddEffect(clip.id, effect)], f"エフェクトを追加: {definition.label}")
     return {"effect_id": str(effect.id), "kind": kind}
+
+
+def _require_stroke(clip: Clip, stroke_id: str) -> Stroke:
+    found = clip.source.find_stroke(StrokeId(stroke_id)) if clip.source is not None else None
+    if found is None:
+        raise ToolError(
+            f"縁取りの層が見つかりません: {stroke_id}（list_clips の strokes で ID が分かる）"
+        )
+    return found
+
+
+def _add_stroke(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """テキストに縁取りの層を足す 省いた項目は今の縁の外側に見える太さと色にする"""
+    _, clip = _target_clip(host, arguments)
+    if clip.source is None or clip.source.kind != "text":
+        raise ToolError("縁取りの層を足せるのはテキストのクリップだけです")
+    stroke = next_stroke(clip.source)
+    params = dict(stroke.params)
+    for name in ("width", "color", "position", "opacity", "join"):
+        if name not in arguments:
+            continue
+        spec = STROKE.spec(name)
+        assert spec is not None  # 名前は定義の項目
+        value = arguments[name]
+        if isinstance(value, list):
+            # 色を数の並びで渡されたとき 並びのままでは色の欄が受け取らず、既定の黒になる
+            value = tuple(float(entry) for entry in value)
+        parsed = _parse_color(value) if isinstance(value, str) and name == "color" else None
+        params[name] = spec.coerce(parsed if parsed is not None else value)
+    stroke = replace(stroke, params=params)
+    index = arguments.get("index")
+    try:
+        host.apply_commands(
+            [AddStroke(clip.id, stroke, int(index) if index is not None else None)],
+            "縁取りを追加",
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    return {"stroke_id": str(stroke.id)}
+
+
+def _remove_stroke(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _, clip = _target_clip(host, arguments)
+    stroke = _require_stroke(clip, str(arguments.get("stroke_id") or ""))
+    host.apply_commands([RemoveStroke(clip.id, stroke.id)], "縁取りを削除")
+    return {"removed": str(stroke.id)}
+
+
+def _move_stroke(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _, clip = _target_clip(host, arguments)
+    stroke = _require_stroke(clip, str(arguments.get("stroke_id") or ""))
+    try:
+        index = int(arguments["index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ToolError("index に整数が要ります（0 が一番上）") from exc
+    host.apply_commands([MoveStroke(clip.id, stroke.id, index)], "縁取りの順番を変更")
+    return {"stroke_id": str(stroke.id), "index": index}
+
+
+def _set_stroke_enabled(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _, clip = _target_clip(host, arguments)
+    stroke = _require_stroke(clip, str(arguments.get("stroke_id") or ""))
+    enabled = bool(arguments.get("enabled", True))
+    host.apply_commands([SetStrokeEnabled(clip.id, stroke.id, enabled)], "縁取りの入り切り")
+    return {"stroke_id": str(stroke.id), "enabled": enabled}
+
+
+def _strokes_of(clip: Clip) -> list[dict[str, Any]] | None:
+    """テキストの縁取りの層の一覧 テキスト以外は ``None``（返事に出さない）
+
+    層を持たない字は、前からの縁（``border_width``）を描く そのときは空の一覧を返し、
+    層を足すと前からの縁が 1 つ目の層へ移ることを道具の説明に書いておく
+    """
+    if clip.source is None or clip.source.kind != "text":
+        return None
+    rows: list[dict[str, Any]] = []
+    for stroke in clip.source.strokes:
+        width = stroke.params.get("width")
+        rows.append(
+            {
+                "stroke_id": str(stroke.id),
+                "enabled": stroke.enabled,
+                "width": width.static if isinstance(width, AnimatedValue) else width,
+                "position": stroke.params.get("position", "outside"),
+                "effects": [
+                    {"effect_id": str(e.id), "kind": e.kind, "enabled": e.enabled}
+                    for e in stroke.effects
+                ],
+            }
+        )
+    return rows
 
 
 def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
@@ -1199,6 +1318,14 @@ def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
     if not name:
         raise ToolError("name が空です")
     effect_id = str(arguments.get("effect_id") or "")
+    stroke_id = str(arguments.get("stroke_id") or "")
+    if stroke_id:
+        # テキストの縁取りの層の項目か、層に掛けたエフェクトの項目
+        if effect_id:
+            return ParamPath.of_stroke_effect(
+                clip_id, StrokeId(stroke_id), EffectId(effect_id), name
+            )
+        return ParamPath.of_stroke(clip_id, StrokeId(stroke_id), name)
     if effect_id:
         return ParamPath.of_effect(clip_id, EffectId(effect_id), name)
     target = str(arguments.get("target", "source")).lower()
@@ -1226,11 +1353,20 @@ def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
     if located is None:
         return None
     _, clip = located
+    stroke = (
+        clip.source.find_stroke(path.stroke_id)
+        if path.stroke_id is not None and clip.source is not None
+        else None
+    )
 
     if path.target is ParamTarget.EFFECT and path.effect_id is not None:
-        effect = next((e for e in clip.effects if e.id == path.effect_id), None)
+        stack = stroke.effects if stroke is not None else clip.effects
+        effect = next((e for e in stack if e.id == path.effect_id), None)
         definition = registry.get(effect.kind) if effect is not None else None
         return definition.spec(path.name) if definition is not None else None
+
+    if path.target is ParamTarget.SOURCE and stroke is not None:
+        return STROKE.spec(path.name)
 
     if path.target is ParamTarget.SOURCE and clip.source is not None:
         source = source_registry.get(clip.source.kind)
@@ -2004,12 +2140,18 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="add_effect",
-        description="クリップにエフェクトを積む 使える kind は list_effects で分かる",
+        description=(
+            "クリップにエフェクトを積む 使える kind は list_effects で分かる"
+            " stroke_id を渡すとテキストの縁取りの層だけに掛ける（掛けられる kind は "
+            + "、".join(STROKE_EFFECT_KINDS)
+            + "）"
+        ),
         schema=_schema(
             {
                 "clip_id": _string("対象"),
                 "kind": _string("エフェクトの種類"),
                 "params": {"type": "object", "description": "初期値"},
+                "stroke_id": _string("縁取りの層（list_clips の strokes）"),
             },
             ["kind"],
         ),
@@ -2017,15 +2159,78 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="add_stroke",
+        description=(
+            "テキストに縁取りの層を足す（Photoshop の境界線のように何重にも重ねられる）"
+            " 並びの頭（index 0）が一番手前 太さは字の輪郭から数える 層の無い字に"
+            "前からの縁（border_width）があれば、先にそれが 1 つ目の層になる"
+            " 省いた項目は今の縁の外側に見える太さと色になる 層の項目は list_effects kind=stroke"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象のテキスト"),
+                "width": _number("太さ（画素 字の輪郭から）"),
+                "color": _string("色 #RRGGBB か #RRGGBBAA"),
+                "position": _string("outside（外側）/ center（中央）/ inside（内側）"),
+                "opacity": _number("不透明度（%）"),
+                "join": _string("角 round / miter / bevel"),
+                "index": _integer("入れる位置 省略すると一番下（一番外）"),
+            },
+            [],
+        ),
+        handler=_add_stroke,
+        writes=True,
+    ),
+    Operation(
+        name="remove_stroke",
+        description="テキストの縁取りの層を外す 層に掛けたエフェクトも一緒に外れる",
+        schema=_schema(
+            {"clip_id": _string("対象のテキスト"), "stroke_id": _string("縁取りの層")},
+            ["stroke_id"],
+        ),
+        handler=_remove_stroke,
+        writes=True,
+    ),
+    Operation(
+        name="move_stroke",
+        description="テキストの縁取りの層の順番を変える 0 が一番手前",
+        schema=_schema(
+            {
+                "clip_id": _string("対象のテキスト"),
+                "stroke_id": _string("縁取りの層"),
+                "index": _integer("行き先"),
+            },
+            ["stroke_id", "index"],
+        ),
+        handler=_move_stroke,
+        writes=True,
+    ),
+    Operation(
+        name="set_stroke_enabled",
+        description="テキストの縁取りの層を消さずに隠す・出す",
+        schema=_schema(
+            {
+                "clip_id": _string("対象のテキスト"),
+                "stroke_id": _string("縁取りの層"),
+                "enabled": _boolean("描くか"),
+            },
+            ["stroke_id", "enabled"],
+        ),
+        handler=_set_stroke_enabled,
+        writes=True,
+    ),
+    Operation(
         name="set_param",
         description=(
             "パラメータを変える effect_id を渡せばそのエフェクト、"
             "省略すればテキストや図形の中身（target=clip でクリップ自身）"
+            " stroke_id を渡せば縁取りの層の項目（effect_id も渡せば層に掛けたエフェクト）"
         ),
         schema=_schema(
             {
                 "clip_id": _string("対象"),
                 "effect_id": _string("エフェクト"),
+                "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
                 "name": _string("パラメータ名"),
                 "value": {"description": "新しい値"},
@@ -2042,6 +2247,7 @@ OPERATIONS: tuple[Operation, ...] = (
             {
                 "clip_id": _string("対象"),
                 "effect_id": _string("エフェクト"),
+                "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
                 "name": _string("パラメータ名"),
                 "frame": _integer("位置 省略すると再生ヘッド"),
