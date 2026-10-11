@@ -13,6 +13,7 @@ from sashimono.core.commands import (
     AddStroke,
     AddTrack,
     AdoptLegacyStroke,
+    Command,
     MoveEffect,
     MoveStroke,
     ParamPath,
@@ -85,9 +86,9 @@ def project() -> tuple[Project, ClipId]:
     return _project(_text())
 
 
-def _apply(project: Project, *commands: object) -> Project:
+def _apply(project: Project, *commands: Command) -> Project:
     for command in commands:
-        project = command.apply(project)  # type: ignore[attr-defined]
+        project = command.apply(project)
     return project
 
 

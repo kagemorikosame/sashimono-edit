@@ -19,6 +19,7 @@ from sashimono.core.model import (
     Clip,
     Effect,
     GeneratedSource,
+    ParamValue,
     Project,
     ProjectSettings,
     Stroke,
@@ -28,7 +29,8 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
-from sashimono.engine.sources import render_source_framed, source_canvas
+from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+from sashimono.engine.sources import StrokeEffects, render_source_framed, source_canvas
 
 SIZE = (360, 200)
 WHITE = (1.0, 1.0, 1.0, 1.0)
@@ -37,26 +39,26 @@ RED = (1.0, 0.0, 0.0, 1.0)
 YELLOW = (1.0, 1.0, 0.0, 1.0)
 
 
-def text(*strokes: Stroke, **params: object) -> GeneratedSource:
-    base: dict[str, object] = {
+def text(*strokes: Stroke, **params: ParamValue) -> GeneratedSource:
+    base: dict[str, ParamValue] = {
         "text": "字あL",
         "size": AnimatedValue(110.0),
         "color": YELLOW,
     }
     base.update(params)
-    return GeneratedSource(kind="text", params=base, strokes=strokes)  # type: ignore[arg-type]
+    return GeneratedSource(kind="text", params=base, strokes=strokes)
 
 
-def layer(width: float, colour: tuple[float, ...], **extra: object) -> Stroke:
-    params: dict[str, object] = {"width": AnimatedValue(width), "color": colour, **extra}
-    return Stroke(params=params)  # type: ignore[arg-type]
+def layer(width: float, colour: tuple[float, ...], **extra: ParamValue) -> Stroke:
+    params: dict[str, ParamValue] = {"width": AnimatedValue(width), "color": colour, **extra}
+    return Stroke(params=params)
 
 
 def draw(
     source: GeneratedSource,
     *,
     scale: float = 1.0,
-    baker: object = None,
+    baker: StrokeEffects | None = None,
 ) -> np.ndarray:
     width, height = round(SIZE[0] * scale), round(SIZE[1] * scale)
     image, _ = render_source_framed(
@@ -64,7 +66,7 @@ def draw(
         width,
         height,
         scale=(scale, scale),
-        stroke_effects=baker,  # type: ignore[arg-type]
+        stroke_effects=baker,
     )
     assert image is not None
     return image
@@ -137,9 +139,8 @@ class TestALegacyBorderLooksTheSame:
     )
     @pytest.mark.parametrize("scale", [1.0, 0.5])
     def test_moving_the_border_into_a_layer_changes_no_pixel(
-        self, params: dict[str, object], scale: float
+        self, params: dict[str, ParamValue], scale: float
     ) -> None:
-        # 前からの縁を層へ移すだけで絵が変わると、開いて縁を触っただけの作品の見た目が変わる
         # 前からの縁を 1 つ目の層へ移す（設定パネルで縁を触る・層を足す）だけで絵が 1 画素でも
         # 変わると、開いて触っただけの作品の見た目が変わる
         legacy = text(**params)
@@ -370,9 +371,7 @@ def test_a_preview_at_half_quality_is_the_export_shrunk() -> None:
 
 
 @pytest.fixture(scope="module")
-def gl_context() -> Iterator[object]:
-    from sashimono.engine.gpu import GLContextError, OffscreenGLContext
-
+def gl_context() -> Iterator[OffscreenGLContext]:
     try:
         context = OffscreenGLContext()
     except GLContextError as exc:
@@ -383,7 +382,7 @@ def gl_context() -> Iterator[object]:
 
 def _rendered(
     source: GeneratedSource,
-    context: object,
+    context: OffscreenGLContext,
     divisor: int = 1,
     *,
     below: GeneratedSource | None = None,
@@ -401,7 +400,7 @@ def _rendered(
             project = command.apply(project)
     renderer = FrameRenderer(
         project,
-        context=context,  # type: ignore[arg-type]
+        context=context,
         quality=RenderQuality(divisor),
     )
     try:
@@ -410,7 +409,7 @@ def _rendered(
         renderer.close()
 
 
-def test_a_blurred_layer_softens_only_the_border(gl_context: object) -> None:
+def test_a_blurred_layer_softens_only_the_border(gl_context: OffscreenGLContext) -> None:
     # 書き出しと同じ道（レンダラ）で、層のぼかしが縁だけをぼかし、字の塗りに掛からないこと
     # 壊れると、縁だけをぼかしたつもりの字幕が書き出しで字までぼけるか、縁がぼけないまま出る
     fill, _, outer = bands()
@@ -424,7 +423,7 @@ def test_a_blurred_layer_softens_only_the_border(gl_context: object) -> None:
     assert soft[outside][:, 0].max() > sharp[outside][:, 0].max() + 20
 
 
-def test_baking_a_layer_keeps_what_is_already_drawn(gl_context: object) -> None:
+def test_baking_a_layer_keeps_what_is_already_drawn(gl_context: OffscreenGLContext) -> None:
     # 層のエフェクトは字の絵を作る途中で GPU に掛ける 描画の作業場を使うと、先に重ねた
     # 下のクリップの絵を壊す
     ground = GeneratedSource(
@@ -453,7 +452,7 @@ def _extent(mask: np.ndarray) -> tuple[int, int]:
     ids=["拡大した影", "回した影"],
 )
 def test_a_zoomed_or_turned_shadow_is_not_cut(
-    gl_context: object, words: str, zoom: float, angle: float, axis: int, factor: float
+    gl_context: OffscreenGLContext, words: str, zoom: float, angle: float, axis: int, factor: float
 ) -> None:
     # 層の影は層の絵の真ん中を支点に拡大・回転する 画素の項目だけで作業面を切ると、大きくした
     # 影や回した影の外側が四角の端で欠け、書き出しで影が途中で切れて見える
@@ -476,7 +475,9 @@ def test_a_zoomed_or_turned_shadow_is_not_cut(
     assert shadowed[axis] > drawn[axis] * factor
 
 
-def test_a_layer_effect_without_change_matches_the_plain_layer(gl_context: object) -> None:
+def test_a_layer_effect_without_change_matches_the_plain_layer(
+    gl_context: OffscreenGLContext,
+) -> None:
     # 何もしない値のエフェクト（ぼかし 0）を掛けた層は、掛けない層と同じ絵
     # 層を別の面に描いて GPU を通す道で、色や位置がずれると、ここが食い違う
     plain = _rendered(text(layer(12.0, RED), layer(4.0, WHITE)), gl_context)

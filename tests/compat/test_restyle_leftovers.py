@@ -284,10 +284,10 @@ class TestStrokeLayers:
     def test_a_template_without_layers_clears_them(self) -> None:
         # 今のクリップの層を残すと、層を持つ字はテンプレートの縁取りの項目を読まないので、
         # テンプレートと違う縁のまま残る
+        styled = _styled()
+        assert styled.source is not None
         layered = replace(
-            _styled(),
-            source=_styled().source.with_strokes(  # type: ignore[union-attr]
-                (Stroke(params={"width": AnimatedValue(9.0)}),)
-            ),
+            styled,
+            source=styled.source.with_strokes((Stroke(params={"width": AnimatedValue(9.0)}),)),
         )
         assert _restyled(_template(), layered).strokes == ()
