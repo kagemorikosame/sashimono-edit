@@ -201,6 +201,37 @@ class TestEffects:
         effects = host.document.project.timeline.tracks[0].clips[0].effects
         assert str(effects[0].id) == result["effect_id"]
 
+    def test_emboss_can_be_found_and_animated(self, host: FakeHost) -> None:
+        # AI は日本語の名前から探して足す 見つからないと「浮き彫りにして」に応えられない
+        # 光の方向は動かせる値なので、キーフレームで光を回せる
+        found = run(host, "list_effects", contains="エンボス")["effects"]
+        assert [row["kind"] for row in found] == ["emboss"]
+        clip = str(_clip_id(host.document.project))
+        added = run(
+            host,
+            "add_effect",
+            clip_id=clip,
+            kind="emboss",
+            params={"basis": "rgb", "keep_color": True},
+        )
+        for frame, degrees in ((0, 0), (60, 180)):
+            run(
+                host,
+                "add_keyframe",
+                clip_id=clip,
+                effect_id=added["effect_id"],
+                name="angle",
+                frame=frame,
+                value=degrees,
+            )
+        effect = host.document.project.timeline.tracks[0].clips[0].effects[0]
+        assert effect.kind == "emboss"
+        assert effect.params["basis"] == "rgb"
+        assert effect.params["keep_color"] is True
+        angle = effect.params["angle"]
+        assert isinstance(angle, AnimatedValue)
+        assert angle.at(30) == pytest.approx(90)
+
     def test_an_unknown_effect_lists_the_real_ones(self, host: FakeHost) -> None:
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="blur"):

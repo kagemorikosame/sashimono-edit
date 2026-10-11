@@ -139,6 +139,7 @@ from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
 from sashimono.ui.timeline.drop import DropSpot
+from sashimono.ui.timeline.snap import PlayheadSnap
 from sashimono.ui.timeline.view import HEIGHT_STEP
 from sashimono.ui.transport import TransportBar
 from sashimono.ui.updates import UpdateController
@@ -440,9 +441,11 @@ class MainWindow(QMainWindow):
         self._timeline = TimelineView(project, self._analyzer, self)
         self._timeline.set_value_lines(self._preferences.value_lines)
         self._timeline.set_detail_min_width(self._preferences.detail_min_width)
+        self._timeline.set_stretch_waves(self._preferences.stretch_waves)
         self._timeline.set_split_audio(self._preferences.splits_media)
         self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
+        self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
@@ -903,10 +906,12 @@ class MainWindow(QMainWindow):
         self._timeline.set_value_lines(preferences.value_lines)
         self._subtitles.wrap_share = preferences.subtitle_wrap_share
         self._timeline.set_detail_min_width(preferences.detail_min_width)
+        self._timeline.set_stretch_waves(preferences.stretch_waves)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
+        self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         self._inspector.set_preset_options(preferences.preset_options)
@@ -1379,6 +1384,9 @@ class MainWindow(QMainWindow):
         # 前のプロジェクトで外した素材の覚えは捨てる 差し替えると取り消しの履歴も消え、
         # 戻ってくることは無い 新しいプロジェクトの素材は、開く所で全部頼んでいる
         self._forgotten.clear()
+        # タイムラインがクリップごとに貯めた描き方は前のプロジェクトのクリップを強く持つ
+        # 捨てないと、新しいクリップで上限まで埋まるまで前のプロジェクトが解放されない
+        self._timeline.forget_drawing()
         # 前のプロジェクトで出していた進み具合の続きとして「終わった」と出さない
         self._background_shown = False
         self._background_indicator.hide()
@@ -2427,7 +2435,7 @@ class MainWindow(QMainWindow):
             if located is None:
                 self.statusBar().showMessage("先にテキストのクリップを選んでください", 5000)
                 return
-            commands = restyle(objects, located[1])
+            commands = restyle(objects, located[1], keep_wrap=self._preferences.restyle_keep_wrap)
             if not commands:
                 self.statusBar().showMessage("テキストのクリップにしか適用できません", 5000)
                 return

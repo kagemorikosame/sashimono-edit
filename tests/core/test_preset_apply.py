@@ -17,12 +17,19 @@ from sashimono.core.commands.fixed import (
     fixed_effect,
     with_fixed_items,
 )
-from sashimono.core.commands.preset import PresetOptions, preset_commands
+from sashimono.core.commands.preset import (
+    PICTURE_SIDE,
+    SOUND_SIDE,
+    PresetOptions,
+    origin_sides,
+    preset_commands,
+)
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
     Effect,
+    GeneratedSource,
     Keyframe,
     Project,
     Track,
@@ -208,3 +215,149 @@ class TestApply:
         after = _applied(_text(duration=90), Preset.capture("出る", saved))
         assert after.opacity == fitted_value(moving, 30, 89)
         assert [k.frame for k in after.opacity.keyframes] == [0, 89]
+
+
+def _side_of(kind: str) -> str:
+    return SOUND_SIDE if kind.startswith("audio_") else PICTURE_SIDE
+
+
+class TestSides:
+    """入れ替えは、保存したクリップと当てる先の両方が持つ側（絵・音）だけ"""
+
+    def test_a_picture_look_does_not_touch_the_sound_side(self) -> None:
+        # 映像と音を両方持つクリップへ、映像だけの見た目（エフェクト無し）を当てる
+        target = replace(
+            _text(), effects=(Effect(kind="blur"), Effect(kind="audio_reverb"), *_text().effects)
+        )
+        after = _applied(
+            target, Preset.capture("素", _text()), picture=True, sound=True, side_of=_side_of
+        )
+        assert _loose_kinds(after) == ["audio_reverb"]
+
+    def test_a_sound_look_replaces_only_the_sound_side(self) -> None:
+        saved = replace(_text(), effects=(Effect(kind="audio_delay"),))
+        target = replace(
+            _text(), effects=(Effect(kind="blur"), Effect(kind="audio_reverb"), *_text().effects)
+        )
+        preset = Preset.capture("響き", saved, picture=False, sound=True)
+        after = _applied(target, preset, picture=True, sound=True, side_of=_side_of)
+        assert _loose_kinds(after) == ["blur", "audio_delay"]
+
+    def test_a_side_the_target_does_not_have_is_left_alone(self) -> None:
+        # 映像と音の両方を持つクリップの見た目でも、音を鳴らさないクリップの音の側には触らない
+        # （鳴らさないクリップに残った音のエフェクトは、本人が後で音を戻すときのための物）
+        both = Preset.capture("両方", _text(), picture=True, sound=True)
+        target = replace(_text(), effects=(Effect(kind="audio_reverb"), *_text().effects))
+        after = _applied(target, both, picture=True, sound=False, side_of=_side_of)
+        assert _loose_kinds(after) == ["audio_reverb"]
+
+    def test_the_origin_of_a_file_without_the_flags_is_inferred(self) -> None:
+        data = Preset.capture("音", with_fixed_items(Clip(0, 30), sound=True), picture=False)
+        data_dict = data.to_dict()
+        del data_dict["picture"], data_dict["sound"]
+        assert origin_sides(Preset.from_dict(data_dict)) == {SOUND_SIDE}
+        text = Preset.capture("字", _text()).to_dict()
+        del text["picture"], text["sound"]
+        assert origin_sides(Preset.from_dict(text)) == {PICTURE_SIDE}
+        assert origin_sides(Preset(name="昔", effects=(Effect(kind="blur"),))) == frozenset()
+
+
+class TestSparseSource:
+    def test_the_defaults_are_the_base_not_the_target(self) -> None:
+        # 読み込んだテキストの持つ項目は少ない 当てる先を土台にすると、無い項目が残る
+        sparse = Clip(
+            timeline_start=0,
+            duration=60,
+            source=GeneratedSource(kind="text", params={"text": "字", "size": AnimatedValue(90)}),
+        )
+        target = _text(text="残る", wrap_width=300, font_style="Light", pos_x=80)
+        after = _applied(
+            target,
+            Preset.capture("読んだ", sparse),
+            defaults_of=lambda kind: TEXT.default_params() if kind == "text" else None,
+        )
+        assert after.source is not None
+        params = after.source.params
+        assert params["size"] == AnimatedValue(90.0)
+        assert params["wrap_width"] == TEXT.default_params()["wrap_width"]
+        assert params["font_style"] == TEXT.default_params()["font_style"]
+        assert params["text"] == "残る"
+        assert params["pos_x"] == AnimatedValue(80.0)
+
+    def test_an_unknown_kind_keeps_the_target_as_the_base(self) -> None:
+        saved = Clip(0, 30, source=GeneratedSource(kind="謎", params={"a": 1}))
+        target = Clip(0, 30, source=GeneratedSource(kind="謎", params={"a": 0, "b": 2}))
+        after = _applied(target, Preset.capture("謎", saved), defaults_of=lambda _kind: None)
+        assert after.source is not None
+        assert after.source.params == {"a": 1, "b": 2}
+
+
+def _body_of(clip: Clip) -> Effect | None:
+    """カスタムオブジェクトの見分けを写した物 空のテキストの最初のふつうのエフェクトが本体"""
+    if clip.source is None or clip.source.params.get("text"):
+        return None
+    first = next((e for e in clip.effects if not e.fixed), None)
+    return first if first is not None and first.kind == "本体" else None
+
+
+def _custom(body: str = "円", *extra: Effect) -> Clip:
+    base = _text(text="")
+    return replace(base, effects=(Effect(kind="本体", params={"形": body}), *extra, *base.effects))
+
+
+def _loose_kinds(clip: Clip) -> list[str]:
+    return [e.kind for e in clip.effects if not e.fixed]
+
+
+class TestBody:
+    """カスタムオブジェクトの本体（中身を作るスクリプト）は見た目ではなく中身として扱う"""
+
+    def test_replacing_keeps_the_body(self) -> None:
+        # 前は入れ替えで本体まで消え、何も描かないクリップが残った
+        target = _custom("円", Effect(kind="blur"))
+        after = _applied(target, Preset.capture("素の字", _text()), body_of=_body_of)
+        assert _loose_kinds(after) == ["本体"]
+        assert _body_of(after) is not None
+
+    def test_the_text_of_a_plain_preset_is_not_put_into_the_body(self) -> None:
+        # 文字を入れると空のテキストでなくなり、本体として読まれなくなる
+        after = _applied(
+            _custom(),
+            Preset.capture("見出し", _text(text="見出し")),
+            options=PresetOptions(with_text=True),
+            body_of=_body_of,
+        )
+        assert _body_of(after) is not None
+
+    def test_the_saved_body_stays_out_without_the_text_option(self) -> None:
+        saved = _custom("星", Effect(kind="glow"))
+        after = _applied(_custom("円"), Preset.capture("星", saved), body_of=_body_of)
+        body = _body_of(after)
+        assert body is not None
+        assert body.params["形"] == "円"
+        assert _loose_kinds(after) == ["本体", "glow"]
+
+    def test_the_text_option_swaps_the_body(self) -> None:
+        # 同じカスタムオブジェクトを作り直したいときの当て方 本体は 1 つのまま入れ替わる
+        saved = _custom("星", Effect(kind="glow"))
+        after = _applied(
+            _custom("円", Effect(kind="blur")),
+            Preset.capture("星", saved),
+            options=PresetOptions(with_text=True),
+            body_of=_body_of,
+        )
+        body = _body_of(after)
+        assert body is not None
+        assert body.params["形"] == "星"
+        assert _loose_kinds(after) == ["本体", "glow"]
+
+    def test_a_plain_text_becomes_the_custom_object_only_with_the_text_option(self) -> None:
+        saved = Preset.capture("星", _custom("星"))
+        plain = _applied(_text(text="字"), saved, body_of=_body_of)
+        assert _loose_kinds(plain) == []
+        made = _applied(
+            _text(text="字"), saved, options=PresetOptions(with_text=True), body_of=_body_of
+        )
+        body = _body_of(made)
+        assert body is not None
+        assert body.params["形"] == "星"

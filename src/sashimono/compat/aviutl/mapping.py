@@ -1379,9 +1379,39 @@ def _text(entry: ExoEntry, log: CompatibilityReport) -> GeneratedSource:
         params["font"] = font
 
     params.update(_decoration_of(entry, size, log))
+    _note_unread_text(entry, log)
     # テキスト欄に埋め込んだ Lua（``<?...?>``）は本文のまま持つ 時刻で結果が
     # 変わるので、読み込む時点ではなく描くたびに走らせる（engine.render.scripts）
     return GeneratedSource(kind="text", params=params)
+
+
+#: テキストで読んでいない項目（#284） 報告に出す名前と、ファイルでの名前（世代で違う物は全部）
+#:
+#: 0 なら何もしない設定なので、落としても見た目は変わらない 0 以外を黙って落とすと、
+#: 実物を数えて多い順に埋める（CLAUDE.md の決まり 7）ときに数に上がらない
+#: AviUtl1 の英語版の名前は :mod:`.exo` が日本語へ寄せてから渡す
+_UNREAD_TEXT: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("表示速度", ("表示速度",)),
+    ("文字毎に個別オブジェクト", ("文字毎に個別オブジェクト",)),
+    ("自動スクロール", ("自動スクロール",)),
+    # AviUtl2 は「表示」、AviUtl1 は「表示する」で終わる
+    ("移動座標上に表示", ("移動座標上に表示", "移動座標上に表示する")),
+    # AviUtl1 は英字の ``autoadjust`` と書く（日本語版でも同じ）
+    ("オブジェクトの長さを自動調節", ("オブジェクトの長さを自動調節", "autoadjust")),
+)
+
+
+def _note_unread_text(entry: ExoEntry, log: CompatibilityReport) -> None:
+    """読んでいないテキストの項目のうち、0 以外の物を未対応として記録する
+
+    表示速度はトラックバーなので動きが付きうる 始めの値だけ見ると、0 から動かす行を
+    見落とす 生の値で見る 数として読めない値（``表示速度=速い`` など）を
+    「使っていない」と捨てると、知らない書き方の実物が数に上がらない
+    """
+    for label, keys in _UNREAD_TEXT:
+        raw = entry.value(*keys)
+        if not _is_off(raw):
+            log.note_missing(f"テキストの{label}")
 
 
 def _text_alignment(entry: ExoEntry) -> tuple[str, str]:

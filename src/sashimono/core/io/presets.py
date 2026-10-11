@@ -43,6 +43,7 @@ __all__ = [
     "TRASH_FOLDER",
     "Preset",
     "PresetStore",
+    "clip_values_for",
     "default_preset_root",
 ]
 
@@ -65,6 +66,26 @@ TRASH_FOLDER = ".trash"
 
 #: ファイル名に使えない文字 Windows の制限に合わせる
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+#: 場面切り替えの中身の種類 ``core.commands.fixed`` と同じ値（読み書きの層から命令の層を読まない）
+_TRANSITION = "transition"
+
+
+def clip_values_for(clip: Clip, *, picture: bool) -> frozenset[str]:
+    """``clip`` が読む、クリップ自身の値（不透明度・合成モード・切り抜き）の名前
+
+    設定パネルの描画の組が出す物と同じ 読まない値を保存すると、既定のままの値が
+    見た目の一部として残り、当てた先の値を上書きする（#275）
+    * 絵を描かないクリップと場面切り替えはどれも読まない
+    * フィルタとグループ制御は不透明度だけ（フィルタは掛ける前と後の混ぜ具合、グループ制御は
+      受け持つクリップへ掛ける） 合成モードと切り抜きは描き方の道に無い
+    """
+    if not picture or (clip.source is not None and clip.source.kind == _TRANSITION):
+        return frozenset()
+    if clip.is_filter or clip.is_group:
+        return frozenset({"opacity"})
+    return frozenset({"opacity", "blend_mode", "clip_to_below"})
 
 
 #: クリップ自身の値を書くときの入れ物の種類 書き方はテキストの中身と同じ ``params`` の辞書
@@ -96,6 +117,12 @@ class Preset:
     #: 保存したクリップの長さ（フレーム） キーフレームを当てる先の長さへ合わせるのに使う
     #: 前の版のプリセットは持たない（``None``） そのときは合わせずにそのまま当てる
     span: int | None = None
+    #: 保存したクリップが絵を描いたか・音を鳴らしたか 当てる先のエフェクトのうち、どちらの
+    #: 側（映像・音）を入れ替えてよいかを決める 映像の見た目を保存した物で音のクリップの
+    #: 残響を消さないため 項目の無いファイルは ``None``（中身から推し量る
+    #: :func:`sashimono.core.commands.preset.origin_sides`）
+    picture: bool | None = None
+    sound: bool | None = None
 
     def __post_init__(self) -> None:
         # 足したエフェクトの列には固定の印（クリップが最初から持つ項目）を持たせない
@@ -115,14 +142,23 @@ class Preset:
 
     @classmethod
     def capture(
-        cls, name: str, clip: Clip, *, picture: bool = True, category: str = "ユーザー"
+        cls,
+        name: str,
+        clip: Clip,
+        *,
+        picture: bool = True,
+        sound: bool = False,
+        category: str = "ユーザー",
     ) -> Preset:
         """``clip`` の見た目を写したプリセット
 
         ``picture`` は絵を描くクリップか 偽なら不透明度・合成モード・切り抜きを持たない
         音だけのクリップの不透明度は既定のまま意味が無く、持つと絵のクリップへ当てたときに
-        向こうの不透明度を 100% へ戻してしまう
+        向こうの不透明度を 100% へ戻してしまう 絵を描いても読まない値（フィルタの合成モード
+        など :func:`clip_values_for`）も同じ理由で持たない ``sound`` は音を鳴らすクリップか
+        どちらも、当てるときにどちらの側のエフェクトを入れ替えるかに使う
         """
+        values = clip_values_for(clip, picture=picture)
         return cls(
             name=name,
             effects=tuple(effect for effect in clip.effects if not effect.fixed),
@@ -130,10 +166,12 @@ class Preset:
             category=category,
             after_effects=tuple(effect for effect in clip.after_effects if not effect.fixed),
             fixed=tuple(effect for effect in clip.effects if effect.fixed),
-            opacity=clip.opacity if picture else None,
-            blend_mode=clip.blend_mode if picture else None,
-            clip_to_below=clip.clip_to_below if picture else None,
+            opacity=clip.opacity if "opacity" in values else None,
+            blend_mode=clip.blend_mode if "blend_mode" in values else None,
+            clip_to_below=clip.clip_to_below if "clip_to_below" in values else None,
             span=clip.duration,
+            picture=picture,
+            sound=sound,
         )
 
     @property
@@ -172,6 +210,8 @@ class Preset:
             if values
             else None,
             "span": self.span,
+            "picture": self.picture,
+            "sound": self.sound,
         }
 
     @classmethod
@@ -207,6 +247,8 @@ class Preset:
             blend_mode=blend_mode if isinstance(blend_mode, str) else None,
             clip_to_below=clip_to_below if isinstance(clip_to_below, bool) else None,
             span=span,
+            picture=_flag(data.get("picture")),
+            sound=_flag(data.get("sound")),
         )
 
     def instantiate(self) -> tuple[Effect, ...]:
@@ -219,6 +261,11 @@ class Preset:
             Effect(kind=effect.kind, params=dict(effect.params), enabled=effect.enabled)
             for effect in self.effects
         )
+
+
+def _flag(raw: object) -> bool | None:
+    """真偽の項目 無い・型が違うときは ``None``（中身から推し量る側へ回す）"""
+    return raw if isinstance(raw, bool) else None
 
 
 def _effects(data: dict[str, object], key: str) -> tuple[Effect, ...]:

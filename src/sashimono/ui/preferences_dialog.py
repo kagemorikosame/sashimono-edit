@@ -38,6 +38,7 @@ from sashimono.engine.encode import (
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT
 from sashimono.ui.media_match import MATCH_CHOICES
@@ -54,6 +55,9 @@ from sashimono.ui.workspace import (
     INSERT_TARGET_TRACKS,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
+    PLAYHEAD_SNAP_ALWAYS,
+    PLAYHEAD_SNAP_OFF,
+    PLAYHEAD_SNAP_SHIFT,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -71,6 +75,14 @@ __all__ = [
     "QUALITY_DIVISORS",
     "PreferencesDialog",
 ]
+
+#: 目盛りで再生ヘッドを動かすときの吸い付き方の名前 Shift の向きがクリップの磁石と
+#: 逆になるので、名前に Shift で何が起きるかまで書く
+PLAYHEAD_SNAP_CHOICES: tuple[tuple[str, str], ...] = (
+    (PLAYHEAD_SNAP_SHIFT, "Shift を押している間だけ吸い付く（既定）"),
+    (PLAYHEAD_SNAP_ALWAYS, "常に吸い付き、Shift を押している間は外す"),
+    (PLAYHEAD_SNAP_OFF, "吸い付かない"),
+)
 
 #: 控えの大きさ 小さいほど軽いが、文字の読みやすさが落ちる
 PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
@@ -382,6 +394,17 @@ class PreferencesDialog(QDialog):
             "下げると引いた表示でも中身を細かく見られ、上げると短いクリップが多いときに描くのが軽い"
         )
         form.addRow("中身を描くクリップの最小の幅", self._detail_min_width)
+        self._stretch_waves = QCheckBox(
+            "ズーム中は波形を伸ばして仮に描き、止まってから描き直す", self
+        )
+        self._stretch_waves.setChecked(preferences.stretch_waves)
+        self._stretch_waves.setToolTip(
+            "初めて見る倍率の波形を作らず、近い倍率で作った波形を伸ばして描く 止まってから"
+            "（0.2 秒）正しい波形に描き直す 伸ばした間は細かい山が少しずれて見える "
+            "短いクリップ 2000 本で細い帯との境を越えた先の初めての倍率の 1 段で、波形を作る "
+            "3〜6ms（遅い機械ではその数倍）を省ける"
+        )
+        form.addRow(self._stretch_waves)
 
         self._double_click_reset = QCheckBox("設定パネルの名前のダブルクリックで初期値に戻す", self)
         self._double_click_reset.setChecked(preferences.double_click_reset)
@@ -403,8 +426,9 @@ class PreferencesDialog(QDialog):
         self._preset_with_position = QCheckBox("プリセットを当てるとき、位置（X・Y）も当てる", self)
         self._preset_with_position.setChecked(preferences.preset_with_position)
         self._preset_with_position.setToolTip(
-            "切っていると、当てる先のクリップの画面の中の位置はそのまま残す "
-            "入れると、保存したクリップと同じ所へ動かす（クリップの長さはどちらでも変えない）"
+            "切っていると、当てる先のクリップの画面の中の位置と、グループ制御の対象レイヤー数は"
+            "そのまま残す 入れると、保存したクリップと同じ値にする"
+            "（クリップの長さはどちらでも変えない）"
         )
         form.addRow(self._preset_with_position)
         self._preset_keep_effects = QCheckBox(
@@ -481,7 +505,9 @@ class PreferencesDialog(QDialog):
         self._timeline_snap.setToolTip(
             "クリップを動かす・端を伸び縮みさせる・置くときに、ほかのクリップの頭と終わり・"
             "再生位置・キーフレーム・書き出し範囲の端へ吸い付く タイムラインの上の〔磁石〕と同じ "
-            "動かしている途中で Shift を押している間は吸い付かない"
+            "動かしている途中で Shift を押している間は吸い付かない "
+            "目盛りで再生ヘッドを動かすときは下の「再生ヘッドの吸い付き」に従う"
+            "（既定では Shift の向きが逆で、押している間だけ吸い付く）"
         )
         form.addRow(self._timeline_snap)
         self._snap_distance = QSpinBox(self)
@@ -498,6 +524,46 @@ class PreferencesDialog(QDialog):
             "動かしている途中で Shift を押している間は吸い付かない"
         )
         form.addRow(self._preview_snap)
+        self._playhead_snap = QComboBox(self)
+        for value, text in PLAYHEAD_SNAP_CHOICES:
+            self._playhead_snap.addItem(text, value)
+        self._playhead_snap.setCurrentIndex(
+            max(0, self._playhead_snap.findData(preferences.playhead_snap))
+        )
+        self._playhead_snap.setToolTip(
+            "目盛りで再生ヘッドをドラッグするときに、近くのクリップの端などへ吸い付くか "
+            "Shift はドラッグを始めてから押す（押してから目盛りを押すと書き出し範囲の指定になる） "
+            "「Shift の間だけ」は〔磁石〕を切っていても効き、「常に」は〔磁石〕を切ると止まる "
+            "距離は上の「吸い付く距離」"
+        )
+        form.addRow("再生ヘッドの吸い付き", self._playhead_snap)
+        # 吸い付く先は 1 行に並べる 4 行に分けると、設定の窓が縦に伸びて狭い画面で欠ける
+        self._playhead_snap_clips = QCheckBox("クリップの端", self)
+        self._playhead_snap_clips.setChecked(preferences.playhead_snap_clips)
+        self._playhead_snap_keyframes = QCheckBox("キーフレーム", self)
+        self._playhead_snap_keyframes.setChecked(preferences.playhead_snap_keyframes)
+        self._playhead_snap_work_area = QCheckBox("書き出し範囲の端", self)
+        self._playhead_snap_work_area.setChecked(preferences.playhead_snap_work_area)
+        self._playhead_snap_markers = QCheckBox("目印（マーカー）", self)
+        self._playhead_snap_markers.setChecked(preferences.playhead_snap_markers)
+        self._playhead_snap_markers.setToolTip(
+            "読み込んだ作品などに付いている目印 いまのタイムラインには描かないので、"
+            "入れると見えない所でも吸い付く"
+        )
+        targets = QWidget(self)
+        target_row = FlowLayout(targets)
+        target_row.setContentsMargins(0, 0, 0, 0)
+        self._playhead_snap_targets = (
+            self._playhead_snap_clips,
+            self._playhead_snap_keyframes,
+            self._playhead_snap_work_area,
+            self._playhead_snap_markers,
+        )
+        for box in self._playhead_snap_targets:
+            target_row.addWidget(box)
+        form.addRow("再生ヘッドの吸い付く先", targets)
+        self._playhead_snap.currentIndexChanged.connect(self._show_playhead_snap_targets)
+        self._show_playhead_snap_targets()
         self._insert_paste = QComboBox(self)
         self._insert_paste.addItem("全トラック（既定）", INSERT_ALL_TRACKS)
         self._insert_paste.addItem("貼り先と、一緒に動く相手のトラックだけ", INSERT_TARGET_TRACKS)
@@ -644,6 +710,21 @@ class PreferencesDialog(QDialog):
         self._subtitle_wrap.toggled.connect(self._subtitle_wrap_percent.setEnabled)
         self._subtitle_wrap_percent.setEnabled(preferences.subtitle_wrap)
 
+        self._restyle_keep_wrap = QCheckBox(
+            "テンプレートを着せ替えても、テキストの折り返しの幅を残す", self
+        )
+        self._restyle_keep_wrap.setChecked(preferences.restyle_keep_wrap)
+        self._restyle_keep_wrap.setToolTip(
+            "テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの「折り返しの幅」を"
+            "そのまま残す 切っていると、テンプレートが持たない項目はどれも既定に戻り、"
+            "棚の見本と同じ見た目になる（AviUtl と YMM4 のテンプレートの多くは折り返しの幅を"
+            "持たないので、折り返さない） 字幕の枠の幅を先に決めてから着せ替える人は入れる"
+            " 幅を使っているテキストでは、折り返しが効くように組み方も今のまま残す"
+            "（AviUtl のテンプレートの組み方「AviUtl2 と同じ」は折り返さないため）"
+            " 文字と文字送りは、どちらでも今のまま残す"
+        )
+        form.addRow(self._restyle_keep_wrap)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -714,6 +795,12 @@ class PreferencesDialog(QDialog):
         choice = find_model(str(self._ai_model.currentData()))
         self._ai_effort.setEnabled(choice is None or choice.effort)
 
+    def _show_playhead_snap_targets(self) -> None:
+        """吸い付かないを選んだら、吸い付く先を触れなくする 選んでも何も変わらない欄を残さない"""
+        active = self._playhead_snap.currentData() != PLAYHEAD_SNAP_OFF
+        for box in self._playhead_snap_targets:
+            box.setEnabled(active)
+
     @staticmethod
     def _select(box: QComboBox, value: int) -> None:
         """その値の項目を選ぶ 一覧に無ければ、その値の項目を足してから選ぶ
@@ -758,6 +845,7 @@ class PreferencesDialog(QDialog):
             keyframe_drag=str(self._keyframe_drag.currentData()),
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),
+            stretch_waves=self._stretch_waves.isChecked(),
             double_click_reset=self._double_click_reset.isChecked(),
             preset_with_text=self._preset_with_text.isChecked(),
             preset_with_position=self._preset_with_position.isChecked(),
@@ -770,6 +858,11 @@ class PreferencesDialog(QDialog):
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
             preview_snap=self._preview_snap.isChecked(),
+            playhead_snap=str(self._playhead_snap.currentData()),
+            playhead_snap_clips=self._playhead_snap_clips.isChecked(),
+            playhead_snap_keyframes=self._playhead_snap_keyframes.isChecked(),
+            playhead_snap_work_area=self._playhead_snap_work_area.isChecked(),
+            playhead_snap_markers=self._playhead_snap_markers.isChecked(),
             insert_paste=str(self._insert_paste.currentData()),
             new_project_layers=str(self._new_project_layers.currentData()),
             media_split=str(self._media_split.currentData()),
@@ -780,4 +873,5 @@ class PreferencesDialog(QDialog):
             scripts_move=str(self._scripts_move.currentData()),
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
+            restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
         )

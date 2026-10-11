@@ -44,6 +44,10 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "PLAYHEAD_SNAP_ALWAYS",
+    "PLAYHEAD_SNAP_MODES",
+    "PLAYHEAD_SNAP_OFF",
+    "PLAYHEAD_SNAP_SHIFT",
     "SCRIPTS_MOVE_ASK",
     "SCRIPTS_MOVE_AUTO",
     "SCRIPTS_MOVE_MODES",
@@ -172,6 +176,13 @@ MEDIA_SPLIT_MODES = (MEDIA_SPLIT, MEDIA_TOGETHER)
 INSERT_ALL_TRACKS = "all"
 INSERT_TARGET_TRACKS = "target"
 INSERT_PASTE_MODES = (INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS)
+
+#: 目盛りで再生ヘッドを動かすときの吸い付き方 :attr:`Preferences.playhead_snap` の値
+#: Shift を押している間だけ吸い付く・常に吸い付いて Shift で外す・吸い付かない
+PLAYHEAD_SNAP_SHIFT = "shift"
+PLAYHEAD_SNAP_ALWAYS = "always"
+PLAYHEAD_SNAP_OFF = "off"
+PLAYHEAD_SNAP_MODES = (PLAYHEAD_SNAP_SHIFT, PLAYHEAD_SNAP_ALWAYS, PLAYHEAD_SNAP_OFF)
 
 #: exe の隣の ``scripts`` に自分で置いた物の扱い :attr:`Preferences.scripts_move` の値
 #: 自動で移す・移すかを尋ねる・何もしない
@@ -324,6 +335,12 @@ class Preferences:
     #: 今までの値） 細かく見たい人は 8 まで下げ、短いクリップが数千本あって描くのが重い
     #: 機械では上げる 狭くすると読めない切れ端が並び、広くすると拡大しても中身が出ない
     detail_min_width: int = 24
+    #: ズームの途中で、初めて見る倍率の波形を作らず、近い倍率で作った波形を伸ばして仮に描く
+    #: ズームが止まってから作り直す 既定は切（今の見た目） 伸ばした波形は列の束ね方が違うので
+    #: 細かい山が少しずれて見える 境を越えた先の初めての倍率の 1 段で、波形を作る分（短い
+    #: クリップ 2000 本の手元の計測で 3〜6ms 遅い機械ではその数倍）を省ける ズームの
+    #: 引っかかりが気になる遅い機械の人は入れる
+    stretch_waves: bool = False
     #: 設定パネルで、行の名前（数はスライダーも）のダブルクリックで値を初期値へ戻す
     #: 既定は入（利用者の要望） 初期値を覚えていなくても戻せ、戻しても取り消せる
     #: 行の名前を続けて押しがちで、うっかり戻るのが嫌な人は切れるようにする
@@ -332,7 +349,8 @@ class Preferences:
     #: 当てる 既定は切（利用者の決定） 見た目だけを当て、打った文字は残す（テンプレートの
     #: 棚の着せ替えと同じ） 決まった文言の見出しを丸ごと当てたい人は入れる
     preset_with_text: bool = False
-    #: 同じく、画面の中の位置（X と Y）も当てる 既定は切 位置は置いた場所の事情で、
+    #: 同じく、画面の中の位置（X と Y）とグループ制御の対象レイヤー数も当てる 既定は切
+    #: どちらも置いた場所の事情で、
     #: 字幕の見た目を当てたら全部が保存した所へ寄ってしまう 決まった所に出す物を作る人は入れる
     preset_with_position: bool = False
     #: 同じく、当てる先に足してあるエフェクトを残してプリセットの物を足す 既定は切（入れ替える）
@@ -368,6 +386,18 @@ class Preferences:
     #: タイムラインの磁石とは別に切れる（利用者の要望） 既定は入 知らない人ほど中央へ
     #: 揃えにくい 1 画素ずつ自由に置きたい人は切る（Shift で一時的にも）
     preview_snap: bool = True
+    #: 目盛りで再生ヘッドを動かすときの吸い付き方（Issue #278） 距離は上の ``snap_distance``
+    #: 既定は Shift を押している間だけ吸い付く（Premiere Pro と同じ） 再生ヘッドは 1 コマずつ
+    #: 自由に動かすことの方が多く、常に吸い付くと知らない人はクリップの端の近くで合わせられない
+    #: クリップの磁石（Shift で外す）と向きを揃えたい人は「常に」、要らない人は切れる
+    playhead_snap: str = PLAYHEAD_SNAP_SHIFT
+    #: 再生ヘッドが吸い付く先 クリップの頭と終わり・キーフレームのコマ・書き出し範囲の端・
+    #: 目印（マーカー） 既定はクリップの磁石と同じ先で、目印は切 いまのタイムラインは目印を
+    #: 描かないので、見えない所で引っ掛かったように見える
+    playhead_snap_clips: bool = True
+    playhead_snap_keyframes: bool = True
+    playhead_snap_work_area: bool = True
+    playhead_snap_markers: bool = False
     #: 挿入貼り付け（Ctrl+Shift+V）で、再生ヘッドから後ろを押し出すトラック 全トラック
     #: （``all``）か、貼り先と、そこで押すクリップのリンクの相手・グループの仲間・焼き込んだ
     #: 字幕のトラックだけ（``target``）か 既定は全トラック（Premiere Pro の既定 全トラックの
@@ -421,6 +451,13 @@ class Preferences:
     #: 折り返す幅（画面の幅の何 %） 既定 90 は左右に 5% ずつの余白で、縁取りと影が画面の
     #: 端に掛からない 端まで使いたい人は 100、狭くまとめたい人は下げる
     subtitle_wrap_percent: int = 90
+    #: テンプレートの棚の〔選択中のクリップに適用〕で、今のテキストの折り返しの幅を残す（#283）
+    #: 既定は切（テンプレートと同じ見た目になる側） AviUtl と YMM4 のテンプレートの多くは
+    #: 折り返しの幅を持たないので、残すと棚の見本と違う行の分かれ方になり、知らない人ほど
+    #: 着せ替えが効いていないと受け取る 字幕の枠の幅を先に決めてから着せ替える人は入れる
+    #: 入れると、幅を使っているテキストは組み方も残す（AviUtl2 の組み方は折り返さないので、
+    #: テンプレートの組み方を取ると幅を残しても 1 行のままになる）
+    restyle_keep_wrap: bool = False
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -534,6 +571,7 @@ class PreferenceStore:
             detail_min_width=_detail_min_width(
                 data.get("detail_min_width"), plain.detail_min_width
             ),
+            stretch_waves=_flag(data.get("stretch_waves"), plain.stretch_waves),
             smooth_audio_motion=_flag(data.get("smooth_audio_motion"), plain.smooth_audio_motion),
             double_click_reset=_flag(data.get("double_click_reset"), plain.double_click_reset),
             preset_with_text=_flag(data.get("preset_with_text"), plain.preset_with_text),
@@ -555,6 +593,19 @@ class PreferenceStore:
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
             preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),
+            playhead_snap=_choice(
+                data.get("playhead_snap"), PLAYHEAD_SNAP_MODES, plain.playhead_snap
+            ),
+            playhead_snap_clips=_flag(data.get("playhead_snap_clips"), plain.playhead_snap_clips),
+            playhead_snap_keyframes=_flag(
+                data.get("playhead_snap_keyframes"), plain.playhead_snap_keyframes
+            ),
+            playhead_snap_work_area=_flag(
+                data.get("playhead_snap_work_area"), plain.playhead_snap_work_area
+            ),
+            playhead_snap_markers=_flag(
+                data.get("playhead_snap_markers"), plain.playhead_snap_markers
+            ),
             insert_paste=_choice(data.get("insert_paste"), INSERT_PASTE_MODES, plain.insert_paste),
             new_project_layers=_choice(
                 data.get("new_project_layers"), LayerMode.ALL, plain.new_project_layers
@@ -573,6 +624,7 @@ class PreferenceStore:
             subtitle_wrap_percent=_wrap_percent(
                 data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
             ),
+            restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
         )
 
     def save(self, preferences: Preferences) -> None:

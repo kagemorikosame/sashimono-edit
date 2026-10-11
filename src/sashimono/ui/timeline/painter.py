@@ -14,12 +14,22 @@ import math
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QFontMetricsF,
+    QImage,
+    QPainter,
+    QPen,
+    QStaticText,
+    QTransform,
+)
 
 from sashimono.compat.aviutl.custom_object import (
     CUSTOM_OBJECT_LABEL,
@@ -55,6 +65,7 @@ __all__ = [
     "WAVEFORM_CACHE_BYTES",
     "WAVEFORM_IMAGE_MAX_COLUMNS",
     "ClipGlance",
+    "cached_pen",
     "clear_waveform_images",
     "clip_content",
     "clip_summary",
@@ -67,6 +78,7 @@ __all__ = [
     "draw_track_background",
     "draw_track_header",
     "filmstrip_tint",
+    "forget_clip_drawing",
     "shown_track_name",
     "to_qimage",
     "track_add_button_rect",
@@ -385,13 +397,409 @@ def draw_clip(
         painter.setPen(QPen(Colors.EDITING, 2))
         painter.drawRect(clip_rect.adjusted(4, 4, -5, -5))
     else:
-        painter.setPen(QPen(Colors.SELECTION if selected else border, 2 if selected else 1))
+        painter.setPen(cached_pen(Colors.SELECTION if selected else border, 2 if selected else 1))
         painter.drawRect(clip_rect.adjusted(0, 0, -1, -1))
     painter.restore()
 
 
 #: 設定パネルが出しているクリップの外枠の太さ（画素） 選んだだけの枠は 2
 EDITING_BORDER = 3
+
+#: :func:`draw_clips` が貼る波形（鍵, 貯めてあった画像, クリップの左端の画素, 列の数, 伸ばすか）
+_WavePlan = tuple["_WaveKey", QImage | None, int, int, bool]
+
+#: :func:`draw_clips` が 1 本ずつ決める描き方（渡された 1 本分, 見た目, サムネイルの所,
+#: 波形の所, 貼る波形, 見えている所だけ作る広い波形か）
+_ClipPlan = tuple[
+    "DetailedClip", "_ClipLooks", QRect | None, QRect | None, "_WavePlan | None", bool
+]
+
+#: :func:`draw_clips` に渡す 1 本分（クリップ, 見えている矩形, 素材, サムネイル, 波形,
+#: 選んだか, 設定パネルが出しているか, シーンの名前）
+DetailedClip = tuple[
+    Clip, QRect, MediaItem | None, Filmstrip | None, Waveform | None, bool, bool, str | None
+]
+
+
+def draw_clips(
+    painter: QPainter,
+    band: TrackBand,
+    layout: TimelineLayout,
+    rate: FrameRate,
+    clips: Sequence[DetailedClip],
+    *,
+    stretch_waves: bool = False,
+) -> int:
+    """1 本のトラックの、名前まで描くクリップをまとめて描く 描く絵は :func:`draw_clip` を
+    1 本ずつ呼んだときと画素まで同じ
+
+    細い帯との境を越えて拡大すると、名前まで描くクリップが 1 回で 400 本を超える 1 本ずつ
+    :func:`draw_clip` を呼ぶと、状態の保存と戻し・色や名前を求める所・波形の鍵を求める所が
+    本数分になり、Qt が描く分（数 ms）の何倍も Python が掛かった（#260） ここでは
+    クリップごとに変わらない物（色・名前・グループの色）を貯め、状態は 1 度だけ保存する
+    トラックの中のクリップは重ならず、どの描き方もクリップの矩形の中だけを塗るので、
+    クリップごとの順（地・サムネイル・波形・名前・グループの線・枠）を守れば同じ絵になる
+
+    初めて見る倍率の波形は、描く前にまとめて作る（:meth:`_WaveformImages.build_many`）
+    ``stretch_waves`` が真なら作らず、列の数だけが違う貯めた画像を伸ばして仮に描く
+    （設定の「ズーム中は波形を伸ばして仮に描く」） 伸ばした本数を返す 呼んだ側は
+    ズームが止まってから描き直す
+    """
+    track = band.track
+    heard = track.kind is not TrackKind.VIDEO
+    gain = 10.0 ** (track.volume_db / 20.0) if heard else 1.0
+    header = float(Metrics.TRACK_HEADER_WIDTH)
+    scale, scroll = layout.pixels_per_frame, layout.scroll_frame
+    label_height = Metrics.CLIP_LABEL_HEIGHT
+
+    # 先に描く物を決め、足りない波形をまとめて作る
+    # （クリップ, 見た目, サムネイルの所, 波形の所, 貼る波形, 見えている所だけ作る広い波形か）
+    plans: list[_ClipPlan] = []
+    # 設定パネルが出している 1 本は数が少ないので、今までの描き方で描く
+    alone: list[DetailedClip] = []
+    missing: list[_WaveRequest] = []
+    queued: set[_WaveKey] = set()
+    stretched = 0
+    for entry in clips:
+        clip, rect, media, _, waveform, _, editing, scene_name = entry
+        if editing:
+            alone.append(entry)
+            continue
+        looks = _CLIP_LOOKS.get(track, clip, media, scene_name)
+        picture_rect: QRect | None = None
+        sound_rect: QRect | None = None
+        content_height = max(0, rect.height() - label_height)
+        if content_height > 4:
+            content = QRect(rect.left(), rect.top() + label_height, rect.width(), content_height)
+            picture_rect, sound_rect = _split_content(content, looks.picture, looks.sound)
+        wave: _WavePlan | None = None
+        wide = False
+        if sound_rect is not None and waveform is not None:
+            height = sound_rect.height()
+            if sound_rect.width() > 0 and height > 2:
+                # _draw_waveform と同じ式（列の数はクリップが画面で占める画素の数）
+                clip_left = header + (clip.timeline_start - scroll) * scale
+                right = header + (clip.timeline_end - scroll) * scale
+                total = max(1, math.floor(right) - math.floor(clip_left))
+                if total <= WAVEFORM_IMAGE_MAX_COLUMNS:
+                    start, end, shaping = _WAVE_SPANS.get(clip, rate, waveform.sample_rate, gain)
+                    key = _WAVEFORM_IMAGES.key(waveform, start, end, total, height, shaping.key())
+                    image = _WAVEFORM_IMAGES.lookup(key, waveform)
+                    stretch = False
+                    if image is None and end > start:
+                        nearby = _WAVEFORM_IMAGES.nearby(key, waveform) if stretch_waves else None
+                        if nearby is not None:
+                            image, stretch = nearby, True
+                            stretched += 1
+                        elif key not in queued:
+                            # 同じ画像を 2 度作って貯めると、使った量を 2 重に数える
+                            queued.add(key)
+                            missing.append((key, waveform, start, end, total, height, shaping))
+                    wave = (key, image, math.floor(clip_left), total, stretch)
+                else:
+                    wide = True
+        plans.append((entry, looks, picture_rect, sound_rect, wave, wide))
+    built: dict[_WaveKey, QImage] = {}
+    if missing:
+        for request, made in zip(missing, _WAVEFORM_IMAGES.build_many(missing), strict=True):
+            built[request[0]] = made
+
+    painter.save()
+    base_font = painter.font()
+    bodies = (Colors.VIDEO_CLIP, Colors.AUDIO_CLIP, Colors.FILTER_CLIP)
+    dims = tuple(_dimmed(body) for body in bodies)
+
+    # 描く順は 1 本の中では draw_clip と同じ（地・サムネイル・波形・名前の帯・字・グループの線・枠）
+    # 別のクリップどうしは重ならないので、同じ段をまとめて描いても絵は変わらない
+    # 切り落とす範囲が要らない段（地・帯・線・枠）は切り落とさずに描き、隣り合って同じ色の
+    # 地と帯は 1 つの矩形にまとめて塗る（重ならない矩形をまとめて塗っても画素は同じ）
+    _fill_runs(
+        painter,
+        [
+            (entry[1], bodies[looks.colour] if entry[0].enabled else dims[looks.colour])
+            for entry, looks, _, _, _, _ in plans
+        ],
+    )
+    for entry, _, picture_rect, _, _, _ in plans:
+        clip, rect, _, filmstrip, _, _, _, _ = entry
+        if picture_rect is not None and filmstrip is not None:
+            # 最後の 1 枚はクリップの外へはみ出すので、クリップの矩形で切り落とす
+            painter.setClipRect(rect)
+            _draw_tiles(painter, picture_rect, clip, rate, filmstrip, header, scale, scroll)
+    painter.setClipping(False)
+    for entry, _, _, sound_rect, wave, wide in plans:
+        clip, rect, _, _, waveform, _, _, _ = entry
+        if sound_rect is None:
+            continue
+        if wide and waveform is not None:
+            painter.setClipRect(rect)
+            _draw_waveform(painter, sound_rect, clip, layout, rate, waveform, track_gain=gain)
+            painter.setClipping(False)
+        elif wave is not None:
+            key, image, left, total, stretch = wave
+            if image is None:
+                image = built.get(key)
+            if image is not None:
+                if stretch:
+                    painter.setClipRect(rect)
+                _paste_wave(painter, sound_rect, image, left, total, stretch)
+                if stretch:
+                    painter.setClipping(False)
+    shade = Colors.CLIP_LABEL_SHADE
+    _fill_runs(
+        painter,
+        [
+            (QRect(rect.left(), rect.top(), rect.width(), label_height), shade)
+            for rect in (plan[0][1] for plan in plans)
+        ],
+    )
+    painter.setPen(cached_pen(Colors.CLIP_LABEL))
+    painter.setFont(_LABEL_TEXTS.use(base_font))
+    for entry, looks, _, _, _, _ in plans:
+        rect = entry[1]
+        # draw_clip と同じ字の所（名前の帯から左右 4 画素ずつ内側）
+        _LABEL_TEXTS.place_alone(
+            painter, QRect(rect.left() + 4, rect.top(), rect.width() - 8, label_height), looks.name
+        )
+    painter.setClipping(False)
+    for entry, looks, _, _, _, _ in plans:
+        rect = entry[1]
+        if looks.group is not None:
+            painter.fillRect(QRect(rect.left(), rect.bottom() - 3, rect.width(), 3), looks.group)
+    _draw_borders(painter, plans)
+    for clip, rect, media, filmstrip, waveform, selected, editing, scene_name in alone:
+        painter.save()
+        painter.setFont(base_font)
+        draw_clip(
+            painter,
+            clip,
+            band,
+            layout,
+            rate,
+            media=media,
+            filmstrip=filmstrip,
+            waveform=waveform,
+            selected=selected,
+            clip_rect=rect,
+            scene_name=scene_name,
+            editing=editing,
+        )
+        painter.restore()
+    painter.restore()
+    return stretched
+
+
+def _fill_runs(painter: QPainter, fills: Sequence[tuple[QRect, QColor]]) -> None:
+    """左から並んだ矩形を塗る 隙間なく続き、上下と色が同じ物は 1 つにまとめて塗る"""
+    run: QRect | None = None
+    colour: QColor | None = None
+    for rect, fill in fills:
+        if (
+            run is not None
+            and fill is colour
+            and rect.left() == run.right() + 1
+            and rect.top() == run.top()
+            and rect.height() == run.height()
+        ):
+            run.setRight(rect.right())
+            continue
+        if run is not None and colour is not None:
+            painter.fillRect(run, colour)
+        run, colour = QRect(rect), fill
+    if run is not None and colour is not None:
+        painter.fillRect(run, colour)
+
+
+def _draw_borders(painter: QPainter, plans: Sequence[_ClipPlan]) -> None:
+    """枠を描く 太さ 1 の枠は矩形の内側だけを塗るので、色ごとにまとめて切り落とさずに描く
+    選んだ物の太さ 2 の枠は矩形の外へ半分はみ出すので、1 本ずつクリップの矩形で切り落とす"""
+    borders = (Colors.VIDEO_CLIP_BORDER, Colors.AUDIO_CLIP_BORDER, Colors.FILTER_CLIP_BORDER)
+    groups: dict[int, list[QRect]] = {}
+    chosen: list[QRect] = []
+    for entry, looks, _, _, _, _ in plans:
+        rect = entry[1]
+        if entry[5]:
+            chosen.append(rect)
+        else:
+            groups.setdefault(looks.colour, []).append(rect.adjusted(0, 0, -1, -1))
+    for colour, rects in groups.items():
+        painter.setPen(cached_pen(borders[colour]))
+        painter.drawRects(rects)
+    if chosen:
+        painter.setPen(cached_pen(Colors.SELECTION, 2))
+        for rect in chosen:
+            painter.setClipRect(rect)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.setClipping(False)
+
+
+def _paste_wave(
+    painter: QPainter, rect: QRect, image: QImage, left: int, total: int, stretch: bool
+) -> None:
+    """クリップ全体の波形の画像を、見えている所へ貼る（:func:`_draw_waveform` と同じ置き方）
+
+    ``stretch`` なら列の数の違う画像を、クリップの幅（``total`` 列）へ伸ばして貼る
+    はみ出す所はクリップの矩形で切り落とす（呼ぶ側が切り落とす範囲を掛けておく）
+    """
+    height = rect.height()
+    if stretch:
+        painter.drawImage(QRectF(left, rect.top(), total, height), image)
+        return
+    offset = rect.left() - left
+    width = min(rect.width(), image.width() - max(0, offset))
+    if width <= 0:
+        return
+    painter.drawImage(
+        QPoint(rect.left() + max(0, -offset), rect.top()),
+        image,
+        QRect(max(0, offset), 0, width, height),
+    )
+
+
+def _draw_tiles(
+    painter: QPainter,
+    rect: QRect,
+    clip: Clip,
+    rate: FrameRate,
+    filmstrip: Filmstrip,
+    header: float,
+    scale: float,
+    scroll: float,
+) -> None:
+    """:func:`_draw_filmstrip` と同じ絵を、番号を整数の計算で求めて描く
+
+    サムネイルの番号は素材の時刻（分数）を間隔で割って求める 1 枚ごとに分数で
+    計算すると、境の辺りで 200 本を超えるクリップで 1ms を超える 分数の分子と分母を
+    クリップごとに求めておけば、整数の掛け算と割り算で同じ番号になる
+    """
+    if filmstrip.count == 0 or rect.height() <= 0:
+        return
+    tile_width = max(1, int(filmstrip.tile_width * (rect.height() / filmstrip.height)))
+    steps = _TILE_STEPS.get(clip, rate, filmstrip.interval)
+    top, height = rect.top(), rect.height()
+    last = filmstrip.count - 1
+    x = rect.left()
+    while x < rect.right():
+        # layout.frame_at と同じ式
+        frame = max(0, int((x - header) / scale + scroll))
+        local = frame - clip.timeline_start
+        if steps is None:
+            index = filmstrip.index_at(clip.picture_time(local, rate))
+        else:
+            numerator, step, denominator = steps
+            index = min(max(0, (numerator + local * step) // denominator), last)
+        image = _FILMSTRIP_TILES.image(filmstrip, index) if index is not None else None
+        if image is None:
+            break
+        painter.drawImage(QRectF(x, top, tile_width, height), image)
+        x += tile_width
+
+
+class _TileSteps:
+    """サムネイルの番号を整数で求めるための値を、クリップごとに貯める
+
+    番号は ``floor((頭 + 進んだフレーム × 1 フレームの秒 × 速さ) / 間隔)``
+    ``頭 / 間隔 = a / b`` と ``1 フレームの秒 × 速さ / 間隔 = c / d`` に分けると
+    ``(a × d + 進んだフレーム × c × b) // (b × d)`` になる 返すのは
+    ``(a × d, c × b, b × d)`` 絵を止めたクリップ（``hold_at``）と間隔が 0 の束は
+    ``None`` を返し、呼ぶ側は分数で求める
+    """
+
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._entries: dict[
+            ClipId, tuple[Clip, FrameRate, Fraction, tuple[int, int, int] | None]
+        ] = {}
+
+    def get(self, clip: Clip, rate: FrameRate, interval: Fraction) -> tuple[int, int, int] | None:
+        entry = self._entries.get(clip.id)
+        # 分数を == で比べるのは軽くないので、同じ物（is）ならそこで済ませる
+        if (
+            entry is not None
+            and entry[0] is clip
+            and (entry[1] is rate or entry[1] == rate)
+            and (entry[2] is interval or entry[2] == interval)
+        ):
+            return entry[3]
+        found: tuple[int, int, int] | None = None
+        if clip.hold_at is None and interval > 0:
+            head = Fraction(clip.source_in) / interval
+            step = Fraction(rate.frame_duration) * Fraction(clip.speed) / interval
+            found = (
+                head.numerator * step.denominator,
+                step.numerator * head.denominator,
+                head.denominator * step.denominator,
+            )
+        if len(self._entries) >= self.LIMIT:
+            self._entries.clear()
+        self._entries[clip.id] = (clip, rate, interval, found)
+        return found
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_TILE_STEPS = _TileSteps()
+
+
+@dataclass(frozen=True, slots=True)
+class _ClipLooks:
+    """クリップの見た目のうち、倍率で変わらない物"""
+
+    picture: bool
+    sound: bool
+    #: 地と枠の色の番号 0 映像 1 音声 2 フィルタ・グループ制御
+    colour: int
+    name: str
+    group: QColor | None
+
+
+class _ClipLookCache:
+    """:class:`_ClipLooks` をクリップごとに貯める クリップ・素材・トラック・シーンの名前が
+    同じ物の間だけ使う（どれも書き換えると別の物になる）"""
+
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._entries: dict[
+            ClipId, tuple[Clip, MediaItem | None, Track, str | None, _ClipLooks]
+        ] = {}
+
+    def get(
+        self, track: Track, clip: Clip, media: MediaItem | None, scene_name: str | None
+    ) -> _ClipLooks:
+        entry = self._entries.get(clip.id)
+        if (
+            entry is not None
+            and entry[0] is clip
+            and entry[1] is media
+            and entry[2] is track
+            and entry[3] == scene_name
+        ):
+            return entry[4]
+        picture, sound = clip_content(track, clip, media)
+        # draw_clip と同じ決め方 色は絵を描くかで決め、フィルタとグループ制御は別の色
+        colour = 0 if picture or not sound else 1
+        if clip.is_filter or clip.is_group:
+            colour = 2
+        group: QColor | None = None
+        if clip.group_id is not None:
+            hue = int(clip.group_id[:6], 16) % 360 if _is_hex(clip.group_id[:6]) else 200
+            group = QColor.fromHsv(hue, 170, 235)
+        looks = _ClipLooks(
+            picture, sound, colour, _label_name(clip, media, scene_name, track), group
+        )
+        if len(self._entries) >= self.LIMIT:
+            self._entries.clear()
+        self._entries[clip.id] = (clip, media, track, scene_name, looks)
+        return looks
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_CLIP_LOOKS = _ClipLookCache()
 
 
 def clip_content(track: Track, clip: Clip, media: MediaItem | None) -> tuple[bool, bool]:
@@ -821,21 +1229,147 @@ def _draw_clip_label(
     if editing:
         shade.setAlpha(170)
     painter.fillRect(label_rect, shade)
+    painter.setPen(cached_pen(Colors.CLIP_LABEL))
+    _LABEL_TEXTS.draw(
+        painter,
+        label_rect.adjusted(4, 0, -4, 0),
+        _compose_name(clip, media, scene_name, voice),
+        clip_rect=rect,
+    )
 
+
+def _compose_name(
+    clip: Clip, media: MediaItem | None, scene_name: str | None, voice: str | None
+) -> str:
+    """名前の帯に書く字 シーンの名前か素材の名前に、音声の番号と速さを添える"""
     name = f"シーン: {scene_name}" if clip.scene_id is not None else _clip_name(clip, media)
     if voice is not None:
         name = f"{name}  {voice}"
     if clip.speed != 1:
         name = f"{name}  ×{float(clip.speed):g}"
-    painter.setPen(QPen(Colors.CLIP_LABEL, 1))
-    font = QFont(painter.font())
-    font.setPointSizeF(8.5)
-    painter.setFont(font)
-    painter.drawText(
-        label_rect.adjusted(4, 0, -4, 0),
-        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-        name,
-    )
+    return name
+
+
+def _label_name(clip: Clip, media: MediaItem | None, scene_name: str | None, track: Track) -> str:
+    """:func:`draw_clip` が書くのと同じ名前（音声の番号はトラックから求める）"""
+    return _compose_name(clip, media, scene_name, voice_label(track, clip, media))
+
+
+class _LabelTexts:
+    """名前の帯の字を、並べた結果を貯めて描く
+
+    ``drawText`` は呼ぶたびに字を並べ直す 細い帯との境の辺りで拡大すると、名前を描く
+    クリップが 1 回で 400 本を超え、名前だけで 17ms ほど掛かった（#260 60fps の予算の
+    ほぼ 1 コマ分） 並べた結果（``QStaticText``）を字と書体ごとに使い回せば、描くのは
+    字の絵を置く所だけになる 置く位置は ``drawText`` の上下中央・左寄せと同じ所にし、
+    矩形の外は ``drawText`` と同じく切り落とす（同じ画素になることを試験で押さえる）
+
+    書体は画面の字を 8.5 ポイントにした物 元の字が同じ間は作った物と行の高さを使い回す
+    クリップごとに写して大きさを変えるのも、400 本では 1ms を超える
+    """
+
+    #: 貯める並べ方の数の上限 名前の種類の数だけあれば足りる 超えたら全部捨てて貯め直す
+    LIMIT = 4096
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], QStaticText] = {}
+        self._base: str | None = None
+        self._font = QFont()
+        self._font_key = ""
+        self._height = 0.0
+        #: 並べ直した回数 試験が、同じ名前を描き直しても並べ直さないことを数える
+        self.prepared = 0
+
+    def draw(self, painter: QPainter, rect: QRect, text: str, *, clip_rect: QRect) -> None:
+        """画家の今の字を元に、``rect`` の中へ ``text`` を描く（1 本ずつ描くとき）"""
+        painter.setFont(self.use(painter.font()))
+        self.place(painter, rect, text, clip_rect=clip_rect)
+
+    def use(self, base: QFont) -> QFont:
+        """元の字を ``base`` にして、名前の帯の字を返す まとめて描くときは 1 度だけ呼ぶ
+
+        書体は中身（key）で見分ける QFont の hash と == は中身の一部しか見ないことがあり、
+        同じ書体を別の物と見て並べ直したり、違う書体を同じ物と見たりする key は軽くない
+        （1 回数 µs）ので、まとめて描くときに 1 本ずつ呼ばない
+        """
+        base_key = base.key()
+        if base_key != self._base:
+            font = QFont(base)
+            font.setPointSizeF(8.5)
+            self._base, self._font = base_key, font
+            self._height = QFontMetricsF(font).height()
+            self._font_key = font.key()
+        return self._font
+
+    def place_alone(self, painter: QPainter, rect: QRect, text: str) -> None:
+        """:meth:`place` と同じ所へ描く 切り落とす範囲は ``rect`` だけにして、戻さない
+
+        ``rect`` がクリップの矩形の中にあれば、クリップの矩形と重ねて切り落とすのと同じ
+        まとめて描くとき（:func:`draw_clips`）は、切り落とす範囲を戻す 1 回が要らない
+        """
+        static = self._static(rect, text)
+        if static is None:
+            return
+        painter.setClipRect(rect)
+        painter.drawStaticText(
+            QPointF(rect.left(), rect.top() + (rect.height() - self._height) / 2), static
+        )
+
+    def _static(self, rect: QRect, text: str) -> QStaticText | None:
+        if rect.width() <= 0 or not text:
+            return None
+        key = (text, self._font_key)
+        static = self._entries.get(key)
+        if static is None:
+            if len(self._entries) >= self.LIMIT:
+                self._entries.clear()
+            static = QStaticText(text)
+            # 既定は字の中身で書式を決める 「<」で始まる名前が HTML として読まれないように
+            static.setTextFormat(Qt.TextFormat.PlainText)
+            static.prepare(QTransform(), self._font)
+            self._entries[key] = static
+            self.prepared += 1
+        return static
+
+    def place(self, painter: QPainter, rect: QRect, text: str, *, clip_rect: QRect) -> None:
+        """:meth:`use` で決めた字で描く 画家の字は呼ぶ側が :meth:`use` の字にしておく"""
+        static = self._static(rect, text)
+        if static is None:
+            return
+        painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
+        painter.drawStaticText(
+            QPointF(rect.left(), rect.top() + (rect.height() - self._height) / 2), static
+        )
+        # 切り落とす範囲をクリップの矩形へ戻す（draw_clip が掛けた物と同じ）
+        painter.setClipRect(clip_rect)
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._base = None
+
+
+_LABEL_TEXTS = _LabelTexts()
+
+
+def cached_pen(colour: QColor, width: float = 1, *, flat: bool = False) -> QPen:
+    """色と太さの決まったペン 同じ組の間は作った物を使い回す ``flat`` なら端を切りっぱなしにする
+
+    クリップ 1 本ごとにペンを作ると、境の辺りの 400 本で数百 µs になる 色はテーマを
+    切り替えると変わるので、色の値（rgba）も鍵に入れる
+    """
+    key = (colour.rgba(), width, flat)
+    pen = _PENS.get(key)
+    if pen is None:
+        if len(_PENS) >= 256:
+            _PENS.clear()
+        pen = QPen(colour, width)
+        if flat:
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        _PENS[key] = pen
+    return pen
+
+
+_PENS: dict[tuple[int, float, bool], QPen] = {}
 
 
 def voice_label(track: Track, clip: Clip, media: MediaItem | None) -> str | None:
@@ -901,11 +1435,68 @@ def _draw_filmstrip(
         # 秒の計算に float を混ぜないよう、まずフレーム番号（整数）へ落とす
         frame = layout.frame_at(x)
         # 描画と同じ式で引く 絵を止めたクリップで、止めた後の所に動く絵が並ばないように
-        tile = filmstrip.at(clip.picture_time(frame - clip.timeline_start, rate))
-        if tile is None:
+        index = filmstrip.index_at(clip.picture_time(frame - clip.timeline_start, rate))
+        image = _FILMSTRIP_TILES.image(filmstrip, index) if index is not None else None
+        if image is None:
             break
-        painter.drawImage(QRectF(x, rect.top(), tile_width, rect.height()), to_qimage(tile))
+        painter.drawImage(QRectF(x, rect.top(), tile_width, rect.height()), image)
         x += tile_width
+
+
+#: サムネイルの画像を貯めておく量の上限（バイト） 1 枚は高さ 72 画素で 40KB ほど
+#: 画面に並ぶ数（数百枚）と、少し前に見た所の分が入れば足りる
+FILMSTRIP_CACHE_BYTES = 32 * 1024 * 1024
+
+
+class _FilmstripTiles:
+    """サムネイルを 1 枚ずつ画像（``QImage``）にした物を、古く使った物から捨てながら貯める
+
+    描くたびに配列から画像を作ると、写しを 2 度取る 細い帯との境の辺りで拡大すると
+    サムネイルを描くクリップが 1 回で 200 本を超え、それだけで数 ms 掛かった（#260）
+    束は弱参照を取れないので、:class:`_FilmstripTints` と同じく画素の配列を弱参照で持つ
+    束を強く持つと、素材を外して解析を捨てても、ここがサムネイルを抱えてメモリが空かない
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._used = 0
+        self._entries: OrderedDict[tuple[int, int], tuple[weakref.ref[np.ndarray], QImage]] = (
+            OrderedDict()
+        )
+        #: 配列から画像を作った回数 試験が、描き直しで作り直さないことを数える
+        self.converted = 0
+
+    def image(self, filmstrip: Filmstrip, index: int) -> QImage | None:
+        sheet = filmstrip.sheet
+        key = (id(sheet), index)
+        entry = self._entries.get(key)
+        # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
+        if entry is not None and entry[0]() is sheet:
+            self._entries.move_to_end(key)
+            return entry[1]
+        if entry is not None:
+            self._drop(key)
+        tile = filmstrip.tile(index)
+        if tile is None:
+            return None
+        image = to_qimage(tile)
+        self.converted += 1
+        self._entries[key] = (weakref.ref(sheet), image)
+        self._used += image.sizeInBytes()
+        while self._used > self._budget and self._entries:
+            self._drop(next(iter(self._entries)))
+        return image
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._used = 0
+
+    def _drop(self, key: tuple[int, int]) -> None:
+        _, image = self._entries.pop(key)
+        self._used -= image.sizeInBytes()
+
+
+_FILMSTRIP_TILES = _FilmstripTiles(FILMSTRIP_CACHE_BYTES)
 
 
 def _draw_waveform(
@@ -944,15 +1535,8 @@ def _draw_waveform(
     if total_columns <= WAVEFORM_IMAGE_MAX_COLUMNS:
         # クリップの頭から数えた列で作る 見えている左端から数えると、スクロールで
         # 1 画素動くたびに列の区切りが変わり、画像を使い回せないうえ波形が揺れて見える
-        end_seconds = clip.source_in + clip.duration * rate.frame_duration * clip.speed
-        image = _WAVEFORM_IMAGES.get(
-            waveform,
-            int(clip.source_in * waveform.sample_rate),
-            int(end_seconds * waveform.sample_rate),
-            total_columns,
-            height,
-            _Shaping(clip, rate, 0.0, float(clip.duration), track_gain),
-        )
+        start, end, shaping = _WAVE_SPANS.get(clip, rate, waveform.sample_rate, track_gain)
+        image = _WAVEFORM_IMAGES.get(waveform, start, end, total_columns, height, shaping)
         if image is None:
             return
         # クリップの矩形（clip_rect_for）と同じく画素へ切り捨てた左端に揃える
@@ -1015,10 +1599,58 @@ class _Shaping:
     first: float
     last: float
     track_gain: float
+    #: :meth:`key` の値 作るときに 1 度だけ求める（エフェクトを全部なめるので軽くない）
+    _key: Hashable = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        found = shape_key(self.clip, self.track_gain)
+        # 凍った dataclass なので object 経由で入れる
+        object.__setattr__(self, "_key", None if found is None else (found, self.first, self.last))
 
     def key(self) -> Hashable:
-        found = shape_key(self.clip, self.track_gain)
-        return None if found is None else (found, self.first, self.last)
+        return self._key
+
+
+class _WaveSpans:
+    """クリップ全体の波形に使う、素材の範囲（サンプル）と効き方を、クリップごとに貯める
+
+    範囲は分数で数え、効き方の鍵はエフェクトを全部なめて作る 描くたびに求めると、
+    細い帯との境の辺りで拡大したときの 200 本を超える波形で 1ms を超えた（#260）
+    クリップは書き換えると別の物になるので、同じ物（``is``）かで見れば足りる
+    """
+
+    #: 貯めるクリップの数の上限 超えたら全部捨てて貯め直す
+    LIMIT = 8192
+
+    def __init__(self) -> None:
+        self._entries: dict[ClipId, tuple[Clip, FrameRate, int, float, int, int, _Shaping]] = {}
+
+    def get(
+        self, clip: Clip, rate: FrameRate, sample_rate: int, track_gain: float
+    ) -> tuple[int, int, _Shaping]:
+        entry = self._entries.get(clip.id)
+        if (
+            entry is not None
+            and entry[0] is clip
+            and (entry[1] is rate or entry[1] == rate)
+            and entry[2] == sample_rate
+            and entry[3] == track_gain
+        ):
+            return entry[4], entry[5], entry[6]
+        end_seconds = clip.source_in + clip.duration * rate.frame_duration * clip.speed
+        start = int(clip.source_in * sample_rate)
+        end = int(end_seconds * sample_rate)
+        shaping = _Shaping(clip, rate, 0.0, float(clip.duration), track_gain)
+        if len(self._entries) >= self.LIMIT:
+            self._entries.clear()
+        self._entries[clip.id] = (clip, rate, sample_rate, track_gain, start, end, shaping)
+        return start, end, shaping
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_WAVE_SPANS = _WaveSpans()
 
 
 class _WaveformImages:
@@ -1031,9 +1663,36 @@ class _WaveformImages:
     def __init__(self, budget: int) -> None:
         self._budget = budget
         self._used = 0
-        self._entries: OrderedDict[
-            tuple[int, int, int, int, int, int, Hashable], tuple[weakref.ref[Waveform], QImage]
-        ] = OrderedDict()
+        self._entries: OrderedDict[_WaveKey, tuple[weakref.ref[Waveform], QImage]] = OrderedDict()
+        #: 列の数だけが違う画像のうち、最後に作った物の鍵（列の数を除いた鍵ごと）
+        #: 倍率を変えた直後に、近い倍率の絵を伸ばして仮に描くのに使う（:meth:`nearby`）
+        self._latest: dict[tuple[int, int, int, int, int, Hashable], _WaveKey] = {}
+        #: 作った画像の枚数 試験と計測が、作り直した回数を数える
+        self.built = 0
+
+    @staticmethod
+    def key(
+        waveform: Waveform, start: int, end: int, columns: int, height: int, shaped: Hashable
+    ) -> _WaveKey:
+        # 色も鍵に入れる 見た目を切り替えたのに前の色の画像が残らないように
+        # 効き方も入れる 音量を変えたのに前の大きさの画像が残らないように
+        return (id(waveform), start, end, columns, height, Colors.WAVEFORM.rgba(), shaped)
+
+    def lookup(self, key: _WaveKey, waveform: Waveform) -> QImage | None:
+        """貯めた画像 無ければ ``None``（作らない）"""
+        entry = self._entries.get(key)
+        # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
+        if entry is not None and entry[0]() is waveform:
+            self._entries.move_to_end(key)
+            return entry[1]
+        if entry is not None:
+            self._drop(key)
+        return None
+
+    def nearby(self, key: _WaveKey, waveform: Waveform) -> QImage | None:
+        """列の数だけが違う、貯めてある画像 無ければ ``None``"""
+        found = self._latest.get(_without_columns(key))
+        return self.lookup(found, waveform) if found is not None else None
 
     def get(
         self,
@@ -1044,54 +1703,143 @@ class _WaveformImages:
         height: int,
         shaping: _Shaping | None = None,
     ) -> QImage | None:
-        # 色も鍵に入れる 見た目を切り替えたのに前の色の画像が残らないように
-        # 効き方も入れる 音量を変えたのに前の大きさの画像が残らないように
         shaped = shaping.key() if shaping is not None else None
-        key = (id(waveform), start, end, columns, height, Colors.WAVEFORM.rgba(), shaped)
-        entry = self._entries.get(key)
-        # id は解放された物の番号を使い回す 弱参照が同じ物を指すときだけ使う
-        if entry is not None and entry[0]() is waveform:
-            self._entries.move_to_end(key)
-            return entry[1]
-        if entry is not None:
-            self._drop(key)
+        key = self.key(waveform, start, end, columns, height, shaped)
+        found = self.lookup(key, waveform)
+        if found is not None:
+            return found
         if end <= start:
             return None
-        envelope = waveform.envelope(start, end, columns)
-        # チャンネルをまとめて 1 本の波形にする ステレオを上下に分けるのは
-        # トラックを高くしたときの表示として P2 で入れる
-        low, high = envelope[:, :, 0].min(axis=1), envelope[:, :, 1].max(axis=1)
-        if shaping is not None and shaped is not None:
-            low, high = shape_envelope(
-                low,
-                high,
-                shaping.clip,
-                shaping.rate,
-                shaping.first,
-                shaping.last,
-                track_gain=shaping.track_gain,
-            )
-        image = waveform_image(low, high, height)
+        return self.build_many([(key, waveform, start, end, columns, height, shaping)])[0]
+
+    def build_many(self, requests: Sequence[_WaveRequest]) -> list[QImage]:
+        """足りない画像をまとめて作って貯める 返す並びは ``requests`` と同じ
+
+        初めて見る倍率では何百本ものクリップの波形を作る 1 本ずつ束ねて塗ると、numpy を
+        呼ぶ回数が本数分になり、境を越えた 1 段で 12ms ほど掛かった（#260） 同じ解析の
+        範囲は :meth:`Waveform.envelopes` でまとめて束ね、同じ高さの物は横に繋いだ 1 枚に
+        塗ってから切り分ける 列ごとに塗る所は列どうしが関わらないので、1 本ずつ作った
+        画像と画素まで同じになる
+        """
+        made: dict[int, QImage] = {}
+        by_wave: dict[int, list[int]] = {}
+        for number, request in enumerate(requests):
+            by_wave.setdefault(id(request[1]), []).append(number)
+        for numbers in by_wave.values():
+            waveform = requests[numbers[0]][1]
+            envelope = waveform.envelopes([requests[n][2:5] for n in numbers])
+            # チャンネルをまとめて 1 本の波形にする ステレオを上下に分けるのは
+            # トラックを高くしたときの表示として P2 で入れる
+            lows = envelope[:, :, 0].min(axis=1)
+            highs = envelope[:, :, 1].max(axis=1)
+            by_height: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] = {}
+            cursor = 0
+            for number in numbers:
+                _, _, _, _, columns, height, shaping = requests[number]
+                low, high = lows[cursor : cursor + columns], highs[cursor : cursor + columns]
+                cursor += columns
+                if shaping is not None and shaping.key() is not None:
+                    low, high = shape_envelope(
+                        low,
+                        high,
+                        shaping.clip,
+                        shaping.rate,
+                        shaping.first,
+                        shaping.last,
+                        track_gain=shaping.track_gain,
+                    )
+                by_height.setdefault(height, []).append((number, low, high))
+            for height, parts in by_height.items():
+                for number, image in _paint_strips(parts, height):
+                    made[number] = image
+        result = [made[number] for number in range(len(requests))]
+        for request, image in zip(requests, result, strict=True):
+            self._store(request[0], request[1], image)
+        return result
+
+    def _store(self, key: _WaveKey, waveform: Waveform, image: QImage) -> None:
+        self.built += 1
         # 1 枚で上限を超える画像（高いトラックの幅の広いクリップ）は貯めずに返す
         # 貯めると、ほかを全部捨てても上限を超えたまま残る
         if image.sizeInBytes() > self._budget:
-            return image
+            return
         self._entries[key] = (weakref.ref(waveform), image)
+        self._latest[_without_columns(key)] = key
         self._used += image.sizeInBytes()
         while self._used > self._budget:
             self._drop(next(iter(self._entries)))
-        return image
 
     def clear(self) -> None:
         self._entries.clear()
+        self._latest.clear()
         self._used = 0
 
-    def _drop(self, key: tuple[int, int, int, int, int, int, Hashable]) -> None:
+    def _drop(self, key: _WaveKey) -> None:
         _, image = self._entries.pop(key)
         self._used -= image.sizeInBytes()
+        base = _without_columns(key)
+        if self._latest.get(base) == key:
+            del self._latest[base]
+
+
+#: 波形の画像の鍵（解析の番号, 頭, 終わり, 列の数, 高さ, 色, 効き方）
+_WaveKey = tuple[int, int, int, int, int, int, Hashable]
+#: まとめて作る画像の頼み（鍵, 解析, 頭, 終わり, 列の数, 高さ, 効き方）
+_WaveRequest = tuple[_WaveKey, Waveform, int, int, int, int, "_Shaping | None"]
+
+
+def _without_columns(key: _WaveKey) -> tuple[int, int, int, int, int, Hashable]:
+    return (key[0], key[1], key[2], key[4], key[5], key[6])
+
+
+#: 横に繋いで塗る 1 枚の幅の上限（画素） QImage の幅の上限（32767）より十分小さく抑える
+_STRIP_COLUMNS = 16384
+
+
+def _paint_strips(
+    parts: list[tuple[int, np.ndarray, np.ndarray]], height: int
+) -> list[tuple[int, QImage]]:
+    """同じ高さの波形を横に繋いで塗り、1 本ずつに切り分ける ``(番号, 画像)`` の並び"""
+    found: list[tuple[int, QImage]] = []
+    start = 0
+    while start < len(parts):
+        stop, width = start, 0
+        while stop < len(parts) and (
+            stop == start or width + len(parts[stop][1]) <= _STRIP_COLUMNS
+        ):
+            width += len(parts[stop][1])
+            stop += 1
+        chunk = parts[start:stop]
+        if len(chunk) == 1:
+            number, low, high = chunk[0]
+            found.append((number, waveform_image(low, high, height)))
+        else:
+            strip = waveform_image(
+                np.concatenate([low for _, low, _ in chunk]),
+                np.concatenate([high for _, _, high in chunk]),
+                height,
+            )
+            left = 0
+            for number, low, _ in chunk:
+                found.append((number, strip.copy(left, 0, len(low), height)))
+                left += len(low)
+        start = stop
+    return found
 
 
 _WAVEFORM_IMAGES = _WaveformImages(WAVEFORM_CACHE_BYTES)
+
+
+def forget_clip_drawing() -> None:
+    """クリップごとに貯めた描き方（見た目・サムネイルの番号の求め方・波形の範囲と効き方）を捨てる
+
+    どれもクリップ（と素材・トラック）を強く持つ 別のプロジェクトを開いたときに捨てないと、
+    新しいクリップで上限まで埋まるまで、前のプロジェクトがまるごとメモリに残る
+    （:meth:`TimelineView.forget_drawing` から呼ぶ）
+    """
+    _CLIP_LOOKS.clear()
+    _TILE_STEPS.clear()
+    _WAVE_SPANS.clear()
 
 
 def clear_waveform_images() -> None:
@@ -1101,6 +1849,7 @@ def clear_waveform_images() -> None:
     変えた直後の 1 回の重さを測ったつもりで、細い帯の目安を求める分が抜ける
     """
     _WAVEFORM_IMAGES.clear()
+    _WAVE_SPANS.clear()
     _WAVEFORM_LEVELS.clear()
     _FILMSTRIP_TINTS.clear()
 

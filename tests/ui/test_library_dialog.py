@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from sashimono.core.commands import AddClip, AddEffect, AddMedia, AddTrack
+from sashimono.core.commands import AddClip, AddEffect, AddMedia, AddTrack, Command
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.io.aliases import Alias, AliasStore
@@ -511,6 +511,39 @@ class TestEntrances:
         assert placed_text is not None and placed_sound is not None
         assert [e.kind for e in placed_text[1].effects if not e.fixed] == ["glow"]
         assert [e.kind for e in placed_sound[1].effects if not e.fixed] == ["audio_reverb"]
+
+    def test_the_pick_goes_through_the_same_entrance_as_the_menu(
+        self, window: MainWindow, library: Library, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 一覧から当てても、メニューから当てるのと同じ入口（apply_preset_commands #288）を通る
+        # 別の道で組み立てると、保存元の側・中身の既定値・組み合わせの決まりが一覧だけ外れる
+        from sashimono.ui.inspector import panel as panel_module
+
+        clip = window.document.project.timeline.tracks[0].clips[0]
+        window._timeline.set_selection((clip.id,))
+        QApplication.processEvents()
+        seen: list[tuple[str, str]] = []
+        real = panel_module.apply_preset_commands
+
+        def spy(
+            project: Project, track: Track, target: Clip, preset: Preset, **kwargs: object
+        ) -> list[Command]:
+            seen.append((target.id, preset.name))
+            return real(project, track, target, preset, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(panel_module, "apply_preset_commands", spy)
+
+        def fake_open(
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+        ) -> LibraryEntry:
+            return next(e for e in shown.entries(PRESET) if e.name == "赤")
+
+        monkeypatch.setattr(library_dialog, "open_library", fake_open)
+        menu = window._inspector.preset_menu()
+        assert menu is not None
+        manage = next(a for a in menu.actions() if a.data() == "manage_presets")
+        window._inspector.run_preset_action(manage)
+        assert seen == [(clip.id, "赤")]
 
     def test_the_preset_menu_opens_the_window_and_applies_the_pick(
         self, window: MainWindow, library: Library, monkeypatch: pytest.MonkeyPatch
