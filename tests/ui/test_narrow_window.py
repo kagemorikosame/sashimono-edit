@@ -352,27 +352,43 @@ def test_a_question_does_not_crush_the_input(window: MainWindow) -> None:
     _check_panels(window)
 
 
+@pytest.mark.parametrize("logged_in", [True, False])
+@pytest.mark.parametrize("boxes", [False, True])
 def test_the_wrapped_model_row_counts_in_the_minimum(
-    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch, logged_in: bool, boxes: bool
 ) -> None:
-    """AI のパネルを最小の高さまで縮めても、折り返したモデルの並びの下が重ならない
+    """AI のパネルを最小の高さまで縮めても、折り返した部品の下が重ならない
 
-    並び（FlowLayout）は狭いと 2 行に折り返すのに、最小の高さは 1 行で数えていた
-    パネルが最小まで縮められると、2 行目の分だけ下の会話の欄・質問の箱・状態の行が
-    重なって読めなくなる（質問の箱を足して最小の高さが窓を決めるようになり、表に出た）
+    並び（FlowLayout）と文を折り返す箱は、狭いと行が増えるのに、最小の高さは 1 行で
+    数えていた パネルが最小まで縮められると、増えた行の分だけ下の部品が重なって
+    読めなくなる（質問の箱を足して最小の高さが窓を決めるようになり、表に出た）
+    ログインの案内は Claude のログインが済んでいない機械（CI）でだけ出る 機械に任せると
+    手元では見えず CI でだけ重なったので、ログインの有無と承認・部品の更新の箱を決めて並べる
     """
     from sashimono.ai import AI_PACK
+    from sashimono.ai.bridge import Approval
+    from sashimono.ai.session import OutdatedClaudeCode
     from sashimono.runtime import PackageStatus, PackStatus
     from sashimono.ui.chat import ChatPanel
+    from sashimono.ui.chat import panel as panel_module
     from sashimono.ui.setup import SetupSection
     from tests.ai.conftest import FakeHost
 
     del qt_application
     status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.158"),))
     monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+    monkeypatch.setattr(panel_module, "credentials_found", lambda: logged_in)
     panel = ChatPanel(FakeHost(Project.create()))
     panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     try:
+        assert panel._login_box.isHidden() is logged_in
+        if boxes:
+            summary = "クリップを分割\n" + "clip_id=0123456789abcdef, frame=30 " * 3
+            panel._bridge._approvals.put(Approval(tool="split_clip", summary=summary, arguments={}))
+            panel._poll()
+            panel._show_outdated(OutdatedClaudeCode("2.1.259", "2.1.280"))
+            assert not panel._approval_box.isHidden()
+            assert not panel._update_box.isHidden()
         panel.show()
         # 並びが 1 行に収まらない幅 モデルの組と深さの組が別の行へ落ちる
         width = panel.minimumSizeHint().width()

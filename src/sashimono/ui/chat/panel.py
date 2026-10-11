@@ -564,25 +564,30 @@ class ChatPanel(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt の命名規約
         super().resizeEvent(event)
-        self._fit_choices()
+        self._fit_wrapped()
 
-    def _fit_choices(self) -> None:
-        """折り返したモデルの並びの高さを、パネルの最小の高さに入れる
+    def _fit_wrapped(self) -> None:
+        """折り返す部品の、今の幅での高さを、パネルの最小の高さに入れる
 
-        並び（FlowLayout）は折り返すと 2 行になるが、最小の高さは 1 行のまま数えられる
-        パネルが最小の高さまで縮められると（質問の箱を出した狭い窓など）、2 行目の分だけ
-        下の部品が重なり、状態の行と質問の箱が重なって読めなくなった
+        モデルの並び（FlowLayout）と、文を折り返す箱（ログインの案内・承認・部品の更新）は、
+        幅が狭いと行が増えるのに、最小の高さは 1 行のまま数えられる パネルが最小の高さ
+        まで縮められると（質問の箱を出した狭い窓など）、増えた行の分だけ下の部品が重なる
+        並びだけを見ていたときは、ログインの済んでいない機械（CI）で案内の箱が並びに重なった
+        箱の文は出し入れのたびに変わるので、状態を当て直す所（_refresh_status）からも呼ぶ
         """
         width = self.width()
         layout = self.layout()
         if layout is not None:
             margins = layout.contentsMargins()
             width -= margins.left() + margins.right()
-        # isVisible ではなく isHidden で見る 別のタブの裏にいる間に窓を縮められても、
-        # 前に出したときの高さが合っているように
-        need = self._choices.heightForWidth(width) if not self._choices.isHidden() else -1
-        if need > 0 and self._choices.minimumHeight() != need:
-            self._choices.setMinimumHeight(need)
+        for part in (self._choices, self._login_box, self._approval_box, self._update_box):
+            # isVisible ではなく isHidden で見る 別のタブの裏にいる間に窓を縮められても、
+            # 前に出したときの高さが合っているように
+            if part.isHidden():
+                continue
+            need = part.heightForWidth(width)
+            if need > 0 and part.minimumHeight() != need:
+                part.setMinimumHeight(need)
 
     # --- 状態 ---
 
@@ -1363,6 +1368,8 @@ class ChatPanel(QWidget):
         if self._send_button.text() != label:
             self._send_button.setText(label)
         self._mark_dock(working)
+        # 承認の箱やログインの案内を出し入れした後も、折り返した高さを最小に入れておく
+        self._fit_wrapped()
 
     def _mark_dock(self, working: bool) -> None:
         """入れてあるドックのタブの名前に、実行中だけ印を付ける
