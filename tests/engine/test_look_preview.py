@@ -99,6 +99,28 @@ class TestSimple:
         assert picture.image[:, :, 3].max() > 0
 
 
+def test_stopping_drops_the_queue_instead_of_drawing_it_all(
+    qt_application: QApplication,
+) -> None:
+    # 止まれの合図を列の末尾に入れるだけだと、数百件頼んだ後に設定を変える・閉じると、
+    # 残りを全部描き終えるまで画面のスレッドが止まった 時間ではなく描いた数で見る
+    from PySide6.QtCore import Qt
+
+    worker = LookWorker(gpu=False)
+    drawn: list[str] = []
+    worker.drawn.connect(lambda key, _result: drawn.append(key), Qt.ConnectionType.DirectConnection)
+    worker.start()
+    preset = Preset.capture("見出し", _clip())
+    for number in range(300):
+        worker.submit(str(number), preset)
+    deadline = time.monotonic() + 30
+    while not drawn and time.monotonic() < deadline:
+        time.sleep(0.001)
+    worker.stop()
+    qt_application.processEvents()
+    assert 0 < len(drawn) < 30
+
+
 @pytest.mark.usefixtures("gpu")
 def test_closing_the_renderer_hands_the_lua_back() -> None:
     # 返さないと、配布物の DLL を読んだランタイム（手放せない）が描画係の数だけ積み上がる

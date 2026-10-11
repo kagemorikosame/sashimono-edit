@@ -91,6 +91,9 @@ class LibraryEntry:
     #: 同じ名前の旧い拡張子のファイル 一覧には出ないが、同じプリセットとして一緒に扱う
     #: 残すと、名前を変えたり消したりした後に、隠れていた旧い方が一覧に戻ってくる
     shadows: tuple[Path, ...] = ()
+    #: 一覧を出したときのファイルの中身の指紋（:func:`_files_digest`） 書き換える前に今の
+    #: ファイルと照らす ほかの窓が後から保存し直していたら、古い中身で上書きせずに断る
+    digest: str = ""
 
     @property
     def name(self) -> str:
@@ -166,14 +169,16 @@ class Library:
         """読める物だけを名前の順に 壊れた 1 つで一覧全体を出なくしない（置き場と同じ）"""
         found: list[LibraryEntry] = []
         for path in self._files(kind):
+            shadows = self._shadows(kind, path)
             try:
+                # 指紋を先に取る 読んだ後に取ると、間でほかの窓が書いた中身を、読んだ物の
+                # 指紋として持ってしまう
+                digest = _files_digest((path, *shadows))
                 item = self._load(kind, path)
                 modified = path.stat().st_mtime
             except (LibraryError, OSError):
                 continue
-            found.append(
-                LibraryEntry(kind, item, path, modified, shadows=self._shadows(kind, path))
-            )
+            found.append(LibraryEntry(kind, item, path, modified, shadows=shadows, digest=digest))
         return tuple(sorted(found, key=lambda entry: (entry.name, entry.category)))
 
     def categories(self, kind: LibraryKind) -> tuple[str, ...]:
@@ -375,10 +380,22 @@ class Library:
         return entry
 
     def _require(self, entry: LibraryEntry) -> None:
+        """一覧を出した後で、元のファイルが無くなったり書き換わったりしていないか
+
+        あるだけでは足りない ほかの窓（別の起動）が同じ名前で保存し直した後に、古い一覧の
+        項目から名前を変えると、古い中身を書いて新しい中身を消す 中身の指紋で照らす
+        """
         if not entry.path.is_file():
             raise LibraryChangedError(
                 f"「{entry.name}」が見つからない（ほかの窓で消したか、名前を変えた）"
             )
+        try:
+            now = _files_digest(entry.files)
+        except OSError as exc:
+            raise LibraryChangedError(f"「{entry.name}」を読めない（{exc}）") from exc
+        shadows = self._shadows(entry.kind, entry.path)
+        if (entry.digest and now != entry.digest) or shadows != entry.shadows:
+            raise LibraryChangedError(f"「{entry.name}」はほかの窓で保存し直された")
 
     def _files(self, kind: LibraryKind) -> list[Path]:
         if kind == PRESET:
@@ -425,9 +442,26 @@ class Library:
             return fallback
 
     def _entry(self, kind: LibraryKind, item: Item, path: Path) -> LibraryEntry:
+        shadows = self._shadows(kind, path)
         return LibraryEntry(
-            kind, item, path, path.stat().st_mtime, shadows=self._shadows(kind, path)
+            kind,
+            item,
+            path,
+            path.stat().st_mtime,
+            shadows=shadows,
+            digest=_files_digest((path, *shadows)),
         )
+
+
+def _files_digest(paths: Iterable[Path]) -> str:
+    """ファイルの中身の指紋 並びと名前も入れる（隠れた旧い写しが増えた・減ったも変化に数える）"""
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _without_ids(value: object) -> object:

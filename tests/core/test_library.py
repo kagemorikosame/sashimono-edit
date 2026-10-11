@@ -225,6 +225,41 @@ class TestAnotherWindow:
         # 黙って作り直すと、ほかの窓で消した物が戻ってくる
         assert library.entries(PRESET) == ()
 
+    def test_a_file_saved_again_elsewhere_is_not_overwritten_with_the_old_look(
+        self, library: Library, tmp_path: Path
+    ) -> None:
+        # ほかの窓が同じ名前で保存し直した後に、古い一覧の項目から書き換えると、古い中身を
+        # 書いて新しい中身を消していた（ファイルがあるだけで確かめを通っていた）
+        library.presets.save(Preset.capture("赤", _clip("前の文字")))
+        seen = _entry(library, "赤")
+        library.presets.save(Preset.capture("赤", _clip("後の文字")))
+        for action in (
+            lambda: library.rename(seen, "青"),
+            lambda: library.recategorize(seen, "別"),
+            lambda: library.delete(seen),
+            lambda: library.duplicate(seen, "写し"),
+            lambda: library.export(seen, tmp_path / "out"),
+        ):
+            with pytest.raises(LibraryChangedError):
+                action()
+        (now,) = library.entries(PRESET)
+        assert isinstance(now.item, Preset) and now.item.source is not None
+        assert now.item.source.params["text"] == "後の文字"
+        assert library.trashed(PRESET) == ()
+        # 読み直した項目からなら変えられる
+        assert library.rename(now, "青").name == "青"
+
+    def test_a_hidden_old_copy_appearing_elsewhere_counts_as_a_change(
+        self, library: Library
+    ) -> None:
+        library.presets.save(Preset.capture("赤", _clip()))
+        seen = _entry(library, "赤")
+        seen.path.with_suffix(".kmkp").write_text(
+            seen.path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        with pytest.raises(LibraryChangedError):
+            library.delete(seen)
+
 
 class TestLegacyFiles:
     def _legacy(self, library: Library, name: str, suffix: str = ".kmkp") -> Path:

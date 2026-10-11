@@ -297,7 +297,16 @@ class LookWorker(QThread):
         self._requests.put((key, item))
 
     def stop(self) -> None:
-        """描きかけの 1 枚を終えて止まる 頼んだまま描いていない物は捨てる"""
+        """描きかけの 1 枚を終えて止まる 頼んだまま描いていない物は捨てる
+
+        止まれの合図を列の末尾に入れるだけだと、数百件頼んだ後に設定を変えたり閉じたり
+        すると、残りを全部描き終えるまで画面のスレッドが止まる 先に列を空にする
+        """
+        while True:
+            try:
+                self._requests.get_nowait()
+            except queue.Empty:
+                break
         self._requests.put(None)
         self.wait()
         if self._context is not None:

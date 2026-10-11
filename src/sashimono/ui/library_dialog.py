@@ -643,8 +643,10 @@ class LibraryDialog(QDialog):
                     return None
                 return action(overwrite=True)
         except LibraryChangedError as exc:
-            self.tell("一覧が変わっていた", f"{exc}\n一覧を読み直す")
+            # 古い一覧のまま続けると、ほかの窓で直した中身を古い中身で上書きする 読み直してから
+            # 知らせる（知らせを見たときには、もう新しい一覧が出ている）
             self.refresh()
+            self.tell("一覧を読み直しました", f"{exc}\nほかで変わったので一覧を読み直しました")
         except (LibraryError, OSError) as exc:
             self.tell("できなかった", str(exc))
         return None

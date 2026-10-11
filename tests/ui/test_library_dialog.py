@@ -180,6 +180,32 @@ class TestOrganize:
         finally:
             _close(dialog)
 
+    def test_a_change_elsewhere_is_told_and_the_list_is_read_again(
+        self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dialog = _dialog(library, thumbnails)
+        try:
+            # 窓を開いた後で、ほかの窓が同じ名前で保存し直す
+            library.presets.save(Preset.capture("赤", _clip("後の文字"), category="見出し"))
+            told: list[str] = []
+            monkeypatch.setattr(dialog, "tell", lambda _t, text: told.append(text))
+            monkeypatch.setattr(dialog, "ask_text", lambda *_args: "朱")
+            dialog.select("赤")
+            dialog.rename_selected()
+            assert told and "ほかで変わったので一覧を読み直しました" in told[0]
+            assert _names(dialog) == ["赤", "青"]
+            red = next(p for p in library.presets.all() if p.name == "赤")
+            assert red.source is not None and red.source.params["text"] == "後の文字"
+            # 一覧はもう読み直してある もう 1 度押せば新しい中身のまま名前が変わる
+            dialog.select("赤")
+            dialog.rename_selected()
+            assert len(told) == 1
+            assert _names(dialog) == ["朱", "青"]
+            red = next(p for p in library.presets.all() if p.name == "朱")
+            assert red.source is not None and red.source.params["text"] == "後の文字"
+        finally:
+            _close(dialog)
+
     def test_a_new_category_can_be_typed(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
