@@ -42,6 +42,7 @@ __all__ = [
     "SUFFIX",
     "Preset",
     "PresetStore",
+    "clip_values_for",
     "default_preset_root",
 ]
 
@@ -59,6 +60,26 @@ LEGACY_SUFFIXES = (".kmkp", ".nvpreset")
 
 #: ファイル名に使えない文字 Windows の制限に合わせる
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+#: 場面切り替えの中身の種類 ``core.commands.fixed`` と同じ値（読み書きの層から命令の層を読まない）
+_TRANSITION = "transition"
+
+
+def clip_values_for(clip: Clip, *, picture: bool) -> frozenset[str]:
+    """``clip`` が読む、クリップ自身の値（不透明度・合成モード・切り抜き）の名前
+
+    設定パネルの描画の組が出す物と同じ 読まない値を保存すると、既定のままの値が
+    見た目の一部として残り、当てた先の値を上書きする（#275）
+    * 絵を描かないクリップと場面切り替えはどれも読まない
+    * フィルタとグループ制御は不透明度だけ（フィルタは掛ける前と後の混ぜ具合、グループ制御は
+      受け持つクリップへ掛ける） 合成モードと切り抜きは描き方の道に無い
+    """
+    if not picture or (clip.source is not None and clip.source.kind == _TRANSITION):
+        return frozenset()
+    if clip.is_filter or clip.is_group:
+        return frozenset({"opacity"})
+    return frozenset({"opacity", "blend_mode", "clip_to_below"})
 
 
 #: クリップ自身の値を書くときの入れ物の種類 書き方はテキストの中身と同じ ``params`` の辞書
@@ -127,9 +148,11 @@ class Preset:
 
         ``picture`` は絵を描くクリップか 偽なら不透明度・合成モード・切り抜きを持たない
         音だけのクリップの不透明度は既定のまま意味が無く、持つと絵のクリップへ当てたときに
-        向こうの不透明度を 100% へ戻してしまう ``sound`` は音を鳴らすクリップか
+        向こうの不透明度を 100% へ戻してしまう 絵を描いても読まない値（フィルタの合成モード
+        など :func:`clip_values_for`）も同じ理由で持たない ``sound`` は音を鳴らすクリップか
         どちらも、当てるときにどちらの側のエフェクトを入れ替えるかに使う
         """
+        values = clip_values_for(clip, picture=picture)
         return cls(
             name=name,
             effects=tuple(effect for effect in clip.effects if not effect.fixed),
@@ -137,9 +160,9 @@ class Preset:
             category=category,
             after_effects=tuple(effect for effect in clip.after_effects if not effect.fixed),
             fixed=tuple(effect for effect in clip.effects if effect.fixed),
-            opacity=clip.opacity if picture else None,
-            blend_mode=clip.blend_mode if picture else None,
-            clip_to_below=clip.clip_to_below if picture else None,
+            opacity=clip.opacity if "opacity" in values else None,
+            blend_mode=clip.blend_mode if "blend_mode" in values else None,
+            clip_to_below=clip.clip_to_below if "clip_to_below" in values else None,
             span=clip.duration,
             picture=picture,
             sound=sound,

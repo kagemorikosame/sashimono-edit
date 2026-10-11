@@ -423,8 +423,9 @@ class PreferencesDialog(QDialog):
         self._preset_with_position = QCheckBox("プリセットを当てるとき、位置（X・Y）も当てる", self)
         self._preset_with_position.setChecked(preferences.preset_with_position)
         self._preset_with_position.setToolTip(
-            "切っていると、当てる先のクリップの画面の中の位置はそのまま残す "
-            "入れると、保存したクリップと同じ所へ動かす（クリップの長さはどちらでも変えない）"
+            "切っていると、当てる先のクリップの画面の中の位置と、グループ制御の対象レイヤー数は"
+            "そのまま残す 入れると、保存したクリップと同じ値にする"
+            "（クリップの長さはどちらでも変えない）"
         )
         form.addRow(self._preset_with_position)
         self._preset_keep_effects = QCheckBox(

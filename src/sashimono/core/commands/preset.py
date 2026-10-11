@@ -40,13 +40,14 @@ from sashimono.core.commands.fixed import (
     fixed_effect,
     takes_picture_items,
 )
-from sashimono.core.io.presets import Preset
-from sashimono.core.model import Clip, Effect, GeneratedSource, ParamValue
+from sashimono.core.io.presets import Preset, clip_values_for
+from sashimono.core.model import GROUP_LAYERS, Clip, Effect, GeneratedSource, ParamValue
 from sashimono.core.model.fitting import fitted_value
 
 __all__ = [
     "CONTENT_PARAMS",
     "PICTURE_SIDE",
+    "PLACE_PARAMS",
     "POSITION_PARAMS",
     "SOUND_SIDE",
     "BodyOf",
@@ -78,6 +79,11 @@ CONTENT_PARAMS = frozenset(
 #: 拡大率・回転・中心は見た目なので当てる
 POSITION_PARAMS = frozenset({"pos_x", "pos_y"})
 
+#: 中身の値のうち、置いた場所の事情で決まる物 位置と同じく「位置も当てる」のときだけ当てる
+#: グループ制御の対象レイヤー数は、手前に何本のトラックがあるかで決める値で、保存した
+#: 所の数をよその所へ当てると、受け持つクリップが変わる（見た目ではなく場所の事情）
+PLACE_PARAMS = POSITION_PARAMS | {GROUP_LAYERS}
+
 #: クリップの中身を作っているエフェクト（本体）を返す手 :func:`preset_commands` を見る
 BodyOf = Callable[[Clip], Effect | None]
 
@@ -95,7 +101,7 @@ class PresetOptions:
 
     #: 文字そのもの（:data:`CONTENT_PARAMS`）も当てる
     with_text: bool = False
-    #: 画面の中の位置（:data:`POSITION_PARAMS`）も当てる
+    #: 画面の中の位置と、置いた場所の事情で決まる値（:data:`PLACE_PARAMS`）も当てる
     with_position: bool = False
     #: 当てる先に足してあるエフェクトを残し、プリセットのエフェクトを後ろへ足す
     #: 偽なら入れ替える（保存したクリップと同じ見た目にする） 前の版のプリセット
@@ -169,10 +175,10 @@ def preset_commands(
         )
     )
     commands.extend(_fixed_commands(preset, clip, chosen, fit, picture=picture, sound=sound))
-    if picture and takes_picture_items(clip):
-        # 場面切り替えとフィルタは不透明度・合成モード・切り抜きを読まない（設定パネルも
-        # 描画の組を出さない） 当てても何も変わらない段が積まれるだけ
-        commands.extend(_clip_commands(preset, clip, fit))
+    # 不透明度・合成モード・切り抜きは、当てる先が読む物だけ（:func:`clip_values_for`）
+    # 場面切り替えはどれも、フィルタとグループ制御は合成モードと切り抜きを読まない 当てても
+    # 設定パネルに出ず、何も変わらない値が残る
+    commands.extend(_clip_commands(preset, clip, fit, clip_values_for(clip, picture=picture)))
     return commands
 
 
@@ -238,7 +244,7 @@ def _source_commands(
         # 種類の違う中身は当てない テキストのクリップを図形に変えるのは置き直しで、
         # 見た目を当てる操作ではない（置き直すならエイリアス）
         return []
-    kept = set(POSITION_PARAMS) if not options.with_position else set()
+    kept = set(PLACE_PARAMS) if not options.with_position else set()
     if keep_content or not options.with_text:
         kept |= CONTENT_PARAMS
     # 土台は種類の既定の値 AviUtl や YMM4 から読んだテキストは持つ項目が少なく、当てる先の
@@ -272,6 +278,7 @@ def _effect_commands(
     side_of: Callable[[str], str],
 ) -> list[Command]:
     transition = clip.source is not None and clip.source.kind == _TRANSITION
+    saved_transition = preset.source is not None and preset.source.kind == _TRANSITION
     # 前の版のプリセットは長さを持たない それは足すだけの当て方で作られた物なので、
     # 入れ替えると、今まで足して重ねていた人の手元でエフェクトが消える
     replacing = preset.span is not None and not options.keep_effects
@@ -291,9 +298,11 @@ def _effect_commands(
         # 足してよい種類かは見ない 中身なので、エフェクトの一覧に出るかとは関係ない
         commands.append(AddEffect(clip.id, _fresh(saved_body, fit), index=0))
     for after, raw in ((False, preset.effects), (True, preset.after_effects)):
-        if after and not transition:
+        if after and not (transition and saved_transition):
             # 後の場面の列は場面切り替えだけが読む ほかのクリップへ足しても描かれず、
-            # 設定パネルにも出ないので、消すこともできない列が残る
+            # 設定パネルにも出ないので、消すこともできない列が残る 保存したクリップが
+            # 場面切り替えでなければ後の場面を持たない 空の列だからと入れ替えると、
+            # テキストの見た目を当てただけで後の場面のエフェクトが全部消える
             continue
         # 本体は上で中身として扱ったので、見た目の列からは外す
         stack = [e for e in raw if after or saved_body is None or e.id != saved_body.id]
@@ -389,15 +398,27 @@ def _fixed_commands(
 
 
 def _clip_commands(
-    preset: Preset, clip: Clip, fit: Callable[[ParamValue], ParamValue]
+    preset: Preset,
+    clip: Clip,
+    fit: Callable[[ParamValue], ParamValue],
+    reads: frozenset[str],
 ) -> list[Command]:
+    """不透明度・合成モード・切り抜き 保存したクリップが持ち、当てる先が読む物だけ"""
     commands: list[Command] = []
-    if preset.opacity is not None:
+    if preset.opacity is not None and "opacity" in reads:
         opacity = fit(preset.opacity)
         if opacity != clip.opacity:
             commands.append(SetParam(ParamPath.of_clip(clip.id, "opacity"), opacity))
-    if preset.blend_mode is not None and preset.blend_mode != clip.blend_mode:
+    if (
+        preset.blend_mode is not None
+        and "blend_mode" in reads
+        and preset.blend_mode != clip.blend_mode
+    ):
         commands.append(SetClipProperty(clip.id, "blend_mode", preset.blend_mode))
-    if preset.clip_to_below is not None and preset.clip_to_below != clip.clip_to_below:
+    if (
+        preset.clip_to_below is not None
+        and "clip_to_below" in reads
+        and preset.clip_to_below != clip.clip_to_below
+    ):
         commands.append(SetClipProperty(clip.id, "clip_to_below", preset.clip_to_below))
     return commands

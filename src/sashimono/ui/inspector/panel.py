@@ -408,16 +408,7 @@ class InspectorPanel(QWidget):
         混合トラックはクリップが絵と音の両方を持てるので、トラックの種類ではなく
         draws_picture と plays_sound で決める
         """
-        media = (
-            self._project.find_media(clip.media_id)
-            if self._project is not None and clip.media_id is not None
-            else None
-        )
-        picture = draws_picture(track, clip, media)
-        sound = (
-            clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
-        )
-        return picture, sound
+        return picture_and_sound(self._project, track, clip)
 
     def _layout_key(self) -> object:
         """欄の構成を決める物を並べた指紋 値は入れない
@@ -1442,13 +1433,12 @@ class InspectorPanel(QWidget):
         located = self._located()
         if clip is None or located is None:
             return None
-        picture, sound = self._picture_and_sound(*located)
 
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         save = menu.addAction("この見た目を保存…")
         save.setData(_SAVE_PRESET)
-        if Preset.capture("", clip, picture=picture, sound=sound).has_look:
+        if capture_preset("", self._project, *located).has_look:
             save.setToolTip(
                 "文字の見た目・足したエフェクト・描画と音声の欄・不透明度・合成モードを保存する"
             )
@@ -1491,21 +1481,20 @@ class InspectorPanel(QWidget):
         """:meth:`preset_menu` で選んだ項目を行う"""
         data = chosen.data()
         if data == _SAVE_PRESET:
-            clip = self._clip()
             located = self._located()
-            if clip is not None and located is not None:
-                picture, sound = self._picture_and_sound(*located)
-                self._save_preset(clip, picture=picture, sound=sound)
+            if located is not None:
+                self._save_preset(*located)
         elif isinstance(data, Preset):
             self._apply_preset(data)
 
-    def _save_preset(self, clip: Clip, *, picture: bool, sound: bool) -> None:
+    def _save_preset(self, track: Track, clip: Clip) -> None:
+        located = (track, clip)
         name, accepted = QInputDialog.getText(
             self, "プリセットを保存", "名前", text=self._describe(clip)
         )
         if not accepted or not name.strip():
             return
-        preset = Preset.capture(name.strip(), clip, picture=picture, sound=sound)
+        preset = capture_preset(name.strip(), self._project, *located)
         if self._presets.exists(preset):
             # 黙って書き換えると、前に作ったプリセットが戻せないまま消える
             answer = QMessageBox.question(
@@ -1539,21 +1528,8 @@ class InspectorPanel(QWidget):
             if located is None:
                 continue
             track, clip = located
-            picture, sound = self._picture_and_sound(track, clip)
-            allowed = frozenset(d.kind for d in effects_for_clip(self._project, track, clip))
-            made = preset_commands(
-                preset,
-                clip,
-                picture=picture,
-                sound=sound,
-                options=self._preset_options,
-                # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
-                accepts=allowed.__contains__,
-                # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
-                # 見た目の入れ替えで消すと、何も描かないクリップが残る
-                body_of=custom_object_script,
-                side_of=_effect_side,
-                defaults_of=_source_defaults,
+            made = apply_preset_commands(
+                self._project, track, clip, preset, options=self._preset_options
             )
             if made:
                 commands.extend(made)
@@ -1689,6 +1665,54 @@ def _fraction(value: ParamValue, scale: int) -> Fraction:
     """
     number = value.static if isinstance(value, AnimatedValue) else 0.0
     return Fraction(number).limit_denominator(1_000_000) / scale
+
+
+def picture_and_sound(project: Project | None, track: Track, clip: Clip) -> tuple[bool, bool]:
+    """絵を描くクリップか・音を鳴らすクリップか（設定パネルが描画と音声の組を出すか）
+
+    混合トラックはクリップが絵と音の両方を持てるので、トラックの種類ではなく
+    draws_picture と plays_sound で決める
+    """
+    media = (
+        project.find_media(clip.media_id)
+        if project is not None and clip.media_id is not None
+        else None
+    )
+    picture = draws_picture(track, clip, media)
+    sound = clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
+    return picture, sound
+
+
+def capture_preset(name: str, project: Project | None, track: Track, clip: Clip) -> Preset:
+    """画面から保存するときのプリセット 絵と音の見分けは設定パネルと同じ"""
+    picture, sound = picture_and_sound(project, track, clip)
+    return Preset.capture(name, clip, picture=picture, sound=sound)
+
+
+def apply_preset_commands(
+    project: Project, track: Track, clip: Clip, preset: Preset, *, options: PresetOptions
+) -> list[Command]:
+    """画面から ``preset`` を ``clip`` へ当てるコマンド
+
+    コア層が自分では読めない知識（エフェクトの定義・中身の既定の値・カスタムオブジェクトの
+    見分け）をここで渡す 試験も同じ入口を通し、画面と同じ当て方を確かめる
+    """
+    picture, sound = picture_and_sound(project, track, clip)
+    allowed = frozenset(d.kind for d in effects_for_clip(project, track, clip))
+    return preset_commands(
+        preset,
+        clip,
+        picture=picture,
+        sound=sound,
+        options=options,
+        # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
+        accepts=allowed.__contains__,
+        # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
+        # 見た目の入れ替えで消すと、何も描かないクリップが残る
+        body_of=custom_object_script,
+        side_of=_effect_side,
+        defaults_of=_source_defaults,
+    )
 
 
 def _effect_side(kind: str) -> str:
