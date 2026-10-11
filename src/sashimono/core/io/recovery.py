@@ -22,8 +22,9 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -237,6 +238,9 @@ def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
 #: 退避を書いたことのある置き場を覚えるファイル（既定の置き場の中） 名前は 1 か所で持つ
 _PLACES = "places.json"
 
+#: 覚えた置き場の一覧を書き換える間に持つ錠
+_PLACES_LOCK = "places.lock"
+
 #: 覚えておく置き場の数 置き場を何度も変える人でも、ファイルが際限なく伸びない
 _PLACES_KEPT = 20
 
@@ -247,11 +251,16 @@ def remember_root(root: Path, registry: Path | None = None) -> None:
     設定の置き場だけを探すと、置き場を A から B へ変えた後に A へ書いた退避（B へ書けずに
     A へ戻した、別の窓が A のまま動いていた など）が、落ちた後に見つからない
     覚えるのは既定の置き場の中 既定の置き場は設定で動かないので、どの設定でも同じ所を読める
+
+    読んでから書き戻すまでを、プロセスの間の錠（:func:`_places_held`）で守る 守らないと、
+    違う設定の窓が同時に覚えたとき、後から書いた方が先に覚えた置き場を消す 錠を取れない・
+    書けないときは ``OSError`` を上げる（呼ぶ側が次の機会にもう 1 度覚える）
     """
-    places = remembered_roots(registry)
-    key = _root_key(root)
-    places = [Path(root), *(place for place in places if _root_key(place) != key)]
-    _write_places(places[:_PLACES_KEPT], registry)
+    with _places_held(registry):
+        places = remembered_roots(registry)
+        key = _root_key(root)
+        places = [Path(root), *(place for place in places if _root_key(place) != key)]
+        _write_places(places[:_PLACES_KEPT], registry)
 
 
 def remembered_roots(registry: Path | None = None) -> list[Path]:
@@ -273,12 +282,39 @@ def forget_empty_roots(keep: list[Path], registry: Path | None = None) -> None:
     （その窓が後で落ちたときに、探す所から外れないように）
     """
     kept = {_root_key(root) for root in keep}
-    places = remembered_roots(registry)
-    remaining = [
-        place for place in places if _root_key(place) in kept or _has_files(place / "recovery")
-    ]
-    if len(remaining) != len(places):
-        _write_places(remaining, registry)
+    # 読んでから書き戻すまでを錠で守る 守らないと、その間にほかの窓が覚えた置き場を消す
+    with _places_held(registry):
+        places = remembered_roots(registry)
+        remaining = [
+            place for place in places if _root_key(place) in kept or _has_files(place / "recovery")
+        ]
+        if len(remaining) != len(places):
+            _write_places(remaining, registry)
+
+
+#: 覚えた置き場の一覧の錠を待つ長さ（秒） 書き戻しは一瞬で終わるので、これだけ待っても
+#: 取れないのは持ち主が止まっているとき 起動や設定の反映を長く止めない
+_PLACES_WAIT = 2.0
+
+
+@contextlib.contextmanager
+def _places_held(registry: Path | None) -> Iterator[None]:
+    """覚えた置き場の一覧（``places.json``）を、プロセスの間で 1 人ずつ書き換える
+
+    錠は窓の錠と同じ仕組み（:func:`~sashimono.core.io.locks.try_hold`） 持ち主が落ちれば
+    次に取りに来た方が片付けて取り直す 待っても取れなければ ``TimeoutError``（``OSError``）
+    """
+    base = registry if registry is not None else default_state_root()
+    base.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _PLACES_WAIT
+    while (lock := try_hold(base / _PLACES_LOCK)) is None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"覚えた置き場の一覧の錠を取れない: {base / _PLACES_LOCK}")
+        time.sleep(0.01)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _root_key(root: Path) -> str:
@@ -447,7 +483,9 @@ def _path_digest(target: Path) -> str:
 
 
 def _write_atomic(path: Path, text: str) -> None:
-    temporary = path.with_name(path.name + ".writing")
+    # 仮の名前は書き手ごとに別にする 同じ名前だと、2 つのプロセスが同時に書いたときに
+    # 互いの書きかけを上書きしたり、相手が置き換えた後の仮のファイルが見つからずに落ちたりする
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.writing")
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
 

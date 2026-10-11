@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
+from sashimono.core.io.locks import try_hold
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.model import Project
 
@@ -496,6 +498,86 @@ class TestRememberedFolders:
         forget_empty_roots([tmp_path / "C"], registry)
         # B は空なので忘れる A は落ちた作業が残っている C は今使っている
         assert remembered_roots(registry) == [tmp_path / "C", tmp_path / "A"]
+
+
+class TestRememberingFromTwoWritersAtOnce:
+    """違う設定の窓が同時に覚えても、両方の置き場が残る
+
+    守らないと、後から書いた方が先に覚えた置き場を消し、その置き場で落ちた作業が
+    次の起動の復元に出ない
+    """
+
+    def test_a_writer_in_between_is_not_lost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        registry = tmp_path / "既定"
+        plain_read = recovery.remembered_roots
+        first_read = threading.Event()
+        go_on = threading.Event()
+        calls = 0
+
+        def slow_read(where: Path | None = None) -> list[Path]:
+            # 1 人目だけ、一覧を読んだ所で止まる その間に 2 人目が覚えに来る
+            nonlocal calls
+            calls += 1
+            found = plain_read(where)
+            if calls == 1:
+                first_read.set()
+                go_on.wait(timeout=5)
+            return found
+
+        monkeypatch.setattr(recovery, "remembered_roots", slow_read)
+        errors: list[BaseException] = []
+
+        def remember(root: Path) -> None:
+            try:
+                remember_root(root, registry)
+            except BaseException as exc:  # 試験の糸の中の失敗を外へ伝える
+                errors.append(exc)
+
+        first = threading.Thread(target=remember, args=(tmp_path / "A",))
+        first.start()
+        assert first_read.wait(timeout=5)
+        second = threading.Thread(target=remember, args=(tmp_path / "B",))
+        second.start()
+        # 錠が無ければ、2 人目はこの間に書き終える 錠があれば 1 人目を待つ
+        second.join(timeout=0.3)
+        go_on.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert errors == []
+        assert sorted(plain_read(registry)) == [tmp_path / "A", tmp_path / "B"]
+
+    def test_a_held_list_is_reported_not_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 錠を取れないまま黙ると、呼ぶ側が覚え直しを試みず、その置き場を見失う
+        registry = tmp_path / "既定"
+        registry.mkdir()
+        monkeypatch.setattr(recovery, "_PLACES_WAIT", 0.05)
+        held = try_hold(registry / "places.lock")
+        assert held is not None
+        try:
+            with pytest.raises(OSError):
+                remember_root(tmp_path / "A", registry)
+        finally:
+            held.release()
+
+    def test_each_writer_uses_its_own_scratch_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 仮のファイルの名前が同じだと、同時に書いた 2 人が互いの書きかけを上書きする
+        scratch: list[str] = []
+        plain_replace = Path.replace
+
+        def replace(self: Path, target: Path) -> Path:
+            scratch.append(self.name)
+            return plain_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", replace)
+        remember_root(tmp_path / "A", tmp_path / "既定")
+        remember_root(tmp_path / "B", tmp_path / "既定")
+        assert len(scratch) == 2 and scratch[0] != scratch[1]
 
 
 class TestPruningGenerations:

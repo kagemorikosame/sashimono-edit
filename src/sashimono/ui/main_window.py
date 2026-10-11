@@ -212,20 +212,29 @@ def initial_size(available: QSize) -> QSize:
     return DEFAULT_SIZE.boundedTo(available - WINDOW_FRAME)
 
 
-def about_text() -> str:
+def about_text(state_folder: str = "") -> str:
     """バージョン情報の文面 不具合の報告の「版」と「環境」の欄にそのまま写せる形
 
     置き場は環境変数の形ではなく実際の場所で出す 開発版と配った zip、Windows と
     それ以外で場所が違い、``%APPDATA%`` と書くだけでは本人の機械でどこなのかが
     分からない
+
+    退避・バックアップは設定で選んだ置き場（``state_folder`` 空なら既定）を出す 既定の
+    置き場を出すと、置き場を変えた人の報告に写したときに違う場所を案内する 選んだ置き場が
+    既定と違えば、書けないときに使う既定の置き場も添える（控えが既定の側にもありうる）
     """
+    default = userdirs.state_root()
+    chosen = Path(state_folder) if state_folder else default
+    state_line = f"退避・バックアップ: {chosen}"
+    if chosen != default:
+        state_line += f"（書けないときは {default}）"
     return "\n".join(
         (
             f"Sashimono Edit {__version__}",
             f"Python {platform.python_version()} / Qt {qVersion()} / {platform.platform()}",
             "",
             f"設定・スクリプト・テンプレート: {userdirs.config_root()}",
-            f"退避・バックアップ: {userdirs.state_root()}",
+            state_line,
             f"キャッシュ: {userdirs.cache_root()}",
             "",
             f"使い方: {MANUAL_URL}",
@@ -347,6 +356,9 @@ class MainWindow(QMainWindow):
         #: この起動で初めて復元を勧めた落ちた作業（中身の場所） 容量の片付けから外す
         #: 〔あとで決める〕を選んだ直後に消すと、「次の起動でまた出る」が守られない
         self._first_offered: set[Path] = set()
+        #: 覚えようとして覚えられなかった置き場（一覧の錠を取れなかった など） 次の退避のときに
+        #: もう 1 度覚える 黙って諦めると、この置き場で落ちた作業が次の起動の復元に出ない
+        self._unremembered: set[Path] = set()
         self._recovery = self._open_recovery(state_root_for(self._preferences))
         #: 開いているプロジェクトの錠 同じファイルを別の窓で開いたことに気付くため
         self._project_lock: HeldLock | None = None
@@ -1014,12 +1026,23 @@ class MainWindow(QMainWindow):
             else:
                 self._recovery_root = root
                 # 書く置き場を覚える 設定を後で別の置き場へ変えても、次の起動はここも探す
-                # 覚えられなくても退避は書ける（既定の置き場が書けないときだけ起こる）
-                with contextlib.suppress(OSError):
-                    remember_root(root)
+                self._remember_root(root)
                 return session
         self._recovery_root = default
         return RecoverySession(default)
+
+    def _remember_root(self, root: Path) -> None:
+        """退避を書く置き場を覚える 覚えられなければ、次の退避のときにもう 1 度覚える
+
+        覚えられなくても退避は書ける 覚えるのは、置き場を変えた後に落ちた作業を
+        次の起動で探すため
+        """
+        try:
+            remember_root(root)
+        except OSError:
+            self._unremembered.add(root)
+        else:
+            self._unremembered.discard(root)
 
     def _tell_state_fallback(self, root: Path, used: Path, exc: BaseException) -> None:
         """選んだ置き場に書けず、``used``（多くは既定の置き場）へ戻したことを知らせる
@@ -2404,6 +2427,9 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"自動退避に失敗した: {exc}", 5000)
                 return
         self._autosaved = project
+        # 前に覚えられなかった置き場を覚え直す 退避を書けた今なら、落ちたときに探す所に要る
+        for root in list(self._unremembered):
+            self._remember_root(root)
 
     def _write_recovery(self, project: Project, session: RecoverySession | None = None) -> None:
         target = session if session is not None else self._recovery
@@ -2872,7 +2898,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self) -> None:
         """版と置き場を出す 不具合の報告で最初に聞くことを 1 か所で見られるようにする"""
-        QMessageBox.about(self, "バージョン情報", about_text())
+        QMessageBox.about(self, "バージョン情報", about_text(self._preferences.state_folder))
 
     # --- AI 連携（EditorHost の実装）---
     #

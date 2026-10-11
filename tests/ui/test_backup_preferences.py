@@ -22,9 +22,12 @@ from sashimono.core.io import (
     backup_before_save,
     backup_folder,
     default_state_root,
+    remember_root,
+    remembered_roots,
 )
 from sashimono.core.io.recovery import BACKUP_GENERATIONS
 from sashimono.core.model import Project
+from sashimono.ui import main_window
 from sashimono.ui.backup_settings import (
     StateFolderField,
     confirm_backup_changes,
@@ -33,7 +36,7 @@ from sashimono.ui.backup_settings import (
     plan_trim_all,
     state_root_for,
 )
-from sashimono.ui.main_window import MainWindow
+from sashimono.ui.main_window import MainWindow, about_text
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.recovery_dialog import RecoveryDialog
 from sashimono.ui.theme import current_theme
@@ -583,5 +586,59 @@ class TestOfferingRecovery:
         try:
             created.offer_recovery()
             assert sorted(offered) == ["既定の側", "選んだ側"]
+        finally:
+            created.close()
+
+
+class TestRememberingAgain:
+    def test_a_folder_that_could_not_be_remembered_is_tried_again(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 覚えられないまま諦めると、この置き場で落ちた作業が次の起動の復元に出ない
+        del qt_application
+        chosen = tmp_path / "選んだ置き場"
+        plain = remember_root
+
+        def busy(root: Path, registry: Path | None = None) -> None:
+            raise TimeoutError("一覧の錠を取れない")
+
+        monkeypatch.setattr(main_window, "remember_root", busy)
+        created = _window(Preferences(state_folder=str(chosen)))
+        try:
+            assert chosen not in remembered_roots()
+            monkeypatch.setattr(main_window, "remember_root", plain)
+            created.execute(RenameProject("作業中"))
+            created.autosave()
+            assert chosen in remembered_roots()
+        finally:
+            created.close()
+
+
+class TestTheAboutBox:
+    def test_the_default_place_is_shown_by_default(self) -> None:
+        # 既定のままの人に別の場所を出すと、報告に写した置き場が違う
+        text = about_text()
+        assert f"退避・バックアップ: {default_state_root()}" in text
+
+    def test_the_chosen_place_is_shown(self, tmp_path: Path) -> None:
+        # 置き場を変えた人に既定の場所だけを出すと、報告に写した置き場に控えが無い
+        chosen = tmp_path / "選んだ置き場"
+        text = about_text(str(chosen))
+        assert f"退避・バックアップ: {chosen}" in text
+        # 書けないときに控えが行く既定の置き場も添える
+        assert str(default_state_root()) in text
+
+    def test_the_window_shows_its_setting(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 窓が設定を渡さないと、選んだ置き場を設定しても既定の場所が出る
+        del qt_application
+        shown: list[str] = []
+        monkeypatch.setattr(QMessageBox, "about", lambda _p, _t, text: shown.append(text))
+        chosen = tmp_path / "選んだ置き場"
+        created = _window(Preferences(state_folder=str(chosen)))
+        try:
+            created.show_about()
+            assert shown and f"退避・バックアップ: {chosen}" in shown[0]
         finally:
             created.close()
