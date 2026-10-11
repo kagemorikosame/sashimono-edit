@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -473,7 +474,7 @@ def backup_before_save(
     # 連番は時刻の後ろに付けるので、名前で並べれば古い順のまま
     # 名前は排他作成（"x"）で先に押さえる 「空いているか見てから書く」の 2 段だと、
     # 同じプロジェクトを 2 つの窓で開いて同時に保存したとき、同じ名前を選んで上書きしうる
-    stamp = f"{datetime.now():%Y%m%d-%H%M%S-%f}"
+    stamp = f"{_next_stamp():%Y%m%d-%H%M%S-%f}"
     number = 0
     copied: Path | None = None
     try:
@@ -518,21 +519,50 @@ def backup_before_save(
     return candidate
 
 
+#: この起動で最後に控えへ付けた時刻 :func:`_next_stamp` が次の時刻をこれより後にする
+_last_stamp: datetime | None = None
+_stamp_lock = threading.Lock()
+
+
+def _next_stamp() -> datetime:
+    """控えの名前に付ける時刻 この起動の中では必ず前の控えより後になる
+
+    Windows の時計の刻みは約 15ms と粗く、選んだ置き場へ書けずに既定の置き場へ控え直すと、
+    2 つの置き場の控えが同じ時刻の名前になる 同じ時刻だと、どちらが後で作った（正しい）
+    控えか名前から分からない 前と同じか前より前なら 1 マイクロ秒だけ進める
+
+    作った順を名前で持つのは、ほかの手掛かりが当てにならないため 更新時刻は元のファイルから
+    写す（``copystat``）ので作った時刻ではなく、作成時刻（ctime）も同じ粗い時計で付く
+    フォルダの中の連番は置き場ごとに数えるので、置き場をまたいでは比べられない
+    """
+    global _last_stamp
+    with _stamp_lock:
+        now = datetime.now()
+        if _last_stamp is not None and now <= _last_stamp:
+            now = _last_stamp + timedelta(microseconds=1)
+        _last_stamp = now
+        return now
+
+
 def latest_backup_folder(target: Path, roots: list[Path]) -> Path | None:
     """そのプロジェクトの控えがある置き場のうち、いちばん新しい控えのある方のフォルダ
 
     フォルダがあるかでは決めない 中身の無い控え（途中で書けなかった物）しか無いフォルダを
     開くと、別の置き場にある正しい控えへたどり着けない 使える控えが無ければ ``None``
+
+    新しさは控えの名前（時刻と連番）で比べる 名前の時刻は :func:`_next_stamp` で、同じ起動の
+    中なら後で作った方が必ず後になる 別々の起動が同じ時刻に控えた（ほとんど起きない）ときは
+    ``roots`` の先にある置き場（設定の置き場）を開く
     """
-    best: tuple[float, Path] | None = None
+    best: tuple[str, Path] | None = None
     for root in roots:
         folder = backup_folder(target, root)
         usable = [path for path in _generations(folder) if _size(path) > 0]
         if not usable:
             continue
-        stamp = _backup_stamp(usable[-1])
-        if best is None or stamp > best[0]:
-            best = (stamp, folder)
+        name = usable[-1].name
+        if best is None or name > best[0]:
+            best = (name, folder)
     return best[1] if best is not None else None
 
 

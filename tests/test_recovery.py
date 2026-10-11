@@ -173,6 +173,8 @@ class TestBackup:
                 return cls.fromtimestamp(frozen.timestamp())
 
         monkeypatch.setattr(recovery, "datetime", Stopped)
+        # 前の試験の控えの時刻より前に戻すので、この起動の控えの時刻の覚えを空にする
+        monkeypatch.setattr(recovery, "_last_stamp", None)
         target = tmp_path / "本編.sme"
         for index in range(3):
             target.write_text(str(index), "utf-8")
@@ -191,6 +193,8 @@ class TestBackup:
                 return cls(2026, 9, 12, 12, 0, 0)
 
         monkeypatch.setattr(recovery, "datetime", Stopped)
+        # 前の試験の控えの時刻より前に戻すので、この起動の控えの時刻の覚えを空にする
+        monkeypatch.setattr(recovery, "_last_stamp", None)
         target = tmp_path / "本編.sme"
         target.write_text("こちら", "utf-8")
         folder = backup_folder(target, tmp_path / "state")
@@ -670,3 +674,42 @@ class TestTheLatestBackupFolder:
 
     def test_nothing_usable_is_none(self, tmp_path: Path) -> None:
         assert latest_backup_folder(tmp_path / "本編.sme", [tmp_path]) is None
+
+    def _freeze(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """時計を止める Windows の粗い時計で、続けて控えると同じ時刻になるのと同じ"""
+        frozen = datetime(2026, 10, 11, 12, 0, 0)
+
+        class Stopped(datetime):
+            @classmethod
+            def now(cls, tz: tzinfo | None = None) -> Stopped:
+                del tz
+                return cls.fromtimestamp(frozen.timestamp())
+
+        monkeypatch.setattr(recovery, "datetime", Stopped)
+        monkeypatch.setattr(recovery, "_last_stamp", None)
+
+    def test_the_later_copy_wins_within_the_same_tick(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 選んだ置き場へ控えた直後に、同じ時刻のうちに既定の置き場へ控え直した 名前の時刻が
+        # 同じだと、先に並べた置き場の古い方を開いてしまう
+        self._freeze(monkeypatch)
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        chosen, default = tmp_path / "選んだ", tmp_path / "既定"
+        backup_before_save(target, chosen)
+        backup_before_save(target, default)
+        assert latest_backup_folder(target, [chosen, default]) == backup_folder(target, default)
+
+    def test_a_true_tie_opens_the_first_folder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 別々の起動が同じ時刻に控えた（名前まで同じ）ときは、先に並べた設定の置き場を開く
+        self._freeze(monkeypatch)
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        chosen, default = tmp_path / "選んだ", tmp_path / "既定"
+        backup_before_save(target, chosen)
+        monkeypatch.setattr(recovery, "_last_stamp", None)
+        backup_before_save(target, default)
+        assert latest_backup_folder(target, [chosen, default]) == backup_folder(target, chosen)
