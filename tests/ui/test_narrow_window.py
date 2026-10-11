@@ -303,6 +303,92 @@ def test_the_minimum_height_leaves_room_without_the_ai_parts(
     _check_panels(window)
 
 
+def test_a_question_does_not_crush_the_input(window: MainWindow) -> None:
+    """AI の質問の箱（#296）を出しても、1280x720 の画面で入力欄と会話の欄が潰れない
+
+    選択肢を上限の 4 つにし、名前と説明も上限の長さにする 箱をそのまま足すと、説明の
+    折り返しで 10 行を超え、窓の最小の高さが画面を超えるか、入力欄が 1 行より低くなって
+    答えを書けなくなる 箱は巻物にして 3 行まで縮む
+    """
+    from sashimono.ai.bridge import Question
+    from sashimono.ai.operations import (
+        CHOICES_RANGE,
+        DESCRIPTION_LIMIT,
+        LABEL_LIMIT,
+        QUESTION_LIMIT,
+        question_spec,
+    )
+    from sashimono.ui.chat import ChatPanel
+
+    chat = window.findChild(ChatPanel)
+    assert chat is not None
+    spec = question_spec(
+        {
+            "question": "問" * QUESTION_LIMIT,
+            "choices": [
+                {
+                    "label": f"{n}" + "名" * (LABEL_LIMIT - 1),
+                    "description": "説" * DESCRIPTION_LIMIT,
+                }
+                for n in range(CHOICES_RANGE[1])
+            ],
+            "multiple": True,
+        }
+    )
+    chat._show_question(Question(spec))
+    _settle()
+    assert window.minimumSizeHint().height() <= SCREENS["1280x720"].height() - FONT_HEADROOM
+    narrowest = QSize(window.minimumSizeHint().width(), SCREENS["1280x720"].height())
+    window.resize(narrowest)
+    _dock(window, "chat").raise_()
+    _settle()
+    assert window.width() == narrowest.width()
+    assert chat._question_box.isVisible()
+    for area in (chat._input, chat._view, chat._question_box):
+        assert area.height() >= area.minimumHeight(), type(area).__name__
+    # 入力欄は少なくとも 1 行が見える 潰れると、選択肢に無い答えを書けない
+    assert chat._input.height() >= chat._input.fontMetrics().lineSpacing()
+    assert _regions_overlap(window) == []
+    _check_panels(window)
+
+
+def test_the_wrapped_model_row_counts_in_the_minimum(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AI のパネルを最小の高さまで縮めても、折り返したモデルの並びの下が重ならない
+
+    並び（FlowLayout）は狭いと 2 行に折り返すのに、最小の高さは 1 行で数えていた
+    パネルが最小まで縮められると、2 行目の分だけ下の会話の欄・質問の箱・状態の行が
+    重なって読めなくなる（質問の箱を足して最小の高さが窓を決めるようになり、表に出た）
+    """
+    from sashimono.ai import AI_PACK
+    from sashimono.runtime import PackageStatus, PackStatus
+    from sashimono.ui.chat import ChatPanel
+    from sashimono.ui.setup import SetupSection
+    from tests.ai.conftest import FakeHost
+
+    del qt_application
+    status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.158"),))
+    monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+    panel = ChatPanel(FakeHost(Project.create()))
+    panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    try:
+        panel.show()
+        # 並びが 1 行に収まらない幅 モデルの組と深さの組が別の行へ落ちる
+        width = panel.minimumSizeHint().width()
+        panel.resize(width, 800)
+        _settle()
+        assert panel._choices.height() > panel._choices.minimumSizeHint().height()
+        panel.resize(width, panel.minimumSizeHint().height())
+        _settle()
+        assert panel.height() == panel.minimumSizeHint().height()
+        assert _overlaps(panel) == []
+    finally:
+        panel.close_session()
+        panel.close()
+        panel.deleteLater()
+
+
 @pytest.mark.parametrize("name", ["subtitles", "chat", "media", "inspector"])
 def test_every_panel_works_at_the_narrowest_window(window: MainWindow, name: str) -> None:
     """窓をいちばん狭くしても、どのパネルを前に出しても部品が重ならず欠けない

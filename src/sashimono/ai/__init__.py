@@ -15,7 +15,7 @@ SDK を import するのは server と session だけ 未導入でも操作の�
 チャットパネルは開けるし、導入ボタンも出せる
 """
 
-from sashimono.ai.bridge import Approval, EditorBridge
+from sashimono.ai.bridge import Approval, EditorBridge, Question
 from sashimono.ai.environment import AI_PACK
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, find_operation
@@ -28,6 +28,7 @@ __all__ = [
     "EditorHost",
     "ImageResult",
     "Operation",
+    "Question",
     "ToolError",
     "find_operation",
 ]

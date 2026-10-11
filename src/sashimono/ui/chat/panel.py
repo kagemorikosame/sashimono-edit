@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QPainter,
     QPaintEvent,
     QPen,
+    QResizeEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,9 +45,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost
+from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost, Question
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
+from sashimono.ai.operations import ASK_USER
 from sashimono.ai.session import (
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
@@ -226,6 +228,10 @@ class ChatPanel(QWidget):
         #: 会話を作ったときの置き方の方式 指示の文をこの方式で書いたので、変わったら作り直す
         self._session_mode = ""
         self._approval: Approval | None = None
+        #: 画面に出している AI からの質問（#296） 出ている間は、入力欄から送った文を答えにする
+        self._question: Question | None = None
+        #: あいまいなときに AI に質問させるか（設定） 会話を作るときに指示の文と道具へ渡す
+        self._ask_questions = True
         self._checkpoint_open = False
         #: 応答が 1 往復終わった回数 無人での確認に使う
         self._turns_done = 0
@@ -422,6 +428,8 @@ class ChatPanel(QWidget):
         approval_layout.addWidget(self._approval_text)
         approval_layout.addLayout(approval_buttons)
 
+        self._build_question_box()
+
         # 部品が古くて断られたときの案内 その場で押せる更新のボタンを添える
         # 案内の文だけだと、どこで更新するのかを探させることになる
         self._update_box = QFrame(self)
@@ -491,10 +499,90 @@ class ChatPanel(QWidget):
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._approval_box)
+        layout.addWidget(self._question_box)
         layout.addWidget(self._update_box)
         layout.addLayout(status_row)
         layout.addWidget(self._input)
         layout.addLayout(controls)
+
+    def _build_question_box(self) -> None:
+        """AI からの質問の箱（#296） 承認の箱のすぐ下に出す
+
+        箱ごと巻物にする 選択肢 4 つに説明を付けると 10 行を超え、そのまま足すと
+        1280x720 の画面で入力欄と会話の欄が潰れる 広い所では全部が見え、狭い所では
+        2 行まで縮んで巻ける
+        """
+        self._question_box = QScrollArea(self)
+        self._question_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self._question_box.setWidgetResizable(True)
+        self._question_box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 巻物の既定は縦にも広がりたがり、会話の欄から高さを奪う 中身の高さまでにする
+        self._question_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        # 最小は 2 行 3 行にすると、狭い窓では AI のパネルの最小の高さが窓の最小の高さを
+        # 決めるようになり、行の高い書体の機械で 1280x720 の画面の中身を超えうる
+        lines = 2 * self.fontMetrics().lineSpacing()
+        self._question_box.setMinimumHeight(lines + 2 * self._question_box.frameWidth())
+        self._question_box.setVisible(False)
+
+        inner = QWidget(self._question_box)
+        self._question_text = QLabel(inner)
+        self._question_text.setWordWrap(True)
+        bold = self._question_text.font()
+        bold.setBold(True)
+        self._question_text.setFont(bold)
+        # 選択肢は質問ごとに作り直す 入れ物だけを持つ
+        self._question_choices = QWidget(inner)
+        #: 複数選べる質問の、選択肢の名前とチェック 名前はボタンの文字から読み戻さない
+        #: （& を印の文字に変えて出すので、読み戻すと AI が書いた名前と食い違う）
+        self._question_checks: list[tuple[str, QCheckBox]] = []
+        choices_layout = QVBoxLayout(self._question_choices)
+        choices_layout.setContentsMargins(0, 0, 0, 0)
+        choices_layout.setSpacing(4)
+        self._question_note = QLabel(inner)
+        self._question_note.setWordWrap(True)
+        themed_style(self._question_note, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+
+        self._question_other = QPushButton("その他（入力欄に書く）", inner)
+        self._question_other.setToolTip("選択肢に無い答えを、下の入力欄に書いて送る")
+        self._question_other.clicked.connect(lambda: self._input.setFocus())
+        self._question_send = QPushButton("選んだ物で答える", inner)
+        self._question_send.clicked.connect(self._reply_checked)
+        # 狭いパネルでも 2 つのボタンが欠けないように折り返す
+        buttons = QWidget(inner)
+        buttons_layout = FlowLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addWidget(self._question_other)
+        buttons_layout.addWidget(self._question_send)
+
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(8, 6, 8, 6)
+        inner_layout.addWidget(self._question_text)
+        inner_layout.addWidget(self._question_choices)
+        inner_layout.addWidget(self._question_note)
+        inner_layout.addWidget(buttons)
+        self._question_box.setWidget(inner)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt の命名規約
+        super().resizeEvent(event)
+        self._fit_choices()
+
+    def _fit_choices(self) -> None:
+        """折り返したモデルの並びの高さを、パネルの最小の高さに入れる
+
+        並び（FlowLayout）は折り返すと 2 行になるが、最小の高さは 1 行のまま数えられる
+        パネルが最小の高さまで縮められると（質問の箱を出した狭い窓など）、2 行目の分だけ
+        下の部品が重なり、状態の行と質問の箱が重なって読めなくなった
+        """
+        width = self.width()
+        layout = self.layout()
+        if layout is not None:
+            margins = layout.contentsMargins()
+            width -= margins.left() + margins.right()
+        # isVisible ではなく isHidden で見る 別のタブの裏にいる間に窓を縮められても、
+        # 前に出したときの高さが合っているように
+        need = self._choices.heightForWidth(width) if not self._choices.isHidden() else -1
+        if need > 0 and self._choices.minimumHeight() != need:
+            self._choices.setMinimumHeight(need)
 
     # --- 状態 ---
 
@@ -595,6 +683,9 @@ class ChatPanel(QWidget):
         """本人の好み（設定画面か、前に欄の上で選んだもの）を当てる"""
         self._input.enter_sends = preferences.chat_enter_sends
         self._describe_send_key()
+        # 選び直しの当て直し（_select_choices の中の _restart_when_idle）より先に持つ
+        # 後にすると、切り替えた設定で会話を作り直す機会を逃す
+        self._ask_questions = preferences.ai_ask_questions
         self._select_choices(preferences.ai_model, preferences.ai_effort)
         self._animate = preferences.ai_busy_animation
         self._alert_when_done = preferences.ai_done_alert
@@ -640,6 +731,13 @@ class ChatPanel(QWidget):
                 "置き方の方式が変わったので、次の指示から新しい会話を始めます"
                 "（それまでのやり取りは引き継ぎません）"
             )
+        elif session.ask != self._ask_questions:
+            # 聞き返す基準と質問の道具も、会話を作るときにしか渡せない 繋ぎ直さないと、
+            # 切った人がまだ質問され、入れた人は聞き返されない
+            self._restart_session(
+                "AI が質問するかの設定が変わったので、次の指示から新しい会話を始めます"
+                "（それまでのやり取りは引き継ぎません）"
+            )
 
     def _wanted(self) -> tuple[str | None, str | None]:
         """いま選んでいる組を、会話が持つ形（空は None）で"""
@@ -675,6 +773,13 @@ class ChatPanel(QWidget):
         """入力欄の内容を送る"""
         prompt = self._input.toPlainText().strip()
         if not prompt:
+            return
+        if self._question is not None:
+            # 質問が出ている間に送った文は答え（自由な記述）にする 新しい指示として並べると、
+            # 返事を待って止まっている今の指示が終わらず、並べた指示もいつまでも始まらない
+            # 複数選べる質問なら、チェックした物も一緒に渡す
+            self._input.clear()
+            self._reply_question(self._checked_labels(), prompt)
             return
         if not self._setup.status.ready:
             self.status_message.emit("AI 連携の環境が入っていません")
@@ -739,7 +844,8 @@ class ChatPanel(QWidget):
                 self._bridge,
                 model=model,
                 effort=effort,
-                system_prompt=system_prompt(layer_mode),
+                system_prompt=system_prompt(layer_mode, ask=self._ask_questions),
+                ask=self._ask_questions,
             )
         self._session.send(prompt)
 
@@ -843,6 +949,7 @@ class ChatPanel(QWidget):
         # まず AI からの依頼を実行する ここが UI スレッド
         self._bridge.pump()
         self._check_approval()
+        self._check_question()
 
         session = self._session
         if session is not None:
@@ -896,7 +1003,10 @@ class ChatPanel(QWidget):
         elif event.kind is EventKind.TOOL_USE:
             self._turn_tools += 1
             self._tool = event.tool
-            self._note(f"▸ {event.tool} {event.detail}")
+            if event.tool != ASK_USER:
+                # 質問は箱と会話の欄の「質問」で見せる 引数の 1 行（choices=[{...}]）を
+                # 並べても読めず、同じ質問が 2 回出るように見える
+                self._note(f"▸ {event.tool} {event.detail}")
         elif event.kind is EventKind.TOOL_RESULT:
             if event.text == "失敗":
                 self._turn_failures += 1
@@ -1025,6 +1135,109 @@ class ChatPanel(QWidget):
             approval.deny()
         self._refresh_status()
 
+    # --- AI からの質問（#296） ---
+
+    def _check_question(self) -> None:
+        showing = self._question
+        if showing is not None:
+            if showing.done.is_set():
+                # 時間切れか中断でブリッジ側が畳んだ 画面からも下げ、答えずに終わったと残す
+                self._hide_question()
+                if not showing.answered:
+                    reason = showing.reason.split(" ")[0] or "答えずに終わりました"
+                    self._note(f"質問を閉じました（{reason}）")
+            return
+        question = self._bridge.take_question()
+        if question is None:
+            return
+        self._show_question(question)
+
+    def _show_question(self, question: Question) -> None:
+        self._question = question
+        spec = question.spec
+        self._question_text.setText(spec.text)
+        layout = self._question_choices.layout()
+        assert layout is not None  # 組み立てで必ず付けてある
+        while layout.count():
+            item = layout.takeAt(0)
+            old = item.widget() if item is not None else None
+            if old is not None:
+                old.deleteLater()
+        self._question_checks = []
+        for choice in spec.choices:
+            if spec.multiple:
+                check = QCheckBox(_button_text(choice.label), self._question_choices)
+                check.toggled.connect(self._refresh_question_send)
+                self._question_checks.append((choice.label, check))
+                picker: QWidget = check
+            else:
+                button = QPushButton(_button_text(choice.label), self._question_choices)
+                button.clicked.connect(
+                    lambda _checked=False, label=choice.label: self._reply_question((label,))
+                )
+                picker = button
+            picker.setToolTip(choice.description)
+            layout.addWidget(picker)
+            if choice.description:
+                # 説明はツールチップだけにしない 選択肢の違いは、押す前に読めないと選べない
+                detail = QLabel(choice.description, self._question_choices)
+                detail.setWordWrap(True)
+                detail.setContentsMargins(16, 0, 0, 0)
+                themed_style(detail, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+                layout.addWidget(detail)
+        # 入力欄から送った文は、新しい指示ではなくこの質問への答えにする 新しい指示として
+        # 扱うと、前の指示が終わるまで待たされ、その前の指示は返事を待ったまま止まる
+        if spec.free_text:
+            note = "選択肢に無い答えは、下の入力欄に書いて送ってください"
+        else:
+            note = "選択肢から選んでください"
+        self._question_note.setText(
+            f"{note} 質問が出ている間に入力欄から送った文は、この質問への答えになります"
+        )
+        self._question_other.setVisible(spec.free_text)
+        self._question_send.setVisible(spec.multiple)
+        self._refresh_question_send()
+        self._question_box.setVisible(True)
+        lines = [spec.text] + [
+            f"・{choice.label}" + (f": {choice.description}" if choice.description else "")
+            for choice in spec.choices
+        ]
+        self._say("質問", "\n".join(lines))
+        self._refresh_status()
+
+    def _refresh_question_send(self, _checked: bool = False) -> None:
+        """複数選べる質問は、1 つも選んでいない間は答えられなくする"""
+        self._question_send.setEnabled(any(check.isChecked() for _, check in self._question_checks))
+
+    def _checked_labels(self) -> tuple[str, ...]:
+        if self._question is None or not self._question.spec.multiple:
+            return ()
+        return tuple(label for label, check in self._question_checks if check.isChecked())
+
+    def _reply_checked(self) -> None:
+        self._reply_question(self._checked_labels())
+
+    def _reply_question(self, selected: tuple[str, ...], free_text: str = "") -> None:
+        """質問に答える 押したボタン・選んだ物・入力欄から送った文のどれからも来る"""
+        question = self._question
+        if question is None:
+            return
+        self._hide_question()
+        if not question.reply(selected, free_text):
+            # 押すのと同時に時間切れか中断で畳まれた AI にはもう届かない
+            self._note("質問はもう閉じていたので、答えは届きませんでした")
+            self._refresh_status()
+            return
+        parts = list(question.selected)
+        if question.free_text:
+            parts.append(question.free_text)
+        self._say("答え", "\n".join(parts))
+        self._refresh_status()
+
+    def _hide_question(self) -> None:
+        self._question = None
+        self._question_box.setVisible(False)
+
     # --- 状態の行 ---
 
     def _begin_turn(self) -> None:
@@ -1075,7 +1288,8 @@ class ChatPanel(QWidget):
                 line += f"・待ち {len(self._queued)} 件"
             return line
         approval = self._approval
-        if not self._queued and approval is None:
+        question = self._question
+        if not self._queued and approval is None and question is None:
             if self._updater.struggling:
                 # 1 回ごとには言わない（たまたま繋がらなかっただけの人を驚かせない）
                 return (
@@ -1086,6 +1300,10 @@ class ChatPanel(QWidget):
         session = self._session
         if self._stopping:
             head = "中断しています…"
+        elif question is not None:
+            # 答えるまで AI は先へ進まない 「実行中」のままだと、待たされているのが
+            # こちらの返事だと気付かない
+            head = "質問待ち"
         elif approval is not None:
             head = f"許可待ち: {approval.tool}"
         elif not self._connected and not (session is not None and session.busy):
@@ -1115,7 +1333,10 @@ class ChatPanel(QWidget):
         if self._busy_mark.isHidden() == show_mark:
             self._busy_mark.setVisible(show_mark)
         # 前の指示が終わるまで待たされることを、押す前に分かるようにする
+        # 質問が出ている間は、送った文が答えになることもボタンで言う
         label = "追加で送る" if working else "送信"
+        if self._question is not None:
+            label = "答えを送る"
         if self._send_button.text() != label:
             self._send_button.setText(label)
         self._mark_dock(working)
@@ -1183,10 +1404,21 @@ def _message_html(who: str | None, text: str) -> str:
     color = {
         "あなた": Colors.TEXT.name(),
         "Claude": Colors.ACCENT.name(),
+        # 質問は Claude から、答えは本人から 言った人と同じ色にする
+        "質問": Colors.ACCENT.name(),
+        "答え": Colors.TEXT.name(),
         "エラー": Colors.PLAYHEAD.name(),
     }.get(who, Colors.TEXT_MUTED.name())
     body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
     return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'
+
+
+def _button_text(label: str) -> str:
+    """ボタンに出す文字 Qt は & の次の文字を押し下げの印（Alt+文字）にして & を消す
+
+    AI が「BGM & 効果音」と書いた選択肢が「BGM  効果音」に見えないように重ねて逃がす
+    """
+    return label.replace("&", "&&")
 
 
 def _nothing() -> None:
