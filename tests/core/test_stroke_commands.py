@@ -25,6 +25,8 @@ from sashimono.core.commands import (
     SplitClip,
     resolve_param,
 )
+from sashimono.core.io import Preset
+from sashimono.core.io.presets import FORMAT_VERSION as PRESET_VERSION
 from sashimono.core.io.serialize import (
     FORMAT_VERSION,
     ProjectFileError,
@@ -317,6 +319,19 @@ class TestSaving:
         too_new = {**project_to_dict(project), "version": FORMAT_VERSION + 1}
         with pytest.raises(ProjectFileError, match="更新"):
             project_from_dict(too_new)
+
+    def test_a_preset_with_layers_is_not_read_by_the_old_version(self) -> None:
+        # 版 1 のままだと、前の版の本体は層を黙って捨てて読み、縁が 1 本も無い見た目を当てる
+        # 層を持つ物だけ版 2 で書き、層の無い物は前の版でも読めるよう版 1 のまま書く
+        layered = Preset(name="層", source=_text().with_strokes((_layer(7.0, "層"),)))
+        plain = Preset(name="層なし", source=_text(border_width=AnimatedValue(4.0)))
+        assert layered.to_dict()["version"] == 2
+        assert plain.to_dict()["version"] == 1
+        assert PRESET_VERSION == 2
+        back = Preset.from_dict(json.loads(json.dumps(layered.to_dict())))
+        assert back.source == layered.source
+        with pytest.raises(ProjectFileError, match="新しい形式"):
+            Preset.from_dict({**layered.to_dict(), "version": PRESET_VERSION + 1})
 
     def test_aliases_and_presets_carry_layers(self) -> None:
         # エイリアスはクリップの書き物、プリセットは中身の書き物を使う どちらも層を持ち運ぶ
