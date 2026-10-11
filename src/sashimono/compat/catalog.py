@@ -64,7 +64,9 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
     new_clip_id,
+    new_effect_id,
     new_group_id,
+    new_stroke_id,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
@@ -885,7 +887,29 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
         staying |= _TIMER_ON_RESTYLE
     params.update({name: current[name] for name in staying if name in current})
 
-    commands: list[Command] = [SetSource(clip.id, GeneratedSource(kind="text", params=params))]
+    # 縁取りの層（#272）もテンプレートの物で置き換える テンプレートに層が無ければ空にする
+    # 今のクリップの層を残すと、層を持つ字はテンプレートの縁取りの項目を読まないので、
+    # テンプレートと違う縁のまま残る 層の値と層のエフェクトの動きも、ほかの値と同じく尺に合わせる
+    strokes = tuple(
+        replace(
+            stroke,
+            params={
+                name: fitted_value(value, span, clip.duration - 1)
+                for name, value in stroke.params.items()
+            },
+            effects=tuple(
+                replace(fitted_effect(effect, span, clip.duration - 1), id=new_effect_id())
+                for effect in stroke.effects
+            ),
+            # 着せるたびに ID を振り直す 同じテンプレートを何本にも着せたときに、棚の元と
+            # 着せた先が同じ ID を持つと、どの層を指しているのか見分けが付かない
+            id=new_stroke_id(),
+        )
+        for stroke in template.clip.source.strokes
+    )
+    commands: list[Command] = [
+        SetSource(clip.id, GeneratedSource(kind="text", params=params, strokes=strokes))
+    ]
     # 固定の項目（クリップが最初から持つ欄）は外せないので残す 外そうとすると
     # 命令が断られ、着せる操作ごと取り消しになる
     commands.extend(RemoveEffect(clip.id, effect.id) for effect in clip.effects if not effect.fixed)
