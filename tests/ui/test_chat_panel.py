@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QInputMethodEvent, QTextCursor
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QFocusEvent, QImage, QInputMethodEvent, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QMessageBox, QWidget
 
 from sashimono.ai.bridge import Approval, EditorBridge
 from sashimono.ai.models import MODELS
@@ -28,9 +28,26 @@ from sashimono.ai.session import (
 from sashimono.core.commands import SetLayerMode, SplitClip
 from sashimono.core.model import LayerMode, MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
+from sashimono.ui.chat.panel import _Input
 from sashimono.ui.theme import PALETTES, THEME_DARK, THEME_LIGHT, theme_signals, use_palette
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
+
+
+@pytest.fixture(autouse=True)
+def no_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """試験の間に確かめの窓や問い合わせの窓が開いたら、その場で落とす
+
+    開いたままだと、無人の CI では誰も閉じずに試験が止まる 質問の箱（#296）は
+    パネルの中に出す物で、窓を開かないことも合わせて押さえる
+    """
+
+    def refuse(*_arguments: object, **_options: object) -> int:
+        raise AssertionError("試験の間に窓が開いた")
+
+    monkeypatch.setattr(QDialog, "exec", refuse)
+    for name in ("information", "warning", "critical", "question"):
+        monkeypatch.setattr(QMessageBox, name, refuse)
 
 
 @pytest.fixture
@@ -352,6 +369,120 @@ class TestSendKey:
         widget, _ = panel
         assert "Enter で送信" in widget._input.placeholderText()
         assert "Shift+Enter で改行" in widget._input.placeholderText()
+
+
+def _preedit(widget: QWidget, text: str) -> None:
+    """日本語入力の変換中の文字（まだ確定していない読み）を送る 空なら変換の終わり"""
+    QApplication.sendEvent(widget, QInputMethodEvent(text, []))
+
+
+def _drawn(widget: QWidget) -> QImage:
+    return widget.grab().toImage()
+
+
+class TestPlaceholderWhileConverting:
+    """日本語の変換中は案内の文を隠し、確定・取り消し・欄を離れたら戻す（#297）
+
+    Qt は文書が空なら案内の文を描く 変換中の読みは文書の外の層にあるので、
+    何もしないと読みと案内の文が重なって描かれる
+    """
+
+    def test_the_placeholder_is_hidden_while_converting(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、打っている読み「てきすと」の上に薄い案内の文が重なって読めない
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        assert widget._input.toPlainText() == ""
+        assert widget._input.placeholderText() == ""
+        assert widget._input.placeholder == placeholder
+
+    def test_what_is_drawn_while_converting_has_no_placeholder(
+        self, qt_application: QApplication
+    ) -> None:
+        # 文字の値だけでなく描かれた絵で見る 壊れると、案内の文のある欄だけ変換中の絵が違う
+        del qt_application
+        with_text, without = _Input(), _Input()
+        with_text.set_placeholder("編集の指示を書いて Enter で送信")
+        try:
+            for field in (with_text, without):
+                field.resize(320, 60)
+                _preedit(field, "てきすと")
+            assert _drawn(with_text) == _drawn(without)
+        finally:
+            with_text.deleteLater()
+            without.deleteLater()
+
+    def test_committing_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、確定して送った後の空の欄に案内の文が出ず、何を書く欄か分からなくなる
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        committed = QInputMethodEvent("", [])
+        committed.setCommitString("テキスト")
+        QApplication.sendEvent(widget._input, committed)
+        assert widget._input.toPlainText() == "テキスト"
+        widget._input.clear()
+        assert widget._input.placeholderText() == placeholder
+
+    def test_cancelling_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # Esc で取り消すと、何も確定せずに読みだけが消える 壊れると空の欄の案内の文が消えたまま
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        _preedit(widget._input, "")
+        assert widget._input.toPlainText() == ""
+        assert widget._input.placeholderText() == placeholder
+
+    def test_leaving_the_field_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 変換中に別の所を押した 壊れると、案内の文が消えたままになり、戻ってきて
+        # 押す Enter も変換の確定と取られて送れない
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        QApplication.sendEvent(widget._input, QFocusEvent(QEvent.Type.FocusOut))
+        assert widget._input.placeholderText() == placeholder
+        assert widget._input._composing is False
+
+    def test_changing_the_send_key_while_converting_keeps_it_hidden(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 変換中に設定を変えた 壊れると、新しい文面の案内の文が読みの上へ戻って重なる
+        widget, _ = panel
+        _preedit(widget._input, "てきすと")
+        widget.apply_preferences(Preferences(chat_enter_sends=False))
+        assert widget._input.placeholderText() == ""
+        _preedit(widget._input, "")
+        # 戻すときは、変えた後の正しい文面で戻る 壊れると前の押し方を案内したまま
+        assert "Ctrl+Enter で送信" in widget._input.placeholderText()
+        assert "Shift+Enter" not in widget._input.placeholderText()
+
+    def test_the_transcription_hint_hides_its_placeholder_too(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 字幕の起こしの「ヒント」欄も同じ症状が出ないかを絵で見る 1 行の欄（QLineEdit）は
+        # 変換中に案内の文を描かない作り 欄を複数行の物へ替えると、壊れて重なる
+        from sashimono.asr.service import TranscriptionService
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        del qt_application
+        dialog = TranscribeDialog(video_media, cast(TranscriptionService, object()))
+        try:
+            field = dialog._prompt
+            assert field.placeholderText()
+            _preedit(field, "てきすと")
+            with_placeholder = _drawn(field)
+            field.setPlaceholderText("")
+            assert with_placeholder == _drawn(field)
+        finally:
+            dialog.deleteLater()
 
 
 class _RecordingSession:

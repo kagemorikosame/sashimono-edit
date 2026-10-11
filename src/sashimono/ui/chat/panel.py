@@ -17,7 +17,15 @@ from collections import deque
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QInputMethodEvent, QKeyEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtGui import (
+    QColor,
+    QFocusEvent,
+    QInputMethodEvent,
+    QKeyEvent,
+    QPainter,
+    QPaintEvent,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -132,12 +140,45 @@ class _Input(QPlainTextEdit):
         self.enter_sends = True
         #: 日本語の変換の途中か 変換を確定する Enter で送らないために持つ
         self._composing = False
+        #: 案内の文（変換中は隠すので、Qt の欄とは別に本来の文面を持つ #297）
+        self._placeholder = ""
+
+    @property
+    def placeholder(self) -> str:
+        """本来の案内の文 変換中で欄から外している間も、この文面を返す"""
+        return self._placeholder
+
+    def set_placeholder(self, text: str) -> None:
+        """案内の文を変える 欄の案内の文はここからだけ変える
+
+        ``setPlaceholderText`` を直に呼ぶと、変換中に Enter の設定を変えたとき
+        隠していた案内の文が変換中の文字の上へ戻り、また重なる
+        """
+        self._placeholder = text
+        self._show_placeholder(not self._composing)
+
+    def _show_placeholder(self, shown: bool) -> None:
+        wanted = self._placeholder if shown else ""
+        if self.placeholderText() != wanted:
+            self.setPlaceholderText(wanted)
 
     def inputMethodEvent(self, event: QInputMethodEvent) -> None:  # noqa: N802 - Qt の命名規約
         # 変換中の文字（まだ確定していない読み）があるかどうかで判断する
         # 確定した瞬間は preedit が空になって届くので、そこで変換の終わりと見る
         self._composing = bool(event.preeditString())
+        # Qt は文書が空なら案内の文を描く 変換中の文字は文書の外の層で描かれるので、
+        # 隠さないと読みと変換の候補の窓に案内の文が重なって読めない（#297）
+        self._show_placeholder(not self._composing)
         super().inputMethodEvent(event)
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802 - Qt の命名規約
+        # 変換中に別の所を押すと、IME によっては preedit を空にする知らせが来ないまま
+        # 欄を離れる 畳まないと、案内の文が消えたままになり、戻ってきた次の Enter も
+        # 変換の確定と取られて送れない
+        if self._composing:
+            self._composing = False
+            self._show_placeholder(True)
+        super().focusOutEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt の命名規約
         is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
@@ -621,7 +662,7 @@ class ChatPanel(QWidget):
 
     def _describe_send_key(self) -> None:
         key = "Enter で送信 Shift+Enter で改行" if self._input.enter_sends else "Ctrl+Enter で送信"
-        self._input.setPlaceholderText(f"編集の指示を書いて {key}（例: 冒頭 10 秒を切って）")
+        self._input.set_placeholder(f"編集の指示を書いて {key}（例: 冒頭 10 秒を切って）")
 
     def _set_auto_approve(self, enabled: bool) -> None:
         self._bridge.auto_approve = enabled
