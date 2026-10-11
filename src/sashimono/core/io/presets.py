@@ -90,6 +90,12 @@ class Preset:
     #: 保存したクリップの長さ（フレーム） キーフレームを当てる先の長さへ合わせるのに使う
     #: 前の版のプリセットは持たない（``None``） そのときは合わせずにそのまま当てる
     span: int | None = None
+    #: 保存したクリップが絵を描いたか・音を鳴らしたか 当てる先のエフェクトのうち、どちらの
+    #: 側（映像・音）を入れ替えてよいかを決める 映像の見た目を保存した物で音のクリップの
+    #: 残響を消さないため 項目の無いファイルは ``None``（中身から推し量る
+    #: :func:`sashimono.core.commands.preset.origin_sides`）
+    picture: bool | None = None
+    sound: bool | None = None
 
     def __post_init__(self) -> None:
         # 足したエフェクトの列には固定の印（クリップが最初から持つ項目）を持たせない
@@ -109,13 +115,20 @@ class Preset:
 
     @classmethod
     def capture(
-        cls, name: str, clip: Clip, *, picture: bool = True, category: str = "ユーザー"
+        cls,
+        name: str,
+        clip: Clip,
+        *,
+        picture: bool = True,
+        sound: bool = False,
+        category: str = "ユーザー",
     ) -> Preset:
         """``clip`` の見た目を写したプリセット
 
         ``picture`` は絵を描くクリップか 偽なら不透明度・合成モード・切り抜きを持たない
         音だけのクリップの不透明度は既定のまま意味が無く、持つと絵のクリップへ当てたときに
-        向こうの不透明度を 100% へ戻してしまう
+        向こうの不透明度を 100% へ戻してしまう ``sound`` は音を鳴らすクリップか
+        どちらも、当てるときにどちらの側のエフェクトを入れ替えるかに使う
         """
         return cls(
             name=name,
@@ -128,6 +141,8 @@ class Preset:
             blend_mode=clip.blend_mode if picture else None,
             clip_to_below=clip.clip_to_below if picture else None,
             span=clip.duration,
+            picture=picture,
+            sound=sound,
         )
 
     @property
@@ -166,6 +181,8 @@ class Preset:
             if values
             else None,
             "span": self.span,
+            "picture": self.picture,
+            "sound": self.sound,
         }
 
     @classmethod
@@ -201,6 +218,8 @@ class Preset:
             blend_mode=blend_mode if isinstance(blend_mode, str) else None,
             clip_to_below=clip_to_below if isinstance(clip_to_below, bool) else None,
             span=span,
+            picture=_flag(data.get("picture")),
+            sound=_flag(data.get("sound")),
         )
 
     def instantiate(self) -> tuple[Effect, ...]:
@@ -213,6 +232,11 @@ class Preset:
             Effect(kind=effect.kind, params=dict(effect.params), enabled=effect.enabled)
             for effect in self.effects
         )
+
+
+def _flag(raw: object) -> bool | None:
+    """真偽の項目 無い・型が違うときは ``None``（中身から推し量る側へ回す）"""
+    return raw if isinstance(raw, bool) else None
 
 
 def _effects(data: dict[str, object], key: str) -> tuple[Effect, ...]:

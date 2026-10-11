@@ -67,7 +67,12 @@ from sashimono.core.commands.fixed import (
     fixed_effect,
     takes_picture_items,
 )
-from sashimono.core.commands.preset import PresetOptions, preset_commands
+from sashimono.core.commands.preset import (
+    PICTURE_SIDE,
+    SOUND_SIDE,
+    PresetOptions,
+    preset_commands,
+)
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.model import (
     AnimatedValue,
@@ -1437,13 +1442,13 @@ class InspectorPanel(QWidget):
         located = self._located()
         if clip is None or located is None:
             return None
-        picture, _ = self._picture_and_sound(*located)
+        picture, sound = self._picture_and_sound(*located)
 
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         save = menu.addAction("この見た目を保存…")
         save.setData(_SAVE_PRESET)
-        if Preset.capture("", clip, picture=picture).has_look:
+        if Preset.capture("", clip, picture=picture, sound=sound).has_look:
             save.setToolTip(
                 "文字の見た目・足したエフェクト・描画と音声の欄・不透明度・合成モードを保存する"
             )
@@ -1489,18 +1494,18 @@ class InspectorPanel(QWidget):
             clip = self._clip()
             located = self._located()
             if clip is not None and located is not None:
-                picture, _ = self._picture_and_sound(*located)
-                self._save_preset(clip, picture=picture)
+                picture, sound = self._picture_and_sound(*located)
+                self._save_preset(clip, picture=picture, sound=sound)
         elif isinstance(data, Preset):
             self._apply_preset(data)
 
-    def _save_preset(self, clip: Clip, *, picture: bool) -> None:
+    def _save_preset(self, clip: Clip, *, picture: bool, sound: bool) -> None:
         name, accepted = QInputDialog.getText(
             self, "プリセットを保存", "名前", text=self._describe(clip)
         )
         if not accepted or not name.strip():
             return
-        preset = Preset.capture(name.strip(), clip, picture=picture)
+        preset = Preset.capture(name.strip(), clip, picture=picture, sound=sound)
         if self._presets.exists(preset):
             # 黙って書き換えると、前に作ったプリセットが戻せないまま消える
             answer = QMessageBox.question(
@@ -1547,6 +1552,8 @@ class InspectorPanel(QWidget):
                 # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
                 # 見た目の入れ替えで消すと、何も描かないクリップが残る
                 body_of=custom_object_script,
+                side_of=_effect_side,
+                defaults_of=_source_defaults,
             )
             if made:
                 commands.extend(made)
@@ -1682,6 +1689,24 @@ def _fraction(value: ParamValue, scale: int) -> Fraction:
     """
     number = value.static if isinstance(value, AnimatedValue) else 0.0
     return Fraction(number).limit_denominator(1_000_000) / scale
+
+
+def _effect_side(kind: str) -> str:
+    """エフェクトが絵と音のどちらに掛かるか 〔＋ エフェクト〕の分け方（音を処理するか）と同じ
+
+    手元に無い種類（読めないスクリプトなど）は絵とする 音のエフェクトはどれも本体の物で、
+    手元に無いことが無い
+    """
+    definition = registry.get(kind)
+    if definition is not None and definition.audio_process is not None:
+        return SOUND_SIDE
+    return PICTURE_SIDE
+
+
+def _source_defaults(kind: str) -> dict[str, ParamValue] | None:
+    """中身の種類の既定の値 プリセットの中身を当てるときの土台 知らない種類は ``None``"""
+    definition = source_registry.get(kind)
+    return definition.default_params() if definition is not None else None
 
 
 def _heading(text: str) -> QLabel:

@@ -39,6 +39,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     Effect,
+    GeneratedSource,
     Keyframe,
     MediaItem,
     Project,
@@ -411,6 +412,95 @@ class TestManyClips:
         # 映像のクリップは入れ替わり、音のクリップは自分のエフェクトのまま
         assert [e.kind for e in text.effects if not e.fixed] == ["glow"]
         assert [e.kind for e in located[1].effects if not e.fixed] == ["audio_reverb"]
+
+
+class TestSidesAndSparseSources:
+    def test_a_look_without_effects_leaves_the_sound_effects_alone(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, audio_media: MediaItem
+    ) -> None:
+        # エフェクトの無い映像の見た目は、列が空なので「入れ替えて空にする」に当たり、
+        # 一緒に選んだ音のクリップの残響まで消えた 保存したクリップに音の側は無い
+        source_clip, target, _ = _clips(window)
+        audio_track = window.document.project.timeline.tracks[2]
+        sound = make_clip(100, 60, audio_media)
+        _run(
+            window,
+            SetParam(ParamPath.of_source(source_clip.id, "color"), RED),
+            AddMedia(audio_media),
+            AddClip(audio_track.id, sound),
+            AddEffect(sound.id, registry.require("audio_reverb").create()),
+            AddEffect(target.id, registry.require("blur").create()),
+        )
+        _select(window, source_clip.id)
+        _save(window, monkeypatch, "赤い字")
+
+        _select(window, target.id, sound.id)
+        _apply(window, "ユーザー", "赤い字")
+        _, text, _ = _clips(window)
+        located = window.document.project.timeline.locate_clip(sound.id)
+        assert located is not None
+        # 映像の側は保存した通りエフェクトの無い見た目へ 音の側は触らない
+        assert [e.kind for e in text.effects if not e.fixed] == []
+        assert [e.kind for e in located[1].effects if not e.fixed] == ["audio_reverb"]
+
+    def test_sound_looks_replace_sound_effects(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, audio_media: MediaItem
+    ) -> None:
+        # 音のクリップ同士では、音のエフェクトが入れ替わる 音の側を見分けられないと、
+        # 残響が絵の側と取り違えられて残り、遅延と重なる
+        audio_track = window.document.project.timeline.tracks[2]
+        first = make_clip(0, 60, audio_media)
+        second = make_clip(100, 60, audio_media)
+        _run(
+            window,
+            AddMedia(audio_media),
+            AddClip(audio_track.id, first),
+            AddClip(audio_track.id, second),
+            AddEffect(first.id, registry.require("audio_delay").create()),
+            AddEffect(second.id, registry.require("audio_reverb").create()),
+        )
+        _select(window, first.id)
+        _save(window, monkeypatch, "やまびこ")
+        _select(window, second.id)
+        _apply(window, "ユーザー", "やまびこ")
+        located = window.document.project.timeline.locate_clip(second.id)
+        assert located is not None
+        assert [e.kind for e in located[1].effects if not e.fixed] == ["audio_delay"]
+
+    def test_items_the_saved_text_did_not_have_go_back_to_the_defaults(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AviUtl や YMM4 から読んだテキストは持つ項目が少ない 当てる先の値を土台にすると、
+        # 保存したクリップに無い折り返しの幅やスタイルが当てる先のまま残った
+        sparse = Clip(
+            timeline_start=400,
+            duration=60,
+            source=GeneratedSource(kind="text", params={"text": "読んだ字", "color": RED}),
+        )
+        _, target, _ = _clips(window)
+        v2 = window.document.project.timeline.tracks[1]
+        _run(
+            window,
+            AddClip(v2.id, with_fixed_items(sparse, picture=True)),
+            SetParam(ParamPath.of_source(target.id, "wrap_width"), AnimatedValue(300.0)),
+            SetParam(ParamPath.of_source(target.id, "font_style"), "Light"),
+            SetParam(ParamPath.of_source(target.id, "pos_x"), AnimatedValue(80.0)),
+        )
+        _select(window, sparse.id)
+        _save(window, monkeypatch, "読んだ字")
+        _select(window, target.id)
+        _apply(window, "ユーザー", "読んだ字")
+
+        _, after, _ = _clips(window)
+        assert after.source is not None
+        params = after.source.params
+        defaults = TEXT.default_params()
+        assert params["color"] == RED
+        assert params["wrap_width"] == defaults["wrap_width"]
+        assert params["font_style"] == defaults["font_style"]
+        # 文字と位置は当てる先のまま
+        assert params["text"] == "残す文字"
+        assert params["pos_x"] == AnimatedValue(80.0)
 
 
 #: 画面の真ん中に白い円を描くだけのカスタムオブジェクト
