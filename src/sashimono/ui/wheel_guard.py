@@ -4,6 +4,15 @@ Qt の選択の欄・数値の欄・スライダーは、焦点が無くても�
 値を変える 設定パネルをホイールで送っている途中に欄の上を通ると、触ったつもりの無い
 値（フォントのスタイルや不透明度）が変わり、取り消しの段まで積まれる
 
+見張るのは、パネルの中の選択の欄（:class:`QComboBox`）・数値の欄（:class:`QAbstractSpinBox`）・
+値を変えるスライダー（:class:`QAbstractSlider` のうち :class:`QScrollBar` でない物）だけ
+次の 2 つは見張らない
+
+- スクロールバー（:class:`QScrollBar`） 送りそのもので、値を変える欄ではない パネル自身の
+  バーも、選択の欄の一覧（ポップアップ）のバーもここで外れる
+- 一覧（:class:`QAbstractItemView`）の中の部品 開いた一覧の中のホイールは一覧を送るための物で、
+  パネルへ回すと一覧が動かなくなる（フォントの欄の一覧がホイールで送れなかった）
+
 焦点はクリックか Tab で取る（:attr:`Qt.FocusPolicy.StrongFocus`） 焦点のある欄は
 今までどおりホイールで値を変える 焦点が無くても変えたい人は設定で切れる
 （:attr:`sashimono.ui.workspace.Preferences.wheel_unfocused`）
@@ -13,18 +22,36 @@ from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAbstractScrollArea,
     QAbstractSlider,
     QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QScrollBar,
     QWidget,
 )
 
 __all__ = ["WheelGuard"]
 
-#: ホイールで値の変わる部品 スクロールバーは送りそのものなので含めない
+#: ホイールで値の変わる部品 スクロールバーと一覧の中の部品は :func:`_guarded` で外す
 _VALUE_WIDGETS: tuple[type[QWidget], ...] = (QComboBox, QAbstractSpinBox, QAbstractSlider)
+
+
+def _guarded(widget: QWidget, root: QWidget) -> bool:
+    """``widget`` を見張るか スクロールバーと、``root`` までの間に一覧のある部品は見張らない"""
+    # スクロールバーを見張ると、焦点の無いバーへ一覧が回したホイールをパネルへ回して握りつぶす
+    # 選択の欄の一覧は欄の子として作られるので、パネルの下を探すと一覧のバーまで見つかる
+    if isinstance(widget, QScrollBar):
+        return False
+    # 一覧の中の欄（項目を書き換える欄など）も一覧を送るホイールの通り道にある
+    # バーでない部品が一覧に入っても一覧の送りを止めないよう、親をたどって外す
+    parent = widget.parentWidget()
+    while parent is not None and parent is not root:
+        if isinstance(parent, QAbstractItemView):
+            return False
+        parent = parent.parentWidget()
+    return True
 
 
 class WheelGuard(QObject):
@@ -43,19 +70,13 @@ class WheelGuard(QObject):
         """
         for kind in _VALUE_WIDGETS:
             for widget in root.findChildren(kind):
-                if isinstance(widget, QAbstractSlider) and widget is self._scroll_bar(widget):
+                if not _guarded(widget, root):
                     continue
                 # ホイールで焦点を取る（WheelFocus）と、送りの途中で通った欄が焦点を奪い、
                 # 次の 1 刻みから値を変えてしまう クリックと Tab だけで取る
                 if widget.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                     widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 widget.installEventFilter(self)
-
-    def _scroll_bar(self, widget: QAbstractSlider) -> QAbstractSlider | None:
-        """``widget`` が送りの縦か横のスクロールバーなら、それを返す"""
-        if widget in (self._scroll.verticalScrollBar(), self._scroll.horizontalScrollBar()):
-            return widget
-        return None
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt の命名規約
         if (
