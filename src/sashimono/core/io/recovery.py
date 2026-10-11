@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -39,6 +40,7 @@ __all__ = [
     "RecoveryEntry",
     "RecoverySession",
     "TrimItem",
+    "UnavailableRecovery",
     "backup_before_save",
     "backup_folder",
     "backups_over",
@@ -160,6 +162,31 @@ class RecoverySession:
         return folder / f"{session}.json"
 
 
+class UnavailableRecovery(RecoverySession):
+    """どの置き場にも退避を書けないときの代わり 退避は書かず、書こうとすると理由を上げる
+
+    既定の置き場まで書けないとき（権限・ドライブ）に起動や設定の反映を止めると、本人は
+    作業そのものができない 編集は続けさせ、退避のたびに書けないことを知らせる
+    """
+
+    def __init__(self, reason: str) -> None:
+        # 置き場も錠も作らない（作れないから使っている）
+        self._folder = Path("unavailable") / "recovery"
+        self.session = ""
+        self._lock = None
+        self.reason = reason
+
+    def save(self, project: Project, source: Path | None) -> None:
+        del project, source
+        raise OSError(f"退避の置き場が使えない: {self.reason}")
+
+    def clear(self) -> None:
+        """書いていないので消す物も無い"""
+
+    def close(self) -> None:
+        """書いていないので片付ける物も無い"""
+
+
 def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
     """持ち主が終わっているのに残っている退避 新しい順
 
@@ -174,10 +201,20 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
     # 退避の途中で落ちると中身だけが残る メモだけを数えるとそれを見落とす
     # 旧い拡張子の退避も拾う 改名前の版で落ちた退避は、置き場を引き継いだあと
     # 旧い拡張子のまま残っている 拾わないと、その作業は復元を勧められずに埋もれる
-    sessions = {path.stem for path in folder.glob("*.json")} | {
-        path.name.removesuffix(suffix)
-        for suffix in (SUFFIX, *LEGACY_SUFFIXES)
-        for path in folder.glob(f"*{suffix}")
+    # Sashimono が付けた名前の形（起動ごとの番号）に合う物だけを退避として扱う 本人が
+    # 同じ名前のフォルダに置いた物（「重要.json」など）を退避のメモと取り違えると、
+    # 対になる中身が無いとして消してしまう
+    sessions = {
+        session
+        for session in (
+            {path.stem for path in folder.glob("*.json")}
+            | {
+                path.name.removesuffix(suffix)
+                for suffix in (SUFFIX, *LEGACY_SUFFIXES)
+                for path in folder.glob(f"*{suffix}")
+            }
+        )
+        if _SESSION_NAME.fullmatch(session)
     }
     found: list[RecoveryEntry] = []
     for session in sessions:
@@ -529,33 +566,37 @@ def backup_before_save(
     folder = backup_folder(target, root)
     existed = folder.is_dir()
     folder.mkdir(parents=True, exist_ok=True)
+    _clear_stale_copies(folder)
     # 時刻が同じなら連番を足す Windows の Python 3.12 は時刻の刻みが約 15ms と粗く、
     # 続けて保存すると同じ名前になって前の控えを上書きしていた（CI で 3.12 だけ落ちた）
     # 連番は時刻の後ろに付けるので、名前で並べれば古い順のまま
-    # 名前は排他作成（"x"）で先に押さえる 「空いているか見てから書く」の 2 段だと、
-    # 同じプロジェクトを 2 つの窓で開いて同時に保存したとき、同じ名前を選んで上書きしうる
+    #
+    # 一時の名前（``.copying`` 世代に数えない）へ写し終えて大きさを確かめてから、最後の
+    # 名前へ置く 最後の名前で先に作って写すと、途中でプロセスや電源が落ちたときに、名前の
+    # 新しい空や途中までの控えが残り、世代数を詰めるときに古い正常な控えの方が消える
+    # 最後の名前へは排他で置く（:func:`_place_exclusive`） 「空いているか見てから置く」の
+    # 2 段だと、2 つの窓が同時に保存したときに同じ名前を選んで上書きしうる
     stamp = f"{_next_stamp():%Y%m%d-%H%M%S-%f}"
-    number = 0
-    copied: Path | None = None
+    temporary = folder / f".{stamp}-{uuid.uuid4().hex[:8]}{_COPYING}"
     try:
+        expected = target.stat().st_size
+        shutil.copyfile(target, temporary)
+        shutil.copystat(target, temporary)
+        if temporary.stat().st_size != expected:
+            raise OSError(f"控えの大きさが元と合わない: {temporary}")
+        number = 0
         while True:
             candidate = folder / f"{stamp}-{number:03d}{SUFFIX}"
-            try:
-                with candidate.open("xb"):
-                    copied = candidate
-                    break
-            except FileExistsError:
-                number += 1
-        shutil.copyfile(target, candidate)
-        shutil.copystat(target, candidate)
+            if _place_exclusive(temporary, candidate):
+                break
+            number += 1
     except OSError:
-        # 途中まで写した控えと、今作った空のフォルダを片付けてから上げる 残すと、
+        # 途中まで写した一時の控えと、今作った空のフォルダを片付けてから上げる 残すと、
         # 〔バックアップのフォルダを開く〕が不完全な控えのある方を開き、呼ぶ側が既定の
         # 置き場へ控え直した正しい物へたどり着けない 消すのは今この場で作った物だけ
         # （前からある控えとフォルダには触らない）
-        if copied is not None:
-            with contextlib.suppress(OSError):
-                copied.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
         if not existed:
             with contextlib.suppress(OSError):
                 folder.rmdir()
@@ -563,7 +604,8 @@ def backup_before_save(
 
     # 旧い拡張子の控えも世代に数える 数えないと、改名前の控えはいつまでも消えずに残り、
     # 20 本に保つ約束が崩れる 名前は時刻から始まるので、拡張子が混ざっても古い順に並ぶ
-    generations = _generations(folder)
+    # 中身の無い控え（壊れて残った物）は数えない（:func:`_usable_generations`）
+    generations = _usable_generations(folder)
     doomed = generations[: max(0, len(generations) - keep)]
     if most is not None:
         doomed = doomed[:most]
@@ -577,6 +619,55 @@ def backup_before_save(
             if failed is not None:
                 failed.append(old)
     return candidate
+
+
+def _place_exclusive(temporary: Path, final: Path) -> bool:
+    """写し終えた一時の控えを最後の名前へ置く その名前が既にあれば置かずに偽
+
+    Windows の ``rename`` は先があれば失敗するので、そのまま排他になる それ以外は
+    ``rename`` が黙って上書きするので、``link``（先があれば失敗する）で置いてから一時の名前を消す
+    """
+    if sys.platform == "win32":
+        try:
+            temporary.rename(final)
+        except FileExistsError:
+            return False
+        return True
+    try:
+        os.link(temporary, final)
+    except FileExistsError:
+        return False
+    temporary.unlink(missing_ok=True)
+    return True
+
+
+#: 写している途中の控えを、落ちた残りと見なすまでの時間（秒） ほかの窓が今まさに写している
+#: 物を消さないよう、十分に古い物だけを片付ける
+_STALE_COPY_SECONDS = 60 * 60
+
+
+def _clear_stale_copies(folder: Path) -> None:
+    """前に写している途中で落ちて残った一時の控えを片付ける 片付けられなくても止めない
+
+    一時の名前の物は世代に数えないので、残っても戻す控えを押し流しはしないが、置き場を食う
+    古さは名前の頭の時刻（写し始めた時刻）で見る 更新時刻は元のファイルから写す（``copystat``）
+    ので、ほかの窓が今まさに写している物まで古く見える
+    """
+    limit = datetime.now() - timedelta(seconds=_STALE_COPY_SECONDS)
+    stale: list[Path] = []
+    try:
+        for path in folder.glob(f".*{_COPYING}"):
+            try:
+                started = datetime.strptime(path.name[1:23], "%Y%m%d-%H%M%S-%f")
+            except ValueError:
+                continue
+            if started < limit:
+                stale.append(path)
+    except OSError:
+        return
+    for path in stale:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 #: この起動で最後に控えへ付けた時刻 :func:`_next_stamp` が次の時刻をこれより後にする
@@ -617,7 +708,7 @@ def latest_backup_folder(target: Path, roots: list[Path]) -> Path | None:
     best: tuple[str, Path] | None = None
     for root in roots:
         folder = backup_folder(target, root)
-        usable = [path for path in _generations(folder) if _size(path) > 0]
+        usable = _usable_generations(folder)
         if not usable:
             continue
         name = usable[-1].name
@@ -626,17 +717,52 @@ def latest_backup_folder(target: Path, roots: list[Path]) -> Path | None:
     return best[1] if best is not None else None
 
 
+#: Sashimono が付ける控えの名前の形（時刻と連番） 旧い版は連番を付けていなかった
+#: 形に合わない物は控えとして数えず、消さない 置き場に本人の物が紛れていても触らないため
+_GENERATION_NAME = re.compile(r"\d{8}-\d{6}-\d{6}(-\d{3})?")
+
+#: Sashimono が付けるプロジェクトごとの控えのフォルダの名前の形（名前の頭と場所の要約）
+_BACKUP_FOLDER_NAME = re.compile(r".+-[0-9a-f]{10}")
+
+#: 退避の名前の形（起動ごとの番号 ``uuid4().hex``）
+_SESSION_NAME = re.compile(r"[0-9a-f]{32}")
+
+#: 写している途中の控えの名前の後ろ 世代に数えない
+_COPYING = ".copying"
+
+
+def _is_generation(path: Path) -> bool:
+    for suffix in (SUFFIX, *LEGACY_SUFFIXES):
+        if path.name.endswith(suffix):
+            return _GENERATION_NAME.fullmatch(path.name.removesuffix(suffix)) is not None
+    return False
+
+
 def _generations(folder: Path) -> list[Path]:
-    """そのプロジェクトの控え 古い順"""
-    return sorted(
-        path for suffix in (SUFFIX, *LEGACY_SUFFIXES) for path in folder.glob(f"*{suffix}")
-    )
+    """そのプロジェクトの控え 古い順 Sashimono が付けた名前の形に合う物だけ"""
+    try:
+        return sorted(path for path in folder.iterdir() if _is_generation(path))
+    except OSError:
+        return []
+
+
+def _usable_generations(folder: Path) -> list[Path]:
+    """戻すのに使える控え 古い順 中身の無い控え（壊れて残った物）は数えない
+
+    数えると、世代数を減らしたときに名前の新しい壊れた控えを残し、古い正常な控えを消す
+    壊れた控えは消しもしない（本人が中を見て判断できるように残す）
+    """
+    return [path for path in _generations(folder) if _size(path) > 0]
 
 
 def _backup_folders(root: Path | None) -> list[Path]:
     base = (root if root is not None else default_state_root()) / "backups"
     try:
-        return [folder for folder in base.iterdir() if folder.is_dir()]
+        return [
+            folder
+            for folder in base.iterdir()
+            if folder.is_dir() and _BACKUP_FOLDER_NAME.fullmatch(folder.name)
+        ]
     except OSError:
         return []
 
@@ -653,7 +779,7 @@ def plan_prune(keep: int, root: Path | None = None) -> list[TrimItem]:
     """
     items: list[TrimItem] = []
     for folder in _backup_folders(root):
-        generations = _generations(folder)
+        generations = _usable_generations(folder)
         label = _backup_label(folder)
         items.extend(
             TrimItem(label, (path,), _size(path), _backup_stamp(path))
@@ -710,7 +836,7 @@ class TrimItem:
 def state_usage(root: Path | None = None) -> int:
     """置き場の退避とバックアップが使っている大きさ（バイト）"""
     base = root if root is not None else default_state_root()
-    return sum(_size(path) for name in ("recovery", "backups") for path in _files(base / name))
+    return sum(_size(path) for path in _owned_files(base))
 
 
 def plan_trim(
@@ -736,19 +862,14 @@ def plan_trim(
     """
     base = root if root is not None else default_state_root()
     gone = {_root_key(path) for path in already}
-    freed = sum(
-        _size(path)
-        for name in ("recovery", "backups")
-        for path in _files(base / name)
-        if _root_key(path) in gone
-    )
+    freed = sum(_size(path) for path in _owned_files(base) if _root_key(path) in gone)
     excess = state_usage(base) - freed - limit
     if excess <= 0:
         return []
     candidates: list[TrimItem] = []
     for folder in _backup_folders(base):
         # このプロジェクトのいちばん新しい控えは数から外す 世代数で消える物を除いた後の物
-        remaining = [path for path in _generations(folder) if _root_key(path) not in gone]
+        remaining = [path for path in _usable_generations(folder) if _root_key(path) not in gone]
         label = _backup_label(folder)
         candidates.extend(
             TrimItem(label, (path,), _size(path), _backup_stamp(path)) for path in remaining[:-1]
@@ -800,11 +921,26 @@ def trim_state(
     return discard_items(items, failed=failed)
 
 
-def _files(folder: Path) -> list[Path]:
-    try:
-        return [path for path in folder.rglob("*") if path.is_file()]
-    except OSError:
-        return []
+def _owned_files(base: Path) -> list[Path]:
+    """置き場の中で Sashimono が書いた形の物（退避と控え） 容量はこれだけを数える
+
+    本人の物が紛れていても数えない 数えると、その分だけ Sashimono の控えを余計に消す
+    """
+    owned: list[Path] = []
+    with contextlib.suppress(OSError):
+        owned.extend(
+            path
+            for path in (base / "recovery").iterdir()
+            if path.is_file() and _SESSION_NAME.fullmatch(path.name.split(".", 1)[0])
+        )
+    for folder in _backup_folders(base):
+        with contextlib.suppress(OSError):
+            owned.extend(
+                path
+                for path in folder.iterdir()
+                if path.is_file() and (_is_generation(path) or path.name.endswith(_COPYING))
+            )
+    return owned
 
 
 def _size(path: Path) -> int:

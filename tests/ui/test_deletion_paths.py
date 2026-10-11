@@ -20,11 +20,12 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QWidget
 
 from sashimono.core.commands import RenameProject
 from sashimono.core.io import (
     RecoverySession,
+    UnavailableRecovery,
     backup_before_save,
     backup_folder,
     default_state_root,
@@ -32,7 +33,8 @@ from sashimono.core.io import (
 )
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.model import Project
-from sashimono.ui.backup_settings import confirm_backup_changes
+from sashimono.ui import backup_settings, main_window
+from sashimono.ui.backup_settings import STATE_SUBFOLDER, confirm_backup_changes
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.recovery_dialog import RecoveryDialog
 from sashimono.ui.theme import current_theme
@@ -123,7 +125,7 @@ class TestConfirmingGenerations:
     ) -> None:
         # 世代数は同じでも、切り替えた先の控えが多ければ確かめる
         chosen = tmp_path / "前の置き場"
-        made = _fill(tmp_path / "本編.sme", 6, chosen)
+        made = _fill(tmp_path / "本編.sme", 6, chosen / STATE_SUBFOLDER)
         asked = _answer(monkeypatch, yes=False)
         before = Preferences(backup_generations=2)
         after = Preferences(backup_generations=2, state_folder=str(chosen))
@@ -458,5 +460,71 @@ class TestABrokenCopyInTheChosenFolder:
             assert not backup_folder(target, chosen).exists()
             created.open_backup_folder()
             assert opened == [QUrl.fromLocalFile(str(backup_folder(target)))]
+        finally:
+            created.close()
+
+
+class TestAnOrdinaryFolderIsLeftAlone:
+    def test_the_users_files_are_neither_read_nor_removed(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 普段使っているフォルダを置き場に選んだ その直下の recovery と backups は本人の物
+        # Sashimono の物として読んだり消したりすると、本人のファイルを失う
+        del qt_application
+        chosen = tmp_path / "書類"
+        (chosen / "recovery").mkdir(parents=True)
+        (chosen / "recovery" / "重要.json").write_text("{}", encoding="utf-8")
+        (chosen / "backups" / "去年").mkdir(parents=True)
+        (chosen / "backups" / "去年" / "20240101-000000-000000-000.sme").write_bytes(b"x" * 2000)
+        monkeypatch.setattr(RecoveryDialog, "exec", lambda _dialog: QDialog.DialogCode.Rejected)
+        target = tmp_path / "本編.sme"
+        target.write_text("前の中身", encoding="utf-8")
+        created = _window(
+            Preferences(state_folder=str(chosen), state_limit_mb=1, recovery_keep_days=1)
+        )
+        try:
+            created.offer_recovery()
+            created._path = target
+            created.execute(RenameProject("作業中"))
+            created.autosave()
+            assert created.save_project()
+            assert created._recovery.path.is_relative_to(chosen / STATE_SUBFOLDER)
+            assert backup_folder(target, chosen / STATE_SUBFOLDER).is_dir()
+        finally:
+            created.close()
+        assert (chosen / "recovery" / "重要.json").is_file()
+        assert (chosen / "backups" / "去年" / "20240101-000000-000000-000.sme").is_file()
+
+
+class TestAnUnusableDefaultFolder:
+    def test_going_back_to_an_unwritable_default_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 書けない既定の置き場へ戻すのを通すと、退避を移す所で止まり、次の起動も同じ所で止まる
+        blocker = tmp_path / "ファイル"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(backup_settings, "default_state_root", lambda: blocker / "既定")
+        warned: list[str] = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda _p, _t, text, *_a: warned.append(text))
+        before = Preferences(state_folder=str(tmp_path / "選んだ置き場"))
+        assert not confirm_backup_changes(None, before, Preferences())
+        assert warned and str(blocker / "既定") in warned[0]
+
+    def test_starting_without_a_usable_default_keeps_going_and_says_so(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 既定の置き場が使えないだけで起動が止まると、本人は作業そのものができない
+        del qt_application
+        blocker = tmp_path / "ファイル"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(main_window, "default_state_root", lambda: blocker / "既定")
+        monkeypatch.setattr(backup_settings, "default_state_root", lambda: blocker / "既定")
+        created = _window()
+        try:
+            assert isinstance(created._recovery, UnavailableRecovery)
+            assert "退避できません" in created.statusBar().currentMessage()
+            created.execute(RenameProject("作業中"))
+            created.autosave()
+            assert "自動退避に失敗した" in created.statusBar().currentMessage()
         finally:
             created.close()

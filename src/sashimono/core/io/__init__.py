@@ -5,6 +5,7 @@ from sashimono.core.io.presets import Preset, PresetStore, default_preset_root
 from sashimono.core.io.recovery import (
     RecoveryEntry,
     RecoverySession,
+    UnavailableRecovery,
     backup_before_save,
     backup_folder,
     backups_over,
@@ -58,6 +59,7 @@ __all__ = [
     "ProjectFileError",
     "RecoveryEntry",
     "RecoverySession",
+    "UnavailableRecovery",
     "backup_before_save",
     "backup_folder",
     "backups_over",

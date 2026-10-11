@@ -79,6 +79,7 @@ from sashimono.core.io import (
     ProjectFileError,
     RecoveryEntry,
     RecoverySession,
+    UnavailableRecovery,
     backup_before_save,
     default_state_root,
     discard,
@@ -126,6 +127,7 @@ from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.backup_settings import (
+    STATE_SUBFOLDER,
     describe_trim,
     recovery_roots,
     state_root_for,
@@ -224,7 +226,8 @@ def about_text(state_folder: str = "") -> str:
     既定と違えば、書けないときに使う既定の置き場も添える（控えが既定の側にもありうる）
     """
     default = userdirs.state_root()
-    chosen = Path(state_folder) if state_folder else default
+    # 選んだフォルダの下の Sashimono 専用のフォルダ（:func:`state_root_for` と同じ決まり）
+    chosen = Path(state_folder) / STATE_SUBFOLDER if state_folder else default
     state_line = f"退避・バックアップ: {chosen}"
     if chosen != default:
         state_line += f"（書けないときは {default}）"
@@ -1014,8 +1017,9 @@ class MainWindow(QMainWindow):
     def _open_recovery(self, root: Path) -> RecoverySession:
         """この起動の退避を ``root`` に用意する 書けなければ既定の置き場へ戻して知らせる
 
-        既定の置き場にも書けないときは起動を止める（前からの動き） 退避の無いまま
-        編集させると、落ちたときに何も残らないことを本人が知らない
+        既定の置き場にも書けないときは、止めずに退避の無いまま続け、知らせる
+        （:class:`~sashimono.core.io.recovery.UnavailableRecovery`） 止めると、既定の置き場の
+        権限やドライブの具合だけで起動も設定の反映もできなくなる 退避のたびにも書けないと知らせる
         """
         default = default_state_root()
         if root != default:
@@ -1029,7 +1033,15 @@ class MainWindow(QMainWindow):
                 self._remember_root(root)
                 return session
         self._recovery_root = default
-        return RecoverySession(default)
+        try:
+            return RecoverySession(default)
+        except (OSError, RuntimeError) as exc:
+            self._state_fallback_message = (
+                f"退避の置き場 {default} にも書けないので、この起動では退避できません（{exc}）"
+                " こまめに保存してください"
+            )
+            self.statusBar().showMessage(self._state_fallback_message, 30000)
+            return UnavailableRecovery(str(exc))
 
     def _remember_root(self, root: Path) -> None:
         """退避を書く置き場を覚える 覚えられなければ、次の退避のときにもう 1 度覚える

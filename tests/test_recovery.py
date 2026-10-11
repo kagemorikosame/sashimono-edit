@@ -852,3 +852,95 @@ class TestTheLatestBackupFolder:
         monkeypatch.setattr(recovery, "_last_stamp", None)
         backup_before_save(target, default)
         assert latest_backup_folder(target, [chosen, default]) == backup_folder(target, chosen)
+
+
+class TestOnlySashimonoShapedFilesAreTouched:
+    """置き場に本人の物が紛れていても、Sashimono が付けた名前の形に合わない物は読まず消さない"""
+
+    def test_a_users_note_is_not_taken_for_a_recovery_note(self, tmp_path: Path) -> None:
+        # 本人の「重要.json」を退避のメモと取り違えると、対の中身が無いとして消してしまう
+        folder = tmp_path / "recovery"
+        folder.mkdir()
+        (folder / "重要.json").write_text("{}", "utf-8")
+        (folder / "メモ.sme").write_text("本人の物", "utf-8")
+        assert find_orphans(tmp_path) == []
+        assert (folder / "重要.json").is_file()
+        assert (folder / "メモ.sme").is_file()
+
+    def test_a_users_files_among_the_backups_are_left_alone(self, tmp_path: Path) -> None:
+        # 本人の物を控えとして数えると、世代数や容量の片付けで消してしまう
+        state = tmp_path / "state"
+        target = tmp_path / "本編.sme"
+        for number in range(3):
+            target.write_text(str(number), "utf-8")
+            backup_before_save(target, state, keep=200)
+        folder = backup_folder(target, state)
+        users = folder / "大事な版.sme"
+        users.write_bytes(b"x" * 5000)
+        stranger = state / "backups" / "写真"
+        stranger.mkdir()
+        (stranger / "20260101-000000-000000-000.sme").write_bytes(b"x" * 5000)
+        assert backups_over(1, state) == 2
+        assert state_usage(state) < 5000
+        discard_items(plan_prune(1, state))
+        trim_state(1, state)
+        assert users.is_file()
+        assert (stranger / "20260101-000000-000000-000.sme").is_file()
+
+
+class TestCopiesAreWrittenAside:
+    """控えは一時の名前へ写し終えてから最後の名前へ置く"""
+
+    def test_a_half_copy_never_gets_a_final_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 最後の名前で写している途中に落ちると、名前の新しい壊れた控えが残る
+        target = tmp_path / "本編.sme"
+        target.write_bytes(b"x" * 1000)
+
+        def short(source: Path, destination: Path, **_kwargs: object) -> Path:
+            Path(destination).write_bytes(b"x" * 10)
+            return Path(destination)
+
+        monkeypatch.setattr(shutil, "copyfile", short)
+        state = tmp_path / "state"
+        with pytest.raises(OSError):
+            backup_before_save(target, state)
+        assert not backup_folder(target, state).exists()
+
+    def test_broken_copies_do_not_count_as_generations(self, tmp_path: Path) -> None:
+        # 名前の新しい空の控えを数えると、世代を詰めるときに古い正常な控えの方が消える
+        state = tmp_path / "state"
+        target = tmp_path / "本編.sme"
+        good = []
+        for number in range(3):
+            target.write_text(f"中身 {number}", "utf-8")
+            copied = backup_before_save(target, state, keep=200)
+            assert copied is not None
+            good.append(copied)
+        broken = backup_folder(target, state) / "29991231-235959-999999-000.sme"
+        broken.write_bytes(b"")
+        target.write_text("中身 3", "utf-8")
+        newest = backup_before_save(target, state, keep=3)
+        assert newest is not None
+        assert [path.exists() for path in good] == [False, True, True]
+        assert newest.is_file()
+        # 壊れた控えは数えないが、消しもしない（本人が中を見て判断できる）
+        assert broken.is_file()
+
+    def test_a_copy_left_from_a_crash_is_cleared_later(self, tmp_path: Path) -> None:
+        # 落ちて残った一時の控えが置き場を食い続けない ほかの窓が今写している物は消さない
+        state = tmp_path / "state"
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        folder = backup_folder(target, state)
+        folder.mkdir(parents=True)
+        old = folder / ".20200101-000000-000000-deadbeef.copying"
+        old.write_bytes(b"half")
+        fresh_stamp = f"{datetime.now():%Y%m%d-%H%M%S-%f}"
+        fresh = folder / f".{fresh_stamp}-cafebabe.copying"
+        fresh.write_bytes(b"half")
+        backup_before_save(target, state)
+        assert not old.exists()
+        assert fresh.is_file()
+        assert len(list(folder.glob("*.sme"))) == 1

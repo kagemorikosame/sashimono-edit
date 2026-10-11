@@ -29,6 +29,7 @@ from sashimono.core.io.recovery import BACKUP_GENERATIONS
 from sashimono.core.model import Project
 from sashimono.ui import main_window
 from sashimono.ui.backup_settings import (
+    STATE_SUBFOLDER,
     StateFolderField,
     confirm_backup_changes,
     folder_caution,
@@ -46,6 +47,12 @@ from sashimono.ui.workspace import (
     Preferences,
     PreferenceStore,
 )
+
+
+def _setting(root: Path) -> str:
+    """置き場 ``root``（Sashimono 専用のフォルダ）を使う設定の値 選ぶフォルダはその親"""
+    assert root.name == STATE_SUBFOLDER
+    return str(root.parent)
 
 
 def _unwritable(tmp_path: Path) -> Path:
@@ -238,6 +245,7 @@ class TestTheFolderChecks:
 class TestReducingTheGenerations:
     def _make_backups(self, root: Path, count: int) -> Path:
         target = root.parent / "本編.sme"
+        target.parent.mkdir(parents=True, exist_ok=True)
         for number in range(count):
             target.write_text(str(number), encoding="utf-8")
             backup_before_save(target, root)
@@ -248,7 +256,7 @@ class TestReducingTheGenerations:
     ) -> None:
         # 黙って減らすと、次の保存でそのプロジェクトの控えがまとめて消える
         del qt_application
-        root = tmp_path / "退避"
+        root = tmp_path / "退避" / STATE_SUBFOLDER
         self._make_backups(root, 6)
         asked: list[str] = []
 
@@ -257,8 +265,8 @@ class TestReducingTheGenerations:
             return QMessageBox.StandardButton.No
 
         monkeypatch.setattr(QMessageBox, "question", say_no)
-        before = Preferences(state_folder=str(root))
-        after = Preferences(state_folder=str(root), backup_generations=2)
+        before = Preferences(state_folder=_setting(root))
+        after = Preferences(state_folder=_setting(root), backup_generations=2)
         assert not confirm_backup_changes(None, before, after)
         assert asked and "4 本" in asked[0]
         # 確かめるだけで、その場では消さない
@@ -268,12 +276,12 @@ class TestReducingTheGenerations:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 消える物が無いのに尋ねると、本人は何かが消えると思って設定をやめる
-        root = tmp_path / "退避"
+        root = tmp_path / "退避" / STATE_SUBFOLDER
         self._make_backups(root, 2)
         monkeypatch.setattr(QMessageBox, "question", lambda *_a: pytest.fail("尋ねた"))
-        before = Preferences(state_folder=str(root))
+        before = Preferences(state_folder=_setting(root))
         assert confirm_backup_changes(
-            None, before, Preferences(state_folder=str(root), backup_generations=5)
+            None, before, Preferences(state_folder=_setting(root), backup_generations=5)
         )
 
     def test_raising_it_asks_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -317,8 +325,8 @@ class TestTheBackups:
     ) -> None:
         # 選んだ置き場と世代数が効かないと、控えが思っていない所に思っていない数だけ溜まる
         del qt_application
-        root = tmp_path / "退避"
-        created = _window(Preferences(state_folder=str(root), backup_generations=2))
+        root = tmp_path / "退避" / STATE_SUBFOLDER
+        created = _window(Preferences(state_folder=_setting(root), backup_generations=2))
         try:
             created._path = tmp_path / "本編.sme"
             for number in range(5):
@@ -382,7 +390,7 @@ class TestTheBackups:
             assert opened == [QUrl.fromLocalFile(str(backup_folder(created._path)))]
             # 選んだ置き場に控えがあれば、そちらを先に開く 既定の側だけ見ると、
             # 設定の置き場へ書いた新しい控えに辿り着けない
-            chosen = tmp_path / "退避"
+            chosen = tmp_path / "退避" / STATE_SUBFOLDER
             backup_before_save(created._path, chosen)
             created.open_backup_folder()
             assert opened[-1] == QUrl.fromLocalFile(str(backup_folder(created._path, chosen)))
@@ -396,8 +404,8 @@ class TestTheRecoveryFolder:
     ) -> None:
         # 選んだ置き場に退避が行かないと、置き場を変えた意味が無い
         del qt_application
-        root = tmp_path / "退避"
-        created = _window(Preferences(state_folder=str(root)))
+        root = tmp_path / "退避" / STATE_SUBFOLDER
+        created = _window(Preferences(state_folder=_setting(root)))
         try:
             created.execute(RenameProject("作業中"))
             created.autosave()
@@ -449,8 +457,8 @@ class TestTheRecoveryFolder:
         window.autosave()
         old = window._recovery.path
         assert old.is_file()
-        root = tmp_path / "新しい置き場"
-        window._apply_preferences(Preferences(state_folder=str(root)))
+        root = tmp_path / "新しい置き場" / STATE_SUBFOLDER
+        window._apply_preferences(Preferences(state_folder=_setting(root)))
         assert window._recovery.path.parent == root / "recovery"
         assert window._recovery.path.is_file()
         assert not old.exists()
@@ -462,7 +470,7 @@ class TestTheRecoveryFolder:
         window.execute(RenameProject("作業中"))
         window.autosave()
         old = window._recovery.path
-        root = tmp_path / "新しい置き場"
+        root = tmp_path / "新しい置き場" / STATE_SUBFOLDER
         plain_save = RecoverySession.save
 
         def refuse_new(self: RecoverySession, project: Project, source: Path | None) -> None:
@@ -471,7 +479,7 @@ class TestTheRecoveryFolder:
             plain_save(self, project, source)
 
         monkeypatch.setattr(RecoverySession, "save", refuse_new)
-        window._apply_preferences(Preferences(state_folder=str(root)))
+        window._apply_preferences(Preferences(state_folder=_setting(root)))
         assert old.is_file()
         assert window._recovery.path == old
         assert "書けない" in window.statusBar().currentMessage()
@@ -496,11 +504,11 @@ class TestTheRecoveryFolder:
         oldest = None
         for number in range(5):
             target.write_bytes(bytes([number]) * 400_000)
-            copied = backup_before_save(target, tmp_path / "新しい置き場")
+            copied = backup_before_save(target, tmp_path / "新しい置き場" / STATE_SUBFOLDER)
             oldest = oldest or copied
         assert oldest is not None
-        root = tmp_path / "新しい置き場"
-        chosen = Preferences(state_folder=str(root), state_limit_mb=1)
+        root = tmp_path / "新しい置き場" / STATE_SUBFOLDER
+        chosen = Preferences(state_folder=_setting(root), state_limit_mb=1)
         window._apply_preferences(chosen, plan_trim_all(chosen))
         assert window._recovery.path.parent == root / "recovery"
         assert window._recovery.path.is_file()
@@ -534,7 +542,7 @@ class TestTheRecoveryFolder:
         window.execute(RenameProject("作業中"))
         window.autosave()
         old = window._recovery
-        root = tmp_path / "新しい置き場"
+        root = tmp_path / "新しい置き場" / STATE_SUBFOLDER
         plain_save, plain_close = RecoverySession.save, RecoverySession.close
 
         def refuse_new(self: RecoverySession, project: Project, source: Path | None) -> None:
@@ -549,7 +557,7 @@ class TestTheRecoveryFolder:
 
         monkeypatch.setattr(RecoverySession, "save", refuse_new)
         monkeypatch.setattr(RecoverySession, "close", cut_off)
-        window._apply_preferences(Preferences(state_folder=str(root)))
+        window._apply_preferences(Preferences(state_folder=_setting(root)))
         assert window._recovery is old
         assert "書けない" in window.statusBar().currentMessage()
         window.execute(RenameProject("続き"))
@@ -572,7 +580,7 @@ class TestOfferingRecovery:
         # 選んだ置き場へ書けずに既定へ戻した起動が落ちると、退避は既定の側に残る
         # 片方しか見ないと、その作業は復元を勧められずに埋もれる
         del qt_application
-        chosen = tmp_path / "退避"
+        chosen = tmp_path / "退避" / STATE_SUBFOLDER
         self._crash_in(chosen, "選んだ側")
         self._crash_in(default_state_root(), "既定の側")
         offered: list[str] = []
@@ -582,7 +590,7 @@ class TestOfferingRecovery:
             return QDialog.DialogCode.Rejected
 
         monkeypatch.setattr(RecoveryDialog, "exec", look)
-        created = _window(Preferences(state_folder=str(chosen)))
+        created = _window(Preferences(state_folder=_setting(chosen)))
         try:
             created.offer_recovery()
             assert sorted(offered) == ["既定の側", "選んだ側"]
@@ -596,14 +604,14 @@ class TestRememberingAgain:
     ) -> None:
         # 覚えられないまま諦めると、この置き場で落ちた作業が次の起動の復元に出ない
         del qt_application
-        chosen = tmp_path / "選んだ置き場"
+        chosen = tmp_path / "選んだ置き場" / STATE_SUBFOLDER
         plain = remember_root
 
         def busy(root: Path, registry: Path | None = None) -> None:
             raise TimeoutError("一覧の錠を取れない")
 
         monkeypatch.setattr(main_window, "remember_root", busy)
-        created = _window(Preferences(state_folder=str(chosen)))
+        created = _window(Preferences(state_folder=_setting(chosen)))
         try:
             assert chosen not in remembered_roots()
             monkeypatch.setattr(main_window, "remember_root", plain)
@@ -624,7 +632,7 @@ class TestTheAboutBox:
         # 置き場を変えた人に既定の場所だけを出すと、報告に写した置き場に控えが無い
         chosen = tmp_path / "選んだ置き場"
         text = about_text(str(chosen))
-        assert f"退避・バックアップ: {chosen}" in text
+        assert f"退避・バックアップ: {chosen / STATE_SUBFOLDER}（" in text
         # 書けないときに控えが行く既定の置き場も添える
         assert str(default_state_root()) in text
 
@@ -635,10 +643,10 @@ class TestTheAboutBox:
         del qt_application
         shown: list[str] = []
         monkeypatch.setattr(QMessageBox, "about", lambda _p, _t, text: shown.append(text))
-        chosen = tmp_path / "選んだ置き場"
-        created = _window(Preferences(state_folder=str(chosen)))
+        chosen = tmp_path / "選んだ置き場" / STATE_SUBFOLDER
+        created = _window(Preferences(state_folder=_setting(chosen)))
         try:
             created.show_about()
-            assert shown and f"退避・バックアップ: {chosen}" in shown[0]
+            assert shown and f"退避・バックアップ: {chosen}（" in shown[0]
         finally:
             created.close()

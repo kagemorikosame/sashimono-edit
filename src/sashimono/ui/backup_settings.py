@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.core import userdirs
 from sashimono.core.io import (
     default_state_root,
     folder_problem,
@@ -77,10 +78,20 @@ __all__ = [
 _LISTED = 8
 
 
+#: 選んだフォルダの下に挟む Sashimono 専用のフォルダの名前 既定の置き場の名前と同じ
+STATE_SUBFOLDER = userdirs.APP_FOLDER
+
+
 def state_root_for(preferences: Preferences) -> Path:
-    """設定で選んだ退避とバックアップの置き場 空なら既定"""
+    """設定で選んだ退避とバックアップの置き場 空なら既定
+
+    選んだフォルダそのものではなく、その下の Sashimono 専用のフォルダ
+    （:data:`STATE_SUBFOLDER`）を使う 本人が普段使っているフォルダを選んだとき、
+    その直下に本人が置いた ``recovery`` や ``backups`` を Sashimono の物として読んだり
+    消したりしないため 既定の置き場（``%LOCALAPPDATA%\\Sashimono``）は初めから専用
+    """
     if preferences.state_folder:
-        return Path(preferences.state_folder)
+        return Path(preferences.state_folder) / STATE_SUBFOLDER
     return default_state_root()
 
 
@@ -210,7 +221,9 @@ class StateFolderField(QWidget):
     def folder(self) -> str:
         """選んだ置き場 既定と同じ場所を選んだときも空にする（既定に付いていくため）"""
         text = self.line.text().strip()
-        if text and _same(Path(text), default_state_root()):
+        default = default_state_root()
+        # 既定の置き場そのものか、その親（下に Sashimono 専用のフォルダを挟むと既定になる）
+        if text and (_same(Path(text), default) or _same(Path(text) / STATE_SUBFOLDER, default)):
             return ""
         return text
 
@@ -270,7 +283,9 @@ class BackupSection:
 
         self.state_folder = StateFolderField(preferences.state_folder, parent)
         self.state_folder.setToolTip(
-            "退避とバックアップを書くフォルダ 空は既定の場所 変えたときに新しい場所へ写すのは"
+            "退避とバックアップを書くフォルダ 空は既定の場所 選んだフォルダの下に Sashimono という"
+            "フォルダを作り、その中だけに書く（ほかの物には触らない）"
+            " 変えたときに新しい場所へ写すのは"
             "開いている作業のこの起動の退避だけで、前の場所に前からある退避とバックアップは移さない"
             " 書けないときは、その起動の間は既定の場所へ書いて知らせる"
             " 落ちた作業は、選んだ場所と既定の場所の両方から探す"
@@ -326,13 +341,15 @@ def confirm_backup_changes(
     ``approved`` を渡すと、容量の上限で消してよいと確かめた物をそこへ足す 設定を当てるときは
     この一覧に入っている物だけを消す（確かめに出していない物は消さない）
     """
-    if after.state_folder and after.state_folder != before.state_folder:
-        folder = Path(after.state_folder)
+    if state_root_for(after) != state_root_for(before):
+        # 既定へ戻すときも確かめる 既定の置き場が書けなくなっていると、退避を移す所で
+        # 止まり、次の起動も同じ所で止まる 確かめるのは実際に書く Sashimono 専用のフォルダ
+        folder = state_root_for(after)
         refusal = folder_refusal(folder)
         if refusal is not None:
             QMessageBox.warning(parent, "この置き場は使えません", f"{folder}\n\n{refusal}")
             return False
-        caution = folder_caution(folder)
+        caution = folder_caution(folder) if after.state_folder else None
         if caution is not None:
             answer = QMessageBox.question(
                 parent,
