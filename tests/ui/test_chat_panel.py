@@ -1380,6 +1380,29 @@ class TestAskPreference:
         _send(widget, "次")
         assert made[1].ask is False
 
+    def test_changing_it_during_a_reply_moves_the_waiting_prompts(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 応えている間に切った 壊れると、続けて送った指示が古い会話（質問の道具と基準あり）で
+        # 走り、切った後も質問される 待ちの指示は消さずに新しい会話へ渡す
+        widget, made = recorded
+        _send(widget, "1 つ目")
+        _send(widget, "2 つ目")
+        widget.apply_preferences(Preferences(ai_ask_questions=False))
+        # 応えている最中の指示は止めない
+        assert made[0].closed is False
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert made[0].closed is True
+        # 古い会話は区切りを待ったまま畳む 区切りを渡すと 2 つ目を古い会話で始めてしまう
+        assert made[0].acknowledged == 0
+        assert len(made) == 2
+        assert made[1].ask is False
+        assert ASK_RULES not in made[1].system_prompt
+        assert made[1].prompts == ["2 つ目"]
+        assert list(widget._queued) == ["2 つ目"]
+        # 2 つ目の取り消しの段も開いている 壊れると 2 つ目の編集が取り消しで戻らない
+        assert widget._checkpoint_open is True
+
     def test_the_choice_survives_a_restart(self, tmp_path: Path) -> None:
         # 保存し忘れると、切ったはずの質問が次の起動で戻る
         from sashimono.ui.workspace import PreferenceStore

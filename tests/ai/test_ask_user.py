@@ -111,6 +111,26 @@ class TestArguments:
         with pytest.raises(ToolError, match="重なって"):
             question_spec(_arguments(choices=[{"label": "a"}, {"label": "a"}]))
 
+    @pytest.mark.parametrize("key", ["multiple", "free_text"])
+    @pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+    def test_a_flag_that_is_not_a_boolean_is_refused(self, key: str, value: object) -> None:
+        # bool("false") は真 壊れると、AI が文字列で "false" と渡したとき逆の設定で質問が出る
+        with pytest.raises(ToolError, match="true か false"):
+            question_spec(_arguments(**{key: value}))
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"question": 3},
+            {"choices": [{"label": 1, "description": ""}, {"label": "b"}]},
+            {"choices": [{"label": "a", "description": ["説明"]}, {"label": "b"}]},
+        ],
+    )
+    def test_text_that_is_not_a_string_is_refused(self, changes: dict[str, object]) -> None:
+        # 壊れると、数やリストを文字にした中身の分からない質問や選択肢が並ぶ
+        with pytest.raises(ToolError, match="文字列で渡してください"):
+            question_spec(_arguments(**changes))
+
     def test_an_empty_question_is_refused(self) -> None:
         # 壊れると、何を聞かれているのか分からない箱が出る
         with pytest.raises(ToolError, match="空"):

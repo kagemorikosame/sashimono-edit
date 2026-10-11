@@ -758,6 +758,24 @@ class ChatPanel(QWidget):
             or f"次の指示から {label} で新しい会話を始めます（それまでのやり取りは引き継ぎません）"
         )
 
+    def _carry_over_queue(self) -> None:
+        """待ちの指示を残したまま会話を作り直し、待ちを新しい会話へ渡す
+
+        :meth:`_restart_session` は待ちを消すので使わない 今の会話は区切りを付け終える
+        知らせ（acknowledge_turn）を待って止まっている 畳むときに、受け取ったまま始めて
+        いない指示は捨てられる（AgentSession.close）ので、同じ指示が 2 回走ることは無い
+        """
+        session = self._session
+        if session is None:
+            return
+        self._session = None
+        session.close(wait=False)
+        self._note(
+            "AI が質問するかの設定が変わったので、残りの指示は新しい会話で始めます"
+            "（それまでのやり取りは引き継ぎません）"
+        )
+        self._pass_held()
+
     def _describe_send_key(self) -> None:
         key = "Enter で送信 Shift+Enter で改行" if self._input.enter_sends else "Ctrl+Enter で送信"
         self._input.set_placeholder(f"編集の指示を書いて {key}（例: 冒頭 10 秒を切って）")
@@ -1030,10 +1048,15 @@ class ChatPanel(QWidget):
                     # 続けて送った指示の段を、その指示が始まる前に開く
                     self._open_checkpoint(self._queued[0])
                     self._begin_turn()
-                if self._session is not None:
+                session = self._session
+                if session is not None and self._queued and session.ask != self._ask_questions:
+                    # 応えている間に「AI が質問する」を変えた 残りの指示を今の会話で続けると、
+                    # 切った後も質問され、入れた後も聞き返されない 会話を作り直して渡し直す
+                    self._carry_over_queue()
+                elif session is not None:
                     # 段を付け替え終えてから次の指示を始めさせる 先に始めると、
                     # 次の指示の編集が前の段へ混ざる
-                    self._session.acknowledge_turn()
+                    session.acknowledge_turn()
             else:
                 # 会話が終わった 残っていた指示はもう返ってこない
                 self._queued.clear()

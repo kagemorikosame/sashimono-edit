@@ -180,8 +180,13 @@ class QuestionSpec:
 
 
 def question_spec(arguments: dict[str, Any]) -> QuestionSpec:
-    """ask_user の引数を確かめる 合わなければ、直し方を書いて断る"""
-    text = str(arguments.get("question", "")).strip()
+    """ask_user の引数を確かめる 合わなければ、直し方を書いて断る
+
+    型は緩く読まない ``bool("false")`` は真なので、AI が文字列で渡すと逆の設定の
+    質問が出る 文字列の欄に数や辞書が来たときも、``str`` で読むと中身の分からない
+    選択肢が並ぶ どちらも断って、正しい型で渡し直させる
+    """
+    text = _text_argument(arguments, "question", "question")
     if not text:
         raise ToolError("question（質問の文）が空です")
     if len(text) > QUESTION_LIMIT:
@@ -194,8 +199,8 @@ def question_spec(arguments: dict[str, Any]) -> QuestionSpec:
     for entry in raw:
         if not isinstance(entry, dict):
             raise ToolError("choices の各項目は label と description を持つ辞書にしてください")
-        label = str(entry.get("label", "")).strip()
-        description = str(entry.get("description", "")).strip()
+        label = _text_argument(entry, "label", "choices の label")
+        description = _text_argument(entry, "description", "choices の description")
         if not label:
             raise ToolError("choices の label（選択肢の名前）が空です")
         if len(label) > LABEL_LIMIT:
@@ -213,9 +218,25 @@ def question_spec(arguments: dict[str, Any]) -> QuestionSpec:
     return QuestionSpec(
         text=text,
         choices=tuple(choices),
-        multiple=bool(arguments.get("multiple", False)),
-        free_text=bool(arguments.get("free_text", True)),
+        multiple=_flag_argument(arguments, "multiple", False),
+        free_text=_flag_argument(arguments, "free_text", True),
     )
+
+
+def _text_argument(arguments: dict[str, Any], key: str, name: str) -> str:
+    """文字列の引数 省いたら空 文字列でなければ断る"""
+    value = arguments.get(key, "")
+    if not isinstance(value, str):
+        raise ToolError(f"{name} は文字列で渡してください（{type(value).__name__} が来ました）")
+    return value.strip()
+
+
+def _flag_argument(arguments: dict[str, Any], key: str, default: bool) -> bool:
+    """真偽値の引数 省いたら ``default`` true / false 以外（"false" などの文字列）は断る"""
+    value = arguments.get(key, default)
+    if not isinstance(value, bool):
+        raise ToolError(f"{key} は true か false で渡してください（{value!r} が来ました）")
+    return value
 
 
 def _ask_user(host: EditorHost, arguments: dict[str, Any]) -> object:
