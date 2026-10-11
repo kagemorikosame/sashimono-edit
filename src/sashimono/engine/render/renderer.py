@@ -78,7 +78,9 @@ from sashimono.engine.render.scripts import (
 from sashimono.engine.sources import (
     MAX_CANVAS,
     Frame,
+    StrokeEffects,
     corner_points_centred,
+    has_stroke_effects,
     render_source_framed,
     source_canvas,
 )
@@ -392,6 +394,16 @@ def _varies_over_time(source: GeneratedSource) -> bool:
     for value in source.params.values():
         if isinstance(value, AnimatedValue) and value.is_animated:
             return True
+    # 縁取りの層の値と、層に掛けたエフェクトの値も見る 層に掛けられるのは時刻で変わらない
+    # エフェクトだけ（:data:`~sashimono.effects.strokes.STROKE_EFFECT_KINDS`）なので、
+    # キーフレームが無ければ同じ絵のまま
+    for stroke in source.strokes:
+        for value in (
+            *stroke.params.values(),
+            *(v for effect in stroke.effects for v in effect.params.values()),
+        ):
+            if isinstance(value, AnimatedValue) and value.is_animated:
+                return True
     if source.params.get("timer_format"):
         return True
     if source.params.get("shape") in _CLOCK_SHAPES:
@@ -1253,7 +1265,7 @@ class FrameRenderer:
             # 選んでいる間は描くたびに 2 つの大きさを作り直すことになる 枠はスクリプト次第で
             # 近い値でしかないので、画面の画素の入れ物を合成の画素へ縮めて返す
             return self._screen_extent(clip, frame)
-        image = self._generate(clip, frame, self._project.rate)
+        image = self._generate(clip, frame, self._project.rate, gpu=False)
         if image is None:
             return None
         height, width = int(image.shape[0]), int(image.shape[1])
@@ -1266,7 +1278,7 @@ class FrameRenderer:
         self, clip: Clip, frame: int
     ) -> tuple[tuple[float, float, float, float], tuple[int, int]] | None:
         """:meth:`object_extent` を画面の画素で作った絵から求め、合成の画素へ縮めた物"""
-        image = self._generate(clip, frame, self._project.rate, screen=True)
+        image = self._generate(clip, frame, self._project.rate, screen=True, gpu=False)
         if image is None:
             return None
         height, width = int(image.shape[0]), int(image.shape[1])
@@ -2248,13 +2260,18 @@ class FrameRenderer:
         return self._decode(clip, frame, rate)
 
     def _generate(
-        self, clip: Clip, frame: int, rate: FrameRate, *, screen: bool = False
+        self, clip: Clip, frame: int, rate: FrameRate, *, screen: bool = False, gpu: bool = True
     ) -> np.ndarray | None:
         """素材を持たないクリップ（テキスト・図形）の絵を作る
 
         ふつうは合成の画素で作る（画質を落としたプレビューでは縮めて作る）
         ``screen`` なら画面（プロジェクトの解像度）の画素で作る スクリプトへ渡す絵で、
         スクリプトは書き出しと同じ大きさの絵を相手に位置や大きさを数える
+
+        縁取りの層のエフェクト（#273）は GPU で掛ける ``gpu`` が偽（外枠を出すだけで、
+        GL のコンテキストの外から呼ばれる :meth:`object_extent`）なら、描いて覚えた絵があれば
+        それを返し、無ければ層のエフェクトを掛けずに作る（覚えない 覚えると、次に描くときに
+        掛けた絵を作り直すことになり、選んでいる間は描くたびに 2 回作る）
         """
         source = clip.source
         if source is None:
@@ -2310,10 +2327,16 @@ class FrameRenderer:
             if source.params.get("shape") == "waveform"
             else None,
             _fingerprint(source.params),
+            # 縁取りの層も鍵に入れる 層を足しても前の絵が出続けないように
+            repr(source.strokes) if source.strokes else None,
         )
         cached = self._generated.get(clip.id)
         if cached is not None and cached.key == key:
             return cached.image
+        baked = has_stroke_effects(source)
+        stroke_effects = None
+        if baked and gpu:
+            stroke_effects = self._stroke_baker(clip, local_frame, rate, scale)
         heard = self._waveform_audio(clip, source, local_frame, rate)
         image, framed = render_source_framed(
             source,
@@ -2327,13 +2350,39 @@ class FrameRenderer:
             trail_paths=self._trail_paths,
             scale=scale,
             screen=canvas,
+            stroke_effects=stroke_effects,
         )
+        if image is not None and baked and not gpu:
+            return image
         if image is not None:
             self._generated.pop(clip.id, None)
             screen_width, screen_height = self._project.settings.resolution
             _make_room(self._generated, image, screen_width * screen_height * 4)
             self._generated[clip.id] = _Made(key, image, framed)
         return image
+
+    def _stroke_baker(
+        self, clip: Clip, local_frame: int, rate: FrameRate, scale: tuple[float, float]
+    ) -> StrokeEffects:
+        """縁取りの層の絵に、その層のエフェクトを GPU で掛ける手（#273）
+
+        掛ける係はスクリプトの焼き込みと同じ物を使う 描画の作業場を使うと、描いている
+        途中のクリップの絵を壊す 画質を落としたプレビューでは、画素で決める設定を合成の
+        画素へ縮めて掛ける（層の絵も縮めて描いてある）
+        """
+
+        def bake(image: np.ndarray, effects: tuple[Effect, ...]) -> np.ndarray:
+            with self._context:
+                return self._script_baker.apply_within(
+                    image,
+                    effects,
+                    frame=local_frame,
+                    fps=float(rate.fps),
+                    duration=clip.duration,
+                    pixel_scale=scale[0],
+                )
+
+        return bake
 
     def _content_box_of(self, clip: Clip, image: np.ndarray) -> _Box | None:
         """``image`` の色の付いた範囲 作って覚えた絵なら、1 度だけ探して覚える

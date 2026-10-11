@@ -16,6 +16,7 @@ __all__ = [
     "MediaId",
     "SceneId",
     "SegmentId",
+    "StrokeId",
     "TrackId",
     "new_clip_id",
     "new_effect_id",
@@ -23,6 +24,7 @@ __all__ = [
     "new_media_id",
     "new_scene_id",
     "new_segment_id",
+    "new_stroke_id",
     "new_track_id",
 ]
 
@@ -33,6 +35,8 @@ EffectId = NewType("EffectId", str)
 GroupId = NewType("GroupId", str)
 SegmentId = NewType("SegmentId", str)
 SceneId = NewType("SceneId", str)
+#: テキストの縁取りの層（:class:`~sashimono.core.model.stroke.Stroke`）
+StrokeId = NewType("StrokeId", str)
 
 
 def _generate() -> str:
@@ -66,3 +70,7 @@ def new_segment_id() -> SegmentId:
 
 def new_scene_id() -> SceneId:
     return SceneId(_generate())
+
+
+def new_stroke_id() -> StrokeId:
+    return StrokeId(_generate())

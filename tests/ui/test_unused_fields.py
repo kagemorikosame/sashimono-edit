@@ -87,10 +87,11 @@ class TestTransition:
 class TestText:
     def test_a_plain_text_hides_the_timer_and_bare_colours(self, panel: InspectorPanel) -> None:
         # 壊れると、ふつうの文字にもタイマーの 4 つと、太さ 0 の縁・影の色が並ぶ
+        # 縁取りは中身の欄ではなく縁取りの層の組に出す（#272） 縁の無い字は足すボタンだけ
         shown = _shown(panel, TEXT.create())
-        assert {"text", "size", "align", "layout", "border_width", "shadow_x"} <= shown
+        assert {"text", "size", "align", "layout", "shadow_x", "add_stroke"} <= shown
         hidden = {"timer_start", "timer_rate", "timer_countdown", "timer_length"}
-        assert not (hidden | {"border_color", "shadow_color"}) & shown
+        assert not (hidden | {"border_width", "border_color", "shadow_color"}) & shown
 
     def test_a_timer_hides_the_text_and_shows_its_settings(self, panel: InspectorPanel) -> None:
         # タイマーは文字の代わりに時間を出す 数え下げを切っていれば長さは読まない
@@ -107,7 +108,12 @@ class TestText:
 
     def test_colours_come_back_with_their_width(self, panel: InspectorPanel) -> None:
         # 太さや影のずらしを入れた・キーフレームで動かしたら色の欄が出る
-        assert "border_color" in _shown(panel, TEXT.create(border_width=4))
+        # 縁取りは縁取りの層の組（仮の層）に出る
+        _shown(panel, TEXT.create(border_width=4))
+        assert {name for owner, name in panel._editors if owner.startswith("stroke:")} >= {
+            "width",
+            "color",
+        }
         moving = AnimatedValue(keyframes=(Keyframe(0, 0.0), Keyframe(10, 5.0)))
         assert "shadow_color" in _shown(panel, TEXT.create(shadow_x=moving))
 
