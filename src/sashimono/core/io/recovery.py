@@ -313,17 +313,21 @@ def remembered_roots(registry: Path | None = None) -> list[Path]:
 
 
 def forget_empty_roots(keep: list[Path], registry: Path | None = None) -> None:
-    """覚えている置き場のうち、退避が 1 つも無い所を忘れる ``keep`` は残す
+    """覚えている置き場のうち、退避も控えも 1 つも無い所を忘れる ``keep`` は残す
 
     動いている窓の錠も退避の置き場にあるので、錠が残っている置き場は忘れない
-    （その窓が後で落ちたときに、探す所から外れないように）
+    （その窓が後で落ちたときに、探す所から外れないように） 控えだけが残る置き場も忘れない
+    置き場を変えても前の控えは移さないので、忘れると〔バックアップのフォルダを開く〕から
+    その控えへたどれない
     """
     kept = {_root_key(root) for root in keep}
     # 読んでから書き戻すまでを錠で守る 守らないと、その間にほかの窓が覚えた置き場を消す
     with _places_held(registry):
         places = remembered_roots(registry)
         remaining = [
-            place for place in places if _root_key(place) in kept or _has_files(place / "recovery")
+            place
+            for place in places
+            if _root_key(place) in kept or _has_files(place / "recovery") or _has_backups(place)
         ]
         if len(remaining) != len(places):
             _write_places(remaining, registry)
@@ -352,6 +356,13 @@ def _places_held(registry: Path | None) -> Iterator[None]:
         yield
     finally:
         lock.release()
+
+
+def _has_backups(root: Path) -> bool:
+    """Sashimono の控えが 1 本でも残っているか 置き場が見えない（抜いたドライブ）ときも残す側"""
+    if not (root / "backups").exists():
+        return not Path(root.anchor).exists()
+    return any(_generations(folder) for folder in _backup_folders(root))
 
 
 def _root_key(root: Path) -> str:

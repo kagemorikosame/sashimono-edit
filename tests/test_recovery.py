@@ -499,6 +499,19 @@ class TestRememberedFolders:
         # B は空なので忘れる A は落ちた作業が残っている C は今使っている
         assert remembered_roots(registry) == [tmp_path / "C", tmp_path / "A"]
 
+    def test_a_folder_with_only_backups_left_is_not_forgotten(self, tmp_path: Path) -> None:
+        # 置き場を変えても前の控えは移さない 忘れると、その控えへ画面からたどれない
+        registry = tmp_path / "既定"
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        backup_before_save(target, tmp_path / "A")
+        RecoverySession(tmp_path / "A").close()
+        RecoverySession(tmp_path / "B").close()
+        remember_root(tmp_path / "A", registry)
+        remember_root(tmp_path / "B", registry)
+        forget_empty_roots([], registry)
+        assert remembered_roots(registry) == [tmp_path / "A"]
+
 
 class TestRememberingFromTwoWritersAtOnce:
     """違う設定の窓が同時に覚えても、両方の置き場が残る

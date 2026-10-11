@@ -426,6 +426,46 @@ def window_with_backups(
     created.close()
 
 
+class TestBackupsLeftInTheOldFolder:
+    def test_the_folder_menu_reaches_them_after_a_move(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 置き場を A から B へ変えた 前の控えは A に残す決まりなので、A を探さないと
+        # 控えがあるのに「バックアップはありません」と出て、画面からたどれない
+        del qt_application
+        opened: list[QUrl] = []
+
+        def fake_open(url: QUrl) -> bool:
+            opened.append(url)
+            return True
+
+        monkeypatch.setattr(QDesktopServices, "openUrl", fake_open)
+        monkeypatch.setattr(RecoveryDialog, "exec", lambda _dialog: QDialog.DialogCode.Rejected)
+        old, new = tmp_path / "A", tmp_path / "B"
+        target = tmp_path / "本編.sme"
+        target.write_text("前の中身", encoding="utf-8")
+        first = _window(Preferences(state_folder=str(old)))
+        try:
+            first._path = target
+            first.execute(RenameProject("作業中"))
+            assert first.save_project()
+            first._apply_preferences(Preferences(state_folder=str(new)))
+            first.open_backup_folder()
+            expected = QUrl.fromLocalFile(str(backup_folder(target, old / STATE_SUBFOLDER)))
+            assert opened == [expected]
+        finally:
+            first.close()
+        # 次の起動でも、退避の無い前の置き場を忘れずに探す
+        second = _window()
+        try:
+            second.offer_recovery()
+            second._path = target
+            second.open_backup_folder()
+            assert opened[-1] == expected
+        finally:
+            second.close()
+
+
 class TestABrokenCopyInTheChosenFolder:
     def test_the_folder_menu_opens_the_good_copy(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

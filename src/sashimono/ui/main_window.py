@@ -2347,11 +2347,12 @@ class MainWindow(QMainWindow):
         if self._path is None:
             self.statusBar().showMessage("まだ保存していないので、バックアップはありません", 5000)
             return
-        # 設定の置き場と既定の置き場のうち、使える控えのいちばん新しい方を開く 設定の置き場へ
-        # 書けなかった保存の控えは既定の側にある フォルダがあるかで決めると、空のフォルダや
-        # 古い控えしか無い方を開き、正しい控えへたどり着けない
-        roots = [state_root_for(self._preferences), default_state_root()]
-        folder = latest_backup_folder(self._path, roots)
+        # 設定の置き場・既定の置き場・前に使った置き場（覚えた置き場）のうち、使える控えの
+        # いちばん新しい方を開く 設定の置き場へ書けなかった保存の控えは既定の側にあり、
+        # 置き場を変える前の控えは前の置き場に残る（移さない決まり） 探さないと、控えが
+        # あるのに「ありません」と出る フォルダがあるかで決めると、空のフォルダや古い控え
+        # しか無い方を開き、正しい控えへたどり着けない
+        folder = latest_backup_folder(self._path, recovery_roots(self._preferences))
         if folder is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
             return
