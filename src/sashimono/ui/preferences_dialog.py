@@ -488,6 +488,15 @@ class PreferencesDialog(QDialog):
             "切っても、選んだ 1 本の大きな下絵は出る"
         )
         form.addRow(self._shelf_thumbnails)
+        self._save_overwrite = QCheckBox(
+            "プリセットやエイリアスを保存するとき、同じ名前なら確認せず上書きする", self
+        )
+        self._save_overwrite.setChecked(preferences.save_overwrite_without_asking)
+        self._save_overwrite.setToolTip(
+            "切っていると、保存の窓で同じ名前を選んだときに「上書きする」の印を入れるまで"
+            "保存できない 入れると印が最初から入る どちらでも前の内容はごみ箱へ移り、戻せる"
+        )
+        form.addRow(self._save_overwrite)
 
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
@@ -854,6 +863,7 @@ class PreferencesDialog(QDialog):
             library_backdrop=str(self._library_backdrop.currentData()),
             library_confirm_delete=self._library_confirm_delete.isChecked(),
             shelf_thumbnails=self._shelf_thumbnails.isChecked(),
+            save_overwrite_without_asking=self._save_overwrite.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

@@ -299,6 +299,50 @@ class Library:
         self._make_room(kind, item, keep=(), overwrite=overwrite)
         return self._entry(kind, item, self._save(item))
 
+    # --- 保存（#276 追記 保存の窓） ---
+
+    def occupant(
+        self,
+        kind: LibraryKind,
+        item: Item,
+        entries: tuple[LibraryEntry, ...] | None = None,
+    ) -> LibraryEntry | None:
+        """``item`` を保存すると上書きになる、いまある物 無ければ ``None``
+
+        エイリアスの置き場は名前だけで決まるので、分類が違っても同じ名前なら上書きになる
+        保存の窓はこれを出して、上書きの印と前後の見本を見せる ``entries`` は窓が読んだ
+        一覧 打つたびに置き場を全部読み直さないため（読み直しは保存の時の照らし合わせが受け持つ）
+        """
+        occupants = self._occupants(kind, item, keep=())
+        if not occupants:
+            return None
+        listed = entries if entries is not None else self.entries(kind)
+        return next(
+            (entry for entry in listed if any(_same_file(entry.path, path) for path in occupants)),
+            None,
+        )
+
+    def save(
+        self, kind: LibraryKind, item: Item, *, replacing: LibraryEntry | None = None
+    ) -> LibraryEntry:
+        """保存する 同じ名前の物があれば、``replacing`` で上書きを明かに頼んだときだけ上書きする
+
+        ``replacing`` は窓が見せた、上書きされる物 上書きされる前の内容はごみ箱へ移し、
+        戻せるようにする（名前の変更・読み込みと同じ） 窓を出した後でほかの窓が保存し直して
+        いたら :class:`LibraryChangedError`（見せた物と違う物を消さない） 頼まずに同じ名前が
+        あれば :class:`LibraryConflictError`
+        """
+        occupants = self._occupants(kind, item, keep=())
+        if occupants:
+            if replacing is None:
+                where = f"「{item.category}」に" if kind == PRESET else ""
+                raise LibraryConflictError(f"{where}「{item.name}」がもうある")
+            self._require(replacing)
+            if not any(_same_file(path, replacing.path) for path in occupants):
+                raise LibraryChangedError(f"「{item.name}」はほかの窓で別の物に変わった")
+            self._to_trash(kind, replacing.item, occupants)
+        return self._entry(kind, item, self._save(item))
+
     # --- 中の手順 ---
 
     def _rewrite(self, entry: LibraryEntry, changed: Item, *, overwrite: bool) -> LibraryEntry:

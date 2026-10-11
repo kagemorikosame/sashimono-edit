@@ -2408,7 +2408,13 @@ class MainWindow(QMainWindow):
         from sashimono.ui.library_dialog import open_library
 
         sources = self._timeline.add_sources
-        open_library(self, Library(presets=sources.presets, aliases=sources.aliases), kind=PRESET)
+        open_library(
+            self,
+            Library(presets=sources.presets, aliases=sources.aliases),
+            kind=PRESET,
+            # 〔いまのクリップで上書き〕は設定パネルが見ているクリップ（選んでいれば）
+            capture=self._inspector.capture_look,
+        )
 
     def show_templates(self) -> None:
         """テンプレートの棚を開いて、選ばれたものを反映する

@@ -60,6 +60,8 @@ class LibraryOptions:
     confirm_delete: bool = True
     #: テンプレートの棚の一覧にも見本の絵を出す（描き方は :attr:`thumbnails` と同じ）
     shelf: bool = True
+    #: 保存するとき、同じ名前なら確認せず上書きする（保存の窓の上書きの印を最初から入れる）
+    overwrite_without_asking: bool = False
 
 
 #: 見えている項目の見本を頼むまで待つ長さ（ミリ秒）

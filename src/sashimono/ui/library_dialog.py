@@ -102,6 +102,9 @@ _KEY = Qt.ItemDataRole.UserRole + 1
 
 T = TypeVar("T")
 
+#: いまのクリップの見た目を、（種類, 名前, 分類）で保存する形にする手 できなければ ``None``
+Capture = Callable[[LibraryKind, str, str], Preset | Alias | None]
+
 
 class LibraryDialog(QDialog):
     """整理の窓 ``pick`` の種類だけ〔当てる〕〔置く〕で選べる（選んだ物は :attr:`chosen`）"""
@@ -112,6 +115,7 @@ class LibraryDialog(QDialog):
         *,
         kind: LibraryKind = PRESET,
         pick: LibraryKind | None = None,
+        capture: Capture | None = None,
         thumbnails: LookThumbnails | None = None,
         options: LibraryOptions | None = None,
         parent: QWidget | None = None,
@@ -121,6 +125,8 @@ class LibraryDialog(QDialog):
         self.resize(780, 540)
         self._library = library
         self._pick = pick
+        #: いまのクリップの見た目を保存する形にする手（〔いまのクリップで上書き〕） 無ければ出さない
+        self._capture = capture
         self._options = options if options is not None else library_options()
         # 描き方は設定を当てたときに係へ渡してある（``set_library_options``）
         self._thumbnails = thumbnails if thumbnails is not None else shared_thumbnails()
@@ -176,6 +182,7 @@ class LibraryDialog(QDialog):
         self._rename_button = self._button("名前を変える…", self.rename_selected)
         self._category_button = self._button("分類を変える…", self.recategorize_selected)
         self._duplicate_button = self._button("複製…", self.duplicate_selected)
+        self._replace_button = self._button("いまのクリップで上書き…", self.replace_with_current)
         self._delete_button = self._button("削除", self.delete_selected)
         self._export_button = self._button("書き出す…", self.export_selected)
         self._import_button = self._button("読み込む…", self.import_files)
@@ -193,6 +200,7 @@ class LibraryDialog(QDialog):
             self._rename_button,
             self._category_button,
             self._duplicate_button,
+            self._replace_button,
             self._delete_button,
             self._restore_button,
             self._purge_button,
@@ -451,11 +459,14 @@ class LibraryDialog(QDialog):
             self._pick_button,
         ):
             button.setVisible(not trash and (button is not self._pick_button or bool(self._pick)))
+        # いまのクリップが分からない所（何も選んでいないなど）では出さない
+        self._replace_button.setVisible(not trash and self._capture is not None)
         for button in (self._restore_button, self._purge_button, self._empty_button):
             button.setVisible(trash)
         self._pick_button.setEnabled(len(chosen) == 1 and self._pick == self.kind)
         self._rename_button.setEnabled(len(chosen) == 1)
         self._duplicate_button.setEnabled(len(chosen) == 1)
+        self._replace_button.setEnabled(len(chosen) == 1 and self._capture is not None)
         self._category_button.setEnabled(bool(chosen))
         self._delete_button.setEnabled(bool(chosen))
         self._export_button.setEnabled(bool(chosen))
@@ -503,6 +514,37 @@ class LibraryDialog(QDialog):
         self.refresh()
         self.show_folder(_CATEGORY + category)
         self.select(*moved)
+
+    def replace_with_current(self) -> None:
+        """選んだ物を、いまのクリップの見た目で上書きする 名前を打ち直さずに更新する
+
+        前の内容はごみ箱へ移す（保存の窓の上書きと同じ :meth:`Library.save`） 一覧を出した後で
+        ほかの窓が保存し直していたら断って読み直す
+        """
+        chosen = self._selected()
+        if len(chosen) != 1 or self._capture is None:
+            return
+        entry = chosen[0]
+        item = self._capture(entry.kind, entry.name, entry.category)
+        if item is None:
+            self.tell(
+                "いまのクリップで上書き",
+                f"いまのクリップは{_KIND_LABELS[entry.kind]}にできない"
+                "（クリップを選んでいない・素材やシーンのクリップ など）",
+            )
+            return
+        if not self._options.overwrite_without_asking and not self.confirm(
+            "いまのクリップで上書き",
+            f"「{entry.name}」をいまのクリップの見た目で上書きする？ 前の内容はごみ箱へ移る",
+        ):
+            return
+        done = self._run(
+            functools.partial(self._library.save, entry.kind, item, replacing=entry),
+            overwritable=False,
+        )
+        if done is not None:
+            self.refresh()
+            self.select(done.name)
 
     def duplicate_selected(self) -> None:
         chosen = self._selected()
@@ -722,9 +764,10 @@ def open_library(
     *,
     kind: LibraryKind,
     pick: LibraryKind | None = None,
+    capture: Capture | None = None,
 ) -> LibraryEntry | None:
     """整理の窓を開く 〔当てる〕〔置く〕で選ばれた物を返す（閉じただけなら ``None``）"""
-    dialog = LibraryDialog(library, kind=kind, pick=pick, parent=parent)
+    dialog = LibraryDialog(library, kind=kind, pick=pick, capture=capture, parent=parent)
     answer = dialog.exec()
     chosen = dialog.chosen
     # 開くたびに作る窓 閉じたら捨てる

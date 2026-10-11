@@ -371,6 +371,10 @@ class Preferences:
     #: 「プリセットの見本」と同じ 棚は数が多く、GPU や置き場を使わせたくない人は切れる
     #: 切っても選んだ 1 本の大きな下絵は出る
     shelf_thumbnails: bool = True
+    #: プリセットやエイリアスを保存するとき、同じ名前なら確認せず上書きする 既定は切
+    #: （保存の窓の「同じ名前があれば上書きする」の印は外れていて、入れるまで保存できない）
+    #: 同じ物を何度も作り直す人は入れる 入れても前の内容はごみ箱へ移る
+    save_overwrite_without_asking: bool = False
     #: 設定パネルで、焦点の無い欄（クリックしていない選択の欄・数値の欄・スライダー）でも
     #: ホイールで値を変える 既定は切 切っていると、焦点の無い欄の上のホイールはパネルを送る
     #: 入れていると、パネルを送る途中で通った欄の値が変わり、気付かずに取り消しの段が積まれる
@@ -491,6 +495,7 @@ class Preferences:
             backdrop=self.library_backdrop,
             confirm_delete=self.library_confirm_delete,
             shelf=self.shelf_thumbnails,
+            overwrite_without_asking=self.save_overwrite_without_asking,
         )
 
     def prefetch_bytes(self) -> int:
@@ -589,6 +594,9 @@ class PreferenceStore:
                 data.get("library_confirm_delete"), plain.library_confirm_delete
             ),
             shelf_thumbnails=_flag(data.get("shelf_thumbnails"), plain.shelf_thumbnails),
+            save_overwrite_without_asking=_flag(
+                data.get("save_overwrite_without_asking"), plain.save_overwrite_without_asking
+            ),
             wheel_unfocused=_flag(data.get("wheel_unfocused"), plain.wheel_unfocused),
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),

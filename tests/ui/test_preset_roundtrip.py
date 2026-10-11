@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QEvent
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from sashimono.compat.aviutl import catalog as catalog_module
 from sashimono.compat.aviutl.catalog import ScriptCatalog, set_script_catalog
@@ -33,6 +33,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io import Preset, PresetStore
+from sashimono.core.io.library import PRESET, Library
 from sashimono.core.io.presets import FORMAT_NAME, SUFFIX
 from sashimono.core.model import (
     AnimatedValue,
@@ -50,6 +51,8 @@ from sashimono.effects import registry
 from sashimono.effects.sources import TEXT, TRANSITION
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.engine.render import FrameRenderer
+from sashimono.ui import library_save
+from sashimono.ui.library_save import SaveChoice
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
@@ -145,9 +148,23 @@ def _save_action(window: MainWindow) -> QAction:
     return next(a for a in _actions(_menu(window)) if a.data() == "save_preset")
 
 
-def _save(window: MainWindow, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    """メニューの「保存」を押し、名前の窓に ``name`` を打って決める"""
-    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: (name, True))
+def _save(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, name: str, *, overwrite: bool = False
+) -> None:
+    """メニューの「保存」を押し、保存の窓で ``name`` を打って決める
+
+    ``overwrite`` は保存の窓の「同じ名前があれば上書きする」の印 窓が上書きされる物として
+    見せた物（:meth:`Library.occupant`）を渡す
+    """
+
+    def ask(
+        _parent: object, library: Library, kind: str, *, make: object, category: str, **_k: object
+    ) -> SaveChoice:
+        item = make(name, category)  # type: ignore[operator]
+        replacing = library.occupant(kind, item) if overwrite else None  # type: ignore[arg-type]
+        return SaveChoice(name=name, category=category, replacing=replacing)
+
+    monkeypatch.setattr(library_save, "ask_save", ask)
     action = _save_action(window)
     assert action.isEnabled()
     window._inspector.run_preset_action(action)
@@ -312,27 +329,26 @@ class TestChoosingAndSaving:
         _save(window, monkeypatch, "見出し")
         _run(window, SetParam(ParamPath.of_source(source_clip.id, "color"), BLUE))
 
-        asked: list[str] = []
-
-        def decline(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
-            asked.append(str(args[2]))
-            return QMessageBox.StandardButton.No
-
-        monkeypatch.setattr(QMessageBox, "question", decline)
+        told: list[str] = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **_k: told.append(str(a[2])))
         _save(window, monkeypatch, "見出し")
-        # 断ったら前の物が残る 前は確かめずに書き換え、作り直せないプリセットが消えた
-        assert asked
+        # 上書きを指定しなければ前の物が残る 前は確かめずに書き換え、作り直せないプリセットが消えた
+        assert told
         (kept,) = store.all()
         assert kept.source is not None
         assert kept.source.params["color"] != BLUE
 
-        monkeypatch.setattr(
-            QMessageBox, "question", lambda *_a, **_k: QMessageBox.StandardButton.Yes
-        )
-        _save(window, monkeypatch, "見出し")
+        _save(window, monkeypatch, "見出し", overwrite=True)
         (replaced,) = store.all()
         assert replaced.source is not None
         assert replaced.source.params["color"] == BLUE
+        # 上書きした前の内容はごみ箱へ移り、戻せる（#276 の追記）
+        library = Library(presets=store)
+        (trashed,) = library.trashed(PRESET)
+        library.restore(trashed, overwrite=True)
+        (back,) = store.all()
+        assert back.source is not None
+        assert back.source.params["color"] != BLUE
 
     def test_an_old_preset_is_listed_and_applied(
         self, window: MainWindow, store: PresetStore

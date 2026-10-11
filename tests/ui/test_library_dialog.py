@@ -521,7 +521,7 @@ class TestEntrances:
         QApplication.processEvents()
 
         def fake_open(
-            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None, **_k: object
         ) -> LibraryEntry:
             return next(e for e in shown.entries(PRESET) if e.name == "光")
 
@@ -560,7 +560,7 @@ class TestEntrances:
         monkeypatch.setattr(panel_module, "apply_preset_commands", spy)
 
         def fake_open(
-            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None, **_k: object
         ) -> LibraryEntry:
             return next(e for e in shown.entries(PRESET) if e.name == "赤")
 
@@ -580,7 +580,7 @@ class TestEntrances:
         opened: list[tuple[str, str | None]] = []
 
         def fake_open(
-            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None, **_k: object
         ) -> LibraryEntry:
             opened.append((kind, pick))
             # 窓に渡す置き場は、設定パネルが持っている物と同じ
@@ -604,7 +604,7 @@ class TestEntrances:
         self, window: MainWindow, library: Library
     ) -> None:
         def fake_open(
-            _parent: object, shown: Library, *, kind: str, pick: str | None = None
+            _parent: object, shown: Library, *, kind: str, pick: str | None = None, **_k: object
         ) -> LibraryEntry:
             assert (kind, pick) == (ALIAS, ALIAS)
             return next(e for e in shown.entries(ALIAS) if e.name == "テロップ")

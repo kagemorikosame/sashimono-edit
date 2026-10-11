@@ -292,6 +292,37 @@ class TestLegacyFiles:
         assert [t.name for t in library.trashed(PRESET)] == ["見出し"]
 
 
+class TestSave:
+    """保存の窓（#276 の追記）の保存 上書きは明かに頼んだときだけ、前の内容はごみ箱へ"""
+
+    def test_a_taken_name_is_refused_unless_replacing_is_given(self, library: Library) -> None:
+        library.presets.save(Preset.capture("赤", _clip("前")))
+        item = Preset.capture("赤", _clip("後"))
+        with pytest.raises(LibraryConflictError):
+            library.save(PRESET, item)
+        shown = library.occupant(PRESET, item)
+        assert shown is not None
+        library.save(PRESET, item, replacing=shown)
+        (now,) = library.presets.all()
+        assert now.source is not None and now.source.params["text"] == "後"
+        assert [t.name for t in library.trashed(PRESET)] == ["赤"]
+
+    def test_an_alias_in_another_category_is_the_same_file(self, library: Library) -> None:
+        library.aliases.save(Alias.of("テロップ", _clip(), category="字幕"))
+        shown = library.occupant(ALIAS, Alias.of("テロップ", _clip(), category="別"))
+        assert shown is not None and shown.category == "字幕"
+
+    def test_a_save_elsewhere_after_showing_is_not_overwritten(self, library: Library) -> None:
+        library.presets.save(Preset.capture("赤", _clip("前")))
+        item = Preset.capture("赤", _clip("いま"))
+        shown = library.occupant(PRESET, item)
+        library.presets.save(Preset.capture("赤", _clip("ほかの窓")))
+        with pytest.raises(LibraryChangedError):
+            library.save(PRESET, item, replacing=shown)
+        (now,) = library.presets.all()
+        assert now.source is not None and now.source.params["text"] == "ほかの窓"
+
+
 class TestExchange:
     def test_export_then_import_on_another_machine(self, library: Library, tmp_path: Path) -> None:
         library.presets.save(Preset.capture("赤", _clip(), category="見出し"))
