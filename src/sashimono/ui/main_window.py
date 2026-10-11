@@ -248,6 +248,20 @@ def _probe_or_none(path: Path) -> MediaItem | None:
         return None
 
 
+def _removal_note(head: str, done: list[TrimItem], failed: list[TrimItem]) -> str:
+    """片付けの知らせ 消せた物と、消せなかった物の数 どちらも無ければ空
+
+    消せなかった物があっても、消せた物を必ず書く 消せた物を書かずに失敗だけを伝えると、
+    本人は何も消えていないと思う
+    """
+    parts = []
+    if done:
+        parts.append(f"{head}: " + describe_trim(done).replace("\n", " "))
+    if failed:
+        parts.append(f"{len(failed)} 件は消せなかったので残した")
+    return " ／ ".join(parts)
+
+
 @dataclass(frozen=True, slots=True)
 class _DropTarget:
     """タイムラインへ落とされた読み込みの置き先 位置と、落としたときに開いていたシーン
@@ -961,11 +975,11 @@ class MainWindow(QMainWindow):
             # 確かめた物そのもの 当てる時に計画を立て直すと、確かめた後に退避を移したなどで
             # 中身が変わり、見せていない物まで消える 見せた数と消える数をそろえる
             # 上限に収まりきらない分は、次の上書き保存のときの片付け（消した物を知らせる）に任せる
-            done = discard_items(approved_trim)
-            if done:
-                self.statusBar().showMessage(
-                    "確かめた物を片付けた: " + describe_trim(done).replace("\n", " "), 15000
-                )
+            failed: list[TrimItem] = []
+            done = discard_items(approved_trim, failed=failed)
+            note = _removal_note("確かめた物を片付けた", done, failed)
+            if note:
+                self.statusBar().showMessage(note, 15000)
 
     def _apply_autosave_timer(self, preferences: Preferences) -> None:
         """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
@@ -2455,16 +2469,25 @@ class MainWindow(QMainWindow):
                 return
             action, entry = dialog.choice
             if action == "discard":
-                discard(entry)
+                try:
+                    discard(entry)
+                except OSError as exc:
+                    # 消せない物を残したまま窓を出し直すと、同じ 1 件を何度も尋ねる
+                    self.statusBar().showMessage(f"退避を捨てられなかった: {exc}", 15000)
+                    return
                 continue
             self.restore_recovery(entry)
             return
 
     def _tidy_state(self, roots: list[Path]) -> None:
         """日数を過ぎた残りの退避と、容量の上限を超えた古い物を片付けて知らせる"""
+        # 1 件消せなくても続ける 消せた物と消せなかった物の両方を知らせる
+        # （途中で止めると、それまでに消した物が知らされない）
+        left: list[RecoveryEntry] = []
         try:
-            tidied = tidy_orphans(roots, self._preferences.recovery_keep_days)
+            tidied = tidy_orphans(roots, self._preferences.recovery_keep_days, failed=left)
         except OSError:
+            # 退避を探す所で読めなかった 何も消していない
             tidied = []
         notes = []
         if tidied:
@@ -2472,6 +2495,8 @@ class MainWindow(QMainWindow):
                 f"{self._preferences.recovery_keep_days} 日より前に落ちた作業の退避を "
                 f"{len(tidied)} 件片付けた"
             )
+        if left:
+            notes.append(f"落ちた作業の退避 {len(left)} 件は消せなかったので残した")
         trimmed = self._trim_state()
         if trimmed:
             notes.append(trimmed)
@@ -2487,15 +2512,14 @@ class MainWindow(QMainWindow):
         limit_mb = self._preferences.state_limit_mb
         if limit_mb <= 0:
             return ""
-        items = []
+        items: list[TrimItem] = []
+        failed: list[TrimItem] = []
         for root in state_roots(self._preferences):
+            # 1 件消せなくても trim_state は続けて、消せた物を返す ここで包むのは、
+            # 置き場そのものを読めない（消す前に止まり、何も消していない）ときだけ
             with contextlib.suppress(OSError):
-                items.extend(trim_state(limit_mb * 1024 * 1024, root))
-        if not items:
-            return ""
-        return f"容量の上限 {limit_mb}MB を超えたので片付けた: " + describe_trim(items).replace(
-            "\n", " "
-        )
+                items.extend(trim_state(limit_mb * 1024 * 1024, root, failed=failed))
+        return _removal_note(f"容量の上限 {limit_mb}MB を超えたので片付けた", items, failed)
 
     def restore_recovery(self, entry: RecoveryEntry) -> bool:
         """退避を開く 保存はしないので、開いた直後は「変更あり」になる
@@ -2527,9 +2551,14 @@ class MainWindow(QMainWindow):
             self._request_proxy(media)
 
         self.autosave()
+        note = ""
         if self._autosaved is project:
-            discard(entry)
-        self.statusBar().showMessage("前回の作業を復元した まだ保存していません", 6000)
+            try:
+                discard(entry)
+            except OSError:
+                # 写した後の元を消せなかった 次の起動でもう 1 度勧められるだけで、作業は失わない
+                note = "（元の退避は消せなかったので、次の起動でもう 1 度尋ねます）"
+        self.statusBar().showMessage(f"前回の作業を復元した まだ保存していません{note}", 6000)
         return True
 
     def export(self) -> None:

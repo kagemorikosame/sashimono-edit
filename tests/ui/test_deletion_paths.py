@@ -9,8 +9,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -267,3 +270,120 @@ class TestOtherPathsKeepTheOld:
         finally:
             monkeypatch.undo()
             created.close()
+
+
+def _refuse(monkeypatch: pytest.MonkeyPatch, *blocked: Path) -> None:
+    """その場所だけ消せなくする（使っている最中・権限が無い など）"""
+    plain = Path.unlink
+    keys = {os.path.normcase(str(path)) for path in blocked}
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if os.path.normcase(str(self)) in keys:
+            raise PermissionError(f"使用中: {self}")
+        plain(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+
+def _crash_in(root: Path, name: str, days_ago: int) -> Path:
+    crashed = RecoverySession(root)
+    crashed.save(Project.create(name=name), None)
+    lock = crashed._lock
+    assert lock is not None
+    lock.abandon()
+    crashed._lock = None
+    meta = crashed.path.with_suffix(".json")
+    data = json.loads(meta.read_text(encoding="utf-8"))
+    data["saved_at"] = (datetime.now() - timedelta(days=days_ago)).isoformat()
+    meta.write_text(json.dumps(data), encoding="utf-8")
+    return crashed.path
+
+
+class TestAFailureMidwayIsStillTold:
+    """途中の 1 件で失敗しても、消せた物を知らせ、残りも続けて片付ける"""
+
+    def test_trimming_after_a_save(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        del qt_application
+        target = tmp_path / "本編.sme"
+        made = _fill(target, 4)
+        created = _window(Preferences(state_limit_mb=1))
+        try:
+            for path in made:
+                path.write_bytes(b"x" * 400_000)
+            _refuse(monkeypatch, made[1])
+            message = created._trim_state()
+            assert "片付けた" in message and "1 件は消せなかった" in message
+            assert not made[0].exists() and made[1].is_file()
+        finally:
+            monkeypatch.undo()
+            created.close()
+
+    def test_applying_what_was_confirmed(
+        self, window_with_backups: tuple[MainWindow, list[Path]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        created, made = window_with_backups
+        asked = _answer(monkeypatch, yes=True)
+        approved: list[TrimItem] = []
+        after = Preferences(backup_generations=2)
+        assert confirm_backup_changes(None, Preferences(), after, approved)
+        assert _shown_count(asked[0]) == 4
+        _refuse(monkeypatch, made[1])
+        created._apply_preferences(after, approved)
+        message = created.statusBar().currentMessage()
+        assert "確かめた物を片付けた: 3 件" in message and "1 件は消せなかった" in message
+        assert [path.exists() for path in made] == [False, True, False, False, True, True]
+
+    def test_tidying_at_start(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        del qt_application
+        paths = [_crash_in(default_state_root(), name, 10) for name in ("一", "二", "三")]
+        monkeypatch.setattr(RecoveryDialog, "exec", lambda _dialog: 0)
+        created = _window(Preferences(recovery_keep_days=7))
+        try:
+            _refuse(monkeypatch, paths[1])
+            created.offer_recovery()
+            message = created.statusBar().currentMessage()
+            assert "2 件片付けた" in message and "1 件は消せなかった" in message
+            assert [path.exists() for path in paths] == [False, True, False]
+        finally:
+            monkeypatch.undo()
+            created.close()
+
+    def test_a_discard_that_fails_is_told_and_not_asked_again(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 消せない物を残したまま窓を出し直すと、同じ 1 件を何度も尋ねる
+        del qt_application
+        path = _crash_in(default_state_root(), "捨てる", 0)
+        shown: list[int] = []
+
+        def discard_it(dialog: RecoveryDialog) -> int:
+            shown.append(1)
+            dialog.choice = ("discard", dialog._entries[0])
+            return 1
+
+        monkeypatch.setattr(RecoveryDialog, "exec", discard_it)
+        created = _window()
+        try:
+            _refuse(monkeypatch, path)
+            created.offer_recovery()
+            assert shown == [1]
+            assert path.is_file()
+            assert "捨てられなかった" in created.statusBar().currentMessage()
+        finally:
+            monkeypatch.undo()
+            created.close()
+
+
+@pytest.fixture
+def window_with_backups(
+    qt_application: QApplication, tmp_path: Path
+) -> Iterator[tuple[MainWindow, list[Path]]]:
+    del qt_application
+    made = _fill(tmp_path / "本編.sme", 6)
+    created = _window()
+    yield created, made
+    created.close()

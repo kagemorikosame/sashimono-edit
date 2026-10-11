@@ -35,6 +35,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
+from sashimono.core.io.recovery import TrimItem
 from sashimono.core.model import Project
 
 
@@ -490,3 +491,98 @@ class TestPruningGenerations:
         assert plan_trim(state_usage(state) - 300, state, already=pruned) == []
         extra = plan_trim(state_usage(state) - 450, state, already=pruned)
         assert [item.paths for item in extra] == [(made[4],)]
+
+
+def _refuse(monkeypatch: pytest.MonkeyPatch, *blocked: Path) -> None:
+    """その場所だけ消せなくする（使っている最中・権限が無い など）"""
+    plain = Path.unlink
+    keys = {os.path.normcase(str(path)) for path in blocked}
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if os.path.normcase(str(self)) in keys:
+            raise PermissionError(f"使用中: {self}")
+        plain(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+
+class TestAFailureMidwayDoesNotHideWhatWent:
+    """途中の 1 件で失敗しても、消せた物を返し、残りも続けて片付ける
+
+    途中で上げると、それまでに消した物が呼ぶ側に伝わらず、本人は消えたことを知らない
+    """
+
+    def _made(self, state: Path, count: int) -> list[Path]:
+        target = state.parent / "本編.sme"
+        made = []
+        for number in range(count):
+            target.write_bytes(bytes([number]) * 100)
+            copied = backup_before_save(target, state, keep=200)
+            assert copied is not None
+            made.append(copied)
+        return made
+
+    def test_trimming_goes_on_past_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 5)
+        _refuse(monkeypatch, made[1])
+        failed: list[TrimItem] = []
+        done = trim_state(1, state, failed=failed)
+        assert [item.paths for item in done] == [(made[0],), (made[2],), (made[3],)]
+        assert [item.paths for item in failed] == [(made[1],)]
+        assert [path.exists() for path in made] == [False, True, False, False, True]
+
+    def test_discarding_goes_on_past_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 4)
+        _refuse(monkeypatch, made[0])
+        failed: list[TrimItem] = []
+        done = discard_items(plan_prune(1, state), failed=failed)
+        assert len(done) == 2 and len(failed) == 1
+        assert [path.exists() for path in made] == [True, False, False, True]
+
+    def test_tidying_goes_on_past_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        entries = [_offered_orphan(tmp_path, name) for name in ("一", "二", "三")]
+        _refuse(monkeypatch, entries[1].path)
+        left: list[RecoveryEntry] = []
+        later = datetime.now() + timedelta(days=10)
+        tidied = tidy_orphans([tmp_path], 1, now=later, failed=left)
+        assert sorted(entry.name for entry in tidied) == ["一", "三"]
+        assert [entry.name for entry in left] == ["二"]
+
+    def test_discard_keeps_everything_when_the_content_cannot_go(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 中身を消せないのにメモを先に消すと、名前と元の場所が分からない退避が残る
+        entry = _offered_orphan(tmp_path, "残る")
+        _refuse(monkeypatch, entry.path)
+        with pytest.raises(OSError):
+            discard(entry)
+        assert entry.path.is_file()
+        assert (tmp_path / "recovery" / f"{entry.session}.json").is_file()
+
+    def test_discard_does_not_complain_after_the_content_went(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 中身を消せた後にメモを消せなくても、消えたことに変わりはない 上げると
+        # 「消せなかった」と伝わり、本人は残っていると思う
+        entry = _offered_orphan(tmp_path, "消える")
+        _refuse(monkeypatch, tmp_path / "recovery" / f"{entry.session}.json")
+        discard(entry)
+        assert not entry.path.exists()
+
+    def test_a_rotation_that_cannot_remove_still_reports_the_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = tmp_path / "state"
+        made = self._made(state, 2)
+        _refuse(monkeypatch, made[0])
+        copied = backup_before_save(tmp_path / "本編.sme", state, keep=2, most=1)
+        assert copied is not None and copied.is_file()
+        assert made[0].is_file()

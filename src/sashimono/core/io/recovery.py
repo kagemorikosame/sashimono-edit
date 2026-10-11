@@ -15,6 +15,7 @@ Qt を使わない 退避の判断はテストで直接確かめたいので、�
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -180,8 +181,10 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
         meta_path = folder / f"{session}.json"
         project_path = _saved_project(folder, session)
         if project_path is None:
-            meta_path.unlink(missing_ok=True)
-            _offered_path(folder, session).unlink(missing_ok=True)
+            # 中身の無いメモと印 消せなくても検索は止めない（次の検索でまた消しに行く）
+            with contextlib.suppress(OSError):
+                meta_path.unlink(missing_ok=True)
+                _offered_path(folder, session).unlink(missing_ok=True)
             continue
         if meta_path.is_file():
             try:
@@ -311,9 +314,22 @@ def folder_problem(root: Path) -> str | None:
 
 
 def discard(entry: RecoveryEntry) -> None:
-    """退避を捨てる 復元し終えたときと、要らないと言われたときに呼ぶ"""
-    for path in _session_files(entry):
-        path.unlink(missing_ok=True)
+    """退避を捨てる 復元し終えたときと、要らないと言われたときに呼ぶ
+
+    中身を先に消す 中身を消せなければ ``OSError`` を上げ、何も消していない
+    中身を消せた後のメモ・錠・印は消せなくても上げない（中身の無いメモは次の検索で片付く）
+    途中で上げると、中身は消えたのに「消せなかった」と伝わる
+    """
+    _remove_files(_session_files(entry))
+
+
+def _remove_files(paths: tuple[Path, ...]) -> None:
+    """先頭（中身）を消し、残りは消せる分だけ消す 中身を消せなければ ``OSError``"""
+    head, *rest = paths
+    head.unlink(missing_ok=True)
+    for path in rest:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def _session_files(entry: RecoveryEntry) -> tuple[Path, ...]:
@@ -340,11 +356,20 @@ def mark_offered(entry: RecoveryEntry) -> None:
     _offered_path(entry.path.parent, entry.session).touch()
 
 
-def tidy_orphans(roots: list[Path], days: int, now: datetime | None = None) -> list[RecoveryEntry]:
+def tidy_orphans(
+    roots: list[Path],
+    days: int,
+    now: datetime | None = None,
+    *,
+    failed: list[RecoveryEntry] | None = None,
+) -> list[RecoveryEntry]:
     """復元を勧めたのに残っている退避のうち、``days`` 日より前の物を片付ける 片付けた物を返す
 
     ``days`` が 0 なら何もしない（既定 前からの動き） 勧めていない退避は古くても残す
     長く起動しなかった人のところで、一度も見ていない落ちた作業が消えないように
+
+    1 件消せなくても止めずに続ける 消せなかった物は ``failed`` へ足す 途中で上げると、
+    それまでに消した物が知らされない
     """
     if days <= 0:
         return []
@@ -352,7 +377,12 @@ def tidy_orphans(roots: list[Path], days: int, now: datetime | None = None) -> l
     tidied: list[RecoveryEntry] = []
     for entry in find_orphans_in(roots):
         if entry.offered and entry.saved_at <= limit:
-            discard(entry)
+            try:
+                discard(entry)
+            except OSError:
+                if failed is not None:
+                    failed.append(entry)
+                continue
             tidied.append(entry)
     return tidied
 
@@ -457,7 +487,10 @@ def backup_before_save(
     if most is not None:
         doomed = doomed[:most]
     for old in doomed:
-        old.unlink(missing_ok=True)
+        # 入れ替えで古い 1 本を消せなくても、新しい控えは書けている 上げると保存の知らせが
+        # 「バックアップは作れなかった」になり、作れた控えが無いことにされる
+        with contextlib.suppress(OSError):
+            old.unlink(missing_ok=True)
     return copied
 
 
@@ -502,8 +535,11 @@ def backups_over(keep: int, root: Path | None = None) -> int:
     return len(plan_prune(keep, root))
 
 
-def discard_items(items: Iterable[TrimItem]) -> list[TrimItem]:
-    """確かめた物を消す 消せた物を返す 消せなかった物（置き場が書けない）は飛ばす
+def discard_items(
+    items: Iterable[TrimItem], *, failed: list[TrimItem] | None = None
+) -> list[TrimItem]:
+    """確かめた物を消す 消せた物を返す 消せなかった物（置き場が書けない）は飛ばして続け、
+    ``failed`` へ足す 途中で上げると、それまでに消した物が知らされない
 
     同じファイルが 2 つの一覧（世代数と容量）に入っていても 1 度だけ数える
     """
@@ -515,9 +551,10 @@ def discard_items(items: Iterable[TrimItem]) -> list[TrimItem]:
             continue
         seen.update(keys)
         try:
-            for path in item.paths:
-                path.unlink(missing_ok=True)
+            _remove_files(item.paths)
         except OSError:
+            if failed is not None:
+                failed.append(item)
             continue
         done.append(item)
     return done
@@ -574,7 +611,7 @@ def plan_trim(
         return []
     candidates: list[TrimItem] = []
     for folder in _backup_folders(base):
-        # いちばん新しい控えは数から外す 世代数で消える物を除いた後のいちばん新しい物
+        # このプロジェクトのいちばん新しい控えは数から外す 世代数で消える物を除いた後の物
         remaining = [path for path in _generations(folder) if _root_key(path) not in gone]
         label = _backup_label(folder)
         candidates.extend(
@@ -602,22 +639,23 @@ def plan_trim(
 
 
 def trim_state(
-    limit: int, root: Path | None = None, *, allowed: Iterable[Path] | None = None
+    limit: int,
+    root: Path | None = None,
+    *,
+    allowed: Iterable[Path] | None = None,
+    failed: list[TrimItem] | None = None,
 ) -> list[TrimItem]:
     """容量を ``limit`` バイトに収めるよう古い物から片付ける 片付けた物を返す
 
     何を消すかの決まりは :func:`plan_trim` ``allowed`` を渡すと、その中にある物だけを消す
     本人に見せて確かめた一覧を渡す 確かめた後に置き場の中身が変わっても（退避を移した、
-    など）、確かめに出していない物は消さない
+    など）、確かめに出していない物は消さない 消せなかった物は飛ばして ``failed`` へ足す
     """
     items = plan_trim(limit, root)
     if allowed is not None:
         approved = {_root_key(path) for path in allowed}
         items = [item for item in items if all(_root_key(path) in approved for path in item.paths)]
-    for item in items:
-        for path in item.paths:
-            path.unlink(missing_ok=True)
-    return items
+    return discard_items(items, failed=failed)
 
 
 def _files(folder: Path) -> list[Path]:
