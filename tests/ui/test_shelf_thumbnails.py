@@ -294,3 +294,61 @@ def test_the_process_ends_cleanly_after_drawing(tmp_path: Path, shelf: Path | No
     )
     assert result.stdout.strip() == "ok True", result.stderr[-2000:]
     assert result.returncode == 0
+
+
+class TestAtomicPictures:
+    """見本の絵と読めなかった印も、書き手ごとの仮の名前で書いてから置き換える（#310 の決まり）"""
+
+    def test_pictures_and_marks_use_a_name_per_writer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import re
+
+        from sashimono.core.io import atomic
+
+        names: list[str] = []
+        real = atomic._replace
+
+        def spy(temporary: Path, path: Path) -> None:
+            names.append(temporary.name)
+            real(temporary, path)
+
+        monkeypatch.setattr(atomic, "_replace", spy)
+        root = _shelf(tmp_path / "棚")
+        service = LookThumbnails(tmp_path / "cache", mode=THUMBNAILS_SIMPLE)
+        try:
+            good = shelf_look(_entry(root, "見出し000"))
+            broken = shelf_look(_entry(root, "壊れ"))
+            keys = [service.request(good), service.request(broken)]
+            _wait(lambda: all(service.thumbnail(k) is not None for k in keys if k))
+        finally:
+            service.release()
+        assert any(re.fullmatch(r".+\.png\.[0-9a-f]{8}\.writing", n) for n in names)
+        assert any(re.fullmatch(r".+\.failed\.[0-9a-f]{8}\.writing", n) for n in names)
+        assert not list((tmp_path / "cache").rglob("*.writing*"))
+
+    def test_a_failed_write_keeps_the_old_picture(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from PySide6.QtGui import QImage
+
+        from sashimono.core.io import atomic
+        from sashimono.ui.library_thumbnails import THUMBNAIL_SIZE
+
+        service = LookThumbnails(tmp_path / "cache", mode=THUMBNAILS_SIMPLE)
+        try:
+            path = service._path("ab" * 16)
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"old picture")
+
+            def refuse(_temporary: Path, _path: Path) -> None:
+                raise OSError("試験で置き換えを断る")
+
+            monkeypatch.setattr(atomic, "_replace", refuse)
+            image = QImage(THUMBNAIL_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(0)
+            service._save("ab" * 16, image, empty=False)
+            assert path.read_bytes() == b"old picture"
+            assert not list(path.parent.glob("*.writing*"))
+        finally:
+            service.release()

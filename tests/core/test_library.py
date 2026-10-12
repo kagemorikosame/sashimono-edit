@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -433,3 +434,59 @@ class TestMany:
         assert len(library.entries(ALIAS)) == 300
         # 手元で 0.4 秒ほど CI の遅い機械でも窓を開く操作がもたつかない目安
         assert time.perf_counter() - started < 5.0
+
+
+class TestAtomicWrites:
+    """書き出しとごみ箱の覚え書きは、書き手ごとの仮の名前で書いてから置き換える（#310 の決まり）
+
+    決まった名前（``<名前>.writing``）だと、2 つの窓が同じ所へ同時に書いたときに相手の
+    書きかけを上書きする 失敗しても元のファイルは無傷で、仮のファイルも残らない
+    """
+
+    @pytest.fixture
+    def seen(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        from sashimono.core.io import atomic
+
+        names: list[str] = []
+        real = atomic._replace
+
+        def spy(temporary: Path, path: Path) -> None:
+            names.append(temporary.name)
+            real(temporary, path)
+
+        monkeypatch.setattr(atomic, "_replace", spy)
+        return names
+
+    def test_export_uses_a_name_per_writer(
+        self, library: Library, tmp_path: Path, seen: list[str]
+    ) -> None:
+        library.presets.save(Preset.capture("赤", _clip()))
+        seen.clear()
+        library.export(_entry(library, "赤"), tmp_path / "out")
+        assert [name for name in seen if name.startswith("赤.smep.")]
+        assert all(re.fullmatch(r".+\.[0-9a-f]{8}\.writing", name) for name in seen)
+
+    def test_the_trash_note_uses_a_name_per_writer(self, library: Library, seen: list[str]) -> None:
+        library.presets.save(Preset.capture("赤", _clip()))
+        seen.clear()
+        library.delete(_entry(library, "赤"))
+        assert any(re.fullmatch(r"entry\.json\.[0-9a-f]{8}\.writing", name) for name in seen)
+
+    def test_a_failed_export_leaves_the_old_file_whole(
+        self, library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.core.io import atomic
+
+        library.presets.save(Preset.capture("赤", _clip()))
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "赤.smep").write_text("前の書き出し", encoding="utf-8")
+
+        def refuse(_temporary: Path, _path: Path) -> None:
+            raise OSError("試験で置き換えを断る")
+
+        monkeypatch.setattr(atomic, "_replace", refuse)
+        with pytest.raises(OSError):
+            library.export(_entry(library, "赤"), out, overwrite=True)
+        assert (out / "赤.smep").read_text(encoding="utf-8") == "前の書き出し"
+        assert not list(out.glob("*.writing"))

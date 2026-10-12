@@ -35,6 +35,7 @@ from typing import Final, Literal
 
 from sashimono.core.io.aliases import SUFFIX as ALIAS_SUFFIX
 from sashimono.core.io.aliases import Alias, AliasStore
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.io.presets import LEGACY_SUFFIXES as PRESET_LEGACY_SUFFIXES
 from sashimono.core.io.presets import SUFFIX as PRESET_SUFFIX
 from sashimono.core.io.presets import TRASH_FOLDER, Preset, PresetStore
@@ -278,9 +279,9 @@ class Library:
         if target.exists() and not overwrite:
             raise LibraryConflictError(f"{target.name} がもうある")
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".writing")
-        temporary.write_text(json_text(entry.item.to_dict()), encoding="utf-8")
-        temporary.replace(target)
+        # 書き手ごとの仮の名前で書いてから置き換える（#310 の決まり） 決まった名前だと、2 つの
+        # 窓が同じ所へ同時に書き出したときに相手の書きかけを上書きする 失敗しても元は無傷
+        write_atomic(target, json_text(entry.item.to_dict()))
         return target
 
     def read_file(self, path: Path) -> tuple[LibraryKind, Item]:
@@ -415,7 +416,9 @@ class Library:
         entry = TrashEntry(kind, folder, item.name, item.category, time.time(), relatives)
         folder.mkdir(parents=True)
         # 覚え書きを先に書く 移している途中で落ちても、移した物がごみ箱の一覧に出る
-        (folder / _TRASH_NOTE).write_text(
+        # 書きかけの覚え書きは読めず、移した物がごみ箱の一覧から消えるので、書いてから置き換える
+        write_atomic(
+            folder / _TRASH_NOTE,
             json_text(
                 {
                     "kind": kind,
@@ -425,7 +428,6 @@ class Library:
                     "files": list(relatives),
                 }
             ),
-            encoding="utf-8",
         )
         moved: list[tuple[Path, Path]] = []
         try:

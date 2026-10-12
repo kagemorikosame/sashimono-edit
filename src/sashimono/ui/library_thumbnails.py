@@ -22,11 +22,12 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtCore import QBuffer, QIODevice, QObject, QSize, Qt, Signal
 from PySide6.QtGui import QImage
 
 from sashimono import __version__
 from sashimono.core.io.aliases import Alias
+from sashimono.core.io.atomic import write_atomic, write_atomic_bytes
 from sashimono.core.io.library import look_fingerprint
 from sashimono.core.io.presets import Preset
 from sashimono.engine.cache.store import default_cache_root
@@ -254,7 +255,7 @@ class LookThumbnails(QObject):
         path = self._path(key).with_suffix(_FAILED_SUFFIX)
         with contextlib.suppress(OSError):
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(reason, encoding="utf-8")
+            write_atomic(path, reason)
 
     def _remember(self, key: str, thumbnail: Thumbnail) -> None:
         self._memory[key] = thumbnail
@@ -292,13 +293,13 @@ class LookThumbnails(QObject):
             path.parent.mkdir(parents=True, exist_ok=True)
             if empty:
                 image.setText(_EMPTY_KEY, "1")
-            # 書きかけを読まないよう、別の名前に書いてから差し替える
-            # 形式は拡張子で決まるので、一時の名前も .png で終える
-            temporary = path.with_name(f"{path.stem}.writing.png")
-            if image.save(str(temporary)):
-                temporary.replace(path)
-            else:
-                temporary.unlink(missing_ok=True)
+            # 絵は手元で PNG のバイト列にしてから、書き手ごとの仮の名前で書いて置き換える
+            # （#310 の決まり） 決まった名前の仮のファイルだと、2 つの窓が同じ絵を同時に描いた
+            # ときに相手の書きかけを上書きし、壊れた絵を置く
+            data = _png_bytes(image)
+            if data is None:
+                return
+            write_atomic_bytes(path, data)
         except OSError:
             # 置き場に書けなくても見本は出す（次に開いたときに描き直すだけ）
             return
@@ -319,6 +320,16 @@ class LookThumbnails(QObject):
                 path.unlink(missing_ok=True)
         except OSError:
             return
+
+
+def _png_bytes(image: QImage) -> bytes | None:
+    """``image`` を PNG のバイト列にする 書けなければ ``None``"""
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    # 形式は文字で渡す 型の定義はバイト列だが、PySide6 はバイト列だと引数の形が違うと断る
+    if not image.save(buffer, "PNG"):  # type: ignore[call-overload]
+        return None
+    return bytes(buffer.data().data())
 
 
 def _to_thumbnail(image: np.ndarray) -> QImage:
