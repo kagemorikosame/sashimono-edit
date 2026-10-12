@@ -675,6 +675,16 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._restyle_keep_wrap)
 
+        self._ai_ask_questions = QCheckBox("あいまいなときは、AI が質問する", self)
+        self._ai_ask_questions.setChecked(preferences.ai_ask_questions)
+        self._ai_ask_questions.setToolTip(
+            "指示があいまいで、どう受け取るかで結果が大きく変わるときだけ、AI アシスタントが"
+            "作業の前に選択肢つきで質問する（1 つの話題で 1 回） 確かめれば分かることや、"
+            "後で簡単に直せることは聞かない 切ると聞き返さずに進める"
+            " 変えると、次の指示から新しい会話になる"
+        )
+        form.addRow(self._ai_ask_questions)
+
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
         )
@@ -832,5 +842,6 @@ class PreferencesDialog(QDialog):
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
+            ai_ask_questions=self._ai_ask_questions.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
         )

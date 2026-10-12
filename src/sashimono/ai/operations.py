@@ -102,7 +102,16 @@ from sashimono.effects.strokes import (
     takes_stroke_effect,
 )
 
-__all__ = ["OPERATIONS", "ImageResult", "Operation", "find_operation"]
+__all__ = [
+    "ASK_USER",
+    "OPERATIONS",
+    "Choice",
+    "ImageResult",
+    "Operation",
+    "QuestionSpec",
+    "find_operation",
+    "question_spec",
+]
 
 #: プレビュー画像の既定の横幅 小さめにしてあるのは、AI が見るのは
 #: 「意図した絵になっているか」であって、画素を数えるわけではないため
@@ -129,9 +138,110 @@ class Operation:
     handler: Callable[[EditorHost, dict[str, Any]], object]
     #: プロジェクトを変えるか 確認ダイアログの要否がこれで決まる
     writes: bool = False
+    #: 人に尋ねる道具か（#296） 編集画面では動かさず、ブリッジが答えを待つ
+    #: ``handler`` は引数を確かめて :class:`QuestionSpec` を返すだけ
+    asks: bool = False
 
     def __call__(self, host: EditorHost, arguments: dict[str, Any]) -> object:
         return self.handler(host, arguments)
+
+
+#: 質問の道具の名前 チャット欄が呼び出しの行を出し分けるのに使う
+ASK_USER = "ask_user"
+
+#: 選択肢の数 1 つは質問ではなく、5 つ以上はチャット欄に収まらず選ぶのも手間になる
+CHOICES_RANGE = (2, 4)
+#: 長さの上限（文字） チャット欄の幅（狭い画面で 300 画素ほど）でボタンの名前が
+#: 1 行に収まり、説明が 2 行ほどで済む長さ 超えたら切らずに断り、AI に縮めさせる
+#: 切ると、選択肢の違いを書いた所が消えて選べなくなる
+QUESTION_LIMIT = 200
+LABEL_LIMIT = 16
+DESCRIPTION_LIMIT = 60
+
+
+@dataclass(frozen=True, slots=True)
+class Choice:
+    """質問の選択肢 1 つ"""
+
+    label: str
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionSpec:
+    """AI からの質問 1 つ（ask_user の引数を確かめた物）"""
+
+    text: str
+    choices: tuple[Choice, ...]
+    #: 複数を選べるか
+    multiple: bool = False
+    #: 選択肢に無い答えを書いてよいか
+    free_text: bool = True
+
+
+def question_spec(arguments: dict[str, Any]) -> QuestionSpec:
+    """ask_user の引数を確かめる 合わなければ、直し方を書いて断る
+
+    型は緩く読まない ``bool("false")`` は真なので、AI が文字列で渡すと逆の設定の
+    質問が出る 文字列の欄に数や辞書が来たときも、``str`` で読むと中身の分からない
+    選択肢が並ぶ どちらも断って、正しい型で渡し直させる
+    """
+    text = _text_argument(arguments, "question", "question")
+    if not text:
+        raise ToolError("question（質問の文）が空です")
+    if len(text) > QUESTION_LIMIT:
+        raise ToolError(f"question は {QUESTION_LIMIT} 文字までにしてください（{len(text)} 文字）")
+    raw = arguments.get("choices")
+    low, high = CHOICES_RANGE
+    if not isinstance(raw, list) or not low <= len(raw) <= high:
+        raise ToolError(f"choices（選択肢）は {low}〜{high} 個にしてください")
+    choices: list[Choice] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ToolError("choices の各項目は label と description を持つ辞書にしてください")
+        label = _text_argument(entry, "label", "choices の label")
+        description = _text_argument(entry, "description", "choices の description")
+        if not label:
+            raise ToolError("choices の label（選択肢の名前）が空です")
+        if len(label) > LABEL_LIMIT:
+            raise ToolError(
+                f"label は {LABEL_LIMIT} 文字までにしてください 違いは description に書きます"
+                f"（{label}）"
+            )
+        if len(description) > DESCRIPTION_LIMIT:
+            raise ToolError(f"description は {DESCRIPTION_LIMIT} 文字までにしてください（{label}）")
+        choices.append(Choice(label, description))
+    labels = [choice.label for choice in choices]
+    if len(set(labels)) != len(labels):
+        # 同じ名前が並ぶと、どちらを選んだのか答えから見分けられない
+        raise ToolError("choices の label が重なっています 選択肢ごとに違う名前にしてください")
+    return QuestionSpec(
+        text=text,
+        choices=tuple(choices),
+        multiple=_flag_argument(arguments, "multiple", False),
+        free_text=_flag_argument(arguments, "free_text", True),
+    )
+
+
+def _text_argument(arguments: dict[str, Any], key: str, name: str) -> str:
+    """文字列の引数 省いたら空 文字列でなければ断る"""
+    value = arguments.get(key, "")
+    if not isinstance(value, str):
+        raise ToolError(f"{name} は文字列で渡してください（{type(value).__name__} が来ました）")
+    return value.strip()
+
+
+def _flag_argument(arguments: dict[str, Any], key: str, default: bool) -> bool:
+    """真偽値の引数 省いたら ``default`` true / false 以外（"false" などの文字列）は断る"""
+    value = arguments.get(key, default)
+    if not isinstance(value, bool):
+        raise ToolError(f"{key} は true か false で渡してください（{value!r} が来ました）")
+    return value
+
+
+def _ask_user(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del host  # 編集画面には触らない 答えを待つのはブリッジ
+    return question_spec(arguments)
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -2400,6 +2510,56 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"steps": _integer("戻す段数（既定 1）")}),
         handler=_undo,
         writes=True,
+    ),
+    Operation(
+        name=ASK_USER,
+        description=(
+            "ユーザーに質問し、答えを待つ 指示があいまいで、どう受け取るかで結果が大きく"
+            "変わるときだけ、作業の前に使う 答えは選んだ選択肢の label（selected）と、"
+            "ユーザーが自由に書いた文（free_text）で返る 返事が無ければ失敗で返る"
+        ),
+        schema=_schema(
+            {
+                "question": {
+                    "type": "string",
+                    "description": f"質問の文 1 つの話題だけを聞く（{QUESTION_LIMIT} 文字まで）",
+                    "maxLength": QUESTION_LIMIT,
+                },
+                "choices": {
+                    "type": "array",
+                    "description": (
+                        f"選択肢 {CHOICES_RANGE[0]}〜{CHOICES_RANGE[1]} 個"
+                        " 違いが分かるように、それぞれ短い名前と説明を付ける"
+                    ),
+                    "minItems": CHOICES_RANGE[0],
+                    "maxItems": CHOICES_RANGE[1],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": f"ボタンに出す名前（{LABEL_LIMIT} 文字まで）",
+                                "maxLength": LABEL_LIMIT,
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": (
+                                    f"選ぶと何をするか（{DESCRIPTION_LIMIT} 文字まで）"
+                                ),
+                                "maxLength": DESCRIPTION_LIMIT,
+                            },
+                        },
+                        "required": ["label", "description"],
+                        "additionalProperties": False,
+                    },
+                },
+                "multiple": _boolean("複数を選べるようにする（既定 false）"),
+                "free_text": _boolean("選択肢に無い答えを書けるようにする（既定 true）"),
+            },
+            ["question", "choices"],
+        ),
+        handler=_ask_user,
+        asks=True,
     ),
 )
 
