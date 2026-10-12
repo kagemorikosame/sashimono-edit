@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import shutil
 import time
@@ -18,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.model import Blending
 from sashimono.core.timebase import FrameRate
 from sashimono.ui.workspace import config_root
@@ -93,19 +93,12 @@ class ProjectPresetStore:
     def save(self, presets: list[ProjectPreset]) -> None:
         """一覧を丸ごと書く 書けなければ :class:`PresetStoreError`"""
         body = {"version": _VERSION, "presets": [preset.to_json() for preset in presets]}
-        # 書きかけの名前は窓ごとに変える 同じ名前だと、2 つの窓が同時に保存したときに
-        # 片方の書きかけをもう片方が入れ替えてしまう
-        temporary = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex[:8]}.writing")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
             # 書き終えてから入れ替える 書いている途中で落ちると、一覧が半分だけ残る
-            temporary.replace(self.path)
+            # 書きかけの名前を窓ごとに変えるのと、失敗したときの片付けは write_atomic が持つ
+            write_atomic(self.path, json.dumps(body, ensure_ascii=False, indent=2))
         except OSError as exc:
-            # 後片付けの失敗で元の理由を隠さない 親がファイルの所では、POSIX の unlink は
-            # FileNotFoundError ではなく NotADirectoryError を出し、missing_ok では抑えられない
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
             raise PresetStoreError(f"テンプレートを保存できなかった: {self.path}（{exc}）") from exc
 
     def put(self, preset: ProjectPreset) -> list[ProjectPreset]:

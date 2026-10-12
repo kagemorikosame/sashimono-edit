@@ -10,8 +10,10 @@ Qt の既定の保存先（Windows ではレジストリ）は使わない 自�
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QByteArray, QSettings, Qt
 from PySide6.QtWidgets import QMainWindow, QTabWidget
@@ -22,6 +24,7 @@ from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
+from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.model import LayerMode
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
@@ -139,13 +142,17 @@ class ShortcutStore:
         return {str(key): value for key, value in data.items() if isinstance(value, str)}
 
     def save(self, overrides: dict[str, str]) -> None:
+        """表を丸ごと書く ほかの窓が先に書いた表には重ねない
+
+        設定（:meth:`PreferenceStore.save`）と違い、変えた所だけを重ねることはしない
+        本人はショートカットの画面で表の全体を見て確かめている 2 つの窓の表を重ねると、
+        どちらの画面にも出ていなかった組み合わせ（同じキーに 2 つの操作）ができ、
+        Qt はそのキーでどちらも動かさない 最後に確かめた表がそのまま残る方が分かりやすい
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + ".writing")
-        temporary.write_text(
-            json.dumps(dict(sorted(overrides.items())), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        write_atomic(
+            self.path, json.dumps(dict(sorted(overrides.items())), ensure_ascii=False, indent=2)
         )
-        temporary.replace(self.path)
 
 
 def find_conflicts(bindings: dict[str, str]) -> dict[str, list[str]]:
@@ -570,11 +577,21 @@ class PreferenceStore:
         self.path = path if path is not None else config_root() / "preferences.json"
 
     def load(self) -> Preferences:
+        preferences = self._parse(self._read())
+        _PREFERENCES_SEEN[_path_key(self.path)] = preferences
+        return preferences
+
+    def _read(self) -> dict[str, Any] | None:
+        """書いてある中身 無い・壊れているなら ``None``"""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return Preferences()
-        if not isinstance(data, dict):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _parse(data: dict[str, Any] | None) -> Preferences:
+        if data is None:
             return Preferences()
         plain = Preferences()
         return Preferences(
@@ -691,12 +708,46 @@ class PreferenceStore:
         )
 
     def save(self, preferences: Preferences) -> None:
+        """この窓で変えた項目だけを、書いてある中身へ重ねて書く
+
+        窓はそれぞれ起動したときに読んだ設定を持っている 丸ごと書き戻すと、ほかの窓が
+        その後に変えた項目（テーマなど）を、この窓が別の項目（磁石など）を変えただけで
+        黙って元へ戻す 変えたかどうかは、この窓が最後に読んだか書いた値（``_PREFERENCES_SEEN``）
+        と比べて決める 同じ項目を両方の窓で変えたら、後から書いた方が残る
+
+        読んでから書き戻すまでを錠で守る 守らないと、2 つの窓が同時に書いたときに、
+        先に書いた方の変更を後の方が読まずに消す 書いてある中身が無いか壊れているなら、
+        この窓の値を丸ごと書く（重ねる先が無い） 知らない項目（新しい版が足した物）は残す
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + ".writing")
-        temporary.write_text(
-            json.dumps(asdict(preferences), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(self.path)
+        key = _path_key(self.path)
+        ours = asdict(preferences)
+        seen = _PREFERENCES_SEEN.get(key)
+        before = asdict(seen) if seen is not None else {}
+        with held_for_update(self.path.with_name(self.path.name + ".lock")):
+            data = self._read()
+            if data is None:
+                data = ours
+            else:
+                data.update(
+                    {
+                        name: value
+                        for name, value in ours.items()
+                        if name not in before or before[name] != value
+                    }
+                )
+            write_atomic(self.path, json.dumps(data, ensure_ascii=False, indent=2))
+        _PREFERENCES_SEEN[key] = preferences
+
+
+#: この窓（プロセス）が最後に読んだか書いた設定 置き場ごと :meth:`PreferenceStore.save` が
+#: 「この窓で変えた項目」を見分けるのに使う 窓は 1 つのプロセスに 1 つなので、プロセスに 1 つ持つ
+_PREFERENCES_SEEN: dict[str, Preferences] = {}
+
+
+def _path_key(path: Path) -> str:
+    """置き場の比べ方 大文字小文字や ``..`` の違いで別の置き場と見なさない"""
+    return os.path.normcase(str(Path(path).resolve()))
 
 
 #: 吸い付く距離として受け付ける範囲（画面の画素）

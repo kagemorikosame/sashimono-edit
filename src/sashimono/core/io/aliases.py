@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.io.serialize import (
     FORMAT_VERSION as CLIP_FORMAT_VERSION,
 )
@@ -205,9 +206,7 @@ class AliasStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         # 一時ファイルへ書いてから差し替える 書いている途中で落ちると、前に保存した
         # 同じ名前のエイリアスまで壊れる
-        temporary = target.with_name(target.name + ".writing")
-        temporary.write_text(json_text(alias.to_dict()), encoding="utf-8")
-        temporary.replace(target)
+        write_atomic(target, json_text(alias.to_dict()))
         return target
 
     def load(self, path: Path) -> Alias:
