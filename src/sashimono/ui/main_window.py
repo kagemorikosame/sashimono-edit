@@ -492,6 +492,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_stretch_waves(self._preferences.stretch_waves)
         self._timeline.set_split_audio(self._preferences.splits_media)
         self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
+        self._timeline.set_ripple_playhead(self._preferences.ripple_playhead)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
@@ -521,6 +522,8 @@ class MainWindow(QMainWindow):
         self._playback = PlaybackController(
             project, self, smooth_history=self._preferences.smooth_audio_motion
         )
+        #: 最後に当てた編集の直前に再生していたか（:meth:`execute_all` が覚える）
+        self._playing_before_edit = False
 
         viewer = QWidget(self)
         viewer_layout = QVBoxLayout(viewer)
@@ -967,6 +970,7 @@ class MainWindow(QMainWindow):
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
+        self._timeline.set_ripple_playhead(preferences.ripple_playhead)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._scene_bar.set_snap(preferences.timeline_snap)
@@ -1151,6 +1155,7 @@ class MainWindow(QMainWindow):
             lambda commands, label: self.execute_all(commands, label, merge=True)
         )
         self._timeline.playhead_moved.connect(self._on_playhead_moved)
+        self._timeline.ripple_landed.connect(self._on_ripple_landed)
         self._timeline.template_requested.connect(self.place_template_entry)
         self._timeline.preview_requested.connect(self._preview_command)
 
@@ -1256,6 +1261,10 @@ class MainWindow(QMainWindow):
         """
         if not commands:
             return True
+        # 編集を当てると再生は止まる（:meth:`PlaybackController.set_project`）
+        # 削除して詰めた頭から鳴らし直すか（:meth:`_on_ripple_landed`）を決めるため、
+        # 止まる前に覚える
+        self._playing_before_edit = self._playback.is_playing
         try:
             with self._document.checkpoint(label, merge=merge):
                 for command in commands:
@@ -2146,6 +2155,19 @@ class MainWindow(QMainWindow):
     def _on_playhead_moved(self, frame: int) -> None:
         self._show_frame(frame)
         self._playback.set_frame(frame)
+
+    def _on_ripple_landed(self, frame: int) -> None:
+        """削除して詰めたあと、再生ヘッドがつなぎ目へ来た（Issue #299）
+
+        再生中に消したなら、止めずに頭から続ける つなぎ目の前後をそのまま見られる
+        編集を当てたところで再生は 1 度止まっているので、ここで鳴らし直す
+        """
+        resume = self._playing_before_edit
+        self._on_playhead_moved(frame)
+        # 末尾に着いたときは鳴らし直さず、末尾で止めておく 続きが無い所で鳴らすと、
+        # :meth:`PlaybackController.play` が作品の頭へ巻き戻して頭から鳴り出す
+        if resume and frame < self.view_project.duration:
+            self._playback.play()
 
     def _on_playback_frame(self, frame: int) -> None:
         self._timeline.set_playhead(frame)
