@@ -24,10 +24,12 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.console import hide_cli_console
 from sashimono.ai.environment import bundled_claude_cli, find_claude_cli
 from sashimono.ai.models import effort_for
+from sashimono.ai.operations import ASK_USER
 from sashimono.ai.server import SERVER_NAME, build_server
 from sashimono.core.model import LayerMode
 
 __all__ = [
+    "ASK_RULES",
     "SYSTEM_PROMPT",
     "UPDATE_PARTS_LABEL",
     "AgentEvent",
@@ -89,22 +91,41 @@ _PROMPT = """\
 - 色は #RRGGBB で指定します
 - 大きく変える前に、何をするつもりかを 1〜2 文で伝えてください 変更系の操作には
   ユーザーの確認が入ります
-- 失敗したら、エラーの文面を読んで直してから再試行してください 同じ操作を
+{ask_rules}- 失敗したら、エラーの文面を読んで直してから再試行してください 同じ操作を
   そのまま繰り返さないこと
 
 返事は日本語で、簡潔に 作業の実況ではなく、やったことと結果を伝えてください
 """
 
 
-def system_prompt(layer_mode: str = LayerMode.SEPARATED) -> str:
+#: 聞き返す基準（#296） 設定の「あいまいなときは、AI が質問する」が入のときだけ差し込む
+#: 聞くのは「決まっていない・推測できない」かつ「結果が大きく変わる」ときだけにする
+#: どちらかだけで聞かせると、毎回のように聞かれて手間が増える 1 つの話題で 1 回に
+#: 絞るのは、同じことを言い方を変えて何度も聞き直されないようにするため
+ASK_RULES = f"""\
+- 指示があいまいで、どう受け取るかで結果が大きく変わるときだけ、作業の前に
+  {ASK_USER} で質問してください 例: どのクリップか決まらない、どの範囲か分からない、
+  元に戻しにくい操作の対象や量が決まらない 選択肢は 2〜4 個にし、名前は短く、
+  違いは説明に書きます
+- 指示や会話で決まっていること、list_clips や get_selection などで確かめれば
+  分かること、どれを選んでも後で簡単に直せることは聞かずに進めます 確かめられる
+  ことは、聞く前に道具で確かめます
+- 1 回に聞くのは 1 つの話題だけで、同じ話題を 2 度聞きません 答えをもらったら、
+  その答えに沿って作業を進めます 返事が無かったときは、推測で進めずに止めます
+"""
+
+
+def system_prompt(layer_mode: str = LayerMode.SEPARATED, *, ask: bool = True) -> str:
     """エージェントへの指示 ``layer_mode`` はプロジェクトの置き方の方式
 
     会話を始めるときの方式で書く 会話の途中で方式を変えることもあるので、確かめ方
-    （get_project の layer_mode）も添えてある
+    （get_project の layer_mode）も添えてある ``ask`` を切ると聞き返す基準を外す
+    （質問の道具も渡さないので、基準だけ残すと無い道具を呼ぼうとする）
     """
     linked = _LINKED_CLIPS.get(layer_mode, _LINKED_CLIPS[LayerMode.SEPARATED])
     # format ではなく置き換えにする 指示の文に波括弧を書いたときに壊れないように
-    return _PROMPT.replace("{linked_clips}", linked)
+    prompt = _PROMPT.replace("{linked_clips}", linked)
+    return prompt.replace("{ask_rules}", ASK_RULES if ask else "")
 
 
 #: 分ける方式（モデルの既定）での指示 会話を作る側が方式を渡さないときに使う
@@ -147,12 +168,15 @@ class AgentSession:
         effort: str | None = None,
         cwd: Path | None = None,
         system_prompt: str = SYSTEM_PROMPT,
+        ask: bool = True,
     ) -> None:
         self._bridge = bridge
         self._model = model or None
         self._effort = effort_for(model or "", effort or "")
         self._cwd = cwd
         self._system_prompt = system_prompt
+        #: 質問の道具（ask_user）を渡すか 指示の文と揃える（設定の「AI が質問する」）
+        self._ask = ask
 
         self._events: queue.Queue[AgentEvent] = queue.Queue()
         self._prompts: queue.Queue[str | None] = queue.Queue()
@@ -182,6 +206,11 @@ class AgentSession:
     def effort(self) -> str | None:
         """実際に渡すエフォート 受け付けないモデルでは ``None``"""
         return self._effort
+
+    @property
+    def ask(self) -> bool:
+        """質問の道具を渡しているか 会話の途中では変えられない（指示の文と同じ）"""
+        return self._ask
 
     @property
     def busy(self) -> bool:
@@ -291,7 +320,7 @@ class AgentSession:
         self._loop = asyncio.get_running_loop()
         options = ClaudeAgentOptions(
             **self.option_values(),
-            mcp_servers={SERVER_NAME: build_server(self._bridge)},
+            mcp_servers={SERVER_NAME: self.server()},
             can_use_tool=self._can_use_tool,
         )
 
@@ -310,6 +339,13 @@ class AgentSession:
                 # 付け終えて立てた旗を、ここで消してしまうことがある
                 self._boundary.clear()
                 await self._turn(client, prompt)
+
+    def server(self) -> Any:
+        """この会話へ渡す道具のサーバ 設定で質問を切っていれば ask_user を入れない
+
+        分けてあるのは、SDK の無い試験でも「質問の道具を渡すか」を確かめるため
+        """
+        return build_server(self._bridge, ask=self._ask)
 
     def option_values(self) -> dict[str, Any]:
         """SDK へ渡す設定のうち、SDK を読まずに決まるもの

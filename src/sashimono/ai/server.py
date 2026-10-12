@@ -49,20 +49,24 @@ def tool_names(*, writes: bool | None = None) -> list[str]:
     ]
 
 
-def build_tools(bridge: EditorBridge) -> list[SdkMcpTool[Any]]:
+def build_tools(bridge: EditorBridge, *, ask: bool = True) -> list[SdkMcpTool[Any]]:
     """ブリッジに繋がった MCP ツールを組み立てる
 
     サーバとは別に取り出せるようにしてある ``create_sdk_mcp_server`` が返す
     設定からはツールを覗けないので、試験からはこちらを使う
+    ``ask`` を切ると質問の道具（ask_user）を渡さない 設定で「AI が質問する」を
+    切った人に、道具だけ残って聞かれることが無いように
     """
-    return [_wrap(operation, bridge) for operation in OPERATIONS]
+    return [_wrap(operation, bridge) for operation in OPERATIONS if ask or not operation.asks]
 
 
-def build_server(bridge: EditorBridge) -> McpSdkServerConfig:
+def build_server(bridge: EditorBridge, *, ask: bool = True) -> McpSdkServerConfig:
     """ブリッジに繋がった MCP サーバを作る"""
     from claude_agent_sdk import create_sdk_mcp_server
 
-    return create_sdk_mcp_server(name=SERVER_NAME, version="1.0.0", tools=build_tools(bridge))
+    return create_sdk_mcp_server(
+        name=SERVER_NAME, version="1.0.0", tools=build_tools(bridge, ask=ask)
+    )
 
 
 def _wrap(operation: Operation, bridge: EditorBridge) -> SdkMcpTool[Any]:
