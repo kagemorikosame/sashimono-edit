@@ -98,6 +98,21 @@ class TestExtendingText:
         run(host, "undo")
         assert host.document.project == before
 
+    def test_the_tail_stops_at_the_clip_after(self) -> None:
+        # 後ろのテキストに重なる所まで伸ばして断られると、AI は量を変えて何度も試し直す
+        host = _host()
+        run(host, "add_text", text="前", at_frame=0, duration=40)
+        run(host, "add_text", text="後", at_frame=60, duration=60)
+        first, second = sorted(_texts(host), key=lambda clip: clip.timeline_start)
+        assert _track_of(host, first) == _track_of(host, second)
+        result = run(host, "trim_clip", clip_id=str(first.id), tail_delta=50)
+        assert result["tail_delta"] == 20
+        assert result["requested_tail_delta"] == 50
+        assert result["stopped_at"] == "後ろのクリップの頭"
+        assert "20 フレーム" in result["note"]
+        first_now = min(_texts(host), key=lambda clip: clip.timeline_start)
+        assert first_now.timeline_end == 60
+
     def test_nothing_to_extend_changes_nothing(self) -> None:
         # 0 フレームの命令を履歴へ積むと、取り消しを 1 回むだに使わせる
         host = _host()

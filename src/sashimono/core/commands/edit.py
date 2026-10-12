@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from fractions import Fraction
 
 from sashimono.core.commands.base import Command
 from sashimono.core.model import (
@@ -31,17 +32,16 @@ from sashimono.core.model import (
     new_clip_id,
     new_group_id,
 )
-from sashimono.core.timebase import FrameRate
 
 __all__ = [
-    "HEAD_STOP_PREVIOUS",
-    "HEAD_STOP_SCENE",
-    "HEAD_STOP_SOURCE",
-    "HEAD_STOP_TIMELINE",
+    "STOP_NEXT",
+    "STOP_PREVIOUS",
+    "STOP_SCENE",
+    "STOP_SOURCE",
+    "STOP_TIMELINE",
     "AddClip",
     "AddMedia",
     "AddTrack",
-    "HeadRoom",
     "InsertGap",
     "MoveClip",
     "MoveClips",
@@ -61,8 +61,10 @@ __all__ = [
     "SplitClip",
     "TrimClip",
     "TrimClips",
+    "TrimRoom",
     "head_room",
     "shifted_track",
+    "tail_room",
 ]
 
 
@@ -487,7 +489,6 @@ class SplitClip(Command):
                 f"[{clip.timeline_start}, {clip.timeline_end}) の外"
             )
 
-        rate = project.rate
         timeline = project.timeline
         # 右側は新しいリンクグループにする 元のままだと、分割してできた左右が
         # 同じグループに残り、片方を削除するともう片方まで消える 新しいグループを
@@ -502,9 +503,9 @@ class SplitClip(Command):
             if track is None:
                 continue
             left, right = _halves(
+                project,
                 target,
                 self.frame,
-                rate,
                 link_group=right_group,
                 group_id=dict(self.new_groups).get(target.group_id, target.group_id)
                 if target.group_id is not None
@@ -516,9 +517,9 @@ class SplitClip(Command):
 
 
 def _halves(
+    project: Project,
     target: Clip,
     frame: int,
-    rate: FrameRate,
     *,
     link_group: GroupId | None,
     group_id: GroupId | None,
@@ -539,8 +540,10 @@ def _halves(
         id=new_clip_id(),
         timeline_start=frame,
         duration=target.timeline_end - frame,
-        # 右側は、左側が消費したソース時間の分だけ後ろから始まる
-        source_in=target.source_in + left_duration * rate.frame_duration * target.speed,
+        # 右側は、左側が消費したソース時間の分だけ後ろから始まる 素材の時間を持たない
+        # クリップは動かさない（:func:`_trimmed` と同じ） 読まない値が割るたびに溜まる
+        source_in=target.source_in
+        + _consumed(project, target, left_duration * project.rate.frame_duration),
         link_group=link_group,
         group_id=group_id,
     )
@@ -637,7 +640,7 @@ class InsertGap(Command):
                 elif clip.timeline_start >= frame:
                     pieces.append(after(clip, clip.timeline_start + self.length))
                 else:
-                    left, right = _halves(clip, frame, project.rate, link_group=None, group_id=None)
+                    left, right = _halves(project, clip, frame, link_group=None, group_id=None)
                     pieces.append(left)
                     pieces.append(
                         after(
@@ -1049,8 +1052,8 @@ class RenameProject(Command):
 def _trimmed(project: Project, track: Track, clip: Clip, head_delta: int, tail_delta: int) -> Clip:
     """端を動かしたクリップを返す 無理な指定は例外にする
 
-    頭を前へ伸ばしすぎたときは、止まる理由と伸ばせる量を文言に入れる AI アシスタントは
-    文言だけを読んで次の手を決めるので、量が無いと 1 フレームずつ試し直すことになる
+    伸ばしすぎたときは、止まる理由と伸ばせる量を文言に入れる AI アシスタントは文言だけを
+    読んで次の手を決めるので、量が無いと 1 フレームずつ試し直すことになる
     """
     duration = clip.duration - head_delta + tail_delta
     if duration <= 0:
@@ -1063,13 +1066,17 @@ def _trimmed(project: Project, track: Track, clip: Clip, head_delta: int, tail_d
                 f"{room.reason}より前へは伸ばせない "
                 f"頭を前へ伸ばせるのはあと {room.frames} フレームまで"
             )
+    if tail_delta > 0:
+        ahead = _member_tail_room(track, clip)
+        if ahead is not None and tail_delta > ahead.frames:
+            raise ValueError(
+                f"{ahead.reason}より後ろへは伸ばせない "
+                f"終わりを後ろへ伸ばせるのはあと {ahead.frames} フレームまで"
+            )
 
-    source_in = clip.source_in
-    if _reads_source_time(project, clip):
-        source_in += head_delta * project.rate.frame_duration * clip.speed
     # 素材の時間を持たないクリップは source_in を動かさない 描くときに読まないので、
     # 頭を削るたびに意味の無い値が溜まり、保存したファイルにまで残る
-
+    source_in = clip.source_in + _consumed(project, clip, head_delta * project.rate.frame_duration)
     return replace(
         clip,
         timeline_start=clip.timeline_start + head_delta,
@@ -1078,16 +1085,29 @@ def _trimmed(project: Project, track: Track, clip: Clip, head_delta: int, tail_d
     )
 
 
-#: 頭を前へ伸ばしたときに止まる所の呼び名 文言の「〜より前へは伸ばせない」へそのまま入る
-HEAD_STOP_SOURCE = "素材の先頭"
-HEAD_STOP_SCENE = "シーンの先頭"
-HEAD_STOP_PREVIOUS = "前のクリップの終わり"
-HEAD_STOP_TIMELINE = "タイムラインの先頭"
+def _consumed(project: Project, clip: Clip, seconds: Fraction) -> Fraction:
+    """タイムラインで ``seconds`` 進んだときに、素材の中で進む時間（秒）
+
+    素材の時間を持たないクリップ（:func:`_reads_source_time` が偽）は 0 トリム・分割・
+    ジェットカットが同じ式を使う どれか 1 つだけ数えると、その操作のたびに読まない
+    source_in が溜まる
+    """
+    if not _reads_source_time(project, clip):
+        return Fraction(0)
+    return seconds * clip.speed
+
+
+#: 端を伸ばしたときに止まる所の呼び名 文言の「〜より前へ（後ろへ）は伸ばせない」へそのまま入る
+STOP_SOURCE = "素材の先頭"
+STOP_SCENE = "シーンの先頭"
+STOP_PREVIOUS = "前のクリップの終わり"
+STOP_TIMELINE = "タイムラインの先頭"
+STOP_NEXT = "後ろのクリップの頭"
 
 
 @dataclass(frozen=True, slots=True)
-class HeadRoom:
-    """クリップの頭を前へ伸ばせる量（フレーム）と、そこで止まる理由
+class TrimRoom:
+    """クリップの端を伸ばせる量（フレーム）と、そこで止まる理由
 
     画面のドラッグと AI アシスタントの ``trim_clip`` が、:class:`TrimClip` と同じ決まりで
     限界を知るために使う 決まりを別々に書くと、ドラッグでは伸ばせて見えたのに離すと
@@ -1095,47 +1115,68 @@ class HeadRoom:
     """
 
     frames: int
-    #: 止まる所の呼び名（``HEAD_STOP_*``） 伸ばすクリップが無ければ空
+    #: 止まる所の呼び名（``STOP_*``） 伸ばすクリップが無ければ空
     reason: str
 
 
-def head_room(project: Project, clip_ids: tuple[ClipId, ...]) -> HeadRoom:
+def head_room(project: Project, clip_ids: tuple[ClipId, ...]) -> TrimRoom:
     """``clip_ids`` をまとめて頭を前へ伸ばせる量 :class:`TrimClips` と同じ決まりで数える
 
     リンクした相手も同じだけ伸びる（:class:`TrimClip` の決まり）ので、相手の限界も入れる
     ロックしたトラックの相手は伸びずに残るので数えない 全員に同じ量を当てるので、
-    一番きつい 1 本で決まる
+    一番きつい 1 本で決まる 伸ばすクリップが無ければ量 0 で理由は空
     """
+    rooms = [
+        _member_head_room(project, track, member)
+        for track, member in _trimmed_members(project, clip_ids)
+    ]
+    return min(rooms, key=lambda room: room.frames, default=TrimRoom(0, ""))
+
+
+def tail_room(project: Project, clip_ids: tuple[ClipId, ...]) -> TrimRoom | None:
+    """``clip_ids`` をまとめて終わりを後ろへ伸ばせる量 何にもぶつからなければ ``None``
+
+    数え方は :func:`head_room` と同じ（リンクした相手を入れ、ロックした相手は数えない）
+    後ろはタイムラインの終わりも素材の終わりも止めない 素材の終わりを越えた所は、前から
+    最後の絵で止めるか何も映らない（:attr:`Clip.hold_at`）決まりで、ここで断ると
+    今まで伸ばせた物が伸ばせなくなる
+    """
+    rooms = [
+        room
+        for track, member in _trimmed_members(project, clip_ids)
+        if (room := _member_tail_room(track, member)) is not None
+    ]
+    return min(rooms, key=lambda room: room.frames, default=None)
+
+
+def _trimmed_members(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[Track, Clip]]:
+    """``clip_ids`` を端で動かすと一緒に動くクリップ（ロックしたトラックの相手は除く）"""
     timeline = project.timeline
-    tightest: HeadRoom | None = None
+    members: list[tuple[Track, Clip]] = []
     for clip_id in clip_ids:
         located = timeline.locate_clip(clip_id)
         if located is None:
             continue
-        _, clip = located
-        for track_id, member in _linked_group(project, clip):
+        for track_id, member in _linked_group(project, located[1]):
             track = timeline.find_track(track_id)
-            if track is None or track.locked:
-                continue
-            room = _member_head_room(project, track, member)
-            if tightest is None or room.frames < tightest.frames:
-                tightest = room
-    return tightest if tightest is not None else HeadRoom(0, "")
+            if track is not None and not track.locked:
+                members.append((track, member))
+    return members
 
 
-def _member_head_room(project: Project, track: Track, clip: Clip) -> HeadRoom:
+def _member_head_room(project: Project, track: Track, clip: Clip) -> TrimRoom:
     """1 本のクリップの頭を前へ伸ばせる量 一番手前で止まる所を返す
 
     前のクリップは同じトラックだけを見る トラックはクリップの重なりを許さないので、
     重なる所まで伸ばすと離したときに失敗する（利用者が決めた 重なる所で止める）
     """
-    rooms: list[HeadRoom] = []
+    rooms: list[TrimRoom] = []
     if _reads_source_time(project, clip):
         # 素材の時刻は秒で持ち、1 フレームで速度ぶん進む 切り捨てて、端数のぶんは伸ばさない
         # 切り上げると source_in が負になり、クリップを作るところで弾かれる
         step = project.rate.frame_duration * clip.speed
-        reason = HEAD_STOP_SCENE if clip.scene_id is not None else HEAD_STOP_SOURCE
-        rooms.append(HeadRoom(int(clip.source_in // step), reason))
+        reason = STOP_SCENE if clip.scene_id is not None else STOP_SOURCE
+        rooms.append(TrimRoom(int(clip.source_in // step), reason))
     previous_end = max(
         (
             other.timeline_end
@@ -1145,11 +1186,29 @@ def _member_head_room(project: Project, track: Track, clip: Clip) -> HeadRoom:
         default=None,
     )
     if previous_end is not None:
-        rooms.append(HeadRoom(clip.timeline_start - previous_end, HEAD_STOP_PREVIOUS))
-    rooms.append(HeadRoom(clip.timeline_start, HEAD_STOP_TIMELINE))
+        rooms.append(TrimRoom(clip.timeline_start - previous_end, STOP_PREVIOUS))
+    rooms.append(TrimRoom(clip.timeline_start, STOP_TIMELINE))
     # 同じ量なら先に入れた方（素材 → 前のクリップ → 先頭）を理由にする 素材で止まるのに
     # 「タイムラインの先頭」と言うと、素材の余りが無いことに気付けない
     return min(rooms, key=lambda room: room.frames)
+
+
+def _member_tail_room(track: Track, clip: Clip) -> TrimRoom | None:
+    """1 本のクリップの終わりを後ろへ伸ばせる量 同じトラックの後ろのクリップの頭で止まる
+
+    頭と同じく重なる所で止める（利用者が頭について選んだ決まりに揃えた）
+    """
+    next_start = min(
+        (
+            other.timeline_start
+            for other in track.clips
+            if other.id != clip.id and other.timeline_start >= clip.timeline_end
+        ),
+        default=None,
+    )
+    if next_start is None:
+        return None
+    return TrimRoom(next_start - clip.timeline_end, STOP_NEXT)
 
 
 def _reads_source_time(project: Project, clip: Clip) -> bool:
@@ -1313,7 +1372,6 @@ def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
 def _cut_range(project: Project, start: int, end: int) -> Project:
     """``[start, end)`` を全トラックから取り除き、後ろを詰める"""
     length = end - start
-    rate = project.rate
     timeline = project.timeline
     # 範囲をまたいだクリップの右側に配り直すリンクグループ 左右が同じ
     # グループに残ると、片方を消したときにもう片方まで消える 映像と音声で
@@ -1325,7 +1383,7 @@ def _cut_range(project: Project, start: int, end: int) -> Project:
             continue
         pieces: list[Clip] = []
         for clip in track.clips:
-            pieces.extend(_cut_clip(clip, start, end, length, rate, regrouped))
+            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped))
         timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
 
     markers = tuple(
@@ -1337,11 +1395,11 @@ def _cut_range(project: Project, start: int, end: int) -> Project:
 
 
 def _cut_clip(
+    project: Project,
     clip: Clip,
     start: int,
     end: int,
     length: int,
-    rate: FrameRate,
     regrouped: dict[GroupId, GroupId],
 ) -> list[Clip]:
     """1 つのクリップから範囲を抜く 残るのは 0 個・1 個・2 個のどれか"""
@@ -1360,7 +1418,8 @@ def _cut_clip(
         return [replace(_split_animation(clip, head)[0], duration=head)]
 
     # 範囲より後ろに残る部分 素材のどこから始まるかを計算し直す
-    consumed = (end - clip.timeline_start) * rate.frame_duration * clip.speed
+    # 素材の時間を持たないクリップは動かさない（分割と同じ）
+    consumed = _consumed(project, clip, (end - clip.timeline_start) * project.rate.frame_duration)
     right = replace(
         _split_animation(clip, end - clip.timeline_start)[1],
         id=new_clip_id() if head > 0 else clip.id,

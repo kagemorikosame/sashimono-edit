@@ -16,7 +16,6 @@ from sashimono.core.commands.edit import (
     AddClip,
     AddMedia,
     AddTrack,
-    HeadRoom,
     InsertGap,
     MoveClip,
     MoveClips,
@@ -36,7 +35,9 @@ from sashimono.core.commands.edit import (
     SplitClip,
     TrimClip,
     TrimClips,
+    TrimRoom,
     head_room,
+    tail_room,
 )
 from sashimono.core.commands.effects import (
     AddEffect,
@@ -122,7 +123,6 @@ __all__ = [
     "ConvertLayers",
     "Document",
     "GroupClips",
-    "HeadRoom",
     "HistoryEntry",
     "InScene",
     "InsertGap",
@@ -169,6 +169,7 @@ __all__ = [
     "SplitSegment",
     "TrimClip",
     "TrimClips",
+    "TrimRoom",
     "UngroupClips",
     "VideoFormat",
     "Voice",
@@ -192,5 +193,6 @@ __all__ = [
     "subtitle_voices",
     "subtitle_wrap_width",
     "switch_layer_mode",
+    "tail_room",
     "voice_label",
 ]

@@ -1,8 +1,9 @@
-"""編集画面でテキストの頭をドラッグして前へ伸ばす（#309）
+"""編集画面でテキストの端をドラッグして伸ばす（#309）
 
 実際の編集画面（MainWindow）を組み、〔テキストを追加〕で置いたテキストの頭の端を掴んで
 前へ引く 伸ばした量は TrimClip と同じ決まりで止まり（タイムラインの先頭・前のクリップの
-終わり・素材の先頭）、止まった所はドラッグの最中の枠でも見える 窓は表示しない
+終わり・素材の先頭）、止まった所はドラッグの最中の枠でも見える 終わりの端を後ろへ引いた
+ときも、後ろのクリップの頭で止まる 窓は表示しない
 
 各試験の頭の 1 行は、壊れたときに利用者に何が起きるか
 """
@@ -152,8 +153,30 @@ class TestDraggingTheHead:
     def test_it_stops_at_the_start_of_the_timeline(self, window: MainWindow) -> None:
         # 0 の手前まで引くと、離したときに失敗して何も伸びない（0 で止まってほしい）
         text = _place_text(window, 30)
+        told: list[str] = []
+        window._timeline.status_message.connect(told.append)
         _drag_head(window, text, -40)
         assert _now(window, text).timeline_start == 0
+        # ヘッダの上まで引いて 0 で止まったときも、止まった理由を出す
+        assert any("タイムラインの先頭" in message for message in told)
+
+    def test_the_tail_stops_at_the_text_after(self, window: MainWindow) -> None:
+        # 後ろのテキストに重なる所まで引くと、離したときに重なりで失敗して何も伸びない
+        first = _place_text(window, 0)
+        second = _place_text(window, first.timeline_end + 30, beside=first)
+        view = window._timeline
+        told: list[str] = []
+        view.status_message.connect(told.append)
+        # 終わりの位置はクリップの外（含まない） 1 フレーム内側の端を掴む
+        start = _point(view, first, first.timeline_end - 1)
+        end = _point(view, first, second.timeline_start + 40)
+        QTest.mousePress(view, _LEFT, _NONE, start)
+        QTest.mouseMove(view, _point(view, first, first.timeline_end + 10))
+        QTest.mouseMove(view, end)
+        assert view._drag.preview_tail_delta == 30
+        QTest.mouseRelease(view, _LEFT, _NONE, end)
+        assert _now(window, first).timeline_end == second.timeline_start
+        assert any("後ろのクリップの頭" in message for message in told)
 
     def test_it_stops_at_the_end_of_the_text_before(self, window: MainWindow) -> None:
         # 前のテキストに重なる所まで引くと、離したときに重なりで失敗して何も伸びない

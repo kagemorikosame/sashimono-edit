@@ -60,6 +60,7 @@ from sashimono.core.commands.edit import (
     MIN_TRACK_HEIGHT,
     head_room,
     shifted_track,
+    tail_room,
 )
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.model import (
@@ -1469,7 +1470,10 @@ class TimelineView(QWidget):
                 # 素材の先頭を越えて伸びて見えるのに、離すと失敗して何も変わらない
                 trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
                 room = head_room(self._project, trimmed)
-                if room.reason and frame - clip.timeline_start < -room.frames:
+                # 位置からのフレームは 0 で切られる ヘッダの上まで引いたときも 0 で止まった
+                # ことを知らせるため、切る前の位置で比べる
+                reach = min(float(frame), self._layout.x_to_frame(position.x()))
+                if room.reason and reach - clip.timeline_start < -room.frames:
                     # 枠が止まっただけでは、なぜ止まったのか（素材が無いのか前が詰まって
                     # いるのか）が分からない 理由を下の帯に出す
                     self.status_message.emit(
@@ -1480,7 +1484,17 @@ class TimelineView(QWidget):
                 )
             else:
                 frame += self._snap_shift((frame,))
-                self._drag.preview_tail_delta = max(frame - clip.timeline_end, -(clip.duration - 1))
+                wanted = max(frame - clip.timeline_end, -(clip.duration - 1))
+                # 後ろも頭と同じく、後ろのクリップの頭で止めて理由を出す 止めないと、枠は
+                # 重なって見えるのに離すと失敗して何も変わらない
+                trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
+                ahead = tail_room(self._project, trimmed)
+                if ahead is not None and wanted > ahead.frames:
+                    self.status_message.emit(
+                        f"{ahead.reason}で止まる 後ろへ伸ばせるのは {ahead.frames} フレームまで"
+                    )
+                    wanted = ahead.frames
+                self._drag.preview_tail_delta = wanted
         self.update()
 
     # --- 磁石（吸着） ---

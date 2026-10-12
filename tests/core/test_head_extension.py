@@ -1,8 +1,10 @@
-"""クリップの頭を前へ伸ばすトリム（#309）
+"""クリップの端を伸ばすトリムと、素材の時間を持たないクリップの source_in（#309）
 
 素材の先頭の判定は、描くときに ``source_in`` から時刻を読むクリップ（動画・音声の素材・
 入れ子のシーン・音声波形）だけに掛ける テキスト・図形・フィルタ・場面切り替え・静止画は
 素材の時間を持たないので、タイムラインの先頭と同じトラックの前のクリップでだけ止まる
+終わりを後ろへ伸ばすときも、同じトラックの後ろのクリップの頭で止まる 分割とジェットカットも
+素材の時間を持たないクリップの source_in を動かさない
 
 各試験の頭の 1 行は、壊れたときに利用者に何が起きるか
 """
@@ -19,17 +21,21 @@ from sashimono.core.commands import (
     AddClip,
     AddScene,
     Document,
-    HeadRoom,
+    RippleCut,
+    SplitClip,
     TrimClip,
     TrimClips,
+    TrimRoom,
     head_room,
     new_scene,
+    tail_room,
 )
 from sashimono.core.commands.edit import (
-    HEAD_STOP_PREVIOUS,
-    HEAD_STOP_SCENE,
-    HEAD_STOP_SOURCE,
-    HEAD_STOP_TIMELINE,
+    STOP_NEXT,
+    STOP_PREVIOUS,
+    STOP_SCENE,
+    STOP_SOURCE,
+    STOP_TIMELINE,
 )
 from sashimono.core.io import load_project, save_project
 from sashimono.core.model import (
@@ -114,7 +120,7 @@ class TestObjectsWithoutSourceTime:
         # 0 より前へ伸びると、クリップが負の時刻に置かれて描く所が無くなる
         clip = _generated(TEXT.create(), start=100)
         placed = _with(project, clip)
-        assert head_room(placed, (clip.id,)) == HeadRoom(100, HEAD_STOP_TIMELINE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(100, STOP_TIMELINE)
         reached = _located(TrimClip(clip.id, head_delta=-100).apply(placed), clip)
         assert (reached.timeline_start, reached.duration) == (0, 160)
         with pytest.raises(ValueError, match=r"タイムラインの先頭.*100 フレーム"):
@@ -154,7 +160,7 @@ class TestObjectsWithSourceTime:
         # 素材の前に無い時刻を読みに行くと、頭に何も映らない所ができる
         clip = make_clip(100, 60, video_media, source_in=1)
         placed = _with(project, clip)
-        assert head_room(placed, (clip.id,)) == HeadRoom(30, HEAD_STOP_SOURCE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(30, STOP_SOURCE)
         reached = _located(TrimClip(clip.id, head_delta=-30).apply(placed), clip)
         assert (reached.timeline_start, reached.source_in) == (70, Fraction(0))
         with pytest.raises(ValueError, match=r"素材の先頭より前へは伸ばせない.*あと 30 フレーム"):
@@ -173,7 +179,7 @@ class TestObjectsWithSourceTime:
         base = _with_track(base, Track(kind=TrackKind.AUDIO, name="A1"))
         clip = make_clip(100, 60, audio_media)
         placed = _with(base, clip)
-        assert head_room(placed, (clip.id,)) == HeadRoom(0, HEAD_STOP_SOURCE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(0, STOP_SOURCE)
         with pytest.raises(ValueError, match=r"素材の先頭.*あと 0 フレーム"):
             TrimClip(clip.id, head_delta=-1).apply(placed)
 
@@ -183,7 +189,7 @@ class TestObjectsWithSourceTime:
         project = AddScene(scene).apply(project)
         clip = Clip(timeline_start=100, duration=60, scene_id=scene.id, source_in=Fraction(1, 3))
         placed = _with(project, clip)
-        assert head_room(placed, (clip.id,)) == HeadRoom(10, HEAD_STOP_SCENE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(10, STOP_SCENE)
         reached = _located(TrimClip(clip.id, head_delta=-10).apply(placed), clip)
         assert reached.source_in == 0
         with pytest.raises(ValueError, match="シーンの先頭"):
@@ -195,7 +201,7 @@ class TestObjectsWithSourceTime:
         placed = _with(project, clip)
         cut = _located(TrimClip(clip.id, head_delta=30).apply(placed), clip)
         assert cut.source_in == Fraction(1)
-        assert head_room(placed, (clip.id,)) == HeadRoom(0, HEAD_STOP_SOURCE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(0, STOP_SOURCE)
 
 
 class TestTheClipBefore:
@@ -204,7 +210,7 @@ class TestTheClipBefore:
         before = _generated(TEXT.create(), start=0, duration=60)
         clip = _generated(TEXT.create(), start=100)
         placed = _with(project, before, clip)
-        assert head_room(placed, (clip.id,)) == HeadRoom(40, HEAD_STOP_PREVIOUS)
+        assert head_room(placed, (clip.id,)) == TrimRoom(40, STOP_PREVIOUS)
         reached = _located(TrimClip(clip.id, head_delta=-40).apply(placed), clip)
         assert reached.timeline_start == 60
         with pytest.raises(ValueError, match=r"前のクリップの終わり.*あと 40 フレーム"):
@@ -215,7 +221,7 @@ class TestTheClipBefore:
         clip = _generated(TEXT.create(), start=100)
         after = _generated(TEXT.create(), start=200)
         placed = _with(project, clip, after)
-        assert head_room(placed, (clip.id,)) == HeadRoom(100, HEAD_STOP_TIMELINE)
+        assert head_room(placed, (clip.id,)) == TrimRoom(100, STOP_TIMELINE)
 
     def test_touching_clips_cannot_extend(self, project: Project) -> None:
         # 隙間の無い所で 1 フレームでも伸ばせると言うと、離したときに重なりで失敗する
@@ -236,7 +242,7 @@ class TestLinkedAndSelected:
         text = replace(_generated(TEXT.create()), link_group=link)
         sound = replace(make_clip(100, 60, video_media), link_group=link)
         placed = AddClip(audio_track.id, sound).apply(_with(project, text))
-        assert head_room(placed, (text.id,)) == HeadRoom(0, HEAD_STOP_SOURCE)
+        assert head_room(placed, (text.id,)) == TrimRoom(0, STOP_SOURCE)
 
     def test_a_locked_partner_does_not_limit(
         self, video_media: MediaItem, project: Project
@@ -250,7 +256,7 @@ class TestLinkedAndSelected:
         placed = AddClip(audio_track.id, sound).apply(_with(project, text))
         locked = replace(placed.timeline.tracks[1], locked=True)
         placed = placed.with_timeline(placed.timeline.replace_track(locked))
-        assert head_room(placed, (text.id,)) == HeadRoom(100, HEAD_STOP_TIMELINE)
+        assert head_room(placed, (text.id,)) == TrimRoom(100, STOP_TIMELINE)
         result = TrimClip(text.id, head_delta=-20).apply(placed)
         assert _located(result, text).timeline_start == 80
         assert _located(result, sound).timeline_start == 100
@@ -264,7 +270,7 @@ class TestLinkedAndSelected:
         text = _generated(TEXT.create(), start=100)
         movie = replace(make_clip(100, 60, video_media), source_in=Fraction(1, 3))
         placed = AddClip(layer.id, movie).apply(_with(project, text))
-        assert head_room(placed, (text.id, movie.id)) == HeadRoom(10, HEAD_STOP_SOURCE)
+        assert head_room(placed, (text.id, movie.id)) == TrimRoom(10, STOP_SOURCE)
         result = TrimClips((text.id, movie.id), head_delta=-10).apply(placed)
         assert _located(result, text).timeline_start == 90
         assert _located(result, movie).timeline_start == 90
@@ -292,3 +298,77 @@ class TestHistoryAndFiles:
         # 開き直した後も同じ決まりで伸ばせる
         again = _located(TrimClip(clip.id, head_delta=-70).apply(reopened), clip)
         assert (again.timeline_start, again.source_in) == (0, Fraction(0))
+
+
+class TestTheTail:
+    def test_it_stops_at_the_head_of_the_clip_after(self, project: Project) -> None:
+        # 後ろのクリップに重なる所まで伸ばすと、重なりで断られて何も変わらない（頭と同じ決まり）
+        clip = _generated(TEXT.create(), start=0, duration=60)
+        after = _generated(TEXT.create(), start=100)
+        placed = _with(project, clip, after)
+        assert tail_room(placed, (clip.id,)) == TrimRoom(40, STOP_NEXT)
+        reached = _located(TrimClip(clip.id, tail_delta=40).apply(placed), clip)
+        assert reached.timeline_end == 100
+        with pytest.raises(ValueError, match=r"後ろのクリップの頭より後ろへは伸ばせない.*あと 40"):
+            TrimClip(clip.id, tail_delta=41).apply(placed)
+
+    def test_nothing_after_means_no_limit(self, video_media: MediaItem, project: Project) -> None:
+        # 後ろが空いているのに止めると、素材より長く伸ばして最後の絵で止める使い方ができなくなる
+        clip = make_clip(0, 60, video_media)
+        placed = _with(project, clip)
+        assert tail_room(placed, (clip.id,)) is None
+        assert _located(TrimClip(clip.id, tail_delta=900).apply(placed), clip).duration == 960
+
+    def test_a_linked_partner_limits_the_tail(
+        self, video_media: MediaItem, project: Project
+    ) -> None:
+        # リンクした音も一緒に伸びる 音のトラックの後ろを見ないと、音だけ重なって失敗する
+        audio_track = Track(kind=TrackKind.AUDIO, name="A1")
+        project = _with_track(project, audio_track)
+        link = new_group_id()
+        picture = replace(make_clip(0, 60, video_media), link_group=link)
+        sound = replace(make_clip(0, 60, video_media), link_group=link)
+        blocker = make_clip(70, 30, video_media)
+        placed = _with(project, picture)
+        for clip in (sound, blocker):
+            placed = AddClip(audio_track.id, clip).apply(placed)
+        assert tail_room(placed, (picture.id,)) == TrimRoom(10, STOP_NEXT)
+
+
+class TestCuttingKeepsSourceIn:
+    @pytest.mark.parametrize("name", list(_SOURCES))
+    def test_splitting_leaves_it_alone(self, project: Project, name: str) -> None:
+        # 割るたびに右側の source_in が溜まり、意味の無い値が保存したファイルに残る
+        clip = _generated(_SOURCES[name].create(), start=0, duration=60)
+        split = SplitClip(clip.id, 20).apply(_with(project, clip))
+        assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, 0]
+
+    def test_a_still_picture_keeps_it_when_split(self, project: Project) -> None:
+        # 静止画も同じ 1 枚を描くだけなので、割っても読み始めを動かす意味が無い
+        still = _still()
+        project = replace(project, media=(*project.media, still))
+        clip = make_clip(0, 60, still)
+        split = SplitClip(clip.id, 30).apply(_with(project, clip))
+        assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, 0]
+
+    def test_a_video_still_moves_on_when_split(
+        self, video_media: MediaItem, project: Project
+    ) -> None:
+        # 動画の右側が頭から読み直すと、割っただけで右側の絵が巻き戻る
+        clip = make_clip(0, 60, video_media)
+        split = SplitClip(clip.id, 30).apply(_with(project, clip))
+        assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, Fraction(1)]
+
+    def test_a_jet_cut_leaves_it_alone(self, project: Project) -> None:
+        # ジェットカットのたびに残ったテキストの source_in が溜まる
+        clip = _generated(TEXT.create(), start=0, duration=90)
+        cut = RippleCut(((30, 60),)).apply(_with(project, clip))
+        assert [c.source_in for c in cut.timeline.tracks[0].clips] == [0, 0]
+
+    def test_a_jet_cut_still_moves_a_video_on(
+        self, video_media: MediaItem, project: Project
+    ) -> None:
+        # 動画の後ろ側が頭から読み直すと、カットした所で同じ場面が繰り返される
+        clip = make_clip(0, 90, video_media)
+        cut = RippleCut(((30, 60),)).apply(_with(project, clip))
+        assert [c.source_in for c in cut.timeline.tracks[0].clips] == [0, Fraction(2)]

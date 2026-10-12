@@ -60,6 +60,7 @@ from sashimono.core.commands import (
     new_scene,
     subtitle_voices,
     subtitle_wrap_width,
+    tail_room,
 )
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
@@ -1163,21 +1164,38 @@ def _trim_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     if head == 0 and tail == 0:
         raise ToolError("head_delta か tail_delta のどちらかを指定してください")
     result: dict[str, object] = {}
+    stops: list[str] = []
+    notes: list[str] = []
+    project = _project(host)
     if head < 0:
-        # 頭を前へ伸ばしすぎた頼みは断らず、伸ばせる所まで伸ばす（利用者が決めた）
+        # 端を伸ばしすぎた頼みは断らず、伸ばせる所まで伸ばす（利用者が決めた）
         # 断ると、AI は量を変えて何度も試し直し、そのたびに会話が長くなる 止めた理由と
         # 足りなかった量を返すので、AI は前のクリップを動かすなど次の手を選べる
-        room = head_room(_project(host), (clip.id,))
+        room = head_room(project, (clip.id,))
         # 理由が空なのは伸ばすクリップが 1 本も無い（ロックしている）とき 量を 0 に削ると
         # 「止めた」と答えてしまうので、そのまま命令へ渡して命令の決まりに任せる
         if room.reason and -head > room.frames:
             result["requested_head_delta"] = head
-            result["stopped_at"] = room.reason
-            result["note"] = (
+            stops.append(room.reason)
+            notes.append(
                 f"{room.reason}で止めた 頼まれた {-head} フレームのうち "
                 f"{room.frames} フレームだけ前へ伸ばした"
             )
             head = -room.frames
+    if tail > 0:
+        # 後ろも頭と同じく、後ろのクリップの頭で止める
+        ahead = tail_room(project, (clip.id,))
+        if ahead is not None and tail > ahead.frames:
+            result["requested_tail_delta"] = tail
+            stops.append(ahead.reason)
+            notes.append(
+                f"{ahead.reason}で止めた 頼まれた {tail} フレームのうち "
+                f"{ahead.frames} フレームだけ後ろへ伸ばした"
+            )
+            tail = ahead.frames
+    if stops:
+        result["stopped_at"] = "、".join(stops)
+        result["note"] = " ".join(notes)
     if head or tail:
         host.apply_commands(
             [TrimClip(clip.id, head_delta=head, tail_delta=tail)], "クリップをトリム"
@@ -2128,8 +2146,9 @@ OPERATIONS: tuple[Operation, ...] = (
         name="trim_clip",
         description=(
             "クリップの端を動かす head_delta は正で短く、負で頭を前へ伸ばす tail_delta は"
-            "正で長くなる テキストや図形も頭を前へ伸ばせる 前へ伸ばしすぎた分は、素材の先頭・"
-            "前のクリップの終わり・タイムラインの先頭で止め、結果の note と stopped_at で知らせる"
+            "正で長くなる テキストや図形も頭を前へ伸ばせる 伸ばしすぎた分は、素材の先頭・"
+            "前のクリップの終わり・タイムラインの先頭・後ろのクリップの頭で止め、結果の note と"
+            " stopped_at で知らせる"
         ),
         schema=_schema(
             {
