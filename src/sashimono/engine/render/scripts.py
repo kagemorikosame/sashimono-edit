@@ -21,7 +21,7 @@ from sashimono.compat.aviutl.catalog import SCRIPT_SUFFIXES, ScriptCatalog, scri
 from sashimono.compat.aviutl.control import lua_value
 from sashimono.compat.aviutl.mapping import script_filter_effects
 from sashimono.compat.aviutl.objapi import DrawCall, EffectRequest, ObjectState
-from sashimono.compat.aviutl.runtime import LuaScriptRuntime, blank_image
+from sashimono.compat.aviutl.runtime import acquire_runtime, blank_image, release_runtime
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND
 from sashimono.core.model import AnimatedValue, Clip, Effect, GeneratedSource, ParamValue
 from sashimono.effects.definition import registry
@@ -89,15 +89,25 @@ class ScriptStage:
         self._apply_effects = apply_effects
         #: いま走らせているクリップのフレーム・fps・長さ 効果の動きが時刻を見る
         self._timing: tuple[int, float, int] = (0, 30.0, 1)
-        self._runtime = LuaScriptRuntime(
+        # 借りる 配布物の DLL を読んだランタイムは手放せない（手放すと落ちる）ので、前の
+        # 描画係が返した物を使い回す 毎回作ると、閉じた描画係の数だけ積み上がる
+        self._runtime = acquire_runtime(
             render_source=self._render_source,
             apply_effects=self._apply_requested if apply_effects is not None else None,
         )
+        self._closed = False
         # 共通処理のファイル（.mod2）はスクリプトと同じ場所に置かれている
         self._runtime.set_roots(catalog.roots)
 
     def set_screen(self, width: int, height: int) -> None:
         self._screen = (width, height)
+
+    def close(self) -> None:
+        """ランタイムを返す 描画係を閉じるときに呼ぶ この後は走らせない"""
+        if self._closed:
+            return
+        self._closed = True
+        release_runtime(self._runtime)
 
     def run(
         self,

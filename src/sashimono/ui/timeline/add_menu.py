@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 from sashimono.compat.aviutl.catalog import KIND_LABELS, ScriptEntry, script_catalog
 from sashimono.compat.aviutl.custom_object import (
@@ -46,7 +46,8 @@ from sashimono.core.commands import (
 from sashimono.core.commands.insert import DEFAULT_GENERATED_FRAMES, is_effect_track, new_track
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.io.aliases import Alias, AliasStore, alias_refusal
-from sashimono.core.io.serialize import ProjectFileError
+from sashimono.core.io.library import ALIAS, Library, LibraryEntry, LibraryKind
+from sashimono.core.io.presets import Preset, PresetStore
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -59,6 +60,8 @@ from sashimono.core.model import (
 )
 from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.sources import GROUP, SHAPE, TEXT, TRANSITION, source_registry
+from sashimono.ui import library_dialog, library_save
+from sashimono.ui.library_save import SaveChoice
 
 if TYPE_CHECKING:
     from sashimono.ui.timeline.view import TimelineView
@@ -110,24 +113,6 @@ def _shelf_templates() -> Sequence[TemplateEntry]:
     return catalog.all()
 
 
-def _ask_name(parent: QWidget, suggestion: str) -> str | None:
-    name, accepted = QInputDialog.getText(
-        parent, "エイリアスとして保存", "エイリアスの名前", text=suggestion
-    )
-    return name.strip() if accepted and name.strip() else None
-
-
-def _confirm_overwrite(parent: QWidget, name: str) -> bool:
-    answer = QMessageBox.question(
-        parent,
-        "エイリアスとして保存",
-        f"エイリアス「{name}」はもうあります 上書きしますか",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No,
-    )
-    return answer == QMessageBox.StandardButton.Yes
-
-
 @dataclass
 class AddSources:
     """〔追加〕に並べる物の出どころ 試験では置き場の無い物へ差し替える"""
@@ -138,10 +123,13 @@ class AddSources:
     templates: Callable[[], Sequence[TemplateEntry]] = _shelf_templates
     #: 自分で保存したエイリアス
     aliases: AliasStore = field(default_factory=AliasStore)
-    #: エイリアスの名前を尋ねる 断られたら ``None``
-    ask_name: Callable[[QWidget, str], str | None] = _ask_name
-    #: 同じ名前のエイリアスを上書きしてよいか 断られたら偽
-    confirm_overwrite: Callable[[QWidget, str], bool] = _confirm_overwrite
+    #: 保存の窓（名前・分類・上書きの指定・前後の見本 #276 の追記）を開いて決めた物を返す
+    #: やめたら ``None`` 試験では窓を開かない物へ差し替える
+    ask_save: Callable[..., SaveChoice | None] = library_save.ask_save
+    #: 保存したプリセット 一覧の窓（#276）でエイリアスと並べて整理するのに使う
+    presets: PresetStore = field(default_factory=PresetStore)
+    #: 一覧の窓を開いて、〔置く〕で選ばれた物を返す 試験では窓を開かない物へ差し替える
+    open_library: Callable[..., LibraryEntry | None] = library_dialog.open_library
 
 
 def effects_for(kind: TrackKind) -> tuple[EffectDefinition, ...]:
@@ -302,11 +290,23 @@ class TimelineAddMenus:
     def _fill_aliases(self, menu: QMenu, frame: int, track_id: TrackId | None) -> None:
         sources = self._view.add_sources
         saved = sources.aliases.all()
+        _action(
+            menu,
+            "管理…（見本で選ぶ・名前や分類を変える・消す）",
+            functools.partial(self.manage_aliases, frame, track_id),
+        )
         mine = menu.addMenu("保存したもの")
         if saved:
+            # 分類が 1 つだけなら段を作らない（前と同じ並び） 開く手間が増えるだけになる
+            categories = {alias.category for alias in saved}
+            groups: dict[str, QMenu] = {}
             for alias in saved:
+                target = mine
+                if len(categories) > 1:
+                    target = groups.get(alias.category) or mine.addMenu(alias.category)
+                    groups[alias.category] = target
                 _action(
-                    mine, alias.name, functools.partial(self.place_alias, alias, frame, track_id)
+                    target, alias.name, functools.partial(self.place_alias, alias, frame, track_id)
                 )
         else:
             _placeholder(mine, "（まだありません 右クリックの〔エイリアスとして保存…〕で作れます）")
@@ -395,6 +395,16 @@ class TimelineAddMenus:
             f"エイリアスを置く: {alias.name}",
         )
 
+    def manage_aliases(self, frame: int, track_id: TrackId | None) -> None:
+        """一覧の窓を開く 〔置く〕で選んだ物を、右クリックした所へ置く（メニューと同じ）"""
+        sources = self._view.add_sources
+        library = Library(presets=sources.presets, aliases=sources.aliases)
+        chosen = sources.open_library(
+            self._view, library, kind=ALIAS, pick=ALIAS, capture=self.capture_selected
+        )
+        if chosen is not None and isinstance(chosen.item, Alias):
+            self.place_alias(chosen.item, frame, track_id)
+
     def place_scene(self, scene_id: SceneId, frame: int, track_id: TrackId | None) -> None:
         scene = self._project.find_scene(scene_id)
         if scene is None:
@@ -441,20 +451,36 @@ class TimelineAddMenus:
             self._view.status_message.emit(reason)
             return False
         sources = self._view.add_sources
-        name = sources.ask_name(self._view, _suggested_name(clip))
-        if name is None:
+        # 名前・分類・上書きの指定は保存の窓で決める（#276 の追記） 既定の名前はテキストの頭から
+        # 作るので、同じ文言の別の見た目を続けて保存すると重なりやすい 重なれば窓の中で警告し、
+        # 上書きの印を入れるまで保存させない 上書きした前の内容はごみ箱へ移る
+        saved = library_save.save_look(
+            self._view,
+            Library(presets=sources.presets, aliases=sources.aliases),
+            ALIAS,
+            make=lambda name, category: Alias.of(name, clip, category=category),
+            suggestion=_suggested_name(clip),
+            ask=sources.ask_save,
+            tell=self._view.status_message.emit,
+        )
+        if saved is None:
             return False
-        # 同じ名前があると黙って差し替わり、前に保存した物が消える 既定の名前は
-        # テキストの頭から作るので、同じ文言の別の見た目を続けて保存すると重なりやすい
-        if sources.aliases.exists(name) and not sources.confirm_overwrite(self._view, name):
-            return False
-        try:
-            sources.aliases.save(Alias.of(name, clip))
-        except (OSError, ValueError, ProjectFileError) as exc:
-            self._view.status_message.emit(f"エイリアスを保存できなかった: {exc}")
-            return False
-        self._view.status_message.emit(f"エイリアス「{name}」を保存した")
+        self._view.status_message.emit(f"エイリアス「{saved.name}」を保存した")
         return True
+
+    def capture_selected(
+        self, kind: LibraryKind, name: str, category: str
+    ) -> Preset | Alias | None:
+        """選んでいる主のクリップの見た目（一覧の窓の〔いまのクリップで上書き〕）
+
+        主は最後に選んだ 1 本（設定パネルに出ている物） 最初の 1 本を使うと、何本も選んで
+        いるときに見えていないクリップで上書きする
+        """
+        primary = self._view.selected_clip
+        located = self._project.timeline.locate_clip(primary) if primary is not None else None
+        if located is None:
+            return None
+        return library_save.capture_look(self._project, *located, kind, name, category)
 
 
 def _suggested_name(clip: Clip) -> str:

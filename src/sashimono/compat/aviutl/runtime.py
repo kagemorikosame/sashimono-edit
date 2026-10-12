@@ -264,6 +264,48 @@ class ScriptResult:
     state: ObjectState | None = field(default=None, repr=False)
 
 
+#: DLL のモジュールを読んだランタイム 手放さずに持ち続ける（``_native_module`` を参照）
+_PINNED_RUNTIMES: list[LuaScriptRuntime] = []
+#: 手放せないランタイムのうち、いま誰も使っていない物 次に描画係が要るときに使い回す
+#: 使い回さないと、書き出し・静止画・見本の描画係を作るたびに 1 つずつ積み上がる
+#: （描画係ごと握られて 1 つ 300MB 近く 書き出し 20 回で 5.9GB 増えた）
+_IDLE_RUNTIMES: list[LuaScriptRuntime] = []
+_IDLE_LOCK = threading.Lock()
+
+
+def _keeps_dll_table(key: tuple[object, ...]) -> bool:
+    """使い回すときに残すモジュールの控えか DLL の関数の表だけ（:meth:`LuaScriptRuntime.reset`）"""
+    kind = key[0] if key else None
+    if kind == "aux2":
+        return True
+    if kind == "mod2":
+        # .mod2 は DLL のことも Lua のソースのこともある 鍵は（種類, 場所, 設定）
+        location = key[1]
+        return isinstance(location, Path) and _is_native(location)
+    return False
+
+
+def acquire_runtime(*, render_source: Any = None, apply_effects: Any = None) -> LuaScriptRuntime:
+    """ランタイムを借りる 手の空いている手放せないランタイムがあれば、それを使い回す"""
+    with _IDLE_LOCK:
+        idle = _IDLE_RUNTIMES.pop() if _IDLE_RUNTIMES else None
+    if idle is None:
+        return LuaScriptRuntime(render_source=render_source, apply_effects=apply_effects)
+    idle.rebind(render_source=render_source, apply_effects=apply_effects)
+    return idle
+
+
+def release_runtime(runtime: LuaScriptRuntime) -> None:
+    """借りたランタイムを返す 手放せない物は状態を消して取っておく ほかは手放す"""
+    runtime.rebind()
+    if not runtime.pinned:
+        return
+    runtime.reset()
+    with _IDLE_LOCK:
+        if runtime not in _IDLE_RUNTIMES:
+            _IDLE_RUNTIMES.append(runtime)
+
+
 def lua_available() -> bool:
     """Lua ランタイムを用意できるか"""
     return _load_module() is not None
@@ -346,6 +388,69 @@ class LuaScriptRuntime:
         self._found: dict[tuple[object, ...], Path | None] = {}
         #: 置き場ごとの深い所のモジュールの索引（:meth:`_deep_index`）
         self._deep: dict[Path, dict[tuple[str, str], Path]] = {}
+        #: 用意したての大域変数 使い回すとき（:meth:`reset`）にここへ戻す
+        self._baseline: dict[Any, Any] = dict(self._lua.globals().items())
+        #: 用意したての標準の表の中身（``string`` ``math`` など） スクリプトが標準の表へ
+        #: 関数を足すと、大域変数を戻すだけでは次の描画に残る
+        self._baseline_tables: dict[Any, dict[Any, Any]] = {
+            key: dict(value.items())
+            for key, value in self._baseline.items()
+            if self._lua_type(value) == "table"
+        }
+
+    # --- 使い回し ---
+
+    @property
+    def pinned(self) -> bool:
+        """DLL のモジュールを読み、手放せなくなったか（:meth:`_native_module`）"""
+        return self in _PINNED_RUNTIMES
+
+    def rebind(
+        self,
+        *,
+        render_source: Any = None,
+        apply_effects: Any = None,
+        report: CompatibilityReport | None = None,
+    ) -> None:
+        """描く側の手を付け替える 使い回すときに、前の描画係を握ったままにしない"""
+        self._render_source = render_source
+        self._apply_effects = apply_effects
+        self._report = report if report is not None else global_report
+
+    def reset(self) -> None:
+        """前の描画の状態を消す スクリプトが置いた大域変数と、標準の表へ足した物を捨てる
+
+        使い回したランタイムで、前の書き出しのスクリプトが残した値が次の描画に見えると、
+        同じプロジェクトでも描くたびに絵が変わる 読んだモジュールは DLL の関数の表だけを
+        残し、Lua のソースのモジュールは次の require で走り直させる
+        """
+        with self._lock:
+            # 大域変数の表そのもの（_G）も用意したての表に入っているので、足された
+            # 大域変数もここで消える
+            for name, contents in self._baseline_tables.items():
+                table = self._baseline[name]
+                for key in list(table.keys()):
+                    if key not in contents:
+                        table[key] = None
+                for key, value in contents.items():
+                    table[key] = value
+            # 中身を足された package は作り直す（:meth:`_install_globals` と同じ形）
+            self._lua.execute("package = { loaded = {} }")
+            self._injected.clear()
+            self._folder = None
+            # 残すのは DLL の関数の表（.mod2 の DLL と汎用プラグインの控え）だけ 手放して
+            # Lua に片付けさせると落ちる（手放せない理由と同じ） DLL は Lua の大域変数に
+            # 触れない（表の関数で値を受け取って返すだけ）ので、残しても大域を消した後と
+            # 食い違わない
+            # Lua のソースのモジュール（require の .lua と、DLL ではない .mod2）は捨てて、
+            # 次の require で走り直させる 読み込むときに大域へ関数を置くモジュールがあり、
+            # 控えの値だけを返すと、上で消した大域の関数が無いままになる
+            # 見つからない・探さなかった印も捨てる（記録は描画係ごとに 1 度に戻る）
+            self._modules = {
+                key: value for key, value in self._modules.items() if _keeps_dll_table(key)
+            }
+            self._found.clear()
+            self._deep.clear()
 
     # --- 準備 ---
 
@@ -732,6 +837,16 @@ class LuaScriptRuntime:
             self._report.note_missing(f'モジュール "{name}" を読めない: {exc}')
             return None
         functions = {function: self._native_function(module, function) for function in module.names}
+        # DLL のモジュールを読んだランタイムは、プロセスが終わるまで手放さない
+        # 手放すと Lua の片付けの中で落ちる（アクセス違反 描画係を閉じた後のごみ集めで
+        # 起きた #277 棚の見本で AviUtl2 のエイリアスを続けて描いたとき） DLL の側が
+        # 片付けの順を前提にしているらしく、Python の側では順を決められない
+        # 持ち続けるのは DLL を読んだランタイムだけ（描画係 1 つに 1 つ）
+        if self not in _PINNED_RUNTIMES:
+            _PINNED_RUNTIMES.append(self)
+            # 一覧に入れるだけでは、プロセスの終わりの片付けで一覧ごと手放されて落ちる
+            # 参照を 1 つ余分に持たせ、終わりの片付けでも壊させない（OS が後で全部返す）
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(self))
         return self._lua.table_from(functions)
 
     def _native_function(self, module: native.NativeModule, name: str) -> Any:

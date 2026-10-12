@@ -137,6 +137,8 @@ from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.inspector import InspectorPanel
+from sashimono.ui.library_save import UndoNotice, undo_offers
+from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
@@ -500,6 +502,13 @@ class MainWindow(QMainWindow):
         self._inspector.set_project(self.view_project)
         self._inspector.set_double_click_reset(self._preferences.double_click_reset)
         self._inspector.set_preset_options(self._preferences.preset_options)
+        # 一覧の窓（プリセットとエイリアス）の見せ方 窓は開くたびに作るので、ここで渡しておく
+        set_library_options(self._preferences.library_options)
+        # プリセットやエイリアスを上書きして保存した直後に、ステータスバーへ〔元に戻す〕を出す
+        self._undo_notice = UndoNotice(self)
+        self.statusBar().addPermanentWidget(self._undo_notice)
+        self._undo_notice.finished.connect(lambda text: self.statusBar().showMessage(text, 8000))
+        undo_offers().offered.connect(self._undo_notice.offer)
         self._inspector.set_wheel_unfocused(self._preferences.wheel_unfocused)
         self._graph = GraphEditor(self)
         # グラフエディタも起動直後にプロジェクトを持たせる 持たせないと、開いた作品で最初の
@@ -746,6 +755,10 @@ class MainWindow(QMainWindow):
         self._add(object_menu, "図形を追加", QKeySequence("Ctrl+Shift+T"), self.add_shape)
         self._add(object_menu, "場面切り替えを追加", QKeySequence(), self.add_transition)
         self._add(object_menu, "フィルタを追加", QKeySequence(), self.add_filter)
+        object_menu.addSeparator()
+        # クリップを選んでいなくても整理できる入口 設定パネルの〔プリセット…〕はクリップを
+        # 選ばないと出ず、〔追加〕→〔エイリアス〕は空いた所の右クリックにしか無い
+        self._add(object_menu, "プリセットとエイリアス…", QKeySequence(), self.show_library)
 
         scene_menu = self._menu("シーン")
         self._add(scene_menu, "新しいシーン…", QKeySequence("Ctrl+Alt+N"), self._ask_new_scene)
@@ -963,6 +976,7 @@ class MainWindow(QMainWindow):
         self._scene_bar.set_snap(preferences.timeline_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         self._inspector.set_preset_options(preferences.preset_options)
+        set_library_options(preferences.library_options)
         self._inspector.set_wheel_unfocused(preferences.wheel_unfocused)
         apply_dock_tabs(self, preferences.dock_tabs)
         application = QApplication.instance()
@@ -2737,6 +2751,23 @@ class MainWindow(QMainWindow):
             missing=tuple(missing),
             commands=tuple(AddMedia(media) for media in items),
             items=tuple(items),
+        )
+
+    def show_library(self) -> None:
+        """プリセットと自作のエイリアスの一覧を開く 整理だけで、当てる・置く先は持たない
+
+        置き場はタイムラインの〔追加〕と同じ物を使う（試験で差し替えた置き場も同じに見える）
+        """
+        from sashimono.core.io.library import PRESET, Library
+        from sashimono.ui.library_dialog import open_library
+
+        sources = self._timeline.add_sources
+        open_library(
+            self,
+            Library(presets=sources.presets, aliases=sources.aliases),
+            kind=PRESET,
+            # 〔いまのクリップで上書き〕は設定パネルが見ているクリップ（選んでいれば）
+            capture=self._inspector.capture_look,
         )
 
     def show_templates(self) -> None:

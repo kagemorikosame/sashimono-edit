@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -79,6 +78,8 @@ from sashimono.core.commands.preset import (
     preset_commands,
 )
 from sashimono.core.io import Preset, PresetStore
+from sashimono.core.io.aliases import Alias, AliasStore
+from sashimono.core.io.library import PRESET, Library, LibraryKind
 from sashimono.core.model import (
     LEGACY_BORDER_COLOR,
     LEGACY_BORDER_WIDTH,
@@ -119,6 +120,7 @@ from sashimono.effects.strokes import (
     takes_stroke_effect,
 )
 from sashimono.engine.gpu import BlendMode
+from sashimono.ui import library_dialog, library_save
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import (
@@ -151,6 +153,8 @@ BLEND_LABELS = {
 
 #: 〔プリセット…〕のメニューで「保存」の項目に持たせる印 一覧の項目はプリセットそのものを持つ
 _SAVE_PRESET = "save_preset"
+#: 同じく「一覧で整理・見本で選ぶ」の項目の印（#276 #277）
+_MANAGE_PRESETS = "manage_presets"
 
 #: 配置のテンプレートのボタンの印 :data:`ALIGNMENTS` と同じ並び（左上から右下へ）
 _ALIGN_MARKS = ("↖", "↑", "↗", "←", "●", "→", "↙", "↓", "↘")
@@ -249,6 +253,8 @@ class InspectorPanel(QWidget):
         self._clip_id: ClipId | None = None
         self._selection: tuple[ClipId, ...] = ()
         self._presets = PresetStore()
+        #: 自作のエイリアスの置き場 一覧の窓（#276）でプリセットと並べて整理するのに使う
+        self._aliases = AliasStore()
         #: プリセットの当て方（設定 :attr:`Preferences.preset_options`）
         self._preset_options = PresetOptions()
         self._frame = 0
@@ -1727,6 +1733,10 @@ class InspectorPanel(QWidget):
         """プリセットの置き場を差し替える 試験と、置き場を選べるようにするときのため"""
         self._presets = store
 
+    def set_alias_store(self, store: AliasStore) -> None:
+        """一覧の窓で並べるエイリアスの置き場を差し替える 試験のため"""
+        self._aliases = store
+
     def _show_preset_menu(self) -> None:
         menu = self.preset_menu()
         if menu is None:
@@ -1762,6 +1772,9 @@ class InspectorPanel(QWidget):
             save.setText("この見た目を保存…（保存できる設定がありません）")
             save.setEnabled(False)
             save.setToolTip("足したエフェクトも、描画・音声の欄も、テキストや図形の中身も無い")
+        manage = menu.addAction("管理…（見本で選ぶ・名前や分類を変える・消す）")
+        manage.setData(_MANAGE_PRESETS)
+        manage.setToolTip("保存したプリセットを見本の絵つきの一覧で整理し、選んで当てる")
         menu.addSeparator()
 
         presets = self._presets.all()
@@ -1799,32 +1812,49 @@ class InspectorPanel(QWidget):
             located = self._located()
             if located is not None:
                 self._save_preset(*located)
+        elif data == _MANAGE_PRESETS:
+            self._manage_presets()
         elif isinstance(data, Preset):
             self._apply_preset(data)
 
-    def _save_preset(self, track: Track, clip: Clip) -> None:
-        located = (track, clip)
-        name, accepted = QInputDialog.getText(
-            self, "プリセットを保存", "名前", text=self._describe(clip)
+    def _manage_presets(self) -> None:
+        """一覧の窓を開く 〔当てる〕で選んだ物を、メニューで選んだときと同じ入口で当てる
+
+        当てるのは :meth:`_apply_preset`（中は :func:`apply_preset_commands`） 一覧から当てても
+        メニューから当てても、保存元の側・当てる先の側・中身の既定値の決まりは同じになる
+        """
+        library = Library(presets=self._presets, aliases=self._aliases)
+        chosen = library_dialog.open_library(
+            self, library, kind=PRESET, pick=PRESET, capture=self.capture_look
         )
-        if not accepted or not name.strip():
-            return
-        preset = capture_preset(name.strip(), self._project, *located)
-        if self._presets.exists(preset):
-            # 黙って書き換えると、前に作ったプリセットが戻せないまま消える
-            answer = QMessageBox.question(
-                self,
-                "プリセットを保存",
-                f"「{preset.category}」に「{preset.name}」がもうある 上書きする？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-        try:
-            self._presets.save(preset)
-        except OSError as exc:
-            QMessageBox.warning(self, "プリセットを保存", f"保存できなかった: {exc}")
+        if chosen is not None and isinstance(chosen.item, Preset):
+            self._apply_preset(chosen.item)
+
+    def _save_preset(self, track: Track, clip: Clip) -> None:
+        """保存の窓（名前・分類・上書きの指定・前後の見本 #276 の追記）で決めて保存する
+
+        前は名前だけを尋ね、同じ名前があると後から上書きを尋ね、上書きすると前の内容は戻せ
+        なかった 上書きは窓の中で指定させ、前の内容はごみ箱へ移す
+        """
+        project = self._project
+
+        def make(name: str, category: str) -> Preset:
+            return replace(capture_preset(name, project, track, clip), category=category)
+
+        library_save.save_look(
+            self,
+            Library(presets=self._presets, aliases=self._aliases),
+            PRESET,
+            make=make,
+            suggestion=self._describe(clip),
+        )
+
+    def capture_look(self, kind: LibraryKind, name: str, category: str) -> Preset | Alias | None:
+        """いまのクリップの見た目を保存する形にする 一覧の窓の〔いまのクリップで上書き〕が使う"""
+        located = self._located()
+        if located is None:
+            return None
+        return library_save.capture_look(self._project, *located, kind, name, category)
 
     def _apply_preset(self, preset: Preset) -> None:
         """選んでいるクリップすべてへ当てる 1 回の取り消しで全部戻る

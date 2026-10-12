@@ -19,7 +19,13 @@ from pathlib import Path
 
 from sashimono.core.io.locks import try_hold
 
-__all__ = ["STALE_WRITING_SECONDS", "WRITING_SUFFIX", "held_for_update", "write_atomic"]
+__all__ = [
+    "STALE_WRITING_SECONDS",
+    "WRITING_SUFFIX",
+    "held_for_update",
+    "write_atomic",
+    "write_atomic_bytes",
+]
 
 #: 書きかけの仮のファイルの名前の後ろ 置き場の引き継ぎ（``core/userdirs.py``）は、
 #: これで終わる物を書きかけとして移さない 名前の形を変えるときは、そちらも合わせる
@@ -65,11 +71,24 @@ def write_atomic(path: Path, text: str, *, durable: bool = False) -> None:
 
     改行は ``\\n`` のまま書く OS ごとに書く物が変わらないように
     """
+    _write(path, text.encode("utf-8"), durable=durable)
+
+
+def write_atomic_bytes(path: Path, data: bytes, *, durable: bool = False) -> None:
+    """:func:`write_atomic` のバイト列の版 絵（PNG）のように文字ではない物を書く
+
+    仮のファイルの名前・片付け・置き換えの決まりは :func:`write_atomic` と同じ 見本の絵
+    （``ui/library_thumbnails.py``）が使う
+    """
+    _write(path, data, durable=durable)
+
+
+def _write(path: Path, data: bytes, *, durable: bool) -> None:
     path = Path(path)
     temporary = path.with_name(f"{_scratch_head(path.name)}.{uuid.uuid4().hex[:8]}{WRITING_SUFFIX}")
     try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+        with temporary.open("wb") as handle:
+            handle.write(data)
             if durable:
                 handle.flush()
                 os.fsync(handle.fileno())

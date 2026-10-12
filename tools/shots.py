@@ -990,12 +990,47 @@ def _shelf(context: Context, name: str) -> TemplateDialog:
 
 def shot_templates(context: Context) -> QImage:
     """テンプレートの棚（AviUtl2 のエイリアス）"""
-    return _grab_dialog(_shelf(context, SAMPLE_ALIAS_NAME))
+    return _grab_shelf(_shelf(context, SAMPLE_ALIAS_NAME))
 
 
 def shot_ymm4_shelf(context: Context) -> QImage:
     """テンプレートの棚（YMM4 のアイテムテンプレート）"""
-    return _grab_dialog(_shelf(context, SAMPLE_YMM4_NAME))
+    return _grab_shelf(_shelf(context, SAMPLE_YMM4_NAME))
+
+
+#: 棚の見本がそろうのを待つ上限（ミリ秒） 待つ長さではなく、知らせが来ないまま止まり
+#: 続けないための見張り そろった知らせ（``thumbnails_done``）が来ればすぐに撮る
+SHELF_GUARD_MS = 120_000
+
+
+def _grab_shelf(dialog: TemplateDialog) -> QImage:
+    """棚を撮る 一覧の見本が描き終わってから撮る
+
+    見本は別のスレッドで描いて後から埋まる 描き終わる前に撮ると、地だけの小さな見本が写る
+    """
+    hide_from_screen(dialog)
+    dialog.show()
+    wait_for_thumbnails(dialog)
+    return _grab_dialog(dialog)
+
+
+def wait_for_thumbnails(dialog: TemplateDialog) -> None:
+    """見えている見本がそろうまで待つ 時間ではなく、棚のそろった知らせで抜ける"""
+    if dialog.thumbnails_settled():
+        return
+    loop = QEventLoop()
+    dialog.thumbnails_done.connect(loop.quit)
+    guard = QTimer()
+    guard.setSingleShot(True)
+    guard.timeout.connect(loop.quit)
+    guard.start(SHELF_GUARD_MS)
+    try:
+        loop.exec()
+    finally:
+        guard.stop()
+        dialog.thumbnails_done.disconnect(loop.quit)
+    if not dialog.thumbnails_settled():
+        raise ShotError("棚の見本が描き終わらない（そろった知らせが来なかった）")
 
 
 def _item_for(tree: QTreeWidget, entry: TemplateEntry | None) -> QTreeWidgetItem | None:

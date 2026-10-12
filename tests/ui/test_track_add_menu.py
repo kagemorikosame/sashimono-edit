@@ -34,6 +34,7 @@ from sashimono.core.model import (
 from sashimono.effects import registry
 from sashimono.effects.sources import TEXT
 from sashimono.engine.cache import MediaAnalyzer
+from sashimono.ui.library_save import SaveChoice
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.media_pool import MEDIA_MIME
 from sashimono.ui.theme import Colors
@@ -56,13 +57,19 @@ def _project() -> Project:
     return base.with_timeline(replace(base.timeline, tracks=tracks))
 
 
+def _take_suggestion(
+    *_args: object, suggestion: str, category: str, **_kwargs: object
+) -> SaveChoice:
+    """保存の窓の代わり 勧めた名前のまま、上書きの指定はせずに保存する"""
+    return SaveChoice(name=suggestion, category=category, replacing=None)
+
+
 def _sources(tmp_path: Path, **overrides: object) -> AddSources:
     sources = AddSources(
         custom_objects=lambda: _NOTHING,
         templates=lambda: (),
         aliases=AliasStore(tmp_path / "aliases"),
-        ask_name=lambda _parent, suggestion: suggestion,
-        confirm_overwrite=lambda _parent, _name: True,
+        ask_save=_take_suggestion,
     )
     for name, value in overrides.items():
         setattr(sources, name, value)
@@ -603,8 +610,8 @@ class TestAliases:
         assert not _find(menu, "エイリアスとして保存…").isEnabled()
 
     def test_saving_can_be_cancelled(self, view: TimelineView, tmp_path: Path) -> None:
-        # 名前を尋ねる所で取り消しても保存されると、要らないエイリアスが一覧に増える
-        view.add_sources = _sources(tmp_path, ask_name=lambda _p, _s: None)
+        # 保存の窓でやめても保存されると、要らないエイリアスが一覧に増える
+        view.add_sources = _sources(tmp_path, ask_save=lambda *_a, **_k: None)
         _find(view.build_context_menu(_point(view, "V1", 10)), "エイリアスとして保存…").trigger()
         assert view.add_sources.aliases.all() == ()
 
@@ -612,17 +619,13 @@ class TestAliases:
         self, view: TimelineView, tmp_path: Path
     ) -> None:
         # 既定の名前はテキストの頭から作る 同じ文言の別の見た目を保存すると、黙って前の物が消える
-        asked: list[str] = []
-
-        def refuse(_parent: object, name: str) -> bool:
-            asked.append(name)
-            return False
-
-        view.add_sources = _sources(tmp_path, confirm_overwrite=refuse)
+        # 上書きは保存の窓で指定する 指定せずに同じ名前で保存しても上書きしない
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        view.add_sources = _sources(tmp_path)
         save = ("エイリアスとして保存…",)
         _find(view.build_context_menu(_point(view, "V1", 10)), *save).trigger()
         first = view.add_sources.aliases.all()
-        assert asked == []
         v1 = _track(view, "V1")
         blurred = replace(v1.clips[0], blend_mode="add")
         view.set_project(
@@ -631,8 +634,8 @@ class TestAliases:
             )
         )
         _find(view.build_context_menu(_point(view, "V1", 10)), *save).trigger()
-        assert asked == ["テキスト 見出し"]
         assert view.add_sources.aliases.all() == first
+        assert any("もうある" in message for message in messages)
 
 
 class TestInTheWindow:
