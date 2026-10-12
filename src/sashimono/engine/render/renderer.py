@@ -64,6 +64,7 @@ from sashimono.engine.gpu.projection import project
 from sashimono.engine.motion_shapes import TrailPaths
 from sashimono.engine.render.groups import grouped
 from sashimono.engine.render.invalidate import image_paths
+from sashimono.engine.render.moving_text import MAX_SPRITE_SCREENS, Sprite, SpriteShelf, spot_of
 from sashimono.engine.render.outline import canvas_scale, is_generated, media_pixel_size
 from sashimono.engine.render.script_bake import ScriptEffectBaker
 from sashimono.engine.render.scripts import (
@@ -83,6 +84,8 @@ from sashimono.engine.sources import (
     has_stroke_effects,
     render_source_framed,
     source_canvas,
+    source_position,
+    text_sprite_canvas,
 )
 
 __all__ = ["FrameRenderer", "RenderQuality"]
@@ -412,6 +415,31 @@ def _varies_over_time(source: GeneratedSource) -> bool:
     return isinstance(text, str) and has_embedded(text)
 
 
+#: テキストの設定の位置 動いても字の形は変わらず、置く所だけが変わる
+_POSITION = ("pos_x", "pos_y")
+
+
+def _still_text(source: GeneratedSource) -> GeneratedSource | None:
+    """位置だけが動くテキストなら、位置を 0 に止めたテキスト それ以外は ``None``（#295）
+
+    止めても時間で変わる物（大きさや文字送りのキーフレーム・タイマー・縁取りの層の値）は
+    字の形そのものが変わるので、今までどおりフレームごとに作り直す 位置の止まった
+    テキストも今までの道で描く（1 枚を覚えて使い回しているので、置き直すまでもない）
+    """
+    if source.kind != "text":
+        return None
+    moving = False
+    for name in _POSITION:
+        value = source.params.get(name)
+        moving |= isinstance(value, AnimatedValue) and value.is_animated
+    if not moving:
+        return None
+    still = replace(
+        source, params={**source.params, **{name: AnimatedValue(0.0) for name in _POSITION}}
+    )
+    return None if _varies_over_time(still) else still
+
+
 def _fingerprint(params: dict[str, ParamValue]) -> tuple[tuple[str, str], ...]:
     """生成オブジェクトの設定の指紋 値が同じなら同じ絵になる
 
@@ -457,6 +485,9 @@ class _Made:
     #: 48ms Issue #128） 絵と同じ所に持つので、絵が作り直されれば一緒に消える
     box: _Box | None = None
     scanned: bool = False
+    #: 位置だけが動くテキスト（:meth:`FrameRenderer._moving_text`）で、字の絵を置いた所
+    #: （左, 上, 幅, 高さ） 次のコマはこの所だけを消して絵を使い回す それ以外の絵は ``None``
+    sprite_at: tuple[int, int, int, int] | None = None
 
 
 class FrameRenderer:
@@ -517,6 +548,8 @@ class FrameRenderer:
         self._grab: Framebuffer | None = None
         #: クリップごとに作った絵 同じ設定と同じフレームなら作り直さない
         self._generated: OrderedDict[ClipId, _Made] = OrderedDict()
+        #: 位置だけが動くテキストの、位置を 0 にして描いた字の絵（#295 :meth:`_moving_text`）
+        self._sprites = SpriteShelf()
         #: 入れ子のシーンを描く合成先 深さごとに 1 つ 使うまで作らない
         self._nested: dict[int, Compositor] = {}
         #: クリップを下のクリップの形で切り抜くときに使う合成先（役目と深さごと）
@@ -1103,6 +1136,7 @@ class FrameRenderer:
         self._shutdown_decodes()
         # 覚えた移動軌跡の道も手放す 閉じたレンダラのぶんを次のプロジェクトまで残さない
         self._trail_paths.clear()
+        self._sprites.clear()
         for decoder in self._decoders.values():
             decoder.close()
         self._decoders.clear()
@@ -2313,6 +2347,9 @@ class FrameRenderer:
         width, height = source_canvas(
             source, *canvas, frame=local_frame, scale=scale, fps=float(rate.fps)
         )
+        moved = self._moving_text(clip, source, local_frame, rate, (width, height), scale, gpu=gpu)
+        if moved is not None:
+            return moved
         # 同じ絵をもう一度作らない テキストは 1 枚で数ミリ秒かかり、動かない字幕を
         # 何本も重ねたタイムラインでは、そこが再生の足を引っ張る
         # 時間で変わらない絵は、フレームを鍵に入れない（毎フレーム作り直さない）
@@ -2329,14 +2366,16 @@ class FrameRenderer:
             clip.duration,
             clip.source_in,
             clip.speed,
+            # 縁取りの層も鍵に入れる 層を足しても前の絵が出続けないように
+            # 読む音（:data:`_HEARD_AT`）より前に置く 後ろへ足すと、読む音を見る所が設定の
+            # 指紋を読み、音の無い波形があるだけで、どの文字や図形の絵も作り直しになる
+            repr(source.strokes) if source.strokes else None,
             # 音声波形は読む音（素材の道・ストリーム・レート）も鍵に入れる 素材を
             # 繋ぎ直したりストリームを選び直したりしても、前の音の波形が出ないように
             _waveform_key(self._project, clip, source)
             if source.params.get("shape") == "waveform"
             else None,
             _fingerprint(source.params),
-            # 縁取りの層も鍵に入れる 層を足しても前の絵が出続けないように
-            repr(source.strokes) if source.strokes else None,
         )
         cached = self._generated.get(clip.id)
         if cached is not None and cached.key == key:
@@ -2367,6 +2406,94 @@ class FrameRenderer:
             screen_width, screen_height = self._project.settings.resolution
             _make_room(self._generated, image, screen_width * screen_height * 4)
             self._generated[clip.id] = _Made(key, image, framed)
+        return image
+
+    def _moving_text(
+        self,
+        clip: Clip,
+        source: GeneratedSource,
+        local_frame: int,
+        rate: FrameRate,
+        canvas: tuple[int, int],
+        scale: tuple[float, float],
+        *,
+        gpu: bool,
+    ) -> np.ndarray | None:
+        """位置だけが動くテキストの ``canvas`` の大きさの絵 当てはまらなければ ``None``（#295）
+
+        位置を 0 にした字を、位置の端数（:mod:`~sashimono.engine.render.moving_text`）ごとに
+        1 枚だけ描いて覚え、整数の画素ぶんは置く所を動かす 今までは位置が変わるたびに
+        字を組み直して塗り、字幕 20 本が動くと 1 コマに 0.4 秒かかっていた
+
+        層のエフェクトを持つ字で ``gpu`` が偽（:meth:`_generate`）なら、覚えた絵が無ければ
+        描かずに ``None`` を返す（呼ぶ側が今までどおり掛けずに作る） 掛けずに描いた絵を
+        覚えると、その端数の位置へ来るたびに縁のエフェクトが抜けた字が出る
+        """
+        still = _still_text(source)
+        if still is None:
+            return None
+        fps = float(rate.fps)
+        size = text_sprite_canvas(still, *canvas, frame=local_frame, scale=scale, fps=fps)
+        if size is None:
+            return None
+        spot = spot_of(source_position(source, local_frame), scale, canvas, size)
+        # 字の絵の鍵 位置は入れない（端数は ``spot.cell`` で分ける） 字の設定が 1 つでも
+        # 変われば別の鍵になり、そのクリップの前の絵は捨てて描き直す
+        sprite_key = (
+            size,
+            scale,
+            _fingerprint(still.params),
+            repr(still.strokes) if still.strokes else None,
+        )
+        # 読む音の所（:data:`_HEARD_AT`）は空にしておく 字は音を読まないので、音の無い波形が
+        # あっても捨てない
+        key = ("moving", sprite_key, spot, canvas, None, ())
+        cached = self._generated.get(clip.id)
+        if cached is not None and cached.key == key:
+            return cached.image
+        sprite = self._sprites.get(clip.id, sprite_key, spot.cell)
+        if sprite is None:
+            baked = has_stroke_effects(still)
+            if baked and not gpu:
+                return None
+            shifted = still.with_param("pos_x", AnimatedValue(spot.shift[0])).with_param(
+                "pos_y", AnimatedValue(spot.shift[1])
+            )
+            drawn, framed = render_source_framed(
+                shifted,
+                *size,
+                frame=local_frame,
+                fps=fps,
+                duration=clip.duration,
+                scale=scale,
+                stroke_effects=(
+                    self._stroke_baker(clip, local_frame, rate, scale) if baked else None
+                ),
+            )
+            if drawn is None:
+                return None
+            sprite = Sprite(drawn, framed, _content_box(drawn))
+            screen_width, screen_height = self._project.settings.resolution
+            budget = screen_width * screen_height * 4 * MAX_SPRITE_SCREENS
+            self._sprites.put(clip.id, sprite_key, spot.cell, sprite, budget)
+        # 前のコマに置いた絵があれば、置いた所だけを消して使い回す
+        reuse = None
+        if cached is not None and cached.sprite_at is not None:
+            reuse = (cached.image, cached.sprite_at)
+        image, framed, box, known = sprite.placed(spot.offset, canvas, reuse)
+        self._generated.pop(clip.id, None)
+        screen_width, screen_height = self._project.settings.resolution
+        _make_room(self._generated, image, screen_width * screen_height * 4)
+        # 色の付いた範囲は字の絵から分かっている エフェクトを積んだ字で、置くたびに
+        # 画面 1 枚ぶんを探し直さない（:meth:`_content_box_of`）
+        self._generated[clip.id] = _Made(
+            key,
+            image,
+            framed,
+            box=box,
+            scanned=known,
+            sprite_at=(*spot.offset, *size),
+        )
         return image
 
     def _stroke_baker(
