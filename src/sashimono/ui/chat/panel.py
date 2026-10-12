@@ -801,6 +801,11 @@ class ChatPanel(QWidget):
             # 質問が出ている間に送った文は答え（自由な記述）にする 新しい指示として並べると、
             # 返事を待って止まっている今の指示が終わらず、並べた指示もいつまでも始まらない
             # 複数選べる質問なら、チェックした物も一緒に渡す
+            if not self._question.spec.free_text:
+                # 選択肢に無い答えを断った質問 渡すと、AI が決めた答えの形の外の文が届く
+                # 書いた文は消さずに残す 答えた後に新しい指示として送れるように
+                self._note("この質問には選択肢から答えてください（入力欄の文は送っていません）")
+                return
             self._input.clear()
             self._reply_question(self._checked_labels(), prompt)
             return
@@ -1172,13 +1177,22 @@ class ChatPanel(QWidget):
                 # 時間切れか中断でブリッジ側が畳んだ 画面からも下げ、答えずに終わったと残す
                 self._hide_question()
                 if not showing.answered:
-                    reason = showing.reason.split(" ")[0] or "答えずに終わりました"
-                    self._note(f"質問を閉じました（{reason}）")
+                    self._note_folded(showing)
             return
         question = self._bridge.take_question()
         if question is None:
             return
+        if question.done.is_set():
+            # 画面が取り出す前に畳まれていた（中断の直後に積まれた・画面が塞がって時間が
+            # 切れた） 出すと、押しても「もう閉じていた」になる箱が残る 出さずに訳だけ残す
+            self._note_folded(question)
+            return
         self._show_question(question)
+
+    def _note_folded(self, question: Question) -> None:
+        """答えずに畳まれた質問の訳を、会話の欄に残す"""
+        reason = question.reason.split(" ")[0] or "答えずに終わりました"
+        self._note(f"質問を閉じました（{reason}）")
 
     def _show_question(self, question: Question) -> None:
         self._question = question
@@ -1215,13 +1229,15 @@ class ChatPanel(QWidget):
                 layout.addWidget(detail)
         # 入力欄から送った文は、新しい指示ではなくこの質問への答えにする 新しい指示として
         # 扱うと、前の指示が終わるまで待たされ、その前の指示は返事を待ったまま止まる
+        # 選択肢だけで答える質問では、入力欄の文を答えにしない（send で断る）
         if spec.free_text:
-            note = "選択肢に無い答えは、下の入力欄に書いて送ってください"
+            note = (
+                "選択肢に無い答えは、下の入力欄に書いて送ってください"
+                " 質問が出ている間に入力欄から送った文は、この質問への答えになります"
+            )
         else:
-            note = "選択肢から選んでください"
-        self._question_note.setText(
-            f"{note} 質問が出ている間に入力欄から送った文は、この質問への答えになります"
-        )
+            note = "選択肢から選んでください この質問には入力欄からは答えられません"
+        self._question_note.setText(note)
         self._question_other.setVisible(spec.free_text)
         self._question_send.setVisible(spec.multiple)
         self._refresh_question_send()
@@ -1364,7 +1380,8 @@ class ChatPanel(QWidget):
         # 質問が出ている間は、送った文が答えになることもボタンで言う
         label = "追加で送る" if working else "送信"
         if self._question is not None:
-            label = "答えを送る"
+            # 選択肢だけで答える質問では、押しても送らない それをボタンの名前でも言う
+            label = "答えを送る" if self._question.spec.free_text else "選択肢から答える"
         if self._send_button.text() != label:
             self._send_button.setText(label)
         self._mark_dock(working)

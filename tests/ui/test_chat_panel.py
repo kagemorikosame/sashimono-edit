@@ -1308,6 +1308,43 @@ class TestQuestion:
         _shown(widget, _question(free_text=False))
         assert widget._question_other.isHidden() is True
         assert "選択肢から選んでください" in widget._question_note.text()
+        assert "入力欄からは答えられません" in widget._question_note.text()
+
+    def test_choices_only_questions_do_not_take_the_input(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 選択肢に無い答えを断った質問 壊れると、AI が決めた答えの形の外の文が答えとして届く
+        widget, made, _ = timed
+        _send(widget, "ここを切って")
+        question = _question(free_text=False)
+        _shown(widget, question)
+        assert widget._send_button.text() == "選択肢から答える"
+        _send(widget, "先頭の 3 秒だけ")
+        assert question.done.is_set() is False
+        assert widget._question is question
+        assert widget._question_box.isHidden() is False
+        # 新しい指示にもしない 書いた文は消さずに残す（答えた後に送り直せるように）
+        assert made[0].prompts == ["ここを切って"]
+        assert widget._input.toPlainText() == "先頭の 3 秒だけ"
+        assert "選択肢から答えてください" in _text(widget)
+        _choice_button(widget, "全部").click()
+        assert question.selected == ("全部",)
+        assert question.free_text == ""
+
+    def test_a_question_folded_before_it_is_shown_is_not_shown(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 中断の直後に積まれた・画面が塞がって時間が切れた質問 壊れると、押しても
+        # 「もう閉じていた」になる箱が出て、状態の行も「質問待ち」のまま
+        widget, _, _ = timed
+        _send(widget, "ここを切って")
+        question = _question()
+        question.give_up("中断されました")
+        _shown(widget, question)
+        assert widget._question is None
+        assert widget._question_box.isHidden() is True
+        assert "質問を閉じました（中断されました）" in _text(widget)
+        assert not _status(widget).startswith("質問待ち")
 
     def test_the_status_says_it_waits_for_an_answer(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
