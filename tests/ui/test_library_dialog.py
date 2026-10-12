@@ -538,6 +538,23 @@ class TestEntrances:
         assert [e.kind for e in placed_text[1].effects if not e.fixed] == ["glow"]
         assert [e.kind for e in placed_sound[1].effects if not e.fixed] == ["audio_reverb"]
 
+    def test_replacing_with_the_current_clip_uses_the_primary_one(self, window: MainWindow) -> None:
+        # 何本も選んでいるとき、〔いまのクリップで上書き〕は設定パネルに出ている主（最後に
+        # 選んだ 1 本）を使う 最初の 1 本を使うと、見えていないクリップで上書きした
+        first = window.document.project.timeline.tracks[0].clips[0]
+        second = replace(_clip("二本目"), timeline_start=200)
+        assert window.execute_all(
+            [AddClip(window.document.project.timeline.tracks[0].id, second)], "下ごしらえ"
+        )
+        window._timeline.set_selection((first.id, second.id))
+        QApplication.processEvents()
+        from_menu = window._timeline._add_menus.capture_selected(ALIAS, "x", "c")
+        from_panel = window._inspector.capture_look(ALIAS, "x", "c")
+        assert isinstance(from_menu, Alias) and isinstance(from_panel, Alias)
+        assert from_menu.clip.source is not None
+        assert from_menu.clip.source.params["text"] == "二本目"
+        assert from_menu.clip.source == from_panel.clip.source
+
     def test_the_pick_goes_through_the_same_entrance_as_the_menu(
         self, window: MainWindow, library: Library, monkeypatch: pytest.MonkeyPatch
     ) -> None:

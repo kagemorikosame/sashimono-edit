@@ -200,6 +200,7 @@ class SaveDialog(QDialog):
         self._timer.setSingleShot(True)
         self._timer.setInterval(VISIBLE_DELAY_MS)
         self._timer.timeout.connect(self._request_pictures)
+        self._listed_requested = False
         self._update()
         self._timer.start()
 
@@ -278,14 +279,29 @@ class SaveDialog(QDialog):
         if not self._thumbnails.enabled:
             return
         name, category = self._typed()
+        # 前後の見本あての古い待ちを外し、絵を空にしてから頼み直す 外さないと、名前を
+        # 「赤」から「緑」へ打ち替えた後に届いた赤の絵が「前」に貼られ、警告と見本が食い違う
+        for waiting_key in list(self._waiting):
+            kept: list[tuple[QLabel | None, QListWidgetItem | None]] = [
+                (label, row) for label, row in self._waiting[waiting_key] if label is None
+            ]
+            if kept:
+                self._waiting[waiting_key] = kept
+            else:
+                del self._waiting[waiting_key]
+        self._before.setPixmap(QPixmap())
+        self._after.setPixmap(QPixmap())
         targets: list[tuple[Item, QLabel | None, QListWidgetItem | None]] = [
             (self._make(name or "無題", category), self._after, None)
         ]
         if self._occupant is not None:
             targets.append((self._occupant.item, self._before, None))
-        for row in range(self._list.count()):
-            listed = self._list.item(row)
-            targets.append((listed.data(Qt.ItemDataRole.UserRole).item, None, listed))
+        if not self._listed_requested:
+            # 一覧の見本は 1 度だけ頼む 打つたびに頼むと、同じ項目あての待ちが積み上がる
+            self._listed_requested = True
+            for row in range(self._list.count()):
+                listed = self._list.item(row)
+                targets.append((listed.data(Qt.ItemDataRole.UserRole).item, None, listed))
         for look, label, row_item in targets:
             found = self._thumbnails.cached(look)
             if found is not None:

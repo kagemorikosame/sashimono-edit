@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 import shiboken6
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,7 +41,12 @@ from sashimono.ui.library_save import (
     save_look,
     undo_offers,
 )
-from sashimono.ui.library_thumbnails import THUMBNAILS_SIMPLE, LookThumbnails
+from sashimono.ui.library_thumbnails import (
+    THUMBNAIL_SIZE,
+    THUMBNAILS_SIMPLE,
+    LookThumbnails,
+    Thumbnail,
+)
 from sashimono.ui.library_view import LibraryOptions
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
@@ -579,3 +585,60 @@ class TestUndoNotice:
             assert self._color(library) == RED
         finally:
             window.close()
+
+
+class _HeldThumbnails(QObject):
+    """絵が届く順を試験で決める見本の係 頼まれた物は覚えておき、届けるのは試験が呼んだ時"""
+
+    ready = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enabled = True
+        self.drawn: dict[str, Thumbnail] = {}
+
+    def key_for(self, item: Preset | Alias) -> str:
+        return item.name
+
+    def cached(self, item: Preset | Alias) -> Thumbnail | None:
+        return None
+
+    def request(self, item: Preset | Alias) -> str:
+        return item.name
+
+    def thumbnail(self, key: str) -> Thumbnail | None:
+        return self.drawn.get(key)
+
+    def deliver(self, key: str) -> None:
+        image = QImage(THUMBNAIL_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(0xFFFF0000)
+        self.drawn[key] = Thumbnail(image)
+        self.ready.emit(key)
+
+
+class TestLatePictures:
+    def test_a_late_picture_of_the_old_name_does_not_land_on_before(self, library: Library) -> None:
+        # 名前を「赤」から、描き終わる前に「緑」へ打ち替える 後から届いた赤の絵が
+        # 「前（ごみ箱へ移る）」に貼られると、警告（緑）と見本（赤）が食い違った
+        library.presets.save(Preset.capture("緑", _clip(), category="見出し"))
+        held = _HeldThumbnails()
+        dialog = SaveDialog(
+            library,
+            PRESET,
+            make=_preset_maker(),
+            suggestion="新しい",
+            category="見出し",
+            thumbnails=held,  # type: ignore[arg-type]
+            options=LibraryOptions(),
+        )
+        try:
+            dialog.set_name("赤")
+            dialog._request_pictures()
+            dialog.set_name("緑")
+            dialog._request_pictures()
+            held.deliver("赤")
+            assert dialog._before.pixmap().isNull()
+            held.deliver("緑")
+            assert not dialog._before.pixmap().isNull()
+        finally:
+            shiboken6.delete(dialog)

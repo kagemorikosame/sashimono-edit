@@ -471,9 +471,13 @@ class TimelineAddMenus:
     def capture_selected(
         self, kind: LibraryKind, name: str, category: str
     ) -> Preset | Alias | None:
-        """選んでいる主のクリップの見た目（一覧の窓の〔いまのクリップで上書き〕）"""
-        selected = self._view.selected_clips
-        located = self._project.timeline.locate_clip(selected[0]) if selected else None
+        """選んでいる主のクリップの見た目（一覧の窓の〔いまのクリップで上書き〕）
+
+        主は最後に選んだ 1 本（設定パネルに出ている物） 最初の 1 本を使うと、何本も選んで
+        いるときに見えていないクリップで上書きする
+        """
+        primary = self._view.selected_clip
+        located = self._project.timeline.locate_clip(primary) if primary is not None else None
         if located is None:
             return None
         return library_save.capture_look(self._project, *located, kind, name, category)
