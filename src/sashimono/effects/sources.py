@@ -10,7 +10,7 @@ Qt の描画系に任せるのが現実的で、その依存をこの層に持�
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sashimono.core.model import (
     FILTER_KIND,
@@ -44,8 +44,27 @@ __all__ = [
     "TEXT",
     "TRANSITION",
     "SourceDefinition",
+    "Unlock",
     "source_registry",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class Unlock:
+    """灰色の欄を使えるようにする切り替え 設定パネルが理由の添え書きにボタンで出す
+
+    理由の文だけでは、どこを変えれば使えるのかを探しに行くことになる 原因の欄（組み方）が
+    遠くにあると結び付けられず、使えない欄を不具合だと受け取られた（#301）
+    """
+
+    #: 欄を使えなくしている設定の呼び名 灰色の欄の中に「〜では選べません」と出す
+    cause: str
+    #: ボタンの文字
+    button: str
+    #: ボタンの説明 押すと何が変わるかを、押す前に読めるようにする
+    detail: str
+    #: 今の値から、変える項目と新しい値を作る クリップごとに呼ぶ（行揃えはクリップで違う）
+    switch: Callable[[Mapping[str, ParamValue]], Mapping[str, ParamValue]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +82,9 @@ class SourceDefinition:
     #: 隠さないのは、別の設定（組み方・スタイルなど）を変えれば使える項目だと分かるようにするため
     #: 隠すと「太字が消えた」と見え、スタイルを既定に戻せば使えることに気付けない
     locked: Callable[[Mapping[str, ParamValue]], Mapping[str, str]] | None = None
+    #: :attr:`locked` の理由ごとの切り替え 同じ切り替えで解ける理由は同じ物を指す
+    #: 設定パネルは同じ物のボタンを 1 つにまとめる（2 つ出すと、別々の操作に見える）
+    unlocks: Mapping[str, Unlock] = field(default_factory=dict)
 
     def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
         """``params`` のときに使わない項目 :attr:`unused` が無ければ空"""
@@ -71,6 +93,10 @@ class SourceDefinition:
     def locked_reasons(self, params: Mapping[str, ParamValue]) -> Mapping[str, str]:
         """``params`` のときに効かない項目と理由 :attr:`locked` が無ければ空"""
         return self.locked(params) if self.locked is not None else {}
+
+    def unlock_for(self, reason: str) -> Unlock | None:
+        """理由 ``reason`` で灰色の欄を使えるようにする切り替え 無ければ ``None``"""
+        return self.unlocks.get(reason)
 
     def spec(self, name: str) -> ParameterSpec | None:
         for parameter in self.parameters:
@@ -137,6 +163,42 @@ AVIUTL_NO_WRAP = (
 AVIUTL_NO_STYLE = (
     "AviUtl2 の組み方はスタイルを使いません AviUtl2 はファミリ名と太字・斜体だけで字を選ぶため"
     "（標準の組み方にすると使えます）"
+)
+
+
+def _native_layout(params: Mapping[str, ParamValue]) -> Mapping[str, ParamValue]:
+    """組み方を標準にするときに変える値
+
+    横の基準も行揃えに合わせる AviUtl2 の組み方は行揃えで塊ごと寄せる（左寄せなら枠の左端が
+    位置に来る）が、標準の組み方は塊を横の基準で置き、行揃えは塊の中の行どうしにしか効かない
+    組み方だけを変えると、左寄せの字が塊の幅の半分だけ右へ跳ぶ（Yu Gothic UI の大きさ 100 の
+    1 行で 357 画素） 合わせると、太字でない 1 行の字は 1 画素以内に収まる
+    """
+    align = params.get("align", "center")
+    anchor = align if align in ("left", "center", "right") else "center"
+    return {"layout": "native", "anchor": anchor}
+
+
+#: AviUtl2 の組み方で使えない欄を、標準の組み方へ切り替えて使えるようにする
+#: 説明の幅は 2026-10-12 に測った 書体は Yu Gothic UI・Noto Sans JP・メイリオ・MS UI Gothic・
+#: ルイカ、大きさは 34・60・100 1 行と 2〜3 行、行揃え 3 通り、太字、字間 10 を 2 つの組み方で
+#: 描き、字の外形の上下左右の端がいちばん動いた量 ルイカは行の高さの持ち方が違い、行の間が動く
+TO_NATIVE_LAYOUT = Unlock(
+    cause="AviUtl2 の組み方",
+    button="組み方を「標準」にする",
+    detail=(
+        "組み方を「標準」に変えて、この欄を使えるようにします（取り消しで戻せます）\n"
+        "AviUtl2 の組み方は、字の送りと位置を AviUtl2 に合わせた組み方です"
+        " 標準にすると、字の位置や幅が次のくらい変わることがあります"
+        "（行揃えに合わせて横の基準も変え、字の塊の位置は保ちます）\n"
+        "・太字でない 1 行: ほとんどの書体で 2 画素以内（ルイカで 6 画素まで）\n"
+        "・太字: 字の大きさの 5〜13%（大きさ 100 で 5〜13 画素）\n"
+        "・2 行以上: ほとんどの書体で 1 画素以内 ルイカは行の間が変わり、大きさ 100 の"
+        " 3 行で 24 画素\n"
+        "・字間を空けているとき: 字間の半分ほど\n"
+        "AviUtl2 で作った見た目にそろえたいときは、AviUtl2 の組み方のままにしてください"
+    ),
+    switch=_native_layout,
 )
 #: スタイルを選んでいる間、太字と斜体を使えない理由
 STYLE_DECIDES_WEIGHT = "スタイルを選んでいる間は使いません（太さと傾きはスタイルが決めます）"
@@ -242,6 +304,7 @@ TEXT = SourceDefinition(
         FontStyleSpec("font_style", "スタイル"),
     ),
     locked=_text_locked,
+    unlocks={AVIUTL_NO_WRAP: TO_NATIVE_LAYOUT, AVIUTL_NO_STYLE: TO_NATIVE_LAYOUT},
 )
 
 

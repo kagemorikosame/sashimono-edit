@@ -680,6 +680,7 @@ class FontStyleEditor(ParameterEditor):
         self._spec = spec
         self._family = ""
         self._value = spec.default_value()
+        self._unavailable: str | None = None
         self._box = QComboBox(self)
         # フォントの欄と同じく、長いスタイル名（Sitka の「Subheading Semibold Italic」など）で
         # 設定パネルの最小の幅を広げない
@@ -707,9 +708,27 @@ class FontStyleEditor(ParameterEditor):
         self._value = text
         self._fill()
 
+    def set_unavailable(self, text: str | None) -> None:
+        """使えない間、一覧の代わりに ``text`` を出す ``None`` で一覧に戻す
+
+        灰色の欄に「既定」とだけ出すと、スタイルに対応していないか、壊れていると受け取られた
+        （#301） 選んでいたスタイルは前に添えて残す（消すと、使える組み方へ戻したときに
+        何を選んでいたかが分からない）
+        """
+        self._unavailable = text
+        self._fill()
+
     def _fill(self) -> None:
         from PySide6.QtGui import QFontDatabase
 
+        if self._unavailable is not None:
+            self._updating = True
+            try:
+                self._box.clear()
+                self._box.addItem(f"{self._value}{self._unavailable}", self._value)
+            finally:
+                self._updating = False
+            return
         # 可変フォント（源ノ角ゴシック VF など）は同じ名前のスタイルを 2 度返す
         styles = list(dict.fromkeys(QFontDatabase.styles(self._family))) if self._family else []
         self._updating = True
