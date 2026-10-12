@@ -113,6 +113,54 @@ class TestEachWriterHasItsOwnScratchFile:
         assert [path.name for path in tmp_path.iterdir()] == [target.name]
 
 
+#: 名前の上限に近い名前 ASCII（Windows の字数）・日本語（Linux などのバイト数）・字の外の文字
+_LONG_NAMES = ["a" * 250 + ".sme", "長い題の動画" * 13 + ".sme", "🎬" * 120 + ".sme"]
+
+
+class TestLongNames:
+    @pytest.mark.parametrize("name", _LONG_NAMES)
+    def test_the_scratch_name_fits_the_limit_of_a_file_name(
+        self, tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、題の長いプロジェクトや設定は仮のファイルを作れず、保存そのものができない
+        opened: list[str] = []
+
+        def record(self: Path, *_args: object, **_kwargs: object) -> None:
+            opened.append(self.name)
+            raise OSError("名前だけを見る")
+
+        monkeypatch.setattr(Path, "open", record)
+        with pytest.raises(OSError, match="名前だけを見る"):
+            write_atomic(tmp_path / name, "{}")
+        (scratch,) = opened
+        assert len(scratch.encode("utf-8")) <= 255
+        assert len(scratch.encode("utf-16-le")) // 2 <= 255
+        assert scratch.endswith(".writing")
+
+    @pytest.mark.parametrize("name", _LONG_NAMES)
+    def test_a_shortened_scratch_is_still_known_as_a_scratch(
+        self, tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、切った名前の書きかけが片付けから漏れて積もるか、引き継ぎで完成品として移る
+        opened: list[str] = []
+
+        def record(self: Path, *_args: object, **_kwargs: object) -> None:
+            opened.append(self.name)
+            raise OSError("名前だけを見る")
+
+        monkeypatch.setattr(Path, "open", record)
+        with pytest.raises(OSError):
+            write_atomic(tmp_path / name, "{}")
+        (scratch,) = opened
+        assert atomic._is_leftover(scratch, name)
+        assert not atomic._is_leftover(scratch, "別の" + name)
+        assert not _can_take(tmp_path / scratch, "recovery")
+
+    def test_a_short_name_keeps_the_whole_name(self) -> None:
+        # 壊れると、書きかけの名前から元のファイルが分からず、手で片付けるときに迷う
+        assert atomic._scratch_head("preferences.json") == "preferences.json"
+
+
 class TestAFailedWriteLeavesTheOldFile:
     def test_a_failure_while_writing_keeps_the_old_file_and_no_scratch(
         self, tmp_path: Path

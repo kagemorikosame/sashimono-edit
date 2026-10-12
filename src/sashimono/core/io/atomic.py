@@ -27,6 +27,12 @@ WRITING_SUFFIX = ".writing"
 #: 書き手ごとの印の形（``uuid4`` の頭 8 桁）
 _MARK = re.compile(r"[0-9a-f]{8}")
 
+#: ファイルの名前の長さの上限（Windows は UTF-16 の 255 字 Linux などは 255 バイト）
+_NAME_MAX = 255
+
+#: 仮のファイルの名前で、元の名前の頭の後ろに足す長さ（``.<印 8 桁>.writing``）
+_SCRATCH_TAIL = len(".") + 8 + len(WRITING_SUFFIX)
+
 #: 落ちた書き手が残した仮のファイルを片付けるまでの古さ（秒）
 #: 書いている最中の物は書くたびに更新時刻が進むので、これより古いのは持ち主がもういない
 #: 短くすると、遅いドライブで大きなプロジェクトを書いている別の窓の仮のファイルを消してしまう
@@ -47,6 +53,7 @@ def write_atomic(path: Path, text: str, *, durable: bool = False) -> None:
     仮のファイルの名前に書き手ごとの印を混ぜる（``<名前>.<印>.writing``） 同じ名前だと、
     2 つの窓が同時に同じファイルを書いたときに、片方が相手の書きかけを上書きしたり、
     相手が先に置き換えて仮のファイルが消え、もう片方の置き換えが落ちたりする
+    名前の上限に近い長い名前は、頭を切って収める（:func:`_scratch_head`）
 
     書くか置き換えるのに失敗したら、仮のファイルを片付けてから上げ直す 片付けないと、
     印が書き手ごとに違うので、落ちるたびに書きかけが積もる
@@ -58,7 +65,7 @@ def write_atomic(path: Path, text: str, *, durable: bool = False) -> None:
     改行は ``\\n`` のまま書く OS ごとに書く物が変わらないように
     """
     path = Path(path)
-    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}{WRITING_SUFFIX}")
+    temporary = path.with_name(f"{_scratch_head(path.name)}.{uuid.uuid4().hex[:8]}{WRITING_SUFFIX}")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
@@ -100,13 +107,12 @@ def _sweep_stale(path: Path) -> None:
     も拾う 古さで分けるのは、別の窓が今まさに書いている物を消さないため
     """
     limit = time.time() - STALE_WRITING_SECONDS
-    head = f"{path.name}."
     try:
         with os.scandir(path.parent) as entries:
             stale = [
                 Path(entry.path)
                 for entry in entries
-                if _is_leftover(entry.name, head)
+                if _is_leftover(entry.name, path.name)
                 and entry.is_file(follow_symlinks=False)
                 and entry.stat(follow_symlinks=False).st_mtime < limit
             ]
@@ -117,13 +123,31 @@ def _sweep_stale(path: Path) -> None:
             leftover.unlink(missing_ok=True)
 
 
-def _is_leftover(name: str, head: str) -> bool:
-    """``head`` のファイルの仮のファイルの名前か 本人の物を取り違えて消さないよう形を厳しく見る"""
+def _scratch_head(name: str) -> str:
+    """仮のファイルの名前の頭 元の名前が長ければ、印と後ろを足しても収まるところで切る
+
+    ファイルの名前は Windows で 255 文字（UTF-16）、Linux などで 255 バイト（UTF-8 で日本語は
+    1 字 3 バイト）まで 元の名前を丸ごと頭にすると、上限に近い名前（長い日本語の題の
+    プロジェクトなど）では仮のファイルを作れず、保存そのものができない 切った頭が別の
+    ファイルと重なっても、印が書き手ごとに違うので仮のファイルはぶつからない
+    """
+    room = _NAME_MAX - _SCRATCH_TAIL
+    head = name
+    # バイトで収めれば字数も収まる UTF-8 のバイト数は、どの文字でも UTF-16 の字数以上
+    while len(head.encode("utf-8")) > room:
+        head = head[:-1]
+    return head
+
+
+def _is_leftover(name: str, target: str) -> bool:
+    """``target`` のファイルの仮のファイルの名前か 本人の物を取り違えて消さないよう形を厳しく見る"""
+    if name == f"{target}{WRITING_SUFFIX}":
+        # 前の版の決まった名前（``<名前>.writing``）
+        return True
+    head = f"{_scratch_head(target)}."
     if not name.startswith(head) or not name.endswith(WRITING_SUFFIX):
         return False
-    middle = name[len(head) : -len(WRITING_SUFFIX)]
-    # 空なら前の版の決まった名前（``<名前>.writing``）
-    return middle == "" or _MARK.fullmatch(middle) is not None
+    return _MARK.fullmatch(name[len(head) : -len(WRITING_SUFFIX)]) is not None
 
 
 @contextlib.contextmanager
