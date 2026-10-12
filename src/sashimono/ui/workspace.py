@@ -474,6 +474,12 @@ class Preferences:
     #: 聞かれるのが手間な人・指示を細かく書く人は切れる 切ると質問の道具を渡さず、
     #: 指示の文からも聞き返す基準を外す
     ai_ask_questions: bool = True
+    #: 削除して詰めたあと（Shift+Delete と右クリックの「削除して詰める」）、再生ヘッドを
+    #: 消した所の頭（つなぎ目）へ動かす（Issue #299） 既定は入 詰めると後ろが前へ寄り、
+    #: 元の位置はつなぎ目と関係の無い所を指す つなぎ目を確かめたい人が多い
+    #: 再生中に消したときは、止めずに頭から続ける（末尾に着いたら続きが無いので止める）
+    #: 動いてほしくない人は切れば今までどおり
+    ripple_playhead: bool = True
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -637,6 +643,7 @@ class PreferenceStore:
             ),
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
+            ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
         )
 
     def save(self, preferences: Preferences) -> None:
