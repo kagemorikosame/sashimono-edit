@@ -13,7 +13,7 @@ import platform
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -79,16 +79,25 @@ from sashimono.core.io import (
     ProjectFileError,
     RecoveryEntry,
     RecoverySession,
+    UnavailableRecovery,
     backup_before_save,
-    backup_folder,
+    default_state_root,
     discard,
-    find_orphans,
+    discard_items,
+    find_orphans_in,
+    forget_empty_roots,
     hold_new,
+    latest_backup_folder,
     load_project,
+    mark_offered,
     others_holding,
     project_presence_dir,
+    remember_root,
     save_project,
+    tidy_orphans,
+    trim_state,
 )
+from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
     Clip,
@@ -117,6 +126,13 @@ from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
+from sashimono.ui.backup_settings import (
+    STATE_SUBFOLDER,
+    describe_trim,
+    recovery_roots,
+    state_root_for,
+    state_roots,
+)
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
@@ -169,11 +185,6 @@ ANALYSIS_REFRESH_MS = 250
 #: 走っている間しか回さないので、短くしても手の空いた時の重さは変わらない
 IMPORT_POLL_MS = 30
 
-#: 保存していない変更を退避する間隔（ミリ秒）
-#: 落ちたときに失うのは最大でこの長さの作業 短くするほど書き込みが増えるが、
-#: 1 回は数百 KB の JSON なので 30 秒なら気にならない
-AUTOSAVE_MS = 30_000
-
 _PORTABLE = QKeySequence.SequenceFormat.PortableText
 
 #: 素材一覧のサムネイルに使う時刻（秒） 頭の 1 コマではなく少し先を使う
@@ -205,20 +216,30 @@ def initial_size(available: QSize) -> QSize:
     return DEFAULT_SIZE.boundedTo(available - WINDOW_FRAME)
 
 
-def about_text() -> str:
+def about_text(state_folder: str = "") -> str:
     """バージョン情報の文面 不具合の報告の「版」と「環境」の欄にそのまま写せる形
 
     置き場は環境変数の形ではなく実際の場所で出す 開発版と配った zip、Windows と
     それ以外で場所が違い、``%APPDATA%`` と書くだけでは本人の機械でどこなのかが
     分からない
+
+    退避・バックアップは設定で選んだ置き場（``state_folder`` 空なら既定）を出す 既定の
+    置き場を出すと、置き場を変えた人の報告に写したときに違う場所を案内する 選んだ置き場が
+    既定と違えば、書けないときに使う既定の置き場も添える（控えが既定の側にもありうる）
     """
+    default = userdirs.state_root()
+    # 選んだフォルダの下の Sashimono 専用のフォルダ（:func:`state_root_for` と同じ決まり）
+    chosen = Path(state_folder) / STATE_SUBFOLDER if state_folder else default
+    state_line = f"退避・バックアップ: {chosen}"
+    if chosen != default:
+        state_line += f"（書けないときは {default}）"
     return "\n".join(
         (
             f"Sashimono Edit {__version__}",
             f"Python {platform.python_version()} / Qt {qVersion()} / {platform.platform()}",
             "",
             f"設定・スクリプト・テンプレート: {userdirs.config_root()}",
-            f"退避・バックアップ: {userdirs.state_root()}",
+            state_line,
             f"キャッシュ: {userdirs.cache_root()}",
             "",
             f"使い方: {MANUAL_URL}",
@@ -239,6 +260,20 @@ def _probe_or_none(path: Path) -> MediaItem | None:
         return probe_media(path)
     except ProbeError:
         return None
+
+
+def _removal_note(head: str, done: list[TrimItem], failed: list[TrimItem]) -> str:
+    """片付けの知らせ 消せた物と、消せなかった物の数 どちらも無ければ空
+
+    消せなかった物があっても、消せた物を必ず書く 消せた物を書かずに失敗だけを伝えると、
+    本人は何も消えていないと思う
+    """
+    parts = []
+    if done:
+        parts.append(f"{head}: " + describe_trim(done).replace("\n", " "))
+    if failed:
+        parts.append(f"{len(failed)} 件は消せなかったので残した")
+    return " ／ ".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,7 +353,18 @@ class MainWindow(QMainWindow):
         self._saved: Project | None = self._document.project
         self._autosaved: Project | None = self._document.project
         self._confirm_unsaved = confirm_unsaved
-        self._recovery = RecoverySession()
+        #: 退避を書いている置き場 設定の置き場へ書けないときは既定の置き場（:meth:`_open_recovery`）
+        self._recovery_root = default_state_root()
+        #: 選んだ置き場へ書けずに戻したことの知らせ 起動の途中で出すと、窓を組み立てる
+        #: 間の知らせ（「素材を読み込んでください」）に上書きされるので、組み立て終えてから出し直す
+        self._state_fallback_message = ""
+        #: この起動で初めて復元を勧めた落ちた作業（中身の場所） 容量の片付けから外す
+        #: 〔あとで決める〕を選んだ直後に消すと、「次の起動でまた出る」が守られない
+        self._first_offered: set[Path] = set()
+        #: 覚えようとして覚えられなかった置き場（一覧の錠を取れなかった など） 次の退避のときに
+        #: もう 1 度覚える 黙って諦めると、この置き場で落ちた作業が次の起動の復元に出ない
+        self._unremembered: set[Path] = set()
+        self._recovery = self._open_recovery(state_root_for(self._preferences))
         #: 開いているプロジェクトの錠 同じファイルを別の窓で開いたことに気付くため
         self._project_lock: HeldLock | None = None
         if path is not None and not self._claim(path):
@@ -402,9 +448,8 @@ class MainWindow(QMainWindow):
         self._import_timer.timeout.connect(self._poll_import)
 
         self._autosave_timer = QTimer(self)
-        self._autosave_timer.setInterval(AUTOSAVE_MS)
         self._autosave_timer.timeout.connect(self.autosave)
-        self._autosave_timer.start()
+        self._apply_autosave_timer(self._preferences)
 
         # 既定の並びを覚えてから、前回の並びを当てる 逆にすると「初期に戻す」が
         # 前回の並びに戻るだけになる
@@ -421,6 +466,8 @@ class MainWindow(QMainWindow):
         self._apply_auto_quality()
 
         self._update_title()
+        if self._state_fallback_message:
+            self.statusBar().showMessage(self._state_fallback_message, 15000)
 
     # --- 組み立て ---
 
@@ -875,13 +922,17 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         if answer != QDialog.DialogCode.Accepted:
             return
-        self._apply_preferences(dialog.preferences())
+        self._apply_preferences(dialog.preferences(), dialog.approved_trim)
 
-    def _apply_preferences(self, preferences: Preferences) -> None:
+    def _apply_preferences(
+        self, preferences: Preferences, approved_trim: Sequence[TrimItem] = ()
+    ) -> None:
         """設定を今の画面へ反映して保存する
 
         控えの大きさを変えたら別の鍵になるので、作り直しを頼む
         古い控えは残るが、掴むことはない（鍵に大きさを混ぜてある）
+
+        ``approved_trim`` は設定画面で消してよいと確かめた物（容量の上限） この中だけを消す
         """
         # 作り直すのは大きさが変わったときと、控えを切ったとき
         # 大きさは置き場の鍵が変わるため 切ったときは**走っている変換を止める**ため
@@ -950,6 +1001,123 @@ class MainWindow(QMainWindow):
         for media in self.view_project.media:
             self._request_proxy(media)
         self._apply_auto_quality()
+        self._apply_autosave_timer(preferences)
+        if state_root_for(preferences) != state_root_for(previous):
+            self._move_recovery(state_root_for(preferences))
+        if approved_trim:
+            # 世代数で詰める控えと容量の上限で片付ける物 消すのは設定画面の OK で見せて
+            # 確かめた物そのもの 当てる時に計画を立て直すと、確かめた後に退避を移したなどで
+            # 中身が変わり、見せていない物まで消える 見せた数と消える数をそろえる
+            # 上限に収まりきらない分は、次の上書き保存のときの片付け（消した物を知らせる）に任せる
+            failed: list[TrimItem] = []
+            done = discard_items(approved_trim, failed=failed)
+            note = _removal_note("確かめた物を片付けた", done, failed)
+            if note:
+                self.statusBar().showMessage(note, 15000)
+
+    def _apply_autosave_timer(self, preferences: Preferences) -> None:
+        """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
+
+        切ったらタイマーを止める 止めずに書き込みだけ飛ばすと、切ったのに 30 秒ごとに
+        起き続ける 間隔を変えたら数え直す（``setInterval`` は動いているタイマーも数え直す）
+        """
+        self._autosave_timer.setInterval(preferences.autosave_seconds * 1000)
+        if preferences.autosave:
+            if not self._autosave_timer.isActive():
+                self._autosave_timer.start()
+        else:
+            self._autosave_timer.stop()
+
+    def _open_recovery(self, root: Path) -> RecoverySession:
+        """この起動の退避を ``root`` に用意する 書けなければ既定の置き場へ戻して知らせる
+
+        既定の置き場にも書けないときは、止めずに退避の無いまま続け、知らせる
+        （:class:`~sashimono.core.io.recovery.UnavailableRecovery`） 止めると、既定の置き場の
+        権限やドライブの具合だけで起動も設定の反映もできなくなる 退避のたびにも書けないと知らせる
+        """
+        default = default_state_root()
+        if root != default:
+            try:
+                session = RecoverySession(root)
+            except (OSError, RuntimeError) as exc:
+                self._tell_state_fallback(root, default, exc)
+            else:
+                self._recovery_root = root
+                # 書く置き場を覚える 設定を後で別の置き場へ変えても、次の起動はここも探す
+                self._remember_root(root)
+                return session
+        self._recovery_root = default
+        try:
+            return RecoverySession(default)
+        except (OSError, RuntimeError) as exc:
+            self._state_fallback_message = (
+                f"退避の置き場 {default} にも書けないので、この起動では退避できません（{exc}）"
+                " こまめに保存してください"
+            )
+            self.statusBar().showMessage(self._state_fallback_message, 30000)
+            return UnavailableRecovery(str(exc))
+
+    def _remember_root(self, root: Path) -> None:
+        """退避を書く置き場を覚える 覚えられなければ、次の退避のときにもう 1 度覚える
+
+        覚えられなくても退避は書ける 覚えるのは、置き場を変えた後に落ちた作業を
+        次の起動で探すため
+        """
+        try:
+            remember_root(root)
+        except OSError:
+            self._unremembered.add(root)
+        else:
+            self._unremembered.discard(root)
+
+    def _tell_state_fallback(self, root: Path, used: Path, exc: BaseException) -> None:
+        """選んだ置き場に書けず、``used``（多くは既定の置き場）へ戻したことを知らせる
+
+        ステータスバーに長めに出す 窓で止めないのは、起動の途中や編集の途中に、本人が
+        何もしていないのに窓が割り込むと何の話か分からないため 置き場の設定はそのまま残し、
+        次の起動でまた選んだ置き場を試す（ドライブを挿し直せば戻る）
+        """
+        self._state_fallback_message = (
+            f"退避とバックアップの置き場 {root} に書けないので、{used} を使います（{exc}）"
+        )
+        self.statusBar().showMessage(self._state_fallback_message, 15000)
+
+    def _move_recovery(self, root: Path) -> None:
+        """この起動の退避を新しい置き場へ移る 前の置き場にあったこの起動の退避は、
+        新しい方へ書けてから消す 前の置き場に前からある退避と控えには触らない
+
+        先に消すと、新しい置き場へ書く前に落ちたときに何も残らない
+        """
+        previous, previous_root = self._recovery, self._recovery_root
+        self._recovery = self._open_recovery(root)
+        if self.is_modified:
+            try:
+                self._recovery.save(self._document.project, self._path)
+            except OSError as exc:
+                # 新しい方へ書けなければ、前の置き場の退避のまま続ける
+                # 既定の置き場へ移す案もあるが採らない 前の置き場にはもう今の作業の退避があり、
+                # 移すと退避が 3 つ目の場所に散る 前の置き場は退避を書いたときに覚えてあり
+                # （:func:`remember_root`）、設定が新しい置き場のままでも次の起動の復元はここを
+                # 探すので、この後に落ちても見失わない
+                # 先に前のセッションへ戻してから閉じる 閉じるのが失敗して例外が上がると、
+                # 閉じたセッションを指したまま残り、次の退避が書けない
+                failed = self._recovery
+                self._recovery, self._recovery_root = previous, previous_root
+                with contextlib.suppress(OSError):
+                    failed.close()
+                self._tell_state_fallback(root, previous_root, exc)
+                return
+        try:
+            previous.close()
+        except OSError as exc:
+            # 前の置き場（回線の切れたネットワークなど）の退避を消せなかった 錠は手放して
+            # あるので、残った退避は次の起動で復元を勧められる 例外を上げると設定の反映が
+            # 途中で止まり、後の片付けと知らせが走らない 黙らずに知らせる
+            self.statusBar().showMessage(
+                f"前の置き場 {previous_root} の退避を消せなかった"
+                f"（次の起動で復元を勧めます）: {exc}",
+                15000,
+            )
 
     def _apply_auto_quality(self) -> None:
         """置いてある素材の大きさに合わせて、プレビューの画質を決める
@@ -2024,7 +2192,10 @@ class MainWindow(QMainWindow):
         """いまの状態を「保存済み」とする 守るものが無くなるので退避も消す"""
         self._saved = self._document.project
         self._autosaved = self._saved
-        self._recovery.clear()
+        # 置き場が書けなくなっていても、保存できたことは変わらない 消し損ねた退避は
+        # 閉じるときにもう 1 度消しに行き、残っても次の起動で勧められるだけ
+        with contextlib.suppress(OSError):
+            self._recovery.clear()
 
     def _confirm_discard(self) -> bool:
         """変更を捨ててよいか 保存を選べば保存してから真を返す"""
@@ -2083,7 +2254,7 @@ class MainWindow(QMainWindow):
             # 古い形式のファイルを今の形式で上書きする前に、横へ写しを残す 自動更新の後で
             # 前の版へ戻した人が、上げる前の作品を開けるように（前の版は新しい形式を読めない）
             keep_pre_upgrade_copy(self._path)
-            backup_before_save(self._path)
+            note = self._back_up(self._path)
         except OSError as exc:
             # 控えが取れなくても保存は止めない 止めると、控えのために
             # いまの作業のほうを失う
@@ -2097,6 +2268,37 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.statusBar().showMessage(f"保存した: {self._path}{note}", 5000 if note else 3000)
         return True
+
+    def _back_up(self, target: Path) -> str:
+        """上書きする前の中身を、設定の置き場と世代数で控える 知らせる言葉を返す（無ければ空）
+
+        設定の置き場へ書けなければ既定の置き場へ控え、そのことを保存の知らせに添える
+        書けないまま黙ると、本人はバックアップがあると思ったまま無い
+        既定の置き場にも書けなければ ``OSError`` をそのまま上げる（呼ぶ側が知らせる）
+        """
+        preferences = self._preferences
+        if not preferences.backup:
+            return ""
+        keep = preferences.backup_generations
+        root = state_root_for(preferences)
+        default = default_state_root()
+        note = ""
+        # 1 回の保存で消すのは入れ替えの 1 本まで 世代数を超えた分は、設定画面で見せて
+        # 確かめたときにだけ詰める（置き場を変えた先や、別の窓の設定で超えていても黙って消さない）
+        # 入れ替えで消せなかった古い控え 黙らない決まりで、保存の知らせに添える
+        stuck: list[Path] = []
+        try:
+            backup_before_save(target, root, keep=keep, most=1, failed=stuck)
+        except OSError as exc:
+            if root == default:
+                raise
+            backup_before_save(target, default, keep=keep, most=1, failed=stuck)
+            note = f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
+        if stuck:
+            note += f"（古いバックアップ {len(stuck)} 本は消せなかったので残した）"
+        # 控えを足したぶん上限を超えうる 超えたら古い物から片付けて、何を消したかを添える
+        trimmed = self._trim_state()
+        return f"{note}（{trimmed}）" if trimmed else note
 
     def save_as(self) -> bool:
         suggested = self._path or Path(f"{self._document.project.name}{SUFFIX}")
@@ -2159,11 +2361,16 @@ class MainWindow(QMainWindow):
         if self._path is None:
             self.statusBar().showMessage("まだ保存していないので、バックアップはありません", 5000)
             return
-        folder = backup_folder(self._path)
-        if not folder.is_dir():
-            self.statusBar().showMessage("バックアップは上書き保存したときに作られます", 5000)
+        # 設定の置き場・既定の置き場・前に使った置き場（覚えた置き場）のうち、使える控えの
+        # いちばん新しい方を開く 設定の置き場へ書けなかった保存の控えは既定の側にあり、
+        # 置き場を変える前の控えは前の置き場に残る（移さない決まり） 探さないと、控えが
+        # あるのに「ありません」と出る フォルダがあるかで決めると、空のフォルダや古い控え
+        # しか無い方を開き、正しい控えへたどり着けない
+        folder = latest_backup_folder(self._path, recovery_roots(self._preferences))
+        if folder is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        self.statusBar().showMessage("バックアップは上書き保存したときに作られます", 5000)
 
     def edit_settings(self) -> None:
         """プロジェクト設定を開く 解像度と重ね合わせの方法を変えられる"""
@@ -2242,33 +2449,147 @@ class MainWindow(QMainWindow):
         if project is self._autosaved:
             return
         try:
-            if self.is_modified:
-                self._recovery.save(project, self._path)
-            else:
-                self._recovery.clear()
+            self._write_recovery(project)
         except OSError as exc:
-            self.statusBar().showMessage(f"自動退避に失敗した: {exc}", 5000)
-            return
+            if not self._fall_back_recovery(exc, project):
+                self.statusBar().showMessage(f"自動退避に失敗した: {exc}", 5000)
+                return
         self._autosaved = project
+        # 前に覚えられなかった置き場を覚え直す 退避を書けた今なら、落ちたときに探す所に要る
+        for root in list(self._unremembered):
+            self._remember_root(root)
+
+    def _write_recovery(self, project: Project, session: RecoverySession | None = None) -> None:
+        target = session if session is not None else self._recovery
+        if self.is_modified:
+            target.save(project, self._path)
+        else:
+            target.clear()
+
+    def _fall_back_recovery(self, exc: OSError, project: Project) -> bool:
+        """選んだ置き場へ退避を書けなくなった（ドライブを抜いた・回線が切れた・満杯）
+
+        この起動の残りは既定の置き場へ書く 既定の置き場へ書けたら真 書けなければ偽
+        書けない所へ 30 秒ごとに書きに行き続けると、退避が黙って止まったままになる
+
+        既定の置き場へ ``project`` を書き終えてから、前の置き場のセッションを閉じる
+        閉じると前の置き場の退避（最後に書けた中身）を消すので、先に閉じて既定の側も
+        書けないと、どちらにも何も残らない
+        """
+        default = default_state_root()
+        if self._recovery_root == default:
+            return False
+        try:
+            replacement = RecoverySession(default)
+        except (OSError, RuntimeError):
+            return False
+        try:
+            self._write_recovery(project, replacement)
+        except OSError:
+            # 既定の側にも書けない 前の置き場のセッション（最後に書けた退避）を残して続ける
+            with contextlib.suppress(OSError):
+                replacement.close()
+            return False
+        failed, self._recovery = self._recovery, replacement
+        failed_root, self._recovery_root = self._recovery_root, default
+        # 書けない置き場の錠を手放す 古い退避を消しに行って失敗しても（書けない所なので）
+        # 既定の側に新しい退避があるので困らない
+        with contextlib.suppress(OSError):
+            failed.close()
+        self._tell_state_fallback(failed_root, default, exc)
+        return True
 
     def offer_recovery(self) -> None:
-        """前回落ちた作業が残っていれば、復元するか尋ねる 起動の直後に呼ぶ"""
+        """前回落ちた作業が残っていれば、復元するか尋ねる 起動の直後に呼ぶ
+
+        尋ね終えてから、日数と容量の上限で片付ける 先に片付けると、本人が一度も
+        見ていない落ちた作業を消しうる
+        """
+        # 設定の置き場と既定の置き場に加え、前に退避を書いた置き場も探す 置き場を変えた後に
+        # 古い置き場へ書いた退避（新しい置き場へ書けずに戻した など）を見失わないため
+        roots = recovery_roots(self._preferences)
+        self._ask_recovery(roots)
+        self._tidy_state(roots)
+        # 退避が 1 つも残っていない古い置き場は忘れる 覚えたままだと、使わなくなった
+        # 置き場（抜いたドライブなど）を起動のたびに探しに行く
+        with contextlib.suppress(OSError):
+            forget_empty_roots([*state_roots(self._preferences), self._recovery_root])
+
+    def _ask_recovery(self, roots: list[Path]) -> None:
         from sashimono.ui.recovery_dialog import RecoveryDialog
 
-        while entries := find_orphans():
+        while entries := find_orphans_in(roots):
             dialog = RecoveryDialog(entries, self)
             answer = dialog.exec()
             # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
             # この後で結果を読む間は残る
             dialog.deleteLater()
+            # 一覧に出した物は勧めた 印を付けられなくても（置き場が書けない）片付けの側が
+            # 消さないだけで困らない
+            for shown in entries:
+                if not shown.offered:
+                    self._first_offered.add(shown.path)
+                with contextlib.suppress(OSError):
+                    mark_offered(shown)
             if answer != QDialog.DialogCode.Accepted or dialog.choice is None:
                 return
             action, entry = dialog.choice
             if action == "discard":
-                discard(entry)
+                try:
+                    discard(entry)
+                except OSError as exc:
+                    # 消せない物を残したまま窓を出し直すと、同じ 1 件を何度も尋ねる
+                    self.statusBar().showMessage(f"退避を捨てられなかった: {exc}", 15000)
+                    return
                 continue
             self.restore_recovery(entry)
             return
+
+    def _tidy_state(self, roots: list[Path]) -> None:
+        """日数を過ぎた残りの退避と、容量の上限を超えた古い物を片付けて知らせる"""
+        # 1 件消せなくても続ける 消せた物と消せなかった物の両方を知らせる
+        # （途中で止めると、それまでに消した物が知らされない）
+        left: list[RecoveryEntry] = []
+        try:
+            tidied = tidy_orphans(roots, self._preferences.recovery_keep_days, failed=left)
+        except OSError:
+            # 退避を探す所で読めなかった 何も消していない
+            tidied = []
+        notes = []
+        if tidied:
+            notes.append(
+                f"{self._preferences.recovery_keep_days} 日より前に落ちた作業の退避を "
+                f"{len(tidied)} 件片付けた"
+            )
+        if left:
+            notes.append(f"落ちた作業の退避 {len(left)} 件は消せなかったので残した")
+        trimmed = self._trim_state()
+        if trimmed:
+            notes.append(trimmed)
+        if notes:
+            self.statusBar().showMessage(" ／ ".join(notes), 15000)
+
+    def _trim_state(self) -> str:
+        """容量の上限を超えていれば古い物から片付ける 知らせる言葉を返す（無ければ空）
+
+        上限を入れた後の、上書き保存と起動のときの片付け 上限は入れるときに消える物を
+        見せて確かめてあり、その後は決まりとして古い物から消し、消した物を必ず知らせる
+        """
+        limit_mb = self._preferences.state_limit_mb
+        if limit_mb <= 0:
+            return ""
+        items: list[TrimItem] = []
+        failed: list[TrimItem] = []
+        for root in state_roots(self._preferences):
+            # 1 件消せなくても trim_state は続けて、消せた物を返す ここで包むのは、
+            # 置き場そのものを読めない（消す前に止まり、何も消していない）ときだけ
+            with contextlib.suppress(OSError):
+                items.extend(
+                    trim_state(
+                        limit_mb * 1024 * 1024, root, failed=failed, spare=self._first_offered
+                    )
+                )
+        return _removal_note(f"容量の上限 {limit_mb}MB を超えたので片付けた", items, failed)
 
     def restore_recovery(self, entry: RecoveryEntry) -> bool:
         """退避を開く 保存はしないので、開いた直後は「変更あり」になる
@@ -2300,9 +2621,14 @@ class MainWindow(QMainWindow):
             self._request_proxy(media)
 
         self.autosave()
+        note = ""
         if self._autosaved is project:
-            discard(entry)
-        self.statusBar().showMessage("前回の作業を復元した まだ保存していません", 6000)
+            try:
+                discard(entry)
+            except OSError:
+                # 写した後の元を消せなかった 次の起動でもう 1 度勧められるだけで、作業は失わない
+                note = "（元の退避は消せなかったので、次の起動でもう 1 度尋ねます）"
+        self.statusBar().showMessage(f"前回の作業を復元した まだ保存していません{note}", 6000)
         return True
 
     def export(self) -> None:
@@ -2617,7 +2943,7 @@ class MainWindow(QMainWindow):
 
     def show_about(self) -> None:
         """版と置き場を出す 不具合の報告で最初に聞くことを 1 か所で見られるようにする"""
-        QMessageBox.about(self, "バージョン情報", about_text())
+        QMessageBox.about(self, "バージョン情報", about_text(self._preferences.state_folder))
 
     # --- AI 連携（EditorHost の実装）---
     #
@@ -2838,7 +3164,10 @@ class MainWindow(QMainWindow):
             self._workspace.save(self)
         # ここまで来たら変更は保存したか、捨てると決めたもの 退避は要らない
         self._autosave_timer.stop()
-        self._recovery.close()
+        # 置き場のドライブを抜いたなどで退避を消せなくても、閉じるのは止めない
+        # 消せなかった退避は次の起動で復元を勧められるだけで、作業は失わない
+        with contextlib.suppress(OSError):
+            self._recovery.close()
         self._release_lock()
 
         # 解放の順番が大事 GL 資源はコンテキストが生きているうちに、
