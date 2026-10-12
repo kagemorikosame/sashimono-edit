@@ -318,7 +318,7 @@ class TestClosingDropsPendingPrompts:
         fake.ClaudeAgentOptions = lambda **_kwargs: object()  # type: ignore[attr-defined]
         fake.ClaudeSDKClient = _FakeClient  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
-        monkeypatch.setattr(session_module, "build_server", lambda _bridge: None)
+        monkeypatch.setattr(session_module, "build_server", lambda _bridge, **_options: None)
         monkeypatch.setattr(session_module, "hide_cli_console", lambda: None)
         monkeypatch.setattr(AgentSession, "option_values", lambda _self: {})
         _FakeClient.queried = []
