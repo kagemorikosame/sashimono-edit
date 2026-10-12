@@ -112,10 +112,14 @@ class TestOldRecoveryAndBackups:
         # 拾わないと、その作業は復元を勧められずに埋もれる
         folder = tmp_path / "recovery"
         folder.mkdir()
-        _write_with_format(Project.create(name="落ちた作業"), folder / "abc.kmk", "kumiki-project")
+        _write_with_format(
+            Project.create(name="落ちた作業"),
+            folder / "0123456789abcdef0123456789abcdef.kmk",
+            "kumiki-project",
+        )
 
         (entry,) = find_orphans(tmp_path)
-        assert entry.path == folder / "abc.kmk"
+        assert entry.path == folder / "0123456789abcdef0123456789abcdef.kmk"
         assert load_project(entry.path).name == "落ちた作業"
 
     def test_a_live_session_still_wins(self, tmp_path: Path) -> None:
