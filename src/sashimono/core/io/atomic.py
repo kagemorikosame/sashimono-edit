@@ -9,6 +9,7 @@ Qt を使わない コア層の保存（プロジェクト・プリセット・�
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import re
 import time
@@ -128,15 +129,21 @@ def _scratch_head(name: str) -> str:
 
     ファイルの名前は Windows で 255 文字（UTF-16）、Linux などで 255 バイト（UTF-8 で日本語は
     1 字 3 バイト）まで 元の名前を丸ごと頭にすると、上限に近い名前（長い日本語の題の
-    プロジェクトなど）では仮のファイルを作れず、保存そのものができない 切った頭が別の
-    ファイルと重なっても、印が書き手ごとに違うので仮のファイルはぶつからない
+    プロジェクトなど）では仮のファイルを作れず、保存そのものができない
+
+    切ったときは、切る前の名前全体から作る短い印（``~<sha256 の頭 8 桁>``）を足す 足さないと、
+    頭の同じ別の長い名前と頭が重なり、片方の片付け（:func:`_sweep_stale`）がもう片方の
+    書きかけを自分の物と見なして消す
     """
-    room = _NAME_MAX - _SCRATCH_TAIL
+    if len(name.encode("utf-8")) <= _NAME_MAX - _SCRATCH_TAIL:
+        return name
+    digest = "~" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    room = _NAME_MAX - _SCRATCH_TAIL - len(digest)
     head = name
     # バイトで収めれば字数も収まる UTF-8 のバイト数は、どの文字でも UTF-16 の字数以上
     while len(head.encode("utf-8")) > room:
         head = head[:-1]
-    return head
+    return head + digest
 
 
 def _is_leftover(name: str, target: str) -> bool:

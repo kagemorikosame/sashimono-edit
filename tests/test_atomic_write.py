@@ -156,6 +156,19 @@ class TestLongNames:
         assert not atomic._is_leftover(scratch, "別の" + name)
         assert not _can_take(tmp_path / scratch, "recovery")
 
+    @pytest.mark.parametrize("name", _LONG_NAMES)
+    def test_a_scratch_of_another_long_name_with_the_same_head_is_not_taken(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        # 壊れると、頭の同じ別の長い名前のファイルを保存したときに、こちらの書きかけを消す
+        other = name[:-4] + "-別.sme"
+        mine = atomic._scratch_head(name)
+        assert mine != atomic._scratch_head(other)
+        scratch = f"{mine}.0a1b2c3d.writing"
+        assert atomic._is_leftover(scratch, name)
+        assert not atomic._is_leftover(scratch, other)
+        assert len(scratch.encode("utf-8")) <= 255
+
     def test_a_short_name_keeps_the_whole_name(self) -> None:
         # 壊れると、書きかけの名前から元のファイルが分からず、手で片付けるときに迷う
         assert atomic._scratch_head("preferences.json") == "preferences.json"
