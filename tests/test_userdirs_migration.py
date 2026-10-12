@@ -255,7 +255,10 @@ class TestLocalFolder:
         # 引き継いだあとに復元を勧められなければ、引き継いだ意味が無い
         data = project_to_dict(Project.create(name="落ちた作業"))
         data["format"] = "kumiki-project"
-        _put(local / "Kumiki" / "recovery" / "abc.kmk", json.dumps(data, ensure_ascii=False))
+        _put(
+            local / "Kumiki" / "recovery" / "0123456789abcdef0123456789abcdef.kmk",
+            json.dumps(data, ensure_ascii=False),
+        )
         migrate_legacy_folders()
         (entry,) = find_orphans()
         assert load_project(entry.path).name == "落ちた作業"
