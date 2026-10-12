@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.io.locks import is_held
 
 __all__ = [
@@ -144,13 +145,18 @@ class UpdateStateStore:
         )
 
     def save(self, state: UpdateState) -> None:
+        """覚え書きを丸ごと書く
+
+        2 つの窓が同時に読んで書き戻すと、後の方が先の方の変更を消しうるが、錠では守らない
+        呼ぶ側は書く直前に読み直しており、消し合う間合いは一瞬 消えるのは最後に確かめた時刻・
+        知らせた印・飛ばした版などで、消えても次の起動でもう 1 度確かめるか尋ねるだけで済む
+        版を落とす・入れ替える所は、別の錠（``STAGE_LOCK`` と ``SWAP_LOCK``）で 1 人ずつにしてある
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + ".writing")
         data = asdict(state)
         data["skipped"] = list(state.skipped)
         data["scripts_offered"] = list(state.scripts_offered)
-        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.path)
+        write_atomic(self.path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _text(value: object) -> str:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import uuid
@@ -31,10 +32,16 @@ class HeldLock:
         self._handle: IO[str] | None = handle
 
     def release(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-        self.path.unlink(missing_ok=True)
+        """手放して錠のファイルを片付ける 片付けるのは自分が持っている錠だけ
+
+        手放してから名前で消すと、その間に待っていた相手が同じ名前で取り直した錠を消す
+        POSIX では 3 人目も入れてしまい、Windows では相手が開いているので消せずに上がり、
+        錠の中で済ませた仕事（書き終えた保存）まで失敗に見える 手放した後（:meth:`abandon`）
+        や 2 度目に呼んだときは、もう自分の錠ではないので何もしない
+        """
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            _let_go(self.path, handle)
 
     def abandon(self) -> None:
         """錠のファイルを片付けずに手放す プロセスが落ちたときと同じ状態になる
@@ -100,6 +107,17 @@ if sys.platform == "win32":
         except FileExistsError:
             return None
 
+    def _let_go(path: Path, handle: IO[str]) -> None:
+        """閉じてから消す 開いたままでは自分でも消せない
+
+        閉じた後に消せないのは、待っていた相手がもう同じ名前で取り直して開いているとき
+        （``PermissionError``） その錠は相手の物なので残す 無いのは、相手が持ち主のいない
+        錠として先に片付けたとき
+        """
+        handle.close()
+        with contextlib.suppress(FileNotFoundError, PermissionError):
+            path.unlink()
+
     def _held(path: Path) -> bool:
         """消せたら持ち主はもういない（開いているファイルは消せない）"""
         try:
@@ -131,6 +149,20 @@ else:
         finally:
             temporary.unlink(missing_ok=True)
         return handle
+
+    def _let_go(path: Path, handle: IO[str]) -> None:
+        """ロックを持ったまま消してから閉じる 消すのは名前がまだ自分のファイルを指すときだけ
+
+        閉じてから消すと、その間に相手がロックを掛けて取り直した錠を消す 持ったまま消せば、
+        相手は消えた名前へ新しい錠を置くので取り違えない
+        """
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                mine, named = os.fstat(handle.fileno()), path.stat()
+                if (mine.st_dev, mine.st_ino) == (named.st_dev, named.st_ino):
+                    path.unlink()
+        finally:
+            handle.close()
 
     def _held(path: Path) -> bool:
         """ロックを掛けられたら持ち主はもういない（プロセスが終わると外れる）"""

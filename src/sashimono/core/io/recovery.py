@@ -31,6 +31,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import (
+    STALE_WRITING_SECONDS,
+    WRITING_SUFFIX,
+    held_for_update,
+    write_atomic,
+)
 from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.core.io.serialize import LEGACY_SUFFIXES, SUFFIX, save_project
 from sashimono.core.model import Project
@@ -133,7 +139,7 @@ class RecoverySession:
             # 前の版が書いた秒単位のメモも fromisoformat でそのまま読める
             "saved_at": datetime.now().isoformat(timespec="microseconds"),
         }
-        _write_atomic(self._meta_path(self._folder, self.session), json.dumps(meta))
+        write_atomic(self._meta_path(self._folder, self.session), json.dumps(meta))
 
     def clear(self) -> None:
         """退避を消す 保存した直後など、守るものが無くなったときに呼ぶ"""
@@ -196,6 +202,7 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
     folder = (root if root is not None else default_state_root()) / "recovery"
     if not folder.is_dir():
         return []
+    _clear_stale_writing(folder)
 
     # メモと中身のどちらか一方しか無いものも拾う 中身から先に書くので、最初の
     # 退避の途中で落ちると中身だけが残る メモだけを数えるとそれを見落とす
@@ -252,6 +259,29 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
             )
         )
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+def _clear_stale_writing(folder: Path) -> None:
+    """終わった起動が退避を書く途中で落ちて残した書きかけを片付ける 片付けられなくても止めない
+
+    最初の退避の途中で落ちると、中身もメモも無く書きかけだけが残る その起動は復元の
+    候補に出ない（:func:`discard` を通らない）ので、ここで消さないと容量に数えられたまま残る
+    生きている起動の物は消さない その窓が今まさに書いている 古さも見るのは二重の守り
+    錠が効かない置き場（回線の先の共有フォルダ など）で生死を取り違えても、書いている最中の
+    物は更新時刻が新しいので消さない 古さの決まりは :func:`write_atomic` と同じ
+    """
+    limit = time.time() - STALE_WRITING_SECONDS
+    try:
+        leftovers = list(folder.glob(f"*{WRITING_SUFFIX}"))
+    except OSError:
+        return
+    for path in leftovers:
+        session = path.name.split(".", 1)[0]
+        if not _SESSION_NAME.fullmatch(session) or _is_alive(folder, session):
+            continue
+        with contextlib.suppress(OSError):
+            if path.is_file() and path.stat().st_mtime < limit:
+                path.unlink(missing_ok=True)
 
 
 def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
@@ -342,20 +372,12 @@ _PLACES_WAIT = 2.0
 def _places_held(registry: Path | None) -> Iterator[None]:
     """覚えた置き場の一覧（``places.json``）を、プロセスの間で 1 人ずつ書き換える
 
-    錠は窓の錠と同じ仕組み（:func:`~sashimono.core.io.locks.try_hold`） 持ち主が落ちれば
-    次に取りに来た方が片付けて取り直す 待っても取れなければ ``TimeoutError``（``OSError``）
+    待っても取れなければ ``TimeoutError``（``OSError``） 錠の決まりは :func:`held_for_update`
     """
     base = registry if registry is not None else default_state_root()
     base.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + _PLACES_WAIT
-    while (lock := try_hold(base / _PLACES_LOCK)) is None:
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"覚えた置き場の一覧の錠を取れない: {base / _PLACES_LOCK}")
-        time.sleep(0.01)
-    try:
+    with held_for_update(base / _PLACES_LOCK, _PLACES_WAIT):
         yield
-    finally:
-        lock.release()
 
 
 def _has_backups(root: Path) -> bool:
@@ -404,7 +426,7 @@ def _has_files(folder: Path) -> bool:
 def _write_places(places: list[Path], registry: Path | None) -> None:
     base = registry if registry is not None else default_state_root()
     base.mkdir(parents=True, exist_ok=True)
-    _write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
+    write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
 
 
 def folder_problem(root: Path) -> str | None:
@@ -444,13 +466,23 @@ def _remove_files(paths: tuple[Path, ...]) -> None:
 
 
 def _session_files(entry: RecoveryEntry) -> tuple[Path, ...]:
-    """その退避に属するファイル 中身・メモ・錠・勧めた印"""
+    """その退避に属するファイル 中身・メモ・錠・勧めた印・落ちたときの書きかけ
+
+    書きかけ（``<起動の番号>.sme.<印>.writing`` など）も含める 起動ごとに名前が違うので、
+    次の退避で上書きされることも、:func:`write_atomic` の片付けで拾われることも無い
+    ここで消さないと、容量（:func:`state_usage`）には数えるのに、どの片付けでも消えずに残る
+    """
     folder = entry.path.parent
+    try:
+        leftovers = tuple(sorted(folder.glob(f"{entry.session}.*{WRITING_SUFFIX}")))
+    except OSError:
+        leftovers = ()
     return (
         entry.path,
         folder / f"{entry.session}.json",
         folder / f"{entry.session}.lock",
         _offered_path(folder, entry.session),
+        *leftovers,
     )
 
 
@@ -548,14 +580,6 @@ def _path_digest(target: Path) -> str:
     """場所の要約 大文字小文字や ``..`` の違いで別物にならないよう正規化してから取る"""
     resolved = os.path.normcase(str(Path(target).resolve()))
     return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:10]
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    # 仮の名前は書き手ごとに別にする 同じ名前だと、2 つのプロセスが同時に書いたときに
-    # 互いの書きかけを上書きしたり、相手が置き換えた後の仮のファイルが見つからずに落ちたりする
-    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.writing")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
 
 
 # --- 世代バックアップ ------------------------------------------------------
