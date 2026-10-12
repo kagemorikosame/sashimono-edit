@@ -359,10 +359,30 @@ def _places_held(registry: Path | None) -> Iterator[None]:
 
 
 def _has_backups(root: Path) -> bool:
-    """Sashimono の控えが 1 本でも残っているか 置き場が見えない（抜いたドライブ）ときも残す側"""
-    if not (root / "backups").exists():
+    """Sashimono の控えが 1 本でも残っているか 置き場が見えない・一覧を読めないときも残す側
+
+    「空」と「読めない」を分ける 一覧を読めない（権限・回線の一時的な失敗）のを空と見なすと、
+    控えの残る置き場を覚えた置き場から外し、読めるようになった後も〔バックアップのフォルダを
+    開く〕が探さない ``Path.exists`` は読めないときに偽を返すので使わない
+    """
+    try:
+        folders = [
+            folder
+            for folder in (root / "backups").iterdir()
+            if folder.is_dir() and _BACKUP_FOLDER_NAME.fullmatch(folder.name)
+        ]
+    except FileNotFoundError:
+        # backups が無い ドライブごと見えないときは忘れない（挿し直せば戻る）
         return not Path(root.anchor).exists()
-    return any(_generations(folder) for folder in _backup_folders(root))
+    except OSError:
+        return True
+    for folder in folders:
+        try:
+            if any(_is_generation(path) for path in folder.iterdir()):
+                return True
+        except OSError:
+            return True
+    return False
 
 
 def _root_key(root: Path) -> str:

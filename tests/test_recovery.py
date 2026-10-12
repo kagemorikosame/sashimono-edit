@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import threading
+from collections.abc import Iterator
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -510,6 +511,39 @@ class TestRememberedFolders:
         remember_root(tmp_path / "A", registry)
         remember_root(tmp_path / "B", registry)
         forget_empty_roots([], registry)
+        assert remembered_roots(registry) == [tmp_path / "A"]
+
+    @pytest.mark.parametrize("unreadable", ["backups", "recovery", "folder"])
+    def test_a_folder_that_cannot_be_listed_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable: str
+    ) -> None:
+        # 一覧を読めないのを空と見なして忘れると、読めるようになった後も控えと退避を探さない
+        registry = tmp_path / "既定"
+        target = tmp_path / "本編.sme"
+        target.write_text("中身", "utf-8")
+        copied = backup_before_save(target, tmp_path / "A")
+        assert copied is not None
+        RecoverySession(tmp_path / "A").close()
+        remember_root(tmp_path / "A", registry)
+        blocked = {
+            "backups": tmp_path / "A" / "backups",
+            "recovery": tmp_path / "A" / "recovery",
+            "folder": copied.parent,
+        }[unreadable]
+        plain = Path.iterdir
+
+        def iterdir(self: Path) -> Iterator[Path]:
+            if self == blocked:
+                raise PermissionError(f"読めない: {self}")
+            return plain(self)
+
+        if unreadable == "recovery":
+            # 控えが無ければ recovery だけが手掛かり 読めないのを空と見なすと忘れる
+            copied.unlink()
+            copied.parent.rmdir()
+        monkeypatch.setattr(Path, "iterdir", iterdir)
+        forget_empty_roots([], registry)
+        monkeypatch.undo()
         assert remembered_roots(registry) == [tmp_path / "A"]
 
 
