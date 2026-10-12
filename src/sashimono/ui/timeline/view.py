@@ -58,6 +58,7 @@ from sashimono.core.commands.edit import (
     DEFAULT_TRACK_HEIGHT,
     MAX_TRACK_HEIGHT,
     MIN_TRACK_HEIGHT,
+    head_room,
     shifted_track,
 )
 from sashimono.core.commands.layers import places_mixed
@@ -1464,7 +1465,19 @@ class TimelineView(QWidget):
             _, clip = located
             if self._drag.kind is DragKind.TRIM_HEAD:
                 frame += self._snap_shift((frame,))
-                self._drag.preview_head_delta = min(frame - clip.timeline_start, clip.duration - 1)
+                # 前へ伸ばす量は TrimClip と同じ決まりで止める 止めないと、枠は前のクリップや
+                # 素材の先頭を越えて伸びて見えるのに、離すと失敗して何も変わらない
+                trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
+                room = head_room(self._project, trimmed)
+                if room.reason and frame - clip.timeline_start < -room.frames:
+                    # 枠が止まっただけでは、なぜ止まったのか（素材が無いのか前が詰まって
+                    # いるのか）が分からない 理由を下の帯に出す
+                    self.status_message.emit(
+                        f"{room.reason}で止まる 前へ伸ばせるのは {room.frames} フレームまで"
+                    )
+                self._drag.preview_head_delta = max(
+                    -room.frames, min(frame - clip.timeline_start, clip.duration - 1)
+                )
             else:
                 frame += self._snap_shift((frame,))
                 self._drag.preview_tail_delta = max(frame - clip.timeline_end, -(clip.duration - 1))

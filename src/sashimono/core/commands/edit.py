@@ -34,9 +34,14 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate
 
 __all__ = [
+    "HEAD_STOP_PREVIOUS",
+    "HEAD_STOP_SCENE",
+    "HEAD_STOP_SOURCE",
+    "HEAD_STOP_TIMELINE",
     "AddClip",
     "AddMedia",
     "AddTrack",
+    "HeadRoom",
     "InsertGap",
     "MoveClip",
     "MoveClips",
@@ -55,6 +60,8 @@ __all__ = [
     "SetTranscript",
     "SplitClip",
     "TrimClip",
+    "TrimClips",
+    "head_room",
     "shifted_track",
 ]
 
@@ -806,7 +813,11 @@ class TrimClip(Command):
     """クリップの端を動かす
 
     ``head`` を動かすとソース範囲の開始位置も一緒にずれる（素材の中身は動かない）
-    ``tail`` は長さだけを変える
+    ``tail`` は長さだけを変える 素材の時間を持たないテキスト・図形・静止画などは
+    開始位置を動かさず、頭を前へ伸ばすのはタイムラインの先頭と前のクリップでだけ止まる
+
+    キーフレームとエフェクトはクリップの頭からのフレームで持つので、頭に付いて動く
+    （AviUtl と同じ 利用者が決めた） 頭を前へ伸ばすと「登場」の動きも前へ動く
     """
 
     clip_id: ClipId
@@ -832,7 +843,7 @@ class TrimClip(Command):
             if track is None or track.locked:
                 continue
             others = tuple(c for c in track.clips if c.id != target.id)
-            trimmed = _trimmed(project, target, self.head_delta, self.tail_delta)
+            trimmed = _trimmed(project, track, target, self.head_delta, self.tail_delta)
             timeline = timeline.replace_track(track.with_clips((*others, trimmed)))
         return project.with_timeline(timeline)
 
@@ -1035,17 +1046,29 @@ class RenameProject(Command):
         return project.renamed(self.name)
 
 
-def _trimmed(project: Project, clip: Clip, head_delta: int, tail_delta: int) -> Clip:
-    """端を動かしたクリップを返す 無理な指定は例外にする"""
+def _trimmed(project: Project, track: Track, clip: Clip, head_delta: int, tail_delta: int) -> Clip:
+    """端を動かしたクリップを返す 無理な指定は例外にする
+
+    頭を前へ伸ばしすぎたときは、止まる理由と伸ばせる量を文言に入れる AI アシスタントは
+    文言だけを読んで次の手を決めるので、量が無いと 1 フレームずつ試し直すことになる
+    """
     duration = clip.duration - head_delta + tail_delta
     if duration <= 0:
         raise ValueError(f"トリム後の長さが 0 以下: {duration}")
 
-    source_in = clip.source_in + head_delta * project.rate.frame_duration * clip.speed
-    if source_in < 0:
-        raise ValueError("素材の先頭より前はトリムできない")
-    if clip.timeline_start + head_delta < 0:
-        raise ValueError("タイムラインの先頭より前へは動かせない")
+    if head_delta < 0:
+        room = _member_head_room(project, track, clip)
+        if -head_delta > room.frames:
+            raise ValueError(
+                f"{room.reason}より前へは伸ばせない "
+                f"頭を前へ伸ばせるのはあと {room.frames} フレームまで"
+            )
+
+    source_in = clip.source_in
+    if _reads_source_time(project, clip):
+        source_in += head_delta * project.rate.frame_duration * clip.speed
+    # 素材の時間を持たないクリップは source_in を動かさない 描くときに読まないので、
+    # 頭を削るたびに意味の無い値が溜まり、保存したファイルにまで残る
 
     return replace(
         clip,
@@ -1053,6 +1076,102 @@ def _trimmed(project: Project, clip: Clip, head_delta: int, tail_delta: int) -> 
         duration=duration,
         source_in=source_in,
     )
+
+
+#: 頭を前へ伸ばしたときに止まる所の呼び名 文言の「〜より前へは伸ばせない」へそのまま入る
+HEAD_STOP_SOURCE = "素材の先頭"
+HEAD_STOP_SCENE = "シーンの先頭"
+HEAD_STOP_PREVIOUS = "前のクリップの終わり"
+HEAD_STOP_TIMELINE = "タイムラインの先頭"
+
+
+@dataclass(frozen=True, slots=True)
+class HeadRoom:
+    """クリップの頭を前へ伸ばせる量（フレーム）と、そこで止まる理由
+
+    画面のドラッグと AI アシスタントの ``trim_clip`` が、:class:`TrimClip` と同じ決まりで
+    限界を知るために使う 決まりを別々に書くと、ドラッグでは伸ばせて見えたのに離すと
+    失敗する、が起きる
+    """
+
+    frames: int
+    #: 止まる所の呼び名（``HEAD_STOP_*``） 伸ばすクリップが無ければ空
+    reason: str
+
+
+def head_room(project: Project, clip_ids: tuple[ClipId, ...]) -> HeadRoom:
+    """``clip_ids`` をまとめて頭を前へ伸ばせる量 :class:`TrimClips` と同じ決まりで数える
+
+    リンクした相手も同じだけ伸びる（:class:`TrimClip` の決まり）ので、相手の限界も入れる
+    ロックしたトラックの相手は伸びずに残るので数えない 全員に同じ量を当てるので、
+    一番きつい 1 本で決まる
+    """
+    timeline = project.timeline
+    tightest: HeadRoom | None = None
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is None:
+            continue
+        _, clip = located
+        for track_id, member in _linked_group(project, clip):
+            track = timeline.find_track(track_id)
+            if track is None or track.locked:
+                continue
+            room = _member_head_room(project, track, member)
+            if tightest is None or room.frames < tightest.frames:
+                tightest = room
+    return tightest if tightest is not None else HeadRoom(0, "")
+
+
+def _member_head_room(project: Project, track: Track, clip: Clip) -> HeadRoom:
+    """1 本のクリップの頭を前へ伸ばせる量 一番手前で止まる所を返す
+
+    前のクリップは同じトラックだけを見る トラックはクリップの重なりを許さないので、
+    重なる所まで伸ばすと離したときに失敗する（利用者が決めた 重なる所で止める）
+    """
+    rooms: list[HeadRoom] = []
+    if _reads_source_time(project, clip):
+        # 素材の時刻は秒で持ち、1 フレームで速度ぶん進む 切り捨てて、端数のぶんは伸ばさない
+        # 切り上げると source_in が負になり、クリップを作るところで弾かれる
+        step = project.rate.frame_duration * clip.speed
+        reason = HEAD_STOP_SCENE if clip.scene_id is not None else HEAD_STOP_SOURCE
+        rooms.append(HeadRoom(int(clip.source_in // step), reason))
+    previous_end = max(
+        (
+            other.timeline_end
+            for other in track.clips
+            if other.id != clip.id and other.timeline_end <= clip.timeline_start
+        ),
+        default=None,
+    )
+    if previous_end is not None:
+        rooms.append(HeadRoom(clip.timeline_start - previous_end, HEAD_STOP_PREVIOUS))
+    rooms.append(HeadRoom(clip.timeline_start, HEAD_STOP_TIMELINE))
+    # 同じ量なら先に入れた方（素材 → 前のクリップ → 先頭）を理由にする 素材で止まるのに
+    # 「タイムラインの先頭」と言うと、素材の余りが無いことに気付けない
+    return min(rooms, key=lambda room: room.frames)
+
+
+def _reads_source_time(project: Project, clip: Clip) -> bool:
+    """描くときに ``source_in`` から時刻を読むクリップか
+
+    読むのは、動画・音声の素材、入れ子のシーン（シーンの中の時刻）、音声波形（読む音の位置）
+    読まないのは、テキスト・図形などの生成オブジェクトと静止画（いつも同じ 1 枚を描く）
+    読まないクリップに素材の先頭の判定を掛けると、置いたばかりのテキストの頭を前へ
+    伸ばせない（Issue #309）
+
+    素材が見つからないクリップは読む側に数える 静止画かどうか分からないまま読まない側に
+    すると source_in が動かなくなり、素材を繋ぎ直したときに伸ばしたぶん絵がずれる
+    """
+    if clip.scene_id is not None:
+        return True
+    source = clip.source
+    if source is not None and source.kind == "shape" and source.params.get("shape") == "waveform":
+        return True
+    if clip.media_id is None:
+        return False
+    media = project.find_media(clip.media_id)
+    return media is None or not media.is_still
 
 
 def _require_track(project: Project, track_id: TrackId) -> Track:
