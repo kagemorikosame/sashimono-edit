@@ -1982,7 +1982,9 @@ class MainWindow(QMainWindow):
         """
         resume = self._playing_before_edit
         self._on_playhead_moved(frame)
-        if resume:
+        # 末尾に着いたときは鳴らし直さず、末尾で止めておく 続きが無い所で鳴らすと、
+        # :meth:`PlaybackController.play` が作品の頭へ巻き戻して頭から鳴り出す
+        if resume and frame < self.view_project.duration:
             self._playback.play()
 
     def _on_playback_frame(self, frame: int) -> None:

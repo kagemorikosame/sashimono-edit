@@ -301,6 +301,32 @@ class TestPlaying:
         assert not window._playback.is_playing
         assert window._timeline.playhead == 30
 
+    def test_landing_on_the_end_stops_there(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 末尾に着いたところで鳴らし直すと、続きが無いので作品の頭（0）へ巻き戻って
+        # 頭から鳴り出す 消した所を見たかったのに、まったく別の場面へ飛ぶ
+        window = _open(
+            qt_application,
+            _project(Track(TrackKind.VIDEO, "V1", (_text(0, 30), _text(60, 30)))),
+        )
+        try:
+            started: list[int] = []
+            player = window._playback._player
+            monkeypatch.setattr(player, "start", lambda sample, **_: started.append(sample))
+            monkeypatch.setattr(player, "stop", lambda: None)
+            window._seek(80)
+            window._playback.play()
+            window.select_clip(_clip(window, 0, 1))
+            _ripple_by_menu(window)
+            assert not window._playback.is_playing
+            assert window._timeline.playhead == 30
+            assert window._playback.frame == 30
+            # 最初に鳴らした 1 回だけ 末尾から鳴らし直していない
+            assert len(started) == 1
+        finally:
+            window.close()
+
 
 class TestPreferences:
     def test_the_default_moves_it(self) -> None:
