@@ -53,13 +53,17 @@ from sashimono.core.commands import (
     Voice,
     burn_defaults,
     burn_subtitles,
+    head_room,
     insert_generated,
     insert_media,
     insert_scene,
     new_scene,
     subtitle_voices,
     subtitle_wrap_width,
+    tail_room,
+    trimmable,
 )
+from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.io.serialize import json_text
@@ -1161,8 +1165,55 @@ def _trim_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     tail = int(arguments.get("tail_delta", 0))
     if head == 0 and tail == 0:
         raise ToolError("head_delta か tail_delta のどちらかを指定してください")
-    host.apply_commands([TrimClip(clip.id, head_delta=head, tail_delta=tail)], "クリップをトリム")
-    return {"head_delta": head, "tail_delta": tail}
+    project = _project(host)
+    if not trimmable(project, (clip.id,)):
+        # リンクの相手まで全部ロックしていると、TrimClip は全部を黙って飛ばす 命令を
+        # 積むと、何も変わらないのに頼んだ量が動いたと答え、履歴に空の 1 手が残る
+        return {
+            "head_delta": 0,
+            "tail_delta": 0,
+            "requested_head_delta": head,
+            "requested_tail_delta": tail,
+            "stopped_at": STOP_LOCKED,
+            "note": (
+                f"{STOP_LOCKED}のクリップなので端を動かさなかった ロックを外してから頼んでください"
+            ),
+        }
+    result: dict[str, object] = {}
+    stops: list[str] = []
+    notes: list[str] = []
+    if head < 0:
+        # 端を伸ばしすぎた頼みは断らず、伸ばせる所まで伸ばす（利用者が決めた）
+        # 断ると、AI は量を変えて何度も試し直し、そのたびに会話が長くなる 止めた理由と
+        # 足りなかった量を返すので、AI は前のクリップを動かすなど次の手を選べる
+        room = head_room(project, (clip.id,))
+        if -head > room.frames:
+            result["requested_head_delta"] = head
+            stops.append(room.reason)
+            notes.append(
+                f"{room.reason}で止めた 頼まれた {-head} フレームのうち "
+                f"{room.frames} フレームだけ前へ伸ばした"
+            )
+            head = -room.frames
+    if tail > 0:
+        # 後ろも頭と同じく、後ろのクリップの頭で止める
+        ahead = tail_room(project, (clip.id,))
+        if ahead is not None and tail > ahead.frames:
+            result["requested_tail_delta"] = tail
+            stops.append(ahead.reason)
+            notes.append(
+                f"{ahead.reason}で止めた 頼まれた {tail} フレームのうち "
+                f"{ahead.frames} フレームだけ後ろへ伸ばした"
+            )
+            tail = ahead.frames
+    if stops:
+        result["stopped_at"] = "、".join(stops)
+        result["note"] = " ".join(notes)
+    if head or tail:
+        host.apply_commands(
+            [TrimClip(clip.id, head_delta=head, tail_delta=tail)], "クリップをトリム"
+        )
+    return {"head_delta": head, "tail_delta": tail, **result}
 
 
 def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2106,7 +2157,12 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="trim_clip",
-        description="クリップの端を動かす head_delta は正で短く、tail_delta は正で長くなる",
+        description=(
+            "クリップの端を動かす head_delta は正で短く、負で頭を前へ伸ばす tail_delta は"
+            "正で長くなる テキストや図形も頭を前へ伸ばせる 伸ばしすぎた分は、素材の先頭・"
+            "前のクリップの終わり・タイムラインの先頭・後ろのクリップの頭で止め、結果の note と"
+            " stopped_at で知らせる"
+        ),
         schema=_schema(
             {
                 "clip_id": _string("対象"),
