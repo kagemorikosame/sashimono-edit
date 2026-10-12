@@ -19,7 +19,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
-from sashimono.core.commands import MoveClip
+from sashimono.core.commands import MoveClip, SetTrackState
 from sashimono.core.io import load_project
 from sashimono.core.model import (
     Clip,
@@ -159,6 +159,27 @@ class TestDraggingTheHead:
         assert _now(window, text).timeline_start == 0
         # ヘッダの上まで引いて 0 で止まったときも、止まった理由を出す
         assert any("タイムラインの先頭" in message for message in told)
+
+    @pytest.mark.parametrize("edge", ["head", "tail"])
+    def test_a_locked_text_is_refused(self, window: MainWindow, edge: str) -> None:
+        # 枠だけ動いて離すと何も変わらず、履歴に空の 1 手が積まれて取り消しを 1 回むだにする
+        text = _place_text(window, 60)
+        assert window.execute(SetTrackState(_track_id(window, text), locked=True))
+        before = window.document.project
+        labels = window.document.history_labels
+        told: list[str] = []
+        view = window._timeline
+        view.status_message.connect(told.append)
+        grab = text.timeline_start if edge == "head" else text.timeline_end - 1
+        start = _point(view, text, grab)
+        end = _point(view, text, grab - 30 if edge == "head" else grab + 30)
+        QTest.mousePress(view, _LEFT, _NONE, start)
+        QTest.mouseMove(view, QPoint((start.x() + end.x()) // 2, start.y()))
+        QTest.mouseMove(view, end)
+        QTest.mouseRelease(view, _LEFT, _NONE, end)
+        assert window.document.history_labels == labels
+        assert window.document.project == before
+        assert any("ロック" in message for message in told)
 
     def test_the_tail_stops_at_the_text_after(self, window: MainWindow) -> None:
         # 後ろのテキストに重なる所まで引くと、離したときに重なりで失敗して何も伸びない

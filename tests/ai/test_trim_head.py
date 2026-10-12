@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from sashimono.ai.operations import ImageResult, find_operation
+from sashimono.core.commands import SetTrackState
 from sashimono.core.model import Clip, Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.render import FrameRenderer
@@ -112,6 +113,24 @@ class TestExtendingText:
         assert "20 フレーム" in result["note"]
         first_now = min(_texts(host), key=lambda clip: clip.timeline_start)
         assert first_now.timeline_end == 60
+
+    @pytest.mark.parametrize(("head", "tail"), [(-10, 0), (10, 0), (0, 10), (0, -10)])
+    def test_a_locked_text_is_left_and_told(self, head: int, tail: int) -> None:
+        # 動かないのに頼んだ量を返すと、AI は伸ばせたと思い込み、履歴に空の 1 手が残る
+        host = _host()
+        run(host, "add_text", text="テロップ", at_frame=60, duration=60)
+        (text,) = _texts(host)
+        track = host.document.project.timeline.locate_clip(text.id)
+        assert track is not None
+        host.apply_commands([SetTrackState(track[0].id, locked=True)], "ロック")
+        before = host.document.project
+        labels = host.document.history_labels
+        result = run(host, "trim_clip", clip_id=str(text.id), head_delta=head, tail_delta=tail)
+        assert (result["head_delta"], result["tail_delta"]) == (0, 0)
+        assert result["stopped_at"] == "ロックしたトラック"
+        assert "ロック" in result["note"]
+        assert host.document.history_labels == labels
+        assert host.document.project == before
 
     def test_nothing_to_extend_changes_nothing(self) -> None:
         # 0 フレームの命令を履歴へ積むと、取り消しを 1 回むだに使わせる

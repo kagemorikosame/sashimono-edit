@@ -61,7 +61,9 @@ from sashimono.core.commands import (
     subtitle_voices,
     subtitle_wrap_width,
     tail_room,
+    trimmable,
 )
+from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.io.serialize import json_text
@@ -1163,18 +1165,29 @@ def _trim_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     tail = int(arguments.get("tail_delta", 0))
     if head == 0 and tail == 0:
         raise ToolError("head_delta か tail_delta のどちらかを指定してください")
+    project = _project(host)
+    if not trimmable(project, (clip.id,)):
+        # リンクの相手まで全部ロックしていると、TrimClip は全部を黙って飛ばす 命令を
+        # 積むと、何も変わらないのに頼んだ量が動いたと答え、履歴に空の 1 手が残る
+        return {
+            "head_delta": 0,
+            "tail_delta": 0,
+            "requested_head_delta": head,
+            "requested_tail_delta": tail,
+            "stopped_at": STOP_LOCKED,
+            "note": (
+                f"{STOP_LOCKED}のクリップなので端を動かさなかった ロックを外してから頼んでください"
+            ),
+        }
     result: dict[str, object] = {}
     stops: list[str] = []
     notes: list[str] = []
-    project = _project(host)
     if head < 0:
         # 端を伸ばしすぎた頼みは断らず、伸ばせる所まで伸ばす（利用者が決めた）
         # 断ると、AI は量を変えて何度も試し直し、そのたびに会話が長くなる 止めた理由と
         # 足りなかった量を返すので、AI は前のクリップを動かすなど次の手を選べる
         room = head_room(project, (clip.id,))
-        # 理由が空なのは伸ばすクリップが 1 本も無い（ロックしている）とき 量を 0 に削ると
-        # 「止めた」と答えてしまうので、そのまま命令へ渡して命令の決まりに任せる
-        if room.reason and -head > room.frames:
+        if -head > room.frames:
             result["requested_head_delta"] = head
             stops.append(room.reason)
             notes.append(

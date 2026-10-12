@@ -34,6 +34,7 @@ from sashimono.core.model import (
 )
 
 __all__ = [
+    "STOP_LOCKED",
     "STOP_NEXT",
     "STOP_PREVIOUS",
     "STOP_SCENE",
@@ -65,6 +66,7 @@ __all__ = [
     "head_room",
     "shifted_track",
     "tail_room",
+    "trimmable",
 ]
 
 
@@ -1103,6 +1105,8 @@ STOP_SCENE = "シーンの先頭"
 STOP_PREVIOUS = "前のクリップの終わり"
 STOP_TIMELINE = "タイムラインの先頭"
 STOP_NEXT = "後ろのクリップの頭"
+#: リンクの相手まで全部がロックしたトラックにあって、どの端も動かせない
+STOP_LOCKED = "ロックしたトラック"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1131,6 +1135,16 @@ def head_room(project: Project, clip_ids: tuple[ClipId, ...]) -> TrimRoom:
         for track, member in _trimmed_members(project, clip_ids)
     ]
     return min(rooms, key=lambda room: room.frames, default=TrimRoom(0, ""))
+
+
+def trimmable(project: Project, clip_ids: tuple[ClipId, ...]) -> bool:
+    """端を動かすと実際に動くクリップがあるか
+
+    :class:`TrimClip` はロックしたトラックのクリップを黙って飛ばす リンクの相手まで全部
+    ロックしていると何も変わらないのに命令は通り、履歴に空の 1 手が積まれ、頼んだ量だけ
+    動いたように見える 呼ぶ側はこれで先に断る
+    """
+    return bool(_trimmed_members(project, clip_ids))
 
 
 def tail_room(project: Project, clip_ids: tuple[ClipId, ...]) -> TrimRoom | None:

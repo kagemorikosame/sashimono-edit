@@ -38,6 +38,7 @@ from sashimono.core.commands.edit import (
     TrimRoom,
     head_room,
     tail_room,
+    trimmable,
 )
 from sashimono.core.commands.effects import (
     AddEffect,
@@ -194,5 +195,6 @@ __all__ = [
     "subtitle_wrap_width",
     "switch_layer_mode",
     "tail_room",
+    "trimmable",
     "voice_label",
 ]

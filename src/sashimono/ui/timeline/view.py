@@ -61,6 +61,7 @@ from sashimono.core.commands.edit import (
     head_room,
     shifted_track,
     tail_room,
+    trimmable,
 )
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.model import (
@@ -1472,16 +1473,25 @@ class TimelineView(QWidget):
                 self._drag.preview_track = band.track.id
         elif located is not None:
             _, clip = located
+            trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
+            if not trimmable(self._project, trimmed):
+                # リンクの相手まで全部ロックしていると TrimClip は黙って何もしない 枠だけ
+                # 動いて見え、離すと履歴に空の 1 手が積まれるので、動かし始めた所で断る
+                self.status_message.emit(
+                    "ロックしたトラックのクリップなので伸び縮みできません ロックを外してください"
+                )
+                self._drag = DragState()
+                self.update()
+                return
             if self._drag.kind is DragKind.TRIM_HEAD:
                 frame += self._snap_shift((frame,))
                 # 前へ伸ばす量は TrimClip と同じ決まりで止める 止めないと、枠は前のクリップや
                 # 素材の先頭を越えて伸びて見えるのに、離すと失敗して何も変わらない
-                trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
                 room = head_room(self._project, trimmed)
                 # 位置からのフレームは 0 で切られる ヘッダの上まで引いたときも 0 で止まった
                 # ことを知らせるため、切る前の位置で比べる
                 reach = min(float(frame), self._layout.x_to_frame(position.x()))
-                if room.reason and reach - clip.timeline_start < -room.frames:
+                if reach - clip.timeline_start < -room.frames:
                     # 枠が止まっただけでは、なぜ止まったのか（素材が無いのか前が詰まって
                     # いるのか）が分からない 理由を下の帯に出す
                     self.status_message.emit(
@@ -1495,7 +1505,6 @@ class TimelineView(QWidget):
                 wanted = max(frame - clip.timeline_end, -(clip.duration - 1))
                 # 後ろも頭と同じく、後ろのクリップの頭で止めて理由を出す 止めないと、枠は
                 # 重なって見えるのに離すと失敗して何も変わらない
-                trimmed = self._trimmable_selection() if self._drag.group else (clip.id,)
                 ahead = tail_room(self._project, trimmed)
                 if ahead is not None and wanted > ahead.frames:
                     self.status_message.emit(
