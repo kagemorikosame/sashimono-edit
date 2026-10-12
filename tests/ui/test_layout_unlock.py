@@ -15,6 +15,7 @@ from PySide6.QtCore import QEvent
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QMessageBox, QPushButton
 
+from sashimono.core.commands import GroupClips
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -160,6 +161,7 @@ class TestButton:
         assert _param(window, "anchor") == "right"
 
     def test_the_native_layout_has_no_button(self, open_window: list[MainWindow]) -> None:
+        # 使える欄の下にボタンが出ると、押す必要の無い切り替えを勧め、押すと横の基準まで変わる
         window = _window(open_window, TEXT.create())
         assert _buttons(window) == []
 
@@ -231,6 +233,26 @@ class TestManyClips:
         _flush()
         assert [_param(window, "layout", i) for i in range(3)] == ["aviutl"] * 3
         assert [_param(window, "anchor", i) for i in range(2)] == ["center", "center"]
+
+    def test_grouped_texts_chosen_together_all_switch(self, open_window: list[MainWindow]) -> None:
+        # 2 本を選んでからグループ化した字幕で押すと、主の 1 本だけが標準になり、もう 1 本は
+        # 灰色のまま残っていた 押したのに半分しか切り替わらず、字の組み方が食い違う
+        project = _project(
+            TEXT.create(layout="aviutl", align="left"),
+            TEXT.create(layout="aviutl", align="right"),
+        )
+        ids = [clip.id for clip in project.timeline.tracks[0].clips]
+        window = MainWindow(GroupClips(tuple(ids)).apply(project), confirm_unsaved=False)
+        open_window.append(window)
+        window._timeline.set_selection([ids[1], ids[0]])
+        _flush()
+        assert window._inspector._clip_id == ids[0]
+        _press(window)
+        assert [_param(window, "layout", i) for i in range(2)] == ["native", "native"]
+        assert [_param(window, "anchor", i) for i in range(2)] == ["left", "right"]
+        window.undo()
+        _flush()
+        assert [_param(window, "layout", i) for i in range(2)] == ["aviutl", "aviutl"]
 
 
 class TestPosition:

@@ -1178,11 +1178,20 @@ class InspectorPanel(QWidget):
         1 回の取り消しで全部が戻るよう、まとめて出す クリップごとに値を作るのは、
         組み方と一緒に変える横の基準が、それぞれの行揃えで決まるため 主のクリップの値を
         写すと、行揃えの違うクリップの字が跳ぶ
+
+        相手は選んだ物すべて 値のまとめ当て（:meth:`_others_in_selection`）と違い、同じ
+        グループの仲間も外さない 外すと、2 本を選んでからグループ化した字幕で主の 1 本だけが
+        標準になり、もう 1 本は灰色のまま残る（押したのに半分しか切り替わらない）
+        グループの仲間として引き込まれただけの物は、選んだ物（``_selection``）に入らない
         """
         primary = self._clip()
         if primary is None or self._project is None:
             return
-        targets = [primary, *self._others_in_selection(primary)]
+        targets = [primary]
+        for clip_id in self._selection:
+            located = self._project.timeline.locate_clip(clip_id)
+            if clip_id != primary.id and located is not None:
+                targets.append(located[1])
         commands: list[Command] = []
         switched = 0
         for clip in targets:
