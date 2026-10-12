@@ -11,14 +11,23 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QInputMethodEvent, QTextCursor
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QFocusEvent, QImage, QInputMethodEvent, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QMessageBox,
+    QPushButton,
+    QWidget,
+)
 
-from sashimono.ai.bridge import Approval, EditorBridge
+from sashimono.ai.bridge import Approval, EditorBridge, Question
 from sashimono.ai.models import MODELS
+from sashimono.ai.operations import ASK_USER, question_spec
 from sashimono.ai.session import (
+    ASK_RULES,
     SYSTEM_PROMPT,
     AgentEvent,
     AgentSession,
@@ -28,9 +37,26 @@ from sashimono.ai.session import (
 from sashimono.core.commands import SetLayerMode, SplitClip
 from sashimono.core.model import LayerMode, MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
+from sashimono.ui.chat.panel import _Input
 from sashimono.ui.theme import PALETTES, THEME_DARK, THEME_LIGHT, theme_signals, use_palette
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
+
+
+@pytest.fixture(autouse=True)
+def no_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """試験の間に確かめの窓や問い合わせの窓が開いたら、その場で落とす
+
+    開いたままだと、無人の CI では誰も閉じずに試験が止まる 質問の箱（#296）は
+    パネルの中に出す物で、窓を開かないことも合わせて押さえる
+    """
+
+    def refuse(*_arguments: object, **_options: object) -> int:
+        raise AssertionError("試験の間に窓が開いた")
+
+    monkeypatch.setattr(QDialog, "exec", refuse)
+    for name in ("information", "warning", "critical", "question"):
+        monkeypatch.setattr(QMessageBox, name, refuse)
 
 
 @pytest.fixture
@@ -354,6 +380,120 @@ class TestSendKey:
         assert "Shift+Enter で改行" in widget._input.placeholderText()
 
 
+def _preedit(widget: QWidget, text: str) -> None:
+    """日本語入力の変換中の文字（まだ確定していない読み）を送る 空なら変換の終わり"""
+    QApplication.sendEvent(widget, QInputMethodEvent(text, []))
+
+
+def _drawn(widget: QWidget) -> QImage:
+    return widget.grab().toImage()
+
+
+class TestPlaceholderWhileConverting:
+    """日本語の変換中は案内の文を隠し、確定・取り消し・欄を離れたら戻す（#297）
+
+    Qt は文書が空なら案内の文を描く 変換中の読みは文書の外の層にあるので、
+    何もしないと読みと案内の文が重なって描かれる
+    """
+
+    def test_the_placeholder_is_hidden_while_converting(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、打っている読み「てきすと」の上に薄い案内の文が重なって読めない
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        assert widget._input.toPlainText() == ""
+        assert widget._input.placeholderText() == ""
+        assert widget._input.placeholder == placeholder
+
+    def test_what_is_drawn_while_converting_has_no_placeholder(
+        self, qt_application: QApplication
+    ) -> None:
+        # 文字の値だけでなく描かれた絵で見る 壊れると、案内の文のある欄だけ変換中の絵が違う
+        del qt_application
+        with_text, without = _Input(), _Input()
+        with_text.set_placeholder("編集の指示を書いて Enter で送信")
+        try:
+            for field in (with_text, without):
+                field.resize(320, 60)
+                _preedit(field, "てきすと")
+            assert _drawn(with_text) == _drawn(without)
+        finally:
+            with_text.deleteLater()
+            without.deleteLater()
+
+    def test_committing_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、確定して送った後の空の欄に案内の文が出ず、何を書く欄か分からなくなる
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        committed = QInputMethodEvent("", [])
+        committed.setCommitString("テキスト")
+        QApplication.sendEvent(widget._input, committed)
+        assert widget._input.toPlainText() == "テキスト"
+        widget._input.clear()
+        assert widget._input.placeholderText() == placeholder
+
+    def test_cancelling_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # Esc で取り消すと、何も確定せずに読みだけが消える 壊れると空の欄の案内の文が消えたまま
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        _preedit(widget._input, "")
+        assert widget._input.toPlainText() == ""
+        assert widget._input.placeholderText() == placeholder
+
+    def test_leaving_the_field_brings_the_placeholder_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 変換中に別の所を押した 壊れると、案内の文が消えたままになり、戻ってきて
+        # 押す Enter も変換の確定と取られて送れない
+        widget, _ = panel
+        placeholder = widget._input.placeholder
+        _preedit(widget._input, "てきすと")
+        QApplication.sendEvent(widget._input, QFocusEvent(QEvent.Type.FocusOut))
+        assert widget._input.placeholderText() == placeholder
+        assert widget._input._composing is False
+
+    def test_changing_the_send_key_while_converting_keeps_it_hidden(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 変換中に設定を変えた 壊れると、新しい文面の案内の文が読みの上へ戻って重なる
+        widget, _ = panel
+        _preedit(widget._input, "てきすと")
+        widget.apply_preferences(Preferences(chat_enter_sends=False))
+        assert widget._input.placeholderText() == ""
+        _preedit(widget._input, "")
+        # 戻すときは、変えた後の正しい文面で戻る 壊れると前の押し方を案内したまま
+        assert "Ctrl+Enter で送信" in widget._input.placeholderText()
+        assert "Shift+Enter" not in widget._input.placeholderText()
+
+    def test_the_transcription_hint_hides_its_placeholder_too(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 字幕の起こしの「ヒント」欄も同じ症状が出ないかを絵で見る 1 行の欄（QLineEdit）は
+        # 変換中に案内の文を描かない作り 欄を複数行の物へ替えると、壊れて重なる
+        from sashimono.asr.service import TranscriptionService
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        del qt_application
+        dialog = TranscribeDialog(video_media, cast(TranscriptionService, object()))
+        try:
+            field = dialog._prompt
+            assert field.placeholderText()
+            _preedit(field, "てきすと")
+            with_placeholder = _drawn(field)
+            field.setPlaceholderText("")
+            assert with_placeholder == _drawn(field)
+        finally:
+            dialog.deleteLater()
+
+
 class _RecordingSession:
     """会話の差し替え Claude へは繋がない 何で始めたかだけを覚える"""
 
@@ -366,11 +506,13 @@ class _RecordingSession:
         model: str | None,
         effort: str | None,
         system_prompt: str = SYSTEM_PROMPT,
+        ask: bool = True,
     ) -> None:
         del bridge
         self.model = model
         self.effort = effort
         self.system_prompt = system_prompt
+        self.ask = ask
         self.prompts: list[str] = []
         self.closed = False
         self.busy = False
@@ -1038,5 +1180,281 @@ class TestRunningStatusPreferences:
         dialog = PreferencesDialog(chosen)
         try:
             assert dialog.preferences() == chosen
+        finally:
+            dialog.deleteLater()
+
+
+def _question(*, multiple: bool = False, free_text: bool = True) -> Question:
+    return Question(
+        question_spec(
+            {
+                "question": "どのクリップを切りますか",
+                "choices": [
+                    {"label": "選択中", "description": "いま選んでいるクリップ"},
+                    {"label": "全部", "description": "タイムラインのすべて"},
+                    {"label": "BGM & 効果音", "description": "音声トラックの物"},
+                ],
+                "multiple": multiple,
+                "free_text": free_text,
+            }
+        )
+    )
+
+
+def _shown(widget: ChatPanel, question: Question) -> None:
+    """ブリッジに質問を積み、見張りの 1 回で画面に出させる"""
+    widget._bridge._questions.put(question)
+    widget._poll()
+
+
+def _choice_button(widget: ChatPanel, label: str) -> QPushButton:
+    return next(
+        button
+        for button in widget._question_choices.findChildren(QPushButton)
+        if button.text().replace("&&", "&") == label
+    )
+
+
+class TestQuestion:
+    """AI からの質問の箱（#296） 選ぶ・複数選ぶ・自由に書くの 3 通りで答えが返る"""
+
+    def test_one_choice_answers_at_once(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 壊れると、ボタンを押しても AI に答えが届かず、返事を待ったまま止まる
+        widget, _, _ = timed
+        _send(widget, "ここを切って")
+        question = _question()
+        _shown(widget, question)
+        assert widget._question_box.isHidden() is False
+        assert widget._question_text.text() == "どのクリップを切りますか"
+        _choice_button(widget, "全部").click()
+        assert question.answered is True
+        assert question.selected == ("全部",)
+        assert widget._question_box.isHidden() is True
+        # 会話の欄に「質問」と「答え」を残す 壊れると、後から何を聞かれて何と答えたか分からない
+        shown = _text(widget)
+        assert "質問" in shown
+        assert "・全部: タイムラインのすべて" in shown
+        assert shown.rstrip().endswith("全部")
+
+    def test_an_ampersand_in_a_label_is_shown_and_answered_as_written(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # Qt は & を押し下げの印にして消す 壊れると「BGM  効果音」と見え、答えも食い違う
+        widget, _ = panel
+        question = _question()
+        _shown(widget, question)
+        button = _choice_button(widget, "BGM & 効果音")
+        assert button.text() == "BGM && 効果音"
+        button.click()
+        assert question.selected == ("BGM & 効果音",)
+
+    def test_several_choices_are_answered_together(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、複数選べる質問で 1 つ目を押した所で答えが出てしまうか、何も返らない
+        widget, _ = panel
+        question = _question(multiple=True)
+        _shown(widget, question)
+        assert widget._question_send.isHidden() is False
+        # 何も選んでいない間は答えられない 押せると空の答えで AI が「どれでもよい」と読む
+        assert widget._question_send.isEnabled() is False
+        checks = dict(widget._question_checks)
+        checks["全部"].setChecked(True)
+        checks["選択中"].setChecked(True)
+        assert question.done.is_set() is False
+        widget._question_send.click()
+        assert question.selected == ("選択中", "全部")
+
+    def test_text_sent_from_the_input_is_the_answer(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 質問が出ている間に送った文は新しい指示にしない 壊れると、答えのつもりの文が
+        # 次の指示として並び、今の指示は返事を待ったまま、並べた指示もいつまでも始まらない
+        widget, made, _ = timed
+        _send(widget, "ここを切って")
+        question = _question()
+        _shown(widget, question)
+        _send(widget, "先頭の 3 秒だけ")
+        assert question.answered is True
+        assert question.free_text == "先頭の 3 秒だけ"
+        assert question.selected == ()
+        assert made[0].prompts == ["ここを切って"]
+        assert list(widget._queued) == ["ここを切って"]
+        assert widget._input.toPlainText() == ""
+
+    def test_checked_choices_go_with_the_written_answer(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 複数選べる質問で、選んだうえに書き足した 壊れると、選んだ物が答えから落ちる
+        widget, _ = panel
+        question = _question(multiple=True)
+        _shown(widget, question)
+        dict(widget._question_checks)["全部"].setChecked(True)
+        widget._input.setPlainText("音声は残す")
+        widget.send()
+        assert question.selected == ("全部",)
+        assert question.free_text == "音声は残す"
+
+    def test_the_box_says_where_the_written_answer_goes(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、入力欄に書いた文が答えになるのか新しい指示になるのか、送るまで分からない
+        widget, _ = panel
+        first = _question()
+        _shown(widget, first)
+        assert "入力欄から送った文は、この質問への答えになります" in widget._question_note.text()
+        assert widget._question_other.isHidden() is False
+        _choice_button(widget, "全部").click()
+        _shown(widget, _question(free_text=False))
+        assert widget._question_other.isHidden() is True
+        assert "選択肢から選んでください" in widget._question_note.text()
+        assert "入力欄からは答えられません" in widget._question_note.text()
+
+    def test_choices_only_questions_do_not_take_the_input(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 選択肢に無い答えを断った質問 壊れると、AI が決めた答えの形の外の文が答えとして届く
+        widget, made, _ = timed
+        _send(widget, "ここを切って")
+        question = _question(free_text=False)
+        _shown(widget, question)
+        assert widget._send_button.text() == "選択肢から答える"
+        _send(widget, "先頭の 3 秒だけ")
+        assert question.done.is_set() is False
+        assert widget._question is question
+        assert widget._question_box.isHidden() is False
+        # 新しい指示にもしない 書いた文は消さずに残す（答えた後に送り直せるように）
+        assert made[0].prompts == ["ここを切って"]
+        assert widget._input.toPlainText() == "先頭の 3 秒だけ"
+        assert "選択肢から答えてください" in _text(widget)
+        _choice_button(widget, "全部").click()
+        assert question.selected == ("全部",)
+        assert question.free_text == ""
+
+    def test_a_question_folded_before_it_is_shown_is_not_shown(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 中断の直後に積まれた・画面が塞がって時間が切れた質問 壊れると、押しても
+        # 「もう閉じていた」になる箱が出て、状態の行も「質問待ち」のまま
+        widget, _, _ = timed
+        _send(widget, "ここを切って")
+        question = _question()
+        question.give_up("中断されました")
+        _shown(widget, question)
+        assert widget._question is None
+        assert widget._question_box.isHidden() is True
+        assert "質問を閉じました（中断されました）" in _text(widget)
+        assert not _status(widget).startswith("質問待ち")
+
+    def test_the_status_says_it_waits_for_an_answer(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 「実行中」のままだと、待たされているのがこちらの返事だと気付かない（#250 の表示）
+        widget, _, _ = timed
+        _send(widget, "ここを切って")
+        widget._handle(AgentEvent(EventKind.READY))
+        _shown(widget, _question())
+        assert _status(widget).startswith("質問待ち")
+        assert widget._send_button.text() == "答えを送る"
+        _choice_button(widget, "選択中").click()
+        assert _status(widget).startswith("実行中")
+        assert widget._send_button.text() == "追加で送る"
+
+    def test_a_folded_question_leaves_the_panel(
+        self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
+    ) -> None:
+        # 中断と時間切れでブリッジが畳んだ 壊れると、押しても届かない箱が残り続ける
+        widget, _, _ = timed
+        _send(widget, "ここを切って")
+        _shown(widget, _question())
+        widget._bridge.cancel()
+        widget._poll()
+        assert widget._question_box.isHidden() is True
+        assert widget._question is None
+        assert "質問を閉じました（中断されました）" in _text(widget)
+        assert not _status(widget).startswith("質問待ち")
+
+    def test_the_raw_call_line_is_not_shown(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 引数の 1 行（choices=[{...}]）は読めず、同じ質問が 2 回出たように見える
+        widget, _ = panel
+        widget._handle(AgentEvent(EventKind.TOOL_USE, tool=ASK_USER, detail="choices=[{...}]"))
+        assert "choices=" not in _text(widget)
+        assert widget._turn_tools == 1
+
+
+class TestAskPreference:
+    """設定の「あいまいなときは、AI が質問する」（#296）"""
+
+    def test_turning_it_off_removes_the_rules_and_the_tool(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、切ったのに聞き返され続ける
+        widget, made = recorded
+        widget.apply_preferences(Preferences(ai_ask_questions=False))
+        _send(widget, "ここを切って")
+        assert made[0].ask is False
+        assert ASK_RULES not in made[0].system_prompt
+
+    def test_it_is_on_from_the_start(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 既定は入（知らない人が、意図と違う操作をされて困らない側）
+        widget, made = recorded
+        assert Preferences().ai_ask_questions is True
+        _send(widget, "ここを切って")
+        assert made[0].ask is True
+        assert ASK_RULES in made[0].system_prompt
+
+    def test_changing_it_starts_a_new_conversation_when_idle(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 指示の文と道具は会話を作るときにしか渡せない 壊れると、切っても今の会話では聞かれる
+        widget, made = recorded
+        _send(widget, "ここを切って")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        widget.apply_preferences(Preferences(ai_ask_questions=False))
+        assert made[0].closed is True
+        _send(widget, "次")
+        assert made[1].ask is False
+
+    def test_changing_it_during_a_reply_moves_the_waiting_prompts(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 応えている間に切った 壊れると、続けて送った指示が古い会話（質問の道具と基準あり）で
+        # 走り、切った後も質問される 待ちの指示は消さずに新しい会話へ渡す
+        widget, made = recorded
+        _send(widget, "1 つ目")
+        _send(widget, "2 つ目")
+        widget.apply_preferences(Preferences(ai_ask_questions=False))
+        # 応えている最中の指示は止めない
+        assert made[0].closed is False
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert made[0].closed is True
+        # 古い会話は区切りを待ったまま畳む 区切りを渡すと 2 つ目を古い会話で始めてしまう
+        assert made[0].acknowledged == 0
+        assert len(made) == 2
+        assert made[1].ask is False
+        assert ASK_RULES not in made[1].system_prompt
+        assert made[1].prompts == ["2 つ目"]
+        assert list(widget._queued) == ["2 つ目"]
+        # 2 つ目の取り消しの段も開いている 壊れると 2 つ目の編集が取り消しで戻らない
+        assert widget._checkpoint_open is True
+
+    def test_the_choice_survives_a_restart(self, tmp_path: Path) -> None:
+        # 保存し忘れると、切ったはずの質問が次の起動で戻る
+        from sashimono.ui.workspace import PreferenceStore
+
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(ai_ask_questions=False))
+        assert store.load().ai_ask_questions is False
+
+    def test_the_settings_dialog_keeps_it(self, qt_application: QApplication) -> None:
+        # 出し忘れると、設定を開いて OK を押しただけで入に戻る
+        from sashimono.ui.preferences_dialog import PreferencesDialog
+
+        del qt_application
+        dialog = PreferencesDialog(Preferences(ai_ask_questions=False))
+        try:
+            assert dialog.preferences().ai_ask_questions is False
         finally:
             dialog.deleteLater()

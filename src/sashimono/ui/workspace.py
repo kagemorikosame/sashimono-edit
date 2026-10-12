@@ -469,6 +469,11 @@ class Preferences:
     #: 入れると、幅を使っているテキストは組み方も残す（AviUtl2 の組み方は折り返さないので、
     #: テンプレートの組み方を取ると幅を残しても 1 行のままになる）
     restyle_keep_wrap: bool = False
+    #: 指示があいまいなときは、AI アシスタントが作業の前に質問する（#296）
+    #: 既定は入 知らない人ほど、短い指示で意図と違うクリップや範囲を変えられて困る
+    #: 聞かれるのが手間な人・指示を細かく書く人は切れる 切ると質問の道具を渡さず、
+    #: 指示の文からも聞き返す基準を外す
+    ai_ask_questions: bool = True
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -631,6 +636,7 @@ class PreferenceStore:
                 data.get("state_limit_mb"), STATE_LIMIT_MB_RANGE, plain.state_limit_mb
             ),
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
+            ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
         )
 
     def save(self, preferences: Preferences) -> None:

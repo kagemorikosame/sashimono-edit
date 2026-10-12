@@ -6,6 +6,7 @@ Claude Agent SDK は自前の asyncio ループを別スレッドで回す そ�
 
 同じ仕組みで確認（承認）も運ぶ 変更系のツールは、UI 側が「許可」を返すまでここで
 止まる 止まっている間も UI は動き続けるので、内容を見てから決められる
+AI からの質問（ask_user #296）も同じ形で運び、答えが返るまで止まる
 
 :class:`~sashimono.engine.cache.MediaAnalyzer` や字幕起こしと同じ「キューに積んで
 タイマーで拾う」形にしてある Qt のシグナルをスレッドまたぎで使うより、いつ実行
@@ -21,9 +22,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation
+from sashimono.ai.operations import Operation, QuestionSpec
 
-__all__ = ["Approval", "EditorBridge"]
+__all__ = ["Approval", "EditorBridge", "Question"]
 
 #: UI スレッドが 1 件の仕事を拾って返すまで待つ上限（秒）
 #: これを超えるのは、書き出しなど UI 側が長く塞がっているとき
@@ -31,6 +32,10 @@ CALL_TIMEOUT = 60.0
 
 #: 承認の待ち時間 人が席を外していることもあるので長めに取る
 APPROVAL_TIMEOUT = 600.0
+
+#: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
+#: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
+QUESTION_TIMEOUT = APPROVAL_TIMEOUT
 
 
 @dataclass(slots=True)
@@ -64,6 +69,52 @@ class Approval:
         self.done.set()
 
 
+@dataclass(slots=True)
+class Question:
+    """返事待ちの質問 1 件（#296）
+
+    答えるのは画面のスレッド、時間切れと中断で畳むのは AI のスレッドと中断のボタン
+    先に決まった方だけを残す 時間切れの直後に押された答えで、畳んだ質問が
+    「答えた」に書き換わると、AI には返事が無かったと伝えたのに画面は答えたことになる
+    """
+
+    spec: QuestionSpec
+    done: threading.Event = field(default_factory=threading.Event)
+    answered: bool = False
+    #: 選んだ選択肢の名前（選んだ順ではなく、選択肢の並び順）
+    selected: tuple[str, ...] = ()
+    #: 選択肢に無い答えとして書かれた文
+    free_text: str = ""
+    #: 答えずに畳んだわけ（時間切れ・中断）
+    reason: str = ""
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def reply(self, selected: tuple[str, ...] = (), free_text: str = "") -> bool:
+        """答える すでに畳まれていたら何もせず偽を返す"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            order = [choice.label for choice in self.spec.choices]
+            self.selected = tuple(label for label in order if label in selected)
+            self.free_text = free_text.strip()
+            self.answered = True
+            self.done.set()
+            return True
+
+    def give_up(self, reason: str) -> bool:
+        """答えずに畳む すでに答えが決まっていたら何もせず偽を返す"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.reason = reason
+            self.done.set()
+            return True
+
+    def answer(self) -> dict[str, object]:
+        """AI へ返す答え 選んだ物と書いた物を分けて渡す（混ぜると選択肢の名前と区別できない）"""
+        return {"selected": list(self.selected), "free_text": self.free_text}
+
+
 class EditorBridge:
     """AI からの操作を、UI スレッドで実行する"""
 
@@ -78,11 +129,21 @@ class EditorBridge:
         self._always: set[str] = set()
         #: UI が取り出して、まだ返事をもらっていない確認 中断のときに畳む
         self._outstanding: Approval | None = None
+        self._questions: queue.Queue[Question] = queue.Queue()
+        #: UI が取り出して画面に出している質問 中断のときに畳む
+        self._asked: Question | None = None
 
     # --- AI スレッドから ---
 
     def invoke(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """ツールを 1 つ実行する 確認が要るものは、許可を待ってから動かす"""
+        if operation.asks:
+            # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
+            # （承認は操作の許可で、質問はどの操作をするかを決める物 別物として扱う）
+            spec = operation(self._host, arguments)
+            if not isinstance(spec, QuestionSpec):
+                raise ToolError(f"{operation.name} が質問の形を返しませんでした")
+            return self.ask(spec)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self.call(lambda: operation(self._host, arguments))
@@ -114,6 +175,28 @@ class EditorBridge:
             approval.deny("確認の返事がありませんでした")
         return approval.allowed
 
+    def ask(self, spec: QuestionSpec) -> dict[str, object]:
+        """画面に質問を出し、答えを待つ 答えなければ失敗にする
+
+        失敗で返すのは、返事が無いのに推測で進めさせないため 答えの代わりに空の
+        結果を返すと、AI は「どれでもよい」と読んで、聞いた意味が無くなる
+        """
+        question = Question(spec)
+        self._questions.put(question)
+        if self._cancel.is_set():
+            # 積んだ後に確かめる 積む前に確かめると、確かめてから積むまでの間に中断された
+            # とき、中断の側は積む前のキューを畳み終えていて、誰も畳まずに 10 分待つ
+            question.give_up("中断されました")
+        if not question.done.wait(QUESTION_TIMEOUT):
+            minutes = round(QUESTION_TIMEOUT / 60)
+            question.give_up(
+                f"質問への返事がありませんでした（{minutes} 分待ちました）"
+                " 推測で進めず、ここで作業を止めて、返事が無かったことを伝えてください"
+            )
+        if not question.answered:
+            raise ToolError(question.reason)
+        return question.answer()
+
     def cancel(self) -> None:
         """走っているツールを諦めさせる 中断ボタンから呼ぶ"""
         self._cancel.set()
@@ -127,6 +210,16 @@ class EditorBridge:
         while True:
             try:
                 self._approvals.get_nowait().deny("中断されました")
+            except queue.Empty:
+                break
+        # 質問も同じ 畳まないと、中断したのに AI のスレッドが返事を 10 分待ち続ける
+        asked = self._asked
+        if asked is not None:
+            asked.give_up("中断されました")
+        self._asked = None
+        while True:
+            try:
+                self._questions.get_nowait().give_up("中断されました")
             except queue.Empty:
                 break
 
@@ -157,6 +250,15 @@ class EditorBridge:
             return None
         self._outstanding = approval
         return approval
+
+    def take_question(self) -> Question | None:
+        """返事待ちの質問が 1 件あれば取り出す 無ければ ``None``"""
+        try:
+            question = self._questions.get_nowait()
+        except queue.Empty:
+            return None
+        self._asked = question
+        return question
 
     def allow_always(self, tool: str) -> None:
         """このツールは以降ずっと許可する この会話の間だけ有効"""

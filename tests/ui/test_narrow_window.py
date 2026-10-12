@@ -303,6 +303,108 @@ def test_the_minimum_height_leaves_room_without_the_ai_parts(
     _check_panels(window)
 
 
+def test_a_question_does_not_crush_the_input(window: MainWindow) -> None:
+    """AI の質問の箱（#296）を出しても、1280x720 の画面で入力欄と会話の欄が潰れない
+
+    選択肢を上限の 4 つにし、名前と説明も上限の長さにする 箱をそのまま足すと、説明の
+    折り返しで 10 行を超え、窓の最小の高さが画面を超えるか、入力欄が 1 行より低くなって
+    答えを書けなくなる 箱は巻物にして 3 行まで縮む
+    """
+    from sashimono.ai.bridge import Question
+    from sashimono.ai.operations import (
+        CHOICES_RANGE,
+        DESCRIPTION_LIMIT,
+        LABEL_LIMIT,
+        QUESTION_LIMIT,
+        question_spec,
+    )
+    from sashimono.ui.chat import ChatPanel
+
+    chat = window.findChild(ChatPanel)
+    assert chat is not None
+    spec = question_spec(
+        {
+            "question": "問" * QUESTION_LIMIT,
+            "choices": [
+                {
+                    "label": f"{n}" + "名" * (LABEL_LIMIT - 1),
+                    "description": "説" * DESCRIPTION_LIMIT,
+                }
+                for n in range(CHOICES_RANGE[1])
+            ],
+            "multiple": True,
+        }
+    )
+    chat._show_question(Question(spec))
+    _settle()
+    assert window.minimumSizeHint().height() <= SCREENS["1280x720"].height() - FONT_HEADROOM
+    narrowest = QSize(window.minimumSizeHint().width(), SCREENS["1280x720"].height())
+    window.resize(narrowest)
+    _dock(window, "chat").raise_()
+    _settle()
+    assert window.width() == narrowest.width()
+    assert chat._question_box.isVisible()
+    for area in (chat._input, chat._view, chat._question_box):
+        assert area.height() >= area.minimumHeight(), type(area).__name__
+    # 入力欄は少なくとも 1 行が見える 潰れると、選択肢に無い答えを書けない
+    assert chat._input.height() >= chat._input.fontMetrics().lineSpacing()
+    assert _regions_overlap(window) == []
+    _check_panels(window)
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+@pytest.mark.parametrize("boxes", [False, True])
+def test_the_wrapped_model_row_counts_in_the_minimum(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch, logged_in: bool, boxes: bool
+) -> None:
+    """AI のパネルを最小の高さまで縮めても、折り返した部品の下が重ならない
+
+    並び（FlowLayout）と文を折り返す箱は、狭いと行が増えるのに、最小の高さは 1 行で
+    数えていた パネルが最小まで縮められると、増えた行の分だけ下の部品が重なって
+    読めなくなる（質問の箱を足して最小の高さが窓を決めるようになり、表に出た）
+    ログインの案内は Claude のログインが済んでいない機械（CI）でだけ出る 機械に任せると
+    手元では見えず CI でだけ重なったので、ログインの有無と承認・部品の更新の箱を決めて並べる
+    """
+    from sashimono.ai import AI_PACK
+    from sashimono.ai.bridge import Approval
+    from sashimono.ai.session import OutdatedClaudeCode
+    from sashimono.runtime import PackageStatus, PackStatus
+    from sashimono.ui.chat import ChatPanel
+    from sashimono.ui.chat import panel as panel_module
+    from sashimono.ui.setup import SetupSection
+    from tests.ai.conftest import FakeHost
+
+    del qt_application
+    status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.158"),))
+    monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
+    monkeypatch.setattr(panel_module, "credentials_found", lambda: logged_in)
+    panel = ChatPanel(FakeHost(Project.create()))
+    panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    try:
+        assert panel._login_box.isHidden() is logged_in
+        if boxes:
+            summary = "クリップを分割\n" + "clip_id=0123456789abcdef, frame=30 " * 3
+            panel._bridge._approvals.put(Approval(tool="split_clip", summary=summary, arguments={}))
+            panel._poll()
+            panel._show_outdated(OutdatedClaudeCode("2.1.259", "2.1.280"))
+            assert not panel._approval_box.isHidden()
+            assert not panel._update_box.isHidden()
+        panel.show()
+        # 並びが 1 行に収まらない幅 モデルの組と深さの組が別の行へ落ちる
+        width = panel.minimumSizeHint().width()
+        panel.resize(width, 800)
+        _settle()
+        assert panel._choices.height() > panel._choices.minimumSizeHint().height()
+        panel.resize(width, panel.minimumSizeHint().height())
+        _settle()
+        assert panel.height() == panel.minimumSizeHint().height()
+        assert _overlaps(panel) == []
+    finally:
+        panel.close_session()
+        panel.close()
+        panel.deleteLater()
+
+
 @pytest.mark.parametrize("name", ["subtitles", "chat", "media", "inspector"])
 def test_every_panel_works_at_the_narrowest_window(window: MainWindow, name: str) -> None:
     """窓をいちばん狭くしても、どのパネルを前に出しても部品が重ならず欠けない
