@@ -18,7 +18,7 @@ from pathlib import Path
 
 from sashimono.core.io.locks import try_hold
 
-__all__ = ["WRITING_SUFFIX", "held_for_update", "write_atomic"]
+__all__ = ["STALE_WRITING_SECONDS", "WRITING_SUFFIX", "held_for_update", "write_atomic"]
 
 #: 書きかけの仮のファイルの名前の後ろ 置き場の引き継ぎ（``core/userdirs.py``）は、
 #: これで終わる物を書きかけとして移さない 名前の形を変えるときは、そちらも合わせる
@@ -30,7 +30,7 @@ _MARK = re.compile(r"[0-9a-f]{8}")
 #: 落ちた書き手が残した仮のファイルを片付けるまでの古さ（秒）
 #: 書いている最中の物は書くたびに更新時刻が進むので、これより古いのは持ち主がもういない
 #: 短くすると、遅いドライブで大きなプロジェクトを書いている別の窓の仮のファイルを消してしまう
-_STALE_SECONDS = 60 * 60
+STALE_WRITING_SECONDS = 60 * 60
 
 #: 置き換えが「使用中」で断られたときに試し直す長さ（秒） 相手の置き換えは一瞬で終わる
 #: 長くすると、本当に開いたままのファイル（エディタで掴んでいる など）で保存が長く止まる
@@ -99,7 +99,7 @@ def _sweep_stale(path: Path) -> None:
     同じファイルを保存するたびに落ちた分だけ積もる 前の版の決まった名前（``<名前>.writing``）
     も拾う 古さで分けるのは、別の窓が今まさに書いている物を消さないため
     """
-    limit = time.time() - _STALE_SECONDS
+    limit = time.time() - STALE_WRITING_SECONDS
     head = f"{path.name}."
     try:
         with os.scandir(path.parent) as entries:

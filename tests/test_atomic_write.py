@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 from sashimono.ai.parts_update import PartsState, PartsStateStore
 from sashimono.core.io import RecoverySession, atomic, discard, find_orphans, save_project
 from sashimono.core.io.aliases import Alias, AliasStore
-from sashimono.core.io.atomic import held_for_update, write_atomic
+from sashimono.core.io.atomic import STALE_WRITING_SECONDS, held_for_update, write_atomic
 from sashimono.core.io.locks import try_hold
 from sashimono.core.io.presets import Preset, PresetStore
 from sashimono.core.io.recovery import remember_root
@@ -212,7 +212,7 @@ class TestLeftoversAreTidied:
         legacy = tmp_path / "preferences.json.writing"
         for leftover in (crashed, legacy):
             leftover.write_text("{", encoding="utf-8")
-            _aged(leftover, atomic._STALE_SECONDS + 60)
+            _aged(leftover, atomic.STALE_WRITING_SECONDS + 60)
         write_atomic(target, "{}")
         assert sorted(path.name for path in tmp_path.iterdir()) == [target.name]
 
@@ -235,7 +235,7 @@ class TestLeftoversAreTidied:
         ]
         for other in others:
             other.write_text("x", encoding="utf-8")
-            _aged(other, atomic._STALE_SECONDS + 60)
+            _aged(other, atomic.STALE_WRITING_SECONDS + 60)
         write_atomic(target, "{}")
         assert all(other.is_file() for other in others)
 
@@ -251,6 +251,50 @@ class TestLeftoversAreTidied:
         session._lock = None
         discard(find_orphans(tmp_path)[0])
         assert list((tmp_path / "recovery").iterdir()) == []
+
+
+class TestScratchOnlySessions:
+    """最初の退避を書く途中で落ちて、書きかけしか残らなかった起動"""
+
+    def _scratch_of(self, folder: Path, session: str, age: float) -> Path:
+        path = folder / f"{session}.sme.0a1b2c3d.writing"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        _aged(path, age)
+        return path
+
+    def test_an_old_scratch_of_an_ended_session_goes_on_the_next_start(
+        self, tmp_path: Path
+    ) -> None:
+        # 壊れると、復元の候補に出ない書きかけが、容量に数えられたままどの片付けでも消えない
+        folder = tmp_path / "recovery"
+        crashed = self._scratch_of(folder, "0" * 32, STALE_WRITING_SECONDS + 60)
+        assert find_orphans(tmp_path) == []
+        assert not crashed.exists()
+
+    def test_a_scratch_of_a_live_window_is_left_alone(self, tmp_path: Path) -> None:
+        # 壊れると、別の窓が今まさに書いている退避の書きかけを消し、その窓の退避が落ちる
+        session = RecoverySession(tmp_path)
+        try:
+            writing = self._scratch_of(
+                tmp_path / "recovery", session.session, STALE_WRITING_SECONDS + 60
+            )
+            find_orphans(tmp_path)
+            assert writing.is_file()
+        finally:
+            session.close()
+
+    def test_a_fresh_scratch_of_an_ended_session_is_left_alone(self, tmp_path: Path) -> None:
+        # 壊れると、錠が効かない置き場で生死を取り違えたときに、書いている最中の物を消す
+        writing = self._scratch_of(tmp_path / "recovery", "0" * 32, 0)
+        find_orphans(tmp_path)
+        assert writing.is_file()
+
+    def test_scratch_files_of_other_shapes_are_left_alone(self, tmp_path: Path) -> None:
+        # 壊れると、本人が退避の置き場に置いた似た名前のファイルを消す
+        mine = self._scratch_of(tmp_path / "recovery", "メモ", STALE_WRITING_SECONDS + 60)
+        find_orphans(tmp_path)
+        assert mine.is_file()
 
 
 class TestMovingTheFoldersSkipsScratchFiles:

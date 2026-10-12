@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -30,7 +31,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from sashimono.core import userdirs
-from sashimono.core.io.atomic import WRITING_SUFFIX, held_for_update, write_atomic
+from sashimono.core.io.atomic import (
+    STALE_WRITING_SECONDS,
+    WRITING_SUFFIX,
+    held_for_update,
+    write_atomic,
+)
 from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.core.io.serialize import LEGACY_SUFFIXES, SUFFIX, save_project
 from sashimono.core.model import Project
@@ -196,6 +202,7 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
     folder = (root if root is not None else default_state_root()) / "recovery"
     if not folder.is_dir():
         return []
+    _clear_stale_writing(folder)
 
     # メモと中身のどちらか一方しか無いものも拾う 中身から先に書くので、最初の
     # 退避の途中で落ちると中身だけが残る メモだけを数えるとそれを見落とす
@@ -252,6 +259,29 @@ def find_orphans(root: Path | None = None) -> list[RecoveryEntry]:
             )
         )
     return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+
+def _clear_stale_writing(folder: Path) -> None:
+    """終わった起動が退避を書く途中で落ちて残した書きかけを片付ける 片付けられなくても止めない
+
+    最初の退避の途中で落ちると、中身もメモも無く書きかけだけが残る その起動は復元の
+    候補に出ない（:func:`discard` を通らない）ので、ここで消さないと容量に数えられたまま残る
+    生きている起動の物は消さない その窓が今まさに書いている 古さも見るのは二重の守り
+    錠が効かない置き場（回線の先の共有フォルダ など）で生死を取り違えても、書いている最中の
+    物は更新時刻が新しいので消さない 古さの決まりは :func:`write_atomic` と同じ
+    """
+    limit = time.time() - STALE_WRITING_SECONDS
+    try:
+        leftovers = list(folder.glob(f"*{WRITING_SUFFIX}"))
+    except OSError:
+        return
+    for path in leftovers:
+        session = path.name.split(".", 1)[0]
+        if not _SESSION_NAME.fullmatch(session) or _is_alive(folder, session):
+            continue
+        with contextlib.suppress(OSError):
+            if path.is_file() and path.stat().st_mtime < limit:
+                path.unlink(missing_ok=True)
 
 
 def find_orphans_in(roots: list[Path]) -> list[RecoveryEntry]:
