@@ -126,6 +126,7 @@ class OffscreenGLContext:
 
         self._depth = 0
         self._created = False
+        self._released = False
         self._surface = QOffscreenSurface()
         self._context = QOpenGLContext()
         try:
@@ -260,11 +261,18 @@ class OffscreenGLContext:
             self.done_current()
 
     def release(self) -> None:
-        """コンテキストとサーフェスを破棄する"""
-        if self._depth:
-            self.done_current()
-            self._depth = 0
-        self._surface.destroy()
+        """コンテキストとサーフェスをその場で破棄する この後は使えない 何度呼んでもよい
+
+        前はサーフェスだけを壊し、コンテキストはごみ集めに任せていた 作れたのに使える版
+        ではなかった物（:meth:`complete` の確かめで断られた物）も、いつ壊れるかが分からない
+        まま残る 作りかけを壊すとき（:meth:`_discard`）と同じく、ここで両方を壊す
+        使う側は、このコンテキストで作った資源（テクスチャなど）を先に手放してから呼ぶ
+        """
+        if self._released:
+            return
+        self._released = True
+        self._depth = 0
+        self._discard()
 
 
 class CurrentGLContext:
