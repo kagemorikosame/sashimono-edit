@@ -78,6 +78,8 @@ __all__ = [
     "has_stroke_effects",
     "render_source",
     "render_source_framed",
+    "source_position",
+    "text_sprite_canvas",
     "waveform_points",
 ]
 
@@ -317,9 +319,72 @@ def _text_canvas(
     fps: float,
 ) -> tuple[int, int]:
     """テキストを描く絵の大きさ 字・縁取り・影が画面からはみ出すなら、その分まで広げる"""
+    found = _placed_reach(source, frame, fps)
+    if found is None:
+        return width, height
+    (left, top, right, bottom), (pos_x, pos_y) = found
+    # 画面の Y は下が正 設定の Y は上が正なので、上へずらすと字の上端は小さくなる
+    needed_width = 2.0 * max(abs(left + pos_x), abs(right + pos_x)) * scale[0]
+    needed_height = 2.0 * max(abs(top - pos_y), abs(bottom - pos_y)) * scale[1]
+    return _grown(width, height, needed_width, needed_height)
+
+
+#: 位置を 0 にして描く字の絵（:func:`text_sprite_canvas`）の周りに足す余白（絵の画素）
+#: 絵は位置の端数（1 画素より小さい）だけずらして描くので、その分と、画質を落とした
+#: プレビューで画面の画素の余白（:data:`_TEXT_MARGIN`）が 1 画素より細くなる分を足す
+_SPRITE_PADDING = 2.0
+
+
+def text_sprite_canvas(
+    source: GeneratedSource,
+    width: int,
+    height: int,
+    *,
+    frame: int = 0,
+    scale: tuple[float, float] = (1.0, 1.0),
+    fps: float = 30.0,
+) -> tuple[int, int] | None:
+    """位置を 0 にした字を、真ん中に置いて描くのに足りる絵の大きさ 字が無ければ ``None``
+
+    位置だけが動く字幕の絵を 1 枚描いて使い回す（#295）ための大きさ 縦横は ``width`` x
+    ``height``（字を置く先の絵）と偶奇をそろえる 差が奇数だと、真ん中どうしを重ねたときに
+    半画素ずれ、置き直した字の輪郭がにじむ 一辺が :data:`MAX_CANVAS` を超えるなら ``None``
+    （置く先の絵も上限で切れるので、今までどおりその都度描く）
+    """
+    found = _placed_reach(source, frame, fps)
+    if found is None:
+        return None
+    left, top, right, bottom = found[0]
+    sizes: list[int] = []
+    for near, far, factor, parity in (
+        (left, right, scale[0], width % 2),
+        (top, bottom, scale[1], height % 2),
+    ):
+        needed = 2.0 * (max(abs(near), abs(far)) * factor + _SPRITE_PADDING)
+        size = max(1, math.ceil(needed))
+        size += (size - parity) % 2
+        if size > MAX_CANVAS:
+            return None
+        sizes.append(size)
+    return sizes[0], sizes[1]
+
+
+def source_position(source: GeneratedSource, frame: int) -> tuple[float, float]:
+    """生成オブジェクトの設定の位置（X, Y 画面の画素 Y は上が正）の ``frame`` での値"""
     definition = source_registry.get(source.kind)
     if definition is None:
-        return width, height
+        return 0.0, 0.0
+    motion_x, motion_y = _motion_of(definition, source.params)
+    return motion_x.at(frame), motion_y.at(frame)
+
+
+def _placed_reach(
+    source: GeneratedSource, frame: int, fps: float
+) -> tuple[Frame, tuple[float, float]] | None:
+    """位置 0 に置いた字の届く範囲（:func:`_text_reach`）と、設定の位置 字が無ければ ``None``"""
+    definition = source_registry.get(source.kind)
+    if definition is None:
+        return None
     values = _resolve(definition, source.params, frame)
     # 縁取りの層の太さと、層のエフェクトの広がりも見積もりに入れる 入れないと、層を
     # 重ねた太い縁やぼかした縁が絵の端で切れる
@@ -340,12 +405,8 @@ def _text_canvas(
         tuple(sorted((name, value) for name, value in values.items() if not name.startswith("_")))
     )
     if reach is None:
-        return width, height
-    left, top, right, bottom = reach
-    # 画面の Y は下が正 設定の Y は上が正なので、上へずらすと字の上端は小さくなる
-    needed_width = 2.0 * max(abs(left + pos_x), abs(right + pos_x)) * scale[0]
-    needed_height = 2.0 * max(abs(top - pos_y), abs(bottom - pos_y)) * scale[1]
-    return _grown(width, height, needed_width, needed_height)
+        return None
+    return reach, (pos_x, pos_y)
 
 
 @lru_cache(maxsize=256)
