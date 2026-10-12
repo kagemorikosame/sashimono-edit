@@ -442,6 +442,11 @@ class Preferences:
     #: 入れると、幅を使っているテキストは組み方も残す（AviUtl2 の組み方は折り返さないので、
     #: テンプレートの組み方を取ると幅を残しても 1 行のままになる）
     restyle_keep_wrap: bool = False
+    #: 削除して詰めたあと（Shift+Delete と右クリックの「削除して詰める」）、再生ヘッドを
+    #: 消した所の頭（つなぎ目）へ動かす（Issue #299） 既定は入 詰めると後ろが前へ寄り、
+    #: 元の位置はつなぎ目と関係の無い所を指す つなぎ目を確かめたい人が多い
+    #: 再生中に消したときは、止めずに頭から続ける 動いてほしくない人は切れば今までどおり
+    ripple_playhead: bool = True
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -589,6 +594,7 @@ class PreferenceStore:
                 data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
             ),
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
+            ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
         )
 
     def save(self, preferences: Preferences) -> None:

@@ -675,6 +675,18 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._restyle_keep_wrap)
 
+        self._ripple_playhead = QCheckBox(
+            "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
+        )
+        self._ripple_playhead.setChecked(preferences.ripple_playhead)
+        self._ripple_playhead.setToolTip(
+            "Shift+Delete と右クリックの「削除して詰める」で、消したクリップ（リンクした映像と"
+            "音声も）の一番早い頭へ再生ヘッドを動かす そのまま再生すればつなぎ目の前後が見える"
+            " 再生中に消したときは、止めずに頭から続ける 末尾を消したときは新しい末尾へ寄せる"
+            " 詰めない削除（Delete）と取り消しでは動かさない 切ると再生ヘッドは元の位置に残る"
+        )
+        form.addRow(self._ripple_playhead)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -820,4 +832,5 @@ class PreferencesDialog(QDialog):
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
+            ripple_playhead=self._ripple_playhead.isChecked(),
         )

@@ -232,6 +232,11 @@ class TimelineView(QWidget):
 
     #: 再生ヘッドが動いた 引数はフレーム番号
     playhead_moved = Signal(int)
+    #: 削除して詰めたあと、再生ヘッドを消した所の頭へ動かした 引数はフレーム番号
+    #:
+    #: :attr:`playhead_moved` と分ける 編集を受け取った側は再生を止めるので、
+    #: 再生中に消したときに頭から鳴らし直すかを、受け取った側が見分けられるようにする
+    ripple_landed = Signal(int)
     #: 選択が変わった 引数はクリップ ID、または空文字列
     selection_changed = Signal(str)
     #: 編集操作が発生した 引数はコマンドの一覧と、履歴に出す操作名
@@ -348,6 +353,9 @@ class TimelineView(QWidget):
         #: 挿入貼り付けで全トラックを押し出すか（:meth:`set_insert_all_tracks`）
         #: 既定は設定の既定と同じ
         self._insert_all_tracks = True
+        #: 削除して詰めたあと、再生ヘッドを消した所の頭（つなぎ目）へ動かすか
+        #: （:meth:`set_ripple_playhead`） 既定は設定の既定と同じ
+        self._ripple_playhead = True
         #: ヘッダを掴んでトラックの順を入れ替えるドラッグ
         self._track_mover = TrackDragger(self._request)
         #: ドラッグ中に端へ寄ったら表示を送る
@@ -2053,16 +2061,57 @@ class TimelineView(QWidget):
         )
 
     def delete_selected(self, *, ripple: bool = False) -> None:
+        """選んでいるクリップを消す ``ripple`` なら後ろを詰め、再生ヘッドをつなぎ目へ動かす
+
+        動かすのは詰めたときだけ（Issue #299） 詰めない削除は隙間が残るだけで、
+        元の再生ヘッドの位置が指す物は変わらない
+        """
         if not self._selection:
             return
         if self._refuse_locked_group(self._selection, "削除"):
             return
+        removed = self._selection
+        # 頭は消す前に求める 消した後のプロジェクトには、もう消したクリップが無い
+        head = self._earliest_start(removed) if ripple and self._ripple_playhead else None
         command: Command = (
-            RemoveClips(self._selection, ripple=ripple)
-            if len(self._selection) > 1
-            else RemoveClip(self._selection[0], ripple=ripple)
+            RemoveClips(removed, ripple=ripple)
+            if len(removed) > 1
+            else RemoveClip(removed[0], ripple=ripple)
         )
         self._request([command], command.label)
+        if head is None:
+            return
+        # ロックしたトラックで断られたとき（受け取った側が戻した）は、どれも残っている
+        # そこで動かすと、何も消えていないのに再生ヘッドだけが飛び、消えたように見える
+        if any(self._project.timeline.locate_clip(c) is not None for c in removed):
+            return
+        # 末尾を消したときは、頭が新しい長さの先に出る そのままだと何も映らない所に
+        # 再生ヘッドが残るので、新しい末尾へ寄せる
+        self.set_playhead(min(head, self._project.duration))
+        self.ripple_landed.emit(self._playhead)
+
+    def set_ripple_playhead(self, enabled: bool) -> None:
+        """削除して詰めたあと再生ヘッドを動かすか 設定（:attr:`Preferences.ripple_playhead`）から"""
+        self._ripple_playhead = enabled
+
+    def _earliest_start(self, clip_ids: Iterable[ClipId]) -> int | None:
+        """渡したクリップと、そのリンクの相手のうち、一番早い頭
+
+        リンクの相手も見る 音声だけを選んでも映像は一緒に消えるので、映像の方が
+        早く始まっていれば、つなぎ目はそちらの頭になる 何本ものトラックにまたがるときも
+        一番早い頭に寄せる 遅い方に寄せると、早い方のつなぎ目を通り過ぎた所から映る
+        """
+        timeline = self._project.timeline
+        starts: list[int] = []
+        for clip_id in clip_ids:
+            located = timeline.locate_clip(clip_id)
+            if located is None:
+                continue
+            clip = located[1]
+            starts.append(clip.timeline_start)
+            if clip.link_group is not None:
+                starts.extend(c.timeline_start for _, c in timeline.linked_clips(clip.link_group))
+        return min(starts) if starts else None
 
     @property
     def has_clipboard(self) -> bool:
