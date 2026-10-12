@@ -111,7 +111,7 @@ from sashimono.effects import (
     registry,
 )
 from sashimono.effects.blending import BLEND_MODES
-from sashimono.effects.sources import source_registry
+from sashimono.effects.sources import SourceDefinition, Unlock, source_registry
 from sashimono.effects.strokes import (
     STROKE,
     STROKE_EFFECT_NOTE,
@@ -1124,6 +1124,9 @@ class InspectorPanel(QWidget):
             unused = unused | {LEGACY_BORDER_WIDTH, LEGACY_BORDER_COLOR}
         locked = definition.locked_reasons(clip.source.params)
         shown = _styles_under_fonts([s for s in definition.parameters if s.name not in unused])
+        # 切り替えのボタンを出した欄の名前 同じ切り替えで解ける欄が後に出たら、ボタンを
+        # 繰り返さずにそちらを指す（2 つ出すと別々の操作に見える）
+        buttons: dict[Unlock, str] = {}
         for index, spec in enumerate(shown):
             path = ParamPath.of_source(clip.id, spec.name)
             value = clip.source.params.get(spec.name)
@@ -1135,12 +1138,84 @@ class InspectorPanel(QWidget):
             # 1 行ずつ出すと、同じ文が 2 度並ぶ
             following = shown[index + 1].name if index + 1 < len(shown) else None
             note = reason is not None and locked.get(following or "") != reason
-            self._param_row(section, spec.label, spec, path, value, reason, note=note)
+            unlock = definition.unlock_for(reason) if reason is not None else None
+            self._param_row(
+                section, spec.label, spec, path, value, reason, note=note and unlock is None
+            )
             editor = self._editors[_editor_key(path)]
+            if unlock is not None and reason is not None:
+                if isinstance(editor, FontStyleEditor):
+                    editor.set_unavailable(f"（{unlock.cause}では選べません）")
+                if note:
+                    self._unlock_note(section, definition, reason, unlock, spec.label, buttons)
             family = definition.spec(spec.font) if isinstance(spec, FontStyleSpec) else None
             if isinstance(family, FontSpec) and isinstance(editor, FontStyleEditor):
                 self._follow_family(editor, family, clip)
         return section
+
+    def _unlock_note(
+        self,
+        section: _Section,
+        definition: SourceDefinition,
+        reason: str,
+        unlock: Unlock,
+        label: str,
+        buttons: dict[Unlock, str],
+    ) -> None:
+        """灰色の欄の理由に、使えるようにする切り替えのボタンを添える（#301）
+
+        理由の文だけだと、原因の欄（組み方）が遠くにあって結び付けられず、不具合だと
+        受け取られた その場で 1 回押せば使えるようにする
+        """
+        first = buttons.get(unlock)
+        if first is not None:
+            section.add_note(f"{reason} 切り替えのボタンは「{first}」の欄の下にあります")
+            return
+        buttons[unlock] = label
+        button = QPushButton(unlock.button)
+        button.setObjectName("unlock_button")
+        button.setToolTip(unlock.detail)
+        button.clicked.connect(lambda: self._apply_unlock(definition, unlock))
+        section.add_note(reason, button)
+
+    def _apply_unlock(self, definition: SourceDefinition, unlock: Unlock) -> None:
+        """選んでいるクリップのうち、同じ切り替えで灰色が解ける物すべてを切り替える
+
+        1 回の取り消しで全部が戻るよう、まとめて出す クリップごとに値を作るのは、
+        組み方と一緒に変える横の基準が、それぞれの行揃えで決まるため 主のクリップの値を
+        写すと、行揃えの違うクリップの字が跳ぶ
+
+        相手は選んだ物すべて 値のまとめ当て（:meth:`_others_in_selection`）と違い、同じ
+        グループの仲間も外さない 外すと、2 本を選んでからグループ化した字幕で主の 1 本だけが
+        標準になり、もう 1 本は灰色のまま残る（押したのに半分しか切り替わらない）
+        グループの仲間として引き込まれただけの物は、選んだ物（``_selection``）に入らない
+        """
+        primary = self._clip()
+        if primary is None or self._project is None:
+            return
+        targets = [primary]
+        for clip_id in self._selection:
+            located = self._project.timeline.locate_clip(clip_id)
+            if clip_id != primary.id and located is not None:
+                targets.append(located[1])
+        commands: list[Command] = []
+        switched = 0
+        for clip in targets:
+            source = clip.source
+            if source is None or source.kind != definition.kind:
+                continue
+            # 灰色になっていないクリップ（縦書きなど）は触らない 押したのは灰色を解くためで、
+            # 効いている設定まで書き換えると、選んでいただけのクリップの見た目が変わる
+            reasons = definition.locked_reasons(source.params).values()
+            if not any(definition.unlock_for(reason) == unlock for reason in reasons):
+                continue
+            switched += 1
+            for name, value in unlock.switch(source.params).items():
+                commands.append(SetParam(ParamPath.of_source(clip.id, name), value))
+        if not commands:
+            return
+        label = unlock.button if switched == 1 else f"{unlock.button}（{switched} 本）"
+        self._send(commands, label)
 
     def _follow_family(self, editor: FontStyleEditor, family: FontSpec, clip: Clip) -> None:
         """スタイルの欄の一覧を、今のフォントのファミリに合わせ続ける
@@ -1861,11 +1936,11 @@ class InspectorPanel(QWidget):
         エフェクトのパラメータは「同じ種類の何番目か」で相手を探す 相手が持って
         いなければ飛ばす（無いものを作ると、選んだだけで中身が増える）
         """
-        others = [clip_id for clip_id in self._selection if clip_id != self._clip_id]
-        if not others or self._project is None:
-            return []
         primary = self._clip()
-        if primary is None:
+        if primary is None or self._project is None:
+            return []
+        others = self._others_in_selection(primary)
+        if not others:
             return []
         target = _effect_of(command)
         pending = self._virtual.get(target) if target is not None else None
@@ -1875,7 +1950,20 @@ class InspectorPanel(QWidget):
             # 相手に欄が無ければ作らない（ほかのエフェクトと同じく飛ばす）
             primary = replace(primary, effects=(*primary.effects, pending[1]))
         extra: list[Command] = []
-        for clip_id in others:
+        for other in others:
+            copied = _for_clip(command, primary, other)
+            if copied is not None:
+                extra.append(copied)
+        return extra
+
+    def _others_in_selection(self, primary: Clip) -> list[Clip]:
+        """選んでいるほかのクリップのうち、同じ設定を当てる相手"""
+        if self._project is None:
+            return []
+        others: list[Clip] = []
+        for clip_id in self._selection:
+            if clip_id == primary.id:
+                continue
             located = self._project.timeline.locate_clip(clip_id)
             if located is None:
                 continue
@@ -1885,10 +1973,8 @@ class InspectorPanel(QWidget):
                 # どちらも自分で選んだ物のまま残り、1 本を押し直しても選びが変わらない
                 # そのせいで利用者の手元では拡大率が連動し続けた
                 continue
-            copied = _for_clip(command, primary, located[1])
-            if copied is not None:
-                extra.append(copied)
-        return extra
+            others.append(located[1])
+        return others
 
     def _refresh_animated(self) -> None:
         """キーフレームで決まる値を、今のフレームの値に更新する"""
@@ -2266,12 +2352,16 @@ class _Section(QFrame):
         """組の中の数値とスライダーの欄 幅をそろえるため"""
         return self.findChildren(TrackEditor)
 
-    def add_note(self, message: str) -> None:
+    def add_note(self, message: str, button: QPushButton | None = None) -> None:
+        """欄の下の添え書き ``button`` は文の下に左寄せで並べる（理由を読んでから押す順）"""
         note = QLabel(message)
         note.setWordWrap(True)
         themed_style(note, lambda: f"color: {Colors.TEXT_MUTED.name()}; border: none;")
         self._grid.addWidget(note, self._row, 0, 1, 3)
         self._row += 1
+        if button is not None:
+            self._grid.addWidget(button, self._row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft)
+            self._row += 1
 
     def _toggle(self, effect: Effect, clip_id: ClipId) -> QToolButton:
         button = QToolButton()
