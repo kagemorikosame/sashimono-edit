@@ -321,9 +321,9 @@ class TestExchange:
             monkeypatch.setattr(dialog, "choose_folder", lambda: out)
             dialog.select("赤")
             dialog.export_selected()
-            assert (out / "赤.smep").is_file()
+            assert (out / "見出し" / "赤.smep").is_file()
 
-            monkeypatch.setattr(dialog, "choose_files", lambda: [out / "赤.smep"])
+            monkeypatch.setattr(dialog, "choose_files", lambda: [out / "見出し" / "赤.smep"])
             monkeypatch.setattr(dialog, "ask_conflict", lambda *_a: CONFLICT_BOTH)
             dialog.import_files()
             assert sorted(_names(dialog)) == ["赤", "赤 (2)", "青"]

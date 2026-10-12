@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -202,8 +203,8 @@ class Library:
         """別の名前で写しを作る 元はそのまま残す"""
         self._require(entry)
         copy = _with(entry.item, name=_cleaned(name))
-        self._make_room(entry.kind, copy, keep=(), overwrite=overwrite)
-        path = self._save(copy)
+        trashed = self._make_room(entry.kind, copy, keep=(), overwrite=overwrite)
+        path = self._save_or_put_back(copy, trashed)
         return self._entry(entry.kind, copy, path)
 
     def free_name(self, kind: LibraryKind, item: Item) -> str:
@@ -273,11 +274,21 @@ class Library:
     # --- 書き出しと読み込み ---
 
     def export(self, entry: LibraryEntry, folder: Path, *, overwrite: bool = False) -> Path:
-        """``folder`` へ置き場と同じ形のファイルを書く 旧い拡張子の物も新しい形で書く"""
+        """``folder`` へ置き場と同じ形のファイルを書く 旧い拡張子の物も新しい形で書く
+
+        プリセットは分類の名前の下のフォルダへ書く（置き場と同じ並び ``<分類>/<名前>.smep``）
+        分類の違う同じ名前のプリセットを一緒に書き出すと、同じファイル名に重なり、上書きを
+        選ぶと最後の 1 件しか残らなかった 分類はファイルの中にもあるので、読み込みで戻る
+        エイリアスは置き場が名前だけで決まり、名前が重ならないのでフォルダを分けない
+        """
         self._require(entry)
-        target = Path(folder) / self._target(entry.item).name
+        stored = self._target(entry.item)
+        relative = (
+            stored.relative_to(self.presets.root) if entry.kind == PRESET else Path(stored.name)
+        )
+        target = Path(folder) / relative
         if target.exists() and not overwrite:
-            raise LibraryConflictError(f"{target.name} がもうある")
+            raise LibraryConflictError(f"{relative.as_posix()} がもうある")
         target.parent.mkdir(parents=True, exist_ok=True)
         # 書き手ごとの仮の名前で書いてから置き換える（#310 の決まり） 決まった名前だと、2 つの
         # 窓が同じ所へ同時に書き出したときに相手の書きかけを上書きする 失敗しても元は無傷
@@ -297,8 +308,8 @@ class Library:
 
     def add(self, kind: LibraryKind, item: Item, *, overwrite: bool = False) -> LibraryEntry:
         """置き場へ足す（読み込み） 同じ名前があれば :class:`LibraryConflictError`"""
-        self._make_room(kind, item, keep=(), overwrite=overwrite)
-        return self._entry(kind, item, self._save(item))
+        trashed = self._make_room(kind, item, keep=(), overwrite=overwrite)
+        return self._entry(kind, item, self._save_or_put_back(item, trashed))
 
     # --- 保存（#276 追記 保存の窓） ---
 
@@ -352,7 +363,7 @@ class Library:
             if not any(_same_file(path, replacing.path) for path in occupants):
                 raise LibraryChangedError(f"「{item.name}」はほかの窓で別の物に変わった")
             trashed = self._to_trash(kind, replacing.item, occupants)
-        return self._entry(kind, item, self._save(item)), trashed
+        return self._entry(kind, item, self._save_or_put_back(item, trashed)), trashed
 
     def undo_overwrite(self, saved: LibraryEntry, trashed: TrashEntry) -> LibraryEntry:
         """上書きして保存した物を、上書きの前の内容に戻す 上書きした新しい方はごみ箱へ移す
@@ -370,11 +381,11 @@ class Library:
         self._require(entry)
         if changed == entry.item and not entry.legacy:
             return entry
-        self._make_room(entry.kind, changed, keep=entry.files, overwrite=overwrite)
+        trashed = self._make_room(entry.kind, changed, keep=entry.files, overwrite=overwrite)
         stat = entry.path.stat()
         target = self._target(changed)
         same = target.exists() and _same_file(target, entry.path)
-        path = self._save(changed)
+        path = self._save_or_put_back(changed, trashed)
         os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         if not same:
             entry.path.unlink(missing_ok=True)
@@ -385,15 +396,29 @@ class Library:
 
     def _make_room(
         self, kind: LibraryKind, item: Item, *, keep: tuple[Path, ...], overwrite: bool
-    ) -> None:
+    ) -> TrashEntry | None:
         occupants = self._occupants(kind, item, keep=keep)
         if not occupants:
-            return
+            return None
         if not overwrite:
             where = f"「{item.category}」に" if kind == PRESET else ""
             raise LibraryConflictError(f"{where}「{item.name}」がもうある")
         # 上書きで消える方もごみ箱へ 上書きを選んだ後でも戻せるようにする
-        self._to_trash(kind, self._load_or(kind, occupants[0], item), occupants)
+        return self._to_trash(kind, self._load_or(kind, occupants[0], item), occupants)
+
+    def _save_or_put_back(self, item: Item, trashed: TrashEntry | None) -> Path:
+        """書く 書けなければ（容量不足など）、上書きのためにごみ箱へ移した前の物を元へ戻す
+
+        戻さないと、失敗の知らせが出たのに、使っていたプリセットやエイリアスが一覧と
+        メニューから消える 戻すのに失敗しても、前の物はごみ箱に残る（戻せる）
+        """
+        try:
+            return self._save(item)
+        except BaseException:
+            if trashed is not None:
+                with contextlib.suppress(LibraryError, OSError):
+                    self.restore(trashed)
+            raise
 
     def _occupants(self, kind: LibraryKind, item: Item, *, keep: tuple[Path, ...]) -> list[Path]:
         """``item`` を書くと重なる、いまある別のファイル ``keep`` は自分自身なので数えない"""

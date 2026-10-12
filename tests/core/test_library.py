@@ -479,8 +479,8 @@ class TestAtomicWrites:
 
         library.presets.save(Preset.capture("赤", _clip()))
         out = tmp_path / "out"
-        out.mkdir()
-        (out / "赤.smep").write_text("前の書き出し", encoding="utf-8")
+        (out / "ユーザー").mkdir(parents=True)
+        (out / "ユーザー" / "赤.smep").write_text("前の書き出し", encoding="utf-8")
 
         def refuse(_temporary: Path, _path: Path) -> None:
             raise OSError("試験で置き換えを断る")
@@ -488,5 +488,77 @@ class TestAtomicWrites:
         monkeypatch.setattr(atomic, "_replace", refuse)
         with pytest.raises(OSError):
             library.export(_entry(library, "赤"), out, overwrite=True)
-        assert (out / "赤.smep").read_text(encoding="utf-8") == "前の書き出し"
-        assert not list(out.glob("*.writing"))
+        assert (out / "ユーザー" / "赤.smep").read_text(encoding="utf-8") == "前の書き出し"
+        assert not list(out.rglob("*.writing"))
+
+
+class TestFailedWritesKeepTheOldOne:
+    """上書きの保存で書けなかったとき（容量不足など）、使っていた物を一覧から消さない
+
+    前は書く前に古いファイルをごみ箱へ移していて、書くのに失敗すると、失敗の知らせが出たのに
+    使っていたプリセットやエイリアスが一覧とメニューから消えた
+    """
+
+    @pytest.fixture
+    def refusing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse(_self: Library, _item: object) -> Path:
+            raise OSError("試験で書き込みを断る（容量不足のつもり）")
+
+        monkeypatch.setattr(Library, "_save", refuse)
+
+    def _text(self, library: Library, kind: LibraryKind = PRESET) -> str:
+        (entry,) = library.entries(kind)
+        item = entry.item
+        source = item.source if isinstance(item, Preset) else item.clip.source
+        assert source is not None
+        return str(source.params["text"])
+
+    def test_saving_over(self, library: Library, refusing: None) -> None:
+        library.presets.save(Preset.capture("赤", _clip("前")))
+        item = Preset.capture("赤", _clip("後"))
+        with pytest.raises(OSError):
+            library.save(PRESET, item, replacing=library.occupant(PRESET, item))
+        assert self._text(library) == "前"
+        assert library.trashed(PRESET) == ()
+
+    def test_importing_over(self, library: Library, refusing: None) -> None:
+        library.aliases.save(Alias.of("テロップ", _clip("前")))
+        with pytest.raises(OSError):
+            library.add(ALIAS, Alias.of("テロップ", _clip("後")), overwrite=True)
+        assert self._text(library, ALIAS) == "前"
+        assert library.trashed(ALIAS) == ()
+
+    def test_renaming_over(self, library: Library, refusing: None) -> None:
+        library.presets.save(Preset.capture("赤", _clip("赤の中身")))
+        library.presets.save(Preset.capture("青", _clip("青の中身")))
+        with pytest.raises(OSError):
+            library.rename(_entry(library, "赤"), "青", overwrite=True)
+        assert {e.name for e in library.entries(PRESET)} == {"赤", "青"}
+        blue = _entry(library, "青").item
+        assert isinstance(blue, Preset) and blue.source is not None
+        assert blue.source.params["text"] == "青の中身"
+        assert library.trashed(PRESET) == ()
+
+
+class TestExportAcrossCategories:
+    def test_the_same_name_in_two_categories_keeps_both(
+        self, library: Library, tmp_path: Path
+    ) -> None:
+        # 前は同じファイル名に重なり、上書きを選ぶと「2 件書き出した」と出て 1 件しか残らなかった
+        library.presets.save(Preset.capture("赤", _clip("見出しの赤"), category="見出し"))
+        library.presets.save(Preset.capture("赤", _clip("字幕の赤"), category="字幕"))
+        out = tmp_path / "out"
+        written = [library.export(entry, out) for entry in library.entries(PRESET)]
+        assert len({path.resolve() for path in written}) == 2
+        other = Library(
+            presets=PresetStore(tmp_path / "other" / "presets"),
+            aliases=AliasStore(tmp_path / "other" / "aliases"),
+        )
+        for path in written:
+            other.add(*other.read_file(path))
+        # 読み込むと分類も戻る（分類はファイルの中にある）
+        found = set()
+        for entry in other.entries(PRESET):
+            assert isinstance(entry.item, Preset) and entry.item.source is not None
+            found.add((entry.category, str(entry.item.source.params["text"])))
+        assert found == {("見出し", "見出しの赤"), ("字幕", "字幕の赤")}
