@@ -23,7 +23,6 @@ import re
 import shutil
 import sys
 import threading
-import time
 import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import WRITING_SUFFIX, held_for_update, write_atomic
 from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.core.io.serialize import LEGACY_SUFFIXES, SUFFIX, save_project
 from sashimono.core.model import Project
@@ -133,7 +133,7 @@ class RecoverySession:
             # 前の版が書いた秒単位のメモも fromisoformat でそのまま読める
             "saved_at": datetime.now().isoformat(timespec="microseconds"),
         }
-        _write_atomic(self._meta_path(self._folder, self.session), json.dumps(meta))
+        write_atomic(self._meta_path(self._folder, self.session), json.dumps(meta))
 
     def clear(self) -> None:
         """退避を消す 保存した直後など、守るものが無くなったときに呼ぶ"""
@@ -342,20 +342,12 @@ _PLACES_WAIT = 2.0
 def _places_held(registry: Path | None) -> Iterator[None]:
     """覚えた置き場の一覧（``places.json``）を、プロセスの間で 1 人ずつ書き換える
 
-    錠は窓の錠と同じ仕組み（:func:`~sashimono.core.io.locks.try_hold`） 持ち主が落ちれば
-    次に取りに来た方が片付けて取り直す 待っても取れなければ ``TimeoutError``（``OSError``）
+    待っても取れなければ ``TimeoutError``（``OSError``） 錠の決まりは :func:`held_for_update`
     """
     base = registry if registry is not None else default_state_root()
     base.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + _PLACES_WAIT
-    while (lock := try_hold(base / _PLACES_LOCK)) is None:
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"覚えた置き場の一覧の錠を取れない: {base / _PLACES_LOCK}")
-        time.sleep(0.01)
-    try:
+    with held_for_update(base / _PLACES_LOCK, _PLACES_WAIT):
         yield
-    finally:
-        lock.release()
 
 
 def _has_backups(root: Path) -> bool:
@@ -404,7 +396,7 @@ def _has_files(folder: Path) -> bool:
 def _write_places(places: list[Path], registry: Path | None) -> None:
     base = registry if registry is not None else default_state_root()
     base.mkdir(parents=True, exist_ok=True)
-    _write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
+    write_atomic(base / _PLACES, json.dumps([str(place) for place in places], ensure_ascii=False))
 
 
 def folder_problem(root: Path) -> str | None:
@@ -444,13 +436,23 @@ def _remove_files(paths: tuple[Path, ...]) -> None:
 
 
 def _session_files(entry: RecoveryEntry) -> tuple[Path, ...]:
-    """その退避に属するファイル 中身・メモ・錠・勧めた印"""
+    """その退避に属するファイル 中身・メモ・錠・勧めた印・落ちたときの書きかけ
+
+    書きかけ（``<起動の番号>.sme.<印>.writing`` など）も含める 起動ごとに名前が違うので、
+    次の退避で上書きされることも、:func:`write_atomic` の片付けで拾われることも無い
+    ここで消さないと、容量（:func:`state_usage`）には数えるのに、どの片付けでも消えずに残る
+    """
     folder = entry.path.parent
+    try:
+        leftovers = tuple(sorted(folder.glob(f"{entry.session}.*{WRITING_SUFFIX}")))
+    except OSError:
+        leftovers = ()
     return (
         entry.path,
         folder / f"{entry.session}.json",
         folder / f"{entry.session}.lock",
         _offered_path(folder, entry.session),
+        *leftovers,
     )
 
 
@@ -548,14 +550,6 @@ def _path_digest(target: Path) -> str:
     """場所の要約 大文字小文字や ``..`` の違いで別物にならないよう正規化してから取る"""
     resolved = os.path.normcase(str(Path(target).resolve()))
     return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:10]
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    # 仮の名前は書き手ごとに別にする 同じ名前だと、2 つのプロセスが同時に書いたときに
-    # 互いの書きかけを上書きしたり、相手が置き換えた後の仮のファイルが見つからずに落ちたりする
-    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.writing")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
 
 
 # --- 世代バックアップ ------------------------------------------------------

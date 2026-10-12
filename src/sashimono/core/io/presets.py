@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.io.serialize import (
     ProjectFileError,
     effect_from_json,
@@ -316,10 +317,8 @@ class PresetStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         # 一時ファイルへ書いてから差し替える プリセットは作り直せないので、
         # 書き込み中に落ちて壊れると手作業で復元することになる
-        temporary = target.with_name(target.name + ".writing")
         # 値には読めないバイトを持つ文字が入りうる（json_text を参照）
-        temporary.write_text(json_text(preset.to_dict()), encoding="utf-8")
-        temporary.replace(target)
+        write_atomic(target, json_text(preset.to_dict()))
         return target
 
     def load(self, path: Path) -> Preset:

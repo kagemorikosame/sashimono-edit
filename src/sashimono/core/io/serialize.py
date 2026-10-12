@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import shutil
 from dataclasses import replace
@@ -20,6 +19,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.model import (
     AnimatedValue,
     AudioStreamInfo,
@@ -945,14 +945,7 @@ def save_project(project: Project, path: Path) -> None:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".writing")
-    payload = json_text(project_to_dict(project))
-
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
+    write_atomic(path, json_text(project_to_dict(project)), durable=True)
 
 
 #: 形式を上げる前の写しに足す尻（``名前.sme.bak``）

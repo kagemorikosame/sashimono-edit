@@ -27,6 +27,7 @@ from pathlib import Path
 from packaging.requirements import InvalidRequirement, Requirement
 
 from sashimono.core import userdirs
+from sashimono.core.io.atomic import write_atomic
 from sashimono.package_index import Latest, latest_release
 from sashimono.runtime import (
     FeaturePack,
@@ -106,11 +107,11 @@ class PartsStateStore:
 
     def save(self, state: PartsState) -> None:
         # 書けなくても次の起動でもう一度確かめるだけ 止めるほどのことではない
+        # 2 つの窓が同時に書き戻して片方の変更が消えても同じで、錠では守らない
+        # 持つのは最後に確かめた時刻と失敗の数だけで、消えると早めにもう 1 度確かめるだけ
         with contextlib.suppress(OSError):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(self.path.name + ".writing")
-            temporary.write_text(json.dumps(asdict(state)), encoding="utf-8")
-            temporary.replace(self.path)
+            write_atomic(self.path, json.dumps(asdict(state)))
 
 
 def is_due(last_checked: float, now: float, interval: float = CHECK_INTERVAL_SECONDS) -> bool:
