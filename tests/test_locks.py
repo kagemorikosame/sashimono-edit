@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from sashimono.core.io import (
     HeldLock,
     hold_new,
@@ -81,6 +83,59 @@ class TestLock:
         lock = try_hold(tmp_path / "a.lock")
         assert lock is not None
         lock.release()
+
+    def test_a_release_leaves_no_file_behind(self, tmp_path: Path) -> None:
+        # 壊れると、窓を閉じるたびに錠のファイルが置き場に積もる
+        lock = try_hold(tmp_path / "a.lock")
+        assert lock is not None
+        lock.release()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_release_does_not_remove_the_lock_a_waiter_just_took(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、手放す途中で取り直した相手の錠を消し、3 人目も入れてしまう
+        # Windows では相手の錠を消せずに上がり、錠の中で書き終えた保存まで失敗に見える
+        path = tmp_path / "a.lock"
+        first = try_hold(path)
+        assert first is not None
+        plain_unlink = Path.unlink
+        waiter: list[HeldLock | None] = []
+
+        def unlink(self: Path, missing_ok: bool = False) -> None:
+            if self == path and not waiter:
+                # 手放す側が名前を消しに来た瞬間に、待っていた相手が取りに来る
+                monkeypatch.setattr(Path, "unlink", plain_unlink)
+                waiter.append(try_hold(path))
+            plain_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+        first.release()
+        monkeypatch.setattr(Path, "unlink", plain_unlink)
+        (second,) = waiter
+        if second is None:
+            # まだ持っている間に来た相手は断られる 手放した後は取れる
+            second = try_hold(path)
+        assert second is not None
+        try:
+            assert is_held(path)
+            assert try_hold(path) is None
+        finally:
+            second.release()
+
+    def test_a_lock_given_up_is_not_removed_later(self, tmp_path: Path) -> None:
+        # 壊れると、手放した錠を後から片付けようとして、その名前で取り直した窓の錠を消す
+        path = tmp_path / "a.lock"
+        first = try_hold(path)
+        assert first is not None
+        first.abandon()
+        second = try_hold(path)
+        assert second is not None
+        try:
+            first.release()
+            assert is_held(path)
+        finally:
+            second.release()
 
     def test_a_leftover_from_a_dead_owner_is_not_held(self, tmp_path: Path) -> None:
         # 落ちた窓の錠が残っていても、開き直すたびに警告が出ないこと

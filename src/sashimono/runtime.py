@@ -1161,6 +1161,8 @@ def write_swap_journal(target: Path, replaced: Sequence[str], added: Sequence[st
     """
     journal = swap_journal(target)
     data = {"replaced": list(replaced), "added": list(added)}
+    # 仮の名前は決まった物でよい 書くのは入れ替えの錠（``-swap.lock``）を持つ 1 人だけで、
+    # ほかの窓と取り合わない（core.io.atomic の書き手ごとの名前は、錠の無い所のため）
     writing = journal.with_name(journal.name + ".writing")
     with writing.open("w", encoding="utf-8") as stream:
         stream.write(json.dumps(data, ensure_ascii=False))

@@ -798,6 +798,7 @@ def _write_journal(target: Path, source: Path, entries: dict[Path, str]) -> None
         "source": str(source),
         "entries": {path.as_posix(): digest for path, digest in entries.items()},
     }
+    # 仮の名前は決まった物でよい 移すのは移し先の錠を持つ 1 人だけで、ほかの窓と取り合わない
     writing = journal.with_name(journal.name + _MOVING_SUFFIX)
     writing.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     writing.replace(journal)
