@@ -604,6 +604,8 @@ class MainWindow(QMainWindow):
         self._scene_bar = SceneBar()
         self._scene_bar.set_snap(self._preferences.timeline_snap)
         self._scene_bar.snap_toggled.connect(self._set_snap)
+        self._scene_bar.set_playhead_snap(self._preferences.playhead_snap)
+        self._scene_bar.playhead_snap_toggled.connect(self._set_playhead_snap)
         timeline_panel = QWidget()
         timeline_layout = QVBoxLayout(timeline_panel)
         timeline_layout.setContentsMargins(0, 0, 0, 0)
@@ -974,6 +976,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._scene_bar.set_snap(preferences.timeline_snap)
+        self._scene_bar.set_playhead_snap(preferences.playhead_snap)
         self._inspector.set_double_click_reset(preferences.double_click_reset)
         self._inspector.set_preset_options(preferences.preset_options)
         set_library_options(preferences.library_options)
@@ -1941,6 +1944,15 @@ class MainWindow(QMainWindow):
         """タイムラインの上の〔磁石〕 次に開いたときも同じにする"""
         self._timeline.set_snap(enabled, self._preferences.snap_distance)
         self._remember_preferences(replace(self._preferences, timeline_snap=enabled))
+
+    def _set_playhead_snap(self, enabled: bool) -> None:
+        """〔磁石〕の隣の再生ヘッドの吸い付き 次に開いたときも同じにする
+
+        吸い付く先は設定画面の値のまま使う 入切だけを変える
+        """
+        preferences = replace(self._preferences, playhead_snap=enabled)
+        self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
+        self._remember_preferences(preferences)
 
     def _remember_preferences(self, preferences: Preferences) -> None:
         """設定画面の外で選んだ好みを覚える 次に開いたときも同じにする"""

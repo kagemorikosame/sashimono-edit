@@ -47,10 +47,6 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
-    "PLAYHEAD_SNAP_ALWAYS",
-    "PLAYHEAD_SNAP_MODES",
-    "PLAYHEAD_SNAP_OFF",
-    "PLAYHEAD_SNAP_SHIFT",
     "SCRIPTS_MOVE_ASK",
     "SCRIPTS_MOVE_AUTO",
     "SCRIPTS_MOVE_MODES",
@@ -184,13 +180,6 @@ INSERT_ALL_TRACKS = "all"
 INSERT_TARGET_TRACKS = "target"
 INSERT_PASTE_MODES = (INSERT_ALL_TRACKS, INSERT_TARGET_TRACKS)
 
-#: 目盛りで再生ヘッドを動かすときの吸い付き方 :attr:`Preferences.playhead_snap` の値
-#: Shift を押している間だけ吸い付く・常に吸い付いて Shift で外す・吸い付かない
-PLAYHEAD_SNAP_SHIFT = "shift"
-PLAYHEAD_SNAP_ALWAYS = "always"
-PLAYHEAD_SNAP_OFF = "off"
-PLAYHEAD_SNAP_MODES = (PLAYHEAD_SNAP_SHIFT, PLAYHEAD_SNAP_ALWAYS, PLAYHEAD_SNAP_OFF)
-
 #: exe の隣の ``scripts`` に自分で置いた物の扱い :attr:`Preferences.scripts_move` の値
 #: 自動で移す・移すかを尋ねる・何もしない
 SCRIPTS_MOVE_AUTO = "auto"
@@ -202,6 +191,11 @@ SCRIPTS_MOVE_MODES = (SCRIPTS_MOVE_AUTO, SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF)
 #: 今の値の対応 分けない（``first``）を選んでいた人は、音声が 1 本の動画も分けない側へ写す
 #: 読まないと、分けないと決めていた人の置き方が黙って分ける側へ変わる
 _LEGACY_MULTI_AUDIO = {"split": MEDIA_SPLIT, "first": MEDIA_TOGETHER}
+
+#: 0.2.1 まで（#278）の再生ヘッドの吸い付き方（3 択の言葉）と、今の入切の対応（#313）
+#: 「常に」は入、「吸い付かない」は切 「Shift の間だけ」は入切のどちらでもないので
+#: ここに書かず、今の既定へ戻す 読まないと、切っていた人のところで黙って吸い付き始める
+_LEGACY_PLAYHEAD_SNAP = {"always": True, "off": False}
 
 #: プレビューの画質を自動で落とし始める縦の画素数
 #: 1080p までは等倍で 60fps に入るので、落とす値打ちが無い
@@ -397,11 +391,13 @@ class Preferences:
     #: タイムラインの磁石とは別に切れる（利用者の要望） 既定は入 知らない人ほど中央へ
     #: 揃えにくい 1 画素ずつ自由に置きたい人は切る（Shift で一時的にも）
     preview_snap: bool = True
-    #: 目盛りで再生ヘッドを動かすときの吸い付き方（Issue #278） 距離は上の ``snap_distance``
-    #: 既定は Shift を押している間だけ吸い付く（Premiere Pro と同じ） 再生ヘッドは 1 コマずつ
-    #: 自由に動かすことの方が多く、常に吸い付くと知らない人はクリップの端の近くで合わせられない
-    #: クリップの磁石（Shift で外す）と向きを揃えたい人は「常に」、要らない人は切れる
-    playhead_snap: str = PLAYHEAD_SNAP_SHIFT
+    #: 目盛りで再生ヘッドを動かすときに、近くの先へ吸い付くか（#278 #313） 距離は上の
+    #: ``snap_distance`` タイムラインの上の〔磁石〕の隣のボタンと同じ物で、〔磁石〕とは別に切れる
+    #: 既定は入（利用者の決定 「磁石のように」） 前は Shift を押している間だけ吸い付く既定に
+    #: していたが、Shift を押してから目盛りを押すと書き出し範囲のドラッグになるので、知らない
+    #: 人には吸い付かせ方が分からなかった 入でも掴んだ後に Shift を押している間は外れ、
+    #: 吸い付く距離（8 画素）の外では自由に動く 1 コマずつ合わせたい人はボタンで切る
+    playhead_snap: bool = True
     #: 再生ヘッドが吸い付く先 クリップの頭と終わり・キーフレームのコマ・書き出し範囲の端・
     #: 目印（マーカー） 既定はクリップの磁石と同じ先で、目印は切 いまのタイムラインは目印を
     #: 描かないので、見えない所で引っ掛かったように見える
@@ -656,9 +652,7 @@ class PreferenceStore:
             timeline_snap=_flag(data.get("timeline_snap"), plain.timeline_snap),
             snap_distance=_snap_distance(data.get("snap_distance"), plain.snap_distance),
             preview_snap=_flag(data.get("preview_snap"), plain.preview_snap),
-            playhead_snap=_choice(
-                data.get("playhead_snap"), PLAYHEAD_SNAP_MODES, plain.playhead_snap
-            ),
+            playhead_snap=_playhead_snap(data.get("playhead_snap"), plain.playhead_snap),
             playhead_snap_clips=_flag(data.get("playhead_snap_clips"), plain.playhead_snap_clips),
             playhead_snap_keyframes=_flag(
                 data.get("playhead_snap_keyframes"), plain.playhead_snap_keyframes
@@ -795,6 +789,15 @@ def _detail_min_width(value: object, default: int) -> int:
 
 def _flag(value: object, default: bool) -> bool:
     return value if isinstance(value, bool) else default
+
+
+def _playhead_snap(value: object, default: bool) -> bool:
+    """再生ヘッドの吸い付きの入切 前の版の 3 択の言葉も読む（:data:`_LEGACY_PLAYHEAD_SNAP`）"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _LEGACY_PLAYHEAD_SNAP.get(value, default)
+    return default
 
 
 def _choice(value: object, choices: tuple[str, ...], default: str) -> str:

@@ -2,14 +2,15 @@
 
 置いてあるもの:
 
-=================  ==========================================================
-``logo.svg``       ロゴの印だけ README や紹介ページ用
-``icon.svg``       角丸の地に印を載せたもの アプリのアイコンの原本
-``sashimono.ico``  ``icon.svg`` から作った Windows 用（16〜256 の 7 サイズ）
-``spin_*.svg``     数値欄の増減ボタンの矢印 ``_off`` は押せないとき
-``magnet*.svg``    タイムラインの磁石（吸着）の入り切りの印 ``_off`` は切のとき
-``*_light.svg``    上の 2 つの明るいテーマ用 暗いテーマ用の白に近い色は明るい地に溶ける
-=================  ==========================================================
+======================  =====================================================
+``logo.svg``            ロゴの印だけ README や紹介ページ用
+``icon.svg``            角丸の地に印を載せたもの アプリのアイコンの原本
+``sashimono.ico``       ``icon.svg`` から作った Windows 用（16〜256 の 7 サイズ）
+``spin_*.svg``          数値欄の増減ボタンの矢印 ``_off`` は押せないとき
+``magnet*.svg``         タイムラインの磁石（吸着）の入り切りの印 ``_off`` は切のとき
+``playhead_snap*.svg``  再生ヘッドの吸い付きの入り切りの印 ``_off`` は切のとき
+``*_light.svg``         上の 3 つの明るいテーマ用 暗いテーマ用の白に近い色は明るい地に溶ける
+======================  =====================================================
 
 ``.ico`` と PNG は ``tools/build_icon.py`` が SVG から作る **原本は SVG だけ**
 なので、形を直すときは SVG を触って作り直す
@@ -29,6 +30,8 @@ __all__ = [
     "LOGO_FILE",
     "MAGNET_ICONS",
     "MAGNET_ICONS_LIGHT",
+    "PLAYHEAD_SNAP_ICONS",
+    "PLAYHEAD_SNAP_ICONS_LIGHT",
     "SPIN_ARROWS",
     "SPIN_ARROWS_LIGHT",
     "path_to",
@@ -65,6 +68,13 @@ SPIN_ARROWS_LIGHT = (
 #: 明るいテーマの磁石の印 並びは :data:`MAGNET_ICONS` と同じ
 MAGNET_ICONS_LIGHT = ("magnet_light.svg", "magnet_off_light.svg")
 
+#: 再生ヘッドの吸い付きのボタンの印 ``(入, 切)`` 〔磁石〕の隣に並ぶので、磁石とは別の形
+#: （再生ヘッドとクリップの端）にする 同じ形だと、どちらを押したのか分からない
+PLAYHEAD_SNAP_ICONS = ("playhead_snap.svg", "playhead_snap_off.svg")
+
+#: 明るいテーマの再生ヘッドの吸い付きの印 並びは :data:`PLAYHEAD_SNAP_ICONS` と同じ
+PLAYHEAD_SNAP_ICONS_LIGHT = ("playhead_snap_light.svg", "playhead_snap_off_light.svg")
+
 #: 配る版に入っていなければならない素材 自己診断（``--self-check``）が揃っているかを見る
 #: 組み立てで積み忘れると、ボタンの印が黙って消える
 BUNDLED_FILES = (
@@ -74,4 +84,6 @@ BUNDLED_FILES = (
     *SPIN_ARROWS_LIGHT,
     *MAGNET_ICONS,
     *MAGNET_ICONS_LIGHT,
+    *PLAYHEAD_SNAP_ICONS,
+    *PLAYHEAD_SNAP_ICONS_LIGHT,
 )
