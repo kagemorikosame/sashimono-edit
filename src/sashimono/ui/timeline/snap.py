@@ -6,8 +6,8 @@
 - キーフレームのコマと、書き出し範囲の端
 
 目盛りで再生ヘッドを動かすときも同じ先へ吸い付く（Issue #278） ただし再生位置そのものは
-先に入れない 自分の位置へ吸い付くと、動かし始めた所から離れられない どの先へ吸い付くかと、
-Shift で入れるか外すかは好みが分かれるので設定に持つ（:class:`PlayheadSnap`）
+先に入れない 自分の位置へ吸い付くと、動かし始めた所から離れられない 入り切りは〔磁石〕の
+隣のボタン（#313）、どの先へ吸い付くかは設定に持つ（:class:`PlayheadSnap`）
 
 画面（ウィジェット）から切り離してある 窓を作らずに試験で押さえるため 吸い付く距離は
 画面の画素で決め、フレームへ直すのは呼ぶ側の倍率で行う（拡大しても縮小しても、指で
@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from sashimono.core.model import ClipId, Project
 from sashimono.ui.timeline.keyframes import keyframe_frames
 
-# 吸い付き方の値は設定（workspace）が持つ 設定の側からこのパッケージを読むと、パッケージの
+# 設定（workspace）はこちらから読む 設定の側からこのパッケージを読むと、パッケージの
 # 頭がタイムラインの画面を読み、画面がまた設定を読んで、読み終わる前の設定を引いて落ちる
-from sashimono.ui.workspace import PLAYHEAD_SNAP_SHIFT, Preferences
+from sashimono.ui.workspace import Preferences
 
 __all__ = [
     "DEFAULT_SNAP_DISTANCE",
@@ -41,14 +41,16 @@ DEFAULT_SNAP_DISTANCE = 8
 
 @dataclass(frozen=True, slots=True)
 class PlayheadSnap:
-    """目盛りで再生ヘッドを動かすときの吸い付き方と、吸い付く先
+    """目盛りで再生ヘッドを動かすときに吸い付くか（``enabled``）と、吸い付く先
 
-    既定はクリップの磁石と同じ先から再生位置を除いた物 目印（マーカー）は既定で入れない
-    いまのタイムラインは目印を描かないので、見えない所へ吸い付くと、知らない人には
+    ``enabled`` は〔磁石〕の隣のボタン 入なら何も押さずに吸い付き、掴んだ後に Shift を
+    押している間は外す（クリップの磁石と同じ向き） 〔磁石〕の入切には左右されない
+    吸い付く先の既定はクリップの磁石と同じ先から再生位置を除いた物 目印（マーカー）は既定で
+    入れない いまのタイムラインは目印を描かないので、見えない所へ吸い付くと、知らない人には
     何も無い所で引っ掛かったように見える
     """
 
-    mode: str = PLAYHEAD_SNAP_SHIFT
+    enabled: bool = True
     clip_edges: bool = True
     keyframes: bool = True
     work_area: bool = True
@@ -58,7 +60,7 @@ class PlayheadSnap:
     def from_preferences(cls, preferences: Preferences) -> PlayheadSnap:
         """設定から作る 起動のときと設定を変えたときの 2 か所で同じ物を作るため"""
         return cls(
-            mode=preferences.playhead_snap,
+            enabled=preferences.playhead_snap,
             clip_edges=preferences.playhead_snap_clips,
             keyframes=preferences.playhead_snap_keyframes,
             work_area=preferences.playhead_snap_work_area,

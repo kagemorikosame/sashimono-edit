@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 再生ヘッドの吸い付きが入のときの印 左に再生ヘッド（五角の頭と縦の線）、右にクリップの端の
+       縦の帯、間に端へ向かう矢印 〔磁石〕の U の字と並べても見分けが付く形にする
+       色はアクセント（#7f8cf0）と、暗い地で見える白に近い色 -->
+  <path d="M2 3 H10 V8 L6 12 L2 8 Z" fill="#7f8cf0"/>
+  <rect x="5" y="11" width="2" height="10" fill="#7f8cf0"/>
+  <rect x="18" y="3" width="4" height="18" fill="#e8eefc"/>
+  <rect x="9" y="15" width="5" height="2" fill="#7f8cf0"/>
+  <path d="M13 12 L17 16 L13 20 Z" fill="#7f8cf0"/>
+</svg>

@@ -139,7 +139,7 @@ from sashimono.ui.timeline.track_name import TrackNameEditor
 from sashimono.ui.timeline.value_line import ValueGrab, ValueLineEditor
 from sashimono.ui.timeline.work_area import WorkAreaEditor
 from sashimono.ui.timeline.zoom_scrollbar import ZoomScrollBar
-from sashimono.ui.workspace import DETAIL_MIN_WIDTHS, PLAYHEAD_SNAP_ALWAYS, PLAYHEAD_SNAP_SHIFT
+from sashimono.ui.workspace import DETAIL_MIN_WIDTHS
 
 __all__ = ["TimelineArea", "TimelineView"]
 
@@ -1272,7 +1272,7 @@ class TimelineView(QWidget):
         if position.y() < Metrics.RULER_HEIGHT:
             self._drag = DragState(kind=DragKind.PLAYHEAD)
             # 押したときのキーで吸い付きを決める 前のマウスの動きで覚えたキーが残っていると、
-            # 離した Shift で吸い付いてしまう
+            # 離した Shift で吸い付きが外れてしまう
             self._drag_modifiers = event.modifiers()
             self._scrub(position)
             return
@@ -1523,9 +1523,13 @@ class TimelineView(QWidget):
         self._snap_cache = None
 
     def set_playhead_snap(self, settings: PlayheadSnap) -> None:
-        """目盛りで再生ヘッドを動かすときの吸い付き方と吸い付く先 設定から"""
+        """目盛りで再生ヘッドを動かすときに吸い付くかと吸い付く先 ボタンと設定から"""
         self._playhead_snap = settings
         self._playhead_snap_cache = None
+
+    @property
+    def playhead_snap(self) -> PlayheadSnap:
+        return self._playhead_snap
 
     @property
     def snap_enabled(self) -> bool:
@@ -1534,28 +1538,20 @@ class TimelineView(QWidget):
     def _playhead_snap_shift(self, frame: int) -> int:
         """目盛りで動かしている再生ヘッドを、近くの吸い付く先へずらす量 吸い付かなければ 0
 
-        Shift の向きはクリップの磁石と逆で、既定は押している間だけ吸い付く（Premiere Pro と
-        同じ） 再生ヘッドは 1 コマずつ自由に動かすことの方が多く、常に吸い付くと
-        クリップの端の近くで細かく合わせられない 押す前から Shift を押していると目盛りの
-        押下は書き出し範囲のドラッグになるので、ここへ来るのは掴んでから押したときだけ
+        入り切りは〔磁石〕の隣のボタン（#313） 入なら何も押さずに吸い付き、Shift を押している
+        間は外す（クリップの磁石と同じ向き） 前は Shift を押している間だけ吸い付く既定だったが、
+        押してから目盛りを押すと書き出し範囲のドラッグになるので、吸い付かせ方が分からなかった
+        ここへ来る Shift は掴んでから押した物だけ
+
+        〔磁石〕（``_snap_enabled``）は見ない 別のボタンにしたので、片方を切ったらもう片方まで
+        止まると、押していないボタンが効いたように見える
 
         キーはマウスの知らせが運んだ物だけを見る（``QApplication.keyboardModifiers`` は
         混ぜない） 日本語入力や別の窓で押した Shift をアプリが覚えたまま残すことがあり、
-        押していないのに吸い付く
+        押していないのに吸い付きが外れる
         """
-        settings = self._playhead_snap
         held = bool(self._drag_modifiers & Qt.KeyboardModifier.ShiftModifier)
-        if settings.mode == PLAYHEAD_SNAP_SHIFT:
-            # 磁石のボタンを切っていても効かせる Shift を押すのは、いま吸い付かせたいと
-            # 本人が言ったのと同じ ボタンは何もしないときの動き（常に吸い付くか）を決める物
-            wanted = held
-        elif settings.mode == PLAYHEAD_SNAP_ALWAYS:
-            # 常に吸い付く側は、クリップの磁石と同じく〔磁石〕のボタンで切れる 切っても
-            # 吸い付くと、ボタンを押した意味が無い
-            wanted = self._snap_enabled and not held
-        else:
-            wanted = False
-        if not wanted:
+        if not self._playhead_snap.enabled or held:
             return 0
         found = nearest_snap(
             (frame,), self._playhead_targets(), self._snap_distance / self._layout.pixels_per_frame

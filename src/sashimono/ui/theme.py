@@ -29,6 +29,8 @@ from sashimono.core.commands.edit import DEFAULT_TRACK_HEIGHT, MAX_TRACK_HEIGHT,
 from sashimono.resources import (
     MAGNET_ICONS,
     MAGNET_ICONS_LIGHT,
+    PLAYHEAD_SNAP_ICONS,
+    PLAYHEAD_SNAP_ICONS_LIGHT,
     SPIN_ARROWS,
     SPIN_ARROWS_LIGHT,
     path_to,
@@ -47,6 +49,7 @@ __all__ = [
     "current_theme",
     "follow_system",
     "magnet_icons",
+    "playhead_snap_icons",
     "resolve_theme",
     "style_sheet",
     "theme_signals",
@@ -321,6 +324,11 @@ def _url(name: str) -> str:
 def magnet_icons() -> tuple[str, str]:
     """いまのテーマの磁石の印 ``(入, 切)`` の同梱素材の名前"""
     return MAGNET_ICONS_LIGHT if _current == THEME_LIGHT else MAGNET_ICONS
+
+
+def playhead_snap_icons() -> tuple[str, str]:
+    """いまのテーマの再生ヘッドの吸い付きの印 ``(入, 切)`` の同梱素材の名前"""
+    return PLAYHEAD_SNAP_ICONS_LIGHT if _current == THEME_LIGHT else PLAYHEAD_SNAP_ICONS
 
 
 def _spin_box() -> str:
