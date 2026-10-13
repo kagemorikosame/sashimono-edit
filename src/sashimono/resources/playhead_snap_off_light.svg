@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 明るいテーマで再生ヘッドの吸い付きが切のときの印 入の印と同じ形を灰色で
+       明るい地との差が残る濃さにする -->
+  <path d="M2 3 H10 V8 L6 12 L2 8 Z" fill="#a6a6ae"/>
+  <rect x="5" y="11" width="2" height="10" fill="#a6a6ae"/>
+  <rect x="18" y="3" width="4" height="18" fill="#74747d"/>
+  <rect x="9" y="15" width="5" height="2" fill="#a6a6ae"/>
+  <path d="M13 12 L17 16 L13 20 Z" fill="#a6a6ae"/>
+</svg>

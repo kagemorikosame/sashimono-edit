@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 再生ヘッドの吸い付きが切のときの印 入の印と同じ形を薄い灰色で -->
+  <path d="M2 3 H10 V8 L6 12 L2 8 Z" fill="#5a5a62"/>
+  <rect x="5" y="11" width="2" height="10" fill="#5a5a62"/>
+  <rect x="18" y="3" width="4" height="18" fill="#8b8b93"/>
+  <rect x="9" y="15" width="5" height="2" fill="#5a5a62"/>
+  <path d="M13 12 L17 16 L13 20 Z" fill="#5a5a62"/>
+</svg>

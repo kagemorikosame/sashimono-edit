@@ -22,7 +22,7 @@ from types import ModuleType
 import pytest
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QLabel, QTreeWidget, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QTreeWidget, QWidget
 
 from sashimono.asr import environment
 from sashimono.asr.service import TranscriptionService
@@ -337,6 +337,35 @@ class TestIsolation:
         for name in names:
             assert Path(os.environ[name]).is_relative_to(base), name
         assert Path(tempfile.gettempdir()).is_relative_to(base)
+
+    def test_the_preferences_shot_hides_the_work_folder(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """設定の窓の置き場の欄に、作業用のフォルダではなく ``%LOCALAPPDATA%`` の形を出す
+
+        出したままだと、撮るたびに名前の変わる ``J:\\sashimono-shots-…`` が README の
+        写真に写り、読む人の機械では出ない場所に見える（#313 の PR で写った）
+        """
+        del qt_application
+        work = tmp_path / "sashimono-shots-撮るたびに変わる"
+        monkeypatch.setenv("LOCALAPPDATA", str(work / "local"))
+        monkeypatch.setenv("APPDATA", str(work / "roaming"))
+        dialog = shots._full_preferences()
+        try:
+            shown = [
+                text
+                for box in dialog.findChildren(QLineEdit)
+                for text in (box.text(), box.placeholderText())
+            ]
+        finally:
+            dialog.close()
+        assert not [text for text in shown if work.name in text]
+        # 置き換えただけで既定の表示が消えると、置き場の欄が空に見えて何が既定か分からない
+        assert any(text.startswith("既定（%LOCALAPPDATA%") for text in shown)
 
 
 class TestMarking:

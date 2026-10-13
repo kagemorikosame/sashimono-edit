@@ -1101,11 +1101,42 @@ def _full_preferences() -> PreferencesDialog:
     変わらないよう、中身の高さまで伸ばしてから撮る
     """
     dialog = PreferencesDialog(Preferences())
+    hide_work_folder(dialog)
     area = dialog.findChild(QScrollArea)
     if area is not None and area.widget() is not None:
         body = area.widget()
         dialog.resize(dialog.width(), body.sizeHint().height() + 64)
     return dialog
+
+
+#: 作業用のフォルダへ向けた置き場と、写真に出す書き方 長い（深い）物から順に当てる
+#: ホームの下に置き場があるときに、先にホームを当てると %USERPROFILE%\AppData\Local の
+#: ように本人の機械と違う書き方になる
+_WORK_FOLDER_NAMES = ("LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "TEMP", "USERPROFILE")
+
+
+def hide_work_folder(widget: QWidget) -> None:
+    """欄の文字と空のときの薄い文字の中の作業用のフォルダを ``%LOCALAPPDATA%`` などへ書き換える
+
+    設定の窓の「退避とバックアップの置き場」は空のとき既定の置き場を薄く出す 置き場は
+    作業用のフォルダ（名前は撮るたびに変わる）へ向けてあるので、そのまま撮ると
+    ``J:\\sashimono-shots-…`` が写り、読む人の機械では出ない場所に見える 本人の機械で
+    出る場所を、名前を伏せた書き方で見せる
+    """
+    roots = sorted(
+        ((os.environ[name], f"%{name}%") for name in _WORK_FOLDER_NAMES if os.environ.get(name)),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+
+    def hidden(text: str) -> str:
+        for folder, shown in roots:
+            text = text.replace(folder, shown)
+        return text
+
+    for box in widget.findChildren(QLineEdit):
+        box.setText(hidden(box.text()))
+        box.setPlaceholderText(hidden(box.placeholderText()))
 
 
 def compatibility_dialog(context: Context) -> CompatibilityDialog:

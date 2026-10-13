@@ -57,9 +57,6 @@ from sashimono.ui.workspace import (
     INSERT_TARGET_TRACKS,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
-    PLAYHEAD_SNAP_ALWAYS,
-    PLAYHEAD_SNAP_OFF,
-    PLAYHEAD_SNAP_SHIFT,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -77,14 +74,6 @@ __all__ = [
     "QUALITY_DIVISORS",
     "PreferencesDialog",
 ]
-
-#: 目盛りで再生ヘッドを動かすときの吸い付き方の名前 Shift の向きがクリップの磁石と
-#: 逆になるので、名前に Shift で何が起きるかまで書く
-PLAYHEAD_SNAP_CHOICES: tuple[tuple[str, str], ...] = (
-    (PLAYHEAD_SNAP_SHIFT, "Shift を押している間だけ吸い付く（既定）"),
-    (PLAYHEAD_SNAP_ALWAYS, "常に吸い付き、Shift を押している間は外す"),
-    (PLAYHEAD_SNAP_OFF, "吸い付かない"),
-)
 
 #: 控えの大きさ 小さいほど軽いが、文字の読みやすさが落ちる
 PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
@@ -517,8 +506,7 @@ class PreferencesDialog(QDialog):
             "クリップを動かす・端を伸び縮みさせる・置くときに、ほかのクリップの頭と終わり・"
             "再生位置・キーフレーム・書き出し範囲の端へ吸い付く タイムラインの上の〔磁石〕と同じ "
             "動かしている途中で Shift を押している間は吸い付かない "
-            "目盛りで再生ヘッドを動かすときは下の「再生ヘッドの吸い付き」に従う"
-            "（既定では Shift の向きが逆で、押している間だけ吸い付く）"
+            "目盛りで再生ヘッドを動かすときは下の「再生ヘッドの吸い付き」に従う（こちらとは別）"
         )
         form.addRow(self._timeline_snap)
         self._snap_distance = QSpinBox(self)
@@ -535,17 +523,15 @@ class PreferencesDialog(QDialog):
             "動かしている途中で Shift を押している間は吸い付かない"
         )
         form.addRow(self._preview_snap)
-        self._playhead_snap = QComboBox(self)
-        for value, text in PLAYHEAD_SNAP_CHOICES:
-            self._playhead_snap.addItem(text, value)
-        self._playhead_snap.setCurrentIndex(
-            max(0, self._playhead_snap.findData(preferences.playhead_snap))
-        )
+        # タイムラインの上の〔磁石〕の隣のボタンと同じ入切（#313） 前は 3 択だったが、
+        # ボタンと二重になるので入切 1 つに寄せた どちらで変えても、もう片方がそろう
+        self._playhead_snap = QCheckBox("目盛りで再生ヘッドを動かすときに吸い付く", self)
+        self._playhead_snap.setChecked(preferences.playhead_snap)
         self._playhead_snap.setToolTip(
-            "目盛りで再生ヘッドをドラッグするときに、近くのクリップの端などへ吸い付くか "
-            "Shift はドラッグを始めてから押す（押してから目盛りを押すと書き出し範囲の指定になる） "
-            "「Shift の間だけ」は〔磁石〕を切っていても効き、「常に」は〔磁石〕を切ると止まる "
-            "距離は上の「吸い付く距離」"
+            "目盛りで再生ヘッドをドラッグするときに、近くのクリップの端などへ吸い付く "
+            "タイムラインの上の〔磁石〕の隣のボタンと同じ 〔磁石〕とは別に入り切りする "
+            "ドラッグを始めてから Shift を押している間は外す（押してから目盛りを押すと"
+            "書き出し範囲の指定になる） 距離は上の「吸い付く距離」"
         )
         form.addRow("再生ヘッドの吸い付き", self._playhead_snap)
         # 吸い付く先は 1 行に並べる 4 行に分けると、設定の窓が縦に伸びて狭い画面で欠ける
@@ -573,7 +559,7 @@ class PreferencesDialog(QDialog):
         for box in self._playhead_snap_targets:
             target_row.addWidget(box)
         form.addRow("再生ヘッドの吸い付く先", targets)
-        self._playhead_snap.currentIndexChanged.connect(self._show_playhead_snap_targets)
+        self._playhead_snap.toggled.connect(self._show_playhead_snap_targets)
         self._show_playhead_snap_targets()
         self._insert_paste = QComboBox(self)
         self._insert_paste.addItem("全トラック（既定）", INSERT_ALL_TRACKS)
@@ -834,9 +820,9 @@ class PreferencesDialog(QDialog):
         choice = find_model(str(self._ai_model.currentData()))
         self._ai_effort.setEnabled(choice is None or choice.effort)
 
-    def _show_playhead_snap_targets(self) -> None:
-        """吸い付かないを選んだら、吸い付く先を触れなくする 選んでも何も変わらない欄を残さない"""
-        active = self._playhead_snap.currentData() != PLAYHEAD_SNAP_OFF
+    def _show_playhead_snap_targets(self, _checked: bool = False) -> None:
+        """吸い付きを切ったら、吸い付く先を触れなくする 選んでも何も変わらない欄を残さない"""
+        active = self._playhead_snap.isChecked()
         for box in self._playhead_snap_targets:
             box.setEnabled(active)
 
@@ -898,7 +884,7 @@ class PreferencesDialog(QDialog):
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
             preview_snap=self._preview_snap.isChecked(),
-            playhead_snap=str(self._playhead_snap.currentData()),
+            playhead_snap=self._playhead_snap.isChecked(),
             playhead_snap_clips=self._playhead_snap_clips.isChecked(),
             playhead_snap_keyframes=self._playhead_snap_keyframes.isChecked(),
             playhead_snap_work_area=self._playhead_snap_work_area.isChecked(),

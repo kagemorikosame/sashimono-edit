@@ -28,7 +28,14 @@ from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
-from sashimono.resources import MAGNET_ICONS, MAGNET_ICONS_LIGHT, SPIN_ARROWS_LIGHT, path_to
+from sashimono.resources import (
+    MAGNET_ICONS,
+    MAGNET_ICONS_LIGHT,
+    PLAYHEAD_SNAP_ICONS,
+    PLAYHEAD_SNAP_ICONS_LIGHT,
+    SPIN_ARROWS_LIGHT,
+    path_to,
+)
 from sashimono.ui.inspector.panel import _lock_label
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -45,6 +52,7 @@ from sashimono.ui.theme import (
     current_theme,
     follow_system,
     magnet_icons,
+    playhead_snap_icons,
     resolve_theme,
     theme_signals,
     themed_style,
@@ -205,9 +213,11 @@ class TestSwitching:
             # 暗いテーマの白に近い矢印が残ると、数値欄の増減ボタンが見えない
             assert path_to(SPIN_ARROWS_LIGHT[0]).as_posix() in sheet
             assert magnet_icons() == MAGNET_ICONS_LIGHT
+            assert playhead_snap_icons() == PLAYHEAD_SNAP_ICONS_LIGHT
             apply_theme(qt_application, THEME_DARK)
             assert PALETTES[THEME_DARK]["TEXT_MUTED"].name() in label.styleSheet()
             assert magnet_icons() == MAGNET_ICONS
+            assert playhead_snap_icons() == PLAYHEAD_SNAP_ICONS
         finally:
             shiboken6.delete(label)
 
@@ -340,8 +350,13 @@ class TestPaintedParts:
             theme_signals().changed.emit()
             assert pool._audio_icon is not before
             accent = PALETTES[THEME_LIGHT]["ACCENT"].name()
-            icon = scenes._snap_button.icon().pixmap(48, 48).toImage()
+            icon = scenes.snap_button.icon().pixmap(48, 48).toImage()
             assert accent in _opaque(icon)
+            # 再生ヘッドの吸い付きの印も明るいテーマの絵へ替わる 替わらないと、白に近い
+            # クリップの端の帯が明るい地に溶ける（#313）
+            playhead = _opaque(scenes.playhead_snap_button.icon().pixmap(48, 48).toImage())
+            assert accent in playhead
+            assert "#23232b" in playhead
             body = PALETTES[THEME_LIGHT]["AUDIO_CLIP"].name()
             assert body in _colors(pool._audio_icon.pixmap(128, 72).toImage(), 1)
         finally:
@@ -440,6 +455,6 @@ def test_the_light_arrows_and_magnets_are_shipped() -> None:
     # 配る版に積み忘れると、明るいテーマで数値欄の矢印と磁石の印が黙って消える
     from sashimono.resources import BUNDLED_FILES
 
-    for name in (*SPIN_ARROWS_LIGHT, *MAGNET_ICONS_LIGHT):
+    for name in (*SPIN_ARROWS_LIGHT, *MAGNET_ICONS_LIGHT, *PLAYHEAD_SNAP_ICONS_LIGHT):
         assert name in BUNDLED_FILES
         assert path_to(name).is_file()
