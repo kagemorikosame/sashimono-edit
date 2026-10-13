@@ -6,10 +6,11 @@
 
 ## English
 
-Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+Planned: free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-> Status: the project has applied to the SignPath Foundation and is waiting for the review.
-> Releases up to and including 0.2.1 are **not** signed.
+> Status: the SignPath Foundation did not approve the first application (October 2026) because the
+> project is not yet widely known. We plan to apply again once it has gained broader recognition.
+> Releases up to and including 0.2.2 are **not** signed.
 > This page will be updated when signed releases begin.
 
 ### What is signed
@@ -88,11 +89,12 @@ computer and does not connect.
 
 ## 日本語
 
-Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+Planned: free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-（SignPath.io の無料のコード署名を使い、証明書は SignPath Foundation が持つ）
+（予定 SignPath.io の無料のコード署名を使い、証明書は SignPath Foundation が持つ）
 
-> いまは SignPath Foundation へ申し込み、審査を待っている 0.2.1 までの版は署名していない
+> 最初の申し込み（2026 年 10 月）は、まだ広く知られていないという理由で SignPath Foundation に通らなかった
+> 知られるようになったら申し込み直す 0.2.2 までの版は署名していない
 > 署名した版を出し始めたら、このページを直す
 
 ### 署名する物

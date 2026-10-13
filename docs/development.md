@@ -2446,7 +2446,7 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 
 ### コード署名の方針と、通信する所の一覧
 
-配る exe には SignPath Foundation の無料のコード署名を使う予定（Issue #255）
+配る exe には SignPath Foundation の無料のコード署名を使う予定（Issue #255） 最初の申し込みは、まだ広く知られていないという理由で通らなかった（2026-10） 知られるようになったら申し込み直すので、方針のページと通信の表はこのまま保つ
 条件として [docs/code-signing-policy.md](code-signing-policy.md) を公開する（決まった文言・役割・
 個人情報の扱い Wiki にも同じ物を写す） 審査は英語なので英語の節が大本で、日本語の節をそろえる
 
