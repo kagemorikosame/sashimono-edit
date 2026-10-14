@@ -194,19 +194,26 @@ class TestAppSettingsAreReadOnly:
 
 
 def _symlink_dir(link: Path, target: Path) -> None:
-    """フォルダへのリンクを作る Windows で権限が無ければジャンクションにする"""
+    """フォルダへのリンクを作る Windows で権限が無ければジャンクションにする
+
+    どちらも作れない所（リンクを禁じたファイルシステムなど）では試験を飛ばす 抜け道の
+    確かめは作れる所で走らせる ジャンクションは権限なしで作れるので、CI の Windows では走る
+    """
     try:
         link.symlink_to(target, target_is_directory=True)
         return
-    except OSError:
+    except OSError as exc:
         if sys.platform != "win32":
-            raise
-    subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-        check=True,
-        capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+            pytest.skip(f"フォルダへのリンクを作れない: {exc}")
+    try:
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"フォルダへのリンクもジャンクションも作れない: {exc}")
 
 
 class TestWritablePlaces:
@@ -425,6 +432,13 @@ class TestIrreversibleIsAlwaysConfirmed:
         inside.mkdir()
         outside = tmp_path / "外"
         outside.mkdir()
+        # リンクを作れるかを先に試す 確かめに答える途中で飛ばすと、AI 役のスレッドが残る
+        probe = tmp_path / "試し"
+        _symlink_dir(probe, outside)
+        if probe.is_symlink():
+            probe.unlink()
+        else:
+            probe.rmdir()
         bridge = EditorBridge(saved)
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(inside / "メモ.txt")})
 
