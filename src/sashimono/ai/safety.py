@@ -145,7 +145,7 @@ def check_writable(
             " ほかの場所へは、人がファイルの窓で選んで保存してもらってください"
         )
     for original in protected:
-        if _same(resolved, original.resolve()):
+        if _same(resolved, original.resolve()) or _same_file(resolved, original):
             # 元の素材は作品の外の物 上書きすると、取り消しても戻らない（#341）
             raise ToolError(f"元の素材のファイルには書けません: {resolved}")
     if resolved.is_dir():
@@ -175,3 +175,16 @@ def _inside(path: Path, root: Path) -> bool:
 
 def _same(left: Path, right: Path) -> bool:
     return _key(left) == _key(right)
+
+
+def _same_file(path: Path, original: Path) -> bool:
+    """中身が同じファイルか（ファイルの ID で比べる）
+
+    場所の文字だけで比べると、元の素材へのハードリンクを別のファイルと見なし、
+    書くと元の素材の中身を上書きする リンクは :meth:`Path.resolve` でも辿れない
+    どちらかがまだ無い（新しく作るファイル・オフラインの素材）なら、同じではない
+    """
+    try:
+        return path.samefile(original)
+    except OSError:
+        return False

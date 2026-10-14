@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import subprocess
 import sys
 import threading
@@ -216,6 +217,14 @@ def _symlink_dir(link: Path, target: Path) -> None:
         pytest.skip(f"フォルダへのリンクもジャンクションも作れない: {exc}")
 
 
+def _hard_link(link: Path, target: Path) -> None:
+    """ハードリンクを作る 作れない所（FAT など）では試験を飛ばす"""
+    try:
+        os.link(target, link)
+    except OSError as exc:
+        pytest.skip(f"ハードリンクを作れない: {exc}")
+
+
 class TestWritablePlaces:
     def test_the_project_folder_is_writable(self, saved: FakeHost) -> None:
         # 壊れると、作品のフォルダへの保存・書き出しまで断られ、AI が完成まで進めない
@@ -288,6 +297,24 @@ class TestWritablePlaces:
         # 相対の場所で渡しても同じ素材と見なす
         with pytest.raises(ToolError, match="元の素材"):
             writable_path(host, "素材.mp4")
+        assert original.read_bytes() == b"original"
+
+    def test_a_hard_link_to_an_original_is_refused(
+        self, video_media: MediaItem, transcript: Transcript, tmp_path: Path
+    ) -> None:
+        # 壊れると、作品のフォルダに置いた元の素材へのハードリンクへ書き、元の素材の中身を
+        # 上書きする（場所の文字は別なので、文字だけ比べると気付けない）
+        original = tmp_path / "素材置き場" / "素材.mp4"
+        original.parent.mkdir()
+        original.write_bytes(b"original")
+        host = FakeHost(make_loaded(replace(video_media, path=original), transcript))
+        folder = tmp_path / "作品"
+        folder.mkdir()
+        host.saved_at = folder / "作品.sme"
+        link = folder / "別名.mp4"
+        _hard_link(link, original)
+        with pytest.raises(ToolError, match="元の素材"):
+            writable_path(host, str(link))
         assert original.read_bytes() == b"original"
 
     def test_the_check_works_without_a_host(self, tmp_path: Path) -> None:
@@ -450,6 +477,32 @@ class TestIrreversibleIsAlwaysConfirmed:
         answer_approvals(bridge, done, swap_then_allow)
         assert isinstance(box.get("error"), ToolError)
         assert not (outside / "メモ.txt").exists()
+
+    def test_a_hard_link_made_while_asking_is_refused_when_writing(
+        self, video_media: MediaItem, transcript: Transcript, tmp_path: Path
+    ) -> None:
+        # 壊れると、窓が出ている間に書く先を元の素材へのハードリンクに差し替えられ、
+        # 許した後に元の素材の中身を上書きする
+        original = tmp_path / "素材置き場" / "素材.mp4"
+        original.parent.mkdir()
+        original.write_bytes(b"original")
+        host = FakeHost(make_loaded(replace(video_media, path=original), transcript))
+        folder = tmp_path / "作品"
+        folder.mkdir()
+        host.saved_at = folder / "作品.sme"
+        target = folder / "メモ.txt"
+        # 作れるかを先に試す 確かめに答える途中で飛ばすと、AI 役のスレッドが残る
+        _hard_link(tmp_path / "試し", original)
+        bridge = EditorBridge(host)
+        done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target), "text": "壊す"})
+
+        def link_then_allow(_approval: Approval) -> bool:
+            _hard_link(target, original)
+            return True
+
+        answer_approvals(bridge, done, link_then_allow)
+        assert isinstance(box.get("error"), ToolError)
+        assert original.read_bytes() == b"original"
 
     def test_undoable_edits_still_follow_auto_approve(self, host: FakeHost) -> None:
         # 壊れると（全部を毎回確かめると）、自動で承認に任せた人の編集が 1 手ごとに止まる
