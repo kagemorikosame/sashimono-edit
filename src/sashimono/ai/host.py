@@ -186,6 +186,23 @@ class EditorHost(Protocol):
         """
         ...
 
+    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+        """タイムラインの字幕を ``path`` へ書く（#327） 画面の字幕の書き出しと同じ形式と処理
+
+        相手は開いているタイムライン（字幕パネルが見ている物と同じ） ``frame_range`` を
+        渡すと、その範囲だけを頭を 0 にずらして書く ``path`` は確かめ済みの場所
+        （:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
+        """
+        ...
+
+    def write_snapshot(self, path: Path, frame: int) -> int:
+        """``frame`` を画面の〔静止画を保存〕と同じ描き方で PNG にして書く（#327）
+
+        描いたフレームを返す（終わりを指していれば最後のフレーム） ``path`` は確かめ済みの場所
+        書けなければ :class:`ToolError`
+        """
+        ...
+
     def start_export(self, request: ExportRequest) -> None:
         """書き出しを裏で始める（B1 #327） 画面の書き出しの窓と同じ設定の作り方と処理を通す
 

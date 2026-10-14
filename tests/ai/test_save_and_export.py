@@ -32,7 +32,9 @@ from sashimono.ai.safety import Safety
 from sashimono.core.commands import SetWorkArea
 from sashimono.core.io.folder_pin import pin_folder
 from sashimono.core.io.serialize import load_project
+from sashimono.core.io.subtitles import subtitles_in_range, to_srt, to_vtt
 from sashimono.core.model import MediaItem, Transcript
+from sashimono.core.projection import project_timeline
 from sashimono.engine.encode import RANGE_ALL, RANGE_WORK_AREA
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
@@ -415,6 +417,214 @@ class TestExport:
         seen, box = _run(bridge, EXPORT, {"path": "a.mp4"})
         assert seen == []
         assert "空" in str(box.get("error"))
+
+
+# --- 字幕の書き出しと静止画 ---
+
+SUBTITLES = _operation("export_subtitles")
+SNAPSHOT = _operation("save_snapshot")
+
+
+class TestSubtitles:
+    def test_auto_approve_still_asks_and_the_same_srt_as_the_panel_is_written(
+        self, saved: FakeHost
+    ) -> None:
+        # 壊れると、自動で承認の人の字幕のファイルを AI が黙って上書きするか、画面の
+        # 〔書き出し…〕と違う形式の字幕ができる
+        assert saved.saved_at is not None
+        target = saved.saved_at.parent / "字幕.srt"
+        target.write_text("前の字幕", encoding="utf-8")
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SUBTITLES, {"path": str(target)})
+
+        assert len(seen) == 1 and seen[0].irreversible
+        summary = seen[0].summary
+        assert "字幕を書き出します" in summary
+        assert "srt" in summary and "全体" in summary and "3 枚" in summary
+        assert "置き換えます" in summary
+        assert box.get("error") is None
+        expected = to_srt(list(project_timeline(saved.project)), saved.project.rate)
+        assert target.read_text(encoding="utf-8") == expected
+
+    def test_the_range_is_shifted_like_the_panel(self, saved: FakeHost) -> None:
+        # 壊れると、範囲で書き出した動画と AI が書いた字幕が、範囲の頭の分だけずれる
+        assert saved.saved_at is not None
+        saved.apply_commands([SetWorkArea((90, 300))], "範囲")
+        target = saved.saved_at.parent / "字幕.vtt"
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SUBTITLES, {"path": str(target)})
+        assert "指定した範囲" in seen[0].summary
+        assert box.get("result") == {"written": str(target.resolve()), "range": [90, 300]}
+        subtitles = list(subtitles_in_range(project_timeline(saved.project), (90, 300)))
+        assert target.read_text(encoding="utf-8") == to_vtt(subtitles, saved.project.rate)
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            ({"path": "字幕.sme"}, ".srt"),
+            ({"path": "字幕.mp4"}, ".srt"),
+            ({"path": "字幕.srt", "range": RANGE_WORK_AREA}, "範囲"),
+        ],
+    )
+    def test_wrong_choices_are_refused_before_asking(
+        self, saved: FakeHost, arguments: dict[str, Any], message: str
+    ) -> None:
+        # 壊れると、作品や素材の名前で字幕の文字を書くか、人が許しても書けない確かめが出る
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SUBTITLES, arguments)
+        assert seen == []
+        assert message in str(box.get("error"))
+        assert saved.written == []
+
+    def test_outside_and_originals_are_refused(
+        self, video_media: MediaItem, transcript: Transcript, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が人の選んでいない場所や、元の素材（のハードリンク）へ字幕を書く
+        original = tmp_path / "作品" / "素材.srt"
+        original.parent.mkdir()
+        original.write_bytes(b"original")
+        host = FakeHost(make_loaded(replace(video_media, path=original), transcript))
+        host.saved_at = original.parent / "作品.sme"
+        link = original.parent / "別名.srt"
+        _hard_link(link, original)
+        outside = tmp_path / "外"
+        outside.mkdir()
+        bridge = EditorBridge(host, auto_approve=True)
+        for target, message in (
+            (original, "元の素材"),
+            (link, "元の素材"),
+            (outside / "a.srt", "書ける場所の外"),
+        ):
+            seen, box = _run(bridge, SUBTITLES, {"path": str(target)})
+            assert seen == []
+            assert message in str(box.get("error"))
+        assert original.read_bytes() == b"original"
+        assert list(outside.iterdir()) == []
+
+    def test_nothing_to_write_is_refused(self, saved: FakeHost) -> None:
+        # 壊れると、空の字幕のファイルを書くために取り消せない確かめが出る
+        clip = saved.project.timeline.tracks[0].clips[0]
+        _operation("delete_clip")(saved, {"clip_id": str(clip.id)})
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SUBTITLES, {"path": "字幕.srt"})
+        assert seen == []
+        assert "字幕がありません" in str(box.get("error"))
+
+    def test_a_folder_swapped_just_before_writing_is_refused(
+        self, saved: FakeHost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、確かめてから書くまでの間にフォルダをリンクへ差し替えられ、外へ字幕を書く
+        assert saved.saved_at is not None
+        inside = saved.saved_at.parent / "字幕"
+        inside.mkdir()
+        outside = tmp_path / "外"
+        outside.mkdir()
+        _can_link(tmp_path, outside)
+
+        def swap_then_pin(path: Path) -> Any:
+            inside.rmdir()
+            _symlink_dir(inside, outside)
+            return pin_folder(path)
+
+        monkeypatch.setattr(safety, "pin_folder", swap_then_pin)
+        bridge = EditorBridge(saved, auto_approve=True)
+        _seen, box = _run(bridge, SUBTITLES, {"path": str(inside / "a.srt")})
+        assert isinstance(box.get("error"), ToolError)
+        assert list(outside.iterdir()) == []
+
+
+class TestSnapshot:
+    def test_auto_approve_still_asks_and_the_frame_is_saved(self, saved: FakeHost) -> None:
+        # 壊れると、自動で承認の人の絵を AI が黙って上書きするか、頼んだのと違うコマを描く
+        assert saved.saved_at is not None
+        target = saved.saved_at.parent / "表紙.png"
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SNAPSHOT, {"path": str(target), "frame": 45})
+        assert len(seen) == 1 and seen[0].irreversible
+        assert "静止画を保存します" in seen[0].summary and "45 フレーム" in seen[0].summary
+        assert box.get("error") is None
+        assert saved.snapshots == [45]
+        assert target.exists()
+
+    def test_the_end_draws_the_last_frame_like_the_screen(self, saved: FakeHost) -> None:
+        # 壊れると、最後まで再生した所で撮ると何も無い黒の絵になる（画面と食い違う）
+        assert saved.saved_at is not None
+        saved.frame = saved.project.duration
+        bridge = EditorBridge(saved, auto_approve=True)
+        _run(bridge, SNAPSHOT, {"path": str(saved.saved_at.parent / "終わり.png")})
+        assert saved.snapshots == [saved.project.duration - 1]
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            ({"path": "絵.jpg"}, ".png"),
+            ({"path": "作品.sme"}, ".png"),
+            ({"path": "絵.png", "frame": "10"}, "frame"),
+        ],
+    )
+    def test_wrong_choices_are_refused_before_asking(
+        self, saved: FakeHost, arguments: dict[str, Any], message: str
+    ) -> None:
+        # 壊れると、作品や素材の名前で絵を書くか、人が許しても書けない確かめが出る
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, box = _run(bridge, SNAPSHOT, arguments)
+        assert seen == []
+        assert message in str(box.get("error"))
+        assert saved.written == []
+
+    def test_outside_and_originals_are_refused(
+        self, video_media: MediaItem, transcript: Transcript, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が人の選んでいない場所や、元の素材（のハードリンク）へ絵を書く
+        original = tmp_path / "作品" / "素材.png"
+        original.parent.mkdir()
+        original.write_bytes(b"original")
+        host = FakeHost(make_loaded(replace(video_media, path=original), transcript))
+        host.saved_at = original.parent / "作品.sme"
+        link = original.parent / "別名.png"
+        _hard_link(link, original)
+        outside = tmp_path / "外"
+        outside.mkdir()
+        bridge = EditorBridge(host, auto_approve=True)
+        for target, message in (
+            (original, "元の素材"),
+            (link, "元の素材"),
+            (outside / "a.png", "書ける場所の外"),
+        ):
+            seen, box = _run(bridge, SNAPSHOT, {"path": str(target)})
+            assert seen == []
+            assert message in str(box.get("error"))
+        assert original.read_bytes() == b"original"
+        assert host.snapshots == []
+
+    def test_a_hard_link_planted_just_before_writing_is_refused(
+        self,
+        video_media: MediaItem,
+        transcript: Transcript,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、書く直前に書く先の名前を元の素材へのハードリンクにされ、その名前を絵で置き換える
+        original = tmp_path / "素材置き場" / "素材.png"
+        original.parent.mkdir()
+        original.write_bytes(b"original")
+        host = FakeHost(make_loaded(replace(video_media, path=original), transcript))
+        folder = tmp_path / "作品"
+        folder.mkdir()
+        host.saved_at = folder / "作品.sme"
+        target = folder / "表紙.png"
+        _hard_link(tmp_path / "試し", original)
+
+        def link_then_pin(path: Path) -> Any:
+            _hard_link(target, original)
+            return pin_folder(path)
+
+        monkeypatch.setattr(safety, "pin_folder", link_then_pin)
+        bridge = EditorBridge(host, auto_approve=True)
+        _seen, box = _run(bridge, SNAPSHOT, {"path": str(target)})
+        assert "元の素材" in str(box.get("error"))
+        assert target.read_bytes() == b"original"
+        assert host.snapshots == []
 
 
 # --- 長い書き出しを待つ・読む・止める ---

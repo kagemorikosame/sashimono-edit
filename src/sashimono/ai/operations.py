@@ -71,6 +71,7 @@ from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.io.serialize import SUFFIX, json_text
+from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
     AnimatedValue,
@@ -1994,6 +1995,104 @@ def _save_project_as(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"saved": str(path), "project_path": str(host.project_path), "note": note}
 
 
+def _subtitle_plan(
+    host: EditorHost, arguments: dict[str, Any]
+) -> tuple[Path, tuple[int, int] | None, str]:
+    """字幕の書き出しの引数を、画面の字幕パネルの〔書き出し…〕と同じ選び方で確かめる
+
+    相手は字幕パネルと同じく開いているタイムライン 範囲の既定もパネルと同じ（範囲を
+    決めてあれば範囲、無ければ全体） 返すのは書く場所・範囲・確かめに出す中身
+    """
+    raw = arguments.get("path")
+    _require_suffix(raw, SUBTITLE_SUFFIXES, "字幕のファイル")
+    path = writable_path(host, raw)
+    project = _project(host)
+    default_range = RANGE_WORK_AREA if export_range(project.timeline) is not None else RANGE_ALL
+    try:
+        frame_range = chosen_range(project, str(arguments.get("range") or default_range))
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    subtitles = [
+        subtitle
+        for subtitle in (
+            subtitles_in_range(project_timeline(project), frame_range)
+            if frame_range is not None
+            else project_timeline(project)
+        )
+        if subtitle.segment.text.strip()
+    ]
+    if not subtitles:
+        # 空のファイルを書くために取り消せない確かめを出しても、人が判断する物が無い
+        raise ToolError(
+            "書き出す字幕がありません（タイムラインに字幕のクリップが無いか、範囲の外）"
+        )
+    rate = project.rate
+    if frame_range is None:
+        span = "全体"
+    else:
+        start, end = frame_range
+        span = (
+            f"指定した範囲（{format_timecode(start, rate)} 〜 {format_timecode(end, rate)}）"
+            " 範囲の頭を 0 秒にずらす"
+        )
+    parts = [
+        f"形式 {path.suffix.lstrip('.')} / {span} / {len(subtitles)} 枚",
+        _replacing(path, "ファイル"),
+    ]
+    return path, frame_range, "\n".join(part for part in parts if part)
+
+
+def _subtitles_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    path, _range, detail = _subtitle_plan(host, arguments)
+    return Consent(action="字幕を書き出します", target=str(path), detail=detail)
+
+
+def _export_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _path, frame_range, _detail = _subtitle_plan(host, arguments)
+    try:
+        with pinned_place(host, arguments.get("path")) as path:
+            written = host.write_subtitles(path, frame_range=frame_range)
+    except OSError as exc:
+        raise ToolError(f"字幕を書き出せませんでした: {exc}") from exc
+    return {"written": str(written), "range": None if frame_range is None else list(frame_range)}
+
+
+def _snapshot_plan(host: EditorHost, arguments: dict[str, Any]) -> tuple[Path, int, str]:
+    """静止画の引数を確かめる 描くのは画面の〔静止画を保存…〕と同じく開いているタイムライン"""
+    raw = arguments.get("path")
+    _require_suffix(raw, (".png",), "静止画")
+    path = writable_path(host, raw)
+    project = _project(host)
+    if project.duration <= 0:
+        raise ToolError("タイムラインが空なので静止画にできません")
+    raw_frame = arguments.get("frame", host.playhead)
+    if isinstance(raw_frame, bool) or not isinstance(raw_frame, int):
+        raise ToolError("frame はフレーム番号（整数）で渡してください 省くと再生ヘッドの位置")
+    # 画面と同じく、終わり（最後のフレームの 1 つ後ろ）を指していれば最後のフレームを描く
+    frame = max(0, min(raw_frame, project.duration - 1))
+    width, height = project.settings.resolution
+    parts = [
+        f"{format_timecode(frame, project.rate)}（{frame} フレーム）を {width}x{height} の PNG で",
+        _replacing(path, "ファイル"),
+    ]
+    return path, frame, "\n".join(part for part in parts if part)
+
+
+def _snapshot_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    path, _frame, detail = _snapshot_plan(host, arguments)
+    return Consent(action="静止画を保存します", target=str(path), detail=detail)
+
+
+def _save_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _path, frame, _detail = _snapshot_plan(host, arguments)
+    try:
+        with pinned_place(host, arguments.get("path")) as path:
+            drawn = host.write_snapshot(path, frame)
+    except OSError as exc:
+        raise ToolError(f"静止画を保存できませんでした: {exc}") from exc
+    return {"saved": str(path), "frame": drawn}
+
+
 @dataclass(frozen=True, slots=True)
 class Waiting:
     """長い仕事の終わりを、AI のスレッドで待つ印（書き出し #327）
@@ -2945,6 +3044,57 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_cancel_export,
         writes=True,
+    ),
+    Operation(
+        name="export_subtitles",
+        description=(
+            "開いているタイムラインの字幕をファイルへ書き出す（画面の字幕の〔書き出し…〕と同じ"
+            "形式と処理） 毎回ユーザーに確かめる 書けるのは今の作品のフォルダと、書き出しの"
+            "窓で前に選んだフォルダの中だけ"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    "書き出し先 形式は名前の終わりで決まる（"
+                    + " / ".join(SUBTITLE_SUFFIXES)
+                    + "） 相対の場所は今の作品のフォルダから読む"
+                ),
+                "range": {
+                    "type": "string",
+                    "enum": [RANGE_ALL, RANGE_WORK_AREA],
+                    "description": (
+                        f"{RANGE_ALL} は全体を時刻のまま、{RANGE_WORK_AREA} はタイムラインで決めた"
+                        "範囲だけを頭を 0 秒にずらして書く（範囲で書き出した動画に合う）"
+                        " 省くと、範囲があれば範囲、無ければ全体（画面と同じ）"
+                    ),
+                },
+            },
+            ["path"],
+        ),
+        handler=_export_subtitles,
+        writes=True,
+        irreversible=True,
+        consent=_subtitles_consent,
+    ),
+    Operation(
+        name="save_snapshot",
+        description=(
+            "開いているタイムラインの 1 フレームを、プロジェクトの解像度の PNG で保存する"
+            "（画面の〔静止画を保存…〕と同じ描き方） 絵を見るだけなら preview_frame を使う"
+            " 毎回ユーザーに確かめる 書けるのは今の作品のフォルダと、書き出しの窓で前に"
+            "選んだフォルダの中だけ"
+        ),
+        schema=_schema(
+            {
+                "path": _string("保存先（.png で終える） 相対の場所は今の作品のフォルダから読む"),
+                "frame": _integer("描くフレーム 省くと再生ヘッドの位置"),
+            },
+            ["path"],
+        ),
+        handler=_save_snapshot,
+        writes=True,
+        irreversible=True,
+        consent=_snapshot_consent,
     ),
     Operation(
         name=ASK_USER,

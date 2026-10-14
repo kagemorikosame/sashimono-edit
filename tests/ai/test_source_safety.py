@@ -4,9 +4,10 @@
 
 - 変える道具は 35 個 どれも ``host.apply_commands`` か ``Document`` の取り消しを通して
   プロジェクト（メモリの中）だけを変える ファイルへ書く道具は 0 個
-- 2026-10-15 に保存と書き出し（B1 #327）を足した ファイルへ書く道具は 3 個（上書き保存・
-  名前を付けて保存・書き出し）になった どれも取り消せない操作で、毎回確かめ、書くのは
-  ホスト（画面の〔保存〕と書き出しの窓と同じ処理）に頼む 道具のコードはファイルを書かない
+- 2026-10-15 に保存と書き出し（B1 #327）を足した ファイルへ書く道具は 5 個（上書き保存・
+  名前を付けて保存・書き出し・字幕の書き出し・静止画の保存）になった どれも取り消せない
+  操作で、毎回確かめ、書くのはホスト（画面の〔保存〕・書き出しの窓・字幕の〔書き出し…〕・
+  〔静止画を保存…〕と同じ処理）に頼む 道具のコードはファイルを書かない
   書き出しを止める道具（cancel_export）は作品もファイルも変えない（書きかけを捨てるだけ）
 - ファイルに触るのは読む所だけ ``import_media`` が素材を読み（``host.probe``）、波形と
   控えを予約する（書く先は本人のキャッシュの置き場で、素材の隣ではない）
@@ -92,7 +93,9 @@ UNDOABLE_TOOLS = frozenset(
 #: ファイルへ書く道具（数えた物） どれも取り消せない操作で、確かめの側（test_safety.py
 #: test_save_and_export.py）で押さえる 足すときは、書く場所を pinned_place か書き出しの
 #: 片付け（ui/ai_export.py）に通してからここへ足す
-FILE_WRITING_TOOLS = frozenset({"save_project", "save_project_as", "export_video"})
+FILE_WRITING_TOOLS = frozenset(
+    {"save_project", "save_project_as", "export_video", "export_subtitles", "save_snapshot"}
+)
 
 #: 道具のコードがホストに書かせる口と、それを呼んでよい道具の関数
 #: 道具の関数の外（読む道具・編集の道具）から呼ぶと、確かめを通らずにファイルを書く
@@ -100,6 +103,8 @@ _HOST_WRITERS = {
     "_save_project": {"write_project"},
     "_save_project_as": {"write_project"},
     "_export_video": {"start_export"},
+    "_export_subtitles": {"write_subtitles"},
+    "_save_snapshot": {"write_snapshot"},
 }
 
 #: 道具のコードが呼んではいけない、ファイルを書く・消す・動かす呼び出し

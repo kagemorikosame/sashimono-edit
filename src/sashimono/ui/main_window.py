@@ -95,6 +95,7 @@ from sashimono.core.io import (
     project_presence_dir,
     remember_root,
     save_project,
+    save_subtitles,
     tidy_orphans,
     trim_state,
 )
@@ -3287,6 +3288,31 @@ class MainWindow(QMainWindow):
             previous_lock.release()
         self.statusBar().showMessage(f"AI アシスタントが保存した: {path}{note}", 5000)
         return note
+
+    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+        """AI の字幕の書き出し 画面の字幕パネルの〔書き出し…〕と同じ形式・同じ処理
+
+        相手は字幕パネルと同じく開いているタイムライン 窓は出さない
+        """
+        try:
+            written = save_subtitles(self.view_project, path, frame_range=frame_range)
+        except OSError as exc:
+            raise ToolError(f"字幕を書き出せませんでした: {path} ({exc})") from exc
+        self.statusBar().showMessage(f"AI アシスタントが字幕を書き出した: {written}", 5000)
+        return written
+
+    def write_snapshot(self, path: Path, frame: int) -> int:
+        """AI の静止画の保存 画面の〔静止画を保存…〕と同じ描き方と書き方で、窓は出さない"""
+        from sashimono.ui.snapshot import snapshot_frame, write_png
+
+        # 画面と同じく止めてから、開いているシーンを書き出しと同じ描き方で描く
+        self._playback.stop()
+        project = self.view_project
+        drawn = snapshot_frame(project, frame)
+        if not write_png(self.snapshot_image(drawn), path):
+            raise ToolError(f"静止画を保存できませんでした: {path}")
+        self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
+        return drawn
 
     def start_export(self, request: ExportRequest) -> None:
         """AI の書き出し 画面の書き出しの窓と同じ作り方の設定で、同じ書き出しの処理を裏で回す"""

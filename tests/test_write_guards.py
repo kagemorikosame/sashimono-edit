@@ -19,6 +19,8 @@ import pytest
 from sashimono.core.io import atomic
 from sashimono.core.io.atomic import copy_atomic, write_atomic
 from sashimono.core.io.folder_pin import FolderSwappedError, pin_folder
+from sashimono.core.io.subtitles import save_subtitles
+from sashimono.core.model import Project
 
 
 def _hard_link(link: Path, target: Path) -> None:
@@ -76,6 +78,20 @@ class TestScratchIsAlwaysNew:
         source.write_bytes(b"new")
         copy_atomic(source, link)
         assert link.read_bytes() == b"new"
+        assert original.read_bytes() == b"original"
+
+
+class TestSubtitleFiles:
+    def test_writing_subtitles_over_a_hard_link_leaves_the_linked_file_alone(
+        self, tmp_path: Path
+    ) -> None:
+        # 壊れると（字幕のファイルを開いて上書きすると）、書き出し先が元の素材への
+        # ハードリンクだったとき、素材の中身が字幕の文字に変わる
+        original = tmp_path / "素材.srt"
+        original.write_bytes(b"original")
+        link = tmp_path / "字幕.srt"
+        _hard_link(link, original)
+        save_subtitles(Project.create(), link)
         assert original.read_bytes() == b"original"
 
 

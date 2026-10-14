@@ -21,6 +21,7 @@ from typing import Any
 
 import av
 import pytest
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from sashimono.ai.bridge import EditorBridge
@@ -29,13 +30,22 @@ from sashimono.ai.operations import Operation, find_operation
 from sashimono.core.commands import AddClip, AddTrack, SetTrackState
 from sashimono.core.io.atomic import copy_atomic
 from sashimono.core.io.serialize import load_project
-from sashimono.core.model import Clip, MediaItem, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.model import (
+    Clip,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.encode import ExportSettings, available_video_codecs, export_project
 from sashimono.ui import ai_export
 from sashimono.ui.ai_export import scratch_folder
 from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
+from tests.ai.conftest import make_loaded
 from tests.ai.test_bridge import call_in_thread
 
 
@@ -205,6 +215,81 @@ class TestSave:
         assert isinstance(box.get("error"), ToolError)
         assert not (outside / "a.sme").exists()
         assert window.project_path == folder / "作品.sme"
+
+
+# --- 字幕の書き出しと静止画 ---
+
+
+class TestSubtitlesAndSnapshot:
+    def test_subtitles_are_the_same_file_the_panel_writes(
+        self,
+        qt_application: QApplication,
+        folder: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、AI が書いた字幕が画面の〔書き出し…〕と違う形式になるか、自動で承認の
+        # 人の字幕のファイルを確かめずに上書きする
+        del qt_application
+        window = _open(make_loaded(video_media, transcript), folder)
+        try:
+            asked, box = _drive(
+                window, _operation("export_subtitles"), {"path": str(folder / "AI.srt")}
+            )
+            _assert_irreversible_request(asked)
+            assert "字幕を書き出します" in asked.texts[0]
+            assert box.get("error") is None, box.get("error")
+
+            # 人が字幕パネルの〔書き出し…〕で同じ所へ書いた物と比べる
+            by_hand = folder / "人.srt"
+            monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: (str(by_hand), ""))
+            window._subtitles.export_file()
+            ai_text = (folder / "AI.srt").read_text(encoding="utf-8")
+            assert ai_text == by_hand.read_text(encoding="utf-8")
+            assert "今日は" in ai_text
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_subtitles_outside_are_refused_without_asking(
+        self, window: MainWindow, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が人の選んでいない場所へ字幕を書く
+        outside = tmp_path / "外"
+        outside.mkdir()
+        asked, box = _drive(
+            window, _operation("export_subtitles"), {"path": str(outside / "a.srt")}
+        )
+        assert asked.texts == []
+        assert isinstance(box.get("error"), ToolError)
+        assert list(outside.iterdir()) == []
+
+    @pytest.mark.usefixtures("gpu")
+    def test_a_snapshot_is_drawn_like_the_screen(self, window: MainWindow, folder: Path) -> None:
+        # 壊れると、AI の静止画が画面の〔静止画を保存…〕と違う描き方になるか、確かめずに書く
+        asked, box = _drive(window, _operation("save_snapshot"), {"path": "AI.png", "frame": 10})
+        _assert_irreversible_request(asked)
+        assert "静止画を保存します" in asked.texts[0]
+        assert box.get("result") == {"saved": str((folder / "AI.png").resolve()), "frame": 10}
+        window.seek(10)
+        by_hand = window.save_snapshot(folder / "人.png")
+        assert by_hand is not None
+        ai_image = QImage(str(folder / "AI.png"))
+        assert not ai_image.isNull()
+        assert (ai_image.width(), ai_image.height()) == (320, 240)
+        assert ai_image == QImage(str(by_hand))
+
+    def test_a_snapshot_outside_is_refused_without_asking(
+        self, window: MainWindow, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が人の選んでいない場所へ絵を書く
+        outside = tmp_path / "外"
+        outside.mkdir()
+        asked, box = _drive(window, _operation("save_snapshot"), {"path": str(outside / "a.png")})
+        assert asked.texts == []
+        assert isinstance(box.get("error"), ToolError)
+        assert list(outside.iterdir()) == []
 
 
 # --- 書き出し ---

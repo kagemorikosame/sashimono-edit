@@ -175,8 +175,10 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   変えられず消せない）、持った後にもう 1 度確かめ、書き終えたら差し替えられていないかを照らす
   仮のファイルは必ず新しく作る（`write_atomic` は `"x"` で開く 先に置かれた名前の中身へは書かない）
 - AI の道具のコードはファイルを書かない 書く道具（上書き保存 `save_project`・名前を付けて保存
-  `save_project_as`・書き出し `export_video`）も、画面の〔保存〕と書き出しの窓と同じ処理を
-  ホスト（`write_project` `start_export`）に頼む 書き出しの設定は画面の窓と同じ
+  `save_project_as`・書き出し `export_video`・字幕の書き出し `export_subtitles`・静止画の保存
+  `save_snapshot`）も、画面の〔保存〕・書き出しの窓・字幕の〔書き出し…〕・〔静止画を保存…〕と
+  同じ処理をホスト（`write_project` `start_export` `write_subtitles` `write_snapshot`）に頼む
+  字幕のファイルも書いてから置き換える（`save_subtitles`） 書き出しの設定は画面の窓と同じ
   `engine/encode/choices.py` で作る 道具を数える見張りは `tests/ai/test_source_safety.py`
   消せるのはプロジェクトの中のクリップ（と縁取りの層）だけで、どれも取り消し 1 回で戻る
   変える道具を足したら、そこの一覧へも足す
@@ -190,7 +192,8 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   覚えると、AI が自分で書ける場所を増やせる
 - アプリ自身の設定（好み・ショートカット・画面配置・更新・ヘルプ）は、AI は読むだけ
   `EditorHost` に変える口を足さない（試験が落ちる 足してよいのは作品の保存と書き出しの口
-  `write_project` `start_export` `export_status` `cancel_export` だけ）
+  `write_project` `start_export` `export_status` `cancel_export` `write_subtitles`
+  `write_snapshot` だけ）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
 ### パラメータ定義は 1 形式

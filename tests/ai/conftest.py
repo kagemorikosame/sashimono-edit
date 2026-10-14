@@ -15,6 +15,7 @@ import pytest
 from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.core.commands import AddClip, Command, Document, InScene
 from sashimono.core.io.serialize import save_project
+from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.model import (
     ClipId,
     MediaId,
@@ -64,6 +65,8 @@ class FakeHost:
         }
         #: 保存した場所（write_project を呼ばれた順）
         self.written: list[Path] = []
+        #: 静止画に頼まれたフレーム
+        self.snapshots: list[int] = []
         #: 頼まれた書き出し 偽物なので書き出しそのものは走らせない
         self.exports: list[ExportRequest] = []
         self.export_state: dict[str, object] = {"state": "idle", "progress": 0.0, "path": None}
@@ -173,6 +176,19 @@ class FakeHost:
         if adopt:
             self.saved_at = path
         return ""
+
+    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+        # 画面の字幕の書き出しと同じ処理で書く
+        written = save_subtitles(self.project, path, frame_range=frame_range)
+        self.written.append(written)
+        return written
+
+    def write_snapshot(self, path: Path, frame: int) -> int:
+        # 絵は描かない（偽物） 書いた場所と頼まれたフレームだけ残す
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + f"{frame}".encode())
+        self.written.append(path)
+        self.snapshots.append(frame)
+        return frame
 
     def start_export(self, request: ExportRequest) -> None:
         if self.export_state["state"] in EXPORT_RUNNING:

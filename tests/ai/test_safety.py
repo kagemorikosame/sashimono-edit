@@ -174,7 +174,8 @@ class TestAppSettingsAreReadOnly:
             for name, member in inspect.getmembers(EditorHost)
             if not name.startswith("_") and callable(member)
         }
-        # 保存と書き出し（B1 #327）は作品を書く口で、アプリ自身の設定は変えない
+        # 保存・書き出し・字幕の書き出し・静止画（B1 #327）は作品を書く口で、
+        # アプリ自身の設定は変えない
         assert changes == {
             "analyze",
             "app_settings",
@@ -193,6 +194,8 @@ class TestAppSettingsAreReadOnly:
             "transcription_status",
             "waveform",
             "write_project",
+            "write_snapshot",
+            "write_subtitles",
         }
 
 

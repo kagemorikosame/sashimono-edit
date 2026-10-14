@@ -11,12 +11,14 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
+from sashimono.core.io.atomic import write_atomic
 from sashimono.core.model import Project
 from sashimono.core.projection import ProjectedSubtitle, project_timeline
 from sashimono.core.timebase import FrameRate
 
 __all__ = [
     "SUBTITLE_FILTER",
+    "SUBTITLE_SUFFIXES",
     "save_subtitles",
     "subtitles_in_range",
     "to_srt",
@@ -26,6 +28,11 @@ __all__ = [
 
 #: 保存ダイアログのフィルタ
 SUBTITLE_FILTER = "SubRip (*.srt);;WebVTT (*.vtt);;テキスト (*.txt)"
+
+#: 書ける字幕の形式（拡張子） 保存ダイアログのフィルタと同じ 3 つ
+#: AI の字幕の書き出し（#327）はこれ以外の名前を断る 知らない拡張子を通すと、作品や
+#: 素材の名前で字幕の文字を書けてしまう
+SUBTITLE_SUFFIXES = (".srt", ".vtt", ".txt")
 
 
 def to_srt(subtitles: Iterable[ProjectedSubtitle], rate: FrameRate) -> str:
@@ -100,9 +107,11 @@ def save_subtitles(
         body = to_srt(subtitles, project.rate)
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    # BOM 無しの UTF-8 SRT を BOM 付きで書くと、古い再生機で 1 枚目の番号が
+    # BOM 無しの UTF-8 で書く BOM 付きで書くと、古い再生機で 1 枚目の番号が
     # 読めずに字幕全体が出ないことがある
-    target.write_text(body, encoding="utf-8", newline="\n")
+    # 書いてから置き換える（#327） 開いて上書きすると、書き出し先が元の素材への
+    # ハードリンクだったときに素材の中身を書き換え、途中で失敗すると前の字幕も壊れる
+    write_atomic(target, body)
     return target
 
 
