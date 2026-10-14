@@ -26,6 +26,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
     QResizeEvent,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -241,6 +242,9 @@ class ChatPanel(QWidget):
         #: 出した会話（言った人、文） 補足は言った人が ``None`` テーマを切り替えたときに
         #: 今の色で書き直すために持つ
         self._log: list[tuple[str | None, str]] = []
+        #: 1 度でも画面に出たか 出る前の幅は置き方が決める前の仮の値で、その幅で折り返した
+        #: 高さを最小に入れると、窓が出るときにその高さまで縦に伸びる（#316 :meth:`_fit_wrapped`）
+        self._shown = False
 
         # --- いま応えている指示（状態の行と区切りの行に使う） ---
         #: 経過秒を測る時計 試験で差し替える（本物の時計だと秒の境目で揺れる）
@@ -566,6 +570,13 @@ class ChatPanel(QWidget):
         super().resizeEvent(event)
         self._fit_wrapped()
 
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt の命名規約
+        super().showEvent(event)
+        # 出る前に溜まっていた大きさの知らせは、出る印が付く前に配られて数えずに終わる
+        # ここで置き方が決めた幅で数え直さないと、狭いパネルの折り返しが最小の高さに入らない
+        self._shown = True
+        self._fit_wrapped()
+
     def _fit_wrapped(self) -> None:
         """折り返す部品の、今の幅での高さを、パネルの最小の高さに入れる
 
@@ -574,7 +585,14 @@ class ChatPanel(QWidget):
         まで縮められると（質問の箱を出した狭い窓など）、増えた行の分だけ下の部品が重なる
         並びだけを見ていたときは、ログインの済んでいない機械（CI）で案内の箱が並びに重なった
         箱の文は出し入れのたびに変わるので、状態を当て直す所（_refresh_status）からも呼ぶ
+
+        1 度も出ていない間は数えない 出る前の幅は作ったときの仮の幅（100 画素など）で、
+        そこで折り返すとログインの案内だけで 460 画素を超える その最小が窓の最小に足され、
+        窓が出るときに頼んだ大きさ（覚えている大きさ・既定の大きさ）より縦に伸びて、
+        落ち着いて最小が下がっても伸びたまま残った（#316 タイムラインが狭くなる）
         """
+        if not self._shown:
+            return
         width = self.width()
         layout = self.layout()
         if layout is not None:
