@@ -6,6 +6,7 @@ Premiere Pro のテキストの「塗り」と同じく、塗りの種類（単�
 名前の頭だけを変えて持たせる 3 つを別々に書くと、範囲や既定が少しずつずれていく
 
 グラデーションの基準は字の枠（字の輪郭を囲む四角 AviUtl2 の組み方なら文字の枠も含める）
+1 行ごと・1 文字ごとを選ぶと、行や字の輪郭を囲む四角ごとに掛け直す
 エフェクトの「グラデーション」「模様で塗る」は絵の全体（縁取りと影も）に掛かるが、こちらは
 塗る所ごとに掛かるので、縁取りと影を巻き込まない
 
@@ -24,6 +25,7 @@ from sashimono.core.model import ParamValue
 from sashimono.effects.spec import GradientSpec, ParameterSpec, SelectSpec, TrackSpec
 
 __all__ = [
+    "FILL_BASES",
     "FILL_KINDS",
     "FILL_SPANS",
     "GRADIENT_SUFFIXES",
@@ -41,7 +43,12 @@ FILL_KINDS = (("solid", "単色"), ("linear", "線形グラデーション"), ("
 #: 枠の幅は角度に関わらず字の枠の横の幅（YMM4 のブラシの割合の指定と同じ 読み込みで使う）
 FILL_SPANS = (("extent", "枠の向きの長さ"), ("width", "枠の幅"))
 
+#: グラデーションを掛け直す単位 字の枠全体は Premiere と同じ 1 行ごと・1 文字ごとは日本語の
+#: テロップで使う（行ごとに上から下へ明るくする、字ごとに同じ光り方をさせる）
+FILL_BASES = (("box", "字の枠全体"), ("line", "1 行ごと"), ("char", "1 文字ごと"))
+
 #: 頭の後ろに付ける項目の名前 並びは設定パネルに出す順
+#: 基準（``basis``）は後から足したので末尾に置く（前に保存した値の並びを動かさない）
 GRADIENT_SUFFIXES = (
     "type",
     "gradient",
@@ -52,6 +59,7 @@ GRADIENT_SUFFIXES = (
     "center_x",
     "center_y",
     "radius",
+    "basis",
 )
 
 #: 線形のときだけ使う項目と、円形のときだけ使う項目
@@ -82,6 +90,7 @@ def fill_specs(prefix: str, owner: str = "") -> tuple[ParameterSpec, ...]:
         TrackSpec(f"{prefix}_center_x", f"{head}グラデーションの中心 X", -500, 500, 0, unit="%"),
         TrackSpec(f"{prefix}_center_y", f"{head}グラデーションの中心 Y", -500, 500, 0, unit="%"),
         TrackSpec(f"{prefix}_radius", f"{head}グラデーションの半径", 1, 1000, 100, unit="%"),
+        SelectSpec(f"{prefix}_basis", f"{head}グラデーションの基準", FILL_BASES, "box"),
     )
 
 

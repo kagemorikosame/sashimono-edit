@@ -37,7 +37,7 @@ def ink(image: np.ndarray) -> tuple[int, int, int, int]:
 def drawn(source: GeneratedSource, scale: float = 1.0) -> np.ndarray:
     width, height = round(SCREEN[0] * scale), round(SCREEN[1] * scale)
     canvas = source_canvas(source, width, height, scale=(scale, scale))
-    image = render_source_framed(source, *canvas, scale=(scale, scale), screen=(width, height))[0]
+    image = render_source_framed(source, *canvas, scale=(scale, scale))[0]
     assert image is not None
     return image
 

@@ -134,6 +134,9 @@ class TestTheShownFields:
         assert {"fill_gradient", "fill_angle", "fill_length", "fill_shift", "fill_span"} <= set(
             shown
         )
+        # 掛け直す単位（字の枠全体・1 行ごと・1 文字ごと）は線形でも円形でも選べる
+        assert "fill_basis" in shown
+        assert TEXT.create().params["fill_basis"] == "box"
         assert "fill_radius" not in shown and "fill_center_x" not in shown
 
     def test_a_radial_fill_shows_the_centre_and_radius(self) -> None:

@@ -45,6 +45,8 @@ class Paint:
     center_x: float = 0.0
     center_y: float = 0.0
     radius: float = 100.0
+    #: 掛け直す単位 ``box``（字の枠全体）・``line``（1 行ごと）・``char``（1 文字ごと）
+    basis: str = "box"
 
     @property
     def visible(self) -> bool:
@@ -72,6 +74,7 @@ def paint_of(values: Mapping[str, object], prefix: str) -> Paint | None:
         return None
     span = values.get(f"{prefix}_span")
     raw = values.get(f"{prefix}_gradient")
+    basis = values.get(f"{prefix}_basis")
     return Paint(
         kind=str(kind),
         stops=_STOPS.coerce(raw if isinstance(raw, tuple) else None),
@@ -82,6 +85,7 @@ def paint_of(values: Mapping[str, object], prefix: str) -> Paint | None:
         center_x=_number(values, f"{prefix}_center_x", 0.0),
         center_y=_number(values, f"{prefix}_center_y", 0.0),
         radius=_number(values, f"{prefix}_radius", 100.0),
+        basis=basis if basis in ("box", "line", "char") else "box",
     )
 
 
