@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from sashimono.compat.catalog import TemplateCatalog, TemplateEntry
+from sashimono.compat.mapped import MappedObject
 from sashimono.compat.subtitle_looks import (
     NO_TEXT,
     LookError,
@@ -19,6 +21,7 @@ from sashimono.compat.subtitle_looks import (
     alias_choice,
     default_choice,
     find_choice,
+    objects_look,
     preset_choice,
     subtitle_look,
     template_choice,
@@ -176,6 +179,30 @@ class TestWrap:
         made = look("字幕", 30)
         assert _value(made, "layout") == "native"
         assert _value(made, "wrap_width") == AnimatedValue(WRAP)
+
+    def test_the_wrap_shrinks_by_the_look_scale(self) -> None:
+        # 壊れると、拡大する見た目（実物ではドット絵風加工の 120%）で置いた長い字幕が、
+        # 拡大した後に画面の幅を超えて端で切れる 折り返しは拡大の前に組むため
+        alias = _styled_alias()
+        enlarged = tuple(
+            replace(e, params={**e.params, "scale": AnimatedValue(150.0)})
+            if e.kind == "transform"
+            else e
+            for e in alias.clip.effects
+        )
+        look = subtitle_look(
+            alias_choice(Alias.of("大きい", replace(alias.clip, effects=enlarged))), _base()
+        )
+        assert callable(look)
+        assert _value(look("字幕", 30), "wrap_width") == AnimatedValue(WRAP / 1.5)
+
+    def test_an_effects_only_look_rescales_the_subtitle_wrap(self) -> None:
+        # 壊れると、中身に触らない見た目（エフェクトだけ）が拡大しても、
+        # 字幕の幅が画面の 90% のまま残り、拡大した字幕が端で切れる
+        effects = (registry.require("transform").create(scale=120.0),)
+        objects = [MappedObject(clip=Clip(timeline_start=0, duration=60, effects=effects), layer=1)]
+        made = objects_look(objects, _base())("字幕", 30)
+        assert _value(made, "wrap_width") == AnimatedValue(WRAP / 1.2)
 
     def test_no_wrap_is_added_when_the_setting_is_off(self) -> None:
         # 壊れると、折り返しを切った人の字幕まで折り返される

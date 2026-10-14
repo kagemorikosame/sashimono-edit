@@ -28,7 +28,7 @@ from sashimono.compat.aviutl.custom_object import custom_object_script
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle, wraps
 from sashimono.compat.mapped import MappedObject
-from sashimono.core.commands import Command, SubtitleTemplate
+from sashimono.core.commands import Command, SubtitleLook, SubtitleTemplate
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.commands.preset import PresetOptions, preset_commands
 from sashimono.core.io.aliases import Alias
@@ -60,6 +60,7 @@ __all__ = [
     "alias_choice",
     "default_choice",
     "find_choice",
+    "objects_look",
     "preset_choice",
     "selected_choice",
     "subtitle_look",
@@ -238,6 +239,14 @@ def subtitle_look(
         if refusal:
             raise LookError(f"「{choice.label}」は使えない: {refusal}")
 
+    return objects_look(objects, base, keep_wrap=keep_wrap)
+
+
+def objects_look(
+    objects: list[MappedObject], base: GeneratedSource, *, keep_wrap: bool = False
+) -> SubtitleLook:
+    """エイリアスや棚の配布物を写した物を、棚の着せ替え（``restyle``）で字幕に着せる手"""
+
     def by_restyle(clip: Clip) -> list[Command]:
         return restyle(objects, clip, keep_wrap=keep_wrap)
 
@@ -249,9 +258,7 @@ def _source_defaults(kind: str) -> dict[str, ParamValue] | None:
     return definition.default_params() if definition is not None else None
 
 
-def _dresser(
-    base: GeneratedSource, commands_for: Callable[[Clip], list[Command]]
-) -> SubtitleTemplate:
+def _dresser(base: GeneratedSource, commands_for: Callable[[Clip], list[Command]]) -> SubtitleLook:
     """既定の見た目で置いた字幕 1 枚に、見た目を着せる手
 
     着せる操作は今あるクリップへのコマンドなので、字幕 1 枚だけの仮のプロジェクトに置いて
@@ -290,12 +297,50 @@ def _wrapped(clip: Clip, base: GeneratedSource) -> Clip:
     source = clip.source
     if not isinstance(width, AnimatedValue) or not wraps(width):
         return clip
-    if source is None or source.kind != "text" or wraps(source.params.get("wrap_width")):
+    if source is None or source.kind != "text":
+        return clip
+    own = source.params.get("wrap_width")
+    # 見た目が自分の幅を持てばそのまま使う エフェクトだけの見た目は中身に触らないので、
+    # 既定の見た目の幅（字幕の折り返し）のまま来る これは足した物として拡大に合わせ直す
+    if wraps(own) and own != width:
         return clip
     params = dict(source.params)
-    params["wrap_width"] = width
+    # 折り返しの幅は字を組むときの画素で、配置の拡大は組んだ後に掛かる 拡大する見た目
+    # （実物ではドット絵風加工の 120%）に画面の幅の 90% をそのまま入れると、拡大した字幕が
+    # 画面の幅を超えて端で切れる 拡大のいちばん大きい所で画面に収まる幅にする
+    widening = _widening(clip)
+    params["wrap_width"] = replace(width, static=width.static / widening) if widening > 1 else width
     vertical = params.get("vertical")
     upright = vertical is True or (isinstance(vertical, int) and bool(vertical))
     if params.get("layout") == "aviutl" and not upright:
         params.update(TO_NATIVE_LAYOUT.switch(params))
     return replace(clip, source=replace(source, params=params))
+
+
+#: 配置のエフェクト（クリップの欄と、見た目が足した物の両方）
+_TRANSFORM = "transform"
+
+
+def _widening(clip: Clip) -> float:
+    """配置が字幕を横へ広げる倍率 欄と足した配置の拡大率と横の拡大率を掛け合わせる
+
+    キーフレームで動く物はいちばん大きい値を取る（動きの途中で画面からはみ出さないように）
+    """
+    total = 1.0
+    for effect in clip.effects:
+        if effect.kind != _TRANSFORM or not effect.enabled:
+            continue
+        for name in ("scale", "scale_x"):
+            total *= _largest(effect.params.get(name)) / 100.0
+    return total
+
+
+def _largest(value: ParamValue | None) -> float:
+    # キーフレームがあれば :attr:`AnimatedValue.static` は使われない 裏返しの負の値は大きさで見る
+    if isinstance(value, AnimatedValue):
+        if value.keyframes:
+            return max(abs(k.value) for k in value.keyframes)
+        return abs(value.static)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return abs(float(value))
+    return 100.0
