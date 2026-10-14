@@ -21,7 +21,7 @@ from PySide6.QtCore import QEvent, QSize, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from sashimono.core.model import Project
-from sashimono.ui.main_window import DEFAULT_SIZE, MainWindow, initial_size
+from sashimono.ui.main_window import DEFAULT_SIZE, WINDOW_FRAME, MainWindow, initial_size
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.recovery_dialog import RecoveryDialog
 from sashimono.ui.theme import style_sheet
@@ -139,34 +139,52 @@ def test_the_window_keeps_the_size_it_was_given(
     assert window.size() == size
 
 
-@pytest.mark.parametrize("name", sorted(SIZES))
-def test_the_remembered_size_comes_back_unchanged(
-    machine: str, styled: list[MainWindow], name: str
-) -> None:
-    """2 回目からの起動でも、覚えている大きさ（画面より大きければ画面に縮めた大きさ）のまま出る
+#: 覚えさせる大きさを、窓の最小からどれだけ大きくするか（画素） 最小ちょうどだと、
+#: 伸びなくても最小に合わせて動いた分と見分けにくい 小さめにして CI の画面にも収める
+REMEMBERED_MARGIN = QSize(40, 30)
+
+
+def _remembered_size(window: MainWindow) -> QSize:
+    """画面に収まり、初めて開いたときの大きさと見分けられる、覚えさせる大きさ
+
+    画面より大きい大きさを覚えさせると、Qt が戻すときに画面へ縮める（CI の 1024x768 ほどの
+    画面で 1022x687） そうなると、覚えた大きさが戻ったのか、別の理由で小さいのかを
+    見分けられない 窓の最小の少し上にすれば、CI の画面にも手元の画面にも収まる
+    """
+    screen = window.screen()
+    assert screen is not None
+    room = screen.availableGeometry().size() - WINDOW_FRAME
+    size = window.minimumSizeHint() + REMEMBERED_MARGIN
+    assert size == size.boundedTo(room), f"覚えさせる {size} が画面の {room} に収まらない"
+    assert size != initial_size(room), "初めての大きさと同じで、戻ったかどうかを見分けられない"
+    return size
+
+
+def test_the_remembered_size_comes_back_unchanged(machine: str, styled: list[MainWindow]) -> None:
+    """2 回目からの起動でも、覚えている大きさのまま出る
 
     壊れると、起動するたびに覚えた大きさより縦に伸びて出て、タイムラインが狭くなる
     （閉じると伸びた大きさを覚えるので、直したつもりでも次の起動で戻らない）
     """
     del machine
-    size = SIZES[name]
     first = _window(styled)
-    first.resize(size)
     first.show()
     _settle()
+    size = _remembered_size(first)
+    first.resize(size)
+    _settle()
+    assert first.size() == size
     Workspace().save(first)
     first.hide()
 
     window = _window(styled)
-    # 覚えた大きさが今の画面に収まらなければ、Qt は戻すときに画面へ縮める（CI の画面は
-    # 1024x768 ほどで 1022x687 になる） 画面からはみ出さないための正しい動きなので、
-    # 縮めた後の大きさを頼んだ大きさとして、出したときに伸びないかを見る
-    restored = window.size()
-    assert restored == size.boundedTo(restored), f"覚えた {size} より大きく戻った {restored}"
+    # 覚えた大きさと直に比べる 戻す処理が効かないと、初めての大きさ（画面に合わせた大きさ）
+    # になって食い違う
+    assert window.size() == size
     window.show()
-    assert window.size() == restored
+    assert window.size() == size
     _settle()
-    assert window.size() == restored
+    assert window.size() == size
 
 
 @pytest.mark.parametrize("machine", ["ログインがまだ"], indirect=True)
@@ -187,6 +205,14 @@ def test_the_wrapped_parts_still_count_once_shown(machine: str, styled: list[Mai
     _settle()
     chat = window.findChild(ChatPanel)
     assert chat is not None
+    # 出た後のパネルの幅で、折り返した部品が要る高さを求めて比べる 最小がそれより低いと、
+    # パネルを最小まで縮めたときに増えた行の分だけ下の部品に重なる
+    layout = chat.layout()
+    assert layout is not None
+    margins = layout.contentsMargins()
+    width = chat.width() - margins.left() - margins.right()
     for part in (chat._choices, chat._login_box):
         assert not part.isHidden(), f"{machine} なのに出ていない"
-        assert part.minimumHeight() > 0, part.objectName() or type(part).__name__
+        need = part.heightForWidth(width)
+        assert need > 0, type(part).__name__
+        assert part.minimumHeight() >= need, (type(part).__name__, part.minimumHeight(), need)
