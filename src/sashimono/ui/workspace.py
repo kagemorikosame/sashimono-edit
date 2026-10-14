@@ -26,6 +26,7 @@ from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.model import LayerMode
+from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
@@ -503,6 +504,10 @@ class Preferences:
     #: 再生中に消したときは、止めずに頭から続ける（末尾に着いたら続きが無いので止める）
     #: 動いてほしくない人は切れば今までどおり
     ripple_playhead: bool = True
+    #: AI アシスタントの完成物の検査（#337）が比べる音量の基準（LUFS） 選べるのは
+    #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
+    #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
+    check_loudness_target: int = -14
     #: 書き出しの窓で前に書き出したフォルダ 空はまだ書き出していない
     #: 好みではなく覚えている物なので、設定画面には出さない 次に開いた書き出しの窓の
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
@@ -704,6 +709,9 @@ class PreferenceStore:
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
+            check_loudness_target=_loudness_target(
+                data.get("check_loudness_target"), plain.check_loudness_target
+            ),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
         )
 
@@ -813,6 +821,18 @@ def _choice(value: object, choices: tuple[str, ...], default: str) -> str:
     何も選ばれていない画面になる
     """
     return value if isinstance(value, str) and value in choices else default
+
+
+def _loudness_target(value: object, default: int) -> int:
+    """音量の基準 選択肢に無い値（手で書き換えた値・壊れた値）は既定へ戻す
+
+    選択肢の外の値を通すと、設定画面のどれも選ばれていない形で開き、OK で黙って
+    先頭の基準に書き換わる
+    """
+    choices = {target for target, _name in LOUDNESS_TARGETS}
+    if isinstance(value, int) and not isinstance(value, bool) and value in choices:
+        return value
+    return default
 
 
 def _size(value: object, default: int) -> int:

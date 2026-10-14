@@ -1316,6 +1316,25 @@ class FrameRenderer:
             return None
         return box, (width, height)
 
+    def content_extent(
+        self, clip: Clip, frame: int
+    ) -> tuple[tuple[float, float, float, float], tuple[int, int]] | None:
+        """:meth:`object_extent` と同じ形で、色の付いた範囲だけを返す（完成物の検査 #337）
+
+        字幕が画面からはみ出すかは、見えている字の範囲で決める AviUtl2 の文字の枠は
+        字の無い余白まで含むので、入れると字の収まった字幕まではみ出すと言ってしまう
+        スクリプトを積んだ物は描く側の絵の作り方が違うので :meth:`object_extent` に任せる
+        """
+        if not is_generated(clip) or split_effects(clip.effects)[1]:
+            return self.object_extent(clip, frame)
+        image = self._generate(clip, frame, self._project.rate, gpu=False)
+        if image is None:
+            return None
+        box = _merged_box(self._content_box_of(clip, image), None)
+        if box is None:
+            return None
+        return box, (int(image.shape[1]), int(image.shape[0]))
+
     def _screen_extent(
         self, clip: Clip, frame: int
     ) -> tuple[tuple[float, float, float, float], tuple[int, int]] | None:

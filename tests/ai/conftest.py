@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -27,6 +28,8 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.checks.report import assemble
 from tests.conftest import make_clip
 
 RATE_30 = FrameRate(30)
@@ -52,6 +55,13 @@ class FakeHost:
         self.split_audio = True
         #: 本人の設定の「新しい字幕を自動で折り返す」の幅（%） 既定は設定と同じく 90
         self.wrap_share = 90
+        #: 完成物の検査（#337） 本人の設定の音量の基準と、頼まれた検査・試験が入れる様子
+        self.loudness = -14.0
+        self.check_requests: list[CheckRequest] = []
+        self.check: CheckState = CheckState()
+        #: 待つ関数が呼ばれた秒と、待った結果
+        self.check_waits: list[float] = []
+        self.check_ready = True
         #: 作品（.sme）の場所 既定はまだ保存していない作品
         self.saved_at: Path | None = None
         #: 書き出しの窓で前に選んだフォルダ 既定はまだ書き出していない
@@ -140,6 +150,39 @@ class FakeHost:
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         del media, stream
         return self.stub_waveform
+
+    @property
+    def loudness_target(self) -> float:
+        return self.loudness
+
+    def request_check(self, request: CheckRequest) -> None:
+        self.check_requests.append(request)
+        if self.check.request != request:
+            # 本物と同じく、新しい頼みは何も調べていない走っている様子から始まる
+            empty = assemble(
+                [],
+                start=request.start,
+                end=max(request.end, request.start + 1),
+                analyzed=request.start,
+                fps=30.0,
+                complete=False,
+                limits=request.limits,
+                index=None,
+                loudness=None,
+                peak=None,
+                length_seconds=None,
+            )
+            self.check = CheckState(request=request, report=empty, running=True)
+
+    def check_state(self) -> CheckState:
+        return self.check
+
+    def check_waiter(self) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            self.check_waits.append(seconds)
+            return self.check_ready
+
+        return wait
 
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None

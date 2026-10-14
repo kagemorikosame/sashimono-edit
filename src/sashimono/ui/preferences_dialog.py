@@ -31,6 +31,7 @@ from sashimono.engine.cache.proxy import (
     MEASURED_PREFETCH_MS,
     MEASURED_THREE_LAYERS_MS,
 )
+from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import (
     MEASURED_DECODE_MS,
     MEASURED_EXPORT_MS,
@@ -736,6 +737,19 @@ class PreferencesDialog(QDialog):
             " 変えると、次の指示から新しい会話になる"
         )
         form.addRow(self._ai_ask_questions)
+        self._check_loudness = QComboBox(self)
+        for target, name in LOUDNESS_TARGETS:
+            self._check_loudness.addItem(name, target)
+        self._check_loudness.setCurrentIndex(
+            max(0, self._check_loudness.findData(preferences.check_loudness_target))
+        )
+        self._check_loudness.setToolTip(
+            "AI アシスタントが仕上がりを調べる（check_output）ときに比べる、全体の音量"
+            "（積分ラウドネス ITU-R BS.1770）の基準 出す先に合わせて選ぶ 配信の多くは"
+            " -14 LUFS にそろえて再生し、欧州の放送は -23、日本の放送は -24 を求める"
+            " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
+        )
+        form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
 
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
@@ -909,6 +923,7 @@ class PreferencesDialog(QDialog):
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
+            check_loudness_target=int(self._check_loudness.currentData()),
         )
 
     def accept(self) -> None:

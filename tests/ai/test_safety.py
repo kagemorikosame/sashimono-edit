@@ -178,8 +178,13 @@ class TestAppSettingsAreReadOnly:
             "analyze",
             "app_settings",
             "apply_commands",
+            # 完成物の検査（#337） 調べるのは作品の写しで、アプリの設定は変えない
+            # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
+            "check_state",
+            "check_waiter",
             "probe",
             "render_png",
+            "request_check",
             "seek",
             "select_clip",
             "select_clips",
