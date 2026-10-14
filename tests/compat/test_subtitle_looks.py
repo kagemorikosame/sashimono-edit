@@ -23,6 +23,7 @@ from sashimono.compat.subtitle_looks import (
     find_choice,
     objects_look,
     preset_choice,
+    saved_looks,
     subtitle_look,
     template_choice,
 )
@@ -266,7 +267,7 @@ class TestByName:
             presets=PresetStore(tmp_path / "presets"), aliases=AliasStore(tmp_path / "aliases")
         )
         library.aliases.save(_styled_alias("黄色"))
-        assert find_choice(library, "alias", "黄色").label == "黄色"
+        assert find_choice(saved_looks(library), "alias", "黄色").label == "黄色"
         # 無い名前は、ある物の名前を添えて断る（AI が次に何を頼めばよいか分かるように）
         with pytest.raises(LookError, match="黄色"):
-            find_choice(library, "alias", "無い")
+            find_choice(saved_looks(library), "alias", "無い")

@@ -57,11 +57,13 @@ __all__ = [
     "LookChoice",
     "LookError",
     "LookRules",
+    "SavedLooks",
     "alias_choice",
     "default_choice",
     "find_choice",
     "objects_look",
     "preset_choice",
+    "saved_looks",
     "selected_choice",
     "subtitle_look",
     "template_choice",
@@ -138,14 +140,37 @@ def template_choice(entry: TemplateEntry) -> LookChoice:
     return LookChoice(f"{TEMPLATE}:{where}", entry.name, TEMPLATE, entry, entry.error)
 
 
-def find_choice(library: Library, kind: str, name: str, category: str = "") -> LookChoice:
+@dataclass(frozen=True, slots=True)
+class SavedLooks:
+    """保存したプリセットとエイリアスの写し（読むだけ）
+
+    AI の道具へは置き場（:class:`~sashimono.core.io.library.Library`）ではなくこの写しを渡す
+    置き場を渡すと、名前の変更や削除まで AI の手の届く所に出る（アプリと本人の持ち物は
+    読むだけ #354）
+    """
+
+    presets: tuple[Preset, ...] = ()
+    aliases: tuple[Alias, ...] = ()
+
+
+def saved_looks(library: Library) -> SavedLooks:
+    """置き場を読んだ写し 壊れた物は読み飛ばす（置き場の一覧と同じ）"""
+    return SavedLooks(
+        presets=tuple(
+            e.item for e in library.entries(LIBRARY_PRESET) if isinstance(e.item, Preset)
+        ),
+        aliases=tuple(e.item for e in library.entries(LIBRARY_ALIAS) if isinstance(e.item, Alias)),
+    )
+
+
+def find_choice(saved: SavedLooks, kind: str, name: str, category: str = "") -> LookChoice:
     """保存したプリセットかエイリアスを名前で探す（AI の道具が使う）
 
     見つからない・プリセットの名前が分類違いで重なるときは :class:`LookError` 重なった物の
     どちらかを黙って選ぶと、頼んだのと違う見た目で何十枚も置く
     """
     if kind == ALIAS:
-        aliases = [e.item for e in library.entries(LIBRARY_ALIAS) if isinstance(e.item, Alias)]
+        aliases = saved.aliases
         found_alias = next((alias for alias in aliases if alias.name == name), None)
         if found_alias is None:
             names = "、".join(alias.name for alias in aliases) or "（無い）"
@@ -153,7 +178,7 @@ def find_choice(library: Library, kind: str, name: str, category: str = "") -> L
         return alias_choice(found_alias)
     if kind != PRESET:
         raise LookError(f"見た目の種類は preset か alias: {kind}")
-    presets = [e.item for e in library.entries(LIBRARY_PRESET) if isinstance(e.item, Preset)]
+    presets = saved.presets
     matches = [p for p in presets if p.name == name and (not category or p.category == category)]
     if not matches:
         names = "、".join(f"{p.category}/{p.name}" for p in presets) or "（無い）"

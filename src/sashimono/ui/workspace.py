@@ -512,6 +512,11 @@ class Preferences:
     #: 再生中に消したときは、止めずに頭から続ける（末尾に着いたら続きが無いので止める）
     #: 動いてほしくない人は切れば今までどおり
     ripple_playhead: bool = True
+    #: 書き出しの窓で前に書き出したフォルダ 空はまだ書き出していない
+    #: 好みではなく覚えている物なので、設定画面には出さない 次に開いた書き出しの窓の
+    #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
+    #: 窓で選んで書き出した所だけ 2026-10-14 利用者の決定 #350）
+    export_folder: str = ""
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -717,6 +722,7 @@ class PreferenceStore:
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
+            export_folder=_folder(data.get("export_folder"), plain.export_folder),
         )
 
     def save(self, preferences: Preferences) -> None:

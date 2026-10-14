@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.bridge import Approval, EditorBridge, Question
 from sashimono.ai.models import MODELS
 from sashimono.ai.operations import ASK_USER, question_spec
+from sashimono.ai.safety import Consent
 from sashimono.ai.session import (
     ASK_RULES,
     SYSTEM_PROMPT,
@@ -37,7 +38,7 @@ from sashimono.ai.session import (
 from sashimono.core.commands import SetLayerMode, SplitClip
 from sashimono.core.model import LayerMode, MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
-from sashimono.ui.chat.panel import _Input
+from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD, _Input
 from sashimono.ui.theme import PALETTES, THEME_DARK, THEME_LIGHT, theme_signals, use_palette
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
@@ -207,6 +208,55 @@ class TestApproval:
         widget._bridge.cancel()
         widget._check_approval()
         assert widget._approval_box.isHidden() is True
+
+    def _irreversible(self, widget: ChatPanel) -> Approval:
+        consent = Consent(action="プロジェクトを上書き保存します", target="C:/作品/作品.sme")
+        approval = Approval(
+            tool="save_project", summary=consent.text(), arguments={}, consent=consent
+        )
+        widget._bridge._approvals.put(approval)
+        widget._check_approval()
+        return approval
+
+    def test_an_irreversible_request_says_so_and_offers_no_always(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、ふだんの確かめと見分けが付かず、戻せない上書きを編集のつもりで許す
+        # 「以降は確認しない」が出ていると、押しても毎回確かめるので効かないボタンになる
+        widget, _ = panel
+        self._irreversible(widget)
+        assert widget._approval_text.text().startswith(IRREVERSIBLE_HEAD)
+        assert "C:/作品/作品.sme" in widget._approval_text.text()
+        assert widget._approval_always.isHidden() is True
+        assert widget._approval_allow.text() == IRREVERSIBLE_ALLOW_TEXT
+
+    def test_the_next_ordinary_request_gets_its_buttons_back(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、1 度取り消せない確かめが出た後、ふだんの編集で「以降は確認しない」が消えたまま
+        widget, _ = panel
+        self._irreversible(widget)
+        widget._answer(True)
+        self._pending(widget)
+        assert widget._approval_always.isHidden() is False
+        assert widget._approval_allow.text() == "許可"
+
+    def test_always_on_an_irreversible_request_is_not_remembered(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、隠したボタンの経路から押された「以降は確認しない」で、次の上書きが黙って走る
+        widget, _ = panel
+        approval = self._irreversible(widget)
+        widget._answer(True, always=True)
+        assert approval.allowed is True
+        assert widget._bridge._always == set()
+
+    def test_the_auto_approve_box_tells_what_it_does_not_skip(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、自動で承認に任せて席を外した人が、確かめで止まっていたことに後で気付く
+        widget, _ = panel
+        assert "取り消せない操作" in widget._auto.toolTip()
 
 
 class TestCheckpoint:

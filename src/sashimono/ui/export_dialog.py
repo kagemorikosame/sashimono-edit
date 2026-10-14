@@ -106,8 +106,12 @@ class ExportDialog(QDialog):
         decode_threads: int = DEFAULT_DECODE_THREADS,
         scene_name: str | None = None,
         smooth_history: bool = True,
+        folder: Path | None = None,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
+
+        ``folder`` は前に書き出したフォルダ（本人の設定 ``export_folder``） 無ければ
+        ビデオのフォルダから始める
 
         ``scene_name`` はシーンを開いているときのその名前 書き出す物の既定はメインのまま
         （開いている物で出る物が変わると、書き出した物を取り違える） 選びにシーンを並べ、
@@ -132,9 +136,13 @@ class ExportDialog(QDialog):
         self._worker: _ExportWorker | None = None
         #: 書き出し中に閉じるよう頼まれた 止まった知らせが来たら閉じる
         self._closing = False
+        #: 書き出しを始めた先のフォルダ 人がこの窓で選んで書き出した所なので、呼んだ側が
+        #: 覚えて、AI アシスタントが書ける場所に入れる（#350） 始めなければ ``None``
+        self.started_folder: Path | None = None
 
         default_name = f"{project.name}.mp4"
-        self._path = QLineEdit(str(Path.home() / "Videos" / default_name), self)
+        start = folder if folder is not None else Path.home() / "Videos"
+        self._path = QLineEdit(str(start / default_name), self)
         browse = QPushButton("参照…", self)
         browse.clicked.connect(self._choose_path)
         path_row = QHBoxLayout()
@@ -331,6 +339,7 @@ class ExportDialog(QDialog):
         settings = self._settings()
         if settings is None:
             return
+        self.started_folder = settings.path.parent
 
         self._progress.setVisible(True)
         self._progress.setValue(0)
