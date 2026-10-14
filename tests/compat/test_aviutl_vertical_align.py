@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 
@@ -23,9 +24,11 @@ import pytest
 from sashimono.compat.aviutl.exo import load_exo
 from sashimono.compat.aviutl.mapping import map_object
 from sashimono.compat.aviutl.report import CompatibilityReport
-from sashimono.core.model import GeneratedSource
+from sashimono.compat.aviutl.text_fill import text_gradient_fill
+from sashimono.core.model import AnimatedValue, GeneratedSource
 from sashimono.core.timebase import FrameRate
-from sashimono.engine.sources import render_source
+from sashimono.effects import registry
+from sashimono.engine.sources import render_source, render_source_framed
 
 ALIAS = """[Object]
 frame=0,59
@@ -150,6 +153,67 @@ def test_the_pitch_is_the_font_size(tmp_path: Path) -> None:
     source, _report = read(tmp_path, "縦書 上寄[右]", text="■■■")
     tops = [box[1] for box in boxes(source)]
     assert [b - a for a, b in pairwise(tops)] == pytest.approx([80, 80], abs=1)
+
+
+def spaced(source: GeneratedSource, letter: float = 0.0, line: float = 0.0) -> GeneratedSource:
+    return GeneratedSource(
+        kind="text",
+        params={
+            **source.params,
+            "letter_spacing": AnimatedValue(letter),
+            "line_spacing": AnimatedValue(line),
+        },
+    )
+
+
+def test_letter_spacing_goes_between_letters(tmp_path: Path) -> None:
+    # 字間を列の後ろにも数えると、塊の上端が字間の分だけずれ、真ん中の揃えで半分ずれる
+    # 字間で字が横へ寄ると、字間を付けた縦書きの字幕の字が列の真ん中から外れる
+    source, _report = read(tmp_path, "縦書 上寄[右]", text="■■■")
+    plain = boxes(source)
+    wide = boxes(spaced(source, letter=20.0))
+    assert [box[1] - plain[0][1] for box in wide] == pytest.approx([0, 100, 200], abs=1)
+    assert [box[0] for box in wide] == [box[0] for box in plain]
+    centred, _report = read(tmp_path, "縦書 中央[中]", text="■■■")
+    # 3 字で 3 x 80 + 2 x 20 = 280 の塊の真ん中が位置 1 字目の升目の上端は 540 - 140
+    top = boxes(spaced(centred, letter=20.0))[0]
+    assert abs((top[1] + top[3]) / 2 - (400 + 40)) <= 2, top
+
+
+def test_line_spacing_goes_between_columns(tmp_path: Path) -> None:
+    # 行間を列の外にも数えると、右寄せ・左寄せの縦書きが行間の分だけ横へずれる
+    # 左寄せで見る 塊の左端が位置なので、1 列目（右の列）の真ん中は 960 + 80 + 30 + 40
+    source, _report = read(tmp_path, "縦書 上寄[左]", text="■\\n■")
+    first, second = boxes(spaced(source, line=30.0))
+    assert abs((first[0] + first[2]) / 2 - 1110) <= 2, first
+    assert abs((first[0] + first[2]) / 2 - (second[0] + second[2]) / 2 - 110) <= 2
+
+
+def test_the_frame_is_the_block_of_cells(tmp_path: Path) -> None:
+    # AviUtl2 の縦書きの入れ物は升目を並べた塊（グラデーションの中心が塊の真ん中だった）
+    # 返さないと、縦書きに掛けたグラデーションや入れ物を使う効果が字の形で掛かる
+    source, _report = read(tmp_path, "縦書 下寄[左]", text="■■\\n■")
+    _image, framed = render_source_framed(source, 1920, 1080)
+    assert framed == pytest.approx((960.0, 380.0, 1120.0, 540.0))
+    native = GeneratedSource(kind="text", params={**source.params, "layout": "native"})
+    assert render_source_framed(native, 1920, 1080)[1] is None
+
+
+def test_a_gradient_on_vertical_text_centres_on_the_block(tmp_path: Path) -> None:
+    # AviUtl2 は縦書きのグラデーションも塊の真ん中を中心に塗った（下寄[左] で差 0.70 → 0.07）
+    # エフェクトのまま絵の真ん中を中心にすると、塊が中心の上にあるので字が全部開始色になる
+    source, _report = read(tmp_path, "縦書 下寄[左]", text="■\\n■")
+    effect = registry.require("gradient").create(
+        start_color=(1.0, 0.0, 0.0, 1.0), end_color=(0.0, 0.0, 1.0, 1.0), angle=0.0, span=40.0
+    )
+    folded = text_gradient_fill(effect, source)
+    assert folded is not None
+    image = render_source(replace(source, params={**source.params, **folded}), 1920, 1080)
+    assert image is not None
+    # 塊は 540 から上へ 80 の 1 段 真ん中は 500 そこより上は赤、下は青
+    x = 1000
+    assert image[470, x, 0] > 200 and image[470, x, 2] < 60, image[470, x]
+    assert image[530, x, 2] > 200 and image[530, x, 0] < 60, image[530, x]
 
 
 def test_the_standard_layout_keeps_its_vertical_text(tmp_path: Path) -> None:

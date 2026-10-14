@@ -867,8 +867,10 @@ def _text_layers(
         # 送っている途中で英単語が行をまたいで飛ぶ
         text = _revealed(_wrapped(raw, wrap_width, metrics, values), values)
     if bool(values.get("vertical", False)):
-        vertical = _vertical_text_path(text, font, metrics, values, width, height, cells)
-        return [(vertical, values, None)], None
+        vertical, column_frame = _vertical_text_path(
+            text, font, metrics, values, width, height, cells
+        )
+        return [(vertical, values, None)], column_frame
 
     lines = text.split(chr(10))
     centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
@@ -1381,39 +1383,51 @@ def _vertical_text_path(
     width: int,
     height: int,
     cells: list[_Cell] | None = None,
-) -> QPainterPath:
-    """縦書きの字の輪郭 行は右から左へ並べる
+) -> tuple[QPainterPath, Frame | None]:
+    """縦書きの字の輪郭と、文字の枠（AviUtl2 の組み方だけ ほかは ``None``） 行は右から左へ並べる
 
     Qt に縦書きの組版は無いので、1 文字ずつ縦に置く 日本語のテロップでは
     使う場面がはっきりあるので、簡素でも入れておく
     ``cells`` を渡すと字の置き場を足す（列が行、送りが字の高さ）
     """
     columns = text.split(chr(10))
-    # AviUtl2 の組み方の縦書きは、字の送りも列の幅も字の大きさ（2026-10-15 に AviUtl2 v2.1.6a で
+    # AviUtl2 の組み方の縦書きは、字の升目も列の幅も字の大きさ（2026-10-15 に AviUtl2 v2.1.6a で
     # Yu Gothic UI 80 を測ると、送りも列の間も 80 だった 標準の組み方は行の高さ 106）
-    # 字は升目の縦の真ん中に字の輪郭の真ん中を合わせる（基準線では置かない g の下がりが
-    # 升目の上へ寄り、H は升目の上から 12 画素だった） 標準の組み方は前からどおり基準線で置く
+    # 字間と行間は字と字・列と列の間にだけ入る（字間 20 の 7 字の列は 680 で、真ん中の揃えの
+    # 塊の上端が字間 0 より 20 ではなく 60 上がった 列の間も同じ） 字は升目の縦の真ん中に字の
+    # 輪郭の真ん中を合わせる（基準線では置かない g の下がりが升目の上へ寄り、H は升目の上から
+    # 12 画素だった） 横は字間を足す前の送り幅の真ん中を列の真ん中に合わせる（字間 20 でも列の
+    # 字の横の位置は字間 0 と同じだった） 標準の組み方は前からどおり（基準線で置き、送りと列の幅に
+    # 字間と行間を足し、塊は送りの数で測る）
     aviutl = values.get("layout") == "aviutl"
+    letter = _number(values, "letter_spacing", 0.0)
+    line = _number(values, "line_spacing", 0.0)
     pitch = _number(values, "size", 64.0) if aviutl else metrics.height()
-    advance = pitch + float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
-    column_width = pitch + float(values.get("line_spacing", 0.0))  # type: ignore[arg-type]
+    advance = pitch + letter
+    column_width = pitch + line
 
-    centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
-    centre_y = height / 2.0 - float(values.get("pos_y", 0.0))  # type: ignore[arg-type]
+    centre_x = width / 2.0 + _number(values, "pos_x", 0.0)
+    centre_y = height / 2.0 - _number(values, "pos_y", 0.0)
     # 1 字ずつ縦に置く 1 字は見た目の 1 字（結合文字や絵文字を割らない）
     glyphs = [graphemes(column) for column in columns]
     tallest = max((len(column) for column in glyphs), default=0)
+
+    def length(count: int) -> float:
+        """``count`` 字の列の長さ AviUtl2 は字間を字と字の間にだけ数える"""
+        if aviutl:
+            return count * pitch + max(count - 1, 0) * letter
+        return count * advance
+
     # 塊の基準は横書きと同じ ``anchor`` と ``valign`` 既定（中・中）は塊の真ん中が位置で、
     # 前の置き方と同じ 見ずにいると、左上を基準にした縦書きも真ん中に置かれる
-    block_width = column_width * len(columns)
+    count = len(columns)
+    block_width = count * pitch + max(count - 1, 0) * line if aviutl else column_width * count
     block_left = centre_x - block_width * _HORIZONTAL_SHARE.get(
         str(values.get("anchor", "center")), 0.5
     )
     # 右端の列の真ん中 列は右から左へ並ぶ
-    left = block_left + block_width - column_width / 2.0
-    top = centre_y - advance * tallest * _VERTICAL_SHARE.get(
-        str(values.get("valign", "middle")), 0.5
-    )
+    left = block_left + block_width - (pitch if aviutl else column_width) / 2.0
+    top = centre_y - length(tallest) * _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5)
 
     # AviUtl2 の縦書きは列どうしも縦の揃えに合わせる（上寄・中央・下寄で短い列が上・真ん中・下へ
     # 寄った 2026-10-15 に AviUtl2 v2.1.6a で測った） 標準の組み方は前からどおり列を上で揃える
@@ -1422,28 +1436,31 @@ def _vertical_text_path(
     path = QPainterPath()
     for column_index, column in enumerate(glyphs):
         x = left - column_width * column_index
-        column_top = top + advance * (tallest - len(column)) * column_share
+        column_top = top + (length(tallest) - length(len(column))) * column_share
         for row_index, character in enumerate(column):
-            baseline = column_top + advance * row_index + metrics.ascent()
+            cell_top = column_top + advance * row_index
+            baseline = cell_top + metrics.ascent()
+            offset = metrics.horizontalAdvance(character) / 2.0
             if aviutl:
                 ink = QPainterPath()
                 ink.addText(QPointF(0.0, 0.0), font, character)
                 if not ink.isEmpty():
-                    middle = ink.boundingRect().center().y()
-                    baseline = column_top + advance * row_index + pitch / 2.0 - middle
-            offset = metrics.horizontalAdvance(character) / 2.0
+                    baseline = cell_top + pitch / 2.0 - ink.boundingRect().center().y()
+                # 字の書体には字間が足してある（Qt の字間は 1 字ごとの送り幅に入る）
+                offset = (metrics.horizontalAdvance(character) - letter) / 2.0
             path.addText(QPointF(x - offset, baseline), font, character)
             if cells is not None:
                 glyph = QPainterPath()
                 glyph.addText(QPointF(x - offset, baseline), font, character)
-                cell = QRectF(
-                    x - column_width / 2.0,
-                    column_top + advance * row_index,
-                    column_width,
-                    advance,
-                )
+                side = pitch if aviutl else column_width
+                height_of = pitch if aviutl else advance
+                cell = QRectF(x - side / 2.0, cell_top, side, height_of)
                 cells.append(_Cell(column_index, cell, glyph.boundingRect()))
-    return path
+    if not aviutl:
+        return path, None
+    # AviUtl2 の縦書きの入れ物は列の升目を並べた塊（グラデーションの中心が塊の真ん中だった
+    # 2026-10-15 下寄[左] と 上寄[右] で測った） 横書きと同じく文字の枠として返す
+    return path, (block_left, top, block_left + block_width, top + length(tallest))
 
 
 def _group_layers(groups: list[_Group], values: dict[str, object]) -> list[_Layer]:

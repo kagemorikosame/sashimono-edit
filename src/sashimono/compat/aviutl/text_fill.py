@@ -57,8 +57,6 @@ def _plain_text(source: GeneratedSource) -> bool:
     text = params.get("text")
     if not isinstance(text, str) or "<" in text:
         return False
-    if params.get("vertical") is True:
-        return False
     for name in ("border_width", "shadow_x", "shadow_y", "shadow_blur"):
         amount = _static(params.get(name), 0.0)
         if amount is None or amount != 0.0:
