@@ -192,6 +192,8 @@ class TestTheKeyboard:
         assert abs(GradientSpec.stops(record.changed[-1])[1][0] - 0.99) < 1e-6
 
     def test_insert_and_delete(self, editor: GradientEditor) -> None:
+        # キーで足せず消せないと、マウスを使えない人が止まりの数を変えられない
+        # 2 つより減らせると、バーで動かせる物が無くなり、グラデーションに戻せない
         record = Recorder(editor)
         bar = editor.bar
         bar.select(0)
@@ -245,6 +247,7 @@ class TestTheFields:
         assert editor._position.value() == 50.0
 
     def test_the_fields_follow_the_selected_stop(self, editor: GradientEditor) -> None:
+        # 欄が選んだ止まりを追わないと、別の止まりの値を見ながら直して、違う止まりが変わる
         editor.set_value((0.0, *RED, 0.75, 0.0, 0.0, 1.0, 0.5))
         editor.bar.select(1)
         assert editor._position.value() == 75.0
@@ -252,6 +255,8 @@ class TestTheFields:
         assert editor._colour.text() == "#0000FF"
 
     def test_the_buttons_add_and_remove(self, editor: GradientEditor) -> None:
+        # ボタンが効かないと、バーのクリックや Delete を知らない人が止まりを足し引きできない
+        # 2 つのときに〔−〕が押せると、押しても何も起きず壊れたように見える
         record = Recorder(editor)
         assert not editor._remove.isEnabled()
         editor._add.click()

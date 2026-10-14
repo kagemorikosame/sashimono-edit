@@ -171,6 +171,8 @@ class TestTheChain:
         assert any(effect.kind == "brush_fill" for effect in mapped.clip.effects)
 
     def test_a_plain_text_item_gets_the_fill(self) -> None:
+        # 読み込みで写らないと、YMM4 の字幕のグラデーションを設定パネルのバーで直せない
+        # 塗りのエフェクトも残ると、同じ塗りが 2 度掛かって色が濃くなる
         plain = text_item(VideoEffects=[fill(*GREEN_FADE)])
         (mapped,) = map_template([plain])
         assert mapped.clip.source is not None

@@ -140,6 +140,7 @@ class TestTheShownFields:
         assert "fill_radius" not in shown and "fill_center_x" not in shown
 
     def test_a_radial_fill_shows_the_centre_and_radius(self) -> None:
+        # 円形で中心と半径が出ないと光る所を動かせず、角度が出ると動かしても何も変わらない
         shown = self._shown(fill_type="radial")
         assert {"fill_center_x", "fill_center_y", "fill_radius"} <= set(shown)
         assert "fill_angle" not in shown
@@ -157,6 +158,7 @@ class TestTheShownFields:
         assert "shadow_fill_type" in self._shown(shadow_y=-4)
 
     def test_a_layer_shows_the_bar_when_it_is_a_gradient(self) -> None:
+        # 縁取りの層でバーが出ないと、層の色をグラデーションにしても直す所が無い
         params = {**STROKE.default_params(), "fill_type": "linear"}
         unused = STROKE.unused_names(params)
         assert "color" in unused and "fill_gradient" not in unused
