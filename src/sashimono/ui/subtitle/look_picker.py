@@ -199,7 +199,11 @@ class LookPicker(QWidget):
             self._tabs.setCurrentIndex(index)
             self._tabs.blockSignals(False)
             self._fill(select=key)
-            return True
+            # 棚の配布物は選んだときに初めて読む 覚えていた物が書き換わって文字を持たなく
+            # なっていると、ここで初めて断られる 断られた物を選んだことにすると、窓を開いた
+            # 直後から〔焼き込む〕が押せず、既定の見た目へ戻す呼び手の手当ても働かない
+            current = self._current
+            return current is not None and current.key == key and not current.refusal
         return False
 
     def shown(self) -> list[LookChoice]:

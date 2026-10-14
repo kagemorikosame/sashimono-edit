@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QListWidget, Q
 
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
+from sashimono.compat.catalog import TemplateCatalog
 from sashimono.compat.subtitle_looks import (
     DEFAULT,
     SELECTED,
@@ -26,6 +27,7 @@ from sashimono.compat.subtitle_looks import (
     alias_choice,
     default_choice,
     selected_choice,
+    template_choice,
 )
 from sashimono.core.commands import AddClip, AddTrack, Command, Voice
 from sashimono.core.commands.fixed import with_fixed_items
@@ -222,6 +224,36 @@ class TestBurning:
 
 
 class TestTheWindow:
+    def test_a_remembered_shelf_look_that_no_longer_has_text_falls_back(
+        self,
+        panel: tuple[SubtitlePanel, list[list[Command]]],
+        thumbnails: LookThumbnails,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると、覚えた棚のテンプレートが書き換わって文字を持たなくなったとき、窓が断られた
+        # 選択のまま開き、〔焼き込む〕が押せない（既定の見た目へ戻らない CodeRabbit の指摘）
+        widget, _sent = panel
+        shelf = tmp_path / "棚"
+        shelf.mkdir()
+        (shelf / "丸だけ.object").write_text(
+            "\n".join(["[Object]", "frame=0,89", "[Object.0]", "effect.name=図形", ""]),
+            "utf-8",
+        )
+        (entry,) = TemplateCatalog().scan((shelf,))
+        widget.shelf_provider = lambda: (entry,)
+        widget.remember_look = True
+        widget.last_look = template_choice(entry).key
+        request = widget._request([(None, 0)], title="置く", accept="置く", choose=False)
+        dialog = BurnDialog(
+            request, thumbnails=thumbnails, options=LibraryOptions(thumbnails=THUMBNAILS_SIMPLE)
+        )
+        try:
+            answer = dialog.answer()
+            assert answer is not None and answer.look.key == DEFAULT
+        finally:
+            dialog.reject()
+            dialog.deleteLater()
+
     def test_text_less_aliases_are_greyed_and_thumbnails_are_drawn(
         self,
         panel: tuple[SubtitlePanel, list[list[Command]]],
