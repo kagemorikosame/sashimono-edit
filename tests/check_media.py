@@ -39,11 +39,17 @@ def write_video(
     tone_db: float | None = None,
     clipped: tuple[float, float] | None = None,
     silent: tuple[float, float] | None = None,
+    audio_codec: str = "aac",
 ) -> Path:
     """動く絵の動画を焼く 区間（秒）を渡すと、そこだけ問題のある絵と音にする
 
-    ``tone_db`` を渡すと音も付ける（AAC） ``clipped`` の間は振幅 2 の正弦波を ±1 で
-    切った音（頭打ちが続く）、``silent`` の間は無音
+    ``tone_db`` を渡すと音も付ける（既定は書き出しと同じ AAC） ``clipped`` の間は
+    振幅 2 の正弦波を ±1 で切った音（頭打ちが続く）、``silent`` の間は無音
+
+    音の位置や大きさを細かく見る試験は ``audio_codec="pcm_s16le"`` と ``.mkv`` で焼く
+    AAC は頭打ちの平らな所を崩す（手元の FFmpeg では 1.05〜1.17 秒の山が 0.965 まで
+    下がった） 崩れ方はエンコーダの版で変わり、CI の Windows では音割れの終わりが
+    0.17 秒手前に来た 圧縮しない PCM ならどの環境でも同じ値になる
     """
     frames = round(seconds * FPS)
     codec = "libx264" if "libx264" in av.codecs_available else "mpeg4"
@@ -56,9 +62,9 @@ def write_video(
         stream.options = {"crf": "18"} if codec == "libx264" else {"qscale": "2"}
         audio = None
         if tone_db is not None:
-            made = container.add_stream("aac", rate=RATE)
+            made = container.add_stream(audio_codec, rate=RATE)
             if not isinstance(made, av.AudioStream):
-                raise TypeError("aac が音の流れを作らなかった")
+                raise TypeError(f"{audio_codec} が音の流れを作らなかった")
             audio = made
             audio.layout = "stereo"
         for index in range(frames):

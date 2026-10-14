@@ -34,6 +34,7 @@ from sashimono.engine.audio import AudioMixer
 from sashimono.engine.checks.overflow import OverflowScan
 from sashimono.engine.checks.report import CheckReport, ClipIndex, assemble
 from sashimono.engine.checks.scan import (
+    CLIPPING,
     TEXT_OVERFLOW,
     AudioScan,
     CheckLimits,
@@ -52,6 +53,8 @@ ANALYSIS_WIDTH = 480
 #: 画面へ進み具合を知らせる間（秒） 1 コマごとに知らせると、短いコマの作品で画面の
 #: スレッドが知らせを捌くだけで忙しくなる
 _NOTIFY_SECONDS = 0.2
+#: 符号化しても標本の値が変わらない音のコーデック（名前の頭） これ以外は音割れを取りこぼしうる
+_LOSSLESS_AUDIO = ("pcm_", "flac", "alac", "wavpack", "tta")
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,6 +456,19 @@ def _check_file(path: Path, progress: _Progress) -> None:
                 )
             if limits.needs_sound and audio is None:
                 progress.notes.append("この動画には音がありません")
+            if (
+                CLIPPING in limits.kinds
+                and audio is not None
+                and not audio.codec_context.name.startswith(_LOSSLESS_AUDIO)
+            ):
+                # AAC などは頭打ちの平らな所を崩す（ふくらんだり 0.96 ほどまで下がったりする）
+                # 崩れた所は続けて最大に届かないので、音割れの一部しか拾えない 拾えなかった物を
+                # 「無い」と読ませない 書き出しは混ぜた音を ±1 で切ってから符号化するので、
+                # 符号化する前の音（タイムライン）を調べれば確かに拾える
+                progress.notes.append(
+                    f"音が圧縮されている（{audio.codec_context.name}）ので、音割れは一部しか"
+                    "拾えないことがあります 確かめるにはタイムラインを調べてください"
+                )
         resampler = av.AudioResampler(format="fltp")
         streams = [stream for stream in (video, audio) if stream is not None]
         pictures = 0

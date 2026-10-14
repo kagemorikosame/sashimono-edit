@@ -58,16 +58,20 @@ class TestWrittenFiles:
 
     def test_each_planted_problem_is_found_where_it_is(self, job: CheckJob, tmp_path: Path) -> None:
         # 壊れると、書き出した動画の黒・止まり・無音・音割れを見落とし、そのまま人へ渡る
+        # 音は圧縮しない PCM で焼く AAC は頭打ちの平らな所を崩し、崩れ方がエンコーダの版で
+        # 変わる（CI では音割れの終わりが 0.17 秒手前に来た） ここで見たいのは検査の位置の正しさ
         path = write_video(
-            tmp_path / "flawed.mp4",
+            tmp_path / "flawed.mkv",
             12.0,
             black=(2.0, 2.5),
             frozen=(4.0, 7.0),
             tone_db=-14.0,
             silent=(8.0, 10.5),
             clipped=(1.0, 1.2),
+            audio_codec="pcm_s16le",
         )
         report = _check(job, path)
+        assert not any("圧縮" in note for note in report.notes)
         found = _kinds(report)
         (black,) = found["black"]
         assert black == pytest.approx((2.0, 2.5), abs=0.05)
@@ -79,6 +83,16 @@ class TestWrittenFiles:
         (clipping,) = found["clipping"]
         assert clipping[0] == pytest.approx(1.0, abs=0.05)
         assert clipping[1] == pytest.approx(1.2, abs=0.05)
+
+    def test_compressed_sound_says_clipping_may_be_missed(
+        self, job: CheckJob, tmp_path: Path
+    ) -> None:
+        # 壊れると、AAC で崩れて拾えなかった音割れを、AI が「音割れ無し」と言い切る
+        path = write_video(tmp_path / "aac.mp4", 2.0, tone_db=-14.0)
+        report = _check(job, path)
+        assert any("圧縮" in note and "タイムライン" in note for note in report.notes)
+        only_loudness = _check(job, path, CheckLimits(kinds=frozenset({"loudness"})))
+        assert not any("圧縮" in note for note in only_loudness.notes)
 
     def test_text_overflow_is_not_claimed_for_a_file(self, job: CheckJob, tmp_path: Path) -> None:
         # 壊れると、字の形の残らない動画を「字幕のはみ出し無し」と言い切り、AI が安心して渡す
