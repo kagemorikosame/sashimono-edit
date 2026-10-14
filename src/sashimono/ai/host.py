@@ -13,7 +13,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core.commands import Command, Document
+from sashimono.core.io.library import Library
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 
@@ -114,6 +116,21 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.subtitle_wrap_share`）
 
         画面の〔焼き込み〕と同じにする 頼み方で字幕が折り返したり切れたりしないように
+        """
+        ...
+
+    def look_library(self) -> Library:
+        """保存したプリセットと自作のエイリアスの置き場（タイムラインの〔追加〕と同じ物）
+
+        字幕を置く道具が、見た目を名前で選ぶのに使う（#308）
+        """
+        ...
+
+    @property
+    def look_rules(self) -> LookRules:
+        """字幕に見た目を着せる決まり（本人のプリセットの当て方と、棚の着せ替えの設定）
+
+        画面の〔焼き込み〕と同じにする 頼み方で同じプリセットの当たり方が変わらないように
         """
         ...
 

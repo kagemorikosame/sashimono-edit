@@ -22,6 +22,7 @@ from sashimono.ai.models import DEFAULT_EFFORT as DEFAULT_AI_EFFORT
 from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
+from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.atomic import held_for_update, write_atomic
@@ -458,6 +459,14 @@ class Preferences:
     #: 折り返す幅（画面の幅の何 %） 既定 90 は左右に 5% ずつの余白で、縁取りと影が画面の
     #: 端に掛からない 端まで使いたい人は 100、狭くまとめたい人は下げる
     subtitle_wrap_percent: int = 90
+    #: 字幕を置く窓（焼き込み・選んだ行を置く #308）で、最後に使った見た目を次も選んでおく
+    #: 既定は切（今まで通り、タイムラインで選んでいるテキストがあればそれ、無ければ既定の見た目）
+    #: 選ぶテキストを毎回替えて写す人が多く、覚えると前のプリセットが選ばれていて気付かない
+    #: いつも同じエイリアスで字幕を置く人は入れる
+    subtitle_look_remember: bool = False
+    #: 覚えた見た目の鍵（``compat.subtitle_looks.LookChoice.key``） 設定画面には出さない
+    #: 覚える設定が入っているときだけ、置くたびに書く
+    subtitle_look_last: str = ""
     #: 保存していない変更を一定の間隔で退避し、落ちた後の起動で復元を勧める（#271）
     #: 既定は入（前からの動き） 切ると、落ちたときに最後に保存した所までしか戻らない
     #: 書き込みを減らしたい人・自分でこまめに保存する人は切れる
@@ -518,6 +527,11 @@ class Preferences:
     def splits_media(self) -> bool:
         """素材を置く所（:func:`~sashimono.core.commands.insert_media`）へ渡す値"""
         return self.media_split == MEDIA_SPLIT
+
+    @property
+    def look_rules(self) -> LookRules:
+        """字幕に見た目を着せる決まり（#308） 設定パネルや棚から着せ替えるときと同じにする"""
+        return LookRules(preset_options=self.preset_options, keep_wrap=self.restyle_keep_wrap)
 
     @property
     def preset_options(self) -> PresetOptions:
@@ -681,6 +695,10 @@ class PreferenceStore:
             subtitle_wrap_percent=_wrap_percent(
                 data.get("subtitle_wrap_percent"), plain.subtitle_wrap_percent
             ),
+            subtitle_look_remember=_flag(
+                data.get("subtitle_look_remember"), plain.subtitle_look_remember
+            ),
+            subtitle_look_last=_text(data.get("subtitle_look_last"), plain.subtitle_look_last),
             autosave=_flag(data.get("autosave"), plain.autosave),
             autosave_seconds=_within(
                 data.get("autosave_seconds"), AUTOSAVE_SECONDS_RANGE, plain.autosave_seconds
@@ -885,6 +903,11 @@ def _within(value: object, bounds: tuple[int, int], default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if bounds[0] <= value <= bounds[1] else default
+
+
+def _text(value: object, default: str) -> str:
+    """文字の値 文字でなければ既定へ戻す（壊れた値で起動を止めない）"""
+    return value if isinstance(value, str) else default
 
 
 def _folder(value: object, default: str) -> str:

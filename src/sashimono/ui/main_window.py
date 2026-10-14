@@ -47,6 +47,7 @@ from sashimono import __version__
 from sashimono.ai.host import ToolError
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.exo import ExoFile
+from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands import (
     DEFAULT_GENERATED_FRAMES,
@@ -97,6 +98,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
+from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
@@ -517,7 +519,10 @@ class MainWindow(QMainWindow):
         self._subtitles = SubtitlePanel(project, self._analyzer, self)
         # 焼き込みのひな形は、タイムラインで選んでいるテキストのクリップ
         self._subtitles.template_provider = self._selected_text_clip
-        self._subtitles.wrap_share = self._preferences.subtitle_wrap_share
+        # 見た目の一覧（#308）はタイムラインの〔追加〕と同じ置き場を並べる
+        self._subtitles.library_provider = self.look_library
+        self._subtitles.shelf_provider = lambda: self._timeline.add_sources.templates()
+        self._apply_subtitle_preferences(self._preferences)
         self._chat = ChatPanel(self, self)
         self._playback = PlaybackController(
             project, self, smooth_history=self._preferences.smooth_audio_motion
@@ -966,7 +971,7 @@ class MainWindow(QMainWindow):
         self._media_pool.set_view_mode(preferences.media_view)
         self._chat.apply_preferences(preferences)
         self._timeline.set_value_lines(preferences.value_lines)
-        self._subtitles.wrap_share = preferences.subtitle_wrap_share
+        self._apply_subtitle_preferences(preferences)
         self._timeline.set_detail_min_width(preferences.detail_min_width)
         self._timeline.set_stretch_waves(preferences.stretch_waves)
         self._playback.set_smooth_history(preferences.smooth_audio_motion)
@@ -1204,6 +1209,7 @@ class MainWindow(QMainWindow):
         self._subtitles.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 5000)
         )
+        self._subtitles.look_used.connect(self._remember_subtitle_look)
 
         self._chat.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 5000)
@@ -1953,6 +1959,29 @@ class MainWindow(QMainWindow):
         preferences = replace(self._preferences, playhead_snap=enabled)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._remember_preferences(preferences)
+
+    def _apply_subtitle_preferences(self, preferences: Preferences) -> None:
+        """字幕を置く窓へ本人の設定を渡す 着せ替えの決まりは設定パネルや棚と同じにする"""
+        panel = self._subtitles
+        panel.wrap_share = preferences.subtitle_wrap_share
+        panel.look_rules = preferences.look_rules
+        panel.remember_look = preferences.subtitle_look_remember
+        panel.last_look = preferences.subtitle_look_last
+
+    def _remember_subtitle_look(self, key: str) -> None:
+        """字幕を置いた見た目を覚える 覚える設定のときだけ書く（切っていれば設定を書き換えない）"""
+        if (
+            not self._preferences.subtitle_look_remember
+            or key == self._preferences.subtitle_look_last
+        ):
+            return
+        self._remember_preferences(replace(self._preferences, subtitle_look_last=key))
+        self._subtitles.last_look = key
+
+    def look_library(self) -> Library:
+        """プリセットとエイリアスの置き場 タイムラインの〔追加〕と同じ物（AI の道具も使う）"""
+        sources = self._timeline.add_sources
+        return Library(presets=sources.presets, aliases=sources.aliases)
 
     def _remember_preferences(self, preferences: Preferences) -> None:
         """設定画面の外で選んだ好みを覚える 次に開いたときも同じにする"""
@@ -2770,13 +2799,12 @@ class MainWindow(QMainWindow):
 
         置き場はタイムラインの〔追加〕と同じ物を使う（試験で差し替えた置き場も同じに見える）
         """
-        from sashimono.core.io.library import PRESET, Library
+        from sashimono.core.io.library import PRESET
         from sashimono.ui.library_dialog import open_library
 
-        sources = self._timeline.add_sources
         open_library(
             self,
-            Library(presets=sources.presets, aliases=sources.aliases),
+            self.look_library(),
             kind=PRESET,
             # 〔いまのクリップで上書き〕は設定パネルが見ているクリップ（選んでいれば）
             capture=self._inspector.capture_look,
@@ -3041,6 +3069,11 @@ class MainWindow(QMainWindow):
     def subtitle_wrap_share(self) -> int:
         """AI が焼き込む字幕も、画面の〔焼き込み〕と同じ幅で折り返す"""
         return self._preferences.subtitle_wrap_share
+
+    @property
+    def look_rules(self) -> LookRules:
+        """AI が見た目を選んで置く字幕も、画面の〔焼き込み〕と同じ決まりで着せる"""
+        return self._preferences.look_rules
 
     def set_active_scene(self, scene_id: SceneId | None) -> None:
         self.open_scene(scene_id)
