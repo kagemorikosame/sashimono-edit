@@ -269,9 +269,14 @@ def analyze_scenes(
         if duration <= 0:
             return SceneSignal.empty(stream=stream.index)
 
+        #: 映像のストリームの長さ 読み終えたかを照らす相手（:func:`_ended_early`）
+        length = _stream_length(stream)
         #: 1 つ前のフレームの（縮めた輝度, ヒストグラム）
         previous: tuple[np.ndarray, np.ndarray] | None = None
         last = 0.0
+        #: 最後に読めたフレームが出終わる時刻と、フレームの間隔（どちらも秒）
+        shown_until = 0.0
+        steps: list[float] = []
         try:
             for frame in container.decode(stream):
                 if should_cancel is not None and should_cancel():
@@ -292,6 +297,9 @@ def analyze_scenes(
                     # 途中で大きさが変わる素材（配信の録画など）は比べずに数え直す
                     # 大きさの違う絵を比べる意味は無く、形の違いで落ちる
                     scan.reach(moment)
+                if previous is not None and moment > last:
+                    steps.append(moment - last)
+                shown_until = moment + _frame_length(frame, steps)
                 previous, last = (luma, shape), moment
                 if progress is not None:
                     progress(min(1.0, moment / duration))
@@ -304,6 +312,10 @@ def analyze_scenes(
             return scan.snapshot(analyzed=last, broken=True)
     if progress is not None:
         progress(1.0)
+    if _ended_early(length, shown_until, steps):
+        # 例外を出さずに途中で黙って止まる壊れ方もある（同じ切った MP4 が、手元では
+        # InvalidDataError、CI では黙って止まった PR #358） どちらも同じ扱いにする
+        return scan.snapshot(analyzed=last, broken=True)
     return scan.snapshot(complete=True, analyzed=max(last, duration))
 
 
@@ -313,6 +325,46 @@ def _duration(container: av.container.InputContainer, stream: av.VideoStream) ->
     if container.duration is not None:
         return container.duration / 1_000_000
     return 0.0
+
+
+#: 読み終えたと見なす差の下限（秒） 最後のフレームが出終わる時刻が、映像のストリームの
+#: 長さよりこれ以上手前なら途中で終わったと見る 小さくすると、目次の長さを少し長めに
+#: 書く素材（編集リストの端数など）を壊れたと取り違える
+END_TOLERANCE = 0.5
+
+
+def _stream_length(stream: av.VideoStream) -> float | None:
+    """映像のストリームの長さ（秒） 書いていない素材（mkv など）は ``None``
+
+    コンテナの長さは使わない 音の方が長い素材では、映像を読み終えても届かない
+    """
+    if stream.duration is None or stream.time_base is None or stream.duration <= 0:
+        return None
+    return float(stream.duration * as_fraction(stream.time_base))
+
+
+def _frame_length(frame: av.VideoFrame, steps: list[float]) -> float:
+    """フレームが出ている長さ（秒） 書いてあればそれ、無ければ今までの間隔の中央値
+
+    書いてある長さを先に使うのは、可変フレームレートで最後の 1 枚を長く出す素材
+    （止めた画面の録画など）で、最後の時刻だけを見ると途中で終わったと取り違えるため
+    """
+    if frame.duration and frame.time_base is not None:
+        return float(frame.duration * as_fraction(frame.time_base))
+    return float(np.median(steps)) if steps else 0.0
+
+
+def _ended_early(length: float | None, shown_until: float, steps: list[float]) -> bool:
+    """最後のフレームが出終わる時刻が、映像のストリームの長さより明らかに手前か
+
+    長さが分からない素材は照らせないので、読み終えたと見なす 差の許容はフレームの
+    間隔の 2 倍か :data:`END_TOLERANCE` の大きい方 フレームの間隔の分だけの差は、
+    最後のフレームの長さを書いていない正常な素材でも出る
+    """
+    if length is None:
+        return False
+    step = float(np.median(steps)) if steps else 0.0
+    return shown_until + max(END_TOLERANCE, 2.0 * step) < length
 
 
 def _frame_seconds(frame: av.VideoFrame, origin: Fraction) -> float | None:

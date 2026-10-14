@@ -7,9 +7,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 
 import av
+import av.container
+import av.error
 import numpy as np
 import pytest
 from PySide6.QtGui import QColor, QImage
@@ -153,6 +157,129 @@ class TestReading:
     def test_a_missing_file_has_no_scenes(self, tmp_path: Path) -> None:
         # 開けない素材で例外を投げると、裏のスレッドの解析が理由を残さずに落ちる
         assert analyze_scenes(tmp_path / "missing.mp4") is None
+
+
+class _Quiet:
+    """読む途中の FFmpegError を飲み込んで黙って止まる入れ物（CI の FFmpeg の振る舞い）
+
+    同じ切った MP4 でも、手元では途中で例外になり、CI では黙って止まった（PR #358）
+    どちらの機械でも黙って止まる道を通すため、例外を飲み込む形を作って差し込む
+    """
+
+    def __init__(self, container: av.container.InputContainer) -> None:
+        self._container = container
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._container, name)
+
+    def __enter__(self) -> _Quiet:
+        return self
+
+    def __exit__(self, *_details: object) -> None:
+        self._container.close()
+
+    def decode(self, *streams: av.VideoStream) -> Iterator[av.VideoFrame]:
+        try:
+            for frame in self._container.decode(*streams):
+                assert isinstance(frame, av.VideoFrame)
+                yield frame
+        except av.error.FFmpegError:
+            return
+
+
+def _write_mjpeg(path: Path, frames: list[tuple[Fraction, Fraction]]) -> Path:
+    """フレームの（出す時刻, 出す長さ）のとおりに並べた絵 鍵フレームだけの MJPEG"""
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mjpeg", rate=30)
+        assert isinstance(stream, av.VideoStream)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuvj420p"
+        stream.time_base = Fraction(1, 1000)
+        for index, (moment, length) in enumerate(frames):
+            image = np.full((48, 64, 3), (index * 37) % 256, np.uint8)
+            frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+            frame.pts = round(moment * 1000)
+            frame.time_base = Fraction(1, 1000)
+            for packet in stream.encode(frame):
+                assert packet.time_base is not None
+                packet.duration = round(length / packet.time_base)
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return path
+
+
+class TestTheEnd:
+    """読み終えたかを、映像のストリームの長さと最後のフレームで照らす（PR #358）"""
+
+    def test_a_video_that_stops_silently_is_broken(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 例外を出さずに黙って止まる壊れ方を読み終えたと返すと、後ろの切り替わりの無い
+        # 一覧を全部だと思って覚える（CI の Python 3.12 と 3.14 で起きた）
+        path = write_broken_video(tmp_path / "broken.mp4")
+        real_open = av.open
+        # 解析は av.open で開く 開いた物を包んで返し、黙って止まる道を通す
+        monkeypatch.setattr(av, "open", lambda name: _Quiet(real_open(name)))
+        found = analyze_scenes(path)
+        assert found is not None
+        assert not found.complete and found.broken
+        assert found.analyzed < CUTS[-1]
+
+    def test_a_long_last_frame_is_not_broken(self, tmp_path: Path) -> None:
+        # 最後の時刻だけを見ると、止めた画面を長く出して終わる可変フレームレートの録画を
+        # 壊れたと取り違え、AI に「続きは出ない」と誤って伝える
+        step = Fraction(1, 30)
+        plan = [(index * step, step) for index in range(30)] + [(Fraction(1), Fraction(3))]
+        found = analyze_scenes(_write_mjpeg(tmp_path / "hold.mp4", plan))
+        assert found is not None
+        assert found.complete and not found.broken
+
+    def test_sound_longer_than_the_picture_is_not_broken(self, tmp_path: Path) -> None:
+        # コンテナの長さ（音の終わり）と比べると、音の方が長い素材を壊れたと取り違える
+        path = tmp_path / "long_sound.mp4"
+        with av.open(str(path), "w") as container:
+            video = container.add_stream("mjpeg", rate=30)
+            assert isinstance(video, av.VideoStream)
+            video.width, video.height, video.pix_fmt = 64, 48, "yuvj420p"
+            sound = container.add_stream("aac", rate=48000)
+            assert isinstance(sound, av.AudioStream)
+            sound.layout = "mono"
+            for index in range(60):
+                image = np.full((48, 64, 3), index * 4, np.uint8)
+                for packet in video.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
+                    container.mux(packet)
+            for packet in video.encode():
+                container.mux(packet)
+            samples = np.zeros((1, 1024), np.float32)
+            for index in range(48000 * 5 // 1024):
+                chunk = av.AudioFrame.from_ndarray(samples, format="fltp", layout="mono")
+                chunk.sample_rate = 48000
+                chunk.pts = index * 1024
+                for packet in sound.encode(chunk):
+                    container.mux(packet)
+            for packet in sound.encode():
+                container.mux(packet)
+        with av.open(str(path)) as container:
+            assert container.duration is not None and container.duration / 1_000_000 > 4
+        found = analyze_scenes(path)
+        assert found is not None
+        assert found.complete and not found.broken
+
+    def test_a_video_without_a_stream_length_is_not_broken(self, tmp_path: Path) -> None:
+        # 長さを書かない入れ物（mkv）で壊れたと決めると、普通の mkv がどれも「続きは出ない」になる
+        path = tmp_path / "plain.mkv"
+        step = Fraction(1, 30)
+        _write_mjpeg(path, [(index * step, step) for index in range(30)])
+        with av.open(str(path)) as container:
+            assert container.streams.video[0].duration is None
+        found = analyze_scenes(path)
+        assert found is not None
+        assert found.complete and not found.broken
+
+    def test_the_last_frame_just_before_the_end_is_fine(self, signal: SceneSignal) -> None:
+        # 最後のフレームは長さの 1 フレーム手前に出る 照らし方が厳しいと、正常な素材が
+        # どれも壊れた扱いになる（焼いた動画は 11.967 秒が最後 長さは 12 秒）
+        assert signal.complete and not signal.broken
 
 
 class TestTheThreshold:
