@@ -102,9 +102,10 @@ def describe_background(proxy: ProgressSnapshot, analysis: ProgressSnapshot) -> 
     if proxy.busy:
         parts.append(f"控え {proxy.finished}/{proxy.total} 本 {round(proxy.fraction * 100)}%")
     if analysis.busy:
+        # 解析は波形・サムネイル・場面の一覧（#321）を合わせて数える 前は「波形とサムネイル」と
+        # 書いていたが、場面を調べている間もそう出ると、何に CPU を使っているのかを取り違える
         parts.append(
-            f"波形とサムネイル {analysis.finished}/{analysis.total} 件 "
-            f"{round(analysis.fraction * 100)}%"
+            f"解析 {analysis.finished}/{analysis.total} 件 {round(analysis.fraction * 100)}%"
         )
     failed = proxy.failed + analysis.failed
     text = "・".join(parts)

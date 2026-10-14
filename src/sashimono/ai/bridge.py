@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation, QuestionSpec
+from sashimono.ai.operations import Operation, Pending, QuestionSpec
 
 __all__ = ["Approval", "EditorBridge", "Question"]
 
@@ -36,6 +37,10 @@ APPROVAL_TIMEOUT = 600.0
 #: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 用意を待つ道具（:class:`~sashimono.ai.operations.Pending`）が 1 回に待つ長さ（秒）
+#: 中断のボタンが効くまでの遅れの上限になる
+WAIT_SLICE = 0.2
 
 
 @dataclass(slots=True)
@@ -146,7 +151,24 @@ class EditorBridge:
             return self.ask(spec)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
-        return self.call(lambda: operation(self._host, arguments))
+        result = self.call(lambda: operation(self._host, arguments))
+        if isinstance(result, Pending):
+            # 待つのはこの（AI の）スレッド 画面のスレッドは待つ間も動き続ける
+            self._wait(result)
+            return self.call(result.then)
+        return result
+
+    def _wait(self, pending: Pending) -> None:
+        """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
+
+        少しずつ区切って待つのは、中断のボタンを待つ間にも効かせるため 区切らずに
+        上限（最長 2 分）まで待つと、押しても止まらない
+        """
+        deadline = time.monotonic() + max(0.0, pending.seconds)
+        while not self._cancel.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
+                return
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""
