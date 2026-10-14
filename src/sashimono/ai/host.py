@@ -137,3 +137,29 @@ class EditorHost(Protocol):
     def transcription_status(self) -> str:
         """走っている起こしの様子"""
         ...
+
+    @property
+    def project_path(self) -> Path | None:
+        """開いている作品（``.sme``）の場所 保存していなければ ``None``
+
+        AI が書ける場所（:func:`~sashimono.ai.safety.writable_path`）はこのフォルダが基準
+        """
+        ...
+
+    @property
+    def export_folder(self) -> Path | None:
+        """書き出しの窓で前に選んだフォルダ 一度も書き出していなければ ``None``
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.export_folder`）
+
+        人が窓で選んで書き出した所なので、AI もそこへは書ける（2026-10-14 利用者の決定）
+        """
+        ...
+
+    def app_settings(self) -> dict[str, object]:
+        """アプリ自身の設定（好み・ショートカット・画面配置・版・ヘルプ）の写し
+
+        AI は読むだけ（2026-10-14 利用者の決定） 変える口はこの窓口に置かない 置くと、
+        ショートカットや更新の設定を AI が黙って変えられ、人が気付かないまま次の起動から
+        動きが変わる 返すのは写しで、受け取った側が書き換えても元は変わらないこと
+        """
+        ...

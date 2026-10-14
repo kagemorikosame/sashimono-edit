@@ -18,7 +18,8 @@ from sashimono.ai.ledger import (
     Entry,
     Status,
 )
-from sashimono.ai.operations import OPERATIONS
+from sashimono.ai.operations import OPERATIONS, find_operation
+from sashimono.ai.safety import Safety
 
 _NAMES = {operation.name for operation in OPERATIONS}
 
@@ -74,6 +75,56 @@ class TestToolsAgreeWithTheLedger:
         # 落ちると: 道具を足して台帳に書かなくても通り、台帳が実物とずれる
         rows = tuple(entry for entry in LEDGER if "undo" not in entry.tools)
         assert "undo" in unmapped_tools(rows, AI_ONLY)
+
+
+def safety_mismatches(rows: tuple[Entry, ...]) -> list[str]:
+    """行の区分（#350 の 読むだけ・取り消せる・取り消せない）と道具の区分が違う所"""
+    wrong: list[str] = []
+    for entry in rows:
+        expected = entry.expected_safety
+        for tool in entry.tools:
+            operation = find_operation(tool)
+            if expected is None or operation is None or operation.safety is expected:
+                continue
+            wrong.append(
+                f"{entry.key}: 行は{expected.label}なのに {tool} は{operation.safety.label}"
+            )
+    return wrong
+
+
+class TestSafetyAgreesWithTheLedger:
+    """台帳の行の区分と、道具の区分（``Operation.safety`` #350）をそろえる"""
+
+    def test_each_tool_has_the_safety_of_its_row(self) -> None:
+        # 落ちると: 取り消せない画面の操作（保存・書き出し）を取り消せる道具で受け、
+        # 「変更を自動で承認」で確かめずに上書きする 読むだけと決めた操作を変える道具で受けても同じ
+        assert not safety_mismatches(LEDGER)
+
+    def test_a_mismatched_tool_is_caught(self) -> None:
+        # 落ちると: 区分の違う道具を行に書いても見張りが気付かない
+        rows = (ledger.missing("メニュー/ファイル/保存", 327, safety=Safety.IRREVERSIBLE),)
+        wrong = (
+            Entry(rows[0].key, Status.SAME, ("delete_clips",), safety=Safety.IRREVERSIBLE),
+            ledger.read_only("メニュー/表示/設定…", "設定"),
+            Entry("メニュー/表示/設定…", Status.READ_ONLY, ("set_param",), 350, "設定"),
+        )
+        assert not safety_mismatches(rows)
+        assert len(safety_mismatches(wrong)) == 2
+
+    def test_read_only_rows_use_the_reading_tool(self) -> None:
+        # 落ちると: アプリ自身の操作を「読むだけ」と書きながら、読む道具が台帳から外れ、
+        # AI が設定を読めるかどうかが台帳から分からない
+        rows = [e for e in LEDGER if e.status is Status.READ_ONLY]
+        assert all(e.tools == ("get_app_settings",) for e in rows)
+        assert Safety.READ_ONLY.label in Status.READ_ONLY.value
+
+    def test_reading_tools_outside_the_ledger_only_read(self) -> None:
+        # 落ちると: 「画面を見て分かることを読む道具」と書いた道具が、実は何かを変える
+        reading = [name for name, why in AI_ONLY.items() if why == ledger.READING]
+        assert reading
+        for name in reading:
+            operation = find_operation(name)
+            assert operation is not None and operation.safety is Safety.READ_ONLY, name
 
 
 class TestRowsAreWellFormed:

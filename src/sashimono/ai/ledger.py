@@ -26,12 +26,16 @@ from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 
+from sashimono.ai.safety import Safety
+
 __all__ = [
     "AI_ONLY",
     "CHILD_ISSUES",
     "DECIDED_READ_ONLY",
     "LEDGER",
+    "READING",
     "Entry",
+    "Safety",
     "Status",
     "counts",
     "hidden",
@@ -84,23 +88,48 @@ class Entry:
     issue: int | None = None
     #: 足りない所、出さない理由の案、など
     note: str = ""
+    #: この画面の操作の区分（#350 の 読むだけ・取り消せる・取り消せない） 省くと
+    #: :attr:`expected_safety` の決まりで決める 対応する道具はこの区分と同じでなければならない
+    #: 取り消せない操作（保存・書き出し）を取り消せる道具で受けると、確かめが省かれる
+    safety: Safety | None = None
+
+    @property
+    def expected_safety(self) -> Safety | None:
+        """対応する道具が持つべき区分 出さない候補は線引きが未決なので ``None``
+
+        アプリ自身の操作は決定どおり読むだけ 書いていない編集の操作は取り消せる編集
+        表示や再生位置だけを変える操作と、取り消せない操作は、行に区分を書く
+        """
+        if self.safety is not None:
+            return self.safety
+        if self.status is Status.READ_ONLY:
+            return Safety.READ_ONLY
+        if self.status is Status.HIDDEN:
+            return None
+        return Safety.UNDOABLE
 
 
-def same(key: str, *tools: str, note: str = "") -> Entry:
-    return Entry(key, Status.SAME, tools, note=note)
+def same(key: str, *tools: str, note: str = "", safety: Safety | None = None) -> Entry:
+    return Entry(key, Status.SAME, tools, note=note, safety=safety)
 
 
-def partial(key: str, *tools: str, issue: int, note: str) -> Entry:
-    return Entry(key, Status.PARTIAL, tools, issue, note)
+def partial(key: str, *tools: str, issue: int, note: str, safety: Safety | None = None) -> Entry:
+    return Entry(key, Status.PARTIAL, tools, issue, note, safety)
 
 
-def missing(key: str, issue: int, note: str = "") -> Entry:
-    return Entry(key, Status.MISSING, (), issue, note)
+def missing(key: str, issue: int, note: str = "", safety: Safety | None = None) -> Entry:
+    return Entry(key, Status.MISSING, (), issue, note, safety)
 
 
-def read_only(key: str, what: str, *tools: str) -> Entry:
-    """アプリ自身の操作 AI は読むだけ（決定） ``tools`` は値を読む道具"""
-    return Entry(key, Status.READ_ONLY, tools, _LINE_DRAWING, f"{what} {DECIDED_READ_ONLY}")
+#: アプリ自身の設定を読む道具（#354） 設定・ショートカット・画面配置・版・ヘルプを返す
+_APP_SETTINGS = "get_app_settings"
+
+
+def read_only(key: str, what: str) -> Entry:
+    """アプリ自身の操作 AI は読むだけ（決定） 値は :data:`_APP_SETTINGS` で読む"""
+    return Entry(
+        key, Status.READ_ONLY, (_APP_SETTINGS,), _LINE_DRAWING, f"{what} {DECIDED_READ_ONLY}"
+    )
 
 
 def hidden(key: str, note: str) -> Entry:
@@ -121,10 +150,10 @@ _VIEW = "表示だけの操作 出す意味があるかは未決（#298 の決�
 
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
-    missing("メニュー/ファイル/新規", 349),
-    missing("メニュー/ファイル/開く…", 349),
-    missing("メニュー/ファイル/保存", 327),
-    missing("メニュー/ファイル/名前を付けて保存…", 327),
+    missing("メニュー/ファイル/新規", 349, safety=Safety.IRREVERSIBLE),
+    missing("メニュー/ファイル/開く…", 349, safety=Safety.IRREVERSIBLE),
+    missing("メニュー/ファイル/保存", 327, safety=Safety.IRREVERSIBLE),
+    missing("メニュー/ファイル/名前を付けて保存…", 327, safety=Safety.IRREVERSIBLE),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
     partial(
         "メニュー/ファイル/プロジェクト設定…",
@@ -134,8 +163,13 @@ LEDGER: tuple[Entry, ...] = (
     ),
     missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
-    missing("メニュー/ファイル/書き出し…", 327),
-    missing("メニュー/ファイル/静止画を保存…", 327, "絵を見るだけなら preview_frame で足りる"),
+    missing("メニュー/ファイル/書き出し…", 327, safety=Safety.IRREVERSIBLE),
+    missing(
+        "メニュー/ファイル/静止画を保存…",
+        327,
+        "絵を見るだけなら preview_frame で足りる",
+        Safety.IRREVERSIBLE,
+    ),
     hidden("メニュー/ファイル/終了", "アプリを閉じる 編集ではない 決定の 5 つに当たらず未決"),
     # --- メニュー 編集 ---
     same("メニュー/編集/元に戻す", "undo"),
@@ -157,8 +191,18 @@ LEDGER: tuple[Entry, ...] = (
         note="コピーと同じ 1 つの道具 アプリのクリップボードからは貼れない",
     ),
     missing("メニュー/編集/貼り付け（挿入）", 349),
-    missing("メニュー/編集/すべて選択", 349, "select_clips に全部の ID を渡せば同じになる"),
-    missing("メニュー/編集/静止画をコピー", 349),
+    missing(
+        "メニュー/編集/すべて選択",
+        349,
+        "select_clips に全部の ID を渡せば同じになる",
+        Safety.READ_ONLY,
+    ),
+    missing(
+        "メニュー/編集/静止画をコピー",
+        349,
+        "プロジェクトを変えない（絵をクリップボードへ写す）",
+        Safety.READ_ONLY,
+    ),
     missing("メニュー/編集/書き出し範囲を解除", 349),
     same("メニュー/編集/グループ化", "group_clips"),
     same("メニュー/編集/グループ解除", "ungroup_clips"),
@@ -176,37 +220,54 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/シーン/シーンを置く…", "place_scene"),
     missing("メニュー/シーン/シーンの名前を変更…", 349),
     missing("メニュー/シーン/シーンを削除", 349),
-    same("メニュー/シーン/メインに戻る", "set_active_scene"),
+    same("メニュー/シーン/メインに戻る", "set_active_scene", safety=Safety.READ_ONLY),
     # --- メニュー 字幕 ---
     read_only("メニュー/字幕/字幕パネル", _LAYOUT),
     same("メニュー/字幕/起こす…", "transcribe"),
     same("メニュー/字幕/整形…", "clean_subtitles"),
     same("メニュー/字幕/無音カット…", "jet_cut"),
     same("メニュー/字幕/焼き込み", "place_subtitles"),
-    missing("メニュー/字幕/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す"),
+    missing(
+        "メニュー/字幕/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す", Safety.IRREVERSIBLE
+    ),
     # --- メニュー 互換 ---
     missing("メニュー/互換/オブジェクトを読み込む…", 328, ".exo .exa .ymmp の部品"),
     missing("メニュー/互換/テンプレート…", 328),
-    missing("メニュー/互換/スクリプトを読み直す", 349),
+    missing(
+        "メニュー/互換/スクリプトを読み直す",
+        349,
+        "置き場の AviUtl スクリプトを読み直すだけで、プロジェクトを変えない",
+        Safety.READ_ONLY,
+    ),
     hidden("メニュー/互換/スクリプトフォルダを開く", _OUTSIDE),
     hidden(
         "メニュー/互換/exe の隣のスクリプトを移す…",
         "アプリの置き場の整理で、編集ではない 更新のときに勧める物だが、更新に数えるかは未決",
     ),
-    missing("メニュー/互換/互換性レポート…", 352, "読めなかった物を AI も読めるようにする"),
+    missing(
+        "メニュー/互換/互換性レポート…",
+        352,
+        "読めなかった物を AI も読めるようにする",
+        Safety.READ_ONLY,
+    ),
     # --- メニュー AI・表示・再生・ヘルプ ---
     read_only("メニュー/AI/アシスタント", _LAYOUT),
-    missing("メニュー/表示/拡大", 350, _VIEW),
-    missing("メニュー/表示/縮小", 350, _VIEW),
-    missing("メニュー/表示/全体を表示", 350, _VIEW),
-    missing("メニュー/表示/グラフエディタ", 350, _VIEW),
+    missing("メニュー/表示/拡大", 350, _VIEW, Safety.READ_ONLY),
+    missing("メニュー/表示/縮小", 350, _VIEW, Safety.READ_ONLY),
+    missing("メニュー/表示/全体を表示", 350, _VIEW, Safety.READ_ONLY),
+    missing("メニュー/表示/グラフエディタ", 350, _VIEW, Safety.READ_ONLY),
     same("メニュー/表示/トラックを高く", "set_track_height"),
     same("メニュー/表示/トラックを低く", "set_track_height"),
     same("メニュー/表示/トラックの高さを戻す", "set_track_height"),
     read_only("メニュー/表示/画面配置を初期に戻す", _LAYOUT),
     read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS),
     read_only("メニュー/表示/設定…", _SETTINGS),
-    missing("メニュー/再生/再生 / 停止", 338, "AI は動きを見られない 範囲の連続フレームで確かめる"),
+    missing(
+        "メニュー/再生/再生 / 停止",
+        338,
+        "AI は動きを見られない 範囲の連続フレームで確かめる",
+        Safety.READ_ONLY,
+    ),
     read_only("メニュー/ヘルプ/使い方", _HELP),
     read_only("メニュー/ヘルプ/不具合・要望を送る", _HELP),
     read_only("メニュー/ヘルプ/更新を確かめる…", _UPDATE),
@@ -232,11 +293,11 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/削除して詰める", "delete_clips", "delete_clip"),
     same("タイムラインの右クリック/グループ化", "group_clips"),
     same("タイムラインの右クリック/グループ解除", "ungroup_clips"),
-    same("タイムラインの右クリック/シーンを開く", "set_active_scene"),
+    same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*", "add_effect"),
     missing("タイムラインの右クリック/エイリアスとして保存…", 328),
-    missing("タイムラインの右クリック/線に不透明度を出す", 350, _VIEW),
-    missing("タイムラインの右クリック/線に音量を出す", 350, _VIEW),
+    missing("タイムラインの右クリック/線に不透明度を出す", 350, _VIEW, Safety.READ_ONLY),
+    missing("タイムラインの右クリック/線に音量を出す", 350, _VIEW, Safety.READ_ONLY),
     # --- タイムラインの右クリック 空いた所 ---
     missing("タイムラインの右クリック/フィルタを置く", 349),
     same("タイムラインの右クリック/追加/テキスト", "add_text"),
@@ -283,8 +344,18 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("タイムラインの〔＋ トラック追加〕/レイヤー", "add_track"),
     # --- プレビューの右クリック ---
-    missing("プレビューの右クリック/静止画を保存…", 327, "絵を見るだけなら preview_frame で足りる"),
-    missing("プレビューの右クリック/静止画をコピー", 349),
+    missing(
+        "プレビューの右クリック/静止画を保存…",
+        327,
+        "絵を見るだけなら preview_frame で足りる",
+        Safety.IRREVERSIBLE,
+    ),
+    missing(
+        "プレビューの右クリック/静止画をコピー",
+        349,
+        "プロジェクトを変えない（絵をクリップボードへ写す）",
+        Safety.READ_ONLY,
+    ),
     # --- シーンの帯 ---
     same("シーンの帯/新規｜空のシーンを作って開く", "add_scene"),
     missing("シーンの帯/名前｜開いているシーンの名前を変える", 349),
@@ -299,13 +370,16 @@ LEDGER: tuple[Entry, ...] = (
         _SETTINGS,
     ),
     # --- 再生の操作 ---
-    same("再生の操作/先頭へ (Home)", "seek"),
-    same("再生の操作/1 フレーム戻る (←)", "seek"),
+    same("再生の操作/先頭へ (Home)", "seek", safety=Safety.READ_ONLY),
+    same("再生の操作/1 フレーム戻る (←)", "seek", safety=Safety.READ_ONLY),
     missing(
-        "再生の操作/再生 / 停止 (Space)", 338, "AI は動きを見られない 範囲の連続フレームで確かめる"
+        "再生の操作/再生 / 停止 (Space)",
+        338,
+        "AI は動きを見られない 範囲の連続フレームで確かめる",
+        Safety.READ_ONLY,
     ),
-    same("再生の操作/1 フレーム進む (→)", "seek"),
-    same("再生の操作/末尾へ (End)", "seek"),
+    same("再生の操作/1 フレーム進む (→)", "seek", safety=Safety.READ_ONLY),
+    same("再生の操作/末尾へ (End)", "seek", safety=Safety.READ_ONLY),
     # --- 素材一覧 ---
     same("素材一覧/読み込み…", "import_media"),
     same("素材一覧/タイムラインへ", "place_media"),
@@ -325,13 +399,16 @@ LEDGER: tuple[Entry, ...] = (
         " 選んでいなければ再生位置の 1 行",
         "place_subtitles",
     ),
-    missing("字幕パネル/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す"),
-    same("字幕パネルの右クリック/ここへ移動", "seek"),
+    missing(
+        "字幕パネル/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す", Safety.IRREVERSIBLE
+    ),
+    same("字幕パネルの右クリック/ここへ移動", "seek", safety=Safety.READ_ONLY),
     partial(
         "字幕パネルの右クリック/文字をコピー",
         "get_subtitles",
         issue=349,
         note="本文は読めるが、クリップボードへは写さない",
+        safety=Safety.READ_ONLY,
     ),
     same("字幕パネルの右クリック/テキストとして置く", "place_subtitles"),
     missing("字幕パネルの右クリック/再生ヘッドで分割", 349),
@@ -361,12 +438,14 @@ LEDGER: tuple[Entry, ...] = (
         "seek",
         issue=349,
         note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        safety=Safety.READ_ONLY,
     ),
     partial(
         "設定パネル/▶｜次のキーへ再生位置を動かす",
         "seek",
         issue=349,
         note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        safety=Safety.READ_ONLY,
     ),
     same("設定パネル/解除", "set_clip_property", note="止めた絵を解く（hold_at を null）"),
     partial(
@@ -429,24 +508,24 @@ LEDGER: tuple[Entry, ...] = (
     missing("設定パネルの〔プリセット…〕/*/*", 328, "保存したプリセットを当てる（分類ごとの一覧）"),
     same("設定パネルの縁取りの〔効果〕/*", "add_effect", note="stroke_id を渡す"),
     missing("設定パネルの ◆ の右クリック/アニメーションを解除", 349, "キーフレームを消す"),
-    missing("設定パネルの ◆ の右クリック/グラフエディタで開く", 350, _VIEW),
+    missing("設定パネルの ◆ の右クリック/グラフエディタで開く", 350, _VIEW, Safety.READ_ONLY),
 )
 
 #: 画面のメニュー・右クリック・ボタンに当たらない道具と、その訳 道具を足して、台帳の
 #: どの行にも当たらないときはここへ書く 書かないと ``tests/ai/test_operation_ledger.py`` が落ちる
-_READ = "人が画面を見て分かることを読む道具"
+READING = "人が画面を見て分かることを読む道具"
 _GESTURE = "画面ではドラッグや表の書き込みで行う 台帳はメニュー・右クリック・ボタンだけを数える"
 AI_ONLY: dict[str, str] = {
-    "get_project": _READ,
-    "list_media": _READ,
-    "list_tracks": _READ,
-    "list_clips": _READ,
-    "get_selection": _READ,
-    "list_effects": _READ,
-    "get_history": _READ,
-    "preview_frame": _READ,
-    "list_scenes": _READ,
-    "transcription_status": _READ,
+    "get_project": READING,
+    "list_media": READING,
+    "list_tracks": READING,
+    "list_clips": READING,
+    "get_selection": READING,
+    "list_effects": READING,
+    "get_history": READING,
+    "preview_frame": READING,
+    "list_scenes": READING,
+    "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,
     "trim_clip": _GESTURE,
