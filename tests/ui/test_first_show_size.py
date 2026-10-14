@@ -143,7 +143,7 @@ def test_the_window_keeps_the_size_it_was_given(
 def test_the_remembered_size_comes_back_unchanged(
     machine: str, styled: list[MainWindow], name: str
 ) -> None:
-    """2 回目からの起動でも、覚えている大きさのまま出る
+    """2 回目からの起動でも、覚えている大きさ（画面より大きければ画面に縮めた大きさ）のまま出る
 
     壊れると、起動するたびに覚えた大きさより縦に伸びて出て、タイムラインが狭くなる
     （閉じると伸びた大きさを覚えるので、直したつもりでも次の起動で戻らない）
@@ -158,11 +158,15 @@ def test_the_remembered_size_comes_back_unchanged(
     first.hide()
 
     window = _window(styled)
-    assert window.size() == size
+    # 覚えた大きさが今の画面に収まらなければ、Qt は戻すときに画面へ縮める（CI の画面は
+    # 1024x768 ほどで 1022x687 になる） 画面からはみ出さないための正しい動きなので、
+    # 縮めた後の大きさを頼んだ大きさとして、出したときに伸びないかを見る
+    restored = window.size()
+    assert restored == size.boundedTo(restored), f"覚えた {size} より大きく戻った {restored}"
     window.show()
-    assert window.size() == size
+    assert window.size() == restored
     _settle()
-    assert window.size() == size
+    assert window.size() == restored
 
 
 @pytest.mark.parametrize("machine", ["ログインがまだ"], indirect=True)
