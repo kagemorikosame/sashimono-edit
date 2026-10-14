@@ -20,7 +20,7 @@ from sashimono.engine.scenes import (
     SceneSignal,
     analyze_scenes,
 )
-from tests.scene_video import CUTS, FPS, write_scene_video
+from tests.scene_video import CUTS, FPS, write_broken_video, write_scene_video
 
 #: 見つけた位置と焼いた位置の差の上限（秒） 1 フレームより細かく合っていること
 TOLERANCE = 0.5 / FPS
@@ -138,6 +138,17 @@ class TestReading:
         assert image.save(str(path))
         found = analyze_scenes(path)
         assert found is not None and found.complete and found.cuts() == ()
+
+    def test_a_video_broken_halfway_is_not_complete(self, tmp_path: Path) -> None:
+        # 読み終えたと返すと、後ろ半分の切り替わりが無い一覧を、全部を読んだ物として
+        # 覚えて AI に渡す（PR #358 の CodeRabbit の指摘）
+        found = analyze_scenes(write_broken_video(tmp_path / "broken.mp4"))
+        assert found is not None
+        assert not found.complete and found.broken
+        assert found.analyzed < CUTS[-1]
+        assert [cut.seconds for cut in found.cuts()] == pytest.approx(
+            [cut for cut in CUTS if cut < found.analyzed], abs=TOLERANCE
+        )
 
     def test_a_missing_file_has_no_scenes(self, tmp_path: Path) -> None:
         # 開けない素材で例外を投げると、裏のスレッドの解析が理由を残さずに落ちる

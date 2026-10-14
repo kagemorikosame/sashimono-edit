@@ -148,6 +148,15 @@ class TestTheList:
         assert [place["clip_id"] for place in result["cuts"][0]["timeline"]] == ["first"]
         assert result["video_stream"] == 1
 
+    def test_a_broken_video_says_no_more_will_come(self, host: FakeHost) -> None:
+        # 「待てば続きが出る」と読ませると、壊れた素材で AI が同じ道具を呼び直し続ける
+        signal = replace(_signal([2.0], until=4.0, complete=False), broken=True)
+        host.scene_states[_media(host).id] = SceneState(signal, running=False)
+        result = _call(host)
+        assert result["complete"] is False
+        assert [row["source_seconds"] for row in result["cuts"]] == [2.0]
+        assert "壊れて" in result["note"] and "続きは出ません" in result["note"]
+
     def test_a_higher_threshold_gives_fewer(self, host: FakeHost) -> None:
         # 感度が効かないと、AI は細かすぎる一覧を絞れない
         signal = _signal([2.0, 6.0])

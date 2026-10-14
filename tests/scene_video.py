@@ -23,7 +23,7 @@ from pathlib import Path
 import av
 import numpy as np
 
-__all__ = ["CUTS", "FPS", "HEIGHT", "WIDTH", "write_scene_video"]
+__all__ = ["CUTS", "FPS", "HEIGHT", "WIDTH", "write_broken_video", "write_scene_video"]
 
 WIDTH, HEIGHT, FPS = 320, 180, 30
 #: 焼いた動画の切り替わり（素材の秒） 新しい場面の最初のフレームの時刻
@@ -81,8 +81,25 @@ def write_scene_video(path: Path) -> Path:
     鍵フレームを細かく入れると、切り替わりの所で鍵フレームの画質の跳ねまで差に乗る
     配られる動画のように鍵フレームの間を長く取る
     """
+    return _write(path, {})
+
+
+def write_broken_video(path: Path) -> Path:
+    """:func:`write_scene_video` と同じ絵を、後ろ半分を欠いた MP4 にする
+
+    目次（moov）を頭に置いてから途中で切るので、目次は素材の終わり（12 秒）を言うのに、
+    中身は途中で終わる 落としかけた・録画が止まった素材の形で、読むと途中で
+    ``InvalidDataError`` になる（目次が後ろにある普通の MP4 は、切ると開けもしない）
+    """
+    _write(path, {"movflags": "faststart"})
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])
+    return path
+
+
+def _write(path: Path, options: dict[str, str]) -> Path:
     codec = "libx264" if "libx264" in av.codecs_available else "mpeg4"
-    with av.open(str(path), "w") as container:
+    with av.open(str(path), "w", options=options) as container:
         stream = container.add_stream(codec, rate=FPS)
         # 名前を変数で渡すと、型の上では音や字幕の流れかもしれないので確かめて絞る
         if not isinstance(stream, av.VideoStream):

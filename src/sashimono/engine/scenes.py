@@ -112,6 +112,11 @@ class SceneSignal:
     #: 映像が何本もある素材では先頭だけを調べる 番号を持たないと、2 本目を出すクリップにも
     #: 先頭の切り替わりを当てはめてしまう（PR #358 の Codex の指摘）
     stream: int | None = None
+    #: 素材が途中で壊れていて、読めた所（:attr:`analyzed`）までで終えた 読み終えては
+    #: いないので :attr:`complete` は偽 読み直しても同じ所で止まるので、覚えて使い回す
+    #: 完了として扱うと、後ろの切り替わりの無い一覧を全部だと思って使う（PR #358 の
+    #: CodeRabbit の指摘）
+    broken: bool = False
 
     @classmethod
     def empty(cls, *, complete: bool = True, stream: int | None = None) -> SceneSignal:
@@ -215,7 +220,9 @@ class SceneScan:
         with self._lock:
             self._analyzed = max(self._analyzed, moment)
 
-    def snapshot(self, *, complete: bool = False, analyzed: float | None = None) -> SceneSignal:
+    def snapshot(
+        self, *, complete: bool = False, analyzed: float | None = None, broken: bool = False
+    ) -> SceneSignal:
         with self._lock:
             return SceneSignal(
                 times=np.asarray(self._times, np.float64),
@@ -224,6 +231,7 @@ class SceneScan:
                 analyzed=self._analyzed if analyzed is None else analyzed,
                 complete=complete,
                 stream=self.stream,
+                broken=broken,
             )
 
 
@@ -288,9 +296,12 @@ def analyze_scenes(
                 if progress is not None:
                     progress(min(1.0, moment / duration))
         except av.error.FFmpegError:
-            # 途中で壊れた素材は、読めた所までを結果にする 全部を捨てると、
-            # 末尾が欠けただけの録画で場面を 1 つも返せない
-            pass
+            # 途中で壊れた素材は、読めた所までを結果にする 全部を捨てると、末尾が欠けた
+            # だけの録画で場面を 1 つも返せない ただし読み終えたとは言わない（読めたのは
+            # ``last`` まで） 言うと、後ろの切り替わりの無い一覧を全部だと思って使う
+            if progress is not None:
+                progress(1.0)
+            return scan.snapshot(analyzed=last, broken=True)
     if progress is not None:
         progress(1.0)
     return scan.snapshot(complete=True, analyzed=max(last, duration))

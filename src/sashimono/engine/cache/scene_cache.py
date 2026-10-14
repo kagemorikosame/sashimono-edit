@@ -1,8 +1,10 @@
 """場面の解析（フレーム間の差の並び）の永続化（#321）
 
 覚えるのは感度を掛ける前の差の並び（:class:`~sashimono.engine.scenes.SceneSignal`）
-感度を変えても読み直さずに済む 読み終えた物だけを書く 途中で止めた物を書くと、
-次に開いたときに途中までの並びを「読み終えた」と取り違える
+感度を変えても読み直さずに済む 書くのは、読み終えた物と、素材が途中で壊れていて
+読めた所までで終えた物（``broken``）だけ 途中で止めた物を書くと、次に開いたときに
+途中までの並びを「読み終えた」と取り違える 壊れた物は読み直しても同じ所で止まるので、
+未完了の印を付けたまま覚え、素材が変わる（大きさか更新時刻）までは読み直さない
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ SUFFIX = ".scenes.npz"
 #: 上げないと、前の測り方の並びに今の感度を掛けることになり、拾う所がずれる
 #: 2 で調べた映像ストリームの番号を持たせた（PR #358） 1 の物は番号が無く、映像が何本もある
 #: 素材でどのクリップに当てはまるかが分からないので読み直す
-FORMAT_VERSION = 2
+#: 3 で途中で壊れた素材の印を持たせた（PR #358） 2 までは壊れた素材も読み終えた物として
+#: 書いていたので、後ろの切り替わりの無い一覧が残っている 読み直す
+FORMAT_VERSION = 3
 
 #: 番号が分からない（``None``）ときに書く値 ストリームの番号は 0 以上
 _NO_STREAM = -1
@@ -39,8 +43,8 @@ def scenes_key(path: Path) -> str:
 
 
 def save_scenes(store: CacheStore, key: str, signal: SceneSignal) -> Path | None:
-    """読み終えた並びを書く 途中の物は書かずに ``None``"""
-    if not signal.complete:
+    """読み終えた並びか、壊れていて読めた所までの並びを書く 途中で止めた物は書かずに ``None``"""
+    if not signal.complete and not signal.broken:
         return None
     return save_arrays(
         store.prepare(NAMESPACE, key, SUFFIX),
@@ -51,6 +55,7 @@ def save_scenes(store: CacheStore, key: str, signal: SceneSignal) -> Path | None
             "histogram": signal.histogram,
             "analyzed": np.array([signal.analyzed], np.float64),
             "stream": np.array([_NO_STREAM if signal.stream is None else signal.stream]),
+            "broken": np.array([signal.broken]),
         },
         compressed=True,
     )
@@ -70,13 +75,15 @@ def load_scenes(store: CacheStore, key: str) -> SceneSignal | None:
         if not times.shape == pixel.shape == histogram.shape or times.ndim != 1:
             return None
         stream = int(data["stream"][0])
+        broken = bool(data["broken"][0])
         return SceneSignal(
             times=times,
             pixel=pixel,
             histogram=histogram,
             analyzed=float(data["analyzed"][0]),
-            complete=True,
+            complete=not broken,
             stream=None if stream == _NO_STREAM else stream,
+            broken=broken,
         )
     except (KeyError, IndexError, ValueError):
         return None

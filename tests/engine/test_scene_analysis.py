@@ -29,7 +29,7 @@ from sashimono.engine.cache import (
 from sashimono.engine.cache import analyzer as analyzer_module
 from sashimono.engine.decode import forget_probe, probe_media
 from sashimono.engine.scenes import SceneScan, SceneSignal
-from tests.scene_video import CUTS, write_scene_video
+from tests.scene_video import CUTS, write_broken_video, write_scene_video
 
 
 @pytest.fixture(scope="module")
@@ -336,6 +336,55 @@ class TestWhileRunning:
         began = time.monotonic()
         assert analyzer.wait_scenes(media.id, 20) is True
         assert time.monotonic() - began < 10
+
+
+class TestABrokenVideo:
+    """途中で壊れた素材（PR #358 の CodeRabbit の指摘）"""
+
+    def test_it_is_not_kept_as_complete(self, store: CacheStore, tmp_path: Path) -> None:
+        # 読み終えた物として覚えると、後ろ半分の切り替わりの無い一覧を AI が全部だと思って使う
+        path = write_broken_video(tmp_path / "broken.mp4")
+        media = _media(path)
+        first = MediaAnalyzer(store)
+        try:
+            first.request_scenes(media)
+            assert first.wait_scenes(media.id, 30)
+            state = first.scene_state(media)
+            assert state.signal is not None and state.signal.broken
+            assert not state.complete
+        finally:
+            first.close()
+        kept = load_scenes(store, scenes_key(path))
+        assert kept is not None and not kept.complete and kept.broken
+
+    def test_it_is_not_read_again_every_time(
+        self, store: CacheStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れた素材を頼まれるたびに全フレーム読み直すと、AI が聞くたびに長く待たされる
+        # 読めた所までを覚え、素材が変わる（大きさか更新時刻）までは読み直さない
+        path = write_broken_video(tmp_path / "broken.mp4")
+        media = _media(path)
+        first = MediaAnalyzer(store)
+        try:
+            first.request_scenes(media)
+            assert first.wait_scenes(media.id, 30)
+        finally:
+            first.close()
+
+        def refuse(*_arguments: object, **_options: object) -> SceneSignal:
+            raise AssertionError("壊れた素材を読み直した")
+
+        monkeypatch.setattr(analyzer_module, "analyze_scenes", refuse)
+        second = MediaAnalyzer(store)
+        try:
+            second.request_scenes(media)
+            assert second.wait_scenes(media.id, 30)
+            state = second.scene_state(media)
+            assert state.signal is not None and state.signal.broken
+            second.request_scenes(media)
+            assert not second.scene_state(media).running
+        finally:
+            second.close()
 
 
 class TestFailure:

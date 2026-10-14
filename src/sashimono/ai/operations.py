@@ -1146,7 +1146,13 @@ def _scene_result(
         # その映像を出すクリップだけを載せる
         "video_stream": _video_number(media, stream),
     }
-    if not signal.complete:
+    if signal.broken:
+        # 呼び直しても同じ所で止まる 「待てば続きが出る」と読ませると、AI が呼び直し続ける
+        notes.append(
+            f"素材が途中で壊れていて {round(signal.analyzed, 1)} 秒までしか読めませんでした"
+            " 読めた所までの切り替わりを返しました 呼び直しても続きは出ません"
+        )
+    elif not signal.complete:
         if state.running:
             notes.append(
                 f"解析の途中です（{round(signal.analyzed, 1)} 秒まで）"
