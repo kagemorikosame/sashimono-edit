@@ -10,7 +10,14 @@ from collections import Counter
 import pytest
 
 from sashimono.ai import ledger
-from sashimono.ai.ledger import AI_ONLY, CHILD_ISSUES, LEDGER, Entry, Status
+from sashimono.ai.ledger import (
+    AI_ONLY,
+    CHILD_ISSUES,
+    DECIDED_READ_ONLY,
+    LEDGER,
+    Entry,
+    Status,
+)
 from sashimono.ai.operations import OPERATIONS
 
 _NAMES = {operation.name for operation in OPERATIONS}
@@ -34,13 +41,13 @@ def malformed(rows: tuple[Entry, ...]) -> list[str]:
     for entry in rows:
         if entry.status in (Status.SAME, Status.PARTIAL) and not entry.tools:
             wrong.append(f"{entry.key}: 道具の名前が無い")
-        if entry.status in (Status.MISSING, Status.PARTIAL, Status.HIDDEN) and (
+        if entry.status in (Status.MISSING, Status.PARTIAL, Status.READ_ONLY, Status.HIDDEN) and (
             entry.issue not in CHILD_ISSUES
         ):
             wrong.append(f"{entry.key}: 足す先の Issue が #298 の子（#319〜#352）でない")
         if entry.status in (Status.MISSING, Status.HIDDEN) and entry.tools:
             wrong.append(f"{entry.key}: AI にできないはずなのに道具の名前がある")
-        if entry.status in (Status.PARTIAL, Status.HIDDEN) and not entry.note:
+        if entry.status in (Status.PARTIAL, Status.READ_ONLY, Status.HIDDEN) and not entry.note:
             wrong.append(f"{entry.key}: 足りない所か、出さない理由の案が無い")
     return wrong
 
@@ -82,9 +89,16 @@ class TestRowsAreWellFormed:
 
     def test_hidden_rows_are_still_only_candidates(self) -> None:
         # 落ちると: 利用者が決めていない線引きを、決まったことのように読ませる
-        # 線引きは #350（E4）で決める 決まったら状態の名前ごと変える
+        # 線引きは #350（E4）で決める 決まった物は READ_ONLY へ移す
         assert Status.HIDDEN.value == "出さない候補"
-        assert all(e.issue == 350 for e in LEDGER if e.status is Status.HIDDEN)
+        hidden = [e for e in LEDGER if e.status is Status.HIDDEN]
+        assert all(e.issue == 350 and DECIDED_READ_ONLY not in e.note for e in hidden)
+
+    def test_read_only_rows_cite_the_decision(self) -> None:
+        # 落ちると: 「AI は読むだけ」が誰がいつ決めたことか分からず、候補と見分けが付かない
+        rows = [e for e in LEDGER if e.status is Status.READ_ONLY]
+        assert rows
+        assert all(e.issue == 350 and DECIDED_READ_ONLY in e.note for e in rows)
 
     @pytest.mark.parametrize("status", list(Status))
     def test_counts_cover_every_row(self, status: Status) -> None:

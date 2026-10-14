@@ -11,18 +11,24 @@
 
 右クリックとボタンは、場面ごとに出る物が違う（クリップの上・空いた所・目盛り・混合の方式）
 出る場面を下の :func:`scan_screen` で 1 つずつ作って取り出す 新しい場面でしか出ない項目を
-足したときは、ここにその場面を足す
+足したときは、ここにその場面を足す 場面を作り忘れたボタンは、ボタンを作る所をソースから
+全部拾って比べる見張り（:func:`unreached_sites`）が見つける
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import fnmatch
+import importlib
+import importlib.util
 import re
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -33,11 +39,15 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QInputDialog,
     QMenu,
     QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QToolButton,
     QWidget,
 )
 
@@ -60,7 +70,7 @@ from sashimono.core.model import (
     Transcript,
 )
 from sashimono.effects import registry
-from sashimono.effects.sources import GROUP, TEXT, TRANSITION
+from sashimono.effects.sources import GROUP, TEXT, TRANSITION, source_registry
 from sashimono.ui.inspector.panel import KeyframeControls
 from sashimono.ui.inspector.widgets import ParameterEditor
 from sashimono.ui.library_save import SaveChoice
@@ -88,6 +98,93 @@ class Scan:
     #: サブメニューの在りか 中身がデータの一覧（エフェクト・エイリアスなど）の行が、
     #: 一覧が空の場面でも在ると分かるようにする
     submenus: set[str] = field(default_factory=set)
+    #: 数えたボタンを作った所（モジュールと行） :func:`button_sites` と比べ、どの場面でも
+    #: 出なかったボタンを見つける
+    sites: set[tuple[str, int]] = field(default_factory=set)
+
+
+# --- ボタンを作る所 ---
+
+#: ボタンを数えるパネルのモジュール ここのボタンは、作る所がどれか 1 つの場面で出ないと落ちる
+PANEL_MODULES = (
+    "sashimono.ui.inspector.panel",
+    "sashimono.ui.media_pool",
+    "sashimono.ui.subtitle.panel",
+    "sashimono.ui.scene_bar",
+    "sashimono.ui.transport",
+)
+_BUTTON_TYPES: tuple[type[QAbstractButton], ...] = (
+    QPushButton,
+    QToolButton,
+    QCheckBox,
+    QRadioButton,
+)
+#: ボタンに作った所を書いておく印の名前
+_SITE = "ledger_site"
+
+
+def _calls(module: str) -> list[ast.Call]:
+    """``module`` の中で、ボタンの型を呼んで作る所"""
+    spec = importlib.util.find_spec(module)
+    assert spec is not None and spec.origin is not None, module
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    names = {kind.__name__ for kind in _BUTTON_TYPES}
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in names
+    ]
+
+
+def button_sites(module: str) -> dict[int, int]:
+    """``module`` の中でボタンを作る所（呼び出しの頭の行 → 終わりの行）
+
+    場面で出る出ないが変わるボタン（AviUtl2 の組み方のときだけ出る〔組み方を「標準」にする〕
+    など）は、場面を作り忘れると数えられず、台帳から黙って漏れる 作る所をソースから全部
+    拾い、どれか 1 つの場面で出たかを見れば、作り忘れた場面が分かる
+    """
+    return {node.lineno: node.end_lineno or node.lineno for node in _calls(module)}
+
+
+def _tracked(module: str, base: type[QAbstractButton]) -> Callable[..., QAbstractButton]:
+    """作った所の行を印に書いてからボタンを返す ``module`` の中の型の名前をこれへ差し替える"""
+
+    def make(*arguments: Any, **options: Any) -> QAbstractButton:
+        button = base(*arguments, **options)
+        button.setProperty(_SITE, f"{module}:{sys._getframe(1).f_lineno}")
+        return button
+
+    return make
+
+
+@contextlib.contextmanager
+def tracked_buttons() -> Iterator[None]:
+    """パネルのモジュールが作るボタンに、作った所の印を付ける
+
+    差し替えるのは、そのモジュールで実際に呼んで作っている型の名前だけ 設定パネルは
+    ``findChild(QCheckBox)`` のように型を探す側でも名前を使うので、作っていない型まで
+    差し替えると探し方が変わる
+    """
+    with contextlib.ExitStack() as stack:
+        for module in PANEL_MODULES:
+            loaded = importlib.import_module(module)
+            used = {node.func.id for node in _calls(module) if isinstance(node.func, ast.Name)}
+            for kind in _BUTTON_TYPES:
+                if kind.__name__ in used:
+                    stack.enter_context(
+                        mock.patch.object(loaded, kind.__name__, _tracked(module, kind))
+                    )
+        yield
+
+
+def unreached_sites(scan: Scan) -> list[str]:
+    """ボタンを作る所のうち、どの場面でも出なかった所"""
+    left: list[str] = []
+    for module in PANEL_MODULES:
+        for start, end in sorted(button_sites(module).items()):
+            if not any(m == module and start <= line <= end for m, line in scan.sites):
+                left.append(f"{module}:{start}")
+    return left
 
 
 # --- 窓を開かせない ---
@@ -254,6 +351,10 @@ def walk_buttons(top: QWidget, place: str, scan: Scan) -> None:
         key = button_key(button)
         assert key, f"{place} に名前も説明も無いボタンがある 台帳に書けないので名前か説明を付ける"
         scan.keys.add(f"{place}/{key}")
+        site = button.property(_SITE)
+        if isinstance(site, str):
+            module, line = site.rsplit(":", 1)
+            scan.sites.add((module, int(line)))
     if any(e.isVisibleTo(top) for e in top.findChildren(ParameterEditor)):
         scan.keys.add(f"{place}/欄の値")
 
@@ -302,13 +403,15 @@ def _separated(media: MediaItem) -> _Stage:
     text = Clip(timeline_start=0, duration=60, source=text_source, effects=(blur.create(),))
     transition = Clip(timeline_start=200, duration=30, source=TRANSITION.create())
     group = Clip(timeline_start=400, duration=30, source=GROUP.create())
+    # AviUtl2 の組み方のテキスト 灰色の欄に〔組み方を「標準」にする〕が出る（#301）
+    aviutl = Clip(timeline_start=500, duration=30, source=TEXT.create(text="字", layout="aviutl"))
     scene = Scene("場面", Timeline(media.video_streams[0].frame_rate))
     nested = Clip(timeline_start=100, duration=60, scene_id=scene.id)
     held = Clip(timeline_start=0, duration=90, media_id=media.id, hold_at=Fraction(1))
     sound = Clip(timeline_start=0, duration=90, media_id=media.id)
     base = Project.create(media=(media,))
     tracks = (
-        Track(TrackKind.VIDEO, "甲", (text, nested, transition, group)),
+        Track(TrackKind.VIDEO, "甲", (text, nested, transition, group, aviutl)),
         Track(TrackKind.VIDEO, "乙", (held,)),
         Track(TrackKind.VIDEO, "FX1"),
         Track(TrackKind.AUDIO, "丙", (sound,)),
@@ -329,7 +432,7 @@ def _separated(media: MediaItem) -> _Stage:
             ("丁", 650),  # 書き出し範囲の上
             (None, 650),  # 目盛り
         ),
-        inspected=(text, transition, group, held, sound),
+        inspected=(text, transition, group, aviutl, held, sound),
         media=media,
     )
 
@@ -418,12 +521,13 @@ def _scan_stage(window: MainWindow, stage: _Stage, folder: Path, scan: Scan) -> 
 def scan_screen(folder: Path, media: MediaItem) -> Scan:
     """場面を 1 つずつ作り、画面の操作を全部取り出す"""
     scan = Scan()
-    for stage in (_separated(media), _mixed(media)):
-        window = MainWindow(stage.project, confirm_unsaved=False)
-        try:
-            _scan_stage(window, stage, folder, scan)
-        finally:
-            window.close()
+    with tracked_buttons():
+        for stage in (_separated(media), _mixed(media)):
+            window = MainWindow(stage.project, confirm_unsaved=False)
+            try:
+                _scan_stage(window, stage, folder, scan)
+            finally:
+                window.close()
     return scan
 
 
@@ -487,6 +591,28 @@ class TestEveryScreenOperationIsListed:
         left = stale(screen)
         assert not left, f"台帳にあって画面に無い行（消すか、場面を scan_screen に足す）: {left}"
 
+    def test_every_button_is_shown_in_some_scene(self, screen: Scan) -> None:
+        # 落ちると: ある場面でしか出ないボタン（AviUtl2 の組み方の〔組み方を「標準」にする〕
+        # など）を取り出す場面が無く、台帳に行が無くても上の見張りが通ってしまう
+        left = unreached_sites(screen)
+        assert not left, (
+            "どの場面でも出なかったボタンを作る所がある その所のボタンが出る場面を "
+            f"scan_screen に足す: {left}"
+        )
+
+    def test_every_unlock_button_has_a_row(self) -> None:
+        # 落ちると: 灰色の欄を使えるようにする切り替え（#301）を足したのに、出る場面が
+        # 試験に無いまま台帳から漏れる 切り替えは定義から全部引いて確かめる
+        patterns = [entry.key for entry in ledger.LEDGER]
+        keys = [
+            f"設定パネル/{unlock.button}｜{unlock.detail.split(chr(10))[0].split(': ')[0]}"
+            for definition in source_registry.all()
+            for unlock in definition.unlocks.values()
+        ]
+        assert keys
+        missing = sorted({k for k in keys if not any(_matches(p, k) for p in patterns)})
+        assert not missing, "灰色の欄の切り替えが台帳に無い\n" + _howto(missing)
+
     def test_the_scan_reaches_every_place(self, screen: Scan) -> None:
         # 落ちると: どこかのパネルを組めずに 0 件で通り、そのパネルの足し忘れを見逃す
         places = {key.split("/", 1)[0] for key in screen.keys}
@@ -542,6 +668,15 @@ class TestTheGuardCatchesAdditions:
         with refuse_windows(), mock.patch.object(TimelineView, "build_context_menu", with_extra):
             scan = scan_screen(tmp_path, media)
         assert "タイムラインの右クリック/試しの右クリック" in unlisted(scan)
+
+    def test_a_button_never_shown_is_caught(self) -> None:
+        # 落ちると: 作る所を数え損ね、どの場面でも出ないボタンを見張りが見逃す
+        everything = Scan(sites={(m, line) for m in PANEL_MODULES for line in button_sites(m)})
+        assert not unreached_sites(everything)
+        inspector = "sashimono.ui.inspector.panel"
+        hidden_one = min(button_sites(inspector))
+        everything.sites.discard((inspector, hidden_one))
+        assert unreached_sites(everything) == [f"{inspector}:{hidden_one}"]
 
     def test_an_opened_window_stops_the_scan(self, qt_application: QApplication) -> None:
         # 落ちると: 取り出しの途中で開いた窓を誰も閉じず、CI が時間切れまで止まる

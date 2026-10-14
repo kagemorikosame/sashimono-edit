@@ -29,6 +29,7 @@ from enum import Enum
 __all__ = [
     "AI_ONLY",
     "CHILD_ISSUES",
+    "DECIDED_READ_ONLY",
     "LEDGER",
     "Entry",
     "Status",
@@ -36,6 +37,7 @@ __all__ = [
     "hidden",
     "missing",
     "partial",
+    "read_only",
     "same",
 ]
 
@@ -43,8 +45,13 @@ __all__ = [
 #: 範囲の外の番号を書くと、どの段で足すのかが親の Issue から辿れなくなる
 CHILD_ISSUES = range(319, 353)
 
-#: AI に出さない線引きを決める Issue（E4） 線引きは利用者がまだ決めていない
+#: AI に出さない線引きを決める Issue（E4）
 _LINE_DRAWING = 350
+
+#: 利用者が決めた線引き（2026-10-14 #298 #350 のコメント）
+#: アプリ自身の操作（設定・更新・画面配置・ショートカット・ヘルプ）は、AI は読むだけ
+#: 変えるのは人だけ
+DECIDED_READ_ONLY = "2026-10-14 に決めた: アプリ自身の操作は AI は読むだけ（#350）"
 
 
 class Status(Enum):
@@ -56,7 +63,10 @@ class Status(Enum):
     PARTIAL = "一部だけできる"
     #: 道具が無い 足す先の Issue を ``issue`` に書く
     MISSING = "まだできない"
-    #: AI に出さない **候補** #298 の「決めること」で利用者がまだ決めていない
+    #: アプリ自身の操作 AI は値を読めるが、変えるのは人だけ **利用者が決めた**
+    #: （:data:`DECIDED_READ_ONLY`） 読む道具ができたら ``tools`` に書く
+    READ_ONLY = "AI は読むだけ（決定）"
+    #: AI に出さない **候補** 上の決定に当たらず、利用者がまだ決めていない
     #: 決まるまでは「出さない」と言い切らず、理由の案だけを ``note`` に持つ
     HIDDEN = "出さない候補"
 
@@ -88,16 +98,24 @@ def missing(key: str, issue: int, note: str = "") -> Entry:
     return Entry(key, Status.MISSING, (), issue, note)
 
 
+def read_only(key: str, what: str, *tools: str) -> Entry:
+    """アプリ自身の操作 AI は読むだけ（決定） ``tools`` は値を読む道具"""
+    return Entry(key, Status.READ_ONLY, tools, _LINE_DRAWING, f"{what} {DECIDED_READ_ONLY}")
+
+
 def hidden(key: str, note: str) -> Entry:
     """出さない候補 線引きは #350（E4）で決める"""
     return Entry(key, Status.HIDDEN, (), _LINE_DRAWING, note)
 
 
-# 理由の案（#298 の表の「AI には出さない候補」）
-_OWN_SETTINGS = "アプリ自身の設定 読み取りだけ許す案"
-_WINDOW = "画面の見た目・配置で、編集の結果を変えない"
-_OUTSIDE = "エクスプローラーやブラウザを開くだけで、プロジェクトを変えない"
-_UPDATE = "更新・版の入れ替えはアプリ自身の操作で、編集ではない"
+# 決定に当たる操作の種類（:func:`read_only` の ``what``）
+_SETTINGS = "設定"
+_LAYOUT = "画面配置（パネルの出し入れ・並べ方）"
+_SHORTCUTS = "ショートカット"
+_UPDATE = "更新"
+_HELP = "ヘルプ"
+# まだ決めていない操作の理由の案（#298 の表の「AI には出さない候補」）
+_OUTSIDE = "エクスプローラーを開くだけで、プロジェクトを変えない 決定の 5 つに当たらず未決"
 #: 表示だけの操作を AI に出すかは #298 の「決めること」の 3 つ目 決まるまでは足す側に数える
 _VIEW = "表示だけの操作 出す意味があるかは未決（#298 の決めること）"
 
@@ -118,7 +136,7 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
     missing("メニュー/ファイル/書き出し…", 327),
     missing("メニュー/ファイル/静止画を保存…", 327, "絵を見るだけなら preview_frame で足りる"),
-    hidden("メニュー/ファイル/終了", "アプリを閉じる 編集ではない"),
+    hidden("メニュー/ファイル/終了", "アプリを閉じる 編集ではない 決定の 5 つに当たらず未決"),
     # --- メニュー 編集 ---
     same("メニュー/編集/元に戻す", "undo"),
     missing("メニュー/編集/やり直す", 333),
@@ -160,7 +178,7 @@ LEDGER: tuple[Entry, ...] = (
     missing("メニュー/シーン/シーンを削除", 349),
     same("メニュー/シーン/メインに戻る", "set_active_scene"),
     # --- メニュー 字幕 ---
-    hidden("メニュー/字幕/字幕パネル", _WINDOW),
+    read_only("メニュー/字幕/字幕パネル", _LAYOUT),
     same("メニュー/字幕/起こす…", "transcribe"),
     same("メニュー/字幕/整形…", "clean_subtitles"),
     same("メニュー/字幕/無音カット…", "jet_cut"),
@@ -171,10 +189,13 @@ LEDGER: tuple[Entry, ...] = (
     missing("メニュー/互換/テンプレート…", 328),
     missing("メニュー/互換/スクリプトを読み直す", 349),
     hidden("メニュー/互換/スクリプトフォルダを開く", _OUTSIDE),
-    hidden("メニュー/互換/exe の隣のスクリプトを移す…", "アプリの置き場の整理で、編集ではない"),
+    hidden(
+        "メニュー/互換/exe の隣のスクリプトを移す…",
+        "アプリの置き場の整理で、編集ではない 更新のときに勧める物だが、更新に数えるかは未決",
+    ),
     missing("メニュー/互換/互換性レポート…", 352, "読めなかった物を AI も読めるようにする"),
     # --- メニュー AI・表示・再生・ヘルプ ---
-    hidden("メニュー/AI/アシスタント", "AI 自身のパネル"),
+    read_only("メニュー/AI/アシスタント", _LAYOUT),
     missing("メニュー/表示/拡大", 350, _VIEW),
     missing("メニュー/表示/縮小", 350, _VIEW),
     missing("メニュー/表示/全体を表示", 350, _VIEW),
@@ -182,15 +203,15 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/表示/トラックを高く", "set_track_height"),
     same("メニュー/表示/トラックを低く", "set_track_height"),
     same("メニュー/表示/トラックの高さを戻す", "set_track_height"),
-    hidden("メニュー/表示/画面配置を初期に戻す", _WINDOW),
-    hidden("メニュー/表示/ショートカットの設定…", _OWN_SETTINGS),
-    hidden("メニュー/表示/設定…", _OWN_SETTINGS),
+    read_only("メニュー/表示/画面配置を初期に戻す", _LAYOUT),
+    read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS),
+    read_only("メニュー/表示/設定…", _SETTINGS),
     missing("メニュー/再生/再生 / 停止", 338, "AI は動きを見られない 範囲の連続フレームで確かめる"),
-    hidden("メニュー/ヘルプ/使い方", _OUTSIDE),
-    hidden("メニュー/ヘルプ/不具合・要望を送る", _OUTSIDE),
-    hidden("メニュー/ヘルプ/更新を確かめる…", _UPDATE),
-    hidden("メニュー/ヘルプ/前の版に戻す…", _UPDATE),
-    hidden("メニュー/ヘルプ/バージョン情報…", "版を見るだけ"),
+    read_only("メニュー/ヘルプ/使い方", _HELP),
+    read_only("メニュー/ヘルプ/不具合・要望を送る", _HELP),
+    read_only("メニュー/ヘルプ/更新を確かめる…", _UPDATE),
+    read_only("メニュー/ヘルプ/前の版に戻す…", _UPDATE),
+    read_only("メニュー/ヘルプ/バージョン情報…", _HELP),
     # --- タイムラインの右クリック クリップの上 ---
     same("タイムラインの右クリック/再生ヘッドで分割", "split_clip"),
     partial(
@@ -272,10 +293,10 @@ LEDGER: tuple[Entry, ...] = (
         "シーンの帯/置く｜ほかのシーンを、再生ヘッドの位置へ 1 本のクリップとして置く",
         "place_scene",
     ),
-    hidden("シーンの帯/磁石（吸着）", "手で動かすときの操作の癖 AI は位置を数で渡す"),
-    hidden(
+    read_only("シーンの帯/磁石（吸着）", _SETTINGS),
+    read_only(
         "シーンの帯/再生ヘッドの吸い付き（目盛りで動かすとき 掴んだ後に Shift で一時的に外す）",
-        "手で動かすときの操作の癖 AI は位置を数で渡す",
+        _SETTINGS,
     ),
     # --- 再生の操作 ---
     same("再生の操作/先頭へ (Home)", "seek"),
@@ -288,8 +309,8 @@ LEDGER: tuple[Entry, ...] = (
     # --- 素材一覧 ---
     same("素材一覧/読み込み…", "import_media"),
     same("素材一覧/タイムラインへ", "place_media"),
-    hidden("素材一覧/一覧｜名前・長さ・大きさを 1 行ずつ並べる", _WINDOW),
-    hidden("素材一覧/アイコン｜サムネイルを大きく並べる", _WINDOW),
+    read_only("素材一覧/一覧｜名前・長さ・大きさを 1 行ずつ並べる", _SETTINGS),
+    read_only("素材一覧/アイコン｜サムネイルを大きく並べる", _SETTINGS),
     same("素材一覧の右クリック/タイムラインへ置く", "place_media"),
     same("素材一覧の右クリック/字幕を起こす…", "transcribe"),
     hidden("素材一覧の右クリック/ファイルの場所を開く", _OUTSIDE),
@@ -348,6 +369,16 @@ LEDGER: tuple[Entry, ...] = (
         note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
     ),
     same("設定パネル/解除", "set_clip_property", note="止めた絵を解く（hold_at を null）"),
+    partial(
+        "設定パネル/組み方を「標準」にする｜組み方を「標準」に変えて、この欄を使えるようにします"
+        "（取り消しで戻せます）",
+        "set_param",
+        issue=349,
+        note=(
+            "AviUtl2 の組み方のテキストの灰色の欄に出る（#301） set_param で layout と anchor を"
+            "変えれば同じ値になるが、2 回の取り消しになり、選んだ何本かをまとめて切り替えられない"
+        ),
+    ),
     same(
         "設定パネル/＋ 縁取りを追加｜今の縁の外側に縁取りを足します"
         " 上の層ほど手前に描き、太さは字の輪郭から数えます",
