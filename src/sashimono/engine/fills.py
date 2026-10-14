@@ -81,7 +81,7 @@ def paint_of(values: Mapping[str, object], prefix: str) -> Paint | None:
         angle=_number(values, f"{prefix}_angle", 0.0),
         length=_number(values, f"{prefix}_length", 100.0),
         shift=_number(values, f"{prefix}_shift", 0.0),
-        span=span if span in ("extent", "width") else "extent",
+        span=span if span in ("extent", "width", "pixels") else "extent",
         center_x=_number(values, f"{prefix}_center_x", 0.0),
         center_y=_number(values, f"{prefix}_center_y", 0.0),
         radius=_number(values, f"{prefix}_radius", 100.0),
@@ -120,7 +120,13 @@ def gradient_brush(paint: Paint, box: QRectF, opacity: float = 1.0) -> QBrush:
         radians = math.radians(paint.angle)
         # 「グラデーション」エフェクトと同じ向き 0 で下へ、90 で左へ（画面の上で時計回り）
         dx, dy = -math.sin(radians), math.cos(radians)
-        basis = width if paint.span == "width" else abs(width * dx) + abs(height * dy)
+        if paint.span == "pixels":
+            # 長さとずらしをそのまま画素で数える（AviUtl2 の幅） 描く座標なのでプレビューでも縮む
+            basis = 100.0
+        elif paint.span == "width":
+            basis = width
+        else:
+            basis = abs(width * dx) + abs(height * dy)
         unit = max(basis, 1e-3) / 100.0
         half = max(paint.length * unit, 1e-3) / 2.0
         middle_x = centre.x() + dx * paint.shift * unit

@@ -29,6 +29,7 @@ from sashimono.compat.aviutl.motion import (
     parse_motion,
 )
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
+from sashimono.compat.aviutl.text_fill import text_gradient_fill
 from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.compat.layers import heard_stream, layer_tracks
 from sashimono.compat.mapped import MappedObject
@@ -791,6 +792,12 @@ def map_object(
             continue
 
         effect = _filter(entry, points, log)
+        if effect is not None and source is not None and not effects:
+            # テキストのすぐ後ろのグラデーションは、テキストの塗りとして読む（#312）
+            folded = text_gradient_fill(effect, source)
+            if folded is not None:
+                source = replace(source, params={**source.params, **folded})
+                continue
         if effect is not None and entry.name in _SOUND_PLACEMENT:
             effect = replace(effect, fixed=True)
         if effect is not None and effect.kind == "split_pieces":

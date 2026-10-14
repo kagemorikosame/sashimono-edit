@@ -41,7 +41,8 @@ FILL_KINDS = (("solid", "単色"), ("linear", "線形グラデーション"), ("
 #: 線形のグラデーションの長さの基準
 #: 枠の向きの長さは、字の枠を角度の向きに測った長さ（100% で枠の端から端まで Premiere と同じ）
 #: 枠の幅は角度に関わらず字の枠の横の幅（YMM4 のブラシの割合の指定と同じ 読み込みで使う）
-FILL_SPANS = (("extent", "枠の向きの長さ"), ("width", "枠の幅"))
+#: 画素は長さとずらしを画面の画素で数える（AviUtl2 の「グラデーション」の幅と同じ 読み込みで使う）
+FILL_SPANS = (("extent", "枠の向きの長さ"), ("width", "枠の幅"), ("pixels", "画素"))
 
 #: グラデーションを掛け直す単位 字の枠全体は Premiere と同じ 1 行ごと・1 文字ごとは日本語の
 #: テロップで使う（行ごとに上から下へ明るくする、字ごとに同じ光り方をさせる）
@@ -83,8 +84,20 @@ def fill_specs(prefix: str, owner: str = "") -> tuple[ParameterSpec, ...]:
         SelectSpec(f"{prefix}_type", f"{head}塗り", FILL_KINDS, "solid"),
         GradientSpec(f"{prefix}_gradient", f"{head}グラデーション"),
         TrackSpec(f"{prefix}_angle", f"{head}グラデーションの角度", -360, 360, 0, unit="度"),
-        TrackSpec(f"{prefix}_length", f"{head}グラデーションの長さ", 1, 1000, 100, unit="%"),
-        TrackSpec(f"{prefix}_shift", f"{head}グラデーションのずらし", -500, 500, 0, unit="%"),
+        # 長さとずらしは基準が画素なら画素の数 AviUtl2 の幅（4000 まで）を切らずに写せる範囲にする
+        # 画質を落としたプレビューでも描く座標ごと縮むので、画素の印（px）は付けない
+        TrackSpec(
+            f"{prefix}_length", f"{head}グラデーションの長さ", 1, 10000, 100, unit="%", pixels=False
+        ),
+        TrackSpec(
+            f"{prefix}_shift",
+            f"{head}グラデーションのずらし",
+            -10000,
+            10000,
+            0,
+            unit="%",
+            pixels=False,
+        ),
         SelectSpec(f"{prefix}_span", f"{head}長さの基準", FILL_SPANS, "extent"),
         # 中心の Y は上が正（テキストの位置と同じ）
         TrackSpec(f"{prefix}_center_x", f"{head}グラデーションの中心 X", -500, 500, 0, unit="%"),
