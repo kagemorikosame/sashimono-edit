@@ -60,6 +60,15 @@ class FakeHost:
         #: 待つ関数が呼ばれた記録（素材, 秒） と、待った結果を決める関数
         self.scene_waits: list[tuple[MediaId, float]] = []
         self.scene_ready: Callable[[MediaId], bool] = lambda _media: True
+        #: 作品（.sme）の場所 既定はまだ保存していない作品
+        self.saved_at: Path | None = None
+        #: 書き出しの窓で前に選んだフォルダ 既定はまだ書き出していない
+        self.exported_to: Path | None = None
+        #: アプリ自身の設定 get_app_settings が写しを返すかを見るため、そのまま持つ
+        self.settings: dict[str, object] = {
+            "preferences": {"theme": "dark", "update_check": True},
+            "shortcuts": {"編集/分割": "S"},
+        }
 
     @property
     def splits_media(self) -> bool:
@@ -163,6 +172,17 @@ class FakeHost:
 
     def transcription_status(self) -> str:
         return self.transcription
+
+    @property
+    def project_path(self) -> Path | None:
+        return self.saved_at
+
+    @property
+    def export_folder(self) -> Path | None:
+        return self.exported_to
+
+    def app_settings(self) -> dict[str, object]:
+        return self.settings
 
 
 def make_loaded(video_media: MediaItem, transcript: Transcript) -> Project:

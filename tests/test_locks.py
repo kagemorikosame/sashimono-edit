@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from sashimono.core.io import (
     project_presence_dir,
     try_hold,
 )
+from sashimono.core.io.atomic import held_for_update
 
 
 class TestLock:
@@ -141,6 +144,87 @@ class TestLock:
         # 落ちた窓の錠が残っていても、開き直すたびに警告が出ないこと
         (tmp_path / "a.lock").write_text("終了済み", encoding="utf-8")
         assert not is_held(tmp_path / "a.lock")
+
+
+def _delete_while_scanned(path: Path) -> Callable[[], None]:
+    """ほかのプロセス（ウイルス対策など）が開いている間に、旧来の消し方で ``path`` を消す
+
+    名前は開いている物が閉じられるまで、消す途中（delete pending）で残る 返す関数で閉じる
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    share_all, open_existing = 0x7, 3
+    scanner = create(str(path), 0x80000000, share_all, None, open_existing, 0, None)
+    deleter = create(str(path), 0x00010000, share_all, None, open_existing, 0, None)
+    flag = ctypes.c_ubyte(1)
+    # 4 は FileDispositionInfo 名前を残す旧来の消し方
+    assert kernel32.SetFileInformationByHandle(deleter, 4, ctypes.byref(flag), 1)
+    kernel32.CloseHandle(deleter)
+    return lambda: kernel32.CloseHandle(scanner)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="消す途中の名前が残るのは Windows")
+class TestDeletePending:
+    """前の持ち主が消した錠を、ほかのプロセスがまだ開いている間（#354 で見つけた揺れ）"""
+
+    def test_a_name_being_deleted_is_busy_not_an_error(self, tmp_path: Path) -> None:
+        # 壊れると、2 つの窓が続けて同じ物（設定・置き場の一覧）を書いたとき、ウイルス対策が
+        # 前の錠を開いていただけで、後の方の保存や覚え直しが「アクセスが拒否」で落ちる
+        path = tmp_path / "places.lock"
+        path.write_text("", encoding="utf-8")
+        close = _delete_while_scanned(path)
+        try:
+            assert try_hold(path) is None
+        finally:
+            close()
+        lock = try_hold(path)
+        assert lock is not None
+        lock.release()
+
+    def test_waiting_for_the_update_lock_rides_over_it(self, tmp_path: Path) -> None:
+        # 壊れると、読んでから書き戻す所の錠が、待てば空く名前で待たずに落ちる
+        path = tmp_path / "places.lock"
+        path.write_text("", encoding="utf-8")
+        close = _delete_while_scanned(path)
+        timer = threading.Timer(0.1, close)
+        timer.start()
+        try:
+            with held_for_update(path, 2.0):
+                pass
+        finally:
+            timer.join()
+
+    def test_a_folder_that_cannot_be_written_still_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると（作れないのを全部「持たれている」と読むと）、書けない置き場で、別の窓が
+        # 開いていると取り違えるか、錠を取れるまで回り続けて止まる
+        def refuse(self: Path, *_arguments: object, **_options: object) -> object:
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "open", refuse)
+        with pytest.raises(PermissionError):
+            try_hold(tmp_path / "a.lock")
 
 
 class TestPresence:

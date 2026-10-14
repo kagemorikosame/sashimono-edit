@@ -2,7 +2,8 @@
 
 読み取りと変更をはっきり分けてある（:attr:`Operation.writes`） 変更系だけに確認を
 挟めるようにするためで、この区別が無いと「全部確認する」か「何も確認しない」かの
-どちらかになる
+どちらかになる 変更系はさらに、取り消せる編集と取り消せない操作に分ける
+（:attr:`Operation.safety` :mod:`sashimono.ai.safety` #350）
 
 ここは Qt も MCP も知らない 素の関数として書いてあるので、テストではホストを
 偽物に差し替えるだけで全部のツールを試せる MCP のツールに変換するのは
@@ -11,6 +12,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections.abc import Callable
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
+from sashimono.ai.safety import Consent, Safety
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
     AddClip,
@@ -148,6 +151,27 @@ class Operation:
     #: 人に尋ねる道具か（#296） 編集画面では動かさず、ブリッジが答えを待つ
     #: ``handler`` は引数を確かめて :class:`QuestionSpec` を返すだけ
     asks: bool = False
+    #: 「元に戻す」で戻らない操作か（上書き保存・書き出し・ファイルを開く・外へ送るなど）
+    #: 真なら「変更を自動で承認」を入れていても毎回確かめる（2026-10-14 利用者の決定）
+    irreversible: bool = False
+    #: 取り消せない操作で、確かめの窓に出す「何をどこへ」を作る 編集画面のスレッドで呼ぶ
+    #: 書けない場所ならここで :class:`ToolError` を投げ、窓を出さずに断る
+    consent: Callable[[EditorHost, dict[str, Any]], Consent] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.irreversible:
+            return
+        # 取り消せない操作は、何をどこへするかを見せずに確かめても判断できない
+        # 変えない道具・質問の道具を取り消せないと書くと、確かめの窓だけが出て中身が無い
+        if self.consent is None or not self.writes or self.asks:
+            raise ValueError(f"{self.name}: 取り消せない操作は writes と consent が要ります")
+
+    @property
+    def safety(self) -> Safety:
+        """道具の区分 確かめの要否がこれで決まる（:mod:`sashimono.ai.safety`）"""
+        if self.irreversible:
+            return Safety.IRREVERSIBLE
+        return Safety.UNDOABLE if self.writes else Safety.READ_ONLY
 
     def __call__(self, host: EditorHost, arguments: dict[str, Any]) -> object:
         return self.handler(host, arguments)
@@ -961,6 +985,13 @@ def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
     png = host.render_png(frame, width=width)
     when = format_timecode(frame, project.rate)
     return ImageResult(png=png, caption=f"{when}（{frame} フレーム）")
+
+
+def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    # 写しを返す ホストの持ち物をそのまま渡すと、後の道具の中で書き換えたときに
+    # 本人の設定まで変わる（アプリ自身の設定は人だけが変える #350）
+    return copy.deepcopy(host.app_settings())
 
 
 def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2187,6 +2218,15 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_detect_scenes,
+    ),
+    Operation(
+        name="get_app_settings",
+        description=(
+            "アプリ自身の設定を読む（本人の好み・ショートカット・画面配置・版・更新・ヘルプ）"
+            " 編集の判断に使う 読むだけで、変えるのは人だけ（表示 → 設定… など）"
+        ),
+        schema=_schema({}),
+        handler=_get_app_settings,
     ),
     Operation(
         name="seek",

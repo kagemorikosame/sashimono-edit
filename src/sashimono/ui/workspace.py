@@ -531,6 +531,11 @@ class Preferences:
     #: （:data:`sashimono.engine.scenes.MEASURED_SCENE_SECONDS`）ので、
     #: 速さと重さの釣り合いはこれ 1 つで取る
     scene_threads: int = DEFAULT_SCENE_THREADS
+    #: 書き出しの窓で前に書き出したフォルダ 空はまだ書き出していない
+    #: 好みではなく覚えている物なので、設定画面には出さない 次に開いた書き出しの窓の
+    #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
+    #: 窓で選んで書き出した所だけ 2026-10-14 利用者の決定 #350）
+    export_folder: str = ""
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -733,6 +738,7 @@ class PreferenceStore:
             scene_threads=_member(
                 data.get("scene_threads"), SCENE_THREAD_CHOICES, plain.scene_threads
             ),
+            export_folder=_folder(data.get("export_folder"), plain.export_folder),
         )
 
     def save(self, preferences: Preferences) -> None:
