@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -160,6 +162,8 @@ class PreferencesDialog(QDialog):
 
     def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        #: 開いたときの設定 :meth:`preferences` はここから画面の項目だけを変える
+        self._given = preferences
         self.setWindowTitle("設定")
 
         form = QFormLayout()
@@ -855,8 +859,14 @@ class PreferencesDialog(QDialog):
         box.setCurrentIndex(index)
 
     def preferences(self) -> Preferences:
-        """画面で選ばれた設定"""
-        return Preferences(
+        """画面で選ばれた設定
+
+        開いたときの設定から、画面に出している項目だけを変えて返す 一から作り直すと、
+        画面に出していない項目（窓の外で覚える書き出しのフォルダなど）が OK で既定へ戻る
+        （覚えたフォルダが消え、AI もそこへ書けなくなっていた）
+        """
+        return replace(
+            self._given,
             use_proxy=self._use_proxy.isChecked(),
             proxy_height=int(self._proxy_height.currentData()),
             auto_quality=self._auto_quality.isChecked(),
