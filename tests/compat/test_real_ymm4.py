@@ -113,6 +113,35 @@ def test_outlines_after_a_fill_stay_in_place(loaded: Loaded) -> None:
         assert sum(1 for effect in clip.effects if effect.kind == "border") == 2
 
 
+def test_the_head_fill_becomes_the_text_fill(loaded: Loaded) -> None:
+    """頭の普通の合成の前景の塗り（実物 19 個）はテキストの塗りのグラデーションになる（#312）
+
+    写せないと、読み込んだ字幕のグラデーションを設定パネルのバーで直せない 2 つ目の乗算の塗り
+    （ポップおこ）は字の色との混ぜ方が違うので、塗りのエフェクトのまま残る
+    YMM4 の書き出しとの差は写す前と変わらない（ポップグラデ濃緑 1.02 ポップおこ濃緑 1.92）
+    """
+    found = {
+        entry.name: item.clip
+        for entry, objects in loaded
+        if any(
+            part in entry.name for part in ("ポップおこ", "ポップグラデ", "確定演出的な虹色字幕")
+        )
+        for item in objects
+        if item.clip.source is not None and item.clip.source.kind == "text"
+    }
+    if not found:
+        pytest.skip("ポップおこ・ポップグラデ・確定演出的な虹色字幕のテンプレートが置かれていない")
+    for name, clip in found.items():
+        assert clip.source is not None
+        assert clip.source.params.get("fill_type") == "linear", name
+        assert clip.source.params.get("fill_span") == "width", name
+        fills = [effect for effect in clip.effects if effect.kind == "brush_fill"]
+        if "ポップグラデ" in name:
+            assert fills == [], name
+        if "ポップおこ" in name:
+            assert [effect.params.get("blend") for effect in fills] == ["multiply"], name
+
+
 def test_layers_widen_outwards(loaded: Loaded) -> None:
     """縁取りの層になった物は、外側の層ほど太い 太さを字の輪郭からの和にしないと、外側の層が
     内側の層の下に隠れる（層になる実物が無ければ何も見ない）"""

@@ -9,7 +9,7 @@ Qt の描画系に任せるのが現実的で、その依存をこの層に持�
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from sashimono.core.model import (
@@ -22,6 +22,7 @@ from sashimono.core.model import (
     ParamValue,
 )
 from sashimono.effects.easing import EASING_KINDS, EASING_MODES
+from sashimono.effects.fills import fill_names, fill_specs, fill_unused
 from sashimono.effects.spec import (
     CheckSpec,
     ColorSpec,
@@ -85,6 +86,31 @@ class SourceDefinition:
     #: :attr:`locked` の理由ごとの切り替え 同じ切り替えで解ける理由は同じ物を指す
     #: 設定パネルは同じ物のボタンを 1 つにまとめる（2 つ出すと、別々の操作に見える）
     unlocks: Mapping[str, Unlock] = field(default_factory=dict)
+    #: 設定パネルで、項目をどの項目のすぐ後ろに出すか（項目の名前 → 前に来る項目の名前）
+    #: 足した項目は定義の末尾に置く（保存した値の並びと既存の項目の位置を動かさない）ので、
+    #: そのまま並べると関係する欄から遠い底に出て見つけられない
+    placed_after: Mapping[str, str] = field(default_factory=dict)
+
+    def display_order(self, specs: Sequence[ParameterSpec]) -> list[ParameterSpec]:
+        """``specs`` を設定パネルに出す順にする :attr:`placed_after` の項目を前の項目の後ろへ
+
+        前に来る項目が ``specs`` に無い（隠れている）ときは定義の位置のまま 同じ項目の後ろへ
+        いくつも動かすときは定義の順に並べる
+        """
+        names = {spec.name for spec in specs}
+        moved = [s for s in specs if self.placed_after.get(s.name) in names]
+        ordered: list[ParameterSpec] = []
+
+        def place(spec: ParameterSpec) -> None:
+            ordered.append(spec)
+            for follower in moved:
+                if self.placed_after.get(follower.name) == spec.name:
+                    place(follower)
+
+        for spec in specs:
+            if spec not in moved:
+                place(spec)
+        return ordered
 
     def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
         """``params`` のときに使わない項目 :attr:`unused` が無ければ空"""
@@ -135,6 +161,8 @@ def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
     - 縦書きは行揃えと組み方を読まない（縦書きは標準の組み方で描く）
     - 縁取りの太さが 0 なら縁取りの色、影のずらしとぼかしが 0 なら影の色を読まない
       （文字の中の制御文字で縁や影を付けたときは、制御文字の色を使う）
+    - 塗りが単色ならグラデーションの項目を、グラデーションなら色を読まない（#312）
+      影も同じ 影を描かないときは影の塗りの項目をどれも読まない
     """
     unused: set[str] = set()
     if not str(params.get("timer_format", "") or ""):
@@ -149,9 +177,35 @@ def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
         unused |= {"align", "layout"}
     if _still_zero(params.get("border_width")):
         unused.add("border_color")
+    unused |= fill_unused(params, TEXT_FILL, "color")
     if all(_still_zero(params.get(name)) for name in ("shadow_x", "shadow_y", "shadow_blur")):
         unused.add("shadow_color")
+        unused |= set(fill_names(SHADOW_FILL))
+    else:
+        unused |= fill_unused(params, SHADOW_FILL, "shadow_color")
     return frozenset(unused)
+
+
+#: 字の塗りと影の塗りの項目の頭（:func:`sashimono.effects.fills.fill_specs`）
+TEXT_FILL = "fill"
+SHADOW_FILL = "shadow_fill"
+
+
+def _text_placed_after() -> dict[str, str]:
+    """塗りの項目を色の欄のすぐ後ろへ、影の塗りの項目を影の色の欄のすぐ後ろへ出す
+
+    前に来る項目は 1 つ前の塗りの項目にしてつなぐ 色の欄はグラデーションのときに隠れるので、
+    色の欄そのものの後ろとだけ決めると、隠れた欄を探して定義の末尾の底に出てしまう
+    頭の項目（塗りの種類）だけは色の欄の 1 つ前の欄（大きさ・影のぼかし）の後ろに置き、
+    色の欄の前に出す 種類を選んでから色かバーを触る、の順に上から読める
+    """
+    placed: dict[str, str] = {}
+    for prefix, anchor in ((TEXT_FILL, "size"), (SHADOW_FILL, "shadow_blur")):
+        previous = anchor
+        for name in fill_names(prefix):
+            placed[name] = previous
+            previous = name
+    return placed
 
 
 #: AviUtl2 の組み方で折り返しの欄を使えない理由 設定パネルの欄に添える
@@ -302,9 +356,15 @@ TEXT = SourceDefinition(
         # フォントのファミリの中のスタイル（#248） 設定パネルはフォントの欄のすぐ下に出す
         # 並びの末尾に置いたのは、保存した値の並びと既存の項目の位置を動かさないため
         FontStyleSpec("font_style", "スタイル"),
+        # 塗りと影の塗りの種類とグラデーション（#312） 既定は単色で、前の版の作品は項目を
+        # 持たないので前からの色で塗る（1 画素も変わらない） 設定パネルでは色の欄の
+        # すぐ上に出す（:func:`_text_placed_after`）
+        *fill_specs(TEXT_FILL),
+        *fill_specs(SHADOW_FILL, "影"),
     ),
     locked=_text_locked,
     unlocks={AVIUTL_NO_WRAP: TO_NATIVE_LAYOUT, AVIUTL_NO_STYLE: TO_NATIVE_LAYOUT},
+    placed_after=_text_placed_after(),
 )
 
 

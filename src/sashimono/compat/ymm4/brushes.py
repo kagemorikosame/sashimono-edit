@@ -18,6 +18,7 @@ import colorsys
 import math
 from collections.abc import Callable
 from dataclasses import replace
+from itertools import pairwise
 from typing import Any
 
 from sashimono.compat.aviutl.report import CompatibilityReport
@@ -33,6 +34,7 @@ __all__ = [
     "gradient_effect",
     "is_solid",
     "noise_mask",
+    "text_fill",
 ]
 
 #: YMM4 の合成モードの名前と、塗りのエフェクトの合成 実物の名前だけを並べる
@@ -103,6 +105,18 @@ def _plugin(brush: dict[str, Any]) -> str:
 
 
 def _stops(raw: Any, report: CompatibilityReport, owner: str) -> dict[str, ParamValue]:
+    """色の並びを「模様で塗る」の項目（色の数・色・位置）にする 並べ方は :func:`_stop_list`"""
+    stops = _stop_list(raw, report, owner)
+    params: dict[str, ParamValue] = {"stops": len(stops)}
+    for index, (offset, rgba) in enumerate(stops):
+        params[f"color{index}"] = rgba
+        params[f"offset{index}"] = AnimatedValue(offset)
+    return params
+
+
+def _stop_list(
+    raw: Any, report: CompatibilityReport, owner: str
+) -> list[tuple[float, tuple[float, float, float, float]]]:
     """色の並びを、位置の順に並べて上限までに収める
 
     配布物の中には位置の順に並んでいないものがある（エディタで点を動かした順）
@@ -126,11 +140,7 @@ def _stops(raw: Any, report: CompatibilityReport, owner: str) -> dict[str, Param
         )
         step = (len(stops) - 1) / (MAX_STOPS - 1)
         stops = [stops[round(index * step)] for index in range(MAX_STOPS)]
-    params: dict[str, ParamValue] = {"stops": len(stops)}
-    for index, (offset, rgba) in enumerate(stops):
-        params[f"color{index}"] = rgba
-        params[f"offset{index}"] = AnimatedValue(offset)
-    return params
+    return stops
 
 
 def _two_colours(first: Any, second: Any) -> dict[str, ParamValue]:
@@ -398,6 +408,105 @@ def fill_foreground(
         opacity=values.track("Opacity", 100.0),
         # ブラシだけで塗る（元の絵の色を捨てて形だけを使う）
         pattern_only=entry.get("IsBrushOnly") is True,
+    )
+
+
+def text_fill(
+    entry: dict[str, Any],
+    base: tuple[float, ...],
+    report: CompatibilityReport,
+    *,
+    length: int = 1,
+    keyframes: Any = None,
+) -> dict[str, ParamValue] | None:
+    """テキストの頭の「前景を塗りつぶし」を、テキストの塗りのグラデーション（#312）にした項目
+
+    写せなければ ``None``（呼ぶ側はこれまでどおり塗りのエフェクトにする） ``base`` は字の色
+
+    写すのは、エフェクトと同じ絵になると言える物だけ 2026-10-14 に実物 73 本（テキスト 125 個）を
+    数えると、テキストの前景の塗りは 39 個 そのうち線形グラデーションのブラシが 29 個で、どれも
+    長さを絵の幅の割合で決める（``Relative``）・端の色のまま（``Clamp``）・角度 90・動かない値・
+    止まり 2 つだった 頭（どの縁取りよりも前）にあって普通の合成の物が 19 個（ポップおこ 9・
+    ポップグラデ 9・確定演出的な虹色字幕 1）で、これを写す 2 つ目に置いた乗算（9 個）と
+    オーバーレイ（1 個）は字の色との混ぜ方が違うので塗りのエフェクトのまま残す ノイズ（8 個）と
+    虹色のブラシ（2 個）は縁取りの後ろか模様なので写さない 円形・画素で長さを決める物は実物に無く、
+    測っていないので写さない
+
+    - 角度 YMM4 のブラシは 0 で左から右 塗りは「グラデーション」エフェクトと同じく 0 で上から下
+      なので 90 を引く（ブラシの 90 は上から下）
+    - 長さとずらし 割合の指定は絵の横の幅が 100 長さの基準を枠の幅にして同じ数を渡す
+      グラデーションの基準の字の枠は、エフェクトの入れ物（字の色の付いた所と文字の枠）と同じ範囲
+    - 色 前景の塗りは字の色の上に止まりの色を不透明度で重ねる（普通の合成） 重ねた色を
+      止まりの色にする 止まりの間で色と不透明度が両方変わると、重ねた色は位置について直線で
+      なくなり、止まりだけでは表せない（その時は写さない） 「ブラシだけ」の物は字の形だけを借りる
+      ので、止まりの色のまま不透明度に字の不透明度を掛ける
+    """
+    if str(entry.get("BlendMode") or "Normal") != "Normal":
+        return None
+    values = _Values(entry, length, keyframes)
+    opacity = values.track("Opacity", 100.0)
+    if opacity.is_animated or opacity.static != 100.0:
+        return None
+    brush = entry.get("Brush")
+    if not isinstance(brush, dict) or not _plugin(brush).startswith("LinearGradientBrush"):
+        return None
+    raw = brush.get("Parameter")
+    parameter = raw if isinstance(raw, dict) else {}
+    if str(parameter.get("CoordinateMode") or "") != "Relative":
+        return None
+    if str(parameter.get("ExtendMode") or "Clamp") != "Clamp":
+        return None
+    brush_values = _Values(parameter, length, keyframes)
+    size = brush_values.track("Size", 400.0)
+    offset = brush_values.track("Offset")
+    angle = brush_values.track("Angle")
+    if size.is_animated or offset.is_animated or angle.is_animated:
+        return None
+    stops = _stop_list(parameter.get("Stops"), report, "線形グラデーションのブラシ")
+    base_rgba = (*base[:3], base[3] if len(base) > 3 else 1.0)
+    brush_only = entry.get("IsBrushOnly") is True
+    if not brush_only and any(_bends(left[1], right[1]) for left, right in pairwise(stops)):
+        return None
+    flat: list[float] = []
+    for position, (red, green, blue, alpha) in stops:
+        colour_: tuple[float, ...]
+        if brush_only:
+            colour_ = (red, green, blue, alpha * base_rgba[3])
+        else:
+            colour_ = (
+                *(
+                    under * (1.0 - alpha) + over * alpha
+                    for under, over in zip(base_rgba[:3], (red, green, blue), strict=True)
+                ),
+                base_rgba[3],
+            )
+        flat.extend((position, *colour_))
+    return {
+        "fill_type": "linear",
+        "fill_gradient": tuple(flat),
+        "fill_angle": AnimatedValue(angle.static - 90.0),
+        "fill_length": AnimatedValue(size.static),
+        "fill_shift": AnimatedValue(offset.static),
+        "fill_span": "width",
+    }
+
+
+#: 字の色に重ねた色が、止まりの間で直線からずれてよい量（0..1） 8 bit の半段より小さければ
+#: 書き出しの色は同じ値に丸まる
+_BEND_LIMIT = 0.5 / 255.0
+
+
+def _bends(left: tuple[float, ...], right: tuple[float, ...]) -> bool:
+    """2 つの止まりの間で、字の色に重ねた色が直線から見て分かるほど曲がるか
+
+    重ねた色は 下の色 x (1 - a) + 止まりの色 x a で、色と不透明度が両方動くと位置の 2 次になる
+    直線からのずれは真ん中で一番大きく、色の差 x 不透明度の差 / 4 実物には 1/255 だけ色の違う
+    止まり（ポップおこ赤・ポップグラデ赤の #50E95532 と #FFEA5532）があり、ずれは 0.0007 で
+    見分けが付かない
+    """
+    swing = abs(right[3] - left[3])
+    return any(
+        abs(b - a) * swing / 4.0 > _BEND_LIMIT for a, b in zip(left[:3], right[:3], strict=True)
     )
 
 

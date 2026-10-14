@@ -61,6 +61,7 @@ from sashimono.engine.audio_shapes import (
     waveform_cells,
     waveform_points,
 )
+from sashimono.engine.fills import Paint, gradient_brush, paint_of
 from sashimono.engine.motion_shapes import (
     TrailPath,
     TrailPaths,
@@ -448,7 +449,7 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
         shift_x = _number(look, "shadow_x", 0.0)
         shift_y = _number(look, "shadow_y", 0.0)
         blur = max(0.0, _number(look, "shadow_blur", 0.0))
-        if (shift_x, shift_y, blur) != (0.0, 0.0, 0.0) and _color(look.get("shadow_color")).alpha():
+        if (shift_x, shift_y, blur) != (0.0, 0.0, 0.0) and _shadow_visible(look):
             # 箱ぼかしを 2 回掛けるので、影はぼかしの幅の 2 倍まで広がる（:func:`_blur_alpha`）
             spread = 2.0 * blur + 1.0
             shadow = inked.translated(shift_x, -shift_y)
@@ -603,8 +604,43 @@ def _draw_text(
     if laid is None:
         return None
     layers, framed = laid
-    _paint_layers(painter, layers)
+    box = _glyph_box(layers, framed)
+    if _uses_gradient(values) and _number(values, "reveal", 100.0) < 100.0:
+        # 文字送りの途中でも、全部を出した字の枠で塗る 出ている字の枠で塗ると、1 文字
+        # 出るたびにグラデーションが伸び縮みして、出た字の色が変わっていく
+        whole = _text_layers({**values, "reveal": 100.0}, width, height)
+        if whole is not None:
+            box = _glyph_box(*whole)
+    _paint_layers(painter, layers, box)
     return framed
+
+
+#: 塗りの項目の頭 字の塗り・影の塗り・縁取りの層の塗り（:mod:`sashimono.effects.fills`）
+_FILL, _SHADOW_FILL, _STROKE_FILL = "fill", "shadow_fill", "fill"
+
+
+def _uses_gradient(values: Mapping[str, object]) -> bool:
+    """字の塗り・影・縁取りの層のどれかがグラデーションか"""
+    if paint_of(values, _FILL) is not None or paint_of(values, _SHADOW_FILL) is not None:
+        return True
+    strokes = values.get("strokes")
+    return isinstance(strokes, tuple) and any(
+        isinstance(ring, _Ring) and ring.paint is not None for ring in strokes
+    )
+
+
+def _glyph_box(layers: list[_Layer], framed: Frame | None) -> QRectF:
+    """グラデーションの基準にする字の枠（描く座標） 字の輪郭すべてを囲む四角
+
+    AviUtl2 の組み方は文字の枠も含める エフェクトの入れ物（字の色の付いた所と文字の枠を
+    合わせた物）と同じ範囲にしておくと、「模様で塗る」から写した塗りが同じ所に出る
+    """
+    box = QRectF()
+    for path, _look, _clip in layers:
+        box = box.united(path.boundingRect())
+    if framed is not None:
+        box = box.united(QRectF(QPointF(framed[0], framed[1]), QPointF(framed[2], framed[3])))
+    return box
 
 
 def _text_layers(
@@ -1222,6 +1258,7 @@ def _redecorated(values: dict[str, object], look: _Look) -> dict[str, object]:
 def _paint_layers(
     painter: QPainter,
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
+    box: QRectF,
 ) -> None:
     """影を全部、縁を全部、塗りを全部の順に描く
 
@@ -1234,9 +1271,12 @@ def _paint_layers(
     描かないと、塗りに隠れて見えない（Photoshop の境界線も字の上に描く） 外側の層を塗りの
     上にすると、前からの縁取り（輪郭をまたいで描き、内側半分を塗りで隠す）と縁の滑らかな所が
     変わり、層が 1 つの字の見た目が前と 1 画素ずれる
+
+    ``box`` はグラデーションの基準の字の枠（#312 :func:`_glyph_box`） 制御文字で色を変えた字も
+    含めた全部の字で 1 つにする 見た目ごとに枠を取ると、色を変えた字だけ別のグラデーションになる
     """
     for path, look, clip in layers:
-        made = _shadow_layer(path, look, painter)
+        made = _shadow_layer(path, look, painter, box)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
             # 影の面は絵の画素で作ってある 描く座標の縮め方を外してから重ねる
@@ -1251,11 +1291,13 @@ def _paint_layers(
     rings = [_rings(look) for _, look, _ in layers]
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, under=True)
+        _paint_ring(painter, layers, rings, index, box, under=True)
     for path, look, clip in layers:
-        _fill_within(painter, path, _color(look.get("color")), clip)
+        paint = paint_of(look, _FILL)
+        fill = _color(look.get("color")) if paint is None else gradient_brush(paint, box)
+        _fill_within(painter, path, fill, clip)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, under=False)
+        _paint_ring(painter, layers, rings, index, box, under=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1278,6 +1320,17 @@ class _Ring:
     #: 層のエフェクトが絵を中心の周りで拡大・回転する（倍率, 度） 広がりは範囲の大きさで
     #: 変わるので、量ではなく値のまま持つ（:func:`~sashimono.effects.strokes.turned_reach`）
     turns: tuple[tuple[float, float], ...] = ()
+    #: 層の色のグラデーション（#312） 単色なら ``None`` で :attr:`colour` で塗る
+    paint: Paint | None = None
+    #: 層の不透明度（0..1） グラデーションの止まりの不透明度に掛ける 単色は :attr:`colour` に
+    #: 掛けてある
+    opacity: float = 1.0
+
+    def fill(self, box: QRectF) -> QColor | QBrush:
+        """層を塗る色か筆 ``box`` はグラデーションの基準の字の枠"""
+        if self.paint is None:
+            return _color(self.colour)
+        return gradient_brush(self.paint, box, self.opacity)
 
     def spread(
         self, half_width: float, half_height: float, scale: float = 1.0
@@ -1340,6 +1393,8 @@ def _resolve_strokes(values: dict[str, object], source: GeneratedSource, frame: 
                 reach=reach,
                 effects=index,
                 turns=turns,
+                paint=paint_of(resolved, _STROKE_FILL),
+                opacity=opacity,
             )
         )
     values["strokes"] = tuple(rings)
@@ -1398,7 +1453,9 @@ def _edge_tagged(rings: list[_Ring], look: Mapping[str, object]) -> list[_Ring]:
     first = rings[0]
     if isinstance(colour, tuple) and len(colour) >= 3:
         alpha = first.colour[3] if len(first.colour) > 3 else 1.0
-        first = replace(first, colour=(*colour[:3], alpha))
+        # 制御文字で色を決めた字は、層がグラデーションでもその 1 色で塗る（字の塗りと同じ
+        # :func:`_recoloured`） 字ごとに書いた色の方が、層全体の設定より狙いがはっきりしている
+        first = replace(first, colour=(*colour[:3], alpha), paint=None)
     if isinstance(width, int | float) and not isinstance(width, bool):
         first = replace(first, width=max(0.0, float(width)))
     return [first, *rings[1:]]
@@ -1416,10 +1473,11 @@ def _paint_ring(
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
     rings: list[tuple[_Ring, ...]],
     index: int,
+    box: QRectF,
     *,
     under: bool,
 ) -> None:
-    """``index`` 番目の層を、字の見た目ごとの輪郭すべてに描く
+    """``index`` 番目の層を、字の見た目ごとの輪郭すべてに描く ``box`` はグラデーションの基準
 
     ``under`` なら外側に引く層だけ（塗りの下）、偽なら中央と内側の層だけ（塗りの上）
     層にエフェクトがあるか内側に引く層なら、別の面に描いてから重ねる 内側は字の形で
@@ -1447,7 +1505,7 @@ def _paint_ring(
     bands = [(_ring_path(path, ring), ring, clip) for path, ring, clip, _ in entries]
     if apply is None and not inside:
         for band, ring, clip in bands:
-            _fill_within(painter, band, _color(ring.colour), clip)
+            _fill_within(painter, band, ring.fill(box), clip)
         return
 
     # 面は縁のある所の周り（層のエフェクトが広げる分を足した四角）だけで作る 字の絵の全体で
@@ -1475,7 +1533,8 @@ def _paint_ring(
     plane_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     plane_painter.setTransform(placed)
     for band, ring, clip in bands:
-        _fill_within(plane_painter, band, _color(ring.colour), clip)
+        # 面の写し方（placed）は描く座標から面の画素へ写すので、枠は描く座標のまま渡す
+        _fill_within(plane_painter, band, ring.fill(box), clip)
     plane_painter.end()
     if inside:
         plane = _within_glyphs(plane, [path for path, _, _, _ in entries], placed)
@@ -1512,9 +1571,9 @@ def _within_glyphs(plane: QImage, paths: list[QPainterPath], transform: QTransfo
 
 
 def _fill_within(
-    painter: QPainter, path: QPainterPath, colour: QColor, clip: QPainterPath | None
+    painter: QPainter, path: QPainterPath, colour: QColor | QBrush, clip: QPainterPath | None
 ) -> None:
-    """``path`` を塗る ``clip`` があればその内側だけ"""
+    """``path`` を塗る ``clip`` があればその内側だけ ``colour`` はグラデーションの筆でもよい"""
     if clip is None:
         painter.fillPath(path, colour)
         return
@@ -1545,6 +1604,12 @@ def _recoloured(
         if name == "border_color":
             # 縁取りの層を持つ字は前からの項目を読まないので、層の頭へ当てる色として残す
             changed[_EDGE_COLOUR] = rgb
+    # 制御文字で色を決めた字は、塗りや影がグラデーションでもその 1 色で塗る（#312）
+    # 字ごとに書いた色の方が、テキスト全体の設定より狙いがはっきりしている
+    if color is not None:
+        changed[f"{_FILL}_type"] = "solid"
+    if edge is not None:
+        changed[f"{_SHADOW_FILL}_type"] = "solid"
     return changed
 
 
@@ -1569,7 +1634,7 @@ def _stroke(path: QPainterPath, width: float, join: str = "round") -> QPainterPa
 
 
 def _shadow_layer(
-    path: QPainterPath, values: dict[str, object], painter: QPainter
+    path: QPainterPath, values: dict[str, object], painter: QPainter, box: QRectF
 ) -> tuple[QImage, tuple[int, int]] | None:
     """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
@@ -1584,12 +1649,15 @@ def _shadow_layer(
     流れるテロップで一辺 8000 近くになり、全体をぼかすと 1 枚で 0.4 秒かかった
     画面に収まる絵は今までどおり絵の全体で作る ぼかしの足し算の順が変わると、
     端の濃さが 1 だけ変わることがあり、収まる字の見た目を 1 画素も変えないため
+
+    影の塗りがグラデーション（#312）なら、``box``（字の枠）を影と同じだけずらして塗る
     """
     offset_x = float(values.get("shadow_x", 0.0))  # type: ignore[arg-type]
     offset_y = float(values.get("shadow_y", 0.0))  # type: ignore[arg-type]
     blur = float(values.get("shadow_blur", 0.0))  # type: ignore[arg-type]
     colour = _color(values.get("shadow_color"))
-    if (offset_x, offset_y, blur) == (0.0, 0.0, 0.0) or colour.alpha() == 0:
+    paint = paint_of(values, _SHADOW_FILL)
+    if (offset_x, offset_y, blur) == (0.0, 0.0, 0.0) or not _shadow_visible(values):
         return None
 
     device = painter.device()
@@ -1618,19 +1686,82 @@ def _shadow_layer(
     layer = QImage(right - left, bottom - top, QImage.Format.Format_RGBA8888)
     layer.fill(Qt.GlobalColor.transparent)
 
+    placed = transform * QTransform.fromTranslate(-left, -top)
     shadow_painter = QPainter(layer)
-    shadow_painter.setTransform(transform * QTransform.fromTranslate(-left, -top))
+    shadow_painter.setTransform(placed)
     shadow_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    # グラデーションの影は形を白で描いてから、色を後で付ける（:func:`_shadow_coloured`）
+    shape = colour if paint is None else QColor(255, 255, 255, 255)
     if outline is not None:
         # 縁取りがあるときは、その外形の影が落ちる 塗りだけの影にすると
         # 縁の分だけ影が細く見える
-        shadow_painter.fillPath(outline, colour)
-    shadow_painter.fillPath(shifted, colour)
+        shadow_painter.fillPath(outline, shape)
+    shadow_painter.fillPath(shifted, shape)
     shadow_painter.end()
 
-    if blur <= 0.0:
-        return layer, (left, top)
-    return _blur_alpha(layer, blur), (left, top)
+    if blur > 0.0:
+        layer = _blur_alpha(layer, blur)
+    if paint is not None:
+        # 影の枠は字の枠を影と同じだけずらした物 影の形とグラデーションが一緒に動く
+        # 色を付けるのは影の形の周り（ぼかしが広げる分を足した四角）だけ 面の全体で作ると、
+        # 画面に収まる字幕でも 1 本ごとに画面 1 枚ぶんを塗って掛け合わせることになる
+        drawn = placed.mapRect((outline if outline is not None else shifted).boundingRect())
+        margin = 2.0 * math.ceil(blur) + 4.0
+        region = (
+            max(0, math.floor(drawn.left() - margin)),
+            max(0, math.floor(drawn.top() - margin)),
+            min(layer.width(), math.ceil(drawn.right() + margin)),
+            min(layer.height(), math.ceil(drawn.bottom() + margin)),
+        )
+        brush = gradient_brush(paint, box.translated(offset_x, -offset_y))
+        layer = _shadow_coloured(layer, brush, placed, region)
+    return layer, (left, top)
+
+
+def _shadow_visible(values: Mapping[str, object]) -> bool:
+    """影の色がどこかに出るか 単色なら色の不透明度、グラデーションならどれかの止まり
+
+    描く所（:func:`_shadow_layer`）と広がりの見積もり（:func:`_text_reach`）で同じ物を見る
+    食い違うと、透明な単色を残したグラデーションの影が絵の端で切れる
+    """
+    paint = paint_of(values, _SHADOW_FILL)
+    if paint is not None:
+        return paint.visible
+    return _color(values.get("shadow_color")).alpha() > 0
+
+
+def _shadow_coloured(
+    shape: QImage, brush: QBrush, placed: QTransform, region: tuple[int, int, int, int]
+) -> QImage:
+    """白で描いてぼかした影の形 ``shape`` に、グラデーションの色を付ける（#312）
+
+    色は影の周りの四角 ``region``（面の画素 左・上・右・下）の全体へ塗ってから、形の不透明度を
+    掛ける 形の所だけを筆で塗ってからぼかすと、ぼけて外へ広がった所の色が 0（黒）のまま残り、
+    明るい影の縁が黒ずむ ``region`` の外は影が無いので触らない（透明のまま）
+    ``placed`` は描く座標から面の画素への写し方（筆を字と同じ所に置くため）
+    """
+    left, top, right, bottom = region
+    if right <= left or bottom <= top:
+        return shape
+    width, height = right - left, bottom - top
+    tint = QImage(width, height, QImage.Format.Format_RGBA8888)
+    tint.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tint)
+    local = placed * QTransform.fromTranslate(-left, -top)
+    painter.setTransform(local)
+    inverse, invertible = local.inverted()
+    whole = QRectF(0.0, 0.0, float(width), float(height))
+    painter.fillRect(inverse.mapRect(whole) if invertible else whole, brush)
+    painter.end()
+    colours = _to_array(tint)
+    # 影の面へじかに書く 写してから作り直すと、字幕 1 本ごとに画面 1 枚ぶんを 2 度写すことになり、
+    # 大きさが動いて毎コマ描き直す字幕 20 本で 1 コマ 300 ms ほど延びた
+    rows = np.frombuffer(shape.bits(), dtype=np.uint8).reshape(shape.height(), shape.bytesPerLine())
+    pixels = rows[:, : shape.width() * 4].reshape(shape.height(), shape.width(), 4)
+    mask = pixels[top:bottom, left:right, 3].astype(np.uint32)
+    pixels[top:bottom, left:right, :3] = colours[:, :, :3]
+    pixels[top:bottom, left:right, 3] = (colours[:, :, 3].astype(np.uint32) * mask + 127) // 255
+    return shape
 
 
 def _blur_alpha(image: QImage, radius: float) -> QImage:

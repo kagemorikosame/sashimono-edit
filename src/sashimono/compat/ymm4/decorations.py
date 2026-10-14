@@ -26,7 +26,13 @@ from typing import Any
 
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.decoration import PLAIN, TextDecoration, decoration_params
-from sashimono.compat.ymm4.brushes import fill_foreground, gradient_effect, is_solid, noise_mask
+from sashimono.compat.ymm4.brushes import (
+    fill_foreground,
+    gradient_effect,
+    is_solid,
+    noise_mask,
+    text_fill,
+)
 from sashimono.compat.ymm4.effects import CenterPoint, center_point, map_effect, mapped_names
 from sashimono.compat.ymm4.values import (
     animated,
@@ -158,6 +164,7 @@ def map_video_effects(
     keyframes: Any = None,
     text: bool = False,
     placed_before: bool = False,
+    fill_base: tuple[float, ...] | None = None,
 ) -> DecorationResult:
     """``VideoEffects`` の列を読む
 
@@ -166,6 +173,8 @@ def map_video_effects(
     縁取りのエフェクトにする
     ``placed_before`` は、この列より前で描画を遅らせる印の配置を先に当てること
     （印の後ろの区間） そこの縁取りは縁取りの層にしない（:func:`layers_keep_order`）
+    ``fill_base`` はテキストの字の色 渡すと、列の頭の前景の塗りを写せる物はテキストの塗りの
+    グラデーションとして ``params`` へ返す（#312 :func:`~sashimono.compat.ymm4.brushes.text_fill`）
     """
     # 知らない移動方法の形を、渡された記録へ書く（値を読む所は記録を受け取らない）
     with reporting(report):
@@ -176,6 +185,7 @@ def map_video_effects(
             keyframes=keyframes,
             text=text,
             placed_before=placed_before,
+            fill_base=fill_base,
         )
 
 
@@ -216,6 +226,7 @@ def _map_video_effects(
     keyframes: Any,
     text: bool,
     placed_before: bool = False,
+    fill_base: tuple[float, ...] | None = None,
 ) -> DecorationResult:
     result = DecorationResult()
     if not isinstance(effects, list):
@@ -235,6 +246,9 @@ def _map_video_effects(
     if not in_place and _outline_count(effects) >= 2:
         in_place = not layers_keep_order(effects, placed_before=placed_before)
     pivot: CenterPoint | None = None
+    #: まだ字の絵を変える物が無いか 頭の前景の塗りだけをテキストの塗りへ写せる（#312）
+    #: 縁取りや別の塗りの後ろにある物は、縁や前の塗りまで塗るので字の塗りでは表せない
+    untouched = text and fill_base is not None and not placed_before
     for entry in effects:
         if not isinstance(entry, dict):
             continue
@@ -242,6 +256,16 @@ def _map_video_effects(
             continue
 
         name = type_name(entry)
+        if name == "FillForegroundEffect" and untouched and fill_base is not None:
+            folded = text_fill(entry, fill_base, report, length=length, keyframes=keyframes)
+            untouched = False
+            if folded is not None:
+                # 並びの残り（縁取りを層にするか）は前と同じに決める 塗りが列に残っていた時と
+                # 同じ順で縁取りが付くので、絵は変わらず、塗りだけが設定パネルのバーで直せる
+                result.params.update(folded)
+                continue
+        elif name not in _NOT_PICTURE:
+            untouched = False
         if name == "ShowOnlyPreviewEffect":
             # 掛かったアイテムごと書き出しから外す（アイテムを読む所で見る）
             continue
