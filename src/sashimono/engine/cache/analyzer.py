@@ -123,6 +123,10 @@ class MediaAnalyzer:
         self._scenes: dict[MediaId, tuple[str, SceneSignal]] = {}
         #: 読んでいる途中の場面の並び 途中までを AI に渡すため
         self._scans: dict[MediaId, SceneScan] = {}
+        #: 止めた（:meth:`cancel_scenes`）解析が読んだ所までの写し 止めた後も AI の道具が
+        #: 説明どおり読んだ所までを返せるように残す（PR #358 の Codex の指摘） 頼み直すか、
+        #: 読み終えるか、素材を外すまで持つ
+        self._halted: dict[MediaId, SceneSignal] = {}
         #: 場面の解析が失敗した理由 AI に「待っても出ない」ことを伝えるため
         self._scene_failures: dict[MediaId, str] = {}
         #: 波形は音声ストリームごとに持つ（:func:`waveform_stream`）
@@ -193,7 +197,8 @@ class MediaAnalyzer:
             running = ("scenes", media.id, None) in self._running
             failure = self._scene_failures.get(media.id)
             scan = self._scans.get(media.id)
-        partial = scan.snapshot() if scan is not None else None
+            halted = self._halted.get(media.id)
+        partial = scan.snapshot() if scan is not None else halted
         return SceneState(partial, running=running, failure=failure)
 
     def request_scenes(
@@ -232,10 +237,16 @@ class MediaAnalyzer:
         """走っている・待っている場面の解析をすべて止める 読み終えた物は残す
 
         設定で取り込み時の解析を切ったときに呼ぶ 切っても裏で読み続けるなら、
-        切った意味が無い
+        切った意味が無い 読んだ所までは写して残す 解析の後片付けは途中の並びを捨てるので、
+        止める前に写さないと、待っていた AI の道具は空の一覧を受け取る
         """
         with self._lock:
-            self._cancelled.update(key for key in self._running if key[0] == "scenes")
+            stopping = [key for key in self._running if key[0] == "scenes"]
+            for key in stopping:
+                scan = self._scans.get(key[1])
+                if scan is not None:
+                    self._halted[key[1]] = scan.snapshot()
+            self._cancelled.update(stopping)
             for job in [key for key in self._again if key[0] == "scenes"]:
                 del self._again[job]
 
@@ -272,6 +283,7 @@ class MediaAnalyzer:
             self._filmstrips.pop(media_id, None)
             self._scenes.pop(media_id, None)
             self._scene_failures.pop(media_id, None)
+            self._halted.pop(media_id, None)
             self._cancelled.update(key for key in self._running if key[1] == media_id)
             # 走らせ直す約束も捨てる 外した素材を、取り消し中の仕事が終わった後に解析し直さない
             for job in [key for key in self._again if key[1] == media_id]:
@@ -320,8 +332,10 @@ class MediaAnalyzer:
             self._cancelled.discard(key)
             self._running.add(key)
             if kind == "scenes":
-                # 頼み直したら前の失敗は消す 残すと、読み直している間も「出せない」と返す
+                # 頼み直したら前の失敗と止めた所までの写しは消す 失敗が残ると読み直している間も
+                # 「出せない」と返し、写しが残ると素材を差し替えた後も前の切り替わりを返す
                 self._scene_failures.pop(media.id, None)
+                self._halted.pop(media.id, None)
             self._board.start(key, media.id)
         self._launch(key, media, work, on_ready)
 
@@ -421,6 +435,7 @@ class MediaAnalyzer:
             if self._closed or job in self._cancelled:
                 return False
             self._scenes[media_id] = (key, signal)
+            self._halted.pop(media_id, None)
             return True
 
     def _is_cancelled(self, key: _JobKey) -> bool:

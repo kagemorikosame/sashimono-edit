@@ -108,15 +108,20 @@ class SceneSignal:
     analyzed: float
     #: 素材の終わりまで読んだか 偽なら途中まで（:class:`SceneScan` の写し）
     complete: bool
+    #: 調べた映像ストリームの番号（素材の中の ``index``） ``None`` は分からない（先頭の映像）
+    #: 映像が何本もある素材では先頭だけを調べる 番号を持たないと、2 本目を出すクリップにも
+    #: 先頭の切り替わりを当てはめてしまう（PR #358 の Codex の指摘）
+    stream: int | None = None
 
     @classmethod
-    def empty(cls, *, complete: bool = True) -> SceneSignal:
+    def empty(cls, *, complete: bool = True, stream: int | None = None) -> SceneSignal:
         return cls(
             times=np.zeros(0, np.float64),
             pixel=np.zeros(0, np.float32),
             histogram=np.zeros(0, np.float32),
             analyzed=0.0,
             complete=complete,
+            stream=stream,
         )
 
     def __len__(self) -> int:
@@ -195,6 +200,8 @@ class SceneScan:
         self._pixel: list[float] = []
         self._histogram: list[float] = []
         self._analyzed = 0.0
+        #: 読んでいる映像ストリームの番号（:attr:`SceneSignal.stream`）
+        self.stream: int | None = None
 
     def add(self, moment: float, pixel: float, histogram: float) -> None:
         with self._lock:
@@ -216,6 +223,7 @@ class SceneScan:
                 histogram=np.asarray(self._histogram, np.float32),
                 analyzed=self._analyzed if analyzed is None else analyzed,
                 complete=complete,
+                stream=self.stream,
             )
 
 
@@ -244,13 +252,14 @@ def analyze_scenes(
         if not streams:
             return None
         stream = streams[0]
+        scan.stream = stream.index
         stream.thread_type = "AUTO"
         if threads > 0:
             stream.codec_context.thread_count = threads
         origin = media_origin(container)
         duration = _duration(container, stream)
         if duration <= 0:
-            return SceneSignal.empty()
+            return SceneSignal.empty(stream=stream.index)
 
         #: 1 つ前のフレームの（縮めた輝度, ヒストグラム）
         previous: tuple[np.ndarray, np.ndarray] | None = None

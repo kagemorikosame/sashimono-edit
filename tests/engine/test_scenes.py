@@ -78,6 +78,11 @@ class TestTheMadeVideo:
             assert cut.before < cut.seconds
             assert cut.seconds - cut.before <= 1.5 / FPS
 
+    def test_the_read_stream_is_named(self, signal: SceneSignal, scene_video: Path) -> None:
+        # 番号が無いと、映像が何本もある素材で別の映像のクリップにまで切り替わりを当てる
+        with av.open(str(scene_video)) as container:
+            assert signal.stream == container.streams.video[0].index
+
     def test_the_whole_video_is_read(self, signal: SceneSignal) -> None:
         # 終わりまで読んだ印が無いと、AI は続きを待ち続ける
         assert signal.complete

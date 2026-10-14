@@ -1120,6 +1120,7 @@ def _scene_result(
         raise ToolError(f"{media.name} の場面を調べられませんでした: {state.failure}")
     signal = state.signal if state.signal is not None else SceneSignal.empty(complete=False)
     project = _project(host)
+    stream = _video_stream(media, signal.stream)
     cuts = signal.cuts(query.threshold, query.min_scene, start=query.start, end=query.end)
     rows = [
         {
@@ -1127,7 +1128,7 @@ def _scene_result(
             # 切り替わりはこの時刻と source_seconds の間にある preview_frame で前後を見る目安
             "after_seconds": round(cut.before, 3),
             "score": round(cut.score, 3),
-            "timeline": _scene_places(project, media, cut.seconds),
+            "timeline": _scene_places(project, media, stream, cut.seconds),
         }
         for cut in cuts
     ]
@@ -1141,6 +1142,9 @@ def _scene_result(
         "duration_seconds": round(duration, 3),
         "threshold": query.threshold,
         "min_scene_seconds": query.min_scene,
+        # 調べた映像の番号（1 から） 映像が何本もある素材は先頭だけを調べ、timeline には
+        # その映像を出すクリップだけを載せる
+        "video_stream": _video_number(media, stream),
     }
     if not signal.complete:
         if state.running:
@@ -1158,18 +1162,46 @@ def _scene_result(
     return result
 
 
-def _scene_places(project: Project, media: MediaItem, seconds: float) -> list[dict[str, Any]]:
+def _video_stream(media: MediaItem, wanted: int | None) -> int | None:
+    """クリップが絵を取る映像ストリームの番号（素材の中の ``index``）
+
+    デコーダ（:class:`~sashimono.engine.decode.VideoDecoder`）と同じ決まりにする 素材に無い
+    番号（音声の番号や、前の版の既定の 0）は先頭の映像になる 決まりがずれると、実際に
+    出ている映像と違う映像の切り替わりをクリップへ当てはめる
+    """
+    streams = media.video_streams
+    if not streams:
+        return None
+    if wanted is not None and any(stream.index == wanted for stream in streams):
+        return wanted
+    return streams[0].index
+
+
+def _video_number(media: MediaItem, stream: int | None) -> int | None:
+    """映像の番号（1 から） 音声の番号（``audio``）と同じ数え方"""
+    for number, info in enumerate(media.video_streams, start=1):
+        if info.index == stream:
+            return number
+    return None
+
+
+def _scene_places(
+    project: Project, media: MediaItem, stream: int | None, seconds: float
+) -> list[dict[str, Any]]:
     """素材の ``seconds`` の絵が出る、今のタイムラインの位置（フレーム）
 
     その位置をそのまま preview_frame へ渡せるように返す 絵を描くクリップだけを見る
-    （音だけのクリップの位置では、その場面は見えない） 1 枚目を CEIL で取るのは、
-    新しい場面の最初の絵が出るフレームにするため
+    （音だけのクリップの位置では、その場面は見えない） 調べた映像（``stream``）とは
+    別の映像を出すクリップも外す（PR #358 の Codex の指摘 その絵には同じ切り替わりが無い）
+    1 枚目を CEIL で取るのは、新しい場面の最初の絵が出るフレームにするため
     """
     moment = Fraction(str(seconds))
     places: list[dict[str, Any]] = []
     for track in project.timeline.tracks:
         for clip in track.clips:
             if clip.media_id != media.id or not project.draws_picture(track, clip):
+                continue
+            if _video_stream(media, clip.stream_index) != stream:
                 continue
             if moment < clip.source_in or (clip.hold_at is not None and moment > clip.hold_at):
                 continue
@@ -2193,7 +2225,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "ある timeline はその場面の最初の絵が出るタイムラインのフレーム（preview_frame へ"
             "そのまま渡せる 今のタイムラインに置いていなければ空） 解析は素材を読み込んだときに"
             "裏で始まり、結果は覚える 終わっていなければ wait_seconds まで待ち、それでも"
-            "終わらなければ読んだ所までを返す（complete が false）" + PAGING_NOTE
+            "終わらなければ読んだ所までを返す（complete が false） 映像が何本もある素材は"
+            "先頭の映像（video_stream）を調べ、timeline にはその映像を出すクリップだけを載せる"
+            + PAGING_NOTE
         ),
         schema=_schema(
             {

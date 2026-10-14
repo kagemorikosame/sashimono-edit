@@ -129,6 +129,25 @@ class TestTheList:
         host.scene_states[video_media.id] = SceneState(_signal([2.0]), running=False)
         assert _call(host)["cuts"][0]["timeline"] == []
 
+    def test_only_clips_of_the_read_stream_are_places(self, video_media: MediaItem) -> None:
+        # 映像が 2 本ある素材で、調べていない 2 本目を出すクリップにも位置を付けると、
+        # AI は別の映像の絵で切り替わりを確かめ、そこに無いカットで切る（PR #358 の Codex の指摘）
+        first = video_media.video_streams[0]
+        second = replace(first, index=2)
+        media = replace(video_media, video_streams=(first, second))
+        project = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(media,))
+        video = Track(kind=TrackKind.VIDEO, name="V1")
+        project = project.with_timeline(replace(project.timeline, tracks=(video,)))
+        shown_first = replace(make_clip(0, 300, media), id=ClipId("first"))
+        shown_second = replace(make_clip(300, 300, media), id=ClipId("second"), stream_index=2)
+        project = AddClip(video.id, shown_first).apply(project)
+        project = AddClip(video.id, shown_second).apply(project)
+        host = FakeHost(project)
+        host.scene_states[media.id] = SceneState(_signal([2.0]), running=False)
+        result = _call(host)
+        assert [place["clip_id"] for place in result["cuts"][0]["timeline"]] == ["first"]
+        assert result["video_stream"] == 1
+
     def test_a_higher_threshold_gives_fewer(self, host: FakeHost) -> None:
         # 感度が効かないと、AI は細かすぎる一覧を絞れない
         signal = _signal([2.0, 6.0])

@@ -22,7 +22,12 @@ SUFFIX = ".scenes.npz"
 
 #: 保存形式の版 差の測り方（縮め方・ヒストグラムの段）を変えたら上げる
 #: 上げないと、前の測り方の並びに今の感度を掛けることになり、拾う所がずれる
-FORMAT_VERSION = 1
+#: 2 で調べた映像ストリームの番号を持たせた（PR #358） 1 の物は番号が無く、映像が何本もある
+#: 素材でどのクリップに当てはまるかが分からないので読み直す
+FORMAT_VERSION = 2
+
+#: 番号が分からない（``None``）ときに書く値 ストリームの番号は 0 以上
+_NO_STREAM = -1
 
 
 def scenes_key(path: Path) -> str:
@@ -45,6 +50,7 @@ def save_scenes(store: CacheStore, key: str, signal: SceneSignal) -> Path | None
             "pixel": signal.pixel,
             "histogram": signal.histogram,
             "analyzed": np.array([signal.analyzed], np.float64),
+            "stream": np.array([_NO_STREAM if signal.stream is None else signal.stream]),
         },
         compressed=True,
     )
@@ -63,12 +69,14 @@ def load_scenes(store: CacheStore, key: str) -> SceneSignal | None:
         histogram = np.asarray(data["histogram"], np.float32)
         if not times.shape == pixel.shape == histogram.shape or times.ndim != 1:
             return None
+        stream = int(data["stream"][0])
         return SceneSignal(
             times=times,
             pixel=pixel,
             histogram=histogram,
             analyzed=float(data["analyzed"][0]),
             complete=True,
+            stream=None if stream == _NO_STREAM else stream,
         )
     except (KeyError, IndexError, ValueError):
         return None

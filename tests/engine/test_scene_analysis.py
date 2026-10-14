@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -88,6 +89,16 @@ class TestTheStore:
         loaded = load_scenes(store, key)
         assert loaded is not None and loaded.complete
         assert np.array_equal(loaded.times, _signal().times)
+
+    def test_the_stream_comes_back(self, store: CacheStore, video: Path) -> None:
+        # 覚えた物から番号が消えると、開き直した後だけ別の映像のクリップに切り替わりを当てる
+        key = scenes_key(video)
+        save_scenes(store, key, replace(_signal(), stream=3))
+        loaded = load_scenes(store, key)
+        assert loaded is not None and loaded.stream == 3
+        save_scenes(store, key, _signal())
+        again = load_scenes(store, key)
+        assert again is not None and again.stream is None
 
     def test_a_partial_signal_is_not_written(self, store: CacheStore, video: Path) -> None:
         # 途中までを書くと、次に開いたときに途中までの一覧を読み終えた物として返す
@@ -286,7 +297,33 @@ class TestWhileRunning:
         assert held.cancelled.wait(10), "止まらない"
         assert analyzer.wait_scenes(media.id, 10)
         state = analyzer.scene_state(media)
-        assert state.signal is None and state.failure is None
+        assert state.failure is None and not state.running
+
+    def test_what_was_read_survives_cancelling(
+        self, analyzer: MediaAnalyzer, video: Path, held: _Held
+    ) -> None:
+        # 止めたときに読んだ所まで捨てると、待っていた AI は説明と違って空の一覧を受け取る
+        # （PR #358 の Codex の指摘）
+        media = _media(video)
+        analyzer.request_scenes(media)
+        assert held.started.wait(10)
+        analyzer.cancel_scenes()
+        assert analyzer.wait_scenes(media.id, 10)
+        state = analyzer.scene_state(media)
+        assert state.signal is not None and not state.complete
+        assert len(state.signal) == 1
+
+    def test_forgetting_drops_what_was_read(
+        self, analyzer: MediaAnalyzer, video: Path, held: _Held
+    ) -> None:
+        # 外した素材の途中の一覧が残ると、同じ ID で入れ直したときに古い切り替わりを返す
+        media = _media(video)
+        analyzer.request_scenes(media)
+        assert held.started.wait(10)
+        analyzer.cancel_scenes()
+        assert analyzer.wait_scenes(media.id, 10)
+        analyzer.forget(media.id)
+        assert analyzer.scene_state(media).signal is None
 
     def test_closing_wakes_the_waiter(
         self, analyzer: MediaAnalyzer, video: Path, held: _Held
