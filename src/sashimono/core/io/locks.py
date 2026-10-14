@@ -102,10 +102,36 @@ def others_holding(folder: Path, mine: Path | None = None) -> bool:
 if sys.platform == "win32":
 
     def _create(path: Path) -> IO[str] | None:
+        # 2 度目は、見に行く間に消す途中が終わったときのため そのときは名前が空いている
+        for attempt in range(2):
+            try:
+                return path.open("x", encoding="utf-8")
+            except FileExistsError:
+                return None
+            except PermissionError:
+                if _deleting(path):
+                    # 前の持ち主が消した錠を、ほかのプロセス（ウイルス対策・検索の索引など）が
+                    # まだ開いている 閉じ終えるまで名前が残り、作ろうとすると「使用中」で断られる
+                    # 持たれている錠と同じに扱い、待つ側に試し直させる 上げると、2 つの窓が
+                    # 続けて同じ物を書いた（#291 #304）だけで、後の方の保存や覚え直しが落ちる
+                    return None
+                if attempt:
+                    raise
+        return None
+
+    def _deleting(path: Path) -> bool:
+        """名前が消す途中（delete pending）か、その間に誰かが作り直したか
+
+        書けないフォルダで作れないときと分ける 消す途中の名前は、見ようとしても
+        「使用中」で断られる 名前が無ければ、本当に書けない所なので上げる
+        """
         try:
-            return path.open("x", encoding="utf-8")
-        except FileExistsError:
-            return None
+            path.stat()
+        except FileNotFoundError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def _let_go(path: Path, handle: IO[str]) -> None:
         """閉じてから消す 開いたままでは自分でも消せない

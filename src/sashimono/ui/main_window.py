@@ -14,7 +14,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -2674,8 +2674,18 @@ class MainWindow(QMainWindow):
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
+            folder=self.export_folder,
         )
         dialog.exec()
+        folder = dialog.started_folder
+        if (
+            folder is not None
+            and folder.is_absolute()
+            and str(folder) != self._preferences.export_folder
+        ):
+            # 人が選んで書き出したフォルダを覚える 次の書き出しの窓の初めの場所になり、
+            # AI アシスタントもここへは書ける（2026-10-14 利用者の決定 #350）
+            self._remember_preferences(replace(self._preferences, export_folder=str(folder)))
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
         dialog.deleteLater()
@@ -3179,6 +3189,43 @@ class MainWindow(QMainWindow):
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()
+
+    @property
+    def project_path(self) -> Path | None:
+        return self._path
+
+    @property
+    def export_folder(self) -> Path | None:
+        folder = self._preferences.export_folder
+        return Path(folder) if folder else None
+
+    def app_settings(self) -> dict[str, object]:
+        """アプリ自身の設定の写し AI は読むだけ（2026-10-14 利用者の決定 #350）
+
+        人が画面で見られる値をそのまま渡す 変える口は作らない（:class:`EditorHost` を参照）
+        """
+        # 名前（objectName）で引く 題は AI の実行中に印が付いて変わる
+        docks = {
+            dock.objectName() or dock.windowTitle(): {
+                "title": dock.windowTitle(),
+                "visible": dock.isVisible(),
+                "floating": dock.isFloating(),
+            }
+            for dock in self.findChildren(QDockWidget)
+        }
+        return {
+            "version": __version__,
+            "preferences": asdict(self._preferences),
+            "shortcuts": {
+                name: action.shortcut().toString(_PORTABLE)
+                for name, (action, _default) in self._actions.items()
+            },
+            "layout": {"docks": docks},
+            "help": {"manual": MANUAL_URL, "report": REPORT_URL},
+            "note": (
+                "読むだけです 変えるのは人だけです（表示 → 設定… / ショートカットの設定… など）"
+            ),
+        }
 
     def show_chat(self) -> None:
         """AI パネルを前へ出す"""

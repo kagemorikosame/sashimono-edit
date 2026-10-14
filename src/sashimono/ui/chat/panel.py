@@ -74,6 +74,13 @@ __all__ = ["ChatPanel"]
 _BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _CODE = re.compile(r"`([^`]+)`")
 
+#: 確かめの許すボタンの文言
+ALLOW_TEXT = "許可"
+#: 取り消せない操作（#350）の確かめの頭と、許すボタンの文言 ふだんの確かめと見分けが付き、
+#: 押すと戻せないことが押す前に読めるようにする
+IRREVERSIBLE_HEAD = "取り消せない操作です 「元に戻す」では戻りません 実行しますか？"
+IRREVERSIBLE_ALLOW_TEXT = "実行する"
+
 #: ワーカーからの知らせを拾う間隔（ミリ秒）
 #: ここを長くすると、AI の操作が画面へ反映されるまでの間が空く
 POLL_MS = 80
@@ -413,10 +420,10 @@ class ChatPanel(QWidget):
         self._approval_text = QLabel(self._approval_box)
         self._approval_text.setWordWrap(True)
 
-        allow = QPushButton("許可", self._approval_box)
-        allow.clicked.connect(lambda: self._answer(True))
-        always = QPushButton("以降は確認しない", self._approval_box)
-        always.clicked.connect(lambda: self._answer(True, always=True))
+        self._approval_allow = QPushButton(ALLOW_TEXT, self._approval_box)
+        self._approval_allow.clicked.connect(lambda: self._answer(True))
+        self._approval_always = QPushButton("以降は確認しない", self._approval_box)
+        self._approval_always.clicked.connect(lambda: self._answer(True, always=True))
         deny = QPushButton("拒否", self._approval_box)
         deny.clicked.connect(lambda: self._answer(False))
 
@@ -424,8 +431,8 @@ class ChatPanel(QWidget):
         approval_buttons.setContentsMargins(0, 0, 0, 0)
         approval_buttons.addStretch(1)
         approval_buttons.addWidget(deny)
-        approval_buttons.addWidget(always)
-        approval_buttons.addWidget(allow)
+        approval_buttons.addWidget(self._approval_always)
+        approval_buttons.addWidget(self._approval_allow)
 
         approval_layout = QVBoxLayout(self._approval_box)
         approval_layout.setContentsMargins(8, 6, 8, 6)
@@ -481,6 +488,12 @@ class ChatPanel(QWidget):
         status_row.addWidget(self._status_text, 1)
 
         self._auto = QCheckBox("変更を自動で承認", self)
+        # 入れても止まる所があると先に分かるようにする 知らないと、任せて席を外した後に
+        # 確かめの窓が出たまま待っていたことに、戻ってから気付く
+        self._auto.setToolTip(
+            "取り消せる編集を確かめずに進めます 保存・書き出しなど取り消せない操作は、"
+            "入れていても毎回確かめます"
+        )
         self._auto.toggled.connect(self._set_auto_approve)
         self._send_button = QPushButton("送信", self)
         self._send_button.clicked.connect(self.send)
@@ -1169,8 +1182,21 @@ class ChatPanel(QWidget):
         if approval is None:
             return
         self._approval = approval
-        self._approval_text.setText(f"この操作を許可しますか？\n{approval.summary}")
+        irreversible = approval.irreversible
+        head = IRREVERSIBLE_HEAD if irreversible else "この操作を許可しますか？"
+        self._approval_text.setText(f"{head}\n{approval.summary}")
+        # 取り消せない操作は毎回確かめる（2026-10-14 利用者の決定） 「以降は確認しない」を
+        # 出すと、押しても効かないボタンになる 許すボタンも、何が起きるかの言葉にする
+        self._approval_always.setVisible(not irreversible)
+        self._approval_allow.setText(IRREVERSIBLE_ALLOW_TEXT if irreversible else ALLOW_TEXT)
         self._approval_box.setVisible(True)
+        if irreversible:
+            # 「変更を自動で承認」に任せて別の窓にいる人は、ここで止まっていることに
+            # 気付かない ステータスバーとタスクバーで知らせる
+            self.status_message.emit("取り消せない操作の確かめを待っています（AI アシスタント）")
+            window = self.window()
+            if not window.isActiveWindow():
+                QApplication.alert(window)
 
     def _answer(self, allowed: bool, *, always: bool = False) -> None:
         approval = self._approval
@@ -1179,7 +1205,7 @@ class ChatPanel(QWidget):
         self._approval = None
         self._approval_box.setVisible(False)
         if allowed:
-            if always:
+            if always and not approval.irreversible:
                 self._bridge.allow_always(approval.tool)
             approval.allow()
         else:

@@ -6,6 +6,8 @@ Claude Agent SDK は自前の asyncio ループを別スレッドで回す そ�
 
 同じ仕組みで確認（承認）も運ぶ 変更系のツールは、UI 側が「許可」を返すまでここで
 止まる 止まっている間も UI は動き続けるので、内容を見てから決められる
+確かめは二段（2026-10-14 利用者の決定 #350） 取り消せる編集は「変更を自動で承認」で
+省けるが、取り消せない操作（:attr:`Operation.irreversible`）は毎回確かめる
 AI からの質問（ask_user #296）も同じ形で運び、答えが返るまで止まる
 
 :class:`~sashimono.engine.cache.MediaAnalyzer` や字幕起こしと同じ「キューに積んで
@@ -22,7 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation, QuestionSpec
+from sashimono.ai.operations import Operation, QuestionSpec, find_operation
+from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
 
@@ -58,6 +61,12 @@ class Approval:
     done: threading.Event = field(default_factory=threading.Event)
     allowed: bool = False
     reason: str = ""
+    #: 取り消せない操作なら、何をどこへするか 画面はこれがあると「以降は確認しない」を出さない
+    consent: Consent | None = None
+
+    @property
+    def irreversible(self) -> bool:
+        return self.consent is not None
 
     def allow(self) -> None:
         self.allowed = True
@@ -144,8 +153,35 @@ class EditorBridge:
             if not isinstance(spec, QuestionSpec):
                 raise ToolError(f"{operation.name} が質問の形を返しませんでした")
             return self.ask(spec)
+        if operation.irreversible:
+            return self._run_irreversible(operation, arguments)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
+        return self.call(lambda: operation(self._host, arguments))
+
+    def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
+        """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
+
+        何をどこへするか（:class:`Consent`）は編集画面のスレッドで作る 書けない場所なら
+        そこで断られ、窓は出ない 出してから断ると、人が許したのに何も起きない
+        """
+        describe = operation.consent
+        if describe is None:
+            # Operation の作りで弾いてある ここへ来たら、確かめずに走らせるより止める
+            raise ToolError(f"{operation.name} は何をするかを示せないので実行しません")
+        consent = self.call(lambda: describe(self._host, arguments))
+        if not isinstance(consent, Consent):
+            raise ToolError(f"{operation.name} が確かめの中身を返しませんでした")
+        approval = Approval(
+            tool=operation.name,
+            summary=f"{consent.text()}\n{describe_call(operation, arguments)}",
+            arguments=arguments,
+            consent=consent,
+        )
+        if not self._wait_for(approval):
+            raise ToolError(
+                "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
+            )
         return self.call(lambda: operation(self._host, arguments))
 
     def call(self, work: Callable[[], object]) -> object:
@@ -170,7 +206,14 @@ class EditorBridge:
             summary=describe_call(operation, arguments),
             arguments=arguments,
         )
+        return self._wait_for(approval)
+
+    def _wait_for(self, approval: Approval) -> bool:
+        """確かめを画面へ積み、返事を待つ"""
         self._approvals.put(approval)
+        if self._cancel.is_set():
+            # 積んだ後に確かめる（:meth:`ask` と同じ） 積む前の中断を見落とすと 10 分待つ
+            approval.deny("中断されました")
         if not approval.done.wait(APPROVAL_TIMEOUT):
             approval.deny("確認の返事がありませんでした")
         return approval.allowed
@@ -261,7 +304,13 @@ class EditorBridge:
         return question
 
     def allow_always(self, tool: str) -> None:
-        """このツールは以降ずっと許可する この会話の間だけ有効"""
+        """このツールは以降ずっと許可する この会話の間だけ有効
+
+        取り消せない操作は覚えない 覚えると、1 度許した上書き保存が、次から黙って走る
+        """
+        operation = find_operation(tool)
+        if operation is not None and operation.irreversible:
+            return
         self._always.add(tool)
 
     def forget_always(self) -> None:
