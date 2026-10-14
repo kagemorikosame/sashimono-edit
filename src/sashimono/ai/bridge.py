@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation, QuestionSpec, find_operation
+from sashimono.ai.operations import Continue, Operation, QuestionSpec, find_operation
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
@@ -157,7 +157,19 @@ class EditorBridge:
             return self._run_irreversible(operation, arguments)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
-        return self.call(lambda: operation(self._host, arguments))
+        return self._run(operation, arguments)
+
+    def _run(self, operation: Operation, arguments: dict[str, Any]) -> object:
+        """道具を編集画面のスレッドで動かす 長い道具は 1 回ずつ分けて続きを頼む
+
+        続き（:class:`Continue`）を 1 つずつ別の仕事として積むので、その間に編集画面は
+        描き直しと人の操作を受け付ける 中断も回ごとに効く（:meth:`call` が見る）
+        1 回ごとに待つ上限（:data:`CALL_TIMEOUT`）が掛かるので、全体が長くても切れない
+        """
+        result = self.call(lambda: operation.start(self._host, arguments))
+        while isinstance(result, Continue):
+            result = self.call(result.step)
+        return result
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
@@ -182,7 +194,7 @@ class EditorBridge:
             raise ToolError(
                 "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
             )
-        return self.call(lambda: operation(self._host, arguments))
+        return self._run(operation, arguments)
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""
@@ -284,6 +296,10 @@ class EditorBridge:
                 item.error = exc
             finally:
                 item.done.set()
+            if isinstance(item.result, Continue):
+                # 続きのある道具は、ここで一度タイマーへ返す 続きを同じ回で拾うと、
+                # 全部を描き終えるまで画面が描き直されず、分けた意味が無くなる
+                return
 
     def take_approval(self) -> Approval | None:
         """確認待ちが 1 件あれば取り出す 無ければ ``None``"""

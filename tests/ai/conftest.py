@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.host import ToolError
+from sashimono.ai.sheet import SheetLayout
 from sashimono.core.commands import AddClip, Command, Document, InScene
 from sashimono.core.model import (
     ClipId,
@@ -32,6 +33,22 @@ from tests.conftest import make_clip
 RATE_30 = FrameRate(30)
 
 
+class FakeSheet:
+    """コマを並べる 1 枚のふり 描いた升・フレーム・字を順に覚える"""
+
+    def __init__(self, layout: SheetLayout) -> None:
+        self.layout = layout
+        self.drawn: list[tuple[int, int, str]] = []
+        self.finished = False
+
+    def draw(self, index: int, frame: int, label: str) -> None:
+        self.drawn.append((index, frame, label))
+
+    def png(self) -> bytes:
+        self.finished = True
+        return b"\x89PNG\r\n\x1a\n" + f"sheet{len(self.drawn)}".encode()
+
+
 class FakeHost:
     """編集ソフトのふりをする"""
 
@@ -42,6 +59,8 @@ class FakeHost:
         self.scene: SceneId | None = None
         self.stopped = 0
         self.rendered: list[tuple[int, int]] = []
+        #: コマを並べた 1 枚（contact_sheet・preview_range） 用意した順
+        self.sheets: list[FakeSheet] = []
         self.analyzed: list[MediaId] = []
         self.probed: list[Path] = []
         self.stub_waveform: Waveform | None = None
@@ -127,6 +146,11 @@ class FakeHost:
         self.rendered.append((frame, width))
         # PNG の識別子だけ本物にしておく 中身は誰も見ない
         return b"\x89PNG\r\n\x1a\n" + f"{frame}".encode()
+
+    def start_sheet(self, layout: SheetLayout) -> FakeSheet:
+        sheet = FakeSheet(layout)
+        self.sheets.append(sheet)
+        return sheet
 
     def probe(self, path: Path) -> MediaItem:
         self.probed.append(path)

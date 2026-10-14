@@ -11,13 +11,17 @@ AI の操作は最終的に UI と同じ :class:`~sashimono.core.commands.Docume
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from sashimono.core.commands import Command, Document
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 
-__all__ = ["EditorHost", "ToolError"]
+if TYPE_CHECKING:
+    # 並べ方の側が ToolError を使うので、ここで実行時に読むと互いを待って読めない
+    from sashimono.ai.sheet import SheetLayout
+
+__all__ = ["EditorHost", "SheetCanvas", "ToolError"]
 
 
 class ToolError(RuntimeError):
@@ -26,6 +30,22 @@ class ToolError(RuntimeError):
     この例外の文面はそのまま Claude へ返る 「どうすれば直るか」が分かる書き方を
     すること Claude は次の手をこの文面だけで決める
     """
+
+
+class SheetCanvas(Protocol):
+    """コマを並べて描く 1 枚（:meth:`EditorHost.start_sheet`）
+
+    1 コマずつ描かせるのは、間で編集画面へ手を返すため（:class:`~sashimono.ai.operations.Continue`）
+    まとめて描くと、大きい作品で何十コマも描く間、画面が止まる
+    """
+
+    def draw(self, index: int, frame: int, label: str) -> None:
+        """``index`` 番目の升へ ``frame`` を描き、真下の帯へ ``label`` を書く"""
+        ...
+
+    def png(self) -> bytes:
+        """描き終えた 1 枚を PNG にする"""
+        ...
 
 
 class EditorHost(Protocol):
@@ -92,6 +112,14 @@ class EditorHost(Protocol):
 
     def render_png(self, frame: int, *, width: int) -> bytes:
         """そのフレームを合成して PNG で返す"""
+        ...
+
+    def start_sheet(self, layout: SheetLayout) -> SheetCanvas:
+        """コマを並べる 1 枚を用意する（コンタクトシートと範囲のコマ #320）
+
+        描くのは用意した時点のプロジェクト（開いているシーン） 描く間に編集が入っても、
+        1 枚の中で前後の升が別の版の絵にならないように
+        """
         ...
 
     def probe(self, path: Path) -> MediaItem:

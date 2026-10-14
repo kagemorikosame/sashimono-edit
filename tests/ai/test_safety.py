@@ -184,6 +184,8 @@ class TestAppSettingsAreReadOnly:
             "select_clip",
             "select_clips",
             "set_active_scene",
+            # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
+            "start_sheet",
             "start_transcription",
             "stop_playback",
             "transcription_status",
