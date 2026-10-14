@@ -463,6 +463,10 @@ def text_fill(
     if size.is_animated or offset.is_animated or angle.is_animated:
         return None
     stops = _stop_list(parameter.get("Stops"), report, "線形グラデーションのブラシ")
+    if len(stops) == 1:
+        # 止まり 1 つのブラシは 1 色で塗る（塗りのエフェクトも 1 色） 塗りの並びは 2 つからなので、
+        # 同じ色を両端に置く 1 つのまま渡すと既定の白から黒へ置き換わる（実物の 73 本には無い）
+        stops = [(0.0, stops[0][1]), (1.0, stops[0][1])]
     base_rgba = (*base[:3], base[3] if len(base) > 3 else 1.0)
     brush_only = entry.get("IsBrushOnly") is True
     if not brush_only and any(_bends(left[1], right[1]) for left, right in pairwise(stops)):

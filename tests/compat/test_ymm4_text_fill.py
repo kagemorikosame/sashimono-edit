@@ -125,6 +125,42 @@ class TestWhatIsFolded:
         bending = fill((0.0, "#00FF0000"), (1.0, "#FF0000FF"))
         assert text_fill(bending, WHITE, CompatibilityReport()) is None
 
+    @pytest.mark.parametrize(
+        "stops",
+        [
+            # 止まり 1 つ（実物の 73 本には無い） 塗りの並びは 2 つから
+            [{"Offset": 0.3, "Color": "#FF00A95F"}],
+            # 1 つだけが読める壊れた並び
+            [{"Offset": 0.3, "Color": "#FF00A95F"}, "壊れた止まり"],
+        ],
+        ids=["1 つ", "壊れた並び"],
+    )
+    def test_a_single_stop_keeps_its_colour(self, stops: list[object]) -> None:
+        # 止まり 1 つのまま塗りへ渡すと、2 つに満たない並びとして既定の白から黒へ置き換わり、
+        # YMM4 では 1 色だった字が白黒のグラデーションで出る
+        entry = fill(*GREEN_FADE)
+        entry["Brush"]["Parameter"]["Stops"] = stops
+        params = text_fill(entry, WHITE, CompatibilityReport())
+        assert params is not None
+        gradient = TEXT.spec("fill_gradient")
+        assert gradient is not None
+        kept = gradient.coerce(params["fill_gradient"])
+        green = (0.0, 0xA9 / 255, 0x5F / 255, 1.0)
+        assert kept == pytest.approx((0.0, *green, 1.0, *green))
+
+    def test_no_stops_match_the_paint_effect(self) -> None:
+        # 止まりが無いブラシは、塗りのエフェクトと同じ既定（白から黒）で塗る
+        # 違うと、写しただけで色が変わる
+        entry = fill()
+        params = text_fill(entry, WHITE, CompatibilityReport())
+        effect = fill_foreground(entry, CompatibilityReport())
+        assert params is not None and effect is not None
+        assert effect.params["color0"] == (1.0, 1.0, 1.0, 1.0)
+        assert effect.params["color1"] == (0.0, 0.0, 0.0, 1.0)
+        gradient = params["fill_gradient"]
+        assert isinstance(gradient, tuple)
+        assert gradient == pytest.approx((0.0, 1, 1, 1, 1, 1.0, 0, 0, 0, 1))
+
     def test_brush_only_keeps_the_colours(self) -> None:
         # ブラシだけの塗りは字の色を捨てる 重ねると、字の色の分だけ明るい字になる
         params = text_fill(
