@@ -829,9 +829,10 @@ def _text_layers(
     if str(values.get("timer_format", "")):
         raw = timer_text(values)[:200]
 
-    # 縦書きは AviUtl2 で測っていないので、AviUtl2 の組み方でも標準の縦書きで描く
-    # （枠は返さず、太字も Qt に任せる） ここで外さないと、Qt の太字を切ったまま
-    # 自分で太らせる横書きの処理も通らず、太字が細字で出る
+    # 縦書きは縦書きの道（:func:`_vertical_text_path`）で描く AviUtl2 の組み方の縦書きは、
+    # 字の送り・列の幅・字の置き方だけを AviUtl2 に合わせる（2026-10-15 に測った）
+    # 枠は返さず、太字も Qt に任せる（縦書きの太字と枠は測っていない） ここで外さないと、
+    # Qt の太字を切ったまま自分で太らせる横書きの処理も通らず、太字が細字で出る
     aviutl = values.get("layout") == "aviutl" and not bool(values.get("vertical", False))
     bold = bool(values.get("bold", False))
     size = max(1, int(float(values.get("size", 64))))  # type: ignore[arg-type]
@@ -1388,8 +1389,14 @@ def _vertical_text_path(
     ``cells`` を渡すと字の置き場を足す（列が行、送りが字の高さ）
     """
     columns = text.split(chr(10))
-    advance = metrics.height() + float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
-    column_width = metrics.height() + float(values.get("line_spacing", 0.0))  # type: ignore[arg-type]
+    # AviUtl2 の組み方の縦書きは、字の送りも列の幅も字の大きさ（2026-10-15 に AviUtl2 v2.1.6a で
+    # Yu Gothic UI 80 を測ると、送りも列の間も 80 だった 標準の組み方は行の高さ 106）
+    # 字は升目の縦の真ん中に字の輪郭の真ん中を合わせる（基準線では置かない g の下がりが
+    # 升目の上へ寄り、H は升目の上から 12 画素だった） 標準の組み方は前からどおり基準線で置く
+    aviutl = values.get("layout") == "aviutl"
+    pitch = _number(values, "size", 64.0) if aviutl else metrics.height()
+    advance = pitch + float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
+    column_width = pitch + float(values.get("line_spacing", 0.0))  # type: ignore[arg-type]
 
     centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
     centre_y = height / 2.0 - float(values.get("pos_y", 0.0))  # type: ignore[arg-type]
@@ -1408,18 +1415,32 @@ def _vertical_text_path(
         str(values.get("valign", "middle")), 0.5
     )
 
+    # AviUtl2 の縦書きは列どうしも縦の揃えに合わせる（上寄・中央・下寄で短い列が上・真ん中・下へ
+    # 寄った 2026-10-15 に AviUtl2 v2.1.6a で測った） 標準の組み方は前からどおり列を上で揃える
+    # （揃え方を変えると、前の版の縦書きの字幕の短い列が動く）
+    column_share = _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5) if aviutl else 0.0
     path = QPainterPath()
     for column_index, column in enumerate(glyphs):
         x = left - column_width * column_index
+        column_top = top + advance * (tallest - len(column)) * column_share
         for row_index, character in enumerate(column):
-            baseline = top + advance * row_index + metrics.ascent()
+            baseline = column_top + advance * row_index + metrics.ascent()
+            if aviutl:
+                ink = QPainterPath()
+                ink.addText(QPointF(0.0, 0.0), font, character)
+                if not ink.isEmpty():
+                    middle = ink.boundingRect().center().y()
+                    baseline = column_top + advance * row_index + pitch / 2.0 - middle
             offset = metrics.horizontalAdvance(character) / 2.0
             path.addText(QPointF(x - offset, baseline), font, character)
             if cells is not None:
                 glyph = QPainterPath()
                 glyph.addText(QPointF(x - offset, baseline), font, character)
                 cell = QRectF(
-                    x - column_width / 2.0, top + advance * row_index, column_width, advance
+                    x - column_width / 2.0,
+                    column_top + advance * row_index,
+                    column_width,
+                    advance,
                 )
                 cells.append(_Cell(column_index, cell, glyph.boundingRect()))
     return path

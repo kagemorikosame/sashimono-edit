@@ -158,7 +158,8 @@ def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
     - タイマーの書式が空なら、タイマーの初めの値・速さ・数え下げ・長さを読まない
     - タイマーの書式があれば、文字の代わりに時間を出すので文字を読まない
     - 数え下げを切っていれば、数え下げる長さを読まない
-    - 縦書きは行揃えと組み方を読まない（縦書きは標準の組み方で描く）
+    - 縦書きは行揃えを読まない（列の揃えは縦の基準で決まる） 組み方は読む（AviUtl2 の組み方は
+      字の送りと字の置き方を AviUtl2 に合わせる #312 の続き）
     - 縁取りの太さが 0 なら縁取りの色、影のずらしとぼかしが 0 なら影の色を読まない
       （文字の中の制御文字で縁や影を付けたときは、制御文字の色を使う）
     - 塗りが単色ならグラデーションの項目を、グラデーションなら色を読まない（#312）
@@ -174,7 +175,7 @@ def _text_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
             unused.add("timer_length")
     vertical = params.get("vertical")
     if vertical is True or (isinstance(vertical, int) and vertical):
-        unused |= {"align", "layout"}
+        unused.add("align")
     if _still_zero(params.get("border_width")):
         unused.add("border_color")
     unused |= fill_unused(params, TEXT_FILL, "color")
