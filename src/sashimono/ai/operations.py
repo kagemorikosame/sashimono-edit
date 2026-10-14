@@ -21,8 +21,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.safety import Consent, Safety
+from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
+from sashimono.ai.safety import Consent, Safety, pinned_place, writable_path
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
     AddClip,
@@ -56,6 +56,7 @@ from sashimono.core.commands import (
     Voice,
     burn_defaults,
     burn_subtitles,
+    export_range,
     head_room,
     insert_generated,
     insert_media,
@@ -69,7 +70,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
-from sashimono.core.io.serialize import json_text
+from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
     AnimatedValue,
@@ -108,14 +109,26 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
+from sashimono.engine.encode import (
+    BITRATE_RANGE_MBPS,
+    CONTAINER_SUFFIXES,
+    DEFAULT_BITRATE_MBPS,
+    RANGE_ALL,
+    RANGE_WORK_AREA,
+    available_video_codecs,
+    chosen_range,
+    export_target,
+)
 
 __all__ = [
     "ASK_USER",
+    "MAX_WAIT_SECONDS",
     "OPERATIONS",
     "Choice",
     "ImageResult",
     "Operation",
     "QuestionSpec",
+    "Waiting",
     "find_operation",
     "question_spec",
 ]
@@ -124,6 +137,9 @@ __all__ = [
 #: 「意図した絵になっているか」であって、画素を数えるわけではないため
 DEFAULT_PREVIEW_WIDTH = 640
 MAX_PREVIEW_WIDTH = 1280
+
+#: 書き出しの codec の「自動」 画面の書き出しの窓の「自動（使えなければ次の候補）」と同じ
+AUTO = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1900,6 +1916,225 @@ def _select(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"selected": clip_id or None}
 
 
+# --- 保存と書き出し（取り消せない操作 B1 #327） ---
+#
+# どれも「元に戻す」では戻らない 2026-10-14 の利用者の決定（#298 #350）のとおり、
+# 「変更を自動で承認」でも毎回確かめ（Operation.irreversible）、書く場所は作品のフォルダと
+# 書き出しの窓で前に選んだフォルダだけ（writable_path） 書くのは確かめの後、フォルダを
+# 開いたまま持って（pinned_place）から 道具はファイルを自分で書かず、画面の〔保存〕と
+# 書き出しの窓と同じ処理をホストに頼む
+
+
+def _require_suffix(raw: object, suffixes: tuple[str, ...], what: str) -> None:
+    """拡張子を確かめる 違う種類のファイルの名前で書かせない
+
+    作品の保存で動画の名前を、書き出しで作品（.sme）の名前を渡されると、作品や素材を
+    別の中身で上書きする 拡張子で書く物の種類を決め、合わなければ断る
+    """
+    suffix = Path(str(raw).strip()).suffix.lower() if isinstance(raw, str) else ""
+    if suffix not in suffixes:
+        allowed = " / ".join(suffixes)
+        raise ToolError(f"{what}の名前は {allowed} で終えてください: {raw}")
+
+
+def _current_project_file(host: EditorHost) -> Path:
+    current = host.project_path
+    if current is None:
+        raise ToolError(
+            "作品はまだ一度も保存されていません save_project_as で保存先（作品のフォルダか"
+            "書き出しのフォルダの中）を渡すか、人に〔名前を付けて保存〕で選んでもらってください"
+        )
+    return current
+
+
+def _replacing(path: Path, what: str) -> str:
+    return f"同じ名前の{what}があり、中身を置き換えます" if path.exists() else ""
+
+
+def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    del arguments
+    path = writable_path(host, str(_current_project_file(host)))
+    return Consent(
+        action="作品を上書き保存します",
+        target=str(path),
+        detail="今のファイルの中身を、いまの編集の中身で置き換えます",
+    )
+
+
+def _save_project(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    try:
+        with pinned_place(host, str(_current_project_file(host))) as path:
+            note = host.write_project(path, adopt=False)
+    except OSError as exc:
+        raise ToolError(f"保存できませんでした: {exc}") from exc
+    return {"saved": str(path), "note": note}
+
+
+def _save_as_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    raw = arguments.get("path")
+    _require_suffix(raw, (SUFFIX,), "作品")
+    path = writable_path(host, raw)
+    detail = " ".join(
+        part
+        for part in (_replacing(path, "ファイル"), "以後はこの場所の作品として編集します")
+        if part
+    )
+    return Consent(action="作品に名前を付けて保存します", target=str(path), detail=detail)
+
+
+def _save_project_as(host: EditorHost, arguments: dict[str, Any]) -> object:
+    raw = arguments.get("path")
+    _require_suffix(raw, (SUFFIX,), "作品")
+    try:
+        with pinned_place(host, raw) as path:
+            note = host.write_project(path, adopt=True)
+    except OSError as exc:
+        raise ToolError(f"保存できませんでした: {exc}") from exc
+    return {"saved": str(path), "project_path": str(host.project_path), "note": note}
+
+
+@dataclass(frozen=True, slots=True)
+class Waiting:
+    """長い仕事の終わりを、AI のスレッドで待つ印（書き出し #327）
+
+    道具は編集画面のスレッドで動くので、道具の中で待つと画面が固まる 道具はこの印を返し、
+    ブリッジ（AI のスレッド）が ``poll`` を少しずつ編集画面のスレッドで呼んで待つ
+    ``poll`` は（終わったか, AI へ返す物）を返す ``seconds`` 待っても終わらなければ、
+    その時の様子をそのまま返す
+    """
+
+    poll: Callable[[EditorHost], tuple[bool, object]]
+    seconds: float
+
+
+#: 書き出しを待つ上限（秒） 長く待たせると、その間は AI が人の新しい指示に応えられない
+#: 長い書き出しは、待たずに戻って export_status で何度か見てもらう
+MAX_WAIT_SECONDS = 300
+
+
+def _wait_seconds(arguments: dict[str, Any]) -> float:
+    raw = arguments.get("wait_seconds", 0)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        raise ToolError("wait_seconds は秒の数で渡してください（0 なら待たずに戻る）")
+    return max(0.0, min(float(raw), float(MAX_WAIT_SECONDS)))
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportPlan:
+    request: ExportRequest
+    #: 確かめの窓に出す、何をどう書き出すか
+    detail: str
+
+
+def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
+    """書き出しの引数を、画面の書き出しの窓と同じ選び方で確かめる
+
+    確かめ（consent）と実行の 2 度呼ぶ 窓が出ている間に作品が変わっても（範囲を消した など）、
+    実行の時点の作品で確かめ直す
+    """
+    raw = arguments.get("path")
+    _require_suffix(raw, CONTAINER_SUFFIXES, "書き出す動画")
+    # 待つ秒数も確かめの前に見る 確かめの後で断ると、人が許したのに書き出しが始まらない
+    _wait_seconds(arguments)
+    if host.export_status().get("state") in EXPORT_RUNNING:
+        raise ToolError(
+            "書き出しがもう走っています export_status で終わるのを待つか、"
+            "cancel_export で止めてから"
+            "始めてください"
+        )
+    path = writable_path(host, raw)
+    whole = host.document.project
+    raw_scene = arguments.get("scene_id")
+    scene_id = SceneId(str(raw_scene)) if raw_scene else None
+    try:
+        target = export_target(whole, scene_id)
+    except KeyError as exc:
+        raise ToolError(
+            f"シーンが見つかりません: {raw_scene}（list_scenes で一覧を取れます）"
+        ) from exc
+    if target.duration <= 0:
+        raise ToolError("タイムラインが空なので書き出せません")
+    # 範囲の既定は画面の書き出しの窓と同じ 範囲を決めてあればその範囲、無ければ全体
+    default_range = RANGE_WORK_AREA if export_range(target.timeline) is not None else RANGE_ALL
+    choice = str(arguments.get("range") or default_range)
+    try:
+        frame_range = chosen_range(target, choice)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    codecs = available_video_codecs()
+    if not codecs:
+        raise ToolError("この機械には使える映像コーデックがありません 書き出せません")
+    raw_codec = str(arguments.get("codec") or AUTO)
+    if raw_codec != AUTO and raw_codec not in codecs:
+        raise ToolError(f"codec は {AUTO} か、使える物（{', '.join(codecs)}）から選んでください")
+    codec = None if raw_codec == AUTO else raw_codec
+    raw_bitrate = arguments.get("bitrate_mbps", DEFAULT_BITRATE_MBPS)
+    low, high = BITRATE_RANGE_MBPS
+    if isinstance(raw_bitrate, bool) or not isinstance(raw_bitrate, int):
+        raise ToolError(f"bitrate_mbps は {low}〜{high} の整数で渡してください")
+    if not low <= raw_bitrate <= high:
+        raise ToolError(f"bitrate_mbps は {low}〜{high} です: {raw_bitrate}")
+
+    start, end = frame_range or (0, target.duration)
+    rate = target.rate
+    scene = whole.find_scene(scene_id) if scene_id is not None else None
+    what = "メイン" if scene is None else f"シーン「{scene.name}」"
+    span = "全体" if frame_range is None else "指定した範囲"
+    label = "自動" if codec is None else codec
+    parts = [
+        f"{what} の{span}（{format_timecode(start, rate)} 〜 {format_timecode(end, rate)}、"
+        f"{end - start} フレーム）",
+        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / {raw_bitrate} Mbps",
+        _replacing(path, "ファイル"),
+    ]
+    request = ExportRequest(
+        path=path,
+        scene_id=scene_id,
+        range_choice=RANGE_ALL if frame_range is None else RANGE_WORK_AREA,
+        codec=codec,
+        bitrate_mbps=raw_bitrate,
+    )
+    return _ExportPlan(request=request, detail="\n".join(part for part in parts if part))
+
+
+def _export_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    plan = _export_plan(host, arguments)
+    return Consent(action="動画を書き出します", target=str(plan.request.path), detail=plan.detail)
+
+
+def _export_poll(host: EditorHost) -> tuple[bool, object]:
+    status = host.export_status()
+    return status.get("state") not in EXPORT_RUNNING, status
+
+
+def _export_video(host: EditorHost, arguments: dict[str, Any]) -> object:
+    wait = _wait_seconds(arguments)
+    plan = _export_plan(host, arguments)
+    host.start_export(plan.request)
+    if wait > 0:
+        return Waiting(poll=_export_poll, seconds=wait)
+    return {
+        "started": str(plan.request.path),
+        "next": "書き出しは裏で進みます export_status で進み具合を読めます"
+        "（wait_seconds を付けると、その秒数まで終わるのを待ちます）",
+    }
+
+
+def _export_status(host: EditorHost, arguments: dict[str, Any]) -> object:
+    wait = _wait_seconds(arguments)
+    if wait > 0:
+        return Waiting(poll=_export_poll, seconds=wait)
+    return host.export_status()
+
+
+def _cancel_export(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    if not host.cancel_export():
+        raise ToolError("走っている書き出しはありません")
+    return {"cancelling": True, "status": host.export_status()}
+
+
 OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="get_project",
@@ -2605,6 +2840,110 @@ OPERATIONS: tuple[Operation, ...] = (
         description="直前の操作を取り消す",
         schema=_schema({"steps": _integer("戻す段数（既定 1）")}),
         handler=_undo,
+        writes=True,
+    ),
+    Operation(
+        name="save_project",
+        description=(
+            "作品を今の場所へ上書き保存する（画面の〔保存〕と同じ） 取り消せない操作なので、"
+            "「変更を自動で承認」でも毎回ユーザーに確かめる まだ保存していない作品は "
+            "save_project_as を使う"
+        ),
+        schema=_schema({}),
+        handler=_save_project,
+        writes=True,
+        irreversible=True,
+        consent=_save_consent,
+    ),
+    Operation(
+        name="save_project_as",
+        description=(
+            "作品に名前を付けて保存し、以後はその場所の作品として編集する（画面の〔名前を付けて"
+            "保存〕と同じ） 書けるのは今の作品のフォルダと、書き出しの窓で前に選んだフォルダの"
+            "中だけ ほかの場所は人がファイルの窓で選ぶ 毎回ユーザーに確かめる"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    f"保存先（{SUFFIX} で終える） 相対の場所は今の作品のフォルダから読む"
+                    " フォルダは作らない"
+                )
+            },
+            ["path"],
+        ),
+        handler=_save_project_as,
+        writes=True,
+        irreversible=True,
+        consent=_save_as_consent,
+    ),
+    Operation(
+        name="export_video",
+        description=(
+            "動画を書き出す（画面の書き出しの窓と同じ設定と処理） 毎回ユーザーに確かめる"
+            " 書き出しは裏で進み、すぐ戻る 進み具合は export_status で読み、止めるのは "
+            "cancel_export 書けるのは今の作品のフォルダと、書き出しの窓で前に選んだフォルダの"
+            "中だけ 元の素材と同じファイルには書かない"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    "書き出し先 形式は名前の終わりで決まる（"
+                    + " / ".join(CONTAINER_SUFFIXES)
+                    + "） 相対の場所は今の作品のフォルダから読む"
+                ),
+                "range": {
+                    "type": "string",
+                    "enum": [RANGE_ALL, RANGE_WORK_AREA],
+                    "description": (
+                        f"書き出す範囲 {RANGE_ALL} は全体、{RANGE_WORK_AREA} はタイムラインで"
+                        "決めた範囲 省くと、範囲があれば範囲、無ければ全体（画面と同じ）"
+                    ),
+                },
+                "scene_id": _string("書き出すシーン 省くとメイン（開いているシーンではない）"),
+                "codec": _string(
+                    f"映像のコーデック {AUTO}（既定 使えなければ次の候補へ）か、"
+                    "h264_nvenc / h264_qsv / libx264 などこの機械で使える物"
+                ),
+                "bitrate_mbps": _integer(
+                    f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps、"
+                    f"既定 {DEFAULT_BITRATE_MBPS}）"
+                ),
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
+                    " 待っても終わらなければ、その時の進み具合を返す"
+                ),
+            },
+            ["path"],
+        ),
+        handler=_export_video,
+        writes=True,
+        irreversible=True,
+        consent=_export_consent,
+    ),
+    Operation(
+        name="export_status",
+        description=(
+            "AI が始めた書き出しの進み具合を読む state は idle / rendering（描いている）/ "
+            "placing（書き出し先へ置いている）/ done / failed / cancelled"
+            " wait_seconds を付けると、終わるかその秒数まで待ってから返す"
+        ),
+        schema=_schema(
+            {
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は今の様子をすぐ返す）"
+                )
+            }
+        ),
+        handler=_export_status,
+    ),
+    Operation(
+        name="cancel_export",
+        description=(
+            "走っている書き出しを止める 書きかけは捨て、書き出し先の前からあるファイルは"
+            "そのまま残る 作品は変わらない"
+        ),
+        schema=_schema({}),
+        handler=_cancel_export,
         writes=True,
     ),
     Operation(

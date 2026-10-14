@@ -44,7 +44,8 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.host import ToolError
+from sashimono.ai.host import ExportRequest, ToolError
+from sashimono.ai.safety import check_writable
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.core import userdirs
@@ -122,10 +123,12 @@ from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
+from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
+from sashimono.ui.ai_export import AssistantExport
 from sashimono.ui.backup_settings import (
     STATE_SUBFOLDER,
     describe_trim,
@@ -627,6 +630,15 @@ class MainWindow(QMainWindow):
             cancel.clicked.connect(self.cancel_import)
         self.statusBar().addPermanentWidget(self._background_indicator)
         self.statusBar().addPermanentWidget(self._import_indicator)
+        # AI が始めた書き出し（#327）も同じ右端に出し、人がいつでも止められるようにする
+        # 書き出しの窓を使わないので、ここに出さないと走っていることも止め方も見えない
+        self._assistant_export = AssistantExport(self)
+        self._assistant_export_indicator = ProgressIndicator(self, cancel_text="中止")
+        stop = self._assistant_export_indicator.cancel_button
+        if stop is not None:
+            stop.clicked.connect(self._assistant_export.cancel)
+        self._assistant_export.changed.connect(self._show_assistant_export)
+        self.statusBar().addPermanentWidget(self._assistant_export_indicator)
         # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
         # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
         self._updates = UpdateController(
@@ -2282,26 +2294,34 @@ class MainWindow(QMainWindow):
         """保存する 保存できたら真 名前がまだ無ければ尋ねる"""
         if self._path is None:
             return self.save_as()
-        project = self._document.project
+        try:
+            note = self._write_project_file(self._path)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存できない", f"{self._path}\n{exc}")
+            return False
+        self.statusBar().showMessage(f"保存した: {self._path}{note}", 5000 if note else 3000)
+        return True
+
+    def _write_project_file(self, path: Path) -> str:
+        """作品を ``path`` へ書き、保存した印を付ける 知らせに添える言葉を返す
+
+        画面の〔保存〕と AI の保存（#327）が通る所 控えの取り方・書き方を 1 か所にする
+        書けなければ ``OSError``（窓は出さない 出すかは呼ぶ側が決める）
+        """
         note = ""
         try:
             # 古い形式のファイルを今の形式で上書きする前に、横へ写しを残す 自動更新の後で
             # 前の版へ戻した人が、上げる前の作品を開けるように（前の版は新しい形式を読めない）
-            keep_pre_upgrade_copy(self._path)
-            note = self._back_up(self._path)
+            keep_pre_upgrade_copy(path)
+            note = self._back_up(path)
         except OSError as exc:
             # 控えが取れなくても保存は止めない 止めると、控えのために
             # いまの作業のほうを失う
             note = f"（バックアップは作れなかった: {exc}）"
-        try:
-            save_project(project, self._path)
-        except OSError as exc:
-            QMessageBox.warning(self, "保存できない", f"{self._path}\n{exc}")
-            return False
+        save_project(self._document.project, path)
         self._mark_saved()
         self._update_title()
-        self.statusBar().showMessage(f"保存した: {self._path}{note}", 5000 if note else 3000)
-        return True
+        return note
 
     def _back_up(self, target: Path) -> str:
         """上書きする前の中身を、設定の置き場と世代数で控える 知らせる言葉を返す（無ければ空）
@@ -2970,6 +2990,8 @@ class MainWindow(QMainWindow):
             found.append("AI アシスタントが作業しています（環境の導入を含む）")
         if self._subtitles.transcribing:
             found.append("字幕を起こしています")
+        if self._assistant_export.running:
+            found.append("AI アシスタントが書き出しています")
         return found
 
     def _close_for_update(self) -> bool:
@@ -3227,6 +3249,107 @@ class MainWindow(QMainWindow):
             ),
         }
 
+    # --- AI の保存と書き出し（B1 #327） ---
+
+    def write_project(self, path: Path, *, adopt: bool) -> str:
+        """AI の保存 画面の〔保存〕と同じ控えと書き方を通す 窓は出さない
+
+        確かめの窓は AI パネルが出し終えている ここで窓を出すと、人が許した後にもう 1 度
+        聞くことになり、「変更を自動で承認」で席を外した人の前で止まる 断るときは
+        :class:`ToolError` で AI に理由を返す
+        """
+        previous = self._path
+        previous_lock = self._project_lock
+        if adopt and path != previous:
+            folder = project_presence_dir(path)
+            if others_holding(folder):
+                # 画面の〔名前を付けて保存〕は尋ねるが、AI には尋ねさせない 両方で保存すると
+                # 後から保存した方だけが残る 人が決めることなので断る
+                raise ToolError(
+                    f"{path.name} は別の Sashimono の窓で開かれています 別の名前にするか、"
+                    "人に〔名前を付けて保存〕で選んでもらってください"
+                )
+            self._project_lock = hold_new(folder)
+            self._path = path
+        try:
+            note = self._write_project_file(path)
+        except OSError as exc:
+            if self._path != previous:
+                # 書けなかったら元の名前と錠へ戻す 戻さないと、タイトルと次の保存先が書けなかった
+                # 場所を指したままになる
+                if self._project_lock is not None:
+                    self._project_lock.release()
+                self._project_lock = previous_lock
+                self._path = previous
+                self._update_title()
+            raise ToolError(f"保存できませんでした: {path} ({exc})") from exc
+        if previous_lock is not None and self._project_lock is not previous_lock:
+            previous_lock.release()
+        self.statusBar().showMessage(f"AI アシスタントが保存した: {path}{note}", 5000)
+        return note
+
+    def start_export(self, request: ExportRequest) -> None:
+        """AI の書き出し 画面の書き出しの窓と同じ作り方の設定で、同じ書き出しの処理を裏で回す"""
+        if self._assistant_export.running:
+            raise ToolError("書き出しがもう走っています")
+        try:
+            target = export_target(self._document.project, request.scene_id)
+            settings = build_settings(
+                request.path,
+                codec=request.codec,
+                bitrate_mbps=request.bitrate_mbps,
+                frame_range=chosen_range(target, request.range_choice),
+                pipeline_depth=self._preferences.export_pipeline_depth,
+                decode_threads=self._preferences.decode_threads,
+                smooth_history=self._preferences.smooth_audio_motion,
+            )
+        except (KeyError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+        # 書き終えたときの確かめは、始めた時の作品の場所と素材で行う 書いている数分の間に
+        # 作品を別の場所へ保存し直しても、人が許した書き出し先はこの場所のまま
+        project_path, export_folder = self._path, self.export_folder
+        protected = tuple(media.path for media in self._document.project.media)
+        raw = str(request.path)
+        self._playback.stop()
+        self._assistant_export.start(
+            target,
+            settings,
+            lambda: check_writable(
+                raw,
+                project_path=project_path,
+                export_folder=export_folder,
+                protected=protected,
+            ),
+        )
+
+    def export_status(self) -> dict[str, object]:
+        return self._assistant_export.status()
+
+    def cancel_export(self) -> bool:
+        return self._assistant_export.cancel()
+
+    def _show_assistant_export(self) -> None:
+        """AI の書き出しの進み具合をステータスバーへ出す 終わったら知らせて隠す"""
+        job = self._assistant_export
+        status = job.status()
+        indicator = self._assistant_export_indicator
+        if job.running:
+            progress = status.get("progress")
+            fraction = float(progress) if isinstance(progress, float | int) else 0.0
+            state = "置いています" if status.get("state") == "placing" else "書き出し中"
+            indicator.show_progress(
+                f"AI の{state} {round(fraction * 100)}%", fraction, tooltip=str(status.get("path"))
+            )
+            cancel = indicator.cancel_button
+            if cancel is not None:
+                cancel.setEnabled(status.get("state") == "rendering")
+            return
+        # isVisible ではなく isHidden で見る 窓をしまっている間（最小化など）は isVisible が偽で、
+        # 終わったのに次に窓を出したとき進み具合が出たまま残る
+        if not indicator.isHidden():
+            indicator.hide()
+            self.statusBar().showMessage(str(status.get("message", "")), 8000)
+
     def show_chat(self) -> None:
         """AI パネルを前へ出す"""
         self._chat_dock.show()
@@ -3257,6 +3380,9 @@ class MainWindow(QMainWindow):
         # 調べている最中の読み込みは捨てる 閉じた窓へ置きに来させない
         self._drop_imports()
         self._chat.close_session()
+        # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
+        # 書きかけは捨てる 書き出し先は前のまま残る
+        self._assistant_export.shutdown()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()

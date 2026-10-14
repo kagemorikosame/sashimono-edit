@@ -12,16 +12,19 @@ import contextlib
 import hashlib
 import os
 import re
+import shutil
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from sashimono.core.io.locks import try_hold
 
 __all__ = [
     "STALE_WRITING_SECONDS",
     "WRITING_SUFFIX",
+    "copy_atomic",
     "held_for_update",
     "write_atomic",
     "write_atomic_bytes",
@@ -48,6 +51,9 @@ STALE_WRITING_SECONDS = 60 * 60
 #: 置き換えが「使用中」で断られたときに試し直す長さ（秒） 相手の置き換えは一瞬で終わる
 #: 長くすると、本当に開いたままのファイル（エディタで掴んでいる など）で保存が長く止まる
 _REPLACE_WAIT = 1.0
+
+#: 大きな物を写すときに 1 度に読む長さ 手元に動画を丸ごと抱えないように
+_COPY_CHUNK = 1 << 20
 
 #: 錠を待つ長さ（秒） 読んで書き戻すのは一瞬で終わるので、これだけ待っても取れないのは
 #: 持ち主が止まっているとき 保存を長く止めない
@@ -83,15 +89,37 @@ def write_atomic_bytes(path: Path, data: bytes, *, durable: bool = False) -> Non
     _write(path, data, durable=durable)
 
 
+def copy_atomic(source: Path, path: Path, *, durable: bool = False) -> os.stat_result:
+    """``source`` の中身を ``path`` へ写す 書き終えるまで元のファイルは無傷で残る
+
+    仮のファイルの名前・片付け・置き換えの決まりは :func:`write_atomic` と同じ 大きな物
+    （書き出した動画）を手元へ読み込まずに少しずつ写す 書いた仮のファイルの身元
+    （:func:`os.fstat`）を返す 置き換えた後に、名前の先が自分の書いた物かを照らすため
+    """
+    with Path(source).open("rb") as reader:
+        return _fill(
+            Path(path), lambda handle: shutil.copyfileobj(reader, handle, _COPY_CHUNK), durable
+        )
+
+
 def _write(path: Path, data: bytes, *, durable: bool) -> None:
-    path = Path(path)
+    _fill(Path(path), lambda handle: handle.write(data), durable)
+
+
+def _fill(path: Path, fill: Callable[[BinaryIO], object], durable: bool) -> os.stat_result:
+    """仮のファイルを新しく作って ``fill`` で中身を入れ、``path`` の名前を付ける"""
     temporary = path.with_name(f"{_scratch_head(path.name)}.{uuid.uuid4().hex[:8]}{WRITING_SUFFIX}")
+    # 仮のファイルは必ず新しく作る（"x"） 同じ名前の物が先に置かれていたら、その中身へは
+    # 書かずに断る 開いて上書きすると、置かれていたのが元の素材へのハードリンクだったとき
+    # 元の素材の中身を書き換える 断った名前は自分の物ではないので片付けない
+    handle = temporary.open("xb")
     try:
-        with temporary.open("wb") as handle:
-            handle.write(data)
+        with handle:
+            fill(handle)
             if durable:
                 handle.flush()
                 os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
         _replace(temporary, path)
     except BaseException:
         # 後片付けの失敗で元の理由を隠さない
@@ -99,6 +127,7 @@ def _write(path: Path, data: bytes, *, durable: bool) -> None:
             temporary.unlink(missing_ok=True)
         raise
     _sweep_stale(path)
+    return written
 
 
 def _replace(temporary: Path, path: Path) -> None:

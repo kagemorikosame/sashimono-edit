@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from sashimono.ai.host import ToolError
+from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.core.commands import AddClip, Command, Document, InScene
+from sashimono.core.io.serialize import save_project
 from sashimono.core.model import (
     ClipId,
     MediaId,
@@ -61,6 +62,11 @@ class FakeHost:
             "preferences": {"theme": "dark", "update_check": True},
             "shortcuts": {"編集/分割": "S"},
         }
+        #: 保存した場所（write_project を呼ばれた順）
+        self.written: list[Path] = []
+        #: 頼まれた書き出し 偽物なので書き出しそのものは走らせない
+        self.exports: list[ExportRequest] = []
+        self.export_state: dict[str, object] = {"state": "idle", "progress": 0.0, "path": None}
 
     @property
     def splits_media(self) -> bool:
@@ -159,6 +165,29 @@ class FakeHost:
     @property
     def export_folder(self) -> Path | None:
         return self.exported_to
+
+    def write_project(self, path: Path, *, adopt: bool) -> str:
+        # 画面の〔保存〕と同じく、作品のファイルの書き方（書いてから置き換える）で書く
+        save_project(self._document.project, path)
+        self.written.append(path)
+        if adopt:
+            self.saved_at = path
+        return ""
+
+    def start_export(self, request: ExportRequest) -> None:
+        if self.export_state["state"] in EXPORT_RUNNING:
+            raise ToolError("書き出しがもう走っています")
+        self.exports.append(request)
+        self.export_state = {"state": "rendering", "progress": 0.0, "path": str(request.path)}
+
+    def export_status(self) -> dict[str, object]:
+        return dict(self.export_state)
+
+    def cancel_export(self) -> bool:
+        if self.export_state["state"] != "rendering":
+            return False
+        self.export_state = {**self.export_state, "state": "cancelled"}
+        return True
 
     def app_settings(self) -> dict[str, object]:
         return self.settings

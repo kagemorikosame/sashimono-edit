@@ -20,15 +20,25 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from sashimono.ai.host import EditorHost, ToolError
+from sashimono.core.io.folder_pin import FolderSwappedError, pin_folder
 
-__all__ = ["Consent", "Safety", "check_writable", "writable_path", "write_roots"]
+__all__ = [
+    "Consent",
+    "Safety",
+    "check_writable",
+    "pinned",
+    "pinned_place",
+    "writable_path",
+    "write_roots",
+]
 
 
 class Safety(StrEnum):
@@ -98,6 +108,40 @@ def writable_path(host: EditorHost, raw: object) -> Path:
         export_folder=host.export_folder,
         protected=(media.path for media in project.media),
     )
+
+
+@contextlib.contextmanager
+def pinned_place(host: EditorHost, raw: object) -> Iterator[Path]:
+    """書く直前に場所を確かめ、書き終えるまでそのフォルダを差し替えさせない
+
+    中で書く 確かめ（:func:`writable_path`）だけでは、確かめてから書くまでの間にフォルダを
+    リンクへ差し替えられる隙間が残る（#354 の報告） フォルダを開いたまま持ち
+    （:func:`~sashimono.core.io.folder_pin.pin_folder`）、持った後にもう 1 度確かめ、
+    書き終えたら差し替えられていないかを照らす
+    """
+    with pinned(lambda: writable_path(host, raw)) as path:
+        yield path
+
+
+@contextlib.contextmanager
+def pinned(check: Callable[[], Path]) -> Iterator[Path]:
+    """:func:`pinned_place` の中身 ``check`` は書ける場所を確かめて返す関数
+
+    書き出しの終わり（編集画面のスレッドの外）からも、確かめた時の値で呼べるように分けてある
+    """
+    path = check()
+    try:
+        with pin_folder(path.parent) as folder:
+            # 持った後にもう 1 度確かめる 確かめてから持つまでの間に差し替えられていたら、
+            # 解決した先が変わるか、持ったフォルダの本当の場所が食い違う
+            again = check()
+            if _key(again) != _key(path):
+                raise ToolError(f"書く場所が確かめた後に変わりました: {path} → {again}")
+            folder.verify()
+            yield path
+            folder.verify()
+    except FolderSwappedError as exc:
+        raise ToolError(f"書く場所のフォルダが差し替えられたので断りました: {exc}") from exc
 
 
 def check_writable(

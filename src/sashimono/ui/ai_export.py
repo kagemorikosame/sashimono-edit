@@ -1,0 +1,239 @@
+"""AI アシスタントが始めた書き出しを、裏で走らせて見守る（B1 #327）
+
+書き出しの処理そのものは画面の書き出しの窓と同じ（:func:`~sashimono.engine.encode.export_project`
+を同じ作り方の設定で呼ぶ） 違うのは書く場所の守りだけ
+
+- 書き出しはまずアプリ自身の置き場（キャッシュ）の仮のファイルへ書く 書き出し先のフォルダで
+  直に書くと、書いている数分の間にフォルダや名前を差し替えられたとき、確かめていない所へ
+  書くか、元の素材へのハードリンクの中身を上書きする
+- 書き終えたら、書き出し先のフォルダを開いたまま持ち（:func:`~sashimono.ai.safety.pinned`）、
+  書ける場所かを確かめ直してから、新しく作った仮のファイルへ写して名前を付け替える
+  （:func:`~sashimono.core.io.atomic.copy_atomic`） 付け替えた後に、その名前の先が自分の書いた
+  物かを照らす
+
+画面を固めない 書き出しは別のスレッドで回し、進み具合はステータスバーと AI の両方へ出す
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QThread, Signal
+
+from sashimono.ai.host import EXPORT_RUNNING, ToolError
+from sashimono.ai.safety import pinned
+from sashimono.core.io.atomic import copy_atomic
+from sashimono.core.model import Project
+from sashimono.core.userdirs import cache_root
+from sashimono.engine.encode import ExportError, ExportSettings
+from sashimono.engine.encode import export_project as run_export
+
+__all__ = ["AssistantExport", "scratch_folder"]
+
+
+def scratch_folder() -> Path:
+    """書き出しの仮のファイルを置く所 アプリ自身のキャッシュの中
+
+    書き出し先のフォルダではなくここへ書く理由はモジュールの説明のとおり キャッシュの
+    置き場なので、落ちて残った物は「キャッシュを消す」で一緒に片付く
+    """
+    return cache_root() / "assistant-export"
+
+
+class _Worker(QObject):
+    """別のスレッドで、仮のファイルへ書き出し、書き出し先へ置く"""
+
+    progressed = Signal(float)
+    placing = Signal()
+    finished = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(
+        self,
+        project: Project,
+        settings: ExportSettings,
+        check: Callable[[], Path],
+    ) -> None:
+        super().__init__()
+        self._project = project
+        self._settings = settings
+        self._check = check
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        target = self._settings.path
+        folder = scratch_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            scratch = folder / f"{uuid.uuid4().hex}{target.suffix.lower()}"
+            # 自分で新しく作ってから書き出しに渡す 名前が先にあれば、その中身へは書かない
+            scratch.open("xb").close()
+        except OSError as exc:
+            self.failed.emit(f"書き出しの仮のファイルを作れませんでした: {exc}")
+            return
+        try:
+            self._export(scratch)
+        finally:
+            with contextlib.suppress(OSError):
+                scratch.unlink(missing_ok=True)
+
+    def _export(self, scratch: Path) -> None:
+        try:
+            run_export(
+                self._project,
+                replace(self._settings, path=scratch),
+                progress=self.progressed.emit,
+                should_cancel=self._cancel.is_set,
+            )
+        except ExportError as exc:
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(f"書き出しに失敗しました: {exc}")
+            return
+        if self._cancel.is_set():
+            self.cancelled.emit()
+            return
+        self.placing.emit()
+        try:
+            placed = self._place(scratch)
+        except (ToolError, OSError) as exc:
+            self.failed.emit(f"書き出し先へ置けませんでした（書き出し先は前のままです）: {exc}")
+            return
+        self.finished.emit(str(placed))
+
+    def _place(self, scratch: Path) -> Path:
+        """書き出し先のフォルダを持ったまま確かめ直し、写して名前を付け替える"""
+        expected = self._settings.path
+        with pinned(self._check) as path:
+            if os.path.normcase(str(path)) != os.path.normcase(str(expected)):
+                raise ToolError(f"書き出し先が確かめた時と変わりました: {expected} → {path}")
+            written = copy_atomic(scratch, path, durable=True)
+            # 付け替えた名前の先が、自分の書いた物かを照らす 違えば、付け替えの直前に
+            # 差し替えられている 書いたと伝えると、AI も人も別の物を完成品だと思う
+            now = path.stat(follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (written.st_dev, written.st_ino):
+                raise ToolError(f"置いた後に書き出し先が別の物に変わっていました: {path}")
+        return path
+
+
+class AssistantExport(QObject):
+    """AI が始めた書き出し 1 本ずつ 様子は :meth:`status` で読む"""
+
+    #: 様子が変わった（進んだ・終わった） 編集画面のスレッドで出る
+    changed = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._thread: QThread | None = None
+        self._worker: _Worker | None = None
+        self._state = "idle"
+        self._progress = 0.0
+        self._path: Path | None = None
+        self._message = ""
+        self._started = 0.0
+        self._ended = 0.0
+
+    @property
+    def running(self) -> bool:
+        return self._state in EXPORT_RUNNING
+
+    def start(self, project: Project, settings: ExportSettings, check: Callable[[], Path]) -> None:
+        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
+        if self.running:
+            raise ToolError("書き出しがもう走っています")
+        self._state = "rendering"
+        self._progress = 0.0
+        self._path = settings.path
+        self._message = ""
+        self._started = time.monotonic()
+        self._ended = 0.0
+        self._worker = _Worker(project, settings, check)
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.placing.connect(self._on_placing)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
+        self._thread.start()
+        self.changed.emit()
+
+    def cancel(self) -> bool:
+        """止めるよう頼む 書き出し先へ置いている最中は止めない（置き終わるのを待つ）"""
+        if self._worker is None or self._state != "rendering":
+            return False
+        self._worker.cancel()
+        self._message = "止めています"
+        self.changed.emit()
+        return True
+
+    def shutdown(self) -> None:
+        """窓を閉じるとき 止めるよう頼み、スレッドが抜けるまで待つ
+
+        待たずに窓を壊すと、走っているスレッドを持ったまま Qt が落ちる
+        """
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread = None
+        self._worker = None
+
+    def status(self) -> dict[str, object]:
+        """AI へ返す様子"""
+        ended = self._ended or time.monotonic()
+        return {
+            "state": self._state,
+            "progress": round(self._progress, 3),
+            "path": str(self._path) if self._path is not None else None,
+            "message": self._message,
+            "elapsed_seconds": round(ended - self._started, 1) if self._started else 0.0,
+        }
+
+    def _on_progress(self, value: float) -> None:
+        self._progress = value
+        self.changed.emit()
+
+    def _on_placing(self) -> None:
+        self._state = "placing"
+        self._progress = 1.0
+        self._message = "書き出し先へ置いています"
+        self.changed.emit()
+
+    def _on_finished(self, path: str) -> None:
+        self._finish("done", f"書き出しました: {path}")
+
+    def _on_failed(self, message: str) -> None:
+        self._finish("failed", message)
+
+    def _on_cancelled(self) -> None:
+        self._finish("cancelled", "書き出しを止めました 書き出し先は前のままです")
+
+    def _finish(self, state: str, message: str) -> None:
+        self._state = state
+        self._message = message
+        self._ended = time.monotonic()
+        if self._thread is not None:
+            self._thread.quit()
+            # 知らせはワーカーが書き終えて出した後 スレッドはイベントループを抜けるだけ
+            self._thread.wait()
+            self._thread = None
+        self._worker = None
+        self.changed.emit()

@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation, QuestionSpec, find_operation
+from sashimono.ai.operations import Operation, QuestionSpec, Waiting, find_operation
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
@@ -39,6 +40,10 @@ APPROVAL_TIMEOUT = 600.0
 #: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 長い仕事（書き出し）を待つ間、様子を読み直す間隔（秒） 短くすると編集画面のスレッドへ
+#: 頼む仕事が増え、長くすると終わってから AI が気付くまでが延びる
+WAIT_INTERVAL = 0.5
 
 
 @dataclass(slots=True)
@@ -157,7 +162,31 @@ class EditorBridge:
             return self._run_irreversible(operation, arguments)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
-        return self.call(lambda: operation(self._host, arguments))
+        return self._settle(self.call(lambda: operation(self._host, arguments)))
+
+    def _settle(self, result: object) -> object:
+        """道具が待つように頼んだ（:class:`Waiting`）なら、ここ（AI のスレッド）で待つ
+
+        待つ間も編集画面は動く 様子は少しずつ編集画面のスレッドで読む 中断のボタンで
+        待つのをやめる（書き出しそのものは止めない 止めるのは cancel_export か画面の〔中止〕）
+        """
+        if not isinstance(result, Waiting):
+            return result
+        poll = result.poll
+        deadline = time.monotonic() + result.seconds
+        while True:
+            answer = self.call(lambda: poll(self._host))
+            if not isinstance(answer, tuple) or len(answer) != 2:
+                raise ToolError("待っている仕事の様子を読めませんでした")
+            finished, value = answer
+            remaining = deadline - time.monotonic()
+            if finished or remaining <= 0:
+                return value
+            if self._cancel.wait(min(WAIT_INTERVAL, remaining)):
+                raise ToolError(
+                    "中断されたので待つのをやめました 書き出しは止めていません"
+                    "（止めるのは cancel_export か画面の〔中止〕）"
+                )
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
@@ -182,7 +211,7 @@ class EditorBridge:
             raise ToolError(
                 "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
             )
-        return self.call(lambda: operation(self._host, arguments))
+        return self._settle(self.call(lambda: operation(self._host, arguments)))
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""

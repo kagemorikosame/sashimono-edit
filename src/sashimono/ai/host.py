@@ -10,6 +10,7 @@ AI の操作は最終的に UI と同じ :class:`~sashimono.core.commands.Docume
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -17,7 +18,28 @@ from sashimono.core.commands import Command, Document
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 
-__all__ = ["EditorHost", "ToolError"]
+__all__ = ["EXPORT_RUNNING", "EXPORT_STATES", "EditorHost", "ExportRequest", "ToolError"]
+
+#: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
+#: 走っている間は「書いている」「置いている」 終わった後は残りのどれか
+EXPORT_RUNNING = ("rendering", "placing")
+EXPORT_STATES = ("idle", *EXPORT_RUNNING, "done", "failed", "cancelled")
+
+
+@dataclass(frozen=True, slots=True)
+class ExportRequest:
+    """AI が頼んだ書き出し 選べる物は画面の書き出しの窓と同じ"""
+
+    #: 確かめ済みの書き出し先（リンクを辿った後の場所）
+    path: Path
+    #: 書き出すシーン ``None`` ならメイン
+    scene_id: SceneId | None
+    #: ``all`` か ``work_area``（:data:`~sashimono.engine.encode.RANGE_ALL` など）
+    range_choice: str
+    #: 映像のコーデック ``None`` なら自動（使えなければ次の候補へ落ちる）
+    codec: str | None
+    #: 映像のビットレート（Mbps）
+    bitrate_mbps: int
 
 
 class ToolError(RuntimeError):
@@ -153,6 +175,31 @@ class EditorHost(Protocol):
 
         人が窓で選んで書き出した所なので、AI もそこへは書ける（2026-10-14 利用者の決定）
         """
+        ...
+
+    def write_project(self, path: Path, *, adopt: bool) -> str:
+        """作品を ``path`` へ保存する（B1 #327） 画面の〔保存〕と同じ控え・書き方を通す
+
+        ``path`` は確かめ済みの場所（:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
+        ``adopt`` が真なら、以後の作品の場所を ``path`` にする（名前を付けて保存）
+        窓は出さない 断るときは :class:`ToolError` 戻り値は知らせに添える言葉（無ければ空）
+        """
+        ...
+
+    def start_export(self, request: ExportRequest) -> None:
+        """書き出しを裏で始める（B1 #327） 画面の書き出しの窓と同じ設定の作り方と処理を通す
+
+        すぐ戻る 進み具合は :meth:`export_status`、止めるのは :meth:`cancel_export`
+        すでに走っていれば :class:`ToolError`
+        """
+        ...
+
+    def export_status(self) -> dict[str, object]:
+        """AI が始めた書き出しの様子 ``state`` は :data:`EXPORT_STATES` のどれか"""
+        ...
+
+    def cancel_export(self) -> bool:
+        """走っている書き出しを止める 止めるよう頼めたら真"""
         ...
 
     def app_settings(self) -> dict[str, object]:
