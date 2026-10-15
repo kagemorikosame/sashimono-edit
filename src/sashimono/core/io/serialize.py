@@ -958,17 +958,22 @@ def save_project(project: Project, path: Path, *, expect: Expected | None = None
 PRE_UPGRADE_SUFFIX = ".bak"
 
 
-def keep_pre_upgrade_copy(path: Path) -> Path | None:
+def keep_pre_upgrade_copy(path: Path, source: Path | None = None) -> Path | None:
     """上書きしようとしているファイルが古い形式なら、横に ``名前.sme.bak`` として写しを残す
 
     写した場所を返す 古い形式でない・読めない・無いなら何もしない
     自動更新で新しい版にしたあと、前の版へ戻した人のため 古い版は新しい形式を開けない
     （「更新してください」で止まる）ので、上げる前の写しが無いと、保存し直した作品へ戻る道が無い
     写しは上げるたびに書き直す 上げる前の最後の中身が要るので、前に上げたときの写しは古すぎる
+
+    ``source`` を渡すと、中身はそこから取る（写しの名前は ``path`` から作る） AI の保存は
+    置き換えた後に、人が許した前のファイル（残した物）から写す（#327） 置き換える前に
+    ``path`` から写すと、照らす前に外のアプリが書き換えた中身で前の写しを潰す
     """
     path = Path(path)
+    origin = Path(source) if source is not None else path
     try:
-        root = json.loads(path.read_text(encoding="utf-8"))
+        root = json.loads(origin.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return None
     version = root.get("version") if isinstance(root, dict) else None
@@ -978,9 +983,9 @@ def keep_pre_upgrade_copy(path: Path) -> Path | None:
     # 新しく作った仮のファイルへ写して名前を付け替える（#327） copy2 は写す先を開いて
     # その場で上書きし、リンクなら辿った先へ書く 写しの名前が元の素材へのハードリンクや
     # 外へのリンクだと、保存のたびに素材や外のファイルが作品の中身に変わる
-    copy_atomic(path, copy)
+    copy_atomic(origin, copy)
     # 時刻は元に合わせる 写しがいつの中身かを、ファイルの時刻で見分けられるように
-    shutil.copystat(path, copy)
+    shutil.copystat(origin, copy)
     return copy
 
 

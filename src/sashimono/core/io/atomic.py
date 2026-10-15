@@ -17,7 +17,8 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -116,6 +117,10 @@ def copy_atomic(
         )
 
 
+#: 置き換えた前のファイルを残す世代の既定 画面の設定のバックアップの世代数の既定と同じ
+KEPT_GENERATIONS = 20
+
+
 @dataclass(frozen=True, slots=True)
 class Expected:
     """書く先が、確かめたときのままかを照らすための覚え（#327）
@@ -126,6 +131,12 @@ class Expected:
     """
 
     identity: tuple[int, int, int, int] | None
+    #: 置き換えた前のファイルを残す世代の数（同じ書く先ごと） 照らす身元ではないので比べない
+    #: 書く側（画面の設定を持つホスト）が、バックアップの世代数
+    #: （``Preferences.backup_generations``）を入れる
+    keep: int = field(default=KEPT_GENERATIONS, compare=False)
+    #: 置き換えた前のファイルを残した場所（書いた後に足す） 呼んだ側が AI と人に知らせる
+    kept: list[Path] = field(default_factory=list, compare=False)
 
 
 class TargetChangedError(FileExistsError):
@@ -200,7 +211,8 @@ def _replace_expected(temporary: Path, path: Path, expect: Expected) -> None:
     2. 退けた物の身元を照らす 違えば、退けた物を置き換えない改名で元の名前へ戻して断る
     3. 新しいファイルを、置き換えない付け方（:func:`_place_new`）で元の名前に付ける
        その間に名前が現れていれば付けずに、退けた物を戻そうとして断る
-    4. 退けた物を消す 人が置き換えを許した物なので、残すと要らない写しが積もる
+    4. 退けた物は消さずに、同じフォルダの決まった名前で残す（:func:`_keep_beside`）
+       消すと、別のアプリが消す共有を許して開いたまま書いていた更新ごと失う
 
     戻せない（元の名前がもう別の物で埋まっている）ときは、退けた物を消さずに残し、その名前を
     断りの文に入れる 黙って消すと、人が許していない形で前のファイルが失われる
@@ -223,8 +235,62 @@ def _replace_expected(temporary: Path, path: Path, expect: Expected) -> None:
         _place_new(temporary, path)
     except TargetChangedError as exc:
         raise TargetChangedError(f"{exc}{_put_back(aside, path)}") from exc
-    with contextlib.suppress(OSError):
-        aside.unlink()
+    expect.kept.append(_keep_beside(aside, path, expect.keep))
+
+
+#: 置き換えた前のファイルを残す名前の形 ``<元の名前の頭>.before-<時刻><元の後ろ>``
+#: 元と同じ後ろ（.mp4 .sme など）にして、人が見つけてそのまま開けるようにする
+_BEFORE = "{stem}.before-{stamp}{suffix}"
+_BEFORE_STAMP = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
+
+
+def _keep_beside(aside: Path, path: Path, keep: int) -> Path:
+    """退けた前のファイルを、消さずに同じフォルダの決まった名前で残す 残した場所を返す
+
+    消さないのは、別のアプリが消す共有（FILE_SHARE_DELETE）を許して書く先を開いたまま
+    書いていると、改名した後も同じ実体へ書き続けられ、照らした後の更新ごと消してしまうため
+    改名は同じ実体を動かすだけなので、その更新もここに残る 同じフォルダにするのは、別の
+    ドライブへ動かすと写して消すことになり、同じく消してしまうから
+
+    溜まり続けないよう、同じ書く先の物を ``keep`` 本に保つ 1 回で消すのは 1 本まで
+    （バックアップの世代の入れ替えと同じ決まり 設定を減らしても、保存のたびにまとめて消さない）
+    残す名前へ付けられなければ、退けた名前のまま残して返す
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    stem, suffix = path.stem, path.suffix
+    for number in range(100):
+        name = _BEFORE.format(
+            stem=stem, stamp=stamp if number == 0 else f"{stamp}-{number}", suffix=suffix
+        )
+        try:
+            _rename_new(aside, path.with_name(name))
+        except FileExistsError:
+            continue
+        except OSError:
+            return aside
+        kept = path.with_name(name)
+        _tidy_kept(path, max(1, keep))
+        return kept
+    return aside
+
+
+def _tidy_kept(path: Path, keep: int) -> None:
+    """同じ書く先の、残した前のファイルを古い物から 1 本だけ消して ``keep`` 本に近づける"""
+    head = f"{path.stem}.before-"
+    try:
+        kept = sorted(
+            entry.name
+            for entry in os.scandir(path.parent)
+            if entry.name.startswith(head)
+            and entry.name.endswith(path.suffix)
+            and _BEFORE_STAMP.fullmatch(entry.name[len(head) : len(entry.name) - len(path.suffix)])
+            and entry.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return
+    for name in kept[: max(0, len(kept) - keep)][:1]:
+        with contextlib.suppress(OSError):
+            (path.parent / name).unlink()
 
 
 def _put_back(aside: Path, path: Path) -> str:

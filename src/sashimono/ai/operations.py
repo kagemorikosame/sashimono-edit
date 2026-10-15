@@ -2223,6 +2223,21 @@ def _basis(consent: Consent) -> Expected:
     return consent.basis
 
 
+def _kept(consent: Consent) -> dict[str, str]:
+    """置き換えた前のファイルを残した場所 AI が人に伝えられるよう、答えに入れる
+
+    前のファイルは消さずに同じフォルダの決まった名前で残す（:mod:`sashimono.core.io.atomic`）
+    """
+    basis = consent.basis
+    if basis is None or not basis.kept:
+        return {}
+    return {
+        "previous_kept_as": str(basis.kept[-1]),
+        "previous_note": "置き換える前のファイルを消さずに残しました 古い物から片付けます"
+        "（バックアップの世代数と同じ本数）",
+    }
+
+
 def _consented(
     approved: Callable[[EditorHost, dict[str, Any], Consent], object],
     describe: Callable[[EditorHost, dict[str, Any]], Consent],
@@ -2246,7 +2261,7 @@ def _save_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
             note = host.write_project(path, adopt=False, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
-    return {"saved": str(path), "note": note}
+    return {"saved": str(path), "note": note, **_kept(consent)}
 
 
 def _save_as_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
@@ -2274,7 +2289,12 @@ def _save_project_as(host: EditorHost, arguments: dict[str, Any], consent: Conse
             note = host.write_project(path, adopt=True, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
-    return {"saved": str(path), "project_path": str(host.project_path), "note": note}
+    return {
+        "saved": str(path),
+        "project_path": str(host.project_path),
+        "note": note,
+        **_kept(consent),
+    }
 
 
 def _subtitle_plan(
@@ -2338,7 +2358,11 @@ def _export_subtitles(host: EditorHost, arguments: dict[str, Any], consent: Cons
             written = host.write_subtitles(path, frame_range=frame_range, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"字幕を書き出せませんでした: {exc}") from exc
-    return {"written": str(written), "range": None if frame_range is None else list(frame_range)}
+    return {
+        "written": str(written),
+        "range": None if frame_range is None else list(frame_range),
+        **_kept(consent),
+    }
 
 
 def _snapshot_plan(host: EditorHost, arguments: dict[str, Any]) -> tuple[Path, int, str]:
@@ -2376,7 +2400,7 @@ def _save_snapshot(host: EditorHost, arguments: dict[str, Any], consent: Consent
             drawn = host.write_snapshot(path, frame, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"静止画を保存できませんでした: {exc}") from exc
-    return {"saved": str(path), "frame": drawn}
+    return {"saved": str(path), "frame": drawn, **_kept(consent)}
 
 
 #: 書き出しを待つ上限（秒） 長く待たせると、その間は AI が人の新しい指示に応えられない

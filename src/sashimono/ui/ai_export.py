@@ -134,7 +134,11 @@ class _Worker(QObject):
         except (ToolError, OSError) as exc:
             self.failed.emit(f"書き出し先へ置けませんでした（書き出し先は前のままです）: {exc}")
             return
-        self.finished.emit(str(placed))
+        note = ""
+        if self._expect is not None and self._expect.kept:
+            # 置き換える前の書き出しは消さずに残した（:mod:`sashimono.core.io.atomic`） 場所を伝える
+            note = f"（置き換える前のファイルは {self._expect.kept[-1]} として残しました）"
+        self.finished.emit(f"{placed}{note}")
 
     def _place(self, scratch: Path) -> Path:
         """書き出し先のフォルダを持ったまま確かめ直し、写して名前を付け替える"""

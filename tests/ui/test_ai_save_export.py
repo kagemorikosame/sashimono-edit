@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import sys
 import threading
@@ -25,13 +27,19 @@ import pytest
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
+from sashimono.ai import operations, safety
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EXPORT_RUNNING, ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.core.commands import AddClip, AddTrack, SetTrackState
 from sashimono.core.io import subtitles as subtitles_module
 from sashimono.core.io.atomic import copy_atomic
-from sashimono.core.io.serialize import keep_pre_upgrade_copy, load_project
+from sashimono.core.io.serialize import (
+    FORMAT_VERSION,
+    PRE_UPGRADE_SUFFIX,
+    load_project,
+    save_project,
+)
 from sashimono.core.model import (
     Clip,
     MediaItem,
@@ -46,6 +54,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.engine.encode import ExportSettings, available_video_codecs, export_project
 from sashimono.ui import ai_export, main_window
 from sashimono.ui.ai_export import scratch_folder
+from sashimono.ui.backup_settings import state_root_for
 from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import make_loaded
@@ -507,19 +516,62 @@ class TestTheTargetChangingAfterApproval:
         assert result["state"] == "done", result
         assert target.read_bytes() == b"new video"
 
+    def test_a_refused_save_leaves_the_backups_and_the_pre_upgrade_copy_alone(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、最後の照らし合わせの後に外のアプリが古い形式の作品を書き換えたとき、
+        # 保存そのものは断られても、許していない中身から控え（.bak と世代のバックアップ）を
+        # 作り、前の控えと古い世代を失う（Codex の P2）
+        project_file = folder / "作品.sme"
+        old_format = json.dumps({"format": "sashimono-project", "version": FORMAT_VERSION - 1})
+        project_file.write_text(old_format, encoding="utf-8")
+        pre_upgrade = folder / f"作品.sme{PRE_UPGRADE_SUFFIX}"
+        pre_upgrade.write_text("前の控え", encoding="utf-8")
+        window._back_up(project_file)
+        backups = state_root_for(window._preferences) / "backups"
+
+        def snapshot() -> dict[str, bytes]:
+            return {str(path): path.read_bytes() for path in backups.rglob("*") if path.is_file()}
+
+        before = snapshot()
+        assert before
+        real_pin = safety.pinned_place
+
+        @contextlib.contextmanager
+        def change_then_pin(host: Any, raw: object) -> Iterator[Path]:
+            # 照らし合わせが済み、書く処理へ入る所で、外のアプリが古い形式のまま書き換えた
+            outside = json.dumps(
+                {
+                    "format": "sashimono-project",
+                    "version": FORMAT_VERSION - 1,
+                    "外": "許していない",
+                },
+                ensure_ascii=False,
+            )
+            project_file.write_text(outside, encoding="utf-8")
+            with real_pin(host, raw) as path:
+                yield path
+
+        monkeypatch.setattr(operations, "pinned_place", change_then_pin)
+        _asked, box = _drive(window, _operation("save_project"), {})
+        assert isinstance(box.get("error"), ToolError)
+        assert "許していない" in project_file.read_text(encoding="utf-8")
+        assert pre_upgrade.read_text(encoding="utf-8") == "前の控え"
+        assert snapshot() == before
+
     def test_a_save_as_name_that_appears_while_writing_is_kept(
         self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 壊れると、名前を付けて保存の途中（控えを取る間）に現れた同じ名前のファイルを潰す
+        # 壊れると、名前を付けて保存の途中（作品を書く間）に現れた同じ名前のファイルを潰す
         target = folder / "第二稿.sme"
-        real = keep_pre_upgrade_copy
+        real = save_project
 
-        def appear_then_copy(path: Path) -> Path | None:
+        def appear_then_save(project: Project, path: Path, **options: Any) -> None:
             if path == target.resolve():
                 target.write_text("other app", encoding="utf-8")
-            return real(path)
+            real(project, path, **options)
 
-        monkeypatch.setattr(main_window, "keep_pre_upgrade_copy", appear_then_copy)
+        monkeypatch.setattr(main_window, "save_project", appear_then_save)
         _asked, box = _drive(window, _operation("save_project_as"), {"path": str(target)})
         assert isinstance(box.get("error"), ToolError)
         assert target.read_text(encoding="utf-8") == "other app"

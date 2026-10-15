@@ -2356,23 +2356,38 @@ class MainWindow(QMainWindow):
 
         画面の〔保存〕と AI の保存（#327）が通る所 控えの取り方・書き方を 1 か所にする
         書けなければ ``OSError``（窓は出さない 出すかは呼ぶ側が決める）
+
+        ``expect``（AI の保存 人が許したときの身元）があれば、控えは置き換えた後に、退けて
+        残した前のファイル（照らして許した物と同じと確かめた物）から取る 置き換える前に
+        ``path`` から取ると、照らす前に外のアプリが書き換えた中身で前の写し（.bak）と古い
+        世代を潰し、保存が断られても控えだけ失う（#327）
         """
-        note = ""
-        try:
-            # 古い形式のファイルを今の形式で上書きする前に、横へ写しを残す 自動更新の後で
-            # 前の版へ戻した人が、上げる前の作品を開けるように（前の版は新しい形式を読めない）
-            keep_pre_upgrade_copy(path)
-            note = self._back_up(path)
-        except OSError as exc:
-            # 控えが取れなくても保存は止めない 止めると、控えのために
-            # いまの作業のほうを失う
-            note = f"（バックアップは作れなかった: {exc}）"
-        save_project(self._document.project, path, expect=expect)
+        if expect is None:
+            note = self._back_up_before(path, path)
+            save_project(self._document.project, path)
+        else:
+            approved = replace(expect, keep=self._preferences.backup_generations)
+            save_project(self._document.project, path, expect=approved)
+            note = self._back_up_before(path, approved.kept[-1]) if approved.kept else ""
+            if approved.kept:
+                note += f"（置き換える前の作品は {approved.kept[-1].name} として残した）"
         self._mark_saved()
         self._update_title()
         return note
 
-    def _back_up(self, target: Path) -> str:
+    def _back_up_before(self, path: Path, source: Path) -> str:
+        """上書きする前の中身（``source``）から、形式を上げる前の写しと世代の控えを取る"""
+        try:
+            # 古い形式のファイルを今の形式で上書きする前に、横へ写しを残す 自動更新の後で
+            # 前の版へ戻した人が、上げる前の作品を開けるように（前の版は新しい形式を読めない）
+            keep_pre_upgrade_copy(path, source)
+            return self._back_up(path, source)
+        except OSError as exc:
+            # 控えが取れなくても保存は止めない 止めると、控えのために
+            # いまの作業のほうを失う
+            return f"（バックアップは作れなかった: {exc}）"
+
+    def _back_up(self, target: Path, source: Path | None = None) -> str:
         """上書きする前の中身を、設定の置き場と世代数で控える 知らせる言葉を返す（無ければ空）
 
         設定の置き場へ書けなければ既定の置き場へ控え、そのことを保存の知らせに添える
@@ -2391,11 +2406,11 @@ class MainWindow(QMainWindow):
         # 入れ替えで消せなかった古い控え 黙らない決まりで、保存の知らせに添える
         stuck: list[Path] = []
         try:
-            backup_before_save(target, root, keep=keep, most=1, failed=stuck)
+            backup_before_save(target, root, keep=keep, most=1, failed=stuck, source=source)
         except OSError as exc:
             if root == default:
                 raise
-            backup_before_save(target, default, keep=keep, most=1, failed=stuck)
+            backup_before_save(target, default, keep=keep, most=1, failed=stuck, source=source)
             note = f"（{root} に書けないので、バックアップは既定の置き場 {default} へ: {exc}）"
         if stuck:
             note += f"（古いバックアップ {len(stuck)} 本は消せなかったので残した）"
@@ -3358,7 +3373,10 @@ class MainWindow(QMainWindow):
         """
         try:
             written = save_subtitles(
-                self.view_project, path, frame_range=frame_range, expect=expect
+                self.view_project,
+                path,
+                frame_range=frame_range,
+                expect=replace(expect, keep=self._preferences.backup_generations),
             )
         except OSError as exc:
             raise ToolError(f"字幕を書き出せませんでした: {path} ({exc})") from exc
@@ -3378,7 +3396,9 @@ class MainWindow(QMainWindow):
             raise ToolError(f"静止画を PNG にできませんでした: {path}")
         # 画面の保存（QSaveFile）と同じ PNG を、書いてから置き換える書き方で置く 描いている間に
         # 同じ名前が現れたり中身が変わったりしていれば、置かずに断る（#327）
-        write_atomic_bytes(path, data, expect=expect)
+        write_atomic_bytes(
+            path, data, expect=replace(expect, keep=self._preferences.backup_generations)
+        )
         self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
         return drawn
 
@@ -3414,7 +3434,7 @@ class MainWindow(QMainWindow):
                 export_folder=export_folder,
                 protected=protected,
             ),
-            request.expect,
+            replace(request.expect, keep=self._preferences.backup_generations),
         )
 
     def export_status(self) -> dict[str, object]:

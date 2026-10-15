@@ -13,6 +13,7 @@ import os
 import sys
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,30 @@ class TestTheTargetIsAsExpected:
             write_atomic(target, "新しい中身", expect=expect)
         assert target.read_bytes() == b"changed!"
         assert [path.name for path in tmp_path.iterdir()] == ["完成.mp4"]
+
+    def test_the_replaced_file_is_kept_beside_under_a_findable_name(self, tmp_path: Path) -> None:
+        # 壊れると、退けた前のファイルを消し、別のアプリが消す共有を許したまま書き続けていた
+        # 中身（照らした後の更新）まで一緒に失う（Codex の P1 安全を言い切れないので残す）
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"approved")
+        expect = expect_now(target)
+        write_atomic(target, "新しい中身", expect=expect)
+        kept = [path for path in tmp_path.iterdir() if path != target]
+        assert len(kept) == 1
+        assert kept[0].name.startswith("完成.before-") and kept[0].suffix == ".mp4"
+        assert kept[0].read_bytes() == b"approved"
+        assert expect.kept == [kept[0]]
+        assert target.read_text(encoding="utf-8") == "新しい中身"
+
+    def test_kept_files_are_tidied_to_the_generation_count(self, tmp_path: Path) -> None:
+        # 壊れると、AI が置き換えるたびに前のファイルが溜まり続け、作品のフォルダが埋まる
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"0")
+        for number in range(1, 5):
+            expect = replace(expect_now(target), keep=2)
+            write_atomic(target, str(number), expect=expect)
+        kept = sorted(path for path in tmp_path.iterdir() if path != target)
+        assert [path.read_bytes() for path in kept] == [b"2", b"3"]
 
     def test_as_expected_it_is_written(self, tmp_path: Path) -> None:
         # 壊れると（照らし方が厳しすぎると）、何も変わっていないのに書けない
