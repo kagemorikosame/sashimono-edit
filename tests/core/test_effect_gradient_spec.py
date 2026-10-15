@@ -8,7 +8,7 @@ from __future__ import annotations
 from sashimono.ai.operations import _describe_spec
 from sashimono.compat.aviutl.text_fill import text_gradient_fill
 from sashimono.core.model import AnimatedValue, Keyframe
-from sashimono.effects import GradientSpec, registry
+from sashimono.effects import GradientSpec, SelectSpec, registry
 from sashimono.effects.sources import TEXT
 from sashimono.ui.inspector.gradient import colour_at
 
@@ -65,8 +65,20 @@ class TestEmptyMeansTheOldFields:
 class TestTheSCurve:
     def test_only_the_gradient_effect_mixes_with_an_s_curve(self) -> None:
         # 模様で塗るは YMM4 と同じく直線で混ぜる 見本を S 字で描くと絵と食い違う
-        assert _spec("gradient").smooth
-        assert not _spec("brush_fill").smooth
+        assert not _spec("brush_fill").smooth_in({})
+        spec = _spec("gradient")
+        # 項目の無い前の版の作品と AviUtl2 の読み込みは S 字のまま 直線にすると前の作品の
+        # グラデーションの帯の端の濃さが変わる
+        assert spec.smooth_in({})
+        assert spec.smooth_in(registry.require("gradient").create().params)
+        assert not spec.smooth_in(registry.require("gradient").create(mixing="linear").params)
+
+    def test_the_mixing_is_a_choice_not_a_keyframed_value(self) -> None:
+        # 動かせる欄にすると、混ぜ方の切り替わりの途中のコマで止まりの色がどちらでもなくなる
+        spec = registry.require("gradient").spec("mixing")
+        assert isinstance(spec, SelectSpec)
+        assert spec.default == "smooth"
+        assert [value for value, _ in spec.choices] == ["smooth", "linear"]
 
     def test_the_smoothed_stops_follow_the_s_curve(self) -> None:
         stops = [(0.0, RED), (1.0, BLUE)]
@@ -94,6 +106,9 @@ class TestWhoReadsTheOldColours:
             angle=0, gradient=(0.0, *RED, 0.5, *GREEN, 1.0, *BLUE)
         )
         assert text_gradient_fill(barred, source) is None
+        # 直線で混ぜる物を S 字で刻んで写すと、帯の中ほどの色が変わる
+        straight = registry.require("gradient").create(angle=0, mixing="linear")
+        assert text_gradient_fill(straight, source) is None
 
     def test_the_ai_is_told_what_an_empty_list_means(self) -> None:
         # 空の意味を伝えないと、AI が空を「色が無い」と読んで止まりを足し直す

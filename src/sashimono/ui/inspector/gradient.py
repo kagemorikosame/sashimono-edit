@@ -122,7 +122,7 @@ class GradientBar(QWidget):
         self._moved = False
         #: 下へ引き出して、離せば消える状態か
         self._removing = False
-        #: 止まりの間を S 字で混ぜるか（:attr:`GradientSpec.smooth`）
+        #: 止まりの間を S 字で混ぜるか（:meth:`GradientSpec.smooth_in`）
         self._smooth = False
 
     def set_smooth(self, smooth: bool) -> None:
@@ -401,7 +401,8 @@ class GradientEditor(ParameterEditor):
         super().__init__(spec, parent)
         self._spec = spec
         self._bar = GradientBar(self)
-        self._bar.set_smooth(spec.smooth)
+        # 混ぜ方の欄を持つ物は、項目の無いとき（既定）の S 字で始める 設定パネルが今の値で直す
+        self._bar.set_smooth(spec.smooth_in({}))
         self._bar.stops_changed.connect(self._on_stops)
         self._bar.selected.connect(lambda _index: self._show_current())
         self._bar.colour_requested.connect(self._choose_colour)
@@ -460,6 +461,10 @@ class GradientEditor(ParameterEditor):
     @property
     def bar(self) -> GradientBar:
         return self._bar
+
+    def set_smooth(self, smooth: bool) -> None:
+        """止まりの間を S 字で混ぜて見せるか（選んだ色の混ぜ方 #364）"""
+        self._bar.set_smooth(smooth)
 
     def is_busy(self) -> bool:
         return self._bar.is_dragging()

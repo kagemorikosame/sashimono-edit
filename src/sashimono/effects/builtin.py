@@ -17,8 +17,10 @@ from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.sampling import AREA_SAMPLING
 from sashimono.effects.spec import (
+    GRADIENT_MIXINGS,
     IMAGE_FILTER,
     MAX_GRADIENT_STOPS,
+    MIXING_SMOOTH,
     CheckSpec,
     ColorSpec,
     FileSpec,
@@ -902,6 +904,12 @@ uniform vec4 end_color;
 uniform int gradient_count;
 uniform vec4 gradient_colors[MAX_GRADIENT_STOPS];
 uniform float gradient_offsets[MAX_GRADIENT_STOPS];
+// 色の混ぜ方 0 が S 字（既定 前の版と同じ）、1 が直線
+uniform int mixing;
+
+float eased(float k) {
+    return mixing == 1 ? k : k * k * (3.0 - 2.0 * k);
+}
 
 // 合成は符号化した値（sRGB）で計算する ここはリニアで持っているので往復する
 vec3 to_srgb(vec3 c) {
@@ -953,11 +961,13 @@ void main() {
     float ramp_alpha;
     if (gradient_count < 2) {
         // 前からの 2 色 前の版と同じ式のまま残す（読み込んだ作品の色を 1 段も動かさない）
-        along = along * along * (3.0 - 2.0 * along);
+        // 直線を選んだときだけ直線 既定の S 字は前と同じ式
+        along = eased(along);
         ramp_rgb = mix(to_srgb(start_color.rgb), to_srgb(end_color.rgb), along);
         ramp_alpha = mix(start_color.a, end_color.a, along);
     } else {
-        // 何色でも 止まりと止まりの間ごとに S 字で混ぜる 並び全体を 1 本の S 字にすると、
+        // 何色でも 止まりと止まりの間ごとに選んだ混ぜ方（既定の S 字か直線）で混ぜる
+        // S 字を並び全体で 1 本にすると、
         // バーで 25% に置いた止まりの色が画面では 33% ほどの所に出る
         // 止まりが 2 つ（位置 0 と 1）なら上の 2 色の式と同じ絵になる
         int count = min(gradient_count, MAX_GRADIENT_STOPS);
@@ -970,7 +980,7 @@ void main() {
                     float left = gradient_offsets[i - 1];
                     float k = right > left ? (along - left) / (right - left) : 1.0;
                     k = clamp(k, 0.0, 1.0);
-                    k = k * k * (3.0 - 2.0 * k);
+                    k = eased(k);
                     colour = mix(gradient_colors[i - 1], gradient_colors[i], k);
                     break;
                 }
@@ -1305,7 +1315,10 @@ def register_builtin_effects() -> None:
                 _END_COLOR,
                 # 何色でも置ける色の止まり（#364） 空の間は開始色と終了色で塗る（前の版の作品・
                 # AviUtl2 の読み込みはどれもこの形） バーには開始色と終了色を並べて見せる
-                GradientSpec("gradient", "色", default=(), smooth=True, legacy=_two_colours),
+                GradientSpec("gradient", "色", default=(), mixing="mixing", legacy=_two_colours),
+                # 止まりの間の混ぜ方（#364 利用者の決定） 既定は S 字で、項目を持たない前の版の
+                # 作品と AviUtl2 の読み込みは S 字のまま 決めの欄なのでキーフレームは打てない
+                SelectSpec("mixing", "色の混ぜ方", GRADIENT_MIXINGS, MIXING_SMOOTH),
                 SelectSpec("shape", "形状", (("linear", "線形"), ("radial", "円形")), "linear"),
                 TrackSpec("angle", "角度", -360, 360, 90, unit="度"),
                 TrackSpec("span", "幅", 1, 4000, 100, step=1, unit="px"),

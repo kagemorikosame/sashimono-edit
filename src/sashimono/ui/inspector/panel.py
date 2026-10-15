@@ -123,6 +123,7 @@ from sashimono.effects.strokes import (
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui import library_dialog, library_save
 from sashimono.ui.flow_layout import ElidedLabel
+from sashimono.ui.inspector.gradient import GradientEditor
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import (
     FontStyleEditor,
@@ -1325,7 +1326,38 @@ class InspectorPanel(QWidget):
             else:
                 path = ParamPath.of_effect(clip.id, effect.id, spec.name, after=after)
             self._param_row(section, spec.label, spec, path, _effect_value(effect, spec.name))
+            editor = self._editors[_editor_key(path)]
+            if isinstance(spec, GradientSpec) and isinstance(editor, GradientEditor):
+                self._follow_mixing(editor, spec, effect.id, stroke_id)
         return section
+
+    def _follow_mixing(
+        self,
+        editor: GradientEditor,
+        spec: GradientSpec,
+        effect_id: EffectId,
+        stroke_id: StrokeId | None,
+    ) -> None:
+        """バーの見本を、エフェクトで選んだ色の混ぜ方（#364）で描かせ、選び替えにも付いていく
+
+        作り直さずに入れ直す（:meth:`_refresh_values`） 混ぜ方を替えても見本が前の混ぜ方のままだと、
+        見本で決めた色の出方が画面の絵と食い違う
+        """
+
+        def refresh(current: Clip) -> None:
+            if stroke_id is not None:
+                held = current.source.find_stroke(stroke_id) if current.source else None
+                stack = held.effects if held is not None else ()
+            else:
+                stack = (*current.effects, *current.after_effects)
+            found = next((e for e in stack if e.id == effect_id), None)
+            if found is not None:
+                editor.set_smooth(spec.smooth_in(found.params))
+
+        clip = self._clip()
+        if clip is not None:
+            refresh(clip)
+        self._refreshers.append(refresh)
 
     # --- 縁取りの層（#272 #273） ---
 

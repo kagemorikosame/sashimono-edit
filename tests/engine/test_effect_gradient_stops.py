@@ -146,6 +146,46 @@ class TestTheGradientEffect:
         assert abs(int(found[0]) - 215) <= 8, found
         assert abs(int(found[1]) - 40) <= 8, found
 
+    def test_choosing_linear_mixes_straight_between_stops(self, gl: OffscreenGLContext) -> None:
+        # 直線を選んでも S 字のままだと、Premiere Pro と同じ色の出方を選べない
+        image = render(gl, (square(), (gradient(gradient=THREE, mixing="linear"),)))
+        found = image[row_at(0.125), WIDTH // 2]
+        # 赤から緑の 1/4 の所 直線なら赤が 255 x 0.75 = 191、緑が 64
+        assert abs(int(found[0]) - 191) <= 8, found
+        assert abs(int(found[1]) - 64) <= 8, found
+        # 止まりの色は直線でも置いた所に出る
+        assert near(image[row_at(0.5), WIDTH // 2], (0, 255, 0), 12)
+
+    def test_choosing_linear_also_mixes_the_two_old_colours_straight(
+        self, gl: OffscreenGLContext
+    ) -> None:
+        # 並びの無い 2 色でも、選んだ混ぜ方が効かないと欄を替えても絵が変わらない
+        smooth = render(gl, (square(), (gradient(),)))
+        straight = render(gl, (square(), (gradient(mixing="linear"),)))
+        quarter = row_at(0.25)
+        # 赤から青の 1/4 の所 S 字なら青が 255 x 0.156 = 40、直線なら 64
+        assert abs(int(smooth[quarter, WIDTH // 2][2]) - 40) <= 8
+        assert abs(int(straight[quarter, WIDTH // 2][2]) - 64) <= 8
+
+    def test_an_effect_without_the_mixing_field_stays_an_s_curve(
+        self, gl: OffscreenGLContext
+    ) -> None:
+        # 項目の無い前の版の作品と AviUtl2 の読み込みを直線で描くと、帯の端の濃さが変わる
+        effect = gradient(gradient=THREE)
+        older = Effect(
+            kind=effect.kind,
+            params={k: v for k, v in effect.params.items() if k != "mixing"},
+        )
+        assert np.array_equal(render(gl, (square(), (older,))), render(gl, (square(), (effect,))))
+        legacy = gradient()
+        older_legacy = Effect(
+            kind=legacy.kind,
+            params={k: v for k, v in legacy.params.items() if k not in ("mixing", "gradient")},
+        )
+        old_picture = render(gl, (square(), (older_legacy,)))
+        assert np.array_equal(old_picture, render(gl, (square(), (legacy,))))
+        assert abs(int(old_picture[row_at(0.25), WIDTH // 2][2]) - 40) <= 8
+
     def test_a_clip_without_stops_does_not_take_the_previous_ones(
         self, gl: OffscreenGLContext
     ) -> None:

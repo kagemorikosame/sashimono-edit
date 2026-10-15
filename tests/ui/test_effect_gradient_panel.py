@@ -269,7 +269,24 @@ class TestTheGradientEffectThroughTheWindow:
             bar = _editor(panel, "gradient")
             assert isinstance(bar, GradientEditor)
             assert bar._value() == RED_TO_BLUE
-            # 見本は描く所と同じ S 字で混ぜる
+            # 見本は描く所と同じ混ぜ方（既定の S 字）で混ぜる
+            assert bar.bar._smooth
+            # 混ぜ方は決めの欄（キーフレームを打てない）
+            assert (_owner(window, "gradient"), "mixing") not in panel._key_controls
+            _editor(panel, "mixing").value_changed.emit("linear")
+            _flush()
+            (effect,) = [e for e in _clip(window).effects if e.kind == "gradient"]
+            assert effect.params["mixing"] == "linear"
+            bar = _editor(panel, "gradient")
+            assert isinstance(bar, GradientEditor)
+            # 直線を選んだら見本も直線 S 字のままだと、見本と絵の中ほどの色が食い違う
+            assert not bar.bar._smooth
+            straight = _render(window, gl_context)
+            assert abs(_down(straight, 0.25)[2] - 64) <= 8, _down(straight, 0.25)
+            _editor(panel, "mixing").value_changed.emit("smooth")
+            _flush()
+            bar = _editor(panel, "gradient")
+            assert isinstance(bar, GradientEditor)
             assert bar.bar._smooth
 
             bar.value_changed.emit(THREE)

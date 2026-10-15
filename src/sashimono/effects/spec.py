@@ -28,11 +28,14 @@ from sashimono.core.model import AnimatedValue, ParamValue
 type ParamInput = ParamValue | float | None
 
 __all__ = [
+    "GRADIENT_MIXINGS",
     "GRADIENT_STOP_SIZE",
     "IMAGE_FILTER",
     "IMAGE_SUFFIXES",
     "MAX_GRADIENT_STOPS",
     "MIN_GRADIENT_STOPS",
+    "MIXING_LINEAR",
+    "MIXING_SMOOTH",
     "PIXEL_UNITS",
     "CheckSpec",
     "ColorSpec",
@@ -492,6 +495,15 @@ MIN_GRADIENT_STOPS = 2
 #: 止まり 1 つが平らな並びの中で占める数（位置, R, G, B, A）
 GRADIENT_STOP_SIZE = 5
 
+#: 色の止まりの間の混ぜ方 選択の欄の値と表示名 並びの頭が既定（S 字 前の版と同じ）
+#: 呼び方はテキストの塗り（止まりの間を直線で混ぜる #312）とそろえる
+MIXING_SMOOTH = "smooth"
+MIXING_LINEAR = "linear"
+GRADIENT_MIXINGS = (
+    (MIXING_SMOOTH, "S 字（AviUtl2 と同じ）"),
+    (MIXING_LINEAR, "直線（Premiere Pro・テキストの塗りと同じ）"),
+)
+
 #: 色の止まり 1 つ 位置（0..1）と sRGB の色（0..1 の R, G, B, A）
 type GradientStop = tuple[float, tuple[float, float, float, float]]
 
@@ -518,9 +530,10 @@ class GradientSpec:
     name: str
     label: str
     default: tuple[float, ...] = (0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    #: 止まりの間を S 字（smoothstep）で混ぜるか 「グラデーション」エフェクトが AviUtl2 に
-    #: 合わせて S 字で混ぜる（#357 で測った） 画面のバーの見本と止まりを足す色もこれに合わせる
-    smooth: bool = False
+    #: 止まりの間の混ぜ方を選ぶ項目（同じエフェクトの選択の欄）の名前 空なら直線で混ぜる
+    #: 「グラデーション」エフェクトは既定が S 字（smoothstep AviUtl2 に合わせた #357 で測った）で、
+    #: 直線も選べる（#364 利用者の決定） 画面のバーの見本と止まりを足す色もこれに合わせる
+    mixing: str = ""
     #: 空の並びのときに、前からの項目（同じエフェクトのほかの項目）から作る止まりの並び
     #: 画面のバーはこれを見せる 描く所は空なら前からの項目のまま描く（前と 1 画素も変えない）
     legacy: Callable[[Mapping[str, ParamValue]], tuple[float, ...]] | None = field(
@@ -531,6 +544,15 @@ class GradientSpec:
 
     def default_value(self) -> tuple[float, ...]:
         return self.default
+
+    def smooth_in(self, params: Mapping[str, ParamValue]) -> bool:
+        """``params`` のとき止まりの間を S 字で混ぜるか
+
+        項目の無い（前の版の作品・読み込み）ときは S 字 直線を選んだときだけ直線にする
+        """
+        if not self.mixing:
+            return False
+        return params.get(self.mixing) != MIXING_LINEAR
 
     def shown(self, params: Mapping[str, ParamValue]) -> tuple[float, ...]:
         """``params`` の中のこの項目を、画面のバーに出す並び
