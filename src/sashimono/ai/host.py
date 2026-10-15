@@ -17,6 +17,7 @@ from typing import Protocol
 from sashimono.core.commands import Command, Document
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
 
 __all__ = ["EditorHost", "ToolError"]
@@ -149,6 +150,28 @@ class EditorHost(Protocol):
 
     def check_waiter(self) -> Callable[[float], bool]:
         """今の検査が終わるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
+
+        返す関数は**AI のスレッドから呼ばれる**（:class:`~sashimono.ai.operations.Pending`）
+        画面のスレッドで待つと、待つ間は画面が固まる
+        """
+        ...
+
+    def request_scenes(self, media: MediaItem) -> None:
+        """場面の解析を頼む（#321） 読み終えた物・走っている物があれば何もしない
+
+        本人の設定で取り込み時の解析を切っていても、AI が頼んだ素材は読む
+        """
+        ...
+
+    def scene_state(self, media: MediaItem) -> SceneState:
+        """場面の解析の今 読み終えた並びか、読んだ所までの写しと、走っているか・失敗の理由
+
+        頼みはしない 失敗の理由を読む前に頼み直すと、理由が消えて「途中」と答えてしまう
+        """
+        ...
+
+    def scene_waiter(self, media_id: MediaId) -> Callable[[float], bool]:
+        """場面の解析が終わるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
 
         返す関数は**AI のスレッドから呼ばれる**（:class:`~sashimono.ai.operations.Pending`）
         画面のスレッドで待つと、待つ間は画面が固まる

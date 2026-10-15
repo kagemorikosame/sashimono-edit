@@ -185,6 +185,11 @@ class TestAppSettingsAreReadOnly:
             "probe",
             "render_png",
             "request_check",
+            # 場面の解析（#319 #321） 頼むのは analyze と同じく本人のキャッシュへの解析だけで、
+            # 取り込み時に調べるかの設定（Preferences.scene_analysis）は変えない
+            "request_scenes",
+            "scene_state",
+            "scene_waiter",
             "seek",
             "select_clip",
             "select_clips",
