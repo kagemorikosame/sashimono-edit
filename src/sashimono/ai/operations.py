@@ -95,8 +95,11 @@ from sashimono.core.timebase import Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
+    MAX_GRADIENT_STOPS,
+    MIN_GRADIENT_STOPS,
     CheckSpec,
     ColorSpec,
+    GradientSpec,
     ParameterSpec,
     ParamInput,
     SelectSpec,
@@ -749,6 +752,13 @@ def _describe_spec(spec: object) -> dict[str, Any]:
     elif isinstance(spec, ColorSpec):
         described["type"] = "color"
         described["format"] = "#RRGGBB か #RRGGBBAA、または [R, G, B, A]（0..1）"
+    elif isinstance(spec, GradientSpec):
+        # 平らな数の並びは形を書かないと AI が色だけの並びを渡し、既定へ戻されて何も変わらない
+        described["type"] = "gradient"
+        described["format"] = (
+            "[位置, R, G, B, A, 位置, R, G, B, A, ...] の平らな並び（どれも 0..1 sRGB）"
+            f" 止まりは {MIN_GRADIENT_STOPS}〜{MAX_GRADIENT_STOPS} 個"
+        )
     else:
         described["type"] = type(spec).__name__.replace("Spec", "").lower()
     return described

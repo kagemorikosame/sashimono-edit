@@ -658,6 +658,7 @@ def _video_chain(
     keyframes: Any,
     *,
     text: bool = False,
+    fill_base: tuple[float, ...] | None = None,
 ) -> tuple[dict[str, ParamValue], list[Effect], list[Effect], list[Stroke]]:
     """映像エフェクトの並びと、最後に当てる配置（反転と位置・拡大・回転）
 
@@ -665,6 +666,7 @@ def _video_chain(
     印が指す分（位置・拡大・回転）だけを先に当て、残りを最後に当てる（試験で確かめた）
     ``text`` が真なら、縁取りをテキストの設定（1 つ目の戻り値）か、2 つ以上なら縁取りの層
     （4 つ目の戻り値 #272）へ分ける
+    ``fill_base`` はテキストの字の色 列の頭の前景の塗りをテキストの塗りへ写すのに使う（#312）
     """
     raw = item.get("VideoEffects")
     entries = raw if isinstance(raw, list) else []
@@ -680,7 +682,9 @@ def _video_chain(
     )
     flip = _flip(item)
     if lazy is None:
-        video = map_video_effects(entries, log, length=length, keyframes=keyframes, text=text)
+        video = map_video_effects(
+            entries, log, length=length, keyframes=keyframes, text=text, fill_base=fill_base
+        )
         final = _fixed([*flip, *_placement(item, length, keyframes, video.pivot)])
         return video.params, list(video.effects), final, list(video.strokes)
 
@@ -695,7 +699,9 @@ def _video_chain(
         and outlines_fit_text(entries, length=length, keyframes=keyframes)
         and not (has_outline(head) and has_outline(tail))
     )
-    first = map_video_effects(head, log, length=length, keyframes=keyframes, text=text)
+    first = map_video_effects(
+        head, log, length=length, keyframes=keyframes, text=text, fill_base=fill_base
+    )
     # 印の後ろの縁取りは、印の所で先に当てる配置（``placed_early``）の後に付く 層にすると
     # 字と一緒に配置の前へ動くので、層にせず並びの位置に残す
     rest = map_video_effects(
@@ -837,7 +843,18 @@ def _map_item(item: dict[str, Any], log: CompatibilityReport) -> MappedObject | 
             else:
                 source = _patterned_fill(source, fill, log, length, keyframes, effects)
     is_text = source is not None and source.kind == "text"
-    params, chain, final, strokes = _video_chain(item, log, length, keyframes, text=is_text)
+    # 頭の前景の塗りはテキストの塗りへ写せる（#312） 文字装飾（Style）で縁や影を付けた字は
+    # 写さない YMM4 の塗りは文字装飾の縁と影まで塗り、塗りの入れ物も縁と影を含めた大きさになる
+    plain_style = str(item.get("Style") or "Normal") == "Normal"
+    base = source.params.get("color") if source is not None and is_text and plain_style else None
+    params, chain, final, strokes = _video_chain(
+        item,
+        log,
+        length,
+        keyframes,
+        text=is_text,
+        fill_base=base if isinstance(base, tuple) else None,
+    )
     if source is not None and is_text:
         decorations = map_decorations(
             item.get("Decorations"),
