@@ -13,12 +13,13 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
 import pytest
 
 from sashimono.ai import operations
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import Continue, ImageResult, find_operation
+from sashimono.ai.operations import Continue, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.ai.sheet import (
     GAP,
@@ -30,8 +31,10 @@ from sashimono.ai.sheet import (
 )
 from sashimono.core.model import Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.cache import SceneState
+from sashimono.engine.scenes import SceneSignal
 from tests.ai.conftest import FakeHost, FakeSheet
-from tests.ai.test_bridge import call_in_thread
+from tests.ai.test_bridge import call_in_thread, pump_until
 
 
 def run(host: FakeHost, tool: str, /, **arguments: Any) -> Any:
@@ -375,3 +378,58 @@ class TestHandingBack:
             time.sleep(0.002)
         assert isinstance(first_box.get("result"), ImageResult)
         assert isinstance(second_box.get("result"), dict)
+
+
+class TestWithDetectedScenes:
+    def test_the_scene_list_goes_straight_into_a_sheet(self, host: FakeHost) -> None:
+        # 壊れると、detect_scenes の timeline を渡しても断られるか違うコマが並び、AI が
+        # 場面ごとの様子を 1 枚で見られず、場面の数だけ preview_frame を呼ぶ
+        media = host.project.media[0]
+        host.scene_states[media.id] = SceneState(_signal([2.0, 6.5]), running=False)
+        found = run(host, "detect_scenes", media_id=str(media.id))
+        frames = [place["frame"] for row in found["cuts"] for place in row["timeline"]]
+        assert frames == [60, 195]
+
+        bridge = EditorBridge(host)
+        sheet = find_operation("contact_sheet")
+        assert sheet is not None
+        done, box = call_in_thread(bridge, sheet, {"frames": frames})
+        pump_until(bridge, done)
+        assert isinstance(box.get("result"), ImageResult), box.get("error")
+        assert _frames(_sheet(host)) == [60, 195]
+
+    def test_a_waited_analysis_can_hand_over_to_drawing(self, host: FakeHost) -> None:
+        # 壊れると、用意を待つ道具（Pending）の続きが描き続ける道具（Continue）だったとき、
+        # 途中の印が AI へ返り、絵の代わりに読めない答えが届く
+        drawn: list[int] = []
+
+        def step() -> object:
+            drawn.append(len(drawn))
+            return Continue(step) if len(drawn) < 3 else "描き終えた"
+
+        ready = threading.Event()
+        ready.set()
+        pending = Pending(wait=ready.wait, seconds=1.0, then=lambda: Continue(step))
+        both = Operation(
+            name="試験の道具",
+            description="待ってから描く",
+            schema={},
+            handler=lambda _host, _arguments: pending,
+        )
+        bridge = EditorBridge(host)
+        done, box = call_in_thread(bridge, both, {})
+        pump_until(bridge, done)
+        assert box.get("result") == "描き終えた", box.get("error")
+        assert drawn == [0, 1, 2]
+
+
+def _signal(cuts: list[float], *, until: float = 10.0) -> SceneSignal:
+    """30fps で ``until`` 秒まで ``cuts`` の秒で跳ねる差の並び（test_detect_scenes と同じ形）"""
+    fps = 30
+    times = np.arange(1, round(until * fps) + 1, dtype=np.float64) / fps
+    pixel = np.full(times.shape, 0.01, np.float32)
+    histogram = np.full(times.shape, 0.01, np.float32)
+    for moment in cuts:
+        index = round(moment * fps) - 1
+        pixel[index], histogram[index] = 0.3, 0.8
+    return SceneSignal(times, pixel, histogram, analyzed=until, complete=True)

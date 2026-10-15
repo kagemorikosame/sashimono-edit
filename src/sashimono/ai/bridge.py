@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Continue, Operation, QuestionSpec, find_operation
+from sashimono.ai.operations import Continue, Operation, Pending, QuestionSpec, find_operation
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
@@ -39,6 +40,10 @@ APPROVAL_TIMEOUT = 600.0
 #: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 用意を待つ道具（:class:`~sashimono.ai.operations.Pending`）が 1 回に待つ長さ（秒）
+#: 中断のボタンが効くまでの遅れの上限になる
+WAIT_SLICE = 0.2
 
 
 @dataclass(slots=True)
@@ -160,16 +165,39 @@ class EditorBridge:
         return self._run(operation, arguments)
 
     def _run(self, operation: Operation, arguments: dict[str, Any]) -> object:
-        """道具を編集画面のスレッドで動かす 長い道具は 1 回ずつ分けて続きを頼む
+        """道具を編集画面のスレッドで動かし、続きがあれば終わりまで辿る
 
-        続き（:class:`Continue`）を 1 つずつ別の仕事として積むので、その間に編集画面は
-        描き直しと人の操作を受け付ける 中断も回ごとに効く（:meth:`call` が見る）
-        1 回ごとに待つ上限（:data:`CALL_TIMEOUT`）が掛かるので、全体が長くても切れない
+        道具の続きは 2 通りあり、どちらもここで辿る（取り消せない操作も同じ道を通る）
+
+        - :class:`Continue` 描き続ける間に画面へ手を返す（何コマも描く道具 #320）
+          続きを 1 つずつ別の仕事として積むので、その間に画面は描き直しと人の操作を受け付ける
+        - :class:`Pending` 用意ができるまで、この（AI の）スレッドで待つ（場面の解析 #321）
+          待つ間も画面は動き続ける
+
+        どちらも 1 回ごとに :meth:`call` を通すので、中断が回ごとに効き、待つ上限
+        （:data:`CALL_TIMEOUT`）も 1 回ずつに掛かる 続きの中からもう一方の続きを返してもよい
         """
         result = self.call(lambda: operation.start(self._host, arguments))
-        while isinstance(result, Continue):
-            result = self.call(result.step)
-        return result
+        while True:
+            if isinstance(result, Pending):
+                self._wait(result)
+                result = self.call(result.then)
+            elif isinstance(result, Continue):
+                result = self.call(result.step)
+            else:
+                return result
+
+    def _wait(self, pending: Pending) -> None:
+        """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
+
+        少しずつ区切って待つのは、中断のボタンを待つ間にも効かせるため 区切らずに
+        上限（最長 2 分）まで待つと、押しても止まらない
+        """
+        deadline = time.monotonic() + max(0.0, pending.seconds)
+        while not self._cancel.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
+                return
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる

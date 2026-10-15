@@ -542,6 +542,9 @@ AI_ONLY: dict[str, str] = {
     "preview_frame": READING,
     "contact_sheet": READING,
     "preview_range": READING,
+    # 場面の切り替わり（#319） 人は再生して目で見つける物を、フレーム間の差の一覧で読む
+    # 読むだけ（Safety.READ_ONLY）で、画面のメニュー・右クリック・ボタンに同じ入口は無い
+    "detect_scenes": READING,
     "list_scenes": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
