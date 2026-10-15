@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import Operation, QuestionSpec, Waiting, find_operation
+from sashimono.ai.operations import Operation, Pending, QuestionSpec, find_operation
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
@@ -41,9 +41,9 @@ APPROVAL_TIMEOUT = 600.0
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
 
-#: 長い仕事（書き出し）を待つ間、様子を読み直す間隔（秒） 短くすると編集画面のスレッドへ
-#: 頼む仕事が増え、長くすると終わってから AI が気付くまでが延びる
-WAIT_INTERVAL = 0.5
+#: 用意を待つ道具（:class:`~sashimono.ai.operations.Pending`）が 1 回に待つ長さ（秒）
+#: 中断のボタンが効くまでの遅れの上限になる
+WAIT_SLICE = 0.2
 
 
 @dataclass(slots=True)
@@ -165,28 +165,27 @@ class EditorBridge:
         return self._settle(self.call(lambda: operation(self._host, arguments)))
 
     def _settle(self, result: object) -> object:
-        """道具が待つように頼んだ（:class:`Waiting`）なら、ここ（AI のスレッド）で待つ
+        """道具が待つように頼んだ（:class:`Pending`）なら、ここで待ってから答えを作る
 
-        待つ間も編集画面は動く 様子は少しずつ編集画面のスレッドで読む 中断のボタンで
-        待つのをやめる（書き出しそのものは止めない 止めるのは cancel_export か画面の〔中止〕）
+        待つのはこの（AI の）スレッド 画面のスレッドは待つ間も動き続ける 場面の解析
+        （#321）と書き出し（#327）が同じ形で待つ 取り消せない操作の後にも通す
         """
-        if not isinstance(result, Waiting):
-            return result
-        poll = result.poll
-        deadline = time.monotonic() + result.seconds
-        while True:
-            answer = self.call(lambda: poll(self._host))
-            if not isinstance(answer, tuple) or len(answer) != 2:
-                raise ToolError("待っている仕事の様子を読めませんでした")
-            finished, value = answer
+        if isinstance(result, Pending):
+            self._wait(result)
+            return self.call(result.then)
+        return result
+
+    def _wait(self, pending: Pending) -> None:
+        """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
+
+        少しずつ区切って待つのは、中断のボタンを待つ間にも効かせるため 区切らずに
+        上限（最長 2 分）まで待つと、押しても止まらない
+        """
+        deadline = time.monotonic() + max(0.0, pending.seconds)
+        while not self._cancel.is_set():
             remaining = deadline - time.monotonic()
-            if finished or remaining <= 0:
-                return value
-            if self._cancel.wait(min(WAIT_INTERVAL, remaining)):
-                raise ToolError(
-                    "中断されたので待つのをやめました 書き出しは止めていません"
-                    "（止めるのは cancel_export か画面の〔中止〕）"
-                )
+            if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
+                return
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる

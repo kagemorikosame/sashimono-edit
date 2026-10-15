@@ -147,16 +147,25 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = 0.0
         self._ended = 0.0
+        #: 走っていない間は立っている AI のスレッドが終わりを待つのに使う（:meth:`wait`）
+        #: 様子（``_state``）そのものは画面のスレッドだけが読み書きする
+        self._idle = threading.Event()
+        self._idle.set()
 
     @property
     def running(self) -> bool:
         return self._state in EXPORT_RUNNING
+
+    def wait(self, seconds: float) -> bool:
+        """終わるまで最長 ``seconds`` 秒待つ 走っていなければ真 どのスレッドから呼んでもよい"""
+        return self._idle.wait(seconds)
 
     def start(self, project: Project, settings: ExportSettings, check: Callable[[], Path]) -> None:
         """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
         if self.running:
             raise ToolError("書き出しがもう走っています")
         self._state = "rendering"
+        self._idle.clear()
         self._progress = 0.0
         self._path = settings.path
         self._message = ""
@@ -195,6 +204,8 @@ class AssistantExport(QObject):
             self._thread.wait()
             self._thread = None
         self._worker = None
+        # 終わりの知らせはもう届かない 待っている AI を上限まで待たせない
+        self._idle.set()
 
     def status(self) -> dict[str, object]:
         """AI へ返す様子"""
@@ -236,4 +247,6 @@ class AssistantExport(QObject):
             self._thread.wait()
             self._thread = None
         self._worker = None
+        # 様子を書き終えてから立てる 先に立てると、待っていた AI が終わる前の様子を読む
+        self._idle.set()
         self.changed.emit()

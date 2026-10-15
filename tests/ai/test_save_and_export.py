@@ -27,7 +27,7 @@ from sashimono.ai import bridge as bridge_module
 from sashimono.ai import safety
 from sashimono.ai.bridge import Approval, EditorBridge
 from sashimono.ai.host import ExportRequest, ToolError
-from sashimono.ai.operations import MAX_WAIT_SECONDS, Operation, Waiting, find_operation
+from sashimono.ai.operations import MAX_WAIT_SECONDS, Operation, Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import SetWorkArea
 from sashimono.core.io.folder_pin import pin_folder
@@ -630,24 +630,23 @@ class TestSnapshot:
 # --- 長い書き出しを待つ・読む・止める ---
 
 
-class _Finishing(FakeHost):
-    """数えた回数だけ読まれたら終わる書き出しのふり"""
+def _finish_later(host: FakeHost, delay: float) -> threading.Timer:
+    """走り出した書き出しを ``delay`` 秒後に終わらせる（書き出しのふり）"""
 
-    def __init__(self, base: FakeHost, after: int) -> None:
-        self.__dict__.update(base.__dict__)
-        self.reads = 0
-        self.after = after
+    def finish() -> None:
+        while host.export_state["state"] != "rendering":
+            time.sleep(0.005)
+        host.export_state = {**host.export_state, "state": "done", "progress": 1.0}
 
-    def export_status(self) -> dict[str, object]:
-        self.reads += 1
-        if self.export_state["state"] == "rendering" and self.reads >= self.after:
-            self.export_state = {**self.export_state, "state": "done", "progress": 1.0}
-        return dict(self.export_state)
+    timer = threading.Timer(delay, finish)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 @pytest.fixture
 def quick_waits(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setattr(bridge_module, "WAIT_INTERVAL", 0.01)
+    monkeypatch.setattr(bridge_module, "WAIT_SLICE", 0.01)
     yield
 
 
@@ -659,18 +658,18 @@ class TestWaiting:
         # （待つのは AI のスレッドで、編集画面のスレッドは様子を読むときだけ使う）
         del codecs, quick_waits
         assert saved.saved_at is not None
-        host = _Finishing(saved, after=5)
-        bridge = EditorBridge(host, auto_approve=True)
+        timer = _finish_later(saved, 0.2)
+        bridge = EditorBridge(saved, auto_approve=True)
         seen, box = _run(
             bridge,
             EXPORT,
             {"path": str(saved.saved_at.parent / "a.mp4"), "wait_seconds": 30},
         )
+        timer.join(5)
         assert len(seen) == 1
         result = box.get("result")
         assert isinstance(result, dict)
         assert result["state"] == "done"
-        assert host.reads >= 5
 
     def test_waiting_gives_up_at_the_limit_and_returns_the_progress(
         self, saved: FakeHost, quick_waits: None
@@ -690,7 +689,7 @@ class TestWaiting:
         # 壊れると、AI が何時間も待つように頼んで、その間は人に応えない
         saved.export_state = {"state": "rendering", "progress": 0.0, "path": "a.mp4"}
         result = STATUS(saved, {"wait_seconds": 10_000})
-        assert isinstance(result, Waiting)
+        assert isinstance(result, Pending)
         assert result.seconds == MAX_WAIT_SECONDS
 
     def test_interrupting_stops_the_wait(self, saved: FakeHost) -> None:
@@ -748,4 +747,7 @@ def test_waiting_runs_on_the_ai_thread(
         bridge.pump()
         time.sleep(0.005)
     assert done.is_set()
+    # 様子を読むのは画面のスレッドだけ 待つのはそれ以外（AI）のスレッド
     assert pumped_on == {threading.get_ident()}
+    assert saved.export_waits
+    assert threading.get_ident() not in saved.export_waits

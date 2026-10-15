@@ -10,6 +10,7 @@ AI の操作は最終的に UI と同じ :class:`~sashimono.core.commands.Docume
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +18,7 @@ from typing import Protocol
 from sashimono.core.commands import Command, Document
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.cache import SceneState
 
 __all__ = ["EXPORT_RUNNING", "EXPORT_STATES", "EditorHost", "ExportRequest", "ToolError"]
 
@@ -147,6 +149,28 @@ class EditorHost(Protocol):
         """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
         ...
 
+    def request_scenes(self, media: MediaItem) -> None:
+        """場面の解析を頼む（#321） 読み終えた物・走っている物があれば何もしない
+
+        本人の設定で取り込み時の解析を切っていても、AI が頼んだ素材は読む
+        """
+        ...
+
+    def scene_state(self, media: MediaItem) -> SceneState:
+        """場面の解析の今 読み終えた並びか、読んだ所までの写しと、走っているか・失敗の理由
+
+        頼みはしない 失敗の理由を読む前に頼み直すと、理由が消えて「途中」と答えてしまう
+        """
+        ...
+
+    def scene_waiter(self, media_id: MediaId) -> Callable[[float], bool]:
+        """場面の解析が終わるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
+
+        返す関数は**AI のスレッドから呼ばれる**（:class:`~sashimono.ai.operations.Pending`）
+        画面のスレッドで待つと、待つ間は画面が固まる
+        """
+        ...
+
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
     ) -> str:
@@ -213,6 +237,14 @@ class EditorHost(Protocol):
 
     def export_status(self) -> dict[str, object]:
         """AI が始めた書き出しの様子 ``state`` は :data:`EXPORT_STATES` のどれか"""
+        ...
+
+    def export_waiter(self) -> Callable[[float], bool]:
+        """書き出しが終わるまで、最長で引数の秒だけ待つ関数 走っていなければ真を返す
+
+        :meth:`scene_waiter` と同じく、返す関数は**AI のスレッドから呼ばれる**
+        （:class:`~sashimono.ai.operations.Pending`） 画面のスレッドで待つと画面が固まる
+        """
         ...
 
     def cancel_export(self) -> bool:

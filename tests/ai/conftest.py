@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -29,6 +32,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.cache import SceneState
 from tests.conftest import make_clip
 
 RATE_30 = FrameRate(30)
@@ -54,6 +58,12 @@ class FakeHost:
         self.split_audio = True
         #: 本人の設定の「新しい字幕を自動で折り返す」の幅（%） 既定は設定と同じく 90
         self.wrap_share = 90
+        #: 場面の解析（#321） 試験が素材ごとの様子を入れる 無ければ頼んでいない様子
+        self.scene_states: dict[MediaId, SceneState] = {}
+        self.scene_requests: list[MediaId] = []
+        #: 待つ関数が呼ばれた記録（素材, 秒） と、待った結果を決める関数
+        self.scene_waits: list[tuple[MediaId, float]] = []
+        self.scene_ready: Callable[[MediaId], bool] = lambda _media: True
         #: 作品（.sme）の場所 既定はまだ保存していない作品
         self.saved_at: Path | None = None
         #: 書き出しの窓で前に選んだフォルダ 既定はまだ書き出していない
@@ -70,6 +80,8 @@ class FakeHost:
         #: 頼まれた書き出し 偽物なので書き出しそのものは走らせない
         self.exports: list[ExportRequest] = []
         self.export_state: dict[str, object] = {"state": "idle", "progress": 0.0, "path": None}
+        #: 書き出しの終わりを待った（export_waiter の関数を呼んだ）スレッド
+        self.export_waits: list[int] = []
 
     @property
     def splits_media(self) -> bool:
@@ -150,6 +162,19 @@ class FakeHost:
         del media, stream
         return self.stub_waveform
 
+    def request_scenes(self, media: MediaItem) -> None:
+        self.scene_requests.append(media.id)
+
+    def scene_state(self, media: MediaItem) -> SceneState:
+        return self.scene_states.get(media.id, SceneState(None, running=False))
+
+    def scene_waiter(self, media_id: MediaId) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            self.scene_waits.append((media_id, seconds))
+            return self.scene_ready(media_id)
+
+        return wait
+
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
     ) -> str:
@@ -198,6 +223,19 @@ class FakeHost:
 
     def export_status(self) -> dict[str, object]:
         return dict(self.export_state)
+
+    def export_waiter(self) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            # 呼ばれたスレッドを残す 待つのが AI のスレッドかを試験が見る
+            self.export_waits.append(threading.get_ident())
+            deadline = time.monotonic() + seconds
+            while self.export_state["state"] in EXPORT_RUNNING:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.005)
+            return True
+
+        return wait
 
     def cancel_export(self) -> bool:
         if self.export_state["state"] != "rendering":
