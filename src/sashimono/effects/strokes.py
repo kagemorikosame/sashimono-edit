@@ -21,6 +21,7 @@ from sashimono.core.model import (
     legacy_in_use,
 )
 from sashimono.effects.definition import EffectDefinition, registry
+from sashimono.effects.fills import fill_names, fill_specs, fill_unused
 from sashimono.effects.sources import SourceDefinition
 from sashimono.effects.spec import ColorSpec, SelectSpec, TrackSpec
 
@@ -30,6 +31,7 @@ __all__ = [
     "STROKE",
     "STROKE_EFFECT_KINDS",
     "STROKE_EFFECT_NOTE",
+    "STROKE_FILL",
     "effect_reach",
     "next_stroke",
     "pixel_reach",
@@ -46,8 +48,29 @@ POSITIONS = (("outside", "外側"), ("center", "中央"), ("inside", "内側"))
 #: 線の角 丸は前からの縁取りと同じ 角は尖らせ、面取りは角を斜めに落とす
 JOINS = (("round", "丸"), ("miter", "角"), ("bevel", "面取り"))
 
+#: 層の塗りの項目の頭（:func:`sashimono.effects.fills.fill_specs`）
+STROKE_FILL = "fill"
+
+
+def _stroke_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """層の項目で、今の値では読まない物 単色ならグラデーションの項目、グラデーションなら色"""
+    return fill_unused(params, STROKE_FILL, "color")
+
+
+def _stroke_placed_after() -> dict[str, str]:
+    """塗りの項目を太さの欄の後ろ（色の欄の前）へつないで出す 並べ方は字の塗りと同じ"""
+    placed: dict[str, str] = {}
+    previous = "width"
+    for name in fill_names(STROKE_FILL):
+        placed[name] = previous
+        previous = name
+    return placed
+
+
 #: 層の項目 太さの上限は前からの縁取り（64）より広くする 縁を何重にも重ねると、外側の層は
 #: 字の輪郭から内側の層の太さの和だけ離れる（YMM4 の 2 つ重ねで 15 画素）
+#: 色はグラデーションにもできる（#312） 層ごとに持つので、層ごとに違うグラデーションを付けられる
+#: 項目は末尾に足す（前の版の層の値の並びを動かさない） 項目を持たない層は単色で描く
 STROKE = SourceDefinition(
     kind="stroke",
     label="縁取り",
@@ -57,7 +80,10 @@ STROKE = SourceDefinition(
         SelectSpec("position", "位置", POSITIONS, "outside"),
         TrackSpec("opacity", "不透明度", 0, 100, 100, step=1, unit="%"),
         SelectSpec("join", "角", JOINS, "round"),
+        *fill_specs(STROKE_FILL),
     ),
+    unused=_stroke_unused,
+    placed_after=_stroke_placed_after(),
 )
 
 #: 縁取りの層の絵に掛けてよいエフェクト

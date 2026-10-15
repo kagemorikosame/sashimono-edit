@@ -23,12 +23,16 @@ from sashimono.core.model.effect import AnimatedValue, Effect, ParamValue
 from sashimono.core.model.ids import StrokeId, new_stroke_id
 
 __all__ = [
+    "GRADIENT_KINDS",
     "LEGACY_BORDER_COLOR",
     "LEGACY_BORDER_WIDTH",
     "MAX_STROKES",
+    "SOURCE_FILL_KINDS",
+    "STROKE_FILL_KIND",
     "Stroke",
     "legacy_in_use",
     "legacy_stroke",
+    "uses_gradient",
 ]
 
 #: 1 つのテキストに足せる層の数 層 1 つごとに字の輪郭から縁を作り直すので、増やすほど
@@ -76,6 +80,26 @@ def legacy_in_use(params: Mapping[str, ParamValue]) -> bool:
     if isinstance(width, int | float):
         return width > 0
     return False
+
+
+#: 塗りの種類の項目（#312） 字の塗り・影の塗りは中身の項目、層の塗りは層の項目
+#: 名前は :mod:`sashimono.effects.fills` と同じ コア層はエフェクトの定義を読まないので、ここにも書く
+#: （食い違わないことは試験で見る）
+SOURCE_FILL_KINDS = ("fill_type", "shadow_fill_type")
+STROKE_FILL_KIND = "fill_type"
+#: グラデーションで塗る種類 これ以外（単色・項目が無い）は前からの色で塗る
+GRADIENT_KINDS = frozenset({"linear", "radial"})
+
+
+def uses_gradient(params: Mapping[str, ParamValue], strokes: tuple[Stroke, ...] = ()) -> bool:
+    """テキストの塗り・影・縁取りの層のどれかをグラデーションで塗るか（#312）
+
+    保存の形の版を決めるのに使う グラデーションを使う物を前の版の形で書くと、前の版の本体が
+    項目を知らずに単色で当てる 切ってある層も数える（入れ直せばグラデーションで出る）
+    """
+    if any(params.get(name) in GRADIENT_KINDS for name in SOURCE_FILL_KINDS):
+        return True
+    return any(stroke.params.get(STROKE_FILL_KIND) in GRADIENT_KINDS for stroke in strokes)
 
 
 def legacy_stroke(params: Mapping[str, ParamValue], stroke_id: StrokeId | None = None) -> Stroke:

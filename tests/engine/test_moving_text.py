@@ -436,6 +436,25 @@ _LOOKS: dict[str, GeneratedSource] = {
     ),
     "AviUtl2 の組み方": text(layout="aviutl", text="AviUtl 字"),
     "縦書き": text(vertical=True),
+    # 塗り・縁取りの層・影のグラデーション（#312） 字の枠を基準に塗るので、位置 0 で描いて
+    # 置き直しても、その位置で描き直した字と同じ色の並びになる 画面を基準に塗ると色がずれる
+    # 縁取りの層は入れない 丸い角の揺れ（単色の層でも塊 13）に、グラデーションの丸めの
+    # 1〜4 の差が隣り合うと塊が上限を超え、塗り方と関係の無い所で落ちる 層だけのグラデーションは
+    # 下の「グラデーションの層」で見る
+    "グラデーション": text(
+        border_width=AnimatedValue(0.0),
+        fill_type="radial",
+        fill_gradient=(0.0, *YELLOW, 1.0, *RED),
+        shadow_x=AnimatedValue(6.0),
+        shadow_y=AnimatedValue(-5.0),
+        shadow_blur=AnimatedValue(3.0),
+        shadow_fill_type="linear",
+        shadow_fill_gradient=(0.0, *RED, 1.0, *YELLOW),
+    ),
+    "グラデーションの層": text(
+        layer(3.0, RED, fill_type="linear", fill_gradient=(0.0, *RED, 1.0, *WHITE)),
+        border_width=AnimatedValue(0.0),
+    ),
 }
 
 

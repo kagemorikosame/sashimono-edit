@@ -104,6 +104,7 @@ from sashimono.effects import (
     FileSpec,
     FontSpec,
     FontStyleSpec,
+    GradientSpec,
     GridSpec,
     ParameterSpec,
     TextSpec,
@@ -505,8 +506,14 @@ class InspectorPanel(QWidget):
             return None
         if not source.strokes:
             return ("legacy", legacy_in_use(source.params))
+        # 層ごとに出す欄（塗りの種類で変わる #312）も入れる 入れないと、単色からグラデーションへ
+        # 替えてもバーが出ない
         return tuple(
-            (stroke.id, tuple((effect.id, effect.kind) for effect in stroke.effects))
+            (
+                stroke.id,
+                tuple((effect.id, effect.kind) for effect in stroke.effects),
+                STROKE.unused_names(stroke.params),
+            )
             for stroke in source.strokes
         )
 
@@ -1123,7 +1130,9 @@ class InspectorPanel(QWidget):
             # 縁も仮の層として同じ所に出す 2 か所に出すと、どちらを動かせばよいか分からない
             unused = unused | {LEGACY_BORDER_WIDTH, LEGACY_BORDER_COLOR}
         locked = definition.locked_reasons(clip.source.params)
-        shown = _styles_under_fonts([s for s in definition.parameters if s.name not in unused])
+        shown = definition.display_order(
+            _styles_under_fonts([s for s in definition.parameters if s.name not in unused])
+        )
         # 切り替えのボタンを出した欄の名前 同じ切り替えで解ける欄が後に出たら、ボタンを
         # 繰り返さずにそちらを指す（2 つ出すと別々の操作に見える）
         buttons: dict[Unlock, str] = {}
@@ -1408,7 +1417,9 @@ class InspectorPanel(QWidget):
             _show_toggle(toggle, held.enabled if held is not None else stroke.enabled)
 
         self._refreshers.append(refresh)
-        for spec in STROKE.parameters:
+        # 単色の層はグラデーションの欄を、グラデーションの層は色の欄を出さない（#312）
+        unused = STROKE.unused_names(stroke.params)
+        for spec in STROKE.display_order([s for s in STROKE.parameters if s.name not in unused]):
             path = ParamPath.of_stroke(clip.id, stroke.id, spec.name)
             self._param_row(section, spec.label, spec, path, stroke.params.get(spec.name))
         return section
@@ -1626,7 +1637,8 @@ class InspectorPanel(QWidget):
         文字やファイルの場所は、戻すと打った中身や選んだ素材が消える ダブルクリックは
         うっかり起きやすいので、打ち直しの利かない物には付けない
         """
-        if isinstance(spec, TextSpec | FileSpec | GridSpec):
+        # グラデーションも戻さない 止まりを並べ直した手間が、うっかりのダブルクリックで消える
+        if isinstance(spec, TextSpec | FileSpec | GridSpec | GradientSpec):
             return None
         return self._if_resettable(lambda: self._reset(spec, path))
 
