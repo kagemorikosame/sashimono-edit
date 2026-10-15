@@ -198,6 +198,17 @@ class Context:
     script_root: Path
     #: 見本のテンプレートを置いた場所（作業用のフォルダからの相対）
     template_root: Path
+    #: 作業用のフォルダ（絶対パス） 撮るたびに消して作り直す見本の置き場は、この中にだけ作る
+    #: 無い（``None``）ときは、置き場を作り直す写真を撮らずに止める
+    work: Path | None = None
+
+    def library_root(self) -> Path:
+        """見本のプリセットの置き場 作業用のフォルダの下の絶対パス"""
+        if self.work is None:
+            raise ShotError(
+                "作業用のフォルダが決まっていないので、見本のプリセットの置き場を作れない"
+            )
+        return self.work / LIBRARY_DIR
 
 
 @dataclass(frozen=True, slots=True)
@@ -1542,7 +1553,7 @@ def wiki_trouble_report(context: Context) -> QImage:
 
 # --- 0.2.2 で入った画面（#317 Wiki の操作のページに載せる） ---
 
-#: 見本のプリセットの置き場（作業用のフォルダからの相対） 撮るたびに消して作り直す
+#: 見本のプリセットの置き場の名前（作業用のフォルダの下） 撮るたびに消して作り直す
 #: 残すと、前の写真で書いた物が次の写真の一覧に混ざり、撮る順番で絵が変わる
 LIBRARY_DIR = "見本の置き場"
 
@@ -1599,12 +1610,18 @@ def _look_clip(
     return with_fixed_items(clip, picture=True)
 
 
-def sample_library(root: Path) -> Library:
+def sample_library(root: Path, work: Path) -> Library:
     """見本のプリセットを書いた置き場 前の中身は消してから書く
 
-    本人のプリセットは使わない 置き場は作業用のフォルダの中にし、名前を相対で持つので、
-    一覧の補足に出る場所にも撮った機械のフォルダは出ない
+    本人のプリセットは使わない 置き場は作業用のフォルダ ``work`` の中にする 場所は一覧の
+    補足（ツールチップ）にだけ出て、写真には写らない
+
+    消す前に、``root`` が ``work`` の中（``work`` そのものではない）かを確かめ、外なら止める
+    相対の場所を今のフォルダから読むと、作業用のフォルダへ移らずに呼んだとき（試験や
+    別の台本から）に、リポジトリの根などにある同じ名前のフォルダを消してしまう
     """
+    if work.resolve() not in root.resolve().parents:
+        raise ShotError(f"見本の置き場が作業用のフォルダの外なので消さない: {root}")
     if root.exists():
         shutil.rmtree(root)
     library = Library(presets=PresetStore(root / "presets"), aliases=AliasStore(root / "aliases"))
@@ -1694,14 +1711,14 @@ def _grab_library(dialog: LibraryDialog | SaveDialog, marks: Sequence[QWidget] =
 
 def wiki_library_manage(context: Context) -> QImage:
     """〔オブジェクト〕→〔プリセットとエイリアス…〕の一覧の窓"""
-    del context
-    return _grab_library(library_dialog(sample_library(Path(LIBRARY_DIR))))
+    root = context.library_root()
+    return _grab_library(library_dialog(sample_library(root, root.parent)))
 
 
 def wiki_library_save(context: Context) -> QImage:
     """〔この見た目を保存…〕の窓 上書きの印と、前といまの見本"""
-    del context
-    dialog = save_dialog(sample_library(Path(LIBRARY_DIR)))
+    root = context.library_root()
+    dialog = save_dialog(sample_library(root, root.parent))
     overwrite = next(
         (box for box in dialog.findChildren(QCheckBox) if box.text().startswith("同じ名前")), None
     )
@@ -2209,6 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 script_root=work / "scripts",
                 template_root=write_sample_templates(Path(TEMPLATE_DIR)),
+                work=work.resolve(),
             )
             result = run(targets, context, output, wiki_images)
         finally:

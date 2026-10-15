@@ -736,12 +736,65 @@ class TestLibraryShots:
     ) -> None:
         # 壊れると、前に撮った写真で書いた物が次の一覧に混ざり、撮る順番で一覧の絵が変わる
         root = tmp_path / "置き場"
-        shots.sample_library(root)
-        stale = shots.sample_library(root)
+        shots.sample_library(root, tmp_path)
+        stale = shots.sample_library(root, tmp_path)
         stale.presets.save(Preset.capture("前の撮影の残り", _text_clip()))
-        library = shots.sample_library(root)
+        library = shots.sample_library(root, tmp_path)
         found = {(entry.name, entry.category) for entry in library.entries(PRESET)}
         assert found == {(name, category) for name, category, *_ in shots.SAMPLE_PRESETS}
+
+    def test_a_folder_outside_the_work_folder_is_not_removed(
+        self, shots: ModuleType, tmp_path: Path
+    ) -> None:
+        # 壊れると、作業用のフォルダの外（リポジトリの根など）の同じ名前のフォルダを中身ごと消す
+        work = tmp_path / "作業"
+        work.mkdir()
+        outside = tmp_path / "外" / shots.LIBRARY_DIR
+        outside.mkdir(parents=True)
+        (outside / "大事.txt").write_text("残す", encoding="utf-8")
+        for root in (outside, work):
+            with pytest.raises(shots.ShotError, match="外なので消さない"):
+                shots.sample_library(root, work)
+        assert (outside / "大事.txt").read_text(encoding="utf-8") == "残す"
+        assert list(work.iterdir()) == []
+
+    @pytest.mark.parametrize("take", ["wiki_library_manage", "wiki_library_save"])
+    def test_the_shot_does_not_touch_the_current_folder(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        take: str,
+    ) -> None:
+        """作業用のフォルダへ移らずに写真の関数を呼んでも、今のフォルダの物を消さない
+
+        壊れると、リポジトリの根から呼んだだけで、根にある同じ名前のフォルダが中身ごと消える
+        試験は一時フォルダの中だけで確かめる（本物のフォルダを消さないため）
+        """
+        del qt_application
+        current = tmp_path / "今のフォルダ"
+        kept = current / shots.LIBRARY_DIR / "大事.txt"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("残す", encoding="utf-8")
+        monkeypatch.chdir(current)
+        work = tmp_path / "作業"
+        work.mkdir()
+
+        def no_picture(dialog: QWidget, marks: object = ()) -> QImage:
+            # 見本の絵は描かせない 見るのはどこを消してどこに作るかだけ
+            del marks
+            dialog.close()
+            dialog.deleteLater()
+            return QImage()
+
+        monkeypatch.setattr(shots, "_grab_library", no_picture)
+        context = shots.Context(
+            media=None, script_root=work / "scripts", template_root=work / "t", work=work
+        )
+        getattr(shots, take)(context)
+        assert kept.read_text(encoding="utf-8") == "残す"
+        assert (work / shots.LIBRARY_DIR / "presets").is_dir()
 
     def test_the_manage_window_waits_for_every_picture(
         self,
@@ -752,7 +805,7 @@ class TestLibraryShots:
     ) -> None:
         # 壊れて待たずに撮ると、遅い機械では地だけの見本が並ぶ写真になる
         del qt_application
-        library = shots.sample_library(tmp_path / "置き場")
+        library = shots.sample_library(tmp_path / "置き場", tmp_path)
         dialog = shots.library_dialog(library, thumbnails, _simple_options())
         try:
             shots.hide_from_screen(dialog)
@@ -774,7 +827,7 @@ class TestLibraryShots:
     ) -> None:
         # 壊れると、Wiki の保存の窓の写真に上書きの印も、前といまの見本も写らない
         del qt_application
-        library = shots.sample_library(tmp_path / "置き場")
+        library = shots.sample_library(tmp_path / "置き場", tmp_path)
         dialog = shots.save_dialog(library, thumbnails, _simple_options())
         try:
             shots.hide_from_screen(dialog)
@@ -809,7 +862,7 @@ class TestLibraryShots:
         for attempt in ("1", "2"):
             thumbnails = LookThumbnails(tmp_path / f"cache{attempt}", mode=THUMBNAILS_SIMPLE)
             try:
-                library = shots.sample_library(tmp_path / f"置き場{attempt}")
+                library = shots.sample_library(tmp_path / f"置き場{attempt}", tmp_path)
                 dialog = getattr(shots, which)(library, thumbnails, _simple_options())
                 pictures.append(shots._grab_library(dialog))
             finally:
@@ -829,7 +882,7 @@ class TestLibraryShots:
         # 写真に写る 一覧の補足（ツールチップ）は写らないので見ない
         del qt_application
         root = tmp_path / "sashimono-shots-撮るたびに変わる"
-        library = shots.sample_library(root)
+        library = shots.sample_library(root, tmp_path)
         dialog = getattr(shots, which)(library, thumbnails, _simple_options())
         try:
             shown = [w.text() for w in dialog.findChildren(QLabel)]
