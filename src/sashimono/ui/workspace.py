@@ -27,6 +27,7 @@ from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.model import LayerMode
+from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
@@ -48,6 +49,11 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "SCENES_ALWAYS",
+    "SCENES_ON_DEMAND",
+    "SCENES_WITH_AI",
+    "SCENE_ANALYSIS_MODES",
+    "SCENE_THREAD_CHOICES",
     "SCRIPTS_MOVE_ASK",
     "SCRIPTS_MOVE_AUTO",
     "SCRIPTS_MOVE_MODES",
@@ -187,6 +193,16 @@ SCRIPTS_MOVE_AUTO = "auto"
 SCRIPTS_MOVE_ASK = "ask"
 SCRIPTS_MOVE_OFF = "off"
 SCRIPTS_MOVE_MODES = (SCRIPTS_MOVE_AUTO, SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF)
+
+#: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
+#: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
+SCENES_WITH_AI = "with_ai"
+SCENES_ALWAYS = "always"
+SCENES_ON_DEMAND = "on_demand"
+SCENE_ANALYSIS_MODES = (SCENES_WITH_AI, SCENES_ALWAYS, SCENES_ON_DEMAND)
+
+#: 場面の解析に使うデコードのスレッドの数として選べる物 0 はすべて（PyAV に任せる）
+SCENE_THREAD_CHOICES = (1, 2, 4, 0)
 
 #: 前の版の設定の名前（``multi_audio`` 音声が 2 本以上ある動画だけの置き方）の値と、
 #: 今の値の対応 分けない（``first``）を選んでいた人は、音声が 1 本の動画も分けない側へ写す
@@ -512,6 +528,18 @@ class Preferences:
     #: 再生中に消したときは、止めずに頭から続ける（末尾に着いたら続きが無いので止める）
     #: 動いてほしくない人は切れば今までどおり
     ripple_playhead: bool = True
+    #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
+    #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
+    #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
+    #: 毎回 CPU を使わせない（4K 154 秒を 2 本のスレッドで 38 秒） AI を使う人は入れて
+    #: おけば、頼んだときに待たずに返る いつも作る・作らない（AI が頼んだときだけ読む）も選べる
+    scene_analysis: str = SCENES_WITH_AI
+    #: 場面の解析に使うデコードのスレッドの数 0 はすべて 既定は 2（裏で読む間も編集と再生に
+    #: CPU を残す） 速い機械で早く終えたい人は増やし、遅い機械では 1 にする
+    #: 縮める大きさや間引きでは速さが変わらなかった
+    #: （:data:`sashimono.engine.scenes.MEASURED_SCENE_SECONDS`）ので、
+    #: 速さと重さの釣り合いはこれ 1 つで取る
+    scene_threads: int = DEFAULT_SCENE_THREADS
     #: 書き出しの窓で前に書き出したフォルダ 空はまだ書き出していない
     #: 好みではなく覚えている物なので、設定画面には出さない 次に開いた書き出しの窓の
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
@@ -722,6 +750,12 @@ class PreferenceStore:
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
+            scene_analysis=_choice(
+                data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis
+            ),
+            scene_threads=_member(
+                data.get("scene_threads"), SCENE_THREAD_CHOICES, plain.scene_threads
+            ),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
         )
 
@@ -863,6 +897,13 @@ def _depth(value: object, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if 0 <= value <= MAX_PIPELINE_DEPTH else default
+
+
+def _member(value: object, choices: tuple[int, ...], default: int) -> int:
+    """決まった数のどれか 知らない数（手で書いた 3 など）と数でない物は既定へ戻す"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    return value if value in choices else default
 
 
 def _threads(value: object, default: int) -> int:

@@ -120,7 +120,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import MediaAnalyzer
+from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
@@ -164,6 +164,8 @@ from sashimono.ui.transport import TransportBar
 from sashimono.ui.updates import UpdateController
 from sashimono.ui.workspace import (
     LAYOUT_VERSION,
+    SCENES_ALWAYS,
+    SCENES_WITH_AI,
     Preferences,
     PreferenceStore,
     ShortcutStore,
@@ -380,6 +382,7 @@ class MainWindow(QMainWindow):
         self._analyzer = MediaAnalyzer(
             sample_rate=self._document.project.settings.sample_rate,
             channels=self._document.project.settings.channels,
+            scene_threads=self._preferences.scene_threads,
         )
         # 描画と書き出しの両方が見るので、窓を組み立てる前に決めておく
         native.set_enabled(self._preferences.native_modules)
@@ -951,7 +954,9 @@ class MainWindow(QMainWindow):
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
         previous = self._preferences
+        scenes_before = self._scenes_on_import()
         self._preferences = preferences
+        self._apply_scene_preferences(scenes_before)
         try:
             PreferenceStore().save(preferences)
         except OSError as exc:
@@ -1026,6 +1031,22 @@ class MainWindow(QMainWindow):
             note = _removal_note("確かめた物を片付けた", done, failed)
             if note:
                 self.statusBar().showMessage(note, 15000)
+
+    def _apply_scene_preferences(self, before: bool) -> None:
+        """場面の解析の設定を当てる（#321） スレッドの数は次に調べる素材から効く
+
+        切ったら走っている解析を止める 切っても裏で全フレーム読み続けるなら、切った意味が無い
+        （AI が頼んで走っている物も止まる AI の道具は読んだ所までを返し、次に呼ばれたら
+        頼み直す） 入れたら今の素材も調べる 読み込み直すまで効かないと、入れたのに
+        AI が頼んだときに待たされる
+        """
+        self._analyzer.set_scene_threads(self._preferences.scene_threads)
+        after = self._scenes_on_import()
+        if before and not after:
+            self._analyzer.cancel_scenes()
+        elif after and not before:
+            for media in self._document.project.media:
+                self._analyzer.request_scenes(media, on_ready=self._on_analysis_ready)
 
     def _apply_autosave_timer(self, preferences: Preferences) -> None:
         """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
@@ -1449,7 +1470,7 @@ class MainWindow(QMainWindow):
         for media in root.media:
             if media.id in self._forgotten:
                 self._forgotten.discard(media.id)
-                self._analyzer.request(media, on_ready=self._on_analysis_ready)
+                self._request_analysis(media)
                 self._request_proxy(media)
 
     def _retime_playhead(self, rate: FrameRate) -> None:
@@ -1693,7 +1714,7 @@ class MainWindow(QMainWindow):
             return
         # 解析と控えは、取り消しても止められない裏の処理 入ったことを確かめてから頼む
         for media in loaded:
-            self._analyzer.request(media, on_ready=self._on_analysis_ready)
+            self._request_analysis(media)
             self._request_proxy(media)
         if failures:
             self.statusBar().showMessage(failures[0], 5000)
@@ -2034,6 +2055,32 @@ class MainWindow(QMainWindow):
             self._analyzed.add(media_id)
         self._analysis_dirty = True
 
+    def _request_analysis(self, media: MediaItem) -> None:
+        """波形とサムネイルを頼む 設定で選んでいれば場面の一覧も（#321）
+
+        素材を読み込む道は何本もある（:meth:`_request_proxy` と同じ） 道ごとに設定を
+        見ると、どれか 1 本だけ場面を調べない（か切っても調べる）道が残る
+        """
+        self._analyzer.request(
+            media, on_ready=self._on_analysis_ready, scenes=self._scenes_on_import()
+        )
+
+    def _scenes_on_import(self) -> bool:
+        """読み込んだ素材の場面の一覧を、頼まれる前に作るか（``Preferences.scene_analysis``）"""
+        mode = self._preferences.scene_analysis
+        if mode == SCENES_ALWAYS:
+            return True
+        return mode == SCENES_WITH_AI and self._assistant_installed()
+
+    def _assistant_installed(self) -> bool:
+        """AI アシスタントの部品が入っているか 入っていない人の機械で場面を調べないため
+
+        読み込みのたびに見る 起動した後で導入の欄から入れた人にも、次の読み込みから効かせる
+        """
+        from sashimono.ai.environment import runtime_status
+
+        return runtime_status().installed
+
     def _request_proxy(self, media: MediaItem) -> None:
         """控えを作るよう頼む 設定で切っていれば何もしない
 
@@ -2304,7 +2351,7 @@ class MainWindow(QMainWindow):
         self._on_project_changed()
         self._seek(0)
         for media in project.media:
-            self._analyzer.request(media, on_ready=self._on_analysis_ready)
+            self._request_analysis(media)
             self._request_proxy(media)
 
     def save_project(self) -> bool:
@@ -2680,7 +2727,7 @@ class MainWindow(QMainWindow):
         self._on_project_changed()
         self._seek(0)
         for media in project.media:
-            self._analyzer.request(media, on_ready=self._on_analysis_ready)
+            self._request_analysis(media)
             self._request_proxy(media)
 
         self.autosave()
@@ -2765,7 +2812,7 @@ class MainWindow(QMainWindow):
             return
         # 解析と控えは取り消しても止まらない 入ったことを確かめてから頼む
         for media in found.items:
-            self._analyzer.request(media, on_ready=self._on_analysis_ready)
+            self._request_analysis(media)
             self._request_proxy(media)
         note = f"{source.name} から {len(exo.objects)} 個を読み込んだ"
         if found.missing:
@@ -2916,7 +2963,7 @@ class MainWindow(QMainWindow):
         if landed:
             self._timeline.set_selection(landed)
         for media in plan.added:
-            self._analyzer.request(media, on_ready=self._on_analysis_ready)
+            self._request_analysis(media)
             self._request_proxy(media)
         # 数えるのは一番上に置いたクリップだけ トラックやシーンを足すコマンドまで
         # 数えると、画像 1 つでも「2 個を置いた」と出る
@@ -3214,11 +3261,23 @@ class MainWindow(QMainWindow):
             raise ToolError(str(exc)) from exc
 
     def analyze(self, media: MediaItem) -> None:
-        self._analyzer.request(media, on_ready=self._on_analysis_ready)
+        self._request_analysis(media)
         self._request_proxy(media)
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         return self._analyzer.waveform(media, stream)
+
+    def request_scenes(self, media: MediaItem) -> None:
+        """AI が頼んだ素材の場面を調べる 設定で取り込み時の解析を切っていても読む"""
+        self._analyzer.request_scenes(media, on_ready=self._on_analysis_ready)
+
+    def scene_state(self, media: MediaItem) -> SceneState:
+        return self._analyzer.scene_state(media)
+
+    def scene_waiter(self, media_id: MediaId) -> Callable[[float], bool]:
+        # 窓を閉じた後に呼ばれても、閉じた係は待たずに返す（MediaAnalyzer.close）
+        analyzer = self._analyzer
+        return lambda seconds: analyzer.wait_scenes(media_id, seconds)
 
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
