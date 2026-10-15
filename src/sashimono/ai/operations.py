@@ -1129,9 +1129,28 @@ def _preview_range(host: EditorHost, arguments: dict[str, Any]) -> object:
     step = _within(arguments, "step", 1, 1, max(1, project.duration))
     # 終わりを越えた分は描かない 越えた所は黒いだけで、動きの確かめにならない
     frames = [frame for frame in range(start, start + count * step, step) if frame <= last]
+    if len(frames) < 2:
+        # 1 コマだけの 1 枚は動きを示さない 返すと AI は止まった絵だと読み違える
+        raise ToolError(
+            f"start_frame {start} から step {step} おきでは、終わり（{last}）までに描けるのが"
+            f" {len(frames)} コマです 動きを見るには 2 コマ以上要ります start_frame を前へ"
+            " 戻すか、step を小さくしてください"
+        )
     cell = _within(arguments, "cell_width", RANGE_DEFAULT_CELL, MIN_CELL_WIDTH, MAX_CELL_WIDTH)
+    # 終わりで足りなくなった分は黙って減らさず、返事に書く 書かないと、AI は頼んだ枚数を
+    # 見たつもりで、その先の動きについて判断する
+    note = ""
+    if len(frames) < count:
+        note = f" 頼んだ {count} コマのうち {len(frames)} コマ（タイムラインの終わり {last} まで）"
     return _draw_sheet(
-        host, project, frames, cell, arguments, "範囲のコマ", default_columns=RANGE_DEFAULT_COLUMNS
+        host,
+        project,
+        frames,
+        cell,
+        arguments,
+        "範囲のコマ",
+        default_columns=RANGE_DEFAULT_COLUMNS,
+        note=note,
     )
 
 
@@ -1144,6 +1163,7 @@ def _draw_sheet(
     title: str,
     *,
     default_columns: int | None = None,
+    note: str = "",
 ) -> object:
     """並べ方を決めて、描き始める 描くのは :class:`Continue` で 1 回ずつ（時間で区切る）"""
     columns = default_columns
@@ -1161,7 +1181,7 @@ def _draw_sheet(
     canvas = host.start_sheet(layout)
     caption = (
         f"{title} {len(frames)} コマ（{layout.columns} 列 x {layout.rows} 行 左上から右へ"
-        f" {layout.width}x{layout.height} 画素） 各コマの下に「タイムコード フレーム」: "
+        f" {layout.width}x{layout.height} 画素）{note} 各コマの下に「タイムコード フレーム」: "
         + " / ".join(f"{index + 1}) {label}" for index, label in enumerate(labels))
     )
     position = 0
@@ -2237,7 +2257,8 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "続いたコマを 1 枚に並べた画像で、動きを確かめる（場面切り替え・キーフレーム・"
             "字幕の出入りなど） start_frame から step おきに count 枚 各コマの下に"
-            "タイムコードとフレーム番号を書く 長い範囲を見渡すときは contact_sheet を使う"
+            "タイムコードとフレーム番号を書く 終わりを越える分は描かず、減らしたことを返事に"
+            "書く 2 コマ未満になる頼みは断る 長い範囲を見渡すときは contact_sheet を使う"
         ),
         schema=_schema(
             {

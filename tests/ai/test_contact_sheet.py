@@ -138,8 +138,27 @@ class TestPreviewRange:
 
     def test_frames_past_the_end_are_left_out(self, host: FakeHost) -> None:
         # 壊れると、終わりより後の黒いコマが並び、AI が最後に暗転があると読み違える
-        run(host, "preview_range", start_frame=295, count=8)
+        result = run(host, "preview_range", start_frame=295, count=8)
         assert _frames(_sheet(host)) == [295, 296, 297, 298, 299]
+        # 減らしたことは黙らず返事に書く 書かないと、AI は 8 枚を見たつもりで続きを判断する
+        assert "頼んだ 8 コマのうち 5 コマ" in result.caption
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"start_frame": 0, "count": 8, "step": 300},
+            {"start_frame": 100, "count": 4, "step": 250},
+            {"start_frame": 299},
+        ],
+    )
+    def test_a_range_that_leaves_one_frame_is_refused(
+        self, host: FakeHost, arguments: dict[str, Any]
+    ) -> None:
+        # 壊れると、step が大きすぎるか終わりの間際から頼んだとき 1 コマだけの 1 枚が返り、
+        # 動きを確かめたつもりの AI が止まった絵だと読み違える
+        with pytest.raises(ToolError, match="2 コマ以上"):
+            run(host, "preview_range", **arguments)
+        assert host.sheets == []
 
     @pytest.mark.parametrize(
         ("arguments", "message"),
