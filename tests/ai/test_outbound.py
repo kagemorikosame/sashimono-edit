@@ -172,6 +172,109 @@ class TestDeclarations:
         }
 
 
+#: 変える道具に渡す本文 結果やエラーの文にこれが出たら、字幕と文字を送ると書くべき道具
+ARG_TEXT = "引数で渡した秘密の本文"
+#: 前からあるテキストのクリップの本文
+BODY_TEXT = "前からある秘密の本文"
+
+
+def _ids(host: FakeHost) -> dict[str, str]:
+    project = host.document.project
+    media = project.media[0]
+    transcript = media.transcript
+    assert transcript is not None
+    clips = [clip for track in project.timeline.tracks for clip in track.clips]
+    text = next(c for c in clips if c.source is not None and c.source.kind == "text")
+    video = next(c for c in clips if c.media_id is not None)
+    return {
+        "media": str(media.id),
+        "segment": str(transcript.segments[0].id),
+        "track": str(project.timeline.tracks[0].id),
+        "video": str(video.id),
+        "text": str(text.id),
+    }
+
+
+#: 変える道具ごとの、ありそうな引数 道具を足したらここにも足す（足さないと落ちる）
+#: 引数が合わずに断られる物もあるが、それでよい 断った文も外へ送るので中身を見る
+WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
+    "import_media": lambda _ids: {"paths": [str(SECRET_PATH)]},
+    "place_media": lambda ids: {"media_id": ids["media"]},
+    "add_track": lambda _ids: {"kind": "video", "name": "V9"},
+    "set_track_state": lambda ids: {"track_id": ids["track"], "muted": True},
+    "set_resolution": lambda _ids: {"width": 1280, "height": 720},
+    "add_text": lambda _ids: {"text": ARG_TEXT},
+    "add_shape": lambda _ids: {},
+    "add_transition": lambda _ids: {},
+    "split_clip": lambda ids: {"clip_id": ids["video"], "frame": 30},
+    "trim_clip": lambda ids: {"clip_id": ids["video"], "tail_delta": -10},
+    "move_clip": lambda ids: {"clip_id": ids["video"], "timeline_start": 10},
+    "delete_clip": lambda ids: {"clip_id": ids["video"]},
+    "add_scene": lambda _ids: {"name": "場面"},
+    "place_scene": lambda _ids: {"scene_id": "無い"},
+    "group_clips": lambda ids: {"clip_ids": [ids["video"], ids["text"]]},
+    "ungroup_clips": lambda ids: {"clip_ids": [ids["video"]]},
+    "move_clips": lambda ids: {"clip_ids": [ids["video"]], "delta": 5},
+    "delete_clips": lambda ids: {"clip_ids": [ids["text"]]},
+    "duplicate_clips": lambda ids: {"clip_ids": [ids["text"]]},
+    "set_track_height": lambda _ids: {"height": 80},
+    "set_clip_property": lambda ids: {"clip_id": ids["text"], "name": "enabled", "value": True},
+    "add_effect": lambda ids: {"clip_id": ids["text"], "kind": "blur"},
+    "add_stroke": lambda ids: {"clip_id": ids["text"]},
+    "remove_stroke": lambda ids: {"clip_id": ids["text"], "stroke_id": "無い"},
+    "move_stroke": lambda ids: {"clip_id": ids["text"], "stroke_id": "無い", "index": 0},
+    "set_stroke_enabled": lambda ids: {"clip_id": ids["text"], "stroke_id": "無い", "enabled": 1},
+    "set_param": lambda ids: {"clip_id": ids["text"], "name": "text", "value": ARG_TEXT},
+    "add_keyframe": lambda ids: {"clip_id": ids["text"], "name": "text", "value": ARG_TEXT},
+    "set_subtitle_text": lambda ids: {
+        "media_id": ids["media"],
+        "segment_id": ids["segment"],
+        "text": ARG_TEXT,
+    },
+    "replace_subtitle_text": lambda _ids: {"pairs": [{"from": "今日は", "to": ARG_TEXT}]},
+    "clean_subtitles": lambda ids: {"media_id": ids["media"]},
+    "place_subtitles": lambda ids: {"media_id": ids["media"]},
+    "jet_cut": lambda ids: {"media_id": ids["media"]},
+    "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
+    "undo": lambda _ids: {},
+}
+
+
+def _with_text_clip(video_media: MediaItem, transcript: Transcript) -> FakeHost:
+    """素材の場所に本人の名前が入り、本文を持つテキストのクリップを 1 本置いた作品"""
+    created = FakeHost(make_loaded(replace(video_media, path=SECRET_PATH), transcript))
+    _operation("add_text")(created, {"text": BODY_TEXT})
+    return created
+
+
+class TestWritingToolsDeclareWhatTheyReturn:
+    def test_every_writing_tool_has_an_example(self) -> None:
+        # 壊れると、変える道具を足した人が例を書かずに済み、下の見張りの外を通る
+        writing = {operation.name for operation in OPERATIONS if operation.writes}
+        assert set(WRITE_EXAMPLES) == writing
+
+    @pytest.mark.parametrize("name", sorted(WRITE_EXAMPLES))
+    def test_what_each_writing_tool_returns_matches_its_declaration(
+        self, name: str, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、変える道具が本文や素材の場所を結果に載せるのに宣言せず、字幕と文字や
+        # 名前と場所を断った人にも、尋ねず伏せずに送る（add_text が本文を返していた）
+        host = _with_text_clip(video_media, transcript)
+        operation = _operation(name)
+        arguments = WRITE_EXAMPLES[name](_ids(host))
+        try:
+            result: object = operation(host, arguments)
+        except (ToolError, ValueError, KeyError) as exc:
+            result = str(exc)
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        sentences = {ARG_TEXT, BODY_TEXT[:12]} | {s.text for s in transcript.segments}
+        if any(sentence in text for sentence in sentences):
+            assert Outbound.TEXT in operation.sends, f"{name}: {text}"
+        places = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name, SECRET_PATH.stem}
+        if any(place in text for place in places):
+            assert Outbound.FILES in operation.sends, f"{name}: {text}"
+
+
 # --- 送る前に尋ねる ---
 
 
@@ -372,6 +475,11 @@ def _add_secret_text(bridge: EditorBridge) -> None:
     assert box.get("error") is None, box.get("error")
 
 
+def _type_secret_text(host: FakeHost) -> None:
+    """人が画面でテキストを足した、の代わり（ブリッジを通さない 外へは何も送らない）"""
+    _operation("add_text")(host, {"text": SECRET_TEXT})
+
+
 @pytest.fixture
 def text_refused(host: FakeHost) -> EditorBridge:
     """字幕と文字を「送らない」にした人 名前と場所は許してある 変更は自動で承認
@@ -395,13 +503,60 @@ def _text_clips(host: FakeHost) -> int:
     )
 
 
+class TestWritingTextWithoutSendingText:
+    """本文を引数で渡して結果にも返す道具（CodeRabbit の指摘 #366）"""
+
+    def test_adding_text_is_refused_and_nothing_is_added(
+        self, host: FakeHost, text_refused: EditorBridge
+    ) -> None:
+        # 壊れると、字幕と文字を断った人の所で、本文が要る道具が尋ねずに動き、本文が結果で返る
+        _seen, box = _run(text_refused, "add_text", arguments={"text": SECRET_TEXT})
+        assert isinstance(box.get("error"), ToolError)
+        assert _text_clips(host) == 0
+
+    @pytest.mark.parametrize("name", ["set_subtitle_text", "replace_subtitle_text"])
+    def test_subtitle_edits_are_refused(self, name: str, text_refused: EditorBridge) -> None:
+        # 壊れると、字幕を断った人の字幕を、AI が尋ねずに書き換え、直した本文が外へ出る
+        _seen, box = _run(text_refused, name, arguments={"pairs": [], "text": SECRET_TEXT})
+        assert isinstance(box.get("error"), ToolError)
+        assert "字幕と文字" in str(box["error"])
+
+    def test_a_text_value_is_set_but_hidden(self, host: FakeHost) -> None:
+        # 壊れると、値を変える道具ごと断られて色や位置も変えられないか、本文が外へ出る
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+        _add_secret_text(bridge)
+        bridge.set_send_choices(
+            {Outbound.FRAMES: SendChoice.ASK, Outbound.TEXT: SendChoice.DENY}
+            | {Outbound.FILES: SendChoice.ALLOW}
+        )
+        clip = next(
+            c
+            for track in host.document.project.timeline.tracks
+            for c in track.clips
+            if c.source is not None and c.source.kind == "text"
+        )
+        changed = "書き換えた秘密の本文"
+        arguments = {"clip_id": str(clip.id), "name": "text", "value": changed}
+        _seen, box = _run(bridge, "set_param", arguments=arguments)
+        assert box.get("error") is None, box.get("error")
+        assert "秘密" not in json.dumps(box["result"], ensure_ascii=False)
+        bodies = [
+            c.source.params["text"]
+            for track in host.document.project.timeline.tracks
+            for c in track.clips
+            if c.id == clip.id and c.source is not None
+        ]
+        assert bodies == [changed]
+
+
 class TestUndoWithoutSendingText:
     def test_undo_still_works_and_the_text_is_hidden(
         self, host: FakeHost, text_refused: EditorBridge
     ) -> None:
         # 壊れると、字幕と文字を送らない人は AI に取り消しを頼めないか、取り消した操作の名前に
         # 混ざったテキストの文が外へ出る
-        _add_secret_text(text_refused)
+        _type_secret_text(host)
         assert _text_clips(host) == 1
         _seen, box = _run(text_refused, "undo")
         assert box.get("error") is None, box.get("error")
@@ -416,7 +571,7 @@ class TestUndoWithoutSendingText:
         self, host: FakeHost, text_refused: EditorBridge
     ) -> None:
         # 壊れると、履歴を読むだけで、送らないと決めた文の頭が外へ出る（または履歴を読めない）
-        _add_secret_text(text_refused)
+        _type_secret_text(host)
         _seen, box = _run(text_refused, "get_history")
         assert box.get("error") is None, box.get("error")
         sent = json.dumps(box["result"], ensure_ascii=False)
@@ -428,7 +583,7 @@ class TestUndoWithoutSendingText:
         # 壊れると、まだ答えていない人が取り消しを頼むたびに、字幕と文字の窓が出る
         bridge = EditorBridge(host, auto_approve=True)
         bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.ALLOW})
-        _add_secret_text(bridge)
+        _type_secret_text(host)
         _seen, box = _run(bridge, "undo")
         assert box.get("error") is None, box.get("error")
         assert "秘密" not in json.dumps(box["result"], ensure_ascii=False)
@@ -470,6 +625,46 @@ class TestUndoWithoutSendingText:
 
 
 class TestRedact:
+    @pytest.mark.parametrize(
+        "place",
+        [
+            "/home/秘密の人/動画/無い.mp4",
+            "/Users/秘密の人/Movies/x.mov",
+            "file:///C:/Users/秘密の人/x.mp4",
+            "file:///home/秘密の人/x.mp4",
+            "~/秘密の人の動画/x.mp4",
+            "~秘密の人/動画/x.mp4",
+        ],
+    )
+    def test_other_ways_of_writing_a_place_are_hidden(self, place: str) -> None:
+        # 壊れると、AI が Windows 以外の書き方で渡した場所が、断った文に混ざってそのまま外へ出る
+        assert "秘密の人" not in redact(f"ファイルがありません: {place}", [])
+
+    @pytest.mark.parametrize(
+        "kept",
+        [
+            "30/1",
+            "色/明るさ",
+            "https://github.com/kagemorikosame/sashimono-edit/issues",
+            "1/2 画質",
+        ],
+    )
+    def test_things_that_only_look_like_places_stay(self, kept: str) -> None:
+        # 壊れると、フレームレートや分類の名前、ヘルプの URL まで伏せられ、AI が読めなくなる
+        assert redact(kept, []) == kept
+
+    def test_a_missing_posix_place_in_an_import_error_is_hidden(self, host: FakeHost) -> None:
+        # 壊れると、名前と場所を断った人の所でも、読み込めなかった場所（ユーザー名入り）が
+        # import_media の断りの文に混ざって返る（CodeRabbit の指摘 #366）
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.DENY})
+        place = "/home/秘密の人/動画/無い.mp4"
+        _seen, box = _run(bridge, "import_media", arguments={"paths": [place]})
+        error = box.get("error")
+        assert isinstance(error, ToolError)
+        assert "ファイルがありません" in str(error)
+        assert "秘密の人" not in str(error)
+
     def test_a_path_inside_a_sentence_is_hidden(self) -> None:
         # 壊れると、表に無い場所（退避のフォルダなど）が文に続けて書かれたとき、伏せずに送る
         text = redact("置き場はC:\\Users\\秘密の人\\退避 です", [])

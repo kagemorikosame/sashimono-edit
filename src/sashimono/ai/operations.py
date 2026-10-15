@@ -1922,7 +1922,7 @@ def _select(host: EditorHost, arguments: dict[str, Any]) -> object:
 _STRUCTURE = frozenset({Outbound.PROJECT})
 #: 素材の名前か場所を返す道具
 _WITH_FILES = frozenset({Outbound.PROJECT, Outbound.FILES})
-#: 字幕の文を返す道具
+#: 字幕の文かテキストの本文を返す道具（引数で受けた本文を結果で返す道具も 断られたら動かさない）
 _WITH_TEXT = frozenset({Outbound.PROJECT, Outbound.TEXT})
 #: 絵を返す道具 #320 のコンタクトシートと範囲のプレビューもこれにする
 _WITH_FRAMES = frozenset({Outbound.PROJECT, Outbound.FRAMES})
@@ -1932,6 +1932,10 @@ _HISTORY = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 #: 履歴の名前の中の文字は、送らないと決めた人には伏せて送る 取り消しは断らない
 #: 断ると、字幕と文字を送らない人は AI に取り消しを頼めない（2026-10-15 利用者の決定）
 _HIDDEN_IN_HISTORY = frozenset({Outbound.TEXT})
+#: 値を変える道具（set_param・add_keyframe）は、テキストの本文を変えたときだけ結果に本文が載る
+#: 本文のための道具ではないので、字幕と文字を送らない人にも断らず、本文を伏せて返す
+#: 断ると、色や位置を変えるだけの頼みまで動かなくなる
+_HIDDEN_IN_VALUES = frozenset({Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
 #: 本人の答え
@@ -2198,7 +2202,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["text"],
         ),
         handler=_add_text,
-        sends=_STRUCTURE,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -2524,7 +2528,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name", "value"],
         ),
         handler=_set_param,
-        sends=_STRUCTURE,
+        sends=_WITH_TEXT,
+        hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
     Operation(
@@ -2544,7 +2549,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name", "value"],
         ),
         handler=_add_keyframe,
-        sends=_STRUCTURE,
+        sends=_WITH_TEXT,
+        hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
     Operation(
@@ -2563,7 +2569,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id", "segment_id", "text"],
         ),
         handler=_set_subtitle_text,
-        sends=_STRUCTURE,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -2591,7 +2597,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["pairs"],
         ),
         handler=_replace_subtitle_text,
-        sends=_STRUCTURE,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(

@@ -181,7 +181,7 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
 AI の道具の結果は、そのまま Claude Code を通して Anthropic へ渡る 道具はどれも、結果に
 何が入りうるかを `Operation.sends`（`ai/outbound.py` の `Outbound`）で宣言する 既定は無く、
 書き忘れると道具を作る所（読み込んだ時点）で落ちる 新しい道具を足すときは、結果とエラーの文を
-読んで宣言する（`tests/ai/test_outbound.py` が読むだけの道具を全部動かして突き合わせる）
+読んで宣言する（`tests/ai/test_outbound.py` が読むだけの道具を全部動かし、変える道具は `WRITE_EXAMPLES` の引数で全部動かして、結果とエラーの文を突き合わせる 変える道具を足したら例も足す）
 
 | 物 | 値 | 同意 |
 |---|---|---|
@@ -189,7 +189,7 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 | 編集の構成 | `project` | 要らない |
 | アプリの設定 | `app_settings` | 要らない |
 | 素材の名前と場所 | `files` | 尋ねる 断ると伏せ字（〔素材 m_…〕）にして送る |
-| 字幕と文字 | `text` | 尋ねる 断ると道具を動かさない 取り消しと履歴（`undo`・`get_history`）だけは尋ねずに動かし、許すまでは操作の名前の中の文字を伏せ字にする（`Operation.hidden` 2026-10-15 利用者の決定） |
+| 字幕と文字 | `text` | 尋ねる 断ると道具を動かさない 取り消しと履歴（`undo`・`get_history`）と値を変える道具（`set_param`・`add_keyframe`）だけは尋ねずに動かし、許すまでは結果の中の文字を伏せ字にする（`Operation.hidden` 取り消しは 2026-10-15 利用者の決定） |
 | 映像の絵 | `frames` | 尋ねる 断ると道具を動かさない |
 
 - 尋ねる 3 つは `Preferences.ai_send_frames` などに `ask`（既定）・`allow`・`deny` で持ち、
