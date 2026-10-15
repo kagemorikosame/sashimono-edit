@@ -190,6 +190,170 @@ class TestTheTargetIsAsExpected:
         assert old.read_text(encoding="utf-8") == "後"
 
 
+def _approved(tmp_path: Path) -> tuple[Path, atomic.Expected]:
+    target = tmp_path / "完成.mp4"
+    target.write_bytes(b"approved")
+    return target, expect_now(target)
+
+
+def _asides(tmp_path: Path) -> list[Path]:
+    return [path for path in tmp_path.iterdir() if path.name.endswith(atomic.ASIDE_SUFFIX)]
+
+
+class TestEveryFailureAfterMovingAside:
+    """前のファイルを退けてから付け終えるまでのどこで失敗しても、元の名前に前のファイルが
+    戻るか、残した名前が人に伝わる（Codex の P1） 失敗を 1 か所ずつ差し込んで確かめる
+    """
+
+    def test_a_failure_while_checking_puts_it_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、退けた物の身元を読めなかったとき、元の名前が消えたまま退けた名前だけが残る
+        target, expect = _approved(tmp_path)
+        real = atomic.expect_now
+
+        def refuse_aside(path: Path) -> atomic.Expected:
+            if path.name.endswith(atomic.ASIDE_SUFFIX):
+                raise PermissionError("試験: 読めない")
+            return real(path)
+
+        monkeypatch.setattr(atomic, "expect_now", refuse_aside)
+        with pytest.raises(OSError, match="読めない"):
+            write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_bytes() == b"approved"
+        assert _asides(tmp_path) == []
+
+    def test_a_failure_while_placing_puts_it_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、ウイルス対策や権限で付けられなかったとき、元の名前が消えたまま残る
+        target, expect = _approved(tmp_path)
+
+        def refuse(_temporary: Path, _path: Path) -> None:
+            raise PermissionError("試験: 付けられない")
+
+        monkeypatch.setattr(atomic, "_place_new", refuse)
+        with pytest.raises(atomic.PlacingError, match="付けられない"):
+            write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_bytes() == b"approved"
+        assert _asides(tmp_path) == []
+
+    def test_when_it_cannot_be_put_back_the_kept_name_is_told(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、戻せなかった前のファイルがどこにあるか、断りの文から分からない
+        target, expect = _approved(tmp_path)
+
+        def refuse(_temporary: Path, _path: Path) -> None:
+            raise PermissionError("試験: 付けられない")
+
+        real_rename = atomic._rename_new
+
+        def no_way_back(source: Path, destination: Path) -> None:
+            if source.name.endswith(atomic.ASIDE_SUFFIX) and destination == target:
+                raise PermissionError("試験: 戻せない")
+            real_rename(source, destination)
+
+        monkeypatch.setattr(atomic, "_place_new", refuse)
+        monkeypatch.setattr(atomic, "_rename_new", no_way_back)
+        with pytest.raises(atomic.PlacingError) as caught:
+            write_atomic(target, "新しい中身", expect=expect)
+        asides = _asides(tmp_path)
+        assert len(asides) == 1
+        assert asides[0].read_bytes() == b"approved"
+        assert str(asides[0]) in str(caught.value)
+
+    def test_an_interruption_while_placing_puts_it_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、中断（Ctrl+C など）で止まったとき、元の名前が消えたまま残る
+        target, expect = _approved(tmp_path)
+
+        def interrupt(_temporary: Path, _path: Path) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(atomic, "_place_new", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_bytes() == b"approved"
+        assert _asides(tmp_path) == []
+
+    def test_a_failure_while_keeping_still_tells_where_it_is(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、新しいファイルは付けたのに、前のファイルの残し場所で失敗して保存ごと失敗に
+        # 見えるか、退けた名前のまま残った前のファイルの場所が伝わらない
+        target, expect = _approved(tmp_path)
+
+        def fail(_aside: Path, _path: Path, _keep: int) -> Path:
+            raise RuntimeError("試験: 残せない")
+
+        monkeypatch.setattr(atomic, "_keep_beside", fail)
+        write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_text(encoding="utf-8") == "新しい中身"
+        asides = _asides(tmp_path)
+        assert len(asides) == 1 and asides[0].read_bytes() == b"approved"
+        assert expect.kept == asides
+
+
+def _hold_sharing_delete(path: Path) -> Callable[[], None]:
+    """別のアプリのつもりで、消す共有を許した書き込みの開き方で ``path`` を開いたままにする"""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    generic_write = 0x40000000
+    share_all = 0x1 | 0x2 | 0x4
+    handle = create(str(path), generic_write, share_all, None, 3, 0, None)
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+    return lambda: close(handle)
+
+
+class TestTidyingKeepsWhatOthersHold:
+    """残した前のファイルの片付けは、誰かが開いている物を消さない（Codex の P2）"""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="開いている人を確かめられるのは Windows")
+    def test_an_oldest_kept_file_held_by_another_app_is_not_deleted(self, tmp_path: Path) -> None:
+        # 壊れると、別のアプリが消す共有を許して書き込み中の前のファイルを片付けで消し、
+        # その更新ごと失う
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"0")
+        write_atomic(target, "1", expect=replace(expect_now(target), keep=1))
+        oldest = next(path for path in tmp_path.iterdir() if path != target)
+        release = _hold_sharing_delete(oldest)
+        try:
+            write_atomic(target, "2", expect=replace(expect_now(target), keep=1))
+            assert oldest.exists(), "誰かが開いている前のファイルを消した"
+        finally:
+            release()
+        # 放した後の片付けでは消える（溜まり続けない）
+        write_atomic(target, "3", expect=replace(expect_now(target), keep=1))
+        assert not oldest.exists()
+
+    def test_where_holders_cannot_be_seen_nothing_is_deleted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、開いている人を確かめられない OS で、書き込み中かもしれない物を消す
+        kept = tmp_path / "完成.before-20261015-101500-123456.mp4"
+        kept.write_bytes(b"before")
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert atomic._delete_if_unheld(kept) is False
+        assert kept.exists()
+
+
 class TestSubtitleFiles:
     def test_writing_subtitles_over_a_hard_link_leaves_the_linked_file_alone(
         self, tmp_path: Path

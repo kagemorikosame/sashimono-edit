@@ -143,6 +143,13 @@ class TargetChangedError(FileExistsError):
     """書く先が、確かめたときから変わった（名前が現れた・中身が変わった） 何も置いていない"""
 
 
+class PlacingError(OSError):
+    """許した前のファイルを退けた後、新しいファイルを付けられなかった
+
+    文には、前のファイルを元の名前へ戻せたか、戻せずに残した名前を入れる
+    """
+
+
 def expect_now(path: Path) -> Expected:
     """``path`` の今の身元を覚える リンクは辿らない（リンクそのものを書く先と見る）"""
     try:
@@ -226,16 +233,29 @@ def _replace_expected(temporary: Path, path: Path, expect: Expected) -> None:
         raise TargetChangedError(
             f"書く先が許した後に消えたので、何も置きませんでした: {path}"
         ) from exc
-    if expect_now(aside) != expect:
-        raise TargetChangedError(
-            f"書く先が許した後に変わったので、前のファイルを残しました: {path}"
-            f"{_put_back(aside, path)}"
-        )
+    # 退けてから付け終えるまでのどこで失敗しても（照らせない・ウイルス対策や権限で付けられない
+    # など）、退けた物を元の名前へ戻そうとする 戻せなければ残した名前を断りの文に入れる
+    # 捕まえ損ねると、元の名前が消えたまま退けた名前だけが残り、人はどこにあるか分からない
     try:
+        if expect_now(aside) != expect:
+            raise TargetChangedError(
+                f"書く先が許した後に変わったので、前のファイルを残しました: {path}"
+            )
         _place_new(temporary, path)
     except TargetChangedError as exc:
         raise TargetChangedError(f"{exc}{_put_back(aside, path)}") from exc
-    expect.kept.append(_keep_beside(aside, path, expect.keep))
+    except OSError as exc:
+        raise PlacingError(f"{exc}{_put_back(aside, path)}") from exc
+    except BaseException:
+        # 中断など 戻すだけ試して、元の理由のまま上げる
+        _put_back(aside, path)
+        raise
+    try:
+        kept = _keep_beside(aside, path, expect.keep)
+    except Exception:
+        # 新しいファイルは付け終えている 退けた物は退けた名前のまま残っているので、それを伝える
+        kept = aside
+    expect.kept.append(kept)
 
 
 #: 置き換えた前のファイルを残す名前の形 ``<元の名前の頭>.before-<時刻><元の後ろ>``
@@ -289,18 +309,58 @@ def _tidy_kept(path: Path, keep: int) -> None:
     except OSError:
         return
     for name in kept[: max(0, len(kept) - keep)][:1]:
-        with contextlib.suppress(OSError):
-            (path.parent / name).unlink()
+        _delete_if_unheld(path.parent / name)
+
+
+def _delete_if_unheld(path: Path) -> bool:
+    """誰も開いていないときだけ消す 消せたら真
+
+    残した前のファイルは、別のアプリが消す共有を許して開いたまま書いている物かもしれない
+    （そのために消さずに残した） 普通に消すと、その更新ごと失う Windows では、共有を一切
+    許さない開き方で、閉じたら消す印を付けて開く 誰かが開いていれば開けないので消さない
+    （次の片付けで改めて見る） 開けたら、閉じた時に消える 開いている人を確かめられない
+    OS では消さない
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    delete_access = 0x00010000
+    no_sharing = 0
+    open_existing = 3
+    # 閉じたら消す・リンクなら辿らずにリンクそのものを相手にする
+    flags = 0x04000000 | 0x00200000
+    handle = create(str(path), delete_access, no_sharing, None, open_existing, flags, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        return False
+    close(handle)
+    return not path.exists()
 
 
 def _put_back(aside: Path, path: Path) -> str:
     """退けた物を元の名前へ置き換えない改名で戻す 戻せなければ、残した名前を知らせる言葉を返す"""
     try:
         _rename_new(aside, path)
-    except OSError:
+    except OSError as exc:
+        # 場所はフォルダまで書く 名前だけだと、どのフォルダかを人が探すことになる
         return (
-            f" 許した前のファイルは元の名前へ戻せなかったので、{aside.name} として残しました"
-            "（元の名前には別のファイルがあります どちらを残すかは人が決めてください）"
+            f" 許した前のファイルは元の名前へ戻せなかったので、{aside} として残しました"
+            f"（{exc}） 元の名前へ戻すかは人が決めてください"
         )
     return ""
 
