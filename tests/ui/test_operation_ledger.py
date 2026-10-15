@@ -71,7 +71,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.sources import GROUP, TEXT, TRANSITION, source_registry
-from sashimono.ui.inspector.panel import KeyframeControls
+from sashimono.ui.inspector.panel import InspectorPanel, KeyframeControls
 from sashimono.ui.inspector.widgets import ParameterEditor
 from sashimono.ui.library_save import SaveChoice
 from sashimono.ui.main_window import MainWindow
@@ -355,8 +355,48 @@ def walk_buttons(top: QWidget, place: str, scan: Scan) -> None:
         if isinstance(site, str):
             module, line = site.rsplit(":", 1)
             scan.sites.add((module, int(line)))
-    if any(e.isVisibleTo(top) for e in top.findChildren(ParameterEditor)):
+    owned = _clip_fields(top)
+    for name in owned:
+        scan.keys.add(f"{place}/クリップ自身の欄/{name}")
+    others = [
+        e
+        for e in top.findChildren(ParameterEditor)
+        if e.isVisibleTo(top) and not any(_within(e, w) for w in owned.values())
+    ]
+    if others:
         scan.keys.add(f"{place}/欄の値")
+
+
+def _within(widget: QWidget, owner: QWidget) -> bool:
+    """``widget`` が ``owner`` そのものか、その中の部品か"""
+    current: QWidget | None = widget
+    while current is not None:
+        if current is owner:
+            return True
+        current = current.parentWidget()
+    return False
+
+
+def _clip_fields(top: QWidget) -> dict[str, QWidget]:
+    """設定パネルの、クリップ自身を変える欄（合成モード・再生速度・クリッピングなど）
+
+    これらは ``SetClipProperty`` で変わり、エフェクトや中身の値（``SetParam``）とは別の道具に
+    当たる 1 行の「欄の値」にまとめると、どの道具で変えるのかを台帳から取り違える
+    見分けは設定パネルの持ち方による 「クリップ自身」（``("clip", 名前)``）の鍵を持ち、
+    パラメータの欄の一覧（``_editors``）に無い物 パラメータの欄もクリップに付く値は同じ
+    形の鍵を持つので、鍵だけでは分けられない
+    """
+    if not isinstance(top, InspectorPanel):
+        return {}
+    params = {id(widget) for widget in top._editors.values()}
+    return {
+        name: widget
+        for (owner, name), widget in top._focus_owners.items()
+        if owner == "clip"
+        and id(widget) not in params
+        and shiboken6.isValid(widget)
+        and widget.isVisibleTo(top)
+    }
 
 
 # --- 場面を作る ---
@@ -535,7 +575,19 @@ def scan_screen(folder: Path, media: MediaItem) -> Scan:
 
 
 def _matches(pattern: str, key: str) -> bool:
-    return fnmatch.fnmatchcase(key, pattern) if "*" in pattern else key == pattern
+    """台帳の行 ``pattern`` が操作 ``key`` を受けるか ``*`` は ``/`` で区切った 1 段だけに当たる
+
+    ``fnmatch`` の ``*`` は ``/`` もまたぐので、「〔エフェクトを追加…〕/*」が「前の場面へ/ぼかし/
+    ぼかし」まで覆い、段の違う操作（前と後の場面へ積む）を足して行を書き忘れても通った
+    段の数をそろえて 1 段ずつ照らす ``*`` の無い行は名前そのものと比べる（「再生 / 停止」の
+    ように名前の中に ``/`` がある項目を、段に割らない）
+    """
+    if "*" not in pattern:
+        return key == pattern
+    parts, segments = pattern.split("/"), key.split("/")
+    return len(parts) == len(segments) and all(
+        fnmatch.fnmatchcase(segment, part) for part, segment in zip(parts, segments, strict=True)
+    )
 
 
 def unlisted(scan: Scan) -> list[str]:
@@ -668,6 +720,17 @@ class TestTheGuardCatchesAdditions:
         with refuse_windows(), mock.patch.object(TimelineView, "build_context_menu", with_extra):
             scan = scan_screen(tmp_path, media)
         assert "タイムラインの右クリック/試しの右クリック" in unlisted(scan)
+
+    def test_a_list_row_covers_only_its_own_depth(self) -> None:
+        # 落ちると: 一覧の行の * が段をまたいで下のサブメニューまで覆い、段の違う操作
+        # （場面切り替えの前と後の場面へ積む など）を足して行を書き忘れても通る
+        assert _matches("甲/*", "甲/乙")
+        assert not _matches("甲/*", "甲/乙/丙")
+        assert _matches("甲/*/*", "甲/乙/丙")
+        assert not _matches("甲/*/*", "甲/乙")
+        assert _matches("メニュー/再生/再生 / 停止", "メニュー/再生/再生 / 停止")
+        deeper = "設定パネルの〔エフェクトを追加…〕/新しい段/ぼかし/ぼかし"
+        assert unlisted(Scan(keys={deeper})) == [deeper]
 
     def test_a_button_never_shown_is_caught(self) -> None:
         # 落ちると: 作る所を数え損ね、どの場面でも出ないボタンを見張りが見逃す

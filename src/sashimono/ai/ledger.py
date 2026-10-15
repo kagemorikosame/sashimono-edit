@@ -294,7 +294,7 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/グループ化", "group_clips"),
     same("タイムラインの右クリック/グループ解除", "ungroup_clips"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
-    same("タイムラインの右クリック/エフェクトを追加/*", "add_effect"),
+    same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     missing("タイムラインの右クリック/エイリアスとして保存…", 328),
     missing("タイムラインの右クリック/線に不透明度を出す", 350, _VIEW, Safety.READ_ONLY),
     missing("タイムラインの右クリック/線に音量を出す", 350, _VIEW, Safety.READ_ONLY),
@@ -314,6 +314,11 @@ LEDGER: tuple[Entry, ...] = (
         "タイムラインの右クリック/追加/エイリアス/*/*",
         328,
         "保存したエイリアスと、AviUtl・YMM4 のテンプレートの棚",
+    ),
+    missing(
+        "タイムラインの右クリック/追加/エイリアス/保存したもの/*/*",
+        328,
+        "保存したエイリアスの分類が 2 つ以上あると、分類ごとの段に並ぶ",
     ),
     same("タイムラインの右クリック/追加/シーン/*", "place_scene"),
     # --- タイムラインの右クリック トラック・範囲 ---
@@ -415,7 +420,18 @@ LEDGER: tuple[Entry, ...] = (
     missing("字幕パネルの右クリック/次と結合", 349),
     missing("字幕パネルの右クリック/削除", 349),
     # --- 設定パネル ---
-    same("設定パネル/欄の値", "set_param", "add_keyframe"),
+    same(
+        "設定パネル/欄の値",
+        "set_param",
+        "add_keyframe",
+        note="中身・エフェクト・縁取りの層の値 クリップ自身の欄は下の行（set_clip_property）",
+    ),
+    # クリップ自身の欄 SetClipProperty で変わる set_param では型が合わない（再生速度は分数）
+    same("設定パネル/クリップ自身の欄/blend_mode", "set_clip_property", note="合成モード"),
+    same("設定パネル/クリップ自身の欄/speed", "set_clip_property", note="再生速度"),
+    same("設定パネル/クリップ自身の欄/source_in", "set_clip_property", note="再生開始位置"),
+    same("設定パネル/クリップ自身の欄/clip_to_below", "set_clip_property", note="クリッピング"),
+    same("設定パネル/クリップ自身の欄/native_size", "set_clip_property", note="画素で置く"),
     same("設定パネル/エフェクトを追加…", "add_effect"),
     missing(
         "設定パネル/プリセット…｜選んでいるクリップの見た目を保存し、ほかのクリップへ当てる", 328
@@ -490,15 +506,15 @@ LEDGER: tuple[Entry, ...] = (
             ("↘", "右下"),
         )
     ),
-    same("設定パネルの〔エフェクトを追加…〕/*", "add_effect"),
+    same("設定パネルの〔エフェクトを追加…〕/*/*", "add_effect"),
     partial(
-        "設定パネルの〔エフェクトを追加…〕/前の場面へ/*",
+        "設定パネルの〔エフェクトを追加…〕/前の場面へ/*/*",
         "add_effect",
         issue=349,
         note="場面切り替えの前と後のどちらの場面へ積むかを選べない",
     ),
     partial(
-        "設定パネルの〔エフェクトを追加…〕/後の場面へ/*",
+        "設定パネルの〔エフェクトを追加…〕/後の場面へ/*/*",
         "add_effect",
         issue=349,
         note="場面切り替えの前と後のどちらの場面へ積むかを選べない",
@@ -506,7 +522,7 @@ LEDGER: tuple[Entry, ...] = (
     missing("設定パネルの〔プリセット…〕/この見た目を保存…", 328),
     missing("設定パネルの〔プリセット…〕/管理…（見本で選ぶ・名前や分類を変える・消す）", 328),
     missing("設定パネルの〔プリセット…〕/*/*", 328, "保存したプリセットを当てる（分類ごとの一覧）"),
-    same("設定パネルの縁取りの〔効果〕/*", "add_effect", note="stroke_id を渡す"),
+    same("設定パネルの縁取りの〔効果〕/*/*", "add_effect", note="stroke_id を渡す"),
     missing("設定パネルの ◆ の右クリック/アニメーションを解除", 349, "キーフレームを消す"),
     missing("設定パネルの ◆ の右クリック/グラフエディタで開く", 350, _VIEW, Safety.READ_ONLY),
 )
