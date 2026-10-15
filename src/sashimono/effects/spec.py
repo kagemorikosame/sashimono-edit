@@ -13,8 +13,10 @@ GUI にも OpenGL にも依存しない 定義はただのデータで、それ�
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import pairwise
 
 from sashimono.core.model import AnimatedValue, ParamValue
 
@@ -506,16 +508,40 @@ class GradientSpec:
 
     止まりは位置の順に並べて持つ 描く所と画面が同じ順で読むため 同じ位置の止まりは
     書いた順を保つ（その位置で色が切り替わる段になる）
+
+    エフェクトの「グラデーション」「模様で塗る」（#364）は、前から色を別の項目（開始色と終了色、
+    色 1・位置 1 …）で持つ この 2 つは既定を空の並びにして、空の間は前からの項目で描く
+    （:attr:`legacy` で前からの項目をバーに出す） 既定を色の入った並びにすると、前の版の作品・
+    読み込み・エイリアスが前からの項目を無視して既定の白から黒で塗られる
     """
 
     name: str
     label: str
     default: tuple[float, ...] = (0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    #: 止まりの間を S 字（smoothstep）で混ぜるか 「グラデーション」エフェクトが AviUtl2 に
+    #: 合わせて S 字で混ぜる（#357 で測った） 画面のバーの見本と止まりを足す色もこれに合わせる
+    smooth: bool = False
+    #: 空の並びのときに、前からの項目（同じエフェクトのほかの項目）から作る止まりの並び
+    #: 画面のバーはこれを見せる 描く所は空なら前からの項目のまま描く（前と 1 画素も変えない）
+    legacy: Callable[[Mapping[str, ParamValue]], tuple[float, ...]] | None = field(
+        default=None, compare=False
+    )
 
     kind = ParameterKind.GRADIENT
 
     def default_value(self) -> tuple[float, ...]:
         return self.default
+
+    def shown(self, params: Mapping[str, ParamValue]) -> tuple[float, ...]:
+        """``params`` の中のこの項目を、画面のバーに出す並び
+
+        空の並び（前からの項目で描く）なら :attr:`legacy` で前からの項目を並びにする
+        バーに既定の白から黒を出すと、触っただけで前からの色が既定の色へ置き換わる
+        """
+        value = self.coerce(params.get(self.name))
+        if value or self.legacy is None:
+            return value
+        return self.legacy(params)
 
     def coerce(self, value: ParamInput) -> tuple[float, ...]:
         """外から来た値を整える 形の合わない値は既定へ戻す
@@ -549,6 +575,26 @@ class GradientSpec:
         for index in range(0, len(value) - GRADIENT_STOP_SIZE + 1, GRADIENT_STOP_SIZE):
             position, red, green, blue, alpha = value[index : index + GRADIENT_STOP_SIZE]
             found.append((position, (red, green, blue, alpha)))
+        return found
+
+    @staticmethod
+    def smoothed(stops: list[GradientStop], steps: int = 16) -> list[GradientStop]:
+        """止まりの間を S 字で混ぜた並びを、直線で混ぜる止まりで刻んだ並び
+
+        直線でしか混ぜない筆（Qt の筆）で S 字の見本を描くため 16 に刻むと、8 bit の色で
+        1 段に満たないずれになる（#357 で AviUtl2 の字の塗りへ写すときと同じ刻み）
+        """
+        if len(stops) < 2:
+            return list(stops)
+        found: list[GradientStop] = [stops[0]]
+        for (left, low), (right, high) in pairwise(stops):
+            for step in range(1, steps + 1):
+                share = step / steps
+                eased = share * share * (3.0 - 2.0 * share)
+                red, green, blue, alpha = (
+                    a + (b - a) * eased for a, b in zip(low, high, strict=True)
+                )
+                found.append((left + (right - left) * share, (red, green, blue, alpha)))
         return found
 
     @staticmethod

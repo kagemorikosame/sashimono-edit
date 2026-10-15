@@ -64,6 +64,8 @@ FORMAT_NAME = "sashimono-preset"
 #: 版 3 で塗り・影・縁取りの層の色のグラデーション（#312）を足した 版 2 までの本体は
 #: 項目を知らずに単色で当てるので、グラデーションを使う物だけを版 3 で書き、前の版には
 #: 「新しい形式」で読ませない 使わない物は前と同じ版（層があれば 2、無ければ 1）で書く
+#: 図形の塗りのグラデーションと、エフェクト（グラデーション・模様で塗る）の色のバーの並び
+#: （#364）も同じ理由で版 3 で書く 版 3 はまだどの公開版も書いていないので、同じ版に足した
 FORMAT_VERSION = 3
 #: 縁取りの層を持つ（グラデーションは使わない）プリセットを書く版
 _LAYERED_VERSION = 2
@@ -217,7 +219,7 @@ class Preset:
             values["clip_to_below"] = self.clip_to_below
         return {
             "format": FORMAT_NAME,
-            "version": _version_of(self.source),
+            "version": _version_of(self.source, (*self.effects, *self.after_effects, *self.fixed)),
             "name": self.name,
             "category": self.category,
             # 前の版の本体はこの 2 つだけを読む 版の数字を上げずに項目を足したので、
@@ -283,13 +285,26 @@ class Preset:
         )
 
 
-def _version_of(source: GeneratedSource | None) -> int:
-    """プリセットを書く版 前の版の本体が読んで黙って違う見た目を当てる物だけ版を上げる"""
+def _version_of(source: GeneratedSource | None, effects: tuple[Effect, ...] = ()) -> int:
+    """プリセットを書く版 前の版の本体が読んで黙って違う見た目を当てる物だけ版を上げる
+
+    図形の塗りのグラデーションと、エフェクトの色のバーで並べた止まり（#364）も版 3 で書く
+    版 2 までの本体は項目を知らず、図形を単色で、エフェクトを前からの 2 色や「色 1」… で塗る
+    """
+    held = (*effects, *(e for stroke in (source.strokes if source else ()) for e in stroke.effects))
+    if any(_has_stops(effect) for effect in held):
+        return FORMAT_VERSION
     if source is None:
         return _PLAIN_VERSION
-    if source.kind == "text" and uses_gradient(source.params, source.strokes):
+    if source.kind in ("text", "shape") and uses_gradient(source.params, source.strokes):
         return FORMAT_VERSION
     return _LAYERED_VERSION if source.strokes else _PLAIN_VERSION
+
+
+def _has_stops(effect: Effect) -> bool:
+    """色のバーで止まりを並べたエフェクトか（並びが空なら前からの色の項目で塗る）"""
+    stops = effect.params.get("gradient")
+    return isinstance(stops, tuple) and bool(stops)
 
 
 def _flag(raw: object) -> bool | None:

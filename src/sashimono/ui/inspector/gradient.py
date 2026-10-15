@@ -72,16 +72,21 @@ _CHECKER_LIGHT = QColor(204, 204, 204)
 _CHECKER_DARK = QColor(153, 153, 153)
 
 
-def colour_at(stops: list[GradientStop], position: float) -> tuple[float, float, float, float]:
+def colour_at(
+    stops: list[GradientStop], position: float, *, smooth: bool = False
+) -> tuple[float, float, float, float]:
     """``position`` の色 字を塗る筆と同じく、色と不透明度を別々に sRGB の値のまま混ぜる
 
-    止まりを足すときの色に使う 足した所の色が前と変わらないので、足しただけで見本も字も変わらない
+    止まりを足すときの色に使う 足した所の色が前と変わらないので、足しただけで止まりの色が
+    跳ねない ``smooth`` なら止まりの間を S 字で混ぜる（「グラデーション」エフェクト #364）
     """
     if position <= stops[0][0]:
         return stops[0][1]
     for (left, low), (right, high) in pairwise(stops):
         if position <= right:
             share = 0.0 if right <= left else (position - left) / (right - left)
+            if smooth:
+                share = share * share * (3.0 - 2.0 * share)
             mixed = (a + (b - a) * share for a, b in zip(low, high, strict=True))
             red, green, blue, alpha = mixed
             return (red, green, blue, alpha)
@@ -117,6 +122,13 @@ class GradientBar(QWidget):
         self._moved = False
         #: 下へ引き出して、離せば消える状態か
         self._removing = False
+        #: 止まりの間を S 字で混ぜるか（:attr:`GradientSpec.smooth`）
+        self._smooth = False
+
+    def set_smooth(self, smooth: bool) -> None:
+        """止まりの間を S 字で混ぜて見せるか 描く所の混ぜ方に合わせないと、見本と絵が食い違う"""
+        self._smooth = smooth
+        self.update()
 
     # --- 値 ---
 
@@ -175,7 +187,9 @@ class GradientBar(QWidget):
         self._paint_checker(painter, track)
         if len(self._stops) >= MIN_GRADIENT_STOPS:
             # 字を塗るのと同じ筆 角度 -90 で左から右へ、長さ 100% で四角の端から端まで
-            paint = Paint(kind="linear", stops=GradientSpec.pack(self._stops), angle=-90.0)
+            # S 字で混ぜるエフェクト（#364）は S 字を細かい止まりで刻んで同じ筆で描く
+            stops = GradientSpec.smoothed(self._stops) if self._smooth else self._stops
+            paint = Paint(kind="linear", stops=GradientSpec.pack(stops), angle=-90.0)
             painter.fillRect(track, gradient_brush(paint, track))
         painter.setPen(QPen(Colors.BORDER, 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -351,7 +365,7 @@ class GradientBar(QWidget):
     def _add_at(self, position: float) -> None:
         if len(self._stops) >= MAX_GRADIENT_STOPS:
             return
-        stop = (position, colour_at(self._stops, position))
+        stop = (position, colour_at(self._stops, position, smooth=self._smooth))
         index = sum(1 for existing in self._stops if existing[0] <= position)
         self._stops.insert(index, stop)
         self._current = index
@@ -387,6 +401,7 @@ class GradientEditor(ParameterEditor):
         super().__init__(spec, parent)
         self._spec = spec
         self._bar = GradientBar(self)
+        self._bar.set_smooth(spec.smooth)
         self._bar.stops_changed.connect(self._on_stops)
         self._bar.selected.connect(lambda _index: self._show_current())
         self._bar.colour_requested.connect(self._choose_colour)

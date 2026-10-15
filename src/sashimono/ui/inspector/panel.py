@@ -488,8 +488,10 @@ class InspectorPanel(QWidget):
             self._native_capable(clip),
             clip.hold_at,
             self._start_maximum(clip),
-            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.effects),
-            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.after_effects),
+            # 欄に出す項目（#364 模様の種類やバーを触ったかで変わる）も入れる 入れないと、
+            # 単色の模様から線形へ替えてもバーが出ない
+            tuple(_effect_layout(effect) for effect in clip.effects),
+            tuple(_effect_layout(effect) for effect in clip.after_effects),
             self._double_click_reset,
             self._stroke_layout(clip),
         )
@@ -511,7 +513,7 @@ class InspectorPanel(QWidget):
         return tuple(
             (
                 stroke.id,
-                tuple((effect.id, effect.kind) for effect in stroke.effects),
+                tuple(_effect_layout(effect) for effect in stroke.effects),
                 STROKE.unused_names(stroke.params),
             )
             for stroke in source.strokes
@@ -1314,12 +1316,15 @@ class InspectorPanel(QWidget):
             # 掛けずに飛ばすので、そのことを言う 黙っていると、値を動かしても絵が変わらない
             section.add_note("このエフェクトは縁取りの層には掛かりません " + STROKE_EFFECT_NOTE)
 
+        unused = definition.unused_names(effect.params)
         for spec in definition.parameters:
+            if spec.name in unused:
+                continue
             if stroke_id is not None:
                 path = ParamPath.of_stroke_effect(clip.id, stroke_id, effect.id, spec.name)
             else:
                 path = ParamPath.of_effect(clip.id, effect.id, spec.name, after=after)
-            self._param_row(section, spec.label, spec, path, effect.params.get(spec.name))
+            self._param_row(section, spec.label, spec, path, _effect_value(effect, spec.name))
         return section
 
     # --- 縁取りの層（#272 #273） ---
@@ -2028,7 +2033,27 @@ class InspectorPanel(QWidget):
             *(effect for stroke in held for effect in stroke.effects),
         )
         effect = next((e for e in both if e.id == owner), None)
-        return effect.params.get(name) if effect is not None else None
+        return _effect_value(effect, name) if effect is not None else None
+
+
+def _effect_layout(effect: Effect) -> tuple[object, ...]:
+    """エフェクトの組の構成（作り直しの指紋 :meth:`InspectorPanel._layout_key`）"""
+    definition = registry.get(effect.kind)
+    unused = definition.unused_names(effect.params) if definition is not None else frozenset()
+    return (effect.id, effect.kind, effect.fixed, unused)
+
+
+def _effect_value(effect: Effect, name: str) -> ParamValue | None:
+    """エフェクトの項目の、欄に出す値
+
+    色の止まりの並びが空（前からの色の項目で塗る #364）なら、前からの項目を並べた物を出す
+    空のまま出すと、バーが既定の白から黒を見せ、触っただけで前からの色が置き換わる
+    """
+    definition = registry.get(effect.kind)
+    spec = definition.spec(name) if definition is not None else None
+    if isinstance(spec, GradientSpec):
+        return spec.shown(effect.params)
+    return effect.params.get(name)
 
 
 def _effect_of(command: Command) -> EffectId | None:
