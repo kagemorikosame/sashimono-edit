@@ -20,7 +20,7 @@ import pytest
 from sashimono.ai import bridge as bridge_module
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, find_operation
+from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.outbound import (
     ASKED,
     DESTINATION,
@@ -622,6 +622,64 @@ class TestUndoWithoutSendingText:
         assert hidden[0] == "無音カット: 3 か所"
         assert "秘密" not in hidden[1]
         assert hidden[2] == f"配置: {TEXT_MARK}"
+
+
+class TestWaitingTools:
+    """待ってから返す道具（:class:`Pending` #321 の detect_scenes など）"""
+
+    @staticmethod
+    def _waiting(steps: list[str], answer: Callable[[EditorHost], object]) -> Operation:
+        def wait(seconds: float) -> bool:
+            del seconds
+            steps.append("待った")
+            return True
+
+        def start(host: EditorHost, _arguments: dict[str, Any]) -> object:
+            steps.append("動いた")
+            return Pending(wait=wait, seconds=1.0, then=lambda: answer(host))
+
+        return Operation(
+            name="waiting",
+            description="",
+            schema={},
+            handler=start,
+            sends=frozenset({Outbound.PROJECT, Outbound.FILES}),
+        )
+
+    def test_consent_is_asked_before_running_and_waiting(self, secret_host: FakeHost) -> None:
+        # 壊れると、待つ道具が同意の前に動き出して待ち、断っても解析や読み込みが走る
+        steps: list[str] = []
+        operation = self._waiting(
+            steps, lambda host: {"media": host.document.project.media[0].name}
+        )
+        bridge = EditorBridge(secret_host)
+
+        def deny(_request: SendRequest) -> SendAnswer:
+            steps.append("尋ねた")
+            return SendAnswer.DENY
+
+        done, box = call_in_thread(bridge, operation, {})
+        answer_sends(bridge, done, deny)
+        assert steps[0] == "尋ねた"
+        assert steps == ["尋ねた", "動いた", "待った"]
+        # 名前と場所は断っても動かし、待った後に返る名前も伏せる
+        assert "結婚式" not in json.dumps(box["result"], ensure_ascii=False)
+
+    def test_what_comes_back_after_waiting_is_hidden_too(self, secret_host: FakeHost) -> None:
+        # 壊れると、待つ前の戻り値だけを伏せ、待った後に返る素材の場所がそのまま外へ出る
+        steps: list[str] = []
+        operation = self._waiting(steps, lambda host: str(host.document.project.media[0].path))
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.DENY})
+        done, box = call_in_thread(bridge, operation, {})
+        answer_sends(bridge, done, _never)
+        assert "秘密の人" not in str(box["result"])
+        assert steps == ["動いた", "待った"]
+
+    def test_detect_scenes_declares_names_and_places(self) -> None:
+        # 壊れると、素材の名前の入った断りの文（映像がありません・調べられませんでした）を、
+        # 名前と場所を断った人の所でも尋ねずに送る
+        assert _operation("detect_scenes").sends == {Outbound.PROJECT, Outbound.FILES}
 
 
 class TestRedact:

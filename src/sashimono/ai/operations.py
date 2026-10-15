@@ -92,7 +92,7 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.projection import project_timeline
-from sashimono.core.timebase import format_timecode
+from sashimono.core.timebase import Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
@@ -109,6 +109,8 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
+from sashimono.engine.cache import SceneState
+from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 
 __all__ = [
     "ASK_USER",
@@ -116,6 +118,7 @@ __all__ = [
     "Choice",
     "ImageResult",
     "Operation",
+    "Pending",
     "QuestionSpec",
     "find_operation",
     "question_spec",
@@ -1015,6 +1018,223 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
         "undo_label": document.undo_label,
         "recent": list(document.history_labels[-10:]),
     }
+
+
+# --- 場面の切り替わり（#319 #321）---
+
+#: 感度（点数のしきい値）として受け付ける範囲 下の端より小さいと、手持ちの揺れや
+#: 圧縮のノイズまで切り替わりに数え、一覧が素材のフレーム数に近づく
+SCENE_THRESHOLD_RANGE = (0.02, 1.0)
+#: 最短の場面（秒）の上限 長くすると、1 つの場面の中の切り替わりを拾えなくなる
+MAX_MIN_SCENE_SECONDS = 600.0
+#: 解析が終わっていないときに待つ秒の既定と上限 待つのは AI のスレッドで、画面は止めない
+#: 上限を置くのは、長い素材で会話が何分も止まったように見えないため 待ちきれなければ
+#: 読んだ所までを返し、続きはもう 1 度呼んで受け取る
+DEFAULT_SCENE_WAIT = 30.0
+MAX_SCENE_WAIT = 120.0
+#: 1 つの切り替わりについて返すタイムラインの位置の数 同じ素材を何十回も置いた
+#: プロジェクトで、1 行が長くなりすぎないため
+MAX_PLACES_PER_CUT = 5
+
+
+@dataclass(frozen=True, slots=True)
+class Pending:
+    """まだ用意できていない物を待ってから返す道具の戻り値（#321）
+
+    道具（``handler``）は画面のスレッドで動くので、そこで待つと待つ間は画面が固まる
+    ブリッジ（:meth:`~sashimono.ai.bridge.EditorBridge.invoke`）が AI のスレッドで
+    ``wait`` を呼んで最長 ``seconds`` 秒待ち、終わったら（か待ちきれなければ）
+    ``then`` を画面のスレッドで呼んで、その戻り値を道具の答えにする
+    """
+
+    #: 用意できるまで最長で引数の秒だけ待ち、できていれば真 どのスレッドから呼んでもよい
+    wait: Callable[[float], bool]
+    seconds: float
+    then: Callable[[], object]
+
+
+@dataclass(frozen=True, slots=True)
+class _SceneQuery:
+    threshold: float
+    min_scene: float
+    start: float | None
+    end: float | None
+    wait: float
+
+
+def _optional_number(
+    arguments: dict[str, Any], key: str, low: float, high: float = math.inf
+) -> float | None:
+    """数の引数 省けば ``None`` 範囲の外・数でない物は、受け付ける範囲を書いて断る
+
+    丸めて受け取らない 0.001 の感度を黙って 0.02 にすると、AI は細かく拾ったつもりで
+    少ない一覧を読む 文字列の数も断る（ほかの道具の真偽値と同じく、型を緩く読まない）
+    """
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ToolError(f"{key} は数で渡してください（{value!r} が来ました）")
+    number = float(value)
+    if not math.isfinite(number) or not low <= number <= high:
+        raise ToolError(f"{key} は {low:g}〜{high:g} で渡してください（{value!r} が来ました）")
+    return number
+
+
+def _number_or(
+    arguments: dict[str, Any], key: str, default: float, low: float, high: float
+) -> float:
+    """省けば ``default`` の数の引数（:func:`_optional_number`）"""
+    number = _optional_number(arguments, key, low, high)
+    return default if number is None else number
+
+
+def _scene_query(arguments: dict[str, Any]) -> _SceneQuery:
+    threshold = _number_or(arguments, "threshold", DEFAULT_THRESHOLD, *SCENE_THRESHOLD_RANGE)
+    min_scene = _number_or(
+        arguments, "min_scene_seconds", DEFAULT_MIN_SCENE, 0.0, MAX_MIN_SCENE_SECONDS
+    )
+    start = _optional_number(arguments, "from_seconds", 0.0)
+    end = _optional_number(arguments, "to_seconds", 0.0)
+    wait = _number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT)
+    if start is not None and end is not None and end <= start:
+        raise ToolError("to_seconds は from_seconds より後にしてください")
+    return _SceneQuery(threshold, min_scene, start, end, wait)
+
+
+def _detect_scenes(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の場面の切り替わりを一覧する 解析が終わっていなければ待ってから返す"""
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    if not media.has_video:
+        raise ToolError(f"{media.name} には映像がありません（場面は映像の切り替わりから探します）")
+    query = _scene_query(arguments)
+    # 頼むのは呼ばれた最初だけ 失敗した素材も、もう 1 度呼ばれたら頼み直す（直した素材のため）
+    host.request_scenes(media)
+    state = host.scene_state(media)
+    if state.complete or not state.running or query.wait <= 0:
+        return _scene_result(host, media, query, state, arguments)
+    media_id = media.id
+
+    def finish() -> object:
+        # 待っている間に素材が外されたら、外したことを伝える 前の素材のまま答えると、
+        # 一覧に無い素材の場面を AI が切りに行く
+        again = _require_media(_project(host), str(media_id))
+        return _scene_result(host, again, query, host.scene_state(again), arguments)
+
+    return Pending(wait=host.scene_waiter(media_id), seconds=query.wait, then=finish)
+
+
+def _scene_result(
+    host: EditorHost,
+    media: MediaItem,
+    query: _SceneQuery,
+    state: SceneState,
+    arguments: dict[str, Any],
+) -> object:
+    if state.signal is None and state.failure is not None:
+        raise ToolError(f"{media.name} の場面を調べられませんでした: {state.failure}")
+    signal = state.signal if state.signal is not None else SceneSignal.empty(complete=False)
+    project = _project(host)
+    stream = _video_stream(media, signal.stream)
+    cuts = signal.cuts(query.threshold, query.min_scene, start=query.start, end=query.end)
+    rows = [
+        {
+            "source_seconds": round(cut.seconds, 3),
+            # 切り替わりはこの時刻と source_seconds の間にある preview_frame で前後を見る目安
+            "after_seconds": round(cut.before, 3),
+            "score": round(cut.score, 3),
+            "timeline": _scene_places(project, media, stream, cut.seconds),
+        }
+        for cut in cuts
+    ]
+    result = _paged(rows, arguments, name="cuts")
+    notes = [str(result.pop("note"))] if "note" in result else []
+    duration = float(media.duration)
+    result |= {
+        "media_id": str(media.id),
+        "complete": signal.complete,
+        "analyzed_seconds": round(min(signal.analyzed, duration), 3),
+        "duration_seconds": round(duration, 3),
+        "threshold": query.threshold,
+        "min_scene_seconds": query.min_scene,
+        # 調べた映像の番号（1 から） 映像が何本もある素材は先頭だけを調べ、timeline には
+        # その映像を出すクリップだけを載せる
+        "video_stream": _video_number(media, stream),
+    }
+    if signal.broken:
+        # 呼び直しても同じ所で止まる 「待てば続きが出る」と読ませると、AI が呼び直し続ける
+        notes.append(
+            f"素材が途中で壊れていて {round(signal.analyzed, 1)} 秒までしか読めませんでした"
+            " 読めた所までの切り替わりを返しました 呼び直しても続きは出ません"
+        )
+    elif not signal.complete:
+        if state.running:
+            notes.append(
+                f"解析の途中です（{round(signal.analyzed, 1)} 秒まで）"
+                " 読んだ所までの切り替わりを返しました"
+                " しばらくしてから同じ引数で呼ぶと続きを返します"
+            )
+        else:
+            notes.append("解析が止まりました もう 1 度呼ぶと解析を頼み直します")
+    elif not rows:
+        notes.append("切り替わりが見つかりません threshold を下げると細かい変化も拾います")
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+def _video_stream(media: MediaItem, wanted: int | None) -> int | None:
+    """クリップが絵を取る映像ストリームの番号（素材の中の ``index``）
+
+    デコーダ（:class:`~sashimono.engine.decode.VideoDecoder`）と同じ決まりにする 素材に無い
+    番号（音声の番号や、前の版の既定の 0）は先頭の映像になる 決まりがずれると、実際に
+    出ている映像と違う映像の切り替わりをクリップへ当てはめる
+    """
+    streams = media.video_streams
+    if not streams:
+        return None
+    if wanted is not None and any(stream.index == wanted for stream in streams):
+        return wanted
+    return streams[0].index
+
+
+def _video_number(media: MediaItem, stream: int | None) -> int | None:
+    """映像の番号（1 から） 音声の番号（``audio``）と同じ数え方"""
+    for number, info in enumerate(media.video_streams, start=1):
+        if info.index == stream:
+            return number
+    return None
+
+
+def _scene_places(
+    project: Project, media: MediaItem, stream: int | None, seconds: float
+) -> list[dict[str, Any]]:
+    """素材の ``seconds`` の絵が出る、今のタイムラインの位置（フレーム）
+
+    その位置をそのまま preview_frame へ渡せるように返す 絵を描くクリップだけを見る
+    （音だけのクリップの位置では、その場面は見えない） 調べた映像（``stream``）とは
+    別の映像を出すクリップも外す（PR #358 の Codex の指摘 その絵には同じ切り替わりが無い）
+    1 枚目を CEIL で取るのは、新しい場面の最初の絵が出るフレームにするため
+    """
+    moment = Fraction(str(seconds))
+    places: list[dict[str, Any]] = []
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.media_id != media.id or not project.draws_picture(track, clip):
+                continue
+            if _video_stream(media, clip.stream_index) != stream:
+                continue
+            if moment < clip.source_in or (clip.hold_at is not None and moment > clip.hold_at):
+                continue
+            offset = seconds_to_frame(
+                (moment - clip.source_in) / clip.speed, project.rate, Rounding.CEIL
+            )
+            frame = clip.timeline_start + offset
+            if frame >= clip.timeline_end:
+                continue
+            places.append({"clip_id": str(clip.id), "frame": frame})
+    return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
 
 
 # --- 変更 ---
@@ -2053,6 +2273,44 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_preview_frame,
         sends=_WITH_FRAMES,
+    ),
+    Operation(
+        name="detect_scenes",
+        description=(
+            "素材（動画）の場面の切り替わり（カット）の位置を一覧する フレーム間の差から"
+            "探すので、映像を 1 枚ずつ見るより速い 見つけた位置の前後だけを preview_frame で"
+            "確かめる 位置は素材の秒（source_seconds）で、切り替わりは after_seconds との間に"
+            "ある timeline はその場面の最初の絵が出るタイムラインのフレーム（preview_frame へ"
+            "そのまま渡せる 今のタイムラインに置いていなければ空） 解析は素材を読み込んだときに"
+            "裏で始まり、結果は覚える 終わっていなければ wait_seconds まで待ち、それでも"
+            "終わらなければ読んだ所までを返す（complete が false） 映像が何本もある素材は"
+            "先頭の映像（video_stream）を調べ、timeline にはその映像を出すクリップだけを載せる"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "threshold": _number(
+                    f"感度 {SCENE_THRESHOLD_RANGE[0]:g}〜{SCENE_THRESHOLD_RANGE[1]:g}"
+                    f"（既定 {DEFAULT_THRESHOLD:g}） 小さいほど小さな変化も切り替わりに数える"
+                    " 一覧の score がこれ以上の所を返す"
+                ),
+                "min_scene_seconds": _number(
+                    f"最短の場面の秒（既定 {DEFAULT_MIN_SCENE:g}） これより近い切り替わりは"
+                    "強い方だけ残す フラッシュなどで 2 回続けて拾うのを防ぐ"
+                ),
+                "from_seconds": _number("この素材の秒から後の切り替わりだけ"),
+                "to_seconds": _number("この素材の秒より前の切り替わりだけ"),
+                "wait_seconds": _number(
+                    f"解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 0 なら待たずに読んだ所までを返す"
+                ),
+                **_paging(),
+            },
+            ["media_id"],
+        ),
+        handler=_detect_scenes,
+        sends=_WITH_FILES,
     ),
     Operation(
         name="get_app_settings",

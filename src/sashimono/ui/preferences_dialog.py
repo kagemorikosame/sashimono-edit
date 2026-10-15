@@ -42,6 +42,7 @@ from sashimono.engine.encode import (
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
+from sashimono.engine.scenes import MEASURED_SCENE_SECONDS
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
@@ -60,6 +61,9 @@ from sashimono.ui.workspace import (
     INSERT_TARGET_TRACKS,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
+    SCENES_ALWAYS,
+    SCENES_ON_DEMAND,
+    SCENES_WITH_AI,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -75,6 +79,8 @@ __all__ = [
     "PREFETCH_BUDGETS",
     "PROXY_HEIGHTS",
     "QUALITY_DIVISORS",
+    "SCENE_ANALYSIS_CHOICES",
+    "SCENE_THREADS",
     "PreferencesDialog",
 ]
 
@@ -122,6 +128,22 @@ DECODE_THREADS: tuple[tuple[str, int], ...] = (
     ("2 本まで", 2),
     ("4 本まで（既定）", 4),
     ("8 本まで", 8),
+)
+
+
+#: 読み込んだときに場面を調べるか（:attr:`Preferences.scene_analysis`）
+SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
+    (SCENES_WITH_AI, "AI アシスタントが入っているときだけ（既定）"),
+    (SCENES_ALWAYS, "いつも調べる"),
+    (SCENES_ON_DEMAND, "調べない（AI が頼んだときだけ）"),
+)
+
+#: 場面を調べるのに使うデコードのスレッドの数 0 はすべて 名前の（）の前は実測の説明にも使う
+SCENE_THREADS: tuple[tuple[str, int], ...] = (
+    ("1 本（いちばん軽い）", 1),
+    ("2 本（既定）", 2),
+    ("4 本", 4),
+    ("すべて（いちばん速い）", 0),
 )
 
 
@@ -765,6 +787,35 @@ class PreferencesDialog(QDialog):
         )
         sends_note.setWordWrap(True)
         form.addRow(sends_note)
+        self._scene_analysis = QComboBox(self)
+        for value, text in SCENE_ANALYSIS_CHOICES:
+            self._scene_analysis.addItem(text, value)
+        self._scene_analysis.setCurrentIndex(
+            max(0, self._scene_analysis.findData(preferences.scene_analysis))
+        )
+        self._scene_analysis.setToolTip(
+            "素材を読み込んだときと、プロジェクトを開いたときに、動画の場面の切り替わりを"
+            "裏で調べて覚えておくか AI アシスタントが「場面ごとに切る」などで使う "
+            "覚えた結果は次からは読み直さない（素材を差し替えたら調べ直す） "
+            "素材を全フレーム読むので、長い動画では CPU をしばらく使う "
+            "「作らない」でも、AI が頼んだ素材はその場で調べる（終わるまで AI が待つ）"
+        )
+        form.addRow("読み込んだときに場面を調べる", self._scene_analysis)
+
+        self._scene_threads = QComboBox(self)
+        for label, threads in SCENE_THREADS:
+            self._scene_threads.addItem(label, threads)
+        self._select(self._scene_threads, preferences.scene_threads)
+        self._scene_threads.setToolTip(
+            "場面を調べるときに、動画のデコードに使うスレッドの数 多いほど早く終わるが、"
+            "その間は編集と再生に回る CPU が減る 4K 30fps の 154 秒の動画での実測は "
+            + " ／ ".join(
+                f"{label.split('（')[0]} {MEASURED_SCENE_SECONDS[threads]:g} 秒"
+                for label, threads in SCENE_THREADS
+            )
+            + "（論理 20 コアの機械） 次に調べる素材から効く"
+        )
+        form.addRow("場面を調べるのに使う CPU", self._scene_threads)
 
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
@@ -947,6 +998,8 @@ class PreferencesDialog(QDialog):
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),
             ai_send_files=self._send_value(Outbound.FILES),
+            scene_analysis=str(self._scene_analysis.currentData()),
+            scene_threads=int(self._scene_threads.currentData()),
         )
 
     def _send_value(self, kind: Outbound) -> str:

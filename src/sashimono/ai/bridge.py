@@ -21,12 +21,19 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.operations import ImageResult, Operation, QuestionSpec, find_operation
+from sashimono.ai.operations import (
+    ImageResult,
+    Operation,
+    Pending,
+    QuestionSpec,
+    find_operation,
+)
 from sashimono.ai.outbound import (
     ASKED,
     Outbound,
@@ -55,6 +62,10 @@ APPROVAL_TIMEOUT = 600.0
 #: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 用意を待つ道具（:class:`~sashimono.ai.operations.Pending`）が 1 回に待つ長さ（秒）
+#: 中断のボタンが効くまでの遅れの上限になる
+WAIT_SLICE = 0.2
 
 
 @dataclass(slots=True)
@@ -187,7 +198,34 @@ class EditorBridge:
             return self._run_irreversible(operation, arguments)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
-        return self.call(lambda: self._run(operation, arguments))
+        return self._execute(operation, arguments)
+
+    def _execute(self, operation: Operation, arguments: dict[str, Any]) -> object:
+        """道具を画面のスレッドで動かし、待つ物（:class:`Pending`）なら待ってから仕上げる
+
+        仕上げ（``then``）の戻り値も、外へ送ってよい形にする（:meth:`_run`） 待つ前の
+        戻り値だけを伏せると、待った後に返る名前や本文がそのまま送られる
+        同意（:meth:`_agree_to_send`）は :meth:`invoke` の頭で取り終えている 待つ前に効く
+        """
+        result = self.call(lambda: self._run(operation, lambda: operation(self._host, arguments)))
+        if isinstance(result, Pending):
+            # 待つのはこの（AI の）スレッド 画面のスレッドは待つ間も動き続ける
+            self._wait(result)
+            finish = result.then
+            return self.call(lambda: self._run(operation, finish))
+        return result
+
+    def _wait(self, pending: Pending) -> None:
+        """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
+
+        少しずつ区切って待つのは、中断のボタンを待つ間にも効かせるため 区切らずに
+        上限（最長 2 分）まで待つと、押しても止まらない
+        """
+        deadline = time.monotonic() + max(0.0, pending.seconds)
+        while not self._cancel.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
+                return
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
@@ -212,7 +250,7 @@ class EditorBridge:
             raise ToolError(
                 "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
             )
-        return self.call(lambda: self._run(operation, arguments))
+        return self._execute(operation, arguments)
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""
@@ -300,7 +338,7 @@ class EditorBridge:
                 "「AI へ送る物」で変えてもらうよう伝えてください 同じ道具を何度も呼ばないでください"
             )
 
-    def _run(self, operation: Operation, arguments: dict[str, Any]) -> object:
+    def _run(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、外へ送ってよい形にして返す 編集画面のスレッドで呼ぶ
 
         名前と場所を送らないなら、結果とエラーの文の中を伏せ字にする 宣言していない
@@ -313,7 +351,7 @@ class EditorBridge:
             # 動かす前の文も表に入れる 取り消すと、取り消した操作が足した文は作品から消える
             texts = text_secrets(self._host.document.project)
         try:
-            result = self._guarded(operation, arguments)
+            result = self._guarded(operation, work)
         except ToolError as exc:
             if texts is None:
                 raise
@@ -324,11 +362,11 @@ class EditorBridge:
         after = text_secrets(self._host.document.project)
         return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
 
-    def _guarded(self, operation: Operation, arguments: dict[str, Any]) -> object:
+    def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""
         hide = not self.may_send(Outbound.FILES)
         try:
-            result = operation(self._host, arguments)
+            result = work()
         except (ToolError, ValueError, KeyError) as exc:
             if not hide:
                 raise
