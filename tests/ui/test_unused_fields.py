@@ -102,9 +102,11 @@ class TestText:
         assert "timer_length" in counting
 
     def test_vertical_text_hides_the_line_alignment(self, panel: InspectorPanel) -> None:
+        # 組み方は縦書きでも出す AviUtl2 の組み方の縦書きは字の送りと置き方が変わる（#312 の続き）
+        # 隠すと、読み込んだ縦書きの字幕を標準の組み方へ戻す手が無い
         shown = _shown(panel, TEXT.create(vertical=True))
-        assert "align" not in shown and "layout" not in shown
-        assert {"anchor", "valign"} <= shown
+        assert "align" not in shown
+        assert {"anchor", "valign", "layout"} <= shown
 
     def test_colours_come_back_with_their_width(self, panel: InspectorPanel) -> None:
         # 太さや影のずらしを入れた・キーフレームで動かしたら色の欄が出る

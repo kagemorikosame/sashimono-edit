@@ -42,6 +42,7 @@ from sashimono.core.model.stroke import (
     Stroke,
     legacy_in_use,
     legacy_stroke,
+    uses_gradient,
 )
 from sashimono.core.model.timeline import (
     FILTER_KIND,
@@ -124,4 +125,5 @@ __all__ = [
     "new_stroke_id",
     "new_track_id",
     "plays_sound",
+    "uses_gradient",
 ]

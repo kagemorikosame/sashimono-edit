@@ -39,6 +39,7 @@ from sashimono.effects import (
     FileSpec,
     FontSpec,
     FontStyleSpec,
+    GradientSpec,
     GridSpec,
     ParameterSpec,
     SelectSpec,
@@ -856,4 +857,9 @@ def create_editor(spec: ParameterSpec, parent: QWidget | None = None) -> Paramet
         return FileEditor(spec, parent)
     if isinstance(spec, GridSpec):
         return GridEditor(spec, parent)
+    if isinstance(spec, GradientSpec):
+        # バーはこの欄の共通の親（ParameterEditor）を使うので、上で読むと互いを読み合う
+        from sashimono.ui.inspector.gradient import GradientEditor
+
+        return GradientEditor(spec, parent)
     return ValueEditor(spec, parent)

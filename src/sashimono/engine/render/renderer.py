@@ -2396,7 +2396,6 @@ class FrameRenderer:
             audio_rate=heard[1] if heard is not None else 44100,
             trail_paths=self._trail_paths,
             scale=scale,
-            screen=canvas,
             stroke_effects=stroke_effects,
         )
         if image is not None and baked and not gpu:

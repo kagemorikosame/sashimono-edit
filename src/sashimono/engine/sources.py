@@ -61,6 +61,7 @@ from sashimono.engine.audio_shapes import (
     waveform_cells,
     waveform_points,
 )
+from sashimono.engine.fills import Paint, gradient_brush, paint_of
 from sashimono.engine.motion_shapes import (
     TrailPath,
     TrailPaths,
@@ -143,7 +144,6 @@ def render_source_framed(
     audio_rate: int = 44100,
     trail_paths: TrailPaths | None = None,
     scale: tuple[float, float] = (1.0, 1.0),
-    screen: tuple[int, int] | None = None,
     stroke_effects: StrokeEffects | None = None,
 ) -> tuple[np.ndarray | None, Frame | None]:
     """:func:`render_source` と同じ絵と、オブジェクトの枠
@@ -157,9 +157,6 @@ def render_source_framed(
     値を 1 つずつ縮めるのではなく描く座標ごと縮めるのは、文字の中の制御文字
     （``<s大きさ>``）のように設定の欄に無い画素の値まで漏れなく縮めるため
     枠も絵の画素で返す
-
-    ``screen`` は広げる前の大きさ（合成の画素 :func:`source_canvas` に渡した物）
-    絵がそれより大きければ、文字の影は影の周りだけで作る（:func:`_shadow_layer`）
 
     ``stroke_effects`` は縁取りの層の絵にその層のエフェクトを掛ける手（#273）
     エフェクトは GPU のシェーダなので、ここでは持たずにレンダラから受け取る 渡さなければ
@@ -186,7 +183,6 @@ def render_source_framed(
     # 巻き込んで捨てないように） 無ければ移動軌跡を描くときだけその場で作る
     # （文字や普通の図形のたびに作らない）
     values["_trail_paths"] = trail_paths
-    values["_crop_shadow"] = screen is not None and (width > screen[0] or height > screen[1])
     image = QImage(width, height, QImage.Format.Format_RGBA8888)
     image.fill(Qt.GlobalColor.transparent)
 
@@ -448,7 +444,7 @@ def _text_reach(items: tuple[tuple[str, object], ...]) -> Frame | None:
         shift_x = _number(look, "shadow_x", 0.0)
         shift_y = _number(look, "shadow_y", 0.0)
         blur = max(0.0, _number(look, "shadow_blur", 0.0))
-        if (shift_x, shift_y, blur) != (0.0, 0.0, 0.0) and _color(look.get("shadow_color")).alpha():
+        if (shift_x, shift_y, blur) != (0.0, 0.0, 0.0) and _shadow_visible(look):
             # 箱ぼかしを 2 回掛けるので、影はぼかしの幅の 2 倍まで広がる（:func:`_blur_alpha`）
             spread = 2.0 * blur + 1.0
             shadow = inked.translated(shift_x, -shift_y)
@@ -595,33 +591,248 @@ _AVIUTL_BOLD = 1.0 / 48.0
 _Layer = tuple[QPainterPath, dict[str, object], QPainterPath | None]
 
 
+@dataclass(frozen=True)
+class _Cell:
+    """字 1 つの置き場 グラデーションを 1 行ごと・1 文字ごとに掛け直すのに使う（#312）
+
+    組み方（標準・縦書き・AviUtl2）ごとに字を置く所で作る 描いた輪郭から行や字を後で
+    切り分けると、1 つの字が別々の輪郭（点や払い）に分かれていて、どこまでが 1 字か分からない
+    """
+
+    #: 何行目か（縦書きは何列目か）
+    line: int
+    #: 送り幅 x 行の高さ（縦書きは列の幅 x 送り）
+    cell: QRectF
+    #: 字の輪郭を囲む四角 空白は空
+    ink: QRectF
+
+
+#: 掛け直す単位の帯の端（描く座標） 帯は平面を隙間なく分けるので、端の行と字は外へ伸ばす
+_FAR = 1.0e7
+
+
+class _Bases:
+    """グラデーションの基準 字の枠全体・1 行ごと・1 文字ごとの、塗る帯と基準の四角（#312）
+
+    行と字は、隣との間の真ん中で平面を帯に分ける 帯で切って塗るので、字の輪郭が送り幅から
+    はみ出した所（斜体・払い）も、どれか 1 つの帯に入って抜けない 基準の四角は帯ではなく
+    行や字の輪郭を囲む四角にする（字の形の中でグラデーションが端から端まで出る）
+    """
+
+    def __init__(
+        self,
+        box: QRectF,
+        cells: list[_Cell],
+        vertical: bool,
+        line_inks: dict[int, QRectF] | None = None,
+    ) -> None:
+        self.box = box
+        self._cells = cells
+        self._vertical = vertical
+        self._line_inks = line_inks
+        self._units: dict[str, list[tuple[QRectF | None, QRectF]]] = {}
+
+    def shifted(self, dx: float, dy: float) -> _Bases:
+        """同じ基準を ``(dx, dy)`` だけずらした物 影は字と同じ帯と四角を影の所で使う"""
+        cells = [
+            _Cell(cell.line, cell.cell.translated(dx, dy), cell.ink.translated(dx, dy))
+            for cell in self._cells
+        ]
+        inks = (
+            {line: ink.translated(dx, dy) for line, ink in self._line_inks.items()}
+            if self._line_inks is not None
+            else None
+        )
+        return _Bases(self.box.translated(dx, dy), cells, self._vertical, inks)
+
+    def units(self, basis: str) -> list[tuple[QRectF | None, QRectF]]:
+        """``basis`` の単位ごとの（塗る帯, 基準の四角） 帯が ``None`` なら切らずに塗る"""
+        if basis not in ("line", "char") or not self._cells:
+            return [(None, self.box)]
+        found = self._units.get(basis)
+        if found is None:
+            found = self._split(basis)
+            self._units[basis] = found
+        return found
+
+    def _cross(self, rect: QRectF) -> tuple[float, float]:
+        """行を並べる向きの範囲（横書きは縦、縦書きは横）"""
+        return (rect.left(), rect.right()) if self._vertical else (rect.top(), rect.bottom())
+
+    def _flow(self, rect: QRectF) -> tuple[float, float]:
+        """字を並べる向きの範囲"""
+        return (rect.top(), rect.bottom()) if self._vertical else (rect.left(), rect.right())
+
+    def _band(self, cross: tuple[float, float], flow: tuple[float, float]) -> QRectF:
+        if self._vertical:
+            return QRectF(QPointF(cross[0], flow[0]), QPointF(cross[1], flow[1]))
+        return QRectF(QPointF(flow[0], cross[0]), QPointF(flow[1], cross[1]))
+
+    @staticmethod
+    def _cuts(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        """並んだ範囲を、隣との間の真ん中で区切った帯 端は外へ伸ばす"""
+        cuts: list[tuple[float, float]] = []
+        for index, (low, high) in enumerate(spans):
+            start = -_FAR if index == 0 else (spans[index - 1][1] + low) / 2.0
+            end = _FAR if index == len(spans) - 1 else (high + spans[index + 1][0]) / 2.0
+            cuts.append((start, end))
+        return cuts
+
+    def _split(self, basis: str) -> list[tuple[QRectF | None, QRectF]]:
+        lines: dict[int, list[_Cell]] = {}
+        for cell in self._cells:
+            lines.setdefault(cell.line, []).append(cell)
+        spans: list[tuple[int, tuple[float, float]]] = []
+        for line, cells in lines.items():
+            ranges = [self._cross(cell.cell) for cell in cells]
+            spans.append((line, (min(r[0] for r in ranges), max(r[1] for r in ranges))))
+        spans.sort(key=lambda item: item[1][0])
+        units: list[tuple[QRectF | None, QRectF]] = []
+        for (line, _span), cross in zip(spans, self._cuts([s for _, s in spans]), strict=True):
+            inked = [cell for cell in lines[line] if not cell.ink.isEmpty()]
+            if not inked:
+                continue
+            if basis == "line":
+                ink = QRectF()
+                for cell in inked:
+                    ink = ink.united(cell.ink)
+                if self._line_inks is not None and line in self._line_inks:
+                    ink = self._line_inks[line]
+                units.append((self._band(cross, (-_FAR, _FAR)), ink))
+                continue
+            inked.sort(key=lambda cell: self._flow(cell.cell)[0])
+            flows = self._cuts([self._flow(cell.cell) for cell in inked])
+            units.extend(
+                (self._band(cross, flow), cell.ink) for cell, flow in zip(inked, flows, strict=True)
+            )
+        return units or [(None, self.box)]
+
+
+#: 塗る物 単色の色か、グラデーションと掛ける不透明度
+_Fill = QColor | tuple[Paint, float]
+
+
+def _fill_of(look: Mapping[str, object], prefix: str, colour: str) -> _Fill:
+    """``look`` の ``prefix`` の塗り 単色なら ``colour`` の項目の色"""
+    paint = paint_of(look, prefix)
+    return _color(look.get(colour)) if paint is None else (paint, 1.0)
+
+
+def _fill_painted(
+    painter: QPainter,
+    path: QPainterPath,
+    fill: _Fill,
+    bases: _Bases,
+    clip: QPainterPath | None,
+) -> None:
+    """``path`` を ``fill`` で塗る グラデーションは基準の単位ごとに帯で切って塗り分ける"""
+    if isinstance(fill, QColor):
+        _fill_within(painter, path, fill, clip)
+        return
+    paint, opacity = fill
+    for band, ink in bases.units(paint.basis):
+        brush = gradient_brush(paint, ink, opacity)
+        if band is None:
+            _fill_within(painter, path, brush, clip)
+            continue
+        painter.save()
+        if clip is not None:
+            painter.setClipPath(clip)
+        painter.setClipRect(
+            band,
+            Qt.ClipOperation.IntersectClip if clip is not None else Qt.ClipOperation.ReplaceClip,
+        )
+        painter.fillPath(path, brush)
+        painter.restore()
+
+
 def _draw_text(
     painter: QPainter, values: dict[str, object], width: int, height: int
 ) -> Frame | None:
     """横書きと縦書きを描き分ける AviUtl2 の組み方なら文字の枠を返す"""
-    laid = _text_layers(values, width, height)
+    cells: list[_Cell] | None = [] if _uses_units(values) else None
+    laid = _text_layers(values, width, height, cells)
     if laid is None:
         return None
     layers, framed = laid
-    _paint_layers(painter, layers)
+    box = _glyph_box(layers, framed)
+    line_inks: dict[int, QRectF] | None = None
+    if _uses_gradient(values) and _number(values, "reveal", 100.0) < 100.0:
+        # 文字送りの途中でも、全部を出した字の枠で塗る 出ている字の枠で塗ると、1 文字
+        # 出るたびにグラデーションが伸び縮みして、出た字の色が変わっていく
+        # 1 行ごとのときも行の全部の字の枠で塗る 1 文字ごとは出た字そのものの枠なので変わらない
+        whole_cells: list[_Cell] | None = [] if cells is not None else None
+        whole = _text_layers({**values, "reveal": 100.0}, width, height, whole_cells)
+        if whole is not None:
+            box = _glyph_box(*whole)
+        if whole_cells:
+            line_inks = {}
+            for cell in whole_cells:
+                if not cell.ink.isEmpty():
+                    line_inks[cell.line] = line_inks.get(cell.line, QRectF()).united(cell.ink)
+    vertical = bool(values.get("vertical", False))
+    _paint_layers(painter, layers, _Bases(box, cells or [], vertical, line_inks))
     return framed
 
 
+#: 塗りの項目の頭 字の塗り・影の塗り・縁取りの層の塗り（:mod:`sashimono.effects.fills`）
+_FILL, _SHADOW_FILL, _STROKE_FILL = "fill", "shadow_fill", "fill"
+
+
+def _uses_gradient(values: Mapping[str, object]) -> bool:
+    """字の塗り・影・縁取りの層のどれかがグラデーションか"""
+    if paint_of(values, _FILL) is not None or paint_of(values, _SHADOW_FILL) is not None:
+        return True
+    strokes = values.get("strokes")
+    return isinstance(strokes, tuple) and any(
+        isinstance(ring, _Ring) and ring.paint is not None for ring in strokes
+    )
+
+
+def _uses_units(values: Mapping[str, object]) -> bool:
+    """字の塗り・影・縁取りの層のどれかが、1 行ごとか 1 文字ごとのグラデーションか
+
+    そのときだけ字の置き場（:class:`_Cell`）を集める 集めるには字を 1 つずつ組み直すので、
+    使わない字幕で毎回払わない
+    """
+    paints = [paint_of(values, _FILL), paint_of(values, _SHADOW_FILL)]
+    strokes = values.get("strokes")
+    if isinstance(strokes, tuple):
+        paints.extend(ring.paint for ring in strokes if isinstance(ring, _Ring))
+    return any(paint is not None and paint.basis != "box" for paint in paints)
+
+
+def _glyph_box(layers: list[_Layer], framed: Frame | None) -> QRectF:
+    """グラデーションの基準にする字の枠（描く座標） 字の輪郭すべてを囲む四角
+
+    AviUtl2 の組み方は文字の枠も含める エフェクトの入れ物（字の色の付いた所と文字の枠を
+    合わせた物）と同じ範囲にしておくと、「模様で塗る」から写した塗りが同じ所に出る
+    """
+    box = QRectF()
+    for path, _look, _clip in layers:
+        box = box.united(path.boundingRect())
+    if framed is not None:
+        box = box.united(QRectF(QPointF(framed[0], framed[1]), QPointF(framed[2], framed[3])))
+    return box
+
+
 def _text_layers(
-    values: dict[str, object], width: int, height: int
+    values: dict[str, object], width: int, height: int, cells: list[_Cell] | None = None
 ) -> tuple[list[_Layer], Frame | None] | None:
     """字を組んで、描く層と文字の枠を返す 字が無ければ ``None``
 
     組むのと塗るのを分けておくのは、描く前に字の広がりを測るため（:func:`source_canvas`）
     同じ組み方を 2 つ書くと、測った広がりと描いた字が食い違って端が切れる
+    ``cells`` を渡すと、字 1 つずつの置き場（:class:`_Cell`）をそこへ足す
     """
     raw = str(values.get("text", ""))
     if str(values.get("timer_format", "")):
         raw = timer_text(values)[:200]
 
-    # 縦書きは AviUtl2 で測っていないので、AviUtl2 の組み方でも標準の縦書きで描く
-    # （枠は返さず、太字も Qt に任せる） ここで外さないと、Qt の太字を切ったまま
-    # 自分で太らせる横書きの処理も通らず、太字が細字で出る
+    # 縦書きは縦書きの道（:func:`_vertical_text_path`）で描く AviUtl2 の組み方の縦書きは、
+    # 字の送り・列の幅・字の置き方だけを AviUtl2 に合わせる（2026-10-15 に測った）
+    # 枠は返さず、太字も Qt に任せる（縦書きの太字と枠は測っていない） ここで外さないと、
+    # Qt の太字を切ったまま自分で太らせる横書きの処理も通らず、太字が細字で出る
     aviutl = values.get("layout") == "aviutl" and not bool(values.get("vertical", False))
     bold = bool(values.get("bold", False))
     size = max(1, int(float(values.get("size", 64))))  # type: ignore[arg-type]
@@ -634,7 +845,9 @@ def _text_layers(
         centre_x = width / 2.0 + _number(values, "pos_x", 0.0)
         centre_y = height / 2.0 - _number(values, "pos_y", 0.0)
         family = aviutl_font_family(str(values.get("font", AVIUTL_DEFAULT_FONT)))
-        groups, framed = _aviutl_lines(tagged, family, size, bold, values, centre_x, centre_y)
+        groups, framed = _aviutl_lines(
+            tagged, family, size, bold, values, centre_x, centre_y, cells
+        )
         return _group_layers(groups, values), framed
 
     text = _revealed(raw, values)
@@ -654,8 +867,10 @@ def _text_layers(
         # 送っている途中で英単語が行をまたいで飛ぶ
         text = _revealed(_wrapped(raw, wrap_width, metrics, values), values)
     if bool(values.get("vertical", False)):
-        vertical = _vertical_text_path(text, font, metrics, values, width, height)
-        return [(vertical, values, None)], None
+        vertical, column_frame = _vertical_text_path(
+            text, font, metrics, values, width, height, cells
+        )
+        return [(vertical, values, None)], column_frame
 
     lines = text.split(chr(10))
     centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
@@ -705,12 +920,31 @@ def _text_layers(
         baseline = top + line_height * index + metrics.ascent()
         placed = QPainterPath()
         placed.addText(QPointF(x, baseline), font, line)
+        drift = 0.0
         if emboldened:
             plain = QPainterPath()
             plain_x = start(plain_metrics.horizontalAdvance(line), plain_widest)
             plain.addText(QPointF(plain_x, baseline), plain_font, line)
-            placed.translate(_bold_drift(plain, placed), 0.0)
+            drift = _bold_drift(plain, placed)
+            placed.translate(drift, 0.0)
         path.addPath(placed)
+        if cells is not None:
+            # 字の置き場は行の頭からの送り幅で測る 行を 1 度に組んだ字と同じ所に来る
+            # （字と字の詰め（カーニング）の分だけずれうるが、帯は字の間の真ん中で切るので抜けない）
+            consumed = ""
+            for part in graphemes(line):
+                before = metrics.horizontalAdvance(consumed)
+                consumed += part
+                step = metrics.horizontalAdvance(consumed) - before
+                glyph = QPainterPath()
+                glyph.addText(QPointF(x + before + drift, baseline), font, part)
+                cells.append(
+                    _Cell(
+                        index,
+                        QRectF(x + before + drift, top + line_height * index, step, line_height),
+                        glyph.boundingRect(),
+                    )
+                )
 
     return [(path, values, None)], None
 
@@ -889,8 +1123,11 @@ def _aviutl_lines(
     values: dict[str, object],
     centre_x: float,
     centre_y: float,
+    cells: list[_Cell] | None = None,
 ) -> tuple[list[_Group], Frame]:
     """AviUtl2 の組み方で行を並べ、見た目ごとの字の輪郭と文字の枠を返す
+
+    ``cells`` を渡すと字の置き場（送り幅 x 行送り）を足す
 
     AviUtl2 に描かせて測った決まり（#64 の見本 ``kumiki_p8_t_*``）
 
@@ -978,7 +1215,7 @@ def _aviutl_lines(
     frame = QPainterPath()
     frame.addRect(QRectF(left, top, widest, block_height))
     line_top = top
-    for parts, advance, pitch, ascent, after in laid:
+    for line_index, (parts, advance, pitch, ascent, after) in enumerate(laid):
         x = left + (widest - advance) * {"left": 0.0, "right": 1.0}.get(align, 0.5)
         baseline = line_top + ascent
         # 1 文字ずつ置く 太字の分だけ送り幅を広げるのは文字ごとで、行をまとめて
@@ -993,6 +1230,22 @@ def _aviutl_lines(
                 glyph = QPainterPath()
                 glyph.addText(QPointF(x, baseline), font, part)
                 target.addPath(_shaped(glyph, x + step / 2.0, line_top + pitch / 2.0, shape))
+            if cells is not None:
+                ink = QPainterPath()
+                ink.addText(QPointF(x, baseline), font, part)
+                if not plain:
+                    ink = _shaped(ink, x + step / 2.0, line_top + pitch / 2.0, shape)
+                # 太字は輪郭を外へ太らせるので、その分だけ字の枠も広げる
+                grow = look.embolden
+                cells.append(
+                    _Cell(
+                        line_index,
+                        QRectF(x, line_top, step, pitch),
+                        ink.boundingRect().adjusted(-grow, -grow, grow, grow)
+                        if not ink.isEmpty()
+                        else QRectF(),
+                    )
+                )
             x += step
         line_top += pitch + after
 
@@ -1129,41 +1382,85 @@ def _vertical_text_path(
     values: dict[str, object],
     width: int,
     height: int,
-) -> QPainterPath:
-    """縦書きの字の輪郭 行は右から左へ並べる
+    cells: list[_Cell] | None = None,
+) -> tuple[QPainterPath, Frame | None]:
+    """縦書きの字の輪郭と、文字の枠（AviUtl2 の組み方だけ ほかは ``None``） 行は右から左へ並べる
 
     Qt に縦書きの組版は無いので、1 文字ずつ縦に置く 日本語のテロップでは
     使う場面がはっきりあるので、簡素でも入れておく
+    ``cells`` を渡すと字の置き場を足す（列が行、送りが字の高さ）
     """
     columns = text.split(chr(10))
-    advance = metrics.height() + float(values.get("letter_spacing", 0.0))  # type: ignore[arg-type]
-    column_width = metrics.height() + float(values.get("line_spacing", 0.0))  # type: ignore[arg-type]
+    # AviUtl2 の組み方の縦書きは、字の升目も列の幅も字の大きさ（2026-10-15 に AviUtl2 v2.1.6a で
+    # Yu Gothic UI 80 を測ると、送りも列の間も 80 だった 標準の組み方は行の高さ 106）
+    # 字間と行間は字と字・列と列の間にだけ入る（字間 20 の 7 字の列は 680 で、真ん中の揃えの
+    # 塊の上端が字間 0 より 20 ではなく 60 上がった 列の間も同じ） 字は升目の縦の真ん中に字の
+    # 輪郭の真ん中を合わせる（基準線では置かない g の下がりが升目の上へ寄り、H は升目の上から
+    # 12 画素だった） 横は字間を足す前の送り幅の真ん中を列の真ん中に合わせる（字間 20 でも列の
+    # 字の横の位置は字間 0 と同じだった） 標準の組み方は前からどおり（基準線で置き、送りと列の幅に
+    # 字間と行間を足し、塊は送りの数で測る）
+    aviutl = values.get("layout") == "aviutl"
+    letter = _number(values, "letter_spacing", 0.0)
+    line = _number(values, "line_spacing", 0.0)
+    pitch = _number(values, "size", 64.0) if aviutl else metrics.height()
+    advance = pitch + letter
+    column_width = pitch + line
 
-    centre_x = width / 2.0 + float(values.get("pos_x", 0.0))  # type: ignore[arg-type]
-    centre_y = height / 2.0 - float(values.get("pos_y", 0.0))  # type: ignore[arg-type]
+    centre_x = width / 2.0 + _number(values, "pos_x", 0.0)
+    centre_y = height / 2.0 - _number(values, "pos_y", 0.0)
     # 1 字ずつ縦に置く 1 字は見た目の 1 字（結合文字や絵文字を割らない）
-    cells = [graphemes(column) for column in columns]
-    tallest = max((len(column) for column in cells), default=0)
+    glyphs = [graphemes(column) for column in columns]
+    tallest = max((len(column) for column in glyphs), default=0)
+
+    def length(count: int) -> float:
+        """``count`` 字の列の長さ AviUtl2 は字間を字と字の間にだけ数える"""
+        if aviutl:
+            return count * pitch + max(count - 1, 0) * letter
+        return count * advance
+
     # 塊の基準は横書きと同じ ``anchor`` と ``valign`` 既定（中・中）は塊の真ん中が位置で、
     # 前の置き方と同じ 見ずにいると、左上を基準にした縦書きも真ん中に置かれる
-    block_width = column_width * len(columns)
+    count = len(columns)
+    block_width = count * pitch + max(count - 1, 0) * line if aviutl else column_width * count
     block_left = centre_x - block_width * _HORIZONTAL_SHARE.get(
         str(values.get("anchor", "center")), 0.5
     )
     # 右端の列の真ん中 列は右から左へ並ぶ
-    left = block_left + block_width - column_width / 2.0
-    top = centre_y - advance * tallest * _VERTICAL_SHARE.get(
-        str(values.get("valign", "middle")), 0.5
-    )
+    left = block_left + block_width - (pitch if aviutl else column_width) / 2.0
+    top = centre_y - length(tallest) * _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5)
 
+    # AviUtl2 の縦書きは列どうしも縦の揃えに合わせる（上寄・中央・下寄で短い列が上・真ん中・下へ
+    # 寄った 2026-10-15 に AviUtl2 v2.1.6a で測った） 標準の組み方は前からどおり列を上で揃える
+    # （揃え方を変えると、前の版の縦書きの字幕の短い列が動く）
+    column_share = _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5) if aviutl else 0.0
     path = QPainterPath()
-    for column_index, column in enumerate(cells):
+    for column_index, column in enumerate(glyphs):
         x = left - column_width * column_index
+        column_top = top + (length(tallest) - length(len(column))) * column_share
         for row_index, character in enumerate(column):
-            baseline = top + advance * row_index + metrics.ascent()
+            cell_top = column_top + advance * row_index
+            baseline = cell_top + metrics.ascent()
             offset = metrics.horizontalAdvance(character) / 2.0
+            if aviutl:
+                ink = QPainterPath()
+                ink.addText(QPointF(0.0, 0.0), font, character)
+                if not ink.isEmpty():
+                    baseline = cell_top + pitch / 2.0 - ink.boundingRect().center().y()
+                # 字の書体には字間が足してある（Qt の字間は 1 字ごとの送り幅に入る）
+                offset = (metrics.horizontalAdvance(character) - letter) / 2.0
             path.addText(QPointF(x - offset, baseline), font, character)
-    return path
+            if cells is not None:
+                glyph = QPainterPath()
+                glyph.addText(QPointF(x - offset, baseline), font, character)
+                side = pitch if aviutl else column_width
+                height_of = pitch if aviutl else advance
+                cell = QRectF(x - side / 2.0, cell_top, side, height_of)
+                cells.append(_Cell(column_index, cell, glyph.boundingRect()))
+    if not aviutl:
+        return path, None
+    # AviUtl2 の縦書きの入れ物は列の升目を並べた塊（グラデーションの中心が塊の真ん中だった
+    # 2026-10-15 下寄[左] と 上寄[右] で測った） 横書きと同じく文字の枠として返す
+    return path, (block_left, top, block_left + block_width, top + length(tallest))
 
 
 def _group_layers(groups: list[_Group], values: dict[str, object]) -> list[_Layer]:
@@ -1222,6 +1519,7 @@ def _redecorated(values: dict[str, object], look: _Look) -> dict[str, object]:
 def _paint_layers(
     painter: QPainter,
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
+    bases: _Bases,
 ) -> None:
     """影を全部、縁を全部、塗りを全部の順に描く
 
@@ -1234,9 +1532,13 @@ def _paint_layers(
     描かないと、塗りに隠れて見えない（Photoshop の境界線も字の上に描く） 外側の層を塗りの
     上にすると、前からの縁取り（輪郭をまたいで描き、内側半分を塗りで隠す）と縁の滑らかな所が
     変わり、層が 1 つの字の見た目が前と 1 画素ずれる
+
+    ``bases`` はグラデーションの基準（#312 字の枠全体は :func:`_glyph_box`） 制御文字で色を
+    変えた字も含めた全部の字で 1 つにする 見た目ごとに取ると、色を変えた字だけ別の
+    グラデーションになる
     """
     for path, look, clip in layers:
-        made = _shadow_layer(path, look, painter)
+        made = _shadow_layer(path, look, painter, bases)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
             # 影の面は絵の画素で作ってある 描く座標の縮め方を外してから重ねる
@@ -1251,11 +1553,11 @@ def _paint_layers(
     rings = [_rings(look) for _, look, _ in layers]
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, under=True)
+        _paint_ring(painter, layers, rings, index, bases, under=True)
     for path, look, clip in layers:
-        _fill_within(painter, path, _color(look.get("color")), clip)
+        _fill_painted(painter, path, _fill_of(look, _FILL, "color"), bases, clip)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, under=False)
+        _paint_ring(painter, layers, rings, index, bases, under=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1278,6 +1580,18 @@ class _Ring:
     #: 層のエフェクトが絵を中心の周りで拡大・回転する（倍率, 度） 広がりは範囲の大きさで
     #: 変わるので、量ではなく値のまま持つ（:func:`~sashimono.effects.strokes.turned_reach`）
     turns: tuple[tuple[float, float], ...] = ()
+    #: 層の色のグラデーション（#312） 単色なら ``None`` で :attr:`colour` で塗る
+    paint: Paint | None = None
+    #: 層の不透明度（0..1） グラデーションの止まりの不透明度に掛ける 単色は :attr:`colour` に
+    #: 掛けてある
+    opacity: float = 1.0
+
+    @property
+    def fill(self) -> _Fill:
+        """層を塗る物 単色の色か、グラデーションと層の不透明度"""
+        if self.paint is None:
+            return _color(self.colour)
+        return (self.paint, self.opacity)
 
     def spread(
         self, half_width: float, half_height: float, scale: float = 1.0
@@ -1340,6 +1654,8 @@ def _resolve_strokes(values: dict[str, object], source: GeneratedSource, frame: 
                 reach=reach,
                 effects=index,
                 turns=turns,
+                paint=paint_of(resolved, _STROKE_FILL),
+                opacity=opacity,
             )
         )
     values["strokes"] = tuple(rings)
@@ -1398,7 +1714,9 @@ def _edge_tagged(rings: list[_Ring], look: Mapping[str, object]) -> list[_Ring]:
     first = rings[0]
     if isinstance(colour, tuple) and len(colour) >= 3:
         alpha = first.colour[3] if len(first.colour) > 3 else 1.0
-        first = replace(first, colour=(*colour[:3], alpha))
+        # 制御文字で色を決めた字は、層がグラデーションでもその 1 色で塗る（字の塗りと同じ
+        # :func:`_recoloured`） 字ごとに書いた色の方が、層全体の設定より狙いがはっきりしている
+        first = replace(first, colour=(*colour[:3], alpha), paint=None)
     if isinstance(width, int | float) and not isinstance(width, bool):
         first = replace(first, width=max(0.0, float(width)))
     return [first, *rings[1:]]
@@ -1416,10 +1734,11 @@ def _paint_ring(
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
     rings: list[tuple[_Ring, ...]],
     index: int,
+    bases: _Bases,
     *,
     under: bool,
 ) -> None:
-    """``index`` 番目の層を、字の見た目ごとの輪郭すべてに描く
+    """``index`` 番目の層を、字の見た目ごとの輪郭すべてに描く ``bases`` はグラデーションの基準
 
     ``under`` なら外側に引く層だけ（塗りの下）、偽なら中央と内側の層だけ（塗りの上）
     層にエフェクトがあるか内側に引く層なら、別の面に描いてから重ねる 内側は字の形で
@@ -1447,7 +1766,7 @@ def _paint_ring(
     bands = [(_ring_path(path, ring), ring, clip) for path, ring, clip, _ in entries]
     if apply is None and not inside:
         for band, ring, clip in bands:
-            _fill_within(painter, band, _color(ring.colour), clip)
+            _fill_painted(painter, band, ring.fill, bases, clip)
         return
 
     # 面は縁のある所の周り（層のエフェクトが広げる分を足した四角）だけで作る 字の絵の全体で
@@ -1475,7 +1794,8 @@ def _paint_ring(
     plane_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     plane_painter.setTransform(placed)
     for band, ring, clip in bands:
-        _fill_within(plane_painter, band, _color(ring.colour), clip)
+        # 面の写し方（placed）は描く座標から面の画素へ写すので、枠は描く座標のまま渡す
+        _fill_painted(plane_painter, band, ring.fill, bases, clip)
     plane_painter.end()
     if inside:
         plane = _within_glyphs(plane, [path for path, _, _, _ in entries], placed)
@@ -1512,9 +1832,9 @@ def _within_glyphs(plane: QImage, paths: list[QPainterPath], transform: QTransfo
 
 
 def _fill_within(
-    painter: QPainter, path: QPainterPath, colour: QColor, clip: QPainterPath | None
+    painter: QPainter, path: QPainterPath, colour: QColor | QBrush, clip: QPainterPath | None
 ) -> None:
-    """``path`` を塗る ``clip`` があればその内側だけ"""
+    """``path`` を塗る ``clip`` があればその内側だけ ``colour`` はグラデーションの筆でもよい"""
     if clip is None:
         painter.fillPath(path, colour)
         return
@@ -1545,6 +1865,12 @@ def _recoloured(
         if name == "border_color":
             # 縁取りの層を持つ字は前からの項目を読まないので、層の頭へ当てる色として残す
             changed[_EDGE_COLOUR] = rgb
+    # 制御文字で色を決めた字は、塗りや影がグラデーションでもその 1 色で塗る（#312）
+    # 字ごとに書いた色の方が、テキスト全体の設定より狙いがはっきりしている
+    if color is not None:
+        changed[f"{_FILL}_type"] = "solid"
+    if edge is not None:
+        changed[f"{_SHADOW_FILL}_type"] = "solid"
     return changed
 
 
@@ -1569,7 +1895,7 @@ def _stroke(path: QPainterPath, width: float, join: str = "round") -> QPainterPa
 
 
 def _shadow_layer(
-    path: QPainterPath, values: dict[str, object], painter: QPainter
+    path: QPainterPath, values: dict[str, object], painter: QPainter, bases: _Bases
 ) -> tuple[QImage, tuple[int, int]] | None:
     """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
@@ -1580,16 +1906,21 @@ def _shadow_layer(
     ぼかしの幅も絵の画素へ直す 画面の画素のままぼかすと、画質を落としたプレビューで
     影だけ 2 倍・4 倍にぼける
 
-    画面より大きく広げた絵（``_crop_shadow``）では、面を影の周りだけにする 広げた絵は
-    流れるテロップで一辺 8000 近くになり、全体をぼかすと 1 枚で 0.4 秒かかった
-    画面に収まる絵は今までどおり絵の全体で作る ぼかしの足し算の順が変わると、
-    端の濃さが 1 だけ変わることがあり、収まる字の見た目を 1 画素も変えないため
+    面は影の周り（ぼかしが広げる分を足した四角）だけで作る 絵の全体で作ると、画面に収まる
+    字幕でも 1 本ごとに画面 1 枚ぶんをぼかし、大きさが動いて毎コマ描き直す字幕 20 本で 1 コマ
+    約 2.7 秒かかった（広げた絵は一辺 8000 近くになり 1 枚で 0.4 秒） 周りの外は 0 なので、
+    ぼかしの累積和は 0 を足すだけで途中の値が変わらず、絵の全体で作った時と 1 画素も変わらない
+    （#312 で、影のある字 360 通りを前後で描き比べて確かめた 字・ぼかし 0〜40・ずれ・画質 1/2・
+    単色とグラデーション・縁取りの層・画面より広い字）
+
+    影の塗りがグラデーション（#312）なら、``bases``（字の基準）を影と同じだけずらして塗る
     """
     offset_x = float(values.get("shadow_x", 0.0))  # type: ignore[arg-type]
     offset_y = float(values.get("shadow_y", 0.0))  # type: ignore[arg-type]
     blur = float(values.get("shadow_blur", 0.0))  # type: ignore[arg-type]
     colour = _color(values.get("shadow_color"))
-    if (offset_x, offset_y, blur) == (0.0, 0.0, 0.0) or colour.alpha() == 0:
+    paint = paint_of(values, _SHADOW_FILL)
+    if (offset_x, offset_y, blur) == (0.0, 0.0, 0.0) or not _shadow_visible(values):
         return None
 
     device = painter.device()
@@ -1603,34 +1934,87 @@ def _shadow_layer(
     outer = max(_rings(values), key=lambda ring: ring.outward, default=None)
     outline = _ring_path(shifted, outer) if outer is not None and outer.outward > 0.0 else None
 
-    left, top, right, bottom = 0, 0, device.width(), device.height()
-    if bool(values.get("_crop_shadow", False)):
-        drawn = transform.mapRect((outline if outline is not None else shifted).boundingRect())
-        # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる 端の 0 の所も同じ値に
-        # なるよう、さらに少し余らせる
-        margin = 2.0 * math.ceil(blur) + 4.0
-        left = max(left, math.floor(drawn.left() - margin))
-        top = max(top, math.floor(drawn.top() - margin))
-        right = min(right, math.ceil(drawn.right() + margin))
-        bottom = min(bottom, math.ceil(drawn.bottom() + margin))
-        if right <= left or bottom <= top:
-            return None
+    drawn = transform.mapRect((outline if outline is not None else shifted).boundingRect())
+    # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる 端の 0 の所も同じ値に
+    # なるよう、さらに少し余らせる
+    margin = 2.0 * math.ceil(blur) + 4.0
+    left = max(0, math.floor(drawn.left() - margin))
+    top = max(0, math.floor(drawn.top() - margin))
+    right = min(device.width(), math.ceil(drawn.right() + margin))
+    bottom = min(device.height(), math.ceil(drawn.bottom() + margin))
+    if right <= left or bottom <= top:
+        return None
     layer = QImage(right - left, bottom - top, QImage.Format.Format_RGBA8888)
     layer.fill(Qt.GlobalColor.transparent)
 
+    placed = transform * QTransform.fromTranslate(-left, -top)
     shadow_painter = QPainter(layer)
-    shadow_painter.setTransform(transform * QTransform.fromTranslate(-left, -top))
+    shadow_painter.setTransform(placed)
     shadow_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    # グラデーションの影は形を白で描いてから、色を後で付ける（:func:`_shadow_coloured`）
+    shape = colour if paint is None else QColor(255, 255, 255, 255)
     if outline is not None:
         # 縁取りがあるときは、その外形の影が落ちる 塗りだけの影にすると
         # 縁の分だけ影が細く見える
-        shadow_painter.fillPath(outline, colour)
-    shadow_painter.fillPath(shifted, colour)
+        shadow_painter.fillPath(outline, shape)
+    shadow_painter.fillPath(shifted, shape)
     shadow_painter.end()
 
-    if blur <= 0.0:
-        return layer, (left, top)
-    return _blur_alpha(layer, blur), (left, top)
+    if blur > 0.0:
+        layer = _blur_alpha(layer, blur)
+    if paint is not None:
+        # 影の基準は字の基準を影と同じだけずらした物 影の形とグラデーションが一緒に動く
+        moved = bases.shifted(offset_x, -offset_y)
+        units = [(band, gradient_brush(paint, ink)) for band, ink in moved.units(paint.basis)]
+        layer = _shadow_coloured(layer, units, placed)
+    return layer, (left, top)
+
+
+def _shadow_visible(values: Mapping[str, object]) -> bool:
+    """影の色がどこかに出るか 単色なら色の不透明度、グラデーションならどれかの止まり
+
+    描く所（:func:`_shadow_layer`）と広がりの見積もり（:func:`_text_reach`）で同じ物を見る
+    食い違うと、透明な単色を残したグラデーションの影が絵の端で切れる
+    """
+    paint = paint_of(values, _SHADOW_FILL)
+    if paint is not None:
+        return paint.visible
+    return _color(values.get("shadow_color")).alpha() > 0
+
+
+def _shadow_coloured(
+    shape: QImage, units: list[tuple[QRectF | None, QBrush]], placed: QTransform
+) -> QImage:
+    """白で描いてぼかした影の形 ``shape`` に、グラデーションの色を付ける（#312）
+
+    色は面（影の周りだけで作ってある）の全体へ塗ってから、形の不透明度を掛ける 形の所だけを
+    筆で塗ってからぼかすと、ぼけて外へ広がった所の色が 0（黒）のまま残り、明るい影の縁が黒ずむ
+    ``units`` は（塗る帯, 筆） 1 行ごと・1 文字ごとの基準では帯ごとに筆を替える（帯が ``None``
+    なら面の全体） ``placed`` は描く座標から面の画素への写し方（筆を字と同じ所に置くため）
+    """
+    width, height = shape.width(), shape.height()
+    tint = QImage(width, height, QImage.Format.Format_RGBA8888)
+    tint.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tint)
+    painter.setTransform(placed)
+    inverse, invertible = placed.inverted()
+    whole = QRectF(0.0, 0.0, float(width), float(height))
+    covered = inverse.mapRect(whole) if invertible else whole
+    for band, brush in units:
+        painter.save()
+        if band is not None:
+            painter.setClipRect(band)
+        painter.fillRect(covered, brush)
+        painter.restore()
+    painter.end()
+    colours = _to_array(tint)
+    # 影の面へじかに書く 写してから作り直すと、字幕 1 本ごとに面をもう 2 度写すことになる
+    rows = np.frombuffer(shape.bits(), dtype=np.uint8).reshape(height, shape.bytesPerLine())
+    pixels = rows[:, : width * 4].reshape(height, width, 4)
+    mask = pixels[:, :, 3].astype(np.uint32)
+    pixels[:, :, :3] = colours[:, :, :3]
+    pixels[:, :, 3] = (colours[:, :, 3].astype(np.uint32) * mask + 127) // 255
+    return shape
 
 
 def _blur_alpha(image: QImage, radius: float) -> QImage:
