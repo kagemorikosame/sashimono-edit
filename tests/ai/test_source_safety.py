@@ -185,12 +185,20 @@ class TestCounted:
                 if called:
                     found[node.name] = called
         assert found == _HOST_WRITERS
-        handlers = {
-            operation.name: operation.handler.__name__
-            for operation in OPERATIONS
-            if operation.name in FILE_WRITING_TOOLS
-        }
+        # 書く道具は、人が許した確かめの中身を受け取る本体（approved）で書く 受け取らずに
+        # 書く先の身元を採り直すと、照らし合わせの後の変更を受け入れる（#327 Codex の P2）
+        handlers: dict[str, str] = {}
+        for operation in OPERATIONS:
+            if operation.name in FILE_WRITING_TOOLS:
+                assert operation.approved is not None, operation.name
+                handlers[operation.name] = operation.approved.__name__
         assert set(handlers.values()) == set(_HOST_WRITERS)
+        # 本体の中で書く先の身元を採り直さない（確かめの中身の身元で照らす）
+        tree = _source(sashimono.ai.operations)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in _HOST_WRITERS:
+                called = _called_names(ast.Module(body=node.body, type_ignores=[]))
+                assert "expect_now" not in called, node.name
 
     @pytest.mark.parametrize(
         "module", [sashimono.ai.operations, sashimono.ai.bridge, sashimono.ai.safety]

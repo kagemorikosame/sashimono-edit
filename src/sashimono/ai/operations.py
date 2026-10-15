@@ -71,7 +71,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
-from sashimono.core.io.atomic import expect_now
+from sashimono.core.io.atomic import Expected, expect_now
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import plan_cuts
@@ -175,6 +175,11 @@ class Operation:
     #: 取り消せない操作で、確かめの窓に出す「何をどこへ」を作る 編集画面のスレッドで呼ぶ
     #: 書けない場所ならここで :class:`ToolError` を投げ、窓を出さずに断る
     consent: Callable[[EditorHost, dict[str, Any]], Consent] | None = None
+    #: 取り消せない操作の本体 人が許した確かめの中身（:class:`Consent`）を受け取って動く
+    #: ブリッジは許した後にこれを呼ぶ 書く処理は確かめの中身の身元（``basis``）で照らす
+    #: 書く処理の中で身元を採り直すと、照らし合わせの後の変更を受け入れてしまう（#327）
+    #: 無ければ ``handler`` を呼ぶ（書く先の身元を持たない道具）
+    approved: Callable[[EditorHost, dict[str, Any], Consent], object] | None = None
 
     def __post_init__(self) -> None:
         if not self.irreversible:
@@ -2197,11 +2202,38 @@ def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     )
 
 
-def _save_project(host: EditorHost, arguments: dict[str, Any]) -> object:
+def _basis(consent: Consent) -> Expected:
+    """人が許したときの書く先の身元 書く処理はこれで照らす（Codex の P2）
+
+    書く処理の中で採り直すと、実行の前の照らし合わせ（確かめの中身を作り直して比べる）の後に
+    書き換えられた中身を、新しい基準として受け入れてしまう
+    """
+    if consent.basis is None:
+        raise ToolError("許したときの書く先の様子が分からないので、書きません")
+    return consent.basis
+
+
+def _consented(
+    approved: Callable[[EditorHost, dict[str, Any], Consent], object],
+    describe: Callable[[EditorHost, dict[str, Any]], Consent],
+) -> Callable[[EditorHost, dict[str, Any]], object]:
+    """確かめを通らずに直に呼ばれたとき（試験など）の入口 その場で確かめの中身を作って渡す
+
+    ブリッジは :attr:`Operation.approved` に、人が許した確かめの中身を渡して呼ぶ
+    """
+
+    def handler(host: EditorHost, arguments: dict[str, Any]) -> object:
+        return approved(host, arguments, describe(host, arguments))
+
+    handler.__name__ = approved.__name__
+    return handler
+
+
+def _save_project(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
     del arguments
     try:
         with pinned_place(host, str(_current_project_file(host))) as path:
-            note = host.write_project(path, adopt=False, expect=expect_now(path))
+            note = host.write_project(path, adopt=False, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
     return {"saved": str(path), "note": note}
@@ -2224,12 +2256,12 @@ def _save_as_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     )
 
 
-def _save_project_as(host: EditorHost, arguments: dict[str, Any]) -> object:
+def _save_project_as(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
     raw = arguments.get("path")
     _require_suffix(raw, (SUFFIX,), "作品")
     try:
         with pinned_place(host, raw) as path:
-            note = host.write_project(path, adopt=True, expect=expect_now(path))
+            note = host.write_project(path, adopt=True, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
     return {"saved": str(path), "project_path": str(host.project_path), "note": note}
@@ -2289,11 +2321,11 @@ def _subtitles_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     )
 
 
-def _export_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+def _export_subtitles(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
     _path, frame_range, _detail = _subtitle_plan(host, arguments)
     try:
         with pinned_place(host, arguments.get("path")) as path:
-            written = host.write_subtitles(path, frame_range=frame_range, expect=expect_now(path))
+            written = host.write_subtitles(path, frame_range=frame_range, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"字幕を書き出せませんでした: {exc}") from exc
     return {"written": str(written), "range": None if frame_range is None else list(frame_range)}
@@ -2327,11 +2359,11 @@ def _snapshot_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     )
 
 
-def _save_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
+def _save_snapshot(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
     _path, frame, _detail = _snapshot_plan(host, arguments)
     try:
         with pinned_place(host, arguments.get("path")) as path:
-            drawn = host.write_snapshot(path, frame, expect=expect_now(path))
+            drawn = host.write_snapshot(path, frame, expect=_basis(consent))
     except OSError as exc:
         raise ToolError(f"静止画を保存できませんでした: {exc}") from exc
     return {"saved": str(path), "frame": drawn}
@@ -2447,10 +2479,12 @@ def _awaiting_export(host: EditorHost, seconds: float) -> Pending:
     return Pending(wait=host.export_waiter(), seconds=seconds, then=host.export_status)
 
 
-def _export_video(host: EditorHost, arguments: dict[str, Any]) -> object:
+def _export_video(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
     wait = _wait_seconds(arguments)
     plan = _export_plan(host, arguments)
-    host.start_export(plan.request)
+    # 置く直前に照らす基準は、人が許したときの身元 ここで採り直すと、照らし合わせの後の
+    # 変更を新しい基準として受け入れてしまう
+    host.start_export(replace(plan.request, expect=_basis(consent)))
     if wait > 0:
         return _awaiting_export(host, wait)
     return {
@@ -3233,7 +3267,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "save_project_as を使う"
         ),
         schema=_schema({}),
-        handler=_save_project,
+        handler=_consented(_save_project, _save_consent),
+        approved=_save_project,
         writes=True,
         irreversible=True,
         consent=_save_consent,
@@ -3254,7 +3289,8 @@ OPERATIONS: tuple[Operation, ...] = (
             },
             ["path"],
         ),
-        handler=_save_project_as,
+        handler=_consented(_save_project_as, _save_as_consent),
+        approved=_save_project_as,
         writes=True,
         irreversible=True,
         consent=_save_as_consent,
@@ -3298,7 +3334,8 @@ OPERATIONS: tuple[Operation, ...] = (
             },
             ["path"],
         ),
-        handler=_export_video,
+        handler=_consented(_export_video, _export_consent),
+        approved=_export_video,
         writes=True,
         irreversible=True,
         consent=_export_consent,
@@ -3355,7 +3392,8 @@ OPERATIONS: tuple[Operation, ...] = (
             },
             ["path"],
         ),
-        handler=_export_subtitles,
+        handler=_consented(_export_subtitles, _subtitles_consent),
+        approved=_export_subtitles,
         writes=True,
         irreversible=True,
         consent=_subtitles_consent,
@@ -3375,7 +3413,8 @@ OPERATIONS: tuple[Operation, ...] = (
             },
             ["path"],
         ),
-        handler=_save_snapshot,
+        handler=_consented(_save_snapshot, _snapshot_consent),
+        approved=_save_snapshot,
         writes=True,
         irreversible=True,
         consent=_snapshot_consent,

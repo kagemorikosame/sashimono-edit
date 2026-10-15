@@ -174,11 +174,7 @@ def _fill(
         elif expect.identity is None:
             _place_new(temporary, path)
         else:
-            if expect_now(path) != expect:
-                raise TargetChangedError(
-                    f"書く先が許した後に変わったので、前のファイルを残しました: {path}"
-                )
-            _replace(temporary, path)
+            _replace_expected(temporary, path, expect)
     except BaseException:
         # 後片付けの失敗で元の理由を隠さない
         with contextlib.suppress(OSError):
@@ -186,6 +182,82 @@ def _fill(
         raise
     _sweep_stale(path)
     return written
+
+
+#: 置き換える前のファイルを退ける名前の後ろ 書きかけ（``.writing``）と分けるのは、古い
+#: 書きかけの片付け（:func:`_sweep_stale`）で消させないため 戻せずに残した物は人が見て決める
+ASIDE_SUFFIX = ".replaced"
+
+
+def _replace_expected(temporary: Path, path: Path, expect: Expected) -> None:
+    """許した前のファイル（``expect``）だけを、新しいファイルで置き換える
+
+    照らしてから置き換えるまでを別の操作にすると、その間に別のアプリが置いたファイルを
+    上書きする（照らした物と置き換えた物が違う） そこで次の順に行い、どの間に割り込まれても
+    相手のファイルを潰さない
+
+    1. 書く先を、置き換えない改名で自分だけが知る名前へ退ける 退けた物は自分の物になる
+    2. 退けた物の身元を照らす 違えば、退けた物を置き換えない改名で元の名前へ戻して断る
+    3. 新しいファイルを、置き換えない付け方（:func:`_place_new`）で元の名前に付ける
+       その間に名前が現れていれば付けずに、退けた物を戻そうとして断る
+    4. 退けた物を消す 人が置き換えを許した物なので、残すと要らない写しが積もる
+
+    戻せない（元の名前がもう別の物で埋まっている）ときは、退けた物を消さずに残し、その名前を
+    断りの文に入れる 黙って消すと、人が許していない形で前のファイルが失われる
+    ``ReplaceFileW`` は置き換える物の身元を照らせず、照らしと置き換えの間の割り込みは
+    同じく防げないので使わない
+    """
+    aside = path.with_name(f"{_scratch_head(path.name)}.{uuid.uuid4().hex[:8]}{ASIDE_SUFFIX}")
+    try:
+        _rename_new(path, aside)
+    except FileNotFoundError as exc:
+        raise TargetChangedError(
+            f"書く先が許した後に消えたので、何も置きませんでした: {path}"
+        ) from exc
+    if expect_now(aside) != expect:
+        raise TargetChangedError(
+            f"書く先が許した後に変わったので、前のファイルを残しました: {path}"
+            f"{_put_back(aside, path)}"
+        )
+    try:
+        _place_new(temporary, path)
+    except TargetChangedError as exc:
+        raise TargetChangedError(f"{exc}{_put_back(aside, path)}") from exc
+    with contextlib.suppress(OSError):
+        aside.unlink()
+
+
+def _put_back(aside: Path, path: Path) -> str:
+    """退けた物を元の名前へ置き換えない改名で戻す 戻せなければ、残した名前を知らせる言葉を返す"""
+    try:
+        _rename_new(aside, path)
+    except OSError:
+        return (
+            f" 許した前のファイルは元の名前へ戻せなかったので、{aside.name} として残しました"
+            "（元の名前には別のファイルがあります どちらを残すかは人が決めてください）"
+        )
+    return ""
+
+
+def _rename_new(source: Path, destination: Path) -> None:
+    """``source`` を ``destination`` へ改名する ``destination`` があれば置き換えずに断る
+
+    Windows の改名は置き換えずに断る ほかの OS は黙って置き換えるので、リンクを張ってから
+    元の名前を外す 使用中で断られたら、:func:`_replace` と同じく少し待って試し直す
+    """
+    deadline = time.monotonic() + _REPLACE_WAIT
+    while True:
+        try:
+            if sys.platform == "win32":
+                source.rename(destination)
+            else:
+                os.link(source, destination)
+                source.unlink()
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def _place_new(temporary: Path, path: Path) -> None:
@@ -196,12 +268,8 @@ def _place_new(temporary: Path, path: Path) -> None:
     黙って置き換えるので、リンクを張って（あれば断る）から仮の名前を外す
     """
     try:
-        if sys.platform == "win32":
-            # Path.rename は Windows で置き換えずに断る（MoveFileEx に置き換えの印を付けない）
-            temporary.rename(path)
-        else:
-            os.link(temporary, path)
-            temporary.unlink()
+        # Path.rename は Windows で置き換えずに断る（MoveFileEx に置き換えの印を付けない）
+        _rename_new(temporary, path)
     except FileExistsError as exc:
         raise TargetChangedError(
             f"書く先に、許した後で同じ名前のファイルができたので、前のファイルを残しました: {path}"

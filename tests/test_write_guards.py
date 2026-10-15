@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,53 @@ class TestTheTargetIsAsExpected:
         with pytest.raises(TargetChangedError):
             copy_atomic(source, target, expect=expect)
         assert target.read_bytes() == b"changed afterwards"
+
+    def test_a_file_put_between_the_check_and_the_placing_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、身元を照らしてから名前を付けるまでの間に別のアプリが置いたファイルを、
+        # 許していないまま上書きして消す（Codex の P1 照らしと置き方が別の操作だった）
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"approved")
+        expect = expect_now(target)
+        interjected: list[str] = []
+
+        def interject(real: Callable[[Path, Path], None]) -> Callable[[Path, Path], None]:
+            def wrapped(temporary: Path, path: Path) -> None:
+                if not interjected:
+                    # 照らした後、名前を付ける直前に別のアプリが書く先へ新しいファイルを置いた
+                    interjected.append("x")
+                    other = tmp_path / "別のアプリ.tmp"
+                    other.write_bytes(b"other app")
+                    other.replace(target)
+                real(temporary, path)
+
+            return wrapped
+
+        monkeypatch.setattr(atomic, "_replace", interject(atomic._replace))
+        monkeypatch.setattr(atomic, "_place_new", interject(atomic._place_new))
+        with pytest.raises(TargetChangedError) as caught:
+            write_atomic(target, "新しい中身", expect=expect)
+        assert interjected
+        assert target.read_bytes() == b"other app"
+        # 許した前のファイルは黙って消さない 退けた名前を知らせて残す
+        kept = [path for path in tmp_path.iterdir() if path.read_bytes() == b"approved"]
+        assert len(kept) == 1
+        assert kept[0].name in str(caught.value)
+
+    def test_a_file_changed_before_it_was_moved_aside_is_put_back(self, tmp_path: Path) -> None:
+        # 壊れると、照らしが違ったときに退けたファイルが仮の名前のまま残り、元の名前から消える
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"approved")
+        expect = expect_now(target)
+        target.write_bytes(b"changed!")
+        # 同じ大きさで続けて書くと、時計の刻みしだいで時刻が同じになる 時刻を確かに進める
+        later = expect.identity[3] + 1_000_000 if expect.identity else 0
+        os.utime(target, ns=(later, later))
+        with pytest.raises(TargetChangedError):
+            write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_bytes() == b"changed!"
+        assert [path.name for path in tmp_path.iterdir()] == ["完成.mp4"]
 
     def test_as_expected_it_is_written(self, tmp_path: Path) -> None:
         # 壊れると（照らし方が厳しすぎると）、何も変わっていないのに書けない

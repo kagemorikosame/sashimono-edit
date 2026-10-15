@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import threading
@@ -25,7 +26,7 @@ from typing import Any
 import pytest
 
 from sashimono.ai import bridge as bridge_module
-from sashimono.ai import safety
+from sashimono.ai import operations, safety
 from sashimono.ai.bridge import Approval, EditorBridge
 from sashimono.ai.host import ExportRequest, ToolError
 from sashimono.ai.operations import MAX_WAIT_SECONDS, Operation, Pending, find_operation
@@ -590,6 +591,75 @@ class TestWhatWasShownIsWhatIsWritten:
         assert "変わりました" in str(box.get("error"))
         assert target.read_bytes() == b"BBBB"
         assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+
+    @pytest.mark.parametrize(
+        ("name", "file"),
+        [
+            ("save_project", None),
+            ("save_project_as", "第二稿.sme"),
+            ("save_snapshot", "表紙.png"),
+            ("export_subtitles", "字幕.srt"),
+        ],
+    )
+    def test_a_change_after_the_check_is_not_taken_as_the_new_basis(
+        self,
+        saved: FakeHost,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        file: str | None,
+    ) -> None:
+        # 壊れると、実行の前の照らし合わせの後で書く先の身元を採り直し、その間の変更を新しい
+        # 基準として受け入れて、人が許していない中身を置き換える（Codex の P2）
+        assert saved.saved_at is not None
+        target = saved.saved_at if file is None else saved.saved_at.parent / file
+        target.write_bytes(b"AAAA")
+        real_pin = safety.pinned_place
+
+        @contextlib.contextmanager
+        def change_then_pin(host: Any, raw: object) -> Iterator[Path]:
+            # 照らし合わせが済み、書く処理へ入る所で、別のアプリが書く先を書き換えた
+            target.write_bytes(b"BBBB")
+            stamp = target.stat().st_mtime_ns + 1_000_000
+            os.utime(target, ns=(stamp, stamp))
+            with real_pin(host, raw) as path:
+                yield path
+
+        monkeypatch.setattr(operations, "pinned_place", change_then_pin)
+        arguments: dict[str, object] = {} if file is None else {"path": str(target)}
+        bridge = EditorBridge(saved, auto_approve=True)
+        _seen, box = _run(bridge, _operation(name), arguments)
+        assert isinstance(box.get("error"), ToolError)
+        assert target.read_bytes() == b"BBBB"
+
+    def test_the_export_keeps_the_approved_basis(
+        self, saved: FakeHost, codecs: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、書き出しが照らし合わせの後に採り直した身元を基準にし、描く前に書き換えられた
+        # 中身を、許した物として置き換える
+        del codecs
+        assert saved.saved_at is not None
+        target = saved.saved_at.parent / "完成.mp4"
+        target.write_bytes(b"AAAA")
+        real_plan = operations._export_plan
+        calls: list[int] = []
+
+        def change_on_the_run(host: Any, arguments: dict[str, Any]) -> Any:
+            calls.append(1)
+            if len(calls) == 3:
+                # 確かめの箱（1 回目）と照らし合わせ（2 回目）の後、書き出しを始める所（3 回目）
+                target.write_bytes(b"BBBB")
+                stamp = target.stat().st_mtime_ns + 1_000_000
+                os.utime(target, ns=(stamp, stamp))
+            return real_plan(host, arguments)
+
+        monkeypatch.setattr(operations, "_export_plan", change_on_the_run)
+        bridge = EditorBridge(saved, auto_approve=True)
+        seen, _box = _run(bridge, EXPORT, {"path": str(target)})
+        assert seen[0].consent is not None
+        assert [request.expect for request in saved.exports] in (
+            [],
+            [seen[0].consent.basis],
+        )
 
     def test_a_snapshot_frame_moved_while_asking_is_refused(self, saved: FakeHost) -> None:
         # 壊れると、箱に出したコマ（再生ヘッドの位置）と違うコマの絵を書く

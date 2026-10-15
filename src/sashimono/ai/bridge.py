@@ -235,6 +235,11 @@ class EditorBridge:
                 raise ToolError(
                     f"確かめた後に{what} 何も書いていません 今の中身でもう 1 度頼み直してください"
                 )
+            # 書く処理には人が許した確かめの中身を渡す 書く先の身元はそこから取り、採り直さない
+            # 採り直すと、上の照らし合わせの後に書き換えられた中身を新しい基準として受け入れる
+            approved = operation.approved
+            if approved is not None:
+                return approved(self._host, arguments, consent)
             return operation(self._host, arguments)
 
         return self._settle(self.call(run_where_approved))
