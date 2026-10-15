@@ -419,6 +419,60 @@ class TestExport:
         assert "空" in str(box.get("error"))
 
 
+# --- 確かめの箱が出ている間に作品の場所が変わる（Codex の P1） ---
+
+
+class TestTheApprovedPlaceIsKept:
+    """確かめの箱はモードレス 出ている間に人が〔名前を付けて保存〕で作品の場所を変えても、
+    許した後に書くのは箱に出した場所だけ 解き直して違えば断る
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "arguments"),
+        [
+            ("save_project", {}),
+            ("save_project_as", {"path": "第二稿.sme"}),
+            ("export_video", {"path": "完成.mp4"}),
+            ("save_snapshot", {"path": "表紙.png"}),
+            ("export_subtitles", {"path": "字幕.srt"}),
+        ],
+    )
+    def test_moving_the_project_while_asking_is_refused(
+        self,
+        saved: FakeHost,
+        codecs: list[str],
+        tmp_path: Path,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        # 壊れると、人が箱に出た場所を見て許したのに、移した先の作品や別のフォルダの
+        # ファイルを上書きする（上書き保存なら、移した先の作品を前の中身で潰す）
+        del codecs
+        assert saved.saved_at is not None
+        folder = saved.saved_at.parent
+        moved_folder = tmp_path / "移した先"
+        moved_folder.mkdir()
+        moved = moved_folder / "作品.sme"
+        moved.write_text("移した先の作品", encoding="utf-8")
+        bridge = EditorBridge(saved, auto_approve=True)
+        done, box = call_in_thread(bridge, _operation(name), arguments)
+
+        def move_then_allow(approval: Approval) -> bool:
+            assert approval.consent is not None
+            assert str(folder.resolve()) in approval.consent.target
+            # 箱が出ている間に、人が〔名前を付けて保存〕で別の場所へ移した
+            saved.saved_at = moved
+            return True
+
+        seen = answer_approvals(bridge, done, move_then_allow)
+        assert len(seen) == 1
+        assert isinstance(box.get("error"), ToolError)
+        assert "変わりました" in str(box["error"])
+        assert moved.read_text(encoding="utf-8") == "移した先の作品"
+        assert sorted(path.name for path in moved_folder.iterdir()) == ["作品.sme"]
+        assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+
+
 # --- 字幕の書き出しと静止画 ---
 
 SUBTITLES = _operation("export_subtitles")

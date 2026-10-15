@@ -210,7 +210,23 @@ class EditorBridge:
             raise ToolError(
                 "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
             )
-        return self._settle(self.call(lambda: operation(self._host, arguments)))
+
+        def run_where_approved() -> object:
+            # 確かめの箱はモードレス 出ている間に人が〔名前を付けて保存〕などで作品の場所を
+            # 変えると、道具が書く先を解き直したとき、箱に出して許された場所と別のファイルに
+            # なる（上書き保存なら移した先の作品を潰す） 許した場所を実行まで固定し、
+            # 解き直した場所と照らして違えば断る 照らすのと実行を同じ 1 件の仕事にして、
+            # 間に画面の操作が挟まらないようにする
+            again = describe(self._host, arguments)
+            if not isinstance(again, Consent) or again.target != consent.target:
+                now = again.target if isinstance(again, Consent) else "（分からない）"
+                raise ToolError(
+                    f"確かめた後に書き込み先が変わりました（許した場所: {consent.target} "
+                    f"今の場所: {now}） 何も書いていません もう 1 度頼み直してください"
+                )
+            return operation(self._host, arguments)
+
+        return self._settle(self.call(run_where_approved))
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""
