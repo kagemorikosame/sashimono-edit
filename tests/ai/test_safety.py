@@ -30,6 +30,7 @@ from sashimono.ai import operations
 from sashimono.ai.bridge import Approval, EditorBridge
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, Operation, find_operation
+from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Consent, Safety, check_writable, writable_path
 from sashimono.core.model import MediaItem, Transcript
 from tests.ai.conftest import FakeHost, make_loaded
@@ -59,6 +60,7 @@ WRITE_NOTE = Operation(
     writes=True,
     irreversible=True,
     consent=_note_consent,
+    sends=frozenset({Outbound.PROJECT}),
 )
 
 
@@ -140,6 +142,7 @@ class TestKinds:
                 schema={},
                 handler=_write_note,
                 irreversible=True,
+                sends=frozenset({Outbound.PROJECT}),
                 **options,
             )
 

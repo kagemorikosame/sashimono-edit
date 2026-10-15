@@ -49,6 +49,7 @@ from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost, Question
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
+from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
 from sashimono.ai.session import (
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
@@ -60,6 +61,7 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.ui.chat.parts_updater import PartsUpdater
+from sashimono.ui.chat.send_consent import ask_send
 from sashimono.ui.disclosure import DisclosureButton
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
@@ -220,6 +222,9 @@ class ChatPanel(QWidget):
     #: 欄の上でモデルか考える深さを選び直した 引数はモデル ID とエフォート
     #: 本人の好みとして覚えるのは受け取る側（設定の置き場を 1 か所にするため）
     choices_changed = Signal(str, str)
+    #: 送ってよいかの窓で「送る（次からは尋ねない）」と答えた 引数は送る物（:class:`Outbound` の値）
+    #: 設定に覚えるのは受け取る側（設定の置き場を 1 か所にするため）
+    send_allowed = Signal(str)
 
     def __init__(
         self,
@@ -240,6 +245,10 @@ class ChatPanel(QWidget):
         #: あいまいなときに AI に質問させるか（設定） 会話を作るときに指示の文と道具へ渡す
         self._ask_questions = True
         self._checkpoint_open = False
+        #: 外へ送ってよいかを尋ねる窓（#342） 試験はここを差し替えて答える
+        self.ask_send: Callable[[QWidget | None, SendRequest], SendAnswer | None] = ask_send
+        #: 送ってよいかの窓を出している間は真 窓の間も見張りの時計は回るので、2 つ目を出さない
+        self._asking_send = False
         #: 応答が 1 往復終わった回数 無人での確認に使う
         self._turns_done = 0
         #: 送ってまだ応答が終わっていない指示（送った順） 会話を繋ぎ直してよいかの
@@ -709,6 +718,7 @@ class ChatPanel(QWidget):
         self._alert_when_done = preferences.ai_done_alert
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
+        self._bridge.set_send_choices(preferences.send_choices())
         self._refresh_status()
 
     def _select_choices(self, model: str, effort: str) -> None:
@@ -991,6 +1001,7 @@ class ChatPanel(QWidget):
         self._bridge.pump()
         self._check_approval()
         self._check_question()
+        self._check_send()
 
         session = self._session
         if session is not None:
@@ -1193,6 +1204,49 @@ class ChatPanel(QWidget):
         else:
             approval.deny()
         self._refresh_status()
+
+    # --- 外へ送ってよいか（#342） ---
+
+    def _check_send(self) -> None:
+        """送ってよいかの確かめがあれば、窓を出して答える
+
+        窓は閉じるまで待つ（モーダル） 待つ間も見張りの時計は回るので、2 つ目を出さない
+        AI のスレッドは答えが出るまで止まっているので、窓の間に新しい仕事は来ない
+        """
+        if self._asking_send:
+            return
+        request = self._bridge.take_send_request()
+        if request is None or request.done.is_set():
+            # 画面が取り出す前に、中断で畳まれていた 出すと押しても何も起きない窓が残る
+            return
+        self._asking_send = True
+        try:
+            window = self.window()
+            if not window.isActiveWindow():
+                # 別の窓を触っている人は、AI が止まっている訳に気付かない
+                QApplication.alert(window)
+            answer = self.ask_send(self, request)
+        finally:
+            self._asking_send = False
+        names = "・".join(kind.label for kind in request.kinds)
+        if answer is None:
+            request.give_up("ユーザーが送らずに窓を閉じました")
+            self._note(f"{names} を送りませんでした（窓を閉じました 次に送るときにまた尋ねます）")
+            return
+        if not request.reply(answer):
+            # 窓を出している間に、中断か時間切れで畳まれた 答えは AI へ届かない
+            return
+        if answer is SendAnswer.ALWAYS:
+            choices = dict(self._bridge.send_choices)
+            for kind in request.kinds:
+                choices[kind] = SendChoice.ALLOW
+                self.send_allowed.emit(kind.value)
+            self._bridge.set_send_choices(choices)
+            self._note(f"{names} を送ります（次からは尋ねません 表示 → 設定… で変えられます）")
+        elif answer is SendAnswer.UNTIL_CLOSE:
+            self._note(f"{names} をアプリを閉じるまで送ります")
+        else:
+            self._note(f"{names} を送りません（アプリを閉じるまで 表示 → 設定… で変えられます）")
 
     # --- AI からの質問（#296） ---
 

@@ -1,0 +1,387 @@
+"""AI の道具が外（Anthropic）へ送る物の宣言と、送る前の同意（#342 D4）
+
+道具の結果はそのまま Anthropic へ渡る 絵・字幕の文・素材の名前と場所は、本人が
+許すまで送らない ブリッジ（AI のスレッドと画面のスレッドの間）で確かめるので、
+実際にスレッドを 2 本使って見る
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from sashimono.ai import bridge as bridge_module
+from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.host import EditorHost, ToolError
+from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, find_operation
+from sashimono.ai.outbound import (
+    ASKED,
+    DESTINATION,
+    Outbound,
+    SendAnswer,
+    SendChoice,
+    SendRequest,
+    file_secrets,
+    redact,
+)
+from sashimono.core.model import MediaItem, Transcript
+from sashimono.core.timebase import format_timecode
+from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.test_bridge import call_in_thread
+
+SECRET_PATH = Path("C:/Users/秘密の人/動画/結婚式の撮影.mp4")
+
+
+def _operation(name: str) -> Operation:
+    found = find_operation(name)
+    assert found is not None
+    return found
+
+
+@pytest.fixture
+def secret_host(video_media: MediaItem, transcript: Transcript) -> FakeHost:
+    """素材の場所に本人の名前が入った作品"""
+    return FakeHost(make_loaded(replace(video_media, path=SECRET_PATH), transcript))
+
+
+def answer_sends(
+    bridge: EditorBridge,
+    done: threading.Event,
+    reply: Callable[[SendRequest], SendAnswer | None],
+    timeout: float = 5.0,
+) -> list[SendRequest]:
+    """画面のスレッドの代わりに、仕事を拾い、出てきた送る前の確かめに ``reply`` で答える
+
+    ``None`` を返すと答えずに窓を閉じたことにする
+    """
+    seen: list[SendRequest] = []
+    deadline = time.monotonic() + timeout
+    while not done.is_set() and time.monotonic() < deadline:
+        bridge.pump()
+        request = bridge.take_send_request()
+        if request is not None:
+            seen.append(request)
+            answer = reply(request)
+            if answer is None:
+                request.give_up("閉じました")
+            else:
+                request.reply(answer)
+        time.sleep(0.005)
+    bridge.pump()
+    assert done.is_set(), "道具が終わらなかった（送る前の確かめを待ったまま止まっている）"
+    return seen
+
+
+def _never(request: SendRequest) -> SendAnswer:
+    pytest.fail(f"尋ねないはずの所で尋ねた: {request.kinds}")
+
+
+def _run(
+    bridge: EditorBridge,
+    name: str,
+    reply: Callable[[SendRequest], SendAnswer | None] = _never,
+    arguments: dict[str, Any] | None = None,
+) -> tuple[list[SendRequest], dict[str, object]]:
+    done, box = call_in_thread(bridge, _operation(name), arguments or {})
+    return answer_sends(bridge, done, reply), box
+
+
+# --- 宣言 ---
+
+
+class TestDeclarations:
+    def test_a_tool_without_a_declaration_cannot_be_made(self) -> None:
+        # 壊れると、絵や字幕を返す道具を足した人が書き忘れても黙って通り、同意を取らずに送る
+        with pytest.raises(TypeError, match="sends"):
+            Operation(  # type: ignore[call-arg]  # 書き忘れを再現するため、わざと渡さない
+                name="forgot",
+                description="",
+                schema={},
+                handler=lambda _host, _arguments: None,
+            )
+
+    def test_an_empty_declaration_is_refused(self) -> None:
+        # 壊れると、空の宣言で「何も送らない」ふりをして、結果をそのまま送る道具を作れる
+        with pytest.raises(ValueError, match="sends"):
+            Operation(
+                name="empty",
+                description="",
+                schema={},
+                handler=lambda _host, _arguments: None,
+                sends=frozenset(),
+            )
+
+    def test_every_tool_declares_what_it_sends(self) -> None:
+        # 壊れると、宣言の無い道具が同意の外を通る（作る所で落ちるので、ここは念のため）
+        for operation in OPERATIONS:
+            assert operation.sends, operation.name
+            assert operation.sends <= set(Outbound), operation.name
+
+    def test_the_preview_is_declared_as_sending_frames(self) -> None:
+        # 壊れると、プレビューの絵を同意なしで送る（この Issue の中心）
+        assert Outbound.FRAMES in _operation("preview_frame").sends
+        assert Outbound.TEXT in _operation("get_subtitles").sends
+        assert Outbound.FILES in _operation("list_media").sends
+
+    def test_what_each_reading_tool_returns_matches_its_declaration(
+        self, secret_host: FakeHost, transcript: Transcript
+    ) -> None:
+        # 壊れると、宣言に無い物（素材の場所・字幕の文・絵）を返す道具が、尋ねずに送る
+        # 読むだけの道具を全部、引数なしで動かして、結果の中身から宣言を確かめる
+        secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
+        texts = {segment.text for segment in transcript.segments}
+        checked = 0
+        for operation in OPERATIONS:
+            if operation.writes or operation.asks:
+                continue
+            try:
+                result: object = operation(secret_host, {})
+            except ToolError as exc:
+                # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
+                result = str(exc)
+            checked += 1
+            if isinstance(result, ImageResult):
+                assert Outbound.FRAMES in operation.sends, operation.name
+                continue
+            text = json.dumps(result, ensure_ascii=False, default=str)
+            if any(secret in text for secret in secrets):
+                assert Outbound.FILES in operation.sends, operation.name
+            if any(sentence in text for sentence in texts):
+                assert Outbound.TEXT in operation.sends, operation.name
+        assert checked >= 10
+
+    def test_only_frames_text_and_files_are_asked(self) -> None:
+        # 壊れると、指示の文や編集の構成まで尋ねて、AI に何も頼めなくなる（または逆に絵を尋ねない）
+        assert ASKED == (Outbound.FRAMES, Outbound.TEXT, Outbound.FILES)
+        assert {kind.value for kind in Outbound} == {
+            "conversation",
+            "project",
+            "app_settings",
+            "files",
+            "text",
+            "frames",
+        }
+
+
+# --- 送る前に尋ねる ---
+
+
+class TestAskingBeforeSending:
+    def test_the_first_preview_asks_before_drawing(self, host: FakeHost) -> None:
+        # 壊れると、本人が知らないうちに映像の絵が外へ出る
+        bridge = EditorBridge(host)
+        drawn_when_asked: list[int] = []
+
+        def deny(request: SendRequest) -> SendAnswer:
+            drawn_when_asked.append(len(host.rendered))
+            return SendAnswer.DENY
+
+        seen, _box = _run(bridge, "preview_frame", deny)
+        assert [request.kinds for request in seen] == [(Outbound.FRAMES,)]
+        assert drawn_when_asked == [0]
+        assert DESTINATION in seen[0].text()
+        assert "映像の絵" in seen[0].text()
+
+    def test_denying_sends_nothing(self, host: FakeHost) -> None:
+        # 壊れると、「送らない」を押しても絵が描かれて外へ出る
+        bridge = EditorBridge(host)
+        _seen, box = _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
+        assert isinstance(box.get("error"), ToolError)
+        assert "映像の絵" in str(box["error"])
+        assert host.rendered == []
+
+    def test_a_denial_is_kept_until_the_app_closes(self, host: FakeHost) -> None:
+        # 壊れると、断ったのに AI が呼び直すたびに窓が出て、作業が止まり続ける
+        bridge = EditorBridge(host)
+        _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
+        _seen, box = _run(bridge, "preview_frame")
+        assert isinstance(box.get("error"), ToolError)
+        assert host.rendered == []
+
+    def test_allowing_until_close_does_not_ask_again(self, host: FakeHost) -> None:
+        # 壊れると、AI が絵を見るたびに窓が出て、1 本の動画を見るのに何十回も押す
+        bridge = EditorBridge(host)
+        seen, box = _run(bridge, "preview_frame", lambda _request: SendAnswer.UNTIL_CLOSE)
+        assert len(seen) == 1
+        assert isinstance(box.get("result"), ImageResult)
+        _seen, again = _run(bridge, "preview_frame")
+        assert isinstance(again.get("result"), ImageResult)
+        assert len(host.rendered) == 2
+
+    def test_closing_the_window_is_not_remembered(self, host: FakeHost) -> None:
+        # 壊れると、答えずに閉じただけで「送らない」が残り、次に尋ねてもらえない
+        bridge = EditorBridge(host)
+        _seen, box = _run(bridge, "preview_frame", lambda _request: None)
+        assert isinstance(box.get("error"), ToolError)
+        seen, _box = _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
+        assert len(seen) == 1
+
+    def test_auto_approve_does_not_skip_it(self, host: FakeHost) -> None:
+        # 壊れると、「変更を自動で承認」を入れた人の絵が、尋ねずに外へ出る（外へ送るのは
+        # 取り消せない 2026-10-14 利用者の決定）
+        bridge = EditorBridge(host, auto_approve=True)
+        seen, _box = _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
+        assert len(seen) == 1
+
+    def test_a_setting_of_allow_sends_without_asking(self, host: FakeHost) -> None:
+        # 壊れると、設定で「尋ねずに送る」にした人にも毎回窓が出る
+        bridge = EditorBridge(host)
+        bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+        _seen, box = _run(bridge, "preview_frame")
+        assert isinstance(box.get("result"), ImageResult)
+
+    def test_a_setting_of_deny_refuses_without_asking(self, host: FakeHost) -> None:
+        # 壊れると、設定で「送らない」にしたのに窓が出る（押し間違えると送る）
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.DENY})
+        _seen, box = _run(bridge, "get_subtitles")
+        assert isinstance(box.get("error"), ToolError)
+        assert "字幕と文字" in str(box["error"])
+
+    def test_changing_the_setting_forgets_the_answer_in_the_window(self, host: FakeHost) -> None:
+        # 壊れると、設定で「送る前に尋ねる」に戻しても、前に窓で答えたままになり尋ねない
+        bridge = EditorBridge(host)
+        _run(bridge, "preview_frame", lambda _request: SendAnswer.UNTIL_CLOSE)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FRAMES: SendChoice.ALLOW})
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FRAMES: SendChoice.ASK})
+        seen, _box = _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
+        assert len(seen) == 1
+
+    def test_tools_that_send_only_the_structure_never_ask(self, host: FakeHost) -> None:
+        # 壊れると、分割や選択のたびに窓が出て、AI に編集を頼めなくなる
+        bridge = EditorBridge(host, auto_approve=True)
+        clip = host.project.timeline.tracks[0].clips[0]
+        _seen, box = _run(bridge, "split_clip", arguments={"clip_id": str(clip.id), "frame": 30})
+        assert box.get("error") is None
+        _seen, box = _run(bridge, "get_selection")
+        assert box.get("error") is None
+
+    def test_an_interrupt_while_asking_folds_it(self, host: FakeHost) -> None:
+        # 壊れると、中断を押しても AI のスレッドが送る前の確かめの返事を 10 分待ち続ける
+        bridge = EditorBridge(host)
+
+        def interrupt(_request: SendRequest) -> SendAnswer:
+            bridge.cancel()
+            return SendAnswer.ALWAYS
+
+        _seen, box = _run(bridge, "preview_frame", interrupt)
+        assert isinstance(box.get("error"), ToolError)
+        assert host.rendered == []
+
+    def test_no_answer_in_time_sends_nothing(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、席を外している間に時間が切れ、黙って送る
+        monkeypatch.setattr(bridge_module, "SEND_TIMEOUT", 0.05)
+        bridge = EditorBridge(host)
+        done, box = call_in_thread(bridge, _operation("preview_frame"), {})
+        deadline = time.monotonic() + 5
+        while not done.is_set() and time.monotonic() < deadline:
+            bridge.pump()
+            time.sleep(0.005)
+        assert isinstance(box.get("error"), ToolError)
+        assert host.rendered == []
+
+
+# --- 素材の名前と場所 ---
+
+
+class TestFileNames:
+    def test_not_allowed_names_are_hidden_but_the_tool_still_works(
+        self, secret_host: FakeHost
+    ) -> None:
+        # 壊れると、名前を送らないと決めた人の素材の場所（ユーザー名入り）が外へ出るか、
+        # 一覧の道具ごと断られて AI が素材を指せなくなる
+        bridge = EditorBridge(secret_host)
+        seen, box = _run(bridge, "list_media", lambda _request: SendAnswer.DENY)
+        assert [request.kinds for request in seen] == [(Outbound.FILES,)]
+        text = json.dumps(box["result"], ensure_ascii=False)
+        assert "秘密の人" not in text
+        assert "結婚式" not in text
+        media = secret_host.project.media[0]
+        assert str(media.id) in text
+
+    def test_errors_are_hidden_too(self, secret_host: FakeHost) -> None:
+        # 壊れると、断った人の素材の名前が、エラーの文に混ざって外へ出る
+        bridge = EditorBridge(secret_host, auto_approve=True)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.DENY})
+        media = secret_host.project.media[0]
+        _seen, box = _run(bridge, "jet_cut", arguments={"media_id": str(media.id)})
+        error = box.get("error")
+        assert isinstance(error, ToolError)
+        assert "波形" in str(error)
+        assert "結婚式" not in str(error)
+
+    def test_a_tool_that_forgot_to_declare_names_still_hides_them(
+        self, secret_host: FakeHost
+    ) -> None:
+        # 壊れると、宣言を書き漏らした道具が、まだ許していない素材の場所を送る
+        leaky = Operation(
+            name="leaky",
+            description="",
+            schema={},
+            handler=lambda host, _arguments: {"path": str(host.document.project.media[0].path)},
+            sends=frozenset({Outbound.PROJECT}),
+        )
+        bridge = EditorBridge(secret_host)
+        done, box = call_in_thread(bridge, leaky, {})
+        answer_sends(bridge, done, _never)
+        assert "秘密の人" not in json.dumps(box["result"], ensure_ascii=False)
+
+    def test_allowed_names_pass_through(self, secret_host: FakeHost) -> None:
+        # 壊れると、名前を送ってよいと答えた人にも伏せ字が返り、AI が素材を名前で探せない
+        bridge = EditorBridge(secret_host)
+        _seen, box = _run(bridge, "list_media", lambda _request: SendAnswer.UNTIL_CLOSE)
+        assert "結婚式の撮影.mp4" in json.dumps(box["result"], ensure_ascii=False)
+
+    def test_an_image_from_an_undeclared_tool_is_refused(self, host: FakeHost) -> None:
+        # 壊れると、絵を返すと宣言していない道具（#320 の見渡しの絵など）が、尋ねずに絵を送る
+        def draw(target: EditorHost, _arguments: dict[str, Any]) -> object:
+            return ImageResult(png=target.render_png(0, width=160))
+
+        sneaky = Operation(
+            name="sneaky",
+            description="",
+            schema={},
+            handler=draw,
+            sends=frozenset({Outbound.PROJECT}),
+        )
+        bridge = EditorBridge(host)
+        bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+        done, box = call_in_thread(bridge, sneaky, {})
+        answer_sends(bridge, done, _never)
+        assert isinstance(box.get("error"), ToolError)
+
+
+class TestRedact:
+    def test_a_path_inside_a_sentence_is_hidden(self) -> None:
+        # 壊れると、表に無い場所（退避のフォルダなど）が文に続けて書かれたとき、伏せずに送る
+        text = redact("置き場はC:\\Users\\秘密の人\\退避 です", [])
+        assert "秘密の人" not in text
+        assert "置き場は" in text
+
+    def test_longer_secrets_are_replaced_first(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、場所の中のファイル名だけが先に伏せられ、フォルダの名前が残る
+        project = make_loaded(replace(video_media, path=SECRET_PATH), transcript)
+        table = file_secrets(project, project_path=None, export_folder=None)
+        hidden = redact({"path": SECRET_PATH.as_posix(), "list": [SECRET_PATH.name]}, table)
+        assert "秘密の人" not in json.dumps(hidden, ensure_ascii=False)
+        assert "〔素材" in hidden["path"]
+
+    def test_the_caption_of_a_frame_keeps_the_timecode(self, host: FakeHost) -> None:
+        # 壊れると、伏せ字の処理で絵の説明（何フレーム目か）まで消え、AI がどこの絵か分からない
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FRAMES: SendChoice.ALLOW})
+        _seen, box = _run(bridge, "preview_frame", arguments={"frame": 30})
+        result = box.get("result")
+        assert isinstance(result, ImageResult)
+        assert format_timecode(30, host.project.rate) in result.caption

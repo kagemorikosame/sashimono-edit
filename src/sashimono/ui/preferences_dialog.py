@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
+from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
 from sashimono.core.io.recovery import TrimItem
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
@@ -160,6 +163,8 @@ class PreferencesDialog(QDialog):
     def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("設定")
+        #: 開いたときの設定 :meth:`preferences` はこれに画面の値を重ねる
+        self._base = preferences
 
         form = QFormLayout()
 
@@ -737,6 +742,30 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._ai_ask_questions)
 
+        # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
+        # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
+        self._ai_sends: dict[Outbound, QComboBox] = {}
+        current = preferences.send_choices()
+        for kind in ASKED:
+            send_box = QComboBox(self)
+            for choice in SendChoice:
+                send_box.addItem(choice.label, choice.value)
+            send_box.setCurrentIndex(max(0, send_box.findData(current[kind].value)))
+            send_box.setToolTip(f"{kind.detail}\n送り先: {DESTINATION}")
+            self._ai_sends[kind] = send_box
+            form.addRow(f"AI へ送る物: {kind.label}", send_box)
+        always = "・".join(kind.label for kind in Outbound if not kind.asked)
+        sends_note = QLabel(
+            f"AI アシスタントは、道具の結果を {DESTINATION} へ送る"
+            f" {always}は、AI に編集を頼むといつも送る"
+            " 上の 3 つは、初めて送るときに尋ねる（「送る前に尋ねる」）"
+            " 窓で「送る」と答えるとここが「尋ねずに送る」になる"
+            " 「送らない」にした絵と文字を使う道具は動かさず、名前と場所は伏せ字にして送る",
+            self,
+        )
+        sends_note.setWordWrap(True)
+        form.addRow(sends_note)
+
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
         )
@@ -841,8 +870,14 @@ class PreferencesDialog(QDialog):
         box.setCurrentIndex(index)
 
     def preferences(self) -> Preferences:
-        """画面で選ばれた設定"""
-        return Preferences(
+        """画面で選ばれた設定
+
+        開いたときの設定に重ねる 画面に出さない項目（書き出しのフォルダなど、覚えている物）を
+        既定から作り直すと、OK を押しただけで消える（書き出しのフォルダが消えると、AI が
+        そこへ書けなくなり、書き出しの窓もビデオのフォルダから選び直しになる）
+        """
+        return replace(
+            self._base,
             use_proxy=self._use_proxy.isChecked(),
             proxy_height=int(self._proxy_height.currentData()),
             auto_quality=self._auto_quality.isChecked(),
@@ -909,7 +944,13 @@ class PreferencesDialog(QDialog):
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
+            ai_send_frames=self._send_value(Outbound.FRAMES),
+            ai_send_text=self._send_value(Outbound.TEXT),
+            ai_send_files=self._send_value(Outbound.FILES),
         )
+
+    def _send_value(self, kind: Outbound) -> str:
+        return str(self._ai_sends[kind].currentData())
 
     def accept(self) -> None:
         """書けない置き場や、バックアップを消す減らし方は、閉じる前に確かめる

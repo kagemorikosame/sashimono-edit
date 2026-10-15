@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from sashimono import __version__
 from sashimono.ai.host import ToolError
+from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.core import userdirs
@@ -1214,6 +1215,7 @@ class MainWindow(QMainWindow):
                 replace(self._preferences, ai_model=model, ai_effort=effort)
             )
         )
+        self._chat.send_allowed.connect(self._remember_send_allowed)
 
         self._transport.play_toggled.connect(self._playback.toggle)
         self._transport.step_requested.connect(
@@ -1961,6 +1963,15 @@ class MainWindow(QMainWindow):
             PreferenceStore().save(self._preferences)
         except OSError as exc:
             self.statusBar().showMessage(f"設定を保存できなかった: {exc}", 5000)
+
+    def _remember_send_allowed(self, kind: str) -> None:
+        """AI へ送る物の窓で「送る（次からは尋ねない）」と答えた 設定の「AI へ送る物」に覚える
+
+        覚えるのは人が窓で答えたときだけ AI の道具からは設定を変えられない（#350）
+        """
+        self._remember_preferences(
+            self._preferences.with_send_choice(Outbound(kind), SendChoice.ALLOW)
+        )
 
     def _insert_media_by_id(self, media_id: str) -> None:
         project = self.view_project

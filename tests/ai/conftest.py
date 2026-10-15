@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
+from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.core.commands import AddClip, Command, Document, InScene
 from sashimono.core.model import (
     ClipId,
@@ -162,6 +164,16 @@ class FakeHost:
 
     def app_settings(self) -> dict[str, object]:
         return self.settings
+
+
+def allow_sending(bridge: EditorBridge) -> EditorBridge:
+    """外へ送る物（#342）をすべて「尋ねずに送る」にしたブリッジ
+
+    包み方や待ち合わせを見る試験で、送る前の確かめに答える役を置かずに済ませる
+    確かめそのものは tests/ai/test_outbound.py が見る
+    """
+    bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+    return bridge
 
 
 def make_loaded(video_media: MediaItem, transcript: Transcript) -> Project:
