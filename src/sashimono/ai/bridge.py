@@ -347,19 +347,24 @@ class EditorBridge:
         言われていなければ、結果の中の文字も伏せる
         """
         texts: list[str] | None = None
-        if Outbound.TEXT in operation.hidden and not self.may_send(Outbound.TEXT):
+        hide_body = Outbound.TEXT in operation.hidden and not self.may_send(Outbound.TEXT)
+        if hide_body:
             # 動かす前の文も表に入れる 取り消すと、取り消した操作が足した文は作品から消える
             texts = text_secrets(self._host.document.project)
+        elif operation.labels and not self.may_send(Outbound.FILES):
+            # 名前と場所だけを断った人 操作の名前の対象を形で伏せる（表は使わない）
+            # 置いた後に消した素材の名前は今の作品に無く、表からは伏せられない
+            texts = []
         try:
             result = self._guarded(operation, work)
         except ToolError as exc:
             if texts is None:
                 raise
-            raise ToolError(str(self._hide_text(str(exc), texts))) from None
-        return result if texts is None else self._hide_text(result, texts)
+            raise ToolError(str(self._hide_text(str(exc), texts, hide_body))) from None
+        return result if texts is None else self._hide_text(result, texts, hide_body)
 
-    def _hide_text(self, value: object, before: list[str]) -> object:
-        after = text_secrets(self._host.document.project)
+    def _hide_text(self, value: object, before: list[str], body: bool) -> object:
+        after = text_secrets(self._host.document.project) if body else []
         return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
 
     def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:

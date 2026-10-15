@@ -33,6 +33,7 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
 )
+from sashimono.core.commands import RemoveMedia
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.timebase import format_timecode
 from tests.ai.conftest import FakeHost, make_loaded
@@ -680,6 +681,56 @@ class TestWaitingTools:
         # 壊れると、素材の名前の入った断りの文（映像がありません・調べられませんでした）を、
         # 名前と場所を断った人の所でも尋ねずに送る
         assert _operation("detect_scenes").sends == {Outbound.PROJECT, Outbound.FILES}
+
+
+class TestPlacesOutsideTheTable:
+    """表（今の作品の素材と場所）に無い名前と場所（Codex の指摘 #366）"""
+
+    def test_a_removed_material_name_in_the_history_is_hidden(self, secret_host: FakeHost) -> None:
+        # 壊れると、置いてから消した素材の名前（「配置: 結婚式の撮影.mp4」）が履歴に残り、
+        # 名前と場所を断った人の所でも外へ出る 今の作品に無い名前は表から伏せられない
+        media = secret_host.document.project.media[0]
+        _operation("place_media")(secret_host, {"media_id": str(media.id)})
+        clips = [
+            str(clip.id)
+            for track in secret_host.document.project.timeline.tracks
+            for clip in track.clips
+        ]
+        _operation("delete_clips")(secret_host, {"clip_ids": clips})
+        secret_host.apply_commands([RemoveMedia(media.id)], "素材を削除")
+        assert not secret_host.document.project.media
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices(
+            {Outbound.FRAMES: SendChoice.ASK, Outbound.TEXT: SendChoice.ALLOW}
+            | {Outbound.FILES: SendChoice.DENY}
+        )
+        _seen, box = _run(bridge, "get_history")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert "結婚式" not in sent
+        assert "配置" in sent
+
+    def test_a_folder_at_the_root_is_hidden(self) -> None:
+        # 壊れると、根の直下の 1 段だけの場所（/backup）が、区切りが 1 つなので伏せずに送られる
+        assert "backup" not in redact("/backup", [])
+        assert "backup" not in redact("置き場 \\backup", [])
+        assert redact("1/2 画質", []) == "1/2 画質"
+
+    def test_folders_in_the_settings_are_hidden_whole(self, host: FakeHost) -> None:
+        # 壊れると、設定の中のフォルダの値が、形（区切りの数など）しだいで伏せずに送られる
+        host.settings = {
+            "preferences": {
+                "state_folder": "backup",
+                "export_folder": "/書き出し",
+                "theme": "dark",
+            },
+        }
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.DENY})
+        _seen, box = _run(bridge, "get_app_settings")
+        preferences = box["result"]["preferences"]  # type: ignore[index]  # 結果は辞書で返る
+        assert preferences["state_folder"] != "backup"
+        assert "書き出し" not in preferences["export_folder"]
+        assert preferences["theme"] == "dark"
 
 
 class TestRedact:

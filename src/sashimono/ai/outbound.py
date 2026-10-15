@@ -216,8 +216,17 @@ _ABSOLUTE_PATH = re.compile(
     + _PATH_TAIL
     + r"|(?<![\w/.:~\\])[/\\][^\s\"'<>|*?/\\]+[/\\]"
     + _PATH_TAIL
+    # 根の直下の 1 段だけの場所（``/backup``） 区切りが 1 つしか無いので上には当たらない
+    # 文字の頭か空白の後に始まり、空白か終わりで閉じる物だけ ``1/2 画質`` の ``/2`` は
+    # 数字の後なので当たらない
+    + r"|(?:^|(?<=\s))[/\\][^\s\"'<>|*?/\\]+(?=$|\s)"
 )
 _PATH_MARK = "〔ファイルの場所〕"
+
+#: 値ごと伏せる項目の名前 設定の中のフォルダ（``state_folder``・``export_folder``）や
+#: 一覧の ``path`` など 中身の形（正規表現）で見分けると、``/backup`` のような短い場所や、
+#: 区切りの無い書き方で漏れる 名前で分かる物は中身を見ずに伏せる
+_PLACE_KEY = re.compile(r"(?:^|_)(?:path|folder|dir|directory)s?$")
 
 
 def file_secrets(
@@ -323,9 +332,24 @@ def redact(value: Any, table: Iterable[tuple[str, str]]) -> Any:
                     item = item.replace(secret, mark)
             return _ABSOLUTE_PATH.sub(_PATH_MARK, item)
         if isinstance(item, Mapping):
-            return {walk(key): walk(entry) for key, entry in item.items()}
+            return {
+                walk(key): (
+                    whole(walk(entry))
+                    if isinstance(key, str) and _PLACE_KEY.search(key)
+                    else walk(entry)
+                )
+                for key, entry in item.items()
+            }
         if isinstance(item, list | tuple):
             return [walk(entry) for entry in item]
+        return item
+
+    def whole(item: Any) -> Any:
+        """場所の項目の値 表で伏せ字になった物（〔素材 …〕）は残し、ほかは値ごと伏せる"""
+        if isinstance(item, str):
+            return item if not item or item.startswith("〔") else _PATH_MARK
+        if isinstance(item, list):
+            return [whole(entry) for entry in item]
         return item
 
     return walk(value)

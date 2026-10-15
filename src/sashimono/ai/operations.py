@@ -169,6 +169,11 @@ class Operation:
     #: 今は取り消しと履歴の道具の字幕と文字だけ（操作の名前に文の頭が混ざるだけで、
     #: 道具の役目は文を送ることではない 2026-10-15 利用者の決定）
     hidden: frozenset[Outbound] = field(default=frozenset(), kw_only=True)
+    #: 結果が操作の名前（履歴と取り消し）か 名前の「動き: 対象」の対象には素材の名前や本文が
+    #: 入るが、消した素材の名前は今の作品に無いので、表
+    #: （:func:`~sashimono.ai.outbound.file_secrets`）では伏せられない
+    #: 名前と場所か字幕と文字を許していなければ、対象を形で伏せる
+    labels: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
@@ -2268,6 +2273,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_get_history,
         sends=_HISTORY,
         hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
     ),
     Operation(
         name="preview_frame",
@@ -2970,6 +2976,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_undo,
         sends=_HISTORY,
         hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
         writes=True,
     ),
     Operation(
