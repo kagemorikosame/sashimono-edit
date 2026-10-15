@@ -456,10 +456,14 @@ class BurnDialog(QDialog):
         lines: list[str] = []
         if everyone is not None:
             lines.append(self._request.describe(everyone))
-        refused = [c for c in (everyone, *self._own.values()) if c is not None and c.refusal]
+        # 断るのは焼き込む話し手の見た目だけ（答えに入れるのと同じ範囲） 印を外した話し手の
+        # 使えない見た目で止めると、焼き込まない人のせいで〔焼き込む〕が押せない
+        chosen = self.chosen()
+        used = [look for voice, look in self._own.items() if voice in chosen]
+        refused = [c for c in (everyone, *used) if c is not None and c.refusal]
         ok = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok is not None:
-            ok.setEnabled(everyone is not None and not refused and bool(self.chosen()))
+            ok.setEnabled(everyone is not None and not refused and bool(chosen))
         for choice in refused:
             lines.append(f"「{choice.label}」は使えない: {choice.refusal}")
         self._note.setText("\n".join(lines))

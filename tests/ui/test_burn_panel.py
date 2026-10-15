@@ -15,7 +15,15 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QListWidget, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QListWidget,
+    QMessageBox,
+)
 
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
@@ -29,7 +37,7 @@ from sashimono.compat.subtitle_looks import (
     selected_choice,
     template_choice,
 )
-from sashimono.core.commands import AddClip, AddTrack, Command, Voice
+from sashimono.core.commands import AddClip, AddTrack, Command, Voice, subtitle_voices
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io.aliases import Alias
 from sashimono.core.io.presets import Preset
@@ -224,6 +232,44 @@ class TestBurning:
 
 
 class TestTheWindow:
+    def test_an_unused_voice_with_a_refused_look_does_not_block(
+        self,
+        panel: tuple[SubtitlePanel, list[list[Command]]],
+        thumbnails: LookThumbnails,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると、話し手 2 に文字を持たないテンプレートを選んだ後で話し手 2 の印を外しても、
+        # 焼き込まない話し手の見た目に断られて〔焼き込む〕が押せないまま残る（Codex の指摘）
+        widget, _sent = panel
+        shelf = tmp_path / "棚"
+        shelf.mkdir()
+        (shelf / "丸だけ.object").write_text(
+            "\n".join(["[Object]", "frame=0,89", "[Object.0]", "effect.name=図形", ""]),
+            "utf-8",
+        )
+        (entry,) = TemplateCatalog().scan((shelf,))
+        widget.shelf_provider = lambda: (entry,)
+        voices = subtitle_voices(widget._project)
+        request = widget._request(voices, title="焼", accept="焼き込む", choose=True)
+        dialog = BurnDialog(
+            request, thumbnails=thumbnails, options=LibraryOptions(thumbnails=THUMBNAILS_SIMPLE)
+        )
+        try:
+            second = voices[1]
+            assert not dialog.choose(template_choice(entry).key, voice=second)
+            buttons = dialog.findChild(QDialogButtonBox)
+            assert buttons is not None
+            ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            assert ok is not None and not ok.isEnabled()
+            checks = [c for c in dialog.findChildren(QCheckBox) if c.text().endswith("音声 2")]
+            checks[0].setChecked(False)
+            assert ok.isEnabled()
+            answer = dialog.answer()
+            assert answer is not None and answer.voices == [voices[0]] and not answer.looks
+        finally:
+            dialog.reject()
+            dialog.deleteLater()
+
     def test_a_remembered_shelf_look_that_no_longer_has_text_falls_back(
         self,
         panel: tuple[SubtitlePanel, list[list[Command]]],
