@@ -37,7 +37,7 @@ def ink(image: np.ndarray) -> tuple[int, int, int, int]:
 def drawn(source: GeneratedSource, scale: float = 1.0) -> np.ndarray:
     width, height = round(SCREEN[0] * scale), round(SCREEN[1] * scale)
     canvas = source_canvas(source, width, height, scale=(scale, scale))
-    image = render_source_framed(source, *canvas, scale=(scale, scale), screen=(width, height))[0]
+    image = render_source_framed(source, *canvas, scale=(scale, scale))[0]
     assert image is not None
     return image
 
@@ -45,8 +45,12 @@ def drawn(source: GeneratedSource, scale: float = 1.0) -> np.ndarray:
 class TestSpec:
     def test_the_width_is_the_last_item_and_off_by_default(self) -> None:
         # 既定 0 は折り返さない 古いファイルは項目が無く、既定で開くので見た目が変わらない
-        # 末尾に足す（既存の項目の位置を動かさない） 後ろはスタイルの欄（#248）だけ
-        assert [spec.name for spec in TEXT.parameters[-2:]] == ["wrap_width", "font_style"]
+        # 末尾に足す（既存の項目の位置を動かさない） 後ろはスタイルの欄（#248）と、
+        # 塗りと影の塗りの欄（#312）だけ
+        names = [spec.name for spec in TEXT.parameters]
+        after = names[names.index("wrap_width") :]
+        assert after[:2] == ["wrap_width", "font_style"]
+        assert all(name.startswith(("fill_", "shadow_fill_")) for name in after[2:])
         width = TEXT.create().params["wrap_width"]
         assert isinstance(width, AnimatedValue) and width.static == 0
 

@@ -29,6 +29,7 @@ from sashimono.compat.aviutl.motion import (
     parse_motion,
 )
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
+from sashimono.compat.aviutl.text_fill import text_gradient_fill
 from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.compat.layers import heard_stream, layer_tracks
 from sashimono.compat.mapped import MappedObject
@@ -773,9 +774,14 @@ def map_object(
     # オブジェクト分割 の分け方 切らないうちは 1 マスなので、個別の効果は何も動かさない
     # （AviUtl2 でも分割なしの 個別の拡大 50 は元の絵のままだった）
     grid: dict[str, ParamValue] = {}
+    #: まだ中身のすぐ後ろか テキストの塗りへ写せるのは、中身のすぐ後ろの
+    #: グラデーション 1 つだけ（#312） 読めないフィルタ・オブジェクト分割・写した塗りの
+    #: 後ろの物は、前の物が変えた絵に掛かるので写さない
+    at_head = True
 
     for entry in stacked:
         if entry.name == _SPLIT:
+            at_head = False
             grid = _split_grid(entry, points, log)
             continue
         if entry.name in _DRAW_NAMES:
@@ -791,6 +797,14 @@ def map_object(
             continue
 
         effect = _filter(entry, points, log)
+        head, at_head = at_head, False
+        if effect is not None and source is not None and head:
+            # テキストのすぐ後ろのグラデーションは、テキストの塗りとして読む（#312）
+            # 写せない物（縁のある字など）はエフェクトのまま並びに残る
+            folded = text_gradient_fill(effect, source)
+            if folded is not None:
+                source = replace(source, params={**source.params, **folded})
+                continue
         if effect is not None and entry.name in _SOUND_PLACEMENT:
             effect = replace(effect, fixed=True)
         if effect is not None and effect.kind == "split_pieces":
@@ -1353,6 +1367,23 @@ _ALIGNMENTS: dict[str, tuple[str, str]] = {
     "右寄せ[下]": ("right", "bottom"),
 }
 
+#: AviUtl2 の縦書きの ``文字揃え``（``縦書 上寄[右]`` など 名前は AviUtl2 v2.1.6a の本体から読んだ）
+#: 値は（縦の揃え, 横の基準） 2026-10-15 に 9 通りを AviUtl2 に描かせると、上寄・中央・下寄は
+#: 塊の上端・真ん中・下端を位置に合わせ、列どうしも同じ向きに揃えた（短い列が上・真ん中・下に寄る）
+#: [右]・[中]・[左] は塊の右端・真ん中・左端を位置に合わせた 前は名前を知らずに横書きの
+#: 中央揃え[下] で読み、縦書きの字幕が横書きで出ていた
+_VERTICAL_ALIGNMENTS: dict[str, tuple[str, str]] = {
+    "縦書 上寄[右]": ("top", "right"),
+    "縦書 中央[右]": ("middle", "right"),
+    "縦書 下寄[右]": ("bottom", "right"),
+    "縦書 上寄[中]": ("top", "center"),
+    "縦書 中央[中]": ("middle", "center"),
+    "縦書 下寄[中]": ("bottom", "center"),
+    "縦書 上寄[左]": ("top", "left"),
+    "縦書 中央[左]": ("middle", "left"),
+    "縦書 下寄[左]": ("bottom", "left"),
+}
+
 
 def _text(entry: ExoEntry, log: CompatibilityReport) -> GeneratedSource:
     """テキストオブジェクト 世代でパラメータ名がまるごと違う"""
@@ -1374,6 +1405,13 @@ def _text(entry: ExoEntry, log: CompatibilityReport) -> GeneratedSource:
         # 今まで読めていた AviUtl1 の字幕の位置が黙って動く
         "layout": "aviutl" if entry.generation >= 2 else "native",
     }
+    named = (entry.params.get("文字揃え") or "").strip()
+    if named in _VERTICAL_ALIGNMENTS:
+        valign, anchor = _VERTICAL_ALIGNMENTS[named]
+        params.update({"vertical": True, "valign": valign, "anchor": anchor})
+    elif named and named not in _ALIGNMENTS:
+        # 知らない名前は中央揃え[下] で読む 黙って読むと、置き場所のずれが数に上がらない
+        log.note_missing(f"テキストの文字揃え: {named}")
     font = entry.value("フォント", "font")
     if font:
         params["font"] = font

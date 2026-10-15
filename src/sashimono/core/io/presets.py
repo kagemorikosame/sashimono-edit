@@ -34,7 +34,14 @@ from sashimono.core.io.serialize import (
     source_from_json,
     source_to_json,
 )
-from sashimono.core.model import AnimatedValue, Clip, Effect, GeneratedSource, ParamValue
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Effect,
+    GeneratedSource,
+    ParamValue,
+    uses_gradient,
+)
 
 __all__ = [
     "FORMAT_NAME",
@@ -54,8 +61,13 @@ FORMAT_NAME = "sashimono-preset"
 #: 前の版では縁が 1 本も無い見た目を黙って当てる（層へ移した字は前からの縁の太さが 0）
 #: 層を持つプリセットだけを版 2 で書き、前の版には「新しい形式」で読ませない
 #: 層を持たないプリセットは版 1 のまま書く 前の版でも今までどおり読める（#288 の決まり）
-FORMAT_VERSION = 2
-#: 縁取りの層を持たないプリセットを書く版
+#: 版 3 で塗り・影・縁取りの層の色のグラデーション（#312）を足した 版 2 までの本体は
+#: 項目を知らずに単色で当てるので、グラデーションを使う物だけを版 3 で書き、前の版には
+#: 「新しい形式」で読ませない 使わない物は前と同じ版（層があれば 2、無ければ 1）で書く
+FORMAT_VERSION = 3
+#: 縁取りの層を持つ（グラデーションは使わない）プリセットを書く版
+_LAYERED_VERSION = 2
+#: 縁取りの層もグラデーションも持たないプリセットを書く版
 _PLAIN_VERSION = 1
 SUFFIX = ".smep"
 
@@ -205,9 +217,7 @@ class Preset:
             values["clip_to_below"] = self.clip_to_below
         return {
             "format": FORMAT_NAME,
-            "version": FORMAT_VERSION
-            if self.source is not None and self.source.strokes
-            else _PLAIN_VERSION,
+            "version": _version_of(self.source),
             "name": self.name,
             "category": self.category,
             # 前の版の本体はこの 2 つだけを読む 版の数字を上げずに項目を足したので、
@@ -271,6 +281,15 @@ class Preset:
             Effect(kind=effect.kind, params=dict(effect.params), enabled=effect.enabled)
             for effect in self.effects
         )
+
+
+def _version_of(source: GeneratedSource | None) -> int:
+    """プリセットを書く版 前の版の本体が読んで黙って違う見た目を当てる物だけ版を上げる"""
+    if source is None:
+        return _PLAIN_VERSION
+    if source.kind == "text" and uses_gradient(source.params, source.strokes):
+        return FORMAT_VERSION
+    return _LAYERED_VERSION if source.strokes else _PLAIN_VERSION
 
 
 def _flag(raw: object) -> bool | None:

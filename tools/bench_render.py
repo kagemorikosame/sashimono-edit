@@ -64,14 +64,18 @@ from sashimono.core.model import (  # noqa: E402
     AnimatedValue,
     Clip,
     GeneratedSource,
+    Keyframe,
     Project,
     ProjectSettings,
+    Stroke,
     Track,
     TrackKind,
 )
 from sashimono.core.timebase import FrameRate  # noqa: E402
 from sashimono.effects.definition import registry  # noqa: E402
 from sashimono.effects.sources import TEXT  # noqa: E402
+from sashimono.effects.spec import ParamInput  # noqa: E402
+from sashimono.effects.strokes import STROKE  # noqa: E402
 from sashimono.engine.decode import probe_media  # noqa: E402
 from sashimono.engine.gpu import (  # noqa: E402
     Framebuffer,
@@ -263,17 +267,59 @@ def video_project(
     return project
 
 
-def text_project(settings: ProjectSettings, count: int, length: int) -> Project:
-    """テキストを ``count`` 本重ねたプロジェクト 文字は毎フレーム描き直される"""
+#: グラデーションの場面の止まり（金属風の 4 色） 字の塗り・影・縁取りの層のどれにも使う（#312）
+_METAL = (
+    *(0.0, 1.0, 0.97, 0.8, 1.0),
+    *(0.45, 0.85, 0.65, 0.2, 1.0),
+    *(0.55, 0.55, 0.38, 0.05, 1.0),
+    *(1.0, 1.0, 0.9, 0.5, 1.0),
+)
+
+
+def text_project(
+    settings: ProjectSettings,
+    count: int,
+    length: int,
+    *,
+    gradient: bool = False,
+    moving: bool = False,
+) -> Project:
+    """テキストを ``count`` 本重ねたプロジェクト 影とぼかし・縁取りの層を 1 つ持つ
+
+    ``gradient`` なら塗り・影・縁取りの層をどれもグラデーションにする（#312） 偽なら同じ影と
+    層を単色で持つ（グラデーションの分だけの差を見るため）
+    ``moving`` なら大きさをキーフレームで動かし、毎フレーム字を組み直して塗らせる
+    （止まった字は覚えた絵を重ねるだけなので、塗りの手間はここでしか測れない）
+    """
     project = Project.create(settings)
+    kind = "linear" if gradient else "solid"
+    look: dict[str, ParamInput] = {
+        "fill_type": kind,
+        "fill_gradient": _METAL,
+        "shadow_x": 4.0,
+        "shadow_y": -4.0,
+        "shadow_blur": 3.0,
+        "shadow_fill_type": kind,
+        "shadow_fill_gradient": _METAL,
+    }
+    layer = Stroke(
+        params={
+            **STROKE.default_params(),
+            "width": AnimatedValue(4.0),
+            "fill_type": kind,
+            "fill_gradient": _METAL,
+            "fill_angle": AnimatedValue(180.0),
+        }
+    )
     for index in range(count):
         track = Track(TrackKind.VIDEO, f"T{index + 1}")
         project = AddTrack(track).apply(project)
-        clip = Clip(
-            timeline_start=0,
-            duration=length,
-            source=TEXT.create(text=f"字幕 {index + 1}", size=48, pos_y=index * 30 - 200),
-        )
+        source = TEXT.create(text=f"字幕 {index + 1}", size=48, pos_y=index * 30 - 200, **look)
+        if moving:
+            size = AnimatedValue(48.0, (Keyframe(0, 48.0), Keyframe(length - 1, 64.0)))
+            source = source.with_param("size", size)
+        source = source.with_strokes((layer,))
+        clip = Clip(timeline_start=0, duration=length, source=source)
         project = AddClip(track.id, clip).apply(project)
     return project
 
@@ -419,11 +465,19 @@ def main(argv: list[str] | None = None) -> int:
             f"{arguments.tracks} 本 × エフェクト {arguments.effects}",
             measure(project, context, arguments.frames, readback=arguments.readback),
         )
-        project = text_project(settings, arguments.texts, length)
-        passed &= report(
-            f"テキスト {arguments.texts} 本",
-            measure(project, context, arguments.frames, readback=arguments.readback),
-        )
+        # グラデーション（#312）の有る無しを、止まった字と毎フレーム組み直す字で並べる
+        for moving in (False, True):
+            for gradient in (False, True):
+                project = text_project(
+                    settings, arguments.texts, length, gradient=gradient, moving=moving
+                )
+                name = f"テキスト {arguments.texts} 本 影と縁あり"
+                name += " グラデーション" if gradient else " 単色"
+                if moving:
+                    name += " 大きさが動く"
+                passed &= report(
+                    name, measure(project, context, arguments.frames, readback=arguments.readback)
+                )
         if arguments.videos:
             source = make_video(_base, arguments.width, arguments.height, length / 30 + 1)
             if source is None:
