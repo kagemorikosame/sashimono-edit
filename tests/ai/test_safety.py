@@ -182,6 +182,8 @@ class TestAppSettingsAreReadOnly:
             "app_settings",
             "apply_commands",
             "probe",
+            # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
+            "remembered_names",
             "render_png",
             # 場面の解析（#319 #321） 頼むのは analyze と同じく本人のキャッシュへの解析だけで、
             # 取り込み時に調べるかの設定（Preferences.scene_analysis）は変えない

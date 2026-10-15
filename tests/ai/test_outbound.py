@@ -748,6 +748,7 @@ def _marked_host(
     - そのまま: 素材も作品の名前も今の作品にある
     - 消した後: 置いた素材をクリップごと消し、素材も外した 名前は履歴と字幕起こしの記録にだけ残る
     - 名前を変えた後: 作品は別の名前で保存してあり、作品の名前だけが目印を持つ
+    - 開き直した後: AI に道具を使わせないまま別の作品を開いた 名前は作品の外にだけ残る
     """
     media = replace(video_media, path=Path(f"C:/Users/{MARK}人/動画/{MARK}素材.mp4"))
     project = replace(make_loaded(media, transcript), name=f"{MARK}作品")
@@ -767,6 +768,13 @@ def _marked_host(
         assert not host.document.project.media
     elif scene == "名前を変えた後":
         host.saved_at = tmp_path / "ふつうの名前.sme"
+    elif scene == "開き直した後":
+        # AI に一度も道具を使わせないまま、別の作品を開いた 履歴は消え、前の作品の名前は
+        # 字幕起こしの記録と、アプリが作品の外で覚えている所（前の作品の場所）にだけ残る
+        host.document.reset(replace(make_loaded(video_media, transcript), name="ふつう"))
+        _operation("add_text")(host, {"text": BODY_TEXT})
+        host.remembered = [f"{MARK}前の作品"]
+        host.transcription = f"{MARK}素材.mp4: 終了した（{MARK}前の作品 で始めた起こし）"
     return host
 
 
@@ -788,7 +796,7 @@ def _every_example(host: FakeHost) -> list[tuple[str, dict[str, Any]]]:
 
 
 class TestNoNameLeaksWhenNamesAreRefused:
-    @pytest.mark.parametrize("scene", ["そのまま", "消した後", "名前を変えた後"])
+    @pytest.mark.parametrize("scene", ["そのまま", "消した後", "名前を変えた後", "開き直した後"])
     def test_the_mark_never_reaches_the_results(
         self, scene: str, video_media: MediaItem, transcript: Transcript, tmp_path: Path
     ) -> None:

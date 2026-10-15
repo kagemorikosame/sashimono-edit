@@ -33,12 +33,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from sashimono.core.model import Project
+from sashimono.core.model import MediaItem, Project
 
 __all__ = [
     "ASKED",
     "DESTINATION",
     "PROJECT_MARK",
+    "REMEMBERED_MARK",
     "TEXT_MARK",
     "Outbound",
     "SendAnswer",
@@ -233,6 +234,8 @@ _PLACE_KEY = re.compile(r"(?:^|_)(?:path|folder|dir|directory|file)s?$")
 
 #: 作品の名前を伏せた印
 PROJECT_MARK = "〔作品〕"
+#: アプリが作品の外で覚えている名前と場所を伏せた印
+REMEMBERED_MARK = "〔ファイルの名前〕"
 
 
 def file_secrets(
@@ -240,6 +243,9 @@ def file_secrets(
     *,
     project_path: Path | None,
     export_folder: Path | None,
+    media: Iterable[MediaItem] = (),
+    names: Iterable[str] = (),
+    remembered: Iterable[str] = (),
 ) -> dict[str, str]:
     """素材の名前と場所を伏せる表（伏せる文字 → 置き換える文字）
 
@@ -248,6 +254,12 @@ def file_secrets(
     名前を変える前の作品の名前は、履歴の名前や字幕起こしの記録に残ったまま外へ出るため
     作品の名前（:attr:`Project.name`）も入れる 未保存の作品や、保存した後に名前を変えた作品は、
     保存先の名前と違う 並べる順は :func:`secret_pairs` で決める
+
+    ``media`` と ``names`` は文書が一度でも持った素材と作品の名前
+    （:attr:`~sashimono.core.commands.Document.seen_media`） 履歴は上限で落ち、別の作品を
+    開くと消えるので、履歴だけでは拾い切れない ``remembered`` はアプリが作品の外で覚えている
+    名前と場所（:meth:`~sashimono.ai.host.EditorHost.remembered_names` 字幕起こしの記録・
+    前に開いた作品の場所など）
     """
     table: dict[str, str] = {}
 
@@ -256,14 +268,20 @@ def file_secrets(
             if len(value) >= _SHORTEST_SECRET and value not in table:
                 table[value] = mark
 
+    def add_media(item: MediaItem) -> None:
+        path = item.path
+        add((str(path), path.as_posix(), item.name, path.name, path.stem), f"〔素材 {item.id}〕")
+
     for project in (projects,) if isinstance(projects, Project) else projects:
-        for media in project.media:
-            path = media.path
-            add(
-                (str(path), path.as_posix(), media.name, path.name, path.stem),
-                f"〔素材 {media.id}〕",
-            )
+        for item in project.media:
+            add_media(item)
         add((project.name,), PROJECT_MARK)
+    for item in media:
+        add_media(item)
+    add(names, PROJECT_MARK)
+    for value in remembered:
+        place = Path(value)
+        add((value, place.as_posix(), place.name, place.stem), REMEMBERED_MARK)
     if project_path is not None:
         add(
             (str(project_path), project_path.as_posix(), project_path.name, project_path.stem),

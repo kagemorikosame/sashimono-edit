@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from sashimono.core.commands.base import Command
-from sashimono.core.model import Project
+from sashimono.core.model import MediaId, MediaItem, Project
 
 __all__ = ["Document", "HistoryEntry"]
 
@@ -51,6 +51,31 @@ class Document:
         #: まだ一番上に残っているときだけ同じ段へまとめる 取り消したあとの段へ
         #: まとめると、関係の無い古い操作と一緒に戻ってしまう
         self._merge_anchor: HistoryEntry | None = None
+        #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
+        self._seen_media: dict[tuple[MediaId, str, str], MediaItem] = {}
+        self._seen_names: set[str] = set()
+        self._remember(project)
+
+    @property
+    def seen_media(self) -> tuple[MediaItem, ...]:
+        """この文書が一度でも持った素材（消した物・開き直す前の作品の物も）
+
+        AI へ送る結果の伏せ字（#342）が、作品の外の記録（字幕起こしの知らせ・履歴の名前）に
+        残った名前を拾うのに使う 履歴は上限で古い段が落ち、別の作品を開くと消えるので、
+        履歴からは拾い切れない 中身の大きい物（作品）は持たず、素材の情報だけを覚える
+        """
+        return tuple(self._seen_media.values())
+
+    @property
+    def seen_project_names(self) -> tuple[str, ...]:
+        """この文書が一度でも持った作品の名前（名前を変える前・開き直す前の物も）"""
+        return tuple(sorted(self._seen_names))
+
+    def _remember(self, project: Project) -> None:
+        for media in project.media:
+            # 名前を変えた素材は変える前の名前も残す（ID だけで見ると前の名前を忘れる）
+            self._seen_media.setdefault((media.id, media.name, str(media.path)), media)
+        self._seen_names.add(project.name)
 
     @property
     def project(self) -> Project:
@@ -224,5 +249,6 @@ class Document:
 
     def _set_project(self, project: Project) -> None:
         self._project = project
+        self._remember(project)
         for listener in list(self._listeners):
             listener(project)

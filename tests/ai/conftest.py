@@ -71,6 +71,8 @@ class FakeHost:
             "preferences": {"theme": "dark", "update_check": True},
             "shortcuts": {"編集/分割": "S"},
         }
+        #: アプリが作品の外で覚えている名前（本物は字幕起こしの記録・前に開いた作品の場所など）
+        self.remembered: list[str] = []
 
     @property
     def splits_media(self) -> bool:
@@ -185,6 +187,9 @@ class FakeHost:
 
     def app_settings(self) -> dict[str, object]:
         return self.settings
+
+    def remembered_names(self) -> tuple[str, ...]:
+        return tuple(self.remembered)
 
 
 def allow_sending(bridge: EditorBridge) -> EditorBridge:

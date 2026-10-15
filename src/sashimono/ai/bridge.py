@@ -407,6 +407,9 @@ class EditorBridge:
             (document.project, *document.past_projects),
             project_path=host.project_path,
             export_folder=host.export_folder,
+            media=document.seen_media,
+            names=document.seen_project_names,
+            remembered=host.remembered_names(),
         )
         for secret, mark in learned.items():
             self._known_names.setdefault(secret, mark)
