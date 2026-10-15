@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from sashimono.core.io import atomic
-from sashimono.core.io.atomic import copy_atomic, write_atomic
+from sashimono.core.io.atomic import TargetChangedError, copy_atomic, expect_now, write_atomic
 from sashimono.core.io.folder_pin import FolderSwappedError, pin_folder
 from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.model import Project
@@ -79,6 +79,42 @@ class TestScratchIsAlwaysNew:
         copy_atomic(source, link)
         assert link.read_bytes() == b"new"
         assert original.read_bytes() == b"original"
+
+
+class TestTheTargetIsAsExpected:
+    """許したときの書く先の身元（:class:`Expected`）と、名前を付ける所で照らす（#327）"""
+
+    def test_a_name_that_appears_after_approval_is_not_replaced(self, tmp_path: Path) -> None:
+        # 壊れると、許したときは無かった名前のファイル（別のアプリが作った物）を置き換えて消す
+        target = tmp_path / "完成.mp4"
+        expect = expect_now(target)
+        target.write_bytes(b"other app")
+        with pytest.raises(TargetChangedError, match="前のファイルを残しました"):
+            write_atomic(target, "新しい中身", expect=expect)
+        assert target.read_bytes() == b"other app"
+        assert [path.name for path in tmp_path.iterdir()] == ["完成.mp4"]
+
+    def test_a_file_changed_after_approval_is_not_replaced(self, tmp_path: Path) -> None:
+        # 壊れると、人が置き換えを許したときの中身ではなく、その後に書き換わった中身を消す
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"previous")
+        expect = expect_now(target)
+        target.write_bytes(b"changed afterwards")
+        source = tmp_path / "仮.bin"
+        source.write_bytes(b"new")
+        with pytest.raises(TargetChangedError):
+            copy_atomic(source, target, expect=expect)
+        assert target.read_bytes() == b"changed afterwards"
+
+    def test_as_expected_it_is_written(self, tmp_path: Path) -> None:
+        # 壊れると（照らし方が厳しすぎると）、何も変わっていないのに書けない
+        new = tmp_path / "新しい.txt"
+        write_atomic(new, "新", expect=expect_now(new))
+        assert new.read_text(encoding="utf-8") == "新"
+        old = tmp_path / "前からある.txt"
+        old.write_text("前", encoding="utf-8")
+        write_atomic(old, "後", expect=expect_now(old))
+        assert old.read_text(encoding="utf-8") == "後"
 
 
 class TestSubtitleFiles:

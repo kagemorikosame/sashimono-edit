@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from sashimono.core.commands import Command, Document
+from sashimono.core.io.atomic import Expected
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
@@ -42,6 +43,9 @@ class ExportRequest:
     codec: str | None
     #: 映像のビットレート（Mbps）
     bitrate_mbps: int
+    #: 許したときの書き出し先の身元（無ければ無かったこと） 置く直前に照らし、名前が現れたり
+    #: 中身が変わったりしていれば置かずに断る（#327）
+    expect: Expected
 
 
 class ToolError(RuntimeError):
@@ -201,16 +205,20 @@ class EditorHost(Protocol):
         """
         ...
 
-    def write_project(self, path: Path, *, adopt: bool) -> str:
+    def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
         """作品を ``path`` へ保存する（B1 #327） 画面の〔保存〕と同じ控え・書き方を通す
 
         ``path`` は確かめ済みの場所（:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
         ``adopt`` が真なら、以後の作品の場所を ``path`` にする（名前を付けて保存）
+        ``expect`` は許したときの ``path`` の身元 書いて名前を付ける所で照らし、その間に名前が
+        現れたり中身が変わったりしていれば、置かずに断る（字幕と静止画の書く口も同じ）
         窓は出さない 断るときは :class:`ToolError` 戻り値は知らせに添える言葉（無ければ空）
         """
         ...
 
-    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+    def write_subtitles(
+        self, path: Path, *, frame_range: tuple[int, int] | None, expect: Expected
+    ) -> Path:
         """タイムラインの字幕を ``path`` へ書く（#327） 画面の字幕の書き出しと同じ形式と処理
 
         相手は開いているタイムライン（字幕パネルが見ている物と同じ） ``frame_range`` を
@@ -219,7 +227,7 @@ class EditorHost(Protocol):
         """
         ...
 
-    def write_snapshot(self, path: Path, frame: int) -> int:
+    def write_snapshot(self, path: Path, frame: int, *, expect: Expected) -> int:
         """``frame`` を画面の〔静止画を保存〕と同じ描き方で PNG にして書く（#327）
 
         描いたフレームを返す（終わりを指していれば最後のフレーム） ``path`` は確かめ済みの場所

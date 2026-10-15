@@ -13,9 +13,11 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -24,7 +26,10 @@ from sashimono.core.io.locks import try_hold
 __all__ = [
     "STALE_WRITING_SECONDS",
     "WRITING_SUFFIX",
+    "Expected",
+    "TargetChangedError",
     "copy_atomic",
+    "expect_now",
     "held_for_update",
     "write_atomic",
     "write_atomic_bytes",
@@ -60,7 +65,9 @@ _COPY_CHUNK = 1 << 20
 _LOCK_WAIT = 2.0
 
 
-def write_atomic(path: Path, text: str, *, durable: bool = False) -> None:
+def write_atomic(
+    path: Path, text: str, *, durable: bool = False, expect: Expected | None = None
+) -> None:
     """``path`` へ ``text`` を UTF-8 で書く 書き終えるまで元のファイルは無傷で残る
 
     仮のファイルの名前に書き手ごとの印を混ぜる（``<名前>.<印>.writing``） 同じ名前だと、
@@ -77,19 +84,23 @@ def write_atomic(path: Path, text: str, *, durable: bool = False) -> None:
 
     改行は ``\\n`` のまま書く OS ごとに書く物が変わらないように
     """
-    _write(path, text.encode("utf-8"), durable=durable)
+    _write(path, text.encode("utf-8"), durable=durable, expect=expect)
 
 
-def write_atomic_bytes(path: Path, data: bytes, *, durable: bool = False) -> None:
+def write_atomic_bytes(
+    path: Path, data: bytes, *, durable: bool = False, expect: Expected | None = None
+) -> None:
     """:func:`write_atomic` のバイト列の版 絵（PNG）のように文字ではない物を書く
 
     仮のファイルの名前・片付け・置き換えの決まりは :func:`write_atomic` と同じ 見本の絵
     （``ui/library_thumbnails.py``）が使う
     """
-    _write(path, data, durable=durable)
+    _write(path, data, durable=durable, expect=expect)
 
 
-def copy_atomic(source: Path, path: Path, *, durable: bool = False) -> os.stat_result:
+def copy_atomic(
+    source: Path, path: Path, *, durable: bool = False, expect: Expected | None = None
+) -> os.stat_result:
     """``source`` の中身を ``path`` へ写す 書き終えるまで元のファイルは無傷で残る
 
     仮のファイルの名前・片付け・置き換えの決まりは :func:`write_atomic` と同じ 大きな物
@@ -98,16 +109,54 @@ def copy_atomic(source: Path, path: Path, *, durable: bool = False) -> os.stat_r
     """
     with Path(source).open("rb") as reader:
         return _fill(
-            Path(path), lambda handle: shutil.copyfileobj(reader, handle, _COPY_CHUNK), durable
+            Path(path),
+            lambda handle: shutil.copyfileobj(reader, handle, _COPY_CHUNK),
+            durable,
+            expect,
         )
 
 
-def _write(path: Path, data: bytes, *, durable: bool) -> None:
-    _fill(Path(path), lambda handle: handle.write(data), durable)
+@dataclass(frozen=True, slots=True)
+class Expected:
+    """書く先が、確かめたときのままかを照らすための覚え（#327）
+
+    ``identity`` は確かめたときの身元（装置・番号・大きさ・更新時刻） 無かったなら ``None``
+    人が許した後、書き終えて名前を付けるまでに、同じ名前が現れたり中身が変わったりすると、
+    許していない物を置き換える :func:`expect_now` で作り、書く関数の ``expect`` に渡す
+    """
+
+    identity: tuple[int, int, int, int] | None
 
 
-def _fill(path: Path, fill: Callable[[BinaryIO], object], durable: bool) -> os.stat_result:
-    """仮のファイルを新しく作って ``fill`` で中身を入れ、``path`` の名前を付ける"""
+class TargetChangedError(FileExistsError):
+    """書く先が、確かめたときから変わった（名前が現れた・中身が変わった） 何も置いていない"""
+
+
+def expect_now(path: Path) -> Expected:
+    """``path`` の今の身元を覚える リンクは辿らない（リンクそのものを書く先と見る）"""
+    try:
+        status = Path(path).stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return Expected(None)
+    return Expected((status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns))
+
+
+def _write(path: Path, data: bytes, *, durable: bool, expect: Expected | None = None) -> None:
+    _fill(Path(path), lambda handle: handle.write(data), durable, expect)
+
+
+def _fill(
+    path: Path,
+    fill: Callable[[BinaryIO], object],
+    durable: bool,
+    expect: Expected | None = None,
+) -> os.stat_result:
+    """仮のファイルを新しく作って ``fill`` で中身を入れ、``path`` の名前を付ける
+
+    ``expect`` を渡すと、名前を付ける所で書く先が覚えたときのままかを照らす
+    無かった名前は置き換えない付け方で付け（後から現れていれば付けずに断る）、あった名前は
+    覚えた身元のままかを付ける直前に照らす どちらも違えば :class:`TargetChangedError`
+    """
     temporary = path.with_name(f"{_scratch_head(path.name)}.{uuid.uuid4().hex[:8]}{WRITING_SUFFIX}")
     # 仮のファイルは必ず新しく作る（"x"） 同じ名前の物が先に置かれていたら、その中身へは
     # 書かずに断る 開いて上書きすると、置かれていたのが元の素材へのハードリンクだったとき
@@ -120,7 +169,16 @@ def _fill(path: Path, fill: Callable[[BinaryIO], object], durable: bool) -> os.s
                 handle.flush()
                 os.fsync(handle.fileno())
             written = os.fstat(handle.fileno())
-        _replace(temporary, path)
+        if expect is None:
+            _replace(temporary, path)
+        elif expect.identity is None:
+            _place_new(temporary, path)
+        else:
+            if expect_now(path) != expect:
+                raise TargetChangedError(
+                    f"書く先が許した後に変わったので、前のファイルを残しました: {path}"
+                )
+            _replace(temporary, path)
     except BaseException:
         # 後片付けの失敗で元の理由を隠さない
         with contextlib.suppress(OSError):
@@ -128,6 +186,26 @@ def _fill(path: Path, fill: Callable[[BinaryIO], object], durable: bool) -> os.s
         raise
     _sweep_stale(path)
     return written
+
+
+def _place_new(temporary: Path, path: Path) -> None:
+    """仮のファイルに ``path`` の名前を付ける ただし同じ名前がもうあれば置き換えずに断る
+
+    確かめてから付けるまでの間に名前が現れても置き換えないよう、1 度の呼び出しで行う
+    Windows の改名（``MoveFileEx`` に置き換えの印を付けない）はあれば断る ほかの OS の改名は
+    黙って置き換えるので、リンクを張って（あれば断る）から仮の名前を外す
+    """
+    try:
+        if sys.platform == "win32":
+            # Path.rename は Windows で置き換えずに断る（MoveFileEx に置き換えの印を付けない）
+            temporary.rename(path)
+        else:
+            os.link(temporary, path)
+            temporary.unlink()
+    except FileExistsError as exc:
+        raise TargetChangedError(
+            f"書く先に、許した後で同じ名前のファイルができたので、前のファイルを残しました: {path}"
+        ) from exc
 
 
 def _replace(temporary: Path, path: Path) -> None:

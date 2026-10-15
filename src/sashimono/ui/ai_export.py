@@ -29,7 +29,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from sashimono.ai.host import EXPORT_RUNNING, ToolError
 from sashimono.ai.safety import pinned
-from sashimono.core.io.atomic import copy_atomic
+from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
 from sashimono.engine.encode import ExportError, ExportSettings
@@ -61,11 +61,13 @@ class _Worker(QObject):
         project: Project,
         settings: ExportSettings,
         check: Callable[[], Path],
+        expect: Expected | None = None,
     ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
         self._check = check
+        self._expect = expect
         self._cancel = threading.Event()
         #: 書き出し先へ置き始めたか 中止の印との確かめと立てるのを、同じ錠の中で行う
         #: 画面のスレッドの様子（placing）は知らせが届いてから変わるので、それで決めると
@@ -140,7 +142,9 @@ class _Worker(QObject):
         with pinned(self._check) as path:
             if os.path.normcase(str(path)) != os.path.normcase(str(expected)):
                 raise ToolError(f"書き出し先が確かめた時と変わりました: {expected} → {path}")
-            written = copy_atomic(scratch, path, durable=True)
+            # 許したときの書き出し先のままかを、名前を付ける所で照らす 描く数分の間に名前が
+            # 現れたり中身が変わったりしていれば、置かずに断る（前のファイルは残る）
+            written = copy_atomic(scratch, path, durable=True, expect=self._expect)
             # 付け替えた名前の先が、自分の書いた物かを照らす 違えば、付け替えの直前に
             # 差し替えられている 書いたと伝えると、AI も人も別の物を完成品だと思う
             now = path.stat(follow_symlinks=False)
@@ -178,7 +182,13 @@ class AssistantExport(QObject):
         """終わるまで最長 ``seconds`` 秒待つ 走っていなければ真 どのスレッドから呼んでもよい"""
         return self._idle.wait(seconds)
 
-    def start(self, project: Project, settings: ExportSettings, check: Callable[[], Path]) -> None:
+    def start(
+        self,
+        project: Project,
+        settings: ExportSettings,
+        check: Callable[[], Path],
+        expect: Expected | None = None,
+    ) -> None:
         """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
         if self.running:
             raise ToolError("書き出しがもう走っています")
@@ -189,7 +199,7 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
-        self._worker = _Worker(project, settings, check)
+        self._worker = _Worker(project, settings, check, expect)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

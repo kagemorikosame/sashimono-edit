@@ -30,6 +30,7 @@ from sashimono.ai.host import ExportRequest, ToolError
 from sashimono.ai.operations import MAX_WAIT_SECONDS, Operation, Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import SetWorkArea
+from sashimono.core.io.atomic import Expected, expect_now
 from sashimono.core.io.folder_pin import pin_folder
 from sashimono.core.io.serialize import load_project
 from sashimono.core.io.subtitles import subtitles_in_range, to_srt, to_vtt
@@ -60,7 +61,7 @@ def saved(host: FakeHost, tmp_path: Path) -> FakeHost:
     folder = tmp_path / "作品"
     folder.mkdir()
     host.saved_at = folder / "作品.sme"
-    host.write_project(host.saved_at, adopt=False)
+    host.write_project(host.saved_at, adopt=False, expect=expect_now(host.saved_at))
     host.written.clear()
     return host
 
@@ -276,14 +277,14 @@ class TestSwappedPlaces:
         refused: list[str] = []
         real_write = saved.write_project
 
-        def swap_then_write(path: Path, *, adopt: bool) -> str:
+        def swap_then_write(path: Path, *, adopt: bool, expect: Expected) -> str:
             try:
                 inside.rmdir()
             except OSError as exc:
                 refused.append(str(exc))
             else:
                 _symlink_dir(inside, outside)
-            return real_write(path, adopt=adopt)
+            return real_write(path, adopt=adopt, expect=expect)
 
         monkeypatch.setattr(saved, "write_project", swap_then_write)
         bridge = EditorBridge(saved, auto_approve=True)
@@ -346,6 +347,7 @@ class TestExport:
                 range_choice=RANGE_ALL,
                 codec="libx264",
                 bitrate_mbps=8,
+                expect=Expected(None),
             )
         ]
 
@@ -471,6 +473,46 @@ class TestTheApprovedPlaceIsKept:
         assert moved.read_text(encoding="utf-8") == "移した先の作品"
         assert sorted(path.name for path in moved_folder.iterdir()) == ["作品.sme"]
         assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+
+
+class TestOtherSystemsAreRefused:
+    """Linux や macOS ではフォルダを持っても改名を止められないので、AI はファイルを書かない
+    （Codex の P2 今の配布は Windows だけ ほかの OS の道は、関数を差し替えてここで通す）
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "arguments"),
+        [
+            ("save_project", {}),
+            ("save_project_as", {"path": "第二稿.sme"}),
+            ("export_video", {"path": "完成.mp4"}),
+            ("save_snapshot", {"path": "表紙.png"}),
+            ("export_subtitles", {"path": "字幕.srt"}),
+        ],
+    )
+    def test_writing_tools_are_refused_where_the_folder_cannot_be_held(
+        self,
+        saved: FakeHost,
+        codecs: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        # 壊れると、書いている間にフォルダをリンクへ差し替えられ、許した範囲の外へ書く
+        # （後で照らして気付いても、外に書いたファイルは残る）
+        del codecs
+        assert saved.saved_at is not None
+        before = saved.saved_at.read_bytes()
+        monkeypatch.setattr(safety, "pin_holds_the_folder", lambda: False)
+        bridge = EditorBridge(saved, auto_approve=True)
+        _seen, box = _run(bridge, _operation(name), arguments)
+        assert "この OS" in str(box.get("error"))
+        assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+        assert saved.saved_at.read_bytes() == before
+
+    def test_windows_holds_the_folder(self) -> None:
+        # 壊れると、Windows でも守りが効かないと見なして書けなくなるか、効かない OS で書く
+        assert safety.pin_holds_the_folder() is (sys.platform == "win32")
 
 
 class TestWhatWasShownIsWhatIsWritten:

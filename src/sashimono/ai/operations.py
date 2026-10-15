@@ -17,6 +17,7 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.io.atomic import expect_now
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import plan_cuts
@@ -2168,7 +2170,18 @@ def _current_project_file(host: EditorHost) -> Path:
 
 
 def _replacing(path: Path, what: str) -> str:
-    return f"同じ名前の{what}があり、中身を置き換えます" if path.exists() else ""
+    """書く先に同じ名前の物があれば、置き換えることと、その大きさと更新時刻を言う
+
+    大きさと時刻も見せるのは、許した後に中身が変わったら、実行の前の照らし合わせ
+    （:meth:`~sashimono.ai.bridge.EditorBridge._run_irreversible`）で気付けるようにするため
+    見せた物だけを比べるので、見せない身元（番号など）はここに入れない
+    """
+    try:
+        status = path.stat(follow_symlinks=False)
+    except OSError:
+        return ""
+    when = datetime.fromtimestamp(status.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return f"同じ名前の{what}（{status.st_size:,} バイト {when} 更新）があり、中身を置き換えます"
 
 
 def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
@@ -2177,7 +2190,9 @@ def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     return Consent(
         action="作品を上書き保存します",
         target=str(path),
-        detail="今のファイルの中身を、いまの編集の中身で置き換えます",
+        # 今のファイルの大きさと時刻も見せる 箱が出ている間に別の窓が同じ作品を保存すると
+        # 変わるので、実行の前の照らし合わせで気付き、その保存を潰さずに断れる
+        detail=_replacing(path, "作品") or "今の場所に作品のファイルが無いので、新しく作ります",
     )
 
 
@@ -2185,7 +2200,7 @@ def _save_project(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     try:
         with pinned_place(host, str(_current_project_file(host))) as path:
-            note = host.write_project(path, adopt=False)
+            note = host.write_project(path, adopt=False, expect=expect_now(path))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
     return {"saved": str(path), "note": note}
@@ -2208,7 +2223,7 @@ def _save_project_as(host: EditorHost, arguments: dict[str, Any]) -> object:
     _require_suffix(raw, (SUFFIX,), "作品")
     try:
         with pinned_place(host, raw) as path:
-            note = host.write_project(path, adopt=True)
+            note = host.write_project(path, adopt=True, expect=expect_now(path))
     except OSError as exc:
         raise ToolError(f"保存できませんでした: {exc}") from exc
     return {"saved": str(path), "project_path": str(host.project_path), "note": note}
@@ -2270,7 +2285,7 @@ def _export_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     _path, frame_range, _detail = _subtitle_plan(host, arguments)
     try:
         with pinned_place(host, arguments.get("path")) as path:
-            written = host.write_subtitles(path, frame_range=frame_range)
+            written = host.write_subtitles(path, frame_range=frame_range, expect=expect_now(path))
     except OSError as exc:
         raise ToolError(f"字幕を書き出せませんでした: {exc}") from exc
     return {"written": str(written), "range": None if frame_range is None else list(frame_range)}
@@ -2306,7 +2321,7 @@ def _save_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
     _path, frame, _detail = _snapshot_plan(host, arguments)
     try:
         with pinned_place(host, arguments.get("path")) as path:
-            drawn = host.write_snapshot(path, frame)
+            drawn = host.write_snapshot(path, frame, expect=expect_now(path))
     except OSError as exc:
         raise ToolError(f"静止画を保存できませんでした: {exc}") from exc
     return {"saved": str(path), "frame": drawn}
@@ -2398,6 +2413,8 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         range_choice=RANGE_ALL if frame_range is None else RANGE_WORK_AREA,
         codec=codec,
         bitrate_mbps=raw_bitrate,
+        # 許したときの書き出し先 描く数分の間に名前が現れたり中身が変わったりしたら置かない
+        expect=expect_now(path),
     )
     return _ExportPlan(request=request, detail="\n".join(part for part in parts if part))
 

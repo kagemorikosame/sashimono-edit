@@ -19,7 +19,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from sashimono.core.io.atomic import copy_atomic, write_atomic
+from sashimono.core.io.atomic import Expected, copy_atomic, write_atomic
 from sashimono.core.model import (
     AnimatedValue,
     AudioStreamInfo,
@@ -936,16 +936,17 @@ def _scene_from_json(raw: object) -> Scene:
     )
 
 
-def save_project(project: Project, path: Path) -> None:
+def save_project(project: Project, path: Path, *, expect: Expected | None = None) -> None:
     """プロジェクトをファイルへ書き出す
 
     一時ファイルへ書いてから差し替える 書き込み中に落ちても、既存のプロジェクト
     ファイルは無傷で残る 編集作業をまるごと失うのが一番痛い失敗なので、
-    ここは常に atomic にする
+    ここは常に atomic にする ``expect`` は :func:`~sashimono.core.io.atomic.write_atomic` と同じ
+    （AI の保存が、許した後に書く先が変わっていないかを照らす #327）
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(path, json_text(project_to_dict(project)), durable=True)
+    write_atomic(path, json_text(project_to_dict(project)), durable=True, expect=expect)
 
 
 #: 形式を上げる前の写しに足す尻（``名前.sme.bak``）

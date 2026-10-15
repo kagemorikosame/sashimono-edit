@@ -29,8 +29,9 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EXPORT_RUNNING, ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.core.commands import AddClip, AddTrack, SetTrackState
+from sashimono.core.io import subtitles as subtitles_module
 from sashimono.core.io.atomic import copy_atomic
-from sashimono.core.io.serialize import load_project
+from sashimono.core.io.serialize import keep_pre_upgrade_copy, load_project
 from sashimono.core.model import (
     Clip,
     MediaItem,
@@ -40,9 +41,10 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.projection import project_timeline
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.encode import ExportSettings, available_video_codecs, export_project
-from sashimono.ui import ai_export
+from sashimono.ui import ai_export, main_window
 from sashimono.ui.ai_export import scratch_folder
 from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
@@ -436,6 +438,139 @@ class TestExport:
         assert _scratch_files() == []
 
 
+class TestTheTargetChangingAfterApproval:
+    """許した後、書く前に書き出し先の名前が現れたり中身が変わったりしたら、置かずに断る
+
+    書き出しは描くのに数分かかり、その間に別のアプリが同じ名前のファイルを作れる
+    保存・静止画・字幕も、書く途中（描く・控えを取る・字幕を並べる）の間に同じことが起こりうる
+    許したときに無かった名前は置き換えず、あった名前は許したときの中身のままかを照らす
+    （Codex の P1）
+    """
+
+    def _fake_export(
+        self, monkeypatch: pytest.MonkeyPatch, meanwhile: Callable[[], object]
+    ) -> None:
+        def fake(project: Project, settings: ExportSettings, **_options: Any) -> Path:
+            settings.path.write_bytes(b"new video")
+            # 描いている数分の間に、別のアプリが書き出し先へ手を出した
+            meanwhile()
+            return settings.path
+
+        monkeypatch.setattr(ai_export, "run_export", fake)
+
+    def test_a_name_that_appears_while_rendering_is_kept(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、許したときは無かった名前のファイル（別のアプリが作った物）を、確かめずに
+        # 書き出しで置き換えて消す
+        target = folder / "完成.mp4"
+        self._fake_export(monkeypatch, lambda: target.write_bytes(b"other app"))
+        asked, box = _drive(
+            window, _operation("export_video"), {"path": str(target), "wait_seconds": 60}
+        )
+        assert "置き換えます" not in asked.texts[0]
+        result = box.get("result")
+        assert isinstance(result, dict)
+        assert result["state"] == "failed", result
+        assert "前のファイルを残しました" in str(result["message"])
+        assert target.read_bytes() == b"other app"
+        assert _scratch_files() == []
+
+    def test_a_file_changed_while_rendering_is_kept(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、人が置き換えを許したときの中身ではなく、その後に書き換わった中身を消す
+        target = folder / "完成.mp4"
+        target.write_bytes(b"previous")
+        self._fake_export(monkeypatch, lambda: target.write_bytes(b"changed meanwhile!"))
+        asked, box = _drive(
+            window, _operation("export_video"), {"path": str(target), "wait_seconds": 60}
+        )
+        assert "置き換えます" in asked.texts[0]
+        result = box.get("result")
+        assert isinstance(result, dict)
+        assert result["state"] == "failed", result
+        assert target.read_bytes() == b"changed meanwhile!"
+
+    def test_an_unchanged_file_is_replaced(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると（照らし方が厳しすぎると）、許した置き換えまで毎回断られる
+        target = folder / "完成.mp4"
+        target.write_bytes(b"previous")
+        self._fake_export(monkeypatch, lambda: None)
+        _asked, box = _drive(
+            window, _operation("export_video"), {"path": str(target), "wait_seconds": 60}
+        )
+        result = box.get("result")
+        assert isinstance(result, dict)
+        assert result["state"] == "done", result
+        assert target.read_bytes() == b"new video"
+
+    def test_a_save_as_name_that_appears_while_writing_is_kept(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、名前を付けて保存の途中（控えを取る間）に現れた同じ名前のファイルを潰す
+        target = folder / "第二稿.sme"
+        real = keep_pre_upgrade_copy
+
+        def appear_then_copy(path: Path) -> Path | None:
+            if path == target.resolve():
+                target.write_text("other app", encoding="utf-8")
+            return real(path)
+
+        monkeypatch.setattr(main_window, "keep_pre_upgrade_copy", appear_then_copy)
+        _asked, box = _drive(window, _operation("save_project_as"), {"path": str(target)})
+        assert isinstance(box.get("error"), ToolError)
+        assert target.read_text(encoding="utf-8") == "other app"
+
+    def test_a_subtitle_name_that_appears_while_writing_is_kept(
+        self,
+        qt_application: QApplication,
+        folder: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、字幕を並べている間に現れた同じ名前のファイルを潰す
+        del qt_application
+        target = folder / "字幕.srt"
+        real = project_timeline
+
+        def appear_then_list(project: Project) -> Any:
+            target.write_text("other app", encoding="utf-8")
+            return real(project)
+
+        window = _open(make_loaded(video_media, transcript), folder)
+        try:
+            # 字幕の書き出し（save_subtitles）が字幕を並べる所で名前を現す 確かめの中身を
+            # 作る所（道具の側）は別の並べ方なので、許したときには名前は無い
+            monkeypatch.setattr(subtitles_module, "project_timeline", appear_then_list)
+            _asked, box = _drive(window, _operation("export_subtitles"), {"path": str(target)})
+            assert isinstance(box.get("error"), ToolError)
+            assert target.read_text(encoding="utf-8") == "other app"
+        finally:
+            window.close()
+            window.deleteLater()
+
+    @pytest.mark.usefixtures("gpu")
+    def test_a_snapshot_name_that_appears_while_drawing_is_kept(
+        self, window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、絵を描いている間に現れた同じ名前のファイルを潰す
+        target = folder / "表紙.png"
+        real = window.snapshot_image
+
+        def appear_then_draw(frame: int | None = None) -> QImage:
+            target.write_bytes(b"other app")
+            return real(frame)
+
+        monkeypatch.setattr(window, "snapshot_image", appear_then_draw)
+        _asked, box = _drive(window, _operation("save_snapshot"), {"path": str(target)})
+        assert isinstance(box.get("error"), ToolError)
+        assert target.read_bytes() == b"other app"
+
+
 class TestStoppingWhilePlacing:
     """書き出し先へ置き始めた後の中止は断る（#327 CodeRabbit の指摘）
 
@@ -455,10 +590,10 @@ class TestStoppingWhilePlacing:
             settings.path.write_bytes(b"new video")
             return settings.path
 
-        def held_copy(source: Path, path: Path, *, durable: bool = False) -> os.stat_result:
+        def held_copy(source: Path, path: Path, **options: Any) -> os.stat_result:
             entered.set()
             release.wait(10)
-            return copy_atomic(source, path, durable=durable)
+            return copy_atomic(source, path, **options)
 
         monkeypatch.setattr(ai_export, "run_export", fake_export)
         monkeypatch.setattr(ai_export, "copy_atomic", held_copy)
@@ -518,14 +653,14 @@ class TestPlacingIsGuarded:
         refused: list[str] = []
         real_copy = copy_atomic
 
-        def swap_then_copy(source: Path, path: Path, *, durable: bool = False) -> os.stat_result:
+        def swap_then_copy(source: Path, path: Path, **options: Any) -> os.stat_result:
             try:
                 folder.rename(tmp_path / "退けた")
             except OSError as exc:
                 refused.append(str(exc))
             else:
                 folder.symlink_to(outside, target_is_directory=True)
-            return real_copy(source, path, durable=durable)
+            return real_copy(source, path, **options)
 
         monkeypatch.setattr(ai_export, "copy_atomic", swap_then_copy)
         _asked, box = _drive(

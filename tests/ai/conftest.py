@@ -17,6 +17,7 @@ import pytest
 
 from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.core.commands import AddClip, Command, Document, InScene
+from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.serialize import save_project
 from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.model import (
@@ -194,23 +195,25 @@ class FakeHost:
     def export_folder(self) -> Path | None:
         return self.exported_to
 
-    def write_project(self, path: Path, *, adopt: bool) -> str:
+    def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
         # 画面の〔保存〕と同じく、作品のファイルの書き方（書いてから置き換える）で書く
-        save_project(self._document.project, path)
+        save_project(self._document.project, path, expect=expect)
         self.written.append(path)
         if adopt:
             self.saved_at = path
         return ""
 
-    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+    def write_subtitles(
+        self, path: Path, *, frame_range: tuple[int, int] | None, expect: Expected
+    ) -> Path:
         # 画面の字幕の書き出しと同じ処理で書く
-        written = save_subtitles(self.project, path, frame_range=frame_range)
+        written = save_subtitles(self.project, path, frame_range=frame_range, expect=expect)
         self.written.append(written)
         return written
 
-    def write_snapshot(self, path: Path, frame: int) -> int:
+    def write_snapshot(self, path: Path, frame: int, *, expect: Expected) -> int:
         # 絵は描かない（偽物） 書いた場所と頼まれたフレームだけ残す
-        path.write_bytes(b"\x89PNG\r\n\x1a\n" + f"{frame}".encode())
+        write_atomic_bytes(path, b"\x89PNG\r\n\x1a\n" + f"{frame}".encode(), expect=expect)
         self.written.append(path)
         self.snapshots.append(frame)
         return frame

@@ -99,6 +99,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
+from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.model import (
@@ -2350,7 +2351,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"保存した: {self._path}{note}", 5000 if note else 3000)
         return True
 
-    def _write_project_file(self, path: Path) -> str:
+    def _write_project_file(self, path: Path, *, expect: Expected | None = None) -> str:
         """作品を ``path`` へ書き、保存した印を付ける 知らせに添える言葉を返す
 
         画面の〔保存〕と AI の保存（#327）が通る所 控えの取り方・書き方を 1 か所にする
@@ -2366,7 +2367,7 @@ class MainWindow(QMainWindow):
             # 控えが取れなくても保存は止めない 止めると、控えのために
             # いまの作業のほうを失う
             note = f"（バックアップは作れなかった: {exc}）"
-        save_project(self._document.project, path)
+        save_project(self._document.project, path, expect=expect)
         self._mark_saved()
         self._update_title()
         return note
@@ -3311,7 +3312,7 @@ class MainWindow(QMainWindow):
 
     # --- AI の保存と書き出し（B1 #327） ---
 
-    def write_project(self, path: Path, *, adopt: bool) -> str:
+    def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
         """AI の保存 画面の〔保存〕と同じ控えと書き方を通す 窓は出さない
 
         確かめの窓は AI パネルが出し終えている ここで窓を出すと、人が許した後にもう 1 度
@@ -3332,7 +3333,7 @@ class MainWindow(QMainWindow):
             self._project_lock = hold_new(folder)
             self._path = path
         try:
-            note = self._write_project_file(path)
+            note = self._write_project_file(path, expect=expect)
         except OSError as exc:
             if self._path != previous:
                 # 書けなかったら元の名前と錠へ戻す 戻さないと、タイトルと次の保存先が書けなかった
@@ -3348,28 +3349,36 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"AI アシスタントが保存した: {path}{note}", 5000)
         return note
 
-    def write_subtitles(self, path: Path, *, frame_range: tuple[int, int] | None) -> Path:
+    def write_subtitles(
+        self, path: Path, *, frame_range: tuple[int, int] | None, expect: Expected
+    ) -> Path:
         """AI の字幕の書き出し 画面の字幕パネルの〔書き出し…〕と同じ形式・同じ処理
 
         相手は字幕パネルと同じく開いているタイムライン 窓は出さない
         """
         try:
-            written = save_subtitles(self.view_project, path, frame_range=frame_range)
+            written = save_subtitles(
+                self.view_project, path, frame_range=frame_range, expect=expect
+            )
         except OSError as exc:
             raise ToolError(f"字幕を書き出せませんでした: {path} ({exc})") from exc
         self.statusBar().showMessage(f"AI アシスタントが字幕を書き出した: {written}", 5000)
         return written
 
-    def write_snapshot(self, path: Path, frame: int) -> int:
+    def write_snapshot(self, path: Path, frame: int, *, expect: Expected) -> int:
         """AI の静止画の保存 画面の〔静止画を保存…〕と同じ描き方と書き方で、窓は出さない"""
-        from sashimono.ui.snapshot import snapshot_frame, write_png
+        from sashimono.ui.snapshot import encode_png, snapshot_frame
 
         # 画面と同じく止めてから、開いているシーンを書き出しと同じ描き方で描く
         self._playback.stop()
         project = self.view_project
         drawn = snapshot_frame(project, frame)
-        if not write_png(self.snapshot_image(drawn), path):
-            raise ToolError(f"静止画を保存できませんでした: {path}")
+        data = encode_png(self.snapshot_image(drawn))
+        if data is None:
+            raise ToolError(f"静止画を PNG にできませんでした: {path}")
+        # 画面の保存（QSaveFile）と同じ PNG を、書いてから置き換える書き方で置く 描いている間に
+        # 同じ名前が現れたり中身が変わったりしていれば、置かずに断る（#327）
+        write_atomic_bytes(path, data, expect=expect)
         self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
         return drawn
 
@@ -3405,6 +3414,7 @@ class MainWindow(QMainWindow):
                 export_folder=export_folder,
                 protected=protected,
             ),
+            request.expect,
         )
 
     def export_status(self) -> dict[str, object]:

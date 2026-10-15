@@ -11,7 +11,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
-from sashimono.core.io.atomic import write_atomic
+from sashimono.core.io.atomic import Expected, write_atomic
 from sashimono.core.model import Project
 from sashimono.core.projection import ProjectedSubtitle, project_timeline
 from sashimono.core.timebase import FrameRate
@@ -86,7 +86,11 @@ def subtitles_in_range(
 
 
 def save_subtitles(
-    project: Project, path: Path, *, frame_range: tuple[int, int] | None = None
+    project: Project,
+    path: Path,
+    *,
+    frame_range: tuple[int, int] | None = None,
+    expect: Expected | None = None,
 ) -> Path:
     """タイムラインの字幕をファイルへ 形式は拡張子で決める
 
@@ -111,7 +115,7 @@ def save_subtitles(
     # 読めずに字幕全体が出ないことがある
     # 書いてから置き換える（#327） 開いて上書きすると、書き出し先が元の素材への
     # ハードリンクだったときに素材の中身を書き換え、途中で失敗すると前の字幕も壊れる
-    write_atomic(target, body)
+    write_atomic(target, body, expect=expect)
     return target
 
 
