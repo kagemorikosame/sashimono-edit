@@ -424,16 +424,63 @@ class TestFingerprint:
         )
 
 
+def _filled(root: Path, count: int) -> Library:
+    """プリセットとエイリアスを ``count`` 件ずつ入れた置き場"""
+    library = Library(presets=PresetStore(root / "presets"), aliases=AliasStore(root / "aliases"))
+    for number in range(count):
+        library.presets.save(Preset.capture(f"見出し {number:03}", _clip()))
+        library.aliases.save(Alias.of(f"テロップ {number:03}", _clip()))
+    return library
+
+
+def _listing_seconds(library: Library, count: int) -> float:
+    started = time.perf_counter()
+    assert len(library.entries(PRESET)) == count
+    assert len(library.entries(ALIAS)) == count
+    return time.perf_counter() - started
+
+
+def _reading_seconds(files: list[Path]) -> float:
+    """同じファイルを開いて JSON として読み、日時を見るだけの時間 一覧が必ずする仕事の下限"""
+    started = time.perf_counter()
+    for path in files:
+        json.loads(path.read_text(encoding="utf-8"))
+        path.stat()
+    return time.perf_counter() - started
+
+
 class TestMany:
-    def test_three_hundred_items_list_quickly(self, library: Library) -> None:
-        for number in range(300):
-            library.presets.save(Preset.capture(f"見出し {number:03}", _clip()))
-            library.aliases.save(Alias.of(f"テロップ {number:03}", _clip()))
-        started = time.perf_counter()
-        assert len(library.entries(PRESET)) == 300
-        assert len(library.entries(ALIAS)) == 300
-        # 手元で 0.4 秒ほど CI の遅い機械でも窓を開く操作がもたつかない目安
-        assert time.perf_counter() - started < 5.0
+    #: 一覧に掛かる時間が、同じファイルを読むだけの時間の何倍まで許すか
+    #: 手元の実測は 2.5 倍前後 1 件ごとに置き場を探し直す作りにすると 38 倍になった
+    #: 機械（計算と記憶装置の速さの釣り合い）や Python の版で比が動く分を見て 10 倍
+    SLOWDOWN_LIMIT = 10.0
+
+    #: 測る回数 それぞれの一番速い回を使う ほかの処理に割り込まれた回を外すため
+    ROUNDS = 5
+
+    def test_three_hundred_items_list_without_slowing_down(self, tmp_path: Path) -> None:
+        """300 件ずつの一覧が、ファイルを読むだけの時間に比べて遅くならない
+
+        壊れると、プリセットやエイリアスを貯めた人ほど管理の窓や右クリックのメニューを
+        開くのがもたつき、300 件で何秒も待たされる
+        前は「5 秒未満」の決まった秒で見ていて、ほかの作業で混んだ機械では、遅くする変更が
+        無くても落ちた 同じ機械で同じ時に測った「読むだけ」の時間との比で見る 機械が
+        混めば両方が同じように遅れるので、比は揺れにくい 件数を増やしたときの伸び方で
+        見る形は、1 件ごとの決まった手間が増える遅れ（件数に比例する）を見逃したので使わない
+        """
+        count = 300
+        library = _filled(tmp_path, count)
+        files = sorted(path for path in tmp_path.rglob("*") if path.is_file())
+        assert len(files) == 2 * count
+        # 交互に測る 片方を測る間だけ機械が混んでも、もう片方の一番速い回で比が崩れない
+        reading = listing = float("inf")
+        for _ in range(self.ROUNDS):
+            reading = min(reading, _reading_seconds(files))
+            listing = min(listing, _listing_seconds(library, count))
+        slowdown = listing / reading
+        assert slowdown < self.SLOWDOWN_LIMIT, (
+            f"読むだけで {reading:.3f} 秒 一覧で {listing:.3f} 秒（{slowdown:.1f} 倍）"
+        )
 
 
 class TestAtomicWrites:
