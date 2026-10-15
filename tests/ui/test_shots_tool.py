@@ -446,6 +446,28 @@ class TestSettling:
         assert elapsed >= rounds * shots.SETTLE_MS * 0.8
 
 
+class TestStatusBar:
+    def test_a_passing_notice_is_not_photographed(
+        self, shots: ModuleType, qt_application: QApplication
+    ) -> None:
+        """ステータスバーの一時の知らせを写さない
+
+        壊れると、裏の仕事（控えと解析）が撮る前に終わったかどうかで知らせが出たり出なかったり
+        して、同じ画面の写真が撮るたびに変わる
+        """
+        del qt_application
+        from PySide6.QtWidgets import QMainWindow
+
+        window = QMainWindow()
+        try:
+            shots.keep_status_bar_quiet(window)
+            window.statusBar().showMessage("控えと解析が終わった", 4000)
+            QApplication.processEvents()
+            assert window.statusBar().currentMessage() == ""
+        finally:
+            window.deleteLater()
+
+
 class TestWikiVersion:
     """手順書の頭に書いた「この版で撮りました」を、撮り直したときに今の版へ書き換える"""
 
