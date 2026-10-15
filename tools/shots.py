@@ -680,7 +680,6 @@ def editor(project: Project | None = None) -> Iterator[MainWindow]:
     window.resize(*WINDOW_SIZE)
     window.show()
     settle(window)
-    fit_window_size(window)
     # 設定パネルを広げる 既定の幅だとエフェクトの見出しの ✕ や値の単位が切れ、
     # 写真の中で積んだエフェクトの名前と操作が読めない
     docks = [window.findChild(QDockWidget, name) for name in ("media", "inspector")]
@@ -696,25 +695,6 @@ def editor(project: Project | None = None) -> Iterator[MainWindow]:
     finally:
         window.close()
         QApplication.processEvents()
-
-
-def fit_window_size(window: MainWindow) -> None:
-    """出した窓が頼んだ大きさから伸びていたら、頼んだ大きさへ当て直す（#316 の間に合わせ）
-
-    AI アシスタントのパネルは、出る前に幅の決まらないまま案内の文の折り返しを数え、窓の
-    最小の高さを 972 まで押し上げる 窓は出たときにそこまで伸び、落ち着いて最小が下がっても
-    伸びたまま残る（1280x972 で撮れてタイムラインが潰れ、レイヤー 2 が写らなかった）
-    本体の直し（#355）が入れば出た直後から頼んだ大きさになり、ここは何もしなくなる
-    そのときはこの関数ごと外してよい
-
-    縮めた後で画面配置を既定へ戻し直す 縮めただけだと、伸びた 172 画素がタイムラインから
-    削られ、タイムラインが 1 段しか写らない
-    """
-    if (window.width(), window.height()) != WINDOW_SIZE:
-        window.resize(*WINDOW_SIZE)
-        settle(window, rounds=4)
-        window.reset_layout()
-        settle(window, rounds=4)
 
 
 def sample_project(width: int = SAMPLE_WIDTH, height: int = SAMPLE_HEIGHT) -> Project:
@@ -2116,8 +2096,17 @@ def isolate_user_folders(base: Path) -> None:
     # 決まった本人の一時フォルダを使い続ける
     tempfile.tempdir = None
 
-    # 先読みは切る 重い絵を出す写真では「1 コマ 0.4 秒掛かるので先読みを止めた」と
-    # いう知らせがステータスバーに出て、説明の写真に不具合のように写る
+    save_shot_preferences()
+
+
+def save_shot_preferences() -> None:
+    """撮るときの設定を置き場へ書く 置き場は先に作業用のフォルダへ向けておく
+
+    先読みは切る 重い絵を出す写真では「1 コマ 0.4 秒掛かるので先読みを止めた」と
+    いう知らせがステータスバーに出て、説明の写真に不具合のように写る 先読みが動いて
+    いると、プレビューの字の縁の描け方が 1 回目と 2 回目で変わることもある（試験の全体を
+    走らせたときに縁取りの写真で起きた 先読みを切ると起きない）
+    """
     PreferenceStore().save(Preferences(prefetch=False))
 
 

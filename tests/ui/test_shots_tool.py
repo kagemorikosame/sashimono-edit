@@ -9,7 +9,6 @@ GPU が要る検査は ``gpu`` フィクスチャを付けてある GPU の無�
 
 from __future__ import annotations
 
-import gc
 import importlib.util
 import os
 import sys
@@ -22,14 +21,13 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QEvent, QRect
+from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QCheckBox,
     QDialog,
-    QDockWidget,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -849,6 +847,15 @@ class TestLibraryShots:
 class TestNewEditorShots:
     """設定パネルの縁取りの層と組み方のボタンの写真（#317）"""
 
+    @pytest.fixture(autouse=True)
+    def shot_preferences(self, shots: ModuleType) -> None:
+        """撮る道具と同じ設定で撮る（置き場は conftest が試験ごとの一時フォルダへ向けている）
+
+        先読みを切らずに撮ると、試験の全体を走らせたときだけ 1 回目と 2 回目で字の縁の描け方が
+        変わり、道具は同じ絵を撮れているのに試験が落ちる
+        """
+        shots.save_shot_preferences()
+
     def test_the_shots_are_the_same_every_time(
         self, shots: ModuleType, qt_application: QApplication, tmp_path: Path
     ) -> None:
@@ -876,45 +883,6 @@ class TestNewEditorShots:
                 shots.inspector_rect(window, button)
             shots._scroll_inspector_to(window, button)
             assert shots.inspector_rect(window, button).height() == button.height()
-
-    def test_a_stretched_window_gets_the_default_layout_back(
-        self, shots: ModuleType, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """出したときに縦へ伸びた窓（#316）を、頼んだ大きさと既定の画面配置へ戻す
-
-        大きさだけを戻すと、伸びた分がタイムラインから削られ、タイムラインが 1 段しか写らない
-        （0.2.2 の Wiki の写真で、レイヤー 2 の音声が写らなかった）
-        """
-        from sashimono.ai import AI_PACK
-        from sashimono.runtime import PackageStatus, PackStatus
-        from sashimono.ui.chat import panel as panel_module
-        from sashimono.ui.setup import SetupSection
-        from sashimono.ui.theme import style_sheet
-
-        # 窓が伸びる機械の形にする AI の部品は入っていてログインがまだ（#316 の PR の試験と同じ）
-        # 本人の機械の状態に任せると、手元では伸びずに通ってしまう 本番のスタイルシートも当てる
-        # （ボタンの余白で高さが変わる）
-        status = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", "0.2.158"),))
-        monkeypatch.setattr(SetupSection, "status", property(lambda _self: status))
-        monkeypatch.setattr(panel_module, "credentials_found", lambda: False)
-        sheet = qt_application.styleSheet()
-        qt_application.setStyleSheet(style_sheet())
-        try:
-            with shots.editor(shots.sample_project()) as window:
-                timeline = window.findChild(QDockWidget, "timeline")
-                assert timeline is not None
-                shown = timeline.height()
-                size = (window.width(), window.height())
-                # 頼んだ大きさの窓に既定の画面配置を当て直した高さと比べる
-                window.reset_layout()
-                shots.settle(window, rounds=4)
-                expected = timeline.height()
-            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
-            gc.collect()
-        finally:
-            qt_application.setStyleSheet(sheet)
-        assert size == shots.WINDOW_SIZE
-        assert shown == expected
 
 
 def _text_clip() -> Clip:
