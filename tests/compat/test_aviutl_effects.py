@@ -409,11 +409,17 @@ class TestWhatTheRealOutputFound:
     def test_a_black_gradient_end_stays_black(self) -> None:
         # 終了色が白へ化けると、暗く落ちていくはずのグラデーションが
         # 明るい方へ伸びる 文字の下半分が白飛びして読めなくなる
-        effect = _one(
+        # テキストのすぐ後ろのグラデーションは塗りへ写る（#312） 塗りの最後の止まりで見る
+        report = CompatibilityReport()
+        body = _object(
             "グラデーション\n強さ=100.0\n角度=90.00\n幅=100\n形状=線形\n"
             "開始色=6c6c6c\n終了色=000000"
         )
-        assert effect.params["end_color"] == (0.0, 0.0, 0.0, 1.0)
+        item = map_object(parse_exo(body).objects[0], RATE, report=report)
+        assert item is not None and item.clip.source is not None
+        stops = item.clip.source.params["fill_gradient"]
+        assert isinstance(stops, tuple)
+        assert stops[-5:] == (1.0, 0.0, 0.0, 0.0, 1.0)
 
     def test_a_hash_or_an_0x_prefix_is_still_dropped(self) -> None:
         # 飾りを 1 つずつ落とす作りにしたので、付いていても読めること

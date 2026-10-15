@@ -26,14 +26,19 @@ from sashimono.core.model import AnimatedValue, ParamValue
 type ParamInput = ParamValue | float | None
 
 __all__ = [
+    "GRADIENT_STOP_SIZE",
     "IMAGE_FILTER",
     "IMAGE_SUFFIXES",
+    "MAX_GRADIENT_STOPS",
+    "MIN_GRADIENT_STOPS",
     "PIXEL_UNITS",
     "CheckSpec",
     "ColorSpec",
     "FileSpec",
     "FontSpec",
     "FontStyleSpec",
+    "GradientSpec",
+    "GradientStop",
     "GridSpec",
     "ParamInput",
     "ParameterKind",
@@ -73,6 +78,8 @@ class ParameterKind(Enum):
     VALUE = "value"
     #: AviUtl に対応する制御文字は無い 格子の点のずれをまとめて持つ
     GRID = "grid"
+    #: AviUtl に対応する制御文字は無い グラデーションの色の止まりの並びをまとめて持つ
+    GRADIENT = "gradient"
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +482,81 @@ class GridSpec:
         return (float(columns), float(rows), *numbers[2:])
 
 
+#: グラデーションの色の止まりの数の上限 「模様で塗る」（``brush_fill``）の色の数と同じ
+#: 配布物の多くは 2〜5 色 金属風の文字で 10 を超える物があり、超えた分は読み込みで間引く
+MAX_GRADIENT_STOPS = 16
+#: 止まりの数の下限 1 つだと単色と同じで、バーで動かす意味が無い
+MIN_GRADIENT_STOPS = 2
+#: 止まり 1 つが平らな並びの中で占める数（位置, R, G, B, A）
+GRADIENT_STOP_SIZE = 5
+
+#: 色の止まり 1 つ 位置（0..1）と sRGB の色（0..1 の R, G, B, A）
+type GradientStop = tuple[float, tuple[float, float, float, float]]
+
+
+@dataclass(frozen=True, slots=True)
+class GradientSpec:
+    """グラデーションの色の止まりの並び（#312）
+
+    値は ``(位置0, R0, G0, B0, A0, 位置1, R1, ...)`` の平らな並び 位置は 0..1、色は sRGB の 0..1
+    :class:`GridSpec` と同じく :data:`~sashimono.core.model.ParamValue` に既にある
+    ``tuple[float, ...]`` に載せる 保存の形・プリセット・取り消しが新しい入れ物を覚えずに済み、
+    止まりの数と中身が必ず一緒に読み書きされる（止まりごとに別の項目にすると、数だけが
+    書き換わった半端な並びが作れてしまう）
+
+    止まりは位置の順に並べて持つ 描く所と画面が同じ順で読むため 同じ位置の止まりは
+    書いた順を保つ（その位置で色が切り替わる段になる）
+    """
+
+    name: str
+    label: str
+    default: tuple[float, ...] = (0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+    kind = ParameterKind.GRADIENT
+
+    def default_value(self) -> tuple[float, ...]:
+        return self.default
+
+    def coerce(self, value: ParamInput) -> tuple[float, ...]:
+        """外から来た値を整える 形の合わない値は既定へ戻す
+
+        数の合わない並びをそのまま渡すと、描く所が 5 つずつ読んで最後の止まりが欠ける
+        数として読めない物や NaN は既定へ戻す（1 つだけ直すと、どの色だったかが分からない）
+        数の多すぎる並びは後ろを捨てず既定へ戻す 手で書いたファイルの誤りを黙って半分だけ
+        描くより、既定で目立たせる方が直しやすい
+        """
+        if not isinstance(value, tuple) or len(value) % GRADIENT_STOP_SIZE:
+            return self.default
+        count = len(value) // GRADIENT_STOP_SIZE
+        if not MIN_GRADIENT_STOPS <= count <= MAX_GRADIENT_STOPS:
+            return self.default
+        numbers = _finite_floats(value)
+        if numbers is None:
+            return self.default
+        clamped = [min(max(number, 0.0), 1.0) for number in numbers]
+        stops = [
+            clamped[index : index + GRADIENT_STOP_SIZE]
+            for index in range(0, len(clamped), GRADIENT_STOP_SIZE)
+        ]
+        # sorted は同じ位置の止まりの順を保つ
+        stops.sort(key=lambda stop: stop[0])
+        return tuple(number for stop in stops for number in stop)
+
+    @staticmethod
+    def stops(value: tuple[float, ...]) -> list[GradientStop]:
+        """整えた値（:meth:`coerce` の結果）を止まりの並びにする"""
+        found: list[GradientStop] = []
+        for index in range(0, len(value) - GRADIENT_STOP_SIZE + 1, GRADIENT_STOP_SIZE):
+            position, red, green, blue, alpha = value[index : index + GRADIENT_STOP_SIZE]
+            found.append((position, (red, green, blue, alpha)))
+        return found
+
+    @staticmethod
+    def pack(stops: list[GradientStop]) -> tuple[float, ...]:
+        """止まりの並びを値にする 並べ替えと範囲の整えは :meth:`coerce` に任せる"""
+        return tuple(float(number) for position, colour in stops for number in (position, *colour))
+
+
 #: パラメータ定義の総称
 type ParameterSpec = (
     TrackSpec
@@ -487,6 +569,7 @@ type ParameterSpec = (
     | FontStyleSpec
     | ValueSpec
     | GridSpec
+    | GradientSpec
 )
 
 

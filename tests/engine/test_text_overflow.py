@@ -67,9 +67,7 @@ def drawn(source: GeneratedSource, scale: float = 1.0) -> np.ndarray:
     """描く道と同じく、:func:`source_canvas` の大きさの絵に描く"""
     width, height = round(SCREEN[0] * scale), round(SCREEN[1] * scale)
     canvas = source_canvas(source, width, height, scale=(scale, scale))
-    image = engine_sources.render_source_framed(
-        source, *canvas, scale=(scale, scale), screen=(width, height)
-    )[0]
+    image = engine_sources.render_source_framed(source, *canvas, scale=(scale, scale))[0]
     assert image is not None
     return image
 
