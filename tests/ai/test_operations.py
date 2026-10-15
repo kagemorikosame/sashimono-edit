@@ -647,3 +647,18 @@ class TestParameterCoercion:
         text = next(row for row in rows if row["kind"] == "text")
         color = next(p for p in text["parameters"] if p["name"] == "color")
         assert "#RRGGBB" in color["format"]
+
+    def test_a_gradient_can_be_set(self, host: FakeHost) -> None:
+        # 並びの形を伝えないと、AI は色だけの並びを送り、既定へ戻されて何も変わらない（#312）
+        rows = run(host, "list_effects", kind="text")["effects"]
+        text = next(row for row in rows if row["kind"] == "text")
+        gradient = next(p for p in text["parameters"] if p["name"] == "fill_gradient")
+        assert gradient["type"] == "gradient"
+        assert "位置" in gradient["format"]
+        clip = self._text_clip(host)
+        stops = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+        run(host, "set_param", clip_id=clip, name="fill_type", value="linear")
+        run(host, "set_param", clip_id=clip, name="fill_gradient", value=stops)
+        params = self._source_params(host, clip)
+        assert params["fill_type"] == "linear"
+        assert params["fill_gradient"] == tuple(stops)

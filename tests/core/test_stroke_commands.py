@@ -315,8 +315,9 @@ class TestSaving:
         # 前の版の本体は層を捨てて開き、層へ移した字は縁が 1 本も無くなる
         # 「更新してください」で止めるため、版を上げた
         project, _ = _project(_text())
-        assert FORMAT_VERSION == 9
-        assert project_to_dict(project)["version"] == 9
+        # 後の版（#312 で 10）でも層を持つ形は読める 版は 9 より下がらない
+        assert FORMAT_VERSION >= 9
+        assert project_to_dict(project)["version"] == FORMAT_VERSION
         too_new = {**project_to_dict(project), "version": FORMAT_VERSION + 1}
         with pytest.raises(ProjectFileError, match="更新"):
             project_from_dict(too_new)
@@ -328,7 +329,7 @@ class TestSaving:
         plain = Preset(name="層なし", source=_text(border_width=AnimatedValue(4.0)))
         assert layered.to_dict()["version"] == 2
         assert plain.to_dict()["version"] == 1
-        assert PRESET_VERSION == 2
+        assert PRESET_VERSION >= 2
         back = Preset.from_dict(json.loads(json.dumps(layered.to_dict())))
         assert back.source == layered.source
         with pytest.raises(ProjectFileError, match="新しい形式"):

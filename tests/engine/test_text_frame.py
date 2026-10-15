@@ -106,8 +106,10 @@ class TestFrame:
         bold, framed = render_source_framed(text(vertical=True, bold=True), *SCREEN)
         assert plain is not None and bold is not None
         assert int((bold[..., 3] > 128).sum()) > int((plain[..., 3] > 128).sum()) * 1.05
-        # 縦書きの枠は測っていない 決まりの分からない枠を返さず、字の形を入れ物にする
-        assert framed is None
+        # 縦書きの枠は列の升目を並べた塊（#312 の続きで AviUtl2 に描かせて測った）
+        # 返さないと、縦書きに掛けた効果が字の形を入れ物にして AviUtl2 と違う所に掛かる
+        assert framed is not None
+        assert framed[2] - framed[0] > 0 and framed[3] - framed[1] > 0
 
     def test_shapes_have_no_frame(self) -> None:
         shape = GeneratedSource(kind="shape", params={"shape": "rect"})

@@ -236,6 +236,8 @@ class TestDrawSettings:
 
 
 class TestGradient:
+    # 図形に掛けたグラデーション テキストのすぐ後ろの物は塗りへ写る（#312
+    # tests/compat/test_aviutl_text_fill.py）ので、エフェクトとしての読み方は図形で見る
     GRADIENT = (
         "[Object]"
         + chr(10)
@@ -243,11 +245,9 @@ class TestGradient:
         + chr(10)
         + "[Object.0]"
         + chr(10)
-        + "effect.name=テキスト"
+        + "effect.name=図形"
         + chr(10)
         + "サイズ=100"
-        + chr(10)
-        + "テキスト=金"
         + chr(10)
         + "[Object.1]"
         + chr(10)

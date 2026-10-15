@@ -15,13 +15,22 @@ from __future__ import annotations
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.builtin import PRELUDE
 from sashimono.effects.definition import EffectDefinition, registry
-from sashimono.effects.spec import CheckSpec, ColorSpec, SelectSpec, TrackSpec, ValueSpec
+from sashimono.effects.spec import (
+    MAX_GRADIENT_STOPS,
+    CheckSpec,
+    ColorSpec,
+    SelectSpec,
+    TrackSpec,
+    ValueSpec,
+)
 
 __all__ = ["BLEND_MODES", "MAX_STOPS", "PATTERNS", "register_paint_effects"]
 
 #: グラデーションの色の数の上限 配布物の多くは 2〜5 色 金属風の文字で 10 を超えるものが
 #: あるが、上限を超えた分は間引いて写す（:mod:`sashimono.compat.ymm4.brushes`）
-MAX_STOPS = 16
+#: テキストの塗りのグラデーション（#312）と同じ数にする 違うと、エフェクトから塗りへ
+#: 写した色の並びが片方の上限で切れる
+MAX_STOPS = MAX_GRADIENT_STOPS
 
 #: 模様の種類 シェーダの番号と同じ並び
 PATTERNS = (
