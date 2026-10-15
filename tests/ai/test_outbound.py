@@ -24,11 +24,13 @@ from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, find_ope
 from sashimono.ai.outbound import (
     ASKED,
     DESTINATION,
+    TEXT_MARK,
     Outbound,
     SendAnswer,
     SendChoice,
     SendRequest,
     file_secrets,
+    hide_text,
     redact,
 )
 from sashimono.core.model import MediaItem, Transcript
@@ -358,6 +360,113 @@ class TestFileNames:
         done, box = call_in_thread(bridge, sneaky, {})
         answer_sends(bridge, done, _never)
         assert isinstance(box.get("error"), ToolError)
+
+
+# --- 取り消しと履歴（2026-10-15 利用者の決定 字幕と文字を送らなくても取り消せる） ---
+
+SECRET_TEXT = "秘密の挨拶をここに書きます"
+
+
+def _add_secret_text(bridge: EditorBridge) -> None:
+    _seen, box = _run(bridge, "add_text", arguments={"text": SECRET_TEXT})
+    assert box.get("error") is None, box.get("error")
+
+
+@pytest.fixture
+def text_refused(host: FakeHost) -> EditorBridge:
+    """字幕と文字を「送らない」にした人 名前と場所は許してある 変更は自動で承認
+
+    名前と場所を許しておくのは、伏せ字が字幕と文字の扱いから来たことを見分けるため
+    """
+    bridge = EditorBridge(host, auto_approve=True)
+    bridge.set_send_choices(
+        {Outbound.FRAMES: SendChoice.ASK, Outbound.TEXT: SendChoice.DENY}
+        | {Outbound.FILES: SendChoice.ALLOW}
+    )
+    return bridge
+
+
+def _text_clips(host: FakeHost) -> int:
+    return sum(
+        1
+        for track in host.document.project.timeline.tracks
+        for clip in track.clips
+        if clip.source is not None and clip.source.kind == "text"
+    )
+
+
+class TestUndoWithoutSendingText:
+    def test_undo_still_works_and_the_text_is_hidden(
+        self, host: FakeHost, text_refused: EditorBridge
+    ) -> None:
+        # 壊れると、字幕と文字を送らない人は AI に取り消しを頼めないか、取り消した操作の名前に
+        # 混ざったテキストの文が外へ出る
+        _add_secret_text(text_refused)
+        assert _text_clips(host) == 1
+        _seen, box = _run(text_refused, "undo")
+        assert box.get("error") is None, box.get("error")
+        assert _text_clips(host) == 0
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert "秘密" not in sent
+        assert SECRET_TEXT[:12] not in sent
+        # どの操作を取り消したかは読める
+        assert "テキストを追加" in sent
+
+    def test_the_history_is_read_with_the_text_hidden(
+        self, host: FakeHost, text_refused: EditorBridge
+    ) -> None:
+        # 壊れると、履歴を読むだけで、送らないと決めた文の頭が外へ出る（または履歴を読めない）
+        _add_secret_text(text_refused)
+        _seen, box = _run(text_refused, "get_history")
+        assert box.get("error") is None, box.get("error")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert "秘密" not in sent
+        assert "テキストを追加" in sent
+        assert box["result"]["can_undo"] is True  # type: ignore[index]  # 結果は辞書で返る
+
+    def test_undo_does_not_ask_about_text(self, host: FakeHost) -> None:
+        # 壊れると、まだ答えていない人が取り消しを頼むたびに、字幕と文字の窓が出る
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.ALLOW})
+        _add_secret_text(bridge)
+        _seen, box = _run(bridge, "undo")
+        assert box.get("error") is None, box.get("error")
+        assert "秘密" not in json.dumps(box["result"], ensure_ascii=False)
+
+    def test_allowed_text_passes_through(self, host: FakeHost) -> None:
+        # 壊れると、文字を送ってよいと答えた人にも伏せ字が返り、AI がどの文を消したか読めない
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+        _add_secret_text(bridge)
+        _seen, box = _run(bridge, "undo")
+        assert SECRET_TEXT[:12] in json.dumps(box["result"], ensure_ascii=False)
+
+    def test_subtitles_are_still_refused(self, text_refused: EditorBridge) -> None:
+        # 壊れると、伏せて送る扱いが字幕の一覧にまで広がり、送らないと決めた字幕の道具が動く
+        _seen, box = _run(text_refused, "get_subtitles")
+        assert isinstance(box.get("error"), ToolError)
+
+    def test_only_text_can_be_hidden(self) -> None:
+        # 壊れると、絵を「伏せて送る」と書いた道具が、尋ねずに絵を送る
+        with pytest.raises(ValueError, match="伏せて"):
+            Operation(
+                name="hidden_frames",
+                description="",
+                schema={},
+                handler=lambda _host, _arguments: None,
+                sends=frozenset({Outbound.FRAMES}),
+                hidden=frozenset({Outbound.FRAMES}),
+            )
+
+    def test_counts_stay_and_quotes_go(self) -> None:
+        # 壊れると、数だけの名前（無音カットの数）まで伏せて読めなくなるか、引用した文が外へ出る
+        hidden = hide_text(
+            ["無音カット: 3 か所", "見た目: 選んでいるテキスト「秘密」を写します", "配置: 本編"],
+            [],
+        )
+        assert hidden[0] == "無音カット: 3 か所"
+        assert "秘密" not in hidden[1]
+        assert hidden[2] == f"配置: {TEXT_MARK}"
 
 
 class TestRedact:

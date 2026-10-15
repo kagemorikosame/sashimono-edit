@@ -189,7 +189,7 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 | 編集の構成 | `project` | 要らない |
 | アプリの設定 | `app_settings` | 要らない |
 | 素材の名前と場所 | `files` | 尋ねる 断ると伏せ字（〔素材 m_…〕）にして送る |
-| 字幕と文字 | `text` | 尋ねる 断ると道具を動かさない |
+| 字幕と文字 | `text` | 尋ねる 断ると道具を動かさない 取り消しと履歴（`undo`・`get_history`）だけは尋ねずに動かし、許すまでは操作の名前の中の文字を伏せ字にする（`Operation.hidden` 2026-10-15 利用者の決定） |
 | 映像の絵 | `frames` | 尋ねる 断ると道具を動かさない |
 
 - 尋ねる 3 つは `Preferences.ai_send_frames` などに `ask`（既定）・`allow`・`deny` で持ち、

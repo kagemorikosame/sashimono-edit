@@ -159,11 +159,19 @@ class Operation:
     #: 既定を置かない 置くと、絵や字幕を返す道具を足した人が書き忘れても黙って通り、
     #: 同意を取らずに外へ送る 書き忘れたら道具を作る所で落ちる
     sends: frozenset[Outbound] = field(kw_only=True)
+    #: ``sends`` のうち、許されていなければ尋ねも断りもせず、結果の中を伏せ字にして送る物
+    #: 今は取り消しと履歴の道具の字幕と文字だけ（操作の名前に文の頭が混ざるだけで、
+    #: 道具の役目は文を送ることではない 2026-10-15 利用者の決定）
+    hidden: frozenset[Outbound] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
             # 結果を返す以上、何かは送る 空にすると、何も送らない道具と見分けが付かない
             raise ValueError(f"{self.name}: 結果に入りうる物（sends）を書いてください")
+        if not self.hidden <= self.sends & {Outbound.TEXT}:
+            # 伏せ方を持っているのは字幕と文字だけ（名前と場所は道具を問わず伏せる）
+            # 絵は伏せられないので、ここに書くと尋ねずに送ることになる
+            raise ValueError(f"{self.name}: 伏せて送れるのは sends に書いた字幕と文字だけです")
         if not self.irreversible:
             return
         # 取り消せない操作は、何をどこへするかを見せずに確かめても判断できない
@@ -1921,6 +1929,9 @@ _WITH_FRAMES = frozenset({Outbound.PROJECT, Outbound.FRAMES})
 #: 操作の履歴の名前を返す道具 名前には素材の名前（「配置: 〜」）と、テキストの文の頭
 #: （「テキストを追加: 〜」）が入る
 _HISTORY = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
+#: 履歴の名前の中の文字は、送らないと決めた人には伏せて送る 取り消しは断らない
+#: 断ると、字幕と文字を送らない人は AI に取り消しを頼めない（2026-10-15 利用者の決定）
+_HIDDEN_IN_HISTORY = frozenset({Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
 #: 本人の答え
@@ -2022,6 +2033,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_history,
         sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
     ),
     Operation(
         name="preview_frame",
@@ -2683,6 +2695,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"steps": _integer("戻す段数（既定 1）")}),
         handler=_undo,
         sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
         writes=True,
     ),
     Operation(

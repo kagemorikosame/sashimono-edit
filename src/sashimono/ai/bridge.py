@@ -34,7 +34,9 @@ from sashimono.ai.outbound import (
     SendChoice,
     SendRequest,
     file_secrets,
+    hide_text,
     redact,
+    text_secrets,
 )
 from sashimono.ai.safety import Consent
 
@@ -258,7 +260,7 @@ class EditorBridge:
         """
         pending: list[Outbound] = []
         for kind in ASKED:
-            if kind not in operation.sends or self.may_send(kind):
+            if kind not in operation.sends or kind in operation.hidden or self.may_send(kind):
                 continue
             with self._sends_lock:
                 answered = kind in self._session_sends
@@ -285,7 +287,10 @@ class EditorBridge:
         refused = [
             kind
             for kind in ASKED
-            if kind in operation.sends and kind is not Outbound.FILES and not self.may_send(kind)
+            if kind in operation.sends
+            and kind is not Outbound.FILES
+            and kind not in operation.hidden
+            and not self.may_send(kind)
         ]
         if refused:
             names = "・".join(kind.label for kind in refused)
@@ -300,7 +305,27 @@ class EditorBridge:
 
         名前と場所を送らないなら、結果とエラーの文の中を伏せ字にする 宣言していない
         道具の結果も伏せる 書き漏らしても外へは出ない
+        字幕と文字を伏せて送る道具（:attr:`Operation.hidden` 取り消しと履歴）は、送ってよいと
+        言われていなければ、結果の中の文字も伏せる
         """
+        texts: list[str] | None = None
+        if Outbound.TEXT in operation.hidden and not self.may_send(Outbound.TEXT):
+            # 動かす前の文も表に入れる 取り消すと、取り消した操作が足した文は作品から消える
+            texts = text_secrets(self._host.document.project)
+        try:
+            result = self._guarded(operation, arguments)
+        except ToolError as exc:
+            if texts is None:
+                raise
+            raise ToolError(str(self._hide_text(str(exc), texts))) from None
+        return result if texts is None else self._hide_text(result, texts)
+
+    def _hide_text(self, value: object, before: list[str]) -> object:
+        after = text_secrets(self._host.document.project)
+        return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
+
+    def _guarded(self, operation: Operation, arguments: dict[str, Any]) -> object:
+        """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""
         hide = not self.may_send(Outbound.FILES)
         try:
             result = operation(self._host, arguments)

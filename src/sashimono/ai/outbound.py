@@ -15,7 +15,9 @@ AI アシスタントの道具の結果は、そのまま Claude Code を通し�
 
 断られたときの扱いは種類で違う
 
-- 絵と文 結果そのものが送る物なので、道具を動かさずに断る
+- 絵と文 結果そのものが送る物なので、道具を動かさずに断る ただし取り消しと履歴の道具は
+  断らず、操作の名前の中の文字を伏せ字にして送る（:attr:`Operation.hidden` 名前に文の頭が
+  混ざるだけで、断ると AI に取り消しを頼めなくなる 2026-10-15 利用者の決定）
 - 素材の名前と場所 一覧のあちこちに混ざる 断っても道具は動かし、結果の中の名前と場所を
   伏せ字（〔素材 m_…〕）に置き換えて送る 素材は ID で指せるので、名前が無くても編集できる
   宣言していない道具の結果も同じく伏せる（書き漏らしても外へは出ない）
@@ -36,12 +38,15 @@ from sashimono.core.model import Project
 __all__ = [
     "ASKED",
     "DESTINATION",
+    "TEXT_MARK",
     "Outbound",
     "SendAnswer",
     "SendChoice",
     "SendRequest",
     "file_secrets",
+    "hide_text",
     "redact",
+    "text_secrets",
 ]
 
 #: 送り先 確かめの窓と設定画面に出す
@@ -100,7 +105,8 @@ _DETAILS: dict[Outbound, str] = {
         " 断ると伏せ字にして送る"
     ),
     Outbound.TEXT: (
-        "字幕起こしの結果の文と、テキストのクリップの文 操作の履歴の名前に入った文の頭も含む"
+        "字幕起こしの結果の文と、テキストのクリップの文"
+        " 取り消しと操作の履歴では、名前に入った文を伏せ字にして送る"
     ),
     Outbound.FRAMES: "プレビューを描いた画像（指定したコマの絵 映っている人や画面もそのまま）",
 }
@@ -228,6 +234,70 @@ def file_secrets(
     if export_folder is not None:
         add((str(export_folder), export_folder.as_posix()), "〔書き出しのフォルダ〕")
     return sorted(table.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+#: 字幕と文字を伏せたときの印
+TEXT_MARK = "〔伏せ字〕"
+
+#: 操作の名前の「動き: 対象」の対象のうち、伏せずに残す物 数と数え方だけ（「無音カット: 3 か所」）
+#: 中身の文字ではないので、残しても字幕や本文は外へ出ない
+_COUNT_ONLY = re.compile(r"[\d\s.,/]*(?:か所|件|本|個|コマ|フレーム|秒)?")
+#: 名前の中のかぎ括弧 中は本文の引用（「選んでいるテキスト「…」を写す」など）
+_QUOTED = re.compile(r"「[^」]*」")
+
+
+def text_secrets(project: Project) -> list[str]:
+    """字幕と文字を伏せる表 字幕起こしの文と、テキストのクリップの文（メインとシーン） 長い順"""
+    found: set[str] = set()
+    for media in project.media:
+        for _stream, transcript in media.transcripts:
+            found.update(segment.text for segment in transcript.segments)
+    for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
+        for track in timeline.tracks:
+            for clip in track.clips:
+                if clip.source is not None and "text" in clip.source.params:
+                    found.add(str(clip.source.params["text"]))
+    lines = {line for text in found for line in (text, *text.splitlines())}
+    return sorted(
+        (line for line in lines if len(line.strip()) >= _SHORTEST_SECRET),
+        key=len,
+        reverse=True,
+    )
+
+
+def hide_text(value: Any, secrets: Iterable[str]) -> Any:
+    """操作の名前（取り消しと履歴の道具の結果）の中の文字を伏せる 元の値は変えない
+
+    表（今ある字幕と本文）に載った文字を伏せたうえで、「動き: 対象」の対象と、かぎ括弧の中を
+    伏せる 表だけでは足りない 名前は文の頭（12 文字）で切ってあり、消したテキストや
+    直す前の字幕の文も、表から消えた後まで履歴の名前に残る 動き（「テキストを追加」）は
+    残すので、AI はどの操作を取り消したかを読める
+    """
+    pairs = list(secrets)
+
+    def one(text: str) -> str:
+        for secret in pairs:
+            if secret in text:
+                text = text.replace(secret, TEXT_MARK)
+        text = _QUOTED.sub(f"「{TEXT_MARK}」", text)
+        for separator in (": ", "："):
+            head, found, tail = text.partition(separator)
+            if found:
+                if _COUNT_ONLY.fullmatch(tail.strip()) is None:
+                    return f"{head}{found}{TEXT_MARK}"
+                return text
+        return text
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, str):
+            return one(item)
+        if isinstance(item, Mapping):
+            return {key: walk(entry) for key, entry in item.items()}
+        if isinstance(item, list | tuple):
+            return [walk(entry) for entry in item]
+        return item
+
+    return walk(value)
 
 
 def redact(value: Any, table: Iterable[tuple[str, str]]) -> Any:
