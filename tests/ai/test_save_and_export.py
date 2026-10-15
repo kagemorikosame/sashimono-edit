@@ -473,6 +473,107 @@ class TestTheApprovedPlaceIsKept:
         assert saved.written == [] and saved.exports == [] and saved.snapshots == []
 
 
+class TestWhatWasShownIsWhatIsWritten:
+    """確かめの箱に見せた中身（何を・どこへ・添えた注意）と、実行の時の中身を丸ごと照らす
+
+    場所が同じでも、箱が出ている間に同じ名前のファイルができたり、描くコマや書き出す範囲が
+    変わったりすると、人が許していない上書きや、見せたのと違う物を書く（Codex の P1）
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "file"),
+        [
+            ("save_project_as", "第二稿.sme"),
+            ("export_video", "完成.mp4"),
+            ("save_snapshot", "表紙.png"),
+            ("export_subtitles", "字幕.srt"),
+        ],
+    )
+    def test_a_file_made_while_asking_is_not_replaced(
+        self, saved: FakeHost, codecs: list[str], name: str, file: str
+    ) -> None:
+        # 壊れると、箱には「新しく作る」と出ていたのに、その間に別のアプリや人が作った
+        # 同じ名前のファイルを、許していないまま置き換える
+        del codecs
+        assert saved.saved_at is not None
+        target = saved.saved_at.parent / file
+        bridge = EditorBridge(saved, auto_approve=True)
+        done, box = call_in_thread(bridge, _operation(name), {"path": str(target)})
+
+        def make_then_allow(approval: Approval) -> bool:
+            assert "置き換えます" not in approval.summary
+            target.write_bytes(b"made while asking")
+            return True
+
+        seen = answer_approvals(bridge, done, make_then_allow)
+        assert len(seen) == 1
+        assert isinstance(box.get("error"), ToolError)
+        assert "変わりました" in str(box["error"])
+        assert target.read_bytes() == b"made while asking"
+        assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+
+    def test_a_snapshot_frame_moved_while_asking_is_refused(self, saved: FakeHost) -> None:
+        # 壊れると、箱に出したコマ（再生ヘッドの位置）と違うコマの絵を書く
+        assert saved.saved_at is not None
+        saved.frame = 30
+        bridge = EditorBridge(saved, auto_approve=True)
+        done, box = call_in_thread(
+            bridge, SNAPSHOT, {"path": str(saved.saved_at.parent / "表紙.png")}
+        )
+
+        def seek_then_allow(approval: Approval) -> bool:
+            assert "30 フレーム" in approval.summary
+            saved.frame = 200
+            return True
+
+        answer_approvals(bridge, done, seek_then_allow)
+        assert "変わりました" in str(box.get("error"))
+        assert saved.snapshots == []
+
+    def test_an_export_range_changed_while_asking_is_refused(
+        self, saved: FakeHost, codecs: list[str]
+    ) -> None:
+        # 壊れると、箱に出した範囲（全体）と違う範囲の動画を書き出す
+        del codecs
+        assert saved.saved_at is not None
+        bridge = EditorBridge(saved, auto_approve=True)
+        done, box = call_in_thread(
+            bridge, EXPORT, {"path": str(saved.saved_at.parent / "完成.mp4")}
+        )
+
+        def narrow_then_allow(approval: Approval) -> bool:
+            assert "全体" in approval.summary
+            saved.apply_commands([SetWorkArea((30, 90))], "範囲")
+            return True
+
+        answer_approvals(bridge, done, narrow_then_allow)
+        assert "変わりました" in str(box.get("error"))
+        assert saved.exports == []
+
+    def test_nothing_changed_still_runs(self, saved: FakeHost, codecs: list[str]) -> None:
+        # 壊れると（見せていない揺れる値まで比べると）、何も変わっていないのに毎回断られる
+        del codecs
+        assert saved.saved_at is not None
+        folder = saved.saved_at.parent
+        bridge = EditorBridge(saved, auto_approve=True)
+        calls: tuple[tuple[str, dict[str, object]], ...] = (
+            ("save_project", {}),
+            ("save_project_as", {"path": str(folder / "第二稿.sme")}),
+            ("save_snapshot", {"path": str(folder / "表紙.png")}),
+            ("export_subtitles", {"path": str(folder / "字幕.srt")}),
+            ("export_video", {"path": str(folder / "完成.mp4")}),
+        )
+        for name, arguments in calls:
+            done, box = call_in_thread(bridge, _operation(name), arguments)
+
+            def wait_then_allow(_approval: Approval) -> bool:
+                time.sleep(0.05)
+                return True
+
+            answer_approvals(bridge, done, wait_then_allow)
+            assert box.get("error") is None, (name, box.get("error"))
+
+
 # --- 字幕の書き出しと静止画 ---
 
 SUBTITLES = _operation("export_subtitles")

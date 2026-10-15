@@ -217,12 +217,23 @@ class EditorBridge:
             # なる（上書き保存なら移した先の作品を潰す） 許した場所を実行まで固定し、
             # 解き直した場所と照らして違えば断る 照らすのと実行を同じ 1 件の仕事にして、
             # 間に画面の操作が挟まらないようにする
+            # 照らすのは箱に見せた中身すべて（何を・どこへ・添えた注意） 場所が同じでも、
+            # 箱が出ている間に同じ名前のファイルができる（注意が「置き換えます」に変わる）、
+            # 描くコマや書き出す範囲が変わると、許していない物を書く 箱に見せるのは
+            # Consent だけで、Consent には時刻のような揺れる値を入れない（入れると毎回断る）
             again = describe(self._host, arguments)
-            if not isinstance(again, Consent) or again.target != consent.target:
-                now = again.target if isinstance(again, Consent) else "（分からない）"
+            if again != consent:
+                if isinstance(again, Consent) and again.target != consent.target:
+                    what = (
+                        f"書き込み先が変わりました（許した場所: {consent.target} "
+                        f"今の場所: {again.target}）"
+                    )
+                elif isinstance(again, Consent):
+                    what = f"中身が変わりました（許した時: {consent.detail} 今: {again.detail}）"
+                else:
+                    what = "中身が変わりました"
                 raise ToolError(
-                    f"確かめた後に書き込み先が変わりました（許した場所: {consent.target} "
-                    f"今の場所: {now}） 何も書いていません もう 1 度頼み直してください"
+                    f"確かめた後に{what} 何も書いていません 今の中身でもう 1 度頼み直してください"
                 )
             return operation(self._host, arguments)
 
