@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -34,7 +35,7 @@ from sashimono.ai.outbound import (
     redact,
     secret_pairs,
 )
-from sashimono.core.commands import RemoveMedia
+from sashimono.core.commands import RemoveMedia, SetTranscript
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.timebase import format_timecode
 from tests.ai.conftest import FakeHost, make_loaded
@@ -824,6 +825,98 @@ class TestNoNameLeaksWhenNamesAreRefused:
             if MARK in sent:
                 leaks.append(f"{name}: {sent[:200]}")
         assert not leaks
+
+
+class TestShortNames:
+    """1 文字と 2 文字の作品名・素材名（Codex の指摘 #366）"""
+
+    @staticmethod
+    def _host(video_media: MediaItem, transcript: Transcript, name: str) -> FakeHost:
+        media = replace(video_media, path=Path(f"C:/素材/{name}.mp4"), display_name=name)
+        host = FakeHost(replace(make_loaded(media, transcript), name=name))
+        host.transcription = f"{name}: 終了した"
+        return host
+
+    @pytest.mark.parametrize("name", ["Q", "QZ"])
+    def test_names_returned_as_fields_are_hidden_whatever_their_length(
+        self, name: str, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、「A」のような短い作品名や素材名が、長さの決まりで表から外れ、
+        # 名前と場所を断った人の get_project や一覧の欄からそのまま送られる
+        host = self._host(video_media, transcript, name)
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices(
+            dict.fromkeys(ASKED, SendChoice.ALLOW) | {Outbound.FILES: SendChoice.DENY}
+        )
+        media_id = str(host.document.project.media[0].id)
+        fields: dict[str, Callable[[Any], list[str]]] = {
+            "get_project": lambda r: [r["name"]],
+            "list_media": lambda r: [row["name"] for row in r["media"]],
+            "list_clips": lambda r: [row["media"] for row in r["clips"]],
+            "place_media": lambda r: [r["placed"]],
+        }
+        for tool, pick in fields.items():
+            arguments = {"media_id": media_id} if tool == "place_media" else {}
+            _seen, box = _run(bridge, tool, arguments=arguments)
+            values = pick(box["result"])
+            assert values, tool
+            assert name not in values, f"{tool}: {values}"
+        _seen, box = _run(bridge, "transcription_status")
+        status = box["result"]["status"]  # type: ignore[index]  # 結果は辞書で返る
+        assert not status.startswith(f"{name}:"), status
+        assert "終了した" in status
+
+    @pytest.mark.parametrize("name", ["Q", "QZ"])
+    def test_no_tool_sends_a_short_name(
+        self, name: str, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、短い作品名・素材名が、見張りの目印（長い名前）では見えない道具から漏れる
+        # 大文字の Q と Z は ID（小文字の 16 進）にも道具の返す決まった文にも出ないので、
+        # 前後が英数字でない Q（QZ）が結果にあれば漏れと見なせる
+        found = re.compile(rf"(?<![A-Za-z0-9]){name}(?![A-Za-z0-9])")
+        leaks: list[str] = []
+        sample = self._host(video_media, transcript, name)
+        _operation("add_text")(sample, {"text": BODY_TEXT})
+        for tool, arguments in _every_example(sample):
+            host = self._host(video_media, transcript, name)
+            _operation("add_text")(host, {"text": BODY_TEXT})
+            bridge = EditorBridge(host, auto_approve=True)
+            bridge.set_send_choices(
+                dict.fromkeys(ASKED, SendChoice.ALLOW) | {Outbound.FILES: SendChoice.DENY}
+            )
+            done, box = call_in_thread(bridge, _operation(tool), arguments)
+            answer_sends(bridge, done, _never)
+            sent = json.dumps(
+                {"result": box.get("result"), "error": str(box.get("error") or "")},
+                ensure_ascii=False,
+                default=str,
+            )
+            if found.search(sent):
+                leaks.append(f"{tool}: {sent[:200]}")
+        assert not leaks
+
+    def test_a_short_name_is_not_hidden_inside_other_words(self) -> None:
+        # 壊れると、1 文字の名前（Q）を伏せるために、関係の無い語（QUIT や 30fps）の中まで消える
+        table = [("Q", "〔素材 m〕")]
+        assert redact("QUIT Q 30fps", table) == "QUIT 〔素材 m〕 30fps"
+
+
+class TestTheDocumentKeepsOnlyNames:
+    def test_seen_media_does_not_hold_subtitles(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、文書が覚えた素材（消した物も）が字幕と単語の時刻を抱えたまま残り、
+        # 起こし直すたびにメモリが増え続ける（Codex の指摘 #366）
+        host = FakeHost(make_loaded(video_media, transcript))
+        document = host.document
+        media = document.project.media[0]
+        for _ in range(3):
+            host.apply_commands([SetTranscript(media.id, transcript)], "字幕")
+        seen = document.seen_media
+        assert seen
+        assert all(not isinstance(entry, MediaItem) for entry in seen)
+        assert all(not hasattr(entry, "transcripts") for entry in seen)
+        assert {entry.name for entry in seen} == {media.name}
 
 
 class TestRedact:

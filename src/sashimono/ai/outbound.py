@@ -31,16 +31,18 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from sashimono.core.model import MediaItem, Project
+from sashimono.core.model import MediaId, Project
 
 __all__ = [
     "ASKED",
     "DESTINATION",
+    "NAME_MARK",
     "PROJECT_MARK",
     "REMEMBERED_MARK",
     "TEXT_MARK",
+    "NamedMedia",
     "Outbound",
     "SendAnswer",
     "SendChoice",
@@ -197,7 +199,9 @@ class SendRequest:
         return "\n".join(lines)
 
 
-#: 伏せ字にしない短さ 1 文字の名前まで伏せると、関係の無い文字が消えて結果が読めなくなる
+#: 文の中で、どこに混ざっていても伏せる長さ これより短い名前（1 文字）は、前後が語の続きで
+#: ない所（文の頭・空白・記号の隣）だけで伏せる どこでも伏せると、関係の無い文字が消えて
+#: 結果が読めなくなる 名前そのものを返す欄は長さに関係なく値ごと伏せる（``name_keys``）
 _SHORTEST_SECRET = 2
 
 #: 表に無いファイルの場所 表は素材と作品と書き出しの場所だけ アプリの設定に入った置き場
@@ -232,8 +236,23 @@ _PATH_MARK = "〔ファイルの場所〕"
 _PLACE_KEY = re.compile(r"(?:^|_)(?:path|folder|dir|directory|file)s?$")
 
 
+class NamedMedia(Protocol):
+    """名前と場所を持つ素材（:class:`MediaItem` か、文書が覚えた軽い記録 ``SeenMedia``）"""
+
+    @property
+    def id(self) -> MediaId: ...
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def path(self) -> Path: ...
+
+
 #: 作品の名前を伏せた印
 PROJECT_MARK = "〔作品〕"
+#: 名前そのものを返す欄（``name_keys``）を値ごと伏せた印
+NAME_MARK = "〔名前〕"
 #: アプリが作品の外で覚えている名前と場所を伏せた印
 REMEMBERED_MARK = "〔ファイルの名前〕"
 
@@ -243,7 +262,7 @@ def file_secrets(
     *,
     project_path: Path | None,
     export_folder: Path | None,
-    media: Iterable[MediaItem] = (),
+    media: Iterable[NamedMedia] = (),
     names: Iterable[str] = (),
     remembered: Iterable[str] = (),
 ) -> dict[str, str]:
@@ -265,16 +284,17 @@ def file_secrets(
 
     def add(values: Iterable[str], mark: str) -> None:
         for value in values:
-            if len(value) >= _SHORTEST_SECRET and value not in table:
+            # 短い名前も表に入れる 伏せ方は :func:`redact` が長さで変える
+            if value.strip() and value not in table:
                 table[value] = mark
 
-    def add_media(item: MediaItem) -> None:
+    def add_media(item: NamedMedia) -> None:
         path = item.path
         add((str(path), path.as_posix(), item.name, path.name, path.stem), f"〔素材 {item.id}〕")
 
     for project in (projects,) if isinstance(projects, Project) else projects:
-        for item in project.media:
-            add_media(item)
+        for owned in project.media:
+            add_media(owned)
         add((project.name,), PROJECT_MARK)
     for item in media:
         add_media(item)
@@ -365,35 +385,52 @@ def hide_text(value: Any, secrets: Iterable[str]) -> Any:
     return walk(value)
 
 
-def redact(value: Any, table: Iterable[tuple[str, str]]) -> Any:
-    """結果の中の文字を、表に従って伏せ字にする 辞書と並びは中まで辿る 元の値は変えない"""
+def redact(value: Any, table: Iterable[tuple[str, str]], name_keys: Iterable[str] = ()) -> Any:
+    """結果の中の文字を、表に従って伏せ字にする 辞書と並びは中まで辿る 元の値は変えない
+
+    ``name_keys`` は名前そのものを返す欄（作品や素材の名前 道具ごとに
+    :attr:`~sashimono.ai.operations.Operation.name_keys` で決める） 表に載っていなくても、
+    短くても、値ごと伏せる
+    """
     pairs = list(table)
+    names = frozenset(name_keys)
+    # 短い名前は、前後が語の続きでない所だけで伏せる（:data:`_SHORTEST_SECRET`）
+    short = [
+        (re.compile(rf"(?<!\w){re.escape(secret)}(?!\w)"), mark)
+        for secret, mark in pairs
+        if len(secret) < _SHORTEST_SECRET
+    ]
+    long = [(secret, mark) for secret, mark in pairs if len(secret) >= _SHORTEST_SECRET]
 
     def walk(item: Any) -> Any:
         if isinstance(item, str):
-            for secret, mark in pairs:
+            for secret, mark in long:
                 if secret in item:
                     item = item.replace(secret, mark)
+            for pattern, mark in short:
+                item = pattern.sub(mark, item)
             return _ABSOLUTE_PATH.sub(_PATH_MARK, item)
         if isinstance(item, Mapping):
-            return {
-                walk(key): (
-                    whole(walk(entry))
-                    if isinstance(key, str) and _PLACE_KEY.search(key)
-                    else walk(entry)
-                )
-                for key, entry in item.items()
-            }
+            return {walk(key): value_of(key, entry) for key, entry in item.items()}
         if isinstance(item, list | tuple):
             return [walk(entry) for entry in item]
         return item
 
-    def whole(item: Any) -> Any:
-        """場所の項目の値 表で伏せ字になった物（〔素材 …〕）は残し、ほかは値ごと伏せる"""
+    def value_of(key: object, entry: Any) -> Any:
+        if not isinstance(key, str):
+            return walk(entry)
+        if key in names:
+            return whole(walk(entry), NAME_MARK)
+        if _PLACE_KEY.search(key):
+            return whole(walk(entry), _PATH_MARK)
+        return walk(entry)
+
+    def whole(item: Any, mark: str) -> Any:
+        """名前か場所の欄の値 表で伏せ字になった物（〔素材 …〕）は残し、ほかは値ごと伏せる"""
         if isinstance(item, str):
-            return item if not item or item.startswith("〔") else _PATH_MARK
+            return item if not item or item.startswith("〔") else mark
         if isinstance(item, list):
-            return [whole(entry) for entry in item]
+            return [whole(entry, mark) for entry in item]
         return item
 
     return walk(value)

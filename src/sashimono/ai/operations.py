@@ -174,6 +174,11 @@ class Operation:
     #: （:func:`~sashimono.ai.outbound.file_secrets`）では伏せられない
     #: 名前と場所か字幕と文字を許していなければ、対象を形で伏せる
     labels: bool = field(default=False, kw_only=True)
+    #: 結果のうち、作品や素材の名前そのものを返す欄の名前（``get_project`` の ``name`` など）
+    #: 名前と場所を許していなければ、表（:func:`~sashimono.ai.outbound.file_secrets`）に
+    #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
+    #: トラック・シーン・エフェクトの名前は作品の中身の名前で、ここには書かない
+    name_keys: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
@@ -2184,6 +2189,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_project,
         sends=_WITH_FILES,
+        name_keys=frozenset({"name"}),
     ),
     Operation(
         name="list_media",
@@ -2191,6 +2197,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
         sends=_WITH_FILES,
+        name_keys=frozenset({"name"}),
     ),
     Operation(
         name="list_tracks",
@@ -2214,6 +2221,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_list_clips,
         sends=_WITH_FILES,
+        name_keys=frozenset({"media"}),
     ),
     Operation(
         name="get_selection",
@@ -2394,6 +2402,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_import_media,
         sends=_WITH_FILES,
+        name_keys=frozenset({"imported"}),
         writes=True,
     ),
     Operation(
@@ -2408,6 +2417,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_place_media,
         sends=_WITH_FILES,
+        name_keys=frozenset({"placed"}),
         writes=True,
     ),
     Operation(
@@ -2957,6 +2967,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_transcribe,
         sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
         writes=True,
     ),
     Operation(

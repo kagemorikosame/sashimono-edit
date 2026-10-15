@@ -392,7 +392,7 @@ class EditorBridge:
                     png=result.png, caption=str(redact(result.caption, self._file_secrets()))
                 )
             return result
-        return redact(result, self._file_secrets()) if hide else result
+        return redact(result, self._file_secrets(), operation.name_keys) if hide else result
 
     def _learn_names(self) -> None:
         """今の作品と履歴に残った作品から、名前と場所を覚える 画面のスレッドで呼ぶ
