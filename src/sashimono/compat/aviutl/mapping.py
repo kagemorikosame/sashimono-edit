@@ -774,9 +774,14 @@ def map_object(
     # オブジェクト分割 の分け方 切らないうちは 1 マスなので、個別の効果は何も動かさない
     # （AviUtl2 でも分割なしの 個別の拡大 50 は元の絵のままだった）
     grid: dict[str, ParamValue] = {}
+    #: まだ中身のすぐ後ろか テキストの塗りへ写せるのは、中身のすぐ後ろの
+    #: グラデーション 1 つだけ（#312） 読めないフィルタ・オブジェクト分割・写した塗りの
+    #: 後ろの物は、前の物が変えた絵に掛かるので写さない
+    at_head = True
 
     for entry in stacked:
         if entry.name == _SPLIT:
+            at_head = False
             grid = _split_grid(entry, points, log)
             continue
         if entry.name in _DRAW_NAMES:
@@ -792,8 +797,10 @@ def map_object(
             continue
 
         effect = _filter(entry, points, log)
-        if effect is not None and source is not None and not effects:
+        head, at_head = at_head, False
+        if effect is not None and source is not None and head:
             # テキストのすぐ後ろのグラデーションは、テキストの塗りとして読む（#312）
+            # 写せない物（縁のある字など）はエフェクトのまま並びに残る
             folded = text_gradient_fill(effect, source)
             if folded is not None:
                 source = replace(source, params={**source.params, **folded})

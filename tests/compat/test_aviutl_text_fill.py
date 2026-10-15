@@ -177,6 +177,74 @@ class TestWhatIsFolded:
         assert found.clip.source.params.get("fill_type") != "linear"
 
 
+#: テキストの後ろに積むフィルタ 1 つ目の後ろに、2 つ目のフィルタを挟んでグラデーションを置く
+_GRADIENT_BLOCK = """[Object.{index}]
+effect.name=グラデーション
+強さ=100.0
+中心X=0.0
+中心Y=0.0
+角度=0.00
+幅=100
+合成モード=通常
+形状=線形
+開始色={start}
+終了色=0000ff
+"""
+
+_TEXT_HEAD = ALIAS.split("[Object.1]")[0].format(
+    decoration="標準文字", align="中央揃え[下]", first="", angle="0.00", blend="通常"
+)
+
+
+def _stacked(tmp_path: Path, *blocks: str) -> Clip:
+    """テキストの後ろに ``blocks`` を順に積んだエイリアスを読む"""
+    body = _TEXT_HEAD + "".join(
+        block.replace("[Object.?]", f"[Object.{index}]") for index, block in enumerate(blocks, 1)
+    )
+    path = tmp_path / "積んだ.object"
+    path.write_text(body, encoding="utf-8")
+    (obj,) = load_exo(path).objects
+    found = map_object(obj, FrameRate(60))
+    assert found is not None
+    return found.clip
+
+
+def _gradient(start: str) -> str:
+    return _GRADIENT_BLOCK.format(index="?", start=start)
+
+
+class TestOnlyTheFirstFilter:
+    def test_a_second_gradient_stays_an_effect(self, tmp_path: Path) -> None:
+        # 2 つ目も塗りへ写すと 1 つ目の塗りを上書きし、1 つ目のグラデーションが黙って消える
+        clip = _stacked(tmp_path, _gradient("ff0000"), _gradient("00ff00"))
+        assert clip.source is not None
+        stops = clip.source.params["fill_gradient"]
+        assert isinstance(stops, tuple)
+        assert stops[1:4] == (1.0, 0.0, 0.0)
+        (kept,) = [effect for effect in clip.effects if effect.kind == "gradient"]
+        assert kept.params["start_color"] == (0.0, 1.0, 0.0, 1.0)
+
+    @pytest.mark.parametrize(
+        "between",
+        [
+            # 読めないフィルタ 何をしているか分からない絵をグラデーションは塗る
+            "[Object.?]\neffect.name=知らないフィルタ\n",
+            # オブジェクト分割 分けた後の絵に掛かる
+            "[Object.?]\neffect.name=オブジェクト分割\n横分割数=2\n縦分割数=2\n",
+        ],
+        ids=["読めないフィルタ", "オブジェクト分割"],
+    )
+    def test_a_gradient_after_another_entry_stays_an_effect(
+        self, tmp_path: Path, between: str
+    ) -> None:
+        # 間に何かを挟んだグラデーションまで塗りへ写すと、AviUtl2 で前の物が変えた絵に掛かる
+        # はずの色が字の塗りだけに掛かる
+        clip = _stacked(tmp_path, between, _gradient("ff0000"))
+        assert clip.source is not None
+        assert clip.source.params.get("fill_type") != "linear"
+        assert any(effect.kind == "gradient" for effect in clip.effects)
+
+
 @pytest.fixture(scope="module")
 def gl_context() -> Iterator[OffscreenGLContext]:
     try:

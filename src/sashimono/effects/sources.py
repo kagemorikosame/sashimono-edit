@@ -98,13 +98,27 @@ class SourceDefinition:
         いくつも動かすときは定義の順に並べる
         """
         names = {spec.name for spec in specs}
-        moved = [s for s in specs if self.placed_after.get(s.name) in names]
+
+        def anchor_of(name: str) -> str | None:
+            """前に来る項目 隠れていれば、その項目の前に来る項目へさかのぼる
+
+            さかのぼらないと、前の項目が隠れた欄（線形の基準・円形の中心など）が底に出る
+            """
+            seen: set[str] = set()
+            anchor = self.placed_after.get(name)
+            while anchor is not None and anchor not in names and anchor not in seen:
+                seen.add(anchor)
+                anchor = self.placed_after.get(anchor)
+            return anchor if anchor in names else None
+
+        anchors = {spec.name: anchor_of(spec.name) for spec in specs}
+        moved = [s for s in specs if anchors[s.name] is not None]
         ordered: list[ParameterSpec] = []
 
         def place(spec: ParameterSpec) -> None:
             ordered.append(spec)
             for follower in moved:
-                if self.placed_after.get(follower.name) == spec.name:
+                if anchors[follower.name] == spec.name:
                     place(follower)
 
         for spec in specs:

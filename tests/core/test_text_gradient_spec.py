@@ -152,6 +152,20 @@ class TestTheShownFields:
         assert shown[shown.index("fill_type") + 1] == "fill_gradient"
         assert shown[shown.index("shadow_blur") + 1] == "shadow_fill_type"
 
+    @pytest.mark.parametrize("prefix", ["fill", "shadow_fill"])
+    def test_the_fill_fields_stay_together(self, prefix: str) -> None:
+        # 前につなぐ欄が隠れていると、線形の基準や円形の中心・半径が設定パネルの底に出て、
+        # グラデーションの欄から 20 行も離れた所を探すことになる
+        for kind, expected in (
+            ("linear", ["type", "gradient", "angle", "length", "shift", "span", "basis"]),
+            ("radial", ["type", "gradient", "center_x", "center_y", "radius", "basis"]),
+        ):
+            values: dict[str, ParamInput] = {f"{prefix}_type": kind, "shadow_x": 4.0}
+            shown = self._shown(**values)
+            head = shown.index(f"{prefix}_type")
+            names = [f"{prefix}_{suffix}" for suffix in expected]
+            assert shown[head : head + len(names)] == names, (kind, shown)
+
     def test_the_shadow_fill_hides_without_a_shadow(self) -> None:
         # 影が無いのに影の塗りの欄が並ぶと、動かしても何も変わらない
         assert "shadow_fill_type" not in self._shown()
