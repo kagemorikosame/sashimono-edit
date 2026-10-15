@@ -305,7 +305,7 @@ class TestBackgroundProgress:
         window._flush_analysis()
         indicator = window._background_indicator
         assert not indicator.isHidden()
-        assert indicator.text == "波形とサムネイル 0/2 件 50%"
+        assert indicator.text == "解析 0/2 件 50%"
         assert indicator.value == 500
         row = window._media_pool.row_text(video_media.id)
         assert row is not None and row.endswith("[解析 50%]")
@@ -388,7 +388,7 @@ class TestBackgroundProgress:
         window._flush_analysis()
         window._flush_analysis()
         indicator = window._background_indicator
-        assert indicator.text == "波形とサムネイル 0/1 件 0% 失敗 1 件"
+        assert indicator.text == "解析 0/1 件 0% 失敗 1 件"
         assert indicator.value == 500
 
         analysis.finish(("waveform", video_media.id))
@@ -490,7 +490,7 @@ class TestWording:
         analysis.finish("a", "開けない")
         analysis.start("b", media)
         text = describe_background(proxy.poll(), analysis.poll())
-        assert text == "控え 0/1 本 0%・波形とサムネイル 1/2 件 50% 失敗 1 件"
+        assert text == "控え 0/1 本 0%・解析 1/2 件 50% 失敗 1 件"
 
     def test_a_row_without_work_has_no_note(self) -> None:
         # 仕事の無い行に注記を付けると、終わった素材まで何かを作っているように見える
