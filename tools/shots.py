@@ -25,8 +25,8 @@ r"""README と Wiki に載せる画面写真を、アプリ自身に撮らせる
 スクリプト）は写さない 再配布の条件が作者ごとに違うので、棚やテンプレートの
 写真に使う物も、ここで書いた見本だけにする
 
-Wiki の手順書の写真は ``--wiki`` に Wiki の clone を渡したときだけ撮り、
-その ``images`` へ書き出す
+Wiki の写真（手順書と、プリセットや AI アシスタントなど操作のページ）は ``--wiki`` に
+Wiki の clone を渡したときだけ撮り、その ``images`` へ書き出す
 """
 
 from __future__ import annotations
@@ -36,9 +36,11 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -54,9 +56,12 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDockWidget,
+    QFrame,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QScrollArea,
@@ -88,20 +93,31 @@ from sashimono.core.commands import (
     SetTranscript,
     insert_generated,
 )
+from sashimono.core.io import Preset, PresetStore
+from sashimono.core.io.aliases import AliasStore
+from sashimono.core.io.library import PRESET, Library
 from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
     ClipId,
     GeneratedSource,
     Project,
     ProjectSettings,
+    Stroke,
     Transcript,
     TranscriptSegment,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.definition import registry
 from sashimono.effects.sources import TEXT
+from sashimono.effects.strokes import STROKE
 from sashimono.runtime import PackageStatus, PackStatus
 from sashimono.ui.compat_dialog import CompatibilityDialog
 from sashimono.ui.inspector import InspectorPanel
+from sashimono.ui.library_dialog import LibraryDialog
+from sashimono.ui.library_save import SaveDialog
+from sashimono.ui.library_thumbnails import LookThumbnails
+from sashimono.ui.library_view import LibraryOptions
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import AUTO_QUALITY_TEXT, PreferencesDialog
 from sashimono.ui.preview import PreviewWidget
@@ -182,6 +198,17 @@ class Context:
     script_root: Path
     #: 見本のテンプレートを置いた場所（作業用のフォルダからの相対）
     template_root: Path
+    #: 作業用のフォルダ（絶対パス） 撮るたびに消して作り直す見本の置き場は、この中にだけ作る
+    #: 無い（``None``）ときは、置き場を作り直す写真を撮らずに止める
+    work: Path | None = None
+
+    def library_root(self) -> Path:
+        """見本のプリセットの置き場 作業用のフォルダの下の絶対パス"""
+        if self.work is None:
+            raise ShotError(
+                "作業用のフォルダが決まっていないので、見本のプリセットの置き場を作れない"
+            )
+        return self.work / LIBRARY_DIR
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +223,7 @@ class Shot:
     #: 要らない写真まで ffmpeg に付き合わせない ffmpeg の無い機械で棚や
     #: スクリプトの写真だけを撮りたいことがある
     needs_media: bool = True
-    #: Wiki の手順書の写真か 真なら ``--wiki`` の ``images`` へ書き出す
+    #: Wiki の写真か（手順書と操作のページ） 真なら ``--wiki`` の ``images`` へ書き出す
     wiki: bool = False
 
 
@@ -893,7 +920,9 @@ def shot_ai(context: Context) -> QImage:
         return take_editor_shot(window)
 
 
-def _fake_conversation(panel: QWidget) -> None:
+def _fake_conversation(
+    panel: QWidget, chat: Sequence[tuple[str | None, str]] = SAMPLE_CHAT
+) -> None:
     """AI パネルに見本の会話を並べ、使える状態の見た目にする
 
     実行環境（Claude Agent SDK と Claude Code 本体）が入っていない機械では、パネルは
@@ -912,7 +941,7 @@ def _fake_conversation(panel: QWidget) -> None:
     panel._send_button.setEnabled(True)
     panel._view.clear()
     panel._log.clear()
-    for who, text in SAMPLE_CHAT:
+    for who, text in chat:
         if who is None:
             panel._note(text)
         else:
@@ -1522,6 +1551,373 @@ def wiki_trouble_report(context: Context) -> QImage:
     return _grab_dialog(compatibility_dialog(context), marks=("内容をコピー",))
 
 
+# --- 0.2.2 で入った画面（#317 Wiki の操作のページに載せる） ---
+
+#: 見本のプリセットの置き場の名前（作業用のフォルダの下） 撮るたびに消して作り直す
+#: 残すと、前の写真で書いた物が次の写真の一覧に混ざり、撮る順番で絵が変わる
+LIBRARY_DIR = "見本の置き場"
+
+_Colour = tuple[float, float, float, float]
+
+#: 見本のプリセット （名前, 分類, 字の色, 縁取りの層（太さ, 色）の並び, グローを掛けるか）
+#: 名前と見た目はここで決めた物 一覧の見本の絵が、色・縁の重ね方・光り方の違う物になるように選んだ
+SAMPLE_PRESETS: tuple[tuple[str, str, _Colour, tuple[tuple[float, _Colour], ...], bool], ...] = (
+    ("黄色の見出し", "見出し", (1.0, 0.85, 0.2, 1.0), ((8.0, (0.25, 0.12, 0.0, 1.0)),), False),
+    (
+        "二重縁の見出し",
+        "見出し",
+        (1.0, 1.0, 1.0, 1.0),
+        ((6.0, (0.85, 0.1, 0.2, 1.0)), (14.0, (1.0, 1.0, 1.0, 1.0))),
+        False,
+    ),
+    ("光る見出し", "見出し", (0.5, 0.95, 1.0, 1.0), ((4.0, (0.0, 0.2, 0.4, 1.0)),), True),
+    ("青縁の字幕", "字幕", (1.0, 1.0, 1.0, 1.0), ((6.0, (0.05, 0.2, 0.6, 1.0)),), False),
+    ("桃色の字幕", "字幕", (1.0, 0.6, 0.8, 1.0), ((6.0, (1.0, 1.0, 1.0, 1.0)),), False),
+    ("黒縁の字幕", "字幕", (1.0, 1.0, 1.0, 1.0), ((5.0, (0.0, 0.0, 0.0, 1.0)),), False),
+)
+
+#: 保存の窓で上書きする見本と、いまのクリップの見た目（前の見本と違って見えるように縁を足す）
+SAMPLE_OVERWRITE = "黄色の見出し"
+SAMPLE_CURRENT: tuple[_Colour, tuple[tuple[float, _Colour], ...]] = (
+    (1.0, 0.6, 0.1, 1.0),
+    ((6.0, (0.25, 0.12, 0.0, 1.0)), (14.0, (1.0, 1.0, 1.0, 1.0))),
+)
+
+#: 見本の絵がそろうのを待つ上限（ミリ秒） 棚と同じく、知らせが来ないまま止まり続けないための見張り
+LIBRARY_GUARD_MS = SHELF_GUARD_MS
+
+
+def sample_strokes(*layers: tuple[float, _Colour]) -> tuple[Stroke, ...]:
+    """縁取りの層の並び 頭が一番上（字に近い側）"""
+    made: list[Stroke] = []
+    for width, colour in layers:
+        params = STROKE.default_params()
+        params["width"] = AnimatedValue(width)
+        params["color"] = colour
+        made.append(Stroke(params=params))
+    return tuple(made)
+
+
+def _look_clip(
+    text: str, colour: _Colour, strokes: tuple[tuple[float, _Colour], ...], glow: bool
+) -> Clip:
+    """見本のプリセットの元にするテキストのクリップ タイムラインには置かない"""
+    from sashimono.core.commands.fixed import with_fixed_items
+
+    source = TEXT.create(text=text, size=96, color=colour).with_strokes(sample_strokes(*strokes))
+    effects = (registry.require("glow").create(),) if glow else ()
+    clip = Clip(timeline_start=0, duration=60, source=source, effects=effects)
+    return with_fixed_items(clip, picture=True)
+
+
+def sample_library(root: Path, work: Path) -> Library:
+    """見本のプリセットを書いた置き場 前の中身は消してから書く
+
+    本人のプリセットは使わない 置き場は作業用のフォルダ ``work`` の中にする 場所は一覧の
+    補足（ツールチップ）にだけ出て、写真には写らない
+
+    消す前に、``root`` が ``work`` の中（``work`` そのものではない）かを確かめ、外なら止める
+    相対の場所を今のフォルダから読むと、作業用のフォルダへ移らずに呼んだとき（試験や
+    別の台本から）に、リポジトリの根などにある同じ名前のフォルダを消してしまう
+    """
+    if work.resolve() not in root.resolve().parents:
+        raise ShotError(f"見本の置き場が作業用のフォルダの外なので消さない: {root}")
+    if root.exists():
+        shutil.rmtree(root)
+    library = Library(presets=PresetStore(root / "presets"), aliases=AliasStore(root / "aliases"))
+    for name, category, colour, strokes, glow in SAMPLE_PRESETS:
+        clip = _look_clip(name, colour, strokes, glow)
+        library.presets.save(Preset.capture(name, clip, category=category))
+    return library
+
+
+def library_dialog(
+    library: Library,
+    thumbnails: LookThumbnails | None = None,
+    options: LibraryOptions | None = None,
+) -> LibraryDialog:
+    """〔オブジェクト〕→〔プリセットとエイリアス…〕と同じ、整理だけの一覧の窓"""
+    dialog = LibraryDialog(library, kind=PRESET, thumbnails=thumbnails, options=options)
+    # 1 つ選んだ所を見せる 何も選んでいないと、名前を変えるなどのボタンが全部灰色で写る
+    dialog.select(SAMPLE_PRESETS[0][0])
+    return dialog
+
+
+def save_dialog(
+    library: Library,
+    thumbnails: LookThumbnails | None = None,
+    options: LibraryOptions | None = None,
+) -> SaveDialog:
+    """〔この見た目を保存…〕の窓で、保存済みの一覧から上書きする物を選んだ所
+
+    一覧から選ぶと名前と分類が入り、上書きの印も入る（窓の中の手順と同じ ``pick``）
+    いまのクリップは前と違う見た目にする 同じだと前といまの見本が同じ絵になり、上書きで
+    何が変わるのかが写らない
+    """
+    colour, strokes = SAMPLE_CURRENT
+
+    def make(name: str, category: str) -> Preset:
+        return Preset.capture(name, _look_clip(name, colour, strokes, False), category=category)
+
+    dialog = SaveDialog(
+        library,
+        PRESET,
+        make=make,
+        suggestion="新しい見出し",
+        category="ユーザー",
+        thumbnails=thumbnails,
+        options=options,
+    )
+    dialog.pick(SAMPLE_OVERWRITE)
+    listing = dialog.findChild(QListWidget)
+    if listing is not None:
+        # 選んだ物を一覧でも選んだ形にする 窓の中で押したときと同じ見た目
+        for row in range(listing.count()):
+            if listing.item(row).text() == SAMPLE_OVERWRITE:
+                listing.setCurrentRow(row)
+    return dialog
+
+
+def library_pictures_waiting(dialog: LibraryDialog | SaveDialog) -> bool:
+    """見本の絵をまだ待っているか 頼む前（窓を出して 40ms の間）も待っている側に数える"""
+    timer = dialog._visible_timer if isinstance(dialog, LibraryDialog) else dialog._timer
+    return timer.isActive() or bool(dialog._waiting)
+
+
+def wait_for_library_pictures(dialog: LibraryDialog | SaveDialog) -> None:
+    """一覧と前後の見本の絵がそろうまで待つ
+
+    絵は別のスレッドで描いて後から埋まる 時間で待つと、遅い機械では地だけの見本が写り、
+    撮るたびに埋まった数が変わる 待ちが尽きたのを見てから撮る
+    """
+    deadline = time.monotonic() + LIBRARY_GUARD_MS / 1000
+    while library_pictures_waiting(dialog) and time.monotonic() < deadline:
+        settle(dialog, rounds=1)
+    if library_pictures_waiting(dialog):
+        raise ShotError("プリセットの見本の絵が描き終わらない")
+
+
+def _grab_library(dialog: LibraryDialog | SaveDialog, marks: Sequence[QWidget] = ()) -> QImage:
+    hide_from_screen(dialog)
+    dialog.show()
+    settle(dialog)
+    wait_for_library_pictures(dialog)
+    image = grab(dialog)
+    mark(image, [rect_in(dialog, widget) for widget in marks])
+    dialog.close()
+    QApplication.processEvents()
+    return image
+
+
+def wiki_library_manage(context: Context) -> QImage:
+    """〔オブジェクト〕→〔プリセットとエイリアス…〕の一覧の窓"""
+    root = context.library_root()
+    return _grab_library(library_dialog(sample_library(root, root.parent)))
+
+
+def wiki_library_save(context: Context) -> QImage:
+    """〔この見た目を保存…〕の窓 上書きの印と、前といまの見本"""
+    root = context.library_root()
+    dialog = save_dialog(sample_library(root, root.parent))
+    overwrite = next(
+        (box for box in dialog.findChildren(QCheckBox) if box.text().startswith("同じ名前")), None
+    )
+    if overwrite is None or not overwrite.isChecked():
+        dialog.close()
+        raise ShotError("保存の窓に上書きの印が入らない")
+    return _grab_library(dialog, marks=(overwrite,))
+
+
+#: 縁取りの層の写真に置くテキスト 層は 2 つ（赤の内と白の外）
+SAMPLE_STROKE_TEXT = "縁取りの層"
+
+#: 右のパネルを高くして撮る写真（縁取りの層・AI の質問）の窓の高さと、そのときのタイムラインの
+#: 高さ（論理画素） 縁取り 2 つと〔＋ 縁取りを追加〕、AI の会話の数行・選択肢 3 つと説明・
+#: 答え方の案内・入力欄が、巻物にならずに入る高さ 写すのは窓の一部なので、窓の高さは写らない
+TALL_WINDOW_HEIGHT = 1000
+TALL_TIMELINE_HEIGHT = 200
+
+
+def _make_room_above_timeline(window: MainWindow) -> QDockWidget:
+    """窓を縦に伸ばしてタイムラインを縮め、上のパネルを高くする タイムラインのドックを返す"""
+    window.resize(WINDOW_SIZE[0], TALL_WINDOW_HEIGHT)
+    settle(window, rounds=4)
+    timeline = window.findChild(QDockWidget, "timeline")
+    if timeline is None:
+        raise ShotError("タイムラインのパネルが無い")
+    window.resizeDocks([timeline], [TALL_TIMELINE_HEIGHT], Qt.Orientation.Vertical)
+    settle(window)
+    return timeline
+
+
+def inspector_rect(window: MainWindow, widget: QWidget) -> QRect:
+    """設定パネルの中の ``widget`` の範囲 パネルの見えている所に無ければ止める
+
+    巻物の外にある部品を囲むと、枠だけが別の場所（タイムラインの上など）に描かれ、
+    手順書が何も無い所を指す
+    """
+    inspector = window.findChild(InspectorPanel)
+    area = inspector.findChild(QScrollArea) if inspector is not None else None
+    if area is None:
+        raise ShotError("設定パネルが無い")
+    rect = rect_in(window, widget)
+    if not rect_in(window, area.viewport()).contains(rect):
+        raise ShotError(f"設定パネルの見えている所に無い: {widget.objectName() or widget}")
+    return rect
+
+
+def _scroll_inspector_to(window: MainWindow, widget: QWidget, above: int = 8) -> None:
+    """設定パネルを送り、``widget`` の頭がパネルの上から ``above`` の所に来るようにする
+
+    送らないと、クリップが最初から持つ描画の欄だけが写り、見せたい組が切れる
+    """
+    inspector = window.findChild(InspectorPanel)
+    area = inspector.findChild(QScrollArea) if inspector is not None else None
+    if area is None or area.widget() is None:
+        raise ShotError("設定パネルが無い")
+    settle(window, rounds=4)
+    top = widget.mapTo(area.widget(), QPoint(0, 0)).y()
+    area.verticalScrollBar().setValue(max(0, top - above))
+    settle(window, rounds=4)
+
+
+def _section(window: MainWindow, heading: str) -> QWidget:
+    """設定パネルの中の、見出しが ``heading`` の組"""
+    inspector = window.findChild(InspectorPanel)
+    for frame in inspector.findChildren(QFrame) if inspector is not None else []:
+        if getattr(frame, "heading", None) == heading:
+            return frame
+    raise ShotError(f"設定パネルに {heading} の組が無い")
+
+
+def _named_button(window: QWidget, name: str) -> QAbstractButton:
+    found = window.findChild(QAbstractButton, name)
+    if found is None:
+        raise ShotError(f"ボタンが無い: {name}")
+    return found
+
+
+def wiki_edit_strokes(context: Context) -> QImage:
+    """設定パネルの縁取りの層（縁取り 1・縁取り 2・〔＋ 縁取りを追加〕）"""
+    del context
+    with editor(sample_project()) as window:
+        strokes = sample_strokes((7.0, (0.8, 0.1, 0.15, 1.0)), (18.0, (1.0, 1.0, 1.0, 1.0)))
+        text = TEXT.create(
+            text=SAMPLE_STROKE_TEXT, size=150, color=(1.0, 0.9, 0.25, 1.0)
+        ).with_strokes(strokes)
+        window.apply_commands(_place_text(window, text, at_frame=0, duration=150), "テキストを追加")
+        window.select_clip(top_text_clip(window))
+        window.seek(20)
+        # 1280x800 の設定パネルには縁取り 2 つと〔＋ 縁取りを追加〕が一度に入らず、足すボタンが
+        # 巻物の下に隠れる パネルを高くし、プレビューと設定パネルだけを切り出す
+        timeline = _make_room_above_timeline(window)
+        _scroll_inspector_to(window, _section(window, "縁取り 1"))
+        image = take_editor_shot(window)
+        mark(image, [inspector_rect(window, _named_button(window, "add_stroke"))])
+        preview = window.findChild(PreviewWidget)
+        left = rect_in(window, preview).left() if preview is not None else 0
+        top = window.menuBar().height()
+        return image.copy(left, top, image.width() - left, rect_in(window, timeline).top() - top)
+
+
+def wiki_edit_layout(context: Context) -> QImage:
+    """AviUtl2 のエイリアスから置いたテキストの〔組み方を「標準」にする〕"""
+    entry = find_template(context, SAMPLE_ALIAS_NAME)
+    with editor(sample_project(*FULL_HD)) as window:
+        if not window.place_template_entry(entry, 0):
+            raise ShotError("見本のテンプレートを置けない")
+        window.select_clip(top_text_clip(window))
+        window.seek(10)
+        settle(window)
+        button = _named_button(window, "unlock_button")
+        # ボタンの上の灰色の欄（スタイル）と理由の文まで入るよう、少し上から見せる
+        _scroll_inspector_to(window, button, above=150)
+        image = take_editor_shot(window)
+        mark(image, [inspector_rect(window, button)])
+        return image
+
+
+def wiki_edit_snap(context: Context) -> QImage:
+    """タイムラインの右上の〔磁石〕と再生ヘッドの吸い付きのボタン タイムラインだけを切り出す"""
+    from sashimono.ui.scene_bar import SceneBar
+
+    with editor(sample_project()) as window:
+        import_sample(window, context)
+        window.seek(60)
+        settle(window)
+        image = take_editor_shot(window)
+        bar = window.findChild(SceneBar)
+        dock = window.findChild(QDockWidget, "timeline")
+        if bar is None or dock is None:
+            raise ShotError("タイムラインの上の帯が無い")
+        mark(image, [rect_in(window, bar.snap_button), rect_in(window, bar.playhead_snap_button)])
+        # 窓全体だと 2 つのボタンは右下の小さな印になり、どれを指しているか読めない
+        top = rect_in(window, dock).top()
+        return image.copy(0, top, image.width(), image.height() - top)
+
+
+#: AI の質問の写真に見せる会話と質問 **本物の Claude には送らない**（``SAMPLE_CHAT`` と同じ）
+#: 質問は、指示があいまいで受け取り方で結果が変わるとき（テロップが 2 本ある）の形にする
+SAMPLE_QUESTION_CHAT: tuple[tuple[str | None, str], ...] = (
+    ("あなた", "テロップを黄色にして"),
+    (None, "▸ list_clips"),
+)
+SAMPLE_QUESTION: dict[str, object] = {
+    "question": "テロップが 2 本あります どれを黄色にしますか",
+    "choices": [
+        {"label": "選んでいるテロップ", "description": "いまタイムラインで選んでいる 1 本"},
+        {"label": "すべてのテロップ", "description": "タイムラインにある 2 本とも"},
+        {"label": "頭のテロップだけ", "description": "0 秒から始まる「見本のテロップ」"},
+    ],
+}
+
+
+def show_sample_question(panel: QWidget) -> None:
+    """AI パネルに見本の会話を並べ、見本の質問の箱を出す
+
+    質問は本物と同じ入口（``_show_question``）で出し、道具（ask_user）の引数の確かめ
+    （``question_spec``）も通す 確かめを通さずに組むと、本物の AI が出せない形
+    （選択肢の名前が長すぎるなど）の質問が写真に写る
+    """
+    from sashimono.ai.bridge import Question
+    from sashimono.ai.operations import question_spec
+    from sashimono.ui.chat import ChatPanel
+
+    if not isinstance(panel, ChatPanel):
+        raise ShotError("AI パネルではない")
+    _fake_conversation(panel, SAMPLE_QUESTION_CHAT)
+    panel._show_question(Question(question_spec(dict(SAMPLE_QUESTION))))
+
+
+def wiki_ai_question(context: Context) -> QImage:
+    """AI アシスタントの質問の箱（選択肢つき） **本物のセッションは走らせない**"""
+    from sashimono.ui.chat import ChatPanel
+
+    with editor(sample_project()) as window:
+        import_sample(window, context)
+        for words, start in (("見本のテロップ", 0), ("2 本目のテロップ", 120)):
+            text = TEXT.create(text=words, size=72, border_width=6, pos_y=-280)
+            window.apply_commands(
+                _place_text(window, text, at_frame=start, duration=90), "テキストを追加"
+            )
+        window.select_clip(top_text_clip(window))
+        window.seek(40)
+
+        window.show_chat()
+        panel = window.findChild(ChatPanel)
+        if panel is None:
+            raise ShotError("AI パネルが無い")
+        show_sample_question(panel)
+        # 1280x800 では質問の箱が巻物になって選択肢と答え方の案内が切れ、会話の欄も 1 行しか
+        # 写らない（何を頼んで聞き返されたのかが読めない） パネルを高くし、パネルだけを切り出す
+        _make_room_above_timeline(window)
+        chat = window.findChild(QDockWidget, "chat")
+        if chat is None:
+            raise ShotError("AI アシスタントのパネルが無い")
+        image = take_editor_shot(window)
+        return image.copy(rect_in(window, chat))
+
+
 SHOTS: tuple[Shot, ...] = (
     Shot("screenshot", "README の先頭（編集画面）", shot_editor),
     Shot("subtitle", "字幕パネル", shot_subtitle),
@@ -1611,6 +2007,37 @@ SHOTS: tuple[Shot, ...] = (
         needs_media=False,
         wiki=True,
     ),
+    # ここから Wiki の操作のページ 名前の頭は載せるページ（edit は基本の編集）
+    Shot(
+        "library-manage",
+        "Wiki プリセットとエイリアス: 一覧の窓",
+        wiki_library_manage,
+        needs_media=False,
+        wiki=True,
+    ),
+    Shot(
+        "library-save",
+        "Wiki プリセットとエイリアス: 保存の窓（上書き）",
+        wiki_library_save,
+        needs_media=False,
+        wiki=True,
+    ),
+    Shot(
+        "edit-strokes",
+        "Wiki 基本の編集: テキストの縁取りの層",
+        wiki_edit_strokes,
+        needs_media=False,
+        wiki=True,
+    ),
+    Shot(
+        "edit-layout",
+        "Wiki 基本の編集: 組み方を「標準」にする",
+        wiki_edit_layout,
+        needs_media=False,
+        wiki=True,
+    ),
+    Shot("edit-snap", "Wiki 基本の編集: 磁石と再生ヘッドの吸い付き", wiki_edit_snap, wiki=True),
+    Shot("ai-question", "Wiki AI アシスタント: 質問の箱", wiki_ai_question, wiki=True),
 )
 
 
@@ -1686,8 +2113,17 @@ def isolate_user_folders(base: Path) -> None:
     # 決まった本人の一時フォルダを使い続ける
     tempfile.tempdir = None
 
-    # 先読みは切る 重い絵を出す写真では「1 コマ 0.4 秒掛かるので先読みを止めた」と
-    # いう知らせがステータスバーに出て、説明の写真に不具合のように写る
+    save_shot_preferences()
+
+
+def save_shot_preferences() -> None:
+    """撮るときの設定を置き場へ書く 置き場は先に作業用のフォルダへ向けておく
+
+    先読みは切る 重い絵を出す写真では「1 コマ 0.4 秒掛かるので先読みを止めた」と
+    いう知らせがステータスバーに出て、説明の写真に不具合のように写る 先読みが動いて
+    いると、プレビューの字の縁の描け方が 1 回目と 2 回目で変わることもある（試験の全体を
+    走らせたときに縁取りの写真で起きた 先読みを切ると起きない）
+    """
     PreferenceStore().save(Preferences(prefetch=False))
 
 
@@ -1790,6 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 script_root=work / "scripts",
                 template_root=write_sample_templates(Path(TEMPLATE_DIR)),
+                work=work.resolve(),
             )
             result = run(targets, context, output, wiki_images)
         finally:
