@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -552,6 +553,42 @@ class TestWhatWasShownIsWhatIsWritten:
         assert isinstance(box.get("error"), ToolError)
         assert "変わりました" in str(box["error"])
         assert target.read_bytes() == b"made while asking"
+        assert saved.written == [] and saved.exports == [] and saved.snapshots == []
+
+    @pytest.mark.parametrize(
+        ("name", "file"),
+        [
+            ("save_project", None),
+            ("save_project_as", "第二稿.sme"),
+            ("export_video", "完成.mp4"),
+            ("save_snapshot", "表紙.png"),
+            ("export_subtitles", "字幕.srt"),
+        ],
+    )
+    def test_a_rewrite_in_the_same_second_and_size_is_refused(
+        self, saved: FakeHost, codecs: list[str], name: str, file: str | None
+    ) -> None:
+        # 壊れると、箱が出ている間に同じ秒の中で同じ大きさに書き換えられた中身（箱の文は
+        # 秒までなので変わって見えない）を、人が許していないまま置き換える
+        del codecs
+        assert saved.saved_at is not None
+        target = saved.saved_at if file is None else saved.saved_at.parent / file
+        target.write_bytes(b"AAAA")
+        second = 1_700_000_000
+        os.utime(target, ns=(second * 10**9 + 100, second * 10**9 + 100))
+        arguments: dict[str, object] = {} if file is None else {"path": str(target)}
+        bridge = EditorBridge(saved, auto_approve=True)
+        done, box = call_in_thread(bridge, _operation(name), arguments)
+
+        def rewrite_then_allow(approval: Approval) -> bool:
+            assert "置き換えます" in approval.summary
+            target.write_bytes(b"BBBB")
+            os.utime(target, ns=(second * 10**9 + 200, second * 10**9 + 200))
+            return True
+
+        answer_approvals(bridge, done, rewrite_then_allow)
+        assert "変わりました" in str(box.get("error"))
+        assert target.read_bytes() == b"BBBB"
         assert saved.written == [] and saved.exports == [] and saved.snapshots == []
 
     def test_a_snapshot_frame_moved_while_asking_is_refused(self, saved: FakeHost) -> None:

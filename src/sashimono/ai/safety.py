@@ -29,6 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from sashimono.ai.host import EditorHost, ToolError
+from sashimono.core.io.atomic import Expected
 from sashimono.core.io.folder_pin import FolderSwappedError, pin_folder
 
 __all__ = [
@@ -68,8 +69,11 @@ class Consent:
     押す前に、何を（``action``）どこへ（``target``）するかを言葉で出す
 
     許した後、実行の直前にもう 1 度作り、丸ごと同じでなければ書かずに断る（#327）
-    だからここには、箱に見せる中身だけを入れ、時刻のような揺れる値を入れない
-    入れると、何も変わっていないのに毎回断られる
+    比べるのは、箱に見せた文と、その文の元になった書く先の身元（:attr:`basis`）
+    文は人が読める粗さ（更新時刻は秒まで）なので、同じ秒の中で同じ大きさに書き換えられると
+    文だけでは変わって見えない 元の身元（ナノ秒の時刻と番号）まで比べて捕まえる
+    見せた物の元にならない揺れる値（今の時刻など）は入れない 入れると、何も変わって
+    いないのに毎回断られる
     """
 
     #: 何をするか 例「プロジェクトを上書き保存します」
@@ -78,6 +82,10 @@ class Consent:
     target: str
     #: 添える注意 例「同じ名前のファイルがあり、中身を置き換えます」
     detail: str = ""
+    #: 箱には出さない ``detail`` の元になった書く先の身元
+    #: （:class:`~sashimono.core.io.atomic.Expected`） 比べるときだけ使う 文に出した大きさと
+    #: 時刻を、細かいまま照らすため
+    basis: Expected | None = None
 
     def text(self) -> str:
         """確かめの窓に出す文"""

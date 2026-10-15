@@ -2193,6 +2193,7 @@ def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
         # 今のファイルの大きさと時刻も見せる 箱が出ている間に別の窓が同じ作品を保存すると
         # 変わるので、実行の前の照らし合わせで気付き、その保存を潰さずに断れる
         detail=_replacing(path, "作品") or "今の場所に作品のファイルが無いので、新しく作ります",
+        basis=expect_now(path),
     )
 
 
@@ -2215,7 +2216,12 @@ def _save_as_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
         for part in (_replacing(path, "ファイル"), "以後はこの場所の作品として編集します")
         if part
     )
-    return Consent(action="作品に名前を付けて保存します", target=str(path), detail=detail)
+    return Consent(
+        action="作品に名前を付けて保存します",
+        target=str(path),
+        detail=detail,
+        basis=expect_now(path),
+    )
 
 
 def _save_project_as(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2278,7 +2284,9 @@ def _subtitle_plan(
 
 def _subtitles_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     path, _range, detail = _subtitle_plan(host, arguments)
-    return Consent(action="字幕を書き出します", target=str(path), detail=detail)
+    return Consent(
+        action="字幕を書き出します", target=str(path), detail=detail, basis=expect_now(path)
+    )
 
 
 def _export_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2314,7 +2322,9 @@ def _snapshot_plan(host: EditorHost, arguments: dict[str, Any]) -> tuple[Path, i
 
 def _snapshot_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     path, _frame, detail = _snapshot_plan(host, arguments)
-    return Consent(action="静止画を保存します", target=str(path), detail=detail)
+    return Consent(
+        action="静止画を保存します", target=str(path), detail=detail, basis=expect_now(path)
+    )
 
 
 def _save_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2421,7 +2431,12 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
 
 def _export_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     plan = _export_plan(host, arguments)
-    return Consent(action="動画を書き出します", target=str(plan.request.path), detail=plan.detail)
+    return Consent(
+        action="動画を書き出します",
+        target=str(plan.request.path),
+        detail=plan.detail,
+        basis=plan.request.expect,
+    )
 
 
 def _awaiting_export(host: EditorHost, seconds: float) -> Pending:
