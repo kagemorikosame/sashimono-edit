@@ -18,11 +18,27 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QTreeWidget, QWidget
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QTreeWidget,
+    QWidget,
+)
 
 from sashimono.asr import environment
 from sashimono.asr.service import TranscriptionService
@@ -31,8 +47,12 @@ from sashimono.compat.aviutl import catalog as catalog_module
 from sashimono.compat.aviutl.catalog import ScriptCatalog, script_catalog, set_script_catalog
 from sashimono.compat.catalog import TemplateCatalog
 from sashimono.core import userdirs
-from sashimono.core.model import MediaItem
+from sashimono.core.io import Preset
+from sashimono.core.io.library import PRESET
+from sashimono.core.model import Clip, MediaItem
 from sashimono.effects.definition import registry
+from sashimono.ui.library_thumbnails import THUMBNAILS_SIMPLE, LookThumbnails
+from sashimono.ui.library_view import LibraryOptions
 from tests.media_fixtures import libx264_available
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +70,27 @@ SAMPLE_ALIAS = "\n".join(
         "",
     )
 )
+
+
+@pytest.fixture(autouse=True)
+def no_modal_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """撮る道具が窓（確かめの小窓・ファイルの窓・exec で開く窓）を開いたら、その場で落とす
+
+    撮影は人の居ない所で走る 窓を開くと誰も閉じずに止まり、CI は時間切れまで待つ
+    """
+
+    def refuse(*args: object, **_kwargs: object) -> object:
+        pytest.fail(f"撮る道具が窓を開いた: {args}")
+
+    for name in ("information", "warning", "question", "critical"):
+        monkeypatch.setattr(QMessageBox, name, refuse)
+    monkeypatch.setattr(QMessageBox, "exec", refuse)
+    monkeypatch.setattr(QDialog, "exec", refuse)
+    monkeypatch.setattr(QMenu, "exec", refuse)
+    for name in ("getText", "getItem", "getInt", "getDouble"):
+        monkeypatch.setattr(QInputDialog, name, refuse)
+    for name in ("getExistingDirectory", "getOpenFileName", "getOpenFileNames", "getSaveFileName"):
+        monkeypatch.setattr(QFileDialog, name, refuse)
 
 
 @pytest.fixture(scope="module")
@@ -644,3 +685,272 @@ class TestAssistantShot:
                 assert text.replace("**", "") in shown
         finally:
             window.close()
+
+    def test_the_sample_question_shows_every_choice_without_a_session(
+        self, shots: ModuleType, qt_application: QApplication
+    ) -> None:
+        """AI の質問の写真（#317）は、見本の質問を本物と同じ箱に出し、Claude には送らない
+
+        壊れると、Wiki の質問の写真に選択肢の欠けた箱が写るか、撮るたびに課金の要る
+        呼び出しが走る 見本の質問が道具の決まり（選択肢の数や名前の長さ）から外れると、
+        撮影がこの写真だけ失敗する
+        """
+        del qt_application
+        from sashimono.ui.chat import ChatPanel
+        from sashimono.ui.main_window import MainWindow
+
+        window = MainWindow(shots.sample_project(), confirm_unsaved=False)
+        try:
+            panel = window.findChild(ChatPanel)
+            assert panel is not None
+            shots.show_sample_question(panel)
+            assert panel._session is None
+            assert not panel._question_box.isHidden()
+            buttons = panel._question_choices.findChildren(QPushButton)
+            choices = shots.SAMPLE_QUESTION["choices"]
+            assert isinstance(choices, list)
+            assert [button.text() for button in buttons] == [c["label"] for c in choices]
+            # 何を頼んで聞き返されたのかが、会話の欄に残っている
+            shown = panel._view.toPlainText()
+            for _, text in shots.SAMPLE_QUESTION_CHAT:
+                assert text in shown
+        finally:
+            window.close()
+
+
+class TestLibraryShots:
+    """プリセットとエイリアスの一覧の窓と保存の窓の写真（#317）
+
+    見本の絵は別のスレッドで後から埋まる ここでは GPU の要らない描き方（文字と図形だけ）の
+    係を渡して、撮る道具の待ち方と組み立てを確かめる
+    """
+
+    @pytest.fixture
+    def thumbnails(self, tmp_path: Path) -> Iterator[LookThumbnails]:
+        created = LookThumbnails(tmp_path / "cache", mode=THUMBNAILS_SIMPLE)
+        yield created
+        created.release()
+
+    def test_the_sample_library_holds_only_the_samples(
+        self, shots: ModuleType, tmp_path: Path
+    ) -> None:
+        # 壊れると、前に撮った写真で書いた物が次の一覧に混ざり、撮る順番で一覧の絵が変わる
+        root = tmp_path / "置き場"
+        shots.sample_library(root, tmp_path)
+        stale = shots.sample_library(root, tmp_path)
+        stale.presets.save(Preset.capture("前の撮影の残り", _text_clip()))
+        library = shots.sample_library(root, tmp_path)
+        found = {(entry.name, entry.category) for entry in library.entries(PRESET)}
+        assert found == {(name, category) for name, category, *_ in shots.SAMPLE_PRESETS}
+
+    def test_a_folder_outside_the_work_folder_is_not_removed(
+        self, shots: ModuleType, tmp_path: Path
+    ) -> None:
+        # 壊れると、作業用のフォルダの外（リポジトリの根など）の同じ名前のフォルダを中身ごと消す
+        work = tmp_path / "作業"
+        work.mkdir()
+        outside = tmp_path / "外" / shots.LIBRARY_DIR
+        outside.mkdir(parents=True)
+        (outside / "大事.txt").write_text("残す", encoding="utf-8")
+        for root in (outside, work):
+            with pytest.raises(shots.ShotError, match="外なので消さない"):
+                shots.sample_library(root, work)
+        assert (outside / "大事.txt").read_text(encoding="utf-8") == "残す"
+        assert list(work.iterdir()) == []
+
+    @pytest.mark.parametrize("take", ["wiki_library_manage", "wiki_library_save"])
+    def test_the_shot_does_not_touch_the_current_folder(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        take: str,
+    ) -> None:
+        """作業用のフォルダへ移らずに写真の関数を呼んでも、今のフォルダの物を消さない
+
+        壊れると、リポジトリの根から呼んだだけで、根にある同じ名前のフォルダが中身ごと消える
+        試験は一時フォルダの中だけで確かめる（本物のフォルダを消さないため）
+        """
+        del qt_application
+        current = tmp_path / "今のフォルダ"
+        kept = current / shots.LIBRARY_DIR / "大事.txt"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("残す", encoding="utf-8")
+        monkeypatch.chdir(current)
+        work = tmp_path / "作業"
+        work.mkdir()
+
+        def no_picture(dialog: QWidget, marks: object = ()) -> QImage:
+            # 見本の絵は描かせない 見るのはどこを消してどこに作るかだけ
+            del marks
+            dialog.close()
+            dialog.deleteLater()
+            return QImage()
+
+        monkeypatch.setattr(shots, "_grab_library", no_picture)
+        context = shots.Context(
+            media=None, script_root=work / "scripts", template_root=work / "t", work=work
+        )
+        getattr(shots, take)(context)
+        assert kept.read_text(encoding="utf-8") == "残す"
+        assert (work / shots.LIBRARY_DIR / "presets").is_dir()
+
+    def test_the_manage_window_waits_for_every_picture(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        thumbnails: LookThumbnails,
+    ) -> None:
+        # 壊れて待たずに撮ると、遅い機械では地だけの見本が並ぶ写真になる
+        del qt_application
+        library = shots.sample_library(tmp_path / "置き場", tmp_path)
+        dialog = shots.library_dialog(library, thumbnails, _simple_options())
+        try:
+            shots.hide_from_screen(dialog)
+            dialog.show()
+            shots.wait_for_library_pictures(dialog)
+            for entry in library.entries(PRESET):
+                assert thumbnails.cached(entry.item) is not None, entry.name
+            # 1 つ選んだ所を見せる 選んでいないと、整理のボタンが全部灰色で写る
+            assert [item.text() for item in dialog.findChild(QListWidget).selectedItems()]
+        finally:
+            dialog.reject()
+
+    def test_the_save_window_shows_the_overwrite(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        thumbnails: LookThumbnails,
+    ) -> None:
+        # 壊れると、Wiki の保存の窓の写真に上書きの印も、前といまの見本も写らない
+        del qt_application
+        library = shots.sample_library(tmp_path / "置き場", tmp_path)
+        dialog = shots.save_dialog(library, thumbnails, _simple_options())
+        try:
+            shots.hide_from_screen(dialog)
+            dialog.show()
+            shots.wait_for_library_pictures(dialog)
+            overwrite = next(
+                box for box in dialog.findChildren(QCheckBox) if box.text().startswith("同じ名前")
+            )
+            assert overwrite.isChecked()
+            assert dialog.can_save()
+            assert "もうあります" in dialog.warning()
+            assert dialog.choice().name == shots.SAMPLE_OVERWRITE
+            assert not dialog._before.pixmap().isNull()
+            assert not dialog._after.pixmap().isNull()
+            # 前といまが同じ絵だと、上書きで何が変わるのかが写らない
+            assert dialog._before.pixmap().toImage() != dialog._after.pixmap().toImage()
+        finally:
+            dialog.reject()
+
+    @pytest.mark.parametrize("which", ["library_dialog", "save_dialog"])
+    def test_the_window_is_the_same_every_time(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        which: str,
+    ) -> None:
+        # 壊れると、撮り直すたびに写真が変わり、画面が変わっていないのに Wiki の差分が出る
+        # 覚えた絵を使い回して同じになるのを避け、2 回とも別の置き場と別の係で描く
+        del qt_application
+        pictures = []
+        for attempt in ("1", "2"):
+            thumbnails = LookThumbnails(tmp_path / f"cache{attempt}", mode=THUMBNAILS_SIMPLE)
+            try:
+                library = shots.sample_library(tmp_path / f"置き場{attempt}", tmp_path)
+                dialog = getattr(shots, which)(library, thumbnails, _simple_options())
+                pictures.append(shots._grab_library(dialog))
+            finally:
+                thumbnails.release()
+        assert pictures[0] == pictures[1]
+
+    @pytest.mark.parametrize("which", ["library_dialog", "save_dialog"])
+    def test_no_folder_is_shown(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        thumbnails: LookThumbnails,
+        which: str,
+    ) -> None:
+        # 壊れると、撮るたびに名前の変わる作業用のフォルダ（J:\sashimono-shots-…）が Wiki の
+        # 写真に写る 一覧の補足（ツールチップ）は写らないので見ない
+        del qt_application
+        root = tmp_path / "sashimono-shots-撮るたびに変わる"
+        library = shots.sample_library(root, tmp_path)
+        dialog = getattr(shots, which)(library, thumbnails, _simple_options())
+        try:
+            shown = [w.text() for w in dialog.findChildren(QLabel)]
+            shown += [w.text() for w in dialog.findChildren(QAbstractButton)]
+            shown += [w.text() for w in dialog.findChildren(QLineEdit)]
+            shown += [w.placeholderText() for w in dialog.findChildren(QLineEdit)]
+            for listing in dialog.findChildren(QListWidget):
+                shown += [listing.item(row).text() for row in range(listing.count())]
+        finally:
+            dialog.reject()
+        assert not [text for text in shown if root.name in text or str(tmp_path) in text]
+
+
+@pytest.mark.usefixtures("gpu")
+class TestNewEditorShots:
+    """設定パネルの縁取りの層と組み方のボタンの写真（#317）"""
+
+    @pytest.fixture(autouse=True)
+    def shot_preferences(self, shots: ModuleType) -> None:
+        """撮る道具と同じ設定で撮る（置き場は conftest が試験ごとの一時フォルダへ向けている）
+
+        先読みを切らずに撮ると、試験の全体を走らせたときだけ 1 回目と 2 回目で字の縁の描け方が
+        変わり、道具は同じ絵を撮れているのに試験が落ちる
+        """
+        shots.save_shot_preferences()
+
+    def test_the_shots_are_the_same_every_time(
+        self, shots: ModuleType, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        # 壊れると、撮り直すたびに写真が変わり、画面が変わっていないのに Wiki の差分が出る
+        del qt_application
+        context = _template_context(shots, tmp_path)
+        for take in (shots.wiki_edit_strokes, shots.wiki_edit_layout):
+            assert take(context) == take(context), take.__name__
+
+    def test_a_button_out_of_view_is_not_marked(
+        self, shots: ModuleType, qt_application: QApplication
+    ) -> None:
+        # 壊れると、設定パネルの巻物の外にあるボタンを囲む枠が、タイムラインの上など何も無い所に
+        # 描かれ、手順書が何も無い所を指す
+        del qt_application
+        with shots.editor(shots.sample_project()) as window:
+            text = shots.TEXT.create(text="縁", size=96).with_strokes(
+                shots.sample_strokes((6.0, (0.0, 0.0, 0.0, 1.0)), (12.0, (1.0, 1.0, 1.0, 1.0)))
+            )
+            window.apply_commands(shots._place_text(window, text, at_frame=0, duration=30), "置く")
+            window.select_clip(shots.top_text_clip(window))
+            shots.settle(window, rounds=4)
+            button = shots._named_button(window, "add_stroke")
+            with pytest.raises(shots.ShotError, match="見えている所"):
+                shots.inspector_rect(window, button)
+            shots._scroll_inspector_to(window, button)
+            assert shots.inspector_rect(window, button).height() == button.height()
+
+
+def _text_clip() -> Clip:
+    from sashimono.core.commands.fixed import with_fixed_items
+    from sashimono.effects.sources import TEXT
+
+    clip = Clip(timeline_start=0, duration=30, source=TEXT.create(text="残り"))
+    return with_fixed_items(clip, picture=True)
+
+
+def _simple_options() -> LibraryOptions:
+    """GPU の要らない見本の描き方 試験の機械（CI）で同じ絵になる"""
+    return LibraryOptions(thumbnails=THUMBNAILS_SIMPLE)
+
+
+def _template_context(shots: ModuleType, tmp_path: Path) -> Any:
+    root = shots.write_sample_templates(tmp_path / "見本のテンプレート")
+    return shots.Context(media=None, script_root=tmp_path / "scripts", template_root=root)
