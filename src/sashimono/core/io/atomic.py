@@ -261,7 +261,7 @@ def _replace_expected(temporary: Path, path: Path, expect: Expected) -> None:
 #: 置き換えた前のファイルを残す名前の形 ``<元の名前の頭>.before-<時刻><元の後ろ>``
 #: 元と同じ後ろ（.mp4 .sme など）にして、人が見つけてそのまま開けるようにする
 _BEFORE = "{stem}.before-{stamp}{suffix}"
-_BEFORE_STAMP = re.compile(r"\d{8}-\d{6}-\d{6}(?:-\d+)?")
+_BEFORE_STAMP = re.compile(r"\d{8}-\d{6}-\d{6}-\d{3}")
 
 
 def _keep_beside(aside: Path, path: Path, keep: int) -> Path:
@@ -278,10 +278,13 @@ def _keep_beside(aside: Path, path: Path, keep: int) -> Path:
     """
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     stem, suffix = path.stem, path.suffix
-    for number in range(100):
-        name = _BEFORE.format(
-            stem=stem, stamp=stamp if number == 0 else f"{stamp}-{number}", suffix=suffix
-        )
+    # 連番は桁をそろえて必ず付ける（recovery の控えと同じ） 付けない物と付けた物、1 桁と 2 桁が
+    # 混ざると、名前の順（片付けが古い順と見なす順）と作った順が食い違い、新しい方を消す
+    # 時計の刻み（Windows で約 15ms）で同じ時刻が続くのはふつうに起こる
+    # 空いた番号を使い直さない 片付けで古い 000 が消えた後に新しい物へ 000 を付けると、
+    # 新しい物が一番古く見えて次に消される 同じ時刻の物の一番大きい番号の次から付ける
+    for number in range(_next_number(path, stamp), 1000):
+        name = _BEFORE.format(stem=stem, stamp=f"{stamp}-{number:03d}", suffix=suffix)
         try:
             _rename_new(aside, path.with_name(name))
         except FileExistsError:
@@ -292,6 +295,22 @@ def _keep_beside(aside: Path, path: Path, keep: int) -> Path:
         _tidy_kept(path, max(1, keep))
         return kept
     return aside
+
+
+def _next_number(path: Path, stamp: str) -> int:
+    """同じ時刻で残した物の、一番大きい連番の次 無ければ 0"""
+    head = f"{path.stem}.before-{stamp}-"
+    numbers = [-1]
+    try:
+        for entry in os.scandir(path.parent):
+            name = entry.name
+            if name.startswith(head) and name.endswith(path.suffix):
+                digits = name[len(head) : len(name) - len(path.suffix)]
+                if len(digits) == 3 and digits.isdigit():
+                    numbers.append(int(digits))
+    except OSError:
+        pass
+    return max(numbers) + 1
 
 
 def _tidy_kept(path: Path, keep: int) -> None:

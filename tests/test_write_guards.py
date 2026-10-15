@@ -14,6 +14,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime, tzinfo
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,11 @@ class TestScratchIsAlwaysNew:
         copy_atomic(source, link)
         assert link.read_bytes() == b"new"
         assert original.read_bytes() == b"original"
+
+
+#: 残した前のファイルを片付けで消すのは、開いている人を確かめられる Windows だけ
+#: （_delete_if_unheld） ほかの OS では消さないので、本数を数える試験は Windows で走らせる
+_HOLDERS_SEEN_ONLY_ON_WINDOWS = "開いている人を確かめて片付けるのは Windows だけ"
 
 
 class TestTheTargetIsAsExpected:
@@ -169,6 +175,7 @@ class TestTheTargetIsAsExpected:
         assert expect.kept == [kept[0]]
         assert target.read_text(encoding="utf-8") == "新しい中身"
 
+    @pytest.mark.skipif(sys.platform != "win32", reason=_HOLDERS_SEEN_ONLY_ON_WINDOWS)
     def test_kept_files_are_tidied_to_the_generation_count(self, tmp_path: Path) -> None:
         # 壊れると、AI が置き換えるたびに前のファイルが溜まり続け、作品のフォルダが埋まる
         target = tmp_path / "完成.mp4"
@@ -178,6 +185,25 @@ class TestTheTargetIsAsExpected:
             write_atomic(target, str(number), expect=expect)
         kept = sorted(path for path in tmp_path.iterdir() if path != target)
         assert [path.read_bytes() for path in kept] == [b"2", b"3"]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason=_HOLDERS_SEEN_ONLY_ON_WINDOWS)
+    def test_kept_files_with_the_same_stamp_are_tidied_oldest_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、時計の刻みで残す名前の時刻が重なったとき、名前の順と作った順が食い違い、
+        # 片付けが新しい方を消す（1 本目と 2 本目、-2 と -10 の並び）
+        class _SameMoment(datetime):
+            @classmethod
+            def now(cls, tz: tzinfo | None = None) -> _SameMoment:
+                return cls(2026, 10, 16, 10, 15, 0, 123456)
+
+        monkeypatch.setattr(atomic, "datetime", _SameMoment)
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"0")
+        for number in range(1, 13):
+            write_atomic(target, str(number), expect=replace(expect_now(target), keep=2))
+        kept = sorted(path for path in tmp_path.iterdir() if path != target)
+        assert [path.read_bytes() for path in kept] == [b"10", b"11"]
 
     def test_as_expected_it_is_written(self, tmp_path: Path) -> None:
         # 壊れると（照らし方が厳しすぎると）、何も変わっていないのに書けない
@@ -325,7 +351,7 @@ def _hold_sharing_delete(path: Path) -> Callable[[], None]:
 class TestTidyingKeepsWhatOthersHold:
     """残した前のファイルの片付けは、誰かが開いている物を消さない（Codex の P2）"""
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="開いている人を確かめられるのは Windows")
+    @pytest.mark.skipif(sys.platform != "win32", reason=_HOLDERS_SEEN_ONLY_ON_WINDOWS)
     def test_an_oldest_kept_file_held_by_another_app_is_not_deleted(self, tmp_path: Path) -> None:
         # 壊れると、別のアプリが消す共有を許して書き込み中の前のファイルを片付けで消し、
         # その更新ごと失う
@@ -347,7 +373,7 @@ class TestTidyingKeepsWhatOthersHold:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 壊れると、開いている人を確かめられない OS で、書き込み中かもしれない物を消す
-        kept = tmp_path / "完成.before-20261015-101500-123456.mp4"
+        kept = tmp_path / "完成.before-20261015-101500-123456-000.mp4"
         kept.write_bytes(b"before")
         monkeypatch.setattr(sys, "platform", "linux")
         assert atomic._delete_if_unheld(kept) is False

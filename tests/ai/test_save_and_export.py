@@ -43,6 +43,14 @@ from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_safety import _hard_link, _symlink_dir, answer_approvals
 
+#: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
+#: （:func:`~sashimono.ai.safety.pin_holds_the_folder` ほかの OS では確かめの箱を出す前に断る）
+#: 書けること・確かめの箱が出た後の振る舞いを見る試験はこの印を付ける 断る試験には付けない
+#: （ほかの OS で断ることは test_save_and_export.py の TestOtherSystemsAreRefused が見る）
+WINDOWS_WRITES = pytest.mark.skipif(
+    sys.platform != "win32", reason="AI がファイルを書くのは Windows だけ（pin_holds_the_folder）"
+)
+
 
 def _operation(name: str) -> Operation:
     found = find_operation(name)
@@ -107,6 +115,7 @@ class TestKinds:
 
 
 class TestSave:
+    @WINDOWS_WRITES
     def test_auto_approve_still_asks_and_then_saves(self, saved: FakeHost) -> None:
         # 壊れると、「変更を自動で承認」を入れた人の作品を、AI が黙って上書き保存する
         assert saved.saved_at is not None
@@ -146,6 +155,7 @@ class TestSave:
 
 
 class TestSaveAs:
+    @WINDOWS_WRITES
     def test_a_new_name_in_the_project_folder_is_saved_and_adopted(self, saved: FakeHost) -> None:
         # 壊れると、AI が付けた名前で保存しても、以後の保存が前のファイルへ行く
         assert saved.saved_at is not None
@@ -159,6 +169,7 @@ class TestSaveAs:
         assert saved.project_path == target.resolve()
         assert target.exists()
 
+    @WINDOWS_WRITES
     def test_an_existing_file_is_named_in_the_request(self, saved: FakeHost) -> None:
         # 壊れると、同じ名前の作品を置き換えると知らないまま許す
         assert saved.saved_at is not None
@@ -234,6 +245,7 @@ class TestSwappedPlaces:
         assert not (outside / "a.sme").exists()
         assert saved.written == []
 
+    @WINDOWS_WRITES
     def test_a_hard_link_planted_just_before_writing_is_refused(
         self,
         video_media: MediaItem,
@@ -265,6 +277,7 @@ class TestSwappedPlaces:
         assert target.read_bytes() == b"original"
         assert host.written == []
 
+    @WINDOWS_WRITES
     def test_the_folder_cannot_be_swapped_while_writing(
         self, saved: FakeHost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -324,6 +337,7 @@ class TestSwappedPlaces:
 
 
 class TestExport:
+    @WINDOWS_WRITES
     def test_auto_approve_still_asks_and_says_what_is_exported(
         self, saved: FakeHost, codecs: list[str]
     ) -> None:
@@ -353,6 +367,7 @@ class TestExport:
             )
         ]
 
+    @WINDOWS_WRITES
     def test_the_range_follows_the_export_window(self, saved: FakeHost, codecs: list[str]) -> None:
         # 壊れると、範囲を決めた人の書き出しが AI からだけ全体になり、長く待たされる
         del codecs
@@ -426,6 +441,7 @@ class TestExport:
 # --- 確かめの箱が出ている間に作品の場所が変わる（Codex の P1） ---
 
 
+@WINDOWS_WRITES
 class TestTheApprovedPlaceIsKept:
     """確かめの箱はモードレス 出ている間に人が〔名前を付けて保存〕で作品の場所を変えても、
     許した後に書くのは箱に出した場所だけ 解き直して違えば断る
@@ -517,6 +533,7 @@ class TestOtherSystemsAreRefused:
         assert safety.pin_holds_the_folder() is (sys.platform == "win32")
 
 
+@WINDOWS_WRITES
 class TestWhatWasShownIsWhatIsWritten:
     """確かめの箱に見せた中身（何を・どこへ・添えた注意）と、実行の時の中身を丸ごと照らす
 
@@ -730,6 +747,7 @@ SNAPSHOT = _operation("save_snapshot")
 
 
 class TestSubtitles:
+    @WINDOWS_WRITES
     def test_auto_approve_still_asks_and_the_same_srt_as_the_panel_is_written(
         self, saved: FakeHost
     ) -> None:
@@ -750,6 +768,7 @@ class TestSubtitles:
         expected = to_srt(list(project_timeline(saved.project)), saved.project.rate)
         assert target.read_text(encoding="utf-8") == expected
 
+    @WINDOWS_WRITES
     def test_the_range_is_shifted_like_the_panel(self, saved: FakeHost) -> None:
         # 壊れると、範囲で書き出した動画と AI が書いた字幕が、範囲の頭の分だけずれる
         assert saved.saved_at is not None
@@ -838,6 +857,7 @@ class TestSubtitles:
 
 
 class TestSnapshot:
+    @WINDOWS_WRITES
     def test_auto_approve_still_asks_and_the_frame_is_saved(self, saved: FakeHost) -> None:
         # 壊れると、自動で承認の人の絵を AI が黙って上書きするか、頼んだのと違うコマを描く
         assert saved.saved_at is not None
@@ -850,6 +870,7 @@ class TestSnapshot:
         assert saved.snapshots == [45]
         assert target.exists()
 
+    @WINDOWS_WRITES
     def test_the_end_draws_the_last_frame_like_the_screen(self, saved: FakeHost) -> None:
         # 壊れると、最後まで再生した所で撮ると何も無い黒の絵になる（画面と食い違う）
         assert saved.saved_at is not None
@@ -901,6 +922,7 @@ class TestSnapshot:
         assert original.read_bytes() == b"original"
         assert host.snapshots == []
 
+    @WINDOWS_WRITES
     def test_a_hard_link_planted_just_before_writing_is_refused(
         self,
         video_media: MediaItem,
@@ -955,6 +977,7 @@ def quick_waits(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 class TestWaiting:
+    @WINDOWS_WRITES
     def test_the_ai_can_wait_for_the_end_without_holding_the_editor(
         self, saved: FakeHost, codecs: list[str], quick_waits: None
     ) -> None:

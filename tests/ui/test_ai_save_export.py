@@ -60,6 +60,14 @@ from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import make_loaded
 from tests.ai.test_bridge import call_in_thread
 
+#: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
+#: （:func:`~sashimono.ai.safety.pin_holds_the_folder` ほかの OS では確かめの箱を出す前に断る）
+#: 書けること・確かめの箱が出た後の振る舞いを見る試験はこの印を付ける 断る試験には付けない
+#: （ほかの OS で断ることは test_save_and_export.py の TestOtherSystemsAreRefused が見る）
+WINDOWS_WRITES = pytest.mark.skipif(
+    sys.platform != "win32", reason="AI がファイルを書くのは Windows だけ（pin_holds_the_folder）"
+)
+
 
 @pytest.fixture(autouse=True)
 def no_popups(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,6 +188,7 @@ def _wait_until(condition: Callable[[], bool], timeout: float = 60.0) -> None:
 
 
 class TestSave:
+    @WINDOWS_WRITES
     def test_auto_approve_still_asks_and_the_project_is_saved(
         self, window: MainWindow, folder: Path
     ) -> None:
@@ -197,6 +206,7 @@ class TestSave:
         assert saved.timeline == window._document.project.timeline
         assert not window.is_modified
 
+    @WINDOWS_WRITES
     def test_denying_writes_nothing(self, window: MainWindow, folder: Path) -> None:
         # 壊れると、拒否しても作品が書かれ、前の中身は取り消しでも戻らない
         asked, box = _drive(window, _operation("save_project"), {}, allow=False)
@@ -204,6 +214,7 @@ class TestSave:
         assert isinstance(box.get("error"), ToolError)
         assert not (folder / "作品.sme").exists()
 
+    @WINDOWS_WRITES
     def test_save_as_in_the_project_folder_switches_the_project(
         self, window: MainWindow, folder: Path
     ) -> None:
@@ -233,6 +244,7 @@ class TestSave:
 
 
 class TestSubtitlesAndSnapshot:
+    @WINDOWS_WRITES
     def test_subtitles_are_the_same_file_the_panel_writes(
         self,
         qt_application: QApplication,
@@ -277,6 +289,7 @@ class TestSubtitlesAndSnapshot:
         assert isinstance(box.get("error"), ToolError)
         assert list(outside.iterdir()) == []
 
+    @WINDOWS_WRITES
     @pytest.mark.usefixtures("gpu")
     def test_a_snapshot_is_drawn_like_the_screen(self, window: MainWindow, folder: Path) -> None:
         # 壊れると、AI の静止画が画面の〔静止画を保存…〕と違う描き方になるか、確かめずに書く
@@ -326,6 +339,7 @@ def _scratch_files() -> list[Path]:
 
 @pytest.mark.usefixtures("gpu")
 class TestExport:
+    @WINDOWS_WRITES
     def test_a_small_project_becomes_a_video_without_holding_the_editor(
         self, window: MainWindow, folder: Path, libx264: str
     ) -> None:
@@ -373,6 +387,7 @@ class TestExport:
         assert isinstance(box.get("error"), ToolError)
         assert list(outside.iterdir()) == []
 
+    @WINDOWS_WRITES
     def test_the_export_can_be_stopped_and_keeps_the_old_file(
         self,
         qt_application: QApplication,
@@ -404,6 +419,7 @@ class TestExport:
             window.close()
             window.deleteLater()
 
+    @WINDOWS_WRITES
     def test_the_stop_button_in_the_status_bar_stops_it(
         self,
         qt_application: QApplication,
@@ -428,6 +444,7 @@ class TestExport:
             window.close()
             window.deleteLater()
 
+    @WINDOWS_WRITES
     def test_closing_the_window_stops_the_export(
         self,
         qt_application: QApplication,
@@ -447,6 +464,7 @@ class TestExport:
         assert _scratch_files() == []
 
 
+@WINDOWS_WRITES
 class TestTheTargetChangingAfterApproval:
     """許した後、書く前に書き出し先の名前が現れたり中身が変わったりしたら、置かずに断る
 
@@ -623,6 +641,7 @@ class TestTheTargetChangingAfterApproval:
         assert target.read_bytes() == b"other app"
 
 
+@WINDOWS_WRITES
 class TestStoppingWhilePlacing:
     """書き出し先へ置き始めた後の中止は断る（#327 CodeRabbit の指摘）
 
@@ -690,6 +709,7 @@ def _slow_export(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("gpu")
+@WINDOWS_WRITES
 class TestPlacingIsGuarded:
     def test_the_folder_cannot_be_swapped_while_the_video_is_placed(
         self,

@@ -39,6 +39,7 @@ __all__ = [
     "pin_holds_the_folder",
     "pinned",
     "pinned_place",
+    "refuse_where_the_folder_cannot_be_held",
     "writable_path",
     "write_roots",
 ]
@@ -115,7 +116,6 @@ def writable_path(host: EditorHost, raw: object) -> Path:
     書く直前の 2 度ここを通す 窓が出ている間に、フォルダがリンクへ差し替えられても
     書く直前に気付けるように
     """
-    _refuse_where_the_folder_cannot_be_held()
     project = host.document.project
     return check_writable(
         raw,
@@ -144,7 +144,7 @@ def pinned(check: Callable[[], Path]) -> Iterator[Path]:
 
     書き出しの終わり（編集画面のスレッドの外）からも、確かめた時の値で呼べるように分けてある
     """
-    _refuse_where_the_folder_cannot_be_held()
+    refuse_where_the_folder_cannot_be_held()
     path = check()
     try:
         with pin_folder(path.parent) as folder:
@@ -160,15 +160,16 @@ def pinned(check: Callable[[], Path]) -> Iterator[Path]:
         raise ToolError(f"書く場所のフォルダが差し替えられたので断りました: {exc}") from exc
 
 
-def _refuse_where_the_folder_cannot_be_held() -> None:
+def refuse_where_the_folder_cannot_be_held() -> None:
     """フォルダを持っても改名を止められない OS では、AI のファイルを書く道具を断る（#327）
 
     Linux や macOS ではフォルダを持っていても改名を止められない 書いている間にリンクへ
     差し替えられると、文字の場所を辿って許した範囲の外へ書き、後で照らして気付いても外の
     ファイルは残る フォルダの記述子を基準に書く（dir_fd）作りにすると、保存・字幕・静止画・
     書き出しの書く所（write_atomic・QImageWriter・FFmpeg）を全部それに合わせる必要がある
-    今の配布は Windows だけなので、ほかの OS では書く道具を断る 確かめの箱を出す前
-    （:func:`writable_path`）と書く直前（:func:`pinned`）の両方で断る
+    今の配布は Windows だけなので、ほかの OS では書く道具を断る 確かめの箱を出す前（書く道具の
+    確かめの中身を作る所）と書く直前（:func:`pinned`）の両方で断る :func:`writable_path` は
+    場所の決まりだけを見る（試験や、書かない確かめからも使えるように）
     """
     if not pin_holds_the_folder():
         raise ToolError(

@@ -23,7 +23,13 @@ from pathlib import Path
 from typing import Any
 
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
-from sashimono.ai.safety import Consent, Safety, pinned_place, writable_path
+from sashimono.ai.safety import (
+    Consent,
+    Safety,
+    pinned_place,
+    refuse_where_the_folder_cannot_be_held,
+    writable_path,
+)
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
     AddClip,
@@ -2162,6 +2168,20 @@ def _select(host: EditorHost, arguments: dict[str, Any]) -> object:
 # 書き出しの窓と同じ処理をホストに頼む
 
 
+def _write_target(host: EditorHost, raw: object) -> Path:
+    """ファイルを書く道具の書く先 場所の決まりで確かめる（:func:`writable_path`）
+
+    守りの効かない OS で断るのは、引数の確かめを全部済ませた後（:func:`_refuse_elsewhere`）
+    先に断ると、どの OS でも出るはずの断り（場所の外・範囲が無い など）が隠れる
+    """
+    return writable_path(host, raw)
+
+
+def _refuse_elsewhere() -> None:
+    """守りの効かない OS では、確かめの箱を出す前に断る（#327） 確かめの中身を作る最後に呼ぶ"""
+    refuse_where_the_folder_cannot_be_held()
+
+
 def _require_suffix(raw: object, suffixes: tuple[str, ...], what: str) -> None:
     """拡張子を確かめる 違う種類のファイルの名前で書かせない
 
@@ -2201,7 +2221,8 @@ def _replacing(path: Path, what: str) -> str:
 
 def _save_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     del arguments
-    path = writable_path(host, str(_current_project_file(host)))
+    path = _write_target(host, str(_current_project_file(host)))
+    _refuse_elsewhere()
     return Consent(
         action="作品を上書き保存します",
         target=str(path),
@@ -2267,12 +2288,13 @@ def _save_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
 def _save_as_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     raw = arguments.get("path")
     _require_suffix(raw, (SUFFIX,), "作品")
-    path = writable_path(host, raw)
+    path = _write_target(host, raw)
     detail = " ".join(
         part
         for part in (_replacing(path, "ファイル"), "以後はこの場所の作品として編集します")
         if part
     )
+    _refuse_elsewhere()
     return Consent(
         action="作品に名前を付けて保存します",
         target=str(path),
@@ -2307,7 +2329,7 @@ def _subtitle_plan(
     """
     raw = arguments.get("path")
     _require_suffix(raw, SUBTITLE_SUFFIXES, "字幕のファイル")
-    path = writable_path(host, raw)
+    path = _write_target(host, raw)
     project = _project(host)
     default_range = RANGE_WORK_AREA if export_range(project.timeline) is not None else RANGE_ALL
     try:
@@ -2341,6 +2363,7 @@ def _subtitle_plan(
         f"形式 {path.suffix.lstrip('.')} / {span} / {len(subtitles)} 枚",
         _replacing(path, "ファイル"),
     ]
+    _refuse_elsewhere()
     return path, frame_range, "\n".join(part for part in parts if part)
 
 
@@ -2369,7 +2392,7 @@ def _snapshot_plan(host: EditorHost, arguments: dict[str, Any]) -> tuple[Path, i
     """静止画の引数を確かめる 描くのは画面の〔静止画を保存…〕と同じく開いているタイムライン"""
     raw = arguments.get("path")
     _require_suffix(raw, (".png",), "静止画")
-    path = writable_path(host, raw)
+    path = _write_target(host, raw)
     project = _project(host)
     if project.duration <= 0:
         raise ToolError("タイムラインが空なので静止画にできません")
@@ -2383,6 +2406,7 @@ def _snapshot_plan(host: EditorHost, arguments: dict[str, Any]) -> tuple[Path, i
         f"{format_timecode(frame, project.rate)}（{frame} フレーム）を {width}x{height} の PNG で",
         _replacing(path, "ファイル"),
     ]
+    _refuse_elsewhere()
     return path, frame, "\n".join(part for part in parts if part)
 
 
@@ -2438,7 +2462,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
             "cancel_export で止めてから"
             "始めてください"
         )
-    path = writable_path(host, raw)
+    path = _write_target(host, raw)
     whole = host.document.project
     raw_scene = arguments.get("scene_id")
     scene_id = SceneId(str(raw_scene)) if raw_scene else None
@@ -2492,6 +2516,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         # 許したときの書き出し先 描く数分の間に名前が現れたり中身が変わったりしたら置かない
         expect=expect_now(path),
     )
+    _refuse_elsewhere()
     return _ExportPlan(request=request, detail="\n".join(part for part in parts if part))
 
 
