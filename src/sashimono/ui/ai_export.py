@@ -67,9 +67,27 @@ class _Worker(QObject):
         self._settings = settings
         self._check = check
         self._cancel = threading.Event()
+        #: 書き出し先へ置き始めたか 中止の印との確かめと立てるのを、同じ錠の中で行う
+        #: 画面のスレッドの様子（placing）は知らせが届いてから変わるので、それで決めると
+        #: 置き始めた後の中止を受けてしまい、止めると答えたのに前のファイルが置き換わる
+        self._placing = False
+        self._lock = threading.Lock()
 
-    def cancel(self) -> None:
-        self._cancel.set()
+    def cancel(self) -> bool:
+        """止めるよう頼む 置き始めた後なら断って偽を返す（置き換えは途中で止めない）"""
+        with self._lock:
+            if self._placing:
+                return False
+            self._cancel.set()
+            return True
+
+    def _begin_placing(self) -> bool:
+        """置き始める 先に中止を頼まれていれば偽（置かない）"""
+        with self._lock:
+            if self._cancel.is_set():
+                return False
+            self._placing = True
+            return True
 
     def run(self) -> None:
         target = self._settings.path
@@ -105,7 +123,7 @@ class _Worker(QObject):
         except Exception as exc:
             self.failed.emit(f"書き出しに失敗しました: {exc}")
             return
-        if self._cancel.is_set():
+        if not self._begin_placing():
             self.cancelled.emit()
             return
         self.placing.emit()
@@ -184,10 +202,15 @@ class AssistantExport(QObject):
         self.changed.emit()
 
     def cancel(self) -> bool:
-        """止めるよう頼む 書き出し先へ置いている最中は止めない（置き終わるのを待つ）"""
+        """止めるよう頼む 書き出し先へ置き始めた後は止めない（置き終わるのを待つ）
+
+        置き始めたかはワーカーに聞く 画面の様子（``_state``）は知らせが届くまで rendering の
+        ままなので、それだけで決めると、置き換えが進んでいるのに「止めています」と答える
+        """
         if self._worker is None or self._state != "rendering":
             return False
-        self._worker.cancel()
+        if not self._worker.cancel():
+            return False
         self._message = "止めています"
         self.changed.emit()
         return True

@@ -2438,6 +2438,13 @@ def _export_status(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _cancel_export(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     if not host.cancel_export():
+        if host.export_status().get("state") in EXPORT_RUNNING:
+            # 置き始めた後は止めない 止めると答えて置き換えが終わると、前のファイルが消えた
+            # ことを AI も人も知らないまま進む
+            raise ToolError(
+                "書き出しはもう書き出し先へ置き始めているので止めません 書き出し先のファイルは"
+                "置き換わります export_status で終わるのを待ってください"
+            )
         raise ToolError("走っている書き出しはありません")
     return {"cancelling": True, "status": host.export_status()}
 
@@ -3284,7 +3291,7 @@ OPERATIONS: tuple[Operation, ...] = (
         name="cancel_export",
         description=(
             "走っている書き出しを止める 書きかけは捨て、書き出し先の前からあるファイルは"
-            "そのまま残る 作品は変わらない"
+            "そのまま残る 作品は変わらない 書き出し先へ置き始めた後（placing）は止めずに断る"
         ),
         schema=_schema({}),
         handler=_cancel_export,

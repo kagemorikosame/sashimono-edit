@@ -718,6 +718,13 @@ class TestWaiting:
         assert isinstance(result, dict)
         assert saved.export_state["state"] == "cancelled"
 
+    def test_a_stop_while_placing_says_the_file_will_be_replaced(self, saved: FakeHost) -> None:
+        # 壊れると、置き始めた後の中止を「走っていない」と答え、AI は前のファイルが残ると思う
+        saved.export_state = {"state": "placing", "progress": 1.0, "path": "a.mp4"}
+        with pytest.raises(ToolError, match="置き換わります"):
+            CANCEL(saved, {})
+        assert saved.export_state["state"] == "placing"
+
     def test_reading_the_status_returns_a_copy(self, saved: FakeHost) -> None:
         # 壊れると、読んだ様子を書き換えただけで、画面の進み具合の表示が狂う
         result = STATUS(saved, {})

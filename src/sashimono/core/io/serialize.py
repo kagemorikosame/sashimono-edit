@@ -19,7 +19,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from sashimono.core.io.atomic import write_atomic
+from sashimono.core.io.atomic import copy_atomic, write_atomic
 from sashimono.core.model import (
     AnimatedValue,
     AudioStreamInfo,
@@ -969,7 +969,12 @@ def keep_pre_upgrade_copy(path: Path) -> Path | None:
     if not isinstance(version, int) or isinstance(version, bool) or version >= FORMAT_VERSION:
         return None
     copy = path.with_name(path.name + PRE_UPGRADE_SUFFIX)
-    shutil.copy2(path, copy)
+    # 新しく作った仮のファイルへ写して名前を付け替える（#327） copy2 は写す先を開いて
+    # その場で上書きし、リンクなら辿った先へ書く 写しの名前が元の素材へのハードリンクや
+    # 外へのリンクだと、保存のたびに素材や外のファイルが作品の中身に変わる
+    copy_atomic(path, copy)
+    # 時刻は元に合わせる 写しがいつの中身かを、ファイルの時刻で見分けられるように
+    shutil.copystat(path, copy)
     return copy
 
 

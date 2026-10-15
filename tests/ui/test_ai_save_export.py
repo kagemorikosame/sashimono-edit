@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -433,6 +434,56 @@ class TestExport:
         window.deleteLater()
         assert not (folder / "a.mp4").exists()
         assert _scratch_files() == []
+
+
+class TestStoppingWhilePlacing:
+    """書き出し先へ置き始めた後の中止は断る（#327 CodeRabbit の指摘）
+
+    画面のスレッドの様子（rendering か placing か）は、ワーカーの知らせが届いてから変わる
+    その間に止めると、止めると答えたのに置き換えはそのまま終わり、前のファイルが消える
+    """
+
+    def test_a_stop_after_placing_began_is_refused_and_the_file_is_placed(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、AI は「止めています」を受け取るのに、書き出し先の前のファイルが置き換わる
+        del qt_application
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_export(project: Project, settings: ExportSettings, **_options: Any) -> Path:
+            settings.path.write_bytes(b"new video")
+            return settings.path
+
+        def held_copy(source: Path, path: Path, *, durable: bool = False) -> os.stat_result:
+            entered.set()
+            release.wait(10)
+            return copy_atomic(source, path, durable=durable)
+
+        monkeypatch.setattr(ai_export, "run_export", fake_export)
+        monkeypatch.setattr(ai_export, "copy_atomic", held_copy)
+        target = tmp_path / "完成.mp4"
+        target.write_bytes(b"previous")
+        job = ai_export.AssistantExport()
+        try:
+            job.start(
+                _small_project(),
+                ExportSettings(path=target),
+                lambda: target.resolve(),
+            )
+            # 画面のイベントは回さない 置き始めた知らせがまだ画面へ届いていない所を作る
+            assert entered.wait(10)
+            assert job.status()["state"] == "rendering"
+            assert job.cancel() is False
+            release.set()
+            _wait_until(lambda: job.status()["state"] not in EXPORT_RUNNING)
+            assert job.status()["state"] == "done"
+            assert "止めています" not in str(job.status()["message"])
+            assert target.read_bytes() == b"new video"
+        finally:
+            release.set()
+            job.shutdown()
+            job.deleteLater()
 
 
 def _slow_export(monkeypatch: pytest.MonkeyPatch) -> None:
