@@ -33,7 +33,9 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
+from sashimono.engine.checks import job as check_job
 from sashimono.engine.decode.probe import probe_media
+from sashimono.engine.gpu import GLContextError
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
@@ -419,6 +421,58 @@ class TestSound:
         window = _window(opened, _clean(media))
         with pytest.raises(ToolError, match="調べられる場所"):
             _call(window, {"path": str(outside)})
+
+
+class _NoGpuContext:
+    """GPU の無い機械のコンテキスト 作るのはできるが、走り係で作り終える所で断られる"""
+
+    def __init__(self, *_arguments: object, **_options: object) -> None:
+        pass
+
+    def complete(self) -> None:
+        raise GLContextError("試験: OpenGL 4.3 が使えない")
+
+    def move_to_thread(self, _thread: object) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+
+def _refuse_gpu(*_arguments: object, **_options: object) -> None:
+    raise GLContextError("試験: サーフェスを作れない")
+
+
+class TestWithoutGpu:
+    """GPU が使えず絵を調べられなかった種類を、調べて問題が無かったと言わない"""
+
+    @pytest.mark.parametrize("missing", [_refuse_gpu, _NoGpuContext])
+    @pytest.mark.parametrize("checks", [["black"], ["text_overflow"], ["black", "freeze"]])
+    def test_picture_checks_are_reported_as_skipped(
+        self,
+        opened: list[MainWindow],
+        media: _Media,
+        monkeypatch: pytest.MonkeyPatch,
+        missing: object,
+        checks: list[str],
+    ) -> None:
+        # 壊れると、GPU の無い機械で黒いコマを頼んだ AI が「黒いコマは無い」と伝える
+        monkeypatch.setattr(check_job, "OffscreenGLContext", missing)
+        result = _call(_window(opened, _clean(media)), {"checks": checks})
+        assert result["checks"] == []
+        assert result["skipped_checks"] == checks
+        assert "問題は見つかりませんでした" not in result["note"]
+        assert "調べていません" in result["note"]
+
+    def test_sound_is_still_checked_and_only_pictures_are_skipped(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、GPU が無いだけで音の検査まで外れるか、絵の検査を調べた物として並べる
+        monkeypatch.setattr(check_job, "OffscreenGLContext", _NoGpuContext)
+        result = _call(_window(opened, _clean(media)), {"checks": ["black", "silence"]})
+        assert result["checks"] == ["silence"]
+        assert result["skipped_checks"] == ["black"]
+        assert "問題は見つかりませんでした" not in result["note"]
 
 
 class TestPreference:

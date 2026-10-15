@@ -1199,7 +1199,9 @@ def _check_result(
         "complete": report.complete,
         "analyzed_seconds": round((report.analyzed - report.start) / report.fps, 3),
         "length_seconds": round(report.seconds, 3),
-        "checks": [kind for kind in CHECK_KINDS if kind in request.limits.kinds],
+        # 調べた種類だけを並べる 調べられなかった種類は別に返す 混ぜると、GPU の無い機械で
+        # 頼んだ黒いコマを「調べて無かった」と AI が読む
+        "checks": [kind for kind in CHECK_KINDS if kind in report.checked],
         "summary": {
             "integrated_lufs": None if report.loudness is None else round(report.loudness, 1),
             "loudness_target_lufs": request.limits.loudness_target,
@@ -1214,7 +1216,12 @@ def _check_result(
         result["scene"] = str(host.active_scene) if host.active_scene is not None else None
     else:
         result["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
+    if report.skipped:
+        result["skipped_checks"] = [kind for kind in CHECK_KINDS if kind in report.skipped]
     notes.extend(report.notes)
+    if report.skipped:
+        names = "・".join(CHECK_KIND_NAMES[kind] for kind in result["skipped_checks"])
+        notes.append(f"{names}は調べていません 問題が無いとは限りません")
     if state.running:
         notes.append(
             f"検査の途中です（{round((report.analyzed - report.start) / report.fps, 1)} 秒まで）"
@@ -1222,8 +1229,10 @@ def _check_result(
         )
     elif state.stopped:
         notes.append("検査は途中で止められました もう 1 度呼ぶと最初から調べ直します")
-    elif not report.problems:
+    elif not report.problems and not report.skipped:
         notes.append("問題は見つかりませんでした")
+    elif not report.problems and report.checked:
+        notes.append("調べた種類（checks）には問題がありませんでした")
     if request.project is not None and _project(host) != request.project:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"

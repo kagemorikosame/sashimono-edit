@@ -94,6 +94,17 @@ class TestWrittenFiles:
         only_loudness = _check(job, path, CheckLimits(kinds=frozenset({"loudness"})))
         assert not any("圧縮" in note for note in only_loudness.notes)
 
+    def test_kinds_a_file_cannot_have_are_marked_skipped(
+        self, job: CheckJob, tmp_path: Path
+    ) -> None:
+        # 壊れると、音の無い動画で無音を頼んだ AI が「無音は無い」と伝え、字幕も調べたことになる
+        path = write_video(tmp_path / "絵だけ.mp4", 2.0)
+        report = _check(
+            job, path, CheckLimits(kinds=frozenset({"silence", "black", "text_overflow"}))
+        )
+        assert report.skipped == frozenset({"silence", "text_overflow"})
+        assert report.checked == frozenset({"black"})
+
     def test_text_overflow_is_not_claimed_for_a_file(self, job: CheckJob, tmp_path: Path) -> None:
         # 壊れると、字の形の残らない動画を「字幕のはみ出し無し」と言い切り、AI が安心して渡す
         path = write_video(tmp_path / "clean.mp4", 2.0, tone_db=-14.0)

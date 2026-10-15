@@ -35,6 +35,8 @@ from sashimono.engine.checks.overflow import OverflowScan
 from sashimono.engine.checks.report import CheckReport, ClipIndex, assemble
 from sashimono.engine.checks.scan import (
     CLIPPING,
+    PICTURE_KINDS,
+    SOUND_KINDS,
     TEXT_OVERFLOW,
     AudioScan,
     CheckLimits,
@@ -106,9 +108,26 @@ class _Progress:
         self.analyzed = request.start
         self.length_seconds: float | None = None
         self.notes: list[str] = []
+        #: 頼まれたのに調べられなかった種類 返事では調べた種類から外し、別に返す
+        #: 外さないと、調べていない種類を「問題は無かった」と読ませる（GPU の無い機械の黒など）
+        self.skipped: set[str] = set()
         self.running = True
         self.failure: str | None = None
         self.stopped = False
+
+    def skip(self, kinds: frozenset[str], note: str) -> None:
+        """頼まれた種類のうち ``kinds`` を調べられなかったと記す 頼まれていなければ何もしない"""
+        missed = kinds & self.request.limits.kinds
+        if missed:
+            self.skipped |= missed
+            self.notes.append(note)
+
+    def skip_pictures(self, reason: object) -> None:
+        """GPU が使えず、絵を描く種類（黒・止まり・字幕）を調べられない"""
+        self.skip(
+            PICTURE_KINDS | {TEXT_OVERFLOW},
+            f"GPU が使えないので、絵と字幕は調べていません（{reason}）",
+        )
 
     def touch(self, *, force: bool = False) -> None:
         """画面へ知らせる 間引いて知らせる（:data:`_NOTIFY_SECONDS`）"""
@@ -140,6 +159,7 @@ class _Progress:
             peak=self.audio.peak if self.audio is not None else None,
             length_seconds=self.length_seconds,
             notes=tuple(self.notes),
+            skipped=frozenset(self.skipped),
         )
 
     def fraction(self) -> float:
@@ -189,7 +209,7 @@ class CheckJob(QObject):
                 context = OffscreenGLContext(deferred=True)
             except GLContextError as exc:
                 # GPU の無い機械でも音は調べられる 絵の検査だけ外したと結果に書く
-                progress.notes.append(f"GPU が使えないので、絵と字幕は調べていません（{exc}）")
+                progress.skip_pictures(exc)
         worker = _Worker(
             request,
             progress,
@@ -308,9 +328,7 @@ class _Worker(QThread):
                     entered = True
                 except GLContextError as exc:
                     with progress.lock:
-                        progress.notes.append(
-                            f"GPU が使えないので、絵と字幕は調べていません（{exc}）"
-                        )
+                        progress.skip_pictures(exc)
             if self._request.path is not None:
                 _check_file(self._request.path, progress)
             else:
@@ -449,13 +467,15 @@ def _check_file(path: Path, progress: _Progress) -> None:
             progress.end = max(1, round(duration * fps))
             progress.analyzed = 0
             progress.video = VideoScan(limits, fps) if video is not None else None
-            if TEXT_OVERFLOW in limits.kinds:
-                progress.notes.append(
-                    "書き出した動画からは字幕のはみ出しを調べられません（字の形が残らない）"
-                    " タイムラインを調べると分かります"
-                )
-            if limits.needs_sound and audio is None:
-                progress.notes.append("この動画には音がありません")
+            progress.skip(
+                frozenset({TEXT_OVERFLOW}),
+                "書き出した動画からは字幕のはみ出しを調べられません（字の形が残らない）"
+                " タイムラインを調べると分かります",
+            )
+            if audio is None:
+                progress.skip(SOUND_KINDS, "この動画には音がありません")
+            if video is None:
+                progress.skip(PICTURE_KINDS, "この動画には絵がありません")
             if (
                 CLIPPING in limits.kinds
                 and audio is not None
