@@ -43,6 +43,7 @@ from sashimono.ai.outbound import (
     file_secrets,
     hide_text,
     redact,
+    secret_pairs,
     text_secrets,
 )
 from sashimono.ai.safety import Consent
@@ -177,6 +178,8 @@ class EditorBridge:
         self._send_requests: queue.Queue[SendRequest] = queue.Queue()
         #: 画面が取り出して窓に出している確かめ 中断のときに畳む
         self._sending: SendRequest | None = None
+        #: これまでに見た素材・作品の名前と場所（伏せる文字 → 印） :meth:`_learn_names` が足す
+        self._known_names: dict[str, str] = {}
 
     # --- AI スレッドから ---
 
@@ -369,6 +372,8 @@ class EditorBridge:
 
     def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""
+        # 動かす前の名前も覚える 道具が素材を消すと、動かした後の作品からは名前が拾えない
+        self._learn_names()
         hide = not self.may_send(Outbound.FILES)
         try:
             result = work()
@@ -389,11 +394,26 @@ class EditorBridge:
             return result
         return redact(result, self._file_secrets()) if hide else result
 
-    def _file_secrets(self) -> list[tuple[str, str]]:
+    def _learn_names(self) -> None:
+        """今の作品と履歴に残った作品から、名前と場所を覚える 画面のスレッドで呼ぶ
+
+        覚えた物はアプリを閉じるまで忘れない 履歴の上限で古い段が落ちたり、別の作品を
+        開いて履歴が消えたりしても、字幕起こしの記録や AI の会話の中には前の名前が残る
+        名前と場所を許している人にも覚えておく 後から断ったときに、前の名前も伏せられるように
+        """
         host = self._host
-        return file_secrets(
-            host.document.project, project_path=host.project_path, export_folder=host.export_folder
+        document = host.document
+        learned = file_secrets(
+            (document.project, *document.past_projects),
+            project_path=host.project_path,
+            export_folder=host.export_folder,
         )
+        for secret, mark in learned.items():
+            self._known_names.setdefault(secret, mark)
+
+    def _file_secrets(self) -> list[tuple[str, str]]:
+        self._learn_names()
+        return secret_pairs(self._known_names)
 
     def take_send_request(self) -> SendRequest | None:
         """送ってよいかの確かめが 1 件あれば取り出す 無ければ ``None`` 画面のスレッドから呼ぶ"""

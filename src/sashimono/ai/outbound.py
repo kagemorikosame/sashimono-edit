@@ -38,6 +38,7 @@ from sashimono.core.model import Project
 __all__ = [
     "ASKED",
     "DESTINATION",
+    "PROJECT_MARK",
     "TEXT_MARK",
     "Outbound",
     "SendAnswer",
@@ -46,6 +47,7 @@ __all__ = [
     "file_secrets",
     "hide_text",
     "redact",
+    "secret_pairs",
     "text_secrets",
 ]
 
@@ -226,15 +228,26 @@ _PATH_MARK = "〔ファイルの場所〕"
 #: 値ごと伏せる項目の名前 設定の中のフォルダ（``state_folder``・``export_folder``）や
 #: 一覧の ``path`` など 中身の形（正規表現）で見分けると、``/backup`` のような短い場所や、
 #: 区切りの無い書き方で漏れる 名前で分かる物は中身を見ずに伏せる
-_PLACE_KEY = re.compile(r"(?:^|_)(?:path|folder|dir|directory)s?$")
+_PLACE_KEY = re.compile(r"(?:^|_)(?:path|folder|dir|directory|file)s?$")
+
+
+#: 作品の名前を伏せた印
+PROJECT_MARK = "〔作品〕"
 
 
 def file_secrets(
-    project: Project, *, project_path: Path | None, export_folder: Path | None
-) -> list[tuple[str, str]]:
-    """素材の名前と場所を伏せる表（伏せる文字, 置き換える文字） 長い順
+    projects: Project | Iterable[Project],
+    *,
+    project_path: Path | None,
+    export_folder: Path | None,
+) -> dict[str, str]:
+    """素材の名前と場所を伏せる表（伏せる文字 → 置き換える文字）
 
-    長い順にするのは、場所の中の名前を先に置き換えると、場所の残りが伏せずに残るため
+    名前の出どころはここに集める 今の作品だけでなく、履歴に残った前の作品も渡す
+    （:attr:`~sashimono.core.commands.Document.past_projects`） 置いた後に消した素材や、
+    名前を変える前の作品の名前は、履歴の名前や字幕起こしの記録に残ったまま外へ出るため
+    作品の名前（:attr:`Project.name`）も入れる 未保存の作品や、保存した後に名前を変えた作品は、
+    保存先の名前と違う 並べる順は :func:`secret_pairs` で決める
     """
     table: dict[str, str] = {}
 
@@ -243,17 +256,30 @@ def file_secrets(
             if len(value) >= _SHORTEST_SECRET and value not in table:
                 table[value] = mark
 
-    for media in project.media:
-        path = media.path
-        add((str(path), path.as_posix(), media.name, path.name, path.stem), f"〔素材 {media.id}〕")
+    for project in (projects,) if isinstance(projects, Project) else projects:
+        for media in project.media:
+            path = media.path
+            add(
+                (str(path), path.as_posix(), media.name, path.name, path.stem),
+                f"〔素材 {media.id}〕",
+            )
+        add((project.name,), PROJECT_MARK)
     if project_path is not None:
         add(
             (str(project_path), project_path.as_posix(), project_path.name, project_path.stem),
-            "〔作品〕",
+            PROJECT_MARK,
         )
         add((str(project_path.parent), project_path.parent.as_posix()), "〔作品のフォルダ〕")
     if export_folder is not None:
         add((str(export_folder), export_folder.as_posix()), "〔書き出しのフォルダ〕")
+    return table
+
+
+def secret_pairs(table: Mapping[str, str]) -> list[tuple[str, str]]:
+    """伏せる順に並べた表 長い順
+
+    長い順にするのは、場所の中の名前を先に置き換えると、場所の残りが伏せずに残るため
+    """
     return sorted(table.items(), key=lambda item: len(item[0]), reverse=True)
 
 

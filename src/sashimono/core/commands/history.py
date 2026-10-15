@@ -198,6 +198,15 @@ class Document:
         """古い順に並べた Undo 可能な操作名 履歴パネル用"""
         return tuple(entry.label for entry in self._undo)
 
+    @property
+    def past_projects(self) -> tuple[Project, ...]:
+        """履歴（取り消しとやり直し）に残ったプロジェクト 古い順
+
+        AI へ送る結果の伏せ字（#342）が、今の作品から消えた素材の名前も拾うのに使う
+        履歴の名前（「配置: 〜」）には、消した素材の名前が残るため
+        """
+        return tuple(entry.before for entry in (*self._undo, *reversed(self._redo)))
+
     def reset(self, project: Project) -> None:
         """別のプロジェクトを読み込み、履歴を捨てる ファイルを開いたときに使う"""
         if self._checkpoint_depth:

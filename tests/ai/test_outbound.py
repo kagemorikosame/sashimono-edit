@@ -32,6 +32,7 @@ from sashimono.ai.outbound import (
     file_secrets,
     hide_text,
     redact,
+    secret_pairs,
 )
 from sashimono.core.commands import RemoveMedia
 from sashimono.core.model import MediaItem, Transcript
@@ -733,6 +734,90 @@ class TestPlacesOutsideTheTable:
         assert preferences["theme"] == "dark"
 
 
+# --- 名前と場所を断った人の所で、目印の名前がどこにも出ないこと（Codex の指摘 #366） ---
+
+#: 目印 素材・作品・置き場の名前に入れ、結果のどこかに出たら漏れ
+MARK = "ZZSECRET"
+
+
+def _marked_host(
+    video_media: MediaItem, transcript: Transcript, scene: str, tmp_path: Path
+) -> FakeHost:
+    """目印の名前を持つ作品を、場面ごとの形にする
+
+    - そのまま: 素材も作品の名前も今の作品にある
+    - 消した後: 置いた素材をクリップごと消し、素材も外した 名前は履歴と字幕起こしの記録にだけ残る
+    - 名前を変えた後: 作品は別の名前で保存してあり、作品の名前だけが目印を持つ
+    """
+    media = replace(video_media, path=Path(f"C:/Users/{MARK}人/動画/{MARK}素材.mp4"))
+    project = replace(make_loaded(media, transcript), name=f"{MARK}作品")
+    host = FakeHost(project)
+    host.settings = {"preferences": {"state_folder": f"/{MARK}退避", "theme": "dark"}}
+    host.transcription = f"{MARK}素材.mp4: 終了した"
+    # 変える道具の例（WRITE_EXAMPLES）はテキストのクリップを指す
+    _operation("add_text")(host, {"text": BODY_TEXT})
+    if scene == "消した後":
+        placed = host.document.project.media[0]
+        _operation("place_media")(host, {"media_id": str(placed.id)})
+        clips = [
+            str(clip.id) for track in host.document.project.timeline.tracks for clip in track.clips
+        ]
+        _operation("delete_clips")(host, {"clip_ids": clips})
+        host.apply_commands([RemoveMedia(placed.id)], "素材を削除")
+        assert not host.document.project.media
+    elif scene == "名前を変えた後":
+        host.saved_at = tmp_path / "ふつうの名前.sme"
+    return host
+
+
+def _every_example(host: FakeHost) -> list[tuple[str, dict[str, Any]]]:
+    """読む道具は引数なしで、変える道具は例の引数で、質問の道具を除いて全部"""
+    project = host.document.project
+    ids = (
+        _ids(host)
+        if project.media
+        else dict.fromkeys(("media", "segment", "track", "video", "text"), "無い")
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for operation in OPERATIONS:
+        if operation.asks:
+            continue
+        example = WRITE_EXAMPLES.get(operation.name)
+        calls.append((operation.name, example(ids) if example is not None else {}))
+    return calls
+
+
+class TestNoNameLeaksWhenNamesAreRefused:
+    @pytest.mark.parametrize("scene", ["そのまま", "消した後", "名前を変えた後"])
+    def test_the_mark_never_reaches_the_results(
+        self, scene: str, video_media: MediaItem, transcript: Transcript, tmp_path: Path
+    ) -> None:
+        # 壊れると、名前と場所を断った人の素材や作品の名前（ユーザー名入りの場所も）が、どれかの
+        # 道具の結果か断りの文に混ざって外へ出る 今の作品の素材だけを伏せる作りだと、消した
+        # 素材の名前（字幕起こしの記録・履歴）や、保存先と違う作品の名前が漏れる
+        leaks: list[str] = []
+        for name, arguments in _every_example(
+            _marked_host(video_media, transcript, scene, tmp_path)
+        ):
+            # 道具ごとに作り直す 前の道具が素材を消すと、後の道具が名前を出さずに通ってしまう
+            host = _marked_host(video_media, transcript, scene, tmp_path)
+            bridge = EditorBridge(host, auto_approve=True)
+            bridge.set_send_choices(
+                {Outbound.FRAMES: SendChoice.ALLOW, Outbound.TEXT: SendChoice.ALLOW}
+                | {Outbound.FILES: SendChoice.DENY}
+            )
+            done, box = call_in_thread(bridge, _operation(name), arguments)
+            answer_sends(bridge, done, _never)
+            sent = json.dumps(
+                {"result": box.get("result"), "error": str(box.get("error") or "")},
+                ensure_ascii=False,
+                default=str,
+            )
+            if MARK in sent:
+                leaks.append(f"{name}: {sent[:200]}")
+        assert not leaks
+
+
 class TestRedact:
     @pytest.mark.parametrize(
         "place",
@@ -785,7 +870,7 @@ class TestRedact:
     ) -> None:
         # 壊れると、場所の中のファイル名だけが先に伏せられ、フォルダの名前が残る
         project = make_loaded(replace(video_media, path=SECRET_PATH), transcript)
-        table = file_secrets(project, project_path=None, export_folder=None)
+        table = secret_pairs(file_secrets(project, project_path=None, export_folder=None))
         hidden = redact({"path": SECRET_PATH.as_posix(), "list": [SECRET_PATH.name]}, table)
         assert "秘密の人" not in json.dumps(hidden, ensure_ascii=False)
         assert "〔素材" in hidden["path"]
