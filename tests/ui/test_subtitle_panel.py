@@ -35,6 +35,7 @@ from sashimono.ui.subtitle import SubtitlePanel
 from sashimono.ui.subtitle import panel as panel_module
 from sashimono.ui.subtitle.dialogs import JetCutDialog
 from tests.conftest import make_clip
+from tests.ui.test_burn_panel import accept_everyone
 
 
 class StubAnalyzer(MediaAnalyzer):
@@ -416,7 +417,7 @@ class TestBurnAndExport:
     ) -> None:
         widget, issued = panel
         # 焼き込む話し手を尋ねる窓は、全部を選んだものとして返す（窓を開くと試験が止まる）
-        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.ask_burn = accept_everyone
         widget.burn()
         commands, label = issued[-1]
         assert label == "字幕を焼き込み"
@@ -436,7 +437,7 @@ class TestBurnAndExport:
         widget = SubtitlePanel(small, StubAnalyzer())
         issued: list[tuple[list[Command], str]] = []
         widget.commands_requested.connect(lambda commands, label: issued.append((commands, label)))
-        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.ask_burn = accept_everyone
         widget.burn()
         widget.deleteLater()
         commands, _ = issued[-1]
@@ -462,7 +463,7 @@ class TestBurnAndExport:
         """
         widget, issued = panel
         widget.wrap_share = share
-        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.ask_burn = accept_everyone
         widget.burn()
         clips = [c.clip for c in issued[-1][0] if isinstance(c, AddClip)]
         assert clips
@@ -484,7 +485,7 @@ class TestBurnAndExport:
             source=TEXT.create(text="ひな形", wrap_width=500),
         )
         widget.template_provider = lambda: template
-        widget.ask_burn = lambda voices, note: [voice for voice, _ in voices]
+        widget.ask_burn = accept_everyone
         widget.burn()
         clips = [c.clip for c in issued[-1][0] if isinstance(c, AddClip)]
         assert clips

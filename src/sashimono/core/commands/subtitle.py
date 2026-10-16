@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from fractions import Fraction
 
@@ -41,6 +41,8 @@ __all__ = [
     "RetimeSegment",
     "SetSegmentText",
     "SplitSegment",
+    "SubtitleLook",
+    "SubtitleTemplate",
     "Voice",
     "burn_defaults",
     "burn_subtitles",
@@ -293,14 +295,25 @@ def _voiced(project: Project) -> list[tuple[Voice, ProjectedSubtitle]]:
     return result
 
 
+#: 字幕 1 枚の見た目を作る手（#308） 本文と長さ（フレーム）を受け取り、位置 0 に置く
+#: テキストのクリップを返す エイリアス・プリセット・テンプレートの棚の見た目を、着せ替えと同じ
+#: 決まり（今の文字と長さを残し、動きを字幕の尺に合わせる）で着せるのに使う 決まりは互換層と
+#: プリセットの当て方にあり、コア層からは互換層を読めないので、作る手を外から受け取る
+type SubtitleLook = Callable[[str, int], Clip]
+
+#: 焼き込みのひな形 テキストの生成物・写すクリップ・見た目を作る手のどれか
+type SubtitleTemplate = GeneratedSource | Clip | SubtitleLook
+
+
 def burn_subtitles(
     project: Project,
-    template: GeneratedSource | Clip,
+    template: SubtitleTemplate,
     *,
     track_name: str = "字幕",
     text_param: str = TEXT_PARAM,
     voices: Collection[Voice] | None = None,
     segments: Collection[SegmentId] | None = None,
+    looks: Mapping[Voice, SubtitleTemplate] | None = None,
 ) -> list[Command]:
     """いま画面に出る字幕を、テキストオブジェクトとしてタイムラインへ並べる
 
@@ -312,8 +325,9 @@ def burn_subtitles(
     切り詰められて欠けた 同じ話し手の中で重なる字幕は、前の方を切り詰める
     （1 本のトラックにクリップを重ねられないため）
 
-    ``template`` はテキストの生成物か、ひな形にするテキストのクリップ クリップなら
-    フォント・色・位置・縁取り・エフェクトまでそのまま写し、本文だけを差し替える
+    ``template`` はテキストの生成物か、ひな形にするテキストのクリップか、見た目を作る手
+    （:data:`SubtitleLook`） クリップならフォント・色・位置・縁取り・エフェクトまでそのまま写し、
+    本文だけを差し替える ``looks`` は話し手ごとのひな形（#308） 無い話し手は ``template``
     ``voices`` は焼き込む話し手（``None`` なら全部）、``segments`` は焼き込む字幕の ID
     （``None`` なら全部 字幕パネルで選んだ行だけを置くときに渡す）
     コマンドは 1 回の取り消しで全部戻る並び（呼ぶ側がまとめて出す）
@@ -346,8 +360,9 @@ def burn_subtitles(
         else:
             track = Track(kind=TrackKind.VIDEO, name=name)
             commands.append(AddTrack(track))
+        chosen = looks.get(voice, template) if looks is not None else template
         for start, end, text, segment_id in _laid_out(grouped[voice]):
-            clip = _text_clip(template, text_param, text, start, end)
+            clip = _text_clip(chosen, text_param, text, start, end)
             # 出どころの印を付ける 字幕の誤植を直すとき、印のあるクリップだけを一緒に直す
             # （本文の一致で探すと、手で書いた同じ本文のタイトルまで書き換わる）
             origin = SubtitleOrigin(media_id=voice[0], stream=voice[1], segment_id=segment_id)
@@ -371,9 +386,23 @@ def _laid_out(subtitles: list[ProjectedSubtitle]) -> list[tuple[int, int, str, S
 
 
 def _text_clip(
-    template: GeneratedSource | Clip, text_param: str, text: str, start: int, end: int
+    template: SubtitleTemplate, text_param: str, text: str, start: int, end: int
 ) -> Clip:
     """字幕 1 枚のテキストのクリップ"""
+    if not isinstance(template, (Clip, GeneratedSource)):
+        made = template(text, end - start)
+        # 位置と長さはここで決める 作る手が長さを取り違えても、字幕の行と同じ所・同じ長さに置く
+        # ID も振り直す 同じ手で作った 2 枚が同じ ID を持つと、プロジェクトの検査に断られる
+        return replace(
+            made,
+            id=new_clip_id(),
+            timeline_start=start,
+            duration=end - start,
+            effects=tuple(replace(e, id=new_effect_id()) for e in made.effects),
+            after_effects=tuple(replace(e, id=new_effect_id()) for e in made.after_effects),
+            link_group=None,
+            group_id=None,
+        )
     if isinstance(template, Clip) and template.source is not None:
         # ひな形のクリップを写す ID は振り直す（同じ ID が 2 本あるとプロジェクトの検査に
         # 断られ、片方を直したつもりで両方を探し当てる） リンクとグループは外す

@@ -35,6 +35,36 @@ MARK = "ZZSECRET"
 #: 文字や辞書を返す口を EditorHost に足したら、ここへ足し、その口が返す名前を
 #: remembered_names からも返す 足さないと下の試験が落ちる
 TEXT_SOURCES = {"transcription_status", "start_transcription", "app_settings"}
+#: 本人の持ち物（保存したプリセット・エイリアスと着せ方の設定 #308） 名前はアプリの設定として
+#: 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
+OWN_LIBRARY = {"saved_looks", "look_rules"}
+#: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
+PROJECT_SIDE = {
+    "document",
+    "project",
+    "active_scene",
+    "set_active_scene",
+    "playhead",
+    "seek",
+    "selected_clip",
+    "select_clip",
+    "selected_clips",
+    "select_clips",
+    "apply_commands",
+    "stop_playback",
+    "render_png",
+    "probe",
+    "splits_media",
+    "subtitle_wrap_share",
+    "analyze",
+    "waveform",
+    "request_scenes",
+    "scene_state",
+    "scene_waiter",
+    "project_path",
+    "export_folder",
+    "remembered_names",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -133,3 +163,20 @@ class TestEveryTextSourceGoesThroughThePort:
         texts = {name for name, hint in hints.items() if hint in (str, dict[str, object])}
         assert texts == TEXT_SOURCES
         assert "remembered_names" in hints
+
+    def test_every_port_of_the_host_is_sorted(self) -> None:
+        # 壊れると、作品の外の物（本人の持ち物の名前・置き場など）を返す口を足した人が、
+        # 送り方を決めないまま道具から返し、名前と場所を断った人の所でも伏せずに送る
+        # 口を足したら、下の 3 つのどれかに入れる 作品の外の名前を返すなら TEXT_SOURCES に入れて
+        # remembered_names からも返す 本人の持ち物なら OWN_LIBRARY に入れ、使う道具の sends に
+        # アプリの設定（Outbound.APP_SETTINGS）を書く
+        ports = {name for name in vars(EditorHost) if not name.startswith("_")}
+        sorted_ports = [TEXT_SOURCES, OWN_LIBRARY, PROJECT_SIDE]
+        assert set().union(*sorted_ports) == ports
+        assert sum(len(group) for group in sorted_ports) == len(ports)
+
+    def test_tools_that_read_the_own_library_declare_app_settings(self) -> None:
+        # 壊れると、プリセットやエイリアスの名前を断りの文に並べる道具が、送る物にそれを書かず、
+        # 設定画面と個人情報の扱いの一覧に無い物が外へ出る
+        operation = next(op for op in OPERATIONS if op.name == "place_subtitles")
+        assert Outbound.APP_SETTINGS in operation.sends

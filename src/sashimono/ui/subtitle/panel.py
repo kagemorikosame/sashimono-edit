@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
 
@@ -34,6 +34,15 @@ from PySide6.QtWidgets import (
 
 from sashimono.asr import JobKind, TranscribeOptions, TranscriptionService, default_backend
 from sashimono.asr.service import Job
+from sashimono.compat.catalog import TemplateEntry, default_template_roots, template_catalog
+from sashimono.compat.subtitle_looks import (
+    DEFAULT,
+    SELECTED,
+    LookChoice,
+    LookError,
+    LookRules,
+    subtitle_look,
+)
 from sashimono.core.commands import (
     Command,
     MergeWithNext,
@@ -42,6 +51,7 @@ from sashimono.core.commands import (
     SetSegmentText,
     SetTranscript,
     SplitSegment,
+    SubtitleTemplate,
     Voice,
     burn_defaults,
     burn_subtitles,
@@ -50,7 +60,9 @@ from sashimono.core.commands import (
     subtitle_wrap_width,
     voice_label,
 )
+from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
+from sashimono.core.io.library import Library
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
     Clip,
@@ -66,9 +78,17 @@ from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 from sashimono.engine.cache import MediaAnalyzer
+from sashimono.engine.render.look_preview import SAMPLE_TEXT
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
 from sashimono.ui.flow_layout import flow_of, narrow_combo
-from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog, JetCutDialog
+from sashimono.ui.subtitle.dialogs import (
+    BurnAnswer,
+    BurnDialog,
+    BurnRequest,
+    CleanupDialog,
+    JetCutDialog,
+)
+from sashimono.ui.subtitle.look_picker import LookSources
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, theme_signals, themed_style
@@ -86,6 +106,18 @@ TIME_COLUMN_PADDING = 24
 MIN_TIME_SAMPLE_SECONDS = 3600
 
 
+def _default_shelf() -> Sequence[TemplateEntry]:
+    """テンプレートの棚（棚の窓と同じ一覧） 見た目の一覧で棚のタブを開いたときに読む
+
+    読んであれば読み直さない（タイムラインの〔追加〕と同じ） 開くたびに読み直すと、数百本の
+    棚で一覧が出るまで待たされる
+    """
+    catalog = template_catalog()
+    if not catalog.all():
+        catalog.scan(default_template_roots())
+    return catalog.all()
+
+
 class SubtitlePanel(QWidget):
     """素材ごとの字幕の一覧と編集"""
 
@@ -95,6 +127,8 @@ class SubtitlePanel(QWidget):
     seek_requested = Signal(int)
     #: ステータスバーへ出す文言
     status_message = Signal(str)
+    #: 字幕を置いた見た目の鍵（#308） 窓が「最後に使った見た目」として覚える
+    look_used = Signal(str)
 
     def __init__(
         self, project: Project, analyzer: MediaAnalyzer, parent: QWidget | None = None
@@ -128,8 +162,20 @@ class SubtitlePanel(QWidget):
         #: 既定の見た目で焼き込む字幕を折り返す幅（画面の幅の % 0 は折り返さない #249）
         #: 窓が本人の設定（``Preferences.subtitle_wrap_share``）から入れる 既定は設定の既定と同じ
         self.wrap_share = 90
-        #: 焼き込む話し手を尋ねる 試験で差し替える
-        self.ask_burn: Callable[[list[tuple[Voice, str]], str], list[Voice] | None] = self._ask_burn
+        #: 見た目の一覧に並べるプリセットとエイリアスの置き場（#308） 窓がタイムラインの
+        #: 〔追加〕と同じ置き場を差し込む（試験で差し替えた置き場も同じに見える）
+        self.library_provider: Callable[[], Library] = Library
+        #: 見た目の一覧に並べるテンプレートの棚 棚のタブを開いたときにだけ読む
+        self.shelf_provider: Callable[[], Sequence[TemplateEntry]] = _default_shelf
+        #: プリセットの当て方と、棚の着せ替えで折り返しの幅を残すか（どちらも本人の設定）
+        #: 字幕に着せるときも、設定パネルや棚から着せ替えるときと同じ決まりにする
+        self.look_rules = LookRules()
+        #: 最後に使った見た目を次も選んでおくか（``Preferences.subtitle_look_remember``）と、
+        #: 覚えた見た目の鍵 既定は切（今まで通り、選んでいるテキストがあればそれ）
+        self.remember_look = False
+        self.last_look = ""
+        #: 焼き込む話し手と見た目を尋ねる 試験で差し替える
+        self.ask_burn: Callable[[BurnRequest], BurnAnswer | None] = self._ask_burn
         #: 起こしている物の最後の進み具合（依頼ごと）
         self._last_progress: dict[int, str] = {}
 
@@ -799,50 +845,122 @@ class SubtitlePanel(QWidget):
             self._project, media.id, silences, stream=media.transcript_stream(self._stream)
         )
 
-    def _template(self) -> tuple[GeneratedSource | Clip, str]:
-        """焼き込みのひな形と、窓に出す説明 タイムラインで選んでいるテキストがあればそれ"""
+    def _selected_text(self) -> Clip | None:
         clip = self.template_provider()
         if clip is not None and clip.source is not None and clip.source.kind == "text":
-            text = str(clip.source.params.get("text", "")).splitlines()
-            head = text[0][:12] if text else ""
-            return clip, f"見た目: 選んでいるテキスト「{head}」を写します（本文だけ差し替え）"
+            return clip
+        return None
+
+    def _base(self) -> GeneratedSource:
+        """既定の見た目 選んだ見た目を着せる土台にもする（大きさ・位置・折り返し）"""
         # 既定の大きさと位置は作品の高さで縮める 画素のまま置くと、720p では画面の外に出る
         settings = self._project.settings
         look = burn_defaults(settings.height, subtitle_wrap_width(settings.width, self.wrap_share))
-        wrap = f"・幅 {self.wrap_share}% で折り返し" if self.wrap_share > 0 else ""
-        return TEXT.create(**look), (
-            f"見た目: 既定（大きさ {look['size']:.3g}・下寄せ・縁取り {look['border_width']:.3g}"
-            f"{wrap}）"
-            " タイムラインでテキストを選んでから焼き込むと、そのテキストの見た目を写します"
+        return TEXT.create(**look)
+
+    def _describe(self, choice: LookChoice) -> str:
+        """窓に出す、選んだ見た目で何が起きるかの説明"""
+        if choice.kind == SELECTED:
+            return f"見た目: {choice.label}を写します（本文だけ差し替え）"
+        if choice.kind == DEFAULT:
+            settings = self._project.settings
+            look = burn_defaults(settings.height)
+            wrap = f"・幅 {self.wrap_share}% で折り返し" if self.wrap_share > 0 else ""
+            size, border = look["size"], look["border_width"]
+            return (
+                f"見た目: 既定（大きさ {size:.3g}・下寄せ・縁取り {border:.3g}"
+                f"{wrap}） タイムラインでテキストを選んでから開くと、そのテキストの見た目も選べます"
+            )
+        wrap = (
+            f" 折り返さない見た目には幅 {self.wrap_share}% の折り返しを足します"
+            if self.wrap_share > 0
+            else ""
         )
+        return (
+            f"見た目: 「{choice.label}」を着せます（本文と長さは字幕のまま 動きは字幕の長さに"
+            f"合わせます）{wrap}"
+        )
+
+    def _request(
+        self, voices: list[Voice], *, title: str, accept: str, choose: bool
+    ) -> BurnRequest:
+        selected = self._selected_text()
+        base = self._base()
+        sample = with_fixed_items(
+            Clip(timeline_start=0, duration=60, source=base.with_param("text", SAMPLE_TEXT)),
+            picture=True,
+        )
+        if self.remember_look and self.last_look:
+            initial = self.last_look
+        else:
+            # 今まで通り 選んでいるテキストがあればそれ、無ければ既定の見た目
+            initial = SELECTED if selected is not None else DEFAULT
+        return BurnRequest(
+            voices=[(voice, voice_label(self._project, voice)) for voice in voices],
+            sources=LookSources(
+                library=self.library_provider(),
+                shelf=self.shelf_provider,
+                sample=sample,
+                selected=selected,
+            ),
+            initial=initial,
+            describe=self._describe,
+            title=title,
+            accept=accept,
+            choose_voices=choose,
+        )
+
+    def _templates(
+        self, answer: BurnAnswer
+    ) -> tuple[SubtitleTemplate, dict[Voice, SubtitleTemplate]] | None:
+        """窓の答えから、全員のひな形と話し手ごとのひな形を作る 作れなければ知らせて ``None``"""
+        base = self._base()
+
+        def made(choice: LookChoice) -> SubtitleTemplate:
+            return subtitle_look(choice, base, self.look_rules)
+
+        try:
+            everyone = made(answer.look)
+            own = {voice: made(choice) for voice, choice in answer.looks.items()}
+        except LookError as exc:
+            self.status_message.emit(str(exc))
+            return None
+        return everyone, own
 
     def burn(self) -> None:
         voices = subtitle_voices(self._project)
         if not voices:
             self.status_message.emit("焼き込む字幕がありません")
             return
-        template, note = self._template()
-        labels = [(voice, voice_label(self._project, voice)) for voice in voices]
-        chosen = self.ask_burn(labels, note)
-        if chosen is None:
+        answer = self.ask_burn(
+            self._request(voices, title="字幕を焼き込む", accept="焼き込む", choose=True)
+        )
+        if answer is None:
             return
+        templates = self._templates(answer)
+        if templates is None:
+            return
+        template, looks = templates
         commands: list[Command] = burn_subtitles(
-            self._project, template, voices=[v for v in voices if v in chosen]
+            self._project,
+            template,
+            voices=[v for v in voices if v in answer.voices],
+            looks=looks,
         )
         if not commands:
             self.status_message.emit("焼き込む字幕がありません")
             return
         self.commands_requested.emit(commands, "字幕を焼き込み")
+        self.look_used.emit(answer.look.key)
 
-    def _ask_burn(self, voices: list[tuple[Voice, str]], note: str) -> list[Voice] | None:
-        dialog = BurnDialog([(voice, label) for voice, label in voices], note, self)
-        answer = dialog.exec()
+    def _ask_burn(self, request: BurnRequest) -> BurnAnswer | None:
+        dialog = BurnDialog(request, parent=self)
+        accepted = dialog.exec()
+        answer = dialog.answer()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
         dialog.deleteLater()
-        if not answer:
-            return None
-        return [voice for voice in dialog.chosen() if isinstance(voice, tuple)]
+        return answer if accepted else None
 
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
@@ -858,8 +976,17 @@ class SubtitlePanel(QWidget):
         if not segments:
             self.status_message.emit("置く字幕の行を選んでください")
             return
-        template, _note = self._template()
         voice: Voice = (media.id, media.transcript_stream(self._stream))
+        # 窓の無かった道にも、焼き込みと同じ見た目の窓を出す（#308） 話し手は見ている 1 本
+        answer = self.ask_burn(
+            self._request([voice], title="選んだ行を置く", accept="置く", choose=False)
+        )
+        if answer is None:
+            return
+        templates = self._templates(answer)
+        if templates is None:
+            return
+        template, _looks = templates
         commands: list[Command] = burn_subtitles(
             self._project, template, voices=[voice], segments=segments
         )
@@ -867,6 +994,7 @@ class SubtitlePanel(QWidget):
             self.status_message.emit("選んだ行はタイムラインに出ていません")
             return
         self.commands_requested.emit(commands, f"字幕を置く: {len(segments)} 行")
+        self.look_used.emit(answer.look.key)
 
     def export_file(self) -> None:
         frame_range = export_range(self._project.timeline)

@@ -24,6 +24,7 @@ from typing import Any
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Consent, Safety
+from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
     AddClip,
@@ -52,6 +53,7 @@ from sashimono.core.commands import (
     SetTrackState,
     SetTranscript,
     SplitClip,
+    SubtitleTemplate,
     TrimClip,
     UngroupClips,
     Voice,
@@ -77,7 +79,6 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     EffectId,
-    GeneratedSource,
     Interpolation,
     MediaId,
     MediaItem,
@@ -1953,8 +1954,24 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 画面の〔焼き込み〕と同じ既定 作品の高さに合わせて縮める
     settings = project.settings
     wrap = subtitle_wrap_width(settings.width, host.subtitle_wrap_share)
-    template: GeneratedSource | Clip = TEXT.create(**burn_defaults(settings.height, wrap))
-    if arguments.get("template_clip_id"):
+    base = TEXT.create(**burn_defaults(settings.height, wrap))
+    template: SubtitleTemplate = base
+    look_name = str(arguments.get("look_name", "") or "")
+    if look_name and arguments.get("template_clip_id"):
+        raise ToolError("見た目は look_name か template_clip_id のどちらか 1 つで選んでください")
+    if look_name:
+        # 画面の〔焼き込み〕の一覧で選ぶのと同じ決まりで着せる（#308）
+        try:
+            choice = find_choice(
+                host.saved_looks,
+                str(arguments.get("look_kind", "alias") or "alias"),
+                look_name,
+                str(arguments.get("look_category", "") or ""),
+            )
+            template = subtitle_look(choice, base, host.look_rules)
+        except LookError as exc:
+            raise ToolError(str(exc)) from exc
+    elif arguments.get("template_clip_id"):
         located = project.timeline.locate_clip(ClipId(str(arguments["template_clip_id"])))
         if located is None:
             raise ToolError(f"ひな形のクリップが見つかりません: {arguments['template_clip_id']}")
@@ -2178,6 +2195,11 @@ _HIDDEN_IN_HISTORY = frozenset({Outbound.TEXT})
 _HIDDEN_IN_VALUES = frozenset({Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
+#: 保存したプリセット・エイリアスで字幕に見た目を着せる道具（#308） 見つからないと断る文に
+#: 保存してある物の名前を並べる（AI が名前を選び直すための唯一の手掛かり） 本人の持ち物の
+#: 名前で、作品の中身でも素材でもないので、アプリの設定と同じく送る 読み込めない理由の文には
+#: 置き場の場所が入りうるので、名前と場所も書く（断った人には伏せる）
+_WITH_LOOKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
 
@@ -2909,7 +2931,9 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "字幕をテキストオブジェクトとしてタイムラインへ置く（焼き込み）"
             " 話し手（素材と音声）ごとに別のレイヤーへ入れる 省けば出ている字幕を全部"
-            " 見た目はひな形のテキストのクリップを写す（省けば下寄せ・縁取りの既定）"
+            " 見た目はひな形のテキストのクリップを写すか、保存したエイリアス・プリセットを"
+            "名前で選んで着せる（本文と長さは字幕のまま 動きは字幕の長さに合わせる）"
+            " どちらも省けば下寄せ・縁取りの既定"
         ),
         schema=_schema(
             {
@@ -2921,10 +2945,20 @@ OPERATIONS: tuple[Operation, ...] = (
                     "description": "置く字幕の ID（get_subtitles の segment_id） 省けば全部",
                 },
                 "template_clip_id": _string("見た目を写すテキストのクリップ"),
+                "look_kind": _string(
+                    "look_name の種類 alias（自作のエイリアス 既定）か preset（プリセット）"
+                ),
+                "look_name": _string(
+                    "見た目にする保存したエイリアスかプリセットの名前 template_clip_id と一緒には"
+                    "使えない 文字を持たないエイリアス（図形など）は使えない"
+                ),
+                "look_category": _string(
+                    "プリセットの分類 同じ名前のプリセットが分類違いで重なるときに指定する"
+                ),
             }
         ),
         handler=_place_subtitles,
-        sends=_STRUCTURE,
+        sends=_WITH_LOOKS,
         writes=True,
     ),
     Operation(
