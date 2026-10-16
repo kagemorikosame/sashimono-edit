@@ -27,6 +27,7 @@ from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
 from sashimono.core.io.recovery import TrimItem
+from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     MEASURED_ONE_LAYER_MS,
@@ -789,6 +790,38 @@ class PreferencesDialog(QDialog):
             " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
         )
         form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
+        # ダッキング（#329）の既定 声を聞かせたい量と BGM の動き方の好みは人と作品で違う
+        # AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        self._duck_depth = QSpinBox(self)
+        self._duck_depth.setRange(*DUCK_DEPTH_DB_RANGE)
+        self._duck_depth.setSuffix(" dB")
+        self._duck_depth.setValue(preferences.duck_depth_db)
+        self._duck_depth.setToolTip(
+            "AI アシスタントが BGM を話している間だけ下げる（ダッキング）ときに下げる量"
+            " 6 dB でおよそ半分の大きさ、12 dB で 4 分の 1、20 dB で 10 分の 1"
+            " 声が BGM に埋もれるなら大きく、BGM が消えたように感じるなら小さくする"
+        )
+        form.addRow("BGM を声の間に下げる量", self._duck_depth)
+        self._duck_attack = QSpinBox(self)
+        self._duck_attack.setRange(*DUCK_ATTACK_MS_RANGE)
+        self._duck_attack.setSingleStep(50)
+        self._duck_attack.setSuffix(" ms")
+        self._duck_attack.setValue(preferences.duck_attack_ms)
+        self._duck_attack.setToolTip(
+            "話し始める前から BGM を下げ始め、話し始めで下がり切るまでの長さ"
+            " 短いと BGM がぶつりと切れたように聞こえ、長いと下げ始めが早く目立つ"
+        )
+        form.addRow("BGM を下げる速さ", self._duck_attack)
+        self._duck_release = QSpinBox(self)
+        self._duck_release.setRange(*DUCK_RELEASE_MS_RANGE)
+        self._duck_release.setSingleStep(100)
+        self._duck_release.setSuffix(" ms")
+        self._duck_release.setValue(preferences.duck_release_ms)
+        self._duck_release.setToolTip(
+            "話し終えてから BGM が元の大きさへ戻るまでの長さ 文と文の間がこれと下げる速さの和より"
+            "短ければ、間でも戻さずに下げたままにする 短いと文の間で BGM が出入りして落ち着かない"
+        )
+        form.addRow("BGM が戻る速さ", self._duck_release)
 
         self._scene_analysis = QComboBox(self)
         for value, text in SCENE_ANALYSIS_CHOICES:
@@ -1001,6 +1034,9 @@ class PreferencesDialog(QDialog):
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
             check_loudness_target=int(self._check_loudness.currentData()),
+            duck_depth_db=self._duck_depth.value(),
+            duck_attack_ms=self._duck_attack.value(),
+            duck_release_ms=self._duck_release.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )

@@ -16,6 +16,7 @@ from typing import Protocol
 
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
+from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
@@ -152,6 +153,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.check_loudness_target`）
 
         配信か放送かで答えが違う（-14 と -23 では 9 LU 違う） AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def duck_shape(self) -> DuckShape:
+        """BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅と速さ
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.duck_shape`）
+
+        どれだけ下げたいか・どれだけ速く戻したいかは人と作品で違う AI が引数で渡さなければこれを使う
         """
         ...
 

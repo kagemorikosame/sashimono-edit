@@ -101,6 +101,7 @@ from sashimono.core.io import (
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
+from sashimono.core.mixing import DuckShape
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -3300,6 +3301,10 @@ class MainWindow(QMainWindow):
     @property
     def loudness_target(self) -> float:
         return float(self._preferences.check_loudness_target)
+
+    @property
+    def duck_shape(self) -> DuckShape:
+        return self._preferences.duck_shape
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

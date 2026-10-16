@@ -424,7 +424,11 @@ LEDGER: tuple[Entry, ...] = (
         "設定パネル/欄の値",
         "set_param",
         "add_keyframe",
-        note="中身・エフェクト・縁取りの層の値 クリップ自身の欄は下の行（set_clip_property）",
+        "set_volume",
+        note=(
+            "中身・エフェクト・縁取りの層の値 クリップ自身の欄は下の行（set_clip_property）"
+            " 音量とパンの欄は set_volume でも変えられる（何本かまとめて dB で動かす #329）"
+        ),
     ),
     # クリップ自身の欄 SetClipProperty で変わる set_param では型が合わない（再生速度は分数）
     same("設定パネル/クリップ自身の欄/blend_mode", "set_clip_property", note="合成モード"),
@@ -556,6 +560,12 @@ AI_ONLY: dict[str, str] = {
     "set_subtitle_text": _GESTURE,
     "replace_subtitle_text": "字幕と、字幕から置いたテキストをまとめて直す 画面に同じ入口は無い",
     "ask_user": "AI から利用者へ尋ねる",
+    # 音量とミックス（#329） 人は音量の線に点を打って下げ、耳で聞いて欄の値を合わせる
+    # 声に合わせて自動で下げる・基準の音量へそろえる入口は画面に無い 人も使えるようにするかは
+    # 利用者が決める（#329 のコメント）
+    "duck_audio": "BGM を声の間だけ下げる 人は音量の線に点を打って行う 画面に同じ入口は無い",
+    "normalize_loudness": "音量を測って基準へそろえる 人は聞いて欄の値を合わせる 同じ入口は無い",
+    "place_sound": _GESTURE,
 }
 
 

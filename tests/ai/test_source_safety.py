@@ -77,6 +77,12 @@ UNDOABLE_TOOLS = frozenset(
         "replace_subtitle_text",
         "clean_subtitles",
         "transcribe",
+        # 音量とミックス（#329） 音量の欄・音量の線・置く命令だけを使う 測るのは裏の検査で
+        # ファイルへは書かない
+        "set_volume",
+        "duck_audio",
+        "normalize_loudness",
+        "place_sound",
         # 履歴
         "undo",
     }
