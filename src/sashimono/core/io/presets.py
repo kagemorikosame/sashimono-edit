@@ -302,9 +302,16 @@ def _version_of(source: GeneratedSource | None, effects: tuple[Effect, ...] = ()
 
 
 def _has_stops(effect: Effect) -> bool:
-    """色のバーで止まりを並べたエフェクトか（並びが空なら前からの色の項目で塗る）"""
+    """前の版が読むと黙って違う絵にする #364 の項目を持つエフェクトか
+
+    色のバーで止まりを並べた物（並びが空なら前からの色の項目で塗る）と、「グラデーション」で
+    既定の S 字でない混ぜ方（直線）を選んだ物 前の版は混ぜ方の項目を知らず S 字で塗る
+    """
     stops = effect.params.get("gradient")
-    return isinstance(stops, tuple) and bool(stops)
+    if isinstance(stops, tuple) and bool(stops):
+        return True
+    mixing = effect.params.get("mixing")
+    return effect.kind == "gradient" and mixing is not None and mixing != "smooth"
 
 
 def _flag(raw: object) -> bool | None:

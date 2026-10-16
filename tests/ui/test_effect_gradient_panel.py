@@ -24,6 +24,7 @@ from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.aliases import Alias
 from sashimono.core.io.presets import FORMAT_VERSION, Preset
+from sashimono.core.io.serialize import FORMAT_VERSION as PROJECT_FORMAT_VERSION
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -412,6 +413,9 @@ class TestCarriedAlong:
             # 単色の図形でも、エフェクトの並びがあれば版 3 前の版が黙って前からの色で当てる
             ((_brush(gradient=THREE),), 3),
             ((_gradient_effect(gradient=THREE),), 3),
+            # 並びが空でも直線を選んだ物は版 3 前の版は混ぜ方を知らず、黙って S 字で当てる
+            ((_gradient_effect(mixing="linear"),), 3),
+            ((_gradient_effect(mixing="smooth"),), 1),
         ],
     )
     def test_the_preset_version_follows_the_stops(
@@ -426,6 +430,21 @@ class TestCarriedAlong:
             replace(Project.create().timeline, tracks=(track,))
         )
         assert capture_preset("版", project, track, saved).to_dict()["version"] == version
+
+    def test_an_alias_with_linear_mixing_is_refused_by_the_previous_version(self) -> None:
+        # エイリアスは中身の版（プロジェクトの版 10）で書く 0.2.2 は 9 までしか読まないので、
+        # 直線の混ぜ方を黙って S 字で置くことは無い 版 9 で書くと黙って S 字に戻る
+        clip = with_fixed_items(
+            Clip(
+                timeline_start=0,
+                duration=30,
+                source=_square(),
+                effects=(_gradient_effect(mixing="linear"),),
+            ),
+            picture=True,
+        )
+        written = Alias.of("直線", clip).to_dict()
+        assert written["clip_version"] == PROJECT_FORMAT_VERSION >= 10
 
     def test_a_gradient_shape_alone_is_written_as_version_3(self) -> None:
         # 図形の塗りだけを版 1 で書くと、前の版の本体が黙って単色の図形を当てる
