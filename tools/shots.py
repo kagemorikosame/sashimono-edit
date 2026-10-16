@@ -694,6 +694,9 @@ def keep_status_bar_quiet(window: QMainWindow) -> None:
         if text:
             bar.clearMessage()
 
+    # つなぐ前に出ていた知らせも消す 編集画面は作る途中で知らせを出すことがある（前回の
+    # 画面配置を読めず既定へ戻したときなど） つないだ後の知らせだけを見ると、それが写る
+    bar.clearMessage()
     bar.messageChanged.connect(clear)
 
 
