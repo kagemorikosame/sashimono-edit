@@ -152,15 +152,21 @@ def export_chapters(project: Project, frame_range: tuple[int, int], path: Path) 
         return []
     frame = project.rate.frame_duration
     found = chapters_of(project.timeline, frame_range)
+    # 型の宣言を通して渡す PyAV 18 の宣言は time_base を Fraction、19 は AVRational と書くが、
+    # どちらも実行時は Fraction を受ける（19.0.1 の CI で読み戻しの試験が通る）
+    # 辞書のまま書くと、入る版によって mypy が片方で落ちる
     return [
-        {
-            "id": index + 1,
-            # 時刻はフレームの区切りに乗っているので、フレームの長さで割れば割り切れる
-            "start": int(chapter.start / frame),
-            "end": int(chapter.end / frame),
-            "time_base": frame,
-            "metadata": {"title": chapter.title},
-        }
+        cast(
+            "Chapter",
+            {
+                "id": index + 1,
+                # 時刻はフレームの区切りに乗っているので、フレームの長さで割れば割り切れる
+                "start": int(chapter.start / frame),
+                "end": int(chapter.end / frame),
+                "time_base": frame,
+                "metadata": {"title": chapter.title},
+            },
+        )
         for index, chapter in enumerate(found.chapters)
     ]
 
