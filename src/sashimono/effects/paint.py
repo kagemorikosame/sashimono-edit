@@ -12,6 +12,9 @@ YMM4 の「前景を塗りつぶし」「グラデーション」エフェクト
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+from sashimono.core.model import AnimatedValue, ParamValue
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.builtin import PRELUDE
 from sashimono.effects.definition import EffectDefinition, registry
@@ -19,6 +22,7 @@ from sashimono.effects.spec import (
     MAX_GRADIENT_STOPS,
     CheckSpec,
     ColorSpec,
+    GradientSpec,
     SelectSpec,
     TrackSpec,
     ValueSpec,
@@ -137,23 +141,37 @@ vec3 to_linear(vec3 c) {
 """
     + _STOP_LOOKUP
     + """
-// 色は sRGB で補間する（YMM4 と同じ） uniform の色はリニアで届くので先に戻す
+// 色のバーで並べた止まり（#364） 数が 2 より少なければ前からの「色 1」「位置 1」… で塗る
+// 色は sRGB のまま届く（混ぜるのも sRGB なので、リニアへ往復させない）
+uniform int gradient_count;
+uniform vec4 gradient_colors[MAX_STOPS];
+uniform float gradient_offsets[MAX_STOPS];
+
+// 単色の模様はバーを使わず「色 1」で塗る（設定パネルも単色ではバーを出さず色の欄を出す）
+bool from_bar() { return gradient_count >= 2 && pattern != 0; }
+int stop_count() {
+    return from_bar() ? min(gradient_count, MAX_STOPS) : clamp(stops, 1, MAX_STOPS);
+}
+float stop_at(int i) { return from_bar() ? gradient_offsets[i] : stop_offset(i); }
+vec4 stop_srgb(int i) {
+    if (from_bar()) return gradient_colors[i];
+    vec4 c = stop_color(i);
+    return vec4(to_srgb(c.rgb), c.a);
+}
+
+// 色は sRGB で補間する（YMM4 と同じ） 前からの項目の色はリニアで届くので先に戻す
 vec4 ramp(float t) {
-    int count = clamp(stops, 1, MAX_STOPS);
-    vec4 first = stop_color(0);
-    if (count == 1 || t <= stop_offset(0)) return vec4(to_srgb(first.rgb), first.a);
+    int count = stop_count();
+    if (count == 1 || t <= stop_at(0)) return stop_srgb(0);
     for (int i = 1; i < count; ++i) {
-        float right = stop_offset(i);
+        float right = stop_at(i);
         if (t <= right) {
-            float left = stop_offset(i - 1);
+            float left = stop_at(i - 1);
             float k = right > left ? (t - left) / (right - left) : 1.0;
-            vec4 a = stop_color(i - 1);
-            vec4 b = stop_color(i);
-            return mix(vec4(to_srgb(a.rgb), a.a), vec4(to_srgb(b.rgb), b.a), clamp(k, 0.0, 1.0));
+            return mix(stop_srgb(i - 1), stop_srgb(i), clamp(k, 0.0, 1.0));
         }
     }
-    vec4 last = stop_color(count - 1);
-    return vec4(to_srgb(last.rgb), last.a);
+    return stop_srgb(count - 1);
 }
 
 float extended(float t) {
@@ -438,6 +456,70 @@ def _stop_parameters() -> tuple[ColorSpec | TrackSpec, ...]:
     return tuple(specs)
 
 
+#: 前からの色の数・色・位置の欄（YMM4 の読み込みが書く形）
+_STOP_COUNT = ValueSpec("stops", "色の数", 2, minimum=1, maximum=MAX_STOPS)
+_STOP_FIELDS = _stop_parameters()
+_STOP_COLOURS = tuple(spec for spec in _STOP_FIELDS if isinstance(spec, ColorSpec))
+_STOP_OFFSETS = tuple(spec for spec in _STOP_FIELDS if isinstance(spec, TrackSpec))
+_LEGACY_NAMES = frozenset({_STOP_COUNT.name, *(spec.name for spec in _STOP_FIELDS)})
+
+
+def _legacy_count(params: Mapping[str, ParamValue]) -> int:
+    return _STOP_COUNT.coerce(params.get(_STOP_COUNT.name))
+
+
+def _legacy_stops(params: Mapping[str, ParamValue]) -> tuple[float, ...]:
+    """前からの「色 1」「位置 1」… を止まりの並びにする（#364 設定パネルのバーに見せる）
+
+    位置はキーフレームの無い値（動く位置はバーに出さず、前からの欄で見せる :func:`_paint_unused`）
+    色が 1 つ（単色の形）なら同じ色を両端に置く バーは 2 つより少ない止まりを持てない
+    """
+    count = _legacy_count(params)
+    stops: list[tuple[float, tuple[float, float, float, float]]] = []
+    for index in range(count):
+        colour_spec, offset_spec = _STOP_COLOURS[index], _STOP_OFFSETS[index]
+        red, green, blue, alpha = colour_spec.coerce(params.get(colour_spec.name))
+        offset = offset_spec.coerce(params.get(offset_spec.name)).static
+        stops.append((offset, (red, green, blue, alpha)))
+    if count == 1:
+        stops = [(0.0, stops[0][1]), (1.0, stops[0][1])]
+    return _STOPS.coerce(GradientSpec.pack(stops))
+
+
+def _moving_offsets(params: Mapping[str, ParamValue]) -> bool:
+    """前からの位置のどれかがキーフレームで動くか"""
+    count = _legacy_count(params)
+    for spec in _STOP_OFFSETS[:count]:
+        value = params.get(spec.name)
+        if isinstance(value, AnimatedValue) and value.is_animated:
+            return True
+    return False
+
+
+def _paint_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """「模様で塗る」の欄で出さない項目（#364）
+
+    色の止まりはバー 1 つで見せ、前からの 33 の欄（色の数・色 1・位置 1 …）を隠す 単色の模様は
+    バーではなく「色 1」の欄だけを出す（描く所も単色は色 1 で塗る）
+    前からの位置がキーフレームで動くときは、バーに出すと動きを見せられず、触ると動きが
+    消えるので、前からの欄（使っている色の数のぶん）を出してバーを隠す
+    """
+    if params.get("pattern", "linear") == "solid":
+        return (_LEGACY_NAMES - {"color0"}) | {_STOPS.name}
+    if not _STOPS.coerce(params.get(_STOPS.name)) and _moving_offsets(params):
+        count = _legacy_count(params)
+        used = {_STOP_COUNT.name}
+        used |= {spec.name for spec in _STOP_COLOURS[:count]}
+        used |= {spec.name for spec in _STOP_OFFSETS[:count]}
+        return (_LEGACY_NAMES - used) | {_STOPS.name}
+    return _LEGACY_NAMES
+
+
+#: 色のバーで並べる止まり（#364） 空の間は前からの「色 1」「位置 1」… で塗る（YMM4 の
+#: 読み込みと前の版の作品はどれもこの形で、値も絵も前のまま） バーで触った時から並びで塗る
+_STOPS = GradientSpec("gradient", "色", default=(), legacy=_legacy_stops)
+
+
 def register_paint_effects() -> None:
     registry.register(
         EffectDefinition(
@@ -457,8 +539,9 @@ def register_paint_effects() -> None:
                 ColorSpec("keep_color", "目印と一緒に描いた線の色", (0.0, 0.0, 0.0, 0.0)),
                 # 模様を塗らずにノイズの値で薄める（YMM4 の NoiseEffect）
                 SelectSpec("noise_mask", "ノイズで薄める", _NOISE_MASKS, "off"),
-                ValueSpec("stops", "色の数", 2, minimum=1, maximum=MAX_STOPS),
-                *_stop_parameters(),
+                _STOPS,
+                _STOP_COUNT,
+                *_STOP_FIELDS,
                 SelectSpec("extend", "端の扱い", _EXTEND, "clamp"),
                 TrackSpec("center_x", "中心 X", -8000, 8000, 0, step=1, unit="px"),
                 TrackSpec("center_y", "中心 Y（下が正）", -8000, 8000, 0, step=1, unit="px"),
@@ -501,5 +584,6 @@ def register_paint_effects() -> None:
                 TrackSpec("speed_z", "奥行きの速さ", -1000, 1000, 0, step=0.01, unit="/秒"),
             ),
             fragment_shader=_PAINT,
+            unused=_paint_unused,
         )
     )

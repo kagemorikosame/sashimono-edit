@@ -752,6 +752,11 @@ def _describe_spec(spec: object) -> dict[str, Any]:
             "[位置, R, G, B, A, 位置, R, G, B, A, ...] の平らな並び（どれも 0..1 sRGB）"
             f" 止まりは {MIN_GRADIENT_STOPS}〜{MAX_GRADIENT_STOPS} 個"
         )
+        if spec.legacy is not None:
+            # エフェクトの並び（#364）は空が既定 空の意味を書かないと、AI が空を「色が無い」と読む
+            described["format"] += (
+                " 空の並び [] なら前からの色の項目（開始色・終了色、色 1 …）で塗る"
+            )
     else:
         described["type"] = type(spec).__name__.replace("Spec", "").lower()
     return described

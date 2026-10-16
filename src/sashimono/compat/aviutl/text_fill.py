@@ -74,6 +74,10 @@ def text_gradient_fill(effect: Effect, source: GeneratedSource) -> dict[str, Par
     params = effect.params
     if params.get("shape", "linear") != "linear" or params.get("blend", "normal") != "normal":
         return None
+    if params.get("gradient") or params.get("mixing", "smooth") != "smooth":
+        # バーで止まりを並べた物（#364）は開始色と終了色を読まない 2 色として写すと別の色になる
+        # 直線で混ぜる物は、S 字で刻んで写すと別の絵になる
+        return None
     numbers = {
         name: _static(params.get(name), default)
         for name, default in (
