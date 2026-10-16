@@ -680,11 +680,32 @@ def menu_picture(menu: QMenu) -> QImage:
     return picture
 
 
+def keep_status_bar_quiet(window: QMainWindow) -> None:
+    """ステータスバーの一時の知らせを、出たそばから消す
+
+    知らせは数秒で消える 素材の控えと解析が終わった知らせ（「控えと解析が終わった」）は
+    裏の仕事が終わった時に出るので、撮る時に出ているかどうかが撮るたびに変わり、
+    同じ画面でも違う絵になった（タイムラインの吸い付きの写真 edit-snap の下の帯に、出たり
+    出なかったりした） 写真で見せたい物ではないので、どの知らせも写さない
+    """
+    bar = window.statusBar()
+
+    def clear(text: str) -> None:
+        if text:
+            bar.clearMessage()
+
+    # つなぐ前に出ていた知らせも消す 編集画面は作る途中で知らせを出すことがある（前回の
+    # 画面配置を読めず既定へ戻したときなど） つないだ後の知らせだけを見ると、それが写る
+    bar.clearMessage()
+    bar.messageChanged.connect(clear)
+
+
 @contextmanager
 def editor(project: Project | None = None) -> Iterator[MainWindow]:
     """編集画面を出す 撮り終わったら必ず閉じる"""
     window = MainWindow(project, confirm_unsaved=False)
     hide_from_screen(window)
+    keep_status_bar_quiet(window)
     # 窓を閉じるたびに画面配置が保存され、次の 1 枚がそれを引き継ぐ 直前に撮った
     # 写真でどのパネルが前に出ていたかによって絵が変わるので、毎回既定へ戻す
     window.reset_layout()
@@ -890,6 +911,11 @@ SAMPLE_CHAT: tuple[tuple[str | None, str], ...] = (
 )
 
 
+#: AI の写真のタイムラインの高さ（論理画素） 素材とテロップの 3 段が入り、会話の欄に
+#: 見本の会話が全部入る高さ
+AI_TIMELINE_HEIGHT = 265
+
+
 def shot_ai(context: Context) -> QImage:
     """AI パネル 見本の会話を見せる **本物のセッションは走らせない**"""
     from sashimono.ui.chat import ChatPanel
@@ -916,6 +942,12 @@ def shot_ai(context: Context) -> QImage:
         if panel is None:
             raise ShotError("AI パネルが無い")
         _fake_conversation(panel)
+        # タイムラインを少し縮めて会話の欄を高くする AI のパネルに状態の行（待機中）が
+        # 足されてから、既定の高さでは頼んだ文（あなた）が上に送られて写らなくなった
+        # 何を頼んだらどう動いたのかが、この 1 枚の要点
+        timeline = window.findChild(QDockWidget, "timeline")
+        if timeline is not None:
+            window.resizeDocks([timeline], [AI_TIMELINE_HEIGHT], Qt.Orientation.Vertical)
         settle(window)
         return take_editor_shot(window)
 
