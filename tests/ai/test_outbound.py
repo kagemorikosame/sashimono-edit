@@ -11,7 +11,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -161,14 +161,7 @@ class TestDeclarations:
                 # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
                 result = str(exc)
             checked += 1
-            if isinstance(result, ImageResult):
-                assert Outbound.FRAMES in operation.sends, operation.name
-                continue
-            text = json.dumps(result, ensure_ascii=False, default=str)
-            if any(secret in text for secret in secrets):
-                assert Outbound.FILES in operation.sends, operation.name
-            if any(sentence in text for sentence in texts):
-                assert Outbound.TEXT in operation.sends, operation.name
+            assert not undeclared(operation, result, sentences=texts, places=secrets)
         assert checked >= 10
 
     def test_every_reading_tool_that_needs_arguments_has_an_example(self) -> None:
@@ -301,16 +294,38 @@ class TestWritingToolsDeclareWhatTheyReturn:
             result: object = operation(host, arguments)
         except (ToolError, ValueError, KeyError) as exc:
             result = str(exc)
-        text = json.dumps(result, ensure_ascii=False, default=str)
         sentences = {ARG_TEXT, BODY_TEXT[:12]} | {s.text for s in transcript.segments}
-        if any(sentence in text for sentence in sentences):
-            assert Outbound.TEXT in operation.sends, f"{name}: {text}"
         places = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name, SECRET_PATH.stem}
-        if any(place in text for place in places):
-            assert Outbound.FILES in operation.sends, f"{name}: {text}"
-        if LOOK_NAME in text:
-            # 保存したプリセットとエイリアスの名前は本人の持ち物 アプリの設定として送ると書く
-            assert Outbound.APP_SETTINGS in operation.sends, f"{name}: {text}"
+        assert not undeclared(operation, result, sentences=sentences, places=places)
+
+
+def undeclared(
+    operation: Operation,
+    result: object,
+    *,
+    sentences: Iterable[str] = (),
+    places: Iterable[str] = (),
+) -> list[str]:
+    """道具の結果（か断りの文）に載っているのに、送る物に書いていない物
+
+    場所は、渡した名前のほかに、ファイルの場所の形（ドライブ名・POSIX など 伏せ字の処理が
+    場所と見なす物）でも見る 渡した名前だけで見ると、試験の作品の外へ書いた場所（一時
+    フォルダなど）を返す道具を見逃す（試験用の write_note がそうだった CodeRabbit の指摘 #366）
+    試験の中だけで作る道具も、この関数で宣言を確かめる
+    """
+    if isinstance(result, ImageResult):
+        return [] if Outbound.FRAMES in operation.sends else [f"{operation.name}: 絵"]
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    missing: list[str] = []
+    if any(sentence in text for sentence in sentences) and Outbound.TEXT not in operation.sends:
+        missing.append(f"{operation.name}: 字幕と文字 {text[:200]}")
+    has_place = any(place in text for place in places) or redact(result, []) != result
+    if has_place and Outbound.FILES not in operation.sends:
+        missing.append(f"{operation.name}: 名前と場所 {text[:200]}")
+    if LOOK_NAME in text and Outbound.APP_SETTINGS not in operation.sends:
+        # 保存したプリセットとエイリアスの名前は本人の持ち物 アプリの設定として送ると書く
+        missing.append(f"{operation.name}: アプリの設定 {text[:200]}")
+    return missing
 
 
 # --- 送る前に尋ねる ---

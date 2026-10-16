@@ -33,8 +33,9 @@ from sashimono.ai.operations import OPERATIONS, Operation, find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Consent, Safety, check_writable, writable_path
 from sashimono.core.model import MediaItem, Transcript
-from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
+from tests.ai.test_outbound import undeclared
 
 # --- 試験のための最小の取り消せない道具 ---
 
@@ -60,7 +61,8 @@ WRITE_NOTE = Operation(
     writes=True,
     irreversible=True,
     consent=_note_consent,
-    sends=frozenset({Outbound.PROJECT}),
+    # 書いた場所を返す 作品のフォルダの場所なので名前と場所を送る物に書く（CodeRabbit の指摘 #366）
+    sends=frozenset({Outbound.PROJECT, Outbound.FILES}),
 )
 
 
@@ -387,11 +389,23 @@ class TestWritablePlaces:
 
 
 class TestIrreversibleIsAlwaysConfirmed:
+    """確かめの二段を見る 送る物の確かめ（#342）は tests/ai/test_outbound.py が見るので、
+    ここのブリッジは送る物を許してある（allow_sending）
+    """
+
+    def test_the_test_tool_declares_what_it_returns(self, saved: FakeHost) -> None:
+        # 壊れると、試験用の道具の宣言が結果と食い違ったまま、確かめの試験が
+        # 名前と場所の確かめを通らない道で走り、本物の道具と違う道筋を見る
+        assert saved.saved_at is not None
+        target = saved.saved_at.parent / "メモ.txt"
+        result = WRITE_NOTE(saved, {"path": str(target), "text": "済"})
+        assert not undeclared(WRITE_NOTE, result)
+
     def test_auto_approve_does_not_skip_it(self, saved: FakeHost) -> None:
         # 壊れると、「変更を自動で承認」を入れた人の作品を、AI が黙って上書きする
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "メモ.txt"
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target), "text": "済"})
         seen = answer_approvals(bridge, done, lambda _approval: True)
 
@@ -404,7 +418,7 @@ class TestIrreversibleIsAlwaysConfirmed:
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "メモ.txt"
         target.write_text("前の中身", encoding="utf-8")
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         done, _box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target)})
         seen = answer_approvals(bridge, done, lambda _approval: False)
 
@@ -420,7 +434,7 @@ class TestIrreversibleIsAlwaysConfirmed:
     def test_allowing_it_always_is_not_remembered(self, saved: FakeHost) -> None:
         # 壊れると、1 度「以降は確認しない」を押した上書きが、次から黙って走る
         assert saved.saved_at is not None
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         bridge.allow_always("write_note")
         for text in ("1 回目", "2 回目"):
             done, _box = call_in_thread(
@@ -444,7 +458,7 @@ class TestIrreversibleIsAlwaysConfirmed:
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "メモ.txt"
         target.write_text("前の中身", encoding="utf-8")
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target), "text": "新"})
         answer_approvals(bridge, done, lambda _approval: False)
 
@@ -456,7 +470,7 @@ class TestIrreversibleIsAlwaysConfirmed:
         self, saved: FakeHost, tmp_path: Path
     ) -> None:
         # 壊れると、書けない場所なのに窓が出て、人が許しても何も起きない（または外へ書く）
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         target = tmp_path / "外.txt"
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target)})
         seen = answer_approvals(bridge, done, lambda _approval: True)
@@ -481,7 +495,7 @@ class TestIrreversibleIsAlwaysConfirmed:
             probe.unlink()
         else:
             probe.rmdir()
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(inside / "メモ.txt")})
 
         def swap_then_allow(_approval: Approval) -> bool:
@@ -508,7 +522,7 @@ class TestIrreversibleIsAlwaysConfirmed:
         target = folder / "メモ.txt"
         # 作れるかを先に試す 確かめに答える途中で飛ばすと、AI 役のスレッドが残る
         _hard_link(tmp_path / "試し", original)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, WRITE_NOTE, {"path": str(target), "text": "壊す"})
 
         def link_then_allow(_approval: Approval) -> bool:
@@ -533,7 +547,7 @@ class TestIrreversibleIsAlwaysConfirmed:
     def test_an_interrupt_while_asking_folds_it(self, saved: FakeHost) -> None:
         # 壊れると、中断を押しても AI のスレッドが確かめの返事を 10 分待ち続ける
         assert saved.saved_at is not None
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         done, box = call_in_thread(
             bridge, WRITE_NOTE, {"path": str(saved.saved_at.parent / "メモ.txt")}
         )
