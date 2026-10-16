@@ -21,6 +21,7 @@ from sashimono.core.io.atomic import Expected
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
+from sashimono.engine.checks import CheckRequest, CheckState
 
 __all__ = ["EXPORT_RUNNING", "EXPORT_STATES", "EditorHost", "ExportRequest", "ToolError"]
 
@@ -169,6 +170,34 @@ class EditorHost(Protocol):
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
+        ...
+
+    @property
+    def loudness_target(self) -> float:
+        """完成物の検査で比べる音量の基準（LUFS）の既定（#337）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.check_loudness_target`）
+
+        配信か放送かで答えが違う（-14 と -23 では 9 LU 違う） AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    def request_check(self, request: CheckRequest) -> None:
+        """完成物の検査を裏で始める（#337） 同じ頼みが走っているか終わっていれば何もしない
+
+        止めた物・失敗した物は、同じ頼みでも調べ直す
+        """
+        ...
+
+    def check_state(self) -> CheckState:
+        """完成物の検査の今 拾った所までの結果と、走っているか・失敗の理由"""
+        ...
+
+    def check_waiter(self) -> Callable[[float], bool]:
+        """今の検査が終わるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
+
+        返す関数は**AI のスレッドから呼ばれる**（:class:`~sashimono.ai.operations.Pending`）
+        画面のスレッドで待つと、待つ間は画面が固まる
+        """
         ...
 
     def request_scenes(self, media: MediaItem) -> None:

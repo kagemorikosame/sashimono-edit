@@ -125,6 +125,7 @@ from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
+from sashimono.engine.checks import CheckJob, CheckRequest, CheckState
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
@@ -649,6 +650,15 @@ class MainWindow(QMainWindow):
             stop.clicked.connect(self._assistant_export.cancel)
         self._assistant_export.changed.connect(self._show_assistant_export)
         self.statusBar().addPermanentWidget(self._assistant_export_indicator)
+        # AI の完成物の検査（#337）は長い作品で数分かかる 裏で走っていると分かるように出し、
+        # 人がその場で止められるようにする
+        self._checks = CheckJob(self)
+        self._check_indicator = ProgressIndicator(self, cancel_text="止める")
+        stop = self._check_indicator.cancel_button
+        if stop is not None:
+            stop.clicked.connect(self._checks.stop)
+        self._checks.changed.connect(self._show_check_progress)
+        self.statusBar().addPermanentWidget(self._check_indicator)
         # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
         # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
         self._updates = UpdateController(
@@ -3327,6 +3337,36 @@ class MainWindow(QMainWindow):
         return self._subtitles.transcription_status()
 
     @property
+    def loudness_target(self) -> float:
+        return float(self._preferences.check_loudness_target)
+
+    def request_check(self, request: CheckRequest) -> None:
+        """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""
+        self._checks.start(
+            request,
+            decode_threads=self._preferences.decode_threads,
+            smooth_history=self._preferences.smooth_audio_motion,
+        )
+
+    def check_state(self) -> CheckState:
+        return self._checks.state()
+
+    def check_waiter(self) -> Callable[[float], bool]:
+        return self._checks.waiter()
+
+    def _show_check_progress(self) -> None:
+        """検査の進み具合をステータスバーへ 終わったら隠す"""
+        state = self._checks.state()
+        if not state.running:
+            self._check_indicator.hide()
+            return
+        self._check_indicator.show_progress(
+            f"仕上がりを調べている {round(state.progress * 100)}%",
+            state.progress,
+            tooltip="AI アシスタントが黒いコマ・無音・音割れ・音量・字幕のはみ出しを調べている",
+        )
+
+    @property
     def project_path(self) -> Path | None:
         return self._path
 
@@ -3544,6 +3584,8 @@ class MainWindow(QMainWindow):
         if self._ai_renderer is not None:
             self._ai_renderer.close()
             self._ai_renderer = None
+        # 検査の走り係は自分のレンダラとコンテキストを持つ 止まるまで待ってから窓を壊す
+        self._checks.close()
         self._analyzer.close()
         self._proxies.close()
         self._preview.shutdown()

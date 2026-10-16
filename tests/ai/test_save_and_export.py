@@ -98,6 +98,25 @@ def _run(
 # --- 区分 ---
 
 
+class TestTheCheckCanReadWhatWasExported:
+    def test_the_places_to_write_and_to_check_are_the_same(
+        self, saved: FakeHost, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が書き出した動画を、仕上がりの検査（check_output #337）が場所の外と
+        # 断るか、書けない場所の動画まで調べられる（書ける場所と調べられる場所が食い違う）
+        assert saved.saved_at is not None
+        exported = saved.saved_at.parent / "完成.mp4"
+        exported.write_bytes(b"video")
+        assert safety.readable_output(saved, str(exported)) == safety.writable_path(
+            saved, str(exported)
+        )
+        outside = tmp_path / "外.mp4"
+        outside.write_bytes(b"video")
+        for check in (safety.readable_output, safety.writable_path):
+            with pytest.raises(ToolError, match="外"):
+                check(saved, str(outside))
+
+
 class TestKinds:
     def test_save_save_as_and_export_are_irreversible(self) -> None:
         # 壊れると、保存や書き出しが「取り消せる編集」と扱われ、自動で承認の人の作品を
