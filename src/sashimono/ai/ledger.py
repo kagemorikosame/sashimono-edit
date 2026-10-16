@@ -542,6 +542,9 @@ AI_ONLY: dict[str, str] = {
     "preview_frame": READING,
     "contact_sheet": READING,
     "preview_range": READING,
+    # 完成物の検査（#337） 人は再生して目と耳で確かめる 画面に同じ入口は無い
+    # ステータスバーの〔止める〕は走っている検査を止めるだけで、検査を始める操作ではない
+    "check_output": READING,
     # 場面の切り替わり（#319） 人は再生して目で見つける物を、フレーム間の差の一覧で読む
     # 読むだけ（Safety.READ_ONLY）で、画面のメニュー・右クリック・ボタンに同じ入口は無い
     "detect_scenes": READING,

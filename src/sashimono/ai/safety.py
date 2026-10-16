@@ -28,7 +28,15 @@ from pathlib import Path
 
 from sashimono.ai.host import EditorHost, ToolError
 
-__all__ = ["Consent", "Safety", "check_writable", "writable_path", "write_roots"]
+__all__ = [
+    "Consent",
+    "Safety",
+    "check_readable",
+    "check_writable",
+    "readable_output",
+    "writable_path",
+    "write_roots",
+]
 
 
 class Safety(StrEnum):
@@ -154,6 +162,47 @@ def check_writable(
         # フォルダは作らない 作れるようにすると、書ける場所の中へ AI が好きな形の
         # フォルダを増やせる 人が知らない置き場が残る
         raise ToolError(f"フォルダがありません: {resolved.parent}")
+    return resolved
+
+
+def readable_output(host: EditorHost, raw: object) -> Path:
+    """AI が調べたい書き出した動画の場所を確かめ、解決した場所を返す 読めなければ断る（#337）
+
+    読むだけでも、場所は書ける所（作品のフォルダと、書き出しの窓で前に選んだフォルダ）に
+    限る 書き出した物はそこにある どこでも読めるようにすると、作品と関係の無い動画の
+    中身（長さや音の大きさ）まで AI へ渡ることになる
+    """
+    return check_readable(raw, project_path=host.project_path, export_folder=host.export_folder)
+
+
+def check_readable(raw: object, *, project_path: Path | None, export_folder: Path | None) -> Path:
+    """:func:`readable_output` の中身 ホストを持たない試験からも呼べるように分けてある"""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("path（調べる動画の場所）を文字で渡してください")
+    roots = write_roots(project_path, export_folder)
+    if not roots:
+        raise ToolError(
+            "調べられる場所がありません 書き出した動画を調べられるのは、作品のフォルダと"
+            "書き出しの窓で選んだフォルダの中だけです path を省くと今のタイムラインを調べます"
+        )
+    candidate = Path(raw.strip())
+    if any(":" in part for part in candidate.parts[1 if candidate.anchor else 0 :]):
+        raise ToolError(f"名前に「:」を含む場所は読めません: {raw}")
+    if ".." in candidate.parts:
+        raise ToolError(f"「..」を含む場所は読めません 場所をそのまま渡してください: {raw}")
+    if not candidate.is_absolute():
+        if project_path is None:
+            raise ToolError(
+                "作品をまだ保存していないので、相対の場所は使えません 絶対の場所を渡してください"
+            )
+        candidate = project_path.parent / candidate
+    resolved = candidate.resolve()
+    allowed = [root.resolve() for root in roots]
+    if not any(_inside(resolved, root) for root in allowed):
+        places = " / ".join(str(root) for root in allowed)
+        raise ToolError(f"{resolved} は調べられる場所の外です 調べられるのは {places} の中だけです")
+    if not resolved.is_file():
+        raise ToolError(f"ファイルがありません: {resolved}")
     return resolved
 
 
