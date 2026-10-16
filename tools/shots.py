@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -85,6 +86,7 @@ from sashimono.compat.catalog import (
     place,
     restyle,
 )
+from sashimono.compat.subtitle_looks import default_choice
 from sashimono.core.commands import (
     AddEffect,
     Command,
@@ -122,6 +124,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import AUTO_QUALITY_TEXT, PreferencesDialog
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.subtitle.dialogs import BurnAnswer, BurnRequest
 from sashimono.ui.template_dialog import TemplateDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 
@@ -1104,7 +1107,7 @@ def _item_for(tree: QTreeWidget, entry: TemplateEntry | None) -> QTreeWidgetItem
             continue
         for child_index in range(group.childCount()):
             item = group.child(child_index)
-            if item.data(0, Qt.ItemDataRole.UserRole) == entry:
+            if item is not None and item.data(0, Qt.ItemDataRole.UserRole) == entry:
                 return item
     return None
 
@@ -1164,8 +1167,8 @@ def _full_preferences() -> PreferencesDialog:
     dialog = PreferencesDialog(Preferences())
     hide_work_folder(dialog)
     area = dialog.findChild(QScrollArea)
-    if area is not None and area.widget() is not None:
-        body = area.widget()
+    body = area.widget() if area is not None else None
+    if body is not None:
         dialog.resize(dialog.width(), body.sizeHint().height() + 64)
     return dialog
 
@@ -1380,12 +1383,21 @@ def wiki_subtitle_output(context: Context) -> QImage:
         return with_menu(window, "字幕", ["焼き込み", "書き出し…"])
 
 
+def burn_everyone(request: BurnRequest) -> BurnAnswer:
+    """焼き込みの窓の代わりの答え 全部の話し手を、既定の見た目で焼き込む
+
+    手順書は窓で何も変えずに〔焼き込む〕を押した所を見せる 窓の形（#353 で見た目を
+    選ぶ窓になった）が変わったら、ここも字幕パネルの ``ask_burn`` の形に合わせる
+    """
+    return BurnAnswer(voices=[voice for voice, _label in request.voices], look=default_choice())
+
+
 def wiki_subtitle_burned(context: Context) -> QImage:
     """焼き込んだあと 字幕がテキストのクリップとして並ぶ"""
     with editor(sample_project()) as window:
         panel = _with_transcript(window, context)
-        # 窓で選ぶ所は全部の話し手のまま進める 窓を開くと撮影がそこで止まる
-        panel.ask_burn = lambda voices, _note: [voice for voice, _ in voices]
+        # 窓で選ぶ所は、全部の話し手と既定の見た目のまま進める 窓を開くと撮影がそこで止まる
+        panel.ask_burn = burn_everyone
         panel.burn()
         # 2 枚目の字幕の途中で止める 字幕と字幕の間で止めると、焼き込んだ字幕が画面に出ない
         window.seek(130)
@@ -1805,10 +1817,11 @@ def _scroll_inspector_to(window: MainWindow, widget: QWidget, above: int = 8) ->
     """
     inspector = window.findChild(InspectorPanel)
     area = inspector.findChild(QScrollArea) if inspector is not None else None
-    if area is None or area.widget() is None:
+    body = area.widget() if area is not None else None
+    if area is None or body is None:
         raise ShotError("設定パネルが無い")
     settle(window, rounds=4)
-    top = widget.mapTo(area.widget(), QPoint(0, 0)).y()
+    top = widget.mapTo(body, QPoint(0, 0)).y()
     area.verticalScrollBar().setValue(max(0, top - above))
     settle(window, rounds=4)
 
@@ -2322,6 +2335,14 @@ def run(shots: Sequence[Shot], context: Context, output: Path, wiki: Path | None
             continue
         except (ShotError, ToolError, OSError, ValueError, KeyError) as exc:
             print(f"失敗 {shot.name}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        except Exception:
+            # 本体の形が変わって撮り方が古くなった（#353 で焼き込みの窓の答えの形が変わり、
+            # 手順書の 1 枚が TypeError で落ちた）ときに、ここで全体を止めると後ろの写真が
+            # 1 枚も撮れない 中身が分かるよう呼び出しの跡を出し、終了コードは失敗にする
+            print(f"失敗 {shot.name}: 撮る道具の不具合", file=sys.stderr)
+            traceback.print_exc()
             failures += 1
             continue
         path = folder / f"{shot.name}.png"

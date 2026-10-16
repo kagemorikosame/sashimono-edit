@@ -56,7 +56,7 @@ CPU の取り合いで落ちることがある 同じワーカーにまとめた
 ```
 .venv\Scripts\python.exe -m ruff format src tests tools
 .venv\Scripts\python.exe -m ruff check --fix src tests tools
-.venv\Scripts\python.exe -m mypy src tests
+.venv\Scripts\python.exe -m mypy src tests tools
 .venv\Scripts\python.exe -m pytest -q
 ```
 
