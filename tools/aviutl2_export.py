@@ -134,9 +134,9 @@ def find_aviutl2(
         return (path, []) if path.is_file() else (None, [f"{ENVIRONMENT_KEY}={named}"])
     command = (association or association_command)()
     if command:
-        path = exe_from_command(command)
-        if path is not None and path.is_file():
-            return path, []
+        found = exe_from_command(command)
+        if found is not None and found.is_file():
+            return found, []
         return None, [f".aup2 の関連付け {command}"]
     return None, [".aup2 の関連付け（登録なし）"]
 

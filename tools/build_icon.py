@@ -45,7 +45,7 @@ def as_png(image: QImage) -> bytes:
     buffer = QBuffer()
     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
     QImageWriter(buffer, b"PNG").write(image)
-    return bytes(buffer.data())
+    return bytes(buffer.data().data())
 
 
 def build_ico(source: Path, target: Path, sizes: tuple[int, ...] = ICO_SIZES) -> None:

@@ -862,7 +862,11 @@ def command_measure(work: Path) -> int:
             theirs = np.asarray(reference)[..., :3]
             pictures[f"{name}_aviutl"] = theirs
             pictures[f"{name}_sashimono"] = ours
-            row = {"name": name, "aviutl": describe(theirs), "sashimono": describe(ours)}
+            row: dict[str, object] = {
+                "name": name,
+                "aviutl": describe(theirs),
+                "sashimono": describe(ours),
+            }
             rows.append(row)
             print(name)
             print(f"  AviUtl2   {row['aviutl']}")
@@ -871,7 +875,10 @@ def command_measure(work: Path) -> int:
         if renderer is not None:
             renderer.close()
     (work / "measure.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1), "utf-8")
-    np.savez_compressed(work / "measure.npz", **pictures)
+    # 絵の名前はどれも `<ケース>_aviutl` の形で、savez の引数（allow_pickle）とは重ならない
+    # 型の上では重なりうるので、名前と絵の組として渡す
+    arrays: dict[str, Any] = dict(pictures)
+    np.savez_compressed(work / "measure.npz", **arrays)
     for line in report.lines():
         print(f"  記録: {line}")
     return 0

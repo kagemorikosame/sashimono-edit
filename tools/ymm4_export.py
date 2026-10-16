@@ -157,9 +157,9 @@ def find_ymm4(
     looked: list[str] = []
     command = (association or association_command)()
     if command:
-        path = exe_from_command(command)
-        if path is not None and path.is_file():
-            return path, []
+        found = exe_from_command(command)
+        if found is not None and found.is_file():
+            return found, []
         looked.append(f".ymmp の関連付け {command}")
     else:
         looked.append(".ymmp の関連付け（登録なし）")

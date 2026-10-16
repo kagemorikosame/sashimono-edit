@@ -1107,7 +1107,7 @@ def _item_for(tree: QTreeWidget, entry: TemplateEntry | None) -> QTreeWidgetItem
             continue
         for child_index in range(group.childCount()):
             item = group.child(child_index)
-            if item.data(0, Qt.ItemDataRole.UserRole) == entry:
+            if item is not None and item.data(0, Qt.ItemDataRole.UserRole) == entry:
                 return item
     return None
 
@@ -1167,8 +1167,8 @@ def _full_preferences() -> PreferencesDialog:
     dialog = PreferencesDialog(Preferences())
     hide_work_folder(dialog)
     area = dialog.findChild(QScrollArea)
-    if area is not None and area.widget() is not None:
-        body = area.widget()
+    body = area.widget() if area is not None else None
+    if body is not None:
         dialog.resize(dialog.width(), body.sizeHint().height() + 64)
     return dialog
 
@@ -1817,10 +1817,11 @@ def _scroll_inspector_to(window: MainWindow, widget: QWidget, above: int = 8) ->
     """
     inspector = window.findChild(InspectorPanel)
     area = inspector.findChild(QScrollArea) if inspector is not None else None
-    if area is None or area.widget() is None:
+    body = area.widget() if area is not None else None
+    if area is None or body is None:
         raise ShotError("設定パネルが無い")
     settle(window, rounds=4)
-    top = widget.mapTo(area.widget(), QPoint(0, 0)).y()
+    top = widget.mapTo(body, QPoint(0, 0)).y()
     area.verticalScrollBar().setValue(max(0, top - above))
     settle(window, rounds=4)
 
