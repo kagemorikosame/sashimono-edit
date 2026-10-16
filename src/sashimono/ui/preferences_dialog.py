@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
+from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
 from sashimono.engine.cache.proxy import (
@@ -823,6 +824,29 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("BGM が戻る速さ", self._duck_release)
 
+        # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
+        # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
+        self._ai_sends: dict[Outbound, QComboBox] = {}
+        current = preferences.send_choices()
+        for kind in ASKED:
+            send_box = QComboBox(self)
+            for choice in SendChoice:
+                send_box.addItem(choice.label, choice.value)
+            send_box.setCurrentIndex(max(0, send_box.findData(current[kind].value)))
+            send_box.setToolTip(f"{kind.detail}\n送り先: {DESTINATION}")
+            self._ai_sends[kind] = send_box
+            form.addRow(f"AI へ送る物: {kind.label}", send_box)
+        always = "・".join(kind.label for kind in Outbound if not kind.asked)
+        sends_note = QLabel(
+            f"AI アシスタントは、道具の結果を {DESTINATION} へ送る"
+            f" {always}は、AI に編集を頼むといつも送る"
+            " 上の 3 つは、初めて送るときに尋ねる（「送る前に尋ねる」）"
+            " 窓で「送る」と答えるとここが「尋ねずに送る」になる"
+            " 「送らない」にした絵と文字を使う道具は動かさず、名前と場所は伏せ字にして送る",
+            self,
+        )
+        sends_note.setWordWrap(True)
+        form.addRow(sends_note)
         self._scene_analysis = QComboBox(self)
         for value, text in SCENE_ANALYSIS_CHOICES:
             self._scene_analysis.addItem(text, value)
@@ -1033,6 +1057,9 @@ class PreferencesDialog(QDialog):
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
+            ai_send_frames=self._send_value(Outbound.FRAMES),
+            ai_send_text=self._send_value(Outbound.TEXT),
+            ai_send_files=self._send_value(Outbound.FILES),
             check_loudness_target=int(self._check_loudness.currentData()),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),
@@ -1040,6 +1067,9 @@ class PreferencesDialog(QDialog):
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )
+
+    def _send_value(self, kind: Outbound) -> str:
+        return str(self._ai_sends[kind].currentData())
 
     def accept(self) -> None:
         """書けない置き場や、バックアップを消す減らし方は、閉じる前に確かめる

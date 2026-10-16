@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from sashimono import __version__
 from sashimono.ai.host import ToolError
+from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
@@ -373,6 +374,8 @@ class MainWindow(QMainWindow):
         self._recovery = self._open_recovery(state_root_for(self._preferences))
         #: 開いているプロジェクトの錠 同じファイルを別の窓で開いたことに気付くため
         self._project_lock: HeldLock | None = None
+        #: 前に開いていた作品の場所 :meth:`remembered_names` が AI へ送る結果の伏せ字に渡す
+        self._left_paths: set[str] = set()
         if path is not None and not self._claim(path):
             # 別の窓で開いていて、開くのをやめると選ばれた 中身だけ見せて保存先を
             # 持たないと、錠を持たないまま同じファイルへ保存できてしまう 空で始める
@@ -1252,6 +1255,7 @@ class MainWindow(QMainWindow):
                 replace(self._preferences, ai_model=model, ai_effort=effort)
             )
         )
+        self._chat.send_allowed.connect(self._remember_send_allowed)
 
         self._transport.play_toggled.connect(self._playback.toggle)
         self._transport.step_requested.connect(
@@ -1596,6 +1600,10 @@ class MainWindow(QMainWindow):
         控えと解析も、前のプロジェクトにしか無い素材の分は外す 残すと、新しい
         プロジェクトのステータスバーに、前の素材の本数と失敗が出続ける
         """
+        if self._path is not None:
+            # 前の作品の場所を覚える（:meth:`remembered_names`） 開き直すと作品の場所は変わるが、
+            # AI との会話や記録には前の場所が残る
+            self._left_paths.add(str(self._path))
         if self._drop_imports():
             self.statusBar().showMessage(
                 "プロジェクトを切り替えたので、素材の読み込みを取り消した", 5000
@@ -2022,6 +2030,15 @@ class MainWindow(QMainWindow):
             PreferenceStore().save(self._preferences)
         except OSError as exc:
             self.statusBar().showMessage(f"設定を保存できなかった: {exc}", 5000)
+
+    def _remember_send_allowed(self, kind: str) -> None:
+        """AI へ送る物の窓で「送る（次からは尋ねない）」と答えた 設定の「AI へ送る物」に覚える
+
+        覚えるのは人が窓で答えたときだけ AI の道具からは設定を変えられない（#350）
+        """
+        self._remember_preferences(
+            self._preferences.with_send_choice(Outbound(kind), SendChoice.ALLOW)
+        )
 
     def _insert_media_by_id(self, media_id: str) -> None:
         project = self.view_project
@@ -3340,6 +3357,22 @@ class MainWindow(QMainWindow):
     def export_folder(self) -> Path | None:
         folder = self._preferences.export_folder
         return Path(folder) if folder else None
+
+    def remembered_names(self) -> tuple[str, ...]:
+        """アプリが作品の外で覚えている名前と場所（#342 :class:`EditorHost` を参照）
+
+        AI の道具が返しうる物の出どころを全部ここへ集める 字幕起こしの知らせに書いた素材、
+        前に開いていた作品の場所、設定に入った置き場（退避・バックアップと書き出しのフォルダ）
+        """
+        names = set(self._subtitles.remembered_names()) | self._left_paths
+        if self._path is not None:
+            names.add(str(self._path))
+        names.update(
+            folder
+            for folder in (self._preferences.state_folder, self._preferences.export_folder)
+            if folder
+        )
+        return tuple(sorted(names))
 
     def app_settings(self) -> dict[str, object]:
         """アプリ自身の設定の写し AI は読むだけ（2026-10-14 利用者の決定 #350）
