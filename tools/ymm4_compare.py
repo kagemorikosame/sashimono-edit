@@ -93,6 +93,7 @@ from sashimono.compat.aviutl.report import CompatibilityReport  # noqa: E402
 from sashimono.compat.catalog import place  # noqa: E402
 from sashimono.compat.ymm4.template import load_template, map_template  # noqa: E402
 from sashimono.compat.ymm4.values import number, type_name  # noqa: E402
+from sashimono.engine.decode.rational import as_fraction  # noqa: E402
 
 WIDTH, HEIGHT, FPS = 1920, 1080, 30
 #: 比べる絵の大きさ YMM4 の書き出しは圧縮されるので、縮めてならしてから比べる
@@ -645,7 +646,8 @@ def _ymm4_frames(video: Path) -> Iterator[Picture]:
         for frame in container.decode(stream):
             if frame.pts is None or frame.time_base is None:
                 continue
-            index = frame_index(frame.pts, stream.start_time, frame.time_base, rate)
+            # PyAV 19 から time_base の型が AVRational になった 分子と分母から Fraction にする
+            index = frame_index(frame.pts, stream.start_time, as_fraction(frame.time_base), rate)
             yield index, partial(frame.to_ndarray, format="rgb24")
 
 
@@ -1505,9 +1507,9 @@ def decode_audio(video: Path) -> tuple[np.ndarray, int] | None:
                 at = sample_index(
                     converted.pts,
                     stream.start_time,
-                    converted.time_base,
+                    as_fraction(converted.time_base),
                     rate,
-                    stream.time_base,
+                    as_fraction(stream.time_base) if stream.time_base is not None else None,
                 )
                 pieces.append((at, np.asarray(converted.to_ndarray(), dtype=np.float32)))
     return assemble_audio(pieces), rate

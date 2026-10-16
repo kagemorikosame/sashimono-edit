@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 # cmd.exe の既定コードページ (cp932) だと日本語が化けるので UTF-8 に固定する
@@ -19,8 +20,8 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 results: list[tuple[str, bool, str]] = []
 
 
-def check(name: str):
-    def deco(fn):
+def check(name: str) -> Callable[[Callable[[], str]], Callable[[], str]]:
+    def deco(fn: Callable[[], str]) -> Callable[[], str]:
         try:
             detail = fn()
             results.append((name, True, detail))

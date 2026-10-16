@@ -153,6 +153,9 @@ class SubtitlePanel(QWidget):
         self._jobs: list[Job] = []
         #: 終わった起こしの知らせ 様子を聞かれたときに並べる
         self._job_notes: list[str] = []
+        #: 起こしの知らせに書いた素材の名前と場所 知らせは作品を開き直しても残るので、
+        #: AI へ送る結果の伏せ字（#342）が拾えるように覚える（:meth:`remembered_names`）
+        self._named: set[str] = set()
         #: 焼き込みのひな形にするクリップを返す（タイムラインで選んでいるテキスト）
         #: 窓が差し込む 差し込まなければひな形は無い（既定の見た目）
         self.template_provider: Callable[[], Clip | None] = lambda: None
@@ -759,11 +762,17 @@ class SubtitlePanel(QWidget):
         lines.extend(self._job_notes[-5:])
         return "\n".join(lines) if lines else "起こしは走っていません"
 
+    def remembered_names(self) -> tuple[str, ...]:
+        """起こしの知らせに書いた素材の名前と場所 :meth:`MainWindow.remembered_names` が集める"""
+        return tuple(sorted(self._named))
+
     def _describe_job(self, job: Job) -> str:
         """起こしの依頼の名前 音声が何本もある素材は何本目の音かも添える"""
         media = self._project.find_media(job.media_id)
         if media is None:
             return str(job.media_id)
+        # 名前を書く所はここだけ 書く前に覚える（覚えずに書くと、開き直した後に伏せられない）
+        self._named.update((media.name, str(media.path)))
         if len(media.audio_streams) < 2:
             return media.name
         known = [s.index for s in media.audio_streams]

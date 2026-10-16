@@ -39,7 +39,7 @@ from sashimono.core.io.subtitles import subtitles_in_range, to_srt, to_vtt
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.projection import project_timeline
 from sashimono.engine.encode import RANGE_ALL, RANGE_WORK_AREA
-from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_safety import _hard_link, _symlink_dir, answer_approvals
 
@@ -138,7 +138,7 @@ class TestSave:
     def test_auto_approve_still_asks_and_then_saves(self, saved: FakeHost) -> None:
         # 壊れると、「変更を自動で承認」を入れた人の作品を、AI が黙って上書き保存する
         assert saved.saved_at is not None
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SAVE, {})
 
         assert len(seen) == 1
@@ -154,7 +154,7 @@ class TestSave:
         # 壊れると、拒否しても上書きされ、前の中身は取り消しでも戻らない
         assert saved.saved_at is not None
         before = saved.saved_at.read_bytes()
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, SAVE, {})
         answer_approvals(bridge, done, lambda _approval: False)
         assert isinstance(box.get("error"), ToolError)
@@ -163,7 +163,7 @@ class TestSave:
 
     def test_an_unsaved_project_is_sent_to_save_as(self, host: FakeHost) -> None:
         # 壊れると、保存先の無い作品で窓だけが出て、許しても何も起きないか、決めていない所へ書く
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         seen, box = _run(bridge, SAVE, {})
         assert seen == []
         assert isinstance(box.get("error"), ToolError)
@@ -179,7 +179,7 @@ class TestSaveAs:
         # 壊れると、AI が付けた名前で保存しても、以後の保存が前のファイルへ行く
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "第二稿.sme"
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SAVE_AS, {"path": str(target)})
 
         assert len(seen) == 1 and seen[0].irreversible
@@ -194,7 +194,7 @@ class TestSaveAs:
         assert saved.saved_at is not None
         other = saved.saved_at.parent / "別の作品.sme"
         other.write_text("{}", encoding="utf-8")
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         done, _box = call_in_thread(bridge, SAVE_AS, {"path": str(other)})
         seen = answer_approvals(bridge, done, lambda _approval: False)
         assert "置き換えます" in seen[0].summary
@@ -206,7 +206,7 @@ class TestSaveAs:
         # 壊れると、AI がデスクトップなど人の選んでいない所へ作品を書く
         outside = tmp_path / "外"
         outside.mkdir()
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SAVE_AS, {"path": str(outside / "a.sme")})
         assert seen == []
         assert isinstance(box.get("error"), ToolError)
@@ -217,7 +217,7 @@ class TestSaveAs:
     def test_a_name_that_is_not_a_project_is_refused(self, saved: FakeHost, name: str) -> None:
         # 壊れると、作品の中身を動画や実行できる名前で書き、素材や別のファイルを潰す
         assert saved.saved_at is not None
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SAVE_AS, {"path": str(saved.saved_at.parent / name)})
         assert seen == []
         assert isinstance(box.get("error"), ToolError)
@@ -258,7 +258,7 @@ class TestSwappedPlaces:
             return real_pin(path)
 
         monkeypatch.setattr(safety, "pin_folder", swap_then_pin)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _seen, box = _run(bridge, SAVE_AS, {"path": str(inside / "a.sme")})
         assert isinstance(box.get("error"), ToolError)
         assert not (outside / "a.sme").exists()
@@ -290,7 +290,7 @@ class TestSwappedPlaces:
             return real_pin(path)
 
         monkeypatch.setattr(safety, "pin_folder", link_then_pin)
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         _seen, box = _run(bridge, SAVE_AS, {"path": str(target)})
         assert "元の素材" in str(box.get("error"))
         assert target.read_bytes() == b"original"
@@ -321,7 +321,7 @@ class TestSwappedPlaces:
             return real_write(path, adopt=adopt, expect=expect)
 
         monkeypatch.setattr(saved, "write_project", swap_then_write)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _seen, box = _run(bridge, SAVE_AS, {"path": str(inside / "a.sme")})
         if sys.platform == "win32":
             assert refused, "書いている最中にフォルダを消せた（持っていない）"
@@ -345,7 +345,7 @@ class TestSwappedPlaces:
         host.saved_at = folder / "作品.sme"
         link = folder / "別名.sme"
         _hard_link(link, original)
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         seen, box = _run(bridge, SAVE_AS, {"path": str(link)})
         assert seen == []
         assert "元の素材" in str(box.get("error"))
@@ -364,7 +364,7 @@ class TestExport:
         del codecs
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "完成.mp4"
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(
             bridge, EXPORT, {"path": str(target), "codec": "libx264", "bitrate_mbps": 8}
         )
@@ -392,7 +392,7 @@ class TestExport:
         del codecs
         assert saved.saved_at is not None
         saved.apply_commands([SetWorkArea((30, 90))], "範囲")
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, _box = _run(bridge, EXPORT, {"path": str(saved.saved_at.parent / "a.mp4")})
         assert saved.exports[-1].range_choice == RANGE_WORK_AREA
         assert "指定した範囲" in seen[0].summary and "60 フレーム" in seen[0].summary
@@ -419,7 +419,7 @@ class TestExport:
         # 壊れると、書けない頼みで確かめが出て人が許しても失敗するか、作品のファイルや
         # 実行できる名前で動画を書く
         del codecs
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, EXPORT, arguments)
         assert seen == []
         assert isinstance(box.get("error"), ToolError)
@@ -438,7 +438,7 @@ class TestExport:
         host.saved_at = original.parent / "作品.sme"
         link = original.parent / "別名.mp4"
         _hard_link(link, original)
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         for target in (original, link):
             seen, box = _run(bridge, EXPORT, {"path": str(target)})
             assert seen == []
@@ -451,7 +451,7 @@ class TestExport:
         assert saved.saved_at is not None
         clip = saved.project.timeline.tracks[0].clips[0]
         _operation("delete_clip")(saved, {"clip_id": str(clip.id)})
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, EXPORT, {"path": "a.mp4"})
         assert seen == []
         assert "空" in str(box.get("error"))
@@ -493,7 +493,7 @@ class TestTheApprovedPlaceIsKept:
         moved_folder.mkdir()
         moved = moved_folder / "作品.sme"
         moved.write_text("移した先の作品", encoding="utf-8")
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, _operation(name), arguments)
 
         def move_then_allow(approval: Approval) -> bool:
@@ -541,7 +541,7 @@ class TestOtherSystemsAreRefused:
         assert saved.saved_at is not None
         before = saved.saved_at.read_bytes()
         monkeypatch.setattr(safety, "pin_holds_the_folder", lambda: False)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _seen, box = _run(bridge, _operation(name), arguments)
         assert "この OS" in str(box.get("error"))
         assert saved.written == [] and saved.exports == [] and saved.snapshots == []
@@ -577,7 +577,7 @@ class TestWhatWasShownIsWhatIsWritten:
         del codecs
         assert saved.saved_at is not None
         target = saved.saved_at.parent / file
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, _operation(name), {"path": str(target)})
 
         def make_then_allow(approval: Approval) -> bool:
@@ -614,7 +614,7 @@ class TestWhatWasShownIsWhatIsWritten:
         second = 1_700_000_000
         os.utime(target, ns=(second * 10**9 + 100, second * 10**9 + 100))
         arguments: dict[str, object] = {} if file is None else {"path": str(target)}
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(bridge, _operation(name), arguments)
 
         def rewrite_then_allow(approval: Approval) -> bool:
@@ -662,7 +662,7 @@ class TestWhatWasShownIsWhatIsWritten:
 
         monkeypatch.setattr(operations, "pinned_place", change_then_pin)
         arguments: dict[str, object] = {} if file is None else {"path": str(target)}
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _seen, box = _run(bridge, _operation(name), arguments)
         assert isinstance(box.get("error"), ToolError)
         assert target.read_bytes() == b"BBBB"
@@ -689,7 +689,7 @@ class TestWhatWasShownIsWhatIsWritten:
             return real_plan(host, arguments)
 
         monkeypatch.setattr(operations, "_export_plan", change_on_the_run)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, _box = _run(bridge, EXPORT, {"path": str(target)})
         assert seen[0].consent is not None
         assert [request.expect for request in saved.exports] in (
@@ -701,7 +701,7 @@ class TestWhatWasShownIsWhatIsWritten:
         # 壊れると、箱に出したコマ（再生ヘッドの位置）と違うコマの絵を書く
         assert saved.saved_at is not None
         saved.frame = 30
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(
             bridge, SNAPSHOT, {"path": str(saved.saved_at.parent / "表紙.png")}
         )
@@ -721,7 +721,7 @@ class TestWhatWasShownIsWhatIsWritten:
         # 壊れると、箱に出した範囲（全体）と違う範囲の動画を書き出す
         del codecs
         assert saved.saved_at is not None
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         done, box = call_in_thread(
             bridge, EXPORT, {"path": str(saved.saved_at.parent / "完成.mp4")}
         )
@@ -740,7 +740,7 @@ class TestWhatWasShownIsWhatIsWritten:
         del codecs
         assert saved.saved_at is not None
         folder = saved.saved_at.parent
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         calls: tuple[tuple[str, dict[str, object]], ...] = (
             ("save_project", {}),
             ("save_project_as", {"path": str(folder / "第二稿.sme")}),
@@ -775,7 +775,7 @@ class TestSubtitles:
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "字幕.srt"
         target.write_text("前の字幕", encoding="utf-8")
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SUBTITLES, {"path": str(target)})
 
         assert len(seen) == 1 and seen[0].irreversible
@@ -793,7 +793,7 @@ class TestSubtitles:
         assert saved.saved_at is not None
         saved.apply_commands([SetWorkArea((90, 300))], "範囲")
         target = saved.saved_at.parent / "字幕.vtt"
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SUBTITLES, {"path": str(target)})
         assert "指定した範囲" in seen[0].summary
         assert box.get("result") == {"written": str(target.resolve()), "range": [90, 300]}
@@ -812,7 +812,7 @@ class TestSubtitles:
         self, saved: FakeHost, arguments: dict[str, Any], message: str
     ) -> None:
         # 壊れると、作品や素材の名前で字幕の文字を書くか、人が許しても書けない確かめが出る
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SUBTITLES, arguments)
         assert seen == []
         assert message in str(box.get("error"))
@@ -831,7 +831,7 @@ class TestSubtitles:
         _hard_link(link, original)
         outside = tmp_path / "外"
         outside.mkdir()
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         for target, message in (
             (original, "元の素材"),
             (link, "元の素材"),
@@ -847,7 +847,7 @@ class TestSubtitles:
         # 壊れると、空の字幕のファイルを書くために取り消せない確かめが出る
         clip = saved.project.timeline.tracks[0].clips[0]
         _operation("delete_clip")(saved, {"clip_id": str(clip.id)})
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SUBTITLES, {"path": "字幕.srt"})
         assert seen == []
         assert "字幕がありません" in str(box.get("error"))
@@ -869,7 +869,7 @@ class TestSubtitles:
             return pin_folder(path)
 
         monkeypatch.setattr(safety, "pin_folder", swap_then_pin)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _seen, box = _run(bridge, SUBTITLES, {"path": str(inside / "a.srt")})
         assert isinstance(box.get("error"), ToolError)
         assert list(outside.iterdir()) == []
@@ -881,7 +881,7 @@ class TestSnapshot:
         # 壊れると、自動で承認の人の絵を AI が黙って上書きするか、頼んだのと違うコマを描く
         assert saved.saved_at is not None
         target = saved.saved_at.parent / "表紙.png"
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SNAPSHOT, {"path": str(target), "frame": 45})
         assert len(seen) == 1 and seen[0].irreversible
         assert "静止画を保存します" in seen[0].summary and "45 フレーム" in seen[0].summary
@@ -894,7 +894,7 @@ class TestSnapshot:
         # 壊れると、最後まで再生した所で撮ると何も無い黒の絵になる（画面と食い違う）
         assert saved.saved_at is not None
         saved.frame = saved.project.duration
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         _run(bridge, SNAPSHOT, {"path": str(saved.saved_at.parent / "終わり.png")})
         assert saved.snapshots == [saved.project.duration - 1]
 
@@ -910,7 +910,7 @@ class TestSnapshot:
         self, saved: FakeHost, arguments: dict[str, Any], message: str
     ) -> None:
         # 壊れると、作品や素材の名前で絵を書くか、人が許しても書けない確かめが出る
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(bridge, SNAPSHOT, arguments)
         assert seen == []
         assert message in str(box.get("error"))
@@ -929,7 +929,7 @@ class TestSnapshot:
         _hard_link(link, original)
         outside = tmp_path / "外"
         outside.mkdir()
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         for target, message in (
             (original, "元の素材"),
             (link, "元の素材"),
@@ -965,7 +965,7 @@ class TestSnapshot:
             return pin_folder(path)
 
         monkeypatch.setattr(safety, "pin_folder", link_then_pin)
-        bridge = EditorBridge(host, auto_approve=True)
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
         _seen, box = _run(bridge, SNAPSHOT, {"path": str(target)})
         assert "元の素材" in str(box.get("error"))
         assert target.read_bytes() == b"original"
@@ -1005,7 +1005,7 @@ class TestWaiting:
         del codecs, quick_waits
         assert saved.saved_at is not None
         timer = _finish_later(saved, 0.2)
-        bridge = EditorBridge(saved, auto_approve=True)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
         seen, box = _run(
             bridge,
             EXPORT,
@@ -1023,7 +1023,7 @@ class TestWaiting:
         # 壊れると、終わらない書き出しを待つ AI が、人の新しい指示に応えないまま止まる
         del quick_waits
         saved.export_state = {"state": "rendering", "progress": 0.25, "path": "a.mp4"}
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         started = time.monotonic()
         _seen, box = _run(bridge, STATUS, {"wait_seconds": 0.2})
         assert time.monotonic() - started < 5
@@ -1041,7 +1041,7 @@ class TestWaiting:
     def test_interrupting_stops_the_wait(self, saved: FakeHost) -> None:
         # 壊れると、中断を押しても AI のスレッドが書き出しの終わりを待ち続ける
         saved.export_state = {"state": "rendering", "progress": 0.0, "path": "a.mp4"}
-        bridge = EditorBridge(saved)
+        bridge = allow_sending(EditorBridge(saved))
         done, box = call_in_thread(bridge, STATUS, {"wait_seconds": 60})
         started = time.monotonic()
         while not done.is_set() and time.monotonic() < started + 5:
@@ -1085,7 +1085,7 @@ def test_waiting_runs_on_the_ai_thread(
     # 壊れると、待つのを編集画面のスレッドで行い、書き出しの数分のあいだ画面が固まる
     del quick_waits
     saved.export_state = {"state": "rendering", "progress": 0.0, "path": "a.mp4"}
-    bridge = EditorBridge(saved)
+    bridge = allow_sending(EditorBridge(saved))
     pumped_on: set[int] = set()
     real = saved.export_status
 

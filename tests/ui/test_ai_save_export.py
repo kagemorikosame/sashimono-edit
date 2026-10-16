@@ -57,7 +57,7 @@ from sashimono.ui.ai_export import scratch_folder
 from sashimono.ui.backup_settings import state_root_for
 from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
-from tests.ai.conftest import make_loaded
+from tests.ai.conftest import allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
 
 #: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
@@ -111,6 +111,9 @@ def _open(project: Project, folder: Path) -> MainWindow:
     window = MainWindow(project, path=folder / "作品.sme", confirm_unsaved=False)
     # 人が〔自動で承認〕を入れた（取り消せる編集は確かめずに進む）
     window._chat._auto.setChecked(True)
+    # 外へ送る物（#342）は尋ねずに送る 送る前の確かめは tests/ai/test_outbound.py と
+    # tests/ui/test_send_consent.py が見る ここで見たいのは保存と書き出しの確かめ
+    allow_sending(window._chat._bridge)
     return window
 
 
@@ -226,6 +229,9 @@ class TestSave:
         assert window.project_path == target.resolve()
         assert load_project(target).timeline == window._document.project.timeline
         assert "第二稿" in window.windowTitle()
+        # 書いた場所は伏せ字の表へ入る（#342） 作品を開き直した後も、名前と場所を断った人の
+        # 所で、知らせに残ったこの場所を伏せる
+        assert str(target.resolve()) in window.remembered_names()
 
     def test_outside_is_refused_without_asking(
         self, window: MainWindow, folder: Path, tmp_path: Path

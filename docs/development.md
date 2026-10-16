@@ -56,7 +56,7 @@ CPU の取り合いで落ちることがある 同じワーカーにまとめた
 ```
 .venv\Scripts\python.exe -m ruff format src tests tools
 .venv\Scripts\python.exe -m ruff check --fix src tests tools
-.venv\Scripts\python.exe -m mypy src tests
+.venv\Scripts\python.exe -m mypy src tests tools
 .venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -218,6 +218,33 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   `write_snapshot` だけ）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
+### AI の道具が外へ送る物と同意（#342）
+
+AI の道具の結果は、そのまま Claude Code を通して Anthropic へ渡る 道具はどれも、結果に
+何が入りうるかを `Operation.sends`（`ai/outbound.py` の `Outbound`）で宣言する 既定は無く、
+書き忘れると道具を作る所（読み込んだ時点）で落ちる 新しい道具を足すときは、結果とエラーの文を
+読んで宣言する（`tests/ai/test_outbound.py` が読むだけの道具を全部動かし、変える道具は `WRITE_EXAMPLES` の引数で全部動かして、結果とエラーの文を突き合わせる 変える道具を足したら例も足す 同じ試験が、目印（ZZSECRET）の名前を持つ作品を「そのまま・消した後・名前を変えた後」の形にして全部の道具を動かし、名前と場所を断った人の結果のどこにも目印が出ないことを見張る）
+
+| 物 | 値 | 同意 |
+|---|---|---|
+| 指示と答え | `conversation` | 要らない（AI に頼む以上いつも送る） |
+| 編集の構成 | `project` | 要らない |
+| アプリの設定 | `app_settings` | 要らない（保存したプリセットとエイリアスの名前を含む 字幕の見た目を選ぶ `place_subtitles` が断りの文に並べる） |
+| 素材の名前と場所 | `files` | 尋ねる 断ると伏せ字（〔素材 m_…〕）にして送る 伏せる名前は `file_secrets` に集め、今の作品・履歴に残った作品（`Document.past_projects`）・作品の名前を入れ、見た名前はアプリを閉じるまで覚える 文書が一度でも持った素材と作品の名前（`Document.seen_media`）と、アプリが作品の外で覚えている名前（`EditorHost.remembered_names` 字幕起こしの知らせ・前に開いた作品の場所・設定の置き場）も入れる 作品の外に名前を覚える所を足したらこの口から返す（`tests/ui/test_remembered_names.py`） 作品や素材の名前そのものを返す欄（`Operation.name_keys` `get_project` の `name` など）は長さに関係なく値ごと伏せ、1 文字の名前は文の中では前後が語の続きでない所だけで伏せる 文書が覚えるのは素材の ID・名前・場所だけ（`SeenMedia`） 履歴と取り消しの名前は「動き: 対象」の対象を形で伏せ、`path`・`folder` などの名前の項目（設定の中のフォルダ）は値ごと伏せる |
+| 字幕と文字 | `text` | 尋ねる 断ると道具を動かさない 取り消しと履歴（`undo`・`get_history`）と値を変える道具（`set_param`・`add_keyframe`）だけは尋ねずに動かし、許すまでは結果の中の文字を伏せ字にする（`Operation.hidden` 取り消しは 2026-10-15 利用者の決定） |
+| 映像の絵 | `frames` | 尋ねる 断ると道具を動かさない |
+
+- 尋ねる 3 つは `Preferences.ai_send_frames` などに `ask`（既定）・`allow`・`deny` で持ち、
+  `表示 → 設定…` の「AI へ送る物」に出す 尋ねる窓の「送る（次からは尋ねない）」は `allow` を覚え、
+  「アプリを閉じるまで送る」と「送らない」は設定に書かない 設定を変えると窓の答えを忘れ、
+  `ask` へ戻せば次にまた尋ねる
+- 同意は「変更を自動で承認」でも省かない（外へ送るのは取り消せない 2026-10-14 の利用者の決定）
+- 素材の名前と場所は、宣言していない道具の結果も、許すまでは伏せる 絵は伏せられないので、
+  `frames` を宣言せずに絵を返した道具は断る
+- 絵を返す道具を足すとき（#320 の見渡しの絵・範囲のプレビューなど）は `frames` を宣言する
+- 外へ送る物を変えたら、同じ PR で [docs/code-signing-policy.md](code-signing-policy.md) の
+  個人情報の扱いの表を直す
+
 ### AI の道具と操作の台帳
 
 画面で人ができる操作は、AI アシスタントも全部できるようにする（#298） 抜けは場当たりで
@@ -251,6 +278,9 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   読むだけ、保存・書き出し・ファイルを開く操作は取り消せないと行に書く 行の道具の
   `Operation.safety` が行の区分と違うと落ちる 取り消せない操作を取り消せる道具で受けると、
   「変更を自動で承認」で確かめが省かれるため 読むだけの行は `get_app_settings` で読む
+- 行の道具が外へ送る物（`Operation.sends` #342）も見る 読むだけと決めたアプリ自身の操作を
+  受ける道具は、アプリの設定を送ると書き、作品の絵と文は送らない 台帳と `AI_ONLY` に出る
+  道具はどれも送る物を書く（`tests/ai/test_operation_ledger.py`）
 
 **道具を足す PR は、台帳にも行を足す** 道具が当たる画面の操作の行を `missing` から
 `same` か `partial` へ書き換え、当たる操作が無ければ `AI_ONLY` に訳を書く 1 行 1 操作なので、

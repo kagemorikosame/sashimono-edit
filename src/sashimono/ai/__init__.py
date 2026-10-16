@@ -8,6 +8,7 @@
 - :mod:`~sashimono.ai.operations` — 何ができるか Qt も MCP も知らない素の関数
 - :mod:`~sashimono.ai.host` — 編集ソフト側に求めること
 - :mod:`~sashimono.ai.bridge` — AI スレッドから UI スレッドへの橋渡しと確認
+- :mod:`~sashimono.ai.outbound` — 道具の結果として外へ送る物と、送る前の同意
 - :mod:`~sashimono.ai.server` — 操作を MCP ツールへ包む
 - :mod:`~sashimono.ai.session` — SDK との会話
 

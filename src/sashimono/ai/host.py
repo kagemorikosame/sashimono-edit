@@ -306,6 +306,17 @@ class EditorHost(Protocol):
         """走っている書き出しを止める 止めるよう頼めたら真"""
         ...
 
+    def remembered_names(self) -> tuple[str, ...]:
+        """アプリが作品の外で覚えている名前と場所（#342） 読むだけ
+
+        AI の道具の結果に混ざりうる物を全部返すこと 字幕起こしの記録に残った素材の名前、
+        前に開いた作品の場所、設定に入った置き場など 名前と場所を送らないと決めた人の所で、
+        ブリッジがこれを伏せ字の表（:func:`~sashimono.ai.outbound.file_secrets`）へ入れる
+        作品の外に名前を覚える所を足したら、ここからも返す 返さないと、別の作品を開いた後に
+        その名前が伏せずに送られる（``tests/ui/test_remembered_names.py`` が見張る）
+        """
+        ...
+
     def app_settings(self) -> dict[str, object]:
         """アプリ自身の設定（好み・ショートカット・画面配置・版・ヘルプ）の写し
 

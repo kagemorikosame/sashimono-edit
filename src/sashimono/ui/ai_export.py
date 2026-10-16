@@ -170,6 +170,7 @@ class AssistantExport(QObject):
         self._state = "idle"
         self._progress = 0.0
         self._path: Path | None = None
+        self._expect: Expected | None = None
         self._message = ""
         self._started = 0.0
         self._ended = 0.0
@@ -200,6 +201,7 @@ class AssistantExport(QObject):
         self._idle.clear()
         self._progress = 0.0
         self._path = settings.path
+        self._expect = expect
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
@@ -243,6 +245,16 @@ class AssistantExport(QObject):
         self._worker = None
         # 終わりの知らせはもう届かない 待っている AI を上限まで待たせない
         self._idle.set()
+
+    def remembered_names(self) -> tuple[str, ...]:
+        """書き出し先と、置き換える前のファイルを残した場所（#342 伏せ字の表に入れる）
+
+        作品を開き直した後も、書き出しの様子（:meth:`status`）にはこの場所が残る
+        """
+        names = [str(self._path)] if self._path is not None else []
+        if self._expect is not None:
+            names.extend(str(kept) for kept in self._expect.kept)
+        return tuple(names)
 
     def status(self) -> dict[str, object]:
         """AI へ返す様子"""

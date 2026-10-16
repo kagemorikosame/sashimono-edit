@@ -10,14 +10,24 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 from sashimono.core.commands.base import Command
-from sashimono.core.model import Project
+from sashimono.core.model import MediaId, Project
 
-__all__ = ["Document", "HistoryEntry"]
+__all__ = ["Document", "HistoryEntry", "SeenMedia"]
 
 #: 保持する履歴の上限 これを超えた分は古い方から捨てる
 DEFAULT_HISTORY_LIMIT = 200
+
+
+@dataclass(frozen=True, slots=True)
+class SeenMedia:
+    """文書が一度でも持った素材の、名前と場所だけの軽い記録（:attr:`Document.seen_media`）"""
+
+    id: MediaId
+    name: str
+    path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,32 @@ class Document:
         #: まだ一番上に残っているときだけ同じ段へまとめる 取り消したあとの段へ
         #: まとめると、関係の無い古い操作と一緒に戻ってしまう
         self._merge_anchor: HistoryEntry | None = None
+        #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
+        self._seen_media: set[SeenMedia] = set()
+        self._seen_names: set[str] = set()
+        self._remember(project)
+
+    @property
+    def seen_media(self) -> tuple[SeenMedia, ...]:
+        """この文書が一度でも持った素材の ID・名前・場所（消した物・開き直す前の作品の物も）
+
+        AI へ送る結果の伏せ字（#342）が、作品の外の記録（字幕起こしの知らせ・履歴の名前）に
+        残った名前を拾うのに使う 履歴は上限で古い段が落ち、別の作品を開くと消えるので、
+        履歴からは拾い切れない 素材そのもの（:class:`MediaItem`）は持たない 字幕と単語の
+        時刻まで抱え、起こし直すたびに古い字幕が溜まっていく
+        """
+        return tuple(sorted(self._seen_media, key=lambda seen: (str(seen.id), seen.name)))
+
+    @property
+    def seen_project_names(self) -> tuple[str, ...]:
+        """この文書が一度でも持った作品の名前（名前を変える前・開き直す前の物も）"""
+        return tuple(sorted(self._seen_names))
+
+    def _remember(self, project: Project) -> None:
+        for media in project.media:
+            # 名前を変えた素材は変える前の名前も残す（ID だけで見ると前の名前を忘れる）
+            self._seen_media.add(SeenMedia(media.id, media.name, media.path))
+        self._seen_names.add(project.name)
 
     @property
     def project(self) -> Project:
@@ -198,6 +234,15 @@ class Document:
         """古い順に並べた Undo 可能な操作名 履歴パネル用"""
         return tuple(entry.label for entry in self._undo)
 
+    @property
+    def past_projects(self) -> tuple[Project, ...]:
+        """履歴（取り消しとやり直し）に残ったプロジェクト 古い順
+
+        AI へ送る結果の伏せ字（#342）が、今の作品から消えた素材の名前も拾うのに使う
+        履歴の名前（「配置: 〜」）には、消した素材の名前が残るため
+        """
+        return tuple(entry.before for entry in (*self._undo, *reversed(self._redo)))
+
     def reset(self, project: Project) -> None:
         """別のプロジェクトを読み込み、履歴を捨てる ファイルを開いたときに使う"""
         if self._checkpoint_depth:
@@ -215,5 +260,6 @@ class Document:
 
     def _set_project(self, project: Project) -> None:
         self._project = project
+        self._remember(project)
         for listener in list(self._listeners):
             listener(project)
