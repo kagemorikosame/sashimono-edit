@@ -20,6 +20,7 @@ from sashimono.ai import operations
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Continue, ImageResult, Operation, Pending, find_operation
+from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 from sashimono.ai.sheet import (
     GAP,
@@ -33,7 +34,7 @@ from sashimono.core.model import Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import SceneState
 from sashimono.engine.scenes import SceneSignal
-from tests.ai.conftest import FakeHost, FakeSheet
+from tests.ai.conftest import FakeHost, FakeSheet, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
 
 
@@ -295,7 +296,7 @@ class TestHandingBack:
     def test_the_editor_keeps_responding_while_a_big_sheet_is_drawn(self, loaded: Project) -> None:
         # 壊れると、大きい作品のコンタクトシートを描く数秒の間、画面が描き直されず固まって見える
         host = _SlowHost(loaded)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         operation = find_operation("contact_sheet")
         assert operation is not None
         done, box = call_in_thread(bridge, operation, {"count": 24})
@@ -319,7 +320,7 @@ class TestHandingBack:
     def test_cancelling_stops_a_sheet_halfway(self, loaded: Project) -> None:
         # 壊れると、中断の釦を押しても、何十コマを描き終えるまで止まらない
         host = _SlowHost(loaded)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         operation = find_operation("contact_sheet")
         assert operation is not None
         done, box = call_in_thread(bridge, operation, {"count": 36})
@@ -338,7 +339,7 @@ class TestHandingBack:
 
     def test_a_pump_hands_back_after_a_continuation(self, host: FakeHost) -> None:
         # 壊れると、続きの仕事が先に積まれていたとき同じ回で全部を拾い、分けても画面が止まる
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         results: list[object] = []
 
         def ask(work: Any) -> threading.Thread:
@@ -367,7 +368,7 @@ class TestHandingBack:
     def test_work_queued_before_a_cancel_does_not_run(self, host: FakeHost) -> None:
         # 壊れると、中断の釦を押した後でも、積まれていた続き（最後の 1 コマと PNG）が描かれ、
         # 中断したはずの絵が AI へ返る
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         ran: list[str] = []
         box: dict[str, object] = {}
 
@@ -393,7 +394,7 @@ class TestHandingBack:
     def test_a_cancel_between_steps_returns_no_picture(self, loaded: Project) -> None:
         # 壊れると、描いている途中で中断しても、続きが描き終わって絵が AI へ返る
         host = _SlowHost(loaded)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         operation = find_operation("contact_sheet")
         assert operation is not None
         # 1 コマ 0.04 秒で区切り 0.1 秒なので、初めの回で 3 コマ描き、積まれた続きが最後の回になる
@@ -417,7 +418,7 @@ class TestHandingBack:
 
     def test_other_work_waits_its_turn_without_being_lost(self, host: FakeHost) -> None:
         # 壊れると、コマを描く間に頼まれた別の道具の仕事が拾われず、AI が待ち続ける
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         sheet = find_operation("contact_sheet")
         read = find_operation("get_project")
         assert sheet is not None and read is not None
@@ -441,7 +442,7 @@ class TestWithDetectedScenes:
         frames = [place["frame"] for row in found["cuts"] for place in row["timeline"]]
         assert frames == [60, 195]
 
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         sheet = find_operation("contact_sheet")
         assert sheet is not None
         done, box = call_in_thread(bridge, sheet, {"frames": frames})
@@ -466,8 +467,9 @@ class TestWithDetectedScenes:
             description="待ってから描く",
             schema={},
             handler=lambda _host, _arguments: pending,
+            sends=frozenset({Outbound.PROJECT}),
         )
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, both, {})
         pump_until(bridge, done)
         assert box.get("result") == "描き終えた", box.get("error")

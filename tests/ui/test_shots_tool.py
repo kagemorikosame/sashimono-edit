@@ -699,6 +699,81 @@ class TestTakingTheEditorShot:
         assert rect is not None
         assert shots.brightest(image, rect) > shots.BLACK_LEVEL
 
+    def test_the_burned_subtitle_shot_is_taken_through_run(
+        self,
+        shots: ModuleType,
+        qt_application: QApplication,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """手順書の「焼き込んだあと」の写真を、--wiki の撮影と同じ道（run）で撮れること
+
+        壊れると、字幕パネルの焼き込みの窓の形が変わったとき（#353）のように、--wiki の
+        撮り直しがこの 1 枚で落ち、Wiki の字幕の手順書に焼き込んだ字幕の写真が載らない
+        窓を代わりに答える所が古いと、窓が開いてその場で落ちる（no_modal_windows）
+        """
+        del qt_application
+        if not libx264_available():
+            pytest.skip("libx264 の入った ffmpeg が無いので見本の素材を作れない")
+
+        shot = next(shot for shot in shots.SHOTS if shot.name == "subtitle-burned")
+        assert shot.wiki
+        context = shots.Context(
+            media=shots.make_sample_media(tmp_path / "media"),
+            script_root=tmp_path / "scripts",
+            template_root=tmp_path / "templates",
+            work=tmp_path,
+        )
+        burned: list[int] = []
+        take = shots.take_editor_shot
+
+        def counting(window: Any) -> QImage:
+            # 写真に写る時のタイムラインに、焼き込んだ字幕（テキストのクリップ）が並んでいるか
+            burned.append(
+                sum(
+                    1
+                    for track in window.project.timeline.tracks
+                    for clip in track.clips
+                    if clip.source is not None and clip.source.kind == "text"
+                )
+            )
+            image: QImage = take(window)
+            return image
+
+        monkeypatch.setattr(shots, "take_editor_shot", counting)
+        wiki = tmp_path / "wiki" / "images"
+        wiki.mkdir(parents=True)
+        assert shots.run([shot], context, tmp_path / "docs", wiki) == 0
+        assert (wiki / "subtitle-burned.png").is_file()
+        # 見本の起こしは 3 行 全部の話し手を焼き込むので 3 本並ぶ
+        assert burned == [len(shots.SAMPLE_SEGMENTS)]
+
+
+class TestRunKeepsGoing:
+    def test_a_broken_shot_does_not_stop_the_rest(
+        self, shots: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """撮る道具の不具合で 1 枚が落ちても、残りの写真は撮り、失敗として数える
+
+        壊れると、本体の形が変わって 1 枚の撮り方が古くなっただけで、--wiki の撮り直し
+        全体が止まり、後ろの写真が 1 枚も撮れない（#353 の後の撮り直しで起きた）
+        失敗を数えないと、壊れた写真のまま「撮れた」ことになる
+        """
+
+        def broken(context: object) -> QImage:
+            raise TypeError("古い撮り方")
+
+        def fine(context: object) -> QImage:
+            image = QImage(4, 4, QImage.Format.Format_RGB32)
+            image.fill(QColor("black"))
+            return image
+
+        context = shots.Context(media=None, script_root=tmp_path, template_root=tmp_path)
+        listing = [shots.Shot("壊れた", "", broken), shots.Shot("撮れる", "", fine)]
+        assert shots.run(listing, context, tmp_path) == 1
+        assert (tmp_path / "撮れる.png").is_file()
+        assert "失敗 壊れた" in capsys.readouterr().err
+
 
 class TestAssistantShot:
     def test_the_sample_conversation_is_never_sent(

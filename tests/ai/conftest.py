@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
+from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Command, Document, InScene
@@ -99,6 +101,8 @@ class FakeHost:
             "preferences": {"theme": "dark", "update_check": True},
             "shortcuts": {"編集/分割": "S"},
         }
+        #: アプリが作品の外で覚えている名前（本物は字幕起こしの記録・前に開いた作品の場所など）
+        self.remembered: list[str] = []
         #: 保存したプリセットとエイリアス 置き場は試験ごとの一時フォルダ（conftest が向ける）
         self.library = Library()
         #: 本人の設定の着せ方 既定は設定と同じ
@@ -263,6 +267,19 @@ class FakeHost:
 
     def app_settings(self) -> dict[str, object]:
         return self.settings
+
+    def remembered_names(self) -> tuple[str, ...]:
+        return tuple(self.remembered)
+
+
+def allow_sending(bridge: EditorBridge) -> EditorBridge:
+    """外へ送る物（#342）をすべて「尋ねずに送る」にしたブリッジ
+
+    包み方や待ち合わせを見る試験で、送る前の確かめに答える役を置かずに済ませる
+    確かめそのものは tests/ai/test_outbound.py が見る
+    """
+    bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+    return bridge
 
 
 def make_loaded(video_media: MediaItem, transcript: Transcript) -> Project:

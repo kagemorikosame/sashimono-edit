@@ -25,7 +25,7 @@ from sashimono.ai.server import (
     tool_name,
     tool_names,
 )
-from tests.ai.conftest import FakeHost
+from tests.ai.conftest import FakeHost, allow_sending
 
 
 def call_tool(bridge: EditorBridge, tool: Any, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -78,7 +78,7 @@ class TestServer:
         assert build_server(EditorBridge(host))["type"] == "sdk"
 
     def test_a_read_returns_json_text(self, host: FakeHost) -> None:
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         tool = find(build_tools(bridge), "get_project")
 
         result = call_tool(bridge, tool, {})
@@ -86,7 +86,7 @@ class TestServer:
         assert payload["duration_frames"] == 300
 
     def test_an_image_comes_back_as_an_image_block(self, host: FakeHost) -> None:
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         tool = find(build_tools(bridge), "preview_frame")
 
         result = call_tool(bridge, tool, {"frame": 30})
@@ -99,7 +99,7 @@ class TestServer:
     @pytest.mark.parametrize("name", ["contact_sheet", "preview_range"])
     def test_a_sheet_comes_back_as_one_image_block(self, host: FakeHost, name: str) -> None:
         # 壊れると、続きのある道具の途中の印が AI へ返り、絵の代わりに読めない文字が届く
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         tool = find(build_tools(bridge), name)
 
         result = call_tool(bridge, tool, {})

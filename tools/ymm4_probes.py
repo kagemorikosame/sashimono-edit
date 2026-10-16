@@ -72,6 +72,11 @@ def collect_samples() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, An
     return shapes, brushes
 
 
+def _cases(table: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """変える項目の組の一覧 組ごとに値の型が違うので、どの値でも受ける形で持つ"""
+    return list(table.items())
+
+
 def set_values(node: dict[str, Any], **values: Any) -> dict[str, Any]:
     """数はアニメーションの形、そのほかはそのまま入れる"""
     for key, value in values.items():
@@ -148,21 +153,23 @@ def build(
         "Opacity": 100,
         "Stops": two_stops,
     }
-    for name, change in {
-        "linear": {},
-        "rot45": {"Rotation": 45},
-        "rot90": {"Rotation": 90},
-        "size800": {"Size": 800},
-        "x300": {"X": 300},
-        "y200": {"Y": 200},
-        "round": {"GradientType": "Round"},
-        "convex": {"GradientType": "Convex"},
-        "wrap": {"ExtendMode": "Wrap", "Size": 200},
-        "mirror": {"ExtendMode": "Mirror", "Size": 200},
-        "multiply": {"Blend": "Multiply"},
-        "opacity50": {"Opacity": 50},
-        "stops3": {"Stops": three_stops},
-    }.items():
+    for name, change in _cases(
+        {
+            "linear": {},
+            "rot45": {"Rotation": 45},
+            "rot90": {"Rotation": 90},
+            "size800": {"Size": 800},
+            "x300": {"X": 300},
+            "y200": {"Y": 200},
+            "round": {"GradientType": "Round"},
+            "convex": {"GradientType": "Convex"},
+            "wrap": {"ExtendMode": "Wrap", "Size": 200},
+            "mirror": {"ExtendMode": "Mirror", "Size": 200},
+            "multiply": {"Blend": "Multiply"},
+            "opacity50": {"Opacity": 50},
+            "stops3": {"Stops": three_stops},
+        }
+    ):
         with_effect(f"gradient_{name}", effect("GradientEffect", **{**gradient, **change}))
 
     # --- 前景の塗りつぶし（ブラシ） ---
@@ -175,14 +182,16 @@ def build(
         "Angle": 0,
         "ExtendMode": "Clamp",
     }
-    for name, change in {
-        "linear": {},
-        "linear_angle45": {"Angle": 45},
-        "linear_offset200": {"Offset": 200},
-        "linear_wrap": {"ExtendMode": "Wrap", "Size": 200},
-        "linear_relative": {"CoordinateMode": "Relative", "Size": 50},
-        "linear_stops3": {"Stops": three_stops},
-    }.items():
+    for name, change in _cases(
+        {
+            "linear": {},
+            "linear_angle45": {"Angle": 45},
+            "linear_offset200": {"Offset": 200},
+            "linear_wrap": {"ExtendMode": "Wrap", "Size": 200},
+            "linear_relative": {"CoordinateMode": "Relative", "Size": 50},
+            "linear_stops3": {"Stops": three_stops},
+        }
+    ):
         with_effect(
             f"fill_{name}",
             effect(
@@ -205,14 +214,16 @@ def build(
         "ExtendMode": "Clamp",
         "IsInverted": False,
     }
-    for name, change in {
-        "radial": {},
-        "radial_center": {"CenterX": 200, "CenterY": 100},
-        "radial_origin": {"OriginX": 150},
-        "radial_aspect": {"Aspect": 50},
-        "radial_zoom": {"Zoom": 200},
-        "radial_inverted": {"IsInverted": True},
-    }.items():
+    for name, change in _cases(
+        {
+            "radial": {},
+            "radial_center": {"CenterX": 200, "CenterY": 100},
+            "radial_origin": {"OriginX": 150},
+            "radial_aspect": {"Aspect": 50},
+            "radial_zoom": {"Zoom": 200},
+            "radial_inverted": {"IsInverted": True},
+        }
+    ):
         with_effect(
             f"fill_{name}",
             effect(
@@ -230,12 +241,14 @@ def build(
         "Zoom": 100,
         "Angle": 0,
     }
-    for name, change in {
-        "stripe": {},
-        "stripe_angle45": {"Angle": 45},
-        "stripe_offset20": {"Offset": 20},
-        "stripe_zoom200": {"Zoom": 200},
-    }.items():
+    for name, change in _cases(
+        {
+            "stripe": {},
+            "stripe_angle45": {"Angle": 45},
+            "stripe_offset20": {"Offset": 20},
+            "stripe_zoom200": {"Zoom": 200},
+        }
+    ):
         with_effect(
             f"fill_{name}",
             effect(
@@ -256,13 +269,15 @@ def build(
         "Aspect": 0,
         "IsInverted": False,
     }
-    for name, change in {
-        "dot": {},
-        "dot_angle45": {"Angle": 45},
-        "dot_xy": {"X": 10, "Y": 20},
-        "dot_aspect": {"Aspect": 50},
-        "dot_inverted": {"IsInverted": True},
-    }.items():
+    for name, change in _cases(
+        {
+            "dot": {},
+            "dot_angle45": {"Angle": 45},
+            "dot_xy": {"X": 10, "Y": 20},
+            "dot_aspect": {"Aspect": 50},
+            "dot_inverted": {"IsInverted": True},
+        }
+    ):
         with_effect(
             f"fill_{name}",
             effect(
@@ -341,15 +356,21 @@ def build(
 
     # --- 影 ---
     red = solid("#FFFF0000")
-    small = lambda: shape(600, 300)  # noqa: E731 - 影がはみ出すので小さめの下地
-    for name, change in {
-        "plain": {},
-        "blur10": {"Blur": 10},
-        "zoom120": {"Zoom": 120},
-        "angle30": {"Angle": 30},
-        "angle30_center": {"Angle": 30, "IsRotateAtCenter": True},
-        "opacity50": {"Opacity": 50},
-    }.items():
+
+    def small() -> dict[str, Any]:
+        # 影がはみ出すので小さめの下地
+        return shape(600, 300)
+
+    for name, change in _cases(
+        {
+            "plain": {},
+            "blur10": {"Blur": 10},
+            "zoom120": {"Zoom": 120},
+            "angle30": {"Angle": 30},
+            "angle30_center": {"Angle": 30, "IsRotateAtCenter": True},
+            "opacity50": {"Opacity": 50},
+        }
+    ):
         values = {
             "X": 40,
             "Y": 30,
@@ -361,21 +382,25 @@ def build(
             "Brush": red,
         }
         with_effect(f"shadow_{name}", effect("ShadowEffect", **{**values, **change}), small())
-    for name, change in {
-        "plain": {},
-        "blur10": {"Blur": 10},
-        "multiply": {"BlendMode": "Multiply"},
-    }.items():
+    for name, change in _cases(
+        {
+            "plain": {},
+            "blur10": {"Blur": 10},
+            "multiply": {"BlendMode": "Multiply"},
+        }
+    ):
         values = {"X": 40, "Y": 30, "Opacity": 100, "Blur": 0, "BlendMode": "Normal", "Brush": red}
         with_effect(
             f"inner_shadow_{name}", effect("InnerShadowEffect", **{**values, **change}), small()
         )
-    for name, change in {
-        "solid": {},
-        "angle45": {"Angle": 45},
-        "image": {"ShadowType": "Image"},
-        "attenuation50": {"Attenuation": 50},
-    }.items():
+    for name, change in _cases(
+        {
+            "solid": {},
+            "angle45": {"Angle": 45},
+            "image": {"ShadowType": "Image"},
+            "attenuation50": {"Attenuation": 50},
+        }
+    ):
         values = {
             "Angle": 135,
             "Length": 60,
@@ -391,12 +416,14 @@ def build(
 
     # --- マスク ---
     circle = copy.deepcopy(samples["MaskEffect"])
-    for name, change in {
-        "circle": {},
-        "circle_invert": {"InvertMask": True},
-        "circle_blur30": {"Blur": 30},
-        "circle_x200": {"X": 200, "Y": 100},
-    }.items():
+    for name, change in _cases(
+        {
+            "circle": {},
+            "circle_invert": {"InvertMask": True},
+            "circle_blur30": {"Blur": 30},
+            "circle_x200": {"X": 200, "Y": 100},
+        }
+    ):
         entry = copy.deepcopy(circle)
         entry["ShapeType2"] = "YukkuriMovieMaker.Shape.CircleShapePlugin, YukkuriMovieMaker"
         entry["ShapeParameter"] = copy.deepcopy(samples["CircleShapeParameter"])
@@ -425,12 +452,14 @@ def build(
     with_effect("mask_fan90", fan)
 
     # --- 反転コピー・背景の塗り ---
-    for name, change in {
-        "right": {},
-        "bottom": {"Position": "Bottom"},
-        "distance100": {"Distance": 100},
-        "not_centering": {"IsCentering": False},
-    }.items():
+    for name, change in _cases(
+        {
+            "right": {},
+            "bottom": {"Position": "Bottom"},
+            "distance100": {"Distance": 100},
+            "not_centering": {"IsCentering": False},
+        }
+    ):
         values = {
             "Position": "Right",
             "Distance": 0,
@@ -443,11 +472,13 @@ def build(
             effect("CopyAndReverseEffect", **{**values, **change}),
             shape(400, 300),
         )
-    for name, change in {
-        "margins": {},
-        "round40": {"Round": 40},
-        "negative": {"Right": -50},
-    }.items():
+    for name, change in _cases(
+        {
+            "margins": {},
+            "round40": {"Round": 40},
+            "negative": {"Right": -50},
+        }
+    ):
         values = {
             "Opacity": 100,
             "Round": 0,
@@ -1133,7 +1164,7 @@ def build_fourth(
             )
         )
 
-    linear = {"EasingType": "Linear", "EasingMode": "In"}
+    linear: dict[str, Any] = {"EasingType": "Linear", "EasingMode": "In"}
     add("switch", transition("SwitchTransitionPlugin"))
     add("fade", transition("FadeTransitionPlugin", **linear))
     add("push_0", transition("PushTransitionPlugin", Angle=0.0, **linear))
@@ -1618,13 +1649,13 @@ def build_fifth(
     )
 
     # 魚眼
-    for label, values in (
+    for label, fish in (
         ("angle120", {"Projection": "Orthographic", "Angle": 120.0, "Zoom": 100.0}),
         ("zoom50", {"Projection": "Orthographic", "Angle": 60.0, "Zoom": 50.0}),
         ("equidistant", {"Projection": "Equidistant", "Angle": 120.0, "Zoom": 100.0}),
         ("stereographic", {"Projection": "Stereographic", "Angle": 120.0, "Zoom": 100.0}),
     ):
-        add(f"fish_eye_{label}", textured(), effect("FishEyeLensEffect", **values))
+        add(f"fish_eye_{label}", textured(), effect("FishEyeLensEffect", **fish))
 
     # 波紋
     add(

@@ -124,7 +124,9 @@ class ScanMeter:
     def uninstall(self) -> None:
         """差し替えた関数を元に戻す 測り終えたら戻して、ほかの呼び出しを測りに巻き込まない"""
         if self._original is not None:
-            renderer_module._content_box = self._original
+            # 持っておいた元の関数は Callable として持つので、def の型の属性へは代入として通らない
+            # 名前の表へ直に戻す（setattr は ruff が代入へ書き換える）
+            vars(renderer_module)["_content_box"] = self._original
             self._original = None
 
     def take(self) -> float:

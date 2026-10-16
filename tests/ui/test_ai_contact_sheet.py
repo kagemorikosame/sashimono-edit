@@ -27,6 +27,7 @@ from sashimono.core.model import Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
 from sashimono.ui.ai_sheet import SHEET_BACKGROUND
 from sashimono.ui.main_window import MainWindow
+from tests.ai.conftest import allow_sending
 from tests.ai.test_bridge import call_in_thread
 
 pytestmark = pytest.mark.usefixtures("gpu")
@@ -193,7 +194,7 @@ class TestBigProject:
         self, big_window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 壊れると、大きい作品で何十コマを描く間、画面が止まり、押した釦も中断も効かない
-        bridge = EditorBridge(big_window)
+        bridge = allow_sending(EditorBridge(big_window))
         # 初めの 1 枚は描き手（GL の文脈）を作るので重い 区切りの見張りから外す
         _run(big_window, "preview_frame", frame=0)
         # 1 コマを重くして（4K の動画のシークのつもり）、1 回で描き切れば必ず長くなるようにする

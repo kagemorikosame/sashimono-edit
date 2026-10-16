@@ -17,14 +17,21 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
+from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Consent, Safety, readable_output
-from sashimono.ai.sheet import MAX_COLUMNS, MAX_SHEET_EDGE, MIN_CELL_WIDTH, sheet_layout
+from sashimono.ai.sheet import (
+    MAX_COLUMNS,
+    MAX_SHEET_EDGE,
+    MIN_CELL_WIDTH,
+    SheetError,
+    sheet_layout,
+)
 from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
@@ -212,8 +219,33 @@ class Operation:
     #: 取り消せない操作で、確かめの窓に出す「何をどこへ」を作る 編集画面のスレッドで呼ぶ
     #: 書けない場所ならここで :class:`ToolError` を投げ、窓を出さずに断る
     consent: Callable[[EditorHost, dict[str, Any]], Consent] | None = None
+    #: 結果に入りうる物 結果はそのまま外（Anthropic）へ渡る（:mod:`sashimono.ai.outbound` #342）
+    #: 既定を置かない 置くと、絵や字幕を返す道具を足した人が書き忘れても黙って通り、
+    #: 同意を取らずに外へ送る 書き忘れたら道具を作る所で落ちる
+    sends: frozenset[Outbound] = field(kw_only=True)
+    #: ``sends`` のうち、許されていなければ尋ねも断りもせず、結果の中を伏せ字にして送る物
+    #: 今は取り消しと履歴の道具の字幕と文字だけ（操作の名前に文の頭が混ざるだけで、
+    #: 道具の役目は文を送ることではない 2026-10-15 利用者の決定）
+    hidden: frozenset[Outbound] = field(default=frozenset(), kw_only=True)
+    #: 結果が操作の名前（履歴と取り消し）か 名前の「動き: 対象」の対象には素材の名前や本文が
+    #: 入るが、消した素材の名前は今の作品に無いので、表
+    #: （:func:`~sashimono.ai.outbound.file_secrets`）では伏せられない
+    #: 名前と場所か字幕と文字を許していなければ、対象を形で伏せる
+    labels: bool = field(default=False, kw_only=True)
+    #: 結果のうち、作品や素材の名前そのものを返す欄の名前（``get_project`` の ``name`` など）
+    #: 名前と場所を許していなければ、表（:func:`~sashimono.ai.outbound.file_secrets`）に
+    #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
+    #: トラック・シーン・エフェクトの名前は作品の中身の名前で、ここには書かない
+    name_keys: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
+        if not self.sends:
+            # 結果を返す以上、何かは送る 空にすると、何も送らない道具と見分けが付かない
+            raise ValueError(f"{self.name}: 結果に入りうる物（sends）を書いてください")
+        if not self.hidden <= self.sends & {Outbound.TEXT}:
+            # 伏せ方を持っているのは字幕と文字だけ（名前と場所は道具を問わず伏せる）
+            # 絵は伏せられないので、ここに書くと尋ねずに送ることになる
+            raise ValueError(f"{self.name}: 伏せて送れるのは sends に書いた字幕と文字だけです")
         if not self.irreversible:
             return
         # 取り消せない操作は、何をどこへするかを見せずに確かめても判断できない
@@ -1243,12 +1275,16 @@ def _draw_sheet(
     columns = default_columns
     if arguments.get("columns") is not None:
         columns = _whole_number(arguments, "columns", 0)
-    layout = sheet_layout(
-        len(frames),
-        cell_width=cell_width,
-        frame_size=project.settings.resolution,
-        columns=columns,
-    )
+    try:
+        layout = sheet_layout(
+            len(frames),
+            cell_width=cell_width,
+            frame_size=project.settings.resolution,
+            columns=columns,
+        )
+    except SheetError as exc:
+        # 並べ方の文面は直し方まで書いてある そのまま AI へ返す
+        raise ToolError(str(exc)) from exc
     labels = [f"{format_timecode(frame, project.rate)} {frame}" for frame in frames]
     # 再生しながら別のコマを描くと GL の資源を取り合う（preview_frame と同じ）
     host.stop_playback()
@@ -2653,24 +2689,63 @@ def _select(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"selected": clip_id or None}
 
 
+#: 道具の結果に入りうる物の組（:attr:`Operation.sends`）
+#: 位置・長さ・ID・エフェクトの値だけを返す道具 素材の名前が混ざるのはエラーの文くらいで、
+#: そこは名前を送らないと決めた人には伏せ字にして送る（:func:`sashimono.ai.outbound.redact`）
+_STRUCTURE = frozenset({Outbound.PROJECT})
+#: 素材の名前か場所を返す道具
+_WITH_FILES = frozenset({Outbound.PROJECT, Outbound.FILES})
+#: 字幕の文かテキストの本文を返す道具（引数で受けた本文を結果で返す道具も 断られたら動かさない）
+_WITH_TEXT = frozenset({Outbound.PROJECT, Outbound.TEXT})
+#: 絵を返す道具 #320 のコンタクトシートと範囲のプレビューもこれにする
+_WITH_FRAMES = frozenset({Outbound.PROJECT, Outbound.FRAMES})
+#: 操作の履歴の名前を返す道具 名前には素材の名前（「配置: 〜」）と、テキストの文の頭
+#: （「テキストを追加: 〜」）が入る
+_HISTORY = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
+#: 履歴の名前の中の文字は、送らないと決めた人には伏せて送る 取り消しは断らない
+#: 断ると、字幕と文字を送らない人は AI に取り消しを頼めない（2026-10-15 利用者の決定）
+_HIDDEN_IN_HISTORY = frozenset({Outbound.TEXT})
+#: 値を変える道具（set_param・add_keyframe）は、テキストの本文を変えたときだけ結果に本文が載る
+#: 本文のための道具ではないので、字幕と文字を送らない人にも断らず、本文を伏せて返す
+#: 断ると、色や位置を変えるだけの頼みまで動かなくなる
+_HIDDEN_IN_VALUES = frozenset({Outbound.TEXT})
+#: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
+_APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
+#: 保存したプリセット・エイリアスで字幕に見た目を着せる道具（#308） 見つからないと断る文に
+#: 保存してある物の名前を並べる（AI が名前を選び直すための唯一の手掛かり） 本人の持ち物の
+#: 名前で、作品の中身でも素材でもないので、アプリの設定と同じく送る 読み込めない理由の文には
+#: 置き場の場所が入りうるので、名前と場所も書く（断った人には伏せる）
+_WITH_LOOKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
+#: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
+_CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 本人の答え
+_CONVERSATION = frozenset({Outbound.CONVERSATION})
+
+
 OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="get_project",
         description="プロジェクトの設定（解像度・fps・長さ）と再生ヘッドの位置を返す",
         schema=_schema({}),
         handler=_get_project,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"name"}),
     ),
     Operation(
         name="list_media",
         description="メディアプールの素材を一覧する media_id はここで得る" + PAGING_NOTE,
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"name"}),
     ),
     Operation(
         name="list_tracks",
         description="タイムラインのトラックを一覧する" + PAGING_NOTE,
         schema=_schema(_paging()),
         handler=_list_tracks,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="list_clips",
@@ -2686,12 +2761,15 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_list_clips,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"media"}),
     ),
     Operation(
         name="get_selection",
         description="選択中のクリップと再生ヘッドの位置",
         schema=_schema({}),
         handler=_get_selection,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="list_effects",
@@ -2708,6 +2786,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_list_effects,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="get_subtitles",
@@ -2734,12 +2813,16 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_get_subtitles,
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="get_history",
         description="直近の操作履歴と、取り消せるかどうか",
         schema=_schema({}),
         handler=_get_history,
+        sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
     ),
     Operation(
         name="preview_frame",
@@ -2754,6 +2837,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_preview_frame,
+        sends=_WITH_FRAMES,
     ),
     Operation(
         name="contact_sheet",
@@ -2786,6 +2870,8 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_contact_sheet,
+        # 絵（何コマも並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
+        sends=_WITH_FRAMES,
     ),
     Operation(
         name="preview_range",
@@ -2811,6 +2897,8 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_preview_range,
+        # 絵（続いたコマを並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
+        sends=_WITH_FRAMES,
     ),
     Operation(
         name="detect_scenes",
@@ -2849,6 +2937,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_detect_scenes,
+        sends=_WITH_FILES,
     ),
     Operation(
         name="check_output",
@@ -2924,6 +3013,11 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_check_output,
+        # 結果は時刻とクリップ ID だが、書き出した動画を調べたときは target に場所が入り、
+        # 調べられなかった理由の文には素材の名前や場所が入りうる 場所は形で、名前は表で伏せる
+        # target は "timeline" も取るので、値ごと伏せる欄（name_keys）には入れない
+        # 音量の基準（本人の設定 Preferences.check_loudness_target）も結果に載る
+        sends=_CHECKS,
     ),
     Operation(
         name="get_app_settings",
@@ -2933,24 +3027,28 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({}),
         handler=_get_app_settings,
+        sends=_APP_SETTINGS,
     ),
     Operation(
         name="seek",
         description="再生ヘッドを動かす",
         schema=_schema({"frame": _integer("移動先のフレーム")}, ["frame"]),
         handler=_seek,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="select_clip",
         description="クリップを選択する clip_id を空にすると選択を解く",
         schema=_schema({"clip_id": _string("選ぶクリップ")}),
         handler=_select,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="list_scenes",
         description="シーン（入れ子のタイムライン）の一覧と、いま開いているシーン",
         schema=_schema({}),
         handler=_list_scenes,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="set_active_scene",
@@ -2960,6 +3058,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({"scene_id": _string("開くシーン 空ならメイン")}),
         handler=_set_active_scene,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="select_clips",
@@ -2969,6 +3068,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["clip_ids"],
         ),
         handler=_select_clips,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="import_media",
@@ -2984,6 +3084,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["paths"],
         ),
         handler=_import_media,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"imported"}),
         writes=True,
     ),
     Operation(
@@ -2997,6 +3099,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_place_media,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"placed"}),
         writes=True,
     ),
     Operation(
@@ -3013,6 +3117,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_add_track,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3031,6 +3136,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["track_id"],
         ),
         handler=_set_track_state,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3044,6 +3150,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["width", "height"],
         ),
         handler=_set_resolution,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3062,6 +3169,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["text"],
         ),
         handler=_add_text,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -3087,6 +3195,7 @@ OPERATIONS: tuple[Operation, ...] = (
             [],
         ),
         handler=_add_shape,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3107,6 +3216,7 @@ OPERATIONS: tuple[Operation, ...] = (
             [],
         ),
         handler=_add_transition,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3116,6 +3226,7 @@ OPERATIONS: tuple[Operation, ...] = (
             {"clip_id": _string("対象"), "frame": _integer("分割位置 省略すると再生ヘッド")}
         ),
         handler=_split_clip,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3134,6 +3245,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_trim_clip,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3148,6 +3260,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["timeline_start"],
         ),
         handler=_move_clip,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3155,6 +3268,7 @@ OPERATIONS: tuple[Operation, ...] = (
         description="クリップを消す ripple を真にすると後ろを詰める",
         schema=_schema({"clip_id": _string("対象"), "ripple": _boolean("詰めるか")}),
         handler=_delete_clip,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3165,6 +3279,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name"],
         ),
         handler=_add_scene,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3182,6 +3297,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["scene_id"],
         ),
         handler=_place_scene,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3189,6 +3305,7 @@ OPERATIONS: tuple[Operation, ...] = (
         description="2 本以上のクリップを 1 つのグループに束ねる 束ねたものは一緒に選ばれて動く",
         schema=_schema({"clip_ids": _clip_ids_schema()}),
         handler=_group_clips,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3196,6 +3313,7 @@ OPERATIONS: tuple[Operation, ...] = (
         description="クリップが入っているグループを、仲間ごと解く",
         schema=_schema({"clip_ids": _clip_ids_schema()}),
         handler=_ungroup_clips,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3209,6 +3327,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["delta"],
         ),
         handler=_move_clips,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3216,6 +3335,7 @@ OPERATIONS: tuple[Operation, ...] = (
         description="何本かのクリップをまとめて消す ripple を真にすると消したぶんを詰める",
         schema=_schema({"clip_ids": _clip_ids_schema(), "ripple": _boolean("詰めるか")}),
         handler=_delete_clips,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3232,6 +3352,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_duplicate_clips,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3245,6 +3366,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["height"],
         ),
         handler=_set_track_height,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3265,6 +3387,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name", "value"],
         ),
         handler=_set_clip_property,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3285,6 +3408,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["kind"],
         ),
         handler=_add_effect,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3308,6 +3432,7 @@ OPERATIONS: tuple[Operation, ...] = (
             [],
         ),
         handler=_add_stroke,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3318,6 +3443,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["stroke_id"],
         ),
         handler=_remove_stroke,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3332,6 +3458,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["stroke_id", "index"],
         ),
         handler=_move_stroke,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3346,6 +3473,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["stroke_id", "enabled"],
         ),
         handler=_set_stroke_enabled,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3367,6 +3495,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name", "value"],
         ),
         handler=_set_param,
+        sends=_WITH_TEXT,
+        hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
     Operation(
@@ -3386,6 +3516,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["name", "value"],
         ),
         handler=_add_keyframe,
+        sends=_WITH_TEXT,
+        hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
     Operation(
@@ -3404,6 +3536,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id", "segment_id", "text"],
         ),
         handler=_set_subtitle_text,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -3431,6 +3564,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["pairs"],
         ),
         handler=_replace_subtitle_text,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -3450,6 +3584,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_clean_subtitles,
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -3484,6 +3619,7 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_place_subtitles,
+        sends=_WITH_LOOKS,
         writes=True,
     ),
     Operation(
@@ -3504,6 +3640,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_jet_cut,
+        sends=_WITH_FILES,
         writes=True,
     ),
     Operation(
@@ -3524,6 +3661,8 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_transcribe,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
         writes=True,
     ),
     Operation(
@@ -3534,12 +3673,16 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({}),
         handler=_transcription_status,
+        sends=_WITH_FILES,
     ),
     Operation(
         name="undo",
         description="直前の操作を取り消す",
         schema=_schema({"steps": _integer("戻す段数（既定 1）")}),
         handler=_undo,
+        sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
         writes=True,
     ),
     Operation(
@@ -3590,6 +3733,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["question", "choices"],
         ),
         handler=_ask_user,
+        sends=_CONVERSATION,
         asks=True,
     ),
 )

@@ -22,7 +22,7 @@ from sashimono.core.model import SceneId
 from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, Run
-from tests.ai.conftest import FakeHost
+from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
 
 
@@ -322,7 +322,7 @@ class TestWaiting:
             return wait
 
         monkeypatch.setattr(host, "check_waiter", blocking_waiter)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         box: dict[str, Any] = {}
 
         def work() -> None:
@@ -366,7 +366,7 @@ class TestWaiting:
             return wait
 
         monkeypatch.setattr(host, "check_waiter", finishing_waiter)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, _operation(), {"wait_seconds": 5})
         pump_until(bridge, done)
         result = box.get("result")

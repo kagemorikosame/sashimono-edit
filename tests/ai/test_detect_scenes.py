@@ -34,7 +34,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import CacheStore, MediaAnalyzer, SceneState
 from sashimono.engine.decode import forget_probe, probe_media
 from sashimono.engine.scenes import SceneSignal
-from tests.ai.conftest import FakeHost
+from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
 from tests.conftest import make_clip
 from tests.scene_video import CUTS, FPS, write_scene_video
@@ -232,7 +232,7 @@ class TestWaiting:
             _signal([2.0], until=4.0, complete=False), running=True
         )
         host.scene_ready = lambda _media: False
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         began = time.monotonic()
         done, box = call_in_thread(bridge, DETECT, {"media_id": str(media.id), "wait_seconds": 0.3})
         pump_until(bridge, done)
@@ -254,7 +254,7 @@ class TestWaiting:
             return True
 
         host.scene_ready = finish
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, DETECT, {"media_id": str(media.id)})
         pump_until(bridge, done)
         result = box["result"]
@@ -271,7 +271,7 @@ class TestWaiting:
             return False
 
         host.scene_ready = never
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, DETECT, {"media_id": str(media.id), "wait_seconds": 60})
         deadline = time.monotonic() + 5
         while not host.scene_waits and time.monotonic() < deadline:
@@ -338,7 +338,7 @@ class TestWithARealVideo:
         clip = replace(make_clip(30, 360, media), id=ClipId("clip"))
         project = AddClip(track.id, clip).apply(project)
         host = _AnalyzingHost(project, analyzer)
-        bridge = EditorBridge(host)
+        bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, DETECT, {"media_id": str(media.id)})
         pump_until(bridge, done, timeout=60)
         result = box.get("result")

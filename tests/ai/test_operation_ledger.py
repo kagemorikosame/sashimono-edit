@@ -19,6 +19,7 @@ from sashimono.ai.ledger import (
     Status,
 )
 from sashimono.ai.operations import OPERATIONS, find_operation
+from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 
 _NAMES = {operation.name for operation in OPERATIONS}
@@ -125,6 +126,57 @@ class TestSafetyAgreesWithTheLedger:
         for name in reading:
             operation = find_operation(name)
             assert operation is not None and operation.safety is Safety.READ_ONLY, name
+
+
+def sends_mismatches(rows: tuple[Entry, ...], only: dict[str, str]) -> list[str]:
+    """台帳の行と、道具が外へ送る物の宣言（``Operation.sends`` #342）が食い違う所
+
+    - アプリ自身の操作（読むだけと決めた行）を受ける道具は、アプリの設定を送ると宣言し、
+      作品の中身（絵・字幕と文字）は送らない 送ると、設定を読ませただけで作品の中身が外へ出る
+    - 「画面を見て分かることを読む道具」も含め、台帳に出てくる道具はどれも何かを送ると書く
+    """
+    wrong: list[str] = []
+    for entry in rows:
+        for tool in entry.tools:
+            operation = find_operation(tool)
+            if operation is None:
+                continue
+            if not operation.sends:
+                wrong.append(f"{entry.key}: {tool} は送る物を書いていない")
+            if entry.status is Status.READ_ONLY and (
+                Outbound.APP_SETTINGS not in operation.sends
+                or operation.sends & {Outbound.FRAMES, Outbound.TEXT}
+            ):
+                wrong.append(
+                    f"{entry.key}: アプリ自身の操作を受ける {tool} の送る物が"
+                    f" {sorted(kind.value for kind in operation.sends)}"
+                )
+    for tool in only:
+        operation = find_operation(tool)
+        if operation is not None and not operation.sends:
+            wrong.append(f"AI_ONLY: {tool} は送る物を書いていない")
+    return wrong
+
+
+class TestSendsAgreeWithTheLedger:
+    """台帳の行と、道具が外へ送る物の宣言（``Operation.sends`` #342）をそろえる"""
+
+    def test_each_tool_sends_what_its_row_says(self) -> None:
+        # 落ちると: アプリの設定を読むだけのはずの道具が作品の絵や文を送り、設定を読ませた
+        # だけで、同意の窓に出ない物が外へ出る（または送る物の書かれていない道具が台帳に残る）
+        assert not sends_mismatches(LEDGER, AI_ONLY)
+
+    def test_a_mismatch_is_caught(self) -> None:
+        # 落ちると: 絵を返す道具をアプリ自身の操作の行に書いても、見張りが気付かない
+        wrong = (Entry("メニュー/表示/設定…", Status.READ_ONLY, ("preview_frame",), 350, "設定"),)
+        assert len(sends_mismatches(wrong, {})) == 1
+
+    def test_the_settings_reader_is_declared_as_sending_settings_and_paths(self) -> None:
+        # 落ちると: 読むだけと決めた行の道具（get_app_settings）が、書き出しのフォルダなどの
+        # 場所を返すのに名前と場所を送ると書かず、尋ねずに送る
+        operation = find_operation("get_app_settings")
+        assert operation is not None
+        assert operation.sends == {Outbound.APP_SETTINGS, Outbound.FILES}
 
 
 class TestRowsAreWellFormed:

@@ -23,7 +23,8 @@ def _operation(name: str) -> Operation:
     return found
 
 
-READ = _operation("get_project")
+# 外へ送る物の同意（#342）が要らない、編集の構成だけを返す道具
+READ = _operation("get_selection")
 WRITE = _operation("split_clip")
 
 
@@ -79,7 +80,7 @@ class TestReadOnlyCalls:
         done, box = call_in_thread(bridge, READ, {})
         pump_until(bridge, done)
         assert bridge.take_approval() is None
-        assert box["result"]["duration_frames"] == 300  # type: ignore[index]
+        assert box["result"]["playhead"] == 0  # type: ignore[index]
 
     def test_a_frozen_ui_times_out_instead_of_hanging(self, host: FakeHost) -> None:
         from sashimono.ai import bridge as bridge_module

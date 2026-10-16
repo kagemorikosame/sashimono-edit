@@ -12,18 +12,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
+from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
-
-if TYPE_CHECKING:
-    # 並べ方の側が ToolError を使うので、ここで実行時に読むと互いを待って読めない
-    from sashimono.ai.sheet import SheetLayout
 
 __all__ = ["EditorHost", "SheetCanvas", "ToolError"]
 
@@ -251,6 +248,17 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.export_folder`）
 
         人が窓で選んで書き出した所なので、AI もそこへは書ける（2026-10-14 利用者の決定）
+        """
+        ...
+
+    def remembered_names(self) -> tuple[str, ...]:
+        """アプリが作品の外で覚えている名前と場所（#342） 読むだけ
+
+        AI の道具の結果に混ざりうる物を全部返すこと 字幕起こしの記録に残った素材の名前、
+        前に開いた作品の場所、設定に入った置き場など 名前と場所を送らないと決めた人の所で、
+        ブリッジがこれを伏せ字の表（:func:`~sashimono.ai.outbound.file_secrets`）へ入れる
+        作品の外に名前を覚える所を足したら、ここからも返す 返さないと、別の作品を開いた後に
+        その名前が伏せずに送られる（``tests/ui/test_remembered_names.py`` が見張る）
         """
         ...
 

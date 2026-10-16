@@ -157,9 +157,9 @@ def find_ymm4(
     looked: list[str] = []
     command = (association or association_command)()
     if command:
-        path = exe_from_command(command)
-        if path is not None and path.is_file():
-            return path, []
+        found = exe_from_command(command)
+        if found is not None and found.is_file():
+            return found, []
         looked.append(f".ymmp の関連付け {command}")
     else:
         looked.append(".ymmp の関連付け（登録なし）")
@@ -344,7 +344,9 @@ def written_length(video: Path) -> tuple[int, Fraction] | None:
         return None
     if rate is None or rate <= 0:
         return None
-    return count, Fraction(rate)
+    # 分子と分母から作る PyAV 19 から average_rate の型が AVRational になり、Fraction へ
+    # そのまま渡す書き方は型の上で通らない（本体の engine/decode/rational.py と同じ作り）
+    return count, Fraction(rate.numerator, rate.denominator)
 
 
 def clock(frame: int, fps: Fraction) -> str:

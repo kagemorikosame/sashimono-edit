@@ -50,6 +50,7 @@ from sashimono.engine.gpu import GLContextError
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ai.conftest import allow_sending
 from tests.check_media import HEIGHT, WIDTH, tone, write_tone, write_video
 
 
@@ -169,7 +170,8 @@ def _call(window: MainWindow, arguments: dict[str, Any], *, timeout: float = 120
     """
     operation = find_operation("check_output")
     assert operation is not None
-    bridge = EditorBridge(window, auto_approve=False)
+    # 送る物の確かめ（#342）は tests/ui/test_send_consent.py が見る ここは検査の道筋だけを見る
+    bridge = allow_sending(EditorBridge(window, auto_approve=False))
     box: dict[str, Any] = {}
 
     def work() -> None:

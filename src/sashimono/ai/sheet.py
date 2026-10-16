@@ -19,17 +19,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sashimono.ai.host import ToolError
-
 __all__ = [
     "GAP",
     "LABEL_HEIGHT",
     "MAX_COLUMNS",
     "MAX_SHEET_EDGE",
     "MIN_CELL_WIDTH",
+    "SheetError",
     "SheetLayout",
     "sheet_layout",
 ]
+
+
+class SheetError(ValueError):
+    """並べられない頼み 文面は直し方まで書く（道具が :class:`ToolError` にして AI へ返す）
+
+    ``ToolError`` をここで使わないのは、ホストの窓口（``ai/host.py``）がこの並べ方を
+    読むため 互いを読み合うと、どちらかが読み終わる前に名前を探して失敗する
+    """
+
 
 #: 1 枚の長い辺の上限（画素） 理由はモジュールの説明
 MAX_SHEET_EDGE = 1568
@@ -92,12 +100,12 @@ def sheet_layout(
     縮めても :data:`MIN_CELL_WIDTH` に届かなければ断る
     """
     if count < 1:
-        raise ToolError("並べるコマがありません")
+        raise SheetError("並べるコマがありません")
     frame_width, frame_height = frame_size
     aspect = frame_height / max(frame_width, 1)
     if columns is not None:
         if not 1 <= columns <= MAX_COLUMNS:
-            raise ToolError(f"columns は 1〜{MAX_COLUMNS} にしてください")
+            raise SheetError(f"columns は 1〜{MAX_COLUMNS} にしてください")
         candidates = [min(columns, count)]
     else:
         candidates = list(range(1, min(count, MAX_COLUMNS) + 1))
@@ -113,7 +121,7 @@ def sheet_layout(
     assert best is not None
     layout = best[1]
     if layout.cell_width < MIN_CELL_WIDTH:
-        raise ToolError(
+        raise SheetError(
             f"{count} 枚を 1 枚（長い辺 {MAX_SHEET_EDGE} 画素まで）に並べると、1 コマの幅が"
             f" {layout.cell_width} 画素になり小さすぎます 枚数を減らすか、columns を変えてください"
         )
