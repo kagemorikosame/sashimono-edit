@@ -571,8 +571,7 @@ class PreferencesDialog(QDialog):
         self._playhead_snap_markers = QCheckBox("目印（マーカー）", self)
         self._playhead_snap_markers.setChecked(preferences.playhead_snap_markers)
         self._playhead_snap_markers.setToolTip(
-            "読み込んだ作品などに付いている目印 いまのタイムラインには描かないので、"
-            "入れると見えない所でも吸い付く"
+            "目盛りの上の旗（マーカー） 目盛りの右クリックか AI アシスタントで置く"
         )
         targets = QWidget(self)
         target_row = FlowLayout(targets)
