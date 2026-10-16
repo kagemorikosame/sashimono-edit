@@ -154,6 +154,28 @@ class Program:
         flat = np.asarray(values, dtype=np.float32).reshape(-1)
         GL.glUniform2fv(location, len(values), flat)
 
+    def set_vec4_array(self, name: str, values: Sequence[Sequence[float]]) -> None:
+        """``vec4`` の配列を渡す 位置の引き方は :meth:`set_vec2_array` と同じ"""
+        location = self._array_location(name)
+        if location < 0 or not values:
+            return
+        flat = np.asarray(values, dtype=np.float32).reshape(-1)
+        GL.glUniform4fv(location, len(values), flat)
+
+    def set_float_array(self, name: str, values: Sequence[float]) -> None:
+        """``float`` の配列を渡す 位置の引き方は :meth:`set_vec2_array` と同じ"""
+        location = self._array_location(name)
+        if location < 0 or not values:
+            return
+        GL.glUniform1fv(location, len(values), np.asarray(values, dtype=np.float32))
+
+    def _array_location(self, name: str) -> int:
+        location = self.location(name)
+        if location < 0:
+            # 実装によっては配列の名前だけでは位置が引けず、先頭の要素名が要る
+            location = self.location(f"{name}[0]")
+        return location
+
     def set_mat3(self, name: str, values: Sequence[float]) -> None:
         """3x3 行列を渡す 並びは行優先で 9 個"""
         location = self.location(name)
