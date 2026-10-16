@@ -24,6 +24,7 @@ from sashimono.effects.spec import (
     CheckSpec,
     ColorSpec,
     FileSpec,
+    GradientSpec,
     GridSpec,
     SelectSpec,
     TrackSpec,
@@ -63,6 +64,21 @@ def srgb_to_linear(value: float) -> float:
     if value <= 0.04045:
         return value / 12.92
     return float(((value + 0.055) / 1.055) ** 2.4)
+
+
+def _set_gradient(program: Program, spec: GradientSpec, value: tuple[float, ...]) -> None:
+    """色の止まりの並び（#364）を ``名前_count`` ``名前_colors`` ``名前_offsets`` へ
+
+    数は**毎回**渡す uniform の値はプログラムに残るので、並びを持たない（前からの色の項目で
+    塗る）クリップが、前に描いた別のクリップの止まりで塗られる
+    色は sRGB のまま渡す シェーダは sRGB のまま混ぜるので、リニアへ往復させると端数が揺れる
+    """
+    stops = GradientSpec.stops(value)
+    program.set_int(f"{spec.name}_count", len(stops))
+    if not stops:
+        return
+    program.set_vec4_array(f"{spec.name}_colors", [colour for _, colour in stops])
+    program.set_float_array(f"{spec.name}_offsets", [position for position, _ in stops])
 
 
 class EffectProcessor:
@@ -426,6 +442,8 @@ class EffectProcessor:
                 program.set_int(spec.name, spec.coerce(value))
             elif isinstance(spec, GridSpec):
                 self._set_grid(program, spec, spec.coerce(value))
+            elif isinstance(spec, GradientSpec):
+                _set_gradient(program, spec, spec.coerce(value))
             elif isinstance(spec, FileSpec) and spec.texture:
                 unit = self._bind_image(program, spec, spec.coerce(value), unit)
 

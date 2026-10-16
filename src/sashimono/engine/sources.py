@@ -44,7 +44,7 @@ from sashimono.compat.aviutl.text_tags import (
 )
 from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.core.model import AnimatedValue, Effect, GeneratedSource, ParamValue
-from sashimono.effects.sources import SourceDefinition, source_registry
+from sashimono.effects.sources import SHAPE_FILL, SourceDefinition, source_registry
 from sashimono.effects.strokes import (
     STROKE,
     pixel_reach,
@@ -2089,7 +2089,14 @@ def _draw_shape(painter: QPainter, values: dict[str, object], width: int, height
     transform.rotate(float(values.get("rotation", 0.0)))  # type: ignore[arg-type]
     path = transform.map(path)
 
-    color = _color(values.get("color"))
+    color: QColor | QBrush = _color(values.get("color"))
+    paint = paint_of(values, SHAPE_FILL)
+    if paint is not None:
+        # 塗りのグラデーション（#364） 図形の枠（回す前の幅 x 高さ）に筆を置き、図形と一緒に
+        # 回す 画面の向きのまま置くと、回した図形の上で色の帯が回らずに残る 塗りと線（縁）は
+        # 同じ筆で塗る（単色のときも同じ色の項目で塗っている） 単色の道は前のまま 1 色で塗る
+        color = gradient_brush(paint, rect)
+        color.setTransform(transform)
     line_width = float(values.get("line_width", 0.0))  # type: ignore[arg-type]
     inside = str(values.get("line_align", "center")) == "inside"
 
