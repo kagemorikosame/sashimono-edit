@@ -35,8 +35,8 @@ from sashimono.ai.outbound import (
     redact,
     secret_pairs,
 )
-from sashimono.core.commands import RemoveMedia, SetTranscript
-from sashimono.core.model import MediaItem, Transcript
+from sashimono.core.commands import AddMarkers, RemoveMedia, SetTranscript
+from sashimono.core.model import Marker, MediaItem, Transcript
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.cache import SceneState
 from tests.ai.conftest import FakeHost, make_loaded
@@ -149,6 +149,9 @@ class TestDeclarations:
         secret_host.saved_at = tmp_path / "作品.sme"
         # 場面の解析が失敗した素材 断りの文に素材の名前が入る
         secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+        # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
+        named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
+        secret_host.apply_commands([AddMarkers(tuple(named))], "目印")
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
@@ -264,13 +267,19 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "jet_cut": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
+    # 目印（#330） 前からある目印（0 フレーム 名前は本文）を動かす・消す
+    "add_markers": lambda _ids: {"markers": [{"frame": 45, "label": ARG_TEXT}]},
+    "update_marker": lambda _ids: {"frame": 0, "label": ARG_TEXT},
+    "delete_markers": lambda _ids: {"frames": [0]},
 }
 
 
 def _with_text_clip(video_media: MediaItem, transcript: Transcript) -> FakeHost:
-    """素材の場所に本人の名前が入り、本文のテキストを 1 本置き、見た目を 1 つ保存した作品"""
+    """素材の場所に本人の名前が入り、本文のテキストを 1 本と本文を名前にした目印を 1 つ置き、
+    見た目を 1 つ保存した作品"""
     created = FakeHost(make_loaded(replace(video_media, path=SECRET_PATH), transcript))
     _operation("add_text")(created, {"text": BODY_TEXT})
+    created.apply_commands([AddMarkers((Marker(0, BODY_TEXT),))], "目印")
     created.library.aliases.save(_styled_alias(LOOK_NAME))
     return created
 

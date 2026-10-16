@@ -1146,9 +1146,15 @@ def _add_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
         color = _marker_color(item["color"]) if item.get("color") else Marker(frame).color
         markers.append(Marker(frame, _marker_label(item.get("label")), color))
     host.apply_commands([AddMarkers(tuple(markers))], "マーカーを置く")
+    project = _project(host)
+    added = {marker.frame for marker in markers}
     return {
-        "added": sorted(marker.frame for marker in markers),
-        "marker_count": len(_project(host).timeline.markers),
+        "added": [
+            _marker_row(marker, project.rate)
+            for marker in project.timeline.markers
+            if marker.frame in added
+        ],
+        "marker_count": len(project.timeline.markers),
     }
 
 
@@ -2705,6 +2711,8 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema(_paging()),
         handler=_list_markers,
+        # 目印の名前は本人の文（話の区切りの見出し） 字幕と文字として尋ねる
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="add_markers",
@@ -2738,6 +2746,9 @@ OPERATIONS: tuple[Operation, ...] = (
             ["markers"],
         ),
         handler=_add_markers,
+        # 置いた目印を名前ごと返す（前後の空白を落とした後の名前を AI が確かめるため）
+        # 字幕と文字を送らない人には、add_text と同じく道具を動かさずに断る
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -2753,6 +2764,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["frame"],
         ),
         handler=_update_marker,
+        sends=_WITH_TEXT,
         writes=True,
     ),
     Operation(
@@ -2769,6 +2781,8 @@ OPERATIONS: tuple[Operation, ...] = (
             }
         ),
         handler=_delete_markers,
+        # 返すのは消した数と残りの数だけで、名前は返さない 字幕と文字を送らない人でも消せる
+        sends=_STRUCTURE,
         writes=True,
     ),
     Operation(
@@ -2781,6 +2795,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({}),
         handler=_get_chapters,
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="preview_frame",
