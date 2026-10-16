@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ from sashimono.ai.models import DEFAULT_EFFORT as DEFAULT_AI_EFFORT
 from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
+from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
@@ -59,6 +60,8 @@ __all__ = [
     "SCRIPTS_MOVE_AUTO",
     "SCRIPTS_MOVE_MODES",
     "SCRIPTS_MOVE_OFF",
+    "SEND_ASK",
+    "SEND_MODES",
     "SNAP_DISTANCES",
     "PreferenceStore",
     "Preferences",
@@ -195,6 +198,10 @@ SCRIPTS_MOVE_ASK = "ask"
 SCRIPTS_MOVE_OFF = "off"
 SCRIPTS_MOVE_MODES = (SCRIPTS_MOVE_AUTO, SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF)
 
+#: AI へ送る物ごとの選択（:attr:`Preferences.ai_send_frames` など #342）
+#: 値は :class:`~sashimono.ai.outbound.SendChoice` と同じ文字
+SEND_ASK = SendChoice.ASK.value
+SEND_MODES = tuple(choice.value for choice in SendChoice)
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -555,6 +562,35 @@ class Preferences:
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
     #: 窓で選んで書き出した所だけ 2026-10-14 利用者の決定 #350）
     export_folder: str = ""
+    #: AI アシスタントが外（Anthropic）へ送る物ごとに、送る前に尋ねる（``ask``）・尋ねずに
+    #: 送る（``allow``）・送らない（``deny``）（#342 :mod:`sashimono.ai.outbound`）
+    #: 既定は尋ねる 何が外へ出るかを知らないまま、映像の絵や字幕の文が送られるのは困る
+    #: 尋ねる窓で「送る」と答えると ``allow`` を覚える 設定で ``ask`` へ戻すとまた尋ねる
+    #: 映像の絵（プレビューを描いた画像）
+    ai_send_frames: str = SEND_ASK
+    #: 字幕と文字（字幕起こしの結果・テキストのクリップの文）
+    ai_send_text: str = SEND_ASK
+    #: 素材の名前と場所 送らないと決めたら、伏せ字にして送る
+    ai_send_files: str = SEND_ASK
+
+    def send_choices(self) -> dict[Outbound, SendChoice]:
+        """AI へ送る物ごとの選択 ブリッジ（:class:`~sashimono.ai.bridge.EditorBridge`）へ渡す"""
+        return {
+            Outbound.FRAMES: SendChoice(self.ai_send_frames),
+            Outbound.TEXT: SendChoice(self.ai_send_text),
+            Outbound.FILES: SendChoice(self.ai_send_files),
+        }
+
+    def with_send_choice(self, kind: Outbound, choice: SendChoice) -> Preferences:
+        """1 つだけ変えた設定 確かめの窓で「送る」と答えた物を覚えるのに使う"""
+        if kind is Outbound.FRAMES:
+            return replace(self, ai_send_frames=choice.value)
+        if kind is Outbound.TEXT:
+            return replace(self, ai_send_text=choice.value)
+        if kind is Outbound.FILES:
+            return replace(self, ai_send_files=choice.value)
+        # 同意の要らない物（指示・編集の構成）は、いつも送るので覚える所が無い
+        raise ValueError(f"{kind} は送る前に尋ねる物ではありません")
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -771,6 +807,9 @@ class PreferenceStore:
                 data.get("scene_threads"), SCENE_THREAD_CHOICES, plain.scene_threads
             ),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
+            ai_send_frames=_choice(data.get("ai_send_frames"), SEND_MODES, plain.ai_send_frames),
+            ai_send_text=_choice(data.get("ai_send_text"), SEND_MODES, plain.ai_send_text),
+            ai_send_files=_choice(data.get("ai_send_files"), SEND_MODES, plain.ai_send_files),
         )
 
     def save(self, preferences: Preferences) -> None:
