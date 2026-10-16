@@ -10,14 +10,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+from sashimono.core.model import ParamValue
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.sampling import AREA_SAMPLING
 from sashimono.effects.spec import (
+    GRADIENT_MIXINGS,
     IMAGE_FILTER,
+    MAX_GRADIENT_STOPS,
+    MIXING_SMOOTH,
     CheckSpec,
     ColorSpec,
     FileSpec,
+    GradientSpec,
     SelectSpec,
     TrackSpec,
     ValueSpec,
@@ -881,6 +888,7 @@ void main() {
 
 _GRADIENT = _shader(
     BLEND_FUNCTIONS
+    + f"const int MAX_GRADIENT_STOPS = {MAX_GRADIENT_STOPS};\n"
     + """
 uniform float strength;
 uniform float center_x;
@@ -891,6 +899,17 @@ uniform int shape;
 uniform int blend;
 uniform vec4 start_color;
 uniform vec4 end_color;
+// 色の止まりの並び（#364） 数が 2 より少なければ前からの開始色と終了色の 2 色で塗る
+// 色は sRGB のまま届く（混ぜるのも sRGB なので、リニアへ往復させない）
+uniform int gradient_count;
+uniform vec4 gradient_colors[MAX_GRADIENT_STOPS];
+uniform float gradient_offsets[MAX_GRADIENT_STOPS];
+// 色の混ぜ方 0 が S 字（既定 前の版と同じ）、1 が直線
+uniform int mixing;
+
+float eased(float k) {
+    return mixing == 1 ? k : k * k * (3.0 - 2.0 * k);
+}
 
 // 合成は符号化した値（sRGB）で計算する ここはリニアで持っているので往復する
 vec3 to_srgb(vec3 c) {
@@ -938,9 +957,38 @@ void main() {
     // 描かせて位置ごとの明るさを測ると、直線ではなく S 字だった
     // 直線で混ぜると、帯の両端が濃くなりすぎて中ほどが薄い別の絵になる
     float along = clamp(t, 0.0, 1.0);
-    along = along * along * (3.0 - 2.0 * along);
-    vec3 ramp_rgb = mix(to_srgb(start_color.rgb), to_srgb(end_color.rgb), along);
-    float ramp_alpha = mix(start_color.a, end_color.a, along);
+    vec3 ramp_rgb;
+    float ramp_alpha;
+    if (gradient_count < 2) {
+        // 前からの 2 色 前の版と同じ式のまま残す（読み込んだ作品の色を 1 段も動かさない）
+        // 直線を選んだときだけ直線 既定の S 字は前と同じ式
+        along = eased(along);
+        ramp_rgb = mix(to_srgb(start_color.rgb), to_srgb(end_color.rgb), along);
+        ramp_alpha = mix(start_color.a, end_color.a, along);
+    } else {
+        // 何色でも 止まりと止まりの間ごとに選んだ混ぜ方（既定の S 字か直線）で混ぜる
+        // S 字を並び全体で 1 本にすると、
+        // バーで 25% に置いた止まりの色が画面では 33% ほどの所に出る
+        // 止まりが 2 つ（位置 0 と 1）なら上の 2 色の式と同じ絵になる
+        int count = min(gradient_count, MAX_GRADIENT_STOPS);
+        vec4 colour = gradient_colors[0];
+        if (along > gradient_offsets[0]) {
+            colour = gradient_colors[count - 1];
+            for (int i = 1; i < count; ++i) {
+                float right = gradient_offsets[i];
+                if (along <= right) {
+                    float left = gradient_offsets[i - 1];
+                    float k = right > left ? (along - left) / (right - left) : 1.0;
+                    k = clamp(k, 0.0, 1.0);
+                    k = eased(k);
+                    colour = mix(gradient_colors[i - 1], gradient_colors[i], k);
+                    break;
+                }
+            }
+        }
+        ramp_rgb = colour.rgb;
+        ramp_alpha = colour.a;
+    }
     // 元の絵の不透明度はそのまま グラデーションは色だけを塗り替える
     float amount = clamp(strength * 0.01, 0.0, 1.0) * ramp_alpha;
     // 合成の仕方は塗りと同じ関数を使う AviUtl のグラデーションは
@@ -955,6 +1003,26 @@ void main() {
 }
 """
 )
+
+
+_START_COLOR = ColorSpec("start_color", "開始色", (1.0, 1.0, 1.0, 1.0))
+_END_COLOR = ColorSpec("end_color", "終了色", (0.0, 0.0, 0.0, 1.0))
+
+
+def _two_colours(params: Mapping[str, ParamValue]) -> tuple[float, ...]:
+    """「グラデーション」の前からの開始色と終了色を、位置 0 と 1 の止まりの並びにする（#364）"""
+    start = _START_COLOR.coerce(params.get(_START_COLOR.name))
+    end = _END_COLOR.coerce(params.get(_END_COLOR.name))
+    return (0.0, *start, 1.0, *end)
+
+
+def _gradient_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
+    """「グラデーション」の欄で出さない項目 開始色と終了色はバーの両端として見せる
+
+    2 か所に出すと、止まりを足した後で開始色を直しても絵が変わらない（並びが勝つ）
+    """
+    del params
+    return frozenset({_START_COLOR.name, _END_COLOR.name})
 
 
 #: AviUtl2 の 色調補正 色は符号化した値（sRGB 0〜1）で計算する 値はどれも 100 で元のまま
@@ -1243,8 +1311,14 @@ def register_builtin_effects() -> None:
             category="装飾",
             parameters=(
                 TrackSpec("strength", "強さ", 0, 100, 100, unit="%"),
-                ColorSpec("start_color", "開始色", (1.0, 1.0, 1.0, 1.0)),
-                ColorSpec("end_color", "終了色", (0.0, 0.0, 0.0, 1.0)),
+                _START_COLOR,
+                _END_COLOR,
+                # 何色でも置ける色の止まり（#364） 空の間は開始色と終了色で塗る（前の版の作品・
+                # AviUtl2 の読み込みはどれもこの形） バーには開始色と終了色を並べて見せる
+                GradientSpec("gradient", "色", default=(), mixing="mixing", legacy=_two_colours),
+                # 止まりの間の混ぜ方（#364 利用者の決定） 既定は S 字で、項目を持たない前の版の
+                # 作品と AviUtl2 の読み込みは S 字のまま 決めの欄なのでキーフレームは打てない
+                SelectSpec("mixing", "色の混ぜ方", GRADIENT_MIXINGS, MIXING_SMOOTH),
                 SelectSpec("shape", "形状", (("linear", "線形"), ("radial", "円形")), "linear"),
                 TrackSpec("angle", "角度", -360, 360, 90, unit="度"),
                 TrackSpec("span", "幅", 1, 4000, 100, step=1, unit="px"),
@@ -1253,6 +1327,7 @@ def register_builtin_effects() -> None:
                 SelectSpec("blend", "合成", BLEND_MODES, "normal"),
             ),
             fragment_shader=_GRADIENT,
+            unused=_gradient_unused,
         )
     )
 

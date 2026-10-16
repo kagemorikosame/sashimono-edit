@@ -123,6 +123,7 @@ from sashimono.effects.strokes import (
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui import library_dialog, library_save
 from sashimono.ui.flow_layout import ElidedLabel
+from sashimono.ui.inspector.gradient import GradientEditor
 from sashimono.ui.inspector.header import ClipHeader, identify_clip
 from sashimono.ui.inspector.widgets import (
     FontStyleEditor,
@@ -488,8 +489,10 @@ class InspectorPanel(QWidget):
             self._native_capable(clip),
             clip.hold_at,
             self._start_maximum(clip),
-            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.effects),
-            tuple((effect.id, effect.kind, effect.fixed) for effect in clip.after_effects),
+            # 欄に出す項目（#364 模様の種類やバーを触ったかで変わる）も入れる 入れないと、
+            # 単色の模様から線形へ替えてもバーが出ない
+            tuple(_effect_layout(effect) for effect in clip.effects),
+            tuple(_effect_layout(effect) for effect in clip.after_effects),
             self._double_click_reset,
             self._stroke_layout(clip),
         )
@@ -511,7 +514,7 @@ class InspectorPanel(QWidget):
         return tuple(
             (
                 stroke.id,
-                tuple((effect.id, effect.kind) for effect in stroke.effects),
+                tuple(_effect_layout(effect) for effect in stroke.effects),
                 STROKE.unused_names(stroke.params),
             )
             for stroke in source.strokes
@@ -1314,13 +1317,47 @@ class InspectorPanel(QWidget):
             # 掛けずに飛ばすので、そのことを言う 黙っていると、値を動かしても絵が変わらない
             section.add_note("このエフェクトは縁取りの層には掛かりません " + STROKE_EFFECT_NOTE)
 
+        unused = definition.unused_names(effect.params)
         for spec in definition.parameters:
+            if spec.name in unused:
+                continue
             if stroke_id is not None:
                 path = ParamPath.of_stroke_effect(clip.id, stroke_id, effect.id, spec.name)
             else:
                 path = ParamPath.of_effect(clip.id, effect.id, spec.name, after=after)
-            self._param_row(section, spec.label, spec, path, effect.params.get(spec.name))
+            self._param_row(section, spec.label, spec, path, _effect_value(effect, spec.name))
+            editor = self._editors[_editor_key(path)]
+            if isinstance(spec, GradientSpec) and isinstance(editor, GradientEditor):
+                self._follow_mixing(editor, spec, effect.id, stroke_id)
         return section
+
+    def _follow_mixing(
+        self,
+        editor: GradientEditor,
+        spec: GradientSpec,
+        effect_id: EffectId,
+        stroke_id: StrokeId | None,
+    ) -> None:
+        """バーの見本を、エフェクトで選んだ色の混ぜ方（#364）で描かせ、選び替えにも付いていく
+
+        作り直さずに入れ直す（:meth:`_refresh_values`） 混ぜ方を替えても見本が前の混ぜ方のままだと、
+        見本で決めた色の出方が画面の絵と食い違う
+        """
+
+        def refresh(current: Clip) -> None:
+            if stroke_id is not None:
+                held = current.source.find_stroke(stroke_id) if current.source else None
+                stack = held.effects if held is not None else ()
+            else:
+                stack = (*current.effects, *current.after_effects)
+            found = next((e for e in stack if e.id == effect_id), None)
+            if found is not None:
+                editor.set_smooth(spec.smooth_in(found.params))
+
+        clip = self._clip()
+        if clip is not None:
+            refresh(clip)
+        self._refreshers.append(refresh)
 
     # --- 縁取りの層（#272 #273） ---
 
@@ -2028,7 +2065,27 @@ class InspectorPanel(QWidget):
             *(effect for stroke in held for effect in stroke.effects),
         )
         effect = next((e for e in both if e.id == owner), None)
-        return effect.params.get(name) if effect is not None else None
+        return _effect_value(effect, name) if effect is not None else None
+
+
+def _effect_layout(effect: Effect) -> tuple[object, ...]:
+    """エフェクトの組の構成（作り直しの指紋 :meth:`InspectorPanel._layout_key`）"""
+    definition = registry.get(effect.kind)
+    unused = definition.unused_names(effect.params) if definition is not None else frozenset()
+    return (effect.id, effect.kind, effect.fixed, unused)
+
+
+def _effect_value(effect: Effect, name: str) -> ParamValue | None:
+    """エフェクトの項目の、欄に出す値
+
+    色の止まりの並びが空（前からの色の項目で塗る #364）なら、前からの項目を並べた物を出す
+    空のまま出すと、バーが既定の白から黒を見せ、触っただけで前からの色が置き換わる
+    """
+    definition = registry.get(effect.kind)
+    spec = definition.spec(name) if definition is not None else None
+    if isinstance(spec, GradientSpec):
+        return spec.shown(effect.params)
+    return effect.params.get(name)
 
 
 def _effect_of(command: Command) -> EffectId | None:
