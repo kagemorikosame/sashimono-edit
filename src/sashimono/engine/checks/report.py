@@ -147,8 +147,15 @@ class CheckReport:
 
     @property
     def checked(self) -> frozenset[str]:
-        """実際に調べた種類"""
-        return self.limits.kinds - self.skipped
+        """実際に調べた種類
+
+        長さは目安（``expected_seconds``）が無ければ比べる相手が無いので数えない 数えると、
+        目安を渡さない呼び方で「長さに問題は無い」と読まれる（長さそのものは要約に出す）
+        """
+        unchecked = self.skipped
+        if self.limits.expected_seconds is None:
+            unchecked = unchecked | {LENGTH}
+        return self.limits.kinds - unchecked
 
     @property
     def seconds(self) -> float:

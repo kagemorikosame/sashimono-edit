@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -40,6 +41,9 @@ def write_video(
     clipped: tuple[float, float] | None = None,
     silent: tuple[float, float] | None = None,
     audio_codec: str = "aac",
+    held: tuple[float, float] | None = None,
+    audio_delay: float = 0.0,
+    audio_gap: tuple[float, float] | None = None,
 ) -> Path:
     """動く絵の動画を焼く 区間（秒）を渡すと、そこだけ問題のある絵と音にする
 
@@ -50,6 +54,11 @@ def write_video(
     AAC は頭打ちの平らな所を崩す（手元の FFmpeg では 1.05〜1.17 秒の山が 0.965 まで
     下がった） 崩れ方はエンコーダの版で変わり、CI の Windows では音割れの終わりが
     0.17 秒手前に来た 圧縮しない PCM ならどの環境でも同じ値になる
+
+    時刻（PTS）の試験は ``.mkv`` で焼く
+    - ``held`` の間はコマを書かない（VFR） 頭のコマが次のコマまで出続ける
+    - ``audio_delay`` 秒だけ音の頭を遅らせる（音は映像より遅れて始まる）
+    - ``audio_gap``（音の秒）の間は音のフレームを書かず、PTS をその分だけ飛ばす
     """
     frames = round(seconds * FPS)
     codec = "libx264" if "libx264" in av.codecs_available else "mpeg4"
@@ -75,13 +84,18 @@ def write_video(
                 image = moving_frame(round(frozen[0] * FPS))
             else:
                 image = moving_frame(index)
-            for packet in stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
+            if held is not None and held[0] < second < held[1] - 1e-9:
+                continue
+            picture = av.VideoFrame.from_ndarray(image, format="rgb24")
+            picture.pts = index
+            picture.time_base = Fraction(1, FPS)
+            for packet in stream.encode(picture):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
         if audio is not None and tone_db is not None:
-            samples = tone(seconds, tone_db, clipped=clipped, silent=silent)
-            _encode_audio(container, audio, samples)
+            samples = tone(seconds - audio_delay, tone_db, clipped=clipped, silent=silent)
+            _encode_audio(container, audio, samples, start=round(audio_delay * RATE), gap=audio_gap)
     return path
 
 
@@ -116,15 +130,25 @@ def write_tone(path: Path, samples: np.ndarray) -> Path:
 
 
 def _encode_audio(
-    container: av.container.OutputContainer, stream: av.AudioStream, samples: np.ndarray
+    container: av.container.OutputContainer,
+    stream: av.AudioStream,
+    samples: np.ndarray,
+    *,
+    start: int = 0,
+    gap: tuple[float, float] | None = None,
 ) -> None:
+    """``start`` サンプル目から書く ``gap``（秒 音の頭から）の間は書かずに PTS を飛ばす"""
     pcm = np.clip(samples, -1.0, 1.0)
     step = 1024
-    for start in range(0, len(pcm), step):
-        block = np.ascontiguousarray(pcm[start : start + step].T.astype(np.float32))
+    skip = (round(gap[0] * RATE), round(gap[1] * RATE)) if gap is not None else None
+    for offset in range(0, len(pcm), step):
+        if skip is not None and skip[0] <= offset < skip[1]:
+            continue
+        block = np.ascontiguousarray(pcm[offset : offset + step].T.astype(np.float32))
         frame = av.AudioFrame.from_ndarray(block, format="fltp", layout="stereo")
         frame.sample_rate = RATE
-        frame.pts = start
+        frame.pts = start + offset
+        frame.time_base = Fraction(1, RATE)
         for packet in stream.encode(frame):
             container.mux(packet)
     for packet in stream.encode():

@@ -281,6 +281,19 @@ class AudioScan:
     def seconds(self) -> float:
         return self._position / self._rate
 
+    @property
+    def samples(self) -> int:
+        """これまでに渡したサンプルの数"""
+        return self._position
+
+    @property
+    def rate(self) -> int:
+        return self._rate
+
+    @property
+    def channels(self) -> int:
+        return self._channels
+
     def add(self, samples: np.ndarray) -> None:
         block = np.asarray(samples, dtype=np.float64).reshape(-1, self._channels)
         if len(block) == 0:

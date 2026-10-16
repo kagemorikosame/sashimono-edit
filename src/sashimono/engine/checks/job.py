@@ -17,10 +17,12 @@ GL のコンテキストはプレビューの先読みと同じ作り（サー�
 from __future__ import annotations
 
 import contextlib
+import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -35,6 +37,7 @@ from sashimono.engine.checks.overflow import OverflowScan
 from sashimono.engine.checks.report import CheckReport, ClipIndex, assemble
 from sashimono.engine.checks.scan import (
     CLIPPING,
+    LOUDNESS,
     PICTURE_KINDS,
     SOUND_KINDS,
     TEXT_OVERFLOW,
@@ -43,6 +46,8 @@ from sashimono.engine.checks.scan import (
     Run,
     VideoScan,
 )
+from sashimono.engine.decode.probe import media_origin
+from sashimono.engine.decode.rational import Ratio, as_fraction
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, FrameRenderer, RenderQuality
 
@@ -146,6 +151,18 @@ class _Progress:
             runs += self.audio.runs(final=final)
         if self.overflow is not None:
             runs += self.overflow.runs()
+        loudness = self.audio.loudness() if self.audio is not None else None
+        skipped = set(self.skipped)
+        notes = list(self.notes)
+        limits = self.request.limits
+        if final and LOUDNESS in limits.kinds and LOUDNESS not in skipped and loudness is None:
+            # 400 ms に満たない音・-70 LUFS より静かな音だけの作品は、規格の決まりで値が出ない
+            # 調べたことにすると「音量は基準どおり」と読まれる 測れなかったと分けて返す
+            skipped.add(LOUDNESS)
+            notes.append(
+                "音量（ラウドネス）は測れませんでした 音が無いか、静かすぎるか（-70 LUFS 未満）、"
+                "短すぎます（400 ms 未満）"
+            )
         return assemble(
             runs,
             start=self.start,
@@ -155,11 +172,11 @@ class _Progress:
             complete=final,
             limits=self.request.limits,
             index=self.index,
-            loudness=self.audio.loudness() if self.audio is not None else None,
+            loudness=loudness,
             peak=self.audio.peak if self.audio is not None else None,
             length_seconds=self.length_seconds,
-            notes=tuple(self.notes),
-            skipped=frozenset(self.skipped),
+            notes=tuple(notes),
+            skipped=frozenset(skipped),
         )
 
     def fraction(self) -> float:
@@ -499,13 +516,24 @@ def _check_file(path: Path, progress: _Progress) -> None:
                 progress.length_seconds = duration
                 progress.analyzed = progress.end
             return
+        # 時刻は素材の原点から数える（デコーダと同じ media_origin） 映像は PTS からコマの番号を、
+        # 音は PTS からサンプルの位置を出す 連番と隙間の無い並びとして渡すと、音が遅れて始まる
+        # ファイルの頭の無音や、VFR で長く出るコマ（止まった絵）を見落とし、時刻もずれる
+        origin = media_origin(container)
+        frame_rate = Fraction(rate) if rate else Fraction(30)
         pictures = 0
+        last_luma: np.ndarray | None = None
         size: tuple[int, int] | None = None
         for packet in container.demux(*streams):
             if progress.cancel.is_set():
                 return
             for decoded in packet.decode():
                 if isinstance(decoded, av.video.frame.VideoFrame):
+                    when = _seconds(decoded.pts, decoded.time_base, origin)
+                    index = pictures if when is None else math.floor(when * frame_rate + 0.5)
+                    if index < pictures:
+                        # 同じコマに 2 枚（VFR の詰まった所・並べ替えの残り）は前の 1 枚だけを数える
+                        continue
                     if size is None:
                         scale = min(1.0, ANALYSIS_WIDTH / max(decoded.width, 1))
                         size = (
@@ -515,17 +543,32 @@ def _check_file(path: Path, progress: _Progress) -> None:
                     gray = decoded.reformat(width=size[0], height=size[1], format="gray")
                     luma = gray.to_ndarray().astype(np.float32) / 255.0
                     with progress.lock:
-                        if progress.video is not None:
-                            progress.video.add(pictures, luma)
-                    pictures += 1
+                        scan = progress.video
+                        if scan is not None:
+                            # 欠けたコマは、再生では前の絵が出続ける 頭より前に絵が無ければ黒
+                            held = last_luma if last_luma is not None else np.zeros_like(luma)
+                            for missing in range(pictures, index):
+                                scan.add(missing, held)
+                            scan.add(index, luma)
+                    last_luma = luma
+                    pictures = index + 1
                 elif isinstance(decoded, av.audio.frame.AudioFrame):
-                    _feed_audio(progress, resampler.resample(decoded), fps)
+                    when = _seconds(decoded.pts, decoded.time_base, origin)
+                    _feed_audio(progress, resampler.resample(decoded), fps, when)
             with progress.lock:
                 heard = progress.audio.seconds * fps if progress.audio is not None else 0
                 progress.analyzed = max(pictures, round(heard))
             progress.touch()
-        _feed_audio(progress, resampler.resample(None), fps)
+        _feed_audio(progress, resampler.resample(None), fps, None)
         with progress.lock:
+            if audio is not None and progress.audio is None:
+                # 音の流れはあるのに 1 サンプルも出なかった 測っていない物を「無音は無い」と言わない
+                progress.skip(SOUND_KINDS, "音の流れから音を読めませんでした")
+            if video is not None and pictures == 0:
+                progress.skip(PICTURE_KINDS, "映像の流れから絵を読めませんでした")
+            if progress.audio is not None and pictures / fps > progress.audio.seconds:
+                # 音が映像より先に終わる所は、再生では無音になる 無音として数える
+                _pad_silence(progress.audio, round(pictures / fps * progress.audio.rate))
             heard = progress.audio.seconds if progress.audio is not None else 0.0
             length = max(pictures / fps, heard)
             progress.length_seconds = length
@@ -533,7 +576,37 @@ def _check_file(path: Path, progress: _Progress) -> None:
             progress.analyzed = progress.end
 
 
-def _feed_audio(progress: _Progress, frames: list[av.audio.frame.AudioFrame], fps: float) -> None:
+def _seconds(pts: int | None, time_base: Ratio | None, origin: Fraction) -> Fraction | None:
+    """フレームの PTS を、素材の原点からの秒にする 分からなければ ``None``"""
+    if pts is None or time_base is None:
+        return None
+    return pts * as_fraction(time_base) - origin
+
+
+#: 音の位置のずれを詰めずに許す長さ（秒） 符号化の丸めで PTS は 1 サンプルほど揺れる
+#: 揺れのたびに無音を足したり削ったりすると、音割れの続きがそこで切れる
+_AUDIO_SLACK = 0.002
+
+
+def _pad_silence(scan: AudioScan, until: int) -> None:
+    """``until`` サンプル目まで無音を足す 長い隙間は 1 秒ずつ渡す（一度に大きな配列を作らない）"""
+    step = scan.rate
+    while scan.samples < until:
+        count = min(step, until - scan.samples)
+        scan.add(np.zeros((count, scan.channels), dtype=np.float32))
+
+
+def _feed_audio(
+    progress: _Progress,
+    frames: list[av.audio.frame.AudioFrame],
+    fps: float,
+    when: Fraction | None,
+) -> None:
+    """リサンプルした音を渡す ``when`` は元のフレームの頭の時刻（原点から 秒）
+
+    PTS が今までに渡した長さより後ろなら、間を無音で埋める（遅れて始まる音・途中の抜け）
+    前なら重なった分を捨てる（原点より前の前置き・重なった PTS）
+    """
     for frame in frames:
         planar = frame.to_ndarray()
         with progress.lock:
@@ -544,4 +617,15 @@ def _feed_audio(progress: _Progress, frames: list[av.audio.frame.AudioFrame], fp
                     channels=planar.shape[0],
                     fps=fps,
                 )
-            progress.audio.add(planar.T)
+            scan = progress.audio
+            block = planar.T
+            if when is not None:
+                at = math.floor(when * scan.rate)
+                slack = round(scan.rate * _AUDIO_SLACK)
+                if at > scan.samples + slack:
+                    _pad_silence(scan, at)
+                elif at < scan.samples - slack:
+                    block = block[scan.samples - at :]
+                # 1 つの元のフレームから出た塊は続けて並べる 2 つ目からは位置を見ない
+                when = None
+            scan.add(block)

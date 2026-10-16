@@ -22,8 +22,19 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, Q
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddClip, insert_generated
+from sashimono.core.commands import (
+    AddClip,
+    AddScene,
+    InScene,
+    ParamPath,
+    ParamTarget,
+    SetParam,
+    insert_generated,
+    insert_scene,
+    new_scene,
+)
 from sashimono.core.model import (
+    AnimatedValue,
     Clip,
     MediaItem,
     Project,
@@ -293,6 +304,27 @@ class TestTimeline:
 class TestSound:
     """音だけを調べる 絵を描かないので GPU が無くても走る"""
 
+    def test_a_work_without_sound_does_not_claim_fine_loudness(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、音を置いていない作品で音量を測れないのに「問題は見つかりませんでした」と返す
+        project = _project(media, pictures=(_clip(media.video, 0, 90, 0.0),), sounds=())
+        result = _call(_window(opened, project), {"checks": ["loudness"]})
+        assert result["checks"] == []
+        assert result["skipped_checks"] == ["loudness"]
+        assert "問題は見つかりませんでした" not in result["note"]
+        assert "測れませんでした" in result["note"]
+
+    def test_length_counts_as_checked_only_with_a_target(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、目安を渡していないのに「長さに問題は無い」と読まれる
+        window = _window(opened, _clean(media))
+        result = _call(window, {"checks": ["length", "silence"]})
+        assert result["checks"] == ["silence"]
+        result = _call(window, {"checks": ["length", "silence"], "expected_seconds": 9})
+        assert result["checks"] == ["silence", "length"]
+
     def test_a_gap_in_the_sound_is_silence(self, opened: list[MainWindow], media: _Media) -> None:
         # 壊れると、音を置き忘れた 3 秒の無音を見落とす
         project = _project(
@@ -441,6 +473,98 @@ class _NoGpuContext:
 
 def _refuse_gpu(*_arguments: object, **_options: object) -> None:
     raise GLContextError("試験: サーフェスを作れない")
+
+
+def _with_scene(media: _Media, text: str, *, inner_x: float = 0.0, outer_x: float = 0.0) -> Project:
+    """動画 1 本の上に、字幕 1 本だけを入れたシーンを置いた作品
+
+    ``inner_x`` はシーンの中の字幕の位置、``outer_x`` はシーンを置いたクリップの位置（配置の X）
+    """
+    base = _project(
+        media,
+        pictures=(_clip(media.video, 0, 180, 0.0),),
+        sounds=(_clip(media.tone, 0, 180),),
+        text="",
+    )
+    # 今のタイムラインの字幕は消しておく（シーンの中の字幕だけを見る）
+    base = base.with_timeline(
+        replace(
+            base.timeline,
+            tracks=tuple(
+                replace(
+                    track,
+                    clips=tuple(
+                        clip
+                        for clip in track.clips
+                        if clip.source is None or clip.source.kind != "text"
+                    ),
+                )
+                for track in base.timeline.tracks
+            ),
+        )
+    )
+    scene = new_scene(base, "字幕")
+    project = AddScene(scene).apply(base)
+    inside = replace(project, timeline=scene.timeline)
+    for command in insert_generated(
+        inside,
+        TEXT.create(text=text, size=20.0, pos_x=inner_x, pos_y=-60.0),
+        at_frame=0,
+        duration=180,
+    ):
+        project = InScene(scene.id, command).apply(project)
+        inside = replace(project, timeline=project.require_scene(scene.id).timeline)
+    for command in insert_scene(project, scene.id, at_frame=0, duration=180):
+        project = command.apply(project)
+    if outer_x:
+        placed = next(
+            clip
+            for track in project.timeline.tracks
+            for clip in track.clips
+            if clip.scene_id == scene.id
+        )
+        transform = next(effect for effect in placed.effects if effect.kind == "transform")
+        project = SetParam(
+            ParamPath(placed.id, ParamTarget.EFFECT, "pos_x", transform.id),
+            AnimatedValue(outer_x),
+        ).apply(project)
+    return project
+
+
+@pytest.mark.usefixtures("gpu")
+class TestSubtitlesInScenes:
+    """置いたシーンの中の字幕も、完成映像に描かれるので調べる"""
+
+    def test_a_long_subtitle_inside_a_scene_is_found(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、シーンにまとめた字幕が画面の端で切れていても見落とす
+        project = _with_scene(media, "とても長い字幕が画面の端からはみ出して切れてしまう例")
+        result = _call(_window(opened, project), {"checks": ["text_overflow"]})
+        (overflow,) = _kinds(result)["text_overflow"]
+        assert overflow["beyond_screen"] is True
+        placed = next(
+            clip for track in project.timeline.tracks for clip in track.clips if clip.scene_id
+        )
+        assert overflow["in_scene_clip"] == str(placed.id)
+
+    def test_moving_the_placed_scene_off_screen_is_found(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、シーンの中では収まる字幕を、置いたクリップの位置で画面の外へ出したのを見落とす
+        project = _with_scene(media, "こんにちは", outer_x=150.0)
+        result = _call(_window(opened, project), {"checks": ["text_overflow"]})
+        (overflow,) = _kinds(result)["text_overflow"]
+        assert overflow["sides"] == "右"
+
+    def test_a_subtitle_that_fits_inside_a_scene_is_fine(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、シーンの中の収まった字幕まで外側の配置を取り違えて、はみ出すと言う
+        project = _with_scene(media, "こんにちは")
+        result = _call(_window(opened, project), {"checks": ["text_overflow"]})
+        assert result["problems"] == []
+        assert result["checks"] == ["text_overflow"]
 
 
 class TestWithoutGpu:

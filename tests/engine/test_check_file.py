@@ -151,6 +151,60 @@ class TestWrittenFiles:
         assert report.checked == frozenset()
         assert report.skipped == frozenset(kinds)
 
+    def test_late_and_missing_sound_follows_the_timestamps(
+        self, job: CheckJob, tmp_path: Path
+    ) -> None:
+        # 壊れると、音が 1 秒遅れて始まる動画の頭の無音と、途中で音のフレームが抜けた所を見落とし、
+        # 後ろの問題の時刻も抜けた分だけ手前にずれる
+        path = write_video(
+            tmp_path / "遅れる音.mkv",
+            10.0,
+            tone_db=-14.0,
+            audio_codec="pcm_s16le",
+            audio_delay=1.0,
+            audio_gap=(3.0, 5.5),
+            clipped=(7.0, 7.2),
+        )
+        report = _check(
+            job,
+            path,
+            CheckLimits(kinds=frozenset({"silence", "clipping"}), min_silence_seconds=0.5),
+        )
+        found = _kinds(report)
+        # 無音は 50 ms の区切りで測るので、区切りとコマの丸めの分（0.1 秒）まで許す
+        assert found["silence"] == [
+            pytest.approx((0.0, 1.0), abs=0.1),
+            pytest.approx((4.0, 6.5), abs=0.1),
+        ]
+        (clipping,) = found["clipping"]
+        assert clipping == pytest.approx((8.0, 8.2), abs=0.05)
+
+    def test_a_long_held_frame_in_a_vfr_video_is_a_freeze(
+        self, job: CheckJob, tmp_path: Path
+    ) -> None:
+        # 壊れると、VFR の動画で 3 秒出続けるコマを 1 コマと数えて止まりを見落とし、
+        # その後の黒の時刻も 3 秒手前にずれる
+        path = write_video(tmp_path / "VFR.mkv", 10.0, held=(2.0, 5.0), black=(7.0, 7.5))
+        report = _check(job, path, CheckLimits(kinds=frozenset({"black", "freeze"})))
+        found = _kinds(report)
+        (freeze,) = found["freeze"]
+        assert freeze == pytest.approx((2.0, 5.0), abs=0.05)
+        (black,) = found["black"]
+        assert black == pytest.approx((7.0, 7.5), abs=0.05)
+        assert report.seconds == pytest.approx(10.0, abs=0.05)
+
+    @pytest.mark.parametrize(("seconds", "db"), [(3.0, -200.0), (3.0, -80.0), (0.3, -14.0)])
+    def test_unmeasurable_loudness_is_not_reported_as_fine(
+        self, job: CheckJob, tmp_path: Path, seconds: float, db: float
+    ) -> None:
+        # 壊れると、無音・静かすぎる・短すぎる動画で音量を測れないのに「問題は無い」と返す
+        path = write_video(tmp_path / "測れない.mkv", seconds, tone_db=db, audio_codec="pcm_s16le")
+        report = _check(job, path, CheckLimits(kinds=frozenset({"loudness"})))
+        assert report.loudness is None
+        assert report.skipped == frozenset({"loudness"})
+        assert report.checked == frozenset()
+        assert any("測れませんでした" in note for note in report.notes)
+
     def test_text_overflow_is_not_claimed_for_a_file(self, job: CheckJob, tmp_path: Path) -> None:
         # 壊れると、字の形の残らない動画を「字幕のはみ出し無し」と言い切り、AI が安心して渡す
         path = write_video(tmp_path / "clean.mp4", 2.0, tone_db=-14.0)
