@@ -34,6 +34,7 @@ from sashimono.engine.cache.proxy import (
     MEASURED_PREFETCH_MS,
     MEASURED_THREE_LAYERS_MS,
 )
+from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import (
     MEASURED_DECODE_MS,
     MEASURED_EXPORT_MS,
@@ -184,9 +185,9 @@ class PreferencesDialog(QDialog):
 
     def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        #: 開いたときの設定 :meth:`preferences` はここから画面の項目だけを変える
+        self._given = preferences
         self.setWindowTitle("設定")
-        #: 開いたときの設定 :meth:`preferences` はこれに画面の値を重ねる
-        self._base = preferences
 
         form = QFormLayout()
 
@@ -776,6 +777,19 @@ class PreferencesDialog(QDialog):
             " 変えると、次の指示から新しい会話になる"
         )
         form.addRow(self._ai_ask_questions)
+        self._check_loudness = QComboBox(self)
+        for target, name in LOUDNESS_TARGETS:
+            self._check_loudness.addItem(name, target)
+        self._check_loudness.setCurrentIndex(
+            max(0, self._check_loudness.findData(preferences.check_loudness_target))
+        )
+        self._check_loudness.setToolTip(
+            "AI アシスタントが仕上がりを調べる（check_output）ときに比べる、全体の音量"
+            "（積分ラウドネス ITU-R BS.1770）の基準 出す先に合わせて選ぶ 配信の多くは"
+            " -14 LUFS にそろえて再生し、欧州の放送は -23、日本の放送は -24 を求める"
+            " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
+        )
+        form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -936,12 +950,12 @@ class PreferencesDialog(QDialog):
     def preferences(self) -> Preferences:
         """画面で選ばれた設定
 
-        開いたときの設定に重ねる 画面に出さない項目（書き出しのフォルダなど、覚えている物）を
-        既定から作り直すと、OK を押しただけで消える（書き出しのフォルダが消えると、AI が
-        そこへ書けなくなり、書き出しの窓もビデオのフォルダから選び直しになる）
+        開いたときの設定から、画面に出している項目だけを変えて返す 一から作り直すと、
+        画面に出していない項目（窓の外で覚える書き出しのフォルダなど）が OK で既定へ戻る
+        （覚えたフォルダが消え、AI もそこへ書けなくなっていた）
         """
         return replace(
-            self._base,
+            self._given,
             use_proxy=self._use_proxy.isChecked(),
             proxy_height=int(self._proxy_height.currentData()),
             auto_quality=self._auto_quality.isChecked(),
@@ -1013,6 +1027,7 @@ class PreferencesDialog(QDialog):
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),
             ai_send_files=self._send_value(Outbound.FILES),
+            check_loudness_target=int(self._check_loudness.currentData()),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )

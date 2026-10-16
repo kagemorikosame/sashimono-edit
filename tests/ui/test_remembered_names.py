@@ -35,9 +35,9 @@ MARK = "ZZSECRET"
 #: 文字や辞書を返す口を EditorHost に足したら、ここへ足し、その口が返す名前を
 #: remembered_names からも返す 足さないと下の試験が落ちる
 TEXT_SOURCES = {"transcription_status", "start_transcription", "app_settings"}
-#: 本人の持ち物（保存したプリセット・エイリアスと着せ方の設定 #308） 名前はアプリの設定として
+#: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337）
 #: 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
-OWN_LIBRARY = {"saved_looks", "look_rules"}
+OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target"}
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
     "document",
@@ -61,6 +61,10 @@ PROJECT_SIDE = {
     "request_scenes",
     "scene_state",
     "scene_waiter",
+    # 仕上がりの検査（#337） 調べるのは作品か、作品と書き出しのフォルダの中の動画だけ
+    "request_check",
+    "check_state",
+    "check_waiter",
     "project_path",
     "export_folder",
     "remembered_names",
@@ -178,5 +182,6 @@ class TestEveryTextSourceGoesThroughThePort:
     def test_tools_that_read_the_own_library_declare_app_settings(self) -> None:
         # 壊れると、プリセットやエイリアスの名前を断りの文に並べる道具が、送る物にそれを書かず、
         # 設定画面と個人情報の扱いの一覧に無い物が外へ出る
-        operation = next(op for op in OPERATIONS if op.name == "place_subtitles")
-        assert Outbound.APP_SETTINGS in operation.sends
+        for name in ("place_subtitles", "check_output"):
+            operation = next(op for op in OPERATIONS if op.name == name)
+            assert Outbound.APP_SETTINGS in operation.sends, name

@@ -138,13 +138,15 @@ class TestDeclarations:
         assert Outbound.FILES in _operation("list_media").sends
 
     def test_what_each_reading_tool_returns_matches_its_declaration(
-        self, secret_host: FakeHost, transcript: Transcript
+        self, secret_host: FakeHost, transcript: Transcript, tmp_path: Path
     ) -> None:
         # 壊れると、宣言に無い物（素材の場所・字幕の文・絵）を返す道具が、尋ねずに送る
         # 読むだけの道具を全部、引数なしで動かして、結果の中身から宣言を確かめる
         secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
         texts = {segment.text for segment in transcript.segments}
         media = secret_host.document.project.media[0]
+        # 保存した作品 書き出した動画を調べる道具（check_output）が、外の場所を書いて断る道を通る
+        secret_host.saved_at = tmp_path / "作品.sme"
         # 場面の解析が失敗した素材 断りの文に素材の名前が入る
         secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
         checked = 0
@@ -203,6 +205,8 @@ LOOK_NAME = "秘密の見た目"
 READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "detect_scenes": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     "seek": lambda _media_id: {"frame": 0},
+    # 書き出した動画を指す 調べられる場所の外なので、場所を書いて断る（#337）
+    "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
 }
 
