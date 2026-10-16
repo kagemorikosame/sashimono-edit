@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.host import ToolError
+from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Command, Document, InScene
+from sashimono.core.io.library import Library
 from sashimono.core.model import (
     ClipId,
     MediaId,
@@ -69,6 +71,18 @@ class FakeHost:
             "preferences": {"theme": "dark", "update_check": True},
             "shortcuts": {"編集/分割": "S"},
         }
+        #: 保存したプリセットとエイリアス 置き場は試験ごとの一時フォルダ（conftest が向ける）
+        self.library = Library()
+        #: 本人の設定の着せ方 既定は設定と同じ
+        self.rules = LookRules()
+
+    @property
+    def saved_looks(self) -> SavedLooks:
+        return saved_looks(self.library)
+
+    @property
+    def look_rules(self) -> LookRules:
+        return self.rules
 
     @property
     def splits_media(self) -> bool:
