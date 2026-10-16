@@ -344,7 +344,9 @@ def written_length(video: Path) -> tuple[int, Fraction] | None:
         return None
     if rate is None or rate <= 0:
         return None
-    return count, Fraction(rate)
+    # 分子と分母から作る PyAV 19 から average_rate の型が AVRational になり、Fraction へ
+    # そのまま渡す書き方は型の上で通らない（本体の engine/decode/rational.py と同じ作り）
+    return count, Fraction(rate.numerator, rate.denominator)
 
 
 def clock(frame: int, fps: Fraction) -> str:
