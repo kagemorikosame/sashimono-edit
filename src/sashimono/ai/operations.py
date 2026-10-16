@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
-from sashimono.ai.safety import Consent, Safety
+from sashimono.ai.safety import Consent, Safety, readable_output
 from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
@@ -113,6 +113,14 @@ from sashimono.effects.strokes import (
     takes_stroke_effect,
 )
 from sashimono.engine.cache import SceneState
+from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
+from sashimono.engine.checks import KINDS as CHECK_KINDS
+from sashimono.engine.checks import (
+    LOUDNESS_TARGETS,
+    CheckLimits,
+    CheckRequest,
+    CheckState,
+)
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 
 __all__ = [
@@ -1237,6 +1245,225 @@ def _scene_places(
     return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
 
 
+# --- 完成物の検査（#337）---
+
+#: 検査が終わっていないときに待つ秒の既定と上限 待つのは AI のスレッドで、画面は止めない
+#: 上限を置くのは、長い作品で会話が何分も止まったように見えないため 待ちきれなければ
+#: 調べた所までを返し、続きはもう 1 度呼んで受け取る（場面の検出 #358 と同じ）
+DEFAULT_CHECK_WAIT = 30.0
+MAX_CHECK_WAIT = 120.0
+
+
+def _limit_number(
+    arguments: dict[str, Any], key: str, default: float, low: float, high: float
+) -> float:
+    """しきい値の引数 省けば ``default`` 範囲の外・数でない物は、受け付ける範囲を書いて断る
+
+    丸めて受け取らない 範囲の外を黙って端へ寄せると、AI は頼んだしきい値で調べたと思い込む
+    """
+    value = arguments.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ToolError(f"{key} は数で渡してください（{value!r} が来ました）")
+    number = float(value)
+    if not math.isfinite(number) or not low <= number <= high:
+        raise ToolError(f"{key} は {low:g}〜{high:g} で渡してください（{value!r} が来ました）")
+    return number
+
+
+def _check_kinds(arguments: dict[str, Any]) -> frozenset[str]:
+    raw = arguments.get("checks")
+    if raw is None:
+        return frozenset(CHECK_KINDS)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ToolError(f"checks は {', '.join(CHECK_KINDS)} から選んだ配列で渡してください")
+    unknown = [str(kind) for kind in raw if kind not in CHECK_KINDS]
+    if unknown:
+        raise ToolError(
+            f"知らない種類です: {', '.join(unknown)}（選べるのは {', '.join(CHECK_KINDS)}）"
+        )
+    return frozenset(str(kind) for kind in raw)
+
+
+def _check_limits(host: EditorHost, arguments: dict[str, Any]) -> CheckLimits:
+    plain = CheckLimits()
+    expected = arguments.get("expected_seconds")
+    clip_samples = arguments.get("clip_samples", plain.clip_samples)
+    if isinstance(clip_samples, bool) or not isinstance(clip_samples, int):
+        raise ToolError(f"clip_samples は整数で渡してください（{clip_samples!r} が来ました）")
+    if not 1 <= clip_samples <= 1000:
+        raise ToolError(f"clip_samples は 1〜1000 で渡してください（{clip_samples!r} が来ました）")
+    return CheckLimits(
+        black_level=_limit_number(arguments, "black_level", plain.black_level, 0.0, 0.5),
+        min_black_seconds=_limit_number(
+            arguments, "min_black_seconds", plain.min_black_seconds, 0.0, 60.0
+        ),
+        freeze_noise=_limit_number(arguments, "freeze_noise", plain.freeze_noise, 0.0, 0.1),
+        min_freeze_seconds=_limit_number(
+            arguments, "min_freeze_seconds", plain.min_freeze_seconds, 0.1, 600.0
+        ),
+        silence_db=_limit_number(arguments, "silence_db", plain.silence_db, -120.0, -10.0),
+        min_silence_seconds=_limit_number(
+            arguments, "min_silence_seconds", plain.min_silence_seconds, 0.1, 600.0
+        ),
+        clip_db=_limit_number(arguments, "clip_db", plain.clip_db, -6.0, 0.0),
+        clip_samples=clip_samples,
+        loudness_target=_limit_number(
+            arguments, "loudness_target", float(host.loudness_target), -40.0, -5.0
+        ),
+        loudness_tolerance=_limit_number(
+            arguments, "loudness_tolerance", plain.loudness_tolerance, 0.1, 10.0
+        ),
+        safe_margin=_limit_number(arguments, "safe_margin_percent", 0.0, 0.0, 20.0) / 100.0,
+        expected_seconds=(
+            None
+            if expected is None
+            else _limit_number(arguments, "expected_seconds", 0.0, 0.1, 86400.0)
+        ),
+        length_tolerance=_limit_number(
+            arguments, "length_tolerance_seconds", plain.length_tolerance, 0.0, 3600.0
+        ),
+        kinds=_check_kinds(arguments),
+    )
+
+
+def _frame_argument(arguments: dict[str, Any], key: str, default: int) -> int:
+    value = arguments.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolError(f"{key} は整数のフレームで渡してください（{value!r} が来ました）")
+    return value
+
+
+def _check_request(host: EditorHost, arguments: dict[str, Any]) -> CheckRequest:
+    limits = _check_limits(host, arguments)
+    raw_path = arguments.get("path")
+    if raw_path is not None:
+        if arguments.get("from_frame") is not None or arguments.get("to_frame") is not None:
+            raise ToolError("from_frame と to_frame はタイムラインを調べるときだけ使えます")
+        path = readable_output(host, raw_path)
+        stat = path.stat()
+        return CheckRequest(limits, path=path, stamp=(stat.st_size, stat.st_mtime_ns))
+    project = _project(host)
+    if project.duration <= 0:
+        raise ToolError("タイムラインが空です クリップを置いてから調べてください")
+    start = _frame_argument(arguments, "from_frame", 0)
+    end = _frame_argument(arguments, "to_frame", project.duration)
+    if not 0 <= start < end <= project.duration:
+        raise ToolError(
+            f"範囲は 0 ≦ from_frame < to_frame ≦ {project.duration}（タイムラインの長さ）で"
+            f"渡してください（{start}〜{end} が来ました）"
+        )
+    scene = str(host.active_scene) if host.active_scene is not None else None
+    return CheckRequest(limits, project=project, start=start, end=end, scene=scene)
+
+
+def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
+    request = _check_request(host, arguments)
+    wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    host.request_check(request)
+    state = host.check_state()
+    if not state.running or wait <= 0:
+        return _check_result(host, request, state, arguments)
+    return Pending(
+        wait=host.check_waiter(),
+        seconds=wait,
+        then=lambda: _check_result(host, request, host.check_state(), arguments),
+    )
+
+
+def _check_result(
+    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+) -> object:
+    if state.request != request:
+        raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
+    report = state.report
+    if state.failure is not None:
+        raise ToolError(f"調べられませんでした: {state.failure}")
+    if report is None:
+        raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
+    timeline = request.project is not None
+    rate = request.project.rate if request.project is not None else None
+    rows: list[dict[str, Any]] = []
+    for problem in report.problems:
+        row: dict[str, Any] = {
+            "kind": problem.kind,
+            "name": CHECK_KIND_NAMES[problem.kind],
+            "severity": problem.severity,
+            "start_frame": problem.start,
+            "end_frame": problem.end,
+            "start_seconds": round(problem.start / report.fps, 3),
+            "end_seconds": round(problem.end / report.fps, 3),
+            "detail": problem.detail,
+            **problem.measure,
+        }
+        if rate is not None:
+            row["timecode"] = format_timecode(problem.start, rate)
+        if problem.clip_ids:
+            row["clip_ids"] = list(problem.clip_ids)
+        if problem.ongoing:
+            row["ongoing"] = True
+        rows.append(row)
+    result = _paged(rows, arguments, name="problems")
+    notes = [str(result.pop("note"))] if "note" in result else []
+    severities: dict[str, int] = {}
+    for problem in report.problems:
+        severities[problem.severity] = severities.get(problem.severity, 0) + 1
+    result |= {
+        "target": "timeline" if timeline else str(request.path),
+        "complete": report.complete,
+        "analyzed_seconds": round((report.analyzed - report.start) / report.fps, 3),
+        "length_seconds": round(report.seconds, 3),
+        # 調べた種類だけを並べる 調べられなかった種類は別に返す 混ぜると、GPU の無い機械で
+        # 頼んだ黒いコマを「調べて無かった」と AI が読む
+        "checks": [kind for kind in CHECK_KINDS if kind in report.checked],
+        "summary": {
+            "integrated_lufs": None if report.loudness is None else round(report.loudness, 1),
+            "loudness_target_lufs": request.limits.loudness_target,
+            "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
+            "counts": report.counts(),
+            "severities": severities,
+        },
+    }
+    if timeline:
+        result["from_frame"] = request.start
+        result["to_frame"] = request.end
+        # 調べ始めたときのシーン 待つ間に人が別のシーンを開いても、結果はこのシーンの物
+        result["scene"] = request.scene
+    else:
+        result["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
+    if report.skipped:
+        result["skipped_checks"] = [kind for kind in CHECK_KINDS if kind in report.skipped]
+    notes.extend(report.notes)
+    if report.skipped:
+        names = "・".join(CHECK_KIND_NAMES[kind] for kind in result["skipped_checks"])
+        notes.append(f"{names}は調べていません 問題が無いとは限りません")
+    if state.running:
+        notes.append(
+            f"検査の途中です（{round((report.analyzed - report.start) / report.fps, 1)} 秒まで）"
+            " 調べた所までを返しました しばらくしてから同じ引数で呼ぶと続きを返します"
+        )
+    elif state.stopped:
+        notes.append("検査は途中で止められました もう 1 度呼ぶと最初から調べ直します")
+    elif not report.problems and not report.skipped:
+        notes.append("問題は見つかりませんでした")
+    elif not report.problems and report.checked:
+        notes.append("調べた種類（checks）には問題がありませんでした")
+    if request.project is not None and _project(host) != request.project:
+        notes.append(
+            "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
+            " 今の作品を調べるにはもう 1 度呼んでください"
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
 # --- 変更 ---
 
 
@@ -2290,6 +2517,81 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_detect_scenes,
+    ),
+    Operation(
+        name="check_output",
+        description=(
+            "仕上がりを調べて問題の一覧を返す（読むだけ 何も変えない） 黒いコマ（black）・"
+            "止まった絵（freeze）・無音（silence）・音割れ（clipping）・音量の基準（loudness "
+            "ITU-R BS.1770 の積分ラウドネス）・字幕のはみ出し（text_overflow"
+            " 画面の外へ出て切れる字）・"
+            "長さ（length expected_seconds を渡したとき）を調べる 既定は今のタイムライン"
+            "（書き出す前の、描いた絵と混ぜた音） path を渡すと書き出した動画のファイルを調べる"
+            "（作品のフォルダと書き出しのフォルダの中だけ 字幕のはみ出しは調べられない"
+            " AAC など圧縮した音では音割れを取りこぼすことがある）"
+            " 各問題は kind・severity（high / medium / low）・start_frame・end_frame・秒・"
+            "detail と程度の数を持つ タイムラインのフレームは preview_frame へそのまま渡して"
+            "確かめる 全部のコマを描くので長い作品では時間がかかる 裏で調べ、終わっていなければ"
+            "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
+            " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
+            " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    "書き出した動画のファイル 省くと今のタイムライン（開いているシーン）を調べる"
+                ),
+                "from_frame": _integer("タイムラインのこのフレームから（既定 0）"),
+                "to_frame": _integer("タイムラインのこのフレームの手前まで（既定 終わり）"),
+                "checks": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(CHECK_KINDS)},
+                    "description": "調べる種類 省くと全部",
+                },
+                "black_level": _number(
+                    "黒とみなす明るさ 0〜0.5（既定 0.1 FFmpeg の blackdetect と同じ） 画面の 98% "
+                    "以上がこれ以下なら黒いコマ"
+                ),
+                "min_black_seconds": _number(
+                    "これより短い黒は返さない（既定 0 = 1 コマでも返す"
+                    " つなぎ目の 1 コマの黒も拾う）"
+                ),
+                "freeze_noise": _number(
+                    "止まりとみなす明るさの差の平均 0〜0.1"
+                    "（既定 0.001 FFmpeg の freezedetect と同じ）"
+                ),
+                "min_freeze_seconds": _number("これより短い止まりは返さない（既定 2）"),
+                "silence_db": _number(
+                    "無音とみなす大きさ dBFS（既定 -60 FFmpeg の silencedetect と同じ）"
+                ),
+                "min_silence_seconds": _number("これより短い無音は返さない（既定 2）"),
+                "clip_db": _number("音割れとみなす大きさ dBFS -6〜0（既定 -0.01）"),
+                "clip_samples": _integer(
+                    "続けて頭打ちになったサンプルがこの数以上で音割れ（既定 3 Audacity と同じ）"
+                ),
+                "loudness_target": _number(
+                    "音量の基準 LUFS（既定は本人の設定 "
+                    + " / ".join(
+                        f"{value} は{name.split(' ')[0]}" for value, name in LOUDNESS_TARGETS
+                    )
+                    + "）"
+                ),
+                "loudness_tolerance": _number("基準からの許す差 LU（既定 1）"),
+                "safe_margin_percent": _number(
+                    "字幕を置いてよい範囲の余白 各辺の % 0〜20（既定 0 = 画面の端 テレビの"
+                    "安全域なら 5）"
+                ),
+                "expected_seconds": _number("長さの目安（秒） 渡すと外れたときに length を返す"),
+                "length_tolerance_seconds": _number("長さの目安からの許す差（秒 既定 0.5）"),
+                "wait_seconds": _number(
+                    f"終わっていないときに待つ秒（0〜{MAX_CHECK_WAIT:g}、"
+                    f"既定 {DEFAULT_CHECK_WAIT:g}） 0 なら待たずに調べた所までを返す"
+                ),
+                **_paging(),
+            }
+        ),
+        handler=_check_output,
     ),
     Operation(
         name="get_app_settings",

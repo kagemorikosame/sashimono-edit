@@ -178,8 +178,13 @@ class TestAppSettingsAreReadOnly:
             "analyze",
             "app_settings",
             "apply_commands",
+            # 完成物の検査（#337） 調べるのは作品の写しで、アプリの設定は変えない
+            # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
+            "check_state",
+            "check_waiter",
             "probe",
             "render_png",
+            "request_check",
             # 場面の解析（#319 #321） 頼むのは analyze と同じく本人のキャッシュへの解析だけで、
             # 取り込み時に調べるかの設定（Preferences.scene_analysis）は変えない
             "request_scenes",
