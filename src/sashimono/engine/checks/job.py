@@ -520,7 +520,8 @@ def _check_file(path: Path, progress: _Progress) -> None:
         # 音は PTS からサンプルの位置を出す 連番と隙間の無い並びとして渡すと、音が遅れて始まる
         # ファイルの頭の無音や、VFR で長く出るコマ（止まった絵）を見落とし、時刻もずれる
         origin = media_origin(container)
-        frame_rate = Fraction(rate) if rate else Fraction(30)
+        # PyAV 19 から average_rate は AVRational（Fraction に直に渡せない） デコーダと同じく直す
+        frame_rate = as_fraction(rate) if rate else Fraction(30)
         pictures = 0
         last_luma: np.ndarray | None = None
         size: tuple[int, int] | None = None
