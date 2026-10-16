@@ -491,6 +491,14 @@ def _check_file(path: Path, progress: _Progress) -> None:
                 )
         resampler = av.AudioResampler(format="fltp")
         streams = [stream for stream in (video, audio) if stream is not None]
+        if not streams:
+            # 読む流れが無い（字幕だけ・音の無い動画で音だけを頼んだなど） demux へ空で渡すと
+            # 全部の流れを読み、長い動画を頭から終わりまでデコードして、頼んでいない音の
+            # 大きさまで返す 長さは入れ物が名乗る長さで足りる
+            with progress.lock:
+                progress.length_seconds = duration
+                progress.analyzed = progress.end
+            return
         pictures = 0
         size: tuple[int, int] | None = None
         for packet in container.demux(*streams):

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
+import av
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -104,6 +106,50 @@ class TestWrittenFiles:
         )
         assert report.skipped == frozenset({"silence", "text_overflow"})
         assert report.checked == frozenset({"black"})
+
+    @pytest.mark.parametrize(
+        ("audio", "kinds"),
+        [(True, {"text_overflow"}), (False, {"silence"}), (False, {"silence", "text_overflow"})],
+    )
+    def test_nothing_is_read_when_no_asked_stream_exists(
+        self,
+        job: CheckJob,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        audio: bool,
+        kinds: set[str],
+    ) -> None:
+        # 壊れると、調べる流れが 1 つも無いのに長い動画を頭から終わりまで読み、
+        # 頼んでいない音の大きさまで返す（字幕だけ・音の無い動画で音だけを頼んだとき）
+        path = write_video(tmp_path / "読まない.mp4", 2.0, tone_db=-14.0 if audio else None)
+        packets: list[object] = []
+        real_open = av.open
+
+        class _Counted:
+            def __init__(self, container: Any) -> None:
+                self._container = container
+
+            def __enter__(self) -> _Counted:
+                self._container.__enter__()
+                return self
+
+            def __exit__(self, *details: object) -> None:
+                self._container.__exit__(*details)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._container, name)
+
+            def demux(self, *streams: Any) -> Iterator[Any]:
+                for packet in self._container.demux(*streams):
+                    packets.append(packet)
+                    yield packet
+
+        monkeypatch.setattr(av, "open", lambda *a, **k: _Counted(real_open(*a, **k)))
+        report = _check(job, path, CheckLimits(kinds=frozenset(kinds)))
+        assert packets == []
+        assert report.peak_db is None
+        assert report.checked == frozenset()
+        assert report.skipped == frozenset(kinds)
 
     def test_text_overflow_is_not_claimed_for_a_file(self, job: CheckJob, tmp_path: Path) -> None:
         # 壊れると、字の形の残らない動画を「字幕のはみ出し無し」と言い切り、AI が安心して渡す
