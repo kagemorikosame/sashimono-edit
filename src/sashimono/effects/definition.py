@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -132,6 +132,17 @@ class EffectDefinition:
     #: バッファを通る分だけ絵も前と変わる ここに当たる物はエンジンが掛けずに飛ばす
     #: （:meth:`is_idle`） 挙げていない項目は結果に効かない物に限る
     idle_when: tuple[tuple[str, float | bool], ...] = ()
+    #: 今の値で設定パネルに出さない項目の名前を返す（値は消さずに残す 生成オブジェクトの
+    #: :attr:`~sashimono.effects.sources.SourceDefinition.unused` と同じ考え）
+    #: 色の止まりをバー 1 つで見せるエフェクト（#364）が、前からの色の欄をここで隠す
+    #: 両方を出すと、どちらを動かせば絵が変わるのかが分からない
+    unused: Callable[[Mapping[str, ParamValue]], frozenset[str]] | None = field(
+        default=None, compare=False
+    )
+
+    def unused_names(self, params: Mapping[str, ParamValue]) -> frozenset[str]:
+        """``params`` のときに設定パネルへ出さない項目 :attr:`unused` が無ければ空"""
+        return self.unused(params) if self.unused is not None else frozenset()
 
     def __post_init__(self) -> None:
         if self.passes < 1:
