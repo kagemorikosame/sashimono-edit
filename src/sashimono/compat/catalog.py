@@ -83,6 +83,7 @@ __all__ = [
     "restyle",
     "set_template_catalog",
     "template_catalog",
+    "wraps",
 ]
 
 #: AviUtl 側で読む拡張子
@@ -875,7 +876,7 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
     staying = set(_KEPT_ON_RESTYLE)
     if keep_wrap:
         staying.add("wrap_width")
-        if _in_use(current.get("wrap_width")):
+        if wraps(current.get("wrap_width")):
             # 組み方も今のまま残す AviUtl2 の組み方（AviUtl のテンプレートが持つ ``aviutl``）は
             # 折り返さない（AviUtl2 に折り返しが無く、足すと読み込んだ作品の行が変わる #249）
             # テンプレートの組み方を取ると、幅を残しても字幕が 1 行のままになり設定が効かない
@@ -937,7 +938,7 @@ def restyle(objects: list[MappedObject], clip: Clip, *, keep_wrap: bool = False)
     return commands
 
 
-def _in_use(value: ParamValue | None) -> bool:
+def wraps(value: ParamValue | None) -> bool:
     """折り返しの幅を使っているか キーフレームで動く値は、途中で 0 でなくなるので使う側"""
     if not isinstance(value, AnimatedValue):
         return False

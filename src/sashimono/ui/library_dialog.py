@@ -26,7 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListView,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -68,6 +67,7 @@ from sashimono.ui.library_view import (
     LibraryOptions,
     library_options,
     shared_thumbnails,
+    show_as_grid,
     thumbnail_pixmap,
 )
 from sashimono.ui.theme import Colors, themed_style
@@ -79,10 +79,6 @@ CONFLICT_OVERWRITE = "overwrite"
 CONFLICT_BOTH = "both"
 CONFLICT_SKIP = "skip"
 
-#: 一覧で見せる見本の大きさ（論理の画素） 置いておく絵の半分 画面の倍率 2 でも粗くならない
-_ICON = QSize(128, 72)
-#: 一覧の 1 枠の大きさ 名前を 2 行まで出す
-_GRID = QSize(150, 112)
 #: 読み込みで選べるファイル 旧い拡張子のプリセットも読める
 _IMPORT_FILTER = "プリセットとエイリアス (*.smep *.smea *.kmkp *.nvpreset);;すべてのファイル (*)"
 _KIND_LABELS = {PRESET: "プリセット", ALIAS: "エイリアス"}
@@ -303,18 +299,7 @@ class LibraryDialog(QDialog):
         words = self._search.text().strip().casefold()
         trash = self._in_trash()
         thumbnails = self._thumbnails.enabled and not trash
-        if thumbnails:
-            self._list.setViewMode(QListView.ViewMode.IconMode)
-            self._list.setIconSize(_ICON)
-            self._list.setGridSize(_GRID)
-            self._list.setWordWrap(True)
-            self._list.setResizeMode(QListView.ResizeMode.Adjust)
-            self._list.setMovement(QListView.Movement.Static)
-            self._list.setUniformItemSizes(True)
-        else:
-            self._list.setViewMode(QListView.ViewMode.ListMode)
-            self._list.setIconSize(QSize())
-            self._list.setGridSize(QSize())
+        show_as_grid(self._list, thumbnails)
         if trash:
             for trashed in self._trashed:
                 if words and words not in trashed.name.casefold():
