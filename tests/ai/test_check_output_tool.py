@@ -18,6 +18,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import RemoveClip
+from sashimono.core.model import SceneId
 from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, Run
@@ -248,6 +249,19 @@ class TestAnswer:
         result = pending.then()
         assert isinstance(result, dict)
         assert "作品が変わりました" in result["note"]
+
+    def test_the_scene_is_the_one_the_check_started_in(self, host: FakeHost) -> None:
+        # 壊れると、待つ間に人が別のシーンを開くと、メインを調べた結果に開いたシーンの名前が付く
+        _operation()(host, {"wait_seconds": 0})
+        request = host.check_requests[-1]
+        host.check = _state(request, running=True, analyzed=30)
+        pending = _operation()(host, {"wait_seconds": 5})
+        assert isinstance(pending, Pending)
+        host.scene = SceneId("あとで開いたシーン")
+        host.check = _state(request)
+        result = pending.then()
+        assert isinstance(result, dict)
+        assert result["scene"] is None
 
     def test_calling_again_after_an_edit_asks_for_a_new_check(self, host: FakeHost) -> None:
         # 壊れると、AI が直した後に呼んでも前の作品の結果が返り、直ったか確かめられない

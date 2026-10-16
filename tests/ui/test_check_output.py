@@ -475,10 +475,19 @@ def _refuse_gpu(*_arguments: object, **_options: object) -> None:
     raise GLContextError("試験: サーフェスを作れない")
 
 
-def _with_scene(media: _Media, text: str, *, inner_x: float = 0.0, outer_x: float = 0.0) -> Project:
+def _with_scene(
+    media: _Media,
+    text: str,
+    *,
+    inner_x: float = 0.0,
+    outer_x: float = 0.0,
+    text_at: int = 0,
+    text_frames: int = 180,
+) -> Project:
     """動画 1 本の上に、字幕 1 本だけを入れたシーンを置いた作品
 
     ``inner_x`` はシーンの中の字幕の位置、``outer_x`` はシーンを置いたクリップの位置（配置の X）
+    ``text_at`` と ``text_frames`` は、シーンの中で字幕を出すコマと長さ
     """
     base = _project(
         media,
@@ -509,8 +518,8 @@ def _with_scene(media: _Media, text: str, *, inner_x: float = 0.0, outer_x: floa
     for command in insert_generated(
         inside,
         TEXT.create(text=text, size=20.0, pos_x=inner_x, pos_y=-60.0),
-        at_frame=0,
-        duration=180,
+        at_frame=text_at,
+        duration=text_frames,
     ):
         project = InScene(scene.id, command).apply(project)
         inside = replace(project, timeline=project.require_scene(scene.id).timeline)
@@ -556,6 +565,18 @@ class TestSubtitlesInScenes:
         result = _call(_window(opened, project), {"checks": ["text_overflow"]})
         (overflow,) = _kinds(result)["text_overflow"]
         assert overflow["sides"] == "右"
+
+    def test_a_short_subtitle_between_the_sampled_frames_is_found(
+        self, opened: list[MainWindow], media: _Media
+    ) -> None:
+        # 壊れると、シーンの中で 0.5 秒より短く出る字幕が、外側で 0.5 秒おきに測る時刻の間に
+        # 収まると、一度も測らずに見落とす（今のタイムラインの字幕は頭と終わりを必ず測る）
+        project = _with_scene(
+            media, "とても長い字幕が画面の端からはみ出して切れてしまう例", text_at=3, text_frames=8
+        )
+        result = _call(_window(opened, project), {"checks": ["text_overflow"]})
+        (overflow,) = _kinds(result)["text_overflow"]
+        assert 3 <= overflow["start_frame"] < 11
 
     def test_a_subtitle_that_fits_inside_a_scene_is_fine(
         self, opened: list[MainWindow], media: _Media

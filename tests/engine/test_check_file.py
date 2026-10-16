@@ -193,6 +193,24 @@ class TestWrittenFiles:
         assert black == pytest.approx((7.0, 7.5), abs=0.05)
         assert report.seconds == pytest.approx(10.0, abs=0.05)
 
+    def test_sound_longer_than_the_picture_is_black_after_the_last_frame(
+        self, job: CheckJob, tmp_path: Path
+    ) -> None:
+        # 壊れると、映像が 4 秒で終わり音が 6 秒まで続く動画で、後ろの 2 秒（再生では絵が出ない）を
+        # 調べないまま、黒いコマは無いと返す
+        path = write_video(
+            tmp_path / "音が長い.mkv",
+            4.0,
+            tone_db=-14.0,
+            audio_codec="pcm_s16le",
+            audio_seconds=6.0,
+        )
+        report = _check(job, path, CheckLimits(kinds=frozenset({"black", "freeze"})))
+        assert report.seconds == pytest.approx(6.0, abs=0.05)
+        (black,) = _kinds(report)["black"]
+        assert black == pytest.approx((4.0, 6.0), abs=0.05)
+        assert report.problems[0].severity == "low"
+
     @pytest.mark.parametrize(("seconds", "db"), [(3.0, -200.0), (3.0, -80.0), (0.3, -14.0)])
     def test_unmeasurable_loudness_is_not_reported_as_fine(
         self, job: CheckJob, tmp_path: Path, seconds: float, db: float

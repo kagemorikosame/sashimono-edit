@@ -44,6 +44,7 @@ def write_video(
     held: tuple[float, float] | None = None,
     audio_delay: float = 0.0,
     audio_gap: tuple[float, float] | None = None,
+    audio_seconds: float | None = None,
 ) -> Path:
     """動く絵の動画を焼く 区間（秒）を渡すと、そこだけ問題のある絵と音にする
 
@@ -59,6 +60,7 @@ def write_video(
     - ``held`` の間はコマを書かない（VFR） 頭のコマが次のコマまで出続ける
     - ``audio_delay`` 秒だけ音の頭を遅らせる（音は映像より遅れて始まる）
     - ``audio_gap``（音の秒）の間は音のフレームを書かず、PTS をその分だけ飛ばす
+    - ``audio_seconds`` を渡すと、音だけその長さにする（映像より長い音）
     """
     frames = round(seconds * FPS)
     codec = "libx264" if "libx264" in av.codecs_available else "mpeg4"
@@ -94,7 +96,8 @@ def write_video(
         for packet in stream.encode():
             container.mux(packet)
         if audio is not None and tone_db is not None:
-            samples = tone(seconds - audio_delay, tone_db, clipped=clipped, silent=silent)
+            heard = audio_seconds if audio_seconds is not None else seconds
+            samples = tone(heard - audio_delay, tone_db, clipped=clipped, silent=silent)
             _encode_audio(container, audio, samples, start=round(audio_delay * RATE), gap=audio_gap)
     return path
 

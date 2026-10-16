@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 
 from sashimono.core.model import Clip, Project, Timeline, Track, controlling_groups
 from sashimono.core.timebase import seconds_to_frame
@@ -119,6 +120,10 @@ class OverflowScan:
                     continue
                 frames = set(range(first, last + 1, step))
                 frames.add(last)
+                if clip.scene_id is not None:
+                    # 中の字幕の頭と終わりが出るコマも測る 0.5 秒おきだけでは、中で短く出る
+                    # 字幕が測る時刻の間に収まり、一度も測らない
+                    frames |= {mark for mark in self._scene_marks(clip, 0) if first <= mark <= last}
                 for frame in frames:
                     self._plan.setdefault(frame, []).append((track, clip))
 
@@ -134,6 +139,35 @@ class OverflowScan:
             for track in scene.timeline.active_picture_tracks()
             for inner in track.clips
         )
+
+    def _scene_marks(self, clip: Clip, depth: int) -> set[int]:
+        """置いたシーン ``clip`` の中の字幕（入れ子も）の頭と終わりが出る、外側のコマ
+
+        中のコマを外側へ写すのは :meth:`Clip.picture_time` の逆（素材の頭 ``source_in`` と
+        速さ）で、端数の丸めで 1 コマずれうるので前後の 1 コマも足す 余分に測ったコマでは
+        中の字幕が出ていないだけで、間違った結果にはならない
+        """
+        if clip.scene_id is None or depth >= MAX_SCENE_DEPTH:
+            return set()
+        scene = self._project.find_scene(clip.scene_id)
+        if scene is None:
+            return set()
+        inner: set[int] = set()
+        for track in scene.timeline.active_picture_tracks():
+            for item in track.clips:
+                if _is_text(item):
+                    inner |= {item.timeline_start, item.timeline_end - 1}
+                elif item.scene_id is not None:
+                    inner |= self._scene_marks(item, depth + 1)
+        rate = self._project.rate
+        speed = clip.speed if clip.speed else Fraction(1)
+        marks: set[int] = set()
+        for frame in inner:
+            local = (frame * rate.frame_duration - clip.source_in) / speed / rate.frame_duration
+            for near in (math.floor(local) - 1, math.floor(local), math.ceil(local) + 1):
+                if 0 <= near < clip.duration:
+                    marks.add(clip.timeline_start + near)
+        return marks
 
     @property
     def frames(self) -> frozenset[int]:

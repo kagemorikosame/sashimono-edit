@@ -78,6 +78,9 @@ class CheckRequest:
     path: Path | None = None
     #: ファイルの（大きさ, 更新時刻） 書き出し直したファイルを前の結果で答えない
     stamp: tuple[int, int] | None = None
+    #: 調べ始めたときに開いていたシーン（ID） メインなら ``None`` 結果を返すときに添える
+    #: 返す時点のシーンを添えると、待つ間に人が別のシーンを開いたとき取り違える
+    scene: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,10 +574,34 @@ def _check_file(path: Path, progress: _Progress) -> None:
                 # 音が映像より先に終わる所は、再生では無音になる 無音として数える
                 _pad_silence(progress.audio, round(pictures / fps * progress.audio.rate))
             heard = progress.audio.seconds if progress.audio is not None else 0.0
-            length = max(pictures / fps, heard)
+            # 音を読まなかったとき（絵だけを頼んだ）も、音の流れの終わりまでが動画の長さ
+            # 端数は切り捨てる AAC の前置きの分（20 ms ほど）で、終わりに黒を 1 コマ足さない
+            ends = _stream_end(container, origin)
+            length = max(pictures / fps, heard, math.floor(ends * fps + 1e-6) / fps)
+            scan = progress.video
+            if scan is not None and last_luma is not None:
+                # 音が映像より長い所は、絵が出ない アプリのデコーダも映像の道の終わりより後ろは
+                # 絵を出さない（engine/decode/video.py 最後の絵で止めるのはクリップの hold_at だけ）
+                # 黒として数える 数えないと、調べていない区間を「黒いコマは無い」と返す
+                black = np.zeros_like(last_luma)
+                for missing in range(pictures, round(length * fps)):
+                    scan.add(missing, black)
             progress.length_seconds = length
             progress.end = max(1, round(length * fps))
             progress.analyzed = progress.end
+
+
+def _stream_end(container: av.container.InputContainer, origin: Fraction) -> float:
+    """映像と音の流れの一番後ろの終わり（原点からの秒） 流れが長さを持たなければ入れ物の長さ"""
+    ends: list[float] = []
+    for stream in (*container.streams.video, *container.streams.audio):
+        if stream.duration is None or stream.time_base is None:
+            continue
+        start = stream.start_time or 0
+        ends.append(float((start + stream.duration) * as_fraction(stream.time_base) - origin))
+    if ends:
+        return max(ends)
+    return float(container.duration) / 1_000_000 if container.duration else 0.0
 
 
 def _seconds(pts: int | None, time_base: Ratio | None, origin: Fraction) -> Fraction | None:

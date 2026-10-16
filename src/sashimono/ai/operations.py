@@ -1358,7 +1358,8 @@ def _check_request(host: EditorHost, arguments: dict[str, Any]) -> CheckRequest:
             f"範囲は 0 ≦ from_frame < to_frame ≦ {project.duration}（タイムラインの長さ）で"
             f"渡してください（{start}〜{end} が来ました）"
         )
-    return CheckRequest(limits, project=project, start=start, end=end)
+    scene = str(host.active_scene) if host.active_scene is not None else None
+    return CheckRequest(limits, project=project, start=start, end=end, scene=scene)
 
 
 def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -1432,7 +1433,8 @@ def _check_result(
     if timeline:
         result["from_frame"] = request.start
         result["to_frame"] = request.end
-        result["scene"] = str(host.active_scene) if host.active_scene is not None else None
+        # 調べ始めたときのシーン 待つ間に人が別のシーンを開いても、結果はこのシーンの物
+        result["scene"] = request.scene
     else:
         result["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
     if report.skipped:
