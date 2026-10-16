@@ -12,8 +12,9 @@ from __future__ import annotations
 import atexit
 from dataclasses import dataclass
 
-from PySide6.QtCore import QCoreApplication, QPoint, QRect
+from PySide6.QtCore import QCoreApplication, QPoint, QRect, QSize
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QListView
 
 from sashimono.ui.library_thumbnails import THUMBNAIL_SIZE, THUMBNAILS_FULL, LookThumbnails
 
@@ -28,8 +29,14 @@ __all__ = [
     "library_options",
     "set_library_options",
     "shared_thumbnails",
+    "show_as_grid",
     "thumbnail_pixmap",
 ]
+
+#: 一覧で見せる見本の大きさ（論理の画素） 置いておく絵の半分 画面の倍率 2 でも粗くならない
+_ICON = QSize(128, 72)
+#: 一覧の 1 枠の大きさ 名前を 2 行まで出す
+_GRID = QSize(150, 112)
 
 #: 見本の絵の地 :attr:`~sashimono.ui.workspace.Preferences.library_backdrop` の値
 BACKDROP_CHECKER = "checker"
@@ -98,6 +105,26 @@ def shared_thumbnails() -> LookThumbnails:
         # イベントループを回さずに終わるとき（試験・道具の台本）は aboutToQuit が来ない
         atexit.register(_thumbnails.release)
     return _thumbnails
+
+
+def show_as_grid(view: QListView, thumbnails: bool) -> None:
+    """一覧を見本の絵の並び（``thumbnails`` が偽なら名前の行）にする
+
+    管理の窓と字幕の焼き込みの窓（#308）で同じ並べ方にする 窓ごとに書くと、片方だけ枠の
+    大きさが変わり、同じプリセットが窓によって違う大きさの見本で出る
+    """
+    if thumbnails:
+        view.setViewMode(QListView.ViewMode.IconMode)
+        view.setIconSize(_ICON)
+        view.setGridSize(_GRID)
+        view.setWordWrap(True)
+        view.setResizeMode(QListView.ResizeMode.Adjust)
+        view.setMovement(QListView.Movement.Static)
+        view.setUniformItemSizes(True)
+    else:
+        view.setViewMode(QListView.ViewMode.ListMode)
+        view.setIconSize(QSize())
+        view.setGridSize(QSize())
 
 
 def failed_pixmap() -> QPixmap:

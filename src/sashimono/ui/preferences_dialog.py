@@ -733,6 +733,19 @@ class PreferencesDialog(QDialog):
         form.addRow("字幕を折り返す幅", self._subtitle_wrap_percent)
         self._subtitle_wrap.toggled.connect(self._subtitle_wrap_percent.setEnabled)
         self._subtitle_wrap_percent.setEnabled(preferences.subtitle_wrap)
+        self._subtitle_look_remember = QCheckBox(
+            "字幕を置くとき、最後に使った見た目を選んでおく", self
+        )
+        self._subtitle_look_remember.setChecked(preferences.subtitle_look_remember)
+        # 覚えた見た目は画面に欄を持たない 持ち越さないと、設定を開いて OK を押しただけで忘れる
+        self._subtitle_look_last = preferences.subtitle_look_last
+        self._subtitle_look_remember.setToolTip(
+            "字幕の〔焼き込み〕と〔選んだ行を置く〕の窓で、前に置いたときの見た目"
+            "（プリセット・エイリアス・テンプレート）を最初から選んでおく"
+            " 切っていると、タイムラインで選んでいるテキストがあればそれ、無ければ既定の見た目"
+            " 話し手ごとに分けた見た目は覚えない（全員の見た目だけ）"
+        )
+        form.addRow(self._subtitle_look_remember)
 
         # 退避とバックアップの欄は塊ごと別のファイルに置く（決めたことも向こうの説明にある）
         self._backups = BackupSection(preferences, self)
@@ -975,6 +988,8 @@ class PreferencesDialog(QDialog):
             scripts_move=str(self._scripts_move.currentData()),
             subtitle_wrap=self._subtitle_wrap.isChecked(),
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
+            subtitle_look_remember=self._subtitle_look_remember.isChecked(),
+            subtitle_look_last=self._subtitle_look_last,
             autosave=self._backups.autosave.isChecked(),
             autosave_seconds=self._backups.autosave_seconds.value(),
             backup=self._backups.backup.isChecked(),
