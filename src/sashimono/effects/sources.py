@@ -98,17 +98,24 @@ class SourceDefinition:
         いくつも動かすときは定義の順に並べる
         """
         names = {spec.name for spec in specs}
+        order = [spec.name for spec in self.parameters]
 
         def anchor_of(name: str) -> str | None:
             """前に来る項目 隠れていれば、その項目の前に来る項目へさかのぼる
 
             さかのぼらないと、前の項目が隠れた欄（線形の基準・円形の中心など）が底に出る
+            隠れた項目が動かす項目でなければ、定義でその 1 つ前の項目へさかのぼる（図形の
+            背景は高さを隠すので、高さの後ろに置いた塗りの欄が底に出ていた #364）
             """
             seen: set[str] = set()
             anchor = self.placed_after.get(name)
             while anchor is not None and anchor not in names and anchor not in seen:
                 seen.add(anchor)
-                anchor = self.placed_after.get(anchor)
+                above = self.placed_after.get(anchor)
+                if above is None and anchor in order:
+                    index = order.index(anchor)
+                    above = order[index - 1] if index > 0 else None
+                anchor = above
             return anchor if anchor in names else None
 
         anchors = {spec.name: anchor_of(spec.name) for spec in specs}
@@ -447,7 +454,32 @@ def _shape_unused(params: Mapping[str, ParamValue]) -> frozenset[str]:
         unused |= {"pos_x", "pos_y"}
     if shape in ("starfield", "waveform"):
         unused.add("line_width")
+    if shape in _OWN_WAY:
+        # 塗りのグラデーション（#364）は輪郭の形で描く図形だけ 専用の道で描く物は色で塗る
+        unused |= set(fill_names(SHAPE_FILL))
+    else:
+        unused |= fill_unused(params, SHAPE_FILL, "color")
+    # 図形の基準は図形の枠全体だけ（行も字も無い） 字のための選び方を出すと、選んでも変わらない
+    unused.add(f"{SHAPE_FILL}_basis")
     return frozenset(unused)
+
+
+#: 図形の塗りの項目の頭（:func:`sashimono.effects.fills.fill_specs` テキストの字の塗りと同じ名前）
+SHAPE_FILL = "fill"
+
+
+def _shape_placed_after() -> dict[str, str]:
+    """塗りの項目を色の欄のすぐ上に出す（テキストの :func:`_text_placed_after` と同じ並べ方）
+
+    頭の項目（塗りの種類）は色の欄の 1 つ前の欄（高さ）の後ろに置く 高さを読まない図形（背景）
+    では、高さの前の欄へさかのぼる（:meth:`SourceDefinition.display_order`）
+    """
+    placed: dict[str, str] = {}
+    previous = "height"
+    for name in fill_names(SHAPE_FILL):
+        placed[name] = previous
+        previous = name
+    return placed
 
 
 SHAPE = SourceDefinition(
@@ -582,7 +614,12 @@ SHAPE = SourceDefinition(
         TrackSpec("pos_x", "X", -4000, 4000, 0, step=1, unit="px"),
         TrackSpec("pos_y", "Y", -4000, 4000, 0, step=1, unit="px"),
         TrackSpec("rotation", "回転", -3600, 3600, 0, unit="度"),
+        # 塗りの種類とグラデーション（#364 テキストの #312 と同じ組） 基準は図形の枠全体で、
+        # 塗りと線（縁）の両方をこれで塗る 既定は単色で、前の版の作品は項目を持たないので
+        # 前からの色で塗る（1 画素も変わらない） 設定パネルでは色の欄のすぐ上に出す
+        *fill_specs(SHAPE_FILL),
     ),
+    placed_after=_shape_placed_after(),
 )
 
 
