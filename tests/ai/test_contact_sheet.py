@@ -364,6 +364,57 @@ class TestHandingBack:
         second.join(5.0)
         assert results[1] == "後の仕事"
 
+    def test_work_queued_before_a_cancel_does_not_run(self, host: FakeHost) -> None:
+        # 壊れると、中断の釦を押した後でも、積まれていた続き（最後の 1 コマと PNG）が描かれ、
+        # 中断したはずの絵が AI へ返る
+        bridge = EditorBridge(host)
+        ran: list[str] = []
+        box: dict[str, object] = {}
+
+        def ask() -> None:
+            try:
+                box["result"] = bridge.call(lambda: ran.append("描いた"))
+            except ToolError as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=ask)
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        # 糸の側が積み終えるのを待つ 積み終えたかは外から見えないので、待ち行列の長さを見る
+        while bridge._work.qsize() < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        bridge.cancel()
+        bridge.pump()
+        thread.join(5.0)
+        assert ran == []
+        assert isinstance(box.get("error"), ToolError)
+
+    def test_a_cancel_between_steps_returns_no_picture(self, loaded: Project) -> None:
+        # 壊れると、描いている途中で中断しても、続きが描き終わって絵が AI へ返る
+        host = _SlowHost(loaded)
+        bridge = EditorBridge(host)
+        operation = find_operation("contact_sheet")
+        assert operation is not None
+        # 1 コマ 0.04 秒で区切り 0.1 秒なので、初めの回で 3 コマ描き、積まれた続きが最後の回になる
+        done, box = call_in_thread(bridge, operation, {"count": 4})
+        deadline = time.monotonic() + 20.0
+        # 続きが積まれるまで回し、積まれた所で中断する（拾う前に中断が入った形）
+        while True:
+            assert time.monotonic() < deadline
+            if bridge._work.qsize() > 0:
+                if host.sheets and host.sheets[-1].drawn:
+                    break
+                bridge.pump()
+            time.sleep(0.001)
+        bridge.cancel()
+        while not done.is_set() and time.monotonic() < deadline:
+            bridge.pump()
+            time.sleep(0.002)
+        assert isinstance(box.get("error"), ToolError)
+        assert "result" not in box
+        assert not host.sheets[-1].finished
+
     def test_other_work_waits_its_turn_without_being_lost(self, host: FakeHost) -> None:
         # 壊れると、コマを描く間に頼まれた別の道具の仕事が拾われず、AI が待ち続ける
         bridge = EditorBridge(host)

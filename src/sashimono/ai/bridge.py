@@ -318,6 +318,12 @@ class EditorBridge:
                 item = self._work.get_nowait()
             except queue.Empty:
                 return
+            if self._cancel.is_set():
+                # 積んだ時は中断の前でも、拾う時に中断されていれば動かさない 動かすと、
+                # 描きかけの続き（最後の 1 コマと PNG）が中断の後に描き上がり、AI へ返る
+                item.error = ToolError("中断されました")
+                item.done.set()
+                continue
             try:
                 item.result = item.run()
             except (ToolError, ValueError, KeyError, OSError, RuntimeError) as exc:

@@ -67,3 +67,34 @@ class TestOtherArrays:
         # 壊れると（省いた to まで断ると）、言葉を消すだけの直しが頼めなくなる
         result = run(host, "replace_subtitle_text", pairs=[{"from": "存在しない言葉"}])
         assert result["unmatched"] == ["存在しない言葉"]
+
+
+class TestExplicitNull:
+    """配列の引数に null を明示したときは、省いたときと同じに扱わない"""
+
+    def test_null_frames_do_not_draw_the_default_sheet(self, host: FakeHost) -> None:
+        # 壊れると、frames に null を渡しただけで全体の 12 コマを描き、AI は渡したつもりの
+        # 場面の一覧を見たと思い込む
+        with pytest.raises(ToolError, match="frames"):
+            run(host, "contact_sheet", frames=None)
+        assert host.sheets == []
+
+    @pytest.mark.parametrize("tool", ["delete_clips", "move_clips"])
+    def test_null_clip_ids_do_not_fall_back_to_the_selection(
+        self, host: FakeHost, tool: str
+    ) -> None:
+        # 壊れると、clip_ids に null が来ただけで、人が選んでいたクリップを消したり動かしたりする
+        clip = host.document.project.timeline.tracks[0].clips[0]
+        host.select_clips([clip.id])
+        before = host.document.project
+        with pytest.raises(ToolError, match="clip_ids"):
+            run(host, tool, clip_ids=None, delta=30)
+        assert host.document.project == before
+
+    def test_null_segment_ids_do_not_place_every_subtitle(self, host: FakeHost) -> None:
+        # 壊れると、segment_ids に null が来ただけで全部の字幕を置き、選んだ行だけのつもりが
+        # タイムラインが字幕で埋まる
+        before = host.document.project
+        with pytest.raises(ToolError, match="segment_ids"):
+            run(host, "place_subtitles", segment_ids=None)
+        assert host.document.project == before

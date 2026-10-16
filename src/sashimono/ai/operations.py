@@ -388,6 +388,17 @@ def _target_clip(host: EditorHost, arguments: dict[str, Any]) -> tuple[Track, Cl
     return _require_clip(_project(host), clip_id)
 
 
+def _no_explicit_null(arguments: dict[str, Any], key: str) -> None:
+    """配列の引数に null を明示したら断る 省いたときと同じに扱わない
+
+    省いたときの既定は「選択中のクリップすべて」「字幕すべて」「全体の 12 コマ」のように
+    広い 明示の null をそちらへ読み替えると、AI が渡したつもりの物とは別の、ずっと
+    広い相手に効く
+    """
+    if key in arguments and arguments[key] is None:
+        raise ToolError(f"{key} に null が来ました 省くか、配列で渡してください")
+
+
 def _target_clips(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, ...]:
     """引数の ``clip_ids``、無ければ選んでいるクリップすべて
 
@@ -395,6 +406,7 @@ def _target_clips(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
     見つからない ID が 1 つでもあれば止める 一部だけ動かすと、どれが動いたのかを
     AI も人も追えなくなる
     """
+    _no_explicit_null(arguments, "clip_ids")
     if arguments.get("clip_ids") is None:
         if not host.selected_clips:
             raise ToolError("clip_ids を指定してください（選択中のクリップもありません）")
@@ -430,6 +442,7 @@ def _clip_id_list(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
     重なったまま渡すと「3 本を移動」のような本数が実際と食い違う 型が違えば
     ToolError にする 素の TypeError で落ちると、AI は何を直せばよいか分からない
     """
+    _no_explicit_null(arguments, "clip_ids")
     raw = arguments.get("clip_ids")
     if raw is None:
         return ()
@@ -1156,7 +1169,9 @@ def _sheet_frames_from_list(project: Project, raw: object) -> list[int]:
 def _contact_sheet(host: EditorHost, arguments: dict[str, Any]) -> object:
     """全体を見渡す 等分したコマ（または指定したコマ）を 1 枚に並べる"""
     project = _project(host)
-    if arguments.get("frames") is not None:
+    # 鍵の有無で分ける 明示の null を省略と同じに読むと、渡したつもりの場面の一覧の
+    # 代わりに全体の 12 コマを描く null は _sheet_frames_from_list が断る
+    if "frames" in arguments:
         if any(arguments.get(key) is not None for key in ("from_frame", "to_frame", "count")):
             # どちらを優先したかを AI が知らないまま読むと、見たいコマと違う 1 枚を信じる
             raise ToolError("frames と from_frame・to_frame・count は一緒に使えません")
@@ -2179,6 +2194,7 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
             voices = [(media.id, media.transcript_stream(_audio_stream(media, arguments)))]
         else:
             voices = [v for v in subtitle_voices(project) if v[0] == media.id]
+    _no_explicit_null(arguments, "segment_ids")
     raw_segments = arguments.get("segment_ids")
     if raw_segments is not None and not isinstance(raw_segments, list):
         raise ToolError(
