@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -85,6 +86,7 @@ from sashimono.compat.catalog import (
     place,
     restyle,
 )
+from sashimono.compat.subtitle_looks import default_choice
 from sashimono.core.commands import (
     AddEffect,
     Command,
@@ -122,6 +124,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import AUTO_QUALITY_TEXT, PreferencesDialog
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.subtitle.dialogs import BurnAnswer, BurnRequest
 from sashimono.ui.template_dialog import TemplateDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 
@@ -1380,12 +1383,21 @@ def wiki_subtitle_output(context: Context) -> QImage:
         return with_menu(window, "字幕", ["焼き込み", "書き出し…"])
 
 
+def burn_everyone(request: BurnRequest) -> BurnAnswer:
+    """焼き込みの窓の代わりの答え 全部の話し手を、既定の見た目で焼き込む
+
+    手順書は窓で何も変えずに〔焼き込む〕を押した所を見せる 窓の形（#353 で見た目を
+    選ぶ窓になった）が変わったら、ここも字幕パネルの ``ask_burn`` の形に合わせる
+    """
+    return BurnAnswer(voices=[voice for voice, _label in request.voices], look=default_choice())
+
+
 def wiki_subtitle_burned(context: Context) -> QImage:
     """焼き込んだあと 字幕がテキストのクリップとして並ぶ"""
     with editor(sample_project()) as window:
         panel = _with_transcript(window, context)
-        # 窓で選ぶ所は全部の話し手のまま進める 窓を開くと撮影がそこで止まる
-        panel.ask_burn = lambda voices, _note: [voice for voice, _ in voices]
+        # 窓で選ぶ所は、全部の話し手と既定の見た目のまま進める 窓を開くと撮影がそこで止まる
+        panel.ask_burn = burn_everyone
         panel.burn()
         # 2 枚目の字幕の途中で止める 字幕と字幕の間で止めると、焼き込んだ字幕が画面に出ない
         window.seek(130)
@@ -2322,6 +2334,14 @@ def run(shots: Sequence[Shot], context: Context, output: Path, wiki: Path | None
             continue
         except (ShotError, ToolError, OSError, ValueError, KeyError) as exc:
             print(f"失敗 {shot.name}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        except Exception:
+            # 本体の形が変わって撮り方が古くなった（#353 で焼き込みの窓の答えの形が変わり、
+            # 手順書の 1 枚が TypeError で落ちた）ときに、ここで全体を止めると後ろの写真が
+            # 1 枚も撮れない 中身が分かるよう呼び出しの跡を出し、終了コードは失敗にする
+            print(f"失敗 {shot.name}: 撮る道具の不具合", file=sys.stderr)
+            traceback.print_exc()
             failures += 1
             continue
         path = folder / f"{shot.name}.png"
