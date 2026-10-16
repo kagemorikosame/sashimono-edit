@@ -35,9 +35,9 @@ MARK = "ZZSECRET"
 #: 文字や辞書を返す口を EditorHost に足したら、ここへ足し、その口が返す名前を
 #: remembered_names からも返す 足さないと下の試験が落ちる
 TEXT_SOURCES = {"transcription_status", "start_transcription", "app_settings"}
-#: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337）
-#: 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
-OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target"}
+#: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337、
+#: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
+OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target", "duck_shape"}
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
     "document",

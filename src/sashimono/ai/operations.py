@@ -2941,6 +2941,9 @@ _WITH_LOOKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: ダッキング（#329） クリップ ID と音量の線の要約に、本人の設定（下げ幅と速さの既定）が載る
+#: 字幕は話している区間の時刻だけを使い、文は返さない 断る文には素材の名前が入りうる
+_DUCKING = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
 
@@ -3821,6 +3824,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_set_volume,
         writes=True,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="duck_audio",
@@ -3876,6 +3880,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_duck_audio,
         writes=True,
+        sends=_DUCKING,
     ),
     Operation(
         name="normalize_loudness",
@@ -3910,6 +3915,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_normalize_loudness,
         writes=True,
+        sends=_CHECKS,
     ),
     Operation(
         name="place_sound",
@@ -3935,6 +3941,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_place_sound,
         writes=True,
+        sends=_WITH_FILES,
     ),
     Operation(
         name="transcribe",

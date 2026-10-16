@@ -45,6 +45,7 @@ from sashimono.engine.decode.probe import probe_media
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ai.conftest import allow_sending
 from tests.check_media import tone, write_tone
 
 
@@ -138,7 +139,8 @@ def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
     """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道） 変更は自動で承認する"""
     operation = find_operation(name)
     assert operation is not None
-    bridge = EditorBridge(window, auto_approve=True)
+    # 送る物の確かめ（#342）は tests/ui/test_send_consent.py が見る ここは音の道筋だけを見る
+    bridge = allow_sending(EditorBridge(window, auto_approve=True))
     box: dict[str, Any] = {}
 
     def work() -> None:

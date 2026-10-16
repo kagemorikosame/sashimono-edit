@@ -262,6 +262,11 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 無い見た目を頼むと、保存してある見た目の名前を並べて断る（#308）
     "place_subtitles": lambda ids: {"media_id": ids["media"], "look_name": "無い見た目"},
     "jet_cut": lambda ids: {"media_id": ids["media"]},
+    # 音量とミックス（#329） 絵のクリップと動画の素材を渡すと断る 断る文に素材の名前が入りうる
+    "set_volume": lambda ids: {"clip_ids": [ids["video"]], "volume_percent": 50},
+    "duck_audio": lambda ids: {"clip_ids": [ids["video"]], "voice_clip_ids": [ids["video"]]},
+    "normalize_loudness": lambda _ids: {"wait_seconds": 0},
+    "place_sound": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
 }
