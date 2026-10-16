@@ -98,10 +98,16 @@ class Chapters:
         return tuple(notes)
 
 
-def chapters_of(timeline: Timeline) -> Chapters:
-    """タイムラインの目印から目次を作る"""
+def chapters_of(timeline: Timeline, span: tuple[int, int] | None = None) -> Chapters:
+    """タイムラインの目印から目次を作る
+
+    ``span`` は書き出すフレームの範囲 省くと書き出し範囲（決めてなければ全体）
+    書き出しの窓で「全体」を選んだときは範囲を決めてあっても全体を書き出すので、
+    書き出す側は選んだ範囲をそのまま渡す
+    """
     rate = timeline.rate
-    span = export_range(timeline)
+    if span is None:
+        span = export_range(timeline)
     start, end = span if span is not None else (0, timeline.duration)
     unnamed = sum(1 for marker in timeline.markers if not marker.label.strip())
     named = sorted(

@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QCloseEvent, QStandardItemModel
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -107,6 +108,7 @@ class ExportDialog(QDialog):
         scene_name: str | None = None,
         smooth_history: bool = True,
         folder: Path | None = None,
+        chapters: bool = True,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
 
@@ -174,6 +176,13 @@ class ExportDialog(QDialog):
         if not project.scenes:
             self._scene.setToolTip("シーンを作ると、ここでシーンだけを書き出せる")
 
+        # 既定は本人の設定（#330 既定は入） 窓で替えた値は呼んだ側が設定へ覚える
+        self._chapters = QCheckBox("マーカーをチャプターとして埋める", self)
+        self._chapters.setChecked(chapters)
+        self._chapters.setToolTip(
+            "名前の付いた目印（目盛りの旗）を動画の章にする 効くのは mp4・mov・mkv だけ"
+        )
+
         self._summary = QLabel(self)
         self._range = QComboBox(self)
         self._empty = QLabel("タイムラインが空なので書き出せない", self)
@@ -186,6 +195,7 @@ class ExportDialog(QDialog):
         form.addRow("ビットレート", self._bitrate)
         form.addRow("内容", self._summary)
         form.addRow("書き出す範囲", self._range)
+        form.addRow("", self._chapters)
         if scene_name is not None:
             # タイムラインに見えているのはシーンの範囲 既定で書き出すのはメインなので、
             # 見えている帯と違う所が出ても驚かないように、ここで言う
@@ -226,6 +236,11 @@ class ExportDialog(QDialog):
         index = self._scene.findData(scene_id)
         if index >= 0:
             self._scene.setCurrentIndex(index)
+
+    @property
+    def embeds_chapters(self) -> bool:
+        """「マーカーをチャプターとして埋める」の今の値 呼んだ側が本人の設定に覚える"""
+        return self._chapters.isChecked()
 
     @property
     def target(self) -> Project:
@@ -331,6 +346,7 @@ class ExportDialog(QDialog):
             pipeline_depth=self._pipeline_depth,
             decode_threads=self._decode_threads,
             smooth_history=self._smooth_history,
+            chapters=self._chapters.isChecked(),
         )
 
     def _start(self) -> None:

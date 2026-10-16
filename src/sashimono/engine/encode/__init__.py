@@ -1,6 +1,7 @@
 """書き出し"""
 
 from sashimono.engine.encode.exporter import (
+    CHAPTER_SUFFIXES,
     COLOR_OPTIONS,
     DEFAULT_PIPELINE_DEPTH,
     MAX_PIPELINE_DEPTH,
@@ -14,6 +15,7 @@ from sashimono.engine.encode.exporter import (
 )
 
 __all__ = [
+    "CHAPTER_SUFFIXES",
     "COLOR_OPTIONS",
     "DEFAULT_PIPELINE_DEPTH",
     "MAX_PIPELINE_DEPTH",

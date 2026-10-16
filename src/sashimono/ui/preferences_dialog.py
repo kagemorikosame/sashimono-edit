@@ -259,6 +259,14 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("書き出しの先読み", self._pipeline_depth)
 
+        self._export_chapters = QCheckBox("マーカーをチャプターとして埋める", self)
+        self._export_chapters.setChecked(preferences.export_chapters)
+        self._export_chapters.setToolTip(
+            "名前の付いた目印（目盛りの旗）を、書き出す動画の章にする プレーヤーで章送りができる "
+            "効くのは mp4・mov・mkv だけ 書き出しの窓でも替えられ、替えた値はここに残る"
+        )
+        form.addRow(self._export_chapters)
+
         self._decode_threads = QComboBox(self)
         for label, threads in DECODE_THREADS:
             self._decode_threads.addItem(label, threads)
@@ -939,6 +947,7 @@ class PreferencesDialog(QDialog):
             prefetch_budget_mb=int(self._prefetch_budget.currentData()),
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
+            export_chapters=self._export_chapters.isChecked(),
             decode_threads=int(self._decode_threads.currentData()),
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
