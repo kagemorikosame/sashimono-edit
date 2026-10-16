@@ -38,8 +38,10 @@ from sashimono.ai.outbound import (
 from sashimono.core.commands import RemoveMedia, SetTranscript
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.timebase import format_timecode
+from sashimono.engine.cache import SceneState
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
+from tests.compat.test_subtitle_looks import _styled_alias
 
 SECRET_PATH = Path("C:/Users/秘密の人/動画/結婚式の撮影.mp4")
 
@@ -142,12 +144,17 @@ class TestDeclarations:
         # 読むだけの道具を全部、引数なしで動かして、結果の中身から宣言を確かめる
         secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
         texts = {segment.text for segment in transcript.segments}
+        media = secret_host.document.project.media[0]
+        # 場面の解析が失敗した素材 断りの文に素材の名前が入る
+        secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
                 continue
+            example = READ_EXAMPLES.get(operation.name)
+            arguments = example(str(media.id)) if example is not None else {}
             try:
-                result: object = operation(secret_host, {})
+                result: object = operation(secret_host, arguments)
             except ToolError as exc:
                 # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
                 result = str(exc)
@@ -161,6 +168,16 @@ class TestDeclarations:
             if any(sentence in text for sentence in texts):
                 assert Outbound.TEXT in operation.sends, operation.name
         assert checked >= 10
+
+    def test_every_reading_tool_that_needs_arguments_has_an_example(self) -> None:
+        # 壊れると、引数の要る読む道具（素材を指す物）が、引数なしで断られるだけで済み、
+        # 上の見張りが結果の中身を見ないまま通る（detect_scenes の宣言を外しても落ちなかった）
+        needing = {
+            operation.name
+            for operation in OPERATIONS
+            if not (operation.writes or operation.asks) and operation.schema.get("required")
+        }
+        assert needing <= set(READ_EXAMPLES)
 
     def test_only_frames_text_and_files_are_asked(self) -> None:
         # 壊れると、指示の文や編集の構成まで尋ねて、AI に何も頼めなくなる（または逆に絵を尋ねない）
@@ -179,6 +196,15 @@ class TestDeclarations:
 ARG_TEXT = "引数で渡した秘密の本文"
 #: 前からあるテキストのクリップの本文
 BODY_TEXT = "前からある秘密の本文"
+#: 保存したエイリアスの名前 結果やエラーの文に出たら、アプリの設定を送ると書くべき道具
+LOOK_NAME = "秘密の見た目"
+
+#: 引数の要る読む道具の引数（素材の ID を受ける） 足したらここにも足す（足さないと落ちる）
+READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
+    "detect_scenes": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    "seek": lambda _media_id: {"frame": 0},
+    "select_clips": lambda _media_id: {"clip_ids": []},
+}
 
 
 def _ids(host: FakeHost) -> dict[str, str]:
@@ -236,7 +262,8 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     },
     "replace_subtitle_text": lambda _ids: {"pairs": [{"from": "今日は", "to": ARG_TEXT}]},
     "clean_subtitles": lambda ids: {"media_id": ids["media"]},
-    "place_subtitles": lambda ids: {"media_id": ids["media"]},
+    # 無い見た目を頼むと、保存してある見た目の名前を並べて断る（#308）
+    "place_subtitles": lambda ids: {"media_id": ids["media"], "look_name": "無い見た目"},
     "jet_cut": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
@@ -244,9 +271,10 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
 
 
 def _with_text_clip(video_media: MediaItem, transcript: Transcript) -> FakeHost:
-    """素材の場所に本人の名前が入り、本文を持つテキストのクリップを 1 本置いた作品"""
+    """素材の場所に本人の名前が入り、本文のテキストを 1 本置き、見た目を 1 つ保存した作品"""
     created = FakeHost(make_loaded(replace(video_media, path=SECRET_PATH), transcript))
     _operation("add_text")(created, {"text": BODY_TEXT})
+    created.library.aliases.save(_styled_alias(LOOK_NAME))
     return created
 
 
@@ -276,6 +304,9 @@ class TestWritingToolsDeclareWhatTheyReturn:
         places = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name, SECRET_PATH.stem}
         if any(place in text for place in places):
             assert Outbound.FILES in operation.sends, f"{name}: {text}"
+        if LOOK_NAME in text:
+            # 保存したプリセットとエイリアスの名前は本人の持ち物 アプリの設定として送ると書く
+            assert Outbound.APP_SETTINGS in operation.sends, f"{name}: {text}"
 
 
 # --- 送る前に尋ねる ---
