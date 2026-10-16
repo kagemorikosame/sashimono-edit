@@ -23,7 +23,9 @@ TARGETS = ["src", "tests", "tools"]
 STEPS: list[tuple[str, list[str]]] = [
     ("ruff (書式)", ["-m", "ruff", "format", "--check", *TARGETS]),
     ("ruff (規約)", ["-m", "ruff", "check", *TARGETS]),
-    ("mypy", ["-m", "mypy", "src", "tests"]),
+    # 型も ruff と同じ 3 か所を見る tools/ を外すと、本体の形が変わって古くなった道具の
+    # 呼び方が、道具を走らせるまで見つからない
+    ("mypy", ["-m", "mypy", *TARGETS]),
     # -q は pyproject の addopts にもある 2 つ重ねると集計の行まで消えるので、ここでは
     # 足さない -rfE は落ちたテストと、準備で落ちたテスト（ERROR）の名前を最後に並べる
     # （CI の要約に写す） -rf だけでは ERROR の行が出ず、要約に名前が載らなかった

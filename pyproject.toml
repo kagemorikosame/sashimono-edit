@@ -101,7 +101,10 @@ report = ["console", "json"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+# tools/ も見る 撮る道具などは本体の部品を直に操るので、本体の形が変わったときに型で止める
+# （#353 で字幕パネルの ask_burn の形が変わり、tools/shots.py の古い撮り方が --wiki の撮影で
+# 落ちるまで気付けなかった）
+files = ["src", "tests", "tools"]
 
 # PyOpenGL は型情報を配布していない GL 呼び出しは薄い層に閉じ込めてあるので、
 # ここだけ型検査の対象外にする
@@ -111,4 +114,10 @@ files = ["src", "tests"]
 # 環境でも型検査が通るようにしておく 入っている環境では実物で検査される
 [[tool.mypy.overrides]]
 module = ["OpenGL.*", "faster_whisper.*", "sounddevice", "claude_agent_sdk.*"]
+ignore_missing_imports = true
+
+# 配る zip を作る道具（tools/build_package.py tools/check_bootloader.py）だけが使う物
+# どちらも型情報を配布していない 道具の中で呼ぶ所は数か所で、本体からは使わない
+[[tool.mypy.overrides]]
+module = ["PyInstaller.*", "pefile"]
 ignore_missing_imports = true

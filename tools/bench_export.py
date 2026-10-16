@@ -39,6 +39,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
+from typing import cast
 
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -188,7 +189,8 @@ def breakdown(
     closed = False
     try:
         stream = container.add_stream(codec, rate=Fraction(30, 1))
-        video = stream
+        # 映像の符号化方式で足した流れは映像の流れ 書き出し（engine/encode/exporter.py）と同じ書き方
+        video = cast("av.video.stream.VideoStream", stream)
         video.width, video.height = width, height
         video.pix_fmt = "yuv420p"
         tag_bt709(video)
