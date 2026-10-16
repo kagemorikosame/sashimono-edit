@@ -437,12 +437,13 @@ def _clip_id_list(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
         raw = [raw]
     if not isinstance(raw, list):
         raise ToolError("clip_ids はクリップ ID の配列で渡してください")
+    names = _string_items(raw, "clip_ids")
     project = _project(host)
-    for clip_id in raw:
-        _require_clip(project, str(clip_id))
+    for clip_id in names:
+        _require_clip(project, clip_id)
     # 最後に現れた位置を残す（画面の set_selection と同じ） 最後の 1 本が主になる
     # 約束なので、先に現れた位置を残すと [A, B, A] の主が B に化ける
-    ids = [ClipId(str(clip_id)) for clip_id in raw]
+    ids = [ClipId(clip_id) for clip_id in names]
     return tuple(reversed(dict.fromkeys(reversed(ids))))
 
 
@@ -936,10 +937,20 @@ def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> objec
     if not isinstance(pairs_raw, list) or not pairs_raw:
         raise ToolError('pairs に [{"from": 誤, "to": 正}, …] を渡してください')
     pairs: list[tuple[str, str]] = []
-    for entry in pairs_raw:
-        if not isinstance(entry, dict) or not str(entry.get("from") or ""):
+    for index, entry in enumerate(pairs_raw):
+        if not isinstance(entry, dict) or not isinstance(entry.get("from"), str):
+            raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は文字で渡します）')
+        if not entry["from"]:
             raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は空にできません）')
-        pairs.append((str(entry["from"]), str(entry.get("to") or "")))
+        replacement = entry.get("to", "")
+        if not isinstance(replacement, str):
+            # null を空の文字と読むと、誤植の言葉を字幕から黙って消す 消したいときは
+            # to を省くか空の文字を渡してもらう
+            raise ToolError(
+                f"pairs の {index + 1} 組目の to は文字で渡してください"
+                f"（{type(replacement).__name__} が来ました 消すなら空の文字）"
+            )
+        pairs.append((entry["from"], replacement))
 
     project = _project(host)
     targets: list[tuple[MediaItem, int]] = []
@@ -1054,11 +1065,31 @@ def _whole_number(arguments: dict[str, Any], key: str, default: int) -> int:
     value = arguments.get(key)
     if value is None:
         return default
+    return _integer_value(value, key)
+
+
+def _integer_value(value: object, name: str) -> int:
+    """整数 1 つ 省いたときの既定は持たない（配列の中の null を既定へ読み替えないため）"""
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ToolError(f"{key} は整数で渡してください（{type(value).__name__} が来ました）")
+        raise ToolError(f"{name} は整数で渡してください（{type(value).__name__} が来ました）")
     if isinstance(value, float) and not value.is_integer():
-        raise ToolError(f"{key} は整数で渡してください（{value}）")
+        raise ToolError(f"{name} は整数で渡してください（{value}）")
     return int(value)
+
+
+def _string_items(raw: list[Any], name: str) -> list[str]:
+    """文字の配列の中身を 1 つずつ確かめる null や数は、何番目かを書いて断る
+
+    ``str()`` で読むと null が "None" という ID や名前になり、見当違いの「見つかりません」
+    が返るか、何にも当たらずに黙って減る
+    """
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise ToolError(
+                f"{name} の {index + 1} 個目は文字で渡してください"
+                f"（{type(entry).__name__} が来ました）"
+            )
+    return list(raw)
 
 
 def _within(arguments: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
@@ -1107,7 +1138,8 @@ def _sheet_frames_from_list(project: Project, raw: object) -> list[int]:
     last = project.duration - 1
     frames: list[int] = []
     for index, value in enumerate(raw):
-        frame = _whole_number({"frames": value}, "frames", 0)
+        # null を既定の 0 に読み替えない 読み替えると頼んでいない頭のコマを描く
+        frame = _integer_value(value, f"frames の {index + 1} 個目")
         if not 0 <= frame <= last:
             raise ToolError(
                 f"frames の {index + 1} 個目（{frame}）はタイムラインの外です（0〜{last}）"
@@ -1457,7 +1489,9 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     raw = arguments.get("paths") or []
     if isinstance(raw, str):
         raw = [raw]
-    paths = [Path(str(entry)) for entry in raw]
+    if not isinstance(raw, list):
+        raise ToolError("paths はファイルパスの配列で渡してください")
+    paths = [Path(entry) for entry in _string_items(raw, "paths")]
     if not paths:
         raise ToolError("paths が空です")
 
@@ -2141,7 +2175,13 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         else:
             voices = [v for v in subtitle_voices(project) if v[0] == media.id]
     raw_segments = arguments.get("segment_ids")
-    segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
+    if raw_segments is not None and not isinstance(raw_segments, list):
+        raise ToolError(
+            "segment_ids は字幕の ID（get_subtitles の segment_id）の配列で渡してください"
+        )
+    segments = (
+        {SegmentId(s) for s in _string_items(raw_segments, "segment_ids")} if raw_segments else None
+    )
 
     # 画面の〔焼き込み〕と同じ既定 作品の高さに合わせて縮める
     settings = project.settings
