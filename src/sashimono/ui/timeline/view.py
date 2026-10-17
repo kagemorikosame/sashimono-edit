@@ -253,6 +253,11 @@ class TimelineView(QWidget):
     #: シーンを置いたクリップをダブルクリックした 引数はシーンの ID
     #: 中を開くのは窓の仕事（どのシーンを編集中かは窓が持つ）
     scene_open_requested = Signal(str)
+    #: 右クリックの〔BGM を声に合わせて下げる…〕（#329） 下げるクリップの ID の並び
+    #: 声のトラックと下げ方を尋ねて下げるのは窓の側（AI の duck_audio と同じ所を通す）
+    duck_requested = Signal(list)
+    #: 右クリックの〔音量を基準にそろえる…〕（#329） そろえるクリップの ID の並び
+    loudness_requested = Signal(list)
     #: ビューは窓を知らない（テストで単体で作れるように） 知らせは信号で外へ出し、
     #: ステータスバーに出すのは窓の仕事にする
     status_message = Signal(str)
@@ -1824,6 +1829,22 @@ class TimelineView(QWidget):
             group.setEnabled(len(self._selection) > 1)
             ungroup = _action(menu, "グループ解除", self.ungroup_selected)
             ungroup.setEnabled(self._selection_has_group())
+            menu.addSeparator()
+            # 音量とミックス（#329） 音を鳴らすクリップを選んでいなければ灰色で出す
+            # 出さずに隠すと、絵のクリップの上で探しても見つからず、在ることに気付けない
+            sounds = [str(clip_id) for clip_id in self._editable_sounds()]
+            duck = _action(
+                menu,
+                f"BGM を声に合わせて下げる…{count}",
+                functools.partial(self.duck_requested.emit, sounds),
+            )
+            duck.setEnabled(bool(sounds))
+            level = _action(
+                menu,
+                f"音量を基準にそろえる…{count}",
+                functools.partial(self.loudness_requested.emit, sounds),
+            )
+            level.setEnabled(bool(sounds))
             if hit[1].scene_id is not None:
                 scene_id = hit[1].scene_id
                 _action(
@@ -1947,6 +1968,22 @@ class TimelineView(QWidget):
         command = UngroupClips(self._selection)
         self._request([command], command.label)
         return True
+
+    def _editable_sounds(self) -> list[ClipId]:
+        """選んでいるクリップのうち、音を鳴らし、ロックしていないトラックにある物
+
+        絵のクリップの音量を変えても何も鳴らない ロックは人が触らせないために掛けた物
+        """
+        project = self._project
+        found: list[ClipId] = []
+        for clip_id in self._selection:
+            located = project.timeline.locate_clip(clip_id)
+            if located is None:
+                continue
+            track, clip = located
+            if not track.locked and project.plays_sound(track, clip):
+                found.append(clip_id)
+        return found
 
     def _selection_has_group(self) -> bool:
         timeline = self._project.timeline

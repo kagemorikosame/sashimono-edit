@@ -1,7 +1,8 @@
 """音量の線を組む計算（#329 B3 音量とミックス）
 
 BGM を話している間だけ下げる（ダッキング）線と、音量の線を全体で同じ比だけ動かす
-計算をここに置く どちらも Qt も音も知らない 話している区間（素材の秒）と、今の音量の線
+計算と、それを命令にする所（AI の道具とタイムラインの右クリックが同じ所を通る）を
+ここに置く どちらも Qt も音も知らない 話している区間（素材の秒）と、今の音量の線
 （:class:`~sashimono.core.model.AnimatedValue` の %）を受け取り、新しい線を返すだけ
 線を変える命令は :mod:`sashimono.core.commands.volume` が作る
 
@@ -17,8 +18,10 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import pairwise
 
+from sashimono.core.commands.base import Command
+from sashimono.core.commands.volume import clip_volume, volume_command
 from sashimono.core.jetcut import FrameRange, SourceRange
-from sashimono.core.model import AnimatedValue, Clip, Keyframe
+from sashimono.core.model import AnimatedValue, Clip, ClipId, Keyframe, Project
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
@@ -29,10 +32,16 @@ __all__ = [
     "DUCK_DEPTH_DB_RANGE",
     "DUCK_RELEASE_MS_RANGE",
     "VOLUME_LIMIT",
+    "DuckPlan",
     "DuckShape",
+    "LoudnessGain",
     "db_to_ratio",
     "duck_curve",
+    "gain_commands",
     "loudest",
+    "loudness_gain",
+    "measure_project",
+    "plan_ducking",
     "ratio_to_db",
     "scaled_volume",
     "speech_frames",
@@ -199,3 +208,104 @@ def duck_curve(
         kept.setdefault(last, _value_at(points, last, base))
     keyframes = tuple(Keyframe(frame=frame, value=level) for frame, level in sorted(kept.items()))
     return AnimatedValue(static=base, keyframes=keyframes)
+
+
+@dataclass(frozen=True, slots=True)
+class DuckPlan:
+    """ダッキングで変える物 命令はまとめて 1 回の取り消しで戻せるよう、呼ぶ側が 1 度に当てる"""
+
+    commands: tuple[Command, ...]
+    #: 下げたクリップと、その新しい線
+    curves: tuple[tuple[Clip, AnimatedValue], ...]
+    #: 範囲に話している所が無く、変えなかったクリップ
+    untouched: tuple[Clip, ...]
+
+
+def plan_ducking(
+    clips: Sequence[Clip],
+    speech: Sequence[FrameRange],
+    *,
+    shape: DuckShape,
+    rate: FrameRate,
+    base: float | None = None,
+) -> DuckPlan:
+    """``clips``（BGM）を、話している区間 ``speech``（タイムラインのフレーム）の間だけ下げる
+
+    下げていない音量 ``base`` を省くと、クリップの線の一番大きい値 前に下げた線を掛け直すとき、
+    下げた所ではなく元の音量を基準にする 下げた所を基準にすると、掛けるたびに BGM が小さくなる
+    """
+    commands: list[Command] = []
+    curves: list[tuple[Clip, AnimatedValue]] = []
+    untouched: list[Clip] = []
+    for clip in clips:
+        level = loudest(clip_volume(clip)) if base is None else base
+        relative = [
+            (start - clip.timeline_start, end - clip.timeline_start) for start, end in speech
+        ]
+        curve = duck_curve(clip.duration, relative, base=level, shape=shape, rate=rate)
+        if curve is None:
+            untouched.append(clip)
+            continue
+        commands.append(volume_command(clip, curve))
+        curves.append((clip, curve))
+    return DuckPlan(tuple(commands), tuple(curves), tuple(untouched))
+
+
+def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
+    """測るクリップだけを残したプロジェクト ミュートとソロは外す
+
+    ほかのクリップを残すと、BGM だけをそろえたいのに声まで含めた音量を測る ソロは聞き比べの
+    ための物で、残すとソロのトラックの外にある測りたい音が鳴らない
+    """
+    wanted = set(clip_ids)
+    tracks = tuple(
+        replace(
+            track,
+            clips=tuple(clip for clip in track.clips if clip.id in wanted),
+            muted=False,
+            solo=False,
+        )
+        for track in project.timeline.tracks
+    )
+    return replace(project, timeline=replace(project.timeline, tracks=tracks))
+
+
+@dataclass(frozen=True, slots=True)
+class LoudnessGain:
+    """測った音量から決めた、全部のクリップへ掛ける量"""
+
+    gain_db: float
+    #: 基準の手前で止めた訳 ``peak``（音の山が天井を超える）と ``volume_limit``（欄の上限）
+    limited_by: tuple[str, ...] = ()
+
+
+def loudness_gain(
+    clips: Sequence[Clip],
+    *,
+    measured: float,
+    peak_db: float | None,
+    target: float,
+    ceiling: float,
+) -> LoudnessGain:
+    """測った積分ラウドネス ``measured`` を ``target`` へ寄せる量（dB）
+
+    上げすぎると音が割れるので、山 ``peak_db`` が天井 ``ceiling`` に当たる所で止める
+    どれかのクリップの線が欄の上限を超える所でも止める 超えた分は鳴らないので、そろえた
+    つもりの音量にならない
+    """
+    gain = target - measured
+    limited: list[str] = []
+    if peak_db is not None and peak_db + gain > ceiling:
+        gain = ceiling - peak_db
+        limited.append("peak")
+    top = max((loudest(clip_volume(clip)) for clip in clips), default=0.0)
+    if top > 0 and top * db_to_ratio(gain) > VOLUME_LIMIT:
+        gain = ratio_to_db(VOLUME_LIMIT / top)
+        limited.append("volume_limit")
+    return LoudnessGain(gain, tuple(limited))
+
+
+def gain_commands(clips: Sequence[Clip], gain_db: float) -> list[Command]:
+    """どのクリップの音量の線にも同じ dB を掛ける命令 声と BGM の釣り合いは変えない"""
+    ratio = db_to_ratio(gain_db)
+    return [volume_command(clip, scaled_volume(clip_volume(clip), ratio)) for clip in clips]

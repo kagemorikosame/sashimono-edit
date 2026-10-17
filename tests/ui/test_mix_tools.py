@@ -16,11 +16,13 @@ from typing import Any
 
 import numpy as np
 import pytest
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddClip
+from sashimono.core.commands import AddClip, SetTrackState
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume
 from sashimono.core.mixing import (
@@ -42,8 +44,11 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.decode.probe import probe_media
+from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
+from sashimono.ui.mix_dialogs import DuckChoice, DuckDialog, LoudnessChoice, LoudnessDialog
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending
 from tests.check_media import tone, write_tone
@@ -274,5 +279,145 @@ class TestPreference:
             dialog._duck_release.setValue(2000)
             chosen = dialog.preferences()
             assert chosen.duck_shape == DuckShape(depth_db=18, attack_ms=500, release_ms=2000)
+        finally:
+            dialog.deleteLater()
+
+
+DUCK_TEXT = "BGM を声に合わせて下げる…"
+LOUDNESS_TEXT = "音量を基準にそろえる…"
+
+
+def _clip_point(view: TimelineView, track: Track, frame: int) -> QPoint:
+    for band in view.view_layout.bands(view.project.timeline):
+        if band.track.id == track.id:
+            return QPoint(int(view.view_layout.frame_to_x(frame)), (band.top + band.bottom) // 2)
+    raise AssertionError(f"トラックが無い: {track.name}")
+
+
+def _menu_action(window: MainWindow, track: Track, text: str) -> QAction:
+    view = window._timeline
+    view.resize(1200, 400)
+    menu = view.build_context_menu(_clip_point(view, track, 30))
+    found = next((a for a in menu.actions() if a.text() == text), None)
+    assert found is not None, [a.text() for a in menu.actions()]
+    return found
+
+
+def _bgm_clip(window: MainWindow, bgm: Track) -> Clip:
+    (clip,) = next(t for t in window.document.project.timeline.tracks if t.id == bgm.id).clips
+    return clip
+
+
+class TestRightClick:
+    """タイムラインの右クリックから人が使う（#329 2026-10-17 利用者の決定）
+
+    窓は main_window の ask_duck / ask_loudness を差し替えて答える 差し替えずに窓が開くと
+    no_windows が落とす
+    """
+
+    def test_both_items_are_on_a_sound_clip(self, opened: list[MainWindow], media: _Media) -> None:
+        # 壊れると、人は AI に頼まないと BGM を声に合わせて下げられない
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        assert _menu_action(window, bgm, DUCK_TEXT).isEnabled()
+        assert _menu_action(window, bgm, LOUDNESS_TEXT).isEnabled()
+
+    def test_a_locked_track_greys_them_out(self, opened: list[MainWindow], media: _Media) -> None:
+        # 壊れると、人が触らせないためにロックしたトラックの BGM の音量が右クリックで変わる
+        project, _voice, bgm = _project(media)
+        project = SetTrackState(bgm.id, locked=True).apply(project)
+        window = _window(opened, project)
+        assert not _menu_action(window, bgm, DUCK_TEXT).isEnabled()
+        assert not _menu_action(window, bgm, LOUDNESS_TEXT).isEnabled()
+
+    def test_ducking_from_the_menu_matches_the_tool(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、人が右クリックで下げた BGM と AI が下げた BGM の線が食い違う
+        PreferenceStore().save(Preferences(duck_depth_db=15))
+        project, voice, bgm = _project(media)
+        asked: list[tuple[list[str], DuckShape]] = []
+
+        def answer(_parent: object, voices: list[Track], shape: DuckShape) -> DuckChoice:
+            asked.append(([t.name for t in voices], shape))
+            return DuckChoice(voice.id, shape)
+
+        monkeypatch.setattr(main_window_module, "ask_duck", answer)
+        by_hand = _window(opened, project)
+        _menu_action(by_hand, bgm, DUCK_TEXT).trigger()
+        # 声のトラックの候補は下げるクリップの外 下げ方の既定は本人の設定
+        assert asked == [(["声"], DuckShape(depth_db=15))]
+        by_tool = _window(opened, project)
+        _call(by_tool, "duck_audio", {"track_id": str(bgm.id), "voice_track_id": str(voice.id)})
+        assert clip_volume(_bgm_clip(by_hand, bgm)) == clip_volume(_bgm_clip(by_tool, bgm))
+        assert clip_volume(_bgm_clip(by_hand, bgm)).keyframes
+        # 取り消し 1 回で戻る
+        by_hand.document.undo()
+        assert by_hand.document.project == project
+
+    def test_cancelling_changes_nothing(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、窓でやめたのに BGM が下がる
+        monkeypatch.setattr(main_window_module, "ask_duck", lambda *_args: None)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, DUCK_TEXT).trigger()
+        assert window.document.project == project
+
+    def test_loudness_from_the_menu_measures_then_applies(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、右クリックでそろえても基準の音量にならないか、測る間に画面が固まる
+        asked: list[float] = []
+
+        def answer(_parent: object, target: float) -> LoudnessChoice:
+            asked.append(target)
+            return LoudnessChoice(-14.0)
+
+        monkeypatch.setattr(main_window_module, "ask_loudness", answer)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        # 基準の既定は本人の設定（仕上がりを調べる音量の基準）
+        assert asked == [-14.0]
+        deadline = time.monotonic() + 60.0
+        while window._pending_loudness is not None:
+            QApplication.processEvents()
+            time.sleep(0.01)
+            assert time.monotonic() < deadline, "測り終えなかった"
+        # BGM だけを測るので -20 LUFS から +6 dB 声のクリップは変えない
+        assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(200.0, rel=0.06)
+        voice_clip = window.document.project.timeline.tracks[0].clips[0]
+        assert clip_volume(voice_clip).static == 100.0
+        window.document.undo()
+        assert window.document.project == project
+
+
+class TestDialogs:
+    def test_the_duck_dialog_starts_from_the_given_shape(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、窓の既定が設定と違い、OK を押すだけで設定と違う下げ方になる
+        del qt_application
+        voice = Track(kind=TrackKind.AUDIO, name="ナレーション")
+        dialog = DuckDialog([voice], DuckShape(depth_db=9, attack_ms=200, release_ms=600))
+        try:
+            assert dialog.choice() == DuckChoice(
+                voice.id, DuckShape(depth_db=9, attack_ms=200, release_ms=600)
+            )
+            dialog.depth_box.setValue(20)
+            assert dialog.choice().shape.depth_db == 20
+        finally:
+            dialog.deleteLater()
+
+    def test_the_loudness_dialog_starts_from_the_preference(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、放送向けに -23 を選んだ人の窓が配信の -14 で開く
+        del qt_application
+        dialog = LoudnessDialog(-23.0)
+        try:
+            assert dialog.choice() == LoudnessChoice(-23.0, -1.0)
         finally:
             dialog.deleteLater()

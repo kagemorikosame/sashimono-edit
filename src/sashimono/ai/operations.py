@@ -73,7 +73,7 @@ from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.insert import new_track, place_media
 from sashimono.core.commands.layers import places_mixed
-from sashimono.core.commands.volume import clip_volume, volume_command, volume_commands
+from sashimono.core.commands.volume import clip_volume, volume_commands
 from sashimono.core.io.serialize import json_text
 from sashimono.core.jetcut import merge_ranges, plan_cuts
 from sashimono.core.mixing import (
@@ -83,11 +83,12 @@ from sashimono.core.mixing import (
     VOLUME_LIMIT,
     DuckShape,
     db_to_ratio,
-    duck_curve,
+    gain_commands,
     loudest,
-    ratio_to_db,
+    loudness_gain,
+    measure_project,
+    plan_ducking,
     scaled_volume,
-    speech_frames,
 )
 from sashimono.core.model import (
     AnimatedValue,
@@ -107,7 +108,7 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
 )
-from sashimono.core.projection import project_timeline, subtitle_voice
+from sashimono.core.projection import project_timeline
 from sashimono.core.timebase import Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
@@ -128,6 +129,13 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
+from sashimono.engine.audio.speech import (
+    SPEECH_SOURCES,
+    SpeechError,
+    WaveformPendingError,
+    voice_speech,
+)
+from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
 from sashimono.engine.checks import KINDS as CHECK_KINDS
@@ -2279,11 +2287,6 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
 # タイムラインの音量の線と同じ所 :func:`volume_command`）、置くのはドラッグ＆ドロップと同じ
 # :func:`place_media` 1 回の呼び出しは 1 回の apply_commands なので、取り消し 1 回で戻る
 
-#: 話している所を何から拾うか
-SPEECH_SOURCES = ("auto", "subtitles", "waveform")
-#: 波形から話している所を拾うときの無音の最短（秒） これより短い息継ぎは無音として数えない
-#: ダッキングは下げる長さと戻る長さの和より短い間をつなぐので、細かく拾っても線は増えない
-_SPEECH_GAP = Fraction(1, 10)
 #: BGM を敷き詰めるときに置く本数の上限 短い効果音を長い範囲へ並べるような頼み違いで、
 #: 何千本も置いて画面が固まるのを防ぐ
 MAX_LOOP_PIECES = 500
@@ -2412,43 +2415,6 @@ def _set_volume(host: EditorHost, arguments: dict[str, Any]) -> object:
     return result
 
 
-def _speech_ranges(
-    host: EditorHost, media: MediaItem, stream: int, source: str, threshold: float
-) -> list[tuple[Fraction, Fraction]]:
-    """素材の話している区間（素材の秒）
-
-    字幕があれば字幕の区間を使う（認識器が文字を起こせた所は確かに話している 波形だけでは
-    小さな声と環境音を分けられない） 無ければ波形の無音の外側を話している所とみなす
-    """
-    transcript = media.transcript_for(stream)
-    if source != "waveform" and transcript is not None and transcript.segments:
-        return [(segment.start, segment.end) for segment in transcript.segments]
-    if source == "subtitles":
-        raise ToolError(
-            f"{media.name} の字幕がありません transcribe で起こすか、speech_from を waveform に"
-            "してください"
-        )
-    from sashimono.engine.audio.silence import SilenceOptions, detect_silence
-
-    waveform = host.waveform(media, stream)
-    if waveform is None:
-        host.analyze(media)
-        raise ToolError(f"{media.name} の波形解析がまだ終わっていません 少し待ってください")
-    silences = detect_silence(
-        waveform,
-        SilenceOptions(threshold_db=threshold, min_silence=_SPEECH_GAP, padding=Fraction(0)),
-    )
-    speech: list[tuple[Fraction, Fraction]] = []
-    cursor = Fraction(0)
-    for start, end in silences:
-        if start > cursor:
-            speech.append((cursor, start))
-        cursor = max(cursor, end)
-    if waveform.duration > cursor:
-        speech.append((cursor, waveform.duration))
-    return speech
-
-
 def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     ducked = _picked_sound_clips(host, arguments, "clip_ids", "track_id")
@@ -2472,42 +2438,35 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError(f"speech_from は {'・'.join(SPEECH_SOURCES)} のどれかです")
     threshold = _limit_number(arguments, "threshold_db", -40.0, -90.0, -10.0)
 
-    speech: list[tuple[int, int]] = []
-    for track, clip in voices:
-        media = project.find_media(clip.media_id) if clip.media_id is not None else None
-        if media is None or not media.has_audio:
-            raise ToolError(
-                f"{clip.id} は素材の音を鳴らすクリップではありません（置いたシーンなど）"
-            )
-        stream = subtitle_voice(project, track, clip, media)
-        ranges = _speech_ranges(host, media, stream, source, threshold)
-        speech.extend(
-            (clip.timeline_start + start, clip.timeline_start + end)
-            for start, end in speech_frames(clip, ranges, project.rate)
-        )
+    def waveform_of(media: MediaItem, stream: int) -> Waveform | None:
+        return host.waveform(media, stream)
+
+    try:
+        speech = voice_speech(project, voices, waveform_of, source=source, threshold_db=threshold)
+    except WaveformPendingError as exc:
+        host.analyze(exc.media)
+        raise ToolError(str(exc)) from exc
+    except SpeechError as exc:
+        raise ToolError(f"{exc}（speech_from を waveform にすると波形から拾います）") from exc
     if not speech:
         raise ToolError(
             "声のクリップに話している所が見つかりません threshold_db を下げるか、"
             "字幕を起こしてから呼んでください"
         )
 
-    commands: list[Command] = []
-    rows: list[dict[str, Any]] = []
-    untouched: list[str] = []
-    for _track, clip in ducked:
-        current = clip_volume(clip)
-        # 下げていない音量 点があれば一番大きい値（前に下げた線を掛け直すとき、下げた所ではなく
-        # 元の音量を基準にする 下げた所を基準にすると、掛けるたびに BGM が小さくなる）
-        base = _limit_number(arguments, "base_volume_percent", loudest(current), 0.0, VOLUME_LIMIT)
-        relative = [
-            (start - clip.timeline_start, end - clip.timeline_start) for start, end in speech
-        ]
-        curve = duck_curve(clip.duration, relative, base=base, shape=shape, rate=project.rate)
-        if curve is None:
-            untouched.append(str(clip.id))
-            continue
-        commands.append(volume_command(clip, curve))
-        rows.append(_volume_row(clip.id, curve))
+    base = arguments.get("base_volume_percent")
+    plan = plan_ducking(
+        [clip for _, clip in ducked],
+        speech,
+        shape=shape,
+        rate=project.rate,
+        base=None
+        if base is None
+        else _limit_number(arguments, "base_volume_percent", 100.0, 0.0, VOLUME_LIMIT),
+    )
+    commands = list(plan.commands)
+    rows = [_volume_row(clip.id, curve) for clip, curve in plan.curves]
+    untouched = [str(clip.id) for clip in plan.untouched]
     if not commands:
         raise ToolError("下げるクリップの範囲に、話している所がありません")
     host.apply_commands(commands, f"BGM を声に合わせて下げる: {len(commands)} 本")
@@ -2525,24 +2484,6 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     if untouched:
         result["untouched_clip_ids"] = untouched
     return result
-
-
-def _measure_project(project: Project, clip_ids: set[ClipId]) -> Project:
-    """測るクリップだけを残したプロジェクト ミュートとソロは外す
-
-    ほかのクリップを残すと、BGM だけをそろえたいのに声まで含めた音量を測る ソロは聞き比べの
-    ための物で、残すとソロのトラックの外にある測りたい音が鳴らない
-    """
-    tracks = tuple(
-        replace(
-            track,
-            clips=tuple(clip for clip in track.clips if clip.id in clip_ids),
-            muted=False,
-            solo=False,
-        )
-        for track in project.timeline.tracks
-    )
-    return replace(project, timeline=replace(project.timeline, tracks=tracks))
 
 
 def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -2571,7 +2512,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     end = max(clip.timeline_end for _, clip in targets)
     request = CheckRequest(
         CheckLimits(loudness_target=target, kinds=frozenset({LOUDNESS})),
-        project=_measure_project(project, {clip.id for _, clip in targets}),
+        project=measure_project(project, (clip.id for _, clip in targets)),
         start=start,
         end=end,
         scene=str(host.active_scene) if host.active_scene is not None else None,
@@ -2623,16 +2564,15 @@ def _apply_loudness(
             "測っている間に作品が変わりました 何も変えていません もう 1 度呼ぶと測り直します"
         )
     measured = report.loudness
-    gain = request.limits.loudness_target - measured
-    limited: list[str] = []
-    if report.peak_db is not None and report.peak_db + gain > ceiling:
-        # 上げすぎると音が割れる 山が天井に当たる所で止め、基準に届かないことを返す
-        gain = ceiling - report.peak_db
-        limited.append("peak")
-    top = max(loudest(clip_volume(clip)) for clip in clips)
-    if top > 0 and top * db_to_ratio(gain) > VOLUME_LIMIT:
-        gain = ratio_to_db(VOLUME_LIMIT / top)
-        limited.append("volume_limit")
+    decided = loudness_gain(
+        clips,
+        measured=measured,
+        peak_db=report.peak_db,
+        target=request.limits.loudness_target,
+        ceiling=ceiling,
+    )
+    gain = decided.gain_db
+    limited = list(decided.limited_by)
     result: dict[str, Any] = {
         "measured_lufs": round(measured, 1),
         "target_lufs": request.limits.loudness_target,
@@ -2642,9 +2582,7 @@ def _apply_loudness(
     if abs(gain) < 0.05:
         result |= {"gain_db": 0.0, "note": "すでに基準に合っています 何も変えていません"}
         return result
-    commands = [
-        volume_command(clip, scaled_volume(clip_volume(clip), db_to_ratio(gain))) for clip in clips
-    ]
+    commands = gain_commands(clips, gain)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
         "gain_db": round(gain, 2),

@@ -293,6 +293,10 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/削除して詰める", "delete_clips", "delete_clip"),
     same("タイムラインの右クリック/グループ化", "group_clips"),
     same("タイムラインの右クリック/グループ解除", "ungroup_clips"),
+    # 音量とミックス（#329） 2026-10-17 に利用者が右クリックに足すと決めた 人も AI も
+    # core/mixing.py の同じ計算を通る
+    same("タイムラインの右クリック/BGM を声に合わせて下げる…", "duck_audio"),
+    same("タイムラインの右クリック/音量を基準にそろえる…", "normalize_loudness"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     missing("タイムラインの右クリック/エイリアスとして保存…", 328),
@@ -560,11 +564,7 @@ AI_ONLY: dict[str, str] = {
     "set_subtitle_text": _GESTURE,
     "replace_subtitle_text": "字幕と、字幕から置いたテキストをまとめて直す 画面に同じ入口は無い",
     "ask_user": "AI から利用者へ尋ねる",
-    # 音量とミックス（#329） 人は音量の線に点を打って下げ、耳で聞いて欄の値を合わせる
-    # 声に合わせて自動で下げる・基準の音量へそろえる入口は画面に無い 人も使えるようにするかは
-    # 利用者が決める（#329 のコメント）
-    "duck_audio": "BGM を声の間だけ下げる 人は音量の線に点を打って行う 画面に同じ入口は無い",
-    "normalize_loudness": "音量を測って基準へそろえる 人は聞いて欄の値を合わせる 同じ入口は無い",
+    # BGM と効果音を置く（#329） 画面では素材をドラッグして置き、右端を詰める
     "place_sound": _GESTURE,
 }
 
