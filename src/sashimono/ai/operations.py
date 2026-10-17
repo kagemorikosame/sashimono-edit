@@ -1418,6 +1418,10 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
         "can_undo": document.can_undo,
         "undo_label": document.undo_label,
         "recent": list(document.history_labels[-10:]),
+        "can_redo": document.can_redo,
+        "redo_label": document.redo_label,
+        # 今の指示で変えた手（古い順） 指示の中で undo するとここから戻る（#333）
+        "this_instruction": list(document.steps_in_checkpoint),
     }
 
 
@@ -3298,18 +3302,62 @@ def _transcription_status(host: EditorHost, arguments: dict[str, Any]) -> object
 
 
 def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
-    steps = max(1, int(arguments.get("steps", 1)))
+    """人の〔元に戻す〕を何回か押すのと同じ 指示の途中なら、この指示の 1 手から戻す（#333）
+
+    指示の中の手は :attr:`Document.steps_in_checkpoint` に積まれていて、戻し切ると前の指示の
+    1 段（「AI: 〜」）をまとめて戻す 履歴は人の Ctrl+Z / Ctrl+Y と同じ 1 本なので、AI が
+    戻した物は人が Ctrl+Y でやり直せる
+    """
     document = host.document
-    undone: list[str] = []
-    for _ in range(steps):
-        label = document.undo_label
-        if label is None:
-            break
-        document.undo()
-        undone.append(label)
+    whole = bool(arguments.get("this_instruction", False))
+    if whole:
+        if "steps" in arguments:
+            # 両方を受けると、どちらを守ったのか AI に分からない 片方だけ当てて黙らない
+            raise ToolError(
+                "steps と this_instruction は一緒に使えません どちらか一方にしてください"
+            )
+        steps = len(document.steps_in_checkpoint)
+        if steps == 0:
+            raise ToolError(
+                "この指示ではまだ何も変えていません 前の指示を戻すなら、"
+                "this_instruction を付けずに undo を呼んでください"
+            )
+    else:
+        steps = max(1, int(arguments.get("steps", 1)))
+    undone = _step_history(host, steps, forward=False)
     if not undone:
         raise ToolError("戻せる操作がありません")
-    return {"undone": undone}
+    return {"undone": undone, "can_redo": document.can_redo}
+
+
+def _redo(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """人の〔やり直す〕を何回か押すのと同じ 取り消した後に別の編集をすると、やり直せない"""
+    steps = max(1, int(arguments.get("steps", 1)))
+    redone = _step_history(host, steps, forward=True)
+    if not redone:
+        raise ToolError(
+            "やり直せる操作がありません 取り消した後に別の編集をすると、やり直しは消えます"
+        )
+    return {"redone": redone, "can_redo": host.document.can_redo}
+
+
+def _step_history(host: EditorHost, steps: int, *, forward: bool) -> list[str]:
+    """履歴を ``steps`` 段だけ辿り、辿った段の名前を返す 端に着いたらそこで止める
+
+    ホストの口（人のメニューと同じ処理）を通す 文書を直に辿ると画面が前の形のまま残る
+    """
+    document = host.document
+    moved: list[str] = []
+    for _ in range(steps):
+        label = document.redo_label if forward else document.undo_label
+        if label is None:
+            break
+        if forward:
+            host.redo()
+        else:
+            host.undo()
+        moved.append(label)
+    return moved
 
 
 def _seek(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -4228,7 +4276,10 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="get_history",
-        description="直近の操作履歴と、取り消せるかどうか",
+        description=(
+            "直近の操作履歴と、取り消せるか・やり直せるか this_instruction は今の指示で"
+            "変えた手（古い順）で、undo はそこから戻す"
+        ),
         schema=_schema({}),
         handler=_get_history,
         sends=_HISTORY,
@@ -5433,9 +5484,36 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="undo",
-        description="直前の操作を取り消す",
-        schema=_schema({"steps": _integer("戻す段数（既定 1）")}),
+        description=(
+            "直前の操作を取り消す（画面の〔元に戻す〕と同じ） 今の指示の途中なら、この指示で"
+            "変えた手を 1 つずつ戻す この指示で変えた物を全部戻すなら this_instruction を真に"
+            "する この指示でまだ何も変えていなければ、前の指示の変更をまとめて 1 段で戻す"
+            " 人が手で変えた段も同じ履歴に並ぶので、戻す前に get_history で名前を確かめる"
+            " 戻した物は redo でやり直せる"
+        ),
+        schema=_schema(
+            {
+                "steps": _integer("戻す段数（既定 1）"),
+                "this_instruction": _boolean(
+                    "今の指示で変えた物を全部戻す（steps とは一緒に使わない）"
+                ),
+            }
+        ),
         handler=_undo,
+        sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
+        writes=True,
+    ),
+    Operation(
+        name="redo",
+        description=(
+            "取り消した操作をやり直す（画面の〔やり直す〕と同じ） 取り消した後に別の編集を"
+            "するとやり直しは消える やり直せる物は get_history の redo_label で分かる"
+        ),
+        schema=_schema({"steps": _integer("やり直す段数（既定 1）")}),
+        handler=_redo,
+        # 結果はやり直した操作の名前 取り消しと同じく、名前に素材の名前と文の頭が入る
         sends=_HISTORY,
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
