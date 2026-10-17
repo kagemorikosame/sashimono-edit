@@ -4051,6 +4051,11 @@ def _apply_template(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"applied": entry.label, "clip_id": str(clip.id)}
 
 
+#: import_objects が読む拡張子 互換の〔オブジェクトを読み込む…〕の窓の種類と、棚が読む AviUtl2 の
+#: ``.object``
+_OBJECT_SUFFIXES = (".exo", ".exa", ".exo2", ".exa2", ".object")
+
+
 def _import_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
     """AviUtl のオブジェクトのファイルを読み込む 互換の〔オブジェクトを読み込む…〕と同じ手順
 
@@ -4059,6 +4064,9 @@ def _import_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
     raw = str(arguments.get("path") or "")
     if not raw:
         raise ToolError("path を指定してください（.exo .exa .exo2 .exa2 .object）")
+    # 読むのは AviUtl のオブジェクトのファイルだけ 人は窓の「すべてのファイル」で自分で選べるが、
+    # AI には選ぶ人がいない 拡張子を見ないと、本人のメモや設定まで開いて読もうとする
+    _require_suffix(raw, _OBJECT_SUFFIXES, "読み込むオブジェクトのファイル")
     source = Path(raw)
     if not source.is_file():
         raise ToolError(f"ファイルがありません: {source}")

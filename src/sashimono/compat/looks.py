@@ -25,6 +25,10 @@ from sashimono.compat.aviutl.custom_object import custom_object_script
 from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.compat.aviutl.mapping import map_exo, media_paths
 from sashimono.compat.catalog import MediaPlan, Probe, gather_media, place
+
+# 同じファイルの見分け方は棚の素材の段取りと 1 つにする 別に書くと、大文字と小文字の違いを
+# 片方だけ同じと見なし、読み込み方で素材が増えたり増えなかったりする
+from sashimono.compat.catalog import _same_file as same_file
 from sashimono.compat.mapped import MappedObject
 from sashimono.core.commands import AddClip, AddMedia, Command
 from sashimono.core.commands.insert import DEFAULT_GENERATED_FRAMES
@@ -336,21 +340,34 @@ class ExoMedia:
     items: tuple[MediaItem, ...]
 
 
-def exo_media(exo: ExoFile, source: Path, probe: Probe) -> ExoMedia:
+def exo_media(exo: ExoFile, source: Path, probe: Probe, project: Project) -> ExoMedia:
     """``.exo`` が参照している素材を読む 一覧へ入れるのは呼んだ側
 
     相対パスは ``.exo`` のある場所からも探す AviUtl のファイルは素材と一緒に配られることがある
+    同じファイルは 1 つの素材にする 作品にすでにあればそれに結び、開き直さない（棚の
+    :func:`~sashimono.compat.catalog.gather_media` と同じ） 結ばないと、同じ ``.exo`` を読む
+    たびに同じ画像が別の素材として一覧に増え、解析と控えも重ねて走る
     """
     ids: dict[str, MediaId] = {}
     missing: list[str] = []
     items: list[MediaItem] = []
+    known = {same_file(item.path): item for item in project.media}
     for raw in media_paths(exo):
         candidates = [Path(raw), source.parent / Path(raw).name]
         path = next((c for c in candidates if c.exists()), None)
-        media = probe(path) if path is not None else None
+        if path is None:
+            missing.append(raw)
+            continue
+        key = same_file(path)
+        held = known.get(key)
+        if held is not None:
+            ids[raw] = held.id
+            continue
+        media = probe(path)
         if media is None:
             missing.append(raw)
             continue
+        known[key] = media
         items.append(media)
         ids[raw] = media.id
     return ExoMedia(
@@ -365,7 +382,7 @@ def exo_commands(
     exo: ExoFile, source: Path, project: Project, probe: Probe
 ) -> tuple[ExoMedia, list[Command]]:
     """``.exo`` を置くコマンド（素材の登録を頭に足した物）と、読んだ素材 置ける物が無ければ空"""
-    found = exo_media(exo, source, probe)
+    found = exo_media(exo, source, probe, project)
     commands = map_exo(exo, project, media=found.ids, items=found.items)
     if not commands:
         return found, []

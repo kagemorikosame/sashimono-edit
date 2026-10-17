@@ -613,6 +613,34 @@ class TestImportObjects:
         run(host, "undo")
         assert host.document.project == before
 
+    @pytest.mark.parametrize("name", ["メモ.txt", "作品.sme", "鍵"])
+    def test_only_object_files_are_read(self, host: FakeHost, tmp_path: Path, name: str) -> None:
+        # 壊れると、AI が AviUtl のファイルでない物（本人のメモや設定など）まで開いて読もうとする
+        # 人は窓の「すべてのファイル」で自分で選べるが、AI には選ぶ人がいない（CodeRabbit の指摘）
+        other = tmp_path / name
+        other.write_text(_EXO_TWO_LAYERS, encoding="utf-8")
+        before = host.document.project
+        with pytest.raises(ToolError, match=r"\.exo"):
+            run(host, "import_objects", path=str(other))
+        assert host.document.project == before
+
+    def test_the_same_media_is_registered_once(self, tmp_path: Path) -> None:
+        # 壊れると、同じ .exo を 2 回読むたびに、同じ画像が別の素材として素材一覧に増え、
+        # 解析と控えも 2 回走る（棚の配置は前から使い回していた CodeRabbit の指摘）
+        host = _empty_host()
+        picture = tmp_path / "絵.png"
+        picture.write_bytes(b"")
+        host.probe_result = MediaItem(path=picture)
+        source = tmp_path / "素材つき.exo"
+        source.write_text(_EXO_IMAGE.format(path=picture), encoding="utf-8")
+        run(host, "import_objects", path=str(source))
+        run(host, "import_objects", path=str(source))
+        project = host.document.project
+        assert len(project.media) == 1
+        linked = {clip.media_id for track in project.timeline.tracks for clip in track.clips}
+        assert linked == {project.media[0].id}
+        assert host.probed == [picture]
+
     def test_a_missing_file_is_refused(self, host: FakeHost, tmp_path: Path) -> None:
         # 壊れると、無いファイルを読んだつもりで「読み込んだ」と答える
         with pytest.raises(ToolError, match="ありません"):
