@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from sashimono.core.io.serialize import (
     FORMAT_VERSION,
@@ -52,3 +55,45 @@ class TestThePreUpgradeCopy:
         broken = tmp_path / "壊れた.sme"
         broken.write_text("{", encoding="utf-8")
         assert keep_pre_upgrade_copy(broken) is None
+
+
+class TestTheCopyDoesNotWriteThroughLinks:
+    """写しの名前に置かれたリンクの先へは書かない（#327 CodeRabbit の指摘）
+
+    AI の上書き保存も画面の保存もここを通る 写しを開いて上書きすると、写しの名前が
+    元の素材へのハードリンクや外へのリンクだったとき、素材や外のファイルが作品の中身に変わる
+    """
+
+    def test_a_hard_link_at_the_copy_name_keeps_the_linked_file(self, tmp_path: Path) -> None:
+        # 壊れると、作品のフォルダに置かれた「作品.sme.bak」という名前の素材へのハードリンクを
+        # 通って、保存のたびに素材が作品の中身で上書きされる
+        original = tmp_path / "素材.mp4"
+        original.write_bytes(b"original")
+        path = tmp_path / "作品.sme"
+        text = _written(path, FORMAT_VERSION - 1)
+        copy_name = tmp_path / f"作品.sme{PRE_UPGRADE_SUFFIX}"
+        try:
+            os.link(original, copy_name)
+        except OSError as exc:
+            pytest.skip(f"ハードリンクを作れない: {exc}")
+        copy = keep_pre_upgrade_copy(path)
+        assert copy is not None and copy.read_text(encoding="utf-8") == text
+        assert original.read_bytes() == b"original"
+
+    def test_a_symbolic_link_at_the_copy_name_keeps_the_outside_file(self, tmp_path: Path) -> None:
+        # 壊れると、写しの名前に置かれたリンクを辿って、作品のフォルダの外のファイルを上書きする
+        outside = tmp_path / "外" / "大事.txt"
+        outside.parent.mkdir()
+        outside.write_bytes(b"outside")
+        folder = tmp_path / "作品"
+        folder.mkdir()
+        path = folder / "作品.sme"
+        _written(path, FORMAT_VERSION - 1)
+        copy_name = folder / f"作品.sme{PRE_UPGRADE_SUFFIX}"
+        try:
+            copy_name.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"リンクを作れない: {exc}")
+        keep_pre_upgrade_copy(path)
+        assert outside.read_bytes() == b"outside"
+        assert not copy_name.is_symlink()

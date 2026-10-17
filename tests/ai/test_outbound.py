@@ -149,6 +149,13 @@ class TestDeclarations:
         secret_host.saved_at = tmp_path / "作品.sme"
         # 場面の解析が失敗した素材 断りの文に素材の名前が入る
         secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+        # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
+        secret_host.export_state = {
+            "state": "done",
+            "progress": 1.0,
+            "path": str(SECRET_PATH),
+            "message": f"書き出しました: {SECRET_PATH}",
+        }
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
@@ -264,6 +271,14 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "jet_cut": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
+    # 保存と書き出し（#327） 試験の作品は保存してあり（作品のフォルダへ書ける）、結果に
+    # 書いた場所が載る 書き出しの止め方は、走っている書き出しを止める試験で見る
+    "save_project": lambda _ids: {},
+    "save_project_as": lambda _ids: {"path": "第二稿.sme"},
+    "export_video": lambda _ids: {"path": "完成.mp4"},
+    "cancel_export": lambda _ids: {},
+    "export_subtitles": lambda _ids: {"path": "字幕.srt"},
+    "save_snapshot": lambda _ids: {"path": "表紙.png"},
 }
 
 
@@ -283,11 +298,13 @@ class TestWritingToolsDeclareWhatTheyReturn:
 
     @pytest.mark.parametrize("name", sorted(WRITE_EXAMPLES))
     def test_what_each_writing_tool_returns_matches_its_declaration(
-        self, name: str, video_media: MediaItem, transcript: Transcript
+        self, name: str, video_media: MediaItem, transcript: Transcript, tmp_path: Path
     ) -> None:
         # 壊れると、変える道具が本文や素材の場所を結果に載せるのに宣言せず、字幕と文字や
         # 名前と場所を断った人にも、尋ねず伏せずに送る（add_text が本文を返していた）
         host = _with_text_clip(video_media, transcript)
+        # 保存した作品 保存と書き出しの道具（#327）が作品のフォルダへ書き、書いた場所を返す道を通る
+        host.saved_at = tmp_path / "作品.sme"
         operation = _operation(name)
         arguments = WRITE_EXAMPLES[name](_ids(host))
         try:
@@ -297,6 +314,18 @@ class TestWritingToolsDeclareWhatTheyReturn:
         sentences = {ARG_TEXT, BODY_TEXT[:12]} | {s.text for s in transcript.segments}
         places = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name, SECRET_PATH.stem}
         assert not undeclared(operation, result, sentences=sentences, places=places)
+
+    def test_stopping_an_export_returns_what_it_declares(self, secret_host: FakeHost) -> None:
+        # 壊れると、書き出しを止めた答え（止めた後の様子）に書き出し先の場所が載るのに宣言せず、
+        # 名前と場所を断った人にも伏せずに送る 上の例では走っている書き出しが無く断るだけなので、
+        # ここで走っている書き出しを止める
+        secret_host.export_state = {"state": "rendering", "progress": 0.5, "path": str(SECRET_PATH)}
+        operation = _operation("cancel_export")
+        result = operation(secret_host, {})
+        assert not undeclared(operation, result, places={str(SECRET_PATH)})
+        assert isinstance(result, dict)
+        status = result["status"]
+        assert isinstance(status, dict) and status["path"] == str(SECRET_PATH)
 
 
 def undeclared(
@@ -791,6 +820,24 @@ class TestPlacesOutsideTheTable:
 MARK = "ZZSECRET"
 
 
+def _answer_sends_and_allow(bridge: EditorBridge, done: threading.Event) -> None:
+    """送る前の確かめは出ないはず（出たら落とす） 取り消せない操作（保存と書き出し #327）の
+    確かめには許すで答える 「変更を自動で承認」でも出るので、答えないと道具が終わらない
+    """
+    deadline = time.monotonic() + 5.0
+    while not done.is_set() and time.monotonic() < deadline:
+        bridge.pump()
+        request = bridge.take_send_request()
+        if request is not None:
+            _never(request)
+        approval = bridge.take_approval()
+        if approval is not None:
+            approval.allow()
+        time.sleep(0.005)
+    bridge.pump()
+    assert done.is_set(), "道具が終わらなかった"
+
+
 def _marked_host(
     video_media: MediaItem, transcript: Transcript, scene: str, tmp_path: Path
 ) -> FakeHost:
@@ -866,7 +913,7 @@ class TestNoNameLeaksWhenNamesAreRefused:
                 | {Outbound.FILES: SendChoice.DENY}
             )
             done, box = call_in_thread(bridge, _operation(name), arguments)
-            answer_sends(bridge, done, _never)
+            _answer_sends_and_allow(bridge, done)
             sent = json.dumps(
                 {"result": box.get("result"), "error": str(box.get("error") or "")},
                 ensure_ascii=False,
