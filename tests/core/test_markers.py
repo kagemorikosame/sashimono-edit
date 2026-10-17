@@ -56,6 +56,14 @@ class TestAddMarkers:
         with pytest.raises(ValueError, match="負"):
             AddMarkers((Marker(-1),)).apply(_project())
 
+    @pytest.mark.parametrize("label", ["前半\n後半", "前半\r後半", "前半 後半"])
+    def test_a_line_break_inside_the_label_is_refused(self, label: str) -> None:
+        # 通すと YouTube の目次の 1 行が 2 行に割れ、後ろの行が時刻の無いただの文になる
+        with pytest.raises(ValueError, match="改行"):
+            AddMarkers((Marker(0, label),)).apply(_project())
+        with pytest.raises(ValueError, match="改行"):
+            UpdateMarker(0, Marker(0, label)).apply(_project((Marker(0, "仮"),)))
+
     def test_the_label_is_trimmed(self) -> None:
         # 空白だけの名前を残すと、名前のある目印として目次に空の行が入る
         project = AddMarkers((Marker(0, "  はじめに \n"),)).apply(_project())
@@ -169,6 +177,31 @@ class TestChapters:
         assert "3 行以上" in warnings
         assert "10 秒より短い" in warnings
         assert youtube_text(result) == "0:05 本編\n0:10 おまけ"
+
+    def test_a_first_chapter_shown_as_zero_is_not_warned(self, video_media: MediaItem) -> None:
+        # 1 秒未満の所の先頭は概要欄で 0:00 と出て YouTube も目次にする 警告すると、AI が
+        # 直さなくてよい目次を直しに行く
+        markers = (Marker(15, "はじめに"), Marker(600, "本編"), Marker(1500, "まとめ"))
+        result = chapters_of(_timeline(video_media, 1800, markers))
+        assert youtube_text(result).startswith("0:00 はじめに")
+        assert result.warnings == ()
+
+    def test_unnamed_markers_outside_the_range_count_as_outside(
+        self, video_media: MediaItem
+    ) -> None:
+        # 名前の有無で先に分けると、範囲の外の名前の無い目印が「範囲の外」に数えられず、
+        # 書き出した動画に無い目印の数を少なく伝える
+        markers = (Marker(0), Marker(300, "頭"), Marker(450), Marker(1500))
+        timeline = replace(_timeline(video_media, 1800, markers), work_area=(300, 1200))
+        result = chapters_of(timeline)
+        assert result.outside == 2
+        assert result.unnamed == 1
+
+    def test_a_line_break_read_from_a_file_is_warned(self, video_media: MediaItem) -> None:
+        # 保存形式は名前を確かめずに読む 黙って目次に入れると、概要欄の 1 行が割れて目次にならない
+        markers = (Marker(0, "前半\n後半"), Marker(600, "本編"), Marker(1500, "まとめ"))
+        result = chapters_of(_timeline(video_media, 1800, markers))
+        assert any("改行" in warning for warning in result.warnings)
 
     def test_the_clock_rounds_down_and_shows_hours(self) -> None:
         # 繰り上げると、目次を押したとき場面の頭より後ろから始まり、頭の言葉が欠ける

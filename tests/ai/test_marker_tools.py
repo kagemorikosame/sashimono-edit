@@ -10,9 +10,10 @@ from dataclasses import replace
 import pytest
 
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
+from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddScene, AddTrack, SetWorkArea, new_scene
+from sashimono.core.io.serialize import json_text
 from sashimono.core.model import Marker, Project, Track, TrackKind
 from tests.ai.conftest import FakeHost
 from tests.ai.test_operations import run
@@ -187,6 +188,30 @@ class TestChapters:
         result = run(host, "get_chapters")
         assert result["youtube"] == "0:01 中"
         assert result["outside_markers"] == 1
+
+
+class TestChapterSize:
+    def test_a_long_list_fits_the_result_budget_and_pages(self, loaded: Project) -> None:
+        # 長い目次をそのまま返すと、道具の結果の上限を越えて途中で切れ、AI は目次の後ろを読めない
+        title = "長い見出し" * 18
+        markers = tuple(
+            Marker(frame, f"{index} {title}") for index, frame in enumerate(range(0, 300, 1))
+        )
+        host = FakeHost(loaded.with_timeline(replace(loaded.timeline, markers=markers)))
+        first = run(host, "get_chapters")
+        assert len(json_text(first)) <= MAX_RESULT_CHARS
+        assert first["total"] == 300
+        assert first["count"] < 300
+        following = run(host, "get_chapters", offset=first["next_offset"])
+        assert following["chapters"][0]["frame"] == first["next_offset"]
+        # 概要欄に入らない長さの目次は文を返さず、わけを書く
+        assert first["youtube"] is None
+        assert any("5000" in warning for warning in first["warnings"])
+
+    def test_a_label_with_a_line_break_is_refused(self, host: FakeHost) -> None:
+        # 通すと目次の 1 行が割れる 人の右クリックと同じく断る
+        with pytest.raises(ToolError, match="改行"):
+            run(host, "add_markers", markers=[{"frame": 0, "label": "前半\n後半"}])
 
 
 class TestSafety:

@@ -25,6 +25,7 @@ __all__ = [
     "AddMarkers",
     "RemoveMarkers",
     "UpdateMarker",
+    "has_line_break",
     "marker_at",
     "valid_marker_color",
 ]
@@ -42,6 +43,15 @@ def valid_marker_color(color: str) -> bool:
     return _COLOR.fullmatch(color) is not None
 
 
+def has_line_break(text: str) -> bool:
+    """名前の中に改行があるか ``\\n`` のほか ``\\r`` や行の区切りの文字（U+2028）も見る
+
+    目印の名前は YouTube の目次の 1 行になる 中に改行があると行が割れ、後ろの半分が時刻の無い
+    ただの文になって、YouTube が目次にしない
+    """
+    return len(text.splitlines()) > 1
+
+
 def marker_at(timeline: Timeline, frame: int) -> Marker | None:
     """``frame`` にある目印 無ければ ``None``"""
     return next((marker for marker in timeline.markers if marker.frame == frame), None)
@@ -57,8 +67,13 @@ def _check(marker: Marker, current: Marker | None = None) -> Marker:
     label = marker.label.strip()
     if (current is None or marker.frame != current.frame) and marker.frame < 0:
         raise ValueError(f"目印の位置が負: {marker.frame}")
-    if (current is None or label != current.label) and len(label) > MARKER_LABEL_LIMIT:
-        raise ValueError(f"目印の名前が長すぎる（{len(label)} 文字 上限 {MARKER_LABEL_LIMIT}）")
+    if current is None or label != current.label:
+        if len(label) > MARKER_LABEL_LIMIT:
+            raise ValueError(f"目印の名前が長すぎる（{len(label)} 文字 上限 {MARKER_LABEL_LIMIT}）")
+        # 空白へ直さずに断る 本人の文を黙って書き換えると、付けたつもりの名前と違う見出しが
+        # 書き出しの目次に残る 人の右クリックと AI の道具はどちらもここを通る
+        if has_line_break(label):
+            raise ValueError("目印の名前に改行は入れられません（目次の 1 行が割れます）")
     changed_color = current is None or marker.color != current.color
     if changed_color and not valid_marker_color(marker.color):
         raise ValueError(f"目印の色は #RRGGBB で渡す: {marker.color!r}")

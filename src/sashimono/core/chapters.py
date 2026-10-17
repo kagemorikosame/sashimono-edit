@@ -19,11 +19,13 @@ import math
 from dataclasses import dataclass
 from fractions import Fraction
 
+from sashimono.core.commands.markers import has_line_break
 from sashimono.core.commands.work_area import export_range
 from sashimono.core.model import Timeline
 from sashimono.core.timebase import frame_to_seconds
 
 __all__ = [
+    "YOUTUBE_DESCRIPTION_LIMIT",
     "YOUTUBE_MIN_CHAPTERS",
     "YOUTUBE_MIN_SECONDS",
     "Chapter",
@@ -37,6 +39,10 @@ __all__ = [
 #: 再生バーが区切られない（YouTube ヘルプの「動画のチャプター」）
 YOUTUBE_MIN_CHAPTERS = 3
 YOUTUBE_MIN_SECONDS = 10
+#: YouTube の概要欄に書ける文字数の上限 越えた目次は貼れない
+YOUTUBE_DESCRIPTION_LIMIT = 5000
+#: 警告に並べる目次の行の数
+_LISTED = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +76,9 @@ class Chapters:
         notes: list[str] = []
         if not self.chapters:
             return ("名前の付いた目印がありません",)
-        if self.chapters[0].start != 0:
+        # 概要欄に出る時刻（秒の切り捨て）で見る 1 秒未満の所の先頭は 0:00 と出て、YouTube も
+        # 目次にする ずれの分まで警告すると、AI が直さなくてよい目次を直しに行く
+        if math.floor(self.chapters[0].start) != 0:
             notes.append(
                 "先頭の目次が 0:00 から始まっていません（YouTube は 0:00 の行が無いと目次に"
                 "しません）"
@@ -82,7 +90,10 @@ class Chapters:
             )
         short = [c for c in self.chapters if c.length < YOUTUBE_MIN_SECONDS]
         if short:
-            names = "・".join(f"{clock(c.start)} {c.title}" for c in short)
+            # 並べるのは頭の数行だけ 何百行も並べると、警告だけで道具の結果の上限を越える
+            names = "・".join(f"{clock(c.start)} {c.title}" for c in short[:_LISTED])
+            if len(short) > _LISTED:
+                names += f" ほか {len(short) - _LISTED} 行"
             notes.append(
                 f"{YOUTUBE_MIN_SECONDS} 秒より短い目次があります: {names}（YouTube は"
                 "どれも 10 秒以上で目次にします）"
@@ -95,6 +106,19 @@ class Chapters:
                 notes.append(f"同じ秒（{clock(chapter.start)}）に目次が 2 つあります")
                 break
             seen.add(second)
+        broken = [c for c in self.chapters if has_line_break(c.title)]
+        if broken:
+            # 保存形式は名前を確かめずに読む（手で書いた作品など） 置く・直すときは断っている
+            notes.append(
+                f"名前に改行がある目次が {len(broken)} 行あります（概要欄では行が割れて"
+                "目次になりません 目印の名前を直してください）"
+            )
+        text = youtube_text(self)
+        if len(text) > YOUTUBE_DESCRIPTION_LIMIT:
+            notes.append(
+                f"目次が {len(text)} 文字です（YouTube の概要欄は {YOUTUBE_DESCRIPTION_LIMIT} 文字"
+                "まで）"
+            )
         return tuple(notes)
 
 
@@ -109,12 +133,15 @@ def chapters_of(timeline: Timeline, span: tuple[int, int] | None = None) -> Chap
     if span is None:
         span = export_range(timeline)
     start, end = span if span is not None else (0, timeline.duration)
-    unnamed = sum(1 for marker in timeline.markers if not marker.label.strip())
-    named = sorted(
-        (marker for marker in timeline.markers if marker.label.strip()),
+    # 範囲で先に分けてから名前で分ける 名前で先に分けると、範囲の外の名前の無い目印が
+    # 「範囲の外」に数えられず、書き出した動画に無い目印の数を少なく伝える
+    within = [marker for marker in timeline.markers if start <= marker.frame < end]
+    outside = len(timeline.markers) - len(within)
+    unnamed = sum(1 for marker in within if not marker.label.strip())
+    inside = sorted(
+        (marker for marker in within if marker.label.strip()),
         key=lambda marker: marker.frame,
     )
-    inside = [marker for marker in named if start <= marker.frame < end]
     duration = frame_to_seconds(max(0, end - start), rate)
     rows: list[Chapter] = []
     for index, marker in enumerate(inside):
@@ -127,7 +154,7 @@ def chapters_of(timeline: Timeline, span: tuple[int, int] | None = None) -> Chap
                 title=marker.label.strip(),
             )
         )
-    return Chapters(tuple(rows), unnamed, len(named) - len(inside), duration)
+    return Chapters(tuple(rows), unnamed, outside, duration)
 
 
 def clock(seconds: Fraction) -> str:

@@ -72,6 +72,7 @@ from sashimono.core.commands.markers import (
     AddMarkers,
     RemoveMarkers,
     UpdateMarker,
+    has_line_break,
     marker_at,
     valid_marker_color,
 )
@@ -196,6 +197,7 @@ __all__ = [
     "convert_layers",
     "export_range",
     "format_to_match",
+    "has_line_break",
     "head_room",
     "insert_clip",
     "insert_filter",

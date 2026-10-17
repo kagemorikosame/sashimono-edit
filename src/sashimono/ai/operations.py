@@ -41,7 +41,7 @@ from sashimono.ai.sheet import (
     sheet_layout,
 )
 from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
-from sashimono.core.chapters import chapters_of, youtube_text
+from sashimono.core.chapters import YOUTUBE_DESCRIPTION_LIMIT, chapters_of, youtube_text
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
     MARKER_LABEL_LIMIT,
@@ -81,6 +81,7 @@ from sashimono.core.commands import (
     burn_defaults,
     burn_subtitles,
     export_range,
+    has_line_break,
     head_room,
     insert_generated,
     insert_media,
@@ -1416,6 +1417,12 @@ def _marker_label(value: object) -> str:
     label = value.strip()
     if len(label) > MARKER_LABEL_LIMIT:
         raise ToolError(f"名前は {MARKER_LABEL_LIMIT} 文字までです（{len(label)} 文字）")
+    # コマンドでも断るが、ここで先に断って直し方を添える 空白に直して通すと、本人の文が
+    # 黙って変わる（人の右クリックも同じく断る）
+    if has_line_break(label):
+        raise ToolError(
+            "名前に改行は入れられません 1 行の見出しにしてください（目次の 1 行が割れます）"
+        )
     return label
 
 
@@ -1515,25 +1522,34 @@ def _delete_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _get_chapters(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
     result = chapters_of(_project(host).timeline)
-    return {
+    rows = [
+        {
+            "frame": chapter.frame,
+            "start_seconds": round(float(chapter.start), 3),
+            "end_seconds": round(float(chapter.end), 3),
+            "title": chapter.title,
+        }
+        for chapter in result.chapters
+    ]
+    text = youtube_text(result)
+    common: dict[str, Any] = {
         "active_scene": str(host.active_scene) if host.active_scene is not None else None,
         "duration_seconds": round(float(result.duration), 3),
-        "chapters": [
-            {
-                "frame": chapter.frame,
-                "start_seconds": round(float(chapter.start), 3),
-                "end_seconds": round(float(chapter.end), 3),
-                "title": chapter.title,
-            }
-            for chapter in result.chapters
-        ],
-        "youtube": youtube_text(result),
+        # 概要欄に入らない長さの文は返さない 貼れない上に、道具の結果の上限を食って一覧が切れる
+        # わけは warnings に入る
+        "youtube": text if len(text) <= YOUTUBE_DESCRIPTION_LIMIT else None,
         "warnings": list(result.warnings),
         "unnamed_markers": result.unnamed,
         "outside_markers": result.outside,
     }
+    # 一覧は切って返す 目次の文と一緒に全部を返すと、長い目次で道具の結果の上限を越え、
+    # 途中で切れて後ろの行が読めない 文の分だけ一覧の件数を減らして上限に収める
+    page = {**common, **_paged(rows, arguments, name="chapters")}
+    while len(json_text(page)) > MAX_RESULT_CHARS and page["count"] > 1:
+        smaller = {**arguments, "limit": max(1, page["count"] * 3 // 4)}
+        page = {**common, **_paged(rows, smaller, name="chapters")}
+    return page
 
 
 # --- 場面の切り替わり（#319 #321）---
@@ -3536,8 +3552,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "youtube は YouTube の概要欄に貼る形（0:00 はじめに） YouTube が目次にしない"
             "（先頭が 0:00 でない・3 行より少ない・10 秒より短い行がある）ときは warnings に"
             "理由が入る 書き出すメインの目次は、シーンを開いていればメインに戻ってから読む"
+            " 行の一覧（chapters）は" + PAGING_NOTE
         ),
-        schema=_schema({}),
+        schema=_schema(_paging()),
         handler=_get_chapters,
         sends=_WITH_TEXT,
     ),
