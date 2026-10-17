@@ -120,6 +120,13 @@ class TestChange:
         run(host, "delete_markers", all=True)
         assert _frames(host) == []
 
+    def test_all_and_frames_together_is_refused(self, host: FakeHost) -> None:
+        # all を先に見ると、位置を指したつもりの AI の頼みで本人の目印が全部消える
+        run(host, "add_markers", markers=[{"frame": f} for f in (0, 30)])
+        with pytest.raises(ToolError, match="一緒に"):
+            run(host, "delete_markers", frames=[0], all=True)
+        assert _frames(host) == [0, 30]
+
     def test_delete_without_a_target_is_an_error(self, host: FakeHost) -> None:
         # 何も渡さずに全部消えると、指定し忘れた AI が本人の目印を丸ごと消す
         run(host, "add_markers", markers=[{"frame": 0}])

@@ -349,7 +349,9 @@ class TimelineView(QWidget):
         self._snap_timer.timeout.connect(self._hide_snap)
         #: 書き出し範囲の Shift+ドラッグと、その帯 ほかのドラッグとは別に持つ
         self._work_area = WorkAreaEditor(self._request)
-        #: 目印（マーカー）の旗と、目盛りの右クリックからの操作（#330）
+        #: 目印（マーカー #330）は描き方と右クリックを別の係に持たせる ビューはクリップの移動や
+        #: 再生ヘッドも抱えていて、目印の当たり判定や項目をここへ混ぜると読み分けにくくなる
+        #: （書き出し範囲の係と同じ分け方）
         self._markers = MarkerEditor(self._request, self)
         #: ファイルや素材を引いてきている間の、落ちる所の目安 引いていなければ ``None``
         self._drop_preview: DropPreview | None = None

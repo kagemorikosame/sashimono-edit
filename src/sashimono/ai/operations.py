@@ -1216,7 +1216,11 @@ def _update_marker(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _delete_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
     timeline = _project(host).timeline
-    if _flag_argument(arguments, "all", False):
+    everything = _flag_argument(arguments, "all", False)
+    # 両方来たら断る all を先に見ると、位置を指したつもりの頼みで本人の目印が全部消える
+    if everything and arguments.get("frames") is not None:
+        raise ToolError("frames と all は一緒に渡せません どちらか 1 つにしてください")
+    if everything:
         frames = tuple(sorted({marker.frame for marker in timeline.markers}))
         if not frames:
             raise ToolError("消す目印がありません")
