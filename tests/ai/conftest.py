@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
@@ -14,12 +16,15 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.host import ToolError
+from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Command, Document, InScene
+from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
+from sashimono.core.io.serialize import save_project
+from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.model import (
     ClipId,
     MediaId,
@@ -101,6 +106,16 @@ class FakeHost:
             "preferences": {"theme": "dark", "update_check": True},
             "shortcuts": {"編集/分割": "S"},
         }
+        #: 保存した場所（write_project を呼ばれた順）
+        self.written: list[Path] = []
+        #: 静止画に頼まれたフレーム
+        self.snapshots: list[int] = []
+        #: 頼まれた書き出し 偽物なので書き出しそのものは走らせない
+        self.exports: list[ExportRequest] = []
+        self.export_state: dict[str, object] = {"state": "idle", "progress": 0.0, "path": None}
+        #: 書き出しの終わりを待った（export_waiter の関数を呼んだ）スレッド
+        self.export_waits: list[int] = []
+
         #: アプリが作品の外で覚えている名前（本物は字幕起こしの記録・前に開いた作品の場所など）
         self.remembered: list[str] = []
         #: 保存したプリセットとエイリアス 置き場は試験ごとの一時フォルダ（conftest が向ける）
@@ -264,6 +279,57 @@ class FakeHost:
     @property
     def export_folder(self) -> Path | None:
         return self.exported_to
+
+    def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
+        # 画面の〔保存〕と同じく、作品のファイルの書き方（書いてから置き換える）で書く
+        save_project(self._document.project, path, expect=expect)
+        self.written.append(path)
+        if adopt:
+            self.saved_at = path
+        return ""
+
+    def write_subtitles(
+        self, path: Path, *, frame_range: tuple[int, int] | None, expect: Expected
+    ) -> Path:
+        # 画面の字幕の書き出しと同じ処理で書く
+        written = save_subtitles(self.project, path, frame_range=frame_range, expect=expect)
+        self.written.append(written)
+        return written
+
+    def write_snapshot(self, path: Path, frame: int, *, expect: Expected) -> int:
+        # 絵は描かない（偽物） 書いた場所と頼まれたフレームだけ残す
+        write_atomic_bytes(path, b"\x89PNG\r\n\x1a\n" + f"{frame}".encode(), expect=expect)
+        self.written.append(path)
+        self.snapshots.append(frame)
+        return frame
+
+    def start_export(self, request: ExportRequest) -> None:
+        if self.export_state["state"] in EXPORT_RUNNING:
+            raise ToolError("書き出しがもう走っています")
+        self.exports.append(request)
+        self.export_state = {"state": "rendering", "progress": 0.0, "path": str(request.path)}
+
+    def export_status(self) -> dict[str, object]:
+        return dict(self.export_state)
+
+    def export_waiter(self) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            # 呼ばれたスレッドを残す 待つのが AI のスレッドかを試験が見る
+            self.export_waits.append(threading.get_ident())
+            deadline = time.monotonic() + seconds
+            while self.export_state["state"] in EXPORT_RUNNING:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.005)
+            return True
+
+        return wait
+
+    def cancel_export(self) -> bool:
+        if self.export_state["state"] != "rendering":
+            return False
+        self.export_state = {**self.export_state, "state": "cancelled"}
+        return True
 
     def app_settings(self) -> dict[str, object]:
         return self.settings

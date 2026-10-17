@@ -34,7 +34,15 @@ MARK = "ZZSECRET"
 #: 作品の外の物を AI へ返しうるホストの口 名前を覚える口（remembered_names）を通すと決めた物
 #: 文字や辞書を返す口を EditorHost に足したら、ここへ足し、その口が返す名前を
 #: remembered_names からも返す 足さないと下の試験が落ちる
-TEXT_SOURCES = {"transcription_status", "start_transcription", "app_settings"}
+TEXT_SOURCES = {
+    "transcription_status",
+    "start_transcription",
+    "app_settings",
+    # 保存と書き出し（#327） 保存の知らせと書き出しの様子に、書いた場所・置き換える前の
+    # ファイルを残した場所・控えの置き場が入る 書いた場所と残した場所は remembered_names から返す
+    "write_project",
+    "export_status",
+}
 #: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337）
 #: 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
 OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target"}
@@ -70,6 +78,13 @@ PROJECT_SIDE = {
     "project_path",
     "export_folder",
     "remembered_names",
+    # 保存と書き出し（#327） 書く先は作品と書き出しのフォルダの中だけ 返すのは書いた場所・
+    # コマ・止められたか・待つ関数で、書いた場所は remembered_names からも返す
+    "write_subtitles",
+    "write_snapshot",
+    "start_export",
+    "export_waiter",
+    "cancel_export",
 }
 
 

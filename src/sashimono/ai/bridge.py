@@ -205,7 +205,12 @@ class EditorBridge:
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)
 
-    def _execute(self, operation: Operation, arguments: dict[str, Any]) -> object:
+    def _execute(
+        self,
+        operation: Operation,
+        arguments: dict[str, Any],
+        body: Callable[[], object] | None = None,
+    ) -> object:
         """道具を編集画面のスレッドで動かし、続きがあれば終わりまで辿る
 
         道具の続きは 2 通りあり、どちらもここで辿る（取り消せない操作も同じ道を通る）
@@ -220,10 +225,11 @@ class EditorBridge:
         続きの戻り値も 1 回ずつ外へ送ってよい形にする（:meth:`_run`） 初めの戻り値だけを
         伏せると、待った後や描き終えた後に返る名前・本文・絵がそのまま送られる
         同意（:meth:`_agree_to_send`）は :meth:`invoke` の頭で取り終えている 続きの前に効く
+        ``body`` を渡すと道具の代わりにそれを動かす（取り消せない操作で、許した中身と照らす #327）
+        場面の解析（#321）と書き出し（#327）は同じ :class:`Pending` で待つ
         """
-        result = self.call(
-            lambda: self._run(operation, lambda: operation.start(self._host, arguments))
-        )
+        work = body if body is not None else partial(operation.start, self._host, arguments)
+        result = self.call(partial(self._run, operation, work))
         while True:
             if isinstance(result, Pending):
                 # 待つのはこの（AI の）スレッド 画面のスレッドは待つ間も動き続ける
@@ -269,7 +275,39 @@ class EditorBridge:
             raise ToolError(
                 "ユーザーがこの操作を許可しませんでした（取り消せない操作は毎回確かめます）"
             )
-        return self._execute(operation, arguments)
+
+        def run_where_approved() -> object:
+            # 確かめの箱はモードレス 出ている間に人が〔名前を付けて保存〕などで作品の場所を
+            # 変えると、道具が書く先を解き直したとき、箱に出して許された場所と別のファイルに
+            # なる（上書き保存なら移した先の作品を潰す） 許した中身を実行まで固定し、
+            # 作り直した中身と照らして違えば断る 照らすのと実行を同じ 1 件の仕事にして、
+            # 間に画面の操作が挟まらないようにする
+            # 照らすのは箱に見せた中身すべて（何を・どこへ・添えた注意）と、その元の身元
+            # 場所が同じでも、箱が出ている間に同じ名前のファイルができる・描くコマや書き出す
+            # 範囲が変わると、許していない物を書く
+            again = describe(self._host, arguments)
+            if again != consent:
+                if isinstance(again, Consent) and again.target != consent.target:
+                    what = (
+                        f"書き込み先が変わりました（許した場所: {consent.target} "
+                        f"今の場所: {again.target}）"
+                    )
+                elif isinstance(again, Consent):
+                    what = f"中身が変わりました（許した時: {consent.detail} 今: {again.detail}）"
+                else:
+                    what = "中身が変わりました"
+                raise ToolError(
+                    f"確かめた後に{what} 何も書いていません 今の中身でもう 1 度頼み直してください"
+                )
+            # 書く処理には人が許した確かめの中身を渡す 書く先の身元はそこから取り、採り直さない
+            # 採り直すと、上の照らし合わせの後に書き換えられた中身を新しい基準として受け入れる
+            approved = operation.approved
+            if approved is not None:
+                return approved(self._host, arguments, consent)
+            # 続き（Continue）は :meth:`_execute` が 1 回ずつ辿る ここで辿り切らない
+            return operation.start(self._host, arguments)
+
+        return self._execute(operation, arguments, run_where_approved)
 
     def call(self, work: Callable[[], object]) -> object:
         """UI スレッドで実行して、結果を返す"""

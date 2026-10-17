@@ -20,20 +20,28 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from sashimono.ai.host import EditorHost, ToolError
+from sashimono.core.io.atomic import Expected
+from sashimono.core.io.folder_pin import FolderSwappedError, pin_folder
 
 __all__ = [
     "Consent",
     "Safety",
     "check_readable",
     "check_writable",
+    "pin_holds_the_folder",
+    "pinned",
+    "pinned_place",
     "readable_output",
+    "refuse_where_the_folder_cannot_be_held",
     "writable_path",
     "write_roots",
 ]
@@ -62,6 +70,13 @@ class Consent:
 
     道具の名前と引数だけでは、どのファイルが消えるのか・どこへ書くのかが読めない
     押す前に、何を（``action``）どこへ（``target``）するかを言葉で出す
+
+    許した後、実行の直前にもう 1 度作り、丸ごと同じでなければ書かずに断る（#327）
+    比べるのは、箱に見せた文と、その文の元になった書く先の身元（:attr:`basis`）
+    文は人が読める粗さ（更新時刻は秒まで）なので、同じ秒の中で同じ大きさに書き換えられると
+    文だけでは変わって見えない 元の身元（ナノ秒の時刻と番号）まで比べて捕まえる
+    見せた物の元にならない揺れる値（今の時刻など）は入れない 入れると、何も変わって
+    いないのに毎回断られる
     """
 
     #: 何をするか 例「プロジェクトを上書き保存します」
@@ -70,6 +85,10 @@ class Consent:
     target: str
     #: 添える注意 例「同じ名前のファイルがあり、中身を置き換えます」
     detail: str = ""
+    #: 箱には出さない ``detail`` の元になった書く先の身元
+    #: （:class:`~sashimono.core.io.atomic.Expected`） 比べるときだけ使う 文に出した大きさと
+    #: 時刻を、細かいまま照らすため
+    basis: Expected | None = None
 
     def text(self) -> str:
         """確かめの窓に出す文"""
@@ -106,6 +125,67 @@ def writable_path(host: EditorHost, raw: object) -> Path:
         export_folder=host.export_folder,
         protected=(media.path for media in project.media),
     )
+
+
+@contextlib.contextmanager
+def pinned_place(host: EditorHost, raw: object) -> Iterator[Path]:
+    """書く直前に場所を確かめ、書き終えるまでそのフォルダを差し替えさせない
+
+    中で書く 確かめ（:func:`writable_path`）だけでは、確かめてから書くまでの間にフォルダを
+    リンクへ差し替えられる隙間が残る（#354 の報告） フォルダを開いたまま持ち
+    （:func:`~sashimono.core.io.folder_pin.pin_folder`）、持った後にもう 1 度確かめ、
+    書き終えたら差し替えられていないかを照らす
+    """
+    with pinned(lambda: writable_path(host, raw)) as path:
+        yield path
+
+
+@contextlib.contextmanager
+def pinned(check: Callable[[], Path]) -> Iterator[Path]:
+    """:func:`pinned_place` の中身 ``check`` は書ける場所を確かめて返す関数
+
+    書き出しの終わり（編集画面のスレッドの外）からも、確かめた時の値で呼べるように分けてある
+    """
+    refuse_where_the_folder_cannot_be_held()
+    path = check()
+    try:
+        with pin_folder(path.parent) as folder:
+            # 持った後にもう 1 度確かめる 確かめてから持つまでの間に差し替えられていたら、
+            # 解決した先が変わるか、持ったフォルダの本当の場所が食い違う
+            again = check()
+            if _key(again) != _key(path):
+                raise ToolError(f"書く場所が確かめた後に変わりました: {path} → {again}")
+            folder.verify()
+            yield path
+            folder.verify()
+    except FolderSwappedError as exc:
+        raise ToolError(f"書く場所のフォルダが差し替えられたので断りました: {exc}") from exc
+
+
+def refuse_where_the_folder_cannot_be_held() -> None:
+    """フォルダを持っても改名を止められない OS では、AI のファイルを書く道具を断る（#327）
+
+    Linux や macOS ではフォルダを持っていても改名を止められない 書いている間にリンクへ
+    差し替えられると、文字の場所を辿って許した範囲の外へ書き、後で照らして気付いても外の
+    ファイルは残る フォルダの記述子を基準に書く（dir_fd）作りにすると、保存・字幕・静止画・
+    書き出しの書く所（write_atomic・QImageWriter・FFmpeg）を全部それに合わせる必要がある
+    今の配布は Windows だけなので、ほかの OS では書く道具を断る 確かめの箱を出す前（書く道具の
+    確かめの中身を作る所）と書く直前（:func:`pinned`）の両方で断る :func:`writable_path` は
+    場所の決まりだけを見る（試験や、書かない確かめからも使えるように）
+    """
+    if not pin_holds_the_folder():
+        raise ToolError(
+            "この OS では、書き終えるまで書く先のフォルダを差し替えさせない守りが効かないので、"
+            "AI はファイルを書きません 保存や書き出しは、人が画面から行ってください"
+        )
+
+
+def pin_holds_the_folder() -> bool:
+    """フォルダを持っている間、そのフォルダと上のフォルダの改名を止められるか（Windows だけ）
+
+    試験がほかの OS の道を通せるよう、関数にしてある
+    """
+    return sys.platform == "win32"
 
 
 def check_writable(

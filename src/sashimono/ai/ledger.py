@@ -148,12 +148,20 @@ _OUTSIDE = "エクスプローラーを開くだけで、プロジェクトを�
 #: 表示だけの操作を AI に出すかは #298 の「決めること」の 3 つ目 決まるまでは足す側に数える
 _VIEW = "表示だけの操作 出す意味があるかは未決（#298 の決めること）"
 
+#: 書き出しの行に添える 書き出し先は決定の場所に限る 進み具合を読む道具と止める道具は
+#: 区分が違う（読むだけ・取り消せる）ので行には書かず、:data:`AI_ONLY` に置く（#327）
+_EXPORT_NOTE = (
+    "進み具合は export_status、止めるのは cancel_export 書き出し先は作品のフォルダと"
+    "書き出しの窓で前に選んだフォルダの中だけ（#350 の決定）"
+)
+_SNAPSHOT_NOTE = "絵を見るだけなら preview_frame で足りる 保存先は作品のフォルダなどの中だけ"
+
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
     missing("メニュー/ファイル/新規", 349, safety=Safety.IRREVERSIBLE),
     missing("メニュー/ファイル/開く…", 349, safety=Safety.IRREVERSIBLE),
-    missing("メニュー/ファイル/保存", 327, safety=Safety.IRREVERSIBLE),
-    missing("メニュー/ファイル/名前を付けて保存…", 327, safety=Safety.IRREVERSIBLE),
+    same("メニュー/ファイル/保存", "save_project", safety=Safety.IRREVERSIBLE),
+    same("メニュー/ファイル/名前を付けて保存…", "save_project_as", safety=Safety.IRREVERSIBLE),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
     partial(
         "メニュー/ファイル/プロジェクト設定…",
@@ -163,12 +171,14 @@ LEDGER: tuple[Entry, ...] = (
     ),
     missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
-    missing("メニュー/ファイル/書き出し…", 327, safety=Safety.IRREVERSIBLE),
-    missing(
+    same(
+        "メニュー/ファイル/書き出し…", "export_video", note=_EXPORT_NOTE, safety=Safety.IRREVERSIBLE
+    ),
+    same(
         "メニュー/ファイル/静止画を保存…",
-        327,
-        "絵を見るだけなら preview_frame で足りる",
-        Safety.IRREVERSIBLE,
+        "save_snapshot",
+        note=_SNAPSHOT_NOTE,
+        safety=Safety.IRREVERSIBLE,
     ),
     hidden("メニュー/ファイル/終了", "アプリを閉じる 編集ではない 決定の 5 つに当たらず未決"),
     # --- メニュー 編集 ---
@@ -227,9 +237,7 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/字幕/整形…", "clean_subtitles"),
     same("メニュー/字幕/無音カット…", "jet_cut"),
     same("メニュー/字幕/焼き込み", "place_subtitles"),
-    missing(
-        "メニュー/字幕/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す", Safety.IRREVERSIBLE
-    ),
+    same("メニュー/字幕/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     # --- メニュー 互換 ---
     missing("メニュー/互換/オブジェクトを読み込む…", 328, ".exo .exa .ymmp の部品"),
     missing("メニュー/互換/テンプレート…", 328),
@@ -349,11 +357,11 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("タイムラインの〔＋ トラック追加〕/レイヤー", "add_track"),
     # --- プレビューの右クリック ---
-    missing(
+    same(
         "プレビューの右クリック/静止画を保存…",
-        327,
-        "絵を見るだけなら preview_frame で足りる",
-        Safety.IRREVERSIBLE,
+        "save_snapshot",
+        note=_SNAPSHOT_NOTE,
+        safety=Safety.IRREVERSIBLE,
     ),
     missing(
         "プレビューの右クリック/静止画をコピー",
@@ -404,9 +412,7 @@ LEDGER: tuple[Entry, ...] = (
         " 選んでいなければ再生位置の 1 行",
         "place_subtitles",
     ),
-    missing(
-        "字幕パネル/書き出し…", 327, "字幕のファイル（SRT など）へ書き出す", Safety.IRREVERSIBLE
-    ),
+    same("字幕パネル/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     same("字幕パネルの右クリック/ここへ移動", "seek", safety=Safety.READ_ONLY),
     partial(
         "字幕パネルの右クリック/文字をコピー",
@@ -558,6 +564,11 @@ AI_ONLY: dict[str, str] = {
     "set_subtitle_text": _GESTURE,
     "replace_subtitle_text": "字幕と、字幕から置いたテキストをまとめて直す 画面に同じ入口は無い",
     "ask_user": "AI から利用者へ尋ねる",
+    "export_status": READING,
+    "cancel_export": (
+        "AI が始めた書き出しを止める 画面ではステータスバーの〔中止〕（台帳はメニュー・"
+        "右クリック・パネルのボタンだけを数え、ステータスバーは数えない）"
+    ),
 }
 
 

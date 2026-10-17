@@ -6,9 +6,9 @@
 2. AI が書けるのは、作品のフォルダと書き出しの窓で前に選んだフォルダだけ
 3. アプリ自身の設定は、AI は読むだけ
 
-取り消せない道具そのもの（保存・書き出し B1 #327）はまだ無いので、試験の中で最小の道具
-（メモを書き出す）を作って、土台を通す 確かめの窓は画面を作らず、ブリッジから確かめを
-取り出して試験が答える（人の代わり）
+土台そのものを、試験の中の最小の道具（メモを書き出す）で通す 確かめの窓は画面を作らず、
+ブリッジから確かめを取り出して試験が答える（人の代わり） 本物の取り消せない道具
+（保存・書き出し B1 #327）は test_save_and_export.py と tests/ui/test_ai_save_export.py
 """
 
 from __future__ import annotations
@@ -179,14 +179,19 @@ class TestAppSettingsAreReadOnly:
             for name, member in inspect.getmembers(EditorHost)
             if not name.startswith("_") and callable(member)
         }
+        # 保存・書き出し・字幕の書き出し・静止画（B1 #327）は作品を書く口で、
+        # アプリ自身の設定は変えない
         assert changes == {
             "analyze",
             "app_settings",
             "apply_commands",
+            "cancel_export",
             # 完成物の検査（#337） 調べるのは作品の写しで、アプリの設定は変えない
             # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
             "check_state",
             "check_waiter",
+            "export_status",
+            "export_waiter",
             "probe",
             # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
             "remembered_names",
@@ -201,12 +206,16 @@ class TestAppSettingsAreReadOnly:
             "select_clip",
             "select_clips",
             "set_active_scene",
+            "start_export",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",
             "start_transcription",
             "stop_playback",
             "transcription_status",
             "waveform",
+            "write_project",
+            "write_snapshot",
+            "write_subtitles",
         }
 
 
