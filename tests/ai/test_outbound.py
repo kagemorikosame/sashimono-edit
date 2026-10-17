@@ -277,6 +277,13 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "set_stroke_enabled": lambda ids: {"clip_id": ids["text"], "stroke_id": "無い", "enabled": 1},
     "set_param": lambda ids: {"clip_id": ids["text"], "name": "text", "value": ARG_TEXT},
     "add_keyframe": lambda ids: {"clip_id": ids["text"], "name": "text", "value": ARG_TEXT},
+    # 強調の動き（#331） テキストのクリップを 0〜20 フレームだけ寄せる
+    "emphasize": lambda ids: {
+        "clip_id": ids["text"],
+        "kind": "zoom",
+        "start_frame": 0,
+        "end_frame": 20,
+    },
     "set_subtitle_text": lambda ids: {
         "media_id": ids["media"],
         "segment_id": ids["segment"],
