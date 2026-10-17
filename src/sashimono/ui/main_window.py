@@ -2848,8 +2848,15 @@ class MainWindow(QMainWindow):
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
             folder=self.export_folder,
+            chapters=self._preferences.export_chapters,
         )
         dialog.exec()
+        if dialog.embeds_chapters != self._preferences.export_chapters:
+            # 窓で替えた章の埋め方を覚える 覚えないと、要らない人は書き出すたびに切り直す
+            # 書き出さずに閉じても覚える 窓で選んだ時点で、本人の好みはそちらと分かる
+            self._remember_preferences(
+                replace(self._preferences, export_chapters=dialog.embeds_chapters)
+            )
         folder = dialog.started_folder
         if (
             folder is not None
@@ -3765,6 +3772,7 @@ class MainWindow(QMainWindow):
                 pipeline_depth=self._preferences.export_pipeline_depth,
                 decode_threads=self._preferences.decode_threads,
                 smooth_history=self._preferences.smooth_audio_motion,
+                chapters=self._preferences.export_chapters,
             )
         except (KeyError, ValueError) as exc:
             raise ToolError(str(exc)) from exc

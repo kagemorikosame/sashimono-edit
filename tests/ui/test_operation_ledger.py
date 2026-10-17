@@ -59,6 +59,7 @@ from sashimono.core.model import (
     Clip,
     Keyframe,
     LayerMode,
+    Marker,
     MediaItem,
     Project,
     ProjectSettings,
@@ -457,7 +458,10 @@ def _separated(media: MediaItem) -> _Stage:
         Track(TrackKind.AUDIO, "丙", (sound,)),
         Track(TrackKind.AUDIO, "丁"),
     )
-    timeline = replace(base.timeline, tracks=tracks, work_area=(600, 700))
+    # 目印の上の右クリックでだけ、名前の変更と削除が出る（#330）
+    timeline = replace(
+        base.timeline, tracks=tracks, work_area=(600, 700), markers=(Marker(300, "印"),)
+    )
     project = replace(base, scenes=(scene,), timeline=timeline)
     return _Stage(
         project,
@@ -471,6 +475,7 @@ def _separated(media: MediaItem) -> _Stage:
             ("FX1", 10),  # フィルタを置くトラック
             ("丁", 650),  # 書き出し範囲の上
             (None, 650),  # 目盛り
+            (None, 300),  # 目盛りの目印
         ),
         inspected=(text, transition, group, aviutl, held, sound),
         media=media,

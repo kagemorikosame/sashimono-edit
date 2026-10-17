@@ -104,6 +104,7 @@ from sashimono.ui.timeline.keyframes import (
     keyframe_frames,
 )
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
+from sashimono.ui.timeline.markers import MarkerEditor
 from sashimono.ui.timeline.painter import (
     ADD_TRACK_BUTTON_SPACE,
     ADD_TRACK_BUTTON_TEXT,
@@ -353,6 +354,10 @@ class TimelineView(QWidget):
         self._snap_timer.timeout.connect(self._hide_snap)
         #: 書き出し範囲の Shift+ドラッグと、その帯 ほかのドラッグとは別に持つ
         self._work_area = WorkAreaEditor(self._request)
+        #: 目印（マーカー #330）は描き方と右クリックを別の係に持たせる ビューはクリップの移動や
+        #: 再生ヘッドも抱えていて、目印の当たり判定や項目をここへ混ぜると読み分けにくくなる
+        #: （書き出し範囲の係と同じ分け方）
+        self._markers = MarkerEditor(self._request, self)
         #: ファイルや素材を引いてきている間の、落ちる所の目安 引いていなければ ``None``
         self._drop_preview: DropPreview | None = None
         #: 動画の映像と音声を分けて置くか（:meth:`set_split_audio`）
@@ -845,6 +850,7 @@ class TimelineView(QWidget):
 
         draw_ruler(painter, self._layout, width, self._project.rate)
         self._work_area.paint_ruler(painter, self._layout, width, timeline.work_area)
+        self._markers.paint_ruler(painter, self._layout, width, timeline)
         draw_playhead(painter, self._layout, self._playhead, self.height())
         self._paint_drop_guide(painter)
 
@@ -1877,6 +1883,7 @@ class TimelineView(QWidget):
                 toggle.setChecked(bool(getattr(track, attribute)))
             _action(menu, f"{name} の高さを戻す", functools.partial(self._reset_height, track.id))
             _action(menu, f"{name} の名前を変更…", functools.partial(self.begin_rename, track.id))
+        self._markers.add_menu_actions(menu, self._layout, position, self._project.timeline)
         self._work_area.add_menu_actions(
             menu, self._layout, position, self._project.timeline.work_area
         )

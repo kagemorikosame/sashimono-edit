@@ -90,6 +90,8 @@ _PROMPT = """\
   位置を取り、その前後だけを preview_frame で確かめてください 1 枚ずつ見て探すより
   ずっと少ない回数で済みます 場面ごとの様子をまとめて見るときは、一覧の timeline を
   contact_sheet の frames へそのまま渡すと、場面の頭が 1 枚に並びます
+- 目次（チャプター）は、話の区切りに名前の付いた目印（マーカー）を add_markers で置き、
+  get_chapters で作ります warnings があれば、そのまま渡さずユーザーに伝えてください
 {linked_clips}
 - 置き方の方式は get_project の layer_mode で分かります 途中で変わっていたら、
   そちらに従ってください

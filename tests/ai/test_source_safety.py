@@ -13,6 +13,8 @@
   控えを予約する（書く先は本人のキャッシュの置き場で、素材の隣ではない）
 - 消す道具が消すのは、プロジェクトの中のクリップ（と、クリップが持つ縁取りの層）だけ
   素材を素材一覧から外す・トラックやシーンを消す道具は無い
+- 2026-10-17 に目印（マーカー）を置く・直す・消す道具を足した（#330） 消すのは目盛りの目印で、
+  これもプロジェクトの中だけを変え、取り消し 1 回で戻る
 
 ここではそれを試験で押さえる 新しく道具を足して崩れたら落ちる
 """
@@ -88,6 +90,10 @@ UNDOABLE_TOOLS = frozenset(
         "duck_audio",
         "normalize_loudness",
         "place_sound",
+        # 目印（#330） プロジェクトの中の目印だけを変える 素材にもファイルにも触らない
+        "add_markers",
+        "update_marker",
+        "delete_markers",
         # 履歴
         "undo",
         # 書き出しを止める 作品もファイルも変えず、書きかけを捨てるだけ もう 1 度書き出せば
@@ -141,7 +147,11 @@ _WRITING_CALLS = frozenset(
 
 #: 道具が使ってよい、消す編集の命令 どれもプロジェクトの中のクリップ（と、その縁取りの層）
 #: を消す 素材を外す（RemoveMedia）・トラックやシーンを消す命令はここに無い
-_ALLOWED_REMOVALS = frozenset({"RemoveClip", "RemoveClips", "RemoveStroke", "RippleCut"})
+#: 目印（RemoveMarkers #330）はプロジェクトの中の目盛りの印で、素材にもクリップにも触らず、
+#: 取り消し 1 回で戻る
+_ALLOWED_REMOVALS = frozenset(
+    {"RemoveClip", "RemoveClips", "RemoveStroke", "RippleCut", "RemoveMarkers"}
+)
 
 
 def _source(module: object) -> ast.Module:
