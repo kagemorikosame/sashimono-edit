@@ -61,6 +61,20 @@ class Document:
         #: まだ一番上に残っているときだけ同じ段へまとめる 取り消したあとの段へ
         #: まとめると、関係の無い古い操作と一緒に戻ってしまう
         self._merge_anchor: HistoryEntry | None = None
+        #: 開いた段の中の小さな段（道具 1 回分・コマンド 1 つ分） 閉じると 1 段にまとまる
+        #: AI の 1 回の指示は段を開いたまま進むので、その間の取り消しはここから戻す
+        #: ここを持たずに段の外の履歴を引き抜くと、閉じた後の履歴から 1 段が消える（#333）
+        self._inner_undo: list[HistoryEntry] = []
+        self._inner_redo: list[HistoryEntry] = []
+        self._inner_anchor: HistoryEntry | None = None
+        #: 開いた段の中で何か変えたか 変えた後の段の外のやり直しは、もう当てられない
+        #: （当てると、段の中の変更を飛ばして古い形へ跳ぶ） ただし段が断られて元へ戻ったら
+        #: 変えなかったことにする 断られただけで、前に取り消した物をやり直せなくなる
+        self._inner_touched = False
+        #: 開いた段の中で、もう 1 つ内側に開いた段（道具 1 回分のまとめ）の始まり
+        self._nested_before: Project | None = None
+        self._nested_label = ""
+        self._nested_merge = False
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
@@ -115,6 +129,8 @@ class Document:
         if self._checkpoint_depth == 0:
             self._push_undo(HistoryEntry(command.label, self._project))
             self._redo.clear()
+        elif self._checkpoint_depth == 1:
+            self._push_inner(HistoryEntry(command.label, self._project), merge=False)
 
         self._set_project(updated)
         return updated
@@ -138,6 +154,12 @@ class Document:
         try:
             yield
         except BaseException:
+            if self._checkpoint_depth == 1:
+                # 一番外の段が断られた 段の中の小さな段は戻した先に無いので捨てる
+                # 残すと、閉じる所で前に取り消した物のやり直しまで消してしまう
+                self._inner_undo.clear()
+                self._inner_redo.clear()
+                self._inner_touched = False
             if self._project is not start:
                 self._set_project(start)
             raise
@@ -158,6 +180,14 @@ class Document:
             self._checkpoint_label = label
             self._checkpoint_before = self._project
             self._checkpoint_merge = merge
+            self._inner_undo.clear()
+            self._inner_redo.clear()
+            self._inner_anchor = None
+            self._inner_touched = False
+        elif self._checkpoint_depth == 1:
+            self._nested_before = self._project
+            self._nested_label = label
+            self._nested_merge = merge
         self._checkpoint_depth += 1
 
     def end_checkpoint(self) -> None:
@@ -165,14 +195,28 @@ class Document:
         if self._checkpoint_depth == 0:
             return
         self._checkpoint_depth -= 1
+        if self._checkpoint_depth == 1:
+            self._close_nested()
+            return
         if self._checkpoint_depth > 0:
             return
 
         before = self._checkpoint_before
         self._checkpoint_before = None
+        inner_redo = list(self._inner_redo)
+        touched = self._inner_touched
+        self._inner_undo.clear()
+        self._inner_redo.clear()
+        self._inner_anchor = None
+        self._inner_touched = False
+        changed = before is not None and before is not self._project
+        if touched or changed:
+            # 段の中で変えた後は、段の外の古いやり直しは当てられない 段の中で最後に
+            # 取り消した物だけを、閉じた後も人が Ctrl+Y でやり直せるよう残す
+            self._redo = inner_redo
         # 何も変わらなかったチェックポイントは履歴に残さない
         # 「取り消しても何も起きない」段が挟まると操作感が悪い
-        if before is None or before is self._project:
+        if not changed or before is None:
             # 何も変わらなかった操作でも、続けて行う操作の区切りにはなる（続きとして
             # 頼まれたものでも） ここで区切らないと、上限に張り付いて変わらなかった
             # ホイールのあとの操作が、前の続けた操作の段へまとまってしまう
@@ -187,30 +231,116 @@ class Document:
         )
         if not continued:
             self._push_undo(HistoryEntry(self._checkpoint_label, before))
-        self._redo.clear()
+
+    def _close_nested(self) -> None:
+        """開いた段の中の段（道具 1 回分）を閉じ、変わっていれば小さな段として積む"""
+        before = self._nested_before
+        self._nested_before = None
+        if before is None or before is self._project:
+            self._inner_anchor = None
+            return
+        self._push_inner(HistoryEntry(self._nested_label, before), merge=self._nested_merge)
+
+    def _push_inner(self, entry: HistoryEntry, *, merge: bool) -> None:
+        top = self._inner_undo[-1] if self._inner_undo else None
+        continued = (
+            merge and top is not None and top is self._inner_anchor and top.label == entry.label
+        )
+        if not continued:
+            self._inner_undo.append(entry)
+            self._inner_anchor = entry
+        self._inner_redo.clear()
+        self._inner_touched = True
 
     @property
     def in_checkpoint(self) -> bool:
         return self._checkpoint_depth > 0
 
     @property
+    def steps_in_checkpoint(self) -> tuple[str, ...]:
+        """開いた段の中で積んだ小さな段の名前 古い順 段を開いていなければ空
+
+        AI の道具が「この指示で変えた物」を数えるのに使う（#333）
+        """
+        return tuple(entry.label for entry in self._inner_undo)
+
+    @property
     def can_undo(self) -> bool:
-        return len(self._undo) > 0
+        return self._next_undo() is not None
 
     @property
     def can_redo(self) -> bool:
-        return len(self._redo) > 0
+        return self._next_redo() is not None
 
     @property
     def undo_label(self) -> str | None:
-        return self._undo[-1].label if self._undo else None
+        entry = self._next_undo()
+        return entry.label if entry is not None else None
 
     @property
     def redo_label(self) -> str | None:
-        return self._redo[-1].label if self._redo else None
+        entry = self._next_redo()
+        return entry.label if entry is not None else None
+
+    @property
+    def _applying(self) -> bool:
+        """まとめて当てている途中（段の中の段が開いている）か
+
+        この間に取り消すと、まとめの始まりが行き先と食い違い、閉じる所で戻した物を
+        「変えた」と数える 窓の中で待つ間に Ctrl+Z が届いても、何もしないで済ませる
+        """
+        return self._checkpoint_depth > 1
+
+    def _next_undo(self) -> HistoryEntry | None:
+        """次に戻す段 段を開いている間は段の中の小さな段から"""
+        if self._applying:
+            return None
+        if self._inner_undo:
+            return self._inner_undo[-1]
+        return self._undo[-1] if self._undo else None
+
+    def _next_redo(self) -> HistoryEntry | None:
+        """次にやり直す段 段の中で変えた後は、段の外のやり直しは当てない"""
+        if self._applying:
+            return None
+        if self._inner_redo:
+            return self._inner_redo[-1]
+        if self._checkpoint_depth and self._inner_touched:
+            return None
+        return self._redo[-1] if self._redo else None
 
     def undo(self) -> Project:
-        """直前の操作を取り消す 履歴が空なら何もしない"""
+        """直前の操作を取り消す 履歴が空なら何もしない
+
+        段を開いている間は、段の中の小さな段から戻す 段の中に戻す物が無ければ段の外の
+        1 段を戻し、段の始まりをそこへ動かす 動かさないと、閉じる所でその段の取り消しが
+        「変えた」と数えられ、戻した段の代わりに今の段が積まれて履歴から 1 段が消える
+        """
+        if self._applying:
+            return self._project
+        if self._checkpoint_depth == 1:
+            if self._inner_undo:
+                entry = self._inner_undo.pop()
+                self._inner_redo.append(HistoryEntry(entry.label, self._project))
+                self._inner_anchor = None
+                self._set_project(entry.before)
+                return self._project
+            if not self._undo:
+                return self._project
+            # 段の中のやり直しは、段の外を戻すと順が崩れるので段の外のやり直しへ移す
+            # 段の中で変えた後なら、段の外の古いやり直しは当てられないので捨てる
+            if self._inner_touched:
+                self._redo = list(self._inner_redo)
+            else:
+                self._redo.extend(self._inner_redo)
+            self._inner_redo.clear()
+            self._inner_touched = False
+            entry = self._undo.pop()
+            self._redo.append(HistoryEntry(entry.label, self._project))
+            self._merge_anchor = None
+            self._checkpoint_before = entry.before
+            self._set_project(entry.before)
+            return self._project
         if not self._undo:
             return self._project
         entry = self._undo.pop()
@@ -220,28 +350,48 @@ class Document:
         return self._project
 
     def redo(self) -> Project:
-        """取り消した操作をやり直す"""
-        if not self._redo:
+        """取り消した操作をやり直す 段を開いている間は :meth:`undo` と同じ順で辿る"""
+        if self._applying:
+            return self._project
+        if self._checkpoint_depth == 1 and self._inner_redo:
+            entry = self._inner_redo.pop()
+            self._inner_undo.append(HistoryEntry(entry.label, self._project))
+            self._inner_anchor = None
+            self._set_project(entry.before)
+            return self._project
+        if self._next_redo() is None:
             return self._project
         entry = self._redo.pop()
         self._undo.append(HistoryEntry(entry.label, self._project))
         self._merge_anchor = None
+        if self._checkpoint_depth == 1:
+            self._checkpoint_before = entry.before
         self._set_project(entry.before)
         return self._project
 
     @property
     def history_labels(self) -> tuple[str, ...]:
-        """古い順に並べた Undo 可能な操作名 履歴パネル用"""
-        return tuple(entry.label for entry in self._undo)
+        """古い順に並べた Undo 可能な操作名 履歴パネル用
+
+        段を開いている間は、段の中の小さな段も後ろに並ぶ（取り消すとそこから戻る）
+        """
+        return tuple(entry.label for entry in (*self._undo, *self._inner_undo))
 
     @property
     def past_projects(self) -> tuple[Project, ...]:
         """履歴（取り消しとやり直し）に残ったプロジェクト 古い順
 
         AI へ送る結果の伏せ字（#342）が、今の作品から消えた素材の名前も拾うのに使う
-        履歴の名前（「配置: 〜」）には、消した素材の名前が残るため
+        履歴の名前（「配置: 〜」）には、消した素材の名前が残るため 開いた段の中の
+        取り消しとやり直しの分も入れる 入れないと、指示の中で取り消した物の名前が漏れる
         """
-        return tuple(entry.before for entry in (*self._undo, *reversed(self._redo)))
+        entries = (
+            *self._undo,
+            *self._inner_undo,
+            *reversed(self._inner_redo),
+            *reversed(self._redo),
+        )
+        return tuple(entry.before for entry in entries)
 
     def reset(self, project: Project) -> None:
         """別のプロジェクトを読み込み、履歴を捨てる ファイルを開いたときに使う"""

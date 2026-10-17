@@ -104,8 +104,9 @@ UNDOABLE_TOOLS = frozenset(
         "place_template",
         "apply_template",
         "import_objects",
-        # 履歴
+        # 履歴 人のメニューと同じ履歴を辿るだけ 戻した物もやり直した物も、もう 1 回で戻る（#333）
         "undo",
+        "redo",
         # 書き出しを止める 作品もファイルも変えず、書きかけを捨てるだけ もう 1 度書き出せば
         # 同じ物ができるので、取り消せない操作の毎回の確かめは要らない
         "cancel_export",

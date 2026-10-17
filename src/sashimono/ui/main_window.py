@@ -1463,10 +1463,12 @@ class MainWindow(QMainWindow):
             self.place_scene(choices[names.index(name)].id)
 
     def undo(self) -> None:
+        """〔元に戻す〕 AI の undo も同じここを通る（#333） 画面を合わせる所を 1 か所にする"""
         self._document.undo()
         self._on_project_changed()
 
     def redo(self) -> None:
+        """〔やり直す〕 AI の redo も同じここを通る（#333）"""
         self._document.redo()
         self._on_project_changed()
 

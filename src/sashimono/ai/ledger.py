@@ -191,7 +191,7 @@ LEDGER: tuple[Entry, ...] = (
     hidden("メニュー/ファイル/終了", "アプリを閉じる 編集ではない 決定の 5 つに当たらず未決"),
     # --- メニュー 編集 ---
     same("メニュー/編集/元に戻す", "undo"),
-    missing("メニュー/編集/やり直す", 333),
+    same("メニュー/編集/やり直す", "redo"),
     same("メニュー/編集/再生ヘッドで分割", "split_clip"),
     same("メニュー/編集/削除", "delete_clips", "delete_clip"),
     same("メニュー/編集/削除して詰める", "delete_clips", "delete_clip"),

@@ -199,6 +199,12 @@ class FakeHost:
         except (ValueError, KeyError) as exc:
             raise ToolError(str(exc)) from exc
 
+    def undo(self) -> None:
+        self._document.undo()
+
+    def redo(self) -> None:
+        self._document.redo()
+
     def stop_playback(self) -> None:
         self.stopped += 1
 
