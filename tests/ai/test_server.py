@@ -96,6 +96,18 @@ class TestServer:
         # 説明文も付ける 画像だけだと、それがどのフレームか分からない
         assert "00:00:01:00" in result["content"][1]["text"]
 
+    @pytest.mark.parametrize("name", ["contact_sheet", "preview_range"])
+    def test_a_sheet_comes_back_as_one_image_block(self, host: FakeHost, name: str) -> None:
+        # 壊れると、続きのある道具の途中の印が AI へ返り、絵の代わりに読めない文字が届く
+        bridge = allow_sending(EditorBridge(host))
+        tool = find(build_tools(bridge), name)
+
+        result = call_tool(bridge, tool, {})
+        image = result["content"][0]
+        assert image["mimeType"] == "image/png"
+        assert base64.b64decode(image["data"]).startswith(b"\x89PNG")
+        assert "00:00:00" in result["content"][1]["text"]
+
     def test_a_failure_is_reported_as_an_error_result(self, host: FakeHost) -> None:
         # 例外を投げると会話が止まる 失敗も結果として返し、次の手を選ばせる
         bridge = EditorBridge(host)

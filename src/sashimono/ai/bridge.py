@@ -24,10 +24,12 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
+    Continue,
     ImageResult,
     Operation,
     Pending,
@@ -209,21 +211,34 @@ class EditorBridge:
         arguments: dict[str, Any],
         body: Callable[[], object] | None = None,
     ) -> object:
-        """道具を画面のスレッドで動かし、待つ物（:class:`Pending`）なら待ってから仕上げる
+        """道具を編集画面のスレッドで動かし、続きがあれば終わりまで辿る
 
-        仕上げ（``then``）の戻り値も、外へ送ってよい形にする（:meth:`_run`） 待つ前の
-        戻り値だけを伏せると、待った後に返る名前や本文がそのまま送られる
-        同意（:meth:`_agree_to_send`）は :meth:`invoke` の頭で取り終えている 待つ前に効く
+        道具の続きは 2 通りあり、どちらもここで辿る（取り消せない操作も同じ道を通る）
+
+        - :class:`Continue` 描き続ける間に画面へ手を返す（何コマも描く道具 #320）
+          続きを 1 つずつ別の仕事として積むので、その間に画面は描き直しと人の操作を受け付ける
+        - :class:`Pending` 用意ができるまで、この（AI の）スレッドで待つ（場面の解析 #321）
+          待つ間も画面は動き続ける
+
+        どちらも 1 回ごとに :meth:`call` を通すので、中断が回ごとに効き、待つ上限
+        （:data:`CALL_TIMEOUT`）も 1 回ずつに掛かる 続きの中からもう一方の続きを返してもよい
+        続きの戻り値も 1 回ずつ外へ送ってよい形にする（:meth:`_run`） 初めの戻り値だけを
+        伏せると、待った後や描き終えた後に返る名前・本文・絵がそのまま送られる
+        同意（:meth:`_agree_to_send`）は :meth:`invoke` の頭で取り終えている 続きの前に効く
         ``body`` を渡すと道具の代わりにそれを動かす（取り消せない操作で、許した中身と照らす #327）
         場面の解析（#321）と書き出し（#327）は同じ :class:`Pending` で待つ
         """
-        work = body if body is not None else (lambda: operation(self._host, arguments))
-        result = self.call(lambda: self._run(operation, work))
-        if isinstance(result, Pending):
-            self._wait(result)
-            finish = result.then
-            return self.call(lambda: self._run(operation, finish))
-        return result
+        work = body if body is not None else partial(operation.start, self._host, arguments)
+        result = self.call(partial(self._run, operation, work))
+        while True:
+            if isinstance(result, Pending):
+                # 待つのはこの（AI の）スレッド 画面のスレッドは待つ間も動き続ける
+                self._wait(result)
+                result = self.call(partial(self._run, operation, result.then))
+            elif isinstance(result, Continue):
+                result = self.call(partial(self._run, operation, result.step))
+            else:
+                return result
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
@@ -289,7 +304,8 @@ class EditorBridge:
             approved = operation.approved
             if approved is not None:
                 return approved(self._host, arguments, consent)
-            return operation(self._host, arguments)
+            # 続き（Continue）は :meth:`_execute` が 1 回ずつ辿る ここで辿り切らない
+            return operation.start(self._host, arguments)
 
         return self._execute(operation, arguments, run_where_approved)
 
@@ -556,12 +572,22 @@ class EditorBridge:
                 item = self._work.get_nowait()
             except queue.Empty:
                 return
+            if self._cancel.is_set():
+                # 積んだ時は中断の前でも、拾う時に中断されていれば動かさない 動かすと、
+                # 描きかけの続き（最後の 1 コマと PNG）が中断の後に描き上がり、AI へ返る
+                item.error = ToolError("中断されました")
+                item.done.set()
+                continue
             try:
                 item.result = item.run()
             except (ToolError, ValueError, KeyError, OSError, RuntimeError) as exc:
                 item.error = exc
             finally:
                 item.done.set()
+            if isinstance(item.result, Continue):
+                # 続きのある道具は、ここで一度タイマーへ返す 続きを同じ回で拾うと、
+                # 全部を描き終えるまで画面が描き直されず、分けた意味が無くなる
+                return
 
     def take_approval(self) -> Approval | None:
         """確認待ちが 1 件あれば取り出す 無ければ ``None``"""

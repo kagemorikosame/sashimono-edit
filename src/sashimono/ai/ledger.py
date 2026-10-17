@@ -550,6 +550,8 @@ AI_ONLY: dict[str, str] = {
     "list_effects": READING,
     "get_history": READING,
     "preview_frame": READING,
+    "contact_sheet": READING,
+    "preview_range": READING,
     # 完成物の検査（#337） 人は再生して目と耳で確かめる 画面に同じ入口は無い
     # ステータスバーの〔止める〕は走っている検査を止めるだけで、検査を始める操作ではない
     "check_output": READING,
