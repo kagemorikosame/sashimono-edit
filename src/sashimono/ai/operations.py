@@ -154,6 +154,7 @@ from sashimono.engine.audio.speech import (
     SPEECH_SOURCES,
     SpeechError,
     WaveformPendingError,
+    speaks,
     voice_speech,
 )
 from sashimono.engine.audio.waveform import Waveform
@@ -2740,9 +2741,13 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 鳴らない声（ミュート・ソロで外れたトラック・無効のクリップ）では下げない 書き出しで
     # 声が聞こえないのに BGM だけが下がる
     voices = [(track, clip) for track, clip in voices if sounds_now(project, track, clip)]
+    # 置いたシーンは話している所を拾えないので声から外す 外さないと、ナレーションと
+    # シーンが並んだトラックを声に選んだだけで全体が断られる
+    voices = [(track, clip) for track, clip in voices if speaks(project, clip)]
     if not voices:
         raise ToolError(
-            "声のクリップが書き出しで鳴りません（ミュート・ソロで外れたトラックか、無効のクリップ）"
+            "話している所を拾える声のクリップがありません 置いたシーンは使えず、"
+            "書き出しで鳴らない声（ミュート・ソロで外れたトラックか、無効のクリップ）も使えません"
         )
     both = {clip.id for _, clip in ducked} & {clip.id for _, clip in voices}
     if both:

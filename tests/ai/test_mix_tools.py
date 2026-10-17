@@ -17,7 +17,7 @@ import pytest
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, SetClipProperty, SetTrackState
+from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume, fixed_volume
 from sashimono.core.mixing import DuckShape, db_to_ratio
@@ -370,7 +370,7 @@ class TestDuck:
             command = SetClipProperty(work.voice.id, "enabled", False)
         work.host.apply_commands([command], "黙らせる")
         before = work.host.document.project
-        with pytest.raises(ToolError, match="鳴りません"):
+        with pytest.raises(ToolError, match="鳴らない声"):
             _run(
                 work.host,
                 "duck_audio",
@@ -378,6 +378,30 @@ class TestDuck:
                 voice_track_id=str(work.voice_track.id),
             )
         assert work.host.document.project == before
+
+    def test_a_scene_beside_the_narration_is_skipped(self, work: _Work) -> None:
+        # 壊れると、声のトラックにナレーションと置いたシーンが並ぶだけで、トラックごと選んだ
+        # ダッキングが全部断られる（#375 の Codex の指摘）
+        scene = new_scene(work.project, "場面")
+        placed = Clip(timeline_start=300, duration=60, scene_id=scene.id)
+        work.host.apply_commands(
+            [AddScene(scene), AddClip(work.voice_track.id, placed)], "シーンを置く"
+        )
+        _run(
+            work.host,
+            "duck_audio",
+            clip_ids=[str(work.bgm.id)],
+            voice_track_id=str(work.voice_track.id),
+        )
+        assert _keys(work)
+        # シーンしか無ければ断る
+        with pytest.raises(ToolError, match="置いたシーン"):
+            _run(
+                work.host,
+                "duck_audio",
+                clip_ids=[str(work.bgm.id)],
+                voice_clip_ids=[str(placed.id)],
+            )
 
     def test_the_voice_cannot_duck_itself(self, work: _Work) -> None:
         # 壊れると、話している所だけ声が小さくなる

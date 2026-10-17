@@ -25,6 +25,7 @@ __all__ = [
     "SPEECH_SOURCES",
     "SpeechError",
     "WaveformPendingError",
+    "speaks",
     "speech_ranges",
     "voice_speech",
 ]
@@ -85,6 +86,16 @@ def speech_ranges(
     return speech
 
 
+def speaks(project: Project, clip: Clip) -> bool:
+    """声として話している所を拾えるクリップか（音を持つ素材のクリップ）
+
+    置いたシーンは音を鳴らすが、素材の字幕も波形も持たない 声のトラックにナレーションと
+    並べて置いてあることがあるので、拾えない物として外す（#375 の Codex の指摘）
+    """
+    media = project.find_media(clip.media_id) if clip.media_id is not None else None
+    return media is not None and media.has_audio
+
+
 def voice_speech(
     project: Project,
     voices: Sequence[tuple[Track, Clip]],
@@ -100,13 +111,16 @@ def voice_speech(
     """
     if source not in SPEECH_SOURCES:
         raise SpeechError(f"話している所の拾い方は {'・'.join(SPEECH_SOURCES)} のどれかです")
+    usable = [(track, clip) for track, clip in voices if speaks(project, clip)]
+    if not usable:
+        # 置いたシーンなどが混ざっていても、拾えるナレーションがあればそれで下げる
+        # 1 つも無いときだけ断る 1 本でも混ざると全体を断ると、声のトラックごと選べない
+        raise SpeechError("声のクリップがありません（置いたシーンからは話している所を拾えない）")
     speech: list[FrameRange] = []
-    for track, clip in voices:
+    for track, clip in usable:
         media = project.find_media(clip.media_id) if clip.media_id is not None else None
-        if media is None or not media.has_audio:
-            raise SpeechError(
-                f"{clip.id} は素材の音を鳴らすクリップではありません（置いたシーンなど）"
-            )
+        if media is None:
+            continue
         stream = subtitle_voice(project, track, clip, media)
         ranges = speech_ranges(media, stream, waveform_of, source=source, threshold_db=threshold_db)
         speech.extend(

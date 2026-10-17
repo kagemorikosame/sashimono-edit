@@ -22,7 +22,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, Q
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddClip, SetClipProperty, SetTrackState
+from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume
 from sashimono.core.mixing import (
@@ -383,6 +383,25 @@ class TestRightClick:
         _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
         assert window._pending_loudness is None
         assert window.document.project == project
+
+    def test_a_scene_beside_the_narration_still_ducks(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、声のトラックに置いたシーンが 1 本あるだけで、右クリックから下げられない
+        project, voice, bgm = _project(media)
+        scene = new_scene(project, "場面")
+        project = AddScene(scene).apply(project)
+        project = AddClip(voice.id, Clip(timeline_start=180, duration=30, scene_id=scene.id)).apply(
+            project
+        )
+        monkeypatch.setattr(
+            main_window_module,
+            "ask_duck",
+            lambda _parent, _voices, shape: DuckChoice(voice.id, shape),
+        )
+        window = _window(opened, project)
+        _menu_action(window, bgm, DUCK_TEXT).trigger()
+        assert clip_volume(_bgm_clip(window, bgm)).keyframes
 
     def test_cancelling_changes_nothing(
         self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch

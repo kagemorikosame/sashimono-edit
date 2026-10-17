@@ -133,7 +133,12 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
-from sashimono.engine.audio.speech import SpeechError, WaveformPendingError, voice_speech
+from sashimono.engine.audio.speech import (
+    SpeechError,
+    WaveformPendingError,
+    speaks,
+    voice_speech,
+)
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
@@ -3465,7 +3470,8 @@ class MainWindow(QMainWindow):
             track
             for track in project.timeline.tracks
             if any(
-                clip.id not in chosen and sounds_now(project, track, clip) for clip in track.clips
+                clip.id not in chosen and sounds_now(project, track, clip) and speaks(project, clip)
+                for clip in track.clips
             )
         ]
         if not voices:
@@ -3480,7 +3486,9 @@ class MainWindow(QMainWindow):
         voice_clips = [
             (voice_track, clip)
             for clip in voice_track.clips
-            if clip.id not in chosen and sounds_now(project, voice_track, clip)
+            if clip.id not in chosen
+            and sounds_now(project, voice_track, clip)
+            and speaks(project, clip)
         ]
         try:
             speech = voice_speech(project, voice_clips, self.waveform)
