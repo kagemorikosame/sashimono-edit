@@ -80,6 +80,18 @@ class TestUpdateMarker:
         with pytest.raises(ValueError, match="もう目印"):
             UpdateMarker(30, Marker(90)).apply(_project((Marker(30), Marker(90))))
 
+    def test_a_bad_colour_from_a_file_does_not_block_a_rename(self) -> None:
+        # 保存形式は色を確かめずに読む 変えていない色まで確かめると、読み込んだ目印の名前を
+        # 変えるたびに必ず断られ、画面からも AI からも直せない
+        project = _project((Marker(30, "仮", "赤"),))
+        renamed = UpdateMarker(30, Marker(30, "本編", "赤")).apply(project)
+        assert renamed.timeline.markers == (Marker(30, "本編", "赤"),)
+
+    def test_a_changed_colour_is_still_checked(self) -> None:
+        # 変える欄まで確かめを外すと、読めない色を新しく書き込める
+        with pytest.raises(ValueError, match="色"):
+            UpdateMarker(30, Marker(30, "仮", "青")).apply(_project((Marker(30, "仮", "赤"),)))
+
     def test_a_missing_marker_is_an_error(self) -> None:
         # 黙って何もしないと、AI は直したつもりで次へ進む
         with pytest.raises(ValueError, match="目印がありません"):
@@ -90,6 +102,20 @@ class TestRemoveMarkers:
     def test_only_the_named_frames_go(self) -> None:
         project = RemoveMarkers((30, 120)).apply(_project((Marker(30), Marker(90), Marker(120))))
         assert _frames(project) == [90]
+
+    def test_only_the_first_of_a_shared_frame_goes(self) -> None:
+        # 手で書いた作品などで同じ位置に 2 つあるとき、位置の全部を消すと、右クリックで指した
+        # 1 つ（先頭 marker_at と同じ）のほかに、別の名前の目印まで黙って消える
+        project = _project((Marker(30, "甲"), Marker(30, "乙"), Marker(90, "丙")))
+        removed = RemoveMarkers((30,)).apply(project)
+        assert removed.timeline.markers == (Marker(30, "乙"), Marker(90, "丙"))
+
+    def test_a_frame_named_twice_removes_two(self) -> None:
+        # すべて消すときは位置を目印の数だけ渡す 1 つずつ消さないと同じ位置の残りが消えない
+        project = _project((Marker(30, "甲"), Marker(30, "乙")))
+        assert RemoveMarkers((30, 30)).apply(project).timeline.markers == ()
+        with pytest.raises(ValueError, match="30"):
+            RemoveMarkers((30, 30, 30)).apply(project)
 
     def test_a_missing_frame_removes_nothing(self) -> None:
         # 飛ばして残りだけ消すと、古い一覧の位置で頼んだ AI は消えたかを取り違える

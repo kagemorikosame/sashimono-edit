@@ -5,13 +5,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddScene, AddTrack, SetWorkArea, new_scene
-from sashimono.core.model import Marker, Track, TrackKind
+from sashimono.core.model import Marker, Project, Track, TrackKind
 from tests.ai.conftest import FakeHost
 from tests.ai.test_operations import run
 from tests.conftest import make_clip
@@ -119,6 +121,14 @@ class TestChange:
         run(host, "add_markers", markers=[{"frame": f} for f in (0, 30)])
         run(host, "delete_markers", all=True)
         assert _frames(host) == []
+
+    def test_delete_all_takes_markers_sharing_a_frame(self, loaded: Project) -> None:
+        # 手で書いた作品で同じ位置に 2 つあると、位置ごとに 1 つずつ消すだけでは片方が残る
+        markers = (Marker(30, "甲"), Marker(30, "乙"))
+        host = FakeHost(loaded.with_timeline(replace(loaded.timeline, markers=markers)))
+        result = run(host, "delete_markers", all=True)
+        assert host.document.project.timeline.markers == ()
+        assert result["deleted"] == 2
 
     def test_all_and_frames_together_is_refused(self, host: FakeHost) -> None:
         # all を先に見ると、位置を指したつもりの AI の頼みで本人の目印が全部消える

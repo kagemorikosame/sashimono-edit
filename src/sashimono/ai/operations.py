@@ -1495,7 +1495,9 @@ def _delete_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
     if everything and arguments.get("frames") is not None:
         raise ToolError("frames と all は一緒に渡せません どちらか 1 つにしてください")
     if everything:
-        frames = tuple(sorted({marker.frame for marker in timeline.markers}))
+        # 目印の数だけ位置を並べる コマンドは位置 1 つで先頭の 1 つだけを消すので、位置の
+        # 重なりをまとめると、手で書いた作品の同じ位置の 2 つ目が残る
+        frames = tuple(marker.frame for marker in timeline.markers)
         if not frames:
             raise ToolError("消す目印がありません")
     else:
@@ -1503,11 +1505,13 @@ def _delete_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
         given = arguments.get("frames")
         if not isinstance(given, list) or not given:
             raise ToolError("frames に消す目印の位置を渡してください（全部なら all を真に）")
-        frames = tuple(_marker_frame(value, "frames") for value in given)
+        # 同じ位置を 2 度書いた頼みは 1 つにまとめる 一覧の位置を重ねて渡しただけで、
+        # 同じ位置に目印が 2 つ無いと断られるのは AI に分かりにくい
+        frames = tuple(dict.fromkeys(_marker_frame(value, "frames") for value in given))
         for frame in frames:
             _require_marker(host, frame)
     host.apply_commands([RemoveMarkers(frames)], "マーカーを削除")
-    return {"deleted": len(set(frames)), "marker_count": len(_project(host).timeline.markers)}
+    return {"deleted": len(frames), "marker_count": len(_project(host).timeline.markers)}
 
 
 def _get_chapters(host: EditorHost, arguments: dict[str, Any]) -> object:

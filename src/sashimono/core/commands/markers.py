@@ -47,14 +47,20 @@ def marker_at(timeline: Timeline, frame: int) -> Marker | None:
     return next((marker for marker in timeline.markers if marker.frame == frame), None)
 
 
-def _check(marker: Marker) -> Marker:
-    """置く前に確かめる 名前の前後の空白は落とす"""
-    if marker.frame < 0:
-        raise ValueError(f"目印の位置が負: {marker.frame}")
+def _check(marker: Marker, current: Marker | None = None) -> Marker:
+    """置く前に確かめる 名前の前後の空白は落とす
+
+    ``current`` は直す前の目印 渡したときは変えた欄だけを確かめる 保存形式は色や位置を
+    確かめずに読むので（手で書いた作品・ほかの道具が書いた作品）、変えていない欄まで
+    確かめると、読み込んだ目印の名前を変えるたびに必ず断られ、画面からも AI からも直せない
+    """
     label = marker.label.strip()
-    if len(label) > MARKER_LABEL_LIMIT:
+    if (current is None or marker.frame != current.frame) and marker.frame < 0:
+        raise ValueError(f"目印の位置が負: {marker.frame}")
+    if (current is None or label != current.label) and len(label) > MARKER_LABEL_LIMIT:
         raise ValueError(f"目印の名前が長すぎる（{len(label)} 文字 上限 {MARKER_LABEL_LIMIT}）")
-    if not valid_marker_color(marker.color):
+    changed_color = current is None or marker.color != current.color
+    if changed_color and not valid_marker_color(marker.color):
         raise ValueError(f"目印の色は #RRGGBB で渡す: {marker.color!r}")
     return replace(marker, label=label)
 
@@ -105,7 +111,7 @@ class UpdateMarker(Command):
         current = marker_at(timeline, self.frame)
         if current is None:
             raise ValueError(f"{self.frame} フレームに目印がありません")
-        checked = _check(self.marker)
+        checked = _check(self.marker, current)
         if checked.frame != self.frame and marker_at(timeline, checked.frame) is not None:
             raise ValueError(f"{checked.frame} フレームにはもう目印があります")
         if checked == current:
@@ -122,6 +128,10 @@ class RemoveMarkers(Command):
     """``frames`` にある目印を消す 1 つでも無ければ何も消さない
 
     無い位置を黙って飛ばすと、AI は古い一覧の位置で消したつもりのまま次へ進む
+
+    位置 1 つで消すのは、その位置の先頭の 1 つだけ（:func:`marker_at` と右クリックが指す物）
+    手で書いた作品などで同じ位置に 2 つあるとき、位置の全部を消すと、指していない別の名前の
+    目印まで黙って消える 同じ位置の目印を全部消すときは、位置を目印の数だけ並べて渡す
     """
 
     frames: tuple[int, ...]
@@ -133,9 +143,14 @@ class RemoveMarkers(Command):
     def apply(self, project: Project) -> Project:
         if not self.frames:
             raise ValueError("消す目印がありません")
-        timeline = project.timeline
-        missing = sorted({frame for frame in self.frames if marker_at(timeline, frame) is None})
+        remaining = list(project.timeline.markers)
+        missing: set[int] = set()
+        for frame in self.frames:
+            index = next((i for i, m in enumerate(remaining) if m.frame == frame), None)
+            if index is None:
+                missing.add(frame)
+            else:
+                del remaining[index]
         if missing:
-            raise ValueError(f"目印がありません: {', '.join(map(str, missing))} フレーム")
-        gone = set(self.frames)
-        return _with_markers(project, [m for m in timeline.markers if m.frame not in gone])
+            raise ValueError(f"目印がありません: {', '.join(map(str, sorted(missing)))} フレーム")
+        return _with_markers(project, remaining)
