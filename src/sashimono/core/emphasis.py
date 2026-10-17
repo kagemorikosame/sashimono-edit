@@ -21,8 +21,21 @@ from fractions import Fraction
 
 from sashimono.core.commands.base import Command
 from sashimono.core.commands.effects import AddEffect, ParamPath, SetParam
-from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, fixed_effect, fixed_slot
-from sashimono.core.model import AnimatedValue, Clip, Effect, Interpolation, Keyframe
+from sashimono.core.commands.fixed import (
+    TRANSFORM_EFFECT_KIND,
+    fixed_effect,
+    fixed_slot,
+    takes_picture_items,
+)
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Effect,
+    Interpolation,
+    Keyframe,
+    Project,
+    Track,
+)
 from sashimono.core.model.easing import CURVES
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
@@ -36,18 +49,22 @@ __all__ = [
     "EMPHASIS_EASINGS",
     "EMPHASIS_EASING_NAMES",
     "EMPHASIS_KINDS",
+    "EMPHASIS_KIND_NAMES",
     "EMPHASIS_PAN_PX_RANGE",
     "EMPHASIS_POP_PERCENT_RANGE",
     "EMPHASIS_RAMP_MS_RANGE",
     "EMPHASIS_SHAKE_PX_RANGE",
     "EMPHASIS_ZOOM_PERCENT_RANGE",
     "PAN",
+    "PAN_DIRECTIONS",
+    "PAN_DIRECTION_NAMES",
     "POP",
     "SHAKE",
     "ZOOM",
     "EmphasisError",
     "EmphasisStyle",
     "Envelope",
+    "can_emphasize",
     "easing_point",
     "envelope",
     "fixed_transform",
@@ -66,6 +83,21 @@ SHAKE = "shake"
 POP = "pop"
 #: 動きの種類 ズームとパンは戻さずに残せる（``keep``） 揺れとポップは一瞬の動きなので残さない
 EMPHASIS_KINDS = (ZOOM, PAN, SHAKE, POP)
+#: 画面と取り消しの段の名前に出す種類の名前
+EMPHASIS_KIND_NAMES: dict[str, str] = {
+    ZOOM: "寄る（ズーム）",
+    PAN: "ずらす（パン）",
+    SHAKE: "揺らす",
+    POP: "一瞬ふくらむ（ポップ）",
+}
+#: パンの向き（Y は上が正 配置の pos_y と同じ）
+PAN_DIRECTIONS: dict[str, tuple[float, float]] = {
+    "left": (-1.0, 0.0),
+    "right": (1.0, 0.0),
+    "up": (0.0, 1.0),
+    "down": (0.0, -1.0),
+}
+PAN_DIRECTION_NAMES: dict[str, str] = {"left": "左", "right": "右", "up": "上", "down": "下"}
 
 #: ズームの既定の拡大率（今の大きさからの %） 120% は話者の顔へ寄ったと分かり、画面の端が
 #: 大きく欠けない量 130% を超えると、横並びの 2 人の片方が画面から外れやすい
@@ -347,6 +379,15 @@ def pan_curves(
 def shake_curve(shape: Envelope, amplitude: float) -> AnimatedValue:
     """揺れの幅の線（範囲の外は 0） ``random_move`` の X と Y の幅に入れる"""
     return shaped(AnimatedValue(static=0.0), shape, lambda _now, amount: amount * amplitude)
+
+
+def can_emphasize(project: Project, track: Track, clip: Clip) -> bool:
+    """強調の動きを付けられるクリップか（AI の道具と右クリックで同じ決まりにする）
+
+    音だけのクリップや場面切り替え・フィルタは配置の欄を持たないので、点を打っても何も
+    動かない ロックは人が触らせないために掛けた物なので、右クリックからも AI からも変えない
+    """
+    return not track.locked and takes_picture_items(clip) and project.draws_picture(track, clip)
 
 
 def fixed_transform(clip: Clip) -> Effect | None:

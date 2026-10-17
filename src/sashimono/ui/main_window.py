@@ -74,7 +74,12 @@ from sashimono.core.commands import (
     switch_layer_mode,
 )
 from sashimono.core.commands.project_format import retime_frame
-from sashimono.core.emphasis import EmphasisStyle
+from sashimono.core.emphasis import (
+    PAN_DIRECTIONS,
+    EmphasisError,
+    EmphasisStyle,
+    can_emphasize,
+)
 from sashimono.core.io import (
     LEGACY_SUFFIXES,
     SUFFIX,
@@ -128,8 +133,9 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
-from sashimono.core.timebase import FrameRate
+from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
+from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
 from sashimono.engine.audio.speech import (
     SpeechError,
@@ -159,6 +165,7 @@ from sashimono.ui.backup_settings import (
     state_roots,
 )
 from sashimono.ui.chat import ChatPanel
+from sashimono.ui.emphasis_dialog import ask_emphasis
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.inspector import InspectorPanel
@@ -1235,6 +1242,9 @@ class MainWindow(QMainWindow):
         )
         self._timeline.loudness_requested.connect(
             lambda clip_ids: self.normalize_clips([ClipId(str(c)) for c in clip_ids])
+        )
+        self._timeline.emphasis_requested.connect(
+            lambda clip_ids: self.emphasize_clips([ClipId(str(c)) for c in clip_ids])
         )
         self._timeline.scene_open_requested.connect(
             lambda scene_id: self.open_scene(SceneId(scene_id))
@@ -3401,6 +3411,71 @@ class MainWindow(QMainWindow):
             if not track.locked and project.plays_sound(track, clip):
                 found.append((track, clip))
         return found
+
+    def emphasis_span(self) -> tuple[int, int]:
+        """〔強調の動きを付ける…〕の範囲（タイムラインのフレーム 終わりは含まない）
+
+        書き出し範囲があればそこ、無ければ再生ヘッドから 1 秒（2026-10-18 利用者の決定）
+        窓で範囲を選ばせないのは、要所の位置を目盛りで決める人の手順（書き出し範囲を引く・
+        再生ヘッドを置く）をそのまま使えるようにするため
+        """
+        project = self.view_project
+        if project.timeline.work_area is not None:
+            return project.timeline.work_area
+        second = seconds_to_frame(Fraction(1), project.rate, Rounding.NEAREST)
+        return self.playhead, self.playhead + max(second, 2)
+
+    def emphasize_clips(self, clip_ids: list[ClipId]) -> bool:
+        """〔強調の動きを付ける…〕 動きを尋ね、範囲（:meth:`emphasis_span`）に付ける
+
+        AI の ``emphasize`` と同じ所（:func:`emphasis_commands`）を通し、何本選んでいても
+        取り消し 1 回で戻る 範囲と重ならないクリップは飛ばす 1 本でも組めなければ何も変えない
+        （一部だけ動くと、どれに付いたのかを人が追えない） 付けられたら真
+        """
+        project = self.view_project
+        targets: list[Clip] = []
+        for clip_id in clip_ids:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_emphasize(project, *located):
+                targets.append(located[1])
+        if not targets:
+            self.statusBar().showMessage("絵を描くクリップを選んでください（ロックは外す）", 5000)
+            return False
+        start, end = self.emphasis_span()
+        rate = project.rate
+        note = "書き出し範囲" if project.timeline.work_area is not None else "再生ヘッドから 1 秒"
+        span = f"{note}（{format_timecode(start, rate)}〜{format_timecode(end, rate)}）"
+        choice = ask_emphasis(self, self._preferences.emphasis_style, span)
+        if choice is None:
+            return False
+        offset = PAN_DIRECTIONS.get(choice.direction, (0.0, 1.0))
+        commands: list[Command] = []
+        for clip in targets:
+            # 範囲をクリップの中に収める 右クリックの範囲は人が目盛りで決めた物で、クリップの
+            # 端をまたいでいても、そのクリップに見えている所だけに付けるのが自然
+            first = max(start, clip.timeline_start)
+            last = min(end, clip.timeline_end)
+            if last - first < 2:
+                continue
+            request = EmphasisRequest(
+                choice.kind,
+                first - clip.timeline_start,
+                last - clip.timeline_start,
+                strength=float(choice.strength),
+                ramp_ms=choice.ramp_ms,
+                easing=choice.easing,
+                offset=(offset[0] * choice.strength, offset[1] * choice.strength),
+            )
+            try:
+                planned, _shape = emphasis_commands(clip, request, rate)
+            except EmphasisError as exc:
+                self.statusBar().showMessage(f"強調の動きを付けられません: {exc}", 8000)
+                return False
+            commands.extend(planned)
+        if not commands:
+            self.statusBar().showMessage(f"選んだクリップが{span}と重なっていません", 5000)
+            return False
+        return self.execute_all(commands, emphasis_label(choice.kind))
 
     def duck_clips(self, clip_ids: list[ClipId]) -> bool:
         """〔BGM を声に合わせて下げる…〕 声のトラックと下げ方を尋ね、話している間だけ下げる
