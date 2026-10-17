@@ -1097,14 +1097,18 @@ def _marker_frame(value: object, name: str) -> int:
 
 
 def _marker_color(value: object) -> str:
-    color = str(value)
-    if not valid_marker_color(color):
-        raise ToolError(f"色は #RRGGBB で渡してください: {value!r}")
-    return color
+    # 呼ぶ側はスキーマを確かめずに渡してくる 文字にしてから見ると、形の違う値の理由が
+    # 「色の形」だけになり、何を渡し間違えたかが AI に伝わらない
+    if not isinstance(value, str) or not valid_marker_color(value):
+        raise ToolError(f"色は #RRGGBB の文字列で渡してください: {value!r}")
+    return value
 
 
 def _marker_label(value: object) -> str:
-    label = str(value or "").strip()
+    # 文字にして受けると、数や null が "123" "None" という名前で目次に入る
+    if not isinstance(value, str):
+        raise ToolError(f"名前は文字列で渡してください（{type(value).__name__} が来ました）")
+    label = value.strip()
     if len(label) > MARKER_LABEL_LIMIT:
         raise ToolError(f"名前は {MARKER_LABEL_LIMIT} 文字までです（{len(label)} 文字）")
     return label
@@ -1143,8 +1147,11 @@ def _add_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
                 f"{frame} フレームにはもう目印があります 名前や色を変えるなら update_marker を"
                 "使ってください"
             )
-        color = _marker_color(item["color"]) if item.get("color") else Marker(frame).color
-        markers.append(Marker(frame, _marker_label(item.get("label")), color))
+        # 既定へ回すのは省いたときだけ 値の真偽で分けると、渡し間違えた 0 や空の色が
+        # 確かめられずに黄色の目印になる
+        color = _marker_color(item["color"]) if "color" in item else Marker(frame).color
+        label = _marker_label(item["label"]) if "label" in item else ""
+        markers.append(Marker(frame, label, color))
     host.apply_commands([AddMarkers(tuple(markers))], "マーカーを置く")
     project = _project(host)
     added = {marker.frame for marker in markers}

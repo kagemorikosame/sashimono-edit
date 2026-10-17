@@ -49,6 +49,23 @@ class TestPlace:
         with pytest.raises(ToolError, match="#RRGGBB"):
             run(host, "add_markers", markers=[{"frame": 0, "color": "red"}])
 
+    @pytest.mark.parametrize("color", [0, False, "", None])
+    def test_a_given_colour_is_always_checked(self, host: FakeHost, color: object) -> None:
+        # 値の真偽で既定の色へ回すと、渡し間違えた 0 や空の色が黙って黄色の目印になる
+        with pytest.raises(ToolError, match="#RRGGBB"):
+            run(host, "add_markers", markers=[{"frame": 0, "color": color}])
+        assert _frames(host) == []
+
+    @pytest.mark.parametrize("label", [123, None, ["本編"]])
+    def test_a_label_must_be_text(self, host: FakeHost, label: object) -> None:
+        # 文字にして受けると、数や None が "123" "None" という名前で目次に入る
+        with pytest.raises(ToolError, match="文字列"):
+            run(host, "add_markers", markers=[{"frame": 0, "label": label}])
+        run(host, "add_markers", markers=[{"frame": 0, "label": "仮"}])
+        with pytest.raises(ToolError, match="文字列"):
+            run(host, "update_marker", frame=0, label=label)
+        assert host.document.project.timeline.markers[0].label == "仮"
+
     def test_it_goes_into_the_open_scene(self, host: FakeHost) -> None:
         # メインへ置くと、シーンを開いて頼んだ目印がシーンに出ない
         scene = new_scene(host.document.project, "場面")
