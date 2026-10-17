@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -34,17 +33,24 @@ from sashimono.core.commands import export_range
 from sashimono.core.model import Project, Scene, SceneId
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.encode import (
+    BITRATE_RANGE_MBPS,
+    DEFAULT_BITRATE_MBPS,
     DEFAULT_PIPELINE_DEPTH,
+    RANGE_ALL,
+    RANGE_WORK_AREA,
     ExportError,
     ExportSettings,
     available_video_codecs,
+    build_settings,
+    chosen_range,
+    export_target,
 )
 from sashimono.engine.encode import export_project as run_export
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 
-__all__ = ["RANGE_ALL", "RANGE_WORK_AREA", "ExportDialog"]
+__all__ = ["CODEC_LABELS", "RANGE_ALL", "RANGE_WORK_AREA", "ExportDialog"]
 
-#: コーデック名と、画面に出す説明
+#: コーデック名と、画面に出す説明 AI の書き出し（#327）の確かめにも同じ名前を出す
 CODEC_LABELS = {
     "h264_nvenc": "H.264 (NVIDIA GPU)",
     "hevc_nvenc": "H.265 (NVIDIA GPU)",
@@ -57,10 +63,6 @@ CODEC_LABELS = {
 #: 「自動」の項目に持たせる値 ``None`` は「コーデックが 1 つも無く書き出せない」項目が
 #: 使っているので分ける 同じにすると、自動を選んで書き出しを押しても何も起きない
 AUTO_CODEC = ""
-
-#: 「書き出す範囲」の選びに持たせる値
-RANGE_ALL = "all"
-RANGE_WORK_AREA = "work_area"
 
 
 class _ExportWorker(QObject):
@@ -165,8 +167,8 @@ class ExportDialog(QDialog):
             self._codec.setEnabled(False)
 
         self._bitrate = QSpinBox(self)
-        self._bitrate.setRange(1, 200)
-        self._bitrate.setValue(12)
+        self._bitrate.setRange(*BITRATE_RANGE_MBPS)
+        self._bitrate.setValue(DEFAULT_BITRATE_MBPS)
         self._bitrate.setSuffix(" Mbps")
 
         self._scene = QComboBox(self)
@@ -257,9 +259,7 @@ class ExportDialog(QDialog):
         scene = self._whole.find_scene(scene_id) if scene_id is not None else None
         before = self._default_name(self._chosen)
         self._chosen = scene
-        self._project = (
-            self._whole if scene is None else replace(self._whole, timeline=scene.timeline)
-        )
+        self._project = export_target(self._whole, scene.id if scene is not None else None)
         project = self._project
         width, height = project.settings.resolution
         self._summary.setText(
@@ -323,7 +323,7 @@ class ExportDialog(QDialog):
     def _frame_range(self) -> tuple[int, int] | None:
         """選んだ範囲 全体なら ``None``（書き出し側がタイムラインの長さを使う）"""
         if self._range.currentData() == RANGE_WORK_AREA:
-            return export_range(self._project.timeline)
+            return chosen_range(self._project, RANGE_WORK_AREA)
         return None
 
     def _choose_path(self) -> None:
@@ -338,10 +338,12 @@ class ExportDialog(QDialog):
         codec = self._codec.currentData()
         if codec is None:
             return None
-        return ExportSettings(
-            path=Path(self._path.text()),
-            video_codec=str(codec) or None,
-            video_bitrate=self._bitrate.value() * 1_000_000,
+        # AI の書き出しと同じ作り方で組む（#327） 画面だけ別に組むと、同じ範囲・画質を
+        # 頼んでも、AI が書き出した物だけ先読みの深さや範囲が違う
+        return build_settings(
+            Path(self._path.text()),
+            codec=str(codec) or None,
+            bitrate_mbps=self._bitrate.value(),
             frame_range=self._frame_range(),
             pipeline_depth=self._pipeline_depth,
             decode_threads=self._decode_threads,

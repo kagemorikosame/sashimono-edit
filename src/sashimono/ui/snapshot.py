@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QIODevice, QSaveFile
+from PySide6.QtCore import QBuffer, QIODevice, QSaveFile
 from PySide6.QtGui import QImage, QImageWriter
 
 from sashimono.core.model import Project
@@ -23,6 +23,7 @@ from sashimono.ui.system_clipboard import clipboard
 __all__ = [
     "SNAPSHOT_FILTER",
     "copy_to_clipboard",
+    "encode_png",
     "render_snapshot",
     "snapshot_frame",
     "snapshot_name",
@@ -83,6 +84,19 @@ def _to_qimage(image: np.ndarray) -> QImage:
     return QImage(
         contiguous.tobytes(), width, height, width * 4, QImage.Format.Format_RGBX8888
     ).copy()
+
+
+def encode_png(image: QImage) -> bytes | None:
+    """:func:`write_png` と同じ書き方（``QImageWriter`` の PNG）でバイト列にする 失敗なら ``None``
+
+    AI の静止画の保存（#327）が使う 書く所を手元で決めたいので（書いてから置き換える・
+    許した後に書く先が変わっていないかを照らす）、ファイルではなくバイト列で受け取る
+    """
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not QImageWriter(buffer, b"PNG").write(image):
+        return None
+    return bytes(buffer.data().data())
 
 
 def write_png(image: QImage, path: Path) -> bool:

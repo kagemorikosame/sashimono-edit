@@ -4,6 +4,11 @@
 
 - 変える道具は 35 個 どれも ``host.apply_commands`` か ``Document`` の取り消しを通して
   プロジェクト（メモリの中）だけを変える ファイルへ書く道具は 0 個
+- 2026-10-15 に保存と書き出し（B1 #327）を足した ファイルへ書く道具は 5 個（上書き保存・
+  名前を付けて保存・書き出し・字幕の書き出し・静止画の保存）になった どれも取り消せない
+  操作で、毎回確かめ、書くのはホスト（画面の〔保存〕・書き出しの窓・字幕の〔書き出し…〕・
+  〔静止画を保存…〕と同じ処理）に頼む 道具のコードはファイルを書かない
+  書き出しを止める道具（cancel_export）は作品もファイルも変えない（書きかけを捨てるだけ）
 - ファイルに触るのは読む所だけ ``import_media`` が素材を読み（``host.probe``）、波形と
   控えを予約する（書く先は本人のキャッシュの置き場で、素材の隣ではない）
 - 消す道具が消すのは、プロジェクトの中のクリップ（と、クリップが持つ縁取りの層）だけ
@@ -85,8 +90,28 @@ UNDOABLE_TOOLS = frozenset(
         "delete_markers",
         # 履歴
         "undo",
+        # 書き出しを止める 作品もファイルも変えず、書きかけを捨てるだけ もう 1 度書き出せば
+        # 同じ物ができるので、取り消せない操作の毎回の確かめは要らない
+        "cancel_export",
     }
 )
+
+#: ファイルへ書く道具（数えた物） どれも取り消せない操作で、確かめの側（test_safety.py
+#: test_save_and_export.py）で押さえる 足すときは、書く場所を pinned_place か書き出しの
+#: 片付け（ui/ai_export.py）に通してからここへ足す
+FILE_WRITING_TOOLS = frozenset(
+    {"save_project", "save_project_as", "export_video", "export_subtitles", "save_snapshot"}
+)
+
+#: 道具のコードがホストに書かせる口と、それを呼んでよい道具の関数
+#: 道具の関数の外（読む道具・編集の道具）から呼ぶと、確かめを通らずにファイルを書く
+_HOST_WRITERS = {
+    "_save_project": {"write_project"},
+    "_save_project_as": {"write_project"},
+    "_export_video": {"start_export"},
+    "_export_subtitles": {"write_subtitles"},
+    "_save_snapshot": {"write_snapshot"},
+}
 
 #: 道具のコードが呼んではいけない、ファイルを書く・消す・動かす呼び出し
 _WRITING_CALLS = frozenset(
@@ -110,6 +135,7 @@ _WRITING_CALLS = frozenset(
         "move",
         "save",
         "save_project",
+        "copy_atomic",
     }
 )
 
@@ -153,17 +179,45 @@ class TestCounted:
         }
         assert undoable == UNDOABLE_TOOLS
         # 取り消せない道具は、確かめの側（test_safety.py）で押さえる
-        assert changing - undoable == {
-            operation.name for operation in OPERATIONS if operation.irreversible
-        }
+        irreversible = {operation.name for operation in OPERATIONS if operation.irreversible}
+        assert changing - undoable == irreversible
+        assert irreversible == FILE_WRITING_TOOLS
+
+    def test_only_the_counted_tools_ask_the_host_to_write(self) -> None:
+        # 壊れると、確かめを通らない道具（読む道具や編集の道具）から作品の保存や書き出しを
+        # 呼べ、「変更を自動で承認」の人の作品や書き出し先を黙って上書きする
+        tree = _source(sashimono.ai.operations)
+        writers = {name for names in _HOST_WRITERS.values() for name in names}
+        found: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                called = _called_names(ast.Module(body=node.body, type_ignores=[])) & writers
+                if called:
+                    found[node.name] = called
+        assert found == _HOST_WRITERS
+        # 書く道具は、人が許した確かめの中身を受け取る本体（approved）で書く 受け取らずに
+        # 書く先の身元を採り直すと、照らし合わせの後の変更を受け入れる（#327 Codex の P2）
+        handlers: dict[str, str] = {}
+        for operation in OPERATIONS:
+            if operation.name in FILE_WRITING_TOOLS:
+                assert operation.approved is not None, operation.name
+                handlers[operation.name] = operation.approved.__name__
+        assert set(handlers.values()) == set(_HOST_WRITERS)
+        # 本体の中で書く先の身元を採り直さない（確かめの中身の身元で照らす）
+        tree = _source(sashimono.ai.operations)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in _HOST_WRITERS:
+                called = _called_names(ast.Module(body=node.body, type_ignores=[]))
+                assert "expect_now" not in called, node.name
 
     @pytest.mark.parametrize(
         "module", [sashimono.ai.operations, sashimono.ai.bridge, sashimono.ai.safety]
     )
     def test_no_tool_code_writes_files(self, module: object) -> None:
         # 壊れると、AI の道具が元の素材や作品のファイルを書き換え、「元に戻す」で戻らない
-        # 書く道具（保存・書き出し）を足すときは、取り消せない操作として確かめを通し、
-        # 書く所は writable_path を通す その道具のための除外をここへ足す
+        # 書く道具（保存・書き出し #327）も、ここでは書かずにホストへ頼む（数えた口だけ
+        # test_only_the_counted_tools_ask_the_host_to_write） 取り消せない操作として確かめを
+        # 通し、書く場所は pinned_place を通す
         called = _called_names(_source(module))
         writing = called & (_WRITING_CALLS | {f"os.{name}" for name in ("replace", "rename")})
         writing |= {name for name in called if name.startswith("shutil.")}

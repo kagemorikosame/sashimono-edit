@@ -6,13 +6,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from sashimono.core.model import Project
-from sashimono.engine.encode import ExportSettings
+from sashimono.ai.host import ExportRequest
+from sashimono.core.commands import AddClip, AddTrack
+from sashimono.core.io.atomic import expect_now
+from sashimono.core.model import Clip, Project, Track, TrackKind
+from sashimono.effects.sources import TEXT
+from sashimono.engine.encode import RANGE_ALL, ExportSettings
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -90,3 +95,33 @@ def test_the_window_remembers_what_was_chosen(
     monkeypatch.setattr(ExportDialog, "exec", look)
     window.export()
     assert seen == [False]
+
+
+@pytest.mark.parametrize("chosen", [True, False])
+def test_the_assistant_export_follows_the_setting(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, chosen: bool
+) -> None:
+    # AI の書き出し（#327）が設定を見ないと、窓で切った人の動画にも AI が書き出すと章が入る
+    window._preferences = replace(window._preferences, export_chapters=chosen)
+    started: list[ExportSettings] = []
+    monkeypatch.setattr(
+        window._assistant_export,
+        "start",
+        lambda _project, settings, _check, _expect=None: started.append(settings),
+    )
+    clip = Clip(timeline_start=0, duration=30, source=TEXT.create())
+    track = Track(TrackKind.VIDEO, "V1")
+    window._document.execute(AddTrack(track))
+    window._document.execute(AddClip(track.id, clip))
+    path = tmp_path / "完成.mp4"
+    window.start_export(
+        ExportRequest(
+            path=path,
+            scene_id=None,
+            range_choice=RANGE_ALL,
+            codec=None,
+            bitrate_mbps=12,
+            expect=expect_now(path),
+        )
+    )
+    assert [settings.chapters for settings in started] == [chosen]
