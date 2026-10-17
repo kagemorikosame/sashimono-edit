@@ -23,6 +23,7 @@ from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, Run
 from tests.ai.conftest import FakeHost, allow_sending
+from tests.ai.test_bridge import call_in_thread, pump_until
 
 
 def _operation() -> Any:
@@ -346,3 +347,28 @@ class TestWaiting:
         assert not thread.is_alive()
         assert time.monotonic() - started < 1.0
         assert "中断" in str(box.get("error", ""))
+
+    def test_a_check_that_ends_while_waiting_returns_through_the_bridge(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると（ブリッジが道具の続きを辿り切らないと）、待つ印がそのまま AI へ返り、
+        # 検査の結果の代わりに読めない答えが届く（#320 で続きの辿り方を 1 つにまとめた）
+        _operation()(host, {"wait_seconds": 0})
+        request = host.check_requests[-1]
+        host.check = _state(request, running=True, analyzed=60)
+
+        def finishing_waiter() -> Any:
+            def wait(seconds: float) -> bool:
+                del seconds
+                host.check = _state(request)
+                return True
+
+            return wait
+
+        monkeypatch.setattr(host, "check_waiter", finishing_waiter)
+        bridge = allow_sending(EditorBridge(host))
+        done, box = call_in_thread(bridge, _operation(), {"wait_seconds": 5})
+        pump_until(bridge, done)
+        result = box.get("result")
+        assert isinstance(result, dict), box.get("error")
+        assert result["complete"] is True

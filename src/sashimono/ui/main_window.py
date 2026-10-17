@@ -47,6 +47,7 @@ from sashimono import __version__
 from sashimono.ai.host import ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import check_writable
+from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
@@ -135,6 +136,7 @@ from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
+from sashimono.ui.ai_sheet import AiSheet
 from sashimono.ui.backup_settings import (
     STATE_SUBFOLDER,
     describe_trim,
@@ -422,6 +424,8 @@ class MainWindow(QMainWindow):
         self._rebuilt: set[str] = set()
         #: AI が結果を確認するための描画係 初めて求められたときに作る
         self._ai_renderer: FrameRenderer | None = None
+        #: AI の描画係に最後に当てた縮める度合い（:meth:`_render_for_ai`）
+        self._ai_divisor = 1
         #: 編集しているシーン ``None`` ならメイン モデルではなく画面の状態なので
         #: 窓が持つ（保存しない 開き直したらメインから始まる）
         self._active_scene: SceneId | None = None
@@ -3223,18 +3227,8 @@ class MainWindow(QMainWindow):
         AI が見ているクリップと絵が食い違う
         """
         project = self.view_project
-        full_width = project.settings.width
-        divisor = max(1, round(full_width / max(width, 1)))
-
-        renderer = self._ai_renderer
-        if renderer is None:
-            renderer = FrameRenderer(project, quality=RenderQuality(divisor))
-            self._ai_renderer = renderer
-        else:
-            renderer.set_project(project)
-            renderer.set_quality(RenderQuality(divisor))
-
-        image = renderer.render(frame)
+        divisor = max(1, round(project.settings.width / max(width, 1)))
+        image = self._render_for_ai(project, frame, divisor)
         height, image_width = image.shape[0], image.shape[1]
         picture = QImage(
             image.tobytes(), image_width, height, image_width * 4, QImage.Format.Format_RGBA8888
@@ -3246,6 +3240,44 @@ class MainWindow(QMainWindow):
         if not QImageWriter(buffer, b"PNG").write(picture):
             raise ToolError("プレビュー画像を作れませんでした")
         return bytes(buffer.data().data())
+
+    def start_sheet(self, layout: SheetLayout) -> AiSheet:
+        """コマを並べる 1 枚を用意する（#320）
+
+        用意した時点のプロジェクトを持っておき、どの升もそれを描く 1 コマずつ描く間に
+        AI や人が編集しても、1 枚の中で前後の升が別の版の絵にならないように
+        """
+        project = self.view_project
+        full_width = project.settings.width
+
+        def render(frame: int, cell_width: int) -> np.ndarray:
+            # 升より小さく描いて引き伸ばすと字幕の字がにじむ 切り捨てて升以上の大きさで描き、
+            # 縮めて升へ入れる 4K の作品でも、描くのは升の幅の 1〜2 倍ほどで済む
+            divisor = max(1, full_width // max(cell_width, 1))
+            return self._render_for_ai(project, frame, divisor)
+
+        return AiSheet(layout, render)
+
+    def _render_for_ai(self, project: Project, frame: int, divisor: int) -> np.ndarray:
+        """AI に見せる絵を描く preview_frame もコマを並べる 1 枚も、ここを通る
+
+        プレビューのウィジェットとは別のコンテキストで描く 再生用の資源を取り合わない
+        ように 描くたびにプロジェクトと大きさを当て直すのは、続きを描く間に別の道具
+        （preview_frame）が同じ描き手を使っても、次の升が前の頼みの大きさで描かれないように
+        """
+        renderer = self._ai_renderer
+        if renderer is None:
+            renderer = FrameRenderer(project, quality=RenderQuality(divisor))
+            self._ai_renderer = renderer
+            self._ai_divisor = divisor
+        else:
+            renderer.set_project(project)
+            if divisor != self._ai_divisor:
+                # 大きさを当てると描き先を作り直す 同じ大きさで何十コマも描くときに
+                # 毎回作り直さない
+                renderer.set_quality(RenderQuality(divisor))
+                self._ai_divisor = divisor
+        return renderer.render(frame)
 
     # --- 静止画 ---
 

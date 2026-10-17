@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
 from sashimono.core.io.atomic import Expected
@@ -23,7 +24,14 @@ from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
 
-__all__ = ["EXPORT_RUNNING", "EXPORT_STATES", "EditorHost", "ExportRequest", "ToolError"]
+__all__ = [
+    "EXPORT_RUNNING",
+    "EXPORT_STATES",
+    "EditorHost",
+    "ExportRequest",
+    "SheetCanvas",
+    "ToolError",
+]
 
 #: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
 #: 走っている間は「書いている」「置いている」 終わった後は残りのどれか
@@ -56,6 +64,22 @@ class ToolError(RuntimeError):
     この例外の文面はそのまま Claude へ返る 「どうすれば直るか」が分かる書き方を
     すること Claude は次の手をこの文面だけで決める
     """
+
+
+class SheetCanvas(Protocol):
+    """コマを並べて描く 1 枚（:meth:`EditorHost.start_sheet`）
+
+    1 コマずつ描かせるのは、間で編集画面へ手を返すため（:class:`~sashimono.ai.operations.Continue`）
+    まとめて描くと、大きい作品で何十コマも描く間、画面が止まる
+    """
+
+    def draw(self, index: int, frame: int, label: str) -> None:
+        """``index`` 番目の升へ ``frame`` を描き、真下の帯へ ``label`` を書く"""
+        ...
+
+    def png(self) -> bytes:
+        """描き終えた 1 枚を PNG にする"""
+        ...
 
 
 class EditorHost(Protocol):
@@ -122,6 +146,14 @@ class EditorHost(Protocol):
 
     def render_png(self, frame: int, *, width: int) -> bytes:
         """そのフレームを合成して PNG で返す"""
+        ...
+
+    def start_sheet(self, layout: SheetLayout) -> SheetCanvas:
+        """コマを並べる 1 枚を用意する（コンタクトシートと範囲のコマ #320）
+
+        描くのは用意した時点のプロジェクト（開いているシーン） 描く間に編集が入っても、
+        1 枚の中で前後の升が別の版の絵にならないように
+        """
         ...
 
     def probe(self, path: Path) -> MediaItem:

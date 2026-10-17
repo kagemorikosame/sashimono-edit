@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -31,6 +32,13 @@ from sashimono.ai.safety import (
     readable_output,
     refuse_where_the_folder_cannot_be_held,
     writable_path,
+)
+from sashimono.ai.sheet import (
+    MAX_COLUMNS,
+    MAX_SHEET_EDGE,
+    MIN_CELL_WIDTH,
+    SheetError,
+    sheet_layout,
 )
 from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
 from sashimono.core.clipboard import copy_clips, paste_commands
@@ -150,11 +158,13 @@ __all__ = [
     "MAX_WAIT_SECONDS",
     "OPERATIONS",
     "Choice",
+    "Continue",
     "ImageResult",
     "Operation",
     "Pending",
     "QuestionSpec",
     "find_operation",
+    "finish",
     "question_spec",
 ]
 
@@ -163,6 +173,25 @@ __all__ = [
 DEFAULT_PREVIEW_WIDTH = 640
 MAX_PREVIEW_WIDTH = 1280
 
+#: コンタクトシート（全体を見渡す）の既定の枚数と升の幅
+#: 12 枚 x 幅 240 は 1 枚でおよそ 730x630 画素 preview_frame の既定（640x360）の 2 枚ぶんほどの
+#: 費用で 12 コマを見せる 細かく見たい所は、ここで当たりを付けてから preview_frame で見る
+SHEET_DEFAULT_COUNT = 12
+SHEET_MAX_COUNT = 36
+SHEET_DEFAULT_CELL = 240
+#: 範囲の連続したコマ（動きの確かめ）の既定の枚数と升の幅 動きは細かい所を見るので
+#: 升を広めに取り、枚数を絞る 8 枚 x 幅 320 を 4 列で 1 枚およそ 1300x400 画素
+RANGE_DEFAULT_COUNT = 8
+RANGE_MAX_COUNT = 16
+RANGE_DEFAULT_CELL = 320
+#: 範囲のコマの既定の列の数 続いたコマは横へ読む 縦横の釣り合いで列を選ぶと 8 枚が
+#: 2 列 x 4 行になり、時間の流れが行ごとに折れて追いにくい
+RANGE_DEFAULT_COLUMNS = 4
+#: 升の幅の上限 これより広くしたいときは preview_frame で 1 コマを大きく見る
+MAX_CELL_WIDTH = 640
+#: 1 度に描き続けてよい時間（秒） 超えたら編集画面へ手を返し、次の回に続きを描く
+#: 返さないと、大きい作品で何十コマも描く間、画面が止まって押した釦も効かない
+SHEET_SLICE_SECONDS = 0.1
 #: 書き出しの codec の「自動」 画面の書き出しの窓の「自動（使えなければ次の候補）」と同じ
 AUTO = "auto"
 
@@ -173,6 +202,25 @@ class ImageResult:
 
     png: bytes
     caption: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Continue:
+    """長い道具の続き 道具はこれを返して、いったん編集画面へ手を返す
+
+    ブリッジは編集画面の次の回で ``step`` を呼ぶ（:meth:`EditorBridge.invoke`） 続きもまた
+    ``Continue`` を返してよく、最後に本当の結果を返す 1 回で全部を描くと、その間は
+    画面が描き直されず、中断の釦も効かない
+    """
+
+    step: Callable[[], object]
+
+
+def finish(result: object) -> object:
+    """``Continue`` を終わりまで辿って本当の結果を返す 編集画面へ手を返さない呼び方用"""
+    while isinstance(result, Continue):
+        result = result.step()
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,8 +290,13 @@ class Operation:
             return Safety.IRREVERSIBLE
         return Safety.UNDOABLE if self.writes else Safety.READ_ONLY
 
-    def __call__(self, host: EditorHost, arguments: dict[str, Any]) -> object:
+    def start(self, host: EditorHost, arguments: dict[str, Any]) -> object:
+        """初めの 1 回だけ動かす 長い道具は :class:`Continue` を返す（ブリッジが続きを呼ぶ）"""
         return self.handler(host, arguments)
+
+    def __call__(self, host: EditorHost, arguments: dict[str, Any]) -> object:
+        """終わりまで動かして結果を返す 編集画面のスレッドで、手を返さずに済む所から呼ぶ"""
+        return finish(self.handler(host, arguments))
 
 
 #: 質問の道具の名前 チャット欄が呼び出しの行を出し分けるのに使う
@@ -405,6 +458,17 @@ def _target_clip(host: EditorHost, arguments: dict[str, Any]) -> tuple[Track, Cl
     return _require_clip(_project(host), clip_id)
 
 
+def _no_explicit_null(arguments: dict[str, Any], key: str) -> None:
+    """配列の引数に null を明示したら断る 省いたときと同じに扱わない
+
+    省いたときの既定は「選択中のクリップすべて」「字幕すべて」「全体の 12 コマ」のように
+    広い 明示の null をそちらへ読み替えると、AI が渡したつもりの物とは別の、ずっと
+    広い相手に効く
+    """
+    if key in arguments and arguments[key] is None:
+        raise ToolError(f"{key} に null が来ました 省くか、配列で渡してください")
+
+
 def _target_clips(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, ...]:
     """引数の ``clip_ids``、無ければ選んでいるクリップすべて
 
@@ -412,6 +476,7 @@ def _target_clips(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
     見つからない ID が 1 つでもあれば止める 一部だけ動かすと、どれが動いたのかを
     AI も人も追えなくなる
     """
+    _no_explicit_null(arguments, "clip_ids")
     if arguments.get("clip_ids") is None:
         if not host.selected_clips:
             raise ToolError("clip_ids を指定してください（選択中のクリップもありません）")
@@ -447,6 +512,7 @@ def _clip_id_list(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
     重なったまま渡すと「3 本を移動」のような本数が実際と食い違う 型が違えば
     ToolError にする 素の TypeError で落ちると、AI は何を直せばよいか分からない
     """
+    _no_explicit_null(arguments, "clip_ids")
     raw = arguments.get("clip_ids")
     if raw is None:
         return ()
@@ -454,12 +520,13 @@ def _clip_id_list(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, 
         raw = [raw]
     if not isinstance(raw, list):
         raise ToolError("clip_ids はクリップ ID の配列で渡してください")
+    names = _string_items(raw, "clip_ids")
     project = _project(host)
-    for clip_id in raw:
-        _require_clip(project, str(clip_id))
+    for clip_id in names:
+        _require_clip(project, clip_id)
     # 最後に現れた位置を残す（画面の set_selection と同じ） 最後の 1 本が主になる
     # 約束なので、先に現れた位置を残すと [A, B, A] の主が B に化ける
-    ids = [ClipId(str(clip_id)) for clip_id in raw]
+    ids = [ClipId(clip_id) for clip_id in names]
     return tuple(reversed(dict.fromkeys(reversed(ids))))
 
 
@@ -958,10 +1025,20 @@ def _replace_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> objec
     if not isinstance(pairs_raw, list) or not pairs_raw:
         raise ToolError('pairs に [{"from": 誤, "to": 正}, …] を渡してください')
     pairs: list[tuple[str, str]] = []
-    for entry in pairs_raw:
-        if not isinstance(entry, dict) or not str(entry.get("from") or ""):
+    for index, entry in enumerate(pairs_raw):
+        if not isinstance(entry, dict) or not isinstance(entry.get("from"), str):
+            raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は文字で渡します）')
+        if not entry["from"]:
             raise ToolError('pairs の各組は {"from": 誤, "to": 正} です（from は空にできません）')
-        pairs.append((str(entry["from"]), str(entry.get("to") or "")))
+        replacement = entry.get("to", "")
+        if not isinstance(replacement, str):
+            # null を空の文字と読むと、誤植の言葉を字幕から黙って消す 消したいときは
+            # to を省くか空の文字を渡してもらう
+            raise ToolError(
+                f"pairs の {index + 1} 組目の to は文字で渡してください"
+                f"（{type(replacement).__name__} が来ました 消すなら空の文字）"
+            )
+        pairs.append((entry["from"], replacement))
 
     project = _project(host)
     targets: list[tuple[MediaItem, int]] = []
@@ -1066,6 +1143,203 @@ def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
     png = host.render_png(frame, width=width)
     when = format_timecode(frame, project.rate)
     return ImageResult(png=png, caption=f"{when}（{frame} フレーム）")
+
+
+def _whole_number(arguments: dict[str, Any], key: str, default: int) -> int:
+    """整数の引数 省けば ``default`` 小数や文字で来たら、直し方を書いて断る
+
+    ``int()`` で読むと 2.7 が黙って 2 になり、AI が頼んだのと違うコマを見て判断する
+    """
+    value = arguments.get(key)
+    if value is None:
+        return default
+    return _integer_value(value, key)
+
+
+def _integer_value(value: object, name: str) -> int:
+    """整数 1 つ 省いたときの既定は持たない（配列の中の null を既定へ読み替えないため）"""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ToolError(f"{name} は整数で渡してください（{type(value).__name__} が来ました）")
+    if isinstance(value, float) and not value.is_integer():
+        raise ToolError(f"{name} は整数で渡してください（{value}）")
+    return int(value)
+
+
+def _string_items(raw: list[Any], name: str) -> list[str]:
+    """文字の配列の中身を 1 つずつ確かめる null や数は、何番目かを書いて断る
+
+    ``str()`` で読むと null が "None" という ID や名前になり、見当違いの「見つかりません」
+    が返るか、何にも当たらずに黙って減る
+    """
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise ToolError(
+                f"{name} の {index + 1} 個目は文字で渡してください"
+                f"（{type(entry).__name__} が来ました）"
+            )
+    return list(raw)
+
+
+def _within(arguments: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    """範囲の決まった整数の引数 外れたら端へ寄せず断る
+
+    黙って寄せると、AI は頼んだ枚数を見たつもりで、見ていないコマについて判断する
+    """
+    value = _whole_number(arguments, key, default)
+    if not low <= value <= high:
+        raise ToolError(f"{key} は {low}〜{high} にしてください（{value}）")
+    return value
+
+
+def _sheet_frames_from_range(project: Project, arguments: dict[str, Any]) -> list[int]:
+    """全体（または from_frame〜to_frame）を ``count`` 等分し、それぞれの真ん中のコマ
+
+    区切りの頭ではなく真ん中を取るのは、頭だと最初の升が黒い頭の 1 コマや場面切り替えの
+    途中になりやすく、その区間の様子を表さないため
+    """
+    last = project.duration
+    if last <= 0:
+        raise ToolError("タイムラインが空です 描くコマがありません")
+    start = _whole_number(arguments, "from_frame", 0)
+    end = _whole_number(arguments, "to_frame", last)
+    start, end = max(0, start), min(end, last)
+    if end <= start:
+        raise ToolError(
+            f"from_frame〜to_frame に描けるコマがありません（タイムラインは 0〜{last - 1}）"
+        )
+    count = _within(arguments, "count", SHEET_DEFAULT_COUNT, 1, SHEET_MAX_COUNT)
+    span = end - start
+    if span <= count:
+        return list(range(start, end))
+    return [start + (2 * index + 1) * span // (2 * count) for index in range(count)]
+
+
+def _sheet_frames_from_list(project: Project, raw: object) -> list[int]:
+    """AI が選んだコマ（場面の切り替わりの一覧など）をそのまま並べる"""
+    if not isinstance(raw, list) or not raw:
+        raise ToolError("frames はフレーム番号の並び（1 つ以上）で渡してください")
+    if len(raw) > SHEET_MAX_COUNT:
+        raise ToolError(
+            f"frames は {SHEET_MAX_COUNT} 個までにしてください（{len(raw)} 個）"
+            " 多いときは何回かに分けるか、from_frame と to_frame で区切ってください"
+        )
+    last = project.duration - 1
+    frames: list[int] = []
+    for index, value in enumerate(raw):
+        # null を既定の 0 に読み替えない 読み替えると頼んでいない頭のコマを描く
+        frame = _integer_value(value, f"frames の {index + 1} 個目")
+        if not 0 <= frame <= last:
+            raise ToolError(
+                f"frames の {index + 1} 個目（{frame}）はタイムラインの外です（0〜{last}）"
+            )
+        frames.append(frame)
+    return frames
+
+
+def _contact_sheet(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """全体を見渡す 等分したコマ（または指定したコマ）を 1 枚に並べる"""
+    project = _project(host)
+    # 鍵の有無で分ける 明示の null を省略と同じに読むと、渡したつもりの場面の一覧の
+    # 代わりに全体の 12 コマを描く null は _sheet_frames_from_list が断る
+    if "frames" in arguments:
+        if any(arguments.get(key) is not None for key in ("from_frame", "to_frame", "count")):
+            # どちらを優先したかを AI が知らないまま読むと、見たいコマと違う 1 枚を信じる
+            raise ToolError("frames と from_frame・to_frame・count は一緒に使えません")
+        frames = _sheet_frames_from_list(project, arguments["frames"])
+    else:
+        frames = _sheet_frames_from_range(project, arguments)
+    cell = _within(arguments, "cell_width", SHEET_DEFAULT_CELL, MIN_CELL_WIDTH, MAX_CELL_WIDTH)
+    return _draw_sheet(host, project, frames, cell, arguments, "コンタクトシート")
+
+
+def _preview_range(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """動きを確かめる 続いたコマ（step おき）を 1 枚に並べる"""
+    project = _project(host)
+    last = project.duration - 1
+    if last < 0:
+        raise ToolError("タイムラインが空です 描くコマがありません")
+    start = _whole_number(arguments, "start_frame", host.playhead)
+    if not 0 <= start <= last:
+        raise ToolError(f"start_frame（{start}）はタイムラインの外です（0〜{last}）")
+    count = _within(arguments, "count", RANGE_DEFAULT_COUNT, 2, RANGE_MAX_COUNT)
+    step = _within(arguments, "step", 1, 1, max(1, project.duration))
+    # 終わりを越えた分は描かない 越えた所は黒いだけで、動きの確かめにならない
+    frames = [frame for frame in range(start, start + count * step, step) if frame <= last]
+    if len(frames) < 2:
+        # 1 コマだけの 1 枚は動きを示さない 返すと AI は止まった絵だと読み違える
+        raise ToolError(
+            f"start_frame {start} から step {step} おきでは、終わり（{last}）までに描けるのが"
+            f" {len(frames)} コマです 動きを見るには 2 コマ以上要ります start_frame を前へ"
+            " 戻すか、step を小さくしてください"
+        )
+    cell = _within(arguments, "cell_width", RANGE_DEFAULT_CELL, MIN_CELL_WIDTH, MAX_CELL_WIDTH)
+    # 終わりで足りなくなった分は黙って減らさず、返事に書く 書かないと、AI は頼んだ枚数を
+    # 見たつもりで、その先の動きについて判断する
+    note = ""
+    if len(frames) < count:
+        note = f" 頼んだ {count} コマのうち {len(frames)} コマ（タイムラインの終わり {last} まで）"
+    return _draw_sheet(
+        host,
+        project,
+        frames,
+        cell,
+        arguments,
+        "範囲のコマ",
+        default_columns=RANGE_DEFAULT_COLUMNS,
+        note=note,
+    )
+
+
+def _draw_sheet(
+    host: EditorHost,
+    project: Project,
+    frames: list[int],
+    cell_width: int,
+    arguments: dict[str, Any],
+    title: str,
+    *,
+    default_columns: int | None = None,
+    note: str = "",
+) -> object:
+    """並べ方を決めて、描き始める 描くのは :class:`Continue` で 1 回ずつ（時間で区切る）"""
+    columns = default_columns
+    if arguments.get("columns") is not None:
+        columns = _whole_number(arguments, "columns", 0)
+    try:
+        layout = sheet_layout(
+            len(frames),
+            cell_width=cell_width,
+            frame_size=project.settings.resolution,
+            columns=columns,
+        )
+    except SheetError as exc:
+        # 並べ方の文面は直し方まで書いてある そのまま AI へ返す
+        raise ToolError(str(exc)) from exc
+    labels = [f"{format_timecode(frame, project.rate)} {frame}" for frame in frames]
+    # 再生しながら別のコマを描くと GL の資源を取り合う（preview_frame と同じ）
+    host.stop_playback()
+    canvas = host.start_sheet(layout)
+    caption = (
+        f"{title} {len(frames)} コマ（{layout.columns} 列 x {layout.rows} 行 左上から右へ"
+        f" {layout.width}x{layout.height} 画素）{note} 各コマの下に「タイムコード フレーム」: "
+        + " / ".join(f"{index + 1}) {label}" for index, label in enumerate(labels))
+    )
+    position = 0
+
+    def step() -> object:
+        nonlocal position
+        started = time.monotonic()
+        # 1 コマは必ず描く 描く前に時間で止めると、1 コマが重い作品で先へ進まない
+        while position < len(frames):
+            canvas.draw(position, frames[position], labels[position])
+            position += 1
+            if time.monotonic() - started >= SHEET_SLICE_SECONDS:
+                break
+        if position < len(frames):
+            return Continue(step)
+        return ImageResult(png=canvas.png(), caption=caption)
+
+    return Continue(step)
 
 
 def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -1528,7 +1802,9 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     raw = arguments.get("paths") or []
     if isinstance(raw, str):
         raw = [raw]
-    paths = [Path(str(entry)) for entry in raw]
+    if not isinstance(raw, list):
+        raise ToolError("paths はファイルパスの配列で渡してください")
+    paths = [Path(entry) for entry in _string_items(raw, "paths")]
     if not paths:
         raise ToolError("paths が空です")
 
@@ -2211,8 +2487,15 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
             voices = [(media.id, media.transcript_stream(_audio_stream(media, arguments)))]
         else:
             voices = [v for v in subtitle_voices(project) if v[0] == media.id]
+    _no_explicit_null(arguments, "segment_ids")
     raw_segments = arguments.get("segment_ids")
-    segments = {SegmentId(str(s)) for s in raw_segments} if raw_segments else None
+    if raw_segments is not None and not isinstance(raw_segments, list):
+        raise ToolError(
+            "segment_ids は字幕の ID（get_subtitles の segment_id）の配列で渡してください"
+        )
+    segments = (
+        {SegmentId(s) for s in _string_items(raw_segments, "segment_ids")} if raw_segments else None
+    )
 
     # 画面の〔焼き込み〕と同じ既定 作品の高さに合わせて縮める
     settings = project.settings
@@ -3002,13 +3285,75 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FRAMES,
     ),
     Operation(
+        name="contact_sheet",
+        description=(
+            "何コマも 1 枚に並べた画像で、全体を見渡す（コンタクトシート） 既定はタイムライン"
+            "全体を 12 等分した真ん中のコマ from_frame・to_frame で区切るか、frames で見たい"
+            "コマ（場面の切り替わりの一覧など）を直に渡す 各コマの下にタイムコードとフレーム"
+            "番号を書く 当たりを付けたら preview_frame で 1 コマを大きく見る"
+            f" 1 枚の長い辺は {MAX_SHEET_EDGE} 画素までで、超えるときは升を縮める"
+        ),
+        schema=_schema(
+            {
+                "frames": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        f"並べるフレーム（{SHEET_MAX_COUNT} 個まで） 渡すと from_frame・"
+                        "to_frame・count は使わない"
+                    ),
+                },
+                "from_frame": _integer("見渡す範囲の頭（既定 0）"),
+                "to_frame": _integer("見渡す範囲の終わり このフレームの前まで（既定 終わりまで）"),
+                "count": _integer(
+                    f"並べる枚数（1〜{SHEET_MAX_COUNT}、既定 {SHEET_DEFAULT_COUNT}）"
+                ),
+                "cell_width": _integer(
+                    f"1 コマの横幅（{MIN_CELL_WIDTH}〜{MAX_CELL_WIDTH}、既定 {SHEET_DEFAULT_CELL}）"
+                ),
+                "columns": _integer(f"列の数（1〜{MAX_COLUMNS}） 省くと升が大きく取れる数"),
+            }
+        ),
+        handler=_contact_sheet,
+        # 絵（何コマも並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
+        sends=_WITH_FRAMES,
+    ),
+    Operation(
+        name="preview_range",
+        description=(
+            "続いたコマを 1 枚に並べた画像で、動きを確かめる（場面切り替え・キーフレーム・"
+            "字幕の出入りなど） start_frame から step おきに count 枚 各コマの下に"
+            "タイムコードとフレーム番号を書く 終わりを越える分は描かず、減らしたことを返事に"
+            "書く 2 コマ未満になる頼みは断る 長い範囲を見渡すときは contact_sheet を使う"
+        ),
+        schema=_schema(
+            {
+                "start_frame": _integer("頭のフレーム 省くと再生ヘッド"),
+                "count": _integer(
+                    f"並べる枚数（2〜{RANGE_MAX_COUNT}、既定 {RANGE_DEFAULT_COUNT}）"
+                ),
+                "step": _integer("何フレームおきに取るか（既定 1 = 1 コマずつ）"),
+                "cell_width": _integer(
+                    f"1 コマの横幅（{MIN_CELL_WIDTH}〜{MAX_CELL_WIDTH}、既定 {RANGE_DEFAULT_CELL}）"
+                ),
+                "columns": _integer(
+                    f"列の数（1〜{MAX_COLUMNS}、既定 {RANGE_DEFAULT_COLUMNS}） 左上から右へ時間順"
+                ),
+            }
+        ),
+        handler=_preview_range,
+        # 絵（続いたコマを並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
+        sends=_WITH_FRAMES,
+    ),
+    Operation(
         name="detect_scenes",
         description=(
             "素材（動画）の場面の切り替わり（カット）の位置を一覧する フレーム間の差から"
             "探すので、映像を 1 枚ずつ見るより速い 見つけた位置の前後だけを preview_frame で"
             "確かめる 位置は素材の秒（source_seconds）で、切り替わりは after_seconds との間に"
-            "ある timeline はその場面の最初の絵が出るタイムラインのフレーム（preview_frame へ"
-            "そのまま渡せる 今のタイムラインに置いていなければ空） 解析は素材を読み込んだときに"
+            "ある timeline はその場面の最初の絵が出るタイムラインのフレーム（preview_frame や"
+            "contact_sheet の frames へそのまま渡せる 今のタイムラインに置いていなければ空）"
+            " 解析は素材を読み込んだときに"
             "裏で始まり、結果は覚える 終わっていなければ wait_seconds まで待ち、それでも"
             "終わらなければ読んだ所までを返す（complete が false） 映像が何本もある素材は"
             "先頭の映像（video_stream）を調べ、timeline にはその映像を出すクリップだけを載せる"
