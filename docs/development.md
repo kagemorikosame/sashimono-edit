@@ -314,7 +314,9 @@ AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.b
   割らない
 - 印は `Document.execute` `checkpoint` `begin_checkpoint` の `by` で付ける 省くと開いている段の印を継ぐ
   （段の外なら人） 編集画面の人の操作は `Author.PERSON`、AI の道具（`apply_commands`）と AI パネルの
-  指示の段は `Author.AI` を書く 書き忘れると、AI の指示の途中の人の変更が AI の段に混ざる アプリが
+  指示の段は `Author.AI` を書く 書き忘れると、AI の指示の途中の人の変更が AI の段に混ざる
+  `tests/ui/test_history_authors.py` がコアの外のソースを読み、`checkpoint` `begin_checkpoint` と、
+  まとめの `with` の外の `execute` が `by` を書いているかを見張る（書き忘れると落ちる） アプリが
   自分で当てる変更（字幕起こしの結果など）は人の側に数える
 
 ### AI に見せる画像の量と、長い道具の分け方（#320）
