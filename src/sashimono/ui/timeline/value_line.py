@@ -25,19 +25,17 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu
 
 from sashimono.core.commands import (
-    AddEffect,
     Command,
     MoveKeyframe,
     ParamPath,
     RemoveKeyframe,
     SetParam,
 )
-from sashimono.core.commands.fixed import VOLUME_EFFECT_KIND, fixed_effect, fixed_slot
+from sashimono.core.commands.volume import clip_volume, fixed_volume, volume_command
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
-    Effect,
     MediaItem,
     Project,
     Track,
@@ -143,24 +141,11 @@ def value_kinds(track: Track, clip: Clip, project: Project) -> tuple[ValueKind, 
     return tuple(kinds)
 
 
-def _fixed_volume(clip: Clip) -> Effect | None:
-    return next((e for e in clip.effects if e.fixed and e.kind == VOLUME_EFFECT_KIND), None)
-
-
-def _animated(value: object, default: float) -> AnimatedValue:
-    if isinstance(value, AnimatedValue):
-        return value
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return AnimatedValue(static=float(value))
-    return AnimatedValue(static=default)
-
-
 def value_of(clip: Clip, kind: ValueKind) -> AnimatedValue:
     """線に出す値 固定の音量をまだ持たない古いクリップは 100%（音を変えない値）として描く"""
     if kind is ValueKind.OPACITY:
         return clip.opacity
-    effect = _fixed_volume(clip)
-    return _animated(effect.params.get("volume") if effect is not None else None, 100.0)
+    return clip_volume(clip)
 
 
 def line_area(rect: QRect) -> QRect | None:
@@ -214,23 +199,19 @@ def _path(clip: Clip, kind: ValueKind) -> ParamPath | None:
     """値の在りか 固定の音量をまだ持たないクリップは ``None``"""
     if kind is ValueKind.OPACITY:
         return ParamPath.of_clip(clip.id, "opacity")
-    effect = _fixed_volume(clip)
+    effect = fixed_volume(clip)
     return None if effect is None else ParamPath.of_effect(clip.id, effect.id, "volume")
 
 
 def _set_value(clip: Clip, kind: ValueKind, value: AnimatedValue) -> Command:
     """値を丸ごと差し替える命令
 
-    固定の音量をまだ持たない古いクリップは、値を入れた固定の音量を足す 1 つの命令にする
-    足すのと値を変えるのを分けると、取り消しが 2 段になり、1 回戻すと 100% の音量調整だけが残る
+    音量は AI の音量の道具（#329）と同じ所で作る（:func:`volume_command`） 固定の音量を
+    まだ持たない古いクリップは、値を入れた固定の音量を足す 1 つの命令になる
     """
-    path = _path(clip, kind)
-    if path is not None:
-        return SetParam(path, value)
-    # 差し込む位置は置いたときと同じ決まり（fixed_slot） 自前で決めると、固定の項目どうしの
-    # 並び（反転 → 配置 → 音量 → フェード）が置いたクリップと食い違う
-    effect = fixed_effect(VOLUME_EFFECT_KIND).with_param("volume", value)
-    return AddEffect(clip.id, effect, index=fixed_slot(clip.effects, VOLUME_EFFECT_KIND))
+    if kind is ValueKind.OPACITY:
+        return SetParam(ParamPath.of_clip(clip.id, "opacity"), value)
+    return volume_command(clip, value)
 
 
 @dataclass(slots=True)
