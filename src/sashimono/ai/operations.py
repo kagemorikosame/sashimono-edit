@@ -3558,15 +3558,9 @@ def _place_template(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"{entry.label} に置けるオブジェクトがありません"
             "（エフェクトだけのテンプレートは apply_template でテキストに着せる）"
         )
-    try:
-        host.apply_commands(list(placement.commands), "テンプレートを配置")
-    except ToolError as exc:
-        # 棚の窓から置くのと同じく、元のレイヤー n を n 本目のトラックへ置く そこに今ある
-        # クリップと重なると断られる 理由だけ返すと、AI は何を変えれば置けるか分からない
-        raise ToolError(
-            f"{exc} 元のレイヤーの並びで置くと、今あるクリップと重なります 空いたトラック"
-            "（add_track で足せる）を track_id に渡すか、at_frame を空いた所にしてください"
-        ) from exc
+    # 元のレイヤーの所が埋まっていれば、置く段取りが一番手前の新しいトラックへ並べ替えてある
+    # （2026-10-17 本人の決定 :mod:`sashimono.compat.layers`） 重なって断られることは無い
+    host.apply_commands(list(placement.commands), "テンプレートを配置")
     # 解析と控えは取り消しても止まらない 入ったことを確かめてから頼む（画面と同じ）
     for media in placement.plan.added:
         host.analyze(media)
@@ -4724,7 +4718,8 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "テンプレートの棚の 1 本（AviUtl のエイリアス・YMM4 のアイテムテンプレート）を置く"
             " 互換の〔テンプレート…〕の〔置く〕と同じ 指している画像や音声も素材として登録する"
-            " 取り消し 1 回で素材ごと戻る"
+            " 元のレイヤーの所が埋まっていれば、全部を一番手前の新しいトラックへ上下の並びのまま"
+            "置く 取り消し 1 回で素材ごと戻る"
         ),
         schema=_schema(
             {
@@ -4732,6 +4727,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "at_frame": _integer("置く位置 省けば再生ヘッド"),
                 "track_id": _string(
                     "置くトラック 置く物が 1 つでそこが空いていれば使う 省けば元のレイヤーの並び"
+                    "（埋まっていれば一番手前の新しいトラック）"
                 ),
             },
             ["template_id"],
@@ -4763,7 +4759,8 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "AviUtl のオブジェクトのファイル（.exo .exa .exo2 .exa2 .object）を読み込んで置く"
             " 互換の〔オブジェクトを読み込む…〕と同じ 元のレイヤーの並びのまま頭から置き、"
-            "指している素材も登録する 取り消し 1 回で素材ごと戻る"
+            "指している素材も登録する 元のレイヤーの所が埋まっていれば、全部を一番手前の新しい"
+            "トラックへ上下の並びのまま置く 取り消し 1 回で素材ごと戻る"
         ),
         schema=_schema({"path": _string("読み込むファイルの場所")}, ["path"]),
         handler=_import_objects,

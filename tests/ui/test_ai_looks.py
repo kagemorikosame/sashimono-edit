@@ -25,7 +25,7 @@ from sashimono.core.model import AnimatedValue, Clip, Project, Track, TrackKind
 from sashimono.effects import registry
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
-from tests.ai.test_look_tools import _SUBTITLE_OBJECT
+from tests.ai.test_look_tools import _EXO_TWO_LAYERS, _SUBTITLE_OBJECT
 from tests.compat.test_subtitle_looks import _styled_alias
 
 
@@ -152,3 +152,69 @@ class TestPlacingThroughTheWindow:
         assert worn.source is not None
         assert worn.source.params["text"] == "一つ目"
         assert worn.source.params["size"] == AnimatedValue(88.0)
+
+
+def _two_layers(tmp_path: Path) -> TemplateEntry:
+    """レイヤー 1 に小さい字、レイヤー 2 に大きい字の ``.exo`` を、棚の 1 本として読む"""
+    folder = tmp_path / "二段"
+    folder.mkdir()
+    (folder / "二段.exo").write_text(_EXO_TWO_LAYERS, encoding="utf-8")
+    (entry,) = TemplateCatalog().scan((folder,))
+    return entry
+
+
+def _new_tracks(window: MainWindow, before: Project) -> list[list[float]]:
+    """足したトラックごとの、置いたテキストの大きさ 並び（奥から手前）の順"""
+    old = {track.id for track in before.timeline.tracks}
+    found: list[list[float]] = []
+    for track in window.document.project.timeline.tracks:
+        if track.id in old:
+            assert track == before.timeline.find_track(track.id), "前からあるトラックが変わった"
+            continue
+        sizes: list[float] = []
+        for clip in track.clips:
+            assert clip.source is not None
+            size = clip.source.params["size"]
+            assert isinstance(size, AnimatedValue)
+            sizes.append(size.static)
+        found.append(sizes)
+    return found
+
+
+class TestCrowdedLayers:
+    """元のレイヤーの所が埋まっているとき（2026-10-17 本人の決定 一番手前の新しいトラックへ）"""
+
+    def test_the_shelf_puts_everything_in_front(self, window: MainWindow, tmp_path: Path) -> None:
+        # 壊れると、字幕のある所へ棚のテンプレートを置くだけで、重なって断られる
+        entry = _two_layers(tmp_path)
+        before = window.document.project
+        assert window.place_template_entry(entry, 30)
+        assert _new_tracks(window, before) == [[40.0], [80.0]]
+        window.document.undo()
+        assert window.document.project == before
+
+    def test_reading_objects_puts_everything_in_front(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、クリップのある作品へ〔オブジェクトを読み込む…〕で読むと、重なって断られる
+        source = _two_layers(tmp_path).path
+        # ファイルを選ぶ窓だけは選んだことにする（ほかの窓が開けば落ちる）
+        monkeypatch.setattr(
+            QFileDialog, "getOpenFileName", staticmethod(lambda *_a, **_k: (str(source), ""))
+        )
+        before = window.document.project
+        window.import_exo()
+        assert _new_tracks(window, before) == [[40.0], [80.0]]
+        window.document.undo()
+        assert window.document.project == before
+
+    def test_the_ai_places_the_same_way(self, window: MainWindow, tmp_path: Path) -> None:
+        # 壊れると、人が棚から置いた並びと、AI が置いた並びが食い違う
+        entry = _two_layers(tmp_path)
+        window._timeline.add_sources.templates = lambda: (entry,)
+        before = window.document.project
+        _run(window, "place_template", template_id=template_choice(entry).key, at_frame=30)
+        assert _new_tracks(window, before) == [[40.0], [80.0]]
+        window.document.undo()
+        _run(window, "import_objects", path=str(entry.path))
+        assert _new_tracks(window, before) == [[40.0], [80.0]]

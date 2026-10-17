@@ -26,6 +26,7 @@ from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
+    LayerMode,
     MediaItem,
     Project,
     ProjectSettings,
@@ -75,6 +76,56 @@ _EFFECT_OBJECT = "\n".join(
         "",
     ]
 )
+
+#: レイヤー 1 に小さい字、レイヤー 2 に大きい字を置いた ``.exo``（AviUtl1 の形）
+#: 元のレイヤーが埋まっているとき、上下の並び（2 が手前）を保って新しいトラックへ置くかを見る
+_EXO_TWO_LAYERS = """[exedit]
+width=1920
+height=1080
+rate=30
+scale=1
+length=300
+audio_rate=44100
+audio_ch=2
+[0]
+start=1
+end=60
+layer=1
+overlay=1
+camera=0
+[0.0]
+_name=テキスト
+サイズ=40
+text=53004b0055005400
+[0.1]
+_name=標準描画
+X=0.0
+Y=0.0
+Z=0.0
+拡大率=100.00
+透明度=0.0
+回転=0.00
+blend=0
+[1]
+start=1
+end=60
+layer=2
+overlay=1
+camera=0
+[1.0]
+_name=テキスト
+サイズ=80
+text=53004b0055005400
+[1.1]
+_name=標準描画
+X=0.0
+Y=0.0
+Z=0.0
+拡大率=100.00
+透明度=0.0
+回転=0.00
+blend=0
+"""
 
 #: 画像を 1 つ参照する ``.exo``（AviUtl1 の形） 素材の登録と配置が 1 回の取り消しになるかを見る
 _EXO_IMAGE = """[exedit]
@@ -148,15 +199,36 @@ def _yellow_preset(host: FakeHost, name: str = "黄色", category: str = "ユー
 
 
 def _shelf_entry(
-    tmp_path: Path, folder: str = "字幕", name: str = "大きい", text: str = _SUBTITLE_OBJECT
+    tmp_path: Path,
+    folder: str = "字幕",
+    name: str = "大きい",
+    text: str = _SUBTITLE_OBJECT,
+    suffix: str = ".object",
 ) -> TemplateEntry:
     """棚の 1 本 置き場は試験ごとの一時フォルダ（本人の AviUtl2 の置き場は読まない）"""
     shelf = tmp_path / name
     (shelf / folder).mkdir(parents=True, exist_ok=True)
-    (shelf / folder / f"{name}.object").write_text(text, encoding="utf-8")
+    (shelf / folder / f"{name}{suffix}").write_text(text, encoding="utf-8")
     catalog = TemplateCatalog()
     (entry,) = catalog.scan((shelf,))
     return entry
+
+
+def _sizes_in_new_tracks(host: FakeHost, before: Project) -> list[float]:
+    """足したトラックに置かれたテキストの大きさ トラックの並び（奥から手前）の順"""
+    old = {track.id for track in before.timeline.tracks}
+    sizes: list[float] = []
+    for track in host.document.project.timeline.tracks:
+        if track.id in old:
+            # 前からあるトラックには何も足さない
+            assert track == before.timeline.find_track(track.id)
+            continue
+        for clip in track.clips:
+            assert clip.source is not None
+            size = clip.source.params["size"]
+            assert isinstance(size, AnimatedValue)
+            sizes.append(size.static)
+    return sizes
 
 
 def _template_id(entry: TemplateEntry) -> str:
@@ -430,19 +502,35 @@ class TestShelf:
         with pytest.raises(ToolError, match="読めた効果"):
             run(host, "apply_template", template_id=_template_id(entry), clip_id=str(clip.id))
 
-    def test_a_crowded_layer_says_how_to_place_it(self, host: FakeHost, tmp_path: Path) -> None:
-        # 壊れると、元のレイヤーの所に動画があるだけで断られ、AI は何を変えれば置けるか分からない
-        entry = _shelf_entry(tmp_path)
+    def test_a_crowded_layer_goes_to_new_tracks_in_front(
+        self, host: FakeHost, tmp_path: Path
+    ) -> None:
+        # 壊れると、元のレイヤーの所に動画があるだけで棚の配置が断られる（2026-10-17 本人の決定で
+        # 一番手前の新しいトラックへ上下の並びのまま置く）
+        entry = _shelf_entry(tmp_path, name="二段", text=_EXO_TWO_LAYERS, suffix=".exo")
         host.shelf = [entry]
         before = host.document.project
-        with pytest.raises(ToolError, match="track_id"):
-            run(host, "place_template", template_id=_template_id(entry), at_frame=30)
+        result = run(host, "place_template", template_id=_template_id(entry), at_frame=30)
+        assert result["placed"] == 2
+        assert _sizes_in_new_tracks(host, before) == [40.0, 80.0]
+        run(host, "undo")
         assert host.document.project == before
-        free = run(host, "add_track", kind="video")["track_id"]
-        result = run(
-            host, "place_template", template_id=_template_id(entry), at_frame=30, track_id=free
+
+    def test_a_crowded_layer_in_a_mixed_project_goes_to_new_layers(self, tmp_path: Path) -> None:
+        # 壊れると、レイヤーの方式の作品で、元のレイヤーが埋まっているだけで棚の配置が断られる
+        settings = ProjectSettings(frame_rate=FrameRate(30), layer_mode=LayerMode.MIXED)
+        base = Project.create(settings)
+        busy = Track(TrackKind.MIXED, "レイヤー 1", (_text_clip("前からある", duration=300),))
+        host = FakeHost(base.with_timeline(replace(base.timeline, tracks=(busy,))))
+        entry = _shelf_entry(tmp_path, name="二段", text=_EXO_TWO_LAYERS, suffix=".exo")
+        host.shelf = [entry]
+        before = host.document.project
+        assert (
+            run(host, "place_template", template_id=_template_id(entry), at_frame=30)["placed"] == 2
         )
-        assert result["placed"] == 1
+        assert _sizes_in_new_tracks(host, before) == [40.0, 80.0]
+        run(host, "undo")
+        assert host.document.project == before
 
     def test_an_unknown_id_says_where_to_look(self, host: FakeHost) -> None:
         # 壊れると、AI は名前を ID の代わりに渡したまま、何を直せばよいか分からない
@@ -481,6 +569,32 @@ class TestShelf:
 
 
 class TestImportObjects:
+    def test_a_crowded_layer_goes_to_new_tracks_in_front(
+        self, host: FakeHost, tmp_path: Path
+    ) -> None:
+        # 壊れると、動画のある作品へ AviUtl のファイルを読むと、元のレイヤーの所で重なって断られる
+        source = tmp_path / "二段.exo"
+        source.write_text(_EXO_TWO_LAYERS, encoding="utf-8")
+        before = host.document.project
+        assert run(host, "import_objects", path=str(source))["placed"] == 2
+        assert _sizes_in_new_tracks(host, before) == [40.0, 80.0]
+        run(host, "undo")
+        assert host.document.project == before
+
+    def test_a_crowded_layer_in_a_mixed_project_goes_to_new_layers(self, tmp_path: Path) -> None:
+        # 壊れると、レイヤーの方式の作品でも、元のレイヤーが埋まっていると読み込みが断られる
+        settings = ProjectSettings(frame_rate=FrameRate(30), layer_mode=LayerMode.MIXED)
+        base = Project.create(settings)
+        busy = Track(TrackKind.MIXED, "レイヤー 1", (_text_clip("前からある", duration=300),))
+        host = FakeHost(base.with_timeline(replace(base.timeline, tracks=(busy,))))
+        source = tmp_path / "二段.exo"
+        source.write_text(_EXO_TWO_LAYERS, encoding="utf-8")
+        before = host.document.project
+        assert run(host, "import_objects", path=str(source))["placed"] == 2
+        assert _sizes_in_new_tracks(host, before) == [40.0, 80.0]
+        run(host, "undo")
+        assert host.document.project == before
+
     def test_media_and_clips_undo_together(self, tmp_path: Path) -> None:
         # 壊れると、戻したときに使われていない素材だけが素材一覧に残る
         host = _empty_host()
