@@ -384,6 +384,18 @@ class TestDuck:
             )
         assert work.host.document.project == before
 
+    def test_an_explicit_null_is_refused(self, work: _Work) -> None:
+        # 壊れると、clip_ids に null を渡した頼みが、トラックごと下げる頼みに化ける
+        with pytest.raises(ToolError, match="null"):
+            _run(
+                work.host,
+                "duck_audio",
+                clip_ids=None,
+                track_id=str(work.bgm_track.id),
+                voice_clip_ids=[str(work.voice.id)],
+            )
+        assert work.host.document.project == work.project
+
     def test_both_ways_of_naming_are_refused(self, work: _Work) -> None:
         # 壊れると、clip_ids と track_id のどちらで下げたのか分からない
         with pytest.raises(ToolError, match="どちらか 1 つ"):
@@ -455,6 +467,12 @@ class TestNormalize:
         assert request.project is not None
         clips = [c.id for t in request.project.timeline.tracks for c in t.clips]
         assert clips == [work.voice.id]
+
+    def test_an_explicit_null_is_not_the_whole_work(self, work: _Work) -> None:
+        # 壊れると、clip_ids に null を渡した AI の頼みで、作品全体の音量が変わる
+        with pytest.raises(ToolError, match="null"):
+            _run(work.host, "normalize_loudness", clip_ids=None, wait_seconds=0)
+        assert work.host.check_requests == []
 
     def test_the_target_follows_the_preference(self, work: _Work) -> None:
         # 壊れると、放送向けに -23 を選んだ人の作品を配信の -14 へそろえる

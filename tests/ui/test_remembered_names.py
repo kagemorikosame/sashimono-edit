@@ -61,6 +61,8 @@ PROJECT_SIDE = {
     "apply_commands",
     "stop_playback",
     "render_png",
+    # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く
+    "start_sheet",
     "probe",
     "splits_media",
     "subtitle_wrap_share",

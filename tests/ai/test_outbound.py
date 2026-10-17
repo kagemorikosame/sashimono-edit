@@ -134,6 +134,9 @@ class TestDeclarations:
     def test_the_preview_is_declared_as_sending_frames(self) -> None:
         # 壊れると、プレビューの絵を同意なしで送る（この Issue の中心）
         assert Outbound.FRAMES in _operation("preview_frame").sends
+        # 何コマも並べた 1 枚も同じ絵（#320）
+        assert Outbound.FRAMES in _operation("contact_sheet").sends
+        assert Outbound.FRAMES in _operation("preview_range").sends
         assert Outbound.TEXT in _operation("get_subtitles").sends
         assert Outbound.FILES in _operation("list_media").sends
 
