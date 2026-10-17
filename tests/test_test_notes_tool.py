@@ -123,6 +123,30 @@ class TestInheritedTests:
             found = tool.scan(path, reader)
             assert [(item.path.name, item.name) for item in found] == [("shared.py", "test_a")]
 
+    def test_a_base_published_by_a_package_is_followed(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # パッケージの __init__.py で読み込み直して公開した基底を辿らないと、置き場を
+        # 1 段深くしただけで書き添えの無い試験が見張りをすり抜ける（#377 の CodeRabbit）
+        package = tmp_path / "tests" / "shared"
+        package.mkdir(parents=True)
+        (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (package / "__init__.py").write_text("from .checks import Checks\n", encoding="utf-8")
+        (package / "checks.py").write_text(
+            "class Checks:\n    def test_a(self):\n        assert True\n", encoding="utf-8"
+        )
+        # 互いを読み込む輪でも止まらずに終わること
+        (package / "loop.py").write_text("from .loop import Loop\n", encoding="utf-8")
+        path = tmp_path / "tests" / "test_published.py"
+        path.write_text(
+            "from tests.shared import Checks\nfrom tests.shared.loop import Loop\n"
+            "class TestReal(Checks):\n    pass\n"
+            "class TestLoop(Loop):\n    pass\n",
+            encoding="utf-8",
+        )
+        found = tool.scan(path, tool.Reader(tmp_path))
+        assert [(item.path.name, item.name) for item in found] == [("checks.py", "test_a")]
+
     def test_an_overridden_test_counts_only_once(self, tool: ModuleType, tmp_path: Path) -> None:
         # 子が同じ名前で書き直した試験は pytest が子の物だけを集める 基底の物まで求めると、
         # 走らない試験に書き添えを強いて verify が落ちる

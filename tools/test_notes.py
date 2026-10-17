@@ -171,23 +171,34 @@ class Reader:
         """基底クラスの定義 同じファイルの直下のクラスか、from で読み込んだクラス"""
         if not isinstance(base, ast.Name):
             return None
+        return self._resolve(module, base.id, frozenset())
+
+    def _resolve(
+        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]]
+    ) -> tuple[_Module, ast.ClassDef] | None:
+        """名前をクラスの定義まで辿る 読み込み先でも同じ手順で解き直す
+
+        読み込み先の直下だけを探すと、パッケージの ``__init__.py`` で読み込み直して
+        公開した基底を見落とし、置き場を 1 段深くしただけで見張りをすり抜ける
+        ``visiting`` はファイル同士が互いを読み込む輪で止まらなくならないため
+        """
+        key = (module.path, name)
+        if key in visiting:
+            return None
+        visiting = visiting | {key}
         for node in module.tree.body:
-            if isinstance(node, ast.ClassDef) and node.name == base.id:
+            if isinstance(node, ast.ClassDef) and node.name == name:
                 return module, node
         for node in module.tree.body:
             if not isinstance(node, ast.ImportFrom):
                 continue
             for alias in node.names:
-                if (alias.asname or alias.name) != base.id:
+                if (alias.asname or alias.name) != name:
                     continue
                 source = self._source(module.path, node)
                 if source is None:
                     return None
-                imported = self.module(source)
-                for item in imported.tree.body:
-                    if isinstance(item, ast.ClassDef) and item.name == alias.name:
-                        return imported, item
-                return None
+                return self._resolve(self.module(source), alias.name, visiting)
         return None
 
     def _source(self, path: Path, node: ast.ImportFrom) -> Path | None:
