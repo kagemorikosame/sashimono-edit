@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 
 import pytest
@@ -12,13 +13,23 @@ from sashimono.core.commands.volume import clip_volume, volume_command, volume_c
 from sashimono.core.mixing import (
     VOLUME_LIMIT,
     DuckShape,
+    audible_clips,
     db_to_ratio,
     duck_curve,
     loudest,
     scaled_volume,
     speech_frames,
 )
-from sashimono.core.model import AnimatedValue, Clip, Keyframe, MediaId
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Keyframe,
+    MediaId,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+)
 from sashimono.core.timebase import FrameRate
 
 RATE = FrameRate(30)
@@ -164,3 +175,23 @@ class TestVolumeCommands:
         assert isinstance(command, SetParam)
         assert command.path.effect_id == volume.id
         assert clip_volume(clip).static == 100.0
+
+
+class TestAudible:
+    def _project(self, *tracks: Track) -> Project:
+        base = Project.create(ProjectSettings(frame_rate=RATE))
+        return base.with_timeline(replace(base.timeline, tracks=tracks))
+
+    def test_it_follows_the_mixer(self) -> None:
+        # 壊れると、ミキサが鳴らさない音（ソロで外れた・ミュート・無効）を測って音量をそろえる
+        on = Clip(timeline_start=0, duration=30, media_id=MediaId("a"))
+        off = Clip(timeline_start=30, duration=30, media_id=MediaId("a"), enabled=False)
+        soloed = Track(kind=TrackKind.AUDIO, name="声", clips=(on, off), solo=True)
+        other = Track(
+            kind=TrackKind.AUDIO,
+            name="BGM",
+            clips=(Clip(timeline_start=0, duration=30, media_id=MediaId("b")),),
+        )
+        assert [c.id for _, c in audible_clips(self._project(soloed, other))] == [on.id]
+        muted = replace(soloed, solo=False, muted=True)
+        assert [c.id for _, c in audible_clips(self._project(muted, other))] == [other.clips[0].id]

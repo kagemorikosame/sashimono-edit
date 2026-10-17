@@ -112,6 +112,7 @@ from sashimono.core.mixing import (
     loudness_gain,
     measure_project,
     plan_ducking,
+    sounds_now,
 )
 from sashimono.core.model import (
     Clip,
@@ -3459,11 +3460,12 @@ class MainWindow(QMainWindow):
         chosen = {clip.id for _, clip in targets}
         # 声のトラックの候補は、下げるクリップ以外の音を持つトラック 自分の声で自分を下げると、
         # 話している所だけ声が小さくなる
+        # 書き出しで鳴る声だけ（ミュート・ソロで外れたトラックと無効のクリップは外す AI と同じ）
         voices = [
             track
             for track in project.timeline.tracks
             if any(
-                clip.id not in chosen and project.plays_sound(track, clip) for clip in track.clips
+                clip.id not in chosen and sounds_now(project, track, clip) for clip in track.clips
             )
         ]
         if not voices:
@@ -3478,7 +3480,7 @@ class MainWindow(QMainWindow):
         voice_clips = [
             (voice_track, clip)
             for clip in voice_track.clips
-            if clip.id not in chosen and project.plays_sound(voice_track, clip)
+            if clip.id not in chosen and sounds_now(project, voice_track, clip)
         ]
         try:
             speech = voice_speech(project, voice_clips, self.waveform)
@@ -3517,7 +3519,11 @@ class MainWindow(QMainWindow):
         choice = ask_loudness(self, float(self._preferences.check_loudness_target))
         if choice is None:
             return False
-        clips = [clip for _, clip in targets]
+        # 無効のクリップはミキサが鳴らさず測りに入らない 掛けると有効に戻したときにずれる
+        clips = [clip for _, clip in targets if clip.enabled]
+        if not clips:
+            self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
+            return False
         request = CheckRequest(
             CheckLimits(loudness_target=choice.target, kinds=frozenset({LOUDNESS})),
             project=measure_project(project, (clip.id for clip in clips)),

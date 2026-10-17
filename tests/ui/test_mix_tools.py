@@ -22,7 +22,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, Q
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddClip, SetTrackState
+from sashimono.core.commands import AddClip, SetClipProperty, SetTrackState
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume
 from sashimono.core.mixing import (
@@ -354,6 +354,35 @@ class TestRightClick:
         # 取り消し 1 回で戻る
         by_hand.document.undo()
         assert by_hand.document.project == project
+
+    def test_a_muted_voice_is_not_offered(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、書き出しで鳴らない声のトラックを選べて、声が無いのに BGM だけが下がる
+        # 窓の差し替えの中で落とすと Qt が例外を飲むので、呼ばれたかを数えて後で見る
+        asked: list[object] = []
+        monkeypatch.setattr(main_window_module, "ask_duck", lambda *args: asked.append(args))
+        project, voice, bgm = _project(media)
+        project = SetTrackState(voice.id, muted=True).apply(project)
+        window = _window(opened, project)
+        _menu_action(window, bgm, DUCK_TEXT).trigger()
+        assert asked == []
+        assert window.document.project == project
+
+    def test_a_disabled_clip_is_not_levelled(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、鳴らない（無効の）クリップの音量まで変え、有効に戻すとそろっていない
+        monkeypatch.setattr(
+            main_window_module, "ask_loudness", lambda *_args: LoudnessChoice(-14.0)
+        )
+        project, _voice, bgm = _project(media)
+        (clip,) = next(t for t in project.timeline.tracks if t.id == bgm.id).clips
+        project = SetClipProperty(clip.id, "enabled", False).apply(project)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        assert window._pending_loudness is None
+        assert window.document.project == project
 
     def test_cancelling_changes_nothing(
         self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch

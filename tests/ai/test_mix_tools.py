@@ -17,7 +17,7 @@ import pytest
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, SetTrackState
+from sashimono.core.commands import AddClip, SetClipProperty, SetTrackState
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume, fixed_volume
 from sashimono.core.mixing import DuckShape, db_to_ratio
@@ -359,6 +359,26 @@ class TestDuck:
                 voice_track_id=str(work.voice_track.id),
             )
 
+    @pytest.mark.parametrize("silenced", ["muted", "solo_elsewhere", "disabled"])
+    def test_a_silent_voice_does_not_duck(self, work: _Work, silenced: str) -> None:
+        # 壊れると、書き出しで声が鳴らない（ミュート・ソロで外れた・無効）のに BGM だけが下がる
+        if silenced == "muted":
+            command: Any = SetTrackState(work.voice_track.id, muted=True)
+        elif silenced == "solo_elsewhere":
+            command = SetTrackState(work.bgm_track.id, solo=True)
+        else:
+            command = SetClipProperty(work.voice.id, "enabled", False)
+        work.host.apply_commands([command], "黙らせる")
+        before = work.host.document.project
+        with pytest.raises(ToolError, match="鳴りません"):
+            _run(
+                work.host,
+                "duck_audio",
+                clip_ids=[str(work.bgm.id)],
+                voice_track_id=str(work.voice_track.id),
+            )
+        assert work.host.document.project == before
+
     def test_the_voice_cannot_duck_itself(self, work: _Work) -> None:
         # 壊れると、話している所だけ声が小さくなる
         with pytest.raises(ToolError, match="重なって"):
@@ -473,6 +493,35 @@ class TestNormalize:
         with pytest.raises(ToolError, match="null"):
             _run(work.host, "normalize_loudness", clip_ids=None, wait_seconds=0)
         assert work.host.check_requests == []
+
+    def test_the_whole_work_follows_solo(self, work: _Work) -> None:
+        # 壊れると、ソロで外れて鳴らない BGM まで測りに混ぜ（測るときはソロを外すので）、
+        # 書き出す音が基準からずれる（#375 の Codex の指摘）
+        work.host.apply_commands([SetTrackState(work.voice_track.id, solo=True)], "ソロ")
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        request = work.host.check_requests[-1]
+        assert request.project is not None
+        clips = [c.id for t in request.project.timeline.tracks for c in t.clips]
+        assert clips == [work.voice.id]
+
+    def test_disabled_clips_are_left_out(self, work: _Work) -> None:
+        # 壊れると、鳴らない（無効の）クリップにも同じ dB を掛け、上限 400% の計算にも入る
+        work.host.apply_commands([SetClipProperty(work.bgm.id, "enabled", False)], "無効")
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        request = work.host.check_requests[-1]
+        assert request.project is not None
+        clips = [c.id for t in request.project.timeline.tracks for c in t.clips]
+        assert clips == [work.voice.id]
+        _measured(work.host, -20.0, -10.0)
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        assert clip_volume(work.clip(work.bgm.id)).static == 100.0
+        with pytest.raises(ToolError, match="無効"):
+            _run(
+                work.host,
+                "normalize_loudness",
+                clip_ids=[str(work.bgm.id)],
+                wait_seconds=0,
+            )
 
     def test_the_target_follows_the_preference(self, work: _Work) -> None:
         # 壊れると、放送向けに -23 を選んだ人の作品を配信の -14 へそろえる

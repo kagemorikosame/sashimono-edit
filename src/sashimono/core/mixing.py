@@ -21,7 +21,15 @@ from itertools import pairwise
 from sashimono.core.commands.base import Command
 from sashimono.core.commands.volume import clip_volume, volume_command
 from sashimono.core.jetcut import FrameRange, SourceRange
-from sashimono.core.model import AnimatedValue, Clip, ClipId, Keyframe, Project
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    ClipId,
+    Keyframe,
+    Project,
+    Track,
+    TrackKind,
+)
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
@@ -35,6 +43,7 @@ __all__ = [
     "DuckPlan",
     "DuckShape",
     "LoudnessGain",
+    "audible_clips",
     "db_to_ratio",
     "duck_curve",
     "gain_commands",
@@ -44,6 +53,7 @@ __all__ = [
     "plan_ducking",
     "ratio_to_db",
     "scaled_volume",
+    "sounds_now",
     "speech_frames",
 ]
 
@@ -309,3 +319,36 @@ def gain_commands(clips: Sequence[Clip], gain_db: float) -> list[Command]:
     """どのクリップの音量の線にも同じ dB を掛ける命令 声と BGM の釣り合いは変えない"""
     ratio = db_to_ratio(gain_db)
     return [volume_command(clip, scaled_volume(clip_volume(clip), ratio)) for clip in clips]
+
+
+def _heard_tracks(project: Project) -> set[int]:
+    """ミキサが混ぜるトラック（の ``id()``） 聞こえる音のトラックと、映る映像トラック
+
+    ミキサ（:meth:`~sashimono.engine.audio.mixer.AudioMixer.render`）と同じ並びで決める
+    映像トラックは置いたシーンの音だけを鳴らし、ソロとミュートは絵の側で見る
+    """
+    timeline = project.timeline
+    heard = {id(track) for track in timeline.active_sound_tracks()}
+    heard |= {id(t) for t in timeline.active_picture_tracks() if t.kind is TrackKind.VIDEO}
+    return heard
+
+
+def sounds_now(project: Project, track: Track, clip: Clip) -> bool:
+    """書き出しで ``clip`` の音が鳴るか ミュート・ソロ・無効（:attr:`Clip.enabled`）を見る
+
+    ミキサと同じ決まりにする 食い違うと、ソロで外れたトラックや無効にしたクリップの音まで
+    測って音量をそろえ、書き出す音が基準からずれる（#375 の Codex の指摘）
+    """
+    return clip.enabled and id(track) in _heard_tracks(project) and project.plays_sound(track, clip)
+
+
+def audible_clips(project: Project) -> list[tuple[Track, Clip]]:
+    """書き出しで音が鳴るクリップすべて（:func:`sounds_now` が真の物）"""
+    heard = _heard_tracks(project)
+    return [
+        (track, clip)
+        for track in project.timeline.tracks
+        if id(track) in heard
+        for clip in track.clips
+        if clip.enabled and project.plays_sound(track, clip)
+    ]

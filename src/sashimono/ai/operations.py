@@ -101,6 +101,7 @@ from sashimono.core.mixing import (
     DUCK_RELEASE_MS_RANGE,
     VOLUME_LIMIT,
     DuckShape,
+    audible_clips,
     db_to_ratio,
     gain_commands,
     loudest,
@@ -108,6 +109,7 @@ from sashimono.core.mixing import (
     measure_project,
     plan_ducking,
     scaled_volume,
+    sounds_now,
 )
 from sashimono.core.model import (
     AnimatedValue,
@@ -2735,6 +2737,13 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     ducked = _picked_sound_clips(host, arguments, "clip_ids", "track_id")
     voices = _picked_sound_clips(host, arguments, "voice_clip_ids", "voice_track_id", editing=False)
+    # 鳴らない声（ミュート・ソロで外れたトラック・無効のクリップ）では下げない 書き出しで
+    # 声が聞こえないのに BGM だけが下がる
+    voices = [(track, clip) for track, clip in voices if sounds_now(project, track, clip)]
+    if not voices:
+        raise ToolError(
+            "声のクリップが書き出しで鳴りません（ミュート・ソロで外れたトラックか、無効のクリップ）"
+        )
     both = {clip.id for _, clip in ducked} & {clip.id for _, clip in voices}
     if both:
         # 自分の声で自分を下げると、話している所だけ声が小さくなる
@@ -2809,13 +2818,9 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     if arguments.get("clip_ids") is None:
         # 省いたら作品全体（書き出しで鳴る音） 選択を使わないのは、「全体の音量をそろえて」で
         # たまたま選んでいた 1 本だけが変わるのを防ぐため
-        targets = [
-            _sound_clip(project, clip.id)
-            for track in project.timeline.tracks
-            if not track.muted
-            for clip in track.clips
-            if project.plays_sound(track, clip)
-        ]
+        # 書き出しで鳴る音だけ（ミキサと同じくミュート・ソロ・無効を見る） ソロで外れた
+        # トラックの音まで入れると、測るときにソロを外すので、鳴らない音まで混ぜて測る
+        targets = [_sound_clip(project, clip.id) for _, clip in audible_clips(project)]
         if not targets:
             raise ToolError("タイムラインに鳴っている音のクリップがありません")
     else:
@@ -2823,6 +2828,11 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         if not clip_ids:
             raise ToolError("clip_ids が空です 作品全体をそろえるなら省いてください")
         targets = [_sound_clip(project, clip_id) for clip_id in clip_ids]
+        # 無効にしたクリップはミキサが鳴らさないので測りに入らない 入らない物に同じ dB を
+        # 掛けると、有効に戻したときにそろえていない音量で鳴る 上限 400% の計算からも外す
+        targets = [(track, clip) for track, clip in targets if clip.enabled]
+        if not targets:
+            raise ToolError("どのクリップも無効です 有効にしてから呼んでください")
     target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
     ceiling = _limit_number(arguments, "peak_ceiling_db", -1.0, -20.0, 0.0)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
