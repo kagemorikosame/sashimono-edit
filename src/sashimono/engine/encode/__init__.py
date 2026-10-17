@@ -11,6 +11,7 @@ from sashimono.engine.encode.choices import (
     export_target,
 )
 from sashimono.engine.encode.exporter import (
+    CHAPTER_SUFFIXES,
     COLOR_OPTIONS,
     DEFAULT_PIPELINE_DEPTH,
     MAX_PIPELINE_DEPTH,
@@ -25,6 +26,7 @@ from sashimono.engine.encode.exporter import (
 
 __all__ = [
     "BITRATE_RANGE_MBPS",
+    "CHAPTER_SUFFIXES",
     "COLOR_OPTIONS",
     "CONTAINER_SUFFIXES",
     "DEFAULT_BITRATE_MBPS",

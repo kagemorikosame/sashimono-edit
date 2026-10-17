@@ -41,10 +41,13 @@ from sashimono.ai.sheet import (
     sheet_layout,
 )
 from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
+from sashimono.core.chapters import YOUTUBE_DESCRIPTION_LIMIT, chapters_of, youtube_text
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
+    MARKER_LABEL_LIMIT,
     AddClip,
     AddEffect,
+    AddMarkers,
     AddScene,
     AddStroke,
     AddTrack,
@@ -57,6 +60,7 @@ from sashimono.core.commands import (
     ParamTarget,
     RemoveClip,
     RemoveClips,
+    RemoveMarkers,
     RemoveStroke,
     RippleCut,
     SetClipProperty,
@@ -72,19 +76,23 @@ from sashimono.core.commands import (
     SubtitleTemplate,
     TrimClip,
     UngroupClips,
+    UpdateMarker,
     Voice,
     burn_defaults,
     burn_subtitles,
     export_range,
+    has_line_break,
     head_room,
     insert_generated,
     insert_media,
     insert_scene,
+    marker_at,
     new_scene,
     subtitle_voices,
     subtitle_wrap_width,
     tail_room,
     trimmable,
+    valid_marker_color,
 )
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.insert import new_track
@@ -99,6 +107,7 @@ from sashimono.core.model import (
     ClipId,
     EffectId,
     Interpolation,
+    Marker,
     MediaId,
     MediaItem,
     ParamValue,
@@ -112,7 +121,13 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.projection import project_timeline
-from sashimono.core.timebase import Rounding, format_timecode, seconds_to_frame
+from sashimono.core.timebase import (
+    FrameRate,
+    Rounding,
+    format_timecode,
+    frame_to_seconds,
+    seconds_to_frame,
+)
 from sashimono.effects import registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
@@ -1357,6 +1372,198 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
         "undo_label": document.undo_label,
         "recent": list(document.history_labels[-10:]),
     }
+
+
+# --- 目印（マーカー）とチャプター（#330）---
+
+#: 1 回で置ける目印の数 長い動画の場面ごとに置いても足りる数 これより多い頼みは、場面の
+#: 一覧をそのまま全部渡したなど取り違えのことが多く、目盛りが旗で埋まって読めなくなる
+MAX_MARKERS_PER_CALL = 200
+
+
+def _marker_row(marker: Marker, rate: FrameRate) -> dict[str, Any]:
+    return {
+        "frame": marker.frame,
+        "seconds": round(float(frame_to_seconds(marker.frame, rate)), 3),
+        "timecode": format_timecode(marker.frame, rate),
+        "label": marker.label,
+        "color": marker.color,
+    }
+
+
+def _marker_frame(value: object, name: str) -> int:
+    """目印の位置 0 以上の整数だけを受ける
+
+    小数を切り捨てて受けると、秒をフレームへ直し忘れた AI の頼みが、ずっと頭の方へ黙って
+    置かれる（2.5 秒のつもりが 2 フレーム目）
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ToolError(f"{name} は 0 以上の整数（フレーム）で渡してください: {value!r}")
+    return value
+
+
+def _marker_color(value: object) -> str:
+    # 呼ぶ側はスキーマを確かめずに渡してくる 文字にしてから見ると、形の違う値の理由が
+    # 「色の形」だけになり、何を渡し間違えたかが AI に伝わらない
+    if not isinstance(value, str) or not valid_marker_color(value):
+        raise ToolError(f"色は #RRGGBB の文字列で渡してください: {value!r}")
+    return value
+
+
+def _marker_label(value: object) -> str:
+    # 文字にして受けると、数や null が "123" "None" という名前で目次に入る
+    if not isinstance(value, str):
+        raise ToolError(f"名前は文字列で渡してください（{type(value).__name__} が来ました）")
+    label = value.strip()
+    if len(label) > MARKER_LABEL_LIMIT:
+        raise ToolError(f"名前は {MARKER_LABEL_LIMIT} 文字までです（{len(label)} 文字）")
+    # コマンドでも断るが、ここで先に断って直し方を添える 空白に直して通すと、本人の文が
+    # 黙って変わる（人の右クリックも同じく断る）
+    if has_line_break(label):
+        raise ToolError(
+            "名前に改行は入れられません 1 行の見出しにしてください（目次の 1 行が割れます）"
+        )
+    return label
+
+
+def _require_marker(host: EditorHost, frame: int) -> Marker:
+    marker = marker_at(_project(host).timeline, frame)
+    if marker is None:
+        raise ToolError(
+            f"{frame} フレームに目印がありません（list_markers で位置を確かめてください）"
+        )
+    return marker
+
+
+def _list_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    markers = sorted(project.timeline.markers, key=lambda marker: marker.frame)
+    rows = [_marker_row(marker, project.rate) for marker in markers]
+    return _paged(rows, arguments, name="markers")
+
+
+def _add_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    items = arguments.get("markers")
+    if not isinstance(items, list) or not items:
+        raise ToolError("markers に置く目印を 1 つ以上渡してください")
+    if len(items) > MAX_MARKERS_PER_CALL:
+        raise ToolError(f"1 回に置ける目印は {MAX_MARKERS_PER_CALL} 個までです（{len(items)} 個）")
+    timeline = _project(host).timeline
+    markers: list[Marker] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ToolError("markers の要素は {frame, label, color} の形で渡してください")
+        frame = _marker_frame(item.get("frame"), "frame")
+        if marker_at(timeline, frame) is not None:
+            raise ToolError(
+                f"{frame} フレームにはもう目印があります 名前や色を変えるなら update_marker を"
+                "使ってください"
+            )
+        # 既定へ回すのは省いたときだけ 値の真偽で分けると、渡し間違えた 0 や空の色が
+        # 確かめられずに黄色の目印になる
+        color = _marker_color(item["color"]) if "color" in item else Marker(frame).color
+        label = _marker_label(item["label"]) if "label" in item else ""
+        markers.append(Marker(frame, label, color))
+    host.apply_commands([AddMarkers(tuple(markers))], "マーカーを置く")
+    project = _project(host)
+    added = {marker.frame for marker in markers}
+    return {
+        "added": [
+            _marker_row(marker, project.rate)
+            for marker in project.timeline.markers
+            if marker.frame in added
+        ],
+        "marker_count": len(project.timeline.markers),
+    }
+
+
+def _update_marker(host: EditorHost, arguments: dict[str, Any]) -> object:
+    frame = _marker_frame(arguments.get("frame"), "frame")
+    current = _require_marker(host, frame)
+    if not any(key in arguments for key in ("to_frame", "label", "color")):
+        raise ToolError("to_frame・label・color のどれかを指定してください")
+    changed = Marker(
+        frame=(
+            _marker_frame(arguments["to_frame"], "to_frame")
+            if "to_frame" in arguments
+            else current.frame
+        ),
+        label=_marker_label(arguments["label"]) if "label" in arguments else current.label,
+        color=_marker_color(arguments["color"]) if "color" in arguments else current.color,
+    )
+    host.apply_commands([UpdateMarker(frame, changed)], "マーカーを変更")
+    return {"marker": _marker_row(changed, _project(host).rate)}
+
+
+def _delete_markers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    timeline = _project(host).timeline
+    everything = _flag_argument(arguments, "all", False)
+    # 両方来たら断る all を先に見ると、位置を指したつもりの頼みで本人の目印が全部消える
+    if everything and arguments.get("frames") is not None:
+        raise ToolError("frames と all は一緒に渡せません どちらか 1 つにしてください")
+    if everything:
+        # 目印の数だけ位置を並べる コマンドは位置 1 つで先頭の 1 つだけを消すので、位置の
+        # 重なりをまとめると、手で書いた作品の同じ位置の 2 つ目が残る
+        frames = tuple(marker.frame for marker in timeline.markers)
+        if not frames:
+            raise ToolError("消す目印がありません")
+    else:
+        # 省いたら断る 空の引数で全部消えると、指定し忘れただけで本人の目印が丸ごと消える
+        given = arguments.get("frames")
+        if not isinstance(given, list) or not given:
+            raise ToolError("frames に消す目印の位置を渡してください（全部なら all を真に）")
+        # 同じ位置を 2 度書いた頼みは 1 つにまとめる 一覧の位置を重ねて渡しただけで、
+        # 同じ位置に目印が 2 つ無いと断られるのは AI に分かりにくい
+        frames = tuple(dict.fromkeys(_marker_frame(value, "frames") for value in given))
+        for frame in frames:
+            _require_marker(host, frame)
+    host.apply_commands([RemoveMarkers(frames)], "マーカーを削除")
+    return {"deleted": len(frames), "marker_count": len(_project(host).timeline.markers)}
+
+
+def _get_chapters(host: EditorHost, arguments: dict[str, Any]) -> object:
+    result = chapters_of(_project(host).timeline)
+    rows = [
+        {
+            "frame": chapter.frame,
+            "start_seconds": round(float(chapter.start), 3),
+            "end_seconds": round(float(chapter.end), 3),
+            "title": chapter.title,
+        }
+        for chapter in result.chapters
+    ]
+    text = youtube_text(result)
+    common: dict[str, Any] = {
+        "active_scene": str(host.active_scene) if host.active_scene is not None else None,
+        "duration_seconds": round(float(result.duration), 3),
+        # 概要欄に入らない長さの文は返さない 貼れない上に、道具の結果の上限を食って一覧が切れる
+        # わけは warnings に入る
+        "youtube": text if len(text) <= YOUTUBE_DESCRIPTION_LIMIT else None,
+        "warnings": list(result.warnings),
+        "unnamed_markers": result.unnamed,
+        "outside_markers": result.outside,
+    }
+    # 一覧は切って返す 目次の文と一緒に全部を返すと、長い目次で道具の結果の上限を越え、
+    # 途中で切れて後ろの行が読めない 文の分だけ一覧の件数を減らして上限に収める
+    page = {**common, **_paged(rows, arguments, name="chapters")}
+    while len(json_text(page)) > MAX_RESULT_CHARS and page["count"] > 1:
+        smaller = {**arguments, "limit": max(1, page["count"] * 3 // 4)}
+        page = {**common, **_paged(rows, smaller, name="chapters")}
+    if len(json_text(page)) > MAX_RESULT_CHARS and page["youtube"] is not None:
+        # 1 行まで減らしても越える（読み込んだ長い名前が文と一覧の両方に入る） 文を外し、
+        # 一覧から読めることを書く 文と一覧の両方を残すと、上限を越えて途中が切れる
+        page["youtube"] = None
+        page["warnings"] = [
+            *page["warnings"],
+            "目次の文は長すぎて一緒に返せません 一覧（chapters）の時刻と名前から組んでください",
+        ]
+    overflow = len(json_text(page)) - MAX_RESULT_CHARS
+    if overflow > 0 and page["chapters"]:
+        # それでも越えるのは、1 行の名前だけで上限に近いとき 名前を切り詰めて印を付ける
+        # （ほかの一覧の道具と同じ :func:`_fit`）
+        row = page["chapters"][0]
+        page["chapters"] = [_fit(row, max(_KEEP_CHARS, len(json_text(row)) - overflow - 64))]
+    return page
 
 
 # --- 場面の切り替わり（#319 #321）---
@@ -3268,6 +3475,102 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_HISTORY,
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
+    ),
+    # 目印（マーカー）とチャプター（#330） 人は目盛りの右クリックで同じことをする
+    Operation(
+        name="list_markers",
+        description=(
+            "タイムラインの目印（マーカー）を位置の順に一覧する 目印は位置（frame）で指す"
+            " シーンを開いていればそのシーンの目印" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_list_markers,
+        # 目印の名前は本人の文（話の区切りの見出し） 字幕と文字として尋ねる
+        sends=_WITH_TEXT,
+    ),
+    Operation(
+        name="add_markers",
+        description=(
+            "目印（マーカー）をまとめて置く 取り消し 1 回で全部戻る 名前を付けた目印は"
+            " get_chapters で目次（チャプター）になる 同じ位置に 2 つは置けない"
+            " 1 つでも置けなければ何も置かない"
+        ),
+        schema=_schema(
+            {
+                "markers": {
+                    "type": "array",
+                    "description": f"置く目印（{MAX_MARKERS_PER_CALL} 個まで）",
+                    "minItems": 1,
+                    "maxItems": MAX_MARKERS_PER_CALL,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "frame": _integer("置く位置（タイムラインのフレーム）"),
+                            "label": _string(
+                                f"名前 チャプターの見出しになる（{MARKER_LABEL_LIMIT} 文字まで）"
+                                " 省くと目次に入らない覚え書きの目印"
+                            ),
+                            "color": _string("色 #RRGGBB（省くと黄色）"),
+                        },
+                        "required": ["frame"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            ["markers"],
+        ),
+        handler=_add_markers,
+        # 置いた目印を名前ごと返す（前後の空白を落とした後の名前を AI が確かめるため）
+        # 字幕と文字を送らない人には、add_text と同じく道具を動かさずに断る
+        sends=_WITH_TEXT,
+        writes=True,
+    ),
+    Operation(
+        name="update_marker",
+        description="目印を動かす・名前や色を変える 変える物だけを渡す",
+        schema=_schema(
+            {
+                "frame": _integer("変える目印の今の位置（list_markers の frame）"),
+                "to_frame": _integer("動かす先の位置"),
+                "label": _string(f"新しい名前（{MARKER_LABEL_LIMIT} 文字まで 空で名前を外す）"),
+                "color": _string("新しい色 #RRGGBB"),
+            },
+            ["frame"],
+        ),
+        handler=_update_marker,
+        sends=_WITH_TEXT,
+        writes=True,
+    ),
+    Operation(
+        name="delete_markers",
+        description="目印を消す 位置をまとめて渡す 1 つでも無い位置があれば何も消さない",
+        schema=_schema(
+            {
+                "frames": {
+                    "type": "array",
+                    "description": "消す目印の位置（list_markers の frame）",
+                    "items": {"type": "integer"},
+                },
+                "all": _boolean("真ならすべての目印を消す"),
+            }
+        ),
+        handler=_delete_markers,
+        # 返すのは消した数と残りの数だけで、名前は返さない 字幕と文字を送らない人でも消せる
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="get_chapters",
+        description=(
+            "名前の付いた目印から目次（チャプター）を作って返す 時刻は書き出す範囲の頭から数え、"
+            "youtube は YouTube の概要欄に貼る形（0:00 はじめに） YouTube が目次にしない"
+            "（先頭が 0:00 でない・3 行より少ない・10 秒より短い行がある）ときは warnings に"
+            "理由が入る 書き出すメインの目次は、シーンを開いていればメインに戻ってから読む"
+            " 行の一覧（chapters）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_get_chapters,
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="preview_frame",

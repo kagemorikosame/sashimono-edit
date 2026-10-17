@@ -275,6 +275,10 @@ class Preferences:
     #: メモリの少ない機械では減らせるようにする 実測は
     #: :data:`sashimono.engine.encode.MEASURED_EXPORT_MS`
     export_pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
+    #: 書き出す動画に、名前の付いた目印（マーカー）をチャプターとして埋めるか（#330）
+    #: 2026-10-17 に利用者が決めた 既定は入 埋めても再生には響かず、プレーヤーで章送りが
+    #: できる 要らない人だけ切ればよい 書き出しの窓で替えた値もここへ覚える
+    export_chapters: bool = True
     #: 重ねたレイヤーの映像デコードを、同時にいくつまで走らせるか 1 で並べない
     #: PyAV のデコードは GIL を解放するので、別の素材どうしなら本当に重なる
     #: 既定は 4 デコード中の絵を素材の数だけ抱えるので（4K で 1 枚 33MB）、
@@ -424,8 +428,9 @@ class Preferences:
     #: 吸い付く距離（8 画素）の外では自由に動く 1 コマずつ合わせたい人はボタンで切る
     playhead_snap: bool = True
     #: 再生ヘッドが吸い付く先 クリップの頭と終わり・キーフレームのコマ・書き出し範囲の端・
-    #: 目印（マーカー） 既定はクリップの磁石と同じ先で、目印は切 いまのタイムラインは目印を
-    #: 描かないので、見えない所で引っ掛かったように見える
+    #: 目印（マーカー） 既定はクリップの磁石と同じ先で、目印は切 0.2.2 までは目印を描かず、
+    #: 見えない所で引っ掛かったように見えたため 目盛りに旗を描くようになっても（#330）既定は
+    #: 変えない 変えると、使い慣れた人の再生ヘッドが今まで止まらなかった所で止まる
     playhead_snap_clips: bool = True
     playhead_snap_keyframes: bool = True
     playhead_snap_work_area: bool = True
@@ -691,6 +696,7 @@ class PreferenceStore:
             export_pipeline_depth=_depth(
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),
+            export_chapters=_flag(data.get("export_chapters"), plain.export_chapters),
             decode_threads=_threads(data.get("decode_threads"), plain.decode_threads),
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),

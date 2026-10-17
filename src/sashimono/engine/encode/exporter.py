@@ -15,18 +15,20 @@ from fractions import Fraction
 from functools import cache
 from pathlib import Path
 from types import TracebackType
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import av
 import av.audio.fifo
 import av.audio.frame
 import av.audio.stream
+import av.container
 import av.error
 import av.video.codeccontext
 import av.video.frame
 import av.video.stream
 import numpy as np
 
+from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
@@ -38,7 +40,12 @@ from sashimono.engine.render import (
     FrameRenderer,
 )
 
+if TYPE_CHECKING:
+    # 型の宣言にしか無い（PyAV の .pyi） 実行時に読むと ImportError になる
+    from av.container.core import Chapter
+
 __all__ = [
+    "CHAPTER_SUFFIXES",
     "COLOR_OPTIONS",
     "DEFAULT_PIPELINE_DEPTH",
     "MAX_DECODE_THREADS",
@@ -49,7 +56,9 @@ __all__ = [
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
+    "export_chapters",
     "export_project",
+    "write_chapters",
 ]
 
 #: 合成の先へ何枚ぶん進めてよいか（0 で直列）
@@ -122,6 +131,53 @@ class ExportSettings:
     #: 前の音を読む音の効果の動く値を、区切りの中でもつなぐ（:class:`AudioMixer`）
     #: 再生と同じ音にするため、本人の設定（プレビューと同じ値）を渡す
     smooth_history: bool = True
+    #: 名前の付いた目印をチャプターとして埋める（#330 2026-10-17 利用者の決定 既定は入）
+    #: 効くのは :data:`CHAPTER_SUFFIXES` の入れ物だけ 本人の設定（Preferences）から渡す
+    chapters: bool = True
+
+
+#: チャプターを埋める入れ物 mp4・mov は章の文字トラック、mkv は Chapters の要素で持つ
+#: ほかの入れ物（webm・avi など）は章を持てないか、プレーヤーが読まない 渡すと多重化に
+#: 断られて書き出しごと失敗しうるので、埋めない
+CHAPTER_SUFFIXES = frozenset({".mp4", ".mov", ".mkv"})
+
+
+def export_chapters(project: Project, frame_range: tuple[int, int], path: Path) -> list[Chapter]:
+    """``path`` へ埋めるチャプター 時刻は書き出す範囲の頭から数えたフレーム
+
+    入れ物が :data:`CHAPTER_SUFFIXES` に無ければ空 名前の無い目印と範囲の外の目印は入れない
+    （:func:`~sashimono.core.chapters.chapters_of`）
+    """
+    if path.suffix.lower() not in CHAPTER_SUFFIXES:
+        return []
+    frame = project.rate.frame_duration
+    found = chapters_of(project.timeline, frame_range)
+    # 型の宣言を通して渡す PyAV 18 の宣言は time_base を Fraction、19 は AVRational と書くが、
+    # どちらも実行時は Fraction を受ける（19.0.1 の CI で読み戻しの試験が通る）
+    # 辞書のまま書くと、入る版によって mypy が片方で落ちる
+    return [
+        cast(
+            "Chapter",
+            {
+                "id": index + 1,
+                # 時刻はフレームの区切りに乗っているので、フレームの長さで割れば割り切れる
+                "start": int(chapter.start / frame),
+                "end": int(chapter.end / frame),
+                "time_base": frame,
+                "metadata": {"title": chapter.title},
+            },
+        )
+        for index, chapter in enumerate(found.chapters)
+    ]
+
+
+def write_chapters(container: av.container.OutputContainer, chapters: list[Chapter]) -> None:
+    """入れ物にチャプターを渡す 最初の多重化（ヘッダを書く）より前に呼ぶ
+
+    後から渡すと、mkv は頭の Chapters の要素を書き終えていて、章が入らない
+    """
+    if chapters:
+        container.set_chapters(chapters)
 
 
 #: 開けるかを試すときの大きさ NVENC は小さすぎる画を断る（64x64 では開けない）ので、
@@ -337,6 +393,9 @@ def _encode(
             )
             audio.bit_rate = settings.audio_bitrate
             fifo = av.audio.fifo.AudioFifo()
+
+        if settings.chapters:
+            write_chapters(container, export_chapters(project, (start, end), settings.path))
 
         # 最初の mux に任せず、ここで開く 任せると開けない失敗が FFmpeg の例外のまま
         # 途中から飛び出し、別のコーデックへやり直せるかどうかを呼び出し側が区別できない

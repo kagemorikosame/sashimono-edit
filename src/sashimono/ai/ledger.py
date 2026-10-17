@@ -336,6 +336,10 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/〔トラック〕 の高さを戻す", "set_track_height"),
     missing("タイムラインの右クリック/〔トラック〕 の名前を変更…", 349),
     missing("タイムラインの右クリック/範囲を解除", 349, "書き出し範囲（ワークエリア）"),
+    # --- タイムラインの右クリック 目盛りの目印（#330） ---
+    same("タイムラインの右クリック/ここにマーカーを置く", "add_markers"),
+    same("タイムラインの右クリック/マーカーの名前を変更…", "update_marker"),
+    same("タイムラインの右クリック/マーカーを削除", "delete_markers"),
     same("タイムラインの右クリック/トラックを追加/映像トラック", "add_track"),
     same("タイムラインの右クリック/トラックを追加/音声トラック", "add_track"),
     partial(
@@ -555,6 +559,9 @@ AI_ONLY: dict[str, str] = {
     # 読むだけ（Safety.READ_ONLY）で、画面のメニュー・右クリック・ボタンに同じ入口は無い
     "detect_scenes": READING,
     "list_scenes": READING,
+    # 目印とチャプター（#330） 人は目盛りの旗を見て読む 目次の文は画面に同じ入口が無い
+    "list_markers": READING,
+    "get_chapters": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,
