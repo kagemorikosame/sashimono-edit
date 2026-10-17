@@ -43,7 +43,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sashimono.compat.aviutl.custom_object import custom_object_script
+from sashimono.compat.looks import (
+    apply_preset_commands,
+    capture_preset,
+    effects_for_clip,
+    picture_and_sound,
+    preset_commands_for,
+)
 from sashimono.core.commands import (
     AddEffect,
     AddStroke,
@@ -72,10 +78,7 @@ from sashimono.core.commands.fixed import (
     takes_picture_items,
 )
 from sashimono.core.commands.preset import (
-    PICTURE_SIDE,
-    SOUND_SIDE,
     PresetOptions,
-    preset_commands,
 )
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.io.aliases import Alias, AliasStore
@@ -94,10 +97,8 @@ from sashimono.core.model import (
     Stroke,
     StrokeId,
     Track,
-    draws_picture,
     legacy_in_use,
     legacy_stroke,
-    plays_sound,
 )
 from sashimono.effects import (
     CheckSpec,
@@ -134,10 +135,17 @@ from sashimono.ui.inspector.widgets import (
 )
 from sashimono.ui.preview_handles import ALIGNMENTS
 from sashimono.ui.theme import Colors, theme_signals, themed_style
-from sashimono.ui.timeline.add_menu import clip_roles, effects_for_clip
 from sashimono.ui.wheel_guard import WheelGuard
 
-__all__ = ["InspectorPanel", "KeyframeControls"]
+# 当てる入口と写し方は compat/looks.py へ移した（AI の道具も使う #328） 画面の試験が
+# ここから読むので、ここからも出す
+__all__ = [
+    "InspectorPanel",
+    "KeyframeControls",
+    "apply_preset_commands",
+    "capture_preset",
+    "picture_and_sound",
+]
 
 #: 合成方法の表示名
 BLEND_LABELS = {
@@ -1914,20 +1922,17 @@ class InspectorPanel(QWidget):
         """
         if self._project is None:
             return
-        commands: list[Command] = []
-        touched = 0
         targets = self._selection or ((self._clip_id,) if self._clip_id is not None else ())
-        for clip_id in dict.fromkeys(targets):
-            located = self._project.timeline.locate_clip(clip_id)
-            if located is None:
-                continue
-            track, clip = located
-            made = apply_preset_commands(
-                self._project, track, clip, preset, options=self._preset_options
-            )
-            if made:
-                commands.extend(made)
-                touched += 1
+        # 当てる入口はこのモジュールの名前から引く 試験が差し替えて、一覧から当てても
+        # 同じ入口を通るかを見る（AI の道具 apply_preset も同じ preset_commands_for を通る）
+        commands, changed = preset_commands_for(
+            self._project,
+            targets,
+            preset,
+            options=self._preset_options,
+            make=apply_preset_commands,
+        )
+        touched = len(changed)
         if not commands:
             QMessageBox.information(
                 self,
@@ -2143,100 +2148,6 @@ def _fraction(value: ParamValue, scale: int) -> Fraction:
     """
     number = value.static if isinstance(value, AnimatedValue) else 0.0
     return Fraction(number).limit_denominator(1_000_000) / scale
-
-
-def picture_and_sound(project: Project | None, track: Track, clip: Clip) -> tuple[bool, bool]:
-    """絵を描くクリップか・音を鳴らすクリップか（設定パネルが描画と音声の組を出すか）
-
-    混合トラックはクリップが絵と音の両方を持てるので、トラックの種類ではなく
-    draws_picture と plays_sound で決める
-    """
-    media = (
-        project.find_media(clip.media_id)
-        if project is not None and clip.media_id is not None
-        else None
-    )
-    picture = draws_picture(track, clip, media)
-    sound = clip.media_id is not None and clip.source is None and plays_sound(track, clip, media)
-    return picture, sound
-
-
-def capture_preset(name: str, project: Project | None, track: Track, clip: Clip) -> Preset:
-    """画面から保存するときのプリセット
-
-    不透明度などを持つかは描くかで決め、どちらの側のエフェクトを持つかは〔＋ エフェクト〕と
-    同じ :func:`clip_roles` で決める 設定パネルが音声の欄を出すか（素材の音だけ）で決めると、
-    混合のトラックに置いたシーンのように欄は無いのに音のエフェクトを持つクリップの音の側が
-    「持っていない」扱いになり、当てた先の音のエフェクトと重なる
-    """
-    picture, _ = picture_and_sound(project, track, clip)
-    _, sound_effects = _effect_roles(project, track, clip)
-    return Preset.capture(name, clip, picture=picture, sound=sound_effects)
-
-
-def apply_preset_commands(
-    project: Project, track: Track, clip: Clip, preset: Preset, *, options: PresetOptions
-) -> list[Command]:
-    """画面から ``preset`` を ``clip`` へ当てるコマンド
-
-    コア層が自分では読めない知識（エフェクトの定義・中身の既定の値・カスタムオブジェクトの
-    見分け）をここで渡す 試験も同じ入口を通し、画面と同じ当て方を確かめる
-    """
-    picture, sound = picture_and_sound(project, track, clip)
-    effect_picture, effect_sound = _effect_roles(project, track, clip)
-    allowed = frozenset(d.kind for d in effects_for_clip(project, track, clip))
-
-    def accepts(kind: str) -> bool:
-        # 定義の無い種類（別の機械で作った・スクリプトを外した AviUtl のエフェクト）は、
-        # 絵の側が効く先なら足す 設定パネルは未知のエフェクトを残して見せ、側も絵として
-        # 扱う（:func:`_effect_side`） 一覧に無いからと捨てると、プリセットの見た目が黙って欠ける
-        # 音だけの先には今までどおり足さない
-        if kind in allowed:
-            return True
-        return effect_picture and registry.get(kind) is None
-
-    return preset_commands(
-        preset,
-        clip,
-        picture=picture,
-        sound=sound,
-        # どちらの側のエフェクトを入れ替えるかは、欄を出すかではなく掛けられるかで決める
-        # （:func:`capture_preset` と同じ理由）
-        effect_sides=(effect_picture, effect_sound),
-        options=options,
-        # 音だけのクリップに映像のエフェクトを足さない（〔＋ エフェクト〕と同じ決まり）
-        accepts=accepts,
-        # カスタムオブジェクトの本体（最初のエフェクトのスクリプト）は中身として扱う
-        # 見た目の入れ替えで消すと、何も描かないクリップが残る
-        body_of=custom_object_script,
-        side_of=_effect_side,
-        defaults_of=_source_defaults,
-    )
-
-
-def _effect_roles(project: Project | None, track: Track, clip: Clip) -> tuple[bool, bool]:
-    """絵のエフェクトと音のエフェクトが効くか（〔＋ エフェクト〕と同じ :func:`clip_roles`）"""
-    if project is None:
-        return picture_and_sound(project, track, clip)
-    return clip_roles(project, track, clip)
-
-
-def _effect_side(kind: str) -> str:
-    """エフェクトが絵と音のどちらに掛かるか 〔＋ エフェクト〕の分け方（音を処理するか）と同じ
-
-    手元に無い種類（読めないスクリプトなど）は絵とする 音のエフェクトはどれも本体の物で、
-    手元に無いことが無い
-    """
-    definition = registry.get(kind)
-    if definition is not None and definition.audio_process is not None:
-        return SOUND_SIDE
-    return PICTURE_SIDE
-
-
-def _source_defaults(kind: str) -> dict[str, ParamValue] | None:
-    """中身の種類の既定の値 プリセットの中身を当てるときの土台 知らない種類は ``None``"""
-    definition = source_registry.get(kind)
-    return definition.default_params() if definition is not None else None
 
 
 def _heading(text: str) -> QLabel:

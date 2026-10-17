@@ -45,7 +45,9 @@ TEXT_SOURCES = {
 }
 #: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337、
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
-OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target", "duck_shape"}
+#: テンプレートの棚（#328）も本人の置き場の物 名前はアプリの設定として送り、フォルダの名前は
+#: 名前と場所（一覧の folder の項目で伏せる） ファイルの場所は道具から返さない
+OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target", "duck_shape", "template_shelf"}
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
     "document",
@@ -199,6 +201,14 @@ class TestEveryTextSourceGoesThroughThePort:
     def test_tools_that_read_the_own_library_declare_app_settings(self) -> None:
         # 壊れると、プリセットやエイリアスの名前を断りの文に並べる道具が、送る物にそれを書かず、
         # 設定画面と個人情報の扱いの一覧に無い物が外へ出る
-        for name in ("place_subtitles", "check_output"):
+        for name in (
+            "place_subtitles",
+            "check_output",
+            "list_looks",
+            "apply_preset",
+            "place_alias",
+            "place_template",
+            "apply_template",
+        ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

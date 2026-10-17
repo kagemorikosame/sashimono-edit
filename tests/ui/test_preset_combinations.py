@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 import pytest
 
 from sashimono.compat.aviutl.custom_object import custom_object_clip, custom_object_script
+from sashimono.compat.looks import effect_side
 from sashimono.core.commands.fixed import (
     PICTURE_FIXED,
     SOUND_FIXED,
@@ -56,7 +57,6 @@ from sashimono.core.model import (
 from sashimono.effects import registry
 from sashimono.effects.sources import FILTER, GROUP, SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.ui.inspector.panel import (
-    _effect_side,
     apply_preset_commands,
     capture_preset,
     picture_and_sound,
@@ -286,7 +286,7 @@ def _check(saved: Clip, before: Clip, after: Clip, preset: Preset, project: Proj
     after_ids = {e.id for e in after_loose}
     assert {e.kind for e in after_loose if e.id not in before_ids} <= preset_kinds
     for gone in (e for e in before_loose if e.id not in after_ids):
-        assert _effect_side(gone.kind) in sides, gone.kind
+        assert effect_side(gone.kind) in sides, gone.kind
 
     # 後の場面の列 保存元も場面切り替えのときだけ触る
     if preset.source is None or preset.source.kind != "transition":
