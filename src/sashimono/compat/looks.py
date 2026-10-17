@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from sashimono.compat.aviutl.catalog import KIND_LABELS
 from sashimono.compat.aviutl.custom_object import custom_object_script
@@ -340,6 +340,23 @@ class ExoMedia:
     items: tuple[MediaItem, ...]
 
 
+def _exo_candidates(raw: str, source: Path) -> list[Path]:
+    """``.exo`` に書かれた素材の場所を探す順
+
+    相対の場所はまず ``.exo`` のフォルダを基準に読む（``素材\\絵.png`` は隣の ``素材`` の中）
+    作業中のフォルダを先に見ると、アプリをどこから起動したかで結ぶ素材が変わり、名前だけで
+    探すと隣のフォルダを失って同じ名前の別の絵を結ぶ 書かれた場所は Windows の形なので
+    ``PureWindowsPath`` で分ける（Windows 以外では ``\\`` を区切りと見ないため）
+    最後に今までどおり、書かれた場所そのものと、``.exo`` の隣の同じ名前を見る
+    """
+    written = PureWindowsPath(raw)
+    candidates: list[Path] = []
+    if not written.drive and not written.root:
+        candidates.append(source.parent.joinpath(*written.parts))
+    candidates += [Path(raw), source.parent / written.name]
+    return candidates
+
+
 def exo_media(exo: ExoFile, source: Path, probe: Probe, project: Project) -> ExoMedia:
     """``.exo`` が参照している素材を読む 一覧へ入れるのは呼んだ側
 
@@ -353,8 +370,7 @@ def exo_media(exo: ExoFile, source: Path, probe: Probe, project: Project) -> Exo
     items: list[MediaItem] = []
     known = {same_file(item.path): item for item in project.media}
     for raw in media_paths(exo):
-        candidates = [Path(raw), source.parent / Path(raw).name]
-        path = next((c for c in candidates if c.exists()), None)
+        path = next((c for c in _exo_candidates(raw, source) if c.exists()), None)
         if path is None:
             missing.append(raw)
             continue

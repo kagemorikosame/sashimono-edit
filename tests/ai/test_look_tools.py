@@ -641,6 +641,23 @@ class TestImportObjects:
         assert linked == {project.media[0].id}
         assert host.probed == [picture]
 
+    def test_a_relative_media_path_is_read_from_the_exo_s_folder(self, tmp_path: Path) -> None:
+        # 壊れると、.exo の隣のフォルダに添えた素材が見つからず、同じ名前の別の絵を結ぶか、
+        # 素材の無いクリップを置く（CodeRabbit の指摘）
+        host = _empty_host()
+        folder = tmp_path / "配布物"
+        (folder / "素材").mkdir(parents=True)
+        wanted = folder / "素材" / "絵.png"
+        wanted.write_bytes(b"wanted")
+        # 同じ名前の別の絵 名前だけで探すと、こちらを結んでしまう
+        (folder / "絵.png").write_bytes(b"decoy")
+        host.probe_result = MediaItem(path=wanted)
+        source = folder / "素材つき.exo"
+        source.write_text(_EXO_IMAGE.format(path="素材\\絵.png"), encoding="utf-8")
+        result = run(host, "import_objects", path=str(source))
+        assert result["missing_media"] == 0
+        assert host.probed == [wanted]
+
     def test_a_missing_file_is_refused(self, host: FakeHost, tmp_path: Path) -> None:
         # 壊れると、無いファイルを読んだつもりで「読み込んだ」と答える
         with pytest.raises(ToolError, match="ありません"):
