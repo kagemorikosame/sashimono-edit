@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import pytest
 
+from sashimono.ai import operations
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
 from sashimono.ai.safety import Safety
@@ -207,6 +208,31 @@ class TestChapterSize:
         # 概要欄に入らない長さの目次は文を返さず、わけを書く
         assert first["youtube"] is None
         assert any("5000" in warning for warning in first["warnings"])
+
+    def test_a_huge_name_from_a_file_still_fits(self, loaded: Project) -> None:
+        # 保存形式は名前の長さを確かめずに読む 1 行でも上限を越えたまま返すと、AI 側で途中が
+        # 切れ、警告も件数も読めなくなる
+        huge = "長" * 20000
+        markers = (Marker(0, huge), Marker(30, "本編"))
+        host = FakeHost(loaded.with_timeline(replace(loaded.timeline, markers=markers)))
+        result = run(host, "get_chapters")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert result["total"] == 2
+        assert result["warnings"]
+        assert result["youtube"] is None
+
+    def test_the_text_gives_way_before_the_list(
+        self, loaded: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 文と一覧の両方に長い名前が入り 1 行でも上限を越えるとき、文を外さないと途中が切れる
+        # 上限を小さくして、概要欄に入る長さの文でもそうなる所を作る
+        monkeypatch.setattr(operations, "MAX_RESULT_CHARS", 2500)
+        markers = (Marker(0, "前" * 1200), Marker(600, "後" * 1200))
+        host = FakeHost(loaded.with_timeline(replace(loaded.timeline, markers=markers)))
+        result = run(host, "get_chapters")
+        assert len(json_text(result)) <= 2500
+        assert result["youtube"] is None
+        assert any("一緒に返せません" in warning for warning in result["warnings"])
 
     def test_a_label_with_a_line_break_is_refused(self, host: FakeHost) -> None:
         # 通すと目次の 1 行が割れる 人の右クリックと同じく断る

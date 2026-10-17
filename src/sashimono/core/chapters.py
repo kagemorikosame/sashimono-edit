@@ -43,6 +43,13 @@ YOUTUBE_MIN_SECONDS = 10
 YOUTUBE_DESCRIPTION_LIMIT = 5000
 #: 警告に並べる目次の行の数
 _LISTED = 10
+#: 警告に出す名前の長さ（文字） 保存形式は名前の長さを確かめずに読むので、読み込んだ長い
+#: 名前をそのまま並べると、警告だけで道具の結果の上限を越える
+_NAME_IN_WARNING = 20
+
+
+def _short(title: str) -> str:
+    return title if len(title) <= _NAME_IN_WARNING else title[:_NAME_IN_WARNING] + "…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +98,7 @@ class Chapters:
         short = [c for c in self.chapters if c.length < YOUTUBE_MIN_SECONDS]
         if short:
             # 並べるのは頭の数行だけ 何百行も並べると、警告だけで道具の結果の上限を越える
-            names = "・".join(f"{clock(c.start)} {c.title}" for c in short[:_LISTED])
+            names = "・".join(f"{clock(c.start)} {_short(c.title)}" for c in short[:_LISTED])
             if len(short) > _LISTED:
                 names += f" ほか {len(short) - _LISTED} 行"
             notes.append(

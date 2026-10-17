@@ -1549,6 +1549,20 @@ def _get_chapters(host: EditorHost, arguments: dict[str, Any]) -> object:
     while len(json_text(page)) > MAX_RESULT_CHARS and page["count"] > 1:
         smaller = {**arguments, "limit": max(1, page["count"] * 3 // 4)}
         page = {**common, **_paged(rows, smaller, name="chapters")}
+    if len(json_text(page)) > MAX_RESULT_CHARS and page["youtube"] is not None:
+        # 1 行まで減らしても越える（読み込んだ長い名前が文と一覧の両方に入る） 文を外し、
+        # 一覧から読めることを書く 文と一覧の両方を残すと、上限を越えて途中が切れる
+        page["youtube"] = None
+        page["warnings"] = [
+            *page["warnings"],
+            "目次の文は長すぎて一緒に返せません 一覧（chapters）の時刻と名前から組んでください",
+        ]
+    overflow = len(json_text(page)) - MAX_RESULT_CHARS
+    if overflow > 0 and page["chapters"]:
+        # それでも越えるのは、1 行の名前だけで上限に近いとき 名前を切り詰めて印を付ける
+        # （ほかの一覧の道具と同じ :func:`_fit`）
+        row = page["chapters"][0]
+        page["chapters"] = [_fit(row, max(_KEEP_CHARS, len(json_text(row)) - overflow - 64))]
     return page
 
 
