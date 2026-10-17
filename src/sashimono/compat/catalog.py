@@ -26,7 +26,7 @@ from pathlib import Path, PureWindowsPath
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
 from sashimono.compat.aviutl.mapping import SILENT_SOUND, map_object
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
-from sashimono.compat.layers import heard_stream, layer_tracks
+from sashimono.compat.layers import Spans, crowded, heard_stream, in_front, layer_tracks
 from sashimono.compat.mapped import MappedObject, fitted_effect, fitted_value
 from sashimono.compat.ymm4.template import Ymm4ParseError, load_template, map_template
 from sashimono.core import userdirs
@@ -514,10 +514,16 @@ def place(
         _put_on_layers(project, layered, commands, track_id)
         return commands
 
+    pictures: dict[int, list[tuple[int, int]]] = {}
+    for item, picture, _sound in prepared:
+        if picture is not None:
+            pictures.setdefault(item.layer, []).append(
+                (picture.timeline_start, picture.timeline_end)
+            )
     tracks = (
         {}
         if track_id is not None or not seen
-        else _tracks_for(project, {item.layer for item in seen}, commands)
+        else _tracks_for(project, {item.layer for item in seen}, commands, pictures)
     )
     sound_tracks = _sound_tracks_for(
         project, [(item, sound) for item, _, sound in prepared if sound is not None], commands
@@ -701,7 +707,10 @@ def _put_on_layers(
     rest = [(item, clip) for item, clip in layered if not fits(clip)]
     layers = {item.layer for item, _ in rest}
     drawn = {item.layer for item, clip in rest if clip.show_picture}
-    tracks = layer_tracks(project, layers, commands, heard_only=layers - drawn)
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for item, clip in rest:
+        spans.setdefault(item.layer, []).append((clip.timeline_start, clip.timeline_end))
+    tracks = layer_tracks(project, layers, commands, heard_only=layers - drawn, spans=spans)
     for item, clip in layered:
         where = target.id if target is not None and fits(clip) else tracks[item.layer].id
         commands.append(AddClip(where, clip))
@@ -945,8 +954,32 @@ def wraps(value: ParamValue | None) -> bool:
     return bool(value.keyframes) or value.static > 0
 
 
-def _tracks_for(project: Project, layers: set[int], commands: list[Command]) -> dict[int, Track]:
+def _tracks_for(
+    project: Project, layers: set[int], commands: list[Command], spans: Spans | None = None
+) -> dict[int, Track]:
+    """元のレイヤー番号 → 置く映像トラック 足りない分は足すコマンドを ``commands`` へ積む
+
+    ``spans`` は置く物の時刻 番号の当たる所が埋まっていれば、全部を一番手前の新しい
+    映像トラックへ並べる（混合の方式の :func:`~sashimono.compat.layers.layer_tracks` と同じ決まり）
+    """
     existing = list(project.timeline.video_tracks())
+    if crowded(existing, spans):
+        count = len(existing)
+        taken = {track.name for track in project.timeline.tracks}
+
+        def fresh(_layer: int) -> Track:
+            nonlocal count
+            count += 1
+            name = f"V{count}"
+            while name in taken:
+                count += 1
+                name = f"V{count}"
+            taken.add(name)
+            track = Track(kind=TrackKind.VIDEO, name=name)
+            commands.append(AddTrack(track))
+            return track
+
+        return in_front(layers, fresh)
     tracks: dict[int, Track] = {}
     for layer in range(1, max(layers, default=0) + 1):
         if layer - 1 < len(existing):

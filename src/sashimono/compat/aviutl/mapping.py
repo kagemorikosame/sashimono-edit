@@ -33,7 +33,7 @@ from sashimono.compat.aviutl.text_fill import text_gradient_fill
 from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.compat.layers import heard_stream, layer_tracks
 from sashimono.compat.mapped import MappedObject
-from sashimono.core.commands import AddClip, AddTrack, Command
+from sashimono.core.commands import AddClip, Command
 from sashimono.core.commands.fixed import fixed_rank, takes_picture_items, with_fixed_items
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.model import (
@@ -45,8 +45,6 @@ from sashimono.core.model import (
     MediaItem,
     ParamValue,
     Project,
-    Track,
-    TrackKind,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.definition import EffectDefinition, registry
@@ -642,7 +640,7 @@ def map_exo(
     ``AddClip`` に断られて読み込み全体が失敗し、動画を指すものは動画がもう 1 枚描かれる
     """
     # catalog はこのモジュールを読み込むので、頭で読むと輪になる
-    from sashimono.compat.catalog import _sound_tracks_for
+    from sashimono.compat.catalog import _sound_tracks_for, _tracks_for
 
     log = report if report is not None else global_report
     written = [map_object(obj, project.rate, report=log) for obj in exo.objects]
@@ -671,11 +669,6 @@ def map_exo(
     commands: list[Command] = []
     layers = {item.layer for item in mapped}
     drawn = {item.layer for item in mapped if not _heard(item)}
-    if mixed:
-        tracks = layer_tracks(project, layers, commands, heard_only=layers - drawn)
-    else:
-        # 分ける方式の音声ファイルは音声トラックへ置くので、映像トラックは作らない
-        tracks = _tracks_for(project, drawn, commands) if drawn else {}
 
     placements: list[tuple[MappedObject, Clip]] = []
     for item in mapped:
@@ -710,6 +703,18 @@ def map_exo(
             # 動画を指すときに 0 番のまま鳴らすと、映像のストリームを音として読みに行く
             placed = replace(placed, stream_index=linked.audio_streams[0].index)
         placements.append((item, placed))
+
+    # レイヤーのトラックは置く物の時刻を見て決める 元の番号の所が埋まっていれば、全部を
+    # 一番手前の新しいトラックへ並べる（棚の配置と同じ決まり :mod:`sashimono.compat.layers`）
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for item, clip in placements:
+        if mixed or not _heard(item):
+            spans.setdefault(item.layer, []).append((clip.timeline_start, clip.timeline_end))
+    if mixed:
+        tracks = layer_tracks(project, layers, commands, heard_only=layers - drawn, spans=spans)
+    else:
+        # 分ける方式の音声ファイルは音声トラックへ置くので、映像トラックは作らない
+        tracks = _tracks_for(project, drawn, commands, spans) if drawn else {}
 
     # 分ける方式の音声トラックは重なりを見て空いている所を探す 映像と同じくレイヤー番号を
     # そのまま番号にすると、10 段目の効果音のために音声トラックを 10 本作ることになる
@@ -2555,24 +2560,6 @@ def _dialog_values(
         params[spec.name] = spec.coerce(
             _spec_value(spec, text, points, log, f"{label}の {variable}")
         )
-
-
-def _tracks_for(project: Project, layers: set[int], commands: list[Command]) -> dict[int, Track]:
-    """レイヤー番号に対応する映像トラックを用意する
-
-    間が空いていても埋める AviUtl のレイヤー番号は上下の位置そのものなので、
-    空きレイヤーを詰めると重ね順が変わってしまう
-    """
-    existing = list(project.timeline.video_tracks())
-    tracks: dict[int, Track] = {}
-    for layer in range(1, max(layers, default=0) + 1):
-        if layer - 1 < len(existing):
-            tracks[layer] = existing[layer - 1]
-            continue
-        track = Track(kind=TrackKind.VIDEO, name=f"V{layer}")
-        commands.append(AddTrack(track))
-        tracks[layer] = track
-    return tracks
 
 
 #: こちらの合成器が持っている方法 AviUtl の合成モードはすべて揃った

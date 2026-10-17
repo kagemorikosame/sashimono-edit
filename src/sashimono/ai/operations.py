@@ -40,7 +40,22 @@ from sashimono.ai.sheet import (
     SheetError,
     sheet_layout,
 )
-from sashimono.compat.subtitle_looks import LookError, find_choice, subtitle_look
+from sashimono.compat.aviutl.exo import ExoParseError, load_exo
+from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle
+from sashimono.compat.looks import (
+    exo_commands,
+    preset_commands_for,
+    restyle_refusal,
+    template_placement,
+)
+from sashimono.compat.mapped import MappedObject
+from sashimono.compat.subtitle_looks import (
+    TEMPLATE,
+    LookError,
+    find_choice,
+    subtitle_look,
+    template_choice,
+)
 from sashimono.core.chapters import YOUTUBE_DESCRIPTION_LIMIT, chapters_of, youtube_text
 from sashimono.core.clipboard import copy_clips, paste_commands
 from sashimono.core.commands import (
@@ -83,6 +98,7 @@ from sashimono.core.commands import (
     export_range,
     has_line_break,
     head_room,
+    insert_clip,
     insert_generated,
     insert_media,
     insert_scene,
@@ -99,7 +115,9 @@ from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, 
 from sashimono.core.commands.insert import new_track, place_media
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.volume import clip_volume, volume_commands
+from sashimono.core.io.aliases import Alias
 from sashimono.core.io.atomic import Expected, expect_now
+from sashimono.core.io.presets import Preset
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import merge_ranges, plan_cuts
@@ -2743,13 +2761,19 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError("見た目は look_name か template_clip_id のどちらか 1 つで選んでください")
     if look_name:
         # 画面の〔焼き込み〕の一覧で選ぶのと同じ決まりで着せる（#308）
+        look_kind = str(arguments.get("look_kind", "alias") or "alias")
         try:
-            choice = find_choice(
-                host.saved_looks,
-                str(arguments.get("look_kind", "alias") or "alias"),
-                look_name,
-                str(arguments.get("look_category", "") or ""),
-            )
+            if look_kind == TEMPLATE:
+                # 棚の配布物は名前が重なりうる（分類違いの同じ名前が何本もある）ので、
+                # list_looks の template_id で選ぶ 画面の〔焼き込み〕の一覧と同じ棚
+                choice = template_choice(_shelf_entry(host, {"template_id": look_name}))
+            else:
+                choice = find_choice(
+                    host.saved_looks,
+                    look_kind,
+                    look_name,
+                    str(arguments.get("look_category", "") or ""),
+                )
             template = subtitle_look(choice, base, host.look_rules)
         except LookError as exc:
             raise ToolError(str(exc)) from exc
@@ -3804,6 +3828,266 @@ def _cancel_export(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"cancelling": True, "status": host.export_status()}
 
 
+# --- 保存した見た目と棚（#328） ---
+
+#: 一覧に出す種類 list_looks の kind で絞る
+_LOOK_KINDS = ("preset", "alias", "template")
+
+
+def _list_looks(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """保存したプリセット・自作のエイリアス・テンプレートの棚を 1 つの一覧で返す
+
+    人は設定パネルの〔プリセット…〕と〔追加〕→〔エイリアス〕のメニューで同じ物を見る
+    棚の中身はここでは読まない（数百本の棚で、一覧を出すだけで全部を開くことになる）
+    棚のファイルの場所は返さない 選ぶのは ``template_id`` で足り、場所には本人の名前が入りうる
+    """
+    kind = str(arguments.get("kind") or "")
+    if kind and kind not in _LOOK_KINDS:
+        raise ToolError(f"kind は {'・'.join(_LOOK_KINDS)} のどれかです: {kind}")
+    wanted = str(arguments.get("contains") or "")
+    rows: list[dict[str, Any]] = []
+    saved = host.saved_looks
+    if kind in ("", "preset"):
+        rows.extend(
+            {
+                "kind": "preset",
+                "name": preset.name,
+                "category": preset.category,
+                # 中身の種類 テキストの見た目を図形へ当てても中身は当たらない（足したエフェクト
+                # だけが当たる） AI が当てる先を選ぶ手掛かり
+                "source": preset.source.kind if preset.source is not None else None,
+                "effects": [effect.kind for effect in (*preset.effects, *preset.after_effects)],
+            }
+            for preset in saved.presets
+        )
+    if kind in ("", "alias"):
+        rows.extend(
+            {
+                "kind": "alias",
+                "name": alias.name,
+                "category": alias.category,
+                "source": alias.clip.source.kind if alias.clip.source is not None else None,
+                "duration": alias.clip.duration,
+            }
+            for alias in saved.aliases
+        )
+    if kind in ("", "template"):
+        for entry in host.template_shelf:
+            row: dict[str, Any] = {
+                "kind": "template",
+                "template_id": template_choice(entry).key,
+                "name": entry.name,
+                # 棚のフォルダの名前 本人の置き場の名前なので、名前と場所を断った人には伏せる
+                # （項目の名前 folder で伏せる :func:`~sashimono.ai.outbound.redact`）
+                "folder": entry.folder,
+                "app": entry.source,
+            }
+            if entry.error:
+                row["error"] = entry.error
+            rows.append(row)
+    if wanted:
+        rows = [row for row in rows if wanted in str(row["name"])]
+    return _paged(rows, arguments, name="looks")
+
+
+def _find_look(host: EditorHost, kind: str, name: str, category: str = "") -> Preset | Alias:
+    """保存したプリセットかエイリアスを名前で探す 字幕の見た目を選ぶのと同じ探し方（#308）"""
+    if not name:
+        raise ToolError("name を指定してください（list_looks で名前を確かめられます）")
+    try:
+        item = find_choice(host.saved_looks, kind, name, category).item
+    except LookError as exc:
+        raise ToolError(str(exc)) from exc
+    assert isinstance(item, Preset | Alias)  # find_choice は preset と alias だけを返す
+    return item
+
+
+def _apply_preset(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """保存したプリセットを当てる 設定パネルの〔プリセット…〕と同じ当て方（本人の設定の当て方）"""
+    preset = _find_look(
+        host,
+        "preset",
+        str(arguments.get("name") or ""),
+        str(arguments.get("category") or ""),
+    )
+    assert isinstance(preset, Preset)
+    targets = _target_clips(host, arguments)
+    commands, changed = preset_commands_for(
+        _project(host), targets, preset, options=host.look_rules.preset_options
+    )
+    if not commands:
+        raise ToolError(
+            f"「{preset.name}」を当てても変わる所がありません"
+            "（中身の種類が違うか、もう同じ見た目になっている）"
+        )
+    label = f"プリセット: {preset.name}"
+    if len(changed) > 1:
+        label = f"{label}（{len(changed)} 本）"
+    host.apply_commands(commands, label)
+    return {
+        "applied": preset.name,
+        "clip_ids": [str(clip_id) for clip_id in changed],
+        "unchanged": [str(clip_id) for clip_id in targets if clip_id not in changed],
+    }
+
+
+def _look_track(host: EditorHost, arguments: dict[str, Any]) -> TrackId | None:
+    """置く先のトラック 無い ID は断る（人は右クリックしたトラックを取り違えない）"""
+    raw = str(arguments.get("track_id") or "")
+    if not raw:
+        return None
+    track = _project(host).timeline.find_track(TrackId(raw))
+    if track is None:
+        raise ToolError(f"トラックが見つかりません: {raw}（list_tracks で確かめてください）")
+    return track.id
+
+
+def _look_frame(host: EditorHost, arguments: dict[str, Any]) -> int:
+    raw = arguments.get("at_frame")
+    if raw is None:
+        return host.playhead
+    return max(0, _integer_value(raw, "at_frame"))
+
+
+def _place_alias(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """保存したエイリアスを置く 右クリックの〔追加〕→〔エイリアス〕と同じ insert_clip を通す"""
+    alias = _find_look(host, "alias", str(arguments.get("name") or ""))
+    assert isinstance(alias, Alias)
+    frame = _look_frame(host, arguments)
+    commands = insert_clip(
+        _project(host),
+        alias.instantiate(),
+        at_frame=frame,
+        track_id=_look_track(host, arguments),
+    )
+    host.apply_commands(commands, f"エイリアスを置く: {alias.name}")
+    placed = next(c for c in commands if isinstance(c, AddClip))
+    return {
+        "placed": alias.name,
+        "clip_id": str(placed.clip.id),
+        "track_id": str(placed.track_id),
+        "at_frame": placed.clip.timeline_start,
+        "duration": placed.clip.duration,
+    }
+
+
+def _shelf_entry(host: EditorHost, arguments: dict[str, Any]) -> TemplateEntry:
+    wanted = str(arguments.get("template_id") or "")
+    entry = next(
+        (item for item in host.template_shelf if template_choice(item).key == wanted), None
+    )
+    if entry is None:
+        raise ToolError(
+            f"棚にそのテンプレートがありません: {wanted}"
+            "（list_looks の kind=template で template_id を確かめてください）"
+        )
+    return entry
+
+
+def _shelf_objects(entry: TemplateEntry) -> list[MappedObject]:
+    """棚の 1 本を読む 読めない理由は画面と同じ文で返す 道具ごと落ちると AI は直し方が分からない"""
+    try:
+        return entry.load()
+    except (*TemplateError, OSError) as exc:
+        raise ToolError(f"{entry.label} を読み込めません: {exc}") from exc
+
+
+def _probe_quietly(host: EditorHost) -> Callable[[Path], MediaItem | None]:
+    """棚や .exo が指す素材を開く手 開けない素材が 1 つあるだけで全体を止めない（画面と同じ）"""
+
+    def probe(path: Path) -> MediaItem | None:
+        try:
+            return host.probe(path)
+        except ToolError:
+            return None
+
+    return probe
+
+
+def _place_template(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """棚のテンプレートを置く 右クリックの〔追加〕→〔エイリアス〕の棚の項目と同じ手順"""
+    entry = _shelf_entry(host, arguments)
+    objects = _shelf_objects(entry)
+    placement = template_placement(
+        objects,
+        _project(host),
+        _look_frame(host, arguments),
+        _probe_quietly(host),
+        near=entry.path.parent,
+        track_id=_look_track(host, arguments),
+    )
+    if not placement.commands:
+        raise ToolError(
+            f"{entry.label} に置けるオブジェクトがありません"
+            "（エフェクトだけのテンプレートは apply_template でテキストに着せる）"
+        )
+    # 元のレイヤーの所が埋まっていれば、置く段取りが一番手前の新しいトラックへ並べ替えてある
+    # （2026-10-17 本人の決定 :mod:`sashimono.compat.layers`） 重なって断られることは無い
+    host.apply_commands(list(placement.commands), "テンプレートを配置")
+    # 解析と控えは取り消しても止まらない 入ったことを確かめてから頼む（画面と同じ）
+    for media in placement.plan.added:
+        host.analyze(media)
+    return {
+        "placed": len(placement.placed),
+        "clip_ids": [str(clip_id) for clip_id in placement.placed],
+        "missing_media": len(placement.plan.missing),
+    }
+
+
+def _apply_template(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """棚のテンプレートをテキストに着せる 棚の〔選択中のクリップに適用〕と同じ
+
+    文字と長さは今のクリップのまま残す（着せ替え :func:`~sashimono.compat.catalog.restyle`）
+    """
+    entry = _shelf_entry(host, arguments)
+    _, clip = _target_clip(host, arguments)
+    objects = _shelf_objects(entry)
+    # 効果だけのテンプレート（YMM4 のアニメーション効果など）はテキスト以外にも着せられる
+    # 先にテキストかを見て断ると、画面の棚ではできる着せ方が AI だけできない
+    commands = restyle(objects, clip, keep_wrap=host.look_rules.keep_wrap)
+    if not commands:
+        raise ToolError(f"{entry.label}: {restyle_refusal(objects, clip)}")
+    host.apply_commands(commands, "テンプレートを適用")
+    return {"applied": entry.label, "clip_id": str(clip.id)}
+
+
+#: import_objects が読む拡張子 互換の〔オブジェクトを読み込む…〕の窓の種類と、棚が読む AviUtl2 の
+#: ``.object``
+_OBJECT_SUFFIXES = (".exo", ".exa", ".exo2", ".exa2", ".object")
+
+
+def _import_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """AviUtl のオブジェクトのファイルを読み込む 互換の〔オブジェクトを読み込む…〕と同じ手順
+
+    人は窓でファイルを選ぶ 置き方は画面と同じで、元のレイヤーの並びのまま頭（0 フレーム）から
+    """
+    raw = str(arguments.get("path") or "")
+    if not raw:
+        raise ToolError("path を指定してください（.exo .exa .exo2 .exa2 .object）")
+    # 読むのは AviUtl のオブジェクトのファイルだけ 人は窓の「すべてのファイル」で自分で選べるが、
+    # AI には選ぶ人がいない 拡張子を見ないと、本人のメモや設定まで開いて読もうとする
+    _require_suffix(raw, _OBJECT_SUFFIXES, "読み込むオブジェクトのファイル")
+    source = Path(raw)
+    if not source.is_file():
+        raise ToolError(f"ファイルがありません: {source}")
+    try:
+        exo = load_exo(source)
+    except ExoParseError as exc:
+        raise ToolError(f"読み込めません: {exc}") from exc
+    found, commands = exo_commands(exo, source, _project(host), _probe_quietly(host))
+    if not commands:
+        raise ToolError("読み込めるオブジェクトがありませんでした")
+    host.apply_commands(commands, f"AviUtl から読み込み: {source.name}")
+    for media in found.items:
+        host.analyze(media)
+    placed = [c.clip.id for c in commands if isinstance(c, AddClip)]
+    return {
+        "placed": len(placed),
+        "clip_ids": [str(clip_id) for clip_id in placed],
+        "missing_media": len(found.missing),
+    }
+
+
 #: 道具の結果に入りうる物の組（:attr:`Operation.sends`）
 #: 位置・長さ・ID・エフェクトの値だけを返す道具 素材の名前が混ざるのはエラーの文くらいで、
 #: そこは名前を送らないと決めた人には伏せ字にして送る（:func:`sashimono.ai.outbound.redact`）
@@ -3831,6 +4115,15 @@ _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
 #: 名前で、作品の中身でも素材でもないので、アプリの設定と同じく送る 読み込めない理由の文には
 #: 置き場の場所が入りうるので、名前と場所も書く（断った人には伏せる）
 _WITH_LOOKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 保存したプリセットとエイリアスを当てる・置く道具（#328） 結果と断る文に名前が載る
+#: 名前は本人の持ち物で、作品の中身でも素材でもないので、アプリの設定として送る（#308 と同じ）
+_SAVED_LOOKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
+#: 一覧（#328） 保存した名前と棚の名前に加えて、棚のフォルダの名前（本人の置き場の名前）を返す
+#: 作品の中身は返さない
+_LOOKS_AND_PLACES = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
+#: 棚の 1 本を置く・着せる道具（#328） 読めない理由の文に棚の場所が、素材の数え方に素材の場所が
+#: 入りうる
+_LOOKS_AND_PLACES_IN_PROJECT = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
@@ -4806,9 +5099,9 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "字幕をテキストオブジェクトとしてタイムラインへ置く（焼き込み）"
             " 話し手（素材と音声）ごとに別のレイヤーへ入れる 省けば出ている字幕を全部"
-            " 見た目はひな形のテキストのクリップを写すか、保存したエイリアス・プリセットを"
-            "名前で選んで着せる（本文と長さは字幕のまま 動きは字幕の長さに合わせる）"
-            " どちらも省けば下寄せ・縁取りの既定"
+            " 見た目はひな形のテキストのクリップを写すか、保存したエイリアス・プリセット・"
+            "テンプレートの棚から選んで着せる（本文と長さは字幕のまま 動きは字幕の長さに合わせる）"
+            " どちらも省けば下寄せ・縁取りの既定 選べる物は list_looks で読める"
         ),
         schema=_schema(
             {
@@ -4821,11 +5114,13 @@ OPERATIONS: tuple[Operation, ...] = (
                 },
                 "template_clip_id": _string("見た目を写すテキストのクリップ"),
                 "look_kind": _string(
-                    "look_name の種類 alias（自作のエイリアス 既定）か preset（プリセット）"
+                    "look_name の種類 alias（自作のエイリアス 既定）・preset（プリセット）・"
+                    "template（テンプレートの棚）"
                 ),
                 "look_name": _string(
-                    "見た目にする保存したエイリアスかプリセットの名前 template_clip_id と一緒には"
-                    "使えない 文字を持たないエイリアス（図形など）は使えない"
+                    "見た目にする保存したエイリアスかプリセットの名前 棚は list_looks の"
+                    "template_id template_clip_id と一緒には使えない 文字を持たない物"
+                    "（図形など）は使えない"
                 ),
                 "look_category": _string(
                     "プリセットの分類 同じ名前のプリセットが分類違いで重なるときに指定する"
@@ -4834,6 +5129,116 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_place_subtitles,
         sends=_WITH_LOOKS,
+        writes=True,
+    ),
+    Operation(
+        name="list_looks",
+        description=(
+            "保存したプリセット（クリップに当てる見た目）・自作のエイリアス（置き直すクリップ）・"
+            "テンプレートの棚（AviUtl のエイリアスと YMM4 のアイテムテンプレート）を一覧する"
+            " 見た目を一から作る前に、ここにある物を apply_preset・place_alias・place_template・"
+            "apply_template で使う 棚は template_id で指す" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "kind": _string("preset・alias・template のどれかで絞る 省けば全部"),
+                "contains": _string("名前に含む言葉で絞る"),
+                **_paging(),
+            }
+        ),
+        handler=_list_looks,
+        # 本人が保存した名前（アプリの設定）と、棚のフォルダの名前（本人の置き場の名前）
+        sends=_LOOKS_AND_PLACES,
+    ),
+    Operation(
+        name="apply_preset",
+        description=(
+            "保存したプリセット（見た目ひとそろい）をクリップへ当てる 設定パネルの"
+            "〔プリセット…〕と同じ当て方（文字と位置を当てるかは本人の設定のまま）"
+            " 取り消し 1 回で全部戻る"
+        ),
+        schema=_schema(
+            {
+                "name": _string("プリセットの名前（list_looks の kind=preset）"),
+                "category": _string("分類 同じ名前が分類違いで重なるときに指定する"),
+                "clip_ids": _clip_ids_schema(),
+            },
+            ["name"],
+        ),
+        handler=_apply_preset,
+        sends=_SAVED_LOOKS,
+        writes=True,
+    ),
+    Operation(
+        name="place_alias",
+        description=(
+            "保存したエイリアス（作り込んだクリップ）を置く 右クリックの〔追加〕→"
+            "〔エイリアス〕と同じ 長さと動きは保存したまま"
+        ),
+        schema=_schema(
+            {
+                "name": _string("エイリアスの名前（list_looks の kind=alias）"),
+                "at_frame": _integer("置く位置 省けば再生ヘッド"),
+                "track_id": _string("置くトラック 空いていなければいつもの決まりで選ぶ"),
+            },
+            ["name"],
+        ),
+        handler=_place_alias,
+        sends=_SAVED_LOOKS,
+        writes=True,
+    ),
+    Operation(
+        name="place_template",
+        description=(
+            "テンプレートの棚の 1 本（AviUtl のエイリアス・YMM4 のアイテムテンプレート）を置く"
+            " 互換の〔テンプレート…〕の〔置く〕と同じ 指している画像や音声も素材として登録する"
+            " 元のレイヤーの所が埋まっていれば、全部を一番手前の新しいトラックへ上下の並びのまま"
+            "置く 取り消し 1 回で素材ごと戻る"
+        ),
+        schema=_schema(
+            {
+                "template_id": _string("棚の 1 本（list_looks の kind=template の template_id）"),
+                "at_frame": _integer("置く位置 省けば再生ヘッド"),
+                "track_id": _string(
+                    "置くトラック 置く物が 1 つでそこが空いていれば使う 省けば元のレイヤーの並び"
+                    "（埋まっていれば一番手前の新しいトラック）"
+                ),
+            },
+            ["template_id"],
+        ),
+        handler=_place_template,
+        # 読めない理由の文と素材の数え方に、棚や素材の場所が入りうる
+        sends=_LOOKS_AND_PLACES_IN_PROJECT,
+        writes=True,
+    ),
+    Operation(
+        name="apply_template",
+        description=(
+            "テンプレートの棚の 1 本の見た目をテキストのクリップに着せる 互換の"
+            "〔テンプレート…〕の〔選択中のクリップに適用〕と同じ 文字と長さはそのまま"
+        ),
+        schema=_schema(
+            {
+                "template_id": _string("棚の 1 本（list_looks の kind=template の template_id）"),
+                "clip_id": _string("着せるテキストのクリップ 省けば選択中のクリップ"),
+            },
+            ["template_id"],
+        ),
+        handler=_apply_template,
+        sends=_LOOKS_AND_PLACES_IN_PROJECT,
+        writes=True,
+    ),
+    Operation(
+        name="import_objects",
+        description=(
+            "AviUtl のオブジェクトのファイル（.exo .exa .exo2 .exa2 .object）を読み込んで置く"
+            " 互換の〔オブジェクトを読み込む…〕と同じ 元のレイヤーの並びのまま頭から置き、"
+            "指している素材も登録する 元のレイヤーの所が埋まっていれば、全部を一番手前の新しい"
+            "トラックへ上下の並びのまま置く 取り消し 1 回で素材ごと戻る"
+        ),
+        schema=_schema({"path": _string("読み込むファイルの場所")}, ["path"]),
+        handler=_import_objects,
+        sends=_WITH_FILES,
         writes=True,
     ),
     Operation(

@@ -155,6 +155,14 @@ _EXPORT_NOTE = (
     "書き出しの窓で前に選んだフォルダの中だけ（#350 の決定）"
 )
 _SNAPSHOT_NOTE = "絵を見るだけなら preview_frame で足りる 保存先は作品のフォルダなどの中だけ"
+#: プリセットとエイリアスの置き場を書き換える操作（保存・名前と分類の変更・複製・削除・書き出し・
+#: 読み込み #328） 置き場は作品の外の本人の持ち物 2026-10-17 に本人が「AI は読むだけ」と
+#: 決めた 区分は出さない候補のまま（#350 の決定の 5 つとは別に決めたので、READ_ONLY の
+#: 行の読む道具 get_app_settings では読まない 読むのは list_looks）
+_LIBRARY = (
+    "本人の持ち物（プリセットとエイリアスの置き場）を書き換える 本人が 2026-10-17 に"
+    "読むだけと決めた（中身は list_looks で読み、当てる・置くは apply_preset・place_alias）"
+)
 
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
@@ -224,7 +232,8 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/オブジェクト/図形を追加", "add_shape"),
     same("メニュー/オブジェクト/場面切り替えを追加", "add_transition"),
     missing("メニュー/オブジェクト/フィルタを追加", 349),
-    missing("メニュー/オブジェクト/プリセットとエイリアス…", 328),
+    # 一覧の窓（整理だけ 当てる・置く先は持たない show_library）
+    hidden("メニュー/オブジェクト/プリセットとエイリアス…", _LIBRARY),
     # --- メニュー シーン ---
     same("メニュー/シーン/新しいシーン…", "add_scene"),
     same("メニュー/シーン/シーンを置く…", "place_scene"),
@@ -239,8 +248,22 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/字幕/焼き込み", "place_subtitles"),
     same("メニュー/字幕/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     # --- メニュー 互換 ---
-    missing("メニュー/互換/オブジェクトを読み込む…", 328, ".exo .exa .ymmp の部品"),
-    missing("メニュー/互換/テンプレート…", 328),
+    same(
+        "メニュー/互換/オブジェクトを読み込む…",
+        "import_objects",
+        note=(
+            "人は窓でファイルを選ぶ 元のレイヤーの並びのまま頭から置き、埋まっていれば"
+            "一番手前の新しいトラックへ（画面と同じ）"
+        ),
+    ),
+    same(
+        "メニュー/互換/テンプレート…",
+        "place_template",
+        "apply_template",
+        note=(
+            "〔置く〕は place_template、〔選択中のクリップに適用〕は apply_template 棚は list_looks"
+        ),
+    ),
     missing(
         "メニュー/互換/スクリプトを読み直す",
         349,
@@ -307,7 +330,7 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/音量を基準にそろえる…", "normalize_loudness"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
-    missing("タイムラインの右クリック/エイリアスとして保存…", 328),
+    hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),
     missing("タイムラインの右クリック/線に不透明度を出す", 350, _VIEW, Safety.READ_ONLY),
     missing("タイムラインの右クリック/線に音量を出す", 350, _VIEW, Safety.READ_ONLY),
     # --- タイムラインの右クリック 空いた所 ---
@@ -318,19 +341,22 @@ LEDGER: tuple[Entry, ...] = (
     missing("タイムラインの右クリック/追加/フィルタ", 349),
     missing("タイムラインの右クリック/追加/グループ制御", 349),
     missing("タイムラインの右クリック/追加/カスタムオブジェクト/*", 349, "AviUtl の .obj を置く"),
-    missing(
+    partial(
         "タイムラインの右クリック/追加/エイリアス/管理…（見本で選ぶ・名前や分類を変える・消す）",
-        328,
+        "place_alias",
+        issue=350,
+        note=f"一覧から選んで置くのは place_alias {_LIBRARY}",
     ),
-    missing(
+    same(
         "タイムラインの右クリック/追加/エイリアス/*/*",
-        328,
-        "保存したエイリアスと、AviUtl・YMM4 のテンプレートの棚",
+        "place_alias",
+        "place_template",
+        note="保存したエイリアスは place_alias、AviUtl・YMM4 のテンプレートの棚は place_template",
     ),
-    missing(
+    same(
         "タイムラインの右クリック/追加/エイリアス/保存したもの/*/*",
-        328,
-        "保存したエイリアスの分類が 2 つ以上あると、分類ごとの段に並ぶ",
+        "place_alias",
+        note="保存したエイリアスの分類が 2 つ以上あると、分類ごとの段に並ぶ",
     ),
     same("タイムラインの右クリック/追加/シーン/*", "place_scene"),
     # --- タイムラインの右クリック トラック・範囲 ---
@@ -451,8 +477,11 @@ LEDGER: tuple[Entry, ...] = (
     same("設定パネル/クリップ自身の欄/clip_to_below", "set_clip_property", note="クリッピング"),
     same("設定パネル/クリップ自身の欄/native_size", "set_clip_property", note="画素で置く"),
     same("設定パネル/エフェクトを追加…", "add_effect"),
-    missing(
-        "設定パネル/プリセット…｜選んでいるクリップの見た目を保存し、ほかのクリップへ当てる", 328
+    partial(
+        "設定パネル/プリセット…｜選んでいるクリップの見た目を保存し、ほかのクリップへ当てる",
+        "apply_preset",
+        issue=350,
+        note=f"当てるのは apply_preset {_LIBRARY}",
     ),
     missing(
         "設定パネル/有効｜この組の欄を掛けるかどうか 無効にすると既定の置き方・鳴り方に戻る", 349
@@ -537,9 +566,18 @@ LEDGER: tuple[Entry, ...] = (
         issue=349,
         note="場面切り替えの前と後のどちらの場面へ積むかを選べない",
     ),
-    missing("設定パネルの〔プリセット…〕/この見た目を保存…", 328),
-    missing("設定パネルの〔プリセット…〕/管理…（見本で選ぶ・名前や分類を変える・消す）", 328),
-    missing("設定パネルの〔プリセット…〕/*/*", 328, "保存したプリセットを当てる（分類ごとの一覧）"),
+    hidden("設定パネルの〔プリセット…〕/この見た目を保存…", _LIBRARY),
+    partial(
+        "設定パネルの〔プリセット…〕/管理…（見本で選ぶ・名前や分類を変える・消す）",
+        "apply_preset",
+        issue=350,
+        note=f"一覧から選んで当てるのは apply_preset {_LIBRARY}",
+    ),
+    same(
+        "設定パネルの〔プリセット…〕/*/*",
+        "apply_preset",
+        note="保存したプリセットを当てる（分類ごとの一覧） 当て方は本人の設定のまま",
+    ),
     same("設定パネルの縁取りの〔効果〕/*/*", "add_effect", note="stroke_id を渡す"),
     missing("設定パネルの ◆ の右クリック/アニメーションを解除", 349, "キーフレームを消す"),
     missing("設定パネルの ◆ の右クリック/グラフエディタで開く", 350, _VIEW, Safety.READ_ONLY),
@@ -569,6 +607,9 @@ AI_ONLY: dict[str, str] = {
     "list_scenes": READING,
     # 目印とチャプター（#330） 人は目盛りの旗を見て読む 目次の文は画面に同じ入口が無い
     "list_markers": READING,
+    # 保存した見た目と棚の一覧（#328） 人は〔プリセット…〕と〔追加〕→〔エイリアス〕のメニューで
+    # 名前を見て選ぶ 一覧を読むだけで、当てる・置くのは台帳の行の道具
+    "list_looks": READING,
     "get_chapters": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
