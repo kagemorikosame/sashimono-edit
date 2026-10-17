@@ -74,6 +74,7 @@ from sashimono.core.commands import (
     switch_layer_mode,
 )
 from sashimono.core.commands.project_format import retime_frame
+from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io import (
     LEGACY_SUFFIXES,
     SUFFIX,
@@ -3367,6 +3368,10 @@ class MainWindow(QMainWindow):
     @property
     def duck_shape(self) -> DuckShape:
         return self._preferences.duck_shape
+
+    @property
+    def emphasis_style(self) -> EmphasisStyle:
+        return self._preferences.emphasis_style
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

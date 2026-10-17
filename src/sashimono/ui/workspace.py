@@ -26,6 +26,21 @@ from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
+from sashimono.core.emphasis import (
+    DEFAULT_EMPHASIS_EASING,
+    DEFAULT_EMPHASIS_PAN_PX,
+    DEFAULT_EMPHASIS_POP_PERCENT,
+    DEFAULT_EMPHASIS_RAMP_MS,
+    DEFAULT_EMPHASIS_SHAKE_PX,
+    DEFAULT_EMPHASIS_ZOOM_PERCENT,
+    EMPHASIS_EASINGS,
+    EMPHASIS_PAN_PX_RANGE,
+    EMPHASIS_POP_PERCENT_RANGE,
+    EMPHASIS_RAMP_MS_RANGE,
+    EMPHASIS_SHAKE_PX_RANGE,
+    EMPHASIS_ZOOM_PERCENT_RANGE,
+    EmphasisStyle,
+)
 from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.mixing import (
     DEFAULT_DUCK_ATTACK_MS,
@@ -564,6 +579,21 @@ class Preferences:
     #: ダッキングで話し終えてから元の音量へ戻るまでの長さ（ミリ秒） 既定は 800 短いと文の間で
     #: BGM が出入りして落ち着かない（ポンピング）
     duck_release_ms: int = DEFAULT_DUCK_RELEASE_MS
+    #: AI アシスタントが付ける強調の動き（#331）の既定 どれだけ寄るか・揺らすか・どれだけ速く
+    #: 動くかは人と作品で違う AI に値を言わなければこれを使う 既定は寄ったと分かり、画面の端が
+    #: 大きく欠けず、字幕が読めなくならない側（:mod:`sashimono.core.emphasis`）
+    #: ズームの拡大率（今の大きさからの %）
+    emphasis_zoom_percent: int = DEFAULT_EMPHASIS_ZOOM_PERCENT
+    #: ポップ（一瞬ふくらんで戻る）の拡大率（%）
+    emphasis_pop_percent: int = DEFAULT_EMPHASIS_POP_PERCENT
+    #: 揺れの幅（画素 上下左右それぞれ）
+    emphasis_shake_px: int = DEFAULT_EMPHASIS_SHAKE_PX
+    #: パンで向きだけを言われたときにずらす長さ（画素）
+    emphasis_pan_px: int = DEFAULT_EMPHASIS_PAN_PX
+    #: 動き始めてから動き切るまで（と戻るまで）の長さ（ミリ秒）
+    emphasis_ramp_ms: int = DEFAULT_EMPHASIS_RAMP_MS
+    #: 動き方（:data:`~sashimono.core.emphasis.EMPHASIS_EASINGS`） 既定はなめらかに動き出して止まる
+    emphasis_easing: str = DEFAULT_EMPHASIS_EASING
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -623,6 +653,18 @@ class Preferences:
             depth_db=float(self.duck_depth_db),
             attack_ms=self.duck_attack_ms,
             release_ms=self.duck_release_ms,
+        )
+
+    @property
+    def emphasis_style(self) -> EmphasisStyle:
+        """AI アシスタントの強調の動き（#331）の既定 AI が値を言わなければこれを使う"""
+        return EmphasisStyle(
+            zoom_percent=self.emphasis_zoom_percent,
+            pop_percent=self.emphasis_pop_percent,
+            shake_px=self.emphasis_shake_px,
+            pan_px=self.emphasis_pan_px,
+            ramp_ms=self.emphasis_ramp_ms,
+            easing=self.emphasis_easing,
         )
 
     @property
@@ -836,6 +878,28 @@ class PreferenceStore:
             ),
             duck_release_ms=_within(
                 data.get("duck_release_ms"), DUCK_RELEASE_MS_RANGE, plain.duck_release_ms
+            ),
+            emphasis_zoom_percent=_within(
+                data.get("emphasis_zoom_percent"),
+                EMPHASIS_ZOOM_PERCENT_RANGE,
+                plain.emphasis_zoom_percent,
+            ),
+            emphasis_pop_percent=_within(
+                data.get("emphasis_pop_percent"),
+                EMPHASIS_POP_PERCENT_RANGE,
+                plain.emphasis_pop_percent,
+            ),
+            emphasis_shake_px=_within(
+                data.get("emphasis_shake_px"), EMPHASIS_SHAKE_PX_RANGE, plain.emphasis_shake_px
+            ),
+            emphasis_pan_px=_within(
+                data.get("emphasis_pan_px"), EMPHASIS_PAN_PX_RANGE, plain.emphasis_pan_px
+            ),
+            emphasis_ramp_ms=_within(
+                data.get("emphasis_ramp_ms"), EMPHASIS_RAMP_MS_RANGE, plain.emphasis_ramp_ms
+            ),
+            emphasis_easing=_choice(
+                data.get("emphasis_easing"), EMPHASIS_EASINGS, plain.emphasis_easing
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis
