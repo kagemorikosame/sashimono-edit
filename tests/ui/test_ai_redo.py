@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
+from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddClip, AddTrack
 from sashimono.core.model import Clip, Project, ProjectSettings, Track, TrackKind
@@ -88,6 +89,45 @@ class TestTheScreenFollowsTheAi:
         assert _shown_clips(window) == 2
         assert window._undo_action.text() == "元に戻す: クリップを分割"
         assert window._redo_action.isEnabled() is False
+
+
+class TestThePersonsEditsDuringAnInstruction:
+    """AI の指示の途中に人が変えた物は人の段（2026-10-18 利用者の決定）"""
+
+    def test_a_persons_edit_is_kept_apart_from_the_instruction(self, window: MainWindow) -> None:
+        """壊れると、AI の指示を取り消したときに、その間に人が足したトラックまで消える"""
+        tracks = len(window.document.project.timeline.tracks)
+        window._chat._open_checkpoint("切って")
+        _split(window, 60)
+        window.execute(AddTrack(Track(TrackKind.AUDIO, "人のトラック")))
+        _split(window, 30)
+        window._chat._close_checkpoint()
+
+        assert window.document.history_labels == (
+            "AI: 切って",
+            "トラックを追加: 人のトラック",
+            "AI: 切って",
+        )
+        result = _tool(window, "undo", steps=3)
+
+        # AI は人の段の後の分だけ戻して止まる 人のトラックは残る
+        assert result["undone"] == ["AI: 切って"]
+        assert "Ctrl+Z" in result["stopped"]
+        assert len(window._timeline.project.timeline.tracks) == tracks + 1
+        assert _shown_clips(window) == 2
+
+    def test_the_ai_refuses_and_the_person_can_still_undo(self, window: MainWindow) -> None:
+        """壊れると、人が後から変えた物を AI が戻すか、人の Ctrl+Z まで止まる"""
+        _split(window, 30)
+        window.execute(AddTrack(Track(TrackKind.AUDIO, "人のトラック")))
+
+        with pytest.raises(ToolError, match="人が後から手で変えた段があるので戻しません"):
+            _tool(window, "undo")
+
+        window.undo()
+        window.undo()
+        assert _shown_clips(window) == 1
+        assert window._redo_action.text() == "やり直す: クリップを分割"
 
 
 class TestThePersonUndoesDuringAnInstruction:

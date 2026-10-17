@@ -21,7 +21,7 @@ from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
-from sashimono.core.commands import AddClip, Command, Document, InScene
+from sashimono.core.commands import AddClip, Author, Command, Document, InScene
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.serialize import save_project
@@ -191,7 +191,8 @@ class FakeHost:
         if not commands:
             return
         try:
-            with self._document.checkpoint(label):
+            # 編集画面と同じく AI の印を付ける 付けないと、AI の段を人の段と数えて取り消しを断る
+            with self._document.checkpoint(label, by=Author.AI):
                 for command in commands:
                     if self.scene is not None and not isinstance(command, InScene):
                         command = InScene(self.scene, command)

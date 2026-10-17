@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from sashimono.core.commands import Document, RenameProject
-from sashimono.core.model import Project
+from sashimono.core.commands import AddTrack, Author, Document, RenameProject
+from sashimono.core.model import Project, Track, TrackKind
 
 
 def _named(document: Document, *names: str) -> None:
@@ -194,3 +194,139 @@ class TestUndoInsideAnOpenStep:
         assert undone in document.past_projects
         document.end_checkpoint()
         assert undone in document.past_projects
+
+
+def _by_ai(document: Document, name: str) -> None:
+    """AI の道具 1 回分（ホストの apply_commands と同じく AI の印を付けてまとめる）"""
+    with document.checkpoint("AI の道具", by=Author.AI):
+        document.execute(RenameProject(name))
+
+
+def _person_adds_a_track(document: Document) -> None:
+    """人が画面で 1 つ変えた（編集画面と同じく人の印を付ける）"""
+    document.execute(AddTrack(Track(TrackKind.AUDIO, "人の足したトラック")), by=Author.PERSON)
+
+
+def _undo_by(document: Document) -> Author | None:
+    # 読むたびに今の値を見る（mypy は前に比べた値のまま見て、変わった後の比べ方を咎める）
+    return document.undo_by
+
+
+def _redo_by(document: Document) -> Author | None:
+    return document.redo_by
+
+
+def _tracks(document: Document) -> int:
+    return len(document.project.timeline.tracks)
+
+
+class TestWhoMadeTheStep:
+    """段ごとの「誰が変えたか」の印（2026-10-18 利用者の決定 AI は人の段を戻さない）"""
+
+    def test_each_step_remembers_who_made_it(self, project: Project) -> None:
+        """壊れると、AI が人の手の段と自分の段を見分けられず、人の変更を巻き戻す"""
+        document = Document(project)
+        _person_adds_a_track(document)
+        assert _undo_by(document) is Author.PERSON
+        _by_ai(document, "AI")
+        assert _undo_by(document) is Author.AI
+        document.undo()
+        # 取り消した後のやり直しも、誰の段かを覚えている
+        assert _redo_by(document) is Author.AI
+        assert _undo_by(document) is Author.PERSON
+
+    def test_a_persons_edit_during_an_ai_instruction_is_its_own_step(
+        self, project: Project
+    ) -> None:
+        """壊れると、AI の指示の途中に人が変えた物が「AI: 〜」の段に混ざり、指示と一緒に消える"""
+        document = Document(project)
+        tracks = _tracks(document)
+        document.begin_checkpoint("AI: 名前を変えて", by=Author.AI)
+        _by_ai(document, "AI の一つ目")
+        _person_adds_a_track(document)
+        _by_ai(document, "AI の二つ目")
+        document.end_checkpoint()
+
+        assert document.history_labels == (
+            "AI: 名前を変えて",
+            "トラックを追加: 人の足したトラック",
+            "AI: 名前を変えて",
+        )
+        assert _undo_by(document) is Author.AI
+        # 指示の後半を取り消しても、人の足したトラックは残る
+        document.undo()
+        assert document.project.name == "AI の一つ目"
+        assert _tracks(document) == tracks + 1
+        assert _undo_by(document) is Author.PERSON
+
+    def test_a_persons_grouped_edit_during_an_instruction_is_its_own_step(
+        self, project: Project
+    ) -> None:
+        """壊れると、人がまとめて当てた操作（貼り付けなど）が AI の指示の段に飲み込まれる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _by_ai(document, "AI")
+        with document.checkpoint("人のまとめ", by=Author.PERSON):
+            _person_adds_a_track(document)
+            _person_adds_a_track(document)
+        document.end_checkpoint()
+
+        assert document.history_labels == ("AI: 指示", "人のまとめ")
+        assert _undo_by(document) is Author.PERSON
+        document.undo()
+        assert _tracks(document) == len(project.timeline.tracks)
+        assert document.project.name == "AI"
+
+    def test_a_persons_edit_right_at_the_start_leaves_no_empty_ai_step(
+        self, project: Project
+    ) -> None:
+        """壊れると、AI がまだ何もしていない所で人が変えると、何も起きない「AI: 〜」の段が挟まる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _person_adds_a_track(document)
+        _by_ai(document, "AI")
+        document.end_checkpoint()
+        assert document.history_labels == ("トラックを追加: 人の足したトラック", "AI: 指示")
+
+    def test_a_failed_persons_edit_does_not_split_the_instruction(self, project: Project) -> None:
+        """壊れると、断られて何も変わらなかった人の操作のせいで、AI の指示が 2 段に割れる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _by_ai(document, "一")
+        with pytest.raises(KeyError), document.checkpoint("人の断られる操作", by=Author.PERSON):
+            _person_adds_a_track(document)
+            raise KeyError("断る")
+        _by_ai(document, "二")
+        document.end_checkpoint()
+        assert document.history_labels == ("AI: 指示",)
+
+    def test_the_persons_ctrl_z_still_undoes_everything(self, project: Project) -> None:
+        """壊れると、人が Ctrl+Z で AI の段も人の段も戻せず、印のせいで履歴の途中で止まる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _by_ai(document, "一")
+        _person_adds_a_track(document)
+        _by_ai(document, "二")
+        document.end_checkpoint()
+        for _ in range(3):
+            document.undo()
+        assert document.project is project
+        for _ in range(3):
+            document.redo()
+        assert document.project.name == "二"
+
+    def test_split_instruction_projects_stay_in_the_table_for_hiding_names(
+        self, project: Project
+    ) -> None:
+        """壊れると、人の手で割れた指示の前半の形が伏せ字の表から落ち、そこにだけある名前が漏れる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _by_ai(document, "前半だけの名前")
+        first_half = document.project
+        _person_adds_a_track(document)
+        _by_ai(document, "後半")
+        document.end_checkpoint()
+        assert first_half in document.past_projects
+        for _ in range(3):
+            document.undo()
+        assert first_half in document.past_projects

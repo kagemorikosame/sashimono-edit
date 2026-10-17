@@ -66,6 +66,7 @@ from sashimono.core.commands import (
     AddScene,
     AddStroke,
     AddTrack,
+    Author,
     Command,
     GroupClips,
     MoveClip,
@@ -1411,6 +1412,10 @@ def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
     return copy.deepcopy(host.app_settings())
 
 
+def _author(by: Author | None) -> str | None:
+    return by.value if by is not None else None
+
+
 def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     document = host.document
@@ -1420,6 +1425,9 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
         "recent": list(document.history_labels[-10:]),
         "can_redo": document.can_redo,
         "redo_label": document.redo_label,
+        # 次に戻す・やり直す段を誰が変えたか（person か ai） 人の段は AI は戻さない（#333）
+        "undo_by": _author(document.undo_by),
+        "redo_by": _author(document.redo_by),
         # 今の指示で変えた手（古い順） 指示の中で undo するとここから戻る（#333）
         "this_instruction": list(document.steps_in_checkpoint),
     }
@@ -3301,12 +3309,18 @@ def _transcription_status(host: EditorHost, arguments: dict[str, Any]) -> object
     return {"status": host.transcription_status()}
 
 
+#: 人が手で変えた段を AI が戻さないときの断り（2026-10-18 利用者の決定 #333）
+#: 「動き: 対象」の形の文は伏せ字で後ろが消えるので、案内を先に書き、段の名前は最後に付ける
+PERSON_UNDO_REFUSAL = "人が後から手で変えた段があるので戻しません 戻すなら Ctrl+Z で"
+PERSON_REDO_REFUSAL = "人が手で変えた段なのでやり直しません やり直すなら Ctrl+Y で"
+
+
 def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
     """人の〔元に戻す〕を何回か押すのと同じ 指示の途中なら、この指示の 1 手から戻す（#333）
 
     指示の中の手は :attr:`Document.steps_in_checkpoint` に積まれていて、戻し切ると前の指示の
     1 段（「AI: 〜」）をまとめて戻す 履歴は人の Ctrl+Z / Ctrl+Y と同じ 1 本なので、AI が
-    戻した物は人が Ctrl+Y でやり直せる
+    戻した物は人が Ctrl+Y でやり直せる 人が手で変えた段に当たったら、そこで止める
     """
     document = host.document
     whole = bool(arguments.get("this_instruction", False))
@@ -3317,33 +3331,48 @@ def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "steps と this_instruction は一緒に使えません どちらか一方にしてください"
             )
         steps = len(document.steps_in_checkpoint)
-        if steps == 0:
+        if steps == 0 and document.undo_by is not Author.PERSON:
             raise ToolError(
                 "この指示ではまだ何も変えていません 前の指示を戻すなら、"
                 "this_instruction を付けずに undo を呼んでください"
             )
+        steps = max(steps, 1)
     else:
         steps = max(1, int(arguments.get("steps", 1)))
-    undone = _step_history(host, steps, forward=False)
+    undone, blocked = _step_history(host, steps, forward=False)
     if not undone:
+        if blocked is not None:
+            raise ToolError(f"{PERSON_UNDO_REFUSAL} 人の段 {blocked}")
         raise ToolError("戻せる操作がありません")
-    return {"undone": undone, "can_redo": document.can_redo}
+    result: dict[str, object] = {"undone": undone, "can_redo": document.can_redo}
+    if blocked is not None:
+        result["stopped"] = f"{PERSON_UNDO_REFUSAL} ここで止めました"
+    return result
 
 
 def _redo(host: EditorHost, arguments: dict[str, Any]) -> object:
-    """人の〔やり直す〕を何回か押すのと同じ 取り消した後に別の編集をすると、やり直せない"""
+    """人の〔やり直す〕を何回か押すのと同じ 取り消した後に別の編集をすると、やり直せない
+
+    人が手で変えた段（人が Ctrl+Z で戻した自分の変更）はやり直さない
+    """
     steps = max(1, int(arguments.get("steps", 1)))
-    redone = _step_history(host, steps, forward=True)
+    redone, blocked = _step_history(host, steps, forward=True)
     if not redone:
+        if blocked is not None:
+            raise ToolError(f"{PERSON_REDO_REFUSAL} 人の段 {blocked}")
         raise ToolError(
             "やり直せる操作がありません 取り消した後に別の編集をすると、やり直しは消えます"
         )
-    return {"redone": redone, "can_redo": host.document.can_redo}
+    result: dict[str, object] = {"redone": redone, "can_redo": host.document.can_redo}
+    if blocked is not None:
+        result["stopped"] = f"{PERSON_REDO_REFUSAL} ここで止めました"
+    return result
 
 
-def _step_history(host: EditorHost, steps: int, *, forward: bool) -> list[str]:
-    """履歴を ``steps`` 段だけ辿り、辿った段の名前を返す 端に着いたらそこで止める
+def _step_history(host: EditorHost, steps: int, *, forward: bool) -> tuple[list[str], str | None]:
+    """履歴を ``steps`` 段だけ辿り、辿った段の名前と、止めた人の段の名前を返す
 
+    端に着いたら止める 人が手で変えた段に当たったら、そこで止めて名前を返す
     ホストの口（人のメニューと同じ処理）を通す 文書を直に辿ると画面が前の形のまま残る
     """
     document = host.document
@@ -3352,12 +3381,15 @@ def _step_history(host: EditorHost, steps: int, *, forward: bool) -> list[str]:
         label = document.redo_label if forward else document.undo_label
         if label is None:
             break
+        by = document.redo_by if forward else document.undo_by
+        if by is Author.PERSON:
+            return moved, label
         if forward:
             host.redo()
         else:
             host.undo()
         moved.append(label)
-    return moved
+    return moved, None
 
 
 def _seek(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -5488,7 +5520,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "直前の操作を取り消す（画面の〔元に戻す〕と同じ） 今の指示の途中なら、この指示で"
             "変えた手を 1 つずつ戻す この指示で変えた物を全部戻すなら this_instruction を真に"
             "する この指示でまだ何も変えていなければ、前の指示の変更をまとめて 1 段で戻す"
-            " 人が手で変えた段も同じ履歴に並ぶので、戻す前に get_history で名前を確かめる"
+            " 人が手で変えた段は戻さない（当たったら断るか、そこで止めて stopped に書く"
+            " 人に Ctrl+Z を頼む） 次に戻す段が誰の物かは get_history の undo_by で分かる"
             " 戻した物は redo でやり直せる"
         ),
         schema=_schema(
@@ -5510,6 +5543,7 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "取り消した操作をやり直す（画面の〔やり直す〕と同じ） 取り消した後に別の編集を"
             "するとやり直しは消える やり直せる物は get_history の redo_label で分かる"
+            " 人が手で変えた段（redo_by が person）はやり直さない"
         ),
         schema=_schema({"steps": _integer("やり直す段数（既定 1）")}),
         handler=_redo,

@@ -61,6 +61,7 @@ from sashimono.ai.session import (
     outdated_claude_code,
     system_prompt,
 )
+from sashimono.core.commands import Author
 from sashimono.ui.chat.parts_updater import PartsUpdater
 from sashimono.ui.chat.send_consent import ask_send
 from sashimono.ui.disclosure import DisclosureButton
@@ -1003,7 +1004,7 @@ class ChatPanel(QWidget):
         label = prompt.strip().splitlines()[0]
         if len(label) > 24:
             label = label[:23] + "…"
-        self._host.document.begin_checkpoint(f"AI: {label}")
+        self._host.document.begin_checkpoint(f"AI: {label}", by=Author.AI)
         self._checkpoint_open = True
 
     def _close_checkpoint(self) -> None:

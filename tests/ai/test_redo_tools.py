@@ -18,8 +18,8 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound, SendChoice
-from sashimono.core.commands import AddMedia
-from sashimono.core.model import ClipId, MediaItem, Transcript, new_media_id
+from sashimono.core.commands import AddMedia, AddTrack, Author, RenameProject
+from sashimono.core.model import ClipId, MediaItem, Track, TrackKind, Transcript, new_media_id
 from tests.ai.conftest import FakeHost
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_outbound import (
@@ -92,7 +92,7 @@ class TestTheScopeOfOneInstruction:
     def test_undo_in_an_instruction_reverts_only_the_last_tool(self, host: FakeHost) -> None:
         """壊れると、AI が直前の 1 手だけ戻すつもりで、前の指示ごと戻してしまう"""
         _split(host, 200)
-        host.document.begin_checkpoint("AI: 細かく切って")
+        host.document.begin_checkpoint("AI: 細かく切って", by=Author.AI)
         _split(host, 100)
         _split(host, 50)
 
@@ -107,7 +107,7 @@ class TestTheScopeOfOneInstruction:
     def test_undo_the_whole_instruction_keeps_what_came_before(self, host: FakeHost) -> None:
         """壊れると、「この指示でやったことを全部戻して」で、前の指示や人の編集まで戻る"""
         _split(host, 200)
-        host.document.begin_checkpoint("AI: 細かく切って")
+        host.document.begin_checkpoint("AI: 細かく切って", by=Author.AI)
         _split(host, 100)
         _split(host, 50)
 
@@ -121,7 +121,7 @@ class TestTheScopeOfOneInstruction:
     def test_undo_the_whole_instruction_with_nothing_done_is_refused(self, host: FakeHost) -> None:
         """壊れると、まだ何もしていない指示で「全部戻す」が前の操作を戻してしまう"""
         _split(host, 200)
-        host.document.begin_checkpoint("AI: 何もまだ")
+        host.document.begin_checkpoint("AI: 何もまだ", by=Author.AI)
         with pytest.raises(ToolError, match="この指示ではまだ何も変えていません"):
             run(host, "undo", this_instruction=True)
         assert _clip_count(host) == 2
@@ -129,7 +129,7 @@ class TestTheScopeOfOneInstruction:
 
     def test_steps_and_the_whole_instruction_cannot_be_mixed(self, host: FakeHost) -> None:
         """壊れると、どちらの頼みを優先したのか AI に分からないまま、片方だけ当たる"""
-        host.document.begin_checkpoint("AI: 両方")
+        host.document.begin_checkpoint("AI: 両方", by=Author.AI)
         _split(host, 100)
         with pytest.raises(ToolError, match="steps"):
             run(host, "undo", steps=2, this_instruction=True)
@@ -141,12 +141,12 @@ class TestTheScopeOfOneInstruction:
 
         戻した指示は、人が後から Ctrl+Y でまとめてやり直せる
         """
-        host.document.begin_checkpoint("AI: 前の指示")
+        host.document.begin_checkpoint("AI: 前の指示", by=Author.AI)
         _split(host, 100)
         _split(host, 50)
         host.document.end_checkpoint()
 
-        host.document.begin_checkpoint("AI: さっきのを取り消して")
+        host.document.begin_checkpoint("AI: さっきのを取り消して", by=Author.AI)
         result = run(host, "undo")
         host.document.end_checkpoint()
 
@@ -159,7 +159,7 @@ class TestTheScopeOfOneInstruction:
 
     def test_what_the_ai_undid_last_can_be_redone_by_the_person_later(self, host: FakeHost) -> None:
         """壊れると、AI が指示の最後に取り消した 1 手を、人が後から Ctrl+Y で戻せない"""
-        host.document.begin_checkpoint("AI: 試して戻す")
+        host.document.begin_checkpoint("AI: 試して戻す", by=Author.AI)
         _split(host, 100)
         _split(host, 50)
         run(host, "undo")
@@ -170,13 +170,102 @@ class TestTheScopeOfOneInstruction:
         assert _clip_count(host) == 3
 
 
+def _person_adds_a_track(host: FakeHost) -> None:
+    """人が画面で 1 つ変えた（編集画面と同じく人の印を付ける）"""
+    host.document.execute(AddTrack(Track(TrackKind.AUDIO, "人の足したトラック")), by=Author.PERSON)
+
+
+def _tracks(host: FakeHost) -> int:
+    return len(host.document.project.timeline.tracks)
+
+
+class TestThePersonsStepsAreLeftAlone:
+    """AI は人が手で変えた段を戻さない・やり直さない（2026-10-18 利用者の決定）"""
+
+    def test_undo_refuses_when_the_person_changed_last(self, host: FakeHost) -> None:
+        """壊れると、「さっきの指示を取り消して」で、人が後から足した物を AI が黙って消す"""
+        _split(host, 100)
+        _person_adds_a_track(host)
+        before = host.document.project
+
+        with pytest.raises(ToolError, match="人が後から手で変えた段があるので戻しません"):
+            run(host, "undo")
+
+        assert host.document.project is before
+
+    def test_undo_stops_at_the_persons_step(self, host: FakeHost) -> None:
+        """壊れると、何段か戻す頼みが人の段を越えて、人の変更とその前の AI の段まで戻す"""
+        _split(host, 200)
+        _person_adds_a_track(host)
+        _split(host, 100)
+
+        result = run(host, "undo", steps=3)
+
+        assert result["undone"] == ["クリップを分割"]
+        assert "Ctrl+Z" in result["stopped"]
+        assert _tracks(host) == 2
+        assert _clip_count(host) == 2
+
+    def test_the_whole_instruction_refuses_when_the_person_changed_last(
+        self, host: FakeHost
+    ) -> None:
+        """壊れると、指示の途中で人が変えた後に「この指示を全部戻して」で人の変更が消える"""
+        host.document.begin_checkpoint("AI: 切って", by=Author.AI)
+        _split(host, 100)
+        _person_adds_a_track(host)
+
+        with pytest.raises(ToolError, match="人が後から手で変えた段があるので戻しません"):
+            run(host, "undo", this_instruction=True)
+
+        assert _tracks(host) == 2
+        host.document.end_checkpoint()
+
+    def test_undoing_an_instruction_keeps_what_the_person_did_in_between(
+        self, host: FakeHost
+    ) -> None:
+        """壊れると、AI の指示を戻したときに、指示の途中で人が変えた物まで一緒に消える"""
+        host.document.begin_checkpoint("AI: 切って", by=Author.AI)
+        _split(host, 200)
+        _person_adds_a_track(host)
+        _split(host, 100)
+        host.document.end_checkpoint()
+
+        result = run(host, "undo", steps=5)
+
+        # 戻すのは人の段の後の AI の分だけ 人の足したトラックも、その前の AI の分も残る
+        assert result["undone"] == ["AI: 切って"]
+        assert _tracks(host) == 2
+        assert _clip_count(host) == 2
+
+    def test_redo_refuses_a_persons_step(self, host: FakeHost) -> None:
+        """壊れると、人が Ctrl+Z で戻した自分の変更を、AI が勝手にやり直す"""
+        _person_adds_a_track(host)
+        host.document.undo()
+
+        with pytest.raises(ToolError, match="人が手で変えた段なのでやり直しません"):
+            run(host, "redo")
+
+        assert _tracks(host) == 1
+
+    def test_history_says_who_made_the_next_steps(self, host: FakeHost) -> None:
+        """壊れると、AI は次に戻す段が人の物か分からず、断られるまで undo を試す"""
+        _person_adds_a_track(host)
+        host.document.execute(RenameProject("人の名前"), by=Author.PERSON)
+        host.document.undo()
+
+        result = run(host, "get_history")
+
+        assert result["undo_by"] == "person"
+        assert result["redo_by"] == "person"
+
+
 class TestHistory:
     def test_history_shows_what_can_be_redone_and_this_instructions_steps(
         self, host: FakeHost
     ) -> None:
         """壊れると、AI は何をやり直せるか・この指示で何を変えたかを読めず、推測で取り消す"""
         _split(host, 200)
-        host.document.begin_checkpoint("AI: 細かく")
+        host.document.begin_checkpoint("AI: 細かく", by=Author.AI)
         _split(host, 100)
         _split(host, 50)
         run(host, "undo")
@@ -224,7 +313,8 @@ class TestWhatRedoReturns:
         """
         host = _with_text_clip(video_media, transcript)
         added = replace(video_media, path=SECRET_PATH.with_name("別の撮影.mp4"), id=new_media_id())
-        host.document.execute(AddMedia(added))
+        # AI が足した素材の段 人の段だとやり直しを断るので、名前を返す道を通らない
+        host.document.execute(AddMedia(added), by=Author.AI)
         host.document.undo()
         host.document.undo()
         host.document.undo()
