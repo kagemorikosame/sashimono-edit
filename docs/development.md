@@ -35,7 +35,7 @@ Sashimono の開発で守ることをここにまとめる **このファイル�
 .venv\Scripts\python.exe tools\verify.py
 ```
 
-ruff（書式・規約）→ mypy（strict）→ pytest をまとめて走らせる **1 つでも落ちたら
+ruff（書式・規約）→ mypy（strict）→ pytest → 句点 → 試験の書き添えをまとめて走らせる **1 つでも落ちたら
 終了コードが非 0** CI もこれと同じものを走らせるので、手元で通れば CI でも通る
 
 CI だけは pytest を 4 つのプロセスに分けて並べて走らせる（pytest-xdist）
@@ -136,7 +136,13 @@ def test_the_animation_uses_the_whole_length(self) -> None:
 壊れ方が違う） 書くのは何が壊れると利用者に何が起きるかで、`assert` の言い換えは書かない
 
 `tools\test_notes.py` が `tests/` の `test_*.py` を見て、抜けている試験を並べる
+`tools\verify.py` と CI に入っているので、書き添えの無い試験を足すと落ちる
 `--count` でファイルごとの数を多い順に出す
+
+前からある試験の抜けは 2026-10-17 に 1451 本・207 ファイルあり、1 本の PR に収まらない
+（CodeRabbit が見るのは 1 PR 100 ファイルまで） 見張る置き場は道具の `WATCHED_PREFIXES` に
+持ち、埋めた置き場から広げる（`tests/ai` と `tests/ui` → `tests/core` と `tests/engine` →
+残り） まだ見張っていない置き場も `--all` で数えられる
 
 ### TODO を残さない
 

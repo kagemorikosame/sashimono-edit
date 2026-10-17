@@ -156,6 +156,7 @@ class TestTheTimelineTakesDrops:
     def test_media_from_the_pool_is_handed_over_as_ids(
         self, view: TimelineView, video_media: MediaItem
     ) -> None:
+        # ID で渡らないと、素材一覧から引いた素材がタイムラインのどこにも置かれない
         received: list[tuple[list[str], int, str]] = []
         view.media_dropped.connect(lambda ids, frame, track: received.append((ids, frame, track)))
         files: list[object] = []
@@ -213,6 +214,7 @@ class TestTheGuide:
         assert view.drop_guide is None
 
     def test_dropping_removes_the_guide(self, view: TimelineView) -> None:
+        # 落とした後も線が残ると、置いたクリップの上に余計な縦線が出たままになる
         mime = _file_mime(Path("C:/素材/a.mp4"))
         _move(view, mime, _point(view, 120, 0).toPoint())
         _drop(view, mime, _point(view, 120, 0))
@@ -256,6 +258,7 @@ class TestFilesDroppedOnTheTimeline:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
+        # 落とした位置を捨てると、狙ったトラックと時刻でなく末尾へ置かれて並べ直す羽目になる
         monkeypatch.setattr(main_window_module, "probe_media", _FakeProbe(audio_media))
         timeline = window._timeline
         _drop(timeline, _file_mime(tmp_path / "声.wav"), _point(timeline, 75, 1))
@@ -342,6 +345,7 @@ class TestMediaDroppedFromThePool:
     def test_it_lands_where_it_was_dropped_in_one_undo(
         self, window: MainWindow, video_media: MediaItem
     ) -> None:
+        # 映像と音声が別々の手になると、1 回の取り消しで片方だけ残り音ずれの元になる
         from sashimono.core.commands import AddMedia
 
         window.execute(AddMedia(video_media))
@@ -400,6 +404,7 @@ class TestThePoolView:
     def test_it_switches_to_icons(
         self, qt_application: QApplication, video_media: MediaItem
     ) -> None:
+        # ボタンが効かないか知らせが出ないと、アイコン表示へ変えられず選んだ表示も覚えない
         del qt_application
         pool = MediaPoolWidget(Project.create(media=(video_media,)))
         chosen: list[str] = []
@@ -475,6 +480,7 @@ class TestThePoolView:
         assert dialog.preferences().media_view == VIEW_ICONS
 
     def test_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 設定ファイルの表示の値が壊れていると、素材一覧が知らない表示で開けず空のまま残る
         path = tmp_path / "preferences.json"
         path.write_text('{"media_view": "巨大"}', encoding="utf-8")
         assert PreferenceStore(path).load().media_view == VIEW_LIST

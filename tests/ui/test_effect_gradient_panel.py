@@ -421,6 +421,8 @@ class TestCarriedAlong:
     def test_the_preset_version_follows_the_stops(
         self, effects: tuple[Effect, ...], version: int
     ) -> None:
+        # 版を色の並びに合わせないと、前の版のアプリでプリセットが一覧から消えるか、
+        # 黙って違う色で当たる
         saved = with_fixed_items(
             Clip(timeline_start=0, duration=30, source=_square(), effects=effects),
             picture=True,

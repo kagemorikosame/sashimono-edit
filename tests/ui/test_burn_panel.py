@@ -156,6 +156,8 @@ class TestBurning:
     def test_the_window_lists_each_voice_and_the_look(
         self, panel: tuple[SubtitlePanel, list[list[Command]]]
     ) -> None:
+        # 音声が何本もある動画で話し手を選べないと、
+        # 要らない声の字幕まで焼き込まれて手で消すことになる
         widget, sent = panel
         asked: list[BurnRequest] = []
 
@@ -177,6 +179,8 @@ class TestBurning:
     def test_a_selected_text_is_copied(
         self, panel: tuple[SubtitlePanel, list[list[Command]]]
     ) -> None:
+        # 選んでいたテキストの見た目が写らないと、整えた大きさが既定に戻り、
+        # 字幕を 1 本ずつ直すことになる
         widget, sent = panel
         styled = with_fixed_items(
             Clip(timeline_start=0, duration=30, source=TEXT.create(text="見本", size=90.0)),
@@ -443,6 +447,8 @@ class TestTheAssistant:
         assert host.document.project == project
 
     def test_it_uses_a_template_clip(self) -> None:
+        # AI に見本のクリップを指して頼んでも見た目が写らないと、
+        # 置かれた字幕がすべて既定の大きさになる
         project, _media = _project()
         styled = Clip(timeline_start=0, duration=30, source=TEXT.create(text="見本", size=77.0))
         track = Track(TrackKind.VIDEO, "テロップ", (styled,))

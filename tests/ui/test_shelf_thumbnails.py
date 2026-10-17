@@ -93,6 +93,8 @@ def _dialog(root: Path, thumbnails: LookThumbnails, *, shelf: bool = True) -> Te
 
 class TestFingerprint:
     def test_the_key_follows_the_content_not_the_place_or_time(self, tmp_path: Path) -> None:
+        # 置き場や時刻で鍵が変わると、写しただけで数百本を描き直して棚が重くなる
+        # 中身で鍵が変わらないと、型を直した後も古い見本が出る
         root = _shelf(tmp_path / "棚")
         first = shelf_look(_entry(root, "見出し000"))
         # 別の置き場へ写しただけ・時刻だけ変わっただけでは描き直さない
@@ -106,6 +108,8 @@ class TestFingerprint:
         assert shelf_look(_entry(copied, "見出し000")).fingerprint != first.fingerprint
 
     def test_templates_in_one_ymm4_file_are_told_apart(self, tmp_path: Path) -> None:
+        # 1 つの YMM4 のファイルに入った型が同じ鍵になると、
+        # どの型にも同じ見本の絵が出て選び分けられない
         write_ymmt(
             tmp_path / "束.ymmt",
             ymm4_template("一", text_item()),
@@ -120,6 +124,7 @@ class TestShelf:
     def test_visible_templates_get_a_picture(
         self, tmp_path: Path, thumbnails: LookThumbnails
     ) -> None:
+        # 見えている型に絵が付かないと、名前だけで中身を思い出して 1 本ずつ当てて確かめることになる
         root = _shelf(tmp_path / "棚")
         dialog = _dialog(root, thumbnails)
         try:
@@ -139,6 +144,7 @@ class TestShelf:
     def test_an_unreadable_one_is_marked_and_not_read_again(
         self, tmp_path: Path, thumbnails: LookThumbnails
     ) -> None:
+        # 読めない型を覚えないと、開くたびに同じ壊れたファイルを読み直して棚がもたつく
         root = _shelf(tmp_path / "棚")
         broken = shelf_look(_entry(root, "壊れ"))
         key = thumbnails.request(broken)
@@ -160,6 +166,7 @@ class TestShelf:
     def test_the_failure_mark_is_shown_in_the_list(
         self, tmp_path: Path, thumbnails: LookThumbnails
     ) -> None:
+        # 一覧に印が出ないと、絵が出ない型が読み込み中なのか壊れているのか分からない
         root = _shelf(tmp_path / "棚")
         dialog = _dialog(root, thumbnails)
         try:
@@ -195,6 +202,7 @@ class TestShelf:
             shiboken6.delete(dialog)
 
     def test_turning_it_off_draws_nothing(self, tmp_path: Path, thumbnails: LookThumbnails) -> None:
+        # 切っても描くと、見本を要らないとした人の棚で重さと置き場の書き込みが残る
         root = _shelf(tmp_path / "棚")
         dialog = _dialog(root, thumbnails, shelf=False)
         try:
@@ -209,12 +217,14 @@ class TestShelf:
 
 class TestPreference:
     def test_it_is_on_by_default_and_comes_back(self, tmp_path: Path) -> None:
+        # 既定で切れていると知らない人が見本に気付かず、保存されないと切った人が開くたびに描かれる
         assert Preferences().library_options.shelf
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(shelf_thumbnails=False))
         assert store.load().library_options.shelf is False
 
     def test_the_dialog_offers_it(self) -> None:
+        # 設定の画面に欄が無いか値を返さないと、棚の見本を切る手段が無くなる
         dialog = PreferencesDialog(Preferences())
         try:
             assert dialog._shelf_thumbnails.isChecked()
@@ -302,6 +312,7 @@ class TestAtomicPictures:
     def test_pictures_and_marks_use_a_name_per_writer(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 書き手ごとの名前でないと、2 つの係が同じ仮の名前へ書いて壊れた絵が棚に出る
         import re
 
         from sashimono.core.io import atomic
@@ -330,6 +341,7 @@ class TestAtomicPictures:
     def test_a_failed_write_keeps_the_old_picture(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 置き換えに失敗して前の絵まで消えると、棚の見本が空になり描き直すまで戻らない
         from PySide6.QtGui import QImage
 
         from sashimono.core.io import atomic

@@ -341,6 +341,7 @@ class TestInsertPastePreference:
 
 class TestTrackHeight:
     def test_dragging_the_border_resizes_that_track(self, view: TimelineView) -> None:
+        # 境目を引いても高さが命令にならないと、トラックを広げられないか、広げても取り消せない
         received = _received(view)
         band = view._layout.bands(view.project.timeline)[0]
         start = QPoint(40, band.bottom)
@@ -372,6 +373,7 @@ class TestMediaPoolMenu:
     def test_removing_asks_the_window(
         self, qt_application: QApplication, video_media: MediaItem
     ) -> None:
+        # メニューから外しても窓へ伝わらないと、押しても素材がプールに残り続ける
         del qt_application
         pool = MediaPoolWidget(Project.create(media=(video_media,)))
         asked: list[str] = []
@@ -430,6 +432,7 @@ class TestWindow:
     def test_a_file_open_in_another_window_is_noticed(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 同じ作品を 2 つの窓で開いたことに気付けないと、後から保存した方だけが残り先の編集が消える
         del qt_application
         path = tmp_path / "本編.sme"
         folder = project_presence_dir(path)

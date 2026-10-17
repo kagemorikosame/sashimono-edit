@@ -38,6 +38,7 @@ def _show(panel: InspectorPanel, source: GeneratedSource) -> None:
 
 class TestInspector:
     def test_the_width_can_be_set_on_a_plain_text(self, panel: InspectorPanel) -> None:
+        # 字幕でないテキストで折り返しの幅が触れないと、長い文が画面の外へはみ出したままになる
         _show(panel, TEXT.create())
         editor = panel._editors[("source", "wrap_width")]
         assert editor.isEnabled()
@@ -63,6 +64,7 @@ class TestPreferences:
         assert Preferences(subtitle_wrap=False).subtitle_wrap_share == 0
 
     def test_a_broken_share_falls_back(self, tmp_path: Path) -> None:
+        # 壊れた値をそのまま使うと、字幕が折り返されないか、画面の何倍もの幅で折られてはみ出す
         path = tmp_path / "preferences.json"
         path.write_text(
             json.dumps({"subtitle_wrap": "はい", "subtitle_wrap_percent": 500}), encoding="utf-8"
@@ -72,6 +74,7 @@ class TestPreferences:
         assert loaded.subtitle_wrap_percent == 90
 
     def test_the_choice_is_saved(self, tmp_path: Path) -> None:
+        # 選んだ折り返しが残らないと、起動のたびに既定へ戻り、字幕の改行の位置が変わる
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(subtitle_wrap=False, subtitle_wrap_percent=75))
         loaded = store.load()

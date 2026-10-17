@@ -188,6 +188,7 @@ class TestUnfocusedFields:
 
 class TestFocusedFields:
     def test_a_focused_choice_still_follows_the_wheel(self, panel: InspectorPanel) -> None:
+        # 焦点を置いた選び欄までホイールを止めると、選んだ欄をホイールで切り替えられなくなる
         box = _choice_box(panel)
         panel.activateWindow()
         box.setFocus(Qt.FocusReason.MouseFocusReason)

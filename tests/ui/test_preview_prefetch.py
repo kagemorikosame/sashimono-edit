@@ -119,6 +119,7 @@ class TestWhenItRuns:
     def test_it_comes_back_when_playing_stops(
         self, preview: tuple[PreviewWidget, StubCache]
     ) -> None:
+        # 止めた後に先読みが戻らないと、止めた所の前後へ動かすたびに絵が出るまで待たされる
         widget, _ = preview
         widget.set_playing(True)
         widget.set_playing(False)
@@ -127,6 +128,7 @@ class TestWhenItRuns:
     def test_it_does_not_run_without_a_budget(
         self, preview: tuple[PreviewWidget, StubCache]
     ) -> None:
+        # 貯める場所が無いのに先読みが回ると、使われない絵を描き続けて編集の操作が重くなる
         widget, stub = preview
         stub.enabled = False
         widget.set_frame(5)
@@ -324,6 +326,7 @@ class TestWhenPrefetchingGoesWrong:
     def test_a_quick_frame_keeps_going(
         self, preview: tuple[PreviewWidget, StubCache], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 速く描けたコマで先読みが止まると、先の絵が貯まらず再生や移動のたびにまた待たされる
         widget, stub = preview
         ticks = iter([0.0, 0.001])
         monkeypatch.setattr("sashimono.ui.preview.time.perf_counter", lambda: next(ticks))

@@ -52,6 +52,7 @@ def _buttons(section: _Section) -> dict[str, QToolButton]:
 def test_the_fixed_effect_shows_a_lock_instead_of_remove_and_move(
     panel: InspectorPanel, audio_media: MediaItem
 ) -> None:
+    # 固定のエフェクトに ✕ や並べ替えが出ると、押しても外せず動かせないボタンで迷う
     project = _placed(audio_media)
     clip = _sound(project)
     blur = registry.require("blur").create()

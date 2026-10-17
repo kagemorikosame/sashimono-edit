@@ -129,6 +129,8 @@ def _start(view: TimelineView, layer: int) -> int:
 
 class TestTargets:
     def test_edges_playhead_keyframes_and_the_work_area(self) -> None:
+        # 吸い付く先から端・再生位置・キー・範囲のどれかが抜けると、そこへクリップを
+        # 揃えようとしても数コマずれて置かれる
         keyed = _text(
             200,
             opacity=AnimatedValue(1.0, keyframes=(Keyframe(0, 0.0), Keyframe(15, 1.0))),
@@ -141,6 +143,7 @@ class TestTargets:
         assert 400 not in targets and 460 not in targets
 
     def test_the_nearest_within_reach_wins(self) -> None:
+        # 届く所の外へ吸い付いたり遠い方を選んだりすると、置いた位置が手を離した所から飛ぶ
         assert nearest_snap((62, 122), [0, 60, 125], 4.0) == (-2, 60)
         assert nearest_snap((70,), [0, 60, 125], 4.0) is None
 
@@ -169,6 +172,7 @@ class TestDragging:
         assert view.snap_line == 60
 
     def test_shift_while_dragging_turns_it_off(self, made: Made) -> None:
+        # Shift で磁石を切れないと、端のすぐそばに数コマずらして置きたいとき吸い付かれて置けない
         view, _ = _open(made, _project((_text(0),), (_text(200),)))
         _drag(
             view,
@@ -236,6 +240,7 @@ class TestDragging:
         release_modifier_keys()
 
     def test_the_toolbar_setting_turns_it_off(self, made: Made) -> None:
+        # ツールバーで磁石を切っても吸い付くと、細かく置きたい人が毎回 Shift を押し続けることになる
         view, _ = _open(made, _project((_text(0),), (_text(200),)))
         view.set_snap(False)
         _drag(view, _point(view, 1, 220), _point(view, 1, 82))
@@ -250,6 +255,7 @@ class TestDragging:
         assert view.project.timeline.tracks[0].clips[0].timeline_end == 150
 
     def test_a_keyframe_attracts_too(self, made: Made) -> None:
+        # キーフレームに吸い付かないと、動きの変わり目に次のクリップの頭を揃えられない
         keyed = _text(0, duration=120, opacity=AnimatedValue(1.0, keyframes=(Keyframe(90, 0.5),)))
         view, _ = _open(made, _project((keyed,), (_text(300),)))
         _drag(view, _point(view, 1, 320), _point(view, 1, 112))

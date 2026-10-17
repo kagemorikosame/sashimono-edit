@@ -91,12 +91,15 @@ class TestListing:
     def test_only_media_with_audio_is_offered(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], video_media: MediaItem
     ) -> None:
+        # 音の無い素材（画像など）を選んでしまうと、字幕パネルを開いても一覧が空で、
+        # 起こしも無音カットも押す先が無い
         widget, _ = panel
         assert widget.media_id == video_media.id
 
     def test_rows_show_timeline_positions_not_source_times(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
+        # 素材の中の時刻を出すと、タイムラインのどこにその字幕が出るのかが一覧から分からない
         widget, _ = panel
         # 素材の 1 秒は 30 フレーム目 30fps なので 00:00:01:00
         assert widget._table.rowCount() == 3
@@ -107,6 +110,7 @@ class TestListing:
     def test_the_cut_moves_the_shown_times(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
     ) -> None:
+        # 壊れると、冒頭を切った後も一覧の時刻が前のままで、字幕の時刻と画面の位置がずれて見える
         widget, _ = panel
         widget.set_project(RippleCut(((0, 30),)).apply(placed))
         item = widget._table.item(0, 0)
@@ -116,6 +120,7 @@ class TestListing:
     def test_subtitles_outside_the_timeline_are_marked(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
     ) -> None:
+        # 印が無いと、切り落とした所の字幕も一覧に並び、焼き込んでも出ない物を直し続けてしまう
         widget, _ = panel
         # クリップを冒頭 2 秒だけにすると、後ろ 2 枚はどこにも出なくなる
         trimmed = placed.timeline.tracks[0].clips[0]
@@ -326,6 +331,7 @@ class TestEditing:
     def test_changing_a_cell_issues_a_command(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], video_media: MediaItem
     ) -> None:
+        # 壊れると、一覧で字幕の文字を直しても作品に入らず、取り消しの履歴にも残らない
         widget, issued = panel
         item = widget._table.item(1, 1)
         assert item is not None
@@ -350,6 +356,7 @@ class TestPlayheadFollowing:
     def test_the_row_under_the_playhead_is_selected(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
+        # 壊れると、再生しても今しゃべっている字幕の行が選ばれず、直したい行を探し回る
         widget, _ = panel
         widget.set_frame(150)  # 5 秒目 2 枚目（4..6 秒）の範囲
         assert widget._table.currentRow() == 1
@@ -357,6 +364,7 @@ class TestPlayheadFollowing:
     def test_clicking_a_row_asks_to_seek(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
+        # 壊れると、一覧の行を押してもその字幕の所へ再生ヘッドが移らず、映像と見比べて直せない
         widget, _ = panel
         seeks: list[int] = []
         widget.seek_requested.connect(seeks.append)
@@ -378,6 +386,7 @@ class TestJetCut:
     def test_without_a_waveform_it_says_so(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
+        # 壊れると、波形がまだ無いときに無音カットを押しても何も起きず、理由も出ない
         widget, issued = panel
         messages: list[str] = []
         widget.status_message.connect(messages.append)
@@ -391,6 +400,7 @@ class TestJetCut:
         placed: Project,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 壊れると、無音カットで間が詰まらないか、起こせている字幕の頭まで削って声が欠ける
         del qt_application
         # 先頭 200 ピーク（約 1.07 秒）だけ無音の素材
         analyzer = StubAnalyzer(make_waveform([(0.0, 400), (0.5, 1500)]))
@@ -415,6 +425,7 @@ class TestBurnAndExport:
     def test_burning_places_text_clips(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]]
     ) -> None:
+        # 壊れると、焼き込みを押しても画面に字幕のテキストが置かれず、書き出した動画に字幕が出ない
         widget, issued = panel
         # 焼き込む話し手を尋ねる窓は、全部を選んだものとして返す（窓を開くと試験が止まる）
         widget.ask_burn = accept_everyone
@@ -500,6 +511,7 @@ class TestBurnAndExport:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 壊れると、字幕の書き出しで SRT が出来ないか時刻がずれ、動画サイトへ載せても字幕が合わない
         widget, _ = panel
         target = tmp_path / "出力.srt"
         monkeypatch.setattr(
@@ -517,6 +529,7 @@ class TestBurnAndExport:
         panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 壊れると、保存先の窓で取り消したのに書き出したと知らせ、どこかに出来たと思い込む
         widget, _ = panel
         monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: ("", ""))
         messages: list[str] = []
@@ -552,6 +565,7 @@ class TestExportWithWorkArea:
     def test_choosing_the_range_shifts_the_head_to_zero(
         self, ranged: tuple[SubtitlePanel, Path, list[bool]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、範囲で書き出した動画と字幕が範囲の頭の分だけずれる
         widget, target, asked = ranged
 
         def answer(*args: object) -> str:
@@ -569,6 +583,7 @@ class TestExportWithWorkArea:
     def test_choosing_the_whole_keeps_timeline_times(
         self, ranged: tuple[SubtitlePanel, Path, list[bool]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、全体で書き出したのに範囲の頭の分だけ字幕が早まり、全体の動画と合わない
         widget, target, _ = ranged
         monkeypatch.setattr(panel_module, "ask_subtitle_range", lambda *args: RANGE_ALL)
         widget.export_file()
@@ -577,6 +592,7 @@ class TestExportWithWorkArea:
     def test_cancelling_the_choice_writes_nothing(
         self, ranged: tuple[SubtitlePanel, Path, list[bool]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、範囲の問いで取り消したのに字幕のファイルが出来て、前に書き出した物を上書きする
         widget, target, _ = ranged
         monkeypatch.setattr(panel_module, "ask_subtitle_range", lambda *args: None)
         widget.export_file()
@@ -626,12 +642,14 @@ class TestSourceTime:
     def test_the_playhead_maps_back_into_the_media(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], video_media: MediaItem
     ) -> None:
+        # 壊れると、再生ヘッドの所で字幕を割ったとき、素材の中の違う時刻で割れる
         widget, _ = panel
         assert widget._source_time(video_media, 90) == Fraction(3)
 
     def test_a_frame_outside_every_clip_has_no_source_time(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], video_media: MediaItem
     ) -> None:
+        # 壊れると、クリップの無い所で字幕を割ろうとしたとき、でたらめな時刻で割れて字幕が崩れる
         widget, _ = panel
         assert widget._source_time(video_media, 9999) is None
 
@@ -671,6 +689,7 @@ class TestDialogsAreFreed:
     def test_opening_and_closing_does_not_pile_up(
         self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、字幕の窓を開け閉めするたびに見えない窓が溜まり、長く使うほど重くなる
         del qt_application
         from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog
         from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog

@@ -158,6 +158,7 @@ class TestFromTheAssistant:
     def test_the_same_voice_twice_is_refused(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
     ) -> None:
+        # 同じ音声の起こしを 2 回受け付けると、同じ字幕が 2 回取り込まれ、待つ時間も倍になる
         panel, _host, first, _second = setup
         speaker.gate.clear()
         panel.start_transcription(first.id, "tiny", audio_stream=2)
@@ -193,6 +194,7 @@ class TestTheWindow:
     def test_redoing_a_voice_asks_before_replacing(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem]
     ) -> None:
+        # 尋ねずに起こし直すと、手で直した字幕が新しい起こしで黙って上書きされて消える
         panel, host, first, _second = setup
         panel.start_transcription(first.id, "tiny", audio_stream=1)
         _settle(panel)
@@ -254,6 +256,7 @@ class TestThePanel:
     def test_the_panel_shows_the_chosen_voice(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem]
     ) -> None:
+        # 選んだ音声の字幕が出ないと、2 本目の音声の字幕を直そうとしても 1 本目の字幕しか見えない
         panel, _host, first, _second = setup
         panel.start_transcription(first.id, "tiny", audio_stream=1)
         panel.start_transcription(first.id, "tiny", audio_stream=2)
@@ -364,6 +367,7 @@ class TestThePanel:
             analyzer.close()
 
     def test_a_single_voice_shows_no_choice(self, qt_application: QApplication) -> None:
+        # 音声が 1 本の素材に選ぶ欄を出すと、選ぶ物の無い欄が場所を取り、何を選ぶのか迷わせる
         del qt_application
         single = _movie("一本", voices=1)
         analyzer = MediaAnalyzer(sample_rate=48000, channels=2)

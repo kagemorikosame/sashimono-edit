@@ -36,6 +36,12 @@ ROOT = Path(__file__).resolve().parent.parent
 #: 他人が作った配布物と、試験の材料として読むだけのファイルの置き場
 SKIP_PREFIXES = ("tests/fixtures/",)
 
+#: 見張る置き場 前からある試験の抜けは 1451 本・207 ファイルあり、1 本の PR に収まらない
+#: （CodeRabbit が見るのは 1 PR 100 ファイルまで） 書き添えを埋めた置き場から順に広げ、
+#: 全部埋まったら tests 全体にする 抜けた試験の控えを持つ形にしないのは、控えが
+#: やり残しの一覧として残り続けるため ``--all`` でまだ見張っていない置き場も数えられる
+WATCHED_PREFIXES = ("tests/ai/", "tests/ui/")
+
 
 @dataclass(frozen=True, slots=True)
 class Missing:
@@ -109,12 +115,14 @@ def scan(path: Path) -> list[Missing]:
     ]
 
 
-def targets(root: Path = ROOT) -> list[Path]:
+def targets(root: Path = ROOT, *, everything: bool = False) -> list[Path]:
     """試験のファイル pytest の既定の集め方（``test_*.py``）に合わせる"""
     found: list[Path] = []
     for path in sorted((root / "tests").rglob("test_*.py")):
         relative = path.relative_to(root).as_posix()
         if relative.startswith(SKIP_PREFIXES) or "__pycache__" in path.parts:
+            continue
+        if not everything and not relative.startswith(WATCHED_PREFIXES):
             continue
         found.append(path)
     return found
@@ -123,9 +131,10 @@ def targets(root: Path = ROOT) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--count", action="store_true", help="ファイルごとの数を多い順に出す")
+    parser.add_argument("--all", action="store_true", help="まだ見張っていない置き場も数える")
     arguments = parser.parse_args(argv)
 
-    missing = [item for path in targets() for item in scan(path)]
+    missing = [item for path in targets(everything=arguments.all) for item in scan(path)]
     if arguments.count:
         for name, count in Counter(_relative(item.path) for item in missing).most_common():
             print(f"{count}\t{name}")

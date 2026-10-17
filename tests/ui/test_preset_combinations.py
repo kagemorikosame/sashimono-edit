@@ -334,6 +334,7 @@ def _check(saved: Clip, before: Clip, after: Clip, preset: Preset, project: Proj
 def test_every_pair_keeps_what_the_preset_does_not_have(
     saved_kind: str, target_kind: str, video_media: MediaItem, audio_media: MediaItem
 ) -> None:
+    # プリセットに無い値まで当て先で書き換えると、着せただけで元の位置や音量などが失われる
     saved = _make(saved_kind, A, 0, video_media, audio_media)
     target = _make(target_kind, B, 100, video_media, audio_media)
     project = _project(saved, target, [video_media, audio_media])
