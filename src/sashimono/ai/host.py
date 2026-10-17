@@ -11,18 +11,44 @@ AI の操作は最終的に UI と同じ :class:`~sashimono.core.commands.Docume
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
+from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
 
-__all__ = ["EditorHost", "ToolError"]
+__all__ = ["EXPORT_RUNNING", "EXPORT_STATES", "EditorHost", "ExportRequest", "ToolError"]
+
+#: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
+#: 走っている間は「書いている」「置いている」 終わった後は残りのどれか
+EXPORT_RUNNING = ("rendering", "placing")
+EXPORT_STATES = ("idle", *EXPORT_RUNNING, "done", "failed", "cancelled")
+
+
+@dataclass(frozen=True, slots=True)
+class ExportRequest:
+    """AI が頼んだ書き出し 選べる物は画面の書き出しの窓と同じ"""
+
+    #: 確かめ済みの書き出し先（リンクを辿った後の場所）
+    path: Path
+    #: 書き出すシーン ``None`` ならメイン
+    scene_id: SceneId | None
+    #: ``all`` か ``work_area``（:data:`~sashimono.engine.encode.RANGE_ALL` など）
+    range_choice: str
+    #: 映像のコーデック ``None`` なら自動（使えなければ次の候補へ落ちる）
+    codec: str | None
+    #: 映像のビットレート（Mbps）
+    bitrate_mbps: int
+    #: 許したときの書き出し先の身元（無ければ無かったこと） 置く直前に照らし、名前が現れたり
+    #: 中身が変わったりしていれば置かずに断る（#327）
+    expect: Expected
 
 
 class ToolError(RuntimeError):
@@ -234,6 +260,60 @@ class EditorHost(Protocol):
 
         人が窓で選んで書き出した所なので、AI もそこへは書ける（2026-10-14 利用者の決定）
         """
+        ...
+
+    def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
+        """作品を ``path`` へ保存する（B1 #327） 画面の〔保存〕と同じ控え・書き方を通す
+
+        ``path`` は確かめ済みの場所（:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
+        ``adopt`` が真なら、以後の作品の場所を ``path`` にする（名前を付けて保存）
+        ``expect`` は許したときの ``path`` の身元 書いて名前を付ける所で照らし、その間に名前が
+        現れたり中身が変わったりしていれば、置かずに断る（字幕と静止画の書く口も同じ）
+        窓は出さない 断るときは :class:`ToolError` 戻り値は知らせに添える言葉（無ければ空）
+        """
+        ...
+
+    def write_subtitles(
+        self, path: Path, *, frame_range: tuple[int, int] | None, expect: Expected
+    ) -> Path:
+        """タイムラインの字幕を ``path`` へ書く（#327） 画面の字幕の書き出しと同じ形式と処理
+
+        相手は開いているタイムライン（字幕パネルが見ている物と同じ） ``frame_range`` を
+        渡すと、その範囲だけを頭を 0 にずらして書く ``path`` は確かめ済みの場所
+        （:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
+        """
+        ...
+
+    def write_snapshot(self, path: Path, frame: int, *, expect: Expected) -> int:
+        """``frame`` を画面の〔静止画を保存〕と同じ描き方で PNG にして書く（#327）
+
+        描いたフレームを返す（終わりを指していれば最後のフレーム） ``path`` は確かめ済みの場所
+        書けなければ :class:`ToolError`
+        """
+        ...
+
+    def start_export(self, request: ExportRequest) -> None:
+        """書き出しを裏で始める（B1 #327） 画面の書き出しの窓と同じ設定の作り方と処理を通す
+
+        すぐ戻る 進み具合は :meth:`export_status`、止めるのは :meth:`cancel_export`
+        すでに走っていれば :class:`ToolError`
+        """
+        ...
+
+    def export_status(self) -> dict[str, object]:
+        """AI が始めた書き出しの様子 ``state`` は :data:`EXPORT_STATES` のどれか"""
+        ...
+
+    def export_waiter(self) -> Callable[[float], bool]:
+        """書き出しが終わるまで、最長で引数の秒だけ待つ関数 走っていなければ真を返す
+
+        :meth:`scene_waiter` と同じく、返す関数は**AI のスレッドから呼ばれる**
+        （:class:`~sashimono.ai.operations.Pending`） 画面のスレッドで待つと画面が固まる
+        """
+        ...
+
+    def cancel_export(self) -> bool:
+        """走っている書き出しを止める 止めるよう頼めたら真"""
         ...
 
     def remembered_names(self) -> tuple[str, ...]:

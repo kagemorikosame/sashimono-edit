@@ -604,8 +604,12 @@ def backup_before_save(
     keep: int = BACKUP_GENERATIONS,
     most: int | None = None,
     failed: list[Path] | None = None,
+    source: Path | None = None,
 ) -> Path | None:
     """上書きする前の中身を控える ``target`` がまだ無ければ何もしない
+
+    ``source`` を渡すと、中身はそこから取る（控えの棚は ``target`` で決める） AI の保存は
+    置き換えた後に、人が許した前のファイル（残した物）から控える（#327）
 
     古いものから消して ``keep`` 本に保つ 名前に時刻を入れてあるので、並べれば
     そのまま古い順になる 消すのは新しい控えを書き終えてから
@@ -616,7 +620,8 @@ def backup_before_save(
     変えた先や別の窓の設定のせいで ``keep`` を超えていても、保存のたびに黙ってまとめて消さない
     """
     target = Path(target)
-    if not target.is_file():
+    origin = Path(source) if source is not None else target
+    if not origin.is_file():
         return None
     folder = backup_folder(target, root)
     existed = folder.is_dir()
@@ -634,9 +639,9 @@ def backup_before_save(
     stamp = f"{_next_stamp():%Y%m%d-%H%M%S-%f}"
     temporary = folder / f".{stamp}-{uuid.uuid4().hex[:8]}{_COPYING}"
     try:
-        expected = target.stat().st_size
-        shutil.copyfile(target, temporary)
-        shutil.copystat(target, temporary)
+        expected = origin.stat().st_size
+        shutil.copyfile(origin, temporary)
+        shutil.copystat(origin, temporary)
         if temporary.stat().st_size != expected:
             raise OSError(f"控えの大きさが元と合わない: {temporary}")
         number = 0
