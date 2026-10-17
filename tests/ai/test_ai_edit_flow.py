@@ -67,6 +67,8 @@ def _materials(directory: Path) -> tuple[Path, Path, Path]:
 
 @pytest.mark.parametrize("mode", [LayerMode.MIXED, LayerMode.SEPARATED])
 def test_a_short_video_made_only_with_the_tools(media_dir: Path, tmp_path: Path, mode: str) -> None:
+    # 前の道具が作った物を次の道具が見つけられないと、AI に頼んだ動画づくりが途中で止まるか、
+    # 置いた文字や BGM の音量が書き出した動画に出ない
     from sashimono.engine.encode import ExportSettings, available_video_codecs, export_project
 
     if not available_video_codecs():

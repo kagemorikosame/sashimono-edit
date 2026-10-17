@@ -82,6 +82,7 @@ class TestMatchingTheFirstVideo:
     def test_yes_takes_the_rate_and_size_of_the_video(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 「はい」でレートが変わらないと、60fps の動画が 30fps で書き出されて半分のコマが捨てられる
         asked = _answer(monkeypatch, True)
         media = _video()
         _pool(window, media)
@@ -150,6 +151,7 @@ class TestMatchingTheFirstVideo:
     def test_no_keeps_the_project(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 「いいえ」でも形が変わると、決めておいた解像度とレートが黙って書き換わる
         _answer(monkeypatch, False)
         media = _video()
         _pool(window, media)
@@ -171,6 +173,7 @@ class TestMatchingTheFirstVideo:
         assert len(asked) == 1
 
     def test_never_does_not_ask(self, window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 「合わせない」を選んだ人に尋ねると、毎回同じ窓を閉じる手間が残る
         asked = _answer(monkeypatch, True)
         window._preferences = replace(window._preferences, match_video=media_match.MATCH_NEVER)
         media = _video()
@@ -182,6 +185,7 @@ class TestMatchingTheFirstVideo:
     def test_always_matches_without_asking(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 「常に合わせる」で尋ねると窓が出て、29.97 を丸めると音と絵が少しずつずれる
         asked = _answer(monkeypatch, False)
         window._preferences = replace(window._preferences, match_video=media_match.MATCH_ALWAYS)
         media = _video(FrameRate(30000, 1001))
@@ -221,16 +225,20 @@ class TestThePreference:
         assert Preferences().match_video == media_match.MATCH_ASK
 
     def test_it_comes_back(self, tmp_path: Path) -> None:
+        # 選んだ合わせ方が残らないと、起動のたびに尋ねる窓へ戻される
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(match_video=media_match.MATCH_NEVER))
         assert store.load().match_video == media_match.MATCH_NEVER
 
     def test_an_unknown_word_falls_back(self, tmp_path: Path) -> None:
+        # 知らない値で尋ねずに進むと、古い版で新しい設定を開いた人のプロジェクトが
+        # 黙って動画に合わせて変わるか、合わないまま置かれる
         path = tmp_path / "preferences.json"
         path.write_text('{"match_video": "sometimes"}', encoding="utf-8")
         assert PreferenceStore(path).load().match_video == media_match.MATCH_ASK
 
     def test_the_dialog_shows_and_returns_it(self, qt_application: QApplication) -> None:
+        # 設定の画面が今の値を返さないと、OK を押しただけで「常に合わせる」が外れる
         del qt_application
         dialog = PreferencesDialog(Preferences(match_video=media_match.MATCH_ALWAYS))
         try:

@@ -59,9 +59,12 @@ def find(tools: list[Any], name: str) -> Any:
 
 class TestNaming:
     def test_tool_names_carry_the_server_prefix(self) -> None:
+        # 接頭辞が食い違うと、門番が自分のツールを他所の物と見なして断り、
+        # AI が何も編集できない
         assert tool_name("split_clip") == f"mcp__{SERVER_NAME}__split_clip"
 
     def test_names_can_be_filtered_by_kind(self) -> None:
+        # 読み取りと変更の分け目が崩れると、名前で許す範囲を絞ったときに変更の道具が混じる
         reads = tool_names(writes=False)
         writes = tool_names(writes=True)
         assert tool_name("list_clips") in reads
@@ -71,6 +74,7 @@ class TestNaming:
 
 class TestServer:
     def test_every_operation_becomes_a_tool(self, host: FakeHost) -> None:
+        # 包み損ねた操作は AI から見えず、画面でできることを頼んでもできないと返る
         from sashimono.ai.operations import OPERATIONS
 
         assert len(build_tools(EditorBridge(host))) == len(OPERATIONS)
@@ -78,6 +82,7 @@ class TestServer:
         assert build_server(EditorBridge(host))["type"] == "sdk"
 
     def test_a_read_returns_json_text(self, host: FakeHost) -> None:
+        # JSON の文字で返さないと、AI は結果を読めず、尺やクリップの数を取り違えて答える
         bridge = allow_sending(EditorBridge(host))
         tool = find(build_tools(bridge), "get_project")
 
@@ -86,6 +91,7 @@ class TestServer:
         assert payload["duration_frames"] == 300
 
     def test_an_image_comes_back_as_an_image_block(self, host: FakeHost) -> None:
+        # 絵を文字として返すと、AI は画面を見られず、見た目の確認を頼んでも憶測で答える
         bridge = allow_sending(EditorBridge(host))
         tool = find(build_tools(bridge), "preview_frame")
 
@@ -118,6 +124,7 @@ class TestServer:
         assert "list_clips" in result["content"][0]["text"]
 
     def test_writes_pass_through_the_approval(self, host: FakeHost) -> None:
+        # 確認を通った変更が当たらないと、利用者が許可しても AI の編集が反映されない
         bridge = EditorBridge(host)
         tool = find(build_tools(bridge), "split_clip")
         clip = str(host.document.project.timeline.tracks[0].clips[0].id)
@@ -127,6 +134,7 @@ class TestServer:
         assert len(host.document.project.timeline.tracks[0].clips) == 2
 
     def test_schemas_are_passed_through(self, host: FakeHost) -> None:
+        # 引数の形が SDK へ渡らないと、AI は text が要ると知らずに文字の無いテロップを頼んで失敗する
         tool = find(build_tools(EditorBridge(host)), "add_text")
         assert "text" in tool.input_schema["properties"]
         assert tool.input_schema["required"] == ["text"]

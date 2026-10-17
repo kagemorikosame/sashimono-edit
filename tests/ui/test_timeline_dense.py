@@ -96,6 +96,7 @@ class TestDenseDrawing:
         assert hit[1].timeline_start <= last and first < hit[1].timeline_end
 
     def test_the_header_is_never_a_clip(self, crowded: TimelineView) -> None:
+        # トラックの見出しをクリップと取ると、名前を押しただけで隣のクリップが選ばれたり動いたりする
         band = crowded._layout.bands(crowded.project.timeline)[0]
         assert crowded._clip_at(QPoint(10, band.top + 5)) is None
 

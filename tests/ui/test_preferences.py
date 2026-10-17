@@ -62,6 +62,8 @@ class TestTheAutomaticQuality:
         assert Preferences().quality_for(2160) == 2
 
     def test_the_boundary_is_the_stated_height(self) -> None:
+        # 境目が 1 つずれると、1080p の素材でもプレビューが粗くなるか、
+        # それより大きい素材が重いまま残る
         plain = Preferences()
         assert plain.quality_for(AUTO_QUALITY_HEIGHT) == 2
         assert plain.quality_for(AUTO_QUALITY_HEIGHT - 1) == 1
@@ -71,11 +73,13 @@ class TestTheAutomaticQuality:
         assert Preferences(auto_quality=False).quality_for(2160) == 1
 
     def test_the_divisor_is_the_one_chosen(self) -> None:
+        # 選んだ分母が使われないと、1/4 を選んでも 1/2 のままで、重い素材の再生が軽くならない
         assert Preferences(auto_quality_divisor=4).quality_for(2160) == 4
 
 
 class TestSaving:
     def test_it_comes_back(self, tmp_path: Path) -> None:
+        # 読み戻らないと、控えや自動の画質を切った人が、起動のたびに切り直すことになる
         store = PreferenceStore(tmp_path / "preferences.json")
         chosen = Preferences(
             use_proxy=False, proxy_height=720, auto_quality=False, auto_quality_divisor=4
@@ -84,6 +88,7 @@ class TestSaving:
         assert store.load() == chosen
 
     def test_nothing_saved_is_the_default(self, tmp_path: Path) -> None:
+        # 設定のファイルがまだ無い初めての起動で既定に倒れないと、入れたばかりの人の起動が止まる
         assert PreferenceStore(tmp_path / "無い.json").load() == Preferences()
 
     def test_a_broken_file_does_not_stop_the_start(self, tmp_path: Path) -> None:
@@ -164,6 +169,7 @@ class TestTheDialog:
         assert dialog.height() <= screen.availableGeometry().height()
 
     def test_it_shows_what_is_set(self, qt_application: QApplication) -> None:
+        # 今の値を映さないと、設定を開いて OK を押しただけで控えの大きさなどが別の値に変わる
         del qt_application
         chosen = Preferences(use_proxy=False, proxy_height=720, auto_quality_divisor=4)
         assert PreferencesDialog(chosen).preferences() == chosen
@@ -206,6 +212,7 @@ class TestTheDialog:
     def test_turning_off_the_auto_quality_disables_its_divisor(
         self, dialog: PreferencesDialog
     ) -> None:
+        # 使わない分母が押せると、効いていると思って触り、画質が変わらない理由を探してしまう
         dialog._auto_quality.setChecked(False)
         assert not dialog._auto_divisor.isEnabled()
 
@@ -244,6 +251,7 @@ class TestTheWindowFollowsThem:
         assert window._preview._proxies is None
 
     def test_turning_it_on_puts_it_back(self, window: MainWindow) -> None:
+        # 入れ直しても控えが戻らないと、1 度切っただけで再起動するまで元の重い素材で再生する
         window._apply_preferences(Preferences(use_proxy=False))
         window._apply_preferences(Preferences(use_proxy=True))
         assert window._preview._proxies is window._proxies.store
@@ -367,6 +375,7 @@ class TestTheWindowFollowsThem:
         assert window._transport.quality() == 2
 
     def test_it_stays_full_when_turned_off(self, window: MainWindow) -> None:
+        # 切ったのに 4K を置いた時点で画質が下がると、切った人のプレビューが勝手に粗くなる
         window._apply_preferences(Preferences(auto_quality=False))
         window.execute(AddMedia(_uhd_media()))
         assert window._transport.quality() == 1

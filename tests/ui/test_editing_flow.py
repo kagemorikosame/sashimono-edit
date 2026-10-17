@@ -50,6 +50,7 @@ class TestEditingFlow:
     def test_import_creates_linked_video_and_audio(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia]
     ) -> None:
+        # 映像と音声がつながっていないと、片方だけ動かしたり消したりして口と声がずれる
         window.import_media([two_clips[0].path])
         assert window.wait_for_imports()
         project = window._document.project
@@ -78,6 +79,7 @@ class TestEditingFlow:
     def test_clips_are_placed_end_to_end(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia]
     ) -> None:
+        # 隙間や重なりができると、読み込んだ直後から黒い間が入るか、後の素材が前を隠す
         window.import_media([two_clips[0].path, two_clips[1].path])
         assert window.wait_for_imports()
         project = window._document.project
@@ -89,6 +91,7 @@ class TestEditingFlow:
     def test_split_then_ripple_delete_shortens_the_timeline(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia]
     ) -> None:
+        # 詰める削除が効かないと、切った頭を消しても空白が残り手で詰め直すことになる
         window.import_media([two_clips[0].path, two_clips[1].path])
         assert window.wait_for_imports()
         before = window._document.project.duration
@@ -109,6 +112,7 @@ class TestEditingFlow:
     def test_undo_restores_everything(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia]
     ) -> None:
+        # 取り消しで元に戻り切らないと、試しに切ったつもりの編集が戻せず作品が壊れたままになる
         window.import_media([two_clips[0].path])
         assert window.wait_for_imports()
         original = window._document.project
@@ -129,6 +133,7 @@ class TestEditingFlow:
     def test_playhead_is_clamped_to_the_timeline(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia]
     ) -> None:
+        # 再生位置が終わりを越えると、何も無い所を指したまま切る・置くの操作が空振りする
         window.import_media([two_clips[0].path])
         assert window.wait_for_imports()
         window._seek(10**6)
@@ -148,6 +153,7 @@ class TestEditingFlow:
     def test_broken_media_does_not_stop_the_others(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia], tmp_path: Path
     ) -> None:
+        # 1 本の壊れたファイルで止まると、一緒に選んだ残りの素材も読み込まれない
         missing = tmp_path / "行方不明.mp4"
         window.import_media([missing, two_clips[0].path])
         assert window.wait_for_imports()
@@ -158,6 +164,7 @@ class TestSaveAndExport:
     def test_save_and_reload(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia], tmp_path: Path
     ) -> None:
+        # 保存して開き直すと切った所が消えていたら、作業した分がまるごと失われる
         window.import_media([two_clips[0].path, two_clips[1].path])
         assert window.wait_for_imports()
         window._seek(45)
@@ -175,6 +182,7 @@ class TestSaveAndExport:
     def test_export_produces_a_file(
         self, window: MainWindow, two_clips: tuple[SampleMedia, SampleMedia], tmp_path: Path
     ) -> None:
+        # ここが通らないと、編集はできても動画として外へ出せず作品が仕上がらない
         codecs = available_video_codecs()
         if not codecs:
             pytest.skip("使えるコーデックが無い")

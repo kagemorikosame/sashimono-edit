@@ -196,6 +196,7 @@ class TestSwitching:
         assert Colors.WINDOW.name() == "#1b1b1e"
 
     def test_an_unknown_theme_is_dark(self) -> None:
+        # 知らない名前で色の表が決まらないと、起動した画面に色が当たらず読めなくなる
         use_palette("purple")
         assert current_theme() == THEME_DARK
         assert resolve_theme("purple") == THEME_DARK
@@ -269,6 +270,7 @@ class TestPaintedParts:
     """自前で描く所は描くたびに Colors を読む 切り替えて描き直せば新しい色になる"""
 
     def test_the_timeline_repaints_in_the_new_colors(self, analyzer: MediaAnalyzer) -> None:
+        # 描き直しで新しい色を読まないと、タイムラインだけ暗いまま明るい窓の中に残る
         clip = Clip(timeline_start=0, duration=60, source=TEXT.create())
         base = Project.create()
         track = Track(TrackKind.VIDEO, "V1", (clip,))
@@ -341,6 +343,7 @@ class TestPaintedParts:
             shiboken6.delete(lock)
 
     def test_the_magnet_and_the_media_marks_follow(self, qt_application: QApplication) -> None:
+        # 吸い付きの磁石や音声の印が前の色のままだと、明るい地の上で溶けて見分けられない
         del qt_application
         scenes = SceneBar()
         pool = MediaPoolWidget(Project.create())
@@ -404,6 +407,7 @@ class TestNoColorsOutsideTheTheme:
 
 class TestTheSetting:
     def test_it_comes_back(self, tmp_path: Path) -> None:
+        # 選んだテーマが残らないと、明るい画面を選んだ人が起動のたびに暗い画面へ戻される
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(theme=THEME_LIGHT))
         assert store.load().theme == THEME_LIGHT
@@ -417,6 +421,7 @@ class TestTheSetting:
         assert loaded.use_proxy is False
 
     def test_the_dialog_offers_every_choice(self, qt_application: QApplication) -> None:
+        # 選べない項目があると「Windows に合わせる」が選べず、開いただけで今の選びが外れる
         del qt_application
         dialog = PreferencesDialog(Preferences(theme=THEME_LIGHT))
         try:

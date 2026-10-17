@@ -218,6 +218,8 @@ class TestSaveThenApply:
     def test_the_look_reaches_another_clip(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 保存した見た目の一部しか当たらないと、色や大きさや合成を
+        # 別のクリップへ 1 つずつ手で写すことになる
         _dress_up(window)
         source_clip, target, _ = _clips(window)
         _select(window, source_clip.id)
@@ -256,6 +258,7 @@ class TestSaveThenApply:
     def test_one_undo_takes_it_all_back(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 取り消し 1 回で戻らないと、試しに当てたプリセットを外すのに何回も戻して途中の姿が混ざる
         _dress_up(window)
         source_clip, target, _ = _clips(window)
         _select(window, source_clip.id)
@@ -324,6 +327,7 @@ class TestChoosingAndSaving:
     def test_saving_over_the_same_name_asks_first(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, store: PresetStore
     ) -> None:
+        # 確かめずに書き換えると、同じ名前で保存しただけで作り込んだプリセットが消える
         source_clip, _, _ = _clips(window)
         _select(window, source_clip.id)
         _save(window, monkeypatch, "見出し")
@@ -602,6 +606,7 @@ class TestOptions:
     def test_text_and_position_follow_the_preferences(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 設定で文字と位置も当てると選んだのに当たらないと、見出しを丸ごと写したい人が打ち直す
         _dress_up(window)
         source_clip, target, _ = _clips(window)
         _select(window, source_clip.id)
@@ -619,6 +624,7 @@ class TestOptions:
     def test_keeping_effects_adds_after_the_ones_already_there(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 残す設定でも前のエフェクトが消えると、足しておいたぼかしが黙って失われる
         _dress_up(window)
         source_clip, target, _ = _clips(window)
         _run(window, AddEffect(target.id, registry.require("blur").create()))
@@ -640,6 +646,7 @@ class TestOptions:
     def test_the_preferences_reach_the_panel_and_survive_a_restart(
         self, window: MainWindow, qt_application: QApplication
     ) -> None:
+        # 設定が窓まで届かないか起動で戻ると、選んだ当て方が効かず知らない当て方で文字が書き換わる
         del qt_application
         # 既定は見た目だけ 知らない人が当てて文字が消えると困る
         assert Preferences().preset_options == PresetOptions()

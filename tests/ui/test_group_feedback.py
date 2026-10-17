@@ -103,6 +103,7 @@ class TestUngroupingLinks:
     def test_the_menu_offers_ungroup_for_a_link(
         self, qt_application: QApplication, video_media: MediaItem
     ) -> None:
+        # 映像と音のつながりを解けないと、音だけずらしたり消したりするたびに絵まで一緒に動く
         del qt_application
         project = _placed(video_media)
         picture, _ = _clips(project)

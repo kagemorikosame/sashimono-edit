@@ -276,6 +276,7 @@ class TestWhenItRuns:
     def test_the_playhead_goes_over(
         self, running: tuple[PreviewWidget, StubCache, StubBackground]
     ) -> None:
+        # 走り係に再生位置が届かないと、先読みが前の位置のまわりを描き続け、動かした先の絵が遅れる
         widget, stub, background = running
         widget.set_frame(42)
         assert background.named("playhead")[-1] == 42

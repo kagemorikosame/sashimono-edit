@@ -109,6 +109,8 @@ class TestTypingAValue:
         assert _scale(window, b) == pytest.approx(100.0)
 
     def test_pressing_the_second_member(self, window: MainWindow) -> None:
+        # グループの 2 本目を押して値を打ったのに 1 本目が変わると、
+        # 狙ったクリップと違う絵が拡大される
         a, b = _select_both_then_group(window)
         view = window._timeline
         view.select(None)
@@ -119,6 +121,7 @@ class TestTypingAValue:
         assert _scale(window, a) == pytest.approx(100.0)
 
     def test_the_preview_pick_changes_only_that_clip(self, window: MainWindow) -> None:
+        # プレビューで選んだ 1 本だけでなく仲間まで変わると、画面で摘まんだ物と違う絵が拡大される
         a, b = _select_both_then_group(window)
         window._preview.clip_picked.emit(str(b))
         _type_scale(window, 70.0)

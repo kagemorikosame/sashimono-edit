@@ -31,6 +31,7 @@ def test_the_next_test_gets_the_style_sheet_back(qt_application: QApplication) -
 
 
 def test_a_test_that_leaves_the_light_colours(qt_application: QApplication) -> None:
+    # 後の 1 本の前振り 明るいテーマのまま終えておかないと、戻す仕組みが壊れても気付けない
     del qt_application
     use_palette(THEME_LIGHT)
     assert current_theme() == THEME_LIGHT

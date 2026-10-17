@@ -50,6 +50,7 @@ class TestScenes:
         assert len(window._timeline.project.timeline.tracks) == 1
 
     def test_placing_a_scene_in_main(self, window: MainWindow) -> None:
+        # シーンを本編へ置けないと、作ったシーンを動画に使えない
         scene_id = window.create_scene("挿入")
         assert scene_id is not None
         window.open_scene(None)
@@ -71,6 +72,7 @@ class TestScenes:
         assert window.active_scene is None
 
     def test_a_placed_scene_is_not_removed(self, window: MainWindow) -> None:
+        # 使っているシーンを消せてしまうと、本編に置いたクリップの中身が空になり絵が消える
         scene_id = window.create_scene("使用中")
         assert scene_id is not None
         window.open_scene(None)
@@ -114,6 +116,7 @@ class TestGroups:
         assert window._scene_bar._place_button.isEnabled()
 
     def test_group_and_ungroup_from_the_selection(self, window: MainWindow) -> None:
+        # 選んだ物をグループにできないか解けないと、まとめて動かすことも 1 本だけ直すこともできない
         view = window._timeline
         view.select_all()
         assert view.group_selected()

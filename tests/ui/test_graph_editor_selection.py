@@ -77,6 +77,7 @@ def graph(qt_application: QApplication) -> Iterator[GraphEditor]:
 
 class TestFollowingTheSelection:
     def test_a_keyed_clip_shows_its_curve(self, graph: GraphEditor) -> None:
+        # キーのあるクリップを選んでも曲線が出ないと、グラフで動きの緩急を直せない
         clip = _faded()
         graph.set_project(_project(clip))
         graph.set_clip(clip.id)
@@ -87,6 +88,7 @@ class TestFollowingTheSelection:
         assert [k.frame for k in graph._canvas._value.keyframes] == [0, 30]
 
     def test_a_clip_without_keys_says_how_to_make_them(self, graph: GraphEditor) -> None:
+        # キーが無いときに空のままだと、グラフが壊れたのか、何をすれば曲線が出るのかが分からない
         clip = replace(_faded(), opacity=AnimatedValue(static=1.0))
         graph.set_project(_project(clip))
         graph.set_clip(clip.id)

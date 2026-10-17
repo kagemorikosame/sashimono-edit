@@ -144,18 +144,22 @@ class TestThePreferences:
         assert (plain.update_check, plain.update_beta, plain.update_confirm) == (True, False, True)
 
     def test_they_come_back(self, tmp_path: Path) -> None:
+        # 読み戻らないと、自動の確かめを切った人の機械で、起動のたびにまた更新を取りに行く
         store = PreferenceStore(tmp_path / "preferences.json")
         chosen = Preferences(update_check=False, update_beta=True, update_confirm=False)
         store.save(chosen)
         assert store.load() == chosen
 
     def test_broken_values_fall_back(self, tmp_path: Path) -> None:
+        # 壊れた値を真と読むと、ベータを受け取らないはずの人にベータが入り、
+        # 確かめる設定が勝手に切れて更新が届かなくなる
         path = tmp_path / "preferences.json"
         path.write_text(json.dumps({"update_check": "no", "update_beta": 1}), encoding="utf-8")
         loaded = PreferenceStore(path).load()
         assert (loaded.update_check, loaded.update_beta) == (True, False)
 
     def test_the_dialog_shows_and_returns_them(self, qt_application: QApplication) -> None:
+        # 今の値を映さないと、設定を開いて OK を押しただけで切った更新の確かめが入り直す
         del qt_application
         chosen = Preferences(update_check=False, update_beta=True, update_confirm=False)
         dialog = PreferencesDialog(chosen)
@@ -190,6 +194,7 @@ class TestCheckingOnStart:
         assert harness.transport.requested == []
 
     def test_not_again_within_hours(self, harness: _Harness) -> None:
+        # 数時間のうちにまた取りに行くと、何度も開き直す人の分だけ GitHub へ通信が走る
         harness.store.save(UpdateState(last_checked=1_000_000.0 - 60))
         harness.controller.start()
         assert harness.transport.requested == []
@@ -226,12 +231,15 @@ class TestCheckingOnStart:
     def test_an_unwritable_place_is_sent_to_the_page(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 書き込めない場所へ落とそうとすると毎回失敗するだけで、配布のページから
+        # 手で入れる道も知らされないまま更新が届かない
         monkeypatch.setattr(Layout, "writable", lambda _self: False)
         harness.controller.start()
         assert harness.layout.staged_version() is None
         assert "配布のページ" in harness.window.statusBar().currentMessage()
 
     def test_a_finished_update_is_told(self, harness: _Harness) -> None:
+        # 済んだことを言わないと、再起動しただけで何が変わったか分からず、失敗したと思う
         harness.store.save(UpdateState(ready_version=__version__, last_checked=1_000_000.0))
         harness.controller.start()
         assert "更新しました" in harness.window.statusBar().currentMessage()
@@ -239,16 +247,20 @@ class TestCheckingOnStart:
 
 class TestCheckingByHand:
     def test_up_to_date_is_said(self, harness: _Harness) -> None:
+        # 最新のときに何も言わないと、メニューから確かめた人は押せたのかどうか分からない
         harness.transport, _ = release(harness.key, __version__)
         harness.controller.check_now()
         assert harness.informed and "最新" in harness.informed[0][1]
 
     def test_a_failure_is_explained(self, harness: _Harness) -> None:
+        # 繋がらないのに黙っていると、手で確かめた人は最新だと思い込み、更新を取り逃す
         harness.transport.pages.clear()
         harness.controller.check_now()
         assert harness.informed and harness.informed[0][0] == "更新を確かめられませんでした"
 
     def test_without_keys_it_says_why(self, tmp_path: Path, qt_application: QApplication) -> None:
+        # 鍵の無い版で理由を言わないと、確かめても何も起きず壊れたと思う 取りに行くと、
+        # 署名を確かめられない物を落として場所と通信を無駄にする
         del qt_application
         made = _Harness(tmp_path, Preferences(), keys=False)
         try:
@@ -269,6 +281,7 @@ class TestOffering:
     def test_next_start_is_remembered(
         self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 〔次の起動で入れる〕を覚えないと、選んだのに次に起動しても古い版のまま
         monkeypatch.setattr(ready.controller, "_choose", lambda *_a, **_k: ANSWER_NEXT_START)
         ready.controller.offer()
         state = ready.store.load()
@@ -279,6 +292,7 @@ class TestOffering:
     def test_a_skipped_version_is_dropped(
         self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 飛ばした版を捨てないと、断ったのに更新のボタンが出続け、落とした分が場所を食う
         monkeypatch.setattr(ready.controller, "_choose", lambda *_a, **_k: ANSWER_SKIP)
         ready.controller.offer()
         state = ready.store.load()
@@ -315,6 +329,7 @@ class TestSwitchingSettings:
         assert harness.controller.button.isHidden()
 
     def test_turning_beta_off_keeps_a_release(self, harness: _Harness) -> None:
+        # ベータを切っただけで正式版まで捨てると、落とし済みの更新が消えて取り直しになる
         harness.controller.start()
         harness.controller.apply_preferences(Preferences(update_beta=False))
         assert harness.controller.ready_version() == NEWER
@@ -336,6 +351,8 @@ class TestRestarting:
     def test_the_swapper_gets_the_plan(
         self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 開いていた作品の名前が渡らないと、再起動のあと空の画面で起きる 本体が終わらないと
+        # ファイルを掴んだままで入れ替えられない
         quit_called: list[bool] = []
         monkeypatch.setattr(QApplication, "quit", lambda: quit_called.append(True))
         assert ready.controller.restart_now()
@@ -413,6 +430,7 @@ class TestRestarting:
         assert ready.informed and "PowerShell" in ready.informed[0][1]
 
     def test_rolling_back_needs_a_previous_version(self, harness: _Harness) -> None:
+        # 前の版が無いのに戻そうとすると、入れ替え係が空の所へ入れ替えて起動できなくなる
         assert not harness.controller.roll_back()
         assert harness.informed and "前の版" in harness.informed[0][0]
 
@@ -482,15 +500,18 @@ class TestTheEditor:
         assert update_choices() == UpdateChoices()
 
     def test_the_help_menu_has_both(self, window: MainWindow) -> None:
+        # メニューに無いと、確かめを切った人が手で確かめる道も、壊れた版から戻る道も無い
         assert "ヘルプ/更新を確かめる…" in window._actions
         assert "ヘルプ/前の版に戻す…" in window._actions
 
     def test_an_idle_editor_has_no_blockers(self, window: MainWindow) -> None:
+        # 何もしていないのに妨げがあると言うと、更新の再起動がいつまでも断られる
         assert window.update_blockers() == []
 
     def test_a_working_assistant_blocks(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # AI の作業中に更新の再起動を許すと、頼んだ編集や環境の導入が途中で断ち切られる
         monkeypatch.setattr(type(window._chat), "working", property(lambda _self: True))
         assert window.update_blockers()
 
@@ -575,9 +596,12 @@ class TestScriptsBesideTheExe:
         return answers
 
     def test_the_default_is_to_move(self) -> None:
+        # 既定で移さないと、zip を展開し直してフォルダごと入れ替えた人の自作スクリプトが消える
         assert Preferences().scripts_move == "auto"
 
     def test_the_setting_comes_back_and_breaks_safely(self, tmp_path: Path) -> None:
+        # 読み戻らないと、尋ねる設定にした人も起動のたびに黙って移される
+        # 知らない値で起動が止まると、新しい版で書いた設定を古い版で開いた人が使えなくなる
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(scripts_move="ask"))
         assert store.load().scripts_move == "ask"
@@ -587,6 +611,7 @@ class TestScriptsBesideTheExe:
         assert store.load().scripts_move == "auto"
 
     def test_the_dialog_returns_it(self, qt_application: QApplication) -> None:
+        # 画面が値を返さないと、移さない設定を選んでも OK を押した時点で「移す」に戻る
         del qt_application
         dialog = PreferencesDialog(Preferences(scripts_move="off"))
         try:
@@ -597,6 +622,8 @@ class TestScriptsBesideTheExe:
     def test_they_are_moved_on_start_and_told_once(
         self, harness: _Harness, asked: list[str]
     ) -> None:
+        # 移さないと、exe の隣のスクリプトはフォルダごと入れ替えたときに消える
+        # 何度も知らせると、起動のたびに手が止まる
         mine = _put_script(harness.layout.install, "自分の/効果.anm2")
         rescanned: list[bool] = []
         harness.controller._rescan_scripts = lambda: rescanned.append(True)
@@ -617,6 +644,8 @@ class TestScriptsBesideTheExe:
     def test_a_name_taken_in_appdata_is_kept_and_told_once(
         self, harness: _Harness, asked: list[str]
     ) -> None:
+        # 同じ名前を上書きすると、%APPDATA% の側で直した新しいスクリプトが古い物で消える
+        # 毎回知らせると、起動のたびに同じ知らせで手が止まる
         mine = _put_script(harness.layout.install, "効果.anm2", "古い")
         _appdata_scripts().mkdir(parents=True)
         (_appdata_scripts() / "効果.anm2").write_text("新しい", encoding="utf-8")
@@ -1036,6 +1065,7 @@ class TestScriptsBesideTheExe:
             controller.deleteLater()
 
     def test_asking_is_once_for_the_same_files(self, harness: _Harness, asked: list[str]) -> None:
+        # 同じ物で毎回尋ねると、断った人が起動のたびに同じ質問で手を止められる
         harness.preferences = Preferences(update_check=False, scripts_move="ask")
 
         def decline(text: str) -> bool:
@@ -1054,12 +1084,14 @@ class TestScriptsBesideTheExe:
         assert len(asked) == 2 and "2 個" in asked[1]
 
     def test_off_does_nothing(self, harness: _Harness, asked: list[str]) -> None:
+        # 切ったのに移したり尋ねたりすると、exe の隣で使い分けている人のスクリプトが勝手に動く
         harness.preferences = Preferences(update_check=False, scripts_move="off")
         mine = _put_script(harness.layout.install, "効果.anm2")
         harness.controller.start()
         assert mine.is_file() and asked == [] and harness.informed == [] and not harness.notified
 
     def test_the_menu_asks_whatever_the_setting(self, harness: _Harness, asked: list[str]) -> None:
+        # 切った設定でメニューまで効かないと、移したくなったときに移す手段が無い
         harness.preferences = Preferences(scripts_move="off")
         _put_script(harness.layout.install, "効果.anm2")
         assert harness.controller.offer_script_move(manual=True)
@@ -1067,10 +1099,12 @@ class TestScriptsBesideTheExe:
         assert (_appdata_scripts() / "効果.anm2").is_file()
 
     def test_the_menu_says_when_there_is_nothing(self, harness: _Harness) -> None:
+        # 移す物が無いときに黙っていると、メニューを押した人は効いていないと思う
         harness.controller.offer_script_move(manual=True)
         assert harness.informed and harness.informed[0][0] == "移す物はありません"
 
     def test_the_bundled_readme_is_not_theirs(self, harness: _Harness, asked: list[str]) -> None:
+        # 同梱の説明書きを本人の物と数えると、何も置いていない人にまで移すよう知らせる
         _put_script(harness.layout.install, "README.txt", "同梱の説明")
         harness.controller.start()
         assert harness.informed == [] and harness.notified == [] and asked == []
@@ -1087,6 +1121,8 @@ class TestScriptsBesideTheExe:
         assert harness.store.load().scripts_offered == ()
 
     def test_the_editor_has_the_menu(self, qt_application: QApplication) -> None:
+        # メニューが無いと、移さない設定の人が手で移せない 移したあとに読み直さないと、
+        # 移したスクリプトが効果の一覧に出ない
         del qt_application
         window = MainWindow(Project.create(), confirm_unsaved=False)
         try:
@@ -1131,6 +1167,8 @@ class TestScriptsBesideTheExe:
     def test_files_that_cannot_be_carried_stop_the_rollback(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 写せないまま戻すと、自作スクリプトは次の更新で消える版にだけ残る
+        # 止めたのに今の版を飛ばす版に残すと、次の更新も受け取れない
         harness.preferences = Preferences(scripts_move="off")
         harness.layout.previous.mkdir()
         (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
@@ -1192,6 +1230,8 @@ class TestPythonChangeNote:
     def test_the_note_says_what_and_how_much(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 入れ直す機能と大きさと時間を書かないと、更新したあとで字幕起こしが使えず、
+        # どれだけ落とし直すかも分からないまま入れることになる
         target = tmp_path / "runtime"
         (target / "faster_whisper-1.1.0.dist-info").mkdir(parents=True)
         (target / "faster_whisper").mkdir()
@@ -1205,6 +1245,7 @@ class TestPythonChangeNote:
     def test_the_same_python_says_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 同じ Python なのに入れ直しの断りを出すと、要らない落とし直しを心配させて更新を遅らせる
         from sashimono.runtime import python_abi
 
         (tmp_path / "x").mkdir()

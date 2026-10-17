@@ -44,6 +44,8 @@ class TestTranscribeAfterInstall:
         qt_application: QApplication,
         video_media: MediaItem,
     ) -> None:
+        # 導入の直後に実行ボタンが押せないと、入れたのに使えず、
+        # アプリを再起動するまで文字起こしできない
         from sashimono.asr import runtime_status
         from sashimono.ui.subtitle import transcribe_dialog
 

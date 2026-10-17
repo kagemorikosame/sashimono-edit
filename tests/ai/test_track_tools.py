@@ -28,6 +28,7 @@ class TestTrackState:
         assert listed["solo"] is True
 
     def test_an_unknown_track_says_where_to_look(self, host: FakeHost) -> None:
+        # どこで調べればよいかを返さないと、AI は無いトラックの名前で切り替えを繰り返す
         with pytest.raises(ToolError, match="list_tracks"):
             run(host, "set_track_state", track_id="無い", muted=True)
 

@@ -91,6 +91,8 @@ class TestStyleField:
     def test_it_lists_the_family_styles_after_the_default(
         self, open_window: list[MainWindow]
     ) -> None:
+        # 一覧にファミリのスタイルが無いと Light のような細い太さを選べない
+        # 既定が先頭でないと、開いただけで別の太さが選ばれたように見える
         box = _style_box(_window(open_window))
         items = [box.itemText(index) for index in range(box.count())]
         assert items[0] == FONT_STYLE_DEFAULT_LABEL
@@ -98,6 +100,7 @@ class TestStyleField:
         assert box.currentIndex() == 0
 
     def test_choosing_a_style_saves_its_name(self, open_window: list[MainWindow]) -> None:
+        # 選んだスタイルが名前で残らないと、保存して開き直したときに文字が元の太さへ戻る
         window = _window(open_window)
         box = _style_box(window)
         box.setCurrentIndex(box.findData(LIGHT))
@@ -132,6 +135,8 @@ class TestGreyedFields:
     def test_bold_and_italic_grey_out_while_a_style_is_chosen(
         self, open_window: list[MainWindow]
     ) -> None:
+        # 灰色にしないと効かない太字を押して何も変わらず迷う
+        # 値まで消すと、スタイルを既定へ戻したときに付けていた太字が失われる
         window = _window(open_window, font_style=LIGHT, bold=True)
         editors = window._inspector._editors
         assert not editors[("source", "bold")].isEnabled()
@@ -153,6 +158,7 @@ class TestGreyedFields:
         assert not window._inspector._editors[("source", "bold")].isEnabled()
 
     def test_the_aviutl_layout_greys_the_style(self, open_window: list[MainWindow]) -> None:
+        # 灰色にしないと、AviUtl2 の組み方で効かないスタイルを選んで描きが変わらず迷う
         window = _window(open_window, layout="aviutl", font_style=LIGHT)
         editors = window._inspector._editors
         assert not editors[("source", "font_style")].isEnabled()
@@ -167,6 +173,7 @@ class TestGreyedFields:
         assert "bold" in TEXT.locked_reasons(params)
 
     def test_no_style_greys_nothing(self) -> None:
+        # 何も選んでいない普通のテキストで欄が灰色になると、太字も斜体も付けられなくなる
         assert TEXT.locked_reasons(TEXT.create().params) == {}
 
 

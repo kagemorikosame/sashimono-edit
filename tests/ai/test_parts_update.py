@@ -854,6 +854,8 @@ class TestOneWriterAtATime:
     def test_the_panel_blocks_both_directions(
         self, automatic: tuple[ChatPanel, PartsUpdater, _Installer], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 導入の欄と自動の入れ替えが同時に走ると、AI の部品の新旧が混ざり、
+        # アシスタントが起動しなくなる
         widget, updater, installer = automatic
         # 導入の欄が入れている間は、自動の入れ替えを始めない
         updater._check(asked=False)

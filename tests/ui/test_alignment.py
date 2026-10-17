@@ -52,6 +52,8 @@ class TestThePreview:
         assert _value(moved, clip.id, "pos_y") == pytest.approx(y)
 
     def test_the_middle_brings_it_back(self, make_widget: MakeWidget) -> None:
+        # 中央へ揃えても位置が 0 に戻らないと、
+        # ずらした絵を画面の真ん中へ戻す手段が手で数字を打つしかない
         clip = _clip(_media())
         project, _ = _project(clip)
         project = _placed_at(project, clip, 30.0)
