@@ -324,6 +324,10 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/削除して詰める", "delete_clips", "delete_clip"),
     same("タイムラインの右クリック/グループ化", "group_clips"),
     same("タイムラインの右クリック/グループ解除", "ungroup_clips"),
+    # 音量とミックス（#329） 2026-10-17 に利用者が右クリックに足すと決めた 人も AI も
+    # core/mixing.py の同じ計算を通る
+    same("タイムラインの右クリック/BGM を声に合わせて下げる…", "duck_audio"),
+    same("タイムラインの右クリック/音量を基準にそろえる…", "normalize_loudness"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),
@@ -460,7 +464,11 @@ LEDGER: tuple[Entry, ...] = (
         "設定パネル/欄の値",
         "set_param",
         "add_keyframe",
-        note="中身・エフェクト・縁取りの層の値 クリップ自身の欄は下の行（set_clip_property）",
+        "set_volume",
+        note=(
+            "中身・エフェクト・縁取りの層の値 クリップ自身の欄は下の行（set_clip_property）"
+            " 音量とパンの欄は set_volume でも変えられる（何本かまとめて dB で動かす #329）"
+        ),
     ),
     # クリップ自身の欄 SetClipProperty で変わる set_param では型が合わない（再生速度は分数）
     same("設定パネル/クリップ自身の欄/blend_mode", "set_clip_property", note="合成モード"),
@@ -617,6 +625,8 @@ AI_ONLY: dict[str, str] = {
         "AI が始めた書き出しを止める 画面ではステータスバーの〔中止〕（台帳はメニュー・"
         "右クリック・パネルのボタンだけを数え、ステータスバーは数えない）"
     ),
+    # BGM と効果音を置く（#329） 画面では素材をドラッグして置き、右端を詰める
+    "place_sound": _GESTURE,
 }
 
 

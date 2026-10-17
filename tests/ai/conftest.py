@@ -26,6 +26,7 @@ from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.serialize import save_project
 from sashimono.core.io.subtitles import save_subtitles
+from sashimono.core.mixing import DuckShape
 from sashimono.core.model import (
     ClipId,
     MediaId,
@@ -87,6 +88,8 @@ class FakeHost:
         self.wrap_share = 90
         #: 完成物の検査（#337） 本人の設定の音量の基準と、頼まれた検査・試験が入れる様子
         self.loudness = -14.0
+        #: ダッキング（#329）の本人の設定 既定は設定と同じ
+        self.duck = DuckShape()
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -225,6 +228,10 @@ class FakeHost:
     @property
     def loudness_target(self) -> float:
         return self.loudness
+
+    @property
+    def duck_shape(self) -> DuckShape:
+        return self.duck
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

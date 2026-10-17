@@ -27,6 +27,15 @@ from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.atomic import held_for_update, write_atomic
+from sashimono.core.mixing import (
+    DEFAULT_DUCK_ATTACK_MS,
+    DEFAULT_DUCK_DEPTH_DB,
+    DEFAULT_DUCK_RELEASE_MS,
+    DUCK_ATTACK_MS_RANGE,
+    DUCK_DEPTH_DB_RANGE,
+    DUCK_RELEASE_MS_RANGE,
+    DuckShape,
+)
 from sashimono.core.model import LayerMode
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.checks import LOUDNESS_TARGETS
@@ -545,6 +554,16 @@ class Preferences:
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
     check_loudness_target: int = -14
+    #: AI アシスタントが BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅（dB）
+    #: 声を聞かせたい量は作品と BGM で違う AI に値を言わなければこれを使う 既定は放送や
+    #: 配信の手引きでよく使う 10〜15 dB の真ん中の 12（:mod:`sashimono.core.mixing`）
+    duck_depth_db: int = DEFAULT_DUCK_DEPTH_DB
+    #: ダッキングで下げ始めてから下がり切るまでの長さ（ミリ秒） 既定は 300 短いほど BGM が
+    #: ぶつりと切れたように聞こえ、長いほど声の頭に BGM が残る
+    duck_attack_ms: int = DEFAULT_DUCK_ATTACK_MS
+    #: ダッキングで話し終えてから元の音量へ戻るまでの長さ（ミリ秒） 既定は 800 短いと文の間で
+    #: BGM が出入りして落ち着かない（ポンピング）
+    duck_release_ms: int = DEFAULT_DUCK_RELEASE_MS
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -596,6 +615,15 @@ class Preferences:
     def subtitle_wrap_share(self) -> int:
         """字幕の折り返しの幅（画面の幅の %） 切ってあれば 0（折り返さない）"""
         return self.subtitle_wrap_percent if self.subtitle_wrap else 0
+
+    @property
+    def duck_shape(self) -> DuckShape:
+        """AI アシスタントのダッキング（#329）の既定の形 AI が値を言わなければこれを使う"""
+        return DuckShape(
+            depth_db=float(self.duck_depth_db),
+            attack_ms=self.duck_attack_ms,
+            release_ms=self.duck_release_ms,
+        )
 
     @property
     def inserts_on_all_tracks(self) -> bool:
@@ -799,6 +827,15 @@ class PreferenceStore:
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
+            ),
+            duck_depth_db=_within(
+                data.get("duck_depth_db"), DUCK_DEPTH_DB_RANGE, plain.duck_depth_db
+            ),
+            duck_attack_ms=_within(
+                data.get("duck_attack_ms"), DUCK_ATTACK_MS_RANGE, plain.duck_attack_ms
+            ),
+            duck_release_ms=_within(
+                data.get("duck_release_ms"), DUCK_RELEASE_MS_RANGE, plain.duck_release_ms
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis

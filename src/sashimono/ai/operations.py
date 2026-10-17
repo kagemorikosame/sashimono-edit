@@ -111,14 +111,32 @@ from sashimono.core.commands import (
     valid_marker_color,
 )
 from sashimono.core.commands.edit import STOP_LOCKED
-from sashimono.core.commands.insert import new_track
+from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
+from sashimono.core.commands.insert import new_track, place_media
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.commands.volume import clip_volume, volume_commands
 from sashimono.core.io.aliases import Alias
 from sashimono.core.io.atomic import Expected, expect_now
 from sashimono.core.io.presets import Preset
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
-from sashimono.core.jetcut import plan_cuts
+from sashimono.core.jetcut import merge_ranges, plan_cuts
+from sashimono.core.mixing import (
+    DUCK_ATTACK_MS_RANGE,
+    DUCK_DEPTH_DB_RANGE,
+    DUCK_RELEASE_MS_RANGE,
+    VOLUME_LIMIT,
+    DuckShape,
+    audible_clips,
+    db_to_ratio,
+    gain_commands,
+    loudest,
+    loudness_gain,
+    measure_project,
+    plan_ducking,
+    scaled_volume,
+    sounds_now,
+)
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -165,6 +183,14 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
+from sashimono.engine.audio.speech import (
+    SPEECH_SOURCES,
+    SpeechError,
+    WaveformPendingError,
+    speaks,
+    voice_speech,
+)
+from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
 from sashimono.engine.checks import KINDS as CHECK_KINDS
@@ -174,6 +200,7 @@ from sashimono.engine.checks import (
     CheckRequest,
     CheckState,
 )
+from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
     CONTAINER_SUFFIXES,
@@ -539,21 +566,23 @@ def _with_groups(host: EditorHost, clip_ids: tuple[ClipId, ...]) -> tuple[ClipId
     return tuple(expanded)
 
 
-def _clip_id_list(host: EditorHost, arguments: dict[str, Any]) -> tuple[ClipId, ...]:
-    """``clip_ids`` を読んで確かめる 重なった ID は 1 つにする
+def _clip_id_list(
+    host: EditorHost, arguments: dict[str, Any], key: str = "clip_ids"
+) -> tuple[ClipId, ...]:
+    """``key``（既定 ``clip_ids``）を読んで確かめる 重なった ID は 1 つにする
 
     重なったまま渡すと「3 本を移動」のような本数が実際と食い違う 型が違えば
     ToolError にする 素の TypeError で落ちると、AI は何を直せばよいか分からない
     """
-    _no_explicit_null(arguments, "clip_ids")
-    raw = arguments.get("clip_ids")
+    _no_explicit_null(arguments, key)
+    raw = arguments.get(key)
     if raw is None:
         return ()
     if isinstance(raw, str):
         raw = [raw]
     if not isinstance(raw, list):
-        raise ToolError("clip_ids はクリップ ID の配列で渡してください")
-    names = _string_items(raw, "clip_ids")
+        raise ToolError(f"{key} はクリップ ID の配列で渡してください")
+    names = _string_items(raw, key)
     project = _project(host)
     for clip_id in names:
         _require_clip(project, clip_id)
@@ -2800,6 +2829,440 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
 
 
+# --- 音量とミックス（#329 B3） ---
+#
+# どれも人の操作と同じ命令を通す 音量はクリップの固定の音量の欄（設定パネルの「音量」と
+# タイムラインの音量の線と同じ所 :func:`volume_command`）、置くのはドラッグ＆ドロップと同じ
+# :func:`place_media` 1 回の呼び出しは 1 回の apply_commands なので、取り消し 1 回で戻る
+
+#: BGM を敷き詰めるときに置く本数の上限 短い効果音を長い範囲へ並べるような頼み違いで、
+#: 何千本も置いて画面が固まるのを防ぐ
+MAX_LOOP_PIECES = 500
+
+
+def _sound_clip(project: Project, clip_id: object, *, editing: bool = True) -> tuple[Track, Clip]:
+    """音を鳴らすクリップ 絵だけのクリップと、変える（``editing``）ならロックしたトラックの
+    クリップを断る
+
+    絵のクリップの音量を変えても何も鳴らないので、AI は効いたと思い込む ロックは人が
+    触らせないために掛けた物なので、AI も変えない 聞くだけのクリップ（ダッキングの声）は
+    ロックしていても使う 断ると、声のトラックを守るためにロックした人が BGM を下げられない
+    """
+    track, clip = _require_clip(project, str(clip_id))
+    if not project.plays_sound(track, clip):
+        raise ToolError(
+            f"{clip_id} は音を鳴らさないクリップです（映像トラックの絵など）"
+            " 音声のクリップを指してください（list_clips の track_kind）"
+        )
+    if editing and track.locked:
+        raise ToolError(
+            f"{clip_id} のトラック {track.name} はロックされています"
+            " 変えるなら set_track_state でロックを解いてから"
+        )
+    return track, clip
+
+
+def _track_sound_clips(
+    project: Project, track_id: object, *, editing: bool = True
+) -> list[tuple[Track, Clip]]:
+    """トラックの音を鳴らすクリップすべて"""
+    track = next((t for t in project.timeline.tracks if str(t.id) == str(track_id)), None)
+    if track is None:
+        raise ToolError(f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）")
+    clips = [
+        _sound_clip(project, clip.id, editing=editing)
+        for clip in track.clips
+        if project.plays_sound(track, clip)
+    ]
+    if not clips:
+        raise ToolError(f"トラック {track.name} に音を鳴らすクリップがありません")
+    return clips
+
+
+def _picked_sound_clips(
+    host: EditorHost,
+    arguments: dict[str, Any],
+    ids_key: str,
+    track_key: str,
+    *,
+    editing: bool = True,
+) -> list[tuple[Track, Clip]]:
+    """``ids_key`` のクリップか ``track_key`` のトラックのクリップ どちらか 1 つだけを受ける"""
+    project = _project(host)
+    # 明示の null を「渡していない」と読むと、もう片方の引数（トラックごと）へ黙って回る
+    _no_explicit_null(arguments, ids_key)
+    has_ids = arguments.get(ids_key) is not None
+    has_track = arguments.get(track_key) is not None
+    if has_ids == has_track:
+        raise ToolError(f"{ids_key} か {track_key} のどちらか 1 つを渡してください")
+    if has_track:
+        return _track_sound_clips(project, arguments[track_key], editing=editing)
+    clip_ids = _clip_id_list(host, arguments, ids_key)
+    if not clip_ids:
+        raise ToolError(f"{ids_key} が空です")
+    return [_sound_clip(project, clip_id, editing=editing) for clip_id in clip_ids]
+
+
+def _volume_row(clip_id: ClipId, value: AnimatedValue) -> dict[str, Any]:
+    """返事に載せる音量の線の要約 点の全部は返さない（BGM 1 本で何百にもなる）"""
+    if not value.keyframes:
+        return {"clip_id": str(clip_id), "volume_percent": round(value.static, 2)}
+    levels = [keyframe.value for keyframe in value.keyframes]
+    return {
+        "clip_id": str(clip_id),
+        "keyframes": len(levels),
+        "max_percent": round(max(levels), 2),
+        "min_percent": round(min(levels), 2),
+    }
+
+
+def _set_volume(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    targets = [_sound_clip(project, clip_id) for clip_id in _target_clips(host, arguments)]
+    has_percent = arguments.get("volume_percent") is not None
+    has_gain = arguments.get("gain_db") is not None
+    has_pan = arguments.get("pan_percent") is not None
+    if has_percent and has_gain:
+        raise ToolError("volume_percent と gain_db はどちらか 1 つにしてください")
+    if not (has_percent or has_gain or has_pan):
+        raise ToolError("volume_percent・gain_db・pan_percent のどれかを渡してください")
+    percent = _limit_number(arguments, "volume_percent", 100.0, 0.0, VOLUME_LIMIT)
+    gain = _limit_number(arguments, "gain_db", 0.0, -60.0, 24.0)
+    pan = (
+        AnimatedValue(static=_limit_number(arguments, "pan_percent", 0.0, -100.0, 100.0))
+        if has_pan
+        else None
+    )
+    commands: list[Command] = []
+    rows: list[dict[str, Any]] = []
+    stopped: list[str] = []
+    for _track, clip in targets:
+        before = clip_volume(clip)
+        after: AnimatedValue | None = None
+        if has_percent:
+            # 決めた値にするときは点を捨てる 点を残すと、次のフレームで線の値へ戻って効かない
+            # （設定パネルの欄で値を打ったときと同じ）
+            after = AnimatedValue(static=percent)
+        elif has_gain:
+            after = scaled_volume(before, db_to_ratio(gain))
+            wanted = loudest(before) * db_to_ratio(gain)
+            if wanted > VOLUME_LIMIT:
+                stopped.append(str(clip.id))
+        commands.extend(volume_commands(clip, after, pan))
+        rows.append(
+            {
+                **_volume_row(clip.id, after if after is not None else before),
+                **({"pan_percent": pan.static} if pan is not None else {}),
+            }
+        )
+    host.apply_commands(commands, f"音量を変更: {len(targets)} 本")
+    result: dict[str, Any] = {"clips": rows}
+    if stopped:
+        result["note"] = (
+            f"{', '.join(stopped)} は上限の {VOLUME_LIMIT:g}% で止まりました"
+            " それ以上大きくするなら素材の音を上げるか、ほかの音を下げてください"
+        )
+    return result
+
+
+def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    ducked = _picked_sound_clips(host, arguments, "clip_ids", "track_id")
+    voices = _picked_sound_clips(host, arguments, "voice_clip_ids", "voice_track_id", editing=False)
+    # 鳴らない声（ミュート・ソロで外れたトラック・無効のクリップ）では下げない 書き出しで
+    # 声が聞こえないのに BGM だけが下がる
+    voices = [(track, clip) for track, clip in voices if sounds_now(project, track, clip)]
+    # 置いたシーンは話している所を拾えないので声から外す 外さないと、ナレーションと
+    # シーンが並んだトラックを声に選んだだけで全体が断られる
+    voices = [(track, clip) for track, clip in voices if speaks(project, clip)]
+    if not voices:
+        raise ToolError(
+            "話している所を拾える声のクリップがありません 置いたシーンは使えず、"
+            "書き出しで鳴らない声（ミュート・ソロで外れたトラックか、無効のクリップ）も使えません"
+        )
+    both = {clip.id for _, clip in ducked} & {clip.id for _, clip in voices}
+    if both:
+        # 自分の声で自分を下げると、話している所だけ声が小さくなる
+        raise ToolError(f"下げるクリップと声のクリップが重なっています: {', '.join(both)}")
+    plain = host.duck_shape
+    shape = DuckShape(
+        depth_db=_limit_number(arguments, "depth_db", plain.depth_db, *DUCK_DEPTH_DB_RANGE),
+        attack_ms=round(
+            _limit_number(arguments, "attack_ms", plain.attack_ms, *DUCK_ATTACK_MS_RANGE)
+        ),
+        release_ms=round(
+            _limit_number(arguments, "release_ms", plain.release_ms, *DUCK_RELEASE_MS_RANGE)
+        ),
+    )
+    source = str(arguments.get("speech_from") or "auto")
+    if source not in SPEECH_SOURCES:
+        raise ToolError(f"speech_from は {'・'.join(SPEECH_SOURCES)} のどれかです")
+    threshold = _limit_number(arguments, "threshold_db", -40.0, -90.0, -10.0)
+
+    def waveform_of(media: MediaItem, stream: int) -> Waveform | None:
+        return host.waveform(media, stream)
+
+    try:
+        speech = voice_speech(project, voices, waveform_of, source=source, threshold_db=threshold)
+    except WaveformPendingError as exc:
+        host.analyze(exc.media)
+        raise ToolError(str(exc)) from exc
+    except SpeechError as exc:
+        raise ToolError(f"{exc}（speech_from を waveform にすると波形から拾います）") from exc
+    if not speech:
+        raise ToolError(
+            "声のクリップに話している所が見つかりません threshold_db を下げるか、"
+            "字幕を起こしてから呼んでください"
+        )
+
+    base = arguments.get("base_volume_percent")
+    plan = plan_ducking(
+        [clip for _, clip in ducked],
+        speech,
+        shape=shape,
+        rate=project.rate,
+        base=None
+        if base is None
+        else _limit_number(arguments, "base_volume_percent", 100.0, 0.0, VOLUME_LIMIT),
+    )
+    commands = list(plan.commands)
+    rows = [_volume_row(clip.id, curve) for clip, curve in plan.curves]
+    untouched = [str(clip.id) for clip in plan.untouched]
+    if not commands:
+        raise ToolError("下げるクリップの範囲に、話している所がありません")
+    host.apply_commands(commands, f"BGM を声に合わせて下げる: {len(commands)} 本")
+    result: dict[str, Any] = {
+        "clips": rows,
+        "depth_db": shape.depth_db,
+        "attack_ms": shape.attack_ms,
+        "release_ms": shape.release_ms,
+        "speech_spans": len(merge_ranges(speech)),
+        "note": (
+            "音量の線を置き換えました（前の点は消えます フェードの欄はそのまま）"
+            " 人はタイムラインの音量の線で点を直せます 取り消し 1 回で元に戻ります"
+        ),
+    }
+    if untouched:
+        result["untouched_clip_ids"] = untouched
+    return result
+
+
+def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    # 明示の null を省いたのと同じに読むと、選んだつもりの 1 本ではなく作品全体が変わる
+    _no_explicit_null(arguments, "clip_ids")
+    if arguments.get("clip_ids") is None:
+        # 省いたら作品全体（書き出しで鳴る音） 選択を使わないのは、「全体の音量をそろえて」で
+        # たまたま選んでいた 1 本だけが変わるのを防ぐため
+        # 書き出しで鳴る音だけ（ミキサと同じくミュート・ソロ・無効を見る） ソロで外れた
+        # トラックの音まで入れると、測るときにソロを外すので、鳴らない音まで混ぜて測る
+        targets = [_sound_clip(project, clip.id) for _, clip in audible_clips(project)]
+        if not targets:
+            raise ToolError("タイムラインに鳴っている音のクリップがありません")
+    else:
+        clip_ids = _clip_id_list(host, arguments)
+        if not clip_ids:
+            raise ToolError("clip_ids が空です 作品全体をそろえるなら省いてください")
+        targets = [_sound_clip(project, clip_id) for clip_id in clip_ids]
+        # 無効にしたクリップはミキサが鳴らさないので測りに入らない 入らない物に同じ dB を
+        # 掛けると、有効に戻したときにそろえていない音量で鳴る 上限 400% の計算からも外す
+        targets = [(track, clip) for track, clip in targets if clip.enabled]
+        if not targets:
+            raise ToolError("どのクリップも無効です 有効にしてから呼んでください")
+    target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
+    ceiling = _limit_number(arguments, "peak_ceiling_db", -1.0, -20.0, 0.0)
+    wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    start = min(clip.timeline_start for _, clip in targets)
+    end = max(clip.timeline_end for _, clip in targets)
+    request = CheckRequest(
+        CheckLimits(loudness_target=target, kinds=frozenset({LOUDNESS})),
+        project=measure_project(project, (clip.id for _, clip in targets)),
+        start=start,
+        end=end,
+        scene=str(host.active_scene) if host.active_scene is not None else None,
+    )
+    host.request_check(request)
+
+    def finish() -> object:
+        return _apply_loudness(host, project, request, [clip for _, clip in targets], ceiling)
+
+    if not host.check_state().running or wait <= 0:
+        return finish()
+    return Pending(wait=host.check_waiter(), seconds=wait, then=finish)
+
+
+def _apply_loudness(
+    host: EditorHost,
+    project: Project,
+    request: CheckRequest,
+    clips: list[Clip],
+    ceiling: float,
+) -> object:
+    """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない"""
+    state = host.check_state()
+    if state.request != request:
+        raise ToolError("測っている間に別の検査に替わりました もう 1 度呼んでください")
+    if state.failure is not None:
+        raise ToolError(f"音量を測れませんでした: {state.failure}")
+    if state.running:
+        report = state.report
+        done = 0.0 if report is None else (report.analyzed - report.start) / report.fps
+        return {
+            "measuring": True,
+            "measured_seconds": round(done, 1),
+            "note": (
+                "音量を測っている途中です まだ何も変えていません"
+                " 同じ引数でもう 1 度呼ぶと、測り終えた所から続けて変えます"
+            ),
+        }
+    if state.stopped:
+        raise ToolError("音量を測るのが止められました もう 1 度呼ぶと測り直します")
+    report = state.report
+    if report is None or report.loudness is None:
+        raise ToolError(
+            "音量を測れませんでした 静かすぎるか、0.4 秒より短い音です（積分ラウドネスは"
+            " -70 LUFS より静かな所を数えない）"
+        )
+    if _project(host) != project:
+        raise ToolError(
+            "測っている間に作品が変わりました 何も変えていません もう 1 度呼ぶと測り直します"
+        )
+    measured = report.loudness
+    decided = loudness_gain(
+        clips,
+        measured=measured,
+        peak_db=report.peak_db,
+        target=request.limits.loudness_target,
+        ceiling=ceiling,
+    )
+    gain = decided.gain_db
+    limited = list(decided.limited_by)
+    result: dict[str, Any] = {
+        "measured_lufs": round(measured, 1),
+        "target_lufs": request.limits.loudness_target,
+        "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
+        "clips": len(clips),
+    }
+    if abs(gain) < 0.05:
+        result |= {"gain_db": 0.0, "note": "すでに基準に合っています 何も変えていません"}
+        return result
+    commands = gain_commands(clips, gain)
+    host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
+    result |= {
+        "gain_db": round(gain, 2),
+        "expected_lufs": round(measured + gain, 1),
+        "expected_peak_dbfs": None if report.peak_db is None else round(report.peak_db + gain, 2),
+    }
+    notes = ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+    if limited:
+        result["limited_by"] = limited
+        if "peak" in limited:
+            notes.append(f"音の山が {ceiling:g} dBFS を超えるので、基準の手前で止めました")
+        if "volume_limit" in limited:
+            notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
+    result["note"] = " ".join(notes)
+    return result
+
+
+def _fixed_param(clip: Clip, kind: str, name: str, value: float) -> Clip:
+    """置く前のクリップの固定の項目の値を 1 つ変える（まだ置いていないので命令にしない）"""
+    effects = tuple(
+        effect.with_param(name, AnimatedValue(static=value))
+        if effect.fixed and effect.kind == kind
+        else effect
+        for effect in clip.effects
+    )
+    return replace(clip, effects=effects)
+
+
+def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    if not media.has_audio:
+        raise ToolError(f"{media.name} に音がありません")
+    if media.has_video or media.is_still:
+        raise ToolError(
+            f"{media.name} は動画か画像です 音だけの素材を指すか、place_media で置いてください"
+        )
+    at = _frame_argument(arguments, "at_frame", host.playhead)
+    if at < 0:
+        raise ToolError("at_frame は 0 以上です")
+    preferred: TrackId | None = None
+    if arguments.get("track_id") is not None:
+        track = next(
+            (t for t in project.timeline.tracks if str(t.id) == str(arguments["track_id"])), None
+        )
+        if track is None or track.kind is TrackKind.VIDEO:
+            raise ToolError("track_id は音声トラックか混合トラックを指してください（list_tracks）")
+        preferred = track.id
+    until = arguments.get("until_frame")
+    if until is not None:
+        until = _frame_argument(arguments, "until_frame", 0)
+        if until <= at:
+            raise ToolError("until_frame は at_frame より後ろにしてください")
+    loop = _flag_argument(arguments, "loop", True)
+    volume = arguments.get("volume_percent")
+    level = _limit_number(arguments, "volume_percent", 100.0, 0.0, VOLUME_LIMIT)
+    fade_in = _limit_number(arguments, "fade_in_seconds", 0.0, 0.0, 60.0)
+    fade_out = _limit_number(arguments, "fade_out_seconds", 0.0, 0.0, 60.0)
+
+    working = project
+    pieces: list[list[Command]] = []
+    cursor = at
+    while True:
+        placed = place_media(
+            working, [media], at_frame=cursor, track_id=preferred, split_audio=host.splits_media
+        )
+        adds = [command for command in placed if isinstance(command, AddClip)]
+        if not adds:
+            raise ToolError(f"{media.name} は長さが無いので置けません")
+        end = max(command.clip.timeline_end for command in adds)
+        if until is not None and end > until:
+            # 最後の 1 本は範囲の終わりで切る 画面で右端を詰めたのと同じ長さになる
+            placed = [
+                AddClip(c.track_id, replace(c.clip, duration=until - c.clip.timeline_start))
+                if isinstance(c, AddClip)
+                else c
+                for c in placed
+            ]
+            end = until
+        for command in placed:
+            working = command.apply(working)
+        pieces.append(placed)
+        preferred = adds[0].track_id
+        cursor = end
+        if until is None or not loop or cursor >= until:
+            break
+        if len(pieces) >= MAX_LOOP_PIECES:
+            raise ToolError(
+                f"{MAX_LOOP_PIECES} 本を超えて並べることになります until_frame を確かめてください"
+            )
+
+    commands: list[Command] = []
+    for index, placed in enumerate(pieces):
+        for command in placed:
+            if not isinstance(command, AddClip):
+                commands.append(command)
+                continue
+            clip = with_fixed_items(command.clip, sound=True)
+            if volume is not None:
+                clip = _fixed_param(clip, VOLUME_EFFECT_KIND, "volume", level)
+            if index == 0 and fade_in > 0:
+                clip = _fixed_param(clip, FADE_EFFECT_KIND, "fade_in", fade_in)
+            if index == len(pieces) - 1 and fade_out > 0:
+                clip = _fixed_param(clip, FADE_EFFECT_KIND, "fade_out", fade_out)
+            commands.append(AddClip(command.track_id, clip))
+    host.apply_commands(commands, f"音を置く: {media.name}")
+    added = [command for command in commands if isinstance(command, AddClip)]
+    return {
+        "placed": len(added),
+        "clip_ids": [str(command.clip.id) for command in added],
+        "track_ids": list(dict.fromkeys(str(command.track_id) for command in added)),
+        "from_frame": at,
+        "to_frame": max(command.clip.timeline_end for command in added),
+    }
+
+
 def _seconds(value: object) -> Fraction:
     return Fraction(round(float(str(value)) * 100), 100)
 
@@ -3656,6 +4119,9 @@ _LOOKS_AND_PLACES_IN_PROJECT = frozenset({Outbound.PROJECT, Outbound.APP_SETTING
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: ダッキング（#329） クリップ ID と音量の線の要約に、本人の設定（下げ幅と速さの既定）が載る
+#: 字幕は話している区間の時刻だけを使い、文は返さない 断る文には素材の名前が入りうる
+_DUCKING = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
 
@@ -4787,6 +5253,143 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_jet_cut,
         sends=_WITH_FILES,
         writes=True,
+    ),
+    Operation(
+        name="set_volume",
+        description=(
+            "音のクリップの音量と左右を変える（設定パネルの「音量」「パン」と同じ欄）"
+            " volume_percent は決めた値にする（100 が素材のまま 0〜400 点は消える）"
+            " gain_db は今の音量から上げ下げする（+6 でおよそ 2 倍 点の付いた線も形を保って"
+            "動かす） 何本かまとめて変えられる 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": _clip_ids_schema(),
+                "volume_percent": _number("音量 %（0〜400 100 が素材のまま）"),
+                "gain_db": _number("今の音量から上げ下げする dB（-60〜+24）"),
+                "pan_percent": _number("左右 %（-100 が左 +100 が右 0 が真ん中）"),
+            }
+        ),
+        handler=_set_volume,
+        writes=True,
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="duck_audio",
+        description=(
+            "BGM などを、声が話している間だけ下げる（ダッキング） 声のクリップの話している所を"
+            "字幕（無ければ波形）から拾い、下げるクリップの音量の線に点を打つ"
+            "（タイムラインの音量の線と同じ点なので人が後で直せる） 下げ幅と速さを省くと"
+            "本人の設定（表示 → 設定… の BGM を声の間に下げる量・速さ）を使う"
+            " 掛け直すと前の線を置き換える（基準は線の一番大きい値） 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "下げるクリップ（BGM） track_id とどちらか",
+                },
+                "track_id": _string("下げるトラック（その上の音のクリップすべて）"),
+                "voice_clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "声のクリップ voice_track_id とどちらか",
+                },
+                "voice_track_id": _string("声のトラック（その上の音のクリップすべて）"),
+                "depth_db": _number(
+                    f"下げる量 dB（{DUCK_DEPTH_DB_RANGE[0]}〜{DUCK_DEPTH_DB_RANGE[1]}"
+                    " 省くと本人の設定）"
+                ),
+                "attack_ms": _number(
+                    f"話し始めの前から下げ始めて下がり切るまでのミリ秒（{DUCK_ATTACK_MS_RANGE[0]}"
+                    f"〜{DUCK_ATTACK_MS_RANGE[1]} 省くと本人の設定）"
+                ),
+                "release_ms": _number(
+                    f"話し終えてから元へ戻るまでのミリ秒（{DUCK_RELEASE_MS_RANGE[0]}"
+                    f"〜{DUCK_RELEASE_MS_RANGE[1]} 省くと本人の設定） 間がこれと attack_ms の"
+                    "和より短い文どうしは、下げたままつなぐ"
+                ),
+                "base_volume_percent": _number(
+                    "下げていない所の音量 %（省くと今の線の一番大きい値）"
+                ),
+                "speech_from": {
+                    "type": "string",
+                    "enum": list(SPEECH_SOURCES),
+                    "description": (
+                        "話している所を何から拾うか auto は字幕があれば字幕、無ければ波形"
+                        "（既定 auto）"
+                    ),
+                },
+                "threshold_db": _number(
+                    "波形から拾うとき、これより大きい所を声とみなす dBFS（既定 -40）"
+                ),
+            }
+        ),
+        handler=_duck_audio,
+        writes=True,
+        sends=_DUCKING,
+    ),
+    Operation(
+        name="normalize_loudness",
+        description=(
+            "音量をラウドネスの基準（ITU-R BS.1770 の積分ラウドネス）へそろえる 測った音へ"
+            "同じ dB を掛けるので、声と BGM の釣り合いは変えない clip_ids を省くと作品全体"
+            "（ミュートしていないトラックの音すべて）、渡すとそのクリップだけを混ぜて測る"
+            " 音の山が peak_ceiling_db を超えるときと、音量の欄の上限 400% に当たるときは、"
+            "基準の手前で止めて limited_by に書く 測るのに時間がかかる 終わらなければ"
+            "何も変えずに measuring を返す（同じ引数でもう 1 度呼ぶと続きから）"
+            " 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "そろえるクリップ 省くと作品全体",
+                },
+                "target_lufs": _number(
+                    "基準 LUFS（-40〜-5 省くと本人の設定 "
+                    + " / ".join(
+                        f"{value} は{name.split(' ')[0]}" for value, name in LOUDNESS_TARGETS
+                    )
+                    + "）"
+                ),
+                "peak_ceiling_db": _number("音の山の上限 dBFS（-20〜0 既定 -1）"),
+                "wait_seconds": _number(
+                    f"測り終えるまで待つ秒（0〜{MAX_CHECK_WAIT:g}、既定 {DEFAULT_CHECK_WAIT:g}）"
+                ),
+            }
+        ),
+        handler=_normalize_loudness,
+        writes=True,
+        sends=_CHECKS,
+    ),
+    Operation(
+        name="place_sound",
+        description=(
+            "BGM や効果音（音だけの素材）をタイムラインへ置く 音声トラック（混合の作品では"
+            "空いたレイヤー）の空いた所へ置く until_frame を渡すと、そこまで素材を繰り返して"
+            "敷き詰め（loop が true のとき）、最後の 1 本を until_frame で切る 音量とフェードは"
+            "置いたクリップの音量・フェードの欄に入る 動画の素材は place_media で置く"
+            " 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("置く素材（音だけの素材）"),
+                "at_frame": _integer("置く位置 省くと再生位置"),
+                "track_id": _string("置きたいトラック 埋まっていればほかの空いたトラックへ"),
+                "until_frame": _integer("ここで終える（BGM を敷く範囲の終わり）"),
+                "loop": _boolean("until_frame まで繰り返す（既定 true）"),
+                "volume_percent": _number("音量 %（0〜400 既定 100）"),
+                "fade_in_seconds": _number("頭のフェードイン 秒（0〜60）"),
+                "fade_out_seconds": _number("終わりのフェードアウト 秒（0〜60）"),
+            },
+            ["media_id"],
+        ),
+        handler=_place_sound,
+        writes=True,
+        sends=_WITH_FILES,
     ),
     Operation(
         name="transcribe",

@@ -104,6 +104,14 @@ from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
+from sashimono.core.mixing import (
+    DuckShape,
+    gain_commands,
+    loudness_gain,
+    measure_project,
+    plan_ducking,
+    sounds_now,
+)
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -115,16 +123,24 @@ from sashimono.core.model import (
     Project,
     ProjectSettings,
     SceneId,
+    Track,
     TrackId,
     heard_stream,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
+from sashimono.engine.audio.speech import (
+    SpeechError,
+    WaveformPendingError,
+    speaks,
+    voice_speech,
+)
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
-from sashimono.engine.checks import CheckJob, CheckRequest, CheckState
+from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
+from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
@@ -148,6 +164,7 @@ from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
+from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.progress_display import (
@@ -646,6 +663,9 @@ class MainWindow(QMainWindow):
         if stop is not None:
             stop.clicked.connect(self._checks.stop)
         self._checks.changed.connect(self._show_check_progress)
+        # 右クリックの〔音量を基準にそろえる…〕（#329）が測り終えるのを待つ頼み
+        self._pending_loudness: _PendingLoudness | None = None
+        self._checks.changed.connect(self._finish_loudness)
         self.statusBar().addPermanentWidget(self._check_indicator)
         # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
         # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
@@ -1209,6 +1229,12 @@ class MainWindow(QMainWindow):
         )
 
         self._timeline.selection_changed.connect(self._on_selection_changed)
+        self._timeline.duck_requested.connect(
+            lambda clip_ids: self.duck_clips([ClipId(str(c)) for c in clip_ids])
+        )
+        self._timeline.loudness_requested.connect(
+            lambda clip_ids: self.normalize_clips([ClipId(str(c)) for c in clip_ids])
+        )
         self._timeline.scene_open_requested.connect(
             lambda scene_id: self.open_scene(SceneId(scene_id))
         )
@@ -3338,6 +3364,10 @@ class MainWindow(QMainWindow):
     def loudness_target(self) -> float:
         return float(self._preferences.check_loudness_target)
 
+    @property
+    def duck_shape(self) -> DuckShape:
+        return self._preferences.duck_shape
+
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""
         self._checks.start(
@@ -3351,6 +3381,166 @@ class MainWindow(QMainWindow):
 
     def check_waiter(self) -> Callable[[float], bool]:
         return self._checks.waiter()
+
+    # --- 音量とミックス（#329 タイムラインの右クリック） ---
+
+    def _sound_targets(self, clip_ids: list[ClipId]) -> list[tuple[Track, Clip]]:
+        """音を鳴らし、ロックしていないトラックにあるクリップ 消えた ID は飛ばす"""
+        project = self.view_project
+        found: list[tuple[Track, Clip]] = []
+        for clip_id in clip_ids:
+            located = project.timeline.locate_clip(clip_id)
+            if located is None:
+                continue
+            track, clip = located
+            if not track.locked and project.plays_sound(track, clip):
+                found.append((track, clip))
+        return found
+
+    def duck_clips(self, clip_ids: list[ClipId]) -> bool:
+        """〔BGM を声に合わせて下げる…〕 声のトラックと下げ方を尋ね、話している間だけ下げる
+
+        AI の ``duck_audio`` と同じ所（話している所は :func:`voice_speech`、線は
+        :func:`plan_ducking`）を通す 下げられたら真
+        """
+        project = self.view_project
+        targets = self._sound_targets(clip_ids)
+        if not targets:
+            self.statusBar().showMessage("音を鳴らすクリップを選んでください", 5000)
+            return False
+        chosen = {clip.id for _, clip in targets}
+        # 声のトラックの候補は、下げるクリップ以外の音を持つトラック 自分の声で自分を下げると、
+        # 話している所だけ声が小さくなる
+        # 書き出しで鳴る声だけ（ミュート・ソロで外れたトラックと無効のクリップは外す AI と同じ）
+        voices = [
+            track
+            for track in project.timeline.tracks
+            if any(
+                clip.id not in chosen and sounds_now(project, track, clip) and speaks(project, clip)
+                for clip in track.clips
+            )
+        ]
+        if not voices:
+            self.statusBar().showMessage("声のクリップを置いたトラックがありません", 5000)
+            return False
+        choice = ask_duck(self, voices, self._preferences.duck_shape)
+        if choice is None:
+            return False
+        voice_track = project.timeline.find_track(choice.voice_track)
+        if voice_track is None:
+            return False
+        voice_clips = [
+            (voice_track, clip)
+            for clip in voice_track.clips
+            if clip.id not in chosen
+            and sounds_now(project, voice_track, clip)
+            and speaks(project, clip)
+        ]
+        try:
+            speech = voice_speech(project, voice_clips, self.waveform)
+        except WaveformPendingError as exc:
+            self.analyze(exc.media)
+            self.statusBar().showMessage(str(exc), 8000)
+            return False
+        except SpeechError as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            return False
+        plan = plan_ducking(
+            [clip for _, clip in targets], speech, shape=choice.shape, rate=project.rate
+        )
+        if not plan.commands:
+            self.statusBar().showMessage("下げるクリップの範囲に、話している所がありません", 5000)
+            return False
+        if not self.execute_all(list(plan.commands), "BGM を声に合わせて下げる"):
+            return False
+        self.statusBar().showMessage(
+            f"BGM を {len(plan.commands)} 本、話している間だけ {choice.shape.depth_db:g} dB 下げた",
+            5000,
+        )
+        return True
+
+    def normalize_clips(self, clip_ids: list[ClipId]) -> bool:
+        """〔音量を基準にそろえる…〕 基準を尋ね、選んだクリップを混ぜて裏で測り始める
+
+        AI の ``normalize_loudness`` と同じ検査（:class:`CheckJob`）で測り、測り終えたら
+        :meth:`_finish_loudness` が同じ量（:func:`loudness_gain`）を掛ける 測り始めたら真
+        """
+        project = self.view_project
+        targets = self._sound_targets(clip_ids)
+        if not targets:
+            self.statusBar().showMessage("音を鳴らすクリップを選んでください", 5000)
+            return False
+        choice = ask_loudness(self, float(self._preferences.check_loudness_target))
+        if choice is None:
+            return False
+        # 無効のクリップはミキサが鳴らさず測りに入らない 掛けると有効に戻したときにずれる
+        clips = [clip for _, clip in targets if clip.enabled]
+        if not clips:
+            self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
+            return False
+        request = CheckRequest(
+            CheckLimits(loudness_target=choice.target, kinds=frozenset({LOUDNESS})),
+            project=measure_project(project, (clip.id for clip in clips)),
+            start=min(clip.timeline_start for clip in clips),
+            end=max(clip.timeline_end for clip in clips),
+            scene=str(self._active_scene) if self._active_scene is not None else None,
+        )
+        self._pending_loudness = _PendingLoudness(request, project, tuple(clips), choice.ceiling)
+        self.request_check(request)
+        # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
+        self._finish_loudness()
+        return True
+
+    def _finish_loudness(self) -> None:
+        """測り終えたら、選んだクリップの音量の線へ同じ dB を掛ける 途中なら何もしない"""
+        pending = self._pending_loudness
+        if pending is None:
+            return
+        state = self._checks.state()
+        if state.request != pending.request:
+            # AI が別の検査を始めると、こちらの測りは止まる 黙って待ち続けない
+            self._pending_loudness = None
+            self.statusBar().showMessage("別の検査に替わったので、音量をそろえるのをやめた", 8000)
+            return
+        if state.running:
+            return
+        self._pending_loudness = None
+        report = state.report
+        if state.failure is not None or state.stopped or report is None or report.loudness is None:
+            reason = (
+                "止めた"
+                if state.stopped
+                else (state.failure or "静かすぎるか 0.4 秒より短い音で、測れなかった")
+            )
+            self.statusBar().showMessage(f"音量をそろえられなかった: {reason}", 8000)
+            return
+        if self.view_project != pending.project:
+            # 測った後に足した音まで同じだけ上げると、測った音量と合わなくなる
+            self.statusBar().showMessage(
+                "測るあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください", 8000
+            )
+            return
+        decided = loudness_gain(
+            pending.clips,
+            measured=report.loudness,
+            peak_db=report.peak_db,
+            target=pending.request.limits.loudness_target,
+            ceiling=pending.ceiling,
+        )
+        if abs(decided.gain_db) < 0.05:
+            self.statusBar().showMessage("すでに基準の音量です", 5000)
+            return
+        target = pending.request.limits.loudness_target
+        if not self.execute_all(
+            gain_commands(pending.clips, decided.gain_db), f"音量を {target:g} LUFS へそろえる"
+        ):
+            return
+        stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
+        self.statusBar().showMessage(
+            f"音量を {decided.gain_db:+.1f} dB 変えた"
+            f"（測った音量 {report.loudness:.1f} LUFS）{stopped}",
+            8000,
+        )
 
     def _show_check_progress(self) -> None:
         """検査の進み具合をステータスバーへ 終わったら隠す"""
@@ -3618,3 +3808,14 @@ class MainWindow(QMainWindow):
         self._proxies.close()
         self._preview.shutdown()
         super().closeEvent(event)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingLoudness:
+    """右クリックの〔音量を基準にそろえる…〕が測り終えるのを待つ頼み（#329）"""
+
+    request: CheckRequest
+    #: 測り始めたときの作品 測る間に変わったら当てない
+    project: Project
+    clips: tuple[Clip, ...]
+    ceiling: float
