@@ -135,7 +135,11 @@ def test_the_animation_uses_the_whole_length(self) -> None:
 クラスの docstring も 1 本ごとの書き添えの代わりにしない（クラスの中で試験ごとに
 壊れ方が違う） 書くのは何が壊れると利用者に何が起きるかで、`assert` の言い換えは書かない
 
+`Test` で始まるクラスが基底クラス（同じファイルの mixin や、`from` で読み込んだ別のファイルの
+クラス）から受け継ぐ試験も pytest は集めるので、書き添えは基底に書いてある試験の方に置く
+
 `tools\test_notes.py` が `tests/` の `test_*.py` を見て、抜けている試験を並べる
+受け継いだ試験も基底を辿って見る
 `tools\verify.py` と CI に入っているので、書き添えの無い試験を足すと落ちる
 `--count` でファイルごとの数を多い順に出す
 

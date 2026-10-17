@@ -85,6 +85,76 @@ def test_helpers_and_other_classes_are_not_tests(tool: ModuleType, tmp_path: Pat
     assert names(tool, tmp_path, text) == []
 
 
+class TestInheritedTests:
+    """pytest は Test で始まるクラスが基底から受け継いだ test_* も集める（#377 の Codex）"""
+
+    def test_a_mixin_in_the_same_file_is_followed(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 具象クラスの本体だけを見ると、名前が Test で始まらない基底に書き添えの無い試験を
+        # 置くだけで見張りをすり抜け、落ちても直すのか消すのか決められない試験が増える
+        text = (
+            "class Checks:\n    def test_a(self):\n        assert True\n"
+            "class TestReal(Checks):\n    pass\n"
+        )
+        assert names(tool, tmp_path, text) == ["test_a"]
+
+    def test_a_mixin_from_another_module_is_followed(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # 共通の試験を別のファイルの mixin に置く形も pytest は集める ここを見逃すと
+        # 置き場を分けただけで書き添えの決まりが効かなくなる
+        package = tmp_path / "tests"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "shared.py").write_text(
+            "class Checks:\n    def test_a(self):\n        assert True\n", encoding="utf-8"
+        )
+        absolute = package / "test_absolute.py"
+        absolute.write_text(
+            "from tests.shared import Checks\nclass TestReal(Checks):\n    pass\n",
+            encoding="utf-8",
+        )
+        relative = package / "test_relative.py"
+        relative.write_text(
+            "from .shared import Checks as Base\nclass TestReal(Base):\n    pass\n",
+            encoding="utf-8",
+        )
+        reader = tool.Reader(tmp_path)
+        for path in (absolute, relative):
+            found = tool.scan(path, reader)
+            assert [(item.path.name, item.name) for item in found] == [("shared.py", "test_a")]
+
+    def test_an_overridden_test_counts_only_once(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 子が同じ名前で書き直した試験は pytest が子の物だけを集める 基底の物まで求めると、
+        # 走らない試験に書き添えを強いて verify が落ちる
+        text = (
+            "class Checks:\n    def test_a(self):\n        assert True\n"
+            "class TestReal(Checks):\n    def test_a(self):\n        # 壊れると作品が開けない\n"
+            "        assert True\n"
+        )
+        assert names(tool, tmp_path, text) == []
+
+    def test_a_shared_base_is_listed_once(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 何本ものクラスが受け継ぐ基底の試験を数だけ並べると、抜けの本数が水増しされる
+        text = (
+            "class TestBase:\n    def test_a(self):\n        assert True\n"
+            "class TestOne(TestBase):\n    pass\n"
+            "class TestTwo(TestBase):\n    pass\n"
+        )
+        assert names(tool, tmp_path, text) == ["test_a"]
+
+    def test_a_base_outside_the_repository_is_skipped(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # unittest.TestCase などリポジトリの外の基底は書き添えを求める先が無い 辿ろうとして
+        # 落ちると、外の基底を使う試験を足しただけで verify が止まる
+        text = (
+            "import unittest\nfrom unittest import TestCase\n"
+            "class TestA(TestCase):\n    pass\n"
+            "class TestB(unittest.TestCase):\n    pass\n"
+        )
+        assert names(tool, tmp_path, text) == []
+
+
 def test_only_the_watched_places_are_checked(tool: ModuleType) -> None:
     # 書き添えを埋めた置き場から順に見張る まだ埋めていない置き場まで見ると verify が
     # 落ち続け、--all を付けなければ数えられないと誰も抜けの数を追えない

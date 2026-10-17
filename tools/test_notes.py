@@ -89,30 +89,133 @@ def _is_noted(node: ast.FunctionDef | ast.AsyncFunctionDef, comments: set[int]) 
     return node.body[0].lineno - 1 in comments
 
 
-def _tests(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    """pytest が集める試験の関数 モジュールの直下と ``Test`` で始まるクラスの中"""
-    found: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
-    for node in tree.body:
-        if isinstance(node, functions) and node.name.startswith("test"):
-            found.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            found.extend(
-                item
-                for item in node.body
-                if isinstance(item, functions) and item.name.startswith("test")
-            )
-    return found
+type _Function = ast.FunctionDef | ast.AsyncFunctionDef
+
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def scan(path: Path) -> list[Missing]:
-    text = path.read_bytes().decode("utf-8")
-    comments = _comment_lines(text)
-    return [
-        Missing(path, node.lineno, node.name)
-        for node in _tests(ast.parse(text))
-        if not _is_noted(node, comments)
-    ]
+@dataclass(slots=True)
+class _Module:
+    """読んだ試験のファイル 1 つ 基底クラスを辿るたびに読み直さないよう持っておく"""
+
+    path: Path
+    tree: ast.Module
+    comments: set[int]
+
+
+class Reader:
+    """試験のファイルを読み、``Test`` で始まるクラスが受け継ぐ試験まで辿る
+
+    pytest は ``Test`` で始まるクラスが基底クラス（名前が ``Test`` で始まらない mixin や、
+    別のモジュールの物も）から受け継いだ ``test_*`` も集める 具象クラスの本体だけを見ると、
+    基底クラスに書き添えの無い試験を置けば見張りをすり抜ける（#377 の Codex の指摘）
+    pytest の収集を基準にすると、試験のファイルが読み込む Qt やエンジンまで起こすので
+    数十秒かかり、部品が無い機械では集める前に落ちる AST で辿れば 1 秒かからず、
+    同じ所（tests の木）だけで答えが決まる 辿れない基底（``unittest.TestCase``
+    やリポジトリの外の物）は書き添えを求める先が無いので見ない
+    """
+
+    def __init__(self, root: Path = ROOT) -> None:
+        #: 辿ってよい置き場 外の基底は書き添えを求める先が無い
+        self._root = root.resolve()
+        self._modules: dict[Path, _Module] = {}
+
+    def module(self, path: Path) -> _Module:
+        resolved = path.resolve()
+        if resolved not in self._modules:
+            text = resolved.read_bytes().decode("utf-8")
+            self._modules[resolved] = _Module(resolved, ast.parse(text), _comment_lines(text))
+        return self._modules[resolved]
+
+    def tests(self, path: Path) -> list[tuple[_Module, _Function]]:
+        """pytest が集める試験の関数と、それが書いてあるファイル"""
+        module = self.module(path)
+        found: list[tuple[_Module, _Function]] = []
+        for node in module.tree.body:
+            if isinstance(node, _FUNCTIONS) and node.name.startswith("test"):
+                found.append((module, node))
+            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                found.extend(self._class_tests(module, node))
+        return found
+
+    def _class_tests(
+        self, module: _Module, node: ast.ClassDef, seen: frozenset[int] = frozenset()
+    ) -> list[tuple[_Module, _Function]]:
+        """クラスが持つ試験 受け継いだ物も含める 上書きした名前は子の物だけを数える
+
+        ``Test`` で始まる入れ子のクラスも pytest は集めるので辿る ``seen`` は基底を
+        辿る輪（同じ名前を付け替えた import など）で止まらなくならないため
+        """
+        if id(node) in seen:
+            return []
+        seen = seen | {id(node)}
+        found: list[tuple[_Module, _Function]] = []
+        names: set[str] = set()
+        for item in node.body:
+            if isinstance(item, _FUNCTIONS) and item.name.startswith("test"):
+                found.append((module, item))
+                names.add(item.name)
+            elif isinstance(item, ast.ClassDef) and item.name.startswith("Test"):
+                found.extend(self._class_tests(module, item, seen))
+        for base in node.bases:
+            located = self._base(module, base)
+            if located is None:
+                continue
+            for owner, function in self._class_tests(*located, seen):
+                if function.name not in names:
+                    found.append((owner, function))
+                    names.add(function.name)
+        return found
+
+    def _base(self, module: _Module, base: ast.expr) -> tuple[_Module, ast.ClassDef] | None:
+        """基底クラスの定義 同じファイルの直下のクラスか、from で読み込んだクラス"""
+        if not isinstance(base, ast.Name):
+            return None
+        for node in module.tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == base.id:
+                return module, node
+        for node in module.tree.body:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            for alias in node.names:
+                if (alias.asname or alias.name) != base.id:
+                    continue
+                source = self._source(module.path, node)
+                if source is None:
+                    return None
+                imported = self.module(source)
+                for item in imported.tree.body:
+                    if isinstance(item, ast.ClassDef) and item.name == alias.name:
+                        return imported, item
+                return None
+        return None
+
+    def _source(self, path: Path, node: ast.ImportFrom) -> Path | None:
+        """``from ... import`` が指すリポジトリの中のファイル 外の物は None"""
+        parts = (node.module or "").split(".") if node.module else []
+        if node.level:
+            base = path.parent
+            for _ in range(node.level - 1):
+                base = base.parent
+        else:
+            base = self._root
+        candidate = base.joinpath(*parts)
+        for found in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+            if found.is_file() and found.resolve().is_relative_to(self._root):
+                return found
+        return None
+
+
+def scan(path: Path, reader: Reader | None = None) -> list[Missing]:
+    """書き添えの無い試験 受け継いだ試験は、書いてあるファイルと行で出す"""
+    reader = reader or Reader()
+    missing: list[Missing] = []
+    for module, node in reader.tests(path):
+        if not _is_noted(node, module.comments):
+            item = Missing(module.path, node.lineno, node.name)
+            if item not in missing:
+                missing.append(item)
+    return missing
 
 
 def targets(root: Path = ROOT, *, everything: bool = False) -> list[Path]:
@@ -134,7 +237,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="まだ見張っていない置き場も数える")
     arguments = parser.parse_args(argv)
 
-    missing = [item for path in targets(everything=arguments.all) for item in scan(path)]
+    # 同じ基底を何本ものクラスが受け継ぐと同じ試験が何度も出るので、1 本にまとめる
+    reader = Reader()
+    missing = list(
+        dict.fromkeys(
+            item for path in targets(everything=arguments.all) for item in scan(path, reader)
+        )
+    )
     if arguments.count:
         for name, count in Counter(_relative(item.path) for item in missing).most_common():
             print(f"{count}\t{name}")
