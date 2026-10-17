@@ -49,11 +49,9 @@ from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import check_writable
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.aviutl import native, plugin
-from sashimono.compat.aviutl.exo import ExoFile
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
 from sashimono.core.commands import (
-    DEFAULT_GENERATED_FRAMES,
     AddClip,
     AddMedia,
     AddScene,
@@ -118,7 +116,6 @@ from sashimono.core.model import (
     ProjectSettings,
     SceneId,
     TrackId,
-    TrackKind,
     heard_stream,
 )
 from sashimono.core.timebase import FrameRate
@@ -183,6 +180,7 @@ from sashimono.ui.workspace import (
 )
 
 if TYPE_CHECKING:
+    from sashimono.compat.catalog import TemplateEntry
     from sashimono.compat.mapped import MappedObject
 
 __all__ = ["MainWindow", "about_text", "initial_size"]
@@ -304,26 +302,6 @@ class _DropTarget:
     #: 最初の動画へ合わせてレートが変わると（:meth:`MainWindow._match_project_to`）、
     #: 数のまま使うと落とした時刻からずれる（30fps の 1 秒が 60fps の 0.5 秒になる）
     rate: FrameRate
-
-
-@dataclass(frozen=True, slots=True)
-class _ExoMedia:
-    """``.exo`` が参照している素材を読んだ結果 登録はまだしていない
-
-    登録をクリップの配置と同じ 1 回の :meth:`MainWindow.execute_all` で行うため、
-    ここではコマンドを作るだけにする 先に登録すると、配置を断られたときに
-    使われない素材と、その解析・控えの重い処理だけが残る
-    （テンプレートの棚の :func:`~sashimono.compat.catalog.gather_media` と同じ作り）
-    """
-
-    #: 書かれていたパス → 結ぶ素材の id（:func:`map_exo` がそのまま受ける形）
-    ids: dict[str, MediaId]
-    #: 見つからないか開けなかったパス
-    missing: tuple[str, ...]
-    #: 素材一覧へ入れるコマンド
-    commands: tuple[Command, ...]
-    #: 入ったあとに解析と控えを頼む素材
-    items: tuple[MediaItem, ...]
 
 
 class MainWindow(QMainWindow):
@@ -2860,7 +2838,7 @@ class MainWindow(QMainWindow):
         止めない テキストや図形だけでも入る方が使い出がある
         """
         from sashimono.compat.aviutl.exo import ExoParseError, load_exo
-        from sashimono.compat.aviutl.mapping import map_exo
+        from sashimono.compat.looks import exo_commands
 
         name, _ = QFileDialog.getOpenFileName(
             self, "AviUtl のオブジェクトを読み込む", "", EXO_FILTER
@@ -2875,17 +2853,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "読み込めない", str(exc))
             return
 
-        found = self._resolve_exo_media(exo, source)
-        commands = map_exo(exo, self.view_project, media=found.ids, items=found.items)
+        # 素材の開き方は _probe_or_none（このモジュールの probe_media を引く 試験が差し替える）
+        # 素材の登録と配置は 1 回の Undo にまとめてある（AI の道具 import_objects と同じ手順）
+        found, commands = exo_commands(exo, source, self.view_project, _probe_or_none)
         if not commands:
             self.statusBar().showMessage("読み込めるオブジェクトがありませんでした", 5000)
             return
 
-        # 素材の登録と配置を 1 回の Undo にまとめる 分けると、配置を断られたときに
-        # 使われていない素材だけが一覧に残る
-        if not self.execute_all(
-            [*found.commands, *commands], f"AviUtl から読み込み: {source.name}"
-        ):
+        if not self.execute_all(commands, f"AviUtl から読み込み: {source.name}"):
             # 断られた理由は execute_all がステータスバーに出している 上書きしない
             return
         # 解析と控えは取り消しても止まらない 入ったことを確かめてから頼む
@@ -2896,38 +2871,6 @@ class MainWindow(QMainWindow):
         if found.missing:
             note += f"（素材 {len(found.missing)} 件が見つかりません）"
         self.statusBar().showMessage(note, 6000)
-
-    def _resolve_exo_media(self, exo: ExoFile, source: Path) -> _ExoMedia:
-        """``.exo`` が参照している素材を読む 一覧へ入れるのは呼んだ側
-
-        相対パスは ``.exo`` のある場所からも探す AviUtl のファイルは素材と
-        一緒に配られることがある
-        """
-        from sashimono.compat.aviutl.mapping import media_paths
-
-        ids: dict[str, MediaId] = {}
-        missing: list[str] = []
-        items: list[MediaItem] = []
-        for raw in media_paths(exo):
-            candidates = [Path(raw), source.parent / Path(raw).name]
-            path = next((c for c in candidates if c.exists()), None)
-            if path is None:
-                missing.append(raw)
-                continue
-            forget_probe(path)
-            try:
-                media = probe_media(path)
-            except ProbeError:
-                missing.append(raw)
-                continue
-            items.append(media)
-            ids[raw] = media.id
-        return _ExoMedia(
-            ids=ids,
-            missing=tuple(missing),
-            commands=tuple(AddMedia(media) for media in items),
-            items=tuple(items),
-        )
 
     def show_library(self) -> None:
         """プリセットと自作のエイリアスの一覧を開く 整理だけで、当てる・置く先は持たない
@@ -2951,6 +2894,7 @@ class MainWindow(QMainWindow):
         「置く」と「着せる」で行き先が違うだけで、どちらも 1 回の Undo で戻る
         """
         from sashimono.compat.catalog import restyle
+        from sashimono.compat.looks import restyle_refusal
         from sashimono.ui.template_dialog import TemplateDialog
 
         dialog = TemplateDialog(parent=self)
@@ -2972,7 +2916,9 @@ class MainWindow(QMainWindow):
                 return
             commands = restyle(objects, located[1], keep_wrap=self._preferences.restyle_keep_wrap)
             if not commands:
-                self.statusBar().showMessage("テキストのクリップにしか適用できません", 5000)
+                # 理由は AI の道具 apply_template と同じ文 効果を読めなかった効果だけの物まで
+                # 「テキストにしか」と出すと、テキストを選び直しても直らない
+                self.statusBar().showMessage(restyle_refusal(objects, located[1]), 5000)
                 return
             if not self.execute_all(commands, "テンプレートを適用"):
                 # 断られた理由は execute_all がステータスバーに出している 上書きしない
@@ -3009,44 +2955,32 @@ class MainWindow(QMainWindow):
         frame: int,
         track_id: TrackId | None = None,
     ) -> bool:
-        from sashimono.compat.catalog import gather_media, place
+        from sashimono.compat.looks import template_placement
 
-        # 画像・音声のアイテムは素材として登録してからクリップに結ぶ 結ばないと、
-        # 置いたクリップは描かれず鳴らない（素材の無いクリップになる）
-        project = self.view_project
-        plan = gather_media(objects, project, _probe_or_none, near=near)
-        pictures = [item for item in objects if item.has_picture]
-        target = None
-        if track_id is not None and len(pictures) == 1 and not pictures[0].children:
-            track = project.timeline.find_track(track_id)
-            clip = pictures[0].clip
-            end = frame + (clip.duration if pictures[0].has_span else DEFAULT_GENERATED_FRAMES)
-            free = track is not None and not any(c.overlaps(frame, end) for c in track.clips)
-            # レイヤー（混合トラック）も受ける 映像トラックに限ると、混合の方式では
-            # 右クリックしたレイヤーを無視して元のレイヤー番号の所へ入る
-            placeable = (TrackKind.VIDEO, TrackKind.MIXED)
-            if free and track is not None and track.kind in placeable and not track.locked:
-                target = track_id
-        commands = place(objects, project, at_frame=frame, track_id=target, media=plan.media)
+        # 置き方（素材の登録・右クリックしたトラックへ置けるか）は AI の道具 place_template と
+        # 同じ手順を通す
+        placement = template_placement(
+            objects, self.view_project, frame, _probe_or_none, near=near, track_id=track_id
+        )
+        plan = placement.plan
+        commands = list(placement.commands)
         if not commands:
             self.statusBar().showMessage("置けるオブジェクトがありませんでした", 5000)
             return False
-        # 素材の登録と配置を 1 回の Undo にまとめる 分けると、戻したときに
+        # 素材の登録と配置を 1 回の Undo にまとめてある 分けると、戻したときに
         # 使われていない素材だけが一覧に残る
-        if not self.execute_all([*plan.commands, *commands], "テンプレートを配置"):
+        if not self.execute_all(commands, "テンプレートを配置"):
             return False
         # 置いた物を選ぶ 右クリックのほかの〔追加〕と同じく、設定パネルがすぐ開く
-        added = [c.clip.id for c in commands if isinstance(c, AddClip)]
-        landed = [c for c in added if self.view_project.timeline.locate_clip(c) is not None]
+        landed = [
+            c for c in placement.placed if self.view_project.timeline.locate_clip(c) is not None
+        ]
         if landed:
             self._timeline.set_selection(landed)
         for media in plan.added:
             self._request_analysis(media)
             self._request_proxy(media)
-        # 数えるのは一番上に置いたクリップだけ トラックやシーンを足すコマンドまで
-        # 数えると、画像 1 つでも「2 個を置いた」と出る
-        placed = sum(isinstance(command, AddClip) for command in commands)
-        note = f"{placed} 個を置いた"
+        note = f"{len(placement.placed)} 個を置いた"
         if plan.missing:
             # 見つからないものと、見つかっても開けなかったものの両方を数えている
             note += f"（素材 {len(plan.missing)} 件が見つからないか開けません）"
@@ -3216,6 +3150,11 @@ class MainWindow(QMainWindow):
     def saved_looks(self) -> SavedLooks:
         """AI に見せる保存したプリセットとエイリアスの写し 置き場そのものは渡さない"""
         return saved_looks(self.look_library())
+
+    @property
+    def template_shelf(self) -> tuple[TemplateEntry, ...]:
+        """AI に見せるテンプレートの棚 タイムラインの〔追加〕→〔エイリアス〕と同じ一覧（#328）"""
+        return tuple(self._timeline.add_sources.templates())
 
     def set_active_scene(self, scene_id: SceneId | None) -> None:
         self.open_scene(scene_id)

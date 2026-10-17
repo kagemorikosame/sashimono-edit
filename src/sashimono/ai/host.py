@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from sashimono.ai.sheet import SheetLayout
+from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
 from sashimono.core.io.atomic import Expected
@@ -189,10 +190,21 @@ class EditorHost(Protocol):
         ...
 
     @property
-    def look_rules(self) -> LookRules:
-        """字幕に見た目を着せる決まり（本人のプリセットの当て方と、棚の着せ替えの設定）
+    def template_shelf(self) -> tuple[TemplateEntry, ...]:
+        """テンプレートの棚（AviUtl のエイリアス・YMM4 のアイテムテンプレート #328） 読むだけ
 
-        画面の〔焼き込み〕と同じにする 頼み方で同じプリセットの当たり方が変わらないように
+        タイムラインの〔追加〕→〔エイリアス〕と互換の〔テンプレート…〕と同じ一覧 AI はここから
+        選んで置く・着せる 中身はまだ読まない（選ばれた 1 本だけを読む 全部を読むと、数百本の
+        棚で道具が返るまで待たされる）
+        """
+        ...
+
+    @property
+    def look_rules(self) -> LookRules:
+        """見た目を着せる決まり（本人のプリセットの当て方と、棚の着せ替えの設定）
+
+        画面の〔焼き込み〕・設定パネルの〔プリセット…〕・棚の〔選択中のクリップに適用〕と同じに
+        する 頼み方で同じプリセットや棚の当たり方が変わらないように
         """
         ...
 

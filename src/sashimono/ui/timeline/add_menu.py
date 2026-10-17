@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QWidget
 
-from sashimono.compat.aviutl.catalog import KIND_LABELS, ScriptEntry, script_catalog
+from sashimono.compat.aviutl.catalog import ScriptEntry, script_catalog
 from sashimono.compat.aviutl.custom_object import (
     CUSTOM_OBJECT_LABEL,
     custom_object_clip,
@@ -34,6 +34,10 @@ from sashimono.compat.catalog import (
     default_template_roots,
     template_catalog,
 )
+
+# エフェクトが効く先の決まりは compat/looks.py に置く AI の道具（プリセットを当てる #328）も
+# 同じ決まりを使うので、Qt を知らない所に 1 つだけ持つ 画面の側はここから出し直す
+from sashimono.compat.looks import clip_roles, effects_for, effects_for_clip
 from sashimono.core.commands import (
     AddEffect,
     Command,
@@ -93,10 +97,6 @@ LAYER_CHOICES: tuple[tuple[str, TrackKind, bool], ...] = (("レイヤー", Track
 #: 混合の方式の右クリックで、レイヤーを 1 本足す項目
 LAYER_ADD_TEXT = "レイヤーを追加"
 
-#: カスタムオブジェクト（中身を作るスクリプト）の分類 エフェクトの一覧には出さない
-#: クリップに掛けると、今の絵を捨てて別の物を描くので、掛けたつもりの絵が消える
-_CUSTOM_OBJECT = KIND_LABELS["obj"]
-
 
 def _custom_objects() -> Sequence[ScriptEntry]:
     return script_catalog().of_kind("obj")
@@ -130,44 +130,6 @@ class AddSources:
     presets: PresetStore = field(default_factory=PresetStore)
     #: 一覧の窓を開いて、〔置く〕で選ばれた物を返す 試験では窓を開かない物へ差し替える
     open_library: Callable[..., LibraryEntry | None] = library_dialog.open_library
-
-
-def effects_for(kind: TrackKind) -> tuple[EffectDefinition, ...]:
-    """そのトラックの種類のクリップへ掛けられるエフェクト
-
-    音のエフェクトは音声トラックのクリップだけ、映像のエフェクトは映像トラックのクリップだけ
-    逆に掛けると、積めても何も起きない
-    """
-    audio = kind is TrackKind.AUDIO
-    return _effects(picture=not audio, sound=audio)
-
-
-def _effects(*, picture: bool, sound: bool) -> tuple[EffectDefinition, ...]:
-    return tuple(
-        definition
-        for definition in registry.all()
-        if (sound if definition.audio_process is not None else picture)
-        and definition.category != _CUSTOM_OBJECT
-    )
-
-
-def clip_roles(project: Project, track: Track, clip: Clip) -> tuple[bool, bool]:
-    """クリップへ掛けて効くのは（絵のエフェクト, 音のエフェクト）か
-
-    映像・音声のトラックは種類で決まる（今までどおり） レイヤー（混合）は 1 本のクリップが
-    絵も音も持てるので、描く・鳴らすかで決める 種類だけで見ると、レイヤーの音付き動画や
-    BGM に音のエフェクトを掛けられず、BGM には効かない絵のエフェクトが並ぶ
-    """
-    if track.kind is TrackKind.MIXED:
-        return project.draws_picture(track, clip), project.plays_sound(track, clip)
-    audio = track.kind is TrackKind.AUDIO
-    return not audio, audio
-
-
-def effects_for_clip(project: Project, track: Track, clip: Clip) -> tuple[EffectDefinition, ...]:
-    """``clip`` へ掛けられるエフェクト（:func:`clip_roles`）"""
-    picture, sound = clip_roles(project, track, clip)
-    return _effects(picture=picture, sound=sound)
 
 
 class TimelineAddMenus:

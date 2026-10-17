@@ -35,6 +35,8 @@ from sashimono.ai.outbound import (
     redact,
     secret_pairs,
 )
+from sashimono.compat.catalog import TemplateEntry
+from sashimono.compat.subtitle_looks import template_choice
 from sashimono.core.commands import AddMarkers, RemoveMedia, SetTranscript
 from sashimono.core.model import Marker, MediaItem, Transcript
 from sashimono.core.timebase import format_timecode
@@ -152,6 +154,9 @@ class TestDeclarations:
         secret_host.saved_at = tmp_path / "作品.sme"
         # 場面の解析が失敗した素材 断りの文に素材の名前が入る
         secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+        # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
+        secret_host.library.aliases.save(_styled_alias(LOOK_NAME))
+        secret_host.shelf = [SHELF_ENTRY]
         # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
         named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
         secret_host.apply_commands([AddMarkers(tuple(named))], "目印")
@@ -206,6 +211,13 @@ ARG_TEXT = "引数で渡した秘密の本文"
 BODY_TEXT = "前からある秘密の本文"
 #: 保存したエイリアスの名前 結果やエラーの文に出たら、アプリの設定を送ると書くべき道具
 LOOK_NAME = "秘密の見た目"
+#: テンプレートの棚の 1 本（#328） 本人の名前の入ったフォルダに置いてある（ファイルは無い）
+SHELF_ENTRY = TemplateEntry(
+    name=LOOK_NAME,
+    path=SECRET_PATH.parent / "テンプレート" / f"{LOOK_NAME}.object",
+    folder=f"{SECRET_PATH.parent.name}のテンプレート",
+)
+SHELF_ID = template_choice(SHELF_ENTRY).key
 
 #: 引数の要る読む道具の引数（素材の ID を受ける） 足したらここにも足す（足さないと落ちる）
 READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
@@ -289,6 +301,13 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "cancel_export": lambda _ids: {},
     "export_subtitles": lambda _ids: {"path": "字幕.srt"},
     "save_snapshot": lambda _ids: {"path": "表紙.png"},
+    # 保存した見た目と棚（#328） 無い名前は、保存してある見た目の名前を並べて断る
+    # 棚の 1 本は読めない場所（本人の名前の入ったフォルダ）を指し、場所を書いて断る道を通る
+    "apply_preset": lambda ids: {"name": "無い見た目", "clip_ids": [ids["text"]]},
+    "place_alias": lambda _ids: {"name": "無い見た目"},
+    "place_template": lambda _ids: {"template_id": SHELF_ID},
+    "apply_template": lambda ids: {"template_id": SHELF_ID, "clip_id": ids["text"]},
+    "import_objects": lambda _ids: {"path": str(SECRET_PATH.with_suffix(".exo"))},
 }
 
 
@@ -299,6 +318,7 @@ def _with_text_clip(video_media: MediaItem, transcript: Transcript) -> FakeHost:
     _operation("add_text")(created, {"text": BODY_TEXT})
     created.apply_commands([AddMarkers((Marker(0, BODY_TEXT),))], "目印")
     created.library.aliases.save(_styled_alias(LOOK_NAME))
+    created.shelf = [SHELF_ENTRY]
     return created
 
 
@@ -865,6 +885,15 @@ def _marked_host(
     host = FakeHost(project)
     host.settings = {"preferences": {"state_folder": f"/{MARK}退避", "theme": "dark"}}
     host.transcription = f"{MARK}素材.mp4: 終了した"
+    # 棚の 1 本を本人の名前の入ったフォルダに置く（#328） 一覧はフォルダの名前を返し、置く道具は
+    # 読めない理由に場所を書く どちらも名前と場所を断った人には伏せる
+    host.shelf = [
+        TemplateEntry(
+            name="見本",
+            path=Path(f"C:/Users/{MARK}人/テンプレート/見本.object"),
+            folder=f"{MARK}のテンプレート",
+        )
+    ]
     # 変える道具の例（WRITE_EXAMPLES）はテキストのクリップを指す
     _operation("add_text")(host, {"text": BODY_TEXT})
     if scene == "消した後":

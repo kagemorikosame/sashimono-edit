@@ -19,6 +19,7 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
+from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Command, Document, InScene
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
@@ -122,10 +123,16 @@ class FakeHost:
         self.library = Library()
         #: 本人の設定の着せ方 既定は設定と同じ
         self.rules = LookRules()
+        #: テンプレートの棚（#328） 既定は空 本人の AviUtl2 の置き場は読まない
+        self.shelf: list[TemplateEntry] = []
 
     @property
     def saved_looks(self) -> SavedLooks:
         return saved_looks(self.library)
+
+    @property
+    def template_shelf(self) -> tuple[TemplateEntry, ...]:
+        return tuple(self.shelf)
 
     @property
     def look_rules(self) -> LookRules:
