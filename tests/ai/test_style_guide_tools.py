@@ -178,6 +178,28 @@ class TestChecking:
         assert result["problems"] == []
         assert result["checked"] == {"font": True, "color": False, "effect": False}
 
+    def test_unreadable_colours_are_not_checked(self, host: FakeHost) -> None:
+        """読めない色だけの方針で checked が真だと、照らしていないのに方針どおりと読み違える
+
+        手で書き換えたファイルの色（white）は照らしの前に外す checked と allowed も同じ物から作る
+        """
+        broken = replace(host.document.project, style_guide=StyleGuide(colors=("white",)))
+        host.document.reset(broken)
+        _place(host, _text(color=RED))
+        result = run(host, "check_style_guide")
+        assert result["checked"]["color"] is False
+        assert result["allowed"]["color"] == []
+
+    def test_effects_on_a_switched_off_stroke_are_not_counted(self, host: FakeHost) -> None:
+        """切ってある縁取りの層の効果は絵に出ない 数えると、AI が直さなくてよい所を直しに行く"""
+        _guided(host)
+        hidden = Stroke(params={"color": WHITE}, enabled=False, effects=(Effect("glow"),))
+        source = GeneratedSource(
+            "text", params={"font": "源ノ角ゴシック", "color": WHITE}, strokes=(hidden,)
+        )
+        _place(host, Clip(timeline_start=0, duration=30, source=source))
+        assert _problems(host) == []
+
     def test_the_result_holds_no_sentences(self, host: FakeHost) -> None:
         """方針の文やテキストの本文を返すと、字幕と文字を送らない人の文が尋ねずに外へ出る"""
         _guided(host)

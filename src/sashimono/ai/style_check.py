@@ -37,6 +37,7 @@ __all__ = [
     "EFFECT",
     "FONT",
     "StyleProblem",
+    "checked_guide",
     "color_hex",
     "style_problems",
 ]
@@ -142,6 +143,9 @@ def _effects_of(clip: Clip) -> Iterator[tuple[Effect, str]]:
             yield effect, "エフェクト"
     if clip.source is not None:
         for number, stroke in enumerate(clip.source.strokes, start=1):
+            if not stroke.enabled:
+                # 切ってある層は描かないので、その層の効果も絵に出ない（色を見る所と同じく飛ばす）
+                continue
             for effect in stroke.effects:
                 if not effect.fixed and effect.enabled:
                     yield effect, f"縁取りの層 {number} の効果"
@@ -180,15 +184,24 @@ def _track_problems(guide: StyleGuide, track: Track) -> Iterator[tuple[str, str,
             yield EFFECT, effect.kind, "トラックのエフェクト"
 
 
+def checked_guide(guide: StyleGuide) -> StyleGuide:
+    """照らすのに使う方針 整えたうえで、読めない色を外す
+
+    保存の形は色を確かめずに読む（手で書き換えたファイル） 読めない色で照らすと数に直せずに落ちる
+    照らす所と、照らした欄（checked）・直す先（allowed）を返す所はどれもこれを使う 別々に
+    作ると、読めない色だけの方針で何も照らしていないのに「色を照らした」と返す
+    """
+    cleaned = guide.cleaned()
+    return replace(cleaned, colors=tuple(c for c in cleaned.colors if valid_style_color(c)))
+
+
 def style_problems(project: Project) -> list[StyleProblem]:
     """方針の外の書体・色・効果 メインからシーンの順、トラックとクリップは並びの順
 
     方針の空の欄（決めていない物）は照らさない 全部空なら何も返さない
     同じクリップで同じ値が何か所かに出たら（縁取りの層が 2 つとも同じ色など）、場所ごとに返す
     """
-    guide = project.style_guide.cleaned()
-    # 保存の形は色を確かめずに読む（手で書き換えたファイル） 読めない色で照らすと数に直せずに落ちる
-    guide = replace(guide, colors=tuple(c for c in guide.colors if valid_style_color(c)))
+    guide = checked_guide(project.style_guide)
     found: list[StyleProblem] = []
     for scene_id, timeline in _timelines(project):
         for track in timeline.tracks:

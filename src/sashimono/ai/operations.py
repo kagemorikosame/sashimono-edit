@@ -41,7 +41,7 @@ from sashimono.ai.sheet import (
     sheet_layout,
 )
 from sashimono.ai.style_check import COLOR as STYLE_COLOR
-from sashimono.ai.style_check import COLOR_TOLERANCE, style_problems
+from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
@@ -1468,7 +1468,9 @@ def _get_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _check_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    guide = project.style_guide.cleaned()
+    # 照らす所（style_problems）と同じ方針から checked と allowed を作る 読めない色を残すと、
+    # 照らしていないのに色を照らしたと返す
+    guide = checked_guide(project.style_guide)
     problems = style_problems(project)
     counts = dict.fromkeys((STYLE_FONT, STYLE_COLOR, STYLE_EFFECT), 0)
     for problem in problems:
