@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.commands import Author
-from sashimono.core.model import Project, StyleGuide
+from sashimono.core.model import STYLE_ITEMS_LIMIT, Project, StyleGuide
+from sashimono.core.model.style import STYLE_EFFECTS_LIMIT
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.project_settings_dialog import ProjectSettingsDialog
@@ -126,6 +127,42 @@ class TestDialog:
         dialog = StyleGuideDialog(StyleGuide(effects=("aviutl:よそのスクリプト",)), effects=EFFECTS)
         assert dialog.guide().effects == ("aviutl:よそのスクリプト",)
         dialog.deleteLater()
+
+    def test_every_effect_can_be_chosen(self, qt_application: QApplication) -> None:
+        """効果の種類が上限より多いと、全部に印を付けた方針を窓が作り、閉じた後に断られて消える
+
+        一覧は本物（今の環境のエフェクトすべて）
+        """
+        del qt_application
+        dialog = StyleGuideDialog(StyleGuide())
+        try:
+            for index in range(dialog.effects_list.count()):
+                item = dialog.effects_list.item(index)
+                assert item is not None
+                item.setCheckState(Qt.CheckState.Checked)
+            assert dialog.guide().effects
+            assert not dialog.guide().problems()
+            assert _ok(dialog)
+        finally:
+            dialog.deleteLater()
+
+    def test_too_many_effects_stop_ok(self, qt_application: QApplication) -> None:
+        """印を付けたときに確かめないと、上限を越えた方針のまま OK を押せて、閉じた後に断られる"""
+        del qt_application
+        many = [(f"効果{n}", f"効果{n}") for n in range(STYLE_EFFECTS_LIMIT + 1)]
+        dialog = StyleGuideDialog(StyleGuide(), effects=many)
+        try:
+            for index in range(dialog.effects_list.count()):
+                item = dialog.effects_list.item(index)
+                assert item is not None
+                item.setCheckState(Qt.CheckState.Checked)
+            assert not _ok(dialog)
+            item = dialog.effects_list.item(0)
+            assert item is not None
+            item.setCheckState(Qt.CheckState.Unchecked)
+            assert _ok(dialog)
+        finally:
+            dialog.deleteLater()
 
     def test_cancel_keeps_the_guide(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
@@ -248,6 +285,21 @@ class TestNewProjects:
         path = tmp_path / "preferences.json"
         path.write_text(json.dumps({"new_project_style_guide": broken}), encoding="utf-8")
         assert PreferenceStore(path).load().new_project_style_guide.empty
+
+    def test_an_oversized_default_keeps_what_fits(self, tmp_path: Path) -> None:
+        """上限を越えた方針を丸ごと捨てると、手で足しすぎた 1 つのために書いた方針が全部消える
+
+        越えた分だけを落とし、残りの欄（文・色）はそのまま読む
+        """
+        fonts = [f"書体{n}" for n in range(STYLE_ITEMS_LIMIT + 5)]
+        path = tmp_path / "preferences.json"
+        saved = {"fonts": fonts, "colors": ["#ffffff", "白"], "notes": "残す決まり"}
+        path.write_text(json.dumps({"new_project_style_guide": saved}), encoding="utf-8")
+        loaded = PreferenceStore(path).load().new_project_style_guide
+        assert loaded.fonts == tuple(fonts[:STYLE_ITEMS_LIMIT])
+        assert loaded.colors == ("#ffffff",)
+        assert loaded.notes == "残す決まり"
+        assert not loaded.problems()
 
     def test_the_preferences_dialog_returns_the_edited_default(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch

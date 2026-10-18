@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.model import StyleGuide
+from sashimono.core.model.style import STYLE_EFFECTS_LIMIT
 from sashimono.effects import registry
 from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.theme import Colors, themed_style
@@ -169,6 +170,9 @@ class StyleGuideDialog(QDialog):
 
         for box in (self._fonts, self._colors, self._subtitles, self._tempo, self._notes):
             box.textChanged.connect(self._sync)
+        # 効果の印も確かめる 文の欄だけにつなぐと、上限を越えて印を付けても OK が押せ、
+        # 閉じた後にコマンドが断って書いた方針が窓ごと消える（Codex の指摘 #382）
+        self._effects.itemChanged.connect(self._sync)
         self._sync()
 
     @property
@@ -240,7 +244,11 @@ class StyleGuideDialog(QDialog):
 
         閉じてから断ると、書いた文が窓ごと消える ここで止めて直してもらう
         """
-        problems = self.guide().problems()
+        guide = self.guide()
+        problems = guide.problems()
+        if len(guide.effects) > STYLE_EFFECTS_LIMIT:
+            # 全部に近い数を選んだ人の直し方 印を全部外せば「決めない（どれでも使ってよい）」になる
+            problems.append("どの効果も使ってよいなら、印を全部外してください（決めない）")
         self._warning.setText("\n".join(problems))
         ok = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok is not None:

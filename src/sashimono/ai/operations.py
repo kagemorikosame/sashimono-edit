@@ -1451,19 +1451,39 @@ def _effect_label(kind: str) -> str:
     return definition.label if definition is not None else kind
 
 
+def _paged_after(
+    head: dict[str, Any], rows: list[Any], arguments: dict[str, Any], name: str, note: str
+) -> dict[str, Any]:
+    """``head`` の後ろに一覧 ``rows`` を切って並べた返事 合わせて上限に収める
+
+    一覧だけを :func:`_paged` で切ると、前に置く欄（方針の文・直す先）の分だけ上限を越え、
+    打ち切られて続きが読めない 越えたら一覧の件数を減らす 一覧の続きの案内（note）は消さず、
+    ``note`` を後ろへ足す
+    """
+    page = dict(arguments)
+    while True:
+        listed = _paged(rows, page, name=name)
+        merged = {**head, **listed, "note": " ".join(filter(None, (listed.get("note"), note)))}
+        count = int(listed["count"])
+        if count <= 1 or len(json_text(merged)) <= MAX_RESULT_CHARS:
+            return merged
+        page["limit"] = max(1, count * 3 // 4)
+
+
 def _get_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
     guide = _project(host).style_guide
-    return {
+    head: dict[str, Any] = {
         "set": not guide.empty,
         "fonts": list(guide.fonts),
         "colors": list(guide.colors),
         "subtitles": guide.subtitles,
         "tempo": guide.tempo,
-        "effects": [{"kind": kind, "label": _effect_label(kind)} for kind in guide.effects],
         "notes": guide.notes,
-        "note": _STYLE_NOTE,
     }
+    # 効果は一覧から印を付けて選ぶので、数百になりうる（#382 の Codex の指摘で上限を 300 にした）
+    # 全部を 1 回で返すと上限を越えて打ち切られるので、効果だけを切って続きを読ませる
+    rows = [{"kind": kind, "label": _effect_label(kind)} for kind in guide.effects]
+    return _paged_after(head, rows, arguments, "effects", _STYLE_NOTE)
 
 
 def _check_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -1498,16 +1518,15 @@ def _check_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
         "中の色、字幕の見た目・テンポ・そのほかの文は get_style_guide で読んで照らしてください"
         f" 色は各成分 {COLOR_TOLERANCE} までの差を同じ色と見なします"
     )
-    page = dict(arguments)
-    while True:
-        listed = _paged(rows, page, name="problems")
-        # 一覧の続きの案内（note）を消さずに、照らし方の断りを後ろへ足す
-        merged = {**head, **listed, "note": " ".join(filter(None, (listed.get("note"), note)))}
-        count = int(listed["count"])
-        # 直す先の一覧の分だけ一覧の上限を越えうる 越えたら一覧の件数を減らす
-        if count <= 1 or len(json_text(merged)) <= MAX_RESULT_CHARS:
-            return merged
-        page["limit"] = max(1, count * 3 // 4)
+    if len(json_text(head["allowed"])) > MAX_RESULT_CHARS // 2:
+        # 効果を一覧のほとんど（数百）選んだ方針 直す先を全部並べると、食い違いの一覧が
+        # 1 件も入らない 効果の直す先は省き、方針の外の種類（problems）だけを返す
+        head["allowed"][STYLE_EFFECT] = []
+        head["allowed_note"] = (
+            "効果の直す先は多いので省いた get_style_guide の effects で読める"
+            " 方針の外の種類は problems にある"
+        )
+    return _paged_after(head, rows, arguments, "problems", note)
 
 
 def _author(by: Author | None) -> str | None:
@@ -4911,8 +4930,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "作品の編集の方針（スタイルガイド）を読む 使う書体・使う色（#RRGGBB）・字幕の見た目・"
             "テンポ・使ってよい効果（エフェクトの kind）・そのほか 見た目や効果やカットの間を"
             "決める前に読んで従う 空の欄は決めていない 読むだけで、変えるのは本人だけ"
+            " 効果の一覧（effects）は" + PAGING_NOTE
         ),
-        schema=_schema({}),
+        schema=_schema(_paging()),
         handler=_get_style_guide,
         # 字幕の見た目・テンポ・そのほかは本人の文 字幕と文字として尋ね、断られたら動かさない
         sends=_WITH_TEXT,

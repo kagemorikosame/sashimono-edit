@@ -1012,17 +1012,18 @@ def _flag(value: object, default: bool) -> bool:
 
 
 def _style_guide(value: object, default: StyleGuide) -> StyleGuide:
-    """新しい作品の編集の方針 形が違うか、持てない方針（手で書き換えた色など）なら既定へ戻す
+    """新しい作品の編集の方針 形が違えば既定へ戻し、持てない所（手で書き換えた色・上限を越えた分）
+    だけを落とす
 
-    戻さずに持つと、新しい作品を作るたびに方針の窓で断られて OK を押せない
+    持てない所を残すと、新しい作品を作るたびに方針の窓で断られて OK を押せない 丸ごと既定へ
+    戻すと、足しすぎた 1 つのために書いた方針が全部消える
     """
     if value is None:
         return default
     try:
-        guide = style_guide_from_json(value).cleaned()
+        return style_guide_from_json(value).fitted()
     except ProjectFileError:
         return default
-    return default if guide.problems() else guide
 
 
 def _playhead_snap(value: object, default: bool) -> bool:

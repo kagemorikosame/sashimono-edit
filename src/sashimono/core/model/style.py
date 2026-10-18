@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
 __all__ = [
+    "STYLE_EFFECTS_LIMIT",
     "STYLE_ITEMS_LIMIT",
     "STYLE_TEXT_LIMIT",
     "StyleGuide",
@@ -28,9 +29,16 @@ __all__ = [
 #: 要点が埋もれる 説明書を丸ごと貼るような使い方は断る
 STYLE_TEXT_LIMIT = 2000
 
-#: 書体・色・効果の数の上限 方針は絞るための物 これより多いのは一覧を丸ごと入れた取り違えで、
+#: 書体・色の数の上限 方針は絞るための物 これより多いのは一覧を丸ごと入れた取り違えで、
 #: 照らしても何も外れない
 STYLE_ITEMS_LIMIT = 100
+
+#: 効果の数の上限 書体と色より大きくする 効果は窓の一覧（今の環境のエフェクト 自前だけで
+#: 105 種 読み込んだ AviUtl のスクリプトも並ぶ）から印を付けて選ぶ 書体と同じ 100 にすると、
+#: 「1 つだけ使わない」と決めた人が 104 個に印を付けられず、窓の OK が押せない
+#: 上限は AI へ送る方針の長さを抑えるために残す 一覧の全部より多くは選べないので、ふつうは
+#: 当たらない（AI の道具は効果の一覧を切って返す）
+STYLE_EFFECTS_LIMIT = 300
 
 _COLOR = re.compile(r"#[0-9a-f]{6}")
 
@@ -85,9 +93,9 @@ class StyleGuide:
         bad = [color for color in self.colors if not valid_style_color(color)]
         if bad:
             found.append(f"色は #RRGGBB で書いてください: {', '.join(bad)}")
-        for label, items in (("書体", self.fonts), ("色", self.colors), ("効果", self.effects)):
-            if len(items) > STYLE_ITEMS_LIMIT:
-                found.append(f"{label}は {STYLE_ITEMS_LIMIT} 個までです（{len(items)} 個）")
+        for label, items, limit in _lists(self):
+            if len(items) > limit:
+                found.append(f"{label}は {limit} 個までです（{len(items)} 個）")
             if any(not item or _has_line_break(item) for item in items):
                 # 1 行に 1 つの欄から来る 改行の入った名前は欄の区切りを取り違えた物
                 found.append(f"{label}に空の名前か、改行の入った名前があります")
@@ -99,6 +107,37 @@ class StyleGuide:
             if len(text) > STYLE_TEXT_LIMIT:
                 found.append(f"{label}は {STYLE_TEXT_LIMIT} 文字までです（{len(text)} 文字）")
         return found
+
+    def fitted(self) -> StyleGuide:
+        """持てない所だけを落とした方針（:meth:`problems` が空になる）
+
+        読めない色・改行の入った名前を除き、上限を越えた分の項目と文の後ろを切る 本人の設定を
+        読むときに使う 丸ごと捨てると、手で足しすぎた 1 つのために書いた方針が全部消える
+        """
+        guide = self.cleaned()
+        return replace(
+            guide,
+            fonts=_kept(guide.fonts, STYLE_ITEMS_LIMIT),
+            colors=_kept(tuple(c for c in guide.colors if valid_style_color(c)), STYLE_ITEMS_LIMIT),
+            subtitles=guide.subtitles[:STYLE_TEXT_LIMIT],
+            tempo=guide.tempo[:STYLE_TEXT_LIMIT],
+            effects=_kept(guide.effects, STYLE_EFFECTS_LIMIT),
+            notes=guide.notes[:STYLE_TEXT_LIMIT],
+        )
+
+
+def _lists(guide: StyleGuide) -> tuple[tuple[str, tuple[str, ...], int], ...]:
+    """名前の並びの欄（表示名, 中身, 上限）"""
+    return (
+        ("書体", guide.fonts, STYLE_ITEMS_LIMIT),
+        ("色", guide.colors, STYLE_ITEMS_LIMIT),
+        ("効果", guide.effects, STYLE_EFFECTS_LIMIT),
+    )
+
+
+def _kept(items: tuple[str, ...], limit: int) -> tuple[str, ...]:
+    """改行の入った名前を除き、先頭から ``limit`` 個 本人が先に書いた物を残す"""
+    return tuple(item for item in items if not _has_line_break(item))[:limit]
 
 
 def _unique(items: Iterable[str]) -> tuple[str, ...]:

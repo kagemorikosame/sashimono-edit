@@ -221,6 +221,38 @@ class TestChecking:
         assert "offset=" in result["note"]
 
 
+class TestManyEffects:
+    """効果は一覧から印を付けて選ぶので、上限（数百）まで選んだ方針もありうる"""
+
+    def _many(self, host: FakeHost) -> None:
+        effects = tuple(
+            f"aviutl:とても長い名前のスクリプトの効果{n:03d}" + "の続き" * 6 for n in range(300)
+        )
+        _guided(host, StyleGuide(effects=effects, notes=NOTE))
+
+    def test_reading_stays_within_the_limit(self, host: FakeHost) -> None:
+        """効果の名前まで全部返すと上限を越えて打ち切られ、後ろの欄（そのほか）が読めない"""
+        self._many(host)
+        result = run(host, "get_style_guide")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert result["notes"] == NOTE
+        # 残りは続きで読む 全部を読み切れること
+        read = list(result["effects"])
+        while "next_offset" in result:
+            result = run(host, "get_style_guide", offset=result["next_offset"])
+            assert len(json_text(result)) <= MAX_RESULT_CHARS
+            read += result["effects"]
+        assert len(read) == 300
+
+    def test_checking_stays_within_the_limit(self, host: FakeHost) -> None:
+        """直す先を全部並べると、食い違いの一覧が 1 件も入らないまま上限を越える"""
+        self._many(host)
+        _place(host, replace(_text(), effects=(Effect("glow"),)))
+        result = run(host, "check_style_guide")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert [row["value"] for row in result["problems"]] == ["glow"]
+
+
 class TestConsent:
     @pytest.fixture
     def text_refused(self, host: FakeHost) -> EditorBridge:
