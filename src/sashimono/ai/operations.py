@@ -1465,9 +1465,21 @@ def _paged_after(
         listed = _paged(rows, page, name=name)
         merged = {**head, **listed, "note": " ".join(filter(None, (listed.get("note"), note)))}
         count = int(listed["count"])
-        if count <= 1 or len(json_text(merged)) <= MAX_RESULT_CHARS:
+        if len(json_text(merged)) <= MAX_RESULT_CHARS:
             return merged
+        if count <= 1:
+            break
         page["limit"] = max(1, count * 3 // 4)
+    # 一覧を 1 件まで減らしても越える 前に置く欄（手で書き換えたファイルの長い方針・クリップの
+    # 長い書体の名前）が長すぎる 持てる方針は欄の上限で必ず収まるので、ここへ来るのはそれ以外だけ
+    # 一番長い所から切って収め、切ったこと（truncated）を返す 黙って返すと上限を越えて打ち切られ、
+    # 後ろの欄も続きの案内も読めない（#382 の CodeRabbit の指摘）
+    told = "長すぎる所を切った（truncated）"
+    fitted = _fit({**merged, "note": f"{told} {merged['note']}"}, MAX_RESULT_CHARS)
+    if len(json_text(fitted)) <= MAX_RESULT_CHARS:
+        return dict(fitted)
+    # 小さな欄が多すぎて切っても収まらない（名前の短い書体を何万個も手で書いたなど）
+    return {"truncated": True, "count": 0, "note": f"{told} 返せる長さに収まらなかった"}
 
 
 def _get_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:

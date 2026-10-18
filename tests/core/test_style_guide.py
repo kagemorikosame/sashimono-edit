@@ -22,6 +22,7 @@ from sashimono.core.io.serialize import (
     save_project,
 )
 from sashimono.core.model import STYLE_ITEMS_LIMIT, STYLE_TEXT_LIMIT, Project, StyleGuide
+from sashimono.core.model.style import STYLE_EFFECT_NAME_LIMIT, STYLE_NAME_LIMIT
 
 GUIDE = StyleGuide(
     fonts=("源ノ角ゴシック", "M PLUS 1p"),
@@ -60,6 +61,38 @@ class TestModel:
         too_many = tuple(f"書体{n}" for n in range(STYLE_ITEMS_LIMIT + 1))
         assert StyleGuide(fonts=too_many).problems()
         assert not GUIDE.problems()
+
+    def test_a_long_name_is_a_problem(self) -> None:
+        """名前の長さを見ないと、数の上限の中でも方針が膨らみ、AI へ渡す返事の上限を越えて切れる"""
+        assert StyleGuide(fonts=("あ" * (STYLE_NAME_LIMIT + 1),)).problems()
+        assert not StyleGuide(fonts=("あ" * STYLE_NAME_LIMIT,)).problems()
+        assert StyleGuide(effects=("a" * (STYLE_EFFECT_NAME_LIMIT + 1),)).problems()
+
+    def test_a_real_aviutl_effect_name_fits(self) -> None:
+        """手元の AviUtl のスクリプトの種類は最長 79 字
+
+        書体と同じ 64 字では、その効果に印を付けた方針を持てない
+        """
+        kind = (
+            "aviutl:YamatanaMarkerCaptionMini/@YamatanaMarkerCaptionMini.obj2:"
+            "マーカー字幕ミニ（進捗制御）"
+        )
+        assert len(kind) == 79
+        assert not StyleGuide(effects=(kind,)).problems()
+
+    def test_fitting_keeps_what_can_be_kept(self) -> None:
+        """丸ごと捨てると、手で足しすぎた 1 つのために書いた方針が全部消える 長すぎる名前は頭だけ
+        残すとどの書体とも合わないので、切らずに除く"""
+        written = StyleGuide(
+            fonts=("源ノ角ゴシック", "あ" * (STYLE_NAME_LIMIT + 1)),
+            colors=("#ffffff", "白"),
+            notes="長い" * STYLE_TEXT_LIMIT,
+        )
+        fitted = written.fitted()
+        assert fitted.fonts == ("源ノ角ゴシック",)
+        assert fitted.colors == ("#ffffff",)
+        assert len(fitted.notes) == STYLE_TEXT_LIMIT
+        assert not fitted.problems()
 
     def test_a_name_with_a_line_break_is_a_problem(self) -> None:
         """通すと、1 行に 1 つの欄へ戻したときに 2 つの書体に割れる"""

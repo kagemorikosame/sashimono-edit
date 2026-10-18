@@ -33,6 +33,13 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
+from sashimono.core.model.style import (
+    STYLE_EFFECT_NAME_LIMIT,
+    STYLE_EFFECTS_LIMIT,
+    STYLE_ITEMS_LIMIT,
+    STYLE_NAME_LIMIT,
+    STYLE_TEXT_LIMIT,
+)
 from tests.ai.conftest import FakeHost
 from tests.ai.test_operations import run
 from tests.ai.test_outbound import _run
@@ -210,7 +217,9 @@ class TestChecking:
 
     def test_a_long_list_stays_within_the_limit(self, host: FakeHost) -> None:
         """直す先の一覧の分を見ずに切ると、返事が上限を越えて打ち切られ、続きを読めない"""
-        fonts = tuple(f"とても長い名前の書体その{n:03d}" + "あ" * 40 for n in range(100))
+        fonts = tuple(
+            f"とても長い名前の書体その{n:03d}" + "あ" * 40 for n in range(STYLE_ITEMS_LIMIT)
+        )
         _guided(host, StyleGuide(fonts=fonts))
         _place(
             host, *(replace(_text(font="MS ゴシック"), timeline_start=n * 30) for n in range(300))
@@ -251,6 +260,70 @@ class TestManyEffects:
         result = run(host, "check_style_guide")
         assert len(json_text(result)) <= MAX_RESULT_CHARS
         assert [row["value"] for row in result["problems"]] == ["glow"]
+
+
+#: 文字にすると JSON で 2 字になる字 長さの見積もりがいちばん外れる書き方
+_ESCAPED = '"'
+
+
+def _fullest() -> StyleGuide:
+    """持てる方針のうち、いちばん長くなる物（どの欄も上限まで、どの字も JSON で 2 字になる）"""
+    name = _ESCAPED * STYLE_NAME_LIMIT
+    text = _ESCAPED * STYLE_TEXT_LIMIT
+    return StyleGuide(
+        fonts=tuple(f"{n:03d}" + name[3:] for n in range(STYLE_ITEMS_LIMIT)),
+        colors=tuple(f"#{n:06x}" for n in range(STYLE_ITEMS_LIMIT)),
+        subtitles=text,
+        tempo=text,
+        effects=tuple(
+            f"{n:03d}" + _ESCAPED * (STYLE_EFFECT_NAME_LIMIT - 3)
+            for n in range(STYLE_EFFECTS_LIMIT)
+        ),
+        notes=text,
+    )
+
+
+class TestLongGuides:
+    """返事は必ず上限（MAX_RESULT_CHARS）に収める 越えると打ち切られ、続きも読めない"""
+
+    def test_the_fullest_guide_is_allowed(self) -> None:
+        """見積もりの前提 上限まで書いた方針は持てる（持てないなら下の試験が何も見ていない）"""
+        assert not _fullest().problems()
+
+    def test_the_fullest_guide_is_read_whole(self, host: FakeHost) -> None:
+        """持てる方針なら切らずに読める
+
+        欄の上限が返事の上限と釣り合っていないと、本人の文が切れる
+        """
+        _guided(host, _fullest())
+        result = run(host, "get_style_guide")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert "truncated" not in result
+        assert result["notes"] == _fullest().notes
+        assert len(result["fonts"]) == STYLE_ITEMS_LIMIT
+        assert result["count"] >= 1
+
+    def test_the_fullest_guide_is_checked(self, host: FakeHost) -> None:
+        """直す先と食い違いを並べても上限に収まる"""
+        _guided(host, _fullest())
+        _place(host, _text(font="MS ゴシック", color=RED))
+        result = run(host, "check_style_guide")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert result["count"] >= 1
+
+    def test_a_hand_written_huge_guide_still_fits(self, host: FakeHost) -> None:
+        """手で書き換えたファイルは上限を確かめずに読む 効果が 0 件でも、前置きだけで越えうる"""
+        huge = StyleGuide(
+            fonts=tuple("書体" * 500 + str(n) for n in range(300)),
+            notes="長い" * 20000,
+        )
+        host.document.reset(replace(host.document.project, style_guide=huge))
+        _place(host, _text(font="よその書体" * 3000))
+        for tool in ("get_style_guide", "check_style_guide"):
+            result = run(host, tool)
+            assert len(json_text(result)) <= MAX_RESULT_CHARS, tool
+            # 切ったことを AI に伝える 黙って切ると、方針の後ろが無い物として編集する
+            assert result.get("truncated") is True, tool
 
 
 class TestConsent:
