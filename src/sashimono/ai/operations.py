@@ -159,7 +159,6 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     EffectId,
-    GeneratedSource,
     Interpolation,
     Marker,
     MediaId,
@@ -199,6 +198,7 @@ from sashimono.core.timebase import (
 )
 from sashimono.effects import registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
+from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
     MAX_GRADIENT_STOPS,
@@ -2523,9 +2523,13 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
         "keep": keep,
         "clips": rows,
         "note": (
-            "リンクした絵と音も同じ速度にしました 音は高さも変わります"
-            " キーフレームはクリップの頭からのフレームのまま動かしていません"
-            " 取り消し 1 回で元に戻ります"
+            "リンクした絵と音も同じ速度にしました 音は高さも変わります "
+            + (
+                "キーフレームは中身の同じ時刻へ動かしました"
+                if keep == "content"
+                else "長さを保ったのでキーフレームは動かしていません"
+            )
+            + " 取り消し 1 回で元に戻ります"
         ),
     }
     if warnings:
@@ -3104,7 +3108,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 結果に載せる中身は、詰めた後の形を手元で作って同じ決まりで組んだ物
         style = _seam_style(host, arguments)
         frames = seams_after_cuts(ranges)
-        transition = _seam_transition(style)
+        transition = seam_transition(style)
         plan = plan_smoothing(cut.apply(project), frames, style, transition)
         commands.append(SmoothCuts(frames, style, transition))
         result["smoothing"] = _seam_result(plan, style, clip_ids=False)
@@ -3146,11 +3150,6 @@ def _seam_style(host: EditorHost, arguments: dict[str, Any]) -> SeamStyle:
     if style.video == SEAM_NONE and style.audio_fade_ms == 0:
         raise ToolError("video が none で audio_fade_ms が 0 なので、付ける物がありません")
     return style
-
-
-def _seam_transition(style: SeamStyle) -> GeneratedSource | None:
-    """クロスフェードに置く場面切り替え 人が〔場面切り替えを追加〕で置く物と同じ既定の中身"""
-    return TRANSITION.create(style="fade") if style.video == SEAM_CROSSFADE else None
 
 
 def _seam_result(plan: SeamPlan, style: SeamStyle, *, clip_ids: bool = True) -> dict[str, object]:
@@ -3219,7 +3218,7 @@ def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
             "start_frame と end_frame で分けて呼んでください"
         )
     style = _seam_style(host, arguments)
-    plan = plan_smoothing(project, frames, style, _seam_transition(style))
+    plan = plan_smoothing(project, frames, style, seam_transition(style))
     if not plan.commands:
         reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
         raise ToolError(

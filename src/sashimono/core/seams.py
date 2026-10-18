@@ -58,6 +58,7 @@ __all__ = [
     "find_seams",
     "plan_smoothing",
     "seams_after_cuts",
+    "seams_touching",
 ]
 
 #: 映像に何もしない（音だけ処理する）
@@ -403,3 +404,28 @@ class SmoothCuts(Command):
 
     def apply(self, project: Project) -> Project:
         return plan_smoothing(project, self.frames, self.style, self.transition).project
+
+
+def seams_touching(project: Project, clip_ids: tuple[ClipId, ...]) -> tuple[int, ...]:
+    """``clip_ids`` の頭か終わりにあるジャンプカットのつなぎ目（右クリックの相手）
+
+    選んだクリップのトラックと、リンクした相手のトラックで探す 絵だけを選んでも、音の
+    継ぎ目は同じフレームにあるので一緒に処理される（:func:`plan_smoothing` は全トラックを見る）
+    選んでいないクリップどうしのつなぎ目は入れない 範囲で探すと、選んだクリップの間に挟まった
+    別の所まで変わる
+    """
+    timeline = project.timeline
+    tracks: set[TrackId] = set()
+    edges: set[int] = set()
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is None:
+            continue
+        track, clip = located
+        tracks.add(track.id)
+        edges.update((clip.timeline_start, clip.timeline_end))
+        if clip.link_group is not None:
+            tracks.update(partner.id for partner, _ in timeline.linked_clips(clip.link_group))
+    if not tracks:
+        return ()
+    return tuple(frame for frame in find_seams(project, track_ids=tuple(tracks)) if frame in edges)

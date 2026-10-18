@@ -74,7 +74,9 @@ from sashimono.core.model import (
     TranscriptSegment,
 )
 from sashimono.core.projection import project_clip, subtitle_stream, subtitle_voice
+from sashimono.core.seams import SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.timebase import format_timecode, seconds_to_frame
+from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
 from sashimono.engine.cache import MediaAnalyzer
@@ -162,6 +164,9 @@ class SubtitlePanel(QWidget):
         #: 既定の見た目で焼き込む字幕を折り返す幅（画面の幅の % 0 は折り返さない #249）
         #: 窓が本人の設定（``Preferences.subtitle_wrap_share``）から入れる 既定は設定の既定と同じ
         self.wrap_share = 90
+        #: 無音カットの窓の「つなぎ目も処理する」の既定（#332） 窓が本人の設定
+        #: （``Preferences.seam_style``）から入れる
+        self.seam_style = SeamStyle()
         #: 見た目の一覧に並べるプリセットとエイリアスの置き場（#308） 窓がタイムラインの
         #: 〔追加〕と同じ置き場を差し込む（試験で差し替えた置き場も同じに見える）
         self.library_provider: Callable[[], Library] = Library
@@ -812,6 +817,7 @@ class SubtitlePanel(QWidget):
         dialog = JetCutDialog(
             has_transcript=media.transcript_for(self._stream) is not None,
             estimate=estimate,
+            seam_style=self.seam_style,
             parent=self,
         )
         answer = dialog.exec()
@@ -825,7 +831,13 @@ class SubtitlePanel(QWidget):
         if not ranges:
             self.status_message.emit("切る場所が見つかりませんでした")
             return
-        self.commands_requested.emit([RippleCut(ranges)], f"無音カット: {len(ranges)} か所")
+        commands: list[Command] = [RippleCut(ranges)]
+        style = dialog.seams()
+        if style is not None:
+            # 詰めたつなぎ目の処理を同じ取り消し 1 回に入れる（AI の jet_cut の smooth と同じ）
+            # 詰めた後のクリップの ID は当てるまで決まらないので、フレームだけを持つ命令で探す
+            commands.append(SmoothCuts(seams_after_cuts(ranges), style, seam_transition(style)))
+        self.commands_requested.emit(commands, f"無音カット: {len(ranges)} か所")
 
     def _plan(
         self, media: MediaItem, options: SilenceOptions, protect: bool

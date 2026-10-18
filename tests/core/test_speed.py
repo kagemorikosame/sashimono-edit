@@ -12,10 +12,13 @@ from fractions import Fraction
 import pytest
 
 from sashimono.core.commands import AddClip, SetTrackState
+from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.speed import ChangeSpeed, sped_duration
 from sashimono.core.model import (
+    AnimatedValue,
     Clip,
     GeneratedSource,
+    Keyframe,
     Project,
 )
 from tests.core.test_seams import RATE, JumpCut
@@ -55,6 +58,63 @@ class TestKeepContent:
         assert sped_duration(clip, Fraction(3)) == 3
         assert sped_duration(clip, Fraction(3, 2)) == 7
         assert sped_duration(clip, Fraction(1000)) == 1
+
+
+def _with_scale_keys(work: JumpCut, keys: tuple[Keyframe, ...]) -> tuple[Project, Clip]:
+    """3 本目の絵に、拡大率のキーフレームを打つ（強調の寄りを付けた形）"""
+    transform = fixed_effect(TRANSFORM_EFFECT_KIND).with_param(
+        "scale", AnimatedValue(keyframes=keys)
+    )
+    picture = replace(
+        work.pictures[2],
+        effects=(transform,),
+        opacity=AnimatedValue(keyframes=(Keyframe(30, 0.5),)),
+    )
+    track = work.project.timeline.find_track(work.video.id)
+    assert track is not None
+    others = tuple(c for c in track.clips if c.id != picture.id)
+    project = work.project.with_timeline(
+        work.project.timeline.replace_track(track.with_clips((*others, picture)))
+    )
+    return project, picture
+
+
+def _scale_keys(project: Project, clip: Clip) -> list[tuple[int, float]]:
+    effect = next(e for e in _clip(project, clip).effects if e.kind == TRANSFORM_EFFECT_KIND)
+    scale = effect.params["scale"]
+    assert isinstance(scale, AnimatedValue)
+    return [(key.frame, key.value) for key in scale.keyframes]
+
+
+class TestKeyframes:
+    def test_keeping_content_moves_the_points_with_the_content(self) -> None:
+        # 壊れると、2 倍速にした後も寄りの点が元のフレームに残り、話の要所からずれるか、
+        # 短くなった後ろに出て見えなくなる
+        work = JumpCut()
+        keys = (Keyframe(0, 100.0), Keyframe(30, 120.0), Keyframe(50, 100.0))
+        project, picture = _with_scale_keys(work, keys)
+        after = ChangeSpeed((picture.id,), Fraction(2)).apply(project)
+        assert _scale_keys(after, picture) == [(0, 100.0), (15, 120.0), (25, 100.0)]
+        # 不透明度や中身の値の点も同じだけ動く
+        assert [key.frame for key in _clip(after, picture).opacity.keyframes] == [15]
+        slower = ChangeSpeed((picture.id,), Fraction(1, 2)).apply(project)
+        assert _scale_keys(slower, picture) == [(0, 100.0), (60, 120.0), (100, 100.0)]
+
+    def test_points_that_meet_keep_the_later_value(self) -> None:
+        # 壊れると、速くして同じフレームに重なった点で、寄り切る前の値が残って寄らない
+        work = JumpCut()
+        keys = (Keyframe(0, 100.0), Keyframe(30, 110.0), Keyframe(31, 130.0))
+        project, picture = _with_scale_keys(work, keys)
+        after = ChangeSpeed((picture.id,), Fraction(10)).apply(project)
+        assert _scale_keys(after, picture) == [(0, 100.0), (3, 130.0)]
+
+    def test_keeping_length_leaves_the_points(self) -> None:
+        # 壊れると、設定パネルと同じ長さを保つ変え方で、点だけが動いて動きの時刻が変わる
+        work = JumpCut()
+        keys = (Keyframe(0, 100.0), Keyframe(30, 120.0))
+        project, picture = _with_scale_keys(work, keys)
+        after = ChangeSpeed((picture.id,), Fraction(2), keep_length=True).apply(project)
+        assert _scale_keys(after, picture) == [(0, 100.0), (30, 120.0)]
 
 
 class TestKeepLength:

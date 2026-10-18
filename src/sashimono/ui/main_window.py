@@ -75,6 +75,7 @@ from sashimono.core.commands import (
     switch_layer_mode,
 )
 from sashimono.core.commands.project_format import retime_frame
+from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
 from sashimono.core.emphasis import (
     PAN_DIRECTIONS,
     EmphasisError,
@@ -134,10 +135,11 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
-from sashimono.core.seams import SeamStyle
+from sashimono.core.seams import SEAM_NONE, SeamStyle, plan_smoothing, seams_touching
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
+from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
 from sashimono.engine.audio.speech import (
     SpeechError,
@@ -186,6 +188,7 @@ from sashimono.ui.progress_display import (
     row_notes,
 )
 from sashimono.ui.scene_bar import SceneBar
+from sashimono.ui.seam_dialogs import ask_seams, ask_speed
 from sashimono.ui.subtitle import SubtitlePanel
 from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
@@ -1248,6 +1251,12 @@ class MainWindow(QMainWindow):
         self._timeline.emphasis_requested.connect(
             lambda clip_ids: self.emphasize_clips([ClipId(str(c)) for c in clip_ids])
         )
+        self._timeline.speed_requested.connect(
+            lambda clip_ids: self.change_speed([ClipId(str(c)) for c in clip_ids])
+        )
+        self._timeline.seams_requested.connect(
+            lambda clip_ids: self.smooth_seams([ClipId(str(c)) for c in clip_ids])
+        )
         self._timeline.scene_open_requested.connect(
             lambda scene_id: self.open_scene(SceneId(scene_id))
         )
@@ -2043,6 +2052,7 @@ class MainWindow(QMainWindow):
         """字幕を置く窓へ本人の設定を渡す 着せ替えの決まりは設定パネルや棚と同じにする"""
         panel = self._subtitles
         panel.wrap_share = preferences.subtitle_wrap_share
+        panel.seam_style = preferences.seam_style
         panel.look_rules = preferences.look_rules
         panel.remember_look = preferences.subtitle_look_remember
         panel.last_look = preferences.subtitle_look_last
@@ -3484,6 +3494,64 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"選んだクリップが{span}と重なっていません", 5000)
             return False
         return self.execute_all(commands, emphasis_label(choice.kind))
+
+    # --- 速度とつなぎ目（#332 タイムラインの右クリック） ---
+
+    def change_speed(self, clip_ids: list[ClipId]) -> bool:
+        """〔速度を変える…〕 速度と変え方を尋ね、AI の ``set_speed`` と同じ命令で変える
+
+        何本選んでいても取り消し 1 回で戻る ぶつかる・ロックした相手などで断られたら、理由を
+        ステータスバーに出して何も変えない 変えられたら真
+        """
+        project = self.view_project
+        targets: list[Clip] = []
+        for clip_id in clip_ids:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_change_speed(project, *located):
+                targets.append(located[1])
+        if not targets:
+            self.statusBar().showMessage(
+                "動画・音声・シーンのクリップを選んでください（ロックは外す）", 5000
+            )
+            return False
+        # 窓の最初の速度は選んだ最後のクリップの今の速度 100% から始めると、今の速度を
+        # 知らずに少しだけ変えたい人が、元の速度を探すことになる
+        current = round(float(targets[-1].speed * 100))
+        choice = ask_speed(self, max(1, min(current, 1000)))
+        if choice is None:
+            return False
+        command = ChangeSpeed(
+            tuple(clip.id for clip in targets), choice.speed, keep_length=choice.keep_length
+        )
+        return self.execute_all([command], command.label)
+
+    def smooth_seams(self, clip_ids: list[ClipId]) -> bool:
+        """〔つなぎ目を目立たなくする…〕 選んだクリップの頭と終わりにあるジャンプカットの
+        つなぎ目へ、AI の ``smooth_cuts`` と同じ処理を付ける
+
+        既定は本人の設定で、窓で変えた値はその 1 回だけ 取り消し 1 回で戻る 付けられたら真
+        """
+        project = self.view_project
+        frames = seams_touching(project, tuple(clip_ids))
+        if not frames:
+            self.statusBar().showMessage(
+                "選んだクリップの端に、同じ素材を飛び飛びにつないだ所がありません", 5000
+            )
+            return False
+        style = ask_seams(self, self._preferences.seam_style, f"つなぎ目 {len(frames)} か所に")
+        if style is None:
+            return False
+        if style.video == SEAM_NONE and style.audio_fade_ms == 0:
+            self.statusBar().showMessage("映像も音も処理しない設定です", 5000)
+            return False
+        plan = plan_smoothing(project, frames, style, seam_transition(style))
+        if not plan.commands:
+            reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
+            self.statusBar().showMessage(f"つなぎ目に付けられませんでした（{reasons}）", 8000)
+            return False
+        return self.execute_all(
+            list(plan.commands), f"つなぎ目を目立たなくする: {len(plan.handled)} か所"
+        )
 
     def duck_clips(self, clip_ids: list[ClipId]) -> bool:
         """〔BGM を声に合わせて下げる…〕 声のトラックと下げ方を尋ね、話している間だけ下げる

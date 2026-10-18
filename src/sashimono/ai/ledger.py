@@ -330,6 +330,10 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/音量を基準にそろえる…", "normalize_loudness"),
     # 強調の動き（#331） 2026-10-18 利用者の決定で右クリックに足した AI と同じ所を通す
     same("タイムラインの右クリック/強調の動きを付ける…", "emphasize"),
+    # 速度とつなぎ目（#332） 2026-10-18 利用者の決定で右クリックに足した AI と同じ命令を通す
+    # 無音カットの窓の「つなぎ目も処理する」は jet_cut の smooth と同じ（窓の中の欄なので行は無い）
+    same("タイムラインの右クリック/速度を変える…", "set_speed"),
+    same("タイムラインの右クリック/つなぎ目を目立たなくする…", "smooth_cuts"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),
@@ -474,14 +478,7 @@ LEDGER: tuple[Entry, ...] = (
     ),
     # クリップ自身の欄 SetClipProperty で変わる set_param では型が合わない（再生速度は分数）
     same("設定パネル/クリップ自身の欄/blend_mode", "set_clip_property", note="合成モード"),
-    # 再生速度（#332） set_speed は長さを保つ変え方（この欄と同じ）に加えて、中身を保って
-    # 長さを変える変え方も持つ 後ろの変え方は画面に同じ入口が無い（利用者に尋ねている）
-    same(
-        "設定パネル/クリップ自身の欄/speed",
-        "set_clip_property",
-        "set_speed",
-        note="再生速度 set_speed はリンクした相手もそろえ、keep=content で長さも合わせられる",
-    ),
+    same("設定パネル/クリップ自身の欄/speed", "set_clip_property", note="再生速度"),
     same("設定パネル/クリップ自身の欄/source_in", "set_clip_property", note="再生開始位置"),
     same("設定パネル/クリップ自身の欄/clip_to_below", "set_clip_property", note="クリッピング"),
     same("設定パネル/クリップ自身の欄/native_size", "set_clip_property", note="画素で置く"),
@@ -634,9 +631,6 @@ AI_ONLY: dict[str, str] = {
         "AI が始めた書き出しを止める 画面ではステータスバーの〔中止〕（台帳はメニュー・"
         "右クリック・パネルのボタンだけを数え、ステータスバーは数えない）"
     ),
-    # ジャンプカットのつなぎ目（#332） 人はつなぎ目ごとに〔場面切り替えを追加〕・拡大率の欄・
-    # 音量フェードの欄で同じ物を付ける まとめて付ける入口は画面に無い（利用者に尋ねている）
-    "smooth_cuts": "つなぎ目ごとに場面切り替え・拡大率・音量フェードを付けるのをまとめた物",
     # BGM と効果音を置く（#329） 画面では素材をドラッグして置き、右端を詰める
     "place_sound": _GESTURE,
 }
