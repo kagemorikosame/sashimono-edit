@@ -7,6 +7,7 @@ tests/core/test_speed.py、設定画面と本物の窓は tests/ui/test_seam_pre
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 from typing import Any
 
@@ -16,11 +17,18 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import SetClipProperty
-from sashimono.core.model import TRANSITION_KIND, Project
+from sashimono.core.commands import AddClip, SetClipProperty
+from sashimono.core.model import (
+    TRANSITION_KIND,
+    Clip,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+)
 from sashimono.core.seams import SEAM_ZOOM, SeamStyle
 from tests.ai.conftest import FakeHost
-from tests.core.test_seams import JumpCut
+from tests.core.test_seams import RATE, JumpCut, talking_media
 
 
 def _run(host: FakeHost, name: str, **arguments: Any) -> Any:
@@ -114,6 +122,35 @@ class TestSetSpeed:
         assert "無音" in sound[0]
         assert "何も映らない" not in sound[0]
 
+    @pytest.mark.parametrize(
+        ("hold_at", "lost"),
+        [(None, "越えた所は映らず、音は無音になる"), (Fraction(29), "越えた所は無音になる")],
+    )
+    def test_a_layer_clip_warns_for_what_it_loses(
+        self, hold_at: Fraction | None, lost: str
+    ) -> None:
+        # 壊れると、絵と音を 1 本で出すレイヤーのクリップで、音のことしか伝わらず、終わりが黒く
+        # なるのに AI が気付かない 絵を止めていれば音のことだけ伝える（CodeRabbit の指摘）
+        media = talking_media()
+        base = Project.create(ProjectSettings(frame_rate=RATE), media=(media,))
+        layer = Track(TrackKind.MIXED, "L1")
+        clip = Clip(
+            timeline_start=0,
+            duration=90,
+            media_id=media.id,
+            source_in=Fraction(10),
+            audio_stream=1,
+            hold_at=hold_at,
+        )
+        project = AddClip(layer.id, clip).apply(
+            base.with_timeline(replace(base.timeline, tracks=(layer,)))
+        )
+        assert project.plays_sound(layer, clip) and project.draws_picture(layer, clip)
+        host = FakeHost(project)
+        result = _run(host, "set_speed", clip_ids=[str(clip.id)], speed_percent=1000, keep="length")
+        (warning,) = result["warnings"]
+        assert lost in warning
+
     def test_a_collision_is_explained(self) -> None:
         # 壊れると、ぶつかって断ったことと伸ばせる量が AI に届かず、何度も同じ頼みを繰り返す
         work = JumpCut()
@@ -195,6 +232,10 @@ class TestSmoothCuts:
             {"end_frame": 120.5},
             {"start_frame": -1},
             {"start_frame": 120, "end_frame": 60},
+            # 長さと拡大率も整数だけ 丸めて受けると頼んだのと違う長さで付く
+            {"crossfade_ms": 100.5},
+            {"zoom_percent": 110.4},
+            {"audio_fade_ms": 20.7},
         ],
     )
     def test_bad_arguments_are_refused(self, arguments: dict[str, Any]) -> None:

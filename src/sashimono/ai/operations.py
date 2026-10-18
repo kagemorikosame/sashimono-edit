@@ -2515,12 +2515,18 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 長さを保つ変え方で速くすると、素材の終わりを越える AI が気付かないまま書き出すと、
         # 絵は終わりが黒くなり、音は無音になる 絵を素材の中で止めて（hold_at）いれば絵は黒く
         # ならないので言わない（言うと直す必要の無い trim_clip を勧める） 音は止めない決まり
-        if after.plays_sound(track, clip):
+        # レイヤー（混合トラック）のクリップは 1 本で絵と音の両方を出すので、両方を見て書く
+        held = clip.hold_at is not None and clip.hold_at <= media.duration
+        picture_lost = after.draws_picture(track, clip) and not held
+        sound_lost = after.plays_sound(track, clip)
+        if picture_lost and sound_lost:
+            lost = "越えた所は映らず、音は無音になる"
+        elif sound_lost:
             lost = "越えた所は無音になる"
-        elif clip.hold_at is not None and clip.hold_at <= media.duration:
-            continue
-        else:
+        elif picture_lost:
             lost = "越えた所は何も映らない"
+        else:
+            continue
         warnings.append(
             f"{clip.id} は素材の終わりを {float(over):.2f} 秒越えます {lost}ので、"
             "trim_clip で終わりを詰めるか、keep を content にしてください"
@@ -3136,6 +3142,20 @@ MAX_SEAMS = 2000
 _SKIPPED_SHOWN = 20
 
 
+def _whole_within(
+    arguments: dict[str, Any], key: str, default: int, bounds: tuple[int, int]
+) -> int:
+    """範囲のある整数の引数 省けば ``default`` 小数や範囲の外は、受け付ける範囲を書いて断る
+
+    丸めて受けると 100.5 ms が黙って 100 ms になり、頼んだのと違う長さで付く
+    """
+    value = _whole_number(arguments, key, default)
+    low, high = bounds
+    if not low <= value <= high:
+        raise ToolError(f"{key} は {low}〜{high} で渡してください（{value} が来ました）")
+    return value
+
+
 def _seam_style(host: EditorHost, arguments: dict[str, Any]) -> SeamStyle:
     """引数のつなぎ目の処理 省いた物は本人の設定（:attr:`EditorHost.seam_style`）"""
     base = host.seam_style
@@ -3144,14 +3164,14 @@ def _seam_style(host: EditorHost, arguments: dict[str, Any]) -> SeamStyle:
         raise ToolError(f"video は {'・'.join(SEAM_VIDEOS)} のどれかです（{video!r} が来ました）")
     style = SeamStyle(
         video=str(video),
-        crossfade_ms=round(
-            _limit_number(arguments, "crossfade_ms", base.crossfade_ms, *SEAM_CROSSFADE_MS_RANGE)
+        crossfade_ms=_whole_within(
+            arguments, "crossfade_ms", base.crossfade_ms, SEAM_CROSSFADE_MS_RANGE
         ),
-        zoom_percent=round(
-            _limit_number(arguments, "zoom_percent", base.zoom_percent, *SEAM_ZOOM_PERCENT_RANGE)
+        zoom_percent=_whole_within(
+            arguments, "zoom_percent", base.zoom_percent, SEAM_ZOOM_PERCENT_RANGE
         ),
-        audio_fade_ms=round(
-            _limit_number(arguments, "audio_fade_ms", base.audio_fade_ms, *SEAM_AUDIO_FADE_MS_RANGE)
+        audio_fade_ms=_whole_within(
+            arguments, "audio_fade_ms", base.audio_fade_ms, SEAM_AUDIO_FADE_MS_RANGE
         ),
     )
     if style.video == SEAM_NONE and style.audio_fade_ms == 0:
