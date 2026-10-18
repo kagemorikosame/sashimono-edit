@@ -64,6 +64,7 @@ from sashimono.core.commands.edit import (
     trimmable,
 )
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.emphasis import can_emphasize
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -259,6 +260,9 @@ class TimelineView(QWidget):
     duck_requested = Signal(list)
     #: 右クリックの〔音量を基準にそろえる…〕（#329） そろえるクリップの ID の並び
     loudness_requested = Signal(list)
+    #: 右クリックの〔強調の動きを付ける…〕（#331） 動きを付けるクリップの ID の並び
+    #: 範囲と動きを尋ねて付けるのは窓の側（AI の emphasize と同じ所を通す）
+    emphasis_requested = Signal(list)
     #: ビューは窓を知らない（テストで単体で作れるように） 知らせは信号で外へ出し、
     #: ステータスバーに出すのは窓の仕事にする
     status_message = Signal(str)
@@ -1851,6 +1855,14 @@ class TimelineView(QWidget):
                 functools.partial(self.loudness_requested.emit, sounds),
             )
             level.setEnabled(bool(sounds))
+            # 強調の動き（#331） 絵を描かないクリップとロックしたトラックだけなら灰色で出す
+            pictures = [str(clip_id) for clip_id in self._editable_pictures()]
+            emphasis = _action(
+                menu,
+                f"強調の動きを付ける…{count}",
+                functools.partial(self.emphasis_requested.emit, pictures),
+            )
+            emphasis.setEnabled(bool(pictures))
             if hit[1].scene_id is not None:
                 scene_id = hit[1].scene_id
                 _action(
@@ -1989,6 +2001,16 @@ class TimelineView(QWidget):
                 continue
             track, clip = located
             if not track.locked and project.plays_sound(track, clip):
+                found.append(clip_id)
+        return found
+
+    def _editable_pictures(self) -> list[ClipId]:
+        """選んでいるクリップのうち、強調の動きを付けられる物（AI の emphasize と同じ決まり）"""
+        project = self._project
+        found: list[ClipId] = []
+        for clip_id in self._selection:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_emphasize(project, *located):
                 found.append(clip_id)
         return found
 
