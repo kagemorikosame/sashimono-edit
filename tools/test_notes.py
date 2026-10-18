@@ -25,6 +25,7 @@ import io
 import sys
 import tokenize
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,32 +94,84 @@ type _Function = ast.FunctionDef | ast.AsyncFunctionDef
 
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
+#: 中の文も同じモジュールの直下として名前を結ぶ文 ``if TYPE_CHECKING:`` や ``try: import``
+#: の中で定義した基底も、実行すればモジュールの名前になる
+_BLOCKS = (ast.If, ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)
 
-@dataclass(slots=True)
+
+def _statements(body: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """モジュールやクラスの直下で名前を結ぶ文 関数とクラスの中には入らない"""
+    for node in body:
+        yield node
+        if isinstance(node, _BLOCKS):
+            for field in ("body", "orelse", "finalbody"):
+                yield from _statements(getattr(node, field, []))
+            for handler in getattr(node, "handlers", []):
+                yield from _statements(handler.body)
+
+
+@dataclass(slots=True, eq=False)
 class _Module:
-    """読んだ試験のファイル 1 つ 基底クラスを辿るたびに読み直さないよう持っておく"""
+    """読んだファイル 1 つ 基底クラスを辿るたびに読み直さないよう持っておく"""
 
     path: Path
     tree: ast.Module
     comments: set[int]
 
+    @property
+    def package(self) -> bool:
+        return self.path.name == "__init__.py"
+
+
+@dataclass(frozen=True, slots=True)
+class _Class:
+    module: _Module
+    node: ast.ClassDef
+
+
+@dataclass(frozen=True, slots=True)
+class _Func:
+    module: _Module
+    node: _Function
+
+
+@dataclass(frozen=True, slots=True)
+class _External:
+    """リポジトリの外の物（``unittest`` など） 点でつないだ名前だけを持つ"""
+
+    name: str
+
+
+type _Symbol = _Module | _Class | _Func | _External
+
 
 class Reader:
-    """試験のファイルを読み、``Test`` で始まるクラスが受け継ぐ試験まで辿る
+    """試験のファイルを読み、pytest が集める試験の関数を、書いてある所まで辿る
 
-    pytest は ``Test`` で始まるクラスが基底クラス（名前が ``Test`` で始まらない mixin や、
-    別のモジュールの物も）から受け継いだ ``test_*`` も集める 具象クラスの本体だけを見ると、
-    基底クラスに書き添えの無い試験を置けば見張りをすり抜ける（#377 の Codex の指摘）
+    pytest は試験のファイルの名前の表（モジュールの ``__dict__``）を見て集める そのため
+    次の物もそのファイルの試験になる 具象クラスの本体や、そのファイルに書いた ``def`` だけを
+    見ると、ほかの所に書き添えの無い試験を置けば見張りをすり抜ける（#377 の Codex と
+    CodeRabbit が別々の道を 3 度指摘した 1 つずつ塞がず、名前の解き方をまとめて作った）
+
+    - ``Test`` で始まるクラスが受け継いだ ``test_*`` 基底は名前が ``Test`` で始まらなくても
+      よく、同じファイル・``from`` や ``import`` で読み込んだ別のファイル・パッケージの
+      ``__init__.py`` で公開し直した物（``import *`` も）・``shared.Checks`` のような属性の形・
+      ``Base = Checks`` のような付け替えのどれでもよい
+    - 別のファイルから読み込んだ ``test_*`` の関数と ``Test*`` のクラス（``import *`` も）
+    - 名前に関係なく ``unittest.TestCase`` を受け継ぐクラス
+    - クラスの中で ``test_b = helper`` と付け替えた関数
+
     pytest の収集を基準にすると、試験のファイルが読み込む Qt やエンジンまで起こすので
-    数十秒かかり、部品が無い機械では集める前に落ちる AST で辿れば 1 秒かからず、
-    同じ所（tests の木）だけで答えが決まる 辿れない基底（``unittest.TestCase``
-    やリポジトリの外の物）は書き添えを求める先が無いので見ない
+    数十秒かかり、部品が無い機械では集める前に落ちる AST で辿れば tests の全部を見ても
+    数秒で、tests の木だけで答えが決まる リポジトリの外の物（``unittest.TestCase`` など）は
+    書き添えを求める先が無いので、``unittest`` の型かどうかを見分けるのにだけ使う
     """
 
     def __init__(self, root: Path = ROOT) -> None:
-        #: 辿ってよい置き場 外の基底は書き添えを求める先が無い
+        #: 辿ってよい置き場 外の物は書き添えを求める先が無い
         self._root = root.resolve()
         self._modules: dict[Path, _Module] = {}
+        self._found: dict[tuple[Path, str], _Symbol | None] = {}
 
     def module(self, path: Path) -> _Module:
         resolved = path.resolve()
@@ -131,94 +184,219 @@ class Reader:
         """pytest が集める試験の関数と、それが書いてあるファイル"""
         module = self.module(path)
         found: list[tuple[_Module, _Function]] = []
-        for node in module.tree.body:
-            if isinstance(node, _FUNCTIONS) and node.name.startswith("test"):
-                found.append((module, node))
-            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                found.extend(self._class_tests(module, node))
+        for name in self._bindings(module, frozenset()):
+            symbol = self.lookup(module, name)
+            if isinstance(symbol, _Func) and name.startswith("test"):
+                found.append((symbol.module, symbol.node))
+            elif isinstance(symbol, _Class) and (
+                name.startswith("Test") or self._is_unittest(symbol, frozenset())
+            ):
+                found.extend((owner, node) for _, owner, node in self._class_tests(symbol))
         return found
 
-    def _class_tests(
-        self, module: _Module, node: ast.ClassDef, seen: frozenset[int] = frozenset()
-    ) -> list[tuple[_Module, _Function]]:
-        """クラスが持つ試験 受け継いだ物も含める 上書きした名前は子の物だけを数える
+    def lookup(
+        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]] = frozenset()
+    ) -> _Symbol | None:
+        """モジュールの直下で名前が指す物
 
-        ``Test`` で始まる入れ子のクラスも pytest は集めるので辿る ``seen`` は基底を
-        辿る輪（同じ名前を付け替えた import など）で止まらなくならないため
-        """
-        if id(node) in seen:
-            return []
-        seen = seen | {id(node)}
-        found: list[tuple[_Module, _Function]] = []
-        names: set[str] = set()
-        for item in node.body:
-            if isinstance(item, _FUNCTIONS) and item.name.startswith("test"):
-                found.append((module, item))
-                names.add(item.name)
-            elif isinstance(item, ast.ClassDef) and item.name.startswith("Test"):
-                found.extend(self._class_tests(module, item, seen))
-        for base in node.bases:
-            located = self._base(module, base)
-            if located is None:
-                continue
-            for owner, function in self._class_tests(*located, seen):
-                if function.name not in names:
-                    found.append((owner, function))
-                    names.add(function.name)
-        return found
-
-    def _base(self, module: _Module, base: ast.expr) -> tuple[_Module, ast.ClassDef] | None:
-        """基底クラスの定義 同じファイルの直下のクラスか、from で読み込んだクラス"""
-        if not isinstance(base, ast.Name):
-            return None
-        return self._resolve(module, base.id, frozenset())
-
-    def _resolve(
-        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]]
-    ) -> tuple[_Module, ast.ClassDef] | None:
-        """名前をクラスの定義まで辿る 読み込み先でも同じ手順で解き直す
-
-        読み込み先の直下だけを探すと、パッケージの ``__init__.py`` で読み込み直して
-        公開した基底を見落とし、置き場を 1 段深くしただけで見張りをすり抜ける
-        ``visiting`` はファイル同士が互いを読み込む輪で止まらなくならないため
+        ``visiting`` はファイル同士が互いを読み込む輪で止まらなくならないため 輪の途中で
+        出た答え（None）は輪の外から引くと違うことがあるので、覚えるのは外からの答えだけ
         """
         key = (module.path, name)
+        if key in self._found:
+            return self._found[key]
         if key in visiting:
             return None
-        visiting = visiting | {key}
-        for node in module.tree.body:
+        found = self._find(module, name, visiting | {key})
+        if not visiting:
+            self._found[key] = found
+        return found
+
+    def _find(
+        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]]
+    ) -> _Symbol | None:
+        # 後から結んだ名前が勝つので、後ろから見る
+        stars: list[ast.ImportFrom] = []
+        for node in reversed(list(_statements(module.tree.body))):
             if isinstance(node, ast.ClassDef) and node.name == name:
-                return module, node
-        for node in module.tree.body:
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            for alias in node.names:
-                if (alias.asname or alias.name) != name:
-                    continue
-                source = self._source(module.path, node)
-                if source is None:
-                    return None
-                return self._resolve(self.module(source), alias.name, visiting)
+                return _Class(module, node)
+            if isinstance(node, _FUNCTIONS) and node.name == name:
+                return _Func(module, node)
+            if isinstance(node, ast.Assign | ast.AnnAssign):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                named = any(isinstance(t, ast.Name) and t.id == name for t in targets)
+                if named and node.value is not None:
+                    return self._expr(module, node.value, visiting)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname == name:
+                        return self._module_at(alias.name, 0, module)
+                    if alias.asname is None and alias.name.split(".")[0] == name:
+                        return self._module_at(name, 0, module)
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        stars.append(node)
+                    elif (alias.asname or alias.name) == name:
+                        return self._from(module, node, alias.name, visiting)
+        # import * は下線で始まる名前を持ち込まない
+        if name.startswith("_"):
+            return None
+        for node in stars:
+            source = self._module_at(node.module or "", node.level, module)
+            if isinstance(source, _Module):
+                found = self.lookup(source, name, visiting)
+                if found is not None:
+                    return found
         return None
 
-    def _source(self, path: Path, node: ast.ImportFrom) -> Path | None:
-        """``from ... import`` が指すリポジトリの中のファイル 外の物は None"""
-        parts = (node.module or "").split(".") if node.module else []
-        if node.level:
-            base = path.parent
-            for _ in range(node.level - 1):
+    def _from(
+        self,
+        module: _Module,
+        node: ast.ImportFrom,
+        name: str,
+        visiting: frozenset[tuple[Path, str]],
+    ) -> _Symbol | None:
+        """``from X import name`` の name X の中の名前か、X が包みならその下のモジュール"""
+        source = self._module_at(node.module or "", node.level, module)
+        if isinstance(source, _External):
+            return _External(f"{source.name}.{name}")
+        if source is None:
+            return None
+        return self.lookup(source, name, visiting) or self._submodule(source, name)
+
+    def _expr(
+        self, module: _Module, expr: ast.expr, visiting: frozenset[tuple[Path, str]]
+    ) -> _Symbol | None:
+        """基底や付け替えの右辺に書いた式が指す物 名前と属性（``a.b.C``）だけを辿る"""
+        if isinstance(expr, ast.Name):
+            return self.lookup(module, expr.id, visiting)
+        if not isinstance(expr, ast.Attribute):
+            return None
+        owner = self._expr(module, expr.value, visiting)
+        if isinstance(owner, _External):
+            return _External(f"{owner.name}.{expr.attr}")
+        if isinstance(owner, _Module):
+            return self.lookup(owner, expr.attr, visiting) or self._submodule(owner, expr.attr)
+        if isinstance(owner, _Class):
+            for item in owner.node.body:
+                if isinstance(item, ast.ClassDef) and item.name == expr.attr:
+                    return _Class(owner.module, item)
+                if isinstance(item, _FUNCTIONS) and item.name == expr.attr:
+                    return _Func(owner.module, item)
+        return None
+
+    def _module_at(self, dotted: str, level: int, origin: _Module) -> _Module | _External | None:
+        """読み込みが指すモジュール リポジトリの中ならファイル、外なら名前だけ"""
+        if level:
+            base = origin.path.parent
+            for _ in range(level - 1):
                 base = base.parent
         else:
             base = self._root
+        parts = [part for part in dotted.split(".") if part]
         candidate = base.joinpath(*parts)
-        for found in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+        files = [candidate / "__init__.py"]
+        if parts:
+            files.insert(0, candidate.with_name(parts[-1] + ".py"))
+        for found in files:
             if found.is_file() and found.resolve().is_relative_to(self._root):
-                return found
+                return self.module(found)
+        # 相対の読み込みが外れるのは書き間違いで、外の物でもない
+        return None if level else _External(dotted)
+
+    def _submodule(self, package: _Module, name: str) -> _Module | None:
+        """包みの下のモジュール ``from tests import shared`` の shared"""
+        if not package.package:
+            return None
+        base = package.path.parent / name
+        for found in (base.with_name(name + ".py"), base / "__init__.py"):
+            if found.is_file() and found.resolve().is_relative_to(self._root):
+                return self.module(found)
         return None
+
+    def _bindings(self, module: _Module, visiting: frozenset[Path]) -> list[str]:
+        """モジュールの直下で結ばれる名前 ``import *`` は読み込み先の名前を足す"""
+        names: list[str] = []
+        for node in _statements(module.tree.body):
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                names.append(node.name)
+            elif isinstance(node, ast.Assign):
+                names.extend(t.id for t in node.targets if isinstance(t, ast.Name))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.append(node.target.id)
+            elif isinstance(node, ast.Import):
+                names.extend(alias.asname or alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        names.append(alias.asname or alias.name)
+                        continue
+                    source = self._module_at(node.module or "", node.level, module)
+                    if isinstance(source, _Module) and source.path not in visiting:
+                        inner = self._bindings(source, visiting | {module.path})
+                        names.extend(name for name in inner if not name.startswith("_"))
+        return list(dict.fromkeys(names))
+
+    def _class_tests(
+        self, cls: _Class, seen: frozenset[int] = frozenset()
+    ) -> list[tuple[str, _Module, _Function]]:
+        """クラスが持つ試験 受け継いだ物も含める 上書きした名前は子の物だけを数える
+
+        ``Test`` で始まる入れ子のクラスも pytest は集めるので辿る ``seen`` は基底を
+        辿る輪で止まらなくならないため
+        """
+        if id(cls.node) in seen:
+            return []
+        seen = seen | {id(cls.node)}
+        found: list[tuple[str, _Module, _Function]] = []
+        names: set[str] = set()
+        for item in cls.node.body:
+            if isinstance(item, _FUNCTIONS) and item.name.startswith("test"):
+                found.append((item.name, cls.module, item))
+                names.add(item.name)
+            elif isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if isinstance(target, ast.Name) and target.id.startswith("test"):
+                        value = self._expr(cls.module, item.value, frozenset())
+                        if isinstance(value, _Func):
+                            found.append((target.id, value.module, value.node))
+                            names.add(target.id)
+            elif isinstance(item, ast.ClassDef) and item.name.startswith("Test"):
+                inner = self._class_tests(_Class(cls.module, item), seen)
+                found.extend(("", owner, node) for _, owner, node in inner)
+        for base in cls.node.bases:
+            located = self._expr(cls.module, base, frozenset())
+            if not isinstance(located, _Class):
+                continue
+            for name, owner, node in self._class_tests(located, seen):
+                # 名前の無いのは基底の中の入れ子の Test クラスの試験 pytest は受け継いだ
+                # 入れ子のクラスも集めるので数える
+                if not name or name not in names:
+                    found.append((name, owner, node))
+                    names.add(name)
+        return found
+
+    def _is_unittest(self, cls: _Class, seen: frozenset[int]) -> bool:
+        """``unittest.TestCase`` を受け継ぐか pytest は名前に関係なく集める"""
+        if id(cls.node) in seen:
+            return False
+        seen = seen | {id(cls.node)}
+        for base in cls.node.bases:
+            located = self._expr(cls.module, base, frozenset())
+            if (
+                isinstance(located, _External)
+                and located.name.startswith("unittest.")
+                and located.name.endswith("TestCase")
+            ):
+                return True
+            if isinstance(located, _Class) and self._is_unittest(located, seen):
+                return True
+        return False
 
 
 def scan(path: Path, reader: Reader | None = None) -> list[Missing]:
-    """書き添えの無い試験 受け継いだ試験は、書いてあるファイルと行で出す"""
+    """書き添えの無い試験 受け継いだり読み込んだりした試験は、書いてあるファイルと行で出す"""
     reader = reader or Reader()
     missing: list[Missing] = []
     for module, node in reader.tests(path):
@@ -230,16 +408,17 @@ def scan(path: Path, reader: Reader | None = None) -> list[Missing]:
 
 
 def targets(root: Path = ROOT, *, everything: bool = False) -> list[Path]:
-    """試験のファイル pytest の既定の集め方（``test_*.py``）に合わせる"""
-    found: list[Path] = []
-    for path in sorted((root / "tests").rglob("test_*.py")):
-        relative = path.relative_to(root).as_posix()
-        if relative.startswith(SKIP_PREFIXES) or "__pycache__" in path.parts:
-            continue
-        if not everything and not relative.startswith(WATCHED_PREFIXES):
-            continue
-        found.append(path)
-    return found
+    """試験のファイル pytest の既定の集め方（``test_*.py`` と ``*_test.py``）に合わせる"""
+    found: set[Path] = set()
+    for pattern in ("test_*.py", "*_test.py"):
+        for path in (root / "tests").rglob(pattern):
+            relative = path.relative_to(root).as_posix()
+            if relative.startswith(SKIP_PREFIXES) or "__pycache__" in path.parts:
+                continue
+            if not everything and not relative.startswith(WATCHED_PREFIXES):
+                continue
+            found.add(path)
+    return sorted(found)
 
 
 def main(argv: list[str] | None = None) -> int:

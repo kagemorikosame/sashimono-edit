@@ -179,6 +179,127 @@ class TestInheritedTests:
         assert names(tool, tmp_path, text) == []
 
 
+#: 別のファイルに置いた試験の材料 書き添えはどれにも無い
+SHARED_CHECKS = (
+    "class Checks:\n    def test_a(self):\n        assert True\n"
+    "def test_b():\n    assert True\n"
+    "class TestImported:\n    def test_c(self):\n        assert True\n"
+    "def helper(self):\n    assert True\n"
+)
+
+
+class TestEveryWayPytestCollects:
+    """pytest が試験のファイルの名前の表から集める道は、どれを通っても見張る
+
+    #377 で Codex と CodeRabbit が基底の辿り方の穴を 3 度続けて指摘した 1 つずつ塞ぐのを
+    やめ、名前の解き方をまとめて作り直したので、知っている道を全部ここに並べる どれかが
+    抜けると、その書き方に変えるだけで書き添えの無い試験が verify を通る
+    """
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "from tests.shared import Checks\nclass TestReal(Checks):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            (
+                "from tests import shared\nclass TestReal(shared.Checks):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            (
+                "import tests.shared\nclass TestReal(tests.shared.Checks):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            (
+                "import tests.shared.checks as c\nclass TestReal(c.Checks):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            (
+                "from tests.shared.checks import Checks\nBase = Checks\n"
+                "class TestReal(Base):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            (
+                "if True:\n    from tests.shared.checks import Checks\n"
+                "class TestReal(Checks):\n    pass\n",
+                [("checks.py", "test_a")],
+            ),
+            ("from tests.shared.checks import test_b\n", [("checks.py", "test_b")]),
+            ("from tests.shared.checks import TestImported\n", [("checks.py", "test_c")]),
+            (
+                "from tests.shared.checks import *\n",
+                [("checks.py", "test_b"), ("checks.py", "test_c")],
+            ),
+            (
+                "from tests.shared.checks import helper\nclass TestReal:\n    test_d = helper\n",
+                [("checks.py", "helper")],
+            ),
+            (
+                "class Outer:\n    class TestInner:\n        def test_e(self):\n"
+                "            assert True\n"
+                "class TestReal(Outer):\n    pass\n",
+                [("test_real.py", "test_e")],
+            ),
+        ],
+        ids=[
+            "star-reexport",
+            "from-package-attribute",
+            "import-attribute",
+            "import-as-attribute",
+            "renamed-base",
+            "base-in-block",
+            "imported-function",
+            "imported-class",
+            "star-into-test-file",
+            "class-attribute-function",
+            "inherited-nested-class",
+        ],
+    )
+    def test_each_way_is_followed(
+        self, tool: ModuleType, tmp_path: Path, source: str, expected: list[tuple[str, str]]
+    ) -> None:
+        # どの道でも、試験が書いてあるファイルと名前で抜けを出す 出なければ、その書き方で
+        # 書き添えの無い試験が見張りをすり抜ける
+        package = tmp_path / "tests" / "shared"
+        package.mkdir(parents=True)
+        (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (package / "__init__.py").write_text("from .checks import *\n", encoding="utf-8")
+        (package / "checks.py").write_text(SHARED_CHECKS, encoding="utf-8")
+        path = tmp_path / "tests" / "test_real.py"
+        path.write_text(source, encoding="utf-8")
+        found = tool.scan(path, tool.Reader(tmp_path))
+        assert sorted((item.path.name, item.name) for item in found) == expected
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import unittest\nclass Checks(unittest.TestCase):\n    def test_a(self):\n"
+            "        assert True\n",
+            "from unittest import TestCase\nclass Mixin(TestCase):\n    pass\n"
+            "class Checks(Mixin):\n    def test_a(self):\n        assert True\n",
+        ],
+        ids=["module-attribute", "through-a-mixin"],
+    )
+    def test_a_unittest_class_is_collected_by_any_name(
+        self, tool: ModuleType, tmp_path: Path, source: str
+    ) -> None:
+        # pytest は unittest.TestCase を受け継ぐクラスを名前に関係なく集める 名前だけで
+        # 選ぶと、Test で始まらない名前を付けるだけで見張りをすり抜ける
+        assert names(tool, tmp_path, source) == ["test_a"]
+
+    def test_files_named_with_a_trailing_test_are_checked(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # pytest は *_test.py も集める test_*.py だけを見ると、名前の付け方を変えた
+        # ファイルの試験が見張りの外に出る
+        (tmp_path / "tests").mkdir()
+        for name in ("test_a.py", "b_test.py", "helper.py"):
+            (tmp_path / "tests" / name).write_text("", encoding="utf-8")
+        found = [path.name for path in tool.targets(tmp_path, everything=True)]
+        assert found == ["b_test.py", "test_a.py"]
+
+
 def test_only_the_watched_places_are_checked(tool: ModuleType) -> None:
     # 書き添えを埋めた置き場から順に見張る まだ埋めていない置き場まで見ると verify が
     # 落ち続け、--all を付けなければ数えられないと誰も抜けの数を追えない
