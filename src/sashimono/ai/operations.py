@@ -3323,7 +3323,8 @@ def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
     戻した物は人が Ctrl+Y でやり直せる 人が手で変えた段に当たったら、そこで止める
     """
     document = host.document
-    whole = bool(arguments.get("this_instruction", False))
+    # 文字の "false" を真と読むと、1 手のつもりの頼みで指示の手が全部戻る
+    whole = _flag_argument(arguments, "this_instruction", False)
     if whole:
         if "steps" in arguments:
             # 両方を受けると、どちらを守ったのか AI に分からない 片方だけ当てて黙らない

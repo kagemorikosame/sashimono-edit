@@ -136,6 +136,21 @@ class TestTheScopeOfOneInstruction:
         assert _clip_count(host) == 2
         host.document.end_checkpoint()
 
+    def test_a_string_false_does_not_undo_the_whole_instruction(self, host: FakeHost) -> None:
+        """壊れると、AI が文字の "false" を渡したとき、1 手のつもりの取り消しで指示の手が全部戻る
+
+        文字の "false" は bool にすると真になる 断って、true か false で渡し直させる
+        """
+        host.document.begin_checkpoint("AI: 細かく切って", by=Author.AI)
+        _split(host, 100)
+        _split(host, 50)
+
+        with pytest.raises(ToolError, match="this_instruction は true か false"):
+            run(host, "undo", this_instruction="false")
+
+        assert _clip_count(host) == 3
+        host.document.end_checkpoint()
+
     def test_the_previous_instruction_is_undone_as_one_step(self, host: FakeHost) -> None:
         """壊れると、「さっきの指示を取り消して」で前の指示が 1 手ずつしか戻らないか、履歴が壊れる
 
