@@ -175,16 +175,24 @@ class Document:
         ``merge`` と ``by`` については :meth:`begin_checkpoint` を参照
         """
         start = self._project
+        # 一番外の段なら、始めた時の履歴を覚える 段の途中で人の変更を分けると、AI と人の段を
+        # その場で履歴へ積む（_land_person） 断られて形だけ戻すと、戻した後の形に合わない段が残る
+        outermost = self._checkpoint_depth == 0
+        history = (list(self._undo), list(self._redo), self._merge_anchor)
         self.begin_checkpoint(label, merge=merge, by=by)
         try:
             yield
         except BaseException:
-            if self._checkpoint_depth == 1:
-                # 一番外の段が断られた 段の中の小さな段は戻した先に無いので捨てる
-                # 残すと、閉じる所で前に取り消した物のやり直しまで消してしまう
+            if outermost and self._checkpoint_depth == 1:
+                # 一番外の段が断られた 段の中の小さな段は戻した先に無いので捨て、
+                # 履歴も始めた時へ戻す 残すと、閉じる所で前に取り消した物のやり直しまで消し、
+                # 途中で積んだ AI と人の段が戻した後の形に合わないまま残る
                 self._inner_undo.clear()
                 self._inner_redo.clear()
+                self._inner_anchor = None
                 self._inner_touched = False
+                self._undo, self._redo, self._merge_anchor = history
+                self._checkpoint_before = start
             if self._project is not start:
                 self._set_project(start)
             raise

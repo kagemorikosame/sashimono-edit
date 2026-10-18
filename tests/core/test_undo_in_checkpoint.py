@@ -300,6 +300,43 @@ class TestWhoMadeTheStep:
         document.end_checkpoint()
         assert document.history_labels == ("AI: 指示",)
 
+    def test_a_failed_ai_group_with_a_persons_edit_leaves_no_steps(self, project: Project) -> None:
+        """壊れると、断られて戻した AI のまとめの途中の形が履歴に残り、Ctrl+Z で捨てたはずの形が戻る
+
+        AI の名前変更 → 人のトラック追加 → 断られる の順 人の段を分けた所で AI と人の段を
+        履歴へ積むので、断られた時はその前の履歴まで戻す
+        """
+        document = Document(project)
+        _named(document, "前")
+        _named(document, "もっと前")
+        document.undo()
+        with pytest.raises(KeyError), document.checkpoint("AI のまとめ", by=Author.AI):
+            document.execute(RenameProject("AI の途中"))
+            _person_adds_a_track(document)
+            raise KeyError("断る")
+
+        assert document.project.name == "前"
+        assert _tracks(document) == len(project.timeline.tracks)
+        assert document.history_labels == ("プロジェクト名を変更",)
+        # 前に取り消した物も、断られる前と同じくやり直せる
+        assert document.redo_label == "プロジェクト名を変更"
+        document.undo()
+        assert document.project is project
+
+    def test_a_failed_ai_group_with_a_persons_group_leaves_no_steps(self, project: Project) -> None:
+        """壊れると、人のまとめ操作を挟んで断られた AI のまとめが、途中の形を指す段を残す"""
+        document = Document(project)
+        with pytest.raises(KeyError), document.checkpoint("AI のまとめ", by=Author.AI):
+            document.execute(RenameProject("AI の途中"))
+            with document.checkpoint("人のまとめ", by=Author.PERSON):
+                _person_adds_a_track(document)
+            document.execute(RenameProject("AI の後"))
+            raise KeyError("断る")
+
+        assert document.project is project
+        assert document.can_undo is False
+        assert document.can_redo is False
+
     def test_the_persons_ctrl_z_still_undoes_everything(self, project: Project) -> None:
         """壊れると、人が Ctrl+Z で AI の段も人の段も戻せず、印のせいで履歴の途中で止まる"""
         document = Document(project)
