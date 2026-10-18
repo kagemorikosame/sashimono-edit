@@ -7,6 +7,7 @@ from fractions import Fraction
 
 from sashimono.core.model.ids import MediaId, SceneId, new_scene_id
 from sashimono.core.model.media import MediaItem
+from sashimono.core.model.style import StyleGuide
 from sashimono.core.model.timeline import (
     Clip,
     Timeline,
@@ -127,6 +128,9 @@ class Project:
     name: str = "無題"
     #: メイン（:attr:`timeline`）とは別のシーン 表示順を保つためタプル
     scenes: tuple[Scene, ...] = ()
+    #: 編集の方針（#343） 作品の見た目そのものの決まりなので、本人の好み（``Preferences``）
+    #: ではなく作品に付ける 同じ作品を別の機械で開いても、AI が同じ方針で編集する
+    style_guide: StyleGuide = field(default_factory=StyleGuide)
 
     def __post_init__(self) -> None:
         if self.timeline.rate != self.settings.frame_rate:
