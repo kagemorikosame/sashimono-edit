@@ -366,6 +366,79 @@ class TestEveryWayPytestCollects:
         assert found == ["b_test.py", "test_a.py"]
 
 
+class TestWhatPytestSkips:
+    """pytest が集めない物には書き添えを求めない 求めると、試験の部品を外した人の verify が落ちる"""
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "class TestHelper:\n    __test__ = False\n    def test_a(self):\n"
+                "        assert True\n",
+                [],
+            ),
+            (
+                "class Base:\n    __test__ = False\n"
+                "class TestOff(Base):\n    def test_a(self):\n        assert True\n"
+                "class TestOn(Base):\n    __test__ = True\n    def test_b(self):\n"
+                "        assert True\n",
+                ["test_b"],
+            ),
+            ("def test_a():\n    assert True\ntest_a.__test__ = False\n", []),
+            (
+                "class TestX:\n    def test_a(self):\n        assert True\n"
+                "TestX.__test__ = False\n",
+                [],
+            ),
+            ("__test__ = False\ndef test_a():\n    assert True\n", []),
+            (
+                "class TestX:\n    __test__ = flag()\n    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+        ],
+        ids=[
+            "class-off",
+            "inherited-off-and-back-on",
+            "function-off",
+            "class-off-from-outside",
+            "module-off",
+            "unknown-value-counts",
+        ],
+    )
+    def test_switched_off_tests_are_not_asked_for(
+        self, tool: ModuleType, tmp_path: Path, source: str, expected: list[str]
+    ) -> None:
+        # 値が分からない物（呼び出しで決める __test__）は数える側に倒す 外す側に倒すと、
+        # 書き添えの無い試験を見逃す
+        assert names(tool, tmp_path, source) == expected
+
+    @pytest.mark.parametrize(
+        ("exports", "expected"),
+        [
+            ('__all__ = ["test_b"]\n', ["test_b"]),
+            ('__all__ = ("test_b", "test_z")\n', ["test_b", "test_z"]),
+            ("__all__ = names()\n", ["test_b", "test_z"]),
+            ("", ["test_b", "test_z"]),
+        ],
+        ids=["list", "tuple", "expression-counts-all", "no-all"],
+    )
+    def test_a_star_import_follows_all(
+        self, tool: ModuleType, tmp_path: Path, exports: str, expected: list[str]
+    ) -> None:
+        # __all__ で外した名前まで数えると、pytest が集めない関数に書き添えを強いる
+        # 式で作った __all__ は読み解かず、全部数える側に倒す
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (tmp_path / "tests" / "shared.py").write_text(
+            exports + "def test_b():\n    assert True\ndef test_z():\n    assert True\n",
+            encoding="utf-8",
+        )
+        path = tmp_path / "tests" / "test_real.py"
+        path.write_text("from tests.shared import *\n", encoding="utf-8")
+        found = tool.scan(path, tool.Reader(tmp_path))
+        assert sorted(item.name for item in found) == expected
+
+
 def test_only_the_watched_places_are_checked(tool: ModuleType) -> None:
     # 書き添えを埋めた置き場から順に見張る まだ埋めていない置き場まで見ると verify が
     # 落ち続け、--all を付けなければ数えられないと誰も抜けの数を追えない

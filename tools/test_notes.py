@@ -150,6 +150,64 @@ type _Symbol = _Module | _Class | _Func | _External
 type _Visiting = frozenset[tuple[Path, str]]
 
 
+def _test_flag(body: list[ast.stmt], owner: str | None = None) -> bool | None:
+    """本体に書いた ``__test__`` の値 ``owner`` があれば ``owner.__test__ = ...`` の方
+
+    値が定数でなければ（関数の呼び出しなど）分からないので None 分からない物は
+    集める側に倒す 外す側に倒すと、書き添えの無い試験を見逃す
+    """
+    for node in reversed(list(_statements(body))):
+        if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if owner is None:
+                hit = isinstance(target, ast.Name) and target.id == "__test__"
+            else:
+                hit = (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "__test__"
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == owner
+                )
+            if hit:
+                value = node.value
+                return bool(value.value) if isinstance(value, ast.Constant) else None
+    return None
+
+
+def _exports(module: _Module) -> frozenset[str] | None:
+    """``__all__`` に文字の並びで直に書いた名前 書いていないか、式で作っていれば None"""
+    for node in reversed(list(_statements(module.tree.body))):
+        if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            continue
+        value = node.value
+        if isinstance(value, ast.List | ast.Tuple) and all(
+            isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts
+        ):
+            return frozenset(
+                str(item.value) for item in value.elts if isinstance(item, ast.Constant)
+            )
+        return None
+    return None
+
+
+def _star_exports(module: _Module, name: str) -> bool:
+    """``from module import *`` がその名前を持ち込むか
+
+    ``__all__`` を文字の並びで直に書いてあれば、それで絞る（下線で始まる名前も載って
+    いれば持ち込む） 無いか式で作っていれば、下線で始まらない名前を全部持ち込む
+    式の ``__all__`` を読み解かないのは、外れたときに多めに数える側へ倒すため
+    """
+    exported = _exports(module)
+    if exported is None:
+        return not name.startswith("_")
+    return name in exported
+
+
 class Reader:
     """試験のファイルを読み、pytest が集める試験の関数を、書いてある所まで辿る
 
@@ -189,9 +247,13 @@ class Reader:
         """pytest が集める試験の関数と、それが書いてあるファイル"""
         module = self.module(path)
         found: list[tuple[_Module, _Function]] = []
+        # pytest はモジュールに __test__ = False があると、中を 1 本も集めない
+        if _test_flag(module.tree.body) is False:
+            return found
         for name in self._names(module, module.tree.body, frozenset()):
             symbol = self.lookup(module, name)
-            found.extend((owner, node) for _, owner, node in self._collected(name, symbol))
+            collected = self._collected(name, symbol, module.tree.body)
+            found.extend((owner, node) for _, owner, node in collected)
         return found
 
     def lookup(
@@ -265,12 +327,11 @@ class Reader:
                         stars.append(node)
                     elif (alias.asname or alias.name) == name:
                         return self._from(module, node, alias.name, visiting)
-        # import * は下線で始まる名前を持ち込まない
-        if owner is not None or name.startswith("_"):
+        if owner is not None:
             return None
         for node in stars:
             source = self._module_at(node.module or "", node.level, module)
-            if isinstance(source, _Module):
+            if isinstance(source, _Module) and _star_exports(source, name):
                 found = self.lookup(source, name, visiting)
                 if found is not None:
                     return found
@@ -390,20 +451,31 @@ class Reader:
                     source = self._module_at(node.module or "", node.level, module)
                     if isinstance(source, _Module) and source.path not in visiting:
                         inner = self._names(source, source.tree.body, visiting | {module.path})
-                        names.extend(name for name in inner if not name.startswith("_"))
+                        names.extend(name for name in inner if _star_exports(source, name))
         return list(dict.fromkeys(names))
 
-    def _collected(self, name: str, symbol: _Symbol | None) -> list[tuple[str, _Module, _Function]]:
+    def _collected(
+        self, name: str, symbol: _Symbol | None, scope: list[ast.stmt]
+    ) -> list[tuple[str, _Module, _Function]]:
         """名前の表の 1 行から pytest が集める試験 モジュールの直下もクラスの本体も同じ決まり
 
         ``test`` で始まる名前の関数と、``Test`` で始まる名前か ``unittest.TestCase`` を
         受け継ぐクラスの試験 鍵は上書きを見分けるための名前（入れ子のクラスは点でつなぐ）
+        ``scope`` はその名前を結んだ本体 ``test_x.__test__ = False`` を探すのに使う
+        ``__test__`` が偽の物は pytest が集めないので、書き添えも求めない 求めると、
+        試験の部品に ``__test__ = False`` を付けて外した人の verify が落ちる
         """
         if isinstance(symbol, _Func) and name.startswith("test"):
-            return [(name, symbol.module, symbol.node)]
+            off = (
+                _test_flag(scope, name) is False
+                or _test_flag(symbol.module.tree.body, symbol.node.name) is False
+            )
+            return [] if off else [(name, symbol.module, symbol.node)]
         if isinstance(symbol, _Class) and (
             name.startswith("Test") or self._is_unittest(symbol, frozenset())
         ):
+            if _test_flag(scope, name) is False or self._switched_off(symbol, frozenset()):
+                return []
             return [
                 (f"{name}.{key}", owner, node) for key, owner, node in self._class_tests(symbol)
             ]
@@ -424,9 +496,8 @@ class Reader:
         found: list[tuple[str, _Module, _Function]] = []
         local = self._names(cls.module, cls.node.body, frozenset())
         for name in local:
-            found.extend(
-                self._collected(name, self._local(cls.module, cls.node, name, frozenset()))
-            )
+            symbol = self._local(cls.module, cls.node, name, frozenset())
+            found.extend(self._collected(name, symbol, cls.node.body))
         taken = set(local)
         for base in cls.node.bases:
             located = self._expr(cls.module, base, frozenset(), cls.outer)
@@ -440,6 +511,25 @@ class Reader:
             found.extend(inherited)
             taken.update(key.split(".")[0] for key, _, _ in inherited)
         return found
+
+    def _switched_off(self, cls: _Class, seen: frozenset[int]) -> bool:
+        """クラスの ``__test__`` が偽か 本体に無ければ基底から受け継いだ値を見る"""
+        return self._class_flag(cls, seen) is False
+
+    def _class_flag(self, cls: _Class, seen: frozenset[int]) -> bool | None:
+        """``__test__`` の値 本体に無ければ基底を前から辿り、最初に書いてある物"""
+        if id(cls.node) in seen:
+            return None
+        flag = _test_flag(cls.node.body)
+        if flag is not None:
+            return flag
+        for base in cls.node.bases:
+            located = self._expr(cls.module, base, frozenset(), cls.outer)
+            if isinstance(located, _Class):
+                inherited = self._class_flag(located, seen | {id(cls.node)})
+                if inherited is not None:
+                    return inherited
+        return None
 
     def _is_unittest(self, cls: _Class, seen: frozenset[int]) -> bool:
         """``unittest.TestCase`` を受け継ぐか pytest は名前に関係なく集める"""
