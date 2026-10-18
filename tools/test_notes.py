@@ -127,6 +127,8 @@ class _Module:
 class _Class:
     module: _Module
     node: ast.ClassDef
+    #: 入れ子のクラスなら、それを書いたクラス 基底の式はそこの名前で解く
+    outer: ast.ClassDef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +145,9 @@ class _External:
 
 
 type _Symbol = _Module | _Class | _Func | _External
+
+#: 辿っている途中のファイルと名前の組 互いを読み込む輪で止まらなくならないため
+type _Visiting = frozenset[tuple[Path, str]]
 
 
 class Reader:
@@ -184,18 +189,13 @@ class Reader:
         """pytest が集める試験の関数と、それが書いてあるファイル"""
         module = self.module(path)
         found: list[tuple[_Module, _Function]] = []
-        for name in self._bindings(module, frozenset()):
+        for name in self._names(module, module.tree.body, frozenset()):
             symbol = self.lookup(module, name)
-            if isinstance(symbol, _Func) and name.startswith("test"):
-                found.append((symbol.module, symbol.node))
-            elif isinstance(symbol, _Class) and (
-                name.startswith("Test") or self._is_unittest(symbol, frozenset())
-            ):
-                found.extend((owner, node) for _, owner, node in self._class_tests(symbol))
+            found.extend((owner, node) for _, owner, node in self._collected(name, symbol))
         return found
 
     def lookup(
-        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]] = frozenset()
+        self, module: _Module, name: str, visiting: _Visiting = frozenset()
     ) -> _Symbol | None:
         """モジュールの直下で名前が指す物
 
@@ -207,26 +207,52 @@ class Reader:
             return self._found[key]
         if key in visiting:
             return None
-        found = self._find(module, name, visiting | {key})
+        found = self._find_in(module, module.tree.body, None, name, visiting | {key})
         if not visiting:
             self._found[key] = found
         return found
 
-    def _find(
-        self, module: _Module, name: str, visiting: frozenset[tuple[Path, str]]
+    def _local(
+        self, module: _Module, owner: ast.ClassDef, name: str, visiting: _Visiting
     ) -> _Symbol | None:
-        # 後から結んだ名前が勝つので、後ろから見る
+        """クラスの本体で名前が指す物 本体に無ければ None（モジュールの直下は見ない）
+
+        ``test_a = test_a`` のように自分の名前を右辺に書くと、Python はまだ結んでいない
+        クラスの名前を飛ばしてモジュールの直下を見る 同じ組を 2 度引いたら None を返して
+        呼び手にモジュールの直下を見させるのは、その順に合わせるため
+        """
+        key = (module.path, f"{owner.lineno}:{owner.col_offset}:{name}")
+        if key in visiting:
+            return None
+        return self._find_in(module, owner.body, owner, name, visiting | {key})
+
+    def _find_in(
+        self,
+        module: _Module,
+        body: list[ast.stmt],
+        owner: ast.ClassDef | None,
+        name: str,
+        visiting: _Visiting,
+    ) -> _Symbol | None:
+        """モジュールの直下（owner が None）かクラスの本体で、名前が指す物
+
+        どちらも同じ手順で解く 名前を結ぶ文（def・class・付け替え・import・from）を、
+        if・try・with などの中まで後ろから見る（後から結んだ名前が勝つ） 付け替えの右辺は
+        結んだ場所の名前の決まりで解く（クラスの本体なら、まずそのクラスの名前） 両方で
+        別々に書くと、片方にだけ足した形がもう片方で抜ける（#377 で 4 度指摘された）
+        ``import *`` だけはクラスの中に書けないので、モジュールの直下でだけ辿る
+        """
         stars: list[ast.ImportFrom] = []
-        for node in reversed(list(_statements(module.tree.body))):
+        for node in reversed(list(_statements(body))):
             if isinstance(node, ast.ClassDef) and node.name == name:
-                return _Class(module, node)
+                return _Class(module, node, owner)
             if isinstance(node, _FUNCTIONS) and node.name == name:
                 return _Func(module, node)
             if isinstance(node, ast.Assign | ast.AnnAssign):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 named = any(isinstance(t, ast.Name) and t.id == name for t in targets)
                 if named and node.value is not None:
-                    return self._expr(module, node.value, visiting)
+                    return self._expr(module, node.value, visiting, owner)
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.asname == name:
@@ -240,7 +266,7 @@ class Reader:
                     elif (alias.asname or alias.name) == name:
                         return self._from(module, node, alias.name, visiting)
         # import * は下線で始まる名前を持ち込まない
-        if name.startswith("_"):
+        if owner is not None or name.startswith("_"):
             return None
         for node in stars:
             source = self._module_at(node.module or "", node.level, module)
@@ -255,7 +281,7 @@ class Reader:
         module: _Module,
         node: ast.ImportFrom,
         name: str,
-        visiting: frozenset[tuple[Path, str]],
+        visiting: _Visiting,
     ) -> _Symbol | None:
         """``from X import name`` の name X の中の名前か、X が包みならその下のモジュール"""
         source = self._module_at(node.module or "", node.level, module)
@@ -266,24 +292,49 @@ class Reader:
         return self.lookup(source, name, visiting) or self._submodule(source, name)
 
     def _expr(
-        self, module: _Module, expr: ast.expr, visiting: frozenset[tuple[Path, str]]
+        self,
+        module: _Module,
+        expr: ast.expr,
+        visiting: _Visiting,
+        owner: ast.ClassDef | None = None,
     ) -> _Symbol | None:
-        """基底や付け替えの右辺に書いた式が指す物 名前と属性（``a.b.C``）だけを辿る"""
+        """基底や付け替えの右辺に書いた式が指す物 名前と属性（``a.b.C``）だけを辿る
+
+        ``owner`` はその式を書いたクラスの本体 名前はまずそのクラスで、無ければ
+        モジュールの直下で引く（Python の名前の決まりと同じ）
+        """
         if isinstance(expr, ast.Name):
+            if owner is not None:
+                found = self._local(module, owner, expr.id, visiting)
+                if found is not None:
+                    return found
             return self.lookup(module, expr.id, visiting)
         if not isinstance(expr, ast.Attribute):
             return None
-        owner = self._expr(module, expr.value, visiting)
-        if isinstance(owner, _External):
-            return _External(f"{owner.name}.{expr.attr}")
-        if isinstance(owner, _Module):
-            return self.lookup(owner, expr.attr, visiting) or self._submodule(owner, expr.attr)
-        if isinstance(owner, _Class):
-            for item in owner.node.body:
-                if isinstance(item, ast.ClassDef) and item.name == expr.attr:
-                    return _Class(owner.module, item)
-                if isinstance(item, _FUNCTIONS) and item.name == expr.attr:
-                    return _Func(owner.module, item)
+        base = self._expr(module, expr.value, visiting, owner)
+        if isinstance(base, _External):
+            return _External(f"{base.name}.{expr.attr}")
+        if isinstance(base, _Module):
+            return self.lookup(base, expr.attr, visiting) or self._submodule(base, expr.attr)
+        if isinstance(base, _Class):
+            return self._attribute(base, expr.attr, visiting, frozenset())
+        return None
+
+    def _attribute(
+        self, cls: _Class, name: str, visiting: _Visiting, seen: frozenset[int]
+    ) -> _Symbol | None:
+        """クラスの属性 本体に無ければ基底を前から辿る（``Helpers.check`` など）"""
+        if id(cls.node) in seen:
+            return None
+        found = self._local(cls.module, cls.node, name, visiting)
+        if found is not None:
+            return found
+        for base in cls.node.bases:
+            located = self._expr(cls.module, base, visiting, cls.outer)
+            if isinstance(located, _Class):
+                found = self._attribute(located, name, visiting, seen | {id(cls.node)})
+                if found is not None:
+                    return found
         return None
 
     def _module_at(self, dotted: str, level: int, origin: _Module) -> _Module | _External | None:
@@ -315,10 +366,14 @@ class Reader:
                 return self.module(found)
         return None
 
-    def _bindings(self, module: _Module, visiting: frozenset[Path]) -> list[str]:
-        """モジュールの直下で結ばれる名前 ``import *`` は読み込み先の名前を足す"""
+    def _names(self, module: _Module, body: list[ast.stmt], visiting: frozenset[Path]) -> list[str]:
+        """モジュールの直下かクラスの本体で結ばれる名前 ``_find_in`` と同じ文を数える
+
+        ``import *`` は読み込み先の名前を足す（クラスの中には書けないので、出るのは
+        モジュールの直下だけ）
+        """
         names: list[str] = []
-        for node in _statements(module.tree.body):
+        for node in _statements(body):
             if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
                 names.append(node.name)
             elif isinstance(node, ast.Assign):
@@ -334,47 +389,56 @@ class Reader:
                         continue
                     source = self._module_at(node.module or "", node.level, module)
                     if isinstance(source, _Module) and source.path not in visiting:
-                        inner = self._bindings(source, visiting | {module.path})
+                        inner = self._names(source, source.tree.body, visiting | {module.path})
                         names.extend(name for name in inner if not name.startswith("_"))
         return list(dict.fromkeys(names))
+
+    def _collected(self, name: str, symbol: _Symbol | None) -> list[tuple[str, _Module, _Function]]:
+        """名前の表の 1 行から pytest が集める試験 モジュールの直下もクラスの本体も同じ決まり
+
+        ``test`` で始まる名前の関数と、``Test`` で始まる名前か ``unittest.TestCase`` を
+        受け継ぐクラスの試験 鍵は上書きを見分けるための名前（入れ子のクラスは点でつなぐ）
+        """
+        if isinstance(symbol, _Func) and name.startswith("test"):
+            return [(name, symbol.module, symbol.node)]
+        if isinstance(symbol, _Class) and (
+            name.startswith("Test") or self._is_unittest(symbol, frozenset())
+        ):
+            return [
+                (f"{name}.{key}", owner, node) for key, owner, node in self._class_tests(symbol)
+            ]
+        return []
 
     def _class_tests(
         self, cls: _Class, seen: frozenset[int] = frozenset()
     ) -> list[tuple[str, _Module, _Function]]:
-        """クラスが持つ試験 受け継いだ物も含める 上書きした名前は子の物だけを数える
+        """クラスが持つ試験 受け継いだ物も含める 本体で結んだ名前は基底の物より勝つ
 
-        ``Test`` で始まる入れ子のクラスも pytest は集めるので辿る ``seen`` は基底を
+        本体の名前はモジュールの直下と同じ ``_names`` と ``_find_in`` で読む
+        基底は前から辿り、先の基底が持つ名前は後の基底の物より勝つ ``seen`` は基底を
         辿る輪で止まらなくならないため
         """
         if id(cls.node) in seen:
             return []
         seen = seen | {id(cls.node)}
         found: list[tuple[str, _Module, _Function]] = []
-        names: set[str] = set()
-        for item in cls.node.body:
-            if isinstance(item, _FUNCTIONS) and item.name.startswith("test"):
-                found.append((item.name, cls.module, item))
-                names.add(item.name)
-            elif isinstance(item, ast.Assign):
-                for target in item.targets:
-                    if isinstance(target, ast.Name) and target.id.startswith("test"):
-                        value = self._expr(cls.module, item.value, frozenset())
-                        if isinstance(value, _Func):
-                            found.append((target.id, value.module, value.node))
-                            names.add(target.id)
-            elif isinstance(item, ast.ClassDef) and item.name.startswith("Test"):
-                inner = self._class_tests(_Class(cls.module, item), seen)
-                found.extend(("", owner, node) for _, owner, node in inner)
+        local = self._names(cls.module, cls.node.body, frozenset())
+        for name in local:
+            found.extend(
+                self._collected(name, self._local(cls.module, cls.node, name, frozenset()))
+            )
+        taken = set(local)
         for base in cls.node.bases:
-            located = self._expr(cls.module, base, frozenset())
+            located = self._expr(cls.module, base, frozenset(), cls.outer)
             if not isinstance(located, _Class):
                 continue
-            for name, owner, node in self._class_tests(located, seen):
-                # 名前の無いのは基底の中の入れ子の Test クラスの試験 pytest は受け継いだ
-                # 入れ子のクラスも集めるので数える
-                if not name or name not in names:
-                    found.append((name, owner, node))
-                    names.add(name)
+            inherited = [
+                item
+                for item in self._class_tests(located, seen)
+                if item[0].split(".")[0] not in taken
+            ]
+            found.extend(inherited)
+            taken.update(key.split(".")[0] for key, _, _ in inherited)
         return found
 
     def _is_unittest(self, cls: _Class, seen: frozenset[int]) -> bool:
@@ -383,7 +447,7 @@ class Reader:
             return False
         seen = seen | {id(cls.node)}
         for base in cls.node.bases:
-            located = self._expr(cls.module, base, frozenset())
+            located = self._expr(cls.module, base, frozenset(), cls.outer)
             if (
                 isinstance(located, _External)
                 and located.name.startswith("unittest.")

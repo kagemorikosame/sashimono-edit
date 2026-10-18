@@ -241,6 +241,61 @@ class TestEveryWayPytestCollects:
                 "class TestReal(Outer):\n    pass\n",
                 [("test_real.py", "test_e")],
             ),
+            # ここから下はクラスの本体 モジュールの直下と同じ形をすべて同じ手順で読む
+            (
+                "class TestReal:\n    if True:\n        def test_f(self):\n"
+                "            assert True\n",
+                [("test_real.py", "test_f")],
+            ),
+            (
+                "class TestReal:\n    def _check(self):\n        assert True\n"
+                "    test_g = _check\n",
+                [("test_real.py", "_check")],
+            ),
+            (
+                "class TestReal:\n    try:\n        def test_h(self):\n            assert True\n"
+                "    except Exception:\n        pass\n",
+                [("test_real.py", "test_h")],
+            ),
+            (
+                "import contextlib\nclass TestReal:\n    with contextlib.suppress(Exception):\n"
+                "        def test_w(self):\n            assert True\n",
+                [("test_real.py", "test_w")],
+            ),
+            (
+                "class TestReal:\n    from tests.shared.checks import test_b\n",
+                [("checks.py", "test_b")],
+            ),
+            (
+                "class TestReal:\n    if True:\n        class TestInner:\n"
+                "            def test_i(self):\n                assert True\n",
+                [("test_real.py", "test_i")],
+            ),
+            (
+                "class TestReal:\n    class Helpers:\n        def check(self):\n"
+                "            assert True\n    test_j = Helpers.check\n",
+                [("test_real.py", "check")],
+            ),
+            (
+                "from tests.shared.checks import Checks\nclass TestReal(Checks):\n"
+                "    if True:\n        def test_a(self):\n"
+                "            # 壊れると作品が開けない\n            assert True\n",
+                [],
+            ),
+            (
+                "class TestReal:\n    class Base:\n        def test_k(self):\n"
+                "            assert True\n    class TestInner(Base):\n        pass\n",
+                [("test_real.py", "test_k")],
+            ),
+            (
+                "def test_l():\n    assert True\nclass TestReal:\n    test_l = test_l\n",
+                [("test_real.py", "test_l")],
+            ),
+            (
+                "class TestReal:\n    def _m(self):\n        assert True\n"
+                "    test_m: object = _m\n",
+                [("test_real.py", "_m")],
+            ),
         ],
         ids=[
             "star-reexport",
@@ -254,6 +309,17 @@ class TestEveryWayPytestCollects:
             "star-into-test-file",
             "class-attribute-function",
             "inherited-nested-class",
+            "class-def-in-if",
+            "class-local-alias",
+            "class-def-in-try",
+            "class-def-in-with",
+            "class-import",
+            "class-nested-in-if",
+            "class-attribute-of-local-class",
+            "class-override-in-if",
+            "nested-base-in-enclosing-class",
+            "class-self-named-alias",
+            "class-annotated-alias",
         ],
     )
     def test_each_way_is_followed(
