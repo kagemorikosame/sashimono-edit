@@ -95,11 +95,45 @@ class TestEnvelope:
 class TestCurves:
     def test_outside_the_range_nothing_changes(self) -> None:
         # 壊れると、要所の前後まで拡大率が動き、強調したい所以外でも絵が揺れる
-        base = AnimatedValue(static=100.0, keyframes=(Keyframe(0, 100.0), Keyframe(100, 200.0)))
+        # 前からの線は 0〜30 でなめらかに上がり、30〜90 は止まり、90〜119 で跳ねて上がる
+        base = AnimatedValue(
+            static=100.0,
+            keyframes=(
+                Keyframe(0, 100.0, Interpolation.EASE_IN_OUT),
+                Keyframe(30, 150.0),
+                Keyframe(90, 150.0, Interpolation.EASE_OUT, curve="back"),
+                Keyframe(119, 200.0),
+            ),
+        )
         curve = scaled_curve(base, envelope("zoom", 40, 60, 5, "smooth"), 1.2)
-        for frame in [*range(0, 41), *range(60, 101)]:
+        for frame in [*range(0, 41), *range(60, 120)]:
             assert curve.at(frame) == pytest.approx(base.at(frame)), frame
-        assert curve.at(50) == pytest.approx(base.at(50) * 1.2)
+        assert curve.at(50) == pytest.approx(150.0 * 1.2)
+
+    @pytest.mark.parametrize(
+        "keyframes",
+        [
+            # 直線で上がり続ける
+            (Keyframe(0, 100.0), Keyframe(100, 200.0)),
+            # ベジェで曲がりながら上がる
+            (
+                Keyframe(0, 100.0, Interpolation.BEZIER, control_points=(0.2, 0.0, 0.3, 1.0)),
+                Keyframe(100, 200.0),
+            ),
+            # 名前付きの曲線（行き過ぎて戻る）
+            (Keyframe(0, 100.0, Interpolation.EASE_OUT, curve="back"), Keyframe(100, 200.0)),
+            # 範囲の終わりで瞬間移動する
+            (Keyframe(0, 100.0, Interpolation.HOLD), Keyframe(60, 200.0)),
+        ],
+    )
+    def test_a_moving_line_inside_the_range_is_refused(
+        self, keyframes: tuple[Keyframe, ...]
+    ) -> None:
+        # 壊れると、範囲の中で前から動いていた線（イージングやベジェ）が点の所の値で
+        # 近づけた形に変わり、人が付けた動きの曲がり方や飛ぶ所が黙って崩れる
+        base = AnimatedValue(static=100.0, keyframes=keyframes)
+        with pytest.raises(EmphasisError, match="前からの動き"):
+            scaled_curve(base, envelope("zoom", 40, 60, 5, "smooth"), 1.2)
 
     def test_a_still_value_rises_to_the_ratio(self) -> None:
         # 壊れると、動いていない拡大率に寄る動きが付かないか、寄る量が頼んだ値と違う

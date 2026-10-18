@@ -32,6 +32,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     GeneratedSource,
+    Interpolation,
     Keyframe,
     MediaItem,
     Project,
@@ -192,26 +193,59 @@ class TestZoom:
         assert result["end_frame"] == work.square.timeline_end
 
     def test_existing_animation_outside_is_kept(self, work: _Work) -> None:
-        # 壊れると、人が付けたゆっくりした拡大が、強調の範囲の外まで崩れる
-        animated = AnimatedValue(static=100.0, keyframes=(Keyframe(0, 100.0), Keyframe(119, 200.0)))
+        # 壊れると、人が付けたなめらかな拡大と跳ねる拡大が、強調の範囲の外まで崩れる
+        # 前からの線は 0〜20 でなめらかに上がり、20〜100 で止まり、100〜119 で跳ねる
+        animated = AnimatedValue(
+            static=100.0,
+            keyframes=(
+                Keyframe(0, 100.0, Interpolation.EASE_IN_OUT),
+                Keyframe(20, 150.0),
+                Keyframe(100, 150.0, Interpolation.EASE_OUT, curve="back"),
+                Keyframe(119, 200.0),
+            ),
+        )
+        host = self._animated(work, animated)
+        _run(host, clip_id="animated", kind="zoom", start_frame=430, end_frame=460)
+        scale = self._scale_of(host)
+        for frame in [*range(0, 31), *range(60, 120)]:
+            assert scale.at(frame) == pytest.approx(animated.at(frame)), frame
+        assert scale.at(45) == pytest.approx(150.0 * 1.2)
+
+    def test_a_moving_line_inside_the_range_is_refused(self, work: _Work) -> None:
+        # 壊れると、範囲の中で前から動いていた拡大（なめらかに上がる途中）が、点の所の値で
+        # 近づけた形に変わり、人が付けた動きが黙って崩れる 断って何も変えない
+        animated = AnimatedValue(
+            static=100.0,
+            keyframes=(Keyframe(0, 100.0, Interpolation.EASE_IN_OUT), Keyframe(119, 200.0)),
+        )
+        host = self._animated(work, animated)
+        before = host.document.project
+        with pytest.raises(ToolError, match="前からの動き"):
+            _run(host, clip_id="animated", kind="zoom", start_frame=430, end_frame=460)
+        assert host.document.project == before
+
+    @staticmethod
+    def _animated(work: _Work, scale: AnimatedValue) -> FakeHost:
+        """拡大率に ``scale`` の動きを持つ図形（400 フレーム目から）を足した作品"""
         transform = fixed_transform(work.square)
         assert transform is not None
         changed = replace(
             work.square,
             id=ClipId("animated"),
             timeline_start=400,
-            effects=(transform.with_param("scale", animated),),
+            effects=(transform.with_param("scale", scale),),
         )
-        host = FakeHost(AddClip(work.video.id, changed).apply(work.project))
-        _run(host, clip_id="animated", kind="zoom", start_frame=430, end_frame=460)
+        return FakeHost(AddClip(work.video.id, changed).apply(work.project))
+
+    @staticmethod
+    def _scale_of(host: FakeHost) -> AnimatedValue:
         located = host.document.project.timeline.locate_clip(ClipId("animated"))
         assert located is not None
         effect = fixed_transform(located[1])
         assert effect is not None
         scale = effect.params["scale"]
         assert isinstance(scale, AnimatedValue)
-        for frame in [*range(0, 31), *range(60, 120)]:
-            assert scale.at(frame) == pytest.approx(animated.at(frame)), frame
+        return scale
 
 
 class TestOtherKinds:

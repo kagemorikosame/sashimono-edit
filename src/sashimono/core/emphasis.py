@@ -15,6 +15,7 @@ Y は上が正（配置の ``pos_y`` と同じ） パンの「上」は ``pos_y`
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -279,6 +280,28 @@ def _as_curve(value: object, default: float) -> AnimatedValue:
     return AnimatedValue(static=default)
 
 
+def _moving_inside(base: AnimatedValue, shape: Envelope) -> int | None:
+    """範囲の中（頭と終わりを含む）で、前からの線が頭の値から変わる最初のフレーム
+
+    変わらなければ ``None``
+
+    強調の点は前からの線の値に強さを掛けた（足した）値で置く 前からの線が範囲の中で
+    動いていると、点と点の間は強調の曲線だけで結ばれ、元の動き（イージングやベジェの曲がり方、
+    瞬間移動の飛び）が点の所の値でしか残らない 拡大率は掛け算なので、どんな出方でも
+    1 本の曲線では正確に表せない 近づけて形を変えるより、断って理由を返す
+    前からの線が範囲で止まっていれば、範囲の頭と終わりで切る点（:meth:`AnimatedValue.with_keyframe_at`）
+    は止まった区間か線の端の外を切るだけなので、範囲の外の形も正確に残る
+    残す動き（``keep``）は頭より後ろに点が無いことを先に確かめてあり、後ろはいつも止まっている
+    """
+    if shape.keep:
+        return None
+    level = base.at(shape.start)
+    for frame in range(shape.start, shape.end + 1):
+        if not math.isclose(base.at(frame), level, rel_tol=1e-9, abs_tol=1e-9):
+            return frame
+    return None
+
+
 def shaped(
     base: AnimatedValue,
     shape: Envelope,
@@ -289,6 +312,8 @@ def shaped(
     範囲の外は形を変えない 範囲の頭と終わりに形を変えない点を足してから、中の点を置く
     範囲の中に人が打った点があれば断る 中の点を消すと人が付けた動きが消え、残すと
     強調の形と混ざってどちらの動きでもなくなる
+
+    範囲の中で前からの線が動いていても断る（:func:`_moving_inside`）
     """
     if shape.keep:
         # 残す動きは範囲の終わりがクリップの終わり 後ろに点があれば、動き切った後に
@@ -300,6 +325,14 @@ def shaped(
         raise EmphasisError(
             f"範囲の中にキーフレームがあります（クリップの頭から {inside[0]} フレーム目など）"
             " 範囲をずらすか、その点を消してから呼んでください"
+        )
+    moving = _moving_inside(base, shape)
+    if moving is not None:
+        raise EmphasisError(
+            f"範囲の中で前からの動きが続いています（クリップの頭から {moving} フレーム目で"
+            f" {base.at(shape.start):g} から {base.at(moving):g} へ変わる）"
+            " 強調の動きを重ねると元の動きの形を保てないので、動いていない所を範囲に選ぶか、"
+            "前からの点を動かしてから付けてください"
         )
     cut = base.with_keyframe_at(shape.start)
     if not shape.keep:
