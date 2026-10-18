@@ -17,6 +17,7 @@ SAME_THINGS = {
     "テンプレートの棚の名前": "template-shelf entries",
     "テンプレートの棚のフォルダの名前": "folder names of the template shelf",
     "やり直し": "redo",
+    "編集の方針": "editing style guide",
 }
 
 

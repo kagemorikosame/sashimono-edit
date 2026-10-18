@@ -29,12 +29,15 @@ from PySide6.QtWidgets import (
 
 from sashimono.core.model import StyleGuide
 from sashimono.effects import registry
+from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["StyleGuideDialog", "StyleGuideRow", "effect_choices", "guide_summary"]
 
-#: 文の欄の高さ（行） 3 つの文の欄と 2 つの一覧を縦に並べても、1280x720 の画面に収まる高さ
-_TEXT_LINES = 3
+#: 文の欄の高さ（行） 5 つの欄と効果の一覧を縦に並べても、1280x720 の画面（中身 640）に収まる高さ
+#: 2026-10-18 に Windows で測って窓の高さは 568 3 行にすると欄 5 つで 80 ほど増えて 640 を越える
+#: 長く書いた欄は欄の中で巻物にして読む
+_TEXT_LINES = 2
 
 
 def effect_choices() -> list[tuple[str, str]]:
@@ -100,6 +103,8 @@ class StyleGuideDialog(QDialog):
 
         self._fonts = _text_box("\n".join(guide.fonts), "1 行に 1 つ 例: 源ノ角ゴシック", self)
         self._font_pick = QFontComboBox(self)
+        # 書体の名前の長さで窓の最小の幅が決まると、狭い画面で窓が画面からはみ出す
+        narrow_combo(self._font_pick, 16)
         add_font = QPushButton("書体を足す", self)
         add_font.clicked.connect(self._add_font)
         font_row = QHBoxLayout()

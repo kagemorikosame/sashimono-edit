@@ -143,6 +143,19 @@ class TestDialog:
         assert row.guide == GUIDE
         row.deleteLater()
 
+    def test_the_dialog_fits_a_small_screen(self, qt_application: QApplication) -> None:
+        """高すぎると、1280x720 のノート PC（中身 640）で OK のボタンが画面の外に出る
+
+        効果の一覧は本物（100 を超える） 一覧は欄の中で巻物にするので高さは変わらない
+        """
+        del qt_application
+        dialog = StyleGuideDialog(GUIDE)
+        try:
+            assert dialog.sizeHint().height() <= 640
+            assert dialog.minimumSizeHint().width() <= 1280
+        finally:
+            dialog.deleteLater()
+
     def test_the_summary_says_what_is_decided(self) -> None:
         """要約が中身を言わないと、窓を開くまで方針があるかどうか分からない"""
         assert "決めていない" in guide_summary(StyleGuide())
