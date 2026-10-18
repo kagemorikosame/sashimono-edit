@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import io
 import sys
 import tokenize
@@ -204,7 +205,21 @@ class _External:
     name: str
 
 
-type _Symbol = _Module | _Class | _Func | _External
+@dataclass(frozen=True, slots=True)
+class _Unknown:
+    """読むだけでは何か決まらない物（呼び出しの結果・見つからない名前など）
+
+    捨てずに候補として残す 捨てると「ほかに何も無い」と読み違え、残った候補だけで
+    ``__test__`` を偽と決めたり ``unittest`` の型でないと決めたりして、数を減らす側に倒れる
+    （#377 で CodeRabbit が ``Base = object`` の枝を落とす所を指摘した）
+    """
+
+
+#: 組み込みの名前（``object``・``Exception`` など） ファイルの中に無くても解けずに
+#: 終わらせず、外の物として持つ ``unittest`` の型でないと分かっているので、数え過ぎない
+_BUILTINS = frozenset(dir(builtins))
+
+type _Symbol = _Module | _Class | _Func | _External | _Unknown
 
 #: 辿っている途中のファイルと名前の組 互いを読み込む輪で止まらなくならないため
 type _Visiting = frozenset[tuple[Path, str]]
@@ -450,7 +465,8 @@ class Reader:
             return ()
         found = self.lookup(source, name, visiting)
         submodule = _one(self._submodule(source, name))
-        return found.symbols if found.definite else found.symbols + submodule
+        symbols = found.symbols if found.definite else found.symbols + submodule
+        return symbols or (_Unknown(),)
 
     def _expr(
         self,
@@ -465,14 +481,31 @@ class Reader:
         結ばれていなければモジュールの直下の物も足す（Python の名前の決まりと同じ）
         """
         if isinstance(expr, ast.Name):
-            if owner is not None:
-                local = self._local(module, owner, expr.id, visiting)
-                if local.definite:
-                    return local.symbols
-                return local.symbols + self.lookup(module, expr.id, visiting).symbols
-            return self.lookup(module, expr.id, visiting).symbols
-        if not isinstance(expr, ast.Attribute):
-            return ()
+            found = self._name(module, expr.id, visiting, owner)
+        elif isinstance(expr, ast.Attribute):
+            found = self._attribute_of(module, expr, visiting, owner)
+        else:
+            found = ()
+        # 何も指さないことは無い 解けなかった物は分からない物として残す
+        return found or (_Unknown(),)
+
+    def _name(
+        self, module: _Module, name: str, visiting: _Visiting, owner: ast.ClassDef | None
+    ) -> tuple[_Symbol, ...]:
+        if owner is not None:
+            local = self._local(module, owner, name, visiting)
+            if local.definite:
+                return local.symbols
+            symbols = local.symbols + self.lookup(module, name, visiting).symbols
+        else:
+            symbols = self.lookup(module, name, visiting).symbols
+        if not symbols and name in _BUILTINS:
+            return (_External(f"builtins.{name}"),)
+        return symbols
+
+    def _attribute_of(
+        self, module: _Module, expr: ast.Attribute, visiting: _Visiting, owner: ast.ClassDef | None
+    ) -> tuple[_Symbol, ...]:
         found: list[_Symbol] = []
         for base in self._expr(module, expr.value, visiting, owner):
             if isinstance(base, _External):
@@ -484,6 +517,8 @@ class Reader:
                     found.extend(_one(self._submodule(base, expr.attr)))
             elif isinstance(base, _Class):
                 found.extend(self._attribute(base, expr.attr, visiting, frozenset()))
+            else:
+                found.append(_Unknown())
         return tuple(dict.fromkeys(found))
 
     def _attribute(
@@ -579,6 +614,14 @@ class Reader:
                     for alias in node.names
                     if alias.name != "*"
                 )
+        # del で消した名前は、基底の物が見えるようになるので上書きとは言えない ブロックの
+        # 中の del も、走るかどうかが決まらないので同じ扱い
+        for node, _ in _statements(body):
+            if isinstance(node, ast.Delete):
+                for target in node.targets:
+                    names.difference_update(
+                        name.id for name in ast.walk(target) if isinstance(name, ast.Name)
+                    )
         return names
 
     def _collected(
@@ -661,10 +704,13 @@ class Reader:
             flag = _test_flag(cls.node.body)
             return True if flag is None else flag
         for base in cls.node.bases:
+            # 中を読めない候補（外の物・分からない物）は __test__ を書いていない物として
+            # 数に入れる 外すと、残った候補の偽だけでクラスごと外してしまう
             flags = [
                 self._class_flag(located, seen | {id(cls.node)})
-                for located in self._expr(cls.module, base, frozenset(), cls.outer)
                 if isinstance(located, _Class)
+                else None
+                for located in self._expr(cls.module, base, frozenset(), cls.outer)
             ]
             defined = [flag for flag in flags if flag is not None]
             if not defined:
@@ -674,17 +720,21 @@ class Reader:
         return None
 
     def _is_unittest(self, cls: _Class, seen: frozenset[int]) -> bool:
-        """``unittest.TestCase`` を受け継ぎうるか pytest は名前に関係なく集める"""
+        """``unittest.TestCase`` を受け継ぎうるか pytest は名前に関係なく集める
+
+        外の物は中を読めない ``unittest`` の型そのものでなくても、それを受け継ぐ外の型
+        （``django.test.TestCase`` など）かもしれないので、組み込みの型でなければ受け継ぎうると
+        見る 分からない物（呼び出しで作る基底など）も同じ 数え過ぎるのは、名前が ``Test`` で
+        始まらず ``test_*`` を持つクラスだけ
+        """
         if id(cls.node) in seen:
             return False
         seen = seen | {id(cls.node)}
         for base in cls.node.bases:
             for located in self._expr(cls.module, base, frozenset(), cls.outer):
-                if (
-                    isinstance(located, _External)
-                    and located.name.startswith("unittest.")
-                    and located.name.endswith("TestCase")
-                ):
+                if isinstance(located, _Unknown):
+                    return True
+                if isinstance(located, _External) and not located.name.startswith("builtins."):
                     return True
                 if isinstance(located, _Class) and self._is_unittest(located, seen):
                     return True

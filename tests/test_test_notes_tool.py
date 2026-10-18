@@ -376,6 +376,93 @@ class TestEveryWayPytestCollects:
         assert names(tool, tmp_path, source) == ["test_a"]
 
     @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            # 指摘の形 except の枝の object を落とすと、Off の偽だけでクラスごと外す
+            (
+                "class Off:\n    __test__ = False\n"
+                "try:\n    Base = Off\nexcept Exception:\n    Base = object\n"
+                "class TestX(Base):\n    def test_x(self):\n        assert True\n",
+                ["test_x"],
+            ),
+            (
+                "class Off:\n    __test__ = False\n"
+                "if flag:\n    Base = Off\nelse:\n    Base = make_base()\n"
+                "class TestX(Base):\n    def test_x(self):\n        assert True\n",
+                ["test_x"],
+            ),
+            (
+                "from somewhere import Base\n"
+                "class TestX(Base):\n    def test_x(self):\n        assert True\n",
+                ["test_x"],
+            ),
+            (
+                "class Off:\n    __test__ = False\n"
+                "class TestX(Off):\n    def test_x(self):\n        assert True\n",
+                [],
+            ),
+        ],
+        ids=["try-object", "if-call", "outside-base", "plain-off"],
+    )
+    def test_a_base_that_cannot_be_read_keeps_the_class(
+        self, tool: ModuleType, tmp_path: Path, source: str, expected: list[str]
+    ) -> None:
+        # 中を読めない基底（object・呼び出しの結果・外の物）を候補から落とすと、残った
+        # 候補の __test__ = False だけでクラスを外し、pytest が集める試験を見逃す
+        assert names(tool, tmp_path, source) == expected
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "from somelib import BaseCase\nclass Checks(BaseCase):\n"
+                "    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+            (
+                "class Checks(make_base()):\n    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+            (
+                "from tests_missing_module import Nothing\nclass Checks(Nothing):\n"
+                "    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+            (
+                "class Helper(Exception):\n    def test_a(self):\n        assert True\n",
+                [],
+            ),
+        ],
+        ids=["outside-base", "call-base", "missing-name", "builtin-base"],
+    )
+    def test_a_class_that_may_be_a_unittest_case_is_counted(
+        self, tool: ModuleType, tmp_path: Path, source: str, expected: list[str]
+    ) -> None:
+        # 外の型（django.test.TestCase など）は unittest.TestCase を受け継いでいるかもしれない
+        # 中を読めない基底を「unittest でない」と決めると、pytest が集める試験を見逃す
+        # 組み込みの型（Exception など）は unittest でないと分かっているので数えない
+        assert names(tool, tmp_path, source) == expected
+
+    def test_a_deleted_override_brings_the_base_test_back(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # 子が del で消した名前を上書きと見なすと、del の後に見える基底の試験を見逃す
+        package = tmp_path / "tests" / "shared"
+        package.mkdir(parents=True)
+        (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "checks.py").write_text(SHARED_CHECKS, encoding="utf-8")
+        path = tmp_path / "tests" / "test_real.py"
+        path.write_text(
+            "from tests.shared.checks import Checks\nclass TestReal(Checks):\n"
+            "    def test_a(self):\n        # 壊れると作品が開けない\n        assert True\n"
+            "    del test_a\n",
+            encoding="utf-8",
+        )
+        found = tool.scan(path, tool.Reader(tmp_path))
+        assert [(item.path.name, item.name) for item in found] == [("checks.py", "test_a")]
+
+    @pytest.mark.parametrize(
         "source",
         [
             "import unittest\nclass Checks(unittest.TestCase):\n    def test_a(self):\n"
