@@ -55,6 +55,7 @@ from sashimono.core.commands import (
     AddClip,
     AddMedia,
     AddScene,
+    Author,
     Command,
     Document,
     InScene,
@@ -1325,7 +1326,7 @@ class MainWindow(QMainWindow):
         続きを進めると、入っていない素材を参照したり「置いた」と出したりする
         """
         try:
-            self._document.execute(self._in_active_scene(command))
+            self._document.execute(self._in_active_scene(command), by=Author.PERSON)
         except (ValueError, KeyError) as exc:
             self.statusBar().showMessage(str(exc), 4000)
             return False
@@ -1346,7 +1347,7 @@ class MainWindow(QMainWindow):
         # 止まる前に覚える
         self._playing_before_edit = self._playback.is_playing
         try:
-            with self._document.checkpoint(label, merge=merge):
+            with self._document.checkpoint(label, merge=merge, by=Author.PERSON):
                 for command in commands:
                     self._document.execute(self._in_active_scene(command))
         except (ValueError, KeyError) as exc:
@@ -1405,7 +1406,7 @@ class MainWindow(QMainWindow):
             return None
         scene = new_scene(self._document.project, name)
         try:
-            self._document.execute(AddScene(scene))
+            self._document.execute(AddScene(scene), by=Author.PERSON)
         except (ValueError, KeyError) as exc:
             self.statusBar().showMessage(str(exc), 4000)
             return None
@@ -1424,7 +1425,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("メインは消せません", 4000)
             return
         try:
-            self._document.execute(RemoveScene(target))
+            self._document.execute(RemoveScene(target), by=Author.PERSON)
         except (ValueError, KeyError) as exc:
             self.statusBar().showMessage(str(exc), 5000)
             return
@@ -1474,10 +1475,12 @@ class MainWindow(QMainWindow):
             self.place_scene(choices[names.index(name)].id)
 
     def undo(self) -> None:
+        """〔元に戻す〕 AI の undo も同じここを通る（#333） 画面を合わせる所を 1 か所にする"""
         self._document.undo()
         self._on_project_changed()
 
     def redo(self) -> None:
+        """〔やり直す〕 AI の redo も同じここを通る（#333）"""
         self._document.redo()
         self._on_project_changed()
 
@@ -1987,7 +1990,7 @@ class MainWindow(QMainWindow):
         if not commands:
             return True
         try:
-            with self._document.checkpoint(label):
+            with self._document.checkpoint(label, by=Author.PERSON):
                 for command in commands:
                     self._document.execute(command)
         except (ValueError, KeyError) as exc:
@@ -2103,7 +2106,7 @@ class MainWindow(QMainWindow):
         if not commands:
             return
         try:
-            with self._document.checkpoint("プロジェクトを動画に合わせる"):
+            with self._document.checkpoint("プロジェクトを動画に合わせる", by=Author.PERSON):
                 for command in commands:
                     self._document.execute(command)
         except (ValueError, KeyError) as exc:
@@ -2623,7 +2626,7 @@ class MainWindow(QMainWindow):
         )
         label = "置き方の方式を切り替えて変換" if dialog.convert else "置き方の方式を切り替え"
         try:
-            with self._document.checkpoint(label):
+            with self._document.checkpoint(label, by=Author.PERSON):
                 for command in commands:
                     self._document.execute(command)
         except (ValueError, KeyError) as exc:
@@ -3155,7 +3158,7 @@ class MainWindow(QMainWindow):
         if not commands:
             return
         try:
-            with self._document.checkpoint(label):
+            with self._document.checkpoint(label, by=Author.AI):
                 for command in commands:
                     self._document.execute(self._in_active_scene(command))
         except (ValueError, KeyError) as exc:

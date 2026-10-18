@@ -57,7 +57,7 @@ from sashimono.core.commands.effects import (
     resolve_param,
 )
 from sashimono.core.commands.group import GroupClips, UngroupClips
-from sashimono.core.commands.history import Document, HistoryEntry
+from sashimono.core.commands.history import Author, Document, HistoryEntry
 from sashimono.core.commands.insert import (
     DEFAULT_GENERATED_FRAMES,
     DEFAULT_STILL_FRAMES,
@@ -132,6 +132,7 @@ __all__ = [
     "AddStroke",
     "AddTrack",
     "AdoptLegacyStroke",
+    "Author",
     "ClearKeyframes",
     "Command",
     "ConvertLayers",
