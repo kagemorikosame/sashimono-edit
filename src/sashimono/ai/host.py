@@ -19,6 +19,7 @@ from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
+from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
@@ -243,6 +244,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.duck_shape`）
 
         どれだけ下げたいか・どれだけ速く戻したいかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def emphasis_style(self) -> EmphasisStyle:
+        """強調の動き（#331）の既定の強さ・動き切る長さ・動き方
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.emphasis_style`）
+
+        どれだけ寄るか・どれだけ速く動くかは人と作品で違う AI が引数で渡さなければこれを使う
         """
         ...
 

@@ -116,6 +116,21 @@ from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, 
 from sashimono.core.commands.insert import new_track, place_media
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.volume import clip_volume, volume_commands
+from sashimono.core.emphasis import (
+    EMPHASIS_EASINGS,
+    EMPHASIS_KINDS,
+    EMPHASIS_PAN_PX_RANGE,
+    EMPHASIS_POP_PERCENT_RANGE,
+    EMPHASIS_RAMP_MS_RANGE,
+    EMPHASIS_SHAKE_PX_RANGE,
+    EMPHASIS_ZOOM_PERCENT_RANGE,
+    PAN,
+    PAN_DIRECTIONS,
+    SHAKE,
+    ZOOM,
+    EmphasisError,
+    can_emphasize,
+)
 from sashimono.core.io.aliases import Alias
 from sashimono.core.io.atomic import Expected, expect_now
 from sashimono.core.io.presets import Preset
@@ -166,6 +181,7 @@ from sashimono.core.timebase import (
     seconds_to_frame,
 )
 from sashimono.effects import registry
+from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
     MAX_GRADIENT_STOPS,
@@ -2702,6 +2718,159 @@ def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"name": path.name, "frame": frame, "value": value}
 
 
+def _emphasis_target(host: EditorHost, arguments: dict[str, Any]) -> tuple[Track, Clip]:
+    """動きを付けるクリップ 絵を描かないクリップとロックしたトラックのクリップを断る
+
+    決まりは右クリックの〔強調の動きを付ける…〕と同じ（:func:`can_emphasize`） 断る文を
+    分けるのは、AI がロックを解けば済むのか別のクリップを指すのかを選べるようにするため
+    """
+    track, clip = _target_clip(host, arguments)
+    if track.locked:
+        raise ToolError(
+            f"{clip.id} のトラック {track.name} はロックされています"
+            " 変えるなら set_track_state でロックを解いてから"
+        )
+    if not can_emphasize(_project(host), track, clip):
+        raise ToolError(
+            f"{clip.id} は絵を描かないクリップです（音・場面切り替え・フィルタ）"
+            " 動画・画像・テキスト・図形のクリップを指してください"
+        )
+    return track, clip
+
+
+def _emphasis_range(
+    host: EditorHost, arguments: dict[str, Any], clip: Clip, *, keep: bool
+) -> tuple[int, int]:
+    """範囲（クリップの頭からのフレーム） タイムラインのフレームで受けて、クリップの外は断る
+
+    端へ寄せない 寄せると、AI が狙った言葉の頭とずれた所で動き出し、ずれたことに気付かない
+    """
+    start = _frame_argument(arguments, "start_frame", host.playhead)
+    if keep:
+        if arguments.get("end_frame") is not None:
+            raise ToolError(
+                "keep を入れたら end_frame は渡さないでください（クリップの終わりまで残す）"
+            )
+        end = clip.timeline_end
+    else:
+        if arguments.get("end_frame") is None:
+            raise ToolError("end_frame（動きを終える位置 タイムラインのフレーム）を渡してください")
+        end = _frame_argument(arguments, "end_frame", 0)
+    if not clip.timeline_start <= start < end <= clip.timeline_end:
+        raise ToolError(
+            f"範囲はクリップの中（{clip.timeline_start}〜{clip.timeline_end} フレーム）で、"
+            f"start_frame < end_frame にしてください（{start}〜{end} が来ました）"
+        )
+    if keep and start >= clip.timeline_end - 1:
+        # 最後のフレームから残しても、動き切るフレームがクリップの外になり何も動かない
+        raise ToolError(
+            f"keep の start_frame はクリップの最後のフレーム（{clip.timeline_end - 1}）より前に"
+            "してください"
+        )
+    return start - clip.timeline_start, end - clip.timeline_start
+
+
+def _emphasis_style(host: EditorHost, arguments: dict[str, Any]) -> tuple[int, str]:
+    plain = host.emphasis_style
+    ramp_ms = round(_limit_number(arguments, "ramp_ms", plain.ramp_ms, *EMPHASIS_RAMP_MS_RANGE))
+    easing = arguments.get("easing", plain.easing)
+    if not isinstance(easing, str) or easing not in EMPHASIS_EASINGS:
+        raise ToolError(
+            f"easing は {'・'.join(EMPHASIS_EASINGS)} のどれかです（{easing!r} が来ました）"
+        )
+    return ramp_ms, easing
+
+
+def _pan_offset(host: EditorHost, arguments: dict[str, Any]) -> tuple[float, float]:
+    has_offset = arguments.get("offset_x") is not None or arguments.get("offset_y") is not None
+    direction = arguments.get("direction")
+    if has_offset == (direction is not None):
+        raise ToolError("パンは offset_x・offset_y か direction のどちらか一方を渡してください")
+    if has_offset:
+        offset = (
+            _limit_number(arguments, "offset_x", 0.0, -4000.0, 4000.0),
+            _limit_number(arguments, "offset_y", 0.0, -4000.0, 4000.0),
+        )
+        if offset == (0.0, 0.0):
+            raise ToolError("offset_x と offset_y がどちらも 0 です")
+        return offset
+    if direction not in PAN_DIRECTIONS:
+        raise ToolError(f"direction は {'・'.join(PAN_DIRECTIONS)} のどれかです")
+    distance = _limit_number(
+        arguments, "distance_px", float(host.emphasis_style.pan_px), *EMPHASIS_PAN_PX_RANGE
+    )
+    unit_x, unit_y = PAN_DIRECTIONS[direction]
+    return unit_x * distance, unit_y * distance
+
+
+def _focus(arguments: dict[str, Any]) -> tuple[float, float] | None:
+    """ズームで止めておく点 どちらも省けば ``None``（絵の支点を中心に拡がる）"""
+    if arguments.get("focus_x") is None and arguments.get("focus_y") is None:
+        return None
+    return (
+        _limit_number(arguments, "focus_x", 0.0, -4000.0, 4000.0),
+        _limit_number(arguments, "focus_y", 0.0, -4000.0, 4000.0),
+    )
+
+
+def _emphasize(host: EditorHost, arguments: dict[str, Any]) -> object:
+    kind = arguments.get("kind")
+    if not isinstance(kind, str) or kind not in EMPHASIS_KINDS:
+        raise ToolError(f"kind は {'・'.join(EMPHASIS_KINDS)} のどれかです（{kind!r} が来ました）")
+    _track, clip = _emphasis_target(host, arguments)
+    keep = _flag_argument(arguments, "keep", False)
+    if keep and kind not in (ZOOM, PAN):
+        raise ToolError("戻さずに残せる（keep）のは zoom と pan だけです")
+    start, end = _emphasis_range(host, arguments, clip, keep=keep)
+    ramp_ms, easing = _emphasis_style(host, arguments)
+    style = host.emphasis_style
+    result: dict[str, Any] = {"clip_id": str(clip.id), "kind": kind}
+    request = EmphasisRequest(kind, start, end, ramp_ms=ramp_ms, easing=easing, keep=keep)
+    if kind == SHAKE:
+        amplitude = _limit_number(
+            arguments, "amplitude_px", float(style.shake_px), *EMPHASIS_SHAKE_PX_RANGE
+        )
+        request = replace(request, strength=amplitude)
+        result["amplitude_px"] = amplitude
+    elif kind == PAN:
+        offset = _pan_offset(host, arguments)
+        request = replace(request, offset=offset)
+        result["offset_px"] = {"x": offset[0], "y": offset[1]}
+    else:
+        default, bounds = (
+            (style.zoom_percent, EMPHASIS_ZOOM_PERCENT_RANGE)
+            if kind == ZOOM
+            else (style.pop_percent, EMPHASIS_POP_PERCENT_RANGE)
+        )
+        percent = _limit_number(arguments, "scale_percent", float(default), *bounds)
+        focus = _focus(arguments) if kind == ZOOM else None
+        request = replace(request, strength=percent, focus=focus)
+        result["scale_percent"] = percent
+        if focus is not None:
+            result["focus_px"] = {"x": focus[0], "y": focus[1]}
+    try:
+        commands, shape = emphasis_commands(clip, request, _project(host).rate)
+    except EmphasisError as exc:
+        raise ToolError(str(exc)) from exc
+    host.apply_commands(commands, emphasis_label(kind))
+    offset_frames = clip.timeline_start
+    result.update(
+        {
+            "start_frame": shape.start + offset_frames,
+            "end_frame": (clip.timeline_end if keep else shape.end + offset_frames),
+            "keyframes": [frame + offset_frames for frame, *_rest in shape.points],
+            "ramp_ms": ramp_ms,
+            "easing": easing,
+            "keep": keep,
+            "note": (
+                "配置の値の線（揺れはランダム移動のエフェクトの幅の線）にキーフレームを打ちました"
+                " 人は設定パネルとグラフエディタで点を直せます 取り消し 1 回で元に戻ります"
+            ),
+        }
+    )
+    return result
+
+
 def _set_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
@@ -4241,6 +4410,9 @@ _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: ダッキング（#329） クリップ ID と音量の線の要約に、本人の設定（下げ幅と速さの既定）が載る
 #: 字幕は話している区間の時刻だけを使い、文は返さない 断る文には素材の名前が入りうる
 _DUCKING = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 強調の動き（#331） クリップ ID・フレーム・強さに、本人の設定（強さ・長さ・動き方の既定）が
+#: 載る 断る文に出るのはクリップ ID とトラックの名前（作品の中身）だけ
+_EMPHASIS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
 
@@ -5140,6 +5312,82 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_TEXT,
         hidden=_HIDDEN_IN_VALUES,
         writes=True,
+    ),
+    Operation(
+        name="emphasize",
+        description=(
+            "話の要所を目立たせる動き（強調の動き）を、絵のクリップの範囲に付ける"
+            " zoom は寄って止まり戻る（focus_x・focus_y の点を止めたまま寄る 話者の顔など）"
+            " pan は位置をずらして戻る ポップ（pop）は一瞬ふくらんで戻る 揺れ（shake）は"
+            "細かく揺らす zoom と pan は keep で戻さずクリップの終わりまで残せる"
+            " どれも配置の値（揺れはランダム移動のエフェクトの幅）にキーフレームを打つので、"
+            "人が設定パネルとグラフエディタで直せる 範囲の外の動きは変えない"
+            " 範囲の中に前からのキーフレームがあるか、前からの動きが範囲の中で続いていれば断る"
+            "（元の動きの形を保てないため） 強さ・動き切る長さ・動き方を省くと"
+            "本人の設定（表示 → 設定… の強調の動き）を使う 取り消し 1 回で戻る"
+            " 位置は画素で Y は上が正"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "kind": {
+                    "type": "string",
+                    "enum": list(EMPHASIS_KINDS),
+                    "description": "動きの種類",
+                },
+                "start_frame": _integer(
+                    "動き始める位置（タイムラインのフレーム 省くと再生ヘッド）"
+                ),
+                "end_frame": _integer(
+                    "戻り終える位置（タイムラインのフレーム） keep のときは渡さない"
+                ),
+                "scale_percent": _number(
+                    "zoom と pop の拡大率 今の大きさからの %"
+                    f"（zoom は {EMPHASIS_ZOOM_PERCENT_RANGE[0]}"
+                    f"〜{EMPHASIS_ZOOM_PERCENT_RANGE[1]}、pop は {EMPHASIS_POP_PERCENT_RANGE[0]}"
+                    f"〜{EMPHASIS_POP_PERCENT_RANGE[1]} 省くと本人の設定）"
+                ),
+                "focus_x": _number(
+                    "zoom で止めておく点の X 配置の中心（既定は画面の中央）からの画素"
+                    " 作品の画面の左上から x の所なら x - 幅/2 省くと絵の中心へ寄る"
+                ),
+                "focus_y": _number(
+                    "zoom で止めておく点の Y（上が正） 作品の画面の左上から y の所なら 高さ/2 - y"
+                ),
+                "offset_x": _number("pan でずらす X の画素（右が正） direction とどちらか"),
+                "offset_y": _number("pan でずらす Y の画素（上が正）"),
+                "direction": {
+                    "type": "string",
+                    "enum": list(PAN_DIRECTIONS),
+                    "description": "pan の向き offset_x・offset_y とどちらか",
+                },
+                "distance_px": _number(
+                    f"direction のときにずらす画素（{EMPHASIS_PAN_PX_RANGE[0]}"
+                    f"〜{EMPHASIS_PAN_PX_RANGE[1]} 省くと本人の設定）"
+                ),
+                "amplitude_px": _number(
+                    f"shake の幅 上下左右それぞれの画素（{EMPHASIS_SHAKE_PX_RANGE[0]}"
+                    f"〜{EMPHASIS_SHAKE_PX_RANGE[1]} 省くと本人の設定）"
+                ),
+                "ramp_ms": _number(
+                    f"動き始めてから動き切るまで（と戻るまで）のミリ秒（{EMPHASIS_RAMP_MS_RANGE[0]}"
+                    f"〜{EMPHASIS_RAMP_MS_RANGE[1]} 0 は 1 フレームで切り替える 省くと本人の設定）"
+                ),
+                "easing": {
+                    "type": "string",
+                    "enum": list(EMPHASIS_EASINGS),
+                    "description": (
+                        "動き方 smooth はなめらかに動き出して止まる back・elastic・bounce は"
+                        "着いた所で跳ねる（省くと本人の設定）"
+                    ),
+                },
+                "keep": _boolean("zoom と pan を戻さずクリップの終わりまで残す（既定 false）"),
+            },
+            ["kind"],
+        ),
+        handler=_emphasize,
+        writes=True,
+        sends=_EMPHASIS,
     ),
     Operation(
         name="set_subtitle_text",

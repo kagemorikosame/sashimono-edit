@@ -328,6 +328,8 @@ LEDGER: tuple[Entry, ...] = (
     # core/mixing.py の同じ計算を通る
     same("タイムラインの右クリック/BGM を声に合わせて下げる…", "duck_audio"),
     same("タイムラインの右クリック/音量を基準にそろえる…", "normalize_loudness"),
+    # 強調の動き（#331） 2026-10-18 利用者の決定で右クリックに足した AI と同じ所を通す
+    same("タイムラインの右クリック/強調の動きを付ける…", "emphasize"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),

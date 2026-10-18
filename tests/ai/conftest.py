@@ -22,6 +22,7 @@ from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
+from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.serialize import save_project
@@ -90,6 +91,8 @@ class FakeHost:
         self.loudness = -14.0
         #: ダッキング（#329）の本人の設定 既定は設定と同じ
         self.duck = DuckShape()
+        #: 強調の動き（#331）の本人の設定 既定は設定と同じ
+        self.emphasis = EmphasisStyle()
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -239,6 +242,10 @@ class FakeHost:
     @property
     def duck_shape(self) -> DuckShape:
         return self.duck
+
+    @property
+    def emphasis_style(self) -> EmphasisStyle:
+        return self.emphasis
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

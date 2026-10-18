@@ -92,6 +92,9 @@ _PROMPT = """\
   contact_sheet の frames へそのまま渡すと、場面の頭が 1 枚に並びます
 - 目次（チャプター）は、話の区切りに名前の付いた目印（マーカー）を add_markers で置き、
   get_chapters で作ります warnings があれば、そのまま渡さずユーザーに伝えてください
+- 話の要所を目立たせる動き（寄る・ずらす・一瞬ふくらむ・揺らす）は、add_keyframe を
+  何度も打たずに emphasize で付け、preview_range で動きを確かめてください 話者へ
+  寄るときは、顔の位置を preview_frame で見てから focus_x・focus_y に渡します
 {linked_clips}
 - 置き方の方式は get_project の layer_mode で分かります 途中で変わっていたら、
   そちらに従ってください

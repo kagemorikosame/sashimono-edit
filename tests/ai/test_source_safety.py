@@ -82,6 +82,8 @@ UNDOABLE_TOOLS = frozenset(
         "set_stroke_enabled",
         "set_param",
         "add_keyframe",
+        # 強調の動き（#331） 配置の値の線とランダム移動の幅の線だけを変える
+        "emphasize",
         # 字幕
         "set_subtitle_text",
         "replace_subtitle_text",

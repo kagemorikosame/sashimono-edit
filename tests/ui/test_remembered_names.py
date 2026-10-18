@@ -47,7 +47,15 @@ TEXT_SOURCES = {
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
 #: テンプレートの棚（#328）も本人の置き場の物 名前はアプリの設定として送り、フォルダの名前は
 #: 名前と場所（一覧の folder の項目で伏せる） ファイルの場所は道具から返さない
-OWN_LIBRARY = {"saved_looks", "look_rules", "loudness_target", "duck_shape", "template_shelf"}
+#: 強調の動きの強さと長さの既定（#331）も本人の設定
+OWN_LIBRARY = {
+    "saved_looks",
+    "look_rules",
+    "loudness_target",
+    "duck_shape",
+    "emphasis_style",
+    "template_shelf",
+}
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
     "document",
@@ -212,6 +220,8 @@ class TestEveryTextSourceGoesThroughThePort:
             "place_alias",
             "place_template",
             "apply_template",
+            # 強調の動き（#331） 結果に本人の設定の強さ・長さ・動き方の既定が載る
+            "emphasize",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name
