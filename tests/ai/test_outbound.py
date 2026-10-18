@@ -301,6 +301,8 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "place_sound": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
+    # 取り消した後でなければ、やり直す物が無いと断る 断る文にも名前は入らない（#333）
+    "redo": lambda _ids: {},
     # 目印（#330） 前からある目印（0 フレーム 名前は本文）を動かす・消す
     "add_markers": lambda _ids: {"markers": [{"frame": 45, "label": ARG_TEXT}]},
     "update_marker": lambda _ids: {"frame": 0, "label": ARG_TEXT},

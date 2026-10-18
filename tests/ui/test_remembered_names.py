@@ -69,6 +69,9 @@ PROJECT_SIDE = {
     "selected_clips",
     "select_clips",
     "apply_commands",
+    # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
+    "undo",
+    "redo",
     "stop_playback",
     "render_png",
     # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く

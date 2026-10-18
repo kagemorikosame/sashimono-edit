@@ -193,6 +193,8 @@ class TestAppSettingsAreReadOnly:
             "export_status",
             "export_waiter",
             "probe",
+            # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
+            "redo",
             # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
             "remembered_names",
             "render_png",
@@ -212,6 +214,7 @@ class TestAppSettingsAreReadOnly:
             "start_transcription",
             "stop_playback",
             "transcription_status",
+            "undo",
             "waveform",
             "write_project",
             "write_snapshot",
