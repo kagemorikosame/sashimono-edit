@@ -2749,6 +2749,12 @@ def _emphasis_range(
             f"範囲はクリップの中（{clip.timeline_start}〜{clip.timeline_end} フレーム）で、"
             f"start_frame < end_frame にしてください（{start}〜{end} が来ました）"
         )
+    if keep and start >= clip.timeline_end - 1:
+        # 最後のフレームから残しても、動き切るフレームがクリップの外になり何も動かない
+        raise ToolError(
+            f"keep の start_frame はクリップの最後のフレーム（{clip.timeline_end - 1}）より前に"
+            "してください"
+        )
     return start - clip.timeline_start, end - clip.timeline_start
 
 

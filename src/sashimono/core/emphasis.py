@@ -231,11 +231,14 @@ def envelope(
         raise EmphasisError("戻さずに残せる（keep）のはズームとパンだけです")
     interpolation, curve = easing_point(easing)
     if keep:
-        # 1 フレームあれば動き切れる 範囲の終わりはクリップの終わりなので見ない
+        # 範囲の終わり（クリップの終わり 含まない）を渡されたら、見えている最後のフレームまでに
+        # 動き切る 越えて点を置くと、見えている所では頼んだ量まで寄らず、後でクリップを
+        # 伸ばすとそこで寄り切る 終わりを渡さない（start 以下）ときは動き切る長さのまま
+        reach = max(1, min(ramp, end - 1 - start)) if end > start else ramp
         return Envelope(
             (
                 (start, 0.0, interpolation, curve),
-                (start + ramp, 1.0, Interpolation.LINEAR, ""),
+                (start + reach, 1.0, Interpolation.LINEAR, ""),
             ),
             keep=True,
         )

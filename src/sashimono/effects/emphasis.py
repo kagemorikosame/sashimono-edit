@@ -114,6 +114,32 @@ def _within_spec(curves: dict[str, AnimatedValue]) -> None:
                 )
 
 
+#: ランダム移動の幅の欄 どれかが 0 でなければ揺れている（Z は奥行きで大きさが揺れる）
+_SHAKE_RANGES = ("range_x", "range_y", "range_z")
+
+
+def _shaking_inside(clip: Clip, shape: Envelope) -> int | None:
+    """範囲の中（頭と終わりを含む）で、有効なランダム移動が揺れている最初のフレーム
+
+    無ければ ``None``
+
+    ランダム移動は掛けた順に重なるので、揺れの上に揺れを足すと二重に掛かる 拡大率や位置で
+    範囲の中の前からの動きを断る（:func:`sashimono.core.emphasis.shaped`）のと同じく断る
+    """
+    for effect in clip.effects:
+        if not effect.enabled or effect.kind != SHAKE_EFFECT_KIND:
+            continue
+        for name in _SHAKE_RANGES:
+            value = effect.params.get(name)
+            if isinstance(value, AnimatedValue):
+                for frame in range(shape.start, shape.end + 1):
+                    if value.at(frame) != 0.0:
+                        return frame
+            elif isinstance(value, int | float) and not isinstance(value, bool) and value != 0:
+                return shape.start
+    return None
+
+
 def _shake_command(clip: Clip, shape: Envelope, amplitude: float, start: int) -> Command:
     """揺れ 範囲の外では幅 0 のランダム移動を足す命令
 
@@ -123,6 +149,14 @@ def _shake_command(clip: Clip, shape: Envelope, amplitude: float, start: int) ->
     definition = registry.get(SHAKE_EFFECT_KIND)
     if definition is None:
         raise EmphasisError(f"揺れに使うエフェクト（{SHAKE_EFFECT_KIND}）が見つかりません")
+    shaking = _shaking_inside(clip, shape)
+    if shaking is not None:
+        raise EmphasisError(
+            "範囲の中で前からのランダム移動が揺れています"
+            f"（クリップの頭から {shaking} フレーム目など）"
+            " 揺れを重ねると前からの揺れの幅と軌跡が変わるので、揺れていない所を範囲に選ぶか、"
+            "そのランダム移動を消すか幅を直してから付けてください"
+        )
     curve = shake_curve(shape, amplitude)
     effect = definition.create(seed=start % 10000)
     effect = effect.with_param("range_x", curve).with_param("range_y", curve)

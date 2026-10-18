@@ -73,6 +73,15 @@ class TestEnvelope:
         with pytest.raises(EmphasisError):
             envelope("shake", 0, 0, 5, "smooth", keep=True)
 
+    def test_keep_reaches_its_peak_inside_the_clip(self) -> None:
+        # 壊れると、クリップの終わりの近くから残す寄りを付けたとき、動き切る点がクリップの外に
+        # 置かれ、見えている所では頼んだ量まで寄らない（後でクリップを伸ばすとそこで寄り切る）
+        # 範囲の終わり（クリップの終わり 含まない）の 1 つ前が見えている最後のフレーム
+        shape = envelope("zoom", 50, 60, 20, "smooth", keep=True)
+        assert shape.points[-1][0] == 59
+        # 範囲の終わりを渡さないとき（0）は動き切る長さのまま
+        assert envelope("zoom", 50, 0, 20, "smooth", keep=True).points[-1][0] == 70
+
     def test_unknown_names_are_refused(self) -> None:
         # 壊れると、綴りを間違えた動き方が黙って直線になり、頼んだ動きにならない
         with pytest.raises(EmphasisError):

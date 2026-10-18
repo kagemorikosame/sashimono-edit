@@ -19,7 +19,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, SetTrackState
+from sashimono.core.commands import AddClip, AddEffect, SetTrackState
 from sashimono.core.commands.fixed import (
     TRANSFORM_EFFECT_KIND,
     VOLUME_EFFECT_KIND,
@@ -40,6 +40,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
+from sashimono.effects import registry
 from tests.ai.conftest import RATE_30, FakeHost
 
 
@@ -191,6 +192,49 @@ class TestZoom:
         scale = work.transform(work.square.id)["scale"]
         assert scale.at(119) == pytest.approx(120.0)
         assert result["end_frame"] == work.square.timeline_end
+
+    def test_keep_near_the_end_peaks_inside_the_clip(self, work: _Work) -> None:
+        # 壊れると、クリップの終わりの近くから残す寄りが、見えている所では頼んだ量まで届かず、
+        # 結果の keyframes にクリップの外のフレームが入って AI が動き切ったと読み違える
+        result = _run(
+            work.host, clip_id=str(work.square.id), kind="zoom", start_frame=145, keep=True
+        )
+        last = work.square.timeline_end - 1
+        assert max(result["keyframes"]) <= last
+        scale = work.transform(work.square.id)["scale"]
+        assert scale.at(last - work.square.timeline_start) == pytest.approx(120.0)
+        # 最後のフレームから残す寄りは、動く所が無いので断る
+        with pytest.raises(ToolError):
+            _run(
+                work.host,
+                clip_id=str(work.square.id),
+                kind="pan",
+                start_frame=last,
+                direction="up",
+                keep=True,
+            )
+
+    def test_a_second_shake_over_an_active_one_is_refused(self, work: _Work) -> None:
+        # 壊れると、揺れているところへもう 1 つランダム移動が足され、揺れが二重に掛かって
+        # 前からの揺れの幅と軌跡が変わる（拡大率や位置と同じく、範囲の中の前からの動きは断る）
+        _run(work.host, clip_id=str(work.square.id), kind="shake", start_frame=40, end_frame=70)
+        before = work.host.document.project
+        with pytest.raises(ToolError, match="ランダム移動"):
+            _run(work.host, clip_id=str(work.square.id), kind="shake", start_frame=60, end_frame=90)
+        assert work.host.document.project == before
+        # 重ならない所なら付けられる
+        _run(work.host, clip_id=str(work.square.id), kind="shake", start_frame=100, end_frame=130)
+        clip = work.clip(work.square.id)
+        assert [e.kind for e in clip.effects].count("random_move") == 2
+
+    def test_shake_over_a_whole_clip_random_move_is_refused(self, work: _Work) -> None:
+        # 壊れると、人がクリップ全体に掛けたランダム移動の上に揺れが重なり、人の揺れが変わる
+        definition = registry.get("random_move")
+        assert definition is not None
+        human = definition.create(range_x=10.0)
+        work.host.apply_commands([AddEffect(work.square.id, human)], "ランダム移動")
+        with pytest.raises(ToolError, match="ランダム移動"):
+            _run(work.host, clip_id=str(work.square.id), kind="shake", start_frame=60, end_frame=90)
 
     def test_existing_animation_outside_is_kept(self, work: _Work) -> None:
         # 壊れると、人が付けたなめらかな拡大と跳ねる拡大が、強調の範囲の外まで崩れる
