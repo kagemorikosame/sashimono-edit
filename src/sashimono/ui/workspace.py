@@ -52,6 +52,17 @@ from sashimono.core.mixing import (
     DuckShape,
 )
 from sashimono.core.model import LayerMode
+from sashimono.core.seams import (
+    DEFAULT_SEAM_AUDIO_FADE_MS,
+    DEFAULT_SEAM_CROSSFADE_MS,
+    DEFAULT_SEAM_VIDEO,
+    DEFAULT_SEAM_ZOOM_PERCENT,
+    SEAM_AUDIO_FADE_MS_RANGE,
+    SEAM_CROSSFADE_MS_RANGE,
+    SEAM_VIDEOS,
+    SEAM_ZOOM_PERCENT_RANGE,
+    SeamStyle,
+)
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
@@ -594,6 +605,18 @@ class Preferences:
     emphasis_ramp_ms: int = DEFAULT_EMPHASIS_RAMP_MS
     #: 動き方（:data:`~sashimono.core.emphasis.EMPHASIS_EASINGS`） 既定はなめらかに動き出して止まる
     emphasis_easing: str = DEFAULT_EMPHASIS_EASING
+    #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
+    #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
+    #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
+    #: :mod:`sashimono.core.seams`）
+    #: 映像の処理（:data:`~sashimono.core.seams.SEAM_VIDEOS`）
+    seam_video: str = DEFAULT_SEAM_VIDEO
+    #: クロスフェードの長さ（ミリ秒）
+    seam_crossfade_ms: int = DEFAULT_SEAM_CROSSFADE_MS
+    #: 1 本おきに寄るときの拡大率（%）
+    seam_zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
+    #: 音の継ぎ目のフェード（ミリ秒） 0 で音は触らない
+    seam_audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -665,6 +688,16 @@ class Preferences:
             pan_px=self.emphasis_pan_px,
             ramp_ms=self.emphasis_ramp_ms,
             easing=self.emphasis_easing,
+        )
+
+    @property
+    def seam_style(self) -> SeamStyle:
+        """AI アシスタントのジャンプカットのつなぎ目の処理（#332）の既定"""
+        return SeamStyle(
+            video=self.seam_video,
+            crossfade_ms=self.seam_crossfade_ms,
+            zoom_percent=self.seam_zoom_percent,
+            audio_fade_ms=self.seam_audio_fade_ms,
         )
 
     @property
@@ -900,6 +933,16 @@ class PreferenceStore:
             ),
             emphasis_easing=_choice(
                 data.get("emphasis_easing"), EMPHASIS_EASINGS, plain.emphasis_easing
+            ),
+            seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
+            seam_crossfade_ms=_within(
+                data.get("seam_crossfade_ms"), SEAM_CROSSFADE_MS_RANGE, plain.seam_crossfade_ms
+            ),
+            seam_zoom_percent=_within(
+                data.get("seam_zoom_percent"), SEAM_ZOOM_PERCENT_RANGE, plain.seam_zoom_percent
+            ),
+            seam_audio_fade_ms=_within(
+                data.get("seam_audio_fade_ms"), SEAM_AUDIO_FADE_MS_RANGE, plain.seam_audio_fade_ms
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis

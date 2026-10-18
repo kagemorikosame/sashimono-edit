@@ -293,7 +293,10 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "clean_subtitles": lambda ids: {"media_id": ids["media"]},
     # 無い見た目を頼むと、保存してある見た目の名前を並べて断る（#308）
     "place_subtitles": lambda ids: {"media_id": ids["media"], "look_name": "無い見た目"},
-    "jet_cut": lambda ids: {"media_id": ids["media"]},
+    "jet_cut": lambda ids: {"media_id": ids["media"], "smooth": True},
+    # 再生速度とつなぎ目（#332） 動画のクリップを半分の速さにし、10 フレーム目をつなぎ目として扱う
+    "set_speed": lambda ids: {"clip_ids": [ids["video"]], "speed_percent": 50},
+    "smooth_cuts": lambda _ids: {"frames": [10]},
     # 音量とミックス（#329） 絵のクリップと動画の素材を渡すと断る 断る文に素材の名前が入りうる
     "set_volume": lambda ids: {"clip_ids": [ids["video"]], "volume_percent": 50},
     "duck_audio": lambda ids: {"clip_ids": [ids["video"]], "voice_clip_ids": [ids["video"]]},

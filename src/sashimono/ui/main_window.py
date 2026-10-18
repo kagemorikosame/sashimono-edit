@@ -134,6 +134,7 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
+from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -3385,6 +3386,10 @@ class MainWindow(QMainWindow):
     @property
     def emphasis_style(self) -> EmphasisStyle:
         return self._preferences.emphasis_style
+
+    @property
+    def seam_style(self) -> SeamStyle:
+        return self._preferences.seam_style
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

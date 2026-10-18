@@ -23,6 +23,7 @@ from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
+from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
@@ -253,6 +254,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.emphasis_style`）
 
         どれだけ寄るか・どれだけ速く動くかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def seam_style(self) -> SeamStyle:
+        """ジャンプカットのつなぎ目（#332）の既定の処理（映像の処理・長さ・音のフェード）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.seam_style`）
+
+        溶かすか寄るか・どれだけの長さかは人と作品で違う AI が引数で渡さなければこれを使う
         """
         ...
 

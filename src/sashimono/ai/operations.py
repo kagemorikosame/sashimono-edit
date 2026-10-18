@@ -115,6 +115,7 @@ from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.insert import new_track, place_media
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
 from sashimono.core.emphasis import (
     EMPHASIS_EASINGS,
@@ -158,6 +159,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     EffectId,
+    GeneratedSource,
     Interpolation,
     Marker,
     MediaId,
@@ -173,6 +175,21 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.projection import project_timeline
+from sashimono.core.seams import (
+    SEAM_AUDIO_FADE_MS_RANGE,
+    SEAM_CROSSFADE,
+    SEAM_CROSSFADE_MS_RANGE,
+    SEAM_NONE,
+    SEAM_VIDEOS,
+    SEAM_ZOOM,
+    SEAM_ZOOM_PERCENT_RANGE,
+    SeamPlan,
+    SeamStyle,
+    SmoothCuts,
+    find_seams,
+    plan_smoothing,
+    seams_after_cuts,
+)
 from sashimono.core.timebase import (
     FrameRate,
     Rounding,
@@ -2444,6 +2461,78 @@ def _set_clip_property(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"name": name, "value": str(value)}
 
 
+#: 速度の変え方（#332） content は中身（素材の範囲）を保って長さを変え、length は長さを保って
+#: 流す素材の範囲を変える（設定パネルの「再生速度」と同じ）
+_SPEED_KEEPS = ("content", "length")
+
+
+def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """クリップの再生速度を変える（#332 B6） リンクした絵と音は一緒に変わる"""
+    if arguments.get("speed_percent") is None:
+        raise ToolError("speed_percent に速度（%）を渡してください（100 で等倍、200 で 2 倍速）")
+    percent = _limit_number(arguments, "speed_percent", 100.0, *SPEED_PERCENT_RANGE)
+    keep = arguments.get("keep", "content")
+    if keep not in _SPEED_KEEPS:
+        raise ToolError(f"keep は {'・'.join(_SPEED_KEEPS)} のどれかです（{keep!r} が来ました）")
+    clip_ids = _target_clips(host, arguments)
+    project = _project(host)
+    # 百分率の小数は 1000 分の 1 まで 分母を大きくすると保存の分数が長くなるだけで聞き分けられない
+    speed = Fraction(str(percent)).limit_denominator(1000) / 100
+    command = ChangeSpeed(clip_ids, speed, keep_length=keep == "length")
+    try:
+        members = speed_members(project, clip_ids)
+        # 先に当ててみて断る理由を拾う ホストに渡してから断られると、ぶつかる相手と
+        # 伸ばせる量が AI に届かない
+        command.apply(project)
+    except (KeyError, ValueError) as exc:
+        raise ToolError(str(exc).strip("'\"")) from exc
+    before = {clip.id: clip.duration for _, clip in members}
+    host.apply_commands([command], command.label)
+
+    after = _project(host)
+    rows: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for clip_id, duration in before.items():
+        located = after.timeline.locate_clip(clip_id)
+        if located is None:  # pragma: no cover - 速度の命令はクリップを消さない
+            continue
+        clip = located[1]
+        rows.append(
+            {
+                "clip_id": str(clip.id),
+                "duration_before": duration,
+                "duration": clip.duration,
+                "timeline_start": clip.timeline_start,
+                "timeline_end": clip.timeline_end,
+            }
+        )
+        media = after.find_media(clip.media_id) if clip.media_id is not None else None
+        if media is None or media.is_still or media.duration <= 0:
+            continue
+        over = clip.source_out(after.rate) - media.duration
+        if over > 0:
+            # 素材の終わりの先は何も映らない（絵を止めていなければ） 長さを保つ変え方で
+            # 速くすると起きる AI が気付かないまま書き出すと、終わりが黒くなる
+            warnings.append(
+                f"{clip.id} は素材の終わりを {float(over):.2f} 秒越えます"
+                " 越えた所は何も映らないので、"
+                "trim_clip で終わりを詰めるか、keep を content にしてください"
+            )
+    result: dict[str, object] = {
+        "speed_percent": float(speed * 100),
+        "keep": keep,
+        "clips": rows,
+        "note": (
+            "リンクした絵と音も同じ速度にしました 音は高さも変わります"
+            " キーフレームはクリップの頭からのフレームのまま動かしていません"
+            " 取り消し 1 回で元に戻ります"
+        ),
+    }
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
 def _hold_at(value: object, name: str = "hold_at") -> Fraction | None:
     """絵を止める素材の時刻（秒）を :class:`~fractions.Fraction` にする ``None`` は解除
 
@@ -3002,12 +3091,146 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError("切れる無音が見つかりません threshold_db を上げてみてください")
 
     removed = sum(end - start for start, end in ranges)
-    host.apply_commands([RippleCut(ranges)], f"無音カット: {len(ranges)} か所")
-    return {
+    cut = RippleCut(ranges)
+    commands: list[Command] = [cut]
+    result: dict[str, object] = {
         "cuts": len(ranges),
         "removed_frames": removed,
         "removed_seconds": round(float(removed * project.rate.frame_duration), 2),
     }
+    if _flag_argument(arguments, "smooth", False):
+        # 詰めてできたつなぎ目の処理を同じ 1 回の取り消しに入れる（#332） 詰めた後のクリップは
+        # 当てるまで ID が決まらないので、フレームだけを持つ命令（SmoothCuts）で後から探す
+        # 結果に載せる中身は、詰めた後の形を手元で作って同じ決まりで組んだ物
+        style = _seam_style(host, arguments)
+        frames = seams_after_cuts(ranges)
+        transition = _seam_transition(style)
+        plan = plan_smoothing(cut.apply(project), frames, style, transition)
+        commands.append(SmoothCuts(frames, style, transition))
+        result["smoothing"] = _seam_result(plan, style, clip_ids=False)
+    host.apply_commands(commands, f"無音カット: {len(ranges)} か所")
+    return result
+
+
+# --- ジャンプカットのつなぎ目（#332 B6） ---
+#
+# 詰めたつなぎ目へ、人が手で付けるのと同じ物を付ける（core/seams.py） クロスフェードは
+# 場面切り替えのクリップ、寄りは配置の拡大率の欄、音は音量フェードの欄 人は設定パネルと
+# タイムラインで同じ物を直せる 1 回の呼び出しは 1 回の apply_commands で、取り消し 1 回で戻る
+
+#: 1 回に処理するつなぎ目の上限 数千か所を一度に組むと編集画面が止まる 1 時間の話を
+#: 細かく詰めても数百か所に収まる
+MAX_SEAMS = 2000
+#: 結果に並べる付けなかった所の上限 全部並べると会話が長くなるだけで、理由は数種類しかない
+_SKIPPED_SHOWN = 20
+
+
+def _seam_style(host: EditorHost, arguments: dict[str, Any]) -> SeamStyle:
+    """引数のつなぎ目の処理 省いた物は本人の設定（:attr:`EditorHost.seam_style`）"""
+    base = host.seam_style
+    video = arguments.get("video", base.video)
+    if video not in SEAM_VIDEOS:
+        raise ToolError(f"video は {'・'.join(SEAM_VIDEOS)} のどれかです（{video!r} が来ました）")
+    style = SeamStyle(
+        video=str(video),
+        crossfade_ms=round(
+            _limit_number(arguments, "crossfade_ms", base.crossfade_ms, *SEAM_CROSSFADE_MS_RANGE)
+        ),
+        zoom_percent=round(
+            _limit_number(arguments, "zoom_percent", base.zoom_percent, *SEAM_ZOOM_PERCENT_RANGE)
+        ),
+        audio_fade_ms=round(
+            _limit_number(arguments, "audio_fade_ms", base.audio_fade_ms, *SEAM_AUDIO_FADE_MS_RANGE)
+        ),
+    )
+    if style.video == SEAM_NONE and style.audio_fade_ms == 0:
+        raise ToolError("video が none で audio_fade_ms が 0 なので、付ける物がありません")
+    return style
+
+
+def _seam_transition(style: SeamStyle) -> GeneratedSource | None:
+    """クロスフェードに置く場面切り替え 人が〔場面切り替えを追加〕で置く物と同じ既定の中身"""
+    return TRANSITION.create(style="fade") if style.video == SEAM_CROSSFADE else None
+
+
+def _seam_result(plan: SeamPlan, style: SeamStyle, *, clip_ids: bool = True) -> dict[str, object]:
+    """つなぎ目の処理の結果 ``clip_ids`` が偽なら寄せたクリップの ID を出さない
+
+    無音カットと一緒に組んだときは、手元で作った形の ID と、実際に当てた形の ID が違う
+    （詰めて割ったクリップの ID は当てるたびに新しく作る） 違う ID を返すと AI が指し損なう
+    """
+    result: dict[str, object] = {
+        "video": style.video,
+        "handled": len(plan.handled),
+        "audio_faded": len(plan.audio),
+        "audio_fade_ms": style.audio_fade_ms,
+    }
+    if style.video == SEAM_CROSSFADE:
+        result["crossfade_ms"] = style.crossfade_ms
+        result["crossfades"] = [
+            {"frame": frame, "frames": length} for frame, length in plan.crossfades
+        ]
+    elif style.video == SEAM_ZOOM:
+        result["zoom_percent"] = style.zoom_percent
+        result["zoomed"] = len(plan.zoomed)
+        if clip_ids:
+            result["zoomed_clip_ids"] = [str(clip_id) for clip_id in plan.zoomed]
+    if plan.skipped:
+        result["skipped"] = [
+            {"frame": frame, "reason": reason} for frame, reason in plan.skipped[:_SKIPPED_SHOWN]
+        ]
+        if len(plan.skipped) > _SKIPPED_SHOWN:
+            result["skipped_more"] = len(plan.skipped) - _SKIPPED_SHOWN
+    return result
+
+
+def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """つなぎ目を目立たなくする 位置を渡さなければ、同じ素材を飛び飛びにつないだ所を探す"""
+    project = _project(host)
+    _no_explicit_null(arguments, "frames")
+    raw = arguments.get("frames")
+    if raw is not None:
+        if not isinstance(raw, list) or not raw:
+            raise ToolError("frames はつなぎ目のフレームの配列で渡してください（省くと探します）")
+        frames = tuple(sorted({_integer_value(value, "frames") for value in raw}))
+        if frames[0] < 1:
+            raise ToolError("frames は 1 以上です（0 フレームの前にクリップは無い）")
+    else:
+        track_id = arguments.get("track_id")
+        tracks: tuple[TrackId, ...] | None = None
+        if track_id is not None:
+            if project.timeline.find_track(TrackId(str(track_id))) is None:
+                raise ToolError(
+                    f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）"
+                )
+            tracks = (TrackId(str(track_id)),)
+        start = int(_limit_number(arguments, "start_frame", 0, 0, 10**9))
+        end_value = arguments.get("end_frame")
+        end = None if end_value is None else int(_limit_number(arguments, "end_frame", 0, 1, 10**9))
+        frames = find_seams(project, start=start, end=end, track_ids=tracks)
+        if not frames:
+            raise ToolError(
+                "ジャンプカットのつなぎ目（同じ素材を飛び飛びにつないだ所）が見つかりません"
+                " 別の素材へ切り替えた所なら frames に位置を渡してください"
+            )
+    if len(frames) > MAX_SEAMS:
+        raise ToolError(
+            f"つなぎ目が {len(frames)} か所あります 1 回に {MAX_SEAMS} か所までなので、"
+            "start_frame と end_frame で分けて呼んでください"
+        )
+    style = _seam_style(host, arguments)
+    plan = plan_smoothing(project, frames, style, _seam_transition(style))
+    if not plan.commands:
+        reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
+        raise ToolError(
+            "どのつなぎ目にも付けられませんでした"
+            + (f"（{reasons}）" if reasons else "（前後のクリップが接している所がありません）")
+        )
+    host.apply_commands(list(plan.commands), f"つなぎ目を目立たなくする: {len(plan.handled)} か所")
+    result = {"seams": len(frames), **_seam_result(plan, style)}
+    if plan.missing:
+        result["not_seams"] = list(plan.missing[:_SKIPPED_SHOWN])
+    return result
 
 
 # --- 音量とミックス（#329 B3） ---
@@ -4413,6 +4636,20 @@ _DUCKING = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: 強調の動き（#331） クリップ ID・フレーム・強さに、本人の設定（強さ・長さ・動き方の既定）が
 #: 載る 断る文に出るのはクリップ ID とトラックの名前（作品の中身）だけ
 _EMPHASIS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
+#: ジャンプカットのつなぎ目（#332） フレームとクリップ ID に、本人の設定（処理の種類と長さの
+#: 既定）が載る 断る文に出るのはクリップ ID だけ
+_SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
+#: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
+_JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
+#: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
+_SEAM_ARGUMENTS: dict[str, Any] = {
+    "video": _string("映像の処理 crossfade・zoom・none 省くと本人の設定"),
+    "crossfade_ms": _integer("クロスフェードの長さ（ミリ秒 10〜1000） 省くと本人の設定"),
+    "zoom_percent": _integer("寄りの拡大率（% 101〜150） 省くと本人の設定"),
+    "audio_fade_ms": _integer(
+        "音の継ぎ目のフェード（ミリ秒 0〜200 0 で音は触らない） 省くと本人の設定"
+    ),
+}
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
 
@@ -5184,6 +5421,30 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="set_speed",
+        description=(
+            "クリップの再生速度を変える（スロー・早送り） リンクした絵と音も同じ速度にする"
+            " keep が content（既定）なら素材の同じ範囲を流す長さにする（200% で長さが半分）"
+            " length なら長さを変えず流す素材の範囲が変わる（設定パネルの「再生速度」と同じ）"
+            " 長くなって後ろのクリップにぶつかるなら断る 音は高さも変わる"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "対象のクリップ 省くと選んでいるクリップすべて",
+                },
+                "speed_percent": _number("速度（% 1〜1000 100 で等倍、50 で半分の速さ）"),
+                "keep": _string("content（中身を保って長さを変える 既定）か length（長さを保つ）"),
+            },
+            ["speed_percent"],
+        ),
+        handler=_set_speed,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
         name="add_effect",
         description=(
             "クリップにエフェクトを積む 使える kind は list_effects で分かる"
@@ -5617,11 +5878,43 @@ OPERATIONS: tuple[Operation, ...] = (
                     "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
                     " 字幕は音声ごとに別"
                 ),
+                "smooth": _boolean(
+                    "詰めたつなぎ目を smooth_cuts と同じく目立たなくする（既定 false）"
+                    " 同じ取り消し 1 回に入る video などの引数も smooth_cuts と同じ"
+                ),
+                **_SEAM_ARGUMENTS,
             },
             ["media_id"],
         ),
         handler=_jet_cut,
-        sends=_WITH_FILES,
+        sends=_JET_CUT,
+        writes=True,
+    ),
+    Operation(
+        name="smooth_cuts",
+        description=(
+            "ジャンプカットのつなぎ目を目立たなくする frames を省くと、同じ素材を飛び飛びに"
+            "つないだ所（無音を詰めた所など）を探す video は crossfade（場面切り替えの短い"
+            "クロスフェードを重ねる）zoom（後ろのクリップを 1 本おきに少し拡大する パンチイン）"
+            "none（映像は触らない） 音は継ぎ目の前後に短いフェードを入れて「プツッ」を消す"
+            " 省いた値は本人の設定 同じ所へ掛け直しても重ならない"
+        ),
+        schema=_schema(
+            {
+                "frames": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "つなぎ目のフレーム（前のクリップの終わり=後ろのクリップの頭）",
+                },
+                "track_id": _string("探すトラック 省くと全部（frames を省いたときだけ）"),
+                "start_frame": _integer("探す範囲の頭（frames を省いたときだけ）"),
+                "end_frame": _integer("探す範囲の終わり 含まない（frames を省いたときだけ）"),
+                **_SEAM_ARGUMENTS,
+            },
+            [],
+        ),
+        handler=_smooth_cuts,
+        sends=_SEAMS,
         writes=True,
     ),
     Operation(

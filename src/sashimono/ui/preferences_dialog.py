@@ -38,6 +38,13 @@ from sashimono.core.emphasis import (
 )
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
+from sashimono.core.seams import (
+    SEAM_AUDIO_FADE_MS_RANGE,
+    SEAM_CROSSFADE_MS_RANGE,
+    SEAM_VIDEO_NAMES,
+    SEAM_VIDEOS,
+    SEAM_ZOOM_PERCENT_RANGE,
+)
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     MEASURED_ONE_LAYER_MS,
@@ -840,6 +847,7 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
+        self._add_seam_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -1088,6 +1096,10 @@ class PreferencesDialog(QDialog):
             emphasis_pan_px=self._emphasis_pan.value(),
             emphasis_ramp_ms=self._emphasis_ramp.value(),
             emphasis_easing=str(self._emphasis_easing.currentData()),
+            seam_video=str(self._seam_video.currentData()),
+            seam_crossfade_ms=self._seam_crossfade.value(),
+            seam_zoom_percent=self._seam_zoom.value(),
+            seam_audio_fade_ms=self._seam_audio.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )
@@ -1145,6 +1157,51 @@ class PreferencesDialog(QDialog):
             "動き出しと止まり方 行き過ぎて戻る・ばね・弾むは、着いた所で跳ねる"
         )
         form.addRow("強調の動き: 動き方", self._emphasis_easing)
+
+    def _add_seam_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """ジャンプカットのつなぎ目（#332）の既定 溶かすか寄るか・どれだけの長さかは人と作品で違う
+        AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        """
+        self._seam_video = QComboBox(self)
+        for video in SEAM_VIDEOS:
+            self._seam_video.addItem(SEAM_VIDEO_NAMES[video], video)
+        self._seam_video.setCurrentIndex(max(0, self._seam_video.findData(preferences.seam_video)))
+        self._seam_video.setToolTip(
+            "AI アシスタントが無音を詰めたつなぎ目（ジャンプカット）を目立たなくするときの"
+            "映像の処理"
+            " クロスフェードは前の絵から後ろの絵へ短く溶かす 寄りは後ろのクリップを 1 本おきに"
+            "少し拡大して、跳びをカメラを替えたように見せる（画面の端が少し欠ける）"
+        )
+        form.addRow("つなぎ目: 映像の処理", self._seam_video)
+
+        def spin(bounds: tuple[int, int], value: int, suffix: str, step: int) -> QSpinBox:
+            box = QSpinBox(self)
+            box.setRange(*bounds)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            box.setValue(value)
+            return box
+
+        self._seam_crossfade = spin(
+            SEAM_CROSSFADE_MS_RANGE, preferences.seam_crossfade_ms, " ms", 10
+        )
+        self._seam_crossfade.setToolTip(
+            "つなぎ目で溶かす長さ 100 ms は 30 fps で 3 フレーム"
+            " 長いと止めた前の絵が残って二重に見える"
+        )
+        form.addRow("つなぎ目: クロスフェードの長さ", self._seam_crossfade)
+        self._seam_zoom = spin(SEAM_ZOOM_PERCENT_RANGE, preferences.seam_zoom_percent, " %", 1)
+        self._seam_zoom.setToolTip(
+            "1 本おきに寄るときの拡大率 大きいほど跳びが隠れるが、"
+            "画面の端（焼き込んだ字幕や頭の上）が欠ける"
+        )
+        form.addRow("つなぎ目: 寄る量", self._seam_zoom)
+        self._seam_audio = spin(SEAM_AUDIO_FADE_MS_RANGE, preferences.seam_audio_fade_ms, " ms", 5)
+        self._seam_audio.setToolTip(
+            "つなぎ目の前後の音に入れる短いフェード 波形が途中で切れて鳴る「プツッ」を消す"
+            " 長いと話の頭と終わりが小さく聞こえる 0 で音は触らない"
+        )
+        form.addRow("つなぎ目: 音のフェード", self._seam_audio)
 
     def _send_value(self, kind: Outbound) -> str:
         return str(self._ai_sends[kind].currentData())
