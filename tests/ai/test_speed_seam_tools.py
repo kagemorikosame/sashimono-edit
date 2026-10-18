@@ -7,6 +7,7 @@ tests/core/test_speed.py、設定画面と本物の窓は tests/ui/test_seam_pre
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
+from sashimono.core.commands import SetClipProperty
 from sashimono.core.model import TRANSITION_KIND, Project
 from sashimono.core.seams import SEAM_ZOOM, SeamStyle
 from tests.ai.conftest import FakeHost
@@ -90,6 +92,27 @@ class TestSetSpeed:
             keep="length",
         )
         assert any("素材の終わり" in warning for warning in result["warnings"])
+
+    def test_a_held_picture_is_not_called_black(self) -> None:
+        # 壊れると、絵を止めた（hold_at）クリップでも「何も映らない」と伝わり、AI が直す必要の
+        # 無い trim_clip を勧める 音は止まらないので、音のクリップには無音になると伝える
+        # （CodeRabbit の指摘）
+        work = JumpCut(durations=(60, 60, 90))
+        project = SetClipProperty(work.pictures[2].id, "hold_at", Fraction(29)).apply(work.project)
+        host = FakeHost(project)
+        result = _run(
+            host,
+            "set_speed",
+            clip_ids=[str(work.pictures[2].id)],
+            speed_percent=1000,
+            keep="length",
+        )
+        warnings = result["warnings"]
+        assert not any(str(work.pictures[2].id) in warning for warning in warnings)
+        sound = [w for w in warnings if str(work.sounds[2].id) in w]
+        assert len(sound) == 1
+        assert "無音" in sound[0]
+        assert "何も映らない" not in sound[0]
 
     def test_a_collision_is_explained(self) -> None:
         # 壊れると、ぶつかって断ったことと伸ばせる量が AI に届かず、何度も同じ頼みを繰り返す
@@ -167,6 +190,11 @@ class TestSmoothCuts:
             {"frames": []},
             {"frames": [0]},
             {"track_id": "無い"},
+            # 範囲は整数のフレームだけ 小数を黙って切り捨てない（CodeRabbit の指摘）
+            {"start_frame": 59.9},
+            {"end_frame": 120.5},
+            {"start_frame": -1},
+            {"start_frame": 120, "end_frame": 60},
         ],
     )
     def test_bad_arguments_are_refused(self, arguments: dict[str, Any]) -> None:

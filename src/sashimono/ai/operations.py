@@ -2496,7 +2496,7 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
         located = after.timeline.locate_clip(clip_id)
         if located is None:  # pragma: no cover - 速度の命令はクリップを消さない
             continue
-        clip = located[1]
+        track, clip = located
         rows.append(
             {
                 "clip_id": str(clip.id),
@@ -2510,14 +2510,21 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
         if media is None or media.is_still or media.duration <= 0:
             continue
         over = clip.source_out(after.rate) - media.duration
-        if over > 0:
-            # 素材の終わりの先は何も映らない（絵を止めていなければ） 長さを保つ変え方で
-            # 速くすると起きる AI が気付かないまま書き出すと、終わりが黒くなる
-            warnings.append(
-                f"{clip.id} は素材の終わりを {float(over):.2f} 秒越えます"
-                " 越えた所は何も映らないので、"
-                "trim_clip で終わりを詰めるか、keep を content にしてください"
-            )
+        if over <= 0:
+            continue
+        # 長さを保つ変え方で速くすると、素材の終わりを越える AI が気付かないまま書き出すと、
+        # 絵は終わりが黒くなり、音は無音になる 絵を素材の中で止めて（hold_at）いれば絵は黒く
+        # ならないので言わない（言うと直す必要の無い trim_clip を勧める） 音は止めない決まり
+        if after.plays_sound(track, clip):
+            lost = "越えた所は無音になる"
+        elif clip.hold_at is not None and clip.hold_at <= media.duration:
+            continue
+        else:
+            lost = "越えた所は何も映らない"
+        warnings.append(
+            f"{clip.id} は素材の終わりを {float(over):.2f} 秒越えます {lost}ので、"
+            "trim_clip で終わりを詰めるか、keep を content にしてください"
+        )
     result: dict[str, object] = {
         "speed_percent": float(speed * 100),
         "keep": keep,
@@ -3203,9 +3210,17 @@ def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
                     f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）"
                 )
             tracks = (TrackId(str(track_id)),)
-        start = int(_limit_number(arguments, "start_frame", 0, 0, 10**9))
-        end_value = arguments.get("end_frame")
-        end = None if end_value is None else int(_limit_number(arguments, "end_frame", 0, 1, 10**9))
+        # 範囲は整数のフレームで受ける 小数を切り捨てて探すと、頼んだのと違う範囲を黙って見る
+        start = _frame_argument(arguments, "start_frame", 0)
+        if start < 0:
+            raise ToolError(f"start_frame は 0 以上です（{start} が来ました）")
+        end = (
+            None
+            if arguments.get("end_frame") is None
+            else _frame_argument(arguments, "end_frame", 0)
+        )
+        if end is not None and end <= start:
+            raise ToolError("end_frame は start_frame より後にしてください")
         frames = find_seams(project, start=start, end=end, track_ids=tracks)
         if not frames:
             raise ToolError(
