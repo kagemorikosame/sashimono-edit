@@ -255,6 +255,16 @@ class TestZoom:
             assert scale.at(frame) == pytest.approx(animated.at(frame)), frame
         assert scale.at(45) == pytest.approx(150.0 * 1.2)
 
+    def test_an_out_of_range_value_outside_the_span_does_not_block(self, work: _Work) -> None:
+        # 壊れると、読み込んだテンプレートなどが範囲の外に欄の上限を超える値（0 フレームで 1000%）を
+        # 持つだけで、関係の無い 40〜60 フレームのズームまで断られ、強さを下げても付けられない
+        animated = AnimatedValue(static=100.0, keyframes=(Keyframe(0, 1000.0), Keyframe(20, 100.0)))
+        host = self._animated(work, animated)
+        _run(host, clip_id="animated", kind="zoom", start_frame=440, end_frame=460)
+        scale = self._scale_of(host)
+        assert scale.at(0) == pytest.approx(1000.0)
+        assert scale.at(50) == pytest.approx(120.0)
+
     def test_a_moving_line_inside_the_range_is_refused(self, work: _Work) -> None:
         # 壊れると、範囲の中で前から動いていた拡大（なめらかに上がる途中）が、点の所の値で
         # 近づけた形に変わり、人が付けた動きが黙って崩れる 断って何も変えない

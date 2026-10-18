@@ -92,21 +92,28 @@ def emphasis_commands(
     else:
         focus = request.focus if request.kind == ZOOM else None
         curves = zoom_curves(transform, shape, request.strength / 100.0, focus)
-    _within_spec(curves)
+    _within_spec(curves, shape)
     return transform_commands(clip, curves), shape
 
 
-def _within_spec(curves: dict[str, AnimatedValue]) -> None:
-    """線の値が配置の欄の範囲（設定パネルと同じ）に収まるかを見る 収まらなければ断る
+def _within_spec(curves: dict[str, AnimatedValue], shape: Envelope) -> None:
+    """強調で動かした点の値が配置の欄の範囲（設定パネルと同じ）に収まるかを見る 収まらなければ断る
 
     端へ寄せると、寄せた所だけ動きが止まり、ズームの寄る先がずれる
+    見るのは強さが 0 でない点（新しく作った区間の値）だけ 範囲の外の点と、範囲の頭と終わりの
+    点（前からの線の値のまま）は変えていない 読み込んだテンプレートなどは欄の範囲の外の値を
+    持てる（:meth:`TrackSpec.scaled_at`）ので、それまで見ると関係の無い所の値で断り、強さを
+    下げても付けられない
     """
+    moved = {frame for frame, amount, *_rest in shape.points if amount != 0.0}
     definition = registry.get(TRANSFORM_EFFECT_KIND)
     for name, curve in curves.items():
         spec = definition.spec(name) if definition is not None else None
         if not isinstance(spec, TrackSpec):
             continue
         for keyframe in curve.keyframes:
+            if keyframe.frame not in moved:
+                continue
             if not spec.minimum <= keyframe.value <= spec.maximum:
                 raise EmphasisError(
                     f"{name} が欄の範囲（{spec.minimum:g}〜{spec.maximum:g}）を超えます"
