@@ -280,7 +280,8 @@ class TestEveryWayPytestCollects:
                 "from tests.shared.checks import Checks\nclass TestReal(Checks):\n"
                 "    if True:\n        def test_a(self):\n"
                 "            # 壊れると作品が開けない\n            assert True\n",
-                [],
+                # if が走らなければ基底の試験が集まるので、基底の物も数える
+                [("checks.py", "test_a")],
             ),
             (
                 "class TestReal:\n    class Base:\n        def test_k(self):\n"
@@ -340,6 +341,43 @@ class TestEveryWayPytestCollects:
     @pytest.mark.parametrize(
         "source",
         [
+            "from tests.shared.checks import Checks\nclass Other:\n    pass\n"
+            "if flag:\n    Base = Checks\nelse:\n    Base = Other\n"
+            "class TestReal(Base):\n    pass\n",
+            "try:\n    from tests.shared.checks import Checks as Base\n"
+            "except ImportError:\n    Base = object\n"
+            "class TestReal(Base):\n    pass\n",
+        ],
+        ids=["if-else-base", "try-except-base"],
+    )
+    def test_a_base_chosen_in_a_block_counts_every_candidate(
+        self, tool: ModuleType, tmp_path: Path, source: str
+    ) -> None:
+        # どちらの枝が走るかは読むだけでは決まらない 1 つに決めて読むと、決めなかった
+        # 枝の基底の試験を見逃す（#377 の CodeRabbit が読み解く側に倒す所を指摘した）
+        package = tmp_path / "tests" / "shared"
+        package.mkdir(parents=True)
+        (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "checks.py").write_text(SHARED_CHECKS, encoding="utf-8")
+        path = tmp_path / "tests" / "test_real.py"
+        path.write_text(source, encoding="utf-8")
+        found = tool.scan(path, tool.Reader(tmp_path))
+        assert [(item.path.name, item.name) for item in found] == [("checks.py", "test_a")]
+
+    def test_a_test_defined_in_either_branch_is_counted(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # 後ろの枝だけを読むと、前の枝の書き添えの無い試験が走る場合を見逃す
+        source = (
+            "if flag:\n    def test_a():\n        assert True\n"
+            "else:\n    def test_a():\n        # 壊れると作品が開けない\n        assert True\n"
+        )
+        assert names(tool, tmp_path, source) == ["test_a"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             "import unittest\nclass Checks(unittest.TestCase):\n    def test_a(self):\n"
             "        assert True\n",
             "from unittest import TestCase\nclass Mixin(TestCase):\n    pass\n"
@@ -391,6 +429,27 @@ class TestWhatPytestSkips:
                 [],
             ),
             ("__test__ = False\ndef test_a():\n    assert True\n", []),
+            # ここから下は書かれ方が 1 通りに決まらない __test__ どれも数える側に倒す
+            (
+                "class TestX:\n    if TYPE_CHECKING:\n        __test__ = False\n"
+                "    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+            ("if flag:\n    __test__ = False\ndef test_a():\n    assert True\n", ["test_a"]),
+            (
+                "def test_a():\n    assert True\nif flag:\n    test_a.__test__ = False\n",
+                ["test_a"],
+            ),
+            (
+                "class TestX:\n    __test__ = False\n    __test__ = True\n"
+                "    def test_a(self):\n        assert True\n",
+                ["test_a"],
+            ),
+            (
+                "class TestX:\n    def test_a(self):\n        assert True\n"
+                "setattr(TestX, '__test__', False)\n",
+                ["test_a"],
+            ),
             (
                 "class TestX:\n    __test__ = flag()\n    def test_a(self):\n        assert True\n",
                 ["test_a"],
@@ -402,6 +461,11 @@ class TestWhatPytestSkips:
             "function-off",
             "class-off-from-outside",
             "module-off",
+            "class-flag-in-if",
+            "module-flag-in-if",
+            "function-flag-in-if",
+            "class-flag-twice",
+            "setattr",
             "unknown-value-counts",
         ],
     )
@@ -432,6 +496,15 @@ class TestWhatPytestSkips:
                 'def grow():\n    global __all__\n    __all__ = ["test_z"]\n__all__ = ["test_b"]\n',
                 ["test_b", "test_z"],
             ),
+            # ブロックの中の __all__ は走るかどうかが決まらない どれも読み解かず全部数える
+            ('if TYPE_CHECKING:\n    __all__ = ["test_b"]\n', ["test_b", "test_z"]),
+            ('for _ in []:\n    __all__ = ["test_b"]\n', ["test_b", "test_z"]),
+            ('while False:\n    __all__ = ["test_b"]\n', ["test_b", "test_z"]),
+            (
+                'try:\n    __all__ = ["test_b"]\nexcept Exception:\n    pass\n',
+                ["test_b", "test_z"],
+            ),
+            ('with suppress():\n    __all__ = ["test_b"]\n', ["test_b", "test_z"]),
         ],
         ids=[
             "list",
@@ -447,6 +520,11 @@ class TestWhatPytestSkips:
             "through-globals",
             "assigned-twice",
             "inside-a-function",
+            "in-if",
+            "in-for",
+            "in-while",
+            "in-try",
+            "in-with",
         ],
     )
     def test_a_star_import_follows_all(
