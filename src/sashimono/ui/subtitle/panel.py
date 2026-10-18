@@ -74,7 +74,7 @@ from sashimono.core.model import (
     TranscriptSegment,
 )
 from sashimono.core.projection import project_clip, subtitle_stream, subtitle_voice
-from sashimono.core.seams import SeamStyle, SmoothCuts, seams_after_cuts
+from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
@@ -836,7 +836,14 @@ class SubtitlePanel(QWidget):
         if style is not None:
             # 詰めたつなぎ目の処理を同じ取り消し 1 回に入れる（AI の jet_cut の smooth と同じ）
             # 詰めた後のクリップの ID は当てるまで決まらないので、フレームだけを持つ命令で探す
-            commands.append(SmoothCuts(seams_after_cuts(ranges), style, seam_transition(style)))
+            commands.append(
+                SmoothCuts(
+                    seams_after_cuts(ranges),
+                    style,
+                    seam_transition(style),
+                    SeamScope(jumps_only=True),
+                )
+            )
         self.commands_requested.emit(commands, f"無音カット: {len(ranges)} か所")
 
     def _plan(

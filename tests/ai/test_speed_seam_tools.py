@@ -17,7 +17,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, SetClipProperty
+from sashimono.core.commands import AddClip, AddScene, InScene, SetClipProperty, new_scene
 from sashimono.core.model import (
     TRANSITION_KIND,
     Clip,
@@ -28,7 +28,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.seams import SEAM_ZOOM, SeamStyle
 from tests.ai.conftest import FakeHost
-from tests.core.test_seams import RATE, JumpCut, talking_media
+from tests.core.test_seams import RATE, JumpCut, talking_media, with_bystander
 
 
 def _run(host: FakeHost, name: str, **arguments: Any) -> Any:
@@ -151,6 +151,31 @@ class TestSetSpeed:
         (warning,) = result["warnings"]
         assert lost in warning
 
+    def test_running_past_the_end_of_a_scene_is_warned(self) -> None:
+        # 壊れると、入れ子のシーンを長さを保ったまま速くしてシーンの終わりを越えても警告が出ず、
+        # 終わりが黒く無音のまま書き出される（描画と音のミキサは越えた時間を空として扱う）
+        # （Codex の指摘）
+        base = Project.create(ProjectSettings(frame_rate=RATE), media=(talking_media(),))
+        inner = new_scene(base, "場面")
+        media = base.media[0]
+        inner_track = Track(TrackKind.VIDEO, "V1")
+        inner = replace(inner, timeline=replace(inner.timeline, tracks=(inner_track,)))
+        project = AddScene(inner).apply(base)
+        project = InScene(
+            inner.id,
+            AddClip(inner_track.id, Clip(timeline_start=0, duration=60, media_id=media.id)),
+        ).apply(project)
+        outer = Track(TrackKind.VIDEO, "V1")
+        project = project.with_timeline(replace(project.timeline, tracks=(outer,)))
+        placed = Clip(timeline_start=0, duration=60, scene_id=inner.id)
+        project = AddClip(outer.id, placed).apply(project)
+        host = FakeHost(project)
+        result = _run(
+            host, "set_speed", clip_ids=[str(placed.id)], speed_percent=200, keep="length"
+        )
+        (warning,) = result["warnings"]
+        assert "シーンの終わりを 2.00 秒越えます" in warning
+
     def test_a_collision_is_explained(self) -> None:
         # 壊れると、ぶつかって断ったことと伸ばせる量が AI に届かず、何度も同じ頼みを繰り返す
         work = JumpCut()
@@ -197,6 +222,30 @@ class TestSmoothCuts:
         assert result["crossfades"] == [{"frame": 60, "frames": 6}]
         assert result["audio_faded"] == 0
         assert _transitions(host.document.project) == [(59, 7)]
+
+    def test_found_seams_leave_a_plain_split_on_another_track_alone(self) -> None:
+        # 壊れると、探したつなぎ目と同じフレームで区切れている別のトラックの関係の無いクリップ
+        # まで寄せ、そこの 1 フレームのクリップのせいでクロスフェードごと断られる（Codex の指摘）
+        work = JumpCut()
+        project, bystander, _before, after = with_bystander(work)
+        host = FakeHost(project)
+        result = _run(host, "smooth_cuts", video="zoom", audio_fade_ms=0)
+        assert result["zoomed_clip_ids"] == [str(work.pictures[1].id)]
+        located = host.document.project.timeline.locate_clip(after.id)
+        assert located is not None and located[1] == after
+        host.document.undo()
+        # トラックを名指ししたら、そのトラックの所だけ（名指しの位置でも別のトラックは触らない）
+        result = _run(
+            host,
+            "smooth_cuts",
+            frames=[60],
+            track_id=str(bystander.id),
+            video="zoom",
+            audio_fade_ms=0,
+        )
+        assert result["zoomed_clip_ids"] == [str(after.id)]
+        located = host.document.project.timeline.locate_clip(work.pictures[1].id)
+        assert located is not None and located[1] == work.pictures[1]
 
     def test_a_place_that_is_not_a_seam_is_reported(self) -> None:
         # 壊れると、つなぎ目でない所を渡したことに AI が気付かず、付けたと思い込む

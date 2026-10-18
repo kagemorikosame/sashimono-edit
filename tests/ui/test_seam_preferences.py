@@ -38,7 +38,7 @@ from sashimono.ui.subtitle.dialogs import JetCutDialog
 from sashimono.ui.subtitle.panel import SubtitlePanel
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending
-from tests.core.test_seams import JumpCut
+from tests.core.test_seams import JumpCut, with_bystander
 from tests.ui.test_subtitle_panel import StubAnalyzer, make_waveform
 
 
@@ -298,6 +298,25 @@ class TestRightClick:
         assert by_hand.document.undo_by is Author.PERSON
         by_hand.document.undo()
         assert by_hand.document.project == work.project
+
+    def test_seams_leave_unselected_clips_on_other_tracks_alone(
+        self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、選んだクリップのつなぎ目と同じフレームで区切れている別のトラックの、
+        # 選んでいないクリップまで寄せる（Codex の指摘）
+        work = JumpCut()
+        project, _track, _before, after = with_bystander(work)
+        monkeypatch.setattr(
+            main_window_module,
+            "ask_seams",
+            lambda _parent, _style, _note: SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0),
+        )
+        window = MainWindow(project, confirm_unsaved=False)
+        opened.append(window)
+        _menu_action(window, work.video, 90, SEAMS_TEXT).trigger()
+        located = window.document.project.timeline.locate_clip(after.id)
+        assert located is not None and located[1] == after
+        assert window.document.can_undo
 
     def test_cancelling_changes_nothing(
         self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch

@@ -183,11 +183,13 @@ from sashimono.core.seams import (
     SEAM_ZOOM,
     SEAM_ZOOM_PERCENT_RANGE,
     SeamPlan,
+    SeamScope,
     SeamStyle,
     SmoothCuts,
     find_seams,
     plan_smoothing,
     seams_after_cuts,
+    touching_scope,
 )
 from sashimono.core.timebase import (
     FrameRate,
@@ -2466,6 +2468,24 @@ def _set_clip_property(host: EditorHost, arguments: dict[str, Any]) -> object:
 _SPEED_KEEPS = ("content", "length")
 
 
+def _source_end(project: Project, clip: Clip) -> tuple[str, Fraction] | None:
+    """クリップが流す物（素材か入れ子のシーン）の名前と長さ（秒） 終わりの無い物は ``None``
+
+    シーンも描画と音のミキサは終わりを越えた時間を空として扱うので、素材と同じく終わりがある
+    見ないと、シーンを長さを保ったまま速くして終わりが黒く無音になっても AI に伝わらない
+    静止画は同じ 1 枚を出し続けるので終わりが無い
+    """
+    if clip.scene_id is not None:
+        scene = project.find_scene(clip.scene_id)
+        if scene is None or scene.timeline.duration <= 0:
+            return None
+        return "シーン", scene.timeline.duration * project.rate.frame_duration
+    media = project.find_media(clip.media_id) if clip.media_id is not None else None
+    if media is None or media.is_still or media.duration <= 0:
+        return None
+    return "素材", media.duration
+
+
 def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
     """クリップの再生速度を変える（#332 B6） リンクした絵と音は一緒に変わる"""
     if arguments.get("speed_percent") is None:
@@ -2506,17 +2526,18 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "timeline_end": clip.timeline_end,
             }
         )
-        media = after.find_media(clip.media_id) if clip.media_id is not None else None
-        if media is None or media.is_still or media.duration <= 0:
+        source_end = _source_end(after, clip)
+        if source_end is None:
             continue
-        over = clip.source_out(after.rate) - media.duration
-        if over <= 0:
-            continue
+        what, length = source_end
+        over = clip.source_out(after.rate) - length
         # 長さを保つ変え方で速くすると、素材の終わりを越える AI が気付かないまま書き出すと、
         # 絵は終わりが黒くなり、音は無音になる 絵を素材の中で止めて（hold_at）いれば絵は黒く
         # ならないので言わない（言うと直す必要の無い trim_clip を勧める） 音は止めない決まり
         # レイヤー（混合トラック）のクリップは 1 本で絵と音の両方を出すので、両方を見て書く
-        held = clip.hold_at is not None and clip.hold_at <= media.duration
+        if over <= 0:
+            continue
+        held = clip.hold_at is not None and clip.hold_at <= length
         picture_lost = after.draws_picture(track, clip) and not held
         sound_lost = after.plays_sound(track, clip)
         if picture_lost and sound_lost:
@@ -2528,7 +2549,7 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
         else:
             continue
         warnings.append(
-            f"{clip.id} は素材の終わりを {float(over):.2f} 秒越えます {lost}ので、"
+            f"{clip.id} は{what}の終わりを {float(over):.2f} 秒越えます {lost}ので、"
             "trim_clip で終わりを詰めるか、keep を content にしてください"
         )
     result: dict[str, object] = {
@@ -3122,8 +3143,11 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         style = _seam_style(host, arguments)
         frames = seams_after_cuts(ranges)
         transition = seam_transition(style)
-        plan = plan_smoothing(cut.apply(project), frames, style, transition)
-        commands.append(SmoothCuts(frames, style, transition))
+        # 詰めてできたつなぎ目は同じ素材を飛び飛びにつないだ対 同じフレームで前から区切れて
+        # いた別のトラックの関係の無いクリップは処理しない
+        jumps = SeamScope(jumps_only=True)
+        plan = plan_smoothing(cut.apply(project), frames, style, transition, jumps)
+        commands.append(SmoothCuts(frames, style, transition, jumps))
         result["smoothing"] = _seam_result(plan, style, clip_ids=False)
     host.apply_commands(commands, f"無音カット: {len(ranges)} か所")
     return result
@@ -3210,11 +3234,36 @@ def _seam_result(plan: SeamPlan, style: SeamStyle, *, clip_ids: bool = True) -> 
     return result
 
 
+def _seam_scope(project: Project, tracks: tuple[TrackId, ...] | None, named: object) -> SeamScope:
+    """処理する対の決まり 探したつなぎ目は同じ素材を飛び飛びにつないだ対だけ、位置を名指し
+    （``named``）したら別の素材へ切り替えた対も入れる トラックを渡したら、そのトラックの
+    クリップとリンクした相手の対だけ
+
+    フレームだけで処理すると、同じフレームで区切れている別のトラックの関係の無いクリップまで
+    寄せたりフェードを入れたりし、そこの短いクリップのせいでクロスフェードごと断られる
+    """
+    jumps_only = named is None
+    if tracks is None:
+        return SeamScope(jumps_only=jumps_only)
+    on_track = tuple(
+        clip.id for track in project.timeline.tracks if track.id in tracks for clip in track.clips
+    )
+    return replace(touching_scope(project, on_track), jumps_only=jumps_only)
+
+
 def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
     """つなぎ目を目立たなくする 位置を渡さなければ、同じ素材を飛び飛びにつないだ所を探す"""
     project = _project(host)
     _no_explicit_null(arguments, "frames")
     raw = arguments.get("frames")
+    track_id = arguments.get("track_id")
+    tracks: tuple[TrackId, ...] | None = None
+    if track_id is not None:
+        if project.timeline.find_track(TrackId(str(track_id))) is None:
+            raise ToolError(
+                f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）"
+            )
+        tracks = (TrackId(str(track_id)),)
     if raw is not None:
         if not isinstance(raw, list) or not raw:
             raise ToolError("frames はつなぎ目のフレームの配列で渡してください（省くと探します）")
@@ -3222,14 +3271,6 @@ def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
         if frames[0] < 1:
             raise ToolError("frames は 1 以上です（0 フレームの前にクリップは無い）")
     else:
-        track_id = arguments.get("track_id")
-        tracks: tuple[TrackId, ...] | None = None
-        if track_id is not None:
-            if project.timeline.find_track(TrackId(str(track_id))) is None:
-                raise ToolError(
-                    f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）"
-                )
-            tracks = (TrackId(str(track_id)),)
         # 範囲は整数のフレームで受ける 小数を切り捨てて探すと、頼んだのと違う範囲を黙って見る
         start = _frame_argument(arguments, "start_frame", 0)
         if start < 0:
@@ -3253,7 +3294,9 @@ def _smooth_cuts(host: EditorHost, arguments: dict[str, Any]) -> object:
             "start_frame と end_frame で分けて呼んでください"
         )
     style = _seam_style(host, arguments)
-    plan = plan_smoothing(project, frames, style, seam_transition(style))
+    plan = plan_smoothing(
+        project, frames, style, seam_transition(style), _seam_scope(project, tracks, raw)
+    )
     if not plan.commands:
         reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
         raise ToolError(
@@ -5940,7 +5983,9 @@ OPERATIONS: tuple[Operation, ...] = (
                     "items": {"type": "integer"},
                     "description": "つなぎ目のフレーム（前のクリップの終わり=後ろのクリップの頭）",
                 },
-                "track_id": _string("探すトラック 省くと全部（frames を省いたときだけ）"),
+                "track_id": _string(
+                    "このトラックのクリップ（とリンクした相手）の所だけを処理する 省くと全部"
+                ),
                 "start_frame": _integer("探す範囲の頭（frames を省いたときだけ）"),
                 "end_frame": _integer("探す範囲の終わり 含まない（frames を省いたときだけ）"),
                 **_SEAM_ARGUMENTS,

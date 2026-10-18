@@ -135,7 +135,13 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
-from sashimono.core.seams import SEAM_NONE, SeamStyle, plan_smoothing, seams_touching
+from sashimono.core.seams import (
+    SEAM_NONE,
+    SeamStyle,
+    plan_smoothing,
+    seams_touching,
+    touching_scope,
+)
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -3544,7 +3550,13 @@ class MainWindow(QMainWindow):
         if style.video == SEAM_NONE and style.audio_fade_ms == 0:
             self.statusBar().showMessage("映像も音も処理しない設定です", 5000)
             return False
-        plan = plan_smoothing(project, frames, style, seam_transition(style))
+        plan = plan_smoothing(
+            project,
+            frames,
+            style,
+            seam_transition(style),
+            touching_scope(project, tuple(clip_ids)),
+        )
         if not plan.commands:
             reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
             self.statusBar().showMessage(f"つなぎ目に付けられませんでした（{reasons}）", 8000)

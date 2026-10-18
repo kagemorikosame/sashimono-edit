@@ -37,7 +37,7 @@ from sashimono.core.model import (
     Track,
     TrackId,
 )
-from sashimono.core.timebase import Rounding, seconds_to_frame
+from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
     "DEFAULT_SEAM_AUDIO_FADE_MS",
@@ -53,12 +53,14 @@ __all__ = [
     "SEAM_ZOOM",
     "SEAM_ZOOM_PERCENT_RANGE",
     "SeamPlan",
+    "SeamScope",
     "SeamStyle",
     "SmoothCuts",
     "find_seams",
     "plan_smoothing",
     "seams_after_cuts",
     "seams_touching",
+    "touching_scope",
 ]
 
 #: 映像に何もしない（音だけ処理する）
@@ -98,6 +100,25 @@ class SeamStyle:
     crossfade_ms: int = DEFAULT_SEAM_CROSSFADE_MS
     zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
     audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
+
+
+@dataclass(frozen=True, slots=True)
+class SeamScope:
+    """つなぎ目で処理する前後のクリップの対の決まり
+
+    フレームだけで探すと、同じフレームで区切れている別のトラックの関係の無いクリップまで
+    寄せたりフェードを入れたりし、そこの短いクリップのせいでクロスフェードごと断られる
+    ``jumps_only`` は同じ素材を飛び飛びにつないだ対（:func:`find_seams` と同じ決まり）だけ
+    ``clip_ids`` を渡せば、前か後ろがその中にある対だけ
+    """
+
+    jumps_only: bool = False
+    clip_ids: frozenset[ClipId] | None = None
+
+    def takes(self, rate: FrameRate, left: Clip, right: Clip) -> bool:
+        if self.jumps_only and not _is_jump(rate, left, right):
+            return False
+        return self.clip_ids is None or left.id in self.clip_ids or right.id in self.clip_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,27 +181,34 @@ def find_seams(
             frame = right.timeline_start
             if left.timeline_end != frame or frame < start or (end is not None and frame >= end):
                 continue
-            if not (left.enabled and right.enabled) or left.media_id is None:
-                continue
-            if left.media_id != right.media_id or left.scene_id or right.scene_id:
-                continue
-            # 半フレーム分より近ければ続いている 分割の計算は分数なので普通はちょうど一致する
-            step = rate.frame_duration * left.speed / 2
-            if abs(right.source_in - left.source_out(rate)) <= step:
-                continue
-            found.add(frame)
+            if left.enabled and right.enabled and _is_jump(rate, left, right):
+                found.add(frame)
     return tuple(sorted(found))
 
 
-def _pairs_at(project: Project, frame: int) -> list[tuple[Track, Clip, Clip]]:
-    """``frame`` で接する前後のクリップ（ロックしていないトラック、どちらも有効な物）"""
+def _is_jump(rate: FrameRate, left: Clip, right: Clip) -> bool:
+    """接した前後のクリップが、同じ素材を飛び飛びにつないだ物か"""
+    if left.media_id is None or left.media_id != right.media_id:
+        return False
+    if left.scene_id or right.scene_id:
+        return False
+    # 半フレーム分より近ければ続いている 分割の計算は分数なので普通はちょうど一致する
+    step = rate.frame_duration * left.speed / 2
+    return abs(right.source_in - left.source_out(rate)) > step
+
+
+def _pairs_at(project: Project, frame: int, scope: SeamScope) -> list[tuple[Track, Clip, Clip]]:
+    """``frame`` で接する前後のクリップ（ロックしていないトラック、どちらも有効な物で、
+    ``scope`` に入る物）"""
     pairs: list[tuple[Track, Clip, Clip]] = []
     for track in project.timeline.tracks:
         if track.locked:
             continue
         left = next((c for c in track.clips if c.timeline_end == frame), None)
         right = next((c for c in track.clips if c.timeline_start == frame), None)
-        if left is not None and right is not None and left.enabled and right.enabled:
+        if left is None or right is None or not (left.enabled and right.enabled):
+            continue
+        if scope.takes(project.rate, left, right):
             pairs.append((track, left, right))
     return pairs
 
@@ -235,12 +263,16 @@ def plan_smoothing(
     frames: tuple[int, ...],
     style: SeamStyle,
     transition: GeneratedSource | None = None,
+    scope: SeamScope | None = None,
 ) -> SeamPlan:
     """``frames`` のつなぎ目を ``style`` で処理する命令を組む
 
     ``transition`` はクロスフェードに置く場面切り替えの中身（クロスフェードの時だけ要る）
     コアはエフェクトの定義を読めないので、呼ぶ側が既定の値を埋めて渡す
+    ``scope`` は処理する前後のクリップの対の決まり（:class:`SeamScope`） 省けば、そのフレームで
+    接する全トラックの対（AI が位置を名指ししたとき）
     """
+    scope = scope or SeamScope()
     if style.video not in SEAM_VIDEOS:
         raise ValueError(f"知らない映像の処理です: {style.video}")
     if style.video == SEAM_CROSSFADE and transition is None:
@@ -252,13 +284,13 @@ def plan_smoothing(
     audio: list[int] = []
     zoomed: list[ClipId] = []
     crossfades: list[tuple[int, int]] = []
-    missing = tuple(frame for frame in ordered if not _pairs_at(project, frame))
+    missing = tuple(frame for frame in ordered if not _pairs_at(project, frame, scope))
 
     if style.audio_fade_ms > 0:
         seconds = style.audio_fade_ms / 1000
         for frame in ordered:
             touched = False
-            for track, left, right in _pairs_at(builder.project, frame):
+            for track, left, right in _pairs_at(builder.project, frame, scope):
                 if not (project.plays_sound(track, left) and project.plays_sound(track, right)):
                     continue
                 rate = project.rate
@@ -277,7 +309,7 @@ def plan_smoothing(
     if style.video == SEAM_ZOOM:
         raised: set[ClipId] = set()
         for frame in ordered:
-            for track, left, right in _pairs_at(builder.project, frame):
+            for track, left, right in _pairs_at(builder.project, frame, scope):
                 if not (
                     can_emphasize(project, track, left) and can_emphasize(project, track, right)
                 ):
@@ -315,7 +347,7 @@ def plan_smoothing(
             1, seconds_to_frame(Fraction(style.crossfade_ms, 1000), project.rate, Rounding.NEAREST)
         )
         for frame in ordered:
-            reason = _crossfade(builder, project, frame, wanted, transition, crossfades)
+            reason = _crossfade(builder, project, frame, wanted, transition, crossfades, scope)
             if reason is None:
                 handled.add(frame)
             elif reason:
@@ -345,6 +377,7 @@ def _crossfade(
     wanted: int,
     transition: GeneratedSource,
     placed: list[tuple[int, int]],
+    scope: SeamScope,
 ) -> str | None:
     """つなぎ目に場面切り替えを置く 置いたら ``None``、置けなければ理由を返す
     つなぎ目ではない所（前で数えた）は空の理由
@@ -357,11 +390,13 @@ def _crossfade(
     """
     pictures = [
         (track, left, right)
-        for track, left, right in _pairs_at(builder.project, frame)
+        for track, left, right in _pairs_at(builder.project, frame, scope)
         if project.draws_picture(track, left) and project.draws_picture(track, right)
     ]
     if not pictures:
-        return "" if not _pairs_at(builder.project, frame) else "絵のつなぎ目ではない（音だけ）"
+        return (
+            "" if not _pairs_at(builder.project, frame, scope) else "絵のつなぎ目ではない（音だけ）"
+        )
     start = frame - 1
     if any(
         clip.source is not None
@@ -397,20 +432,22 @@ class SmoothCuts(Command):
     frames: tuple[int, ...]
     style: SeamStyle
     transition: GeneratedSource | None = None
+    #: 処理する対の決まり 無音カットは同じ素材を飛び飛びにつないだ対だけ（詰めてできた所）
+    scope: SeamScope = SeamScope()
 
     @property
     def label(self) -> str:
         return f"つなぎ目を目立たなくする: {len(self.frames)} か所"
 
     def apply(self, project: Project) -> Project:
-        return plan_smoothing(project, self.frames, self.style, self.transition).project
+        return plan_smoothing(project, self.frames, self.style, self.transition, self.scope).project
 
 
 def seams_touching(project: Project, clip_ids: tuple[ClipId, ...]) -> tuple[int, ...]:
     """``clip_ids`` の頭か終わりにあるジャンプカットのつなぎ目（右クリックの相手）
 
     選んだクリップのトラックと、リンクした相手のトラックで探す 絵だけを選んでも、音の
-    継ぎ目は同じフレームにあるので一緒に処理される（:func:`plan_smoothing` は全トラックを見る）
+    継ぎ目は同じフレームにあるので一緒に処理される 処理する対は :func:`touching_scope` で絞る
     選んでいないクリップどうしのつなぎ目は入れない 範囲で探すと、選んだクリップの間に挟まった
     別の所まで変わる
     """
@@ -429,3 +466,22 @@ def seams_touching(project: Project, clip_ids: tuple[ClipId, ...]) -> tuple[int,
     if not tracks:
         return ()
     return tuple(frame for frame in find_seams(project, track_ids=tuple(tracks)) if frame in edges)
+
+
+def touching_scope(project: Project, clip_ids: tuple[ClipId, ...]) -> SeamScope:
+    """右クリックで選んだクリップ（とリンクした相手）が前か後ろにいるジャンプカットの対だけ
+
+    フレームだけを渡すと、同じフレームで区切れている別のトラックの、選んでいないクリップまで
+    寄せたりフェードを入れたりする
+    """
+    timeline = project.timeline
+    chosen: set[ClipId] = set()
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is None:
+            continue
+        clip = located[1]
+        chosen.add(clip.id)
+        if clip.link_group is not None:
+            chosen.update(partner.id for _, partner in timeline.linked_clips(clip.link_group))
+    return SeamScope(jumps_only=True, clip_ids=frozenset(chosen))

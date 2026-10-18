@@ -42,11 +42,13 @@ from sashimono.core.seams import (
     SEAM_CROSSFADE,
     SEAM_NONE,
     SEAM_ZOOM,
+    SeamScope,
     SeamStyle,
     SmoothCuts,
     find_seams,
     plan_smoothing,
     seams_after_cuts,
+    touching_scope,
 )
 from sashimono.core.timebase import FrameRate
 
@@ -310,6 +312,75 @@ class TestZoom:
         plan = plan_smoothing(project, (60,), SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0))
         assert plan.commands == ()
         assert plan.skipped == ((60, f"{second.id} の拡大率がキーフレームで動いている"),)
+
+
+def with_bystander(work: JumpCut) -> tuple[Project, Track, Clip, Clip]:
+    """V2 に、つなぎ目と同じ 60 フレームで区切れている関係の無いクリップを足す
+
+    ただ分割しただけ（素材の時刻が続いている）で、後ろは 1 フレームしかない
+    """
+    bystander = Track(TrackKind.VIDEO, "V2")
+    project = work.project.with_timeline(
+        replace(work.project.timeline, tracks=(*work.project.timeline.tracks, bystander))
+    )
+    transform = (fixed_effect(TRANSFORM_EFFECT_KIND),)
+    before = Clip(
+        timeline_start=0,
+        duration=60,
+        media_id=work.media.id,
+        source_in=Fraction(20),
+        effects=transform,
+    )
+    after = Clip(
+        timeline_start=60,
+        duration=1,
+        media_id=work.media.id,
+        source_in=Fraction(22),
+        effects=transform,
+    )
+    project = AddClip(bystander.id, before).apply(project)
+    project = AddClip(bystander.id, after).apply(project)
+    return project, bystander, before, after
+
+
+class TestScope:
+    def test_the_chosen_clips_leave_other_tracks_alone(self) -> None:
+        # 壊れると、右クリックで選んだクリップのつなぎ目と同じフレームで区切れている別のトラックの
+        # クリップまで寄せ、そこの 1 フレームのクリップのせいでクロスフェードごと断られる
+        # （Codex の指摘）
+        work = JumpCut()
+        project, _track, _before, after = with_bystander(work)
+        scope = touching_scope(project, (work.pictures[1].id,))
+        zoom = plan_smoothing(
+            project, (60,), SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0), scope=scope
+        )
+        assert zoom.zoomed == (work.pictures[1].id,)
+        assert _scale(zoom.project, after) == 100.0
+        fade = plan_smoothing(project, (60,), SeamStyle(audio_fade_ms=0), FADE, scope)
+        assert fade.crossfades == ((60, 3),)
+
+    def test_jumps_only_skips_a_plain_split_at_the_same_frame(self) -> None:
+        # 壊れると、無音を詰めた所の処理が、同じフレームで前から区切れていた別のトラックの
+        # クリップにも掛かる
+        work = JumpCut()
+        project, _track, before, after = with_bystander(work)
+        plan = plan_smoothing(
+            project,
+            (60,),
+            SeamStyle(video=SEAM_ZOOM),
+            scope=SeamScope(jumps_only=True),
+        )
+        assert plan.zoomed == (work.pictures[1].id,)
+        assert _scale(plan.project, after) == 100.0
+        effects = [e.kind for e in _clip(plan.project, before).effects]
+        assert FADE_EFFECT_KIND not in effects
+
+    def test_without_a_scope_every_track_at_the_frame_is_handled(self) -> None:
+        # 壊れると、AI が位置を名指しした（別の素材へ切り替えた所など）ときに何も付かない
+        work = JumpCut()
+        project, _track, _before, after = with_bystander(work)
+        plan = plan_smoothing(project, (60,), SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0))
+        assert after.id in plan.zoomed
 
 
 class TestOneUndo:
