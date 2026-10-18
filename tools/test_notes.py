@@ -177,12 +177,28 @@ def _test_flag(body: list[ast.stmt], owner: str | None = None) -> bool | None:
 
 
 def _exports(module: _Module) -> frozenset[str] | None:
-    """``__all__`` に文字の並びで直に書いた名前 書いていないか、式で作っていれば None"""
-    for node in reversed(list(_statements(module.tree.body))):
+    """``__all__`` に文字の並びで直に書いた名前 書いていないか、式で作っていれば None
+
+    読み解くのは、ファイルの中で ``__all__`` が出てくるのが、直下で文字の並びを
+    結ぶ 1 か所だけのときに限る ``+=``・``extend``・``append``・``del``・添字への代入・
+    ``__all__`` を渡す呼び出し・``globals()["__all__"]`` など、ほかに 1 つでも出てくれば
+    書き換えの形を見分けずに None（多めに数える側）へ倒す 形ごとに読み解くと、読まない
+    形で足した名前を落とし、書き添えの無い試験を見逃す（#377 の CodeRabbit）
+    """
+    mentions = [
+        node
+        for node in ast.walk(module.tree)
+        if (isinstance(node, ast.Name) and node.id == "__all__")
+        or (isinstance(node, ast.Attribute) and node.attr == "__all__")
+        or (isinstance(node, ast.Constant) and node.value == "__all__")
+    ]
+    if len(mentions) != 1:
+        return None
+    for node in _statements(module.tree.body):
         if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+        if not any(target is mentions[0] for target in targets):
             continue
         value = node.value
         if isinstance(value, ast.List | ast.Tuple) and all(

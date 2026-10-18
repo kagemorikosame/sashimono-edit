@@ -419,8 +419,35 @@ class TestWhatPytestSkips:
             ('__all__ = ("test_b", "test_z")\n', ["test_b", "test_z"]),
             ("__all__ = names()\n", ["test_b", "test_z"]),
             ("", ["test_b", "test_z"]),
+            # ここから下は書き換えた __all__ どれも読み解かず全部数える
+            ('__all__ = ["test_b"]\n__all__ += ["test_z"]\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\n__all__.extend(["test_z"])\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\n__all__.append("test_z")\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\n__all__.insert(0, "test_z")\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b", "x"]\n__all__[1] = "test_z"\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\ngrow(__all__)\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\nglobals()["__all__"] = ["test_z"]\n', ["test_b", "test_z"]),
+            ('__all__ = ["test_b"]\n__all__ = ["test_b", "test_z"]\n', ["test_b", "test_z"]),
+            (
+                'def grow():\n    global __all__\n    __all__ = ["test_z"]\n__all__ = ["test_b"]\n',
+                ["test_b", "test_z"],
+            ),
         ],
-        ids=["list", "tuple", "expression-counts-all", "no-all"],
+        ids=[
+            "list",
+            "tuple",
+            "expression-counts-all",
+            "no-all",
+            "augmented",
+            "extend",
+            "append",
+            "insert",
+            "item-assignment",
+            "passed-to-a-call",
+            "through-globals",
+            "assigned-twice",
+            "inside-a-function",
+        ],
     )
     def test_a_star_import_follows_all(
         self, tool: ModuleType, tmp_path: Path, exports: str, expected: list[str]
