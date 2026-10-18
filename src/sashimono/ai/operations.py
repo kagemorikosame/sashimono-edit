@@ -3331,15 +3331,8 @@ def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
             raise ToolError(
                 "steps と this_instruction は一緒に使えません どちらか一方にしてください"
             )
-        steps = len(document.steps_in_checkpoint)
-        if steps == 0 and document.undo_by is not Author.PERSON:
-            raise ToolError(
-                "この指示ではまだ何も変えていません 前の指示を戻すなら、"
-                "this_instruction を付けずに undo を呼んでください"
-            )
-        steps = max(steps, 1)
-    else:
-        steps = max(1, int(arguments.get("steps", 1)))
+        return _undo_this_instruction(host)
+    steps = max(1, int(arguments.get("steps", 1)))
     undone, blocked = _step_history(host, steps, forward=False)
     if not undone:
         if blocked is not None:
@@ -3348,6 +3341,43 @@ def _undo(host: EditorHost, arguments: dict[str, Any]) -> object:
     result: dict[str, object] = {"undone": undone, "can_redo": document.can_redo}
     if blocked is not None:
         result["stopped"] = f"{PERSON_UNDO_REFUSAL} ここで止めました"
+    return result
+
+
+#: 指示が人の変更で割れ、前半が人の段の下に残ったときの知らせ
+PERSON_SPLIT_NOTE = (
+    "この指示の前半は、人が後から手で変えた段の下にあるので戻していません 戻すなら Ctrl+Z で"
+)
+
+
+def _undo_this_instruction(host: EditorHost) -> object:
+    """今の指示で変えた物を戻す 人の変更で割れた前半の段も、人の段の上にある間は戻す
+
+    数を先に数えて戻すと、人の変更で割れた指示の前半（段の外へ先に積んだ段）を数えず、
+    後半だけ戻して「戻した」と言ってしまう 1 段ずつ、指示の物かを見て戻す
+    """
+    document = host.document
+    undone: list[str] = []
+    # 戻すたびに 1 段減るので、履歴の段数より多くは回らない 念のため上限を置く
+    for _ in range(len(document.history_labels) + 1):
+        if not document.undo_in_checkpoint:
+            break
+        label = document.undo_label
+        if label is None:
+            break
+        host.undo()
+        undone.append(label)
+    left = document.parts_left_in_checkpoint
+    if not undone:
+        if left:
+            raise ToolError(f"{PERSON_UNDO_REFUSAL} 人の段 {document.undo_label}")
+        raise ToolError(
+            "この指示ではまだ何も変えていません 前の指示を戻すなら、"
+            "this_instruction を付けずに undo を呼んでください"
+        )
+    result: dict[str, object] = {"undone": undone, "can_redo": document.can_redo}
+    if left:
+        result["stopped"] = PERSON_SPLIT_NOTE
     return result
 
 

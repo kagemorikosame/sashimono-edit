@@ -252,6 +252,31 @@ class TestThePersonsStepsAreLeftAlone:
         assert _tracks(host) == 2
         assert _clip_count(host) == 2
 
+    def test_the_whole_instruction_says_the_first_half_was_left(self, host: FakeHost) -> None:
+        """壊れると、人の変更で割れた指示の後半だけ戻して「全部戻した」ように見え、前半が残る
+
+        人が自分の段を Ctrl+Z で戻した後は、前半も同じ頼みで戻せる
+        """
+        host.document.begin_checkpoint("AI: 切って", by=Author.AI)
+        _split(host, 200)
+        _person_adds_a_track(host)
+        _split(host, 100)
+
+        result = run(host, "undo", this_instruction=True)
+
+        assert result["undone"] == ["クリップを分割"]
+        assert "前半" in result["stopped"]
+        assert _clip_count(host) == 2
+        host.document.undo()  # 人が自分のトラックを Ctrl+Z で戻した
+        assert _tracks(host) == 1
+
+        again = run(host, "undo", this_instruction=True)
+
+        assert again["undone"] == ["AI: 切って"]
+        assert "stopped" not in again
+        assert _clip_count(host) == 1
+        host.document.end_checkpoint()
+
     def test_redo_refuses_a_persons_step(self, host: FakeHost) -> None:
         """壊れると、人が Ctrl+Z で戻した自分の変更を、AI が勝手にやり直す"""
         _person_adds_a_track(host)

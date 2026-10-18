@@ -367,3 +367,86 @@ class TestWhoMadeTheStep:
         for _ in range(3):
             document.undo()
         assert first_half in document.past_projects
+
+
+class _SameProject(RenameProject):
+    """何も変えないコマンド（同じプロジェクトを返す）"""
+
+    def apply(self, project: Project) -> Project:
+        return project
+
+
+class TestHowStepsArePiled:
+    """段の積み方・やり直しの捨て方・印の継ぎ方（Sourcery の指摘 #379）"""
+
+    def test_redoing_an_earlier_step_in_a_turn_adds_no_step(self, project: Project) -> None:
+        """壊れると、指示の中で前の段をやり直しただけで、取り消しても何も起きない段が増える"""
+        document = Document(project)
+        _named(document, "一")
+        document.undo()
+        document.begin_checkpoint("AI: やり直して", by=Author.AI)
+        document.redo()
+        assert document.steps_in_checkpoint == ()
+        document.end_checkpoint()
+
+        assert document.history_labels == ("プロジェクト名を変更",)
+        document.undo()
+        assert document.project is project
+
+    def test_partly_redone_steps_stay_redoable_after_the_turn(self, project: Project) -> None:
+        """壊れると、指示の中で一部だけやり直した後、残りのやり直しが指示を閉じた所で消える"""
+        document = Document(project)
+        _named(document, "一", "二")
+        document.undo()
+        document.undo()
+        document.begin_checkpoint("AI: 1 つやり直して", by=Author.AI)
+        document.redo()
+        document.end_checkpoint()
+
+        assert document.project.name == "一"
+        assert document.can_redo is True
+        document.redo()
+        assert document.project.name == "二"
+
+    def test_a_command_that_changes_nothing_leaves_no_step(self, project: Project) -> None:
+        """壊れると、何も変えない人の操作が人の段として積まれ、AI が自分の指示を戻せなくなる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 指示", by=Author.AI)
+        _by_ai(document, "AI")
+        document.execute(_SameProject("同じ"), by=Author.PERSON)
+        document.end_checkpoint()
+        document.execute(_SameProject("同じ"), by=Author.PERSON)
+
+        assert document.history_labels == ("AI: 指示",)
+        assert _undo_by(document) is Author.AI
+
+    def test_an_ai_command_inside_a_persons_group_is_the_ais_step(self, project: Project) -> None:
+        """壊れると、人のまとめの中で AI と書いて当てた変更が人の段になり、AI が戻せない"""
+        document = Document(project)
+        with document.checkpoint("人のまとめ", by=Author.PERSON):
+            _person_adds_a_track(document)
+            document.execute(RenameProject("AI の名前"), by=Author.AI)
+
+        # 人の分はまとめの名前の段、AI の分はコマンドの名前の段になる
+        assert document.history_labels == ("人のまとめ", "プロジェクト名を変更")
+        assert _undo_by(document) is Author.AI
+        document.undo()
+        assert _undo_by(document) is Author.PERSON
+        assert _tracks(document) == len(project.timeline.tracks) + 1
+
+    def test_steps_inside_a_long_turn_are_capped(self, project: Project) -> None:
+        """壊れると、1 つの指示で何百手も積むと手ごとの形を閉じるまで抱え続け、重くなる
+
+        上限を越えた古い手は 1 手にまとめる 戻し切れば指示の前へちゃんと届く
+        """
+        document = Document(project, history_limit=3)
+        document.begin_checkpoint("AI: たくさん", by=Author.AI)
+        _named(document, *[f"名前{index}" for index in range(10)])
+
+        assert len(document.steps_in_checkpoint) == 3
+        for _ in range(3):
+            document.undo()
+        assert document.project is project
+        assert document.can_undo is False
+        document.end_checkpoint()
+        assert document.can_redo is True

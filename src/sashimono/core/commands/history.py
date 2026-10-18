@@ -92,6 +92,10 @@ class Document:
         self._nested_label = ""
         self._nested_merge = False
         self._nested_by = Author.PERSON
+        #: 開いた段が別の人の変更で割れたとき、先に積んだ前半の段の ``before`` 段の外へ
+        #: 積んでも、この段（指示）の物として数える（:attr:`undo_in_checkpoint`）
+        #: 段を覚えず ``before`` で見分けるのは、取り消して・やり直すと段が作り直されるため
+        self._earlier_parts: list[Project] = []
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
@@ -141,19 +145,24 @@ class Document:
 
         ``by`` を省くと、開いている段の印を継ぐ（段の外なら人） 編集画面の人の操作は
         ``Author.PERSON`` を書く 書かないと、AI の指示の途中の人の変更が AI の段に混ざる
+        まとめ（段の中の段）の中では、まとめの印が勝つ（1 つのまとめは 1 人の変更）
         コマンドが例外を投げた場合、プロジェクトも履歴も一切変わらない
+        何も変えなかったコマンド（同じプロジェクトを返した）は履歴に積まない 積むと、
+        取り消しても何も起きない段が挟まり、人の段に数えられて AI の取り消しを止める
         """
         updated = command.apply(self._project)
+        if updated is self._project:
+            return updated
 
+        author = by or (self._checkpoint_by if self._checkpoint_depth else Author.PERSON)
         if self._checkpoint_depth == 0:
-            self._push_undo(HistoryEntry(command.label, self._project, by or Author.PERSON))
+            self._push_undo(HistoryEntry(command.label, self._project, author))
             self._redo.clear()
         elif self._checkpoint_depth == 1:
-            if self._splits(by or self._checkpoint_by):
-                self._land_person(command.label, self._project, updated, merge=False)
+            if author is not self._checkpoint_by:
+                self._land_other(command.label, self._project, updated, author, merge=False)
             else:
-                entry = HistoryEntry(command.label, self._project, self._checkpoint_by)
-                self._push_inner(entry, merge=False)
+                self._push_inner(HistoryEntry(command.label, self._project, author), merge=False)
 
         self._set_project(updated)
         return updated
@@ -175,8 +184,8 @@ class Document:
         ``merge`` と ``by`` については :meth:`begin_checkpoint` を参照
         """
         start = self._project
-        # 一番外の段なら、始めた時の履歴を覚える 段の途中で人の変更を分けると、AI と人の段を
-        # その場で履歴へ積む（_land_person） 断られて形だけ戻すと、戻した後の形に合わない段が残る
+        # 一番外の段なら、始めた時の履歴を覚える 段の途中で別の人の変更を分けると、段を
+        # その場で履歴へ積む（_land_other） 断られて形だけ戻すと、戻した後の形に合わない段が残る
         outermost = self._checkpoint_depth == 0
         history = (list(self._undo), list(self._redo), self._merge_anchor)
         self.begin_checkpoint(label, merge=merge, by=by)
@@ -186,11 +195,8 @@ class Document:
             if outermost and self._checkpoint_depth == 1:
                 # 一番外の段が断られた 段の中の小さな段は戻した先に無いので捨て、
                 # 履歴も始めた時へ戻す 残すと、閉じる所で前に取り消した物のやり直しまで消し、
-                # 途中で積んだ AI と人の段が戻した後の形に合わないまま残る
-                self._inner_undo.clear()
-                self._inner_redo.clear()
-                self._inner_anchor = None
-                self._inner_touched = False
+                # 途中で積んだ段が戻した後の形に合わないまま残る
+                self._reset_inner()
                 self._undo, self._redo, self._merge_anchor = history
                 self._checkpoint_before = start
             if self._project is not start:
@@ -211,19 +217,18 @@ class Document:
         積まずにそこへまとめる ホイールを回し続けたぶんが 1 段ずつ積まれると、
         戻すのに同じ回数だけ取り消すことになる
 
-        ``by`` は誰の変更か AI の段（AI の指示）を開いている間に人が変えた物は、その段に
-        混ぜずに人の段として分けて積む（2026-10-18 利用者の決定） 混ぜると、AI の指示を
-        取り消したときに人の変更まで消える 省くと開いている段の印を継ぐ（段の外なら人）
+        ``by`` は誰の変更か 段は 1 人の変更だけを持つ AI の段（AI の指示）を開いている間に
+        人が変えた物は、その段に混ぜずに人の段として分けて積む（2026-10-18 利用者の決定）
+        混ぜると、AI の指示を取り消したときに人の変更まで消える 逆に人の段の中の AI の変更も
+        分ける 省くと開いている段の印を継ぐ（段の外なら人）
         """
         if self._checkpoint_depth == 0:
             self._checkpoint_label = label
             self._checkpoint_before = self._project
             self._checkpoint_merge = merge
             self._checkpoint_by = by or Author.PERSON
-            self._inner_undo.clear()
-            self._inner_redo.clear()
-            self._inner_anchor = None
-            self._inner_touched = False
+            self._reset_inner()
+            self._earlier_parts = []
         elif self._checkpoint_depth == 1:
             self._nested_before = self._project
             self._nested_label = label
@@ -246,14 +251,14 @@ class Document:
         self._checkpoint_before = None
         inner_redo = list(self._inner_redo)
         touched = self._inner_touched
-        self._inner_undo.clear()
-        self._inner_redo.clear()
-        self._inner_anchor = None
-        self._inner_touched = False
+        self._reset_inner()
+        self._earlier_parts = []
         changed = before is not None and before is not self._project
-        if touched or changed:
+        if touched:
             # 段の中で変えた後は、段の外の古いやり直しは当てられない 段の中で最後に
             # 取り消した物だけを、閉じた後も人が Ctrl+Y でやり直せるよう残す
+            # 段の中で変えていなければ（段の外を取り消し・やり直しで辿っただけなら）、
+            # 段の外のやり直しの残りはそのまま残す 新しい変更が無いのに捨てる訳が無い
             self._redo = inner_redo
         # 何も変わらなかったチェックポイントは履歴に残さない
         # 「取り消しても何も起きない」段が挟まると操作感が悪い
@@ -274,9 +279,11 @@ class Document:
         if not continued:
             self._push_undo(HistoryEntry(self._checkpoint_label, before, self._checkpoint_by))
 
-    def _splits(self, by: Author) -> bool:
-        """AI の段を開いている間の人の変更か そうなら AI の段に混ぜずに分ける"""
-        return self._checkpoint_by is Author.AI and by is Author.PERSON
+    def _reset_inner(self) -> None:
+        self._inner_undo.clear()
+        self._inner_redo.clear()
+        self._inner_anchor = None
+        self._inner_touched = False
 
     def _close_nested(self) -> None:
         """開いた段の中の段（道具 1 回分）を閉じ、変わっていれば小さな段として積む"""
@@ -285,38 +292,41 @@ class Document:
         if before is None or before is self._project:
             self._inner_anchor = None
             return
-        if self._splits(self._nested_by):
-            self._land_person(self._nested_label, before, self._project, merge=self._nested_merge)
+        if self._nested_by is not self._checkpoint_by:
+            self._land_other(
+                self._nested_label, before, self._project, self._nested_by, merge=self._nested_merge
+            )
             return
         entry = HistoryEntry(self._nested_label, before, self._nested_by)
         self._push_inner(entry, merge=self._nested_merge)
 
-    def _land_person(self, label: str, before: Project, after: Project, *, merge: bool) -> None:
-        """AI の段の途中に人が変えた ``before`` → ``after`` を、人の段として分けて積む
+    def _land_other(
+        self, label: str, before: Project, after: Project, by: Author, *, merge: bool
+    ) -> None:
+        """開いた段の途中に別の人（``by``）が変えた ``before`` → ``after`` を、別の段として積む
 
-        それまでの AI の変更は、開いた段と同じ名前の AI の段として先に積み、人の段の後の
-        AI の変更はまた同じ名前で始め直す 1 つの指示が 2 段に割れるが、人の変更を挟んだ
-        前後の形しか持たないので、人の変更だけを残して指示を戻すにはこう分けるしかない
-        変わっていない（断られた）人の操作では割らない（呼ぶ側が変わった時だけ呼ぶ）
+        それまでの段の変更は、開いた段と同じ名前の段として先に積み、別の人の段の後の
+        変更はまた同じ名前で始め直す 1 つの指示が 2 段に割れるが、別の人の変更を挟んだ
+        前後の形しか持たないので、その人の変更だけを残して指示を戻すにはこう分けるしかない
+        先に積んだ段は「この段の前半」として覚える（:attr:`undo_in_checkpoint`）
+        呼ぶ側は変わった時だけ呼ぶ（断られた・何も変えなかった操作では割らない）
         """
-        ai_before = self._checkpoint_before
-        if ai_before is not None and ai_before is not before:
-            self._push_undo(HistoryEntry(self._checkpoint_label, ai_before, self._checkpoint_by))
-        self._inner_undo.clear()
-        self._inner_redo.clear()
-        self._inner_anchor = None
-        self._inner_touched = False
+        own_before = self._checkpoint_before
+        if own_before is not None and own_before is not before:
+            self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
+            self._earlier_parts.append(own_before)
+        self._reset_inner()
         top = self._undo[-1] if self._undo else None
         continued = (
             merge
             and top is not None
             and top is self._merge_anchor
             and top.label == label
-            and top.by is Author.PERSON
+            and top.by is by
         )
         if not continued:
-            self._push_undo(HistoryEntry(label, before, Author.PERSON))
-        # 人の新しい変更の後は、前に取り消した物はやり直せない（人の Ctrl+Y と同じ 1 本の履歴）
+            self._push_undo(HistoryEntry(label, before, by))
+        # 新しい変更の後は、前に取り消した物はやり直せない（人の Ctrl+Y と同じ 1 本の履歴）
         self._redo.clear()
         self._checkpoint_before = after
 
@@ -328,6 +338,12 @@ class Document:
         if not continued:
             self._inner_undo.append(entry)
             self._inner_anchor = entry
+            if len(self._inner_undo) > self._history_limit:
+                # 段の中の小さな段も上限まで 1 つの指示で何百手も積むと、手ごとの形を
+                # 閉じるまで抱えて重くなる 一番古い 2 手を 1 手にまとめて数を保つ
+                # 捨てると、戻し切った時に段の始まりへ届かず、段の外を引き抜いてしまう
+                first, second = self._inner_undo[0], self._inner_undo[1]
+                self._inner_undo[:2] = [HistoryEntry(second.label, first.before, first.by)]
         self._inner_redo.clear()
         self._inner_touched = True
 
@@ -342,6 +358,33 @@ class Document:
         AI の道具が「この指示で変えた物」を数えるのに使う（#333）
         """
         return tuple(entry.label for entry in self._inner_undo)
+
+    @property
+    def undo_in_checkpoint(self) -> bool:
+        """次に戻す段が、開いている段（指示）の物か
+
+        段の中の小さな段と、別の人の変更で割れて段の外へ先に積んだ前半の段が当たる
+        AI の「この指示を全部戻す」は、これが真の間だけ戻す（#333）
+        """
+        entry = self._next_undo()
+        if entry is None or not self._checkpoint_depth:
+            return False
+        if self._inner_undo:
+            return True
+        return self._is_earlier_part(entry)
+
+    @property
+    def parts_left_in_checkpoint(self) -> bool:
+        """開いている段（指示）の前半の段が、まだ段の外の履歴に残っているか
+
+        別の人の段の下にあると戻せない AI に「前半は戻していない」と伝えるのに使う
+        """
+        return any(self._is_earlier_part(entry) for entry in self._undo)
+
+    def _is_earlier_part(self, entry: HistoryEntry) -> bool:
+        return entry.by is self._checkpoint_by and any(
+            entry.before is part for part in self._earlier_parts
+        )
 
     @property
     def can_undo(self) -> bool:
