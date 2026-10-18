@@ -27,6 +27,15 @@ from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
 from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
+from sashimono.core.emphasis import (
+    EMPHASIS_EASING_NAMES,
+    EMPHASIS_EASINGS,
+    EMPHASIS_PAN_PX_RANGE,
+    EMPHASIS_POP_PERCENT_RANGE,
+    EMPHASIS_RAMP_MS_RANGE,
+    EMPHASIS_SHAKE_PX_RANGE,
+    EMPHASIS_ZOOM_PERCENT_RANGE,
+)
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
 from sashimono.engine.cache.proxy import (
@@ -830,6 +839,7 @@ class PreferencesDialog(QDialog):
             "短ければ、間でも戻さずに下げたままにする 短いと文の間で BGM が出入りして落ち着かない"
         )
         form.addRow("BGM が戻る速さ", self._duck_release)
+        self._add_emphasis_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -1072,9 +1082,69 @@ class PreferencesDialog(QDialog):
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),
             duck_release_ms=self._duck_release.value(),
+            emphasis_zoom_percent=self._emphasis_zoom.value(),
+            emphasis_pop_percent=self._emphasis_pop.value(),
+            emphasis_shake_px=self._emphasis_shake.value(),
+            emphasis_pan_px=self._emphasis_pan.value(),
+            emphasis_ramp_ms=self._emphasis_ramp.value(),
+            emphasis_easing=str(self._emphasis_easing.currentData()),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )
+
+    def _add_emphasis_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """強調の動き（#331）の既定 どれだけ寄るか・どれだけ速く動くかは人と作品で違う
+        AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        """
+
+        def spin(bounds: tuple[int, int], value: int, suffix: str, step: int = 1) -> QSpinBox:
+            box = QSpinBox(self)
+            box.setRange(*bounds)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            box.setValue(value)
+            return box
+
+        self._emphasis_zoom = spin(
+            EMPHASIS_ZOOM_PERCENT_RANGE, preferences.emphasis_zoom_percent, " %", 5
+        )
+        self._emphasis_zoom.setToolTip(
+            "AI アシスタントが話の要所で寄る（ズーム）ときの拡大率 今の大きさからの割合"
+            " 大きいほど目立つが、画面の端が欠け、横並びの 2 人の片方が外れやすい"
+        )
+        form.addRow("強調の動き: 寄る量", self._emphasis_zoom)
+        self._emphasis_pop = spin(
+            EMPHASIS_POP_PERCENT_RANGE, preferences.emphasis_pop_percent, " %", 5
+        )
+        self._emphasis_pop.setToolTip("テロップや絵を一瞬ふくらませて戻す（ポップ）ときの拡大率")
+        form.addRow("強調の動き: ふくらむ量", self._emphasis_pop)
+        self._emphasis_shake = spin(EMPHASIS_SHAKE_PX_RANGE, preferences.emphasis_shake_px, " px")
+        self._emphasis_shake.setToolTip(
+            "揺らすときの幅（上下左右それぞれ） 大きいと字幕が読みにくくなる"
+            " 画面いっぱいの動画を揺らすと、幅だけ画面の端に隙間が出る"
+        )
+        form.addRow("強調の動き: 揺れの幅", self._emphasis_shake)
+        self._emphasis_pan = spin(EMPHASIS_PAN_PX_RANGE, preferences.emphasis_pan_px, " px", 10)
+        self._emphasis_pan.setToolTip(
+            "パンで向きだけを頼まれたときにずらす長さ 動かす量を頼まれたらその値を使う"
+        )
+        form.addRow("強調の動き: パンの長さ", self._emphasis_pan)
+        self._emphasis_ramp = spin(EMPHASIS_RAMP_MS_RANGE, preferences.emphasis_ramp_ms, " ms", 50)
+        self._emphasis_ramp.setToolTip(
+            "動き始めてから動き切るまで（と戻るまで）の長さ 短いと急に寄ったように見え、"
+            "長いと要所を過ぎてから寄り切る 0 は 1 フレームで切り替える（ジャンプカットの寄り）"
+        )
+        form.addRow("強調の動き: 動き切る長さ", self._emphasis_ramp)
+        self._emphasis_easing = QComboBox(self)
+        for easing in EMPHASIS_EASINGS:
+            self._emphasis_easing.addItem(EMPHASIS_EASING_NAMES[easing], easing)
+        self._emphasis_easing.setCurrentIndex(
+            max(0, self._emphasis_easing.findData(preferences.emphasis_easing))
+        )
+        self._emphasis_easing.setToolTip(
+            "動き出しと止まり方 行き過ぎて戻る・ばね・弾むは、着いた所で跳ねる"
+        )
+        form.addRow("強調の動き: 動き方", self._emphasis_easing)
 
     def _send_value(self, kind: Outbound) -> str:
         return str(self._ai_sends[kind].currentData())
