@@ -9,6 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from sashimono.compat.aviutl.encoding import (
     decode_bytes,
@@ -163,11 +165,19 @@ class TestEncoding:
 
     def test_a_broken_hex_string_gives_an_empty_text(self) -> None:
         # 崩れた 16 進で例外を出すと、テキスト欄が 1 つ壊れただけで .exo の読み込み全体が止まる
-        # 16 進以外を除く処理と 4 桁へ切り詰める処理のどちらかが欠けても、fromhex が
-        # 例外を出して空へ落ちる 混じり物と半端な桁の後ろに読める文字を残し、本文が残ることを見る
+        # 16 進以外を除く処理と 4 桁へ切り詰める処理のどちらかが欠けると、fromhex の
+        # 例外が漏れる 混じり物と半端な桁の後ろに読める文字を残し、本文が残ることを見る
         assert decode_utf16_hex("zzz") == ""
         assert decode_utf16_hex("4200 zz 3100") == "B1"
         assert decode_utf16_hex("420031003") == "B1"
+
+    @settings(max_examples=300, deadline=None)
+    @given(st.text())
+    def test_any_text_field_decodes_without_an_error(self, value: str) -> None:
+        # 復号は念のための except を持たない（#384） 手前の 2 つの処理が fromhex へ
+        # 渡せる形に必ず整える約束で、破れると壊れた欄 1 つで .exo の読み込み全体が止まる
+        # 全角の数字や 16 進に似た字を含む任意の文字列で、例外にならず文字を返すことを見る
+        assert isinstance(decode_utf16_hex(value), str)
 
 
 class TestLoading:
