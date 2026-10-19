@@ -39,6 +39,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
@@ -93,6 +94,8 @@ class FakeHost:
         self.duck = DuckShape()
         #: 強調の動き（#331）の本人の設定 既定は設定と同じ
         self.emphasis = EmphasisStyle()
+        #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
+        self.seams = SeamStyle()
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -246,6 +249,10 @@ class FakeHost:
     @property
     def emphasis_style(self) -> EmphasisStyle:
         return self.emphasis
+
+    @property
+    def seam_style(self) -> SeamStyle:
+        return self.seams
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

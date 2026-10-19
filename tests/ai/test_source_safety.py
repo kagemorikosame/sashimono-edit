@@ -71,10 +71,14 @@ UNDOABLE_TOOLS = frozenset(
         "delete_clip",
         "delete_clips",
         "jet_cut",
+        # つなぎ目（#332） 場面切り替えを置き、拡大率と音量フェードの欄を変えるだけ
+        "smooth_cuts",
         "group_clips",
         "ungroup_clips",
         # 見た目
         "set_clip_property",
+        # 再生速度（#332） クリップ自身の速度と長さだけを変える
+        "set_speed",
         "add_effect",
         "add_stroke",
         "remove_stroke",

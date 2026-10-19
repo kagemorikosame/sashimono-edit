@@ -30,10 +30,12 @@ from sashimono.asr import DEFAULT_FILLERS, EXTRA_FILLERS, CleanupOptions, clean_
 from sashimono.compat.subtitle_looks import LookChoice, default_choice
 from sashimono.core.commands import Voice
 from sashimono.core.model import Transcript
+from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.silence import SilenceOptions
 from sashimono.ui.flow_layout import narrow_combo
 from sashimono.ui.library_thumbnails import LookThumbnails
 from sashimono.ui.library_view import LibraryOptions
+from sashimono.ui.seam_dialogs import SeamFields
 from sashimono.ui.subtitle.look_picker import SAME, LookPicker, LookSources
 from sashimono.ui.theme import Colors, themed_style
 
@@ -189,6 +191,7 @@ class JetCutDialog(QDialog):
         *,
         has_transcript: bool,
         estimate: Estimator | None = None,
+        seam_style: SeamStyle | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -227,6 +230,16 @@ class JetCutDialog(QDialog):
         form.addRow("最短の無音", self._min_silence)
         form.addRow("前後に残す余白", self._padding)
         form.addRow("", self._keep_speech)
+        # 詰めたつなぎ目の処理（#332） 既定は切ったまま（今までどおり詰めるだけ）で、欄の値は
+        # 本人の設定 窓で変えた値はその 1 回だけ
+        self._smooth = QCheckBox("つなぎ目も処理する（クロスフェード・寄り・音のフェード）", self)
+        self._smooth.setToolTip(
+            "詰めた所の絵の跳びと音の「プツッ」を目立たなくする 詰めるのと同じ取り消し 1 回で戻る"
+        )
+        form.addRow("", self._smooth)
+        self._seam_fields = SeamFields(self, form, seam_style or SeamStyle())
+        self._seam_fields.set_enabled(False)
+        self._smooth.toggled.connect(self._seam_fields.set_enabled)
 
         buttons = _confirm_buttons(self, "カットする")
 
@@ -244,6 +257,12 @@ class JetCutDialog(QDialog):
     @property
     def keep_speech(self) -> bool:
         return self._keep_speech.isChecked()
+
+    def seams(self) -> SeamStyle | None:
+        """つなぎ目の処理 処理しないなら ``None``"""
+        if not self._smooth.isChecked():
+            return None
+        return self._seam_fields.style()
 
     def options(self) -> SilenceOptions:
         return SilenceOptions(

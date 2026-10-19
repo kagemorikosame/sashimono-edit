@@ -54,6 +54,7 @@ OWN_LIBRARY = {
     "loudness_target",
     "duck_shape",
     "emphasis_style",
+    "seam_style",
     "template_shelf",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
@@ -222,6 +223,9 @@ class TestEveryTextSourceGoesThroughThePort:
             "apply_template",
             # 強調の動き（#331） 結果に本人の設定の強さ・長さ・動き方の既定が載る
             "emphasize",
+            # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
+            "smooth_cuts",
+            "jet_cut",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name
