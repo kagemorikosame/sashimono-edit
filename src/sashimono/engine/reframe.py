@@ -1,0 +1,706 @@
+"""縦動画への再構図（#334）を命令にする所
+
+線の形は :mod:`sashimono.core.reframe` が組む ここは素材の置き方（画素で置く・画面に収める）・
+配置の値の読み方・被写体の並び（:mod:`sashimono.engine.subject`）を知っている側の仕事を足して、
+人の操作と同じ命令（解像度の変更と、配置とテキストの欄の値の差し替え）にする AI の道具も、
+人の入口を足したときの画面も、ここを通す 入口ごとに書くと、同じ作品から違う縦の作品ができる
+
+作り替えるのはメインとすべてのシーン 解像度は作品で 1 つなので、シーンだけ横のまま残すと、
+シーンを置いた所が縦の画面の真ん中に横長の絵で潰れる
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from fractions import Fraction
+from itertools import pairwise
+
+import numpy as np
+
+from sashimono.core.commands.base import Command
+from sashimono.core.commands.edit import SetResolution
+from sashimono.core.commands.effects import ParamPath, SetParam
+from sashimono.core.commands.fixed import FLIP_EFFECT_KIND
+from sashimono.core.commands.scene import InScene
+from sashimono.core.emphasis import fixed_transform, transform_commands
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    MediaId,
+    MediaItem,
+    ParamValue,
+    Project,
+    SceneId,
+    Timeline,
+    Track,
+    TrackKind,
+)
+from sashimono.core.reframe import (
+    CropWindow,
+    ReframeError,
+    Sample,
+    Shot,
+    ShotPlan,
+    affine,
+    background_changes,
+    clamp_span,
+    crop_window,
+    focus_curves,
+    overlay_changes,
+    plan_shot,
+    window_of,
+)
+from sashimono.core.timebase import Rounding, seconds_to_frame
+from sashimono.effects.sources import TO_NATIVE_LAYOUT
+from sashimono.engine.gpu import fit_placement
+from sashimono.engine.render.outline import has_outline, media_pixel_size, transform_values
+from sashimono.engine.scenes import SceneSignal
+from sashimono.engine.subject import SUBJECT_SECONDS
+
+__all__ = [
+    "BACKGROUND_COVER",
+    "MIN_STRENGTH",
+    "ReframePlan",
+    "ReframeRequest",
+    "plan_reframe",
+    "tracked_media",
+]
+
+#: 背景と見なす、絵が画面を覆う割合（横と縦のどちらも） 9 割を覆う絵は、上に重ねた物ではなく
+#: 画面そのもの 少し縮めて縁を見せた動画も背景に数える
+BACKGROUND_COVER = 0.9
+
+#: 手がかりと見なす濃さの下限（:attr:`~sashimono.engine.subject.SubjectTrack.strength`）
+#: 動きも肌色も無い絵（止まった風景）は 0.002 を下回る ここより薄い行で枠を動かすと、
+#: 圧縮のざらつきを追って枠が揺れる
+MIN_STRENGTH = 0.002
+
+#: 被写体の並びの行と、クリップの時刻の差の上限（秒） 解析の届いていない所は手がかりに数えない
+_NEAREST = SUBJECT_SECONDS
+
+_TEXT = "text"
+
+
+@dataclass(frozen=True, slots=True)
+class ReframeRequest:
+    """作り替えの頼み ``wrap_share`` は文字を折り返す幅（縦の画面の幅の % 0 は折り返さない）"""
+
+    width: int
+    height: int
+    follow: str
+    smooth_ms: int
+    wrap_share: int
+
+
+@dataclass(frozen=True, slots=True)
+class ShotNote:
+    """決めた場面 1 つ（返事に載せる） 位置は横の画面の画素（中央が 0 Y は上が正）"""
+
+    scene_id: SceneId | None
+    start: int
+    end: int
+    mode: str
+    focus: tuple[float, float]
+    points: int
+    no_clue: bool
+    clip_id: str
+
+
+@dataclass(slots=True)
+class ReframePlan:
+    """組んだ命令と、何をどう変えたかの控え"""
+
+    window: CropWindow
+    commands: list[Command] = field(default_factory=list)
+    shots: list[ShotNote] = field(default_factory=list)
+    backgrounds: list[str] = field(default_factory=list)
+    overlays: list[str] = field(default_factory=list)
+    wrapped: list[str] = field(default_factory=list)
+    #: 前からの位置の動きを残すため、そのクリップの間は枠を止めた
+    held: list[str] = field(default_factory=list)
+    #: 作り替えられなかったクリップと理由
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _timelines(project: Project) -> list[tuple[SceneId | None, Timeline]]:
+    return [(None, project.timeline), *((scene.id, scene.timeline) for scene in project.scenes)]
+
+
+def _placed(size: tuple[int, int], clip: Clip, canvas: tuple[int, int]) -> tuple[float, float]:
+    """素材を置いた大きさ（配置を掛ける前 画面の画素） 描く側（``_media_placement``）と同じ"""
+    if clip.native_size:
+        return float(size[0]), float(size[1])
+    placement = fit_placement(size[0], size[1], canvas[0], canvas[1])
+    return placement.width, placement.height
+
+
+def _transform_at(clip: Clip, local: int) -> dict[str, float | str | bool]:
+    effect = fixed_transform(clip)
+    if effect is None:
+        return {}
+    return transform_values(effect, local)
+
+
+def _number(values: Mapping[str, float | str | bool], name: str, default: float) -> float:
+    value = values.get(name, default)
+    return float(value) if isinstance(value, int | float) else default
+
+
+def _drawn_scale(values: Mapping[str, float | str | bool]) -> tuple[float, float]:
+    whole = _number(values, "scale", 100.0) / 100.0
+    return (
+        whole * _number(values, "scale_x", 100.0) / 100.0,
+        whole * _number(values, "scale_y", 100.0) / 100.0,
+    )
+
+
+def _pivot(
+    values: Mapping[str, float | str | bool], placed: tuple[float, float]
+) -> tuple[float, float]:
+    """支点の、画面の中央からのずれ（画素 Y は上が正） シェーダの ``_TRANSFORM`` と同じ決まり"""
+    horizontal = {"left": -placed[0] / 2.0, "right": placed[0] / 2.0}
+    vertical = {"top": placed[1] / 2.0, "bottom": -placed[1] / 2.0}
+    return (
+        horizontal.get(str(values.get("pivot_h", "screen")), 0.0)
+        + _number(values, "anchor_x", 0.0),
+        vertical.get(str(values.get("pivot_v", "screen")), 0.0) + _number(values, "anchor_y", 0.0),
+    )
+
+
+def _flipped(clip: Clip) -> tuple[bool, bool]:
+    for effect in clip.effects:
+        if effect.kind == FLIP_EFFECT_KIND and effect.enabled:
+            values = transform_values(effect, 0)
+            return bool(values.get("horizontal", False)), bool(values.get("vertical", False))
+    return False, False
+
+
+@dataclass(frozen=True, slots=True)
+class _Picture:
+    """背景のクリップ 1 本の置き方"""
+
+    scene_id: SceneId | None
+    track: Track
+    clip: Clip
+    media: MediaItem
+    placed_old: tuple[float, float]
+    placed_new: tuple[float, float]
+
+    @property
+    def moving(self) -> bool:
+        return self.media.has_video and self.media.duration > 0
+
+
+def _is_background(
+    project: Project, clip: Clip, canvas: tuple[int, int]
+) -> tuple[MediaItem, tuple[int, int]] | None:
+    if clip.media_id is None or clip.scene_id is not None:
+        return None
+    size = media_pixel_size(project, clip)
+    media = project.find_media(clip.media_id)
+    if size is None or media is None:
+        return None
+    placed = _placed(size, clip, canvas)
+    scale_x, scale_y = _drawn_scale(_transform_at(clip, 0))
+    covers = (
+        placed[0] * abs(scale_x) >= canvas[0] * BACKGROUND_COVER
+        and placed[1] * abs(scale_y) >= canvas[1] * BACKGROUND_COVER
+    )
+    return (media, size) if covers else None
+
+
+def tracked_media(project: Project) -> list[MediaItem]:
+    """被写体を追う素材（背景に置いた動画） 場面の解析を待つ相手"""
+    canvas = project.settings.resolution
+    found: dict[MediaId, MediaItem] = {}
+    for _scene_id, timeline in _timelines(project):
+        for track in timeline.tracks:
+            for clip in track.clips:
+                if not project.draws_picture(track, clip) or not has_outline(clip):
+                    continue
+                background = _is_background(project, clip, canvas)
+                if background is None:
+                    continue
+                media = background[0]
+                if media.has_video and media.duration > 0:
+                    found.setdefault(media.id, media)
+    return list(found.values())
+
+
+def _stream_of(media: MediaItem, wanted: int) -> int | None:
+    """デコーダと同じ選び方（番号が合う物、無ければ最初の映像）"""
+    if not media.video_streams:
+        return None
+    if any(stream.index == wanted for stream in media.video_streams):
+        return wanted
+    return media.video_streams[0].index
+
+
+class _Tracker:
+    """背景のクリップ 1 本の、タイムラインのフレームごとの被写体と枠を置ける範囲"""
+
+    def __init__(
+        self,
+        project: Project,
+        picture: _Picture,
+        signal: SceneSignal | None,
+        window: CropWindow,
+    ) -> None:
+        self._project = project
+        self.picture = picture
+        self._window = window
+        self._flip = _flipped(picture.clip)
+        subject = signal.subject if signal is not None else None
+        usable = (
+            subject is not None
+            and len(subject) > 0
+            and picture.moving
+            and (
+                signal is None
+                or signal.stream in (None, _stream_of(picture.media, picture.clip.stream_index))
+            )
+        )
+        self._subject = subject if usable else None
+        self._centers: tuple[np.ndarray, np.ndarray] | None = None
+        if self._subject is not None:
+            scale_x, scale_y = _drawn_scale(_transform_at(picture.clip, 0))
+            crop = window.size
+            self._centers = self._subject.centers(
+                (
+                    min(1.0, crop[0] / max(1e-6, picture.placed_old[0] * abs(scale_x))),
+                    min(1.0, crop[1] / max(1e-6, picture.placed_old[1] * abs(scale_y))),
+                )
+            )
+
+    def sample(self, frame: int) -> tuple[Sample, tuple[float, float, float, float]]:
+        """タイムラインの ``frame`` の被写体と、枠の中心を置ける範囲（左・右・下・上）"""
+        clip = self.picture.clip
+        local = frame - clip.timeline_start
+        values = _transform_at(clip, local)
+        scale_x, scale_y = _drawn_scale(values)
+        placed = self.picture.placed_old
+        pivot = _pivot(values, placed)
+        position = (_number(values, "pos_x", 0.0), _number(values, "pos_y", 0.0))
+        # 配置の式（シェーダ）は 支点 + 位置 + 拡大 x (絵の点 - 支点) 回転は数えない（枠の位置の
+        # 見積もりには、回した絵の外接の向きまでは要らない）
+        center = (
+            pivot[0] + position[0] - scale_x * pivot[0],
+            pivot[1] + position[1] - scale_y * pivot[1],
+        )
+        half = (abs(scale_x) * placed[0] / 2.0, abs(scale_y) * placed[1] / 2.0)
+        crop = self._window.size
+        bounds = (
+            center[0] - half[0] + crop[0] / 2.0,
+            center[0] + half[0] - crop[0] / 2.0,
+            center[1] - half[1] + crop[1] / 2.0,
+            center[1] + half[1] - crop[1] / 2.0,
+        )
+        weight = 0.0
+        across, down = 0.5, 0.5
+        if self._subject is not None and self._centers is not None:
+            seconds = float(clip.picture_time(local, self._project.rate))
+            times = self._subject.times
+            index = int(np.clip(np.searchsorted(times, seconds), 0, len(times) - 1))
+            if index > 0 and abs(times[index - 1] - seconds) < abs(times[index] - seconds):
+                index -= 1
+            if abs(float(times[index]) - seconds) <= _NEAREST:
+                strength = float(self._subject.strength[index])
+                if strength >= MIN_STRENGTH:
+                    weight = strength
+                    across = float(self._centers[0][index])
+                    down = float(self._centers[1][index])
+        if self._flip[0]:
+            across = 1.0 - across
+        if self._flip[1]:
+            down = 1.0 - down
+        # 絵の中の点（左から across・上から down）の、支点からの画素（Y は上が正）
+        point = ((across - 0.5) * placed[0], (0.5 - down) * placed[1])
+        sample = Sample(
+            frame=frame,
+            x=center[0] + scale_x * point[0],
+            y=center[1] + scale_y * point[1],
+            weight=weight,
+        )
+        return sample, bounds
+
+    def home(self, frame: int) -> tuple[float, float]:
+        sample, bounds = self.sample(frame)
+        del sample
+        return ((bounds[0] + bounds[1]) / 2.0, (bounds[2] + bounds[3]) / 2.0)
+
+    def cuts(self, signal: SceneSignal | None) -> set[int]:
+        """素材の場面の切り替わりが、このクリップで出るタイムラインのフレーム"""
+        clip = self.picture.clip
+        if signal is None or self._subject is None:
+            return set()
+        frames: set[int] = set()
+        rate = self._project.rate
+        for cut in signal.cuts():
+            moment = cut.seconds
+            if moment <= clip.source_in or (clip.hold_at is not None and moment > clip.hold_at):
+                continue
+            offset = seconds_to_frame(
+                (Fraction(str(moment)) - clip.source_in) / clip.speed, rate, Rounding.CEIL
+            )
+            if 0 < offset < clip.duration:
+                frames.add(clip.timeline_start + offset)
+        return frames
+
+
+def _visible(timeline: Timeline) -> set[int]:
+    return {id(track) for track in timeline.active_picture_tracks()}
+
+
+def _shots(
+    project: Project,
+    timeline: Timeline,
+    trackers: list[_Tracker],
+    signals: Mapping[MediaId, SceneSignal],
+) -> list[tuple[Shot, _Tracker]]:
+    """背景の絵がいちばん手前の物の切り替わりと、素材の場面の切り替わりで区切った場面"""
+    visible = _visible(timeline)
+    order = {id(track): index for index, track in enumerate(timeline.tracks)}
+    candidates = [t for t in trackers if id(t.picture.track) in visible and t.picture.clip.enabled]
+    boundaries: set[int] = set()
+    cut_frames: set[int] = set()
+    for tracker in candidates:
+        clip = tracker.picture.clip
+        boundaries.update((clip.timeline_start, clip.timeline_end))
+        cut_frames.update(tracker.cuts(signals.get(tracker.picture.media.id)))
+    events = sorted(boundaries | cut_frames)
+
+    def front(frame: int) -> _Tracker | None:
+        showing = [t for t in candidates if t.picture.clip.contains(frame)]
+        if not showing:
+            return None
+        return max(showing, key=lambda t: order[id(t.picture.track)])
+
+    spans: list[tuple[int, int, _Tracker]] = []
+    for start, end in pairwise(events):
+        if end <= start:
+            continue
+        owner = front(start)
+        if owner is None:
+            continue
+        if spans and spans[-1][2] is owner and spans[-1][1] == start and start not in cut_frames:
+            spans[-1] = (spans[-1][0], end, owner)
+        else:
+            spans.append((start, end, owner))
+    step = max(1, round(float(project.rate.fps) * SUBJECT_SECONDS))
+    shots: list[tuple[Shot, _Tracker]] = []
+    for start, end, owner in spans:
+        samples: list[Sample] = []
+        left, right, bottom, top = -math.inf, math.inf, -math.inf, math.inf
+        for frame in range(start, end, step):
+            sample, bounds = owner.sample(frame)
+            samples.append(sample)
+            left, right = max(left, bounds[0]), min(right, bounds[1])
+            bottom, top = max(bottom, bounds[2]), min(top, bounds[3])
+        shots.append(
+            (
+                Shot(
+                    start=start,
+                    end=end,
+                    samples=tuple(samples),
+                    bounds=(left, right, bottom, top),
+                    home=owner.home(start),
+                ),
+                owner,
+            )
+        )
+    return shots
+
+
+def _animated(value: ParamValue | None) -> bool:
+    return isinstance(value, AnimatedValue) and bool(value.keyframes)
+
+
+def _changed(
+    params: Mapping[str, ParamValue], name: str, value: AnimatedValue, default: float
+) -> bool:
+    before = params.get(name)
+    if isinstance(before, AnimatedValue):
+        return before != value
+    plain = (
+        float(before)
+        if isinstance(before, int | float) and not isinstance(before, bool)
+        else default
+    )
+    return value.keyframes != () or not math.isclose(value.static, plain, abs_tol=1e-9)
+
+
+_DEFAULTS = {"pos_x": 0.0, "pos_y": 0.0, "scale": 100.0, "anchor_x": 0.0, "anchor_y": 0.0}
+
+
+def _transform_edit(clip: Clip, changes: dict[str, AnimatedValue]) -> list[Command]:
+    effect = fixed_transform(clip)
+    params = dict(effect.params) if effect is not None else {}
+    kept = {
+        name: value
+        for name, value in changes.items()
+        if _changed(params, name, value, _DEFAULTS.get(name, 0.0))
+    }
+    return transform_commands(clip, kept)
+
+
+def _mean_focus(curve: AnimatedValue, start: int, end: int) -> AnimatedValue:
+    if not curve.keyframes:
+        return curve
+    frames = range(start, max(start + 1, end))
+    return AnimatedValue(static=sum(curve.at(frame) for frame in frames) / len(frames))
+
+
+def _background_commands(
+    picture: _Picture,
+    focus: tuple[AnimatedValue, AnimatedValue],
+    window: CropWindow,
+    plan: ReframePlan,
+) -> list[Command]:
+    clip = picture.clip
+    effect = fixed_transform(clip)
+    params: dict[str, ParamValue] = dict(effect.params) if effect is not None else {}
+    if _animated(params.get("anchor_x")) or _animated(params.get("anchor_y")):
+        raise ReframeError("配置の中心（中心 X・Y）がキーフレームで動いています")
+    local = (
+        window_of(focus[0], clip.timeline_start, clip.timeline_end),
+        window_of(focus[1], clip.timeline_start, clip.timeline_end),
+    )
+    targets = list(local)
+    for axis, name in enumerate(("pos_x", "pos_y")):
+        if _animated(params.get(name)) and targets[axis].keyframes:
+            # 前からの位置の動きと枠の動きは 1 次の式で重ねられない 位置の動き（人が付けた寄りや
+            # パン）を残し、このクリップの間は枠を止める
+            targets[axis] = _mean_focus(focus[axis], clip.timeline_start, clip.timeline_end)
+            if str(clip.id) not in plan.held:
+                plan.held.append(str(clip.id))
+    values = _transform_at(clip, 0)
+    placement = picture.placed_new[0] / max(picture.placed_old[0], 1e-9)
+    pivot = _pivot(values, picture.placed_old)
+    changes = background_changes(params, (targets[0], targets[1]), window, placement, pivot)
+    if not math.isclose(placement, 1.0):
+        # 支点も置いた絵と同じ比で縮む（絵の端を選んだ支点は自動で付いてくるので、ずらし分だけ）
+        for name in ("anchor_x", "anchor_y"):
+            if params.get(name) is not None:
+                changes[name] = affine(params.get(name), placement, 0.0, 0.0)
+    return _transform_edit(clip, changes)
+
+
+def _static(value: ParamValue | None, default: float) -> float | None:
+    """動かない値ならその数 動く値は ``None``"""
+    if isinstance(value, AnimatedValue):
+        return None if value.keyframes else value.static
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return default if value is None else None
+
+
+def _overlay_media_commands(
+    project: Project,
+    clip: Clip,
+    window: CropWindow,
+) -> list[Command]:
+    """上に重ねた画像・動画 同じ割合の所へ置き、縦の画面からはみ出すほど大きければ縮めて収める"""
+    old, new = window.old, window.new
+    ratio = (new[0] / old[0], new[1] / old[1])
+    effect = fixed_transform(clip)
+    params: dict[str, ParamValue] = dict(effect.params) if effect is not None else {}
+    size = media_pixel_size(project, clip)
+    placement = 1.0
+    placed_new: tuple[float, float] | None = None
+    if size is not None:
+        placed_old = _placed(size, clip, old)
+        placed_new = _placed(size, clip, new)
+        placement = placed_new[0] / max(placed_old[0], 1e-9)
+    changes = overlay_changes(params, ratio, placement)
+    scale = _static(changes.get("scale", params.get("scale")), 100.0)
+    x, y = _static(changes["pos_x"], 0.0), _static(changes["pos_y"], 0.0)
+    if placed_new is not None and scale is not None and x is not None and y is not None:
+        values = _transform_at(clip, 0)
+        unit_x = _number(values, "scale_x", 100.0) / 100.0
+        unit_y = _number(values, "scale_y", 100.0) / 100.0
+        width = placed_new[0] * scale / 100.0 * abs(unit_x)
+        height = placed_new[1] * scale / 100.0 * abs(unit_y)
+        shrink = min(1.0, new[0] / max(width, 1e-9), new[1] / max(height, 1e-9))
+        if shrink < 1.0:
+            scale *= shrink
+            width, height = width * shrink, height * shrink
+            changes["scale"] = AnimatedValue(static=scale)
+        changes["pos_x"] = AnimatedValue(static=clamp_span(x, (-width / 2, width / 2), new[0]))
+        changes["pos_y"] = AnimatedValue(static=clamp_span(y, (-height / 2, height / 2), new[1]))
+    return _transform_edit(clip, changes)
+
+
+def _widening(clip: Clip) -> float:
+    """配置が文字を横へ広げる倍率 キーフレームで動く物はいちばん大きい値"""
+    effect = fixed_transform(clip)
+    total = 1.0
+    if effect is None:
+        return total
+    for name in ("scale", "scale_x"):
+        value = effect.params.get(name)
+        if isinstance(value, AnimatedValue):
+            largest = max((abs(k.value) for k in value.keyframes), default=abs(value.static))
+        elif isinstance(value, int | float) and not isinstance(value, bool):
+            largest = abs(float(value))
+        else:
+            largest = 100.0
+        total *= largest / 100.0
+    return total
+
+
+def _text_commands(
+    clip: Clip, window: CropWindow, wrap_share: int, plan: ReframePlan
+) -> list[Command]:
+    """テキスト 同じ割合の所へ置き、縦の画面の幅で折り返し、はみ出す位置なら内側へ寄せる
+
+    折り返しの幅は字を組むときの画素で、配置の拡大は後から掛かる 拡大の分だけ幅を縮める
+    （字幕の見た目を着せるときの決まり :mod:`sashimono.compat.subtitle_looks` と同じ）
+    AviUtl2 の組み方は折り返さないので、設定パネルの〔組み方を「標準」にする〕と同じ値で替える
+    """
+    old, new = window.old, window.new
+    ratio = (new[0] / old[0], new[1] / old[1])
+    source = clip.source
+    assert source is not None
+    effect = fixed_transform(clip)
+    params: dict[str, ParamValue] = dict(effect.params) if effect is not None else {}
+    changes = overlay_changes(params, ratio, 1.0)
+    source_changes: dict[str, ParamValue] = {}
+    own = dict(source.params)
+    for name, share in (("pos_x", ratio[0]), ("pos_y", ratio[1])):
+        moved = affine(own.get(name), share, 0.0, 0.0)
+        if _changed(own, name, moved, 0.0):
+            source_changes[name] = moved
+    vertical = own.get("vertical")
+    upright = vertical is True or (
+        isinstance(vertical, int) and not isinstance(vertical, bool) and vertical != 0
+    )
+    widening = max(_widening(clip), 1e-6)
+    limit = new[0] * wrap_share / 100.0 / widening
+    wrap = own.get("wrap_width")
+    current = _static(wrap, 0.0)
+    span_width: float | None = None
+    if not upright and wrap_share > 0 and current is not None:
+        if current <= 0 or current > limit:
+            source_changes["wrap_width"] = AnimatedValue(static=round(limit))
+            if own.get("layout") == "aviutl":
+                source_changes.update(TO_NATIVE_LAYOUT.switch(own))
+            plan.wrapped.append(str(clip.id))
+            span_width = round(limit) * widening
+        else:
+            span_width = current * widening
+    commands = _transform_edit(clip, changes)
+    if span_width is not None:
+        anchor = str(source_changes.get("anchor", own.get("anchor", "center")))
+        span = {"left": (0.0, span_width), "right": (-span_width, 0.0)}.get(
+            anchor, (-span_width / 2, span_width / 2)
+        )
+        own_x = _static(source_changes.get("pos_x", own.get("pos_x")), 0.0)
+        frame_x = _static(changes["pos_x"], 0.0)
+        if own_x is not None and frame_x is not None:
+            placed = clamp_span(own_x + frame_x, span, new[0])
+            if not math.isclose(placed, own_x + frame_x):
+                commands = _transform_edit(
+                    clip, {**changes, "pos_x": AnimatedValue(static=placed - own_x)}
+                )
+    commands.extend(
+        SetParam(ParamPath.of_source(clip.id, name), value)
+        for name, value in source_changes.items()
+    )
+    return commands
+
+
+def _in(scene_id: SceneId | None, commands: Iterable[Command]) -> list[Command]:
+    if scene_id is None:
+        return list(commands)
+    return [InScene(scene_id, command) for command in commands]
+
+
+def plan_reframe(
+    project: Project, request: ReframeRequest, signals: Mapping[MediaId, SceneSignal]
+) -> ReframePlan:
+    """横の作品を ``request`` の大きさに作り替える命令を組む
+
+    ``signals`` は背景の動画の場面の解析（被写体の並びを含む） 無い素材は真ん中を切り出す
+    ロックしたトラックで変える物があれば、何も組まずに断る（人が触らせないために掛けた物）
+    """
+    old = project.settings.resolution
+    new = (request.width, request.height)
+    window = crop_window(old, new)
+    plan = ReframePlan(window=window)
+    plan.commands.append(SetResolution(request.width, request.height))
+    smooth_frames = max(1, round(float(project.rate.fps) * request.smooth_ms / 1000))
+    locked: list[str] = []
+    for scene_id, timeline in _timelines(project):
+        trackers: list[_Tracker] = []
+        overlays: list[tuple[Track, Clip]] = []
+        for track in timeline.tracks:
+            if track.kind is TrackKind.AUDIO:
+                continue
+            for clip in track.clips:
+                if not project.draws_picture(track, clip):
+                    continue
+                if clip.scene_id is None and not has_outline(clip):
+                    continue
+                background = _is_background(project, clip, old)
+                if background is not None:
+                    media, size = background
+                    picture = _Picture(
+                        scene_id,
+                        track,
+                        clip,
+                        media,
+                        _placed(size, clip, old),
+                        _placed(size, clip, new),
+                    )
+                    trackers.append(_Tracker(project, picture, signals.get(media.id), window))
+                else:
+                    overlays.append((track, clip))
+        plans: list[ShotPlan] = []
+        for shot, owner in _shots(project, timeline, trackers, signals):
+            shot_plan = plan_shot(shot, request.follow, window.size, smooth_frames)
+            plans.append(shot_plan)
+            plan.shots.append(
+                ShotNote(
+                    scene_id=scene_id,
+                    start=shot_plan.start,
+                    end=shot_plan.end,
+                    mode=shot_plan.mode,
+                    focus=(shot_plan.points[0][1], shot_plan.points[0][2]),
+                    points=len(shot_plan.points),
+                    no_clue=shot_plan.no_clue,
+                    clip_id=str(owner.picture.clip.id),
+                )
+            )
+        focus = focus_curves(plans) if plans else (AnimatedValue(), AnimatedValue())
+        for tracker in trackers:
+            picture = tracker.picture
+            try:
+                commands = _background_commands(picture, focus, window, plan)
+            except ReframeError as exc:
+                plan.skipped.append((str(picture.clip.id), str(exc)))
+                continue
+            if commands and picture.track.locked:
+                locked.append(picture.track.name)
+            plan.commands.extend(_in(scene_id, commands))
+            plan.backgrounds.append(str(picture.clip.id))
+        for track, clip in overlays:
+            if clip.source is not None and clip.source.kind == _TEXT:
+                commands = _text_commands(clip, window, request.wrap_share, plan)
+            else:
+                commands = _overlay_media_commands(project, clip, window)
+            if not commands:
+                continue
+            if track.locked:
+                locked.append(track.name)
+            plan.commands.extend(_in(scene_id, commands))
+            plan.overlays.append(str(clip.id))
+    if locked:
+        names = "・".join(dict.fromkeys(locked))
+        raise ReframeError(
+            f"ロックされたトラック（{names}）のクリップも動かす必要があります"
+            " 解像度は作品全体で 1 つなので、残すと縦の画面で位置がずれます"
+            " ロックを解いてから呼んでください"
+        )
+    return plan

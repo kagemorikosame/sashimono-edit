@@ -53,6 +53,15 @@ from sashimono.core.mixing import (
     DuckShape,
 )
 from sashimono.core.model import LayerMode, StyleGuide
+from sashimono.core.reframe import (
+    DEFAULT_REFRAME_FOLLOW,
+    DEFAULT_REFRAME_SIZE,
+    DEFAULT_REFRAME_SMOOTH_MS,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+    ReframeStyle,
+)
 from sashimono.core.seams import (
     DEFAULT_SEAM_AUDIO_FADE_MS,
     DEFAULT_SEAM_CROSSFADE_MS,
@@ -622,6 +631,16 @@ class Preferences:
     seam_zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
     #: 音の継ぎ目のフェード（ミリ秒） 0 で音は触らない
     seam_audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
+    #: AI アシスタントが横の作品を縦の作品に作り替える（#334）ときの既定
+    #: どの縦の大きさで出すか・枠を止めるか追うかは人と作品で違う AI に値を言わなければこれを使う
+    #: （:mod:`sashimono.core.reframe`）
+    #: 作る大きさ（:data:`~sashimono.core.reframe.REFRAME_SIZES`） 既定はショート動画の 1080x1920
+    reframe_size: str = DEFAULT_REFRAME_SIZE
+    #: 枠の動かし方（:data:`~sashimono.core.reframe.REFRAME_FOLLOWS`） 既定は収まる場面は止め、
+    #: 外れる場面だけ追う（動き続ける枠は、知らない人が見ると酔いやすい）
+    reframe_follow: str = DEFAULT_REFRAME_FOLLOW
+    #: 追うときにならす長さ（ミリ秒） 長いほどゆっくり動く
+    reframe_smooth_ms: int = DEFAULT_REFRAME_SMOOTH_MS
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -703,6 +722,15 @@ class Preferences:
             crossfade_ms=self.seam_crossfade_ms,
             zoom_percent=self.seam_zoom_percent,
             audio_fade_ms=self.seam_audio_fade_ms,
+        )
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        """AI アシスタントの縦動画への作り替え（#334）の既定"""
+        return ReframeStyle(
+            size=self.reframe_size,
+            follow=self.reframe_follow,
+            smooth_ms=self.reframe_smooth_ms,
         )
 
     @property
@@ -951,6 +979,13 @@ class PreferenceStore:
             ),
             seam_audio_fade_ms=_within(
                 data.get("seam_audio_fade_ms"), SEAM_AUDIO_FADE_MS_RANGE, plain.seam_audio_fade_ms
+            ),
+            reframe_size=_choice(data.get("reframe_size"), REFRAME_SIZES, plain.reframe_size),
+            reframe_follow=_choice(
+                data.get("reframe_follow"), REFRAME_FOLLOWS, plain.reframe_follow
+            ),
+            reframe_smooth_ms=_within(
+                data.get("reframe_smooth_ms"), REFRAME_SMOOTH_MS_RANGE, plain.reframe_smooth_ms
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis

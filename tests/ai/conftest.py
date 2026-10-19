@@ -39,6 +39,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
@@ -96,6 +97,8 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
+        self.reframing = ReframeStyle()
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -253,6 +256,10 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self.reframing
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

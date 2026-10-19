@@ -210,6 +210,23 @@ def _placed_bounds(
     )
 
 
+def _spilling_buffer(
+    placement: Placement, screen_width: int, screen_height: int
+) -> tuple[int, int] | None:
+    """画面からはみ出して置いた絵を、はみ出した所ごと収めるバッファの大きさ 収まれば ``None``
+
+    画面との差を偶数にそろえる 奇数だと画面の中心へ半画素ずれて重なり、絵が 1 画素ぼける
+    """
+    spill_x = math.ceil(placement.width - screen_width - 1e-6)
+    spill_y = math.ceil(placement.height - screen_height - 1e-6)
+    if spill_x <= 0 and spill_y <= 0:
+        return None
+    return (
+        screen_width + max(0, spill_x + spill_x % 2),
+        screen_height + max(0, spill_y + spill_y % 2),
+    )
+
+
 def _object_sized(image: np.ndarray, found: Frame | None) -> tuple[np.ndarray, tuple[float, float]]:
     """入れ物 ``found``（:func:`_object_box`）だけを切り出した絵と、画面の中心からのずれ
     （画素、Y は下が正） 入れ物が無ければ元の絵
@@ -1240,6 +1257,13 @@ class FrameRenderer:
             )
             return
 
+        buffer = _spilling_buffer(placement, screen_width, screen_height)
+        if buffer is not None:
+            self._draw_spilling(
+                texture, image, clip, gpu_effects, local_frame, rate, opacity, placement, buffer
+            )
+            return
+
         result = self._effects.apply(
             texture,
             gpu_effects,
@@ -1257,6 +1281,60 @@ class FrameRenderer:
             flip=False,
             blend=clip.blend_mode,
         )
+
+    def _draw_spilling(
+        self,
+        texture: Texture,
+        image: np.ndarray,
+        clip: Clip,
+        gpu_effects: tuple[Effect, ...],
+        local_frame: int,
+        rate: FrameRate,
+        opacity: float,
+        placement: Placement,
+        buffer: tuple[int, int],
+    ) -> None:
+        """画面からはみ出す大きさに置いた素材（画素で置いた 4K を 1080p の作品に置いた物、
+        縦の作品に作り替えた横の動画 #334）を、はみ出した所ごとエフェクトに通して置く
+
+        画面の大きさのバッファへ置いてからエフェクトを掛けると、はみ出した所がそこで切れ、
+        縮めたり動かしたりしても切れたままになる（縦の作品に作り替えた横の動画で、枠を寄せた
+        側が黒い帯になった） 画面と絵の両方を含む大きさのバッファで掛け、画面の中心に重ねて置く
+        バッファの中心は画面の中心と同じなので、位置の計算（画素）は変わらない
+        """
+        screen_width, screen_height = self._compositor.width, self._compositor.height
+        width, height = buffer
+        inner = Placement(
+            placement.left + (width - screen_width) / 2.0,
+            placement.top + (height - screen_height) / 2.0,
+            placement.width,
+            placement.height,
+        )
+        self._effects.resize(width, height)
+        try:
+            result = self._effects.apply(
+                texture,
+                gpu_effects,
+                frame=local_frame,
+                fps=float(rate.fps),
+                source_rect=inner.to_clip(width, height),
+                duration=clip.duration,
+                bounds=_placed_bounds(self._object_box_of(clip, image), image, inner),
+            )
+            self._compositor.draw_handle(
+                result.color,
+                Placement(
+                    (screen_width - width) / 2.0,
+                    (screen_height - height) / 2.0,
+                    float(width),
+                    float(height),
+                ),
+                opacity=opacity,
+                flip=False,
+                blend=clip.blend_mode,
+            )
+        finally:
+            self._effects.resize(screen_width, screen_height)
 
     def _media_placement(self, clip: Clip, texture: Texture) -> Placement:
         """絵を置く矩形（合成先の画素）

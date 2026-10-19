@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 
 import av
@@ -32,6 +33,7 @@ import numpy as np
 
 from sashimono.engine.decode.probe import media_origin, moving_pictures
 from sashimono.engine.decode.rational import as_fraction
+from sashimono.engine.subject import SubjectScan, SubjectTrack, skin_mask
 
 __all__ = [
     "DEFAULT_MIN_SCENE",
@@ -117,6 +119,9 @@ class SceneSignal:
     #: 完了として扱うと、後ろの切り替わりの無い一覧を全部だと思って使う（PR #358 の
     #: CodeRabbit の指摘）
     broken: bool = False
+    #: 被写体のいそうな所（#334 縦動画への再構図） 同じ読み込みのついでに数える
+    #: （:mod:`sashimono.engine.subject`） 別に読み直すと、4K の 2 分半で 20〜70 秒かかる
+    subject: SubjectTrack = field(default_factory=SubjectTrack.empty)
 
     @classmethod
     def empty(cls, *, complete: bool = True, stream: int | None = None) -> SceneSignal:
@@ -207,6 +212,8 @@ class SceneScan:
         self._analyzed = 0.0
         #: 読んでいる映像ストリームの番号（:attr:`SceneSignal.stream`）
         self.stream: int | None = None
+        #: 被写体のいそうな所（#334） 差と同じく読んだ所から順に足す
+        self.subject = SubjectScan()
 
     def add(self, moment: float, pixel: float, histogram: float) -> None:
         with self._lock:
@@ -232,6 +239,7 @@ class SceneScan:
                 complete=complete,
                 stream=self.stream,
                 broken=broken,
+                subject=self.subject.snapshot(),
             )
 
 
@@ -286,6 +294,7 @@ def analyze_scenes(
                     continue
                 luma = _luma(frame)
                 shape = _histogram(luma)
+                difference: np.ndarray | None = None
                 if previous is not None and previous[0].shape == luma.shape:
                     difference = np.abs(luma.astype(np.int16) - previous[0].astype(np.int16))
                     scan.add(
@@ -297,6 +306,7 @@ def analyze_scenes(
                     # 途中で大きさが変わる素材（配信の録画など）は比べずに数え直す
                     # 大きさの違う絵を比べる意味は無く、形の違いで落ちる
                     scan.reach(moment)
+                scan.subject.feed(moment, difference, partial(skin_mask, frame, luma))
                 if previous is not None and moment > last:
                     steps.append(moment - last)
                 shown_until = moment + _frame_length(frame, steps)
@@ -309,9 +319,11 @@ def analyze_scenes(
             # ``last`` まで） 言うと、後ろの切り替わりの無い一覧を全部だと思って使う
             if progress is not None:
                 progress(1.0)
+            scan.subject.finish()
             return scan.snapshot(analyzed=last, broken=True)
     if progress is not None:
         progress(1.0)
+    scan.subject.finish()
     if _ended_early(length, shown_until, steps):
         # 例外を出さずに途中で黙って止まる壊れ方もある（同じ切った MP4 が、手元では
         # InvalidDataError、CI では黙って止まった PR #358） どちらも同じ扱いにする

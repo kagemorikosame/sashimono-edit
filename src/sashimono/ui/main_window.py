@@ -136,6 +136,7 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import (
     SEAM_NONE,
     SeamStyle,
@@ -3423,6 +3424,10 @@ class MainWindow(QMainWindow):
     @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self._preferences.reframe_style
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

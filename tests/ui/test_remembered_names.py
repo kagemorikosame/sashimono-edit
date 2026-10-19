@@ -47,7 +47,7 @@ TEXT_SOURCES = {
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
 #: テンプレートの棚（#328）も本人の置き場の物 名前はアプリの設定として送り、フォルダの名前は
 #: 名前と場所（一覧の folder の項目で伏せる） ファイルの場所は道具から返さない
-#: 強調の動きの強さと長さの既定（#331）も本人の設定
+#: 強調の動きの強さと長さの既定（#331）も本人の設定 縦動画への作り替えの既定（#334）も
 OWN_LIBRARY = {
     "saved_looks",
     "look_rules",
@@ -55,6 +55,7 @@ OWN_LIBRARY = {
     "duck_shape",
     "emphasis_style",
     "seam_style",
+    "reframe_style",
     "template_shelf",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
@@ -226,6 +227,8 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
+            "reframe",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

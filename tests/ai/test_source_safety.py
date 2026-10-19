@@ -88,6 +88,8 @@ UNDOABLE_TOOLS = frozenset(
         "add_keyframe",
         # 強調の動き（#331） 配置の値の線とランダム移動の幅の線だけを変える
         "emphasize",
+        # 縦動画への作り替え（#334） 解像度と、配置とテキストの欄の値の線だけを変える
+        "reframe",
         # 字幕
         "set_subtitle_text",
         "replace_subtitle_text",
