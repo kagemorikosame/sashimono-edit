@@ -596,6 +596,10 @@ LEDGER: tuple[Entry, ...] = (
 #: どの行にも当たらないときはここへ書く 書かないと ``tests/ai/test_operation_ledger.py`` が落ちる
 READING = "人が画面を見て分かることを読む道具"
 _GESTURE = "画面ではドラッグや表の書き込みで行う 台帳はメニュー・右クリック・ボタンだけを数える"
+_AUTO_FIX_NOTE = (
+    "素材を測って補正の値を決める 画面では右クリックの〔エフェクトを追加〕で同じエフェクト"
+    "（拡張色調補正・ノイズ除去）を積み、値は人が決める 測って決める入口は画面に無い"
+)
 AI_ONLY: dict[str, str] = {
     "get_project": READING,
     "list_media": READING,
@@ -640,6 +644,11 @@ AI_ONLY: dict[str, str] = {
     ),
     # BGM と効果音を置く（#329） 画面では素材をドラッグして置き、右端を詰める
     "place_sound": _GESTURE,
+    # 色と雑音の自動補正（#336） 測って値を決める所は画面に同じ入口が無い 人は右クリックの
+    # 〔エフェクトを追加〕で拡張色調補正とノイズ除去を積み、設定パネルで値を決める
+    # 人の入口（右クリック〔色を自動で整える…〕など）を足すかは利用者の判断を待っている
+    "auto_color": _AUTO_FIX_NOTE,
+    "reduce_noise": _AUTO_FIX_NOTE,
 }
 
 

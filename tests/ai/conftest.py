@@ -41,8 +41,11 @@ from sashimono.core.model import (
 )
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.auto_color import DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache import SceneState
+from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.report import assemble
 from tests.conftest import make_clip
@@ -96,6 +99,13 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: 色と雑音の自動補正（#336）の本人の設定 既定は設定と同じ
+        self.color_strength = DEFAULT_AUTO_COLOR_STRENGTH
+        self.noise_reduction = int(DEFAULT_REDUCTION_DB)
+        #: 素材ごとのサムネイルのシート 試験が入れる 無ければまだ用意できていない
+        self.filmstrips: dict[MediaId, Filmstrip] = {}
+        #: 音声ごとの波形 試験が入れる 無ければ stub_waveform
+        self.waveforms: dict[tuple[MediaId, int | None], Waveform] = {}
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -235,8 +245,18 @@ class FakeHost:
         self.analyzed.append(media.id)
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
-        del media, stream
-        return self.stub_waveform
+        return self.waveforms.get((media.id, stream), self.stub_waveform)
+
+    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+        return self.filmstrips.get(media.id)
+
+    @property
+    def auto_color_strength(self) -> int:
+        return self.color_strength
+
+    @property
+    def denoise_reduction(self) -> int:
+        return self.noise_reduction
 
     @property
     def loudness_target(self) -> float:

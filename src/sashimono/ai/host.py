@@ -26,6 +26,7 @@ from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
+from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
 
 __all__ = [
@@ -228,6 +229,33 @@ class EditorHost(Protocol):
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
+        ...
+
+    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+        """用意できていればサムネイルのシート（タイムラインに並ぶ絵）を返す 無ければ ``None``
+
+        色を測る道具（``auto_color`` #336）が読む 素材を読み直すと、4K の素材で道具が返るまで
+        画面が止まる 取り込みのときに裏で作ってある物を使う
+        """
+        ...
+
+    @property
+    def auto_color_strength(self) -> int:
+        """色を自動で整える（#336）ときの既定の強さ（%）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.auto_color_strength`）
+
+        わざとそう撮った色や暗さまで直してよいかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def denoise_reduction(self) -> int:
+        """音のノイズを自動で減らす（#336）ときの既定の下げる量（dB）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.denoise_reduction_db`）
+
+        雑音をどこまで消したいか・声の質の変わり方をどこまで許すかは人と素材で違う
+        AI が引数で渡さなければこれを使う
+        """
         ...
 
     @property

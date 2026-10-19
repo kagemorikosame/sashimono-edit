@@ -306,6 +306,10 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "duck_audio": lambda ids: {"clip_ids": [ids["video"]], "voice_clip_ids": [ids["video"]]},
     "normalize_loudness": lambda _ids: {"wait_seconds": 0},
     "place_sound": lambda ids: {"media_id": ids["media"]},
+    # 色と雑音の自動補正（#336） 色はサムネイルがまだ無いので、素材の名前を書いて断る
+    # 雑音は絵のクリップを渡すと断る（波形を待つ断りの文の名前は test_auto_fix_tools で見る）
+    "auto_color": lambda ids: {"clip_ids": [ids["video"]]},
+    "reduce_noise": lambda ids: {"clip_ids": [ids["video"]]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
     "undo": lambda _ids: {},
     # 取り消した後でなければ、やり直す物が無いと断る 断る文にも名前は入らない（#333）

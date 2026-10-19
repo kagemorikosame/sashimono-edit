@@ -64,6 +64,8 @@ from sashimono.core.seams import (
     SEAM_ZOOM_PERCENT_RANGE,
     SeamStyle,
 )
+from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE, DEFAULT_REDUCTION_DB
+from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE, DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
@@ -622,6 +624,14 @@ class Preferences:
     seam_zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
     #: 音の継ぎ目のフェード（ミリ秒） 0 で音は触らない
     seam_audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
+    #: AI アシスタントがクリップの色を自動で整える（#336）ときの強さ（%） 測ったとおりに直す
+    #: 量にこれを掛ける 既定は控えめ（:mod:`sashimono.engine.auto_color`） 夕焼けの赤みや
+    #: 夜の暗さのように、わざとそう撮った絵まで真っ平らにしないため
+    auto_color_strength: int = DEFAULT_AUTO_COLOR_STRENGTH
+    #: AI アシスタントが音のノイズを自動で減らす（#336）ときに下げる量（dB）
+    #: 大きいほど雑音は消えるが、声の小さい所まで削れて水の中で話すような音になる
+    #: 既定は 12 dB（雑音がおよそ 4 分の 1 :mod:`sashimono.effects.denoise`）
+    denoise_reduction_db: int = int(DEFAULT_REDUCTION_DB)
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -951,6 +961,16 @@ class PreferenceStore:
             ),
             seam_audio_fade_ms=_within(
                 data.get("seam_audio_fade_ms"), SEAM_AUDIO_FADE_MS_RANGE, plain.seam_audio_fade_ms
+            ),
+            auto_color_strength=_within(
+                data.get("auto_color_strength"),
+                AUTO_COLOR_STRENGTH_RANGE,
+                plain.auto_color_strength,
+            ),
+            denoise_reduction_db=_within(
+                data.get("denoise_reduction_db"),
+                AUTO_REDUCTION_DB_RANGE,
+                plain.denoise_reduction_db,
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis

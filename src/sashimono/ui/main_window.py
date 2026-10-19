@@ -157,6 +157,7 @@ from sashimono.engine.audio.speech import (
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
+from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
@@ -3388,6 +3389,9 @@ class MainWindow(QMainWindow):
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         return self._analyzer.waveform(media, stream)
 
+    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+        return self._analyzer.filmstrip(media)
+
     def request_scenes(self, media: MediaItem) -> None:
         """AI が頼んだ素材の場面を調べる 設定で取り込み時の解析を切っていても読む"""
         self._analyzer.request_scenes(media, on_ready=self._on_analysis_ready)
@@ -3423,6 +3427,14 @@ class MainWindow(QMainWindow):
     @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
+
+    @property
+    def auto_color_strength(self) -> int:
+        return self._preferences.auto_color_strength
+
+    @property
+    def denoise_reduction(self) -> int:
+        return self._preferences.denoise_reduction_db
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

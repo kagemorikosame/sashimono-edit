@@ -216,6 +216,8 @@ class TestAppSettingsAreReadOnly:
             "transcription_status",
             "undo",
             "waveform",
+            # 色を測るサムネイルを読むだけ（#336） 作れていなければ None を返し、作るのは analyze
+            "filmstrip",
             "write_project",
             "write_snapshot",
             "write_subtitles",

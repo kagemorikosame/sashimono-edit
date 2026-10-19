@@ -55,6 +55,9 @@ OWN_LIBRARY = {
     "duck_shape",
     "emphasis_style",
     "seam_style",
+    # 色と雑音の自動補正の強さ・下げる量の既定（#336）
+    "auto_color_strength",
+    "denoise_reduction",
     "template_shelf",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
@@ -82,6 +85,8 @@ PROJECT_SIDE = {
     "subtitle_wrap_share",
     "analyze",
     "waveform",
+    # 色を測るサムネイル（#336） 素材の絵の縮めた物 道具は測った数だけを返し、絵は送らない
+    "filmstrip",
     "request_scenes",
     "scene_state",
     "scene_waiter",
@@ -226,6 +231,9 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # 色と雑音の自動補正（#336） 結果に本人の設定の強さと下げる量の既定が載る
+            "auto_color",
+            "reduce_noise",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

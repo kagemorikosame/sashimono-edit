@@ -103,6 +103,9 @@ _PROMPT = """\
 - 無音を詰めたつなぎ目（ジャンプカット）を目立たなくするときは、jet_cut の smooth か
   smooth_cuts を使います 速度を変える（スロー・早送り）ときは set_speed を使い、
   長さを合わせるか（keep）を頼みに合わせて選びます
+- 色を整える（暗い・色がかぶっている・クリップごとに色が違う）ときは、拡張色調補正の
+  値を推して決めずに auto_color で測って付け、preview_frame で確かめます 音の雑音
+  （サー・ブーン）は reduce_noise で減らし、skipped の訳はそのまま伝えてください
 {linked_clips}
 - 置き方の方式は get_project の layer_mode で分かります 途中で変わっていたら、
   そちらに従ってください

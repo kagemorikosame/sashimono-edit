@@ -99,6 +99,10 @@ UNDOABLE_TOOLS = frozenset(
         "duck_audio",
         "normalize_loudness",
         "place_sound",
+        # 色と雑音の自動補正（#336） 素材はサムネイルと波形を読むだけ クリップにエフェクトを
+        # 積むか、その値を変えるだけで、元の素材は変えない
+        "auto_color",
+        "reduce_noise",
         # 目印（#330） プロジェクトの中の目印だけを変える 素材にもファイルにも触らない
         "add_markers",
         "update_marker",
