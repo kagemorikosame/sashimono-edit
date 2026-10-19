@@ -93,6 +93,14 @@ class TestWaveform:
         waveform = analyze_waveform(sample_av.path)
         assert waveform is not None
         assert float(waveform.duration) == pytest.approx(2.0, abs=0.1)
+        # 長さは解析の前にデコーダから決まるので、ピークが途中で途切れても上の検査は
+        # 通る（#383 の CodeRabbit） ピークが素材の終わりまで並び、終わりの 4 分の 1 にも
+        # 音の振れが残っていることを見る 素材は頭から終わりまで鳴り続ける 440 Hz の音
+        finest = waveform.levels[0]
+        assert finest.count * finest.samples_per_peak >= waveform.total_samples
+        tail = finest.peaks[finest.count * 3 // 4 :]
+        assert len(tail) > 0
+        assert float(np.abs(tail).max()) > 0.01
 
     def test_peaks_bracket_the_signal(self, sample_av: SampleMedia) -> None:
         # min は必ず max 以下 逆転していれば描画が破綻する

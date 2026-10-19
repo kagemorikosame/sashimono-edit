@@ -477,7 +477,15 @@ class TestAudioDecoder:
         # 頼んだ長さと違うサンプル数の配列を返す
         with AudioDecoder(sample_av.path, sample_rate=48000) as decoder:
             samples = decoder.read_seconds(Fraction(1, 2), Fraction(1, 4))
+            # 形だけでは、開始の時刻を無視して頭から読んでも通る（#383 の CodeRabbit）
+            # 440 Hz の音は 0.5 秒でちょうど周期がそろい頭と同じ音になるので、周期の
+            # そろわない 1/3 秒から読み、その位置の音であって頭の音ではないことを見る
+            shifted = decoder.read_seconds(Fraction(1, 3), Fraction(1, 4))
+            expected = decoder.read(16000, 12000)
+            head = decoder.read(0, 12000)
         assert samples.shape == (12000, 2)
+        assert np.allclose(shifted, expected, atol=1e-4)
+        assert not np.allclose(shifted, head, atol=1e-2)
 
     def test_rejects_bad_arguments(self, sample_av: SampleMedia) -> None:
         # サンプリングレート 0 や 3 チャンネルを通すと、変換器を作る所で分かりにくい誤りで

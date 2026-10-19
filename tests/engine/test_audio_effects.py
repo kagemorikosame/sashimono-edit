@@ -135,8 +135,11 @@ class TestMonaural:
 
     def test_full_ratio_makes_both_sides_the_same(self) -> None:
         # 比率 100 で左右がそろわないと、モノラル化を掛けても片側だけの録音が片耳からしか聞こえない
-        out = _run("audio_monaural", _stereo(4, left=1.0, right=-1.0), ratio=100.0)
-        assert out[0, 0] == pytest.approx(out[0, 1])
+        # 左だけ鳴る音を入れ、両耳から半分ずつ鳴ることを見る 逆相の音では左右とも 0 になり、
+        # 何も鳴らない壊れ方でも通ってしまう（#383 の CodeRabbit）
+        out = _run("audio_monaural", _stereo(4, left=1.0, right=0.0), ratio=100.0)
+        assert np.allclose(out[:, 0], out[:, 1])
+        assert np.allclose(out, 0.5)
 
     def test_half_way_is_between(self) -> None:
         # 比率 50 で半分だけ寄せないと、比率を少し上げたつもりで広がりが一気に消えるか変わらない

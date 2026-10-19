@@ -270,7 +270,18 @@ class TestEditingInsideAPlacedScene:
         try:
             mixer.render(0, RATE // 2)
             kept = dict(mixer._windows)
-            mixer.set_project(project)
+            # 同じ作品を渡し直すだけでは、編集で作品が別の物になったときに捨てる壊れ方を
+            # 拾えない 名前を変えて空のトラックを足し、リバーブのクリップには触れない編集に
+            # する（#383 の CodeRabbit）
+            renamed = project.renamed("変えた後")
+            edited = renamed.with_timeline(
+                replace(
+                    renamed.timeline,
+                    tracks=(*renamed.timeline.tracks, Track(TrackKind.VIDEO, "V2", ())),
+                )
+            )
+            assert edited is not project
+            mixer.set_project(edited)
             assert kept and all(mixer._windows[key] is value for key, value in kept.items())
         finally:
             mixer.close()
