@@ -71,6 +71,7 @@ class TestFollowingRedirects:
         assert transport.requested == [LATEST, TAGGED, CDN]
 
     def test_a_relative_redirect_is_resolved(self, transport: MemoryTransport) -> None:
+        # 相対の転送先を追えないと、そう返されたときに目録が取れず、起動時の確認が黙って失敗し続ける
         transport.redirects[LATEST] = "/owner/repo/releases/download/v1.2.3/update.json"
         transport.pages[TAGGED] = b"{}"
         assert fetch_bytes(LATEST, transport, limit=100) == b"{}"
@@ -99,11 +100,18 @@ class TestFollowingRedirects:
         assert len(transport.requested) == MAX_REDIRECTS + 1
 
     def test_a_redirect_without_a_target_fails(self, transport: MemoryTransport) -> None:
+        # 転送先の無い返事を FetchError で終えないと、check_for_update が受け止められず
+        # 確認ごと抜ける
+        # 空の転送先は urljoin で同じ URL に戻り、確かめが無くても転送の上限で結局 FetchError に
+        # なるので、1 回で止めたかを頼んだ回数で見る
         transport.redirects[LATEST] = ""
-        with pytest.raises(FetchError):
+        with pytest.raises(FetchError, match="転送先が書かれていない"):
             fetch_bytes(LATEST, transport, limit=100)
+        assert transport.requested == [LATEST]
 
     def test_a_missing_file_fails(self, transport: MemoryTransport) -> None:
+        # 404 を FetchError にしないと、beta のタグがまだ無い間、ベータを選んだ人は
+        # 正式版も受け取れない
         with pytest.raises(FetchError):
             fetch_bytes(LATEST, transport, limit=100)
 
@@ -132,6 +140,7 @@ class TestDownloading:
         download(TAGGED, transport, target, **options)  # type: ignore[arg-type]
 
     def test_a_matching_file_is_kept(self, served: MemoryTransport, tmp_path: Path) -> None:
+        # 照合の通った zip が本来の名前に置かれないと展開へ進めず、書きかけの .part が隣に残る
         target = tmp_path / "package.zip"
         self._download(served, target)
         assert target.read_bytes() == self.BODY
@@ -152,18 +161,21 @@ class TestDownloading:
         assert list(tmp_path.iterdir()) == []
 
     def test_a_shorter_file_fails(self, served: MemoryTransport, tmp_path: Path) -> None:
+        # 目録より短い返事を通すと、大きさの照らしが効かず SHA-256 の 1 本だけで落とし終えたと決める
         target = tmp_path / "package.zip"
         with pytest.raises(FetchError):
             self._download(served, target, size=len(self.BODY) + 1)
         assert list(tmp_path.iterdir()) == []
 
     def test_it_can_be_stopped(self, served: MemoryTransport, tmp_path: Path) -> None:
+        # 止める合図を見ないと、呼び手が止めても zip を最後まで落として置いてしまう
         target = tmp_path / "package.zip"
         with pytest.raises(FetchError):
             self._download(served, target, should_cancel=lambda: True)
         assert list(tmp_path.iterdir()) == []
 
     def test_a_foreign_cdn_is_not_used(self, transport: MemoryTransport, tmp_path: Path) -> None:
+        # 決めたホストでない転送先から落とすと、署名は中身を守っても、どこから取ったかを言えなくなる
         transport.redirects[TAGGED] = "https://cdn.example.com/package.zip"
         transport.pages["https://cdn.example.com/package.zip"] = self.BODY
         with pytest.raises(FetchError):
@@ -195,12 +207,16 @@ class TestACutOffAnswer:
     """本文の途中で繋がりが切れても FetchError にする 起動時の確認は FetchError を黙って流す"""
 
     def test_a_small_file(self) -> None:
+        # 切れた返事が FetchError にならないと check_for_update が受け止めず、正式版とベータの
+        # 片方が切れただけで確認ごと失敗する
         transport = _CuttingTransport()
         transport.pages[LATEST] = b"{}"
         with pytest.raises(FetchError):
             fetch_bytes(LATEST, transport, limit=100)
 
     def test_a_download_leaves_nothing(self, tmp_path: Path) -> None:
+        # 切れたときに書きかけを消さないと Sashimono の隣に .part が残り、FetchError にならないと
+        # 〔更新を確かめる…〕の知らせに http.client の例外の名前がそのまま出る
         transport = _CuttingTransport()
         transport.pages[TAGGED] = b"body"
         target = tmp_path / "package.zip"

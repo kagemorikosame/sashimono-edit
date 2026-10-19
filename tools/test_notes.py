@@ -38,12 +38,6 @@ ROOT = Path(__file__).resolve().parent.parent
 #: 他人が作った配布物と、試験の材料として読むだけのファイルの置き場
 SKIP_PREFIXES = ("tests/fixtures/",)
 
-#: 見張る置き場 前からある試験の抜けは 1451 本・207 ファイルあり、1 本の PR に収まらない
-#: （CodeRabbit が見るのは 1 PR 100 ファイルまで） 書き添えを埋めた置き場から順に広げ、
-#: 全部埋まったら tests 全体にする 抜けた試験の控えを持つ形にしないのは、控えが
-#: やり残しの一覧として残り続けるため ``--all`` でまだ見張っていない置き場も数えられる
-WATCHED_PREFIXES = ("tests/ai/", "tests/ui/", "tests/core/", "tests/engine/")
-
 
 @dataclass(frozen=True, slots=True)
 class Missing:
@@ -757,15 +751,18 @@ def scan(path: Path, reader: Reader | None = None) -> list[Missing]:
     return missing
 
 
-def targets(root: Path = ROOT, *, everything: bool = False) -> list[Path]:
-    """試験のファイル pytest の既定の集め方（``test_*.py`` と ``*_test.py``）に合わせる"""
+def targets(root: Path = ROOT) -> list[Path]:
+    """試験のファイル pytest の既定の集め方（``test_*.py`` と ``*_test.py``）に合わせる
+
+    tests の全部を見る 前からある試験の抜け（1451 本・207 ファイル）は #363 で 3 本の PR に
+    分けて埋め、置き場を少しずつ広げてきた 埋め終えたので置き場の一覧は持たない 一覧を
+    残すと、新しく置き場を足したときにそこだけ見張りの外になる
+    """
     found: set[Path] = set()
     for pattern in ("test_*.py", "*_test.py"):
         for path in (root / "tests").rglob(pattern):
             relative = path.relative_to(root).as_posix()
             if relative.startswith(SKIP_PREFIXES) or "__pycache__" in path.parts:
-                continue
-            if not everything and not relative.startswith(WATCHED_PREFIXES):
                 continue
             found.add(path)
     return sorted(found)
@@ -774,16 +771,11 @@ def targets(root: Path = ROOT, *, everything: bool = False) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--count", action="store_true", help="ファイルごとの数を多い順に出す")
-    parser.add_argument("--all", action="store_true", help="まだ見張っていない置き場も数える")
     arguments = parser.parse_args(argv)
 
     # 同じ基底を何本ものクラスが受け継ぐと同じ試験が何度も出るので、1 本にまとめる
     reader = Reader()
-    missing = list(
-        dict.fromkeys(
-            item for path in targets(everything=arguments.all) for item in scan(path, reader)
-        )
-    )
+    missing = list(dict.fromkeys(item for path in targets() for item in scan(path, reader)))
     if arguments.count:
         for name, count in Counter(_relative(item.path) for item in missing).most_common():
             print(f"{count}\t{name}")

@@ -60,6 +60,8 @@ def crash(session: RecoverySession) -> None:
 
 class TestRecovery:
     def test_a_live_session_is_not_an_orphan(self, tmp_path: Path) -> None:
+        # 生きている別の窓の退避を落ちた作業として勧めると、同じ作業が 2 つの窓で
+        # 別々に進み、どちらかの変更が消える
         session = RecoverySession(tmp_path)
         session.save(Project.create(name="作業中"), None)
         try:
@@ -68,6 +70,7 @@ class TestRecovery:
             session.close()
 
     def test_a_crashed_session_is_found(self, tmp_path: Path) -> None:
+        # 落ちた起動の退避を見つけられないと、次の起動で復元の窓が出ず、保存していない作業が戻らない
         session = RecoverySession(tmp_path)
         source = tmp_path / "本編.sme"
         session.save(Project.create(name="本編"), source)
@@ -78,6 +81,7 @@ class TestRecovery:
         assert load_project(entries[0].path).name == "本編"
 
     def test_a_clean_exit_leaves_nothing(self, tmp_path: Path) -> None:
+        # 普通に閉じた後に退避が残ると、次の起動で落ちていない作業まで復元を勧められる
         session = RecoverySession(tmp_path)
         session.save(Project.create(), None)
         session.close()
@@ -92,6 +96,7 @@ class TestRecovery:
         assert find_orphans(tmp_path) == []
 
     def test_discard_removes_it(self, tmp_path: Path) -> None:
+        # 捨てたはずの退避が残ると、復元の窓で〔捨てる〕を選んだ後も同じ 1 件が出続ける
         session = RecoverySession(tmp_path)
         session.save(Project.create(), None)
         crash(session)
@@ -100,6 +105,8 @@ class TestRecovery:
         assert list((tmp_path / "recovery").iterdir()) == []
 
     def test_newest_comes_first(self, tmp_path: Path) -> None:
+        # 1 つの置き場の中で新しい順に並ばないと、先頭を最新の作業として扱う呼び手が
+        # 前の作業を選ぶ（画面は find_orphans_in が並べ直す）
         older = RecoverySession(tmp_path)
         older.save(Project.create(name="古い"), None)
         crash(older)
@@ -133,6 +140,8 @@ class TestRecovery:
         assert load_project(entry.path).name == "最初の退避"
 
     def test_two_sessions_do_not_share_a_file(self, tmp_path: Path) -> None:
+        # 2 つの窓が同じ退避ファイルへ書くと、片方の作業がもう片方の退避で上書きされ、
+        # 落ちたときに戻らない
         first, second = RecoverySession(tmp_path), RecoverySession(tmp_path)
         try:
             assert first.path != second.path
@@ -557,6 +566,8 @@ class TestRememberingFromTwoWritersAtOnce:
     def test_a_writer_in_between_is_not_lost(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 覚える途中に別の窓が割り込むと片方の置き場が一覧から消え、そこで落ちた作業の
+        # 退避が次の起動で探されない
         registry = tmp_path / "既定"
         plain_read = recovery.remembered_roots
         first_read = threading.Event()

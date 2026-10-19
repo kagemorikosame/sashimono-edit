@@ -487,7 +487,7 @@ class TestEveryWayPytestCollects:
         (tmp_path / "tests").mkdir()
         for name in ("test_a.py", "b_test.py", "helper.py"):
             (tmp_path / "tests" / name).write_text("", encoding="utf-8")
-        found = [path.name for path in tool.targets(tmp_path, everything=True)]
+        found = [path.name for path in tool.targets(tmp_path)]
         assert found == ["b_test.py", "test_a.py"]
 
 
@@ -631,16 +631,20 @@ class TestWhatPytestSkips:
         assert sorted(item.name for item in found) == expected
 
 
-def test_only_the_watched_places_are_checked(tool: ModuleType) -> None:
-    # 書き添えを埋めた置き場から順に見張る まだ埋めていない置き場まで見ると verify が
-    # 落ち続け、--all を付けなければ数えられないと誰も抜けの数を追えない
-    watched = tool.targets()
-    everything = tool.targets(everything=True)
-    assert watched
-    assert set(watched) < set(everything)
-    for path in watched:
-        assert path.relative_to(ROOT).as_posix().startswith(tool.WATCHED_PREFIXES)
-    assert not any("fixtures" in path.parts for path in everything)
+def test_every_place_under_tests_is_checked(tool: ModuleType, tmp_path: Path) -> None:
+    # 置き場の一覧で絞ると、新しく足した置き場（tests/新しい所 など）だけが見張りの外になり、
+    # そこに書き添えの無い試験を置いても verify が通る 他人の配布物の fixtures だけは見ない
+    for place in ("ai", "compat", "新しい所", "fixtures"):
+        (tmp_path / "tests" / place).mkdir(parents=True)
+        (tmp_path / "tests" / place / "test_a.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests" / "test_top.py").write_text("", encoding="utf-8")
+    found = {path.relative_to(tmp_path).as_posix() for path in tool.targets(tmp_path)}
+    assert found == {
+        "tests/ai/test_a.py",
+        "tests/compat/test_a.py",
+        "tests/新しい所/test_a.py",
+        "tests/test_top.py",
+    }
 
 
 def test_verify_runs_the_check() -> None:

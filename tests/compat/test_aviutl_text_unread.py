@@ -134,6 +134,8 @@ class TestAviUtl2:
 
 class TestAviUtl1:
     def test_all_zero_records_nothing(self) -> None:
+        # 0 の項目で記録が出ると、AviUtl1 の .exa を読み込むたびに互換性レポートが
+        # 使っていない項目の行で埋まる
         assert _unread(_missing(_aviutl1())) == {}
 
     def test_the_first_generation_names_are_read(self) -> None:

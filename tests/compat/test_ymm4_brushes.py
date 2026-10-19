@@ -83,6 +83,8 @@ class TestBrushes:
             assert effect.params["blend"] == expected
 
     def test_dot_brush_keeps_its_spacing(self) -> None:
+        # ドットの間隔（Span）を写し損ねると、
+        # YMM4 の水玉模様で塗ったテンプレートの点が違う間隔で並ぶ
         brush = _brush(
             "DotBrushPlugin",
             Foreground="#FFFF0000",

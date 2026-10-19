@@ -38,6 +38,8 @@ def _leftovers(layout: Layout) -> list[str]:
 
 class TestStaging:
     def test_a_good_package_waits_beside(self, layout: Layout) -> None:
+        # 新しい版が .new に置かれないと〔新しい版を入れる…〕のボタンが出ず、落とした zip が残ると
+        # その分のディスクを塞ぐ
         transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
         staged = stage(manifest, transport, layout)
         assert staged == layout.staged
@@ -46,6 +48,7 @@ class TestStaging:
         assert _leftovers(layout) == [layout.staged.name]
 
     def test_a_wrong_hash_stages_nothing(self, layout: Layout) -> None:
+        # 目録と SHA-256 の違う zip を展開して置くと、すり替えた中身を次の入れ替えで入れる
         transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
         bad = replace(manifest, package=replace(manifest.package, sha256="0" * 64))
         with pytest.raises(FetchError):
@@ -81,6 +84,7 @@ class TestStaging:
         assert _leftovers(layout) == []
 
     def test_an_older_stage_is_replaced(self, layout: Layout) -> None:
+        # 前に置いた古い .new を片付けないと置き直せず、新しい版を落としても待つ版が古いままになる
         key = Ed25519PrivateKey.generate()
         transport, first = release(key, "1.2.0")
         stage(first, transport, layout)
@@ -89,6 +93,8 @@ class TestStaging:
         assert layout.staged_version() == "1.3.0"
 
     def test_the_hash_is_checked_on_the_bytes(self, layout: Layout) -> None:
+        # 見本の目録の SHA-256 が配った zip から作られていないと、ほかの置き場の試験の照合が
+        # 本物の照らし方を通らない
         transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
         stage(manifest, transport, layout)
         body = transport.pages[next(u for u in transport.pages if u.endswith(".zip"))]
@@ -106,10 +112,13 @@ class TestTheLayout:
         assert not Layout(tmp_path / "missing" / "Sashimono").writable()
 
     def test_a_writable_parent_is_left_clean(self, layout: Layout) -> None:
+        # 書ける所を書けないと見ると配布のページへ回され、試しのフォルダを消さないと隣に残る
         assert layout.writable()
         assert _leftovers(layout) == []
 
     def test_build_info_is_read(self, layout: Layout) -> None:
+        # 書き付けを読めないと、落とした zip を「build-info.json が無い」と断り、
+        # 新しい版を入れられない
         assert read_build_info(layout.install) is None
         package_module.write_build_info(layout.install, "1.2.3", "cp314")
         info = read_build_info(layout.install)
@@ -118,6 +127,8 @@ class TestTheLayout:
         assert (info.swap_contract, info.swap_script) == (0, "")
 
     def test_the_swap_script_is_read_from_the_build_info(self, layout: Layout) -> None:
+        # 台本の場所を読めないと、入れ替え係はいつも今の版の台本で走り、
+        # 台本の直しが 1 つ前の版からの更新に効かない
         package_module.write_build_info(
             layout.install, "1.2.3", "cp314", swap_contract=4, swap_script="_internal/x.ps1"
         )
@@ -180,6 +191,8 @@ class TestUserScripts:
         assert not list(layout.previous.rglob("*.moving"))
 
     def test_the_same_content_is_left_alone(self, layout: Layout) -> None:
+        # 同じ中身まで写し直すと、前の版へ戻すたびに戻る先の物を全部書き直す
+        # （写した数は呼び手が使わない）
         self._write(layout.install, "効果.anm2", "同じ")
         self._write(layout.previous, "効果.anm2", "同じ")
         assert carry_user_files(layout.install, layout.previous, overwrite=True) == 0
@@ -275,6 +288,8 @@ class TestUserScripts:
         assert not list(layout.staged.rglob("*.moving"))
 
     def test_a_failure_to_put_it_aside_is_raised_too(self, layout: Layout, tmp_path: Path) -> None:
+        # %APPDATA% へ写せないのを黙ると、本人の物はどちらにも写らないまま入れ替わり、
+        # 次の更新で消える
         aside = tmp_path / "roaming" / "Sashimono" / "scripts"
         aside.mkdir(parents=True)
         (aside / "見本").write_text("塞ぐ", encoding="utf-8")

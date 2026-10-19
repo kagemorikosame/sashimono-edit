@@ -247,6 +247,8 @@ def _shrunk(image: np.ndarray) -> np.ndarray:
     ],
 )
 def test_the_waveform_modes_match_aviutl(name: str, limit: float) -> None:
+    # 升目やスペース、スペクトラムの棒の読み方がずれると、AviUtl2 の音声波形表示を
+    # 読み込んだ絵が AviUtl2 と違う線や棒で描かれる
     if not BGM.exists():
         pytest.skip("音声波形表示の見本が描く音が無い")
     _match(name, [3, 40, 76], limit)

@@ -277,6 +277,8 @@ class TestPipInsideThePackage:
         assert "--only-binary" not in command
 
     def test_the_exe_hands_it_to_pip(self, frozen: Path) -> None:
+        # exe -m pip の後ろを pip への引数として返せないと、導入ボタンが exe 自身を子として起こし
+        # （0.1.3 で Defender に消された流れ）、手で打った Sashimono.exe -m pip は編集画面を立てる
         assert pip_arguments([str(frozen), "-m", "pip", "install", "pkg"]) == ["install", "pkg"]
 
     def test_an_ordinary_start_is_not_taken_for_pip(self, frozen: Path) -> None:
@@ -441,6 +443,8 @@ class TestPipRunsInsideTheApp:
         assert run_pip_here(["install"]) == expected
 
     def test_a_failing_pip_is_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # pip の失敗を 0 で返すと、入らなかった機能に入れ終えた印を書き、
+        # 導入の欄に「導入が完了しました」と出る
         monkeypatch.setattr("pip._internal.cli.main.main", lambda arguments: 1)
         assert run_pip_here(["install", "pkg"]) == 1
 
@@ -768,6 +772,7 @@ class TestTheNotices:
     """
 
     def test_the_zip_carries_the_notices(self, builder: ModuleType, tmp_path: Path) -> None:
+        # 使用許諾の全文と一覧が zip から抜けると、GPL の部品（x264・x265）を条件の文書無しで配る
         bundle = tmp_path / "bundle"
         bundle.mkdir()
         builder.assemble(bundle)
@@ -1059,6 +1064,8 @@ class TestNativeLicenses:
     """wheel の中の DLL（PyAV の av.libs、lupa の LuaJIT）には、リポジトリの写しが要る"""
 
     def test_the_version_and_mark_are_stripped(self, builder: ModuleType) -> None:
+        # 版の番号や delvewheel の印が残ると表の名前と合わず、積んだ DLL がどれも
+        # 「使用許諾の写しが決まっていない」となって組み立てが止まる
         assert builder.native_base_name("libx264-165-f3a909470ddc2d85ed21eda3d0fb7954.dll") == (
             "libx264"
         )
@@ -1071,6 +1078,7 @@ class TestNativeLicenses:
         assert builder.native_base_name("luajit21.cp314-win_amd64.pyd") == "luajit21"
 
     def test_known_dlls_pass(self, builder: ModuleType, tmp_path: Path) -> None:
+        # 表にある DLL や lupa の Lua 5.x を問題に挙げると、写しのそろった組み立てまで [NG] で止まる
         internal = tmp_path / "_internal"
         (internal / "av.libs").mkdir(parents=True)
         (internal / "lupa").mkdir()
@@ -1094,6 +1102,8 @@ class TestNativeLicenses:
         assert len(problems) == 1 and "libaom" in problems[0]
 
     def test_every_listed_copy_is_in_the_repository(self, builder: ModuleType) -> None:
+        # 表に書いた写しのフォルダがリポジトリに無いと、その DLL を積む組み立てが
+        # 「写し licenses/<フォルダ> が無い」の [NG] で止まる
         for folder in set(builder.NATIVE_LICENSES.values()):
             assert (ROOT / "licenses" / folder).is_dir(), folder
 
@@ -1112,6 +1122,8 @@ class TestOnlyRecordedFilesGoIn:
         return record
 
     def test_a_stray_dll_is_found(self, builder: ModuleType, tmp_path: Path) -> None:
+        # --skip-build で混ざった DLL を見逃すと、出どころも使用許諾も分からない物を
+        # zip に入れて配る
         bundle = tmp_path / "Sashimono"
         (bundle / "_internal" / "PySide6").mkdir(parents=True)
         (bundle / "Sashimono.exe").write_bytes(b"MZ")
@@ -1151,6 +1163,8 @@ class TestUnusedQtIsLeftOut:
     """
 
     def test_the_listed_parts_are_removed(self, builder: ModuleType, tmp_path: Path) -> None:
+        # 外し損ねると zip が 18 MB ほど膨らみ、LGPL の部品として qtwebengine のソースまで添付が要る
+        # 使う Qt6Core まで外すと、配った exe が起動しない
         internal = tmp_path / "_internal"
         for relative in [*builder.UNUSED_QT_PARTS, "PySide6/Qt6Core.dll"]:
             (internal / relative).parent.mkdir(parents=True, exist_ok=True)
@@ -1178,6 +1192,7 @@ class TestUnusedQtIsLeftOut:
     def test_nothing_dangles_when_nothing_uses_them(
         self, builder: ModuleType, tmp_path: Path
     ) -> None:
+        # 外した DLL を読まない物まで挙げると、組み立てが毎回「[NG] 外した … を … が読む」で止まる
         internal = tmp_path / "_internal"
         (internal / "PySide6").mkdir(parents=True)
         (internal / "PySide6" / "Qt6Widgets.dll").write_bytes(b"MZ")
@@ -1207,6 +1222,8 @@ class TestTheEditorCheckLeavesNoTrace:
     """
 
     def test_the_layout_is_not_written(self) -> None:
+        # 自己診断が編集画面を閉じるときに本人の置き場へ書くと、整えた画面の並びが
+        # 既定の並びで上書きされる
         from sashimono.selfcheck import _editor
         from sashimono.ui.workspace import config_root
 
@@ -1262,6 +1279,8 @@ class TestWithoutAConsole:
         return shown
 
     def test_the_result_is_shown_in_a_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 標準出力の無い起動（ダブルクリック）で窓を出さないと、自己診断を頼んだ人には
+        # 何も起きないように見える
         shown = self._capture(monkeypatch)
         monkeypatch.setattr(
             "sashimono.selfcheck.run_self_check", lambda: [CheckResult("GL で描く", True, "描けた")]
@@ -1309,6 +1328,7 @@ class TestOnlyCheckedZipsRemain:
     def test_a_failed_check_takes_the_zip_away(
         self, builder: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 確かめて落ちた zip が dist に残ると、動かない物を完成品と取り違えて配る
         monkeypatch.setattr(builder, "smoke_test", lambda archive, notices: 1)
         target = tmp_path / "out.zip"
         assert builder.package(self._bundle(tmp_path), target) == 1
@@ -1326,6 +1346,7 @@ class TestOnlyCheckedZipsRemain:
     def test_a_passed_check_keeps_it(
         self, builder: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 確かめて通った zip まで消すと、組み立てを待った後の dist に配る zip が残らない
         monkeypatch.setattr(builder, "smoke_test", lambda archive, notices: 0)
         target = tmp_path / "out.zip"
         assert builder.package(self._bundle(tmp_path), target) == 0
@@ -1508,6 +1529,8 @@ class TestTheExeCarriesItsVersion:
             builder.version_numbers("70000.0")
 
     def test_the_build_asks_for_the_version_file(self, builder: ModuleType) -> None:
+        # main が書いた版情報を PyInstaller へ渡さないと、exe のプロパティが空のまま配られ、
+        # 署名した後の発行元の表示と製品名・版が食い違う
         arguments = builder.pyinstaller_arguments(Path("work"), Path("dist"))
         index = arguments.index("--version-file")
         assert Path(arguments[index + 1]) == Path("work") / builder.VERSION_FILE_NAME
@@ -1531,6 +1554,8 @@ class TestTheStandardLibraryGoesIn:
     """
 
     def test_the_whole_library_is_asked_for(self, builder: ModuleType) -> None:
+        # 後から入れる部品が使う標準ライブラリを積み忘れると、配布版で AI 連携を入れて送った途端に
+        # No module named 'zoneinfo' のように止まる
         arguments = builder.pyinstaller_arguments(Path("w"), Path("d"))
         asked = _values(arguments, "--hidden-import") | _values(arguments, "--collect-submodules")
         assert {"zoneinfo", "email", "xml", "json", "asyncio", "sqlite3", "tomllib"} <= asked
@@ -1609,12 +1634,16 @@ class TestTheImportCheck:
         assert str(dlls) in sys.path
 
     def test_a_readable_module_passes(self, tmp_path: Path) -> None:
+        # 読める部品で 1 を返すと、開発の環境の --add-on-check が入った部品まで
+        # 読めないと言って落ちる
         (tmp_path / "sashimono_import_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
         assert main(["sashimono", "--import-check", str(tmp_path), "sashimono_import_probe"]) == 0
 
     def test_a_missing_module_fails_and_says_which(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 読めない部品で 0 を返すと、AI 連携を読めない置き場でも --add-on-check が通る
+        # 名前を出さないと、どの部品が欠けたかを確かめの要約から辿れない
         (tmp_path / "sashimono_import_broken.py").write_text(
             "import no_such_stdlib_part\n", encoding="utf-8"
         )
@@ -1734,6 +1763,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
     def test_the_exe_pip_installs_what_the_buttons_install(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 導入ボタンと違う引数で入れて確かめると、ボタンでは入らない zip が確かめを通って配られる
         from sashimono.ai.environment import AI_PACK
         from sashimono.asr.environment import ASR_PACK
         from sashimono.runtime import install_arguments
@@ -1894,6 +1924,8 @@ class TestTheProjectArgumentBeforeLeavingTheFolder:
     def test_a_relative_project_becomes_absolute(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 相対のまま作業場所を移すと、Sashimono.exe 作品.sme と渡した作品を移した先で探して開けず、
+        # 更新で起こし直すときにも別の場所を渡す
         from sashimono.app import absolute_project_argument
 
         monkeypatch.chdir(tmp_path)
@@ -1905,6 +1937,8 @@ class TestTheProjectArgumentBeforeLeavingTheFolder:
 
     @pytest.mark.parametrize("arguments", [["Sashimono.exe"], ["Sashimono.exe", "-platform"]])
     def test_other_arguments_are_left_alone(self, arguments: list[str]) -> None:
+        # Qt の -platform などを場所に書き換えると Qt の指定として効かず、引数の無い起動で
+        # 1 つ目を読もうとして落ちると、いつもの起動が編集画面まで届かない
         from sashimono.app import absolute_project_argument
 
         assert absolute_project_argument(arguments) == arguments
@@ -1920,6 +1954,8 @@ class TestAScriptIsNotTakenForAProject:
     def test_the_pip_runner_is_refused(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 台本を渡された exe が編集画面を立てると、pip がソースの形から組む導入が終わらない
+        # 台本の名前を出さないと、なぜ失敗したかを pip の出力から読めない
         import sashimono.app as app
 
         def no_editor(arguments: list[str]) -> int:
@@ -1949,6 +1985,8 @@ class TestTheAssistantSaysWhatIsMissing:
     """AI アシスタントの窓に ModuleNotFoundError のまま出さない（利用者の画面）"""
 
     def test_a_missing_standard_part_points_to_an_update(self) -> None:
+        # 標準ライブラリの欠けを入れ直しへ案内すると、配布版の不具合なので何度入れ直しても直らない
+        # ModuleNotFoundError のまま出すと、アシスタントの窓を見た人は何をすればよいか分からない
         from sashimono.ai.session import _explain
 
         text = _explain(ModuleNotFoundError("No module named 'zoneinfo'", name="zoneinfo"))
@@ -1956,6 +1994,8 @@ class TestTheAssistantSaysWhatIsMissing:
         assert "ModuleNotFoundError" not in text
 
     def test_a_missing_add_on_points_to_reinstalling(self) -> None:
+        # 足りない部品の名前と「環境を更新」の案内が無いと、アシスタントが動かない人が
+        # 入れ直しに辿り着けない
         from sashimono.ai.session import REINSTALL_HINT, _explain
 
         text = _explain(ModuleNotFoundError("No module named 'anyio'", name="anyio"))
@@ -1981,6 +2021,7 @@ class TestTheUpdateParts:
         assert builder.BUILD_INFO_NAME not in builder.notice_digests(bundle)
 
     def test_the_build_info_is_not_a_stray_file(self, builder: ModuleType, tmp_path: Path) -> None:
+        # assemble が置く書き付けを記録に無いファイルと数えると、組み立てが毎回 [NG] で止まる
         bundle = tmp_path / "Sashimono"
         bundle.mkdir()
         (bundle / "Sashimono.exe").write_bytes(b"MZ")
@@ -2114,6 +2155,7 @@ class TestTheSelfCheckOnAnEnglishWindows:
     """
 
     def test_a_narrow_pipe_is_switched_to_utf8(self) -> None:
+        # cp1252 のまま書くと英語の Windows（CI）で結果を出す前に落ち、終了コードの 1 だけが残る
         from sashimono.selfcheck import _make_writable
 
         stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
@@ -2147,6 +2189,8 @@ class TestTheVcRuntimeCheck:
         return bundle
 
     def test_parts_from_inside_pass(self, tmp_path: Path) -> None:
+        # 配布版の中から読んだ部品を外から借りたと見ると、自己診断のこの項目が [NG] になり、
+        # 正しく積んだ zip まで確かめで落ちる
         from sashimono.selfcheck import vc_runtime_report
 
         bundle = self._bundle(tmp_path)
@@ -2169,6 +2213,8 @@ class TestTheVcRuntimeCheck:
         assert "msvcp140.dll" in vc_runtime_report(loaded, bundle)
 
     def test_a_part_only_windows_has_fails(self, tmp_path: Path) -> None:
+        # 配布版に無い部品を Windows から借りて通すと、再頒布可能パッケージの無い機械で
+        # 起動しない zip を配る
         from sashimono.selfcheck import vc_runtime_report
 
         bundle = self._bundle(tmp_path)
@@ -2188,6 +2234,7 @@ class TestTheVcRuntimeCheck:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows の DLL の一覧を読む")
     def test_this_process_is_counted(self) -> None:
+        # 読み込んだ DLL を数えられないと、配布版の自己診断のこの項目が「数えられない」で落ちる
         from sashimono.selfcheck import VC_RUNTIME_PREFIXES, loaded_modules
 
         names = [path.name.lower() for path in loaded_modules()]
@@ -2204,13 +2251,32 @@ class TestTheVcRuntimeCheck:
 class TestTheEncodeCheckNeedsNoGL:
     """GPU の無い機械でも FFmpeg の部品は確かめる 書き出す項目は GL で先に落ちる"""
 
-    def test_it_encodes_into_a_japanese_folder(self) -> None:
+    def test_it_encodes_into_a_japanese_folder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ASCII の名前の置き場でだけ符号化すると、パスを狭い文字コードで渡す部品の積み違えを
+        # 見逃し、ユーザー名が日本語の人の一時フォルダや書き出し先で落ちる zip を配る
+        # 返す文に名前を入れるだけでも通らないよう、FFmpeg へ渡したパスそのものを見る
+        import av
+
         from sashimono.selfcheck import JAPANESE_FOLDER, _encode
 
+        opened: list[str] = []
+        real_open = av.open
+
+        def spy(file: Any, *args: Any, **kwargs: Any) -> Any:
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(av, "open", spy)
         assert " " in JAPANESE_FOLDER and not JAPANESE_FOLDER.isascii()
         assert JAPANESE_FOLDER in _encode()
+        # 書く 1 回と読み戻す 1 回の両方が、日本語と空白を含む置き場の同じファイルを通る
+        assert len(opened) == 2 and opened[0] == opened[1], opened
+        assert Path(opened[0]).parent.name == JAPANESE_FOLDER
+        assert not Path(opened[0]).name.isascii()
 
     def test_it_does_not_touch_gl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 符号化の項目が GL を使うと、GPU の無い機械では FFmpeg の DLL の積み忘れと
+        # GL が無いだけとを分けられず、まっさらな機械の確かめがこの項目で落ちる
         from sashimono import selfcheck
 
         def no_gl(*args: object, **kwargs: object) -> None:
@@ -2239,6 +2305,8 @@ class TestTheBuildIsPinnedToTheList:
         return module
 
     def test_the_listed_packages_are_pinned(self, notices: ModuleType) -> None:
+        # 一覧の版に留めないと、その日の最新（av 19 など）が入って写しの無い DLL を積み、
+        # 一覧と版が食い違って CI の組み立てが止まる
         lines = notices.constraints(notices.NOTICES_SOURCE.read_text(encoding="utf-8"))
         names = {line.split("==")[0] for line in lines}
         assert {"av", "pyside6-essentials", "cryptography", "pyinstaller"} <= names

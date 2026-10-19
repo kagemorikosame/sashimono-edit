@@ -52,14 +52,17 @@ def decode_utf16_hex(value: str) -> str:
 
     AviUtl はテキストを UTF-16LE の 16 進文字列で書く 末尾は 0 で埋められて
     いるので、最初の終端文字までを本文とする
+
+    崩れた欄でも例外にしない（テキスト欄が 1 つ壊れただけで .exo の読み込み全体を
+    止めない） 16 進の字だけを残し、4 桁（1 文字分）の倍数へ切り詰めるので、
+    ``bytes.fromhex`` が断る字（16 進でない字・半端な桁）は渡らない 前は念のための
+    ``except ValueError`` を置いていたが、ここを通る入力は無く、試験で確かめられない
+    分かれ道だった（#384） 約束は試験が任意の文字列で押さえている
     """
     cleaned = "".join(c for c in value if c in "0123456789abcdefABCDEF")
     if len(cleaned) % 4:
         cleaned = cleaned[: len(cleaned) // 4 * 4]
-    try:
-        raw = bytes.fromhex(cleaned)
-    except ValueError:
-        return ""
+    raw = bytes.fromhex(cleaned)
     text = raw.decode("utf-16-le", errors="replace")
     return text.split("\x00", 1)[0]
 
