@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from fractions import Fraction
 
@@ -230,6 +231,104 @@ class TestTheBackground:
         video = _video(video_media)
         project = _project(video_media, (video,), (_text("字幕"),))
         assert [media.id for media in tracked_media(project)] == [video_media.id]
+
+
+def _with_transform(clip: Clip, **values: float) -> Clip:
+    effects = tuple(
+        _set_all(e, values) if e.kind == TRANSFORM_EFFECT_KIND else e for e in clip.effects
+    )
+    return replace(clip, effects=effects)
+
+
+def _set_all(effect: Effect, values: dict[str, float]) -> Effect:
+    for name, value in values.items():
+        effect = effect.with_param(name, AnimatedValue(value))
+    return effect
+
+
+def _turned_on_screen(
+    project: Project, clip: Clip, frame: int, point: tuple[float, float]
+) -> float:
+    """絵の中の点（素材の中央からの画素 Y は上が正）が縦の画面の中央から横に何画素の所か
+
+    配置の式（シェーダの _TRANSFORM と同じ） 位置 + 回転(-角度) x 拡大 x 点（支点は画面の中央）
+    """
+    effect = _transform(project, clip)
+    pos = _value(effect, "pos_x", 0.0).at(frame)
+    scale = _value(effect, "scale", 100.0).at(frame) / 100.0
+    turn = -math.radians(_value(effect, "rotation", 0.0).at(frame))
+    return pos + scale * (math.cos(turn) * point[0] - math.sin(turn) * point[1])
+
+
+class TestTheTurnAndPixels:
+    def test_a_turned_clip_counts_the_turn(self, video_media: MediaItem) -> None:
+        # 回転を数えないと、傾けて置いた動画で、傾ける前の位置へ枠を合わせて人が外れる
+        video = _with_transform(_video(video_media), rotation=30.0, scale=130.0)
+        project = _project(video_media, (video,))
+        done = _applied(
+            project,
+            plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.62)])}).commands,
+        )
+        across = (int(0.62 * SUBJECT_BINS) + 0.5) / SUBJECT_BINS
+        point = ((across - 0.5) * 1920, 0.0)
+        assert abs(_turned_on_screen(done, video, 100, point)) < 20
+
+    def test_a_turned_window_stays_on_the_picture(self, video_media: MediaItem) -> None:
+        # 回した絵の外接の箱で範囲を取ると、枠の角が絵の外へ出て縦の画面の隅が黒くなる
+        video = _with_transform(_video(video_media), rotation=10.0, scale=150.0)
+        project = _project(video_media, (video,))
+        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.99)])})
+        focus = plan.shots[0].focus
+        crop = plan.window.size
+        turn = math.radians(10.0)
+        half = (1.5 * 1920 / 2, 1.5 * 1080 / 2)
+        for corner in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+            x = focus[0] + corner[0] * crop[0] / 2
+            y = focus[1] + corner[1] * crop[1] / 2
+            # 枠の角を絵の向きへ戻して、絵の中にあるかを見る
+            local = (
+                math.cos(turn) * x - math.sin(turn) * y,
+                math.sin(turn) * x + math.cos(turn) * y,
+            )
+            assert abs(local[0]) <= half[0] + 1e-6 and abs(local[1]) <= half[1] + 1e-6
+
+    def test_a_blur_on_a_fitted_clip_keeps_its_look(self, video_media: MediaItem) -> None:
+        # 画面に収めて置く古いクリップで直さないと、縦の画面で拡げ直したときにぼかしだけが太る
+        blur = Effect(kind="blur", params={"radius": AnimatedValue(16.0)})
+        video = _video(video_media, native=False)
+        video = replace(video, effects=(blur, *video.effects))
+        project = _project(video_media, (video,))
+        done = _applied(project, plan_reframe(project, REQUEST, {}).commands)
+        located = done.timeline.locate_clip(video.id)
+        assert located is not None
+        radius = next(e for e in located[1].effects if e.kind == "blur").params["radius"]
+        # 縦の画面で置いた絵は幅 1080 に収まって 0.5625 倍 ぼかしも同じ比にする
+        assert radius == AnimatedValue(16.0 * 1080 / 1920)
+
+    def test_a_blur_on_a_pixel_clip_is_left_alone(self, video_media: MediaItem) -> None:
+        # 画素で置くクリップのぼかしを直すと、拡大と二重に掛かってぼけ方が変わる
+        blur = Effect(kind="blur", params={"radius": AnimatedValue(16.0)})
+        video = _video(video_media)
+        video = replace(video, effects=(blur, *video.effects))
+        project = _project(video_media, (video,))
+        done = _applied(project, plan_reframe(project, REQUEST, {}).commands)
+        located = done.timeline.locate_clip(video.id)
+        assert located is not None
+        assert next(e for e in located[1].effects if e.kind == "blur").params["radius"] == (
+            AnimatedValue(16.0)
+        )
+
+    def test_an_effect_after_the_frame_grows_with_the_window(self, video_media: MediaItem) -> None:
+        # 配置より後ろのエフェクトは画面の上で掛かる 拡げないと縦の画面でだけぼかしが細くなる
+        blur = Effect(kind="blur")
+        video = _video(video_media)
+        video = replace(video, effects=(*video.effects, blur))
+        project = _project(video_media, (video,))
+        done = _applied(project, plan_reframe(project, REQUEST, {}).commands)
+        located = done.timeline.locate_clip(video.id)
+        assert located is not None
+        radius = next(e for e in located[1].effects if e.kind == "blur").params["radius"]
+        assert radius == AnimatedValue(8.0 * 1920 / 1080)
 
 
 class TestTheOverlays:

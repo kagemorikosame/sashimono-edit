@@ -258,7 +258,13 @@ from sashimono.engine.encode import (
     chosen_range,
     export_target,
 )
-from sashimono.engine.reframe import ReframePlan, ReframeRequest, plan_reframe, tracked_media
+from sashimono.engine.reframe import (
+    ReframePlan,
+    ReframeRequest,
+    gather_signals,
+    plan_reframe,
+    tracked_media,
+)
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 
 __all__ = [
@@ -3200,24 +3206,14 @@ def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
     if (request.width, request.height) == project.settings.resolution:
         raise ToolError(f"作品はもう {request.width}x{request.height} です")
     media = [] if request.follow == CENTER else tracked_media(project)
-    signals: dict[MediaId, SceneSignal] = {}
-    waiting: list[str] = []
-    untracked: list[str] = []
-    for item in media:
-        state = host.scene_state(item)
-        signal = state.signal
-        if signal is not None and (signal.complete or signal.broken):
-            signals[item.id] = signal
-        elif state.running:
-            waiting.append(str(item.id))
-        else:
-            untracked.append(str(item.id))
-    if waiting:
+    gathered = gather_signals(media, host.scene_state)
+    untracked = [str(media_id) for media_id in gathered.untracked]
+    if gathered.waiting:
         # 途中までの並びで組むと、読んでいない所の枠が真ん中に止まり、呼び直しても直らない
         return {
             "changed": False,
             "complete": False,
-            "waiting_media": waiting,
+            "waiting_media": [str(media_id) for media_id in gathered.waiting],
             "note": (
                 "被写体を見積もる解析（場面の解析と同じ読み込み）がまだ終わっていません"
                 " 何も変えていません しばらくしてから同じ引数で呼んでください"
@@ -3225,7 +3221,7 @@ def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
             ),
         }
     try:
-        plan = plan_reframe(project, request, signals)
+        plan = plan_reframe(project, request, gathered.signals)
     except ReframeError as exc:
         raise ToolError(str(exc)) from exc
     before = project.settings.resolution

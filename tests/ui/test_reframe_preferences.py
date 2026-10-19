@@ -1,8 +1,9 @@
-"""縦動画への作り替え（#334）の設定画面と、本物の窓で AI が作り替えた作品
+"""縦動画への作り替え（#334）の設定画面とメニューと、本物の窓で AI が作り替えた作品
 
 偽のホストの試験（tests/ai/test_reframe_tool.py）は道具の受け口を見る ここでは、設定画面の
 値が保存されて道具の既定になること、本物の窓でブリッジ越しに作り替えた作品が取り消し 1 回で
-戻り、その段が AI の物として積まれることを見る
+戻り、その段が AI の物として積まれること、メニューの〔縦の作品に作り替える…〕が同じ作品を
+人の段として作ることを見る
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from sashimono.core.commands import AddClip, Author
 from sashimono.core.model import MediaItem, Project, ProjectSettings, Track, TrackKind
 from sashimono.core.reframe import REFRAME_FOLLOWS, REFRAME_SIZES, STEADY, ReframeStyle
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.cache import SceneState
+from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
@@ -158,3 +161,122 @@ class TestPreference:
             )
         finally:
             dialog.deleteLater()
+
+
+def _shape(project: Project) -> list[object]:
+    """解像度と、クリップごとのエフェクトの種類と値"""
+    return [
+        project.settings.resolution,
+        *(
+            [(effect.kind, dict(effect.params)) for effect in clip.effects]
+            for track in project.timeline.tracks
+            for clip in track.clips
+        ),
+    ]
+
+
+class TestMenu:
+    """メニューの〔縦の作品に作り替える…〕から人が使う（#334 2026-10-20 利用者の決定）
+
+    窓は main_window の ask_reframe を差し替えて答える 差し替えずに窓が開くと no_windows が落とす
+    """
+
+    def test_it_matches_the_tool_and_undoes_once_as_the_person(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、人の作り替えと AI の作り替えで違う縦の作品ができるか、人の段が AI の段に
+        # 数えられて AI の取り消しで消える
+        work = _work(video_media)
+        window = MainWindow(work, confirm_unsaved=False)
+        opened.append(window)
+        asked: list[ReframeStyle] = []
+
+        def answer(_parent: object, style: ReframeStyle) -> ReframeStyle:
+            asked.append(style)
+            return ReframeStyle(size="720x1280", follow="center", smooth_ms=500)
+
+        monkeypatch.setattr(main_window_module, "ask_reframe", answer)
+        assert window.reframe_project()
+        assert asked == [window.reframe_style]
+        made = window.document.project
+        assert made.settings.resolution == (720, 1280)
+        assert window.document.undo_by is Author.PERSON
+        window.document.undo()
+        assert window.document.project == work
+        # 同じ値で AI の道具を通すと同じ作品になる（足した配置の欄の ID は作るたびに違うので見ない）
+        _call(window, {"width": 720, "height": 1280, "follow": "center"})
+        assert _shape(window.document.project) == _shape(made)
+
+    def test_the_menu_value_is_only_for_that_time(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 窓で試した値が設定に残ると、次から知らないうちに別の大きさで作られる
+        window = MainWindow(_work(video_media), confirm_unsaved=False)
+        opened.append(window)
+        before = window.reframe_style
+        monkeypatch.setattr(
+            main_window_module,
+            "ask_reframe",
+            lambda *_args: ReframeStyle(size="1080x1080", follow="center"),
+        )
+        assert window.reframe_project()
+        assert window.reframe_style == before
+
+    def test_cancelling_changes_nothing(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # やめたのに変えると、窓を閉じただけで作品が縦になる
+        work = _work(video_media)
+        window = MainWindow(work, confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(main_window_module, "ask_reframe", lambda *_args: None)
+        assert not window.reframe_project()
+        assert window.document.project == work
+
+    def test_a_running_analysis_changes_nothing(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 途中までの並びで作ると、読んでいない所の枠が真ん中に止まり、やり直しても直らない
+        work = _work(video_media)
+        window = MainWindow(work, confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="auto")
+        )
+        monkeypatch.setattr(
+            window._analyzer, "scene_state", lambda _media: SceneState(None, running=True)
+        )
+        assert not window.reframe_project()
+        assert window.document.project == work
+        assert "解析" in window.statusBar().currentMessage()
+
+    def test_a_locked_track_says_why(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 黙って何もしないと、人はなぜ縦にならないのか分からない
+        work = _work(video_media)
+        track = replace(work.timeline.tracks[0], locked=True)
+        work = work.with_timeline(work.timeline.replace_track(track))
+        window = MainWindow(work, confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="center")
+        )
+        assert not window.reframe_project()
+        assert window.document.project == work
+        assert "ロック" in window.statusBar().currentMessage()

@@ -3,7 +3,8 @@
 線の形は :mod:`sashimono.core.reframe` が組む ここは素材の置き方（画素で置く・画面に収める）・
 配置の値の読み方・被写体の並び（:mod:`sashimono.engine.subject`）を知っている側の仕事を足して、
 人の操作と同じ命令（解像度の変更と、配置とテキストの欄の値の差し替え）にする AI の道具も、
-人の入口を足したときの画面も、ここを通す 入口ごとに書くと、同じ作品から違う縦の作品ができる
+人のメニューの〔縦の作品に作り替える…〕も、ここを通す 入口ごとに書くと、同じ作品から違う縦の
+作品ができる
 
 作り替えるのはメインとすべてのシーン 解像度は作品で 1 つなので、シーンだけ横のまま残すと、
 シーンを置いた所が縦の画面の真ん中に横長の絵で潰れる
@@ -12,7 +13,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import pairwise
@@ -38,6 +39,7 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.reframe import (
+    Area,
     CropWindow,
     ReframeError,
     Sample,
@@ -53,7 +55,10 @@ from sashimono.core.reframe import (
     window_of,
 )
 from sashimono.core.timebase import Rounding, seconds_to_frame
+from sashimono.effects import registry
 from sashimono.effects.sources import TO_NATIVE_LAYOUT
+from sashimono.effects.spec import TrackSpec
+from sashimono.engine.cache.analyzer import SceneState
 from sashimono.engine.gpu import fit_placement
 from sashimono.engine.render.outline import has_outline, media_pixel_size, transform_values
 from sashimono.engine.scenes import SceneSignal
@@ -62,8 +67,10 @@ from sashimono.engine.subject import SUBJECT_SECONDS
 __all__ = [
     "BACKGROUND_COVER",
     "MIN_STRENGTH",
+    "Gathered",
     "ReframePlan",
     "ReframeRequest",
+    "gather_signals",
     "plan_reframe",
     "tracked_media",
 ]
@@ -238,6 +245,24 @@ def _stream_of(media: MediaItem, wanted: int) -> int | None:
     return media.video_streams[0].index
 
 
+def _inside(
+    center: tuple[float, float],
+    half: tuple[float, float],
+    crop: tuple[float, float],
+    turn: float,
+) -> Area:
+    """枠の中心を置ける範囲 枠の角が回した絵（中心 ``center`` 半分の大きさ ``half``）から
+    はみ出さない所
+
+    枠は画面の向きのまま 絵の向きで見ると、枠を回した四角になり、その外接の箱がはみ出さなければ
+    枠の角もはみ出さない（絵は絵の向きで箱なので） 収まらなければ絵の中心だけにする
+    """
+    cos, sin = abs(math.cos(turn)), abs(math.sin(turn))
+    need = (cos * crop[0] / 2.0 + sin * crop[1] / 2.0, sin * crop[0] / 2.0 + cos * crop[1] / 2.0)
+    room = (max(0.0, half[0] - need[0]), max(0.0, half[1] - need[1]))
+    return Area(center=center, reach=room, turn=turn)
+
+
 class _Tracker:
     """背景のクリップ 1 本の、タイムラインのフレームごとの被写体と枠を置ける範囲"""
 
@@ -274,8 +299,8 @@ class _Tracker:
                 )
             )
 
-    def sample(self, frame: int) -> tuple[Sample, tuple[float, float, float, float]]:
-        """タイムラインの ``frame`` の被写体と、枠の中心を置ける範囲（左・右・下・上）"""
+    def sample(self, frame: int) -> tuple[Sample, Area]:
+        """タイムラインの ``frame`` の被写体と、枠の中心を置ける範囲"""
         clip = self.picture.clip
         local = frame - clip.timeline_start
         values = _transform_at(clip, local)
@@ -283,19 +308,25 @@ class _Tracker:
         placed = self.picture.placed_old
         pivot = _pivot(values, placed)
         position = (_number(values, "pos_x", 0.0), _number(values, "pos_y", 0.0))
-        # 配置の式（シェーダ）は 支点 + 位置 + 拡大 x (絵の点 - 支点) 回転は数えない（枠の位置の
-        # 見積もりには、回した絵の外接の向きまでは要らない）
-        center = (
-            pivot[0] + position[0] - scale_x * pivot[0],
-            pivot[1] + position[1] - scale_y * pivot[1],
-        )
-        half = (abs(scale_x) * placed[0] / 2.0, abs(scale_y) * placed[1] / 2.0)
-        crop = self._window.size
-        bounds = (
-            center[0] - half[0] + crop[0] / 2.0,
-            center[0] + half[0] - crop[0] / 2.0,
-            center[1] - half[1] + crop[1] / 2.0,
-            center[1] + half[1] - crop[1] / 2.0,
+        # 配置の式（シェーダの _TRANSFORM）は 支点 + 位置 + 回転(-角度) x 拡大 x (絵の点 - 支点)
+        # （Y は上が正 正の角度で時計回りに回る） 回転を数えないと、傾けて置いた動画で、
+        # 被写体のいる所を傾ける前の位置で数えて枠がずれる
+        turn = -math.radians(_number(values, "rotation", 0.0))
+        cos, sin = math.cos(turn), math.sin(turn)
+
+        def placed_at(point: tuple[float, float]) -> tuple[float, float]:
+            x, y = scale_x * (point[0] - pivot[0]), scale_y * (point[1] - pivot[1])
+            return (
+                pivot[0] + position[0] + cos * x - sin * y,
+                pivot[1] + position[1] + sin * x + cos * y,
+            )
+
+        center = placed_at((0.0, 0.0))
+        bounds = _inside(
+            center,
+            (abs(scale_x) * placed[0] / 2.0, abs(scale_y) * placed[1] / 2.0),
+            self._window.size,
+            turn,
         )
         weight = 0.0
         across, down = 0.5, 0.5
@@ -316,19 +347,11 @@ class _Tracker:
         if self._flip[1]:
             down = 1.0 - down
         # 絵の中の点（左から across・上から down）の、支点からの画素（Y は上が正）
-        point = ((across - 0.5) * placed[0], (0.5 - down) * placed[1])
-        sample = Sample(
-            frame=frame,
-            x=center[0] + scale_x * point[0],
-            y=center[1] + scale_y * point[1],
-            weight=weight,
-        )
-        return sample, bounds
+        x, y = placed_at(((across - 0.5) * placed[0], (0.5 - down) * placed[1]))
+        return Sample(frame=frame, x=x, y=y, weight=weight), bounds
 
     def home(self, frame: int) -> tuple[float, float]:
-        sample, bounds = self.sample(frame)
-        del sample
-        return ((bounds[0] + bounds[1]) / 2.0, (bounds[2] + bounds[3]) / 2.0)
+        return self.sample(frame)[1].center
 
     def cuts(self, signal: SceneSignal | None) -> set[int]:
         """素材の場面の切り替わりが、このクリップで出るタイムラインのフレーム"""
@@ -347,6 +370,23 @@ class _Tracker:
             if 0 < offset < clip.duration:
                 frames.add(clip.timeline_start + offset)
         return frames
+
+
+def _common(areas: list[Area]) -> Area:
+    """場面の間ずっと枠を置ける範囲 頭の範囲を、ほかの時刻の範囲に収まるまで縮める
+
+    寄りやパンで絵が動くと範囲も動く 頭の範囲の中心からのずれ（絵の向きで見た大きさ）だけ
+    縮めれば、どの時刻の範囲にも入る（回す角度は頭の物を使う 回しながら動く絵では近い値）
+    """
+    first = areas[0]
+    cos, sin = math.cos(first.turn), math.sin(first.turn)
+    reach_x, reach_y = first.reach
+    for area in areas[1:]:
+        dx = area.center[0] - first.center[0]
+        dy = area.center[1] - first.center[1]
+        reach_x = min(reach_x, max(0.0, area.reach[0] - abs(cos * dx + sin * dy)))
+        reach_y = min(reach_y, max(0.0, area.reach[1] - abs(-sin * dx + cos * dy)))
+    return Area(center=first.center, reach=(reach_x, reach_y), turn=first.turn)
 
 
 def _visible(timeline: Timeline) -> set[int]:
@@ -392,12 +432,14 @@ def _shots(
     shots: list[tuple[Shot, _Tracker]] = []
     for start, end, owner in spans:
         samples: list[Sample] = []
-        left, right, bottom, top = -math.inf, math.inf, -math.inf, math.inf
+        areas: list[Area] = []
         for frame in range(start, end, step):
-            sample, bounds = owner.sample(frame)
+            sample, area = owner.sample(frame)
             samples.append(sample)
-            left, right = max(left, bounds[0]), min(right, bounds[1])
-            bottom, top = max(bottom, bounds[2]), min(top, bounds[3])
+            areas.append(area)
+        area = _common(areas)
+        left, right = area.center[0] - area.reach[0], area.center[0] + area.reach[0]
+        bottom, top = area.center[1] - area.reach[1], area.center[1] + area.reach[1]
         shots.append(
             (
                 Shot(
@@ -406,6 +448,7 @@ def _shots(
                     samples=tuple(samples),
                     bounds=(left, right, bottom, top),
                     home=owner.home(start),
+                    area=area,
                 ),
                 owner,
             )
@@ -484,7 +527,45 @@ def _background_commands(
         for name in ("anchor_x", "anchor_y"):
             if params.get(name) is not None:
                 changes[name] = affine(params.get(name), placement, 0.0, 0.0)
-    return _transform_edit(clip, changes)
+    return [
+        *_transform_edit(clip, changes),
+        *_pixel_commands(clip, placement, window.scale),
+    ]
+
+
+def _pixel_commands(clip: Clip, before: float, after: float) -> list[Command]:
+    """エフェクトの画素で決める値（ぼかしの強さ・影のずれ・揺れの幅など）を直す命令
+
+    固定の配置より前のエフェクトは置いた絵の上で掛かり、配置の拡大と一緒に拡がる 画面に収めて
+    置く古いクリップは、縦の画面で置いた絵が ``before``（置き方の比）倍に縮むので、同じ比で
+    縮めないと、拡大し直したときにぼかしや影のずれだけが 1 / 置き方の比 倍に太る
+    固定の配置より後ろのエフェクトは画面の上で掛かるので、背景なら枠と一緒に ``after``（枠を
+    拡げる倍率）倍にする 倍率が 1 の所は触らない 書いていない値は定義の既定の画素で数える
+    """
+    transform = fixed_transform(clip)
+    order = next((i for i, e in enumerate(clip.effects) if e is transform), len(clip.effects))
+    commands: list[Command] = []
+    for index, effect in enumerate(clip.effects):
+        if effect.fixed:
+            continue
+        factor = before if index < order else after
+        definition = registry.get(effect.kind)
+        if definition is None or math.isclose(factor, 1.0):
+            continue
+        for spec in definition.parameters:
+            if not isinstance(spec, TrackSpec) or not spec.in_pixels:
+                continue
+            raw = effect.params.get(spec.name)
+            default = float(spec.default)
+            if raw is not None and not isinstance(raw, AnimatedValue | int | float):
+                continue
+            commands.append(
+                SetParam(
+                    ParamPath.of_effect(clip.id, effect.id, spec.name),
+                    affine(raw, factor, 0.0, default),
+                )
+            )
+    return commands
 
 
 def _static(value: ParamValue | None, default: float) -> float | None:
@@ -529,7 +610,7 @@ def _overlay_media_commands(
             changes["scale"] = AnimatedValue(static=scale)
         changes["pos_x"] = AnimatedValue(static=clamp_span(x, (-width / 2, width / 2), new[0]))
         changes["pos_y"] = AnimatedValue(static=clamp_span(y, (-height / 2, height / 2), new[1]))
-    return _transform_edit(clip, changes)
+    return [*_transform_edit(clip, changes), *_pixel_commands(clip, placement, 1.0)]
 
 
 def _widening(clip: Clip) -> float:
@@ -704,3 +785,32 @@ def plan_reframe(
             " ロックを解いてから呼んでください"
         )
     return plan
+
+
+@dataclass(slots=True)
+class Gathered:
+    """背景の動画ごとの解析の様子 AI の道具と人のメニューが同じ分け方をする"""
+
+    #: 読み終えた（か、壊れていて読めた所までの）並び
+    signals: dict[MediaId, SceneSignal] = field(default_factory=dict)
+    #: まだ読んでいる 途中までの並びで作ると、読んでいない所の枠が真ん中に止まる
+    waiting: list[MediaId] = field(default_factory=list)
+    #: 読めなかった（失敗した） 被写体を追わずに真ん中を切り出す
+    untracked: list[MediaId] = field(default_factory=list)
+
+
+def gather_signals(
+    media: Iterable[MediaItem], state_of: Callable[[MediaItem], SceneState]
+) -> Gathered:
+    """場面の解析の様子を、使える・待つ・追わないに分ける"""
+    gathered = Gathered()
+    for item in media:
+        state = state_of(item)
+        signal = state.signal
+        if signal is not None and (signal.complete or signal.broken):
+            gathered.signals[item.id] = signal
+        elif state.running:
+            gathered.waiting.append(item.id)
+        else:
+            gathered.untracked.append(item.id)
+    return gathered

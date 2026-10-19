@@ -45,6 +45,7 @@ __all__ = [
     "REFRAME_SIZE_NAMES",
     "REFRAME_SMOOTH_MS_RANGE",
     "STEADY",
+    "Area",
     "CropWindow",
     "ReframeError",
     "ReframeStyle",
@@ -178,10 +179,37 @@ class Sample:
 
 
 @dataclass(frozen=True, slots=True)
+class Area:
+    """回した絵の中で枠の中心を置ける範囲 絵の向きに傾いた四角
+
+    ``center`` は四角の中心（横の画面の画素） ``reach`` は絵の向きで見た半分の幅と高さ
+    ``turn`` は絵を回した角度（ラジアン Y は上が正で反時計回りが正 配置の回転の符号を返した物）
+    枠は画面の向きのまま動くので、枠の角が回した絵からはみ出さない所は傾いた四角になる
+    軸にそろえた箱で内側から取ると、傾けた絵ではほとんど動けなくなる
+    """
+
+    center: tuple[float, float]
+    reach: tuple[float, float]
+    turn: float
+
+    def clamp(self, x: float, y: float) -> tuple[float, float]:
+        """範囲の中のいちばん近い所（絵の向きで、横と縦を別々に寄せる）"""
+        cos, sin = math.cos(self.turn), math.sin(self.turn)
+        dx, dy = x - self.center[0], y - self.center[1]
+        across = _clamp(cos * dx + sin * dy, -self.reach[0], self.reach[0])
+        down = _clamp(-sin * dx + cos * dy, -self.reach[1], self.reach[1])
+        return (
+            self.center[0] + cos * across - sin * down,
+            self.center[1] + sin * across + cos * down,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Shot:
     """1 つの場面（タイムラインのフレーム ``start`` 以上 ``end`` 未満）
 
     ``bounds`` は枠の中心を置ける範囲（左・右・下・上） 背景の絵の外を映さない範囲
+    ``area`` があれば、傾けた絵の中の範囲としてこちらを使う（``bounds`` は見ない）
     ``home`` は手がかりが無いときに置く所（背景の絵の中心）
     """
 
@@ -190,6 +218,7 @@ class Shot:
     samples: tuple[Sample, ...]
     bounds: tuple[float, float, float, float]
     home: tuple[float, float]
+    area: Area | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,8 +333,11 @@ def plan_shot(shot: Shot, follow: str, window: tuple[float, float], smooth_frame
             f"枠の動かし方は {'・'.join(REFRAME_FOLLOWS)} のどれかです（{follow!r} が来ました）"
         )
     left, right, bottom, top = shot.bounds
+    area = shot.area
 
     def placed(x: float, y: float) -> tuple[float, float]:
+        if area is not None:
+            return area.clamp(x, y)
         return _clamp(x, left, right), _clamp(y, bottom, top)
 
     home = placed(*shot.home)

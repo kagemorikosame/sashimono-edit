@@ -544,6 +544,8 @@ class FrameRenderer:
             # エフェクト処理は合成と同じ全画面四角形を使い回す
             self._effects = EffectProcessor(width, height, self._compositor.quad)
             self._effects.canvas_encoded = self._encoded
+        #: 画面からはみ出す大きさに置いた素材を通す係（:meth:`_spill_effects`） 使うまで作らない
+        self._spill: EffectProcessor | None = None
         # 画素で決める設定を合成の画素へ縮める割合 画質を落としたプレビューで 1 より小さい
         self._effects.pixel_scale = self._scale[0]
         #: 素材ごとのデコーダ 最近使ったものを残す
@@ -646,6 +648,8 @@ class FrameRenderer:
         # 差し替えるたびに前の画像が閉じるまで残り、長く編集するほどメモリを食う
         with self._context:
             self._effects.retain_images(image_paths(project))
+            if self._spill is not None:
+                self._spill.retain_images(image_paths(project))
 
     def set_decode_threads(self, threads: int) -> None:
         """レイヤーごとの並列デコードのスレッド数を変える 1 で並べない
@@ -1165,6 +1169,9 @@ class FrameRenderer:
                 texture.release()
             self._textures.clear()
             self._effects.release()
+            if self._spill is not None:
+                self._spill.release()
+                self._spill = None
             self._script_baker.release()
             if self._grab is not None:
                 self._grab.release()
@@ -1310,31 +1317,46 @@ class FrameRenderer:
             placement.width,
             placement.height,
         )
-        self._effects.resize(width, height)
-        try:
-            result = self._effects.apply(
-                texture,
-                gpu_effects,
-                frame=local_frame,
-                fps=float(rate.fps),
-                source_rect=inner.to_clip(width, height),
-                duration=clip.duration,
-                bounds=_placed_bounds(self._object_box_of(clip, image), image, inner),
-            )
-            self._compositor.draw_handle(
-                result.color,
-                Placement(
-                    (screen_width - width) / 2.0,
-                    (screen_height - height) / 2.0,
-                    float(width),
-                    float(height),
-                ),
-                opacity=opacity,
-                flip=False,
-                blend=clip.blend_mode,
-            )
-        finally:
-            self._effects.resize(screen_width, screen_height)
+        effects = self._spill_effects(width, height)
+        result = effects.apply(
+            texture,
+            gpu_effects,
+            frame=local_frame,
+            fps=float(rate.fps),
+            source_rect=inner.to_clip(width, height),
+            duration=clip.duration,
+            bounds=_placed_bounds(self._object_box_of(clip, image), image, inner),
+        )
+        self._compositor.draw_handle(
+            result.color,
+            Placement(
+                (screen_width - width) / 2.0,
+                (screen_height - height) / 2.0,
+                float(width),
+                float(height),
+            ),
+            opacity=opacity,
+            flip=False,
+            blend=clip.blend_mode,
+        )
+
+    def _spill_effects(self, width: int, height: int) -> EffectProcessor:
+        """はみ出した素材を通す、画面の物とは別のエフェクトの係（大きさが同じなら使い回す）
+
+        画面の係を毎フレーム大きくして戻すと、そのたびにバッファを作り直す 1080p の動画を縦の
+        1080x1920 に作り替えた作品で、1 フレームの描く時間が 7 ms から 15 ms に延びた
+        別に持てば作り直すのは大きさが変わったときだけになる
+        """
+        effects = self._spill
+        if effects is None:
+            effects = EffectProcessor(width, height, self._compositor.quad)
+            effects.retain_images(image_paths(self._project))
+            self._spill = effects
+        else:
+            effects.resize(width, height)
+        effects.canvas_encoded = self._encoded
+        effects.pixel_scale = self._scale[0]
+        return effects
 
     def _media_placement(self, clip: Clip, texture: Texture) -> Placement:
         """絵を置く矩形（合成先の画素）
@@ -2958,7 +2980,8 @@ class FrameRenderer:
         :func:`~sashimono.engine.render.image_spans` でその画像を使う範囲を出し、
         先読みした絵を捨てる GL は触らない
         """
-        return self._effects.stale_images()
+        stale = self._effects.stale_images()
+        return stale if self._spill is None else stale | self._spill.stale_images()
 
     def reopen_sources(self, media_ids: Collection[MediaId] | None = None) -> None:
         """デコーダを閉じる 次に要るときに開き直す
