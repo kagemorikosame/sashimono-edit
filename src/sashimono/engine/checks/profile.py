@@ -290,7 +290,9 @@ def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _cues(profile: SoundProfile, start: int, end: int, silence_db: float) -> _Cues:
+def _cues(
+    profile: SoundProfile, levels: np.ndarray, start: int, end: int, silence_db: float
+) -> _Cues:
     """``[start, end)`` の 1 秒の手がかり 前後 1 秒も見る"""
     low = max(0, start - CONTEXT_TICKS)
     high = min(profile.ticks, end + CONTEXT_TICKS)
@@ -298,7 +300,7 @@ def _cues(profile: SoundProfile, start: int, end: int, silence_db: float) -> _Cu
     mean = float(np.mean(energy))
     # 平均の半分を下回る区切りの割合 話し声は息継ぎと音節の谷で 0.4 を超え、音楽は 0.2 未満が多い
     dips = float(np.mean(energy < 0.5 * mean)) if mean > 0 else 0.0
-    loud = profile.rms_db()[low:high]
+    loud = levels[low:high]
     voiced = loud > silence_db
     # 大きさの揺れ（鳴っている区切りの dB の標準偏差） 実際の話し声は 4〜7 dB、音楽は 1〜3 dB
     spread = float(np.std(loud[voiced])) if voiced.sum() > 1 else 0.0
@@ -323,21 +325,22 @@ def _cues(profile: SoundProfile, start: int, end: int, silence_db: float) -> _Cu
         and gap < _BED_GAP
         and float(np.median(profile.flatness[low:high][quiet])) < _TONAL_BED
     )
-    heard = profile.rms_db()[start:end] > silence_db
+    heard = levels[start:end] > silence_db
     flat = profile.flatness[start:end][heard]
     return _Cues(speech, music, bed, float(np.median(flat)) if len(flat) else 1.0)
 
 
 def _window(
     profile: SoundProfile,
+    levels: np.ndarray,
     start: int,
     end: int,
     covered: float | None,
     silence_db: float,
 ) -> _Window:
-    if float(profile.rms_db()[start:end].max()) < silence_db:
+    if float(levels[start:end].max()) < silence_db:
         return _Window(SILENCE, HIGH, 0.0, 0.0, covered)
-    cues = _cues(profile, start, end, silence_db)
+    cues = _cues(profile, levels, start, end, silence_db)
     speech, music = round(cues.speech, 2), round(cues.music, 2)
     if covered is not None and covered >= 0.5:
         # 字幕のある所は話している 下に山のある音が残るか音楽らしさも強ければ、BGM の上で話している
@@ -387,10 +390,13 @@ def classify(
     （話の途中の 1 秒の盛り上がりで区間を割らない 無音は挟まれても残す 短い間も編集の手がかり）
     """
     windows: list[tuple[int, int, _Window]] = []
+    # dB の並びは 1 度だけ作り、1 秒ごとの見分けへ渡す 区間ごとに作品全体を作り直すと、
+    # 作品の長さの二乗で重くなり、2 時間の作品で編集画面が数秒止まる（#385 の CodeRabbit の指摘）
+    levels = profile.rms_db()
     for start in range(0, profile.ticks, WINDOW_TICKS):
         end = min(profile.ticks, start + WINDOW_TICKS)
         covered = None if subtitles is None else float(np.mean(subtitles[start:end]))
-        windows.append((start, end, _window(profile, start, end, covered, silence_db)))
+        windows.append((start, end, _window(profile, levels, start, end, covered, silence_db)))
     labels = [window.label for _start, _end, window in windows]
     for index in range(1, len(labels) - 1):
         before, now, after = labels[index - 1], labels[index], labels[index + 1]

@@ -133,7 +133,7 @@ class TestKinds:
         # 前後 1 秒も見るので隣の秒まで引きずられる）
         seconds = [SPEECH, SPEECH, MUSIC, SPEECH, SPEECH, SILENCE, SPEECH, NOISE, NOISE, SPEECH]
 
-        def decided(_profile: SoundProfile, start: int, *_rest: object) -> object:
+        def decided(_profile: SoundProfile, _levels: object, start: int, *_rest: object) -> object:
             return profile_module._Window(seconds[start // 10], "medium", 0.5, 0.5, None)
 
         monkeypatch.setattr(profile_module, "_window", decided)
@@ -145,6 +145,25 @@ class TestKinds:
             (7, 9, NOISE),
             (9, 10, SPEECH),
         ]
+
+    def test_the_levels_are_made_once_for_a_long_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、1 秒ごとに作品全体の dB を作り直し、2 時間の作品で見分けに数秒かかって
+        # analyze_audio と audio_graph のたびに編集画面が止まる（長さの二乗で重くなる）
+        ticks = 2 * 3600 * 10
+        loud = np.repeat(np.random.default_rng(0).integers(0, 2, ticks // 10), 10) * 0.1 + 0.01
+        profile = SoundProfile(energy=loud**2, rms=loud, peak=loud, flatness=np.full(ticks, 0.1))
+        made: list[int] = []
+        original = SoundProfile.rms_db
+
+        def counted(self: SoundProfile) -> np.ndarray:
+            made.append(1)
+            return original(self)
+
+        monkeypatch.setattr(SoundProfile, "rms_db", counted)
+        classify(profile)
+        assert len(made) == 1
 
     def test_silence_between_sounds_is_kept(self) -> None:
         # 壊れると、話の間の 1 秒の無音を前後の話し声に飲み込み、切る所の候補から消える
