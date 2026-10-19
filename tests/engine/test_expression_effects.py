@@ -143,6 +143,8 @@ def _make(kind: str, **params: object) -> Effect:
 
 class TestRegistration:
     def test_every_new_kind_is_registered(self) -> None:
+        # 登録が漏れた種類は、YMM4 のテンプレートを読んでも写す先が無く、
+        # その動きや加工が黙って抜ける
         missing = [kind for kind in NEW_KINDS if kind not in registry]
         assert missing == []
 

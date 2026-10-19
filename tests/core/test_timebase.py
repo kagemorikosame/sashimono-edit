@@ -38,9 +38,13 @@ SAMPLE_RATES = [44100, 48000, 96000]
 
 class TestFrameRate:
     def test_reduces_to_lowest_terms(self) -> None:
+        # 既約にしないと 60/2 と 30/1 が別のレートになり、保存した作品がタイムラインと設定の
+        # フレームレートの食い違いとして開けなくなる
         assert FrameRate(60, 2) == FrameRate(30, 1)
 
     def test_rejects_non_positive(self) -> None:
+        # 0 のレートを通すと 1 フレームの長さを求める所で 0 で割って落ち、負のレートでは
+        # 時刻が逆向きに進む
         with pytest.raises(ValueError, match="正でなければ"):
             FrameRate(0)
         with pytest.raises(ValueError, match="正でなければ"):
@@ -58,6 +62,8 @@ class TestFrameRate:
         ],
     )
     def test_parse(self, text: str, expected: FrameRate) -> None:
+        # 29.97 や 23.976 と小数で書かれたレートを分数へ吸着できないと、1 時間で 3 フレーム
+        # 以上ずれ、音と絵が終盤で食い違う
         assert FrameRate.parse(text) == expected
 
     def test_decimal_snaps_to_broadcast_rate(self) -> None:
@@ -75,9 +81,13 @@ class TestFrameRate:
         [(NTSC_30, 30), (NTSC_60, 60), (FrameRate(24000, 1001), 24), (PAL, 25)],
     )
     def test_nominal_fps(self, rate: FrameRate, nominal: int) -> None:
+        # 29.97 の数え方を 29 にすると、タイムコードのフレーム桁が 29 で繰り上がり、
+        # 再生位置の表示が実際の時刻から毎秒ずれていく
         assert rate.nominal_fps == nominal
 
     def test_drop_frame_capability(self) -> None:
+        # 29.97 で無しと答えると表示が 1 時間で 3.6 秒時計から遅れ、30fps で有りと答えると
+        # 欠番の表に無いレートを引いてタイムコードの表示が落ちる
         assert NTSC_30.is_drop_frame_capable
         assert NTSC_60.is_drop_frame_capable
         assert not FrameRate(30).is_drop_frame_capable
@@ -91,6 +101,8 @@ class TestRounding:
         assert seconds_to_frame(Fraction(3, 60), FrameRate(30), Rounding.NEAREST) == 2
 
     def test_floor_and_ceil(self) -> None:
+        # 切り捨てと切り上げが入れ替わると、その時刻に映っているコマの代わりに次のコマを
+        # 指し、再生位置や切った所が 1 フレームずれる
         just_under_two = Fraction(199, 100) / 30
         assert seconds_to_frame(just_under_two, FrameRate(30), Rounding.FLOOR) == 1
         assert seconds_to_frame(just_under_two, FrameRate(30), Rounding.CEIL) == 2
@@ -102,6 +114,8 @@ class TestFrameSecondsRoundTrip:
         rate=st.sampled_from(RATES),
     )
     def test_frame_survives_round_trip(self, frame: int, rate: FrameRate) -> None:
+        # フレームを秒にして戻すと別のフレームになるなら、秒を介して換算するたびに
+        # クリップの位置が 1 フレームずつ動いていく
         seconds = frame_to_seconds(frame, rate)
         assert seconds_to_frame(seconds, rate, Rounding.FLOOR) == frame
 
@@ -111,6 +125,8 @@ class TestFrameSecondsRoundTrip:
         assert seconds_to_frame(frame_to_seconds(frame, NTSC_30), NTSC_30) == frame
 
     def test_seconds_are_exact_rationals(self) -> None:
+        # 秒を浮動小数で持つと 29.97fps の 1 フレームが割り切れず、長尺の終盤で音と絵が
+        # 少しずつずれていく
         assert frame_to_seconds(1, NTSC_30) == Fraction(1001, 30000)
 
 
@@ -120,6 +136,8 @@ class TestAudio:
         sample_rate=st.sampled_from(SAMPLE_RATES),
     )
     def test_sample_survives_round_trip(self, sample: int, sample_rate: int) -> None:
+        # サンプル番号を秒にして戻すとずれるなら、音の位置を換算するたびに 1 サンプルずつ
+        # 動き、クリップの継ぎ目の音が前後へずれる
         seconds = sample_to_seconds(sample, sample_rate)
         assert seconds_to_sample(seconds, sample_rate, Rounding.NEAREST) == sample
 
@@ -147,12 +165,16 @@ class TestAudio:
         assert sample_to_frame(sample, sample_rate, rate) in (frame - 1, frame)
 
     def test_rejects_bad_sample_rate(self) -> None:
+        # サンプリングレート 0 を通すと、秒からサンプルへの換算がすべて 0 になり、どこを
+        # 再生しても頭の音しか読まない
         with pytest.raises(ValueError, match="正でなければ"):
             seconds_to_sample(Fraction(1), 0)
 
 
 class TestPts:
     def test_round_trip(self) -> None:
+        # PTS と秒の往復がずれると、シークした先で目当てと違うフレームを読み、プレビューに
+        # 隣のコマが映る
         time_base = Fraction(1, 90000)
         assert seconds_to_pts(pts_to_seconds(12345, time_base), time_base) == 12345
 
@@ -163,6 +185,8 @@ class TestPts:
         assert pts_to_seconds(pts, time_base) <= Fraction(1, 3)
 
     def test_rejects_bad_time_base(self) -> None:
+        # タイムベース 0 を黙って通すと、壊れた素材の時刻がすべて 0 秒になり、どこへ
+        # シークしても頭の絵が出る
         with pytest.raises(ValueError, match="正でなければ"):
             pts_to_seconds(1, Fraction(0))
 
@@ -182,6 +206,8 @@ class TestTimecode:
         ],
     )
     def test_non_drop(self, frame: int, rate: FrameRate, expected: str) -> None:
+        # ノンドロップの桁の繰り上げを誤ると、再生位置や素材の長さの表示が実際と違う
+        # 時・分・秒を示す
         assert format_timecode(frame, rate, drop_frame=False) == expected
 
     @pytest.mark.parametrize(
@@ -202,6 +228,8 @@ class TestTimecode:
         ],
     )
     def test_drop_frame_29_97(self, frame: int, expected: str) -> None:
+        # 欠番の位置を誤ると、29.97fps の作品の再生位置の表示が分の変わり目で存在しない
+        # 番号を出したり、10 分ごとに時計とずれたりする
         assert format_timecode(frame, NTSC_30) == expected
 
     def test_drop_frame_matches_wall_clock(self) -> None:
@@ -216,10 +244,14 @@ class TestTimecode:
 
     @given(frame=st.integers(min_value=0, max_value=30 * 3600 * 4))
     def test_drop_frame_round_trip(self, frame: int) -> None:
+        # 表示と読みのどちらかが欠番を数え違えると、表示したタイムコードを読み返したときに
+        # 別のコマを指す（29.97fps の長尺ほど食い違いが大きい）
         assert parse_timecode(format_timecode(frame, NTSC_30), NTSC_30) == frame
 
     @given(frame=st.integers(min_value=0, max_value=60 * 3600 * 2))
     def test_drop_frame_round_trip_59_94(self, frame: int) -> None:
+        # 59.94fps は 1 分ごとに 4 番を飛ばす 2 番のまま数えると、表示したタイムコードを
+        # 読み返したときに 59.94fps の作品で別のコマを指す
         assert parse_timecode(format_timecode(frame, NTSC_60), NTSC_60) == frame
 
     @given(
@@ -227,6 +259,8 @@ class TestTimecode:
         rate=st.sampled_from([FILM, PAL, FrameRate(30), FrameRate(60)]),
     )
     def test_non_drop_round_trip(self, frame: int, rate: FrameRate) -> None:
+        # 負の時刻や 24・25fps で表示と読みが食い違うと、タイムコードで指した位置が
+        # 書いた所と別のフレームになる
         assert parse_timecode(format_timecode(frame, rate), rate) == frame
 
     def test_separator_signals_drop_frame(self) -> None:
@@ -235,6 +269,8 @@ class TestTimecode:
         assert parse_timecode("00:10:00:00", NTSC_30) == 18000
 
     def test_rejects_drop_frame_on_incompatible_rate(self) -> None:
+        # 欠番の無いレートでドロップフレームを受けると、表に無いレートを引いて落ちるか、
+        # 30fps の作品の時刻を 29.97 の欠番で数えて分ごとにずらす
         with pytest.raises(ValueError, match="ドロップフレーム"):
             format_timecode(0, FrameRate(30), drop_frame=True)
         with pytest.raises(ValueError, match="ドロップフレーム"):
@@ -244,5 +280,7 @@ class TestTimecode:
         "text", ["", "abc", "1:2", "00:00:00", "00:60:00:00", "00:00:60:00", "00:00:00:30"]
     )
     def test_rejects_malformed(self, text: str) -> None:
+        # 崩れたタイムコードを 0 や近い値で受けると、打ち間違えたのに気付けないまま
+        # 違う位置を指す
         with pytest.raises(ValueError):
             parse_timecode(text, FrameRate(30))

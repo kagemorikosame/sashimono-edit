@@ -67,6 +67,7 @@ def test_the_same_name_changes_nothing() -> None:
 
 
 def test_an_unknown_track_is_refused() -> None:
+    # 消えたトラックを指したとき KeyError 以外で失敗すると、断りの知らせにならず編集の途中で落ちる
     from sashimono.core.model import new_track_id
 
     with pytest.raises(KeyError):

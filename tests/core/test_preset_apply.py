@@ -57,6 +57,8 @@ def _applied(clip: Clip, preset: Preset, **kwargs: object) -> Clip:
 
 class TestFormat:
     def test_everything_survives_the_file(self, tmp_path: Path) -> None:
+        # 保存したプリセットを読み直したときに動く不透明度・合成モード・切り抜き・エフェクト・長さの
+        # どれかが抜けると、当てても保存した見た目にならない
         moving = AnimatedValue(1.0, (Keyframe(0, 1.0), Keyframe(30, 0.2)))
         clip = replace(
             _text(color=(1.0, 0.0, 0.0, 1.0)),
@@ -104,6 +106,8 @@ class TestFormat:
         assert not preset.has_look
 
     def test_a_broken_clip_value_is_dropped_not_the_whole_preset(self) -> None:
+        # 合成モードの値が 1 つ壊れているだけでプリセット丸ごと読めなくなり、
+        # 保存した見た目が棚から消える
         data = Preset.capture("見出し", _text()).to_dict()
         data["clip"] = {"kind": "clip", "params": {"blend_mode": 3}}
         loaded = Preset.from_dict(data)
@@ -120,6 +124,8 @@ class TestApply:
         assert not any(isinstance(c, SetSource) for c in commands)
 
     def test_a_timer_does_not_turn_plain_text_into_a_timer(self) -> None:
+        # タイマーの見た目を当てたときに書式まで写ると、
+        # ふつうのテキストが時計の表示に変わり書いた文字が消える
         timer = Preset.capture("時計", _text(timer_format="mm\\:ss", size=90))
         after = _applied(_text(text="ふつう"), timer)
         assert after.source is not None
@@ -148,6 +154,8 @@ class TestApply:
         assert added.params["pos_x"] == fixed_effect(TRANSFORM_EFFECT_KIND).params["pos_x"]
 
     def test_switching_a_fixed_item_off_travels(self) -> None:
+        # 保存したときに反転を切ってあっても当てた先では入ったままになり、
+        # 保存した物と向きが違って見える
         saved = _text()
         saved = replace(
             saved,
@@ -169,6 +177,7 @@ class TestApply:
         )
 
     def test_effects_the_clip_cannot_take_are_skipped(self) -> None:
+        # 当てる先が受け付けないエフェクトまで足されると、効かない段が設定パネルに積まれる
         clip = replace(_text(), effects=(Effect(kind="blur"), *_text().effects))
         commands = preset_commands(
             Preset.capture("ぼかし", clip), _text(), accepts=lambda kind: kind != "blur"
@@ -196,10 +205,13 @@ class TestApply:
         assert not any(isinstance(c, SetParam) and c.path.name == "opacity" for c in commands)
 
     def test_nothing_to_do_gives_no_commands(self) -> None:
+        # 同じ見た目を当て直しただけで何も変わらない操作が履歴に積まれ、
+        # 元に戻すを余分に押すことになる
         clip = _text(color=(0.0, 1.0, 0.0, 1.0))
         assert preset_commands(Preset.capture("同じ", clip), clip) == []
 
     def test_text_comes_along_only_when_asked(self) -> None:
+        # 見た目だけ当てたつもりで字幕の文字までプリセットを保存したときの文字に書き換わる
         preset = Preset.capture("文字", _text(text="新しい"))
         kept = _applied(_text(text="古い"), preset)
         taken = _applied(_text(text="古い"), preset, options=PresetOptions(with_text=True))
@@ -235,6 +247,7 @@ class TestSides:
         assert _loose_kinds(after) == ["audio_reverb"]
 
     def test_a_sound_look_replaces_only_the_sound_side(self) -> None:
+        # 音の見た目を当てたときに映像のぼかしまで消えるか、元の残響が残って保存した響きにならない
         saved = replace(_text(), effects=(Effect(kind="audio_delay"),))
         target = replace(
             _text(), effects=(Effect(kind="blur"), Effect(kind="audio_reverb"), *_text().effects)
@@ -252,6 +265,8 @@ class TestSides:
         assert _loose_kinds(after) == ["audio_reverb"]
 
     def test_the_origin_of_a_file_without_the_flags_is_inferred(self) -> None:
+        # 絵か音かの印が無い前の版のプリセットで側を取り違えると、
+        # 音の見た目を当てたのに映像のエフェクトが入れ替わるなど、触らないはずの側が変わる
         data = Preset.capture("音", with_fixed_items(Clip(0, 30), sound=True), picture=False)
         data_dict = data.to_dict()
         del data_dict["picture"], data_dict["sound"]
@@ -285,6 +300,8 @@ class TestSparseSource:
         assert params["pos_x"] == AnimatedValue(80.0)
 
     def test_an_unknown_kind_keeps_the_target_as_the_base(self) -> None:
+        # 種類の分からない中身に当てたとき、プリセットに無い項目が消え、
+        # 当てる先で決めてあった値が失われる
         saved = Clip(0, 30, source=GeneratedSource(kind="謎", params={"a": 1}))
         target = Clip(0, 30, source=GeneratedSource(kind="謎", params={"a": 0, "b": 2}))
         after = _applied(target, Preset.capture("謎", saved), defaults_of=lambda _kind: None)
@@ -330,6 +347,8 @@ class TestBody:
         assert _body_of(after) is not None
 
     def test_the_saved_body_stays_out_without_the_text_option(self) -> None:
+        # 見た目だけ当てたつもりでカスタムオブジェクトの中身まで入れ替わり、
+        # 円を描いていたクリップが星になる
         saved = _custom("星", Effect(kind="glow"))
         after = _applied(_custom("円"), Preset.capture("星", saved), body_of=_body_of)
         body = _body_of(after)
@@ -352,6 +371,8 @@ class TestBody:
         assert _loose_kinds(after) == ["本体", "glow"]
 
     def test_a_plain_text_becomes_the_custom_object_only_with_the_text_option(self) -> None:
+        # ふつうのテキストへ見た目を当てただけで本体が足されると、
+        # 書いた文字がカスタムオブジェクトの絵に置き換わる
         saved = Preset.capture("星", _custom("星"))
         plain = _applied(_text(text="字"), saved, body_of=_body_of)
         assert _loose_kinds(plain) == []

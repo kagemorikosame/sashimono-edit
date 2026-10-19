@@ -72,15 +72,19 @@ class TestPlacement:
         assert fit_placement(100, 100, 200, 100) == Placement(50.0, 0.0, 100.0, 100.0)
 
     def test_fits_inside_a_taller_frame(self) -> None:
+        # 縦長の画面で上下に余白を取らないと、正方形の素材が縦に引き伸ばされて歪む
         assert fit_placement(100, 100, 100, 200) == Placement(0.0, 50.0, 100.0, 100.0)
 
     def test_exact_match_fills_the_frame(self) -> None:
+        # 画面と同じ大きさの素材が縮んだりずれたりすると、縁に背景の黒い筋が覗く
         assert fit_placement(1920, 1080, 1920, 1080) == Placement(0.0, 0.0, 1920.0, 1080.0)
 
     def test_upscales_small_sources(self) -> None:
+        # 小さい素材を拡大しないと、640x480 の作品に 320x240 の素材が小さく浮いて映る
         assert fit_placement(320, 240, 640, 480) == Placement(0.0, 0.0, 640.0, 480.0)
 
     def test_degenerate_source_fills_the_frame(self) -> None:
+        # 幅や高さが 0 と読めた素材で 0 で割ると、そのフレームの描画ごと例外で止まる
         assert fit_placement(0, 0, 200, 100) == Placement(0.0, 0.0, 200.0, 100.0)
 
 
@@ -133,6 +137,7 @@ class TestCompositor:
         assert result[6, 4, 0] < 128, "上下が逆さまになっている"
 
     def test_layers_stack_in_draw_order(self, gl_context: OffscreenGLContext) -> None:
+        # 描いた順と重なりが逆になると、上に置いた字幕や画像が下の映像に隠れる
         with gl_context:
             compositor = Compositor(16, 16)
             back = Texture.from_array(solid(16, 16, (255, 0, 0)))
@@ -149,6 +154,7 @@ class TestCompositor:
         assert result[8, 8, :3].tolist() == [0, 255, 0]
 
     def test_transparent_layer_leaves_the_background(self, gl_context: OffscreenGLContext) -> None:
+        # 透明な画素が色を塗ると、透過 PNG の周りが四角い板になって下の映像を隠す
         with gl_context:
             compositor = Compositor(16, 16)
             back = Texture.from_array(solid(16, 16, (255, 0, 0)))
@@ -198,6 +204,7 @@ class TestCompositor:
         assert result[14, 8, 0] == 0, "下端が赤い"
 
     def test_resize(self, gl_context: OffscreenGLContext) -> None:
+        # 大きさを作り直せないと、作品の解像度を変えた後のプレビューや書き出しが古い大きさのまま出る
         with gl_context:
             compositor = Compositor(16, 16)
             compositor.resize(32, 8)
@@ -207,10 +214,12 @@ class TestCompositor:
         assert result.shape == (8, 32, 4)
 
     def test_rejects_bad_size(self, gl_context: OffscreenGLContext) -> None:
+        # 解像度 0 を通すと、GL の奥で原因の分からない失敗になる 理由の書かれた誤りで止める
         with gl_context, pytest.raises(ValueError, match="解像度"):
             Compositor(0, 16)
 
     def test_texture_rejects_wrong_dtype(self, gl_context: OffscreenGLContext) -> None:
+        # RGBA の 4 つ組でない配列を上げると、画素の区切りがずれて絵が崩れるか、配列の外を読む
         with gl_context, pytest.raises(ValueError, match="RGBA uint8"):
             Texture.from_array(np.zeros((4, 4, 3), dtype=np.uint8))
 
@@ -231,6 +240,7 @@ class TestFrameRenderer:
     def test_renders_at_project_resolution(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 作品の解像度と違う大きさで返すと、書き出した動画が設定と違う大きさになる
         renderer = FrameRenderer(rendered_project, context=gl_context)
         try:
             frame = renderer.render(0)
@@ -240,6 +250,7 @@ class TestFrameRenderer:
         assert frame.dtype == np.uint8
 
     def test_empty_timeline_renders_black(self, gl_context: OffscreenGLContext) -> None:
+        # 何も置いていない作品が黒でないと、空の所のプレビューや書き出しにごみの色が映る
         project = Project.create(ProjectSettings(width=32, height=32))
         renderer = FrameRenderer(project, context=gl_context)
         try:
@@ -263,6 +274,7 @@ class TestFrameRenderer:
     def test_different_frames_differ(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 時刻を進めても同じ絵だと、再生しても書き出しても動画が最初のフレームで止まって見える
         renderer = FrameRenderer(rendered_project, context=gl_context)
         try:
             first = renderer.render(0)
@@ -274,6 +286,7 @@ class TestFrameRenderer:
     def test_opacity_keyframes_are_applied(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 不透明度のキーフレームが効かないと、フェードインを付けたクリップが頭からくっきり映る
         track = rendered_project.timeline.tracks[0]
         faded = replace(
             track.clips[0],
@@ -298,6 +311,7 @@ class TestFrameRenderer:
     def test_disabled_clip_is_skipped(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 無効にしたクリップが描かれると、一時的に外したつもりの映像が書き出しに映る
         track = rendered_project.timeline.tracks[0]
         project = rendered_project.with_timeline(
             rendered_project.timeline.replace_track(
@@ -314,6 +328,7 @@ class TestFrameRenderer:
     def test_muted_track_is_skipped(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 非表示にしたトラックが描かれると、隠したつもりのトラックの映像が書き出しに映る
         track = rendered_project.timeline.tracks[0]
         project = rendered_project.with_timeline(
             rendered_project.timeline.replace_track(replace(track, muted=True))
@@ -328,6 +343,7 @@ class TestFrameRenderer:
     def test_reduced_quality_shrinks_the_output(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 画質を落としても縮まないと、プレビューの画質を下げても再生が軽くならない
         renderer = FrameRenderer(rendered_project, context=gl_context, quality=RenderQuality(2))
         try:
             frame = renderer.render(0)
@@ -338,6 +354,7 @@ class TestFrameRenderer:
     def test_quality_can_change_at_runtime(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 途中で画質を変えても大きさが変わらないと、再生中に画質の欄を切り替えても効かない
         renderer = FrameRenderer(rendered_project, context=gl_context)
         try:
             assert renderer.render(0).shape == (240, 320, 4)
@@ -363,6 +380,7 @@ class TestFrameRenderer:
     def test_set_project_closes_removed_media(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 外した素材のデコーダを閉じないと、消した後もファイルを掴み、上書きも削除もできない
         renderer = FrameRenderer(rendered_project, context=gl_context)
         try:
             renderer.render(0)
@@ -460,6 +478,7 @@ class TestFrameRenderer:
     def test_closed_renderer_refuses_to_render(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 閉じた後に描けてしまうと、解放した GPU の資源を触ってアプリごと落ちる
         renderer = FrameRenderer(rendered_project, context=gl_context)
         renderer.close()
         with pytest.raises(RuntimeError, match="閉じたレンダラ"):
@@ -468,6 +487,7 @@ class TestFrameRenderer:
     def test_close_is_idempotent(
         self, rendered_project: Project, gl_context: OffscreenGLContext
     ) -> None:
+        # 2 度目の後始末で例外になると、窓を閉じる途中でアプリが落ちる
         renderer = FrameRenderer(rendered_project, context=gl_context)
         renderer.close()
         renderer.close()
@@ -475,10 +495,12 @@ class TestFrameRenderer:
 
 class TestRenderQuality:
     def test_rejects_zero(self) -> None:
+        # 0 の画質を受け付けると、プレビューの大きさを割り出す所が 0 除算で落ちる
         with pytest.raises(ValueError, match="1 以上"):
             RenderQuality(0)
 
     def test_never_shrinks_below_one_pixel(self) -> None:
+        # 小さい作品を低い画質にしたとき 0 画素になると、合成先を作れずプレビューが止まる
         assert RenderQuality(100).apply(32, 32) == (1, 1)
 
 
@@ -493,6 +515,7 @@ class TestGeneratedCache:
         return base.with_timeline(replace(base.timeline, tracks=(track,)))
 
     def test_a_still_text_is_drawn_once(self, gl_context: OffscreenGLContext) -> None:
+        # 動かない字幕を毎フレーム作り直すと、字幕を何本も重ねたときに再生がもたつく
         project = self._project()
         renderer = FrameRenderer(project, context=gl_context)
         try:
@@ -506,6 +529,7 @@ class TestGeneratedCache:
             renderer.close()
 
     def test_an_animated_value_is_drawn_again(self, gl_context: OffscreenGLContext) -> None:
+        # キーフレームで動く字幕まで使い回すと、文字が最初の位置に止まったまま動かない
         settings = ProjectSettings(width=64, height=64, frame_rate=FrameRate(30))
         base = Project.create(settings)
         moving = AnimatedValue(0.0, (Keyframe(0, 0.0), Keyframe(29, 40.0)))

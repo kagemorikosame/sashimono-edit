@@ -56,6 +56,7 @@ def _run(
 
 class TestVolume:
     def test_it_scales_the_level(self) -> None:
+        # 音量 50 で半分にならないと、音量調整で BGM を下げても声の後ろで同じ大きさのまま鳴る
         out = _run("audio_volume", _stereo(4), volume=50.0)
         assert out[0, 0] == pytest.approx(0.5)
 
@@ -74,6 +75,7 @@ class TestVolume:
         assert out[0, 1] == pytest.approx(1.0)
 
     def test_panning_left_quiets_the_right(self) -> None:
+        # 左へ振ったときに右が絞られないと、パンを -100 にしても右のスピーカーから音が出続ける
         out = _run("audio_volume", _stereo(4), pan=-100.0)
         assert out[0, 0] == pytest.approx(1.0)
         assert out[0, 1] == pytest.approx(0.0)
@@ -119,6 +121,8 @@ class TestFade:
         assert len(np.unique(out[:, 0])) == 4, "隣り合うサンプルの音量が同じになっている"
 
     def test_no_fade_changes_nothing(self) -> None:
+        # イン・アウト 0 秒で音が変わると、音量フェードを積んだだけで
+        # クリップの音が変わって書き出される
         plain = _stereo(8)
         assert np.allclose(_run("audio_fade", plain, duration=8), plain)
 
@@ -130,10 +134,12 @@ class TestMonaural:
         assert np.allclose(_run("audio_monaural", plain), plain)
 
     def test_full_ratio_makes_both_sides_the_same(self) -> None:
+        # 比率 100 で左右がそろわないと、モノラル化を掛けても片側だけの録音が片耳からしか聞こえない
         out = _run("audio_monaural", _stereo(4, left=1.0, right=-1.0), ratio=100.0)
         assert out[0, 0] == pytest.approx(out[0, 1])
 
     def test_half_way_is_between(self) -> None:
+        # 比率 50 で半分だけ寄せないと、比率を少し上げたつもりで広がりが一気に消えるか変わらない
         out = _run("audio_monaural", _stereo(4, left=1.0, right=0.0), ratio=50.0)
         assert out[0, 0] == pytest.approx(0.75)
         assert out[0, 1] == pytest.approx(0.25)
@@ -318,6 +324,8 @@ class TestTheMixerAppliesThem:
         assert out[width, 0] == pytest.approx(0.0), "升をまたいでも下がっていない"
 
     def test_a_disabled_effect_is_skipped(self) -> None:
+        # 無効にした音のエフェクトが掛かると、音量 0 のチェックを外しても
+        # クリップが無音のまま書き出される
         from sashimono.engine.audio.mixer import _apply_effects
 
         muted = replace(registry.require("audio_volume").create(volume=0.0), enabled=False)

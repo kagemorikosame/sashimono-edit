@@ -108,6 +108,7 @@ class TestUpdateMarker:
 
 class TestRemoveMarkers:
     def test_only_the_named_frames_go(self) -> None:
+        # 2 つ選んで消したのに間の目印まで消えると、その場面のチャプターが目次から黙って抜ける
         project = RemoveMarkers((30, 120)).apply(_project((Marker(30), Marker(90), Marker(120))))
         assert _frames(project) == [90]
 

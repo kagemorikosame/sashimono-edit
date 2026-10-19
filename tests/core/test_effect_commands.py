@@ -66,10 +66,13 @@ def blur(radius: float = 8.0) -> Effect:
 
 class TestParamPath:
     def test_effect_path_needs_an_effect_id(self) -> None:
+        # エフェクトの ID の無い道を作った所で断らないと、値を書く所まで進んでから、
+        # どのエフェクトの値か分からない失敗になる
         with pytest.raises(ValueError, match="effect_id"):
             ParamPath(ClipId("c"), ParamTarget.EFFECT, "radius")
 
     def test_constructors(self) -> None:
+        # 作り口が別の種類の道を返すと、不透明度を動かしたつもりがエフェクトの値を探しに行き失敗する
         clip_id, effect_id = ClipId("c"), EffectId("e")
         assert ParamPath.of_effect(clip_id, effect_id, "x").target is ParamTarget.EFFECT
         assert ParamPath.of_source(clip_id, "x").target is ParamTarget.SOURCE
@@ -78,6 +81,7 @@ class TestParamPath:
 
 class TestEffectStack:
     def test_add_and_remove(self, placed: Project) -> None:
+        # 足しても積まれない・外しても残ると、〔＋ エフェクト〕や削除を押しても絵が変わらない
         clip_id = only_clip(placed)
         effect = blur()
         added = AddEffect(clip_id, effect).apply(placed)
@@ -87,6 +91,7 @@ class TestEffectStack:
         assert removed.timeline.tracks[0].clips[0].effects == ()
 
     def test_add_at_index(self, placed: Project) -> None:
+        # 指した位置でなく末尾に入ると、掛ける順が変わり、色を変えてからぼかした絵が逆の順の絵になる
         clip_id = only_clip(placed)
         first, second = blur(), registry.require("color").create()
         project = AddEffect(clip_id, first).apply(placed)
@@ -104,12 +109,14 @@ class TestEffectStack:
         assert [e.kind for e in moved.timeline.tracks[0].clips[0].effects] == ["color", "blur"]
 
     def test_move_clamps_the_index(self, placed: Project) -> None:
+        # 列より大きい行き先を断ると、一覧のいちばん下より先へドラッグしただけで並べ替えが失敗する
         clip_id = only_clip(placed)
         effect = blur()
         project = AddEffect(clip_id, effect).apply(placed)
         assert MoveEffect(clip_id, effect.id, 99).apply(project) is not None
 
     def test_enable_toggle(self, placed: Project) -> None:
+        # 無効にしても効いたままだと、消さずに切って掛ける前と後を見比べることができない
         clip_id = only_clip(placed)
         effect = blur()
         project = AddEffect(clip_id, effect).apply(placed)
@@ -117,12 +124,15 @@ class TestEffectStack:
         assert not disabled.timeline.tracks[0].clips[0].effects[0].enabled
 
     def test_unknown_effect_is_refused(self, placed: Project) -> None:
+        # 無いエフェクトを外す指示が通ると、何も変わらないのに「エフェクトを削除」の段が積まれ、
+        # 取り消しても何も起きない
         with pytest.raises(KeyError):
             RemoveEffect(only_clip(placed), EffectId("無い")).apply(placed)
 
 
 class TestSetParam:
     def test_effect_parameter(self, placed: Project) -> None:
+        # 書いた値を読み戻せないと、インスペクターでぼかしの強さを変えても絵も数も変わらない
         clip_id = only_clip(placed)
         effect = blur()
         project = AddEffect(clip_id, effect).apply(placed)
@@ -134,6 +144,7 @@ class TestSetParam:
         assert value.static == 30.0
 
     def test_clip_parameter(self, placed: Project) -> None:
+        # 元の作品まで書き換わると、取り消しても不透明度が戻らない
         clip_id = only_clip(placed)
         path = ParamPath.of_clip(clip_id, "opacity")
         updated = SetParam(path, AnimatedValue(static=0.5)).apply(placed)
@@ -141,6 +152,7 @@ class TestSetParam:
         assert updated.timeline.tracks[0].clips[0].opacity.static == 0.5
 
     def test_source_parameter(self, project: Project) -> None:
+        # 文字が中身に入らないと、インスペクターで打った文字が画面のテロップに出ない
         track = project.timeline.tracks[0]
         clip = replace(make_clip(0, 60, _dummy_media()), media_id=None, source=TEXT.create())
         staged = project.with_timeline(project.timeline.replace_track(track.with_clips((clip,))))
@@ -150,16 +162,21 @@ class TestSetParam:
         assert resolve_param(updated, path) == "こんにちは"
 
     def test_source_parameter_without_a_source(self, placed: Project) -> None:
+        # テキストを持たない動画のクリップへ文字を書く指示をここで断らないと、
+        # 無い中身を触って落ち、何が悪いのか知らせに出ない
         path = ParamPath.of_source(only_clip(placed), "text")
         with pytest.raises(KeyError, match="生成オブジェクト"):
             SetParam(path, "x").apply(placed)
 
     def test_unknown_clip_field(self, placed: Project) -> None:
+        # 無い項目名をここで断らないと、差し替えの型の誤りで落ち、どの項目名が悪いのか出ない
         path = ParamPath.of_clip(only_clip(placed), "そんな項目は無い")
         with pytest.raises(KeyError):
             SetParam(path, AnimatedValue()).apply(placed)
 
     def test_resolve_returns_none_for_missing_clip(self, placed: Project) -> None:
+        # グラフエディタは開いた時の道を持ち続ける 指すクリップが消えた後に読んで例外になると、
+        # クリップを消しただけでグラフエディタが落ちる
         assert resolve_param(placed, ParamPath.of_clip(ClipId("無い"), "opacity")) is None
 
 
@@ -171,6 +188,7 @@ class TestKeyframes:
         return staged, ParamPath.of_effect(clip_id, effect.id, "radius")
 
     def test_set_creates_animation(self, placed: Project) -> None:
+        # 2 つ目のキーを打っても値が動かないと、0 から 60 へ強まるはずのぼかしがずっと同じ強さで出る
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         project = SetKeyframe(path, 30, 60.0).apply(project)
@@ -183,6 +201,8 @@ class TestKeyframes:
         assert value.at(30) == 60.0
 
     def test_set_replaces_at_the_same_frame(self, placed: Project) -> None:
+        # 同じ位置へ打ち直した値を新しい点として足すと、同じフレームの 2 点がモデルに断られ、
+        # 値を打ち直せない
         project, path = self._path(placed)
         project = SetKeyframe(path, 10, 1.0).apply(project)
         project = SetKeyframe(path, 10, 5.0).apply(project)
@@ -193,6 +213,8 @@ class TestKeyframes:
         assert value.keyframes[0].value == 5.0
 
     def test_keyframes_stay_sorted(self, placed: Project) -> None:
+        # 並べ直さずに足すと、前の時刻へ後から打った点がモデルの昇順の検査で断られ、
+        # 戻った位置にキーを打てない
         project, path = self._path(placed)
         for frame in (30, 0, 15):
             project = SetKeyframe(path, frame, float(frame)).apply(project)
@@ -202,6 +224,7 @@ class TestKeyframes:
         assert [k.frame for k in value.keyframes] == [0, 15, 30]
 
     def test_interpolation_is_kept(self, placed: Project) -> None:
+        # 止める出方（HOLD）が落ちると、パッと切り替わるはずの値が次の点へ向けてじわじわ変わる
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0, interpolation=Interpolation.HOLD).apply(project)
         project = SetKeyframe(path, 20, 10.0).apply(project)
@@ -256,6 +279,7 @@ class TestKeyframes:
         assert value.keyframes[0].curve == ""
 
     def test_remove_one(self, placed: Project) -> None:
+        # 消した点が残ると、グラフエディタで消したはずのキーがまだ動きに効き続ける
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         project = SetKeyframe(path, 30, 60.0).apply(project)
@@ -277,6 +301,7 @@ class TestKeyframes:
         assert value.static == 42.0
 
     def test_move(self, placed: Project) -> None:
+        # 動かした点が元の位置に残るか値が変わらないと、点を引きずっても動きの時刻と強さが変わらない
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         project = SetKeyframe(path, 30, 60.0).apply(project)
@@ -298,12 +323,15 @@ class TestKeyframes:
         assert [(k.frame, k.value) for k in value.keyframes] == [(0, 90.0)]
 
     def test_move_unknown_frame(self, placed: Project) -> None:
+        # 動かす点が無いと断らないと、別の操作で消えた点をグラフエディタでつまんで動かしたとき、
+        # 何を動かしたのか分からない失敗になる
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         with pytest.raises(KeyError):
             MoveKeyframe(path, 99, 10, 1.0).apply(project)
 
     def test_clear_freezes_the_current_value(self, placed: Project) -> None:
+        # 解除した値が見ていたフレームの値にならないと、アニメーションを解除した瞬間に絵が跳ぶ
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         project = SetKeyframe(path, 30, 60.0).apply(project)
@@ -333,6 +361,7 @@ class TestKeyframes:
 
 class TestClipProperties:
     def test_blend_mode(self, placed: Project) -> None:
+        # 選んだ合成モードがクリップに入らないと、加算を選んでもふつうに重なった絵のまま書き出される
         updated = SetClipProperty(only_clip(placed), "blend_mode", "add").apply(placed)
         assert updated.timeline.tracks[0].clips[0].blend_mode == "add"
 
@@ -342,6 +371,7 @@ class TestClipProperties:
             SetClipProperty(only_clip(placed), "timeline_start", 999).apply(placed)
 
     def test_set_source(self, placed: Project) -> None:
+        # 差し替えた中身が入らないと、テロップを置いても画面に文字が出ない
         source = TEXT.create(text="テロップ")
         updated = SetSource(only_clip(placed), source).apply(placed)
         assert updated.timeline.tracks[0].clips[0].source == source
@@ -349,6 +379,7 @@ class TestClipProperties:
 
 class TestUndo:
     def test_effect_edits_are_undoable(self, placed: Project) -> None:
+        # 追加とキーを 2 回の Ctrl+Z で戻しきれないと、試しに掛けたぼかしを元の絵へ戻せない
         document = Document(placed)
         effect = blur()
         document.execute(AddEffect(only_clip(placed), effect))
@@ -366,6 +397,7 @@ class TestPresets:
         return PresetStore(tmp_path / "presets")
 
     def test_round_trip(self, store: PresetStore) -> None:
+        # 読み戻せないか並びが変わると、次に開いたとき縁取りと影の組が消えるか、掛ける順が変わる
         preset = Preset(
             name="縁取り＋影",
             effects=(
@@ -381,6 +413,7 @@ class TestPresets:
         assert [e.kind for e in loaded[0].effects] == ["border", "shadow"]
 
     def test_keyframes_survive(self, store: PresetStore) -> None:
+        # プリセットに入れた動きが保存で消えると、ぼかしが抜ける見た目を当てても止まったぼかしになる
         animated = AnimatedValue(
             keyframes=(Keyframe(frame=0, value=0.0), Keyframe(frame=30, value=40.0))
         )
@@ -403,6 +436,7 @@ class TestPresets:
         assert first[0].kind == second[0].kind
 
     def test_source_presets(self, store: PresetStore) -> None:
+        # テキストのプリセットに中身が残らないと、見出しのプリセットを当てても文字や大きさが入らない
         preset = Preset(name="見出し", source=TEXT.create(text="見出し", size=96))
         store.save(preset)
         loaded = store.all()[0]
@@ -410,11 +444,14 @@ class TestPresets:
         assert loaded.source.params["text"] == "見出し"
 
     def test_unsafe_names_are_sanitised(self, store: PresetStore) -> None:
+        # 名前の「/」や「:」をそのままファイル名に使うと、Windows で保存できないか、
+        # 置き場の中の別のフォルダへ書いてしまう
         path = store.save(Preset(name="a/b:c*d?", effects=(blur(),)))
         assert path.exists()
         assert "/" not in path.name
 
     def test_empty_name(self, store: PresetStore) -> None:
+        # 空白だけの名前をそのまま使うと、名前の無い「.smep」のファイルになり、一覧で見分けられない
         path = store.save(Preset(name="   ", effects=(blur(),)))
         assert path.name == f"無題{SUFFIX}"
 
@@ -427,9 +464,11 @@ class TestPresets:
         assert [p.name for p in store.all()] == ["よい"]
 
     def test_missing_directory(self, tmp_path: Path) -> None:
+        # 置き場のフォルダがまだ無いときに落ちると、プリセットを作る前の人が一覧を開いただけで止まる
         assert PresetStore(tmp_path / "まだ無い").all() == ()
 
     def test_foreign_format(self, store: PresetStore) -> None:
+        # 形式の名前を見ずに読むと、拡張子だけ同じ別の物を、見た目の無いプリセットとして読んでしまう
         path = store.root / "ユーザー" / f"別物{SUFFIX}"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"format": "aviutl"}', encoding="utf-8")
@@ -437,6 +476,7 @@ class TestPresets:
             store.load(path)
 
     def test_delete(self, store: PresetStore) -> None:
+        # 消したプリセットのファイルが残ると、削除したのに次に一覧を開くとまた並ぶ
         preset = Preset(name="消す", effects=(blur(),))
         store.save(preset)
         store.delete(preset)
@@ -450,6 +490,7 @@ def _dummy_media() -> MediaItem:
 
 class TestGeneratedClipsInTracks:
     def test_generated_clips_live_on_video_tracks(self, project: Project) -> None:
+        # 素材を持たないクリップを映像トラックに持てないと、テキストや図形をタイムラインに置けない
         track = Track(kind=TrackKind.VIDEO, name="V1")
         clip = replace(
             make_clip(0, 60, _dummy_media()),

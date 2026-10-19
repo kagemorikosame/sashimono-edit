@@ -87,6 +87,8 @@ def _covered_mp3(directory: Path) -> Path:
 
 class TestProbe:
     def test_reads_video_and_audio(self, sample_av: SampleMedia) -> None:
+        # 大きさ・レート・符号の種類を読み違えると、素材に合わせて作るプロジェクトの
+        # 解像度やフレームレートが元の動画と食い違う
         item = probe_media(sample_av.path)
         assert item.has_video
         assert item.has_audio
@@ -104,6 +106,8 @@ class TestProbe:
         assert audio.codec == "aac"
 
     def test_duration_is_exact_rational(self, sample_av: SampleMedia) -> None:
+        # 長さを浮動小数で持つと、置いたクリップの長さをフレームへ直す所で端数がずれ、
+        # 最後の 1 フレームが欠けたり余ったりする
         item = probe_media(sample_av.path)
         assert isinstance(item.duration, Fraction)
         assert item.duration == pytest.approx(2.0, abs=0.1)
@@ -152,6 +156,8 @@ class TestProbe:
         assert float(item.duration) == pytest.approx(2.0, abs=0.1)
 
     def test_video_only_media(self, sample_long: SampleMedia) -> None:
+        # 音の無い動画に音があると答えると、置いたときに鳴らない音声クリップができ、
+        # 開けない音を読みに行く
         item = probe_media(sample_long.path)
         assert item.has_video
         assert not item.has_audio
@@ -166,10 +172,14 @@ class TestProbe:
         assert stream.display_size == (240, 320)
 
     def test_missing_file(self, tmp_path: Path) -> None:
+        # 見つからないと言えないと、読み込みに失敗した理由が利用者に伝わらず、
+        # どの素材を探し直せばよいか分からない
         with pytest.raises(ProbeError, match="見つからない"):
             probe_media(tmp_path / "無い.mp4")
 
     def test_not_media(self, tmp_path: Path) -> None:
+        # 動画でないファイルを断れないと、読み込みの途中で落ちるか、中身の無い素材が
+        # 一覧に並ぶ
         path = tmp_path / "notmedia.mp4"
         path.write_bytes(b"not a media file at all")
         with pytest.raises(ProbeError, match="開けない"):
@@ -184,6 +194,8 @@ class TestVideoDecoder:
             VideoDecoder(_covered_mp3(media_dir))
 
     def test_reads_the_first_frame(self, sample_av: SampleMedia) -> None:
+        # 最初のコマを RGBA の 8 bit で返せないと、プレビューも書き出しもクリップの頭で
+        # 絵が出ない
         with VideoDecoder(sample_av.path) as decoder:
             frame = decoder.frame_at(Fraction(0))
         assert frame is not None
@@ -191,6 +203,8 @@ class TestVideoDecoder:
         assert frame.dtype == np.uint8
 
     def test_sequential_reads_match_the_reference(self, sample_long: SampleMedia) -> None:
+        # 順に読んで先頭からの並びと違うコマを返すと、再生中のプレビューや書き出した動画で
+        # コマが飛んだり重なったりする
         reference = decode_all_frames(sample_long.path)
         with VideoDecoder(sample_long.path) as decoder:
             for index in range(0, 40):
@@ -258,10 +272,14 @@ class TestVideoDecoder:
             assert decoder.frame_at(Fraction(3, 2)) is None
 
     def test_past_the_end_returns_none(self, sample_av: SampleMedia) -> None:
+        # 素材の終わりの後も絵を返すと、クリップを素材より長く伸ばした所で最後の絵が
+        # 止まったまま映り続ける
         with VideoDecoder(sample_av.path) as decoder:
             assert decoder.frame_at(Fraction(10)) is None
 
     def test_negative_time_clamps_to_the_start(self, sample_av: SampleMedia) -> None:
+        # 素材の頭より前を頼まれて何も返さないと、クリップの頭で 1 コマ目が出ず
+        # 何も映らないコマが挟まる
         with VideoDecoder(sample_av.path) as decoder:
             first = decoder.frame_at(Fraction(0))
             before = decoder.frame_at(Fraction(-5))
@@ -270,6 +288,8 @@ class TestVideoDecoder:
         assert np.array_equal(first, before)
 
     def test_rotation_is_applied(self, media_dir: Path, sample_av: SampleMedia) -> None:
+        # 回転を当てないと、スマホで縦に撮った動画がプレビューでも書き出しでも
+        # 横倒しで映る
         rotated = make_rotated(media_dir, "rot90b.mp4", sample_av.path, 90)
         with VideoDecoder(rotated) as decoder:
             frame = decoder.frame_at(Fraction(0))
@@ -278,6 +298,8 @@ class TestVideoDecoder:
         assert frame.shape == (320, 240, 4)
 
     def test_media_without_video(self, media_dir: Path) -> None:
+        # 音だけの素材で映像のデコーダを開けてしまうと、呼ぶ側が音だけの素材と
+        # 見分けられず、絵の無い所を読みに行って落ちる
         audio_only = make_sample(
             media_dir, "audio_only.m4a", duration=1.0, audio=True, pattern="testsrc2"
         )
@@ -309,6 +331,8 @@ class TestVideoDecoder:
 
 class TestAudioDecoder:
     def test_reads_requested_length(self, sample_av: SampleMedia) -> None:
+        # 頼んだ長さで返らないと、ミキサが音の塊をつなぐ所で長さが合わず、
+        # 再生と書き出しの音が途切れたり落ちたりする
         with AudioDecoder(sample_av.path, sample_rate=48000, channels=2) as decoder:
             samples = decoder.read(0, 4800)
         assert samples.shape == (4800, 2)
@@ -427,6 +451,8 @@ class TestAudioDecoder:
         assert float(np.abs(sound[24000:]).max()) == 0.0
 
     def test_before_the_start_is_silent(self, sample_av: SampleMedia) -> None:
+        # 素材の頭より前に音を入れると、クリップの頭より前に素材の音が鳴り、
+        # 継ぎ目にずれた音が混じる
         with AudioDecoder(sample_av.path, sample_rate=48000) as decoder:
             samples = decoder.read(-1000, 2000)
         assert np.all(samples[:1000] == 0.0)
@@ -440,21 +466,29 @@ class TestAudioDecoder:
         assert np.all(samples == 0.0)
 
     def test_mono_downmix(self, sample_av: SampleMedia) -> None:
+        # 1 本にまとめられないと、モノラルで音を読む字幕起こしが受け取る形と合わず、
+        # 文字起こしが失敗する
         with AudioDecoder(sample_av.path, sample_rate=48000, channels=1) as decoder:
             samples = decoder.read(0, 4800)
         assert samples.shape == (4800, 1)
 
     def test_read_seconds(self, sample_av: SampleMedia) -> None:
+        # 秒で頼んだ範囲がサンプル数に正しく直らないと、秒で読む呼び手が頼んだ時刻と
+        # 違う所の音や違う長さを受け取る
         with AudioDecoder(sample_av.path, sample_rate=48000) as decoder:
             samples = decoder.read_seconds(Fraction(1, 2), Fraction(1, 4))
         assert samples.shape == (12000, 2)
 
     def test_rejects_bad_arguments(self, sample_av: SampleMedia) -> None:
+        # サンプリングレート 0 や 3 チャンネルを通すと、変換器を作る所で分かりにくい誤りで
+        # 落ちるか、左右の決まりに無い形の音をミキサへ渡す
         with pytest.raises(ValueError, match="サンプリングレート"):
             AudioDecoder(sample_av.path, sample_rate=0)
         with pytest.raises(ValueError, match="チャンネル数"):
             AudioDecoder(sample_av.path, sample_rate=48000, channels=3)
 
     def test_media_without_audio(self, sample_long: SampleMedia) -> None:
+        # 音の無い素材を断らないと、ミキサや字幕起こしが音が無いと分からず、無音に
+        # する代わりに読む所で落ちる
         with pytest.raises(ProbeError, match="音声ストリームが無い"):
             AudioDecoder(sample_long.path, sample_rate=48000)

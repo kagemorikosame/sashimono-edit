@@ -174,6 +174,7 @@ class TestTheOutlineIsWhereThePictureIs:
     def test_a_picture_at_its_own_pixels(
         self, gl_context: OffscreenGLContext, picture: MediaItem
     ) -> None:
+        # 素材の画素で置いた絵に画面いっぱいの枠が出ると、絵の無い所を掴んでも絵が動いてしまう
         image, outline = _outline_of(_project(_picture_clip(picture), picture), gl_context)
         assert _bounds(outline) == (128.0, 74.0, 192.0, 106.0)
         _assert_matches(image, outline)
@@ -218,6 +219,7 @@ class TestTheOutlineIsWhereThePictureIs:
     def test_a_picture_moved_to_its_pivot(
         self, gl_context: OffscreenGLContext, picture: MediaItem
     ) -> None:
+        # 支点へ寄せる動きを枠が辿り損ねると、枠が絵から離れた所に出て、掴んだ所と動く物が合わない
         clip = _picture_clip(
             picture, pivot_h="right", pivot_v="bottom", move_to_pivot=True, rotation=45
         )
@@ -325,6 +327,8 @@ class TestApproximate:
         assert outline is not None and outline.approximate
 
     def test_an_effect_before_the_placement_keeps_it_exact(self, picture: MediaItem) -> None:
+        # 足したぼかし（配置の前に入る）だけで枠が点線になると、ほとんどの絵が点線になり
+        # 本当にずれている物を見分けられない
         clip = _picture_clip(picture)
         blur = registry.require("blur").create(radius=3)
         clip = replace(clip, effects=(blur, *clip.effects))

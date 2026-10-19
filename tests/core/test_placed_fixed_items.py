@@ -91,6 +91,7 @@ class TestPlacing:
         assert all(e.fixed for e in sound.effects)
 
     def test_a_placed_still_gets_the_picture_items(self) -> None:
+        # 静止画だけ欄が付かないと、置いた画像の位置や反転をパネルの組で変えられない
         project = _apply(Project.create(), insert_media(Project.create(), _still()))
         (picture,) = _clips(project, TrackKind.VIDEO)
         assert [e.kind for e in picture.effects] == [FLIP_EFFECT_KIND, TRANSFORM_EFFECT_KIND]
@@ -181,6 +182,7 @@ class TestDefaults:
         assert registry.require(kind).is_idle(fixed_effect(kind))
 
     def test_a_moved_transform_is_not_idle(self) -> None:
+        # 何もしない物と見なされると描くときに飛ばされ、パネルで X を動かしても絵が元の位置のまま
         moved = fixed_effect(TRANSFORM_EFFECT_KIND).with_param("pos_x", AnimatedValue(10.0))
         assert not registry.require(TRANSFORM_EFFECT_KIND).is_idle(moved)
 

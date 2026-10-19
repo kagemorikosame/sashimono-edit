@@ -133,6 +133,7 @@ def test_the_group_turns_each_object_around_its_position(
 
 
 def test_the_opacity_multiplies(gl_context: OffscreenGLContext, picture: MediaItem) -> None:
+    # グループの不透明度が掛からないと、AviUtl でグループごと薄めた場面が読み込むと濃いまま出る
     group = replace(_group(), opacity=AnimatedValue(0.5))
     grouped = _render(gl_context, picture, group, _object(picture))
     direct = _render(gl_context, picture, replace(_object(picture), opacity=AnimatedValue(0.5)))
@@ -169,6 +170,7 @@ def test_layers_past_the_reach_stay_put(gl_context: OffscreenGLContext, picture:
 
 
 def test_the_group_itself_draws_nothing(gl_context: OffscreenGLContext, picture: MediaItem) -> None:
+    # グループ制御そのものが何かを描くと、受け持つ物が無い所に余計な絵や枠が映り込む
     image = _render(gl_context, picture, _group(pos_x=40.0))
     assert image[:, :, :3].max() == 0
 

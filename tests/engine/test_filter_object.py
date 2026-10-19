@@ -448,6 +448,7 @@ class TestInvalidation:
         assert not found.contains(5) and not found.contains(25)
 
     def test_changing_the_filter_drops_its_span(self) -> None:
+        # フィルタの外まで捨てると、入り切りを試すたびに作品全体を描き直して先読みが追い付かない
         before = _project(filter_clip=_filter())
         clip_id = _filter_id(before)
         # フィルタ自身を切り替えたのに捨て損ねると、先読みした所だけ反転したままの絵が出る

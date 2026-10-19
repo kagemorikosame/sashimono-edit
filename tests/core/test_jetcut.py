@@ -98,6 +98,7 @@ class TestPlanCuts:
     def test_the_same_media_placed_twice_is_cut_in_both_places(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 同じ素材を 2 か所に置いたとき片方しか切らず、もう片方には無音の間が残ったままになる
         track = project.timeline.tracks[0].id
         placed = AddClip(track, make_clip(0, 300, video_media)).apply(project)
         placed = AddClip(track, make_clip(300, 300, video_media)).apply(placed)
@@ -106,23 +107,32 @@ class TestPlanCuts:
         assert (390, 420) in ranges
 
     def test_too_short_ranges_are_dropped(self, placed: Project, video_media: MediaItem) -> None:
+        # 1 コマに満たない無音を拾うと、何も詰まらない切り取りが
+        # 履歴の「無音カット: N か所」に数えられる
         tiny = ((Fraction(3), Fraction(3) + Fraction(1, 60)),)
         assert plan_cuts(placed, video_media.id, tiny) == ()
 
 
 class TestMergeRanges:
     def test_overlapping_ranges_become_one(self) -> None:
+        # 映像と音声のクリップは同じ無音を返すので、重なりをまとめないと
+        # 1 か所の無音が 2 か所と数えられる
         assert merge_ranges([(0, 10), (5, 20), (30, 40)]) == ((0, 20), (30, 40))
 
     def test_touching_ranges_become_one(self) -> None:
+        # 接した無音が 2 つのまま残ると、ひと続きの無音が履歴の「無音カット」で 2 か所と数えられる
         assert merge_ranges([(10, 20), (20, 30)]) == ((10, 30),)
 
     def test_empty_ranges_are_dropped(self) -> None:
+        # 長さの無い範囲や逆向きの範囲が残ると、何も消さない所まで
+        # 履歴の「無音カット: N か所」に数えられる
         assert merge_ranges([(10, 10), (5, 4)]) == ()
 
 
 class TestRippleCut:
     def test_gaps_are_closed_and_source_positions_follow(self, placed: Project) -> None:
+        # 詰めた後ろのクリップが素材の位置を引き継がないと、
+        # 切ったはずの無音や前の発話がもう一度流れる
         cut = RippleCut(((0, 30), (90, 120), (180, 210), (270, 300))).apply(placed)
         # 無音 4 か所を抜いて 3 本になり、隙間なく並ぶ 素材のどこから始まるかは
         # 発話の頭（1 秒 / 4 秒 / 7 秒）に一致する
@@ -133,6 +143,7 @@ class TestRippleCut:
         ]
 
     def test_subtitles_follow_without_any_sync_step(self, placed: Project) -> None:
+        # カットで詰めた分だけ字幕が前へ動かないと、無音を抜いた動画で字幕が話より遅れて出る
         before = _subtitles(placed)
         assert before == [("今日は", 30, 90), ("編集ソフトを", 120, 180), ("作ります", 210, 270)]
 
@@ -147,6 +158,7 @@ class TestRippleCut:
     def test_a_clip_fully_inside_the_range_disappears(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 範囲にすっぽり入ったクリップが残ると、消したはずの無音の場面がタイムラインに居座る
         track = project.timeline.tracks[0].id
         placed = AddClip(track, make_clip(0, 30, video_media)).apply(project)
         placed = AddClip(track, make_clip(60, 30, video_media)).apply(placed)
@@ -156,6 +168,7 @@ class TestRippleCut:
     def test_linked_video_and_audio_stay_aligned(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 映像と音声が別々の長さに切られると、無音カットのあと口の動きと声がずれる
         placed = project
         for command in insert_media(project, video_media):
             placed = command.apply(placed)
@@ -170,6 +183,7 @@ class TestRippleCut:
     def test_split_halves_get_a_shared_new_link_group(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 割れた右半分が元のグループに残ると、左の映像を消したとき右の映像と音声まで一緒に消える
         placed = project
         for command in insert_media(project, video_media):
             placed = command.apply(placed)
@@ -183,6 +197,7 @@ class TestRippleCut:
         assert video[1].link_group != video[0].link_group
 
     def test_locked_tracks_are_left_alone(self, project: Project, video_media: MediaItem) -> None:
+        # ロックしたトラックまで切られると、手を付けないよう固めた BGM や映像が無音カットで削られる
         from dataclasses import replace
 
         placed = AddClip(project.timeline.tracks[0].id, make_clip(0, 300, video_media)).apply(
@@ -200,6 +215,8 @@ class TestRippleCut:
         assert _clips(cut) == [(0, 210, Fraction(3))]
 
     def test_markers_inside_the_cut_are_removed_and_the_rest_shift(self, placed: Project) -> None:
+        # 後ろの目印が詰めた分だけ前へ動かないと、カットのあと目印が付けた場面と別の所を指す
+        # 切った範囲の中の目印が残ると、もう無い場面を指す目印が増える
         from dataclasses import replace
 
         from sashimono.core.model import Marker

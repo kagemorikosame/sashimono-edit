@@ -80,6 +80,7 @@ def _render(project: Project, context: OffscreenGLContext) -> np.ndarray:
 
 
 def test_the_cover_shows_only_inside_the_shape_below(gl_context: OffscreenGLContext) -> None:
+    # 切り抜きが効かないと、吹き出しの形だけに見せるはずの模様の背景が画面全体を覆う
     image = _render(_project(clipped=True), gl_context)
     # 形の中は上の赤、外は下地の黒のまま（覆われない）
     assert image[32, 32, 0] > 200 and image[32, 32, 2] < 50
@@ -87,6 +88,7 @@ def test_the_cover_shows_only_inside_the_shape_below(gl_context: OffscreenGLCont
 
 
 def test_a_faint_shape_below_still_clips_at_full_strength(gl_context: OffscreenGLContext) -> None:
+    # 下の形の薄さまで写すと、看板テロップの板が半分透けて下の絵と混ざった色で出る
     image = _render(_project(clipped=True, below_opacity=0.5), gl_context)
     # 切り抜く形に下のクリップの不透明度まで当てると、上の赤が半分しか出ず、
     # 下の青が透けて紫になる（木製看板テロップの板が 56.4% しか出なかった不具合）
@@ -110,6 +112,7 @@ def test_the_shape_below_keeps_its_own_faintness(gl_context: OffscreenGLContext)
 
 
 def test_without_clipping_the_cover_fills_the_screen(gl_context: OffscreenGLContext) -> None:
+    # 切り抜きを付けていないクリップまで切り抜くと、全面の背景が下のクリップの形にしか出ない
     image = _render(_project(clipped=False), gl_context)
     assert image[2, 2, 0] > 200
 
@@ -148,6 +151,7 @@ def test_a_clipped_script_reads_the_screen_below(gl_context: OffscreenGLContext)
 
 
 def test_the_setting_is_saved() -> None:
+    # 保存で切り抜きが落ちると、開き直した途端に吹き出しの模様が画面全体に広がる
     project = _project(clipped=True)
     loaded = project_from_dict(project_to_dict(project))
     assert loaded.timeline.tracks[1].clips[0].clip_to_below is True

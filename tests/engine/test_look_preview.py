@@ -57,6 +57,7 @@ class TestSampleProject:
         assert frame == 45
 
     def test_an_alias_is_placed_as_it_is(self) -> None:
+        # エイリアスの文字や長さを見本の側で差し替えると、棚の見本が置いたときの見た目と違って見える
         alias = Alias.of("テロップ", _clip("置く文字", duration=40))
         project, frame = sample_project(alias)
         drawn = next(track.clips[0] for track in project.timeline.tracks if track.clips)
@@ -66,6 +67,8 @@ class TestSampleProject:
 
 class TestCrop:
     def test_nothing_visible_keeps_the_whole_frame(self) -> None:
+        # 何も見えない見本を空と知らせないと、棚のヒントに「見本のコマに見える物がない」が出ず、
+        # 透明な見本が壊れて見える
         image = np.zeros((1080, 1920, 4), dtype=np.uint8)
         cropped, empty = crop_to_content(image)
         assert empty
@@ -84,6 +87,7 @@ class TestCrop:
         assert cropped[:, :, 3].max() == 255
 
     def test_the_crop_stays_inside_the_frame(self) -> None:
+        # 切り出しが画面の外へはみ出すと、端に置いたロゴの見本が欠けたり空になったりする
         image = np.zeros((1080, 1920, 4), dtype=np.uint8)
         image[0:10, 1900:1920] = 255
         cropped, _ = crop_to_content(image)
@@ -93,6 +97,7 @@ class TestCrop:
 
 class TestSimple:
     def test_text_is_drawn_without_a_gpu(self) -> None:
+        # GPU が使えない機械で文字が描けないと、プリセットとエイリアスの棚の見本が全部空になる
         picture = LookRenderer(gpu=False).render(Preset.capture("見出し", _clip()))
         assert picture.simple
         assert not picture.empty
@@ -175,6 +180,8 @@ class TestGpu:
         assert picture.image[0, 0, 3] == 0
 
     def test_the_worker_draws_off_the_screen_thread(self, qt_application: QApplication) -> None:
+        # 別のスレッドで GPU の見本が描けないと、棚を開いても見本が届かないか、
+        # エフェクトの無い簡易の絵だけが並ぶ
         worker = LookWorker(gpu=True)
         received: list[tuple[str, object]] = []
         worker.drawn.connect(lambda key, result: received.append((key, result)))

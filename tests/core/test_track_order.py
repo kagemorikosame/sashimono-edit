@@ -24,6 +24,7 @@ def _names(project: Project) -> list[str]:
 
 class TestMoveTrack:
     def test_moves_within_the_same_kind(self) -> None:
+        # 行き先がずれると、手前へ動かしたつもりの映像トラックが別の重ね順に入り、字幕が絵に隠れる
         v1, v2, v3 = (Track(TrackKind.VIDEO, name) for name in ("V1", "V2", "V3"))
         project = _project(v1, v2, v3)
         moved = MoveTrack(v1.id, 2).apply(project)
@@ -59,6 +60,7 @@ class TestMoveTrack:
             MoveTrack(v1.id, 1).apply(_project(v1, v2))
 
     def test_passing_a_locked_track_is_allowed(self) -> None:
+        # ロックしたトラックを越えて動かすのまで断ると、ロックが 1 本あるだけで重ね順を変えられない
         v1 = Track(TrackKind.VIDEO, "V1")
         v2 = Track(TrackKind.VIDEO, "V2", locked=True)
         moved = MoveTrack(v1.id, 1).apply(_project(v1, v2))
@@ -72,11 +74,13 @@ class TestMoveTrack:
             MoveTrack(v1.id, 3).apply(_project(v1, v2, a1))
 
     def test_staying_put_changes_nothing(self) -> None:
+        # 動かない並べ替えで新しい作品を返すと、取り消しても何も起きない段が履歴に積まれる
         v1, v2 = Track(TrackKind.VIDEO, "V1"), Track(TrackKind.VIDEO, "V2")
         project = _project(v1, v2)
         assert MoveTrack(v1.id, 0).apply(project) is project
 
     def test_it_can_be_undone(self) -> None:
+        # 並べ替えを取り消しても戻らないと、重ね順を間違えたときに手で並べ直すことになる
         v1, v2 = Track(TrackKind.VIDEO, "V1"), Track(TrackKind.VIDEO, "V2")
         document = Document(_project(v1, v2))
         document.execute(MoveTrack(v1.id, 1))

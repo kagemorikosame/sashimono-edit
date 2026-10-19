@@ -56,6 +56,8 @@ def held(project: Project, video_media: MediaItem) -> Project:
 
 class TestPictureTime:
     def test_the_picture_moves_until_the_hold(self) -> None:
+        # YMM4 から読んだ素材より長い動画アイテムが、素材の終わりより前から静止画になったり
+        # 頭が飛んだりする
         clip = Clip(timeline_start=0, duration=300, source_in=Fraction(1), hold_at=Fraction(5))
         # 止める前は素のクリップと同じく進む 止める所を早めに効かせると、動くはずの所が止まる
         assert clip.picture_time(30, RATE) == Fraction(2)

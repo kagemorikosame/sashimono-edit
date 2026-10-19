@@ -87,6 +87,7 @@ class TestScatter:
         return registry.require("scatter").create(**params)
 
     def test_more_copies_cover_more(self, draw: Callable[..., np.ndarray]) -> None:
+        # 数を読まずにいると、AviUtl の作品で 12 個撒いた桜吹雪などが 2 個のときと同じ量にしか出ない
         few = int(_lit(draw(self._scatter(count=2, span=200.0))).sum())
         many = int(_lit(draw(self._scatter(count=12, span=200.0))).sum())
         assert many > few

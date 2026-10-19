@@ -81,6 +81,7 @@ class TestWhereItLands:
         _apply(project, commands)
 
     def test_no_free_track_makes_a_new_one(self, audio_media: MediaItem) -> None:
+        # 空きトラックが無いと重なりで断られ、落とした音声が何も置かれずに消える
         taken = Track(TrackKind.AUDIO, "A1", (make_clip(0, 300, audio_media),))
         project = _project(taken)
         commands = place_media(project, [audio_media], at_frame=30, track_id=taken.id)

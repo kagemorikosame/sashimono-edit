@@ -38,13 +38,18 @@ from sashimono.core.timebase import FrameRate
 
 class TestRoundTrip:
     def test_empty_project(self) -> None:
+        # 空の作品が往復で変わると、新しく作って保存しただけの作品が開き直すと別の設定になる
         original = Project.create()
         assert project_from_dict(project_to_dict(original)) == original
 
     def test_rich_project(self, rich_project: Project) -> None:
+        # 保存で落ちる項目があると、作り込んだエフェクトやキーフレームや字幕が、閉じて
+        # 開き直しただけで消える
         assert project_from_dict(project_to_dict(rich_project)) == rich_project
 
     def test_survives_a_file(self, rich_project: Project, tmp_path: Path) -> None:
+        # ファイルへ書いて読む所で崩れると、辞書の往復は通っても、実際に保存して開き直した
+        # 作品が編集していた物と違う
         path = tmp_path / "配信回_07.sme"
         save_project(rich_project, path)
         assert load_project(path) == rich_project
@@ -96,6 +101,8 @@ class TestRoundTrip:
         assert project_from_dict(data) == original
 
     def test_fractions_are_written_as_strings(self, tmp_path: Path) -> None:
+        # 29.97 fps（30000/1001）を小数で書くと開き直しても同じ分数に戻らず、フレームを
+        # 秒へ直すたびに誤差が乗る
         settings = ProjectSettings(frame_rate=FrameRate(30000, 1001))
         project = Project.create(settings)
         path = tmp_path / "ntsc.sme"
@@ -114,31 +121,40 @@ class TestRoundTrip:
 
 class TestFileHandling:
     def test_creates_parent_directories(self, tmp_path: Path) -> None:
+        # 保存先のフォルダがまだ無いときに保存が失敗し、閉じる前の編集を残せない
         path = tmp_path / "深い" / "階層" / "p.sme"
         save_project(Project.create(), path)
         assert path.exists()
 
     def test_no_temporary_file_is_left_behind(self, tmp_path: Path) -> None:
+        # 書きかけの仮のファイルが残ると、保存するたびに作品の横へ .writing のファイルが積もる
         path = tmp_path / "p.sme"
         save_project(Project.create(), path)
         assert [p.name for p in tmp_path.iterdir()] == ["p.sme"]
 
     def test_overwrites_existing_file(self, tmp_path: Path) -> None:
+        # 上書きの保存が前の中身を残すと、保存し直した編集が開き直したときに消えている
         path = tmp_path / "p.sme"
         save_project(Project.create(name="一回目"), path)
         save_project(Project.create(name="二回目"), path)
         assert load_project(path).name == "二回目"
 
     def test_untitled_project_takes_its_filename(self, tmp_path: Path) -> None:
+        # 名前の無い作品にファイル名を使わないと、書き出しの窓が勧めるファイル名が
+        # 保存したファイル名でなく「無題」になる
         path = tmp_path / "夏の思い出.sme"
         save_project(Project.create(), path)
         assert load_project(path).name == "夏の思い出"
 
     def test_missing_file(self, tmp_path: Path) -> None:
+        # 消した・動かした作品を開こうとしたときに、何が悪いか分かる言葉の代わりに
+        # ファイルの例外がそのまま出る
         with pytest.raises(ProjectFileError, match="開けない"):
             load_project(tmp_path / "無い.sme")
 
     def test_not_json(self, tmp_path: Path) -> None:
+        # 壊れた保存や別のソフトのファイルを開いたときに、JSON の読み取りの例外がそのまま出て
+        # 作品のファイルが壊れていると分からない
         path = tmp_path / "p.sme"
         path.write_text("これは JSON ではない", encoding="utf-8")
         with pytest.raises(ProjectFileError, match="JSON として読めない"):
@@ -147,26 +163,35 @@ class TestFileHandling:
 
 class TestValidation:
     def test_rejects_foreign_format(self) -> None:
+        # ほかのソフトの JSON を作品として読み進めると、項目が合わずに崩れた作品が開くか、
+        # 読み取りの途中で分かりにくい例外になる
         with pytest.raises(ProjectFileError, match="プロジェクトファイルではない"):
             project_from_dict({"format": "aviutl", "version": 1})
 
     def test_rejects_newer_version(self) -> None:
+        # 新しい版の作品を古い本体で開けると、知らない項目を捨てたまま開き、上書き保存で
+        # 新しい版で付けた編集が消える
         with pytest.raises(ProjectFileError, match="新しい形式"):
             project_from_dict({"format": FORMAT_NAME, "version": FORMAT_VERSION + 1})
 
     def test_rejects_rate_mismatch(self, rich_project: Project) -> None:
+        # 手で直して設定とタイムラインのフレームレートが食い違ったファイルを、どこが悪いか
+        # 分かる言葉で断れず、開けない理由が分からない
         data = project_to_dict(rich_project)
         data["timeline"]["rate"] = "25/1"
         with pytest.raises(ProjectFileError, match="食い違っている"):
             project_from_dict(data)
 
     def test_rejects_unknown_track_kind(self, rich_project: Project) -> None:
+        # 知らない種類のトラックを読み飛ばすと、新しい版で作った混合トラックが前の版で
+        # 黙って消え、上書き保存で失われる
         data = project_to_dict(rich_project)
         data["timeline"]["tracks"][0]["kind"] = "subtitle"
         with pytest.raises(ProjectFileError, match="未知のトラック種別"):
             project_from_dict(data)
 
     def test_rejects_unknown_interpolation(self, rich_project: Project) -> None:
+        # 知らない補間方法を通すと、新しい版で付けた動きが前の版で黙って別の動きになる
         data = project_to_dict(rich_project)
         clip = data["timeline"]["tracks"][0]["clips"][0]
         clip["effects"][0]["params"]["radius"]["keyframes"][0]["interpolation"] = "魔法"
@@ -216,12 +241,16 @@ class TestValidation:
             project_from_dict(data)
 
     def test_rejects_malformed_fraction(self, rich_project: Project) -> None:
+        # 手で直してフレームレートを壊したファイルで、どの項目が悪いかを示せず、
+        # 分数の読み取りの例外がそのまま出る
         data = project_to_dict(rich_project)
         data["settings"]["frame_rate"] = "さんじゅう"
         with pytest.raises(ProjectFileError, match="分数として読めない"):
             project_from_dict(data)
 
     def test_rejects_wrong_type(self, rich_project: Project) -> None:
+        # 幅が文字のまま通ると、設定の検査で文字と数を比べる型の例外になり、開けない理由が
+        # 分からない
         data = project_to_dict(rich_project)
         data["settings"]["width"] = "1920"
         with pytest.raises(ProjectFileError, match="整数ではない"):
@@ -242,6 +271,8 @@ class TestCompactness:
 
 class TestTranscriptRoundTrip:
     def test_words_and_speaker_survive(self, rich_project: Project) -> None:
+        # 単語ごとの時刻を落とすと、開き直した後に字幕を割るとき単語の切れ目で分けられず、
+        # 文字数の比で語の途中から割れる 話者も消える
         restored = project_from_dict(project_to_dict(rich_project))
         media = next(m for m in restored.media if m.transcript is not None)
         assert media.transcript is not None
@@ -250,6 +281,8 @@ class TestTranscriptRoundTrip:
         assert [w.text for w in first.words] == ["今日", "は"]
 
     def test_edited_flag_survives(self, project: Project, video_media: MediaItem) -> None:
+        # 手で直した印を保存で落とすと、開き直した後の整理が「手で直した字幕には触らない」
+        # でも直した文を書き換える
         transcript = Transcript(
             segments=(
                 TranscriptSegment(start=Fraction(0), end=Fraction(1), text="編集済み", edited=True),

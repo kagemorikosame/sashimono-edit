@@ -62,6 +62,7 @@ def test_one_layer_in_front_by_default() -> None:
 
 
 def test_zero_means_every_layer_in_front() -> None:
+    # AviUtl で対象を 0（手前の全部）にしたグループが、読み込むと何も動かさないか一部しか動かさない
     tracks = _layers(g := _group(layers=0), _text(), _text(), _text())
     assert all(_ids(controlling_groups(tracks, t.id, 5)) == [g.id] for t in tracks[1:])
 
@@ -74,6 +75,7 @@ def test_only_while_the_group_is_there() -> None:
 
 
 def test_a_disabled_group_does_nothing() -> None:
+    # 見比べようとグループを無効にしても、手前の物が動いたままで外したときの絵が見られない
     tracks = _layers(replace(_group(), enabled=False), _text())
     assert controlling_groups(tracks, tracks[1].id, 0) == []
 

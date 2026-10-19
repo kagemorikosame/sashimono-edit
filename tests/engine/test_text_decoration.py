@@ -39,6 +39,7 @@ def centre_of_mass(image: np.ndarray) -> tuple[float, float]:
 
 class TestShadow:
     def test_a_shadow_adds_ink(self) -> None:
+        # 影を設定しても何も描かれないと、白い字幕が明るい背景に溶けて読めなくなる
         plain = draw()
         shadowed = draw(
             shadow_x=AnimatedValue(8.0),
@@ -60,11 +61,13 @@ class TestShadow:
         assert shadow_x > plain_x
 
     def test_a_transparent_shadow_changes_nothing(self) -> None:
+        # 影の色を透明にしても何か描かれると、影を消したつもりの字幕の周りに跡が残る
         assert opaque(draw(shadow_x=AnimatedValue(8.0), shadow_color=(0, 0, 0, 0.0))) == opaque(
             draw()
         )
 
     def test_blurring_spreads_it_without_losing_the_letter(self) -> None:
+        # 影のぼかしの値を上げても影が広がらないと、柔らかい影が作れずぼかしの欄が効かない
         sharp = draw(
             shadow_x=AnimatedValue(10.0),
             shadow_y=AnimatedValue(-10.0),
@@ -99,6 +102,7 @@ class TestShadow:
 
 class TestOutline:
     def test_an_outline_adds_ink(self) -> None:
+        # 縁取りの太さを上げても縁が描かれないと、字幕が背景に埋もれて読めない
         assert opaque(draw(border_width=AnimatedValue(8.0))) > opaque(draw())
 
     def test_the_outline_sits_under_the_fill(self) -> None:
@@ -114,6 +118,7 @@ class TestOutline:
 
 class TestVerticalAnchor:
     def test_the_bottom_anchor_puts_the_text_above_the_point(self) -> None:
+        # 縦の基準を下にしても字が点の下へ垂れると、画面の下端に置いた字幕が画面の外へはみ出す
         top = centre_of_mass(draw(valign="top"))[0]
         middle = centre_of_mass(draw(valign="middle"))[0]
         bottom = centre_of_mass(draw(valign="bottom"))[0]
@@ -136,11 +141,13 @@ class TestVerticalWriting:
         assert np.ptp(ys) > np.ptp(xs)
 
     def test_horizontal_text_is_wider_than_it_is_tall(self) -> None:
+        # 横書きのテキストが縦に並んで描かれると、ふつうの字幕が縦書きになる
         image = draw(text="あいう", vertical=False)
         ys, xs = np.nonzero(image[:, :, 3] > 8)
         assert np.ptp(xs) > np.ptp(ys)
 
     def test_vertical_text_takes_decorations_too(self) -> None:
+        # 縦書きにすると縁取りが消えると、縦書きのテロップだけ縁の無い字になる
         plain = draw(text="あい", vertical=True)
         decorated = draw(text="あい", vertical=True, border_width=AnimatedValue(8.0))
         assert opaque(decorated) > opaque(plain)
@@ -148,11 +155,13 @@ class TestVerticalWriting:
 
 class TestReveal:
     def test_the_reveal_still_works_with_decorations(self) -> None:
+        # 縁取りを付けた字で文字送りが効かないと、1 字ずつ出るはずの字幕が初めから全部出る
         half = draw(text="あいうえお", reveal=AnimatedValue(40.0), border_width=AnimatedValue(4.0))
         full = draw(text="あいうえお", reveal=AnimatedValue(100.0), border_width=AnimatedValue(4.0))
         assert opaque(half) < opaque(full)
 
     def test_nothing_is_drawn_at_zero(self) -> None:
+        # 文字送り 0% のコマで字が少しでも描かれると、出てくる前の字がちらつく
         assert opaque(draw(text="あいう", reveal=AnimatedValue(0.0))) == 0
 
 

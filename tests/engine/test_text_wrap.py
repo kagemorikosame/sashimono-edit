@@ -27,9 +27,12 @@ class TestWrap:
         ]
 
     def test_japanese_breaks_between_any_characters(self) -> None:
+        # 和文を空白の所でしか折り返さないと、空白の無い日本語の字幕が
+        # 1 行のまま画面の端からはみ出す
         assert wrap_lines("あいうえおかきくけこ", 40, measure) == ["あいうえ", "おかきく", "けこ"]
 
     def test_a_fitting_line_stays(self) -> None:
+        # 幅に収まる短い字幕まで割られると、1 行で済む文が 2 行に分かれて表示される
         assert wrap_lines("あいう", 30, measure) == ["あいう"]
 
     def test_manual_breaks_are_kept_and_each_line_wraps(self) -> None:
@@ -42,6 +45,7 @@ class TestWrap:
         assert wrap_lines("あいう、」えお", 30, measure) == ["あい", "う、」", "えお"]
 
     def test_small_kana_and_long_vowel_do_not_start_a_line(self) -> None:
+        # 「っ」や「ー」が行の頭に来ると、日本語の字幕として不格好な折り返しになり読みが途切れる
         assert wrap_lines("あいっていー", 30, measure) == ["あいっ", "ていー"]
 
     def test_an_opening_bracket_does_not_end_a_line(self) -> None:
@@ -49,6 +53,7 @@ class TestWrap:
         assert wrap_lines("あい「うえ」", 30, measure) == ["あい", "「う", "え」"]
 
     def test_english_words_are_not_split(self) -> None:
+        # 英単語の途中で行が割れると、「wor」と「ld」のように読めない字幕になる
         assert wrap_lines("hello big world", 100, measure) == ["hello big", "world"]
 
     def test_a_word_longer_than_the_width_is_split(self) -> None:
@@ -69,6 +74,7 @@ class TestWrap:
         assert len(wrap_lines("あいう", 5, measure)) == 3
 
     def test_an_empty_line_is_kept(self) -> None:
+        # 手で入れた空行が消えると、行間を空けて組んだテロップが詰まって見える
         assert wrap_lines("あ\n\nい", 30, measure) == ["あ", "", "い"]
 
 
@@ -131,12 +137,16 @@ class TestGraphemes:
         assert wrap_lines(FAMILY * 2, 20, unjoined) == [FAMILY, FAMILY]
 
     def test_a_skin_tone_stays_with_its_emoji(self) -> None:
+        # 肌の色を付けた絵文字が行の端で割れると、絵文字と色の四角が別々の行に出る
         assert wrap_lines(THUMB * 2, 10, unjoined) == [THUMB, THUMB]
 
     def test_a_flag_is_not_halved(self) -> None:
+        # 国旗の 2 字が別々の行に分かれると、旗の代わりに地域を表す文字の記号が 2 つ見える
         assert wrap_lines(JAPAN + FRANCE, 10, unjoined) == [JAPAN, FRANCE]
 
     def test_a_variation_selector_stays_with_its_kanji(self) -> None:
+        # 異体字セレクタが基の漢字から離れて次の行へ回ると、
+        # 人名の字が選んだ字形でなく普通の字形で出る
         assert wrap_lines(KUZU * 3, 20, by_grapheme) == [KUZU * 2, KUZU]
 
     def test_a_long_plain_word_is_still_split(self) -> None:
@@ -153,6 +163,8 @@ class TestLongWordCost:
     """
 
     def test_twice_the_length_costs_about_twice(self) -> None:
+        # 測る量が字数の二乗に戻ると、区切りの無い長い URL を貼った字幕を描くのが
+        # 固まったように重くなる
         def cost(length: int) -> int:
             measured = 0
 
@@ -178,8 +190,11 @@ class TestRevealByGraphemes:
         assert _revealed(VOICED + "き", {"reveal": 34.0}) == VOICED
 
     def test_a_flag_appears_whole(self) -> None:
+        # 文字送りの途中で国旗の片方だけが出ると、一瞬だけ旗でなく地域を表す文字の記号が見える
         assert _revealed(JAPAN + FRANCE, {"reveal": 30.0}) == JAPAN
 
     def test_the_aviutl_layout_counts_the_same_way(self) -> None:
+        # AviUtl から読んだテキストの文字送りだけが一瞬濁点の無い「か」を出し、
+        # 読み込んだ作品で字がちらつく
         lines = _revealed_lines(parse_tags(VOICED + "き", 64.0), {"reveal": 34.0})
         assert "".join(run.text for line in lines for run in line.runs) == VOICED

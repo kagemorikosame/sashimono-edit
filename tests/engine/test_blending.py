@@ -158,6 +158,7 @@ class TestOpacityOnBlack:
     def test_a_plain_clip(
         self, gl_context: OffscreenGLContext, blending: str, opacity: float
     ) -> None:
+        # 白だけでは見えない符号化の掛け忘れや掛けすぎで、半透明の灰色の素材が設定と違う明るさになる
         project, _ = _single(blending, GRAY, opacity)
         assert abs(_center(project, gl_context) - _expected(blending, GRAY, opacity)) <= 1
 

@@ -61,6 +61,8 @@ class TestSetSegmentText:
         assert texts.count("こんにちは") == 2
 
     def test_edited_flag_is_set(self, placed: Project, video_media: MediaItem) -> None:
+        # 印が付かないと、字幕の整形を「手で直した字幕は飛ばす」で掛け直したときに、
+        # 手で直した本文まで整形し直されて書き換わる
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         target = item.transcript.segments[0]
@@ -71,6 +73,8 @@ class TestSetSegmentText:
         assert updated.segments[0].edited is True
 
     def test_unknown_segment_fails(self, placed: Project, video_media: MediaItem) -> None:
+        # 見つからない字幕への書き換えを黙って通すと、直したつもりの本文がどこにも残らず、
+        # 失敗に気付けない
         from sashimono.core.model import SegmentId
 
         with pytest.raises(KeyError):
@@ -81,6 +85,8 @@ class TestRetimeSegment:
     def test_moving_a_segment_keeps_the_order_valid(
         self, placed: Project, video_media: MediaItem
     ) -> None:
+        # 時刻を動かした後に並べ直さないと、開始時刻の昇順という起こしの決まりに反し、
+        # 字幕を後ろへ動かす操作がそのまま断られる
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         first = item.transcript.segments[0]
@@ -96,6 +102,8 @@ class TestRetimeSegment:
         ]
 
     def test_inverted_range_fails(self, placed: Project, video_media: MediaItem) -> None:
+        # 終わりが頭以前の字幕を通すと、長さ 0 の字幕ができ、画面に一瞬も出ないまま
+        # 字幕の一覧にだけ残る
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         first = item.transcript.segments[0]
@@ -107,6 +115,8 @@ class TestRemoveAndAdd:
     def test_removing_drops_it_from_the_timeline(
         self, placed: Project, video_media: MediaItem
     ) -> None:
+        # 素材の起こしから消しても投影に残ると、消した字幕がプレビューや書き出しに
+        # 出続ける
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         removed = RemoveSegment(video_media.id, item.transcript.segments[1].id).apply(placed)
@@ -115,6 +125,8 @@ class TestRemoveAndAdd:
     def test_adding_to_media_without_transcript(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 起こしの無い素材に足せないと、文字起こしをしていない動画には手で字幕を
+        # 1 枚も入れられない
         added = AddSegment(video_media.id, Fraction(1), Fraction(2), "手で入れた").apply(project)
         assert _segments(added, video_media) == [("手で入れた", Fraction(1), Fraction(2))]
 
@@ -123,6 +135,8 @@ class TestSplitSegment:
     def test_word_timestamps_decide_the_boundary(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 単語の時刻を使わずに割ると、話の切れ目でない所で本文が分かれ、前半の字幕に
+        # 後半の言葉が出る
         segment = TranscriptSegment(
             start=Fraction(0),
             end=Fraction(4),
@@ -143,6 +157,8 @@ class TestSplitSegment:
     def test_without_words_the_text_is_split_by_time_ratio(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 時間の比で分けないと、単語の時刻を持たない字幕（手で入れた物など）を割ったときに
+        # 本文が片方へ丸ごと寄り、もう片方が空の字幕になる
         segment = TranscriptSegment(start=Fraction(0), end=Fraction(4), text="ABCDEFGH")
         placed = SetTranscript(video_media.id, Transcript((segment,))).apply(project)
         split = SplitSegment(video_media.id, segment.id, Fraction(1)).apply(placed)
@@ -151,6 +167,8 @@ class TestSplitSegment:
     def test_split_outside_the_segment_fails(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 字幕の外や端で割るのを通すと、長さ 0 の字幕が残るか、何が悪いのか分からない
+        # 誤りの文言で操作が断られる
         segment = TranscriptSegment(start=Fraction(0), end=Fraction(4), text="ABC")
         placed = SetTranscript(video_media.id, Transcript((segment,))).apply(project)
         with pytest.raises(ValueError, match="内側にない"):
@@ -159,6 +177,8 @@ class TestSplitSegment:
 
 class TestMergeWithNext:
     def test_two_segments_become_one(self, placed: Project, video_media: MediaItem) -> None:
+        # 繋いだ字幕の時刻や本文を誤ると、2 枚目の言葉が落ちるか、改行で繋いで整形を
+        # 掛け直したときに二重に折り返される
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         merged = MergeWithNext(video_media.id, item.transcript.segments[0].id).apply(placed)
@@ -168,6 +188,8 @@ class TestMergeWithNext:
         ]
 
     def test_merging_the_last_one_fails(self, placed: Project, video_media: MediaItem) -> None:
+        # 最後の 1 枚で結合を通すと、範囲の外を読んで分かりにくい誤りで落ちる 断れば
+        # 「次の字幕が無い」と利用者に伝えられる
         item = placed.require_media(video_media.id)
         assert item.transcript is not None
         with pytest.raises(ValueError, match="次の字幕が無い"):
@@ -176,6 +198,8 @@ class TestMergeWithNext:
 
 class TestBurnSubtitles:
     def test_projected_subtitles_become_text_clips(self, placed: Project) -> None:
+        # 焼き込みで時刻やテンプレートの値を落とすと、書き出した動画の字幕が話とずれた所に
+        # 出るか、選んだ大きさを無視した文字で出る
         template = GeneratedSource(kind="text", params={"text": "", "size": AnimatedValue(48.0)})
         burned = placed
         for command in burn_subtitles(placed, template):
@@ -212,6 +236,8 @@ class TestBurnSubtitles:
         assert look["pos_y"] < -height / 4
 
     def test_nothing_to_burn_returns_no_commands(self, project: Project) -> None:
+        # 字幕が無いのに空の字幕トラックを作ると、焼き込むたびに中身の無いトラックが
+        # タイムラインに増える
         assert burn_subtitles(project, GeneratedSource(kind="text")) == []
 
     def test_overlapping_subtitles_are_trimmed_to_fit_one_track(

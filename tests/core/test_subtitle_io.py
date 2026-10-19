@@ -28,6 +28,8 @@ def placed(project: Project, video_media: MediaItem, transcript: Transcript) -> 
 
 class TestSrt:
     def test_numbering_and_timestamps(self, placed: Project) -> None:
+        # SRT の番号や時刻の書き方が崩れると、動画サイトや再生ソフトが字幕を読めないか、
+        # 話と違う時刻に出す
         srt = to_srt(project_timeline(placed), placed.rate)
         assert srt.startswith("1\n00:00:01,000 --> 00:00:03,000\n今日は\n")
         assert "3\n00:00:07,000 --> 00:00:09,000\n作ります\n" in srt
@@ -39,6 +41,7 @@ class TestSrt:
         assert srt.startswith("1\n00:00:00,000 --> 00:00:02,000\n今日は\n")
 
     def test_empty_text_is_skipped(self, project: Project, video_media: MediaItem) -> None:
+        # 空白だけの字幕まで書くと、読み込んだ先で何も書いていない字幕が 1 枚として並ぶ
         from sashimono.core.model import TranscriptSegment
 
         blank = Transcript(
@@ -52,11 +55,14 @@ class TestSrt:
         assert to_srt(project_timeline(placed), placed.rate).count("-->") == 1
 
     def test_no_subtitles_gives_an_empty_string(self, project: Project) -> None:
+        # 字幕の無い作品で空のファイルにならないと、読み込んだ先に覚えの無い字幕の行が出る
         assert to_srt(project_timeline(project), project.rate) == ""
 
 
 class TestVtt:
     def test_header_and_period_separator(self, placed: Project) -> None:
+        # WEBVTT の見出しや時刻のピリオドが崩れると、ブラウザの動画再生が VTT として読まず
+        # 字幕が 1 枚も出ない
         vtt = to_vtt(project_timeline(placed), placed.rate)
         assert vtt.startswith("WEBVTT\n")
         assert "00:00:01.000 --> 00:00:03.000" in vtt
@@ -64,11 +70,14 @@ class TestVtt:
 
 class TestText:
     def test_only_the_body_survives(self, placed: Project) -> None:
+        # 文章として書き出したときに番号や時刻が混ざると、文字起こしをそのまま台本や記事に使えない
         assert to_text(project_timeline(placed)) == "今日は\n編集ソフトを\n作ります\n"
 
     def test_line_breaks_inside_a_subtitle_become_spaces(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 2 行に折った字幕が文章の書き出しでも 2 行に割れると、1 行 1 字幕の並びが崩れて
+        # 1 文が別々に見える
         from sashimono.core.model import TranscriptSegment
 
         wrapped = Transcript((TranscriptSegment(Fraction(0), Fraction(2), "上の行\n下の行"),))
@@ -96,6 +105,8 @@ class TestTimestamps:
 
 class TestSaveSubtitles:
     def test_the_extension_decides_the_format(self, placed: Project, tmp_path: Path) -> None:
+        # 選んだ拡張子と中身の形式が食い違うと、.vtt なのに SRT の中身が入り、
+        # 再生ソフトが字幕を読めない
         srt = save_subtitles(placed, tmp_path / "a.srt").read_text(encoding="utf-8")
         assert srt.startswith("1\n")
         assert (
@@ -108,6 +119,8 @@ class TestSaveSubtitles:
         )
 
     def test_an_unknown_extension_falls_back_to_srt(self, placed: Project, tmp_path: Path) -> None:
+        # 拡張子を付け間違えただけで保存に失敗すると、文字起こしの結果を外へ出せない
+        # 読める SRT で書いておけば名前を直すだけで使える
         written = save_subtitles(placed, tmp_path / "a.unknown")
         assert written.read_text(encoding="utf-8").startswith("1\n")
 

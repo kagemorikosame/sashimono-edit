@@ -95,6 +95,8 @@ def _render(project: Project, context: OffscreenGLContext, frame: int) -> np.nda
 
 class TestPicture:
     def test_the_scene_is_drawn_where_it_is_placed(self, gl_context: OffscreenGLContext) -> None:
+        # シーンの中身が描かれないと、シーンにまとめた途端にその場所が
+        # プレビューでも書き出しでも空白になる
         project, _ = _scene_with(
             Project.create(SETTINGS),
             Clip(timeline_start=0, duration=60, source=_shape((1.0, 1.0, 1.0, 1.0))),
@@ -134,6 +136,8 @@ class TestPicture:
 
 class TestSound:
     def test_the_scene_audio_is_mixed(self, sample_av: SampleMedia) -> None:
+        # シーンの中の音を混ぜないと、BGM やナレーションをシーンにまとめた途端に音が消える
+        # 置いた位置より前で鳴ると、シーンの音が映像より早く始まる
         media = probe_media(sample_av.path)
         project = AddMedia(media).apply(Project.create(SETTINGS))
         scene = new_scene(project, "音")
@@ -168,6 +172,7 @@ class TestScripts:
         return "aviutl:試験.anm:寄せる"
 
     def test_a_script_moves_the_scene(self, gl_context: OffscreenGLContext) -> None:
+        # シーンに掛けた AviUtl のスクリプトが効かないと、配布の動きを当てたシーンが止まったまま出る
         identifier = self._moved()
         project, placed = _scene_with(
             Project.create(SETTINGS),
@@ -182,6 +187,8 @@ class TestScripts:
         assert int(image[32, 32, 0]) < 8
 
     def test_a_script_moves_the_framebuffer(self, gl_context: OffscreenGLContext) -> None:
+        # フレームバッファのクリップにスクリプトが効かないと、
+        # 画面全体をずらす配布の効果が何も起こさない
         identifier = self._moved()
         project = Project.create(SETTINGS)
         below = Track(TrackKind.VIDEO, "V0")

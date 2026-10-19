@@ -330,6 +330,7 @@ class TestGradientMapPattern:
     def test_without_a_pattern_the_two_colours_are_used(
         self, draw: Callable[..., np.ndarray]
     ) -> None:
+        # 模様の欄が空のときに 2 色を使わないと、明部の色を赤にしても白い所が赤く染まらない
         mapping = registry.require("gradient_map").create(light_color=(1.0, 0.0, 0.0, 1.0))
         assert colour_at(draw(white_square(), (mapping,)), 100, 100) == "赤"
 
@@ -363,6 +364,7 @@ class TestBorderPattern:
     def test_without_a_pattern_the_colour_is_used(
         self, draw: Callable[..., np.ndarray], tmp_path: Path
     ) -> None:
+        # 模様が無いときに縁色を使わないと、縁取りの色を赤にしても縁が別の色で出る
         border = registry.require("border").create(width=8, color=(1.0, 0.0, 0.0, 1.0))
         assert colour_at(draw(white_square(), (border,)), 100, 154) == "赤"
 
@@ -412,6 +414,8 @@ class TestTheImageStore:
         assert len(reader.calls) == 1
 
     def test_a_rewritten_file_is_read_again_and_the_old_one_released(self, tmp_path: Path) -> None:
+        # 読み直さないと、模様を描き直して保存しても前の模様のまま出る
+        # 古い方を手放さないと、描き直すたびに GPU のメモリが減っていく
         path = solid(tmp_path / "a.png", RED)
         reader = _Reader()
         images = _images(reader)
@@ -501,6 +505,8 @@ class TestTheImageStore:
         assert images.get(str(path)) is None
 
     def test_an_empty_path_means_no_image(self) -> None:
+        # 空の欄をパスとして探すと、模様を付けていない縁取りのたびに
+        # ログへ「画像が見つからない」が書かれる
         reader = _Reader()
         assert _images(reader).get("") is None
         assert reader.calls == []
@@ -538,6 +544,8 @@ class TestWhatToRedraw:
         assert image_spans(project, {"a.png"}).spans == ((0, 10),)
 
     def test_a_scene_that_reads_the_image_drops_where_it_is_placed(self) -> None:
+        # シーンの中の位置で捨てると、シーンを置いた 30 フレーム目からの先読みが残り、
+        # 模様を差し替えてもその場面だけ古い模様が映る
         inner = Timeline(
             rate=RATE, tracks=(Track(kind=TrackKind.VIDEO, clips=(self._clip(0, "a.png"),)),)
         )
@@ -608,6 +616,8 @@ class TestWhatToRedraw:
             renderer.close()
 
     def test_nothing_changed_drops_nothing(self) -> None:
+        # 書き換わっていないのに範囲を返すと、画像の見張りが回るたびに先読みした絵が捨てられ、
+        # プレビューが描き直しで引っかかる
         project = _project(self._clip(0, "a.png"))
         assert not image_spans(project, set())
         assert not image_spans(project, {"別の.png"})

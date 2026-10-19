@@ -81,6 +81,8 @@ class TestSplit:
         ]
 
     def test_keys_only_after_the_cut_move_with_the_second_part(self) -> None:
+        # 後ろのキーを割った位置から数え直さないと、後ろのクリップの動きが割った長さだけ遅れ、
+        # クリップの外へ出て消える
         project, clip = _project(_keys(Keyframe(80, 0.2), Keyframe(110, 0.9)))
         before, after = _pieces(SplitClip(clip.id, START + 60).apply(project))
         assert not before.opacity.is_animated
@@ -88,6 +90,7 @@ class TestSplit:
         assert [k.frame for k in after.opacity.keyframes] == [20, 50]
 
     def test_keys_only_before_the_cut_leave_the_second_part_still(self) -> None:
+        # 前にしか無いキーを後ろへも写すと、後ろのクリップの頭でまた同じ動きが始まる
         project, clip = _project(_keys(Keyframe(0, 0.2), Keyframe(20, 0.9)))
         before, after = _pieces(SplitClip(clip.id, START + 60).apply(project))
         assert [k.frame for k in before.opacity.keyframes] == [0, 20]
@@ -122,6 +125,7 @@ class TestSplit:
         ]
 
     def test_it_can_be_undone(self) -> None:
+        # 取り消しても元の 1 本に戻らないと、キーを入れたクリップを割り間違えたら動きを打ち直す
         project, clip = _project(FADE)
         document = Document(project)
         document.execute(SplitClip(clip.id, START + 50))

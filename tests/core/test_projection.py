@@ -66,11 +66,15 @@ class TestBasicProjection:
     def test_media_without_transcript_yields_nothing(
         self, project: Project, video_media: MediaItem
     ) -> None:
+        # 文字起こし前の素材でつまずくと、まだ字幕を作っていない動画を置いただけで
+        # 字幕パネルと字幕の書き出しが働かなくなる
         track = project.timeline.tracks[0]
         placed = AddClip(track.id, make_clip(0, 300, video_media)).apply(project)
         assert list(project_timeline(placed)) == []
 
     def test_generated_clip_without_media_is_skipped(self, project: Project) -> None:
+        # 素材を持たないテロップや図形のクリップで素材を探しに行くと、テキストを 1 枚
+        # 置いただけで字幕パネルと字幕の書き出しが止まる
         track = project.timeline.tracks[0]
         text_clip = Clip(timeline_start=0, duration=60, media_id=None)
         placed = AddClip(track.id, text_clip).apply(project)
@@ -79,6 +83,8 @@ class TestBasicProjection:
 
 class TestFollowsEditing:
     def test_moving_the_clip_moves_the_subtitles(self, project_with_subtitles: Project) -> None:
+        # 字幕がクリップの位置を追わないと、動画を後ろへずらしても字幕だけ元の時刻に残り、
+        # 話す前に字幕が出る
         clip = project_with_subtitles.timeline.tracks[0].clips[0]
         moved = MoveClip(clip.id, 600).apply(project_with_subtitles)
         assert _texts_with_bounds(moved) == [
@@ -149,6 +155,7 @@ class TestSpeed:
     def test_double_speed_halves_the_spacing(
         self, project: Project, video_media: MediaItem, transcript: Transcript
     ) -> None:
+        # 倍速で字幕の間隔が詰まらないと、早回しした所で字幕が声よりどんどん遅れて出る
         with_transcript = SetTranscript(video_media.id, transcript).apply(project)
         track = with_transcript.timeline.tracks[0]
         fast = Clip(timeline_start=0, duration=150, media_id=video_media.id, speed=Fraction(2))
@@ -163,6 +170,7 @@ class TestSpeed:
     def test_half_speed_doubles_the_spacing(
         self, project: Project, video_media: MediaItem, transcript: Transcript
     ) -> None:
+        # スローで字幕の間隔が伸びないと、字幕が声より先に進み、後ろの字幕ほど話す前に出る
         with_transcript = SetTranscript(video_media.id, transcript).apply(project)
         track = with_transcript.timeline.tracks[0]
         # 半速では 10 秒の素材が 20 秒（600 フレーム）になる
@@ -192,6 +200,7 @@ class TestReuse:
     def test_editing_the_transcript_updates_every_occurrence(
         self, project: Project, video_media: MediaItem, transcript: Transcript
     ) -> None:
+        # 使い回した片方だけが直ると、誤字を直したのに 2 回目の場面では古い文字が焼き込まれる
         with_transcript = SetTranscript(video_media.id, transcript).apply(project)
         track = with_transcript.timeline.tracks[0]
         placed = AddClip(track.id, make_clip(0, 300, video_media)).apply(with_transcript)
@@ -207,6 +216,8 @@ class TestReuse:
     def test_projection_is_sorted_across_tracks(
         self, project: Project, video_media: MediaItem, transcript: Transcript
     ) -> None:
+        # トラックの順のまま返すと、AI に渡す字幕の一覧が時刻順にならず、
+        # 通し番号の offset で続きを読んだ AI が字幕を読み飛ばす
         with_transcript = SetTranscript(video_media.id, transcript).apply(project)
         second = Track(kind=TrackKind.VIDEO, name="V2")
         with_track = AddTrack(second).apply(with_transcript)

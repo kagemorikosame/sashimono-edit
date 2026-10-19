@@ -55,6 +55,7 @@ def at(peaks: int) -> Fraction:
 
 class TestDetectSilence:
     def test_a_quiet_stretch_between_speech_is_found(self) -> None:
+        # 話の間の無音を見つけ損ねると、無音を詰めても間が残り、境目がずれると話の頭や終わりが削れる
         waveform = make_waveform([(0.5, 200), (0.0, 400), (0.5, 200)])
         options = SilenceOptions(padding=Fraction(0))
         assert detect_silence(waveform, options) == ((at(200), at(600)),)
@@ -80,6 +81,7 @@ class TestDetectSilence:
         assert detect_silence(waveform, loose) == ((at(200), at(600)),)
 
     def test_silence_at_the_head_and_tail_is_found(self) -> None:
+        # 頭と終わりの無音を落とすと、録画を始めてから話し出すまでの間が詰められずに残る
         waveform = make_waveform([(0.0, 200), (0.5, 200), (0.0, 200)])
         options = SilenceOptions(padding=Fraction(0))
         assert detect_silence(waveform, options) == ((at(0), at(200)), (at(400), at(600)))
@@ -97,6 +99,8 @@ class TestDetectSilence:
         assert detect_silence(waveform, SilenceOptions(padding=Fraction(0))) == ()
 
     def test_short_speech_islands_can_be_absorbed(self) -> None:
+        # 既定でまとめると間の短い一言まで切り落とし、指定してもまとめないと
+        # 咳払いを挟んだ長い間が 2 つに割れて残る
         waveform = make_waveform([(0.0, 200), (0.5, 20), (0.0, 200)])
         # 既定では残す 舌打ち 1 つのために発話を消す方が事故になる
         keep = SilenceOptions(padding=Fraction(0))
@@ -106,6 +110,7 @@ class TestDetectSilence:
         assert detect_silence(waveform, absorb) == ((at(0), at(420)),)
 
     def test_an_empty_waveform_yields_nothing(self) -> None:
+        # 長さ 0 の波形でつまずくと、音の無い素材を選んで無音を探しただけで操作が止まる
         empty = Waveform(
             sample_rate=SAMPLE_RATE,
             channels=1,
@@ -115,6 +120,8 @@ class TestDetectSilence:
         assert detect_silence(empty) == ()
 
     def test_invalid_options_are_rejected(self) -> None:
+        # 最短無音長 0 を黙って受けると、言葉の間のほんの一瞬まで切る指示になり、
+        # 話が細切れに詰められる
         with pytest.raises(ValueError, match="最短無音長"):
             SilenceOptions(min_silence=Fraction(0))
 
@@ -129,16 +136,20 @@ class TestKeepSpeech:
         assert kept == ()
 
     def test_a_range_around_speech_is_split_in_two(self) -> None:
+        # 発話を避けて 2 つに割らないと、無音の中の小さな一言ごと切るか、前後の無音も詰めずに残す
         transcript = Transcript((TranscriptSegment(Fraction(2), Fraction(3), "喋り"),))
         kept = keep_speech(((Fraction(0), Fraction(5)),), transcript, margin=Fraction(0))
         assert kept == ((Fraction(0), Fraction(2)), (Fraction(3), Fraction(5)))
 
     def test_the_margin_widens_what_is_protected(self) -> None:
+        # 余白を広げないと、文字起こしの時刻ぎりぎりで切り、話の頭と終わりの音が欠ける
         transcript = Transcript((TranscriptSegment(Fraction(2), Fraction(3), "喋り"),))
         kept = keep_speech(((Fraction(0), Fraction(5)),), transcript, margin=Fraction(1, 2))
         assert kept == ((Fraction(0), Fraction(3, 2)), (Fraction(7, 2), Fraction(5)))
 
     def test_an_empty_transcript_changes_nothing(self) -> None:
+        # 文字起こしが無いのに範囲を減らすと、まだ文字起こししていない動画では
+        # 無音を詰めても何も切れない
         ranges = ((Fraction(0), Fraction(1)),)
         assert keep_speech(ranges, Transcript()) == ranges
 

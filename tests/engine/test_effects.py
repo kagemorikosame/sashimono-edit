@@ -108,6 +108,7 @@ def lit_pixels(image: np.ndarray, threshold: int = 20) -> int:
 
 class TestParameterSpecs:
     def test_track_clamps_out_of_range(self) -> None:
+        # 範囲外の値をそのまま通すと、読み込んだエイリアスの値がスライダーの端を越えて効く
         spec = TrackSpec("radius", "範囲", 0, 100, 10)
         assert spec.coerce(500).static == 100
         assert spec.coerce(-5).static == 0
@@ -119,10 +120,12 @@ class TestParameterSpecs:
         assert spec.coerce(animated) is animated
 
     def test_track_rejects_bad_definition(self) -> None:
+        # 既定値が範囲外の定義を通すと、足した直後のエフェクトの値がスライダーで表せない所に置かれる
         with pytest.raises(ValueError, match="既定値が範囲外"):
             TrackSpec("x", "X", 0, 10, 50)
 
     def test_color_pads_missing_alpha(self) -> None:
+        # RGB だけで書かれた色の不透明度を 1 で補わないと、読み込んだ縁取りや影の色が透けて消える
         spec = ColorSpec("color", "色")
         assert spec.coerce((1.0, 0.5, 0.0)) == (1.0, 0.5, 0.0, 1.0)
 
@@ -148,14 +151,17 @@ class TestRegistry:
                 assert definition.parameters, f"{definition.kind}: パラメータが無い"
 
     def test_defaults_round_trip_through_normalize(self) -> None:
+        # 既定値が整え直しで変わると、足したばかりのエフェクトが保存して開き直すと別の値になる
         for definition in registry.all():
             params = definition.default_params()
             assert definition.normalize(params) == params
 
     def test_unknown_effect_is_not_an_error(self) -> None:
+        # 知らない種類で例外になると、入っていないエフェクトを含むプロジェクトの描画が止まる
         assert registry.get("存在しない") is None
 
     def test_duplicate_registration_is_refused(self) -> None:
+        # 同じ名前の自前エフェクトを黙って上書きすると、どちらの定義が効いているのか分からなくなる
         with pytest.raises(ValueError, match="すでに登録"):
             registry.register(registry.require("blur"))
 
@@ -183,12 +189,14 @@ class TestShaders:
 
 class TestColorEffect:
     def test_brightness(self, draw: Callable[..., np.ndarray]) -> None:
+        # 明るさが効かないと、色調補正の明るさのスライダーを動かしても映像が明るくならない
         grey = SHAPE.create(shape="rect", width=180, height=180, color=(0.5, 0.5, 0.5, 1.0))
         plain = draw(grey)
         brighter = draw(grey, (registry.require("color").create(brightness=50),))
         assert centre(brighter)[0] > centre(plain)[0]
 
     def test_saturation_to_zero_makes_grey(self, draw: Callable[..., np.ndarray]) -> None:
+        # 彩度を下げきっても色が残ると、白黒にしたつもりの映像に色かぶりが残る
         red = SHAPE.create(shape="rect", width=180, height=180, color=(1.0, 0.2, 0.2, 1.0))
         desaturated = draw(red, (registry.require("color").create(saturation=-100),))
         r, g, b = centre(desaturated)
@@ -196,6 +204,7 @@ class TestColorEffect:
         assert abs(g - b) <= 2
 
     def test_defaults_change_nothing(self, draw: Callable[..., np.ndarray]) -> None:
+        # 既定のままで絵が変わると、色調補正を足しただけで何も触っていない映像の色がずれる
         square = white_square()
         assert np.array_equal(draw(square), draw(square, (registry.require("color").create(),)))
 
@@ -216,6 +225,7 @@ class TestColorEffect:
 
 class TestGeometryEffects:
     def test_transform_moves_the_image(self, draw: Callable[..., np.ndarray]) -> None:
+        # 位置 X が効かないか向きが逆だと、変形で右へずらしたクリップが中央に残るか左へ動く
         square = white_square(60)
         moved = draw(square, (registry.require("transform").create(pos_x=60),))
         # 中央は空き、右へずれた位置に現れる
@@ -264,12 +274,14 @@ class TestGeometryEffects:
         assert np.abs(lit.astype(int) - lit[::-1].astype(int)).sum() < 40
 
     def test_transform_scale(self, draw: Callable[..., np.ndarray]) -> None:
+        # 拡大率が縦横の両方に効かないと、200% にした物が倍の大きさにならない
         square = white_square(60)
         plain = lit_pixels(draw(square))
         doubled = lit_pixels(draw(square, (registry.require("transform").create(scale=200),)))
         assert doubled == pytest.approx(plain * 4, rel=0.15)
 
     def test_crop_cuts_the_edges(self, draw: Callable[..., np.ndarray]) -> None:
+        # 端を切っても残ると、クリッピングで隠したはずの所が書き出しに映る
         square = white_square(180)
         cropped = draw(square, (registry.require("crop").create(top=80, bottom=80),))
         assert cropped[HEIGHT // 2, WIDTH // 2, 0] > 200
@@ -296,6 +308,7 @@ class TestGeometryEffects:
         assert (int(columns.min()), int(columns.max())) == (70, 109)
 
     def test_mask_hides_the_outside(self, draw: Callable[..., np.ndarray]) -> None:
+        # マスクの外が残ると、丸く切り抜いたつもりの絵の外側が下のトラックを隠したままになる
         square = white_square(180)
         masked = draw(
             square,
@@ -305,6 +318,7 @@ class TestGeometryEffects:
         assert masked[HEIGHT // 2, 20, 0] < 20
 
     def test_mask_centre_moves_up_for_a_positive_y(self, draw: Callable[..., np.ndarray]) -> None:
+        # Y の向きが変形と逆だと、マスクの中心を上へ動かしたつもりが下へ動く
         big = white_square(180)
         masked = draw(
             big,
@@ -318,6 +332,7 @@ class TestGeometryEffects:
         assert masked[HEIGHT // 2 + 60, WIDTH // 2, 0] < 20
 
     def test_mask_invert(self, draw: Callable[..., np.ndarray]) -> None:
+        # 反転が効かないと、中をくり抜くつもりのマスクが普通のマスクと同じ絵になる
         square = white_square(180)
         masked = draw(
             square,
@@ -333,6 +348,7 @@ class TestGeometryEffects:
 
 class TestBlurEffects:
     def test_blur_softens_the_edge(self, draw: Callable[..., np.ndarray]) -> None:
+        # 縁がにじまないと、ぼかしを掛けたクリップがくっきりしたまま書き出される
         square = white_square(80)
         sharp = draw(square)
         blurred = draw(square, (registry.require("blur").create(radius=12),))
@@ -354,6 +370,7 @@ class TestBlurEffects:
         assert int(np.abs(lit[:, 0].astype(int) - lit[:, 2].astype(int)).max()) <= 3
 
     def test_glow_brightens_around_the_shape(self, draw: Callable[..., np.ndarray]) -> None:
+        # 図形の周りが明るくならないと、発光を掛けても何も光らない
         square = white_square(60)
         plain = draw(square)
         glowing = draw(
@@ -365,11 +382,13 @@ class TestBlurEffects:
         assert glowing[outside][0] > plain[outside][0]
 
     def test_sharpen_keeps_flat_areas_flat(self, draw: Callable[..., np.ndarray]) -> None:
+        # 平らな面まで削ると、シャープを強めた白い面の中ほどが灰色に沈む
         square = white_square(120)
         sharpened = draw(square, (registry.require("sharpen").create(strength=200),))
         assert centre(sharpened)[0] > 200
 
     def test_mosaic_makes_uniform_blocks(self, draw: Callable[..., np.ndarray]) -> None:
+        # ブロックの中が揃わないと、モザイクを掛けた顔や文字の輪郭がうっすら読めてしまう
         square = white_square(101)
         blocky = draw(square, (registry.require("mosaic").create(size=40),))
         # 縁がブロックの境界に揃うので、中間の値がほとんど無くなる
@@ -380,6 +399,7 @@ class TestBlurEffects:
 
 class TestDecorationEffects:
     def test_border_surrounds_the_shape(self, draw: Callable[..., np.ndarray]) -> None:
+        # 縁が外に出ないか中身まで塗ると、縁取りした図形の縁が見えないか、赤一色の塊になる
         square = white_square(60)
         bordered = draw(
             square,
@@ -586,11 +606,13 @@ class TestDecorationEffects:
     def test_gradient_strength_blends_with_the_original(
         self, draw: Callable[..., np.ndarray]
     ) -> None:
+        # 強さ 0 でも色が変わると、グラデーションを弱めきったはずのクリップに色が残る
         square = white_square(120)
         none = draw(square, (registry.require("gradient").create(strength=0),))
         assert centre(none)[0] > 240, "強さ 0 で色が変わっている"
 
     def test_noise_varies_over_time(self, draw: Callable[..., np.ndarray]) -> None:
+        # 動かす指定のノイズが毎フレーム同じだと、ざらつきが画面に張り付いた汚れに見える
         square = white_square(120)
         effect = registry.require("noise").create(strength=60, animate=True)
         assert not np.array_equal(
@@ -598,6 +620,7 @@ class TestDecorationEffects:
         )
 
     def test_static_noise_is_stable(self, draw: Callable[..., np.ndarray]) -> None:
+        # 止める指定のノイズがフレームごとに変わると、止まった質感のつもりがちらついて見える
         square = white_square(120)
         effect = registry.require("noise").create(strength=60, animate=False)
         assert np.array_equal(draw(square, (effect,), frame=0), draw(square, (effect,), frame=7))
@@ -723,6 +746,7 @@ class TestEmboss:
 
 class TestChromaKey:
     def test_removes_the_key_colour(self, draw: Callable[..., np.ndarray]) -> None:
+        # キーの色が抜けないと、緑の背景で撮った素材の背景が残り、下の映像と合成できない
         green = SHAPE.create(shape="rect", width=180, height=180, color=(0.0, 1.0, 0.0, 1.0))
         keyed = draw(
             green,
@@ -735,6 +759,7 @@ class TestChromaKey:
         assert centre(keyed)[1] < 30, "緑が抜けていない"
 
     def test_keeps_other_colours(self, draw: Callable[..., np.ndarray]) -> None:
+        # キーと離れた色まで抜けると、人物や服が透けて下の映像が見える
         red = SHAPE.create(shape="rect", width=180, height=180, color=(1.0, 0.0, 0.0, 1.0))
         keyed = draw(
             red,
@@ -767,6 +792,7 @@ class TestKeyframes:
         assert at_end[HEIGHT // 2, WIDTH // 2 + 60, 0] > 200
 
     def test_source_parameters_animate(self, draw: Callable[..., np.ndarray]) -> None:
+        # 生成オブジェクトの値にキーフレームが効かないと、図形を広げる動きが大きさに出ない
         growing = GeneratedSource(
             kind="shape",
             params={
@@ -784,16 +810,19 @@ class TestKeyframes:
 
 class TestSources:
     def test_text_draws_something(self) -> None:
+        # かなや漢字を描けないと、日本語の字幕が空白のまま書き出される
         image = render_source(TEXT.create(text="あア亜A", size=48), WIDTH, HEIGHT)
         assert image is not None
         assert int((image[..., 3] > 0).sum()) > 0
 
     def test_empty_text_draws_nothing(self) -> None:
+        # 空のテキストが透明にならないと、文字を消したテキストのクリップが下の映像の上に何かを残す
         image = render_source(TEXT.create(text=""), WIDTH, HEIGHT)
         assert image is not None
         assert int((image[..., 3] > 0).sum()) == 0
 
     def test_text_border_widens_the_glyphs(self) -> None:
+        # 縁取りの幅で字が太らないと、字幕の縁取りが付かず明るい背景の上で読めない
         plain = render_source(TEXT.create(text="あ", size=64, border_width=0), WIDTH, HEIGHT)
         outlined = render_source(TEXT.create(text="あ", size=64, border_width=6), WIDTH, HEIGHT)
         assert plain is not None
@@ -802,11 +831,13 @@ class TestSources:
 
     @pytest.mark.parametrize("shape", ["rect", "rounded", "ellipse", "triangle", "star"])
     def test_every_shape_draws(self, shape: str) -> None:
+        # どれかの形が描けないと、その形を選んだ図形のクリップが空白になる
         image = render_source(SHAPE.create(shape=shape, width=120, height=120), WIDTH, HEIGHT)
         assert image is not None
         assert int((image[..., 3] > 0).sum()) > 0
 
     def test_shape_size_is_respected(self) -> None:
+        # 幅と高さが大きさに効かないと、図形の大きさを変えても画面での大きさが合わない
         small = render_source(SHAPE.create(shape="rect", width=40, height=40), WIDTH, HEIGHT)
         large = render_source(SHAPE.create(shape="rect", width=80, height=80), WIDTH, HEIGHT)
         assert small is not None
@@ -816,6 +847,7 @@ class TestSources:
         )
 
     def test_unknown_source(self) -> None:
+        # 知らない種類で例外になると、そのクリップを含む作品の描画が止まる 今はそれだけ描かない
         assert render_source(GeneratedSource(kind="なにか"), WIDTH, HEIGHT) is None
 
     def test_image_has_no_row_padding(self) -> None:
@@ -825,6 +857,7 @@ class TestSources:
         assert image.shape == (51, 101, 4)
 
     def test_registry(self) -> None:
+        # テキストと図形が棚に無いと、字幕と図形のクリップがすべて空白になる
         assert "text" in source_registry
         assert "shape" in source_registry
         assert source_registry.get("なにか") is None
@@ -832,6 +865,7 @@ class TestSources:
 
 class TestColourConversion:
     def test_srgb_to_linear(self) -> None:
+        # 黒と白の端がずれると、色を指定した影や縁取りの黒が灰色に浮き、白がくすむ
         assert srgb_to_linear(0.0) == 0.0
         assert srgb_to_linear(1.0) == pytest.approx(1.0)
         # sRGB の中間 (0.5) はリニアでは 0.21 前後 ここを取り違えると、
@@ -841,6 +875,7 @@ class TestColourConversion:
 
 class TestBlendModes:
     def test_add_is_brighter_than_normal(self, gl: OffscreenGLContext) -> None:
+        # 加算が通常と同じ明るさになると、光の素材を加算で重ねても明るくならない
         project = Project.create(
             ProjectSettings(width=WIDTH, height=HEIGHT, frame_rate=FrameRate(30))
         )

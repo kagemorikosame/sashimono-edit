@@ -61,6 +61,8 @@ def _fill(cache: FrameCache, *frames: int) -> None:
 
 class TestHowManyFit:
     def test_the_budget_decides_the_count(self) -> None:
+        # 設定した先読みのメモリと貯める枚数が合わないと、GPU のメモリを食い過ぎるか、余裕があるのに
+        # 先読みが短くなる
         cache, _ = _cache(4)
         assert cache.capacity == 4
 
@@ -81,6 +83,7 @@ class TestHowManyFit:
 
 class TestKeepingWhatIsNear:
     def test_a_stored_frame_comes_back(self) -> None:
+        # 先読みした絵を取り出せないと、貯めたのに毎回描き直し、プレビューの再生が滑らかにならない
         cache, _ = _cache(4)
         surface = cache.store(7, lambda target: None)
         assert surface is not None
@@ -145,6 +148,7 @@ class TestWhenDrawingFails:
         assert cache.cached == frozenset()
 
     def test_the_surface_comes_back_for_the_next_try(self) -> None:
+        # 描けなかった枠が使い回されないと、失敗のたびに新しい枠を確保し、GPU のメモリを余分に取る
         cache, factory = _cache(2)
 
         def explode(surface: CacheSurface) -> None:
@@ -165,12 +169,14 @@ class TestThrowingAway:
         assert cache.cached == {0, 1}
 
     def test_everything_goes_when_asked(self) -> None:
+        # 作品全体に掛かる変更のあとも古い絵が残ると、再生したときに直す前の見た目が混ざる
         cache, _ = _cache(5)
         _fill(cache, 0, 1, 10)
         assert cache.invalidate(Invalidation.all()) == 3
         assert cache.cached == frozenset()
 
     def test_nothing_to_throw_away_touches_nothing(self) -> None:
+        # 絵に関わらない操作のたびに先読みが捨てられると、貯めた絵を一から描き直して再生がもたつく
         cache, _ = _cache(5)
         _fill(cache, 0, 1)
         assert cache.invalidate(Invalidation.nothing()) == 0
@@ -197,6 +203,8 @@ class TestThrowingAway:
 
 class TestChangingTheBudget:
     def test_shrinking_drops_the_far_ones(self) -> None:
+        # 先読みのメモリを減らしたときに再生ヘッドのすぐ先の絵が捨てられると、
+        # 再生のすぐ先で描き直しになる
         cache, _ = _cache(4)
         cache.set_playhead(0)
         _fill(cache, 0, 1, 2, 3)
@@ -213,6 +221,7 @@ class TestChangingTheBudget:
         assert all(surface.released for surface in factory.made)
 
     def test_growing_keeps_what_is_there(self) -> None:
+        # 先読みのメモリを増やしただけで貯めた絵が捨てられると、描き直しで再生がもたつく
         cache, _ = _cache(2)
         _fill(cache, 0, 1)
         cache.set_budget(ONE_FRAME * 4)
@@ -240,6 +249,7 @@ class TestWhenTheGpuRunsOut:
             return super().__call__(width, height)
 
     def test_it_stops_at_what_it_could_take(self) -> None:
+        # GPU のメモリが足りない機械で取れた分で止まらないと、毎コマ確保を試して失敗し続ける
         cache, _ = _cache(8, factory=self.Stingy(3))
         _fill(cache, 0, 1, 2, 3)
         assert cache.cached == {0, 1, 2}

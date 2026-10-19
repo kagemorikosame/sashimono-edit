@@ -119,6 +119,8 @@ class TestALongEcho:
         return _project(path, "audio_delay", time=2000, feedback=90, mix=100)
 
     def test_every_audible_repeat_is_counted(self) -> None:
+        # 数え足りないと、繰り返しの多いやまびこがまだ聞こえる所で急に途切れ、
+        # 書き出した動画の残響がぶつりと切れる
         from sashimono.effects.audio import _delay_repeats
 
         # 量 100%・繰り返し 90% は 66 回目まで -60 dB より大きい
@@ -127,6 +129,8 @@ class TestALongEcho:
         assert _delay_repeats({"time": 250, "feedback": 0, "mix": 50}) == 1
 
     def test_the_echo_after_ten_seconds_is_still_heard(self, far: Project) -> None:
+        # 前の音を 10 秒で切って読むと、2000ms・90% のやまびこが 12 秒後のまだ大きい所で
+        # 消える
         mixer = AudioMixer(far)
         try:
             first = float(mixer.render(0, 16)[0, 0])
@@ -160,6 +164,8 @@ class TestTheTapeGrowsAsNeeded:
     """
 
     def test_the_head_of_a_long_echo_takes_little(self, tmp_path: Path) -> None:
+        # 最も長い読み戻しの分を最初から取ると、クリップの頭を少し鳴らしただけで 1 本
+        # 100 MB ほどのメモリを持ち、長いやまびこを何本も使う作品で重くなる
         samples = np.zeros(RATE * 3, dtype=np.float32)
         samples[0] = 0.5
         project = _project(
@@ -176,6 +182,8 @@ class TestTheTapeGrowsAsNeeded:
         assert 0 < taken < 4 * 1024 * 1024
 
     def test_it_reads_back_what_was_written(self) -> None:
+        # 輪の回り込みで並びが崩れると、続けて再生している間に前の音が入れ替わって読まれ、
+        # やまびこやリバーブに無かった音が混じる
         from sashimono.engine.audio.mixer import _Tape
 
         rng = np.random.default_rng(7)
@@ -200,6 +208,8 @@ class TestTheTapeGrowsAsNeeded:
         assert tape.capacity > first
 
     def test_it_shrinks_when_far_less_is_kept(self) -> None:
+        # 残す量が減っても大きいまま持つと、長いやまびこを鳴らし終えた後も
+        # そのクリップの分のメモリが空かない
         from sashimono.engine.audio.mixer import _TAPE_SLACK, _Tape
 
         tape = _Tape(0, np.zeros((_TAPE_SLACK * 10, 2), dtype=np.float32))
@@ -235,6 +245,8 @@ class TestEditingInsideAPlacedScene:
         return project.with_timeline(replace(project.timeline, tracks=(placed,))), scene.id
 
     def test_emptying_the_scene_silences_it(self, tmp_path: Path) -> None:
+        # シーンの中を直しても前に作った音を使うと、リバーブを掛けたシーンの中の音を
+        # 消しても、消す前の音が鳴り続ける
         project, scene_id = self._placed(tmp_path)
         mixer = AudioMixer(project)
         try:
@@ -251,6 +263,8 @@ class TestEditingInsideAPlacedScene:
             mixer.close()
 
     def test_unrelated_edits_keep_what_was_made(self, tmp_path: Path) -> None:
+        # 関係の無い編集のたびに作り直すと、リバーブを掛けたシーンのある作品で編集する
+        # たびに前の音を読み直し、再生が間に合わず途切れる
         project, _ = self._placed(tmp_path)
         mixer = AudioMixer(project)
         try:
@@ -285,6 +299,8 @@ class TestTheTapesShareABudget:
     def test_the_oldest_goes_and_the_sound_stays(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 上限を越えても捨てないとメモリが増え続け、捨てた後に読み直せないと、
+        # 捨てたクリップのリバーブが途中から変わって聞こえる
         from sashimono.engine.audio import mixer as module
 
         project = self._two_clips(tmp_path)
@@ -301,6 +317,8 @@ class TestTheTapesShareABudget:
         assert np.allclose(np.concatenate(parts)[:, 0], roomy, atol=1e-6)
 
     def test_both_stay_when_they_fit(self, tmp_path: Path) -> None:
+        # 上限に余裕があるのに捨てると、2 本のクリップを行き来するたびに前の音を
+        # 頭から読み直し、再生が間に合わず音が途切れる
         mixer = AudioMixer(self._two_clips(tmp_path))
         try:
             mixer.render(0, RATE // 2)
@@ -350,6 +368,8 @@ class TestMovingValuesOfAnEcho:
         return out / level - 1.0
 
     def test_the_mix_follows_the_keyframes_inside_a_window(self, tmp_path: Path) -> None:
+        # 区切りの頭の値しか使わないと、やまびこの量をキーフレームで上げたときに
+        # 0.34 秒ごとの段になって聞こえる
         project = self._rising(tmp_path)
         times = np.arange(RATE) / RATE
         part = slice(int(RATE * 0.15), int(RATE * 0.95))
@@ -360,6 +380,8 @@ class TestMovingValuesOfAnEcho:
         assert np.abs(stepped[part] - times[part]).max() > 0.2
 
     def test_small_blocks_hear_the_same_when_smooth(self, tmp_path: Path) -> None:
+        # つなぐ設定で塊の大きさにより値が変わると、プレビュー（1024 サンプルずつ）と
+        # 書き出した動画で、動くやまびこの量が違って聞こえる
         project = self._rising(tmp_path)
         whole = AudioMixer(project, smooth_history=True)
         blocks = AudioMixer(project, smooth_history=True)
@@ -393,6 +415,8 @@ def test_the_reverb_of_the_kept_part_is_the_same_either_way() -> None:
 
 class TestReverb:
     def test_it_leaves_a_tail(self, tmp_path: Path) -> None:
+        # 響きが残らなければリバーブを掛けても何も変わらず、消えなければ音の止んだ後も
+        # ずっと鳴り続ける
         project = _project(_click(tmp_path), "audio_reverb", decay=0.5, mix=50)
         out = _render(project, RATE)
         tail = np.abs(out[RATE // 20 : RATE // 4])
@@ -401,10 +425,14 @@ class TestReverb:
         assert np.abs(out[int(RATE * 0.6) :]).max() < 1e-3
 
     def test_small_blocks_hear_the_same(self, tmp_path: Path) -> None:
+        # 塊の頭より前の音を読めないと、プレビューでは 1024 サンプルごとにリバーブの響きが
+        # 途切れ、書き出した動画とも違って聞こえる
         project = _project(_click(tmp_path), "audio_reverb", decay=0.5, mix=50)
         assert np.allclose(_render(project, 1024), _render(project, RATE), atol=1e-4)
 
     def test_nothing_changes_at_zero(self, tmp_path: Path) -> None:
+        # 量 0 でも音が変わると、リバーブを付けて量を 0 にしただけのクリップの音色が
+        # 知らないうちに変わる
         plain = _project(_click(tmp_path), "audio_volume")
         dry = _project(_click(tmp_path), "audio_reverb", mix=0)
         assert np.allclose(_render(plain, RATE), _render(dry, RATE))
@@ -425,10 +453,14 @@ class TestPitch:
         assert _peak_frequency(out) == pytest.approx(880.0, abs=6.0)
 
     def test_down_as_well(self, tmp_path: Path) -> None:
+        # 下げる向きだけ壊れると、声を低くする調整で音程が変わらないか、
+        # 狙いと別の高さになる
         project = _project(_sine(tmp_path), "audio_pitch", semitones=-12)
         assert _peak_frequency(_render(project, RATE)) == pytest.approx(220.0, abs=6.0)
 
     def test_small_blocks_hear_the_same(self, tmp_path: Path) -> None:
+        # 音程の調整が塊の切れ目でつながらないと、プレビューでは 1024 サンプルごとに
+        # プツプツ鳴り、書き出した動画とも違う音になる
         project = _project(_sine(tmp_path), "audio_pitch", semitones=5)
         assert np.allclose(_render(project, 1024), _render(project, RATE), atol=1e-4)
 
@@ -480,6 +512,8 @@ class TestPlaybackBlocks:
     def test_small_blocks_match_one_long_render(
         self, voice: Path, kind: str, values: dict[str, float]
     ) -> None:
+        # 実際の声の素材で塊ごとの音がずれると、再生中のリバーブ・やまびこ・音程の調整が
+        # 塊の境目で段差になって途切れて聞こえる
         project = _project(voice, kind, **values)
         whole_mixer = AudioMixer(project)
         whole = whole_mixer.render(RATE, RATE * 2)[:, 0]
@@ -522,6 +556,8 @@ class TestTheCacheIsLetGo:
     """
 
     def test_a_removed_clip_is_forgotten(self, tmp_path: Path) -> None:
+        # 消したクリップの分を捨てないと、長い編集で消すたびに 1 本 4 MB ほどずつ
+        # メモリが増え続ける
         project = _project(_click(tmp_path), "audio_reverb")
         mixer = AudioMixer(project)
         try:
@@ -537,6 +573,8 @@ class TestTheCacheIsLetGo:
             mixer.close()
 
     def test_closing_lets_it_all_go(self, tmp_path: Path) -> None:
+        # 閉じても手放さないと、再生や書き出しを終えた後もリバーブの前の音の分の
+        # メモリが残る
         mixer = AudioMixer(_project(_click(tmp_path), "audio_reverb"))
         mixer.render(0, RATE // 2)
         mixer.close()

@@ -29,6 +29,7 @@ def _written(path: Path, version: int) -> str:
 
 class TestThePreUpgradeCopy:
     def test_an_older_file_is_copied_beside(self, tmp_path: Path) -> None:
+        # 写しが残らないと、更新の後で前の版へ戻した人は上書き保存した作品をどの版でも開けなくなる
         path = tmp_path / "作品.sme"
         text = _written(path, FORMAT_VERSION - 1)
         copy = keep_pre_upgrade_copy(path)
@@ -51,6 +52,8 @@ class TestThePreUpgradeCopy:
         assert sorted(p.name for p in tmp_path.iterdir()) == ["作品.sme"]
 
     def test_missing_or_broken_files_are_left_alone(self, tmp_path: Path) -> None:
+        # 読めない中身で例外が漏れると、壊れた作品の名前へ上書き保存するときに保存ごと止まり
+        # いまの作業を失う
         assert keep_pre_upgrade_copy(tmp_path / "無い.sme") is None
         broken = tmp_path / "壊れた.sme"
         broken.write_text("{", encoding="utf-8")

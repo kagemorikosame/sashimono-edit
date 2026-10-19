@@ -223,6 +223,7 @@ class TestAPreviewAtLowerQualityIsTheExportShrunk:
     def test_a_region_mosaic(
         self, gl_context: OffscreenGLContext, checker: MediaItem, divisor: int
     ) -> None:
+        # モザイクの範囲と升目の大きさを縮め忘れると、軽いプレビューでだけ顔を隠す枠がずれて粗くなる
         mosaic = _effect(
             REGION_BLUR,
             mode="mosaic",
@@ -259,6 +260,8 @@ class TestAPreviewAtLowerQualityIsTheExportShrunk:
         assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE / 5
 
     def test_a_shadow_and_a_border(self, gl_context: OffscreenGLContext, divisor: int) -> None:
+        # 影の距離や縁取りの太さを縮め忘れると、軽いプレビューでだけ影が遠く縁が太く見え、
+        # 書き出しと違う絵になる
         clip = _source(
             "shape",
             _effect("border", width=8, color=(1.0, 0.0, 0.0, 1.0)),
@@ -306,6 +309,7 @@ class TestAPreviewAtLowerQualityIsTheExportShrunk:
     def test_text_moved_by_the_placement(
         self, gl_context: OffscreenGLContext, divisor: int
     ) -> None:
+        # 配置の X・Y を縮め忘れると、軽いプレビューでだけテロップが 2 倍・4 倍離れた所に出る
         clip = _placed(_source("text", text="字", size=64), pos_x=-64, pos_y=32, scale=150)
         assert _mismatch(_project(clip), gl_context, divisor) < TOLERANCE
 
