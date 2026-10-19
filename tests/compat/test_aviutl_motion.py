@@ -220,7 +220,19 @@ X=0.00
 
     def test_a_missing_speed_means_normal(self) -> None:
         # 再生速度の書かれていない動画が 1 倍以外で再生されるか、素材の頭から始まらない
-        item, _ = _mapped("X=0")
+        # テキストは速度を読まないので、動画ファイルの中身で再生速度と再生位置を省く
+        # （#384 の CodeRabbit） テキストのままでは、動画の既定が崩れても既定の 1 倍で通る
+        body = """[Object]
+frame=0,59
+[Object.0]
+effect.name=動画ファイル
+ファイル=D:/録画先/a.mp4
+[Object.1]
+effect.name=映像再生
+X=0.00
+"""
+        item = map_object(parse_exo(body).objects[0], RATE, report=CompatibilityReport())
+        assert item is not None
         assert item.clip.speed == Fraction(1)
         assert item.clip.source_in == Fraction(0)
 

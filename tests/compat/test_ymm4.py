@@ -373,6 +373,10 @@ class TestValues:
 
     def test_a_brush_hides_its_colour_one_level_down(self) -> None:
         # Parameter の中の Color を引けないと、YMM4 の縁取りなどのブラシの色が既定の色で写る
+        # 縁取りや図形の線の呼び手は既定に白を渡すので、白の見本だけでは読み落としが既定の白と
+        # 見分けられない（#384 の CodeRabbit） 白を既定に渡して赤を入れ、赤が返ることを見る
+        red = {**BRUSH, "Parameter": {**BRUSH["Parameter"], "Color": "#FFFF0000"}}
+        assert brush_colour(red, (1.0, 1.0, 1.0, 1.0)) == pytest.approx((1.0, 0.0, 0.0, 1.0))
         assert brush_colour(BRUSH) == pytest.approx((1.0, 1.0, 1.0, 1.0))
 
     def test_a_brush_that_is_not_a_single_colour_keeps_the_default(self) -> None:
