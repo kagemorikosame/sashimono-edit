@@ -145,6 +145,7 @@ def _child_environment(tmp_path: Path) -> dict[str, str]:
 def test_switching_survives_a_collection_while_it_hands_out_the_change(
     qt_application: QApplication, tmp_path: Path
 ) -> None:
+    # テーマを配っている途中でごみ集めが走ると、テーマを切り替えただけでアプリが落ちる
     del qt_application
     done = subprocess.run(
         [sys.executable, "-X", "faulthandler", "-c", _SCRIPT],

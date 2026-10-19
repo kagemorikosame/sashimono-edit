@@ -369,6 +369,7 @@ class TestTogether:
     """何本か選んだときのトリム・トラック跨ぎ・設定パネル"""
 
     def test_trimming_the_edge_trims_them_all(self, view: TimelineView) -> None:
+        # まとめて選んだのに 1 本だけ縮むと、揃えて詰めたつもりのクリップの終わりがばらばらになる
         a, b, _ = _ids(view)
         QTest.mouseClick(view, _LEFT, pos=_point(view, 0, 10))
         QTest.mouseClick(view, _LEFT, _CTRL, _point(view, 0, 50))
@@ -384,6 +385,7 @@ class TestTogether:
         assert command.tail_delta == -10
 
     def test_a_group_can_change_track(self, view: TimelineView) -> None:
+        # 何本か選んで下のトラックへ移しても 1 本しか動かないと、揃えていたクリップの並びが崩れる
         a, b, _ = _ids(view)
         QTest.mouseClick(view, _LEFT, pos=_point(view, 0, 10))
         QTest.mouseClick(view, _LEFT, _CTRL, _point(view, 0, 50))
@@ -398,6 +400,8 @@ class TestTogether:
         assert command.track_delta == 1
 
     def test_the_inspector_sets_every_selected_clip(self, window: MainWindow) -> None:
+        # 設定パネルの変更が最後に選んだ 1 本にしか当たらないと、何本も同じ見た目にするのに
+        # 1 本ずつ直すことになる
         timeline = window._timeline
         a, b, _ = (
             timeline.project.timeline.tracks[0].clips[0].id,
@@ -547,6 +551,7 @@ class TestLockedGroup:
         assert any("グループ" in m for m in messages)
 
     def test_deleting_and_cutting_are_refused(self, view: TimelineView) -> None:
+        # ロックした仲間を残して片方だけ消えると、グループの片割れだけが残って束ねた形が崩れる
         a, _b, _c, messages = self._locked_group(view)
         view.select(a)
         received = _received(view)

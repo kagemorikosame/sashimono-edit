@@ -34,6 +34,7 @@ class TestScenes:
         assert len(run(host, "list_clips")["clips"]) == main_clips
 
     def test_a_scene_can_be_placed_in_the_main_timeline(self, host: FakeHost) -> None:
+        # 置いた位置や長さがずれると、AI が報告した位置と違う所に挿入シーンが出る
         created = run(host, "add_scene", name="挿入", open=False)
         run(host, "place_scene", scene_id=created["scene_id"], at_frame=400, duration=60)
         placed = [clip for clip in run(host, "list_clips")["clips"] if clip["scene_id"]]
@@ -52,10 +53,12 @@ class TestScenes:
             run(host, "place_scene", scene_id=created["scene_id"])
 
     def test_unknown_scenes_point_to_the_list(self, host: FakeHost) -> None:
+        # シーンの調べ方を返さないと、AI は名前を ID と取り違えたまま開こうとし続ける
         with pytest.raises(ToolError, match="list_scenes"):
             run(host, "set_active_scene", scene_id="無い")
 
     def test_the_list_shows_every_scene(self, host: FakeHost) -> None:
+        # 一覧から漏れたシーンは AI から開けず、作ったはずのシーンを編集できない
         run(host, "add_scene", name="A", open=False)
         run(host, "add_scene", name="B", open=False)
         assert [scene["name"] for scene in run(host, "list_scenes")["scenes"]] == ["A", "B"]
@@ -105,6 +108,7 @@ class TestGroups:
         assert run(host, "list_clips")["clips"] == []
 
     def test_a_single_clip_is_refused(self, host: FakeHost) -> None:
+        # 1 本だけの束を作れると、何も束ねていないグループが残り、AI の「束ねました」が空振りする
         clip = run(host, "list_clips")["clips"][0]["clip_id"]
         with pytest.raises(ToolError, match="2 本"):
             run(host, "group_clips", clip_ids=[clip])

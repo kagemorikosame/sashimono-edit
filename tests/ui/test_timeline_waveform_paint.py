@@ -268,6 +268,7 @@ class TestTheSoundShapesTheWave:
     """
 
     def test_half_the_volume_draws_half_the_wave(self) -> None:
+        # 音量を下げても波形が同じ大きさだと、どこを小さくしたのかタイムラインで見分けられない
         waveform = _waveform(-0.8, 0.8)
         full = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip()))
         quiet = _sound_clip(registry.require("audio_volume").create(volume=50.0))
@@ -278,6 +279,7 @@ class TestTheSoundShapesTheWave:
         assert middle > 0
 
     def test_the_track_volume_also_counts(self) -> None:
+        # トラックの音量を下げても波形が変わらないと、音の釣り合いをタイムラインで見て取れない
         waveform = _waveform(-0.8, 0.8)
         canvas = QImage(_RECT.right() + 10, _RECT.bottom() + 10, QImage.Format.Format_ARGB32)
         canvas.fill(0)
@@ -289,6 +291,7 @@ class TestTheSoundShapesTheWave:
         assert quarter == pytest.approx(full / 4, abs=2)
 
     def test_a_fade_thins_the_start(self) -> None:
+        # フェードを掛けても頭の波形が細らないと、効いているかを聞いて確かめるしかない
         waveform = _waveform(-0.8, 0.8)
         fade = registry.require("audio_fade").create(fade_in=1.0)
         drawn = _tall(_paint(waveform, _RECT, _LAYOUT, _sound_clip(fade)))
@@ -347,6 +350,7 @@ class TestTheShapeOfAWideClip:
         return int(heights[round(layout.frame_to_x(frame))])
 
     def test_the_echo_stays_after_its_sound_scrolls_out(self) -> None:
+        # スクロールしただけでやまびこの波形が消えると、ディレイがどこまで鳴るのかが見るたびに変わる
         delay = registry.require("audio_delay").create(time=2000, feedback=0, mix=100)
         clip = Clip(timeline_start=0, duration=1800, effects=(delay,))
         # やまびこは 22〜23 秒（660〜690 コマ） 元の音（600〜630 コマ）が見えているときと、
@@ -357,5 +361,6 @@ class TestTheShapeOfAWideClip:
         assert scrolled == seen
 
     def test_without_an_echo_the_spot_stays_quiet(self) -> None:
+        # やまびこの無いクリップに尾が描かれると、鳴っていない音が見えて音の切れ目を見誤る
         clip = Clip(timeline_start=0, duration=1800)
         assert self._column_at(clip, 645.0, 675) <= 2

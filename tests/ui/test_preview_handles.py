@@ -277,6 +277,7 @@ class TestCornersAndTurning:
         assert _value(scaled, clip.id, "scale_y") == pytest.approx(100.0)
 
     def test_alt_scales_across_and_down_apart(self, make_widget: MakeWidget) -> None:
+        # Alt で横と縦を別々に変えられないと、絵を横長や縦長に伸ばすのに数を打つことになる
         media = _media()
         clip = _clip(media)
         project, _ = _project(clip)
@@ -596,6 +597,7 @@ class TestOldClips:
         assert _value(moved, clip.id, "pos_y") == pytest.approx(-10.0)
 
     def test_no_change_adds_nothing(self) -> None:
+        # 動かしていないのに配置を足すと、前の版のクリップを選んだだけで取り消しの段が増える
         media = _media()
         clip = _clip(media, fixed=False)
         project, _ = _project(clip)
@@ -618,6 +620,7 @@ class TestPicking:
         assert seen.committed == []
 
     def test_a_click_where_only_the_back_one_is(self, make_widget: MakeWidget) -> None:
+        # 手前の絵が無い所で奥を選べないと、重なった奥のクリップをプレビューから動かせない
         back_media, front_media = _media("奥.png"), _media("手前.png")
         back = _clip(back_media)
         front = _clip(front_media)
@@ -742,6 +745,7 @@ class TestTheOverlayIsDrawnOnEveryPath:
     def test_each_path_paints_the_overlay(
         self, make_widget: MakeWidget, monkeypatch: pytest.MonkeyPatch, path: str
     ) -> None:
+        # どれかの道で枠を描き忘れると、先読みが当たったコマでだけ選んだ絵の枠と掴み所が消える
         project, _ = _project()
         widget = make_widget(project)
         painted: list[int] = []
@@ -767,6 +771,7 @@ class TestTheOverlayOnScreen:
         return color.red(), color.green(), color.blue()
 
     def test_the_selected_clip_has_a_line(self, make_widget: MakeWidget) -> None:
+        # 枠が画面に出ないと、どのクリップを選んでいてどこを掴めば動くのか分からない
         media = _media()
         clip = _clip(media)
         project, _ = _project(clip)
@@ -776,6 +781,7 @@ class TestTheOverlayOnScreen:
         assert blue > 150 and blue > red
 
     def test_the_setting_off_draws_no_line(self, make_widget: MakeWidget) -> None:
+        # 切っても枠が描かれると、設定を切った人のプレビューに要らない線が残る
         media = _media()
         clip = _clip(media)
         project, _ = _project(clip)

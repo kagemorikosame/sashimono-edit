@@ -81,6 +81,7 @@ def _text(panel: ChatPanel) -> str:
 
 class TestConversationView:
     def test_assistant_text_is_shown(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、AI の説明や問い返しが会話の欄に出ず、何をしたのか本人に伝わらない
         widget, _ = panel
         widget._handle(AgentEvent(EventKind.TEXT, text="切りました"))
         assert "切りました" in _text(widget)
@@ -97,6 +98,7 @@ class TestConversationView:
         assert "frame=30" in shown
 
     def test_failed_tool_results_are_shown(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、AI の操作が失敗しても理由が出ず、編集が済んだと思い込んで先へ進む
         widget, _ = panel
         widget._handle(AgentEvent(EventKind.TOOL_RESULT, text="失敗", detail="見つかりません"))
         assert "見つかりません" in _text(widget)
@@ -140,12 +142,14 @@ class TestConversationView:
         assert "**そのまま**" in _text(widget)
 
     def test_errors_are_labelled(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 印が無いと、Claude Code が見つからない等の失敗が AI の返事に紛れて見落とされる
         widget, _ = panel
         widget._handle(AgentEvent(EventKind.ERROR, text="Claude Code が見つかりません"))
         assert "エラー" in _text(widget)
         assert "Claude Code" in _text(widget)
 
     def test_html_in_the_text_is_escaped(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 返事の中の < > を書式として読むと、タグに見える部分の文字が消え、AI の言ったことが欠ける
         widget, _ = panel
         widget._handle(AgentEvent(EventKind.TEXT, text="<b>太字にはしない</b>"))
         assert "<b>太字にはしない</b>" in _text(widget)
@@ -159,6 +163,7 @@ class TestApproval:
         return approval
 
     def test_a_request_is_shown_with_its_arguments(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、どのクリップの何フレーム目を切るのか分からないまま許可を押すことになる
         widget, _ = panel
         self._pending(widget)
         # パネル自体を画面に出していないので isVisible は使えない 表示の指示だけを見る
@@ -166,6 +171,7 @@ class TestApproval:
         assert "frame=30" in widget._approval_text.text()
 
     def test_allowing_releases_the_waiting_tool(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、許可を押しても AI の操作が待ったまま進まず、確かめの欄も残り続ける
         widget, _ = panel
         approval = self._pending(widget)
         widget._answer(True)
@@ -174,6 +180,7 @@ class TestApproval:
         assert widget._approval_box.isHidden() is True
 
     def test_denying_is_recorded(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、拒んだはずの操作が走るか、AI が答えを待ち続けて会話が止まる
         widget, _ = panel
         approval = self._pending(widget)
         widget._answer(False)
@@ -181,6 +188,7 @@ class TestApproval:
         assert approval.done.is_set()
 
     def test_always_allow_covers_the_next_call(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、「以降は確認しない」を押しても同じ操作のたびに確かめが出続ける
         widget, _ = panel
         approval = self._pending(widget)
         widget._answer(True, always=True)
@@ -188,6 +196,7 @@ class TestApproval:
         assert "split_clip" in widget._bridge._always
 
     def test_auto_approve_is_off_by_default(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 既定で入っていると、知らずに使い始めた人の作品を AI が確かめ無しに書き換える
         widget, _ = panel
         assert widget._bridge.auto_approve is False
         widget._auto.setChecked(True)
@@ -196,6 +205,8 @@ class TestApproval:
     def test_turning_auto_approve_off_forgets_the_exceptions(
         self, panel: tuple[ChatPanel, FakeHost]
     ) -> None:
+        # 壊れると、自動の承認を切って確かめに戻したつもりでも、
+        # 前に「以降は確認しない」にした操作だけは黙って走る
         widget, _ = panel
         widget._bridge.allow_always("split_clip")
         widget._auto.setChecked(True)
@@ -203,6 +214,7 @@ class TestApproval:
         assert widget._bridge._always == set()
 
     def test_an_interrupted_request_disappears(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、中断した後も答える相手の無い確かめの欄が残り、押しても何も起きない
         widget, _ = panel
         self._pending(widget)
         widget._bridge.cancel()
@@ -261,6 +273,8 @@ class TestApproval:
 
 class TestCheckpoint:
     def test_one_prompt_becomes_one_undo_step(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、AI が 1 つの指示で行った編集を戻すのに何度も取り消しを押し、
+        # 途中で数え違えると半端に切れた状態が残る
         widget, host = panel
         clip = host.document.project.timeline.tracks[0].clips[0].id
 
@@ -279,6 +293,7 @@ class TestCheckpoint:
         assert len(host.document.project.timeline.tracks[0].clips) == 1
 
     def test_the_label_is_trimmed(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 長い指示の全文を段の名前にすると、履歴の一覧や「元に戻す」の文字が横に伸びて読めない
         widget, host = panel
         widget._open_checkpoint("あ" * 100)
         clip = host.document.project.timeline.tracks[0].clips[0].id
@@ -289,12 +304,15 @@ class TestCheckpoint:
     def test_a_turn_that_changed_nothing_leaves_no_step(
         self, panel: tuple[ChatPanel, FakeHost]
     ) -> None:
+        # 壊れると、AI が何も変えなかった指示にも段ができ、
+        # 取り消しを押しても何も戻らない 1 回が混ざる
         widget, host = panel
         widget._open_checkpoint("何もしないで")
         widget._close_checkpoint()
         assert host.document.can_undo is False
 
     def test_the_turn_ending_closes_the_checkpoint(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、応答が終わっても段が開いたままで、その後の手の編集まで AI の段に飲み込まれる
         widget, host = panel
         widget._open_checkpoint("切って")
         clip = host.document.project.timeline.tracks[0].clips[0].id
@@ -317,6 +335,7 @@ class TestCheckpoint:
 
 class TestSending:
     def test_an_empty_prompt_does_nothing(self, panel: tuple[ChatPanel, FakeHost]) -> None:
+        # 壊れると、空のまま送りを押しただけで空の指示が Claude へ飛び、中身の無い履歴の段が開く
         widget, host = panel
         widget._input.setPlainText("   ")
         widget.send()
@@ -326,6 +345,7 @@ class TestSending:
 
 class TestFormatting:
     def test_bold_and_code_are_rendered(self) -> None:
+        # 壊れると、返事の中の道具や値の名前が本文と見分けられず、何を変えたのか読み取りにくい
         from sashimono.ui.chat.panel import _to_html
 
         # Claude の返事は素の Markdown で来る そのまま出すと ** が本文に混ざる
@@ -334,6 +354,8 @@ class TestFormatting:
         assert "<code" in rendered and "set_param" in rendered
 
     def test_tags_in_the_text_are_neutralised_first(self) -> None:
+        # 組む前に無害にしないと、返事に混ざった <b> などが書式として効き、
+        # 文字が消えたり崩れたりする
         from sashimono.ui.chat.panel import _to_html
 
         rendered = _to_html("<b>これは太字にしない</b>")

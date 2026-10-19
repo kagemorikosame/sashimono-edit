@@ -296,6 +296,7 @@ class TestTrackReorder:
     def test_a_locked_track_cannot_be_grabbed(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # ロックしたトラックを名前で掴んで動かせると、触らないと決めた重ね順が手ぶれで崩れる
         project = _four_tracks()
         locked = replace(project.timeline.tracks[0], locked=True)
         view, harness = _open(
@@ -319,6 +320,7 @@ class TestTrackReorder:
     def test_the_drop_line_is_drawn_while_dragging(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 引いている間に線が出ないと、離すまでどのトラックの間へ入るのか分からない
         view, _ = _open(make_area, analyzer, _four_tracks())
         top, bottom = _band(view, "V1")
         v3_top, _ = _band(view, "V3")
@@ -368,6 +370,7 @@ class TestZoomScrollBar:
     def test_pulling_the_right_edge_in_zooms_in(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 右の端を引いても拡大しないと、見たい所を広げるのにつまみと別の拡大の操作を往復する
         view, _ = _open(make_area, analyzer, _long())
         bar = view.horizontal_scroll_bar
         assert isinstance(bar, ZoomScrollBar)
@@ -383,6 +386,7 @@ class TestZoomScrollBar:
     def test_pushing_the_left_edge_out_zooms_out(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 左の端を外へ押しても縮小しないと、長い作品の全体を見渡すのに別の操作が要る
         view, _ = _open(make_area, analyzer, _long())
         bar = view.horizontal_scroll_bar
         assert isinstance(bar, ZoomScrollBar)
@@ -415,6 +419,7 @@ class TestZoomScrollBar:
     def test_the_cursor_shows_the_edge(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 形が変わらないと、つまみの端を掴めば伸び縮みすると気付けず、中を掴んでスクロールしてしまう
         view, _ = _open(make_area, analyzer, _long())
         bar = view.horizontal_scroll_bar
         handle = bar.handle_rect()
@@ -481,6 +486,7 @@ class TestZoomScrollBar:
 
 class TestEdgeScroll:
     def test_speed_grows_toward_and_past_the_edge(self) -> None:
+        # 端の近くで速さが付かないか逆を向くと、引いたまま画面の外へ運べないか、逆へ流れる
         assert edge_speed(500, 100, 900) == 0.0
         near = edge_speed(900 - EDGE_ZONE // 2, 100, 900)
         far = edge_speed(950, 100, 900)
@@ -509,6 +515,7 @@ class TestEdgeScroll:
     def test_the_left_edge_scrolls_back(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 左の端で戻らないと、後ろから前の方へクリップを運ぶのに一度離してスクロールし直す
         view, _ = _open(make_area, analyzer, _long())
         view.horizontal_scroll_bar.setValue(2000)
         before = view.view_layout.scroll_frame
@@ -521,6 +528,7 @@ class TestEdgeScroll:
     def test_moving_a_clip_to_the_edge_carries_it_along(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 端で表示が付いてこないと、画面の外の遠い所へクリップを運ぶのに何回も掴み直す
         project = _project(Track(TrackKind.VIDEO, "V1", (_text(0, 50), _text(3000, 10))))
         view, harness = _open(make_area, analyzer, project)
         grab = _clip_point(view, "V1", 25)
@@ -539,6 +547,7 @@ class TestEdgeScroll:
     def test_it_stops_when_the_mouse_comes_back(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # マウスを戻しても止まらないと、表示が流れ続けて狙った所で離せない
         view, _ = _open(make_area, analyzer, _long())
         QTest.mousePress(view, _LEFT, _NONE, QPoint(400, 10))
         QTest.mouseMove(view, QPoint(view.width() - 4, 10))
@@ -579,6 +588,7 @@ class TestKeyframeMarks:
     def test_a_diamond_is_drawn_and_brighter_when_selected(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 印が描かれないと、どのクリップのどこに動きがあるのか開いて調べるまで分からない
         project = _project(Track(TrackKind.VIDEO, "V1", (_text(0, 200, opacity=_animated(50)),)))
         view, _ = _open(make_area, analyzer, project)
         point = _mark_point(view, "V1", 50)
@@ -591,6 +601,8 @@ class TestKeyframeMarks:
     def test_crowded_marks_are_thinned(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 詰まった印を間引かないと、細かく打ったクリップが塗りつぶした帯になり
+        # 印を 1 つずつ見分けられない
         from sashimono.ui.timeline.keyframes import keyframe_marks
         from sashimono.ui.timeline.painter import clip_rect_for
 
@@ -607,6 +619,7 @@ class TestKeyframeMarks:
     def test_clicking_a_diamond_moves_the_playhead_there(
         self, make_area: list[TimelineArea], analyzer: MediaAnalyzer
     ) -> None:
+        # 印を押しても再生ヘッドが来ないと、キーの値を直すのにタイムラインで位置を合わせ直す
         project = _project(Track(TrackKind.VIDEO, "V1", (_text(0, 200, opacity=_animated(70)),)))
         view, harness = _open(make_area, analyzer, project)
         point = _mark_point(view, "V1", 70) + QPoint(2, 0)

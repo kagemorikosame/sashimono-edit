@@ -36,12 +36,15 @@ def _clip_id(project: Project) -> ClipId:
 
 class TestCatalogue:
     def test_every_operation_has_a_schema_and_description(self) -> None:
+        # 説明や引数の形が欠けたツールは、AI が使い方を知れず、
+        # 頼んでも使われないか引数を外して失敗する
         for operation in OPERATIONS:
             assert operation.description.strip()
             assert operation.schema["type"] == "object"
             assert "properties" in operation.schema
 
     def test_names_are_unique(self) -> None:
+        # 名前が重なると片方のツールへ AI から届かなくなり、頼んだのと別の操作が走る
         names = [operation.name for operation in OPERATIONS]
         assert len(set(names)) == len(names)
 
@@ -55,27 +58,34 @@ class TestCatalogue:
 
 class TestReading:
     def test_get_project(self, host: FakeHost) -> None:
+        # 解像度や長さを取り違えると、AI がテロップを画面の外へ置いたり、
+        # 尺の外を指したりする
         result = run(host, "get_project")
         assert result["resolution"] == "1920x1080"
         assert result["fps"] == 30.0
         assert result["duration_frames"] == 300
 
     def test_list_media_exposes_ids(self, host: FakeHost) -> None:
+        # 字幕の数や音の有無が見えないと、AI は起こし済みの素材を起こし直したり、
+        # 音の無い素材に無音カットを掛けようとしたりする
         rows = run(host, "list_media")["media"]
         assert len(rows) == 1
         assert rows[0]["subtitle_count"] == 3
         assert rows[0]["has_audio"] is True
 
     def test_list_clips_reports_positions(self, host: FakeHost) -> None:
+        # 位置と長さがずれると、AI が「3 秒目で切って」を別の場所で切る
         rows = run(host, "list_clips")["clips"]
         assert rows[0]["start"] == 0
         assert rows[0]["duration"] == 300
         assert rows[0]["start_timecode"] == "00:00:00:00"
 
     def test_list_clips_can_filter_by_track(self, host: FakeHost) -> None:
+        # 絞り込みが効かないと、別のトラックのクリップまで返り、AI がそれを触ってしまう
         assert run(host, "list_clips", track_id="そんなものは無い")["clips"] == []
 
     def test_get_subtitles_returns_timeline_positions(self, host: FakeHost) -> None:
+        # 素材の中の時刻を返すと、カットした後の動画で AI が字幕と違う所を切る
         rows = run(host, "get_subtitles")["subtitles"]
         # 素材の 1 秒は 30 フレーム目 AI が見るのは編集後の位置
         assert [row["start"] for row in rows] == [30, 120, 210]
@@ -90,6 +100,7 @@ class TestReading:
         assert radius["max"] > radius["min"]
 
     def test_get_history_is_empty_at_first(self, host: FakeHost) -> None:
+        # 開いたばかりで戻せると答えると、AI が「戻します」と言ったのに何も戻らない
         assert run(host, "get_history")["can_undo"] is False
 
 
@@ -102,19 +113,23 @@ class TestPreviewFrame:
         assert result.png.startswith(b"\x89PNG")
 
     def test_it_defaults_to_the_playhead(self, host: FakeHost) -> None:
+        # 再生位置を使わないと、「今の画面を見て」と頼んでも AI は別のフレームを見て答える
         host.frame = 90
         run(host, "preview_frame")
         assert host.rendered[-1][0] == 90
 
     def test_the_frame_is_clamped_to_the_timeline(self, host: FakeHost) -> None:
+        # 尺の外を描かせると何も映らない絵か失敗が返り、AI が動画の終わりの画面を確かめられない
         run(host, "preview_frame", frame=99999)
         assert host.rendered[-1][0] == 299
 
     def test_the_width_is_clamped(self, host: FakeHost) -> None:
+        # 大きな幅をそのまま描くと、1 枚の絵で使う量がかさみ、返事も遅くなる
         run(host, "preview_frame", width=99999)
         assert host.rendered[-1][1] == 1280
 
     def test_the_caption_carries_the_timecode(self, host: FakeHost) -> None:
+        # 絵だけを返すと AI はどの時刻の画面か分からず、場面の時刻を言い間違える
         result = run(host, "preview_frame", frame=30)
         assert isinstance(result, ImageResult)
         assert "00:00:01:00" in result.caption
@@ -122,39 +137,48 @@ class TestPreviewFrame:
 
 class TestEditing:
     def test_split_uses_the_playhead_and_the_selection(self, host: FakeHost) -> None:
+        # 画面で選んで再生位置を合わせただけの「ここで切って」が、ID を聞き返されて通らなくなる
         host.select_clip(_clip_id(host.document.project))
         host.frame = 100
         run(host, "split_clip")
         assert len(host.document.project.timeline.tracks[0].clips) == 2
 
     def test_editing_lands_in_the_history(self, host: FakeHost) -> None:
+        # AI の編集が履歴に載らないと、Ctrl+Z で AI のやったことを戻せない
         run(host, "split_clip", clip_id=str(_clip_id(host.document.project)), frame=100)
         assert host.document.can_undo is True
 
     def test_a_failed_edit_explains_itself(self, host: FakeHost) -> None:
+        # 分割位置が外れていると文面に出ないと、AI は同じ位置で何度も切ろうとする
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="分割位置"):
             run(host, "split_clip", clip_id=clip, frame=9999)
 
     def test_an_unknown_clip_points_at_the_listing_tool(self, host: FakeHost) -> None:
+        # list_clips へ導かないと、AI は推測した ID のまま同じ失敗を繰り返す
         with pytest.raises(ToolError, match="list_clips"):
             run(host, "split_clip", clip_id="ないよ", frame=10)
 
     def test_without_a_selection_it_asks_for_an_id(self, host: FakeHost) -> None:
+        # 選択が無いときに clip_id を求めないと、AI は何が足りないのか分からず、
+        # 同じ呼び出しを繰り返す
         with pytest.raises(ToolError, match="clip_id"):
             run(host, "split_clip")
 
     def test_delete_with_ripple(self, host: FakeHost) -> None:
+        # 詰めずに消すと、「消して詰めて」と頼んでも消した所に何も映らない間が残る
         clip = str(_clip_id(host.document.project))
         run(host, "delete_clip", clip_id=clip, ripple=True)
         assert host.document.project.duration == 0
 
     def test_trim_needs_a_direction(self, host: FakeHost) -> None:
+        # どちらの端も指さない呼び出しを黙って通すと、AI は「詰めました」と言うのに長さが変わらない
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="head_delta"):
             run(host, "trim_clip", clip_id=clip)
 
     def test_speed_is_kept_exact(self, host: FakeHost) -> None:
+        # 小数のまま入れると分数として書けずに保存の所で落ち、AI に半速を頼んだ後に保存できない
         clip = str(_clip_id(host.document.project))
         run(host, "set_clip_property", clip_id=clip, name="speed", value=0.5)
         assert host.document.project.timeline.tracks[0].clips[0].speed == Fraction(1, 2)
@@ -188,6 +212,8 @@ class TestEditing:
             run(host, "set_clip_property", clip_id=clip, name="source_in", value=-1)
 
     def test_only_allowed_properties_can_change(self, host: FakeHost) -> None:
+        # 長さや位置を検査無しで書き換えさせると、素材と合わないクリップができ、
+        # 再生や書き出しで絵が途切れる
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="変えられるのは"):
             run(host, "set_clip_property", clip_id=clip, name="duration", value=10)
@@ -195,6 +221,7 @@ class TestEditing:
 
 class TestEffects:
     def test_adding_an_effect_returns_its_id(self, host: FakeHost) -> None:
+        # ID が返らないと、AI は足したばかりのエフェクトの強さやキーフレームを続けて変えられない
         clip = str(_clip_id(host.document.project))
         result = run(host, "add_effect", clip_id=clip, kind="blur", params={"radius": 12})
         assert result["kind"] == "blur"
@@ -233,11 +260,13 @@ class TestEffects:
         assert angle.at(30) == pytest.approx(90)
 
     def test_an_unknown_effect_lists_the_real_ones(self, host: FakeHost) -> None:
+        # 使える名前を返さないと、AI は思い付きの名前を試し続け、エフェクトがいつまでも掛からない
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="blur"):
             run(host, "add_effect", clip_id=clip, kind="いい感じにするやつ")
 
     def test_keyframes_can_be_placed_on_an_effect(self, host: FakeHost) -> None:
+        # エフェクトにキーフレームを打てないと、「だんだんぼかして」が一定のぼかしになる
         clip = str(_clip_id(host.document.project))
         added = run(host, "add_effect", clip_id=clip, kind="blur")
         run(
@@ -263,6 +292,8 @@ class TestEffects:
         assert len(radius.keyframes) == 2  # type: ignore[union-attr]
 
     def test_an_unknown_interpolation_lists_the_choices(self, host: FakeHost) -> None:
+        # 選べる補間を返さないと、AI は「ぬるっと」のような言葉を送り続け、
+        # キーフレームが打てない
         clip = str(_clip_id(host.document.project))
         with pytest.raises(ToolError, match="補間"):
             run(
@@ -279,6 +310,7 @@ class TestEffects:
 
 class TestText:
     def test_adding_text_places_a_clip(self, host: FakeHost) -> None:
+        # テロップのクリップが置かれないと、AI の「入れました」に反して画面に文字が出ない
         run(host, "add_text", text="テロップ", at_frame=0, duration=60, size=72)
         placed = [
             clip
@@ -291,6 +323,7 @@ class TestText:
         assert placed[0].source.params["text"] == "テロップ"
 
     def test_empty_text_is_refused(self, host: FakeHost) -> None:
+        # 空白だけのテロップを通すと、見えないクリップがタイムラインに残り、どこにあるか分からない
         with pytest.raises(ToolError, match="text"):
             run(host, "add_text", text="   ")
 
@@ -377,6 +410,7 @@ class TestStrokes:
 
 class TestSubtitles:
     def test_text_can_be_rewritten(self, host: FakeHost) -> None:
+        # 書き換えが字幕へ届かないと、AI に誤字を直させても画面と字幕の書き出しに誤字が残る
         media = host.document.project.media[0]
         assert media.transcript is not None
         run(
@@ -391,6 +425,7 @@ class TestSubtitles:
         assert updated.segments[0].text == "こんばんは"
 
     def test_cleaning_reports_what_changed(self, host: FakeHost) -> None:
+        # 整えた後の本数を返さないと、AI は字幕が消えすぎていないか確かめられない
         media = host.document.project.media[0]
         result = run(host, "clean_subtitles", media_id=str(media.id))
         assert result["remaining"] == 3
@@ -398,6 +433,8 @@ class TestSubtitles:
     def test_cleaning_without_a_transcript_says_so(
         self, host: FakeHost, video_media: MediaItem
     ) -> None:
+        # 字幕の無い素材で黙って成功すると、AI は整えたと報告し、
+        # 利用者は文字起こしが先に要ることに気付けない
         del video_media
         media = host.document.project.media[0]
         host.document.execute(
@@ -415,6 +452,8 @@ class TestSubtitles:
         assert host.transcription == "起こしは走っていません"
 
     def test_transcribe_hands_back_a_next_step(self, host: FakeHost) -> None:
+        # 次に何を呼ぶかを返さないと、AI は起こしの終わりを待たずに字幕を読み、
+        # 空の字幕のまま話を進める
         media = host.document.project.media[0]
         result = run(host, "transcribe", media_id=str(media.id), replace=True)
         assert "transcription_status" in result["next"]
@@ -456,11 +495,13 @@ def _forget_transcript(project: Project, media_id: str) -> object:
 
 class TestJetCut:
     def test_without_a_waveform_it_says_to_wait(self, host: FakeHost) -> None:
+        # 波形を作っている途中で通すと、無音が見つからず「切る所がありません」と誤って返す
         media = host.document.project.media[0]
         with pytest.raises(ToolError, match="波形"):
             run(host, "jet_cut", media_id=str(media.id))
 
     def test_silence_becomes_a_cut(self, host: FakeHost) -> None:
+        # 無音が切られないと、無音カットを頼んでも間延びした動画のまま変わらない
         from tests.ui.test_subtitle_panel import make_waveform
 
         # 先頭に無音、あとは鳴っている素材
@@ -529,6 +570,7 @@ def test_jet_cut_of_voice_one_leaves_the_moved_voice_two_alone(audio: int | None
 
 class TestImport:
     def test_import_probes_and_places(self, host: FakeHost, tmp_path: Path) -> None:
+        # 素材を調べずに置くと、長さの分からないクリップができ、取り込んだ素材が正しく並ばない
         target = tmp_path / "追加.mp4"
         target.write_bytes(b"dummy")
         result = run(host, "import_media", paths=[str(target)])
@@ -538,20 +580,25 @@ class TestImport:
         assert len(host.analyzed) == 1
 
     def test_a_missing_file_is_reported(self, host: FakeHost, tmp_path: Path) -> None:
+        # 無いファイルを黙って飛ばすと、AI は取り込んだと報告し、
+        # 利用者は素材が足りないことに気付けない
         with pytest.raises(ToolError, match="ファイルがありません"):
             run(host, "import_media", paths=[str(tmp_path / "無い.mp4")])
 
 
 class TestNavigation:
     def test_seek_moves_the_playhead(self, host: FakeHost) -> None:
+        # 再生位置が動かないと、AI が「ここです」と言った場面を画面で見られない
         run(host, "seek", frame=42)
         assert host.playhead == 42
 
     def test_select_checks_the_clip_exists(self, host: FakeHost) -> None:
+        # 無い ID を選べてしまうと、選択が空のまま AI は選んだつもりで次の操作に進む
         with pytest.raises(ToolError, match="list_clips"):
             run(host, "select_clip", clip_id="ないよ")
 
     def test_undo_reports_what_it_undid(self, host: FakeHost) -> None:
+        # 何を戻したかを返さないと、AI は自分の操作を戻したのか人の編集まで戻したのか言えない
         clip = str(_clip_id(host.document.project))
         run(host, "split_clip", clip_id=clip, frame=100)
         result = run(host, "undo")
@@ -559,6 +606,7 @@ class TestNavigation:
         assert len(host.document.project.timeline.tracks[0].clips) == 1
 
     def test_undo_with_nothing_to_undo(self, host: FakeHost) -> None:
+        # 戻す物が無いときに黙って成功すると、AI は「戻しました」と言うのに画面は何も変わらない
         with pytest.raises(ToolError, match="戻せる操作がありません"):
             run(host, "undo")
 
@@ -584,6 +632,7 @@ class TestParameterCoercion:
         return dict(located[1].source.params)
 
     def test_hex_colours_become_channels(self, host: FakeHost) -> None:
+        # 「#FF8000」を色として読まないと、オレンジにしてと頼んでも文字の色が変わらない
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="color", value="#FF8000")
         color = self._source_params(host, clip)["color"]
@@ -593,6 +642,7 @@ class TestParameterCoercion:
         assert color[3] == pytest.approx(1.0)
 
     def test_hex_with_alpha(self, host: FakeHost) -> None:
+        # 8 桁目までの不透明度を落とすと、半透明の文字を頼んでも不透明な文字になる
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="color", value="#00000080")
         color = self._source_params(host, clip)["color"]
@@ -600,11 +650,13 @@ class TestParameterCoercion:
         assert color[3] == pytest.approx(128 / 255, abs=0.01)
 
     def test_a_list_also_works(self, host: FakeHost) -> None:
+        # 数の並びで送った色を受け付けないと、AI は書き方を変えて何度もやり直す
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="color", value=[1.0, 0.0, 0.0, 1.0])
         assert self._source_params(host, clip)["color"] == (1.0, 0.0, 0.0, 1.0)
 
     def test_numbers_are_clamped_to_the_declared_range(self, host: FakeHost) -> None:
+        # 範囲の外の大きさを通すと、文字が画面からはみ出し、設定パネルの範囲でも表せない値が残る
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="size", value=9999)
         size = self._source_params(host, clip)["size"]
@@ -613,21 +665,25 @@ class TestParameterCoercion:
         assert float(size.at(0)) == 512.0
 
     def test_booleans_reach_check_parameters(self, host: FakeHost) -> None:
+        # true が切り替えの項目に届かないと、太字にしてと頼んでも細いままになる
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="bold", value=True)
         assert bool(self._source_params(host, clip)["bold"]) is True
 
     def test_select_parameters_take_their_identifier(self, host: FakeHost) -> None:
+        # 選ぶ項目の名前を受け取れないと、左寄せにしてと頼んでも寄せ方が変わらない
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="align", value="left")
         assert self._source_params(host, clip)["align"] == "left"
 
     def test_text_stays_text(self, host: FakeHost) -> None:
+        # 文字の中身まで色や数へ寄せると、テロップを差し替えたときに文字が化けたり消えたりする
         clip = self._text_clip(host)
         run(host, "set_param", clip_id=clip, name="text", value="差し替えた")
         assert self._source_params(host, clip)["text"] == "差し替えた"
 
     def test_effect_parameters_use_the_effect_definition(self, host: FakeHost) -> None:
+        # クリップの定義で読むと、縁取りの色に「#00FF00」を渡しても緑にならない
         target = str(_clip_id(host.document.project))
         added = run(host, "add_effect", clip_id=target, kind="border")
         run(

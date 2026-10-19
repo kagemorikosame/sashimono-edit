@@ -275,6 +275,7 @@ class TestDialog:
     def test_delete_removes_it_from_the_list_and_the_file(
         self, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 消したのに一覧やファイルに残ると、要らない設定がまた出てきて、選び間違える
         del qt_application
         store = ProjectPresetStore(tmp_path / "p.json")
         store.put(ProjectPreset("消す", 1280, 720, FrameRate(30), Blending.SRGB))

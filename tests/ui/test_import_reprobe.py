@@ -53,6 +53,7 @@ def window(qt_application: QApplication, monkeypatch: pytest.MonkeyPatch) -> Ite
 def test_importing_again_opens_the_file_again(
     window: MainWindow, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # 2 度目の読み込みで開き直さないと、差し替えたファイルの長さや音声の本数が古いまま使われる
     opened = _count_opens(monkeypatch)
     for _ in range(2):
         window.import_media([sample_av.path])

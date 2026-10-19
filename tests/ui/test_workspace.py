@@ -64,6 +64,7 @@ class TestTrackButtons:
         QTest.mouseClick(view, Qt.MouseButton.LeftButton, pos=rect.center())
 
     def test_a_click_asks_for_the_toggle(self, view: TimelineView) -> None:
+        # 押してもソロの切り替えが頼まれないと、ボタンを押しても何も起きず、聞き比べができない
         received: list[list[Command]] = []
         view.commands_requested.connect(lambda commands, _label: received.append(commands))
         self.click_button(view, "A1", "solo")
@@ -130,10 +131,13 @@ class TestTrackButtons:
 
 class TestUnsavedChanges:
     def test_a_fresh_window_is_clean(self, window: MainWindow) -> None:
+        # 開いたばかりで変更ありになると、何も触らずに閉じても保存を尋ねられ、題に * が付く
         assert not window.is_modified
         assert "*" not in window.windowTitle()
 
     def test_an_edit_marks_it_and_undo_clears_it(self, window: MainWindow) -> None:
+        # 印が付かないと、保存を尋ねずに閉じて編集を失う 取り消しで外れないと、
+        # 元どおりなのに保存を尋ねられる
         window.execute(RenameProject("別名"))
         assert window.is_modified
         assert "*" in window.windowTitle()
@@ -141,6 +145,8 @@ class TestUnsavedChanges:
         assert not window.is_modified
 
     def test_autosave_writes_only_when_changed(self, window: MainWindow) -> None:
+        # 変えたのに書かないと、落ちたときに作業を失う 変えていないのに書くと、
+        # 何も失っていないのに次の起動で復元を勧められる
         window.autosave()
         assert not window._recovery.path.exists()
         window.execute(RenameProject("別名"))
@@ -150,6 +156,8 @@ class TestUnsavedChanges:
     def test_saving_clears_the_autosave_and_backs_up(
         self, window: MainWindow, tmp_path: Path
     ) -> None:
+        # 保存しても退避が残ると、次の起動で古い作業の復元を勧められる 前の版を控えないと、
+        # 上書きで壊したときに戻れない
         window._path = tmp_path / "本編.sme"
         window.execute(RenameProject("一回目"))
         window.autosave()
@@ -162,6 +170,8 @@ class TestUnsavedChanges:
         assert len(list(backup_folder(window._path).iterdir())) == 1
 
     def test_a_live_window_is_never_offered_for_recovery(self, window: MainWindow) -> None:
+        # 動いている窓の退避を拾うと、もう 1 つ窓を開いたときに、今編集している作業を
+        # 復元するよう勧めて同じ作品が 2 つに分かれる
         window.execute(RenameProject("作業中"))
         window.autosave()
         assert find_orphans() == []
@@ -169,6 +179,7 @@ class TestUnsavedChanges:
 
 class TestRestoring:
     def test_a_crashed_session_comes_back(self, window: MainWindow, tmp_path: Path) -> None:
+        # 落ちたあとの退避から戻せないと、最後に保存してからの作業がすべて失われる
         source = tmp_path / "本編.sme"
         crashed = RecoverySession()
         crashed.save(_with_tracks().renamed("落ちた作業"), source)
@@ -192,6 +203,7 @@ class TestRestoring:
 
 class TestLayout:
     def test_the_layout_is_saved_on_close(self, qt_application: QApplication) -> None:
+        # 閉じるときに残さないと、パネルを並べ直しても次の起動で毎回元の配置へ戻る
         del qt_application
         first = MainWindow(confirm_unsaved=False)
         first.close()
@@ -210,6 +222,7 @@ class TestLayout:
         assert all(dock.objectName() for dock in window.findChildren(QDockWidget))
 
     def test_reset_hides_the_graph_editor_again(self, window: MainWindow) -> None:
+        # 初期配置に戻してもグラフエディタが出たままだと、戻したのにタイムラインが狭いまま
         window._graph_dock.setVisible(True)
         window.reset_layout()
         assert window._graph_dock.isHidden()
@@ -217,6 +230,8 @@ class TestLayout:
 
 class TestShortcuts:
     def test_an_override_is_applied_at_start(self, qt_application: QApplication) -> None:
+        # 変えたキーが起動のときに効かないと、毎回割り当て直すことになる 版が変わって
+        # 消えた項目の名前が残っていても、起動は止めない
         del qt_application
         ShortcutStore().save({"ファイル/保存": "Ctrl+Alt+S", "消えた/項目": "F9"})
         created = MainWindow(confirm_unsaved=False)
@@ -228,11 +243,13 @@ class TestShortcuts:
             created.close()
 
     def test_a_broken_file_means_defaults(self, tmp_path: Path) -> None:
+        # ショートカットのファイルが壊れただけで起動が止まると、既定のキーで使うこともできない
         path = tmp_path / "shortcuts.json"
         path.write_text("{壊れている", "utf-8")
         assert ShortcutStore(path).load() == {}
 
     def test_conflicts_are_found(self) -> None:
+        # 重なりを見つけないと、同じキーを 2 つに割り当てても気づかず、押してもどちらも動かない
         bindings = {"a": "Ctrl+S", "b": "Ctrl+S", "c": "", "d": ""}
         # 空は「割り当てなし」 いくつあっても重なりではない
         assert find_conflicts(bindings) == {"Ctrl+S": ["a", "b"]}
@@ -245,6 +262,7 @@ class TestShortcuts:
 
 class TestSettingsDialog:
     def test_the_preset_follows_the_numbers(self, qt_application: QApplication) -> None:
+        # 縦横を入れ替えても一覧が前の名前のままだと、縦動画のつもりが表示と数が食い違って迷う
         del qt_application
         dialog = ProjectSettingsDialog(ProjectSettings())
         dialog._swap()
@@ -311,6 +329,8 @@ class TestSettingsDialog:
         assert window.document.project.settings == before
 
     def test_odd_numbers_cannot_be_confirmed(self, qt_application: QApplication) -> None:
+        # 奇数の幅を通すと、h.264 は幅も高さも偶数でないと符号化できないので、
+        # 編集を終えてから書き出しで失敗する
         del qt_application
         dialog = ProjectSettingsDialog(ProjectSettings())
         dialog._width.setValue(1919)

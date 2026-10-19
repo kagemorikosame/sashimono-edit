@@ -156,6 +156,7 @@ class TestEveryEntrance:
 
     @pytest.mark.parametrize(("mode", "layers"), _EXPECTED)
     def test_dragging_from_the_media_pool(self, window: MainWindow, mode: str, layers: int) -> None:
+        # プールから引いた時だけ設定を見ないと、入れ方によって音声のレイヤーの数が変わる
         _choose(window, mode)
         media = _pooled(window)
         window._on_media_dropped([str(media.id)], 0, "")
@@ -163,6 +164,7 @@ class TestEveryEntrance:
 
     @pytest.mark.parametrize(("mode", "layers"), _EXPECTED)
     def test_placing_from_the_media_pool(self, window: MainWindow, mode: str, layers: int) -> None:
+        # プールの〔置く〕だけ設定を見ないと、選んだ置き方と違う数のレイヤーが並ぶ
         _choose(window, mode)
         media = _pooled(window)
         window._insert_media_by_id(str(media.id))

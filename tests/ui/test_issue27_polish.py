@@ -347,6 +347,7 @@ class TestDockTabs:
         assert Preferences().dock_tabs == DOCK_TABS_TOP
 
     def test_the_choice_is_saved_and_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # タブの位置が残らないと起動のたびに上へ戻り、壊れた値をそのまま当てるとタブが変な所に出る
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(dock_tabs=DOCK_TABS_BOTTOM))
         assert store.load().dock_tabs == DOCK_TABS_BOTTOM
@@ -742,6 +743,8 @@ class TestClipIdentity:
     def test_the_panel_shows_which_clip_it_is(
         self, qt_application: QApplication, video_media: MediaItem
     ) -> None:
+        # パネルがどのクリップかを言わないと、
+        # 映像と音のどちらの値を触っているのか分からず別の方を変える
         del qt_application
         project, picture, sound = _linked_project(video_media)
         panel = InspectorPanel()

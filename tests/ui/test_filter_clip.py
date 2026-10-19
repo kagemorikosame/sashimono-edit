@@ -41,6 +41,7 @@ def analyzer(qt_application: QApplication) -> Iterator[MediaAnalyzer]:
 
 
 def test_the_timeline_paints_a_filter_in_its_own_colour(analyzer: MediaAnalyzer) -> None:
+    # フィルタのクリップを映像と同じ色で塗ると、タイムラインでどれが画面全体に効く物か見分けられない
     project, _ = _project()
     view = TimelineView(project, analyzer)
     view.resize(600, 160)
@@ -60,6 +61,7 @@ def test_the_timeline_paints_a_filter_in_its_own_colour(analyzer: MediaAnalyzer)
 
 
 def test_the_inspector_edits_the_filter_effects(qt_application: QApplication) -> None:
+    # フィルタのクリップでエフェクトの欄が出ないと、置いても中身を足したり変えたりできない
     del qt_application
     project, clip = _project()
     panel = InspectorPanel()

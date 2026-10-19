@@ -43,12 +43,14 @@ def test_a_removed_layer_does_not_cause_a_twin(host: FakeHost) -> None:
 
 
 def test_the_list_says_mixed(host: FakeHost) -> None:
+    # 一覧で mixed と言わないと、AI はレイヤーを映像か音声のトラックと取り違え、置き場所を誤る
     run(host, "add_track", kind="mixed")
     kinds = [entry["kind"] for entry in run(host, "list_tracks")["tracks"]]
     assert kinds[-1] == "mixed"
 
 
 def test_an_unknown_kind_names_the_choices(host: FakeHost) -> None:
+    # 選べる種類を返さないと、AI は無い種類で足そうとし続け、トラックが増えないまま止まる
     with pytest.raises(ToolError, match="mixed"):
         run(host, "add_track", kind="effect")
 

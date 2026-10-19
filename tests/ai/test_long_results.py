@@ -85,11 +85,14 @@ class TestReadingSubtitles:
         assert texts[0].startswith("0 行目")
 
     def test_even_a_large_limit_stays_short(self, video_media: MediaItem) -> None:
+        # 大きな件数を頼まれて上限を越えると、返事が途中で切られ、
+        # AI は字幕の続きを読めず誤植を直せない
         page = _call(_host(video_media), "get_subtitles", limit=10_000)
         _short(page)
         assert len(json_text(page["subtitles"])) <= MAX_RESULT_CHARS
 
     def test_the_compact_form_has_only_the_line_time_and_text(self, video_media: MediaItem) -> None:
+        # 軽い形に余計な欄が混ざると 1 回で読める行が減り、長い字幕を読み終えるまで何度も往復する
         page = _call(_host(video_media), "get_subtitles", compact=True, limit=300)
         _short(page)
         assert set(page["subtitles"][0]) == {"n", "time", "text"}
@@ -98,6 +101,7 @@ class TestReadingSubtitles:
         assert page["count"] > full["count"]
 
     def test_words_and_times_narrow_it(self, video_media: MediaItem) -> None:
+        # 言葉や秒で絞れないと、AI は数百行を頭から全部読まないと誤植の行に辿り着けない
         host = _host(video_media)
         found = _call(host, "get_subtitles", contains="誤字", compact=True)
         assert [row["text"].split()[0] for row in found["subtitles"]] == ["10", "200", "300"]
@@ -134,6 +138,7 @@ class TestOneLongRow:
     def test_the_answer_stays_short_and_says_how_to_read_it_all(
         self, video_media: MediaItem, compact: bool
     ) -> None:
+        # 1 行だけで上限を越える字幕を切ったまま続きを示さないと、AI はその行の後半を読めず直せない
         host = self._long_host(video_media)
         page = _call(host, "get_subtitles", compact=compact)
         assert len(json_text(page)) <= MAX_RESULT_CHARS
@@ -159,6 +164,7 @@ class TestOneLongRow:
         assert whole == self.LONG
 
     def test_any_list_keeps_one_row_inside_the_limit(self) -> None:
+        # 字幕以外の一覧でも長い 1 件をそのまま返すと、返事が切られて AI は件数も続きも読めない
         from sashimono.ai.operations import _paged
 
         row = {"id": "x", "name": "名前" * 9000, "items": list(range(5000))}
@@ -233,11 +239,13 @@ class TestTheSecondsWindow:
     """
 
     def test_the_end_second_is_left_out(self, video_media: MediaItem) -> None:
+        # 終わりの秒ちょうどに始まる行まで返すと、AI が範囲の字幕を直すとき隣の行まで書き換える
         host = _host(video_media)
         rows = _call(host, "get_subtitles", from_seconds=0, to_seconds=1, compact=True)
         assert [row["text"].split()[0] for row in rows["subtitles"]] == ["0"]
 
     def test_a_little_past_the_second_takes_the_next(self, video_media: MediaItem) -> None:
+        # 秒を少し越えた所の行を落とすと、AI は頼まれた範囲の最後の字幕を見落として直さない
         host = _host(video_media)
         rows = _call(host, "get_subtitles", from_seconds=0, to_seconds=1.01, compact=True)
         assert [row["text"].split()[0] for row in rows["subtitles"]] == ["0", "1"]
@@ -253,6 +261,8 @@ class TestTheSecondsWindow:
 
 class TestFixingTypos:
     def test_pairs_fix_the_subtitles_and_the_burned_text(self, video_media: MediaItem) -> None:
+        # 字幕だけ直して焼き込んだ文字が古いままだと、画面には誤植が残り、
+        # 戻すにも取り消しが何回も要る
         host = _host(video_media)
         _call(host, "place_subtitles")
         before = host.document.project
@@ -394,12 +404,14 @@ class TestFixingTypos:
         assert result["burned_text_clips"] == 3
 
     def test_bad_pairs_are_refused(self, video_media: MediaItem) -> None:
+        # 空の言葉で置き換えを通すと、字幕のすべての文字の間に置き換え先が挟まり、字幕が読めなくなる
         with pytest.raises(ToolError, match="pairs"):
             _call(_host(video_media), "replace_subtitle_text", pairs=[{"from": "", "to": "x"}])
 
 
 class TestOtherLists:
     def test_many_clips_are_paged(self, video_media: MediaItem) -> None:
+        # クリップが多い作品で一覧を 1 回で返すと、返事が切られて AI は後ろのクリップを編集できない
         host = _host(video_media)
         project = host.document.project
         media = project.media[0]
@@ -427,6 +439,8 @@ class TestOtherLists:
         assert window["total"] == 3
 
     def test_the_effect_list_is_short_unless_one_is_asked(self) -> None:
+        # 全部のエフェクトの設定項目まで並べると返事が上限を越え、1 つを聞いても項目が出ないと
+        # AI はどの名前で値を変えればよいか分からない
         host = FakeHost(Project.create())
         listed = _call(host, "list_effects", limit=300)
         _short(listed)
@@ -435,6 +449,7 @@ class TestOtherLists:
         assert any(p["name"] == "radius" for p in blur["parameters"])
 
     def test_the_media_list_is_paged(self, video_media: MediaItem) -> None:
+        # 素材が多い作品で一覧が切られると、AI は後ろの素材を置けず、読み込んでいないと答えてしまう
         many = tuple(replace(video_media, id=type(video_media.id)(f"m{n}")) for n in range(300))
         host = FakeHost(Project.create(media=many))
         page = _call(host, "list_media", limit=300)

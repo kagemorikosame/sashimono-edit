@@ -138,6 +138,7 @@ class TestEffectMenu:
     def test_a_sound_clip_lists_only_sound_effects(
         self, panel: InspectorPanel, audio_media: MediaItem
     ) -> None:
+        # 音だけのクリップにぼかしや色が並ぶと、積んでも何も変わらず効かない理由を探し回る
         project = _placed(audio_media)
         (audio,) = _clips(project, TrackKind.AUDIO)
         panel.set_project(project)
@@ -145,6 +146,8 @@ class TestEffectMenu:
         assert _menu_categories(panel) == {"音"}
 
     def test_a_text_lists_no_sound_effects(self, panel: InspectorPanel) -> None:
+        # テキストに音のエフェクトが並ぶと、積んでも何も鳴らない
+        # 逆にぼかしが消えると文字をぼかせない
         project = Project.create()
         for command in insert_generated(project, TEXT.create()):
             project = command.apply(project)

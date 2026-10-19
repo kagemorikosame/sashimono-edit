@@ -113,6 +113,7 @@ class TestShelfRoots:
     def test_the_dialog_lists_only_the_given_roots(
         self, shots: ModuleType, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 渡した置き場の外まで読むと、撮った機械の配布物のエイリアスが README の棚の写真に並ぶ
         del shots, qt_application
         from sashimono.ui.template_dialog import TemplateDialog
 
@@ -143,6 +144,7 @@ class TestShelfThumbnailsInShots:
     def test_it_waits_for_the_pictures_not_for_time(
         self, shots: ModuleType, qt_application: QApplication, tmp_path: Path
     ) -> None:
+        # 決まった時間だけ待つと、遅い機械では地だけの見本が写り、速い機械では撮影が無駄に長引く
         del qt_application
         from sashimono.ui.library_thumbnails import THUMBNAILS_SIMPLE, LookThumbnails
         from sashimono.ui.library_view import LibraryOptions
@@ -178,6 +180,7 @@ class TestSampleTemplates:
     """
 
     def test_every_sample_is_on_the_shelf(self, shots: ModuleType, tmp_path: Path) -> None:
+        # 見本が棚に揃わないと、README が名前を挙げている型が見つからず棚の写真が撮れない
         root = shots.write_sample_templates(tmp_path / "見本")
         names = {entry.name.rsplit("/", 1)[-1] for entry in TemplateCatalog().scan((root,))}
         expected = set(shots.SAMPLE_ALIASES) | {name for name, _ in shots.SAMPLE_YMM4}
@@ -268,6 +271,7 @@ class TestTranscribeShot:
     def test_the_shot_opens_the_first_time_state(
         self, shots: ModuleType, qt_application: QApplication, video_media: MediaItem
     ) -> None:
+        # 導入済みの機械で「環境を更新」のまま開くと、囲むボタンが見つからず撮影が落ちる
         del qt_application
         from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 
@@ -511,6 +515,7 @@ class TestWikiVersion:
         assert other.read_bytes() == b"# Home\r\n"
 
     def test_the_default_is_the_running_version(self, shots: ModuleType) -> None:
+        # 既定が今の版でないと、引数なしで撮り直した手順書の頭に古い版の数字が書かれる
         from sashimono import __version__
 
         assert shots.stamp_wiki_version.__defaults__ == (__version__,)

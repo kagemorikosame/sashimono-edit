@@ -138,9 +138,9 @@ class TestCredentials:
     def test_an_api_key_in_the_environment_counts(
         self, machine: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        del machine
         # 壊れると、API キーで使っている人にも、要らないログインの案内が出続ける
         # 値の中身は見ない 在るかどうかだけ
+        del machine
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         assert environment.credentials_found() is True
 

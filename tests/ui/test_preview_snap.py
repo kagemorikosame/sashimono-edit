@@ -97,12 +97,14 @@ class TestSnapping:
 
 class TestSetting:
     def test_it_is_on_by_default_and_kept(self, tmp_path: Path) -> None:
+        # 既定で切れていると知らない人は吸着に気付けず、切った設定が残らないと起動のたびに戻る
         assert Preferences().preview_snap is True
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(preview_snap=False))
         assert store.load().preview_snap is False
 
     def test_the_dialog_returns_it(self, qt_application: QApplication) -> None:
+        # 画面が値を返さないと、設定を開いて OK を押しただけで切った吸着がまた入る
         del qt_application
         from sashimono.ui.preferences_dialog import PreferencesDialog
 
