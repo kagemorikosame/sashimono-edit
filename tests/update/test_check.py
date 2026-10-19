@@ -24,12 +24,14 @@ def key() -> Ed25519PrivateKey:
 
 class TestTheAnswer:
     def test_a_newer_version_is_offered(self, key: Ed25519PrivateKey) -> None:
+        # 新しい版を見落とすと、起動時の確認は黙り、〔更新を確かめる…〕も「最新です」と言う
         transport, manifest = release(key, "1.2.0")
         result = check_for_update("1.1.0", transport=transport, keys=[key.public_key()])
         assert result.outcome is Outcome.AVAILABLE
         assert result.manifest == manifest
 
     def test_the_same_version_is_up_to_date(self, key: Ed25519PrivateKey) -> None:
+        # 今と同じ版を新しい版と見ると、入れ終えた後も同じ版を落として入れ替えを勧め続ける
         transport, _ = release(key, "1.2.0")
         result = check_for_update("1.2.0", transport=transport, keys=[key.public_key()])
         assert result.outcome is Outcome.UP_TO_DATE
@@ -65,6 +67,7 @@ class TestTheSignatureGate:
         assert result.outcome is Outcome.FAILED
 
     def test_a_stranger_key_is_ignored(self, key: Ed25519PrivateKey) -> None:
+        # 埋め込んでいない鍵の署名を通すと、配布元でない誰かの目録が指す zip を落として入れる
         stranger = Ed25519PrivateKey.generate()
         transport, _ = release(stranger, "1.2.0")
         result = check_for_update("1.1.0", transport=transport, keys=[key.public_key()])
@@ -80,6 +83,7 @@ class TestTheSignatureGate:
         assert result.outcome is Outcome.AVAILABLE
 
     def test_a_missing_signature_is_ignored(self, key: Ed25519PrivateKey) -> None:
+        # 署名の無い目録を通すと、目録を差し替えるだけで偽の zip を入れさせられる
         transport, _ = release(key, "1.2.0")
         del transport.redirects[STABLE_MANIFEST_URL + SIGNATURE_SUFFIX]
         result = check_for_update("1.1.0", transport=transport, keys=[key.public_key()])
@@ -102,12 +106,14 @@ class TestTheSignatureGate:
 
 class TestTheBetaChannel:
     def test_beta_is_not_read_unless_asked(self, key: Ed25519PrivateKey) -> None:
+        # ベータを選んでいない人がベータの目録を読むと、先行版を落として入れ替えを勧められる
         transport, _ = release(key, "1.2.0")
         release(key, "1.3.0b1", transport=transport, beta=True)
         result = check_for_update("1.1.0", transport=transport, keys=[key.public_key()])
         assert result.manifest is not None and result.manifest.version == "1.2.0"
 
     def test_the_newer_of_the_two_is_taken(self, key: Ed25519PrivateKey) -> None:
+        # ベータを選んだ人に古い方の正式版を採ると、出たばかりのベータが届かない
         transport, _ = release(key, "1.2.0")
         release(key, "1.3.0b1", transport=transport, beta=True)
         result = check_for_update("1.1.0", transport=transport, keys=[key.public_key()], beta=True)
@@ -129,6 +135,7 @@ class TestTheBetaChannel:
 
 class TestSkippedVersions:
     def test_a_skipped_version_is_not_offered(self, key: Ed25519PrivateKey) -> None:
+        # 〔この版を飛ばす〕や前の版に戻した版を除かないと、起動の確認がその版をまた落として勧める
         transport, _ = release(key, "1.2.0")
         result = check_for_update(
             "1.1.0", transport=transport, keys=[key.public_key()], skipped=["1.2.0"]
@@ -136,6 +143,7 @@ class TestSkippedVersions:
         assert result.outcome is Outcome.UP_TO_DATE
 
     def test_a_skipped_beta_leaves_the_release(self, key: Ed25519PrivateKey) -> None:
+        # 飛ばしたベータと一緒に正式版まで捨てると、ベータを 1 本飛ばしただけで正式版も届かない
         transport, _ = release(key, "1.2.0")
         release(key, "1.3.0b1", transport=transport, beta=True)
         result = check_for_update(
@@ -154,9 +162,12 @@ class TestHowOften:
         assert not is_due(1000.0, 1000.0 + CHECK_INTERVAL_SECONDS - 1)
 
     def test_again_after_it(self) -> None:
+        # 間隔を過ぎた起動でも確かめに行かないと、起動時に新しい版を知らせなくなる
         assert is_due(1000.0, 1000.0 + CHECK_INTERVAL_SECONDS)
 
     def test_the_first_time(self) -> None:
+        # 1 度も確かめていない（覚え書きの時刻が 0）起動で確かめないと、入れたばかりの人に
+        # 新しい版を知らせない
         assert is_due(0.0, 1000.0 + CHECK_INTERVAL_SECONDS)
 
     def test_a_clock_moved_back(self) -> None:
@@ -164,4 +175,6 @@ class TestHowOften:
         assert is_due(5000.0, 1000.0)
 
     def test_hours_not_minutes(self) -> None:
+        # 間隔を分の単位まで縮めると開き直すたびに GitHub へ取りに行き、半日より延ばすと
+        # 新しい版を知るのが遅れる
         assert 3 * 60 * 60 <= CHECK_INTERVAL_SECONDS <= 12 * 60 * 60

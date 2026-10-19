@@ -25,6 +25,8 @@ def _state(frame: int = 0) -> ObjectState:
 
 class TestSplitting:
     def test_code_and_text_alternate(self) -> None:
+        # 文字と Lua の境目を取り違えると、字幕に Lua のソースが映るか、前後の 残り や 秒 が
+        # 消える
         assert split_embedded("残り<?mes(3)?>秒") == [
             (False, "残り"),
             (True, "mes(3)"),
@@ -57,6 +59,7 @@ class TestExpansion:
         assert runtime.expand_text(text, _state()) == "前後"
 
     def test_mes_writes_in_place(self, runtime: LuaScriptRuntime) -> None:
+        # mes の書き出しがその場所に入らないと、残り 6 秒 のような数え上げの字幕で数字が消える
         assert runtime.expand_text("残り<?mes(10 - 4)?>秒", _state()) == "残り6秒"
 
     def test_obj_follows_the_frame(self, runtime: LuaScriptRuntime) -> None:
@@ -69,6 +72,8 @@ class TestExpansion:
         assert runtime.expand_text("<?n = 7?>値=<?mes(n)?>", _state()) == "値=7"
 
     def test_the_short_form_prints_the_value(self, runtime: LuaScriptRuntime) -> None:
+        # <?=式?> を mes と同じに扱わないと、= で始まる部分が構文の誤りになり、その字幕は
+        # 値を出さない
         assert runtime.expand_text("<?=1+2?>", _state()) == "3"
 
     def test_text_with_brackets_survives(self, runtime: LuaScriptRuntime) -> None:
@@ -76,6 +81,7 @@ class TestExpansion:
         assert runtime.expand_text("]] ]=] 前<?mes('x')?>\n後", _state()) == "]] ]=] 前x\n後"
 
     def test_a_broken_block_shows_only_the_text(self, runtime: LuaScriptRuntime) -> None:
+        # 読めない Lua を書いた字幕で 前 と 後 だけを残せないと、ソースが映るか本文ごと消える
         assert runtime.expand_text("前<?mes(?>後", _state()) == "前後"
 
     def test_mes_does_not_leak_into_scripts(self, runtime: LuaScriptRuntime) -> None:
@@ -86,7 +92,14 @@ class TestExpansion:
         assert target.ox == 1.0
 
     def test_plain_text_is_untouched(self, runtime: LuaScriptRuntime) -> None:
+        # 埋め込みの無い本文を変えて返すと、呼び手にふつうの字幕の文字が崩れて渡る
+        # （描画は has_embedded で先に分けている）
         assert runtime.expand_text("ただの字幕", _state()) == "ただの字幕"
 
-    def test_the_source_is_one_chunk(self) -> None:
-        assert build_source("a<?x=1?>").count("function mes") == 1
+    def test_the_source_is_one_chunk(self, runtime: LuaScriptRuntime) -> None:
+        # 本文を 1 本の Lua に組まないと、前の <? ?> で作った変数が後ろで nil になる
+        # local で作った変数で見る 部分ごとに do … end や関数で包むと大域の変数は届くので
+        # test_blocks_share_variables は通るが、local の変数だけ後ろで nil になる
+        text = "<?local n = 7?>値=<?mes(n)?>"
+        assert build_source(text).count("function mes") == 1
+        assert runtime.expand_text(text, _state()) == "値=7"

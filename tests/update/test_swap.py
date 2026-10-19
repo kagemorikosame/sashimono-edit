@@ -87,6 +87,8 @@ def _plan(layout: Layout, mode: str = "apply", **changes: object) -> SwapPlan:
 
 class TestApplying:
     def test_the_new_version_takes_the_place(self, layout: Layout, tmp_path: Path) -> None:
+        # 入れ替わらないと再起動しても古い版のままで、.previous が残らないと
+        # 〔前の版に戻す…〕が使えない
         _folder(layout.staged, HEALTHY)
         (layout.staged / "version.txt").write_text("new", encoding="ascii")
         lines = _run(_plan(layout), tmp_path / "update")
@@ -247,6 +249,7 @@ class TestTheNewVersionsScript:
         )
 
     def test_the_staged_script_runs_the_swap(self, layout: Layout, tmp_path: Path) -> None:
+        # 新しい版の台本を使わないと、入れ替え係の不具合を直しても 1 つ前の版からの更新には効かない
         marked = HELPER_SCRIPT.replace(
             "Write-Result 'holding'\n", "Write-Result 'holding'\n    Write-Result 'new-script'\n", 1
         )
@@ -273,6 +276,8 @@ class TestTheNewVersionsScript:
         assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
 
     def test_a_missing_or_empty_script_keeps_the_current_script(self, layout: Layout) -> None:
+        # 空や消えた台本を頼ると入れ替え係が何もせず、本体は待った末に
+        # 「入れ替えを始められません」と出す
         self._stage_script(layout, "  \n")
         assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False)
         (layout.staged / BUNDLED_SCRIPT).unlink()
@@ -292,6 +297,7 @@ class TestTheNewVersionsScript:
             assert helper_script(_plan(layout)) == (HELPER_SCRIPT, False), pointed
 
     def test_rolling_back_uses_the_current_script(self, layout: Layout) -> None:
+        # 戻すときに .new の台本を使うと、入れてもいない版の台本で戻し、それが壊れていれば戻せない
         self._stage_script(layout, "exit 1")
         assert helper_script(_plan(layout, "rollback")) == (HELPER_SCRIPT, False)
 
@@ -302,6 +308,8 @@ class TestLeavingTheInstallFolder:
     def test_an_app_started_from_explorer_moves_out(
         self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Explorer から起こした本体が作業場所を移さないと、子が受け継いで
+        # 次の更新が install-locked で止まる
         home = tmp_path / "home"
         home.mkdir()
         monkeypatch.chdir(layout.install / ".")
@@ -311,6 +319,8 @@ class TestLeavingTheInstallFolder:
     def test_a_folder_inside_the_install_folder_also_moves_out(
         self, layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 中のフォルダや綴りの大小が違う場所を外と見ると、そこで起こした本体が
+        # 次の更新の改名を断らせる
         inner = layout.install / "SCRIPTS"
         inner.mkdir()
         monkeypatch.chdir(inner)
@@ -328,6 +338,7 @@ class TestLeavingTheInstallFolder:
     def test_the_development_tree_stays(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 開発の環境で作業場所をホームへ移すと、相対の場所で触る開発の道具がリポジトリの外を見る
         monkeypatch.chdir(tmp_path)
         assert leave_install_folder(None, tmp_path / "home") is None
         assert Path.cwd() == tmp_path
@@ -419,6 +430,8 @@ class TestTheHandshake:
     def test_the_new_version_marks_its_start(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 印を書けないと入れ替え係は新しい版が起動できなかったと数えて前の版へ戻し、環境変数を残すと
+        # 本体が起こす子（pip など）にも印の場所が渡る
         mark = tmp_path / "started.txt"
         monkeypatch.setenv(HEALTH_ENV, str(mark))
         mark_started()
@@ -429,8 +442,16 @@ class TestTheHandshake:
     def test_a_normal_start_marks_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 入れ替え係に起こされていない起動で印を書くと、窓を出すたびに要らないファイルを残す
+        # 作業場所を tmp_path へ移し、書き込みも見張る 作業場所や更新の置き場など別の所へ
+        # 書いても、tmp_path が空かだけでは気付けない
+        monkeypatch.chdir(tmp_path)
         monkeypatch.delenv(HEALTH_ENV, raising=False)
+        written: list[Path] = []
+        monkeypatch.setattr(Path, "write_text", lambda self, *_a, **_k: written.append(self))
+        monkeypatch.setattr(Path, "write_bytes", lambda self, *_a, **_k: written.append(self))
         mark_started()
+        assert written == []
         assert list(tmp_path.iterdir()) == []
 
     def test_the_script_is_plain_ascii_outside_comments(self) -> None:

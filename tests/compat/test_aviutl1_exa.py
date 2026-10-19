@@ -165,6 +165,8 @@ class TestSections:
         assert not obj.span_given
 
     def test_the_audio_and_scene_change_sections_are_read(self) -> None:
+        # [ao] [v.0] を受けないと、PSDToolKit の wav.exa やシーンチェンジのエイリアスが
+        # オブジェクト 0 個で読まれ、棚から置いても何も入らない
         assert [e.name for e in parse_exo(AUDIO_ALIAS).objects[0].entries] == [
             "音声ファイル",
             "標準再生",
@@ -172,6 +174,8 @@ class TestSections:
         assert parse_exo(SCENE_ALIAS).objects[0].entries[0].name == "シーンチェンジ"
 
     def test_the_text_is_mapped(self) -> None:
+        # 本文か length を読み落とすと、棚から置いた Subtitle.exa の字幕が
+        # 空の文字か 1 フレームになる
         mapped = map_object(parse_exo(TEXT_ALIAS).objects[0], RATE, report=CompatibilityReport())
         assert mapped is not None
         assert mapped.clip.source is not None
@@ -194,6 +198,8 @@ class TestEnglishNames:
         )
 
     def test_the_english_drawing_is_placed(self) -> None:
+        # Zoom% や Clearness を読み替え損ねると、Subtitle_en.exa の字幕が
+        # 元の大きさ・不透明のまま置かれる
         report = CompatibilityReport()
         mapped = map_object(parse_exo(ENGLISH_ALIAS).objects[0], RATE, report=report)
         assert mapped is not None
@@ -222,6 +228,8 @@ class TestTrackLines:
         assert "AviUtl の移動方法: AviUtl1 の番号 7" in report.missing
 
     def test_plain_values_are_left_alone(self) -> None:
+        # 動きの無い値まで書き換えると、AviUtl1 のエイリアスから読む数や色が崩れ、
+        # 置いた物の大きさや色が変わる
         assert from_aviutl1("100.00") == "100.00"
         assert from_aviutl1("ffffff") == "ffffff"
 
@@ -242,6 +250,8 @@ class TestEffectOnly:
         assert not report.missing
 
     def test_the_tracks_and_the_dialog_are_read(self, scripts: ScriptCatalog) -> None:
+        # param を読み落とすと 内側シャドー の色や画像がスクリプトの既定のまま掛かり、
+        # [[...]] の中の ; で切ると画像の名前が欠ける
         del scripts
         mapped = map_object(parse_exo(EFFECT_ALIAS).objects[0], RATE, report=CompatibilityReport())
         assert mapped is not None
@@ -259,6 +269,7 @@ class TestEffectOnly:
         assert "_0" not in params
 
     def test_a_missing_script_is_counted_by_name(self, scripts: ScriptCatalog) -> None:
+        # 束の名前まで含めて数えないと、互換性レポートからどの配布物を入れれば直るかが分からない
         del scripts
         report = CompatibilityReport()
         text = EFFECT_ALIAS.replace("内側シャドー@効果集σ", "内側シャドー@別の束")
@@ -307,6 +318,8 @@ class TestSceneChange:
     def test_a_scripted_scene_change_becomes_a_transition_running_the_script(
         self, scene_scripts: ScriptCatalog
     ) -> None:
+        # .scn に繋がらないと ディザワイプ が描かれず真ん中で入れ替わるだけになり、
+        # 同じ名前の .anm に繋がると前の場面の効果として掛かる
         report = CompatibilityReport()
         mapped = map_object(parse_exo(SCENE_ALIAS).objects[0], RATE, report=report)
         assert mapped is not None
@@ -388,6 +401,7 @@ class TestSceneChange:
 
 class TestScriptedContents:
     def test_the_audio_volume_is_kept(self) -> None:
+        # 標準再生 の音量を写さないと、wav.exa で 50 に絞った音が棚から置くと元の大きさで鳴る
         report = CompatibilityReport()
         mapped = map_object(parse_exo(AUDIO_ALIAS).objects[0], RATE, report=report)
         assert mapped is not None
@@ -406,6 +420,8 @@ class TestDialog:
         assert [spec.name for spec in header.parameters] == ["_1"]
 
     def test_a_long_string_default_is_text(self) -> None:
+        # [[]] を数と読むと パターン画像 の欄がスライダーになり、画像の名前を入れたエイリアスを
+        # 読むたびに「数として読めない値」と記録される
         (spec,) = parse_control("--dialog:パターン画像,_2=[[]];").parameters
         assert isinstance(spec, TextSpec)
         assert spec.default == ""

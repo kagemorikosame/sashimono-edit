@@ -62,6 +62,7 @@ class TestTheTableIsKeyedByTheAviutlName:
     """``座標`` ``拡大率`` ``回転`` はどれも変形へ写すが、``X`` の意味が違う"""
 
     def test_the_coordinate_filter_moves(self) -> None:
+        # 座標 の Y を反転し損ねると、読み込んだクリップが AviUtl と上下逆の向きへずれる
         effect = _one("座標\nX=100\nY=50\nZ=0")
         assert effect.kind == "transform"
         assert _value(effect, "pos_x") == 100.0
@@ -93,6 +94,7 @@ class TestTheTableIsKeyedByTheAviutlName:
         assert _value(effect, "scale_y") == 25.0
 
     def test_the_rotate_filter_turns(self) -> None:
+        # 回転 の Z を写せないと、AviUtl で傾けた物が読み込み後にまっすぐ立って出る
         effect = _one("回転\nX=0\nY=0\nZ=45")
         assert _value(effect, "rotation") == 45.0
 
@@ -105,6 +107,7 @@ class TestValuesThatNeedFixing:
         assert _value(effect, "amount") == 70.0
 
     def test_the_shadow_offset_flips(self) -> None:
+        # 影の Y を反転し損ねると下へ落とした影が文字の上に出る 拡散を落とすと影がくっきりする
         effect = _one("ドロップシャドウ\nX=10\nY=20\n濃さ=80\n拡散=5\n影色=000000")
         assert effect.kind == "shadow"
         assert _value(effect, "offset_y") == -20.0
@@ -118,6 +121,7 @@ class TestValuesThatNeedFixing:
         assert _value(effect, "range_y") == 8.0
 
     def test_a_quarter_turn_becomes_degrees(self) -> None:
+        # 回す数を角度へ直さないと、ローテーション 2（180 度）が 2 度しか回らない
         effect = _one("ローテーション\n90度回転=2")
         assert _value(effect, "rotation") == 180.0
 
@@ -126,6 +130,7 @@ class TestAppearance:
     """登場と退場 AviUtl はフェードとワイプだけ「イン」「アウト」を秒で持つ"""
 
     def test_fade_reads_both_ends(self) -> None:
+        # イン・アウトの片方を読み落とすと、読み込んだクリップがフェードせずにいきなり出るか消える
         effect = _one("フェード\nイン=0.50\nアウト=0.50")
         assert effect.kind == "inout_fade"
         assert effect.params["effect_in"] is True
@@ -133,6 +138,7 @@ class TestAppearance:
         assert _value(effect, "effect_time") == 0.5
 
     def test_only_an_out_time_means_no_entrance(self) -> None:
+        # イン 0 を登場ありと読むと、消えるときだけフェードさせた物が出るときにもフェードする
         effect = _one("フェード\nイン=0\nアウト=1.0")
         assert effect.params["effect_in"] is False
         assert effect.params["effect_out"] is True
@@ -145,6 +151,8 @@ class TestAppearance:
         assert any("違う時間" in line for line in report.lines())
 
     def test_a_wipe_keeps_its_shape(self) -> None:
+        # 形を落とすと円で開くワイプが別の形になり、反転やぼかしを落とすと
+        # 開く向きと縁の柔らかさが変わる
         effect = _one(
             "ワイプ\nイン=0.5\nアウト=0\nぼかし=2\nワイプの種類=ワイプ(円)\n反転(イン)=1\n反転(アウト)=0"
         )
@@ -164,16 +172,19 @@ class TestAppearance:
         [(0.0, "right"), (90.0, "bottom"), (180.0, "left"), (270.0, "top")],
     )
     def test_the_angle_chooses_the_direction(self, angle: float, expected: str) -> None:
+        # 角度と向きの表を取り違えると、画面外から登場 が AviUtl と違う辺から入ってくる
         effect = _one(f"画面外から登場\n時間=0.5\n角度={angle}\n数=1\nランダム方向=0")
         assert effect.kind == "inout_move"
         assert effect.params["direction"] == expected
 
     def test_an_angle_between_directions_is_recorded(self) -> None:
+        # 斜めの角度を黙って上下左右へ丸めると、入る向きが変わったことが互換性レポートに出ない
         effects, report = _effects("画面外から登場\n時間=0.5\n角度=45\n数=1\nランダム方向=0")
         assert effects[0].params["direction"] in ("right", "bottom")
         assert any("角度" in line for line in report.lines())
 
     def test_spreading_flattens_one_axis(self) -> None:
+        # 縮める軸を取り違えると、横に広がって出るはずの 広がって登場 が縦に広がる
         effect = _one("広がって登場\n時間=0.3\n縦方向=0")
         assert effect.kind == "inout_zoom"
         # 隠れたときは横が 0（縦方向の旗が立つと軸が入れ替わる）
@@ -181,17 +192,20 @@ class TestAppearance:
         assert _value(effect, "zoom_y") == 100.0
 
     def test_spreading_vertically_swaps_the_axes(self) -> None:
+        # 縦方向 の旗を読み落とすと、縦に広がって出るはずの物が横に広がる
         effect = _one("広がって登場\n時間=0.3\n縦方向=1")
         assert _value(effect, "zoom_x") == 100.0
         assert _value(effect, "zoom_y") == 0.0
 
     def test_the_bounce_count_becomes_one_period(self) -> None:
+        # 回数を 1 回の長さへ直さないと、4 回弾むはずの 弾んで登場 が別の回数で弾む
         effect = _one("弾んで登場\n時間=2.0\n高さ=200\n回数=4")
         assert effect.kind == "inout_jump"
         assert _value(effect, "height") == 200.0
         assert _value(effect, "period") == 0.5
 
     def test_the_easing_flag_smooths_both_ends(self) -> None:
+        # 加減速 を読み落とすと、拡大縮小して登場 が両端で滑らかにならず一定の速さで動く
         effect = _one("拡大縮小して登場\n時間=0.3\n拡大率=300\n加減速=1")
         assert effect.kind == "inout_zoom"
         assert _value(effect, "zoom") == 300.0
@@ -199,12 +213,15 @@ class TestAppearance:
         assert effect.params["easing_mode"] == "inout"
 
     def test_settings_that_cannot_be_copied_are_recorded(self) -> None:
+        # 勢い を黙って捨てると、起き上がり方が違うのに互換性レポートに出ず、
+        # 埋める穴として数えられない
         _, report = _effects("起き上がって登場\n時間=0.6\n勢い=2.0")
         assert any("勢い" in line for line in report.lines())
 
 
 class TestShapesAndSwings:
     def test_the_fan_clip_uses_the_fan_shape(self) -> None:
+        # 扇の形と範囲角を写さないと、90 度だけ残すはずの 扇クリッピング が別の形に切り抜く
         effect = _one("扇クリッピング\n中心X=0\n中心Y=0\n基準角=0\n範囲角=90\nぼかし=0")
         assert effect.kind == "shape_mask"
         assert effect.params["shape"] == "fan"
@@ -437,6 +454,8 @@ class TestSelectsWrittenAsNumbers:
     """
 
     def test_a_numeric_choice_is_recorded(self) -> None:
+        # 番号で書かれた向きを黙って既定へ落とすと、AviUtl1 のミラーの向きが変わっても
+        # 互換性レポートに出ない
         _, report = _effects("ミラー\n透明度=0\n減衰=0\n境目調整=0\nミラーの方向=0")
         assert any("ミラーの項目: ミラーの方向" in line for line in report.lines())
 

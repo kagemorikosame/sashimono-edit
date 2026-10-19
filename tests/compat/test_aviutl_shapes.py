@@ -80,11 +80,13 @@ class TestTheSecondGeneration:
         assert source.params["outline_only"] is False
 
     def test_a_thin_line_stays_an_outline(self) -> None:
+        # 細い線を塗りつぶしと見なすと、AviUtl で輪郭だけだった円が塗られた円として読み込まれる
         source = _source("図形\n図形の種類=円\nサイズ=100\n色=ffffff\nライン幅=8")
         assert _value(source, "line_width") == 8.0
         assert source.params["outline_only"] is True
 
     def test_rounded_corners_change_the_kind(self) -> None:
+        # 角を丸くする を見落とすと、角丸の四角形が角の立った四角形として読み込まれる
         source = _source("図形\n図形の種類=四角形\nサイズ=100\n色=ffffff\n角を丸くする=1")
         assert source.params["shape"] == "rounded"
 
@@ -313,10 +315,12 @@ class TestTheFirstGeneration:
 
 class TestConcentration:
     def test_the_custom_object_becomes_a_shape(self) -> None:
-        source = _source("集中線\n濃さ=40.0\n速さ=25.0\n中心幅=0\n色=ffffff")
+        # 集中線を図形の集中線として写せないと、読み込んだ集中線が別の絵で描かれる
+        # 速さは既定の 25 と違う値にする 同じ値だと速さを読み落としても通る
+        source = _source("集中線\n濃さ=40.0\n速さ=60.0\n中心幅=0\n色=ffffff")
         assert source.kind == "shape"
         assert source.params["shape"] == "concentration"
-        assert _value(source, "flicker") == 25.0
+        assert _value(source, "flicker") == 60.0
         # AviUtl の集中線は中心幅が 0 でも画面いっぱい 空きの有無で描き方を
         # 分けると、空きを 0 にしたものだけが小さな円に縮む
         assert source.params["fill_frame"] is True
@@ -418,6 +422,8 @@ class TestCustomObjects:
         assert any("多角形の座標" in line for line in report.lines())
 
     def test_a_counter_becomes_a_timer(self) -> None:
+        # カウンターが数の進む文字として読み込まれず、初期値・速さ・フォントが
+        # AviUtl と違う表示になる
         source = _source(
             "カウンター\n初期値=5.0\n速度=2.0\nサイズ=34.0"
             + "\n表示形式=標準\nフォント名=MS UI Gothic\n文字色=ffffff"
@@ -482,6 +488,8 @@ class TestWhatTheSecondReviewFound:
         assert any("扇型の動く中心角" in line for line in report.lines())
 
     def test_a_moving_counter_speed_is_recorded(self) -> None:
+        # 速度の動きは先頭の値で止めて写す 記録に残らないと、だんだん速く数えるはずの
+        # カウンターが一定の速さになったことに互換性レポートで気付けない
         _, report = _mapped("カウンター\n初期値=0\n速度=1,5,直線移動,0\nフォント名=MS UI Gothic")
         assert any("カウンターの動く速度" in line for line in report.lines())
 

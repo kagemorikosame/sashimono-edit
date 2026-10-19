@@ -12,6 +12,7 @@ import pytest
 from sashimono.compat.aviutl.exo import parse_exo
 from sashimono.compat.aviutl.mapping import map_object
 from sashimono.compat.aviutl.report import CompatibilityReport
+from sashimono.compat.decoration import decoration_params, find_decoration
 from sashimono.core.model import AnimatedValue
 from sashimono.core.timebase import FrameRate
 
@@ -106,6 +107,8 @@ class TestTextField:
         assert entry.text() == "一行目" + chr(10) + "二行目"
 
     def test_the_old_generation_still_decodes_hex(self) -> None:
+        # AviUtl1 の 16 進を解かずに渡すと、
+        # .exo や .exa から読み込んだ字幕が「4200」のような数字の列で出る
         old = (
             "[0]"
             + chr(10)
@@ -136,14 +139,20 @@ class TestDecoration:
         assert width.at(0) == pytest.approx(60.0 * 0.12)
 
     def test_the_outline_takes_the_edge_colour(self) -> None:
+        # 影・縁色 を読み落とすと、AviUtl から読み込んだ字幕の縁が配布物の色ではなく既定の黒で出る
         item = mapped(SUBTITLE)
         source = item.clip.source  # type: ignore[attr-defined]
         assert source is not None
-        assert source.params["border_color"] == pytest.approx(
-            (0x10 / 255, 0x20 / 255, 0x30 / 255, 1.0)
-        )
+        colour = (0x10 / 255, 0x20 / 255, 0x30 / 255, 1.0)
+        assert source.params["border_color"] == pytest.approx(colour)
+        # 読み込みは縁の無い装飾にも縁の色を後から足すので、上だけでは装飾から縁の色を
+        # 作る所（YMM4 や字幕の見た目でも使う）が色を落としても通ってしまう そこを直に見る
+        thick = find_decoration("縁取り文字（太）")
+        assert thick is not None
+        assert decoration_params(thick, 60.0, colour)["border_color"] == colour
 
     def test_a_shadow_decoration_offsets_down_and_right(self) -> None:
+        # 影の Y の向きを取り違えると、影付き文字 の字幕の影が字の右下ではなく右上へずれて出る
         text = SUBTITLE.replace("縁取り文字（太）", "影付き文字")
         source = mapped(text).clip.source  # type: ignore[attr-defined]
         assert source is not None
@@ -153,16 +162,22 @@ class TestDecoration:
         assert "border_width" not in source.params
 
     def test_the_thin_outline_is_thinner_than_the_thick_one(self) -> None:
+        # 細 と 太 を同じ太さで読むと、
+        # 縁取り文字（細）の字幕が太い縁で出て AviUtl2 の見た目と合わない
         thin = mapped(SUBTITLE.replace("（太）", "（細）")).clip.source  # type: ignore[attr-defined]
         thick = mapped(SUBTITLE).clip.source  # type: ignore[attr-defined]
         assert thin.params["border_width"].at(0) < thick.params["border_width"].at(0)
 
     def test_a_plain_decoration_adds_nothing(self) -> None:
+        # 標準文字 に縁や影を付けると、
+        # 飾りの無い字幕のエイリアスを読み込んだのに縁や影の付いた字で出る
         source = mapped(SUBTITLE.replace("縁取り文字（太）", "標準文字")).clip.source  # type: ignore[attr-defined]
         assert "border_width" not in source.params
         assert "shadow_x" not in source.params
 
     def test_an_unknown_decoration_is_recorded(self) -> None:
+        # 知らない装飾を黙って飾り無しにすると、AviUtl 互換性レポートに上がらず、
+        # どの装飾から埋めるか数えられない
         report = CompatibilityReport()
         obj = parse_exo(SUBTITLE.replace("縁取り文字（太）", "未知の飾り")).objects[0]
         map_object(obj, RATE, report=report)
@@ -189,6 +204,7 @@ class TestAlignment:
         assert (source.params["align"], source.params["valign"]) == ("center", "bottom")
 
     def test_the_middle_variant(self) -> None:
+        # [中] を引けないと 中央揃え[下] として読まれ、左寄せ[中] の字幕が横も縦もずれた所に置かれる
         source = mapped(SUBTITLE.replace("中央揃え[下]", "左寄せ[中]")).clip.source  # type: ignore[attr-defined]
         assert (source.params["align"], source.params["valign"]) == ("left", "middle")
 
@@ -226,9 +242,12 @@ class TestDrawSettings:
         assert any("差の絶対値" in line for line in report.lines())
 
     def test_opacity_comes_from_the_transparency(self) -> None:
+        # 透明度 を 1 から引かずに写すと、
+        # 少しだけ透かしたオブジェクトが読み込み後にほとんど見えなくなる
         assert mapped(SUBTITLE).clip.opacity.at(0) == pytest.approx(0.75)  # type: ignore[attr-defined]
 
     def test_the_position_becomes_a_transform(self) -> None:
+        # Y を裏返さないと、AviUtl で画面の下へ置いた字幕が読み込むと上へ出る
         effects = mapped(SUBTITLE).clip.effects  # type: ignore[attr-defined]
         assert effects[0].kind == "transform"
         # 画面の Y は下向き、AviUtl の Y も下向き こちらは上向きなので反転する
@@ -268,10 +287,14 @@ class TestGradient:
     )
 
     def test_the_gradient_is_mapped(self) -> None:
+        # グラデーション を写せないと、
+        # AviUtl から読み込んだ図形の色の移り変わりが消えて図形の色のまま出る
         effects = mapped(self.GRADIENT).clip.effects  # type: ignore[attr-defined]
         assert [e.kind for e in effects] == ["gradient"]
 
     def test_its_numbers_come_across(self) -> None:
+        # 強さ・角度・幅 の対応がずれると、
+        # 読み込んだグラデーションの濃さや向きや広がりが AviUtl と変わる
         effect = mapped(self.GRADIENT).clip.effects[0]  # type: ignore[attr-defined]
         assert effect.params["strength"].at(0) == pytest.approx(80.0)
         assert effect.params["angle"].at(0) == pytest.approx(90.0)
@@ -283,6 +306,7 @@ class TestGradient:
         assert effect.params["start_color"] == pytest.approx((0.0, 0xFB / 255, 0x7B / 255, 1.0))
 
     def test_the_shape_is_read_as_a_choice(self) -> None:
+        # 形状 の表示名を引けないと、AviUtl で 円形 にしたグラデーションの形が読み込み後に変わる
         effect = mapped(self.GRADIENT).clip.effects[0]  # type: ignore[attr-defined]
         assert effect.params["shape"] == "linear"
         radial = mapped(self.GRADIENT.replace("形状=線形", "形状=円形"))

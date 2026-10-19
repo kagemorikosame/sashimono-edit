@@ -29,6 +29,8 @@ def _counted() -> tuple[int, int, int]:
 
 
 def test_the_readme_counts_every_effect() -> None:
+    # エフェクトを足して README の数を直し忘れると、
+    # README が実際より少ない種類数を案内する（#274 では 80 種のまま 105 種）
     found = PATTERN.findall(README.read_text(encoding="utf-8"))
     assert len(found) == 1, "README にエフェクトの数の行が無いか、2 か所ある"
     written = tuple(int(n) for n in found[0])

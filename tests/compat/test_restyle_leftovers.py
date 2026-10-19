@@ -119,6 +119,8 @@ class TestLeftovers:
         assert _number(params["reveal"]) == 40.0
 
     def test_the_template_values_are_taken(self) -> None:
+        # テンプレートの大きさや組み方が入らないと、棚から字幕テンプレートを着せても
+        # 字の大きさと組み方が前のまま残る
         params = _params(_styled())
         assert _number(params["size"]) == 60.0
         assert params["layout"] == "aviutl"

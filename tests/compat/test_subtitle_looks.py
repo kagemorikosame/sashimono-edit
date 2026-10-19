@@ -263,6 +263,8 @@ class TestTemplateShelf:
 
 class TestByName:
     def test_presets_and_aliases_are_found_by_name(self, tmp_path: Path) -> None:
+        # AI が字幕の見た目を名前で頼んだとき、保存したエイリアスを引けないか、
+        # 断りに保存してある名前が出ず、AI が次に何を頼めばよいか分からない
         library = Library(
             presets=PresetStore(tmp_path / "presets"), aliases=AliasStore(tmp_path / "aliases")
         )
@@ -271,3 +273,18 @@ class TestByName:
         # 無い名前は、ある物の名前を添えて断る（AI が次に何を頼めばよいか分かるように）
         with pytest.raises(LookError, match="黄色"):
             find_choice(saved_looks(library), "alias", "無い")
+        # プリセットも名前で引ける 分類違いで同じ名前が 2 つあると、どちらかを黙って選ばずに
+        # 分類を指定するよう断る 黙って選ぶと、頼んだのと違う見た目で字幕を何十枚も置く
+        library.presets.save(Preset("見出し", source=_base(), category="字幕"))
+        library.presets.save(Preset("強調", source=_base(), category="字幕"))
+        library.presets.save(Preset("強調", source=_base(), category="見出し"))
+        saved = saved_looks(library)
+        heading = find_choice(saved, "preset", "見出し")
+        assert (heading.kind, heading.label) == ("preset", "見出し")
+        with pytest.raises(LookError, match="分類違い"):
+            find_choice(saved, "preset", "強調")
+        chosen = find_choice(saved, "preset", "強調", "見出し").item
+        assert isinstance(chosen, Preset)
+        assert chosen.category == "見出し"
+        with pytest.raises(LookError, match="字幕/見出し"):
+            find_choice(saved, "preset", "無い")

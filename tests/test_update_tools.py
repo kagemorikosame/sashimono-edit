@@ -117,6 +117,8 @@ class TestMakingKeys:
     def test_show_prints_the_public_key(
         self, keys_tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # show が鍵のファイルの公開鍵を出さないと、渡した鍵が TRUSTED_PUBLIC_KEYS のどれかを
+        # release.py の案内どおりに確かめられない
         key = Ed25519PrivateKey.generate()
         path = tmp_path / "k.key"
         path.write_bytes(encrypt_private_key(key, PASSPHRASE, n=2**10))
@@ -153,6 +155,7 @@ class TestTheManifest:
     def test_a_zip_without_build_info_is_refused(
         self, sign_tool: ModuleType, tmp_path: Path
     ) -> None:
+        # 書き付けの無い zip から目録を作れると、配った版が新しい版として受け取れない zip に署名する
         with pytest.raises(sign_tool.ReleaseError):
             sign_tool.build_manifest(_zip(tmp_path / "x.zip", info=False))
 
@@ -189,6 +192,7 @@ class TestSigning:
         manifest: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 署名を目録の隣の update.json.sig へ書かないと、release.py が署名を見つけられずに止まる
         monkeypatch.setattr(sign_tool, "TRUSTED_PUBLIC_KEYS", (public_key_text(key.public_key()),))
         code = sign_tool.main(
             ["sign", str(manifest), "--key", str(key_file)], ask=_answers(PASSPHRASE)
@@ -216,6 +220,7 @@ class TestSigning:
     def test_a_wrong_passphrase_writes_nothing(
         self, sign_tool: ModuleType, key_file: Path, manifest: Path
     ) -> None:
+        # 合言葉を打ち間違えても .sig を書くと、手で署名した人は署名できたと思って次の段へ進む
         code = sign_tool.main(
             ["sign", str(manifest), "--key", str(key_file)], ask=_answers("違う合言葉ですけれど")
         )
@@ -241,6 +246,7 @@ class TestSigning:
         manifest: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 埋め込んだ鍵で照らさないと、署名の後で書き換えた目録まで通り、配った版が断る目録を上げる
         from sashimono.update.signing import sign_manifest
 
         manifest.with_name("update.json.sig").write_bytes(sign_manifest(manifest.read_bytes(), key))
@@ -277,6 +283,8 @@ class TestSigning:
 
 class TestTheTag:
     def test_a_matching_tag_passes(self, sign_tool: ModuleType) -> None:
+        # 合っているタグで 1 を返すと、package.yml の check-tag でタグの組み立てが毎回止まり、
+        # 下書きが作られない
         assert sign_tool.main(["check-tag", f"v{__version__}"]) == 0
 
     @pytest.mark.parametrize("tag", ["v9.9.9", __version__, f"v{__version__}-fix"])

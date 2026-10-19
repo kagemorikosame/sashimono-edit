@@ -27,6 +27,8 @@ from sashimono.core.io.atomic import held_for_update
 
 class TestLock:
     def test_a_second_holder_is_refused(self, tmp_path: Path) -> None:
+        # 持たれている錠をもう 1 人が取れると、held_for_update で 1 人ずつにしている
+        # 読んで書き戻す所を 2 つの窓が同時に通り、後から書いた方が先の変更を消す
         first = try_hold(tmp_path / "a.lock")
         assert first is not None
         try:
@@ -35,6 +37,8 @@ class TestLock:
             first.release()
 
     def test_a_released_lock_is_free_again(self, tmp_path: Path) -> None:
+        # 手放した錠が空かないと、次に取りに来た held_for_update が待ち切れて
+        # TimeoutError で上がり、錠の中の書き戻しができない
         lock = try_hold(tmp_path / "a.lock")
         assert lock is not None
         lock.release()
