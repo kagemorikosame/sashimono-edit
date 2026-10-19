@@ -215,6 +215,8 @@ class TestTheContainer:
         assert [t.name for t in load_template(path)] == ["あ", "い", "う"]
 
     def test_the_classification_comes_from_path(self, tmp_path: Path) -> None:
+        # Path を分類として読まないと、
+        # テンプレートの窓で 1 つの .ymmt の 100 本超が 1 つの見出しに潰れる
         path = write_ymmt(tmp_path / "束.ymmt", template("アニメーション効果/振り子", text_item()))
         loaded = load_template(path)[0]
         assert loaded.path == ("アニメーション効果", "振り子")
@@ -227,6 +229,8 @@ class TestTheContainer:
         assert len(load_template(path)[0].items) == 1
 
     def test_broken_json_says_so(self, tmp_path: Path) -> None:
+        # JSON の失敗を Ymm4ParseError に変えないと、
+        # 壊れた .ymmt が 1 つあるだけで棚の走査ごと落ち、ほかのテンプレートも並ばない
         path = tmp_path / "壊れ.ymmt"
         path.write_text("{これは JSON ではない", "utf-8")
         with pytest.raises(Ymm4ParseError):
@@ -241,6 +245,8 @@ class TestTypeNames:
         assert type_name({"$type": raw}) == "TextItem"
 
     def test_a_missing_type_is_empty(self) -> None:
+        # $type の無い物や辞書でない値で例外を投げると、
+        # その .ymmt のテンプレートを選んだところで読み込みが止まる
         assert type_name({"Text": "x"}) == ""
         assert type_name("文字列") == ""
 
@@ -257,6 +263,8 @@ class TestAnimationPositions:
         assert frame_positions({"Frames": [60, 240], "Count": 2}, 300, 4) == [0, 60, 240, 300]
 
     def test_without_middle_points_it_spans_the_whole_item(self) -> None:
+        # 中間点の無い動きの終わりがアイテムの終わりに来ないと、
+        # YMM4 のテンプレートの動きが途中で止まるか終わりまでに着かない
         assert frame_positions({"Frames": [], "Count": 0}, 300, 2) == [0, 300]
 
     def test_a_mismatch_falls_back_to_even_spacing(self) -> None:
@@ -272,6 +280,8 @@ class TestAnimationPositions:
         assert value.at(150) == pytest.approx(50.0)
 
     def test_a_single_value_is_static(self) -> None:
+        # 値 1 つの項目にキーフレームを付けると、
+        # テンプレートを置いたクリップの動かない値までキーフレームを持つ値として写る
         value = animated(still(42.0), length=300)
         assert value.is_animated is False
         assert value.at(0) == 42.0
@@ -279,6 +289,7 @@ class TestAnimationPositions:
 
 class TestInterpolationNames:
     def test_japanese_names(self) -> None:
+        # 瞬間移動 を引けないと直線として読まれ、YMM4 では一度に切り替わる値がなめらかに動いてしまう
         assert interpolation_of("直線移動") is Interpolation.LINEAR
         assert interpolation_of("瞬間移動") is Interpolation.HOLD
 
@@ -343,9 +354,13 @@ class TestInterpolationNames:
 
 class TestValues:
     def test_a_bare_number(self) -> None:
+        # 素の数を読めないと Length のような項目が既定へ落ち、
+        # 300 フレームのアイテムが 1 フレームで置かれる
         assert number(60) == 60.0
 
     def test_an_animation_reads_as_its_first_value(self) -> None:
+        # 値の並びの形を読めないと、
+        # number で読む項目（文字装飾の太さを決める FontSize など）が既定へ落ちる
         assert number(still(60.0)) == 60.0
 
     def test_alpha_comes_first_in_a_colour(self) -> None:
@@ -353,9 +368,11 @@ class TestValues:
         assert colour("#80FF0000") == pytest.approx((1.0, 0.0, 0.0, 128 / 255))
 
     def test_a_colour_without_alpha_is_opaque(self) -> None:
+        # アルファの無い 6 桁の色を不透明にしないと、その色で描くはずの字や縁が透けるか消える
         assert colour("#00FF00") == pytest.approx((0.0, 1.0, 0.0, 1.0))
 
     def test_a_brush_hides_its_colour_one_level_down(self) -> None:
+        # Parameter の中の Color を引けないと、YMM4 の縁取りなどのブラシの色が既定の色で写る
         assert brush_colour(BRUSH) == pytest.approx((1.0, 1.0, 1.0, 1.0))
 
     def test_a_brush_that_is_not_a_single_colour_keeps_the_default(self) -> None:
@@ -376,6 +393,8 @@ class TestTextFields:
         assert self.mapped(Italic=True).params["italic"] is True
 
     def test_the_font_and_colour(self) -> None:
+        # Font と FontColor を読み落とすと、
+        # YMM4 の字幕テンプレートを置いても着せても既定のフォントと色で出る
         source = self.mapped()
         assert source.params["font"] == "Noto Sans JP Black"
         assert source.params["color"] == pytest.approx((0x2B / 255, 0x9F / 255, 0xE2 / 255, 1.0))
@@ -388,14 +407,17 @@ class TestTextFields:
         assert value_at(wide.params["line_spacing"]) == pytest.approx(120.0 * 0.5)
 
     def test_the_base_point_splits_into_two(self) -> None:
+        # BasePoint を横と縦に分けられないと、左下に揃えた YMM4 のテンプレートの字の寄せ方が変わる
         source = self.mapped(BasePoint="LeftBottom")
         assert (source.params["align"], source.params["valign"]) == ("left", "bottom")
 
     def test_the_default_base_point(self) -> None:
+        # CenterCenter を中央・真ん中に読まないと、YMM4 で真ん中に揃えた字幕がずれて置かれる
         source = self.mapped()
         assert (source.params["align"], source.params["valign"]) == ("center", "middle")
 
     def test_the_style_becomes_a_decoration(self) -> None:
+        # Style と StyleColor を読み落とすと、YMM4 の文字装飾で付けた縁が消えるか既定の色になる
         source = self.mapped(Style="SharpBorder", StyleColor="#FF112233")
         assert value_at(source.params["border_width"]) > 0
         assert source.params["border_color"] == pytest.approx(
@@ -403,6 +425,8 @@ class TestTextFields:
         )
 
     def test_an_unknown_style_is_recorded(self) -> None:
+        # 知らない Style を黙って捨てると、字の飾りが消えたことがテンプレートの窓の注意書きに出ず、
+        # どの文字装飾から埋めるか数えられない
         report = CompatibilityReport()
         map_template([text_item(Style="キラキラ")], report=report)
         assert any("キラキラ" in line for line in report.lines())
@@ -412,6 +436,8 @@ class TestVideoEffects:
     """実物の飾りは ``Decorations`` ではなくここに入っていた"""
 
     def test_the_outline_effect_becomes_the_text_border(self) -> None:
+        # 縁取りの太さと色を写し損ねると、
+        # YMM4 の縁取り付きの字幕テンプレートが違う太さや色の縁で出る
         item = text_item(VideoEffects=[outline(7.3)])
         source = map_template([item], report=CompatibilityReport())[0].clip.source
         assert source is not None
@@ -741,6 +767,7 @@ class TestVideoEffects:
         )
 
     def test_a_disabled_effect_is_skipped(self) -> None:
+        # 切ってある縁取りまで写すと、YMM4 では縁の無い字幕テンプレートに縁が付いて出る
         effect = outline(9.0)
         effect["IsEnabled"] = False
         item = text_item(VideoEffects=[effect])
@@ -809,6 +836,8 @@ class TestVideoEffects:
         assert report.missing["YMM4 のモザイクの形: Delaunay"] == 1
 
     def test_the_rotate_effect_uses_the_z_axis(self) -> None:
+        # RotateEffect の Z を回転へ写さないと、
+        # YMM4 で平面のまま回したテンプレートの絵が回らずに置かれる
         effect = {
             "$type": "YukkuriMovieMaker.Project.Effects.RotateEffect, YukkuriMovieMaker",
             "X": still(0.0),
@@ -860,6 +889,8 @@ class TestVideoEffects:
     def test_the_in_out_effects(
         self, name: str, fields: dict[str, Any], kind: str, expected: dict[str, Any]
     ) -> None:
+        # 時間・退場の旗・値を写し損ねると、YMM4 の登場と退場の動きが付いたテンプレートで、
+        # 動く時間や向きが変わるか退場の動きが消える
         effect = {
             "$type": f"YukkuriMovieMaker.Project.Effects.{name}, YukkuriMovieMaker",
             "IsInEffect": True,
@@ -907,6 +938,8 @@ class TestVideoEffects:
         assert value_at(mapped.params["spacing"]) == 7.0
 
     def test_the_inner_outline(self) -> None:
+        # 太さや「縁だけ」の旗を写し損ねると、YMM4 の内側の縁取りが違う太さで描かれるか、
+        # 縁だけのはずが元の絵ごと出る
         effect = {
             "$type": "N.InnerOutline.InnerOutlineEffect, YukkuriMovieMaker.Plugin.Community",
             "Thickness": 3.0,
@@ -1038,6 +1071,8 @@ class TestVideoEffects:
         assert any("Count" in line for line in report.lines())
 
     def test_an_unknown_effect_is_recorded_not_dropped(self) -> None:
+        # 知らないエフェクトを黙って捨てると、テンプレートの窓の注意書きにも互換性の記録にも出ず、
+        # どのエフェクトから埋めるか数えられない
         report = CompatibilityReport()
         map_video_effects(
             [{"$type": "N.MeshDeformationEffect, A", "IsEnabled": True}], report, length=1
@@ -1091,6 +1126,8 @@ class TestMeshDeformation:
         assert report.lines()
 
     def test_a_five_by_five_mesh_keeps_all_twentyfive_points(self) -> None:
+        # 5x5 の格子を諦めるか点を落とすと、
+        # 細かい格子で歪ませた YMM4 のテンプレートが歪まないまま出るか一部の点だけ動かない
         report = CompatibilityReport()
         (mapped,) = map_video_effects([mesh_effect(5, 5)], report, length=30).effects
         assert not report.lines()
@@ -1213,6 +1250,8 @@ class TestGroups:
         assert sorted(item.clip.duration for item in mapped) == [60, 300]
 
     def test_a_group_with_nothing_to_give_produces_nothing(self) -> None:
+        # 既定のままの入れ物から配置のエフェクトを作ると、
+        # 着せた先のクリップに何も変えない配置のエフェクトが足される
         assert map_template([group_item()], report=CompatibilityReport()) == []
 
     def test_an_item_outside_the_range_gets_nothing_from_the_group(self) -> None:
@@ -1506,22 +1545,29 @@ class TestPlacement:
         assert map_template([text_item(Layer=2)], report=CompatibilityReport())[0].layer == 3
 
     def test_the_span_comes_from_frame_and_length(self) -> None:
+        # Frame と Length を取り違えると、
+        # YMM4 のテンプレートを置いたクリップの長さやアイテムどうしの時刻の差が変わる
         clip = map_template([text_item(Frame=30, Length=120)], report=CompatibilityReport())[0].clip
         assert (clip.timeline_start, clip.duration) == (30, 120)
 
     def test_the_opacity_is_a_percentage(self) -> None:
+        # Opacity を百分率のまま渡すと、不透明度 40 のアイテムの透け方が YMM4 と変わる
         clip = map_template([text_item(Opacity=still(40.0))], report=CompatibilityReport())[0].clip
         assert clip.opacity.at(0) == pytest.approx(0.4)
 
     def test_the_y_axis_is_flipped(self) -> None:
+        # Y を裏返さないと、YMM4 で下へずらしたアイテムが置くと上へ出る
         mapped = map_template([text_item(Y=still(200.0))], report=CompatibilityReport())[0]
         assert mapped.clip.effects[0].kind == "transform"
         assert value_at(mapped.clip.effects[0].params["pos_y"]) == pytest.approx(-200.0)
 
     def test_a_still_item_adds_no_transform(self) -> None:
+        # 動かないアイテムにも配置のエフェクトを付けると、置いたクリップに何も変えない配置が積まれる
         assert map_template([text_item()], report=CompatibilityReport())[0].clip.effects == ()
 
     def test_an_unsupported_blend_is_recorded(self) -> None:
+        # 知らない合成モードを黙って通常にすると、
+        # 重なり方が YMM4 と変わった理由がテンプレートの窓の注意書きに出ない
         report = CompatibilityReport()
         mapped = map_template([text_item(Blend="Lighten")], report=report)
         assert mapped[0].clip.blend_mode == "normal"
@@ -1548,6 +1594,8 @@ class TestPlacement:
 
 class TestOtherItems:
     def test_a_transition_splits_its_effects_between_the_scenes(self) -> None:
+        # 前の場面と後の場面のエフェクトを取り違えると、
+        # YMM4 のトランジションで回るはずの前の場面ではなく後の場面が回る
         rotate = {
             "$type": "YukkuriMovieMaker.Project.Effects.RotateEffect, YukkuriMovieMaker",
             "X": still(0.0),
@@ -1598,6 +1646,7 @@ class TestOtherItems:
         assert value_at(mapped.clip.source.params["angle"]) == 0.0
 
     def test_a_media_item_returns_its_path(self) -> None:
+        # 素材のパスを返さないと素材が登録されず、置いた動画アイテムが描かれず鳴らないクリップになる
         item = {
             "$type": "YukkuriMovieMaker.Project.Items.VideoItem, YukkuriMovieMaker",
             "FilePath": "C:/素材/映像.mp4",
@@ -2176,6 +2225,8 @@ class TestItemSound:
         assert not any("VibratoEffect" in line for line in report.lines())
 
     def test_an_unknown_item_is_recorded_and_skipped(self) -> None:
+        # 知らないアイテムを黙って捨てると、
+        # テンプレートの一部が置かれない理由がテンプレートの窓の注意書きに出ない
         report = CompatibilityReport()
         assert map_template([{"$type": "N.TachieItem, A"}], report=report) == []
         assert any("TachieItem" in line for line in report.lines())
@@ -2251,6 +2302,7 @@ class TestDecorationsList:
     """``Decorations`` は実物では空だったが、形式にはあるので読めるままにする"""
 
     def test_a_border_decoration(self) -> None:
+        # Decorations の縁取りの太さを読み落とすと、この形で縁を書いたテンプレートの字の縁が消える
         result = map_decorations(
             [{"$type": "N.BorderDecoration, A", "Thickness": 6, "Color": "#FF000000"}],
             CompatibilityReport(),
@@ -2258,4 +2310,6 @@ class TestDecorationsList:
         assert value_at(result.params["border_width"]) == 6.0
 
     def test_something_that_is_not_a_list_is_ignored(self) -> None:
+        # Decorations の無いテキストアイテムで例外を投げると、
+        # その YMM4 の字幕テンプレートを選んだところで読み込みが止まる
         assert map_decorations(None, CompatibilityReport()).params == {}

@@ -59,9 +59,13 @@ def _animated(value: object) -> AnimatedValue:
 
 class TestParsing:
     def test_a_plain_number_has_no_method(self) -> None:
+        # 動きの無いただの数を読めないと、縦横比=0.000 のような行まで既定値へ置き換わり、
+        # 互換性レポートが読めない値の行で埋まる
         assert parse_motion("0.000") == Motion(values=(0.0,))
 
     def test_values_method_and_flags(self) -> None:
+        # 値と移動方法と旗の切れ目を取り違えると、AviUtl で動いていた項目が読み込み後に
+        # 止まるか、別の移動方法として記録される
         motion = parse_motion("-0.01,149.16,300.00,直線移動,0")
         assert motion == Motion(values=(-0.01, 149.16, 300.0), method="直線移動", flags=0)
 
@@ -79,12 +83,15 @@ class TestParsing:
         assert motion.flags == 8
 
     def test_text_is_not_a_number(self) -> None:
+        # None で例外を出すと項目の無いオブジェクトで .exo の読み込みが止まり、
+        # 文字を数として返すと既定値へ戻したことが互換性レポートに残らない
         assert parse_motion("Rounded Mplus 1c Black") is None
         assert parse_motion(None) is None
 
 
 class TestKeyframes:
     def test_a_middle_point_becomes_a_keyframe(self) -> None:
+        # 中間点を置けないと、途中で 150 を通る AviUtl の動きが 0 から 300 への直線になる
         params, _ = _transform("X=0,150,300,直線移動,0", frame="244,333,423")
         pos_x = _animated(params["pos_x"])
         placed = [(k.frame, k.value) for k in pos_x.keyframes]
@@ -102,6 +109,7 @@ class TestKeyframes:
         assert not any("中間点より値が少ない" in line for line in report.lines())
 
     def test_an_instant_move_holds_its_value(self) -> None:
+        # 瞬間移動で切り替わる拡大率が、読み込み後は区間をかけてじわじわ大きくなる
         params, _ = _transform("拡大率=100,200,瞬間移動,0")
         scale = _animated(params["scale"])
         assert scale.keyframes[0].interpolation is Interpolation.HOLD
@@ -132,6 +140,7 @@ class TestAcceleration:
         ],
     )
     def test_the_flags_choose_the_curve(self, flags: int, expected: Interpolation) -> None:
+        # 旗を取り違えると、AviUtl で減速して止まる動きが加速して止まるなど、緩急が逆になる
         params, _ = _transform(f"X=0,300,補間移動,{flags}")
         assert _animated(params["pos_x"]).keyframes[0].interpolation is expected
 
@@ -144,21 +153,28 @@ class TestWhatCannotBeCopied:
         assert any("ランダム移動" in line for line in report.lines())
 
     def test_an_expression_is_recorded_and_frozen(self) -> None:
+        # 参照式を値の並びのまま動かすと、AviUtl と違う動きが出たまま
+        # 互換性レポートにも残らない
         params, report = _transform("拡大率=150,200,瞬間移動,8|100+time*10")
         assert _animated(params["scale"]) == AnimatedValue(150.0)
         assert any("参照式" in line for line in report.lines())
 
     def test_time_control_keeps_the_values_and_is_recorded(self) -> None:
+        # 時間制御付きの動きが止まるか、時間の伸縮を写せていないことが
+        # 互換性レポートに出ず、速さの違いに気付けない
         params, report = _transform("X=0,300,直線移動(時間制御),0")
         assert _animated(params["pos_x"]).is_animated
         assert any("時間制御" in line for line in report.lines())
 
     def test_an_unknown_method_is_recorded(self) -> None:
+        # 知らない移動方法を直線で動かすと AviUtl と違う動きが出て、
+        # 互換性レポートにも名前が残らず、次に埋める穴が分からない
         params, report = _transform("X=10,300,未知の移動,0")
         assert _animated(params["pos_x"]) == AnimatedValue(10.0)
         assert any("未知の移動" in line for line in report.lines())
 
     def test_a_spline_says_it_is_an_approximation(self) -> None:
+        # 補間移動をイージングで近似していることが互換性レポートに出ず、曲線の違いに気付けない
         _, report = _transform("X=0,300,補間移動,3")
         assert any("補間移動" in line for line in report.lines())
 
@@ -173,6 +189,8 @@ class TestTheObjectSpan:
         assert obj.relative_points() == (0, 89, 179)
 
     def test_without_a_middle_point_the_points_are_the_two_ends(self) -> None:
+        # 中間点の無いオブジェクトで両端が取れないと、X=0,300 のような 2 つの値の動きが
+        # 中間点と数が合わないとして止まる
         document = parse_exo(_object("X=0", frame="0,59"))
         assert document.objects[0].relative_points() == (0, 59)
 
@@ -201,6 +219,7 @@ X=0.00
         assert not any("再生位置" in line for line in report.lines())
 
     def test_a_missing_speed_means_normal(self) -> None:
+        # 再生速度の書かれていない動画が 1 倍以外で再生されるか、素材の頭から始まらない
         item, _ = _mapped("X=0")
         assert item.clip.speed == Fraction(1)
         assert item.clip.source_in == Fraction(0)

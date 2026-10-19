@@ -169,6 +169,8 @@ class TestSubtitleFlow:
     def test_undo_returns_the_cut_and_the_subtitles_together(
         self, window: MainWindow, speech: Path
     ) -> None:
+        # カットを取り消しても字幕の表示位置が戻らないと、
+        # 取り消した後の字幕が話している所からずれて出る
         window.import_media([speech])
         assert window.wait_for_imports()
         media = window._document.project.media[0]

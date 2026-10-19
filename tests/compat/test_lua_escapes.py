@@ -111,6 +111,8 @@ def _faulthandler_paused(config: pytest.Config) -> Iterator[None]:
 
 @pytest.mark.parametrize("body", ESCAPES)
 def test_the_same_bytes_as_luajit(body: str) -> None:
+    # 戻し方が LuaJIT とずれると、ダイアログの初期値や .exa の param= の文字が
+    # AviUtl1 と違う文字でスクリプトに届く
     if LUAJIT is None:
         pytest.skip("LuaJIT が無い")
     literal = '"' + body + '"'
@@ -178,6 +180,8 @@ def test_the_old_shortcuts_are_gone() -> None:
 
 
 def test_a_dialog_default_is_unescaped() -> None:
+    # --dialog の文字の初期値の逃がし書きを戻さないと、設定欄の既定の文字が
+    # A と改行ではなく \065\r のまま出る
     (spec,) = parse_control('--dialog:本文,_1="\\065\\r";').parameters
     assert isinstance(spec, TextSpec)
     assert spec.default == "A\r"

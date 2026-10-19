@@ -61,6 +61,8 @@ def test_a_single_voice_leaves_no_floating_choice(
 
 
 def test_two_voices_get_their_own_row(media_dir: Path, qt_application: object) -> None:
+    # 音声が 2 本ある素材で「起こす音声」の行が出ないか重なると、マイクの声を選べないか、
+    # 「モデル」の名前の列が潰れて読めない
     del qt_application
     dialog = _opened(_two_voices(media_dir))
     try:

@@ -60,6 +60,8 @@ class TestReadingTheArguments:
     """DLL が引数を読む関数 C の並び（0 から）と Lua の並び（1 から）の食い違いも見る"""
 
     def test_numbers_strings_and_counts(self) -> None:
+        # 引数の数や型ごとの読み方がずれると、DLL が別の値を読み、絵は出るがどこかが
+        # 少しずつおかしくなる
         seen: dict[str, Any] = {}
 
         def body(p: _Param) -> None:
@@ -128,6 +130,7 @@ class TestReadingTheArguments:
 
 class TestTheResults:
     def test_results_come_back_in_order(self) -> None:
+        # DLL が積んだ順に返さないと、複数の戻り値を受けるスクリプトが値を取り違える
         def body(p: _Param) -> None:
             p.push_result_int(3)
             values = (ctypes.c_int * 4)(10, 5, 73, 30)
@@ -138,6 +141,8 @@ class TestTheResults:
         assert module.call("f", []) == [3, [10, 5, 73, 30], "板"]
 
     def test_a_table_result(self) -> None:
+        # push_result_table_double の表が名前つきで返らないと、w や h を受けるスクリプトが
+        # nil を読む
         def body(p: _Param) -> None:
             keys = (ctypes.c_char_p * 2)(b"w", b"h")
             values = (ctypes.c_double * 2)(1.5, 2.5)
@@ -161,6 +166,8 @@ class TestWhenItGoesWrong:
             module.call("f", [])
 
     def test_an_unknown_function(self) -> None:
+        # 無い名前を NativeModuleError で断らないと、呼び手（runtime の DLL 関数の包み）が
+        # DLL の失敗として記録できない
         module, _keep = _module({"f": lambda p: None})
         with pytest.raises(NativeModuleError, match="無い"):
             module.call("g", [])
@@ -179,6 +186,8 @@ def _pe(path: Path, machine: int) -> Path:
 
 class TestWhatIsLoaded:
     def test_a_64bit_dll_is_recognised(self, tmp_path: Path) -> None:
+        # 64bit の DLL を見分けられないと、正しい .mod2 や汎用プラグインも読まれず、
+        # それを使うスクリプトが動かない
         assert is_native_x64(_pe(tmp_path / "a.mod2", 0x8664))
 
     def test_a_32bit_dll_is_not(self, tmp_path: Path) -> None:
@@ -186,6 +195,8 @@ class TestWhatIsLoaded:
         assert not is_native_x64(_pe(tmp_path / "a.mod2", 0x014C))
 
     def test_text_is_not(self, tmp_path: Path) -> None:
+        # 中身が Lua の文字のファイルを 64bit の DLL と見ると、呼び手が Windows の DLL として
+        # 読み込みに行く
         path = tmp_path / "a.mod2"
         path.write_text("return {}", "utf-8")
         assert not is_native_x64(path)
@@ -197,6 +208,8 @@ class TestWhatIsLoaded:
             native.load(_pe(tmp_path / "a.mod2", 0x8664))
 
     def test_only_on_windows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Windows 以外で断らないと ctypes.WinDLL の無い所で落ち、呼び手が受ける例外から
+        # 外れて、読めない理由が分かりにくくなる
         monkeypatch.setattr(sys, "platform", "linux")
         with pytest.raises(NativeModuleError, match="Windows"):
             native.load(_pe(tmp_path / "a.mod2", 0x8664))

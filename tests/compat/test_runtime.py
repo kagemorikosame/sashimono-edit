@@ -40,6 +40,8 @@ class TestAvailability:
         assert target.ox == 1.0
 
     def test_five_one_only_functions_exist(self, runtime: LuaScriptRuntime) -> None:
+        # unpack と setfenv が無いと、それを使う配布スクリプトが落ち、そのクリップは
+        # 効果の無い元の絵で描かれる
         target = state()
         runtime.run("obj.ox = (unpack ~= nil and setfenv ~= nil) and 1 or 0", target)
         assert target.ox == 1.0
@@ -47,22 +49,27 @@ class TestAvailability:
 
 class TestFields:
     def test_writable_fields_round_trip(self, runtime: LuaScriptRuntime) -> None:
+        # obj.ox などの代入が状態へ戻らないと、スクリプトで動かした位置・拡大・透明度・回転が
+        # プレビューにも書き出しにも出ない
         target = state()
         runtime.run("obj.ox=1 obj.oy=2 obj.zoom=3 obj.alpha=0.5 obj.rz=90 obj.aspect=0.25", target)
         assert (target.ox, target.oy, target.zoom) == (1.0, 2.0, 3.0)
         assert (target.alpha, target.rz, target.aspect) == (0.5, 90.0, 0.25)
 
     def test_size_is_read_from_the_image(self, runtime: LuaScriptRuntime) -> None:
+        # obj.w と obj.h が絵の大きさを返さないと、大きさに合わせて並べるスクリプトが位置を誤る
         target = state(width=120, height=80)
         runtime.run("obj.ox = obj.w  obj.oy = obj.h", target)
         assert (target.ox, target.oy) == (120.0, 80.0)
 
     def test_time_comes_from_the_frame_and_rate(self, runtime: LuaScriptRuntime) -> None:
+        # obj.time を frame と fps から作らないと、時間で動くスクリプトが止まるか速さが変わる
         target = state(frame=15, totalframe=60, framerate=30.0)
         runtime.run("obj.ox = obj.time  obj.oy = obj.totaltime  obj.oz = obj.frame", target)
         assert (target.ox, target.oy, target.oz) == (0.5, 2.0, 15.0)
 
     def test_track_values_are_visible(self, runtime: LuaScriptRuntime) -> None:
+        # obj.track0〜3 で設定欄の値が読めないと、スライダーを動かしても効果が変わらない
         target = state()
         target.track = [10.0, 20.0, 30.0, 40.0]
         runtime.run("obj.ox = obj.track0 + obj.track3", target)
@@ -84,16 +91,25 @@ class TestFields:
         assert (target.ox, target.oy) == (7.0, 7.0)
 
     def test_writing_a_read_only_field_is_recorded(self) -> None:
+        # obj.w への代入を黙って捨てると、大きさが変わらない理由が互換性レポートに出ない
         report = CompatibilityReport()
         runtime = LuaScriptRuntime(report=report, instruction_limit=100_000)
-        runtime.run("obj.w = 999", state())
+        # 記録だけでなく、代入が効かないことも見る 効くと絵の大きさが AviUtl と違ってしまう
+        # 既定の 64 と違う大きさにして、読み戻しで元の幅が返ることを確かめる
+        target = state(32, 48)
+        runtime.run("obj.w = 999  obj.ox = obj.w", target)
         assert any("obj.w" in line for line in report.lines())
+        assert (target.width, target.height) == (32, 48)
+        assert target.ox == 32.0
+        assert "w" not in target.values
 
 
 class TestDrawing:
     def test_without_an_explicit_draw_the_state_is_drawn_once(
         self, runtime: LuaScriptRuntime
     ) -> None:
+        # obj.draw を呼ばないスクリプトで自動の 1 回が描かれないと、位置を動かすだけの効果で
+        # クリップが消える
         result = runtime.run("obj.ox = 40", state())
         assert len(result.draws) == 1
         assert result.draws[0].x == 40.0
@@ -107,6 +123,8 @@ class TestDrawing:
     def test_draw_without_arguments_uses_the_current_values(
         self, runtime: LuaScriptRuntime
     ) -> None:
+        # 引数を省いた obj.draw がいまの obj.ox や obj.rz を使わないと、動かしてから描く
+        # スクリプトが元の位置と向きで描く
         result = runtime.run("obj.ox = 12 obj.rz = 30 obj.draw()", state())
         assert (result.draws[0].x, result.draws[0].rz) == (12.0, 30.0)
 
@@ -193,12 +211,16 @@ class TestDrawing:
 
 class TestEffects:
     def test_a_known_filter_is_queued(self, runtime: LuaScriptRuntime) -> None:
+        # obj.effect のぼかしが積まれないと、スクリプトが頼んでもプレビューと書き出しで
+        # ぼけない
         target = state()
         result = runtime.run('obj.effect("ぼかし", "範囲", 20)', target)
         assert [request.kind for request in result.draws[0].effects] == ["blur"]
         assert result.draws[0].effects[0].params == {"範囲": 20.0}
 
     def test_an_unknown_filter_is_recorded(self) -> None:
+        # 無いフィルタを黙って捨てると、効果が掛からない理由が互換性レポートに出ず、
+        # 次に足すフィルタを数で選べない
         report = CompatibilityReport()
         runtime = LuaScriptRuntime(report=report, instruction_limit=100_000)
         runtime.run('obj.effect("まだ無いフィルタ")', state())
@@ -207,17 +229,21 @@ class TestEffects:
 
 class TestHelpers:
     def test_rgb_and_hsv(self, runtime: LuaScriptRuntime) -> None:
+        # RGB と HSV の数がずれると、色を組み立てて渡すスクリプトが違う色で描く
         target = state()
         runtime.run("obj.ox = RGB(255,128,0)  obj.oy = HSV(0,255,255)", target)
         assert target.ox == 0xFF8000
         assert target.oy == 0xFF0000
 
     def test_bit_operations(self, runtime: LuaScriptRuntime) -> None:
+        # OR・AND・XOR がずれると、色や旗をビットで組むスクリプトが違う値を読む
         target = state()
         runtime.run("obj.ox = OR(5,2) obj.oy = AND(6,3) obj.oz = XOR(5,3)", target)
         assert (target.ox, target.oy, target.oz) == (7.0, 2.0, 6.0)
 
     def test_shift(self, runtime: LuaScriptRuntime) -> None:
+        # SHIFT の正負の向きを取り違えると、左へずらすはずの値を右へずらし、スクリプトが
+        # 組む数が変わる
         target = state()
         runtime.run("obj.ox = SHIFT(1, 4)  obj.oy = SHIFT(16, -2)", target)
         assert (target.ox, target.oy) == (16.0, 4.0)
@@ -231,6 +257,7 @@ class TestHelpers:
         assert first.ox == second.ox
 
     def test_rand_changes_between_frames(self, runtime: LuaScriptRuntime) -> None:
+        # フレームで種が変わらないと、obj.rand で散らす揺れや粒が全フレームで同じ値に止まる
         values = set()
         for frame in range(8):
             target = state(frame=frame)
@@ -239,6 +266,8 @@ class TestHelpers:
         assert len(values) > 1
 
     def test_interpolation_passes_through_the_points(self, runtime: LuaScriptRuntime) -> None:
+        # 端の点を通らないと、obj.interpolation で道筋を描くスクリプトの始めと終わりが
+        # 指定した位置からずれる
         target = state()
         runtime.run("obj.ox = obj.interpolation(0.0, 10, 20, 30)", target)
         assert target.ox == 10.0
@@ -248,6 +277,8 @@ class TestHelpers:
 
 class TestTextAndFigures:
     def test_setfont_and_mes_make_an_image(self, qt_application: object) -> None:
+        # obj.setfont と obj.mes で文字の絵ができないと、文字を描くスクリプトのクリップに
+        # 何も映らない
         del qt_application
         from sashimono.core.model import GeneratedSource
         from sashimono.engine.sources import render_source
@@ -271,6 +302,8 @@ class TestTextAndFigures:
         assert int((target.image[..., 3] > 0).sum()) > 0
 
     def test_load_figure_uses_the_aviutl_names(self, qt_application: object) -> None:
+        # AviUtl の図形名を写せないと、obj.load で 六角形 を頼んだスクリプトが円を描き、
+        # 色もずれる
         del qt_application
         from sashimono.core.model import AnimatedValue, GeneratedSource
         from sashimono.engine.sources import render_source
@@ -295,10 +328,12 @@ class TestTextAndFigures:
 
 class TestSandbox:
     def test_file_access_is_closed(self, runtime: LuaScriptRuntime) -> None:
+        # io が開いていると、配布スクリプトを読み込んだだけで手元のファイルを読み書きされうる
         result = runtime.run('local f = io.open("秘密.txt")', state())
         assert result.failed is True
 
     def test_process_access_is_closed(self, runtime: LuaScriptRuntime) -> None:
+        # os が開いていると、配布スクリプトから別のプログラムを起動されうる
         assert runtime.run('os.execute("calc")', state()).failed is True
 
     def test_require_only_reaches_the_script_folders(self, runtime: LuaScriptRuntime) -> None:
@@ -310,6 +345,8 @@ class TestSandbox:
         assert target.ox == 1.0
 
     def test_require_cannot_escape_the_folders(self, runtime: LuaScriptRuntime) -> None:
+        # ../ でスクリプトフォルダの外へ出られると、配布スクリプトの require でディスク上の
+        # 別の Lua を走らせられる
         target = state()
         runtime.run('obj.ox = require("../../秘密") == nil and 1 or 0', target)
         assert target.ox == 1.0
@@ -327,10 +364,14 @@ class TestSandbox:
         assert len(result.draws) == 1
 
     def test_a_syntax_error_is_reported(self, runtime: LuaScriptRuntime) -> None:
+        # 構文の誤りで failed が立たないと、シーンチェンジのスクリプトが走らなかったと
+        # 分からず、前の場面のまま切り替わらない
         result = runtime.run("this is not lua", state())
         assert result.failed is True
 
     def test_failures_are_recorded(self) -> None:
+        # 失敗をスクリプト名つきで記録しないと、互換性レポートにどのスクリプトが落ちたかが
+        # 出ない
         report = CompatibilityReport()
         runtime = LuaScriptRuntime(report=report, instruction_limit=100_000)
         runtime.run("error('だめ')", state(), script="ためし.anm")
@@ -418,6 +459,8 @@ class TestLimits:
 
 class TestSetup:
     def test_param_code_runs_before_the_script(self, runtime: LuaScriptRuntime) -> None:
+        # --param の初期化が本文より先に走らないと、そこで決めた値を読む本文が nil の計算で
+        # 落ちる
         from sashimono.compat.aviutl.control import parse_control
 
         header = parse_control("--param:base=5;")

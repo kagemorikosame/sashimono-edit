@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import json
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from sashimono.runtime import (
     runtime_abi,
     stale_runtime,
 )
+from sashimono.update import manifest as manifest_module
 
 #: 前の Python の印 走らせている Python から 1 つ前を作る 決め打ちすると、その版の Python
 #: （対応している 3.12〜）で走らせたときに今の印と同じになり、古さを見分ける試験が通らない
@@ -53,8 +55,18 @@ def _extension(target: Path, package: str, abi: str) -> None:
 
 
 class TestFindingOut:
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="拡張モジュールの名前に cp314 が付くのは Windows"
+    )
     def test_the_tag_is_major_and_minor(self) -> None:
-        assert python_abi() == f"cp{sys.version_info.major}{sys.version_info.minor}"
+        # 書き方が拡張モジュールの名前や更新の目録の印（cp314）とずれると、
+        # 今の Python 向けに入れた環境まで古いと見て読まない
+        # 本体と同じ式を書き直して比べると、式ごと間違えても通る Python 自身が拡張モジュールに
+        # 付ける名前と、目録が受け付ける書き方の 2 つと突き合わせる
+        abi = python_abi()
+        suffixes = importlib.machinery.EXTENSION_SUFFIXES
+        assert any(suffix.startswith(f".{abi}-") for suffix in suffixes), suffixes
+        assert manifest_module._ABI.fullmatch(abi) is not None
 
     def test_extension_names_tell_the_old_python(self, target: Path) -> None:
         """印を書くようになる前に入れた導入先も、拡張モジュールの名前で分かる"""
@@ -76,6 +88,8 @@ class TestFindingOut:
         assert stale_runtime() is None
 
     def test_the_current_python_is_not_stale(self, target: Path) -> None:
+        # 今の Python 向けの導入先を古いと見ると、起動で import の道へ足さず、入れてある
+        # 字幕起こしと AI 連携が使えない
         _extension(target, "ctranslate2", python_abi())
         assert stale_runtime() is None
 
@@ -88,6 +102,7 @@ class TestWhatHappens:
         assert str(target) not in sys.path
 
     def test_it_is_not_deleted(self, target: Path) -> None:
+        # 古い導入先を消すと、入れ直しの前に 2 GB を黙って捨てて落とし直させることになる
         _extension(target, "ctranslate2", OLD)
         runtime_module.activate_runtime()
         assert (target / "ctranslate2" / f"_ext.{OLD}-win_amd64.pyd").exists()
@@ -135,6 +150,8 @@ class TestOnlyOnePackReinstalled:
         return target
 
     def test_the_other_pack_is_not_ready(self, half: Path) -> None:
+        # 片方だけ入れ直した後にもう片方を動かせると見ると、古い拡張モジュールの import で
+        # 落ちる
         status = self.PACK.status()
         assert status.installed
         assert status.stale_abi == OLD
@@ -159,6 +176,7 @@ class TestOnlyOnePackReinstalled:
 
 class TestInstalling:
     def test_a_finished_install_is_marked(self, target: Path) -> None:
+        # 入れ終えた機能に今の Python の印を付けないと、入れ直した後も古いと見て読まない
         code = install_runtime(ASR_PACK, command=[sys.executable, "-c", "pass"])
         assert code == 0
         marks = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))

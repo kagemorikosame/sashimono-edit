@@ -208,11 +208,14 @@ class TestRestylingMyOwnSubtitle:
     """自分で打った字幕に、配布デザインを着せる ここが本命"""
 
     def test_my_text_is_still_mine(self, restyled: Project) -> None:
+        # 着せ替えで文字が入れ替わると、
+        # テンプレートを着せた字幕の自分で打った文が見本の文字に書き換わる
         source = restyled.timeline.tracks[0].clips[0].source
         assert source is not None
         assert source.params["text"] == MY_TEXT
 
     def test_the_timing_did_not_move(self, restyled: Project) -> None:
+        # 着せ替えで置き場所や長さが動くと、テンプレートを着せた字幕が話している所からずれる
         clip = restyled.timeline.tracks[0].clips[0]
         assert (clip.timeline_start, clip.duration) == (0, 60)
 
@@ -270,6 +273,8 @@ class TestPlacingATemplate:
     def test_it_lands_at_the_playhead_and_draws(
         self, template: TemplateCatalog, gl: OffscreenGLContext
     ) -> None:
+        # 置き場所がずれるか置いた物が描かれないと、
+        # 棚から置いた新しいテロップが再生ヘッドの所に出ない
         document = Document(project_with_my_subtitle())
         entry = template.find("見本")
         assert entry is not None
@@ -292,6 +297,7 @@ class TestPlacingATemplate:
         assert count(draw(document.project, gl, frame=95), 255, 238, 0) > 200
 
     def test_placing_does_not_touch_what_was_there(self, template: TemplateCatalog) -> None:
+        # 置くときに既にある字幕まで書き換わると、テロップを足しただけで自分の字幕の見た目が変わる
         document = Document(project_with_my_subtitle())
         entry = template.find("見本")
         assert entry is not None
@@ -310,6 +316,7 @@ class TestTheRealDistributedAliases:
     def test_every_one_of_them_renders_something(
         self, real_aliases: tuple[Path, ...], gl: OffscreenGLContext
     ) -> None:
+        # 実物の配布エイリアスで読み落としがあると、棚から置いたテンプレートが真っ黒のまま何も出ない
         if not real_aliases:
             pytest.skip("このマシンに AviUtl2 の配布エイリアスが無い")
 

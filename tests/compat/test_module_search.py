@@ -37,6 +37,8 @@ def _runtime(root: Path, report: CompatibilityReport | None = None) -> LuaScript
 
 class TestDeepModules:
     def test_text_lua_finds_a_module_three_folders_down(self, tmp_path: Path) -> None:
+        # 置き場の深い所を探さないと、配布のまま置いた PSDToolKit の require が見つからず、
+        # 字幕表示が subobj を作れない
         _module(tmp_path / "aviutl_psdtoolkit" / "src" / "lua" / "Deep.lua", "deep")
         report = CompatibilityReport()
         text = _runtime(tmp_path, report).expand_text('<?mes(require("Deep").name)?>', _state())
@@ -95,6 +97,8 @@ class TestDeepModules:
         assert len(walks) <= 1
 
     def test_a_missing_module_is_still_recorded(self, tmp_path: Path) -> None:
+        # 深く探しても無い名前を記録しないと、互換性レポートにどのモジュールが足りないかが
+        # 出ない
         report = CompatibilityReport()
         _runtime(tmp_path, report).expand_text('<?mes(tostring(require("Nowhere")))?>', _state())
         assert any("Nowhere" in line for line in report.missing)

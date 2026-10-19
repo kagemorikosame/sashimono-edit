@@ -23,9 +23,23 @@ from sashimono.asr.service import JobKind, TranscriptionService
 from sashimono.asr.whisper import FasterWhisperBackend, is_cuda_library_error
 from sashimono.core.model import MediaId
 from sashimono.engine.decode import probe_media
+from sashimono.runtime import PackageStatus, PackStatus
 from tests.media_fixtures import SampleMedia
 
 MISSING = RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
+
+def _status(*, cuda_version: str | None) -> PackStatus:
+    """起こしの本体は入っていて、CUDA ランタイムだけが有るか無いかの導入状況"""
+    cudnn = "9.1.0" if cuda_version else None
+    return PackStatus(
+        pack=environment.ASR_PACK,
+        packages=(PackageStatus("faster-whisper", "1.1.1", "1.1"),),
+        extras=(
+            PackageStatus("nvidia-cublas-cu12", cuda_version),
+            PackageStatus("nvidia-cudnn-cu12", cudnn, "9.1"),
+        ),
+    )
 
 
 class _Segment:
@@ -101,6 +115,8 @@ class TestFallingBackToTheCpu:
     def test_a_model_that_cannot_load_on_the_gpu_loads_on_the_cpu(
         self, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # GPU でモデルを読めない所で CPU へ落とせないと、CUDA ランタイムの無い機械で
+        # 「GPU を使う」のまま起こすと「モデルを読み込めない」で止まり、字幕が 1 枚もできない
         backend, loaded = _backend(monkeypatch, MISSING, _Model())
         transcript = backend.transcribe(sample_av.path, TranscribeOptions(device="cuda"))
         assert transcript is not None
@@ -128,15 +144,32 @@ class TestFallingBackToTheCpu:
     def test_the_notice_says_how_to_install_when_the_runtime_is_absent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 知らせに入れ方が無いと、
+        # CPU で遅く起こされた人が「環境を更新」で GPU 版を足せることを知らないまま待つ
+        # 本物の導入状況で分かれ道を選ぶと機械ごとに片方しか見ないので、無い側を作って渡す
         from sashimono.asr import whisper
 
-        status = environment.ASR_PACK.status()
+        status = _status(cuda_version=None)
+        assert not status.extra_installed
         monkeypatch.setattr(whisper, "runtime_status", lambda: status)
         text = whisper.gpu_fallback_notice(MISSING)
-        if not status.extra_installed:
-            assert "環境を更新" in text and "GPU を使う" in text
-        else:
-            assert "入れ直して" in text
+        assert "cublas64_12.dll が読めない" in text
+        assert "環境を更新" in text and "GPU を使う" in text and "約 1.7 GB" in text
+        assert "入れ直して" not in text
+
+    def test_the_notice_says_to_reinstall_when_the_runtime_is_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 入れてあるのに「GPU を使う」に印をと言うと、もう入れた人が同じ 1.7 GB を
+        # 落とし直すだけで直らない ドライバか入れ直しを言わないと GPU へ戻れない
+        from sashimono.asr import whisper
+
+        status = _status(cuda_version="12.4.5")
+        assert status.extra_installed
+        monkeypatch.setattr(whisper, "runtime_status", lambda: status)
+        text = whisper.gpu_fallback_notice(MISSING)
+        assert "入れ直して" in text and "ドライバ" in text
+        assert "GPU を使う" not in text
 
     def test_the_finished_message_carries_the_notice(
         self, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
@@ -150,6 +183,8 @@ class TestFallingBackToTheCpu:
         assert done and "CPU" in done[0].notice and "CPU" in done[0].message
 
     def test_it_knows_a_cuda_failure(self) -> None:
+        # 見分けを外すと、cuBLAS が読めない失敗で CPU へ落とさずに止まるか、
+        # 「音声を読めない」まで CPU で起こし直して原因が見えないまま遅くなる
         assert is_cuda_library_error(MISSING)
         assert is_cuda_library_error(RuntimeError("CUDA driver version is insufficient"))
         assert not is_cuda_library_error(RuntimeError("音声を読めない"))
@@ -177,6 +212,8 @@ class TestFindingTheRuntime:
         assert os.environ["PATH"].split(os.pathsep).count(str(folder)) == 1
 
     def test_loading_on_the_gpu_registers_them_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # GPU で読む前に DLL の置き場を足さないと、
+        # CUDA ランタイムを入れてあっても cublas64_12.dll が見つからず CPU へ落ちる
         from sashimono.asr import whisper
 
         called: list[bool] = []
@@ -236,12 +273,16 @@ class TestChoosingTheVoice:
     def test_a_stream_the_media_lacks_is_refused(
         self, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 素材に無い音声の番号を黙って 1 本目に読み替えると、
+        # マイクの声のつもりでゲームの音を起こしたことに気付けない
         backend = FasterWhisperBackend()
         monkeypatch.setattr(backend, "_ensure_model", lambda options: _Model())
         with pytest.raises(AsrError, match="素材に無い"):
             backend.transcribe(sample_av.path, TranscribeOptions(device="cpu", audio_stream=9))
 
     def test_the_dialog_lists_the_voices(self, media_dir: Path, qt_application: object) -> None:
+        # 音声が 2 本ある素材で選び先が並ばないと、
+        # 字幕起こしの窓から 2 本目（マイクの声など）を選べず 1 本目しか起こせない
         del qt_application
         from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 

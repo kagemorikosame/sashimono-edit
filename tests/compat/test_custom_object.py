@@ -209,6 +209,8 @@ class TestShapesTheScriptsUse:
         assert state.effects == []
 
     def test_resize_in_percent_scales(self, qt_application: object) -> None:
+        # リサイズの拡大率と X を両方掛けないと、百分率で図形を大きくする
+        # カスタムオブジェクトの絵の大きさが AviUtl と食い違う
         del qt_application
         state = _state()
         runtime = LuaScriptRuntime(render_source=_source, instruction_limit=500_000)

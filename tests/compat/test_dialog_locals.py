@@ -34,6 +34,8 @@ def _run(runtime: LuaScriptRuntime, source: str, values: dict[str, object]) -> O
 
 class TestDialogLocals:
     def test_local_items_reach_the_body(self) -> None:
+        # local の欄の値が本文へ届かないと、PSDToolKit の 吹き出し が余白を nil で読んで
+        # 1 行目の計算で落ちる
         runtime = LuaScriptRuntime(report=CompatibilityReport())
         state = _run(runtime, SOURCE, {"local mlr": 30, "local col": 0xFF0000, "plain": 5})
         assert (state.ox, state.oy, state.oz) == (30.0, float(0xFF0000), 5.0)

@@ -101,6 +101,7 @@ def test_every_file_gives_one_object() -> None:
 def test_every_object_maps(
     mapped: tuple[list[tuple[Path, MappedObject]], CompatibilityReport],
 ) -> None:
+    # 写す途中で落ちるか中身を失うと、その配布エイリアスを棚から置いても何も入らない
     written = {path for path, _ in mapped[0]}
     assert [path.name for path in FILES if path not in written] == []
 

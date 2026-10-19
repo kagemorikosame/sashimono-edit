@@ -165,11 +165,14 @@ def shelf(tmp_path: Path) -> tuple[TemplateCatalog, Path]:
 
 class TestScanning:
     def test_both_kinds_are_found(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # どちらかの拡張子を拾い損ねると、
+        # テンプレートの窓に AviUtl のエイリアスか YMM4 の .ymmt の片方が並ばない
         catalog, _ = shelf
         sources = sorted({entry.source for entry in catalog.all()})
         assert sources == ["aviutl", "ymm4"]
 
     def test_other_files_are_skipped(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # 関係の無いファイルまで拾うと、置き場の .txt などがテンプレートの窓に並ぶ
         catalog, _ = shelf
         assert all(entry.name != "読まない" for entry in catalog.all())
 
@@ -207,8 +210,16 @@ class TestScanning:
         assert found["見出し"].load()
 
     def test_an_absent_folder_is_not_an_error(self, tmp_path: Path) -> None:
+        # 既定の置き場には AviUtl2 や YMM4 を入れていないと無いフォルダが入る 無いだけで失敗すると、
+        # テンプレートの窓が開けない
+        # 無いフォルダを先に並べ、後ろの置き場が読まれることも見る 無いフォルダで走査を
+        # 打ち切ると、窓は開いても後ろの置き場の物が棚に 1 本も出ない
+        (tmp_path / "ある").mkdir()
+        (tmp_path / "ある" / "強調.object").write_text(ALIAS, "utf-8")
         catalog = TemplateCatalog()
         assert catalog.scan((tmp_path / "無い",)) == []
+        found = catalog.scan((tmp_path / "無い", tmp_path / "ある"))
+        assert [entry.name for entry in found] == ["強調"]
 
     @pytest.mark.parametrize(
         "content",
@@ -261,6 +272,8 @@ class TestScanning:
 
 class TestPlacing:
     def test_a_clip_is_added(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # AviUtl のエイリアスからクリップを作れないと、
+        # テンプレートの窓の〔タイムラインへ置く〕を押しても何も置かれない
         catalog, _ = shelf
         entry = catalog.find("強調")
         assert entry is not None
@@ -270,11 +283,21 @@ class TestPlacing:
     def test_a_track_is_created_when_there_is_none(
         self, shelf: tuple[TemplateCatalog, Path]
     ) -> None:
+        # トラックを作らずに置くと、トラックの無いプロジェクトではクリップの置き先が無く、
+        # テンプレートを置けない
         catalog, _ = shelf
         entry = catalog.find("強調")
         assert entry is not None
         commands = place(entry.load(), Project.create())
         assert isinstance(commands[0], AddTrack)
+        # 作ったトラックへ実際に置けるかまで当てて見る 置き先が作った物と違うと、
+        # 当てたときに無いトラックへ置こうとして配置ごと断られる
+        project = Project.create()
+        for command in commands:
+            project = command.apply(project)
+        (track,) = project.timeline.tracks
+        assert track.id == commands[0].track.id
+        assert [clip.timeline_start for clip in track.clips] == [0]
 
     def test_it_lands_where_asked(self, shelf: tuple[TemplateCatalog, Path]) -> None:
         # エイリアスは元の位置を持ったまま そのまま置くと指定した場所へ来ない
@@ -297,6 +320,8 @@ class TestPlacing:
         assert added[0].clip.duration == 150
 
     def test_an_alias_with_a_span_keeps_it(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # frame= の長さを捨てて既定の長さで置くと、
+        # 90 フレームの字幕エイリアスが配布物と違う長さで置かれる
         catalog, _ = shelf
         entry = catalog.find("強調")
         assert entry is not None
@@ -331,6 +356,8 @@ class TestRestyling:
         assert source.params["text"] == "自分で打った字幕"
 
     def test_the_look_is_taken_from_the_template(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # 大きさ・フォント・縁を写さないと、
+        # 〔選択中のクリップに適用〕を押しても字幕の見た目がテンプレートに変わらない
         source = next(c for c in self.commands(shelf) if isinstance(c, SetSource)).source
         assert source is not None
         assert value_at(source.params["size"], 0) == 72.0
@@ -349,6 +376,8 @@ class TestRestyling:
         assert all(not isinstance(c, AddClip) for c in self.commands(shelf))
 
     def test_a_non_text_clip_is_refused(self, shelf: tuple[TemplateCatalog, Path]) -> None:
+        # 断らないと、図形のクリップの中身がテンプレートのテキストで置き換わり、
+        # 図形が消えて文字になる
         catalog, _ = shelf
         entry = catalog.find("強調")
         assert entry is not None
