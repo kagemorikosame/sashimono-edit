@@ -208,6 +208,16 @@ class TestTheEstimate:
         assert estimate is not None
         assert not estimate.has_quiet_parts
 
+    def test_a_singing_voice_alone_is_told_apart(self) -> None:
+        # 壊れると、歌の声だけを抜き出した物（息継ぎでも残響が残り、静かな所と大きな所の差が
+        # 14 dB ほど）を雑音の乗った声と見て、声を削る（本人の手元の実素材で起きた）
+        steps = int(10 * RATE / BASE_SAMPLES_PER_PEAK)
+        amplitudes = np.full(steps, 10 ** (-26 / 20), dtype=np.float32)
+        amplitudes[(np.arange(steps) // 8) % 2 == 0] = 10 ** (-12 / 20)
+        estimate = estimate_noise(_peaks(amplitudes), Fraction(0), Fraction(10))
+        assert estimate is not None
+        assert not estimate.has_quiet_parts
+
     def test_only_the_range_of_the_clip_is_read(self) -> None:
         # 壊れると、クリップに使っていない所（トリムで外した雑音の多い所）で決めてしまう
         steps = int(10 * RATE / BASE_SAMPLES_PER_PEAK)

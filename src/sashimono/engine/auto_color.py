@@ -62,16 +62,22 @@ _CLIP_PERCENT = 0.5
 _MAX_STRETCH = 1.8
 #: 明るさの幅がこれより狭い絵は広げない（一色に近い絵 黒い画面・白い画面）
 _MIN_SPAN = 0.08
+#: 黒と白がもうこれだけ出ている絵は広げない（暗い方の端・明るい方の端） 画面の録画のように
+#: 白が 95% ほどで止まる絵を毎回少しだけ広げると、整っている絵まで変わる（本人の手元の実素材）
+_LEVELS_DONE = (0.04, 0.9)
 #: 真ん中の明るさをこの間に収める（sRGB） 外れたときだけガンマで寄せる
-_MIDDLE_BAND = (0.33, 0.6)
+#: 下を 0.33 にしていたら、暗めに作られた画面の録画（真ん中 0.29）まで持ち上げた
+_MIDDLE_BAND = (0.25, 0.65)
 #: ガンマの乗数の範囲 大きく曲げると肌の階調が潰れる
 _POWER_RANGE = (0.75, 1.33)
 #: 色の薄い所とみなす彩度（最大と最小の差 / 最大）
 _NEUTRAL_SATURATION = 0.3
 #: 色の薄い所を測る明るさの範囲 黒に近い所は雑音、白に近い所は飛んでいて色が当てにならない
 _NEUTRAL_LUMA = (0.12, 0.92)
-#: 色の薄い所がこれより少なければ、全体の平均でそろえ、強さを半分にする
-_NEUTRAL_SHARE = 0.03
+#: 色の薄い所（灰色の明るさの範囲で彩度の低い画素）が全体の画素のうちこれより少なければ、
+#: 白のつり合いは直さない 本人の手元の実素材で決めた 実写は 0.28〜0.78、画面の録画は 0.14、
+#: 暗い所の多い実写は 0.08 で、録画の色の偏りを色かぶりと見て直していた（前は 0.03）
+_NEUTRAL_SHARE = 0.2
 #: 赤・緑・青の倍率の範囲 外れるほどの色かぶりは、測り違い（一面の緑の芝など）の方が多い
 _CHANNEL_RANGE = (0.8, 1.25)
 #: これより小さい色かぶりは直さない（倍率 1 からの差）
@@ -114,6 +120,9 @@ class ColorStats:
                 "blue": round((blue / mean - 1.0) * 100, 1),
             },
             "saturation_percent": round(self.chroma * 100, 1),
+            # 色の薄い所の割合 少ない絵の cast_percent は全体の平均で、色かぶりではなく
+            # 映っている物の色のことが多い（読み違えないよう一緒に返す）
+            "neutral_percent": round(self.neutral_share * 100, 1),
         }
 
 
@@ -282,9 +291,13 @@ def _levels(stats: ColorStats, notes: list[str]) -> dict[str, float]:
     if span < _MIN_SPAN:
         notes.append("明るさの幅がほとんど無い絵（一色に近い）なので、明るさは直しませんでした")
         return {}
-    scale = min(1.0 / span, _MAX_STRETCH)
     params: dict[str, float] = {}
-    if scale > 1.0 + 1e-3 or stats.black > 1e-3:
+    if stats.black <= _LEVELS_DONE[0] and stats.white >= _LEVELS_DONE[1]:
+        # 黒も白ももう出ている 広げずに、真ん中だけを見る
+        scale = 1.0
+    else:
+        scale = min(1.0 / span, _MAX_STRETCH)
+    if scale > 1.0 + 1e-3:
         params["luma_gain"] = (scale - 1.0) * 100.0
         params["luma_offset"] = -stats.black * scale * 100.0
     if scale >= _MAX_STRETCH:
@@ -292,7 +305,8 @@ def _levels(stats: ColorStats, notes: list[str]) -> dict[str, float]:
             f"明るさの幅が狭い絵なので、広げるのを {_MAX_STRETCH:g} 倍で止めました"
             "（暗い場面をわざと暗く撮ったときに昼の絵へ寄せないため）"
         )
-    moved = float(np.clip((stats.middle - stats.black) * scale, 0.02, 0.98))
+    shift = stats.black if scale > 1.0 + 1e-3 else 0.0
+    moved = float(np.clip((stats.middle - shift) * scale, 0.02, 0.98))
     low, high = _MIDDLE_BAND
     if not low <= moved <= high:
         aim = low if moved < low else high
@@ -306,12 +320,15 @@ def _balance(stats: ColorStats, notes: list[str]) -> dict[str, float]:
     means = np.array(stats.neutral)
     if means.max() <= 1e-3:
         return {}
-    gains = np.clip(means.mean() / np.maximum(means, 1e-6), *_CHANNEL_RANGE)
     if stats.neutral_share < _NEUTRAL_SHARE:
-        # 灰色の物が映っていない絵（一面の芝・空）では、全体の平均の偏りは絵の中身の色で、
-        # 色かぶりではないことが多い 半分だけ寄せる
-        gains = 1.0 + (gains - 1.0) * 0.5
-        notes.append("白や灰色の物が少ない絵なので、白のつり合いは全体の平均から控えめに直しました")
+        # 灰色の物が少ない絵（色の付いた物で埋まった録画・暗い所の多い絵）では、灰色の所の偏りが
+        # 映っている物の色か色かぶりかを見分けられない 直すと、わざとの色まで消す
+        notes.append(
+            "白や灰色の物が少ない絵なので、偏りが映っている物の色か色かぶりかを見分けられず、"
+            "白のつり合いは直しませんでした"
+        )
+        return {}
+    gains = np.clip(means.mean() / np.maximum(means, 1e-6), *_CHANNEL_RANGE)
     if np.abs(gains - 1.0).max() < _MIN_CAST:
         return {}
     return {

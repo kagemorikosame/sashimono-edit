@@ -97,6 +97,23 @@ class TestAutomatic:
         black[..., 3] = 255
         assert not plan_auto(pixels_of([black]), strength=100, white_balance=False).changes
 
+    def test_a_colourful_picture_keeps_its_colours(self) -> None:
+        # 壊れると、灰色の物がほとんど映らない絵（色の付いた物で埋まった録画）の偏りを色かぶりと
+        # 見て、映っている物の色を消す（本人の手元の実素材の画面の録画で起きた）
+        rng = np.random.default_rng(1)
+        green = np.clip(rng.normal((0.3, 0.6, 0.2), 0.05, (60, 96, 3)), 0.0, 1.0)
+        image = np.concatenate([green, np.ones((60, 96, 1))], axis=2)
+        pixels = pixels_of([np.asarray(image * 255, dtype=np.uint8)])
+        plan = plan_auto(pixels, strength=100, exposure=False)
+        assert not plan.changes
+        assert any("見分けられず" in note for note in plan.notes)
+
+    def test_a_picture_that_already_reaches_black_and_white_is_not_stretched(self) -> None:
+        # 壊れると、白が 95% ほどで止まる整った絵（画面の録画）を毎回少しずつ広げて変える
+        pixels = pixels_of([_scene(dark=0.02, light=0.94)])
+        plan = plan_auto(pixels, strength=100, white_balance=False)
+        assert "luma_gain" not in plan.params
+
     def test_see_through_pixels_are_not_measured(self) -> None:
         # 壊れると、透けた所（黒の 0）まで暗い所として数え、黒が足りていると見誤る
         image = _scene(dark=0.3, light=0.7)
