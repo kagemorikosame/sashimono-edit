@@ -26,6 +26,7 @@ from sashimono.core.seams import (
     SEAM_NONE,
     SEAM_VIDEOS,
     SEAM_ZOOM,
+    UNFIT_SEAM,
     SeamStyle,
     SmoothCuts,
     seams_after_cuts,
@@ -317,6 +318,27 @@ class TestRightClick:
         located = window.document.project.timeline.locate_clip(after.id)
         assert located is not None and located[1] == after
         assert window.document.can_undo
+
+    def test_a_refusal_says_why(
+        self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、寄りを選んだのに音だけのつなぎ目しか無いとき、ステータスバーに
+        # 「付けられませんでした（）」と空の括弧が出て、何を変えればよいか分からない
+        # （CodeRabbit の指摘）
+        work = JumpCut()
+        project = SetTrackState(work.video.id, locked=True).apply(work.project)
+        monkeypatch.setattr(
+            main_window_module,
+            "ask_seams",
+            lambda _parent, _style, _note: SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0),
+        )
+        window = MainWindow(project, confirm_unsaved=False)
+        opened.append(window)
+        _menu_action(window, work.audio, 90, SEAMS_TEXT).trigger()
+        message = window.statusBar().currentMessage()
+        assert "（）" not in message
+        assert UNFIT_SEAM in message
+        assert window.document.project == project
 
     def test_cancelling_changes_nothing(
         self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch

@@ -3576,7 +3576,10 @@ class MainWindow(QMainWindow):
         )
         if not plan.commands:
             reasons = "、".join(dict.fromkeys(reason for _, reason in plan.skipped))
-            self.statusBar().showMessage(f"つなぎ目に付けられませんでした（{reasons}）", 8000)
+            # 理由はつなぎ目ごとに plan_smoothing が残す 空なら前後のクリップが接していない
+            # （AI の smooth_cuts と同じ文） 空の括弧を出すと、何を変えればよいか分からない
+            detail = reasons or "前後のクリップが接している所がありません"
+            self.statusBar().showMessage(f"つなぎ目に付けられませんでした（{detail}）", 8000)
             return False
         return self.execute_all(
             list(plan.commands), f"つなぎ目を目立たなくする: {len(plan.handled)} か所"

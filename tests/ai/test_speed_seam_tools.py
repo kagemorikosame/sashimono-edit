@@ -17,7 +17,14 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, AddScene, InScene, SetClipProperty, new_scene
+from sashimono.core.commands import (
+    AddClip,
+    AddScene,
+    InScene,
+    SetClipProperty,
+    SetTrackState,
+    new_scene,
+)
 from sashimono.core.model import (
     TRANSITION_KIND,
     Clip,
@@ -26,7 +33,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
-from sashimono.core.seams import SEAM_ZOOM, SeamStyle
+from sashimono.core.seams import SEAM_ZOOM, UNFIT_SEAM, SeamStyle
 from tests.ai.conftest import FakeHost
 from tests.core.test_seams import RATE, JumpCut, talking_media, with_bystander
 
@@ -246,6 +253,15 @@ class TestSmoothCuts:
         assert result["zoomed_clip_ids"] == [str(after.id)]
         located = host.document.project.timeline.locate_clip(work.pictures[1].id)
         assert located is not None and located[1] == work.pictures[1]
+
+    def test_a_refusal_names_the_reason(self) -> None:
+        # 壊れると、寄りを頼んだのに音だけのつなぎ目しか無いとき、「前後のクリップが接している所が
+        # ありません」と事実と違う理由で断り、AI が見当違いの位置を探し直す（CodeRabbit の指摘から）
+        work = JumpCut()
+        project = SetTrackState(work.video.id, locked=True).apply(work.project)
+        host = FakeHost(project)
+        with pytest.raises(ToolError, match=UNFIT_SEAM):
+            _run(host, "smooth_cuts", video="zoom", audio_fade_ms=0, frames=[60])
 
     def test_a_place_that_is_not_a_seam_is_reported(self) -> None:
         # 壊れると、つなぎ目でない所を渡したことに AI が気付かず、付けたと思い込む

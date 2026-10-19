@@ -52,6 +52,7 @@ __all__ = [
     "SEAM_VIDEO_NAMES",
     "SEAM_ZOOM",
     "SEAM_ZOOM_PERCENT_RANGE",
+    "UNFIT_SEAM",
     "SeamPlan",
     "SeamScope",
     "SeamStyle",
@@ -90,6 +91,8 @@ SEAM_ZOOM_PERCENT_RANGE = (101, 150)
 #: 0 は音に何もしない
 DEFAULT_SEAM_AUDIO_FADE_MS = 20
 SEAM_AUDIO_FADE_MS_RANGE = (0, 200)
+#: 対はあるが、選んだ処理を付けられる絵か音の対が無いつなぎ目の理由
+UNFIT_SEAM = "選んだ処理を付けられる絵か音のつなぎ目ではない"
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +355,14 @@ def plan_smoothing(
                 handled.add(frame)
             elif reason:
                 skipped.append((frame, reason))
+
+    # 対はあったのに、選んだ処理を付けられる物が無かったつなぎ目（寄りを頼んだのに音だけの対など）
+    # 理由を残さないと、呼ぶ側は「付けられなかった」としか言えず、人も AI も何を変えればよいか
+    # 分からない
+    noted = {frame for frame, _ in skipped}
+    for frame in ordered:
+        if frame not in handled and frame not in missing and frame not in noted:
+            skipped.append((frame, UNFIT_SEAM))
 
     return SeamPlan(
         commands=tuple(builder.commands),

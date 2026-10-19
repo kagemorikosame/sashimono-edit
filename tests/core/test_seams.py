@@ -42,6 +42,7 @@ from sashimono.core.seams import (
     SEAM_CROSSFADE,
     SEAM_NONE,
     SEAM_ZOOM,
+    UNFIT_SEAM,
     SeamScope,
     SeamStyle,
     SmoothCuts,
@@ -381,6 +382,17 @@ class TestScope:
         project, _track, _before, after = with_bystander(work)
         plan = plan_smoothing(project, (60,), SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0))
         assert after.id in plan.zoomed
+
+
+def test_a_seam_with_nothing_to_fit_says_why() -> None:
+    # 壊れると、寄りを頼んだのに音だけのつなぎ目しか無いとき（絵のトラックをロックしたなど）、
+    # 理由が 1 つも残らず、右クリックは空の括弧を出し、AI も何を変えればよいか分からない
+    # （CodeRabbit の指摘）
+    work = JumpCut()
+    project = SetTrackState(work.video.id, locked=True).apply(work.project)
+    plan = plan_smoothing(project, work.seams, SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0))
+    assert plan.commands == ()
+    assert plan.skipped == ((60, UNFIT_SEAM), (120, UNFIT_SEAM))
 
 
 class TestOneUndo:
