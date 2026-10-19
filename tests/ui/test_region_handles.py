@@ -172,6 +172,7 @@ class TestDragging:
         assert _number(moved, clip.id, region.id, "center_y") == pytest.approx(20.0)
 
     def test_outside_the_region_the_clip_still_moves(self, make_widget: MakeWidget) -> None:
+        # 範囲の外を掴んでもクリップが動かないと、部分モザイクを掛けた素材を位置合わせできない
         clip = _with(_clip(_media()), _region())
         widget, _, seen = _open(make_widget, clip)
         _drag(widget, (100, 120), (110, 120))
@@ -190,6 +191,7 @@ class TestDragging:
         assert _number(moved, clip.id, region.id, "center_y") == pytest.approx(5.0)
 
     def test_alt_resizes_around_the_centre(self, make_widget: MakeWidget) -> None:
+        # Alt で中心を保てないと、顔に合わせた範囲を広げるたびに中心がずれて置き直すことになる
         clip = _with(_clip(_media()), region := _region())
         widget, project, seen = _open(make_widget, clip)
         _drag(widget, (200, 90), (210, 95), modifiers=Qt.KeyboardModifier.AltModifier)
@@ -249,6 +251,7 @@ class TestDragging:
         assert _number(moved, clip.id, region.id, "center_x", 40) == pytest.approx(60.0)
 
     def test_it_is_one_undo_step(self, make_widget: MakeWidget) -> None:
+        # 範囲の移動が何段にも分かれると、ずらしすぎた範囲を戻すのに取り消しを何回も押すことになる
         clip = _with(_clip(_media()), _region())
         widget, project, seen = _open(make_widget, clip)
         _drag(widget, (180, 80), (190, 80), (200, 80))
@@ -261,6 +264,7 @@ class TestDragging:
         assert document.project == project
 
     def test_escape_cancels(self, make_widget: MakeWidget) -> None:
+        # Esc で止められないと、掴み間違えた範囲がそのまま動き、取り消しで戻すしかなくなる
         from PySide6.QtGui import QKeyEvent
         from PySide6.QtWidgets import QApplication
 

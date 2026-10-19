@@ -143,6 +143,8 @@ class TestOrder:
         assert "音量" not in _rows(_group(panel, "描画"))
 
     def test_text_shows_its_content_after_the_picture_group(self, panel: InspectorPanel) -> None:
+        # テキストに画素で置く欄が出ると、触っても何も変わらない欄に迷う
+        # 順が崩れると文字の欄を探し回る
         project = Project.create()
         for command in insert_generated(project, TEXT.create()):
             project = command.apply(project)
@@ -243,6 +245,8 @@ class TestOldFiles:
     def test_an_old_clip_shows_the_default_values(
         self, panel: InspectorPanel, video_media: MediaItem
     ) -> None:
+        # 前の版の作品で拡大率が 0 などに見えると、
+        # 開いただけで絵が消えたと思い込み値を打ち直してしまう
         project = _placed(video_media)
         picture = _clip(project, TrackKind.VIDEO)
         panel.set_project(self._old(project, picture))
@@ -275,7 +279,6 @@ class TestClipFields:
         self, panel: InspectorPanel, video_media: MediaItem
     ) -> None:
         # 主のクリップだけ切り替わると、一緒に値を変えたほかのクリップと欄の効き方が食い違う
-
         from sashimono.core.commands import SetEffectEnabled
 
         project = _placed(video_media)

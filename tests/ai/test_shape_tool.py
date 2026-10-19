@@ -20,6 +20,7 @@ def _add_shape(host: FakeHost, **arguments: object) -> object:
 
 
 def test_it_places_a_shape_with_the_given_look(host: FakeHost) -> None:
+    # 頼んだ形・大きさ・色・位置で置かれないと、AI に図形を頼んでも別の物が別の所に出る
     _add_shape(
         host, shape="ellipse", width=200, height=100, color="#FF0000", at_frame=10, duration=20
     )
@@ -34,6 +35,7 @@ def test_it_places_a_shape_with_the_given_look(host: FakeHost) -> None:
 
 
 def test_it_is_one_undo_step(host: FakeHost) -> None:
+    # 図形を置くのが何段にも分かれると、AI が置いた図形を消すのに取り消しを何回も押すことになる
     before = host.document.project
     _add_shape(host)
     host.document.undo()

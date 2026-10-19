@@ -143,6 +143,7 @@ def _wait(condition: object, seconds: float = 30) -> None:
 
 class TestOrganize:
     def test_both_kinds_are_listed(self, library: Library, thumbnails: LookThumbnails) -> None:
+        # 壊れると、プリセットとエイリアスの片方を開いても中身が出ず、保存した物が消えたように見える
         dialog = _dialog(library, thumbnails)
         try:
             assert _names(dialog) == ["赤", "青"]
@@ -154,6 +155,8 @@ class TestOrganize:
     def test_rename_from_the_window(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、一覧で名前を変えても置き場のファイルは前の名前のままで、
+        # 次に開くと元の名前に戻っている
         dialog = _dialog(library, thumbnails)
         try:
             dialog.select("赤")
@@ -167,6 +170,7 @@ class TestOrganize:
     def test_a_taken_name_is_asked_and_kept_when_refused(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、既にある名前へ変えたとき黙って上書きし、断ったのに同じ名前の方が消える
         library.presets.save(Preset.capture("緑", _clip(), category="見出し"))
         dialog = _dialog(library, thumbnails)
         try:
@@ -183,6 +187,7 @@ class TestOrganize:
     def test_a_change_elsewhere_is_told_and_the_list_is_read_again(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、ほかの窓で保存し直した新しい中身を、開いた時の古い中身で名前替えして消してしまう
         dialog = _dialog(library, thumbnails)
         try:
             # 窓を開いた後で、ほかの窓が同じ名前で保存し直す
@@ -209,6 +214,7 @@ class TestOrganize:
     def test_a_new_category_can_be_typed(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、今ある分類にしか移せず、整理のための新しい分類を作る手段が無い
         dialog = _dialog(library, thumbnails)
         try:
             dialog.select("赤", "青")
@@ -223,6 +229,7 @@ class TestOrganize:
     def test_duplicate(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、少しだけ変えた版を作りたいとき、元を残したまま写しを作る手段が無い
         dialog = _dialog(library, thumbnails, kind=ALIAS)
         try:
             dialog.select("テロップ")
@@ -237,6 +244,7 @@ class TestDelete:
     def test_it_asks_then_goes_to_the_trash_and_comes_back(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、押し間違えた削除で作り込んだ見た目が確かめ無しに消え、ごみ箱からも戻せない
         dialog = _dialog(library, thumbnails)
         try:
             dialog.select("赤")
@@ -259,6 +267,7 @@ class TestDelete:
     def test_the_question_can_be_turned_off(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、確かめを切った人に毎回問いが出るか、切ったとたんごみ箱を通らず消えて戻せなくなる
         options = LibraryOptions(thumbnails=thumbnails.mode, confirm_delete=False)
         dialog = _dialog(library, thumbnails, options=options)
         try:
@@ -274,6 +283,8 @@ class TestDelete:
     def test_emptying_always_asks(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、確かめを切った人がごみ箱を空にする操作まで問い無しで走り、
+        # 戻せる最後の写しが一度に消える
         options = LibraryOptions(thumbnails=thumbnails.mode, confirm_delete=False)
         library.delete(next(e for e in library.entries(PRESET) if e.name == "赤"))
         dialog = _dialog(library, thumbnails, options=options)
@@ -313,6 +324,8 @@ class TestExchange:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
+        # 壊れると、別の機械へ持っていった見た目が読み込めないか、
+        # 同じ名前の手元の物を上書きして片方が消える
         dialog = _dialog(library, thumbnails)
         try:
             out = tmp_path / "out"
@@ -356,6 +369,7 @@ class TestPick:
     def test_the_chosen_preset_is_handed_back(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、一覧で選んで〔当てる〕を押しても、選んだプリセットがクリップに当たらない
         dialog = _dialog(library, thumbnails, pick=PRESET)
         try:
             dialog.select("青")
@@ -383,6 +397,7 @@ class TestThumbnails:
     def test_visible_items_get_a_picture_and_it_is_kept(
         self, library: Library, thumbnails: LookThumbnails, tmp_path: Path
     ) -> None:
+        # 壊れると、一覧に見本の絵が出ず名前だけで当てる羽目になるか、開くたびに描き直して重くなる
         dialog = _dialog(library, thumbnails)
         try:
             preset = next(p for p in library.presets.all() if p.name == "赤")
@@ -401,11 +416,13 @@ class TestThumbnails:
     def test_a_rename_reuses_the_picture_and_a_change_does_not(
         self, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、名前を変えただけで描き直しを待たされるか、中身を変えたのに前の見本が出続ける
         first = Preset.capture("赤", _clip("あ"))
         assert thumbnails.key_for(first) == thumbnails.key_for(Preset.capture("朱", _clip("あ")))
         assert thumbnails.key_for(first) != thumbnails.key_for(Preset.capture("赤", _clip("い")))
 
     def test_a_broken_picture_is_drawn_again(self, thumbnails: LookThumbnails) -> None:
+        # 作り置きの絵が壊れたまま使われると、その見本だけが空白のまま一覧に残り続ける
         preset = Preset.capture("赤", _clip())
         thumbnails.request(preset)
         _wait(lambda: thumbnails.cached(preset) is not None)
@@ -444,6 +461,7 @@ class TestThumbnails:
 
 class TestPreferences:
     def test_the_settings_come_back(self, tmp_path: Path) -> None:
+        # 壊れると、見本の描き方・下地・削除の確かめを変えても、次に起動すると既定へ戻る
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(
             Preferences(
@@ -458,12 +476,15 @@ class TestPreferences:
         )
 
     def test_the_defaults_suit_someone_who_never_opened_the_settings(self) -> None:
+        # 既定が外れると、設定を知らない人の一覧に見本が出ないか、確かめ無しに削除が走る
         options = Preferences().library_options
         assert options.thumbnails == "full"
         assert options.backdrop == "checker"
         assert options.confirm_delete
 
     def test_the_dialog_offers_them(self) -> None:
+        # 出し忘れると、設定画面から一覧の見た目や削除の確かめを変える手段が無いか、
+        # OK を押しただけで既定へ戻る
         dialog = PreferencesDialog(Preferences(library_thumbnails=THUMBNAILS_SIMPLE))
         try:
             assert dialog.preferences().library_thumbnails == THUMBNAILS_SIMPLE
@@ -591,6 +612,8 @@ class TestEntrances:
     def test_the_preset_menu_opens_the_window_and_applies_the_pick(
         self, window: MainWindow, library: Library, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、設定パネルの〔プリセット…〕から一覧を開いて選んでも何も当たらないか、
+        # 打った文字まで保存時の文字へ置き換わる
         clip = window.document.project.timeline.tracks[0].clips[0]
         window._timeline.set_selection((clip.id,))
         QApplication.processEvents()
@@ -620,6 +643,7 @@ class TestEntrances:
     def test_the_alias_menu_opens_the_window_and_places_the_pick(
         self, window: MainWindow, library: Library
     ) -> None:
+        # 壊れると、〔追加〕→〔エイリアス〕の一覧で選んでも、タイムラインの押した所に何も置かれない
         def fake_open(
             _parent: object, shown: Library, *, kind: str, pick: str | None = None, **_k: object
         ) -> LibraryEntry:

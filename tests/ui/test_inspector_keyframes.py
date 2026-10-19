@@ -222,6 +222,7 @@ class TestKeyButton:
     def test_pressing_again_removes_the_key_and_undo_brings_it_back(
         self, panel: InspectorPanel
     ) -> None:
+        # 同じ所でもう一度押しても消えないと、打ち間違えたキーをタイムラインで探して消すことになる
         harness, clip = _open(panel, _animated((10, 0.3), (50, 0.9)))
         panel.set_frame(START + 10)
         controls = _controls(panel, clip)
@@ -247,6 +248,7 @@ class TestKeyButton:
         assert not controls.toggle.isEnabled()
 
     def test_the_key_button_starts_hollow_without_keys(self, panel: InspectorPanel) -> None:
+        # キーの無い値で ◆ や矢印が押せると見えると、無いキーを消したり飛んだりできると誤解する
         _, clip = _open(panel)
         panel.set_frame(START)
         controls = _controls(panel, clip)
@@ -306,6 +308,7 @@ class TestReset:
         assert [(k.frame, k.value) for k in keys] == [(10, 0.3), (50, 1.0)]
 
     def test_between_keys_a_default_key_is_added(self, panel: InspectorPanel) -> None:
+        # キーの間で戻すと前後のキーまで書き換わると、そこだけ戻したつもりで動き全体が崩れる
         harness, clip = _open(panel, _animated((10, 0.3), (50, 0.2)))
         panel.set_frame(START + 30)
         _double_click(_label(panel, "不透明度"))
@@ -328,6 +331,7 @@ class TestReset:
         assert harness.labels == []
 
     def test_a_colour_goes_back_to_its_default(self, panel: InspectorPanel) -> None:
+        # 色が初期値へ戻らないと、文字の色を一度変えると元の色を数で調べて選び直すことになる
         harness, clip = _open(panel)
         spec = next(s for s in TEXT.parameters if isinstance(s, ColorSpec))
         assert clip.source is not None
@@ -345,6 +349,7 @@ class TestReset:
         assert located[1].source.params[spec.name] == spec.default_value()
 
     def test_the_blend_mode_goes_back_to_normal(self, panel: InspectorPanel) -> None:
+        # 合成モードが通常へ戻らないと、加算などで光った見た目を一覧から探して戻すことになる
         harness, clip = _open(panel)
         blend = next(
             box
@@ -383,6 +388,8 @@ class TestTheResetSetting:
         assert harness.opacity(clip) == AnimatedValue(static=0.4)
 
     def test_it_is_on_by_default_and_kept(self, tmp_path: Path) -> None:
+        # 既定で切れていると知らない人がダブルクリックで戻せない
+        # 保存されないと、切った人が起動のたびに切り直す
         assert Preferences().double_click_reset
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(double_click_reset=False))
@@ -457,6 +464,7 @@ class TestHoldingTheSlider:
         return slider
 
     def test_pressing_and_dragging_adjusts_the_value(self, panel: InspectorPanel) -> None:
+        # 押したまま動かして値が変わらないと、スライダーで不透明度を調整できない
         harness, clip = _open(panel, AnimatedValue(static=0.8))
         _drag(self._slider(panel), QEvent.Type.MouseButtonPress, 40)
         assert harness.labels == ["opacity を変更"]

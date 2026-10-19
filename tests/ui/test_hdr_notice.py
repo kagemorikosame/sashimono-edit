@@ -129,6 +129,7 @@ class TestTheNoticeOnImport:
     def test_sdr_material_is_not_told(
         self, window: MainWindow, tagged: dict[str, Path], silent_hdr_notice: list[list[str]]
     ) -> None:
+        # ふつうの素材にも HDR の知らせが出ると、読み込むたびに関係ない警告を閉じることになる
         _import(window, tagged["sdr"])
         assert silent_hdr_notice == []
 
@@ -188,6 +189,7 @@ class TestThePreference:
         assert Preferences().hdr_notice is True
 
     def test_it_is_saved_and_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 切った設定が残らないと HDR の知らせが毎回戻り、壊れた値で切れたままだと要る知らせが出ない
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(hdr_notice=False))
         assert store.load().hdr_notice is False

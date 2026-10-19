@@ -34,6 +34,9 @@ STEPS: list[tuple[str, list[str]]] = [
     ("pytest", ["-m", "pytest", "-rfE", "--durations=30"]),
     # 文章に句点を使わない約束 データとしての句点は見ない（tools/punctuation.py）
     ("句点", ["tools/punctuation.py"]),
+    # 試験に壊れたときに何が起きるかを書き添える約束（tools/test_notes.py #363）
+    # 書き添えの無い試験は、落ちたときに直すのか消すのかを次の人が決められない
+    ("試験の書き添え", ["tools/test_notes.py"]),
 ]
 
 

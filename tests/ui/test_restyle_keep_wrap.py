@@ -82,6 +82,7 @@ class TestWindow:
     def test_the_default_matches_the_template(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 既定で前のフォントや折り返しの幅が残ると、棚で選んだ見本と違う見た目の字幕になる
         window._preferences = Preferences()
         source = _restyle(window, monkeypatch)
         assert (source.params["font"], source.params["font_style"]) == ("Noto Sans JP", "")
@@ -116,16 +117,19 @@ class TestPreferences:
         assert Preferences().restyle_keep_wrap is False
 
     def test_the_choice_is_saved(self, tmp_path: Path) -> None:
+        # 選んだ設定が保存されないと、起動し直すたびに折り返しの幅を消す側へ戻る
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(restyle_keep_wrap=True))
         assert store.load().restyle_keep_wrap is True
 
     def test_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 壊れた値を真と読むと、本人が選んでいないのに着せ替えで前の折り返しの幅が残る
         path = tmp_path / "preferences.json"
         path.write_text(json.dumps({"restyle_keep_wrap": "はい"}), encoding="utf-8")
         assert PreferenceStore(path).load().restyle_keep_wrap is False
 
     def test_the_dialog_shows_and_returns_it(self, qt_application: QApplication) -> None:
+        # 設定画面が今の値を出さないか切り替えを返さないと、チェックを外しても幅が残り続ける
         del qt_application
         chosen = Preferences(restyle_keep_wrap=True)
         dialog = PreferencesDialog(chosen)

@@ -101,6 +101,7 @@ class TestChange:
         assert host.document.project.timeline.markers == (Marker(30, "仮"),)
 
     def test_an_unknown_frame_says_where_to_look(self, host: FakeHost) -> None:
+        # どこで調べればよいかを返さないと、AI は位置を当て推量して無い目印を直そうとし続ける
         with pytest.raises(ToolError, match="list_markers"):
             run(host, "update_marker", frame=30, label="名")
 
@@ -120,6 +121,7 @@ class TestChange:
         assert _frames(host) == [0, 30, 60]
 
     def test_delete_all(self, host: FakeHost) -> None:
+        # 全部消す指定が効かないと、目印を一掃したい人の頼みに AI が応えられず、古い目次が残る
         run(host, "add_markers", markers=[{"frame": f} for f in (0, 30)])
         run(host, "delete_markers", all=True)
         assert _frames(host) == []

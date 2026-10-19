@@ -284,6 +284,7 @@ class TestOff:
 
 class TestTargets:
     def test_the_default_targets(self) -> None:
+        # 既定の吸着先が欠けると、再生位置をクリップの端や作業範囲の端へぴったり合わせられない
         keyed = _text(
             200, opacity=AnimatedValue(1.0, keyframes=(Keyframe(0, 0.0), Keyframe(15, 1.0)))
         )

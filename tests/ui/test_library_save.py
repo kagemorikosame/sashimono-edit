@@ -142,6 +142,7 @@ class TestTheWindow:
     def test_a_taken_name_warns_and_needs_the_mark(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、既にある名前で保存したとき黙って上書きし、前に作った見た目が知らないうちに替わる
         dialog = _dialog(library, thumbnails)
         try:
             assert dialog.can_save()
@@ -163,6 +164,8 @@ class TestTheWindow:
     def test_the_mark_starts_off_unless_the_setting_says_so(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 既定で入っていると、知らない人が同じ名前で保存しただけで上書きになる
+        # 設定で入れた人に効かないと、毎回印を入れ直す手間が残る
         dialog = _dialog(library, thumbnails)
         try:
             assert not dialog._overwrite.isChecked()
@@ -178,6 +181,7 @@ class TestTheWindow:
     def test_picking_from_the_list_means_overwriting_it(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、一覧で上書きしたい物を選んでも名前と分類を打ち直し、印も入れ直すことになる
         dialog = _dialog(library, thumbnails)
         try:
             dialog.pick("赤")
@@ -203,6 +207,7 @@ class TestTheWindow:
     def test_a_new_category_can_be_typed(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、保存の時に今ある分類しか選べず、新しい分類へ入れるには保存した後で移し直す
         dialog = _dialog(library, thumbnails)
         try:
             dialog.set_category("新しい分類")
@@ -231,6 +236,7 @@ class TestTheWindow:
     def test_before_and_after_pictures_are_shown_side_by_side(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、上書きで何が消えて何に替わるのかを絵で見比べられないまま保存を押す
         dialog = _dialog(library, thumbnails)
         try:
             dialog.set_category("見出し")
@@ -266,6 +272,7 @@ class TestSaving:
     def test_overwriting_moves_the_old_one_to_the_trash_and_it_comes_back(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、上書きした前の見た目がごみ箱に残らず、間違えて上書きしたら取り戻せない
         dialog = _dialog(library, thumbnails)
         try:
             dialog.pick("赤")
@@ -311,6 +318,8 @@ class TestSaving:
     def test_a_name_taken_elsewhere_without_the_mark_is_not_overwritten(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # 壊れると、窓を開いた後にほかの窓で同じ名前が保存されたとき、
+        # 上書きの印を入れていないのにそちらを消してしまう
         dialog = _dialog(library, thumbnails, ALIAS, suggestion="新しい")
         try:
             library.aliases.save(Alias.of("新しい", _clip("ほかの窓")))
@@ -351,6 +360,8 @@ class TestReplaceFromTheList:
     def test_the_selected_one_is_updated_with_the_current_clip(
         self, library: Library, thumbnails: LookThumbnails, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 壊れると、一覧の〔いまのクリップで上書き〕で分類が外れるか、
+        # 前の中身がごみ箱に残らず戻せない
         def capture(kind: LibraryKind, name: str, category: str) -> Alias:
             assert kind == ALIAS
             return Alias.of(name, _clip("いまの文字"), category=category)
@@ -377,6 +388,7 @@ class TestReplaceFromTheList:
     def test_without_a_current_clip_the_button_is_not_shown(
         self, library: Library, thumbnails: LookThumbnails
     ) -> None:
+        # クリップを選んでいないのにボタンが出ていると、押しても上書きする中身が無く何も起きない
         dialog = self._list_dialog(library, thumbnails, None)
         try:
             dialog.select("テロップ")
@@ -390,6 +402,7 @@ class TestPresetSaveUsesTheSameWindow:
     def test_the_panel_opens_the_save_window(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # 壊れると、設定パネルからの保存だけが前の名前だけの窓に戻り、上書きの印や見比べが出ない
         from dataclasses import replace
 
         from sashimono.core.model import Project, Track, TrackKind
@@ -424,12 +437,14 @@ class TestPresetSaveUsesTheSameWindow:
 
 class TestPreference:
     def test_it_comes_back(self, tmp_path: Path) -> None:
+        # 既定が入っていると知らない人が黙って上書きする 保存されないと、入れた人が起動のたびに戻る
         assert not Preferences().library_options.overwrite_without_asking
         store = PreferenceStore(tmp_path / "preferences.json")
         store.save(Preferences(save_overwrite_without_asking=True))
         assert store.load().library_options.overwrite_without_asking
 
     def test_the_dialog_offers_it(self) -> None:
+        # 出し忘れると、上書きの印を最初から入れておく設定を、設定画面から変える手段が無い
         dialog = PreferencesDialog(Preferences())
         try:
             assert not dialog._save_overwrite.isChecked()
@@ -475,6 +490,7 @@ class TestUndoNotice:
     def test_the_button_brings_the_old_one_back_once(
         self, library: Library, offers: list[OverwriteUndo]
     ) -> None:
+        # 壊れると、上書きした直後の〔元に戻す〕を押しても前の見た目が戻らない
         self._overwrite(library)
         (offer,) = offers
         notice = UndoNotice()
@@ -497,6 +513,8 @@ class TestUndoNotice:
             shiboken6.delete(notice)
 
     def test_a_new_save_offers_nothing(self, library: Library, offers: list[OverwriteUndo]) -> None:
+        # 新しく保存しただけで〔元に戻す〕が出ると、押して何が戻るのか分からず、
+        # 押すと保存した物が消えたように見える
         saved = save_look(
             None,
             library,
@@ -523,6 +541,8 @@ class TestUndoNotice:
     def test_the_notice_goes_away_and_cannot_be_used_after(
         self, library: Library, offers: list[OverwriteUndo]
     ) -> None:
+        # 知らせが消えないと画面の端に残り続け、時間が経った後に押されると、
+        # その後の作業で選び直した上書きまで戻ってしまう
         self._overwrite(library)
         notice = UndoNotice()
         try:
@@ -543,6 +563,8 @@ class TestUndoNotice:
         offers: list[OverwriteUndo],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # 壊れると、一覧から〔いまのクリップで上書き〕したときだけ、
+        # 直後の〔元に戻す〕が出ず前の中身をすぐに戻せない
         def capture(kind: LibraryKind, name: str, category: str) -> Alias:
             return Alias.of(name, _clip("いまの文字"), category=category)
 
@@ -569,6 +591,7 @@ class TestUndoNotice:
             shiboken6.delete(dialog)
 
     def test_the_main_window_shows_it_in_the_status_bar(self, library: Library) -> None:
+        # 壊れると、上書きして保存しても主の窓に〔元に戻す〕の知らせが出ず、戻す手段に気付かない
         from sashimono.core.model import Project
         from sashimono.ui.main_window import MainWindow
 

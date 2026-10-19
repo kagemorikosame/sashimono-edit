@@ -66,6 +66,7 @@ class TestSelection:
         assert not host.selected_clips
 
     def test_an_unknown_id_is_refused(self, host: FakeHost) -> None:
+        # 無い ID を混ぜて選べると、AI は選んだつもりで、一部が抜けたまま「まとめて」の操作に進む
         with pytest.raises(ToolError, match="list_clips"):
             run(host, "select_clips", clip_ids=["無い"])
 
@@ -105,6 +106,7 @@ class TestMoving:
         assert host.document.history_labels[-1] == "1 本を移動"
 
     def test_zero_is_refused(self, host: FakeHost, two: tuple[ClipId, ClipId]) -> None:
+        # 0 だけ動かす呼び出しを通すと、何も変わらない「移動」が履歴に積まれ、Ctrl+Z が空振りする
         with pytest.raises(ToolError, match="delta"):
             run(host, "move_clips", clip_ids=[str(two[0])], delta=0)
 
@@ -135,12 +137,14 @@ class TestTrackHeight:
         assert run(host, "list_tracks")["tracks"][0]["height"] == 240
 
     def test_an_unknown_track_is_refused(self, host: FakeHost) -> None:
+        # 無いトラックを黙って飛ばすと、AI は高さを変えたと報告し、画面のトラックは変わらない
         with pytest.raises(ToolError, match="list_tracks"):
             run(host, "set_track_height", track_id="無い", height=80)
 
 
 class TestTransition:
     def test_a_transition_is_placed(self, host: FakeHost) -> None:
+        # 置かれないか種類や長さが違うと、「押し出しで 40 フレーム」と頼んだ切り替えが画面に出ない
         result = run(host, "add_transition", style="push", duration=40, angle=90.0)
         assert result == {"added": "push", "duration": 40}
         placed = [
@@ -155,5 +159,6 @@ class TestTransition:
         assert placed[0].source.params["style"] == "push"
 
     def test_an_unknown_style_is_refused(self, host: FakeHost) -> None:
+        # 知らない種類を既定に読み替えると、「ワイプで」と頼んだのに別の切り替えが黙って入る
         with pytest.raises(ToolError, match="style"):
             run(host, "add_transition", style="ワイプ")

@@ -49,6 +49,7 @@ class TestShape:
         assert not {"star_count", "density", "wave_volume", "corner_radius", "points"} & shown
 
     def test_a_starfield_shows_its_own(self, panel: InspectorPanel) -> None:
+        # 星空に自分の欄が出ないと星の数や速さを変えられず、読まない欄が並ぶと動かしても変わらない
         shown = _shown(panel, SHAPE.create(shape="starfield"))
         assert {"star_count", "star_speed", "color"} <= shown
         # 星空は画面の座標で描き、大きさ・位置・回転を読まない
@@ -70,11 +71,13 @@ class TestTransition:
         assert "style" in shown
 
     def test_a_crossfade_hides_the_direction(self, panel: InspectorPanel) -> None:
+        # フェードに向きの欄を出すと、動かしても何も変わらない欄を触って効かないと悩む
         shown = _shown(panel, TRANSITION.create(style="fade"))
         assert "angle" not in shown and "target" not in shown
         assert "easing" in shown
 
     def test_a_slide_shows_the_direction(self, panel: InspectorPanel) -> None:
+        # スライドで向きの欄が隠れると、どちらへ滑らせるかを変える手が無くなる
         shown = _shown(panel, TRANSITION.create(style="slide"))
         assert {"angle", "target", "easing"} <= shown
 
@@ -120,6 +123,7 @@ class TestText:
         assert "shadow_color" in _shown(panel, TEXT.create(shadow_x=moving))
 
     def test_hidden_values_are_kept(self) -> None:
+        # 文字を隠したときに本文を捨てると、タイマーをやめて文字に戻したとき書いた文が消えている
         source = TEXT.create(text="残す", timer_format="ss")
         assert source.params["text"] == "残す"
         assert "text" in TEXT.unused_names(source.params)
