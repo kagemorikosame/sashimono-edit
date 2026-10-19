@@ -15,7 +15,7 @@ from fractions import Fraction
 from functools import cache
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import av
 import av.audio.fifo
@@ -32,7 +32,12 @@ from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
-from sashimono.engine.encoders import PRIORITY_AUTO, order_by_priority, probe_encoder
+from sashimono.engine.encoders import (
+    PRIORITY_AUTO,
+    encoder_options,
+    order_by_priority,
+    probe_encoder,
+)
 from sashimono.engine.gpu import OffscreenGLContext
 from sashimono.engine.render import (
     DEFAULT_DECODE_THREADS,
@@ -227,8 +232,50 @@ def _open_encoder(name: str) -> None:
     probe_encoder(name)
 
 
-class _EncoderOpenError(ExportError):
-    """エンコーダを開けなかった まだ 1 コマも書いていないので、別のコーデックでやり直せる"""
+class _EncoderError(ExportError):
+    """エンコーダが使えなかった 書きかけを捨てて、別のコーデックで最初からやり直せる"""
+
+
+class _EncoderOpenError(_EncoderError):
+    """エンコーダを開けなかった まだ 1 コマも書いていない"""
+
+
+class _EncoderWriteError(_EncoderError):
+    """開けたエンコーダが途中で書けなくなった（駆動の失敗など）
+
+    合成や多重化（mux）の失敗とは分ける そちらはコーデックを替えても直らないので、
+    やり直すと同じ所でもう 1 度落ちるまで待たされる
+    """
+
+
+def _fallback_notice(refused: list[tuple[str, _EncoderError]], used: str) -> str:
+    """次の候補で書き上げたときの知らせ 何で書いたかと、前の候補が使えなかった理由"""
+    reasons = " / ".join(str(error) for _codec, error in refused)
+    names = "、".join(codec for codec, _error in refused)
+    return f"{names} では書き出せなかったので、{used} で最初から書き出し直した（{reasons}）"
+
+
+def _video_options(codec: str, settings: ExportSettings) -> dict[str, str]:
+    """エンコーダへ渡す選択肢 既定（AMF の品質と上限のビットレート #365）に本人の指定を重ねる
+
+    本人の指定（:attr:`ExportSettings.options`）を後から重ねて勝たせる 既定を後にすると、
+    品質を名指しした人の指定が黙って消える
+    """
+    return {**encoder_options(codec, settings.video_bitrate), **settings.options}
+
+
+def _encode_frame(
+    video: av.video.stream.VideoStream, frame: av.video.frame.VideoFrame | None
+) -> list[av.Packet[Any]]:
+    """1 コマ（``None`` なら残り）をエンコードする 失敗したら :class:`_EncoderWriteError`
+
+    多重化（mux）はここに入れない エンコーダの失敗だけを、次の候補へ移れる失敗として拾う
+    """
+    try:
+        return video.encode(frame)
+    except av.error.FFmpegError as exc:
+        name = video.codec_context.name
+        raise _EncoderWriteError(f"映像のエンコーダ {name} が途中で書けなくなった ({exc})") from exc
 
 
 def _color_options_in(options: dict[str, str]) -> list[str]:
@@ -254,12 +301,17 @@ def export_project(
     *,
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    notice: Callable[[str], None] | None = None,
 ) -> Path:
     """プロジェクトを 1 本の動画ファイルへ書き出す
 
     ``should_cancel`` が真を返したら、書きかけのファイルを消して
     :class:`ExportError` を投げる 中途半端なファイルを残すと、書き出せたのか
     どうかが分からなくなる
+
+    コーデックを名指ししない書き出しで、候補のエンコーダが開けなかったり途中で書けなく
+    なったりしたら、次の候補で最初から書き出し直す 書き上げたら、何で書いたかを ``notice``
+    へ知らせる（#365） 黙って替えると、GPU で書いたつもりの人が遅さや画の違いの理由を探せない
     """
     start, end = settings.frame_range or (0, project.duration)
     total = end - start
@@ -317,6 +369,8 @@ def export_project(
     context = OffscreenGLContext()
     renderer = FrameRenderer(project, context=context, quality=FULL_QUALITY, decode_threads=threads)
     mixer = AudioMixer(project, smooth_history=settings.smooth_history)
+    #: 書けなかったコーデックと理由 次の候補で書き上げたときに、何で書いたかと一緒に知らせる
+    refused: list[tuple[str, _EncoderError]] = []
 
     try:
         for index, codec in enumerate(codecs):
@@ -324,13 +378,26 @@ def export_project(
                 _encode(
                     project, settings, codec, start, end, renderer, mixer, progress, should_cancel
                 )
-                break
-            except _EncoderOpenError:
-                # 開けなかっただけなら、まだ何も描いておらず音も進めていない
-                # 書きかけの入れ物だけ消して次へ移る 候補が尽きたら理由をそのまま伝える
+            except _EncoderError as exc:
+                # 書きかけの入れ物を消して次へ移る 候補が尽きたら理由をそのまま伝える
                 settings.path.unlink(missing_ok=True)
                 if index == len(codecs) - 1:
                     raise
+                refused.append((codec, exc))
+                if isinstance(exc, _EncoderWriteError):
+                    # 途中まで描いて音も進めた 描く側と混ぜる側は前の音や絵を覚えている
+                    # （音の効果の残り・軌跡など）ので、作り直して最初から書き出し直す
+                    # 使い回すと、2 本目の頭に 1 本目の途中の音や絵が混ざる
+                    renderer.close()
+                    mixer.close()
+                    renderer = FrameRenderer(
+                        project, context=context, quality=FULL_QUALITY, decode_threads=threads
+                    )
+                    mixer = AudioMixer(project, smooth_history=settings.smooth_history)
+                continue
+            if refused and notice is not None:
+                notice(_fallback_notice(refused, codec))
+            break
     except BaseException:
         # 例外でもキャンセルでも、書きかけを残さない
         settings.path.unlink(missing_ok=True)
@@ -389,8 +456,9 @@ def _encode(
         tag_bt709(video)
         if settings.video_bitrate:
             video.bit_rate = settings.video_bitrate
-        if settings.options:
-            video.options = dict(settings.options)
+        options = _video_options(codec, settings)
+        if options:
+            video.options = dict(options)
 
         audio = None
         fifo = None
@@ -454,7 +522,7 @@ def _encode(
         # ここへ来るのは書き込みスレッドが終わった後だけ（`with` が待って join する）
         if audio is not None and fifo is not None:
             _flush_audio(container, audio, fifo)
-        container.mux(video.encode(None))
+        container.mux(_encode_frame(video, None))
 
 
 class _FrameWriter:
@@ -513,7 +581,7 @@ class _FrameWriter:
         frame = to_bt709(frame, self._pixel_format, reformatter=self._reformatter)
         frame.pts = index
         frame.time_base = self._frame_time_base
-        self._container.mux(self._video.encode(frame))
+        self._container.mux(_encode_frame(self._video, frame))
 
         # 進み具合は**書けた枚数**で出す 合成した枚数で出すと、パイプラインの
         # 深さのぶんだけ先へ進んで見え、100% になってから実際の書き込みを待つ

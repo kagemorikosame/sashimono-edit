@@ -16,11 +16,15 @@ import av.video.codeccontext
 import av.video.frame
 
 __all__ = [
+    "AMF_PEAK_RATIO",
+    "AMF_QUALITY",
     "ENCODER_PRIORITIES",
     "PRIORITY_AMD",
     "PRIORITY_AUTO",
     "PRIORITY_CPU",
     "PRIORITY_INTEL",
+    "PROBE_BIT_RATE",
+    "encoder_options",
     "encoder_vendor",
     "order_by_priority",
     "probe_encoder",
@@ -43,6 +47,34 @@ _VENDOR_SUFFIXES = (("_nvenc", "nvidia"), ("_amf", PRIORITY_AMD), ("_qsv", PRIOR
 #: 開けるかを試すときの大きさ NVENC は小さすぎる画を断る（64x64 では開けない）ので、
 #: 書き出しでよく使う大きさに近い 16:9 で試す 小さくすると、使える NVENC まで外れる
 PROBE_SIZE = (640, 360)
+#: 試すときのビットレート（bps） 書き出しの既定（12 Mbps）と同じにする AMF は上限の
+#: ビットレートをこれから組むので、書き出しと同じ選択肢で開けるかを試せる
+PROBE_BIT_RATE = 12_000_000
+
+#: AMF の品質の選び（FFmpeg の amfenc の ``quality`` speed / balanced / quality / high_quality）
+#: 2026-10-20 に利用者が決めた 省くと AMF の駆動の既定任せになり、機械ごとに画が変わる
+#: AMD の実機で確かめていない 外れたら直す（#365）
+AMF_QUALITY = "balanced"
+#: AMF の上限のビットレート（FFmpeg の汎用の ``maxrate``）を、指定のビットレートの何倍にするか
+#: 2026-10-20 に利用者が決めた 省くと amfenc は peak constrained VBR を上限なしで選び、
+#: 駆動の既定の上限になる 指定と同じにすると CBR に切り替わる（amfenc_h264.c の選び方）
+#: NVENC の VBR に近い振る舞いを狙う AMD の実機で確かめていない 外れたら直す（#365）
+AMF_PEAK_RATIO = (3, 2)
+
+
+def encoder_options(name: str, bit_rate: int | None) -> dict[str, str]:
+    """``name`` のエンコーダへ既定で渡す選択肢 AMF のほかは空
+
+    名前と値は FFmpeg の文書と amfenc_h264.c / amfenc_hevc.c の AVOption に合わせた
+    ``maxrate`` は全エンコーダに共通の選択肢（``rc_max_rate``）で、AMF は peak bitrate として読む
+    """
+    if encoder_vendor(name) != PRIORITY_AMD:
+        return {}
+    options = {"quality": AMF_QUALITY}
+    if bit_rate:
+        numerator, denominator = AMF_PEAK_RATIO
+        options["maxrate"] = str(bit_rate * numerator // denominator)
+    return options
 
 
 def encoder_vendor(name: str) -> str:
@@ -90,14 +122,28 @@ def probe_encoder(name: str) -> None:
 
 
 def _open_context(name: str) -> av.video.codeccontext.VideoCodecContext:
-    """試しに書くための文脈を開く 開けなければ投げる"""
-    # create は種類の union を返す 映像の属性を触るので、ここで型を確定させる
-    context = cast("av.video.codeccontext.VideoCodecContext", av.CodecContext.create(name, "w"))
+    """試しに書くための文脈を開く 開けなければ投げる
+
+    ビットレートと既定の選択肢（:func:`encoder_options`）は書き出しと同じ組み方で渡す
+    渡さずに試すと、AMF の駆動が書き出しの選択肢だけを断る機械で、試しには通って
+    書き出しで落ちる
+    """
+    context = _new_context(name)
     context.width, context.height = PROBE_SIZE
     context.pix_fmt = "yuv420p"
     context.time_base = Fraction(1, 30)
+    context.bit_rate = PROBE_BIT_RATE
+    options = encoder_options(name, PROBE_BIT_RATE)
+    if options:
+        context.options = options
     context.open()
     return context
+
+
+def _new_context(name: str) -> av.video.codeccontext.VideoCodecContext:
+    """まだ開いていない書き込みの文脈 試験が偽のエンコーダに差し替える所"""
+    # create は種類の union を返す 映像の属性を触るので、ここで型を確定させる
+    return cast("av.video.codeccontext.VideoCodecContext", av.CodecContext.create(name, "w"))
 
 
 @cache

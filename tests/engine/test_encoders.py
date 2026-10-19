@@ -137,6 +137,74 @@ class TestProbe:
         assert encoders.usable("libx264")
 
 
+class _Recording:
+    """開けたときの選択肢とビットレートを覚える偽のエンコーダ 1 コマ渡せば 1 つ出す"""
+
+    def __init__(self) -> None:
+        self.width = self.height = 0
+        self.pix_fmt = ""
+        self.time_base: object = None
+        self.bit_rate = 0
+        self.options: dict[str, str] = {}
+        self.opened_with: dict[str, str] | None = None
+
+    def open(self) -> None:
+        self.opened_with = dict(self.options)
+
+    def encode(self, frame: object) -> list[object]:
+        return [] if frame is None else [object()]
+
+
+class TestAmfOptions:
+    """AMF に渡す品質と上限のビットレート（2026-10-20 利用者の決定 AMD の実機で確かめていない）"""
+
+    def test_amf_gets_balanced_quality_and_a_peak_of_one_and_a_half(self) -> None:
+        # 崩れると、AMF の駆動の既定任せになり、機械ごとに画とファイルの大きさが変わる
+        assert encoders.encoder_options("h264_amf", 12_000_000) == {
+            "quality": "balanced",
+            "maxrate": "18000000",
+        }
+        assert encoders.encoder_options("hevc_amf", 8_000_000)["maxrate"] == "12000000"
+
+    def test_without_a_bit_rate_only_the_quality_is_given(self) -> None:
+        # 上限だけ 0 で渡すと、amfenc は上限なしの扱いと食い違い、駆動に断られうる
+        assert encoders.encoder_options("h264_amf", None) == {"quality": "balanced"}
+
+    @pytest.mark.parametrize("name", ["h264_nvenc", "h264_qsv", "libx264"])
+    def test_other_encoders_get_nothing(self, name: str) -> None:
+        # AMF の選択肢を NVENC や libx264 へ渡すと、知らない名前で開けずに書き出せなくなる
+        assert encoders.encoder_options(name, 12_000_000) == {}
+
+    def test_the_probe_opens_amf_with_the_same_options_as_the_export(
+        self, monkeypatch: pytest.MonkeyPatch, forget_usable: None
+    ) -> None:
+        """試しに開くときも、書き出しと同じ選択肢を渡す
+
+        渡さずに試すと、駆動が選択肢を断る機械で、試しには通って書き出しで落ちる
+        """
+        made: list[_Recording] = []
+
+        def fake(_name: str) -> _Recording:
+            made.append(_Recording())
+            return made[-1]
+
+        monkeypatch.setattr(encoders, "_new_context", fake)
+        assert encoders.usable("h264_amf")
+        assert made[0].bit_rate == encoders.PROBE_BIT_RATE
+        assert made[0].opened_with == encoders.encoder_options("h264_amf", encoders.PROBE_BIT_RATE)
+
+    def test_the_export_lets_the_users_own_options_win(self, tmp_path: Path) -> None:
+        # 既定が後に勝つと、品質を名指しした人の指定が黙って消える
+        settings = exporter.ExportSettings(
+            path=tmp_path / "a.mp4", video_bitrate=10_000_000, options={"quality": "speed"}
+        )
+        assert exporter._video_options("h264_amf", settings) == {
+            "quality": "speed",
+            "maxrate": "15000000",
+        }
+        assert exporter._video_options("libx264", settings) == {"quality": "speed"}
+
+
 class TestExportCandidates:
     def test_amf_is_dropped_on_a_machine_without_amd(
         self, monkeypatch: pytest.MonkeyPatch, forget_usable: None

@@ -80,6 +80,9 @@ class _ExportWorker(QObject):
         self._project = project
         self._settings = settings
         self._cancel = threading.Event()
+        #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365）
+        #: 書き出しのスレッドが足し、終わりの知らせ（finished）が届いてから画面のスレッドが読む
+        self.notes: list[str] = []
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -91,6 +94,7 @@ class _ExportWorker(QObject):
                 self._settings,
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
+                notice=self.notes.append,
             )
         except ExportError as exc:
             self.failed.emit(str(exc))
@@ -393,12 +397,16 @@ class ExportDialog(QDialog):
         self._progress.setValue(int(value * 1000))
 
     def _on_finished(self, path: str) -> None:
+        notes = self._worker.notes if self._worker is not None else []
         self._teardown()
         if self._closing:
             # 閉じるよう頼まれて止めている間に書き終わった 頼まれたとおり閉じる
             super().reject()
             return
-        QMessageBox.information(self, "書き出し", f"書き出しました\n{path}")
+        # 次の候補のエンコーダで書き直したときは、何で書いたかを添える 黙っていると、
+        # GPU で書いたつもりの人が遅さや画の違いの理由を探せない
+        text = "\n".join([f"書き出しました\n{path}", *notes])
+        QMessageBox.information(self, "書き出し", text)
         self.accept()
 
     def _on_failed(self, message: str) -> None:

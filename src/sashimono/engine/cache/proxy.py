@@ -89,7 +89,7 @@ from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
 from sashimono.engine.decode import ProbeError, VideoDecoder, probe_media
 from sashimono.engine.decode.rational import as_fraction
-from sashimono.engine.encoders import PRIORITY_AUTO, order_by_priority, usable
+from sashimono.engine.encoders import PRIORITY_AUTO, encoder_options, order_by_priority, usable
 
 __all__ = [
     "MEASURED_PREFETCH_MS",
@@ -328,6 +328,11 @@ def _transcode(
             tag_bt709(video)
             # 控えは見るためだけのもの 画質より、小ささと変換の速さを取る
             video.bit_rate = width * scaled * 4
+            # AMF は品質と上限のビットレートを書き出しと同じ組み方で渡す（#365） 試し
+            # （:func:`usable`）も同じ組み方で開くので、選択肢の名前を駆動が受けないなら試しで外れる
+            options = encoder_options(codec, video.bit_rate)
+            if options:
+                video.options = dict(options)
             video.time_base = stream.time_base
 
             for frame in container.decode(stream):

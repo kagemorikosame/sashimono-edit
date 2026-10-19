@@ -7,14 +7,16 @@ GPU のエンコーダを使うか・どの GPU を先に使うかは人によ�
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from sashimono.ai.host import ExportRequest
+from sashimono.ai.host import EXPORT_RUNNING, ExportRequest
 from sashimono.core.commands import AddClip, AddTrack
 from sashimono.core.io.atomic import expect_now
 from sashimono.core.model import Clip, Project, Track, TrackKind
@@ -26,6 +28,7 @@ from sashimono.engine.encoders import (
     PRIORITY_AUTO,
     PRIORITY_CPU,
 )
+from sashimono.ui import ai_export, export_dialog
 from sashimono.ui.export_dialog import AUTO_CODEC, CODEC_LABELS, ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import ENCODER_PRIORITY_CHOICES, PreferencesDialog
@@ -182,3 +185,65 @@ def test_changing_the_priority_remakes_the_proxy_builder(window: MainWindow) -> 
     assert window._proxies.encoder_priority == PRIORITY_AUTO
     window._apply_preferences(replace(window._preferences, encoder_priority=PRIORITY_CPU))
     assert window._proxies.encoder_priority == PRIORITY_CPU
+
+
+#: 次の候補で書き直したときの知らせ 書き出し側（export_project の notice）から来る
+FALLBACK_NOTE = "h264_amf では書き出せなかったので、libx264 で最初から書き出し直した（偽）"
+
+
+def _noting_export(_project: Project, settings: ExportSettings, **options: Any) -> Path:
+    """書き上げて、次の候補で書き直したと知らせる偽の書き出し"""
+    settings.path.write_bytes(b"video")
+    options["notice"](FALLBACK_NOTE)
+    return settings.path
+
+
+def _text_project() -> Project:
+    """文字を 1 つ置いた作品 空だと書き出しを始められない"""
+    track = Track(TrackKind.VIDEO, "V1")
+    project = AddTrack(track).apply(Project.create())
+    clip = Clip(timeline_start=0, duration=30, source=TEXT.create())
+    return AddClip(track.id, clip).apply(project)
+
+
+def _wait_until(condition: Callable[[], bool], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert condition()
+
+
+def test_the_export_dialog_says_which_encoder_wrote_it(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 黙っていると、GPU で書いたつもりの人が、遅さや画の違いの理由を探せない
+    del qt_application
+    shown: list[str] = []
+    monkeypatch.setattr(export_dialog, "run_export", _noting_export)
+    monkeypatch.setattr(QMessageBox, "information", lambda _p, _t, text: shown.append(text))
+    dialog = ExportDialog(_text_project(), folder=tmp_path)
+    try:
+        dialog._start()
+        _wait_until(lambda: bool(shown))
+        assert FALLBACK_NOTE in shown[0]
+    finally:
+        dialog.deleteLater()
+
+
+def test_the_assistant_export_says_which_encoder_wrote_it(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 黙っていると、AI が GPU で書いたと説明しかねず、人も何で書いたか分からない
+    del qt_application
+    monkeypatch.setattr(ai_export, "run_export", _noting_export)
+    target = tmp_path / "完成.mp4"
+    job = ai_export.AssistantExport()
+    try:
+        job.start(_text_project(), ExportSettings(path=target), lambda: target.resolve())
+        _wait_until(lambda: job.status()["state"] not in EXPORT_RUNNING)
+        assert job.status()["state"] == "done"
+        assert FALLBACK_NOTE in str(job.status()["message"])
+    finally:
+        job.shutdown()
+        job.deleteLater()

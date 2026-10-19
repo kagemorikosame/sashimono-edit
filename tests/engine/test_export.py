@@ -10,11 +10,13 @@ import threading
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import av
 import av.codec.codec
 import av.error
 import av.video.codeccontext
+import av.video.stream
 import numpy as np
 import pytest
 from av.video.reformatter import ColorPrimaries, ColorRange, ColorTrc
@@ -110,6 +112,43 @@ def probed(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list[str]:
     monkeypatch.setattr(exporter, "_open_encoder", fake)
     monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("h264_qsv", "libx264"))
     return calls
+
+
+@pytest.fixture
+def breaks_mid_way(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list[str]:
+    """3 コマ目で書けなくなる偽のエンコーダ（mpeg4 を使う）を、候補の先頭に置く
+
+    GPU の駆動が書き出しの途中で断るのを真似る 開けるのは本物なので、2 コマ目までは
+    実際に書いてから落ちる 返す一覧には書き出しの知らせ（notice）を入れる
+    """
+
+    class Breaking:
+        """どのコマも断るストリーム エンコーダの失敗と同じ FFmpeg の例外を投げる"""
+
+        def __init__(self, video: av.video.stream.VideoStream) -> None:
+            self.codec_context = video.codec_context
+
+        def encode(self, _frame: object) -> list[av.Packet[Any]]:
+            raise av.error.ExternalError(-542398533, "偽の駆動の失敗")
+
+    real = getattr(exporter, "_encode_frame", None)
+    written = {"count": 0}
+
+    def fake(video: av.video.stream.VideoStream, frame: object) -> list[av.Packet[Any]]:
+        assert real is not None
+        target: object = video
+        if video.codec_context.name == "mpeg4" and frame is not None:
+            written["count"] += 1
+            if written["count"] >= 3:
+                target = Breaking(video)
+        packets: list[av.Packet[Any]] = real(target, frame)
+        return packets
+
+    monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+    monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("mpeg4", "libx264"))
+    # 直す前の書き出しにはこの口が無い 無ければ差し込まずに mpeg4 のまま書き上がり、試験が落ちる
+    monkeypatch.setattr(exporter, "_encode_frame", fake, raising=False)
+    return []
 
 
 def _encoder_of(path: Path) -> str:
@@ -235,6 +274,51 @@ class TestExport:
         output = tmp_path / "out.mp4"
         export_project(ready_project, ExportSettings(path=output, frame_range=(0, 3)))
         assert _encoder_of(output) == "libx264"
+
+    def test_falls_back_when_the_encoder_fails_mid_way(
+        self,
+        breaks_mid_way: list[str],
+        ready_project: Project,
+        tmp_path: Path,
+    ) -> None:
+        """開けたエンコーダが途中で書けなくなっても、次の候補で最初から書き上げる（#365）
+
+        GPU の駆動はまれに書き出しの途中で断る 落ちないと、libx264 なら書ける作品でも
+        書き出しが失敗し、利用者は何度押しても書き出せない 何で書いたかも知らせる
+        """
+        output = tmp_path / "out.mp4"
+        export_project(
+            ready_project,
+            ExportSettings(path=output, frame_range=(0, 6)),
+            notice=breaks_mid_way.append,
+        )
+        assert _encoder_of(output) == "libx264"
+        with av.open(str(output)) as container:
+            frames = sum(1 for _ in container.decode(video=0))
+            has_audio = bool(container.streams.audio)
+        # 1 本目の途中から続けると頭が欠ける 最初から書き直していれば 6 コマそろう
+        assert frames == 6
+        assert has_audio
+        assert len(breaks_mid_way) == 1
+        assert "mpeg4" in breaks_mid_way[0] and "libx264" in breaks_mid_way[0]
+
+    def test_a_chosen_codec_that_fails_mid_way_is_an_export_error(
+        self,
+        breaks_mid_way: list[str],
+        ready_project: Project,
+        tmp_path: Path,
+    ) -> None:
+        """名指ししたコーデックが途中で書けなくなったら、替えずに断って書きかけを消す
+
+        黙って別のコーデックに変えると、選んだ物で書けたと思い込ませる 書きかけが残ると、
+        途中で切れた動画を完成品と取り違える
+        """
+        output = tmp_path / "out.mp4"
+        settings = ExportSettings(path=output, video_codec="mpeg4", frame_range=(0, 6))
+        with pytest.raises(ExportError, match="mpeg4"):
+            export_project(ready_project, settings, notice=breaks_mid_way.append)
+        assert not output.exists()
+        assert breaks_mid_way == []
 
     def test_a_chosen_codec_that_does_not_open_is_an_export_error(
         self, ready_project: Project, tmp_path: Path
