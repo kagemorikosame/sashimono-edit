@@ -29,7 +29,8 @@ def _written(path: Path, version: int) -> str:
 
 class TestThePreUpgradeCopy:
     def test_an_older_file_is_copied_beside(self, tmp_path: Path) -> None:
-        # 写しが残らないと、更新の後で前の版へ戻した人は上書き保存した作品をどの版でも開けなくなる
+        # 写しが残らないと、更新の後で前の版へ戻した人は、新しい形で上書き保存した作品を
+        # 前の版で開けず、更新前の中身へも戻せない
         path = tmp_path / "作品.sme"
         text = _written(path, FORMAT_VERSION - 1)
         copy = keep_pre_upgrade_copy(path)

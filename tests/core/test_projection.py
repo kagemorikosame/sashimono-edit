@@ -216,8 +216,8 @@ class TestReuse:
     def test_projection_is_sorted_across_tracks(
         self, project: Project, video_media: MediaItem, transcript: Transcript
     ) -> None:
-        # トラックの順のまま返すと、AI に渡す字幕の一覧が時刻順にならず、
-        # 通し番号の offset で続きを読んだ AI が字幕を読み飛ばす
+        # トラックの順のまま返すと、AI に渡す字幕の一覧が時刻順にならず、AI が場面と違う
+        # 順で字幕を読んで、話の流れを取り違える
         with_transcript = SetTranscript(video_media.id, transcript).apply(project)
         second = Track(kind=TrackKind.VIDEO, name="V2")
         with_track = AddTrack(second).apply(with_transcript)

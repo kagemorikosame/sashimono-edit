@@ -160,8 +160,8 @@ class TestFilmstrip:
         assert not np.array_equal(first, last), "全部同じ絵になっている"
 
     def test_lookup_by_time(self, sample_av: SampleMedia) -> None:
-        # 時刻と番号の対応がずれると、クリップの位置と違う場面のサムネイルが出て、
-        # 素材の終わりより先を指したときにはサムネイルが空白になる
+        # 時刻と番号の対応がずれると、クリップの位置と違う場面のサムネイルが出る 範囲を
+        # 越えた時刻で最後の 1 枚を返せないと、素材の終わり近くのサムネイルが空白になる
         filmstrip = build_filmstrip(sample_av.path, interval=Fraction(1, 2), height=24)
         assert filmstrip is not None
 
