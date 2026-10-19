@@ -47,6 +47,15 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost, Question
+from sashimono.ai.bridge import BudgetRequest
+from sashimono.ai.budget import (
+    DailyUsageStore,
+    Limits,
+    Usage,
+    UsageMeter,
+    format_minutes,
+    format_tokens,
+)
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
@@ -68,9 +77,16 @@ from sashimono.ui.disclosure import DisclosureButton
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
 from sashimono.ui.theme import Colors, theme_signals, themed_style
-from sashimono.ui.workspace import Preferences
+from sashimono.ui.workspace import Preferences, config_root
 
 __all__ = ["ChatPanel"]
+
+#: 1 日に使った量を残すファイル（本人の設定の置き場 #344） 外へは送らない
+USAGE_FILE = "ai_usage.json"
+
+#: 上限に当たったときの箱の頭と、ボタンの文言
+BUDGET_HEAD = "AI が使う量の上限に達しました 続けますか？"
+BUDGET_STOP_TEXT = "ここで止める"
 
 #: 太字と等幅だけを拾う Claude の返事は素の Markdown で来るので、
 #: そのまま出すと ** が本文に混ざる 見出しや表まで組む必要は無い
@@ -237,8 +253,15 @@ class ChatPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._host = host
-        self._bridge = EditorBridge(host)
+        # 1 日の量はアプリを閉じても残す（#344） 置き場は設定と同じ（試験は一時フォルダへ向く）
+        self._bridge = EditorBridge(
+            host, usage=UsageMeter(DailyUsageStore(config_root() / USAGE_FILE))
+        )
         self._session: AgentSession | None = None
+        #: 画面に出している「上限に達しました 続けますか」（#344）
+        self._budget: BudgetRequest | None = None
+        #: 止めると決まった後も道具を呼び続けたので、会話を止めた（同じ指示で 2 度止めない）
+        self._halted = False
         #: 会話を作ったときの置き方の方式 指示の文をこの方式で書いたので、変わったら作り直す
         self._session_mode = ""
         self._approval: Approval | None = None
@@ -449,6 +472,27 @@ class ChatPanel(QWidget):
         approval_layout.addWidget(self._approval_text)
         approval_layout.addLayout(approval_buttons)
 
+        # 上限に当たったとき（#344） 許可の箱と同じ形で、パネルの中に出す 窓にすると、
+        # 任せて別の作業をしている人の前に急に割り込む
+        self._budget_box = QFrame(self)
+        self._budget_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self._budget_box.setVisible(False)
+        self._budget_text = QLabel(self._budget_box)
+        self._budget_text.setWordWrap(True)
+        self._budget_go = QPushButton(self._budget_box)
+        self._budget_go.clicked.connect(lambda: self._reply_budget(True))
+        self._budget_stop = QPushButton(BUDGET_STOP_TEXT, self._budget_box)
+        self._budget_stop.clicked.connect(lambda: self._reply_budget(False))
+        budget_buttons = QHBoxLayout()
+        budget_buttons.setContentsMargins(0, 0, 0, 0)
+        budget_buttons.addStretch(1)
+        budget_buttons.addWidget(self._budget_stop)
+        budget_buttons.addWidget(self._budget_go)
+        budget_layout = QVBoxLayout(self._budget_box)
+        budget_layout.setContentsMargins(8, 6, 8, 6)
+        budget_layout.addWidget(self._budget_text)
+        budget_layout.addLayout(budget_buttons)
+
         self._build_question_box()
 
         # 部品が古くて断られたときの案内 その場で押せる更新のボタンを添える
@@ -497,6 +541,12 @@ class ChatPanel(QWidget):
         status_row.addWidget(self._busy_mark)
         status_row.addWidget(self._status_text, 1)
 
+        # 使った量（#344） 状態の行と同じく幅を文字に合わせて広げない 収まらない分は切れる
+        # ので、全部はツールチップで読めるようにする
+        self._usage_text = QLabel(self)
+        self._usage_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        themed_style(self._usage_text, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+
         self._auto = QCheckBox("変更を自動で承認", self)
         # 入れても止まる所があると先に分かるようにする 知らないと、任せて席を外した後に
         # 確かめの窓が出たまま待っていたことに、戻ってから気付く
@@ -526,9 +576,11 @@ class ChatPanel(QWidget):
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._approval_box)
+        layout.addWidget(self._budget_box)
         layout.addWidget(self._question_box)
         layout.addWidget(self._update_box)
         layout.addLayout(status_row)
+        layout.addWidget(self._usage_text)
         layout.addWidget(self._input)
         layout.addLayout(controls)
 
@@ -738,6 +790,8 @@ class ChatPanel(QWidget):
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
+        # 上限は次の道具の前から効く 応えている途中で変えても、会話を作り直さずに済む
+        self._bridge.usage.limits = preferences.budget_limits()
         self._refresh_status()
 
     def _select_choices(self, model: str, effort: str) -> None:
@@ -1021,6 +1075,7 @@ class ChatPanel(QWidget):
         self._check_approval()
         self._check_question()
         self._check_send()
+        self._check_budget()
 
         session = self._session
         if session is not None:
@@ -1267,6 +1322,83 @@ class ChatPanel(QWidget):
         else:
             self._note(f"{names} を送りません（アプリを閉じるまで 表示 → 設定… で変えられます）")
 
+    # --- 使う量の上限（#344） ---
+
+    def _check_budget(self) -> None:
+        """上限に当たった知らせと「続けますか」を拾う"""
+        notice = self._bridge.take_budget_notice()
+        if notice is not None:
+            # 設定が「尋ねずに止める」 止めた訳を残さないと、AI が途中で投げ出したように見える
+            self._say("上限", f"{notice.text()} ここで止めました {_CHANGE_LIMITS}")
+            self._alert_when_away()
+        if self._bridge.wants_halt and not self._halted and self._session is not None:
+            # 断った訳を返しても道具を呼び続けている 呼ぶたびに API を使うので、会話ごと止める
+            self._halted = True
+            self._note("上限で止めた後も道具を呼び続けたので、会話を止めました")
+            self.interrupt()
+        showing = self._budget
+        if showing is not None:
+            if showing.done.is_set():
+                # 時間切れか中断でブリッジ側が畳んだ 画面からも下げ、止めたことを残す
+                self._hide_budget()
+                if showing.reason:
+                    self._note(f"上限の確かめを閉じました（{showing.reason}）")
+            return
+        request = self._bridge.take_budget_request()
+        if request is None:
+            return
+        if request.done.is_set():
+            # 取り出す前に畳まれていた 出すと、押しても何も起きない箱が残る
+            return
+        self._budget = request
+        overrun = request.overrun
+        self._budget_text.setText(f"{BUDGET_HEAD}\n{overrun.text()}")
+        self._budget_go.setText(f"続ける（{overrun.extended()} まで）")
+        self._budget_box.setVisible(True)
+        self._alert_when_away()
+
+    def _alert_when_away(self) -> None:
+        """別の窓を触っている人に、AI が止まっていることをタスクバーで知らせる"""
+        window = self.window()
+        if not window.isActiveWindow():
+            QApplication.alert(window)
+
+    def _reply_budget(self, proceed: bool) -> None:
+        request = self._budget
+        if request is None:
+            return
+        self._hide_budget()
+        if not request.reply(proceed):
+            # 押す前に中断か時間切れで畳まれていた 答えは AI へ届かない
+            return
+        overrun = request.overrun
+        if proceed:
+            self._note(
+                f"続けます（{overrun.kind.label}の上限を {overrun.extended()} まで広げました）"
+            )
+        else:
+            self._say("上限", f"{overrun.text()} ここで止めました {_CHANGE_LIMITS}")
+        self._refresh_status()
+
+    def _hide_budget(self) -> None:
+        self._budget = None
+        self._budget_box.setVisible(False)
+
+    def _usage_line(self) -> tuple[str, str]:
+        """使った量の行（短い文, ツールチップの全文）
+
+        応えている間はこの指示の量、待機中は今日の量を出す 両方を 1 行に並べると、AI の
+        パネルの幅に収まらず肝心の所が切れる 全文はツールチップで読める
+        """
+        meter = self._bridge.usage
+        limits = meter.limits
+        turn = meter.turn_usage()
+        today = _usage_text(meter.day_usage(), limits, daily=True)
+        if turn is None:
+            return f"今日: {today}", f"今日 AI が使った量: {today}"
+        now = _usage_text(turn, limits, daily=False)
+        return f"この指示: {now}", f"この指示: {now}\n今日: {today}"
+
     # --- AI からの質問（#296） ---
 
     def _check_question(self) -> None:
@@ -1386,6 +1518,9 @@ class ChatPanel(QWidget):
     def _begin_turn(self) -> None:
         """次の指示に取りかかった 秒と数を数え直す"""
         self._turn_started = self._clock()
+        # 使った量（#344）も指示ごとに数え直す 前の指示の量で次の指示が止まらないように
+        self._bridge.begin_turn()
+        self._halted = False
         self._turn_tools = 0
         self._turn_failures = 0
         self._turn_error = False
@@ -1410,10 +1545,23 @@ class ChatPanel(QWidget):
             outcome = "失敗"
         else:
             outcome = "完了"
+        self._bridge.end_turn()
+        used = self._bridge.usage.last
+        stopped = self._bridge.usage.last_stop
+        if stopped is not None:
+            # 上限で止めた指示を「完了」と書くと、頼んだことが全部済んだと読める
+            # 止めた後も道具を呼び続けて会話ごと止めた（中断）ときも、止めた訳は上限
+            outcome = "上限で停止"
         counts = f"操作 {self._turn_tools} 件"
         if self._turn_failures:
             counts += f"・失敗 {self._turn_failures} 件"
         elapsed = _duration(self._clock() - started)
+        # 使った量も残す（#344） 終わった後に、どの指示が重かったかを見返せる
+        # 知らせが来なかった物（繋がる前に落ちた指示など）は 0 と書かない 使わなかったと読める
+        if used.tokens:
+            counts += f"・{format_tokens(used.tokens)} トークン"
+        if used.images:
+            counts += f"・絵 {used.images} 枚"
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
         self._stopping = False
 
@@ -1432,7 +1580,7 @@ class ChatPanel(QWidget):
             return line
         approval = self._approval
         question = self._question
-        if not self._queued and approval is None and question is None:
+        if not self._queued and approval is None and question is None and self._budget is None:
             if self._updater.struggling:
                 # 1 回ごとには言わない（たまたま繋がらなかっただけの人を驚かせない）
                 return (
@@ -1447,6 +1595,9 @@ class ChatPanel(QWidget):
             # 答えるまで AI は先へ進まない 「実行中」のままだと、待たされているのが
             # こちらの返事だと気付かない
             head = "質問待ち"
+        elif self._budget is not None:
+            # 上限で止まっている 「実行中」のままだと、まだ動いていると思って待ち続ける
+            head = "上限の確かめ待ち"
         elif approval is not None:
             head = f"許可待ち: {approval.tool}"
         elif not self._connected and not (session is not None and session.busy):
@@ -1471,6 +1622,10 @@ class ChatPanel(QWidget):
         line = self._status_line()
         if self._status_text.text() != line:
             self._status_text.setText(line)
+        usage, full = self._usage_line()
+        if self._usage_text.text() != usage:
+            self._usage_text.setText(usage)
+            self._usage_text.setToolTip(full)
         working = bool(self._queued)
         show_mark = (working or self._updating) and self._animate
         if self._busy_mark.isHidden() == show_mark:
@@ -1569,6 +1724,32 @@ def _button_text(label: str) -> str:
 
 def _nothing() -> None:
     """待つ物が無いときの、待つ物"""
+
+
+#: 上限で止めたときに、続け方と変え方を添える文
+_CHANGE_LIMITS = (
+    "続けるなら、もう 1 度指示を送ってください（上限は 表示 → 設定… の「AI の上限」で変えられます）"
+)
+
+
+def _usage_text(usage: Usage, limits: Limits, *, daily: bool) -> str:
+    """使った量を「3.2 万 / 100 万トークン・絵 2 / 30 枚・1 分 5 秒 / 30 分」の形で
+
+    上限が 0（無し）の物は量だけを出す 1 日の量は時間を出さない（時間の上限は指示ごと）
+    """
+    tokens_limit = limits.day_tokens if daily else limits.turn_tokens
+    images_limit = limits.day_images if daily else limits.turn_images
+    tokens = _with_limit(format_tokens(usage.tokens), tokens_limit, format_tokens(tokens_limit))
+    images = _with_limit(str(usage.images), images_limit, str(images_limit))
+    parts = [f"{tokens} トークン", f"絵 {images} 枚"]
+    if not daily:
+        seconds = limits.turn_seconds
+        parts.append(_with_limit(format_minutes(usage.seconds), seconds, format_minutes(seconds)))
+    return "・".join(parts)
+
+
+def _with_limit(used: str, limit: int, shown: str) -> str:
+    return f"{used} / {shown}" if limit > 0 else used
 
 
 def _duration(seconds: float) -> str:

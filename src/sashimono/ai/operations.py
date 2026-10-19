@@ -1243,11 +1243,33 @@ def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
     frame = max(0, min(frame, max(project.duration - 1, 0)))
     width = int(arguments.get("width", DEFAULT_PREVIEW_WIDTH))
     width = max(160, min(width, MAX_PREVIEW_WIDTH))
+    fitted = _width_within_edge(width, project.settings.resolution, host.image_edge)
 
     host.stop_playback()
-    png = host.render_png(frame, width=width)
+    png = host.render_png(frame, width=fitted)
     when = format_timecode(frame, project.rate)
-    return ImageResult(png=png, caption=f"{when}（{frame} フレーム）")
+    caption = f"{when}（{frame} フレーム）"
+    if fitted < width:
+        # 黙って縮めると、AI は頼んだ大きさで見たつもりで細部を読み違える
+        caption += (
+            f" 長い辺の上限（本人の設定 {host.image_edge} 画素）に合わせて横 {fitted} に縮めました"
+        )
+    return ImageResult(png=png, caption=caption)
+
+
+def _width_within_edge(width: int, frame_size: tuple[int, int], edge: int) -> int:
+    """長い辺が ``edge`` に収まる横幅（#344） 縦長の作品は縦が長い辺になる
+
+    横幅だけで上限を見ると、縦長（1080x1920）の作品で横 640 の絵が縦 1138 になり、
+    設定で小さくした上限を越えて送る
+    """
+    frame_width, frame_height = frame_size
+    if frame_width <= 0 or frame_height <= 0:
+        return min(width, edge)
+    tall = width * frame_height / frame_width
+    if max(width, tall) <= edge:
+        return width
+    return max(1, min(width, edge, int(edge * frame_width / frame_height)))
 
 
 def _whole_number(arguments: dict[str, Any], key: str, default: int) -> int:
@@ -1416,6 +1438,8 @@ def _draw_sheet(
             cell_width=cell_width,
             frame_size=project.settings.resolution,
             columns=columns,
+            # 長い辺の上限は本人の設定（#344） 費用を抑えたい人は升が小さくなる
+            max_edge=host.image_edge,
         )
     except SheetError as exc:
         # 並べ方の文面は直し方まで書いてある そのまま AI へ返す
@@ -4790,7 +4814,8 @@ _WITH_FILES = frozenset({Outbound.PROJECT, Outbound.FILES})
 #: 字幕の文かテキストの本文を返す道具（引数で受けた本文を結果で返す道具も 断られたら動かさない）
 _WITH_TEXT = frozenset({Outbound.PROJECT, Outbound.TEXT})
 #: 絵を返す道具 #320 のコンタクトシートと範囲のプレビューもこれにする
-_WITH_FRAMES = frozenset({Outbound.PROJECT, Outbound.FRAMES})
+#: 縮めたときと並べられないときは、本人の設定の長い辺の上限（#344）を説明と断りの文に載せる
+_WITH_FRAMES = frozenset({Outbound.PROJECT, Outbound.FRAMES, Outbound.APP_SETTINGS})
 #: 操作の履歴の名前を返す道具 名前には素材の名前（「配置: 〜」）と、テキストの文の頭
 #: （「テキストを追加: 〜」）が入る
 _HISTORY = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
@@ -5053,7 +5078,10 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema(
             {
                 "frame": _integer("見たいフレーム 省略すると再生ヘッド"),
-                "width": _integer("画像の横幅（160〜1280、既定 640）"),
+                "width": _integer(
+                    "画像の横幅（160〜1280、既定 640） 長い辺がユーザーの設定の上限を"
+                    "超えるときは縮める（縮めたら説明に書く）"
+                ),
             }
         ),
         handler=_preview_frame,
@@ -5066,7 +5094,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "全体を 12 等分した真ん中のコマ from_frame・to_frame で区切るか、frames で見たい"
             "コマ（場面の切り替わりの一覧など）を直に渡す 各コマの下にタイムコードとフレーム"
             "番号を書く 当たりを付けたら preview_frame で 1 コマを大きく見る"
-            f" 1 枚の長い辺は {MAX_SHEET_EDGE} 画素までで、超えるときは升を縮める"
+            " 1 枚の長い辺はユーザーの設定（既定"
+            f" {MAX_SHEET_EDGE} 画素）までで、超えるときは升を縮める"
         ),
         schema=_schema(
             {

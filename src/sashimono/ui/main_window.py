@@ -3424,6 +3424,10 @@ class MainWindow(QMainWindow):
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
 
+    @property
+    def image_edge(self) -> int:
+        return self._preferences.ai_image_edge
+
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""
         self._checks.start(

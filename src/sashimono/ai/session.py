@@ -445,6 +445,11 @@ class AgentSession:
         )
 
         if isinstance(message, AssistantMessage):
+            # 使った量を数える（#344） 上限の確かめ（ブリッジ）は次の道具の前にこれを見る
+            # 古い SDK には欄が無いので getattr で読む 無ければ数えない
+            self._bridge.usage.record_message(
+                getattr(message, "message_id", None), getattr(message, "usage", None)
+            )
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     self._emit(AgentEvent(EventKind.TEXT, text=block.text))
