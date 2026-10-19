@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from sashimono.core.model import MediaItem, Project
+from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.scan import (
     BLACK,
     CLIPPING,
@@ -144,6 +145,9 @@ class CheckReport:
     #: 頼まれたのに調べられなかった種類（GPU が無い・ファイルに音が無いなど）
     #: 調べた種類と混ぜると、問題が 0 件のときに「その種類の問題は無い」と読まれる
     skipped: frozenset[str] = frozenset()
+    #: 混ぜた音の推移（100 ms ごと #322） 最初の区切りは ``start`` のフレームの頭 音を
+    #: 調べなければ ``None``
+    sound: SoundProfile | None = None
 
     @property
     def checked(self) -> frozenset[str]:
@@ -183,6 +187,7 @@ def assemble(
     length_seconds: float | None,
     notes: tuple[str, ...] = (),
     skipped: frozenset[str] = frozenset(),
+    sound: SoundProfile | None = None,
 ) -> CheckReport:
     """区間に程度と説明を付けて並べる ``length_seconds`` は長さを比べられるときだけ渡す"""
     problems = [_problem(run, start, end, index) for run in runs if run.kind in limits.kinds]
@@ -244,6 +249,7 @@ def assemble(
         peak_db=peak_db,
         notes=notes,
         skipped=skipped,
+        sound=sound,
     )
 
 

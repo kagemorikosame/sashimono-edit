@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from sashimono.engine.checks.loudness import LoudnessMeter
+from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
 
 __all__ = [
     "BLACK",
@@ -268,10 +268,10 @@ class AudioScan:
         #: チャンネルごとの、前の塊の終わりから続いている頭打ち（始まりのサンプル, 長さ, 最大）
         self._carry: list[tuple[int, int, float] | None] = [None] * self._channels
         self._regions: list[_ClipRegion] = []
-        # ラウドネス
-        self._meter = (
-            LoudnessMeter(self._rate, self._channels) if LOUDNESS in limits.kinds else None
-        )
+        # ラウドネスと音の推移（#322） 推移は頼まれた種類に関係なく覚える 音の道具
+        # （analyze_audio・audio_graph）は前の検査の結果をそのまま読むので、種類で絞った検査でも
+        # 推移が無いと混ぜ直すことになる K 特性は推移とラウドネスで 1 度だけ掛ける
+        self._profiler = SoundProfiler(self._rate, self._channels)
 
     @property
     def peak(self) -> float:
@@ -304,8 +304,7 @@ class AudioScan:
             self._scan_silence(block)
         if CLIPPING in self._limits.kinds:
             self._scan_clipping(magnitude)
-        if self._meter is not None:
-            self._meter.add(block)
+        self._profiler.add(block)
         self._position += len(block)
 
     # --- 無音 ---
@@ -394,9 +393,13 @@ class AudioScan:
         return self._origin + (math.ceil(exact - 1e-9) if up else math.floor(exact + 1e-9))
 
     def loudness(self) -> float | None:
-        if self._meter is None:
+        if LOUDNESS not in self._limits.kinds:
             return None
-        return self._meter.integrated()
+        return self._profiler.meter.integrated()
+
+    def profile(self) -> SoundProfile:
+        """ここまでの音の推移の写し（#322）"""
+        return self._profiler.snapshot()
 
     def finish(self) -> None:
         """終わりまで渡した 最後のサンプルまで続いている頭打ちを閉じる"""
