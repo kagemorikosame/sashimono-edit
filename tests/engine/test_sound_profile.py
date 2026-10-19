@@ -94,6 +94,14 @@ class TestKinds:
         # 壊れると、BGM だけの所を話し声と読み、字幕を起こす所や話を切る所に選ぶ
         assert set(_labels(_profile(chord(12.0)))) == {MUSIC}
 
+    def test_a_pulsing_chord_is_still_music(self) -> None:
+        # 壊れると、拍ごとに大きさが上下する曲（実際の曲で多い）を、谷の多さだけで話し声寄りに
+        # 読む 谷が無音まで落ちない（大きな所との差が 8 dB ほど）ので音楽と分かるはず
+        samples = chord(12.0, level=0.2)
+        times = np.arange(len(samples)) / RATE
+        beat = 1.0 - 0.6 * ((times % 0.5) > 0.25)
+        assert set(_labels(_profile((samples * beat[:, None]).astype(np.float32)))) == {MUSIC}
+
     def test_talking_over_a_bed_is_both(self) -> None:
         # 壊れると、BGM を敷いたままの語りを声だけと読み、BGM が声を邪魔しているかを確かめない
         samples = talk(12.0) + chord(12.0, level=0.03)

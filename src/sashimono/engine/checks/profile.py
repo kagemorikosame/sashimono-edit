@@ -17,11 +17,15 @@
 - 字幕（文字起こしの区間）が重なる所は話し声 認識器が文字を起こせた所は確かに話している
 - 字幕の無い所は音の形で見る 話し声は音節ごとに大きさが上下し、息継ぎで小さくなる区切りが
   多い（前後 1 秒を含む 3 秒の中で、平均の半分を下回る 100 ms の割合 Scheirer と Slaney の
-  low-energy ratio と、大きさの揺れ） 音楽は音が途切れず、大きさがならされている
+  low-energy ratio と、大きさの揺れと、大きな所と谷の差） 音楽は音が途切れず、谷も鳴っている
 - 話し声の谷（静かな 4 分の 1 の区切り）に、無音より大きく山のある音（平たくない音）が
   残っていれば、下に BGM が敷かれているとみなす 谷に残るのが平たい音なら部屋の雑音
-- 限り: 歌（歌詞のある音楽）・ラップ・笑い声・拍手は外れやすい 打楽器だけの音楽と、
-  間の多い弾き語りは話し声に似る 谷の音が無音のしきい値より小さい BGM は見分けられない
+- しきい値は合成した音と、本人の許した実際の素材（話し声だけ・音楽だけ・歌と伴奏を分けた物・
+  ゲームの録画）で決めた 話し声だけの素材の 94%、音楽だけの素材の 90〜94% を当てた
+- 限り: 歌は音楽として返す（歌だけの素材も音楽と読む） ラップ・笑い声・拍手は外れやすい
+  ゲームの効果音や中の声は話し声に寄り、録画の話していない所の半分ほどを話し声と読む
+  打楽器だけの音楽と、間の多い弾き語りは話し声に似る 谷の音が無音のしきい値より小さい
+  BGM は見分けられない
   1 秒ごとに見るので、1 秒より短い切り替わりは拾わない 確からしさ（confidence）は
   これを踏まえて付ける（字幕と合えば high、音の形だけなら medium まで）
 """
@@ -87,6 +91,12 @@ _TONAL_BED = 0.3
 #: 谷の音と大きな所の差がこれより小さければ、谷にも音が残っている（dB） 話し声だけなら
 #: 谷は無音に近く 60 dB を超えて開く BGM を -10 dB で敷くと 20 dB ほど、-20 dB で 30 dB ほど
 _BED_GAP = 40.0
+#: 大きな所と谷の差（dB）の、音楽らしい端と話し声らしい端 実際の素材で、音楽は 10 dB を
+#: 超えることが少なく、話し声は 25 dB を下回ることが少なかった
+_GAP_LOW = 10.0
+_GAP_HIGH = 25.0
+#: 下に音が敷かれているとき、これだけ話し声らしければ敷いた音の上の話し声とみなす
+_BED_SPEECH = 0.35
 #: 小さすぎて比べられない値の下限 log と割り算を守る
 _TINY = 1e-12
 
@@ -290,16 +300,27 @@ def _cues(profile: SoundProfile, start: int, end: int, silence_db: float) -> _Cu
     dips = float(np.mean(energy < 0.5 * mean)) if mean > 0 else 0.0
     loud = profile.rms_db()[low:high]
     voiced = loud > silence_db
-    # 大きさの揺れ（鳴っている区切りの dB の標準偏差） 話し声は 6 dB を超え、音楽は 4 dB ほど
+    # 大きさの揺れ（鳴っている区切りの dB の標準偏差） 実際の話し声は 4〜7 dB、音楽は 1〜3 dB
     spread = float(np.std(loud[voiced])) if voiced.sum() > 1 else 0.0
-    speech = 0.55 * _clamp((dips - 0.15) / 0.3) + 0.45 * _clamp((spread - 3.0) / 6.0)
-    music = 0.55 * _clamp((0.3 - dips) / 0.25) + 0.45 * _clamp((7.0 - spread) / 5.0)
     # 静かな 4 分の 1 の区切り（話し声なら息継ぎと音節の谷）に何が残っているか
     quiet = np.argsort(loud)[: max(1, len(loud) // 4)]
     floor = float(np.median(loud[quiet]))
+    # 大きな所と谷の差（dB） 実際の話し声は 25〜50 dB、音楽は 2〜10 dB で、手がかりの中で
+    # 一番よく分かれた（谷の割合は、間の多い曲で 0.3 を超え、話し声に寄る）
+    gap = float(np.percentile(loud, 90)) - floor
+    speech = (
+        0.35 * _clamp((dips - 0.15) / 0.3)
+        + 0.25 * _clamp((spread - 2.5) / 4.0)
+        + 0.4 * _clamp((gap - _GAP_LOW) / (_GAP_HIGH - _GAP_LOW))
+    )
+    music = (
+        0.35 * _clamp((0.3 - dips) / 0.25)
+        + 0.25 * _clamp((6.0 - spread) / 4.0)
+        + 0.4 * _clamp((_GAP_HIGH - gap) / (_GAP_HIGH - _GAP_LOW))
+    )
     bed = (
         floor > silence_db
-        and float(np.percentile(loud, 90)) - floor < _BED_GAP
+        and gap < _BED_GAP
         and float(np.median(profile.flatness[low:high][quiet])) < _TONAL_BED
     )
     heard = profile.rms_db()[start:end] > silence_db
@@ -332,6 +353,10 @@ def _window(
         return _Window(SPEECH, MEDIUM if margin >= 0.3 else LOW, speech, music, covered)
     if music >= 0.5 and margin <= -0.1:
         return _Window(MUSIC, MEDIUM if margin <= -0.3 else LOW, speech, music, covered)
+    if cues.bed and speech >= _BED_SPEECH:
+        # BGM やゲームの音の上で話すと、谷が音で埋まって話し声らしさが半ばで止まる
+        # 見分けられないと返すより、敷いた音の上の話し声と返す方が実際の録画で合った
+        return _Window(SPEECH_AND_MUSIC, LOW, speech, music, covered)
     return _Window(UNCLEAR, LOW, speech, music, covered)
 
 

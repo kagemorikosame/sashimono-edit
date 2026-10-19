@@ -129,7 +129,9 @@ class TestAnalyzeAudio:
         assert speech["subtitles"] == 1.0
         assert speech["timecode"] == "00:00:01:00"
         assert speech["clip_ids"]
-        assert result["summary"]["seconds_by_kind"]["speech"] == pytest.approx(6.0)
+        # 字幕のある 6 秒は必ず話し声 終わりの 1 秒の和音は前の話し声に引きずられうる（1 秒より
+        # 短い切り替わりは拾わない限り）ので、数に入っても入らなくてもよい
+        assert 6.0 <= result["summary"]["seconds_by_kind"]["speech"] <= 7.0
         assert result["complete"] is True
 
     def test_the_curve_is_bundled_into_points(self, host: FakeHost) -> None:
