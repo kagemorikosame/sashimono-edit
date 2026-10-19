@@ -1,4 +1,4 @@
-"""プロジェクト設定（解像度と重ね合わせの方法） 新規作成のときはフレームレートも
+"""プロジェクト設定（解像度と重ね合わせの方法と編集の方針） 新規作成のときはフレームレートも
 
 解像度の選びには、決まった組み合わせ（:data:`RESOLUTION_PRESETS`）に続けて、本人が名前を
 付けて保存した組み合わせ（:mod:`sashimono.ui.project_presets`）も並べる
@@ -24,9 +24,10 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION
-from sashimono.core.model import Blending, LayerMode, ProjectSettings
+from sashimono.core.model import Blending, LayerMode, ProjectSettings, StyleGuide
 from sashimono.core.timebase import FrameRate
 from sashimono.ui.project_presets import PresetStoreError, ProjectPreset, ProjectPresetStore
+from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = [
@@ -104,6 +105,7 @@ class ProjectSettingsDialog(QDialog):
         *,
         new: bool = False,
         presets: ProjectPresetStore | None = None,
+        guide: StyleGuide | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("新規プロジェクト" if new else "プロジェクト設定")
@@ -203,6 +205,16 @@ class ProjectSettingsDialog(QDialog):
         form.addRow("重ね合わせ", self._blending)
         if self._layers is not None:
             form.addRow("置き方の方式", self._layers)
+        #: 編集の方針（#343） 解像度の組み合わせの保存には入れない 組み合わせは画面の形の
+        #: 控えで、方針は作品の中身の決まり 混ぜると、解像度を選んだだけで方針が入れ替わる
+        self._guide = StyleGuideRow(
+            guide if guide is not None else StyleGuide(), self, title="編集の方針"
+        )
+        self._guide.setToolTip(
+            "書体・色・字幕の見た目・テンポ・使ってよい効果など、この作品で AI アシスタントが"
+            "従う決まり\n新しい作品の初めの方針は 表示 → 設定… の「新しい作品の編集の方針」"
+        )
+        form.addRow("編集の方針", self._guide)
 
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
@@ -239,6 +251,14 @@ class ProjectSettingsDialog(QDialog):
             blending=blending,
             layer_mode=layers if layers is not None else self._base.layer_mode,
         )
+
+    def style_guide(self) -> StyleGuide:
+        """書いた編集の方針 〔編集…〕で開いた窓を OK で閉じた所までの物"""
+        return self._guide.guide
+
+    @property
+    def guide_row(self) -> StyleGuideRow:
+        return self._guide
 
     @property
     def saved_presets(self) -> tuple[ProjectPreset, ...]:

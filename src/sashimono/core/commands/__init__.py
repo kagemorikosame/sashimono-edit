@@ -99,6 +99,7 @@ from sashimono.core.commands.strokes import (
     SetStrokeEnabled,
     adopted_source,
 )
+from sashimono.core.commands.style import SetStyleGuide
 from sashimono.core.commands.subtitle import (
     AddSegment,
     MergeWithNext,
@@ -177,6 +178,7 @@ __all__ = [
     "SetSegmentText",
     "SetSource",
     "SetStrokeEnabled",
+    "SetStyleGuide",
     "SetTrackHeights",
     "SetTrackState",
     "SetTranscript",

@@ -40,6 +40,10 @@ from sashimono.ai.sheet import (
     SheetError,
     sheet_layout,
 )
+from sashimono.ai.style_check import COLOR as STYLE_COLOR
+from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
+from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
+from sashimono.ai.style_check import FONT as STYLE_FONT
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
 from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle
 from sashimono.compat.looks import (
@@ -773,6 +777,9 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 置き方の方式 混合（mixed）なら素材は絵と音の 1 本、分ける（separated）なら
         # 映像と音声の 2 本をリンクで結ぶ 知らないと、AI が組の片方を探しに行く
         "layer_mode": settings.layer_mode,
+        # 編集の方針（#343）を決めてあるか 中身は本人の文なので get_style_guide で読む
+        # （字幕と文字として同意を取る） ここで有る無しだけを返し、読み忘れを防ぐ
+        "has_style_guide": not project.style_guide.empty,
     }
 
 
@@ -1426,6 +1433,112 @@ def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 写しを返す ホストの持ち物をそのまま渡すと、後の道具の中で書き換えたときに
     # 本人の設定まで変わる（アプリ自身の設定は人だけが変える #350）
     return copy.deepcopy(host.app_settings())
+
+
+# --- 編集の方針（#343）---
+
+#: 方針の道具が添える断り書き 方針は本人が AI に渡す決まり AI は変えない
+_STYLE_NOTE = (
+    "本人が ファイル → プロジェクト設定… の「編集の方針」で書いた決まりです AI は読むだけで、"
+    "変えるのは本人だけです 空の欄は決めていない（好きに選んでよい）という意味です"
+    " 指示と方針が食い違うときは指示に従い、食い違ったことを返事で伝えてください"
+)
+
+
+def _effect_label(kind: str) -> str:
+    definition = registry.get(kind)
+    # 読み込んでいない AviUtl のスクリプトなど、今の環境に無い種類は名前の代わりに種類を出す
+    return definition.label if definition is not None else kind
+
+
+def _paged_after(
+    head: dict[str, Any], rows: list[Any], arguments: dict[str, Any], name: str, note: str
+) -> dict[str, Any]:
+    """``head`` の後ろに一覧 ``rows`` を切って並べた返事 合わせて上限に収める
+
+    一覧だけを :func:`_paged` で切ると、前に置く欄（方針の文・直す先）の分だけ上限を越え、
+    打ち切られて続きが読めない 越えたら一覧の件数を減らす 一覧の続きの案内（note）は消さず、
+    ``note`` を後ろへ足す
+    """
+    page = dict(arguments)
+    while True:
+        listed = _paged(rows, page, name=name)
+        merged = {**head, **listed, "note": " ".join(filter(None, (listed.get("note"), note)))}
+        count = int(listed["count"])
+        if len(json_text(merged)) <= MAX_RESULT_CHARS:
+            return merged
+        if count <= 1:
+            break
+        page["limit"] = max(1, count * 3 // 4)
+    # 一覧を 1 件まで減らしても越える 前に置く欄（手で書き換えたファイルの長い方針・クリップの
+    # 長い書体の名前）が長すぎる 持てる方針は欄の上限で必ず収まるので、ここへ来るのはそれ以外だけ
+    # 一番長い所から切って収め、切ったこと（truncated）を返す 黙って返すと上限を越えて打ち切られ、
+    # 後ろの欄も続きの案内も読めない（#382 の CodeRabbit の指摘）
+    told = "長すぎる所を切った（truncated）"
+    fitted = _fit({**merged, "note": f"{told} {merged['note']}"}, MAX_RESULT_CHARS)
+    if len(json_text(fitted)) <= MAX_RESULT_CHARS:
+        return dict(fitted)
+    # 小さな欄が多すぎて切っても収まらない（名前の短い書体を何万個も手で書いたなど）
+    return {"truncated": True, "count": 0, "note": f"{told} 返せる長さに収まらなかった"}
+
+
+def _get_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
+    guide = _project(host).style_guide
+    head: dict[str, Any] = {
+        "set": not guide.empty,
+        "fonts": list(guide.fonts),
+        "colors": list(guide.colors),
+        "subtitles": guide.subtitles,
+        "tempo": guide.tempo,
+        "notes": guide.notes,
+    }
+    # 効果は一覧から印を付けて選ぶので、数百になりうる（#382 の Codex の指摘で上限を 300 にした）
+    # 全部を 1 回で返すと上限を越えて打ち切られるので、効果だけを切って続きを読ませる
+    rows = [{"kind": kind, "label": _effect_label(kind)} for kind in guide.effects]
+    return _paged_after(head, rows, arguments, "effects", _STYLE_NOTE)
+
+
+def _check_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    # 照らす所（style_problems）と同じ方針から checked と allowed を作る 読めない色を残すと、
+    # 照らしていないのに色を照らしたと返す
+    guide = checked_guide(project.style_guide)
+    problems = style_problems(project)
+    counts = dict.fromkeys((STYLE_FONT, STYLE_COLOR, STYLE_EFFECT), 0)
+    for problem in problems:
+        counts[problem.kind] += 1
+    rows = [problem.row() for problem in problems]
+    head: dict[str, Any] = {
+        # 照らした欄 空の欄（決めていない物）は照らさない 何も照らしていないのに
+        # 「食い違い 0」だけを返すと、方針どおりだと読み違える
+        "checked": {
+            STYLE_FONT: bool(guide.fonts),
+            STYLE_COLOR: bool(guide.colors),
+            STYLE_EFFECT: bool(guide.effects),
+        },
+        "counts": counts,
+        # 直す先 書体の名前・色・効果の種類だけで、方針の文（字幕の見た目・テンポ・そのほか）は
+        # 返さない 字幕と文字を送らないと決めた人にも、何へ直せばよいかが分かる
+        "allowed": {
+            STYLE_FONT: list(guide.fonts),
+            STYLE_COLOR: list(guide.colors),
+            STYLE_EFFECT: list(guide.effects),
+        },
+    }
+    note = (
+        "照らすのは書体・色（字と図形の塗り・縁取りの層）・効果の種類だけです 影やエフェクトの"
+        "中の色、字幕の見た目・テンポ・そのほかの文は get_style_guide で読んで照らしてください"
+        f" 色は各成分 {COLOR_TOLERANCE} までの差を同じ色と見なします"
+    )
+    if len(json_text(head["allowed"])) > MAX_RESULT_CHARS // 2:
+        # 効果を一覧のほとんど（数百）選んだ方針 直す先を全部並べると、食い違いの一覧が
+        # 1 件も入らない 効果の直す先は省き、方針の外の種類（problems）だけを返す
+        head["allowed"][STYLE_EFFECT] = []
+        head["allowed_note"] = (
+            "効果の直す先は多いので省いた get_style_guide の effects で読める"
+            " 方針の外の種類は problems にある"
+        )
+    return _paged_after(head, rows, arguments, "problems", note)
 
 
 def _author(by: Author | None) -> str | None:
@@ -4821,6 +4934,32 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_app_settings,
         sends=_APP_SETTINGS,
+    ),
+    # 編集の方針（#343） 人は ファイル → プロジェクト設定… で書く AI は読むだけ
+    Operation(
+        name="get_style_guide",
+        description=(
+            "作品の編集の方針（スタイルガイド）を読む 使う書体・使う色（#RRGGBB）・字幕の見た目・"
+            "テンポ・使ってよい効果（エフェクトの kind）・そのほか 見た目や効果やカットの間を"
+            "決める前に読んで従う 空の欄は決めていない 読むだけで、変えるのは本人だけ"
+            " 効果の一覧（effects）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_get_style_guide,
+        # 字幕の見た目・テンポ・そのほかは本人の文 字幕と文字として尋ね、断られたら動かさない
+        sends=_WITH_TEXT,
+    ),
+    Operation(
+        name="check_style_guide",
+        description=(
+            "編集の方針に照らして、方針の外の書体・色・効果を使うクリップを返す（メインと"
+            "すべてのシーン） 照らすのは決めてある欄だけ（checked） 直す先は allowed"
+            " 一覧（problems）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_check_style_guide,
+        # 返すのは書体の名前・色・効果の種類とクリップの在りかだけ 方針の文も本文も返さない
+        sends=_STRUCTURE,
     ),
     Operation(
         name="seek",

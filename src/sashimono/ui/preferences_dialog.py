@@ -62,6 +62,7 @@ from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
+from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
     AUTO_QUALITY_HEIGHT,
@@ -362,6 +363,15 @@ class PreferencesDialog(QDialog):
             "新規作成の窓でもプロジェクトごとに選べる 開いたプロジェクトの方式は変えない"
         )
         form.addRow("新しいプロジェクトの置き方", self._new_project_layers)
+        self._new_project_style = StyleGuideRow(
+            preferences.new_project_style_guide, self, title="新しい作品の編集の方針"
+        )
+        self._new_project_style.setToolTip(
+            "新しく作る作品と、起動した直後の空の作品に入れる編集の方針（AI アシスタントが従う"
+            "書体・色・字幕の見た目・テンポ・使ってよい効果）\n開いている作品の方針は変えない"
+            " 作品ごとの方針は ファイル → プロジェクト設定… で変える"
+        )
+        form.addRow("新しい作品の編集の方針", self._new_project_style)
         self._media_split = QComboBox(self)
         self._media_split.addItem("映像と音声を別のレイヤーに分ける（既定）", MEDIA_SPLIT)
         self._media_split.addItem("1 本のクリップにまとめる", MEDIA_TOGETHER)
@@ -1055,6 +1065,7 @@ class PreferencesDialog(QDialog):
             playhead_snap_markers=self._playhead_snap_markers.isChecked(),
             insert_paste=str(self._insert_paste.currentData()),
             new_project_layers=str(self._new_project_layers.currentData()),
+            new_project_style_guide=self._new_project_style.guide,
             media_split=str(self._media_split.currentData()),
             theme=str(self._theme.currentData()),
             update_check=self._update_check.isChecked(),
