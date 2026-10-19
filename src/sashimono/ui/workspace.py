@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ from sashimono.core.emphasis import (
     EmphasisStyle,
 )
 from sashimono.core.io.atomic import held_for_update, write_atomic
+from sashimono.core.io.serialize import ProjectFileError, style_guide_from_json
 from sashimono.core.mixing import (
     DEFAULT_DUCK_ATTACK_MS,
     DEFAULT_DUCK_DEPTH_DB,
@@ -51,7 +52,7 @@ from sashimono.core.mixing import (
     DUCK_RELEASE_MS_RANGE,
     DuckShape,
 )
-from sashimono.core.model import LayerMode
+from sashimono.core.model import LayerMode, StyleGuide
 from sashimono.core.seams import (
     DEFAULT_SEAM_AUDIO_FADE_MS,
     DEFAULT_SEAM_CROSSFADE_MS,
@@ -482,6 +483,10 @@ class Preferences:
     #: 映像と音声を別のトラックに分けて並べる方が慣れている人は切り替えられる
     #: モデルの既定（分ける）とは別に持つ 古いファイルと試験の動きを変えないため
     new_project_layers: str = LayerMode.MIXED
+    #: 新しく作る作品の編集の方針（#343） 新規作成の窓の初期値と、起動した直後の空の作品に使う
+    #: 動画の作り手は作品をまたいで同じ書体と色を使うことが多く、作るたびに書き直させない
+    #: 既定は空（決めていない） 開いた作品の方針は変えない（方針は作品に付く）
+    new_project_style_guide: StyleGuide = field(default_factory=StyleGuide)
     #: 動画の映像と音声の置き方 映像と音声を別のトラックへ分けて置く（``split``）か、
     #: 1 本のクリップにまとめる（``together``）か 分けると、混合の方式では置いたレイヤーに
     #: 映像、その次のレイヤーから音声を 1 本ずつ並べ、どれも一緒に動く（リンク）
@@ -864,6 +869,9 @@ class PreferenceStore:
             new_project_layers=_choice(
                 data.get("new_project_layers"), LayerMode.ALL, plain.new_project_layers
             ),
+            new_project_style_guide=_style_guide(
+                data.get("new_project_style_guide"), plain.new_project_style_guide
+            ),
             media_split=_choice(
                 data.get("media_split"),
                 MEDIA_SPLIT_MODES,
@@ -1044,6 +1052,21 @@ def _detail_min_width(value: object, default: int) -> int:
 
 def _flag(value: object, default: bool) -> bool:
     return value if isinstance(value, bool) else default
+
+
+def _style_guide(value: object, default: StyleGuide) -> StyleGuide:
+    """新しい作品の編集の方針 形が違えば既定へ戻し、持てない所（手で書き換えた色・上限を越えた分）
+    だけを落とす
+
+    持てない所を残すと、新しい作品を作るたびに方針の窓で断られて OK を押せない 丸ごと既定へ
+    戻すと、足しすぎた 1 つのために書いた方針が全部消える
+    """
+    if value is None:
+        return default
+    try:
+        return style_guide_from_json(value).fitted()
+    except ProjectFileError:
+        return default
 
 
 def _playhead_snap(value: object, default: bool) -> bool:

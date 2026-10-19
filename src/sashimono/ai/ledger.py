@@ -175,7 +175,10 @@ LEDGER: tuple[Entry, ...] = (
         "メニュー/ファイル/プロジェクト設定…",
         "set_resolution",
         issue=349,
-        note="解像度だけ fps・音の設定・背景などは無い",
+        note=(
+            "解像度だけ fps・音の設定・背景などは無い 編集の方針（#343）は本人が AI に渡す"
+            "決まりなので AI は変えず、get_style_guide で読み check_style_guide で照らす"
+        ),
     ),
     missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
@@ -617,6 +620,10 @@ AI_ONLY: dict[str, str] = {
     # 名前を見て選ぶ 一覧を読むだけで、当てる・置くのは台帳の行の道具
     "list_looks": READING,
     "get_chapters": READING,
+    # 編集の方針（#343） 人はプロジェクト設定の窓で読み書きする 窓の欄は台帳で数えない
+    # （台帳はメニュー・右クリック・パネルのボタンだけ） 方針を変える道具は置かない
+    "get_style_guide": READING,
+    "check_style_guide": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,

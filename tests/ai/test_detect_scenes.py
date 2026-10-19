@@ -273,14 +273,18 @@ class TestWaiting:
         host.scene_ready = never
         bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, DETECT, {"media_id": str(media.id), "wait_seconds": 60})
-        deadline = time.monotonic() + 5
-        while not host.scene_waits and time.monotonic() < deadline:
+        # 待ちに入ったことを確かめてから止める 時間で区切って先へ進むと、遅い機械では待ちに
+        # 入る前に止めてしまい、待つ間の中断を確かめないまま通る（#382 で同じ形の試験が揺れた）
+        deadline = time.monotonic() + 30
+        while not host.scene_waits and not done.is_set() and time.monotonic() < deadline:
             bridge.pump()
             time.sleep(0.01)
-        began = time.monotonic()
+        assert host.scene_waits, f"待ちに入らなかった: {box}"
+        assert not done.is_set(), f"止める前に抜けた: {box}"
         bridge.cancel()
-        pump_until(bridge, done)
-        assert time.monotonic() - began < 2.0
+        # 待つ長さ（60 秒）まで待たずに抜けること 上限は遅い機械でも揺れない広さにする
+        pump_until(bridge, done, timeout=30.0)
+        assert done.is_set(), "中断を押しても待ち続けた"
         assert isinstance(box.get("error"), ToolError)
 
     def test_a_failure_is_told(self, host: FakeHost) -> None:

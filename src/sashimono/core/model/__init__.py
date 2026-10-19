@@ -44,6 +44,12 @@ from sashimono.core.model.stroke import (
     legacy_stroke,
     uses_gradient,
 )
+from sashimono.core.model.style import (
+    STYLE_ITEMS_LIMIT,
+    STYLE_TEXT_LIMIT,
+    StyleGuide,
+    valid_style_color,
+)
 from sashimono.core.model.timeline import (
     FILTER_KIND,
     GROUP_AS_ONE,
@@ -76,6 +82,8 @@ __all__ = [
     "LEGACY_BORDER_COLOR",
     "LEGACY_BORDER_WIDTH",
     "MAX_STROKES",
+    "STYLE_ITEMS_LIMIT",
+    "STYLE_TEXT_LIMIT",
     "TRANSITION_KIND",
     "AnimatedValue",
     "AudioStreamInfo",
@@ -100,6 +108,7 @@ __all__ = [
     "SegmentId",
     "Stroke",
     "StrokeId",
+    "StyleGuide",
     "SubtitleOrigin",
     "Timeline",
     "Track",
@@ -128,4 +137,5 @@ __all__ = [
     "new_track_id",
     "plays_sound",
     "uses_gradient",
+    "valid_style_color",
 ]

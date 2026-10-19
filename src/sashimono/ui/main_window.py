@@ -65,6 +65,7 @@ from sashimono.core.commands import (
     RenameScene,
     SetBlending,
     SetResolution,
+    SetStyleGuide,
     convert_layers,
     insert_filter,
     insert_generated,
@@ -2352,7 +2353,12 @@ class MainWindow(QMainWindow):
 
         if not self._confirm_discard():
             return
-        dialog = ProjectSettingsDialog(self._new_settings(), self, new=True)
+        dialog = ProjectSettingsDialog(
+            self._new_settings(),
+            self,
+            new=True,
+            guide=self._preferences.new_project_style_guide,
+        )
         answer = dialog.exec()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
@@ -2361,7 +2367,8 @@ class MainWindow(QMainWindow):
             return
         self._playback.stop()
         previous = self._document.project
-        self._document.reset(Project.create(dialog.settings()))
+        created = replace(Project.create(dialog.settings()), style_guide=dialog.style_guide())
+        self._document.reset(created)
         self._leave_project(previous)
         self._path = None
         self._release_lock()
@@ -2378,8 +2385,15 @@ class MainWindow(QMainWindow):
         return ProjectSettings(layer_mode=self._preferences.new_project_layers)
 
     def _blank_project(self) -> Project:
-        """起動した直後や、開くのをやめたときの空のプロジェクト"""
-        return Project.create(self._new_settings())
+        """起動した直後や、開くのをやめたときの空のプロジェクト
+
+        方針は本人の「新しい作品の編集の方針」 起動した直後の空の作品へ置いて保存する人が
+        多い 新規作成の窓を通らないこの道で入れないと、方針の無い作品ができる
+        """
+        return replace(
+            Project.create(self._new_settings()),
+            style_guide=self._preferences.new_project_style_guide,
+        )
 
     def _mark_saved(self) -> None:
         """いまの状態を「保存済み」とする 守るものが無くなるので退避も消す"""
@@ -2589,11 +2603,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("バックアップは上書き保存したときに作られます", 5000)
 
     def edit_settings(self) -> None:
-        """プロジェクト設定を開く 解像度と重ね合わせの方法を変えられる"""
+        """プロジェクト設定を開く 解像度と重ね合わせの方法と編集の方針（#343）を変えられる"""
         from sashimono.ui.project_settings_dialog import ProjectSettingsDialog
 
         settings = self._document.project.settings
-        dialog = ProjectSettingsDialog(settings, self)
+        guide = self._document.project.style_guide
+        dialog = ProjectSettingsDialog(settings, self, guide=guide)
         answer = dialog.exec()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
@@ -2606,6 +2621,8 @@ class MainWindow(QMainWindow):
             commands.append(SetResolution(chosen.width, chosen.height))
         if chosen.blending != settings.blending:
             commands.append(SetBlending(chosen.blending))
+        if dialog.style_guide() != guide:
+            commands.append(SetStyleGuide(dialog.style_guide()))
         # 1 回の OK で変えたものは 1 回の取り消しで戻す 分けると、取り消しの途中で
         # 解像度だけ戻った、見たことのない組み合わせを通る
         self.execute_all(commands, "プロジェクト設定を変更")
@@ -3762,9 +3779,14 @@ class MainWindow(QMainWindow):
             }
             for dock in self.findChildren(QDockWidget)
         }
+        preferences = asdict(self._preferences)
+        # 新しい作品の編集の方針（#343）は本人の文 アプリの設定は同意なしで送るので、ここに
+        # 載せると字幕と文字を送らないと決めた人の文まで外へ出る 有る無しだけを残す
+        # （作品の方針は get_style_guide が字幕と文字として同意を取って読む）
+        preferences["new_project_style_guide"] = not self._preferences.new_project_style_guide.empty
         return {
             "version": __version__,
-            "preferences": asdict(self._preferences),
+            "preferences": preferences,
             "shortcuts": {
                 name: action.shortcut().toString(_PORTABLE)
                 for name, (action, _default) in self._actions.items()

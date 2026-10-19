@@ -306,17 +306,23 @@ class TestWaiting:
     def test_the_bridge_waits_without_blocking_and_stops_on_cancel(
         self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 壊れると、待つ間に画面の仕事を拾えず固まるか、中断を押しても最長 2 分待ち続ける
+        """壊れると、待つ間に画面の仕事を拾えず固まるか、中断を押しても最長 2 分待ち続ける
+
+        時間で区切って「1 秒後にも生きているか」を見ると、遅い機械では待ちに入る前に区切りが
+        来て揺れる（CI の 3.14 で落ちた #382） 待ちに入ったことを印（Event）で確かめてから止める
+        中断が効くまでの上限は、待つ長さ（120 秒）よりずっと短いことだけを見る
+        """
         _operation()(host, {"wait_seconds": 0})
         request = host.check_requests[-1]
         host.check = _state(request, running=True, analyzed=60)
-        waited: list[float] = []
+        entered = threading.Event()
+        released = threading.Event()
 
         def blocking_waiter() -> Any:
-            # 本物と同じく、頼まれた秒だけ本当に止まる（終わらない検査）
+            # 本物と同じく、頼まれた秒だけ本当に止まる（終わらない検査） 試験の終わりには放す
             def wait(seconds: float) -> bool:
-                waited.append(seconds)
-                time.sleep(seconds)
+                entered.set()
+                released.wait(seconds)
                 return False
 
             return wait
@@ -333,20 +339,26 @@ class TestWaiting:
 
         thread = threading.Thread(target=work, daemon=True)
         thread.start()
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            bridge.pump()
-            thread.join(0.01)
-        assert thread.is_alive()
-        assert waited
-        started = time.monotonic()
-        bridge.cancel()
-        while thread.is_alive() and time.monotonic() - started < 5.0:
-            bridge.pump()
-            thread.join(0.01)
-        assert not thread.is_alive()
-        assert time.monotonic() - started < 1.0
-        assert "中断" in str(box.get("error", ""))
+        try:
+            # 待ちに入るまで画面の仕事を回し続ける 回さないと道具の頭（画面のスレッドの仕事）が
+            # 進まず、待ちに入らない（画面を止めないことの確かめ）
+            patience = time.monotonic() + 30.0
+            while not entered.is_set() and thread.is_alive() and time.monotonic() < patience:
+                bridge.pump()
+                thread.join(0.01)
+            assert entered.is_set(), f"待ちに入らなかった: {box}"
+            # 検査は終わらないので、中断するまで待ち続けている
+            assert thread.is_alive(), f"止める前に抜けた: {box}"
+            started = time.monotonic()
+            bridge.cancel()
+            while thread.is_alive() and time.monotonic() - started < 30.0:
+                bridge.pump()
+                thread.join(0.01)
+            # 待つ長さ（120 秒）まで待たずに抜けたこと 上限は遅い機械でも揺れない広さにする
+            assert not thread.is_alive(), "中断を押しても待ち続けた"
+            assert "中断" in str(box.get("error", ""))
+        finally:
+            released.set()
 
     def test_a_check_that_ends_while_waiting_returns_through_the_bridge(
         self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
