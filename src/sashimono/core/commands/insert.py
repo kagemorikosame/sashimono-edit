@@ -34,6 +34,7 @@ from sashimono.core.commands.layers import (
 )
 from sashimono.core.model import (
     FILTER_KIND,
+    TRANSITION_KIND,
     Clip,
     Effect,
     GeneratedSource,
@@ -491,13 +492,20 @@ def insert_clip(
         # フィルタもこれで下の絵すべてに掛かる（:func:`_filter_track` と同じ考え）
         track = free_layer(project, start, placed.timeline_end, commands, picture=True)
     if track is None:
+        # 場面切り替えもフィルタと同じく下のトラックの絵にしか効かない（#332）
+        # 下から空きを探すと、切れ目の絵より下の空いたトラックへ入り、置いたのに何も変わらない
         track = (
             _filter_track(project, start, placed.timeline_end, commands)
-            if placed.is_filter
+            if placed.is_filter or _covers_below(placed)
             else _free_video_track(project, start, placed.duration, commands)
         )
     commands.append(AddClip(track.id, placed))
     return commands
+
+
+def _covers_below(clip: Clip) -> bool:
+    """下のトラックの絵を切り替えるクリップ（場面切り替え）か"""
+    return clip.source is not None and clip.source.kind == TRANSITION_KIND
 
 
 def _wanted_track(project: Project, track_id: TrackId | None, start: int, end: int) -> Track | None:

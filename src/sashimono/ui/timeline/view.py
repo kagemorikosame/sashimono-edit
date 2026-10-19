@@ -64,6 +64,7 @@ from sashimono.core.commands.edit import (
     trimmable,
 )
 from sashimono.core.commands.layers import places_mixed
+from sashimono.core.commands.speed import can_change_speed
 from sashimono.core.emphasis import can_emphasize
 from sashimono.core.model import (
     Clip,
@@ -263,6 +264,11 @@ class TimelineView(QWidget):
     #: 右クリックの〔強調の動きを付ける…〕（#331） 動きを付けるクリップの ID の並び
     #: 範囲と動きを尋ねて付けるのは窓の側（AI の emphasize と同じ所を通す）
     emphasis_requested = Signal(list)
+    #: 右クリックの〔速度を変える…〕（#332） 速度を変えるクリップの ID の並び
+    speed_requested = Signal(list)
+    #: 右クリックの〔つなぎ目を目立たなくする…〕（#332） 選んだクリップの ID の並び
+    #: つなぎ目を探して処理を尋ねるのは窓の側（AI の smooth_cuts と同じ所を通す）
+    seams_requested = Signal(list)
     #: ビューは窓を知らない（テストで単体で作れるように） 知らせは信号で外へ出し、
     #: ステータスバーに出すのは窓の仕事にする
     status_message = Signal(str)
@@ -1863,6 +1869,20 @@ class TimelineView(QWidget):
                 functools.partial(self.emphasis_requested.emit, pictures),
             )
             emphasis.setEnabled(bool(pictures))
+            # 速度とつなぎ目（#332） 素材の時間を持たないクリップとロックしたトラックだけなら灰色
+            timed = [str(clip_id) for clip_id in self._editable_timed()]
+            speed = _action(
+                menu,
+                f"速度を変える…{count}",
+                functools.partial(self.speed_requested.emit, timed),
+            )
+            speed.setEnabled(bool(timed))
+            seams = _action(
+                menu,
+                f"つなぎ目を目立たなくする…{count}",
+                functools.partial(self.seams_requested.emit, timed),
+            )
+            seams.setEnabled(bool(timed))
             if hit[1].scene_id is not None:
                 scene_id = hit[1].scene_id
                 _action(
@@ -2011,6 +2031,20 @@ class TimelineView(QWidget):
         for clip_id in self._selection:
             located = project.timeline.locate_clip(clip_id)
             if located is not None and can_emphasize(project, *located):
+                found.append(clip_id)
+        return found
+
+    def _editable_timed(self) -> list[ClipId]:
+        """選んでいるクリップのうち、速度を変えられる物（AI の set_speed と同じ決まり）
+
+        つなぎ目も同じ物で探す ジャンプカットのつなぎ目は素材を飛び飛びにつないだ所なので、
+        素材の時間を持たないクリップには無い
+        """
+        project = self._project
+        found: list[ClipId] = []
+        for clip_id in self._selection:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_change_speed(project, *located):
                 found.append(clip_id)
         return found
 
