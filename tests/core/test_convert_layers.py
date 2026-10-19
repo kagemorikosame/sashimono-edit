@@ -257,6 +257,7 @@ def test_nothing_is_listed_when_the_output_stays_the_same(
 
 
 def test_a_clip_with_picture_and_sound_splits_into_a_linked_pair(video_media: MediaItem) -> None:
+    # 分けた絵と音が結ばれないと、変換のあとで動画をずらしても音が付いてこず口の動きと声がずれる
     mixed = _to(_separated(video_media), LayerMode.MIXED)
     separated = _to(mixed, LayerMode.SEPARATED)
     assert _kinds(separated) == [TrackKind.VIDEO, TrackKind.AUDIO]

@@ -15,6 +15,7 @@ def test_the_number_of_points_is_capped() -> None:
 
 
 def test_unreadable_pairs_are_skipped() -> None:
+    # 1 組の書き損じで点列の全体を諦めると、点を 1 つ打ち間違えただけで線が丸ごと画面から消える
     assert polyline_points("1,2;だめ;3,4") == [(1.0, 2.0), (3.0, 4.0)]
 
 

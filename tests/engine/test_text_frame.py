@@ -85,6 +85,8 @@ class TestFrame:
         assert (top + bottom) / 2 == pytest.approx(SCREEN[1] / 2, abs=0.5)
 
     def test_the_frame_is_wider_than_the_ink(self) -> None:
+        # 枠が字の形と同じ大きさになると、AviUtl2 の組み方のテキストに掛けた画像合成や
+        # 縁取りの模様が 20 画素ほど内側を基準にずれる
         image, framed = render_source_framed(text(), *SCREEN)
         assert image is not None and framed is not None
         ink_left, ink_top, ink_right, ink_bottom = ink(image)
@@ -112,6 +114,7 @@ class TestFrame:
         assert framed[2] - framed[0] > 0 and framed[3] - framed[1] > 0
 
     def test_shapes_have_no_frame(self) -> None:
+        # 図形にも文字の枠を返すと、図形に掛けた効果の範囲が描いた形と別の大きさで決まる
         shape = GeneratedSource(kind="shape", params={"shape": "rect"})
         assert render_source_framed(shape, *SCREEN)[1] is None
 
@@ -232,6 +235,8 @@ class TestGraphemes:
 
 class TestObjectBox:
     def test_the_frame_is_the_object_box(self) -> None:
+        # 枠を入れ物にしないと、スクリプトへ渡す obj.w が字の形の幅になり、分割したマスや
+        # 並べる間隔が AviUtl2 より狭くなる
         image = np.zeros((100, 200, 4), np.uint8)
         image[40:60, 80:120, 3] = 255
         assert _object_box(image, (60.5, 30.0, 140.5, 70.0)) == (60.5, 30.0, 140.5, 70.0)
@@ -243,6 +248,8 @@ class TestObjectBox:
         assert _object_box(image, (60.0, 30.0, 140.0, 70.0)) == (50.0, 30.0, 140.0, 70.0)
 
     def test_without_a_frame_the_ink_is_the_box(self) -> None:
+        # 枠の無い物で字の形を入れ物にしないと、標準の組み方の文字や図形に掛けた効果の範囲が変わり、
+        # 既にある作品の見た目がずれる
         image = np.zeros((100, 200, 4), np.uint8)
         image[40:60, 80:120, 3] = 255
         assert _object_box(image) == (80.0, 40.0, 120.0, 60.0)
@@ -274,6 +281,8 @@ def gl_context() -> Iterator[OffscreenGLContext]:
 @pytest.mark.usefixtures("ms_ui_gothic")
 class TestRenderer:
     def test_a_script_moves_text_by_the_frame_width(self, gl_context: OffscreenGLContext) -> None:
+        # obj.w に字の形の幅を渡すと、自分の幅だけずらす配布スクリプトのテキストが
+        # AviUtl2 より手前で止まる
         catalog = ScriptCatalog(roots=())
         catalog.add_text("aviutl:枠の試験.anm:自分の幅", OWN_SIZE)
         set_script_catalog(catalog)

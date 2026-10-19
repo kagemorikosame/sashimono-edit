@@ -183,6 +183,7 @@ class TestRevealLayout:
     """
 
     def test_trailing_unrevealed_lines_are_not_laid_out(self) -> None:
+        # まだ出ていない行まで高さに数えると、中央揃えの字幕が文字送りの途中で前の版より上へずれる
         body = "<@メイリオ>HH<@>\nHH\n<@ＭＳ ゴシック>HH<@>"
         # 6 文字のうち 3 文字 1 行目と 2 行目の 1 文字だけが出る
         half, half_frame = draw(body, reveal=AnimatedValue(50.0))

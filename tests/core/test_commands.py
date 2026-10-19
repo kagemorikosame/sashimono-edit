@@ -40,6 +40,8 @@ def _only_track(project: Project) -> Track:
 
 class TestMediaCommands:
     def test_add_media(self, audio_media: MediaItem, project: Project) -> None:
+        # 足すたびに元のプロジェクトまで書き換わると、履歴が持つ変更前の形も変わり、
+        # Ctrl+Z を押しても足した素材が消えない
         updated = AddMedia(audio_media).apply(project)
         assert len(updated.media) == 2
         assert updated.find_media(audio_media.id) is not None
@@ -47,15 +49,19 @@ class TestMediaCommands:
         assert len(project.media) == 1
 
     def test_add_duplicate_media_fails(self, video_media: MediaItem, project: Project) -> None:
+        # 同じ素材を 2 度登録できると、素材の一覧に同じ物が並び、クリップがどちらを指すか決まらない
         with pytest.raises(ValueError, match="すでに登録"):
             AddMedia(video_media).apply(project)
 
     def test_remove_media(self, audio_media: MediaItem, project: Project) -> None:
+        # 外した素材が一覧に残ると、使わなくなった素材が保存したファイルにも残り続ける
         added = AddMedia(audio_media).apply(project)
         removed = RemoveMedia(audio_media.id).apply(added)
         assert removed.find_media(audio_media.id) is None
 
     def test_remove_media_in_use_fails(self, video_media: MediaItem, project: Project) -> None:
+        # 置いてあるクリップの素材を外せると、そのクリップは無い素材を指し、
+        # プレビューにも書き出しにも絵が出なくなる
         track = _only_track(project)
         placed = AddClip(track.id, make_clip(0, 30, video_media)).apply(project)
         with pytest.raises(ValueError, match="使われている"):
@@ -64,6 +70,7 @@ class TestMediaCommands:
     def test_set_transcript(
         self, video_media: MediaItem, transcript: Transcript, project: Project
     ) -> None:
+        # 起こした字幕が素材に付かないと、字幕起こしを待った結果が消え、字幕を使う編集が何もできない
         updated = SetTranscript(video_media.id, transcript).apply(project)
         stored = updated.require_media(video_media.id).transcript
         assert stored is not None
@@ -72,22 +79,27 @@ class TestMediaCommands:
 
 class TestTrackCommands:
     def test_add_track_at_index(self, project: Project) -> None:
+        # 指した位置に入らないと、新しいトラックが別の重ね順に入り、上に足したつもりの絵が下に隠れる
         new_track = Track(kind=TrackKind.AUDIO, name="A1")
         updated = AddTrack(new_track, index=0).apply(project)
         assert updated.timeline.tracks[0].id == new_track.id
         assert len(updated.timeline.tracks) == 2
 
     def test_add_track_appends_by_default(self, project: Project) -> None:
+        # 位置を指さずに足したトラックが末尾に来ないと、既にあるトラックの番号と重ね順がずれる
         new_track = Track(kind=TrackKind.AUDIO, name="A1")
         updated = AddTrack(new_track).apply(project)
         assert updated.timeline.tracks[-1].id == new_track.id
 
     def test_remove_track(self, project: Project) -> None:
+        # 消したトラックが残ると、そのトラックのクリップがプレビューと書き出しに出続ける
         track = _only_track(project)
         updated = RemoveTrack(track.id).apply(project)
         assert updated.timeline.tracks == ()
 
     def test_remove_unknown_track_fails(self, project: Project) -> None:
+        # 無いトラックを消す指示が黙って通ると、execute_all が成功を返し、
+        # 消せなかった知らせがステータスバーに出ない
         from sashimono.core.model import TrackId
 
         with pytest.raises(KeyError):
@@ -96,17 +108,20 @@ class TestTrackCommands:
 
 class TestClipCommands:
     def test_add_clip(self, video_media: MediaItem, project: Project) -> None:
+        # 置いたクリップがトラックに入らないと、素材をタイムラインへ落としても何も現れない
         track = _only_track(project)
         updated = AddClip(track.id, make_clip(0, 30, video_media)).apply(project)
         assert len(_only_track(updated).clips) == 1
 
     def test_add_overlapping_clip_fails(self, video_media: MediaItem, project: Project) -> None:
+        # 同じトラックに重ねて置けると、同じ時刻にどちらの絵を出すかが決まらず、片方が隠れる
         track = _only_track(project)
         placed = AddClip(track.id, make_clip(0, 30, video_media)).apply(project)
         with pytest.raises(ValueError, match="重なっている"):
             AddClip(track.id, make_clip(15, 30, video_media)).apply(placed)
 
     def test_add_clip_to_locked_track_fails(self, video_media: MediaItem, project: Project) -> None:
+        # ロックしたトラックに置けると、守っているはずのトラックの絵や音が知らないうちに変わる
         track = replace(_only_track(project), locked=True)
         locked = project.with_timeline(project.timeline.replace_track(track))
         with pytest.raises(ValueError, match="ロック"):
@@ -122,6 +137,7 @@ class TestClipCommands:
             AddClip(track.id, make_clip(0, 30, audio_media)).apply(with_audio)
 
     def test_remove_clip(self, video_media: MediaItem, project: Project) -> None:
+        # 消したクリップがトラックに残ると、削除したはずの絵が書き出しに出続ける
         track = _only_track(project)
         clip = make_clip(0, 30, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -129,6 +145,7 @@ class TestClipCommands:
         assert _only_track(removed).clips == ()
 
     def test_ripple_delete_closes_the_gap(self, video_media: MediaItem, project: Project) -> None:
+        # 詰める削除で後ろが前へ寄らないと、消した所が黒い間のまま書き出しに残る
         track = _only_track(project)
         first = make_clip(0, 30, video_media)
         second = make_clip(30, 30, video_media)
@@ -142,6 +159,7 @@ class TestClipCommands:
         assert starts == [0, 30]
 
     def test_plain_delete_leaves_the_gap(self, video_media: MediaItem, project: Project) -> None:
+        # ふつうの削除で後ろまで寄ると、間を残したいだけなのに後ろのクリップがほかのトラックとずれる
         track = _only_track(project)
         first = make_clip(0, 30, video_media)
         second = make_clip(30, 30, video_media)
@@ -155,6 +173,7 @@ class TestClipCommands:
         assert starts == [0, 60]
 
     def test_move_clip_within_track(self, video_media: MediaItem, project: Project) -> None:
+        # 同じトラックの中で動かしたときに元の位置のクリップが残ると、同じ場面が 2 度出る
         track = _only_track(project)
         clip = make_clip(0, 30, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -164,6 +183,7 @@ class TestClipCommands:
         assert clips[0].timeline_start == 90
 
     def test_move_clip_to_another_track(self, video_media: MediaItem, project: Project) -> None:
+        # 別のトラックへ運んだクリップが元のトラックにも残ると、同じ絵が 2 枚重なって出る
         second_track = Track(kind=TrackKind.VIDEO, name="V2")
         with_track = AddTrack(second_track).apply(project)
         clip = make_clip(0, 30, video_media)
@@ -176,6 +196,7 @@ class TestClipCommands:
     def test_move_to_negative_position_fails(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # タイムラインの頭より前へ置けると、0 フレームより前に出た部分が再生でも書き出しでも見えない
         track = _only_track(project)
         clip = make_clip(30, 30, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -185,6 +206,7 @@ class TestClipCommands:
 
 class TestSplit:
     def test_split_produces_two_clips(self, video_media: MediaItem, project: Project) -> None:
+        # 割った長さがずれると、割った所の前後でコマが欠けるか同じコマが 2 度出る
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -194,6 +216,7 @@ class TestSplit:
         assert [(c.timeline_start, c.duration) for c in clips] == [(0, 20), (20, 40)]
 
     def test_split_advances_source_in(self, video_media: MediaItem, project: Project) -> None:
+        # 後ろの片割れが素材の頭から再生し直すと、割っただけで同じ場面がもう 1 度流れる
         track = _only_track(project)
         clip = make_clip(0, 60, video_media, source_in=1)
         placed = AddClip(track.id, clip).apply(project)
@@ -205,6 +228,7 @@ class TestSplit:
         assert right.source_in == Fraction(2)
 
     def test_split_respects_speed(self, video_media: MediaItem, project: Project) -> None:
+        # 速さを無視して素材の位置を数えると、倍速のクリップを割った所で場面が巻き戻る
         track = _only_track(project)
         clip = Clip(timeline_start=0, duration=60, media_id=video_media.id, speed=Fraction(2))
         placed = AddClip(track.id, clip).apply(project)
@@ -215,6 +239,8 @@ class TestSplit:
         assert right.source_in == Fraction(2)
 
     def test_left_keeps_id(self, video_media: MediaItem, project: Project) -> None:
+        # タイムラインの選択はクリップの ID で覚えている 前の片割れまで ID が変わると、
+        # 割っただけで選んでいたクリップが選択から外れる
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -226,6 +252,8 @@ class TestSplit:
     def test_split_outside_clip_fails(
         self, frame: int, video_media: MediaItem, project: Project
     ) -> None:
+        # 端や外で割る指示をここで断らないと、長さ 0 以下の片割れを作る所で落ち、
+        # 割る位置が悪いと分からない知らせが出る
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -273,6 +301,7 @@ class TestSplit:
     def test_deleting_one_half_keeps_the_other(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 割った前半を消したときに後半まで一緒に消えると、残したかった映像と音声が無くなる
         group: GroupId = new_group_id()
         audio_track = Track(kind=TrackKind.AUDIO, name="A1")
         with_track = AddTrack(audio_track).apply(project)
@@ -297,6 +326,7 @@ class TestSplit:
 
 class TestTrim:
     def test_trim_head_advances_source(self, video_media: MediaItem, project: Project) -> None:
+        # 頭を削っても素材の頭から再生されると、削ったはずの場面が流れ、残したい後ろの場面が切れる
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -311,6 +341,7 @@ class TestTrim:
     def test_trim_tail_only_changes_duration(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 終わりを削ったときに頭まで動くと、残したい場面の始まりの位置や中身がずれる
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -321,6 +352,7 @@ class TestTrim:
         assert result.source_in == Fraction(0)
 
     def test_trim_to_nothing_fails(self, video_media: MediaItem, project: Project) -> None:
+        # 削りすぎを長さが 0 以下になると分かる知らせで断らないと、なぜ端を動かせないのか伝わらない
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -328,6 +360,8 @@ class TestTrim:
             TrimClip(clip.id, head_delta=60).apply(placed)
 
     def test_trim_before_media_start_fails(self, video_media: MediaItem, project: Project) -> None:
+        # 素材の頭より前へ伸ばす指示を止まる理由を添えて断らないと、
+        # 人も AI も伸ばせない訳が分からず 1 フレームずつ試し直す
         track = _only_track(project)
         clip = make_clip(30, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
@@ -337,6 +371,7 @@ class TestTrim:
 
 class TestDocument:
     def test_execute_and_undo(self, audio_media: MediaItem, project: Project) -> None:
+        # Ctrl+Z で戻らない・Ctrl+Y でやり直せないと、間違えた操作を手で直すしかなくなる
         document = Document(project)
         document.execute(AddMedia(audio_media))
         assert len(document.project.media) == 2
@@ -353,6 +388,7 @@ class TestDocument:
     def test_failed_command_leaves_everything_untouched(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 断られた操作が作品や履歴を変えると、Ctrl+Z を押しても何も戻らない段が挟まる
         document = Document(project)
         before = document.project
         with pytest.raises(ValueError):
@@ -361,6 +397,7 @@ class TestDocument:
         assert not document.can_undo
 
     def test_new_command_clears_redo(self, audio_media: MediaItem, project: Project) -> None:
+        # 取り消した後に別の編集をしてもやり直しが残ると、Ctrl+Y で古い形が被さり新しい編集が消える
         document = Document(project)
         document.execute(RenameProject("一回目"))
         document.undo()
@@ -386,6 +423,7 @@ class TestDocument:
     def test_nested_checkpoints_record_only_the_outer(
         self, audio_media: MediaItem, project: Project
     ) -> None:
+        # 内側のまとめまで履歴に載ると、AI の 1 回の指示を戻すのに何度も取り消すことになる
         document = Document(project)
         with document.checkpoint("外側"):
             document.execute(RenameProject("A"))
@@ -403,6 +441,7 @@ class TestDocument:
     def test_checkpoint_survives_an_exception(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 失敗した指示の前半（名前の変更）だけが作品に残ると、どの操作の結果か分からない形になる
         document = Document(project)
         with pytest.raises(ValueError), document.checkpoint("途中で失敗"):
             document.execute(RenameProject("途中"))
@@ -426,6 +465,8 @@ class TestDocument:
         assert document.history_labels == ("AI",)
 
     def test_subscribe_and_unsubscribe(self, project: Project) -> None:
+        # 知らせが届かないと、取り消してもタイムラインやプレビューが古い絵のまま
+        # 解除が効かないと、閉じた画面にも知らせが届き続ける
         document = Document(project)
         seen: list[str] = []
         unsubscribe = document.subscribe(lambda p: seen.append(p.name))
@@ -439,12 +480,14 @@ class TestDocument:
         assert len(seen) == 2
 
     def test_history_limit_drops_oldest(self, project: Project) -> None:
+        # 古い段を捨てないと、長く編集するほど作品の形を何百も抱えてメモリが膨らみ続ける
         document = Document(project, history_limit=3)
         for index in range(5):
             document.execute(RenameProject(f"名前{index}"))
         assert len(document.history_labels) == 3
 
     def test_reset_clears_history(self, audio_media: MediaItem, project: Project) -> None:
+        # 別の作品を開いた後も前の履歴が残ると、Ctrl+Z で開く前の作品の形へ戻ってしまう
         document = Document(project)
         document.execute(AddMedia(audio_media))
         document.reset(project)
@@ -452,11 +495,13 @@ class TestDocument:
         assert not document.can_redo
 
     def test_undo_on_empty_history_is_a_noop(self, project: Project) -> None:
+        # 履歴が空のときの Ctrl+Z で落ちると、作品を開いた直後に押しただけでアプリが止まる
         document = Document(project)
         assert document.undo() is project
         assert document.redo() is project
 
     def test_undo_label(self, audio_media: MediaItem, project: Project) -> None:
+        # 戻す操作の名前が違うと、編集メニューの「元に戻す: 〜」に何が戻るかが正しく出ない
         document = Document(project)
         document.execute(AddMedia(audio_media))
         assert document.undo_label == f"素材を追加: {audio_media.name}"
@@ -466,6 +511,8 @@ class TestFrameRateIsUnusedButExplicit:
     """conftest の RATE_30 がプロジェクト設定と一致していることの確認"""
 
     def test_project_rate(self, project: Project) -> None:
+        # 試験の 30 fps が作品の設定とずれると、「30 フレーム = 1 秒」で書いた分割やトリムの試験が
+        # 別の速さで数え、素材の位置のずれを見逃す
         assert project.rate == RATE_30
 
 
@@ -490,6 +537,7 @@ class TestLinkedMoveAndTrim:
     def test_moving_the_video_moves_the_audio(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 映像だけ動いて音声が残ると、ドラッグした途端に口の動きと声がずれる
         placed, video_clip, _ = self._linked(video_media, project)
         moved = MoveClip(video_clip.id, 100).apply(placed)
         assert moved.timeline.tracks[0].clips[0].timeline_start == 100
@@ -519,6 +567,7 @@ class TestLinkedMoveAndTrim:
         assert shifted.timeline.tracks[1].clips[0].timeline_start == 0
 
     def test_trimming_the_head_trims_both(self, video_media: MediaItem, project: Project) -> None:
+        # 頭を削ったときに音声が削れないと、映像より先に声が鳴り始めて口とずれる
         placed, video_clip, _ = self._linked(video_media, project)
         trimmed = TrimClip(video_clip.id, head_delta=10).apply(placed)
         video = trimmed.timeline.tracks[0].clips[0]
@@ -528,6 +577,7 @@ class TestLinkedMoveAndTrim:
         assert video.source_in == audio.source_in
 
     def test_trimming_the_tail_trims_both(self, video_media: MediaItem, project: Project) -> None:
+        # 終わりを削っても音声が縮まないと、映像が終わった後も声だけが鳴り続ける
         placed, video_clip, _ = self._linked(video_media, project)
         trimmed = TrimClip(video_clip.id, tail_delta=-20).apply(placed)
         assert trimmed.timeline.tracks[0].clips[0].duration == 40
@@ -536,6 +586,7 @@ class TestLinkedMoveAndTrim:
     def test_an_impossible_trim_changes_nothing(
         self, video_media: MediaItem, project: Project
     ) -> None:
+        # 断られたトリムが元の作品まで書き換えると、映像と音声の片方だけ縮んだ形が残る
         placed, video_clip, _ = self._linked(video_media, project)
         with pytest.raises(ValueError):
             TrimClip(video_clip.id, head_delta=999).apply(placed)
@@ -543,6 +594,7 @@ class TestLinkedMoveAndTrim:
         assert placed.timeline.tracks[0].clips[0].duration == 60
 
     def test_unlinked_clips_are_untouched(self, video_media: MediaItem, project: Project) -> None:
+        # リンクしていないクリップまで一緒に動くと、1 本を動かしただけでほかのクリップの位置が変わる
         track = _only_track(project)
         first = make_clip(0, 30, video_media)
         second = make_clip(60, 30, video_media)

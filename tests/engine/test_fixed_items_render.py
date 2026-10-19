@@ -119,6 +119,7 @@ class TestIdleItemsChangeNothing:
         assert np.array_equal(before, after)
 
     def test_text_draws_the_same_with_the_items(self, gl_context: OffscreenGLContext) -> None:
+        # 既定の欄を通すと文字が中間のバッファで描き直され、前の版で作った作品のテロップの縁が変わる
         text = Clip(
             timeline_start=0,
             duration=10,
@@ -171,6 +172,7 @@ class TestIdleItemsChangeNothing:
     def test_a_flipped_item_still_flips(
         self, gl_context: OffscreenGLContext, picture: MediaItem
     ) -> None:
+        # 反転の欄まで何もしない物として飛ばすと、パネルで左右反転を入れても絵が裏返らない
         clip = with_fixed_items(_picture_clip(picture, native=True), picture=True)
         flipped = replace(
             clip, effects=(clip.effects[0].with_param("horizontal", True), clip.effects[1])

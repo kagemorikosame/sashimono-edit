@@ -78,6 +78,7 @@ class TestEachVoiceGetsItsOwnTrack:
         assert _texts(burned, "字幕 音声 2") == ["マイクの声"]
 
     def test_the_voices_can_be_chosen(self) -> None:
+        # 話し手の絞り込みが効かないと、マイクの声だけ焼くつもりがゲームの声の字幕まで画面に載る
         project, media = _project()
         commands = burn_subtitles(project, TEXT.create(), voices=[(media.id, 2)])
         burned = _apply(project, commands)
@@ -85,6 +86,7 @@ class TestEachVoiceGetsItsOwnTrack:
         assert _texts(burned, "字幕") == ["マイクの声"]
 
     def test_only_the_chosen_rows(self) -> None:
+        # 字幕パネルで選んだ行だけ置いたつもりが、選んでいない行まで焼き込まれて手で消す羽目になる
         project, media = _project()
         transcript = media.transcript_for(1)
         assert transcript is not None

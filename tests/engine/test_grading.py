@@ -125,6 +125,7 @@ class TestGradientMap:
         return registry.require("gradient_map").create(**base)
 
     def test_dark_and_light_go_to_the_two_colours(self, paint: Callable[..., np.ndarray]) -> None:
+        # 暗い色と明るい色を逆に当てると、影が黄色く光る所が青く沈む反転したような絵になる
         dark = paint((0.0, 0.0, 0.0), self._effect())
         light = paint((1.0, 1.0, 1.0), self._effect())
         assert dark[2] > 200 and dark[0] < 40
@@ -139,6 +140,8 @@ class TestGradientMap:
         assert int(paint((1.0, 0.0, 0.0), effect)[0]) == pytest.approx(0.299 * 255, abs=10)
 
     def test_strength_zero_leaves_the_picture(self, paint: Callable[..., np.ndarray]) -> None:
+        # 強さを 0 にしても色が置き換わると、キーフレームで 0 から効かせ始めても
+        # 頭から色が変わっている
         after = paint((1.0, 0.0, 0.0), self._effect(strength=0.0))
         assert after[0] > 200 and after[2] < 40
 
@@ -154,6 +157,7 @@ class TestColorRangeShift:
         )
 
     def test_the_named_colour_is_replaced(self, paint: Callable[..., np.ndarray]) -> None:
+        # 指定した赤そのものが塗り替わらないと、色の置き換えを掛けても絵が何も変わらない
         after = paint((1.0, 0.0, 0.0), self._effect())
         assert after[1] > 200 and after[0] < 60
 

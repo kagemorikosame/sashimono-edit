@@ -154,6 +154,7 @@ class TestPicture:
     def test_a_hidden_picture_is_not_drawn(
         self, gl_context: OffscreenGLContext, two_voices: MediaItem
     ) -> None:
+        # 音だけ使うつもりで絵を隠した動画がレイヤーに映ったままになり、下の映像を覆う
         clip = _video_clip(two_voices, 0, show_picture=False)
         image = _render(_layer_project(two_voices, clip), gl_context)
         assert int(image[32, 32, 0]) < 8
@@ -201,6 +202,7 @@ class TestPicture:
         assert int(image[2, 2, 0]) > 200
 
     def test_a_muted_layer_is_not_drawn(self, gl_context: OffscreenGLContext) -> None:
+        # ミュートしたレイヤーの絵が映り続けると、その層を一時的に外して見比べられない
         layer = Track(TrackKind.MIXED, "レイヤー 1", (Clip(0, 30, source=_shape(RED)),), muted=True)
         assert int(_render(_with_tracks(layer), gl_context)[32, 32, 0]) < 8
 
@@ -231,6 +233,7 @@ class TestSound:
         assert _pitch(high) == pytest.approx(HIGH_HZ, abs=10)
 
     def test_no_stream_is_silent(self, two_voices: MediaItem) -> None:
+        # 音を選ばずに置いた動画から音が鳴ると、要らない声や BGM が作品に混ざる
         assert _rms(_mix(_layer_project(two_voices, _video_clip(two_voices, None)))) == 0.0
 
     def test_a_stream_the_media_lacks_is_silent(self, two_voices: MediaItem) -> None:
@@ -244,17 +247,20 @@ class TestSound:
         assert _rms(_mix(_layer_project(two_voices, clip))) > 0.01
 
     def test_the_layer_volume_applies(self, two_voices: MediaItem) -> None:
+        # レイヤーの音量を下げても音が変わらないと、BGM のレイヤーだけ絞る調整ができない
         clip = _video_clip(two_voices, 0)
         loud = _rms(_mix(_layer_project(two_voices, clip)))
         quiet = _rms(_mix(_layer_project(two_voices, clip, volume_db=-20.0)))
         assert quiet / loud == pytest.approx(0.1, rel=0.05)
 
     def test_the_layer_pan_applies(self, two_voices: MediaItem) -> None:
+        # レイヤーの左右の振り分けが効かないと、左に寄せたはずの音が両方から聞こえる
         mixed = _mix(_layer_project(two_voices, _video_clip(two_voices, 0), pan=-1.0))
         assert _rms(mixed[:, 0]) > 0.01
         assert _rms(mixed[:, 1]) < 1e-4
 
     def test_a_muted_layer_is_silent(self, two_voices: MediaItem) -> None:
+        # ミュートしたレイヤーの音が鳴り続けると、消したはずの声がプレビューに残る
         project = _layer_project(two_voices, _video_clip(two_voices, 0), muted=True)
         assert _rms(_mix(project)) == 0.0
 
@@ -265,6 +271,7 @@ class TestSound:
         assert _rms(_mix(project)) == 0.0
 
     def test_a_soloed_layer_is_heard(self, two_voices: MediaItem) -> None:
+        # ソロにしたレイヤーまで黙ると、そのレイヤーの音だけを聞き直せない
         project = _layer_project(two_voices, _video_clip(two_voices, 0), solo=True)
         project = AddTrack(Track(TrackKind.AUDIO, "A1")).apply(project)
         assert _rms(_mix(project)) > 0.01
@@ -276,6 +283,7 @@ class TestSound:
         assert _rms(_mix(project)) == 0.0
 
     def test_layers_inside_a_scene_are_heard(self, two_voices: MediaItem) -> None:
+        # シーンの中のレイヤーに置いた動画の音が鳴らないか、選んだのと違う声が鳴る
         base = Project.create(SETTINGS, media=(two_voices,))
         project, _ = _scene_on_a_layer(base, _video_clip(two_voices, 1))
         assert _pitch(_mix(project)) == pytest.approx(HIGH_HZ, abs=10)

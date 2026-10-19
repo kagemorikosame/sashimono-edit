@@ -155,6 +155,7 @@ class TestCodecs:
         assert "h264_nvenc" in available_video_codecs()
 
     def test_at_least_one_codec_is_available(self) -> None:
+        # 書き出しの画面でコーデックの選択肢が空になり、どの作品も動画にできない
         assert available_video_codecs(), "書き出せるコーデックが 1 つも無い"
 
     def test_preference_order_is_respected(self) -> None:
@@ -169,6 +170,7 @@ class TestExport:
     def test_produces_a_playable_file(
         self, codec: str, ready_project: Project, tmp_path: Path
     ) -> None:
+        # 書き出した mp4 が開けない・音が入らない・大きさやコマの速さが設定と違う、のどれかになる
         if codec not in available_video_codecs():
             pytest.skip(f"{codec} が使えない")
 
@@ -249,6 +251,7 @@ class TestExport:
         assert not output.exists()
 
     def test_frame_count_matches_the_timeline(self, ready_project: Project, tmp_path: Path) -> None:
+        # 書き出した動画のコマ数がタイムラインと合わないと、終わりが欠けるか余計なコマが付く
         output = tmp_path / "out.mp4"
         export_project(ready_project, ExportSettings(path=output, video_codec="libx264"))
 
@@ -257,6 +260,8 @@ class TestExport:
         assert frames == ready_project.duration
 
     def test_video_only_project(self, silent_project: Project, tmp_path: Path) -> None:
+        # 音を鳴らすクリップが無いのに音声の道を作ると、書き出しの窓や AI の書き出しで出した
+        # 動画に黙った音声トラックが付き、絵だけの動画にならない
         output = tmp_path / "silent.mp4"
         export_project(silent_project, ExportSettings(path=output, video_codec="libx264"))
 
@@ -265,6 +270,7 @@ class TestExport:
         assert not item.has_audio
 
     def test_frame_range(self, ready_project: Project, tmp_path: Path) -> None:
+        # 範囲を決めて書き出しても作品全体や違う長さが出ると、切り出したい場面だけを動画にできない
         output = tmp_path / "range.mp4"
         export_project(
             ready_project,
@@ -275,6 +281,8 @@ class TestExport:
         assert frames == 15
 
     def test_reports_progress(self, ready_project: Project, tmp_path: Path) -> None:
+        # 進み具合が動かない・戻る・100% に届かないまま終わると、
+        # 書き出しが止まったのか終わったのか分からない
         seen: list[float] = []
         export_project(
             ready_project,
@@ -303,6 +311,7 @@ class TestExport:
         assert not output.exists()
 
     def test_failure_leaves_no_file(self, ready_project: Project, tmp_path: Path) -> None:
+        # 失敗したのに壊れた mp4 が残ると、出来上がったと思って開いても再生できない
         output = tmp_path / "broken.mp4"
         with pytest.raises(Exception):  # noqa: B017 - コーデック側の例外種別は問わない
             export_project(
@@ -312,11 +321,14 @@ class TestExport:
         assert not output.exists()
 
     def test_empty_timeline_is_refused(self, tmp_path: Path) -> None:
+        # 画面と AI の道具は手前で空を断るが、ここを直に呼んで空のまま進むと 1 枚も描かずに
+        # 成功として出力先を返し、そのファイルは出来ていない
         empty = Project.create(ProjectSettings(width=320, height=240))
         with pytest.raises(ExportError, match="範囲が空"):
             export_project(empty, ExportSettings(path=tmp_path / "empty.mp4"))
 
     def test_creates_missing_directories(self, ready_project: Project, tmp_path: Path) -> None:
+        # 保存先にまだ無いフォルダを指定すると、フォルダを手で作らない限り書き出せない
         output = tmp_path / "深い" / "階層" / "out.mp4"
         export_project(ready_project, ExportSettings(path=output, video_codec="libx264"))
         assert output.exists()

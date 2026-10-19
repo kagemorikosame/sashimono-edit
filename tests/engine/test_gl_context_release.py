@@ -18,6 +18,8 @@ pytestmark = pytest.mark.usefixtures("gpu")
 
 
 def test_release_destroys_the_context_too() -> None:
+    # 書き出しや先読みを終えてもコンテキストがごみ集めまで残り、いつ壊れるかが分からなくなる
+    # （作りかけを壊す _discard と同じ理由 #149）
     context = OffscreenGLContext()
     gl, surface = context.context, context.surface
     with context:
@@ -48,6 +50,8 @@ def test_a_context_refused_after_creation_is_destroyed_on_release(
 def test_the_look_worker_lets_go_of_a_refused_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # GL の使えない機械で見本を簡易の描き方へ切り替えた後も、断られたコンテキストを掴み続け
+    # いつ壊れるかがごみ集め次第になる
     from sashimono.engine.render.look_preview import LookWorker
 
     def refuse(_self: OffscreenGLContext) -> None:

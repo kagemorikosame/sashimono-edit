@@ -28,6 +28,7 @@ class _Rational:
 
 
 def test_a_fraction_stays_the_same() -> None:
+    # 前の版の PyAV が渡す Fraction の時刻の単位が変わると、その環境でだけシークの位置がずれる
     assert as_fraction(Fraction(1, 15360)) == Fraction(1, 15360)
 
 

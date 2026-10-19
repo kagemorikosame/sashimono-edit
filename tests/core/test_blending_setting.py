@@ -96,6 +96,8 @@ class TestCommand:
         assert document.project.settings.blending == Blending.SRGB
 
     def test_an_unknown_blending_is_refused(self) -> None:
+        # AI や台本が知らない方式を渡して通ると、保存した作品が次に開くとき
+        # 読めないファイルとして断られる
         with pytest.raises(ValueError, match="重ね合わせ"):
             SetBlending("add").apply(Project.create())
 
