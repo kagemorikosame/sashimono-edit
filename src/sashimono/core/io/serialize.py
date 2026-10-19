@@ -44,6 +44,7 @@ from sashimono.core.model import (
     SegmentId,
     Stroke,
     StrokeId,
+    StyleGuide,
     SubtitleOrigin,
     Timeline,
     Track,
@@ -75,6 +76,8 @@ __all__ = [
     "save_project",
     "source_from_json",
     "source_to_json",
+    "style_guide_from_json",
+    "style_guide_to_json",
 ]
 
 #: 対になっていない代用符号 1 文字
@@ -145,6 +148,9 @@ FORMAT_NAME = "sashimono-project"
 #: 「模様で塗る」の色のバーの並び（``gradient`` #364）も足した 10 はまだどの公開版も書いて
 #: いない（0.2.2 までは 9）ので版を分けない 並びが空（既定）の間は前からの色の項目で描くので、
 #: 9 までのファイルと読み込んだ作品は何も直さずに同じ絵で読める
+#: 同じ 10 で編集の方針（``style_guide`` #343）も足した 同じ理由で版を分けない 9 までの本体は
+#: 10 を「更新してください」で止めるので、方針を黙って捨てて保存し直すことは無い 方針は
+#: 決めたときだけ書く 9 までのファイルと方針の無いファイルは、空の方針（決めていない）で読む
 FORMAT_VERSION = 10
 
 #: 映像の終わり（``end_time``）を素材の頭から数え始めた版 これより前の値は捨てる
@@ -828,9 +834,49 @@ def _timeline_from_json(raw: object) -> Timeline:
 # --- プロジェクト ---------------------------------------------------------
 
 
+def style_guide_to_json(guide: StyleGuide) -> dict[str, Any]:
+    """編集の方針（#343）を JSON にできる辞書へ 本人の設定（新しい作品の方針）も同じ形で書く"""
+    return {
+        "fonts": list(guide.fonts),
+        "colors": list(guide.colors),
+        "subtitles": guide.subtitles,
+        "tempo": guide.tempo,
+        "effects": list(guide.effects),
+        "notes": guide.notes,
+    }
+
+
+def style_guide_from_json(raw: object) -> StyleGuide:
+    """:func:`style_guide_to_json` の出力から方針を戻す 形が違えば :class:`ProjectFileError`
+
+    中身（色の書き方・長さ）は確かめない 確かめるのは変えるとき（:class:`SetStyleGuide`）
+    読むときに断ると、手で書き換えた 1 色のために作品ごと開けなくなる（目印の色と同じ扱い）
+    """
+    data = _require(raw, "style_guide")
+
+    def names(key: str) -> tuple[str, ...]:
+        items = _get_list(data, key)
+        if not all(isinstance(item, str) for item in items):
+            raise ProjectFileError(f"style_guide の {key} に文字列でない物がある")
+        return tuple(items)
+
+    return StyleGuide(
+        fonts=names("fonts"),
+        colors=names("colors"),
+        subtitles=_get_str(data, "subtitles"),
+        tempo=_get_str(data, "tempo"),
+        effects=names("effects"),
+        notes=_get_str(data, "notes"),
+    )
+
+
 def project_to_dict(project: Project) -> dict[str, Any]:
     """プロジェクトを JSON にできる辞書へ"""
     settings = project.settings
+    extra: dict[str, Any] = {}
+    if not project.style_guide.empty:
+        # 決めたときだけ書く 方針を使わない作品のファイルは前と同じ中身のまま
+        extra["style_guide"] = style_guide_to_json(project.style_guide)
     return {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
@@ -851,6 +897,7 @@ def project_to_dict(project: Project) -> dict[str, Any]:
             {"id": scene.id, "name": scene.name, "timeline": _timeline_to_json(scene.timeline)}
             for scene in project.scenes
         ],
+        **extra,
     }
 
 
@@ -930,6 +977,12 @@ def _project_from_dict(data: object) -> Project:
             media=tuple(_media_from_json(m, version) for m in _get_list(root, "media")),
             name=_get_str(root, "name", "無題"),
             scenes=scenes,
+            # 9 までのファイルと、方針を決めていない作品には項目が無い 空の方針で開く
+            style_guide=(
+                style_guide_from_json(root["style_guide"])
+                if "style_guide" in root
+                else StyleGuide()
+            ),
         )
     except ValueError as exc:
         # シーンの入れ子が自分へ戻っている、など 壊れたファイルとして伝える

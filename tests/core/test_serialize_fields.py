@@ -39,6 +39,7 @@ from sashimono.core.model import (
     Scene,
     Stroke,
     StrokeId,
+    StyleGuide,
     SubtitleOrigin,
     Timeline,
     Track,
@@ -206,7 +207,18 @@ def _full_project() -> Project:
         blending=Blending.LINEAR,
         layer_mode=LayerMode.MIXED,
     )
-    return Project(settings, timeline, media=(media,), name="試し", scenes=(scene,))
+    # 編集の方針（#343） どの欄も既定（空）と違う値にする
+    guide = StyleGuide(
+        fonts=("源ノ角ゴシック",),
+        colors=("#ff0000",),
+        subtitles="下に白の字",
+        tempo="間は詰める",
+        effects=("blur",),
+        notes="絵文字は使わない",
+    )
+    return Project(
+        settings, timeline, media=(media,), name="試し", scenes=(scene,), style_guide=guide
+    )
 
 
 def _instances(project: Project) -> dict[type, list[Any]]:
@@ -242,6 +254,7 @@ def _instances(project: Project) -> dict[type, list[Any]]:
         Transcript: [transcript],
         TranscriptSegment: list(transcript.segments),
         Word: list(transcript.segments[0].words),
+        StyleGuide: [project.style_guide],
     }
 
 
@@ -278,6 +291,7 @@ def _written(tree: _Reading) -> dict[type, list[_Reading]]:
         Transcript: [transcript],
         TranscriptSegment: [segment],
         Word: [_at(segment, "words", 0)],
+        StyleGuide: [_at(tree, "style_guide")],
     }
 
 

@@ -37,8 +37,8 @@ from sashimono.ai.outbound import (
 )
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import template_choice
-from sashimono.core.commands import AddMarkers, RemoveMedia, SetTranscript
-from sashimono.core.model import Marker, MediaItem, Transcript
+from sashimono.core.commands import AddMarkers, RemoveMedia, SetStyleGuide, SetTranscript
+from sashimono.core.model import Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.cache import SceneState
 from tests.ai.conftest import FakeHost, make_loaded
@@ -160,6 +160,10 @@ class TestDeclarations:
         # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
         named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
         secret_host.apply_commands([AddMarkers(tuple(named))], "目印")
+        # 字幕の文を書いた編集の方針（#343） 方針を読む道具が本人の文を返し、照らす道具は返さない
+        sentence = sorted(texts)[0]
+        guide = StyleGuide(fonts=("源ノ角ゴシック",), subtitles=sentence, notes=sentence)
+        secret_host.apply_commands([SetStyleGuide(guide)], "方針")
         # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
         secret_host.export_state = {
             "state": "done",
