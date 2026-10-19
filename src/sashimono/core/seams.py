@@ -44,6 +44,8 @@ __all__ = [
     "DEFAULT_SEAM_CROSSFADE_MS",
     "DEFAULT_SEAM_VIDEO",
     "DEFAULT_SEAM_ZOOM_PERCENT",
+    "FADE_ALREADY",
+    "FADE_MOVING",
     "SEAM_AUDIO_FADE_MS_RANGE",
     "SEAM_CROSSFADE",
     "SEAM_CROSSFADE_MS_RANGE",
@@ -93,6 +95,10 @@ DEFAULT_SEAM_AUDIO_FADE_MS = 20
 SEAM_AUDIO_FADE_MS_RANGE = (0, 200)
 #: 対はあるが、選んだ処理を付けられる絵か音の対が無いつなぎ目の理由
 UNFIT_SEAM = "選んだ処理を付けられる絵か音のつなぎ目ではない"
+#: 音の対に、頼んだ長さ以上のフェードがもう付いている
+FADE_ALREADY = "もう頼んだ長さ以上の音のフェードが付いている"
+#: 音の対のフェードの長さをキーフレームで動かしている（人が付けた動きは触らない）
+FADE_MOVING = "音のフェードの長さがキーフレームで動いている"
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +248,15 @@ def _fade_commands(clip: Clip, name: str, seconds: float) -> list[Command]:
     return [SetParam(ParamPath.of_effect(clip.id, effect.id, name), AnimatedValue(static=seconds))]
 
 
+def _fade_note(clip: Clip, name: str) -> str:
+    """:func:`_fade_commands` が何も返さなかった訳"""
+    effect = next((e for e in clip.effects if e.fixed and e.kind == FADE_EFFECT_KIND), None)
+    value = effect.params.get(name) if effect is not None else None
+    if isinstance(value, AnimatedValue) and value.is_animated:
+        return FADE_MOVING
+    return FADE_ALREADY
+
+
 class _Builder:
     """命令を 1 つずつ当てながら積む 後の命令は前の命令を当てた形を見て組む"""
 
@@ -288,6 +303,9 @@ def plan_smoothing(
     zoomed: list[ClipId] = []
     crossfades: list[tuple[int, int]] = []
     missing = tuple(frame for frame in ordered if not _pairs_at(project, frame, scope))
+    #: 音の対はあったが、もう付いていた（または動かしている）ので何もしなかったつなぎ目の理由
+    #: 映像の処理を付けたつなぎ目では言わない（付けたのに断ったように見える）
+    sound_notes: dict[int, str] = {}
 
     if style.audio_fade_ms > 0:
         seconds = style.audio_fade_ms / 1000
@@ -301,7 +319,11 @@ def plan_smoothing(
                 for clip, name in ((left, "fade_out"), (right, "fade_in")):
                     # 短いクリップでは頭と終わりのフェードが重ならないよう半分までにする
                     limit = float(clip.duration * rate.frame_duration) / 2
-                    commands += _fade_commands(builder.clip(clip.id), name, min(seconds, limit))
+                    current = builder.clip(clip.id)
+                    planned = _fade_commands(current, name, min(seconds, limit))
+                    if not planned:
+                        sound_notes.setdefault(frame, _fade_note(current, name))
+                    commands += planned
                 if commands:
                     builder.add(commands)
                     touched = True
@@ -359,10 +381,13 @@ def plan_smoothing(
     # 対はあったのに、選んだ処理を付けられる物が無かったつなぎ目（寄りを頼んだのに音だけの対など）
     # 理由を残さないと、呼ぶ側は「付けられなかった」としか言えず、人も AI も何を変えればよいか
     # 分からない
+    # 音の対にもう付いていた所は「つなぎ目ではない」と言わず、付いていたと言う（掛け直したときに
+    # 間違った案内をしない）
     noted = {frame for frame, _ in skipped}
     for frame in ordered:
-        if frame not in handled and frame not in missing and frame not in noted:
-            skipped.append((frame, UNFIT_SEAM))
+        if frame in handled or frame in missing or frame in noted:
+            continue
+        skipped.append((frame, sound_notes.get(frame, UNFIT_SEAM)))
 
     return SeamPlan(
         commands=tuple(builder.commands),

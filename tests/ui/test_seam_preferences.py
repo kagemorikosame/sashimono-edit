@@ -23,6 +23,7 @@ from sashimono.ai.operations import find_operation
 from sashimono.core.commands import Author, Command, RippleCut, SetTrackState
 from sashimono.core.model import TRANSITION_KIND, Project, Track
 from sashimono.core.seams import (
+    FADE_ALREADY,
     SEAM_NONE,
     SEAM_VIDEOS,
     SEAM_ZOOM,
@@ -339,6 +340,26 @@ class TestRightClick:
         assert "（）" not in message
         assert UNFIT_SEAM in message
         assert window.document.project == project
+
+    def test_running_it_again_says_the_fade_is_there(
+        self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、音のフェードだけを掛け直したとき、音のつなぎ目なのに「絵か音のつなぎ目
+        # ではない」と案内される（CodeRabbit の指摘）
+        work = JumpCut()
+        monkeypatch.setattr(
+            main_window_module,
+            "ask_seams",
+            lambda _parent, _style, _note: SeamStyle(video=SEAM_NONE, audio_fade_ms=20),
+        )
+        window = MainWindow(work.project, confirm_unsaved=False)
+        opened.append(window)
+        _menu_action(window, work.audio, 90, SEAMS_TEXT).trigger()
+        assert window.document.can_undo
+        _menu_action(window, work.audio, 90, SEAMS_TEXT).trigger()
+        message = window.statusBar().currentMessage()
+        assert FADE_ALREADY in message
+        assert UNFIT_SEAM not in message
 
     def test_cancelling_changes_nothing(
         self, opened: list[MainWindow], monkeypatch: pytest.MonkeyPatch

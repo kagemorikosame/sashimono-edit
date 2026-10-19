@@ -39,6 +39,8 @@ from sashimono.core.model import (
     new_group_id,
 )
 from sashimono.core.seams import (
+    FADE_ALREADY,
+    FADE_MOVING,
     SEAM_CROSSFADE,
     SEAM_NONE,
     SEAM_ZOOM,
@@ -393,6 +395,34 @@ def test_a_seam_with_nothing_to_fit_says_why() -> None:
     plan = plan_smoothing(project, work.seams, SeamStyle(video=SEAM_ZOOM, audio_fade_ms=0))
     assert plan.commands == ()
     assert plan.skipped == ((60, UNFIT_SEAM), (120, UNFIT_SEAM))
+
+
+def test_a_fade_that_is_already_there_is_named() -> None:
+    # 壊れると、音のフェードだけを掛け直したとき、音のつなぎ目なのに「絵か音のつなぎ目ではない」と
+    # 案内され、人も AI も見当違いの所を探す キーフレームで動かしている所もその訳を言う
+    # （CodeRabbit の指摘）
+    work = JumpCut()
+    first = plan_smoothing(work.project, work.seams, AUDIO_ONLY)
+    again = plan_smoothing(first.project, work.seams, AUDIO_ONLY)
+    assert again.commands == ()
+    assert again.skipped == ((60, FADE_ALREADY), (120, FADE_ALREADY))
+    track = work.project.timeline.find_track(work.audio.id)
+    assert track is not None
+    moving = fixed_effect(FADE_EFFECT_KIND).with_param(
+        "fade_out", AnimatedValue(keyframes=(Keyframe(0, 0.1), Keyframe(10, 0.3)))
+    )
+    first_sound = replace(work.sounds[0], effects=(moving,))
+    keep = tuple(c for c in track.clips if c.id != first_sound.id)
+    project = work.project.with_timeline(
+        work.project.timeline.replace_track(track.with_clips((*keep, first_sound)))
+    )
+    long_in = plan_smoothing(project, (60,), AUDIO_ONLY)
+    # 後ろのクリップにはフェードが入るので処理したつなぎ目 前の動かしている欄は触らない
+    assert long_in.audio == (60,)
+    assert long_in.skipped == ()
+    # 後ろにも長いフェードが付いていれば何もしないので、動かしている訳を言う
+    done = plan_smoothing(long_in.project, (60,), AUDIO_ONLY)
+    assert done.skipped == ((60, FADE_MOVING),)
 
 
 class TestOneUndo:
