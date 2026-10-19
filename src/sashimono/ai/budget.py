@@ -76,6 +76,8 @@ DEFAULT_IMAGE_EDGE = 1568
 #: 1 日の量を何日分残すか 日をまたいだ確かめには今日の分しか使わないが、残しておけば
 #: 本人がファイルを開いて最近の使い方を見られる 古い物を消さないとファイルが育ち続ける
 KEEP_DAYS = 31
+#: 時間だけが進んだとき、1 日の置き場へ書くまで溜める秒（:meth:`UsageMeter._save`）
+SAVE_SECONDS = 5.0
 
 
 class LimitKind(Enum):
@@ -163,6 +165,13 @@ class Usage:
             tokens=self.tokens + other.tokens,
             images=self.images + other.images,
             seconds=self.seconds + other.seconds,
+        )
+
+    def __sub__(self, other: Usage) -> Usage:
+        return Usage(
+            tokens=self.tokens - other.tokens,
+            images=self.images - other.images,
+            seconds=self.seconds - other.seconds,
         )
 
 
@@ -292,16 +301,36 @@ def _usage_json(usage: Usage) -> dict[str, float]:
     return {"tokens": usage.tokens, "images": usage.images, "seconds": round(usage.seconds, 1)}
 
 
+class _MemoryStore:
+    """覚えない置き場（試験・CLI） 1 日の量はこの数えが生きている間だけ持つ
+
+    置き場が無いときも同じ道（足してから読み直す）で数える 道を分けると、片方だけで
+    1 日の上限の数え方が食い違う
+    """
+
+    def __init__(self) -> None:
+        self._days: dict[date, Usage] = {}
+
+    def load(self, day: date) -> Usage:
+        return self._days.get(day, Usage())
+
+    def add(self, day: date, usage: Usage) -> None:
+        self._days[day] = self._days.get(day, Usage()) + usage
+
+
 @dataclass(slots=True)
 class _Turn:
     """いま応えている指示の数え"""
 
     started: float
     day: date
-    #: 1 日のファイルにあった分（取りかかった時点） ほかの窓の分も含む
-    day_before: Usage
+    #: 1 日の置き場の今日の量（最後に足して読み直した時点） ほかの窓の分と、この指示の
+    #: 足し終えた分（:attr:`saved`）を含む
+    day_seen: Usage
     tokens: int = 0
     images: int = 0
+    #: この指示の量のうち、1 日の置き場へ足し終えた分 足すのは差だけにする
+    saved: Usage = field(default_factory=Usage)
     #: API の 1 回（``message_id``）ごとに、欄ごとの一番大きい値 同じ応答が中身の塊ごとに
     #: 何通かに分かれて届くので、足すと 2 重 3 重に数える
     messages: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -314,6 +343,12 @@ class _Turn:
 class UsageMeter:
     """使った量を数える AI のスレッド（トークン・絵）と画面のスレッド（指示の始まりと終わり）
     の両方から呼ばれるので、中は錠で守る
+
+    1 日の置き場へは、指示の終わりだけでなく上限を確かめるたび（道具の前）と :meth:`flush`
+    で、まだ足していない差を足す 終わりにだけ足すと、窓を閉じた・落ちた指示の量が残らず、
+    起動し直すとその分だけ 1 日の上限を越えて使える 1 日の上限は足した後に置き場を読み直した
+    量で確かめる 指示を始めた時の量のままだと、もう 1 つの窓が同時に使った分が入らず、
+    2 つの窓で上限の 2 倍まで使える
     """
 
     def __init__(
@@ -323,7 +358,7 @@ class UsageMeter:
         clock: Callable[[], float] = time.monotonic,
         today: Callable[[], date] = date.today,
     ) -> None:
-        self._store = store
+        self._store: DailyUsageStore | _MemoryStore = store if store is not None else _MemoryStore()
         self._clock = clock
         self._today = today
         self._lock = threading.Lock()
@@ -348,35 +383,45 @@ class UsageMeter:
         if self._turn is not None:
             self.end_turn()
         day = self._today()
-        before = self._load(day)
         with self._lock:
-            # 指示の外で数えた分はこの指示に入れる 入れないと 1 日のファイルへ書かれずに消える
+            # 指示の外で数えた分はこの指示に入れる 入れないと 1 日の置き場へ書かれずに消える
             loose = self._loose
             self._loose = Usage()
             self._turn = _Turn(
                 started=self._clock(),
                 day=day,
-                day_before=before,
+                day_seen=self._store.load(day),
                 tokens=loose.tokens,
                 images=loose.images,
             )
 
     def end_turn(self) -> Usage:
-        """指示が終わった 量を 1 日のファイルへ足し、この指示の量を返す"""
+        """指示が終わった 残りの差を 1 日の置き場へ足し、この指示の量を返す
+
+        窓を閉じるとき（応えている途中でも）も呼ぶ 指示の外で数えた分もここで足す
+        """
         with self._lock:
             turn = self._turn
             self._turn = None
-            if turn is None:
-                return Usage()
-            used = Usage(
-                tokens=turn.tokens, images=turn.images, seconds=self._clock() - turn.started
-            )
-            self.last = used
-            self.last_stop = turn.stopped
-            self._day_base = (turn.day, turn.day_before + used)
-        if self._store is not None:
-            self._store.add(turn.day, used)
-        return used
+            used = Usage()
+            if turn is not None:
+                self._save(turn, force=True)
+                used = turn.saved
+                self.last = used
+                self.last_stop = turn.stopped
+                self._day_base = (turn.day, turn.day_seen)
+            if self._loose != Usage():
+                today = self._today()
+                self._store.add(today, self._loose)
+                self._loose = Usage()
+                self._day_base = (today, self._store.load(today))
+            return used
+
+    def flush(self) -> None:
+        """まだ足していない差を 1 日の置き場へ足す 画面が時々呼ぶ（落ちたときに失う量を減らす）"""
+        with self._lock:
+            if self._turn is not None:
+                self._save(self._turn)
 
     # --- AI のスレッドから ---
 
@@ -414,7 +459,8 @@ class UsageMeter:
     def overrun(self, *, adding_images: int = 0) -> Overrun | None:
         """当たった上限 無ければ ``None`` ``adding_images`` はこれから送る絵の枚数
 
-        止めると決まった指示では、決まった上限を返し続ける
+        止めると決まった指示では、決まった上限を返し続ける 1 日の量は、この指示の差を
+        置き場へ足してから読み直した量（ほかの窓の分を含む）で見る
         """
         with self._lock:
             turn = self._turn
@@ -422,9 +468,10 @@ class UsageMeter:
                 return None
             if turn.stopped is not None:
                 return turn.stopped
+            self._save(turn)
             limits = self.limits
             day_extra = self._day_extra_now()
-            day_used = turn.day_before + Usage(tokens=turn.tokens, images=turn.images)
+            day_used = turn.day_seen
             checks: list[tuple[LimitKind, float, int]] = [
                 (LimitKind.TURN_SECONDS, self._clock() - turn.started, 0),
                 (LimitKind.TURN_TOKENS, turn.tokens, 0),
@@ -476,39 +523,46 @@ class UsageMeter:
         """いまの指示の量 応えている指示が無ければ ``None``"""
         with self._lock:
             turn = self._turn
-            if turn is None:
-                return None
-            return Usage(
-                tokens=turn.tokens, images=turn.images, seconds=self._clock() - turn.started
-            )
+            return None if turn is None else self._current(turn)
 
     def day_usage(self) -> Usage:
         """今日の量（ほかの窓の分を含む）
 
-        ファイルを読むのは指示を始めた時と、日が変わった後に初めて見た時だけ 画面は
-        80 ミリ秒ごとに量を出し直すので、毎回読むとディスクを叩き続ける ほかの窓が
-        数えた分は、次の指示を始めた所で入る
+        置き場を読むのは差を足した時と、日が変わった後に初めて見た時だけ 画面は 80 ミリ秒
+        ごとに量を出し直すので、毎回読むとディスクを叩き続ける 見せる量は少し古くてよいが、
+        上限の確かめ（:meth:`overrun`）は必ず読み直す
         """
         with self._lock:
             turn = self._turn
             if turn is not None:
-                return turn.day_before + Usage(
-                    tokens=turn.tokens, images=turn.images, seconds=self._clock() - turn.started
-                )
+                return turn.day_seen + (self._current(turn) - turn.saved)
             day, base = self._day_base
             today = self._today()
-            if day == today:
-                return base + self._loose
-        loaded = self._load(today)
-        with self._lock:
-            self._day_base = (today, loaded)
-            return loaded + self._loose
+            if day != today:
+                base = self._store.load(today)
+                self._day_base = (today, base)
+            return base + self._loose
 
-    def _load(self, day: date) -> Usage:
-        return self._store.load(day) if self._store is not None else Usage()
+    # --- 錠の中で呼ぶ ---
+
+    def _current(self, turn: _Turn) -> Usage:
+        return Usage(tokens=turn.tokens, images=turn.images, seconds=self._clock() - turn.started)
+
+    def _save(self, turn: _Turn, *, force: bool = False) -> None:
+        """この指示のまだ足していない差を置き場へ足し、今日の量を読み直す
+
+        時間だけの差は :data:`SAVE_SECONDS` に満ちるまで書かない 道具のたびに数ミリ秒の
+        差を書くと、ファイルを書き換えるだけの手間が増える（時間は 1 日の上限に使わない）
+        """
+        current = self._current(turn)
+        delta = current - turn.saved
+        if force or delta.tokens or delta.images or delta.seconds >= SAVE_SECONDS:
+            self._store.add(turn.day, delta)
+            turn.saved = current
+        turn.day_seen = self._store.load(turn.day)
 
     def _day_extra_now(self) -> dict[LimitKind, int]:
-        """今日の広げた分 日が変わっていたら捨てる（錠の中で呼ぶ）"""
+        """今日の広げた分 日が変わっていたら捨てる"""
         day, extra = self._day_extra
         today = self._today()
         if day != today:

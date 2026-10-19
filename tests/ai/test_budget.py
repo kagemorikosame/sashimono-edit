@@ -265,6 +265,46 @@ class TestDailyStore:
         two.end_turn()
         assert DailyUsageStore(path).load(today.day).tokens == 12
 
+    def test_two_windows_at_once_share_the_daily_limit(self, tmp_path: Path) -> None:
+        # 壊れると、2 つの窓で同時に指示したとき、それぞれが始めた時の量で確かめ、
+        # 1 日の上限が 100 なら合わせて 200 まで使える
+        path = tmp_path / "ai_usage.json"
+        today = _Today()
+        one = UsageMeter(DailyUsageStore(path), today=today)
+        two = UsageMeter(DailyUsageStore(path), today=today)
+        for meter in (one, two):
+            meter.limits = Limits(turn_tokens=0, day_tokens=100)
+            meter.begin_turn()
+        one.record_message("a", {"output_tokens": 60})
+        assert one.overrun() is None
+        two.record_message("b", {"output_tokens": 60})
+        overrun = two.overrun()
+        assert overrun is not None
+        assert overrun.kind is LimitKind.DAY_TOKENS
+        assert overrun.used == 120
+        # 先に確かめた窓も、次の道具の前にはもう一方の分を読む
+        assert one.overrun() is not None
+        # 確かめるたびに足しても、終わりに 2 重に足さない
+        one.end_turn()
+        two.end_turn()
+        assert DailyUsageStore(path).load(today.day).tokens == 120
+
+    def test_what_was_used_is_saved_before_the_instruction_ends(self, tmp_path: Path) -> None:
+        # 壊れると、指示の途中でアプリが落ちたとき、それまでに使った量が 1 日の置き場に残らず、
+        # 起動し直すとその分だけ 1 日の上限を越えて使える
+        path = tmp_path / "ai_usage.json"
+        today = _Today()
+        meter = UsageMeter(DailyUsageStore(path), today=today)
+        meter.begin_turn()
+        meter.record_message("a", {"output_tokens": 40})
+        meter.record_image()
+        meter.flush()
+        assert DailyUsageStore(path).load(today.day).tokens == 40
+        meter.record_message("b", {"output_tokens": 2})
+        meter.overrun()
+        stored = DailyUsageStore(path).load(today.day)
+        assert (stored.tokens, stored.images) == (42, 1)
+
     def test_a_new_day_starts_from_zero(self, tmp_path: Path) -> None:
         # 壊れると、昨日の量で今日の最初の指示が止まる
         store = DailyUsageStore(tmp_path / "ai_usage.json")

@@ -222,6 +222,24 @@ class TestShowingUsage:
         stored = json.loads((config_root() / USAGE_FILE).read_text(encoding="utf-8"))
         assert [day["tokens"] for day in stored.values()] == [77]
 
+    def test_closing_while_answering_keeps_what_was_used(
+        self, qt_application: QApplication, loaded: Project
+    ) -> None:
+        # 壊れると、AI が応えている途中で窓を閉じた指示の量が 1 日の置き場に残らず、
+        # 起動し直すとその分だけ 1 日の上限を越えて使える
+        del qt_application
+        widget = ChatPanel(FakeHost(loaded))
+        try:
+            widget._queued.append("切って")
+            widget._begin_turn()
+            widget._bridge.usage.record_message("m", {"output_tokens": 55})
+            widget._bridge.usage.record_image()
+            widget.close_session()
+        finally:
+            widget.deleteLater()
+        stored = json.loads((config_root() / USAGE_FILE).read_text(encoding="utf-8"))
+        assert [(day["tokens"], day["images"]) for day in stored.values()] == [(55, 1)]
+
 
 class TestPreferences:
     def test_the_panel_uses_the_limits_from_the_settings(

@@ -104,6 +104,10 @@ IRREVERSIBLE_ALLOW_TEXT = "実行する"
 #: ここを長くすると、AI の操作が画面へ反映されるまでの間が空く
 POLL_MS = 80
 
+#: 使った量を 1 日の置き場へ足す間隔（秒 #344） 道具の前と指示の終わりにも足すので、
+#: これは道具を使わない長い応答の間と、落ちたときのための物
+USAGE_FLUSH_SECONDS = 10.0
+
 #: 実行中にドックのタブの名前の頭へ付ける印 パネルが別のタブの裏にあっても動いていると分かる
 RUNNING_MARK = "● "
 
@@ -262,6 +266,8 @@ class ChatPanel(QWidget):
         self._budget: BudgetRequest | None = None
         #: 止めると決まった後も道具を呼び続けたので、会話を止めた（同じ指示で 2 度止めない）
         self._halted = False
+        #: 使った量を最後に 1 日の置き場へ足した時刻（:data:`USAGE_FLUSH_SECONDS`）
+        self._flushed_at = 0.0
         #: 会話を作ったときの置き方の方式 指示の文をこの方式で書いたので、変わったら作り直す
         self._session_mode = ""
         self._approval: Approval | None = None
@@ -1047,6 +1053,10 @@ class ChatPanel(QWidget):
         if self._session is not None:
             self._session.close()
             self._session = None
+        # 応えている途中で閉じた指示も、使った量を 1 日の置き場へ足す（#344） 足さないと、
+        # 起動し直した後にその分だけ 1 日の上限を越えて使える 会話を畳んだ後に締めるのは、
+        # 畳むまでに届いた知らせも数えるため
+        self._bridge.end_turn()
         self._close_checkpoint()
 
     # --- 1 プロンプト = 1 Undo ---
@@ -1076,6 +1086,11 @@ class ChatPanel(QWidget):
         self._check_question()
         self._check_send()
         self._check_budget()
+        now = self._clock()
+        if now - self._flushed_at >= USAGE_FLUSH_SECONDS:
+            # 道具を使わずに長く書いている間の量も時々足す アプリが落ちても失うのはこの間の分だけ
+            self._flushed_at = now
+            self._bridge.usage.flush()
 
         session = self._session
         if session is not None:
