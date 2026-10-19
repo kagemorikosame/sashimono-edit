@@ -93,6 +93,8 @@ class TestExpandArea:
     def test_expanding_the_right_pushes_the_picture_left(
         self, draw: Callable[..., np.ndarray]
     ) -> None:
+        # 右を広げて絵が左へ半分ずれないと、領域拡張を使う配布の飾り枠が
+        # AviUtl2 と左右で違う所に出る
         before = _extent(draw())
         after = _extent(draw(registry.require("expand_area").create(right=60.0)))
         assert before[0] - after[0] == pytest.approx(30, abs=2)
@@ -134,12 +136,15 @@ class TestMirror:
         return registry.require("mirror").create(**params)
 
     def test_the_reflection_appears_below(self, draw: Callable[..., np.ndarray]) -> None:
+        # 鏡像が下に出ないと、床に映る反射を付けたテロップの下に何も映らない
+        # 上へはみ出すと、文字の上に逆さの字が重なる
         before = _extent(draw())
         after = _extent(draw(self._mirror(side="bottom")))
         assert after[3] > before[3] + 20, "下に鏡像が出ていない"
         assert after[2] == before[2], "上へはみ出している"
 
     def test_the_reflection_can_go_to_the_right(self, draw: Callable[..., np.ndarray]) -> None:
+        # 向きを読まずにいつも下へ写すと、右側に映す設定にしても反射が下に出る
         before = _extent(draw())
         after = _extent(draw(self._mirror(side="right")))
         assert after[1] > before[1] + 20
@@ -160,6 +165,7 @@ class TestMirror:
         assert far[3] - close[3] == pytest.approx(20, abs=3)
 
     def test_full_transparency_hides_the_reflection(self, draw: Callable[..., np.ndarray]) -> None:
+        # 透明度 100 でも鏡像が残ると、反射を消すつもりで透明にしても薄い逆さの絵が下に残る
         before = _extent(draw())
         after = _extent(draw(self._mirror(side="bottom", opacity=100.0)))
         assert after == before

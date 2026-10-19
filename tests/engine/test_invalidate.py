@@ -81,6 +81,7 @@ class TestTheSpans:
         assert Invalidation.over([(5, 5)]).spans == ()
 
     def test_everything_contains_any_frame(self) -> None:
+        # 全部捨てる指示が遠いフレームを含まないと、長い動画の後半で変える前の古い絵が映る
         assert Invalidation.all().contains(99999)
 
     def test_nothing_is_false(self) -> None:
@@ -90,6 +91,8 @@ class TestTheSpans:
 
 class TestWhatDoesNotChangeThePicture:
     def test_the_same_project_changes_nothing(self) -> None:
+        # 同じプロジェクトで範囲を返すと、何も変えていない更新のたびに先読みした絵が消え、
+        # 再生がそのたびに描き直しで止まる
         project = _project(_clip(0, 30))
         assert not changed_spans(project, project)
 
@@ -174,6 +177,7 @@ class TestWhatChangesOnePlace:
         assert result.contains(100)
 
     def test_removing_a_clip_drops_its_frames(self) -> None:
+        # 消したクリップの所を捨てないと、クリップを消してもプレビューにその絵が残って見える
         first, second = _clip(0, 30), _clip(100, 30)
         before = _project(first, second)
         after = _project(first)
@@ -229,6 +233,7 @@ class TestWhatTheRendererDoesNotReadOnClips:
         assert not changed_spans(before, after)
 
     def test_linking_does_not_touch_the_picture(self) -> None:
+        # 映像と音のリンクで捨てると、リンクを付け外しするたびに貯めた絵が消えて描き直しになる
         clip = _clip(0, 30)
         before = _project(clip)
         after = _project(replace(clip, link_group=new_group_id()))
@@ -368,6 +373,7 @@ class TestWhatTheRendererDoesNotRead:
     """
 
     def test_a_transcript_does_not_touch_the_picture(self) -> None:
+        # 字幕を 1 本直すたびにその素材の先読みが消えると、字幕を直しながらの再生がその都度止まる
         media = _media()
         clip = _clip(0, 30, media_id=media.id)
         before = replace(_project(clip), media=(media,))
@@ -375,6 +381,7 @@ class TestWhatTheRendererDoesNotRead:
         assert not changed_spans(before, after), "字幕を直しただけで先読みが消える"
 
     def test_a_display_name_does_not_touch_the_picture(self) -> None:
+        # 表示名で先読みが消えると、素材の名前を付け直すたびにその素材の所が描き直しになる
         media = _media()
         clip = _clip(0, 30, media_id=media.id)
         before = replace(_project(clip), media=(media,))

@@ -67,6 +67,8 @@ def _with_clip(project: Project) -> Project:
 
 class TestSetFrameRate:
     def test_an_empty_project_takes_the_new_rate(self) -> None:
+        # 空のプロジェクトでも選んだレートが本体と時間軸の両方に入らないと、
+        # 60fps の素材を置いても 30fps のまま書き出されて動きが粗くなる
         project = SetFrameRate(FrameRate(60)).apply(Project.create())
         assert project.rate == FrameRate(60)
         assert project.timeline.rate == FrameRate(60)
@@ -82,6 +84,8 @@ class TestSetFrameRate:
             SetFrameRate(FrameRate(60)).apply(_with_clip(Project.create()))
 
     def test_a_clip_inside_a_scene_also_refuses(self) -> None:
+        # メインが空でもシーンの中のクリップを見落とすと、レートを変えた途端に
+        # シーンに置いたクリップの長さが別の秒数になる
         base = Project.create()
         scene = new_scene(base, "中")
         project = AddScene(replace(scene, timeline=_with_clip(base).timeline)).apply(base)
@@ -104,6 +108,7 @@ class TestSetFrameRate:
         assert changed.timeline.work_area == (30, 90)
 
     def test_it_can_be_undone(self) -> None:
+        # 取り消しても 50fps のまま残ると、Ctrl+Z で戻したつもりの作品が別のレートで書き出される
         document = Document(Project.create())
         document.execute(SetFrameRate(FrameRate(50)))
         document.undo()
@@ -130,6 +135,8 @@ class TestRateForProject:
 
 class TestFormatToMatch:
     def test_the_first_video_of_an_empty_project(self) -> None:
+        # 最初の動画の形を拾えないと、1280x720 60fps の素材が 1920x1080 30fps の作品に入り、
+        # 引き伸ばされたうえにコマが間引かれる
         found = format_to_match(Project.create(), [_video()])
         assert found is not None
         assert (found.width, found.height, found.rate) == (1280, 720, FrameRate(60))
@@ -139,6 +146,7 @@ class TestFormatToMatch:
         assert format_to_match(Project.create(), [_video(1920, 1080, FrameRate(30))]) is None
 
     def test_nothing_once_a_clip_is_placed(self) -> None:
+        # 2 本目の素材でも尋ねると、そこで合わせた途端に置いてあるクリップの長さが全部ずれる
         assert format_to_match(_with_clip(Project.create()), [_video()]) is None
 
     def test_a_portrait_phone_video_uses_the_turned_size(self) -> None:
@@ -154,10 +162,13 @@ class TestFormatToMatch:
         assert (found.width, found.height) == (854, 482)
 
     def test_a_still_image_is_not_a_video(self) -> None:
+        # 静止画を動画と取り違えると、画像を最初に置いただけで画像の大きさへ合わせるか尋ねられる
         still = replace(_video(), duration=Fraction(0))
         assert format_to_match(Project.create(), [still]) is None
 
     def test_the_commands_change_only_what_differs(self) -> None:
+        # 違わない方まで入れると、レートだけ違う 1080p の動画でも「解像度を変更」の手順が走り、
+        # 合わせる段に要らない変更が混ざる
         project = Project.create()
         wanted = format_to_match(project, [_video(1920, 1080, FrameRate(60))])
         assert wanted is not None

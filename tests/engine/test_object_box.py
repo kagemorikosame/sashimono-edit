@@ -170,6 +170,7 @@ CASES = list(cases())
 
 @pytest.mark.parametrize(("name", "image"), CASES, ids=[name for name, _ in CASES])
 def test_the_box_is_the_same_as_before(name: str, image: np.ndarray) -> None:
+    # 範囲が 1 画素でも狭いと、角丸や回転の中心や影の広がりの基準がずれ、絵の端が 1 列切れる
     assert _content_box(image) == reference_box(image), name
 
 
@@ -378,6 +379,7 @@ def test_a_changing_generated_picture_is_scanned_every_frame(
 def test_a_changing_generated_picture_matches_the_old_box(
     gl: OffscreenGLContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # 覚えた範囲を伸びる図形に使い回すと、再生していくうちに角丸や影が前のコマの大きさのまま描かれる
     clip = Clip(timeline_start=0, duration=10, source=growing_shape(), effects=EFFECTS["全部"])
     project = project_of(clip, ())
     now = frames_of(project, gl, count=5)

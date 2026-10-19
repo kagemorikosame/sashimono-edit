@@ -37,6 +37,8 @@ class TestEmptyMeansTheOldFields:
         assert spec.coerce(None) == ()
 
     def test_the_bar_shows_the_start_and_end_colours(self) -> None:
+        # バーに開始色と終了色が出ないと、前からの作品の設定パネルに既定の白から黒が並び、
+        # 触っただけで色が置き換わる
         params = registry.require("gradient").create(start_color=GREEN, end_color=RED).params
         assert _spec("gradient").shown(params) == (0.0, *GREEN, 1.0, *RED)
 
@@ -57,6 +59,7 @@ class TestEmptyMeansTheOldFields:
         assert _spec("brush_fill").shown(params) == (0.0, *RED, 1.0, *RED)
 
     def test_the_bar_wins_once_it_has_stops(self) -> None:
+        # 止まりを並べた後も前からの 2 色をバーに出すと、バーで足した色が画面から消え、直せなくなる
         stops = (0.0, *GREEN, 1.0, *BLUE)
         params = registry.require("gradient").create(gradient=stops).params
         assert _spec("gradient").shown(params) == stops
@@ -81,6 +84,7 @@ class TestTheSCurve:
         assert [value for value, _ in spec.choices] == ["smooth", "linear"]
 
     def test_the_smoothed_stops_follow_the_s_curve(self) -> None:
+        # 見本を直線で刻むと、設定パネルのバーの色の移り方が書き出した絵の S 字の混ざり方と食い違う
         stops = [(0.0, RED), (1.0, BLUE)]
         smoothed = GradientSpec.smoothed(stops)
         assert smoothed[0] == stops[0] and smoothed[-1] == stops[-1]

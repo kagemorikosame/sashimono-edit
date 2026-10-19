@@ -77,6 +77,8 @@ def _project(effects: tuple[Effect, ...], source: GeneratedSource) -> Project:
 
 @pytest.mark.parametrize("kind", sorted(d.kind for d in registry.all()))
 def test_odd_values_do_not_break_rendering(kind: str, gl_context: OffscreenGLContext) -> None:
+    # 配布された作品の 1 つのエフェクトにおかしな値があるだけで、プレビューが止まり
+    # 書き出しが途中で落ちる
     definition = registry.get(kind)
     assert definition is not None
     rng = random.Random(f"{kind}-20260917")

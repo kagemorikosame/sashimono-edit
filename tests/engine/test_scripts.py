@@ -139,6 +139,7 @@ class TestTransform:
     def test_without_a_script_the_shape_is_centred(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # 値を 0 のまま積んだだけで位置がずれると、配布の効果を当てた途端に置いた物が中央から外れる
         del catalog
         left, right, top, bottom = bounds(render(build("aviutl:試験.anm:移動"), gl_context))
         assert (left + right) // 2 == pytest.approx(SCREEN[0] // 2, abs=2)
@@ -147,6 +148,7 @@ class TestTransform:
     def test_ox_moves_the_object(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # obj.ox が描画に届かないと、配布の効果で横へ動くはずの物がその場に止まったまま書き出される
         del catalog
         left, right, _, _ = bounds(render(build("aviutl:試験.anm:移動", track0=80), gl_context))
         assert (left + right) // 2 == pytest.approx(SCREEN[0] // 2 + 80, abs=2)
@@ -154,6 +156,7 @@ class TestTransform:
     def test_rz_rotates_around_the_centre(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # 回転の中心が物の中央からずれると、回すスクリプトを当てた物が回りながら横へずれていく
         del catalog
         left, right, top, bottom = bounds(
             render(build("aviutl:試験.anm:移動", track1=45), gl_context)
@@ -166,6 +169,7 @@ class TestTransform:
     def test_zoom_scales_the_object(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # obj.zoom が届かないと、拡大・縮小で出入りする配布の効果が大きさを変えずに出る
         del catalog
         left, right, _, _ = bounds(render(build("aviutl:試験.anm:移動", track2=200), gl_context))
         assert right - left == pytest.approx(80, abs=3)
@@ -173,6 +177,7 @@ class TestTransform:
     def test_rotation_does_not_leak_into_the_next_draw(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # 回転の状態が描画係に残ると、回すスクリプトを使った後に描いた別のクリップまで傾いて出る
         del catalog
         # 回転を掛けた直後に、掛けていないものを描いても回らないこと
         render(build("aviutl:試験.anm:移動", track1=30), gl_context)
@@ -242,6 +247,7 @@ class TestMultipleDraws:
     def test_a_script_can_draw_several_times(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # obj.draw の 2 回目以降を捨てると、残像のように何枚も描く配布スクリプトが 1 枚しか出さない
         del catalog
         image = render(build("aviutl:試験.anm:残像", track0=3), gl_context)
         left, right, _, _ = bounds(image)
@@ -252,6 +258,7 @@ class TestMultipleDraws:
     def test_the_alpha_of_each_draw_is_honoured(
         self, gl_context: OffscreenGLContext, catalog: ScriptCatalog
     ) -> None:
+        # obj.draw ごとの不透明度を無視すると、残像が後ろまで同じ濃さで出て、ただの複製に見える
         del catalog
         image = render(build("aviutl:試験.anm:残像", track0=3), gl_context)
         middle = SCREEN[1] // 2
@@ -296,6 +303,8 @@ class TestALighterPreview:
         identifier: str,
         params: dict[str, float],
     ) -> None:
+        # 縮めた合成の画素でスクリプトを走らせると、軽くしたプレビューで位置や残像の間隔が
+        # 2 倍や 4 倍に出て、書き出しと見た目が食い違う
         del catalog
         project = build(identifier, **params)
         full = bounds(render(project, gl_context))

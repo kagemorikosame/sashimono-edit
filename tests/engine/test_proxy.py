@@ -104,9 +104,11 @@ class TestWhenItIsWorthIt:
     """小さい素材まで変換すると、待たされるだけで速くならない"""
 
     def test_a_4k_source_is_worth_it(self, tmp_path: Path) -> None:
+        # 4K の素材に控えが作られないと、プレビューが重いままコマ落ちする
         assert is_worth_proxying(_media(tmp_path / "a.mp4", 3840, 2160))
 
     def test_a_1080p_source_is_not(self, tmp_path: Path) -> None:
+        # 1080p の素材まで控えを作ると、置くたびに変換を待たされるのに再生は速くならない
         assert not is_worth_proxying(_media(tmp_path / "a.mp4", 1920, 1080))
 
     def test_the_boundary_is_the_stated_height(self, tmp_path: Path) -> None:
@@ -119,11 +121,13 @@ class TestWhenItIsWorthIt:
         assert not is_worth_proxying(_media(tmp_path / "a.png", 4000, 3000, still=True))
 
     def test_audio_only_is_not(self, tmp_path: Path) -> None:
+        # 映像の無い素材を控えの変換に回すと、作れない控えのために無駄な処理が走る
         assert not is_worth_proxying(MediaItem(path=tmp_path / "a.wav", duration=Fraction(2)))
 
 
 class TestMakingOne:
     def test_it_shrinks_the_picture(self, sample_av: SampleMedia, tmp_path: Path) -> None:
+        # 控えが元の大きさのまま作られると、変換を待ったのにプレビューが軽くならない
         target = tmp_path / "proxy.mp4"
         assert create_proxy(sample_av.path, target, height=120) == target
         made = probe_media(target)
@@ -295,6 +299,8 @@ class TestMakingOne:
         assert len(tried) == 1, f"やめたのに {len(tried)} 個の候補を試した: {tried}"
 
     def test_it_reports_progress(self, sample_av: SampleMedia, tmp_path: Path) -> None:
+        # 控えを作る進み具合が 100% まで行かないか途中で戻ると、
+        # 変換が終わったのか止まったのか見分けられない
         seen: list[float] = []
         create_proxy(sample_av.path, tmp_path / "proxy.mp4", height=120, progress=seen.append)
         assert seen and seen[-1] == 1.0
@@ -331,6 +337,8 @@ class TestMakingOne:
 
 class TestTheStore:
     def test_it_is_absent_until_made(self, sample_av: SampleMedia, tmp_path: Path) -> None:
+        # 作る前から控えがあると答えると無いファイルを開き、
+        # 作ったあとも見つけられないと重い元の素材で再生し続ける
         store = ProxyStore(CacheStore(tmp_path), height=120)
         media = _media(sample_av.path, sample_av.width, sample_av.height)
         assert store.find(media) is None
@@ -632,6 +640,8 @@ class TestBuildingInTheBackground:
             time.sleep(0.02)
 
     def test_it_makes_one(self, sample_av: SampleMedia, tmp_path: Path) -> None:
+        # 裏で頼んだ控えができないか、できたと知らされないと、
+        # プレビューが重い元の素材のまま切り替わらない
         store = ProxyStore(CacheStore(tmp_path), height=120)
         builder = ProxyBuilder(store)
         media = replace(probe_media(sample_av.path), video_streams=_tall(sample_av.path))
@@ -674,6 +684,7 @@ class TestBuildingInTheBackground:
     def test_it_reports_progress_while_running(
         self, sample_av: SampleMedia, tmp_path: Path
     ) -> None:
+        # 裏で作っている控えの進み具合が出ないか、作り終えても残ると、作り続けているように見える
         store = ProxyStore(CacheStore(tmp_path), height=120)
         builder = ProxyBuilder(store)
         media = replace(probe_media(sample_av.path), video_streams=_tall(sample_av.path))

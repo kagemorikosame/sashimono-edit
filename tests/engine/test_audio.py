@@ -88,9 +88,19 @@ class TestWaveform:
             assert coarser.count < finer.count
 
     def test_covers_the_whole_media(self, sample_av: SampleMedia) -> None:
+        # 波形の解析が素材の途中で止まると、タイムラインのクリップの後半に波形が描かれず、
+        # 無音に見えて切る所を見誤る
         waveform = analyze_waveform(sample_av.path)
         assert waveform is not None
         assert float(waveform.duration) == pytest.approx(2.0, abs=0.1)
+        # 長さは解析の前にデコーダから決まるので、ピークが途中で途切れても上の検査は
+        # 通る（#383 の CodeRabbit） ピークが素材の終わりまで並び、終わりの 4 分の 1 にも
+        # 音の振れが残っていることを見る 素材は頭から終わりまで鳴り続ける 440 Hz の音
+        finest = waveform.levels[0]
+        assert finest.count * finest.samples_per_peak >= waveform.total_samples
+        tail = finest.peaks[finest.count * 3 // 4 :]
+        assert len(tail) > 0
+        assert float(np.abs(tail).max()) > 0.01
 
     def test_peaks_bracket_the_signal(self, sample_av: SampleMedia) -> None:
         # min は必ず max 以下 逆転していれば描画が破綻する
@@ -100,6 +110,8 @@ class TestWaveform:
             assert np.all(level.peaks[:, :, 0] <= level.peaks[:, :, 1])
 
     def test_level_matches_the_zoom(self, sample_av: SampleMedia) -> None:
+        # 倍率に合わない段階を選ぶと、拡大したときに波形が粗い階段になり、縮小したときは
+        # 読む量が増えてタイムラインの描画が重くなる
         waveform = analyze_waveform(sample_av.path)
         assert waveform is not None
         # 極端に拡大したら最も細かい段階
@@ -108,6 +120,8 @@ class TestWaveform:
         assert waveform.level_for(10**9).samples_per_peak == waveform.levels[-1].samples_per_peak
 
     def test_envelope_shape(self, sample_av: SampleMedia) -> None:
+        # 形や最小と最大の順が崩れると、タイムラインの波形が裏返った縦線や欠けた列で
+        # 描かれる
         waveform = analyze_waveform(sample_av.path)
         assert waveform is not None
         envelope = waveform.envelope(0, waveform.total_samples, 200)
@@ -126,6 +140,8 @@ class TestWaveform:
         assert amplitude[27] > 0.01, "後半に音が無い"
 
     def test_envelope_handles_degenerate_input(self, sample_av: SampleMedia) -> None:
+        # 幅 0 や長さ 0 の範囲で落ちると、極端に縮めたタイムラインや長さ 0 の範囲を
+        # 描くたびに波形の描画が止まる
         waveform = analyze_waveform(sample_av.path)
         assert waveform is not None
         assert waveform.envelope(0, 0, 10).shape == (10, 2, 2)
@@ -136,6 +152,8 @@ class TestWaveform:
         assert analyze_waveform(sample_av.path, should_cancel=lambda: True) is None
 
     def test_reports_progress(self, sample_av: SampleMedia) -> None:
+        # 進み具合が戻ったり 1.0 に届かなかったりすると、素材の解析の進み具合の表示が
+        # 行き来するか、終わったのに解析中のまま残る
         seen: list[float] = []
         analyze_waveform(sample_av.path, progress=seen.append)
         assert seen
@@ -164,6 +182,8 @@ def rms(samples: np.ndarray) -> float:
 
 class TestMixer:
     def test_renders_requested_length(self, audio_project: Project) -> None:
+        # 頼んだ長さで返らないと、再生や書き出しの音の塊が詰まったり欠けたりして、
+        # 絵と音が少しずつずれる
         mixer = AudioMixer(audio_project)
         try:
             block = mixer.render(0, 4800)
@@ -199,6 +219,8 @@ class TestMixer:
         assert rms(after) > 0.0
 
     def test_track_volume(self, audio_project: Project) -> None:
+        # トラックの音量が効かないと、下げた BGM のトラックが再生でも書き出しでも
+        # 元の大きさのまま鳴る
         mixer = AudioMixer(audio_project)
         try:
             full = mixer.render(0, 24000)
@@ -219,6 +241,8 @@ class TestMixer:
         assert rms(reduced) / rms(full) == pytest.approx(0.5, abs=0.02)
 
     def test_muted_track_is_silent(self, audio_project: Project) -> None:
+        # ミュートが効かないと、消したつもりのトラックの音が再生にも書き出した動画にも
+        # 入る
         track = audio_project.timeline.tracks[0]
         project = audio_project.with_timeline(
             audio_project.timeline.replace_track(replace(track, muted=True))
@@ -254,6 +278,8 @@ class TestMixer:
         assert rms(soloed) == pytest.approx(rms(single), rel=0.01)
 
     def test_two_tracks_add_up(self, audio_project: Project) -> None:
+        # トラックを足し合わせずに片方で上書きすると、声と BGM を別のトラックに置いたときに
+        # 片方しか聞こえない
         media = audio_project.media[0]
         second = Track(kind=TrackKind.AUDIO, name="A2")
         project = AddTrack(second).apply(audio_project)
@@ -380,6 +406,8 @@ class TestMixer:
         assert rms(tail) == 0.0
 
     def test_render_frames(self, audio_project: Project) -> None:
+        # フレームからサンプルへの換算を誤ると、書き出しで 1 コマごとに付ける音の長さが
+        # 狂い、長い動画ほど音が絵から遅れるか先走る
         mixer = AudioMixer(audio_project)
         try:
             block = mixer.render_frames(0, 30)
@@ -391,6 +419,8 @@ class TestMixer:
     def test_video_only_media_contributes_nothing(
         self, sample_long: SampleMedia, audio_project: Project
     ) -> None:
+        # 音の無い動画を置いたトラックで落ちると、無音の画面録画などを置いただけで
+        # 再生も書き出しも止まる
         media = probe_media(sample_long.path)
         project = AddMedia(media).apply(audio_project)
         track = project.timeline.tracks[0]
@@ -406,6 +436,8 @@ class TestMixer:
             mixer.close()
 
     def test_offline_media_is_silent_instead_of_crashing(self, audio_project: Project) -> None:
+        # 素材を移したり消したりした作品では、そのクリップだけ無音で再生を続ける 落ちると
+        # 素材 1 本の行方不明で作品全体が鳴らせなくなる
         original = audio_project.media[0]
         broken = replace(original, path=original.path.parent / "行方不明.wav")
         project = audio_project.replace_media(broken)
@@ -416,6 +448,8 @@ class TestMixer:
             mixer.close()
 
     def test_closed_mixer_refuses(self, audio_project: Project) -> None:
+        # 閉じた後も読めてしまうと、素材を開き直して持ったままになり、閉じたつもりの
+        # 素材のファイルが掴まれ続ける
         mixer = AudioMixer(audio_project)
         mixer.close()
         with pytest.raises(RuntimeError, match="閉じたミキサ"):

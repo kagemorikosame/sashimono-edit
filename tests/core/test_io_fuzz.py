@@ -81,6 +81,7 @@ def source(rich_project: Project) -> dict[str, Any]:
 
 
 def test_broken_files_fail_only_as_file_errors(source: dict[str, Any]) -> None:
+    # 書き込みが途中で止まった作品や配布された作品を開くと、「開けない」と出ずにソフトごと落ちる
     rng = random.Random(20260917)
     leaks: list[str] = []
     for _ in range(_FILES):

@@ -155,6 +155,7 @@ class TestFillingAhead:
             renderer.close()
 
     def test_an_edit_takes_back_only_its_range(self, gl_context: OffscreenGLContext) -> None:
+        # 直した所を捨て損ねると古い絵のまま再生され、外まで捨てると編集のたびに先読みが空になる
         renderer = FrameRenderer(_gray_project(), context=gl_context)
         try:
             with gl_context:

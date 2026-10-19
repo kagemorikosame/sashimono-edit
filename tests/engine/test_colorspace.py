@@ -170,6 +170,8 @@ class TestReading:
         matrix: Colorspace,
         tag: int | None,
     ) -> None:
+        # 行列の当て方を誤ると、読み込んだ素材が編集画面で赤がくすみ緑が黄色へ寄るなど
+        # 元と違う色で出る
         path = write_bars(tmp_path / name, width, height, matrix=matrix, tag=tag)
         with VideoDecoder(path) as decoder:
             image = decoder.frame_at(Fraction(0))
@@ -217,10 +219,13 @@ class TestRange:
     """
 
     def test_full_range_is_read_as_full(self) -> None:
+        # full の素材を limited として読むと、暗い所が黒へ明るい所が白へ潰れ、影や空の階調が消える
         image = to_rgb_array(gray_steps(ColorRange.JPEG), "rgb24")
         assert gray_levels(image[:, :, 0]) == [16, 128, 235]
 
     def test_limited_range_is_read_as_limited(self) -> None:
+        # 普通の動画（limited）を full として読むと、黒が灰色に白がくすんで、
+        # 素材が全体に白っぽく霞む
         image = to_rgb_array(gray_steps(ColorRange.MPEG), "rgb24")
         assert gray_levels(image[:, :, 0]) == [0, 130, 255]
 

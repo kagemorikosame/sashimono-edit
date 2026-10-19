@@ -57,6 +57,7 @@ def test_a_fade_that_grows_longer_quiets_the_end() -> None:
 
 
 def test_values_that_do_not_move_draw_as_before() -> None:
+    # 動かないディレイの波形でやまびこの位置や大きさがずれると、聞こえる音と見える波形が合わなくなる
     _, high = _shape("audio_delay", _click(), time=500, feedback=50, mix=100)
     assert high[165] == np.float32(1.0)
     assert high[180] == np.float32(0.5)

@@ -42,7 +42,7 @@ SKIP_PREFIXES = ("tests/fixtures/",)
 #: （CodeRabbit が見るのは 1 PR 100 ファイルまで） 書き添えを埋めた置き場から順に広げ、
 #: 全部埋まったら tests 全体にする 抜けた試験の控えを持つ形にしないのは、控えが
 #: やり残しの一覧として残り続けるため ``--all`` でまだ見張っていない置き場も数えられる
-WATCHED_PREFIXES = ("tests/ai/", "tests/ui/")
+WATCHED_PREFIXES = ("tests/ai/", "tests/ui/", "tests/core/", "tests/engine/")
 
 
 @dataclass(frozen=True, slots=True)

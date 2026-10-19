@@ -185,6 +185,7 @@ def test_the_old_scene_lasts_until_the_end(gl_context: OffscreenGLContext) -> No
 
 
 def test_effects_go_to_their_own_scene(gl_context: OffscreenGLContext) -> None:
+    # 前の場面のエフェクトが後の場面にも掛かると、前の場面を透明にしたつもりで切り替えの先まで消える
     opacity = registry.get("opacity")
     assert opacity is not None
     project = _project("overlay", target="before")
@@ -269,6 +270,7 @@ def test_scene_tiles_are_the_size_of_the_contents_and_masks_sit_on_the_origin(
 
 
 def test_after_effects_survive_saving() -> None:
+    # 保存で後の場面のエフェクトが落ちると、開き直した場面切り替えから後の場面の加工が消える
     opacity = registry.get("opacity")
     assert opacity is not None
     project = _project("fade")
@@ -287,6 +289,7 @@ def test_after_effects_survive_saving() -> None:
     ["linear", "sine", "quad", "cubic", "quart", "quint", "expo", "circ", "back", "bounce"],
 )
 def test_easing_starts_at_zero_and_ends_at_one(kind: str, mode: str) -> None:
+    # 両端が 0 と 1 から外れると、場面切り替えの頭か終わりで前の場面が残るか後の場面へ跳ぶ
     assert ease(0.0, kind, mode) == pytest.approx(0.0, abs=1e-3)
     assert ease(1.0, kind, mode) == pytest.approx(1.0, abs=1e-3)
 
@@ -300,6 +303,8 @@ class TestEditingTheScenes:
         return project, clip.id
 
     def test_effects_go_to_the_stack_you_asked_for(self) -> None:
+        # 後の場面へ積むよう頼んだエフェクトが前に入ると、
+        # 切り替えの先に掛けた効果が手前の場面に掛かる
         project, clip_id = self._clip()
         opacity = registry.get("opacity")
         assert opacity is not None
@@ -311,6 +316,8 @@ class TestEditingTheScenes:
         assert clip.after_effects[0].params["amount"].static == 90.0  # type: ignore[union-attr]
 
     def test_a_parameter_change_finds_the_after_stack(self) -> None:
+        # 後の場面のエフェクトの値を探せないと、設定パネルで後の場面の不透明度を
+        # 動かしても絵が変わらない
         project, clip_id = self._clip()
         opacity = registry.get("opacity")
         assert opacity is not None
@@ -321,6 +328,8 @@ class TestEditingTheScenes:
         assert resolve_param(project, path) == AnimatedValue(40.0)
 
     def test_removing_from_the_after_stack_leaves_the_front_alone(self) -> None:
+        # 後の場面から消すときに前の場面の物まで消えると、
+        # 片方を外しただけで切り替え全体の加工が無くなる
         project, clip_id = self._clip()
         opacity = registry.get("opacity")
         assert opacity is not None

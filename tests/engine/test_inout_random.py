@@ -254,6 +254,7 @@ class TestRandomDirection:
     def test_it_is_away_at_the_start_and_home_at_the_end(
         self, draw: Callable[..., np.ndarray]
     ) -> None:
+        # 登場の頭で既に画面に出ていると飛んでくる動きにならず、着かないと最後まで画面から消えたまま
         assert not _lit(draw(self._fly(), 0)).any(), "始めから画面に居座っている"
         assert _lit(draw(self._fly(), DURATION - 1)).any(), "着いていない"
 

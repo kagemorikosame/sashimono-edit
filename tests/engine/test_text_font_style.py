@@ -115,12 +115,18 @@ class TestEmbeddedLuaSeesTheDrawnFont:
         return font["bold"], font["italic"], given[5], given[6]
 
     def test_greyed_bold_and_italic_are_not_passed(self) -> None:
+        # 灰色で効いていない太字と斜体を渡すと、字は変わらないのに obj.getfont を読む
+        # 埋め込み Lua の結果だけが太字向けに変わる
         assert self._font(font_style=LIGHT, bold=True, italic=True) == (False,) * 4
 
     def test_a_bold_style_is_passed_as_bold(self) -> None:
+        # Bold のスタイルを太字でないと伝えると、obj.getfont を読む埋め込み Lua が
+        # 太く描いた字を細字として展開する
         assert self._font(font_style=BOLD) == (True, False, True, False)
 
     def test_without_a_style_the_checks_are_passed_as_before(self) -> None:
+        # スタイルを選ばないテキストで太字と斜体が渡らないと、
+        # 前の版で作った埋め込み Lua の展開が変わる
         assert self._font(bold=True, italic=True) == (True,) * 4
         assert self._font() == (False,) * 4
 
@@ -145,6 +151,8 @@ class TestRealFamilyWithNumberedStyles:
         [("Ruika", "05", "09"), ("ルイカ", "０５", "０９")],
     )
     def test_numbered_styles_change_the_weight(self, family: str, thin: str, thick: str) -> None:
+        # 数字の名前のスタイルを読み分けないと、ルイカのような配布フォントで
+        # 05 と 09 が同じ太さで出る
         styles = QFontDatabase.styles(family)
         if thin not in styles or thick not in styles:
             pytest.skip(f"{family} の {thin} と {thick} が入っていない")

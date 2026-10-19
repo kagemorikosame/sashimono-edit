@@ -130,6 +130,7 @@ def _assert_same(before: Project, after: Project, context: OffscreenGLContext) -
 def test_separated_to_mixed_looks_and_sounds_the_same(
     sample_av: SampleMedia, music: Path, gl_context: OffscreenGLContext
 ) -> None:
+    # 音声トラックの音量や定位を写し損ねると、レイヤーへまとめただけで BGM が大きくなり左右も変わる
     before = _built(LayerMode.SEPARATED, sample_av, music)
     after = _to(before, LayerMode.MIXED)
     assert {t.kind for t in after.timeline.tracks} == {TrackKind.MIXED}
@@ -139,6 +140,8 @@ def test_separated_to_mixed_looks_and_sounds_the_same(
 def test_mixed_to_separated_looks_and_sounds_the_same(
     sample_av: SampleMedia, music: Path, gl_context: OffscreenGLContext
 ) -> None:
+    # 分けるときに重なり順や音のストリームを取り落とすと、半透明の動画の奥と手前が
+    # 入れ替わったり声が消えたりする
     before = _built(LayerMode.MIXED, sample_av, music)
     layers = list(before.timeline.tracks)
     # レイヤーの音量と定位も付ける 分けたとき音声トラックへ移さないと消える
