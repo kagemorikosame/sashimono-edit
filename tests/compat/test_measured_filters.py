@@ -172,6 +172,8 @@ class TestYmm4Outline:
         assert _value(effect.params["offset_x"]) == pytest.approx(30.0)
 
     def test_only_the_edge_moves(self, draw: Callable[..., np.ndarray]) -> None:
+        # 縁だけでなく本体まで動くか、縁が動かないと、YMM4 で縁をずらした字や図形の
+        # 縁の位置が YMM4 と食い違う
         border = registry.require("border").create(
             width=10, color=(0.0, 1.0, 1.0, 1.0), offset_y=20
         )
@@ -293,6 +295,7 @@ class TestYmm4Noise:
     def test_the_mean_opacity_matches_ymm4(
         self, draw: Callable[..., np.ndarray], strength: float, mean: float
     ) -> None:
+        # 強さと不透明度の対応がずれると、YMM4 の雨や砂嵐のノイズを読み込んだ絵が濃すぎるか薄すぎる
         (effect,) = map_video_effects([_noise(strength)], CompatibilityReport()).effects
         assert effect.kind == "brush_fill"
         assert effect.params["noise_mask"] == "alpha"
@@ -468,6 +471,8 @@ class TestAviUtlColorCorrection:
         change: tuple[str, str],
         expected: tuple[int, int, int],
     ) -> None:
+        # 項目ごとの換算がずれると、AviUtl2 で色調補正を掛けたオブジェクトが
+        # 読み込み後に明るさや色相の違う色で出る
         colour = (self.ORANGE[0] / 255.0, self.ORANGE[1] / 255.0, self.ORANGE[2] / 255.0)
         image = draw(_square(200, colour), (self._effect(**{change[0]: change[1]}),))
         assert tuple(int(v) for v in image[200, 200]) == pytest.approx(expected, abs=4)
@@ -506,6 +511,8 @@ class TestAviUtlSlantClip:
         assert _box(self._clipped(draw, "100")) == pytest.approx((100, 150, 300, 250), abs=2)
 
     def test_a_negative_width_drops_a_band(self, draw: Callable[..., np.ndarray]) -> None:
+        # 負の幅で帯を消せないと、AviUtl2 で真ん中の帯を抜いた斜めクリッピングが
+        # 帯の残った絵や片側の欠けた絵で読み込まれる
         image = self._clipped(draw, "-100")
         assert _box(image) == pytest.approx((100, 100, 300, 300), abs=1)
         assert int(image[200, 200].max()) < 20

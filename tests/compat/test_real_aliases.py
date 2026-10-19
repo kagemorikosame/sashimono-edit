@@ -68,6 +68,8 @@ def mapped() -> list[tuple[Path, MappedObject]]:
 
 
 def test_every_file_maps_to_at_least_one_clip(mapped: list[tuple[Path, MappedObject]]) -> None:
+    # 1 つも写せない配布エイリアスは、
+    # AviUtl のオブジェクトの読み込みやテンプレートの棚から置いても何も入らない
     written = {path for path, _ in mapped}
     missing = [path.name for path in FILES if path not in written]
     assert not missing, f"写せなかった: {missing}"

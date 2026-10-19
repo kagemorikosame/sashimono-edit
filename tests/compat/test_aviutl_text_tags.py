@@ -239,12 +239,16 @@ class TestDroppedParts:
     """
 
     def test_a_strike_through_is_counted(self) -> None:
+        # 3 通りの書き方のどれかで数え漏れると、取り消し線のはずの字が素の字で出ても
+        # 互換性レポートに残らず気付けない
         report = CompatibilityReport()
         parse_tags("<@メイリオ,3S>H<@>H<s,,S>H<@+S>H", 100.0, report)
         assert report.missing[DROPPED_STRIKE] == 3
         assert any(DROPPED_STRIKE in line for line in report.lines())
 
     def test_tags_that_are_read_whole_leave_no_record(self) -> None:
+        # 読めている制御文字まで記録すると、互換性レポートが写せている物の行で埋まり、
+        # 本当に足りない穴が多い順の上に来ない
         report = CompatibilityReport()
         parse_tags(
             "<@メイリオ,3B>H<@><#ff0000,0000ff>H<#><s*2,,I,4>H<s><gw4>H<tr+5>H", 100.0, report

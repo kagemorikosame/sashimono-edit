@@ -46,6 +46,7 @@ def test_nothing_is_granted_by_default() -> None:
 
 
 def test_installing_jobs_cannot_write() -> None:
+    # 依存を入れるジョブが書けると、PyPI の依存のどれかが悪さをしたときにリリースを書き換えられる
     jobs = _all_jobs()
     installing = [name for name, text in jobs.items() if "pip install" in text]
     assert installing
@@ -54,6 +55,7 @@ def test_installing_jobs_cannot_write() -> None:
 
 
 def test_writing_jobs_install_nothing() -> None:
+    # 書けるジョブで依存を入れたり checkout したりすると、その中のコードが書けるトークンに届く
     jobs = _all_jobs()
     writing = [name for name, text in jobs.items() if "contents: write" in text]
     assert writing

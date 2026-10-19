@@ -65,6 +65,8 @@ class TestTheContract:
         assert parse_manifest(encoded(data)).version == "1.2.3"
 
     def test_it_round_trips(self) -> None:
+        # 書いた目録が読み戻して同じにならないと、update_sign.py manifest が
+        # 作り直しの照らしで止まり、リリースする人が目録を出せない
         manifest = parse_manifest(encoded(document()))
         assert parse_manifest(manifest_to_json(manifest)) == manifest
 
@@ -94,6 +96,8 @@ class TestBrokenManifests:
         ],
     )
     def test_a_wrong_field_is_refused(self, changes: dict[str, Any]) -> None:
+        # 欠けた・型の違う値を通すと、update_sign.py が壊れた目録にも署名し、配った版はその値で
+        # 入れるかを決める
         with pytest.raises(ManifestError):
             parse_manifest(encoded(document(**changes)))
 

@@ -49,12 +49,16 @@ class TestWhatIsInstalled:
         assert installed_packs(tmp_path, (ASR, AI)) == [(ASR, True), (AI, False)]
 
     def test_nothing_installed(self, tmp_path: Path) -> None:
+        # 何も入っていないのに見積もりを返すと、確認の窓に入れ直す物の無い
+        # 「約 1 MB（目安）」の行が出る
         assert installed_packs(tmp_path, (ASR, AI)) == []
         assert estimate(tmp_path, (ASR, AI)) is None
 
 
 class TestMeasuring:
     def test_the_folder_is_measured(self, tmp_path: Path) -> None:
+        # 深いフォルダを数え落とすと、確認の窓の落とし直す量が実際より小さく出て、大きな落とし直しを
+        # 軽く見て選ぶ
         _install(tmp_path, "faster_whisper", size=1000)
         (tmp_path / "faster_whisper" / "深い" / "所").mkdir(parents=True)
         (tmp_path / "faster_whisper" / "深い" / "所" / "x.pyd").write_bytes(b"y" * 500)
@@ -90,11 +94,14 @@ class TestMeasuring:
 
 class TestEstimate:
     def test_a_measured_size_is_used(self, tmp_path: Path) -> None:
+        # 測れたのに目安を使うと、確認の窓に今入れてある分と違う落とし直しの量を出す
         _install(tmp_path, "faster_whisper", "claude_agent_sdk", size=2048)
         found = estimate(tmp_path, (ASR, AI))
         assert found == Reinstall(("字幕起こし", "AI 連携"), 4096, measured=True)
 
     def test_a_guess_is_used_when_measuring_gives_up(self, tmp_path: Path) -> None:
+        # 目安に追加（CUDA ランタイム）を足し忘れると、2 GB を超える落とし直しを
+        # 550 MB と小さく見せる
         _install(tmp_path, "faster_whisper", "nvidia_cublas_cu12", "claude_agent_sdk")
         ticks: Iterator[float] = iter(float(i) for i in range(100))
         found = estimate(tmp_path, (ASR, AI), seconds=0.5, clock=lambda: next(ticks))
@@ -111,6 +118,7 @@ class TestEstimate:
     def test_the_line_says_what_how_much_and_how_long(
         self, size: int, measured: bool, expected: str
     ) -> None:
+        # 機能・量・時間のどれかが抜けると、遅い回線の人が数分で済むと読んで締め切り前に選ぶ
         text = describe(Reinstall(("字幕起こし", "AI 連携"), size, measured))
         assert "字幕起こし・AI 連携" in text
         assert expected in text

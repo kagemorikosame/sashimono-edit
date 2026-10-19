@@ -24,6 +24,8 @@ HIGH = lua_string('"a\\255b"')
 
 
 def test_the_value_holds_the_raw_byte() -> None:
+    # \255 を 1 バイトの文字として持てないと、ダイアログのその値が AviUtl1 と違う
+    # バイト列でスクリプトに届く
     assert HIGH == "a\udcffb"
     # 読めないバイトは Lua との間の符号化（LUA_ENCODING）がそのまま渡すので、ここでは触らない
     assert lua_text(HIGH) == HIGH
@@ -71,6 +73,8 @@ def test_a_surrogate_that_is_not_a_byte_is_replaced_and_recorded() -> None:
 
 
 def test_a_project_with_a_high_byte_saves_and_reloads(tmp_path: Path) -> None:
+    # 読めないバイトを持つ値で保存が例外になると、AviUtl1 のダイアログの値を持つ
+    # プロジェクトが保存できない
     track = Track(kind=TrackKind.VIDEO, name="V1")
     project = AddTrack(track).apply(Project.create())
     clip = Clip(
@@ -112,6 +116,8 @@ def test_the_japanese_stays_readable(tmp_path: Path) -> None:
 
 
 def test_a_preset_with_a_high_byte_saves_and_reloads(tmp_path: Path) -> None:
+    # 読めないバイトを持つ値のプリセットが保存で例外になるか、読み直して別の文字に
+    # 変わると、当てたスクリプトに違う値が渡る
     store = PresetStore(root=tmp_path)
     preset = Preset(name="高いバイト", effects=(Effect(kind="blur", params={"memo": HIGH}),))
     path = store.save(preset)

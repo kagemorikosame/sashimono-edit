@@ -116,6 +116,8 @@ class TestCModule:
         assert "読み取れなかった" in line and "C モジュール" not in line
 
     def test_a_module_that_is_not_there_is_still_not_found(self, tmp_path: Path) -> None:
+        # 無いモジュールを「見つかりません」と名前付きで残せないと、
+        # 互換性レポートからスクリプトの置き忘れたモジュールに気付けない
         _, report = _run('local b = require("nothing")', folder=tmp_path)
         assert list(report.missing) == ['モジュール "nothing" が見つかりません']
 

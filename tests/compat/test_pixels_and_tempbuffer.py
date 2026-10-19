@@ -118,6 +118,8 @@ class TestTriangles:
 
 class TestPastingAPicture:
     def test_it_is_centred(self) -> None:
+        # 仮想バッファへ obj.draw した絵が (0, 0) を真ん中として置かれないと、
+        # 読み戻した絵の中で位置がずれる
         buffer = np.zeros((10, 10, 4), np.uint8)
         image = np.full((2, 4, 4), 255, np.uint8)
         raster.draw_image(buffer, image)
@@ -144,6 +146,8 @@ class TestPixelData:
         assert np.array_equal(state.image, before)
 
     def test_the_size_comes_back(self, runtime: LuaScriptRuntime) -> None:
+        # getpixeldata が幅と高さを返さないと、DLL へ大きさを渡すスクリプト（テレビ字幕）が
+        # 画素の並びを読み違える
         state = _state(20, 10)
         runtime.run('local d, w, h = obj.getpixeldata("object")\nobj.ox = w * 100 + h', state)
         assert state.ox == 2010
@@ -237,6 +241,8 @@ class TestTheTempBuffer:
         assert any("回転か拡大" in line for line in report.lines())
 
     def test_loading_it_makes_it_the_object(self, runtime: LuaScriptRuntime) -> None:
+        # obj.load("tempbuffer") で仮想バッファが絵にならないと、描いて読み戻す
+        # テレビ字幕の板が出ない
         state = _state(4, 2)
         runtime.run(
             'obj.setoption("drawtarget", "tempbuffer", 10, 8)\nobj.draw()\n'
@@ -291,6 +297,8 @@ class TestFigures:
         assert state.image[50, 50].tolist() == list(YELLOW)
 
     def test_a_given_size(self, runtime: LuaScriptRuntime) -> None:
+        # 大きさを渡した obj.load("figure") がその大きさにならないと、図形を貼る
+        # スクリプトの形が指定と違う大きさになる
         state = _state()
         runtime.run('obj.load("figure", "四角形", 0xffd400, 40)', state)
         assert state.image.shape[:2] == (40, 40)

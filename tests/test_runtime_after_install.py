@@ -379,6 +379,8 @@ class TestSetupSection:
     def test_the_section_reports_ready_right_after_installing(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, qt_application: QApplication
     ) -> None:
+        # 導入の直後に使える状態と知らせないと、再起動するまで未導入のままで、
+        # AI のパネルが入れている間に預かった指示も渡さない
         from sashimono.ui import setup
 
         dist, module = _unique()
@@ -466,6 +468,8 @@ class TestSetupSection:
     def test_a_failed_install_does_not_claim_success(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, qt_application: QApplication
     ) -> None:
+        # pip が失敗したのに「導入が終わりました」と出すと、入っていない機能を使えると
+        # 案内する
         from sashimono.ui import setup
 
         dist, _module = _unique()

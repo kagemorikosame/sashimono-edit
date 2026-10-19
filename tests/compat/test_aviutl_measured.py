@@ -85,6 +85,8 @@ def test_every_probe_has_a_measurement(tool: ModuleType) -> None:
 def test_the_picture_lands_where_aviutl2_put_it(
     tool: ModuleType, tmp_path: Path, name: str
 ) -> None:
+    # 拡大率・縦横比・リサイズ・クリッピングの読み方がずれると、AviUtl2 のオブジェクトを
+    # 読み込んだ絵が AviUtl2 と違う大きさや位置に描かれる
     (probe,) = [probe for probe in tool.PROBES if probe.name == name]
     image = tmp_path / "white.png"
     image.write_bytes(tool.solid_png(*tool.IMAGE_SIZE, (255, 255, 255)))

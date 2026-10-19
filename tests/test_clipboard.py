@@ -403,6 +403,8 @@ class TestInsertPaste:
         assert _spans(pasted, 1) == [(60, 90), (90, 120)]
 
     def test_nothing_copied_does_nothing(self, linked: Project) -> None:
+        # 空の中身でコマンドを返すと、
+        # 挿入貼り付け（Ctrl+Shift+V）が何も貼らない「貼り付け（挿入）」を実行へ回す
         assert insert_paste_commands(linked, ClipboardContent(()), 0) == []
 
 

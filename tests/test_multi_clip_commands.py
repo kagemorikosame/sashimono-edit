@@ -95,6 +95,7 @@ class TestMoveClipsAcrossTracks:
         return base.with_timeline(replace(base.timeline, tracks=(upper, lower)))
 
     def test_the_whole_selection_changes_track(self) -> None:
+        # まとめて段を移したクリップの一部が元のトラックに残り、選んだ並びが上下に割れる
         project = self._two_tracks()
         clips = project.timeline.tracks[0].clips
         moved = MoveClips(tuple(c.id for c in clips), 0, track_delta=1).apply(project)
@@ -102,24 +103,32 @@ class TestMoveClipsAcrossTracks:
         assert moved.timeline.tracks[0].clips == ()
 
     def test_moving_past_the_last_track_fails(self) -> None:
+        # 並びの外を ValueError で断らないと、まとめて段を跨ぐドラッグで時間だけ動かす
+        # 逃げ道に入らず、別の例外で操作が止まる
         project = self._two_tracks()
         clips = project.timeline.tracks[0].clips
         with pytest.raises(ValueError, match="並びの外"):
             MoveClips(tuple(c.id for c in clips), 0, track_delta=5).apply(project)
 
     def test_a_clip_already_there_stops_the_move(self) -> None:
+        # 移した先のクリップと重なっても断らないと、段を移したクリップが下のクリップに重なる
         base = Project.create()
         upper = Track(TrackKind.VIDEO, "V1", (_text(0),))
         lower = Track(TrackKind.VIDEO, "V2", (_text(10),))
         project = base.with_timeline(replace(base.timeline, tracks=(upper, lower)))
         moving = upper.clips[0].id
-        with pytest.raises(ValueError):
+        # 断った理由が重なりであることまで見る 段の移し方そのものが壊れて別の
+        # ValueError を出しても、型だけを見ていると通ってしまう
+        with pytest.raises(ValueError, match="重なっている"):
             MoveClips((moving,), 0, track_delta=1).apply(project)
-        assert project.timeline.tracks[0].clips[0].id == moving
+        # 重ならない所へなら同じ段の移し方で通る 断ったのが重なりのせいだと確かめる
+        moved = MoveClips((moving,), 40, track_delta=1).apply(project)
+        assert [c.id for c in moved.timeline.tracks[1].clips][-1] == moving
 
 
 class TestTrimClips:
     def test_every_selected_clip_is_trimmed(self) -> None:
+        # 掴んだ 1 本だけが縮むと、まとめて端を詰めたつもりのほかのクリップが元の長さのまま残る
         project = _project(_text(0), _text(60))
         clips = project.timeline.tracks[0].clips
         trimmed = TrimClips(tuple(c.id for c in clips), tail_delta=-10).apply(project)
@@ -134,6 +143,8 @@ class TestTrimClips:
         assert [c.duration for c in project.timeline.tracks[0].clips] == [30, 30, 30]
 
     def test_a_locked_track_is_refused(self) -> None:
+        # ロックしたトラックのクリップまで端が動くと、触らないつもりでロックしたクリップの
+        # 長さがまとめての調整で変わる
         project = _project(_text(0), locked=True)
         clip = project.timeline.tracks[0].clips[0]
         with pytest.raises(ValueError, match="ロック"):

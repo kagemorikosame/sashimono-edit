@@ -50,6 +50,7 @@ def one(text: str) -> MappedObject:
 
 class TestText:
     def test_a_text_object_becomes_a_text_source(self) -> None:
+        # 写し損ねると、AviUtl1 の .exo から読み込んだテキストの本文・大きさ・色が元と違って出る
         hexed = encode_utf16_hex("こんにちは", length=8)
         mapped = one(build(f"_name=テキスト\nサイズ=64\ncolor=ff0000\ntext={hexed}"))
         source = mapped.clip.source
@@ -60,12 +61,14 @@ class TestText:
         assert source.params["color"] == (1.0, 0.0, 0.0, 1.0)
 
     def test_the_font_is_carried_over(self) -> None:
+        # font を落とすと、読み込んだ字幕が元の書体ではなく既定の書体で描かれる
         mapped = one(build("_name=テキスト\nfont=Meiryo\nサイズ=32"))
         source = mapped.clip.source
         assert source is not None
         assert source.params["font"] == "Meiryo"
 
     def test_bold_and_alignment(self) -> None:
+        # B と align を落とすと、読み込んだ太字が細字になり、左揃えの文字が中央揃えでずれて出る
         mapped = one(build("_name=テキスト\nB=1\nalign=1"))
         source = mapped.clip.source
         assert source is not None
@@ -93,6 +96,7 @@ class TestFigure:
             assert source.params["shape"] == expected
 
     def test_the_aspect_ratio_changes_the_size(self) -> None:
+        # 縦横比 を読まないと、横を半分に縮めた四角が読み込み後に正方形で出る
         mapped = one(build("_name=図形\ntype=1\nサイズ=100\n縦横比=50"))
         source = mapped.clip.source
         assert source is not None
@@ -102,6 +106,7 @@ class TestFigure:
 
 class TestDrawSettings:
     def test_position_and_scale_become_a_transform(self) -> None:
+        # 標準描画 の位置と拡大を変形へ写せないと、読み込んだ物が画面の真ん中に元の大きさで出る
         mapped = one(
             build(
                 "_name=図形\ntype=1\nサイズ=100",
@@ -116,10 +121,12 @@ class TestDrawSettings:
         assert float(effects[0].params["scale"].at(0)) == 150.0  # type: ignore[union-attr]
 
     def test_transparency_becomes_opacity(self) -> None:
+        # 透明度をそのまま不透明度に入れると、25% 透かしただけの図形が 4 分の 1 の濃さで出る
         mapped = one(build("_name=図形", "_name=標準描画\n透明度=25.0"))
         assert float(mapped.clip.opacity.at(0)) == 0.75
 
     def test_the_blend_number_is_translated(self) -> None:
+        # blend の番号を読み違えると、加算で光らせた物が通常の重ね方になり明るさが乗らない
         mapped = one(build("_name=図形", "_name=標準描画\nblend=1"))
         assert mapped.clip.blend_mode == "add"
 
@@ -152,12 +159,16 @@ class TestDrawSettings:
 
 class TestFilters:
     def test_known_filters_become_effects(self) -> None:
+        # 知っているフィルタを写せないと読み込んだクリップから ぼかし が消え、
+        # 範囲を落とすとぼけ方の強さが変わる
         mapped = one(build("_name=図形", "_name=ぼかし\n範囲=20", "_name=標準描画"))
         effects = mapped.clip.effects
         assert [effect.kind for effect in effects] == ["blur"]
         assert float(effects[0].params["radius"].at(0)) == 20.0  # type: ignore[union-attr]
 
     def test_unknown_filters_are_recorded(self) -> None:
+        # 知らないフィルタを記録しないと、効果が欠けたことが互換性レポートに出ず、
+        # 埋める順を数えられない
         report = CompatibilityReport()
         mapped = map_object(
             parse_exo(build("_name=図形", "_name=まだ無いフィルタ\n値=1")).objects[0],
@@ -169,6 +180,7 @@ class TestFilters:
         assert any("まだ無いフィルタ" in line for line in report.lines())
 
     def test_unknown_content_is_recorded(self) -> None:
+        # 知らない中身を黙って捨てると、読み込んだ数が減った理由が互換性レポートに出ない
         report = CompatibilityReport()
         map_object(parse_exo(build("_name=謎のオブジェクト")).objects[0], RATE, report=report)
         assert any("謎のオブジェクト" in line for line in report.lines())
@@ -181,12 +193,14 @@ class TestTiming:
         assert (mapped.clip.timeline_start, mapped.clip.duration) == (0, 60)
 
     def test_a_later_object(self) -> None:
+        # 開始を 1 始まりのまま置くと、31 フレーム目から始まる物が読み込み後に 1 フレーム遅れて出る
         mapped = one(build("_name=図形", start=31, end=90))
         assert (mapped.clip.timeline_start, mapped.clip.duration) == (30, 60)
 
 
 class TestWholeFile:
     def test_layers_become_tracks(self) -> None:
+        # レイヤーの番号をトラックへ写せないと、レイヤー 1 と 3 の重なり順が AviUtl と変わる
         text = (
             "[exedit]\nwidth=1920\nheight=1080\nrate=30\nscale=1\n"
             + build("_name=図形\ntype=1", layer=1)
@@ -203,6 +217,7 @@ class TestWholeFile:
         assert len(applied.timeline.tracks[2].clips) == 1
 
     def test_objects_can_be_dropped_at_a_position(self) -> None:
+        # at_frame を足し忘れると、呼び手が置く位置を指定しても頭（0 フレーム）に置かれる
         project = Project.create(ProjectSettings(frame_rate=RATE))
         commands = map_exo(
             parse_exo(build("_name=図形\ntype=1")),
@@ -216,6 +231,8 @@ class TestWholeFile:
         assert applied.timeline.tracks[0].clips[0].timeline_start == 90
 
     def test_a_file_with_nothing_mappable_gives_no_commands(self) -> None:
+        # 置ける物が無いのにコマンドを返すと、〔オブジェクトを読み込む…〕が
+        # 「読み込めるオブジェクトがありませんでした」を出せない
         project = Project.create(ProjectSettings(frame_rate=RATE))
         empty = "[exedit]\nwidth=1920\nheight=1080\n"
         assert map_exo(parse_exo(empty), project, report=CompatibilityReport()) == []
