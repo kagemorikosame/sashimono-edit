@@ -843,6 +843,8 @@ def _rate_manifest_and_video(
 def test_measuring_the_rate_before_building_explains_itself(
     tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # video-rate-build の前に測ると無い一覧を読みに行き、案内の無い traceback で終わって、
+    # 測る開発者は何を先に走らせるか分からない
     arguments = SimpleNamespace(work=tmp_path, skip_sashimono=True)
     assert tool.command_video_rate_measure(arguments) == 0
     assert "video-rate-build" in capsys.readouterr().out
@@ -2018,6 +2020,8 @@ def test_the_effect_item_probe_is_read_the_way_real_effect_items_are(
 
 
 def test_the_effect_item_reading_says_when_both_are_the_same(tool: ModuleType) -> None:
+    # 差の小さい方を取り違えると、
+    # 測る開発者は YMM4 の書き出しから遠い方のエフェクトアイテムの読みを裏付けとして受け取る
     near = {tool.EFFECT_FRAMEBUFFER: 0.1, tool.EFFECT_FILTER: 226.8}
     assert tool.effect_item_reading(near) == tool.EFFECT_FRAMEBUFFER
     far = {tool.EFFECT_FRAMEBUFFER: 40.0, tool.EFFECT_FILTER: 2.0}

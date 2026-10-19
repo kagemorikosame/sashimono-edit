@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -62,6 +62,8 @@ class TestApplyingOnStart:
     def test_a_chosen_version_is_handed_to_the_swapper(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 〔次の起動で入れる〕を選んでも入れ替え係が起きないと古い版のまま開き、引数が渡らないと
+        # 作品を開いて起動したのに新しい版がその作品を開かない
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         plans: list[SwapPlan] = []
@@ -240,6 +242,8 @@ class TestApplyingOnStart:
     def test_an_automatic_reservation_applies_while_not_asking(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 〔入れる前に尋ねる〕を切った人の自動の予約を入れないと、落とした新しい版が
+        # いつまでも入らない
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
         assert apply_on_start(
@@ -356,6 +360,8 @@ class TestApplyingOnStart:
         assert (install / "version.txt").read_text(encoding="ascii") == "new"
 
     def test_staging_elsewhere_is_left_alone(self, layout: Layout, store: UpdateStateStore) -> None:
+        # ほかの窓が落としている最中に入れ替えると置き場が替わる途中の .new を渡しかねず、
+        # 予約を消すと落とし終えた後の起動でも入らない
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         held = try_hold(lock_path(STAGE_LOCK, store.path.parent))
@@ -416,6 +422,7 @@ class TestTheSwitchTable:
     def test_every_switch_lands_on_the_same_rule(
         self, before: UpdateState, after: UpdateChoices, expected: tuple[str, bool, bool]
     ) -> None:
+        # 表とずれると、確かめるのを切ったのに次の起動で入れ替わる・ベータを切ったのにベータが入る
         assert _reserved(reconcile(before, after)) == expected
 
     def test_a_failed_version_is_not_reserved_again(self) -> None:
@@ -485,6 +492,7 @@ class TestStartFollowsTheTable:
     def test_a_failed_swap_is_not_retried_on_every_start(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 入れ替え係を起こせない機械で自動の予約を繰り返すと、起動のたびに入れ替えを試して待たされる
         _stage(layout, "1.2.0")
         store.save(NONE)
         not_asking = lambda: UpdateChoices(confirm=False)  # noqa: E731
@@ -504,6 +512,7 @@ class TestStartFollowsTheTable:
     def test_a_failure_in_the_results_blocks_the_automatic_retry(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 入れ替えに失敗した版を尋ねない設定がまた予約すると、起動のたびに同じ失敗を繰り返す
         _stage(layout, "1.2.0")
         store.save(NONE)
         settle(layout=layout, store=store, current="1.1.0", results=["busy"])
@@ -530,6 +539,7 @@ class TestOneAtATime:
     def test_nothing_is_staged_while_swapping(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 入れ替え係が走っている間に落とし始めると、入れ替えている最中の .new を消す
         transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
         held = try_hold(lock_path(SWAP_LOCK, store.path.parent))
         assert held is not None
@@ -575,6 +585,7 @@ class TestOneAtATime:
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
 
     def test_a_vanished_stage_is_not_applied(self, layout: Layout, store: UpdateStateStore) -> None:
+        # 待っていた .new が消えた後も予約に従うと、無い版へ入れ替え係を起こし、予約も残り続ける
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.1.0")
         assert not store.load().apply_on_start
@@ -586,6 +597,7 @@ class TestOneAtATime:
         assert not apply_on_start(["x"], layout=layout, store=store, swap=_never, current="1.3.0")
 
     def test_the_development_tree_is_left_alone(self, store: UpdateStateStore) -> None:
+        # 置き場の無い開発の環境で真を返すと、python -m sashimono が画面を出さずに終わる
         store.save(UpdateState(ready_version="1.2.0", apply_on_start=True))
         assert not apply_on_start(["x"], layout=None, store=store, swap=_never)
 
@@ -596,6 +608,8 @@ def _never(_plan: SwapPlan) -> bool:
 
 class TestSettling:
     def test_a_finished_update_is_told(self, layout: Layout, store: UpdateStateStore) -> None:
+        # 入れ替えた後の起動で知らせないと更新に気付かず、待つ版を片付けないと
+        # 起動のたびに同じ知らせが出る
         store.save(UpdateState(ready_version="1.2.0", ready_notes_url="https://x"))
         notice = settle(layout=layout, store=store, current="1.2.0", results=["swapped"])
         assert notice is not None and "1.2.0 に更新しました" in notice
@@ -631,6 +645,7 @@ class TestSettling:
     def test_an_unfinished_rollback_still_skips_the_version(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 戻し切れなかった回に版を飛ばさないと、起動できなかった版を次の確認でまた落として入れる
         store.save(UpdateState(ready_version="1.2.0"))
         notice = settle(
             layout=layout, store=store, current="1.1.0", results=["swapped", "rollback-failed"]
@@ -639,6 +654,8 @@ class TestSettling:
         assert "1.2.0" in store.load().skipped
 
     def test_a_failed_swap_is_told(self, layout: Layout, store: UpdateStateStore) -> None:
+        # 入れ替えの失敗を黙ると本人は古い版のまま気付かず、待つ版を片付けると
+        # 入れ直しに落とし直しが要る
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0"))
         notice = settle(layout=layout, store=store, current="1.1.0", results=["busy"])
@@ -676,6 +693,7 @@ class TestSettling:
     def test_a_different_failure_starts_counting_again(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 別のわけの失敗まで続けて数えると、1 回目の失敗から手で名前を変える手順を出す
         _stage(layout, "1.2.0")
         store.save(UpdateState(ready_version="1.2.0", last_failure="busy", failure_count=3))
         notice = settle(layout=layout, store=store, current="1.1.0", results=["install-locked"])
@@ -755,6 +773,7 @@ class TestSettling:
     def test_a_finished_update_forgets_the_failures(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 入れ終えても失敗の回数を消さないと、済んだ版の失敗が覚え書きに残り続ける
         store.save(
             UpdateState(ready_version="1.2.0", last_failure="install-locked", failure_count=2)
         )
@@ -762,6 +781,7 @@ class TestSettling:
         assert (store.load().last_failure, store.load().failure_count) == ("", 0)
 
     def test_nothing_to_tell(self, layout: Layout, store: UpdateStateStore) -> None:
+        # 何も起きていない起動で知らせを返すと、起動のたびにステータスバーに更新の知らせが出る
         assert settle(layout=layout, store=store, current="1.1.0", results=[]) is None
 
     def test_an_orphan_stage_is_removed(self, layout: Layout, store: UpdateStateStore) -> None:
@@ -773,12 +793,15 @@ class TestSettling:
     def test_a_broken_state_does_not_stop_the_start(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:
+        # 壊れた覚え書きで例外を出すと、画面を出した後の更新の仕度
+        # （UpdateController.start）が途中で落ちる
         store.path.write_text("{壊れた", encoding="utf-8")
         assert settle(layout=layout, store=store, current="1.1.0", results=[]) is None
 
 
 class TestTheState:
     def test_it_round_trips(self, store: UpdateStateStore) -> None:
+        # 書いた値が読み戻せないと、起動のたびに確かめに行く・飛ばした版をまた勧める・待つ版を忘れる
         state = UpdateState(
             last_checked=12.5,
             skipped=("1.0.0",),
@@ -786,9 +809,16 @@ class TestTheState:
             ready_notes_url="https://x",
             ready_python_abi="cp314",
             apply_on_start=True,
+            apply_chosen=True,
+            auto_blocked="1.1.0",
+            scripts_offered=("tool.lua",),
+            pending_notice="install-locked",
             last_failure="install-locked",
             failure_count=2,
         )
+        # すべての欄を既定と違う値にする 既定のままの欄は、保存や読み戻しが抜けても同じ値に戻る
+        plain = UpdateState()
+        assert all(getattr(state, f.name) != getattr(plain, f.name) for f in fields(UpdateState))
         store.save(state)
         assert store.load() == state
 
@@ -803,5 +833,7 @@ class TestTheState:
         ],
     )
     def test_broken_values_fall_back(self, store: UpdateStateStore, text: str) -> None:
+        # 型の違う値をそのまま使うと、時刻を比べる所で例外になったり、文字列の skipped を版の並びと
+        # 取り違えたりする
         store.path.write_text(text, encoding="utf-8")
         assert store.load() == UpdateState()

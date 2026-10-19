@@ -212,6 +212,8 @@ class TestCollect:
 
 class TestCheck:
     def test_a_reachable_archive_passes(self, tool: ModuleType, server: str) -> None:
+        # 届く置き場で止まるか中身まで落とすと、
+        # リリースする人の --check が届いているのに NG を出すか、確かめるだけで数百 MB を落とす
         assert tool.check_urls([_source(tool, f"{server}/archive")]) == []
         # 確かめるだけで中身は落とさない
         assert [method for method, _ in _Handler.requests] == ["HEAD"]
@@ -223,10 +225,14 @@ class TestCheck:
         assert tool.check_urls([_source(tool, f"{server}/nohead")]) == []
 
     def test_a_missing_archive_is_reported(self, tool: ModuleType, server: str) -> None:
+        # 消えた置き場を見落とすと、--check が [ok] を出し、
+        # リリースする人が入手先の無くなった部品に気付かないまま進む
         problems = tool.check_urls([_source(tool, f"{server}/gone")])
         assert len(problems) == 1 and "/gone" in problems[0]
 
     def test_a_bot_page_is_reported(self, tool: ModuleType, server: str) -> None:
+        # ボット避けの画面を届いたと数えると、--check が通り、
+        # 入手先からソースを落とせないことにリリースする人が気付けない
         assert tool.check_urls([_source(tool, f"{server}/page")]) != []
 
 
@@ -245,6 +251,8 @@ class TestOnlyWhatIsBundled:
     """
 
     def test_the_modules_come_from_the_files(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 積んだファイルから Qt のモジュールを数え損ねると、
+        # 積んだ qtsvg などのソースを Release へ添付し損ねるか、Qt でない DLL で道具が止まる
         pyside = _pyside(
             tmp_path,
             "Qt6Core.dll",
@@ -261,6 +269,8 @@ class TestOnlyWhatIsBundled:
         assert unknown == []
 
     def test_an_unshipped_module_is_not_attached(self, tool: ModuleType) -> None:
+        # 積んだ Qt で絞れないと、積んでいない qtwebengine（580 MB）までリリースのたびに落とすか、
+        # Qt に依らない x264 などのソースが添付から抜ける
         attached = {source.qt_module for source in tool.sources_for({"qtbase"})}
         assert "qtwebengine" not in attached
         assert "qtbase" in attached
@@ -331,6 +341,8 @@ class TestTheList:
     def test_a_version_mismatch_stops_the_tool(
         self, tool: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 版が食い違ったまま先へ進むと、
+        # --check が zip に積んだのと別の版の入手先を確かめて [ok] を出す
         monkeypatch.setattr(tool, "installed_mismatches", lambda: ["積んでいる FFmpeg は 9.0"])
         called: list[object] = []
 

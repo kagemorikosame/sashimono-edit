@@ -97,6 +97,8 @@ class TestMotionTrail:
                 assert not effect.params["pos_x"].is_animated  # type: ignore[union-attr]
 
     def test_the_items_are_read(self) -> None:
+        # 項目を読み落として既定へ落ちると、ライン幅や先端を変えた AviUtl2 の
+        # ライン(移動軌跡) が既定の太さや先端で描かれる
         item, _ = _mapped(LINE)
         source = item.clip.source
         assert source is not None
@@ -106,6 +108,49 @@ class TestMotionTrail:
         assert _static(source.params["trail_interval"]) == 10.0
         # 実物の三角形は円に内接する形（大きさ 48 で高さ 36）
         assert source.params["trail_head_shape"] == "inscribed_triangle"
+        # 見本の値は読み込みの既定と同じで、読み落としても上は通る
+        # 全部の項目を既定と違う値にして、読んだ値が届くことを見る
+        changed = (
+            LINE.replace("ライン幅=16.0", "ライン幅=7.0")
+            .replace("先端=48.0", "先端=21.0")
+            .replace("先端角度=0.00", "先端角度=30.00")
+            .replace("先端位置補正=70.0", "先端位置補正=55.0")
+            .replace("先端図形=三角形", "先端図形=星型")
+            .replace("固定速度=0.00", "固定速度=4.00")
+            .replace("描画間隔=10.0", "描画間隔=3.0")
+            .replace("最小間隔=2", "最小間隔=5")
+            .replace("主線描画(%)=100.0", "主線描画(%)=60.0")
+            .replace("補助描画(%)=0.0", "補助描画(%)=25.0")
+        )
+        item, _ = _mapped(changed)
+        source = item.clip.source
+        assert source is not None
+        read = {
+            name: _static(source.params[name])
+            for name in (
+                "line_width",
+                "trail_head_size",
+                "trail_head_angle",
+                "trail_head_offset",
+                "trail_speed",
+                "trail_interval",
+                "trail_min_step",
+                "trail_core",
+                "trail_band",
+            )
+        }
+        assert read == {
+            "line_width": 7.0,
+            "trail_head_size": 21.0,
+            "trail_head_angle": 30.0,
+            "trail_head_offset": 55.0,
+            "trail_speed": 4.0,
+            "trail_interval": 3.0,
+            "trail_min_step": 5.0,
+            "trail_core": 60.0,
+            "trail_band": 25.0,
+        }
+        assert source.params["trail_head_shape"] == "star"
 
     def test_an_unknown_figure_is_recorded(self) -> None:
         # 自分で足した図形を黙って三角形にすると、違う先端に気付けない

@@ -61,6 +61,8 @@ def _shape_item(plugin: str, parameter: dict[str, Any], **fields: Any) -> dict[s
 
 class TestLightAndLens:
     def test_reflection_reads_the_nested_lighting(self) -> None:
+        # 入れ子の Lighting と Heightmap を読み落とすと、
+        # YMM4 の反射と押し出しの光の向きや形や色が既定のまま描かれる
         effect, report = _map(
             "ReflectionAndExtrusionEffect",
             LightingMode="DistantDiffuse",
@@ -89,11 +91,13 @@ class TestLightAndLens:
         assert effect.params["inverted"] is True
 
     def test_lens_blur(self) -> None:
+        # BlurRadius を半径へ写し損ねると、YMM4 のレンズぼかしのぼけの強さが変わる
         effect, _ = _map("LensBlurEffect", BlurRadius=_still(20.0), Brightness=_still(150.0))
         assert effect.kind == "lens_blur"
         assert _value(effect.params["radius"]) == 20.0
 
     def test_bloom_can_colour_the_light(self) -> None:
+        # 色付けの旗と色を読み落とすと、YMM4 で緑に色付けしたブルームの光が元の色のまま光る
         effect, report = _map(
             "BloomEffect",
             Strength=_still(120.0),
@@ -110,6 +114,7 @@ class TestLightAndLens:
 
 class TestDistortion:
     def test_fish_eye(self) -> None:
+        # 射影の方式や角度を写し損ねると、YMM4 の魚眼レンズの歪み方が変わる
         effect, _ = _map(
             "FishEyeLensEffect", Projection="Equidistant", Angle=_still(120.0), Zoom=_still(90.0)
         )
@@ -118,6 +123,7 @@ class TestDistortion:
         assert _value(effect.params["angle"]) == 120.0
 
     def test_ripple_flips_y(self) -> None:
+        # 波紋の中心の Y を裏返さないと、YMM4 で中心より下に置いた波紋が上で広がる
         effect, _ = _map(
             "RippleEffect",
             X=_still(100.0),
@@ -130,6 +136,7 @@ class TestDistortion:
         assert _value(effect.params["center_y"]) == -40.0
 
     def test_stretch(self) -> None:
+        # 引き伸ばしの長さと中心に揃える旗を写し損ねると、YMM4 の引き伸ばしの量や伸びる起点が変わる
         effect, _ = _map(
             "StretchEffect",
             X=_still(0.0),
@@ -144,6 +151,7 @@ class TestDistortion:
         assert effect.params["centering"] is False
 
     def test_polar_and_tiling(self) -> None:
+        # 芯の幅やタイルの縦の数を写し損ねると、YMM4 の極座標変換やタイル状に並べた絵の形が変わる
         polar, _ = _map("PolarTransformEffect", CoreWidth=_still(200.0), TwistAngle=_still(90.0))
         assert (polar.kind, _value(polar.params["core"])) == ("polar", 200.0)
         tiling, _ = _map("TilingEffect", X=_still(2.0), Y=_still(41.0))
@@ -152,6 +160,8 @@ class TestDistortion:
 
 class TestTiming:
     def test_repeat_zoom(self) -> None:
+        # 間隔・イージング・中心の旗を写し損ねると、
+        # YMM4 で繰り返し拡大するテンプレートの速さや動き方が変わる
         effect, _ = _map(
             "RepeatZoomEffect",
             Zoom=_still(150.0),
@@ -168,6 +178,7 @@ class TestTiming:
         assert effect.params["centering"] is True
 
     def test_jump(self) -> None:
+        # 跳ねる高さや周期を写し損ねると、YMM4 で弾ませたテンプレートの跳ね方が変わる
         effect, _ = _map(
             "JumpEffect",
             JumpHeight=_still(40.0),
@@ -181,6 +192,8 @@ class TestTiming:
         assert _value(effect.params["period"]) == 0.53
 
     def test_the_jump_easing_waits_until_the_end(self) -> None:
+        # Jump を知らない形として扱うか加減速へ丸めると、繰り返し回転が終わりで一度に回らず、
+        # なめらかに回る
         effect, report = _map(
             "RepeatRotateEffect",
             X=_still(0.0),
@@ -195,6 +208,7 @@ class TestTiming:
         assert effect.params["easing"] == "jump"
 
     def test_after_image(self) -> None:
+        # 残像の強さとモードを写し損ねると、YMM4 の残像の濃さや前後の重なり方が変わる
         effect, _ = _map("AfterImageEffect", Strength=_still(53.6), Mode="Front")
         assert effect.kind == "after_image"
         assert _value(effect.params["strength"]) == pytest.approx(53.6)
@@ -225,6 +239,8 @@ class TestWipeAndKey:
         ],
     )
     def test_the_bundled_wipe_images_become_patterns(self, name: str, pattern: str) -> None:
+        # YMM4 に付いてくるワイプ画像の名前を模様へ引けないと、
+        # 横や円のワイプが別の形かただのフェードで出る
         effect, report = _map(
             "InOutTransitionEffect",
             File=f"D:\\Program\\YukkuriMovieMaker_v4\\Resources\\Transition\\{name}.png",
@@ -242,11 +258,14 @@ class TestWipeAndKey:
         assert effect.params["easing"] == "quart"
 
     def test_an_unknown_wipe_image_falls_back_to_a_fade(self) -> None:
+        # 自作のワイプ画像を黙ってフェードへ代えると、
+        # ワイプの形が消えた理由がテンプレートの窓の注意書きに出ない
         effect, report = _map("InOutTransitionEffect", File="C:\\素材\\自作ワイプ.png")
         assert effect.params["pattern"] == "fade"
         assert any("自作ワイプ" in line for line in report.lines())
 
     def test_directional_key(self) -> None:
+        # 背景色を写し損ねると、YMM4 の色で抜くキーで抜く色が変わり、抜けるはずの背景が残る
         effect, _ = _map(
             "DirectionalColorKeyEffect",
             BackgroundColor="#FF282828",
@@ -264,6 +283,7 @@ class TestWipeAndKey:
 
 class TestParticles:
     def test_the_emitter_keeps_the_screen_direction(self) -> None:
+        # 放つ位置の Y をほかと同じく裏返すと、画面の上から降らせるパーティクルが画面の下から出る
         effect, report = _map(
             "ParticleOutputEffect",
             Rate=_still(400.0),
@@ -342,6 +362,8 @@ class TestParticles:
 
 class TestShapes:
     def test_the_pen_points_move_to_the_centre(self) -> None:
+        # ペンの線の点・太さ・描く範囲を写し損ねると、
+        # YMM4 の手描きの線のテンプレートが違う位置・太さ・長さで出る
         item = _shape_item(
             "PenShapePlugin",
             {
@@ -369,6 +391,8 @@ class TestShapes:
         assert _value(source.params["trim_end"]) == pytest.approx(90.0)
 
     def test_the_timer_counts_down_to_its_first_value(self) -> None:
+        # 数え下げの旗や長さを写し損ねると、
+        # YMM4 のカウントダウンのテンプレートが数え上げで出るか違う時刻で終わる
         item = _shape_item(
             "TimerShapePlugin",
             {
@@ -388,6 +412,7 @@ class TestShapes:
         assert source.params["timer_length"] == 60
 
     def test_the_concentration_lines(self) -> None:
+        # 密度や中心の幅を写し損ねると、YMM4 の集中線のテンプレートの線の混み方や柔らかさが変わる
         item = _shape_item(
             "ConcentrationLineShapePlugin",
             {
@@ -409,6 +434,8 @@ class TestShapes:
         assert not report.lines()
 
     def test_an_inverted_item_is_flipped_before_it_is_placed(self) -> None:
+        # 反転を配置の後へ回すと、ずらして置いた後の絵を裏返すことになり、
+        # X で右へ置いた反転アイテムが YMM4 と違う所に出る
         item = _shape_item(
             "QuadrilateralShapePlugin",
             {"Width": _still(100.0), "Height": _still(50.0)},
@@ -480,6 +507,7 @@ class TestCropByAngle:
     """
 
     def test_an_angle_of_zero_keeps_a_level_band(self) -> None:
+        # 角度 0 の帯を縦に取ると、ドッグタグ風テロップが YMM4 の横長の札ではなく縦長の細い板になる
         image = _cropped_by_angle(0.0)
         assert image[100, 30, 0] > 200, "横の帯の端が切れている"
         assert image[30, 100, 0] < 20, "帯の上まで残っている（縦の帯になっている）"
@@ -572,6 +600,8 @@ class TestBrokenValues:
         assert any("重ね数" in line for line in report.lines())
 
     def test_an_unknown_transition_setting_is_recorded(self) -> None:
+        # 知らないイージングや向きを黙って直線にすると、
+        # トランジションの動き方が変わった理由がテンプレートの窓の注意書きに出ない
         item = {
             "$type": "YukkuriMovieMaker.Project.Items.TransitionItem, YukkuriMovieMaker",
             "TransitionType": "N.FadeTransitionPlugin, YukkuriMovieMaker",
