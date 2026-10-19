@@ -70,6 +70,8 @@ def _finish(service: TranscriptionService) -> list[JobEvent]:
 
 class TestTranscriptionService:
     def test_progress_then_done(self) -> None:
+        # 完了の知らせに起こした字幕が載らないと、字幕起こしの窓も AI から始めた起こしも、
+        # 終わったのに何も取り込まない
         service = TranscriptionService(FakeBackend())
         events = _finish(service)
         kinds = [event.kind for event in events]
@@ -77,6 +79,8 @@ class TestTranscriptionService:
         assert events[-1].transcript is RESULT
 
     def test_failure_becomes_an_event_not_an_exception(self) -> None:
+        # 失敗が知らせとして積まれないと、字幕起こしの窓が起こし中の表示のまま止まり、
+        # 「モデルが無い」のような理由も出ない
         service = TranscriptionService(FakeBackend(error=AsrError("モデルが無い")))
         events = _finish(service)
         assert events[-1].kind is JobKind.FAILED
@@ -90,6 +94,8 @@ class TestTranscriptionService:
         assert "想定外" in events[-1].message
 
     def test_cancelling_stops_the_worker(self) -> None:
+        # 中断がバックエンドへ届かないと、窓で〔中断〕を押しても起こしが最後まで回り、
+        # その間は次の起こしも始まらない
         backend = FakeBackend(block=threading.Event())
         service = TranscriptionService(backend)
         job = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
@@ -126,6 +132,8 @@ class TestTranscriptionService:
         assert service.jobs() == []
 
     def test_a_cancelled_waiting_job_never_runs(self) -> None:
+        # 順番待ちのまま止めた起こしが走ると、窓を閉じて取りやめた起こしが前の起こしの後で始まり、
+        # GPU を使い続ける
         gate = threading.Event()
         service = TranscriptionService(FakeBackend(block=gate))
         first = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
@@ -136,6 +144,8 @@ class TestTranscriptionService:
         assert second.poll()[-1].kind is JobKind.CANCELLED
 
     def test_polling_an_idle_job_returns_nothing(self) -> None:
+        # 取り出した出来事が次の poll でまた返ると、
+        # 定期的に拾う窓と字幕パネルが同じ出来事を何度も受け取る
         service = TranscriptionService(FakeBackend())
         job = service.start(MediaId("m"), Path("素材.mp4"), TranscribeOptions())
         assert job.wait(5.0)

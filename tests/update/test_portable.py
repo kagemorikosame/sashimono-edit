@@ -94,15 +94,20 @@ class TestFindingTheirFiles:
         assert [p.as_posix() for p in user_script_files(install)] == ["配布物/README.txt"]
 
     def test_the_bundled_name_is_matched_without_case(self, install: Path) -> None:
+        # 大文字小文字だけ違う同梱の説明を本人の物と数えると、何も置いていない人の readme.txt を
+        # %APPDATA% へ移して知らせる
         (install / PORTABLE_SCRIPTS_DIR / "README.txt").rename(
             install / PORTABLE_SCRIPTS_DIR / "readme.txt"
         )
         assert user_script_files(install) == []
 
     def test_no_folder_means_nothing(self, tmp_path: Path) -> None:
+        # scripts が無いときに例外を出すと、起動の後のスクリプトの移しが失敗の知らせを出す
         assert user_script_files(tmp_path / "無い") == []
 
     def test_offered_ones_are_not_offered_again(self) -> None:
+        # 勧めた物を大文字小文字の違いで別の物と見ると、移さないと答えた人に
+        # 起動のたびに同じ物を尋ねる
         files = [Path("a.anm2"), Path("b/c.obj2")]
         assert unoffered(files, ()) == files
         assert unoffered(files, ("A.anm2",)) == [Path("b/c.obj2")]
@@ -111,6 +116,7 @@ class TestFindingTheirFiles:
 
 class TestMoving:
     def test_their_files_move_with_the_folders(self, install: Path, target: Path) -> None:
+        # 下のフォルダの物が残ると、移した先のスクリプトが同じフォルダに置いた画像を見つけられない
         _put(install, "自分の/効果.anm2", _script("揺れ"))
         _put(install, "自分の/画像/星.png", "png")
         result = move_user_scripts(install, target)
@@ -139,6 +145,7 @@ class TestMoving:
     def test_a_failed_copy_keeps_the_original(
         self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 写せなかったのに元を消すと、本人のスクリプトがどこにも残らない
         mine = _put(install, "効果.anm2", _script("揺れ"))
 
         def broken(source: Path, destination: Path) -> None:
@@ -172,6 +179,7 @@ class TestMoving:
     def test_an_original_that_cannot_be_removed_is_counted(
         self, install: Path, target: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 消せなかった元を移した物と数えると、「移しました」と知らせて両方に在ることを言わない
         mine = _put(install, "効果.anm2", _script("揺れ"))
         real_unlink = Path.unlink
 
@@ -199,6 +207,7 @@ class TestReadingOrder:
         return {entry.identifier: entry.source for entry in found}
 
     def test_winners_stay_the_same(self, install: Path, target: Path, tmp_path: Path) -> None:
+        # 移して同じ名前のスクリプトの勝ち負けが変わると、移しただけで作品が別のスクリプトで描かれる
         aviutl = tmp_path / "ProgramData" / "aviutl2" / "Script"
         aviutl.mkdir(parents=True)
         _put(install, "一/ひとつ.anm2", _script("ひとつ", 1))
@@ -542,6 +551,8 @@ class TestBundles:
         assert not leftover.exists()
 
     def test_the_bundles(self) -> None:
+        # 束の分け方が崩れると、同じ配布物のスクリプトとモジュールが別々に動き、移した先で別の
+        # モジュールを読んで描画が変わる
         found = bundles(
             [Path("a.anm2"), Path("b.lua"), Path("X/c.anm2"), Path("x/d/e.lua"), Path("Y/f")]
         )
@@ -1044,6 +1055,8 @@ class TestSurvivingUpdates:
     def test_an_automatic_update_after_moving_has_nothing_to_carry(
         self, install: Path, target: Path, tmp_path: Path
     ) -> None:
+        # 移した物が exe の隣に残ると、次の自動更新でまた新しい版へ写り、
+        # 同じスクリプトが 2 か所に並ぶ
         _put(install, "自分の/効果.anm2", _script("揺れ"))
         move_user_scripts(install, target)
         staged = tmp_path / "Programs" / "Sashimono.new"

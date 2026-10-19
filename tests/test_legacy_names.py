@@ -50,6 +50,8 @@ class TestOldProjects:
     def test_a_project_saved_under_an_old_name_opens(
         self, tmp_path: Path, format_name: str, suffix: str
     ) -> None:
+        # 旧名の形式を読めないと、
+        # Kumiki や NovaEdit の頃に保存した作品が「プロジェクトファイルではない」で開けない
         path = tmp_path / f"改名前の作品{suffix}"
         _write_with_format(Project.create(name="改名前の作品"), path, format_name)
         assert load_project(path).name == "改名前の作品"

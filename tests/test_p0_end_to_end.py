@@ -35,6 +35,8 @@ from tests.conftest import make_clip
 def test_edit_save_reload_and_undo(
     video_media: MediaItem, audio_media: MediaItem, transcript: Transcript, tmp_path: Path
 ) -> None:
+    # 冒頭を切って詰めても字幕が話す所に付いて来ないか、保存した作品を開き直すと形が変わるか、
+    # 取り消しが 1 手ずつ戻らないと、コアだけで組む編集（AI の道具も同じ経路）が崩れる
     document = Document(Project.create(ProjectSettings(frame_rate=FrameRate(30))))
 
     # 素材を登録する

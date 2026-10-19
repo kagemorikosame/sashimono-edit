@@ -80,6 +80,8 @@ class TestScenes:
         assert project.name == "本編"
 
     def test_placing_uses_the_scene_length(self, with_scene: tuple[Project, SceneId]) -> None:
+        # 中の長さや指定の位置が使われないと、置いたシーンの終わりが切れるか、
+        # 再生ヘッドと違う所に置かれる
         project, scene_id = with_scene
         track = Track(TrackKind.VIDEO, "V1")
         project = InScene(scene_id, AddTrack(track)).apply(project)
@@ -99,6 +101,7 @@ class TestScenes:
     def test_two_scenes_cannot_contain_each_other(
         self, with_scene: tuple[Project, SceneId]
     ) -> None:
+        # 自分自身だけを見て互いの入れ子を断れないと、描くときに 2 つのシーンの間を潜り続けて固まる
         project, first = with_scene
         second = new_scene(project, "エンディング")
         project = AddScene(second).apply(project)
@@ -173,6 +176,8 @@ class TestGroups:
         return base.with_timeline(replace(base.timeline, tracks=(track,))), a, b
 
     def test_group_and_ungroup(self) -> None:
+        # 束ねても印が揃わないと選択が一緒に広がらず、1 本を解いても残りに印が残ると
+        # 解いたはずのクリップが束ねたまま動く
         project, a, b = self._two()
         grouped = GroupClips((a.id, b.id)).apply(project)
         clips = grouped.timeline.tracks[0].clips

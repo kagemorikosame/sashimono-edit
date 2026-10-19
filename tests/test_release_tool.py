@@ -432,6 +432,7 @@ class TestTheWholeRun:
     def test_a_folder_given_to_key_uses_the_current_key_inside(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # フォルダから今使う鍵を選ばないと、鍵を入れたフォルダを --key に渡しただけで止まる
         world.key = world.key.parent
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -440,6 +441,8 @@ class TestTheWholeRun:
     def test_a_folder_without_the_current_key_stops_before_anything(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 今使う鍵の名前を挙げずに止まると、渡したフォルダに何が足りないのかが分からない
+        # 書き込みの前に止めないと、鍵の渡し間違いのままタグだけが push される
         empty = tmp_path / "空"
         empty.mkdir()
         world.key = empty
@@ -475,6 +478,7 @@ class TestPrerequisites:
         change: dict[str, Any],
         message: str,
     ) -> None:
+        # 前提が欠けたまま進むと、main でない枝や commit していない変更の上でタグを打って push する
         for name, value in change.items():
             setattr(world.github, name, value)
         world.answers = ["y", "y"]
@@ -486,6 +490,7 @@ class TestPrerequisites:
     def test_the_version_must_match_the_source(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 引数の版と __version__ が違うまま進むと、v<版> のタグを中身が別の版を名乗る commit に打つ
         (world.root / "src" / "sashimono" / "__init__.py").write_text(
             '__version__ = "9.9.9"\n', encoding="utf-8"
         )
@@ -495,6 +500,8 @@ class TestPrerequisites:
 
     @pytest.mark.parametrize("workflow", ["CI", "Package"])
     def test_a_failed_ci_run_stops(self, tool: ModuleType, world: World, workflow: str) -> None:
+        # CI か Package が落ちた commit で止まらないと、試験や組み立てが通っていない
+        # commit にタグを打つ
         world.github.runs[workflow] = [_run(HEAD, workflow, "failure")]
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
@@ -503,6 +510,8 @@ class TestPrerequisites:
 
 class TestTheTag:
     def test_a_missing_tag_is_made_and_pushed(self, tool: ModuleType, world: World) -> None:
+        # タグが無いときに打って push しないと Release の run が始まらず、
+        # 3 の段で run が見つからずに止まる
         world.github.remote_tag = None
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -522,6 +531,7 @@ class TestTheTag:
         assert world.github.writes == []
 
     def test_a_tag_whose_version_differs_stops(self, tool: ModuleType, world: World) -> None:
+        # 版の違う commit を指すタグで止まらないと、前の版の中身を新しい版の名前で確かめて署名する
         world.github.remote_tag = OLD
         world.github.ancestors = {OLD}
         world.github.tag_version = "1.2.2"
@@ -541,6 +551,8 @@ class TestTheTag:
         assert "手元の HEAD より前の bbbbbbb" in capsys.readouterr().out
 
     def test_a_local_tag_on_another_commit_stops(self, tool: ModuleType, world: World) -> None:
+        # HEAD と違う commit を指す手元のタグをそのまま push すると、
+        # 打ち間違えた commit で zip が組まれる
         world.github.remote_tag = None
         world.github.local_tag = STRANGER
         assert world.main(tool) == 1
@@ -565,6 +577,7 @@ class TestTheReleaseWorkflow:
         assert "[済] Release（v1.2.3） が success" in out
 
     def test_it_waits_for_ci_that_is_still_running(self, tool: ModuleType, world: World) -> None:
+        # 走っている途中の CI を待たないと、main へ入れた直後に打っただけで落ちたと見て止まる
         world.github.finish_after = {"CI": 3}
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -583,6 +596,8 @@ class TestTheReleaseWorkflow:
     def test_a_failed_run_stops(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 落ちた Release の run で止まらないと、まっさらな Windows の確かめを
+        # 通っていない下書きへ進む
         world.github.runs["release.yml"] = [_run(HEAD, "release.yml", "failure")]
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
@@ -653,6 +668,7 @@ class TestTheDraft:
     def test_a_body_of_the_wrong_size_is_uploaded_again(
         self, tool: ModuleType, world: World
     ) -> None:
+        # 大きさの違うソースを揃ったと見ると、途中で切れた ffmpeg のソースのまま GPL の部品を配る
         world.github.files["ffmpeg-8.1.2.tar.xz"] = b"half"
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -674,6 +690,8 @@ class TestTheDraft:
     def test_dry_run_names_the_missing_sources_without_writing(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # --dry-run で集めたり上げたりすると、試しに見ただけで下書きと dist が書き換わる
+        # 足りない物を名指さないと、本番で何を落として上げるのかが前もって分からない
         del world.github.files["ffmpeg-8.1.2.tar.xz"]
         assert world.main(tool, "--dry-run") == 0
         out = capsys.readouterr().out
@@ -723,6 +741,7 @@ class TestAfterPublishing:
         assert len(half_done.secrets) == 1
 
     def test_the_rest_is_not_done_without_yes(self, tool: ModuleType, half_done: World) -> None:
+        # y を待たずに続けると、公開済みの版の beta の目録を人が確かめないまま上げ直す
         writes = list(half_done.github.writes)
         half_done.answers = ["n"]
         assert half_done.main(tool) == 0
@@ -759,6 +778,8 @@ class TestAfterPublishing:
     def test_without_the_checked_copy_it_prints_what_to_do_by_hand(
         self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 手元に写しが無いと打ち直しても同じ所で止まる 手で打つ beta への上げ直しを出さないと、
+        # 公開した版の beta の目録が古いまま残る
         for path in (half_done.root / "dist" / "release").rglob("update.json"):
             path.unlink()
         capsys.readouterr()
@@ -774,6 +795,8 @@ class TestAfterPublishing:
     def test_a_failed_download_of_the_published_manifest_says_it_is_published(
         self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 公開済みの目録を落とせずに止まったとき「公開はしていない」と出すと、リリースする人が
+        # 公開済みと気付かず、beta の目録の上げ直しが放っておかれる
         half_done.github.fail_downloads = {"update.json.sig"}
         capsys.readouterr()
         writes = list(half_done.github.writes)
@@ -798,6 +821,8 @@ class TestAfterPublishing:
     def test_a_publish_call_that_fails_keeps_the_draft_message(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # GitHub の側でも公開されていないのに「公開は済んでいる」と出すと、下書きのままの版を
+        # 公開したと思い込み、打ち直さない
         world.github.edit_result = (False, 1)
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
@@ -807,6 +832,8 @@ class TestAfterPublishing:
     def test_dry_run_on_a_published_release_writes_nothing(
         self, tool: ModuleType, half_done: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 公開済みの版に --dry-run を打っただけで beta へ目録を上げると、
+        # 試しに見たつもりで公開した後の残りが進む
         capsys.readouterr()
         writes = list(half_done.github.writes)
         assert half_done.main(tool, "--dry-run") == 0
@@ -838,6 +865,8 @@ class TestAFalseDetectionByDefender:
     def test_a_detection_is_rebuilt_on_yes_and_the_clean_build_is_published(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 誤検出された zip を残して記録しないと Microsoft へ報告する物が無い
+        # 組み直した後も前の zip に署名すると、目録の sha256 が下書きの zip と食い違う
         first = world.github.files[ZIP]
         world.detect = [True, False]
         # 組み直す・GL で描けた・公開する
@@ -866,6 +895,7 @@ class TestAFalseDetectionByDefender:
     def test_no_to_the_rebuild_question_stops_without_publishing(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # n と答えても止まらないと、誤検出された zip のまま合言葉を尋ねて署名し、公開まで進む
         world.detect = [True]
         world.answers = ["n", "y", "y"]
         assert world.main(tool) == 1
@@ -935,6 +965,8 @@ class TestAFalseDetectionByDefender:
     def test_an_exe_that_disappeared_is_a_detection(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 隔離されて消えた exe を普通の [NG] と見ると、組み直しを勧めず、
+        # 誤検出された zip も記録に残らない
         def quarantined(archive: Path, home: Path) -> int:
             (home / tool_exe()).unlink()
             return 1
@@ -967,17 +999,20 @@ class TestAFalseDetectionByDefender:
 
 class TestTheCheckAndSignature:
     def test_a_failed_self_check_stops_before_signing(self, tool: ModuleType, world: World) -> None:
+        # 確かめが落ちても止まらないと、自己診断の通らない zip に合言葉を尋ねて署名し、公開を尋ねる
         world.smoke_result = 1
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
         assert world.secrets == [] and not world.published
 
     def test_no_to_the_gl_question_stops(self, tool: ModuleType, world: World) -> None:
+        # GL で描けていないと答えても進むと、プレビューに絵が出ない zip に署名して公開を尋ねる
         world.answers = ["n", "y"]
         assert world.main(tool) == 1
         assert world.secrets == [] and not world.published
 
     def test_skip_launch_does_not_start_the_app(self, tool: ModuleType, world: World) -> None:
+        # --skip-launch でもアプリを起こすと、窓を閉じるまで道具が先へ進まない
         world.answers = ["n"]
         assert world.main(tool, "--skip-launch") == 0
         assert world.launched == [] and world.smoked
@@ -985,6 +1020,8 @@ class TestTheCheckAndSignature:
     def test_a_signed_draft_is_verified_and_not_signed_again(
         self, tool: ModuleType, world: World, tmp_path: Path
     ) -> None:
+        # 上げ終えた目録を確かめずに作り直すと、打ち直すたびに合言葉を尋ね、--key を外した打ち直しは
+        # 「署名する鍵が要る」で止まる
         _signed(world, tool, tmp_path)
         world.answers = ["y", "y"]
         assert world.main(tool, key=False) == 0
@@ -994,6 +1031,7 @@ class TestTheCheckAndSignature:
     def test_a_bad_signature_on_the_draft_stops(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 下書きの壊れた署名を通すと、配った版がどれも信じない目録を公開し、全員の自動更新が止まる
         _signed(world, tool, tmp_path)
         world.github.files["update.json.sig"] = b"AAAA\n"
         world.answers = ["y", "y"]
@@ -1004,6 +1042,7 @@ class TestTheCheckAndSignature:
     def test_a_wrong_passphrase_stops_without_uploading(
         self, tool: ModuleType, world: World
     ) -> None:
+        # 合言葉を打ち間違えたときに止まらないと、署名できていない目録を下書きへ上げようとする
         world.passphrase = "違う合言葉"
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
@@ -1043,6 +1082,8 @@ class TestAPythonChange:
     def test_a_changed_python_is_warned_before_the_question(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # Python が変わる版で注意を出さないと、字幕起こしと AI 連携を入れた人の入れ直し（合わせて
+        # 2 GB を超える）をリリースノートに書かないまま公開する
         self._published_before(tool, world, tmp_path, "cp313")
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -1054,6 +1095,8 @@ class TestAPythonChange:
     def test_the_same_python_says_nothing(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # Python が同じ版にも注意を出すと、入れ直しの要らない版でも
+        # リリースノートに入れ直しの案内を書かせる
         self._published_before(tool, world, tmp_path, "cp314")
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
@@ -1117,6 +1160,8 @@ class TestAPythonChange:
             assert text == ""
 
     def test_a_release_compares_only_with_the_stable_one(self, tool: ModuleType) -> None:
+        # 正式版を beta の目録とも比べると、ベータで既に上げた Python と比べて黙り、
+        # 正式版の人が入れ直しになる版に注意が出ない
         assert tool.previous_manifest_urls(False) == (tool.STABLE_MANIFEST_URL,)
         assert tool.previous_manifest_urls(True) == (
             tool.BETA_MANIFEST_URL,
@@ -1154,6 +1199,7 @@ class TestReusedManifestsFollowTheArguments:
     def test_a_draft_manifest_with_another_minimum_stops(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # --minimum を変えて打ち直したのに前の目録を通すと、古い minimum で署名した目録を公開する
         _signed(world, tool, tmp_path)
         world.answers = ["y", "y"]
         assert world.main(tool, "--minimum", "0.3.0") == 1
@@ -1168,6 +1214,7 @@ class TestReusedManifestsFollowTheArguments:
     def test_other_items_are_compared_too(
         self, tool: ModuleType, world: World, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # minimum のほかの項目（notes_url など）の違いを見逃すと、今の引数と違う目録を公開する
         _signed(world, tool, tmp_path, notes_url="https://example.invalid/notes")
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
@@ -1192,6 +1239,8 @@ class TestReusedManifestsFollowTheArguments:
     def test_resuming_with_another_minimum_stops(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # 引数の違いを言わずに止まると、前と同じ引数で打ち直せば続けられることが分からない
+        # 手で打つ beta への上げ直しを出すと、今の引数で確かめていない目録を広げる
         world.github.beta_release = True
         world.github.fail_uploads = {"beta"}
         world.answers = ["y", "y"]
@@ -1252,6 +1301,8 @@ class TestDryRun:
     def test_it_writes_nothing_and_lists_what_is_left(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # --dry-run でタグ・上げる・確かめ・署名のどれかを行うと、
+        # 様子を見るだけのつもりでタグや下書きが変わる
         world.answers = ["y", "y"]
         assert world.main(tool, "--dry-run") == 0
         out = capsys.readouterr().out
@@ -1272,6 +1323,7 @@ class TestDryRun:
     def test_it_reports_a_missing_prerequisite_and_goes_on(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # --dry-run が前提の欠けで止まると、後の段（下書きのソースなど）の様子が見られない
         world.github.branch = "phase/x"
         assert world.main(tool, "--dry-run") == 1
         out = capsys.readouterr().out
@@ -1281,6 +1333,8 @@ class TestDryRun:
     def test_without_a_tag_it_says_the_tag_would_be_made(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # タグの無い版の --dry-run でタグを打つと、試しに見ただけで push され、
+        # Release の組み立てが走る
         world.github.remote_tag = None
         world.github.draft = None
         world.github.runs["release.yml"] = []

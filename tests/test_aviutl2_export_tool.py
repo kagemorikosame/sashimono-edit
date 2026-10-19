@@ -210,6 +210,8 @@ def test_an_open_program_stops_the_tool_before_it_touches_anything(
 def test_a_finished_export_is_published_and_the_settings_are_restored(
     tool: ModuleType, ready: dict[str, Any]
 ) -> None:
+    # 書き終えた連番が --output に移らないと見本の絵が手に入らず、aviutl2.ini を戻さないと
+    # 道具を走らせた開発者の AviUtl2 が道具の書き換えた設定のまま残る
     assert tool.main(_arguments(ready)) == 0
     assert sorted(path.name for path in ready["output"].iterdir()) == [
         "frame0.png",

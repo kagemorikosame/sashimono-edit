@@ -50,6 +50,7 @@ def _run(tmp_path: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_the_current_baseline_passes(tmp_path: Path) -> None:
+    # 基準どおりの結果で止まると、試験を弱めていない PR でも CI の mutation の検査が落ち続ける
     report = tmp_path / "coverage" / "gremlins" / "gremlins.json"
     _report(report)
 
@@ -57,6 +58,8 @@ def test_the_current_baseline_passes(tmp_path: Path) -> None:
 
 
 def test_a_new_survivor_fails_the_gate(tmp_path: Path) -> None:
+    # 生き残りが基準より 1 件増えたのを通すと、
+    # 試験の検出力を落とした変更が CI の mutation の検査を素通りする
     report = tmp_path / "coverage" / "gremlins" / "gremlins.json"
     _report(report, zapped=131, survived=24)
 
@@ -66,6 +69,7 @@ def test_a_new_survivor_fails_the_gate(tmp_path: Path) -> None:
 
 
 def test_a_lower_score_fails_the_gate(tmp_path: Path) -> None:
+    # レポートの割合を信じると、件数では検出力が落ちていても CI の mutation の検査が通る
     report = tmp_path / "coverage" / "gremlins" / "gremlins.json"
     # レポートの割合が誤っていても、実際の件数から低下を検出する
     _report(report, total=154, zapped=131, reported_percentage=100.0)

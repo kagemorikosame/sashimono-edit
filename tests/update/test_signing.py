@@ -40,6 +40,8 @@ def spare() -> Ed25519PrivateKey:
 
 class TestTheSignature:
     def test_a_signed_manifest_is_trusted(self, current: Ed25519PrivateKey) -> None:
+        # 正しく署名した目録まで通らないと、配った版はどの新しい版も受け取れず、update_sign.py も
+        # 「書いた署名が通らない」で止まる
         signature = sign_manifest(MANIFEST, current)
         assert verify_manifest(MANIFEST, signature, [current.public_key()])
 
@@ -80,11 +82,14 @@ class TestTheSignature:
 
     @pytest.mark.parametrize("signature", [b"", b"not base64!", b"QUJD", b"A" * 5000])
     def test_garbage_is_not(self, current: Ed25519PrivateKey, signature: bytes) -> None:
+        # 壊れた・長すぎる署名を通すと、署名の資産をすり替えるだけで偽の目録を信じさせられる
         assert not verify_manifest(MANIFEST, signature, [current.public_key()])
 
 
 class TestThePublicKey:
     def test_it_round_trips(self, current: Ed25519PrivateKey) -> None:
+        # 書き出した公開鍵を読み戻せないと、貼った鍵が trusted_keys で飛ばされ、配った版が更新を
+        # 確かめなくなる
         text = public_key_text(current.public_key())
         assert text.startswith(KEY_PREFIX)
         signature = sign_manifest(MANIFEST, current)
@@ -120,11 +125,13 @@ class TestThePublicKey:
 
 class TestTheKeyFile:
     def test_it_opens_with_the_passphrase(self, current: Ed25519PrivateKey) -> None:
+        # 正しい合言葉で開けないと、リリースする人が update_sign.py sign で目録に署名できない
         blob = encrypt_private_key(current, "正しい合言葉です長め", n=LIGHT)
         opened = decrypt_private_key(blob, "正しい合言葉です長め")
         assert opened.private_bytes_raw() == current.private_bytes_raw()
 
     def test_a_wrong_passphrase_does_not(self, current: Ed25519PrivateKey) -> None:
+        # 違う合言葉で開けてしまうと、鍵のファイルが漏れたときに合言葉なしで更新へ署名できる
         blob = encrypt_private_key(current, "正しい合言葉です長め", n=LIGHT)
         with pytest.raises(KeyFileError):
             decrypt_private_key(blob, "違う合言葉です長めの")
@@ -140,6 +147,8 @@ class TestTheKeyFile:
     def test_the_public_key_is_shown_without_the_passphrase(
         self, current: Ed25519PrivateKey
     ) -> None:
+        # 合言葉なしで公開鍵を出せないと、update_keys.py show も release.py も、鍵のファイルが
+        # 埋め込んだ何本目の鍵かを見分けられない
         blob = encrypt_private_key(current, "正しい合言葉です長め", n=LIGHT)
         assert key_file_public_key(blob) == public_key_text(current.public_key())
 
@@ -156,11 +165,13 @@ class TestTheKeyFile:
             decrypt_private_key(forged, "正しい合言葉です長め")
 
     def test_an_empty_passphrase_is_refused(self, current: Ed25519PrivateKey) -> None:
+        # 空の合言葉で包めると、鍵のファイルが漏れたときに誰でも開いて更新へ署名できる
         with pytest.raises(KeyFileError):
             encrypt_private_key(current, "", n=LIGHT)
 
     @pytest.mark.parametrize("blob", [b"", b"{}", b"not json", b'{"format": "other"}'])
     def test_other_files_are_refused(self, blob: bytes) -> None:
+        # 別のファイルで KeyFileError にならないと、update_sign.py が [NG] の 1 行でなく例外で落ちる
         with pytest.raises(KeyFileError):
             decrypt_private_key(blob, "正しい合言葉です長め")
 

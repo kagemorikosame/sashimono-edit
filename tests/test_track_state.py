@@ -26,14 +26,17 @@ def names(tracks: tuple[Track, ...]) -> list[str]:
 
 class TestActiveTracks:
     def test_everything_plays_by_default(self) -> None:
+        # 何も付けていないトラックが外れると、そのトラックの音がミキサで鳴らなくなる
         line = timeline(Track(TrackKind.AUDIO, "A1"), Track(TrackKind.AUDIO, "A2"))
         assert names(line.active_tracks(TrackKind.AUDIO)) == ["A1", "A2"]
 
     def test_a_muted_track_is_left_out(self) -> None:
+        # ミュートしたトラックがミキサから外れず、消したはずの音が鳴る
         line = timeline(Track(TrackKind.AUDIO, "A1", muted=True), Track(TrackKind.AUDIO, "A2"))
         assert names(line.active_tracks(TrackKind.AUDIO)) == ["A2"]
 
     def test_solo_leaves_only_the_soloed(self) -> None:
+        # ソロにしてもほかのトラックの音が混ざり、1 本だけを聞き比べられない
         line = timeline(Track(TrackKind.AUDIO, "A1"), Track(TrackKind.AUDIO, "A2", solo=True))
         assert names(line.active_tracks(TrackKind.AUDIO)) == ["A2"]
 
@@ -73,6 +76,7 @@ def two_tracks() -> Project:
 
 class TestSetTrackState:
     def test_only_the_given_flag_changes(self, two_tracks: Project) -> None:
+        # ソロを押しただけでミュートやロックまで書き換わると、音が消えるかクリップに触れなくなる
         track = two_tracks.timeline.tracks[0]
         changed = SetTrackState(track.id, solo=True).apply(two_tracks)
         updated = changed.timeline.tracks[0]
@@ -85,16 +89,20 @@ class TestSetTrackState:
         assert changed.timeline.tracks[1].muted
 
     def test_it_is_one_undo_step(self, two_tracks: Project) -> None:
+        # ミュートを押したあと 1 回の取り消しで押す前へ戻らない
         document = Document(two_tracks)
         document.execute(SetTrackState(two_tracks.timeline.tracks[0].id, muted=True))
         document.undo()
         assert document.project is two_tracks
 
     def test_an_unknown_track_fails(self, two_tracks: Project) -> None:
+        # 呼び元の画面と AI の道具は先に有無を見ている 断らないと、消えたトラックを指す
+        # コマンドが黙って通り、呼び手は変えられなかったことに気付けない
         with pytest.raises(KeyError):
             SetTrackState(Track(TrackKind.VIDEO).id, muted=True).apply(two_tracks)
 
     def test_nothing_given_changes_nothing(self, two_tracks: Project) -> None:
+        # 何も指定しないのに新しいプロジェクトを返すと、取り消しても何も起きない段が履歴に積まれる
         assert SetTrackState(two_tracks.timeline.tracks[0].id).apply(two_tracks) is two_tracks
 
     def test_the_label_says_what_happened(self, two_tracks: Project) -> None:

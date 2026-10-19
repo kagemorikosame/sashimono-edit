@@ -91,6 +91,8 @@ class TestSettings:
         assert new / "templates" in default_template_roots()
 
     def test_old_presets_appear_in_the_list(self, roaming: Path) -> None:
+        # 旧い置き場のプリセットを引き継げないと、
+        # Kumiki の頃に保存したプリセットが改名後の版の一覧に出ず、全部消えたように見える
         _put(
             roaming / "Kumiki" / "presets" / "ユーザー" / "影.kmkp",
             '{"format": "kumiki-preset", "version": 1, "name": "影", "effects": []}',
