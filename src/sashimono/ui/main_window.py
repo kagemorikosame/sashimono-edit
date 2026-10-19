@@ -418,7 +418,10 @@ class MainWindow(QMainWindow):
         plugin.set_scan_all(self._preferences.all_aviutl_plugins)
         #: プレビュー用の控えを作る係 **書き出しには渡さない**
         #: 渡すと、画面では気付かないまま低解像度の絵が最終出力に入る
-        self._proxies = ProxyBuilder(ProxyStore(height=self._preferences.proxy_height))
+        self._proxies = ProxyBuilder(
+            ProxyStore(height=self._preferences.proxy_height),
+            encoder_priority=self._preferences.encoder_priority,
+        )
         self._analysis_dirty = False
         #: 解析ができた素材 次の間隔でタイムラインの細い帯の目安を求め直させる
         #: ワーカースレッドが足し、画面のスレッドが取り出すので錠で守る（``_proxied`` と同じ）
@@ -1003,8 +1006,11 @@ class MainWindow(QMainWindow):
         # 大きさは置き場の鍵が変わるため 切ったときは**走っている変換を止める**ため
         # （切ったのに裏で変換が続くなら、切った意味が無い）
         # 何が変わっても作り直すと、画質の設定を触っただけで進行中の変換が止まる
+        # エンコーダの優先（#365）を替えたときも作り直す 係が優先を持っているので、
+        # 作り直さないと次に起動し直すまで控えの作成に効かない
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
+        reencoded = preferences.encoder_priority != self._preferences.encoder_priority
         previous = self._preferences
         scenes_before = self._scenes_on_import()
         self._preferences = preferences
@@ -1017,9 +1023,12 @@ class MainWindow(QMainWindow):
         # 予約を今の好みにそろえる 決まりは起動の頭と同じ（update.flow.reconcile）
         self._updates.apply_preferences(preferences)
 
-        if resized or stopped:
+        if resized or stopped or reencoded:
             self._proxies.close()
-            self._proxies = ProxyBuilder(ProxyStore(height=preferences.proxy_height))
+            self._proxies = ProxyBuilder(
+                ProxyStore(height=preferences.proxy_height),
+                encoder_priority=preferences.encoder_priority,
+            )
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
         if not preferences.pool_progress:
@@ -2875,6 +2884,7 @@ class MainWindow(QMainWindow):
             smooth_history=self._preferences.smooth_audio_motion,
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
+            encoder_priority=self._preferences.encoder_priority,
         )
         dialog.exec()
         if dialog.embeds_chapters != self._preferences.export_chapters:
@@ -3905,6 +3915,7 @@ class MainWindow(QMainWindow):
                 decode_threads=self._preferences.decode_threads,
                 smooth_history=self._preferences.smooth_audio_motion,
                 chapters=self._preferences.export_chapters,
+                encoder_priority=self._preferences.encoder_priority,
             )
         except (KeyError, ValueError) as exc:
             raise ToolError(str(exc)) from exc

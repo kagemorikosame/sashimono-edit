@@ -46,6 +46,7 @@ from sashimono.engine.encode import (
     export_target,
 )
 from sashimono.engine.encode import export_project as run_export
+from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 
 __all__ = ["CODEC_LABELS", "RANGE_ALL", "RANGE_WORK_AREA", "ExportDialog"]
@@ -55,6 +56,8 @@ CODEC_LABELS = {
     "h264_nvenc": "H.264 (NVIDIA GPU)",
     "hevc_nvenc": "H.265 (NVIDIA GPU)",
     "av1_nvenc": "AV1 (NVIDIA GPU)",
+    "h264_amf": "H.264 (AMD GPU)",
+    "hevc_amf": "H.265 (AMD GPU)",
     "h264_qsv": "H.264 (Intel GPU)",
     "libx264": "H.264 (CPU)",
     "libx265": "H.265 (CPU)",
@@ -111,8 +114,12 @@ class ExportDialog(QDialog):
         smooth_history: bool = True,
         folder: Path | None = None,
         chapters: bool = True,
+        encoder_priority: str = PRIORITY_AUTO,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
+
+        ``encoder_priority`` はどの作り手のエンコーダを先に試すか（本人の設定 #365）
+        コーデックの並びと「自動」の中身がこれに従う
 
         ``folder`` は前に書き出したフォルダ（本人の設定 ``export_folder``） 無ければ
         ビデオのフォルダから始める
@@ -136,6 +143,7 @@ class ExportDialog(QDialog):
         self._pipeline_depth = pipeline_depth
         self._decode_threads = decode_threads
         self._smooth_history = smooth_history
+        self._encoder_priority = encoder_priority
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
         #: 書き出し中に閉じるよう頼まれた 止まった知らせが来たら閉じる
@@ -154,7 +162,8 @@ class ExportDialog(QDialog):
         path_row.addWidget(browse)
 
         self._codec = QComboBox(self)
-        codecs = available_video_codecs()
+        # 「自動」に出す名前と書き出し側が実際に選ぶ物をそろえるため、同じ優先で並べる
+        codecs = available_video_codecs(encoder_priority)
         if codecs:
             # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
             # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
@@ -349,6 +358,7 @@ class ExportDialog(QDialog):
             decode_threads=self._decode_threads,
             smooth_history=self._smooth_history,
             chapters=self._chapters.isChecked(),
+            encoder_priority=self._encoder_priority,
         )
 
     def _start(self) -> None:

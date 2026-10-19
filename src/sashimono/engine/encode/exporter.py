@@ -32,6 +32,7 @@ from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
+from sashimono.engine.encoders import PRIORITY_AUTO, order_by_priority, probe_encoder
 from sashimono.engine.gpu import OffscreenGLContext
 from sashimono.engine.render import (
     DEFAULT_DECODE_THREADS,
@@ -86,8 +87,12 @@ MEASURED_EXPORT_TOTAL_MS = (31.4, 28.5)
 MEASURED_DECODE_MS = (15.9, 11.2)
 
 #: 優先順に並べた映像コーデック 前にあるものから、使えるものを選ぶ
-#: NVENC は CPU をほとんど使わないので、長尺でも編集を続けながら書き出せる
-VIDEO_CODEC_PREFERENCE = ("h264_nvenc", "h264_qsv", "libx264")
+#: GPU のエンコーダは CPU をほとんど使わないので、長尺でも編集を続けながら書き出せる
+#: AMD（AMF）は NVENC の後ろ、Intel（QSV）の前に置く NVENC を持たない AMD の機械で、
+#: CPU や内蔵の Intel より先に AMD の GPU を使うため（#365） NVIDIA と AMD の両方がある
+#: 機械では NVENC を先に使う 先に使う側は本人の設定
+#: （:attr:`ExportSettings.encoder_priority`）で替えられる
+VIDEO_CODEC_PREFERENCE = ("h264_nvenc", "h264_amf", "h264_qsv", "libx264")
 
 _LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
 
@@ -134,6 +139,10 @@ class ExportSettings:
     #: 名前の付いた目印をチャプターとして埋める（#330 2026-10-17 利用者の決定 既定は入）
     #: 効くのは :data:`CHAPTER_SUFFIXES` の入れ物だけ 本人の設定（Preferences）から渡す
     chapters: bool = True
+    #: ``video_codec`` が ``None`` のとき、どの作り手のエンコーダを先に試すか（#365）
+    #: :data:`~sashimono.engine.encoders.ENCODER_PRIORITIES` のどれか
+    #: 本人の設定（Preferences）から渡す
+    encoder_priority: str = PRIORITY_AUTO
 
 
 #: チャプターを埋める入れ物 mp4・mov は章の文字トラック、mkv は Chapters の要素で持つ
@@ -180,24 +189,22 @@ def write_chapters(container: av.container.OutputContainer, chapters: list[Chapt
         container.set_chapters(chapters)
 
 
-#: 開けるかを試すときの大きさ NVENC は小さすぎる画を断る（64x64 では開けない）ので、
-#: 書き出しでよく使う大きさに近い 16:9 で試す 小さくすると、使える NVENC まで外れる
-_PROBE_SIZE = (640, 360)
-
-
-def available_video_codecs() -> list[str]:
+def available_video_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
     """この環境で使える映像コーデックを、優先順に返す
 
-    入っているだけでは数えない 実際に開けたものだけを返す（#67）
-    QSV は FFmpeg に組み込まれていても、Intel の GPU や駆動が無い機械では開けない
-    入っているかだけで選ぶと、開けない QSV が既定になって書き出しが失敗する
+    入っているだけでは数えない 実際に開けて 1 コマ書けたものだけを返す（#67 #365）
+    QSV や AMF は FFmpeg に組み込まれていても、Intel や AMD の GPU や駆動が無い機械では開けない
+    入っているかだけで選ぶと、開けない QSV や AMF が既定になって書き出しが失敗する
+
+    ``priority`` の作り手のエンコーダを前へ寄せる
+    （:func:`~sashimono.engine.encoders.order_by_priority`） 知らない値は ``ValueError``
     """
-    return [name for name in VIDEO_CODEC_PREFERENCE if _opens(name)]
+    return order_by_priority([name for name in VIDEO_CODEC_PREFERENCE if _opens(name)], priority)
 
 
 @cache
 def _opens(name: str) -> bool:
-    """``name`` のエンコーダを開けるか 1 つにつき 1 度だけ試して覚える
+    """``name`` のエンコーダで書けるか 1 つにつき 1 度だけ試して覚える
 
     NVENC を開くのは 1 回 100 ms ほどかかる 書き出しの画面を開くたびに試すと、
     そのたびに待たされる 機械の GPU は起動中に変わらないので、覚えておいてよい
@@ -212,19 +219,12 @@ def _opens(name: str) -> bool:
 
 
 def _open_encoder(name: str) -> None:
-    """``name`` のエンコーダを yuv420p で開いてみる 開けなければ投げる
+    """``name`` のエンコーダを開いて 1 コマ書いてみる 書けなければ投げる
 
-    画素形式は :attr:`ExportSettings.pixel_format` の既定と同じ yuv420p に固定する
-    答えはコーデックごとに 1 つだけ覚えるので、書き出しごとの設定には追従できない
-    別の画素形式で開けないときは、コーデックを指定しない書き出しなら始めた時点で次の候補へ移る
+    試し方は控えの作成と同じ物を使う（:func:`~sashimono.engine.encoders.probe_encoder`）
+    名前をここに残すのは、試験が開けないエンコーダを真似るときにここを差し替えるため
     """
-    # create は種類の union を返す 映像の属性を触るので、ここで型を確定させる
-    context = cast("av.video.codeccontext.VideoCodecContext", av.CodecContext.create(name, "w"))
-    context.width, context.height = _PROBE_SIZE
-    context.pix_fmt = "yuv420p"
-    context.time_base = Fraction(1, 30)
-    # 開いた文脈は捨てるだけでよい PyAV は参照が切れたときに閉じる
-    context.open()
+    probe_encoder(name)
 
 
 class _EncoderOpenError(ExportError):
@@ -269,7 +269,15 @@ def export_project(
     # 指定が無ければ、開けた候補を前から試す 試しに開けても、実際の大きさでは
     # 断られることがある（NVENC の H.264 は幅 4096 を超える画を開けない）
     # そのときに書き出しごと失敗させず、最後は libx264 まで落とす
-    codecs = [settings.video_codec] if settings.video_codec else available_video_codecs()
+    try:
+        codecs = (
+            [settings.video_codec]
+            if settings.video_codec
+            else available_video_codecs(settings.encoder_priority)
+        )
+    except ValueError as exc:
+        # 知らない優先を黙って自動にすると、選んだ物が効かない理由が分からない
+        raise ExportError(str(exc)) from exc
     if not codecs:
         raise ExportError("使える映像コーデックが見つからない")
 

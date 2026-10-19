@@ -166,7 +166,7 @@ class TestCodecs:
 
 
 class TestExport:
-    @pytest.mark.parametrize("codec", ["libx264", "h264_nvenc"])
+    @pytest.mark.parametrize("codec", ["libx264", "h264_nvenc", "h264_amf"])
     def test_produces_a_playable_file(
         self, codec: str, ready_project: Project, tmp_path: Path
     ) -> None:
@@ -569,7 +569,7 @@ class TestColor:
     なり、再生側は行列を推測で読むしかなかった
     """
 
-    @pytest.mark.parametrize("codec", ["libx264", "h264_nvenc", "h264_qsv"])
+    @pytest.mark.parametrize("codec", ["libx264", "h264_nvenc", "h264_amf", "h264_qsv"])
     def test_values_and_tags_are_bt709(
         self, codec: str, bars_project: Project, tmp_path: Path
     ) -> None:
