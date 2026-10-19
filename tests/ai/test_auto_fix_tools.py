@@ -15,7 +15,7 @@ import pytest
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
-from sashimono.core.commands import AddClip, AddEffect, SetTrackState
+from sashimono.core.commands import AddClip, AddEffect, SetClipProperty, SetTrackState
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -202,6 +202,17 @@ class TestAutoColor:
         after = rows[0]["after"]
         before = rows[0]["before"]
         assert after["white_percent"] > before["white_percent"] + 15
+
+    def test_the_picture_stream_of_the_clip_is_measured(self, work: Work) -> None:
+        # 壊れると、2 本目の映像を映すクリップの色を 1 本目のカメラの絵で測る 1 本目は
+        # 整った絵、2 本目は眠い絵にしてあるので、1 本目で測ると何も直さない
+        second = replace(work.picture, stream_index=2)
+        work.host.document.execute(SetClipProperty(work.picture.id, "stream_index", 2))
+        work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.0, light=1.0))
+        work.host.stream_strips[(work.media.id, 2)] = _strip(_scene(dark=0.25, light=0.7))
+        result = _call(work.host, "auto_color", {"clip_ids": [str(second.id)]})
+        rows = result["clips"]
+        assert isinstance(rows, list) and len(rows) == 1
 
     def test_the_reference_cannot_be_one_of_the_targets(self, work: Work) -> None:
         # 壊れると、自分に合わせて何も変わらないのに、変えたと返す

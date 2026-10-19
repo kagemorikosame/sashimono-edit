@@ -23,6 +23,13 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from sashimono.ai.auto_fix import (
+    ColorRequest,
+    NoiseRequest,
+    picture_clip,
+    plan_color_fix,
+    plan_noise_fix,
+)
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -84,7 +91,6 @@ from sashimono.core.commands import (
     RemoveStroke,
     RippleCut,
     SetClipProperty,
-    SetEffectEnabled,
     SetKeyframe,
     SetParam,
     SetResolution,
@@ -163,7 +169,6 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
-    Effect,
     EffectId,
     Interpolation,
     Marker,
@@ -178,7 +183,6 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
-    heard_stream,
 )
 from sashimono.core.projection import project_timeline
 from sashimono.core.seams import (
@@ -206,7 +210,6 @@ from sashimono.core.timebase import (
     seconds_to_frame,
 )
 from sashimono.effects import registry
-from sashimono.effects.audio import DENOISE_KIND
 from sashimono.effects.denoise import (
     AUTO_REDUCTION_DB_RANGE,
     DEFAULT_SENSITIVITY_DB,
@@ -232,7 +235,6 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
-from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.speech import (
     SPEECH_SOURCES,
     SpeechError,
@@ -241,14 +243,7 @@ from sashimono.engine.audio.speech import (
     voice_speech,
 )
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.auto_color import (
-    AUTO_COLOR_STRENGTH_RANGE,
-    GRADE_KIND,
-    graded,
-    pixels_of,
-    plan_auto,
-    plan_match,
-)
+from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
 from sashimono.engine.checks import KINDS as CHECK_KINDS
@@ -3875,186 +3870,28 @@ def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
 
 
-#: 色を測るのに使うサムネイルの枚数の上限（#336） 0.5 秒ごとの絵なので、長いクリップでも
-#: 等間隔に間引いてこれだけを見る 明るさの分布と色の平均はこの数で落ち着く
-COLOR_SAMPLE_TILES = 24
-#: 色の自動補正が入れる値（拡張色調補正の欄） 掛け直すときはここだけを置き換え、人が足した
-#: ほかの欄（リフト・色相など）は残す
-_AUTO_GRADE_PARAMS = (
-    "luma_gain",
-    "luma_offset",
-    "luma_gamma",
-    "sat_gain",
-    "red_gain",
-    "green_gain",
-    "blue_gain",
-)
-
-
-def _picture_clip(project: Project, clip_id: object, *, editing: bool = True) -> tuple[Track, Clip]:
-    """素材の絵を描くクリップ テキスト・図形・置いたシーン・音だけのクリップは測れないので断る
-
-    変える（``editing``）ならロックしたトラックのクリップも断る 合わせる相手（見るだけ）は
-    ロックしていても使う
-    """
-    track, clip = _require_clip(project, str(clip_id))
-    media = project.find_media(clip.media_id) if clip.media_id is not None else None
-    if media is None or not project.draws_picture(track, clip) or not media.has_video:
-        raise ToolError(
-            f"{clip_id} は素材の絵を描くクリップではありません（テキスト・図形・置いたシーン・"
-            "音だけのクリップは色を測れない） 動画か画像のクリップを指してください"
-        )
-    if editing and track.locked:
-        raise ToolError(
-            f"{clip_id} のトラック {track.name} はロックされています"
-            " 変えるなら set_track_state でロックを解いてから"
-        )
-    return track, clip
-
-
-def _clip_tiles(host: EditorHost, project: Project, clip: Clip) -> list[Any]:
-    """クリップに映る範囲のサムネイル（RGBA） まだ無ければ用意を頼んで断る"""
-    assert clip.media_id is not None
-    media = _require_media(project, str(clip.media_id))
-    strip = host.filmstrip(media)
-    if strip is None or strip.count == 0:
-        host.analyze(media)
-        raise ToolError(
-            f"{media.name} のサムネイルがまだできていません（取り込みの後に裏で作る）"
-            " 少し待ってからもう 1 度呼んでください"
-        )
-    start = clip.source_in
-    end = clip.source_out(project.rate)
-    if clip.hold_at is not None:
-        end = min(end, max(clip.hold_at, start))
-    picks = COLOR_SAMPLE_TILES
-    numbers = {
-        index
-        for step in range(picks)
-        if (index := strip.index_at(start + (end - start) * step / picks)) is not None
-    }
-    return [tile for index in sorted(numbers) if (tile := strip.tile(index)) is not None]
-
-
-def _head_grade(clip: Clip) -> Effect | None:
-    """クリップの頭（一番先に掛かる所）にある拡張色調補正 色の自動補正が置く所"""
-    if clip.effects and clip.effects[0].kind == GRADE_KIND and not clip.effects[0].fixed:
-        return clip.effects[0]
-    return None
-
-
-def _clip_pixels(host: EditorHost, project: Project, clip: Clip, *, graded_head: bool) -> Any:
-    """クリップの絵の画素（sRGB） ``graded_head`` なら頭の拡張色調補正を掛けた後の色
-
-    合わせる相手は、色の自動補正を掛けた後の見え方に合わせる 素材のままの色に合わせると、
-    整えたクリップに合わせたつもりで整える前の色へ寄る
-    """
-    pixels = pixels_of(_clip_tiles(host, project, clip))
-    if len(pixels) == 0:
-        raise ToolError(f"{clip.id} の絵がすべて透けていて色を測れません")
-    head = _head_grade(clip)
-    if graded_head and head is not None and head.enabled:
-        values = {
-            name: value.static
-            for name, value in head.params.items()
-            if isinstance(value, AnimatedValue)
-        }
-        values |= {n: v for n, v in head.params.items() if isinstance(v, bool)}
-        pixels = graded(pixels, values)
-    return pixels
-
-
-def _grade_commands(clip: Clip, params: dict[str, float]) -> tuple[list[Command], bool]:
-    """拡張色調補正をクリップの頭へ積む 頭にもうあれば自動補正の欄だけを置き換える
-
-    頭に積むのは、測ったのが素材の色だから 後ろに積むと、前に積んだエフェクト（色を変える
-    物など）を通した後の絵に、素材の色で決めた値を掛けることになる
-    返す真偽は置き換えたか
-    """
-    head = _head_grade(clip)
-    if head is None:
-        effect = registry.require(GRADE_KIND).create(**params)
-        return [AddEffect(clip.id, effect, index=0)], False
-    moving = [
-        name
-        for name in _AUTO_GRADE_PARAMS
-        if isinstance(value := head.params.get(name), AnimatedValue) and value.is_animated
-    ]
-    if moving:
-        raise ToolError(
-            f"{clip.id} の頭の拡張色調補正は {', '.join(moving)} をキーフレームで動かしています"
-            " 置き換えると動きが消えるので触りません 外すか、別のクリップで試してください"
-        )
-    commands: list[Command] = [
-        SetParam(
-            ParamPath.of_effect(clip.id, head.id, name),
-            AnimatedValue(static=params.get(name, 0.0)),
-        )
-        for name in _AUTO_GRADE_PARAMS
-    ]
-    if not head.enabled:
-        # 人が切った補正の値だけを直すと、効いていないのに整えたと返すことになる
-        commands.append(SetEffectEnabled(clip.id, head.id, True))
-    return commands, True
-
-
 def _auto_color(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    targets = [_picture_clip(project, clip_id) for clip_id in _target_clips(host, arguments)]
+    targets = [picture_clip(project, clip_id)[1] for clip_id in _target_clips(host, arguments)]
     strength = _limit_number(
         arguments, "strength_percent", float(host.auto_color_strength), *AUTO_COLOR_STRENGTH_RANGE
     )
-    exposure = _flag_argument(arguments, "exposure", True)
-    white_balance = _flag_argument(arguments, "white_balance", True)
-    if not exposure and not white_balance:
-        raise ToolError("exposure と white_balance の両方を false にすると何も直しません")
-    reference: Any = None
     match = arguments.get("match_clip_id")
-    if match is not None:
-        _, model = _picture_clip(project, match, editing=False)
-        if any(clip.id == model.id for _, clip in targets):
-            raise ToolError("合わせる相手（match_clip_id）を直すクリップに入れないでください")
-        reference = _clip_pixels(host, project, model, graded_head=True)
-    rows: list[dict[str, Any]] = []
-    unchanged: list[str] = []
-    commands: list[Command] = []
-    for _, clip in targets:
-        pixels = _clip_pixels(host, project, clip, graded_head=False)
-        if reference is None:
-            plan = plan_auto(
-                pixels, strength=strength, exposure=exposure, white_balance=white_balance
-            )
-        else:
-            plan = plan_match(
-                pixels,
-                reference,
-                strength=strength,
-                exposure=exposure,
-                white_balance=white_balance,
-            )
-        if not plan.changes:
-            unchanged.append(str(clip.id))
-            continue
-        made, replaced = _grade_commands(clip, plan.params)
-        commands.extend(made)
-        row: dict[str, Any] = {
-            "clip_id": str(clip.id),
-            "before": plan.before.summary(),
-            "after": plan.after.summary(),
-            "params": plan.params,
-            "replaced": replaced,
-        }
-        if plan.notes:
-            row["notes"] = list(plan.notes)
-        rows.append(row)
-    result: dict[str, Any] = {"clips": rows, "strength_percent": strength}
-    if unchanged:
-        result["unchanged_clip_ids"] = unchanged
-    if not commands:
+    request = ColorRequest(
+        strength=strength,
+        exposure=_flag_argument(arguments, "exposure", True),
+        white_balance=_flag_argument(arguments, "white_balance", True),
+        match=ClipId(str(match)) if match is not None else None,
+    )
+    fix = plan_color_fix(host, project, targets, request)
+    result: dict[str, Any] = {"clips": list(fix.rows), "strength_percent": strength}
+    if fix.unchanged:
+        result["unchanged_clip_ids"] = [str(clip_id) for clip_id in fix.unchanged]
+    if not fix.commands:
         result["note"] = "どのクリップもすでに整っています 何も変えていません"
         return result
-    label = "色を合わせる" if reference is not None else "色を自動で整える"
-    host.apply_commands(commands, f"{label}: {len(rows)} 本")
+    label = "色を合わせる" if request.match is not None else "色を自動で整える"
+    host.apply_commands(list(fix.commands), f"{label}: {len(fix.rows)} 本")
     result["note"] = (
         "クリップの頭に拡張色調補正を積みました（前に自動で積んだ物があれば値を置き換え）"
         " 人は設定パネルの「拡張色調補正」で直せます 取り消し 1 回で元に戻ります"
@@ -4067,67 +3904,29 @@ def _auto_color(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _reduce_noise(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     targets = _picked_sound_clips(host, arguments, "clip_ids", "track_id")
-    reduction = _limit_number(
-        arguments, "reduction_db", float(host.denoise_reduction), *AUTO_REDUCTION_DB_RANGE
+    request = NoiseRequest(
+        reduction=_limit_number(
+            arguments, "reduction_db", float(host.denoise_reduction), *AUTO_REDUCTION_DB_RANGE
+        ),
+        sensitivity=_limit_number(
+            arguments, "sensitivity_db", DEFAULT_SENSITIVITY_DB, *SENSITIVITY_DB_RANGE
+        ),
+        force=_flag_argument(arguments, "force", False),
     )
-    sensitivity = _limit_number(
-        arguments, "sensitivity_db", DEFAULT_SENSITIVITY_DB, *SENSITIVITY_DB_RANGE
-    )
-    force = _flag_argument(arguments, "force", False)
-    waiting: list[MediaItem] = []
-    measured: list[tuple[Clip, NoiseEstimate | None]] = []
-    for track, clip in targets:
-        media = project.find_media(clip.media_id) if clip.media_id is not None else None
-        if media is None:
-            # 置いたシーンは素材の波形を持たない 測らずに掛けるのは force のときだけ
-            measured.append((clip, None))
-            continue
-        waveform = host.waveform(media, heard_stream(track, clip))
-        if waveform is None:
-            host.analyze(media)
-            waiting.append(media)
-            continue
-        estimate = estimate_noise(waveform, clip.source_in, clip.source_out(project.rate))
-        measured.append((clip, estimate))
-    if waiting:
-        names = "、".join(dict.fromkeys(media.name for media in waiting))
-        raise ToolError(
-            f"{names} の波形解析がまだ終わっていません 何も変えていません"
-            " 少し待ってから呼んでください"
-        )
-    rows: list[dict[str, Any]] = []
-    skipped: list[dict[str, str]] = []
-    commands: list[Command] = []
-    for clip, estimate in measured:
-        reason = _noise_skip_reason(estimate)
-        if reason and not force:
-            skipped.append({"clip_id": str(clip.id), "reason": reason})
-            continue
-        made, replaced = _denoise_commands(clip, reduction, sensitivity)
-        commands.extend(made)
-        row: dict[str, Any] = {"clip_id": str(clip.id), "replaced": replaced}
-        if estimate is not None:
-            row |= {
-                "noise_dbfs": estimate.noise_db,
-                "speech_dbfs": estimate.speech_db,
-                "margin_db": round(estimate.margin_db, 1),
-            }
-        if reason:
-            row["forced"] = reason
-        rows.append(row)
+    fix = plan_noise_fix(host, project, targets, request)
     result: dict[str, Any] = {
-        "clips": rows,
-        "reduction_db": reduction,
-        "sensitivity_db": sensitivity,
+        "clips": list(fix.rows),
+        "reduction_db": request.reduction,
+        "sensitivity_db": request.sensitivity,
     }
-    if skipped:
-        result["skipped"] = skipped
-    if not commands:
+    if fix.skipped:
+        result["skipped"] = list(fix.skipped)
+    if not fix.commands:
         result["note"] = (
             "どのクリップにも掛けませんでした（skipped の理由） 掛けるなら force を true にします"
         )
         return result
-    host.apply_commands(commands, f"ノイズを減らす: {len(rows)} 本")
+    host.apply_commands(list(fix.commands), f"ノイズを減らす: {len(fix.rows)} 本")
     result["note"] = (
         "音のエフェクト「ノイズ除去」を足しました（前からあれば値を置き換え）"
         " 一定に鳴り続ける雑音（空調・機械の音・マイクのサー）を下げ、咳や物音のような"
@@ -4135,41 +3934,6 @@ def _reduce_noise(host: EditorHost, arguments: dict[str, Any]) -> object:
         " 取り消し 1 回で元に戻ります"
     )
     return result
-
-
-def _noise_skip_reason(estimate: NoiseEstimate | None) -> str:
-    """見積もりから掛けない訳 掛けてよければ空"""
-    if estimate is None:
-        return "素材の波形が無いか 1 秒より短く、雑音を測れません（置いたシーンなど）"
-    if not estimate.audible:
-        return (
-            f"雑音は {estimate.noise_db:g} dBFS で聞こえない大きさです"
-            f"（{QUIET_NOISE_DB:g} dBFS 以下）"
-        )
-    if not estimate.has_quiet_parts:
-        return (
-            f"静かな所と大きい所の差が {estimate.margin_db:.1f} dB しかありません"
-            "（音楽か、ずっと続く音か、雑音に埋もれた声） 下げると声や音楽まで削れます"
-        )
-    return ""
-
-
-def _denoise_commands(
-    clip: Clip, reduction: float, sensitivity: float
-) -> tuple[list[Command], bool]:
-    """ノイズ除去を積む もうあれば値だけを置き換える（重ねて掛けると声まで削れる）"""
-    found = next((effect for effect in clip.effects if effect.kind == DENOISE_KIND), None)
-    if found is None:
-        effect = registry.require(DENOISE_KIND).create(reduction=reduction, sensitivity=sensitivity)
-        # 位置は渡さない 固定の項目（音量・フェード）の前へ入る 雑音を下げてから音量を掛ける
-        return [AddEffect(clip.id, effect)], False
-    commands: list[Command] = [
-        SetParam(ParamPath.of_effect(clip.id, found.id, name), AnimatedValue(static=value))
-        for name, value in (("reduction", reduction), ("sensitivity", sensitivity))
-    ]
-    if not found.enabled:
-        commands.append(SetEffectEnabled(clip.id, found.id, True))
-    return commands, True
 
 
 def _seconds(value: object) -> Fraction:

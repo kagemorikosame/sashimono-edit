@@ -231,8 +231,9 @@ class EditorHost(Protocol):
         """用意できていれば波形を返す 無ければ ``None`` ``stream`` は音声（省けば 1 本目）"""
         ...
 
-    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
         """用意できていればサムネイルのシート（タイムラインに並ぶ絵）を返す 無ければ ``None``
+        ``stream`` は映像の流れ（省けば 1 本目） クリップが映す流れの絵で測る
 
         色を測る道具（``auto_color`` #336）が読む 素材を読み直すと、4K の素材で道具が返るまで
         画面が止まる 取り込みのときに裏で作ってある物を使う

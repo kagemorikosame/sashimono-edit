@@ -104,6 +104,8 @@ class FakeHost:
         self.noise_reduction = int(DEFAULT_REDUCTION_DB)
         #: 素材ごとのサムネイルのシート 試験が入れる 無ければまだ用意できていない
         self.filmstrips: dict[MediaId, Filmstrip] = {}
+        #: 映像の流れを名指しして引かれたときのシート（素材, 流れ）
+        self.stream_strips: dict[tuple[MediaId, int | None], Filmstrip] = {}
         #: 音声ごとの波形 試験が入れる 無ければ stub_waveform
         self.waveforms: dict[tuple[MediaId, int | None], Waveform] = {}
         self.check_requests: list[CheckRequest] = []
@@ -247,8 +249,9 @@ class FakeHost:
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         return self.waveforms.get((media.id, stream), self.stub_waveform)
 
-    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
-        return self.filmstrips.get(media.id)
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
+        # 流れを名指しした物を先に引く 無ければ素材の物（1 本目の映像）
+        return self.stream_strips.get((media.id, stream), self.filmstrips.get(media.id))
 
     @property
     def auto_color_strength(self) -> int:
