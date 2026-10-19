@@ -199,17 +199,17 @@ class TestShowingUsage:
         assert widget._usage_text.text() == "今日: 0 トークン・絵 0 枚"
 
     def test_the_divider_keeps_what_the_instruction_used(
-        self, panel: tuple[ChatPanel, FakeHost], monkeypatch: pytest.MonkeyPatch
+        self, panel: tuple[ChatPanel, FakeHost]
     ) -> None:
         # 壊れると、終わった後にどの指示が重かったかを見返せない
+        # 送る所は通さない（AI の部品の無い機械では送らずに案内を出すので、指示が始まらない）
         widget, _ = panel
-        # Claude Code は起こさない 送った後の数えと区切りの行だけを見る
-        monkeypatch.setattr(widget, "_dispatch", lambda prompt: None)
-        widget._input.setPlainText("切って")
-        widget.send()
+        widget._queued.append("切って")
+        widget._begin_turn()
         widget._bridge.usage.record_message("m", {"output_tokens": 12_345})
+        widget._bridge.usage.record_image()
         widget._handle(AgentEvent(EventKind.TURN_DONE))
-        assert "1.2 万 トークン" in widget._view.toPlainText()
+        assert "1.2 万 トークン・絵 1 枚" in widget._view.toPlainText()
 
     def test_the_day_is_written_to_the_settings_folder(
         self, panel: tuple[ChatPanel, FakeHost]
