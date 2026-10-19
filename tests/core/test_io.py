@@ -101,8 +101,8 @@ class TestRoundTrip:
         assert project_from_dict(data) == original
 
     def test_fractions_are_written_as_strings(self, tmp_path: Path) -> None:
-        # 29.97 fps（30000/1001）を小数で書くと開き直しても同じ分数に戻らず、フレームを
-        # 秒へ直すたびに誤差が乗る
+        # 29.97 fps（30000/1001）を小数で書くと、読む側（_fraction_from_json）は小数を
+        # 分数ではないと断るので、保存した作品が開けなくなる
         settings = ProjectSettings(frame_rate=FrameRate(30000, 1001))
         project = Project.create(settings)
         path = tmp_path / "ntsc.sme"
@@ -191,7 +191,8 @@ class TestValidation:
             project_from_dict(data)
 
     def test_rejects_unknown_interpolation(self, rich_project: Project) -> None:
-        # 知らない補間方法を通すと、新しい版で付けた動きが前の版で黙って別の動きになる
+        # 名前を添えて断らないと、Enum の英語の文が「壊れた値がある」に包まれて出るだけで、
+        # 新しい版で付けた補間を前の版で開いたとき、何が読めないのか分からない
         data = project_to_dict(rich_project)
         clip = data["timeline"]["tracks"][0]["clips"][0]
         clip["effects"][0]["params"]["radius"]["keyframes"][0]["interpolation"] = "魔法"

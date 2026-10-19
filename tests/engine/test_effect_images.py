@@ -616,8 +616,8 @@ class TestWhatToRedraw:
             renderer.close()
 
     def test_nothing_changed_drops_nothing(self) -> None:
-        # 書き換わっていないのに範囲を返すと、画像の見張りが回るたびに先読みした絵が捨てられ、
-        # プレビューが描き直しで引っかかる
+        # 今は使っていない画像（前に読んだ物）が書き換わっただけで範囲を返すと、関係の無い
+        # ファイルを保存するたびに先読みした絵が捨てられ、プレビューが描き直しで引っかかる
         project = _project(self._clip(0, "a.png"))
         assert not image_spans(project, set())
         assert not image_spans(project, {"別の.png"})

@@ -323,8 +323,8 @@ class TestKeyframes:
         assert [(k.frame, k.value) for k in value.keyframes] == [(0, 90.0)]
 
     def test_move_unknown_frame(self, placed: Project) -> None:
-        # 動かす点が無いと断らないと、別の操作で消えた点をグラフエディタでつまんで動かしたとき、
-        # 何を動かしたのか分からない失敗になる
+        # 動かす点が無いと KeyError で断らないと、None を replace へ渡して TypeError になる
+        # execute_all は ValueError と KeyError しか受けず、グラフエディタの操作から例外が漏れる
         project, path = self._path(placed)
         project = SetKeyframe(path, 0, 0.0).apply(project)
         with pytest.raises(KeyError):

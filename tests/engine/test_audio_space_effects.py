@@ -263,8 +263,8 @@ class TestEditingInsideAPlacedScene:
             mixer.close()
 
     def test_unrelated_edits_keep_what_was_made(self, tmp_path: Path) -> None:
-        # 関係の無い編集のたびに作り直すと、リバーブを掛けたシーンのある作品で編集する
-        # たびに前の音を読み直し、再生が間に合わず途切れる
+        # 関係の無い編集でも作り直すと、リバーブを掛けたシーンのある作品で編集のたびに
+        # 前の音を読み直してリバーブを掛け直し、その後の再生で余計な時間を食う
         project, _ = self._placed(tmp_path)
         mixer = AudioMixer(project)
         try:

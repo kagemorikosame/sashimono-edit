@@ -260,8 +260,8 @@ class TestExport:
         assert frames == ready_project.duration
 
     def test_video_only_project(self, silent_project: Project, tmp_path: Path) -> None:
-        # 音の無い作品に中身の無い音声トラックが付くと、
-        # 再生ソフトや動画サイトが音のある動画として扱う
+        # 音を鳴らすクリップが無いのに音声の道を作ると、書き出しの窓や AI の書き出しで出した
+        # 動画に黙った音声トラックが付き、絵だけの動画にならない
         output = tmp_path / "silent.mp4"
         export_project(silent_project, ExportSettings(path=output, video_codec="libx264"))
 
@@ -321,7 +321,8 @@ class TestExport:
         assert not output.exists()
 
     def test_empty_timeline_is_refused(self, tmp_path: Path) -> None:
-        # 何も置いていない作品で書き出したとき、理由を示さずに失敗するか中身の無い動画ができる
+        # 画面と AI の道具は手前で空を断るが、ここを直に呼んで空のまま進むと 1 枚も描かずに
+        # 成功として出力先を返し、そのファイルは出来ていない
         empty = Project.create(ProjectSettings(width=320, height=240))
         with pytest.raises(ExportError, match="範囲が空"):
             export_project(empty, ExportSettings(path=tmp_path / "empty.mp4"))

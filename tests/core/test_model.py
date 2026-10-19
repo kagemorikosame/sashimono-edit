@@ -122,16 +122,16 @@ class TestTimeline:
             Timeline(rate=RATE_30, tracks=(track, track))
 
     def test_rejects_inverted_work_area(self) -> None:
-        # 終わりが頭以前の書き出し範囲を持てると、範囲を指定して書き出したときに中身の
-        # 無い動画になる
+        # 終わりが頭以前の書き出し範囲を持てると、書き出しの窓はその範囲を「タイムラインの
+        # 終わりより後ろなので使えない」と違う理由で見せる
         with pytest.raises(ValueError, match="書き出し範囲"):
             Timeline(rate=RATE_30, work_area=(100, 100))
 
 
 class TestProject:
     def test_rate_must_match_timeline(self) -> None:
-        # 設定とタイムラインでフレームレートが違うと、フレームで数えた位置を秒へ直す割合が
-        # 所ごとに違い、絵と音や字幕の時刻がずれる
+        # 設定とタイムラインでフレームレートが違うと、目次（chapters_of）だけが timeline.rate で
+        # 秒へ直し、ほかは設定の rate を使うので、目次の時刻が動画とずれる
         with pytest.raises(ValueError, match="一致しない"):
             Project(
                 settings=ProjectSettings(frame_rate=FrameRate(30)),

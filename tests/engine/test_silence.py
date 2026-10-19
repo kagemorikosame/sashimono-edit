@@ -110,7 +110,8 @@ class TestDetectSilence:
         assert detect_silence(waveform, absorb) == ((at(0), at(420)),)
 
     def test_an_empty_waveform_yields_nothing(self) -> None:
-        # 長さ 0 の波形でつまずくと、音の無い素材を選んで無音を探しただけで操作が止まる
+        # 長さ 0 の波形で空を返せないと、長さ 0 の音声の素材に無音カットを掛けたとき
+        # 字幕パネルと AI の道具が「切る所が無い」と返せずに止まる
         empty = Waveform(
             sample_rate=SAMPLE_RATE,
             channels=1,
@@ -120,8 +121,8 @@ class TestDetectSilence:
         assert detect_silence(empty) == ()
 
     def test_invalid_options_are_rejected(self) -> None:
-        # 最短無音長 0 を黙って受けると、言葉の間のほんの一瞬まで切る指示になり、
-        # 話が細切れに詰められる
+        # 最短無音長 0 を黙って受けると、AI の無音カットが min_silence に 0 を渡したとき
+        # （画面は 0.05 秒が下限） 言葉の間のほんの一瞬まで切り、話が細切れに詰められる
         with pytest.raises(ValueError, match="最短無音長"):
             SilenceOptions(min_silence=Fraction(0))
 

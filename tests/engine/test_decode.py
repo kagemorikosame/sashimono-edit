@@ -278,8 +278,8 @@ class TestVideoDecoder:
             assert decoder.frame_at(Fraction(10)) is None
 
     def test_negative_time_clamps_to_the_start(self, sample_av: SampleMedia) -> None:
-        # 素材の頭より前を頼まれて何も返さないと、クリップの頭で 1 コマ目が出ず
-        # 何も映らないコマが挟まる
+        # 頭より前の時刻で None を返すと、None は終端を越えたときだけという frame_at の約束が
+        # 破れ、呼び手は頭より前を頼んだだけなのに素材が終わったと受け取る
         with VideoDecoder(sample_av.path) as decoder:
             first = decoder.frame_at(Fraction(0))
             before = decoder.frame_at(Fraction(-5))
@@ -473,8 +473,8 @@ class TestAudioDecoder:
         assert samples.shape == (4800, 1)
 
     def test_read_seconds(self, sample_av: SampleMedia) -> None:
-        # 秒で頼んだ範囲がサンプル数に正しく直らないと、秒で読む呼び手が頼んだ時刻と
-        # 違う所の音や違う長さを受け取る
+        # 秒からサンプル数への直しを誤ると、read_seconds は頼んだ時刻と違う所の音や、
+        # 頼んだ長さと違うサンプル数の配列を返す
         with AudioDecoder(sample_av.path, sample_rate=48000) as decoder:
             samples = decoder.read_seconds(Fraction(1, 2), Fraction(1, 4))
         assert samples.shape == (12000, 2)

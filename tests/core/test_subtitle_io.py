@@ -41,7 +41,7 @@ class TestSrt:
         assert srt.startswith("1\n00:00:00,000 --> 00:00:02,000\n今日は\n")
 
     def test_empty_text_is_skipped(self, project: Project, video_media: MediaItem) -> None:
-        # 空白だけの字幕まで書くと、読み込んだ先で何も書いていない字幕が 1 枚として並ぶ
+        # 空白だけの字幕まで書くと、字幕の書き出しで出した SRT に本文の無いコマが番号付きで混ざる
         from sashimono.core.model import TranscriptSegment
 
         blank = Transcript(
@@ -55,7 +55,8 @@ class TestSrt:
         assert to_srt(project_timeline(placed), placed.rate).count("-->") == 1
 
     def test_no_subtitles_gives_an_empty_string(self, project: Project) -> None:
-        # 字幕の無い作品で空のファイルにならないと、読み込んだ先に覚えの無い字幕の行が出る
+        # 字幕の無い作品で何か返すと、字幕の書き出し（メニュー・字幕パネル・AI）がそのまま書き、
+        # 中身の無いはずの SRT に字幕でない行が入る
         assert to_srt(project_timeline(project), project.rate) == ""
 
 

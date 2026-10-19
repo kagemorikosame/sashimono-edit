@@ -98,7 +98,8 @@ class TestTrackCommands:
         assert updated.timeline.tracks == ()
 
     def test_remove_unknown_track_fails(self, project: Project) -> None:
-        # 無いトラックを消す指示が黙って通ると、呼んだ側（画面や AI）は消せたものとして先へ進む
+        # 無いトラックを消す指示が黙って通ると、execute_all が成功を返し、
+        # 消せなかった知らせがステータスバーに出ない
         from sashimono.core.model import TrackId
 
         with pytest.raises(KeyError):

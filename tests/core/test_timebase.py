@@ -62,8 +62,8 @@ class TestFrameRate:
         ],
     )
     def test_parse(self, text: str, expected: FrameRate) -> None:
-        # 29.97 や 23.976 と小数で書かれたレートを分数へ吸着できないと、1 時間で 3 フレーム
-        # 以上ずれ、音と絵が終盤で食い違う
+        # 小数を放送規格の分数へ寄せられないと 29.97 が 2997/100 のまま返り、欠番を持てない
+        # レートと見なされて、format_timecode がドロップフレームで数えなくなる
         assert FrameRate.parse(text) == expected
 
     def test_decimal_snaps_to_broadcast_rate(self) -> None:
@@ -244,14 +244,14 @@ class TestTimecode:
 
     @given(frame=st.integers(min_value=0, max_value=30 * 3600 * 4))
     def test_drop_frame_round_trip(self, frame: int) -> None:
-        # 表示と読みのどちらかが欠番を数え違えると、表示したタイムコードを読み返したときに
-        # 別のコマを指す（29.97fps の長尺ほど食い違いが大きい）
+        # parse_timecode と format_timecode の欠番の数え方が食い違うと、format_timecode が
+        # 出した 29.97fps の文字列を読み返しても元のフレーム番号に戻らない
         assert parse_timecode(format_timecode(frame, NTSC_30), NTSC_30) == frame
 
     @given(frame=st.integers(min_value=0, max_value=60 * 3600 * 2))
     def test_drop_frame_round_trip_59_94(self, frame: int) -> None:
-        # 59.94fps は 1 分ごとに 4 番を飛ばす 2 番のまま数えると、表示したタイムコードを
-        # 読み返したときに 59.94fps の作品で別のコマを指す
+        # 59.94fps は 1 分ごとに 4 番を飛ばす 2 番のまま数えると、format_timecode が出した
+        # 59.94fps の文字列を読み返しても元のフレーム番号に戻らない
         assert parse_timecode(format_timecode(frame, NTSC_60), NTSC_60) == frame
 
     @given(
@@ -259,8 +259,8 @@ class TestTimecode:
         rate=st.sampled_from([FILM, PAL, FrameRate(30), FrameRate(60)]),
     )
     def test_non_drop_round_trip(self, frame: int, rate: FrameRate) -> None:
-        # 負の時刻や 24・25fps で表示と読みが食い違うと、タイムコードで指した位置が
-        # 書いた所と別のフレームになる
+        # 負の時刻や 24・25fps で表示と読みが食い違うと、format_timecode が出した文字列を
+        # parse_timecode で読み返しても元のフレーム番号に戻らない
         assert parse_timecode(format_timecode(frame, rate), rate) == frame
 
     def test_separator_signals_drop_frame(self) -> None:
@@ -280,7 +280,7 @@ class TestTimecode:
         "text", ["", "abc", "1:2", "00:00:00", "00:60:00:00", "00:00:60:00", "00:00:00:30"]
     )
     def test_rejects_malformed(self, text: str) -> None:
-        # 崩れたタイムコードを 0 や近い値で受けると、打ち間違えたのに気付けないまま
-        # 違う位置を指す
+        # 崩れたタイムコードを 0 や近い値で受けると、呼び手は ValueError で崩れを知れず、
+        # 書かれていないフレーム番号を受け取る
         with pytest.raises(ValueError):
             parse_timecode(text, FrameRate(30))

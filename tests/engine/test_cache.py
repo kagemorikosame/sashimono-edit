@@ -188,7 +188,8 @@ class TestFilmstrip:
         assert build_filmstrip(sample_av.path, should_cancel=lambda: True) is None
 
     def test_broken_media_returns_none(self, tmp_path: Path) -> None:
-        # 行方不明の素材で例外が上がると、サムネイルが無いだけで済む所で解析の仕事が異常終了する
+        # 読めない素材は None で返す約束 例外にすると解析の係が拾って失敗には数えるが、
+        # 素材の行に出る理由が素の例外の文になる
         assert build_filmstrip(tmp_path / "無い.mp4") is None
 
     def test_round_trip(self, store: CacheStore, sample_av: SampleMedia) -> None:
@@ -279,8 +280,8 @@ class TestMediaAnalyzer:
     def test_video_only_media_gets_no_waveform(
         self, store: CacheStore, sample_long: SampleMedia
     ) -> None:
-        # 映像だけの素材は音を待たずにサムネイルを出す 無い音の波形を作りに行くと、
-        # 開けずに失敗として進み具合に数えられる
+        # 無い音の波形を作りに行くと開けずに失敗に数えられ、映像だけの素材の行に
+        # 「解析できなかった」が付き、終わりの知らせにも失敗の件数が出る
         media = probe_media(sample_long.path)
         analyzer = MediaAnalyzer(store)
         try:

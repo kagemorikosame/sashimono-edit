@@ -18,8 +18,8 @@ pytestmark = pytest.mark.usefixtures("gpu")
 
 
 def test_release_destroys_the_context_too() -> None:
-    # 書き出しや先読みの後もコンテキストがごみ集めまで残り、共有元のプレビューが先に消えると
-    # ソフトを閉じる片付けで落ちる（#149 と同じ形）
+    # 書き出しや先読みを終えてもコンテキストがごみ集めまで残り、いつ壊れるかが分からなくなる
+    # （作りかけを壊す _discard と同じ理由 #149）
     context = OffscreenGLContext()
     gl, surface = context.context, context.surface
     with context:

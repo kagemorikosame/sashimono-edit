@@ -66,15 +66,15 @@ class TestBasicProjection:
     def test_media_without_transcript_yields_nothing(
         self, project: Project, video_media: MediaItem
     ) -> None:
-        # 文字起こし前の素材でつまずくと、まだ字幕を作っていない動画を置いただけで
-        # 字幕パネルと字幕の書き出しが働かなくなる
+        # 文字起こし前の素材でつまずくと、字幕をまだ作っていない動画を置いただけで
+        # 字幕の書き出しと焼き込み（字幕パネルと AI の道具）が例外で止まる
         track = project.timeline.tracks[0]
         placed = AddClip(track.id, make_clip(0, 300, video_media)).apply(project)
         assert list(project_timeline(placed)) == []
 
     def test_generated_clip_without_media_is_skipped(self, project: Project) -> None:
-        # 素材を持たないテロップや図形のクリップで素材を探しに行くと、テキストを 1 枚
-        # 置いただけで字幕パネルと字幕の書き出しが止まる
+        # 素材を持たないテロップや図形のクリップでつまずくと、テキストを 1 枚置いただけで
+        # 字幕の書き出しと焼き込み（字幕パネルと AI の道具）が例外で止まる
         track = project.timeline.tracks[0]
         text_clip = Clip(timeline_start=0, duration=60, media_id=None)
         placed = AddClip(track.id, text_clip).apply(project)
