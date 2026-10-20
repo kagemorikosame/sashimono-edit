@@ -1,0 +1,13 @@
+{
+ "tolerances": {
+  "scene_frames": 2,
+  "talk_seconds": 1.0,
+  "subtitle_seconds": 0.5
+ },
+ "materials": [
+  {"id": "E04", "tasks": ["silence", "subtitles"]},
+  {"id": "E05", "tasks": ["silence", "talk", "subtitles"]},
+  {"id": "E09", "tasks": ["silence", "scenes"]},
+  {"id": "E11", "tasks": ["scenes"]}
+ ]
+}
