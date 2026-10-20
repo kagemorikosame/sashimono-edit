@@ -41,6 +41,7 @@ import pytest
 import sashimono.ai.bridge
 import sashimono.ai.operations
 import sashimono.ai.safety
+import sashimono.ui.main_window
 from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.model import MediaItem, Transcript
@@ -144,13 +145,19 @@ _HOST_WRITERS = {
     "_export_video": {"start_export"},
     "_export_subtitles": {"write_subtitles"},
     "_save_snapshot": {"write_snapshot"},
-    # 声を作り終えるのを待ってから書く（Pending の続き） 続きは本体の中に書くので、
-    # 本体と続きの両方の名前で数える
-    "_generate_narration": {"make_narration_folder", "write_narration"},
-    "_write_and_place": {"make_narration_folder", "write_narration"},
+    # ナレーション（#335） 声を作り終えてから書く所 AI の道具と人の窓が同じ関数を通る
+    "write_and_place_narration": {"make_narration_folder", "write_narration"},
 }
-#: 上のうち、道具の本体（Operation.approved）ではなく本体の中の続き（待った後に書く所）
-_WRITING_CONTINUATIONS = frozenset({"_write_and_place"})
+#: 上のうち、道具の本体（Operation.approved）ではなく、本体と人の窓が分け合う書く所
+#: 値は呼んでよい道具の本体と、人の窓の関数（どちらも許した中身を渡す）
+_SHARED_WRITERS = {
+    "write_and_place_narration": (
+        # AI の道具 声を待った後の続き（本体の中の関数）から呼ぶ
+        frozenset({"_generate_narration", "_place_when_made"}),
+        # 人の窓〔ナレーションを作る…〕 窓の OK で採った確かめの中身を渡す
+        frozenset({"_check_narration"}),
+    ),
+}
 
 #: 道具のコードが呼んではいけない、ファイルを書く・消す・動かす呼び出し
 _WRITING_CALLS = frozenset(
@@ -209,6 +216,16 @@ def _called_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _callers(tree: ast.Module, name: str) -> set[str]:
+    """``name`` を呼ぶ関数の名前（入れ子の関数は、外の関数と自分の両方で数える）"""
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and name in _called_names(ast.Module(body=node.body, type_ignores=[]))
+    }
+
+
 class TestCounted:
     def test_the_tools_that_change_things_are_the_ones_counted(self) -> None:
         # 壊れると、確かめていない変える道具が増え、元の素材やファイルに触るかを誰も見ていない
@@ -241,16 +258,16 @@ class TestCounted:
             if operation.name in FILE_WRITING_TOOLS:
                 assert operation.approved is not None, operation.name
                 handlers[operation.name] = operation.approved.__name__
-        assert set(handlers.values()) == set(_HOST_WRITERS) - _WRITING_CONTINUATIONS
-        # 続きは本体の中にだけ書く（本体の外の関数にすると、確かめを通らない所から呼べる）
-        nested = {
-            child.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name in handlers.values()
-            for child in ast.walk(node)
-            if isinstance(child, ast.FunctionDef) and child is not node
-        }
-        assert nested >= _WRITING_CONTINUATIONS
+        bodies = {name for tools, _window in _SHARED_WRITERS.values() for name in tools}
+        assert set(handlers.values()) == (set(_HOST_WRITERS) - set(_SHARED_WRITERS)) | (
+            bodies & set(handlers.values())
+        )
+        # 分け合う書く所を呼ぶのは、決めた道具の本体（と本体の中の続き）と人の窓だけ
+        # ほかから呼ぶと、確かめを通らずに作品のフォルダへ書ける
+        for shared, (tools, window) in _SHARED_WRITERS.items():
+            assert _callers(tree, shared) == tools
+            assert _callers(_source(sashimono.ui.main_window), shared) == window
+            assert tools & set(handlers.values())
         # 本体の中で書く先の身元を採り直さない（確かめの中身の身元で照らす）
         tree = _source(sashimono.ai.operations)
         for node in ast.walk(tree):

@@ -38,7 +38,12 @@ from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_outbound import undeclared
 from tests.ai.test_safety import _symlink_dir, answer_approvals
-from tests.fake_voice_engine import FakeVoiceEngine, closed_engine_url, fake_voice_engine
+from tests.fake_voice_engine import (
+    SECONDS_PER_CHAR,
+    FakeVoiceEngine,
+    closed_engine_url,
+    fake_voice_engine,
+)
 
 WINDOWS_WRITES = pytest.mark.skipif(
     sys.platform != "win32", reason="AI がファイルを書くのは Windows だけ（pin_holds_the_folder）"
@@ -293,6 +298,61 @@ class TestMakingAndPlacing:
         narrating.document.undo()
         assert narrating.document.project == before
         assert written.exists()
+
+    def test_subtitles_follow_each_sentence_of_the_made_voice(self, narrating: FakeHost) -> None:
+        # 壊れると、作った声に字幕が付かないか、文の区切りと声がずれて、2 文目の字幕が
+        # 1 文目を読んでいる間に出る（2026-10-20 利用者の決定 文ごと・声の長さに合わせる）
+        _listed(narrating)
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT, "voice_id": 3})
+        result = box["result"]
+        assert isinstance(result, dict)
+        assert result["subtitle_lines"] == 2
+        media = next(
+            m for m in narrating.document.project.media if m.path == Path(str(result["file"]))
+        )
+        transcript = media.transcript
+        assert transcript is not None
+        assert [segment.text for segment in transcript] == [
+            "今日は動画の切り方を話します。",
+            "最後まで見てください。",
+        ]
+        first, second = transcript.segments
+        assert first.start == 0
+        assert float(first.end) == pytest.approx(15 * SECONDS_PER_CHAR, abs=0.001)
+        assert second.start == first.end
+        assert float(second.end) == pytest.approx(media.duration, abs=0.01)
+        assert all(segment.edited for segment in transcript)
+        # 字幕も同じ 1 段で戻る
+        narrating.document.undo()
+        assert all(m.path != media.path for m in narrating.document.project.media)
+
+    def test_the_owner_can_turn_the_subtitles_off_for_the_ai(self, narrating: FakeHost) -> None:
+        # 壊れると、字幕を別に起こす人の作品に、AI が作るたびに台本の字幕が重なる
+        _listed(narrating)
+        narrating.narration = NarrationSettings(url=narrating.narration.url, subtitles=False)
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        # AI は設定に従う（引数で字幕を頼んでも付けない）
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT, "subtitles": True})
+        result = box["result"]
+        assert isinstance(result, dict)
+        assert result["subtitle_lines"] == 0
+        media = next(
+            m for m in narrating.document.project.media if m.path == Path(str(result["file"]))
+        )
+        assert media.transcript is None
+
+    def test_the_person_path_picks_any_voice_and_the_subtitles(self, narrating: FakeHost) -> None:
+        # 壊れると、人が窓で選んだ声まで「AI に声を選ばせない」設定で断るか、窓で切った字幕を
+        # 付ける
+        _listed(narrating)
+        narrating.narration = NarrationSettings(url=narrating.narration.url, ai_picks_voice=False)
+        arguments = {"text": SCRIPT, "voice_id": 3, "subtitles": False}
+        plan = operations.narration_plan(narrating, arguments, person=True)
+        assert plan.speaker.name == "ずんだもん"
+        assert plan.subtitles is False
+        with pytest.raises(ToolError, match="既定の声だけ"):
+            operations.narration_plan(narrating, arguments)
 
     def test_a_second_voice_gets_a_new_name_and_the_credit_once(self, narrating: FakeHost) -> None:
         # 壊れると、2 本目の声が 1 本目を潰すか、同じ表記が何度も並ぶ

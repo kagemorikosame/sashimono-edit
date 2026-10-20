@@ -45,8 +45,15 @@ from PySide6.QtWidgets import (
 
 from sashimono import __version__
 from sashimono.ai.host import ExportRequest, ToolError
+from sashimono.ai.operations import (
+    NarrationJob,
+    narration_consent,
+    narration_plan,
+    remember_voice_catalog,
+    write_and_place_narration,
+)
 from sashimono.ai.outbound import Outbound, SendChoice
-from sashimono.ai.safety import check_writable
+from sashimono.ai.safety import Consent, check_writable
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
@@ -185,6 +192,7 @@ from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
+from sashimono.ui.narration_dialog import ask_narration
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.progress_display import (
@@ -670,6 +678,11 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出し（#327）も同じ右端に出し、人がいつでも止められるようにする
         # 書き出しの窓を使わないので、ここに出さないと走っていることも止め方も見えない
         self._assistant_export = AssistantExport(self)
+        #: 人の窓（〔ナレーションを作る…〕 #335）で裏で作っている声と、窓の OK で採った確かめの中身
+        self._narration_job: tuple[NarrationJob, Consent] | None = None
+        self._narration_timer = QTimer(self)
+        self._narration_timer.setInterval(100)
+        self._narration_timer.timeout.connect(self._check_narration)
         self._assistant_export_indicator = ProgressIndicator(self, cancel_text="中止")
         stop = self._assistant_export_indicator.cancel_button
         if stop is not None:
@@ -845,6 +858,9 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+Shift+J"),
             self._subtitles.jet_cut,
         )
+        # ナレーション（#335） 台本から声と字幕を作って置く 2026-10-20 利用者の決定で人の入口を
+        # 足した AI の generate_narration と同じ処理を通す
+        self._add(subtitle_menu, "ナレーションを作る…", QKeySequence(), self.create_narration)
         subtitle_menu.addSeparator()
         self._add(subtitle_menu, "焼き込み", QKeySequence(), self._subtitles.burn)
         self._add(subtitle_menu, "書き出し…", QKeySequence(), self._subtitles.export_file)
@@ -3894,6 +3910,78 @@ class MainWindow(QMainWindow):
         self._remember_written(path, expect)
         self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
         return drawn
+
+    def create_narration(self) -> None:
+        """〔字幕〕→〔ナレーションを作る…〕 台本と声を窓で選び、AI と同じ処理で作って置く（#335）
+
+        取り消せない操作（WAV を書く）の確かめは、人が窓で〔作る〕を押したことで足りる
+        （2026-10-20 利用者の決定） 声を作る間は画面を止めず、裏で作ってタイマーで終わりを見る
+        置いた物は人の段（``Author.PERSON``）として積み、取り消し 1 回で戻る
+        """
+        if self._narration_job is not None:
+            self.statusBar().showMessage("ナレーションの声を作っている途中です", 4000)
+            return
+        if self._path is None:
+            QMessageBox.information(
+                self,
+                "ナレーションを作る",
+                "作品をまだ保存していません WAV は作品のフォルダの narration へ書くので、"
+                "先に〔名前を付けて保存〕で保存してください",
+            )
+            return
+        self._playback.stop()
+        answer = ask_narration(self, self._preferences.narration_settings)
+        if answer is None:
+            return
+        choice, catalog = answer
+        remember_voice_catalog(catalog)
+        arguments = choice.arguments(self.playhead)
+        try:
+            plan = narration_plan(self, arguments, person=True)
+            consent = narration_consent(self, arguments, person=True)
+            job = NarrationJob(plan)
+        except ToolError as exc:
+            QMessageBox.warning(self, "ナレーションを作る", str(exc))
+            return
+        self._narration_job = (job, consent)
+        self.statusBar().showMessage("ナレーションの声を作っています…")
+        self._narration_timer.start()
+
+    def _check_narration(self) -> None:
+        """裏で作っている声が終わったら、書いて置く 終わるまでは次の回を待つ"""
+        running = self._narration_job
+        if running is None:
+            self._narration_timer.stop()
+            return
+        job, consent = running
+        if not job.wait(0):
+            return
+        self._narration_timer.stop()
+        self._narration_job = None
+        try:
+            result = write_and_place_narration(
+                self, job.plan, consent, job.take(), self._apply_as_person
+            )
+        except ToolError as exc:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "ナレーションを作る", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"ナレーションを置いた: {Path(str(result['file'])).name} 表記: {result['credit']}"
+            "（書き出しのときにも知らせます）",
+            8000,
+        )
+
+    def _apply_as_person(self, commands: list[Command], label: str) -> None:
+        """人の操作として 1 段で当てる 断られたら :class:`ToolError`（呼んだ側が知らせる）"""
+        try:
+            with self._document.checkpoint(label, by=Author.PERSON):
+                for command in commands:
+                    self._document.execute(self._in_active_scene(command))
+        except (ValueError, KeyError) as exc:
+            raise ToolError(str(exc)) from exc
+        finally:
+            self._on_project_changed()
 
     def make_narration_folder(self) -> Path:
         """AI のナレーション（#335）を書くフォルダ 作品のフォルダの下の narration だけを作る"""

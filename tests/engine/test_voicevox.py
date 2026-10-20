@@ -192,7 +192,9 @@ class TestMakingTheVoice:
         assert query["volumeScale"] == pytest.approx(0.8)
         assert query["pitchScale"] == pytest.approx(-0.05)
         assert query["intonationScale"] == pytest.approx(1.0)
-        assert wav_seconds(data) == pytest.approx(len("こんにちは。") * SECONDS_PER_CHAR, abs=0.001)
+        assert wav_seconds(data.wav) == pytest.approx(
+            len("こんにちは。") * SECONDS_PER_CHAR, abs=0.001
+        )
 
     def test_a_long_script_is_split_at_sentences_and_joined(self, engine: FakeVoiceEngine) -> None:
         # 壊れると、100 文字を超える台本で AivisSpeech が断るか抑揚が崩れ、つないだ声が
@@ -204,7 +206,16 @@ class TestMakingTheVoice:
         assert "".join(engine.texts) == sentence
         assert all(text.endswith("。") for text in engine.texts)
         expected = sum(len(text) for text in engine.texts) * SECONDS_PER_CHAR
-        assert wav_seconds(data) == pytest.approx(expected, abs=0.01)
+        assert wav_seconds(data.wav) == pytest.approx(expected, abs=0.01)
+
+    def test_each_sentence_keeps_its_own_length(self, engine: FakeVoiceEngine) -> None:
+        # 壊れると、字幕を声の長さに合わせられず、2 文目の字幕が 1 文目の声のうちに出る
+        spoken = VoiceEngine(engine.url).synthesize("はい。今日は長めに話します。", 3, Tuning())
+        assert [line.text for line in spoken.lines] == ["はい。", "今日は長めに話します。"]
+        assert spoken.lines[0].seconds == pytest.approx(3 * SECONDS_PER_CHAR, abs=0.001)
+        assert spoken.lines[1].seconds == pytest.approx(11 * SECONDS_PER_CHAR, abs=0.001)
+        total = sum(line.seconds for line in spoken.lines)
+        assert wav_seconds(spoken.wav) == pytest.approx(total, abs=0.001)
 
     def test_pieces_of_different_shapes_are_refused(self, engine: FakeVoiceEngine) -> None:
         # 壊れると、塊ごとにサンプリングレートの違う声を黙ってつなぎ、途中から高さと速さが変わる
@@ -226,9 +237,11 @@ class TestMakingTheVoice:
 
 
 class TestSplitting:
-    def test_sentences_are_packed_up_to_the_limit(self) -> None:
-        # 壊れると、短い文を 1 文ずつ頼み、文の数だけエンジンを呼んで遅くなる
-        assert split_script("あ。い。う。", 4) == ["あ。い。", "う。"]
+    def test_each_sentence_is_its_own_piece(self) -> None:
+        # 壊れると、文をまたいで詰めて作り、字幕を文ごとに区切れない（どこで次の文になるかが
+        # 声から分からない 2026-10-20 利用者の決定 字幕は文ごと）
+        assert split_script("あ。い。う。", 4) == ["あ。", "い。", "う。"]
+        assert split_script("今日は？晴れ！") == ["今日は？", "晴れ！"]
 
     def test_a_long_sentence_is_cut_at_commas_then_by_length(self) -> None:
         # 壊れると、句点の無い長い文が上限を越えたまま渡り、エンジンに断られる
@@ -240,7 +253,7 @@ class TestSplitting:
     def test_blank_lines_are_dropped(self) -> None:
         # 壊れると、空の塊をエンジンへ渡して断られる
         assert split_script("\n\n  \n") == []
-        assert split_script("一行目\n\n二行目") == ["一行目\n\n二行目"]
+        assert split_script("一行目\n\n二行目") == ["一行目", "二行目"]
 
 
 class TestJoining:

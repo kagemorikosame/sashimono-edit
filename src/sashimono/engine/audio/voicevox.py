@@ -44,8 +44,10 @@ __all__ = [
     "VOLUME_PERCENT_RANGE",
     "Catalog",
     "EngineError",
+    "Line",
     "NarrationSettings",
     "Speaker",
+    "Spoken",
     "Style",
     "Tuning",
     "VoiceEngine",
@@ -166,6 +168,23 @@ class Tuning:
 
 
 @dataclass(frozen=True, slots=True)
+class Line:
+    """作った声の 1 文 字幕の 1 枚になる"""
+
+    text: str
+    #: その文の声の長さ（秒 前後の間を含む）
+    seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class Spoken:
+    """作った声 つないだ WAV と、文ごとの長さ"""
+
+    wav: bytes
+    lines: tuple[Line, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class NarrationSettings:
     """ナレーションの本人の設定（:class:`~sashimono.ui.workspace.Preferences` から作る）
 
@@ -184,6 +203,9 @@ class NarrationSettings:
     #: AI が既定と違う声を選んでよいか 切ると既定の声だけを使う
     #: 既定は選んでよい 声は毎回の確かめの窓に出るので、人が知らない声で作られることは無い
     ai_picks_voice: bool = True
+    #: 作った声に台本から字幕を付けるか（文ごとに区切り、声の長さに合わせる） 既定は付ける
+    #: （2026-10-20 利用者の決定） 字幕を別に起こす人や、字幕の要らない人は切れる
+    subtitles: bool = True
 
 
 def check_engine_url(raw: object) -> str:
@@ -300,10 +322,12 @@ class VoiceEngine:
         tuning: Tuning,
         *,
         stopped: Callable[[], bool] = lambda: False,
-    ) -> bytes:
-        """台本を WAV にする 長い文は文の切れ目で分けて作り、つないで 1 本にする
+    ) -> Spoken:
+        """台本を WAV にする 文ごとに作り、つないで 1 本にする
 
-        ``stopped`` が真を返したら、次の塊を作らずに断る（待つのをやめた道具の後で、
+        文ごとに作るのは、字幕を文ごとに区切り、作った声の長さに合わせて置くため
+        （2026-10-20 利用者の決定） まとめて作ると、どこで次の文になるかが声から分からない
+        ``stopped`` が真を返したら、次の文を作らずに断る（待つのをやめた道具の後で、
         エンジンを使い続けない）
         """
         pieces = split_script(text, PIECE_LIMIT)
@@ -331,7 +355,11 @@ class VoiceEngine:
             )
             self._check(status, "/synthesis")
             waves.append(data)
-        return join_wavs(waves)
+        joined = join_wavs(waves)
+        lines = tuple(
+            Line(piece, wav_seconds(data)) for piece, data in zip(pieces, waves, strict=True)
+        )
+        return Spoken(joined, lines)
 
     # --- 中身 ---
 
@@ -426,15 +454,15 @@ def _speaker(item: object) -> Speaker | None:
 
 
 def split_script(text: str, limit: int = PIECE_LIMIT) -> list[str]:
-    """台本を、文の切れ目で ``limit`` 文字以下の塊に分ける 空の塊は捨てる
+    """台本を文ごとの ``limit`` 文字以下の塊に分ける 空の塊は捨てる
 
-    文の切れ目（句点・！？と改行）で分けて詰め、1 つの文が長すぎれば読点などで、それでも
-    長ければ ``limit`` 文字ずつに分ける 切れ目の無い所で切ると読みと抑揚が変わるので、
-    切るのは最後の手
+    文の切れ目（句点・！？と改行）で分ける 1 つの塊が字幕の 1 枚になるので、文をまたいで
+    詰めない 1 つの文が長すぎれば読点などで分けて詰め、それでも長ければ ``limit`` 文字ずつに
+    分ける 切れ目の無い所で切ると読みと抑揚が変わるので、切るのは最後の手
     """
     pieces: list[str] = []
-    current = ""
     for sentence in _SENTENCE_END.split(text):
+        current = ""
         for part in _fit(sentence, limit):
             if len(current) + len(part) <= limit:
                 current += part
@@ -442,8 +470,8 @@ def split_script(text: str, limit: int = PIECE_LIMIT) -> list[str]:
             if current.strip():
                 pieces.append(current.strip())
             current = part
-    if current.strip():
-        pieces.append(current.strip())
+        if current.strip():
+            pieces.append(current.strip())
     return pieces
 
 

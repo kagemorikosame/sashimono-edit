@@ -1139,6 +1139,7 @@ class PreferencesDialog(QDialog):
             narration_speed_percent=self._narration_speed.value(),
             narration_volume_percent=self._narration_volume.value(),
             narration_ai_picks_voice=self._narration_ai_picks.isChecked(),
+            narration_subtitles=self._narration_subtitles.isChecked(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )
@@ -1305,6 +1306,13 @@ class PreferencesDialog(QDialog):
             "どの声で作るかは毎回の確かめの窓に出る"
         )
         form.addRow(self._narration_ai_picks)
+        self._narration_subtitles = QCheckBox("作ったナレーションに台本から字幕を付ける", self)
+        self._narration_subtitles.setChecked(preferences.narration_subtitles)
+        self._narration_subtitles.setToolTip(
+            "台本の文ごとに字幕を区切り、作った声の長さに合わせて付ける（字幕パネルに出る）"
+            " AI が作るときもこれに従う 〔ナレーションを作る…〕の窓ではその 1 回だけ変えられる"
+        )
+        form.addRow(self._narration_subtitles)
 
     def _narration_engine(self) -> VoiceEngine | None:
         """欄の場所のエンジン 場所が受け付けられなければ理由を出して ``None``"""

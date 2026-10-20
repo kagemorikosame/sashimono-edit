@@ -248,6 +248,9 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/字幕/起こす…", "transcribe"),
     same("メニュー/字幕/整形…", "clean_subtitles"),
     same("メニュー/字幕/無音カット…", "jet_cut"),
+    # ナレーション（#335） 2026-10-20 利用者の決定で人の入口を足した 同じ処理を通し、WAV を
+    # 書くので取り消せない操作（人は窓の〔作る〕が確かめに当たる）
+    same("メニュー/字幕/ナレーションを作る…", "generate_narration", safety=Safety.IRREVERSIBLE),
     same("メニュー/字幕/焼き込み", "place_subtitles"),
     same("メニュー/字幕/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     # --- メニュー 互換 ---
@@ -643,12 +646,6 @@ AI_ONLY: dict[str, str] = {
     # ナレーション（#335） 声の一覧はエンジンのアプリで見る物で、画面に同じ入口は無い
     # 設定の窓の〔声の一覧を読む〕は既定の声を選ぶ欄の中の釦（台帳は窓の欄を数えない）
     "list_voices": READING,
-    # 声を作って置く操作は、画面に人の入口がまだ無い（人の入口を作るかは本人が決める #335）
-    # 人は VOICEVOX か AivisSpeech のアプリで WAV を書き出し、素材として読み込んで置く
-    "generate_narration": (
-        "台本の文を声にして置く 画面に同じ入口はまだ無い（人はエンジンのアプリで WAV を"
-        "書き出して読み込む 人の入口を作るかは #335 で本人が決める）"
-    ),
 }
 
 

@@ -647,6 +647,9 @@ class Preferences:
     #: AI が既定と違う声を選んでよいか 既定は選んでよい 声は毎回の確かめの窓に出るので、
     #: 知らない声で作られることは無い 切ると、いつも同じ声で読ませたい人が AI に選び直されない
     narration_ai_picks_voice: bool = True
+    #: 作った声に台本から字幕を付けるか（文ごとに区切り、声の長さに合わせる） 既定は付ける
+    #: （2026-10-20 利用者の決定） 字幕を別に起こす人・字幕の要らない人は切れる AI も従う
+    narration_subtitles: bool = True
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -740,6 +743,7 @@ class Preferences:
             speed_percent=self.narration_speed_percent,
             volume_percent=self.narration_volume_percent,
             ai_picks_voice=self.narration_ai_picks_voice,
+            subtitles=self.narration_subtitles,
         )
 
     @property
@@ -1009,6 +1013,7 @@ class PreferenceStore:
             narration_ai_picks_voice=_flag(
                 data.get("narration_ai_picks_voice"), plain.narration_ai_picks_voice
             ),
+            narration_subtitles=_flag(data.get("narration_subtitles"), plain.narration_subtitles),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis
             ),

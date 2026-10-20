@@ -17,16 +17,31 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QMainWindow,
+    QMessageBox,
+)
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddCredits
+from sashimono.core.commands import AddCredits, Author
 from sashimono.core.io.serialize import save_project
 from sashimono.core.model import MediaItem, Project, Transcript
-from sashimono.engine.audio.voicevox import AUTO_VOICE, DEFAULT_ENGINE_URL
+from sashimono.engine.audio.voicevox import (
+    AUTO_VOICE,
+    DEFAULT_ENGINE_URL,
+    TEXT_LIMIT,
+    NarrationSettings,
+    VoiceEngine,
+)
+from sashimono.ui import main_window as main_window_module
 from sashimono.ui.export_dialog import CREDIT_NOTE, ExportDialog
 from sashimono.ui.main_window import MainWindow
+from sashimono.ui.narration_dialog import NarrationChoice, NarrationDialog
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending, make_loaded
@@ -92,6 +107,8 @@ class TestPreference:
         assert plain.narration_voice == AUTO_VOICE
         assert plain.narration_settings.ai_picks_voice is True
         assert plain.narration_settings.speed_percent == 100
+        # 字幕は付ける側が既定（2026-10-20 利用者の決定）
+        assert plain.narration_settings.subtitles is True
 
     def test_an_outside_place_in_the_file_falls_back(self) -> None:
         # 壊れると、設定ファイルを手で書き換えた外の場所へ、台本の文を送る
@@ -115,6 +132,7 @@ class TestPreference:
             narration_voice=888753760,
             narration_voice_name="まお（ノーマル）",
             narration_ai_picks_voice=False,
+            narration_subtitles=False,
         )
         PreferenceStore().save(chosen)
         loaded = PreferenceStore().load()
@@ -140,11 +158,13 @@ class TestDialog:
             ]
             box.setCurrentIndex(box.findData(3))
             dialog._narration_ai_picks.setChecked(False)
+            dialog._narration_subtitles.setChecked(False)
             dialog._narration_speed.setValue(120)
             chosen = dialog.preferences()
             assert chosen.narration_voice == 3
             assert chosen.narration_voice_name == "ずんだもん（ノーマル）"
             assert chosen.narration_ai_picks_voice is False
+            assert chosen.narration_subtitles is False
             assert chosen.narration_speed_percent == 120
             assert "VOICEVOX" in dialog._narration_status.text()
         finally:
@@ -304,6 +324,190 @@ def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
     if "error" in box:
         raise box["error"]
     return box["result"]
+
+
+class TestNarrationDialog:
+    def test_voices_come_from_the_engine_and_the_choice_is_returned(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、人が窓で声をエンジンの一覧から選べないか、選んだ声と台本が作る所へ届かない
+        del qt_application
+        dialog = NarrationDialog(NarrationSettings(url=engine.url, voice=3, subtitles=True))
+        try:
+            ok = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
+            assert not ok.isEnabled()  # 声を読むまでは押せない
+            dialog.read_voices()
+            assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
+            assert not ok.isEnabled()  # 台本が空のうちは押せない
+            dialog.set_text("こんにちは。")
+            assert ok.isEnabled()
+            dialog._subtitles.setChecked(False)
+            dialog._speed.setValue(130)
+            choice = dialog.choice()
+            assert choice == NarrationChoice("こんにちは。", 3, 130, 100, False)
+            assert choice.arguments(45)["at_frame"] == 45
+        finally:
+            dialog.deleteLater()
+
+    def test_a_stopped_engine_is_told_and_nothing_can_be_made(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、エンジンを起動していない人が〔作る〕を押せて、何も起きない理由が分からない
+        del qt_application
+        dialog = NarrationDialog(NarrationSettings(url=closed_engine_url()))
+        try:
+            dialog.read_voices()
+            dialog.set_text("こんにちは。")
+            assert "起動" in dialog._status.text()
+            assert not dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+        finally:
+            dialog.deleteLater()
+
+    def test_a_too_long_script_cannot_be_made(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、上限を越えた台本で〔作る〕を押せ、作る所で断られて書いた台本が無駄になる
+        del qt_application
+        dialog = NarrationDialog(NarrationSettings(url=engine.url))
+        try:
+            dialog.read_voices()
+            dialog.set_text("あ" * (TEXT_LIMIT + 1))
+            assert not dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+        finally:
+            dialog.deleteLater()
+
+
+def _saved_window(
+    opened: list[MainWindow],
+    tmp_path: Path,
+    video_media: MediaItem,
+    transcript: Transcript,
+    url: str,
+) -> tuple[MainWindow, Project]:
+    PreferenceStore().save(Preferences(narration_engine_url=url))
+    project = replace(make_loaded(video_media, transcript), name="作品")
+    path = tmp_path / "作品.sme"
+    save_project(project, path)
+    window = MainWindow(project, confirm_unsaved=False)
+    opened.append(window)
+    window._path = path
+    return window, project
+
+
+def _wait_for_narration(window: MainWindow) -> None:
+    deadline = time.monotonic() + 30
+    while window._narration_job is not None:
+        QApplication.processEvents()
+        time.sleep(0.01)
+        assert time.monotonic() < deadline, "ナレーションが終わらなかった"
+    QApplication.processEvents()
+
+
+class TestMenu:
+    def test_the_menu_offers_making_a_narration(self, opened: list[MainWindow]) -> None:
+        # 壊れると、人がナレーションを作る入口が無く、AI に頼むしかない（2026-10-20 利用者の決定）
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        opened.append(window)
+        action, _default = window._actions["字幕/ナレーションを作る…"]
+        assert action.text() == "ナレーションを作る…"
+
+    def test_an_unsaved_project_is_told_to_save_first(
+        self, opened: list[MainWindow], told: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、保存していない作品で窓を開いて台本を書かせた後に、書く場所が無いと断る
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        opened.append(window)
+        asked: list[object] = []
+        monkeypatch.setattr(main_window_module, "ask_narration", lambda *a: asked.append(a))
+        window.create_narration()
+        assert asked == []
+        assert len(told) == 1 and "保存" in told[0]
+
+    @WINDOWS_WRITES
+    def test_the_window_makes_places_subtitles_and_undoes_as_the_person(
+        self,
+        opened: list[MainWindow],
+        engine: FakeVoiceEngine,
+        tmp_path: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、人の窓で作った声が AI の段に積まれて AI の取り消しで消えるか、字幕と表記が
+        # 付かないか、戻すのに取り消しが何回も要る
+        window, project = _saved_window(opened, tmp_path, video_media, transcript, engine.url)
+        catalog = VoiceEngine(engine.url).catalog()
+        choice = NarrationChoice("はい。今日は長めに話します。", 3, 100, 100, True)
+        monkeypatch.setattr(main_window_module, "ask_narration", lambda *_a: (choice, catalog))
+        window.seek(60)
+        window.create_narration()
+        _wait_for_narration(window)
+
+        written = (tmp_path / "narration" / "narration_001.wav").resolve()
+        assert written.exists()
+        media = next(m for m in window.document.project.media if m.path == written)
+        assert media.transcript is not None
+        assert [segment.text for segment in media.transcript] == [
+            "はい。",
+            "今日は長めに話します。",
+        ]
+        placed = [
+            clip
+            for track in window.document.project.timeline.tracks
+            for clip in track.clips
+            if clip.media_id == media.id
+        ]
+        assert [clip.timeline_start for clip in placed] == [60]
+        assert window.document.project.credits == ("VOICEVOX:ずんだもん",)
+        assert window.document.undo_by is Author.PERSON
+        window.document.undo()
+        assert window.document.project == project
+        assert written.exists()
+
+    @WINDOWS_WRITES
+    def test_the_window_can_turn_the_subtitles_off_once(
+        self,
+        opened: list[MainWindow],
+        engine: FakeVoiceEngine,
+        tmp_path: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、窓で字幕を切っても台本の字幕が付き、本人の起こした字幕と重なる
+        window, _project = _saved_window(opened, tmp_path, video_media, transcript, engine.url)
+        catalog = VoiceEngine(engine.url).catalog()
+        choice = NarrationChoice("こんにちは。", 3, 100, 100, False)
+        monkeypatch.setattr(main_window_module, "ask_narration", lambda *_a: (choice, catalog))
+        window.create_narration()
+        _wait_for_narration(window)
+        media = window.document.project.media[-1]
+        assert media.transcript is None
+        # 設定は変えない（窓の値はその 1 回だけ）
+        assert window.narration_settings.subtitles is True
+
+    @WINDOWS_WRITES
+    def test_an_engine_failure_is_told_and_nothing_is_placed(
+        self,
+        opened: list[MainWindow],
+        engine: FakeVoiceEngine,
+        tmp_path: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+        told: list[str],
+    ) -> None:
+        # 壊れると、エンジンが途中で断ったのに半端な WAV が残るか、何が起きたのか分からない
+        window, project = _saved_window(opened, tmp_path, video_media, transcript, engine.url)
+        catalog = VoiceEngine(engine.url).catalog()
+        engine.synthesis_status = 500
+        choice = NarrationChoice("こんにちは。", 3, 100, 100, True)
+        monkeypatch.setattr(main_window_module, "ask_narration", lambda *_a: (choice, catalog))
+        window.create_narration()
+        _wait_for_narration(window)
+        assert len(told) == 1 and "HTTP 500" in told[0]
+        assert window.document.project == project
+        assert not (tmp_path / "narration" / "narration_001.wav").exists()
 
 
 @WINDOWS_WRITES
