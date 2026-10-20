@@ -347,6 +347,25 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 並行して道具を足す PR どうしがぶつかるのは、同じ操作の行を書き換えたときだけ
 数は `ledger.counts()` で出せる
 
+### コマンドと AI の道具の対応（#351）
+
+台帳は画面の側から数える もう 1 つ、コマンド（`core` の `Command`）の側からも数える
+道具をコマンドの一覧から自動で作ることはしない 道具には引数の説明・安全の段（`safety`）・
+外へ送る物（`sends`）・確かめ（`consent`）が要り、どれもコマンドの形からは決まらないため
+代わりに対応を試験で見張る
+
+- AI の道具が 1 つも通さないコマンドは、`src/sashimono/ai/command_ledger.py` の
+  `COMMANDS_WITHOUT_TOOLS` に理由を書く 人の操作だけ（`PERSON_ONLY` 足す先の Issue か
+  足さない訳）か、画面も AI も使わない（`NEITHER`）か
+- `tests/ai/test_command_coverage.py` が `core` の下のコマンドを全部集め、変える道具を全部
+  動かして `Document.execute` に届いたコマンドを数える 道具も理由も無いコマンドがあると落ち、
+  道具が通すのに理由が残っていても落ちる 名前を探すだけでは、手順の関数の中で作るコマンド
+  （`place_media` `apply_preset` など）を取りこぼすので、動かして数える
+- 動かす例は `tests/ai/test_outbound.py` の `WRITE_EXAMPLES` と、その例では断られる道具に
+  通る引数を持たせた `test_command_coverage.py` の `EXAMPLES`
+- **コマンドを足す PR は、道具を足すか理由を書く** 道具を足して前から理由のあったコマンドを
+  通すようになったら、その行を消す
+
 ### AI の取り消しとやり直し（#333）
 
 AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.begin_checkpoint`）を開いたまま進む
