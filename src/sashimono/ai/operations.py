@@ -4433,21 +4433,18 @@ def _separate_speakers(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"{media.name} の音声 {_audio_number(media, stream)} にはまだ字幕がありません"
             " 先に transcribe で起こしてください"
         )
-    if transcript_speakers(transcript) and not bool(arguments.get("replace", False)):
+    # bool() で読むと文字の "false" が真になり、断るはずの分け直しで付け替えた名前を消す
+    if transcript_speakers(transcript) and not _flag_argument(arguments, "replace", False):
         # 分け直すと人が付け替えた名前と直しが消える 分け直すかは頼む側が決める
         raise ToolError(
             f"{media.name} の音声 {_audio_number(media, stream)} の字幕には話者が付いています"
             " 分け直すときは replace を true にしてください（付け替えた名前も消えます）"
         )
-    speakers = arguments.get("speakers")
     count: int | None = None
-    if speakers is not None:
-        try:
-            count = int(speakers)
-        except (TypeError, ValueError) as exc:
-            raise ToolError("speakers は話す人の数（整数）です 分からなければ省きます") from exc
-        if not 2 <= count <= MAX_SPEAKERS:
-            raise ToolError(f"speakers は 2 から {MAX_SPEAKERS} まで 分からなければ省きます")
+    if arguments.get("speakers") is not None:
+        # int() で読むと 2.7 が黙って 2 に、true が 1 になり、頼んだのと違う人数で分ける
+        # 省いたとき（None）は部品に人数を決めさせるので、既定の 2 は使わない
+        count = _within(arguments, "speakers", 2, 2, MAX_SPEAKERS)
     try:
         message = host.start_speaker_separation(media.id, audio_stream=stream, speakers=count)
     except RuntimeError as exc:

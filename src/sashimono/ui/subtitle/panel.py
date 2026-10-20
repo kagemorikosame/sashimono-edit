@@ -935,12 +935,14 @@ class SubtitlePanel(QWidget):
         if media is None or transcript is None:
             return "字幕が無くなっていたので、話者を付けませんでした"
         updated = assign_speakers(transcript, turns)
+        people = transcript_speakers(updated)
+        if not people:
+            # 見分けられなかった回で当てると全部の行の話者が空になり、前の回の話者と
+            # 人が付け替えた名前が消える 窓・AI・起こしの続きのどれもここを通るので、ここで止める
+            return "話している人を見分けられませんでした（字幕は変えていません）"
         self.commands_requested.emit(
             [SetTranscript(media.id, updated, stream=stream)], f"話者を分ける: {media.name}"
         )
-        people = transcript_speakers(updated)
-        if not people:
-            return "話している人を見分けられませんでした（話者は付けていません）"
         return f"{len(people)} 人に分けました（{'・'.join(people)}）"
 
     def remembered_names(self) -> tuple[str, ...]:

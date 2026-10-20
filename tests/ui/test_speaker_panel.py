@@ -62,6 +62,8 @@ class _Speakers:
 
     def __init__(self) -> None:
         self.asked: list[SpeakerOptions] = []
+        # 返す区間 空にすると、無音や見分けられなかった回の部品の答えになる
+        self.result: tuple[SpeakerTurn, ...] = TURNS
         self.gate = threading.Event()
         self.gate.set()
 
@@ -79,7 +81,7 @@ class _Speakers:
         del path, progress, should_cancel
         self.gate.wait(5.0)
         self.asked.append(options)
-        return TURNS
+        return self.result
 
 
 class _Host:
@@ -291,6 +293,40 @@ class TestFromTheAssistant:
         after = host.project.require_media(media.id).transcript
         assert after is not None
         assert after.segments[0].text == "こんばんは" and after.segments[0].speaker == "話者 1"
+
+    def test_a_run_that_finds_nobody_keeps_the_names_given_before(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, _Speakers]
+    ) -> None:
+        """壊れると、AI が分け直して 1 人も見分けられなかった回に、前の回の話者と人が
+        付け替えた名前が全部消え、知らせは「付けていません」と言うので消えたことにも気付けない
+        """
+        panel, host, media, speakers = setup
+        panel._apply_speakers(media.id, None, TURNS)
+        panel.ask_speaker_name = lambda _old: "佐藤"
+        panel.rename_speaker("話者 2")
+        before = len(host.labels)
+        speakers.result = ()
+        panel.start_speaker_separation(media.id)
+        status = _settle(panel)
+        assert _speakers_of(host, media) == ["話者 1", "佐藤", "佐藤"]
+        assert len(host.labels) == before
+        assert "字幕は変えていません" in status
+
+
+class TestFindingNobody:
+    def test_the_window_result_with_nobody_leaves_the_rows_alone(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, _Speakers]
+    ) -> None:
+        """壊れると、窓で分け直して見分けられなかった回に、前の回の話者が全部外れ、
+        取り消しの履歴にも中身の無い段が積まれる
+        """
+        panel, host, media, _speakers = setup
+        panel._apply_speakers(media.id, None, TURNS)
+        before = len(host.labels)
+        message = panel._apply_speakers(media.id, None, ())
+        assert message == "話している人を見分けられませんでした（字幕は変えていません）"
+        assert _speakers_of(host, media) == ["話者 1", "話者 2", "話者 2"]
+        assert len(host.labels) == before
 
 
 class TestContinuingAfterTranscription:

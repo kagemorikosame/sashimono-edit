@@ -66,13 +66,42 @@ class TestSeparating:
         _operation("separate_speakers")(host, {"media_id": media_id, "replace": True})
         assert host.separated is not None
 
-    @pytest.mark.parametrize("count", [1, 11, "多い"])
+    @pytest.mark.parametrize("replace", ["false", "true", 1])
+    def test_replace_must_be_a_real_flag(self, video_media: MediaItem, replace: Any) -> None:
+        """壊れると、AI が文字の "false" を渡したのを真と読み、断るはずの分け直しを始めて
+        人が付け替えた名前を消す
+        """
+        host = _host(video_media, ["山田", "佐藤", "山田"])
+        media_id = str(host.document.project.media[0].id)
+        with pytest.raises(ToolError, match="replace"):
+            _operation("separate_speakers")(host, {"media_id": media_id, "replace": replace})
+        assert host.separated is None
+
+    @pytest.mark.parametrize("count", [1, 11, "多い", 2.7, True, "3"])
     def test_a_strange_count_is_refused(self, video_media: MediaItem, count: Any) -> None:
-        """壊れると、1 人や 11 人を部品へ渡し、意味の無い分け方で字幕の話者を上書きする"""
+        """壊れると、1 人や 11 人を部品へ渡すか、2.7 人を黙って 2 人に丸めて分け、
+        頼んだのと違う人数で字幕の話者を上書きする
+        """
         host = _host(video_media, [None, None, None])
         media_id = str(host.document.project.media[0].id)
         with pytest.raises(ToolError, match="speakers"):
             _operation("separate_speakers")(host, {"media_id": media_id, "speakers": count})
+        assert host.separated is None
+
+    def test_a_whole_float_count_and_a_missing_count_are_taken(
+        self, video_media: MediaItem
+    ) -> None:
+        """壊れると、JSON で 3.0 と来た人数を断るか、省いた人数を 2 人と決め打ちして
+        3 人の対談を 2 人にまとめる
+        """
+        host = _host(video_media, [None, None, None])
+        media = host.document.project.media[0]
+        _operation("separate_speakers")(host, {"media_id": str(media.id), "speakers": 3.0})
+        assert host.separated == (media.id, None, 3)
+        unsure = _host(video_media, [None, None, None])
+        other = unsure.document.project.media[0]
+        _operation("separate_speakers")(unsure, {"media_id": str(other.id), "speakers": None})
+        assert unsure.separated == (other.id, None, None)
 
     def test_a_missing_part_is_passed_on_as_the_reason(self, video_media: MediaItem) -> None:
         """壊れると、部品の無い人の所で AI が理由を受け取れず、何度も頼み直す"""
