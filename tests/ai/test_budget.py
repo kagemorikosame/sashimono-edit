@@ -127,6 +127,9 @@ class TestCounting:
         meter.record_message("a", {"output_tokens": 9})
         meter.record_image()
         assert meter.day_usage().tokens == 9
+        # 指示の外で置き場へ書いた後も、今日の量から抜けない
+        meter.flush()
+        assert (meter.day_usage().tokens, meter.day_usage().images) == (9, 1)
         meter.begin_turn()
         meter.record_message("b", {"output_tokens": 9})
         assert meter.overrun() is None

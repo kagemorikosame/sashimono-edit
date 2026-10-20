@@ -433,6 +433,12 @@ class UsageMeter:
             self._retry_unsaved()
             if self._turn is not None:
                 self._save(self._turn)
+            else:
+                # 指示の外で見せる量は 置き場の量（_day_base）+ まだ書いていない分 書いた分は
+                # まだ書いていない分から消えるので、置き場の量も読み直す 読み直さないと、
+                # 書けた分だけ今日の量が少なく見える
+                today = self._today()
+                self._day_base = (today, self._store.load(today))
 
     # --- AI のスレッドから ---
 
