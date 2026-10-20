@@ -180,6 +180,7 @@ class _Progress:
             length_seconds=self.length_seconds,
             notes=tuple(notes),
             skipped=frozenset(skipped),
+            sound=self.audio.profile() if self.audio is not None else None,
         )
 
     def fraction(self) -> float:
