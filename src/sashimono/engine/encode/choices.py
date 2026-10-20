@@ -80,6 +80,7 @@ def build_settings(
     pipeline_depth: int,
     decode_threads: int,
     smooth_history: bool,
+    gpu_color: bool,
     chapters: bool,
 ) -> ExportSettings:
     """書き出しの設定を作る
@@ -88,7 +89,8 @@ def build_settings(
     先読みの深さ・デコードの並列数・音の動きのつなぎは、書き出しごとに変える物ではなく
     本人の設定（表示 → 設定…）から渡す ``chapters``（目印をチャプターとして埋める #330）も
     本人の設定から渡す 既定を置かないのは、AI の書き出しが設定を渡し忘れて、切った人の
-    動画に章が入るのを型で止めるため
+    動画に章が入るのを型で止めるため ``gpu_color``（色変換を GPU で行う #372）も同じ理由で
+    既定を置かない 駆動との相性で切った人の書き出しが、AI からだけ GPU で変換されないように
     """
     low, high = BITRATE_RANGE_MBPS
     if not low <= bitrate_mbps <= high:
@@ -101,5 +103,6 @@ def build_settings(
         pipeline_depth=pipeline_depth,
         decode_threads=decode_threads,
         smooth_history=smooth_history,
+        gpu_color=gpu_color,
         chapters=chapters,
     )

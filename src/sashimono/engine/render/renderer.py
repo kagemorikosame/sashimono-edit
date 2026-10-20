@@ -670,6 +670,15 @@ class FrameRenderer:
         """合成結果を直接画面へ出したいときの逃げ道 プレビューが使う"""
         return self._compositor
 
+    @property
+    def context(self) -> GLScope:
+        """合成に使う GL コンテキスト :meth:`compose` の結果を GPU の上で続けて使う所が入る
+
+        書き出しの色変換（#372）は、合成と同じコンテキストで読み戻しのバッファを作る
+        別のコンテキストで作ると、合成の結果のテクスチャが見えない
+        """
+        return self._context
+
     def compose(self, frame: int, *, underlay: bool = True) -> None:
         """``frame`` を合成する 結果は CPU へ戻さず GPU 上に残る
 

@@ -20,6 +20,10 @@ r"""書き出しの重さの内訳を測る（Issue #56 の 1 と 2）
 ``--decode-threads 1`` でレイヤーごとの並列デコードを切れる 並べた場合と
 比べるとき（同じ機械・同じ素材で 2 回回す）に使う
 
+内訳と ``--compare`` は、色変換を CPU（swscale）で行う道と GPU で行う道（#372）の
+両方で測る GPU の道では「読み戻し」に GPU の変換と YUV の読み戻しが入り、
+「色変換」は CPU で YUV の面を PyAV のフレームで包むだけになる
+
 ffmpeg が無いか GPU が使えない環境では、何も測らずに終わる（終了コード 0）
 """
 
@@ -68,7 +72,12 @@ from sashimono.core.model import (  # noqa: E402
     TrackKind,
 )
 from sashimono.core.timebase import FrameRate  # noqa: E402
-from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709  # noqa: E402
+from sashimono.engine.colorspace import (  # noqa: E402
+    VideoReformatter,
+    tag_bt709,
+    tag_frame_bt709,
+    to_bt709,
+)
 from sashimono.engine.decode import VideoDecoder, probe_media  # noqa: E402
 from sashimono.engine.encode import (  # noqa: E402
     ExportSettings,
@@ -76,6 +85,7 @@ from sashimono.engine.encode import (  # noqa: E402
     export_project,
 )
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext  # noqa: E402
+from sashimono.engine.gpu.yuv import YuvReadback, open_readback  # noqa: E402
 from sashimono.engine.render import (  # noqa: E402
     DEFAULT_DECODE_THREADS,
     FULL_QUALITY,
@@ -165,14 +175,26 @@ def breakdown(
     frames: int,
     output: Path,
     threads: int,
-) -> dict[str, list[float]]:
+    *,
+    gpu: bool = False,
+) -> dict[str, list[float]] | None:
     """1 フレームの内訳（ミリ秒） 書き出しと同じ順序で 1 段ずつ測る
 
     合成のあとに ``glFinish`` を入れる 入れないと命令を投げた時間だけを測り、
     実際の待ちが読み戻しの側へ寄って見える
+
+    ``gpu`` を立てると色変換を GPU で行う道で測る 段の分け方を揃えるため、読み戻しは
+    受け取るまで待つ（書き出しは 1 コマ遅れて受け取り、合成の裏で運ぶ） この機械で
+    GPU の変換を作れなければ ``None``
     """
-    renderer = FrameRenderer(project, context=context, quality=FULL_QUALITY, decode_threads=threads)
     width, height = project.settings.resolution
+    readback: YuvReadback[int] | None = None
+    if gpu:
+        with context:
+            readback = open_readback(width, height, "yuv420p")
+        if readback is None:
+            return None
+    renderer = FrameRenderer(project, context=context, quality=FULL_QUALITY, decode_threads=threads)
     container = av.open(str(output), mode="w")
     # 書き出しの本体（_FrameWriter）と同じく、swscale の表を使い回す
     # ここだけ毎フレーム作り直すと、直さなくてよい所が重く見える
@@ -203,10 +225,19 @@ def breakdown(
                 renderer.compose(number % max(project.duration, 1))
                 GL.glFinish()
                 composed = time.perf_counter()
-                image = renderer.compositor.read()
+                if readback is None:
+                    image = renderer.compositor.read()
+                else:
+                    readback.push(renderer.compositor.resolved_texture(), number)
+                    _tag, image = readback.pop()
                 read = time.perf_counter()
-            frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgba")
-            frame = to_bt709(frame, "yuv420p", reformatter=reformatter)
+            if readback is None:
+                frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgba")
+                frame = to_bt709(frame, "yuv420p", reformatter=reformatter)
+            else:
+                # 書き出しの本体と同じく、写さずに包む
+                frame = av.video.frame.VideoFrame.from_numpy_buffer(image, format="yuv420p")
+                tag_frame_bt709(frame)
             frame.pts = number
             frame.time_base = Fraction(1, 30)
             converted = time.perf_counter()
@@ -243,6 +274,9 @@ def breakdown(
             # 閉じるのに失敗しても、GPU とデコーダは必ず手放す
             # ここを飛ばすと、測るたびにテクスチャとデコーダが残る
             renderer.close()
+            if readback is not None:
+                with context:
+                    readback.release()
     return times
 
 
@@ -348,17 +382,36 @@ def compare_pipeline(
     depths: list[int],
     threads: int,
 ) -> None:
-    """パイプラインの深さを変えて書き出し、時間と中身を比べる"""
-    print("\n書き出し全体（パイプラインの深さごと）")
+    """パイプラインの深さと色変換の道（CPU・GPU）を変えて書き出し、時間と中身を比べる
+
+    GPU の道は色が丸めの 1 まで違ってよいので、絵の一致は同じ道どうしで見る
+    """
+    print("\n書き出し全体（パイプラインの深さと色変換の道ごと）")
+    for gpu in (False, True):
+        _compare_depths(project, codec, frames, directory, depths, threads, gpu=gpu)
+
+
+def _compare_depths(
+    project: Project,
+    codec: str,
+    frames: int,
+    directory: Path,
+    depths: list[int],
+    threads: int,
+    *,
+    gpu: bool,
+) -> None:
     reference: list[np.ndarray] | None = None
+    way = "GPU" if gpu else "CPU"
     for depth in depths:
-        path = directory / f"out-depth{depth}.mp4"
+        path = directory / f"out-{way}-depth{depth}.mp4"
         settings = ExportSettings(
             path=path,
             video_codec=codec,
             frame_range=(0, frames),
             pipeline_depth=depth,
             decode_threads=threads,
+            gpu_color=gpu,
         )
         started = time.perf_counter()
         export_project(project, settings)
@@ -377,8 +430,8 @@ def compare_pipeline(
                 if all(np.array_equal(a, b) for a, b in zip(produced, reference, strict=True))
                 else "**絵が違う**"
             )
-        label = "直列" if depth == 0 else f"深さ {depth}"
-        print(f"  {label:<8} {elapsed:8.1f} ms  ({elapsed / frames:6.2f} ms/枚)  {same}")
+        label = f"色変換 {way} " + ("直列" if depth == 0 else f"深さ {depth}")
+        print(f"  {label:<16} {elapsed:8.1f} ms  ({elapsed / frames:6.2f} ms/枚)  {same}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -449,15 +502,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     project = _project(sources, arguments.width, arguments.height, arguments.frames + 2)
     try:
-        times = breakdown(
-            project, context, codec, arguments.frames, _base / "breakdown.mp4", threads
-        )
-        print("\n1 フレームの内訳")
-        total = sum(sum(values) for values in times.values())
-        for name, values in times.items():
-            share = sum(values) / total * 100 if total else 0.0
-            print(f"  {name:<8} {_summary(values)}  {share:5.1f} %")
-        print(f"  {'合計':<8} {total / arguments.frames:6.2f} ms/枚")
+        totals: dict[str, float] = {}
+        for gpu in (False, True):
+            way = "GPU" if gpu else "CPU"
+            times = breakdown(
+                project,
+                context,
+                codec,
+                arguments.frames,
+                _base / f"breakdown-{way}.mp4",
+                threads,
+                gpu=gpu,
+            )
+            if times is None:
+                print(f"\n1 フレームの内訳（色変換 {way}）: この機械では GPU の変換を作れない")
+                continue
+            print(f"\n1 フレームの内訳（色変換 {way}）")
+            total = sum(sum(values) for values in times.values())
+            for name, values in times.items():
+                share = sum(values) / total * 100 if total else 0.0
+                print(f"  {name:<8} {_summary(values)}  {share:5.1f} %")
+            totals[way] = total / arguments.frames
+            print(f"  {'合計':<8} {totals[way]:6.2f} ms/枚")
+        if len(totals) == 2:
+            print(f"\n色変換を GPU へ移すと {totals['CPU'] / totals['GPU']:.2f} 倍")
         decode_by_layers(
             sources, arguments.width, arguments.height, arguments.frames, context, threads
         )

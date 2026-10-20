@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import cache
@@ -31,8 +31,15 @@ import numpy as np
 from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
 from sashimono.engine.audio import AudioMixer
-from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
+from sashimono.engine.colorspace import (
+    VideoReformatter,
+    bt709_planes,
+    tag_bt709,
+    tag_frame_bt709,
+    to_bt709,
+)
 from sashimono.engine.gpu import OffscreenGLContext
+from sashimono.engine.gpu.yuv import COLOR_TOLERANCE, YuvReadback, open_readback
 from sashimono.engine.render import (
     DEFAULT_DECODE_THREADS,
     FULL_QUALITY,
@@ -53,6 +60,7 @@ __all__ = [
     "MEASURED_DECODE_MS",
     "MEASURED_EXPORT_MS",
     "MEASURED_EXPORT_TOTAL_MS",
+    "MEASURED_GPU_COLOR_MS",
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
@@ -78,6 +86,12 @@ MEASURED_EXPORT_MS = (11.2, 2.7, 6.0, 0.7)
 #: 内訳の差（6.7ms）ほど縮まないのは、色変換の前半（画素を PyAV へ写す所）が
 #: GIL を握ったままで、合成の側の Python の処理と取り合うため
 MEASURED_EXPORT_TOTAL_MS = (31.4, 28.5)
+
+#: 色変換を CPU で行うときと GPU で行うとき（#372）の、書き出し 1 枚あたりの実測（ミリ秒）
+#: 1920x1080 を 3 枚重ね・NVENC・先読みの深さ 2 で 200 枚を書き出し切った値 GPU の側は
+#: 読み戻しも 1.5 byte/画素に減り、色変換が CPU から消える 4K では 76.8 が 35.6 になった
+#: 測り直すときは tools\bench_export.py --compare
+MEASURED_GPU_COLOR_MS = (17.9, 12.0)
 
 #: 同じ素材の合成（デコードを含む GPU 合成）1 枚あたりの実測（ミリ秒）
 #: 並べない（1 本ずつ）/ 4 本まで並べる の順 1920x1080 を 3 枚重ね
@@ -128,6 +142,10 @@ class ExportSettings:
     pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
     #: 重ねたレイヤーのデコードを、いくつまで同時に走らせてよいか 1 なら並べない
     decode_threads: int = DEFAULT_DECODE_THREADS
+    #: 動画用の色（BT.709 の YUV）への変換を GPU で行う（#372） 偽なら CPU（swscale）で行う
+    #: GPU で行えるのは 8bit の 4:2:0（yuv420p・nv12）で縦横が偶数のときだけで、ほかは
+    #: 真でも CPU で行う 結果の差は 8bit の丸めの 1 まで 本人の設定（Preferences）から渡す
+    gpu_color: bool = True
     #: 前の音を読む音の効果の動く値を、区切りの中でもつなぐ（:class:`AudioMixer`）
     #: 再生と同じ音にするため、本人の設定（プレビューと同じ値）を渡す
     smooth_history: bool = True
@@ -422,20 +440,35 @@ def _encode(
             progress=progress,
         )
 
-        # 書き込み（色変換・エンコード・mux）は別スレッドへ逃がす 渡す順序は
-        # そのままなので、出来上がるファイルは直列のときと 1 バイトも変わらない
-        with _WritePipeline(writer.write, settings.pipeline_depth) as pipeline:
-            for index, frame_number in enumerate(range(start, end)):
-                if should_cancel is not None and should_cancel():
-                    raise ExportError("書き出しを中止した")
-                # 書き込み側が落ちていたら、そこで合成をやめる 続けても捨てられるだけで、
-                # 本当の失敗（閉じるときに投げ直す）が後ろへ遠ざかる
-                if pipeline.failed:
-                    break
-                # 席を取ってから描く 描いてから待つと、キューの上限に加えて手元の 1 枚が
-                # 余分に残り、選んだ枚数より多く抱える（4K なら 1 枚 33MB）
-                pipeline.reserve()
-                pipeline.submit(index, frame_number, renderer.render(frame_number))
+        # 色変換は GPU で行えるならそちらで行う（#372） 作れない形式や駆動では CPU に残る
+        source = _FrameSource(
+            renderer, settings.pixel_format if settings.gpu_color else None, width, height
+        )
+        try:
+            # 書き込み（色変換・エンコード・mux）は別スレッドへ逃がす 渡す順序は
+            # そのままなので、出来上がるファイルは直列のときと 1 バイトも変わらない
+            with _WritePipeline(writer.write, settings.pipeline_depth) as pipeline:
+                for index, frame_number in enumerate(range(start, end)):
+                    if should_cancel is not None and should_cancel():
+                        raise ExportError("書き出しを中止した")
+                    # 書き込み側が落ちていたら、そこで合成をやめる 続けても捨てられるだけで、
+                    # 本当の失敗（閉じるときに投げ直す）が後ろへ遠ざかる
+                    if pipeline.failed:
+                        break
+                    # 席は絵を手元へ出す直前に取る（:meth:`_FrameSource.frame` が呼ぶ）
+                    # 描いてから待つと、キューの上限に加えて手元の 1 枚が余分に残り、
+                    # 選んだ枚数より多く抱える（4K なら 1 枚 33MB）
+                    for item in source.frame(index, frame_number, pipeline.reserve):
+                        pipeline.submit(*item)
+                # GPU で読み戻している途中のコマを受け取る ここを忘れると末尾のコマが欠ける
+                # 書き込み側が落ちていれば受け取っても捨てられるだけなので、閉じて投げ直させる
+                if not pipeline.failed:
+                    for item in source.drain(pipeline.reserve):
+                        pipeline.submit(*item)
+        finally:
+            # 中止や失敗で抜けたときも、読み戻しのバッファを返す 書き込みのスレッドは
+            # 上の with が終わらせてあり、もう GPU の配列を待っている者はいない
+            source.release()
 
         # 最後の 1 枚を渡した後、書き込みが終わるまでの間に押された中止もここで拾う
         # 見ないと、中止したのに「書き出しました」と出てファイルも残る
@@ -498,11 +531,19 @@ class _FrameWriter:
                 self._audio_cursor,
             )
 
-        # 合成結果は RGBA のまま渡す rgb24 へ詰め直すと、飛び飛びの読み出しで
-        # 6MB を写す手間が増えるだけ（1920x1080 で 1 枚 3ms）
-        # swscale は RGBA の A を捨てるので、出る画素は rgb24 から変換したものと同じ
-        frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgba")
-        frame = to_bt709(frame, self._pixel_format, reformatter=self._reformatter)
+        if image.ndim == 2:
+            # GPU で変換済みの面（#372） 並びは書き出す画素形式そのもので、変換は要らない
+            # タグだけ CPU の道と同じに付ける 写さずに配列をそのまま包む（from_ndarray で
+            # 写すと 4K で 1 枚 7ms 掛かり、GPU へ移して浮いた時間の 3 分の 1 が消える）
+            # 配列は読み戻しがコマごとに新しく作るので、包んだまま後で上書きされることは無い
+            frame = av.video.frame.VideoFrame.from_numpy_buffer(image, format=self._pixel_format)
+            tag_frame_bt709(frame)
+        else:
+            # 合成結果は RGBA のまま渡す rgb24 へ詰め直すと、飛び飛びの読み出しで
+            # 6MB を写す手間が増えるだけ（1920x1080 で 1 枚 3ms）
+            # swscale は RGBA の A を捨てるので、出る画素は rgb24 から変換したものと同じ
+            frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgba")
+            frame = to_bt709(frame, self._pixel_format, reformatter=self._reformatter)
         frame.pts = index
         frame.time_base = self._frame_time_base
         self._container.mux(self._video.encode(frame))
@@ -513,8 +554,105 @@ class _FrameWriter:
             self._progress((index + 1) / self._total)
 
 
+#: 書き込みへ渡す 1 コマ 通し番号・タイムラインのフレーム・絵
+#: 絵は RGBA の ``(高さ, 幅, 4)`` か、GPU で変換済みの YUV の面 ``(高さ x 1.5, 幅)``
+_Frame = tuple[int, int, np.ndarray]
+
+
+class _FrameSource:
+    """合成した絵を、書き込みへ渡す形で出す GPU の色変換（#372）の出入り口
+
+    GPU で変換できるときは、合成した絵を GPU の上で YUV へ変換し、PBO で読み戻す
+    読み戻しは 1 コマ遅れて出てくる（次のコマを合成している間に運ぶ） 出る順は合成した
+    順のまま :meth:`drain` で最後の分を受け取る
+
+    最初の 1 コマだけは CPU の変換でも作って比べ、差が :data:`COLOR_TOLERANCE` を
+    超えたら GPU をやめて CPU の道で書き続ける 手元で確かめられたのは NVIDIA だけで、
+    AMD や Intel の駆動で変換が食い違ったときに、色のずれた動画を黙って書かないため
+    比べるのは 1 コマぶんの CPU の変換（1080p で 7 ms ほど）だけで済む
+
+    使えないとき（形式・奇数の大きさ・駆動が断った・本人が切った）は、今までどおり
+    :meth:`FrameRenderer.render` の RGBA を渡し、書き込みの側で CPU が変換する
+    """
+
+    def __init__(
+        self, renderer: FrameRenderer, pixel_format: str | None, width: int, height: int
+    ) -> None:
+        self._renderer = renderer
+        self._readback: YuvReadback[tuple[int, int]] | None = None
+        #: 最初のコマを CPU の変換と比べ終えたか
+        self._checked = False
+        if pixel_format is not None:
+            with renderer.context:
+                self._readback = open_readback(width, height, pixel_format)
+        self._pixel_format = pixel_format or ""
+
+    @property
+    def on_gpu(self) -> bool:
+        """色変換を GPU で行っているか 比べて食い違ったら途中で偽になる"""
+        return self._readback is not None
+
+    def frame(self, index: int, frame_number: int, reserve: Callable[[], None]) -> list[_Frame]:
+        """``frame_number`` を合成し、渡せるようになったコマを返す（0 か 1 枚）
+
+        ``reserve`` は書き込みの席を取る 絵を手元へ出す直前に呼ぶ
+        """
+        readback = self._readback
+        if readback is None:
+            reserve()
+            return [(index, frame_number, self._renderer.render(frame_number))]
+        with self._renderer.context:
+            self._renderer.compose(frame_number)
+            texture = self._renderer.compositor.resolved_texture()
+            if not self._checked:
+                return [self._first(readback, index, frame_number, texture, reserve)]
+            readback.push(texture, (index, frame_number))
+            if not readback.full:
+                return []
+            reserve()
+            (done, number), image = readback.pop()
+        return [(done, number, image)]
+
+    def _first(
+        self,
+        readback: YuvReadback[tuple[int, int]],
+        index: int,
+        frame_number: int,
+        texture: int,
+        reserve: Callable[[], None],
+    ) -> _Frame:
+        """最初のコマを GPU と CPU の両方で変換して比べ、どちらで続けるかを決める"""
+        self._checked = True
+        reserve()
+        readback.push(texture, (index, frame_number))
+        _tag, planes = readback.pop()
+        image = self._renderer.compositor.read()
+        expected = bt709_planes(image, self._pixel_format)
+        difference = np.abs(planes.astype(np.int16) - expected.astype(np.int16))
+        if expected.shape == planes.shape and int(difference.max()) <= COLOR_TOLERANCE:
+            return index, frame_number, planes
+        # 食い違った GPU の変換は捨てる 残りのコマも CPU で変換する
+        self.release()
+        return index, frame_number, image
+
+    def drain(self, reserve: Callable[[], None]) -> Iterator[_Frame]:
+        """読み戻している途中のコマを、合成した順に出す"""
+        while self._readback is not None and self._readback.pending:
+            reserve()
+            with self._renderer.context:
+                (index, frame_number), image = self._readback.pop()
+            yield index, frame_number, image
+
+    def release(self) -> None:
+        """読み戻しのバッファを返す 何度呼んでもよい 返した後は CPU の道で書く"""
+        readback, self._readback = self._readback, None
+        if readback is not None:
+            with self._renderer.context:
+                readback.release()
+
+
 #: 書き込みスレッドへ渡す品物 ``None`` は「もう来ない」の合図
-_Item = tuple[int, int, np.ndarray] | None
+_Item = _Frame | None
 
 
 class _WritePipeline:

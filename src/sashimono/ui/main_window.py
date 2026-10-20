@@ -2873,6 +2873,7 @@ class MainWindow(QMainWindow):
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
+            gpu_color=self._preferences.export_gpu_color,
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
         )
@@ -3904,6 +3905,7 @@ class MainWindow(QMainWindow):
                 pipeline_depth=self._preferences.export_pipeline_depth,
                 decode_threads=self._preferences.decode_threads,
                 smooth_history=self._preferences.smooth_audio_motion,
+                gpu_color=self._preferences.export_gpu_color,
                 chapters=self._preferences.export_chapters,
             )
         except (KeyError, ValueError) as exc:
