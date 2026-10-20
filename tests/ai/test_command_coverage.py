@@ -34,9 +34,10 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import CHILD_ISSUES
 from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.compat.looks import capture_preset
-from sashimono.core.commands import Command, Document, InScene
+from sashimono.core.commands import Command, Document, InScene, RemoveClip, RenameTrack
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
 from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript
+from sashimono.core.model.ids import ClipId, TrackId
 from sashimono.effects.sources import TEXT
 from tests.ai.conftest import FakeHost
 from tests.ai.test_look_tools import (
@@ -82,15 +83,19 @@ def recording() -> Iterator[set[str]]:
     """文書に届いたコマンドの名前を集める シーンの中の実行は中のコマンドも数える
 
     道具が手順を組むときに ``apply`` で試すだけのコマンドは数えない（作品は変わらない）
+    断られたコマンドも数えない 作品を変えていないのに数えると、いつも断られる道のコマンドを
+    「AI が使う」と数え、理由を求めずに通してしまう
     """
     seen: set[str] = set()
     original = Document.execute
 
     def execute(self: Document, command: Command, **options: Any) -> Any:
+        # 通った後で数える 先に数えると、例外で断られて作品を変えなかったコマンドまで残る
+        result = original(self, command, **options)
         seen.add(type(command).__name__)
         if isinstance(command, InScene):
             seen.add(type(command.command).__name__)
-        return original(self, command, **options)
+        return result
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Document, "execute", execute)
@@ -299,6 +304,24 @@ def _write_example(name: str) -> Example:
     return example
 
 
+#: 道具を動かす関数 :data:`OPERATIONS` の 1 つか、試験が作る偽物
+Run = Callable[[Any, dict[str, Any]], Any]
+
+
+def tally(operation: Run, host: FakeHost, arguments: dict[str, Any]) -> tuple[set[str], str | None]:
+    """道具を 1 回動かし、作品に残ったコマンドと断りの文（通ったら None）を返す
+
+    断られたら何も数えない 途中まで通ったコマンドも ``checkpoint`` が元へ戻すので作品に
+    残らない 数えると、断られる道しか通らないコマンドが見張りの数えから外れる
+    """
+    with recording() as seen:
+        try:
+            operation(host, arguments)
+        except (ToolError, ValueError, KeyError) as exc:
+            return set(), str(exc)
+    return seen, None
+
+
 def _used(material: Material) -> tuple[dict[str, set[str]], dict[str, str]]:
     """道具ごとに通ったコマンドと、断られた例（例の名前 → 断りの文）"""
     used: dict[str, set[str]] = {}
@@ -309,11 +332,9 @@ def _used(material: Material) -> tuple[dict[str, set[str]], dict[str, str]]:
         host, tool, arguments = example(material)
         operation = find_operation(tool)
         assert operation is not None, label
-        with recording() as seen:
-            try:
-                operation(host, arguments)
-            except (ToolError, ValueError, KeyError) as exc:
-                refused[label] = str(exc)
+        seen, refusal = tally(operation, host, arguments)
+        if refusal is not None:
+            refused[label] = refusal
         used.setdefault(tool, set()).update(seen)
     return used, refused
 
@@ -367,6 +388,38 @@ class TestEveryCommandHasAToolOrAReason:
         expected = {f"WRITE_EXAMPLES {name}" for name in WRITE_EXAMPLES if name in covered}
         assert set(refused) <= expected, {k: v for k, v in refused.items() if k not in expected}
         assert not {k for k in refused if k.startswith("EXAMPLES ")}
+
+    def test_a_refused_run_counts_nothing(self, material: Material) -> None:
+        # 壊れると、1 本目を通して 2 本目で断られた道具（作品は checkpoint で元へ戻る）の
+        # 1 本目を「AI が使う」と数え、いつも断られる道のコマンドを理由なしに見逃す
+        host = _text_host(material)
+        track = TrackId(_ids(host)["track"])
+        before = host.document.project
+
+        def refused_halfway(host: FakeHost, arguments: dict[str, Any]) -> None:
+            host.apply_commands(
+                [RenameTrack(track, "通る"), RemoveClip(ClipId("無いクリップ"))], "試し"
+            )
+
+        seen, refusal = tally(refused_halfway, host, {})
+        assert refusal is not None
+        assert host.document.project == before
+        assert seen == set()
+
+    def test_a_command_refused_inside_a_tool_is_not_counted(self, material: Material) -> None:
+        # 壊れると、道具が試して断られ、別の道へ回ったコマンドを「AI が使う」と数え、
+        # 作品へ一度も届かないコマンドを見張りの数えから外す
+        host = _text_host(material)
+        track = TrackId(_ids(host)["track"])
+
+        def falls_back(host: FakeHost, arguments: dict[str, Any]) -> None:
+            with pytest.raises(KeyError):
+                host.document.execute(RemoveClip(ClipId("無いクリップ")))
+            host.apply_commands([RenameTrack(track, "通る")], "試し")
+
+        seen, refusal = tally(falls_back, host, {})
+        assert refusal is None
+        assert seen == {"RenameTrack"}
 
     def test_every_writing_tool_is_run(self) -> None:
         # 壊れると、例の無い変える道具が通すコマンドを数えず、そのコマンドに要らない理由を求める
