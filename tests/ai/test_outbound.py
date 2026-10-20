@@ -16,6 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from sashimono.ai import bridge as bridge_module
@@ -41,6 +42,7 @@ from sashimono.core.commands import AddMarkers, RemoveMedia, SetStyleGuide, SetT
 from sashimono.core.model import Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.checks.profile import SoundProfiler
 from sashimono.engine.vision import Box, ScreenKind, ScreenReport, ScreenSample, TextLine
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
@@ -140,6 +142,8 @@ class TestDeclarations:
         # 何コマも並べた 1 枚も同じ絵（#320）
         assert Outbound.FRAMES in _operation("contact_sheet").sends
         assert Outbound.FRAMES in _operation("preview_range").sends
+        # 音量の推移のグラフも絵（#338） 絵は伏せられないので、同意を取ってから送る
+        assert Outbound.FRAMES in _operation("audio_graph").sends
         assert Outbound.TEXT in _operation("get_subtitles").sends
         assert Outbound.FILES in _operation("list_media").sends
 
@@ -182,6 +186,11 @@ class TestDeclarations:
             "path": str(SECRET_PATH),
             "message": f"書き出しました: {SECRET_PATH}",
         }
+        # 混ぜた音の推移（#322 #338） 音の道具が待たずに結果（数の並びとグラフの絵）を返す道を通る
+        # 入れないと、解析を頼んだだけの断りの文しか見ず、グラフの絵の宣言を外しても落ちない
+        profiler = SoundProfiler(48000, 2)
+        profiler.add(np.full((48000 * 2, 2), 0.1))
+        secret_host.heard = profiler.snapshot()
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
@@ -196,6 +205,20 @@ class TestDeclarations:
             checked += 1
             assert not undeclared(operation, result, sentences=texts, places=secrets)
         assert checked >= 10
+
+    @pytest.mark.parametrize("name", ["analyze_audio", "audio_graph"])
+    def test_the_sound_tools_declare_the_file_they_were_given(
+        self, name: str, secret_host: FakeHost, tmp_path: Path
+    ) -> None:
+        # 壊れると、書き出した動画の場所を断りの文に入れて返す音の道具（#322 #338）が、
+        # 素材の名前と場所を尋ねずに送る 上の見張りは引数なし（タイムライン）でしか呼ばない
+        secret_host.saved_at = tmp_path / "作品.sme"
+        operation = _operation(name)
+        with pytest.raises(ToolError) as refused:
+            operation(secret_host, {"path": str(SECRET_PATH), "wait_seconds": 0})
+        assert SECRET_PATH.name in str(refused.value)
+        secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
+        assert not undeclared(operation, str(refused.value), places=secrets)
 
     def test_every_reading_tool_that_needs_arguments_has_an_example(self) -> None:
         # 壊れると、引数の要る読む道具（素材を指す物）が、引数なしで断られるだけで済み、
