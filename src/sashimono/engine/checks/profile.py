@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -365,7 +366,10 @@ def _window(
 
 def _segment(run: list[tuple[int, int, _Window]], label: str) -> SoundSegment:
     covered = [window.subtitles for _start, _end, window in run if window.subtitles is not None]
-    rank = round(sum(_RANK[window.confidence] for _start, _end, window in run) / len(run))
+    average = sum(_RANK[window.confidence] for _start, _end, window in run) / len(run)
+    # ちょうど半々なら低い側へ丸める round は偶数へ寄せるので、high と medium の半々は high、
+    # medium と low の半々は low と向きが変わり、裏付けの無い秒を半分含む区間を high と返していた
+    rank = math.ceil(average - 0.5)
     return SoundSegment(
         start=run[0][0],
         end=run[-1][1],

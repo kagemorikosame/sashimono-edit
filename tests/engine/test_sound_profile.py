@@ -146,6 +146,28 @@ class TestKinds:
             (9, 10, SPEECH),
         ]
 
+    @pytest.mark.parametrize(
+        ("confidences", "expected"),
+        [
+            (["high", "medium"], "medium"),
+            (["medium", "low"], "low"),
+            (["high", "high", "high", "medium"], "high"),
+            (["high", "low"], "medium"),
+        ],
+    )
+    def test_a_tie_in_confidence_goes_down(
+        self, confidences: list[str], expected: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、字幕で裏付けた秒と音の形だけの秒が半々の区間を high と返し、AI が
+        # 確かめずに切ってよい所と読む（丸めが偶数寄りで、半々が上にも下にも転ぶ）
+        def decided(_profile: SoundProfile, _levels: object, start: int, *_rest: object) -> object:
+            return profile_module._Window(SPEECH, confidences[start // 10], 0.5, 0.5, None)
+
+        monkeypatch.setattr(profile_module, "_window", decided)
+        samples = np.zeros((len(confidences) * RATE, 2))
+        ((segment),) = classify(_profile(samples))
+        assert segment.confidence == expected
+
     def test_the_levels_are_made_once_for_a_long_work(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
