@@ -1007,13 +1007,28 @@ def command_adopt(folder: EvalDir, material: str, task: str, source: Path | None
     print(f"{material} {task}: 直した正解を取り込んだ")
 
 
+class TranscribeError(RuntimeError):
+    """字幕起こしが例外を投げた 同じ素材のあとの課題でも、やり直さずにこれを投げる"""
+
+
 def _remembered(transcriber: Transcriber) -> Transcriber:
-    """1 本の素材の中で、字幕起こしの結果を覚えて使い回す包み"""
+    """1 本の素材の中で、字幕起こしの結果を覚えて使い回す包み
+
+    失敗も覚える 覚えないと、字幕の課題で落ちた字幕起こしを書き出しの課題でもう 1 度走らせ、
+    長い素材では同じ失敗を待つだけで数分を失う
+    """
     memo: dict[str, Transcript | None] = {}
+    failed: list[TranscribeError] = []
 
     def once(media: Path, chosen: ToolParams) -> Transcript | None:
+        if failed:
+            raise failed[0]
         if "value" not in memo:
-            memo["value"] = transcriber(media, chosen)
+            try:
+                memo["value"] = transcriber(media, chosen)
+            except Exception as error:
+                failed.append(TranscribeError(type(error).__name__))
+                raise failed[0] from error
         return memo["value"]
 
     return once
@@ -1085,6 +1100,11 @@ def command_run(
                             metrics=score(task, prediction.value, with_facts(truth, answer), book),
                             params=resolved.record(task),
                         )
+            except TranscribeError as error:
+                # 字幕起こしの失敗は、それを使う課題のどれでも同じ理由にする 書き出しの失敗と
+                # 取り違えると、GPU を疑って字幕起こしの部品の不具合を見落とす
+                print(f"{material.id} {task}: 字幕起こしに失敗した（{error}）")
+                record.update(status="failed", reason="asr-error")
             except Exception as error:
                 print(f"{material.id} {task}: 失敗した（{type(error).__name__}）")
                 record.update(

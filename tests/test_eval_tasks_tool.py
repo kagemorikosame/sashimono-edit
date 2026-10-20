@@ -162,8 +162,50 @@ def test_one_failing_task_keeps_the_other_results(
     def exporter(path: Path, transcript: Transcript | None, output: Path) -> dict[str, Any]:
         raise RuntimeError(f"書き出しに失敗 {path} {secret}")
 
+    records = tool.command_run(
+        eval_dir,
+        book,
+        [],
+        results=results,
+        transcriber=_fake_transcriber,
+        exporter=exporter,
+        commit="abc",
+    )
+    by_task = {(r["material"], r["task"]): r for r in records}
+    assert by_task["E01", "scenes"]["status"] == "ok"
+    assert by_task["E02", "silence"]["status"] == "ok"
+    assert by_task["E02", "subtitles"]["status"] == "ok"
+    assert (by_task["E02", "export"]["status"], by_task["E02", "export"]["reason"]) == (
+        "failed",
+        "export-error",
+    )
+    written = [json.loads(line) for line in results.read_text(encoding="utf-8").splitlines()]
+    assert len(written) == len(records) == 5
+    text = results.read_text(encoding="utf-8")
+    assert "secretclip" not in text and "evaldir" not in text and "失敗" not in text
+
+
+def test_failed_transcription_is_not_retried(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """字幕起こしが落ちたら、同じ素材のあとの課題でやり直さず、どれも同じ理由で failed にすること
+
+    落ちると、長い素材で同じ失敗を待つだけの字幕起こしを課題の数だけ走らせて数分を失い、
+    書き出しの課題が export-error と出て、GPU を疑って字幕起こしの部品の不具合を見落とす
+    """
+    tool, eval_dir, book = folder
+    tool.command_draft(eval_dir, book, [], transcriber=_fake_transcriber)
+    results = tmp_path / "results.jsonl"
+    calls: list[Path] = []
+    exported: list[Path] = []
+
     def transcriber(path: Path, params: object) -> Transcript:
+        calls.append(path)
         raise OSError(f"字幕起こしに失敗 {path}")
+
+    def exporter(path: Path, transcript: Transcript | None, output: Path) -> dict[str, Any]:
+        exported.append(output)
+        return {"problems": 0, "loudness": None, "complete": True}
 
     records = tool.command_run(
         eval_dir,
@@ -174,21 +216,18 @@ def test_one_failing_task_keeps_the_other_results(
         exporter=exporter,
         commit="abc",
     )
+    assert len(calls) == 1
+    # 字幕が要る書き出しを、字幕無しで黙って書き出して ok にしない
+    assert exported == []
     by_task = {(r["material"], r["task"]): r for r in records}
-    assert by_task["E01", "scenes"]["status"] == "ok"
     assert by_task["E02", "silence"]["status"] == "ok"
-    assert (by_task["E02", "subtitles"]["status"], by_task["E02", "subtitles"]["reason"]) == (
-        "failed",
-        "tool-error",
-    )
-    assert (by_task["E02", "export"]["status"], by_task["E02", "export"]["reason"]) == (
-        "failed",
-        "export-error",
-    )
-    written = [json.loads(line) for line in results.read_text(encoding="utf-8").splitlines()]
-    assert len(written) == len(records) == 5
+    for task in ("subtitles", "export"):
+        assert (by_task["E02", task]["status"], by_task["E02", task]["reason"]) == (
+            "failed",
+            "asr-error",
+        )
     text = results.read_text(encoding="utf-8")
-    assert "secretclip" not in text and "evaldir" not in text and "失敗" not in text
+    assert "secretclip" not in text and "失敗" not in text
 
 
 def test_character_error_rate(tool: ModuleType) -> None:
