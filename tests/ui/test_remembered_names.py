@@ -75,6 +75,10 @@ PROJECT_SIDE = {
     "clipboard",
     "set_clipboard",
     "insert_paste_all_tracks",
+    # 開く・新規（#349） 何も返さない 開いた作品の場所は remembered_names からも返す
+    "is_modified",
+    "open_project_file",
+    "start_new_project",
     # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
     "undo",
     "redo",

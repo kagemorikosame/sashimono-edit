@@ -25,6 +25,7 @@ from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.core.seams import SeamStyle
+from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
@@ -32,11 +33,19 @@ from sashimono.engine.checks import CheckRequest, CheckState
 __all__ = [
     "EXPORT_RUNNING",
     "EXPORT_STATES",
+    "UNSAVED_REFUSAL",
     "EditorHost",
     "ExportRequest",
     "SheetCanvas",
     "ToolError",
 ]
+
+#: 保存していない変更があるのに作品を閉じようとした AI の開く・新規を断る文（#349）
+#: 2026-10-20 利用者の決定 黙って捨てず、保存するか人が窓で決めるかを案内する
+UNSAVED_REFUSAL = (
+    "保存していない変更があるので、今の作品を閉じません 先に save_project で保存するか、"
+    "人が〔開く…〕〔新規〕の窓で決めてください"
+)
 
 #: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
 #: 走っている間は「書いている」「置いている」 終わった後は残りのどれか
@@ -134,6 +143,29 @@ class EditorHost(Protocol):
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         """選択を丸ごと入れ替える 空なら選択を解く"""
+        ...
+
+    @property
+    def is_modified(self) -> bool:
+        """保存してから変えたか AI の開く・新規（#349）は、変えていれば今の作品を閉じない"""
+        ...
+
+    def open_project_file(self, path: Path) -> None:
+        """作品（``.sme``）を開いて今の作品と差し替える（AI の開く #349） 画面の〔開く…〕と同じ処理
+
+        ``path`` は確かめ済みの場所 窓は出さない 保存していない変更がある・読めない・別の窓で
+        開いているときは :class:`ToolError` AI の指示の段を開いていれば、その指示の残りの
+        編集は断る（:attr:`~sashimono.core.commands.Document.replaced_in_checkpoint`）
+        """
+        ...
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        """新しい作品へ差し替える（AI の新規 #349） 省いた値は本人の「新しい作品」の設定
+
+        保存していない変更があれば :class:`ToolError` 指示の残りの編集は開くと同じく断る
+        """
         ...
 
     @property

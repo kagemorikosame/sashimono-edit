@@ -9,14 +9,19 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import replace
+from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
+from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
+from sashimono.core.commands import Author
 from sashimono.core.commands.fixed import with_fixed_items
-from sashimono.core.model import Clip, Project, Track, TrackKind
+from sashimono.core.io.serialize import save_project
+from sashimono.core.model import Clip, LayerMode, MediaItem, Project, Track, TrackKind
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
 
@@ -124,3 +129,66 @@ class TestScenesInTheWindow:
         _run(window, "rename_scene", name="冒頭")
         assert window.active_scene == scene_id
         assert [scene.name for scene in window.document.project.scenes] == ["冒頭"]
+
+
+class TestOpeningAndNewInTheWindow:
+    @pytest.fixture
+    def saved(self, window: MainWindow, tmp_path: Path) -> Path:
+        """窓の作品を tmp_path/作品.sme に保存し、隣に 第二稿.sme を置く 返すのは第二稿の場所"""
+        window._path = tmp_path / "作品.sme"
+        window._write_project_file(window._path)
+        other = tmp_path / "第二稿.sme"
+        save_project(replace(Project.create(), name="第二稿"), other)
+        return other
+
+    def test_opening_swaps_the_window_without_any_popup(
+        self, window: MainWindow, saved: Path
+    ) -> None:
+        # 壊れると、AI の〔開く〕で保存を尋ねる窓や錠の窓が出て、答えるまで AI が止まる
+        window.document.begin_checkpoint("AI: 開く", by=Author.AI)
+        _run(window, "open_project", path=str(saved))
+        assert window.document.project.name == "第二稿"
+        assert window.project_path == saved.resolve()
+        assert not window.is_modified
+        # 同じ指示の中の編集は断る
+        with pytest.raises(ToolError, match="次の指示"):
+            _run(window, "add_text", text="字")
+        window.document.end_checkpoint()
+        _run(window, "add_text", text="字")
+
+    def test_unsaved_changes_are_kept(self, window: MainWindow, saved: Path) -> None:
+        # 壊れると、人が保存していない編集が、AI の〔開く〕で黙って消える
+        _run(window, "add_text", text="保存していない")
+        before = window.document.project
+        with pytest.raises(ToolError, match="save_project"):
+            _run(window, "open_project", path=str(saved))
+        assert window.document.project is before
+
+    def test_a_new_project_uses_the_person_s_settings_for_new_projects(
+        self, window: MainWindow
+    ) -> None:
+        # 壊れると、AI が作った作品だけ置き方の方式が本人の「新しい作品」の設定と違う
+        window._preferences = replace(window._preferences, new_project_layers=LayerMode.MIXED)
+        window._mark_saved()
+        _run(window, "new_project", width=1280, height=720)
+        settings = window.document.project.settings
+        assert settings.resolution == (1280, 720)
+        assert settings.layer_mode == LayerMode.MIXED
+        assert window.project_path is None
+
+
+class TestRemovingMediaInTheWindow:
+    def test_the_analysis_is_dropped_like_the_pool_menu(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        # 壊れると、AI が素材一覧から外した素材の波形やサムネイルを、アプリがメモリに抱え続ける
+        del qt_application
+        media = MediaItem(path=tmp_path / "使わない.wav", duration=Fraction(1))
+        created = MainWindow(Project.create(media=(media,)), confirm_unsaved=False)
+        try:
+            _run(created, "remove_media", media_id=str(media.id))
+            assert created.document.project.media == ()
+            assert media.id in created._forgotten
+        finally:
+            created.close()
+            created.deleteLater()

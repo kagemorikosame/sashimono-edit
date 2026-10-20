@@ -23,11 +23,18 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
+from sashimono.ai.host import (
+    EXPORT_RUNNING,
+    UNSAVED_REFUSAL,
+    EditorHost,
+    ExportRequest,
+    ToolError,
+)
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
     Consent,
     Safety,
+    openable_project,
     pinned_place,
     readable_output,
     refuse_where_the_folder_cannot_be_held,
@@ -4848,6 +4855,96 @@ def _save_project_as(host: EditorHost, arguments: dict[str, Any], consent: Conse
     }
 
 
+# --- 開く・新規（今の作品を閉じる 取り消せない操作 #349） ---
+#
+# 2026-10-20 利用者の決定 毎回確かめる 保存していない変更があれば断って save_project か
+# 人の窓を案内する 開けるのは作品のフォルダと書き出しの窓で前に選んだフォルダの中の .sme だけ
+# 開いた後は、その指示の中で編集の道具を断る（指示の取り消しの段が前の作品を指すため）
+
+#: 確かめの欄に添える 差し替えると取り消しの履歴が消え、前の作品へは戻れない
+_CLOSING_NOTE = "今の作品を閉じます 取り消しの履歴も消え、「元に戻す」では戻りません"
+
+
+def _refuse_unsaved(host: EditorHost) -> None:
+    if host.is_modified:
+        raise ToolError(UNSAVED_REFUSAL)
+
+
+def _open_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    raw = arguments.get("path")
+    _require_suffix(raw, (SUFFIX,), "作品")
+    _refuse_unsaved(host)
+    path = openable_project(host, raw)
+    status = path.stat()
+    when = datetime.fromtimestamp(status.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return Consent(
+        action="作品を開きます",
+        target=str(path),
+        detail=f"開く作品は {status.st_size:,} バイト {when} 更新 {_CLOSING_NOTE}",
+        # 許した後に中身が変わったら、実行の前の照らし合わせで気付けるよう身元を持つ
+        basis=expect_now(path),
+    )
+
+
+def _open_project(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    del arguments
+    # 開くのは人が許した場所 引数から解き直すと、許した後に作品の場所が変わったとき
+    # 別の場所を指す（実行の前の照らし合わせで同じと確かめてある）
+    path = Path(consent.target)
+    host.open_project_file(path)
+    return {
+        "opened": str(path),
+        "name": host.document.project.name,
+        "note": "この指示の中では、開いた作品をもう編集しません 続きは次の指示で頼んでください",
+    }
+
+
+def _new_settings(arguments: dict[str, Any]) -> tuple[tuple[int, int] | None, FrameRate | None]:
+    """新しい作品の解像度とフレームレート 省けば本人の「新しい作品」の設定のまま"""
+    resolution: tuple[int, int] | None = None
+    if "width" in arguments or "height" in arguments:
+        try:
+            width, height = int(arguments["width"]), int(arguments["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolError("width と height は一緒に整数で渡してください") from exc
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
+            # 奇数の縦横は書き出しでエンコーダに断られる（解像度の道具と同じ決まり）
+            raise ToolError(f"解像度は正の偶数にしてください: {width}x{height}")
+        resolution = (width, height)
+    rate: FrameRate | None = None
+    if arguments.get("frame_rate") is not None:
+        try:
+            rate = FrameRate.from_decimal(Fraction(str(arguments["frame_rate"])))
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            raise ToolError("frame_rate は 30 や 29.97 のような正の数です") from exc
+    return resolution, rate
+
+
+def _new_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    resolution, rate = _new_settings(arguments)
+    _refuse_unsaved(host)
+    size = f"{resolution[0]}x{resolution[1]}" if resolution else "設定の既定の解像度"
+    fps = f"{rate} fps" if rate else "設定の既定のフレームレート"
+    return Consent(
+        action="新しい作品を作ります",
+        target=f"{size} {fps}（作った後はフレームレートを変えられません）",
+        detail=_CLOSING_NOTE,
+    )
+
+
+def _new_project(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    del consent
+    resolution, rate = _new_settings(arguments)
+    host.start_new_project(resolution=resolution, frame_rate=rate)
+    settings = host.document.project.settings
+    return {
+        "resolution": f"{settings.width}x{settings.height}",
+        "frame_rate": str(settings.frame_rate),
+        "layer_mode": settings.layer_mode,
+        "note": "この指示の中では、新しい作品をもう編集しません 続きは次の指示で頼んでください",
+    }
+
+
 def _subtitle_plan(
     host: EditorHost, arguments: dict[str, Any]
 ) -> tuple[Path, tuple[int, int] | None, str]:
@@ -7355,6 +7452,50 @@ OPERATIONS: tuple[Operation, ...] = (
         # 名前と場所を断った人には伏せる（場所の欄は値ごと）
         sends=_WITH_FILES,
         name_keys=frozenset({"saved", "previous_kept_as"}),
+    ),
+    Operation(
+        name="open_project",
+        description=(
+            "作品（.sme）を開いて今の作品と差し替える（画面の〔開く…〕と同じ）"
+            " 毎回ユーザーに確かめる"
+            " 開けるのは今の作品のフォルダと、書き出しの窓で前に選んだフォルダの中だけ"
+            " 保存していない変更があれば断る（先に save_project で保存する） 開いた後、この指示の"
+            "中では編集の道具を使えない 続きは次の指示で"
+        ),
+        schema=_schema(
+            {"path": _string(f"開く作品（{SUFFIX}） 相対の場所は今の作品のフォルダから読む")},
+            ["path"],
+        ),
+        handler=_consented(_open_project, _open_consent),
+        approved=_open_project,
+        writes=True,
+        irreversible=True,
+        consent=_open_consent,
+        # 開いた作品の場所と名前を返す 名前と場所を断った人には値ごと伏せる
+        sends=_WITH_FILES,
+        name_keys=frozenset({"opened", "name"}),
+    ),
+    Operation(
+        name="new_project",
+        description=(
+            "新しい空の作品を作って今の作品と差し替える（画面の〔新規〕と同じ） 毎回ユーザーに"
+            "確かめる 省いた値と置き方の方式・編集の方針は本人の「新しい作品」の設定"
+            " フレームレートは作った後に変えられない 保存していない変更があれば断る"
+            "（先に save_project で保存する） 作った後、この指示の中では編集の道具を使えない"
+        ),
+        schema=_schema(
+            {
+                "width": _integer("横の画素（偶数 height と一緒に）"),
+                "height": _integer("縦の画素（偶数 width と一緒に）"),
+                "frame_rate": _number("フレームレート（30・29.97・60 など）"),
+            }
+        ),
+        handler=_consented(_new_project, _new_consent),
+        approved=_new_project,
+        writes=True,
+        irreversible=True,
+        consent=_new_consent,
+        sends=_STRUCTURE,
     ),
     Operation(
         name="export_video",

@@ -16,7 +16,11 @@ from pathlib import Path
 from sashimono.core.commands.base import Command
 from sashimono.core.model import MediaId, Project
 
-__all__ = ["Author", "Document", "HistoryEntry", "SeenMedia"]
+__all__ = ["REPLACED_REFUSAL", "Author", "Document", "HistoryEntry", "SeenMedia"]
+
+#: 指示の中で作品を開き直した後の AI の編集を断る文（#349 2026-10-20 利用者の決定）
+#: 差し替えた作品を同じ指示のまま編集すると、指示の取り消し（#333）が前の作品の段を指す
+REPLACED_REFUSAL = "この指示の中で作品を開き直したので、編集はしません 次の指示で頼んでください"
 
 #: 保持する履歴の上限 これを超えた分は古い方から捨てる
 DEFAULT_HISTORY_LIMIT = 200
@@ -96,6 +100,8 @@ class Document:
         #: 積んでも、この段（指示）の物として数える（:attr:`undo_in_checkpoint`）
         #: 段を覚えず ``before`` で見分けるのは、取り消して・やり直すと段が作り直されるため
         self._earlier_parts: list[Project] = []
+        #: 開いている一番外の段の中で作品を差し替えたか（:attr:`replaced_in_checkpoint`）
+        self._replaced = False
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
@@ -155,6 +161,8 @@ class Document:
             return updated
 
         author = by or (self._checkpoint_by if self._checkpoint_depth else Author.PERSON)
+        if self._replaced and author is Author.AI:
+            raise ValueError(REPLACED_REFUSAL)
         if self._checkpoint_depth == 0:
             self._push_undo(HistoryEntry(command.label, self._project, author))
             self._redo.clear()
@@ -230,6 +238,9 @@ class Document:
             self._reset_inner()
             self._earlier_parts = []
         elif self._checkpoint_depth == 1:
+            if self._replaced and (by or self._checkpoint_by) is Author.AI:
+                # 人の変更は通す 開き直した作品を人が触るのは止めない
+                raise ValueError(REPLACED_REFUSAL)
             self._nested_before = self._project
             self._nested_label = label
             self._nested_merge = merge
@@ -249,6 +260,7 @@ class Document:
 
         before = self._checkpoint_before
         self._checkpoint_before = None
+        self._replaced = False
         inner_redo = list(self._inner_redo)
         touched = self._inner_touched
         self._reset_inner()
@@ -527,14 +539,36 @@ class Document:
         )
         return tuple(entry.before for entry in entries)
 
-    def reset(self, project: Project) -> None:
-        """別のプロジェクトを読み込み、履歴を捨てる ファイルを開いたときに使う"""
-        if self._checkpoint_depth:
+    def reset(self, project: Project, *, within_checkpoint: bool = False) -> None:
+        """別のプロジェクトを読み込み、履歴を捨てる ファイルを開いたときに使う
+
+        ``within_checkpoint`` は AI の指示の段（一番外の段）を開いたまま差し替える（AI の
+        開く・新規 #349） 段は閉じずに中身を空にし、始まりを差し替えた作品にする 閉じると、
+        指示の段を開いた画面の側（AI のパネル）と段の数が食い違う 段の中の残りの道具は
+        :attr:`replaced_in_checkpoint` を見て断る（差し替えた作品を同じ指示で編集しない
+        2026-10-20 利用者の決定） まとめ（段の中の段）の途中では、従来どおり断る
+        """
+        if self._checkpoint_depth and not within_checkpoint:
             raise RuntimeError("チェックポイントの途中でプロジェクトを差し替えられない")
+        if self._checkpoint_depth > 1:
+            raise RuntimeError("まとめの途中でプロジェクトを差し替えられない")
         self._undo.clear()
         self._redo.clear()
         self._merge_anchor = None
+        if self._checkpoint_depth:
+            self._reset_inner()
+            self._earlier_parts = []
+            self._checkpoint_before = project
+            self._replaced = True
         self._set_project(project)
+
+    @property
+    def replaced_in_checkpoint(self) -> bool:
+        """開いている一番外の段の中で、作品を差し替えたか（:meth:`reset` の ``within_checkpoint``）
+
+        段を閉じると偽へ戻る 戻さないと、次の指示でも編集が断られ続ける
+        """
+        return self._replaced
 
     def _push_undo(self, entry: HistoryEntry) -> None:
         self._undo.append(entry)

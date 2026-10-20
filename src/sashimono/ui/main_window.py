@@ -13,7 +13,7 @@ import platform
 import threading
 import time
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.host import ExportRequest, ToolError
+from sashimono.ai.host import UNSAVED_REFUSAL, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import check_writable
 from sashimono.ai.sheet import SheetLayout
@@ -1932,6 +1932,15 @@ class MainWindow(QMainWindow):
         target = MediaId(media_id)
         self.execute(RemoveMedia(target))
         if self._document.project.find_media(target) is None:
+            self._forget_media((target,))
+
+    def _forget_media(self, gone: Iterable[MediaId]) -> None:
+        """素材一覧から外した素材の解析（波形・サムネイル・控え）を捨てる
+
+        人の〔プールから外す〕と AI の remove_media（#349）が通る所 AI の側で捨て忘れると、
+        もう使わない素材の波形をメモリに抱え続ける
+        """
+        for target in gone:
             self._analyzer.forget(target)
             self._proxies.forget(target)
             # 取り消しで戻ったときに頼み直す（:meth:`_reanalyze_returned`）
@@ -2366,10 +2375,18 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         if answer != QDialog.DialogCode.Accepted:
             return
+        created = replace(Project.create(dialog.settings()), style_guide=dialog.style_guide())
+        self._adopt_new(created)
+
+    def _adopt_new(self, created: Project) -> None:
+        """新しい作品へ差し替える 画面の〔新規〕と AI の new_project（#349）が通る所
+
+        AI の指示の段を開いていれば開いたまま差し替える（:meth:`Document.reset`） 段を
+        閉じてから差し替えると、AI のパネルが後で閉じる段と数が食い違う
+        """
         self._playback.stop()
         previous = self._document.project
-        created = replace(Project.create(dialog.settings()), style_guide=dialog.style_guide())
-        self._document.reset(created)
+        self._document.reset(created, within_checkpoint=self._document.in_checkpoint)
         self._leave_project(previous)
         self._path = None
         self._release_lock()
@@ -2439,12 +2456,18 @@ class MainWindow(QMainWindow):
             return
         if not self._claim(Path(name)):
             return
+        self._adopt_opened(project, Path(name))
 
+    def _adopt_opened(self, project: Project, path: Path) -> None:
+        """開いた作品へ差し替える 画面の〔開く…〕と AI の open_project（#349）が通る所
+
+        AI の指示の段を開いていれば開いたまま差し替える（:meth:`_adopt_new` と同じ訳）
+        """
         self._playback.stop()
         previous = self._document.project
-        self._document.reset(project)
+        self._document.reset(project, within_checkpoint=self._document.in_checkpoint)
         self._leave_project(previous)
-        self._path = Path(name)
+        self._path = path
         self._mark_saved()
         self._on_project_changed()
         self._seek(0)
@@ -2556,8 +2579,11 @@ class MainWindow(QMainWindow):
         self._update_title()
         return saved
 
-    def _claim(self, path: Path) -> bool:
+    def _claim(self, path: Path, *, ask: bool = True) -> bool:
         """このファイルを開いている窓はここ、と錠で示す 別の窓が開いていれば尋ねる
+
+        ``ask`` が偽（AI の開く #349）なら尋ねずに偽を返す 窓を出すと、AI の確かめの欄とは
+        別に人が答える窓が増え、答えるまで AI の道具が止まる
 
         止めはしない 読み返すだけのこともあるので、知らせたうえで本人に選ばせる
         知らせずに開けると、両方で保存したとき後から保存した方が黙って勝つ
@@ -2565,6 +2591,8 @@ class MainWindow(QMainWindow):
         folder = project_presence_dir(path)
         if self._project_lock is not None and self._project_lock.path.parent == folder:
             return True
+        if others_holding(folder) and not ask:
+            return False
         if others_holding(folder) and self._confirm_unsaved:
             answer = QMessageBox.warning(
                 self,
@@ -3191,6 +3219,43 @@ class MainWindow(QMainWindow):
     def set_clipboard(self, content: ClipboardContent) -> None:
         self._timeline.set_clipboard(content)
 
+    def open_project_file(self, path: Path) -> None:
+        """AI の〔開く…〕（#349） 画面と同じ読み方・錠・差し替えを通す 窓は出さない
+
+        保存していない変更があれば断る（2026-10-20 利用者の決定） 道具の確かめでも断るが、
+        確かめの欄が出ている間に人が編集した物を、ここで黙って捨てないよう見直す
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        try:
+            project = load_project(path)
+        except ProjectFileError as exc:
+            raise ToolError(f"開けませんでした: {exc}") from exc
+        if not self._claim(path, ask=False):
+            raise ToolError(
+                "この作品は別の Sashimono の窓で開いています 両方で保存すると後の方だけが残るので、"
+                "開くなら人が〔開く…〕の窓で決めてください"
+            )
+        self._adopt_opened(project, path)
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        """AI の〔新規〕（#349） 作る作品の初めの値は、画面の新規作成の窓と同じ本人の好み
+
+        置き方の方式と編集の方針は本人の「新しい作品」の設定 窓を通らない起動直後の空の
+        作品と同じ所（:meth:`_blank_project`）から作る
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        blank = self._blank_project()
+        settings = blank.settings
+        if resolution is not None:
+            settings = replace(settings, width=resolution[0], height=resolution[1])
+        if frame_rate is not None:
+            settings = replace(settings, frame_rate=frame_rate)
+        self._adopt_new(replace(Project.create(settings), style_guide=blank.style_guide))
+
     @property
     def insert_paste_all_tracks(self) -> bool:
         """AI の挿入貼り付けも、人の Ctrl+Shift+V と同じ押し出し方（本人の設定）にする"""
@@ -3205,6 +3270,7 @@ class MainWindow(QMainWindow):
         """
         if not commands:
             return
+        before = {media.id for media in self._document.project.media}
         try:
             with self._document.checkpoint(label, by=Author.AI):
                 for command in commands:
@@ -3213,6 +3279,8 @@ class MainWindow(QMainWindow):
             raise ToolError(str(exc)) from exc
         finally:
             self._on_project_changed()
+        # AI が素材一覧から外した素材も、人の〔プールから外す〕と同じく解析を捨てる
+        self._forget_media(before - {media.id for media in self._document.project.media})
 
     @property
     def project(self) -> Project:

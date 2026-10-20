@@ -192,6 +192,9 @@ class TestAppSettingsAreReadOnly:
             "check_waiter",
             "export_status",
             "export_waiter",
+            # 開く・新規（#349） 作品を差し替える 取り消せない操作の道具からだけ呼ぶ
+            # アプリ自身の設定は変えない（新しい作品の初めの値は本人の設定を読むだけ）
+            "open_project_file",
             "probe",
             # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
             "redo",
@@ -212,6 +215,7 @@ class TestAppSettingsAreReadOnly:
             # 同じタイムラインの置き場 アプリ自身の設定は変えない
             "set_clipboard",
             "start_export",
+            "start_new_project",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",
             "start_transcription",

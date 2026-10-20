@@ -157,6 +157,10 @@ FILE_WRITING_TOOLS = frozenset(
     {"save_project", "save_project_as", "export_video", "export_subtitles", "save_snapshot"}
 )
 
+#: 今の作品を閉じて差し替える道具（#349 開く・新規） ファイルは書かず読むだけだが、
+#: 取り消しで前の作品へ戻れないので取り消せない操作 毎回確かめる（2026-10-20 利用者の決定）
+PROJECT_REPLACING_TOOLS = frozenset({"open_project", "new_project"})
+
 #: 道具のコードがホストに書かせる口と、それを呼んでよい道具の関数
 #: 道具の関数の外（読む道具・編集の道具）から呼ぶと、確かめを通らずにファイルを書く
 _HOST_WRITERS = {
@@ -248,7 +252,7 @@ class TestCounted:
         # 取り消せない道具は、確かめの側（test_safety.py）で押さえる
         irreversible = {operation.name for operation in OPERATIONS if operation.irreversible}
         assert changing - undoable == irreversible
-        assert irreversible == FILE_WRITING_TOOLS
+        assert irreversible == FILE_WRITING_TOOLS | PROJECT_REPLACING_TOOLS
 
     def test_only_the_counted_tools_ask_the_host_to_write(self) -> None:
         # 壊れると、確かめを通らない道具（読む道具や編集の道具）から作品の保存や書き出しを

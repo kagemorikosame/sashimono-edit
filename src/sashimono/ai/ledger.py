@@ -178,8 +178,22 @@ _AFTER_NOTE = "場面切り替えの前の場面か後の場面かは add_effect
 
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
-    missing("メニュー/ファイル/新規", 349, safety=Safety.IRREVERSIBLE),
-    missing("メニュー/ファイル/開く…", 349, safety=Safety.IRREVERSIBLE),
+    # 開く・新規（#349） 2026-10-20 利用者の決定 毎回確かめ、保存していない変更があれば断る
+    same(
+        "メニュー/ファイル/新規",
+        "new_project",
+        note="省いた値は本人の「新しい作品」の設定 作った指示の中ではもう編集しない",
+        safety=Safety.IRREVERSIBLE,
+    ),
+    same(
+        "メニュー/ファイル/開く…",
+        "open_project",
+        note=(
+            "開けるのは作品のフォルダと書き出しの窓で前に選んだフォルダの中の .sme だけ"
+            " 開いた指示の中ではもう編集しない"
+        ),
+        safety=Safety.IRREVERSIBLE,
+    ),
     same("メニュー/ファイル/保存", "save_project", safety=Safety.IRREVERSIBLE),
     same("メニュー/ファイル/名前を付けて保存…", "save_project_as", safety=Safety.IRREVERSIBLE),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),

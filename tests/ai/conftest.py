@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
+from sashimono.ai.host import EXPORT_RUNNING, UNSAVED_REFUSAL, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
@@ -26,7 +26,7 @@ from sashimono.core.commands import AddClip, Author, Command, Document, InScene
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
-from sashimono.core.io.serialize import save_project
+from sashimono.core.io.serialize import ProjectFileError, load_project, save_project
 from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import (
@@ -72,6 +72,8 @@ class FakeHost:
 
     def __init__(self, project: Project) -> None:
         self._document = Document(project)
+        #: 保存した（か開いた・作った）時の作品 is_modified はこれと比べる
+        self.saved_project = project
         self.frame = 0
         self.selection: tuple[ClipId, ...] = ()
         self.scene: SceneId | None = None
@@ -197,6 +199,40 @@ class FakeHost:
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self.selection = tuple(clip_ids)
+
+    @property
+    def is_modified(self) -> bool:
+        # 本物と同じく同一性で比べる 保存した（か開いた・作った）時の作品のままか
+        return self._document.project is not self.saved_project
+
+    def open_project_file(self, path: Path) -> None:
+        # 本物と同じく、保存していなければ断り、AI の指示の段を開いたまま差し替える
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        try:
+            project = load_project(path)
+        except ProjectFileError as exc:
+            raise ToolError(f"開けませんでした: {exc}") from exc
+        self._document.reset(project, within_checkpoint=self._document.in_checkpoint)
+        self.saved_at = path
+        self.saved_project = project
+        self.scene = None
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        settings = ProjectSettings()
+        if resolution is not None:
+            settings = replace(settings, width=resolution[0], height=resolution[1])
+        if frame_rate is not None:
+            settings = replace(settings, frame_rate=frame_rate)
+        created = Project.create(settings)
+        self._document.reset(created, within_checkpoint=self._document.in_checkpoint)
+        self.saved_at = None
+        self.saved_project = created
+        self.scene = None
 
     @property
     def clipboard(self) -> ClipboardContent | None:
@@ -334,6 +370,7 @@ class FakeHost:
     def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
         # 画面の〔保存〕と同じく、作品のファイルの書き方（書いてから置き換える）で書く
         save_project(self._document.project, path, expect=expect)
+        self.saved_project = self._document.project
         self.written.append(path)
         if adopt:
             self.saved_at = path
