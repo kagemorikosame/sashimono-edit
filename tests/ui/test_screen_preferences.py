@@ -22,6 +22,7 @@ from sashimono.engine.cache import ScreenAnalyzer
 from sashimono.engine.vision import ScreenKind
 from sashimono.engine.vision.parts import (
     MEASURED_DECORATED_RATE,
+    MEASURED_FALSE_LINES,
     MEASURED_OCR_SECONDS,
     OCR_ENGINES,
     OCR_RAPID,
@@ -211,6 +212,9 @@ class TestTheOcrChoice:
         assert dialog.preferences().ocr_engine == OCR_RAPID
         tip = dialog._ocr_engine.toolTip()
         for text in (*MEASURED_OCR_SECONDS.values(), *MEASURED_DECORATED_RATE.values()):
+            assert text in tip
+        # 文字でない物を読む誤りはどちらも出る 書かないと、RapidOCR なら誤りが減ると思って選ぶ
+        for text in MEASURED_FALSE_LINES.values():
             assert text in tip
 
     def test_the_rapidocr_button_opens_its_own_install_window(

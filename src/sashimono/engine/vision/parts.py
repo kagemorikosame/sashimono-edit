@@ -23,6 +23,7 @@ from .scan import Detector
 
 __all__ = [
     "MEASURED_DECORATED_RATE",
+    "MEASURED_FALSE_LINES",
     "MEASURED_OCR_SECONDS",
     "OCR_ENGINES",
     "OCR_RAPID",
@@ -49,6 +50,9 @@ OCR_ENGINES = (OCR_WINDOWS, OCR_RAPID)
 MEASURED_OCR_SECONDS = {OCR_WINDOWS: "720p で 1 枚約 0.1 秒", OCR_RAPID: "720p で 1 枚約 1 秒"}
 #: 実素材（ゲームの画面）のいつも出ている飾った題字で、読めた字の割合（60 枚の平均）
 MEASURED_DECORATED_RATE = {OCR_WINDOWS: "5%", OCR_RAPID: "56%"}
+#: 同じ素材の同じ 60 枚で、題字の外（ゲームの模様・道具の欄の数字など）を文字と読んだ行の
+#: 1 枚あたりの数 どちらも同じくらい出るので、RapidOCR なら誤りが減ると読めないよう説明に書く
+MEASURED_FALSE_LINES = {OCR_WINDOWS: "約 1.0 行", OCR_RAPID: "約 0.9 行"}
 
 
 def ocr_of(engine: str) -> str:

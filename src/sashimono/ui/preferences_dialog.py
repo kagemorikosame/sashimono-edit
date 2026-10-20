@@ -64,6 +64,7 @@ from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
 from sashimono.engine.scenes import MEASURED_SCENE_SECONDS
 from sashimono.engine.vision.parts import (
     MEASURED_DECORATED_RATE,
+    MEASURED_FALSE_LINES,
     MEASURED_OCR_SECONDS,
     OCR_RAPID,
     OCR_WINDOWS,
@@ -1194,7 +1195,10 @@ class PreferencesDialog(QDialog):
             "読めない 「飾った文字も読む」は RapidOCR で読み、遅い"
             f"（{MEASURED_OCR_SECONDS[OCR_RAPID]}） 実素材の飾った題字で読めた字は"
             f" Windows の OCR {MEASURED_DECORATED_RATE[OCR_WINDOWS]}・RapidOCR"
-            f" {MEASURED_DECORATED_RATE[OCR_RAPID]} RapidOCR は別の部品で、下のボタンから入れる"
+            f" {MEASURED_DECORATED_RATE[OCR_RAPID]} 文字でない物（ゲームの模様など）を文字と読む"
+            f"誤りはどちらも同じくらい出る（同じ素材で 1 枚あたり Windows の OCR"
+            f" {MEASURED_FALSE_LINES[OCR_WINDOWS]}・RapidOCR {MEASURED_FALSE_LINES[OCR_RAPID]}）"
+            " RapidOCR は別の部品で、下のボタンから入れる"
             "（入れずに選ぶと、AI の頼みは理由と入れ方を返して断る）"
         )
         form.addRow("画面の文字を読む方式", self._ocr_engine)
