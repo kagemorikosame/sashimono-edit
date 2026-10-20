@@ -73,6 +73,10 @@ class Document:
         self._checkpoint_before: Project | None = None
         self._checkpoint_merge = False
         self._checkpoint_by = Author.PERSON
+        #: 一番外の段を開いた回数 段（AI の 1 回の指示）ごとに数え直す物（検査の直しの
+        #: 回数 #339）が、新しい指示に替わったことをこれで知る 名前で見分けると、同じ文の
+        #: 指示を続けたときに数え直さない
+        self._checkpoint_serial = 0
         #: 最後に積んだ段 続けて行う操作（ホイールで高さを変えるなど）は、この段が
         #: まだ一番上に残っているときだけ同じ段へまとめる 取り消したあとの段へ
         #: まとめると、関係の無い古い操作と一緒に戻ってしまう
@@ -223,6 +227,7 @@ class Document:
         分ける 省くと開いている段の印を継ぐ（段の外なら人）
         """
         if self._checkpoint_depth == 0:
+            self._checkpoint_serial += 1
             self._checkpoint_label = label
             self._checkpoint_before = self._project
             self._checkpoint_merge = merge
@@ -350,6 +355,43 @@ class Document:
     @property
     def in_checkpoint(self) -> bool:
         return self._checkpoint_depth > 0
+
+    @property
+    def checkpoint_serial(self) -> int:
+        """一番外の段を開いた回数 開くたびに 1 つ増える（段を開いていなくても前の値のまま）"""
+        return self._checkpoint_serial
+
+    @property
+    def checkpoint_label(self) -> str | None:
+        """開いている一番外の段の名前 段を開いていなければ ``None``"""
+        return self._checkpoint_label if self._checkpoint_depth else None
+
+    def split_checkpoint(self, label: str) -> bool:
+        """開いている段をここで区切り、ここから先を ``label`` の段として続ける（#339）
+
+        それまでに変えた分は今の名前の段として先に積む 人が段の途中で変えたときに段を割るのと
+        同じ形で、先に積んだ段もこの段（指示）の前半として数える（:attr:`undo_in_checkpoint`）
+        AI が検査で見つけた問題を直すたびに、直した回を Ctrl+Z 1 回で戻せる段にするために使う
+        区切らないと、直した分が指示の段に混ざり、直しだけを戻すと指示の編集まで消える
+
+        区切れたら真 段を開いていない・まとめ（段の中の段）の途中なら区切らずに偽
+        まとめの途中で区切ると、まとめの始まりが積んだ段の後ろに残り、閉じる所で形が合わない
+        何も変えていなければ段は積まず、名前だけを替える（中身の無い段を履歴に挟まない）
+        """
+        if self._checkpoint_depth != 1:
+            return False
+        own_before = self._checkpoint_before
+        if own_before is not None and own_before is not self._project:
+            self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
+            self._earlier_parts.append(own_before)
+            self._reset_inner()
+            # 新しい段を積んだので、前に取り消した物はやり直せない（人の変更で割るときと同じ）
+            self._redo.clear()
+            self._checkpoint_before = self._project
+        self._checkpoint_label = label
+        # 区切った後の段は前の段へまとめない まとめると直した回が前の段に吸い込まれる
+        self._checkpoint_merge = False
+        return True
 
     @property
     def steps_in_checkpoint(self) -> tuple[str, ...]:

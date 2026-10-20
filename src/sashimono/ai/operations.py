@@ -23,6 +23,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from sashimono.ai.fixes import AUTO as FIX_AUTO
+from sashimono.ai.fixes import FIX_ACTIONS, FixRound, fix_for, start_check
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -2111,19 +2113,26 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
     request = _check_request(host, arguments)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    # 直した回を数え、この後の直しを別の段に区切る（#339） 引数を確かめた後にする
+    # 断った呼び出しまで数えると、AI が引数を直して呼び直すだけで直す回が減る
+    rounds = start_check(host.document, host.fix_rounds)
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
-        return _check_result(host, request, state, arguments)
+        return _check_result(host, request, state, arguments, rounds)
     return Pending(
         wait=host.check_waiter(),
         seconds=wait,
-        then=lambda: _check_result(host, request, host.check_state(), arguments),
+        then=lambda: _check_result(host, request, host.check_state(), arguments, rounds),
     )
 
 
 def _check_result(
-    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+    host: EditorHost,
+    request: CheckRequest,
+    state: CheckState,
+    arguments: dict[str, Any],
+    rounds: FixRound,
 ) -> object:
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
@@ -2153,12 +2162,19 @@ def _check_result(
             row["clip_ids"] = list(problem.clip_ids)
         if problem.ongoing:
             row["ongoing"] = True
+        # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
+        row["fix"] = fix_for(
+            problem.kind, problem.severity, problem.measure, closed=rounds.closed
+        ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
     notes = [str(result.pop("note"))] if "note" in result else []
     severities: dict[str, int] = {}
+    fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
+        action = fix_for(problem.kind, problem.severity, problem.measure, closed=rounds.closed)
+        fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2173,7 +2189,10 @@ def _check_result(
             "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
             "counts": report.counts(),
             "severities": severities,
+            # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
+            "fixes": fixes,
         },
+        "fix_round": rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2204,9 +2223,30 @@ def _check_result(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
             " 今の作品を調べるにはもう 1 度呼んでください"
         )
+    notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _round_notes(rounds: FixRound, fixes: dict[str, int]) -> list[str]:
+    """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds.closed:
+        if rounds.limit == 0:
+            return [
+                "本人の設定で、検査の後に直さないことになっています（直す回数の上限 0）"
+                " この指示ではもう編集できません 見つかった問題を人へ伝えてください"
+            ]
+        return [
+            f"直す回数の上限（{rounds.limit} 回）に達しました この指示ではもう編集できません"
+            " 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を人へ伝えてください"
+        ]
+    if fixes[FIX_AUTO]:
+        return [
+            f"fix の action が auto の物を直してから、もう 1 度 check_output で調べてください"
+            f"（{rounds.next_round} 回目の直し 上限 {rounds.limit} 回）"
+        ]
+    return []
 
 
 # --- 変更 ---
@@ -5176,7 +5216,11 @@ OPERATIONS: tuple[Operation, ...] = (
             "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
             " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
             " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
-            + PAGING_NOTE
+            " 各問題の fix は直し方（action が auto は直してよい・ask は人に尋ねてから・"
+            "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
+            " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
+            " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
+            "その指示ではもう編集できない" + PAGING_NOTE
         ),
         schema=_schema(
             {

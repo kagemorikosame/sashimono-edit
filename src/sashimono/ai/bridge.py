@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
+from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
@@ -54,6 +55,10 @@ __all__ = ["Approval", "EditorBridge", "Question"]
 
 #: 送る前の同意の返事の待ち時間 確かめと同じく、人が席を外していることもあるので長めに取る
 SEND_TIMEOUT = 600.0
+
+#: 検査の直しの回数の上限（#339）に達した後も通す変える道具 取り消しとやり直しは作品を
+#: 前の形へ辿るだけで、人に頼まれて戻すこともある 断ると、直しを戻してと言われても戻せない
+_AFTER_FIX_LIMIT = frozenset({"undo", "redo"})
 
 #: UI スレッドが 1 件の仕事を拾って返すまで待つ上限（秒）
 #: これを超えるのは、書き出しなど UI 側が長く塞がっているとき
@@ -201,6 +206,8 @@ class EditorBridge:
             return self.ask(spec)
         if operation.irreversible:
             return self._run_irreversible(operation, arguments)
+        if operation.writes:
+            self._refuse_after_fix_limit(operation)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)
@@ -239,6 +246,22 @@ class EditorBridge:
                 result = self.call(partial(self._run, operation, result.step))
             else:
                 return result
+
+    def _refuse_after_fix_limit(self, operation: Operation) -> None:
+        """検査の直しの回数が上限に達した指示では、取り消せる編集を断る（#339）
+
+        回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 確かめの窓を出す前に断る
+        出してから断ると、人が許したのに何も起きない 取り消しとやり直しは通す（人に頼まれて
+        戻すことはある） 保存と書き出しは取り消せない操作の道を通るので、ここへは来ない
+        """
+        if operation.name in _AFTER_FIX_LIMIT:
+            return
+        if self.call(lambda: fixes_closed(self._host.document)):
+            raise ToolError(
+                "この指示では、検査の後に直す回数の上限（本人の設定）に達しました これ以上は"
+                "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"
+                "ユーザーに伝えて終えてください 続けるかはユーザーが次の指示で決めます"
+            )
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ

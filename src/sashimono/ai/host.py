@@ -240,6 +240,16 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def fix_rounds(self) -> int:
+        """検査で見つけた問題を AI が直して調べ直す回数の上限（#339 0 は調べるだけ）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_fix_rounds`）
+
+        どこまで AI に任せるかは人で違う 数えて止めるのはアプリ（:mod:`sashimono.ai.fixes`）
+        で、AI は引数で上限を変えられない 変えられると、止まらない繰り返しを AI が自分で許せる
+        """
+        ...
+
+    @property
     def duck_shape(self) -> DuckShape:
         """BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅と速さ
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.duck_shape`）

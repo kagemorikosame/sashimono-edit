@@ -101,6 +101,8 @@ class FakeHost:
         #: 待つ関数が呼ばれた秒と、待った結果
         self.check_waits: list[float] = []
         self.check_ready = True
+        #: 検査の直しの回数の上限（#339） 既定は設定と同じ 3
+        self.fix_limit = 3
         #: 場面の解析（#321） 試験が素材ごとの様子を入れる 無ければ頼んでいない様子
         self.scene_states: dict[MediaId, SceneState] = {}
         self.scene_requests: list[MediaId] = []
@@ -241,6 +243,10 @@ class FakeHost:
     @property
     def loudness_target(self) -> float:
         return self.loudness
+
+    @property
+    def fix_rounds(self) -> int:
+        return self.fix_limit
 
     @property
     def duck_shape(self) -> DuckShape:
