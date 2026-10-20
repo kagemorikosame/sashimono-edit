@@ -351,11 +351,19 @@ class UsageMeter:
     """使った量を数える AI のスレッド（トークン・絵）と画面のスレッド（指示の始まりと終わり）
     の両方から呼ばれるので、中は錠で守る
 
-    1 日の置き場へは、指示の終わりだけでなく上限を確かめるたび（道具の前）と :meth:`flush`
-    で、まだ足していない差を足す 終わりにだけ足すと、窓を閉じた・落ちた指示の量が残らず、
-    起動し直すとその分だけ 1 日の上限を越えて使える 1 日の上限は足した後に置き場を読み直した
-    量で確かめる 指示を始めた時の量のままだと、もう 1 つの窓が同時に使った分が入らず、
-    2 つの窓で上限の 2 倍まで使える
+    量の流れ
+
+    1. **数える** 指示の中で届いた量は指示（``_Turn``）に、指示の外で届いた量は日ごとの
+       「まだ書いていない分」（``_unsaved``）に入れる 指示の外の量を次の指示へ入れると、
+       前の指示の量で次の指示の 1 回の上限に当たる
+    2. **足す** 指示の差は、上限を確かめるたび（道具の前）・:meth:`flush`・指示の終わりに
+       1 日の置き場へ足す 終わりにだけ足すと、窓を閉じた・落ちた指示の量が残らない
+       書けたときだけ「足し終えた」所を進める 書けなかった差は ``_unsaved`` へ移し、
+       次の機会に足し直す（1 回の指示の量には入れない）
+    3. **読み直す** 足した後に置き場を読み直す（ほかの窓の分を含む） 始めた時の量のままだと、
+       同時に指示した 2 つの窓が上限の 2 倍まで使える
+    4. **確かめる** 1 日の量は 置き場の量 + まだ書けていない分（``_unsaved`` と指示の差）
+       書けない間も、1 日の上限から量が抜けない
     """
 
     def __init__(
@@ -371,15 +379,16 @@ class UsageMeter:
         self._lock = threading.Lock()
         self.limits = Limits()
         self._turn: _Turn | None = None
-        #: 指示の外で数えた分（指示を始める前に届いた知らせなど）も捨てない
-        self._loose = Usage()
+        #: 1 日の置き場へまだ書いていない分（日ごと） 指示の外で届いた量と、書けなかった差
+        #: 1 日の量には入れ、1 回の指示の量には入れない
+        self._unsaved: dict[date, Usage] = {}
         #: 1 日の上限を〔続ける〕で広げた分 その日のうちは残す（指示ごとに尋ね直さない）
         self._day_extra: tuple[date, dict[LimitKind, int]] = (today(), {})
         #: 最後に終えた指示の量 区切りの行に出す
         self.last = Usage()
         #: 最後に終えた指示を上限で止めたなら、その上限 区切りの行を「上限で停止」にする
         self.last_stop: Overrun | None = None
-        #: 指示の外で見せる今日の量（日, 量） 日が違えば読み直す
+        #: 指示の外で見せる今日の置き場の量（日, 量） 日が違えば読み直す
         #: 初めは必ず読むよう、ありえない日にする
         self._day_base: tuple[date, Usage] = (date.min, Usage())
 
@@ -391,21 +400,13 @@ class UsageMeter:
             self.end_turn()
         day = self._today()
         with self._lock:
-            # 指示の外で数えた分はこの指示に入れる 入れないと 1 日の置き場へ書かれずに消える
-            loose = self._loose
-            self._loose = Usage()
-            self._turn = _Turn(
-                started=self._clock(),
-                day=day,
-                day_seen=self._store.load(day),
-                tokens=loose.tokens,
-                images=loose.images,
-            )
+            self._retry_unsaved()
+            self._turn = _Turn(started=self._clock(), day=day, day_seen=self._store.load(day))
 
     def end_turn(self) -> Usage:
         """指示が終わった 残りの差を 1 日の置き場へ足し、この指示の量を返す
 
-        窓を閉じるとき（応えている途中でも）も呼ぶ 指示の外で数えた分もここで足す
+        窓を閉じるとき（応えている途中でも）も呼ぶ まだ書いていない分もここで足し直す
         """
         with self._lock:
             turn = self._turn
@@ -417,19 +418,19 @@ class UsageMeter:
                 used = self._current(turn)
                 self.last = used
                 self.last_stop = turn.stopped
-                self._day_base = (turn.day, turn.day_seen)
-                # 書けなかった差は指示の外の分として持ち続け、次に足し直す（次の指示に入る）
-                self._loose = self._loose + (used - turn.saved)
-            if self._loose.tokens or self._loose.images:
-                today = self._today()
-                if self._store.add(today, self._loose):
-                    self._loose = Usage()
-                self._day_base = (today, self._store.load(today))
+                pending = used - turn.saved
+                if pending.tokens or pending.images:
+                    # 書けなかった差は、その指示の日の分として持ち続ける 次の指示の量には入れない
+                    self._keep_unsaved(turn.day, pending)
+            self._retry_unsaved()
+            today = self._today()
+            self._day_base = (today, self._store.load(today))
             return used
 
     def flush(self) -> None:
-        """まだ足していない差を 1 日の置き場へ足す 画面が時々呼ぶ（落ちたときに失う量を減らす）"""
+        """まだ書いていない分を 1 日の置き場へ足す 画面が時々呼ぶ（落ちたときに失う量を減らす）"""
         with self._lock:
+            self._retry_unsaved()
             if self._turn is not None:
                 self._save(self._turn)
 
@@ -454,7 +455,8 @@ class UsageMeter:
                         added += value - seen.get(key, 0)
                         seen[key] = value
             if turn is None:
-                self._loose = self._loose + Usage(tokens=added)
+                # 指示の外で届いた量は 1 日の分にだけ入れる（次の指示の上限に混ぜない）
+                self._keep_unsaved(self._today(), Usage(tokens=added))
             else:
                 turn.tokens += added
 
@@ -462,15 +464,15 @@ class UsageMeter:
         """絵を 1 枚送った"""
         with self._lock:
             if self._turn is None:
-                self._loose = self._loose + Usage(images=1)
+                self._keep_unsaved(self._today(), Usage(images=1))
             else:
                 self._turn.images += 1
 
     def overrun(self, *, adding_images: int = 0) -> Overrun | None:
         """当たった上限 無ければ ``None`` ``adding_images`` はこれから送る絵の枚数
 
-        止めると決まった指示では、決まった上限を返し続ける 1 日の量は、この指示の差を
-        置き場へ足してから読み直した量（ほかの窓の分を含む）で見る
+        止めると決まった指示では、決まった上限を返し続ける 1 日の量は、まだ書いていない分を
+        足し直して置き場を読み直した量 + それでも書けなかった分（:meth:`_day_used`）で見る
         """
         with self._lock:
             turn = self._turn
@@ -478,12 +480,11 @@ class UsageMeter:
                 return None
             if turn.stopped is not None:
                 return turn.stopped
+            self._retry_unsaved()
             self._save(turn)
             limits = self.limits
             day_extra = self._day_extra_now()
-            # 置き場へ書けなかった差も足して見る 置き場の量だけで見ると、書けない間は
-            # この指示の分が 1 日の量に入らない
-            day_used = turn.day_seen + (self._current(turn) - turn.saved)
+            day_used = self._day_used(turn)
             checks: list[tuple[LimitKind, float, int]] = [
                 (LimitKind.TURN_SECONDS, self._clock() - turn.started, 0),
                 (LimitKind.TURN_TOKENS, turn.tokens, 0),
@@ -547,18 +548,26 @@ class UsageMeter:
         with self._lock:
             turn = self._turn
             if turn is not None:
-                return turn.day_seen + (self._current(turn) - turn.saved)
+                return self._day_used(turn)
             day, base = self._day_base
             today = self._today()
             if day != today:
                 base = self._store.load(today)
                 self._day_base = (today, base)
-            return base + self._loose
+            return base + self._unsaved.get(today, Usage())
 
     # --- 錠の中で呼ぶ ---
 
     def _current(self, turn: _Turn) -> Usage:
         return Usage(tokens=turn.tokens, images=turn.images, seconds=self._clock() - turn.started)
+
+    def _day_used(self, turn: _Turn) -> Usage:
+        """指示の日の量 置き場の量（最後に読んだ時点）+ まだ書けていない分"""
+        return (
+            turn.day_seen
+            + self._unsaved.get(turn.day, Usage())
+            + (self._current(turn) - turn.saved)
+        )
 
     def _save(self, turn: _Turn, *, force: bool = False) -> None:
         """この指示のまだ足していない差を置き場へ足し、今日の量を読み直す
@@ -568,11 +577,27 @@ class UsageMeter:
         """
         current = self._current(turn)
         delta = current - turn.saved
+        today = self._today()
+        if today != turn.day:
+            # 指示の途中で日が変わった 足し終えた分は前の日に残し、ここからは今日へ足して
+            # 今日の量で確かめる 前の日のまま見ると、0 時を過ぎた指示が昨日の量で止まり、
+            # 今日の分まで昨日へ書かれる 前に足してから日をまたぐまでの差は、いつ使ったかを
+            # 分けられないので今日の分にする
+            turn.day = today
         due = force or delta.tokens or delta.images or delta.seconds >= SAVE_SECONDS
         # 書けたときだけ足し終えた所を進める 書けなかった差は次の機会に足し直す
         if due and self._store.add(turn.day, delta):
             turn.saved = current
         turn.day_seen = self._store.load(turn.day)
+
+    def _keep_unsaved(self, day: date, usage: Usage) -> None:
+        self._unsaved[day] = self._unsaved.get(day, Usage()) + usage
+
+    def _retry_unsaved(self) -> None:
+        """まだ書いていない分を足し直す 書けた日だけ消す"""
+        for day, pending in list(self._unsaved.items()):
+            if self._store.add(day, pending):
+                del self._unsaved[day]
 
     def _day_extra_now(self) -> dict[LimitKind, int]:
         """今日の広げた分 日が変わっていたら捨てる"""

@@ -116,13 +116,18 @@ class TestCounting:
         meter.begin_turn()
         assert meter.overrun() is None
 
-    def test_what_arrives_between_instructions_is_kept(self) -> None:
-        # 壊れると、指示の区切りの間に届いた知らせが 1 日の量にも入らずに消える
-        meter = _meter()
+    def test_what_arrives_between_instructions_counts_for_the_day_only(self) -> None:
+        # 壊れると、指示の区切りの間に届いた知らせが 1 日の量にも入らずに消えるか、
+        # 次の指示の量に混ざって、短い指示が前の量で 1 回の上限に当たる
+        meter = _meter(Limits(turn_tokens=10, day_tokens=0))
         meter.record_message("a", {"output_tokens": 9})
         meter.record_image()
+        assert meter.day_usage().tokens == 9
         meter.begin_turn()
-        assert meter.end_turn() == Usage(tokens=9, images=1, seconds=meter.last.seconds)
+        meter.record_message("b", {"output_tokens": 9})
+        assert meter.overrun() is None
+        assert meter.end_turn().tokens == 9
+        assert (meter.day_usage().tokens, meter.day_usage().images) == (18, 1)
 
     def test_tokens_are_shown_in_man(self) -> None:
         # 壊れると、AI のパネルに 1234567 のような桁の多い数が並び、どれだけ使ったか掴めない
@@ -330,10 +335,40 @@ class TestDailyStore:
         assert meter.overrun() is not None
         assert meter.end_turn().tokens == 100
         assert DailyUsageStore(path).load(today.day) == Usage()
+        # 書けないまま次の指示へ進んでも、前の指示の量は次の指示の量に入らない
+        meter.limits = Limits(turn_tokens=50, day_tokens=0)
+        meter.begin_turn()
+        fresh = meter.turn_usage()
+        assert fresh is not None
+        assert fresh.tokens == 0
+        assert meter.overrun() is None
+        assert meter.day_usage().tokens == 100
+        meter.end_turn()
+        # 書けなかった分は、その日の分として持ち続ける 日が変わっても次の日へ移さない
+        today.day += timedelta(days=1)
         monkeypatch.setattr(budget_module, "write_atomic", real)
         meter.begin_turn()
         meter.end_turn()
-        assert DailyUsageStore(path).load(today.day).tokens == 100
+        assert DailyUsageStore(path).load(today.day - timedelta(days=1)).tokens == 100
+        assert DailyUsageStore(path).load(today.day) == Usage()
+
+    def test_an_instruction_across_midnight_counts_for_each_day(self, tmp_path: Path) -> None:
+        # 壊れると、0 時をまたいだ指示が昨日の量で 1 日の上限に当たり、今日の分まで昨日へ書かれる
+        path = tmp_path / "ai_usage.json"
+        today = _Today()
+        meter = UsageMeter(DailyUsageStore(path), today=today)
+        meter.limits = Limits(turn_tokens=0, day_tokens=100)
+        meter.begin_turn()
+        meter.record_message("a", {"output_tokens": 80})
+        assert meter.overrun() is None
+        today.day += timedelta(days=1)
+        meter.record_message("b", {"output_tokens": 30})
+        assert meter.overrun() is None
+        assert meter.day_usage().tokens == 30
+        meter.end_turn()
+        store = DailyUsageStore(path)
+        assert store.load(today.day - timedelta(days=1)).tokens == 80
+        assert store.load(today.day).tokens == 30
 
     def test_a_new_day_starts_from_zero(self, tmp_path: Path) -> None:
         # 壊れると、昨日の量で今日の最初の指示が止まる
