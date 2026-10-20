@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
 from sashimono.ai.host import ToolError
@@ -21,10 +22,21 @@ from sashimono.ai.operations import ALIGN_ANCHORS, find_operation
 from sashimono.core.commands import Author
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io.serialize import save_project
-from sashimono.core.model import Clip, LayerMode, MediaItem, Project, Track, TrackKind
+from sashimono.core.model import (
+    Clip,
+    LayerMode,
+    MediaItem,
+    Project,
+    Track,
+    TrackKind,
+    Transcript,
+    TranscriptSegment,
+)
 from sashimono.effects.sources import TEXT
+from sashimono.ui import snapshot as snapshot_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preview_handles import ALIGNMENTS
+from tests.fake_clipboard import FakeClipboard
 from tests.ui.test_preview_handles import _clip as _picture_clip
 from tests.ui.test_preview_handles import _media as _picture_media
 from tests.ui.test_preview_handles import _project as _picture_project
@@ -235,3 +247,40 @@ class TestRemovingMediaInTheWindow:
         finally:
             created.close()
             created.deleteLater()
+
+
+class TestCopyingOutOfTheWindow:
+    def test_the_snapshot_goes_through_the_menu_s_drawing(
+        self, window: MainWindow, fake_clipboard: FakeClipboard, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、AI の〔静止画をコピー〕が画面と違う描き方（窓の大きさの絵など）で貼られる
+        drawn: list[int] = []
+
+        def render(project: Project, frame: int) -> QImage:
+            drawn.append(frame)
+            width, height = project.settings.resolution
+            return QImage(width, height, QImage.Format.Format_RGBX8888)
+
+        monkeypatch.setattr(snapshot_module, "render_snapshot", render)
+        result = _run(window, "copy_snapshot", frame=10_000)
+        settings = window.document.project.settings
+        assert drawn == [result["copied_frame"]] == [window.view_project.duration - 1]
+        image = fake_clipboard.image()
+        assert (image.width(), image.height()) == settings.resolution
+
+    def test_the_subtitle_text_goes_to_the_same_clipboard(
+        self, qt_application: QApplication, fake_clipboard: FakeClipboard
+    ) -> None:
+        # 壊れると、AI が写した字幕の文字を、人がほかのアプリへ貼れない
+        del qt_application
+        segment = TranscriptSegment(start=Fraction(0), end=Fraction(1), text="写す字幕")
+        media = MediaItem(path=Path("C:/素材/声.wav"), duration=Fraction(2)).with_transcript(
+            Transcript((segment,))
+        )
+        created = MainWindow(Project.create(media=(media,)), confirm_unsaved=False)
+        try:
+            _run(created, "copy_subtitle_text", media_id=str(media.id), segment_id=str(segment.id))
+        finally:
+            created.close()
+            created.deleteLater()
+        assert fake_clipboard.text() == "写す字幕"

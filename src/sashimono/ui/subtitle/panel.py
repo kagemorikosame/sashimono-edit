@@ -97,7 +97,7 @@ from sashimono.ui.subtitle.dialogs import (
 )
 from sashimono.ui.subtitle.look_picker import LookSources
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
-from sashimono.ui.system_clipboard import clipboard
+from sashimono.ui.system_clipboard import copy_text
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 
 __all__ = ["SubtitlePanel", "ask_subtitle_range"]
@@ -626,7 +626,7 @@ class SubtitlePanel(QWidget):
         elif chosen is copy:
             item = self._table.item(row, 1)
             if item is not None:
-                clipboard().setText(item.text())
+                copy_text(item.text())
         elif chosen is remove:
             self.commands_requested.emit(
                 [RemoveSegment(self._media_id, segment_id, stream=self._stream)], "字幕を削除"

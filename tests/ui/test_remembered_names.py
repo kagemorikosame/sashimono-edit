@@ -84,6 +84,9 @@ PROJECT_SIDE = {
     # スクリプトを読み直す（本数だけ返す）・配置のテンプレート（命令だけ返す #349）
     "reload_scripts",
     "alignment_commands",
+    # OS のクリップボードへ置く（#349） 返すのは描いたフレームだけ
+    "copy_snapshot_image",
+    "copy_text",
     # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
     "undo",
     "redo",

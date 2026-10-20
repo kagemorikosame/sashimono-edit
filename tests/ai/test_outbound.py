@@ -232,6 +232,8 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "select_clips": lambda _media_id: {"clip_ids": []},
     # 前後のキーへ（#349） キーの無い欄は、名前を書いて断る
     "seek_keyframe": lambda _media_id: {"name": "size"},
+    # 字幕の文字を OS のクリップボードへ（#349） 無い字幕は ID を書いて断る
+    "copy_subtitle_text": lambda media_id: {"media_id": media_id, "segment_id": "無い"},
 }
 
 

@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import pytest
 
+from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
+from sashimono.ai.operations import find_operation
+from sashimono.ai.outbound import ASKED, Outbound, SendChoice
+from sashimono.ai.safety import Safety
 from sashimono.compat.aviutl.catalog import ScriptCatalog
 from sashimono.core.commands import AddClip, ParamPath, SetParam
 from sashimono.core.commands.fixed import with_fixed_items
@@ -24,7 +28,9 @@ from sashimono.core.model import (
 from sashimono.effects.sources import TEXT, TO_NATIVE_LAYOUT
 from sashimono.effects.unlock import unlock_commands
 from tests.ai.conftest import FakeHost
+from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_operations import run
+from tests.ai.test_safety import answer_approvals
 
 
 def _text_clip(host: FakeHost, start: int = 400, **params: str) -> Clip:
@@ -183,3 +189,58 @@ class TestStandardLayout:
         native = _text_clip(host)
         with pytest.raises(ToolError, match="灰色"):
             run(host, "use_standard_layout", clip_ids=[str(native.id)])
+
+
+class TestCopyingOutOfTheApp:
+    """OS のクリップボードへ写す道具（2026-10-20 利用者の決定 読むだけ 送る前の同意に乗る）"""
+
+    def test_a_snapshot_is_copied_without_changing_the_project(self, host: FakeHost) -> None:
+        # 壊れると、AI に「この絵をコピーして」と頼んでも貼れないか、終わりの黒い絵が入る
+        before = host.document.project
+        result = run(host, "copy_snapshot", frame=10_000)
+        assert result["copied_frame"] == 299
+        assert host.copied_frames == [299]
+        assert host.document.project is before
+        assert not host.document.can_undo
+
+    def test_a_subtitle_line_is_copied(self, host: FakeHost) -> None:
+        # 壊れると、字幕パネルの〔文字をコピー〕と同じことを AI に頼めない
+        media = host.document.project.media[0]
+        assert media.transcript is not None
+        segment = media.transcript.segments[1]
+        result = run(host, "copy_subtitle_text", media_id=str(media.id), segment_id=str(segment.id))
+        assert host.copied_texts == [segment.text]
+        assert result == {"segment_id": str(segment.id), "copied_chars": len(segment.text)}
+
+    @pytest.mark.parametrize(
+        ("tool", "kind"),
+        [("copy_snapshot", Outbound.FRAMES), ("copy_subtitle_text", Outbound.TEXT)],
+    )
+    def test_they_only_read_and_declare_what_leaves_the_app(
+        self, tool: str, kind: Outbound
+    ) -> None:
+        # 壊れると、絵や文字をアプリの外へ出すのに送る前の同意に乗らないか、確かめの窓が出る
+        operation = find_operation(tool)
+        assert operation is not None
+        assert operation.safety is Safety.READ_ONLY
+        assert kind in operation.sends
+
+    @pytest.mark.parametrize("kind", [Outbound.FRAMES, Outbound.TEXT])
+    def test_a_refused_kind_is_not_copied(self, host: FakeHost, kind: Outbound) -> None:
+        # 壊れると、絵や字幕を送らないと決めた人の所でも、AI が黙ってクリップボードへ写す
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**dict.fromkeys(ASKED, SendChoice.ALLOW), kind: SendChoice.DENY})
+        media = host.document.project.media[0]
+        assert media.transcript is not None
+        tool = "copy_snapshot" if kind is Outbound.FRAMES else "copy_subtitle_text"
+        arguments: dict[str, object] = (
+            {}
+            if kind is Outbound.FRAMES
+            else {"media_id": str(media.id), "segment_id": str(media.transcript.segments[0].id)}
+        )
+        operation = find_operation(tool)
+        assert operation is not None
+        done, box = call_in_thread(bridge, operation, arguments)
+        answer_approvals(bridge, done, lambda _approval: False)
+        assert isinstance(box.get("error"), ToolError)
+        assert host.copied_frames == [] and host.copied_texts == []

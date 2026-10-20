@@ -4895,6 +4895,41 @@ def _use_standard_layout(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"switched": switched}
 
 
+# --- OS のクリップボードへ写す（#349 2026-10-20 利用者の決定） ---
+#
+# 読むだけの道具 作品は変えないが、絵と文字がアプリの外へ出る 送る物は絵なら映像の絵、
+# 文字なら字幕と文字として宣言し、送る前の同意（#342）に乗せる 断った人の所では動かさない
+
+
+def _copy_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """静止画を OS のクリップボードへ置く（〔静止画をコピー〕と同じ描き方）"""
+    project = _project(host)
+    if project.duration <= 0:
+        raise ToolError("タイムラインが空なので静止画にできません")
+    raw = arguments.get("frame", host.playhead)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ToolError("frame はフレーム番号（整数）で渡してください 省くと再生ヘッドの位置")
+    drawn = host.copy_snapshot_image(raw)
+    width, height = project.settings.resolution
+    return {
+        "copied_frame": drawn,
+        "timecode": format_timecode(drawn, project.rate),
+        "size": f"{width}x{height}",
+    }
+
+
+def _copy_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕 1 枚の本文を OS のクリップボードへ置く（字幕パネルの〔文字をコピー〕）
+
+    本文は返さない 読むのは get_subtitles 返すと、人が貼り付けるための写しが AI への
+    返事にもう 1 度載る
+    """
+    media, segment_id, stream = _segment_target(host, arguments)
+    segment = next(s for s in _transcript_of(host, media.id, stream) if s.id == segment_id)
+    host.copy_text(segment.text)
+    return {"segment_id": str(segment_id), "copied_chars": len(segment.text)}
+
+
 # --- 保存と書き出し（取り消せない操作 B1 #327） ---
 #
 # どれも「元に戻す」では戻らない 2026-10-14 の利用者の決定（#298 #350）のとおり、
@@ -6986,6 +7021,34 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_use_standard_layout,
         sends=_STRUCTURE,
         writes=True,
+    ),
+    Operation(
+        name="copy_snapshot",
+        description=(
+            "今のタイムラインの 1 コマを、画面の〔静止画をコピー〕と同じ描き方（作品の解像度）で"
+            " OS のクリップボードへ置く 人がほかのアプリへ貼るため 作品は変えない"
+            " 絵がアプリの外へ出るので、映像の絵を送ってよいかの同意に乗る"
+        ),
+        schema=_schema({"frame": _integer("描くフレーム 省くと再生ヘッドの位置")}),
+        handler=_copy_snapshot,
+        sends=_WITH_FRAMES,
+    ),
+    Operation(
+        name="copy_subtitle_text",
+        description=(
+            "字幕 1 枚の本文を OS のクリップボードへ置く（字幕パネルの〔文字をコピー〕）"
+            " 本文は返さない（読むのは get_subtitles） 字幕と文字を送ってよいかの同意に乗る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "segment_id": _string("字幕（get_subtitles の segment_id）"),
+                "audio": _integer("音声の番号（1 から） 省くと 1 本目"),
+            },
+            ["media_id", "segment_id"],
+        ),
+        handler=_copy_subtitle_text,
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="set_track_height",

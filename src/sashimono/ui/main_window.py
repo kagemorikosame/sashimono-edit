@@ -199,6 +199,7 @@ from sashimono.ui.progress_display import (
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.seam_dialogs import ask_seams, ask_speed
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.system_clipboard import copy_text as copy_text_to_clipboard
 from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
@@ -3468,13 +3469,33 @@ class MainWindow(QMainWindow):
 
     def copy_snapshot(self) -> None:
         """静止画をクリップボードへ置く"""
+        self._copy_snapshot(self._snapshot_frame())
+
+    def _copy_snapshot(self, frame: int) -> QImage:
+        """``frame`` を静止画にしてクリップボードへ置く 画面の〔静止画をコピー〕と AI の
+        copy_snapshot（#349）が通る所 描き方を 1 か所にして、貼った絵が食い違わないように
+        """
         from sashimono.ui.snapshot import copy_to_clipboard
 
-        image = self.snapshot_image()
+        image = self.snapshot_image(frame)
         copy_to_clipboard(image)
         self.statusBar().showMessage(
             f"静止画をクリップボードへコピーした（{image.width()}x{image.height()}）", 5000
         )
+        return image
+
+    def copy_snapshot_image(self, frame: int) -> int:
+        """AI の〔静止画をコピー〕（#349） 画面と同じく止めてから描き、描いたフレームを返す"""
+        from sashimono.ui.snapshot import snapshot_frame
+
+        self._playback.stop()
+        drawn = snapshot_frame(self.view_project, frame)
+        self._copy_snapshot(drawn)
+        return drawn
+
+    def copy_text(self, text: str) -> None:
+        """AI の字幕の〔文字をコピー〕（#349） 字幕パネルと同じクリップボードへ文字を置く"""
+        copy_text_to_clipboard(text)
 
     def probe(self, path: Path) -> MediaItem:
         forget_probe(path)

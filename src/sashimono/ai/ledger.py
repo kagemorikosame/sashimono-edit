@@ -176,6 +176,10 @@ _EFFECT_TRACK_NOTE = "add_track の effect（FX と番号の名前の映像ト�
 #: 場面切り替えの前の場面・後の場面（#349） add_effect の after で選ぶ
 _AFTER_NOTE = "場面切り替えの前の場面か後の場面かは add_effect の after で選ぶ"
 
+#: OS のクリップボードへ写す行（#349） 作品は変えないが絵と文字がアプリの外へ出るので、
+#: 送る物（絵・字幕と文字）を宣言して送る前の同意に乗せる（2026-10-20 利用者の決定）
+_OS_COPY_NOTE = "作品は変えない OS のクリップボードへ写すので、送る前の同意（#342）に乗る"
+
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
     # 開く・新規（#349） 2026-10-20 利用者の決定 毎回確かめ、保存していない変更があれば断る
@@ -239,11 +243,11 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("メニュー/編集/貼り付け（挿入）", "paste_clips", note=_INSERT_NOTE),
     same("メニュー/編集/すべて選択", "select_all", safety=Safety.READ_ONLY),
-    missing(
+    same(
         "メニュー/編集/静止画をコピー",
-        349,
-        "プロジェクトを変えない（絵をクリップボードへ写す）",
-        Safety.READ_ONLY,
+        "copy_snapshot",
+        note=_OS_COPY_NOTE,
+        safety=Safety.READ_ONLY,
     ),
     same("メニュー/編集/書き出し範囲を解除", "set_work_area", note="clear を真にする"),
     same("メニュー/編集/グループ化", "group_clips"),
@@ -441,11 +445,11 @@ LEDGER: tuple[Entry, ...] = (
         note=_SNAPSHOT_NOTE,
         safety=Safety.IRREVERSIBLE,
     ),
-    missing(
+    same(
         "プレビューの右クリック/静止画をコピー",
-        349,
-        "プロジェクトを変えない（絵をクリップボードへ写す）",
-        Safety.READ_ONLY,
+        "copy_snapshot",
+        note=_OS_COPY_NOTE,
+        safety=Safety.READ_ONLY,
     ),
     # --- シーンの帯 ---
     same("シーンの帯/新規｜空のシーンを作って開く", "add_scene"),
@@ -499,11 +503,11 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("字幕パネル/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     same("字幕パネルの右クリック/ここへ移動", "seek", safety=Safety.READ_ONLY),
-    partial(
+    same(
         "字幕パネルの右クリック/文字をコピー",
+        "copy_subtitle_text",
         "get_subtitles",
-        issue=349,
-        note="本文は読めるが、クリップボードへは写さない",
+        note=f"本文を読むのは get_subtitles {_OS_COPY_NOTE}",
         safety=Safety.READ_ONLY,
     ),
     same("字幕パネルの右クリック/テキストとして置く", "place_subtitles"),

@@ -278,7 +278,8 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   `EditorHost` に変える口を足さない（試験が落ちる 足してよいのは作品の保存と書き出しの口
   `write_project` `start_export` `export_status` `export_waiter` `cancel_export` `write_subtitles`
   `write_snapshot` と、#349 の作品を扱う口（コピーの置き場 `set_clipboard`・開く `open_project_file`・
-  新規 `start_new_project`・スクリプトの読み直し `reload_scripts`・配置の命令 `alignment_commands`）だけ）
+  新規 `start_new_project`・スクリプトの読み直し `reload_scripts`・配置の命令 `alignment_commands`・
+  OS のクリップボードへ写す `copy_snapshot_image` `copy_text`）だけ）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
 ### AI の道具が外へ送る物と同意（#342）
@@ -353,7 +354,7 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 ### 画面と同じ道具（#349）
 
 台帳の「まだできない」「一部だけできる」の #349 の行（着手のとき 56）を、本格的な編集に要る物から
-53 行埋めた どれも画面の同じ操作と同じ命令を通る
+全部埋めた どれも画面の同じ操作と同じ命令を通る
 
 - コピー・切り取り・貼り付け（`copy_clips` `cut_clips` `paste_clips`）の置き場は、人の Ctrl+C・Ctrl+X と
   同じタイムラインの 1 つ（`EditorHost.clipboard` `set_clipboard`） AI だけの置き場を持つと、人のコピーを
@@ -382,8 +383,10 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 - 配置のテンプレート（`align_clip`）は画面と同じくプレビューが今のコマで描いた枠から命令を作る
   （`EditorHost.alignment_commands`） 標準の組み方（`use_standard_layout`）は設定パネルのボタンと同じ
   `effects/unlock.py` の `unlock_commands` で値を作る
-- OS のクリップボードへ写す操作（静止画をコピー・字幕の文字をコピー）はまだ道具に無い アプリの外へ
-  出す扱いを利用者が決めてから足す
+- OS のクリップボードへ写す道具（`copy_snapshot` `copy_subtitle_text`）は読むだけ（2026-10-20 利用者の決定）
+  作品は変えないが絵と文字がアプリの外へ出るので、送る物を映像の絵・字幕と文字と書き、送る前の同意
+  （#342）に乗せる 描き方と写す口は画面の〔静止画をコピー〕〔文字をコピー〕と同じ
+  （`MainWindow._copy_snapshot` `system_clipboard.copy_text`）
 
 ### AI の取り消しとやり直し（#333）
 

@@ -148,6 +148,9 @@ class FakeHost:
         #: 配置のテンプレート（#349） 頼まれた（クリップ, 寄せ先）と、返す命令
         self.alignments: list[tuple[ClipId, str]] = []
         self.aligned: list[Command] | None = None
+        #: OS のクリップボードへ置いた静止画のフレームと文字（#349）
+        self.copied_frames: list[int] = []
+        self.copied_texts: list[str] = []
 
     @property
     def saved_looks(self) -> SavedLooks:
@@ -206,6 +209,15 @@ class FakeHost:
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self.selection = tuple(clip_ids)
+
+    def copy_snapshot_image(self, frame: int) -> int:
+        # 絵は描かない（偽物） 本物と同じく終わりを指せば最後のフレームを描いたことにする
+        drawn = max(0, min(frame, self.project.duration - 1))
+        self.copied_frames.append(drawn)
+        return drawn
+
+    def copy_text(self, text: str) -> None:
+        self.copied_texts.append(text)
 
     def reload_scripts(self) -> int:
         self.reloads += 1
