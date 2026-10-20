@@ -53,7 +53,10 @@ from tests.core.test_seams import JumpCut
 
 
 def _subclasses(base: type) -> Iterator[type]:
-    for sub in base.__subclasses__():
+    # 要素の型を書いておく 書かないと、キャッシュの無い mypy（CI）が型を決められずに落ちる
+    # 基底は抽象クラスの Command なので type[Command] では受けられない
+    found: list[type] = base.__subclasses__()
+    for sub in found:
         yield sub
         yield from _subclasses(sub)
 

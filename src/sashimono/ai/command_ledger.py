@@ -33,7 +33,8 @@ class Why(Enum):
 
     #: 画面の操作は使う AI の道具がまだ無い（``issue`` で足す）か、足さないと決めた
     PERSON_ONLY = "人の操作だけ"
-    #: 画面も AI も使わない（読み込みや試験の中だけ） 入口を作るときに道具も足す
+    #: 画面も AI も使わない（試験や道具の台本の中だけ） 残す訳を ``reason`` に書く
+    #: どこからも使われない物は残さず外す（#351 で AddSegment と RetimeSegment を外した）
     NEITHER = "どちらでもない"
 
 
@@ -58,7 +59,6 @@ def _neither(reason: str) -> Note:
 
 #: AI の道具が 1 つも通さないコマンド 名前はクラスの名前 道具を足したら行を消す
 COMMANDS_WITHOUT_TOOLS: dict[str, Note] = {
-    "AddSegment": _neither("字幕を手で 1 枚足す入口は、字幕パネルにも AI にもまだ無い"),
     "AdoptLegacyStroke": _person(
         "設定パネルが前の版の縁取りを層へ移す下ごしらえ AI の縁取りの道具は層の ID を指すので、"
         "前の版の縁は指せない"
@@ -79,11 +79,13 @@ COMMANDS_WITHOUT_TOOLS: dict[str, Note] = {
     "RemoveSegment": _person("字幕 1 枚の削除（字幕パネル）"),
     "RemoveTrack": _person("トラックの削除（タイムラインの右クリック）"),
     "RenameProject": _neither(
-        "作品の名前は保存したファイルの名前から付く 名前だけを変える入口は無い"
+        "作品の名前は保存したファイルの名前から付く 名前だけを変える入口は画面にも AI にも無い "
+        "残すのは、作品を 1 段だけ確実に変える一番小さい命令として、履歴・取り消し・控え・"
+        "自動保存の試験（tests の 11 ファイル）と字幕の速さを測る tools/bench_subtitles.py "
+        "が使うため 外すと、それらが中身を変える命令を別に持つことになる"
     ),
     "RenameScene": _person("シーンの名前の変更（シーンメニュー）"),
     "RenameTrack": _person("トラックの名前の変更（トラックの見出し）"),
-    "RetimeSegment": _neither("字幕の時刻を動かす入口は、字幕パネルにも AI にもまだ無い"),
     "SetBlending": _person("半透明の重ね合わせの方法（プロジェクト設定）"),
     "SetFrameRate": _person("フレームレートの変更（プロジェクト設定・動画に合わせる）"),
     "SetLayerMode": _person("置き方の方式の切り替え（ファイルメニュー・プロジェクト設定）"),
