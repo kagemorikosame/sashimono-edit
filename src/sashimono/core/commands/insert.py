@@ -46,7 +46,7 @@ from sashimono.core.model import (
     default_track_name,
     new_group_id,
 )
-from sashimono.core.timebase import Rounding, seconds_to_frame
+from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
     "DEFAULT_GENERATED_FRAMES",
@@ -54,6 +54,7 @@ __all__ = [
     "EFFECT_TRACK_PREFIX",
     "VOLUME_EFFECT_KIND",
     "default_volume_effect",
+    "held_at_end",
     "insert_clip",
     "insert_filter",
     "insert_generated",
@@ -194,6 +195,11 @@ def _place(
             ),
             picture=True,
         )
+        # 長さは音と映像の長い方（コンテナの長さ）を切り上げてあるので、音の方が長い素材や
+        # 端数で 1 コマ増えた素材は、絵のクリップが映像の終わりを越える 越えた所を最後の
+        # 絵で止める 止めないと書き出した動画の終わりが黒くなる（#402） 映像の長さで
+        # 切らないのは、音の終わり（話し声やBGMの尻）を黙って欠かさないため
+        picture = replace(picture, hold_at=held_at_end(picture, media, project.rate))
 
     # 音ごとに作る 音量とフェードの欄は 2 本目以降の音にも付ける 付けないと、
     # 置いた直後に 2 本目の音だけ音量をいじれない
@@ -236,6 +242,51 @@ def default_volume_effect() -> Effect:
     重ねて掛けたいときはふつうの音量調整を別に足す
     """
     return fixed_effect(VOLUME_EFFECT_KIND)
+
+
+def held_at_end(clip: Clip, media: MediaItem, rate: FrameRate) -> Fraction | None:
+    """素材の映像の終わりを越えて読むクリップの、最後の絵の時刻 越えなければ ``None``
+
+    素材を置くとき（:func:`insert_media` :func:`place_media`）と互換の読み込みで、YMM4 の
+    「最後の絵で止める」を写すときに使う 置くときのクリップの長さはコンテナの長さ（音と
+    映像の長い方）なので、音の方が長い素材は映像の終わりを越える 止めないと、越えた所は
+    デコーダが何も返さず、書き出すと動画の終わりが黒くなる（#402）
+
+    越えないクリップに持たせないのは、止まらないのに設定画面へ「絵を止める」が出て、
+    何を止めているのか分からなくなるため
+
+    最後の絵の時刻は、映像の終わりの **time_base の 1 刻み手前** デコーダは「その時刻を
+    越えない最後のフレーム」を返し（:meth:`~sashimono.engine.decode.VideoDecoder.frame_at`）、
+    終わりちょうどでは何も返さない 最後のフレームの PTS は必ず終わりより 1 刻み以上前に
+    あるので、フレームの間隔によらず最後のフレームが出る 平均のフレーム 1 つ分を引くと、
+    可変フレームレートの素材で最後の間隔が平均より短いとき、1 つ前の絵で止まる
+
+    映像の終わりは映像の道の長さ
+    （:attr:`~sashimono.core.model.VideoStreamInfo.end_time`）で見る コンテナの
+    長さ（:attr:`MediaItem.duration`）で見ると、音の方が長い素材で最後の映像フレームより
+    後ろを指し、止めた後もデコーダが毎フレーム終わり付近へシークし直してデコードする
+    道の終わりもコンテナの長さも、素材の頭（:func:`~sashimono.engine.decode.probe.media_origin`）
+    から数えてあり、クリップの ``source_in``・YMM4 の ``ContentOffset``・デコーダが読む時刻と
+    同じ数え方（Issue #123） 頭が 0 より後ろの素材（分割して書き出した物）でも、頭 5 秒・
+    長さ 2 秒なら映像の終わりは 2 秒 PTS そのまま（7 秒）で数えると、デコーダの映像の
+    終わりを越えた所で止めることになり、止めた所から何も映らない
+    道の長さが分からない素材（古いプロジェクトに入っていた素材など）はコンテナの長さで見る
+
+    長さの分からない素材（0 と読めた物）と静止画は止めない 静止画はもともと
+    いつでも同じ絵で、長さの分からない素材はどこが最後か決められない
+    """
+    if media.is_still or media.duration <= 0 or not media.video_streams:
+        return None
+    # 映像のクリップが読むのは最初の映像ストリーム（素材を置くときの絵のクリップと同じ）
+    stream = media.video_streams[0]
+    end = media.duration if stream.end_time is None else stream.end_time
+    if clip.source_out(rate) <= end:
+        return None
+    # 1 刻みがフレームより長い（壊れた time_base）ときはフレーム 1 つ分に抑える 大きく引くと
+    # 最後より前の絵で止まる 0 以下の刻みは引いても終わりちょうどになり、何も映らない
+    frame = stream.frame_rate.frame_duration
+    tick = stream.time_base if 0 < stream.time_base < frame else frame
+    return max(Fraction(0), end - tick)
 
 
 def _timeline_duration(project: Project, media: MediaItem) -> int:
