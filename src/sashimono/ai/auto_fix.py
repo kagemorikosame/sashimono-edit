@@ -197,9 +197,11 @@ def plan_color_fix(
                 exposure=request.exposure,
                 white_balance=request.white_balance,
             )
-        if not plan.changes:
+        if not plan.changes and not _has_auto_values(clip):
             unchanged.append(clip.id)
             continue
+        # 直す物が無くても、頭の補正に前の自動の値（色合わせなど）が残っていれば 0 へ戻す
+        # 戻さないと「整っています」と返しながら前の補正が効き続ける（#387 の Codex の指摘）
         made, replaced = _grade_commands(clip, plan.params)
         commands.extend(made)
         row: dict[str, Any] = {
@@ -247,6 +249,18 @@ def _head_grade(clip: Clip) -> Effect | None:
     if clip.effects and clip.effects[0].kind == GRADE_KIND and not clip.effects[0].fixed:
         return clip.effects[0]
     return None
+
+
+def _has_auto_values(clip: Clip) -> bool:
+    """頭の拡張色調補正の自動補正の欄に、0 でない値（か動き）が入っているか"""
+    head = _head_grade(clip)
+    if head is None:
+        return False
+    for name in AUTO_GRADE_PARAMS:
+        value = head.params.get(name)
+        if isinstance(value, AnimatedValue) and (value.is_animated or value.static != 0.0):
+            return True
+    return False
 
 
 def _clip_pixels(source: FixSource, project: Project, clip: Clip, *, graded_head: bool) -> Any:
@@ -298,8 +312,9 @@ def _grade_commands(clip: Clip, params: dict[str, float]) -> tuple[list[Command]
         )
         for name in AUTO_GRADE_PARAMS
     ]
-    if not head.enabled:
+    if not head.enabled and params:
         # 人が切った補正の値だけを直すと、効いていないのに整えたと返すことになる
+        # 0 へ戻すだけ（直す物が無い）なら入れ直さない
         commands.append(SetEffectEnabled(clip.id, head.id, True))
     return commands, True
 
@@ -342,6 +357,10 @@ def plan_noise_fix(
     for clip, estimate in measured:
         reason = _noise_skip_reason(estimate)
         if reason and not request.force:
+            if any(effect.kind == DENOISE_KIND for effect in clip.effects):
+                # 前に掛けたノイズ除去は外さない（人が足した物かもしれない） 効き続けることは
+                # 書いておく 書かないと、掛けないと返したのに音が変わったままに見える
+                reason += " 前からのノイズ除去はそのまま残しています"
             skipped.append({"clip_id": str(clip.id), "reason": reason})
             continue
         made, replaced = _denoise_commands(clip, request.reduction, request.sensitivity)
@@ -385,6 +404,17 @@ def _denoise_commands(
         effect = registry.require(DENOISE_KIND).create(reduction=reduction, sensitivity=sensitivity)
         # 位置は渡さない 固定の項目（音量・フェード）の前へ入る 雑音を下げてから音量を掛ける
         return [AddEffect(clip.id, effect)], False
+    moving = [
+        name
+        for name in ("reduction", "sensitivity")
+        if isinstance(value := found.params.get(name), AnimatedValue) and value.is_animated
+    ]
+    if moving:
+        # 拡張色調補正と同じく、人が付けた動きを 1 つの値で黙って消さない（#387 の Codex の指摘）
+        raise ToolError(
+            f"{clip.id} のノイズ除去は {', '.join(moving)} をキーフレームで動かしています"
+            " 置き換えると動きが消えるので触りません 設定パネルで直してください"
+        )
     commands: list[Command] = [
         SetParam(ParamPath.of_effect(clip.id, found.id, name), AnimatedValue(static=value))
         for name, value in (("reduction", reduction), ("sensitivity", sensitivity))

@@ -12,6 +12,7 @@ from fractions import Fraction
 import numpy as np
 import pytest
 
+from sashimono.ai.auto_fix import AUTO_GRADE_PARAMS
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
@@ -170,6 +171,35 @@ class TestAutoColor:
         before = work.host.document.project
         with pytest.raises(ToolError, match="キーフレーム"):
             _call(work.host, "auto_color", {"clip_ids": [str(work.picture.id)]})
+        assert work.host.document.project == before
+
+    def test_an_earlier_match_is_cleared_when_nothing_needs_fixing(self, work: Work) -> None:
+        # 壊れると、色合わせで変えた後に整った素材へふつうの補正を掛け直したとき、「整って
+        # います」と返しながら前の色合わせが効き続ける（#387 の Codex の指摘）
+        work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.0, light=1.0))
+        work.host.filmstrips[work.other.id] = _strip(_scene(dark=0.2, light=0.6))
+        _call(
+            work.host,
+            "auto_color",
+            {"clip_ids": [str(work.picture.id)], "match_clip_id": str(work.second.id)},
+        )
+        result = _call(work.host, "auto_color", {"clip_ids": [str(work.picture.id)]})
+        head = work.clip(work.picture).effects[0]
+        assert head.kind == GRADE_KIND
+        for name in AUTO_GRADE_PARAMS:
+            value = head.params.get(name)
+            assert isinstance(value, AnimatedValue) and value.static == 0.0, name
+        rows = result["clips"]
+        assert isinstance(rows, list) and rows[0]["replaced"] is True
+
+    def test_a_clean_grade_is_not_touched_again(self, work: Work) -> None:
+        # 壊れると、もう 0 の自動補正の欄を毎回書き直し、何も変わらない段が取り消しの履歴に積まれる
+        grade = registry.require(GRADE_KIND).create(hue_offset=10.0)
+        work.host.apply_commands([AddEffect(work.picture.id, grade, index=0)], "人")
+        work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.0, light=1.0))
+        before = work.host.document.project
+        result = _call(work.host, "auto_color", {"clip_ids": [str(work.picture.id)]})
+        assert result["unchanged_clip_ids"] == [str(work.picture.id)]
         assert work.host.document.project == before
 
     def test_the_preference_is_the_default_strength(self, work: Work) -> None:
@@ -339,6 +369,28 @@ class TestReduceNoise:
         work.host.stub_waveform = _waveform(noise=0.01)
         with pytest.raises(ToolError, match="reduction_db"):
             _call(work.host, "reduce_noise", {"clip_ids": [str(work.sound.id)], "reduction_db": 80})
+
+    def test_a_moving_effect_is_not_overwritten(self, work: Work) -> None:
+        # 壊れると、人がキーフレームで動かしたノイズ除去の量を 1 つの値で黙って上書きし、
+        # 動きが消える（#387 の Codex の指摘 右クリックも同じ所を通る）
+        moving = AnimatedValue(12.0, keyframes=(Keyframe(0, 6.0), Keyframe(30, 24.0)))
+        effect = registry.require(DENOISE_KIND).create().with_param("reduction", moving)
+        work.host.apply_commands([AddEffect(work.sound.id, effect)], "人")
+        work.host.stub_waveform = _waveform(noise=0.01)
+        before = work.host.document.project
+        with pytest.raises(ToolError, match="キーフレーム"):
+            _call(work.host, "reduce_noise", {"clip_ids": [str(work.sound.id)]})
+        assert work.host.document.project == before
+
+    def test_a_skipped_clip_says_the_earlier_effect_stays(self, work: Work) -> None:
+        # 壊れると、掛けないと返したのに前のノイズ除去が効き続け、人と AI が音の変わった訳を追えない
+        work.host.apply_commands(
+            [AddEffect(work.sound.id, registry.require(DENOISE_KIND).create())], "人"
+        )
+        work.host.stub_waveform = _waveform(noise=10 ** (-75 / 20))
+        result = _call(work.host, "reduce_noise", {"clip_ids": [str(work.sound.id)]})
+        skipped = result["skipped"]
+        assert isinstance(skipped, list) and "そのまま" in skipped[0]["reason"]
 
     def test_a_turned_off_effect_is_turned_back_on(self, work: Work) -> None:
         # 壊れると、人が切ったノイズ除去の値だけを直し、効いていないのに減らしたと返す
