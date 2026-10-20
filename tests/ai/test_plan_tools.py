@@ -291,6 +291,27 @@ class TestPause:
         view = plan.view()
         assert view is not None and view.finished and view.stopped is None
 
+    def test_pausing_during_the_last_step_leaves_no_reason_once_it_is_done(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、最後の手順の途中で〔区切りで止める〕を押して AI が終えた計画に
+        # 「区切りで止めました」が残り、終えた作業を止めたように見せて get_plan も食い違う
+        plan = plan_for(host.document)
+        _plan(host, 2)
+        _mark(host, 1, "done")
+        _mark(host, 2, "running")
+        assert plan.request_pause() is True
+        result = _mark(host, 2, "done")
+        assert result["finished"] is True
+        assert "paused" not in result
+        assert _read(host)["stopped"] is None
+        # 終えた後は、ほかの道具も断らない（止める所が残っていない）
+        assert plan.refusal("split_clip") == ""
+        plan.end_turn(interrupted=False)
+        view = plan.view()
+        assert view is not None and view.finished and view.stopped is None
+        assert _read(host)["stopped"] is None
+
 
 class TestBelongsToTheProject:
     def test_opening_another_project_closes_the_plan(

@@ -251,6 +251,12 @@ class WorkPlan:
                 step = self._steps[number - 1]
                 self._steps[number - 1] = PlanStep(step.title, wanted, remark)
                 self._version += 1
+            if all(item.state.finished for item in self._steps):
+                # 最後の手順の途中で止めを頼まれ、そのまま終えた 止める所が残っていないので
+                # 止めを外す 残すと、終えた計画に「区切りで止めました」と押せない〔続ける〕が出る
+                self._pause_requested = False
+                self._paused = False
+                self._stopped = None
             view = self._view()
             paused = self._paused
         result: dict[str, Any] = {
@@ -348,6 +354,9 @@ class WorkPlan:
                     self._stopped = Stopped.PAUSED
                 else:
                     self._stopped = Stopped.ENDED
+            else:
+                # 終えた計画に止まった訳を残さない 残すと会話の欄が「区切りで止めました」と出す
+                self._stopped = None
             self._pause_requested = False
             self._paused = False
             self._version += 1

@@ -237,6 +237,25 @@ class TestPauseAndResume:
         widget.resume_plan()
         assert sessions[0].prompts == ["無音を詰めて"]
 
+    def test_pausing_during_the_last_step_ends_as_finished(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、最後の手順の途中で止めを頼んで AI が終えたとき、会話の欄に
+        # 「計画を区切りで止めました」と出て、押せない〔続ける〕を案内する
+        widget, host, _ = made
+        _send(widget, "無音を詰めて")
+        _plan(host, "a", "b")
+        _mark(host, 1, "done")
+        _mark(host, 2, "running")
+        widget._poll()
+        box = widget._plan_box
+        box.pause_button.click()
+        _mark(host, 2, "done")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert "計画を区切りで止めました" not in _log(widget)
+        assert box.stopped_text() == ""
+        assert box.resume_button.isEnabled() is False
+
     def test_opening_another_project_closes_the_plan(
         self,
         made: tuple[ChatPanel, FakeHost, list[_RecordingSession]],
