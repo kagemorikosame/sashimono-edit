@@ -23,6 +23,7 @@ from sashimono.core.model import (
     Timeline,
     Track,
     TrackId,
+    TrackKind,
     TranscriptSegment,
     heard_stream,
 )
@@ -30,8 +31,10 @@ from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
     "ProjectedSubtitle",
+    "heard_timeline",
     "project_clip",
     "project_timeline",
+    "sounding",
     "source_seconds_at",
     "subtitle_stream",
     "subtitle_voice",
@@ -163,35 +166,69 @@ def project_timeline(project: Project) -> Iterator[ProjectedSubtitle]:
     yield from projected
 
 
+def heard_timeline(project: Project) -> Iterator[ProjectedSubtitle]:
+    """書き出しで声が鳴るクリップの字幕だけを、開始位置順に返す（#322）
+
+    シーンの中も、ミキサと同じ決まり（:func:`sounding`）でトラックとクリップを選ぶ
+    投影した後の字幕は ``clip_id`` が外側のシーンのクリップに書き換わるので、後から
+    鳴るかを照らすと、シーンの中で消音したトラックや無効のクリップの字幕まで通る
+    （#385 の Codex の指摘）
+    """
+    projected = list(_project_tracks(project, project.timeline, 0, heard=True))
+    projected.sort(key=lambda p: (p.start_frame, p.end_frame))
+    yield from projected
+
+
 #: シーンの入れ子をたどる深さの上限 描画と音（MAX_SCENE_DEPTH）に揃える
 MAX_SCENE_DEPTH = 8
 
 
 def _project_tracks(
-    project: Project, timeline: Timeline, depth: int
+    project: Project, timeline: Timeline, depth: int, *, heard: bool = False
 ) -> Iterator[ProjectedSubtitle]:
-    for track in timeline.tracks:
-        for clip in track.clips:
-            if clip.scene_id is not None:
-                # シーンの中の字幕も、置いた場所に出す 見ないと、シーンにまとめた
-                # 途端に字幕パネル・焼き込み・字幕ファイルから消える
-                # 描画と同じ深さまで見る（レンダラは深さ 7 に置いたシーンの中身も描く）
-                if depth >= MAX_SCENE_DEPTH:
-                    continue
-                scene = project.find_scene(clip.scene_id)
-                if scene is None:
-                    continue
-                inner = _project_tracks(project, scene.timeline, depth + 1)
-                yield from _place_scene(inner, clip, project.rate, track.id)
+    placed = (
+        sounding(project, timeline)
+        if heard
+        else [(track, clip) for track in timeline.tracks for clip in track.clips]
+    )
+    for track, clip in placed:
+        if clip.scene_id is not None:
+            # シーンの中の字幕も、置いた場所に出す 見ないと、シーンにまとめた
+            # 途端に字幕パネル・焼き込み・字幕ファイルから消える
+            # 描画と同じ深さまで見る（レンダラは深さ 7 に置いたシーンの中身も描く）
+            if depth >= MAX_SCENE_DEPTH:
                 continue
-            if clip.media_id is None:
+            scene = project.find_scene(clip.scene_id)
+            if scene is None:
                 continue
-            media = project.find_media(clip.media_id)
-            if media is None or not media.transcripts:
-                continue
-            yield from project_clip(
-                clip, media, project.rate, track.id, subtitle_stream(project, track, clip)
-            )
+            inner = _project_tracks(project, scene.timeline, depth + 1, heard=heard)
+            yield from _place_scene(inner, clip, project.rate, track.id)
+            continue
+        if clip.media_id is None:
+            continue
+        media = project.find_media(clip.media_id)
+        if media is None or not media.transcripts:
+            continue
+        yield from project_clip(
+            clip, media, project.rate, track.id, subtitle_stream(project, track, clip)
+        )
+
+
+def sounding(project: Project, timeline: Timeline) -> list[tuple[Track, Clip]]:
+    """``timeline`` の中で、書き出しで音が鳴るクリップ（ミキサと同じ決まり）
+
+    音声トラックと混合トラックは聞こえるトラック（ソロとミュート）、映像トラックは映る
+    トラックの置いたシーンだけ どれも無効のクリップは鳴らさない 入れ子のシーンの中も
+    同じ決まりで選ぶ（ミキサはシーンの中のタイムラインも同じ道で混ぜる）
+    """
+    tracks = list(timeline.active_sound_tracks())
+    tracks += [t for t in timeline.active_picture_tracks() if t.kind is TrackKind.VIDEO]
+    return [
+        (track, clip)
+        for track in tracks
+        for clip in track.clips
+        if clip.enabled and project.plays_sound(track, clip)
+    ]
 
 
 def _place_scene(

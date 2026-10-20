@@ -23,6 +23,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from sashimono.ai.host import (
     EXPORT_RUNNING,
     UNSAVED_REFUSAL,
@@ -46,6 +48,23 @@ from sashimono.ai.sheet import (
     MIN_CELL_WIDTH,
     SheetError,
     sheet_layout,
+)
+from sashimono.ai.sound_graph import (
+    FLOOR_LUFS,
+    GRAPH_DEFAULT_HEIGHT,
+    GRAPH_DEFAULT_WIDTH,
+    GRAPH_MAX_HEIGHT,
+    GRAPH_MIN_HEIGHT,
+    GRAPH_MIN_WIDTH,
+    MARGIN_LEFT,
+    MAX_MARKS,
+    Band,
+    SoundGraph,
+    clipped_columns,
+    graph_columns,
+    plot_width,
+    spans,
+    time_step,
 )
 from sashimono.ai.style_check import COLOR as STYLE_COLOR
 from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
@@ -216,7 +235,7 @@ from sashimono.core.model import (
     TrackKind,
     TranscriptSegment,
 )
-from sashimono.core.projection import project_timeline, source_seconds_at
+from sashimono.core.projection import heard_timeline, project_timeline, source_seconds_at
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -287,7 +306,21 @@ from sashimono.engine.checks import (
     CheckRequest,
     CheckState,
 )
-from sashimono.engine.checks.scan import LOUDNESS
+from sashimono.engine.checks.loudness import ABSOLUTE_GATE
+from sashimono.engine.checks.profile import (
+    MUSIC,
+    NOISE,
+    SPEECH,
+    SPEECH_AND_MUSIC,
+    TICK_SECONDS,
+    UNCLEAR,
+    SoundProfile,
+    SoundSegment,
+    classify,
+)
+from sashimono.engine.checks.profile import SILENCE as SOUND_SILENCE
+from sashimono.engine.checks.report import CheckReport, ClipIndex
+from sashimono.engine.checks.scan import LOUDNESS, SOUND_KINDS
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
     CONTAINER_SUFFIXES,
@@ -2271,6 +2304,479 @@ def _check_result(
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+# --- 音の推移と見分け（#322 #338）---
+
+#: 推移の点の数の既定と上限 1 点は 30 字ほどなので、上限でも返事の上限の半分ほどに収まる
+DEFAULT_SOUND_POINTS = 60
+MAX_SOUND_POINTS = 200
+#: 無音とみなす大きさ（dBFS）の既定 話の間（静かな部屋の雑音は -50〜-60）も拾える側
+#: 検査（check_output）の既定 -60 は「音が無い」不具合を探す値で、話の間を拾わない
+DEFAULT_SOUND_SILENCE_DB = -50.0
+#: 返す無音の最短（秒）の既定 話の区切り（0.5 秒ほどの間）を拾い、息継ぎは拾わない
+DEFAULT_SOUND_MIN_SILENCE = 0.5
+#: 一覧の種類 区間の見分けか、無音か
+SOUND_LISTS = ("segments", "silences")
+SOUND_LABEL_NAMES = {
+    SPEECH: "話し声",
+    MUSIC: "音楽",
+    SPEECH_AND_MUSIC: "BGM の上の話し声",
+    SOUND_SILENCE: "無音",
+    NOISE: "雑音",
+    UNCLEAR: "見分けられない",
+}
+#: 区間に添えるクリップの数 長い音楽の下に何十本も並べない
+_CLIPS_PER_SOUND = 3
+#: グラフに頭打ちの印を付ける大きさ（dBFS） 検査の音割れの既定（-0.01）と同じ
+_GRAPH_CLIP_DB = -0.01
+#: グラフの見分けの帯の色の説明（描く色は ui/ai_sound_graph.py）
+_BAND_LEGEND = "青=話し声 橙=音楽 紫=BGM の上の話し声 灰=無音 茶=雑音 白=見分けられない"
+_SOUND_LIMITS_NOTE = (
+    " 話し声と音楽の見分けは、字幕（文字起こし）の重なりと、音の大きさの上下（話し声は"
+    "音節と息継ぎで上下し、谷が無音近くまで落ちる 音楽は谷も鳴っている）と、話の谷に残る音で"
+    "見る 外のモデルは使わない 歌は音楽として返す ラップ・笑い声・拍手・打楽器だけの音楽は"
+    "外れやすく、ゲームの効果音や中の声は話し声に寄る（録画の話していない所の半分ほどを"
+    "話し声と読む） 1 秒より短い切り替わりは拾わない confidence は high（字幕と合う）・"
+    "medium・low 大事な所は preview_range と再生で確かめる"
+)
+
+
+def _same_target(one: CheckRequest, other: CheckRequest) -> bool:
+    """同じ物（同じ作品の同じ範囲か、同じ書き出したファイル）を調べる頼みか しきい値は見ない"""
+    return (one.path, one.stamp, one.start, one.end, one.scene) == (
+        other.path,
+        other.stamp,
+        other.start,
+        other.end,
+        other.scene,
+    ) and (one.project is other.project or one.project == other.project)
+
+
+def _sound_target(host: EditorHost, arguments: dict[str, Any]) -> CheckRequest:
+    """音だけを調べる頼みを作る（まだ頼まない） 範囲と場所はここで確かめて断る"""
+    picked = {
+        key: arguments[key]
+        for key in ("path", "from_frame", "to_frame")
+        if arguments.get(key) is not None
+    }
+    return _check_request(host, {**picked, "checks": sorted(SOUND_KINDS)})
+
+
+def _start_sound(host: EditorHost, fresh: CheckRequest) -> CheckRequest:
+    """``fresh`` を頼む 同じ物を調べた検査（check_output も）があれば、それを使い回す
+
+    推移は検査が音を混ぜるついでに覚える（:mod:`sashimono.engine.checks.profile`）
+    使い回さずに頼み直すと、AI が今頼んだ検査を止めて、同じ音をもう 1 度混ぜ直す
+    """
+    state = host.check_state()
+    current = state.request
+    if (
+        current is not None
+        and current.limits.needs_sound
+        and state.failure is None
+        and not state.stopped
+        and _same_target(current, fresh)
+    ):
+        return current
+    host.request_check(fresh)
+    return fresh
+
+
+def _sound_wait(arguments: dict[str, Any]) -> float:
+    return _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+
+
+def _after_sound(host: EditorHost, wait: float, answer: Callable[[CheckState], object]) -> object:
+    """解析が終わっていなければ待ってから（待ちきれなければ途中までで）答える"""
+    state = host.check_state()
+    if not state.running or wait <= 0:
+        return answer(state)
+    return Pending(wait=host.check_waiter(), seconds=wait, then=lambda: answer(host.check_state()))
+
+
+@dataclass(frozen=True, slots=True)
+class _Heard:
+    """答えに使う音の推移と、添える断り書き"""
+
+    report: CheckReport
+    profile: SoundProfile
+    notes: tuple[str, ...]
+
+
+def _heard(host: EditorHost, request: CheckRequest, state: CheckState) -> _Heard:
+    if state.request != request:
+        raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
+    if state.failure is not None:
+        raise ToolError(f"音を読めませんでした: {state.failure}")
+    report = state.report
+    profile = report.sound if report is not None else None
+    if report is None or profile is None or profile.ticks == 0:
+        if state.running:
+            raise ToolError(
+                "音を読み始めたところです 少し待ってからもう 1 度呼んでください"
+                "（wait_seconds を長くすると、そのまま待てます）"
+            )
+        if state.stopped:
+            raise ToolError("音の解析は途中で止められました もう 1 度呼ぶと最初から調べ直します")
+        reason = " ".join(report.notes) if report is not None and report.notes else "音がありません"
+        raise ToolError(f"音の推移を出せませんでした（{reason}）")
+    notes: list[str] = []
+    if state.running:
+        notes.append(
+            f"解析の途中です（{round(profile.ticks * TICK_SECONDS, 1)} 秒まで） 調べた所までを"
+            "返しました しばらくしてから同じ引数で呼ぶと続きを返します"
+        )
+    elif state.stopped:
+        notes.append("解析は途中で止められました もう 1 度呼ぶと最初から調べ直します")
+    if request.project is not None and _project(host) != request.project:
+        notes.append(
+            "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
+            " 今の作品を調べるにはもう 1 度呼んでください"
+        )
+    return _Heard(report, profile, tuple(notes))
+
+
+def _tick_frame(report: CheckReport, tick: int) -> int:
+    """推移の区切り（100 ms）の頭が当たるフレーム 範囲の終わりを越えない"""
+    return min(report.end, report.start + round(tick * TICK_SECONDS * report.fps))
+
+
+def _subtitle_ticks(project: Project, start: int, fps: float, ticks: int) -> np.ndarray:
+    """区切りごとに、鳴っているクリップの字幕が重なるか
+
+    消音のトラックや無効のクリップの字幕は数えない 聞こえない声の字幕で話し声と読むと、
+    BGM だけが鳴っている所を話し声と返す 置いたシーンの中も、外へ写す前に鳴るかを見る
+    （:func:`heard_timeline` 写した後はクリップ ID が外側のシーンの物になり、見分けられない）
+    """
+    mask = np.zeros(ticks, dtype=bool)
+    for subtitle in heard_timeline(project):
+        low = math.floor((subtitle.start_frame - start) / fps / TICK_SECONDS)
+        high = math.ceil((subtitle.end_frame - start) / fps / TICK_SECONDS)
+        if high <= 0 or low >= ticks:
+            continue
+        mask[max(0, low) : min(ticks, high)] = True
+    return mask
+
+
+def _sound_segments(request: CheckRequest, heard: _Heard, silence_db: float) -> list[SoundSegment]:
+    report, profile = heard.report, heard.profile
+    subtitles = (
+        _subtitle_ticks(request.project, report.start, report.fps, profile.ticks)
+        if request.project is not None
+        else None
+    )
+    return classify(profile, subtitles=subtitles, silence_db=silence_db)
+
+
+def _lufs(value: float | None) -> float | None:
+    """LUFS の値を返事の形にする 測れない（-70 以下・無音）は ``None``"""
+    if value is None or not math.isfinite(value) or value <= ABSOLUTE_GATE:
+        return None
+    return round(value, 1)
+
+
+def _sound_levels(report: CheckReport, profile: SoundProfile, points: int) -> dict[str, Any]:
+    """推移を ``points`` 点に束ねる 1 点は区間の頭のフレームと、その区間の値"""
+    momentary = profile.momentary()
+    short = profile.short_term()
+    peaks = profile.peak_db()
+    count = profile.ticks
+    points = max(1, min(points, count))
+    rows: list[list[Any]] = []
+    for index in range(points):
+        low = index * count // points
+        high = max(low + 1, (index + 1) * count // points)
+        rows.append(
+            [
+                _tick_frame(report, low),
+                _lufs(float(short[high - 1])),
+                _lufs(float(momentary[low:high].max())),
+                round(float(peaks[low:high].max()), 1),
+            ]
+        )
+    return {
+        "seconds_per_point": round(count * TICK_SECONDS / points, 2),
+        "columns": ["frame", "short_term_lufs", "max_momentary_lufs", "peak_dbfs"],
+        "rows": rows,
+    }
+
+
+def _sound_arguments(arguments: dict[str, Any]) -> tuple[float, float]:
+    silence_db = _limit_number(arguments, "silence_db", DEFAULT_SOUND_SILENCE_DB, -120.0, -10.0)
+    min_silence = _limit_number(
+        arguments, "min_silence_seconds", DEFAULT_SOUND_MIN_SILENCE, 0.1, 600.0
+    )
+    return silence_db, min_silence
+
+
+def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """音の推移・ラウドネス・無音・話し声と音楽の見分けを数で返す"""
+    points = _within(arguments, "points", DEFAULT_SOUND_POINTS, 0, MAX_SOUND_POINTS)
+    silence_db, min_silence = _sound_arguments(arguments)
+    listing = str(arguments.get("list") or SOUND_LISTS[0])
+    if listing not in SOUND_LISTS:
+        raise ToolError(f"list は {' か '.join(SOUND_LISTS)} で渡してください（{listing!r}）")
+    wait = _sound_wait(arguments)
+    request = _start_sound(host, _sound_target(host, arguments))
+
+    def answer(state: CheckState) -> object:
+        heard = _heard(host, request, state)
+        return _sound_numbers(
+            request, heard, arguments, points, silence_db, min_silence, listing=listing
+        )
+
+    return _after_sound(host, wait, answer)
+
+
+def _sound_numbers(
+    request: CheckRequest,
+    heard: _Heard,
+    arguments: dict[str, Any],
+    points: int,
+    silence_db: float,
+    min_silence: float,
+    *,
+    listing: str,
+) -> object:
+    report, profile = heard.report, heard.profile
+    project = request.project
+    index = ClipIndex(project) if project is not None else None
+    segments = _sound_segments(request, heard, silence_db)
+    by_kind: dict[str, float] = {}
+    for segment in segments:
+        seconds = (segment.end - segment.start) * TICK_SECONDS
+        by_kind[segment.label] = round(by_kind.get(segment.label, 0.0) + seconds, 1)
+    loudness_range = profile.loudness_range()
+    head: dict[str, Any] = {
+        "target": "timeline" if project is not None else str(request.path),
+        "complete": report.complete,
+        "analyzed_seconds": round(profile.ticks * TICK_SECONDS, 1),
+        "length_seconds": round(report.seconds, 3),
+        "summary": {
+            "integrated_lufs": _lufs(profile.integrated()),
+            "loudness_range_lu": None if loudness_range is None else round(loudness_range, 1),
+            "max_momentary_lufs": _lufs(float(profile.momentary().max())),
+            "max_short_term_lufs": _lufs(float(profile.short_term().max())),
+            "sample_peak_dbfs": round(float(profile.peak_db().max()), 2),
+            "loudness_target_lufs": request.limits.loudness_target,
+            "seconds_by_kind": by_kind,
+        },
+    }
+    if project is not None:
+        head |= {"from_frame": request.start, "to_frame": request.end, "scene": request.scene}
+    else:
+        head["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
+
+    def clips(start: int, end: int) -> list[str]:
+        if index is None:
+            return []
+        return [item.clip_id for item in index.sounds(start, end)][:_CLIPS_PER_SOUND]
+
+    rows: list[dict[str, Any]] = []
+    if listing == "segments":
+        peaks = profile.peak_db()
+        for segment in segments:
+            start, end = _tick_frame(report, segment.start), _tick_frame(report, segment.end)
+            row: dict[str, Any] = {
+                "kind": segment.label,
+                "name": SOUND_LABEL_NAMES[segment.label],
+                "confidence": segment.confidence,
+                "start_frame": start,
+                "end_frame": end,
+                "start_seconds": round(start / report.fps, 2),
+                "end_seconds": round(end / report.fps, 2),
+                "lufs": _lufs(profile.integrated(segment.start, segment.end)),
+                "peak_dbfs": round(float(peaks[segment.start : segment.end].max()), 1),
+                "speech_score": segment.speech_score,
+                "music_score": segment.music_score,
+            }
+            if segment.subtitles is not None:
+                row["subtitles"] = segment.subtitles
+            rows.append(row)
+    else:
+        shortest = max(1, math.ceil(min_silence / TICK_SECONDS - 1e-9))
+        for low, high, loudest in profile.silences(silence_db, shortest):
+            start, end = _tick_frame(report, low), _tick_frame(report, high)
+            rows.append(
+                {
+                    "start_frame": start,
+                    "end_frame": end,
+                    "start_seconds": round(start / report.fps, 2),
+                    "seconds": round((high - low) * TICK_SECONDS, 1),
+                    "loudest_dbfs": round(loudest, 1),
+                }
+            )
+    for row in rows:
+        if project is not None:
+            row["timecode"] = format_timecode(int(row["start_frame"]), project.rate)
+        placed = clips(int(row["start_frame"]), int(row["end_frame"]))
+        if placed:
+            row["clip_ids"] = placed
+    notes = list(heard.notes)
+    if points:
+        # 推移と区間を合わせて返事の上限に収める 推移は返事の半分まで 越えたら点を減らす
+        wanted = points
+        head["levels"] = _sound_levels(report, profile, points)
+        while points > 10 and len(json_text(head)) > MAX_RESULT_CHARS // 2:
+            points = points * 3 // 4
+            head["levels"] = _sound_levels(report, profile, points)
+        if points < wanted:
+            notes.append(f"推移は返事に収まるよう {points} 点に減らした")
+    notes.append(
+        "LUFS が null の所は無音か -70 LUFS より静か 区間・無音のフレームはタイムラインの"
+        "フレームで、preview_frame・preview_range・audio_graph の marks へそのまま渡せる"
+        + _SOUND_LIMITS_NOTE
+    )
+    return _paged_after(head, rows, arguments, listing, " ".join(notes))
+
+
+def _graph_marks(arguments: dict[str, Any], low: int, high: int) -> list[int]:
+    """縦線を引くフレーム 範囲の外は寄せずに断る"""
+    raw = arguments.get("marks")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ToolError("marks はフレームの配列で渡してください")
+    if len(raw) > MAX_MARKS:
+        raise ToolError(f"marks は {MAX_MARKS} 個までにしてください（{len(raw)} 個）")
+    frames = [_integer_value(value, "marks") for value in raw]
+    outside = [frame for frame in frames if not low <= frame < high]
+    if outside:
+        raise ToolError(
+            f"marks の {', '.join(map(str, outside))} はグラフの範囲（{low}〜{high - 1}）の外です"
+        )
+    return frames
+
+
+def _audio_graph(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """音量の推移を 1 枚の絵で返す 動き（preview_range）と並べて確かめる"""
+    width = _within(arguments, "width", GRAPH_DEFAULT_WIDTH, GRAPH_MIN_WIDTH, MAX_SHEET_EDGE)
+    height = _within(arguments, "height", GRAPH_DEFAULT_HEIGHT, GRAPH_MIN_HEIGHT, GRAPH_MAX_HEIGHT)
+    silence_db, _min_silence = _sound_arguments(arguments)
+    wait = _sound_wait(arguments)
+    fresh = _sound_target(host, arguments)
+    # 引数は解析を頼む前に確かめる 外れた引数で長い解析を走らせ、AI が頼み直す間も混ぜ続けない
+    # 書き出した動画の長さは読むまで分からない その時は答える所で確かめる
+    marks = _graph_marks(arguments, fresh.start, fresh.end) if fresh.path is None else None
+    request = _start_sound(host, fresh)
+
+    def answer(state: CheckState) -> object:
+        heard = _heard(host, request, state)
+        report = heard.report
+        chosen = marks if marks is not None else _graph_marks(arguments, report.start, report.end)
+        graph = _sound_graph(request, heard, width, height, chosen, silence_db)
+        png = host.draw_sound_graph(graph)
+        return ImageResult(png=png, caption=_graph_caption(request, heard, chosen))
+
+    return _after_sound(host, wait, answer)
+
+
+def _sound_graph(
+    request: CheckRequest,
+    heard: _Heard,
+    width: int,
+    height: int,
+    marks: list[int],
+    silence_db: float,
+) -> SoundGraph:
+    report, profile = heard.report, heard.profile
+    columns = plot_width(width)
+    # 途中までの解析でも横は範囲の全体に取る 測った所を全体に引き伸ばすと、時刻の目盛りが
+    # 実際の位置とずれる まだの所は未解析として描く
+    total = max(profile.ticks, math.ceil(report.seconds / TICK_SECONDS - 1e-9))
+    missing = total - profile.ticks
+
+    def padded(values: np.ndarray, fill: float) -> np.ndarray:
+        return np.concatenate([values, np.full(missing, fill)]) if missing > 0 else values
+
+    def x_of(tick: int) -> int:
+        return MARGIN_LEFT + round(tick * columns / total)
+
+    subtitles: tuple[tuple[int, int], ...] = ()
+    if request.project is not None:
+        mask = _subtitle_ticks(request.project, report.start, report.fps, profile.ticks)
+        subtitles = tuple((x_of(low), x_of(high)) for low, high in spans(mask.tolist()))
+    seconds = total * TICK_SECONDS
+    step = time_step(seconds, columns)
+    ticks: list[tuple[int, str]] = []
+    moment = 0.0
+    while moment <= seconds + 1e-9:
+        frame = report.start + round(moment * report.fps)
+        label = (
+            format_timecode(frame, request.project.rate)
+            if request.project is not None
+            else _clock(moment)
+        )
+        ticks.append((MARGIN_LEFT + round(moment / seconds * columns), label))
+        moment += step
+    span = max(1, report.end - report.start)
+    return SoundGraph(
+        width=width,
+        height=height,
+        momentary=graph_columns(padded(profile.momentary(), -math.inf), columns),
+        short_term=graph_columns(padded(profile.short_term(), -math.inf), columns, reduce="last"),
+        clipped=tuple(
+            MARGIN_LEFT + column
+            for column in clipped_columns(
+                padded(profile.peak_db(), -120.0), columns, _GRAPH_CLIP_DB
+            )
+        ),
+        bands=tuple(
+            Band(x_of(segment.start), x_of(segment.end), segment.label)
+            for segment in _sound_segments(request, heard, silence_db)
+        ),
+        subtitles=subtitles,
+        target=request.limits.loudness_target,
+        time_ticks=tuple(ticks),
+        marks=tuple(
+            (MARGIN_LEFT + round((frame - report.start) * columns / span), str(number))
+            for number, frame in enumerate(marks, start=1)
+        ),
+        analyzed_until=None if missing <= 0 else x_of(profile.ticks),
+    )
+
+
+def _clock(seconds: float) -> str:
+    """書き出した動画の時刻の字 時:分:秒"""
+    whole = int(seconds)
+    return f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}"
+
+
+def _graph_caption(request: CheckRequest, heard: _Heard, marks: list[int]) -> str:
+    report, profile = heard.report, heard.profile
+    project = request.project
+
+    def when(frame: int) -> str:
+        if project is not None:
+            return f"{format_timecode(frame, project.rate)}（{frame}）"
+        return f"{_clock(frame / report.fps)}（{frame}）"
+
+    target = "タイムライン" if project is not None else f"書き出した動画 {request.path}"
+    clock = "タイムコード" if project is not None else "時:分:秒"
+    # 書き出した動画には字幕の区間が無い 帯の説明を書くと、無い帯を探させる
+    lane = " その下の細い帯は字幕のある所" if project is not None else ""
+    parts = [
+        f"音量の推移 {target} {when(report.start)}〜{when(report.end)} {report.seconds:.1f} 秒",
+        f"横は時間（下の字は{clock}） 縦はラウドネス（LUFS 上が大きい 横線は 10 LU ごと"
+        f" 下の端は {FLOOR_LUFS:g} これより静かな所は下の端に付く）",
+        "太い線は短時間（3 秒）・細い線は瞬時（400 ms）の最大",
+        f"点線は音量の基準 {request.limits.loudness_target:g} LUFS",
+        "上の端の赤い印は頭打ち（音割れのおそれ）",
+        f"線の下の帯は話し声と音楽の見分け（{_BAND_LEGEND}）{lane}",
+        f"積分ラウドネス {_lufs(profile.integrated())} LUFS"
+        f" 最大のサンプル {round(float(profile.peak_db().max()), 2)} dBFS",
+    ]
+    if marks:
+        parts.append(
+            "縦線の番号: "
+            + " / ".join(f"{number}) {when(frame)}" for number, frame in enumerate(marks, 1))
+        )
+    if not report.complete:
+        parts.append("右の灰色の所はまだ解析していない")
+    parts.append("数で読むなら analyze_audio 同じ範囲の動きは preview_range で見る")
+    parts.extend(heard.notes)
+    return " ".join(parts)
 
 
 # --- 変更 ---
@@ -5734,6 +6240,11 @@ _LOOKS_AND_PLACES_IN_PROJECT = frozenset({Outbound.PROJECT, Outbound.APP_SETTING
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 音量の推移のグラフ（#338） 検査と同じ物に、絵（グラフの画像）が加わる 字幕は重なる時刻だけを
+#: 使い、文は返さない
+_SOUND_PICTURE = frozenset(
+    {Outbound.PROJECT, Outbound.FRAMES, Outbound.APP_SETTINGS, Outbound.FILES}
+)
 #: ダッキング（#329） クリップ ID と音量の線の要約に、本人の設定（下げ幅と速さの既定）が載る
 #: 字幕は話している区間の時刻だけを使い、文は返さない 断る文には素材の名前が入りうる
 _DUCKING = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
@@ -6014,6 +6525,7 @@ OPERATIONS: tuple[Operation, ...] = (
             "字幕の出入りなど） start_frame から step おきに count 枚 各コマの下に"
             "タイムコードとフレーム番号を書く 終わりを越える分は描かず、減らしたことを返事に"
             "書く 2 コマ未満になる頼みは断る 長い範囲を見渡すときは contact_sheet を使う"
+            " 同じ範囲の音は audio_graph に並べたフレームを marks で渡すと、縦線で揃えて見られる"
         ),
         schema=_schema(
             {
@@ -6152,6 +6664,101 @@ OPERATIONS: tuple[Operation, ...] = (
         # target は "timeline" も取るので、値ごと伏せる欄（name_keys）には入れない
         # 音量の基準（本人の設定 Preferences.check_loudness_target）も結果に載る
         sends=_CHECKS,
+    ),
+    Operation(
+        name="analyze_audio",
+        description=(
+            "音を数で読む（読むだけ 何も変えない） 全体の積分ラウドネス・ラウドネスの幅（LRA）・"
+            "最大の瞬時と短時間のラウドネス・最大のサンプル（summary）と、音量の推移（levels"
+            " points 点に束ねた 各点はフレーム・短時間（3 秒）のラウドネス・瞬時（400 ms）の"
+            "最大・最大のサンプル）と、一覧（list）を返す 一覧は segments（話し声 speech・"
+            "音楽 music・BGM の上の話し声 speech_and_music・無音 silence・雑音 noise・"
+            "見分けられない unclear を 1 秒ごとに見分けた区間）か silences（無音の区間"
+            " 100 ms 刻み） 既定は今のタイムライン（書き出す前の混ぜた音） path を渡すと"
+            "書き出した動画のファイル（作品のフォルダと書き出しのフォルダの中だけ）"
+            " check_output と同じ解析を使い回す 同じ範囲を前に調べていれば読み直さない"
+            " 長い作品は裏で調べ、終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
+            "調べた所までを返す（complete が false 同じ引数でもう 1 度呼ぶと続きを返す）"
+            " 絵で見るなら audio_graph" + _SOUND_LIMITS_NOTE + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    "書き出した動画のファイル 省くと今のタイムライン（開いているシーン）を調べる"
+                ),
+                "from_frame": _integer("タイムラインのこのフレームから（既定 0）"),
+                "to_frame": _integer("タイムラインのこのフレームの手前まで（既定 終わり）"),
+                "list": {
+                    "type": "string",
+                    "enum": list(SOUND_LISTS),
+                    "description": "返す一覧 segments（見分けた区間 既定）か silences（無音）",
+                },
+                "points": _integer(
+                    f"推移の点の数（0〜{MAX_SOUND_POINTS}、既定 {DEFAULT_SOUND_POINTS}） 0 なら"
+                    " 推移を返さない 狭い範囲を細かく見たいときは from_frame・to_frame で絞る"
+                ),
+                "silence_db": _number(
+                    f"無音とみなす大きさ dBFS（既定 {DEFAULT_SOUND_SILENCE_DB:g} 話の間も拾う"
+                    " check_output の既定 -60 より大きい）"
+                ),
+                "min_silence_seconds": _number(
+                    f"silences で返す無音の最短（秒 既定 {DEFAULT_SOUND_MIN_SILENCE:g}）"
+                ),
+                "wait_seconds": _number(
+                    f"終わっていないときに待つ秒（0〜{MAX_CHECK_WAIT:g}、"
+                    f"既定 {DEFAULT_CHECK_WAIT:g}） 0 なら待たずに調べた所までを返す"
+                ),
+                **_paging(),
+            }
+        ),
+        handler=_analyze_audio,
+        # 数の並び（作品の構成）と、音量の基準（本人の設定） 書き出した動画を調べたときは
+        # target に場所が入り、調べられなかった理由の文に素材の名前が入りうる（check_output と同じ）
+        sends=_CHECKS,
+    ),
+    Operation(
+        name="audio_graph",
+        description=(
+            "音量の推移をグラフの画像で返す（読むだけ） 横は時間・縦はラウドネス（LUFS） 太い"
+            "線は短時間（3 秒）、細い線は瞬時（400 ms）の最大 点線は音量の基準 上の端の赤い印は"
+            "頭打ち 線の下の帯は話し声・音楽・無音の見分け（色の意味は返事の説明） その下の"
+            "細い帯は字幕のある所 marks に渡したフレームに番号付きの縦線を引く（preview_range"
+            " で見るコマのフレームを渡すと、動きと音を並べて確かめられる） 範囲は from_frame・"
+            "to_frame（既定 タイムライン全体） path を渡すと書き出した動画 解析は analyze_audio"
+            "・check_output と同じ物を使い回し、終わっていなければ wait_seconds まで待つ"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    "書き出した動画のファイル 省くと今のタイムライン（開いているシーン）を描く"
+                ),
+                "from_frame": _integer("タイムラインのこのフレームから（既定 0）"),
+                "to_frame": _integer("タイムラインのこのフレームの手前まで（既定 終わり）"),
+                "marks": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": f"縦線を引くフレーム（{MAX_MARKS} 個まで 範囲の中だけ）",
+                },
+                "width": _integer(
+                    f"画像の横幅（{GRAPH_MIN_WIDTH}〜{MAX_SHEET_EDGE}、既定 {GRAPH_DEFAULT_WIDTH}）"
+                ),
+                "height": _integer(
+                    f"画像の高さ（{GRAPH_MIN_HEIGHT}〜{GRAPH_MAX_HEIGHT}、"
+                    f"既定 {GRAPH_DEFAULT_HEIGHT}）"
+                ),
+                "silence_db": _number(
+                    f"見分けの帯で無音とみなす大きさ dBFS（既定 {DEFAULT_SOUND_SILENCE_DB:g}）"
+                ),
+                "wait_seconds": _number(
+                    f"終わっていないときに待つ秒（0〜{MAX_CHECK_WAIT:g}、"
+                    f"既定 {DEFAULT_CHECK_WAIT:g}）"
+                ),
+            }
+        ),
+        handler=_audio_graph,
+        # 絵（グラフ）は同意を取ってから送る（#342） 説明の文は作品の構成と音量の基準
+        # 書き出した動画を描いたときは説明に場所が入る
+        sends=_SOUND_PICTURE,
     ),
     Operation(
         name="get_app_settings",

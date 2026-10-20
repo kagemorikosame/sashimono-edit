@@ -195,6 +195,8 @@ class TestAppSettingsAreReadOnly:
             # OS のクリップボードへ絵と文字を置く（#349） 作品もアプリの設定も変えない
             "copy_snapshot_image",
             "copy_text",
+            # 音量の推移のグラフ（#338） 渡された中身を絵にするだけ 作品にも設定にも触らない
+            "draw_sound_graph",
             "export_status",
             "export_waiter",
             # 開く・新規（#349） 作品を差し替える 取り消せない操作の道具からだけ呼ぶ
