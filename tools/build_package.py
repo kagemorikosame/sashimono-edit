@@ -244,6 +244,20 @@ RUNTIME_PACKAGES = (
 #: 落ちた（組み立ての確かめの exe の中での import で分かった）
 SHARED_WITH_ADD_ONS = ("cryptography", "attr", "attrs")
 
+#: 本体の numpy の中で、本体は読まないが後から入れる部品が読む物 OpenCV（RapidOCR が読む
+#: ``cv2`` #324）は numpy 1 の時代の入口 ``numpy.core.multiarray`` を読む numpy 2 では互換の
+#: ための薄い部品で、本体が読まないので積まれず、配布版の --add-on-check で
+#: ``No module named 'numpy.core.multiarray'`` になった 後から入れた置き場の numpy は、
+#: 配布版の numpy に隠れて読まれない numpy を丸ごと積むと試験や f2py まで入るので、互換の
+#: 部品だけを名指しする
+SHARED_HIDDEN_IMPORTS = (
+    "numpy.core",
+    "numpy.core.multiarray",
+    "numpy.core._multiarray_umath",
+    "numpy.core.umath",
+    "numpy.core.numeric",
+)
+
 #: 標準ライブラリで積まない物 画面の部品（Tk）・Python 自身の試験・開発の道具
 #: どれも Sashimono も後から入れる部品も使わない Tk は DLL と Tcl の書庫で 10 MB を超える
 STDLIB_LEFT_OUT = frozenset(
@@ -503,6 +517,8 @@ def pyinstaller_arguments(work: Path, dist: Path) -> list[str]:
     for package in SHARED_WITH_ADD_ONS:
         if importlib.util.find_spec(package) is not None:
             arguments += ["--collect-submodules", package]
+    for module in SHARED_HIDDEN_IMPORTS:
+        arguments += ["--hidden-import", module]
     for module in EXCLUDED_MODULES:
         arguments += ["--exclude-module", module]
     arguments.append(str(ROOT / "src" / "sashimono" / "__main__.py"))

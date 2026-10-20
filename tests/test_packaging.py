@@ -740,6 +740,18 @@ class TestTheZip:
         excluded = _values(arguments, "--exclude-module")
         assert {"pywintypes", "pythoncom", "win32api", "win32evtlogutil", "win32pdh"} <= excluded
 
+    def test_the_old_numpy_entrance_is_kept_for_opencv(self, builder: ModuleType) -> None:
+        """後から入れる OpenCV（RapidOCR #324）が読む numpy の古い入口を積む
+
+        積まないと、飾った文字の読み取りを入れた人の配布版で ``import cv2`` が
+        ``No module named 'numpy.core.multiarray'`` で落ち、RapidOCR が 1 つも読めない
+        （CI の clean-machine の --add-on-check で落ちた）
+        """
+        arguments = builder.pyinstaller_arguments(Path("w"), Path("d"))
+        hidden = _values(arguments, "--hidden-import")
+        assert "numpy.core.multiarray" in hidden
+        assert "numpy.core._multiarray_umath" in hidden
+
     def test_the_dynamically_loaded_parts_are_collected(self, builder: ModuleType) -> None:
         """名前で読む部品はまとめて積む
 
