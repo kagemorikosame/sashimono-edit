@@ -48,6 +48,7 @@ from sashimono.ai.host import ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import check_writable
 from sashimono.ai.sheet import SheetLayout
+from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
@@ -168,6 +169,7 @@ from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
 from sashimono.ui.ai_sheet import AiSheet
+from sashimono.ui.ai_sound_graph import draw_sound_graph
 from sashimono.ui.backup_settings import (
     STATE_SUBFOLDER,
     describe_trim,
@@ -3278,6 +3280,10 @@ class MainWindow(QMainWindow):
             return self._render_for_ai(project, frame, divisor)
 
         return AiSheet(layout, render)
+
+    def draw_sound_graph(self, graph: SoundGraph) -> bytes:
+        """音量の推移のグラフを描く（#338） 作品にも画面にも触らない"""
+        return draw_sound_graph(graph)
 
     def _render_for_ai(self, project: Project, frame: int, divisor: int) -> np.ndarray:
         """AI に見せる絵を描く preview_frame もコマを並べる 1 枚も、ここを通る

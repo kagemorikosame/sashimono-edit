@@ -27,7 +27,9 @@ import numpy as np
 __all__ = [
     "ABSOLUTE_GATE",
     "LoudnessMeter",
+    "block_loudness",
     "channel_weights",
+    "gated_loudness",
     "k_weighting",
 ]
 
@@ -191,21 +193,50 @@ class LoudnessMeter:
         self._tail = joined[len(joined) - (taps - 1) :]
         return np.asarray(filtered)
 
+    @property
+    def block_samples(self) -> int:
+        """100 ms の区切り 1 つのサンプル数"""
+        return self._step
+
+    def block_energies(self) -> np.ndarray:
+        """100 ms の区切りごとの、K 特性と重みを掛けた二乗の和（測り終えた区切りだけ）
+
+        音の推移（#322）はこの並びから瞬時と短時間のラウドネスを出す 同じ K 特性を
+        もう 1 度掛けると、長い作品で畳み込みの手間が 2 倍になる
+        """
+        self._flush()
+        return np.asarray(self._energies, dtype=np.float64)
+
     def integrated(self) -> float | None:
         """積分ラウドネス（LUFS） 測れる区切りが無ければ（400 ms に満たない・無音）``None``"""
-        self._flush()
-        energies = np.asarray(self._energies)
+        energies = self.block_energies()
         if len(energies) < 4:
             return None
         # 400 ms の区切り = 100 ms の区切り 4 つ 区切りごとの平均の二乗
         blocks = (energies[:-3] + energies[1:-2] + energies[2:-1] + energies[3:]) / (4 * self._step)
-        with np.errstate(divide="ignore"):
-            levels = _OFFSET + 10.0 * np.log10(blocks)
-        kept = blocks[levels > ABSOLUTE_GATE]
-        if len(kept) == 0:
-            return None
-        relative = _OFFSET + 10.0 * math.log10(float(np.mean(kept))) + RELATIVE_GATE
-        gated = blocks[(levels > ABSOLUTE_GATE) & (levels > relative)]
-        if len(gated) == 0:
-            return None
-        return _OFFSET + 10.0 * math.log10(float(np.mean(gated)))
+        return gated_loudness(blocks)
+
+
+def block_loudness(mean_squares: np.ndarray) -> np.ndarray:
+    """区切りの平均の二乗（K 特性と重みを掛けた物）を LUFS にする 無音は ``-inf``"""
+    with np.errstate(divide="ignore"):
+        return np.asarray(_OFFSET + 10.0 * np.log10(mean_squares))
+
+
+def gated_loudness(blocks: np.ndarray) -> float | None:
+    """400 ms の区切りの平均の二乗から、2 つのゲートを通した積分ラウドネス（LUFS）
+
+    検査（:class:`LoudnessMeter`）と音の推移の道具（#322）が同じ式を通る 別々に書くと、
+    同じ作品で検査の値と推移の要約の値が食い違う
+    """
+    if len(blocks) == 0:
+        return None
+    levels = block_loudness(blocks)
+    kept = blocks[levels > ABSOLUTE_GATE]
+    if len(kept) == 0:
+        return None
+    relative = _OFFSET + 10.0 * math.log10(float(np.mean(kept))) + RELATIVE_GATE
+    gated = blocks[(levels > ABSOLUTE_GATE) & (levels > relative)]
+    if len(gated) == 0:
+        return None
+    return _OFFSET + 10.0 * math.log10(float(np.mean(gated)))
