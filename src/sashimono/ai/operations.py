@@ -2155,11 +2155,12 @@ def _highlight_result(
         elif state is not None:
             scenes, complete = _highlight_scenes(media, state, notes, missing, complete)
     transcript = media.transcript_for(query.audio)
-    looked = [name for name in query.signals if name not in missing]
-    if not looked and HIGHLIGHT_LAUGHTER in query.signals and transcript and transcript.segments:
-        # 波形を待つ間も、字幕の笑いの印だけで笑い声を探せる
-        looked = [HIGHLIGHT_LAUGHTER]
+    if HIGHLIGHT_LAUGHTER in missing and transcript and transcript.segments:
+        # 波形を待つ間も、字幕の笑いの印（笑いの主な手がかり）で笑い声を探す 動きが
+        # 見られるときだけ外すと、取り込んだ直後の映像の素材で主な手がかりを黙って落とし、
+        # AI は unavailable を見て「笑いは調べていない」と読む
         missing = [name for name in missing if name != HIGHLIGHT_LAUGHTER]
+    looked = [name for name in query.signals if name not in missing]
     if not looked:
         raise ToolError(" ".join(notes))
     duration = float(media.duration)

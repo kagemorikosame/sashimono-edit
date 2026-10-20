@@ -116,7 +116,9 @@ class TestTheList:
         result = _call(host)
         assert [row["reasons"] for row in result["highlights"]] == [["motion"]]
         assert result["complete"] is False
-        assert result["unavailable"] == ["laughter", "loud"]
+        # 字幕があるので笑いは字幕の印で調べ、音量だけが調べられない
+        assert result["unavailable"] == ["loud"]
+        assert result["signals"] == ["laughter", "motion"]
         assert host.analyzed == [_media(host).id]
 
     def test_a_moved_and_faster_clip_is_followed(self, host: FakeHost) -> None:
@@ -186,6 +188,29 @@ class TestTheList:
         assert row["laughter_from_subtitles"] is True
         assert row["start_seconds"] == pytest.approx(4.0)
         assert "（笑）" not in json.dumps(result, ensure_ascii=False)
+
+    def test_subtitles_are_kept_beside_motion(self, host: FakeHost) -> None:
+        """波形がまだで動きを見られるときも、字幕の笑いの印を使う
+
+        壊れると、映像の素材を取り込んだ直後に頼むと笑いの主な手がかりを黙って落とし、
+        字幕に「（笑）」がある所を盛り上がりとして返さない
+        """
+        media = _media(host)
+        transcript = media.transcript
+        assert transcript is not None
+        marked = replace(transcript.segments[1], text="（笑）")
+        changed = replace(
+            transcript, segments=(transcript.segments[0], marked, transcript.segments[2])
+        )
+        host.apply_commands([SetTranscript(media.id, changed)], "字幕")
+        host.scene_states[media.id] = SceneState(_still(busy=(7.5, 9.0)), running=False)
+        result = _call(host, order="time")
+        assert "laughter" in result["signals"]
+        assert "laughter" not in result["unavailable"]
+        rows = result["highlights"]
+        assert rows[0]["laughter_from_subtitles"] is True
+        assert rows[0]["start_seconds"] == pytest.approx(4.0)
+        assert any("motion" in row["reasons"] for row in rows)
 
 
 class TestWaiting:

@@ -283,22 +283,34 @@ _LAUGH_RUN = re.compile(
 #: 字幕の文から外す飾り 「あははは！」の「！」で笑いの割合を下げない 句点は文の句点の
 #: 見張り（tools/punctuation.py）が文章と取り違えないよう、番号で足す
 _PUNCTUATION = re.compile("[\\s、" + chr(0x3002) + "，．,.!?！？…・ー〜~「」『』]+")
-#: 笑いの音 割合を数える物
+#: 笑いの音 文がこれだけでできているかを見る 「あ」「っ」は「あはは」「ふふっ」の飾り
 _LAUGH_SOUND = re.compile(r"[はハひヒふフへヘあアっッ]|[wｗWＷ]|草|笑|ha|he|hi", re.IGNORECASE)
+#: 笑いの核の音 「あ」「っ」だけの文（「あああ」「あっ」）は驚きや嘆きで、笑いではない
+#: 「草」はそれ 1 字で笑いを表すので 2 つ分に数える
+_LAUGH_CORE = re.compile(r"[はハひヒふフへヘ]|[wｗWＷ]|草|ha|he|hi", re.IGNORECASE)
+#: かなの笑いの音だけの文 2 字（「はは」）は「母」のような言葉と見分けが付かない
+_KANA_LAUGH = re.compile(r"[はハひヒふフへヘあアっッ]+")
 
 
 def is_laughter_text(text: str) -> bool:
     """字幕の文が笑いを書いた物か
 
-    書き添え（「（笑）」）・同じ笑いの音が 3 つ以上続く所・ほとんど笑いの音だけの文
-    （「あはは」）を笑いと見る 「笑顔」のように字の中に「笑」があるだけの文は見ない
+    書き添え（「（笑）」）・同じ笑いの音が 3 つ以上続く所・笑いの音だけでできていて核の音
+    （は・ひ・ふ・へ・w・草）が 2 つ以上ある文（「あはは」「ｗｗ」「草」）を笑いと見る
+    「笑顔」のように字の中に「笑」があるだけの文や、「ああ、はい」のような相づちは見ない
     """
     if _LAUGH_NOTE.search(text) or _LAUGH_RUN.search(text):
         return True
     body = _PUNCTUATION.sub("", text)
-    sounds = sum(len(found) for found in _LAUGH_SOUND.findall(body))
-    # 2 文字（「はは」）は「母」と見分けが付かないので、3 文字から数える
-    return sounds >= 3 and sounds / len(body) >= 0.75
+    # 笑いの音以外が 1 字でも混ざれば笑いと見ない 割合で見ると「ああ、はい」「あっ、はい」の
+    # ような相づちが 4 字のうち 3 字で笑いになり、ふつうの話し声を盛り上がりとして返した
+    if not body or _LAUGH_SOUND.sub("", body):
+        return False
+    core = sum(2 if found == "草" else 1 for found in _LAUGH_CORE.findall(body))
+    if core < 2:
+        return False
+    # 「ｗｗ」「草」は 2 字以下でも笑いと決まるが、かなの 2 字は言葉と取り違える
+    return len(body) >= 3 or _KANA_LAUGH.fullmatch(body) is None
 
 
 def _with_subtitles(
