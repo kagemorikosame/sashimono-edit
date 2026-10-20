@@ -133,6 +133,64 @@ def test_interval_scores_follow_the_shift(tool: ModuleType) -> None:
     assert shifted["edge_median"] == 0.5
 
 
+def test_interval_scores_without_tool_edges(tool: ModuleType) -> None:
+    """道具が無音を 1 つも見つけず端が無くても、数え終わって端のずれを「測れない」にすること
+
+    落ちると、しきい値を変えた回や無音の少ない素材で台本が止まり、同じ回の結果が 1 行も残らない
+    0.0 にすると「ずれ無し」と読めてしまい、何も切れていない道具を良いと取り違える
+    """
+    whole = tool.interval_scores([[0.0, 10.0]], [[0.0, 4.0], [6.0, 10.0]], 10.0)
+    assert whole["edge_median"] is None
+    assert whole["iou"] == 0.8
+    # 正解にも端が無ければ、ずれは無いと言える
+    assert tool.interval_scores([[0.0, 10.0]], [[0.0, 10.0]], 10.0)["edge_median"] == 0.0
+
+
+def test_one_failing_task_keeps_the_other_results(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """書き出しや道具の 1 つが例外を投げても、その課題を failed にして同じ回のほかの行を残すこと
+
+    落ちると、GPU の無い機械や検査の時間切れで、それまで数分かけて数えた結果が全部捨てられる
+    例外の文には素材の置き場が混じりうるので、結果には固定の理由だけを書く
+    """
+    tool, eval_dir, book = folder
+    tool.command_draft(eval_dir, book, [], transcriber=_fake_transcriber)
+    results = tmp_path / "results.jsonl"
+    secret = str(eval_dir.root)
+
+    def exporter(path: Path, transcript: Transcript | None, output: Path) -> dict[str, Any]:
+        raise RuntimeError(f"書き出しに失敗 {path} {secret}")
+
+    def transcriber(path: Path, params: object) -> Transcript:
+        raise OSError(f"字幕起こしに失敗 {path}")
+
+    records = tool.command_run(
+        eval_dir,
+        book,
+        [],
+        results=results,
+        transcriber=transcriber,
+        exporter=exporter,
+        commit="abc",
+    )
+    by_task = {(r["material"], r["task"]): r for r in records}
+    assert by_task["E01", "scenes"]["status"] == "ok"
+    assert by_task["E02", "silence"]["status"] == "ok"
+    assert (by_task["E02", "subtitles"]["status"], by_task["E02", "subtitles"]["reason"]) == (
+        "failed",
+        "tool-error",
+    )
+    assert (by_task["E02", "export"]["status"], by_task["E02", "export"]["reason"]) == (
+        "failed",
+        "export-error",
+    )
+    written = [json.loads(line) for line in results.read_text(encoding="utf-8").splitlines()]
+    assert len(written) == len(records) == 5
+    text = results.read_text(encoding="utf-8")
+    assert "secretclip" not in text and "evaldir" not in text and "失敗" not in text
+
+
 def test_character_error_rate(tool: ModuleType) -> None:
     """字幕の文字の誤り率が、句読点や空白の違いを数えないこと
 

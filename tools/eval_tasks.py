@@ -545,7 +545,7 @@ def _edges(ranges: Sequence[Sequence[float]], duration: float) -> list[float]:
 
 def interval_scores(
     predicted: Sequence[Sequence[float]], answer: Sequence[Sequence[float]], duration: float
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """残した区間の一致 iou は残した所の重なり agreement は残す・削るが合った割合
 
     境界のずれは、正解の端ごとに一番近い道具の端までの秒の中央値 一致率だけだと、
@@ -559,11 +559,20 @@ def interval_scores(
     same = sum(1 for a, b in zip(mine, truth, strict=True) if a == b)
     answer_edges = _edges(answer, duration)
     mine_edges = _edges(predicted, duration)
-    offsets = [min(abs(edge - other) for other in mine_edges) for edge in answer_edges]
+    # 道具の端が無いまま min() に渡すと空の列で止まり、同じ回のほかの結果まで書かれない
+    offsets = (
+        [min(abs(edge - other) for other in mine_edges) for edge in answer_edges]
+        if mine_edges
+        else []
+    )
+    # 正解に端があるのに道具に端が無いときは測れない（None） 0.0 にすると「ずれ無し」と読めて、
+    # 何も切らなかった道具を良いと取り違える 正解にも端が無ければ、ずれは無い（0.0）
+    unmeasured = None if answer_edges else 0.0
+    edge_median = round(statistics.median(offsets), 3) if offsets else unmeasured
     return {
         "iou": round(both / either, 4) if either else 1.0,
         "agreement": round(same / cells, 4),
-        "edge_median": round(statistics.median(offsets), 3) if offsets and mine_edges else 0.0,
+        "edge_median": edge_median,
         "kept_seconds": round(sum(mine) * GRID_SECONDS, 2),
         "answer_kept_seconds": round(sum(truth) * GRID_SECONDS, 2),
     }
@@ -910,7 +919,7 @@ def with_facts(truth: Mapping[str, Any], answer: Mapping[str, Any]) -> dict[str,
 
 def score(
     task: str, value: Mapping[str, Any], answer: Mapping[str, Any], book: TaskBook
-) -> dict[str, float]:
+) -> Mapping[str, float | None]:
     tolerances = book.tolerances
     if task == EXPORT:
         raise ValueError("書き出しの課題は正解と比べない")
@@ -1044,31 +1053,43 @@ def command_run(
             truth = answer.get("tasks", {}).get(task)
             if path is None:
                 record.update(status="skipped", reason="no-material")
-            elif task == EXPORT:
-                began = time.perf_counter()
-                transcript = once(path, resolved)
-                folder.exports.mkdir(parents=True, exist_ok=True)
-                metrics = export(path, transcript, folder.exports / f"{material.id}.mp4")
-                record.update(
-                    status="ok",
-                    seconds=round(time.perf_counter() - began, 2),
-                    metrics=metrics,
-                    params={"subtitles": transcript is not None},
-                )
-            elif truth is None:
-                record.update(status="skipped", reason="no-answer")
-            else:
-                prediction = predict(task, path, resolved, once, facts)
-                if prediction.value is None:
-                    record.update(status="skipped", reason=prediction.reason)
-                else:
+                records.append(record)
+                continue
+            # 1 つの課題の失敗（GPU の無い機械の書き出し・検査の時間切れ・字幕起こしの部品の
+            # 不具合）で止めると、数分かけて数えた同じ回のほかの結果が 1 行も残らない
+            # 例外の文には素材の置き場が混じりうるので、結果には固定の理由だけを書き、
+            # 画面にも例外の型の名前だけを出す
+            try:
+                if task == EXPORT:
+                    began = time.perf_counter()
+                    transcript = once(path, resolved)
+                    folder.exports.mkdir(parents=True, exist_ok=True)
+                    metrics = export(path, transcript, folder.exports / f"{material.id}.mp4")
                     record.update(
                         status="ok",
-                        provisional=bool(truth.get("provisional", True)),
-                        seconds=prediction.seconds,
-                        metrics=score(task, prediction.value, with_facts(truth, answer), book),
-                        params=resolved.record(task),
+                        seconds=round(time.perf_counter() - began, 2),
+                        metrics=metrics,
+                        params={"subtitles": transcript is not None},
                     )
+                elif truth is None:
+                    record.update(status="skipped", reason="no-answer")
+                else:
+                    prediction = predict(task, path, resolved, once, facts)
+                    if prediction.value is None:
+                        record.update(status="skipped", reason=prediction.reason)
+                    else:
+                        record.update(
+                            status="ok",
+                            provisional=bool(truth.get("provisional", True)),
+                            seconds=prediction.seconds,
+                            metrics=score(task, prediction.value, with_facts(truth, answer), book),
+                            params=resolved.record(task),
+                        )
+            except Exception as error:
+                print(f"{material.id} {task}: 失敗した（{type(error).__name__}）")
+                record.update(
+                    status="failed", reason="export-error" if task == EXPORT else "tool-error"
+                )
             records.append(record)
     append_results(results, records, names)
     return records
