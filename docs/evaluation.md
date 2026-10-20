@@ -18,7 +18,7 @@
 
 ## 用意
 
-1. 外のフォルダを作る（例 `D:\sashimono-eval`） 中に `manifest.json` を置く
+1. 外のフォルダを作る（例 `D:\eval-material`） 中に `manifest.json` を置く
 
    ```json
    {"E04": "D:/どこか/素材その1.mp4", "E05": "D:/どこか/素材その2.mp4"}
