@@ -5,9 +5,9 @@
   "subtitle_seconds": 0.5
  },
  "materials": [
-  {"id": "E04", "tasks": ["silence", "subtitles"]},
+  {"id": "E04", "tasks": ["silence", "subtitles", "export"]},
   {"id": "E05", "tasks": ["silence", "talk", "subtitles"]},
-  {"id": "E09", "tasks": ["silence", "scenes"]},
+  {"id": "E09", "tasks": ["silence", "scenes", "export"]},
   {"id": "E11", "tasks": ["scenes"]}
  ]
 }

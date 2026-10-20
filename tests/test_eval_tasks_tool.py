@@ -85,7 +85,7 @@ def folder(tool: ModuleType, tmp_path: Path) -> tuple[ModuleType, Any, Any]:
             {
                 "materials": [
                     {"id": "E01", "tasks": ["scenes"]},
-                    {"id": "E02", "tasks": ["silence", "talk", "subtitles"]},
+                    {"id": "E02", "tasks": ["silence", "talk", "subtitles", "export"]},
                 ]
             }
         ),
@@ -185,19 +185,47 @@ def test_tool_stage_round_trip(folder: tuple[ModuleType, Any, Any], tmp_path: Pa
     assert answer["tasks"]["talk"]["boundaries"] == [3.0]
 
     results = tmp_path / "results.jsonl"
+    heard: list[Path] = []
+    exported: list[tuple[Path, int]] = []
+
+    def transcriber(path: Path, params: object) -> Transcript:
+        heard.append(path)
+        return _fake_transcriber(path, params)
+
+    def exporter(path: Path, transcript: Transcript | None, output: Path) -> dict[str, Any]:
+        exported.append((output, 0 if transcript is None else len(transcript.segments)))
+        return {"problems": 0, "loudness": None, "complete": True}
+
     first = tool.command_run(
-        eval_dir, book, [], results=results, transcriber=_fake_transcriber, commit="abc"
+        eval_dir,
+        book,
+        [],
+        results=results,
+        transcriber=transcriber,
+        exporter=exporter,
+        commit="abc",
     )
     second = tool.command_run(
-        eval_dir, book, [], results=results, transcriber=_fake_transcriber, commit="abc"
+        eval_dir,
+        book,
+        [],
+        results=results,
+        transcriber=transcriber,
+        exporter=exporter,
+        commit="abc",
     )
+    # 字幕と書き出しの両方を持つ素材でも、字幕起こしは 1 回の実行で 1 回だけ
+    assert len(heard) == 2
+    assert exported[0] == (eval_dir.exports / "E02.mp4", 2)
     by_task = {(r["material"], r["task"]): r for r in first}
     assert by_task["E01", "scenes"]["metrics"]["f1"] == 1.0
     assert by_task["E01", "scenes"]["metrics"]["answer"] == len(CUTS)
     assert by_task["E02", "silence"]["metrics"]["iou"] == 1.0
     assert by_task["E02", "subtitles"]["metrics"]["cer"] == 0.0
     assert by_task["E02", "talk"]["reason"] == "no-tool"
-    assert all(r["provisional"] for r in first if r["status"] == "ok")
+    assert by_task["E02", "export"]["params"] == {"subtitles": True}
+    assert "provisional" not in by_task["E02", "export"]
+    assert all(r["provisional"] for r in first if r["status"] == "ok" and r["task"] != "export")
     assert [r.get("metrics") for r in first] == [r.get("metrics") for r in second]
     text = results.read_text(encoding="utf-8")
     assert "secretclip" not in text and "evaldir" not in text and "\\u" not in text
@@ -292,3 +320,50 @@ def test_task_book_rejects_names(tool: ModuleType, tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="鍵"):
         tool.load_tasks(path)
+
+
+def test_app_runtime_is_read_from_behind(
+    tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """アプリが入れた部品の置き場を、探す道の後ろへ足すこと 別の Python 向けなら足さないこと
+
+    前へ足すと、置き場の別の版の numpy などが .venv の物より先に読まれ、本体の試験と違う
+    部品で数える 別の Python 向けの置き場を足すと、字幕起こしを始めた所で import が落ちる
+    """
+    from sashimono.runtime import ABI_MARKER, python_abi
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    (stale / ABI_MARKER).write_text(json.dumps({"asr": "cp200"}), encoding="utf-8")
+    assert tool.load_app_runtime(stale) is None
+    assert str(stale) not in sys.path
+
+    fitting = tmp_path / "fitting"
+    fitting.mkdir()
+    (fitting / ABI_MARKER).write_text(json.dumps({"asr": python_abi()}), encoding="utf-8")
+    first = sys.path[0]
+    assert tool.load_app_runtime(fitting) == fitting
+    assert sys.path[0] == first
+    assert str(fitting) in sys.path
+    assert tool.load_app_runtime(tmp_path / "missing") is None
+
+
+@pytest.mark.usefixtures("gpu", "qt_application")
+def test_export_and_check_on_a_short_video(tool: ModuleType, tmp_path: Path) -> None:
+    """字幕を焼き込んで書き出し、書き出した動画の検査の数が結果の形で返ること
+
+    書き出しか検査の呼び方が本体とずれると、書き出しの課題が実物の素材で毎回落ち、
+    書き出しで起きる問題（黒いコマ・音の欠け）の増減が数に出なくなる
+    """
+    from tests.check_media import write_video
+
+    source = write_video(tmp_path / "talk.mp4", 8.0, tone_db=-14.0)
+    output = tmp_path / "out.mp4"
+    metrics = tool.export_and_check(source, _fake_transcriber(source, None), output)
+    assert output.exists()
+    assert metrics["complete"] is True
+    assert metrics["subtitle_clips"] == 2
+    assert metrics["count_length"] == 0
+    assert abs(float(metrics["length_error"])) < 0.1
+    tool.guard_record({"metrics": metrics}, [])

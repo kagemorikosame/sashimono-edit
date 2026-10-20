@@ -14,6 +14,11 @@ r"""編集の正しさを、人の編集（正解）と比べて数える（#345
 道具の段は AI を通さず、編集の道具が使う処理（無音の検出・場面の検出・字幕起こし）を
 直に呼ぶ 決まった結果が出て無料なので、既定値や感度を変えた前と後を比べるのに使う
 「話の区切り」は道具が無い（AI が字幕を読んで決める）ので、道具の段では数えない
+「書き出し」は正解と比べず、字幕を焼き込んで書き出した動画を ``check_output`` と同じ検査に
+掛け、見つかった問題の数と書き出しの秒を数える（短い素材 2 本だけ GPU が要る）
+
+字幕起こしは開発の環境（.venv）へ入れず、アプリが入れた部品（LOCALAPPDATA の Sashimono の
+runtime）を読む（:func:`load_app_runtime`） 部品の無い機械では字幕の課題を飛ばす
 
 正解は、本人が直すまでは道具の下書き（仮の正解）で、結果の行に ``provisional`` の印を
 付ける 仮の正解と同じ道具の結果を比べると 1.0 に近くなるのは当たり前で、その数は
@@ -66,7 +71,12 @@ SILENCE = "silence"
 TALK = "talk"
 SCENES = "scenes"
 SUBTITLES = "subtitles"
-TASKS = (SILENCE, TALK, SCENES, SUBTITLES)
+#: 字幕を焼き込んで書き出し、書き出した動画を検査する 正解と比べる課題ではなく、
+#: 書き出せたかと、検査（``check_output`` と同じ）で見つかった問題の数を数える
+EXPORT = "export"
+TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT)
+#: 正解を持つ課題 下書きと取り込みはこれだけ
+ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES)
 
 #: 課題の定義と、結果を足していく所（どちらもリポジトリの中）
 TASKS_FILE = ROOT / "eval" / "tasks.json"
@@ -202,6 +212,11 @@ class EvalDir:
 
     def answer_path(self, material: str) -> Path:
         return self.answers / f"{material}.json"
+
+    @property
+    def exports(self) -> Path:
+        """書き出しの課題が書く動画 回すたびに上書きする（見返せるように残す）"""
+        return self.root / "exports"
 
     def draft_path(self, material: str, task: str) -> Path:
         return self.drafts / f"{material}_{task}.sme"
@@ -352,12 +367,45 @@ def transcribe_with_app(path: Path, params: ToolParams) -> Transcript | None:
     from sashimono.asr import default_backend as asr_backend
 
     activate_runtime()
+    load_app_runtime()
     backend = asr_backend()
     if not backend.is_available():
         return None
     options = TranscribeOptions(model=params.asr_model) if params.asr_model else TranscribeOptions()
     transcript = backend.transcribe(path, options)
     return None if transcript is None else clean_transcript(transcript)
+
+
+def app_runtime_dir() -> Path:
+    """配布版のアプリが画面のボタンから入れた部品の置き場（LOCALAPPDATA の Sashimono の runtime）"""
+    from sashimono.core import userdirs
+    from sashimono.runtime import _RUNTIME_DIR
+
+    return userdirs.data_root() / _RUNTIME_DIR
+
+
+def load_app_runtime(target: Path | None = None) -> Path | None:
+    """アプリが入れた字幕起こしの部品を、評価の台本から読めるようにする 読めた置き場を返す
+
+    開発の環境（.venv）へは字幕起こしを入れない（2026-10-20 本人が決めた 2 GB 近くあり、
+    アプリが入れた物と同じ物を二重に持つことになる） 開発の実行ではアプリの
+    ``activate_runtime`` が何もしない（配布版だけの決まり）ので、ここで同じ置き場を読む
+
+    探す道の**後ろ**へ足す 前へ足すと、置き場にある numpy などの別の版が .venv の物より
+    先に読まれ、本体の試験と違う部品で数えることになる 別の Python 向けに入れた置き場は
+    読まない（拡張モジュールが読めず、import した所で落ちる）
+    """
+    from sashimono.runtime import python_abi, read_path_files, runtime_abi
+
+    place = target if target is not None else app_runtime_dir()
+    if not place.is_dir():
+        return None
+    found = runtime_abi(place, "asr")
+    if found is not None and found != python_abi():
+        return None
+    if str(place) not in sys.path:
+        read_path_files(str(place))
+    return place
 
 
 def segments_of(transcript: Transcript) -> list[list[Any]]:
@@ -369,6 +417,111 @@ def talk_from_silences(silences: Sequence[tuple[float, float]]) -> list[float]:
     return [
         round((start + end) / 2, 3) for start, end in silences if end - start >= TALK_PAUSE_SECONDS
     ]
+
+
+# --- 書き出しと検査 ---
+
+#: 書き出しの課題を行う物 試験では GPU の無い CI でも回るよう偽物に差し替えられる
+type Exporter = Callable[[Path, Transcript | None, Path], dict[str, float | int | bool | None]]
+
+#: 書き出した動画の検査を待つ上限（秒） 短い素材 2 本だけに当てる課題なので、数分で終わる
+CHECK_TIMEOUT_SECONDS = 1800.0
+
+
+def _application() -> object:
+    """書き出し（GPU の合成）と検査（Qt のスレッド）に要る Qt の入れ物 無ければ作る"""
+    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtWidgets import QApplication
+
+    from sashimono.engine.gpu import preferred_surface_format
+
+    existing = QApplication.instance()
+    if existing is not None:
+        return existing
+    QSurfaceFormat.setDefaultFormat(preferred_surface_format())
+    return QApplication([])
+
+
+def burned_project(media_path: Path, transcript: Transcript | None) -> Project:
+    """素材を置き、字幕があれば画面の〔焼き込み〕と同じ既定の見た目で焼き込んだ作品"""
+    from sashimono.core.commands.subtitle import (
+        burn_defaults,
+        burn_subtitles,
+        subtitle_wrap_width,
+    )
+    from sashimono.effects.sources import TEXT
+    from sashimono.engine.decode.probe import probe_media
+    from sashimono.ui.workspace import Preferences
+
+    media = probe_media(media_path)
+    document = _project_for(media, "export")
+    if transcript is not None and transcript.segments:
+        document.execute(SetTranscript(media.id, transcript))
+        settings = document.project.settings
+        # 折り返しの幅は本人の設定の既定（知らない人が困らない側）に合わせる
+        wrap = subtitle_wrap_width(settings.width, Preferences().subtitle_wrap_share)
+        base = TEXT.create(**burn_defaults(settings.height, wrap))
+        for command in burn_subtitles(document.project, base):
+            document.execute(command)
+    return document.project
+
+
+def export_and_check(
+    media_path: Path, transcript: Transcript | None, output: Path
+) -> dict[str, float | int | bool | None]:
+    """字幕を焼き込んで書き出し、書き出した動画を ``check_output`` と同じ検査に掛ける
+
+    数えるのは、問題の数（種類ごと）・音量（LUFS）・長さのずれ・書き出しと検査の秒
+    字幕のはみ出しは書き出した動画では調べられない（検査の決まり）ので数に入らない
+    """
+    from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest
+    from sashimono.engine.checks.scan import KINDS
+    from sashimono.engine.encode.exporter import ExportSettings, export_project
+
+    _application()
+    project = burned_project(media_path, transcript)
+    expected = float(project.duration * project.rate.frame_duration)
+    began = time.perf_counter()
+    export_project(project, ExportSettings(path=output))
+    exported = time.perf_counter()
+    job = CheckJob()
+    try:
+        stat = output.stat()
+        job.start(
+            CheckRequest(
+                CheckLimits(expected_seconds=expected),
+                path=output,
+                stamp=(stat.st_size, stat.st_mtime_ns),
+            )
+        )
+        if not job.waiter()(CHECK_TIMEOUT_SECONDS):
+            raise RuntimeError("書き出した動画の検査が時間内に終わらなかった")
+        state = job.state()
+    finally:
+        job.close()
+    if state.failure is not None or state.report is None:
+        raise RuntimeError(f"書き出した動画を検査できなかった: {state.failure}")
+    report = state.report
+    counts = report.counts()
+    metrics: dict[str, float | int | bool | None] = {
+        "problems": len(report.problems),
+        "complete": report.complete,
+        "loudness": None if report.loudness is None else round(report.loudness, 2),
+        "length_error": round(report.seconds - expected, 3),
+        # 焼き込んだ字幕はテキストのクリップ トラックの名前で数えると、方式や話し手の数で
+        # 名前が変わったときに 0 と数える
+        "subtitle_clips": sum(
+            1
+            for track in project.timeline.tracks
+            for clip in track.clips
+            if clip.source is not None and clip.source.kind == "text"
+        ),
+        "export_seconds": round(exported - began, 2),
+        "check_seconds": round(time.perf_counter() - exported, 2),
+    }
+    for kind in KINDS:
+        metrics[f"count_{kind}"] = counts.get(kind, 0)
+    return metrics
 
 
 # --- 一致率 ---
@@ -759,6 +912,8 @@ def score(
     task: str, value: Mapping[str, Any], answer: Mapping[str, Any], book: TaskBook
 ) -> dict[str, float]:
     tolerances = book.tolerances
+    if task == EXPORT:
+        raise ValueError("書き出しの課題は正解と比べない")
     if task == SILENCE:
         return interval_scores(value["kept"], answer["kept"], float(answer["duration"]))
     if task == SCENES:
@@ -797,6 +952,8 @@ def command_draft(
         tasks: dict[str, Any] = answer.setdefault("tasks", {})
         silences: list[tuple[float, float]] | None = None
         for task in material.tasks:
+            if task not in ANSWERED:
+                continue
             existing = tasks.get(task)
             if existing is not None and not existing.get("provisional", True):
                 print(f"{material.id} {task}: 人が直した正解があるので触らない")
@@ -824,8 +981,8 @@ def command_draft(
 
 def command_adopt(folder: EvalDir, material: str, task: str, source: Path | None = None) -> None:
     """直した .sme を正解にする 仮の印を外す"""
-    if task not in TASKS:
-        raise SystemExit(f"課題が分からない: {task}")
+    if task not in ANSWERED:
+        raise SystemExit(f"正解を持つ課題ではない: {task}")
     manifest = folder.manifest()
     path = manifest.get(material)
     if path is None:
@@ -841,6 +998,18 @@ def command_adopt(folder: EvalDir, material: str, task: str, source: Path | None
     print(f"{material} {task}: 直した正解を取り込んだ")
 
 
+def _remembered(transcriber: Transcriber) -> Transcriber:
+    """1 本の素材の中で、字幕起こしの結果を覚えて使い回す包み"""
+    memo: dict[str, Transcript | None] = {}
+
+    def once(media: Path, chosen: ToolParams) -> Transcript | None:
+        if "value" not in memo:
+            memo["value"] = transcriber(media, chosen)
+        return memo["value"]
+
+    return once
+
+
 def command_run(
     folder: EvalDir,
     book: TaskBook,
@@ -849,10 +1018,12 @@ def command_run(
     results: Path = RESULTS_FILE,
     params: ToolParams | None = None,
     transcriber: Transcriber = transcribe_with_app,
+    exporter: Exporter | None = None,
     commit: str | None = None,
 ) -> list[dict[str, object]]:
     """道具の段を回して正解と比べ、結果を足す 足した行を返す"""
     resolved = params or ToolParams()
+    export = exporter if exporter is not None else export_and_check
     manifest = folder.manifest()
     names = forbidden_names(folder, manifest)
     stamp = {
@@ -866,15 +1037,28 @@ def command_run(
         path = manifest.get(material.id)
         answer = folder.read_answer(material.id)
         facts = media_facts(path) if path is not None else MediaFacts(0.0, 0.0)
+        # 字幕と書き出しの両方を持つ素材で、字幕起こしを 2 回走らせない（長い素材で数分かかる）
+        once = _remembered(transcriber)
         for task in material.tasks:
             record: dict[str, object] = {**stamp, "material": material.id, "task": task}
             truth = answer.get("tasks", {}).get(task)
             if path is None:
                 record.update(status="skipped", reason="no-material")
+            elif task == EXPORT:
+                began = time.perf_counter()
+                transcript = once(path, resolved)
+                folder.exports.mkdir(parents=True, exist_ok=True)
+                metrics = export(path, transcript, folder.exports / f"{material.id}.mp4")
+                record.update(
+                    status="ok",
+                    seconds=round(time.perf_counter() - began, 2),
+                    metrics=metrics,
+                    params={"subtitles": transcript is not None},
+                )
             elif truth is None:
                 record.update(status="skipped", reason="no-answer")
             else:
-                prediction = predict(task, path, resolved, transcriber, facts)
+                prediction = predict(task, path, resolved, once, facts)
                 if prediction.value is None:
                     record.update(status="skipped", reason=prediction.reason)
                 else:
@@ -891,7 +1075,7 @@ def command_run(
 
 
 #: 表に出す主な数 課題ごとに 1 つ
-HEADLINE = {SILENCE: "iou", SCENES: "f1", TALK: "f1", SUBTITLES: "cer"}
+HEADLINE = {SILENCE: "iou", SCENES: "f1", TALK: "f1", SUBTITLES: "cer", EXPORT: "problems"}
 
 
 def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -910,7 +1094,8 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         previous = history[-2] if len(history) > 1 else None
         before = None if previous is None else float(previous["metrics"][name])
         change = "" if before is None else f"{value - before:+.4f}"
-        mark = "仮" if now.get("provisional") else "人"
+        # 書き出しの課題は正解を持たないので、仮も人も付けない
+        mark = "-" if "provisional" not in now else ("仮" if now["provisional"] else "人")
         # 道具の値を変えて回した差と、コードを変えた差を取り違えないように印を付ける
         # 正解を直した回（仮から人へ）も、数の動きが道具の変化ではないので印を付ける
         notes = []
@@ -945,7 +1130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     draft.add_argument("--force", action="store_true", help="仮の正解を作り直す")
     adopt = sub.add_parser("adopt", help="直した .sme を正解にする")
     adopt.add_argument("id")
-    adopt.add_argument("task", choices=TASKS)
+    adopt.add_argument("task", choices=ANSWERED)
     adopt.add_argument("--from", dest="source", type=Path, help="直した .sme（省くと下書きの所）")
     run = sub.add_parser("run", help="道具の段を回して結果を足す")
     tool_options(run)
