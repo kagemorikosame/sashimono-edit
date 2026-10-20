@@ -252,15 +252,20 @@ def _head_grade(clip: Clip) -> Effect | None:
 
 
 def _has_auto_values(clip: Clip) -> bool:
-    """頭の拡張色調補正の自動補正の欄に、0 でない値（か動き）が入っているか"""
+    """頭の拡張色調補正の自動補正の欄に、0 へ戻すべき値が入っているか
+
+    キーフレームで動いている欄は人が付けた動きなので戻さない（戻すと動きが消える）
+    動きを戻す物に数えると、直す物の無いクリップで断ることになり、一緒に頼んだほかの
+    クリップも直らない（#387 の CodeRabbit の指摘） 直す物があるクリップで動きを断る
+    :func:`_grade_commands` の守りはそのまま
+    """
     head = _head_grade(clip)
     if head is None:
         return False
-    for name in AUTO_GRADE_PARAMS:
-        value = head.params.get(name)
-        if isinstance(value, AnimatedValue) and (value.is_animated or value.static != 0.0):
-            return True
-    return False
+    values = [head.params.get(name) for name in AUTO_GRADE_PARAMS]
+    if any(isinstance(value, AnimatedValue) and value.is_animated for value in values):
+        return False
+    return any(isinstance(value, AnimatedValue) and value.static != 0.0 for value in values)
 
 
 def _clip_pixels(source: FixSource, project: Project, clip: Clip, *, graded_head: bool) -> Any:

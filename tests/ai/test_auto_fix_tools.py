@@ -202,6 +202,23 @@ class TestAutoColor:
         assert result["unchanged_clip_ids"] == [str(work.picture.id)]
         assert work.host.document.project == before
 
+    def test_a_moving_grade_on_a_good_picture_does_not_stop_the_others(self, work: Work) -> None:
+        # 壊れると、整っている素材の頭の補正をキーフレームで動かしているだけで断り、一緒に頼んだ
+        # ほかのクリップも直らない（#387 の CodeRabbit の指摘） 動きは人の物なので残す
+        moving = AnimatedValue(5.0, keyframes=(Keyframe(0, 0.0), Keyframe(30, 20.0)))
+        grade = registry.require(GRADE_KIND).create().with_param("luma_gain", moving)
+        work.host.apply_commands([AddEffect(work.picture.id, grade, index=0)], "人")
+        work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.0, light=1.0))
+        work.host.filmstrips[work.other.id] = _strip(_scene(dark=0.25, light=0.7))
+        result = _call(
+            work.host,
+            "auto_color",
+            {"clip_ids": [str(work.picture.id), str(work.second.id)]},
+        )
+        assert result["unchanged_clip_ids"] == [str(work.picture.id)]
+        assert work.clip(work.picture).effects[0].params["luma_gain"] == moving
+        assert work.clip(work.second).effects[0].kind == GRADE_KIND
+
     def test_the_preference_is_the_default_strength(self, work: Work) -> None:
         # 壊れると、設定画面で選んだ強さが AI に効かない
         work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.25, light=0.7))
