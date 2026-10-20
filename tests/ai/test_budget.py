@@ -593,6 +593,62 @@ def test_the_session_counts_what_the_sdk_reports(host: FakeHost) -> None:
     assert turn.tokens == 7
 
 
+@pytest.mark.parametrize("is_error", [False, True])
+def test_the_output_is_settled_by_the_result(host: FakeHost, is_error: bool) -> None:
+    # 壊れると、途中の知らせの仮の出力（応答の始めの数トークン）だけを数え、長い返事を書いた
+    # 指示でも出力がほぼ 0 になり、1 回と 1 日のトークンの上限が遅れて効く
+    # 値は claude-agent-sdk 0.2.164 で実際に流れてきた形（途中の知らせは 6 結果は 332）
+    sdk = pytest.importorskip("claude_agent_sdk", reason="AI 連携の実行環境が未導入")
+    from sashimono.ai.session import AgentSession, EventKind
+
+    bridge = EditorBridge(host)
+    bridge.begin_turn()
+    session = AgentSession(bridge)
+    for _ in range(2):
+        session._translate(
+            sdk.AssistantMessage(
+                content=[sdk.TextBlock(text="切ります")],
+                model="claude",
+                usage={"input_tokens": 3455, "output_tokens": 6},
+                message_id="msg_1",
+            )
+        )
+    result = sdk.ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=is_error,
+        num_turns=1,
+        session_id="s",
+        usage={"input_tokens": 3455, "output_tokens": 332},
+        result="失敗" if is_error else "済み",
+    )
+    # 同じ結果を 2 度受けても 2 重に足さない
+    session._translate(result)
+    session._translate(result)
+    turn = bridge.usage.turn_usage()
+    assert turn is not None
+    assert turn.tokens == 3455 + 332
+    kinds = []
+    while not session._events.empty():
+        kinds.append(session._events.get_nowait().kind)
+    # 失敗の知らせは今のまま出す
+    assert (EventKind.ERROR in kinds) is is_error
+
+
+def test_a_result_never_lowers_the_count() -> None:
+    # 壊れると、結果の出力が途中の知らせの合計より小さいとき（結果の欄が無い古い CLI など）、
+    # 数えた量を減らして上限を越えて使える
+    meter = _meter()
+    meter.begin_turn()
+    meter.record_message("a", {"output_tokens": 50})
+    meter.settle_output({"output_tokens": 20})
+    meter.settle_output(None)
+    turn = meter.turn_usage()
+    assert turn is not None
+    assert turn.tokens == 50
+
+
 def test_the_lock_keeps_threads_from_losing_counts() -> None:
     # 壊れると、AI のスレッドが数える間に画面が指示を締め、数えた分が 1 日の量から消える
     meter = _meter()

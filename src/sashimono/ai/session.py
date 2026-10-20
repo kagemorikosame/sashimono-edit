@@ -477,12 +477,17 @@ class AgentSession:
                             text="失敗" if block.is_error else "",
                         )
                     )
-        elif isinstance(message, ResultMessage) and message.is_error:
-            self._emit(
-                AgentEvent(
-                    EventKind.ERROR, text=with_login_hint(str(message.result or "失敗しました"))
+        elif isinstance(message, ResultMessage):
+            # 途中の知らせの出力は仮の値なので、本当の出力は結果で確かめる（#344）
+            # 失敗した指示も使った分は払うので、成功と失敗の両方で数える
+            self._bridge.usage.settle_output(getattr(message, "usage", None))
+            if message.is_error:
+                self._emit(
+                    AgentEvent(
+                        EventKind.ERROR,
+                        text=with_login_hint(str(message.result or "失敗しました")),
+                    )
                 )
-            )
 
     def _emit(self, event: AgentEvent) -> None:
         self._events.put(event)

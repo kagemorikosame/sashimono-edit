@@ -1285,7 +1285,9 @@ def _preview_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
     if fitted < width:
         # 黙って縮めると、AI は頼んだ大きさで見たつもりで細部を読み違える
         caption += (
-            f" 長い辺の上限（本人の設定 {host.image_edge} 画素）に合わせて横 {fitted} に縮めました"
+            # 描く所は作品の大きさを整数で割るので、横は fitted ちょうどとは限らない（それ以下）
+            f" 長い辺の上限（本人の設定 {host.image_edge} 画素）に合わせて横 {fitted} 以下に"
+            "縮めました"
         )
     return ImageResult(png=png, caption=caption)
 

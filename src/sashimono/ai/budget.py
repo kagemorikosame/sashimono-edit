@@ -341,6 +341,9 @@ class _Turn:
     #: API の 1 回（``message_id``）ごとに、欄ごとの一番大きい値 同じ応答が中身の塊ごとに
     #: 何通かに分かれて届くので、足すと 2 重 3 重に数える
     messages: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: この指示で数えた出力のトークン（途中の知らせの仮の値と、結果で確かめた差の合計）
+    #: 結果（:meth:`UsageMeter.settle_output`）はこれとの差だけを足す
+    output: int = 0
     #: 〔続ける〕で広げた分（この指示の間だけ）
     extra: dict[LimitKind, int] = field(default_factory=dict)
     #: 止めると決まった上限 決まった後の道具は尋ね直さずに断る
@@ -452,19 +455,38 @@ class UsageMeter:
             if turn is None or message_id is None:
                 # 印の無い知らせ（古い SDK）はそのまま足す 2 重に数えうるが、少なく数えて
                 # 上限が効かないより安全な側
-                added = sum(counted.values())
+                fresh = dict(counted)
             else:
                 seen = turn.messages.setdefault(message_id, {})
-                added = 0
+                fresh = {}
                 for key, value in counted.items():
                     if value > seen.get(key, 0):
-                        added += value - seen.get(key, 0)
+                        fresh[key] = value - seen.get(key, 0)
                         seen[key] = value
+            added = sum(fresh.values())
             if turn is None:
                 # 指示の外で届いた量は 1 日の分にだけ入れる（次の指示の上限に混ぜない）
                 self._keep_unsaved(self._today(), Usage(tokens=added))
             else:
                 turn.tokens += added
+                turn.output += fresh.get("output_tokens", 0)
+
+    def settle_output(self, usage: Mapping[str, Any] | None) -> None:
+        """1 回の指示の結果（SDK の ``ResultMessage``）の出力のトークンで、数えた出力を確かめる
+
+        途中の知らせ（``AssistantMessage``）の ``output_tokens`` は応答の始めの仮の値で、
+        同じ応答の知らせはどれも同じ値を繰り返す（claude-agent-sdk 0.2.164 で 332 の応答が
+        6 と届いた） 本当の出力は結果に、その指示（query 1 回）の合計として届く 足すのは
+        それまでに数えた出力との差だけ 同じ結果を 2 度受けても、2 度目の差は 0 になる
+        指示の外で届いた結果は、どれだけ数えたかを持っていないので足さない
+        """
+        total = message_tokens(usage).get("output_tokens", 0)
+        with self._lock:
+            turn = self._turn
+            if turn is None or total <= turn.output:
+                return
+            turn.tokens += total - turn.output
+            turn.output = total
 
     def record_image(self) -> None:
         """絵を 1 枚送った"""

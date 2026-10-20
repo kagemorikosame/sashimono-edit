@@ -11,7 +11,9 @@ import threading
 import time
 from collections.abc import Iterator
 
+import numpy as np
 import pytest
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
 from sashimono.ai.budget import (
@@ -22,9 +24,11 @@ from sashimono.ai.budget import (
     Limits,
 )
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
+from sashimono.ai.operations import ImageResult, find_operation
 from sashimono.ai.session import AgentEvent, EventKind
-from sashimono.core.model import MediaItem, Project, Transcript
+from sashimono.core.model import MediaItem, Project, ProjectSettings, Transcript
+from sashimono.core.timebase import FrameRate
+from sashimono.engine.render.renderer import RenderQuality
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.panel import BUDGET_HEAD, USAGE_FILE
 from sashimono.ui.main_window import MainWindow
@@ -351,6 +355,46 @@ class TestPreferences:
         finally:
             window.close()
             window.deleteLater()
+
+
+@pytest.mark.parametrize(
+    ("size", "width"),
+    [((1920, 1080), 1280), ((1080, 1920), 640)],
+    ids=["landscape", "portrait"],
+)
+def test_the_real_preview_stays_within_the_edge(
+    qt_application: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
+    width: int,
+) -> None:
+    # 壊れると、本物の窓は縮める度合いを丸めて 2.5 を 2 にし、上限 768 にした人にも
+    # 横長なら横 960、縦長なら縦 960 の絵を送り、選んだ費用の上限が効かない
+    del qt_application
+    PreferenceStore().save(Preferences(ai_image_edge=768))
+    settings = ProjectSettings(width=size[0], height=size[1], frame_rate=FrameRate(30))
+    window = MainWindow(Project.create(settings), confirm_unsaved=False)
+    try:
+        # 合成は GPU が要るので、作品を divisor で割った大きさの黒い絵で代える
+        # 度合いから大きさを出す所（RenderQuality.apply）は本物と同じ物を使う
+        def drawn(project: Project, frame: int, divisor: int) -> np.ndarray:
+            del frame
+            columns, rows = RenderQuality(divisor).apply(
+                project.settings.width, project.settings.height
+            )
+            return np.zeros((rows, columns, 4), np.uint8)
+
+        monkeypatch.setattr(window, "_render_for_ai", drawn)
+        operation = find_operation("preview_frame")
+        assert operation is not None
+        result = operation(window, {"frame": 0, "width": width})
+        assert isinstance(result, ImageResult)
+        picture = QImage.fromData(result.png)
+        assert not picture.isNull()
+        assert max(picture.width(), picture.height()) <= 768
+    finally:
+        window.close()
+        window.deleteLater()
 
 
 def test_every_limit_has_a_label() -> None:
