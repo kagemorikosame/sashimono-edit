@@ -104,15 +104,23 @@ class TestOpening:
         assert "save_project" in UNSAVED_REFUSAL
         assert saved.document.project is before
 
-    @pytest.mark.parametrize("name", ["外.sme", "第二稿.txt"])
-    def test_only_sme_files_in_the_allowed_folders_open(
-        self, saved: FakeHost, tmp_path: Path, name: str
+    def test_projects_outside_the_allowed_folders_do_not_open(
+        self, saved: FakeHost, tmp_path: Path
     ) -> None:
-        # 壊れると、AI が本人の見せるつもりの無い作品や、作品でないファイルを読み込む
-        outside = tmp_path / name
+        # 壊れると、AI が本人の見せるつもりの無いフォルダの作品を読み込んで中身を外へ送る
+        outside = tmp_path / "外.sme"
         save_project(Project.create(), outside)
-        with pytest.raises(ToolError):
+        with pytest.raises(ToolError, match="開ける場所の外"):
             OPEN(saved, {"path": str(outside)})
+
+    def test_only_sme_files_open_inside_the_allowed_folders(self, saved: FakeHost) -> None:
+        # 壊れると、作品のフォルダの中に置いた作品でないファイル（拡張子だけ違う物）を AI が
+        # 作品として読み込む 場所の外で断られる所に置くと、拡張子の確かめを外しても気付けない
+        inside = _second(saved).with_suffix(".txt")
+        save_project(replace(Project.create(), name="拡張子違い"), inside)
+        with pytest.raises(ToolError, match=r"作品の名前は \.sme で終えてください"):
+            OPEN(saved, {"path": str(inside)})
+        assert saved.document.project.name != "拡張子違い"
 
     def test_nothing_opens_before_the_project_has_a_place(self, host: FakeHost) -> None:
         # 壊れると、まだ保存していない作品から、どこの作品でも開けてしまう
