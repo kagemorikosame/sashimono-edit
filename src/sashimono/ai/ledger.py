@@ -441,6 +441,12 @@ LEDGER: tuple[Entry, ...] = (
     same("素材一覧/タイムラインへ", "place_media"),
     read_only("素材一覧/一覧｜名前・長さ・大きさを 1 行ずつ並べる", _SETTINGS),
     read_only("素材一覧/アイコン｜サムネイルを大きく並べる", _SETTINGS),
+    # 素材の意味検索（#326） 人の入口 窓の中の検索の欄から、AI と同じ引き方で引く
+    same(
+        "素材一覧/探す…｜素材の字幕と場面の説明から、言葉を含む所を探す",
+        "search_media",
+        safety=Safety.READ_ONLY,
+    ),
     same("素材一覧の右クリック/タイムラインへ置く", "place_media"),
     same("素材一覧の右クリック/字幕を起こす…", "transcribe"),
     hidden("素材一覧の右クリック/ファイルの場所を開く", _OUTSIDE),
@@ -613,6 +619,13 @@ AI_ONLY: dict[str, str] = {
     # 場面の切り替わり（#319） 人は再生して目で見つける物を、フレーム間の差の一覧で読む
     # 読むだけ（Safety.READ_ONLY）で、画面のメニュー・右クリック・ボタンに同じ入口は無い
     "detect_scenes": READING,
+    # 場面の説明（#326） 人は素材の絵を見れば中身が分かり、説明を書いて覚える入口は要らない
+    # AI は場面の絵を見て説明を作り、覚えた説明を search_media で引く（人も〔探す…〕で引ける）
+    "media_scene_sheet": READING,
+    "remember_scene_descriptions": (
+        "AI が場面の絵を見て作った説明を、素材の解析の控えに覚える 人は絵を見れば分かるので、"
+        "画面に同じ入口は無い 作品は変えない"
+    ),
     "list_scenes": READING,
     # 目印とチャプター（#330） 人は目盛りの旗を見て読む 目次の文は画面に同じ入口が無い
     "list_markers": READING,

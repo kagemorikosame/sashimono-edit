@@ -24,6 +24,7 @@ from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.core.seams import SeamStyle
+from sashimono.core.search import SceneNote
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
@@ -168,6 +169,27 @@ class EditorHost(Protocol):
 
         描くのは用意した時点のプロジェクト（開いているシーン） 描く間に編集が入っても、
         1 枚の中で前後の升が別の版の絵にならないように
+        """
+        ...
+
+    def start_media_sheet(self, media: MediaItem, layout: SheetLayout) -> SheetCanvas:
+        """素材 1 本の中の絵を並べる 1 枚を用意する（場面の説明 #326）
+
+        タイムラインに置いていない素材の場面も見られるように、素材だけを頭から置いた作品
+        （:func:`~sashimono.core.commands.insert.media_alone`）を描く 升の ``frame`` は
+        素材の頭から数えた、作品の fps のフレーム 作品にもアプリの設定にも触らない
+        """
+        ...
+
+    def scene_notes(self, media: MediaItem) -> tuple[SceneNote, ...]:
+        """覚えた場面の説明（#326） 素材の解析と同じ置き場（``engine/cache``）から読む"""
+        ...
+
+    def remember_scene_notes(self, media: MediaItem, notes: tuple[SceneNote, ...]) -> None:
+        """素材の場面の説明を丸ごと置き換えて覚える（#326） 空なら忘れる
+
+        作品の外の控え（``engine/cache``）に書く 作品は変えないので取り消しの段も積まない
+        控えは消しても絵を見せ直せば作れる物で、アプリ自身の設定でもない
         """
         ...
 

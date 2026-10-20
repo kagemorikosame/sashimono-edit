@@ -195,6 +195,9 @@ class TestAppSettingsAreReadOnly:
             "probe",
             # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
             "redo",
+            # 場面の説明（#326） 覚えるのは素材の解析と同じ本人のキャッシュ（engine/cache）で、
+            # 作品もアプリの設定も変えない 消しても絵を見せ直せば作り直せる
+            "remember_scene_notes",
             # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
             "remembered_names",
             "render_png",
@@ -202,6 +205,7 @@ class TestAppSettingsAreReadOnly:
             # 場面の解析（#319 #321） 頼むのは analyze と同じく本人のキャッシュへの解析だけで、
             # 取り込み時に調べるかの設定（Preferences.scene_analysis）は変えない
             "request_scenes",
+            "scene_notes",
             "scene_state",
             "scene_waiter",
             "seek",
@@ -209,6 +213,8 @@ class TestAppSettingsAreReadOnly:
             "select_clips",
             "set_active_scene",
             "start_export",
+            # 素材 1 本の絵を並べた 1 枚を描くだけ（#326） start_sheet と同じく何も変えない
+            "start_media_sheet",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",
             "start_transcription",
