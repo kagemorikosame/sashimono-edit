@@ -192,6 +192,8 @@ class TestAppSettingsAreReadOnly:
             "check_waiter",
             # 互換性レポートと画面の表示の写し（#352） 読むだけで、記録を消す・表示を変える口は無い
             "compat_report",
+            # 音量の推移のグラフ（#338） 渡された中身を絵にするだけ 作品にも設定にも触らない
+            "draw_sound_graph",
             "export_status",
             "export_waiter",
             "probe",
