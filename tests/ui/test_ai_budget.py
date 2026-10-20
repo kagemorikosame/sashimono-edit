@@ -211,6 +211,30 @@ class TestShowingUsage:
         widget._handle(AgentEvent(EventKind.TURN_DONE))
         assert "1.2 万 トークン・絵 1 枚" in widget._view.toPlainText()
 
+    def test_time_waiting_for_the_parts_update_is_not_counted(
+        self, panel: tuple[ChatPanel, FakeHost], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、AI の部品の更新中に送った指示が、更新を待つ間だけで 1 回の時間の上限に
+        # 当たり、AI が指示を受け取った直後の最初の道具で止まる
+        widget, _ = panel
+        now = [100.0]
+        widget._bridge.usage._clock = lambda: now[0]
+        dispatched: list[str] = []
+        # 会話は作らない 部品の無い機械でも試験できるように、渡した指示だけを記録する
+        monkeypatch.setattr(widget, "_dispatch", dispatched.append)
+        widget._retrying = True
+        widget._queued.append("切って")
+        widget._begin_turn()
+        assert widget._bridge.usage.turn_usage() is None
+        now[0] += 600.0
+        widget._retrying = False
+        widget._pass_held()
+        assert dispatched == ["切って"]
+        now[0] += 5.0
+        turn = widget._bridge.usage.turn_usage()
+        assert turn is not None
+        assert turn.seconds == pytest.approx(5.0)
+
     def test_the_day_is_written_to_the_settings_folder(
         self, panel: tuple[ChatPanel, FakeHost]
     ) -> None:

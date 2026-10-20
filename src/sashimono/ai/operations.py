@@ -2613,6 +2613,11 @@ def _audio_graph(host: EditorHost, arguments: dict[str, Any]) -> object:
     """音量の推移を 1 枚の絵で返す 動き（preview_range）と並べて確かめる"""
     width = _within(arguments, "width", GRAPH_DEFAULT_WIDTH, GRAPH_MIN_WIDTH, MAX_SHEET_EDGE)
     height = _within(arguments, "height", GRAPH_DEFAULT_HEIGHT, GRAPH_MIN_HEIGHT, GRAPH_MAX_HEIGHT)
+    # 引数の範囲（1568 まで）は設定と関係なく決まっている 縮めないと、絵の長い辺を 768 に
+    # 下げた人にも既定で 1200 画素のグラフを送り、選んだ費用と画質の釣り合いが音だけ効かない（#344）
+    # 断らずに縮めるのは、上限は本人の設定で AI が知らずに頼むため 縮めたことは説明に書く
+    edge = host.image_edge
+    fitted_width, fitted_height = min(width, edge), min(height, edge)
     silence_db, _min_silence = _sound_arguments(arguments)
     wait = _sound_wait(arguments)
     fresh = _sound_target(host, arguments)
@@ -2625,9 +2630,16 @@ def _audio_graph(host: EditorHost, arguments: dict[str, Any]) -> object:
         heard = _heard(host, request, state)
         report = heard.report
         chosen = marks if marks is not None else _graph_marks(arguments, report.start, report.end)
-        graph = _sound_graph(request, heard, width, height, chosen, silence_db)
+        graph = _sound_graph(request, heard, fitted_width, fitted_height, chosen, silence_db)
         png = host.draw_sound_graph(graph)
-        return ImageResult(png=png, caption=_graph_caption(request, heard, chosen))
+        caption = _graph_caption(request, heard, chosen)
+        if (fitted_width, fitted_height) != (width, height):
+            # 黙って縮めると、AI は頼んだ細かさで見たつもりで、短い山や谷を読み違える
+            caption += (
+                f" 長い辺の上限（本人の設定 {edge} 画素）に合わせて"
+                f" {fitted_width}x{fitted_height} に縮めました"
+            )
+        return ImageResult(png=png, caption=caption)
 
     return _after_sound(host, wait, answer)
 

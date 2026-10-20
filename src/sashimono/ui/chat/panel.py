@@ -297,6 +297,9 @@ class ChatPanel(QWidget):
         self._clock: Callable[[], float] = time.monotonic
         #: いまの指示に取りかかった時刻 応えている指示が無ければ ``None``
         self._turn_started: float | None = None
+        #: 指示を部品の入れ替えの間持っていて、使った量（#344）をまだ数え始めていないか
+        #: 数え始めるのは会話へ渡す所（:meth:`_pass_held`）
+        self._usage_waiting = False
         #: いまの指示で AI が呼んだ道具の数と、そのうち失敗した数
         self._turn_tools = 0
         self._turn_failures = 0
@@ -958,6 +961,10 @@ class ChatPanel(QWidget):
         """
         if self._holding:
             return
+        if self._usage_waiting and self._queued:
+            # 持っておいた先頭の指示は、ここで初めて AI へ渡る 時間もここから数える
+            self._usage_waiting = False
+            self._bridge.begin_turn()
         for prompt in self._queued:
             self._dispatch(prompt)
 
@@ -1534,7 +1541,11 @@ class ChatPanel(QWidget):
         """次の指示に取りかかった 秒と数を数え直す"""
         self._turn_started = self._clock()
         # 使った量（#344）も指示ごとに数え直す 前の指示の量で次の指示が止まらないように
-        self._bridge.begin_turn()
+        # 部品を入れ替えている間は、渡す所まで数え始めない 先に時計を回すと、更新に数分
+        # かかったとき、AI が指示を受け取る前の待ちだけで 1 回の時間の上限に当たって止まる
+        self._usage_waiting = self._holding
+        if not self._usage_waiting:
+            self._bridge.begin_turn()
         self._halted = False
         self._turn_tools = 0
         self._turn_failures = 0
