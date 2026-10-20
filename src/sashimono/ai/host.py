@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from sashimono.ai.sheet import SheetLayout
+from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.commands import Command, Document
@@ -169,6 +170,13 @@ class EditorHost(Protocol):
 
         描くのは用意した時点のプロジェクト（開いているシーン） 描く間に編集が入っても、
         1 枚の中で前後の升が別の版の絵にならないように
+        """
+        ...
+
+    def draw_sound_graph(self, graph: SoundGraph) -> bytes:
+        """音量の推移のグラフを PNG にする（#338） 描く物はすべて ``graph`` が持つ
+
+        作品にもアプリの設定にも触らない 描くのが編集画面なのは、字を描くのに Qt が要るため
         """
         ...
 
