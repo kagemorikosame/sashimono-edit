@@ -277,7 +277,8 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
 - アプリ自身の設定（好み・ショートカット・画面配置・更新・ヘルプ）は、AI は読むだけ
   `EditorHost` に変える口を足さない（試験が落ちる 足してよいのは作品の保存と書き出しの口
   `write_project` `start_export` `export_status` `export_waiter` `cancel_export` `write_subtitles`
-  `write_snapshot` と、作品の中身の写しを人と同じ置き場へ置くコピーの口 `set_clipboard` #349 だけ）
+  `write_snapshot` と、#349 の作品を扱う口（コピーの置き場 `set_clipboard`・開く `open_project_file`・
+  新規 `start_new_project`・スクリプトの読み直し `reload_scripts`・配置の命令 `alignment_commands`）だけ）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
 ### AI の道具が外へ送る物と同意（#342）
@@ -351,7 +352,8 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 
 ### 画面と同じ道具（#349）
 
-台帳の「まだできない」行を、本格的な編集に要る物から埋めた どれも画面の同じ操作と同じ命令を通る
+台帳の「まだできない」「一部だけできる」の #349 の行（着手のとき 56）を、本格的な編集に要る物から
+53 行埋めた どれも画面の同じ操作と同じ命令を通る
 
 - コピー・切り取り・貼り付け（`copy_clips` `cut_clips` `paste_clips`）の置き場は、人の Ctrl+C・Ctrl+X と
   同じタイムラインの 1 つ（`EditorHost.clipboard` `set_clipboard`） AI だけの置き場を持つと、人のコピーを
@@ -367,7 +369,21 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 - キーフレームの位置はクリップの頭から数える 位置を省いたときは再生ヘッドからクリップの頭を引く
   （前の `add_keyframe` はタイムラインのフレームのまま渡していて、頭が 0 でないクリップで別の所に付いた）
 - 字幕の分割の時刻は、字幕パネルと同じ `core/projection.py` の `source_seconds_at` で決める
-- 開く・新規（今の作品を閉じる操作）は、保存していない変更の扱いを利用者が決めるまで足さない
+- 開く・新規（`open_project` `new_project`）は取り消せない操作で、毎回確かめる（2026-10-20 利用者の決定）
+  保存していない変更があれば断り、`save_project` か人の窓を案内する（`UNSAVED_REFUSAL`） 開けるのは
+  作品のフォルダと書き出しの窓で前に選んだフォルダの中の `.sme` だけ（`safety.openable_project`）
+  画面の〔開く…〕〔新規〕と同じ差し替え（`MainWindow._adopt_opened` `_adopt_new`）を通し、別の窓で
+  開いている作品は尋ねずに断る AI の指示の段は開いたまま差し替え（`Document.reset` の
+  `within_checkpoint`）、その指示の残りの AI の編集は断る（`replaced_in_checkpoint`） 指示の取り消しの段が
+  前の作品を指すため 人の編集は止めない
+- AI が素材一覧から外した素材も、〔プールから外す〕と同じく解析とプロキシを捨てる（`_forget_media`）
+- 置き方の方式の切り替え（`switch_layer_mode`）はメインとすべてのシーンに掛かるので、シーンを開いて
+  いれば断る（開いたまま当てるとシーンの中へ包まれ、メインが前の方式に残る）
+- 配置のテンプレート（`align_clip`）は画面と同じくプレビューが今のコマで描いた枠から命令を作る
+  （`EditorHost.alignment_commands`） 標準の組み方（`use_standard_layout`）は設定パネルのボタンと同じ
+  `effects/unlock.py` の `unlock_commands` で値を作る
+- OS のクリップボードへ写す操作（静止画をコピー・字幕の文字をコピー）はまだ道具に無い アプリの外へ
+  出す扱いを利用者が決めてから足す
 
 ### AI の取り消しとやり直し（#333）
 

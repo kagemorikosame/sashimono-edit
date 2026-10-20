@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from sashimono.ai.sheet import SheetLayout
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.clipboard import ClipboardContent
@@ -143,6 +144,32 @@ class EditorHost(Protocol):
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         """選択を丸ごと入れ替える 空なら選択を解く"""
+        ...
+
+    def reload_scripts(self) -> int:
+        """置き場の AviUtl スクリプトを読み直し、読み込んだ本数を返す
+
+        画面の〔スクリプトを読み直す〕と同じ（#349）
+
+        作品も本人の設定も変えない 置き場へ足したスクリプトを、アプリを開き直さずに使えるようにする
+        """
+        ...
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        """置けるカスタムオブジェクト（``.obj`` ``.obj2`` #349） 読むだけ
+
+        タイムラインの〔追加〕→〔カスタムオブジェクト〕と同じ一覧 名前は本人の置き場の持ち物
+        なので、返す道具はアプリの設定を送ると書く
+        """
+        ...
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """クリップを画面の ``anchor`` へ寄せる命令（設定パネルの配置のテンプレート #349）
+
+        枠は今のコマで描いた物から取る 再生位置に映っていない・ロックしている物は ``None``
+        命令を作るだけで実行しない（AI の印で :meth:`apply_commands` へ渡す）
+        """
         ...
 
     @property

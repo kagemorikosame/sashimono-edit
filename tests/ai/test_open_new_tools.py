@@ -27,6 +27,7 @@ from sashimono.core.model import Marker, Project
 from sashimono.core.timebase import FrameRate
 from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread
+from tests.ai.test_outbound import undeclared
 from tests.ai.test_safety import answer_approvals
 
 
@@ -78,10 +79,20 @@ class TestOpening:
     def test_a_saved_project_is_swapped_for_the_one_in_the_folder(self, saved: FakeHost) -> None:
         # 壊れると、AI に「第二稿を開いて」と頼んでも開けない
         result = OPEN(saved, {"path": "第二稿.sme"})
+        assert isinstance(result, dict)
         assert saved.document.project.name == "第二稿"
         assert saved.saved_at == _second(saved).resolve()
         assert result["name"] == "第二稿"
         assert not saved.document.can_undo
+
+    def test_what_it_returns_matches_its_declaration(self, saved: FakeHost) -> None:
+        # 壊れると、開いた作品の場所と名前を返すのに名前と場所を送ると書かず、断った人にも
+        # 伏せずに送る（変える道具の例の試験は、保存していない作品で断られる所しか通らない）
+        result = OPEN(saved, {"path": "第二稿.sme"})
+        second = _second(saved)
+        places = {str(second), str(second.resolve()), "第二稿"}
+        assert not undeclared(OPEN, result, places=places)
+        assert "opened" in OPEN.name_keys
 
     def test_unsaved_changes_are_refused_with_the_way_forward(self, saved: FakeHost) -> None:
         # 壊れると、保存していない編集が、AI の〔開く〕で黙って消える
@@ -142,6 +153,7 @@ class TestNew:
     def test_a_new_project_takes_the_size_and_rate_asked(self, host: FakeHost) -> None:
         # 壊れると、「縦の 60fps の作品を新しく作って」と頼んでも既定の作品になる
         result = NEW(host, {"width": 1080, "height": 1920, "frame_rate": 59.94})
+        assert isinstance(result, dict)
         settings = host.document.project.settings
         assert settings.resolution == (1080, 1920)
         assert settings.frame_rate == FrameRate(60000, 1001)

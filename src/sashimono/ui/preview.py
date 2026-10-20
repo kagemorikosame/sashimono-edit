@@ -631,15 +631,29 @@ class PreviewWidget(QOpenGLWidget):
         """
         if self._selection is None:
             return False
-        located = self._project.timeline.locate_clip(self._selection)
-        if located is None or located[0].locked:
+        commands = self.alignment_commands(self._selection, anchor)
+        if commands is None:
             return False
+        if commands:
+            label = next(a[1] for a in ALIGNMENTS if a[0] == anchor)
+            self.commands_requested.emit(commands, f"配置を{label}へ")
+        return True
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """``clip_id`` を ``anchor`` へ寄せる命令 寄せられなければ ``None``（実行はしない）
+
+        画面のボタン（:meth:`align_selected`）と AI の道具（#349）が同じ計算を通る 枠は今の
+        コマで描いた物から取るので、AI も人と同じく再生位置に映っている物だけを揃えられる
+        """
+        located = self._project.timeline.locate_clip(clip_id)
+        if located is None or located[0].locked:
+            return None
         track, clip = located
         if not self._project.draws_picture(track, clip):
-            return False
+            return None
         outline = self.outline_of(clip)
         if outline is None:
-            return False
+            return None
         changes = aligned_values(
             start_values(clip, self._frame - clip.timeline_start),
             bounding_box(outline.corners),
@@ -647,13 +661,9 @@ class PreviewWidget(QOpenGLWidget):
             anchor,
             scale=self.canvas_scale(),
         )
-        commands = transform_commands(
+        return transform_commands(
             self._project, clip.id, changes, self._frame, keyframes=self._keyframe_drag
         )
-        if commands:
-            label = next(a[1] for a in ALIGNMENTS if a[0] == anchor)
-            self.commands_requested.emit(commands, f"配置を{label}へ")
-        return True
 
     def _snap_targets(self, moving: ClipId) -> tuple[list[float], list[float]]:
         """掴んだ物のほかに今のコマで描いている物の枠と、画面の端と中央"""

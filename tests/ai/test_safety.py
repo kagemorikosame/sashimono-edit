@@ -188,6 +188,8 @@ class TestAppSettingsAreReadOnly:
             "cancel_export",
             # 完成物の検査（#337） 調べるのは作品の写しで、アプリの設定は変えない
             # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
+            # 配置のテンプレート（#349） 寄せる命令を作るだけで、当てるのは apply_commands
+            "alignment_commands",
             "check_state",
             "check_waiter",
             "export_status",
@@ -198,6 +200,8 @@ class TestAppSettingsAreReadOnly:
             "probe",
             # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
             "redo",
+            # スクリプトの置き場を読み直す（#349） 作品も本人の設定も変えない
+            "reload_scripts",
             # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
             "remembered_names",
             "render_png",

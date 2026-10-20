@@ -197,16 +197,21 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/ファイル/保存", "save_project", safety=Safety.IRREVERSIBLE),
     same("メニュー/ファイル/名前を付けて保存…", "save_project_as", safety=Safety.IRREVERSIBLE),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
-    partial(
+    same(
         "メニュー/ファイル/プロジェクト設定…",
+        "set_project_settings",
         "set_resolution",
-        issue=349,
         note=(
-            "解像度だけ fps・音の設定・背景などは無い 編集の方針（#343）は本人が AI に渡す"
-            "決まりなので AI は変えず、get_style_guide で読み check_style_guide で照らす"
+            "解像度と半透明の重ね合わせ（fps は窓でも作った後は変えられない） 編集の方針（#343）は"
+            "本人が AI に渡す決まりなので AI は変えず、get_style_guide で読み check_style_guide で"
+            "照らす 組み合わせの保存は本人の持ち物"
         ),
     ),
-    missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
+    same(
+        "メニュー/ファイル/置き方の方式を切り替える…",
+        "switch_layer_mode",
+        note="変換するかは窓で毎回尋ねる所を convert で渡す シーンを開いていれば断る",
+    ),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
     same(
         "メニュー/ファイル/書き出し…", "export_video", note=_EXPORT_NOTE, safety=Safety.IRREVERSIBLE
@@ -287,11 +292,11 @@ LEDGER: tuple[Entry, ...] = (
             "〔置く〕は place_template、〔選択中のクリップに適用〕は apply_template 棚は list_looks"
         ),
     ),
-    missing(
+    same(
         "メニュー/互換/スクリプトを読み直す",
-        349,
-        "置き場の AviUtl スクリプトを読み直すだけで、プロジェクトを変えない",
-        Safety.READ_ONLY,
+        "reload_scripts",
+        note="置き場の AviUtl スクリプトを読み直すだけで、プロジェクトを変えない",
+        safety=Safety.READ_ONLY,
     ),
     hidden("メニュー/互換/スクリプトフォルダを開く", _OUTSIDE),
     hidden(
@@ -369,7 +374,11 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/追加/場面切り替え", "add_transition"),
     same("タイムラインの右クリック/追加/フィルタ", "add_filter"),
     same("タイムラインの右クリック/追加/グループ制御", "add_group_control"),
-    missing("タイムラインの右クリック/追加/カスタムオブジェクト/*", 349, "AviUtl の .obj を置く"),
+    same(
+        "タイムラインの右クリック/追加/カスタムオブジェクト/*",
+        "add_custom_object",
+        note="AviUtl の .obj を置く 一覧は list_custom_objects",
+    ),
     partial(
         "タイムラインの右クリック/追加/エイリアス/管理…（見本で選ぶ・名前や分類を変える・消す）",
         "place_alias",
@@ -540,30 +549,22 @@ LEDGER: tuple[Entry, ...] = (
         "remove_keyframe",
         note="打つのは add_keyframe、消すのは remove_keyframe",
     ),
-    partial(
+    same(
         "設定パネル/◀｜前のキーへ再生位置を動かす",
-        "seek",
-        issue=349,
-        note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        "seek_keyframe",
         safety=Safety.READ_ONLY,
     ),
-    partial(
+    same(
         "設定パネル/▶｜次のキーへ再生位置を動かす",
-        "seek",
-        issue=349,
-        note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        "seek_keyframe",
         safety=Safety.READ_ONLY,
     ),
     same("設定パネル/解除", "set_clip_property", note="止めた絵を解く（hold_at を null）"),
-    partial(
+    same(
         "設定パネル/組み方を「標準」にする｜組み方を「標準」に変えて、この欄を使えるようにします"
         "（取り消しで戻せます）",
-        "set_param",
-        issue=349,
-        note=(
-            "AviUtl2 の組み方のテキストの灰色の欄に出る（#301） set_param で layout と anchor を"
-            "変えれば同じ値になるが、2 回の取り消しになり、選んだ何本かをまとめて切り替えられない"
-        ),
+        "use_standard_layout",
+        note="AviUtl2 の組み方のテキストの灰色の欄に出る（#301） 選んだ何本かを 1 回で切り替える",
     ),
     same(
         "設定パネル/＋ 縁取りを追加｜今の縁の外側に縁取りを足します"
@@ -579,11 +580,10 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("設定パネル/✕｜この縁取りを外す 掛けたエフェクトも一緒に外れる", "remove_stroke"),
     *(
-        partial(
+        same(
             f"設定パネル/{arrow}｜{place}へ揃える（見えている範囲の端を画面の端へ付ける）",
-            "set_param",
-            issue=349,
-            note="位置は set_param で変えられるが、見えている範囲の端へ揃える計算は無い",
+            "align_clip",
+            note="枠は画面と同じくプレビューの今のコマから取る",
         )
         for arrow, place in (
             ("↖", "左上"),
@@ -644,6 +644,8 @@ AI_ONLY: dict[str, str] = {
     # 保存した見た目と棚の一覧（#328） 人は〔プリセット…〕と〔追加〕→〔エイリアス〕のメニューで
     # 名前を見て選ぶ 一覧を読むだけで、当てる・置くのは台帳の行の道具
     "list_looks": READING,
+    # カスタムオブジェクトの一覧（#349） 人は〔追加〕→〔カスタムオブジェクト〕の名前を見て選ぶ
+    "list_custom_objects": READING,
     "get_chapters": READING,
     # 編集の方針（#343） 人はプロジェクト設定の窓で読み書きする 窓の欄は台帳で数えない
     # （台帳はメニュー・右クリック・パネルのボタンだけ） 方針を変える道具は置かない

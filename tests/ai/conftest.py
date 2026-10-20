@@ -19,6 +19,7 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EXPORT_RUNNING, UNSAVED_REFUSAL, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.clipboard import ClipboardContent
@@ -141,6 +142,12 @@ class FakeHost:
         self.copied: ClipboardContent | None = None
         #: 本人の設定の挿入貼り付けの押し出し方 既定は設定と同じく全トラック
         self.insert_all_tracks = True
+        #: スクリプトの置き場（#349） 既定は空 本人の AviUtl の置き場は読まない
+        self.scripts: list[ScriptEntry] = []
+        self.reloads = 0
+        #: 配置のテンプレート（#349） 頼まれた（クリップ, 寄せ先）と、返す命令
+        self.alignments: list[tuple[ClipId, str]] = []
+        self.aligned: list[Command] | None = None
 
     @property
     def saved_looks(self) -> SavedLooks:
@@ -199,6 +206,19 @@ class FakeHost:
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self.selection = tuple(clip_ids)
+
+    def reload_scripts(self) -> int:
+        self.reloads += 1
+        return len(self.scripts)
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        return tuple(self.scripts)
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        # 偽物は描かないので枠を持たない 試験が寄せた後の命令（か None）を入れる
+        self.alignments.append((clip_id, anchor))
+        return self.aligned
 
     @property
     def is_modified(self) -> bool:

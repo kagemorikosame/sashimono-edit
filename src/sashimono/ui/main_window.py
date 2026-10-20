@@ -49,6 +49,7 @@ from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import check_writable
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.aviutl import native, plugin
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
 from sashimono.core.clipboard import ClipboardContent
@@ -3092,12 +3093,31 @@ class MainWindow(QMainWindow):
 
     def rescan_scripts(self) -> None:
         """スクリプトのフォルダを読み直す"""
+        count = self.reload_scripts()
+        self.statusBar().showMessage(f"スクリプトを {count} 本読み込んだ", 4000)
+
+    def reload_scripts(self) -> int:
+        """置き場の AviUtl スクリプトを読み直し、読み込んだ本数を返す
+
+        画面の〔スクリプトを読み直す〕と AI の reload_scripts（#349）が通る所 作品は変えない
+        """
         from sashimono.compat.aviutl.catalog import script_catalog
 
         catalog = script_catalog()
         catalog.scan()
-        count = catalog.register_all()
-        self.statusBar().showMessage(f"スクリプトを {count} 本読み込んだ", 4000)
+        return catalog.register_all()
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        """AI に見せるカスタムオブジェクト
+
+        タイムラインの〔追加〕→〔カスタムオブジェクト〕と同じ一覧（#349）
+        """
+        return tuple(self._timeline.add_sources.custom_objects())
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """AI の配置のテンプレート（#349）も、設定パネルの ↖〜↘ と同じくプレビューの枠で計算する"""
+        return self._preview.alignment_commands(clip_id, anchor)
 
     def open_script_folder(self) -> None:
         """スクリプトを置く場所をエクスプローラで開く

@@ -51,6 +51,7 @@ from sashimono.ai.style_check import COLOR as STYLE_COLOR
 from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
+from sashimono.compat.aviutl.custom_object import custom_object_clip
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
 from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle
 from sashimono.compat.looks import (
@@ -108,6 +109,7 @@ from sashimono.core.commands import (
     RenameScene,
     RenameTrack,
     RippleCut,
+    SetBlending,
     SetClipProperty,
     SetEffectEnabled,
     SetKeyframe,
@@ -146,6 +148,7 @@ from sashimono.core.commands import (
     trimmable,
     valid_marker_color,
 )
+from sashimono.core.commands.convert import convert_layers, switch_layer_mode
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.insert import new_track, place_media
@@ -191,11 +194,13 @@ from sashimono.core.mixing import (
 )
 from sashimono.core.model import (
     AnimatedValue,
+    Blending,
     Clip,
     ClipId,
     Effect,
     EffectId,
     Interpolation,
+    LayerMode,
     Marker,
     MediaId,
     MediaItem,
@@ -239,7 +244,14 @@ from sashimono.core.timebase import (
 from sashimono.effects import registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
-from sashimono.effects.sources import GROUP, SHAPE, TEXT, TRANSITION, source_registry
+from sashimono.effects.sources import (
+    GROUP,
+    SHAPE,
+    TEXT,
+    TO_NATIVE_LAYOUT,
+    TRANSITION,
+    source_registry,
+)
 from sashimono.effects.spec import (
     MAX_GRADIENT_STOPS,
     MIN_GRADIENT_STOPS,
@@ -257,6 +269,7 @@ from sashimono.effects.strokes import (
     next_stroke,
     takes_stroke_effect,
 )
+from sashimono.effects.unlock import unlock_commands
 from sashimono.engine.audio.speech import (
     SPEECH_SOURCES,
     SpeechError,
@@ -4695,6 +4708,193 @@ def _delete_subtitle(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"deleted": str(segment_id)}
 
 
+# --- 作品の設定・置き方の方式・配置のテンプレートなど（#349 2 回目） ---
+
+#: 置き方の方式を切り替えたときに返す、引き継げない物の数の上限 1 回の返事に収める
+MAX_LAYER_NOTICES = 30
+
+
+def _switch_layer_mode(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """置き方の方式を今と逆へ切り替える（〔置き方の方式を切り替える…〕と同じ命令）
+
+    変換はメインとすべてのシーンに掛かる シーンを開いたまま当てると、開いているシーンの
+    中へ包まれ（InScene）、メインが前の方式のまま残る 画面は包まずに当てるので、AI は
+    メインへ戻ってから頼むよう断る
+    """
+    if host.active_scene is not None:
+        raise ToolError(
+            "シーンを開いたままでは切り替えません"
+            " set_active_scene でメインへ戻ってから頼んでください"
+            "（メインとすべてのシーンが変わる）"
+        )
+    if "convert" not in arguments:
+        raise ToolError(
+            "convert を渡してください 真なら置いてあるトラックも新しい方式へ変換し、偽なら"
+            "これから置く物だけが新しい方式になる（画面は毎回尋ねる）"
+        )
+    convert = bool(arguments["convert"])
+    project = host.document.project
+    target = (
+        LayerMode.SEPARATED if project.settings.layer_mode == LayerMode.MIXED else LayerMode.MIXED
+    )
+    sound_kinds = registry.sound_kinds()
+    notices = convert_layers(project, target, sound_kinds).notices if convert else ()
+    commands = switch_layer_mode(project, target, convert=convert, sound_kinds=sound_kinds)
+    label = "置き方の方式を切り替えて変換" if convert else "置き方の方式を切り替え"
+    host.apply_commands(commands, label)
+    return {
+        "layer_mode": target,
+        "converted": convert,
+        "notices": list(notices[:MAX_LAYER_NOTICES]),
+        "more_notices": max(0, len(notices) - MAX_LAYER_NOTICES),
+    }
+
+
+def _set_project_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """プロジェクト設定の窓で変えられる物（解像度・半透明の重ね合わせ）を 1 回の取り消しで変える
+
+    フレームレートは作った後に変えられない（窓と同じ） 編集の方針は本人が AI に渡す決まり
+    なので変えない（#343 get_style_guide で読む）
+    """
+    settings = host.document.project.settings
+    commands: list[Command] = []
+    if "width" in arguments or "height" in arguments:
+        try:
+            width = int(arguments.get("width", settings.width))
+            height = int(arguments.get("height", settings.height))
+        except (TypeError, ValueError) as exc:
+            raise ToolError("width と height は整数で渡してください") from exc
+        if (width, height) != settings.resolution:
+            commands.append(SetResolution(width, height))
+    if arguments.get("blending") is not None:
+        blending = str(arguments["blending"])
+        if blending not in Blending.ALL:
+            raise ToolError(f"blending は {'、'.join(Blending.ALL)} のどれかです: {blending}")
+        if blending != settings.blending:
+            commands.append(SetBlending(blending))
+    if not commands:
+        raise ToolError("変わる所がありません（width・height・blending のどれかを今と違う値で）")
+    host.apply_commands(commands, "プロジェクト設定を変更")
+    after = host.document.project.settings
+    return {"resolution": f"{after.width}x{after.height}", "blending": after.blending}
+
+
+_KEY_DIRECTIONS = ("previous", "next")
+
+
+def _seek_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """前か次のキーフレームへ再生位置を動かす（設定パネルの ◀ ▶ と同じ）
+
+    見るのはクリップの中のキーだけ（クリップの外のキーへは飛ばない 画面と同じ）
+    """
+    _, clip = _target_clip(host, arguments)
+    path = _param_path(clip.id, arguments)
+    direction = str(arguments.get("direction") or "next")
+    if direction not in _KEY_DIRECTIONS:
+        raise ToolError("direction は previous か next です")
+    animated = _animated(_project(host), path)
+    local = host.playhead - clip.timeline_start
+    frames = [k.frame for k in animated.keyframes if 0 <= k.frame < clip.duration]
+    if direction == "previous":
+        target = max((f for f in frames if f < local), default=None)
+    else:
+        target = min((f for f in frames if f > local), default=None)
+    if target is None:
+        raise ToolError(
+            f"{path.name} の{'前' if direction == 'previous' else '次'}にキーがありません"
+        )
+    host.seek(clip.timeline_start + target)
+    return {"playhead": host.playhead, "key_frame": target}
+
+
+def _reload_scripts(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    return {"loaded": host.reload_scripts()}
+
+
+def _custom_object_rows(host: EditorHost) -> list[dict[str, str]]:
+    """置けるカスタムオブジェクトの名前と分類 置き場の場所は返さない（名前で選ぶ）"""
+    return [{"name": entry.label, "category": entry.category} for entry in host.custom_objects]
+
+
+def _list_custom_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
+    return _paged(_custom_object_rows(host), arguments, name="custom_objects")
+
+
+def _add_custom_object(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """カスタムオブジェクト（AviUtl の .obj）を置く 右クリックの〔追加〕と同じ形のクリップ"""
+    name = str(arguments.get("name") or "")
+    found = [entry for entry in host.custom_objects if entry.label == name]
+    if not found:
+        names = "、".join(row["name"] for row in _custom_object_rows(host)[:30])
+        raise ToolError(
+            f"そのカスタムオブジェクトはありません: {name}（置けるのは {names or 'ありません'}"
+            " list_custom_objects で一覧を取れます）"
+        )
+    if len(found) > 1:
+        raise ToolError(
+            f"同じ名前のカスタムオブジェクトが {len(found)} 本あるので選べません: {name}"
+        )
+    entry = found[0]
+    at_frame, duration, track_id = _place_spot(host, arguments)
+    definition = registry.get(entry.identifier) or entry.definition()
+    clip = custom_object_clip(definition.create(), duration=duration)
+    commands = insert_clip(_project(host), clip, at_frame=at_frame, track_id=track_id)
+    host.apply_commands(commands, f"{entry.label}を追加")
+    placed = _placed_clip(host, commands)
+    if placed is not None:
+        host.select_clip(placed)
+    return {"clip_id": str(placed) if placed is not None else None, "name": entry.label}
+
+
+#: 配置のテンプレートの寄せ先 設定パネルの ↖〜↘ と同じ名前と並び
+#: （``ui/preview_handles.py`` の ``ALIGNMENTS`` ``tests/ui/test_ai_screen_parity.py`` が見張る）
+ALIGN_ANCHORS = (
+    "top_left",
+    "top",
+    "top_right",
+    "left",
+    "center",
+    "right",
+    "bottom_left",
+    "bottom",
+    "bottom_right",
+)
+
+
+def _align_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """見えている範囲ごと画面の端や中央へ寄せる（設定パネルの ↖〜↘） 計算は画面と同じ所"""
+    _, clip = _target_clip(host, arguments)
+    anchor = str(arguments.get("anchor") or "")
+    if anchor not in ALIGN_ANCHORS:
+        raise ToolError(f"anchor は {'、'.join(ALIGN_ANCHORS)} のどれかです: {anchor}")
+    commands = host.alignment_commands(clip.id, anchor)
+    if commands is None:
+        raise ToolError(
+            "再生位置にこのクリップが映っていないか、ロックしているので揃えられません"
+            "（seek でクリップの上へ動かしてから）"
+        )
+    if not commands:
+        return {"clip_id": str(clip.id), "anchor": anchor, "moved": False}
+    host.apply_commands(commands, f"配置を揃える: {anchor}")
+    return {"clip_id": str(clip.id), "anchor": anchor, "moved": True}
+
+
+def _use_standard_layout(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """AviUtl2 の組み方のテキストを「標準」の組み方へ替える（設定パネルの灰色の欄のボタン #301）
+
+    灰色になっていないテキストは触らない 何本渡しても取り消し 1 回で戻る
+    """
+    project = _project(host)
+    clips = [_require_clip(project, str(clip_id))[1] for clip_id in _target_clips(host, arguments)]
+    commands, switched = unlock_commands(clips, TEXT, TO_NATIVE_LAYOUT)
+    if not commands:
+        raise ToolError("AviUtl2 の組み方で灰色になっているテキストがありません")
+    label = TO_NATIVE_LAYOUT.button
+    host.apply_commands(commands, label if switched == 1 else f"{label}（{switched} 本）")
+    return {"switched": switched}
+
+
 # --- 保存と書き出し（取り消せない操作 B1 #327） ---
 #
 # どれも「元に戻す」では戻らない 2026-10-14 の利用者の決定（#298 #350）のとおり、
@@ -6653,6 +6853,137 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id", "segment_id"],
         ),
         handler=_delete_subtitle,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="switch_layer_mode",
+        description=(
+            "置き方の方式（分ける ⇔ 混合のレイヤー）を今と逆へ切り替える"
+            "（〔置き方の方式を切り替える…〕と同じ） メインとすべてのシーンに掛かるので、"
+            "シーンを開いていれば断る convert が真なら置いてあるトラックも変換し、引き継げない物を"
+            " notices に返す 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {"convert": _boolean("置いてあるトラックも変換するか（画面は毎回尋ねる）")},
+            ["convert"],
+        ),
+        handler=_switch_layer_mode,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="set_project_settings",
+        description=(
+            "プロジェクト設定の窓で変えられる物（解像度・半透明の重ね合わせ blending）を変える"
+            " 1 回の取り消しで戻る フレームレートは作った後に変えられない 編集の方針は変えない"
+            "（本人の決まり get_style_guide で読む）"
+        ),
+        schema=_schema(
+            {
+                "width": _integer("横の画素（偶数）"),
+                "height": _integer("縦の画素（偶数）"),
+                "blending": _string(
+                    "半透明の重ね合わせ "
+                    + "・".join(Blending.ALL)
+                    + "（srgb は AviUtl と YMM4 と同じ）"
+                ),
+            }
+        ),
+        handler=_set_project_settings,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="seek_keyframe",
+        description=(
+            "パラメータの前か次のキーフレームへ再生位置を動かす（設定パネルの ◀ ▶）"
+            " 見るのはクリップの中のキーだけ 指し方は add_keyframe と同じ"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "effect_id": _string("エフェクト"),
+                "stroke_id": _string("縁取りの層"),
+                "target": _string("source か clip"),
+                "name": _string("パラメータ名"),
+                "after": _boolean("場面切り替えの後の場面のエフェクトを指す"),
+                "direction": _string("previous か next（既定 next）"),
+            },
+            ["name"],
+        ),
+        handler=_seek_keyframe,
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="reload_scripts",
+        description=(
+            "置き場の AviUtl スクリプトを読み直す（〔スクリプトを読み直す〕） 置き場へ足した"
+            "スクリプトを、アプリを開き直さずに使えるようにする 作品は変えない"
+        ),
+        schema=_schema({}),
+        handler=_reload_scripts,
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="list_custom_objects",
+        description=(
+            "置けるカスタムオブジェクト（AviUtl の .obj）の名前と分類 置くのは add_custom_object"
+        ),
+        schema=_schema(_paging()),
+        handler=_list_custom_objects,
+        # 名前は本人の置き場のスクリプトの名前（本人の持ち物）
+        sends=_SAVED_LOOKS,
+    ),
+    Operation(
+        name="add_custom_object",
+        description=(
+            "カスタムオブジェクト（AviUtl の .obj）を置く（右クリックの〔追加〕と同じ）"
+            " 名前は list_custom_objects で分かる 値は set_param で変える 置いた物が選ばれる"
+        ),
+        schema=_schema(
+            {
+                "name": _string("置くカスタムオブジェクトの名前"),
+                "at_frame": _integer("置く位置 省略すると再生ヘッド"),
+                "duration": _integer("長さ（フレーム、既定 150）"),
+                "track_id": _string("置きたいトラック 塞がっていればいつもの決まりで選ぶ"),
+            },
+            ["name"],
+        ),
+        handler=_add_custom_object,
+        sends=_SAVED_LOOKS,
+        writes=True,
+    ),
+    Operation(
+        name="align_clip",
+        description=(
+            "クリップを見えている範囲ごと画面の端や中央へ寄せる（設定パネルの配置のテンプレート"
+            " ↖〜↘） 再生位置に映っている物だけ 回した絵は見えている範囲で揃える"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "anchor": {
+                    "type": "string",
+                    "enum": list(ALIGN_ANCHORS),
+                    "description": "寄せる所",
+                },
+            },
+            ["anchor"],
+        ),
+        handler=_align_clip,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="use_standard_layout",
+        description=(
+            "AviUtl2 の組み方のテキストを「標準」の組み方へ替え、灰色の欄（太字・字間など）を"
+            "使えるようにする（設定パネルの〔組み方を「標準」にする〕） 字の位置や幅が少し動く"
+            " 灰色でないテキストは触らない 何本でも取り消し 1 回で戻る"
+        ),
+        schema=_schema({"clip_ids": _clip_ids_schema()}),
+        handler=_use_standard_layout,
         sends=_STRUCTURE,
         writes=True,
     ),

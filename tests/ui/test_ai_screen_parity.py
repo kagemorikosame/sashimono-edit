@@ -17,13 +17,17 @@ import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
+from sashimono.ai.operations import ALIGN_ANCHORS, find_operation
 from sashimono.core.commands import Author
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io.serialize import save_project
 from sashimono.core.model import Clip, LayerMode, MediaItem, Project, Track, TrackKind
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
+from sashimono.ui.preview_handles import ALIGNMENTS
+from tests.ui.test_preview_handles import _clip as _picture_clip
+from tests.ui.test_preview_handles import _media as _picture_media
+from tests.ui.test_preview_handles import _project as _picture_project
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +70,11 @@ def _run(window: MainWindow, tool: str, /, **arguments: Any) -> Any:
     operation = find_operation(tool)
     assert operation is not None, f"そんなツールは無い: {tool}"
     return operation(window, arguments)
+
+
+def _who(window: MainWindow) -> Author | None:
+    """次に戻す段を誰が変えたか 関数にするのは、続けて読むと型の見方が前の値に固まるため"""
+    return window.document.undo_by
 
 
 def _texts(window: MainWindow) -> list[tuple[int, str]]:
@@ -175,6 +184,40 @@ class TestOpeningAndNewInTheWindow:
         assert settings.resolution == (1280, 720)
         assert settings.layer_mode == LayerMode.MIXED
         assert window.project_path is None
+
+
+class TestAlignmentInTheWindow:
+    def test_the_anchors_are_the_panel_s_anchors(self) -> None:
+        # 壊れると、設定パネルに寄せ先を足しても AI の道具が知らず、名前が食い違う
+        assert tuple(name for name, *_ in ALIGNMENTS) == ALIGN_ANCHORS
+
+    def test_the_assistant_aligns_like_the_panel_button(self, qt_application: QApplication) -> None:
+        # 壊れると、AI の〔左上へ揃える〕と人のボタンで寄せる所が違う
+        del qt_application
+        clip = _picture_clip(_picture_media())
+        project, _ = _picture_project(clip)
+        created = MainWindow(project, confirm_unsaved=False)
+        try:
+            created.seek(30)
+            created.select_clip(clip.id)
+            before = created.document.project
+            assert _run(created, "align_clip", clip_id=str(clip.id), anchor="top_left")["moved"]
+            by_ai = created.document.project
+            assert by_ai != before
+            assert _who(created) is Author.AI
+            created.undo()
+            created._align_selected("top_left")
+            assert created.document.project == by_ai
+            assert _who(created) is Author.PERSON
+        finally:
+            created.close()
+            created.deleteLater()
+
+    def test_the_lists_come_from_the_add_menu(self, window: MainWindow) -> None:
+        # 壊れると、右クリックの〔カスタムオブジェクト〕に並ぶ物と AI の一覧が食い違う
+        window._timeline.add_sources.custom_objects = lambda: ()
+        assert window.custom_objects == ()
+        assert _run(window, "list_custom_objects")["custom_objects"] == []
 
 
 class TestRemovingMediaInTheWindow:

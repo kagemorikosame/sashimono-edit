@@ -130,6 +130,13 @@ UNDOABLE_TOOLS = frozenset(
         "split_subtitle",
         "merge_subtitles",
         "delete_subtitle",
+        # 作品の設定・置き方の方式・置く・揃える（#349） どれも画面と同じ命令で取り消し 1 回
+        "switch_layer_mode",
+        "set_project_settings",
+        # カスタムオブジェクトを置く 置き場のスクリプトは読むだけ
+        "add_custom_object",
+        "align_clip",
+        "use_standard_layout",
         # 目印（#330） プロジェクトの中の目印だけを変える 素材にもファイルにも触らない
         "add_markers",
         "update_marker",

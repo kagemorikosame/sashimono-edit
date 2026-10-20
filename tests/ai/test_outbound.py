@@ -230,6 +230,8 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     # 書き出した動画を指す 調べられる場所の外なので、場所を書いて断る（#337）
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
+    # 前後のキーへ（#349） キーの無い欄は、名前を書いて断る
+    "seek_keyframe": lambda _media_id: {"name": "size"},
 }
 
 
@@ -361,6 +363,13 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 開く・新規（#349） 試験の作品は変えてあるので、どちらも保存していない変更で断る
     "open_project": lambda _ids: {"path": "第二稿.sme"},
     "new_project": lambda _ids: {"width": 1280, "height": 720},
+    # 作品の設定・置き方の方式・置く・揃える（#349） 無いカスタムオブジェクトは置き場の名前を
+    # 並べて断る 揃える枠は偽のホストに無いので断る
+    "switch_layer_mode": lambda _ids: {"convert": True},
+    "set_project_settings": lambda _ids: {"blending": "linear"},
+    "add_custom_object": lambda _ids: {"name": "無い"},
+    "align_clip": lambda ids: {"clip_id": ids["text"], "anchor": "center"},
+    "use_standard_layout": lambda ids: {"clip_ids": [ids["text"]]},
 }
 
 

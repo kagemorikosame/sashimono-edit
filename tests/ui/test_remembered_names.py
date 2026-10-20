@@ -56,6 +56,8 @@ OWN_LIBRARY = {
     "emphasis_style",
     "seam_style",
     "template_shelf",
+    # カスタムオブジェクトの名前（#349） 本人の置き場のスクリプト 道具はアプリの設定を送ると書く
+    "custom_objects",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -79,6 +81,9 @@ PROJECT_SIDE = {
     "is_modified",
     "open_project_file",
     "start_new_project",
+    # スクリプトを読み直す（本数だけ返す）・配置のテンプレート（命令だけ返す #349）
+    "reload_scripts",
+    "alignment_commands",
     # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
     "undo",
     "redo",
@@ -235,6 +240,9 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # カスタムオブジェクト（#349） 一覧と、無い名前の断りに置き場のスクリプトの名前が載る
+            "list_custom_objects",
+            "add_custom_object",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name
