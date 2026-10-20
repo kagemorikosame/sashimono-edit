@@ -289,6 +289,30 @@ def _smoothed(samples: Sequence[Sample], reach: int) -> list[tuple[int, float, f
     return path
 
 
+def _limited(
+    path: list[tuple[int, float, float]], max_step: float
+) -> list[tuple[int, float, float]]:
+    """枠の動く速さを ``max_step``（1 フレームの画素）までに抑えた線
+
+    ならしても、散った動きの偏りや速い被写体で枠が 1 秒に画面の幅ほど動くことがある 速すぎる枠は
+    手で振り回したカメラのように見える 抑えた分は遅れて追い付く
+    """
+    if not path or math.isinf(max_step):
+        return path
+    limited = [path[0]]
+    for frame, x, y in path[1:]:
+        last_frame, last_x, last_y = limited[-1]
+        reach = max_step * max(1, frame - last_frame)
+        limited.append(
+            (
+                frame,
+                last_x + max(-reach, min(reach, x - last_x)),
+                last_y + max(-reach, min(reach, y - last_y)),
+            )
+        )
+    return limited
+
+
 def _simplified(
     path: list[tuple[int, float, float]], tolerance: tuple[float, float]
 ) -> list[tuple[int, float, float]]:
@@ -323,10 +347,18 @@ def _simplified(
     return [path[position] for position in sorted(kept)]
 
 
-def plan_shot(shot: Shot, follow: str, window: tuple[float, float], smooth_frames: int) -> ShotPlan:
+def plan_shot(
+    shot: Shot,
+    follow: str,
+    window: tuple[float, float],
+    smooth_frames: int,
+    *,
+    max_step: float = math.inf,
+) -> ShotPlan:
     """場面 1 つの枠の中心を決める
 
     ``window`` は枠の大きさ（横の画面の画素） ``smooth_frames`` は追うときにならす長さ
+    ``max_step`` は追うときに枠が 1 フレームで動ける長さ（画素 横と縦それぞれ）
     """
     if follow not in REFRAME_FOLLOWS:
         raise ReframeError(
@@ -366,7 +398,10 @@ def plan_shot(shot: Shot, follow: str, window: tuple[float, float], smooth_frame
                 _quantile([s.y for s in strong], weights, 0.5),
             )
         return ShotPlan(shot.start, shot.end, STEADY, ((shot.start, *placed(*center)),))
-    path = [(frame, *placed(x, y)) for frame, x, y in _smoothed(inside, smooth_frames // 2)]
+    path = _limited(
+        [(frame, *placed(x, y)) for frame, x, y in _smoothed(inside, smooth_frames // 2)],
+        max_step,
+    )
     points = _simplified(path, (window[0] * PATH_TOLERANCE, window[1] * PATH_TOLERANCE))
     # 場面の頭から動いた先を映す 最初の手がかりが頭より後ろでも、頭の絵は最初の位置で切る
     points[0] = (shot.start, points[0][1], points[0][2])

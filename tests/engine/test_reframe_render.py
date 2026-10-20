@@ -91,7 +91,8 @@ def test_a_face_on_the_right_comes_to_the_middle(
 def test_the_face_moving_left_is_followed(video: Path, gl_context: OffscreenGLContext) -> None:
     # 前の位置で止めたままだと、左へ移った人が縦の画面の外へ出る
     project = _reframed(video)
-    columns = _skin_columns(project, FPS * 3, gl_context)
+    # 枠は 1 秒に枠の幅までしか動かないので、移ってから追い付いた所で見る
+    columns = _skin_columns(project, FPS * 4 - 5, gl_context)
     assert abs(float(columns.mean()) - HEIGHT / 2) < HEIGHT * 0.15
 
 

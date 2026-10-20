@@ -66,6 +66,8 @@ from sashimono.engine.subject import SUBJECT_SECONDS
 
 __all__ = [
     "BACKGROUND_COVER",
+    "MAX_PAN_WINDOWS",
+    "MIN_GATHERED",
     "MIN_STRENGTH",
     "Gathered",
     "ReframePlan",
@@ -83,6 +85,17 @@ BACKGROUND_COVER = 0.9
 #: 動きも肌色も無い絵（止まった風景）は 0.002 を下回る ここより薄い行で枠を動かすと、
 #: 圧縮のざらつきを追って枠が揺れる
 MIN_STRENGTH = 0.002
+
+#: 手がかりと見なす、枠に集まっている度合いの下限（:func:`~sashimono.engine.subject.gathering`）
+#: 散った動き（ゲームの画面の録画・画面じゅうが揺れる手持ち）の偏りを追うと、枠が跳ね回る
+#: 人の映る実物でも中央値は 0.13〜0.3 ほどしかないので、外すのは 0.1 未満だけにし、残りは
+#: 度合いを手がかりの重みに掛ける（散った行ほど枠を動かさない）
+MIN_GATHERED = 0.1
+
+#: 追うときに枠が動ける速さ（1 秒に枠の幅の何倍か） 速いと被写体の動きに付いていけるが、
+#: 速すぎる枠は手で振り回したカメラのように見える 1 は横切って歩く人（画面の幅を 3 秒ほど）に
+#: 付いていけ、実物のゲームの画面の録画で跳ね回る速さを半分ほどに抑えた
+MAX_PAN_WINDOWS = 1.0
 
 #: 被写体の並びの行と、クリップの時刻の差の上限（秒） 解析の届いていない所は手がかりに数えない
 _NEAREST = SUBJECT_SECONDS
@@ -289,15 +302,16 @@ class _Tracker:
         )
         self._subject = subject if usable else None
         self._centers: tuple[np.ndarray, np.ndarray] | None = None
+        self._gathered: np.ndarray | None = None
         if self._subject is not None:
             scale_x, scale_y = _drawn_scale(_transform_at(picture.clip, 0))
             crop = window.size
-            self._centers = self._subject.centers(
-                (
-                    min(1.0, crop[0] / max(1e-6, picture.placed_old[0] * abs(scale_x))),
-                    min(1.0, crop[1] / max(1e-6, picture.placed_old[1] * abs(scale_y))),
-                )
+            shares = (
+                min(1.0, crop[0] / max(1e-6, picture.placed_old[0] * abs(scale_x))),
+                min(1.0, crop[1] / max(1e-6, picture.placed_old[1] * abs(scale_y))),
             )
+            self._centers = self._subject.centers(shares)
+            self._gathered = self._subject.gathered(shares, self._centers)
 
     def sample(self, frame: int) -> tuple[Sample, Area]:
         """タイムラインの ``frame`` の被写体と、枠の中心を置ける範囲"""
@@ -338,8 +352,9 @@ class _Tracker:
                 index -= 1
             if abs(float(times[index]) - seconds) <= _NEAREST:
                 strength = float(self._subject.strength[index])
-                if strength >= MIN_STRENGTH:
-                    weight = strength
+                gathered = 1.0 if self._gathered is None else float(self._gathered[index])
+                if strength >= MIN_STRENGTH and gathered >= MIN_GATHERED:
+                    weight = strength * gathered
                     across = float(self._centers[0][index])
                     down = float(self._centers[1][index])
         if self._flip[0]:
@@ -712,6 +727,7 @@ def plan_reframe(
     plan = ReframePlan(window=window)
     plan.commands.append(SetResolution(request.width, request.height))
     smooth_frames = max(1, round(float(project.rate.fps) * request.smooth_ms / 1000))
+    max_step = window.size[0] * MAX_PAN_WINDOWS / float(project.rate.fps)
     locked: list[str] = []
     for scene_id, timeline in _timelines(project):
         trackers: list[_Tracker] = []
@@ -740,7 +756,9 @@ def plan_reframe(
                     overlays.append((track, clip))
         plans: list[ShotPlan] = []
         for shot, owner in _shots(project, timeline, trackers, signals):
-            shot_plan = plan_shot(shot, request.follow, window.size, smooth_frames)
+            shot_plan = plan_shot(
+                shot, request.follow, window.size, smooth_frames, max_step=max_step
+            )
             plans.append(shot_plan)
             plan.shots.append(
                 ShotNote(

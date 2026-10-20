@@ -15,9 +15,15 @@ import pytest
 from sashimono.engine.cache import CacheStore, load_scenes, save_scenes, scenes_key
 from sashimono.engine.cache.scene_cache import NAMESPACE, SUFFIX
 from sashimono.engine.cache.store import save_arrays
-from sashimono.engine.reframe import MIN_STRENGTH
+from sashimono.engine.reframe import MIN_GATHERED, MIN_STRENGTH
 from sashimono.engine.scenes import SceneSignal, analyze_scenes
-from sashimono.engine.subject import SUBJECT_BINS, SubjectTrack, best_center
+from sashimono.engine.subject import (
+    SUBJECT_BINS,
+    SubjectScan,
+    SubjectTrack,
+    best_center,
+    gathering,
+)
 from tests.subject_video import write_subject_video
 
 #: 縦の枠の幅（1920x1080 から 1080x1920 を切るときの割合）
@@ -68,6 +74,35 @@ class TestTheMadeVideo:
         _across, down = signal.subject.centers((0.3, 0.3))
         rows = _between(signal, 0.0, 2.0)
         assert np.all(np.abs(down[rows] - 0.5) < 0.1)
+
+
+class TestTheGathering:
+    def test_a_spread_motion_is_not_gathered(self) -> None:
+        # 画面じゅうに散った動き（ゲームの画面の録画）を集まっていると見ると、たまたまの偏りを
+        # 追って枠が 1 秒に画面の幅ほど跳ね回る
+        flat = np.full(SUBJECT_BINS, 1.0, np.float32)
+        assert gathering(flat, WINDOW[0], 0.5) == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_single_subject_is_gathered(self) -> None:
+        # 1 人だけの絵を散っていると見ると、話す人の前でも枠が真ん中に止まる
+        one = np.zeros(SUBJECT_BINS, np.float32)
+        one[24] = 1.0
+        assert gathering(one, WINDOW[0], best_center(one, WINDOW[0])) == pytest.approx(1.0)
+
+    def test_a_skin_coloured_wall_does_not_hide_the_speaker(self) -> None:
+        # 肌色の壁を人と数えると、壁の前で話す人の動きが壁に埋もれ、枠が人を追わない
+        # （実物のベージュの地の前の話し手で、枠が真ん中に決まっていた）
+        scan = SubjectScan()
+        motion = np.zeros((36, 64), np.int16)
+        motion[10:30, 44:52] = 40
+        wall = np.ones((36, 64), bool)
+        for frame in range(4):
+            scan.feed(frame / 30, motion if frame else None, lambda: wall)
+        scan.finish()
+        track = scan.snapshot()
+        centers = track.centers(WINDOW)
+        assert float(centers[0][0]) == pytest.approx(0.75, abs=0.06)
+        assert float(track.gathered(WINDOW, centers)[0]) >= MIN_GATHERED * 3
 
 
 class TestTheCenter:

@@ -185,6 +185,17 @@ class TestTheCurves:
         assert across.at(60) == pytest.approx(300.0)
 
 
+class TestTheSpeed:
+    def test_a_jumping_clue_does_not_whip_the_window(self) -> None:
+        # 抑えないと、散った動きの偏りや速い被写体で枠が 1 秒に画面の幅ほど振り回される
+        points = [
+            (frame, -600.0 if (frame // 8) % 2 else 600.0, 0.01) for frame in range(0, 120, 8)
+        ]
+        plan = plan_shot(_shot(points), FOLLOW, WINDOW.size, 8, max_step=5.0)
+        for (frame_a, x_a, _), (frame_b, x_b, _) in zip(plan.points, plan.points[1:], strict=False):
+            assert abs(x_b - x_a) <= 5.0 * (frame_b - frame_a) + 1e-6
+
+
 class TestTheShots:
     def test_a_subject_that_stays_gets_a_still_window(self) -> None:
         # 少し動くだけの話し手を追うと、枠が手振りで揺れ続けて見にくい

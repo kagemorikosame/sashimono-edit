@@ -260,6 +260,19 @@ def _turned_on_screen(
     return pos + scale * (math.cos(turn) * point[0] - math.sin(turn) * point[1])
 
 
+class TestTheSpreadMotion:
+    def test_a_spread_motion_is_no_clue(self, video_media: MediaItem) -> None:
+        # 画面じゅうに散った動きを手がかりにすると、たまたまの偏りへ枠が寄って跳ね回る
+        video = _video(video_media)
+        project = _project(video_media, (video,))
+        signal = _signal([(0.0, 0.8)])
+        flat = replace(
+            signal.subject, columns=np.full_like(signal.subject.columns, 1.0 / SUBJECT_BINS)
+        )
+        plan = plan_reframe(project, REQUEST, {video_media.id: replace(signal, subject=flat)})
+        assert plan.shots[0].no_clue
+
+
 class TestTheTurnAndPixels:
     def test_a_turned_clip_counts_the_turn(self, video_media: MediaItem) -> None:
         # 回転を数えないと、傾けて置いた動画で、傾ける前の位置へ枠を合わせて人が外れる

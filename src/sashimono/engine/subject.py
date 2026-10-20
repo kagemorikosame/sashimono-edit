@@ -16,7 +16,8 @@ GPL の条件）にも響くため（#298 の「決めること」） 場面の�
 精度の限り（道具の説明にも書く）
 
 - 顔かどうかは見ていない 肌色に近い物（木の床・ベージュの壁・赤みのある照明）も人と数える
-  画面の多くを肌色が占める絵では肌色の重みを下げる（:data:`SKIN_CROWD`）が、見分けはしない
+  画面の多くを肌色が占める絵では肌色を数えない（:data:`SKIN_CROWD` :data:`SKIN_FLOOD`）が、
+  見分けはしない
 - 動く物が 2 つあれば、多く動く方を選ぶ 話していない人が大きく動けばそちらへ寄る
 - 素材に焼き込まれた字幕やテロップは、出入りする瞬間だけ動きとして数える
 - 縮めた絵は横 64 画素 枠の位置の細かさは素材の幅の 1/32 ほど
@@ -36,12 +37,14 @@ __all__ = [
     "SKIN_CB",
     "SKIN_CR",
     "SKIN_CROWD",
+    "SKIN_FLOOD",
     "SKIN_WEIGHT",
     "SUBJECT_BINS",
     "SUBJECT_SECONDS",
     "SubjectScan",
     "SubjectTrack",
     "best_center",
+    "gathering",
     "skin_mask",
 ]
 
@@ -65,9 +68,12 @@ SKIN_LUMA = 40
 #: 肌色の重み（動きの濃さ 1 に対して） 動いている所の方を強く見る 止まって話す人の顔は
 #: 動きが小さいので、肌色が無いと画面の中央へ戻ってしまう
 SKIN_WEIGHT = 0.5
-#: 画面の中の肌色の割合がこれを超えたら、肌色の重みを割合に合わせて下げる 肌色の壁や床が
-#: 画面の半分を占める絵で、壁の方へ枠を寄せない
-SKIN_CROWD = 0.35
+#: 画面の中の肌色の割合がこれを超えたら肌色の重みを下げ始め、:data:`SKIN_FLOOD` で 0 にする
+#: 肌色の壁や床が画面の多くを占める絵では、肌色は人ではなく地 割合で薄めるだけでは、地が
+#: 画面じゅうに同じ濃さで残り、人の動きが埋もれる（実物のベージュの地の前で話す人で、枠が
+#: 人ではなく真ん中に決まっていた）
+SKIN_CROWD = 0.25
+SKIN_FLOOD = 0.45
 
 #: 色差の面を直に読める形式 → （横の間引き, 縦の間引き, 色差が交互に並ぶ面か, Cb が先か）
 #: これ以外は縮めながら yuv444p へ変換させる 4K で 1 枚 4ms ほどかかるので、よくある形式は直に読む
@@ -119,6 +125,26 @@ class SubjectTrack:
         down = np.array([best_center(row, height) for row in self.rows], np.float64)
         return across, down
 
+    def gathered(
+        self, window: tuple[float, float], centers: tuple[np.ndarray, np.ndarray]
+    ) -> np.ndarray:
+        """行ごとの、枠に集まっている度合い（0〜1 :func:`gathering`）
+
+        枠が素材いっぱいの向きは数えない
+        """
+        result = np.ones(len(self), np.float64)
+        for profiles, share, middle in (
+            (self.columns, window[0], centers[0]),
+            (self.rows, window[1], centers[1]),
+        ):
+            if share >= 1.0:
+                continue
+            result = np.minimum(
+                result,
+                [gathering(row, share, float(c)) for row, c in zip(profiles, middle, strict=True)],
+            )
+        return result
+
 
 def best_center(profile: np.ndarray, window: float) -> float:
     """分布 ``profile`` に幅 ``window``（0〜1）の枠を置くとき、枠に入る量がいちばん多い中心
@@ -156,6 +182,27 @@ def best_center(profile: np.ndarray, window: float) -> float:
         return chosen
     centroid = float((weights * centers).sum() / weights.sum())
     return min(max(centroid, half), 1.0 - half)
+
+
+def gathering(profile: np.ndarray, window: float, center: float) -> float:
+    """幅 ``window`` の枠を ``center`` に置いたとき、分布がどれだけ枠に集まっているか（0〜1）
+
+    0 は画面じゅうに同じだけ散っている（枠に入るのは枠の幅の割合だけ） 1 は全部が枠に入る
+    ゲームの画面の録画や、画面じゅうが動く手持ちの絵は 0 に近い そういう行の「いちばん多い所」は
+    たまたまの偏りで、追うと枠が左右に跳ね回る（実物の画面の録画で毎秒 1000 画素を超えた）
+    """
+    total = float(profile.sum())
+    if total <= 0.0 or window >= 1.0:
+        return 0.0 if total <= 0.0 else 1.0
+    bins = profile.shape[0]
+    cumulative = np.concatenate(([0.0], np.cumsum(profile, dtype=np.float64)))
+    edges = np.arange(bins + 1, dtype=np.float64)
+    half = window / 2.0
+    inside = float(
+        np.interp((center + half) * bins, edges, cumulative)
+        - np.interp((center - half) * bins, edges, cumulative)
+    )
+    return min(1.0, max(0.0, (inside / total - window) / (1.0 - window)))
 
 
 def _profile(values: np.ndarray, bins: int) -> np.ndarray:
@@ -295,7 +342,8 @@ class SubjectScan:
             layers.append(motion.astype(np.float32))
         if skin is not None:
             share = float(skin.mean())
-            weight = SKIN_WEIGHT * (min(1.0, SKIN_CROWD / share) if share > 0 else 0.0)
+            fade = (SKIN_FLOOD - share) / (SKIN_FLOOD - SKIN_CROWD)
+            weight = SKIN_WEIGHT * min(1.0, max(0.0, fade))
             layers.append(skin.astype(np.float32) * weight)
         interest = sum(layers[1:], layers[0]) if layers else None
         if interest is None:
