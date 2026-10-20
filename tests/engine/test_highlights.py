@@ -126,6 +126,15 @@ class TestSubtitles:
             ("ｗｗ", True),
             ("草", True),
             ("haha", True),
+            ("hehe", True),
+            ("Hahaha!", True),
+            ("lol", True),
+            ("ww", True),
+            ("Hi, hi!", False),
+            ("hi", False),
+            ("hihi", False),
+            ("he he said", False),
+            ("hew", False),
             ("ああ、はい", False),
             ("あっ、はい", False),
             ("あああ", False),
@@ -136,7 +145,8 @@ class TestSubtitles:
     def test_laughter_marks_are_read(self, text: str, laughs: bool) -> None:
         """字幕の笑いの印を見分ける
 
-        壊れると、「笑顔」や「ああ、はい」の相づちの字幕を笑いと見て盛り上がりに返すか、
+        壊れると、「笑顔」や「ああ、はい」の相づち・「Hi, hi!」の挨拶の字幕を笑いと見て
+        盛り上がりに返すか、
         「（笑）」「ｗｗ」「草」を見落とす
         """
         assert is_laughter_text(text) is laughs

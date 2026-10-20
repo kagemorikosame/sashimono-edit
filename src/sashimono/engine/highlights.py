@@ -274,34 +274,44 @@ _LAUGH_NOTE = re.compile(
     r"[（(\[［【〔]\s*(?:笑|笑い|爆笑|苦笑|laugh(?:s|ing|ter)?)\s*[）)\]］】〕]", re.IGNORECASE
 )
 #: 同じ笑いの音が 3 つ以上続く所（「ははは」「ふふふ」「www」「hahaha」） 2 つ（「はは」）は
-#: 「母」のようなふつうの言葉と見分けが付かない
+#: 「母」のようなふつうの言葉と見分けが付かない 英字の hi は挨拶（「Hi, hi!」）と
+#: 見分けが付かないので数えない
 _LAUGH_RUN = re.compile(
     r"(?:[はハ][っッ]?){3,}|(?:[ひヒ][っッ]?){3,}|(?:[ふフ][っッ]?){3,}|(?:[へヘ][っッ]?){3,}"
-    r"|[wｗWＷ]{3,}|草{2,}|(?:ha){3,}|(?:he){3,}|(?:hi){3,}|\blol\b|\blmao\b",
+    r"|[wｗWＷ]{3,}|草{2,}|(?:ha){3,}|(?:he){3,}|\blol\b|\blmao\b",
     re.IGNORECASE,
 )
 #: 字幕の文から外す飾り 「あははは！」の「！」で笑いの割合を下げない 句点は文の句点の
 #: 見張り（tools/punctuation.py）が文章と取り違えないよう、番号で足す
 _PUNCTUATION = re.compile("[\\s、" + chr(0x3002) + "，．,.!?！？…・ー〜~「」『』]+")
 #: 笑いの音 文がこれだけでできているかを見る 「あ」「っ」は「あはは」「ふふっ」の飾り
-_LAUGH_SOUND = re.compile(r"[はハひヒふフへヘあアっッ]|[wｗWＷ]|草|笑|ha|he|hi", re.IGNORECASE)
+_LAUGH_SOUND = re.compile(r"[はハひヒふフへヘあアっッ]|[ｗＷ]|草|笑")
 #: 笑いの核の音 「あ」「っ」だけの文（「あああ」「あっ」）は驚きや嘆きで、笑いではない
 #: 「草」はそれ 1 字で笑いを表すので 2 つ分に数える
-_LAUGH_CORE = re.compile(r"[はハひヒふフへヘ]|[wｗWＷ]|草|ha|he|hi", re.IGNORECASE)
+_LAUGH_CORE = re.compile(r"[はハひヒふフへヘ]|[ｗＷ]|草")
 #: かなの笑いの音だけの文 2 字（「はは」）は「母」のような言葉と見分けが付かない
 _KANA_LAUGH = re.compile(r"[はハひヒふフへヘあアっッ]+")
+#: 英字の文で笑いと読める物 ha・he の繰り返しと w の並びだけに絞る hi や英単語の
+#: 綴りを笑いの音として数えると「Hi, hi!」の挨拶や「hew」のような言葉を笑いと見る
+#: lol・lmao は _LAUGH_RUN が拾う
+_LATIN_LAUGH = re.compile(r"(?:ha|he){2,}|[wW]{2,}", re.IGNORECASE)
+_LATIN = re.compile(r"[A-Za-z]")
 
 
 def is_laughter_text(text: str) -> bool:
     """字幕の文が笑いを書いた物か
 
     書き添え（「（笑）」）・同じ笑いの音が 3 つ以上続く所・笑いの音だけでできていて核の音
-    （は・ひ・ふ・へ・w・草）が 2 つ以上ある文（「あはは」「ｗｗ」「草」）を笑いと見る
+    （は・ひ・ふ・へ・w・草）が 2 つ以上ある文（「あはは」「ｗｗ」「草」）・英字なら ha・he の
+    繰り返しか w だけの文（「haha」「hehe」「ww」）を笑いと見る
     「笑顔」のように字の中に「笑」があるだけの文や、「ああ、はい」のような相づちは見ない
     """
     if _LAUGH_NOTE.search(text) or _LAUGH_RUN.search(text):
         return True
     body = _PUNCTUATION.sub("", text)
+    if _LATIN.search(body):
+        # 英字は綴りの組み合わせが多く、笑いの音だけで割り切ると言葉を拾うので、形で見る
+        return _LATIN_LAUGH.fullmatch(body) is not None
     # 笑いの音以外が 1 字でも混ざれば笑いと見ない 割合で見ると「ああ、はい」「あっ、はい」の
     # ような相づちが 4 字のうち 3 字で笑いになり、ふつうの話し声を盛り上がりとして返した
     if not body or _LAUGH_SOUND.sub("", body):
