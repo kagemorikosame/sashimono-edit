@@ -595,17 +595,17 @@ try {
     Restore-NetworkGuard
 }
 
-# --- 後から入れる部品（AI 連携・字幕起こし）を exe の pip で入れて読む ネットにつなぐ ---
+# --- 後から入れる部品（AI 連携・字幕起こし・画面の解析）を exe の pip で入れて読む ネットにつなぐ ---
 # ファイアウォールの規則を戻した後で走らせる 前で走らせると pip が止められて落ち、外へ出ないことを
 # 数える所にも pip の接続が混ざる 0.1.0 は CI でここを見ておらず、AI 連携が読めない zip を組んだ
 # 入れ方と読み方は exe 自身が持つ（Sashimono.exe --add-on-check sashimono/addon_check.py）
 # ここへ書き写すと、導入ボタンの入れ方が変わったときに確かめだけが古いまま残る
 $addOns = Join-Path $Local 'Sashimono\後から 入れた 部品'
-# exe の側が段（AI 連携の pip・字幕起こしの pip・import の 3 つ どれも exe の中で走る）を 1 つずつ待つ秒数
-# CI では合わせて 40 秒ほど 時間切れなら exe が [NG] を書いて終わり、下で要約まで書ける
+# exe の側が段（AI 連携の pip・字幕起こしの pip・画面の解析の pip・import の 4 つ どれも exe の中で走る）を
+# 1 つずつ待つ秒数 CI では合わせて 40 秒ほど 時間切れなら exe が [NG] を書いて終わり、下で要約まで書ける
 $AddOnStepSeconds = 300
-# exe 全体を待つ秒数 段 3 つ分と、exe の起動の分
-$AddOnSeconds = $AddOnStepSeconds * 3 + 60
+# exe 全体を待つ秒数 段 4 つ分と、exe の起動の分
+$AddOnSeconds = $AddOnStepSeconds * 4 + 60
 try {
     $addOnCheck = Invoke-Exe 'add-on-check' @('--add-on-check', $addOns, "$AddOnStepSeconds") $AddOnSeconds
     foreach ($line in ($addOnCheck.Out -split "`r?`n")) {

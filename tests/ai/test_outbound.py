@@ -40,7 +40,8 @@ from sashimono.compat.subtitle_looks import template_choice
 from sashimono.core.commands import AddMarkers, RemoveMedia, SetStyleGuide, SetTranscript
 from sashimono.core.model import Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.vision import Box, ScreenKind, ScreenReport, ScreenSample, TextLine
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.compat.test_subtitle_looks import _styled_alias
@@ -154,6 +155,16 @@ class TestDeclarations:
         secret_host.saved_at = tmp_path / "作品.sme"
         # 場面の解析が失敗した素材 断りの文に素材の名前が入る
         secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+        # 画面の文字（#324） 画面に映った字幕の文を読んだ結果 読む道具が本人の文を返す道を通る
+        # 顔は調べられなかった素材 断りの文に素材の名前が入る
+        read = ScreenSample(1.0, lines=(TextLine(sorted(texts)[0], Box(0.0, 0.0, 80.0, 20.0)),))
+        secret_host.screen_states[(media.id, ScreenKind.TEXT)] = ScreenState(
+            ScreenReport(ScreenKind.TEXT, "試験", 640, 360, (read,), planned=1, complete=True),
+            running=False,
+        )
+        secret_host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(
+            None, running=False, failure="部品が無い"
+        )
         # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
         secret_host.library.aliases.save(_styled_alias(LOOK_NAME))
         secret_host.shelf = [SHELF_ENTRY]
@@ -226,6 +237,9 @@ SHELF_ID = template_choice(SHELF_ENTRY).key
 #: 引数の要る読む道具の引数（素材の ID を受ける） 足したらここにも足す（足さないと落ちる）
 READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "detect_scenes": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    # 画面の中身（#324） 文字は読めた文を返し、顔は断りの文に素材の名前を書く
+    "detect_text": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    "detect_faces": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     "seek": lambda _media_id: {"frame": 0},
     # 書き出した動画を指す 調べられる場所の外なので、場所を書いて断る（#337）
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},

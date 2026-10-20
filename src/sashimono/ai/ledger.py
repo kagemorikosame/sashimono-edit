@@ -613,6 +613,10 @@ AI_ONLY: dict[str, str] = {
     # 場面の切り替わり（#319） 人は再生して目で見つける物を、フレーム間の差の一覧で読む
     # 読むだけ（Safety.READ_ONLY）で、画面のメニュー・右クリック・ボタンに同じ入口は無い
     "detect_scenes": READING,
+    # 画面の中の文字と顔の位置（#324） 人は再生して目で読む物を、場面ごとに数枚調べた一覧で読む
+    # 読むだけで、画面のメニュー・右クリック・ボタンに同じ入口は無い
+    "detect_text": READING,
+    "detect_faces": READING,
     "list_scenes": READING,
     # 目印とチャプター（#330） 人は目盛りの旗を見て読む 目次の文は画面に同じ入口が無い
     "list_markers": READING,

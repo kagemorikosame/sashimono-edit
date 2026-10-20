@@ -196,6 +196,10 @@ EXCLUDED_MODULES = (
     "torch",
     "nvidia",
     "claude_agent_sdk",
+    # 画面の解析（#324）の部品 本体は関数の中でだけ import するが、PyInstaller は関数の中の
+    # import も辿るので、開発の .venv に入っていると積んでしまう onnxruntime は字幕起こしと共有
+    "onnxruntime",
+    "winrt",
     # pywin32 本体は使わない AI 連携（mcp）の依存として開発の .venv に入っていると、標準の
     # logging.handlers と numpy.testing の import から拾われ、pywintypes の DLL と、それを
     # 探す道へ足す差し込みまで積まれる CI（pywin32 が無い）で組んだ 0.1.0 の zip には無く、
@@ -221,7 +225,14 @@ EXCLUDED_MODULES = (
 #: 配布版に Python の本体は無いので、これらとその依存が使う標準ライブラリは配布版が持って
 #: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
 #: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
-RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2")
+RUNTIME_PACKAGES = (
+    "claude-agent-sdk",
+    "faster-whisper",
+    "ctranslate2",
+    # 画面の解析（#324） 依存（winrt の名前空間ごとの包み）は辿って数える
+    "onnxruntime",
+    "winrt-Windows.Media.Ocr",
+)
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
 #: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の

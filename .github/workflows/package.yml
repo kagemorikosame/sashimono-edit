@@ -32,6 +32,8 @@ on:
       - "src/sashimono/runtime.py"
       - "src/sashimono/ai/environment.py"
       - "src/sashimono/asr/environment.py"
+      - "src/sashimono/engine/vision/parts.py"
+      - "src/sashimono/model_files.py"
       - "pyproject.toml"
       - "THIRD_PARTY_NOTICES.md"
       - "licenses/**"

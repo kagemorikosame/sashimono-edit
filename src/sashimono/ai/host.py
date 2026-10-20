@@ -25,8 +25,9 @@ from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
 from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.vision import ScreenKind
 
 __all__ = [
     "EXPORT_RUNNING",
@@ -304,6 +305,29 @@ class EditorHost(Protocol):
 
         返す関数は**AI のスレッドから呼ばれる**（:class:`~sashimono.ai.operations.Pending`）
         画面のスレッドで待つと、待つ間は画面が固まる
+        """
+        ...
+
+    def request_screen(self, media: MediaItem, kind: ScreenKind) -> None:
+        """画面の中身（文字か顔の位置 #324）を調べるよう頼む 調べ終えた物・調べている物が
+        あれば何もしない 失敗した物（部品が無かった）は頼み直す
+
+        頼むのは本人のキャッシュへの解析だけで、読み込みのときに調べるかの設定
+        （``Preferences.screen_analysis``）は変えない
+        """
+        ...
+
+    def screen_state(self, media: MediaItem, kind: ScreenKind) -> ScreenState:
+        """画面の中身を調べた様子 調べ終えた結果か、調べた所までの写しと、失敗の理由
+
+        頼みはしない（:meth:`scene_state` と同じ 失敗の理由を読む前に頼み直すと理由が消える）
+        """
+        ...
+
+    def screen_waiter(self, media_id: MediaId, kind: ScreenKind) -> Callable[[float], bool]:
+        """画面の中身を調べ終えるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
+
+        返す関数は**AI のスレッドから呼ばれる**（:meth:`scene_waiter` と同じ）
         """
         ...
 

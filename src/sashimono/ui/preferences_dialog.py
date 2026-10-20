@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QLabel,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -61,6 +62,7 @@ from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
 from sashimono.engine.scenes import MEASURED_SCENE_SECONDS
+from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
@@ -83,6 +85,8 @@ from sashimono.ui.workspace import (
     SCENES_ALWAYS,
     SCENES_ON_DEMAND,
     SCENES_WITH_AI,
+    SCREEN_ON_DEMAND,
+    SCREEN_ON_IMPORT,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -155,6 +159,19 @@ SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
     (SCENES_WITH_AI, "AI アシスタントが入っているときだけ（既定）"),
     (SCENES_ALWAYS, "いつも調べる"),
     (SCENES_ON_DEMAND, "調べない（AI が頼んだときだけ）"),
+)
+
+#: 画面の中身（文字と顔の位置 #324）をいつ調べるか（:attr:`Preferences.screen_analysis`）
+SCREEN_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
+    (SCREEN_ON_DEMAND, "AI が頼んだときだけ（既定）"),
+    (SCREEN_ON_IMPORT, "読み込んだときに調べる（部品が入っていれば）"),
+)
+
+#: 場面ごとに画面の中身を調べる枚数（:attr:`Preferences.screen_samples`）
+SCREEN_SAMPLES: tuple[tuple[str, int], ...] = (
+    ("2 枚（速い）", 2),
+    ("4 枚（既定）", 4),
+    ("8 枚（場面の中の動きを拾う）", 8),
 )
 
 #: 場面を調べるのに使うデコードのスレッドの数 0 はすべて 名前の（）の前は実測の説明にも使う
@@ -911,6 +928,7 @@ class PreferencesDialog(QDialog):
             + "（論理 20 コアの機械） 次に調べる素材から効く"
         )
         form.addRow("場面を調べるのに使う CPU", self._scene_threads)
+        self._add_screen_rows(form, preferences)
 
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
@@ -1113,7 +1131,51 @@ class PreferencesDialog(QDialog):
             seam_audio_fade_ms=self._seam_audio.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
+            screen_analysis=str(self._screen_analysis.currentData()),
+            screen_samples=int(self._screen_samples.currentData()),
         )
+
+    def _add_screen_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """画面の中身（文字と顔の位置 #324）をいつ・どれだけ調べるか と、部品の導入の窓
+
+        読み込むたびに裏で調べるか、頼まれてから待つかは、機械の速さと使い方で答えが違う
+        """
+        self._screen_analysis = QComboBox(self)
+        for value, text in SCREEN_ANALYSIS_CHOICES:
+            self._screen_analysis.addItem(text, value)
+        self._screen_analysis.setCurrentIndex(
+            max(0, self._screen_analysis.findData(preferences.screen_analysis))
+        )
+        self._screen_analysis.setToolTip(
+            "AI アシスタントが画面の中の文字（テロップ・看板）と顔の位置を使うときに、"
+            "素材を読み込んだ時点で裏で調べておくか 調べるのは場面ごとに数枚で、結果は覚える"
+            "（素材を差し替えたら調べ直す） 「読み込んだときに調べる」は画面の解析の部品が"
+            "入っているときだけ効く 「AI が頼んだときだけ」でも、頼まれた素材はその場で調べる"
+            "（終わるまで AI が待つ）"
+        )
+        form.addRow("画面の文字と顔を調べる", self._screen_analysis)
+        self._screen_samples = QComboBox(self)
+        for label, count in SCREEN_SAMPLES:
+            self._screen_samples.addItem(label, count)
+        self._select(self._screen_samples, preferences.screen_samples)
+        self._screen_samples.setToolTip(
+            "場面の切り替わりで素材を区切り、1 つの場面で何枚の絵を調べるか 多いほど場面の中の"
+            "動き（歩く人・流れるテロップ）を拾うが、その分だけ待つ 1 枚に掛かるのは"
+            f" {MEASURED_SCREEN_SAMPLE}（場面の数 x 枚数だけ掛かる）"
+            " 変えると、次に調べる素材から効く"
+        )
+        form.addRow("画面を調べる枚数（場面ごと）", self._screen_samples)
+        parts = QPushButton("画面の解析の部品…", self)
+        parts.setToolTip(
+            "文字を読む Windows の OCR の包みと、顔の検出（onnxruntime と YuNet のモデル）を入れる"
+        )
+        parts.clicked.connect(self._open_vision_setup)
+        form.addRow("", parts)
+
+    def _open_vision_setup(self) -> None:
+        from sashimono.ui.vision_setup import VisionSetupDialog
+
+        VisionSetupDialog(self).exec()
 
     def _add_emphasis_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """強調の動き（#331）の既定 どれだけ寄るか・どれだけ速く動くかは人と作品で違う
