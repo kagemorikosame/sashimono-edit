@@ -182,6 +182,20 @@ class TestLoud:
         samples = speech(40, np.random.default_rng(10))
         assert _curves(samples, signals=(LOUD,)).highlights() == ()
 
+    def test_talk_with_pauses_has_no_peak(self) -> None:
+        """話の合間が多い素材でも、ふつうの話し声を山と見ない
+
+        壊れると、普段の大きさを合間の小さい所で低く見積もり、話している所が全部山に並ぶ
+        （実際の素材で山の 8 割が外れだった）
+        """
+        rng = np.random.default_rng(12)
+        parts = []
+        for _ in range(20):
+            parts.append(speech(1.0, rng))
+            parts.append(0.01 * rng.standard_normal(RATE * 2))
+        samples = np.concatenate(parts)
+        assert _curves(samples, signals=(LOUD,)).highlights() == ()
+
     def test_silence_has_no_peak(self) -> None:
         """無音だけの素材で落ちず、山も作らない 壊れると、無音の素材で道具が例外を出す"""
         samples = np.zeros(RATE * 5, np.float32)
@@ -198,6 +212,23 @@ class TestMotion:
         assert found[0].reasons == (MOTION,)
         assert found[0].start == pytest.approx(8.0, abs=0.75)
         assert found[0].end == pytest.approx(12.0, abs=0.75)
+
+    def test_a_game_scene_moving_a_little_more_is_found(self) -> None:
+        """ふだんから少し動く実況の画面で、動きが倍ほどになった所を拾う
+
+        壊れると、実況の素材の動く所（差 0.03 前後）をほとんど見落とす（幅を広く取って
+        いたとき、実際の素材で当たりが 18% だった）
+        """
+        signal = _motion_signal((8.0, 12.0), level=0.035)
+        busy = SceneSignal(
+            signal.times,
+            np.maximum(signal.pixel, 0.015),
+            signal.histogram,
+            analyzed=20.0,
+            complete=True,
+        )
+        found = highlight_curves(20.0, scenes=busy).highlights()
+        assert [item.reasons for item in found] == [(MOTION,)]
 
     def test_a_cut_is_not_motion(self) -> None:
         """場面の切り替わりの 1 コマを動きと見ない
