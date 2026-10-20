@@ -190,6 +190,8 @@ class TestAppSettingsAreReadOnly:
             # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
             "check_state",
             "check_waiter",
+            # 互換性レポートと画面の表示の写し（#352） 読むだけで、記録を消す・表示を変える口は無い
+            "compat_report",
             "export_status",
             "export_waiter",
             "probe",
@@ -204,6 +206,7 @@ class TestAppSettingsAreReadOnly:
             "request_scenes",
             "scene_state",
             "scene_waiter",
+            "screen_state",
             "seek",
             "select_clip",
             "select_clips",

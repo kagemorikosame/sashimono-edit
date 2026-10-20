@@ -162,8 +162,10 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    Effect,
     EffectId,
     Interpolation,
+    Keyframe,
     Marker,
     MediaId,
     MediaItem,
@@ -799,6 +801,22 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 編集の方針（#343）を決めてあるか 中身は本人の文なので get_style_guide で読む
         # （字幕と文字として同意を取る） ここで有る無しだけを返し、読み忘れを防ぐ
         "has_style_guide": not project.style_guide.empty,
+        # 開いているタイムラインの書き出し範囲（ワークエリア #352） 人は目盛りの帯で見ている
+        # 読めないと、export_video の range を省いたときにどこが書き出されるのか AI に分からない
+        "work_area": _work_area(project),
+    }
+
+
+def _work_area(project: Project) -> dict[str, Any] | None:
+    area = project.timeline.work_area
+    if area is None:
+        return None
+    start, end = area
+    return {
+        "start_frame": start,
+        "end_frame": end,
+        "start_timecode": format_timecode(start, project.rate),
+        "end_timecode": format_timecode(end, project.rate),
     }
 
 
@@ -839,6 +857,10 @@ def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
             "locked": track.locked,
             "muted": track.muted,
             "solo": track.solo,
+            # トラックの音量と定位 タイムラインの波形の大きさに出ている（#352）
+            # 読めないと、波形が小さく見える訳を AI がクリップの音量に探しに行く
+            "volume_db": track.volume_db,
+            "pan": track.pan,
         }
         for track in _project(host).timeline.tracks
     ]
@@ -928,11 +950,28 @@ def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     project = _project(host)
     selected = host.selected_clip
+    screen = host.screen_state()
+    subtitle_media = (
+        project.find_media(screen.subtitle_media) if screen.subtitle_media is not None else None
+    )
     return {
         "clip_id": str(selected) if selected is not None else None,
         "clip_ids": [str(clip_id) for clip_id in host.selected_clips],
         "playhead": host.playhead,
         "playhead_timecode": format_timecode(host.playhead, project.rate),
+        # 素材一覧と字幕パネルで人が選んでいる物（#352） 「この素材を起こして」「選んだ行を
+        # 直して」の「この」「選んだ」を、AI も人と同じ物として読む
+        "media_id": str(screen.pool_media) if screen.pool_media is not None else None,
+        "subtitles": {
+            "media_id": str(subtitle_media.id) if subtitle_media is not None else None,
+            # get_subtitles の audio と同じ 1 から数えた番号
+            "audio": (
+                _audio_number(subtitle_media, screen.subtitle_stream)
+                if subtitle_media is not None
+                else None
+            ),
+            "segment_ids": [str(segment) for segment in screen.subtitle_rows],
+        },
     }
 
 
@@ -1452,6 +1491,245 @@ def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 写しを返す ホストの持ち物をそのまま渡すと、後の道具の中で書き換えたときに
     # 本人の設定まで変わる（アプリ自身の設定は人だけが変える #350）
     return copy.deepcopy(host.app_settings())
+
+
+# --- 人が画面で見ている物（読み取りの同等性 #352）---
+
+#: 曲線を読むときの点の数の上限 グラフエディタの幅（数百画素）で形が分かる数 これより多いと
+#: 値の多いクリップで返事が上限を越え、エフェクトの一覧が 1 件ずつしか読めなくなる
+MAX_CURVE_SAMPLES = 60
+
+
+def _param_location(path: ParamPath) -> dict[str, Any]:
+    """値の在りかを、set_param・add_keyframe・get_clip の引数と同じ形で返す そのまま渡し直せる"""
+    where: dict[str, Any] = {"clip_id": str(path.clip_id), "name": path.name}
+    if path.target is ParamTarget.CLIP:
+        where["target"] = "clip"
+    if path.effect_id is not None:
+        where["effect_id"] = str(path.effect_id)
+    if path.stroke_id is not None:
+        where["stroke_id"] = str(path.stroke_id)
+    if path.after:
+        where["after"] = True
+    return where
+
+
+def _get_screen(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    project = _project(host)
+    screen = host.screen_state()
+    start, end = screen.visible_frames
+    rate = project.rate
+    check = host.check_state()
+    exported = host.export_status()
+    graph = screen.graph_path
+    return {
+        "timeline": {
+            # 人が見ている範囲 「ここ」「見えている所」と言われたときの手掛かり
+            "from_frame": start,
+            "to_frame": end,
+            "from_timecode": format_timecode(start, rate),
+            "to_timecode": format_timecode(end, rate),
+            # 拡大の度合い 1 秒が何画素か（大きいほど寄っている）
+            "pixels_per_second": round(screen.pixels_per_frame * float(rate.fps), 3),
+        },
+        "playing": screen.playing,
+        "playhead": host.playhead,
+        "active_scene": str(host.active_scene) if host.active_scene is not None else None,
+        "graph_editor": {
+            "shown": screen.graph_shown,
+            # get_clip にそのまま渡すと、出ている曲線の値とキーフレームを読める
+            "value": _param_location(graph) if graph is not None else None,
+        },
+        # ステータスバーと書き出しの窓に出ている進み具合 名前と場所は載せない（書き出し先は
+        # export_status で読む 名前と場所として同意を取る）
+        "progress": {
+            "person_export": (
+                None if screen.person_export is None else round(screen.person_export, 3)
+            ),
+            "assistant_export": {
+                "state": exported.get("state"),
+                "progress": exported.get("progress"),
+            },
+            "check_output": {
+                "running": check.running,
+                "progress": round(check.progress, 3),
+            },
+        },
+    }
+
+
+def _rounded(value: float) -> float:
+    # 浮動小数の端（0.30000000000000004 など）は読む AI の邪魔なだけ 画面の欄と同じ程度に丸める
+    return round(float(value), 4)
+
+
+def _keyframe_row(keyframe: Keyframe) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "frame": keyframe.frame,
+        "value": _rounded(keyframe.value),
+        "interpolation": keyframe.interpolation.value,
+    }
+    if keyframe.control_points is not None and keyframe.interpolation is Interpolation.BEZIER:
+        row["control_points"] = [_rounded(point) for point in keyframe.control_points]
+    if keyframe.curve:
+        row["curve"] = keyframe.curve
+    return row
+
+
+def _value_row(value: ParamValue, duration: int, samples: int) -> Any:
+    """値 1 つ 動かない値は数のまま、キーフレームのある値は点の並び（と曲線の点）"""
+    if isinstance(value, AnimatedValue):
+        if not value.is_animated:
+            return _rounded(value.static)
+        row: dict[str, Any] = {"keyframes": [_keyframe_row(k) for k in value.keyframes]}
+        if samples:
+            # 点の間の形（加減速・曲線・名前付きの曲線）は点だけでは分からない グラフエディタと
+            # 同じ式（AnimatedValue.at）で、クリップの頭から終わりまでを等しく分けて引く
+            last = max(duration - 1, 0)
+            frames = sorted({round(last * i / (samples - 1)) for i in range(samples)})
+            row["samples"] = [[frame, _rounded(value.at(frame))] for frame in frames]
+        return row
+    if isinstance(value, tuple):
+        return [_rounded(entry) for entry in value]
+    return value
+
+
+def _values(
+    params: dict[str, ParamValue], specs: tuple[Any, ...], duration: int, samples: int
+) -> dict[str, Any]:
+    """設定パネルと同じ値の並び 持っていない欄は既定の値（パネルもそれを出す）
+
+    クリップが持つ値だけを返すと、触っていない欄が無い物に見え、AI は今の位置や大きさを
+    知らないまま動かす 定義に無い値（読み込んだスクリプトの古い欄など）も残す
+    """
+    names = [str(getattr(spec, "name", "")) for spec in specs]
+    merged: dict[str, ParamValue] = {}
+    for spec, name in zip(specs, names, strict=True):
+        if name in params:
+            merged[name] = params[name]
+        elif hasattr(spec, "default_value"):
+            merged[name] = spec.default_value()
+    for name, value in params.items():
+        merged.setdefault(name, value)
+    return {name: _value_row(value, duration, samples) for name, value in merged.items()}
+
+
+def _effect_rows(
+    effects: tuple[Effect, ...], duration: int, samples: int, *, after: bool = False
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for effect in effects:
+        definition = registry.get(effect.kind)
+        specs = definition.parameters if definition is not None else ()
+        row: dict[str, Any] = {
+            "effect_id": str(effect.id),
+            "kind": effect.kind,
+            "label": definition.label if definition is not None else effect.kind,
+            "enabled": effect.enabled,
+            "fixed": effect.fixed,
+            "params": _values(effect.params, specs, duration, samples),
+        }
+        if after:
+            # 場面切り替えの後の場面へ積んだエフェクト 前の場面の物と同じ種類が並びうる
+            row["after"] = True
+        rows.append(row)
+    return rows
+
+
+def _curve_samples(arguments: dict[str, Any]) -> int:
+    raw = arguments.get("samples", 0)
+    if raw is None or raw == 0:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ToolError("samples は整数で渡してください（0 で曲線を引かない）")
+    if not 2 <= raw <= MAX_CURVE_SAMPLES:
+        # 端へ寄せない 1 点では形にならず、多すぎる頼みは返事が上限を越えて一覧が欠ける
+        raise ToolError(f"samples は 2〜{MAX_CURVE_SAMPLES} にしてください（{raw} が来ました）")
+    return raw
+
+
+def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
+    track, clip = _target_clip(host, arguments)
+    project = _project(host)
+    samples = _curve_samples(arguments)
+    duration = clip.duration
+    source = clip.source
+    if clip.scene_id is not None:
+        kind = "scene"
+    elif source is not None:
+        kind = source.kind
+    else:
+        kind = "media"
+    head: dict[str, Any] = {
+        "clip_id": str(clip.id),
+        "track_id": str(track.id),
+        "kind": kind,
+        "media_id": str(clip.media_id) if clip.media_id is not None else None,
+        "scene_id": str(clip.scene_id) if clip.scene_id is not None else None,
+        "start": clip.timeline_start,
+        "duration": duration,
+        "start_timecode": format_timecode(clip.timeline_start, project.rate),
+        # クリップ自身の欄（set_clip_property で変える）
+        "enabled": clip.enabled,
+        "blend_mode": clip.blend_mode,
+        "clip_to_below": clip.clip_to_below,
+        "native_size": clip.native_size,
+        "speed": round(float(clip.speed), 4),
+        "source_in_seconds": round(float(clip.source_in), 3),
+        "hold_at_seconds": round(float(clip.hold_at), 3) if clip.hold_at is not None else None,
+        # 不透明度は set_param の target=clip で変える
+        "opacity": _value_row(clip.opacity, duration, samples),
+    }
+    if source is not None:
+        definition = source_registry.get(source.kind)
+        specs = definition.parameters if definition is not None else ()
+        head["params"] = _values(source.params, specs, duration, samples)
+        if source.strokes:
+            head["strokes"] = [
+                {
+                    "stroke_id": str(stroke.id),
+                    "enabled": stroke.enabled,
+                    "params": _values(stroke.params, STROKE.parameters, duration, samples),
+                    "effects": _effect_rows(stroke.effects, duration, samples),
+                }
+                for stroke in source.strokes
+            ]
+    rows = _effect_rows(clip.effects, duration, samples)
+    rows += _effect_rows(clip.after_effects, duration, samples, after=True)
+    return _paged_after(head, rows, arguments, "effects", _CLIP_NOTE)
+
+
+#: get_clip の返事に添える読み方
+_CLIP_NOTE = (
+    "キーフレームの frame はクリップの頭から数える（タイムラインのフレームは start を足す）"
+    " samples はクリップの頭から終わりまでを等しく分けた所の値 [frame, 値]"
+    " 欄の名前は set_param・add_keyframe の name に、effect_id・stroke_id もそのまま渡せる"
+)
+
+
+def _get_compat_report(host: EditorHost, arguments: dict[str, Any]) -> object:
+    report = host.compat_report()
+    head: dict[str, Any] = {
+        "summary": report.summary,
+        "scripts": report.scripts,
+        # 置き場の場所 名前と場所を断った人には値ごと伏せる（項目の名前が folders で終わる）
+        "script_folders": list(report.folders),
+    }
+    rows: list[dict[str, Any]] = [
+        {"kind": "missing_api", "name": name, "count": count} for name, count in report.missing
+    ]
+    rows += [{"kind": "control", "name": line, "count": count} for line, count in report.controls]
+    rows += [
+        {"kind": "failure", "name": script, "message": message}
+        for script, message in report.failures
+    ]
+    note = (
+        "人が 互換 → 互換性レポート… で見る物と同じ 多い物から並ぶ missing_api は AviUtl の"
+        "スクリプトが呼んだまだ無い API、control は読めなかった制御文字、failure は読み込みや"
+        "実行に失敗したスクリプト 記録を消す・スクリプトを読み直すのは人だけ"
+    )
+    return _paged_after(head, rows, arguments, "records", note)
 
 
 # --- 編集の方針（#343）---
@@ -2936,10 +3214,18 @@ def _parse_color(text: str) -> tuple[float, ...] | None:
     return tuple(channels)
 
 
+#: add_keyframe で選べる補間 曲線（bezier）は制御点を渡す口が無いので外す
+_KEY_INTERPOLATIONS = " / ".join(i.value for i in Interpolation if i is not Interpolation.BEZIER)
+
+
 def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
-    frame = int(arguments.get("frame", host.playhead))
+    # キーの位置はクリップの頭から数える（get_clip と設定パネルと同じ） 省いたときは設定パネルの
+    # ◆ と同じく再生ヘッドの所（クリップの外なら近い端） タイムラインの再生ヘッドをそのまま
+    # 使うと、頭が 0 でないクリップでは再生ヘッドよりずっと後ろ（クリップの外）にキーが入る
+    default = min(max(host.playhead - clip.timeline_start, 0), max(clip.duration - 1, 0))
+    frame = int(arguments.get("frame", default))
     try:
         value = float(arguments["value"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -2949,8 +3235,13 @@ def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     try:
         interpolation = Interpolation(name)
     except ValueError as exc:
-        choices = "、".join(i.value for i in Interpolation)
-        raise ToolError(f"補間は {choices} のどれかです") from exc
+        raise ToolError(f"補間は {_KEY_INTERPOLATIONS} のどれかです") from exc
+    if interpolation is Interpolation.BEZIER:
+        # 曲線は制御点が要るが、この道具では渡せない 渡さずに作ると点を作る所で落ち、AI には
+        # 何を直せばよいかの分からない失敗が返る
+        raise ToolError(
+            f"bezier は制御点が要るので打てません {_KEY_INTERPOLATIONS} から選んでください"
+        )
 
     host.apply_commands(
         [SetKeyframe(path, frame, value, interpolation)], f"{path.name} にキーフレーム"
@@ -4847,7 +5138,10 @@ _CONVERSATION = frozenset({Outbound.CONVERSATION})
 OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="get_project",
-        description="プロジェクトの設定（解像度・fps・長さ）と再生ヘッドの位置を返す",
+        description=(
+            "プロジェクトの設定（解像度・fps・長さ）と再生ヘッドの位置、開いているタイムラインの"
+            "書き出し範囲（work_area 無ければ null）を返す"
+        ),
         schema=_schema({}),
         handler=_get_project,
         sends=_WITH_FILES,
@@ -4887,10 +5181,55 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="get_selection",
-        description="選択中のクリップと再生ヘッドの位置",
+        description=(
+            "人が選んでいる物 タイムラインのクリップ（clip_id が設定パネルに出ている 1 本）・"
+            "再生ヘッドの位置・素材一覧で選んでいる素材（media_id）・字幕パネルが出している"
+            "素材と音声と選んでいる行（subtitles） 「これ」「選んだ」と言われたらまず読む"
+        ),
         schema=_schema({}),
         handler=_get_selection,
         sends=_STRUCTURE,
+    ),
+    # 人が画面で見ている物（読み取りの同等性 #352）
+    Operation(
+        name="get_screen",
+        description=(
+            "人が画面で見ている表示の様子を読む タイムラインに見えている範囲と拡大の度合い・"
+            "再生しているか・グラフエディタを出しているかと出している値（get_clip にそのまま"
+            "渡せる）・書き出しと仕上がりの検査の進み具合（人が書き出しの窓で始めた物も）"
+            " 「見えている所」「今出ているグラフ」と言われたときに読む 読むだけで表示は変えない"
+        ),
+        schema=_schema({}),
+        handler=_get_screen,
+        # 返すのはフレーム・ID・進み具合の数だけ 書き出し先の場所は返さない（export_status）
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="get_clip",
+        description=(
+            "クリップ 1 本の値を、設定パネルとグラフエディタに出ている物と同じだけ読む"
+            " クリップ自身の欄・不透明度・中身（テキストや図形）の値・縁取りの層・エフェクトの"
+            "値（触っていない欄は既定の値） キーフレームのある値は点の並び（frame はクリップの"
+            "頭から数える 補間の種類と曲線の制御点つき） samples を渡すと、点の間の形（曲線）も"
+            "等しく分けた所の値で返す 値を変える前に今の値を読む エフェクトの一覧（effects）は"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("読むクリップ 省くと選択中のクリップ（設定パネルに出ている物）"),
+                "samples": _integer(
+                    f"キーフレームのある値ごとに曲線を引く点の数（2〜{MAX_CURVE_SAMPLES}"
+                    " 省くと引かない）"
+                ),
+                **_paging(),
+            }
+        ),
+        handler=_get_clip,
+        # 値にはテキストの本文（字幕と文字）と、画像を読むエフェクトのファイルの場所（名前と場所）が
+        # 入りうる 本文は値を変える道具と同じく、送らないと決めた人には断らずに伏せて返す
+        # 道具の役目は色や位置などの値を読むことで、断ると本文の無いクリップの値まで読めなくなる
+        sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
+        hidden=_HIDDEN_IN_VALUES,
     ),
     Operation(
         name="list_effects",
@@ -5247,6 +5586,20 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({}),
         handler=_get_app_settings,
+        sends=_APP_SETTINGS,
+    ),
+    Operation(
+        name="get_compat_report",
+        description=(
+            "互換性レポートを読む（画面の 互換 → 互換性レポート… と同じ中身） AviUtl の"
+            "スクリプトが呼んだまだ無い API・読めなかった制御文字・読み込めなかったスクリプトを"
+            "多い順に並べる 読み込んだ作品の見た目が AviUtl と違う訳を探すときに読む"
+            " 読むだけで、記録を消す・読み直すのは人だけ 一覧（records）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_get_compat_report,
+        # 本人のアプリが覚えた記録（作品の中身ではない） スクリプトの置き場の場所と、失敗の文に
+        # 混ざる場所（OS の文言）が入りうる
         sends=_APP_SETTINGS,
     ),
     # 編集の方針（#343） 人は ファイル → プロジェクト設定… で書く AI は読むだけ
@@ -5779,9 +6132,14 @@ OPERATIONS: tuple[Operation, ...] = (
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
                 "name": _string("パラメータ名"),
-                "frame": _integer("位置 省略すると再生ヘッド"),
+                "frame": _integer(
+                    "位置（クリップの頭から数えたフレーム get_clip の keyframes と同じ）"
+                    " 省略すると再生ヘッドの所"
+                ),
                 "value": _number("その位置での値"),
-                "interpolation": _string("linear / ease / hold / bezier"),
+                "interpolation": _string(
+                    f"次の点までの動き方 {_KEY_INTERPOLATIONS}（既定 linear）"
+                ),
             },
             ["name", "value"],
         ),

@@ -20,7 +20,7 @@ import pytest
 
 from sashimono.ai import bridge as bridge_module
 from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.host import EditorHost, ToolError
+from sashimono.ai.host import CompatReport, EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.outbound import (
     ASKED,
@@ -35,10 +35,17 @@ from sashimono.ai.outbound import (
     redact,
     secret_pairs,
 )
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import template_choice
-from sashimono.core.commands import AddMarkers, RemoveMedia, SetStyleGuide, SetTranscript
-from sashimono.core.model import Marker, MediaItem, StyleGuide, Transcript
+from sashimono.core.commands import (
+    AddEffect,
+    AddMarkers,
+    RemoveMedia,
+    SetStyleGuide,
+    SetTranscript,
+)
+from sashimono.core.model import Effect, Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.cache import SceneState
 from tests.ai.conftest import FakeHost, make_loaded
@@ -147,44 +154,48 @@ class TestDeclarations:
     ) -> None:
         # 壊れると、宣言に無い物（素材の場所・字幕の文・絵）を返す道具が、尋ねずに送る
         # 読むだけの道具を全部、引数なしで動かして、結果の中身から宣言を確かめる
-        secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
-        texts = {segment.text for segment in transcript.segments}
+        texts = _reading_host(secret_host, transcript, tmp_path)
         media = secret_host.document.project.media[0]
-        # 保存した作品 書き出した動画を調べる道具（check_output）が、外の場所を書いて断る道を通る
-        secret_host.saved_at = tmp_path / "作品.sme"
-        # 場面の解析が失敗した素材 断りの文に素材の名前が入る
-        secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
-        # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
-        secret_host.library.aliases.save(_styled_alias(LOOK_NAME))
-        secret_host.shelf = [SHELF_ENTRY]
-        # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
-        named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
-        secret_host.apply_commands([AddMarkers(tuple(named))], "目印")
-        # 字幕の文を書いた編集の方針（#343） 方針を読む道具が本人の文を返し、照らす道具は返さない
-        sentence = sorted(texts)[0]
-        guide = StyleGuide(fonts=("源ノ角ゴシック",), subtitles=sentence, notes=sentence)
-        secret_host.apply_commands([SetStyleGuide(guide)], "方針")
-        # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
-        secret_host.export_state = {
-            "state": "done",
-            "progress": 1.0,
-            "path": str(SECRET_PATH),
-            "message": f"書き出しました: {SECRET_PATH}",
-        }
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
                 continue
-            example = READ_EXAMPLES.get(operation.name)
-            arguments = example(str(media.id)) if example is not None else {}
-            try:
-                result: object = operation(secret_host, arguments)
-            except ToolError as exc:
-                # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
-                result = str(exc)
             checked += 1
-            assert not undeclared(operation, result, sentences=texts, places=secrets)
+            result = _read(operation, secret_host, str(media.id))
+            assert not undeclared(operation, result, sentences=texts, places=READ_PLACES)
         assert checked >= 10
+
+    @pytest.mark.parametrize(
+        ("name", "kind"),
+        [
+            # 人が画面で見ている物を読む道具（#352）
+            ("get_clip", Outbound.TEXT),
+            ("get_clip", Outbound.FILES),
+            ("get_compat_report", Outbound.APP_SETTINGS),
+            ("get_compat_report", Outbound.FILES),
+            ("get_app_settings", Outbound.APP_SETTINGS),
+            ("get_app_settings", Outbound.FILES),
+        ],
+    )
+    def test_weakening_a_reading_declaration_is_caught(
+        self,
+        name: str,
+        kind: Outbound,
+        secret_host: FakeHost,
+        transcript: Transcript,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると（上の見張りが道具の結果に秘密を載せないまま動いていると）、読む道具の宣言から
+        # 本文や場所や設定を外しても通り、同意の窓に出ない物が外へ出る（#352 で足した道具も見る）
+        texts = _reading_host(secret_host, transcript, tmp_path)
+        operation = _operation(name)
+        weakened = replace(
+            operation, sends=operation.sends - {kind}, hidden=operation.hidden - {kind}
+        )
+        media = secret_host.document.project.media[0]
+        result = _read(weakened, secret_host, str(media.id))
+        assert not undeclared(operation, result, sentences=texts, places=READ_PLACES)
+        assert undeclared(weakened, result, sentences=texts, places=READ_PLACES)
 
     def test_every_reading_tool_that_needs_arguments_has_an_example(self) -> None:
         # 壊れると、引数の要る読む道具（素材を指す物）が、引数なしで断られるだけで済み、
@@ -231,6 +242,73 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
 }
+
+
+#: 読む道具の結果に出たら、名前と場所を送ると書くべき文字
+READ_PLACES = frozenset({str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name})
+#: アプリの設定と互換性レポートに入れる目印 結果に出たら、アプリの設定を送ると書くべき道具
+APP_MARK = "秘密の設定の目印"
+
+
+def _reading_host(host: FakeHost, transcript: Transcript, tmp_path: Path) -> set[str]:
+    """読むだけの道具が、宣言した物をどれも結果に載せうる作品にする 字幕の文の組を返す"""
+    texts = {segment.text for segment in transcript.segments}
+    media = host.document.project.media[0]
+    # 保存した作品 書き出した動画を調べる道具（check_output）が、外の場所を書いて断る道を通る
+    host.saved_at = tmp_path / "作品.sme"
+    # 場面の解析が失敗した素材 断りの文に素材の名前が入る
+    host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+    # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
+    host.library.aliases.save(_styled_alias(LOOK_NAME))
+    host.shelf = [SHELF_ENTRY]
+    # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
+    named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
+    host.apply_commands([AddMarkers(tuple(named))], "目印")
+    # 字幕の文を書いた編集の方針（#343） 方針を読む道具が本人の文を返し、照らす道具は返さない
+    sentence = sorted(texts)[0]
+    guide = StyleGuide(fonts=("源ノ角ゴシック",), subtitles=sentence, notes=sentence)
+    host.apply_commands([SetStyleGuide(guide)], "方針")
+    # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
+    host.export_state = {
+        "state": "done",
+        "progress": 1.0,
+        "path": str(SECRET_PATH),
+        "message": f"書き出しました: {SECRET_PATH}",
+    }
+    # 人が選んで設定パネルに出しているテキスト（#352） 本文は字幕の文、画像を読むエフェクトは
+    # 本人の名前の入った場所を読む クリップの値を読む道具（get_clip）がどちらも返す道を通る
+    _operation("add_text")(host, {"text": sentence})
+    clip = next(
+        c.id
+        for track in host.document.project.timeline.tracks
+        for c in track.clips
+        if c.source is not None and c.source.kind == "text"
+    )
+    image = Effect(kind="image_blend", params={"image_file": str(SECRET_PATH)})
+    host.apply_commands([AddEffect(clip, image)], "画像")
+    host.select_clip(clip)
+    # 互換性レポート（#352） 本人のアプリの記録 置き場と失敗の文に本人の名前の入った場所が入る
+    recorded = CompatibilityReport()
+    recorded.note_missing(APP_MARK)
+    recorded.note_failure(SECRET_PATH.name, f"開けない: {SECRET_PATH}")
+    host.compat = CompatReport.of(recorded, scripts=1, folders=(str(SECRET_PATH.parent),))
+    # アプリの設定 置き場のフォルダ（本人の名前の入った場所）と目印
+    host.settings = {
+        "preferences": {"theme": APP_MARK, "state_folder": str(SECRET_PATH.parent)},
+        "shortcuts": {"編集/分割": "S"},
+    }
+    return texts
+
+
+def _read(operation: Operation, host: FakeHost, media_id: str) -> object:
+    """読む道具を例の引数で動かした結果 断られたら断りの文（どちらも外へ送る）"""
+    example = READ_EXAMPLES.get(operation.name)
+    arguments = example(media_id) if example is not None else {}
+    try:
+        return operation(host, arguments)
+    except ToolError as exc:
+        # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
+        return str(exc)
 
 
 def _ids(host: FakeHost) -> dict[str, str]:
@@ -404,8 +482,9 @@ def undeclared(
     has_place = any(place in text for place in places) or redact(result, []) != result
     if has_place and Outbound.FILES not in operation.sends:
         missing.append(f"{operation.name}: 名前と場所 {text[:200]}")
-    if LOOK_NAME in text and Outbound.APP_SETTINGS not in operation.sends:
+    if (LOOK_NAME in text or APP_MARK in text) and Outbound.APP_SETTINGS not in operation.sends:
         # 保存したプリセットとエイリアスの名前は本人の持ち物 アプリの設定として送ると書く
+        # 設定の値と互換性レポート（#352）も本人のアプリの物
         missing.append(f"{operation.name}: アプリの設定 {text[:200]}")
     return missing
 

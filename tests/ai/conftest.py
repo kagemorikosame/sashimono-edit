@@ -16,9 +16,10 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
+from sashimono.ai.host import EXPORT_RUNNING, CompatReport, ExportRequest, ScreenState, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
@@ -134,6 +135,21 @@ class FakeHost:
         self.rules = LookRules()
         #: テンプレートの棚（#328） 既定は空 本人の AviUtl2 の置き場は読まない
         self.shelf: list[TemplateEntry] = []
+        #: 人が見ている表示（#352） 試験が入れる 既定は何も選んでいない、頭の 10 秒が見えている画面
+        self.screen = ScreenState(
+            visible_frames=(0, 300),
+            pixels_per_frame=2.0,
+            playing=False,
+            graph_shown=False,
+            graph_path=None,
+            pool_media=None,
+            subtitle_media=None,
+            subtitle_stream=None,
+            subtitle_rows=(),
+            person_export=None,
+        )
+        #: 互換性レポート（#352） 試験が入れる 既定は記録の無いレポート
+        self.compat = CompatReport.of(CompatibilityReport(), scripts=0, folders=())
 
     @property
     def saved_looks(self) -> SavedLooks:
@@ -365,6 +381,12 @@ class FakeHost:
             return False
         self.export_state = {**self.export_state, "state": "cancelled"}
         return True
+
+    def screen_state(self) -> ScreenState:
+        return self.screen
+
+    def compat_report(self) -> CompatReport:
+        return self.compat
 
     def app_settings(self) -> dict[str, object]:
         return self.settings

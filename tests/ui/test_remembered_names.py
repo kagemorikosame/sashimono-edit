@@ -56,6 +56,9 @@ OWN_LIBRARY = {
     "emphasis_style",
     "seam_style",
     "template_shelf",
+    # 互換性レポート（#352） 本人のアプリが覚えた記録 スクリプトの置き場の場所は一覧の
+    # script_folders の項目で値ごと伏せ、失敗の文に混ざる場所は形で伏せる
+    "compat_report",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -74,6 +77,8 @@ PROJECT_SIDE = {
     "undo",
     "redo",
     "stop_playback",
+    # 人が見ている表示（#352） 返すのはフレーム・ID・進み具合の数だけで、名前と場所は持たない
+    "screen_state",
     "render_png",
     # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く
     "start_sheet",
@@ -226,6 +231,8 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # 互換性レポート（#352） 本人のアプリの記録を返す
+            "get_compat_report",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

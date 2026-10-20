@@ -79,6 +79,23 @@ class CompatibilityReport:
             parts.append(f"失敗 {len(self.failures)} 件")
         return "、".join(parts)
 
+    def records(
+        self,
+    ) -> tuple[
+        tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], tuple[tuple[str, str], ...]
+    ]:
+        """記録の写し（未実装の API・制御文字は多い順、失敗はスクリプトと文）
+
+        AI が読む口（#352）が使う 3 つを同じ錠の中で写す 錠の外で辞書を辿ると、描く裏の
+        スレッドが同じときに数え足して「辿る間に大きさが変わった」で落ちる
+        """
+        with self._lock:
+            return (
+                tuple(self.missing.most_common()),
+                tuple(self.controls.most_common()),
+                tuple((f.script, f.message) for f in self.failures.values()),
+            )
+
     def lines(self) -> tuple[str, ...]:
         """一覧に出す行 多い順に並べる"""
         with self._lock:
