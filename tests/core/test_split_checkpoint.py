@@ -94,3 +94,33 @@ class TestSplit:
         assert inside == first + 1
         assert document.checkpoint_serial == first + 2
         document.end_checkpoint()
+
+
+class TestChangesBy:
+    def test_changes_are_counted_per_author(self, project: Project) -> None:
+        """壊れると、AI の指示の途中で人が手で変えた分まで AI の変更に数え、AI が直した回を
+        数え違えて、直す前に止まる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        with document.checkpoint("道具", by=Author.AI):
+            _named(document, "一", "二")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        _named(document, "三")
+        document.undo()
+        document.end_checkpoint()
+        # まとめは 1 回 段の中の AI のコマンドも 1 回 取り消しは数えない
+        assert document.changes_by(Author.AI) == 2
+        assert document.changes_by(Author.PERSON) == 1
+
+    def test_a_refused_group_is_not_counted(self, project: Project) -> None:
+        """壊れると、断られて何も変わらなかった道具を AI が直した回に数える"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        try:
+            with document.checkpoint("断られる道具", by=Author.AI):
+                _named(document, "途中")
+                raise KeyError("断る")
+        except KeyError:
+            pass
+        document.end_checkpoint()
+        assert document.changes_by(Author.AI) == 0

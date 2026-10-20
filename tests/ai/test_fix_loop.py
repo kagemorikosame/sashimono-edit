@@ -199,6 +199,22 @@ class TestRounds:
         assert result["fix_round"]["used"] == 0
         assert result["fix_round"]["closed"] is False
 
+    def test_edits_by_the_person_are_not_a_round(self, host: FakeHost) -> None:
+        """壊れると、調べ直す間に人が手で変えた分まで AI の直した回に数え、AI が 1 回も
+        直さずに止まる"""
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        host.document.execute(RenameProject("人の直し"), by=Author.PERSON)
+        result = _finish(host, [_MIXED_CLIP])
+        assert result["fix_round"]["used"] == 0
+        assert result["fix_round"]["closed"] is False
+        _fix(host, "AI の直し")
+        result = _finish(host, [_MIXED_CLIP])
+        host.document.end_checkpoint()
+        assert result["fix_round"]["used"] == 1
+        assert result["fix_round"]["closed"] is True
+
     def test_a_new_instruction_starts_counting_again(self, host: FakeHost) -> None:
         """壊れると、前の指示で上限に達した後、次の指示でも編集を断り続ける"""
         host.fix_limit = 0

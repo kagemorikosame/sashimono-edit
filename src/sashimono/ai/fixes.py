@@ -26,8 +26,7 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from sashimono.core.commands import Document
-from sashimono.core.model import Project
+from sashimono.core.commands import Author, Document
 from sashimono.engine.checks.report import HIGH, LOW, MEDIUM
 from sashimono.engine.checks.scan import (
     BLACK,
@@ -206,8 +205,9 @@ class _Loop:
     """1 つの指示の数え 指示（段）が替わると作り直す"""
 
     serial: int
-    #: 前に調べたときのプロジェクト 同じ物なら、その間に何も直していない
-    checked: Project | None = None
+    #: 前に調べたときに AI が作品を変えた回数（:meth:`Document.changes_by`） 同じなら、その間に
+    #: AI は何も直していない 人が手で変えただけの回は数えない
+    checked: int | None = None
     used: int = 0
     closed: bool = False
 
@@ -228,16 +228,17 @@ def _loop(document: Document) -> _Loop:
 def start_check(document: Document, limit: int) -> FixRound:
     """``check_output`` が調べ始めるたびに呼ぶ（編集画面のスレッド）
 
-    前に調べた後に作品が変わっていれば、直した回を 1 つ数える 上限に達していなければ、
+    前に調べた後に AI の段で作品が変わっていれば、直した回を 1 つ数える（人の段だけで変わったなら
+    数えない 数えると、人が手で直した分だけ AI の直せる回が減る） 上限に達していなければ、
     ここで指示の段を区切り、この後の直しを「AI: 検査の直し（n 回目）」の段にする
     上限に達したら、この指示の残りの編集をブリッジが断る（:func:`fixes_closed`）
     同じ作品のまま呼び直した（途中までの結果の続きを読む）だけなら数えない
     """
     loop = _loop(document)
-    project = document.project
-    if loop.checked is not None and project is not loop.checked and not loop.closed:
+    changed = document.changes_by(Author.AI)
+    if loop.checked is not None and changed != loop.checked and not loop.closed:
         loop.used += 1
-    loop.checked = project
+    loop.checked = changed
     if loop.closed or loop.used >= max(0, limit):
         loop.closed = True
         return FixRound(loop.used, limit, None)

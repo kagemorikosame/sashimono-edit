@@ -77,6 +77,8 @@ class Document:
         #: 回数 #339）が、新しい指示に替わったことをこれで知る 名前で見分けると、同じ文の
         #: 指示を続けたときに数え直さない
         self._checkpoint_serial = 0
+        #: 誰の変更を何回積んだか（:meth:`changes_by`） 段の中の段は閉じたときに 1 回と数える
+        self._changes: dict[Author, int] = dict.fromkeys(Author, 0)
         #: 最後に積んだ段 続けて行う操作（ホイールで高さを変えるなど）は、この段が
         #: まだ一番上に残っているときだけ同じ段へまとめる 取り消したあとの段へ
         #: まとめると、関係の無い古い操作と一緒に戻ってしまう
@@ -159,6 +161,9 @@ class Document:
             return updated
 
         author = by or (self._checkpoint_by if self._checkpoint_depth else Author.PERSON)
+        if self._checkpoint_depth <= 1:
+            # まとめ（段の中の段）の中のコマンドは数えない まとめを閉じたときに、まとめの印で数える
+            self._changes[author] += 1
         if self._checkpoint_depth == 0:
             self._push_undo(HistoryEntry(command.label, self._project, author))
             self._redo.clear()
@@ -297,6 +302,7 @@ class Document:
         if before is None or before is self._project:
             self._inner_anchor = None
             return
+        self._changes[self._nested_by] += 1
         if self._nested_by is not self._checkpoint_by:
             self._land_other(
                 self._nested_label, before, self._project, self._nested_by, merge=self._nested_merge
@@ -360,6 +366,14 @@ class Document:
     def checkpoint_serial(self) -> int:
         """一番外の段を開いた回数 開くたびに 1 つ増える（段を開いていなくても前の値のまま）"""
         return self._checkpoint_serial
+
+    def changes_by(self, author: Author) -> int:
+        """``author`` が作品を変えた回数（取り消し・やり直しは数えない 減らない）
+
+        AI が検査の後に自分で直したかを、人の変更と分けて見るのに使う（#339） 作品が変わったかで
+        見ると、調べ直す間に人が手で変えた分まで AI の直した回に数え、AI の直せる回が減る
+        """
+        return self._changes[author]
 
     @property
     def checkpoint_label(self) -> str | None:
