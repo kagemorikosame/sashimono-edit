@@ -43,6 +43,7 @@ from sashimono.engine.encode import (
     export_project,
     exporter,
 )
+from sashimono.engine.encoders import usable
 from tests.color_bars import (
     AVCOL_SPC_BT709,
     BT709_YUV,
@@ -131,6 +132,11 @@ def breaks_mid_way(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list
         def encode(self, _frame: object) -> list[av.Packet[Any]]:
             raise av.error.ExternalError(-542398533, "偽の駆動の失敗")
 
+    # 途中で断らせる mpeg4 と、落ちる先の libx264 の両方で本物が書ける機械でだけ確かめる
+    # 書けない機械で落とすと、落ちた理由が「次の候補へ移らない」に見える
+    for name in ("mpeg4", "libx264"):
+        if not usable(name):
+            pytest.skip(f"{name} で書けない")
     real = getattr(exporter, "_encode_frame", None)
     written = {"count": 0}
 

@@ -220,6 +220,9 @@ def test_the_export_dialog_says_which_encoder_wrote_it(
     # 黙っていると、GPU で書いたつもりの人が、遅さや画の違いの理由を探せない
     del qt_application
     shown: list[str] = []
+    # 機械のコーデックの有無に左右させない 開けるコーデックが無い機械では書き出しが始まらず、
+    # 知らせが届かないことが落ちた理由に見える 本物の NVENC や AMF を開く待ちも省ける
+    monkeypatch.setattr(export_dialog, "available_video_codecs", lambda _priority: ["libx264"])
     monkeypatch.setattr(export_dialog, "run_export", _noting_export)
     monkeypatch.setattr(QMessageBox, "information", lambda _p, _t, text: shown.append(text))
     dialog = ExportDialog(_text_project(), folder=tmp_path)

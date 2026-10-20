@@ -253,6 +253,9 @@ class TestProxyCandidates:
 
         できないと、AMD の GPU の無い機械で 4K の素材を読み込んでも、プレビューが軽くならない
         """
+        # 落ちる先の libx264 で書けない機械では、確かめる相手がいない 落とすと理由が AMF に見える
+        if not encoders.usable("libx264"):
+            pytest.skip("libx264 で書けない")
         monkeypatch.setattr(proxy, "CODEC_PREFERENCE", ("h264_amf", "libx264"))
         target = tmp_path / "proxy.mp4"
         assert proxy.create_proxy(sample_av.path, target, height=120) == target
