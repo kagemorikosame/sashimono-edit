@@ -6,6 +6,8 @@
 - :func:`write_tone` 1 kHz の正弦波 振幅をフルスケールの dB で決める（左右同じ）
   両方のチャンネルに同じ振幅 A の正弦波を入れると、BS.1770 の積分ラウドネスは 20 log10(A)
   （1 kHz で K 特性の増幅と式の -0.691 が打ち消し合う） -14 dBFS の正弦波は -14 LUFS
+- :func:`talk` と :func:`chord` 話し声と音楽の見分け（#322）に使う音 本物の声と曲は
+  使えないので、見分けの手がかり（音節と息継ぎの上下・ならされた和音）だけを持つ音を作る
 """
 
 from __future__ import annotations
@@ -16,10 +18,55 @@ from pathlib import Path
 import av
 import numpy as np
 
-__all__ = ["FPS", "HEIGHT", "RATE", "WIDTH", "moving_frame", "write_tone", "write_video"]
+__all__ = [
+    "FPS",
+    "HEIGHT",
+    "RATE",
+    "WIDTH",
+    "chord",
+    "moving_frame",
+    "talk",
+    "write_tone",
+    "write_video",
+]
 
 WIDTH, HEIGHT, FPS = 320, 180, 30
 RATE = 48000
+
+
+def talk(seconds: float, *, seed: int = 0, level: float = 0.2) -> np.ndarray:
+    """話し声らしい音 ``(サンプル数, 2)``
+
+    倍音の多い声（110〜180 Hz）の音節（0.12〜0.25 秒）を短い間で並べ、1〜2 秒ごとに
+    0.3〜0.6 秒の息継ぎを入れる 話し声の見分けの手がかり（大きさの上下と谷）を持つ
+    """
+    rng = np.random.default_rng(seed)
+    out = np.zeros(round(seconds * RATE))
+    at = 0.0
+    while at < seconds:
+        phrase = at + rng.uniform(1.0, 2.0)
+        while at < min(phrase, seconds):
+            length = rng.uniform(0.12, 0.25)
+            begin = round(at * RATE)
+            count = min(round(length * RATE), len(out) - begin)
+            times = np.arange(count) / RATE
+            pitch = rng.uniform(110.0, 180.0)
+            voice = sum(np.sin(2 * np.pi * pitch * h * times) / h for h in range(1, 12))
+            out[begin : begin + count] += level * voice * np.hanning(count) * rng.uniform(0.4, 1.0)
+            at += length + rng.uniform(0.02, 0.08)
+        at += rng.uniform(0.3, 0.6)
+    return np.stack([out, out], axis=1).astype(np.float32)
+
+
+def chord(seconds: float, *, level: float = 0.1) -> np.ndarray:
+    """ならされた和音（A の長三和音と倍音） ``(サンプル数, 2)`` 最大の振幅が ``level``"""
+    times = np.arange(round(seconds * RATE)) / RATE
+    wave = np.zeros_like(times)
+    for pitch in (220.0, 277.18, 329.63):
+        for harmonic in range(1, 5):
+            wave += np.sin(2 * np.pi * pitch * harmonic * times) / harmonic
+    wave *= level / np.max(np.abs(wave))
+    return np.stack([wave, wave], axis=1).astype(np.float32)
 
 
 def moving_frame(index: int) -> np.ndarray:

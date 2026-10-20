@@ -82,6 +82,8 @@ PROJECT_SIDE = {
     "start_media_sheet",
     "scene_notes",
     "remember_scene_notes",
+    # 音量の推移のグラフ（#338） 描くのは道具が渡した時刻と値だけ 送る道具は sends に絵を書く
+    "draw_sound_graph",
     "probe",
     "splits_media",
     "subtitle_wrap_share",
