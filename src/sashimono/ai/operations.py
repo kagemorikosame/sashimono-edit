@@ -1073,7 +1073,7 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     wanted_audio = arguments.get("audio")
     contains = str(arguments.get("contains") or "")
     wanted_speaker = str(arguments.get("speaker") or "")
-    compact = bool(arguments.get("compact", False))
+    compact = _flag_argument(arguments, "compact", False)
     one = str(arguments.get("segment_id") or "")
     try:
         text_offset = max(0, int(arguments.get("text_offset", 0) or 0))
@@ -2779,7 +2779,9 @@ def _set_track_state(host: EditorHost, arguments: dict[str, Any]) -> object:
     if track is None:
         raise ToolError(f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）")
     changes: dict[str, bool] = {
-        name: bool(arguments[name]) for name in ("muted", "solo", "locked") if name in arguments
+        name: _flag_argument(arguments, name, False)
+        for name in ("muted", "solo", "locked")
+        if name in arguments
     }
     if not changes:
         raise ToolError("muted・solo・locked のどれかを指定してください")
@@ -2996,7 +2998,7 @@ def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _delete_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
-    ripple = bool(arguments.get("ripple", False))
+    ripple = _flag_argument(arguments, "ripple", False)
     members = _with_groups(host, (clip.id,))
     if len(members) > 1:
         # 1 本だけ消すと、画面で消したときと違って仲間が残る
@@ -3019,7 +3021,7 @@ def _move_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _delete_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     clip_ids = _with_groups(host, _target_clips(host, arguments))
-    ripple = bool(arguments.get("ripple", False))
+    ripple = _flag_argument(arguments, "ripple", False)
     command = RemoveClips(clip_ids, ripple=ripple)
     host.apply_commands([command], command.label)
     return {"deleted": [str(clip_id) for clip_id in clip_ids], "ripple": ripple}
@@ -3307,7 +3309,7 @@ def _move_stroke(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _set_stroke_enabled(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     stroke = _require_stroke(clip, str(arguments.get("stroke_id") or ""))
-    enabled = bool(arguments.get("enabled", True))
+    enabled = _flag_argument(arguments, "enabled", True)
     host.apply_commands([SetStrokeEnabled(clip.id, stroke.id, enabled)], "縁取りの入り切り")
     return {"stroke_id": str(stroke.id), "enabled": enabled}
 
@@ -3757,7 +3759,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     )
     silences = detect_silence(waveform, options)
     transcript = media.transcript_for(stream)
-    if bool(arguments.get("keep_speech", True)) and transcript is not None:
+    if _flag_argument(arguments, "keep_speech", True) and transcript is not None:
         silences = keep_speech(silences, transcript)
 
     # 省いた音（None）は 1 本目 そのまま渡すと plan_cuts は音で絞らず、別の位置へ置いた
@@ -4392,7 +4394,7 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
     stream = _audio_stream(media, arguments)
-    if media.transcript_for(stream) is not None and not bool(arguments.get("replace", False)):
+    if media.transcript_for(stream) is not None and not _flag_argument(arguments, "replace", False):
         # 黙って置き換えると、人が直した字幕まで消える 置き換えるかは頼む側が決める
         raise ToolError(
             f"{media.name} の音声 {_audio_number(media, stream)} には字幕があります"
@@ -4646,10 +4648,12 @@ def _add_scene(host: EditorHost, arguments: dict[str, Any]) -> object:
     name = str(arguments.get("name") or "").strip()
     if not name:
         raise ToolError("name にシーンの名前を指定してください")
+    # 足す前に読む 足した後に断ると、断ったのにシーンだけが増える
+    open_it = _flag_argument(arguments, "open", True)
     scene = new_scene(_project(host), name)
     # シーンの追加はどのタイムラインを開いていても同じ プロジェクトそのものへ足す
     host.apply_commands([AddScene(scene)], f"シーンを追加: {name}")
-    if bool(arguments.get("open", True)):
+    if open_it:
         host.set_active_scene(scene.id)
     return {"scene_id": str(scene.id), "name": name, "opened": host.active_scene == scene.id}
 
