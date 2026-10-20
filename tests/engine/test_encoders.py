@@ -10,7 +10,10 @@ import threading
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
+import av
+import av.error
 import pytest
 
 from sashimono.core.model import MediaItem, VideoStreamInfo
@@ -259,6 +262,37 @@ class TestProxyCandidates:
         monkeypatch.setattr(proxy, "CODEC_PREFERENCE", ("h264_amf", "libx264"))
         target = tmp_path / "proxy.mp4"
         assert proxy.create_proxy(sample_av.path, target, height=120) == target
+
+    def test_the_progress_does_not_go_back_when_the_next_candidate_starts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sample_av: SampleMedia,
+        tmp_path: Path,
+    ) -> None:
+        """先頭の候補が途中で失敗し次の候補で作り直しても、進み具合は戻らない
+
+        戻ると、素材の一覧のプロキシの進み具合が 60% から 1% へ下がり、壊れたように見える
+        """
+        if not encoders.usable("libx264"):
+            pytest.skip("libx264 で書けない")
+        real = proxy._transcode
+
+        def fails_mid_way(*args: Any, **options: Any) -> bool:
+            if options["codec"] == "h264_amf":
+                # 途中まで進めてから、駆動に断られた形で落ちる
+                options["progress"](0.6)
+                raise av.error.ExternalError(-542398533, "偽の駆動の失敗")
+            made: bool = real(*args, **options)
+            return made
+
+        monkeypatch.setattr(proxy, "CODEC_PREFERENCE", ("h264_amf", "libx264"))
+        monkeypatch.setattr(proxy, "proxy_codecs", lambda _priority: ["h264_amf", "libx264"])
+        monkeypatch.setattr(proxy, "_transcode", fails_mid_way)
+        seen: list[float] = []
+        target = tmp_path / "proxy.mp4"
+        assert proxy.create_proxy(sample_av.path, target, height=120, progress=seen.append)
+        assert seen == sorted(seen), f"進み具合が戻った: {seen}"
+        assert seen[-1] == pytest.approx(1.0)
 
     def test_the_builder_passes_the_priority(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

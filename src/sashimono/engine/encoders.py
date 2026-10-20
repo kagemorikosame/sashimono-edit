@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from fractions import Fraction
 from functools import cache
 from typing import cast
@@ -24,6 +25,7 @@ __all__ = [
     "PRIORITY_CPU",
     "PRIORITY_INTEL",
     "PROBE_BIT_RATE",
+    "MonotonicProgress",
     "encoder_options",
     "encoder_vendor",
     "order_by_priority",
@@ -60,6 +62,36 @@ AMF_QUALITY = "balanced"
 #: 駆動の既定の上限になる 指定と同じにすると CBR に切り替わる（amfenc_h264.c の選び方）
 #: NVENC の VBR に近い振る舞いを狙う AMD の実機で確かめていない 外れたら直す（#365）
 AMF_PEAK_RATIO = (3, 2)
+
+
+class MonotonicProgress:
+    """次の候補のエンコーダで書き直しても、進み具合を後ろへ戻さない
+
+    書き直しは 1 コマ目から 0..1 を送り直す そのまま流すと、書き出しの窓のバーや AI の
+    export_status、素材の一覧のプロキシの進み具合が 80% から 1% へ下がり、壊れたのか
+    最初に戻ったのか分からない 出した値で止めておく形は選ばない 書き直しの間ずっと動かず、
+    固まったように見える 書き直しの進み具合を、出した値から 1 までの残りへ割り当てて、
+    動きながら戻らない形にする 何で書き直したかは書き上げた後に知らせる
+    """
+
+    def __init__(self, forward: Callable[[float], None]) -> None:
+        self._forward = forward
+        #: 今の試みの 0 を、どの値に置くか 書き直すたびに、それまでに出した値へ上げる
+        self._base = 0.0
+        self._last = 0.0
+
+    def report(self, value: float) -> None:
+        """今の試みの進み具合（0..1）を受けて、戻らない値にして渡す"""
+        shown = self._base + (1.0 - self._base) * value
+        # 割り当てても丸めで前より小さくなることはあり得る 戻る値は出さない
+        if shown < self._last:
+            return
+        self._last = shown
+        self._forward(shown)
+
+    def start_again(self) -> None:
+        """次の候補で頭から書き直す"""
+        self._base = self._last
 
 
 def encoder_options(name: str, bit_rate: int | None) -> dict[str, str]:

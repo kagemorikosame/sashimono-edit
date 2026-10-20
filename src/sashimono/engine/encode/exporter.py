@@ -34,6 +34,7 @@ from sashimono.engine.audio import AudioMixer
 from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
 from sashimono.engine.encoders import (
     PRIORITY_AUTO,
+    MonotonicProgress,
     encoder_options,
     order_by_priority,
     probe_encoder,
@@ -371,12 +372,22 @@ def export_project(
     mixer = AudioMixer(project, smooth_history=settings.smooth_history)
     #: 書けなかったコーデックと理由 次の候補で書き上げたときに、何で書いたかと一緒に知らせる
     refused: list[tuple[str, _EncoderError]] = []
+    # 書き直しても進み具合を戻さない（#365 戻ると窓のバーや AI の export_status が下がる）
+    shown = MonotonicProgress(progress) if progress is not None else None
 
     try:
         for index, codec in enumerate(codecs):
             try:
                 _encode(
-                    project, settings, codec, start, end, renderer, mixer, progress, should_cancel
+                    project,
+                    settings,
+                    codec,
+                    start,
+                    end,
+                    renderer,
+                    mixer,
+                    shown.report if shown is not None else None,
+                    should_cancel,
                 )
             except _EncoderError as exc:
                 # 書きかけの入れ物を消して次へ移る 候補が尽きたら理由をそのまま伝える
@@ -384,6 +395,8 @@ def export_project(
                 if index == len(codecs) - 1:
                     raise
                 refused.append((codec, exc))
+                if shown is not None:
+                    shown.start_again()
                 if isinstance(exc, _EncoderWriteError):
                     # 途中まで描いて音も進めた 描く側と混ぜる側は前の音や絵を覚えている
                     # （音の効果の残り・軌跡など）ので、作り直して最初から書き出し直す

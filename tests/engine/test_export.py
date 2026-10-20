@@ -308,6 +308,29 @@ class TestExport:
         assert len(breaks_mid_way) == 1
         assert "mpeg4" in breaks_mid_way[0] and "libx264" in breaks_mid_way[0]
 
+    def test_the_progress_does_not_go_back_when_it_starts_again(
+        self,
+        breaks_mid_way: list[str],
+        ready_project: Project,
+        tmp_path: Path,
+    ) -> None:
+        """次の候補で書き直しても、進み具合は戻らずに最後まで進む（#365）
+
+        戻ると、書き出しの窓のバーや AI の export_status が 30% から 1% へ下がり、
+        利用者は壊れたのか最初からやり直しになったのか分からない
+        """
+        seen: list[float] = []
+        export_project(
+            ready_project,
+            ExportSettings(path=tmp_path / "out.mp4", frame_range=(0, 6)),
+            progress=seen.append,
+            notice=breaks_mid_way.append,
+        )
+        assert seen == sorted(seen), f"進み具合が戻った: {seen}"
+        assert seen[-1] == pytest.approx(1.0)
+        # 書き直しの間も動き続ける 止めたままにすると、固まったように見える
+        assert len(set(seen)) > 6
+
     def test_a_chosen_codec_that_fails_mid_way_is_an_export_error(
         self,
         breaks_mid_way: list[str],

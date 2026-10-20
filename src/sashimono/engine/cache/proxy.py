@@ -89,7 +89,13 @@ from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
 from sashimono.engine.decode import ProbeError, VideoDecoder, probe_media
 from sashimono.engine.decode.rational import as_fraction
-from sashimono.engine.encoders import PRIORITY_AUTO, encoder_options, order_by_priority, usable
+from sashimono.engine.encoders import (
+    PRIORITY_AUTO,
+    MonotonicProgress,
+    encoder_options,
+    order_by_priority,
+    usable,
+)
 
 __all__ = [
     "MEASURED_PREFETCH_MS",
@@ -236,8 +242,12 @@ def create_proxy(
     # 書きかけの名前を分けておく 同じ素材を 2 回読み込んでも取り合いにならず、
     # 途中で落ちても壊れた控えが残らない
     working = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+    # 次の候補で作り直しても進み具合を戻さない（#365） 戻ると素材の一覧の進み具合が下がる
+    shown = MonotonicProgress(progress) if progress is not None else None
 
-    for name in names:
+    for index, name in enumerate(names):
+        if index > 0 and shown is not None:
+            shown.start_again()
         try:
             made = _transcode(
                 source,
@@ -245,7 +255,7 @@ def create_proxy(
                 height=height,
                 stream_index=stream_index,
                 codec=name,
-                progress=progress,
+                progress=shown.report if shown is not None else None,
                 should_cancel=should_cancel,
             ) and _has_a_frame(working)
             # 最後の 1 枚を書いたあとにやめると言われることがある 置かずに捨てる
