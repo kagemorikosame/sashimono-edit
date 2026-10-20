@@ -19,6 +19,7 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
+from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
@@ -47,6 +48,7 @@ from sashimono.engine.auto_color import DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache import SceneState
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.report import assemble
 from tests.conftest import make_clip
 
@@ -113,6 +115,11 @@ class FakeHost:
         #: 待つ関数が呼ばれた秒と、待った結果
         self.check_waits: list[float] = []
         self.check_ready = True
+        #: 混ぜた音の推移（#322） 入れておくと、頼まれた検査がこの推移で調べ終えた様子になる
+        #: 入れなければ今までどおり、何も調べていない走っている様子から始まる
+        self.heard: SoundProfile | None = None
+        #: 描いた音量のグラフ（#338） 頼まれた順
+        self.graphs: list[SoundGraph] = []
         #: 場面の解析（#321） 試験が素材ごとの様子を入れる 無ければ頼んでいない様子
         self.scene_states: dict[MediaId, SceneState] = {}
         self.scene_requests: list[MediaId] = []
@@ -237,6 +244,10 @@ class FakeHost:
         self.sheets.append(sheet)
         return sheet
 
+    def draw_sound_graph(self, graph: SoundGraph) -> bytes:
+        self.graphs.append(graph)
+        return b"\x89PNG\r\n\x1a\n" + f"graph{len(self.graphs)}".encode()
+
     def probe(self, path: Path) -> MediaItem:
         self.probed.append(path)
         if self.probe_result is None:
@@ -295,6 +306,29 @@ class FakeHost:
                 length_seconds=None,
             )
             self.check = CheckState(request=request, report=empty, running=True)
+            if self.heard is not None:
+                # 推移を入れた試験は、調べ終えた様子にする 書き出した動画は推移の長さを
+                # 動画の長さにする
+                end = (
+                    request.end
+                    if request.project is not None
+                    else max(1, round(self.heard.ticks * 3))
+                )
+                done = assemble(
+                    [],
+                    start=request.start,
+                    end=end,
+                    analyzed=end,
+                    fps=30.0,
+                    complete=True,
+                    limits=request.limits,
+                    index=None,
+                    loudness=self.heard.integrated(),
+                    peak=float(self.heard.peak.max()) if self.heard.ticks else None,
+                    length_seconds=(end - request.start) / 30.0,
+                    sound=self.heard,
+                )
+                self.check = CheckState(request=request, report=done, running=False)
 
     def check_state(self) -> CheckState:
         return self.check
