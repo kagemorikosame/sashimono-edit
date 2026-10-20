@@ -192,6 +192,9 @@ class TestAppSettingsAreReadOnly:
             "check_waiter",
             "export_status",
             "export_waiter",
+            # ナレーション（#335） 作品のフォルダの下の narration を用意し、そこへ WAV を書く
+            # 作品を書く口で、アプリの設定は変えない 書く先は pinned_place で確かめた所だけ
+            "make_narration_folder",
             "probe",
             # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
             "redo",
@@ -216,6 +219,7 @@ class TestAppSettingsAreReadOnly:
             "transcription_status",
             "undo",
             "waveform",
+            "write_narration",
             "write_project",
             "write_snapshot",
             "write_subtitles",

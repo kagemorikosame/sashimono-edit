@@ -216,8 +216,15 @@ def _full_project() -> Project:
         effects=("blur",),
         notes="絵文字は使わない",
     )
+    # 作った声の表記（#335） 空だと書かないので、1 行入れて書く側と読む側を通す
     return Project(
-        settings, timeline, media=(media,), name="試し", scenes=(scene,), style_guide=guide
+        settings,
+        timeline,
+        media=(media,),
+        name="試し",
+        scenes=(scene,),
+        style_guide=guide,
+        credits=("VOICEVOX:ずんだもん",),
     )
 
 

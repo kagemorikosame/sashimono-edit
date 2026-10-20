@@ -12,6 +12,7 @@ from sashimono.core.commands.convert import (
     convert_layers,
     switch_layer_mode,
 )
+from sashimono.core.commands.credits import CREDIT_LIMIT, AddCredits
 from sashimono.core.commands.edit import (
     AddClip,
     AddMedia,
@@ -120,11 +121,13 @@ from sashimono.core.commands.track_order import MoveTrack, reorder_group
 from sashimono.core.commands.work_area import SetWorkArea, export_range
 
 __all__ = [
+    "CREDIT_LIMIT",
     "DEFAULT_GENERATED_FRAMES",
     "DEFAULT_SCENE_FRAMES",
     "DEFAULT_STILL_FRAMES",
     "MARKER_LABEL_LIMIT",
     "AddClip",
+    "AddCredits",
     "AddEffect",
     "AddMarkers",
     "AddMedia",

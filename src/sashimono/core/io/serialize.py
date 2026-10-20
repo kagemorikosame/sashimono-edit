@@ -151,6 +151,8 @@ FORMAT_NAME = "sashimono-project"
 #: 同じ 10 で編集の方針（``style_guide`` #343）も足した 同じ理由で版を分けない 9 までの本体は
 #: 10 を「更新してください」で止めるので、方針を黙って捨てて保存し直すことは無い 方針は
 #: 決めたときだけ書く 9 までのファイルと方針の無いファイルは、空の方針（決めていない）で読む
+#: 同じ 10 で作った声の表記（``credits`` #335）も足した 同じ理由で版を分けない 声を作ったとき
+#: だけ書く 9 までのファイルと表記の無いファイルは、表記なしで読む
 FORMAT_VERSION = 10
 
 #: 映像の終わり（``end_time``）を素材の頭から数え始めた版 これより前の値は捨てる
@@ -877,6 +879,9 @@ def project_to_dict(project: Project) -> dict[str, Any]:
     if not project.style_guide.empty:
         # 決めたときだけ書く 方針を使わない作品のファイルは前と同じ中身のまま
         extra["style_guide"] = style_guide_to_json(project.style_guide)
+    if project.credits:
+        # 表記（#335）も作ったときだけ書く 声を作らない作品のファイルは前と同じ中身のまま
+        extra["credits"] = list(project.credits)
     return {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
@@ -983,10 +988,23 @@ def _project_from_dict(data: object) -> Project:
                 if "style_guide" in root
                 else StyleGuide()
             ),
+            credits=_credits_from_json(root),
         )
     except ValueError as exc:
         # シーンの入れ子が自分へ戻っている、など 壊れたファイルとして伝える
         raise ProjectFileError(str(exc)) from exc
+
+
+def _credits_from_json(root: dict[str, Any]) -> tuple[str, ...]:
+    """表記（#335） 項目の無いファイル（9 まで・声を作っていない作品）は空で読む
+
+    文字でない物があれば壊れたファイルとして断る 黙って捨てると、規約が求める表記を
+    書き出しのときに知らせ漏らす
+    """
+    items = _get_list(root, "credits")
+    if not all(isinstance(item, str) for item in items):
+        raise ProjectFileError("credits に文字列でない物がある")
+    return tuple(items)
 
 
 def _scene_from_json(raw: object) -> Scene:

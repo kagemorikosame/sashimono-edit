@@ -18,6 +18,8 @@
 - 2026-10-17 に保存した見た目と棚を当てる・置く道具を足した（#328） プリセットとエイリアスの
   置き場・棚・``.exo`` は読むだけで、置き場の保存・名前の変更・削除の道具は無い
   （2026-10-17 本人の決定 AI は読むだけ）
+- 2026-10-20 にナレーションの道具を足した（#335） 書くのは作品のフォルダの narration の
+  新しい名前の WAV だけで、取り消せない操作として毎回確かめる 前に作った WAV も素材も書き換えない
 
 ここではそれを試験で押さえる 新しく道具を足して崩れたら落ちる
 """
@@ -123,7 +125,15 @@ UNDOABLE_TOOLS = frozenset(
 #: test_save_and_export.py）で押さえる 足すときは、書く場所を pinned_place か書き出しの
 #: 片付け（ui/ai_export.py）に通してからここへ足す
 FILE_WRITING_TOOLS = frozenset(
-    {"save_project", "save_project_as", "export_video", "export_subtitles", "save_snapshot"}
+    {
+        "save_project",
+        "save_project_as",
+        "export_video",
+        "export_subtitles",
+        "save_snapshot",
+        # ナレーション（#335） 作品のフォルダの narration へ新しい名前の WAV を書く
+        "generate_narration",
+    }
 )
 
 #: 道具のコードがホストに書かせる口と、それを呼んでよい道具の関数
@@ -134,7 +144,13 @@ _HOST_WRITERS = {
     "_export_video": {"start_export"},
     "_export_subtitles": {"write_subtitles"},
     "_save_snapshot": {"write_snapshot"},
+    # 声を作り終えるのを待ってから書く（Pending の続き） 続きは本体の中に書くので、
+    # 本体と続きの両方の名前で数える
+    "_generate_narration": {"make_narration_folder", "write_narration"},
+    "_write_and_place": {"make_narration_folder", "write_narration"},
 }
+#: 上のうち、道具の本体（Operation.approved）ではなく本体の中の続き（待った後に書く所）
+_WRITING_CONTINUATIONS = frozenset({"_write_and_place"})
 
 #: 道具のコードが呼んではいけない、ファイルを書く・消す・動かす呼び出し
 _WRITING_CALLS = frozenset(
@@ -225,7 +241,16 @@ class TestCounted:
             if operation.name in FILE_WRITING_TOOLS:
                 assert operation.approved is not None, operation.name
                 handlers[operation.name] = operation.approved.__name__
-        assert set(handlers.values()) == set(_HOST_WRITERS)
+        assert set(handlers.values()) == set(_HOST_WRITERS) - _WRITING_CONTINUATIONS
+        # 続きは本体の中にだけ書く（本体の外の関数にすると、確かめを通らない所から呼べる）
+        nested = {
+            child.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in handlers.values()
+            for child in ast.walk(node)
+            if isinstance(child, ast.FunctionDef) and child is not node
+        }
+        assert nested >= _WRITING_CONTINUATIONS
         # 本体の中で書く先の身元を採り直さない（確かめの中身の身元で照らす）
         tree = _source(sashimono.ai.operations)
         for node in ast.walk(tree):

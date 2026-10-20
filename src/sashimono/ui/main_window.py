@@ -154,6 +154,7 @@ from sashimono.engine.audio.speech import (
     speaks,
     voice_speech,
 )
+from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import MediaAnalyzer, SceneState
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
@@ -177,7 +178,7 @@ from sashimono.ui.backup_settings import (
 )
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.emphasis_dialog import ask_emphasis
-from sashimono.ui.export_dialog import ExportDialog
+from sashimono.ui.export_dialog import ExportDialog, credit_text
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_save import UndoNotice, undo_offers
@@ -3424,6 +3425,10 @@ class MainWindow(QMainWindow):
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
 
+    @property
+    def narration_settings(self) -> NarrationSettings:
+        return self._preferences.narration_settings
+
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""
         self._checks.start(
@@ -3890,6 +3895,37 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
         return drawn
 
+    def make_narration_folder(self) -> Path:
+        """AI のナレーション（#335）を書くフォルダ 作品のフォルダの下の narration だけを作る"""
+        if self._path is None:
+            raise ToolError("作品をまだ保存していないので、ナレーションを書く場所がありません")
+        folder = self._path.parent / NARRATION_FOLDER
+        try:
+            # 上のフォルダは作らない 作品のフォルダが消えていたら、そこへは書かない
+            folder.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise ToolError(
+                f"ナレーションを書くフォルダを作れませんでした: {folder} ({exc})"
+            ) from exc
+        if not folder.is_dir():
+            raise ToolError(f"{folder} はフォルダではないので、ナレーションを書けません")
+        return folder
+
+    def write_narration(self, path: Path, data: bytes, *, expect: Expected) -> None:
+        """AI が作ったナレーションの WAV を、書いてから名前を付ける書き方で置く（#335）
+
+        新しい名前にだけ書く（:mod:`sashimono.ai.operations` が空いた番号を選ぶ） 許した後に
+        同じ名前が現れていれば置かずに断る（``expect``） 窓は出さない
+        """
+        try:
+            write_atomic_bytes(
+                path, data, expect=replace(expect, keep=self._preferences.backup_generations)
+            )
+        except OSError as exc:
+            raise ToolError(f"ナレーションの WAV を書けませんでした: {path} ({exc})") from exc
+        self._remember_written(path, expect)
+        self.statusBar().showMessage(f"AI アシスタントがナレーションを書いた: {path}", 5000)
+
     def start_export(self, request: ExportRequest) -> None:
         """AI の書き出し 画面の書き出しの窓と同じ作り方の設定で、同じ書き出しの処理を裏で回す"""
         if self._assistant_export.running:
@@ -3956,7 +3992,13 @@ class MainWindow(QMainWindow):
         # 終わったのに次に窓を出したとき進み具合が出たまま残る
         if not indicator.isHidden():
             indicator.hide()
-            self.statusBar().showMessage(str(status.get("message", "")), 8000)
+            message = str(status.get("message", ""))
+            credits = self._document.project.credits
+            if status.get("state") == "done" and credits:
+                # 作った声の表記（#335） AI が書き出したときも人へ知らせる AI の返事だけに
+                # 載せると、読み飛ばした人が表記を入れ忘れる（規約に反するのは本人）
+                message += f" 概要欄などに表記を入れてください: {credit_text(credits)}"
+            self.statusBar().showMessage(message, 15000 if credits else 8000)
 
     def show_chat(self) -> None:
         """AI パネルを前へ出す"""

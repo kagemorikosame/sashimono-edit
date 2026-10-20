@@ -41,6 +41,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState
 from sashimono.engine.checks import CheckRequest, CheckState
@@ -48,6 +49,9 @@ from sashimono.engine.checks.report import assemble
 from tests.conftest import make_clip
 
 RATE_30 = FrameRate(30)
+#: 誰も待ち受けていないエンジンの場所（9 番は discard で、ふつうは閉じている）
+#: 偽のホストの既定はここへ向け、試験が本物の VOICEVOX へつながらないようにする
+CLOSED_ENGINE_URL = "http://127.0.0.1:9"
 
 
 class FakeSheet:
@@ -96,6 +100,11 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: ナレーション（#335）の本人の設定 エンジンの場所は誰も待ち受けていない番号へ向ける
+        #: 既定の 50021 のままだと、VOICEVOX を起動している開発の機械で本物へつながる
+        self.narration = NarrationSettings(url=CLOSED_ENGINE_URL)
+        #: 書いたナレーションの WAV（場所と中身）
+        self.narrations: list[tuple[Path, bytes]] = []
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
@@ -253,6 +262,23 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def narration_settings(self) -> NarrationSettings:
+        return self.narration
+
+    def make_narration_folder(self) -> Path:
+        # 本物（MainWindow）と同じく、作品のフォルダの下の narration だけを作る
+        if self.saved_at is None:
+            raise ToolError("作品をまだ保存していないので、ナレーションを書く場所がありません")
+        folder = self.saved_at.parent / NARRATION_FOLDER
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    def write_narration(self, path: Path, data: bytes, *, expect: Expected) -> None:
+        # 本物と同じ書き方（書いてから名前を付け、許した後に現れた名前は潰さない）
+        write_atomic_bytes(path, data, expect=expect)
+        self.narrations.append((path, data))
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

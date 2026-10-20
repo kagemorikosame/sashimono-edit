@@ -47,8 +47,26 @@ from sashimono.engine.encode import (
 )
 from sashimono.engine.encode import export_project as run_export
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
+from sashimono.ui.system_clipboard import clipboard
 
-__all__ = ["CODEC_LABELS", "RANGE_ALL", "RANGE_WORK_AREA", "ExportDialog"]
+__all__ = [
+    "CODEC_LABELS",
+    "CREDIT_NOTE",
+    "RANGE_ALL",
+    "RANGE_WORK_AREA",
+    "ExportDialog",
+    "credit_text",
+]
+
+
+#: 作った声の表記（#335）を知らせる文 書き出しの窓と、書き終えた知らせで同じ文を使う
+CREDIT_NOTE = "この作品は音声合成の声を使っています 動画の概要欄などに次の表記を入れてください"
+
+
+def credit_text(credits: tuple[str, ...], separator: str = "、") -> str:
+    """作った声の表記（#335）を 1 つの文にする 概要欄へ貼るときは改行で区切る"""
+    return separator.join(credits)
+
 
 #: コーデック名と、画面に出す説明 AI の書き出し（#327）の確かめにも同じ名前を出す
 CODEC_LABELS = {
@@ -208,6 +226,20 @@ class ExportDialog(QDialog):
             )
             note.setWordWrap(True)
             form.addRow("", note)
+        #: 作った声の表記（#335） 声の規約が求める物 書き出す前に見せ、書き終えたときにも知らせる
+        #: 忘れて規約に反するのは本人なので、知らせる所まではアプリが受け持つ
+        self._credits = project.credits
+        if self._credits:
+            credit_note = QLabel(f"{CREDIT_NOTE}\n{credit_text(self._credits, chr(10))}", self)
+            credit_note.setWordWrap(True)
+            credit_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            copy = QPushButton("表記を写す", self)
+            copy.setToolTip("表記をクリップボードへ写す 概要欄にそのまま貼れる")
+            copy.clicked.connect(self._copy_credits)
+            credit_row = QHBoxLayout()
+            credit_row.addWidget(credit_note, 1)
+            credit_row.addWidget(copy)
+            form.addRow("表記", credit_row)
         form.addRow("", self._empty)
 
         self._progress = QProgressBar(self)
@@ -388,8 +420,14 @@ class ExportDialog(QDialog):
             # 閉じるよう頼まれて止めている間に書き終わった 頼まれたとおり閉じる
             super().reject()
             return
-        QMessageBox.information(self, "書き出し", f"書き出しました\n{path}")
+        message = f"書き出しました\n{path}"
+        if self._credits:
+            message += f"\n\n{CREDIT_NOTE}\n{credit_text(self._credits, chr(10))}"
+        QMessageBox.information(self, "書き出し", message)
         self.accept()
+
+    def _copy_credits(self) -> None:
+        clipboard().setText(credit_text(self._credits, "\n"))
 
     def _on_failed(self, message: str) -> None:
         self._teardown()

@@ -9,14 +9,20 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QFrame,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -44,6 +50,17 @@ from sashimono.core.seams import (
     SEAM_VIDEO_NAMES,
     SEAM_VIDEOS,
     SEAM_ZOOM_PERCENT_RANGE,
+)
+from sashimono.engine.audio.voicevox import (
+    AIVIS_ENGINE_URL,
+    AUTO_VOICE,
+    DEFAULT_ENGINE_URL,
+    SPEED_PERCENT_RANGE,
+    VOLUME_PERCENT_RANGE,
+    Catalog,
+    EngineError,
+    VoiceEngine,
+    check_engine_url,
 )
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
@@ -858,6 +875,7 @@ class PreferencesDialog(QDialog):
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
         self._add_seam_rows(form, preferences)
+        self._add_narration_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -1111,6 +1129,16 @@ class PreferencesDialog(QDialog):
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
             seam_audio_fade_ms=self._seam_audio.value(),
+            narration_engine_url=self._narration_url_value(),
+            narration_voice=int(self._narration_voice.currentData()),
+            narration_voice_name=(
+                ""
+                if self._narration_voice.currentData() == AUTO_VOICE
+                else self._narration_voice.currentText()
+            ),
+            narration_speed_percent=self._narration_speed.value(),
+            narration_volume_percent=self._narration_volume.value(),
+            narration_ai_picks_voice=self._narration_ai_picks.isChecked(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
         )
@@ -1214,6 +1242,149 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("つなぎ目: 音のフェード", self._seam_audio)
 
+    def _add_narration_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """ナレーションの生成（#335）の既定 どのエンジンをどこで動かすか・どの声が好きかは
+        人と機械で違う（2026-10-20 利用者の決定 エンジンの場所と既定の声はここに出す）
+        """
+        self._narration_url = QLineEdit(preferences.narration_engine_url, self)
+        self._narration_url.setToolTip(
+            "AI アシスタントがナレーションの声を作るエンジンの場所 本人が入れて起動した"
+            f" VOICEVOX（{DEFAULT_ENGINE_URL}）か AivisSpeech（{AIVIS_ENGINE_URL}）"
+            " 自分の機械の中（127.0.0.1 か localhost）だけを受け付け、台本の文を外へは送らない"
+        )
+        form.addRow("ナレーション: エンジンの場所", self._narration_url)
+
+        self._narration_voice = QComboBox(self)
+        self._narration_voice.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+        if preferences.narration_voice != AUTO_VOICE:
+            # エンジンが動いていなくても、選んだ声を名前で見せる（OK で黙って最初の声へ戻さない）
+            name = preferences.narration_voice_name or f"ID {preferences.narration_voice}"
+            self._narration_voice.addItem(name, preferences.narration_voice)
+            self._narration_voice.setCurrentIndex(1)
+        self._narration_voice.setToolTip(
+            "AI がナレーションに使う声 〔声の一覧を読む〕でエンジンの声を並べてから選ぶ"
+            " 声ごとに規約が違う（企業での利用や非商用だけの声がある）ので〔規約を見る〕で確かめる"
+        )
+        read = QPushButton("声の一覧を読む", self)
+        read.setToolTip("上の場所のエンジンから声の一覧を読む エンジンを起動しておく")
+        read.clicked.connect(self._read_voices)
+        terms = QPushButton("規約を見る", self)
+        terms.setToolTip("選んだ声の規約の文を、エンジンが返したまま見せる")
+        terms.clicked.connect(self._show_voice_terms)
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self._narration_voice, 1)
+        voice_row.addWidget(read)
+        voice_row.addWidget(terms)
+        form.addRow("ナレーション: 既定の声", voice_row)
+        self._narration_status = QLabel("", self)
+        self._narration_status.setWordWrap(True)
+        form.addRow("", self._narration_status)
+        #: 読んだ声の一覧 規約を見るときに声の持ち主を探す
+        self._narration_catalog: Catalog | None = None
+
+        def spin(bounds: tuple[int, int], value: int) -> QSpinBox:
+            box = QSpinBox(self)
+            box.setRange(*bounds)
+            box.setSingleStep(5)
+            box.setSuffix(" %")
+            box.setValue(value)
+            return box
+
+        self._narration_speed = spin(SPEED_PERCENT_RANGE, preferences.narration_speed_percent)
+        self._narration_speed.setToolTip("ナレーションの話す速さ 100% はエンジンの既定の速さ")
+        form.addRow("ナレーション: 話す速さ", self._narration_speed)
+        self._narration_volume = spin(VOLUME_PERCENT_RANGE, preferences.narration_volume_percent)
+        self._narration_volume.setToolTip(
+            "ナレーションを作るときの声の大きさ 置いた後はクリップの音量の欄でも変えられる"
+        )
+        form.addRow("ナレーション: 声の大きさ", self._narration_volume)
+        self._narration_ai_picks = QCheckBox("AI がナレーションの声を選んでよい", self)
+        self._narration_ai_picks.setChecked(preferences.narration_ai_picks_voice)
+        self._narration_ai_picks.setToolTip(
+            "切ると、AI は上の既定の声だけを使う（頼んでも別の声にしない） 入れておいても、"
+            "どの声で作るかは毎回の確かめの窓に出る"
+        )
+        form.addRow(self._narration_ai_picks)
+
+    def _narration_engine(self) -> VoiceEngine | None:
+        """欄の場所のエンジン 場所が受け付けられなければ理由を出して ``None``"""
+        try:
+            return VoiceEngine(self._narration_url.text())
+        except EngineError as exc:
+            self._narration_status.setText(str(exc))
+            return None
+
+    def _read_voices(self, _checked: bool = False) -> None:
+        """エンジンの声を並べる 人が押したときだけ、自分の機械の中のエンジンへつなぐ
+
+        窓は出さず、断りは欄の下に書く 止まった機械で窓を出すと、押すたびに閉じる手間が増える
+        """
+        engine = self._narration_engine()
+        if engine is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            catalog = engine.catalog()
+        except EngineError as exc:
+            self._narration_status.setText(str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._narration_catalog = catalog
+        current = int(self._narration_voice.currentData())
+        box = self._narration_voice
+        box.clear()
+        box.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+        for speaker in catalog.speakers:
+            for style in speaker.styles:
+                box.addItem(f"{speaker.name}（{style.name}）", style.id)
+        index = box.findData(current)
+        if index < 0:
+            # 今の声がこのエンジンに無い 黙って最初の声へ替えず、無いことを見せて残す
+            box.addItem(f"ID {current}（このエンジンに無い声）", current)
+            index = box.count() - 1
+        box.setCurrentIndex(index)
+        voices = sum(len(speaker.styles) for speaker in catalog.speakers)
+        self._narration_status.setText(
+            f"{catalog.engine_name or catalog.brand} の声を {voices} 個読んだ"
+            f" 表記は「{catalog.brand}:声の名前」の形で、書き出しのときに知らせる"
+        )
+
+    def _show_voice_terms(self, _checked: bool = False) -> None:
+        """選んだ声の規約を、エンジンが返した文のまま見せる アプリは中身を判断しない"""
+        if self._narration_catalog is None:
+            self._read_voices()
+        catalog = self._narration_catalog
+        engine = self._narration_engine()
+        if catalog is None or engine is None:
+            return
+        found = catalog.find(int(self._narration_voice.currentData()))
+        if found is None:
+            self._narration_status.setText("選んだ声がエンジンの一覧にありません")
+            return
+        speaker, style = found
+        try:
+            policy = engine.policy(speaker)
+        except EngineError as exc:
+            self._narration_status.setText(str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "声の規約",
+            f"{speaker.name}（{style.name}） 表記: {catalog.credit(speaker)}\n\n"
+            + (policy or "エンジンが規約の文を返しませんでした エンジンのアプリで確かめてください"),
+        )
+
+    def _narration_url_value(self) -> str:
+        """欄のエンジンの場所 受け付けられない場所なら開いたときの値を残す
+
+        受け付けられない場所は :meth:`accept` が窓を開いたまま断る
+        """
+        try:
+            return check_engine_url(self._narration_url.text())
+        except ValueError:
+            return self._given.narration_engine_url
+
     def _send_value(self, kind: Outbound) -> str:
         return str(self._ai_sends[kind].currentData())
 
@@ -1222,6 +1393,12 @@ class PreferencesDialog(QDialog):
 
         断られたら窓を開いたままにして、選び直せるようにする
         """
+        try:
+            check_engine_url(self._narration_url.text())
+        except ValueError as exc:
+            # 外の場所を黙って前の値へ戻すと、直したつもりの人が気付かない 窓を開いたまま知らせる
+            QMessageBox.warning(self, "設定", f"ナレーションのエンジンの場所: {exc}")
+            return
         approved: list[TrimItem] = []
         if not confirm_backup_changes(self, self._backups.before, self.preferences(), approved):
             return
