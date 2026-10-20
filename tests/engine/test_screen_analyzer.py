@@ -89,7 +89,8 @@ def _make(
     made: list[ScreenKind] = []
     found = reader or FakeReader()
 
-    def detectors(kind: ScreenKind) -> FakeReader:
+    def detectors(kind: ScreenKind, ocr: str) -> FakeReader:
+        del ocr
         made.append(kind)
         return found
 
@@ -153,7 +154,7 @@ class TestScreenAnalyzer:
 
     def test_missing_parts_are_kept_as_the_reason(self, tmp_path: Path, video: MediaItem) -> None:
         # 壊れると、部品の無い機械で AI が「まだ調べている」と待ち続け、入れ方も知らされない
-        def missing(_kind: ScreenKind) -> FakeReader:
+        def missing(_kind: ScreenKind, _ocr: str) -> FakeReader:
             raise PartsMissingError("画面の解析の部品が使えません（試験）")
 
         waited: list[MediaItem] = []
@@ -178,7 +179,7 @@ class TestScreenAnalyzer:
         broken = [True]
         reader = FakeReader()
 
-        def detectors(_kind: ScreenKind) -> FakeReader:
+        def detectors(_kind: ScreenKind, _ocr: str) -> FakeReader:
             if broken[0]:
                 raise PartsMissingError("無い")
             return reader
@@ -229,6 +230,63 @@ class TestScreenAnalyzer:
             assert report is not None
             assert all(sample.seconds < 6.0 for sample in report.samples)
             assert report.planned == len(report.samples) == 2 * 3
+        finally:
+            analyzer.close()
+
+    def test_the_chosen_ocr_reads_the_text_and_switching_reads_again(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、設定で「飾った文字も読む」を選んでも Windows の OCR で読み続けるか、
+        # 切り替えた後も前の方式で読んだ文字を返す
+        asked: list[str] = []
+        readers = {"windows": FakeReader("windows-ocr:ja"), "rapidocr": FakeReader("rapidocr:3")}
+
+        def detectors(_kind: ScreenKind, ocr: str) -> FakeReader:
+            asked.append(ocr)
+            return readers[ocr]
+
+        analyzer = ScreenAnalyzer(
+            CacheStore(tmp_path / "c"),
+            scenes=lambda _m, _c: _signal(CUTS),
+            detectors=detectors,
+            ocr="rapidocr",
+        )
+        try:
+            _finish(analyzer, video)
+            report = analyzer.state(video, ScreenKind.TEXT).report
+            assert report is not None and report.engine == "rapidocr:3"
+            analyzer.set_ocr("windows")
+            assert analyzer.state(video, ScreenKind.TEXT).report is None
+            _finish(analyzer, video)
+            again = analyzer.state(video, ScreenKind.TEXT).report
+            assert again is not None and again.engine == "windows-ocr:ja"
+            assert asked == ["rapidocr", "windows"]
+        finally:
+            analyzer.close()
+
+    def test_a_missing_rapidocr_is_not_replaced_by_windows(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、RapidOCR を選んだのに黙って Windows の OCR で読み、飾った文字が読めないまま
+        # RapidOCR の結果だと思い込む 戻した後も前の断りが残ると、Windows の OCR でも読めない
+        def detectors(_kind: ScreenKind, ocr: str) -> FakeReader:
+            if ocr == "rapidocr":
+                raise PartsMissingError("飾った文字の読み取りの部品が入っていません")
+            return FakeReader("windows-ocr:ja")
+
+        analyzer = ScreenAnalyzer(
+            CacheStore(tmp_path / "c"),
+            scenes=lambda _m, _c: _signal(CUTS),
+            detectors=detectors,
+            ocr="rapidocr",
+        )
+        try:
+            _finish(analyzer, video)
+            state = analyzer.state(video, ScreenKind.TEXT)
+            assert state.report is None and state.failure is not None
+            assert "飾った文字" in state.failure
+            analyzer.set_ocr("windows")
+            assert analyzer.state(video, ScreenKind.TEXT).failure is None
         finally:
             analyzer.close()
 

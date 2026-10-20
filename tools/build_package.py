@@ -200,6 +200,8 @@ EXCLUDED_MODULES = (
     # import も辿るので、開発の .venv に入っていると積んでしまう onnxruntime は字幕起こしと共有
     "onnxruntime",
     "winrt",
+    "rapidocr",
+    "cv2",
     # pywin32 本体は使わない AI 連携（mcp）の依存として開発の .venv に入っていると、標準の
     # logging.handlers と numpy.testing の import から拾われ、pywintypes の DLL と、それを
     # 探す道へ足す差し込みまで積まれる CI（pywin32 が無い）で組んだ 0.1.0 の zip には無く、
@@ -232,6 +234,7 @@ RUNTIME_PACKAGES = (
     # 画面の解析（#324） 依存（winrt の名前空間ごとの包み）は辿って数える
     "onnxruntime",
     "winrt-Windows.Media.Ocr",
+    "rapidocr",
 )
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**

@@ -33,6 +33,7 @@ from sashimono.engine.vision import (
     TextLine,
     parts_note,
 )
+from sashimono.engine.vision.parts import rapid_note
 from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
 
@@ -125,6 +126,24 @@ class TestText:
         assert result["samples"][0]["timeline"][0]["frame"] == 60
         assert (result["frame_width"], result["frame_height"]) == (1920, 1080)
         assert "上が正" in result["coordinates"]
+
+    def test_the_result_says_which_ocr_read_it(self, host: FakeHost) -> None:
+        # 壊れると、飾った文字が読めていないときに、AI が Windows の OCR で読んだからだと分からず、
+        # 本人に設定の切り替えを案内できない
+        sample = ScreenSample(2.0, lines=(TELOP,))
+        for engine, way in (("rapidocr:3.10.0", "rapidocr"), ("windows-ocr:ja", "windows")):
+            report = ScreenReport(ScreenKind.TEXT, engine, 640, 360, (sample,), 1, complete=True)
+            _set(host, ScreenKind.TEXT, ScreenState(report, running=False))
+            assert _call(TEXT, host)["ocr"] == way
+        _set(host, ScreenKind.FACES, ScreenState(_report(ScreenKind.FACES), running=False))
+        assert "ocr" not in _call(FACES, host)
+
+    def test_a_missing_rapidocr_explains_the_choice(self, host: FakeHost) -> None:
+        # 壊れると、RapidOCR を選んで入れていない人の所で、AI が設定を戻すか入れるかを案内できない
+        note = rapid_note("飾った文字の読み取り（RapidOCR）の部品が入っていません")
+        _set(host, ScreenKind.TEXT, ScreenState(None, running=False, failure=note))
+        with pytest.raises(ToolError, match="Windows の OCR"):
+            _call(TEXT, host)
 
     def test_a_range_narrows_the_samples(self, host: FakeHost) -> None:
         # 壊れると、長い素材で一部だけを聞いても全部が返り、返事の上限で切れる

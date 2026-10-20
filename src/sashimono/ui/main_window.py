@@ -171,7 +171,7 @@ from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
-from sashimono.engine.vision import VISION_PACK, ScreenKind
+from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
@@ -427,6 +427,7 @@ class MainWindow(QMainWindow):
         self._screen = ScreenAnalyzer(
             scenes=scenes_from(self._analyzer, self._on_analysis_ready),
             per_scene=self._preferences.screen_samples,
+            ocr=self._preferences.ocr_engine,
         )
         # 描画と書き出しの両方が見るので、窓を組み立てる前に決めておく
         native.set_enabled(self._preferences.native_modules)
@@ -1124,6 +1125,7 @@ class MainWindow(QMainWindow):
         裏で調べ続けるなら、切った意味が無い） 入れたら今の素材も調べる
         """
         self._screen.set_per_scene(self._preferences.screen_samples)
+        self._screen.set_ocr(self._preferences.ocr_engine)
         after = self._screen_on_import()
         if before and not after:
             self._screen.cancel()
@@ -2185,7 +2187,18 @@ class MainWindow(QMainWindow):
             self._request_screen_all(media)
 
     def _request_screen_all(self, media: MediaItem) -> None:
+        """読み込んだ素材の文字と顔を頼む 選んだ OCR の部品が無ければ文字は頼まない
+
+        RapidOCR を選んでいて入れていない人の所で頼むと、素材ごとに「部品が無い」失敗を積む
+        （AI が頼んだときは断りの理由と入れ方を返す）
+        """
         for kind in ScreenKind:
+            if (
+                kind is ScreenKind.TEXT
+                and self._preferences.ocr_engine == OCR_RAPID
+                and not RAPIDOCR_PACK.status().ready
+            ):
+                continue
             self._screen.request(media, kind)
 
     def _screen_on_import(self) -> bool:

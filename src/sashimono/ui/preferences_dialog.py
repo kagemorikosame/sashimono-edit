@@ -62,6 +62,12 @@ from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
 from sashimono.engine.scenes import MEASURED_SCENE_SECONDS
+from sashimono.engine.vision.parts import (
+    MEASURED_DECORATED_RATE,
+    MEASURED_OCR_SECONDS,
+    OCR_RAPID,
+    OCR_WINDOWS,
+)
 from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
@@ -165,6 +171,12 @@ SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
 SCREEN_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
     (SCREEN_ON_DEMAND, "AI が頼んだときだけ（既定）"),
     (SCREEN_ON_IMPORT, "読み込んだときに調べる（部品が入っていれば）"),
+)
+
+#: 画面の中の文字を読む方式（:attr:`Preferences.ocr_engine` 2026-10-21 本人の決定）
+OCR_CHOICES: tuple[tuple[str, str], ...] = (
+    (OCR_WINDOWS, "Windows の OCR（速い 既定）"),
+    (OCR_RAPID, "飾った文字も読む（遅い RapidOCR）"),
 )
 
 #: 場面ごとに画面の中身を調べる枚数（:attr:`Preferences.screen_samples`）
@@ -1133,6 +1145,7 @@ class PreferencesDialog(QDialog):
             scene_threads=int(self._scene_threads.currentData()),
             screen_analysis=str(self._screen_analysis.currentData()),
             screen_samples=int(self._screen_samples.currentData()),
+            ocr_engine=str(self._ocr_engine.currentData()),
         )
 
     def _add_screen_rows(self, form: QFormLayout, preferences: Preferences) -> None:
@@ -1171,11 +1184,36 @@ class PreferencesDialog(QDialog):
         )
         parts.clicked.connect(self._open_vision_setup)
         form.addRow("", parts)
+        self._ocr_engine = QComboBox(self)
+        for value, text in OCR_CHOICES:
+            self._ocr_engine.addItem(text, value)
+        self._ocr_engine.setCurrentIndex(max(0, self._ocr_engine.findData(preferences.ocr_engine)))
+        self._ocr_engine.setToolTip(
+            "AI アシスタントが画面の中の文字を読むときの方式 "
+            f"Windows の OCR は速い（{MEASURED_OCR_SECONDS[OCR_WINDOWS]}）が、飾った文字はほとんど"
+            "読めない 「飾った文字も読む」は RapidOCR で読み、遅い"
+            f"（{MEASURED_OCR_SECONDS[OCR_RAPID]}） 実素材の飾った題字で読めた字は"
+            f" Windows の OCR {MEASURED_DECORATED_RATE[OCR_WINDOWS]}・RapidOCR"
+            f" {MEASURED_DECORATED_RATE[OCR_RAPID]} RapidOCR は別の部品で、下のボタンから入れる"
+            "（入れずに選ぶと、AI の頼みは理由と入れ方を返して断る）"
+        )
+        form.addRow("画面の文字を読む方式", self._ocr_engine)
+        rapid = QPushButton("飾った文字の読み取りの部品…", self)
+        rapid.setToolTip(
+            "RapidOCR と OpenCV を入れる（90 MB ほど） 読むモデルは部品の中に入っている"
+        )
+        rapid.clicked.connect(self._open_rapidocr_setup)
+        form.addRow("", rapid)
 
     def _open_vision_setup(self) -> None:
         from sashimono.ui.vision_setup import VisionSetupDialog
 
         VisionSetupDialog(self).exec()
+
+    def _open_rapidocr_setup(self) -> None:
+        from sashimono.ui.vision_setup import rapidocr_setup
+
+        rapidocr_setup(self).exec()
 
     def _add_emphasis_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """強調の動き（#331）の既定 どれだけ寄るか・どれだけ速く動くかは人と作品で違う

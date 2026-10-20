@@ -123,6 +123,8 @@ module = [
     "onnxruntime.*",
     "winrt",
     "winrt.*",
+    "rapidocr",
+    "rapidocr.*",
 ]
 ignore_missing_imports = true
 

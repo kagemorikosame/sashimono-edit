@@ -72,6 +72,7 @@ from sashimono.engine.cache.screen_analyzer import (
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
+from sashimono.engine.vision.parts import OCR_ENGINES, OCR_WINDOWS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryOptions
 from sashimono.ui.media_match import MATCH_ASK, MATCH_MODES
@@ -652,6 +653,10 @@ class Preferences:
     #: 画面の中身を調べるとき、場面ごとに調べる枚数 多いほど場面の中の動き（歩く人・
     #: 流れるテロップ）を拾うが、その分だけ待つ
     screen_samples: int = DEFAULT_SAMPLES_PER_SCENE
+    #: 画面の中の文字を読む方式（2026-10-21 本人の決定） 既定は Windows の OCR（速い 720p で
+    #: 1 枚 0.1 秒ほど） 飾った文字も読みたい人は RapidOCR（1 枚 1 秒ほど 別の部品）を選ぶ
+    #: 実素材の飾った題字で、読めた字は 5% と 56% だった
+    ocr_engine: str = OCR_WINDOWS
     #: 書き出しの窓で前に書き出したフォルダ 空はまだ書き出していない
     #: 好みではなく覚えている物なので、設定画面には出さない 次に開いた書き出しの窓の
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
@@ -982,6 +987,7 @@ class PreferenceStore:
             screen_samples=_member(
                 data.get("screen_samples"), SAMPLES_PER_SCENE_CHOICES, plain.screen_samples
             ),
+            ocr_engine=_choice(data.get("ocr_engine"), OCR_ENGINES, plain.ocr_engine),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
             ai_send_frames=_choice(data.get("ai_send_frames"), SEND_MODES, plain.ai_send_frames),
             ai_send_text=_choice(data.get("ai_send_text"), SEND_MODES, plain.ai_send_text),

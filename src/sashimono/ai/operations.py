@@ -285,7 +285,7 @@ from sashimono.engine.encode import (
     export_target,
 )
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
-from sashimono.engine.vision import ScreenKind, ScreenReport
+from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
 __all__ = [
     "ASK_USER",
@@ -2161,6 +2161,10 @@ def _screen_result(
     }
     if kind is ScreenKind.FACES:
         result["min_score"] = query.min_score
+    else:
+        # どちらの方式で読んだか（本人の設定 Preferences.ocr_engine） 飾った文字が読めていない
+        # ときに、AI が「Windows の OCR で読んだから」と分かるように
+        result["ocr"] = ocr_of(report.engine)
     if not report.by_scene:
         notes.append(
             "場面の切り替わりが分からなかったので、等間隔に調べました"
@@ -5840,14 +5844,15 @@ OPERATIONS: tuple[Operation, ...] = (
         name="detect_text",
         description=(
             "素材（動画）の画面の中の文字（テロップ・看板・スライド）を読む（OCR 読むだけ） "
-            "場面の切り替わりで素材を区切り、場面ごとに数枚を Windows の OCR で手元で読む"
+            "場面の切り替わりで素材を区切り、場面ごとに数枚を手元の OCR で読む"
             "（絵は外へ送らない 読めた文字は送る） 文字のあった絵ごとに source_seconds（素材の秒）"
             "・lines（文と枠）・timeline（その絵が出るタイムラインのフレーム preview_frame へ"
             "渡せる）を返す " + SCREEN_COORDINATES + " 字幕やテキストを画面の文字に重ねずに"
-            "置くときや、スライドの切り替わりで切るときに使う 横書きの普通の文字は読めるが、"
-            "飾った文字・縦書き・小さな文字は読めないことがある 結果は覚え、2 度目からは"
-            "待たない 終わっていなければ wait_seconds まで待ち、それでも終わらなければ読んだ"
-            "所までを返す（complete が false） 部品（画面の解析）が入っていなければ断る"
+            "置くときや、スライドの切り替わりで切るときに使う 読む方式は本人の設定に従い、"
+            "結果の ocr に書く（windows は速いが飾った文字・縦書き・小さな文字は読めないことが"
+            "ある rapidocr は飾った文字も読むが遅い 方式は AI からは変えられない） 結果は覚え、"
+            "2 度目からは待たない 終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
+            "読んだ所までを返す（complete が false） 部品が入っていなければ理由と入れ方を返して断る"
             + PAGING_NOTE
         ),
         schema=_schema(

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from sashimono.core.model import MediaId, MediaItem
 from sashimono.engine.scenes import SceneSignal
 from sashimono.engine.vision import (
+    OCR_WINDOWS,
     Detector,
     PartsMissingError,
     ScreenKind,
@@ -110,13 +111,16 @@ class ScreenAnalyzer:
         store: CacheStore | None = None,
         *,
         scenes: ScenesFor,
-        detectors: Callable[[ScreenKind], Detector] = make_detector,
+        detectors: Callable[[ScreenKind, str], Detector] = make_detector,
         per_scene: int = DEFAULT_SAMPLES_PER_SCENE,
+        ocr: str = OCR_WINDOWS,
     ) -> None:
         self._store = store if store is not None else CacheStore()
         self._scenes = scenes
         self._make_detector = detectors
         self._per_scene = max(1, per_scene)
+        #: 文字を読む方式（:data:`~sashimono.engine.vision.parts.OCR_ENGINES`）
+        self._ocr = ocr
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sashimono-screen")
         self._lock = threading.Lock()
         #: 調べ終える（止まる・落ちるも）たびに起こす AI の道具が待つ
@@ -129,7 +133,7 @@ class ScreenAnalyzer:
         self._cancelled: set[_Key] = set()
         #: 作った調べる係 係のスレッドだけが触る onnxruntime の読み込みは 1 秒ほどかかるので、
         #: 素材ごとに作り直さない
-        self._detectors: dict[ScreenKind, Detector] = {}
+        self._detectors: dict[tuple[ScreenKind, str], Detector] = {}
         self._closed = False
 
     @property
@@ -147,6 +151,26 @@ class ScreenAnalyzer:
                 return
             self._per_scene = max(1, count)
             self._done.clear()
+
+    @property
+    def ocr(self) -> str:
+        return self._ocr
+
+    def set_ocr(self, ocr: str) -> None:
+        """文字を読む方式 次に頼まれた物から効く 覚えた文字の結果と失敗は捨てる
+
+        捨てないと、方式を変えても前の方式で読んだ文字を返し続ける 前の方式の失敗（部品が無い）も
+        捨てる 残すと、Windows の OCR に戻したのに RapidOCR の断りが返る（ディスクの控えは方式
+        ごとに別の鍵なので、戻せば読み直さずに済む）
+        """
+        with self._lock:
+            if ocr == self._ocr:
+                return
+            self._ocr = ocr
+            for key in [key for key in self._done if key[1] is ScreenKind.TEXT]:
+                del self._done[key]
+            for key in [key for key in self._failures if key[1] is ScreenKind.TEXT]:
+                del self._failures[key]
 
     def report(self, media: MediaItem, kind: ScreenKind) -> ScreenReport | None:
         """調べ終えた結果 無いか、素材が変わっていれば ``None``（覚えた物は捨てる）"""
@@ -194,8 +218,8 @@ class ScreenAnalyzer:
             self._cancelled.discard(key)
             self._failures.pop(key, None)
             self._running.add(key)
-            per_scene = self._per_scene
-            self._executor.submit(self._run, media, kind, per_scene)
+            per_scene, ocr = self._per_scene, self._ocr
+            self._executor.submit(self._run, media, kind, per_scene, ocr)
 
     def wait(self, media_id: MediaId, kind: ScreenKind, timeout: float) -> bool:
         """調べ終える（止まる・落ちるも）まで待つ 終わっていれば真 AI のスレッドから呼ぶ"""
@@ -240,18 +264,19 @@ class ScreenAnalyzer:
         with self._lock:
             return self._closed or key in self._cancelled
 
-    def _detector(self, kind: ScreenKind) -> Detector:
-        found = self._detectors.get(kind)
+    def _detector(self, kind: ScreenKind, ocr: str) -> Detector:
+        held = (kind, ocr if kind is ScreenKind.TEXT else OCR_WINDOWS)
+        found = self._detectors.get(held)
         if found is None:
-            found = self._make_detector(kind)
-            self._detectors[kind] = found
+            found = self._make_detector(kind, ocr)
+            self._detectors[held] = found
         return found
 
-    def _run(self, media: MediaItem, kind: ScreenKind, per_scene: int) -> None:
+    def _run(self, media: MediaItem, kind: ScreenKind, per_scene: int, ocr: str) -> None:
         key = (media.id, kind)
         failure: str | None = None
         try:
-            self._examine(media, kind, per_scene)
+            self._examine(media, kind, per_scene, ocr)
         except PartsMissingError as exc:
             failure = str(exc)
         except Exception as exc:  # 裏のスレッドの例外は誰にも見えずに消える 理由として残す
@@ -266,14 +291,14 @@ class ScreenAnalyzer:
                     self._failures[key] = failure
                 self._changed.notify_all()
 
-    def _examine(self, media: MediaItem, kind: ScreenKind, per_scene: int) -> None:
+    def _examine(self, media: MediaItem, kind: ScreenKind, per_scene: int, ocr: str) -> None:
         key = (media.id, kind)
 
         def cancelled() -> bool:
             return self._is_cancelled(key)
 
         # 先に係を作る 部品が無ければ、場面の解析（全フレームを読む）を待たずに断れる
-        detector = self._detector(kind)
+        detector = self._detector(kind, ocr)
         stamp = _stamp(media)
         signal = self._scenes(media, cancelled)
         if cancelled():
@@ -299,7 +324,7 @@ class ScreenAnalyzer:
         if cache_key is not None:
             cached = load_screen(self._store, cache_key)
             if cached is not None:
-                self._publish(key, stamp, cached, per_scene)
+                self._publish(key, stamp, cached, per_scene, ocr)
                 return
         scan = ScreenScan()
         with self._lock:
@@ -317,9 +342,11 @@ class ScreenAnalyzer:
             return
         if cache_key is not None:
             save_screen(self._store, cache_key, report)
-        self._publish(key, stamp, report, per_scene)
+        self._publish(key, stamp, report, per_scene, ocr)
 
-    def _publish(self, key: _Key, stamp: str, report: ScreenReport, per_scene: int) -> None:
+    def _publish(
+        self, key: _Key, stamp: str, report: ScreenReport, per_scene: int, ocr: str
+    ) -> None:
         """結果を載せる 止められていたら載せない（外した素材の結果を残さないため）
 
         調べている間に場面ごとの枚数を変えられたら載せない 載せると、変えた後も前の枚数の
@@ -327,5 +354,8 @@ class ScreenAnalyzer:
         """
         with self._lock:
             if self._closed or key in self._cancelled or per_scene != self._per_scene:
+                return
+            if key[1] is ScreenKind.TEXT and ocr != self._ocr:
+                # 調べている間に OCR の方式を変えられた 前の方式の結果を新しい方式の物として返さない
                 return
             self._done[key] = (stamp, report)

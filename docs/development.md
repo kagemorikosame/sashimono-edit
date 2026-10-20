@@ -1600,6 +1600,14 @@ AI アシスタントの道具 `detect_text`（画面の中の文字 OCR）と `
   写真）で本物の顔が 0.79〜0.92 だった OpenCV Zoo の見本の 0.9 では小さな顔の大半を落とす
 - 外へ送る物（#342）は、読めた文字を字幕と文字（`text`）に数える 画面に映った本人の文
   （資料・看板）に当たるため 顔の位置は数だけなので尋ねない 絵はどちらも送らない
+- 文字を読む方式は設定で選ぶ（`Preferences.ocr_engine` 2026-10-21 利用者の決定） 既定は Windows の
+  OCR（速い） 「飾った文字も読む」は RapidOCR（`engine/vision/rapid.py` 版は 3.10.0 に固定、
+  OpenCV も固定）で、画面の解析とは別の部品（`RAPIDOCR_PACK` 〔飾った文字の読み取りの部品…〕）
+  読み取りのモデル（PP-OCRv6 small）は wheel の中の物を使い、言語の引数は渡さない（渡すと wheel に
+  無いモデルを外から落としに行く） 選んだのに入っていなければ、理由と入れ方を返して断る（黙って
+  Windows の OCR に落とさない） `detect_text` の結果の `ocr` にどちらで読んだかを書く 方式を変えると
+  覚えた文字の結果と失敗を捨てる（控えは方式ごとに別の鍵） RapidOCR を作る所でも onnxruntime を
+  winrt より先に読む
 - 設定は `Preferences.screen_analysis`（既定は AI が頼んだときだけ 読み込んだときに調べるのは
   部品が入っていれば）と `Preferences.screen_samples`（場面ごとの枚数 既定 4）
   1 枚に掛かるのは 1920x1080 で 0.1 秒・3840x2160 で 0.4 秒ほど（`MEASURED_SCREEN_SAMPLE`）

@@ -88,7 +88,7 @@ libiconv・winpthreads・zlib は、組み立てに使った MSYS2 の MinGW か
 
 ## zip に入れず、後から入れる物
 
-字幕起こし・AI アシスタント・画面の解析の部品は zip に入れません 利用者がアプリの中の導入ボタンを
+字幕起こし・AI アシスタント・画面の解析・飾った文字の読み取りの部品は zip に入れません 利用者がアプリの中の導入ボタンを
 押したときに、pip が Python Package Index から入れ、包みごとの使用許諾は入れた包みの dist-info に
 あります 画面の解析（文字と顔の位置）の顔の検出のモデルだけは PyPI に無いので、導入のボタンで
 pip の後に次の所から落とし、決めた sha256 と大きさで照らしてから
@@ -96,6 +96,8 @@ pip の後に次の所から落とし、決めた sha256 と大きさで照ら�
 
 | 部品 | 版 | 使用許諾 | 取得元 | sha256 |
 |---|---|---|---|---|
+| RapidOCR（飾った文字の読み取り 設定で選んだ人だけが入れる 読み取りのモデル PP-OCRv6 small は包みの中にある） | 3.10.0（固定） | Apache-2.0（モデルの PP-OCR も Apache-2.0） | https://github.com/RapidAI/RapidOCR から PyPI の `rapidocr` を pip が入れる | pip が PyPI のハッシュで照らす |
+| OpenCV（RapidOCR が読む `opencv-python-headless`） | 5.0.0.93（固定） | Apache-2.0（wheel に同梱の部品の分は入れた包みの中の使用許諾にある） | https://github.com/opencv/opencv-python から PyPI の包みを pip が入れる | pip が PyPI のハッシュで照らす |
 | YuNet（顔の検出のモデル `face_detection_yunet_2026may.onnx` 229738 バイト） | opencv_zoo のコミット `26cc381e4d2594bb9f47a26eb8fd96c94a13660d` | MIT（Copyright (c) 2020 Shiqi Yu https://github.com/opencv/opencv_zoo/blob/26cc381e4d2594bb9f47a26eb8fd96c94a13660d/models/face_detection_yunet/LICENSE） | https://github.com/opencv/opencv_zoo/tree/26cc381e4d2594bb9f47a26eb8fd96c94a13660d/models/face_detection_yunet | `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0` |
 
 ## ソースの入手先

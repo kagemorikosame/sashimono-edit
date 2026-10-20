@@ -13,29 +13,51 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QWidget
 
-from sashimono.engine.vision import VISION_PACK
+from sashimono.engine.vision import RAPIDOCR_PACK, VISION_PACK
 from sashimono.runtime import FeaturePack
 from sashimono.ui.setup import SetupSection
 
-__all__ = ["VisionSetupDialog"]
+__all__ = ["RAPIDOCR_INTRO", "VISION_INTRO", "VisionSetupDialog", "rapidocr_setup"]
 
 #: 止めるよう頼んだ後、終わったかを見る間隔（ミリ秒）
 _CLOSE_POLL_MS = 150
+
+VISION_INTRO = (
+    "AI アシスタントが素材の画面の中の文字（テロップ・看板・資料）と顔の位置を調べるための"
+    "部品です 文字は Windows の OCR で、顔は顔の検出のモデル（YuNet）で、どちらもこの"
+    "パソコンの中で調べ、絵は外へ送りません 読めた文字は「AI へ送る物」の「字幕と文字」"
+    "として、送る前に尋ねます onnxruntime は字幕起こしと同じ物を使います"
+)
+
+RAPIDOCR_INTRO = (
+    "飾った文字（題字・ゲームの画面の文字など）も読む OCR（RapidOCR）の部品です 設定の"
+    "「画面の文字を読む方式」で「飾った文字も読む」を選んだときに使います 画面の解析の部品"
+    "（onnxruntime）と一緒に使い、OpenCV などを入れます 読むモデルは部品の中に入っていて、"
+    "読むときに外へはつなぎません"
+)
+
+
+def rapidocr_setup(parent: QWidget | None = None) -> VisionSetupDialog:
+    """飾った文字の読み取り（RapidOCR）の部品の導入の窓"""
+    return VisionSetupDialog(
+        parent, pack=RAPIDOCR_PACK, title="飾った文字の読み取りの部品", text=RAPIDOCR_INTRO
+    )
 
 
 class VisionSetupDialog(QDialog):
     """画面の解析の部品の導入の窓"""
 
-    def __init__(self, parent: QWidget | None = None, *, pack: FeaturePack = VISION_PACK) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        pack: FeaturePack = VISION_PACK,
+        title: str = "画面の解析の部品",
+        text: str = VISION_INTRO,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("画面の解析の部品")
-        intro = QLabel(
-            "AI アシスタントが素材の画面の中の文字（テロップ・看板・資料）と顔の位置を調べるための"
-            "部品です 文字は Windows の OCR で、顔は顔の検出のモデル（YuNet）で、どちらもこの"
-            "パソコンの中で調べ、絵は外へ送りません 読めた文字は「AI へ送る物」の「字幕と文字」"
-            "として、送る前に尋ねます onnxruntime は字幕起こしと同じ物を使います",
-            self,
-        )
+        self.setWindowTitle(title)
+        intro = QLabel(text, self)
         intro.setWordWrap(True)
         self.section = SetupSection(pack, self)
         self._buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)

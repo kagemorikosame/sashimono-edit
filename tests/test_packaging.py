@@ -1766,7 +1766,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         # 導入ボタンと違う引数で入れて確かめると、ボタンでは入らない zip が確かめを通って配られる
         from sashimono.ai.environment import AI_PACK
         from sashimono.asr.environment import ASR_PACK
-        from sashimono.engine.vision.parts import VISION_PACK
+        from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
         from sashimono.runtime import install_arguments
 
         pips, _, code = self._frozen_calls(monkeypatch)
@@ -1778,6 +1778,9 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         # 画面の解析（#324）も設定の窓の導入と同じ引数 入れずに配ると、winrt の包みや
         # onnxruntime が配布版で読めないまま、使う人の手元で初めて落ちる
         assert pips[2] == install_arguments(VISION_PACK, target, extra=False)
+        # 飾った文字の読み取り（RapidOCR 2026-10-21）も同じ 入れずに配ると、OpenCV が配布版で
+        # 読めないまま、選んだ人の手元で初めて落ちる
+        assert pips[3] == install_arguments(RAPIDOCR_PACK, target, extra=False)
         assert "--only-binary" in pips[0]
         assert not set(ASR_PACK.extra) & set(pips[1])
 
@@ -1794,14 +1797,17 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         pips, reads, code = self._frozen_calls(monkeypatch)
         assert code == 0
-        assert len(pips) == 3
+        assert len(pips) == 4
         # 入れた導入先だけを、起動のときと同じ読み方でこのプロセスの中で読む
         assert reads == [("add-ons", list(ADD_ON_MODULES))]
-        assert {"claude_agent_sdk", "faster_whisper", "onnxruntime"} <= set(ADD_ON_MODULES)
+        assert {"claude_agent_sdk", "faster_whisper", "onnxruntime", "rapidocr"} <= set(
+            ADD_ON_MODULES
+        )
         # onnxruntime は winrt の包みより先に読む 逆の順ではプロセスごと落ちる（#324）
         winrt = [name for name in ADD_ON_MODULES if name.startswith("winrt")]
         assert winrt
         assert ADD_ON_MODULES.index("onnxruntime") < ADD_ON_MODULES.index(winrt[0])
+        assert ADD_ON_MODULES.index("onnxruntime") < ADD_ON_MODULES.index("rapidocr")
 
     def test_the_read_lines_reach_the_summary(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

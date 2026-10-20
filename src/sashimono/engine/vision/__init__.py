@@ -7,12 +7,26 @@
 """
 
 from .faces import YUNET
-from .parts import VISION_PACK, PartsMissingError, make_detector, parts_note
+from .parts import (
+    OCR_ENGINES,
+    OCR_RAPID,
+    OCR_WINDOWS,
+    RAPIDOCR_PACK,
+    VISION_PACK,
+    PartsMissingError,
+    make_detector,
+    ocr_of,
+    parts_note,
+)
 from .report import Box, Face, ScreenKind, ScreenReport, ScreenSample, TextLine
 from .sampling import fallback_cuts, sample_times
 from .scan import Detector, ScreenScan, scan_screen
 
 __all__ = [
+    "OCR_ENGINES",
+    "OCR_RAPID",
+    "OCR_WINDOWS",
+    "RAPIDOCR_PACK",
     "VISION_PACK",
     "YUNET",
     "Box",
@@ -26,6 +40,7 @@ __all__ = [
     "TextLine",
     "fallback_cuts",
     "make_detector",
+    "ocr_of",
     "parts_note",
     "sample_times",
     "scan_screen",

@@ -37,6 +37,8 @@ from sashimono.engine.vision.faces import (
     suppress,
 )
 from sashimono.engine.vision.ocr import OcrUnavailableError, WindowsOcr, join_words
+from sashimono.engine.vision.parts import OCR_RAPID, OCR_WINDOWS, RAPIDOCR_PACK, ocr_of
+from sashimono.engine.vision.rapid import lines_from
 from sashimono.engine.vision.report import Face
 from sashimono.engine.vision.sampling import (
     EDGE_SECONDS,
@@ -284,6 +286,71 @@ class TestLoadingOrder:
             WindowsOcr()
         assert asked[0] == "onnxruntime"
         assert any(name.startswith("winrt") for name in asked[1:])
+
+
+class TestRapidOcr:
+    def test_the_corners_become_a_box_with_up_positive(self) -> None:
+        # 壊れると、RapidOCR で読んだ文字の位置が上下逆になり、AI が字幕を題字の上へ重ねる
+        corners = np.array([[[10, 20], [110, 22], [110, 60], [10, 58]]], float)
+        lines = lines_from(corners, ("題字",), (640, 360))
+        assert [line.text for line in lines] == ["題字"]
+        box = lines[0].box
+        assert (box.x, box.y) == (60 - 320, 180 - 40)
+        assert (box.width, box.height) == (100, 40)
+
+    def test_nothing_read_gives_no_lines(self) -> None:
+        # 壊れると、文字の無い絵で RapidOCR が空を返したときに落ち、素材ごと調べられない
+        assert lines_from(None, None, (640, 360)) == ()
+
+    def test_choosing_rapidocr_without_it_is_refused_not_replaced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、飾った文字も読むを選んだのに黙って Windows の OCR で読み、題字が読めないまま
+        # RapidOCR の結果だと思い込む
+        import builtins
+
+        real_import = builtins.__import__
+        asked: list[str] = []
+
+        def without_rapidocr(name: str, *arguments: object, **options: object) -> object:
+            asked.append(name)
+            if name == "rapidocr" or name.startswith("winrt"):
+                raise ImportError(name=name)
+            return real_import(name, *arguments, **options)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", without_rapidocr)
+        with pytest.raises(PartsMissingError, match="飾った文字の読み取りの部品"):
+            make_detector(ScreenKind.TEXT, OCR_RAPID)
+        assert not any(name.startswith("winrt") for name in asked)
+        # onnxruntime を先に読む（winrt の後に読むとアプリごと落ちる件と同じ順）
+        assert "onnxruntime" in asked
+        assert asked.index("onnxruntime") < asked.index("rapidocr")
+
+    def test_an_unknown_ocr_is_refused(self) -> None:
+        # 壊れると、設定ファイルの壊れた値で知らない方式を頼み、どちらで読んだか分からなくなる
+        with pytest.raises(PartsMissingError, match="知らない OCR"):
+            make_detector(ScreenKind.TEXT, "なにか")
+
+    def test_the_engine_name_tells_the_way(self) -> None:
+        # 壊れると、detect_text の結果の ocr が実際に読んだ方式と食い違う
+        assert ocr_of("rapidocr:3.10.0") == OCR_RAPID
+        assert ocr_of("windows-ocr:ja") == OCR_WINDOWS
+
+    def test_the_package_is_pinned_and_separate(self) -> None:
+        # 壊れると、画面の解析を入れただけの人に OpenCV（90 MB ほど）を負わせるか、版が動いて
+        # 配布版で確かめていない RapidOCR が入る
+        assert not any("rapidocr" in name for name in VISION_PACK.required)
+        pinned = [name for name in RAPIDOCR_PACK.required if "==" in name]
+        assert any(name.startswith("rapidocr==") for name in pinned)
+        assert any(name.startswith("opencv-python-headless==") for name in pinned)
+
+    def test_the_real_rapidocr_reads_japanese(self) -> None:
+        # 壊れると、RapidOCR を呼ぶ所の形が合わず、飾った文字を選んだ人の所で 1 つも読めない
+        if importlib.util.find_spec("rapidocr") is None:
+            pytest.skip("RapidOCR が無い（飾った文字の読み取りの部品を入れた機械で走る）")
+        detector = make_detector(ScreenKind.TEXT, OCR_RAPID)
+        assert detector.engine.startswith("rapidocr:")
+        assert detector.look(np.zeros((120, 320, 4), np.uint8), 0.0).lines == ()
 
 
 class TestMissingParts:

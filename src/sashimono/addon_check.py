@@ -34,7 +34,7 @@ from pathlib import Path
 from sashimono.ai.environment import AI_PACK
 from sashimono.app import IMPORT_CHECK_FLAG, import_check
 from sashimono.asr.environment import ASR_PACK
-from sashimono.engine.vision.parts import VISION_PACK
+from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
 from sashimono.runtime import FeaturePack, install_arguments, is_frozen, run_pip_in_worker
 
 __all__ = ["ADD_ON_MODULES", "ADD_ON_PACKS", "INSTALL_TIMEOUT", "main", "self_command"]
@@ -42,7 +42,7 @@ __all__ = ["ADD_ON_MODULES", "ADD_ON_PACKS", "INSTALL_TIMEOUT", "main", "self_co
 #: 確かめる機能 使う人が導入の欄で押す物と同じ 画面の解析（#324）は設定の窓から入れる
 #: 顔の検出のモデル（pip の外で落とす物）は確かめない 読み込みは onnxruntime の仕事で、
 #: 配布版で読めるかは onnxruntime の import で分かる 取りに行く所は試験が見る
-ADD_ON_PACKS = (AI_PACK, ASR_PACK, VISION_PACK)
+ADD_ON_PACKS = (AI_PACK, ASR_PACK, VISION_PACK, RAPIDOCR_PACK)
 #: 入れた後に import する名前 送った途端・起こし始めた途端に読まれる物
 #: onnxruntime は winrt の包みより先に読む 逆の順ではアプリごと落ちる
 #: （:func:`sashimono.engine.vision.ocr.load_onnxruntime_first`）
@@ -51,6 +51,9 @@ ADD_ON_MODULES = (
     "faster_whisper",
     "ctranslate2",
     "onnxruntime",
+    # 飾った文字の読み取り（RapidOCR）と、それが読む OpenCV onnxruntime より後に読む
+    "cv2",
+    "rapidocr",
     "winrt.windows.media.ocr",
     "winrt.windows.graphics.imaging",
     "winrt.windows.storage.streams",

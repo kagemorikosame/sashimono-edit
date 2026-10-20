@@ -20,12 +20,21 @@ from sashimono.core.model import MediaItem, Project, VideoStreamInfo
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import ScreenAnalyzer
 from sashimono.engine.vision import ScreenKind
+from sashimono.engine.vision.parts import (
+    MEASURED_DECORATED_RATE,
+    MEASURED_OCR_SECONDS,
+    OCR_ENGINES,
+    OCR_RAPID,
+    OCR_WINDOWS,
+    RAPIDOCR_PACK,
+)
 from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.runtime import FeaturePack
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui import vision_setup
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import (
+    OCR_CHOICES,
     SCREEN_ANALYSIS_CHOICES,
     SCREEN_SAMPLES,
     PreferencesDialog,
@@ -176,6 +185,77 @@ class TestTheDialog:
         assert len(buttons) == 1
         buttons[0].click()
         assert len(opened) == 1
+
+
+class TestTheOcrChoice:
+    def test_windows_is_the_default_and_both_can_be_chosen(self) -> None:
+        # 壊れると、知らない人の所で遅い RapidOCR を使うか、飾った文字を読みたい人が選べない
+        assert Preferences().ocr_engine == OCR_WINDOWS
+        assert {value for value, _text in OCR_CHOICES} == set(OCR_ENGINES)
+
+    def test_the_choice_comes_back_and_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 壊れると、選んだ方式が次の起動で戻るか、壊れた値で知らない方式を頼む
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(ocr_engine=OCR_RAPID))
+        assert store.load().ocr_engine == OCR_RAPID
+        path = tmp_path / "broken.json"
+        path.write_text('{"ocr_engine": "tesseract"}', encoding="utf-8")
+        assert PreferenceStore(path).load().ocr_engine == OCR_WINDOWS
+
+    def test_the_dialog_shows_the_choice_and_the_numbers(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、どちらを選べばどれだけ遅く、どれだけ読めるのか分からないまま選ぶ
+        del qt_application
+        dialog = PreferencesDialog(Preferences(ocr_engine=OCR_RAPID))
+        assert dialog.preferences().ocr_engine == OCR_RAPID
+        tip = dialog._ocr_engine.toolTip()
+        for text in (*MEASURED_OCR_SECONDS.values(), *MEASURED_DECORATED_RATE.values()):
+            assert text in tip
+
+    def test_the_rapidocr_button_opens_its_own_install_window(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、RapidOCR をどこから入れればよいか分からず、AI の断りの案内が嘘になる
+        del qt_application
+        opened: list[QDialog] = []
+
+        def record(self: QDialog) -> int:
+            opened.append(self)
+            return 0
+
+        monkeypatch.setattr(VisionSetupDialog, "exec", record)
+        dialog = PreferencesDialog(Preferences())
+        buttons = [
+            b for b in dialog.findChildren(QPushButton) if b.text() == "飾った文字の読み取りの部品…"
+        ]
+        assert len(buttons) == 1
+        buttons[0].click()
+        assert len(opened) == 1
+        assert isinstance(opened[0], VisionSetupDialog)
+        assert opened[0].section.status.pack is RAPIDOCR_PACK
+
+    def test_the_choice_reaches_the_analyzer(self, window: MainWindow) -> None:
+        # 壊れると、設定で RapidOCR を選んでも Windows の OCR で読み続ける
+        window._apply_preferences(Preferences(ocr_engine=OCR_RAPID))
+        assert window._screen.ocr == OCR_RAPID
+
+    def test_on_import_skips_text_when_rapidocr_is_missing(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、RapidOCR を選んで入れていない人の所で、読み込むたびに部品の無い失敗を積む
+        _parts(monkeypatch, ready=True)
+        missing = SimpleNamespace(ready=False)
+        monkeypatch.setattr(
+            main_window_module, "RAPIDOCR_PACK", SimpleNamespace(status=lambda: missing)
+        )
+        spy = _Spy(window._screen, monkeypatch)
+        window._apply_preferences(
+            Preferences(screen_analysis=SCREEN_ON_IMPORT, ocr_engine=OCR_RAPID)
+        )
+        media = _video()
+        window._request_analysis(media)
+        assert spy.requests == [(str(media.id), ScreenKind.FACES)]
 
 
 class TestTheInstallWindow:
