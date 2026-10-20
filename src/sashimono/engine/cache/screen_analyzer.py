@@ -279,6 +279,11 @@ class ScreenAnalyzer:
         if cancelled():
             return
         duration = float(media.duration)
+        if signal is not None and signal.broken:
+            # 途中で壊れた素材は、読めた所までしか絵を取り出せない その先を予定に数えると、
+            # 取り出せない絵の分だけ「調べ終えた」のに予定より少ない結果になる（実素材の 362 秒の
+            # 動画は 214 秒で壊れていて、9 枚の予定のうち 2 枚を取り出せなかった）
+            duration = min(duration, signal.analyzed)
         by_scene = signal is not None
         stream = signal.stream if signal is not None else None
         if signal is not None:

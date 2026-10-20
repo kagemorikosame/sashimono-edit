@@ -18,6 +18,7 @@ from collections.abc import Sequence
 __all__ = [
     "EDGE_SECONDS",
     "FALLBACK_STEP",
+    "MAX_GAP",
     "MAX_SAMPLES",
     "MEASURED_SCREEN_SAMPLE",
     "MIN_STEP",
@@ -30,6 +31,9 @@ __all__ = [
 EDGE_SECONDS = 0.2
 #: 同じ場面で調べる 2 枚の間の最短の秒 短い場面に何枚も取ると、ほぼ同じ絵を調べるだけになる
 MIN_STEP = 0.5
+#: 長い場面で 2 枚の間を空けてよい最長の秒 場面ごとの枚数（設定）はこれより短い場面の数で、
+#: 長い場面はこの間ごとに足す
+MAX_GAP = 10.0
 #: 1 本の素材で調べる枚数の上限 切り替わりの多い長い素材（数千の場面）で、1 枚ずつ取り出す
 #: 時間が何十分にもならないため 越えるときは場面ごとに 1 枚（場面の真ん中）へ減らし、
 #: それでも越えれば場面を間引く
@@ -59,7 +63,12 @@ def _scene_times(start: float, end: float, per_scene: int) -> list[float]:
         return [start]
     edge = min(EDGE_SECONDS, length / 4)
     inner_start, inner_end = start + edge, end - edge
-    count = max(1, min(per_scene, math.ceil((inner_end - inner_start) / MIN_STEP)))
+    span = inner_end - inner_start
+    count = max(1, min(per_scene, math.ceil(span / MIN_STEP)))
+    # 長い場面は MAX_GAP 秒ごとに 1 枚は取る 5 分の話し手の場面を 4 枚で済ませると、
+    # 話し手が動いた所を見落とす（実素材の 300 秒の場面で 4 枚になり、枚の間で顔の中心が
+    # 絵の幅の 7% 動いていた）
+    count = max(count, math.ceil(span / MAX_GAP))
     step = (inner_end - inner_start) / count
     # 区間を count 等分した真ん中 頭と終わりの寄りを避けたうえで、場面の中をまんべんなく見る
     return [inner_start + step * (index + 0.5) for index in range(count)]

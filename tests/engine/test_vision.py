@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import math
 from pathlib import Path
 
@@ -37,7 +38,13 @@ from sashimono.engine.vision.faces import (
 )
 from sashimono.engine.vision.ocr import OcrUnavailableError, WindowsOcr, join_words
 from sashimono.engine.vision.report import Face
-from sashimono.engine.vision.sampling import EDGE_SECONDS, MAX_SAMPLES, MIN_STEP, scene_bounds
+from sashimono.engine.vision.sampling import (
+    EDGE_SECONDS,
+    MAX_GAP,
+    MAX_SAMPLES,
+    MIN_STEP,
+    scene_bounds,
+)
 from sashimono.model_files import models_root
 
 # --- 調べる時刻 ---
@@ -59,6 +66,13 @@ class TestSampleTimes:
         times = sample_times((1.0,), 1.6, 8)
         short = [t for t in times if t >= 1.0]
         assert len(short) == math.ceil((0.6 - 2 * min(EDGE_SECONDS, 0.6 / 4)) / MIN_STEP)
+
+    def test_a_long_scene_is_looked_at_every_few_seconds(self) -> None:
+        # 壊れると、5 分の話し手の場面を 4 枚で済ませ、話し手が動いた所で縦の枠が顔から外れる
+        times = sample_times((), 300.0, 4)
+        assert len(times) >= 300 / MAX_GAP
+        gaps = [later - earlier for earlier, later in itertools.pairwise(times)]
+        assert max(gaps) <= MAX_GAP
 
     def test_a_long_material_with_many_cuts_stays_under_the_limit(self) -> None:
         # 壊れると、切り替わりが数千ある素材で何千枚も取り出し、AI が何十分も待つ

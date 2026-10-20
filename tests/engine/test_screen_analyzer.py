@@ -216,6 +216,22 @@ class TestScreenAnalyzer:
         finally:
             second.close()
 
+    def test_a_broken_material_is_only_looked_at_where_it_can_be_read(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、途中で壊れた素材で取り出せない絵まで予定に数え、調べ終えたのに予定より
+        # 少ない結果になり、AI が後ろの場面を調べ損ねたと取り違える
+        broken = replace(_signal((2.0, 4.0)), complete=False, broken=True, analyzed=6.0)
+        analyzer, _reader, _ = _make(tmp_path, scenes=lambda _m, _c: broken)
+        try:
+            _finish(analyzer, video)
+            report = analyzer.state(video, ScreenKind.TEXT).report
+            assert report is not None
+            assert all(sample.seconds < 6.0 for sample in report.samples)
+            assert report.planned == len(report.samples) == 2 * 3
+        finally:
+            analyzer.close()
+
     def test_changing_the_count_looks_again(
         self, made: tuple[ScreenAnalyzer, FakeReader, list[ScreenKind]], video: MediaItem
     ) -> None:

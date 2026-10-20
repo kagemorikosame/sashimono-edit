@@ -21,7 +21,8 @@ SUFFIX = ".screen.json"
 
 #: 保存形式の版 調べる時刻の選び方（:mod:`sashimono.engine.vision.sampling`）や結果の形を
 #: 変えたら上げる 上げないと、前の選び方で調べた結果を今の物として返す
-FORMAT_VERSION = 1
+#: 2 で長い場面を 10 秒ごとに調べるようにした（:data:`~sashimono.engine.vision.sampling.MAX_GAP`）
+FORMAT_VERSION = 2
 
 
 def screen_key(
