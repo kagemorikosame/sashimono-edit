@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation
+from sashimono.ai.plan import PLAN_TOOLS
 from sashimono.core.io.serialize import json_text
 
 __all__ = ["SERVER_NAME", "build_server", "build_tools", "tool_name", "tool_names"]
@@ -49,23 +50,33 @@ def tool_names(*, writes: bool | None = None) -> list[str]:
     ]
 
 
-def build_tools(bridge: EditorBridge, *, ask: bool = True) -> list[SdkMcpTool[Any]]:
+def build_tools(
+    bridge: EditorBridge, *, ask: bool = True, plan: bool = True
+) -> list[SdkMcpTool[Any]]:
     """ブリッジに繋がった MCP ツールを組み立てる
 
     サーバとは別に取り出せるようにしてある ``create_sdk_mcp_server`` が返す
     設定からはツールを覗けないので、試験からはこちらを使う
     ``ask`` を切ると質問の道具（ask_user）を渡さない 設定で「AI が質問する」を
     切った人に、道具だけ残って聞かれることが無いように
+    ``plan`` を切ると計画の道具（#340）を渡さない 設定で計画を切った人の会話で、
+    道具だけ見えて計画を書きに来ることが無いように
     """
-    return [_wrap(operation, bridge) for operation in OPERATIONS if ask or not operation.asks]
+    return [
+        _wrap(operation, bridge)
+        for operation in OPERATIONS
+        if (ask or not operation.asks) and (plan or operation.name not in PLAN_TOOLS)
+    ]
 
 
-def build_server(bridge: EditorBridge, *, ask: bool = True) -> McpSdkServerConfig:
+def build_server(
+    bridge: EditorBridge, *, ask: bool = True, plan: bool = True
+) -> McpSdkServerConfig:
     """ブリッジに繋がった MCP サーバを作る"""
     from claude_agent_sdk import create_sdk_mcp_server
 
     return create_sdk_mcp_server(
-        name=SERVER_NAME, version="1.0.0", tools=build_tools(bridge, ask=ask)
+        name=SERVER_NAME, version="1.0.0", tools=build_tools(bridge, ask=ask, plan=plan)
     )
 
 

@@ -25,6 +25,17 @@ from typing import Any
 
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
+from sashimono.ai.plan import (
+    GET_PLAN,
+    GOAL_LIMIT,
+    NOTE_LIMIT,
+    SET_PLAN,
+    STEP_LIMIT,
+    STEPS_RANGE,
+    UPDATE_PLAN_STEP,
+    StepState,
+    plan_for,
+)
 from sashimono.ai.safety import (
     Consent,
     Safety,
@@ -495,6 +506,24 @@ def _flag_argument(arguments: dict[str, Any], key: str, default: bool) -> bool:
 def _ask_user(host: EditorHost, arguments: dict[str, Any]) -> object:
     del host  # 編集画面には触らない 答えを待つのはブリッジ
     return question_spec(arguments)
+
+
+# --- 長い作業の計画（#340） ---
+
+
+def _set_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
+    return plan_for(host.document).make(arguments.get("goal"), arguments.get("steps"))
+
+
+def _update_plan_step(host: EditorHost, arguments: dict[str, Any]) -> object:
+    return plan_for(host.document).mark(
+        arguments.get("step"), arguments.get("state"), arguments.get("note", "")
+    )
+
+
+def _get_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    return plan_for(host.document).read()
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -4842,6 +4871,12 @@ _SEAM_ARGUMENTS: dict[str, Any] = {
 }
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
+#: 計画を読む道具（#340） 目標と手順は AI が自分で書いた文で、計画を作った人の指示も添える
+#: どちらも会話の中身だが、AI が読んだ素材の名前や字幕の文を手順に書き写していることがある
+#: 名前と場所は道具を問わず伏せ（断った人には伏せ字で送る）、字幕と文字は尋ねずに伏せて
+#: 送る（取り消しと同じ 断ると、字幕を送らない人は止めた所から続けられない）
+_PLAN = frozenset({Outbound.CONVERSATION, Outbound.TEXT, Outbound.FILES})
+_HIDDEN_IN_PLAN = frozenset({Outbound.TEXT})
 
 
 OPERATIONS: tuple[Operation, ...] = (
@@ -6575,6 +6610,76 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_ask_user,
         sends=_CONVERSATION,
         asks=True,
+    ),
+    # 長い作業の計画（#340） 作品は変えない（パネルの計画の欄だけ） 人は欄を見て止める・続ける
+    Operation(
+        name=SET_PLAN,
+        description=(
+            "何手もかかる頼み（目安は手順が 3 つ以上）を始める前に、目標と手順を AI のパネルの"
+            "計画の欄に出す ユーザーは進み具合を見て、区切りで止めたり続きを頼んだりする"
+            " 前の計画は捨てる 1〜2 手で済む頼みには使わない"
+        ),
+        schema=_schema(
+            {
+                "goal": {
+                    "type": "string",
+                    "description": f"何を仕上げる計画か（{GOAL_LIMIT} 文字まで）",
+                    "maxLength": GOAL_LIMIT,
+                },
+                "steps": {
+                    "type": "array",
+                    "description": (
+                        f"手順 {STEPS_RANGE[0]}〜{STEPS_RANGE[1]} 個 やる順に、それぞれ何を"
+                        "するかを短く"
+                    ),
+                    "minItems": STEPS_RANGE[0],
+                    "maxItems": STEPS_RANGE[1],
+                    "items": {"type": "string", "maxLength": STEP_LIMIT},
+                },
+            },
+            ["goal", "steps"],
+        ),
+        handler=_set_plan,
+        # 返すのは手順の数と次の番号だけ 書いた文は返さない（書いた本人が持っている）
+        sends=_CONVERSATION,
+    ),
+    Operation(
+        name=UPDATE_PLAN_STEP,
+        description=(
+            "計画の手順の進み具合を書く 取りかかる時に running、終えたら done、やめたら"
+            " skipped、できなければ failed（訳を note に） 結果に paused があればユーザーが"
+            "区切りで止めたので、道具を使わずに済んだことと残りを伝えて終える"
+        ),
+        schema=_schema(
+            {
+                "step": _integer("手順の番号（1 から）"),
+                "state": {
+                    "type": "string",
+                    "enum": [state.value for state in StepState],
+                    "description": "進み具合",
+                },
+                "note": {
+                    "type": "string",
+                    "description": f"添える一言（{NOTE_LIMIT} 文字まで 省いてよい）",
+                    "maxLength": NOTE_LIMIT,
+                },
+            },
+            ["step", "state"],
+        ),
+        handler=_update_plan_step,
+        # 返すのは番号と進み具合の数だけ 手順の文も添えた一言も返さない
+        sends=_CONVERSATION,
+    ),
+    Operation(
+        name=GET_PLAN,
+        description=(
+            "今の計画（目標・計画を作ったときの指示・手順ごとの進み具合と一言・止めた訳）を読む"
+            " 計画の続きを頼まれたら、まずこれで済んだ手順と止めた所を確かめる"
+        ),
+        schema=_schema({}),
+        handler=_get_plan,
+        sends=_PLAN,
+        hidden=_HIDDEN_IN_PLAN,
     ),
 )
 

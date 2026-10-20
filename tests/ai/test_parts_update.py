@@ -517,9 +517,11 @@ class _Session:
         effort: str | None,
         system_prompt: str = SYSTEM_PROMPT,
         ask: bool = True,
+        plan: bool = True,
     ) -> None:
         del bridge, model, effort, system_prompt
         self.ask = ask
+        self.plan = plan
         self.prompts: list[str] = []
         self.closed = False
         self.busy = False

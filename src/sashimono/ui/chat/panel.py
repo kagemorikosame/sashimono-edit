@@ -51,6 +51,7 @@ from sashimono.ai.environment import claude_cli, credentials_found, open_login_w
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
+from sashimono.ai.plan import RESUME_PROMPT, Stopped
 from sashimono.ai.session import (
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
@@ -63,6 +64,7 @@ from sashimono.ai.session import (
 )
 from sashimono.core.commands import Author
 from sashimono.ui.chat.parts_updater import PartsUpdater
+from sashimono.ui.chat.plan_box import PlanBox, plan_progress
 from sashimono.ui.chat.send_consent import ask_send
 from sashimono.ui.disclosure import DisclosureButton
 from sashimono.ui.flow_layout import FlowLayout
@@ -246,6 +248,10 @@ class ChatPanel(QWidget):
         self._question: Question | None = None
         #: あいまいなときに AI に質問させるか（設定） 会話を作るときに指示の文と道具へ渡す
         self._ask_questions = True
+        #: 長い作業は計画を先に示させるか（設定 #340） 質問と同じく会話を作るときに渡す
+        self._plan_first = True
+        #: 開いている作品の計画（#340） ブリッジと同じ物を見る
+        self._plan = self._bridge.plan
         self._checkpoint_open = False
         #: 外へ送ってよいかを尋ねる窓（#342） 試験はここを差し替えて答える
         self.ask_send: Callable[[QWidget | None, SendRequest], SendAnswer | None] = ask_send
@@ -451,6 +457,13 @@ class ChatPanel(QWidget):
 
         self._build_question_box()
 
+        # 長い作業の計画と進み具合（#340） 会話の欄の真下に置く 確かめの箱や質問の箱より上に
+        # 置くのは、それらが出ている間も、どの手順の中で止まっているかが読めるように
+        self._plan_box = PlanBox(self)
+        self._plan_box.pause_requested.connect(self.pause_plan)
+        self._plan_box.resume_requested.connect(self.resume_plan)
+        self._plan_box.close_requested.connect(self.close_plan)
+
         # 部品が古くて断られたときの案内 その場で押せる更新のボタンを添える
         # 案内の文だけだと、どこで更新するのかを探させることになる
         self._update_box = QFrame(self)
@@ -525,6 +538,7 @@ class ChatPanel(QWidget):
         layout.addWidget(self._parts_box)
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
+        layout.addWidget(self._plan_box)
         layout.addWidget(self._approval_box)
         layout.addWidget(self._question_box)
         layout.addWidget(self._update_box)
@@ -732,6 +746,7 @@ class ChatPanel(QWidget):
         # 選び直しの当て直し（_select_choices の中の _restart_when_idle）より先に持つ
         # 後にすると、切り替えた設定で会話を作り直す機会を逃す
         self._ask_questions = preferences.ai_ask_questions
+        self._plan_first = preferences.ai_plan_first
         self._select_choices(preferences.ai_model, preferences.ai_effort)
         self._animate = preferences.ai_busy_animation
         self._alert_when_done = preferences.ai_done_alert
@@ -785,6 +800,17 @@ class ChatPanel(QWidget):
                 "AI が質問するかの設定が変わったので、次の指示から新しい会話を始めます"
                 "（それまでのやり取りは引き継ぎません）"
             )
+        elif session.plan != self._plan_first:
+            # 計画の決まりと道具も同じ（#340） 繋ぎ直さないと、切った人の会話でまだ計画を書く
+            # 計画そのものは作品に付けて持つので、繋ぎ直しても〔続ける〕で続きから頼める
+            self._restart_session(
+                "AI が計画を示すかの設定が変わったので、次の指示から新しい会話を始めます"
+                "（それまでのやり取りは引き継ぎません）"
+            )
+
+    def _settings_changed(self, session: AgentSession) -> bool:
+        """会話を作るときにしか渡せない設定（質問と計画）が、会話を作った後に変わったか"""
+        return session.ask != self._ask_questions or session.plan != self._plan_first
 
     def _wanted(self) -> tuple[str | None, str | None]:
         """いま選んでいる組を、会話が持つ形（空は None）で"""
@@ -818,7 +844,7 @@ class ChatPanel(QWidget):
         self._session = None
         session.close(wait=False)
         self._note(
-            "AI が質問するかの設定が変わったので、残りの指示は新しい会話で始めます"
+            "AI の進め方の設定（質問・計画）が変わったので、残りの指示は新しい会話で始めます"
             "（それまでのやり取りは引き継ぎません）"
         )
         self._pass_held()
@@ -854,13 +880,16 @@ class ChatPanel(QWidget):
         if not self._setup.status.ready:
             self.status_message.emit("AI 連携の環境が入っていません")
             return
+        self._input.clear()
+        self._submit(prompt)
 
+    def _submit(self, prompt: str) -> None:
+        """指示を並べて会話へ渡す 入力欄から送った指示も、計画の〔続ける〕も同じ道を通る"""
         # 「ログイン…」から済ませたかもしれない 済んでいれば案内を下げる
         self._login_box.setVisible(not credentials_found())
         # 方式を変えても知らせは来ない 送る前に確かめ、前の指示がすべて終わっていれば
         # 今の方式の説明で会話を作り直す（指示が残っている間は、終わった所で当てる）
         self._restart_when_idle()
-        self._input.clear()
         self._say("あなた", prompt)
         self._queued.append(prompt)
         if len(self._queued) == 1:
@@ -914,8 +943,11 @@ class ChatPanel(QWidget):
                 self._bridge,
                 model=model,
                 effort=effort,
-                system_prompt=system_prompt(layer_mode, ask=self._ask_questions),
+                system_prompt=system_prompt(
+                    layer_mode, ask=self._ask_questions, plan=self._plan_first
+                ),
                 ask=self._ask_questions,
+                plan=self._plan_first,
             )
         self._session.send(prompt)
 
@@ -1102,9 +1134,10 @@ class ChatPanel(QWidget):
                     self._open_checkpoint(self._queued[0])
                     self._begin_turn()
                 session = self._session
-                if session is not None and self._queued and session.ask != self._ask_questions:
-                    # 応えている間に「AI が質問する」を変えた 残りの指示を今の会話で続けると、
-                    # 切った後も質問され、入れた後も聞き返されない 会話を作り直して渡し直す
+                if session is not None and self._queued and self._settings_changed(session):
+                    # 応えている間に「AI が質問する」か「計画を示す」を変えた 残りの指示を今の
+                    # 会話で続けると、切った後も質問され（計画を書かれ）、入れた後も聞き返されない
+                    # 会話を作り直して渡し直す
                     self._carry_over_queue()
                 elif session is not None:
                     # 段を付け替え終えてから次の指示を始めさせる 先に始めると、
@@ -1381,10 +1414,49 @@ class ChatPanel(QWidget):
         self._question = None
         self._question_box.setVisible(False)
 
+    # --- 長い作業の計画（#340） ---
+
+    def _refresh_plan(self) -> None:
+        """計画の欄を今の計画に合わせる 別の作品を開いていたら、前の作品の計画を閉じる"""
+        if self._plan.follow(self._host.document.generation):
+            # 前の作品の計画を次の作品で続けると、別の作品のクリップを手順どおりに変えかねない
+            self._note("別の作品を開いたので、前の作品の計画を閉じました")
+        self._plan_box.show_plan(
+            self._plan.view(),
+            working=bool(self._queued),
+            ready=self._setup.status.ready,
+        )
+
+    def pause_plan(self) -> None:
+        """〔区切りで止める〕 今の手順を終えた所で止める（すぐ止めるのは〔中断〕）"""
+        if not self._queued or not self._plan.request_pause():
+            return
+        self._note(
+            "今の手順を終えた所で止めます（すぐに止めるなら〔中断〕 止めた後は〔続ける〕で"
+            "続きを頼めます）"
+        )
+        self._refresh_status()
+
+    def resume_plan(self) -> None:
+        """〔続ける〕 止めた所から残りの手順を頼む 応えている間は並べない"""
+        view = self._plan.view()
+        if self._queued or view is None or view.finished or not self._setup.status.ready:
+            # 応えている間に並べると、今の指示の後ろで「続けて」が走り、止めた所が分からなくなる
+            return
+        self._submit(RESUME_PROMPT)
+
+    def close_plan(self) -> None:
+        """計画の欄の〔×〕 応えている間は閉じない（AI が手順の印を書けずに失敗が並ぶ）"""
+        if self._queued:
+            return
+        self._plan.discard()
+        self._refresh_status()
+
     # --- 状態の行 ---
 
     def _begin_turn(self) -> None:
-        """次の指示に取りかかった 秒と数を数え直す"""
+        """次の指示に取りかかった 秒と数を数え直す 計画を止めていたら外す（#340）"""
+        self._plan.begin_turn(self._queued[0] if self._queued else "")
         self._turn_started = self._clock()
         self._turn_tools = 0
         self._turn_failures = 0
@@ -1415,6 +1487,12 @@ class ChatPanel(QWidget):
             counts += f"・失敗 {self._turn_failures} 件"
         elapsed = _duration(self._clock() - started)
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
+        # 手順が残っていれば、止まった訳を計画に残す（#340） 欄が〔続ける〕を出す
+        self._plan.end_turn(interrupted=self._stopping)
+        view = self._plan.view()
+        if view is not None and view.stopped is Stopped.PAUSED:
+            # 欄だけだと、区切りで止まったのか自分で終えたのかが会話の欄から読めない
+            self._note(f"計画を区切りで止めました（{plan_progress(view)}）")
         self._stopping = False
 
     @property
@@ -1457,6 +1535,12 @@ class ChatPanel(QWidget):
             head = "実行中"
         started = self._turn_started
         line = head if started is None else f"{head}（{_duration(self._clock() - started)}）"
+        plan = self._plan.view()
+        if plan is not None and not plan.finished:
+            # 長い作業のどこにいるかを、欄を巻き戻さなくても読めるようにする（#340）
+            line += f"・{plan_progress(plan)}"
+            if plan.pause_requested:
+                line += "・区切りで止めます"
         waiting = len(self._queued) - 1
         if waiting > 0:
             line += f"・待ち {waiting} 件"
@@ -1467,7 +1551,10 @@ class ChatPanel(QWidget):
 
         見張りの時計から 80 ミリ秒ごとに呼ばれるので、変わった所だけを書き換える
         同じ文を書き直すだけでも、文字の欄は大きさを測り直して窓の配置をやり直す
+        計画の欄（#340）もここで合わせる AI が道具で書いた進み具合も、指示の始めと終わりも、
+        この後の状態の行と同じ回で欄に出る
         """
+        self._refresh_plan()
         line = self._status_line()
         if self._status_text.text() != line:
             self._status_text.setText(line)

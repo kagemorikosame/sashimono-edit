@@ -11,6 +11,8 @@ Claude Agent SDK は自前の asyncio ループを別スレッドで回す そ�
 AI からの質問（ask_user #296）も同じ形で運び、答えが返るまで止まる
 外へ送る物の同意（#342 :mod:`sashimono.ai.outbound`）も同じ形で運ぶ 道具を動かす前に、
 結果に入りうる物（:attr:`Operation.sends`）のうちまだ許されていない物を尋ねる
+長い作業の計画（#340 :mod:`sashimono.ai.plan`）を人が区切りで止めた後は、計画の道具の
+ほかは動かさずに断る
 
 :class:`~sashimono.engine.cache.MediaAnalyzer` や字幕起こしと同じ「キューに積んで
 タイマーで拾う」形にしてある Qt のシグナルをスレッドまたぎで使うより、いつ実行
@@ -48,6 +50,7 @@ from sashimono.ai.outbound import (
     secret_pairs,
     text_secrets,
 )
+from sashimono.ai.plan import WorkPlan, plan_for
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "EditorBridge", "Question"]
@@ -159,6 +162,9 @@ class EditorBridge:
 
     def __init__(self, host: EditorHost, *, auto_approve: bool = False) -> None:
         self._host = host
+        #: 開いている作品の計画（#340） 文書は作品を開き直しても同じ物なので、作ったときに
+        #: 引いておけば AI のスレッドから編集画面を通さずに止めたかを見られる
+        self.plan: WorkPlan = plan_for(host.document)
         self._work: queue.Queue[_Work] = queue.Queue()
         self._approvals: queue.Queue[Approval] = queue.Queue()
         self._cancel = threading.Event()
@@ -190,7 +196,12 @@ class EditorBridge:
 
         外へ送る物の同意（#342）は、許可より先に取る 送らないと決まった道具の許可を
         尋ねても、許した後に断るだけになる
+        区切りで止めた後（#340）は、同意も許可も尋ねる前に断る 止めた人に、止めた後の
+        道具の確かめの窓を出さない
         """
+        paused = self.plan.refusal(operation.name)
+        if paused:
+            raise ToolError(paused)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く

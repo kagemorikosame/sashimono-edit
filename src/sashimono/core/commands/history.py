@@ -99,7 +99,19 @@ class Document:
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
+        #: 別の作品へ差し替えた（:meth:`reset`）回数 :attr:`generation` を見る
+        self._generation = 0
         self._remember(project)
+
+    @property
+    def generation(self) -> int:
+        """別の作品へ差し替えるたびに 1 つ増える数
+
+        作品の外で、開いている作品に付けて持つ物（AI の作業の計画 #340）が、今の作品の物かを
+        見分けるのに使う 文書は作品を開き直しても同じ物を使い回すので、文書だけで見ると
+        前の作品の計画を次の作品で続けてしまう
+        """
+        return self._generation
 
     @property
     def seen_media(self) -> tuple[SeenMedia, ...]:
@@ -534,6 +546,7 @@ class Document:
         self._undo.clear()
         self._redo.clear()
         self._merge_anchor = None
+        self._generation += 1
         self._set_project(project)
 
     def _push_undo(self, entry: HistoryEntry) -> None:
