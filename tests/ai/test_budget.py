@@ -41,6 +41,10 @@ def _operation(name: str) -> Operation:
     return found
 
 
+#: 道具が返るのを待つ上限（秒） 返ればすぐ戻る 並べて走らせた CI でスレッドの切り替えが
+#: 遅れても、待ちの長さで落ちないように取る（結果を見る試験で、速さは見ない）
+WAIT = 60.0
+
 PREVIEW = _operation("preview_frame")
 SHEET = _operation("contact_sheet")
 READ = _operation("get_selection")
@@ -400,7 +404,7 @@ class TestDailyStore:
         assert store.load(day).tokens == 4
 
 
-def _wait_for_request(bridge: EditorBridge, timeout: float = 5.0) -> BudgetRequest:
+def _wait_for_request(bridge: EditorBridge, timeout: float = WAIT) -> BudgetRequest:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         bridge.pump()
@@ -423,13 +427,13 @@ class TestBridge:
         # 壊れると、上限を越えた絵も描いて送り、設定した枚数を守らない
         bridge = _bridge(host, Limits(turn_images=1, action=LimitAction.STOP))
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 0})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert "result" in box
         sent = bridge.usage.turn_usage()
         assert sent is not None
         assert sent.images == 1
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 1})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         error = box.get("error")
         assert isinstance(error, ToolError)
         assert "上限" in str(error)
@@ -445,7 +449,7 @@ class TestBridge:
         bridge.usage.record_message("a", {"output_tokens": 10})
         for _ in range(2):
             done, box = call_in_thread(bridge, READ, {})
-            pump_until(bridge, done)
+            pump_until(bridge, done, WAIT)
             assert isinstance(box.get("error"), ToolError)
         # 断った訳を返しても呼び続けたら、画面に会話を止めさせる
         assert bridge.wants_halt
@@ -460,7 +464,7 @@ class TestBridge:
         assert host.rendered == []
         assert request.overrun.kind is LimitKind.TURN_IMAGES
         assert request.reply(True)
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert "result" in box
         assert host.rendered == [(3, 640)]
         # 1 枚分だけ広がった 次の絵ではまた尋ねる
@@ -475,10 +479,10 @@ class TestBridge:
         done, box = call_in_thread(bridge, READ, {})
         request = _wait_for_request(bridge)
         assert request.reply(False)
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert isinstance(box.get("error"), ToolError)
         done, box = call_in_thread(bridge, READ, {})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert isinstance(box.get("error"), ToolError)
         assert bridge.take_budget_request() is None
 
@@ -500,7 +504,7 @@ class TestBridge:
         bridge.begin_turn()
         bridge.usage.record_image()
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 0})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert isinstance(box.get("error"), ToolError)
         assert bridge.take_send_request() is None
 
@@ -508,9 +512,9 @@ class TestBridge:
         # 壊れると、描けずに断った絵も数えて、まだ送っていないのに上限で止まる
         bridge = _bridge(host, Limits())
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 0})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         done, box = call_in_thread(bridge, SHEET, {"count": 37})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert isinstance(box.get("error"), ToolError)
         turn = bridge.usage.turn_usage()
         assert turn is not None
@@ -522,7 +526,7 @@ class TestBridge:
         bridge.usage.limits = Limits(turn_images=0, day_images=0, turn_tokens=1, day_tokens=1)
         bridge.usage.record_message("a", {"output_tokens": 50})
         done, box = call_in_thread(bridge, READ, {})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert "result" in box
 
 
@@ -534,7 +538,7 @@ class TestImageEdge:
         host.image_edge = 768
         bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 0})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert host.rendered == [(0, 768 * 1080 // 1920)]
         caption = box["result"].caption  # type: ignore[attr-defined]
         assert "768" in caption
@@ -543,7 +547,7 @@ class TestImageEdge:
         # 壊れると、上限の内の絵まで縮めて送り、細かい所が見えなくなる
         bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, PREVIEW, {"frame": 0, "width": 1280})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert host.rendered == [(0, 1280)]
         assert "縮め" not in box["result"].caption  # type: ignore[attr-defined]
 
@@ -552,13 +556,13 @@ class TestImageEdge:
         host.image_edge = 1024
         bridge = allow_sending(EditorBridge(host))
         done, box = call_in_thread(bridge, SHEET, {"count": 12, "cell_width": 640})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         assert "result" in box
         layout = host.sheets[0].layout
         assert max(layout.width, layout.height) <= 1024
         host.image_edge = MAX_SHEET_EDGE
         done, box = call_in_thread(bridge, SHEET, {"count": 12, "cell_width": 640})
-        pump_until(bridge, done)
+        pump_until(bridge, done, WAIT)
         wide = host.sheets[1].layout
         assert max(wide.width, wide.height) > 1024
 

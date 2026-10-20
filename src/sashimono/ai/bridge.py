@@ -211,6 +211,10 @@ class EditorBridge:
         usage: UsageMeter | None = None,
     ) -> None:
         self._host = host
+        #: 画面のスレッドが 1 件を拾うのを待つ上限（秒） ``None`` は :data:`CALL_TIMEOUT`
+        #: 本物の窓を並べて走らせる試験だけが長くする（画面のスレッドが他の試験の描画と
+        #: GPU を取り合って止まっても、試験の結果は変わらないため）
+        self.call_timeout: float | None = None
         #: 使った量と上限（#344） 画面は 1 日の量を設定の置き場へ残す物を渡す
         #: 渡さなければ覚えない物（試験・CLI） 上限は既定の値で効く
         self.usage = usage if usage is not None else UsageMeter()
@@ -380,7 +384,8 @@ class EditorBridge:
 
         item = _Work(run=work)
         self._work.put(item)
-        if not item.done.wait(CALL_TIMEOUT):
+        timeout = CALL_TIMEOUT if self.call_timeout is None else self.call_timeout
+        if not item.done.wait(timeout):
             raise ToolError("編集画面が応答しません（重い処理の最中かもしれません）")
         if item.error is not None:
             raise item.error

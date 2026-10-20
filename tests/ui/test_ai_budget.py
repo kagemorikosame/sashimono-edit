@@ -95,7 +95,7 @@ def _call_in_thread(widget: ChatPanel, name: str) -> tuple[threading.Event, dict
     return done, box
 
 
-def _poll_until(widget: ChatPanel, condition: object, timeout: float = 5.0) -> None:
+def _poll_until(widget: ChatPanel, condition: object, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         widget._poll()

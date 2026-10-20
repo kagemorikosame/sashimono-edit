@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Iterator
 from fractions import Fraction
 from typing import Any
@@ -18,8 +16,6 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
-from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import Author, Command, RippleCut, SetTrackState
 from sashimono.core.model import TRANSITION_KIND, Project, Track
 from sashimono.core.seams import (
@@ -39,8 +35,8 @@ from sashimono.ui.seam_dialogs import SpeedChoice
 from sashimono.ui.subtitle.dialogs import JetCutDialog
 from sashimono.ui.subtitle.panel import SubtitlePanel
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import allow_sending
 from tests.core.test_seams import JumpCut, with_bystander
+from tests.ui.ai_tool_calls import call_tool
 from tests.ui.test_subtitle_panel import StubAnalyzer, make_waveform
 
 
@@ -82,32 +78,8 @@ def opened(qt_application: QApplication) -> Iterator[list[MainWindow]]:
 
 
 def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道） 変更は自動で承認する"""
-    operation = find_operation(name)
-    assert operation is not None
-    bridge = allow_sending(EditorBridge(window, auto_approve=True))
-    box: dict[str, Any] = {}
-
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 60.0
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+    """本物の AI と同じ道で道具を呼ぶ（変更の承認と待ちの上限は tests/ui/ai_tool_calls.py）"""
+    return call_tool(window, name, arguments)
 
 
 class TestWindow:
