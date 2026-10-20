@@ -258,9 +258,14 @@ class DailyUsageStore:
     def load(self, day: date) -> Usage:
         return _usage_of(self._read().get(day.isoformat()))
 
-    def add(self, day: date, usage: Usage) -> None:
+    def add(self, day: date, usage: Usage) -> bool:
+        """足せたか 足せなかった差は呼んだ側が持ち続け、次の機会に足し直す
+
+        書けないときに AI を止めないのは同じ 偽を返すだけにする 書けなかった差を足し終えた
+        扱いにすると、その分は二度と足されず、1 日の量を少なく数えて上限を越えて使える
+        """
         if usage == Usage():
-            return
+            return True
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with held_for_update(self.path.with_name(self.path.name + ".lock")):
@@ -271,7 +276,8 @@ class DailyUsageStore:
                 kept = {name: value for name, value in data.items() if name > oldest}
                 write_atomic(self.path, json.dumps(kept, ensure_ascii=False, indent=2))
         except OSError:
-            return
+            return False
+        return True
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -314,8 +320,9 @@ class _MemoryStore:
     def load(self, day: date) -> Usage:
         return self._days.get(day, Usage())
 
-    def add(self, day: date, usage: Usage) -> None:
+    def add(self, day: date, usage: Usage) -> bool:
         self._days[day] = self._days.get(day, Usage()) + usage
+        return True
 
 
 @dataclass(slots=True)
@@ -406,14 +413,17 @@ class UsageMeter:
             used = Usage()
             if turn is not None:
                 self._save(turn, force=True)
-                used = turn.saved
+                # 書けなかったときも、区切りの行には使った量を出す
+                used = self._current(turn)
                 self.last = used
                 self.last_stop = turn.stopped
                 self._day_base = (turn.day, turn.day_seen)
-            if self._loose != Usage():
+                # 書けなかった差は指示の外の分として持ち続け、次に足し直す（次の指示に入る）
+                self._loose = self._loose + (used - turn.saved)
+            if self._loose.tokens or self._loose.images:
                 today = self._today()
-                self._store.add(today, self._loose)
-                self._loose = Usage()
+                if self._store.add(today, self._loose):
+                    self._loose = Usage()
                 self._day_base = (today, self._store.load(today))
             return used
 
@@ -471,7 +481,9 @@ class UsageMeter:
             self._save(turn)
             limits = self.limits
             day_extra = self._day_extra_now()
-            day_used = turn.day_seen
+            # 置き場へ書けなかった差も足して見る 置き場の量だけで見ると、書けない間は
+            # この指示の分が 1 日の量に入らない
+            day_used = turn.day_seen + (self._current(turn) - turn.saved)
             checks: list[tuple[LimitKind, float, int]] = [
                 (LimitKind.TURN_SECONDS, self._clock() - turn.started, 0),
                 (LimitKind.TURN_TOKENS, turn.tokens, 0),
@@ -556,8 +568,9 @@ class UsageMeter:
         """
         current = self._current(turn)
         delta = current - turn.saved
-        if force or delta.tokens or delta.images or delta.seconds >= SAVE_SECONDS:
-            self._store.add(turn.day, delta)
+        due = force or delta.tokens or delta.images or delta.seconds >= SAVE_SECONDS
+        # 書けたときだけ足し終えた所を進める 書けなかった差は次の機会に足し直す
+        if due and self._store.add(turn.day, delta):
             turn.saved = current
         turn.day_seen = self._store.load(turn.day)
 

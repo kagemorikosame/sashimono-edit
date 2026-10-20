@@ -305,6 +305,36 @@ class TestDailyStore:
         stored = DailyUsageStore(path).load(today.day)
         assert (stored.tokens, stored.images) == (42, 1)
 
+    def test_what_could_not_be_written_is_written_later(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、錠やファイルが一時的に開けなかった差を足し終えた扱いにして二度と足さず、
+        # 1 日の量を少なく数えて、もう 1 つの窓や起動し直した後に上限を越えて使える
+        from sashimono.ai import budget as budget_module
+
+        path = tmp_path / "ai_usage.json"
+        today = _Today()
+        meter = UsageMeter(DailyUsageStore(path), today=today)
+        meter.limits = Limits(turn_tokens=0, day_tokens=100)
+        meter.begin_turn()
+        from sashimono.core.io.atomic import write_atomic as real
+
+        def refuse(*_arguments: object, **_options: object) -> None:
+            raise OSError("書けない")
+
+        monkeypatch.setattr(budget_module, "write_atomic", refuse)
+        meter.record_message("a", {"output_tokens": 70})
+        meter.flush()
+        meter.record_message("b", {"output_tokens": 30})
+        # 書けない間も、この指示の分を 1 日の量に入れて確かめる
+        assert meter.overrun() is not None
+        assert meter.end_turn().tokens == 100
+        assert DailyUsageStore(path).load(today.day) == Usage()
+        monkeypatch.setattr(budget_module, "write_atomic", real)
+        meter.begin_turn()
+        meter.end_turn()
+        assert DailyUsageStore(path).load(today.day).tokens == 100
+
     def test_a_new_day_starts_from_zero(self, tmp_path: Path) -> None:
         # 壊れると、昨日の量で今日の最初の指示が止まる
         store = DailyUsageStore(tmp_path / "ai_usage.json")
