@@ -329,6 +329,35 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "place_template": lambda _ids: {"template_id": SHELF_ID},
     "apply_template": lambda ids: {"template_id": SHELF_ID, "clip_id": ids["text"]},
     "import_objects": lambda _ids: {"path": str(SECRET_PATH.with_suffix(".exo"))},
+    # 画面の操作と同じ道具（#349） 入れ物（トラック・素材）は中身があるので断る 断る文に
+    # 素材の名前を書かないかを見る 貼り付けはコピーした物が無いので断る
+    "cut_clips": lambda ids: {"clip_ids": [ids["text"]]},
+    "paste_clips": lambda _ids: {"insert": True},
+    "remove_track": lambda ids: {"track_id": ids["track"]},
+    "rename_track": lambda ids: {"track_id": ids["track"], "name": "V9"},
+    "move_track": lambda ids: {"track_id": ids["track"], "index": 0},
+    "rename_scene": lambda _ids: {"scene_id": "無い", "name": "場面"},
+    "remove_scene": lambda _ids: {"scene_id": "無い"},
+    "remove_media": lambda ids: {"media_id": ids["media"]},
+    "set_work_area": lambda _ids: {"start_frame": 0, "end_frame": 30},
+    "add_filter": lambda _ids: {},
+    "add_group_control": lambda _ids: {},
+    "remove_effect": lambda ids: {"clip_id": ids["text"], "effect_id": "無い"},
+    "move_effect": lambda ids: {"clip_id": ids["text"], "effect_id": "無い", "index": 0},
+    "set_effect_enabled": lambda ids: {
+        "clip_id": ids["text"],
+        "effect_ids": ["無い"],
+        "enabled": False,
+    },
+    "remove_keyframe": lambda ids: {"clip_id": ids["text"], "name": "size", "frame": 0},
+    "clear_keyframes": lambda ids: {"clip_id": ids["text"], "name": "size"},
+    "split_subtitle": lambda ids: {
+        "media_id": ids["media"],
+        "segment_id": ids["segment"],
+        "at_seconds": 0.5,
+    },
+    "merge_subtitles": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
+    "delete_subtitle": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
 }
 
 

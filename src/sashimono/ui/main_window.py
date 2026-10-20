@@ -51,6 +51,7 @@ from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import (
     AddClip,
     AddMedia,
@@ -3181,6 +3182,19 @@ class MainWindow(QMainWindow):
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self._timeline.set_selection(clip_ids)
+
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        """AI の貼り付け（#349）も、人の Ctrl+C・Ctrl+X と同じタイムラインの置き場から取る"""
+        return self._timeline.clipboard
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        self._timeline.set_clipboard(content)
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        """AI の挿入貼り付けも、人の Ctrl+Shift+V と同じ押し出し方（本人の設定）にする"""
+        return self._timeline.insert_all_tracks
 
     def apply_commands(self, commands: list[Command], label: str) -> None:
         """AI からのコマンドを実行する

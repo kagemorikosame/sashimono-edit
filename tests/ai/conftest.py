@@ -21,6 +21,7 @@ from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
@@ -134,6 +135,10 @@ class FakeHost:
         self.rules = LookRules()
         #: テンプレートの棚（#328） 既定は空 本人の AviUtl2 の置き場は読まない
         self.shelf: list[TemplateEntry] = []
+        #: タイムラインのコピーした中身（#349） 人の Ctrl+C と同じ置き場のふり
+        self.copied: ClipboardContent | None = None
+        #: 本人の設定の挿入貼り付けの押し出し方 既定は設定と同じく全トラック
+        self.insert_all_tracks = True
 
     @property
     def saved_looks(self) -> SavedLooks:
@@ -192,6 +197,17 @@ class FakeHost:
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self.selection = tuple(clip_ids)
+
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        return self.copied
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        self.copied = content
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        return self.insert_all_tracks
 
     def apply_commands(self, commands: list[Command], label: str) -> None:
         if not commands:

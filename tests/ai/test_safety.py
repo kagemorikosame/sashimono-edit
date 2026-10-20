@@ -208,6 +208,9 @@ class TestAppSettingsAreReadOnly:
             "select_clip",
             "select_clips",
             "set_active_scene",
+            # コピー・切り取りの中身を置く（#349） 置くのは作品の中身の写しで、人の Ctrl+C と
+            # 同じタイムラインの置き場 アプリ自身の設定は変えない
+            "set_clipboard",
             "start_export",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",

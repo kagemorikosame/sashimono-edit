@@ -61,8 +61,14 @@ from sashimono.compat.subtitle_looks import (
     template_choice,
 )
 from sashimono.core.chapters import YOUTUBE_DESCRIPTION_LIMIT, chapters_of, youtube_text
-from sashimono.core.clipboard import copy_clips, paste_commands
+from sashimono.core.clipboard import (
+    copy_clips,
+    cut_commands,
+    insert_paste_commands,
+    paste_commands,
+)
 from sashimono.core.commands import (
+    DEFAULT_GENERATED_FRAMES,
     MARKER_LABEL_LIMIT,
     AddClip,
     AddEffect,
@@ -71,19 +77,32 @@ from sashimono.core.commands import (
     AddStroke,
     AddTrack,
     Author,
+    ClearKeyframes,
     Command,
     GroupClips,
+    MergeWithNext,
     MoveClip,
     MoveClips,
+    MoveEffect,
     MoveStroke,
+    MoveTrack,
     ParamPath,
     ParamTarget,
     RemoveClip,
     RemoveClips,
+    RemoveEffect,
+    RemoveKeyframe,
     RemoveMarkers,
+    RemoveMedia,
+    RemoveScene,
+    RemoveSegment,
     RemoveStroke,
+    RemoveTrack,
+    RenameScene,
+    RenameTrack,
     RippleCut,
     SetClipProperty,
+    SetEffectEnabled,
     SetKeyframe,
     SetParam,
     SetResolution,
@@ -92,7 +111,9 @@ from sashimono.core.commands import (
     SetTrackHeights,
     SetTrackState,
     SetTranscript,
+    SetWorkArea,
     SplitClip,
+    SplitSegment,
     SubtitleTemplate,
     TrimClip,
     UngroupClips,
@@ -104,11 +125,14 @@ from sashimono.core.commands import (
     has_line_break,
     head_room,
     insert_clip,
+    insert_filter,
     insert_generated,
     insert_media,
     insert_scene,
     marker_at,
     new_scene,
+    reorder_group,
+    resolve_param,
     subtitle_voices,
     subtitle_wrap_width,
     tail_room,
@@ -162,6 +186,7 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    Effect,
     EffectId,
     Interpolation,
     Marker,
@@ -169,6 +194,7 @@ from sashimono.core.model import (
     MediaItem,
     ParamValue,
     Project,
+    Scene,
     SceneId,
     SegmentId,
     Stroke,
@@ -176,8 +202,9 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
+    TranscriptSegment,
 )
-from sashimono.core.projection import project_timeline
+from sashimono.core.projection import project_timeline, source_seconds_at
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -205,7 +232,7 @@ from sashimono.core.timebase import (
 from sashimono.effects import registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
-from sashimono.effects.sources import SHAPE, TEXT, TRANSITION, source_registry
+from sashimono.effects.sources import GROUP, SHAPE, TEXT, TRANSITION, source_registry
 from sashimono.effects.spec import (
     MAX_GRADIENT_STOPS,
     MIN_GRADIENT_STOPS,
@@ -898,9 +925,26 @@ def _list_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
                         }
                         for e in clip.effects
                     ],
+                    **_after_effects_of(clip),
                 }
             )
     return _paged(clips, arguments, name="clips")
+
+
+def _after_effects_of(clip: Clip) -> dict[str, object]:
+    """場面切り替えの後の場面へ積んだエフェクト 場面切り替えだけに出す（#349）
+
+    ほかのクリップに出すと、効かない置き場があるように読める ID が見えないと、後の場面の
+    エフェクトを外す・並べ替える・値を変える道具が指せない
+    """
+    if clip.source is None or clip.source.kind != TRANSITION.kind:
+        return {}
+    return {
+        "after_effects": [
+            {"effect_id": str(e.id), "kind": e.kind, "enabled": e.enabled}
+            for e in clip.after_effects
+        ]
+    }
 
 
 def _frame_window(project: Project, arguments: dict[str, Any]) -> tuple[int, int | None]:
@@ -2251,7 +2295,10 @@ def _add_track(host: EditorHost, arguments: dict[str, Any]) -> object:
     except ValueError:
         raise ToolError("kind は video・audio・mixed のどれかです") from None
     # 画面の「トラックを追加」と同じ所で作る 名前とソロの引き継ぎを 1 か所で決めるため
-    track = new_track(project, track_kind).track
+    try:
+        track = new_track(project, track_kind, effect=bool(arguments.get("effect", False))).track
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
     if arguments.get("name"):
         track = replace(track, name=str(arguments["name"]))
     host.apply_commands([AddTrack(track)], f"トラックを追加: {track.name}")
@@ -2717,6 +2764,9 @@ def _add_effect(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError("params はオブジェクトで渡してください")
     effect = definition.create(**{str(k): v for k, v in raw.items()})
     stroke_id = str(arguments.get("stroke_id") or "")
+    after = _after_scene(clip, arguments)
+    if after and stroke_id:
+        raise ToolError("after と stroke_id は一緒に渡せません（縁取りの層は文字にだけある）")
     if stroke_id:
         # 縁取りの層に掛ける（#273） 掛けられる種類は設定パネルのメニューと同じ
         _require_stroke(clip, stroke_id)
@@ -2728,8 +2778,10 @@ def _add_effect(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"エフェクトを縁取りに追加: {definition.label}",
         )
         return {"effect_id": str(effect.id), "kind": kind, "stroke_id": stroke_id}
-    host.apply_commands([AddEffect(clip.id, effect)], f"エフェクトを追加: {definition.label}")
-    return {"effect_id": str(effect.id), "kind": kind}
+    host.apply_commands(
+        [AddEffect(clip.id, effect, after=after)], f"エフェクトを追加: {definition.label}"
+    )
+    return {"effect_id": str(effect.id), "kind": kind, "after": after}
 
 
 def _require_stroke(clip: Clip, stroke_id: str) -> Stroke:
@@ -2823,12 +2875,32 @@ def _strokes_of(clip: Clip) -> list[dict[str, Any]] | None:
     return rows
 
 
+def _after_scene(clip: Clip, arguments: dict[str, Any]) -> bool:
+    """場面切り替えの「後の場面」へ積んだエフェクトを指すか（設定パネルの〔後の場面へ〕 #349）
+
+    場面切り替え以外で真を受けると、どこにも描かれない置き場へエフェクトが積まれ、
+    掛けたのに絵が変わらない 画面も場面切り替えにだけこの段を出す
+    """
+    after = bool(arguments.get("after", False))
+    if after and (clip.source is None or clip.source.kind != TRANSITION.kind):
+        raise ToolError("after は場面切り替えのクリップにだけ使えます（後の場面へ積む）")
+    return after
+
+
 def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
     name = str(arguments.get("name", ""))
     if not name:
         raise ToolError("name が空です")
     effect_id = str(arguments.get("effect_id") or "")
     stroke_id = str(arguments.get("stroke_id") or "")
+    if bool(arguments.get("after", False)):
+        # 後の場面の置き場はエフェクトだけ 中身やクリップ自身の値を後の場面の物として
+        # 読むと、前の場面の値を変えたのに後の場面を変えたと答える
+        if not effect_id or stroke_id:
+            raise ToolError(
+                "after を渡すときは effect_id も渡す（後の場面にあるのはエフェクトだけ）"
+            )
+        return ParamPath.of_effect(clip_id, EffectId(effect_id), name, after=True)
     if stroke_id:
         # テキストの縁取りの層の項目か、層に掛けたエフェクトの項目
         if effect_id:
@@ -2939,7 +3011,7 @@ def _parse_color(text: str) -> tuple[float, ...] | None:
 def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
-    frame = int(arguments.get("frame", host.playhead))
+    frame = _local_frame(host, clip, arguments)
     try:
         value = float(arguments["value"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -4104,6 +4176,516 @@ def _select(host: EditorHost, arguments: dict[str, Any]) -> object:
     else:
         host.select_clip(None)
     return {"selected": clip_id or None}
+
+
+def _select_all(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """開いているタイムラインのクリップを全部選ぶ（〔すべて選択〕と同じ #349）
+
+    ロックしたトラックの物も選ぶ（画面と同じ 見るだけなら困らない） 選んだ後に消す・動かす
+    道具へ省いて渡せば、選んだ全部に効く
+    """
+    del arguments
+    everything = [clip.id for track in _project(host).timeline.tracks for clip in track.clips]
+    host.select_clips(everything)
+    return {"selected": len(host.selected_clips)}
+
+
+# --- コピー・切り取り・貼り付け（#349） ---
+#
+# 置き場は人の Ctrl+C・Ctrl+X と同じタイムラインの 1 つ（:attr:`EditorHost.clipboard`）
+# AI だけの置き場を別に持つと、人がコピーした物を AI に「貼って」と頼めず、AI が
+# 切り取った物を人が Ctrl+V で貼り戻せない 間に人が別の物をコピーすると中身が変わるので、
+# 貼った道具は貼った本数とクリップを返す（コピーと貼り付けを 1 回で済ますなら duplicate_clips）
+
+
+def _locked_groups(project: Project, clip_ids: tuple[ClipId, ...]) -> bool:
+    """ロックしたトラックのクリップを含むグループに入ったクリップがあるか
+
+    画面の切り取りと同じく断る（:meth:`TimelineView._refuse_locked_group`） 一部だけ消すと、
+    束ねた物の頭や長さが食い違う
+    """
+    timeline = project.timeline
+    groups = set()
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is not None and located[1].group_id is not None:
+            groups.add(located[1].group_id)
+    return any(track.locked for group in groups for track, _ in timeline.grouped_clips(group))
+
+
+def _copy_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
+    clip_ids = _with_groups(host, _target_clips(host, arguments))
+    content = copy_clips(_project(host), clip_ids)
+    if not content.clips:
+        raise ToolError("コピーできるクリップがありません")
+    host.set_clipboard(content)
+    return {
+        "copied": [str(copied.clip.id) for copied in content.clips],
+        "length_frames": content.length,
+    }
+
+
+def _cut_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """コピーしてから消す 隙間は詰めない（画面の〔切り取り〕と同じ 詰めるなら delete_clips）"""
+    clip_ids = _with_groups(host, _target_clips(host, arguments))
+    project = _project(host)
+    if _locked_groups(project, clip_ids):
+        raise ToolError(
+            "グループの中にロックしたレイヤーのクリップがあるので切り取れません"
+            " ロックを外すか、グループを解除してください"
+        )
+    content = copy_clips(project, clip_ids)
+    if not content.clips:
+        raise ToolError("切り取れるクリップがありません")
+    host.apply_commands(cut_commands(project, content), "切り取り")
+    # 消せた後に置く 断られたのに置き場だけ変わると、人が前にコピーした物が黙って消える
+    host.set_clipboard(content)
+    return {
+        "cut": [str(copied.clip.id) for copied in content.clips],
+        "length_frames": content.length,
+    }
+
+
+def _paste_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
+    content = host.clipboard
+    if content is None or not content.clips:
+        raise ToolError(
+            "コピーしたクリップがありません"
+            "（copy_clips か cut_clips で写すか、duplicate_clips を使う）"
+        )
+    project = _project(host)
+    at_frame = int(arguments.get("at_frame", host.playhead))
+    insert = bool(arguments.get("insert", False))
+    try:
+        if insert:
+            commands = insert_paste_commands(
+                project, content, at_frame, all_tracks=host.insert_paste_all_tracks
+            )
+        else:
+            commands = paste_commands(project, content, at_frame)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    host.apply_commands(commands, "貼り付け（挿入）" if insert else "貼り付け")
+    # 貼った物を選ぶ（画面と同じ） 続けて動かす・消す道具へ省いて渡せる
+    landed = [
+        command.clip.id
+        for command in commands
+        if isinstance(command, AddClip)
+        and _project(host).timeline.locate_clip(command.clip.id) is not None
+    ]
+    host.select_clips(landed)
+    return {
+        "pasted": [str(clip_id) for clip_id in landed],
+        "at_frame": max(0, at_frame),
+        "insert": insert,
+    }
+
+
+# --- トラック・シーン・素材の整理（#349） ---
+
+
+def _require_track(host: EditorHost, arguments: dict[str, Any]) -> Track:
+    track_id = str(arguments.get("track_id") or "")
+    track = _project(host).timeline.find_track(TrackId(track_id)) if track_id else None
+    if track is None:
+        raise ToolError(f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）")
+    return track
+
+
+def _remove_track(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """空のトラックを消す クリップのあるトラックは断る（画面の〔トラックを削除〕と同じ）
+
+    中身ごと消すと、AI が消せる物がクリップを超えて広がる（#341 消すのはクリップまで）
+    中身を消したいなら、先に delete_clips で消してから頼む（どちらも取り消し 1 回で戻る）
+    """
+    track = _require_track(host, arguments)
+    if track.clips:
+        raise ToolError(
+            f"クリップのあるトラックは消せません（{len(track.clips)} 本）"
+            " 先に delete_clips で空にしてください"
+        )
+    host.apply_commands(
+        [RemoveTrack(track.id)], f"トラックを削除: {track.name or track.kind.value}"
+    )
+    return {"removed": str(track.id)}
+
+
+def _rename_track(host: EditorHost, arguments: dict[str, Any]) -> object:
+    track = _require_track(host, arguments)
+    command = RenameTrack(track.id, str(arguments.get("name") or ""))
+    host.apply_commands([command], command.label)
+    renamed = _project(host).timeline.find_track(track.id)
+    # 空の名前はその位置の既定の名前へ戻る 実際になった名前を返さないと、AI は空のまま
+    # だと思い込む
+    return {"track_id": str(track.id), "name": renamed.name if renamed is not None else None}
+
+
+def _move_track(host: EditorHost, arguments: dict[str, Any]) -> object:
+    track = _require_track(host, arguments)
+    try:
+        index = int(arguments["index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ToolError("index に整数が要ります（同じ種類のトラックの中で 0 から）") from exc
+    command = MoveTrack(track.id, index)
+    host.apply_commands([command], command.label)
+    timeline = _project(host).timeline
+    moved = timeline.find_track(track.id)
+    order = reorder_group(timeline, moved) if moved is not None else ()
+    return {"track_id": str(track.id), "order": [str(t.id) for t in order]}
+
+
+def _scene_argument(host: EditorHost, arguments: dict[str, Any]) -> Scene:
+    """引数のシーン 省けば開いているシーン メインは名前を変えることも消すこともできない"""
+    raw = str(arguments.get("scene_id") or "")
+    if not raw:
+        if host.active_scene is None:
+            raise ToolError("scene_id を指定してください（メインを開いています メインは対象外）")
+        raw = str(host.active_scene)
+    scene = host.document.project.find_scene(SceneId(raw))
+    if scene is None:
+        raise ToolError(f"シーンが見つかりません: {raw}（list_scenes で一覧を取れます）")
+    return scene
+
+
+def _rename_scene(host: EditorHost, arguments: dict[str, Any]) -> object:
+    scene = _scene_argument(host, arguments)
+    name = str(arguments.get("name") or "").strip()
+    if not name:
+        raise ToolError("name にシーンの新しい名前を指定してください")
+    host.apply_commands([RenameScene(scene.id, name)], "シーンの名前を変更")
+    return {"scene_id": str(scene.id), "name": name}
+
+
+def _remove_scene(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """どこにも置かれていないシーンを消す（〔シーンを削除〕と同じ 置いてあれば断る）
+
+    開いているシーンを消すときはメインへ戻ってから消す（画面と同じ） 開いたまま消すと、
+    シーンの中で動かす包み（InScene）が開いているシーンを見失う
+    確かめは消す前に作品全体で行う 開いている別のシーンの中から確かめると、メインに
+    置いた物を数え落とす
+    """
+    scene = _scene_argument(host, arguments)
+    command = RemoveScene(scene.id)
+    try:
+        command.apply(host.document.project)
+    except (ValueError, KeyError) as exc:
+        raise ToolError(str(exc)) from exc
+    if host.active_scene == scene.id:
+        host.set_active_scene(None)
+    host.apply_commands([command], f"シーンを削除: {scene.name}")
+    return {
+        "removed": str(scene.id),
+        "active_scene": str(host.active_scene) if host.active_scene is not None else None,
+    }
+
+
+def _remove_media(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材を素材一覧から外す（〔プールから外す〕と同じ） ファイルには触らない
+
+    どこかのタイムライン（メイン・シーン）で使っていれば断る 断る文に素材の名前を書かない
+    名前と場所を送らないと決めた人の所でも、断りの文で名前が出ないように
+    """
+    media = _require_media(_project(host), str(arguments.get("media_id", "")))
+    root = host.document.project
+    used = sum(
+        1
+        for timeline in (root.timeline, *(scene.timeline for scene in root.scenes))
+        for track in timeline.tracks
+        for clip in track.clips
+        if clip.media_id == media.id
+    )
+    if used:
+        raise ToolError(
+            f"この素材はタイムラインで {used} か所使われているので外せません"
+            "（先にそのクリップを消してください）"
+        )
+    host.apply_commands([RemoveMedia(media.id)], "素材を削除")
+    return {"removed": str(media.id)}
+
+
+# --- 書き出し範囲・フィルタ・グループ制御（#349） ---
+
+
+def _set_work_area(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """書き出し範囲を決める・解く
+
+    解くのは〔書き出し範囲を解除〕、決めるのは目盛りのドラッグと同じ
+    """
+    if bool(arguments.get("clear", False)):
+        if "start_frame" in arguments or "end_frame" in arguments:
+            raise ToolError("clear と start_frame・end_frame は一緒に渡せません")
+        if _project(host).timeline.work_area is None:
+            raise ToolError("書き出し範囲は指定されていません")
+        host.apply_commands([SetWorkArea(None)], "書き出し範囲を解除")
+        return {"work_area": None}
+    try:
+        start = int(arguments["start_frame"])
+        end = int(arguments["end_frame"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ToolError("start_frame と end_frame に整数が要ります（解くなら clear）") from exc
+    host.apply_commands([SetWorkArea((start, end))], "書き出し範囲を指定")
+    return {"work_area": [start, end]}
+
+
+def _placed_clip(host: EditorHost, commands: list[Command]) -> ClipId | None:
+    """置いた生成オブジェクトのクリップ 置いた命令から取る（画面の :meth:`_last_added_clip`）"""
+    timeline = _project(host).timeline
+    for command in reversed(commands):
+        if isinstance(command, AddClip) and timeline.locate_clip(command.clip.id) is not None:
+            return command.clip.id
+    return None
+
+
+def _place_spot(host: EditorHost, arguments: dict[str, Any]) -> tuple[int, int, TrackId | None]:
+    """置く位置・長さ・置きたいトラック 位置を省けば再生ヘッド 長さを省けば画面と同じ 150"""
+    at_frame = int(arguments.get("at_frame", host.playhead))
+    duration = int(arguments.get("duration", DEFAULT_GENERATED_FRAMES))
+    if duration < 1:
+        raise ToolError("duration は 1 フレーム以上です")
+    track_id = str(arguments.get("track_id") or "")
+    if track_id:
+        _require_track(host, arguments)
+    return max(0, at_frame), duration, TrackId(track_id) if track_id else None
+
+
+def _add_filter(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """下の絵全体へ掛かるフィルタを置く（〔フィルタを追加〕と同じ置き先） エフェクトは積まない
+
+    何を掛けるかは置いた後に add_effect で選ぶ（画面も置いた後に設定パネルで足す）
+    """
+    at_frame, duration, track_id = _place_spot(host, arguments)
+    commands = insert_filter(
+        _project(host), at_frame=at_frame, duration=duration, track_id=track_id
+    )
+    host.apply_commands(commands, "フィルタを追加")
+    placed = _placed_clip(host, commands)
+    if placed is not None:
+        host.select_clip(placed)
+    return {"clip_id": str(placed) if placed is not None else None, "at_frame": at_frame}
+
+
+def _add_group_control(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """グループ制御を置く 手前の対象レイヤー数ぶんのトラックの物をまとめて動かす"""
+    at_frame, duration, track_id = _place_spot(host, arguments)
+    commands = insert_generated(
+        _project(host), GROUP.create(), at_frame=at_frame, duration=duration, track_id=track_id
+    )
+    host.apply_commands(commands, "グループ制御を追加")
+    placed = _placed_clip(host, commands)
+    if placed is not None:
+        host.select_clip(placed)
+    return {"clip_id": str(placed) if placed is not None else None, "at_frame": at_frame}
+
+
+# --- エフェクトの外し・並べ替え・入り切り（#349） ---
+
+
+def _stack_target(
+    host: EditorHost, arguments: dict[str, Any]
+) -> tuple[Clip, bool, StrokeId | None, tuple[Effect, ...]]:
+    """引数のクリップと、エフェクトの置き場（場面切り替えの後の場面・縁取りの層）"""
+    _, clip = _target_clip(host, arguments)
+    after = _after_scene(clip, arguments)
+    stroke_id = str(arguments.get("stroke_id") or "")
+    if stroke_id:
+        if after:
+            raise ToolError("after と stroke_id は一緒に渡せません（縁取りの層は文字にだけある）")
+        stroke = _require_stroke(clip, stroke_id)
+        return clip, False, stroke.id, stroke.effects
+    return clip, after, None, clip.after_effects if after else clip.effects
+
+
+def _require_effect(effects: tuple[Effect, ...], raw: object) -> Effect:
+    effect_id = str(raw or "")
+    found = next((e for e in effects if str(e.id) == effect_id), None)
+    if found is None:
+        raise ToolError(
+            f"エフェクトが見つかりません: {effect_id}（list_clips の effects で ID が分かる）"
+        )
+    return found
+
+
+def _remove_effect(host: EditorHost, arguments: dict[str, Any]) -> object:
+    clip, after, stroke_id, effects = _stack_target(host, arguments)
+    effect = _require_effect(effects, arguments.get("effect_id"))
+    if effect.fixed:
+        raise ToolError(
+            f"{effect.kind} はクリップが最初から持つ欄なので外せません"
+            "（set_effect_enabled で無効にはできる）"
+        )
+    command = RemoveEffect(clip.id, effect.id, after=after, stroke_id=stroke_id)
+    host.apply_commands([command], command.label)
+    return {"removed": str(effect.id), "kind": effect.kind}
+
+
+def _move_effect(host: EditorHost, arguments: dict[str, Any]) -> object:
+    clip, after, stroke_id, effects = _stack_target(host, arguments)
+    effect = _require_effect(effects, arguments.get("effect_id"))
+    try:
+        index = int(arguments["index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ToolError("index に整数が要ります（0 が一番先に掛かる）") from exc
+    command = MoveEffect(clip.id, effect.id, index, after=after, stroke_id=stroke_id)
+    host.apply_commands([command], command.label)
+    _, moved = _require_clip(_project(host), str(clip.id))
+    stack = _stack_of_clip(moved, after, stroke_id)
+    return {"effect_id": str(effect.id), "order": [str(e.id) for e in stack]}
+
+
+def _stack_of_clip(clip: Clip, after: bool, stroke_id: StrokeId | None) -> tuple[Effect, ...]:
+    if stroke_id is not None:
+        stroke = clip.source.find_stroke(stroke_id) if clip.source is not None else None
+        return stroke.effects if stroke is not None else ()
+    return clip.after_effects if after else clip.effects
+
+
+def _set_effect_enabled(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """エフェクトを消さずに切る・入れる 何個かまとめて渡すと 1 回の取り消しで戻る
+
+    最初から持つ欄の組（描画・音声など 画面の組の見出しの〔有効〕）は、組の欄の ID を
+    まとめて渡せば画面と同じになる
+    """
+    clip, after, stroke_id, effects = _stack_target(host, arguments)
+    _no_explicit_null(arguments, "effect_ids")
+    raw = arguments.get("effect_ids")
+    if raw is None:
+        raw = [arguments.get("effect_id")]
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ToolError("effect_ids にエフェクトの ID の配列を渡してください")
+    # 重なった ID は 1 つにする 同じ欄を 2 度切り替えても結果は同じだが、返す数が食い違う
+    chosen = list(dict.fromkeys(_require_effect(effects, entry).id for entry in raw))
+    enabled = bool(arguments.get("enabled", True))
+    commands: list[Command] = [
+        SetEffectEnabled(clip.id, effect_id, enabled, after=after, stroke_id=stroke_id)
+        for effect_id in chosen
+    ]
+    host.apply_commands(commands, "エフェクトを有効化" if enabled else "エフェクトを無効化")
+    return {"effect_ids": [str(effect_id) for effect_id in chosen], "enabled": enabled}
+
+
+# --- キーフレームを消す（#349） ---
+
+
+def _local_frame(host: EditorHost, clip: Clip, arguments: dict[str, Any]) -> int:
+    """キーの位置（クリップの頭から数えたフレーム） 省けば再生ヘッドの所
+
+    キーはクリップの頭から数える（設定パネルの ◆ と同じ） 再生ヘッドのタイムラインの
+    フレームのまま渡すと、頭が 0 でないクリップでは別の所にキーが付く
+    """
+    if arguments.get("frame") is not None:
+        try:
+            return int(arguments["frame"])
+        except (TypeError, ValueError) as exc:
+            raise ToolError("frame はクリップの頭から数えたフレームの整数です") from exc
+    return host.playhead - clip.timeline_start
+
+
+def _animated(project: Project, path: ParamPath) -> AnimatedValue:
+    try:
+        value = resolve_param(project, path)
+    except (KeyError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    if not isinstance(value, AnimatedValue):
+        raise ToolError(f"{path.name} は数の欄ではないのでキーフレームを持ちません")
+    return value
+
+
+def _remove_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
+    _, clip = _target_clip(host, arguments)
+    path = _param_path(clip.id, arguments)
+    frame = _local_frame(host, clip, arguments)
+    animated = _animated(_project(host), path)
+    keys = [key.frame for key in animated.keyframes]
+    if frame not in keys:
+        raise ToolError(
+            f"{path.name} の {frame} フレーム目にキーフレームがありません（ある所: {keys}）"
+        )
+    command = RemoveKeyframe(path, frame)
+    host.apply_commands([command], "キーフレームを削除")
+    return {"name": path.name, "frame": frame, "left": [k for k in keys if k != frame]}
+
+
+def _clear_keyframes(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """アニメーションを解除し、その位置の値で固定する（◆ の右クリック〔アニメーションを解除〕）"""
+    _, clip = _target_clip(host, arguments)
+    path = _param_path(clip.id, arguments)
+    frame = _local_frame(host, clip, arguments)
+    if not _animated(_project(host), path).is_animated:
+        raise ToolError(f"{path.name} にはキーフレームがありません")
+    command = ClearKeyframes(path, frame)
+    host.apply_commands([command], command.label)
+    return {"name": path.name, "fixed_at_frame": frame}
+
+
+# --- 字幕の分割・結合・削除（字幕パネルの右クリックと同じ #349） ---
+
+
+def _segment_target(
+    host: EditorHost, arguments: dict[str, Any]
+) -> tuple[MediaItem, SegmentId, int | None]:
+    """引数の素材・字幕・音声 字幕が無ければ断る 断る文に素材の名前を書かない
+
+    名前と場所を送らないと決めた人の所でも、断りの文で素材の名前が出ないように
+    """
+    media = _require_media(_project(host), str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    segment_id = str(arguments.get("segment_id") or "")
+    if transcript is None:
+        raise ToolError("この素材のこの音声には字幕がありません（get_subtitles で確かめる）")
+    if not any(str(segment.id) == segment_id for segment in transcript.segments):
+        raise ToolError(f"字幕が見つかりません: {segment_id}（get_subtitles で ID が分かる）")
+    return media, SegmentId(segment_id), stream
+
+
+def _split_subtitle(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕 1 枚を 2 枚に割る 位置は素材の秒（``at_seconds``）か、省けば再生ヘッド"""
+    media, segment_id, stream = _segment_target(host, arguments)
+    if arguments.get("at_seconds") is not None:
+        try:
+            at = Fraction(str(float(arguments["at_seconds"])))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ToolError("at_seconds は素材の中の秒の数です") from exc
+    else:
+        found = source_seconds_at(_project(host), media, stream, host.playhead)
+        if found is None:
+            raise ToolError(
+                "再生ヘッドがこの素材のこの音声の上にありません（at_seconds で素材の秒を渡す）"
+            )
+        at = found
+    before = {s.id for s in _transcript_of(host, media.id, stream)}
+    try:
+        host.apply_commands([SplitSegment(media.id, segment_id, at, stream=stream)], "字幕を分割")
+    except ToolError as exc:
+        raise ToolError(f"{exc}（source_start_seconds と長さの内側の秒を渡す）") from exc
+    added = [str(s.id) for s in _transcript_of(host, media.id, stream) if s.id not in before]
+    return {"segment_ids": [str(segment_id), *added], "at_seconds": round(float(at), 3)}
+
+
+def _transcript_of(
+    host: EditorHost, media_id: MediaId, stream: int | None
+) -> tuple[TranscriptSegment, ...]:
+    media = _project(host).find_media(media_id)
+    transcript = media.transcript_for(stream) if media is not None else None
+    return transcript.segments if transcript is not None else ()
+
+
+def _merge_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕を次の 1 枚と繋げる（〔次と結合〕） 繋いだ字幕は前の字幕の ID を引き継ぐ"""
+    media, segment_id, stream = _segment_target(host, arguments)
+    before = {str(s.id) for s in _transcript_of(host, media.id, stream)}
+    host.apply_commands([MergeWithNext(media.id, segment_id, stream=stream)], "字幕を結合")
+    after = {str(s.id) for s in _transcript_of(host, media.id, stream)}
+    return {"segment_id": str(segment_id), "merged": sorted(before - after)}
+
+
+def _delete_subtitle(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕 1 枚を消す（字幕パネルの〔削除〕） 素材に付いた字幕なので、どの置き場所からも消える"""
+    media, segment_id, stream = _segment_target(host, arguments)
+    host.apply_commands([RemoveSegment(media.id, segment_id, stream=stream)], "字幕を削除")
+    return {"deleted": str(segment_id)}
 
 
 # --- 保存と書き出し（取り消せない操作 B1 #327） ---
@@ -5360,6 +5942,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     " 省くとプロジェクトの方式（get_project の layer_mode）に合わせる"
                 ),
                 "name": _string("表示名"),
+                "effect": _boolean(
+                    "フィルタを置くための映像トラック（エフェクトトラック FX と番号の名前）にする"
+                    " 一番上に入り、置いたフィルタがほかの映像トラックすべてに掛かる video だけ"
+                ),
             }
         ),
         handler=_add_track,
@@ -5602,6 +6188,378 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="select_all",
+        description=(
+            "開いているタイムラインのクリップを全部選ぶ"
+            "（〔すべて選択〕と同じ ロックしたトラックも）"
+            " 消す・動かす道具で clip_ids を省けば選んだ全部に効く"
+        ),
+        schema=_schema({}),
+        handler=_select_all,
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="copy_clips",
+        description=(
+            "クリップをコピーする（画面の〔コピー〕と同じ置き場 人の Ctrl+V でも貼れる）"
+            " リンクした映像と音声・グループの仲間も入る 作品は変えない"
+            " 人の前のコピーは置き換わる コピーと貼り付けを 1 回で済ますなら duplicate_clips"
+        ),
+        schema=_schema({"clip_ids": _clip_ids_schema()}),
+        handler=_copy_clips,
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="cut_clips",
+        description=(
+            "クリップを切り取る（コピーしてから消す 画面の〔切り取り〕と同じ） 隙間は詰めない"
+            " 貼るのは paste_clips 取り消し 1 回で消した物が戻る"
+        ),
+        schema=_schema({"clip_ids": _clip_ids_schema()}),
+        handler=_cut_clips,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="paste_clips",
+        description=(
+            "コピー・切り取りした物を貼る（人がコピーした物も同じ置き場） 並びの間隔は保つ"
+            " insert を真にすると、貼る位置から後ろを貼る長さぶん押し出してから貼る"
+            "（〔貼り付け（挿入）〕 押すトラックは本人の設定のまま） 貼った物が選ばれる"
+            " 間に人が別の物をコピーすると中身が変わるので、返す pasted で確かめる"
+        ),
+        schema=_schema(
+            {
+                "at_frame": _integer("貼る先頭の位置 省略すると再生ヘッド"),
+                "insert": _boolean("後ろを押し出して挿入するか（既定 false）"),
+            }
+        ),
+        handler=_paste_clips,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="remove_track",
+        description=(
+            "空のトラックを消す（〔トラックを削除〕と同じ） クリップのあるトラックは断る"
+            "（先に delete_clips で空にする） 取り消し 1 回で戻る"
+        ),
+        schema=_schema({"track_id": _string("消すトラック")}, ["track_id"]),
+        handler=_remove_track,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="rename_track",
+        description=(
+            "トラックの名前を変える 空にするとその位置の既定の名前（V2 など）へ戻る"
+            " 名前が FX と番号の映像トラックはフィルタ用（エフェクトトラック）として扱われる"
+        ),
+        schema=_schema(
+            {"track_id": _string("対象のトラック"), "name": _string("新しい名前")},
+            ["track_id", "name"],
+        ),
+        handler=_rename_track,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="move_track",
+        description=(
+            "トラックの並びを変える 同じ種類（映像どうし・音声どうし・レイヤーどうし）の中だけ"
+            " index は list_tracks の並びで同じ種類だけを数えた番号（0 から） 映像とレイヤーは"
+            "番号が大きいほど手前に重なる ロックしたトラックは動かせない"
+        ),
+        schema=_schema(
+            {"track_id": _string("動かすトラック"), "index": _integer("行き先（0 から）")},
+            ["track_id", "index"],
+        ),
+        handler=_move_track,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="rename_scene",
+        description="シーンの名前を変える scene_id を省くと開いているシーン メインは変えられない",
+        schema=_schema(
+            {"scene_id": _string("対象のシーン"), "name": _string("新しい名前")}, ["name"]
+        ),
+        handler=_rename_scene,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="remove_scene",
+        description=(
+            "シーンを消す（〔シーンを削除〕と同じ）"
+            " どこか（メイン・ほかのシーン）に置かれていれば断る"
+            " 開いているシーンを消すとメインへ戻る scene_id を省くと開いているシーン"
+            " 取り消し 1 回で戻る"
+        ),
+        schema=_schema({"scene_id": _string("消すシーン")}),
+        handler=_remove_scene,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="remove_media",
+        description=(
+            "素材を素材一覧から外す（〔プールから外す〕と同じ） ファイルは消さない"
+            " どこかのタイムラインで使っていれば断る 取り消し 1 回で戻る"
+        ),
+        schema=_schema({"media_id": _string("外す素材")}, ["media_id"]),
+        handler=_remove_media,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="set_work_area",
+        description=(
+            "書き出し範囲（目盛りの帯）を決める・解く"
+            " 決めた範囲は書き出しの範囲 work_area で使う"
+            " clear を真にすると解く（〔書き出し範囲を解除〕）"
+            " 範囲はタイムラインのフレーム [start, end)"
+        ),
+        schema=_schema(
+            {
+                "start_frame": _integer("始まり（含む）"),
+                "end_frame": _integer("終わり（含まない）"),
+                "clear": _boolean("範囲を解く"),
+            }
+        ),
+        handler=_set_work_area,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="add_filter",
+        description=(
+            "フィルタを置く（〔フィルタを追加〕と同じ）"
+            " 下に重なった絵全体へ、積んだエフェクトを掛ける"
+            " 置いた時点ではエフェクトを持たない 返す clip_id へ add_effect で積む"
+            " 置いた物が選ばれる"
+        ),
+        schema=_schema(
+            {
+                "at_frame": _integer("置く位置 省略すると再生ヘッド"),
+                "duration": _integer("長さ（フレーム、既定 150）"),
+                "track_id": _string(
+                    "置きたいトラック（右クリックした所） 塞がっていればいつもの決まりで選ぶ"
+                ),
+            }
+        ),
+        handler=_add_filter,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="add_group_control",
+        description=(
+            "グループ制御を置く 手前の対象レイヤー数ぶんのトラックの物を、位置・拡大率などで"
+            "まとめて動かす（値は set_param で変える） 置いた物が選ばれる"
+        ),
+        schema=_schema(
+            {
+                "at_frame": _integer("置く位置 省略すると再生ヘッド"),
+                "duration": _integer("長さ（フレーム、既定 150）"),
+                "track_id": _string(
+                    "置きたいトラック（右クリックした所） 塞がっていればいつもの決まりで選ぶ"
+                ),
+            }
+        ),
+        handler=_add_group_control,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="remove_effect",
+        description=(
+            "クリップのエフェクトを外す（設定パネルの ✕） 最初から持つ欄（fixed）は外せない"
+            "（set_effect_enabled で無効にする） 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "stroke_id": _string("縁取りの層（list_clips の strokes） その層のエフェクト"),
+                "after": _boolean(
+                    "場面切り替えの後の場面のエフェクト（list_clips の after_effects）"
+                ),
+                "effect_id": _string("外すエフェクト（list_clips の effects）"),
+            },
+            ["effect_id"],
+        ),
+        handler=_remove_effect,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="move_effect",
+        description=(
+            "エフェクトの順番を変える（設定パネルの ▲ ▼） 掛ける順で絵が変わる 0 が一番先に掛かる"
+            " 最初から持つ欄（fixed）は動かせず、またぐこともできない 返す order が並んだ後の順"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "stroke_id": _string("縁取りの層（list_clips の strokes） その層のエフェクト"),
+                "after": _boolean(
+                    "場面切り替えの後の場面のエフェクト（list_clips の after_effects）"
+                ),
+                "effect_id": _string("動かすエフェクト"),
+                "index": _integer("行き先（0 から）"),
+            },
+            ["effect_id", "index"],
+        ),
+        handler=_move_effect,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="set_effect_enabled",
+        description=(
+            "エフェクトを消さずに無効・有効にする（設定パネルの〔有効〕 掛ける前と後を見比べる）"
+            " 最初から持つ欄の組（描画・音声など）は、組の欄の ID を effect_ids にまとめて渡す"
+            " 何個渡しても取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "stroke_id": _string("縁取りの層（list_clips の strokes） その層のエフェクト"),
+                "after": _boolean(
+                    "場面切り替えの後の場面のエフェクト（list_clips の after_effects）"
+                ),
+                "effect_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "切り替えるエフェクト（1 つなら effect_id でもよい）",
+                },
+                "effect_id": _string("切り替えるエフェクト 1 つ"),
+                "enabled": _boolean("有効にするか"),
+            },
+            ["enabled"],
+        ),
+        handler=_set_effect_enabled,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="remove_keyframe",
+        description=(
+            "キーフレームを 1 つ消す（設定パネルの ◆ でキーの所を押すのと同じ）"
+            " 最後の 1 つを消すと、その値で固定される 指し方は add_keyframe と同じ"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "effect_id": _string("エフェクト"),
+                "stroke_id": _string("縁取りの層"),
+                "target": _string("source か clip"),
+                "name": _string("パラメータ名"),
+                "frame": _integer(
+                    "位置（クリップの頭から数えたフレーム） 省略すると再生ヘッドの所"
+                ),
+                "after": _boolean(
+                    "場面切り替えの後の場面へ積んだエフェクト（list_clips の after_effects）を指す"
+                ),
+            },
+            ["name"],
+        ),
+        handler=_remove_keyframe,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="clear_keyframes",
+        description=(
+            "パラメータのアニメーションを解除し、frame の所の値で固定する"
+            "（◆ の右クリックの〔アニメーションを解除〕） 指し方は add_keyframe と同じ"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("対象（省くと選択中のクリップ）"),
+                "effect_id": _string("エフェクト"),
+                "stroke_id": _string("縁取りの層"),
+                "target": _string("source か clip"),
+                "name": _string("パラメータ名"),
+                "frame": _integer(
+                    "位置（クリップの頭から数えたフレーム） 省略すると再生ヘッドの所"
+                ),
+                "after": _boolean(
+                    "場面切り替えの後の場面へ積んだエフェクト（list_clips の after_effects）を指す"
+                ),
+            },
+            ["name"],
+        ),
+        handler=_clear_keyframes,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="split_subtitle",
+        description=(
+            "字幕 1 枚を 2 枚に割る（字幕パネルの〔再生ヘッドで分割〕） 位置は素材の中の秒"
+            "（get_subtitles の source_start_seconds と同じ数え方） 省くと再生ヘッドの所"
+            " 本文は言葉の時刻があればその境目、無ければ長さの比で分ける 返す segment_ids は前と後"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "segment_id": _string("字幕（get_subtitles の segment_id）"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+                "at_seconds": _number("割る所（素材の中の秒）"),
+            },
+            ["media_id", "segment_id"],
+        ),
+        handler=_split_subtitle,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="merge_subtitles",
+        description=(
+            "字幕を次の 1 枚と繋げる（字幕パネルの〔次と結合〕） 本文は空白で繋ぐ"
+            " 繋いだ字幕は前の ID のまま 返す merged が消えた次の字幕"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "segment_id": _string("字幕（get_subtitles の segment_id）"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+            },
+            ["media_id", "segment_id"],
+        ),
+        handler=_merge_subtitles,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="delete_subtitle",
+        description=(
+            "字幕 1 枚を消す（字幕パネルの〔削除〕） 素材に付いた字幕なので、その素材を置いた"
+            "どの所からも消える 焼き込んだテキストは消えない 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "segment_id": _string("字幕（get_subtitles の segment_id）"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+            },
+            ["media_id", "segment_id"],
+        ),
+        handler=_delete_subtitle,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
         name="set_track_height",
         description=(
             "タイムラインでのトラックの高さ（画素）を変える 28〜240 の外は端へ寄せる "
@@ -5674,6 +6632,9 @@ OPERATIONS: tuple[Operation, ...] = (
                 "kind": _string("エフェクトの種類"),
                 "params": {"type": "object", "description": "初期値"},
                 "stroke_id": _string("縁取りの層（list_clips の strokes）"),
+                "after": _boolean(
+                    "場面切り替えの後の場面へ積む（設定パネルの〔後の場面へ〕） 省くと前の場面"
+                ),
             },
             ["kind"],
         ),
@@ -5761,6 +6722,9 @@ OPERATIONS: tuple[Operation, ...] = (
                 "target": _string("source か clip"),
                 "name": _string("パラメータ名"),
                 "value": {"description": "新しい値"},
+                "after": _boolean(
+                    "場面切り替えの後の場面へ積んだエフェクト（list_clips の after_effects）を指す"
+                ),
             },
             ["name", "value"],
         ),
@@ -5779,8 +6743,13 @@ OPERATIONS: tuple[Operation, ...] = (
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
                 "name": _string("パラメータ名"),
-                "frame": _integer("位置 省略すると再生ヘッド"),
+                "frame": _integer(
+                    "位置（クリップの頭から数えたフレーム） 省略すると再生ヘッドの所"
+                ),
                 "value": _number("その位置での値"),
+                "after": _boolean(
+                    "場面切り替えの後の場面へ積んだエフェクト（list_clips の after_effects）を指す"
+                ),
                 "interpolation": _string("linear / ease / hold / bezier"),
             },
             ["name", "value"],

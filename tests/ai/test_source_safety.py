@@ -18,6 +18,15 @@
 - 2026-10-17 に保存した見た目と棚を当てる・置く道具を足した（#328） プリセットとエイリアスの
   置き場・棚・``.exo`` は読むだけで、置き場の保存・名前の変更・削除の道具は無い
   （2026-10-17 本人の決定 AI は読むだけ）
+- 2026-10-20 に画面の操作と同じ道具を足した（#349） 消す物が増えた どれも画面の同じ操作と
+  同じ命令で、プロジェクトの中だけを変え、取り消し 1 回で戻る ファイルには触らない
+  - クリップの中の物 エフェクト（最初から持つ欄は外せない）・キーフレーム
+  - 素材に付いた字幕の 1 枚（分割・結合・削除 字幕パネルの右クリックと同じ）
+  - 空のトラック（クリップのあるトラックは画面と同じく断る 中身ごとは消さない）
+  - どこにも置かれていないシーン（置いてあれば断る）
+  - どこにも使っていない素材を素材一覧から外す（使っていれば断る ファイルは消さない）
+  消す範囲を広げても、中身のあるトラック・置いたシーン・使っている素材は消えない 消せるのは
+  空になった入れ物だけで、クリップを消す道具（#341）より先へは届かない
 
 ここではそれを試験で押さえる 新しく道具を足して崩れたら落ちる
 """
@@ -39,6 +48,7 @@ import pytest
 import sashimono.ai.bridge
 import sashimono.ai.operations
 import sashimono.ai.safety
+from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.model import MediaItem, Transcript
@@ -99,6 +109,27 @@ UNDOABLE_TOOLS = frozenset(
         "duck_audio",
         "normalize_loudness",
         "place_sound",
+        # 画面の操作と同じ道具（#349） どれも画面と同じ命令で、取り消し 1 回で戻る
+        "cut_clips",
+        "paste_clips",
+        "remove_track",
+        "rename_track",
+        "move_track",
+        "rename_scene",
+        "remove_scene",
+        # 素材一覧から外すだけ（使っていれば断る） ファイルは消さない
+        "remove_media",
+        "set_work_area",
+        "add_filter",
+        "add_group_control",
+        "remove_effect",
+        "move_effect",
+        "set_effect_enabled",
+        "remove_keyframe",
+        "clear_keyframes",
+        "split_subtitle",
+        "merge_subtitles",
+        "delete_subtitle",
         # 目印（#330） プロジェクトの中の目印だけを変える 素材にもファイルにも触らない
         "add_markers",
         "update_marker",
@@ -162,12 +193,25 @@ _WRITING_CALLS = frozenset(
     }
 )
 
-#: 道具が使ってよい、消す編集の命令 どれもプロジェクトの中のクリップ（と、その縁取りの層）
-#: を消す 素材を外す（RemoveMedia）・トラックやシーンを消す命令はここに無い
-#: 目印（RemoveMarkers #330）はプロジェクトの中の目盛りの印で、素材にもクリップにも触らず、
-#: 取り消し 1 回で戻る
+#: 道具が使ってよい、消す編集の命令 どれもプロジェクトの中だけを変え、取り消し 1 回で戻る
+#: クリップ（と、その縁取りの層）・目印（RemoveMarkers #330）
+#: 画面と同じ道具（#349）で、クリップの中のエフェクトとキーフレーム・字幕の 1 枚・空のトラック・
+#: 置いていないシーン・使っていない素材の素材一覧の行（RemoveMedia ファイルは消さない）を足した
+#: 入れ物の 3 つ（トラック・シーン・素材）は、中身があれば道具が断る（下の試験が見張る）
 _ALLOWED_REMOVALS = frozenset(
-    {"RemoveClip", "RemoveClips", "RemoveStroke", "RippleCut", "RemoveMarkers"}
+    {
+        "RemoveClip",
+        "RemoveClips",
+        "RemoveStroke",
+        "RippleCut",
+        "RemoveMarkers",
+        "RemoveEffect",
+        "RemoveKeyframe",
+        "RemoveSegment",
+        "RemoveTrack",
+        "RemoveScene",
+        "RemoveMedia",
+    }
 )
 
 
@@ -246,8 +290,9 @@ class TestCounted:
         writing |= {name for name in called if name.startswith("shutil.")}
         assert writing == set()
 
-    def test_tools_only_remove_clips(self) -> None:
-        # 壊れると、AI が素材を素材一覧から外したり、トラックやシーンを丸ごと消したりできる
+    def test_tools_only_remove_what_was_counted(self) -> None:
+        # 壊れると、数えていない消す命令を道具が使い、確かめていない物（素材のファイルの
+        # 扱い・中身のある入れ物）を AI が消せる
         tree = _source(sashimono.ai.operations)
         used = {
             node.id
@@ -255,7 +300,6 @@ class TestCounted:
             if isinstance(node, ast.Name) and node.id.startswith(("Remove", "Ripple"))
         }
         assert used <= _ALLOWED_REMOVALS
-        assert "RemoveMedia" not in used
 
 
 # --- 実際に消して、素材のファイルと素材一覧が残ることを見る ---
@@ -349,6 +393,47 @@ class TestDeletingKeepsTheOriginals:
 
         on_disk.document.undo()
         assert on_disk.document.project == before
+
+    def test_removing_media_keeps_the_file_and_undo_brings_the_row_back(
+        self, on_disk: FakeHost, original: Path, no_file_writes: list[str]
+    ) -> None:
+        # 壊れると、AI が素材一覧から外しただけで素材のファイルが消えるか書き換わり、
+        # 取り消しても素材一覧に戻らない（#349）
+        before = on_disk.document.project
+        content = original.read_bytes()
+        clip = before.timeline.tracks[0].clips[0]
+        _run(on_disk, "delete_clips", {"clip_ids": [str(clip.id)]})
+        emptied = on_disk.document.project
+
+        _run(on_disk, "remove_media", {"media_id": str(before.media[0].id)})
+
+        assert on_disk.document.project.media == ()
+        assert original.read_bytes() == content
+        assert no_file_writes == []
+        on_disk.document.undo()
+        assert on_disk.document.project == emptied
+
+    @pytest.mark.parametrize(
+        ("name", "arguments"),
+        [
+            ("remove_media", {}),
+            ("remove_track", {}),
+        ],
+    )
+    def test_containers_with_contents_are_refused(
+        self, on_disk: FakeHost, no_file_writes: list[str], name: str, arguments: dict[str, Any]
+    ) -> None:
+        # 壊れると、AI が使っている素材を外して絵の出ないクリップを残すか、クリップの載った
+        # トラックを中身ごと消し、消せる物がクリップを消す道具（#341）の外へ広がる
+        before = on_disk.document.project
+        ids = {
+            "media_id": str(before.media[0].id),
+            "track_id": str(before.timeline.tracks[0].id),
+        }
+        with pytest.raises(ToolError):
+            _run(on_disk, name, {**ids, **arguments})
+        assert on_disk.document.project == before
+        assert no_file_writes == []
 
     def test_the_undo_tool_brings_a_deleted_clip_back_in_one_step(
         self, on_disk: FakeHost, no_file_writes: list[str]

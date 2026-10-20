@@ -18,6 +18,7 @@ from typing import Protocol
 from sashimono.ai.sheet import SheetLayout
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import Command, Document
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
@@ -133,6 +134,31 @@ class EditorHost(Protocol):
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         """選択を丸ごと入れ替える 空なら選択を解く"""
+        ...
+
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        """タイムラインのコピーした中身 無ければ ``None``
+
+        人の Ctrl+C・Ctrl+X と同じ置き場（#349）
+        """
+        ...
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        """AI のコピー・切り取りの中身を置く 人の Ctrl+V でも同じ物が貼れること
+
+        作品の中身の写しを置くだけで、アプリ自身の設定は変えない（読むだけの決定 #350 の外）
+        """
+        ...
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        """挿入貼り付けで全トラックを押し出すか
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.insert_paste`）
+
+        AI の挿入貼り付けも人の Ctrl+Shift+V と同じ押し出し方にする 食い違うと、頼み方で
+        ほかのトラックの字幕や音が貼った所の後ろでずれたりずれなかったりする
+        """
         ...
 
     def apply_commands(self, commands: list[Command], label: str) -> None:

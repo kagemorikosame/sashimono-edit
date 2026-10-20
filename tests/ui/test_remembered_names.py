@@ -70,6 +70,11 @@ PROJECT_SIDE = {
     "selected_clips",
     "select_clips",
     "apply_commands",
+    # コピー・切り取り・貼り付け（#349） 置き場はタイムラインの写しで、道具が返すのは
+    # クリップの ID と長さだけ 素材の消えた写しは貼る所で断る（断る文に名前は無い）
+    "clipboard",
+    "set_clipboard",
+    "insert_paste_all_tracks",
     # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
     "undo",
     "redo",

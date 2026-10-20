@@ -73,7 +73,12 @@ from sashimono.core.model import (
     SegmentId,
     TranscriptSegment,
 )
-from sashimono.core.projection import project_clip, subtitle_stream, subtitle_voice
+from sashimono.core.projection import (
+    project_clip,
+    source_seconds_at,
+    subtitle_stream,
+    subtitle_voice,
+)
 from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.seams import seam_transition
@@ -649,19 +654,10 @@ class SubtitlePanel(QWidget):
     def _source_time(self, media: MediaItem, frame: int) -> Fraction | None:
         """タイムラインのフレームを、この素材の見ている音のソース秒へ
 
-        見ている音の字幕を出すクリップから取る 最初に当たるクリップを使うと、リンクを外して
-        音声 2 だけを切り詰めたとき、音声 1 のクリップの時刻で音声 2 の字幕を割る（PR #231）
+        AI の字幕の分割（``split_subtitle`` #349）と同じ所（:func:`source_seconds_at`）で決める
+        別々に持つと、人と AI で同じ再生ヘッドから割る時刻が食い違う
         """
-        wanted = media.transcript_stream(self._stream)
-        for track in self._project.timeline.tracks:
-            for clip in track.clips:
-                if clip.media_id != media.id or not clip.contains(frame):
-                    continue
-                if subtitle_voice(self._project, track, clip, media) != wanted:
-                    continue
-                elapsed = (frame - clip.timeline_start) * self._project.rate.frame_duration
-                return clip.source_in + elapsed * clip.speed
-        return None
+        return source_seconds_at(self._project, media, self._stream, frame)
 
     # --- 起こし・整形・カット ---
 
