@@ -27,6 +27,7 @@ import av.video.codeccontext
 import av.video.frame
 import av.video.stream
 import numpy as np
+from OpenGL.error import Error as GLLibraryError
 
 from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
@@ -38,7 +39,7 @@ from sashimono.engine.colorspace import (
     tag_frame_bt709,
     to_bt709,
 )
-from sashimono.engine.gpu import OffscreenGLContext
+from sashimono.engine.gpu import OffscreenGLContext, ShaderError, Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE, YuvReadback, open_readback
 from sashimono.engine.render import (
     DEFAULT_DECODE_THREADS,
@@ -566,12 +567,14 @@ class _FrameSource:
     読み戻しは 1 コマ遅れて出てくる（次のコマを合成している間に運ぶ） 出る順は合成した
     順のまま :meth:`drain` で最後の分を受け取る
 
-    最初の 1 コマだけは CPU の変換でも作って比べ、差が :data:`COLOR_TOLERANCE` を
-    超えたら GPU をやめて CPU の道で書き続ける 手元で確かめられたのは NVIDIA だけで、
-    AMD や Intel の駆動で変換が食い違ったときに、色のずれた動画を黙って書かないため
-    比べるのは 1 コマぶんの CPU の変換（1080p で 7 ms ほど）だけで済む
+    書き出しを始める前に、決まった試験の絵（:func:`_check_picture`）を GPU と CPU の両方で
+    変換して比べ、差が :data:`COLOR_TOLERANCE` を超えたら GPU を使わずに CPU の道で書く
+    手元で確かめられたのは NVIDIA だけで、AMD や Intel の駆動で変換が食い違ったときに、
+    色のずれた動画を黙って書かないため 比べるのは 1 枚ぶんの CPU の変換（1080p で 7 ms ほど）
+    合成した最初のコマで比べないのは、書き出しが暗転や単色で始まることが多いため 単色の絵では
+    色差の間引きの重み・端の扱い・U と V の面の境目が違っても差が 0 になり、食い違いを見逃す
 
-    使えないとき（形式・奇数の大きさ・駆動が断った・本人が切った）は、今までどおり
+    使えないとき（形式・奇数の大きさ・駆動が断った・食い違った・本人が切った）は、今までどおり
     :meth:`FrameRenderer.render` の RGBA を渡し、書き込みの側で CPU が変換する
     """
 
@@ -580,16 +583,20 @@ class _FrameSource:
     ) -> None:
         self._renderer = renderer
         self._readback: YuvReadback[tuple[int, int]] | None = None
-        #: 最初のコマを CPU の変換と比べ終えたか
-        self._checked = False
         if pixel_format is not None:
             with renderer.context:
-                self._readback = open_readback(width, height, pixel_format)
-        self._pixel_format = pixel_format or ""
+                readback: YuvReadback[tuple[int, int]] | None = open_readback(
+                    width, height, pixel_format
+                )
+                if readback is not None and not _agrees(readback, pixel_format, width, height):
+                    # 食い違った GPU の変換は捨てる どのコマも CPU で変換する
+                    readback.release()
+                    readback = None
+                self._readback = readback
 
     @property
     def on_gpu(self) -> bool:
-        """色変換を GPU で行っているか 比べて食い違ったら途中で偽になる"""
+        """色変換を GPU で行っているか 始める前に比べて食い違ったら偽"""
         return self._readback is not None
 
     def frame(self, index: int, frame_number: int, reserve: Callable[[], None]) -> list[_Frame]:
@@ -604,36 +611,12 @@ class _FrameSource:
         with self._renderer.context:
             self._renderer.compose(frame_number)
             texture = self._renderer.compositor.resolved_texture()
-            if not self._checked:
-                return [self._first(readback, index, frame_number, texture, reserve)]
             readback.push(texture, (index, frame_number))
             if not readback.full:
                 return []
             reserve()
             (done, number), image = readback.pop()
         return [(done, number, image)]
-
-    def _first(
-        self,
-        readback: YuvReadback[tuple[int, int]],
-        index: int,
-        frame_number: int,
-        texture: int,
-        reserve: Callable[[], None],
-    ) -> _Frame:
-        """最初のコマを GPU と CPU の両方で変換して比べ、どちらで続けるかを決める"""
-        self._checked = True
-        reserve()
-        readback.push(texture, (index, frame_number))
-        _tag, planes = readback.pop()
-        image = self._renderer.compositor.read()
-        expected = bt709_planes(image, self._pixel_format)
-        difference = np.abs(planes.astype(np.int16) - expected.astype(np.int16))
-        if expected.shape == planes.shape and int(difference.max()) <= COLOR_TOLERANCE:
-            return index, frame_number, planes
-        # 食い違った GPU の変換は捨てる 残りのコマも CPU で変換する
-        self.release()
-        return index, frame_number, image
 
     def drain(self, reserve: Callable[[], None]) -> Iterator[_Frame]:
         """読み戻している途中のコマを、合成した順に出す"""
@@ -649,6 +632,53 @@ class _FrameSource:
         if readback is not None:
             with self._renderer.context:
                 readback.release()
+
+
+#: GPU の変換を確かめるときの読み戻しの印 合成したコマの印（通し番号は 0 から）と重ならない
+_CHECK_TAG = (-1, -1)
+
+
+def _check_picture(width: int, height: int) -> np.ndarray:
+    """GPU の変換を確かめる ``width`` x ``height`` の RGBA 毎回同じ絵
+
+    上半分は 1 行おき・1 列おきの縞 縦の間引きの重みと端の扱いが違うと、ここでずれる
+    下半分は隣と関係の無い色 色差の間引き方や係数が違うと、ここがいちばん大きくずれる
+    大きさを書き出しと同じにするのは、yuv420p の U と V の面の境目が大きさで動くため
+    小さな絵で確かめると、境目の位置を間違える駆動を見逃す
+    """
+    image = np.random.default_rng(372).integers(0, 256, (height, width, 4), dtype=np.uint8)
+    top = image[: height // 2]
+    top[...] = 0
+    top[0::2, :, 0] = 255
+    top[1::2, :, 1] = 255
+    top[:, 0::2, 2] = 200
+    image[..., 3] = 255
+    return image
+
+
+def _agrees(
+    readback: YuvReadback[tuple[int, int]], pixel_format: str, width: int, height: int
+) -> bool:
+    """``readback`` の変換が、CPU の変換と :data:`COLOR_TOLERANCE` まで揃うか
+
+    GL コンテキストが current な状態で呼ぶ 駆動がここで断ったときも偽を返す
+    書き出しごと失敗させると、今まで CPU で書き出せていた機械で書けなくなる
+    """
+    picture = _check_picture(width, height)
+    try:
+        texture = Texture.from_array(picture, srgb=False)
+        try:
+            readback.push(texture.handle, _CHECK_TAG)
+            tag, planes = readback.pop()
+        finally:
+            texture.release()
+    except (ShaderError, GLLibraryError):
+        return False
+    expected = bt709_planes(picture, pixel_format)
+    if tag != _CHECK_TAG or planes.shape != expected.shape:
+        return False
+    difference = np.abs(planes.astype(np.int16) - expected.astype(np.int16))
+    return int(difference.max()) <= COLOR_TOLERANCE
 
 
 #: 書き込みスレッドへ渡す品物 ``None`` は「もう来ない」の合図

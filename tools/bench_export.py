@@ -381,13 +381,25 @@ def compare_pipeline(
     directory: Path,
     depths: list[int],
     threads: int,
+    *,
+    gpu_available: bool = True,
 ) -> None:
     """パイプラインの深さと色変換の道（CPU・GPU）を変えて書き出し、時間と中身を比べる
 
     GPU の道は色が丸めの 1 まで違ってよいので、絵の一致は同じ道どうしで見る
+
+    書き出しは GPU の変換を作れないと黙って CPU で変換する ``gpu_available`` が偽
+    （内訳で GPU の変換を作れなかった機械）なら GPU の行を測らない 測ると CPU の時間が
+    「色変換 GPU」の行に並び、CPU と同じ速さに見えて比べた意味が無くなる
+    書き出しは始める前に試験の絵で GPU と CPU の変換を比べ、食い違った駆動でも CPU に戻る
+    こちらはベンチマークの側から見えないので、内訳で GPU を作れても GPU の行が CPU で
+    測った時間になることがある GPU の行が CPU の行とほぼ同じなら、それを疑う
     """
     print("\n書き出し全体（パイプラインの深さと色変換の道ごと）")
     for gpu in (False, True):
+        if gpu and not gpu_available:
+            print("  色変換 GPU: この機械では GPU の変換を作れない")
+            continue
         _compare_depths(project, codec, frames, directory, depths, threads, gpu=gpu)
 
 
@@ -501,8 +513,9 @@ def main(argv: list[str] | None = None) -> int:
         f"デコードの並列 {threads} 本"
     )
     project = _project(sources, arguments.width, arguments.height, arguments.frames + 2)
+    # 色変換の道ごとの 1 枚の時間 GPU の変換を作れなかった道は入らない（--compare が見る）
+    totals: dict[str, float] = {}
     try:
-        totals: dict[str, float] = {}
         for gpu in (False, True):
             way = "GPU" if gpu else "CPU"
             times = breakdown(
@@ -534,7 +547,15 @@ def main(argv: list[str] | None = None) -> int:
 
     gil_release(sources, min(arguments.frames, 30))
     if arguments.compare:
-        compare_pipeline(project, codec, arguments.frames, _base, [0, 2, 4], threads)
+        compare_pipeline(
+            project,
+            codec,
+            arguments.frames,
+            _base,
+            [0, 2, 4],
+            threads,
+            gpu_available="GPU" in totals,
+        )
     return 0
 
 

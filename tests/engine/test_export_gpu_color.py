@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -25,7 +26,8 @@ from sashimono.core.timebase import FrameRate
 from sashimono.engine.colorspace import bt709_planes
 from sashimono.engine.decode import probe_media
 from sashimono.engine.encode import ExportError, ExportSettings, export_project, exporter
-from sashimono.engine.gpu import yuv
+from sashimono.engine.gpu import ShaderError, yuv
+from sashimono.engine.gpu.glutil import Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE
 from sashimono.engine.render import FrameRenderer
 from tests.media_fixtures import SampleMedia
@@ -41,6 +43,21 @@ def _picture(frame_number: int) -> np.ndarray:
     image[..., 2] = 255 - (frame_number * 37) % 256
     image[..., 3] = 255
     return image
+
+
+def _black(frame_number: int) -> np.ndarray:
+    """暗転の絵 どのコマも同じ黒 色差の間引き方がどう違っても、変換の結果は変わらない"""
+    image = np.zeros((HEIGHT, WIDTH, 4), np.uint8)
+    image[..., 3] = 255
+    return image
+
+
+def _shifted(image: np.ndarray, pixel_format: str) -> np.ndarray:
+    """1 行ずれた絵から変換する駆動の真似 縦の端の扱いや面の境目を間違えるとこうなる
+
+    単色の絵では正しい変換と 1 画素も違わないので、単色のコマで比べても見つからない
+    """
+    return bt709_planes(np.roll(image, 1, axis=0), pixel_format)
 
 
 class _Scope:
@@ -66,24 +83,26 @@ class _Scope:
 
 
 class _Compositor:
-    def __init__(self) -> None:
+    def __init__(self, picture: Callable[[int], np.ndarray]) -> None:
         self.current = -1
+        self._picture = picture
 
     def resolved_texture(self, *, straight: bool = False) -> int:
         # テクスチャの番号の代わりに、合成したコマの番号を渡す
         return self.current
 
     def read(self, *, straight: bool = False) -> np.ndarray:
-        return _picture(self.current)
+        return self._picture(self.current)
 
 
 class _Renderer:
     """FrameRenderer の代わり CPU の道（render）を通ったコマを覚える"""
 
-    def __init__(self) -> None:
+    def __init__(self, picture: Callable[[int], np.ndarray] = _picture) -> None:
         self.context = _Scope()
-        self.compositor = _Compositor()
+        self.compositor = _Compositor(picture)
         self.rendered: list[int] = []
+        self._picture = picture
 
     def compose(self, frame: int) -> None:
         assert self.context.depth > 0, "GL コンテキストの外で合成した"
@@ -91,17 +110,45 @@ class _Renderer:
 
     def render(self, frame: int) -> np.ndarray:
         self.rendered.append(frame)
-        return _picture(frame)
+        return self._picture(frame)
+
+
+class _Texture:
+    """Texture の代わり 上げた絵を、負の番号で読み戻しの偽物へ預ける
+
+    合成したコマの番号（0 以上）と重ならないので、偽物はどちらの絵を変換するかを番号で見分ける
+    """
+
+    def __init__(self, uploads: dict[int, np.ndarray], image: np.ndarray) -> None:
+        self.handle = -1 - len(uploads)
+        uploads[self.handle] = image
+        self._uploads = uploads
+
+    def release(self) -> None:
+        del self._uploads[self.handle]
 
 
 class _Readback:
     """YuvReadback の代わり 本物と同じく、PBO の数だけ溜めて先に入れた物から出す"""
 
-    def __init__(self, pixel_format: str, *, buffers: int = 2, skew: int = 0) -> None:
+    def __init__(
+        self,
+        pixel_format: str,
+        *,
+        buffers: int = 2,
+        skew: int = 0,
+        convert: Callable[[np.ndarray, str], np.ndarray] = bt709_planes,
+        picture: Callable[[int], np.ndarray] = _picture,
+    ) -> None:
         self.pixel_format = pixel_format
         self.buffers = buffers
         #: 変換の結果に足す値 駆動が食い違ったときの真似
         self.skew = skew
+        #: GPU の変換の代わり 既定は CPU の変換そのもの
+        self.convert = convert
+        self.picture = picture
+        #: 上げた試験の絵 :class:`_Texture` が番号を付けて入れる
+        self.uploads: dict[int, np.ndarray] = {}
         self._pending: deque[tuple[int, tuple[int, int]]] = deque()
         self.released = False
         self.pushed: list[int] = []
@@ -122,7 +169,8 @@ class _Readback:
 
     def pop(self) -> tuple[tuple[int, int], np.ndarray]:
         texture, tag = self._pending.popleft()
-        planes = bt709_planes(_picture(texture), self.pixel_format).astype(np.int16) + self.skew
+        image = self.uploads[texture] if texture < 0 else self.picture(texture)
+        planes = self.convert(image, self.pixel_format).astype(np.int16) + self.skew
         return tag, np.clip(planes, 0, 255).astype(np.uint8)
 
     def release(self) -> None:
@@ -135,6 +183,7 @@ def _source(
     readback: _Readback | None,
     *,
     pixel_format: str | None = "yuv420p",
+    picture: Callable[[int], np.ndarray] = _picture,
 ) -> tuple[exporter._FrameSource, _Renderer, list[str]]:
     opened: list[str] = []
 
@@ -142,8 +191,16 @@ def _source(
         opened.append(fmt)
         return readback
 
+    def fake_texture(image: np.ndarray, *, srgb: bool = True) -> _Texture:
+        # 合成の結果（resolved_texture）は符号化済みの RGBA8 sRGB で上げると、読む時に
+        # リニアへ戻されて試験の絵が別の色になる
+        assert not srgb, "試験の絵を sRGB で上げた"
+        assert readback is not None
+        return _Texture(readback.uploads, image)
+
     monkeypatch.setattr(exporter, "open_readback", fake_open)
-    renderer = _Renderer()
+    monkeypatch.setattr(Texture, "from_array", fake_texture)
+    renderer = _Renderer(picture)
     source = exporter._FrameSource(cast("FrameRenderer", renderer), pixel_format, WIDTH, HEIGHT)
     return source, renderer, opened
 
@@ -219,7 +276,7 @@ class TestOrder:
         assert renderer.rendered == []
         assert source.on_gpu
 
-    def test_the_first_frame_that_disagrees_switches_to_the_cpu(
+    def test_a_disagreeing_driver_writes_every_frame_on_the_cpu(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 手元で確かめていない駆動で色が食い違ったら、色のずれた動画を黙って書かない
@@ -230,8 +287,64 @@ class TestOrder:
         assert not source.on_gpu
         assert all(image.ndim == 3 for _i, _n, image in items)
         assert [number for _i, number, _image in items] == [100, 101, 102, 103]
-        # 最初のコマは比べるために合成した絵をそのまま使う 2 回合成すると動きの記憶がずれる
-        assert renderer.rendered == [101, 102, 103]
+        # 合成する前に決めるので、どのコマも 1 回だけ CPU の道で合成する
+        # 2 回合成すると動きの記憶がずれる
+        assert renderer.rendered == [100, 101, 102, 103]
+        assert readback.pushed == [-1], "合成したコマを食い違った GPU へ渡した"
+
+    def test_a_black_opening_still_catches_a_misplaced_conversion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 暗転で始まる書き出しを最初のコマで比べると差が 0 で通り、面の境目や縦の端を
+        # 間違える駆動でも、残りのコマ全部を色のずれたまま書いてしまう
+        readback = _Readback("yuv420p", convert=_shifted, picture=_black)
+        source, renderer, _opened = _source(monkeypatch, readback, picture=_black)
+        items = _run(source, 3)
+        assert readback.released
+        assert not source.on_gpu
+        assert all(image.ndim == 3 for _i, _n, image in items)
+        assert renderer.rendered == [100, 101, 102]
+
+    def test_the_check_picture_is_the_size_of_the_export(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # yuv420p の U と V の面の境目は大きさで動く 小さな絵で確かめると、書き出しの
+        # 大きさでだけ境目を間違える駆動を見逃す
+        sizes: list[tuple[int, ...]] = []
+        original = exporter._check_picture
+
+        def spy(width: int, height: int) -> np.ndarray:
+            image = original(width, height)
+            sizes.append(image.shape)
+            return image
+
+        monkeypatch.setattr(exporter, "_check_picture", spy)
+        _source(monkeypatch, _Readback("yuv420p"))
+        assert sizes == [(HEIGHT, WIDTH, 4)]
+
+    def test_the_check_picture_shows_chroma_and_row_mistakes(self) -> None:
+        # 試験の絵が平らだと、色差の間引きや 1 行のずれがあっても差が出ず、比べても素通りする
+        image = exporter._check_picture(64, 48)
+        right = bt709_planes(image, "yuv420p").astype(np.int16)
+        assert int(np.abs(_shifted(image, "yuv420p") - right).max()) > COLOR_TOLERANCE
+        assert np.array_equal(image, exporter._check_picture(64, 48)), "毎回違う絵になった"
+
+    def test_a_driver_that_fails_the_check_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 確かめる途中で駆動が断ったときに投げたままにすると、CPU なら書けた書き出しが始まらない
+        readback = _Readback("yuv420p")
+
+        def refuse() -> tuple[tuple[int, int], np.ndarray]:
+            raise ShaderError("読み戻しのバッファを開けない")
+
+        monkeypatch.setattr(readback, "pop", refuse)
+        source, renderer, _opened = _source(monkeypatch, readback)
+        assert not source.on_gpu
+        assert readback.released
+        assert readback.uploads == {}, "試験の絵のテクスチャを返していない"
+        _run(source, 2)
+        assert renderer.rendered == [100, 101]
 
     def test_a_disagreement_within_rounding_stays_on_the_gpu(
         self, monkeypatch: pytest.MonkeyPatch
@@ -301,20 +414,22 @@ class TestExport:
         depth: int,
     ) -> None:
         # 速くするために絵が変わったら本末転倒 コマの数・順・色が CPU の道と丸めの 1 まで同じ
-        pushed: list[int] = []
+        pushed: list[tuple[int, int]] = []
         original = yuv.YuvReadback.push
 
         def spy(self: yuv.YuvReadback[tuple[int, int]], texture: int, tag: tuple[int, int]) -> None:
-            pushed.append(texture)
+            pushed.append(tag)
             original(self, texture, tag)
 
         monkeypatch.setattr(yuv.YuvReadback, "push", spy)
         gpu = tmp_path / "gpu.mp4"
         cpu = tmp_path / "cpu.mp4"
         export_project(moving_project, _lossless(gpu, gpu_color=True, depth=depth))
-        assert len(pushed) == 12, "GPU の道を通っていない"
+        # 頭の 1 枚は始める前の試験の絵 それが通ってから 12 コマを GPU で変換する
+        assert pushed[0] == exporter._CHECK_TAG, "始める前に GPU の変換を確かめていない"
+        assert len(pushed) == 13, "GPU の道を通っていない"
         export_project(moving_project, _lossless(cpu, gpu_color=False, depth=depth))
-        assert len(pushed) == 12, "切ったのに GPU の道を通った"
+        assert len(pushed) == 13, "切ったのに GPU の道を通った"
 
         left, right = _planes(gpu), _planes(cpu)
         assert len(left) == len(right) == 12
