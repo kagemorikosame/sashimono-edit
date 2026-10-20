@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from typing import NamedTuple
 
 from sashimono.core.commands.base import Command
 from sashimono.core.commands.edit import AddClip, AddTrack
@@ -38,7 +39,9 @@ __all__ = [
     "AddSegment",
     "MergeWithNext",
     "RemoveSegment",
+    "RenameSpeaker",
     "RetimeSegment",
+    "SetSegmentSpeaker",
     "SetSegmentText",
     "SplitSegment",
     "SubtitleLook",
@@ -100,6 +103,79 @@ class SetSegmentText(Command):
         transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         updated = transcript.replace_segment(segment.with_text(self.text))
         return _store(project, self.media_id, updated, self.stream)
+
+
+@dataclass(frozen=True, slots=True)
+class SetSegmentSpeaker(Command):
+    """字幕の話者を付け替える（#323） 分離が取り違えた行を人と AI が直す
+
+    ``speaker`` が ``None`` なら話者を外す 本文の編集済みの印は変えない（本文は直していない）
+    """
+
+    media_id: MediaId
+    segment_ids: tuple[SegmentId, ...]
+    speaker: str | None
+    stream: int | None = None
+
+    @property
+    def label(self) -> str:
+        return "話者を変更"
+
+    def apply(self, project: Project) -> Project:
+        name = _speaker_value(self.speaker)
+        transcript = None
+        for segment_id in self.segment_ids:
+            # 無い行はここで断る 黙って飛ばすと、直したつもりの行が残る
+            transcript, _ = _locate(project, self.media_id, segment_id, self.stream)
+        if transcript is None:
+            raise ValueError("話者を変える字幕がありません")
+        wanted = set(self.segment_ids)
+        segments = [replace(s, speaker=name) if s.id in wanted else s for s in transcript.segments]
+        return _store(project, self.media_id, _rebuilt(transcript, segments), self.stream)
+
+
+@dataclass(frozen=True, slots=True)
+class RenameSpeaker(Command):
+    """話者の名前を付け替える（#323） その素材と音声の、同じ名前の字幕すべて
+
+    分離は「話者 1」のように番号で名前を振る 人の名前に替えると、焼き込みのレイヤーの名前と
+    AI の読む字幕にもその名前が出る 替える先が既にある名前なら 2 人を 1 人にまとめる
+    （分離が 1 人を 2 人に割ったときの直し方）
+    """
+
+    media_id: MediaId
+    old: str
+    new: str
+    stream: int | None = None
+
+    @property
+    def label(self) -> str:
+        return "話者の名前を変更"
+
+    def apply(self, project: Project) -> Project:
+        name = _speaker_value(self.new)
+        if name is None:
+            raise ValueError("新しい話者の名前が空です")
+        item = project.require_media(self.media_id)
+        transcript = item.transcript_for(self.stream)
+        if transcript is None:
+            raise KeyError(f"素材に字幕が無い: {item.name}")
+        if all(s.speaker != self.old for s in transcript.segments):
+            raise KeyError(f"その話者の字幕がありません: {self.old}")
+        segments = [
+            replace(s, speaker=name) if s.speaker == self.old else s for s in transcript.segments
+        ]
+        return _store(project, self.media_id, _rebuilt(transcript, segments), self.stream)
+
+
+def _speaker_value(name: str | None) -> str | None:
+    """話者の名前をそろえる 前後の空白は落とし、空なら話者なし
+
+    空白だけの名前を残すと、焼き込みのレイヤーが「字幕 」のような見分けの付かない名前になる
+    """
+    if name is None:
+        return None
+    return name.strip() or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,30 +329,57 @@ class MergeWithNext(Command):
         )
 
 
-#: 焼き込む字幕の話し手（素材と音声ストリームの番号） 素材を持たない（シーンの中の）字幕は
-#: ``(None, 0)`` にまとめる
-Voice = tuple[MediaId | None, int]
+class Voice(NamedTuple):
+    """焼き込む字幕の話し手 素材・音声ストリームの番号・話者（#323）
+
+    素材を持たない（シーンの中の）字幕は素材 ``None``・音声 0 にまとめる 話者は字幕に
+    付いた名前（:attr:`TranscriptSegment.speaker`） 分離していない字幕は ``None`` で、
+    今までどおり素材と音声だけで分かれる マイク 1 本に 2 人が入った素材も、話者を付ければ
+    人ごとに別のレイヤーへ入り、同時に話す所で前の字幕が切り詰められなくなる
+    """
+
+    media_id: MediaId | None
+    stream: int
+    speaker: str | None = None
 
 
 def subtitle_voices(project: Project) -> list[Voice]:
-    """タイムラインに字幕が出ている話し手 素材の並び・音声の番号の順"""
-    found = {voice for voice, _ in _voiced(project)}
+    """タイムラインに字幕が出ている話し手 素材の並び・音声の番号・話者が初めて出た順"""
+    voiced = _voiced(project)
     order = {item.id: index for index, item in enumerate(project.media)}
-    return sorted(found, key=lambda v: (order.get(v[0], -1) if v[0] else -1, v[1]))
+    # 話者は名前の並びではなく初めて出た順 「話者 10」が「話者 2」より前に並ばないように
+    appeared: dict[str, int] = {}
+    for voice, _ in voiced:
+        if voice.speaker is not None:
+            appeared.setdefault(voice.speaker, len(appeared))
+    found = {voice for voice, _ in voiced}
+    return sorted(
+        found,
+        key=lambda v: (
+            order.get(v.media_id, -1) if v.media_id else -1,
+            v.stream,
+            -1 if v.speaker is None else appeared[v.speaker],
+        ),
+    )
 
 
-def voice_label(project: Project, voice: Voice, *, with_media: bool = True) -> str:
-    """話し手の名前 音声が何本もある素材は「音声 N」を添える"""
-    media_id, stream = voice
-    media = project.find_media(media_id) if media_id is not None else None
+def voice_label(
+    project: Project, voice: Voice, *, with_media: bool = True, with_stream: bool = True
+) -> str:
+    """話し手の名前 音声が何本もある素材は「音声 N」を、話者が付いていればその名前を添える
+
+    ``with_media`` と ``with_stream`` を偽にすると素材の名前と「音声 N」を省く 焼き込みの
+    レイヤーの名前で、同じ素材・同じ音声の話者だけが並ぶときに「字幕 話者 1」と短くする
+    何も残らなければ素材の名前
+    """
+    media = project.find_media(voice.media_id) if voice.media_id is not None else None
     if media is None:
-        return "シーン"
+        return " ".join(part for part in ("シーン", voice.speaker) if part)
     known = [s.index for s in media.audio_streams]
-    number = known.index(stream) + 1 if stream in known else 1
-    voice_part = f"音声 {number}" if len(known) > 1 else ""
-    if not with_media:
-        return voice_part or media.name
-    return f"{media.name} {voice_part}".strip()
+    number = known.index(voice.stream) + 1 if voice.stream in known else 1
+    voice_part = f"音声 {number}" if len(known) > 1 and with_stream else ""
+    parts = (media.name if with_media else "", voice_part, voice.speaker or "")
+    return " ".join(part for part in parts if part) or media.name
 
 
 def _voiced(project: Project) -> list[tuple[Voice, ProjectedSubtitle]]:
@@ -288,9 +391,10 @@ def _voiced(project: Project) -> list[tuple[Voice, ProjectedSubtitle]]:
     """
     result: list[tuple[Voice, ProjectedSubtitle]] = []
     for subtitle in project_timeline(project):
-        voice: Voice = (None, 0)
+        speaker = subtitle.segment.speaker
+        voice = Voice(None, 0, speaker)
         if subtitle.media_id is not None and project.find_media(subtitle.media_id) is not None:
-            voice = (subtitle.media_id, subtitle.stream)
+            voice = Voice(subtitle.media_id, subtitle.stream, speaker)
         result.append((voice, subtitle))
     return result
 
@@ -320,7 +424,7 @@ def burn_subtitles(
     投影した結果をそのまま置くので、この時点のカット状態が固定される あとから
     素材を切っても焼き込んだテキストは動かない だから仕上げの最後に使う
 
-    話し手（素材と音声 :data:`Voice`）ごとに別のレイヤー（分ける方式では映像トラック）へ
+    話し手（素材と音声と話者 :class:`Voice`）ごとに別のレイヤー（分ける方式では映像トラック）へ
     入れる 1 本にまとめていたときは、音声 1 と 2 が同時に話している所で前の字幕が
     切り詰められて欠けた 同じ話し手の中で重なる字幕は、前の方を切り詰める
     （1 本のトラックにクリップを重ねられないため）
@@ -346,13 +450,17 @@ def burn_subtitles(
 
     order = subtitle_voices(project)
     keys = sorted(grouped, key=lambda v: order.index(v) if v in order else len(order))
-    same_media = len({media for media, _ in keys}) == 1
+    same_media = len({voice.media_id for voice in keys}) == 1
+    same_stream = len({(voice.media_id, voice.stream) for voice in keys}) == 1
     commands: list[Command] = []
     for voice in keys:
         if len(keys) == 1:
             name = track_name
         else:
-            name = f"{track_name} {voice_label(project, voice, with_media=not same_media)}"
+            label = voice_label(
+                project, voice, with_media=not same_media, with_stream=not same_stream
+            )
+            name = f"{track_name} {label}"
         if places_mixed(project):
             # 混合の方式ではレイヤーにする 並びの末尾（一番手前）に入るので、動画の上に出る
             # 映像トラックにすると、方式を混合にしたのに字幕だけ別の種類のトラックへ入る

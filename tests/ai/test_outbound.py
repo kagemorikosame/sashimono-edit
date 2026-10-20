@@ -307,6 +307,14 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "normalize_loudness": lambda _ids: {"wait_seconds": 0},
     "place_sound": lambda ids: {"media_id": ids["media"]},
     "transcribe": lambda ids: {"media_id": ids["media"], "replace": True},
+    # 話者の分離（#323） 始めた知らせに素材の名前が入る 付け替える名前は本文と同じ扱い
+    "separate_speakers": lambda ids: {"media_id": ids["media"], "speakers": 2},
+    "rename_speaker": lambda ids: {"media_id": ids["media"], "from": "話者 1", "to": ARG_TEXT},
+    "set_subtitle_speaker": lambda ids: {
+        "media_id": ids["media"],
+        "segment_ids": [ids["segment"]],
+        "speaker": ARG_TEXT,
+    },
     "undo": lambda _ids: {},
     # 取り消した後でなければ、やり直す物が無いと断る 断る文にも名前は入らない（#333）
     "redo": lambda _ids: {},

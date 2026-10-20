@@ -11,7 +11,7 @@ from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
-from sashimono.core.commands import Command, burn_subtitles
+from sashimono.core.commands import Command, Voice, burn_subtitles
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.model import (
     AudioStreamInfo,
@@ -80,7 +80,7 @@ class TestEachVoiceGetsItsOwnTrack:
     def test_the_voices_can_be_chosen(self) -> None:
         # 話し手の絞り込みが効かないと、マイクの声だけ焼くつもりがゲームの声の字幕まで画面に載る
         project, media = _project()
-        commands = burn_subtitles(project, TEXT.create(), voices=[(media.id, 2)])
+        commands = burn_subtitles(project, TEXT.create(), voices=[Voice(media.id, 2)])
         burned = _apply(project, commands)
         # 1 人だけなら名前に音声を添えない（今までの「字幕」）
         assert _texts(burned, "字幕") == ["マイクの声"]
