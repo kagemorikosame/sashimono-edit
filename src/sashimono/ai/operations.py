@@ -196,7 +196,7 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
 )
-from sashimono.core.projection import project_timeline
+from sashimono.core.projection import heard_timeline, project_timeline
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -2382,13 +2382,11 @@ def _subtitle_ticks(project: Project, start: int, fps: float, ticks: int) -> np.
     """区切りごとに、鳴っているクリップの字幕が重なるか
 
     消音のトラックや無効のクリップの字幕は数えない 聞こえない声の字幕で話し声と読むと、
-    BGM だけが鳴っている所を話し声と返す
+    BGM だけが鳴っている所を話し声と返す 置いたシーンの中も、外へ写す前に鳴るかを見る
+    （:func:`heard_timeline` 写した後はクリップ ID が外側のシーンの物になり、見分けられない）
     """
     mask = np.zeros(ticks, dtype=bool)
-    heard = {clip.id for _track, clip in audible_clips(project)}
-    for subtitle in project_timeline(project):
-        if subtitle.clip_id not in heard:
-            continue
+    for subtitle in heard_timeline(project):
         low = math.floor((subtitle.start_frame - start) / fps / TICK_SECONDS)
         high = math.ceil((subtitle.end_frame - start) / fps / TICK_SECONDS)
         if high <= 0 or low >= ticks:

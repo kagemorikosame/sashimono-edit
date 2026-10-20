@@ -27,7 +27,7 @@ from sashimono.ai.operations import (
 from sashimono.ai.outbound import ASKED, Outbound, SendChoice
 from sashimono.ai.safety import Safety
 from sashimono.ai.sound_graph import MARGIN_LEFT, plot_width
-from sashimono.core.commands import AddClip
+from sashimono.core.commands import AddClip, AddScene, InScene, insert_scene, new_scene
 from sashimono.core.model import MediaItem, Project, ProjectSettings, Track, TrackKind, Transcript
 from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
@@ -77,6 +77,34 @@ def _voiced(media: MediaItem, transcript: Transcript, seconds: int = 10) -> Fake
     track = Track(kind=TrackKind.AUDIO, name="A1")
     base = base.with_timeline(replace(base.timeline, tracks=(track,)))
     return FakeHost(AddClip(track.id, make_clip(0, seconds * 30, voiced)).apply(base))
+
+
+def _in_scenes(
+    media: MediaItem, transcript: Transcript, *, muted: bool, enabled: bool, nested: bool
+) -> FakeHost:
+    """字幕を付けた声をシーンの中の音声トラックに置き、そのシーンを外に置いた作品
+
+    ``nested`` ならシーンをもう 1 段のシーンに入れてから置く 声のトラックを消音（``muted``）
+    したり、声のクリップを無効（``enabled`` が偽）にしたりできる
+    """
+    voiced = replace(media, duration=Fraction(10)).with_transcript(transcript)
+    base = Project.create(ProjectSettings(frame_rate=RATE_30), media=(voiced,))
+    clip = replace(make_clip(0, 300, voiced), enabled=enabled)
+    voice = Track(kind=TrackKind.AUDIO, name="声", clips=(clip,), muted=muted)
+    inner = replace(new_scene(base, "中"), timeline=replace(base.timeline, tracks=(voice,)))
+    project = AddScene(inner).apply(base)
+    placed_id = inner.id
+    if nested:
+        outer = new_scene(project, "外")
+        project = AddScene(outer).apply(project)
+        inside = replace(project, timeline=project.require_scene(outer.id).timeline)
+        for command in insert_scene(inside, inner.id, at_frame=0, duration=300):
+            project = InScene(outer.id, command).apply(project)
+            inside = replace(project, timeline=project.require_scene(outer.id).timeline)
+        placed_id = outer.id
+    for command in insert_scene(project, placed_id, at_frame=0, duration=300):
+        project = command.apply(project)
+    return FakeHost(project)
 
 
 @pytest.fixture
@@ -133,6 +161,27 @@ class TestAnalyzeAudio:
         # 短い切り替わりは拾わない限り）ので、数に入っても入らなくてもよい
         assert 6.0 <= result["summary"]["seconds_by_kind"]["speech"] <= 7.0
         assert result["complete"] is True
+
+    @pytest.mark.parametrize("nested", [False, True])
+    @pytest.mark.parametrize(("muted", "enabled"), [(False, True), (True, True), (False, False)])
+    def test_only_heard_subtitles_inside_scenes_count(
+        self,
+        video_media: MediaItem,
+        transcript: Transcript,
+        muted: bool,
+        enabled: bool,
+        nested: bool,
+    ) -> None:
+        # 壊れると、シーンの中で消音した声のトラックや無効にした声のクリップの字幕を根拠に、
+        # BGM だけが鳴る所を話し声と返す（字幕を外へ写すとクリップ ID が外側のシーンの物に
+        # 書き換わるので、外で鳴るかを照らしても見分けられない）
+        host = _in_scenes(video_media, transcript, muted=muted, enabled=enabled, nested=nested)
+        host.heard = _heard(chord(10.0))
+        result = _operation("analyze_audio")(host, {"points": 0})
+        assert isinstance(result, dict)
+        heard = not muted and enabled
+        covered = [row for row in result["segments"] if row.get("subtitles")]
+        assert bool(covered) is heard, result["segments"]
 
     def test_the_curve_is_bundled_into_points(self, host: FakeHost) -> None:
         # 壊れると、推移を 100 ms ごとに全部返し、長い作品で返事が上限を越えて打ち切られる
