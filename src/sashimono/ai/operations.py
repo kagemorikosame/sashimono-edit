@@ -23,6 +23,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from sashimono.ai.handoff import GET_HANDOFF, shelf_for
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -1579,6 +1580,23 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 今の指示で変えた手（古い順） 指示の中で undo するとここから戻る（#333）
         "this_instruction": list(document.steps_in_checkpoint),
     }
+
+
+def _get_handoff(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    document = host.document
+    shelf = shelf_for(document)
+    found = shelf.current(document)
+    if found is None:
+        return {
+            "handoff": None,
+            "note": "引き継ぎはありません（途中で止まった指示が無いか、その後に別の作品を開いた）",
+        }
+    result = found.as_dict()
+    # 止まった後に終えた指示の数（今の指示は数えない） 0 でなければ、その後の指示で形が
+    # 変わっているかもしれない
+    result["later_instructions"] = shelf.later
+    return result
 
 
 # --- 目印（マーカー）とチャプター（#330）---
@@ -4842,6 +4860,9 @@ _SEAM_ARGUMENTS: dict[str, Any] = {
 }
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
+#: 止まった指示の引き継ぎ（#346） 人の指示と AI の最後の言葉（会話）、変えた手の名前（履歴と
+#: 同じく素材の名前とテキストの文の頭が入る）、失敗した道具の文（素材の場所が入りうる）が載る
+_HANDOFF = frozenset({Outbound.CONVERSATION, Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 
 
 OPERATIONS: tuple[Operation, ...] = (
@@ -4945,6 +4966,21 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_history,
         sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
+    ),
+    # 途中で止まった指示の引き継ぎ（#346） 人は AI のパネルの引き継ぎの欄で読む
+    # 中身は人の指示の文と変えた手の名前なので、履歴と同じく字幕と文字は断っても動かして伏せる
+    Operation(
+        name=GET_HANDOFF,
+        description=(
+            "途中で止まった前の指示の引き継ぎ（止まった訳・変えた手・取り消しの段・失敗した操作・"
+            "許されなかった物・残り）を読む 止まった指示の続きを頼まれたら、まずこれを読む"
+            " changes と checkpoint は作品の履歴から組んだ物、ai_words は前の AI の言葉"
+        ),
+        schema=_schema({}),
+        handler=_get_handoff,
+        sends=_HANDOFF,
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
     ),

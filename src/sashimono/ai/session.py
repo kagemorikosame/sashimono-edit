@@ -30,6 +30,7 @@ from sashimono.core.model import LayerMode
 
 __all__ = [
     "ASK_RULES",
+    "LIMIT_DETAIL",
     "SYSTEM_PROMPT",
     "UPDATE_PARTS_LABEL",
     "AgentEvent",
@@ -37,6 +38,7 @@ __all__ = [
     "EventKind",
     "OutdatedClaudeCode",
     "outdated_claude_code",
+    "result_error",
     "system_prompt",
 ]
 
@@ -122,6 +124,8 @@ _PROMPT = """\
   読めますが、変えられません 変えたほうがよいときは、ユーザーに伝えてください
 {ask_rules}- 失敗したら、エラーの文面を読んで直してから再試行してください 同じ操作を
   そのまま繰り返さないこと
+- 途中で止まった前の指示の続きを頼まれたら、まず get_handoff で引き継ぎ（変えた手・
+  止まった訳・残り）を読み、今の形を確かめてから続けてください
 
 返事は日本語で、簡潔に 作業の実況ではなく、やったことと結果を伝えてください
 """
@@ -469,14 +473,28 @@ class AgentSession:
                         )
                     )
         elif isinstance(message, ResultMessage) and message.is_error:
-            self._emit(
-                AgentEvent(
-                    EventKind.ERROR, text=with_login_hint(str(message.result or "失敗しました"))
-                )
-            )
+            self._emit(result_error(str(message.subtype or ""), message.result))
 
     def _emit(self, event: AgentEvent) -> None:
         self._events.put(event)
+
+
+#: Claude Code の上限（手数・費用）で止まったことを、ERROR の知らせの ``detail`` に書く印（#346）
+LIMIT_DETAIL = "limit"
+
+
+def result_error(subtype: str, result: str | None) -> AgentEvent:
+    """Claude Code が失敗で終えた知らせ（ResultMessage）を、画面の知らせへ
+
+    手数や費用の上限（``error_max_turns``・``error_max_budget_usd`` など ``error_max`` で始まる）で
+    止まったときは ``detail`` に :data:`LIMIT_DETAIL` を付ける 画面は引き継ぎの訳を「上限」にする
+    エラーと書くと、直す不具合があるように読め、送り直せば続くことに気付かない
+    SDK を読まずに試せるよう、メッセージそのものではなく値を受け取る
+    """
+    if subtype.startswith("error_max"):
+        text = result or f"Claude Code の上限に達して止まりました（{subtype}）"
+        return AgentEvent(EventKind.ERROR, text=text, detail=LIMIT_DETAIL)
+    return AgentEvent(EventKind.ERROR, text=with_login_hint(str(result or "失敗しました")))
 
 
 async def _safe_interrupt(client: Any) -> None:

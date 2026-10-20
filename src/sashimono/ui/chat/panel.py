@@ -48,10 +48,12 @@ from PySide6.QtWidgets import (
 
 from sashimono.ai import AI_PACK, Approval, EditorBridge, EditorHost, Question
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
+from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, TurnRecord, shelf_for
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
 from sashimono.ai.session import (
+    LIMIT_DETAIL,
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
     AgentEvent,
@@ -67,6 +69,7 @@ from sashimono.ui.chat.send_consent import ask_send
 from sashimono.ui.disclosure import DisclosureButton
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.setup import SetupSection
+from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, theme_signals, themed_style
 from sashimono.ui.workspace import Preferences
 
@@ -90,6 +93,9 @@ POLL_MS = 80
 
 #: 実行中にドックのタブの名前の頭へ付ける印 パネルが別のタブの裏にあっても動いていると分かる
 RUNNING_MARK = "● "
+
+#: 止まった指示の引き継ぎ（#346）を会話の欄に出すときの、言った人の代わりの名前
+HANDOFF_WHO = "引き継ぎ"
 
 #: 会話の欄の区切りの行（1 回の応答の終わり）を表す、言った人の代わりの印
 #: 本人や Claude の発言と取り違えないよう、名前に使わない制御文字で始める
@@ -284,6 +290,16 @@ class ChatPanel(QWidget):
         #: 指示がすべて終わったらタスクバーで知らせるか（設定）
         self._alert_when_done = False
 
+        # --- 止まった指示の引き継ぎ（#346） ---
+        #: いまの指示で起きたこと（呼んだ道具・失敗・許されなかった物・止まった訳）
+        self._record = TurnRecord()
+        #: いまの指示の取り消しの段の名前 引き継ぎの「Ctrl+Z で〜を戻す」に書く
+        self._checkpoint_label = ""
+        #: 欄に出している引き継ぎ
+        self._handoff: Handoff | None = None
+        #: 止まったときに引き継ぎを欄に出すか（設定） 切っても作って置き、AI は読める
+        self._show_handoffs = True
+
         # --- 部品が古くて断られたとき ---
         #: いまの指示で「Claude Code が古くて、このモデルを使えない」と断られた
         self._outdated: OutdatedClaudeCode | None = None
@@ -465,6 +481,8 @@ class ChatPanel(QWidget):
         update_layout.addWidget(self._update_text, 1)
         update_layout.addWidget(self._update_button)
 
+        self._build_handoff_box()
+
         self._input = _Input(self)
         self._describe_send_key()
         self._input.setMaximumHeight(96)
@@ -528,6 +546,7 @@ class ChatPanel(QWidget):
         layout.addWidget(self._approval_box)
         layout.addWidget(self._question_box)
         layout.addWidget(self._update_box)
+        layout.addWidget(self._handoff_box)
         layout.addLayout(status_row)
         layout.addWidget(self._input)
         layout.addLayout(controls)
@@ -589,6 +608,50 @@ class ChatPanel(QWidget):
         inner_layout.addWidget(buttons)
         self._question_box.setWidget(inner)
 
+    def _build_handoff_box(self) -> None:
+        """止まった指示の引き継ぎの欄（#346） 要約の全文は会話の欄に残し、ここは頭の 1 行と操作だけ
+
+        全文を欄に出すと、狭い窓で会話の欄と入力欄が潰れる 全文は会話の欄にあるので巻き戻せば
+        読め、〔要約をコピー〕は全文を写す 〔続きを頼む〕は入力欄に指示を入れるだけで送らない
+        送る前に人が書き足せるように 要約の中身は入力欄に写さず、AI に道具で読ませる
+        （外へ送る物の同意 #342 を通す 写すと、伏せるはずの素材の名前が指示の文として出る）
+        """
+        self._handoff_box = QFrame(self)
+        self._handoff_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self._handoff_box.setVisible(False)
+        self._handoff_text = QLabel(self._handoff_box)
+        self._handoff_text.setWordWrap(True)
+        self._handoff_close = QToolButton(self._handoff_box)
+        self._handoff_close.setText("×")
+        self._handoff_close.setToolTip("閉じる（要約は会話の欄に残ります）")
+        self._handoff_close.setAccessibleName("引き継ぎを閉じる")
+        self._handoff_close.setAutoRaise(True)
+        self._handoff_close.clicked.connect(self._hide_handoff)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self._handoff_text, 1)
+        header.addWidget(self._handoff_close, 0, Qt.AlignmentFlag.AlignTop)
+
+        self._handoff_copy = QPushButton("要約をコピー", self._handoff_box)
+        self._handoff_copy.setToolTip("何をやって・どこで止まったかの要約を、全文コピーする")
+        self._handoff_copy.clicked.connect(self.copy_handoff)
+        self._handoff_continue = QPushButton("続きを頼む", self._handoff_box)
+        self._handoff_continue.setToolTip(
+            "要約を読んで続けるよう頼む指示を入力欄に入れる（送るのは〔送信〕で）"
+        )
+        self._handoff_continue.clicked.connect(self.continue_from_handoff)
+        # 狭いパネルでも 2 つのボタンが欠けないように折り返す
+        buttons = QWidget(self._handoff_box)
+        buttons_layout = FlowLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addWidget(self._handoff_copy)
+        buttons_layout.addWidget(self._handoff_continue)
+
+        layout = QVBoxLayout(self._handoff_box)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.addLayout(header)
+        layout.addWidget(buttons)
+
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt の命名規約
         super().resizeEvent(event)
         self._fit_wrapped()
@@ -621,7 +684,14 @@ class ChatPanel(QWidget):
         if layout is not None:
             margins = layout.contentsMargins()
             width -= margins.left() + margins.right()
-        for part in (self._choices, self._login_box, self._approval_box, self._update_box):
+        parts = (
+            self._choices,
+            self._login_box,
+            self._approval_box,
+            self._update_box,
+            self._handoff_box,
+        )
+        for part in parts:
             # isVisible ではなく isHidden で見る 別のタブの裏にいる間に窓を縮められても、
             # 前に出したときの高さが合っているように
             if part.isHidden():
@@ -663,6 +733,8 @@ class ChatPanel(QWidget):
             # 入れ直しに失敗して使えなくなった 持っておいた指示は渡せないので、送れなかったと
             # 言って終える 持ったままだと、状態の行が実行中のまま待ち続ける
             self._note("AI 連携の環境が使えないため、待っていた指示は送りませんでした")
+            self._record.stop(StopReason.ERROR, "AI 連携の環境を入れ直せず、使えなくなりました")
+            self._record_dropped(list(self._queued)[1:])
             self._finish_turn()
             self._close_checkpoint()
             self._queued.clear()
@@ -735,6 +807,9 @@ class ChatPanel(QWidget):
         self._select_choices(preferences.ai_model, preferences.ai_effort)
         self._animate = preferences.ai_busy_animation
         self._alert_when_done = preferences.ai_done_alert
+        self._show_handoffs = preferences.ai_handoff
+        if not self._show_handoffs:
+            self._hide_handoff()
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
@@ -861,6 +936,10 @@ class ChatPanel(QWidget):
         # 今の方式の説明で会話を作り直す（指示が残っている間は、終わった所で当てる）
         self._restart_when_idle()
         self._input.clear()
+        # 人が次の指示を送ったら引き継ぎの欄は下ろす 要約は会話の欄に残り、AI は get_handoff で
+        # 読める 出したままだと、新しい指示も止まったように見える 続けて送ってあった指示が
+        # 始まるだけのときは下ろさない（止まった指示の要約をコピーできなくなる）
+        self._hide_handoff()
         self._say("あなた", prompt)
         self._queued.append(prompt)
         if len(self._queued) == 1:
@@ -945,6 +1024,7 @@ class ChatPanel(QWidget):
                 # 断られた分の「失敗」も持ち越さない 送り直しが通れば「完了」と出す
                 self._outdated = None
                 self._turn_error = False
+                self._record.forget(StopReason.ERROR)
             else:
                 # 自動では直せなかった ここで初めて、何が起きたかと手での直し方を見せる
                 # 入れ替えをやめた（設定で切った）ときも同じ 送り直しはやめ、続けて送って
@@ -1004,12 +1084,16 @@ class ChatPanel(QWidget):
         label = prompt.strip().splitlines()[0]
         if len(label) > 24:
             label = label[:23] + "…"
-        self._host.document.begin_checkpoint(f"AI: {label}", by=Author.AI)
+        self._checkpoint_label = f"AI: {label}"
+        self._host.document.begin_checkpoint(self._checkpoint_label, by=Author.AI)
         self._checkpoint_open = True
 
     def _close_checkpoint(self) -> None:
         if not self._checkpoint_open:
             return
+        # 閉じると段の中の小さな段は 1 段にまとまり、何を変えたかの名前が読めなくなる
+        # 引き継ぎ（#346）に載せる変えた手は、閉じる前に履歴から写す
+        self._record.capture(self._host.document)
         self._checkpoint_open = False
         self._host.document.end_checkpoint()
 
@@ -1061,6 +1145,12 @@ class ChatPanel(QWidget):
                 # 打て」と言うが、同梱の物はそれでは上がらない） 自動で直せるなら黙って直し、
                 # 直せないときだけ案内とボタンを出す
                 self._turn_error = True
+                # 送り直しが通れば完了に戻す（_on_parts_updated で記録ごと数え直す）
+                # 訳は短く書く 直し方の案内（found.message）はエラーと更新の箱で出すので、
+                # 引き継ぎにも全文を写すと同じ案内が会話の欄に 2 度並ぶ
+                self._record.stop(
+                    StopReason.ERROR, "Claude Code が古く、選んだモデルを使えませんでした"
+                )
                 if self._outdated is None and not self._can_retry():
                     self._show_outdated(found)
                 self._outdated = found
@@ -1071,9 +1161,11 @@ class ChatPanel(QWidget):
             self._retry_after_update()
         elif event.kind is EventKind.TEXT:
             self._say("Claude", event.text)
+            self._record.said(event.text)
         elif event.kind is EventKind.TOOL_USE:
             self._turn_tools += 1
             self._tool = event.tool
+            self._record.tool(event.tool)
             if event.tool != ASK_USER:
                 # 質問は箱と会話の欄の「質問」で見せる 引数の 1 行（choices=[{...}]）を
                 # 並べても読めず、同じ質問が 2 回出るように見える
@@ -1082,8 +1174,12 @@ class ChatPanel(QWidget):
             if event.text == "失敗":
                 self._turn_failures += 1
                 self._note(f"　× {event.detail}")
+                self._record.failed(event.detail)
         elif event.kind is EventKind.ERROR:
             self._turn_error = True
+            # 上限（手数・費用）で止まったのは、エラーと分けて引き継ぐ 送り直せば続く
+            limited = event.detail == LIMIT_DETAIL
+            self._record.stop(StopReason.LIMIT if limited else StopReason.ERROR, event.text)
             self._say("エラー", event.text)
             if REINSTALL_HINT in event.text:
                 # 入れ直す所（環境の導入の欄）は、導入済みのときは隠している 出さないと、
@@ -1091,6 +1187,12 @@ class ChatPanel(QWidget):
                 self._show_parts(True)
         elif event.kind is EventKind.TURN_DONE or event.kind is EventKind.CLOSED:
             self._turns_done += 1
+            if event.kind is EventKind.CLOSED and self._turn_started is not None:
+                # 応えている途中で会話が閉じた 続けて送ってあった指示も、もう返ってこない
+                self._record.stop(
+                    StopReason.DISCONNECTED, "応えている途中で Claude Code との会話が閉じました"
+                )
+                self._record_dropped(list(self._queued)[1:])
             self._close_checkpoint()
             # 終わった印を会話の欄に残す 中断ボタンが灰色に戻るだけだと気付かない
             self._finish_turn()
@@ -1189,6 +1291,9 @@ class ChatPanel(QWidget):
             if showing.done.is_set():
                 self._approval = None
                 self._approval_box.setVisible(False)
+                if not showing.allowed:
+                    # 時間切れか中断で、人が答える前に断られた 許さなかった物として引き継ぐ
+                    self._record.refused(f"{showing.tool}（{showing.reason}）")
             return
         approval = self._bridge.take_approval()
         if approval is None:
@@ -1222,6 +1327,7 @@ class ChatPanel(QWidget):
             approval.allow()
         else:
             approval.deny()
+            self._record.refused(f"{approval.tool}（許可しませんでした）")
         self._refresh_status()
 
     # --- 外へ送ってよいか（#342） ---
@@ -1251,6 +1357,7 @@ class ChatPanel(QWidget):
         if answer is None:
             request.give_up("ユーザーが送らずに窓を閉じました")
             self._note(f"{names} を送りませんでした（窓を閉じました 次に送るときにまた尋ねます）")
+            self._record.refused(f"{request.tool}（{names} を送るかの窓を閉じました）")
             return
         if not request.reply(answer):
             # 窓を出している間に、中断か時間切れで畳まれた 答えは AI へ届かない
@@ -1266,6 +1373,7 @@ class ChatPanel(QWidget):
             self._note(f"{names} をアプリを閉じるまで送ります")
         else:
             self._note(f"{names} を送りません（アプリを閉じるまで 表示 → 設定… で変えられます）")
+            self._record.refused(f"{request.tool}（{names} を送らないと答えました）")
 
     # --- AI からの質問（#296） ---
 
@@ -1292,6 +1400,7 @@ class ChatPanel(QWidget):
         """答えずに畳まれた質問の訳を、会話の欄に残す"""
         reason = question.reason.split(" ")[0] or "答えずに終わりました"
         self._note(f"質問を閉じました（{reason}）")
+        self._record.refused(f"質問「{question.spec.text}」に答えていません（{reason}）")
 
     def _show_question(self, question: Question) -> None:
         self._question = question
@@ -1384,7 +1493,8 @@ class ChatPanel(QWidget):
     # --- 状態の行 ---
 
     def _begin_turn(self) -> None:
-        """次の指示に取りかかった 秒と数を数え直す"""
+        """次の指示に取りかかった 秒と数を数え直す 引き継ぎ（#346）の記録も始め直す"""
+        self._record.begin(self._queued[0] if self._queued else "")
         self._turn_started = self._clock()
         self._turn_tools = 0
         self._turn_failures = 0
@@ -1415,7 +1525,67 @@ class ChatPanel(QWidget):
             counts += f"・失敗 {self._turn_failures} 件"
         elapsed = _duration(self._clock() - started)
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
+        self._hand_off()
         self._stopping = False
+
+    # --- 止まった指示の引き継ぎ（#346） ---
+
+    def _record_dropped(self, prompts: list[str]) -> None:
+        """続けて送ってあったのに始まらずに捨てる指示を、引き継ぎの残りに書く"""
+        for prompt in prompts:
+            self._record.remain(f"始まらなかった指示: {prompt}")
+
+    def _hand_off(self) -> None:
+        """止まった指示なら引き継ぎを作り、棚に置いて欄に出す 止まらずに終えたなら何もしない
+
+        区切りの行（_finish_turn）から呼ぶ 止まる道（例外・中断・上限・断られた・接続が
+        切れた・部品が古い・環境が使えない）はどれも区切りの行を通るので、ここ 1 か所で拾える
+        段がまだ開いていれば（区切りの行を先に足す道）、変えた手をここで履歴から写す
+        """
+        if self._stopping:
+            self._record.stop(StopReason.INTERRUPTED, "人が〔中断〕を押しました")
+        document = self._host.document
+        if self._checkpoint_open:
+            self._record.capture(document)
+        handoff = self._record.handoff(document, self._checkpoint_label)
+        shelf = shelf_for(document)
+        if handoff is None:
+            shelf.turn_finished()
+            return
+        shelf.put(handoff)
+        if not self._show_handoffs:
+            return
+        self._handoff = handoff
+        self._say(HANDOFF_WHO, handoff.text())
+        self._handoff_text.setText(f"引き継ぎ: {handoff.headline()}")
+        self._handoff_box.setVisible(True)
+
+    def _hide_handoff(self) -> None:
+        self._handoff = None
+        self._handoff_box.setVisible(False)
+
+    def copy_handoff(self) -> None:
+        """〔要約をコピー〕 欄に出している引き継ぎの全文を写す"""
+        handoff = self._handoff
+        if handoff is None:
+            return
+        # アプリのクリップボードの口を通す 試験で偽物へ差し替えられ、本人のコピーを消さない
+        clipboard().setText(handoff.text())
+        self.status_message.emit("引き継ぎの要約をコピーしました")
+
+    def continue_from_handoff(self) -> None:
+        """〔続きを頼む〕 引き継ぎを読んで続けるよう頼む指示を、入力欄に入れる（送らない）
+
+        書きかけの文があれば消さずに後ろへ足す 消すと、打っていた指示が黙って失われる
+        """
+        if self._handoff is None:
+            return
+        written = self._input.toPlainText().strip()
+        self._input.setPlainText(f"{CONTINUE_PROMPT}\n{written}" if written else CONTINUE_PROMPT)
+        cursor = self._input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._input.setTextCursor(cursor)
+        self._input.setFocus()
 
     @property
     def _updating(self) -> bool:
@@ -1554,6 +1724,8 @@ def _message_html(who: str | None, text: str) -> str:
         "質問": Colors.ACCENT.name(),
         "答え": Colors.TEXT.name(),
         "エラー": Colors.PLAYHEAD.name(),
+        # 引き継ぎは人が読んで次の手を決める物 補足の色だと読み飛ばされる
+        HANDOFF_WHO: Colors.TEXT.name(),
     }.get(who, Colors.TEXT_MUTED.name())
     body = _to_html(text) if who == "Claude" else html.escape(text).replace("\n", "<br>")
     return f'<b style="color:{color}">{html.escape(who)}</b><br>{body}<br>'

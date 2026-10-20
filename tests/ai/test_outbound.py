@@ -20,6 +20,7 @@ import pytest
 
 from sashimono.ai import bridge as bridge_module
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.handoff import StopReason, TurnRecord, shelf_for
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.outbound import (
@@ -52,6 +53,17 @@ def _operation(name: str) -> Operation:
     found = find_operation(name)
     assert found is not None
     return found
+
+
+def put_handoff(host: FakeHost, instruction: str, failure: str) -> None:
+    """途中で止まった指示の引き継ぎ（#346）を置く AI は get_handoff で読む"""
+    record = TurnRecord()
+    record.begin(instruction)
+    record.failed(failure)
+    record.stop(StopReason.ERROR, failure)
+    handoff = record.handoff(host.document, "AI: 切って")
+    assert handoff is not None
+    shelf_for(host.document).put(handoff)
 
 
 @pytest.fixture
@@ -171,6 +183,8 @@ class TestDeclarations:
             "path": str(SECRET_PATH),
             "message": f"書き出しました: {SECRET_PATH}",
         }
+        # 途中で止まった指示の引き継ぎ（#346） 指示に字幕の文、失敗した道具の文に素材の場所が載る
+        put_handoff(secret_host, f"「{sentence}」の所で切って", f"{SECRET_PATH} を開けません")
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
@@ -917,6 +931,8 @@ def _marked_host(
     ]
     # 変える道具の例（WRITE_EXAMPLES）はテキストのクリップを指す
     _operation("add_text")(host, {"text": BODY_TEXT})
+    # 途中で止まった指示の引き継ぎ（#346） 失敗した道具の文に素材の場所が載る
+    put_handoff(host, "切って", f"C:/Users/{MARK}人/動画/{MARK}素材.mp4 を開けません")
     if scene == "消した後":
         placed = host.document.project.media[0]
         _operation("place_media")(host, {"media_id": str(placed.id)})
