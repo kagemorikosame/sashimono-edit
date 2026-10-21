@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.budget import DEFAULT_IMAGE_EDGE
 from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
@@ -103,6 +104,8 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
+        self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
         self.check: CheckState = CheckState()
         #: 待つ関数が呼ばれた秒と、待った結果
