@@ -337,6 +337,16 @@ class EditorHost(Protocol):
         """
         ...
 
+    @property
+    def image_edge(self) -> int:
+        """AI に見せる絵 1 枚の長い辺の上限（画素 #344）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_image_edge`）
+
+        絵の費用は画素の数でほぼ決まる どこまで払ってよいかは人で違う 絵を返す道具は、
+        AI が大きい絵を頼んでもこれに収まるよう縮める
+        """
+        ...
+
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める（#337） 同じ頼みが走っているか終わっていれば何もしない
 
