@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from sashimono.ai.operations import find_operation
 from sashimono.ai.sheet import sheet_layout
 from sashimono.core.commands import AddClip, SetTranscript
+from sashimono.core.commands.insert import media_alone
 from sashimono.core.model import (
     MediaId,
     MediaItem,
@@ -40,6 +41,7 @@ from sashimono.core.model.transcript import TranscriptSegment
 from sashimono.core.search import SceneNote
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import forget_probe, probe_media
+from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.media_search import MediaSearchDialog
@@ -217,6 +219,35 @@ class TestTheHost:
         finally:
             again.close()
             again.deleteLater()
+
+    def test_the_sheet_holds_the_last_picture_of_an_old_media(
+        self, window: MainWindow, unplaced: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、映像の終わりを持たない古い作品の素材（映像 6 秒・音 10 秒）で、映像より
+        # 後ろの場面の絵が黒くなり、AI が黒い絵に説明を付ける（#402 の黒いコマと同じ）
+        assert unplaced.video_streams[0].end_time is None
+        stream = replace(unplaced.video_streams[0], end_time=Fraction(6))
+        fresh = replace(unplaced, video_streams=(stream,))
+        monkeypatch.setattr(main_window_module, "_probe_or_none", lambda _path: fresh)
+        drawn: list[Project] = []
+        original = media_alone
+
+        def recorded(settings: ProjectSettings, media: MediaItem) -> Project:
+            project = original(settings, media)
+            drawn.append(project)
+            return project
+
+        monkeypatch.setattr(main_window_module, "media_alone", recorded)
+        window.start_media_sheet(unplaced, sheet_layout(2, cell_width=240, frame_size=(320, 180)))
+        (project,) = drawn
+        pictures = [
+            clip
+            for track in project.timeline.tracks
+            if track.kind is TrackKind.VIDEO
+            for clip in track.clips
+        ]
+        assert pictures
+        assert all(clip.hold_at is not None and clip.hold_at < 6 for clip in pictures)
 
     def test_remembering_through_the_tool_leaves_the_history_alone(
         self, window: MainWindow, unplaced: MediaItem

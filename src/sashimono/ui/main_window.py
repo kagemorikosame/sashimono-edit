@@ -77,7 +77,7 @@ from sashimono.core.commands import (
     place_media,
     switch_layer_mode,
 )
-from sashimono.core.commands.insert import media_alone
+from sashimono.core.commands.insert import media_alone, with_known_video_end
 from sashimono.core.commands.project_format import retime_frame
 from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
 from sashimono.core.emphasis import (
@@ -1990,7 +1990,8 @@ class MainWindow(QMainWindow):
         project = self.view_project
         commands = place_media(
             project,
-            media,
+            # 一覧の「配置」と同じく、古い作品の素材は映像の終わりを開き直して添える（#402）
+            with_known_video_end(media, _probe_or_none),
             at_frame=retime_frame(frame, before, project.rate),
             track_id=TrackId(track_id) if track_id else None,
             split_audio=self._preferences.splits_media,
@@ -2125,8 +2126,11 @@ class MainWindow(QMainWindow):
         if media is None:
             return
         self._match_project_to([media])
+        # 古い作品の素材は映像の終わりを持たない 置く前に開き直して添えないと、音の方が
+        # 長い素材の絵を止めず、書き出した動画の終わりが黒くなる（#402）
+        (placed,) = with_known_video_end([media], _probe_or_none)
         self.execute_all(
-            insert_media(self.view_project, media, split_audio=self._preferences.splits_media),
+            insert_media(self.view_project, placed, split_audio=self._preferences.splits_media),
             f"配置: {media.name}",
         )
 
@@ -3413,7 +3417,11 @@ class MainWindow(QMainWindow):
         タイムラインに置いていない素材も見られるよう、素材だけを頭から置いた作品を描く
         描き方は start_sheet と同じ（AI に見せる絵の描き手を使い回す）
         """
-        project = media_alone(self.view_project.settings, media)
+        # 場面は素材の長さ（音の方が長ければ音の終わり）まで数えるので、映像の終わりを持たない
+        # 古い作品の素材をそのまま置くと、映像より後ろの場面の絵が黒くなり、AI が黒い絵に
+        # 説明を付ける 素材一覧から置くときと同じく、開き直して添えてから置く（#402）
+        (known,) = with_known_video_end([media], _probe_or_none)
+        project = media_alone(self.view_project.settings, known)
         full_width = project.settings.width
 
         def render(frame: int, cell_width: int) -> np.ndarray:
