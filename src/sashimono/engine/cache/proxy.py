@@ -89,6 +89,13 @@ from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
 from sashimono.engine.decode import ProbeError, VideoDecoder, probe_media
 from sashimono.engine.decode.rational import as_fraction
+from sashimono.engine.encoders import (
+    PRIORITY_AUTO,
+    MonotonicProgress,
+    encoder_options,
+    order_by_priority,
+    usable,
+)
 
 __all__ = [
     "MEASURED_PREFETCH_MS",
@@ -127,23 +134,22 @@ NAMESPACE = "proxy"
 #: 2: BT.709 へ変換してタグを付けるようにした（#61）
 FORMAT_VERSION = 2
 
-#: 控えに使うコーデックの優先順 NVENC は CPU をほとんど使わないので、
+#: 控えに使うコーデックの優先順 GPU のエンコーダは CPU をほとんど使わないので、
 #: 変換しながら編集を続けられる 無い環境では CPU の libx264 へ落ちる
-CODEC_PREFERENCE = ("h264_nvenc", "h264_qsv", "libx264")
+#: 並びは書き出し（:data:`~sashimono.engine.encode.exporter.VIDEO_CODEC_PREFERENCE`）と同じ
+#: NVIDIA → AMD → Intel → CPU（#365）
+CODEC_PREFERENCE = ("h264_nvenc", "h264_amf", "h264_qsv", "libx264")
 
 
-def proxy_codecs() -> list[str]:
-    """この環境で控えを作れるコーデックを、優先順に返す"""
-    found: list[str] = []
-    for name in CODEC_PREFERENCE:
-        try:
-            av.codec.Codec(name, "w")
-        except Exception:
-            # 入っていないコーデックは Codec() が投げる 種類は環境によって違うので
-            # 名前で拾わない ここで落とすと、1 つ無いだけで控えが作れなくなる
-            continue
-        found.append(name)
-    return found
+def proxy_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
+    """この環境で控えを作れるコーデックを、優先順に返す
+
+    入っているだけでは数えず、開けて 1 コマ書けた物だけを返す（:func:`usable`）
+    前は入っているかだけを見ていた AMF や QSV は GPU の無い機械でも FFmpeg に入っているので、
+    素材を読み込むたびに開けない物から変換を始め、失敗してから次へ移っていた
+    ``priority`` の作り手を前へ寄せる 知らない値は ``ValueError``
+    """
+    return order_by_priority([name for name in CODEC_PREFERENCE if usable(name)], priority)
 
 
 def is_worth_proxying(media: MediaItem) -> bool:
@@ -210,6 +216,7 @@ def create_proxy(
     height: int = PROXY_HEIGHT,
     stream_index: int | None = None,
     codec: str | None = None,
+    encoder_priority: str = PRIORITY_AUTO,
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Path | None:
@@ -224,8 +231,10 @@ def create_proxy(
     **時刻は元の素材と同じに保つ** 縮めるのは大きさだけで、フレームの並びも
     長さも変えない ここがずれると、控えのときだけ絵が 1 フレーム早い/遅い
     という、原因の分かりにくい不具合になる
+
+    ``codec`` を名指ししなければ、``encoder_priority`` の作り手を先に試す（#365）
     """
-    names = [codec] if codec is not None else proxy_codecs()
+    names = [codec] if codec is not None else proxy_codecs(encoder_priority)
     if not names:
         return None
 
@@ -233,8 +242,12 @@ def create_proxy(
     # 書きかけの名前を分けておく 同じ素材を 2 回読み込んでも取り合いにならず、
     # 途中で落ちても壊れた控えが残らない
     working = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+    # 次の候補で作り直しても進み具合を戻さない（#365） 戻ると素材の一覧の進み具合が下がる
+    shown = MonotonicProgress(progress) if progress is not None else None
 
-    for name in names:
+    for index, name in enumerate(names):
+        if index > 0 and shown is not None:
+            shown.start_again()
         try:
             made = _transcode(
                 source,
@@ -242,7 +255,7 @@ def create_proxy(
                 height=height,
                 stream_index=stream_index,
                 codec=name,
-                progress=progress,
+                progress=shown.report if shown is not None else None,
                 should_cancel=should_cancel,
             ) and _has_a_frame(working)
             # 最後の 1 枚を書いたあとにやめると言われることがある 置かずに捨てる
@@ -325,6 +338,11 @@ def _transcode(
             tag_bt709(video)
             # 控えは見るためだけのもの 画質より、小ささと変換の速さを取る
             video.bit_rate = width * scaled * 4
+            # AMF は品質と上限のビットレートを書き出しと同じ組み方で渡す（#365） 試し
+            # （:func:`usable`）も同じ組み方で開くので、選択肢の名前を駆動が受けないなら試しで外れる
+            options = encoder_options(codec, video.bit_rate)
+            if options:
+                video.options = dict(options)
             video.time_base = stream.time_base
 
             for frame in container.decode(stream):
@@ -425,8 +443,14 @@ class ProxyBuilder:
     投入前に終わったものを消し損ねる
     """
 
-    def __init__(self, store: ProxyStore | None = None) -> None:
+    def __init__(
+        self, store: ProxyStore | None = None, *, encoder_priority: str = PRIORITY_AUTO
+    ) -> None:
         self._store = store if store is not None else ProxyStore()
+        # どの作り手のエンコーダを先に試すか（#365） 本人の設定から来る 変えたときは
+        # 呼ぶ側が作り直す（大きさを変えたときと同じ） 途中で替えられる形にすると、
+        # 走っている変換と次の変換で選び方が混ざる
+        self._encoder_priority = encoder_priority
         # 本数は外から変えられないようにする 増やせる形にすると、
         # 「同時に 1 本だけ」という約束が呼ぶ側の都合で破れる
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sashimono-proxy")
@@ -451,6 +475,11 @@ class ProxyBuilder:
     @property
     def store(self) -> ProxyStore:
         return self._store
+
+    @property
+    def encoder_priority(self) -> str:
+        """どの作り手のエンコーダを先に試すか"""
+        return self._encoder_priority
 
     def poll(self) -> ProgressSnapshot:
         """画面へ出す進み具合 画面のスレッドのタイマーから呼ぶ（:meth:`JobBoard.poll`）"""
@@ -525,6 +554,7 @@ class ProxyBuilder:
                     # 1 本目の映像だけを控えにする 読む側（レンダラ）も
                     # 1 本目を指すクリップにしか渡さない
                     stream_index=media.video_streams[0].index if media.video_streams else None,
+                    encoder_priority=self._encoder_priority,
                     progress=report,
                     should_cancel=cancelled,
                 )

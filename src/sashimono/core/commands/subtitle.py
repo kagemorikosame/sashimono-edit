@@ -35,10 +35,8 @@ from sashimono.core.model import (
 from sashimono.core.projection import ProjectedSubtitle, project_timeline
 
 __all__ = [
-    "AddSegment",
     "MergeWithNext",
     "RemoveSegment",
-    "RetimeSegment",
     "SetSegmentText",
     "SplitSegment",
     "SubtitleLook",
@@ -103,30 +101,6 @@ class SetSegmentText(Command):
 
 
 @dataclass(frozen=True, slots=True)
-class RetimeSegment(Command):
-    """字幕 1 枚の時刻を動かす 値はソース秒"""
-
-    media_id: MediaId
-    segment_id: SegmentId
-    start: Fraction
-    end: Fraction
-    stream: int | None = None
-
-    @property
-    def label(self) -> str:
-        return "字幕の時刻を変更"
-
-    def apply(self, project: Project) -> Project:
-        transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
-        if self.end <= self.start:
-            raise ValueError(f"終了が開始以前: {self.start} .. {self.end}")
-        moved = replace(segment, start=self.start, end=self.end, edited=True)
-        return _store(
-            project, self.media_id, _rebuilt(transcript, _swap(transcript, moved)), self.stream
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class RemoveSegment(Command):
     """字幕 1 枚を消す"""
 
@@ -142,33 +116,6 @@ class RemoveSegment(Command):
         transcript, segment = _locate(project, self.media_id, self.segment_id, self.stream)
         remaining = [s for s in transcript.segments if s.id != segment.id]
         return _store(project, self.media_id, _rebuilt(transcript, remaining), self.stream)
-
-
-@dataclass(frozen=True, slots=True)
-class AddSegment(Command):
-    """字幕を 1 枚足す 起こしを使わずに手で入れる場合に使う"""
-
-    media_id: MediaId
-    start: Fraction
-    end: Fraction
-    text: str = ""
-    stream: int | None = None
-
-    @property
-    def label(self) -> str:
-        return "字幕を追加"
-
-    def apply(self, project: Project) -> Project:
-        item = project.require_media(self.media_id)
-        found = item.transcript_for(self.stream)
-        transcript = found if found is not None else Transcript()
-        added = TranscriptSegment(start=self.start, end=self.end, text=self.text, edited=True)
-        return _store(
-            project,
-            self.media_id,
-            _rebuilt(transcript, [*transcript.segments, added]),
-            self.stream,
-        )
 
 
 @dataclass(frozen=True, slots=True)
