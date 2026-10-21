@@ -78,6 +78,7 @@ from sashimono.core.seams import (
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
+from sashimono.engine.encoders import ENCODER_PRIORITIES, PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryOptions
@@ -337,6 +338,12 @@ class Preferences:
     #: 2026-10-17 に利用者が決めた 既定は入 埋めても再生には響かず、プレーヤーで章送りが
     #: できる 要らない人だけ切ればよい 書き出しの窓で替えた値もここへ覚える
     export_chapters: bool = True
+    #: 書き出しと控えの作成で、どの作り手のエンコーダを先に試すか（#365）
+    #: 既定は自動（NVIDIA → AMD → Intel → CPU の順で、この機械で書ける物） 知らない人は
+    #: 速くて CPU の空く GPU を使うのが困らない側 同じビットレートなら CPU（libx264）の方が
+    #: きれいなことが多いので画質を取る人は CPU を、GPU を 2 枚挿した人は使う側を選べるようにする
+    #: 書き出しの窓でコーデックを名指しすれば、そちらが勝つ
+    encoder_priority: str = PRIORITY_AUTO
     #: 重ねたレイヤーの映像デコードを、同時にいくつまで走らせるか 1 で並べない
     #: PyAV のデコードは GIL を解放するので、別の素材どうしなら本当に重なる
     #: 既定は 4 デコード中の絵を素材の数だけ抱えるので（4K で 1 枚 33MB）、
@@ -563,6 +570,10 @@ class Preferences:
     #: 覚えた見た目の鍵（``compat.subtitle_looks.LookChoice.key``） 設定画面には出さない
     #: 覚える設定が入っているときだけ、置くたびに書く
     subtitle_look_last: str = ""
+    #: 字幕を起こし終えたら、続けて話者を分けて字幕に付ける（#323） 既定は切
+    #: 2026-10-20 本人の決定 部品（話者の分離）を入れていない人と、1 人で話す動画しか作らない
+    #: 人を、起こしのたびに待たせない 対談や実況を毎回分ける人は入れる
+    speakers_after_transcribe: bool = False
     #: 保存していない変更を一定の間隔で退避し、落ちた後の起動で復元を勧める（#271）
     #: 既定は入（前からの動き） 切ると、落ちたときに最後に保存した所までしか戻らない
     #: 書き込みを減らしたい人・自分でこまめに保存する人は切れる
@@ -864,6 +875,9 @@ class PreferenceStore:
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),
             export_chapters=_flag(data.get("export_chapters"), plain.export_chapters),
+            encoder_priority=_choice(
+                data.get("encoder_priority"), ENCODER_PRIORITIES, plain.encoder_priority
+            ),
             decode_threads=_threads(data.get("decode_threads"), plain.decode_threads),
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
@@ -950,6 +964,9 @@ class PreferenceStore:
                 data.get("subtitle_look_remember"), plain.subtitle_look_remember
             ),
             subtitle_look_last=_text(data.get("subtitle_look_last"), plain.subtitle_look_last),
+            speakers_after_transcribe=_flag(
+                data.get("speakers_after_transcribe"), plain.speakers_after_transcribe
+            ),
             autosave=_flag(data.get("autosave"), plain.autosave),
             autosave_seconds=_within(
                 data.get("autosave_seconds"), AUTOSAVE_SECONDS_RANGE, plain.autosave_seconds
