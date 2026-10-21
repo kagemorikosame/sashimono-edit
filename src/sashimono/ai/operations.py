@@ -697,8 +697,34 @@ DEFAULT_PAGE = 50
 MAX_PAGE = 300
 
 
+class _RowsOf[T]:
+    """``items`` を 1 件ずつ ``make`` で行にする一覧 行を作るのは切り出された分だけ
+
+    :func:`_paged` が見るのは件数と切り出した分だけ 先に全部の行を作ると、返事に入らない
+    何万件にも重い整形（タイムラインのクリップを全部見るなど）を掛け、道具が動く編集画面の
+    スレッドが止まる（PR #399 の CodeRabbit の指摘） 作った行は覚えておき、返事が長すぎて
+    件数を減らして切り直すときに作り直さない
+    """
+
+    def __init__(self, items: list[T], make: Callable[[T], Any]) -> None:
+        self._items = items
+        self._make = make
+        self._made: dict[int, Any] = {}
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, window: slice) -> list[Any]:
+        return [self._row(index) for index in range(*window.indices(len(self._items)))]
+
+    def _row(self, index: int) -> Any:
+        if index not in self._made:
+            self._made[index] = self._make(self._items[index])
+        return self._made[index]
+
+
 def _paged(
-    rows: list[Any],
+    rows: list[Any] | _RowsOf[Any],
     arguments: dict[str, Any],
     *,
     name: str = "items",
@@ -1545,7 +1571,11 @@ def _effect_label(kind: str) -> str:
 
 
 def _paged_after(
-    head: dict[str, Any], rows: list[Any], arguments: dict[str, Any], name: str, note: str
+    head: dict[str, Any],
+    rows: list[Any] | _RowsOf[Any],
+    arguments: dict[str, Any],
+    name: str,
+    note: str,
 ) -> dict[str, Any]:
     """``head`` の後ろに一覧 ``rows`` を切って並べた返事 合わせて上限に収める
 
@@ -2156,8 +2186,10 @@ def _search_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
     if SCENE in kinds:
         head["media_with_scene_notes"] = sum(1 for media in searched if host.scene_notes(media))
-    rows = [_hit_row(project, hit) for hit in hits]
-    return _paged_after(head, rows, arguments, "hits", "" if rows else _NOTHING_FOUND)
+    # 行は返事に入るページの分だけ作る 1 行ごとにタイムラインのクリップを全部見るので、
+    # 短い語で何万行も当たり、詰めて何千本のクリップがある作品だと画面が止まる
+    rows = _RowsOf(hits, lambda hit: _hit_row(project, hit))
+    return _paged_after(head, rows, arguments, "hits", "" if hits else _NOTHING_FOUND)
 
 
 def _hit_row(project: Project, hit: Hit) -> dict[str, Any]:
@@ -2275,6 +2307,9 @@ def _scene_sheet(
             cell_width=query.cell,
             frame_size=media.video_streams[0].display_size,
             columns=query.columns,
+            # 長い辺の上限は本人の設定（#344 contact_sheet と同じ） 渡さないと、上限を小さくした
+            # 人にも場面の 1 枚だけ 1568 画素で送る
+            max_edge=host.image_edge,
         )
     except SheetError as exc:
         raise ToolError(str(exc)) from exc

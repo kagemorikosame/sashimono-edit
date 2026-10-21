@@ -26,6 +26,7 @@ from sashimono.ai.operations import (
 )
 from sashimono.ai.outbound import Outbound, SendChoice
 from sashimono.ai.safety import Safety
+from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.core.commands import AddClip, SetTranscript
 from sashimono.core.io.serialize import json_text
 from sashimono.core.model import MediaId, MediaItem, Transcript
@@ -111,7 +112,9 @@ class TestDeclarations:
 
     def test_the_sheet_declares_frames(self) -> None:
         # 壊れると、素材の絵を送らないと決めた人の場面の絵が、尋ねずに外へ出る
-        assert SHEET.sends == {Outbound.PROJECT, Outbound.FRAMES}
+        # 並べられないときの断りの文には本人の設定の長い辺の上限（#344）が載るので、
+        # アプリの設定も送る物に数える
+        assert SHEET.sends == {Outbound.PROJECT, Outbound.FRAMES, Outbound.APP_SETTINGS}
 
     def test_remembering_returns_only_counts(self) -> None:
         # 壊れて文を返すようにすると、字幕と文字を送らないと決めた人の説明が尋ねずに外へ出る
@@ -200,6 +203,34 @@ class TestSearch:
         assert result["total"] == 600
         assert result["next_offset"] == result["count"]
 
+    def test_only_the_page_is_placed_on_the_timeline(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、短い語で何万行も当たったときに返事に入らない行までタイムラインの位置を
+        # 求め、詰めて何千本のクリップがある作品では編集画面が長く止まる（PR #399 の指摘）
+        from sashimono.ai import operations
+
+        _off_timeline(host, *(f"{n} 行目" for n in range(600)))
+        looked: list[float] = []
+        original = operations._media_places
+
+        def counted(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            looked.append(args[2])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(operations, "_media_places", counted)
+        result = _result(SEARCH, host, queries=["行目"], limit=10)
+        assert result["count"] == 10
+        assert len(looked) == 10
+        assert (result["total"], result["next_offset"]) == (600, 10)
+        looked.clear()
+        last = _result(SEARCH, host, queries=["行目"], offset=595, limit=10)
+        # 続きを読むときも、そのページの分だけ求め、件数と続きの有無は全部の当たりで数える
+        assert len(looked) == 5
+        assert (last["total"], last["offset"], last["count"]) == (600, 595, 5)
+        assert "next_offset" not in last
+        assert last["hits"][0]["text"] == "595 行目"
+
 
 class TestTheSheet:
     def _host(self, host: FakeHost, cuts: list[float]) -> MediaItem:
@@ -218,6 +249,19 @@ class TestTheSheet:
         assert [frame for _index, frame, _label in sheet[1].drawn] == [60, 150, 240]
         assert "0〜4" in result.caption and "6〜10" in result.caption
         assert "remember_scene_descriptions" in result.caption
+
+    def test_the_sheet_fits_the_set_image_edge(self, host: FakeHost) -> None:
+        # 壊れると、絵の長い辺を小さくした人（#344 の設定）にも場面の 1 枚だけ 1568 画素で送り、
+        # 選んだ費用と画質の釣り合いが場面の説明作りだけ効かない
+        media = self._host(host, [0.5 * n for n in range(1, 20)])
+        host.image_edge = 1024
+        SHEET(host, {"media_id": str(media.id), "count": 12, "cell_width": 640})
+        layout = host.media_sheets[-1][1].layout
+        assert max(layout.width, layout.height) <= 1024
+        host.image_edge = MAX_SHEET_EDGE
+        SHEET(host, {"media_id": str(media.id), "count": 12, "cell_width": 640})
+        wide = host.media_sheets[-1][1].layout
+        assert max(wide.width, wide.height) > 1024
 
     def test_a_long_scene_is_split(self, host: FakeHost) -> None:
         # 壊れると、切り替わりの無い長い 1 カット（話しっぱなしの動画）が 1 枚の絵の説明になり、

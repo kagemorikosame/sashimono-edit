@@ -14,7 +14,15 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDockWidget,
+    QFileDialog,
+    QMessageBox,
+    QPushButton,
+    QTabBar,
+)
 
 from sashimono.ai.operations import find_operation
 from sashimono.ai.sheet import sheet_layout
@@ -168,6 +176,34 @@ class TestGoingThere:
         pool = window.findChild(MediaPoolWidget)
         assert pool is not None and pool.selected_media_id() == unplaced.id
         assert "置いていません" in window.statusBar().currentMessage()
+
+    def test_the_media_list_comes_to_the_front_for_an_unplaced_media(
+        self, window: MainWindow
+    ) -> None:
+        # 壊れると、字幕パネルを前に出していたり素材一覧を閉じていたりしたとき、見えない一覧で
+        # 行を選ぶだけになり、案内の〔タイムラインへ〕でどの素材を置けばよいか分からない
+        pool = window.findChild(MediaPoolWidget)
+        assert pool is not None
+        dock = pool.parentWidget()
+        assert isinstance(dock, QDockWidget)
+        dialog = window.show_media_search()
+        _search(dialog, "ラーメン")
+        window.show_subtitles()
+        assert _front_tab(window, dock) == "字幕"
+        dialog.results.itemActivated.emit(dialog.results.item(0))
+        assert _front_tab(window, dock) == "メディア"
+        dock.close()
+        dialog.results.itemActivated.emit(dialog.results.item(0))
+        assert not dock.isHidden()
+
+
+def _front_tab(window: MainWindow, dock: QDockWidget) -> str:
+    """``dock`` を含むタブの並びで、前に出ているタブの名前"""
+    for bar in window.findChildren(QTabBar):
+        names = [bar.tabText(index) for index in range(bar.count())]
+        if dock.windowTitle() in names:
+            return bar.tabText(bar.currentIndex())
+    raise AssertionError("素材一覧がタブで重なっていない")
 
 
 class TestTheHost:

@@ -608,6 +608,7 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, pool_dock)
+        self._pool_dock = pool_dock
 
         inspector_dock = self._dock("オブジェクト設定", "inspector")
         inspector_dock.setWidget(self._inspector)
@@ -3453,7 +3454,11 @@ class MainWindow(QMainWindow):
                 f"見つけた所へ移動した（{format_timecode(frame, project.rate)}）", 5000
             )
             return
-        self._media_pool.select_media(media.id)
+        if self._media_pool.select_media(media.id):
+            # 素材一覧は字幕パネルとタブで重ねてある 字幕を前に出していたり一覧を閉じて
+            # いたりすると、選んだ行が見えず、案内の〔タイムラインへ〕がどの素材か分からない
+            self._pool_dock.show()
+            self._pool_dock.raise_()
         self.statusBar().showMessage(
             "この所は開いているタイムラインに置いていません 素材一覧の〔タイムラインへ〕で置けます",
             8000,
