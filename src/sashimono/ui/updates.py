@@ -930,9 +930,10 @@ def _feature_packs() -> tuple[FeaturePack, ...]:
     # 包みを足したときに見積もりだけ古くなる
     from sashimono.ai.environment import AI_PACK
     from sashimono.asr.environment import ASR_PACK
+    from sashimono.asr.speakers import SPEAKER_PACK
     from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
 
-    return (ASR_PACK, AI_PACK, VISION_PACK, RAPIDOCR_PACK)
+    return (ASR_PACK, SPEAKER_PACK, AI_PACK, VISION_PACK, RAPIDOCR_PACK)
 
 
 #: 移した物を名前で並べる数 多すぎると知らせの窓が画面からはみ出す

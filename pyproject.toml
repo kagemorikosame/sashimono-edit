@@ -113,6 +113,7 @@ files = ["src", "tests", "tools"]
 # （字幕起こしと AI 連携の実行環境 合計 2 GB を超えるため） 入っていない
 # 環境でも型検査が通るようにしておく 入っている環境では実物で検査される
 # 画面の解析（#324）の onnxruntime と winrt の包みも同じく後から入れる物
+# 話者の分離（sherpa_onnx とモデルを落とす huggingface_hub #323）も同じく後から入れる
 [[tool.mypy.overrides]]
 module = [
     "OpenGL.*",
@@ -125,6 +126,8 @@ module = [
     "winrt.*",
     "rapidocr",
     "rapidocr.*",
+    "sherpa_onnx.*",
+    "huggingface_hub.*",
 ]
 ignore_missing_imports = true
 

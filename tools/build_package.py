@@ -193,6 +193,9 @@ def write_version_file(work: Path) -> Path:
 EXCLUDED_MODULES = (
     "faster_whisper",
     "ctranslate2",
+    # 話者の分離（#323）も後から入れる 本体は使う所で初めて import する
+    "sherpa_onnx",
+    "onnxruntime",
     "torch",
     "nvidia",
     "claude_agent_sdk",
@@ -231,6 +234,8 @@ RUNTIME_PACKAGES = (
     "claude-agent-sdk",
     "faster-whisper",
     "ctranslate2",
+    # 話者の分離（#323）
+    "sherpa-onnx",
     # 画面の解析（#324） 依存（winrt の名前空間ごとの包み）は辿って数える
     "onnxruntime",
     "winrt-Windows.Media.Ocr",

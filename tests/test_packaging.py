@@ -1778,6 +1778,7 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         # 導入ボタンと違う引数で入れて確かめると、ボタンでは入らない zip が確かめを通って配られる
         from sashimono.ai.environment import AI_PACK
         from sashimono.asr.environment import ASR_PACK
+        from sashimono.asr.speakers import SPEAKER_PACK
         from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
         from sashimono.runtime import install_arguments
 
@@ -1787,12 +1788,15 @@ class TestTheAddOnsAreCheckedTheUsersWay:
         # 導入ボタンと同じ引数（wheel だけ・--target） 字幕起こしは CUDA ランタイムを除く
         assert pips[0] == install_arguments(AI_PACK, target, extra=False)
         assert pips[1] == install_arguments(ASR_PACK, target, extra=False)
+        # 話者の分離（#323）も同じ 入れずに配ると、sherpa_onnx が配布版で読めないまま、
+        # 分けようとした人の手元で初めて落ちる
+        assert pips[2] == install_arguments(SPEAKER_PACK, target, extra=False)
         # 画面の解析（#324）も設定の窓の導入と同じ引数 入れずに配ると、winrt の包みや
         # onnxruntime が配布版で読めないまま、使う人の手元で初めて落ちる
-        assert pips[2] == install_arguments(VISION_PACK, target, extra=False)
+        assert pips[3] == install_arguments(VISION_PACK, target, extra=False)
         # 飾った文字の読み取り（RapidOCR 2026-10-21）も同じ 入れずに配ると、OpenCV が配布版で
         # 読めないまま、選んだ人の手元で初めて落ちる
-        assert pips[3] == install_arguments(RAPIDOCR_PACK, target, extra=False)
+        assert pips[4] == install_arguments(RAPIDOCR_PACK, target, extra=False)
         assert "--only-binary" in pips[0]
         assert not set(ASR_PACK.extra) & set(pips[1])
 
@@ -1809,12 +1813,15 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         pips, reads, code = self._frozen_calls(monkeypatch)
         assert code == 0
-        assert len(pips) == 4
+        # AI 連携・字幕起こし・話者の分離（#323）・画面の解析・飾った文字の読み取り（#324）
+        assert len(pips) == 5
         # 入れた導入先だけを、起動のときと同じ読み方でこのプロセスの中で読む
         assert reads == [("add-ons", list(ADD_ON_MODULES))]
-        assert {"claude_agent_sdk", "faster_whisper", "onnxruntime", "rapidocr"} <= set(
-            ADD_ON_MODULES
+        assert {"claude_agent_sdk", "faster_whisper", "onnxruntime", "rapidocr", "sherpa_onnx"} <= (
+            set(ADD_ON_MODULES)
         )
+        # 字幕起こしの onnxruntime を話者の分離の sherpa_onnx より先に読む（#323）
+        assert ADD_ON_MODULES.index("onnxruntime") < ADD_ON_MODULES.index("sherpa_onnx")
         # onnxruntime は winrt の包みより先に読む 逆の順ではプロセスごと落ちる（#324）
         winrt = [name for name in ADD_ON_MODULES if name.startswith("winrt")]
         assert winrt
