@@ -27,7 +27,14 @@ from sashimono.compat.subtitle_looks import (
     subtitle_look,
     template_choice,
 )
-from sashimono.core.commands import AddClip, Command, Document, burn_defaults, burn_subtitles
+from sashimono.core.commands import (
+    AddClip,
+    Command,
+    Document,
+    Voice,
+    burn_defaults,
+    burn_subtitles,
+)
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.commands.preset import PresetOptions
 from sashimono.core.io.aliases import Alias, AliasStore
@@ -216,7 +223,7 @@ class TestEachVoice:
     def test_each_voice_wears_its_own_look_and_one_undo_takes_all_back(self) -> None:
         # 壊れると、話し手ごとに選んだ見た目が全員同じになるか、取り消しで一部が残る
         project, media = _project()
-        voice2 = (media.id, 2)
+        voice2 = Voice(media.id, 2)
         everyone = subtitle_look(default_choice(), _base())
         mine = subtitle_look(alias_choice(_styled_alias()), _base())
         document = Document(project)

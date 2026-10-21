@@ -219,6 +219,9 @@ class TestAppSettingsAreReadOnly:
             "start_media_sheet",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",
+            # 話者の分離（#323） 字幕に話者を付けるだけで、アプリの設定は変えない
+            # 続けて分けるかの設定（Preferences.speakers_after_transcribe）は人だけが変える
+            "start_speaker_separation",
             "start_transcription",
             "stop_playback",
             "transcription_status",

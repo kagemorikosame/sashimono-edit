@@ -248,7 +248,7 @@ class TestExportDialog:
         1 つも開けない機械では ``_settings()`` が ``None`` を返し、範囲と関係の無い理由で
         落ちる 範囲が設定まで届くかを見たいので、コーデックの有無はここで決めてしまう
         """
-        monkeypatch.setattr(export_dialog, "available_video_codecs", lambda: ["libx264"])
+        monkeypatch.setattr(export_dialog, "available_video_codecs", lambda _priority: ["libx264"])
 
     def test_with_a_range_the_range_is_the_default(self) -> None:
         """範囲があれば既定は範囲 帯を引いた人は、その所を出したくて引いている"""

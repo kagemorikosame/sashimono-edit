@@ -348,6 +348,25 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 並行して道具を足す PR どうしがぶつかるのは、同じ操作の行を書き換えたときだけ
 数は `ledger.counts()` で出せる
 
+### コマンドと AI の道具の対応（#351）
+
+台帳は画面の側から数える もう 1 つ、コマンド（`core` の `Command`）の側からも数える
+道具をコマンドの一覧から自動で作ることはしない 道具には引数の説明・安全の段（`safety`）・
+外へ送る物（`sends`）・確かめ（`consent`）が要り、どれもコマンドの形からは決まらないため
+代わりに対応を試験で見張る
+
+- AI の道具が 1 つも通さないコマンドは、`src/sashimono/ai/command_ledger.py` の
+  `COMMANDS_WITHOUT_TOOLS` に理由を書く 人の操作だけ（`PERSON_ONLY` 足す先の Issue か
+  足さない訳）か、画面も AI も使わない（`NEITHER`）か
+- `tests/ai/test_command_coverage.py` が `core` の下のコマンドを全部集め、変える道具を全部
+  動かして `Document.execute` に届いたコマンドを数える 道具も理由も無いコマンドがあると落ち、
+  道具が通すのに理由が残っていても落ちる 名前を探すだけでは、手順の関数の中で作るコマンド
+  （`place_media` `apply_preset` など）を取りこぼすので、動かして数える
+- 動かす例は `tests/ai/test_outbound.py` の `WRITE_EXAMPLES` と、その例では断られる道具に
+  通る引数を持たせた `test_command_coverage.py` の `EXAMPLES`
+- **コマンドを足す PR は、道具を足すか理由を書く** 道具を足して前から理由のあったコマンドを
+  通すようになったら、その行を消す
+
 ### AI の取り消しとやり直し（#333）
 
 AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.begin_checkpoint`）を開いたまま進む
@@ -1292,6 +1311,41 @@ AI の道具 `transcribe` も `audio`（1 から タイムラインの「音声 
 まとめて切り替え、1 回の取り消しで戻る 値はクリップごとに作る（AviUtl2 の組み方を標準へ
 戻すときの横の基準は、それぞれの行揃えで決まる） 組み方の欄の位置は動かさない 慣れた人が
 迷い、灰色の欄から押せるボタンで足りるため
+
+### 話者の分離（#323）
+
+誰が話しているかを字幕 1 枚ずつに付ける（`TranscriptSegment.speaker`） 焼き込み（`burn_subtitles`）と
+`place_subtitles` の話し手（`core/commands/subtitle.py` の `Voice`）は「素材・音声・話者」で、話者を
+付けた字幕は人ごとに別のレイヤーへ入る マイク 1 本に 2 人が入った素材も、同時に話す所で前の字幕が
+切り詰められない 話者の無い字幕は今までどおり素材と音声だけで分かれる 2026-10-20 に本人が決めた
+
+- 部品は sherpa-onnx（Apache-2.0）で、字幕起こしとは別の包み（`asr/speakers.py` の `SPEAKER_PACK`
+  wheel は合わせて約 25 MB）にして使う人だけが入れる 入れるのは字幕パネルの〔話者を分ける…〕の窓
+  モデルは区間の切り出し（pyannote segmentation-3.0 の int8 1.5 MB MIT）と声の特徴（3D-Speaker の CAM++
+  26 MB Apache-2.0）で、登録の要らない Hugging Face の置き場から字幕起こしと同じ置き場へ落とす
+  pyannote.audio は重み（gated）に登録と鍵が要るので使わない 音は外へ送らない
+- 字幕 1 枚の途中で話し手が替わるときは、重なりのいちばん長い人を付ける（字幕は割らない 枚数と行の ID
+  が変わると、人が直した行と焼き込んだ文字の印が外れる） 重なる区間が無い短い字幕は 1 秒以内の一番近い
+  区間の人 名前は初めて出た順に「話者 1」「話者 2」（`core/speakers.py`）
+- 分けるのは起こしと同じ列（`TranscriptionService`） どちらも機械を丸ごと使うので並べない 結果は
+  **分け終えた時の**字幕へ当てる（分けている間の人の直しを消さない） 取り消し 1 回で外れる
+- 人数は自動（sherpa-onnx の速いまとめ しきい値 0.5）か、窓と道具で渡す 渡した数より少なく分かれたら
+  1 つ増やしてまとめ直す（`separate_with_retries` 速いまとめは小さな塊を落とし、合成の 3 人の声で 3 を
+  渡すと 2 人、4 を渡すと 3 人になった）
+- 名前の付け替えは右クリックの〔話者の名前を変える…〕（`RenameSpeaker` ほかの話者と同じ名前にすると
+  1 人にまとまる） 1 行の付け替えは表の話者の列（`SetSegmentSpeaker`） 列は話者の付いた字幕があるときだけ出す
+- 起こし終えたら続けて分けるかは本人の設定（`Preferences.speakers_after_transcribe` 既定は切 部品を
+  入れていない人と 1 人で話す動画の人を待たせない） 部品が無ければ知らせて飛ばす
+- AI の道具は `separate_speakers`（`replace` が真でなければ話者の付いた字幕を分け直さない）・
+  `rename_speaker`・`set_subtitle_speaker` `get_subtitles` は行に `speaker` を返し、`speaker` で絞れる
+  様子は `transcription_status` に並ぶ
+- sherpa-onnx-core は自前の `onnxruntime.dll` を持ち、字幕起こし（faster-whisper の無音の判定）が連れてくる
+  onnxruntime と同じ名前になる 2026-10-20 に Python 3.14 で両方の順（onnxruntime を先・sherpa-onnx を先）に
+  読んで分けられることを確かめた 配る zip の確かめ（`--add-on-check` `addon_check.ADD_ON_MODULES`）も
+  onnxruntime を先に読んでから sherpa_onnx を読む
+- 速さは 2026-10-20 に日本語の合成の 3 人の声（Windows の Ichiro・Haruka・Ayumi）59 秒で測った CPU の
+  2 スレッドで 4.3 秒（1 時間で 4〜5 分ほど） 自動の人数で 3 人に分かれ、取り違えは 1 か所 実際の素材での
+  当たりは #345 の課題集で数える
 
 ### 部分フィルタの範囲をプレビューで動かす
 
@@ -3096,7 +3150,7 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 | 所 | いまの動き |
 |---|---|
 | 書き出し | `yuv420p`（8 ビット）へ **BT.709 の行列・リミテッドレンジ**（16〜235）で変換し、ストリームに `color_primaries=bt709` `color_trc=bt709` `colorspace=bt709` `color_range=tv` を書く（`to_bt709` `tag_bt709`） 変換の行列と印は必ず同じ |
-| 書き出しの符号化方式 | 画面で選べるのは `h264_nvenc` `h264_qsv` `libx264` 印はどれにも同じく付く |
+| 書き出しの符号化方式 | 画面で選べるのは `h264_nvenc` `h264_amf` `h264_qsv` `libx264` のうちこの機械で開けて 1 コマ書けた物 自動で試す順は NVIDIA → AMD → Intel → CPU で、表示 → 設定… の「エンコーダの優先」で替えられる（控えの作成も同じ） 自動のときは、開けなかったり途中で書けなくなったりしたら次の候補で最初から書き直し、何で書いたかを知らせる AMF には `quality=balanced` と、指定の 1.5 倍の `maxrate` を渡す（`engine/encoders.py` の `encoder_options`） 印はどれにも同じく付く（AMF の選択肢と印は AMD の実機で確かめていない #365） |
 | 色の印を外から変える | `color_*` の指定と、`x264-params` などの中の `colorprim` `transfer` `colormatrix` `range` は書き出す前に断る 行列と印が食い違うのを防ぐため |
 | 伝達特性の印 | 合成した値は sRGB の曲線だが、印は `bt709` にする 再生ソフトと動画サイトが sRGB の印（`iec61966-2-1`）を扱えないことがあるため（意図した食い違い `colorspace.py` に理由） |
 | 読み込み（映像） | 素材の行列の印と範囲の印（`colorspace` `color_range`）に従って RGBA へ変換する 印の無い素材は大きさで見当を付ける（幅 1280 以上か高さ 576 超えは BT.709、それ以外は BT.601） フルレンジ（`yuvj*` など）も印どおりに読む |

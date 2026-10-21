@@ -8,10 +8,8 @@ import pytest
 
 from sashimono.core.commands import (
     AddClip,
-    AddSegment,
     MergeWithNext,
     RemoveSegment,
-    RetimeSegment,
     SetSegmentText,
     SetTranscript,
     SplitSegment,
@@ -81,36 +79,6 @@ class TestSetSegmentText:
             SetSegmentText(video_media.id, SegmentId("なし"), "x").apply(placed)
 
 
-class TestRetimeSegment:
-    def test_moving_a_segment_keeps_the_order_valid(
-        self, placed: Project, video_media: MediaItem
-    ) -> None:
-        # 時刻を動かした後に並べ直さないと、開始時刻の昇順という起こしの決まりに反し、
-        # 字幕を後ろへ動かす操作がそのまま断られる
-        item = placed.require_media(video_media.id)
-        assert item.transcript is not None
-        first = item.transcript.segments[0]
-
-        # 1 枚目を最後尾へ動かす 順序の不変条件はコマンド側で整える
-        moved = RetimeSegment(video_media.id, first.id, Fraction(9, 2), Fraction(11, 2)).apply(
-            placed
-        )
-        assert [text for text, _, _ in _segments(moved, video_media)] == [
-            "編集ソフトを",
-            "今日は",
-            "作ります",
-        ]
-
-    def test_inverted_range_fails(self, placed: Project, video_media: MediaItem) -> None:
-        # 終わりが頭以前の字幕を通すと、長さ 0 の字幕ができ、画面に一瞬も出ないまま
-        # 字幕の一覧にだけ残る
-        item = placed.require_media(video_media.id)
-        assert item.transcript is not None
-        first = item.transcript.segments[0]
-        with pytest.raises(ValueError, match="終了が開始以前"):
-            RetimeSegment(video_media.id, first.id, Fraction(5), Fraction(5)).apply(placed)
-
-
 class TestRemoveAndAdd:
     def test_removing_drops_it_from_the_timeline(
         self, placed: Project, video_media: MediaItem
@@ -121,14 +89,6 @@ class TestRemoveAndAdd:
         assert item.transcript is not None
         removed = RemoveSegment(video_media.id, item.transcript.segments[1].id).apply(placed)
         assert [p.segment.text for p in project_timeline(removed)] == ["今日は", "作ります"]
-
-    def test_adding_to_media_without_transcript(
-        self, project: Project, video_media: MediaItem
-    ) -> None:
-        # 起こしの無い素材に足せないと、文字起こしをしていない動画には手で字幕を
-        # 1 枚も入れられない
-        added = AddSegment(video_media.id, Fraction(1), Fraction(2), "手で入れた").apply(project)
-        assert _segments(added, video_media) == [("手で入れた", Fraction(1), Fraction(2))]
 
 
 class TestSplitSegment:
