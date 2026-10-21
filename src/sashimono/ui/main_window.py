@@ -2075,6 +2075,7 @@ class MainWindow(QMainWindow):
         panel.look_rules = preferences.look_rules
         panel.remember_look = preferences.subtitle_look_remember
         panel.last_look = preferences.subtitle_look_last
+        panel.speakers_after_transcribe = preferences.speakers_after_transcribe
 
     def _remember_subtitle_look(self, key: str) -> None:
         """字幕を置いた見た目を覚える 覚える設定のときだけ書く（切っていれば設定を書き換えない）"""
@@ -3427,6 +3428,13 @@ class MainWindow(QMainWindow):
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()
+
+    def start_speaker_separation(
+        self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
+    ) -> str:
+        return self._subtitles.start_speaker_separation(
+            media_id, audio_stream=audio_stream, speakers=speakers
+        )
 
     @property
     def loudness_target(self) -> float:
