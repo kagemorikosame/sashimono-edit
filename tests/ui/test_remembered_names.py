@@ -57,6 +57,8 @@ OWN_LIBRARY = {
     "seam_style",
     "reframe_style",
     "template_shelf",
+    # AI に見せる絵の長い辺の上限（#344） 絵を返す道具が縮めた訳と断りの文に載せる
+    "image_edge",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -231,6 +233,10 @@ class TestEveryTextSourceGoesThroughThePort:
             "jet_cut",
             # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
             "reframe",
+            # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る
+            "preview_frame",
+            "contact_sheet",
+            "preview_range",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name
