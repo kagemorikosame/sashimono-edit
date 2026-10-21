@@ -58,6 +58,12 @@ from sashimono.engine.encode import (
     MEASURED_EXPORT_MS,
     MEASURED_EXPORT_TOTAL_MS,
 )
+from sashimono.engine.encoders import (
+    PRIORITY_AMD,
+    PRIORITY_AUTO,
+    PRIORITY_CPU,
+    PRIORITY_INTEL,
+)
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
@@ -98,6 +104,7 @@ from sashimono.ui.workspace import (
 __all__ = [
     "AUTO_QUALITY_TEXT",
     "DECODE_THREADS",
+    "ENCODER_PRIORITY_CHOICES",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
     "PROXY_HEIGHTS",
@@ -106,6 +113,16 @@ __all__ = [
     "SCENE_THREADS",
     "PreferencesDialog",
 ]
+
+#: どの作り手のエンコーダを先に試すか（#365）
+#: 並びは :data:`~sashimono.engine.encoders.ENCODER_PRIORITIES` と同じ
+#: NVIDIA を先にする項目は置かない 自動がすでに NVIDIA を先に試す
+ENCODER_PRIORITY_CHOICES: tuple[tuple[str, str], ...] = (
+    ("自動（NVIDIA → AMD → Intel → CPU 既定）", PRIORITY_AUTO),
+    ("AMD の GPU を先に", PRIORITY_AMD),
+    ("Intel の GPU を先に", PRIORITY_INTEL),
+    ("CPU を先に（画質を取る）", PRIORITY_CPU),
+)
 
 #: 控えの大きさ 小さいほど軽いが、文字の読みやすさが落ちる
 PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
@@ -303,6 +320,22 @@ class PreferencesDialog(QDialog):
             "効くのは mp4・mov・mkv だけ 書き出しの窓でも替えられ、替えた値はここに残る"
         )
         form.addRow(self._export_chapters)
+
+        self._encoder_priority = QComboBox(self)
+        for label, value in ENCODER_PRIORITY_CHOICES:
+            self._encoder_priority.addItem(label, value)
+        # 読み込みで知らない値は自動へ直してある（workspace の _choice） ここで足す項目は要らない
+        self._encoder_priority.setCurrentIndex(
+            max(0, self._encoder_priority.findData(preferences.encoder_priority))
+        )
+        self._encoder_priority.setToolTip(
+            "書き出しの「自動」と控えの作成で、どのエンコーダを先に試すか "
+            "選んだ側がこの機械で使えなければ、次の候補へ落ちる "
+            "GPU は速く CPU が空くので編集を続けながら書き出せる "
+            "同じビットレートなら CPU（libx264）の方がきれいなことが多い "
+            "書き出しの窓でコーデックを名指しすれば、そちらが勝つ"
+        )
+        form.addRow("エンコーダの優先", self._encoder_priority)
 
         self._decode_threads = QComboBox(self)
         for label, threads in DECODE_THREADS:
@@ -799,6 +832,18 @@ class PreferencesDialog(QDialog):
             " 話し手ごとに分けた見た目は覚えない（全員の見た目だけ）"
         )
         form.addRow(self._subtitle_look_remember)
+        self._speakers_after_transcribe = QCheckBox(
+            "字幕を起こし終えたら、続けて話者を分ける", self
+        )
+        self._speakers_after_transcribe.setObjectName("speakers_after_transcribe")
+        self._speakers_after_transcribe.setChecked(preferences.speakers_after_transcribe)
+        self._speakers_after_transcribe.setToolTip(
+            "起こした字幕に、誰が話しているか（話者 1・話者 2 …）を続けて付ける"
+            " 字幕パネルの〔話者を分ける…〕で部品を入れてから使う この機械で動き、音は外へ送らない"
+            " 2 時間の素材で CPU で 10 分ほど（日本語の合成の声 1 分を 4 秒で分けた）"
+            " 1 人で話す動画しか作らないなら切ったままでよい"
+        )
+        form.addRow(self._speakers_after_transcribe)
 
         # 退避とバックアップの欄は塊ごと別のファイルに置く（決めたことも向こうの説明にある）
         self._backups = BackupSection(preferences, self)
@@ -1063,6 +1108,7 @@ class PreferencesDialog(QDialog):
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_chapters=self._export_chapters.isChecked(),
+            encoder_priority=str(self._encoder_priority.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
@@ -1114,6 +1160,7 @@ class PreferencesDialog(QDialog):
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
             subtitle_look_remember=self._subtitle_look_remember.isChecked(),
             subtitle_look_last=self._subtitle_look_last,
+            speakers_after_transcribe=self._speakers_after_transcribe.isChecked(),
             autosave=self._backups.autosave.isChecked(),
             autosave_seconds=self._backups.autosave_seconds.value(),
             backup=self._backups.backup.isChecked(),
