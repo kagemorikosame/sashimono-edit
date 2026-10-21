@@ -58,6 +58,8 @@ OWN_LIBRARY = {
     "template_shelf",
     # カスタムオブジェクトの名前（#349） 本人の置き場のスクリプト 道具はアプリの設定を送ると書く
     "custom_objects",
+    # AI に見せる絵の長い辺の上限（#344） 絵を返す道具が縮めた訳と断りの文に載せる
+    "image_edge",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -248,6 +250,10 @@ class TestEveryTextSourceGoesThroughThePort:
             # カスタムオブジェクト（#349） 一覧と、無い名前の断りに置き場のスクリプトの名前が載る
             "list_custom_objects",
             "add_custom_object",
+            # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る
+            "preview_frame",
+            "contact_sheet",
+            "preview_range",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name
