@@ -197,7 +197,7 @@ def _tag_name(kind: type[ColorTrc] | type[ColorPrimaries], value: object) -> str
 def tag_bt709(stream: av.video.stream.VideoStream) -> None:
     """書き出すストリームに BT.709 / limited の色のタグを付ける
 
-    タグはフレームではなくコーデックの設定に付ける エンコーダ（libx264・NVENC・QSV）が
+    タグはフレームではなくコーデックの設定に付ける エンコーダ（libx264・NVENC・AMF・QSV）が
     ビットストリームの VUI へ書くのも、MP4 の colr へ写されるのも、開く前の設定の値
     フレームにだけ付けても、ファイルには残らない
 

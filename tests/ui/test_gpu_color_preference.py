@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono.core.model import Project
 from sashimono.engine.encode import ExportSettings, build_settings
+from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -60,6 +61,7 @@ def test_the_ai_export_takes_the_setting(tmp_path: Path) -> None:
         smooth_history=True,
         gpu_color=False,
         chapters=True,
+        encoder_priority=PRIORITY_AUTO,
     )
     assert settings.gpu_color is False
 

@@ -13,9 +13,11 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
-from typing import cast
+from typing import Any, cast
 
 import av
+import av.video.frame
+import av.video.stream
 import numpy as np
 import pytest
 from OpenGL.error import NullFunctionError
@@ -26,6 +28,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.engine.colorspace import bt709_planes
 from sashimono.engine.decode import probe_media
 from sashimono.engine.encode import ExportError, ExportSettings, export_project, exporter
+from sashimono.engine.encoders import usable
 from sashimono.engine.gpu import ShaderError, yuv
 from sashimono.engine.gpu.glutil import Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE
@@ -498,3 +501,79 @@ class TestExport:
         with pytest.raises(RuntimeError, match="書き込みで失敗した"):
             export_project(moving_project, _lossless(tmp_path / "f.mp4", gpu_color=True))
         assert released.is_set()
+
+    def test_starting_again_with_the_next_encoder_reopens_the_readback(
+        self,
+        moving_project: Project,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """候補のエンコーダが途中で書けなくなり、次の候補で書き直しても GPU の道で書き上げる（#365）
+
+        1 本目の読み戻しを返さないと、書き直すたびに GPU のメモリが残る 2 本目で開き直して
+        確かめ直さないと、返した PBO を使って落ちるか、黙って CPU の道へ落ちて遅くなる
+        進み具合が戻ると、書き出しの窓のバーが下がって壊れたように見える
+        """
+        for name in ("mpeg4", "libx264"):
+            if not usable(name):
+                pytest.skip(f"{name} で書けない")
+        # 開けるかの答えはプロセスの中で覚えている 偽の答えを後の試験へ漏らさない
+        exporter._opens.cache_clear()
+        monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+        monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("mpeg4", "libx264"))
+        real = exporter._encode_frame
+        written = [0]
+
+        def breaking(
+            video: av.video.stream.VideoStream, frame: av.video.frame.VideoFrame | None
+        ) -> list[av.Packet[Any]]:
+            if video.codec_context.name == "mpeg4" and frame is not None:
+                written[0] += 1
+                if written[0] >= 4:
+                    raise exporter._EncoderWriteError("偽の駆動の失敗")
+            return real(video, frame)
+
+        opened: list[yuv.YuvReadback[tuple[int, int]]] = []
+        real_open = yuv.open_readback
+
+        def spy_open(width: int, height: int, fmt: str) -> yuv.YuvReadback[tuple[int, int]] | None:
+            readback: yuv.YuvReadback[tuple[int, int]] | None = real_open(width, height, fmt)
+            if readback is not None:
+                opened.append(readback)
+            return readback
+
+        pushed: list[tuple[int, int]] = []
+        real_push = yuv.YuvReadback.push
+
+        def spy_push(
+            self: yuv.YuvReadback[tuple[int, int]], texture: int, tag: tuple[int, int]
+        ) -> None:
+            pushed.append(tag)
+            real_push(self, texture, tag)
+
+        monkeypatch.setattr(exporter, "_encode_frame", breaking)
+        monkeypatch.setattr(exporter, "open_readback", spy_open)
+        monkeypatch.setattr(yuv.YuvReadback, "push", spy_push)
+        seen: list[float] = []
+        notices: list[str] = []
+        output = tmp_path / "again.mp4"
+        try:
+            export_project(
+                moving_project,
+                ExportSettings(path=output, frame_range=(0, 12), pipeline_depth=2),
+                progress=seen.append,
+                notice=notices.append,
+            )
+        finally:
+            exporter._opens.cache_clear()
+
+        assert len(opened) == 2, "書き直しで GPU の読み戻しを開き直していない"
+        assert all(readback.released for readback in opened), "読み戻しを返していない"
+        checks = [at for at, tag in enumerate(pushed) if tag == exporter._CHECK_TAG]
+        assert len(checks) == 2, "書き直しで GPU の変換を確かめ直していない"
+        # 2 本目は試験の絵の後に、12 コマを頭から順に GPU で変換する
+        assert pushed[checks[1] + 1 :] == [(index, index) for index in range(12)]
+        assert len(notices) == 1 and "libx264" in notices[0]
+        assert seen == sorted(seen), f"進み具合が戻った: {seen}"
+        assert seen[-1] == pytest.approx(1.0)
+        assert len(_planes(output)) == 12

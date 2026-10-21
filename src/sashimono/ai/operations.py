@@ -7063,7 +7063,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "scene_id": _string("書き出すシーン 省くとメイン（開いているシーンではない）"),
                 "codec": _string(
                     f"映像のコーデック {AUTO}（既定 使えなければ次の候補へ）か、"
-                    "h264_nvenc / h264_qsv / libx264 などこの機械で使える物"
+                    "h264_nvenc / h264_amf / h264_qsv / libx264 などこの機械で使える物"
                 ),
                 "bitrate_mbps": _integer(
                     f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps、"
