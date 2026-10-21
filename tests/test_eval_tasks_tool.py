@@ -10,6 +10,7 @@ import importlib.util
 import json
 import sys
 import wave
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -340,7 +341,8 @@ def test_guard_refuses_names_and_free_text(tool: ModuleType, tmp_path: Path) -> 
     """
     results = tmp_path / "out.jsonl"
     good = {"material": "E01", "task": "scenes", "status": "ok", "metrics": {"f1": 1.0}}
-    named = {**good, "reason": "secretclip"}
+    # 名前の照らしは、引数から来うる値（params）と数（metrics）に掛かる
+    named = {**good, "params": {"asr_model": "secretclip"}}
     japanese = {**good, "reason": "字幕"}
     pathlike = {**good, "reason": "C:/clips"}
     for bad in (named, japanese, pathlike, {**good, "note": "x"}):
@@ -499,6 +501,90 @@ def test_adopt_reads_the_corrected_project(
     assert record["provisional"] is False
     assert record["metrics"]["precision"] < 1.0
     assert record["metrics"]["recall"] == 1.0
+
+
+def test_adopt_without_draft_scores_with_the_measured_length(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """下書きを通さずに取り込んだ正解でも、素材から測った長さで数え、正解にも長さを残すこと
+
+    落ちると、長さ 0 の素材として数えて無音の一致率が意味を失い、誤った数が ok のまま残る
+    """
+    tool, eval_dir, book = folder
+    tool.command_draft(eval_dir, book, ["E02"], transcriber=_fake_transcriber)
+    # 別の場所で直した .sme だけを持ってきた形 正解のファイルはまだ無い
+    elsewhere = tmp_path / "fixed.sme"
+    eval_dir.draft_path("E02", "silence").replace(elsewhere)
+    eval_dir.answer_path("E02").unlink()
+
+    tool.command_adopt(eval_dir, "E02", "silence", elsewhere)
+    answer = eval_dir.read_answer("E02")
+    assert answer["duration"] == pytest.approx(AUDIO_SECONDS, abs=0.05)
+
+    # 正解のファイルの長さが無くても（前の版で取り込んだ正解）、その回に測った長さで数える
+    del answer["duration"], answer["fps"]
+    eval_dir.write_answer("E02", answer)
+    records = tool.command_run(
+        eval_dir,
+        book,
+        ["E02"],
+        results=tmp_path / "r.jsonl",
+        transcriber=_fake_transcriber,
+        exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
+        commit="",
+    )
+    silence = next(r for r in records if r["task"] == "silence")
+    assert silence["metrics"]["answer_kept_seconds"] > AUDIO_SECONDS - 3.0
+    assert silence["metrics"]["iou"] == 1.0
+    assert silence["metrics"]["edge_median"] == 0.0
+
+
+def test_results_are_written_when_folders_share_names_with_the_tool(
+    tool: ModuleType, tmp_path: Path
+) -> None:
+    """置き場のフォルダ名が年（2026）や段・課題の名前（tools export talk）でも、結果を書けること
+
+    落ちると、年ごとのフォルダに素材を置いた人は毎回、数分走らせたあとに 1 行も書けずに止まり、
+    素材の名前ではない値を「名前が混じった」と言われて直し方も分からない
+    """
+    year = datetime.now(UTC).strftime("%Y")
+    media = tmp_path / year / "export" / "tools"
+    media.mkdir(parents=True)
+    audio = _write_talk(media / "talk.wav")
+    root = tmp_path / "evaldir"
+    root.mkdir()
+    (root / "manifest.json").write_text(json.dumps({"E02": str(audio)}), encoding="utf-8")
+    book_path = tmp_path / "tasks.json"
+    book_path.write_text(
+        json.dumps(
+            {"materials": [{"id": "E02", "tasks": ["silence", "talk", "subtitles", "export"]}]}
+        ),
+        encoding="utf-8",
+    )
+    eval_dir, book = tool.EvalDir(root), tool.load_tasks(book_path)
+    tool.command_draft(eval_dir, book, [], transcriber=_fake_transcriber)
+    results = tmp_path / "results.jsonl"
+    records = tool.command_run(
+        eval_dir,
+        book,
+        [],
+        results=results,
+        transcriber=_fake_transcriber,
+        exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
+    )
+    assert {r["task"]: r["status"] for r in records}["silence"] == "ok"
+    assert len(tool.read_results(results)) == len(records) == 4
+    # 引数から来る値に置き場の名前が混じれば、今までどおり止める
+    with pytest.raises(tool.LeakError):
+        tool.command_run(
+            eval_dir,
+            book,
+            [],
+            results=results,
+            transcriber=_fake_transcriber,
+            params=tool.ToolParams(asr_model=f"m{year}"),
+            exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
+        )
 
 
 def test_draft_keeps_human_answers(folder: tuple[ModuleType, Any, Any], tmp_path: Path) -> None:

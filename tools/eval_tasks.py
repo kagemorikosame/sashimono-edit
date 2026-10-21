@@ -114,6 +114,13 @@ _RECORD_KEYS = frozenset(
         "params",
     }
 )
+#: 道具が自分で作る値の鍵 素材から来ないので、名前の照らしから外す（形の決まりは見る）
+#: 日時・版・コミット・段・番号（課題の定義から）・課題・状態・理由（固定の文字）のどれも、
+#: 素材の名前や置き場を入れる道が無い 照らすと、年ごとのフォルダ（2026）が日時に、
+#: export や tools という名のフォルダが課題や段の名前に当たり、毎回 1 行も書けずに止まる
+_OWN_KEYS = frozenset(
+    {"date", "version", "commit", "stage", "material", "task", "status", "reason", "provisional"}
+)
 #: 名前の照らしで、これより短い名前は見ない 2 文字の名前（例 R）は版やコミットの中にも
 #: 現れるので、照らすと正しい行まで止めてしまう 短い名前は形の決まり（_SAFE_TEXT）で守る
 _MIN_NAME_LENGTH = 3
@@ -696,12 +703,16 @@ def guard_record(record: Mapping[str, object], names: Sequence[str]) -> None:
     if unknown:
         raise LeakError(f"知らない鍵がある: {sorted(unknown)}")
     for key, value in record.items():
+        # 道具が自分で作る値は、形の決まりだけを見て名前は照らさない（下の _OWN_KEYS）
+        # 中の鍵（metrics と params の数の名前）もコードが決めた名前なので同じ扱いにする
+        # 素材や引数から来うる値（params と metrics の値）には名前の照らしを残す
+        own = () if key in _OWN_KEYS else names
         if isinstance(value, Mapping):
             for inner, item in value.items():
-                _check_value(str(inner), f"{key} の鍵", names)
+                _check_value(str(inner), f"{key} の鍵", ())
                 _check_value(item, f"{key}.{inner}", names)
         else:
-            _check_value(value, key, names)
+            _check_value(value, key, own)
 
 
 def append_results(
@@ -973,9 +984,14 @@ def predict(
     return Prediction(value, round(time.perf_counter() - began, 2))
 
 
-def with_facts(truth: Mapping[str, Any], answer: Mapping[str, Any]) -> dict[str, Any]:
-    """課題 1 つの正解に、素材の長さと fps を添える 比べるときと .sme を作るときに要る"""
-    return {**truth, "duration": answer.get("duration", 0.0), "fps": answer.get("fps", 0.0)}
+def with_facts(truth: Mapping[str, Any], facts: MediaFacts) -> dict[str, Any]:
+    """課題 1 つの正解に、素材の長さと fps を添える 比べるときと .sme を作るときに要る
+
+    正解のファイルに残った長さではなく、その回に素材から測った値を使う ``adopt --from`` で
+    下書きを通さずに取り込んだ正解には長さが無く、0 のまま数えると無音の一致率が意味を失い、
+    場面の許す幅も 30fps の決め打ちになって、誤った数が ok のまま残る
+    """
+    return {**truth, "duration": facts.duration, "fps": facts.fps}
 
 
 def score(
@@ -1081,7 +1097,7 @@ def command_draft(
                     continue
                 draft = {"provisional": True, "source": "draft", **value}
                 folder.drafts.mkdir(parents=True, exist_ok=True)
-                project = draft_project(path, material.id, task, with_facts(draft, answer))
+                project = draft_project(path, material.id, task, with_facts(draft, facts))
                 save_project(project, folder.draft_path(material.id, task))
             except Exception as error:
                 print(f"{material.id} {task}: 下書きを作れなかった（{type(error).__name__}）")
@@ -1104,6 +1120,10 @@ def command_adopt(folder: EvalDir, material: str, task: str, source: Path | None
         raise SystemExit(f"対応表に無い番号: {material}")
     project = load_project(source or folder.draft_path(material, task))
     answer = folder.read_answer(material)
+    # 下書きを通さずに取り込んだ正解にも長さと fps を残す 正解のファイルだけを見る人
+    # （report を読む人や後で作る AI の段）が、素材の長さを 0 と取り違えない
+    facts = media_facts(path)
+    answer.update({"material": material, "duration": facts.duration, "fps": facts.fps})
     answer.setdefault("tasks", {})[task] = {
         "provisional": False,
         "source": "human",
@@ -1208,7 +1228,7 @@ def command_run(
                             status="ok",
                             provisional=bool(truth.get("provisional", True)),
                             seconds=prediction.seconds,
-                            metrics=score(task, prediction.value, with_facts(truth, answer), book),
+                            metrics=score(task, prediction.value, with_facts(truth, facts), book),
                             params=resolved.record(task),
                         )
             except TranscribeError as error:
