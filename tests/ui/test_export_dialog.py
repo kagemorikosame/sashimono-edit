@@ -103,7 +103,7 @@ def test_without_any_codec_the_button_is_disabled_instead_of_doing_nothing(
     """
     # 文字列の名前で差し替えない 他の試験がモジュールを読み直していると、この試験が使う
     # ExportDialog とは別のモジュールを差し替えてしまい、何も確かめられない
-    monkeypatch.setattr(export_dialog, "available_video_codecs", list)
+    monkeypatch.setattr(export_dialog, "available_video_codecs", lambda _priority: [])
     # 空でない作品にする 空だとそちらの理由でボタンが無効になり、試験が何も確かめない
     dialog = ExportDialog(_non_empty_project())
     try:
