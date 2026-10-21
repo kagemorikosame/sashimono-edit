@@ -46,6 +46,7 @@ __all__ = [
     "FIX_ROUNDS_RANGE",
     "HANDOFF",
     "LEAVE",
+    "PASSES_AFTER_LIMIT",
     "Fix",
     "FixRound",
     "fix_for",
@@ -151,6 +152,13 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
 
 #: 表に無い組み合わせ 黙って直すより、人へ渡す側に倒す
 _UNKNOWN = Fix(HANDOFF, (), "直し方を決めていない種類 人に伝える")
+
+#: 直す回数の上限に達した後も通す、取り消せる編集の区分の道具（ブリッジが見る）
+#: どれも作品を新しく変えない 取り消しとやり直しは前の形へ辿るだけで、人に頼まれて直しを戻すことが
+#: ある 書き出しの中止は人が許した書き出しを止めるだけで、断ると AI が始めた書き出しを止められない
+#: 保存と書き出しは取り消せない操作の道を通るので、ここに書かなくても断られない
+#: 足したら docs/development.md の「検査で見つけた問題を AI が直す繰り返し」にも書く（試験が照らす）
+PASSES_AFTER_LIMIT = frozenset({"undo", "redo", "cancel_export"})
 
 #: 上限に達した後の直し方 直さずに人へ渡す
 _CLOSED = "直す回数の上限に達したので、直さずに人へ伝える"

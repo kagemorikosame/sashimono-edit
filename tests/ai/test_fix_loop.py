@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import re
+import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,12 +26,13 @@ from sashimono.ai.fixes import (
     FIXES,
     HANDOFF,
     LEAVE,
+    PASSES_AFTER_LIMIT,
     fix_for,
     fix_label,
     fixes_closed,
 )
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import Operation, find_operation
+from sashimono.ai.operations import OPERATIONS, Operation, find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import Author, RenameProject
@@ -302,6 +306,57 @@ class TestBridge:
         host.document.end_checkpoint()
         assert "error" not in box, box
         assert host.document.project.name != "直し"
+
+    def test_cancelling_an_export_still_works_after_the_limit(self, host: FakeHost) -> None:
+        """壊れると、直す回数の上限に達した後、AI が始めた書き出しを AI が止められない"""
+        self._closed(host)
+        host.export_state = {**host.export_state, "state": "rendering"}
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        done, box = call_in_thread(bridge, _tool("cancel_export"), {})
+        pump_until(bridge, done)
+        host.document.end_checkpoint()
+        assert "error" not in box, box
+        assert host.export_state["state"] == "cancelled"
+
+    def test_only_the_listed_tools_pass_after_the_limit(self, host: FakeHost) -> None:
+        """壊れると、上限の後も作品を変える道具が通るか、通すと決めた道具が断られる"""
+        self._closed(host)
+        passed: set[str] = set()
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        changing = [op for op in OPERATIONS if op.writes and not op.irreversible]
+        done = threading.Event()
+
+        def look() -> None:
+            # 断るかの確かめは編集画面のスレッドへ頼むので、AI のスレッドの代わりに
+            # 別のスレッドで呼ぶ
+            try:
+                for operation in changing:
+                    try:
+                        bridge._refuse_after_fix_limit(operation)
+                    except ToolError:
+                        continue
+                    passed.add(operation.name)
+            finally:
+                done.set()
+
+        threading.Thread(target=look, daemon=True).start()
+        pump_until(bridge, done, timeout=30.0)
+        host.document.end_checkpoint()
+        assert done.is_set()
+        assert passed == set(PASSES_AFTER_LIMIT)
+
+    def test_the_document_names_what_passes_after_the_limit(self) -> None:
+        """壊れると、開発の文書に書いた「上限の後も通す道具」と、実際にブリッジが通す道具が
+        食い違い、直す人が文書を信じて取り違える"""
+        text = (Path(__file__).parents[2] / "docs" / "development.md").read_text(encoding="utf-8")
+        section = text[text.index("### 検査で見つけた問題を AI が直す繰り返し") :]
+        bullet = section[section.index("- 上限は `Preferences.ai_fix_rounds`") :]
+        bullet = bullet[: bullet.index("\n- ", 1)]
+        named = {
+            name for name in re.findall(r"`([a-z_]+)`", bullet) if find_operation(name) is not None
+        }
+        irreversible = {operation.name for operation in OPERATIONS if operation.irreversible}
+        assert named == set(PASSES_AFTER_LIMIT) | irreversible
 
     def test_edits_before_any_check_are_not_refused(self, host: FakeHost) -> None:
         """壊れると、直さないと決めた人の所で、調べる前の普通の編集まで断られる"""

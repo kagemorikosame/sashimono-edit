@@ -422,8 +422,10 @@ AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.b
   指示（`Document.checkpoint_serial`）ごとに数え直す
 - 上限は `Preferences.ai_fix_rounds`（`表示 → 設定…` の「AI が仕上がりを直す回数」 既定 3 0〜10
   0 は調べるだけ） AI は引数で変えられない 上限に達すると `fix_round` の `closed` が真になり、直す物も
-  人へ渡す扱いにし、その指示の残りの取り消せる編集はブリッジが確かめの窓より先に断る（取り消し・
-  やり直しと、保存・書き出しは通す）
+  人へ渡す扱いにし、その指示の残りの取り消せる編集はブリッジが確かめの窓より先に断る 作品を変えない
+  取り消し・やり直し・書き出しの中止（`undo` `redo` `cancel_export` `ai/fixes.py` の `PASSES_AFTER_LIMIT`）と、
+  取り消せない保存と書き出し（`save_project` `save_project_as` `export_video` `export_subtitles`
+  `save_snapshot`）は通す
 - 調べるたびに、上限の前なら指示の段を区切り（`Document.split_checkpoint`）、ここから先を
   「AI: 検査の直し（n 回目）」の段にする 人は〔元に戻す〕1 回でその回の直しだけを戻せる 区切った前の
   段もその指示の物として数えるので、AI の `undo` の `this_instruction` は指示の全部を戻す

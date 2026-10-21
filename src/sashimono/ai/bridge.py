@@ -30,7 +30,7 @@ from functools import partial
 from typing import Any
 
 from sashimono.ai.budget import LimitAction, Overrun, UsageMeter
-from sashimono.ai.fixes import fixes_closed
+from sashimono.ai.fixes import PASSES_AFTER_LIMIT, fixes_closed
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
@@ -58,10 +58,6 @@ __all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
 
 #: 送る前の同意の返事の待ち時間 確かめと同じく、人が席を外していることもあるので長めに取る
 SEND_TIMEOUT = 600.0
-
-#: 検査の直しの回数の上限（#339）に達した後も通す変える道具 取り消しとやり直しは作品を
-#: 前の形へ辿るだけで、人に頼まれて戻すこともある 断ると、直しを戻してと言われても戻せない
-_AFTER_FIX_LIMIT = frozenset({"undo", "redo"})
 
 #: UI スレッドが 1 件の仕事を拾って返すまで待つ上限（秒）
 #: これを超えるのは、書き出しなど UI 側が長く塞がっているとき
@@ -319,10 +315,11 @@ class EditorBridge:
         """検査の直しの回数が上限に達した指示では、取り消せる編集を断る（#339）
 
         回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 確かめの窓を出す前に断る
-        出してから断ると、人が許したのに何も起きない 取り消しとやり直しは通す（人に頼まれて
-        戻すことはある） 保存と書き出しは取り消せない操作の道を通るので、ここへは来ない
+        出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
+        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
+        取り消せない操作の道を通るので、ここへは来ない
         """
-        if operation.name in _AFTER_FIX_LIMIT:
+        if operation.name in PASSES_AFTER_LIMIT:
             return
         if self.call(lambda: fixes_closed(self._host.document)):
             raise ToolError(
