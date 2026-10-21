@@ -101,10 +101,8 @@ from sashimono.core.commands.strokes import (
 )
 from sashimono.core.commands.style import SetStyleGuide
 from sashimono.core.commands.subtitle import (
-    AddSegment,
     MergeWithNext,
     RemoveSegment,
-    RetimeSegment,
     SetSegmentText,
     SplitSegment,
     SubtitleLook,
@@ -129,7 +127,6 @@ __all__ = [
     "AddMarkers",
     "AddMedia",
     "AddScene",
-    "AddSegment",
     "AddStroke",
     "AddTrack",
     "AdoptLegacyStroke",
@@ -165,7 +162,6 @@ __all__ = [
     "RenameProject",
     "RenameScene",
     "RenameTrack",
-    "RetimeSegment",
     "RippleCut",
     "SetBlending",
     "SetClipProperty",
