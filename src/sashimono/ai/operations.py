@@ -447,11 +447,19 @@ class Operation:
     #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
     #: トラック・シーン・エフェクトの名前は作品の中身の名前で、ここには書かない
     name_keys: frozenset[str] = field(default=frozenset(), kw_only=True)
+    #: 絵（``sends`` の :attr:`Outbound.FRAMES`）を AI への結果ではなくアプリの外（OS の
+    #: クリップボード）へ出す道具か（``copy_snapshot`` #349） 同意は絵と同じく取るが、AI には
+    #: 絵を返さないので、使う量の上限（#344）の送った絵には数えず、絵の上限でも止めない
+    #: 数えると、絵の上限に当たった人は貼るための写しまで AI に頼めなくなる
+    frames_elsewhere: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
             # 結果を返す以上、何かは送る 空にすると、何も送らない道具と見分けが付かない
             raise ValueError(f"{self.name}: 結果に入りうる物（sends）を書いてください")
+        if self.frames_elsewhere and Outbound.FRAMES not in self.sends:
+            # 絵を外へ出さない道具に書いても意味が無い 書き違いで同意を取らずに絵を出さないよう断る
+            raise ValueError(f"{self.name}: frames_elsewhere は sends に絵を書いた道具だけです")
         if not self.hidden <= self.sends & {Outbound.TEXT}:
             # 伏せ方を持っているのは字幕と文字だけ（名前と場所は道具を問わず伏せる）
             # 絵は伏せられないので、ここに書くと尋ねずに送ることになる
@@ -462,6 +470,11 @@ class Operation:
         # 変えない道具・質問の道具を取り消せないと書くと、確かめの窓だけが出て中身が無い
         if self.consent is None or not self.writes or self.asks:
             raise ValueError(f"{self.name}: 取り消せない操作は writes と consent が要ります")
+
+    @property
+    def returns_frames(self) -> bool:
+        """AI への結果に絵を返しうる道具か 使う量の上限（#344）で、送る 1 枚を足して確かめる"""
+        return Outbound.FRAMES in self.sends and not self.frames_elsewhere
 
     @property
     def safety(self) -> Safety:
@@ -7682,6 +7695,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"frame": _integer("描くフレーム 省くと再生ヘッドの位置")}),
         handler=_copy_snapshot,
         sends=_WITH_FRAMES,
+        frames_elsewhere=True,
     ),
     Operation(
         name="copy_subtitle_text",

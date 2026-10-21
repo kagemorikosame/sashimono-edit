@@ -397,9 +397,10 @@ class EditorBridge:
         """上限に当たっていれば、設定に従って尋ねるか断る 続けてよければ戻る
 
         絵を返す道具は、これから送る 1 枚を足して確かめる 送ってから数えると、上限の 1 枚
-        先まで描いて送ってしまう
+        先まで描いて送ってしまう 絵をクリップボードへ出すだけの道具（``copy_snapshot``）は
+        AI へ絵を返さないので足さない
         """
-        adding = 1 if Outbound.FRAMES in operation.sends else 0
+        adding = 1 if operation.returns_frames else 0
         while (overrun := self.usage.overrun(adding_images=adding)) is not None:
             if self.usage.stopped is not None:
                 self._refused_after_stop += 1
