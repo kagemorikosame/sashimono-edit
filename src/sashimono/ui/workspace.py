@@ -335,7 +335,9 @@ class Preferences:
     export_pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
     #: 書き出しの色変換（RGB から動画用の BT.709 の YUV へ）を GPU で行う（#372）
     #: 既定は入 1080p で 1 コマ 18ms が 12ms ほどに縮み、色の差は 8bit の丸めの 1 まで
-    #: 書き出しの最初のコマで CPU の変換と比べ、食い違えば自分で CPU へ戻る 切れるように
+    #: 書き出す前に、縞と乱数の試験の絵（書き出しと同じ大きさ）で CPU の変換と比べ、
+    #: 食い違えば自分で CPU へ戻る 合成した最初のコマで比べないのは、暗転や単色で始まる
+    #: 書き出しでは食い違いが差に出ないため 切れるように
     #: するのは、手元で確かめていない GPU の駆動で絵が乱れたときに逃げられるようにするため
     #: 実測は :data:`sashimono.engine.encode.MEASURED_GPU_COLOR_MS`
     export_gpu_color: bool = True
