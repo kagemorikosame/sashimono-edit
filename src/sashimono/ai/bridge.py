@@ -11,6 +11,8 @@ Claude Agent SDK は自前の asyncio ループを別スレッドで回す そ�
 AI からの質問（ask_user #296）も同じ形で運び、答えが返るまで止まる
 外へ送る物の同意（#342 :mod:`sashimono.ai.outbound`）も同じ形で運ぶ 道具を動かす前に、
 結果に入りうる物（:attr:`Operation.sends`）のうちまだ許されていない物を尋ねる
+使う量の上限（#344 :mod:`sashimono.ai.budget`）も、道具を動かす前に確かめる 当たったら
+設定に従い、続けるかを尋ねるか、尋ねずに断る
 
 :class:`~sashimono.engine.cache.MediaAnalyzer` や字幕起こしと同じ「キューに積んで
 タイマーで拾う」形にしてある Qt のシグナルをスレッドまたぎで使うより、いつ実行
@@ -27,6 +29,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
+from sashimono.ai.budget import LimitAction, Overrun, UsageMeter
 from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
@@ -51,7 +54,7 @@ from sashimono.ai.outbound import (
 )
 from sashimono.ai.safety import Consent
 
-__all__ = ["Approval", "EditorBridge", "Question"]
+__all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
 
 #: 送る前の同意の返事の待ち時間 確かめと同じく、人が席を外していることもあるので長めに取る
 SEND_TIMEOUT = 600.0
@@ -70,6 +73,14 @@ APPROVAL_TIMEOUT = 600.0
 #: 質問の返事の待ち時間 承認と同じく、人が席を外していることもあるので長めに取る
 #: 待つ間は AI のスレッドが止まるだけで、画面は動き続ける
 QUESTION_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 上限に当たったときの「続けますか」の返事の待ち時間 返事が無ければ止める
+#: 席を外している間に、上限を越えて使い続けないように
+BUDGET_TIMEOUT = APPROVAL_TIMEOUT
+
+#: 止めると決まった後に、道具を何回断ったら会話そのものを止めるか 断った訳は AI へ返して
+#: あるので、ふつうは 1 回でまとめに移る それでも道具を呼び続けると、呼ぶたびに API を使う
+HALT_AFTER_REFUSALS = 2
 
 #: 用意を待つ道具（:class:`~sashimono.ai.operations.Pending`）が 1 回に待つ長さ（秒）
 #: 中断のボタンが効くまでの遅れの上限になる
@@ -159,11 +170,66 @@ class Question:
         return {"selected": list(self.selected), "free_text": self.free_text}
 
 
+@dataclass(slots=True)
+class BudgetRequest:
+    """上限に当たった 続けるかの返事待ち 1 件（#344）
+
+    答えるのは画面のスレッド、時間切れと中断で畳むのは AI のスレッドと中断のボタン
+    先に決まった方だけを残す（:class:`Question` と同じ）
+    """
+
+    overrun: Overrun
+    done: threading.Event = field(default_factory=threading.Event)
+    #: 続けると答えたか 畳んだときと止めると答えたときは偽
+    proceed: bool = False
+    #: 答えずに畳んだわけ（時間切れ・中断）
+    reason: str = ""
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def reply(self, proceed: bool) -> bool:
+        """答える すでに畳まれていたら何もせず偽を返す"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.proceed = proceed
+            self.done.set()
+            return True
+
+    def give_up(self, reason: str) -> bool:
+        """答えずに畳む すでに答えが決まっていたら何もせず偽を返す"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.reason = reason
+            self.done.set()
+            return True
+
+
 class EditorBridge:
     """AI からの操作を、UI スレッドで実行する"""
 
-    def __init__(self, host: EditorHost, *, auto_approve: bool = False) -> None:
+    def __init__(
+        self,
+        host: EditorHost,
+        *,
+        auto_approve: bool = False,
+        usage: UsageMeter | None = None,
+    ) -> None:
         self._host = host
+        #: 画面のスレッドが 1 件を拾うのを待つ上限（秒） ``None`` は :data:`CALL_TIMEOUT`
+        #: 本物の窓を並べて走らせる試験だけが長くする（画面のスレッドが他の試験の描画と
+        #: GPU を取り合って止まっても、試験の結果は変わらないため）
+        self.call_timeout: float | None = None
+        #: 使った量と上限（#344） 画面は 1 日の量を設定の置き場へ残す物を渡す
+        #: 渡さなければ覚えない物（試験・CLI） 上限は既定の値で効く
+        self.usage = usage if usage is not None else UsageMeter()
+        self._budget_requests: queue.Queue[BudgetRequest] = queue.Queue()
+        #: 画面が取り出して出している「続けますか」 中断のときに畳む
+        self._budget_asking: BudgetRequest | None = None
+        #: 尋ねずに止めたときの知らせ（設定が「尋ねずに止める」） 画面が拾って会話の欄に出す
+        self._budget_notices: queue.Queue[Overrun] = queue.Queue()
+        #: 止めると決まった後に断った道具の数 :data:`HALT_AFTER_REFUSALS` で会話を止めさせる
+        self._refused_after_stop = 0
         self._work: queue.Queue[_Work] = queue.Queue()
         self._approvals: queue.Queue[Approval] = queue.Queue()
         self._cancel = threading.Event()
@@ -196,6 +262,8 @@ class EditorBridge:
         外へ送る物の同意（#342）は、許可より先に取る 送らないと決まった道具の許可を
         尋ねても、許した後に断るだけになる
         """
+        # 量の上限は同意より先に見る 上限で止まる道具の同意を尋ねても、答えた後に断るだけになる
+        self._keep_within_budget(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -339,11 +407,77 @@ class EditorBridge:
 
         item = _Work(run=work)
         self._work.put(item)
-        if not item.done.wait(CALL_TIMEOUT):
+        timeout = CALL_TIMEOUT if self.call_timeout is None else self.call_timeout
+        if not item.done.wait(timeout):
             raise ToolError("編集画面が応答しません（重い処理の最中かもしれません）")
         if item.error is not None:
             raise item.error
         return item.result
+
+    # --- 使う量の上限（#344） ---
+
+    def _keep_within_budget(self, operation: Operation) -> None:
+        """上限に当たっていれば、設定に従って尋ねるか断る 続けてよければ戻る
+
+        絵を返す道具は、これから送る 1 枚を足して確かめる 送ってから数えると、上限の 1 枚
+        先まで描いて送ってしまう
+        """
+        adding = 1 if Outbound.FRAMES in operation.sends else 0
+        while (overrun := self.usage.overrun(adding_images=adding)) is not None:
+            if self.usage.stopped is not None:
+                self._refused_after_stop += 1
+                raise ToolError(_stop_message(overrun))
+            if self.usage.limits.action is LimitAction.STOP:
+                self._stop(overrun)
+                self._budget_notices.put(overrun)
+                raise ToolError(_stop_message(overrun))
+            request = BudgetRequest(overrun)
+            self._budget_requests.put(request)
+            if self._cancel.is_set():
+                # 積んだ後に確かめる（:meth:`ask` と同じ） 積む前の中断を見落とすと 10 分待つ
+                request.give_up("中断されました")
+            if not request.done.wait(BUDGET_TIMEOUT):
+                request.give_up("続けるかの返事がありませんでした")
+            if not request.proceed:
+                self._stop(overrun)
+                reason = f"{request.reason} " if request.reason else ""
+                raise ToolError(reason + _stop_message(overrun))
+            self.usage.extend(overrun.kind)
+
+    def _stop(self, overrun: Overrun) -> None:
+        self.usage.stop(overrun)
+        self._refused_after_stop = 1
+
+    @property
+    def wants_halt(self) -> bool:
+        """止めると決まった後も道具を呼び続けている 画面は会話を止める（中断と同じ）"""
+        return self._refused_after_stop >= HALT_AFTER_REFUSALS
+
+    def begin_turn(self) -> None:
+        """指示に取りかかった 量を数え直す 画面のスレッドから呼ぶ"""
+        self._refused_after_stop = 0
+        self.usage.begin_turn()
+
+    def end_turn(self) -> None:
+        """指示が終わった 量を 1 日の分へ足す 画面のスレッドから呼ぶ"""
+        self._refused_after_stop = 0
+        self.usage.end_turn()
+
+    def take_budget_request(self) -> BudgetRequest | None:
+        """「続けますか」が 1 件あれば取り出す 無ければ ``None`` 画面のスレッドから呼ぶ"""
+        try:
+            request = self._budget_requests.get_nowait()
+        except queue.Empty:
+            return None
+        self._budget_asking = request
+        return request
+
+    def take_budget_notice(self) -> Overrun | None:
+        """尋ねずに止めた知らせが 1 件あれば取り出す 無ければ ``None``"""
+        try:
+            return self._budget_notices.get_nowait()
+        except queue.Empty:
+            return None
 
     # --- 外へ送る物（#342） ---
 
@@ -464,6 +598,8 @@ class EditorBridge:
             if Outbound.FRAMES not in operation.sends:
                 # 絵は伏せられない 宣言せずに絵を返す道具は、同意を取らずに送ることになる
                 raise ToolError(f"{operation.name} は絵を返すと書いていないので、送りません")
+            # 送る絵として数える（#344） 描けなかった・断った絵は送らないので数えない
+            self.usage.record_image()
             if hide:
                 return ImageResult(
                     png=result.png, caption=str(redact(result.caption, self._file_secrets()))
@@ -582,6 +718,16 @@ class EditorBridge:
                 self._send_requests.get_nowait().give_up("中断されました")
             except queue.Empty:
                 break
+        # 上限の「続けますか」も同じ 畳まないと、AI のスレッドが返事を 10 分待ち続ける
+        asking = self._budget_asking
+        if asking is not None:
+            asking.give_up("中断されました")
+        self._budget_asking = None
+        while True:
+            try:
+                self._budget_requests.get_nowait().give_up("中断されました")
+            except queue.Empty:
+                break
 
     def resume(self) -> None:
         self._cancel.clear()
@@ -642,6 +788,15 @@ class EditorBridge:
 
     def forget_always(self) -> None:
         self._always.clear()
+
+
+def _stop_message(overrun: Overrun) -> str:
+    """上限で止めたときに AI へ返す文 まとめて終えるよう頼む（道具を呼び直させない）"""
+    return (
+        f"{overrun.text()} ユーザーが設定した上限なので、ここで作業を止めます"
+        " これ以上道具を使わず、ここまでにしたことと残っていることを短く伝えて終えてください"
+        "（続けるかはユーザーが決めます 上限は 表示 → 設定… の「AI の上限」で変えられます）"
+    )
 
 
 def describe_call(operation: Operation, arguments: dict[str, Any]) -> str:
