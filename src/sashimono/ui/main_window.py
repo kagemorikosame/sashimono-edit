@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 import platform
 import threading
 import time
@@ -3249,7 +3250,10 @@ class MainWindow(QMainWindow):
         AI が見ているクリップと絵が食い違う
         """
         project = self.view_project
-        divisor = max(1, round(project.settings.width / max(width, 1)))
+        # 縮める度合いは切り上げる 丸めると 2.5 が 2 になり、頼んだ幅より大きく描く 頼んだ幅は
+        # 絵の長い辺の上限（#344）に収めてあるので、越えると本人が選んだ費用の上限が効かない
+        # （1920x1080 で上限 768 なら横 960、縦長 1080x1920 なら縦 960 で送っていた）
+        divisor = max(1, math.ceil(project.settings.width / max(width, 1)))
         image = self._render_for_ai(project, frame, divisor)
         height, image_width = image.shape[0], image.shape[1]
         picture = QImage(
@@ -3429,6 +3433,10 @@ class MainWindow(QMainWindow):
     @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
+
+    @property
+    def image_edge(self) -> int:
+        return self._preferences.ai_image_edge
 
     def request_check(self, request: CheckRequest) -> None:
         """完成物の検査を裏で始める 書き出しと同じ数のスレッドでデコードし、同じ音の混ぜ方にする"""

@@ -337,6 +337,29 @@ class TestAudioGraph:
         assert "1) 00:00:01:00（30）" in result.caption
         assert "2) 00:00:05:00（150）" in result.caption
 
+    def test_the_graph_fits_the_set_image_edge(self, host: FakeHost) -> None:
+        # 壊れると、絵の長い辺を 768 に下げた人にも既定で 1200 画素のグラフを送り、
+        # 選んだ費用の上限が音量のグラフだけ効かない（#344）
+        host.heard = _spoken()
+        host.image_edge = 768
+        result = _operation("audio_graph")(host, {"marks": [30]})
+        assert isinstance(result, ImageResult)
+        (graph,) = host.graphs
+        assert max(graph.width, graph.height) <= 768
+        assert graph.width == 768
+        assert "768" in result.caption
+        # 縦線は縮めた幅の上で同じ時刻に引く 元の幅のまま置くと、縦線が音とずれる
+        assert graph.marks[0][0] == MARGIN_LEFT + round(30 * plot_width(768) / 300)
+
+    def test_a_graph_within_the_edge_is_untouched(self, host: FakeHost) -> None:
+        # 壊れると、上限の内のグラフまで縮めて送り、短い山や谷が潰れて見えなくなる
+        host.heard = _spoken()
+        result = _operation("audio_graph")(host, {"width": 800})
+        assert isinstance(result, ImageResult)
+        (graph,) = host.graphs
+        assert graph.width == 800
+        assert "縮め" not in result.caption
+
     def test_marks_outside_the_range_are_refused_before_mixing(self, host: FakeHost) -> None:
         # 壊れると、範囲の外の縦線を端へ寄せて描き、AI が違う時刻の音を見て判断する
         with pytest.raises(ToolError, match="範囲"):
