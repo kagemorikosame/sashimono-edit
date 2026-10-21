@@ -18,6 +18,17 @@ from typing import Any
 from PySide6.QtCore import QByteArray, QSettings, Qt
 from PySide6.QtWidgets import QMainWindow, QTabWidget
 
+from sashimono.ai.budget import (
+    DEFAULT_DAY_IMAGES,
+    DEFAULT_DAY_TOKENS,
+    DEFAULT_IMAGE_EDGE,
+    DEFAULT_TURN_IMAGES,
+    DEFAULT_TURN_MINUTES,
+    DEFAULT_TURN_TOKENS,
+    IMAGE_EDGES,
+    LimitAction,
+    Limits,
+)
 from sashimono.ai.models import DEFAULT_EFFORT as DEFAULT_AI_EFFORT
 from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
@@ -67,6 +78,7 @@ from sashimono.core.seams import (
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
+from sashimono.engine.encoders import ENCODER_PRIORITIES, PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryOptions
@@ -76,12 +88,16 @@ from sashimono.ui.preview_handles import KEYFRAME_DRAG_AT_PLAYHEAD, KEYFRAME_DRA
 from sashimono.ui.theme import THEME_DARK, THEME_MODES
 
 __all__ = [
+    "AI_IMAGE_LIMITS",
+    "AI_MINUTE_LIMITS",
+    "AI_TOKEN_LIMITS",
     "AUTO_QUALITY_HEIGHT",
     "DETAIL_MIN_WIDTHS",
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
     "DOCK_TAB_POSITIONS",
     "LAYOUT_VERSION",
+    "LIMIT_ACTIONS",
     "MAX_PREFETCH_MB",
     "MEDIA_SPLIT",
     "MEDIA_SPLIT_MODES",
@@ -238,6 +254,13 @@ SCRIPTS_MOVE_MODES = (SCRIPTS_MOVE_AUTO, SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF)
 #: 値は :class:`~sashimono.ai.outbound.SendChoice` と同じ文字
 SEND_ASK = SendChoice.ASK.value
 SEND_MODES = tuple(choice.value for choice in SendChoice)
+#: AI の上限に当たったときの動き（:attr:`Preferences.ai_limit_action` #344）
+LIMIT_ACTIONS = tuple(action.value for action in LimitAction)
+#: 上限として受け付ける範囲 0 は上限なし 上は手で書き換えた桁違いの値を弾くための目安
+#: トークンは 10 億、絵は 1 万枚、時間は 1 日（分）
+AI_TOKEN_LIMITS = (0, 1_000_000_000)
+AI_IMAGE_LIMITS = (0, 10_000)
+AI_MINUTE_LIMITS = (0, 1440)
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -315,6 +338,12 @@ class Preferences:
     #: 2026-10-17 に利用者が決めた 既定は入 埋めても再生には響かず、プレーヤーで章送りが
     #: できる 要らない人だけ切ればよい 書き出しの窓で替えた値もここへ覚える
     export_chapters: bool = True
+    #: 書き出しと控えの作成で、どの作り手のエンコーダを先に試すか（#365）
+    #: 既定は自動（NVIDIA → AMD → Intel → CPU の順で、この機械で書ける物） 知らない人は
+    #: 速くて CPU の空く GPU を使うのが困らない側 同じビットレートなら CPU（libx264）の方が
+    #: きれいなことが多いので画質を取る人は CPU を、GPU を 2 枚挿した人は使う側を選べるようにする
+    #: 書き出しの窓でコーデックを名指しすれば、そちらが勝つ
+    encoder_priority: str = PRIORITY_AUTO
     #: 重ねたレイヤーの映像デコードを、同時にいくつまで走らせるか 1 で並べない
     #: PyAV のデコードは GIL を解放するので、別の素材どうしなら本当に重なる
     #: 既定は 4 デコード中の絵を素材の数だけ抱えるので（4K で 1 枚 33MB）、
@@ -653,6 +682,38 @@ class Preferences:
     ai_send_text: str = SEND_ASK
     #: 素材の名前と場所 送らないと決めたら、伏せ字にして送る
     ai_send_files: str = SEND_ASK
+    #: AI アシスタントが使う量の上限（#344 :mod:`sashimono.ai.budget`） 0 は上限なし
+    #: どこまで使ってよいかは契約と懐で人ごとに違う 既定は、ふつうの指示では当たらず、同じ道具を
+    #: 繰り返して止まらなくなった指示は止まる量 当たっても、既定では続けるかを尋ねるだけ
+    #: 1 回の指示のトークン（入力 + キャッシュの書き込み + 出力）
+    ai_limit_turn_tokens: int = DEFAULT_TURN_TOKENS
+    #: 1 回の指示で送る絵の枚数
+    ai_limit_turn_images: int = DEFAULT_TURN_IMAGES
+    #: 1 回の指示の時間（分）
+    ai_limit_turn_minutes: int = DEFAULT_TURN_MINUTES
+    #: 1 日のトークン
+    ai_limit_day_tokens: int = DEFAULT_DAY_TOKENS
+    #: 1 日に送る絵の枚数
+    ai_limit_day_images: int = DEFAULT_DAY_IMAGES
+    #: 上限に当たったとき 止めて続けるかを尋ねる（``ask``）・尋ねずに止めて知らせる（``stop``）
+    #: 既定は尋ねる 知らない人が黙って止められると、AI が途中で投げ出したように見える
+    #: 席を外して任せる人は、尋ねる箱で待たされないよう「尋ねずに止める」を選べる
+    ai_limit_action: str = LimitAction.ASK.value
+    #: AI に見せる絵 1 枚の長い辺の上限（画素 :data:`~sashimono.ai.budget.IMAGE_EDGES`）
+    #: 既定は #361 で決めた 1568（モデルが縮めずに読める大きさ） 費用を抑えたい人は小さくする
+    ai_image_edge: int = DEFAULT_IMAGE_EDGE
+
+    def budget_limits(self) -> Limits:
+        """AI の上限 ブリッジの数え（:class:`~sashimono.ai.budget.UsageMeter`）へ渡す"""
+        return Limits(
+            turn_tokens=self.ai_limit_turn_tokens,
+            turn_images=self.ai_limit_turn_images,
+            turn_seconds=self.ai_limit_turn_minutes * 60,
+            day_tokens=self.ai_limit_day_tokens,
+            day_images=self.ai_limit_day_images,
+            action=LimitAction(self.ai_limit_action),
+            image_edge=self.ai_image_edge,
+        )
 
     def send_choices(self) -> dict[Outbound, SendChoice]:
         """AI へ送る物ごとの選択 ブリッジ（:class:`~sashimono.ai.bridge.EditorBridge`）へ渡す"""
@@ -809,6 +870,9 @@ class PreferenceStore:
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),
             export_chapters=_flag(data.get("export_chapters"), plain.export_chapters),
+            encoder_priority=_choice(
+                data.get("encoder_priority"), ENCODER_PRIORITIES, plain.encoder_priority
+            ),
             decode_threads=_threads(data.get("decode_threads"), plain.decode_threads),
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
@@ -969,6 +1033,25 @@ class PreferenceStore:
             ai_send_frames=_choice(data.get("ai_send_frames"), SEND_MODES, plain.ai_send_frames),
             ai_send_text=_choice(data.get("ai_send_text"), SEND_MODES, plain.ai_send_text),
             ai_send_files=_choice(data.get("ai_send_files"), SEND_MODES, plain.ai_send_files),
+            ai_limit_turn_tokens=_within(
+                data.get("ai_limit_turn_tokens"), AI_TOKEN_LIMITS, plain.ai_limit_turn_tokens
+            ),
+            ai_limit_turn_images=_within(
+                data.get("ai_limit_turn_images"), AI_IMAGE_LIMITS, plain.ai_limit_turn_images
+            ),
+            ai_limit_turn_minutes=_within(
+                data.get("ai_limit_turn_minutes"), AI_MINUTE_LIMITS, plain.ai_limit_turn_minutes
+            ),
+            ai_limit_day_tokens=_within(
+                data.get("ai_limit_day_tokens"), AI_TOKEN_LIMITS, plain.ai_limit_day_tokens
+            ),
+            ai_limit_day_images=_within(
+                data.get("ai_limit_day_images"), AI_IMAGE_LIMITS, plain.ai_limit_day_images
+            ),
+            ai_limit_action=_choice(
+                data.get("ai_limit_action"), LIMIT_ACTIONS, plain.ai_limit_action
+            ),
+            ai_image_edge=_member(data.get("ai_image_edge"), IMAGE_EDGES, plain.ai_image_edge),
         )
 
     def save(self, preferences: Preferences) -> None:

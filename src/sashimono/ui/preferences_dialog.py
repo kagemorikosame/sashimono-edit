@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.ai.budget import IMAGE_EDGES, LimitAction
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
@@ -57,6 +58,12 @@ from sashimono.engine.encode import (
     MEASURED_EXPORT_MS,
     MEASURED_EXPORT_TOTAL_MS,
 )
+from sashimono.engine.encoders import (
+    PRIORITY_AMD,
+    PRIORITY_AUTO,
+    PRIORITY_CPU,
+    PRIORITY_INTEL,
+)
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
@@ -72,6 +79,9 @@ from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.workspace import (
+    AI_IMAGE_LIMITS,
+    AI_MINUTE_LIMITS,
+    AI_TOKEN_LIMITS,
     AUTO_QUALITY_HEIGHT,
     DETAIL_MIN_WIDTHS,
     DOCK_TABS_BOTTOM,
@@ -94,6 +104,7 @@ from sashimono.ui.workspace import (
 __all__ = [
     "AUTO_QUALITY_TEXT",
     "DECODE_THREADS",
+    "ENCODER_PRIORITY_CHOICES",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
     "PROXY_HEIGHTS",
@@ -102,6 +113,16 @@ __all__ = [
     "SCENE_THREADS",
     "PreferencesDialog",
 ]
+
+#: どの作り手のエンコーダを先に試すか（#365）
+#: 並びは :data:`~sashimono.engine.encoders.ENCODER_PRIORITIES` と同じ
+#: NVIDIA を先にする項目は置かない 自動がすでに NVIDIA を先に試す
+ENCODER_PRIORITY_CHOICES: tuple[tuple[str, str], ...] = (
+    ("自動（NVIDIA → AMD → Intel → CPU 既定）", PRIORITY_AUTO),
+    ("AMD の GPU を先に", PRIORITY_AMD),
+    ("Intel の GPU を先に", PRIORITY_INTEL),
+    ("CPU を先に（画質を取る）", PRIORITY_CPU),
+)
 
 #: 控えの大きさ 小さいほど軽いが、文字の読みやすさが落ちる
 PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
@@ -166,6 +187,9 @@ SCENE_THREADS: tuple[tuple[str, int], ...] = (
 )
 
 
+#: AI の上限のトークンの欄の 1 目盛り（#344） 欄は万の単位で出す
+TOKENS_PER_STEP = 10_000
+
 #: 目安を出すときの物差し **プロジェクトの解像度ではなく 1920x1080 で固定する**
 #: 実際の 1 枚は画質の設定でも変わるが、設定を開く前から見当が付く数でないと
 #: 「どれを選べばいいか」の助けにならない
@@ -174,6 +198,17 @@ FULL_HD_FRAME_BYTES = 1920 * 1080 * BYTES_PER_FRAME_PIXEL
 #: 1GB に入る枚数と、30fps での秒数 設定の画面で目安として出す
 PREFETCH_FRAMES_PER_GB = 1024 * 1024 * 1024 // FULL_HD_FRAME_BYTES
 PREFETCH_SECONDS_PER_GB = PREFETCH_FRAMES_PER_GB // 30
+
+
+def _tokens(box: QSpinBox, given: int) -> int:
+    """万の単位の欄からトークンの数へ 欄を触っていなければ開いたときの値のまま返す
+
+    設定ファイルに万で割り切れない値（手で書いた 123456 など）があると、欄は 12 万と出す
+    そのまま掛け直すと、触っていない項目が OK だけで 120000 に変わる
+    """
+    if box.value() == given // TOKENS_PER_STEP:
+        return given
+    return box.value() * TOKENS_PER_STEP
 
 
 def _megabytes(size: int) -> float:
@@ -285,6 +320,22 @@ class PreferencesDialog(QDialog):
             "効くのは mp4・mov・mkv だけ 書き出しの窓でも替えられ、替えた値はここに残る"
         )
         form.addRow(self._export_chapters)
+
+        self._encoder_priority = QComboBox(self)
+        for label, value in ENCODER_PRIORITY_CHOICES:
+            self._encoder_priority.addItem(label, value)
+        # 読み込みで知らない値は自動へ直してある（workspace の _choice） ここで足す項目は要らない
+        self._encoder_priority.setCurrentIndex(
+            max(0, self._encoder_priority.findData(preferences.encoder_priority))
+        )
+        self._encoder_priority.setToolTip(
+            "書き出しの「自動」と控えの作成で、どのエンコーダを先に試すか "
+            "選んだ側がこの機械で使えなければ、次の候補へ落ちる "
+            "GPU は速く CPU が空くので編集を続けながら書き出せる "
+            "同じビットレートなら CPU（libx264）の方がきれいなことが多い "
+            "書き出しの窓でコーデックを名指しすれば、そちらが勝つ"
+        )
+        form.addRow("エンコーダの優先", self._encoder_priority)
 
         self._decode_threads = QComboBox(self)
         for label, threads in DECODE_THREADS:
@@ -894,6 +945,7 @@ class PreferencesDialog(QDialog):
         )
         sends_note.setWordWrap(True)
         form.addRow(sends_note)
+        self._add_limit_rows(form, preferences)
         self._scene_analysis = QComboBox(self)
         for value, text in SCENE_ANALYSIS_CHOICES:
             self._scene_analysis.addItem(text, value)
@@ -1045,6 +1097,7 @@ class PreferencesDialog(QDialog):
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_chapters=self._export_chapters.isChecked(),
+            encoder_priority=str(self._encoder_priority.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
             native_modules=self._native_modules.isChecked(),
@@ -1110,6 +1163,13 @@ class PreferencesDialog(QDialog):
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),
             ai_send_files=self._send_value(Outbound.FILES),
+            ai_limit_turn_tokens=_tokens(self._limit_turn_tokens, self._given.ai_limit_turn_tokens),
+            ai_limit_turn_images=self._limit_turn_images.value(),
+            ai_limit_turn_minutes=self._limit_turn_minutes.value(),
+            ai_limit_day_tokens=_tokens(self._limit_day_tokens, self._given.ai_limit_day_tokens),
+            ai_limit_day_images=self._limit_day_images.value(),
+            ai_limit_action=str(self._limit_action.currentData()),
+            ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),
@@ -1226,6 +1286,81 @@ class PreferencesDialog(QDialog):
             " 長いと話の頭と終わりが小さく聞こえる 0 で音は触らない"
         )
         form.addRow("つなぎ目: 音のフェード", self._seam_audio)
+
+    def _add_limit_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """AI が使う量の上限（#344） どこまで使ってよいかは契約と懐で人ごとに違う
+
+        トークンは万の単位で選ばせる 1 の単位では桁が多すぎて、上下の矢印で動かせない
+        0 は上限なし（欄には「上限なし」と出す）
+        """
+
+        def spin(bounds: tuple[int, int], value: int, suffix: str, step: int) -> QSpinBox:
+            box = QSpinBox(self)
+            box.setRange(*bounds)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            box.setSpecialValueText("上限なし")
+            box.setValue(value)
+            return box
+
+        man = (AI_TOKEN_LIMITS[0] // TOKENS_PER_STEP, AI_TOKEN_LIMITS[1] // TOKENS_PER_STEP)
+        self._limit_turn_tokens = spin(
+            man, preferences.ai_limit_turn_tokens // TOKENS_PER_STEP, " 万トークン", 10
+        )
+        self._limit_turn_tokens.setToolTip(
+            "1 回の指示で AI が使ってよいトークン（入力 + 出力 + キャッシュの書き込み"
+            " 値段が 1/10 のキャッシュの読み込みは数えない） 道具を 20 回ほど使う指示で"
+            " 10 万〜20 万 同じ道具を繰り返して止まらなくなった指示を止める"
+        )
+        form.addRow("AI の上限: 1 回の指示のトークン", self._limit_turn_tokens)
+        self._limit_turn_images = spin(AI_IMAGE_LIMITS, preferences.ai_limit_turn_images, " 枚", 5)
+        self._limit_turn_images.setToolTip(
+            "1 回の指示で AI に送ってよい絵（プレビュー・コマを並べた 1 枚）の枚数"
+            " 絵は 1 枚で数百〜3000 トークンほど使う 越える 1 枚は描く前に止める"
+        )
+        form.addRow("AI の上限: 1 回の指示で送る絵", self._limit_turn_images)
+        self._limit_turn_minutes = spin(
+            AI_MINUTE_LIMITS, preferences.ai_limit_turn_minutes, " 分", 5
+        )
+        self._limit_turn_minutes.setToolTip(
+            "1 回の指示に取りかかってからの時間 次の道具を使う前に確かめる"
+            "（書き出しを待っている間は止めない）"
+        )
+        form.addRow("AI の上限: 1 回の指示の時間", self._limit_turn_minutes)
+        self._limit_day_tokens = spin(
+            man, preferences.ai_limit_day_tokens // TOKENS_PER_STEP, " 万トークン", 100
+        )
+        self._limit_day_tokens.setToolTip(
+            "1 日（0 時から）に AI が使ってよいトークン ほかの窓で使った分も足す"
+            " 数えた量はこの機械の設定の置き場（ai_usage.json）にだけ残し、外へは送らない"
+        )
+        form.addRow("AI の上限: 1 日のトークン", self._limit_day_tokens)
+        self._limit_day_images = spin(AI_IMAGE_LIMITS, preferences.ai_limit_day_images, " 枚", 10)
+        self._limit_day_images.setToolTip("1 日（0 時から）に AI へ送ってよい絵の枚数")
+        form.addRow("AI の上限: 1 日に送る絵", self._limit_day_images)
+        self._limit_action = QComboBox(self)
+        for action in LimitAction:
+            self._limit_action.addItem(action.label, action.value)
+        self._limit_action.setCurrentIndex(
+            max(0, self._limit_action.findData(preferences.ai_limit_action))
+        )
+        self._limit_action.setToolTip(
+            "上限に当たったとき、AI は次の道具を使わずに止まる 尋ねるなら〔続ける〕で上限を"
+            "同じ量だけ広げて続けられる（1 日の上限はその日のうち） 返事が無いまま 10 分"
+            "たつと止める 尋ねずに止めるときは、止めた訳を会話の欄に書く"
+        )
+        form.addRow("AI の上限に当たったとき", self._limit_action)
+        self._image_edge = QComboBox(self)
+        for edge in IMAGE_EDGES:
+            label = f"{edge} 画素" + ("（既定）" if edge == max(IMAGE_EDGES) else "")
+            self._image_edge.addItem(label, edge)
+        self._select(self._image_edge, preferences.ai_image_edge)
+        self._image_edge.setToolTip(
+            "AI に見せる絵 1 枚の長い辺の上限 絵の費用は画素の数でほぼ決まる"
+            "（1568 x 880 でおよそ 1800 トークン 1024 x 576 で 800 トークン） 小さくすると"
+            "費用が減る代わりに、コマを並べた 1 枚の升が小さくなり、細かい所を見落としやすい"
+        )
+        form.addRow("AI に見せる絵の大きさ（長い辺）", self._image_edge)
 
     def _send_value(self, kind: Outbound) -> str:
         return str(self._ai_sends[kind].currentData())

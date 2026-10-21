@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -20,8 +19,6 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
-from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume
@@ -50,8 +47,8 @@ from sashimono.ui.mix_dialogs import DuckChoice, DuckDialog, LoudnessChoice, Lou
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import allow_sending
 from tests.check_media import tone, write_tone
+from tests.ui.ai_tool_calls import call_tool
 
 
 @pytest.fixture(autouse=True)
@@ -141,33 +138,8 @@ def _window(opened: list[MainWindow], project: Project) -> MainWindow:
 
 
 def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道） 変更は自動で承認する"""
-    operation = find_operation(name)
-    assert operation is not None
-    # 送る物の確かめ（#342）は tests/ui/test_send_consent.py が見る ここは音の道筋だけを見る
-    bridge = allow_sending(EditorBridge(window, auto_approve=True))
-    box: dict[str, Any] = {}
-
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 120.0
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+    """本物の AI と同じ道で道具を呼ぶ（変更の承認と待ちの上限は tests/ui/ai_tool_calls.py）"""
+    return call_tool(window, name, arguments)
 
 
 def _rms_db(project: Project, frame: int) -> float:
