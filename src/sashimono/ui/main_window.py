@@ -77,6 +77,7 @@ from sashimono.core.commands import (
     place_media,
     switch_layer_mode,
 )
+from sashimono.core.commands.insert import with_known_video_end
 from sashimono.core.commands.project_format import retime_frame
 from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
 from sashimono.core.emphasis import (
@@ -1980,7 +1981,8 @@ class MainWindow(QMainWindow):
         project = self.view_project
         commands = place_media(
             project,
-            media,
+            # 一覧の「配置」と同じく、古い作品の素材は映像の終わりを開き直して添える（#402）
+            with_known_video_end(media, _probe_or_none),
             at_frame=retime_frame(frame, before, project.rate),
             track_id=TrackId(track_id) if track_id else None,
             split_audio=self._preferences.splits_media,
@@ -2075,6 +2077,7 @@ class MainWindow(QMainWindow):
         panel.look_rules = preferences.look_rules
         panel.remember_look = preferences.subtitle_look_remember
         panel.last_look = preferences.subtitle_look_last
+        panel.speakers_after_transcribe = preferences.speakers_after_transcribe
 
     def _remember_subtitle_look(self, key: str) -> None:
         """字幕を置いた見た目を覚える 覚える設定のときだけ書く（切っていれば設定を書き換えない）"""
@@ -2114,8 +2117,11 @@ class MainWindow(QMainWindow):
         if media is None:
             return
         self._match_project_to([media])
+        # 古い作品の素材は映像の終わりを持たない 置く前に開き直して添えないと、音の方が
+        # 長い素材の絵を止めず、書き出した動画の終わりが黒くなる（#402）
+        (placed,) = with_known_video_end([media], _probe_or_none)
         self.execute_all(
-            insert_media(self.view_project, media, split_audio=self._preferences.splits_media),
+            insert_media(self.view_project, placed, split_audio=self._preferences.splits_media),
             f"配置: {media.name}",
         )
 
@@ -3427,6 +3433,13 @@ class MainWindow(QMainWindow):
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()
+
+    def start_speaker_separation(
+        self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
+    ) -> str:
+        return self._subtitles.start_speaker_separation(
+            media_id, audio_stream=audio_stream, speakers=speakers
+        )
 
     @property
     def loudness_target(self) -> float:

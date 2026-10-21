@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMenu,
     QMessageBox,
@@ -34,6 +35,8 @@ from PySide6.QtWidgets import (
 
 from sashimono.asr import JobKind, TranscribeOptions, TranscriptionService, default_backend
 from sashimono.asr.service import Job
+from sashimono.asr.speakers import SpeakerOptions
+from sashimono.asr.speakers import runtime_status as speaker_status
 from sashimono.compat.catalog import TemplateEntry, default_template_roots, template_catalog
 from sashimono.compat.subtitle_looks import (
     DEFAULT,
@@ -47,7 +50,9 @@ from sashimono.core.commands import (
     Command,
     MergeWithNext,
     RemoveSegment,
+    RenameSpeaker,
     RippleCut,
+    SetSegmentSpeaker,
     SetSegmentText,
     SetTranscript,
     SplitSegment,
@@ -75,6 +80,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.projection import project_clip, subtitle_stream, subtitle_voice
 from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
+from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_speakers
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
@@ -91,6 +97,7 @@ from sashimono.ui.subtitle.dialogs import (
     JetCutDialog,
 )
 from sashimono.ui.subtitle.look_picker import LookSources
+from sashimono.ui.subtitle.speaker_dialog import SpeakerDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import clipboard
 from sashimono.ui.theme import Colors, theme_signals, themed_style
@@ -106,6 +113,9 @@ TIME_COLUMN_PADDING = 24
 #: フレーム数ではなく秒で持つ フレーム数だと、フレームレートによって
 #: 表す長さが変わってしまう（30fps の 10 万フレームは約 1 時間だが 60fps では 30 分）
 MIN_TIME_SAMPLE_SECONDS = 3600
+
+#: 話者の列（#323） 書き換えるとその行の話者を付け替える
+SPEAKER_COLUMN = 2
 
 
 def _default_shelf() -> Sequence[TemplateEntry]:
@@ -183,6 +193,13 @@ class SubtitlePanel(QWidget):
         self.ask_burn: Callable[[BurnRequest], BurnAnswer | None] = self._ask_burn
         #: 起こしている物の最後の進み具合（依頼ごと）
         self._last_progress: dict[int, str] = {}
+        #: 起こし終えたら続けて話者を分けるか（``Preferences.speakers_after_transcribe`` #323）
+        #: 窓が本人の設定から入れる 既定は切（部品を入れていない人・1 人で話す動画の人を待たせない）
+        self.speakers_after_transcribe = False
+        #: 話者の部品が使えるか 試験で差し替える（部品の無い CI でも続けて分ける道を通す）
+        self.speakers_ready: Callable[[], bool] = lambda: speaker_status().ready
+        #: 話者の名前を尋ねる 今の名前を受けて新しい名前か ``None``（やめた）を返す 試験で差し替える
+        self.ask_speaker_name: Callable[[str], str | None] = self._ask_speaker_name
 
         self._build()
         self.set_project(project)
@@ -204,6 +221,11 @@ class SubtitlePanel(QWidget):
 
         self._transcribe_button = self._button("起こす…", self.transcribe)
         self._clean_button = self._button("整形…", self.clean)
+        self._speakers_button = self._button("話者を分ける…", self.separate_speakers)
+        self._speakers_button.setToolTip(
+            "誰が話しているかを見分けて字幕に付ける（この機械で動き、音は外へ送らない）"
+            " 焼き込みは話者ごとに別のレイヤーへ入る"
+        )
         self._cut_button = self._button("無音カット…", self.jet_cut)
         self._burn_button = self._button("焼き込み", self.burn)
         self._place_rows_button = self._button("選んだ行を置く", self.place_selected_rows)
@@ -222,14 +244,18 @@ class SubtitlePanel(QWidget):
         # 字幕のパネルだけで 1366 の画面の 3 分の 1 を取った
         actions = flow_of(
             self._clean_button,
+            self._speakers_button,
             self._cut_button,
             self._burn_button,
             self._place_rows_button,
             self._export_button,
         )
 
-        self._table = QTableWidget(0, 2, self)
-        self._table.setHorizontalHeaderLabels(["時刻", "本文"])
+        # 話者の列は本文の後ろに置く 本文の列の番号（1）を動かすと、本文を読み書きする所が
+        # みな話者を読む 話者の付いた字幕があるときだけ出す（分けない人の一覧は変えない）
+        self._table = QTableWidget(0, 3, self)
+        self._table.setHorizontalHeaderLabels(["時刻", "本文", "話者"])
+        self._table.setColumnHidden(SPEAKER_COLUMN, True)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # 何行もまとめて選べる（選んだ行をテキストとして置くため）
@@ -247,6 +273,7 @@ class SubtitlePanel(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(0, self._time_column_width())
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(SPEAKER_COLUMN, QHeaderView.ResizeMode.Interactive)
         # 幅が変われば折り返しの行数も変わる 高さを取り直さないと、2 行目が
         # 隠れて本文の末尾が読めなくなる どの列でも取り直す（理由は
         # :meth:`_on_section_resized` に書いた）
@@ -518,6 +545,10 @@ class SubtitlePanel(QWidget):
                     time_item.setToolTip("いまのタイムラインには出ていません")
                 self._table.setItem(row, 0, time_item)
                 self._table.setItem(row, 1, QTableWidgetItem(segment.text))
+                self._table.setItem(row, SPEAKER_COLUMN, QTableWidgetItem(segment.speaker or ""))
+            self._table.setColumnHidden(
+                SPEAKER_COLUMN, not any(segment.speaker for segment in segments)
+            )
         finally:
             self._table.setUpdatesEnabled(True)
             self._updating = False
@@ -550,6 +581,7 @@ class SubtitlePanel(QWidget):
     def _update_actions(self) -> None:
         has_segments = bool(self._segments())
         self._clean_button.setEnabled(has_segments)
+        self._speakers_button.setEnabled(has_segments)
         self._burn_button.setEnabled(has_segments)
         self._place_rows_button.setEnabled(has_segments)
         self._export_button.setEnabled(has_segments)
@@ -581,12 +613,23 @@ class SubtitlePanel(QWidget):
                 self.seek_requested.emit(start)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._updating or item.column() != 1 or self._media_id is None:
+        if self._updating or item.column() not in (1, SPEAKER_COLUMN) or self._media_id is None:
             return
         row = item.row()
         if not (0 <= row < len(self._rows)):
             return
         segment_id = self._rows[row][0]
+        if item.column() == SPEAKER_COLUMN:
+            # その行だけ話者を付け替える 分離が取り違えた行を直す 空にすれば話者を外す
+            self.commands_requested.emit(
+                [
+                    SetSegmentSpeaker(
+                        self._media_id, (segment_id,), item.text() or None, stream=self._stream
+                    )
+                ],
+                "話者を変更",
+            )
+            return
         self.commands_requested.emit(
             [SetSegmentText(self._media_id, segment_id, item.text(), stream=self._stream)],
             "字幕を編集",
@@ -607,6 +650,13 @@ class SubtitlePanel(QWidget):
         split = menu.addAction("再生ヘッドで分割")
         merge = menu.addAction("次と結合")
         remove = menu.addAction("削除")
+        menu.addSeparator()
+        speaker = self._speaker_of(segment_id)
+        rename = menu.addAction("話者の名前を変える…")
+        # 話者の付いていない行では押せない 押せても名前を変える相手がいない
+        # 押した先は受け手でつなぐ（押せないときも操作として数える 説明の行と見分けるため）
+        rename.setEnabled(speaker is not None)
+        rename.triggered.connect(lambda: self.rename_speaker(speaker) if speaker else None)
         chosen = menu.exec(self._table.viewport().mapToGlobal(position))
         # 右クリックのたびに作るメニュー 選んだ項目はこの後で比べるので、後で捨てる
         menu.deleteLater()
@@ -645,6 +695,30 @@ class SubtitlePanel(QWidget):
         self.commands_requested.emit(
             [SplitSegment(self._media_id, segment_id, at, stream=self._stream)], "字幕を分割"
         )
+
+    def _speaker_of(self, segment_id: SegmentId) -> str | None:
+        return next((s.speaker for s in self._segments() if s.id == segment_id), None)
+
+    def rename_speaker(self, old: str) -> None:
+        """話者の名前を付け替える 見ている素材と音声の、同じ名前の字幕すべて（#323）"""
+        if self._media_id is None:
+            return
+        new = self.ask_speaker_name(old)
+        if new is None or not new.strip() or new.strip() == old:
+            return
+        self.commands_requested.emit(
+            [RenameSpeaker(self._media_id, old, new.strip(), stream=self._stream)],
+            "話者の名前を変更",
+        )
+
+    def _ask_speaker_name(self, old: str) -> str | None:
+        name, accepted = QInputDialog.getText(
+            self,
+            "話者の名前を変える",
+            f"「{old}」の新しい名前（ほかの話者と同じ名前にすると 1 人にまとまります）",
+            text=old,
+        )
+        return name if accepted else None
 
     def _source_time(self, media: MediaItem, frame: int) -> Fraction | None:
         """タイムラインのフレームを、この素材の見ている音のソース秒へ
@@ -689,6 +763,7 @@ class SubtitlePanel(QWidget):
             if dialog.notice:
                 # 窓は起こし終えたら閉じるので、GPU から CPU へ落とした理由などはここで出す
                 self.status_message.emit(dialog.notice)
+            self._continue_with_speakers(media.id, dialog.chosen_stream)
 
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
@@ -746,26 +821,129 @@ class SubtitlePanel(QWidget):
                 self._jobs.remove(job)
                 self._last_progress.pop(id(job), None)
                 name = self._describe_job(job)
+                message = event.message or "終了した"
                 if event.kind is JobKind.DONE and event.transcript is not None:
                     # 頼んだ素材と音へ取り込む 表で見ている素材や音には依らない
                     self.commands_requested.emit(
                         [SetTranscript(job.media_id, event.transcript, stream=job.stream)],
                         f"字幕を起こす: {name}",
                     )
-                self._job_notes.append(f"{name}: {event.message or '終了した'}")
+                    self._continue_with_speakers(job.media_id, job.stream)
+                elif event.kind is JobKind.DONE and event.speakers is not None:
+                    message = self._apply_speakers(job.media_id, job.stream, event.speakers)
+                self._job_notes.append(f"{name}: {message}")
                 break
 
         lines = []
         if self._service is not None:
             for job in self._service.jobs():
                 name = self._describe_job(job)
+                what = "話者を分けている" if job.separating else "起こしている"
                 if job.waiting:
-                    lines.append(f"順番待ち: {name}")
+                    kind = "（話者の分離）" if job.separating else ""
+                    lines.append(f"順番待ち{kind}: {name}")
                 else:
                     detail = self._last_progress.get(id(job), "")
-                    lines.append(f"起こしている: {name}" + (f" {detail}" if detail else ""))
+                    lines.append(f"{what}: {name}" + (f" {detail}" if detail else ""))
         lines.extend(self._job_notes[-5:])
-        return "\n".join(lines) if lines else "起こしは走っていません"
+        return "\n".join(lines) if lines else "起こしも話者の分離も走っていません"
+
+    # --- 話者の分離（#323） ---
+
+    def separate_speakers(self) -> None:
+        """見ている素材と音声の字幕に、話者を付ける 窓で部品の導入と人数を尋ねる"""
+        media = self._current_media()
+        if media is None or media.transcript_for(self._stream) is None:
+            self.status_message.emit("話者を分けるには、先に字幕を起こしてください")
+            return
+        if self._service is None:
+            self._service = TranscriptionService(default_backend())
+        dialog = SpeakerDialog(media, self._service, self, stream=self._stream)
+        answer = dialog.exec()
+        # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
+        # この後で結果を読む間は残る
+        dialog.deleteLater()
+        if answer and dialog.turns is not None:
+            self.status_message.emit(
+                self._apply_speakers(media.id, dialog.chosen_stream, dialog.turns)
+            )
+
+    def start_speaker_separation(
+        self,
+        media_id: MediaId,
+        *,
+        audio_stream: int | None = None,
+        speakers: int | None = None,
+        require_transcript: bool = True,
+    ) -> str:
+        """話者の分離を頼む AI からの依頼を受ける入口 起こしと同じ列で順に走る
+
+        同じ素材の同じ音をすでに分けていれば断る（2 回分けても後の結果で上書きするだけ）
+        ``require_transcript`` が偽なら字幕がまだ無くても頼む 起こし終えた直後に続けるとき、
+        起こした字幕の取り込みがまだこの表に届いていないことがある（当てるのは分け終えた時）
+        """
+        media = self._project.find_media(media_id)
+        if media is None:
+            raise KeyError(f"素材が見つからない: {media_id}")
+        stream = media.transcript_stream(audio_stream)
+        if require_transcript and media.transcript_for(stream) is None:
+            raise RuntimeError(
+                f"{media.name} のその音声にはまだ字幕がありません 先に起こしてください"
+            )
+        if not self.speakers_ready():
+            raise RuntimeError(
+                "話者の分離の部品が入っていません 字幕パネルの〔話者を分ける…〕から入れられます"
+            )
+        if self._service is None:
+            self._service = TranscriptionService(default_backend())
+        if self._service.find(media.id, stream, separating=True) is not None:
+            raise RuntimeError(f"{media.name} のその音声はもう分けています（順番待ちを含む）")
+        options = SpeakerOptions(speakers=speakers, audio_stream=stream)
+        waiting = self._service.busy
+        self._jobs.append(self._service.start_speakers(media.id, media.path, options))
+        self.select_media(media.id)
+        if waiting:
+            return f"{media.name} の話者の分離を順番待ちに入れました 前の物が終わると始まります"
+        return f"{media.name} の話者の分離を始めました"
+
+    def _continue_with_speakers(self, media_id: MediaId, stream: int | None) -> None:
+        """起こし終えた字幕へ続けて話者を付ける 本人が設定で入れたときだけ
+
+        部品が無ければ黙って飛ばさず知らせる（入れたつもりで付いていないことに気付ける）
+        """
+        if not self.speakers_after_transcribe:
+            return
+        try:
+            message = self.start_speaker_separation(
+                media_id, audio_stream=stream, require_transcript=False
+            )
+        except (KeyError, RuntimeError) as exc:
+            self.status_message.emit(f"続けて話者を分けられませんでした: {exc}")
+            return
+        self.status_message.emit(message)
+
+    def _apply_speakers(
+        self, media_id: MediaId, stream: int | None, turns: tuple[SpeakerTurn, ...]
+    ) -> str:
+        """分けた区間を、その素材と音声の**今の**字幕へ当てる 当てた結果の知らせを返す
+
+        分けている間に人が直した字幕（本文・分割）も残す 頼んだ時の字幕へ当てると、
+        その間の直しが消える
+        """
+        media = self._project.find_media(media_id)
+        transcript = media.transcript_for(stream) if media is not None else None
+        if media is None or transcript is None:
+            return "字幕が無くなっていたので、話者を付けませんでした"
+        updated = assign_speakers(transcript, turns)
+        people = transcript_speakers(updated)
+        if not people:
+            # 見分けられなかった回で当てると全部の行の話者が空になり、前の回の話者と
+            # 人が付け替えた名前が消える 窓・AI・起こしの続きのどれもここを通るので、ここで止める
+            return "話している人を見分けられませんでした（字幕は変えていません）"
+        self.commands_requested.emit(
+            [SetTranscript(media.id, updated, stream=stream)], f"話者を分ける: {media.name}"
+        )
+        return f"{len(people)} 人に分けました（{'・'.join(people)}）"
 
     def remembered_names(self) -> tuple[str, ...]:
         """起こしの知らせに書いた素材の名前と場所 :meth:`MainWindow.remembered_names` が集める"""
@@ -995,10 +1173,15 @@ class SubtitlePanel(QWidget):
         if not segments:
             self.status_message.emit("置く字幕の行を選んでください")
             return
-        voice: Voice = (media.id, media.transcript_stream(self._stream))
-        # 窓の無かった道にも、焼き込みと同じ見た目の窓を出す（#308） 話し手は見ている 1 本
+        stream = media.transcript_stream(self._stream)
+        # 話し手は見ている音の、選んだ行の話者（#323） 話者が違う行は別のレイヤーへ入る
+        voices = sorted(
+            {Voice(media.id, stream, s.speaker) for s in self._segments() if s.id in segments},
+            key=lambda v: (v.speaker is not None, v.speaker or ""),
+        )
+        # 窓の無かった道にも、焼き込みと同じ見た目の窓を出す（#308）
         answer = self.ask_burn(
-            self._request([voice], title="選んだ行を置く", accept="置く", choose=False)
+            self._request(voices, title="選んだ行を置く", accept="置く", choose=False)
         )
         if answer is None:
             return
@@ -1007,7 +1190,7 @@ class SubtitlePanel(QWidget):
             return
         template, _looks = templates
         commands: list[Command] = burn_subtitles(
-            self._project, template, voices=[voice], segments=segments
+            self._project, template, voices=voices, segments=segments
         )
         if not commands:
             self.status_message.emit("選んだ行はタイムラインに出ていません")
