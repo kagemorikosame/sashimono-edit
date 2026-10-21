@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import IO
@@ -15,7 +17,7 @@ from typing import IO
 import pytest
 
 from sashimono import model_files, runtime
-from sashimono.model_files import RemoteFile, fetch_files, missing_files
+from sashimono.model_files import HttpsOnlyRedirect, RemoteFile, fetch_files, missing_files
 from sashimono.runtime import FeaturePack, install_runtime
 
 BODY = b"model-bytes" * 100
@@ -112,6 +114,33 @@ class TestFetch:
         )
         assert code == 1
         assert not (tmp_path / "m.onnx").exists()
+
+
+class TestRedirects:
+    def _redirect(self, newurl: str) -> urllib.request.Request | None:
+        request = urllib.request.Request("https://example.invalid/m.onnx")
+        headers = http.client.HTTPMessage()
+        return HttpsOnlyRedirect().redirect_request(
+            request, io.BytesIO(), 302, "Found", headers, newurl
+        )
+
+    def test_a_redirect_to_plain_http_is_refused(self) -> None:
+        # 壊れると、取得元が http へ転送したときに平文でつなぎ、版を名乗った頼みが外から読める
+        with pytest.raises(urllib.error.URLError, match="HTTPS でない転送先"):
+            self._redirect("http://example.invalid/m.onnx")
+
+    def test_a_redirect_to_https_is_followed(self) -> None:
+        # 壊れると（HTTPS の転送まで断ると）、GitHub の LFS のように転送する取得元から落とせない
+        followed = self._redirect("https://media.example.invalid/m.onnx")
+        assert followed is not None
+        assert followed.full_url == "https://media.example.invalid/m.onnx"
+
+    def test_the_real_opener_checks_every_redirect(self) -> None:
+        # 壊れると、確かめる転送の決まりを作っても、実際に落とす所が既定の開き方のまま転送に従う
+        # 型の情報（typeshed）に handlers が無いが、OpenerDirector は持っている
+        handlers: list[object] = model_files._OPENER.handlers  # type: ignore[attr-defined]
+        assert any(isinstance(handler, HttpsOnlyRedirect) for handler in handlers)
+        assert not any(type(handler) is urllib.request.HTTPRedirectHandler for handler in handlers)
 
 
 class TestPackStatus:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from sashimono.core import userdirs
 
 __all__ = [
     "MODELS_DIR",
+    "HttpsOnlyRedirect",
     "Opener",
     "RemoteFile",
     "fetch_files",
@@ -91,8 +93,35 @@ def missing_files(files: Sequence[RemoteFile], root: Path | None = None) -> tupl
     return tuple(file for file in files if not file.present(root))
 
 
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """転送先も HTTPS に限る
+
+    既定の転送は https から http へも従うので、最初の URL だけを確かめても、転送の後は平文で
+    つなぎ、名乗り（版）を載せた頼みが外から読める 中身は sha256 で照らすので差し替えた物は
+    置かないが、つなぐ先そのものを HTTPS に限る約束（:func:`_fetch`）を転送の後も守る
+    断りは ``URLError``（``OSError`` の仲間）なので、:func:`_fetch` が理由として返す
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if urlsplit(newurl).scheme != "https":
+            raise urllib.error.URLError(f"HTTPS でない転送先は使いません（{newurl}）")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+#: 転送先を確かめる開き方 :func:`_open` が使う
+_OPENER = urllib.request.build_opener(HttpsOnlyRedirect)
+
+
 def _open(request: urllib.request.Request) -> IO[bytes]:
-    response: IO[bytes] = urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
+    response: IO[bytes] = _OPENER.open(request, timeout=TIMEOUT_SECONDS)
     return response
 
 

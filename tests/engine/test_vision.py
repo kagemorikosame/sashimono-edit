@@ -10,7 +10,9 @@ from __future__ import annotations
 import importlib.util
 import itertools
 import math
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +21,7 @@ from sashimono.engine.vision import (
     VISION_PACK,
     YUNET,
     Box,
+    Detector,
     PartsMissingError,
     ScreenKind,
     ScreenReport,
@@ -403,6 +406,44 @@ def _real_model() -> Path | None:
     return path if YUNET.present(models_root()) else None
 
 
+def _japanese_ocr(make: Callable[[ScreenKind], Detector] = make_detector) -> Detector:
+    """日本語を読む Windows の OCR を作る 作れない機械では試験を飛ばす
+
+    Windows の OCR は言語を決めずに作ると利用者の言語の設定から選ぶので、日本語の読み取りが
+    無い機械（英語の Windows など）では英語の係ができる そのまま日本語の文で比べると、
+    部品の不具合ではないのに落ちる（PR #403 の CodeRabbit の指摘）
+    """
+    try:
+        detector = make(ScreenKind.TEXT)
+    except PartsMissingError as exc:
+        pytest.skip(f"Windows の OCR を使えない（{exc}）")
+    language = detector.engine.removeprefix("windows-ocr:").split("-", 1)[0].lower()
+    if language != "ja":
+        pytest.skip(f"日本語の Windows の OCR が無い（選ばれたのは {detector.engine}）")
+    return detector
+
+
+class TestJapaneseOcrGuard:
+    def test_another_language_skips_instead_of_failing(self) -> None:
+        # 壊れると、英語の Windows の機械で、部品は動いているのに日本語の試験が落ち続ける
+        english = SimpleNamespace(engine="windows-ocr:en-US")
+        with pytest.raises(pytest.skip.Exception, match="日本語"):
+            _japanese_ocr(lambda _kind: english)
+
+    def test_a_missing_language_pack_skips_instead_of_erroring(self) -> None:
+        # 壊れると、OCR の言語が 1 つも無い機械で、試験が飛ばずに例外で止まる
+        def missing(_kind: ScreenKind) -> Detector:
+            raise PartsMissingError("言語が無い")
+
+        with pytest.raises(pytest.skip.Exception, match="使えない"):
+            _japanese_ocr(missing)
+
+    def test_japanese_goes_on(self) -> None:
+        # 壊れると、日本語の Windows でも本物の OCR の試験が飛び、読み取りの不具合を見逃す
+        japanese = SimpleNamespace(engine="windows-ocr:ja")
+        assert _japanese_ocr(lambda _kind: japanese) is japanese
+
+
 class TestRealParts:
     def test_the_real_model_reads_its_outputs(self) -> None:
         # 壊れると（モデルの出力の名前や並びが前後の処理と食い違うと）、本物の素材で顔が
@@ -433,7 +474,7 @@ class TestRealParts:
         painter.end()
         rows = np.frombuffer(image.constBits(), np.uint8).reshape(360, image.bytesPerLine())
         rgba = rows[:, : 640 * 4].reshape(360, 640, 4).copy()
-        detector = make_detector(ScreenKind.TEXT)
+        detector = _japanese_ocr()
         sample = detector.look(rgba, 0.0)
         assert [line.text for line in sample.lines] == ["本日のおすすめ"]
         assert sample.lines[0].box.y > 0
