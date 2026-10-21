@@ -5384,7 +5384,7 @@ def narration_plan(
     )
     subtitles = settings.subtitles
     if person and "subtitles" in arguments:
-        subtitles = bool(arguments["subtitles"])
+        subtitles = _flag_argument(arguments, "subtitles", subtitles)
     project = _project(host)
     at = _frame_argument(arguments, "at_frame", host.playhead)
     if at < 0:

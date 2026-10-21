@@ -36,8 +36,8 @@ from sashimono.ai.operations import OPERATIONS, Pending, find_operation, finish
 from sashimono.compat.looks import capture_preset
 from sashimono.core.commands import Command, Document, InScene, RemoveClip, RenameTrack
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
-from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript
 from sashimono.core.io.atomic import expect_now
+from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript
 from sashimono.core.model.ids import ClipId, TrackId
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.voicevox import NarrationSettings
@@ -395,9 +395,7 @@ def uncovered(
 
 
 @pytest.fixture
-def material(
-    video_media: MediaItem, transcript: Transcript, tmp_path: Path
-) -> Iterator[Material]:
+def material(video_media: MediaItem, transcript: Transcript, tmp_path: Path) -> Iterator[Material]:
     with fake_voice_engine() as engine:
         yield Material(video_media, transcript, tmp_path, engine.url)
 
