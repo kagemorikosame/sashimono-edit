@@ -91,6 +91,9 @@ class FakeHost:
         self.probe_result: MediaItem | None = None
         self.transcription = "起こしは走っていません"
         self.transcribed_stream: int | None = None
+        #: 話者の分離（#323）を頼まれた素材・音声・人数 断らせたいときは理由を入れる
+        self.separated: tuple[MediaId, int | None, int | None] | None = None
+        self.speakers_refusal = ""
         #: 本人の設定の「動画の映像と音声」 既定は設定と同じく分ける
         self.split_audio = True
         #: 本人の設定の「新しい字幕を自動で折り返す」の幅（%） 既定は設定と同じく 90
@@ -369,6 +372,15 @@ class FakeHost:
 
     def transcription_status(self) -> str:
         return self.transcription
+
+    def start_speaker_separation(
+        self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
+    ) -> str:
+        if self.speakers_refusal:
+            raise RuntimeError(self.speakers_refusal)
+        #: 分けるように頼まれた素材・音声ストリームの番号・人数
+        self.separated = (media_id, audio_stream, speakers)
+        return f"{media_id} の話者の分離を始めました"
 
     @property
     def project_path(self) -> Path | None:

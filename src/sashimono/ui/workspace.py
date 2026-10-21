@@ -573,6 +573,10 @@ class Preferences:
     #: 覚えた見た目の鍵（``compat.subtitle_looks.LookChoice.key``） 設定画面には出さない
     #: 覚える設定が入っているときだけ、置くたびに書く
     subtitle_look_last: str = ""
+    #: 字幕を起こし終えたら、続けて話者を分けて字幕に付ける（#323） 既定は切
+    #: 2026-10-20 本人の決定 部品（話者の分離）を入れていない人と、1 人で話す動画しか作らない
+    #: 人を、起こしのたびに待たせない 対談や実況を毎回分ける人は入れる
+    speakers_after_transcribe: bool = False
     #: 保存していない変更を一定の間隔で退避し、落ちた後の起動で復元を勧める（#271）
     #: 既定は入（前からの動き） 切ると、落ちたときに最後に保存した所までしか戻らない
     #: 書き込みを減らしたい人・自分でこまめに保存する人は切れる
@@ -995,6 +999,9 @@ class PreferenceStore:
                 data.get("subtitle_look_remember"), plain.subtitle_look_remember
             ),
             subtitle_look_last=_text(data.get("subtitle_look_last"), plain.subtitle_look_last),
+            speakers_after_transcribe=_flag(
+                data.get("speakers_after_transcribe"), plain.speakers_after_transcribe
+            ),
             autosave=_flag(data.get("autosave"), plain.autosave),
             autosave_seconds=_within(
                 data.get("autosave_seconds"), AUTOSAVE_SECONDS_RANGE, plain.autosave_seconds

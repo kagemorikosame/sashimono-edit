@@ -849,6 +849,18 @@ class PreferencesDialog(QDialog):
             " 話し手ごとに分けた見た目は覚えない（全員の見た目だけ）"
         )
         form.addRow(self._subtitle_look_remember)
+        self._speakers_after_transcribe = QCheckBox(
+            "字幕を起こし終えたら、続けて話者を分ける", self
+        )
+        self._speakers_after_transcribe.setObjectName("speakers_after_transcribe")
+        self._speakers_after_transcribe.setChecked(preferences.speakers_after_transcribe)
+        self._speakers_after_transcribe.setToolTip(
+            "起こした字幕に、誰が話しているか（話者 1・話者 2 …）を続けて付ける"
+            " 字幕パネルの〔話者を分ける…〕で部品を入れてから使う この機械で動き、音は外へ送らない"
+            " 2 時間の素材で CPU で 10 分ほど（日本語の合成の声 1 分を 4 秒で分けた）"
+            " 1 人で話す動画しか作らないなら切ったままでよい"
+        )
+        form.addRow(self._speakers_after_transcribe)
 
         # 退避とバックアップの欄は塊ごと別のファイルに置く（決めたことも向こうの説明にある）
         self._backups = BackupSection(preferences, self)
@@ -1155,6 +1167,7 @@ class PreferencesDialog(QDialog):
             subtitle_wrap_percent=self._subtitle_wrap_percent.value(),
             subtitle_look_remember=self._subtitle_look_remember.isChecked(),
             subtitle_look_last=self._subtitle_look_last,
+            speakers_after_transcribe=self._speakers_after_transcribe.isChecked(),
             autosave=self._backups.autosave.isChecked(),
             autosave_seconds=self._backups.autosave_seconds.value(),
             backup=self._backups.backup.isChecked(),

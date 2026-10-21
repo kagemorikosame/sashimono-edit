@@ -451,6 +451,12 @@ LEDGER: tuple[Entry, ...] = (
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),
     same("字幕パネル/整形…", "clean_subtitles"),
+    same(
+        "字幕パネル/話者を分ける…｜誰が話しているかを見分けて字幕に付ける（この機械で動き、"
+        "音は外へ送らない） 焼き込みは話者ごとに別のレイヤーへ入る",
+        "separate_speakers",
+        note="窓の〔部品を入れる〕は人だけ（部品の導入はアプリ自身の操作 #350 の決定）",
+    ),
     same("字幕パネル/無音カット…", "jet_cut"),
     same("字幕パネル/焼き込み", "place_subtitles"),
     same(
@@ -471,6 +477,7 @@ LEDGER: tuple[Entry, ...] = (
     missing("字幕パネルの右クリック/再生ヘッドで分割", 349),
     missing("字幕パネルの右クリック/次と結合", 349),
     missing("字幕パネルの右クリック/削除", 349),
+    same("字幕パネルの右クリック/話者の名前を変える…", "rename_speaker"),
     # --- 設定パネル ---
     same(
         "設定パネル/欄の値",
@@ -638,6 +645,8 @@ AI_ONLY: dict[str, str] = {
     "move_clip": _GESTURE,
     "move_clips": _GESTURE,
     "set_subtitle_text": _GESTURE,
+    # 字幕パネルの話者の列の書き換え（#323）
+    "set_subtitle_speaker": _GESTURE,
     "replace_subtitle_text": "字幕と、字幕から置いたテキストをまとめて直す 画面に同じ入口は無い",
     "ask_user": "AI から利用者へ尋ねる",
     "export_status": READING,

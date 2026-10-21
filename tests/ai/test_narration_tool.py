@@ -327,6 +327,20 @@ class TestMakingAndPlacing:
         narrating.document.undo()
         assert all(m.path != media.path for m in narrating.document.project.media)
 
+    def test_the_subtitles_carry_the_voice_as_their_speaker(self, narrating: FakeHost) -> None:
+        # 壊れると、話者を分けた起こしの字幕（#323）と並べたときにナレーションの行だけ話者が
+        # 無く、AI が get_subtitles の speaker で声の行を絞れず、分け直そうとする
+        _listed(narrating)
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT, "voice_id": 3})
+        result = box["result"]
+        assert isinstance(result, dict)
+        media = next(
+            m for m in narrating.document.project.media if m.path == Path(str(result["file"]))
+        )
+        assert media.transcript is not None
+        assert {segment.speaker for segment in media.transcript} == {"ずんだもん"}
+
     def test_the_owner_can_turn_the_subtitles_off_for_the_ai(self, narrating: FakeHost) -> None:
         # 壊れると、字幕を別に起こす人の作品に、AI が作るたびに台本の字幕が重なる
         _listed(narrating)
