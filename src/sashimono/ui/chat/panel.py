@@ -1662,7 +1662,7 @@ class ChatPanel(QWidget):
             counts += f"・絵 {used.images} 枚"
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
         # 手順が残っていれば、止まった訳を計画に残す（#340） 欄が〔続ける〕を出す
-        self._plan.end_turn(interrupted=self._stopping)
+        self._plan.end_turn(interrupted=self._stopping, limited=stopped is not None)
         view = self._plan.view()
         if view is not None and view.stopped is Stopped.PAUSED:
             # 欄だけだと、区切りで止まったのか自分で終えたのかが会話の欄から読めない

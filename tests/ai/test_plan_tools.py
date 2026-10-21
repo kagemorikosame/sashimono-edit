@@ -261,23 +261,28 @@ class TestPause:
         assert plan.request_pause() is False
 
     @pytest.mark.parametrize(
-        ("interrupted", "pause", "stopped"),
+        ("interrupted", "pause", "limited", "stopped"),
         [
-            (True, False, Stopped.INTERRUPTED),
-            (False, True, Stopped.PAUSED),
-            (False, False, Stopped.ENDED),
+            (True, False, False, Stopped.INTERRUPTED),
+            (False, True, False, Stopped.PAUSED),
+            (False, False, False, Stopped.ENDED),
+            # 使う量の上限（#344）で止めた指示 止めた後も道具を呼び続けて会話ごと止めた
+            # （中断）ときも、訳は上限
+            (False, False, True, Stopped.LIMIT),
+            (True, False, True, Stopped.LIMIT),
         ],
     )
     def test_the_reason_for_stopping_is_kept(
-        self, host: FakeHost, interrupted: bool, pause: bool, stopped: Stopped
+        self, host: FakeHost, interrupted: bool, pause: bool, limited: bool, stopped: Stopped
     ) -> None:
         # 壊れると、中断で途中まで済んだ手順を、続きの AI が済んでいない物として最初からやり直す
+        # 上限で止めた指示が「応え終えた」と残ると、続きの AI が途中の手順を確かめずに進める
         plan = plan_for(host.document)
         _plan(host)
         _mark(host, 1, "running")
         if pause:
             plan.request_pause()
-        plan.end_turn(interrupted=interrupted)
+        plan.end_turn(interrupted=interrupted, limited=limited)
         assert _read(host)["stopped"] == stopped.value
         view = plan.view()
         assert view is not None and view.stopped is stopped

@@ -13,8 +13,10 @@ from typing import Any
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
+from sashimono.ai.budget import LimitAction, Limits
+from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
-from sashimono.ai.plan import RESUME_PROMPT, Stopped, plan_for
+from sashimono.ai.plan import PAUSED_MESSAGE, RESUME_PROMPT, Stopped, plan_for
 from sashimono.ai.session import PLAN_RULES, AgentEvent, EventKind
 from sashimono.core.model import MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
@@ -87,6 +89,15 @@ def _mark(host: FakeHost, step: int, state: str) -> dict[str, Any]:
 
 def _log(widget: ChatPanel) -> str:
     return widget._view.toPlainText()
+
+
+def _over_the_limit(widget: ChatPanel) -> None:
+    """この指示でトークンの上限（尋ねずに止める）を使い切った所にする
+
+    尋ねずに止める設定なら、道具を呼ぶとその場で断る 尋ねる設定だと画面のスレッドの返事を待つ
+    """
+    widget._bridge.usage.limits = Limits(turn_tokens=100, action=LimitAction.STOP)
+    widget._bridge.usage.record_message("m", {"output_tokens": 100})
 
 
 class TestPlanBox:
@@ -194,6 +205,45 @@ class TestPauseAndResume:
         assert Stopped.INTERRUPTED.value in box.stopped_text()
         assert "途中" in box.stopped_text()
         assert box.resume_button.isEnabled()
+
+    def test_a_limit_stop_is_kept_as_the_reason(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、使う量の上限（#344）で止めた指示が計画の欄に「応え終えた」と残り、会話の欄の
+        # 「上限で停止」と食い違う 続きの AI も途中の手順を確かめずに進める
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "running")
+        _over_the_limit(widget)
+        with pytest.raises(ToolError, match="上限"):
+            widget._bridge.invoke(_operation("get_selection"), {})
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert "上限で停止" in _log(widget)
+        box = widget._plan_box
+        assert Stopped.LIMIT.value in box.stopped_text()
+        assert "AI の上限" in box.stopped_text()
+        assert box.resume_button.isEnabled()
+
+    def test_a_paused_plan_refuses_before_the_limit(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、区切りで止めた後の道具にも上限の確かめが先に効き、止めた人に「上限を広げて
+        # 続けますか」を尋ねる（広げても区切りで断るだけ） 上限で止めた印も残り、区切りで止めた
+        # 指示が「上限で停止」と書かれる
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "running")
+        assert plan_for(host.document).request_pause()
+        _mark(host, 1, "done")
+        _over_the_limit(widget)
+        with pytest.raises(ToolError) as refused:
+            widget._bridge.invoke(_operation("get_selection"), {})
+        assert str(refused.value) == PAUSED_MESSAGE
+        assert widget._bridge.usage.stopped is None
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.PAUSED.value in widget._plan_box.stopped_text()
 
     def test_resume_and_close_wait_while_answering(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
