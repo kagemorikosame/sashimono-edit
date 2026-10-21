@@ -1682,6 +1682,9 @@ class ChatPanel(QWidget):
         else:
             outcome = "完了"
         self._bridge.end_turn()
+        # 渡す前に終わった指示は数え始めていない 残すと、続けて持っておいた次の指示を渡す所
+        # （_pass_held）で、終わった指示の数えを始めてしまう
+        self._usage_waiting = False
         used = self._bridge.usage.last
         stopped = self._bridge.usage.last_stop
         if stopped is not None:

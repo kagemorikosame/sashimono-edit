@@ -291,6 +291,41 @@ class TestTheUsageLimit:
         assert handoff.reason is StopReason.LIMIT
         assert "中断を押しました" not in handoff.text()
 
+    def test_an_instruction_held_for_the_parts_update_does_not_inherit_the_limit(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、上限で止めた指示の後、部品の入れ替え中に送った指示が入れ替えの失敗で
+        # 終わったとき、前の指示の上限が残り、関係の無い指示を「上限で止まった」と引き継ぐ
+        # （入れ替え中は使う量を数え始めないので、その指示の数えが無い）
+        from sashimono.ai import AI_PACK
+        from sashimono.runtime import PackageStatus, PackStatus
+        from sashimono.ui.setup import SetupSection
+
+        widget, _ = recorded
+        self._over_the_limit(widget)
+        self._call_refused(widget)
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        first = _shelved(widget)
+        assert first is not None and first.reason is StopReason.LIMIT
+
+        widget._retrying = True
+        _send(widget, "字幕を付けて")
+        assert widget._usage_waiting is True
+        widget._retrying = False
+        # 入れ直しの後に Claude Code が見つからない（使えない）形
+        broken = PackStatus(
+            pack=AI_PACK,
+            packages=(PackageStatus("claude-agent-sdk", "0.2.158"),),
+            missing_commands=("claude",),
+        )
+        monkeypatch.setattr(SetupSection, "status", property(lambda _self: broken))
+        widget._on_setup_finished(False)
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert handoff.instruction == "字幕を付けて"
+        assert handoff.reason is StopReason.ERROR
+        assert "上限で停止" not in widget._view.toPlainText().split("字幕を付けて")[-1]
+
 
 class TestTheBox:
     def _stopped(self, widget: ChatPanel) -> None:
