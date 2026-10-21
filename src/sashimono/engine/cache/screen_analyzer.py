@@ -86,6 +86,10 @@ def scenes_from(
     """
 
     def scenes(media: MediaItem, cancelled: Callable[[], bool]) -> SceneSignal | None:
+        # 頼む前に止める頼みを見る 見ずに頼むと、設定を切った後に順番待ちから出てきた仕事が
+        # 素材ごとに全フレームを読む場面の解析を予約し、CPU を使い続ける（PR #403 の Codex の指摘）
+        if cancelled():
+            return None
         analyzer.request_scenes(media, on_ready=on_ready)
         while not analyzer.wait_scenes(media.id, _POLL_SECONDS):
             if cancelled():
@@ -187,9 +191,12 @@ class ScreenAnalyzer:
     def state(self, media: MediaItem, kind: ScreenKind) -> ScreenState:
         """調べた様子 調べ終えていればその結果、途中なら調べた所までの写し"""
         done = self.report(media, kind)
-        if done is not None:
-            return ScreenState(done, running=False)
         key = (media.id, kind)
+        if done is not None:
+            # 仮の結果（等間隔）は、場面ごとに調べ直している間も走っていると返す
+            with self._lock:
+                running = not done.by_scene and key in self._running
+            return ScreenState(done, running=running)
         with self._lock:
             running = key in self._running
             failure = self._failures.get(key)
@@ -208,7 +215,11 @@ class ScreenAnalyzer:
         self.report(media, kind)
         key = (media.id, kind)
         with self._lock:
-            if self._closed or key in self._done:
+            held = self._done.get(key)
+            # 場面が分からず等間隔で調べた仮の結果（``by_scene`` が偽）は終わりとして扱わない
+            # 終わりとして扱うと、後で場面の解析が通っても同じ起動の中では場面ごとに調べ直せない
+            # （PR #403 の Codex の指摘） 仮の結果は調べ直す間も返す（:meth:`state`）
+            if self._closed or (held is not None and held[1].by_scene):
                 return
             if key in self._running:
                 # 止める頼み（設定を切った・素材を外した）の後にまた頼まれたら、走っている物を
@@ -297,8 +308,14 @@ class ScreenAnalyzer:
         def cancelled() -> bool:
             return self._is_cancelled(key)
 
+        # 順番待ちの間に止められていたら、係も作らず場面の解析も頼まない 頼むと、設定を切った後も
+        # 素材ごとに全フレームを読む解析が予約される（PR #403 の Codex の指摘）
+        if cancelled():
+            return
         # 先に係を作る 部品が無ければ、場面の解析（全フレームを読む）を待たずに断れる
         detector = self._detector(kind, ocr)
+        if cancelled():
+            return
         stamp = _stamp(media)
         signal = self._scenes(media, cancelled)
         if cancelled():
@@ -317,7 +334,12 @@ class ScreenAnalyzer:
             cache_key: str | None = screen_key(media.path, kind, detector.engine, per_scene, stream)
         else:
             # 場面が分からなければ等間隔で調べる 控えには書かない 場面の解析を直した後も
-            # 等間隔の結果を返し続けないため
+            # 等間隔の結果を返し続けないため 同じ起動の中でも仮の結果として持ち、次に頼まれたら
+            # 場面の解析からやり直す（:meth:`request`） 仮の結果が既にあれば調べ直さずに載せ直す
+            previous = self._provisional(key, stamp)
+            if previous is not None:
+                self._publish(key, stamp, previous, per_scene, ocr)
+                return
             cuts = fallback_cuts(duration)
             count = 1
             cache_key = None
@@ -343,6 +365,14 @@ class ScreenAnalyzer:
         if cache_key is not None:
             save_screen(self._store, cache_key, report)
         self._publish(key, stamp, report, per_scene, ocr)
+
+    def _provisional(self, key: _Key, stamp: str) -> ScreenReport | None:
+        """今の素材の仮の結果（等間隔に調べた物） 無ければ ``None``"""
+        with self._lock:
+            held = self._done.get(key)
+        if held is None or held[0] != stamp or held[1].by_scene:
+            return None
+        return held[1]
 
     def _publish(
         self, key: _Key, stamp: str, report: ScreenReport, per_scene: int, ocr: str

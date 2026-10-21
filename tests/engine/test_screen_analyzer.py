@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sashimono.core.model import MediaItem
+from sashimono.core.model import MediaId, MediaItem
 from sashimono.engine.cache import CacheStore, ScreenAnalyzer
 from sashimono.engine.cache.analyzer import MediaAnalyzer
 from sashimono.engine.cache.screen_analyzer import scenes_from
@@ -290,6 +290,66 @@ class TestScreenAnalyzer:
         finally:
             analyzer.close()
 
+    def test_an_even_result_is_redone_by_scene_once_the_scenes_are_known(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、場面の解析が 1 度失敗した素材は、同じ起動の中で後から場面が分かっても
+        # 等間隔の仮の結果のままで、場面ごとに調べ直せない（PR #403 の Codex の指摘）
+        known: list[SceneSignal | None] = [None]
+        analyzer, reader, _ = _make(tmp_path, scenes=lambda _m, _c: known[0])
+        try:
+            _finish(analyzer, video)
+            first = analyzer.state(video, ScreenKind.TEXT)
+            assert first.report is not None and not first.report.by_scene
+            # 場面が分からないままもう 1 度頼まれても、等間隔に調べ直さない（仮の結果を載せ直す）
+            count = len(reader.seen)
+            _finish(analyzer, video)
+            assert len(reader.seen) == count
+            known[0] = _signal(CUTS)
+            _finish(analyzer, video)
+            again = analyzer.state(video, ScreenKind.TEXT).report
+            assert again is not None and again.by_scene
+            assert again.planned == 2 * (len(CUTS) + 1)
+        finally:
+            analyzer.close()
+
+    def test_a_job_stopped_while_waiting_asks_for_nothing(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、設定を切った後に順番待ちから出てきた仕事が、部品を作り場面の解析を頼み、
+        # 素材ごとに全フレームを読んで CPU を使い続ける（PR #403 の Codex の指摘）
+        reader = FakeReader()
+        reader.gate = threading.Event()
+        asked: list[str] = []
+
+        def scenes(media: MediaItem, _cancelled: Callable[[], bool]) -> SceneSignal | None:
+            asked.append(str(media.id))
+            return _signal(CUTS)
+
+        made: list[ScreenKind] = []
+
+        def detectors(kind: ScreenKind, _ocr: str) -> FakeReader:
+            made.append(kind)
+            return reader
+
+        analyzer = ScreenAnalyzer(CacheStore(tmp_path / "c"), scenes=scenes, detectors=detectors)
+        other = replace(video, id=MediaId("m_もう一本"))
+        try:
+            analyzer.request(video, ScreenKind.TEXT)
+            assert reader.blocked.wait(30)
+            # 1 本目が調べている間に、2 本目（文字と顔）が順番を待っている
+            analyzer.request(other, ScreenKind.TEXT)
+            analyzer.request(other, ScreenKind.FACES)
+            analyzer.cancel()
+            reader.gate.set()
+            assert analyzer.wait(other.id, ScreenKind.TEXT, 30)
+            assert analyzer.wait(other.id, ScreenKind.FACES, 30)
+            assert asked == [str(video.id)]
+            assert made == [ScreenKind.TEXT]
+        finally:
+            reader.gate.set()
+            analyzer.close()
+
     def test_changing_the_count_looks_again(
         self, made: tuple[ScreenAnalyzer, FakeReader, list[ScreenKind]], video: MediaItem
     ) -> None:
@@ -423,6 +483,19 @@ class TestScenesFrom:
             assert signal is not None and signal.complete
             cuts = [cut.seconds for cut in signal.cuts()]
             assert cuts == pytest.approx(list(CUTS), abs=0.05)
+        finally:
+            scenes.close()
+
+    def test_a_stopped_job_does_not_ask_for_the_scenes(
+        self, tmp_path: Path, video: MediaItem
+    ) -> None:
+        # 壊れると、止めた後の仕事が場面の解析（全フレームを読む）を予約してから止まる
+        scenes = MediaAnalyzer(CacheStore(tmp_path / "s"))
+        asked: list[object] = []
+        scenes.request_scenes = lambda media, **_options: asked.append(media)  # type: ignore[method-assign]
+        try:
+            assert scenes_from(scenes)(video, lambda: True) is None
+            assert asked == []
         finally:
             scenes.close()
 
