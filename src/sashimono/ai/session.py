@@ -453,6 +453,11 @@ class AgentSession:
         )
 
         if isinstance(message, AssistantMessage):
+            # 使った量を数える（#344） 上限の確かめ（ブリッジ）は次の道具の前にこれを見る
+            # 古い SDK には欄が無いので getattr で読む 無ければ数えない
+            self._bridge.usage.record_message(
+                getattr(message, "message_id", None), getattr(message, "usage", None)
+            )
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     self._emit(AgentEvent(EventKind.TEXT, text=block.text))
@@ -476,12 +481,17 @@ class AgentSession:
                             text="失敗" if block.is_error else "",
                         )
                     )
-        elif isinstance(message, ResultMessage) and message.is_error:
-            self._emit(
-                AgentEvent(
-                    EventKind.ERROR, text=with_login_hint(str(message.result or "失敗しました"))
+        elif isinstance(message, ResultMessage):
+            # 途中の知らせの出力は仮の値なので、本当の出力は結果で確かめる（#344）
+            # 失敗した指示も使った分は払うので、成功と失敗の両方で数える
+            self._bridge.usage.settle_output(getattr(message, "usage", None))
+            if message.is_error:
+                self._emit(
+                    AgentEvent(
+                        EventKind.ERROR,
+                        text=with_login_hint(str(message.result or "失敗しました")),
+                    )
                 )
-            )
 
     def _emit(self, event: AgentEvent) -> None:
         self._events.put(event)

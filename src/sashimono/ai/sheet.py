@@ -89,6 +89,7 @@ def sheet_layout(
     cell_width: int,
     frame_size: tuple[int, int],
     columns: int | None = None,
+    max_edge: int = MAX_SHEET_EDGE,
 ) -> SheetLayout:
     """``count`` 枚を並べる形を決める
 
@@ -96,7 +97,8 @@ def sheet_layout(
     少なく、縦横の差が小さい方 横に長い 1 行や縦に長い 1 列にすると、長い辺の上限に
     先に当たって升が小さくなる
 
-    升の幅は頼まれた幅から、全体が :data:`MAX_SHEET_EDGE` に収まるまで縮める
+    升の幅は頼まれた幅から、全体が ``max_edge``（本人の設定 #344 既定は :data:`MAX_SHEET_EDGE`）
+    に収まるまで縮める
     縮めても :data:`MIN_CELL_WIDTH` に届かなければ断る
     """
     if count < 1:
@@ -112,7 +114,7 @@ def sheet_layout(
 
     best: tuple[tuple[int, int, int], SheetLayout] | None = None
     for candidate in candidates:
-        layout = _fit(count, candidate, cell_width, aspect)
+        layout = _fit(count, candidate, cell_width, aspect, max_edge)
         empty = layout.rows * layout.columns - count
         # 升の幅が大きいほど、空きが少ないほど、縦横が近いほどよい
         score = (-layout.cell_width, empty, abs(layout.width - layout.height))
@@ -122,19 +124,19 @@ def sheet_layout(
     layout = best[1]
     if layout.cell_width < MIN_CELL_WIDTH:
         raise SheetError(
-            f"{count} 枚を 1 枚（長い辺 {MAX_SHEET_EDGE} 画素まで）に並べると、1 コマの幅が"
+            f"{count} 枚を 1 枚（長い辺 {max_edge} 画素まで）に並べると、1 コマの幅が"
             f" {layout.cell_width} 画素になり小さすぎます 枚数を減らすか、columns を変えてください"
         )
     return layout
 
 
-def _fit(count: int, columns: int, cell_width: int, aspect: float) -> SheetLayout:
+def _fit(count: int, columns: int, cell_width: int, aspect: float, max_edge: int) -> SheetLayout:
     """頼まれた幅から、全体が上限に収まる所まで升を縮める"""
     rows = -(-count // columns)
     # 横の上限から決まる幅
-    by_width = (MAX_SHEET_EDGE - (columns + 1) * GAP) // columns
+    by_width = (max_edge - (columns + 1) * GAP) // columns
     # 縦の上限から決まる幅 1 行の高さは 絵の高さ（幅 x 縦横比）+ 帯
-    room = MAX_SHEET_EDGE - (rows + 1) * GAP - rows * LABEL_HEIGHT
+    room = max_edge - (rows + 1) * GAP - rows * LABEL_HEIGHT
     by_height = int(room / rows / aspect) if aspect > 0 else by_width
     width = max(1, min(cell_width, by_width, by_height))
     # 切り捨てる 丸めて上げると、行の数だけ積もって長い辺の上限を数画素超える
