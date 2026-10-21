@@ -193,6 +193,9 @@ def write_version_file(work: Path) -> Path:
 EXCLUDED_MODULES = (
     "faster_whisper",
     "ctranslate2",
+    # 話者の分離（#323）も後から入れる 本体は使う所で初めて import する
+    "sherpa_onnx",
+    "onnxruntime",
     "torch",
     "nvidia",
     "claude_agent_sdk",
@@ -221,7 +224,7 @@ EXCLUDED_MODULES = (
 #: 配布版に Python の本体は無いので、これらとその依存が使う標準ライブラリは配布版が持って
 #: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
 #: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
-RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2")
+RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2", "sherpa-onnx")
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
 #: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の

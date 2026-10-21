@@ -209,6 +209,18 @@ def _jet_cut(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "jet_cut", {"media_id": media, "keep_speech": False, "smooth": True}
 
 
+def _rename_speaker(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # WRITE_EXAMPLES の作品の字幕には話者が無く「話者 1」が見つからずに断られる
+    # 分け終えた字幕（話者の付いた形）を置いて、名前を変える道を通す
+    named = replace(
+        material.transcript,
+        segments=tuple(replace(s, speaker="話者 1") for s in material.transcript.segments),
+    )
+    host = _with_text_clip(material.video_media, named)
+    arguments = {"media_id": _ids(host)["media"], "from": "話者 1", "to": "山田"}
+    return host, "rename_speaker", arguments
+
+
 def _smooth_cuts(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return FakeHost(JumpCut().project), "smooth_cuts", {}
 
@@ -410,6 +422,7 @@ EXAMPLES: dict[str, Example] = {
     "place_subtitles": _place_subtitles,
     "jet_cut": _jet_cut,
     "smooth_cuts": _smooth_cuts,
+    "rename_speaker": _rename_speaker,
     "set_volume": _mix("set_volume", lambda w: {"clip_ids": [str(w.bgm.id)], "volume_percent": 50}),
     "duck_audio": _mix(
         "duck_audio",

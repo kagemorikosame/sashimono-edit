@@ -37,6 +37,9 @@ MARK = "ZZSECRET"
 TEXT_SOURCES = {
     "transcription_status",
     "start_transcription",
+    # 話者の分離（#323） 始めた知らせに素材の名前が入る（今の作品の素材なので伏せ字の表にある）
+    # 終わった知らせは transcription_status に並び、名前は _describe_job が覚える
+    "start_speaker_separation",
     "app_settings",
     # 保存と書き出し（#327） 保存の知らせと書き出しの様子に、書いた場所・置き換える前の
     # ファイルを残した場所・控えの置き場が入る 書いた場所と残した場所は remembered_names から返す
