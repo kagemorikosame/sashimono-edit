@@ -1790,10 +1790,11 @@ class TestTheAddOnsAreCheckedTheUsersWay:
 
         pips, reads, code = self._frozen_calls(monkeypatch)
         assert code == 0
-        assert len(pips) == 2
+        # AI 連携・字幕起こし・話者の分離（#323）
+        assert len(pips) == 3
         # 入れた導入先だけを、起動のときと同じ読み方でこのプロセスの中で読む
         assert reads == [("add-ons", list(ADD_ON_MODULES))]
-        assert {"claude_agent_sdk", "faster_whisper"} <= set(ADD_ON_MODULES)
+        assert {"claude_agent_sdk", "faster_whisper", "sherpa_onnx"} <= set(ADD_ON_MODULES)
 
     def test_the_read_lines_reach_the_summary(
         self, frozen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
