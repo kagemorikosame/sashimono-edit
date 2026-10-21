@@ -262,6 +262,27 @@ class TestMenu:
         assert window.document.project == work
         assert "解析" in window.statusBar().currentMessage()
 
+    def test_a_failed_analysis_is_told(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 解析できなかった素材を黙って真ん中で切り出すと、人は被写体を追っていないことに気付かない
+        work = _work(video_media)
+        window = MainWindow(work, confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="auto")
+        )
+        monkeypatch.setattr(
+            window._analyzer,
+            "scene_state",
+            lambda _media: SceneState(None, running=False, failure="読めない"),
+        )
+        assert window.reframe_project()
+        assert "解析ができなかった素材 1 本" in window.statusBar().currentMessage()
+
     def test_a_locked_track_says_why(
         self,
         opened: list[MainWindow],

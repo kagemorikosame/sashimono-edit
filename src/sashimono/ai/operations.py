@@ -3774,6 +3774,13 @@ def _still_analyzing(state: SceneState) -> bool:
 
 def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
     """解析を待った後に呼ぶ 待つ間に作品が変わっていても、今の作品で組み直す"""
+    if host.active_scene is not None:
+        # 待つ間（最長 2 分）に人がシーンを開くと、読む作品のメインがシーンのタイムラインに
+        # 替わり、命令も開いたシーンへ包まれる メインとすべてのシーンの作り替えが別の所へ当たる
+        raise ToolError(
+            "解析を待っている間にシーンが開かれたので、何も変えていません"
+            " set_active_scene でメインに戻してから呼び直してください"
+        )
     project = _project(host)
     if (request.width, request.height) == project.settings.resolution:
         raise ToolError(f"作品はもう {request.width}x{request.height} です")

@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
@@ -125,6 +126,65 @@ def test_a_large_picture_shrunk_is_not_cut_at_the_screen(
         renderer.close()
     for corner in (image[:3, :3], image[:3, -3:], image[-3:, :3], image[-3:, -3:]):
         assert float(corner[:, :, 2].mean()) > 40
+
+
+def _wide_image_project(path: Path, width: int) -> Project:
+    """横 ``width`` の画像を画素で置き、50% に縮めた小さい作品（はみ出す大きさの素材）"""
+    rows = np.zeros((64, width, 3), np.uint8)
+    rows[:, :, 2] = 200
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("png", rate=1)
+        stream.width, stream.height, stream.pix_fmt = width, 64, "rgb24"
+        for packet in stream.encode(av.VideoFrame.from_ndarray(rows, format="rgb24")):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    forget_probe(path)
+    media = probe_media(path)
+    settings = ProjectSettings(width=WIDTH, height=HEIGHT, frame_rate=FrameRate(FPS))
+    base = Project.create(settings, media=(media,))
+    track = Track(TrackKind.VIDEO, "V1")
+    base = base.with_timeline(replace(base.timeline, tracks=(track,)))
+    clip = with_fixed_items(
+        Clip(timeline_start=0, duration=FPS, media_id=media.id, native_size=True), picture=True
+    )
+    clip = replace(
+        clip,
+        effects=tuple(
+            e.with_param("scale", AnimatedValue(50.0)) if e.kind == "transform" else e
+            for e in clip.effects
+        ),
+    )
+    return AddClip(track.id, clip).apply(base)
+
+
+def test_a_huge_picture_falls_back_to_the_screen_buffer(
+    tmp_path: Path, gl_context: OffscreenGLContext
+) -> None:
+    # 上限を設けないと、とても大きな画像を画素で置いたとき、はみ出し用のバッファが RGBA16F で
+    # 何枚も GPU に作られてメモリが尽きるか、作れずにフレームごと描けなくなる 上限を超えたら
+    # 前の道（画面の大きさで切ってから掛ける）で描き、落ちない
+    project = _wide_image_project(tmp_path / "wide.png", 7000)
+    renderer = FrameRenderer(project, context=gl_context)
+    try:
+        image = renderer.render(0)
+        assert renderer._spill is None
+    finally:
+        renderer.close()
+    # 縮めた帯（高さ 32）が画面の真ん中に描かれている
+    assert int(image[HEIGHT // 2, WIDTH // 2, 2]) > 100
+
+
+def test_a_lowered_limit_is_kept(tmp_path: Path, gl_context: OffscreenGLContext) -> None:
+    # 上限を GPU から読み直して上書きすると、GPU の上限の小さい機械で作れない大きさを作る
+    project = _wide_image_project(tmp_path / "small.png", 400)
+    renderer = FrameRenderer(project, context=gl_context)
+    renderer.spill_limit = 256
+    try:
+        renderer.render(0)
+        assert renderer._spill is None
+    finally:
+        renderer.close()
 
 
 def test_no_black_band_at_the_edges(video: Path, gl_context: OffscreenGLContext) -> None:

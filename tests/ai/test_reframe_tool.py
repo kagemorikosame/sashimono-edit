@@ -159,6 +159,21 @@ class TestTheResult:
 
 
 class TestTheRefusals:
+    def test_a_scene_opened_while_waiting_is_refused(self, host: FakeHost) -> None:
+        # 待つ間に人がシーンを開いたまま作り替えると、シーンのタイムラインをメインと取り違え、
+        # 命令も開いたシーンへ包まれて、メインが横のまま残るか命令ごと断られる
+        host.scene_states[_media(host).id] = SceneState(None, running=True)
+        pending = REFRAME(host, {})
+        assert isinstance(pending, Pending)
+        before = host.document.project
+        scene = Scene("中", Timeline(rate=RATE_30))
+        host.apply_commands([AddScene(scene)], "シーン")
+        host.set_active_scene(scene.id)
+        host.scene_states[_media(host).id] = SceneState(_signal(0.8), running=False)
+        with pytest.raises(ToolError, match="シーンが開かれた"):
+            pending.then()
+        assert host.document.project.settings.resolution == before.settings.resolution
+
     def test_an_open_scene_is_refused(self, host: FakeHost) -> None:
         # 開いたシーンだけを作り替えると、メインが縦の画面に横の配置のまま残る
         scene = Scene("中", Timeline(rate=RATE_30))

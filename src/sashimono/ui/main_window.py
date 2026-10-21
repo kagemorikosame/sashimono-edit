@@ -2740,13 +2740,24 @@ class MainWindow(QMainWindow):
             self._on_project_changed()
             return False
         self._on_project_changed()
+        notes: list[str] = []
+        if gathered.untracked:
+            # 解析できなかった素材（壊れた・読めない）は真ん中を切り出して作り替える
+            # 断ると、読めない
+            # 素材が 1 本あるだけで作品ごと作り替えられない 黙ると人は追えていないことに気付かない
+            # （AI の道具は返事の untracked_media で同じことを知らせる）
+            notes.append(
+                f"場面の解析ができなかった素材 {len(gathered.untracked)} 本は、被写体を追わずに"
+                "真ん中を切り出しました"
+            )
         if plan.skipped:
-            self.statusBar().showMessage(
+            notes.append(
                 f"作り替えられなかったクリップが {len(plan.skipped)} 本あります（"
                 + " / ".join(reason for _clip, reason in plan.skipped[:3])
-                + "）",
-                8000,
+                + "）"
             )
+        if notes:
+            self.statusBar().showMessage(" ".join(notes), 8000)
         return True
 
     # --- 退避と復元 ---
