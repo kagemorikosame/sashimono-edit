@@ -132,6 +132,10 @@ def _assert_tail_decodes(project: Project) -> None:
 
 
 def _assert_export_has_no_black(project: Project, path: Path) -> None:
+    # エンコーダは libx264 に決める 選ばせると機械ごとに NVENC などへ変わり、試験の結果が
+    # GPU のエンコーダの具合に左右される 入っていない機械では書き出せないので、落とさず飛ばす
+    if "libx264" not in av.codecs_available:
+        pytest.skip("libx264 が入っていない")
     export_project(project, ExportSettings(path=path, video_codec="libx264"))
     with av.open(str(path)) as container:
         means = [float(f.to_ndarray(format="rgb24").mean()) for f in container.decode(video=0)]
