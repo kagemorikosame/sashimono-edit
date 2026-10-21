@@ -2326,7 +2326,17 @@ def _highlight_row(
             row[name] = value
     if item.laughter_from_subtitles:
         row["laughter_from_subtitles"] = True
-    row["timeline"] = _highlight_places(project, media, item, sources)
+    # 音の手がかりで拾っていない区間（動きだけ）は、音のクリップとして数えない 数えると
+    # 絵を止めた混合トラックのクリップで hold_at を越えた範囲を返し、preview_range で
+    # 止まった絵しか出ない所を見せる 絵の側は区間の手がかりに関係なく数える 笑いや音量の
+    # 区間でも、調べた映像を描くクリップならその時刻の絵が出る（止めた所までは）
+    # どの手がかりも半分に届かない区間（reasons が空）は、どちらで拾ったか分からないので両方を見る
+    heard = not item.reasons or any(
+        name in item.reasons for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD)
+    )
+    row["timeline"] = _highlight_places(
+        project, media, item, sources if heard else replace(sources, audio=None)
+    )
     return row
 
 

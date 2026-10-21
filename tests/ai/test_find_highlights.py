@@ -288,6 +288,25 @@ class TestTheSources:
         assert _clip_ids(row) == [str(clip.id)]
         assert row["timeline"][0]["end_frame"] > 30
 
+    def test_a_motion_only_range_ignores_the_sound(self, video_media: MediaItem) -> None:
+        """動きだけで拾った区間は、絵を止めた混合トラックのクリップでも止めた時刻で切る
+
+        壊れると、音も調べる既定の呼び出しで、音を鳴らすクリップとして数えて hold_at を越えた
+        範囲を返し、preview_range で止まった絵しか出ない所を動きの盛り上がりとして見せる
+        """
+        held = replace(make_clip(0, 300, video_media), hold_at=Fraction(5), audio_stream=1)
+        partly = replace(make_clip(400, 300, video_media), hold_at=Fraction(7), audio_stream=1)
+        host = _placed(video_media, (TrackKind.MIXED, held), (TrackKind.MIXED, partly))
+        host.stub_waveform = waveform_of(speech(10.0, np.random.default_rng(3)))
+        host.scene_states[video_media.id] = SceneState(_still(busy=(6.0, 8.0)), running=False)
+        result = _call(host)
+        assert "loud" in result["signals"] and "motion" in result["signals"]
+        row = next(row for row in result["highlights"] if row["reasons"] == ["motion"])
+        assert _clip_ids(row) == [str(partly.id)]
+        place = row["timeline"][0]
+        assert place["end_frame"] == 400 + 7 * 30
+        assert place.get("peak_frame", 0) < place["end_frame"]
+
     def test_the_sound_a_mixed_clip_plays_is_compared(self, video_media: MediaItem) -> None:
         """混合トラックは鳴らす音声（audio_stream）で比べ、絵の番号（stream_index）では比べない
 
