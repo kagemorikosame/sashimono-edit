@@ -109,12 +109,15 @@ class _Worker(QObject):
                 scratch.unlink(missing_ok=True)
 
     def _export(self, scratch: Path) -> None:
+        #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
+        notes: list[str] = []
         try:
             run_export(
                 self._project,
                 replace(self._settings, path=scratch),
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
+                notice=notes.append,
             )
         except ExportError as exc:
             if self._cancel.is_set():
@@ -138,7 +141,9 @@ class _Worker(QObject):
         if self._expect is not None and self._expect.kept:
             # 置き換える前の書き出しは消さずに残した（:mod:`sashimono.core.io.atomic`） 場所を伝える
             note = f"（置き換える前のファイルは {self._expect.kept[-1]} として残しました）"
-        self.finished.emit(f"{placed}{note}")
+        # 何で書いたかを AI と人の両方へ伝える 黙っていると、AI が GPU で書いたと説明しかねない
+        extra = "".join(f" {text}" for text in notes)
+        self.finished.emit(f"{placed}{note}{extra}")
 
     def _place(self, scratch: Path) -> Path:
         """書き出し先のフォルダを持ったまま確かめ直し、写して名前を付け替える"""

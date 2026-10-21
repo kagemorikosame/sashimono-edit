@@ -95,6 +95,11 @@ UNDOABLE_TOOLS = frozenset(
         "replace_subtitle_text",
         "clean_subtitles",
         "transcribe",
+        # 話者の分離（#323） 字幕の行の話者だけを変える 素材は読むだけで、モデルは本人の
+        # Hugging Face の置き場へ落とす（作品の外のファイルは書かない）
+        "separate_speakers",
+        "rename_speaker",
+        "set_subtitle_speaker",
         # 音量とミックス（#329） 音量の欄・音量の線・置く命令だけを使う 測るのは裏の検査で
         # ファイルへは書かない
         "set_volume",

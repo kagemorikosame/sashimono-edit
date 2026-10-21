@@ -6,6 +6,8 @@
 そこで、ワーカーは出来事をキューへ積むだけにして、UI 側は自分の都合の良い間隔で
 :meth:`Job.poll` して取り出す :class:`~sashimono.engine.cache.MediaAnalyzer` が
 解析結果を一定間隔で反映しているのと同じ考え方で、Qt に依存しないので試験も書ける
+
+話者の分離（#323）も同じ列で走らせる どちらも機械を丸ごと使うので、並べても速くならない
 """
 
 from __future__ import annotations
@@ -21,7 +23,9 @@ from sashimono.asr.backend import (
     TranscribeOptions,
     TranscriptionBackend,
 )
+from sashimono.asr.speakers import SpeakerBackend, SpeakerOptions
 from sashimono.core.model import MediaId, Transcript
+from sashimono.core.speakers import SpeakerTurn
 
 __all__ = ["Job", "JobEvent", "JobKind", "TranscriptionService"]
 
@@ -43,6 +47,8 @@ class JobEvent:
     transcript: Transcript | None = None
     #: 起こせたが知らせておくこと（GPU の道具が読めず CPU で起こした など）
     notice: str = ""
+    #: 話者の分離の結果（ソース秒の区間） 起こしの依頼では ``None``
+    speakers: tuple[SpeakerTurn, ...] | None = None
 
     @property
     def finished(self) -> bool:
@@ -50,23 +56,37 @@ class JobEvent:
 
 
 class Job:
-    """走っている（または走り終わった）起こし 1 件"""
+    """走っている（または走り終わった）起こし 1 件 話者の分離も 1 件の依頼として持つ"""
 
     def __init__(
-        self, media_id: MediaId, path: Path, options: TranscribeOptions | None = None
+        self,
+        media_id: MediaId,
+        path: Path,
+        options: TranscribeOptions | None = None,
+        *,
+        speakers: SpeakerOptions | None = None,
     ) -> None:
         self.media_id = media_id
         self.path = path
         #: 起こす条件 音声ストリーム（``options.audio_stream``）で結果の取り込み先が決まる
         self.options = options if options is not None else TranscribeOptions()
+        #: 話者の分離の条件 ``None`` なら起こしの依頼
+        self.speaker_options = speakers
         self._events: queue.Queue[JobEvent] = queue.Queue()
         self._cancel = threading.Event()
         self._started = threading.Event()
         self._done = threading.Event()
 
     @property
+    def separating(self) -> bool:
+        """話者の分離の依頼か"""
+        return self.speaker_options is not None
+
+    @property
     def stream(self) -> int | None:
-        """起こす音声ストリームの番号 ``None`` なら 1 本目"""
+        """起こす（分ける）音声ストリームの番号 ``None`` なら 1 本目"""
+        if self.speaker_options is not None:
+            return self.speaker_options.audio_stream
         return self.options.audio_stream
 
     @property
@@ -114,8 +134,11 @@ class TranscriptionService:
     取り込まれずに消えることがあった
     """
 
-    def __init__(self, backend: TranscriptionBackend) -> None:
+    def __init__(
+        self, backend: TranscriptionBackend, speaker_backend: SpeakerBackend | None = None
+    ) -> None:
         self._backend = backend
+        self._speaker_backend = speaker_backend
         self._queue: list[Job] = []
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
@@ -123,6 +146,15 @@ class TranscriptionService:
     @property
     def backend(self) -> TranscriptionBackend:
         return self._backend
+
+    @property
+    def speaker_backend(self) -> SpeakerBackend:
+        """話者の分離の実行係 渡されていなければ sherpa-onnx の物を初めて使うときに作る"""
+        if self._speaker_backend is None:
+            from sashimono.asr.speakers import SherpaSpeakerBackend
+
+            self._speaker_backend = SherpaSpeakerBackend()
+        return self._speaker_backend
 
     @property
     def busy(self) -> bool:
@@ -134,13 +166,28 @@ class TranscriptionService:
         with self._lock:
             return [job for job in self._queue if job.running]
 
-    def find(self, media_id: MediaId, stream: int | None) -> Job | None:
-        """その素材と音声を起こしている（待っている）依頼"""
-        return next((j for j in self.jobs() if j.media_id == media_id and j.stream == stream), None)
+    def find(
+        self, media_id: MediaId, stream: int | None, *, separating: bool = False
+    ) -> Job | None:
+        """その素材と音声を起こしている（``separating`` なら話者を分けている）依頼"""
+        return next(
+            (
+                j
+                for j in self.jobs()
+                if j.media_id == media_id and j.stream == stream and j.separating == separating
+            ),
+            None,
+        )
 
     def start(self, media_id: MediaId, path: Path, options: TranscribeOptions) -> Job:
         """起こしを頼む 走っている物があれば順番待ちに入れる"""
-        job = Job(media_id, Path(path), options)
+        return self._enqueue(Job(media_id, Path(path), options))
+
+    def start_speakers(self, media_id: MediaId, path: Path, options: SpeakerOptions) -> Job:
+        """話者の分離を頼む 起こしと同じ列に並ぶ"""
+        return self._enqueue(Job(media_id, Path(path), speakers=options))
+
+    def _enqueue(self, job: Job) -> Job:
         with self._lock:
             self._queue = [j for j in self._queue if j.running]
             self._queue.append(job)
@@ -169,7 +216,10 @@ class TranscriptionService:
                 job._emit(JobEvent(JobKind.CANCELLED, message="中断した"))
                 job._done.set()
                 continue
-            self._run(job, job.options)
+            if job.speaker_options is not None:
+                self._run_speakers(job, job.speaker_options)
+            else:
+                self._run(job, job.options)
 
     def _run(self, job: Job, options: TranscribeOptions) -> None:
         try:
@@ -200,6 +250,36 @@ class TranscriptionService:
                         message=f"{done} {notice}" if notice else done,
                         transcript=transcript,
                         notice=notice,
+                    )
+                )
+        finally:
+            job._done.set()
+
+    def _run_speakers(self, job: Job, options: SpeakerOptions) -> None:
+        try:
+            turns = self.speaker_backend.separate(
+                job.path,
+                options,
+                progress=lambda ratio, message: job._emit(
+                    JobEvent(JobKind.PROGRESS, ratio=ratio, message=message)
+                ),
+                should_cancel=job._cancel.is_set,
+            )
+        except AsrError as exc:
+            job._emit(JobEvent(JobKind.FAILED, message=str(exc)))
+        except Exception as exc:  # 外の部品の思わぬ失敗でアプリごと落とさない
+            job._emit(JobEvent(JobKind.FAILED, message=f"想定外の失敗: {exc}"))
+        else:
+            if turns is None:
+                job._emit(JobEvent(JobKind.CANCELLED, message="中断した"))
+            else:
+                people = len({turn.speaker for turn in turns})
+                job._emit(
+                    JobEvent(
+                        JobKind.DONE,
+                        ratio=1.0,
+                        message=f"{people} 人に分けた",
+                        speakers=turns,
                     )
                 )
         finally:

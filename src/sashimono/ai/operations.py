@@ -101,11 +101,13 @@ from sashimono.core.commands import (
     RemoveClips,
     RemoveMarkers,
     RemoveStroke,
+    RenameSpeaker,
     RippleCut,
     SetClipProperty,
     SetKeyframe,
     SetParam,
     SetResolution,
+    SetSegmentSpeaker,
     SetSegmentText,
     SetStrokeEnabled,
     SetTrackHeights,
@@ -1084,7 +1086,8 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     wanted = str(arguments.get("media_id") or "")
     wanted_audio = arguments.get("audio")
     contains = str(arguments.get("contains") or "")
-    compact = bool(arguments.get("compact", False))
+    wanted_speaker = str(arguments.get("speaker") or "")
+    compact = _flag_argument(arguments, "compact", False)
     one = str(arguments.get("segment_id") or "")
     try:
         text_offset = max(0, int(arguments.get("text_offset", 0) or 0))
@@ -1108,6 +1111,9 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         audio = _audio_number(media, subtitle.stream)
         if wanted_audio is not None and audio != int(wanted_audio):
             continue
+        speaker = subtitle.segment.speaker
+        if wanted_speaker and speaker != wanted_speaker:
+            continue
         rows.append(
             {
                 "segment_id": str(subtitle.segment.id),
@@ -1120,12 +1126,15 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "start_timecode": format_timecode(subtitle.start_frame, project.rate),
                 "source_start_seconds": round(float(subtitle.segment.start), 3),
             }
+            # 話者（#323）は付いている行だけ 分けていない作品の返事を長くしない
+            | ({"speaker": speaker} if speaker else {})
         )
     for row in rows:
         _clip_text(row, text_offset if one else None)
     if compact:
         rows = [
             {"n": index, "time": row["start_timecode"], "text": row["text"]}
+            | ({"speaker": row["speaker"]} if "speaker" in row else {})
             | ({"segment_id": row["segment_id"], "truncated": True} if "truncated" in row else {})
             for index, row in enumerate(rows)
         ]
@@ -2822,7 +2831,9 @@ def _set_track_state(host: EditorHost, arguments: dict[str, Any]) -> object:
     if track is None:
         raise ToolError(f"トラックが見つかりません: {track_id}（list_tracks で確かめてください）")
     changes: dict[str, bool] = {
-        name: bool(arguments[name]) for name in ("muted", "solo", "locked") if name in arguments
+        name: _flag_argument(arguments, name, False)
+        for name in ("muted", "solo", "locked")
+        if name in arguments
     }
     if not changes:
         raise ToolError("muted・solo・locked のどれかを指定してください")
@@ -3039,7 +3050,7 @@ def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _delete_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
-    ripple = bool(arguments.get("ripple", False))
+    ripple = _flag_argument(arguments, "ripple", False)
     members = _with_groups(host, (clip.id,))
     if len(members) > 1:
         # 1 本だけ消すと、画面で消したときと違って仲間が残る
@@ -3062,7 +3073,7 @@ def _move_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _delete_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     clip_ids = _with_groups(host, _target_clips(host, arguments))
-    ripple = bool(arguments.get("ripple", False))
+    ripple = _flag_argument(arguments, "ripple", False)
     command = RemoveClips(clip_ids, ripple=ripple)
     host.apply_commands([command], command.label)
     return {"deleted": [str(clip_id) for clip_id in clip_ids], "ripple": ripple}
@@ -3350,7 +3361,7 @@ def _move_stroke(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _set_stroke_enabled(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     stroke = _require_stroke(clip, str(arguments.get("stroke_id") or ""))
-    enabled = bool(arguments.get("enabled", True))
+    enabled = _flag_argument(arguments, "enabled", True)
     host.apply_commands([SetStrokeEnabled(clip.id, stroke.id, enabled)], "縁取りの入り切り")
     return {"stroke_id": str(stroke.id), "enabled": enabled}
 
@@ -3896,10 +3907,20 @@ def _place_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
     voices: list[Voice] | None = None
     if arguments.get("media_id"):
         media = _require_media(project, str(arguments["media_id"]))
+        voices = [v for v in subtitle_voices(project) if v.media_id == media.id]
         if arguments.get("audio") is not None:
-            voices = [(media.id, media.transcript_stream(_audio_stream(media, arguments)))]
-        else:
-            voices = [v for v in subtitle_voices(project) if v[0] == media.id]
+            stream = media.transcript_stream(_audio_stream(media, arguments))
+            voices = [v for v in voices if v.stream == stream]
+    speaker = str(arguments.get("speaker", "") or "")
+    if speaker:
+        # 話者（#323）で絞る 字幕に付いた名前（get_subtitles の speaker）と同じ名前
+        chosen = voices if voices is not None else subtitle_voices(project)
+        voices = [v for v in chosen if v.speaker == speaker]
+        if not voices:
+            raise ToolError(
+                f"話者「{speaker}」の字幕がタイムラインにありません get_subtitles の speaker で"
+                "名前を読めます"
+            )
     _no_explicit_null(arguments, "segment_ids")
     raw_segments = arguments.get("segment_ids")
     if raw_segments is not None and not isinstance(raw_segments, list):
@@ -3970,7 +3991,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     )
     silences = detect_silence(waveform, options)
     transcript = media.transcript_for(stream)
-    if bool(arguments.get("keep_speech", True)) and transcript is not None:
+    if _flag_argument(arguments, "keep_speech", True) and transcript is not None:
         silences = keep_speech(silences, transcript)
 
     # 省いた音（None）は 1 本目 そのまま渡すと plan_cuts は音で絞らず、別の位置へ置いた
@@ -4605,7 +4626,7 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
     stream = _audio_stream(media, arguments)
-    if media.transcript_for(stream) is not None and not bool(arguments.get("replace", False)):
+    if media.transcript_for(stream) is not None and not _flag_argument(arguments, "replace", False):
         # 黙って置き換えると、人が直した字幕まで消える 置き換えるかは頼む側が決める
         raise ToolError(
             f"{media.name} の音声 {_audio_number(media, stream)} には字幕があります"
@@ -4627,6 +4648,95 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _transcription_status(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     return {"status": host.transcription_status()}
+
+
+def _separate_speakers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕に話者を付ける（#323） 画面の〔話者を分ける…〕と同じ列で、裏で分ける
+
+    音は外へ送らない（この機械の sherpa-onnx で分ける） 送るのは始めた知らせだけ
+    """
+    from sashimono.asr.speakers import MAX_SPEAKERS
+    from sashimono.core.speakers import transcript_speakers
+
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None:
+        raise ToolError(
+            f"{media.name} の音声 {_audio_number(media, stream)} にはまだ字幕がありません"
+            " 先に transcribe で起こしてください"
+        )
+    # bool() で読むと文字の "false" が真になり、断るはずの分け直しで付け替えた名前を消す
+    if transcript_speakers(transcript) and not _flag_argument(arguments, "replace", False):
+        # 分け直すと人が付け替えた名前と直しが消える 分け直すかは頼む側が決める
+        raise ToolError(
+            f"{media.name} の音声 {_audio_number(media, stream)} の字幕には話者が付いています"
+            " 分け直すときは replace を true にしてください（付け替えた名前も消えます）"
+        )
+    count: int | None = None
+    if arguments.get("speakers") is not None:
+        # int() で読むと 2.7 が黙って 2 に、true が 1 になり、頼んだのと違う人数で分ける
+        # 省いたとき（None）は部品に人数を決めさせるので、既定の 2 は使わない
+        count = _within(arguments, "speakers", 2, 2, MAX_SPEAKERS)
+    try:
+        message = host.start_speaker_separation(media.id, audio_stream=stream, speakers=count)
+    except RuntimeError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "started": message,
+        "next": "しばらく待ってから transcription_status を見てください"
+        " 終わったら get_subtitles の speaker で誰の字幕かが分かります",
+    }
+
+
+def _subtitle_transcript(
+    project: Project, arguments: dict[str, Any]
+) -> tuple[MediaItem, int | None]:
+    """字幕を直す道具の、素材と音声 字幕が無ければ断る"""
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    if media.transcript_for(stream) is None:
+        raise ToolError(f"{media.name} の音声 {_audio_number(media, stream)} には字幕がありません")
+    return media, stream
+
+
+def _rename_speaker(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """話者の名前を付け替える 字幕パネルの右クリックの〔話者の名前を変える…〕と同じ"""
+    project = _project(host)
+    media, stream = _subtitle_transcript(project, arguments)
+    old = str(arguments.get("from", "") or "")
+    new = str(arguments.get("to", "") or "").strip()
+    if not old or not new:
+        raise ToolError("from（今の名前）と to（新しい名前）を渡してください")
+    command = RenameSpeaker(media.id, old, new, stream=stream)
+    try:
+        command.apply(project)
+    except (KeyError, ValueError) as exc:
+        raise ToolError(f"{exc} get_subtitles の speaker で今の名前を読めます") from exc
+    host.apply_commands([command], "話者の名前を変更")
+    return {"from": old, "to": new}
+
+
+def _set_subtitle_speaker(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕の行の話者を付け替える 字幕パネルの話者の列の書き換えと同じ"""
+    project = _project(host)
+    media, stream = _subtitle_transcript(project, arguments)
+    _no_explicit_null(arguments, "segment_ids")
+    raw = arguments.get("segment_ids")
+    if not isinstance(raw, list) or not raw:
+        raise ToolError(
+            "segment_ids に字幕の ID（get_subtitles の segment_id）の配列を渡してください"
+        )
+    segment_ids = tuple(SegmentId(s) for s in _string_items(raw, "segment_ids"))
+    speaker = str(arguments.get("speaker", "") or "").strip() or None
+    command = SetSegmentSpeaker(media.id, segment_ids, speaker, stream=stream)
+    try:
+        command.apply(project)
+    except (KeyError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    host.apply_commands([command], "話者を変更")
+    return {"changed": len(segment_ids), "speaker": speaker}
 
 
 #: 人が手で変えた段を AI が戻さないときの断り（2026-10-18 利用者の決定 #333）
@@ -4770,10 +4880,12 @@ def _add_scene(host: EditorHost, arguments: dict[str, Any]) -> object:
     name = str(arguments.get("name") or "").strip()
     if not name:
         raise ToolError("name にシーンの名前を指定してください")
+    # 足す前に読む 足した後に断ると、断ったのにシーンだけが増える
+    open_it = _flag_argument(arguments, "open", True)
     scene = new_scene(_project(host), name)
     # シーンの追加はどのタイムラインを開いていても同じ プロジェクトそのものへ足す
     host.apply_commands([AddScene(scene)], f"シーンを追加: {name}")
-    if bool(arguments.get("open", True)):
+    if open_it:
         host.set_active_scene(scene.id)
     return {"scene_id": str(scene.id), "name": name, "opened": host.active_scene == scene.id}
 
@@ -5661,13 +5773,17 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "タイムラインに出る字幕を、表示位置つきで一覧する 誤植を探すときは compact で"
             "行の番号・時刻・本文だけを読み、contains（言葉）や時刻で絞る 直すときは"
-            " replace_subtitle_text で「誤 → 正」をまとめて渡す" + PAGING_NOTE
+            " replace_subtitle_text で「誤 → 正」をまとめて渡す 話者を分けた字幕の行は"
+            " speaker（誰が話しているか）を持つ" + PAGING_NOTE
         ),
         schema=_schema(
             {
                 "media_id": _string("絞り込む素材"),
                 "audio": _integer("絞り込む音声の番号（1 から）"),
                 "contains": _string("本文に含む言葉で絞る（部分一致）"),
+                "speaker": _string(
+                    "話者の名前で絞る（行の speaker separate_speakers で付けた「話者 1」など）"
+                ),
                 "segment_id": _string(
                     "この 1 行だけ 長くて切り詰められた（truncated）行の全文を読む"
                 ),
@@ -6832,7 +6948,8 @@ OPERATIONS: tuple[Operation, ...] = (
         name="place_subtitles",
         description=(
             "字幕をテキストオブジェクトとしてタイムラインへ置く（焼き込み）"
-            " 話し手（素材と音声）ごとに別のレイヤーへ入れる 省けば出ている字幕を全部"
+            " 話し手（素材と音声と、separate_speakers で付けた話者）ごとに別のレイヤーへ入れる"
+            " 省けば出ている字幕を全部"
             " 見た目はひな形のテキストのクリップを写すか、保存したエイリアス・プリセット・"
             "テンプレートの棚から選んで着せる（本文と長さは字幕のまま 動きは字幕の長さに合わせる）"
             " どちらも省けば下寄せ・縁取りの既定 選べる物は list_looks で読める"
@@ -6841,6 +6958,7 @@ OPERATIONS: tuple[Operation, ...] = (
             {
                 "media_id": _string("絞り込む素材"),
                 "audio": _integer("絞り込む音声の番号（1 から） media_id と一緒に"),
+                "speaker": _string("絞り込む話者の名前（get_subtitles の speaker）"),
                 "segment_ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -7192,12 +7310,86 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="transcription_status",
         description=(
-            "字幕起こしの様子を見る 走っている物と順番待ちの物を並べる"
-            " 起こしは 1 本ずつ順に走り、終わった物はその素材と音声の字幕へ入る"
+            "字幕起こしと話者の分離の様子を見る 走っている物と順番待ちの物を並べる"
+            " 起こしと分離は 1 本ずつ順に走り、終わった物はその素材と音声の字幕へ入る"
         ),
         schema=_schema({}),
         handler=_transcription_status,
         sends=_WITH_FILES,
+    ),
+    # 話者の分離（#323） 画面では字幕パネルの〔話者を分ける…〕 分けるのはこの機械で、音は
+    # 外へ送らない（Outbound に音の区分が無いのはそのため） 結果は字幕の行の speaker に入り、
+    # 取り消し 1 回で外れる
+    Operation(
+        name="separate_speakers",
+        description=(
+            "字幕に、誰が話しているか（話者 1・話者 2 …）を付ける 対談や実況のように 1 本の音に"
+            "何人も入った素材で使う この機械で分け（音は外へ送らない）、終わるまで数分かかる"
+            " 起こしと同じ列で順に走る 様子は transcription_status 終わったら get_subtitles の"
+            " speaker で読め、place_subtitles は話者ごとに別のレイヤーへ置く 字幕 1 枚の途中で"
+            "話し手が替わるときは重なりの長い人を付ける 部品（話者の分離）が入っていなければ断る"
+            "（人に字幕パネルの〔話者を分ける…〕から入れてもらう）"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（先に transcribe で字幕を起こしておく）"),
+                "audio": _integer(
+                    "分ける音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                ),
+                "speakers": _integer("話す人の数（2 から 10） 分からなければ省く（自動で決める）"),
+                "replace": _boolean(
+                    "話者が付いた字幕を分け直す"
+                    "（既定 false 付いていれば断る 付け替えた名前も消える）"
+                ),
+            },
+            ["media_id"],
+        ),
+        handler=_separate_speakers,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
+        writes=True,
+    ),
+    Operation(
+        name="rename_speaker",
+        description=(
+            "話者の名前を付け替える（「話者 1」→ 人の名前） その素材と音声の同じ名前の字幕すべて"
+            " ほかの話者と同じ名前にすると 1 人にまとまる（1 人を 2 人に割ったときの直し方）"
+            " 焼き込みのレイヤーの名前にも出る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "audio": _integer("音声の番号（1 から） 省くと 1 本目"),
+                "from": _string("今の名前（get_subtitles の speaker）"),
+                "to": _string("新しい名前"),
+            },
+            ["media_id", "from", "to"],
+        ),
+        handler=_rename_speaker,
+        sends=_WITH_TEXT,
+        writes=True,
+    ),
+    Operation(
+        name="set_subtitle_speaker",
+        description=(
+            "字幕の行の話者を付け替える（分離が取り違えた行を直す） speaker を空にすると話者を外す"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "audio": _integer("音声の番号（1 から） 省くと 1 本目"),
+                "segment_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "付け替える字幕の ID（get_subtitles の segment_id）",
+                },
+                "speaker": _string("付ける話者の名前（空なら外す）"),
+            },
+            ["media_id", "segment_ids", "speaker"],
+        ),
+        handler=_set_subtitle_speaker,
+        sends=_WITH_TEXT,
+        writes=True,
     ),
     Operation(
         name="undo",
@@ -7308,7 +7500,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "scene_id": _string("書き出すシーン 省くとメイン（開いているシーンではない）"),
                 "codec": _string(
                     f"映像のコーデック {AUTO}（既定 使えなければ次の候補へ）か、"
-                    "h264_nvenc / h264_qsv / libx264 などこの機械で使える物"
+                    "h264_nvenc / h264_amf / h264_qsv / libx264 などこの機械で使える物"
                 ),
                 "bitrate_mbps": _integer(
                     f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps、"
