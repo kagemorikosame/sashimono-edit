@@ -138,7 +138,7 @@ from sashimono.core.commands import (
 )
 from sashimono.core.commands.edit import STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
-from sashimono.core.commands.insert import new_track, place_media
+from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
@@ -2847,7 +2847,7 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     at_frame = arguments.get("at_frame")
     commands = insert_media(
         project,
-        media,
+        _with_known_video_end(host, media),
         at_frame=int(at_frame) if at_frame is not None else None,
         split_audio=host.splits_media,
     )
@@ -2855,6 +2855,23 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError(f"{media.name} は長さが無いので置けません")
     host.apply_commands(commands, f"配置: {media.name}")
     return {"placed": media.name}
+
+
+def _with_known_video_end(host: EditorHost, media: MediaItem) -> MediaItem:
+    """素材一覧の素材を置く前に、古い作品の素材なら映像の終わりを開き直して添える
+
+    古い作品の素材は映像の終わりを持たず、そのまま置くと音の方が長い素材の絵を止めず、
+    書き出した動画の終わりが黒くなる（:func:`~sashimono.core.commands.insert.with_known_video_end`）
+    開けないときは今までどおり置く 道具ごと断ると、素材が見つからないだけで置けなくなる
+    """
+
+    def probe(path: Path) -> MediaItem | None:
+        try:
+            return host.probe(path)
+        except ToolError:
+            return None
+
+    return with_known_video_end([media], probe)[0]
 
 
 def _add_text(host: EditorHost, arguments: dict[str, Any]) -> object:

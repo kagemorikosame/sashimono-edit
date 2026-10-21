@@ -24,6 +24,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from sashimono.ai.operations import find_operation
+from sashimono.core.io.serialize import _media_from_json, _media_to_json
 from sashimono.core.model import Clip, LayerMode, MediaItem, Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import VideoDecoder, probe_media
@@ -240,3 +241,64 @@ def test_the_sound_is_not_cut(materials: dict[str, Path]) -> None:
     sounds = [c for t in project.timeline.audio_tracks() for c in t.clips]
     assert sounds
     assert all(clip.source_out(project.rate) >= Fraction(12, 5) for clip in sounds)
+
+
+def _old_media(path: Path) -> MediaItem:
+    """形式 4 の作品から読んだ素材 映像の終わり（``end_time``）を持たない
+
+    4 までの値は数え方が違うので読み捨てる（``_media_from_json``） 長さはコンテナの長さ
+    （音の終わり）なので、これだけ見て止めるかを決めると、音の方が長い素材を止めない
+    """
+    media = _media_from_json(_media_to_json(probe_media(path)), 4)
+    assert media.video_streams[0].end_time is None, "古い作品の素材に映像の終わりが残っている"
+    return media
+
+
+def _old_project(path: Path, mode: str) -> tuple[Project, MediaItem]:
+    """古い作品を開いた所 素材一覧にだけ素材があり、タイムラインは空"""
+    media = _old_media(path)
+    return Project.create(_settings(mode)).with_media((media,)), media
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("shape", ["longer", "barely"])
+def test_the_ai_placing_from_an_old_project_keeps_its_last_picture(
+    materials: dict[str, Path], shape: str, mode: str
+) -> None:
+    """古い作品の素材一覧から AI が置いた素材も、最後のコマに絵があること
+
+    古い作品の素材は映像の終わりを持たない 長さ（音の終わり）だけで止めるかを決めると
+    止めず、置き直した素材の終わりが黒く書き出される（#404 の Codex の指摘）
+    """
+    project, media = _old_project(materials[shape], mode)
+    host = _Host(project)
+    _call(host, "place_media", media_id=str(media.id))
+    _assert_tail_decodes(host.document.project)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("shape", ["longer", "barely"])
+@pytest.mark.parametrize("place", ["button", "drop"])
+def test_placing_from_an_old_project_on_screen_keeps_its_last_picture(
+    qt_application: QApplication, materials: dict[str, Path], shape: str, mode: str, place: str
+) -> None:
+    """古い作品の素材一覧から画面で置いた素材も、最後のコマに絵があること
+
+    一覧の「配置」とタイムラインへのドラッグは別の入口 片方だけ映像の終わりを取り直し
+    忘れると、そちらで置いた素材の終わりが黒く書き出される
+    """
+    del qt_application
+    project, media = _old_project(materials[shape], mode)
+    window = MainWindow(project, confirm_unsaved=False)
+    try:
+        if place == "button":
+            window._insert_media_by_id(str(media.id))
+        else:
+            window._on_media_dropped([str(media.id)], 0, "")
+        placed = window._document.project
+        _assert_tail_decodes(placed)
+        # 素材一覧の素材は書き換えない 書き換えるなら取り消せる形にする必要があり、
+        # 置いただけで一覧の中身が変わるのは本人の予想を外れる
+        assert placed.media == (media,), "置いたら素材一覧が書き換わった"
+    finally:
+        window.close()

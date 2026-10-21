@@ -49,7 +49,12 @@ from sashimono.core.commands.fixed import (
     takes_picture_items,
     with_fixed_items,
 )
-from sashimono.core.commands.insert import DEFAULT_GENERATED_FRAMES, held_at_end
+from sashimono.core.commands.insert import (
+    DEFAULT_GENERATED_FRAMES,
+    held_at_end,
+    lacks_video_end,
+    with_video_end,
+)
 from sashimono.core.commands.layers import active_layers, media_placements, places_mixed
 from sashimono.core.model import (
     AnimatedValue,
@@ -367,41 +372,11 @@ def gather_media(
                 continue
             commands.append(AddMedia(media))
             known[key] = media
-        elif raw in held and _lacks_video_end(media):
-            media = _with_video_end(media, probe(path))
+        elif raw in held and lacks_video_end(media):
+            media = with_video_end(media, probe(path))
             known[key] = media
         chosen[raw] = media
     return MediaPlan(commands=tuple(commands), media=chosen, missing=tuple(missing))
-
-
-def _lacks_video_end(media: MediaItem) -> bool:
-    """映像の道の終わりを持たない登録済みの素材か（道の終わりを記録する前の版で登録した物）"""
-    return (
-        bool(media.video_streams) and not media.is_still and media.video_streams[0].end_time is None
-    )
-
-
-def _with_video_end(media: MediaItem, fresh: MediaItem | None) -> MediaItem:
-    """登録済みの素材へ、開き直して取った映像の道の終わりを添える
-
-    絵を止める時刻（:func:`~sashimono.core.commands.insert.held_at_end`）を決めるためだけに
-    使う 無いままだとコンテナの長さで見るしかなく、音の方が長い素材（映像 2 秒・音 3 秒）では
-    止める時刻が映像の最後のフレームより後ろになり、止めた後もデコーダが毎フレーム終わり付近を読み直す
-    素材の ``id`` はそのまま残すので、クリップは登録済みの素材に結ばれる
-    プロジェクトの素材は書き換えない 書き換えるなら元に戻せるコマンドを通す必要があり、
-    テンプレートを置くだけで素材一覧が変わるのは本人の予想を外れる
-    長さも開き直した物に替える 版 4 までに覚えた長さはコンテナの頭から数えてあり、
-    映像より早く始まる音の前置きを含む 道の終わりが分からない素材は止める時刻を長さで
-    決めるので、古い長さのままだと映像の終わりより後ろを基準にして、止めるべき
-    クリップを止めない
-    開けないときは元のまま使う
-    """
-    if fresh is None:
-        return media
-    end = fresh.video_streams[0].end_time if fresh.video_streams else None
-    first, *rest = media.video_streams
-    duration = fresh.duration if fresh.duration > 0 else media.duration
-    return replace(media, duration=duration, video_streams=(replace(first, end_time=end), *rest))
 
 
 def place(
