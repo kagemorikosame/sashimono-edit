@@ -427,6 +427,59 @@ class TestScreenAnalyzer:
             reader.gate.set()
             analyzer.close()
 
+    def test_asking_again_after_it_decided_to_stop_is_not_lost(
+        self, tmp_path: Path, video: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、設定を切った直後に AI が頼み直したとき、仕事がもう止まると決めていれば
+        # 頼み直しが黙って消え、AI は「止まった」を受け取って何も読めない
+        # （PR #403 の CodeRabbit の指摘 止まると決めた後・後片付けの前に頼む順を作る）
+        reader = FakeReader()
+        reader.gate = threading.Event()
+        analyzer, _, _ = _make(tmp_path, reader=reader)
+        original = analyzer._is_cancelled
+        asked_again = threading.Event()
+
+        def deciding(key: tuple[MediaId, ScreenKind]) -> bool:
+            stopping = original(key)
+            if stopping and not asked_again.is_set():
+                # 仕事が止まると決めた所で、後片付けより先に頼み直しが来る
+                asked_again.set()
+                analyzer.request(video, ScreenKind.TEXT)
+            return stopping
+
+        monkeypatch.setattr(analyzer, "_is_cancelled", deciding)
+        try:
+            analyzer.request(video, ScreenKind.TEXT)
+            assert reader.blocked.wait(30)
+            analyzer.cancel()
+            reader.gate.set()
+            assert analyzer.wait(video.id, ScreenKind.TEXT, 30)
+            assert asked_again.is_set()
+            state = analyzer.state(video, ScreenKind.TEXT)
+            assert state.complete, state
+        finally:
+            reader.gate.set()
+            analyzer.close()
+
+    def test_a_removed_material_is_not_asked_again(self, tmp_path: Path, video: MediaItem) -> None:
+        # 壊れると、止める仕事の間に頼まれた素材を外しても、止まった後に調べ直して結果が戻る
+        reader = FakeReader()
+        reader.gate = threading.Event()
+        analyzer, _, _ = _make(tmp_path, reader=reader)
+        try:
+            analyzer.request(video, ScreenKind.TEXT)
+            assert reader.blocked.wait(30)
+            analyzer.cancel()
+            analyzer.request(video, ScreenKind.TEXT)
+            analyzer.forget(video.id)
+            reader.gate.set()
+            assert analyzer.wait(video.id, ScreenKind.TEXT, 30)
+            state = analyzer.state(video, ScreenKind.TEXT)
+            assert state.report is None and not state.running
+        finally:
+            reader.gate.set()
+            analyzer.close()
+
     def test_a_partial_result_is_readable_while_looking(
         self, tmp_path: Path, video: MediaItem
     ) -> None:

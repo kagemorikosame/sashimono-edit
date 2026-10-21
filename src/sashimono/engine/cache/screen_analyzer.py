@@ -135,6 +135,9 @@ class ScreenAnalyzer:
         self._failures: dict[_Key, str] = {}
         self._running: set[_Key] = set()
         self._cancelled: set[_Key] = set()
+        #: 止める印の付いた仕事が走っている間に、同じ鍵でまた頼まれた物 走っている仕事が
+        #: 止まった後に投げ直す
+        self._again: dict[_Key, MediaItem] = {}
         #: 作った調べる係 係のスレッドだけが触る onnxruntime の読み込みは 1 秒ほどかかるので、
         #: 素材ごとに作り直さない
         self._detectors: dict[tuple[ScreenKind, str], Detector] = {}
@@ -222,9 +225,12 @@ class ScreenAnalyzer:
             if self._closed or (held is not None and held[1].by_scene):
                 return
             if key in self._running:
-                # 止める頼み（設定を切った・素材を外した）の後にまた頼まれたら、走っている物を
-                # 生かし直す 止まるのを待ってから頼み直すと、AI が「止まった」を受け取って呼び直す
-                self._cancelled.discard(key)
+                # 止める頼み（設定を切った・素材を外した）の後にまた頼まれたら、走っている物が
+                # 止まった後に頼み直す（後片付けの :meth:`_run` が鍵を載せたまま投げ直す）
+                # 印を外して生かし直すだけだと、仕事がもう止まると決めた後では誰も調べ直さず、
+                # AI は「止まった」を受け取る（PR #403 の CodeRabbit の指摘 MediaAnalyzer と同じ形）
+                if key in self._cancelled:
+                    self._again[key] = media
                 return
             self._cancelled.discard(key)
             self._failures.pop(key, None)
@@ -261,6 +267,9 @@ class ScreenAnalyzer:
             for key in [key for key in self._failures if key[0] == media_id]:
                 del self._failures[key]
             self._cancelled.update(key for key in self._running if key[0] == media_id)
+            # 投げ直す約束も捨てる 外した素材を、止める仕事が終わった後に調べ直さない
+            for key in [key for key in self._again if key[0] == media_id]:
+                del self._again[key]
 
     def close(self) -> None:
         with self._lock:
@@ -268,6 +277,7 @@ class ScreenAnalyzer:
                 return
             self._closed = True
             self._cancelled.update(self._running)
+            self._again.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._changed.notify_all()
 
@@ -296,10 +306,17 @@ class ScreenAnalyzer:
             with self._lock:
                 stopped = self._closed or key in self._cancelled
                 self._cancelled.discard(key)
-                self._running.discard(key)
                 self._scans.pop(key, None)
-                if failure is not None and not stopped:
-                    self._failures[key] = failure
+                again = None if self._closed else self._again.pop(key, None)
+                if again is not None:
+                    # 鍵を ``_running`` に載せたまま投げ直す 1 度外すと、その間に待っている AI が
+                    # 「終わった」を受け取り、何も無い様子を読む
+                    self._failures.pop(key, None)
+                    self._executor.submit(self._run, again, kind, self._per_scene, self._ocr)
+                else:
+                    self._running.discard(key)
+                    if failure is not None and not stopped:
+                        self._failures[key] = failure
                 self._changed.notify_all()
 
     def _examine(self, media: MediaItem, kind: ScreenKind, per_scene: int, ocr: str) -> None:
