@@ -2276,11 +2276,14 @@ def _highlight_scenes(
     signal = state.signal
     if signal.broken:
         # 呼び直しても同じ所で止まる 待てば続きが出ると読ませない（場面の検出と同じ）
+        # それでも後ろは読めていないので完了とは言わない（場面の検出の complete も偽）
+        # 受け取った complete を返すと、波形があるときや動きだけを頼んだときに true になり、
+        # 読めなかった後ろに盛り上がりは無いと読ませる
         notes.append(
             f"素材が途中で壊れていて、動きは {round(signal.analyzed, 1)} 秒までしか見ていません"
             " 呼び直しても続きは出ません"
         )
-        return signal, complete
+        return signal, False
     if not signal.complete:
         notes.append(
             f"映像の解析の途中です 動きは {round(signal.analyzed, 1)} 秒まで見ました"

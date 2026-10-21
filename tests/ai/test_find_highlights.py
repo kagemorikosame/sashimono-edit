@@ -335,6 +335,23 @@ class TestWaiting:
         assert result["complete"] is False
         assert "3.0 秒" in result["note"]
 
+    @pytest.mark.parametrize("signals", [None, ["motion"]])
+    def test_a_broken_picture_is_not_complete(
+        self, host: FakeHost, signals: list[str] | None
+    ) -> None:
+        """映像が途中で壊れて読めた所までなら、波形があっても動きだけでも完了と言わない
+
+        壊れると、読めなかった後ろ半分に盛り上がりは無いと読ませる
+        """
+        _laughing(host)
+        media = _media(host)
+        broken = replace(_still(until=3.0, busy=(1.0, 2.5), complete=False), broken=True)
+        host.scene_states[media.id] = SceneState(broken, running=False)
+        result = _call(host, **({} if signals is None else {"signals": signals}))
+        assert result["complete"] is False
+        assert "壊れて" in result["note"]
+        assert "見つかりません" not in result["note"]
+
 
 class TestRefusals:
     def test_nothing_to_look_at_is_refused(
