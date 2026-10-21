@@ -14,7 +14,9 @@ import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from sashimono.ai.bridge import Approval, Question
+from sashimono.ai.budget import LimitAction, Limits
 from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, shelf_for
+from sashimono.ai.host import ToolError
 from sashimono.ai.operations import question_spec
 from sashimono.ai.outbound import Outbound, SendAnswer, SendRequest
 from sashimono.ai.session import LIMIT_DETAIL, AgentEvent, EventKind
@@ -23,8 +25,9 @@ from sashimono.core.model import MediaItem, Transcript
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.panel import HANDOFF_WHO
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.fake_clipboard import FakeClipboard
+from tests.ui.test_ai_budget import _call_in_thread, _poll_until
 from tests.ui.test_chat_panel import _ready, _RecordingSession
 
 
@@ -236,6 +239,57 @@ class TestEveryWayOfStopping:
         assert _shelved(widget) is None
         assert widget._handoff_box.isHidden() is True
         assert _logged(widget) == []
+
+
+class TestTheUsageLimit:
+    """アプリの使う量の上限（#344）で止めた指示も、上限の訳で引き継ぐ"""
+
+    def _over_the_limit(self, widget: ChatPanel) -> None:
+        """指示の中で切った後、尋ねずに止める設定でトークンの上限を使い切った所にする"""
+        _send(widget, "冒頭を切って")
+        _cut_twice(widget)
+        allow_sending(widget._bridge)
+        widget._bridge.usage.limits = Limits(turn_tokens=100, action=LimitAction.STOP)
+        widget._bridge.usage.record_message("m", {"output_tokens": 100})
+
+    def _call_refused(self, widget: ChatPanel) -> None:
+        done, box = _call_in_thread(widget, "get_selection")
+        _poll_until(widget, done.is_set)
+        assert isinstance(box.get("error"), ToolError)
+
+    def test_a_usage_limit_hands_off(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、使う量の上限で止めた指示は AI が言葉で締めるだけなので「完了」扱いになり、
+        # 何を変えて何をやり残したかの要約が人に届かない
+        widget, _ = recorded
+        self._over_the_limit(widget)
+        self._call_refused(widget)
+        widget._handle(AgentEvent(EventKind.TEXT, text="上限なのでここまでにします"))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert handoff.reason is StopReason.LIMIT
+        assert "トークン" in handoff.detail
+        assert handoff.changes == ("分割", "分割")
+
+    def test_halting_after_the_limit_is_not_a_person_interrupt(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、上限で止めた後も道具を呼び続けたのでアプリが会話を止めたのに、引き継ぎに
+        # 「人が〔中断〕を押しました」と書かれ、止めた訳（上限）が隠れる
+        widget, _ = recorded
+        self._over_the_limit(widget)
+        while not widget._bridge.wants_halt:
+            self._call_refused(widget)
+        widget._poll()
+        assert widget._halted is True
+        widget._handle(AgentEvent(EventKind.ERROR, text="ToolError: 中断されました"))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert handoff.reason is StopReason.LIMIT
+        assert "中断を押しました" not in handoff.text()
 
 
 class TestTheBox:

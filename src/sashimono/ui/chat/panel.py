@@ -1688,6 +1688,9 @@ class ChatPanel(QWidget):
             # 上限で止めた指示を「完了」と書くと、頼んだことが全部済んだと読める
             # 止めた後も道具を呼び続けて会話ごと止めた（中断）ときも、止めた訳は上限
             outcome = "上限で停止"
+            # 引き継ぎ（#346）にも上限の訳で渡す AI は止めた訳を聞いて言葉で締めるだけなので、
+            # ここで書かないと「完了」扱いになり、何をやり残したかの要約が人に届かない
+            self._record.stop(StopReason.LIMIT, stopped.text())
         counts = f"操作 {self._turn_tools} 件"
         if self._turn_failures:
             counts += f"・失敗 {self._turn_failures} 件"
@@ -1716,7 +1719,9 @@ class ChatPanel(QWidget):
         切れた・部品が古い・環境が使えない）はどれも区切りの行を通るので、ここ 1 か所で拾える
         段がまだ開いていれば（区切りの行を先に足す道）、変えた手をここで履歴から写す
         """
-        if self._stopping:
+        if self._stopping and not self._halted:
+            # 上限で止めた後も道具を呼び続けたのでアプリが会話を止めた（#344）ときは、人の中断と
+            # 書かない 中断は訳の中で一番強く、上限の訳を隠して人が止めたように読める
             self._record.stop(StopReason.INTERRUPTED, "人が〔中断〕を押しました")
         document = self._host.document
         if self._checkpoint_open:
