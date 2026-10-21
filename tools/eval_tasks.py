@@ -79,6 +79,26 @@ TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT)
 #: 正解を持つ課題 下書きと取り込みはこれだけ
 ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES)
 
+#: 結果の行の段 道具の段だけ AI の段を作るときにここへ足す
+STAGES = ("tools",)
+#: 結果の行の状態
+STATUSES = ("ok", "skipped", "failed")
+#: 数えなかった理由 結果の行の ``reason`` はこの中の物だけを書ける
+#: 段・課題・状態・理由は名前の照らしを外している（年のフォルダや export のフォルダに当たるため）
+#: 決まった値だけに絞らないと、将来ここへ例外の文や素材から来る文字を入れたときに、
+#: 名前の照らしをすり抜けて素材の名前が公開のリポジトリへ載る
+#: docs/evaluation.md の「状態と理由」の表と同じ物を並べる（試験が食い違いを見る）
+REASONS = (
+    "no-material",
+    "no-answer",
+    "no-tool",
+    "asr-missing",
+    "asr-error",
+    "export-error",
+    "tool-error",
+    "answer-error",
+)
+
 #: 課題の定義と、結果を足していく所（どちらもリポジトリの中）
 TASKS_FILE = ROOT / "eval" / "tasks.json"
 RESULTS_FILE = ROOT / "eval" / "results" / "tools.jsonl"
@@ -702,6 +722,16 @@ def guard_record(record: Mapping[str, object], names: Sequence[str]) -> None:
     unknown = set(record) - _RECORD_KEYS
     if unknown:
         raise LeakError(f"知らない鍵がある: {sorted(unknown)}")
+    # 名前を照らさない鍵のうち、台本が決まった値しか書かない物は、その一覧で絞る
+    # 値そのものは出さない 素材の名前が混じっていたら、それを画面に出すことになる
+    for key, allowed in (
+        ("stage", STAGES),
+        ("task", TASKS),
+        ("status", STATUSES),
+        ("reason", REASONS),
+    ):
+        if key in record and record[key] not in allowed:
+            raise LeakError(f"{key} が決まった値の一覧に無い")
     for key, value in record.items():
         # 道具が自分で作る値は、形の決まりだけを見て名前は照らさない（下の _OWN_KEYS）
         # 中の鍵（metrics と params の数の名前）もコードが決めた名前なので同じ扱いにする

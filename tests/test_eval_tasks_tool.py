@@ -353,6 +353,43 @@ def test_guard_refuses_names_and_free_text(tool: ModuleType, tmp_path: Path) -> 
     assert len(tool.read_results(results)) == 1
 
 
+def test_reason_and_status_outside_the_list_are_refused(tool: ModuleType, tmp_path: Path) -> None:
+    """理由・状態・段・課題が台本の決まった値の一覧に無ければ、1 行も書かずに止まること
+
+    これらは名前の照らしを外しているので、一覧で絞らないと、将来ここへ例外の文や素材から
+    来る文字を入れたときに素材の名前が公開のリポジトリへ載る
+    """
+    results = tmp_path / "out.jsonl"
+    good = {"material": "E01", "task": "scenes", "status": "ok", "stage": "tools"}
+    tool.append_results(results, [{**good, "status": "skipped", "reason": "no-answer"}], [])
+    for bad in (
+        {"reason": "FileNotFoundError"},
+        {"reason": "E01clip"},
+        {"status": "done"},
+        {"stage": "secret"},
+        {"task": "clip2026"},
+    ):
+        with pytest.raises(tool.LeakError) as caught:
+            tool.append_results(results, [good, {**good, **bad}], [])
+        assert str(next(iter(bad.values()))) not in str(caught.value)
+    assert len(tool.read_results(results)) == 1
+
+
+def test_reason_list_matches_the_docs(tool: ModuleType) -> None:
+    """docs/evaluation.md の「状態と理由」の表と、台本の一覧が同じであること
+
+    食い違うと、結果の行に出た理由を表で引けないか、表にある理由を書こうとして止まる
+    """
+    text = (ROOT / "docs" / "evaluation.md").read_text(encoding="utf-8")
+    section = text.split("### 状態と理由", 1)[1].split("\n#", 1)[0]
+    rows = [line.split("|") for line in section.splitlines() if line.startswith("| `")]
+    documented = {(cells[2].strip(), cells[1].strip().strip("`")) for cells in rows}
+    expected = {("状態", value) for value in tool.STATUSES} | {
+        ("理由", value) for value in tool.REASONS
+    }
+    assert documented == expected
+
+
 def test_torn_last_result_line_is_skipped_and_mended(
     tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
