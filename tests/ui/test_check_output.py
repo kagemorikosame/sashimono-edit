@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -19,9 +18,7 @@ from typing import Any
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
-from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import (
     AddClip,
     AddScene,
@@ -50,8 +47,8 @@ from sashimono.engine.gpu import GLContextError
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import allow_sending
 from tests.check_media import HEIGHT, WIDTH, tone, write_tone, write_video
+from tests.ui.ai_tool_calls import call_tool
 
 
 @pytest.fixture(autouse=True)
@@ -163,37 +160,9 @@ def _window(opened: list[MainWindow], project: Project) -> MainWindow:
     return window
 
 
-def _call(window: MainWindow, arguments: dict[str, Any], *, timeout: float = 120.0) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ 画面のスレッドは仕事を拾い続ける
-
-    本物の AI と同じ道を通す 道具は画面のスレッドで動き、待つのは AI のスレッド
-    """
-    operation = find_operation("check_output")
-    assert operation is not None
-    # 送る物の確かめ（#342）は tests/ui/test_send_consent.py が見る ここは検査の道筋だけを見る
-    bridge = allow_sending(EditorBridge(window, auto_approve=False))
-    box: dict[str, Any] = {}
-
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + timeout
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+def _call(window: MainWindow, arguments: dict[str, Any]) -> Any:
+    """完成物の検査を本物の AI と同じ道で呼ぶ（待ちの上限は tests/ui/ai_tool_calls.py）"""
+    return call_tool(window, "check_output", arguments)
 
 
 def _kinds(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
