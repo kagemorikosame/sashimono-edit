@@ -185,6 +185,99 @@ def test_one_failing_task_keeps_the_other_results(
     assert "secretclip" not in text and "evaldir" not in text and "失敗" not in text
 
 
+def test_unreadable_material_keeps_the_other_results(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """素材が無い・読めない・正解が壊れていても、その素材を飛ばしてほかの素材の行を残すこと
+
+    落ちると、外付けのドライブを外した・素材の名前を変えたといった 1 本の事情で、
+    同じ回のほかの素材の結果まで 1 行も残らず、下書きも途中の素材で止まる
+    """
+    tool, eval_dir, book = folder
+    tool.command_draft(eval_dir, book, [], transcriber=_fake_transcriber)
+    manifest = eval_dir.manifest()
+    results = tmp_path / "results.jsonl"
+
+    def run() -> dict[tuple[str, str], Any]:
+        records = tool.command_run(
+            eval_dir,
+            book,
+            [],
+            results=results,
+            transcriber=_fake_transcriber,
+            exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
+            commit="abc",
+        )
+        return {(r["material"], r["task"]): r for r in records}
+
+    # 素材の名前を変えた（対応表には残っている）
+    moved = manifest["E01"].with_name("moved.mp4")
+    manifest["E01"].rename(moved)
+    rows = run()
+    assert (rows["E01", "scenes"]["status"], rows["E01", "scenes"]["reason"]) == (
+        "skipped",
+        "no-material",
+    )
+    assert rows["E02", "silence"]["status"] == "ok"
+    moved.rename(manifest["E01"])
+
+    # 素材はあるが読めない（壊れた動画）
+    original = manifest["E01"].read_bytes()
+    manifest["E01"].write_bytes(b"not a video")
+    rows = run()
+    assert (rows["E01", "scenes"]["status"], rows["E01", "scenes"]["reason"]) == (
+        "failed",
+        "tool-error",
+    )
+    assert rows["E02", "silence"]["status"] == "ok"
+    # 下書きも、読めない素材だけを飛ばしてほかの素材は作る
+    made = tool.command_draft(eval_dir, book, [], force=True, transcriber=_fake_transcriber)
+    assert "E02 silence" in made and not any(item.startswith("E01") for item in made)
+    manifest["E01"].write_bytes(original)
+
+    # 正解のファイルが壊れた 下書きは上書きせずに残す
+    broken = eval_dir.answer_path("E01")
+    broken.write_text("{", encoding="utf-8")
+    rows = run()
+    assert (rows["E01", "scenes"]["status"], rows["E01", "scenes"]["reason"]) == (
+        "failed",
+        "answer-error",
+    )
+    tool.command_draft(eval_dir, book, [], force=True, transcriber=_fake_transcriber)
+    assert broken.read_text(encoding="utf-8") == "{"
+    text = results.read_text(encoding="utf-8")
+    assert "secretclip" not in text and "moved" not in text
+
+
+def test_answer_survives_a_crash_while_writing(
+    folder: tuple[ModuleType, Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """正解を書く途中で落ちても、前の正解がそのまま読めること
+
+    落ちると、本人が数時間かけて直した正解（同じファイルに入っている）が切れたファイルになり、
+    次の回から読めなくなる
+    """
+    _, eval_dir, _ = folder
+    before = {"material": "E01", "tasks": {"scenes": {"provisional": False, "cuts": [1.0]}}}
+    eval_dir.write_answer("E01", before)
+
+    def torn_write(self: Path, text: str, *args: Any, **kwargs: Any) -> int:
+        # 書き始めて半分で落ちた形 その場で上書きする書き方だと、ここで前の中身が消える
+        with self.open("w", encoding="utf-8") as file:
+            file.write(text[: len(text) // 2])
+        raise OSError("書く途中で落ちた")
+
+    def failed_replace(self: Path, target: Any) -> Path:
+        raise OSError("置き換える前に落ちた")
+
+    monkeypatch.setattr(Path, "write_text", torn_write)
+    monkeypatch.setattr(Path, "replace", failed_replace)
+    with pytest.raises(OSError):
+        eval_dir.write_answer("E01", {"material": "E01", "tasks": {}})
+    monkeypatch.undo()
+    assert eval_dir.read_answer("E01") == before
+
+
 def test_failed_transcription_is_not_retried(
     folder: tuple[ModuleType, Any, Any], tmp_path: Path
 ) -> None:

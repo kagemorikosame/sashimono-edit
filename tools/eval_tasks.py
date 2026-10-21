@@ -54,6 +54,7 @@ from sashimono import __version__  # noqa: E402
 from sashimono.core.commands import AddMarkers, Document, RippleCut, SetTranscript  # noqa: E402
 from sashimono.core.commands.insert import insert_media  # noqa: E402
 from sashimono.core.io import load_project, save_project  # noqa: E402
+from sashimono.core.io.atomic import write_atomic  # noqa: E402
 from sashimono.core.jetcut import plan_cuts  # noqa: E402
 from sashimono.core.model import (  # noqa: E402
     Clip,
@@ -229,9 +230,11 @@ class EvalDir:
         return loaded
 
     def write_answer(self, material: str, answer: Mapping[str, Any]) -> None:
+        # その場で上書きすると、書く途中で落ちたときに切れたファイルが残り、本人が数時間かけて
+        # 直した正解（同じファイルに入っている）まで読めなくなる 作り直せないので fsync もする
         self.answers.mkdir(parents=True, exist_ok=True)
         text = json.dumps(answer, ensure_ascii=False, indent=1)
-        self.answer_path(material).write_text(text + "\n", encoding="utf-8")
+        write_atomic(self.answer_path(material), text + "\n", durable=True)
 
 
 def eval_dir(argument: str | None) -> EvalDir:
@@ -933,6 +936,38 @@ def score(
     return subtitle_scores(value["segments"], answer["segments"], tolerances.subtitle_seconds)
 
 
+@dataclass(frozen=True, slots=True)
+class Opened:
+    """素材 1 本の下ごしらえ ``reason`` が空でなければ、その素材の課題はどれも数えない"""
+
+    answer: dict[str, Any]
+    facts: MediaFacts
+    reason: str = ""
+
+
+def open_material(folder: EvalDir, material: str, path: Path | None) -> Opened:
+    """正解を読み、素材の長さと fps を測る 失敗しても止めず、固定の理由を返す
+
+    ここで止めると、外付けのドライブを外した・素材の名前を変えた・正解のファイルが壊れた
+    といった 1 本の事情で、同じ回のほかの素材の結果まで 1 行も残らない
+    例外の文には置き場が混じりうるので、画面には型の名前だけを出す
+    """
+    empty = MediaFacts(0.0, 0.0)
+    if path is None or not path.is_file():
+        return Opened({"material": material, "tasks": {}}, empty, "no-material")
+    try:
+        answer = folder.read_answer(material)
+    except Exception as error:
+        print(f"{material}: 正解を読めなかった（{type(error).__name__}）")
+        return Opened({"material": material, "tasks": {}}, empty, "answer-error")
+    try:
+        facts = media_facts(path)
+    except Exception as error:
+        print(f"{material}: 素材を読めなかった（{type(error).__name__}）")
+        return Opened(answer, empty, "tool-error")
+    return Opened(answer, facts)
+
+
 def command_draft(
     folder: EvalDir,
     book: TaskBook,
@@ -955,8 +990,12 @@ def command_draft(
         if path is None:
             print(f"{material.id}: 対応表に無いので飛ばす")
             continue
-        answer = folder.read_answer(material.id)
-        facts = media_facts(path)
+        opened = open_material(folder, material.id, path)
+        if opened.reason:
+            # 正解が読めないまま書くと、本人が直した正解を空の正解で上書きしてしまう
+            print(f"{material.id}: 下書きを作らずに飛ばす（{opened.reason}）")
+            continue
+        answer, facts = opened.answer, opened.facts
         answer.update({"material": material.id, "duration": facts.duration, "fps": facts.fps})
         tasks: dict[str, Any] = answer.setdefault("tasks", {})
         silences: list[tuple[float, float]] | None = None
@@ -970,18 +1009,27 @@ def command_draft(
             if existing is not None and not force:
                 print(f"{material.id} {task}: 仮の正解があるので飛ばす（作り直すなら --force）")
                 continue
-            if task == TALK:
-                silences = silences if silences is not None else find_silences(path, resolved)
-                value: dict[str, Any] | None = {"boundaries": talk_from_silences(silences)}
-            else:
-                value = predict(task, path, resolved, transcriber, facts).value
-            if value is None:
-                print(f"{material.id} {task}: 道具が使えないので下書きを作れない（字幕起こし）")
+            # 1 つの課題の道具が落ちても、同じ素材のほかの課題とあとの素材の下書きは作る
+            # 止めると、それまでに作った仮の正解もこの素材の分は書かれずに消える
+            try:
+                if task == TALK:
+                    if silences is None:
+                        silences = find_silences(path, resolved)
+                    value: dict[str, Any] | None = {"boundaries": talk_from_silences(silences)}
+                else:
+                    value = predict(task, path, resolved, transcriber, facts).value
+                if value is None:
+                    print(f"{material.id} {task}: 道具が使えないので下書きを作れない（字幕起こし）")
+                    continue
+                draft = {"provisional": True, "source": "draft", **value}
+                folder.drafts.mkdir(parents=True, exist_ok=True)
+                project = draft_project(path, material.id, task, with_facts(draft, answer))
+                save_project(project, folder.draft_path(material.id, task))
+            except Exception as error:
+                print(f"{material.id} {task}: 下書きを作れなかった（{type(error).__name__}）")
                 continue
-            tasks[task] = {"provisional": True, "source": "draft", **value}
-            folder.drafts.mkdir(parents=True, exist_ok=True)
-            project = draft_project(path, material.id, task, with_facts(tasks[task], answer))
-            save_project(project, folder.draft_path(material.id, task))
+            # 直す用の .sme を置けてから正解へ足す 先に足すと、直す物の無い仮の正解が残る
+            tasks[task] = draft
             made.append(f"{material.id} {task}")
             print(f"{material.id} {task}: 仮の正解を作った")
         folder.write_answer(material.id, answer)
@@ -1059,15 +1107,17 @@ def command_run(
     records: list[dict[str, object]] = []
     for material in _materials(book, chosen):
         path = manifest.get(material.id)
-        answer = folder.read_answer(material.id)
-        facts = media_facts(path) if path is not None else MediaFacts(0.0, 0.0)
+        opened = open_material(folder, material.id, path)
+        answer, facts = opened.answer, opened.facts
         # 字幕と書き出しの両方を持つ素材で、字幕起こしを 2 回走らせない（長い素材で数分かかる）
         once = _remembered(transcriber)
         for task in material.tasks:
             record: dict[str, object] = {**stamp, "material": material.id, "task": task}
             truth = answer.get("tasks", {}).get(task)
-            if path is None:
-                record.update(status="skipped", reason="no-material")
+            if path is None or opened.reason:
+                # 素材が無いのは数える前の事情なので飛ばした扱い 読めなかったのは失敗
+                status = "skipped" if opened.reason == "no-material" else "failed"
+                record.update(status=status, reason=opened.reason)
                 records.append(record)
                 continue
             # 1 つの課題の失敗（GPU の無い機械の書き出し・検査の時間切れ・字幕起こしの部品の
