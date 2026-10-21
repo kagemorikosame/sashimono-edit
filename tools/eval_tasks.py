@@ -714,15 +714,73 @@ def append_results(
     for record in records:
         guard_record(record, names)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _mend_tail(path)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         for record in records:
             file.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
 
 
+class BrokenResultsError(RuntimeError):
+    """結果のファイルの途中の行が読めない 書く途中で切れたのではないので、直すまで読まない"""
+
+
+def _parse_results(text: str) -> tuple[list[dict[str, Any]], int | None]:
+    """結果の行を読む 最後の行が切れていれば、その行の頭の位置（文字）を添えて返す
+
+    足して書く途中で落ちると、最後の行だけが切れて残る その 1 行のために全部を読めなくすると、
+    report も次の run も止まり、それまでの回の数が見られなくなる 途中の行が壊れているのは
+    切れたのではない（手で書き換えた・ほかの物が書いた）ので、黙って飛ばさずに止める
+    行の中身は出さない 素材の名前や置き場が混じっているかもしれない
+    """
+    rows: list[dict[str, Any]] = []
+    lines = text.splitlines(keepends=True)
+    filled = [index for index, line in enumerate(lines) if line.strip()]
+    for index in filled:
+        try:
+            rows.append(json.loads(lines[index]))
+        except json.JSONDecodeError:
+            if index != filled[-1]:
+                raise BrokenResultsError(
+                    f"結果のファイルの {index + 1} 行目が読めない（途中の行が壊れている）"
+                ) from None
+            return rows, sum(len(line) for line in lines[:index])
+    return rows, None
+
+
+def _mend_tail(path: Path) -> None:
+    """足して書く前に、切れた最後の行を外し、改行で終わっていなければ改行を足す
+
+    改行を足さずに書くと、切れた行と新しい行が 1 行につながって新しい行まで読めなくなる
+    切れた行は、改行を足すだけだと次からは途中の壊れた行になって読めなくなるので外す
+    （切れた行は JSON として読めず、数を取り出せないので、外しても失う物は無い）
+    途中の行が壊れていれば、その上に足さずに止める
+    """
+    if not path.exists():
+        return
+    text = _raw_text(path)
+    _, torn = _parse_results(text)
+    if torn is not None:
+        print("結果のファイルの最後の切れた行を外してから足す")
+        with path.open("r+b") as file:
+            file.truncate(len(text[:torn].encode("utf-8")))
+    elif text and not text.endswith("\n"):
+        with path.open("a", encoding="utf-8", newline="\n") as file:
+            file.write("\n")
+
+
+def _raw_text(path: Path) -> str:
+    """改行を読み替えずに読む 読み替えると、切れた行の頭の位置がファイルの位置とずれる"""
+    with path.open(encoding="utf-8", newline="") as file:
+        return file.read()
+
+
 def read_results(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    rows, torn = _parse_results(_raw_text(path))
+    if torn is not None:
+        print("結果のファイルの最後の行が切れていたので 1 行飛ばした")
+    return rows
 
 
 def current_commit() -> str:
@@ -1096,6 +1154,9 @@ def command_run(
     """道具の段を回して正解と比べ、結果を足す 足した行を返す"""
     resolved = params or ToolParams()
     export = exporter if exporter is not None else export_and_check
+    # 途中の行が壊れた結果のファイルには足せない 道具を数分走らせてから止まらないように先に見る
+    if results.exists():
+        _parse_results(_raw_text(results))
     manifest = folder.manifest()
     names = forbidden_names(folder, manifest)
     stamp = {
@@ -1227,7 +1288,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     tool_options(run)
     sub.add_parser("report", help="前回との差を出す")
     arguments = parser.parse_args(argv)
+    try:
+        return _dispatch(arguments)
+    except BrokenResultsError as error:
+        # 行の番号だけを出す 例外の流れ（Traceback）を見せても直す手がかりは増えない
+        print(error)
+        return 1
 
+
+def _dispatch(arguments: argparse.Namespace) -> int:
     if arguments.command == "report":
         print("\n".join(report_lines(read_results(RESULTS_FILE))))
         return 0

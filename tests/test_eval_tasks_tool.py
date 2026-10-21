@@ -351,6 +351,60 @@ def test_guard_refuses_names_and_free_text(tool: ModuleType, tmp_path: Path) -> 
     assert len(tool.read_results(results)) == 1
 
 
+def test_torn_last_result_line_is_skipped_and_mended(
+    tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """結果を足す途中で落ちて最後の行が切れても、前の回の行が読め、次に足した行も読めること
+
+    落ちると、切れた 1 行のために report も次の run も止まり、それまでの回の数が見られなくなる
+    切れた行に次の行をつなげて書くと、新しく数えた行まで読めなくなる
+    """
+    results = tmp_path / "out.jsonl"
+    good = {"material": "E01", "task": "scenes", "status": "ok", "metrics": {"f1": 1.0}}
+    tool.append_results(results, [good, good], [])
+    whole = results.read_text(encoding="utf-8")
+    results.write_text(whole + whole[:25], encoding="utf-8", newline="\n")
+    assert len(tool.read_results(results)) == 2
+    assert "1 行飛ばした" in capsys.readouterr().out
+    tool.append_results(results, [good], [])
+    assert len(tool.read_results(results)) == 3
+    assert "飛ばした" not in capsys.readouterr().out
+    # 切れてはいないが改行で終わらない最後の行も、次の行とつながらない
+    results.write_text(whole.rstrip("\n"), encoding="utf-8", newline="\n")
+    tool.append_results(results, [good], [])
+    assert len(tool.read_results(results)) == 3
+
+
+def test_broken_middle_result_line_stops_with_its_number(
+    tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """途中の行が壊れた結果は、行の番号だけを出して止まり、上に足さないこと
+
+    黙って飛ばすと、手で書き換えた・ほかの物が書いた壊れに気付かず、前回との差を取り違える
+    行の中身を出すと、素材の名前や置き場が画面や記録に出るかもしれない
+    """
+    results = tmp_path / "out.jsonl"
+    good = {"material": "E01", "task": "scenes", "status": "ok", "metrics": {"f1": 1.0}}
+    tool.append_results(results, [good], [])
+    line = results.read_text(encoding="utf-8")
+    broken = line + "{secretclip\n" + line
+    results.write_text(broken, encoding="utf-8", newline="\n")
+    with pytest.raises(tool.BrokenResultsError, match="2 行目") as caught:
+        tool.read_results(results)
+    assert "secretclip" not in str(caught.value)
+    with pytest.raises(tool.BrokenResultsError):
+        tool.append_results(results, [good], [])
+    assert results.read_text(encoding="utf-8") == broken
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool, "RESULTS_FILE", results)
+    try:
+        assert tool.main(["report"]) == 1
+    finally:
+        monkey.undo()
+    shown = capsys.readouterr().out
+    assert "2 行目" in shown and "secretclip" not in shown
+
+
 def test_forbidden_names_cover_folders(tool: ModuleType, tmp_path: Path) -> None:
     """照らす名前に、素材のファイル名と置き場のフォルダ名が入ること
 
