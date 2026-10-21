@@ -195,6 +195,7 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
+    heard_stream,
 )
 from sashimono.core.projection import heard_timeline, project_timeline
 from sashimono.core.seams import (
@@ -2206,7 +2207,17 @@ def _highlight_result(
     if query.order == "score":
         found.sort(key=lambda item: (-item.score, item.start))
     project = _project(host)
-    rows = [_highlight_row(project, media, item, looked) for item in found]
+    # 区間を探したのと同じ絵と音を出すクリップの位置だけを返す 別の映像や別の音声の
+    # クリップを混ぜると、preview_range で見せる所に探した盛り上がりが無い
+    sources = _HighlightSources(
+        video=_video_stream(media, scenes.stream)
+        if scenes is not None and HIGHLIGHT_MOTION in looked
+        else None,
+        audio=media.transcript_stream(query.audio)
+        if any(name in looked for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD))
+        else None,
+    )
+    rows = [_highlight_row(project, media, item, looked, sources) for item in found]
     common: dict[str, Any] = {
         "media_id": str(media.id),
         "signals": looked,
@@ -2272,8 +2283,20 @@ def _highlight_scenes(
     return signal, complete
 
 
+@dataclass(frozen=True, slots=True)
+class _HighlightSources:
+    """区間を探した絵と音のストリーム（素材の中の ``index``） 調べていない側は ``None``"""
+
+    video: int | None
+    audio: int | None
+
+
 def _highlight_row(
-    project: Project, media: MediaItem, item: Highlight, looked: list[str]
+    project: Project,
+    media: MediaItem,
+    item: Highlight,
+    looked: list[str],
+    sources: _HighlightSources,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "start_seconds": item.start,
@@ -2291,16 +2314,25 @@ def _highlight_row(
             row[name] = value
     if item.laughter_from_subtitles:
         row["laughter_from_subtitles"] = True
-    row["timeline"] = _highlight_places(project, media, item)
+    row["timeline"] = _highlight_places(project, media, item, sources)
     return row
 
 
-def _highlight_places(project: Project, media: MediaItem, item: Highlight) -> list[dict[str, Any]]:
+def _highlight_places(
+    project: Project, media: MediaItem, item: Highlight, sources: _HighlightSources
+) -> list[dict[str, Any]]:
     """区間が出る今のタイムラインの範囲（フレーム） 頂の絵が出るフレームも添える
 
     絵のクリップも音のクリップも見る 笑い声と音量は音のクリップにしか無いことがある
     リンクした絵と音は同じ範囲になるので 1 つにまとめる（同じ範囲が 2 行並ぶと、AI が
     2 か所あると読む）
+
+    絵は動きを調べた映像（``sources.video``）を描くクリップ、音は笑い声と音量を調べた音声
+    （``sources.audio``）を鳴らすクリップだけを数える（場面の検出の :func:`_scene_places` と
+    同じ訳） 鳴らす音声は :func:`heard_stream` で引く 混合トラックの ``stream_index`` は
+    絵の番号なので、それで比べると違う言語の音のクリップを返す 絵を止めた
+    （``hold_at``）クリップは止めた時刻までしか絵が進まないので、絵の範囲はそこで切る
+    音は止めないので切らない
     """
     rate = project.rate
     start, end, peak = (Fraction(str(value)) for value in (item.start, item.end, item.peak))
@@ -2311,6 +2343,21 @@ def _highlight_places(project: Project, media: MediaItem, item: Highlight) -> li
                 continue
             low = max(start, clip.source_in)
             high = min(end, clip.source_out(rate))
+            hears = (
+                sources.audio is not None
+                and project.plays_sound(track, clip)
+                and media.transcript_stream(heard_stream(track, clip)) == sources.audio
+            )
+            if not hears:
+                draws = (
+                    sources.video is not None
+                    and project.draws_picture(track, clip)
+                    and _video_stream(media, clip.stream_index) == sources.video
+                )
+                if not draws:
+                    continue
+                if clip.hold_at is not None:
+                    high = min(high, clip.hold_at)
             if low >= high:
                 continue
             first = clip.timeline_start + seconds_to_frame(

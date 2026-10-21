@@ -20,10 +20,18 @@ from sashimono.ai.operations import MAX_RESULT_CHARS, Operation, Pending, find_o
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddClip, MoveClip, SetClipProperty, SetTranscript
 from sashimono.core.io.serialize import json_text
-from sashimono.core.model import MediaItem, Track, TrackKind, Transcript
+from sashimono.core.model import (
+    Clip,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.engine.cache import SceneState
 from sashimono.engine.scenes import SceneSignal
-from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.conftest import RATE_30, FakeHost, make_loaded
 from tests.conftest import make_clip
 from tests.highlight_sound import laugh, speech, waveform_of
 
@@ -211,6 +219,92 @@ class TestTheList:
         assert rows[0]["laughter_from_subtitles"] is True
         assert rows[0]["start_seconds"] == pytest.approx(4.0)
         assert any("motion" in row["reasons"] for row in rows)
+
+
+def _two_of_each(video_media: MediaItem) -> MediaItem:
+    """映像 2 本（0 と 2）と音声 2 本（1 と 3）を持つ素材"""
+    picture = video_media.video_streams[0]
+    sound = video_media.audio_streams[0]
+    return replace(
+        video_media,
+        video_streams=(picture, replace(picture, index=2)),
+        audio_streams=(sound, replace(sound, index=3)),
+    )
+
+
+def _placed(media: MediaItem, *clips: tuple[TrackKind, Clip]) -> FakeHost:
+    """``clips`` を 1 本ずつ別のトラックに置いたプロジェクト"""
+    base = Project.create(ProjectSettings(frame_rate=RATE_30), media=(media,))
+    tracks = tuple(Track(kind=kind, name=f"T{number}") for number, (kind, _) in enumerate(clips))
+    project = base.with_timeline(replace(base.timeline, tracks=tracks))
+    for track, (_, clip) in zip(tracks, clips, strict=True):
+        project = AddClip(track.id, clip).apply(project)
+    return FakeHost(project)
+
+
+def _clip_ids(row: dict[str, Any]) -> list[str]:
+    return [str(place["clip_id"]) for place in row["timeline"]]
+
+
+class TestTheSources:
+    def test_a_clip_of_another_picture_is_left_out(self, video_media: MediaItem) -> None:
+        """動きを調べたのと別の映像を出すクリップの位置は返さない
+
+        壊れると、2 本目のカメラの絵を出すクリップを preview_range で見せ、そこに無い動きを
+        盛り上がりとして読ませる
+        """
+        media = _two_of_each(video_media)
+        shown = replace(make_clip(400, 300, media), stream_index=0)
+        other = replace(make_clip(0, 300, media), stream_index=2)
+        host = _placed(media, (TrackKind.VIDEO, other), (TrackKind.VIDEO, shown))
+        host.scene_states[media.id] = SceneState(_still(busy=(6.0, 8.0)), running=False)
+        row = _call(host, signals=["motion"])["highlights"][0]
+        assert _clip_ids(row) == [str(shown.id)]
+
+    def test_a_held_picture_stops_at_the_hold(self, video_media: MediaItem) -> None:
+        """絵を止めたクリップは、止めた時刻より後の動きの位置を返さない
+
+        壊れると、止まった絵しか出ない所を動きの盛り上がりとして preview_range で見せる
+        """
+        held = replace(make_clip(0, 300, video_media), hold_at=Fraction(5))
+        partly = replace(make_clip(400, 300, video_media), hold_at=Fraction(7))
+        host = _placed(video_media, (TrackKind.VIDEO, held), (TrackKind.VIDEO, partly))
+        host.scene_states[video_media.id] = SceneState(_still(busy=(6.0, 8.0)), running=False)
+        row = _call(host, signals=["motion"])["highlights"][0]
+        assert _clip_ids(row) == [str(partly.id)]
+        place = row["timeline"][0]
+        assert place["end_frame"] == 400 + 7 * 30
+        assert place["start_frame"] < place["end_frame"]
+
+    def test_a_held_picture_keeps_its_sound(self, video_media: MediaItem) -> None:
+        """絵を止めても音は進むので、音のクリップは止めた時刻の後の笑いも返す
+
+        壊れると、絵を止めた混合トラックのクリップで、鳴っている笑いの位置を返さない
+        """
+        clip = replace(make_clip(0, 300, video_media), hold_at=Fraction(1), audio_stream=1)
+        host = _placed(video_media, (TrackKind.MIXED, clip))
+        _laughing(host)
+        row = _call(host, signals=["laughter"])["highlights"][0]
+        assert _clip_ids(row) == [str(clip.id)]
+        assert row["timeline"][0]["end_frame"] > 30
+
+    def test_the_sound_a_mixed_clip_plays_is_compared(self, video_media: MediaItem) -> None:
+        """混合トラックは鳴らす音声（audio_stream）で比べ、絵の番号（stream_index）では比べない
+
+        壊れると、別の言語の音を鳴らすクリップを笑いの位置として返し、調べた音を鳴らす
+        クリップを落とす
+        """
+        media = _two_of_each(video_media)
+        other = replace(
+            make_clip(0, 300, media), show_picture=False, stream_index=1, audio_stream=3
+        )
+        heard = replace(
+            make_clip(400, 300, media), show_picture=False, stream_index=0, audio_stream=1
+        )
+        host = _placed(media, (TrackKind.MIXED, other), (TrackKind.MIXED, heard))
+        _laughing(host)
+        row = _call(host, signals=["laughter"])["highlights"][0]
+        assert _clip_ids(row) == [str(heard.id)]
 
 
 class TestWaiting:
