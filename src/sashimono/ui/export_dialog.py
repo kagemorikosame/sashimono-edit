@@ -46,6 +46,7 @@ from sashimono.engine.encode import (
     export_target,
 )
 from sashimono.engine.encode import export_project as run_export
+from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 from sashimono.ui.system_clipboard import clipboard
 
@@ -73,6 +74,8 @@ CODEC_LABELS = {
     "h264_nvenc": "H.264 (NVIDIA GPU)",
     "hevc_nvenc": "H.265 (NVIDIA GPU)",
     "av1_nvenc": "AV1 (NVIDIA GPU)",
+    "h264_amf": "H.264 (AMD GPU)",
+    "hevc_amf": "H.265 (AMD GPU)",
     "h264_qsv": "H.264 (Intel GPU)",
     "libx264": "H.264 (CPU)",
     "libx265": "H.265 (CPU)",
@@ -95,6 +98,9 @@ class _ExportWorker(QObject):
         self._project = project
         self._settings = settings
         self._cancel = threading.Event()
+        #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365）
+        #: 書き出しのスレッドが足し、終わりの知らせ（finished）が届いてから画面のスレッドが読む
+        self.notes: list[str] = []
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -106,6 +112,7 @@ class _ExportWorker(QObject):
                 self._settings,
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
+                notice=self.notes.append,
             )
         except ExportError as exc:
             self.failed.emit(str(exc))
@@ -129,8 +136,12 @@ class ExportDialog(QDialog):
         smooth_history: bool = True,
         folder: Path | None = None,
         chapters: bool = True,
+        encoder_priority: str = PRIORITY_AUTO,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
+
+        ``encoder_priority`` はどの作り手のエンコーダを先に試すか（本人の設定 #365）
+        コーデックの並びと「自動」の中身がこれに従う
 
         ``folder`` は前に書き出したフォルダ（本人の設定 ``export_folder``） 無ければ
         ビデオのフォルダから始める
@@ -154,6 +165,7 @@ class ExportDialog(QDialog):
         self._pipeline_depth = pipeline_depth
         self._decode_threads = decode_threads
         self._smooth_history = smooth_history
+        self._encoder_priority = encoder_priority
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
         #: 書き出し中に閉じるよう頼まれた 止まった知らせが来たら閉じる
@@ -172,7 +184,8 @@ class ExportDialog(QDialog):
         path_row.addWidget(browse)
 
         self._codec = QComboBox(self)
-        codecs = available_video_codecs()
+        # 「自動」に出す名前と書き出し側が実際に選ぶ物をそろえるため、同じ優先で並べる
+        codecs = available_video_codecs(encoder_priority)
         if codecs:
             # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
             # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
@@ -381,6 +394,7 @@ class ExportDialog(QDialog):
             decode_threads=self._decode_threads,
             smooth_history=self._smooth_history,
             chapters=self._chapters.isChecked(),
+            encoder_priority=self._encoder_priority,
         )
 
     def _start(self) -> None:
@@ -415,15 +429,19 @@ class ExportDialog(QDialog):
         self._progress.setValue(int(value * 1000))
 
     def _on_finished(self, path: str) -> None:
+        notes = self._worker.notes if self._worker is not None else []
         self._teardown()
         if self._closing:
             # 閉じるよう頼まれて止めている間に書き終わった 頼まれたとおり閉じる
             super().reject()
             return
-        message = f"書き出しました\n{path}"
+        # 次の候補のエンコーダで書き直したときは、何で書いたかを添える 黙っていると、
+        # GPU で書いたつもりの人が遅さや画の違いの理由を探せない
+        text = "\n".join([f"書き出しました\n{path}", *notes])
         if self._credits:
-            message += f"\n\n{CREDIT_NOTE}\n{credit_text(self._credits, chr(10))}"
-        QMessageBox.information(self, "書き出し", message)
+            # 作った声の表記（#335） 書き終えたときにも知らせる
+            text += f"\n\n{CREDIT_NOTE}\n{credit_text(self._credits, chr(10))}"
+        QMessageBox.information(self, "書き出し", text)
         self.accept()
 
     def _copy_credits(self) -> None:

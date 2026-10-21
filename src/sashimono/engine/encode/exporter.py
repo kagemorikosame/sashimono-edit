@@ -15,7 +15,7 @@ from fractions import Fraction
 from functools import cache
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import av
 import av.audio.fifo
@@ -32,6 +32,13 @@ from sashimono.core.chapters import chapters_of
 from sashimono.core.model import Project, TrackKind
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.colorspace import VideoReformatter, tag_bt709, to_bt709
+from sashimono.engine.encoders import (
+    PRIORITY_AUTO,
+    MonotonicProgress,
+    encoder_options,
+    order_by_priority,
+    probe_encoder,
+)
 from sashimono.engine.gpu import OffscreenGLContext
 from sashimono.engine.render import (
     DEFAULT_DECODE_THREADS,
@@ -86,8 +93,12 @@ MEASURED_EXPORT_TOTAL_MS = (31.4, 28.5)
 MEASURED_DECODE_MS = (15.9, 11.2)
 
 #: 優先順に並べた映像コーデック 前にあるものから、使えるものを選ぶ
-#: NVENC は CPU をほとんど使わないので、長尺でも編集を続けながら書き出せる
-VIDEO_CODEC_PREFERENCE = ("h264_nvenc", "h264_qsv", "libx264")
+#: GPU のエンコーダは CPU をほとんど使わないので、長尺でも編集を続けながら書き出せる
+#: AMD（AMF）は NVENC の後ろ、Intel（QSV）の前に置く NVENC を持たない AMD の機械で、
+#: CPU や内蔵の Intel より先に AMD の GPU を使うため（#365） NVIDIA と AMD の両方がある
+#: 機械では NVENC を先に使う 先に使う側は本人の設定
+#: （:attr:`ExportSettings.encoder_priority`）で替えられる
+VIDEO_CODEC_PREFERENCE = ("h264_nvenc", "h264_amf", "h264_qsv", "libx264")
 
 _LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
 
@@ -134,6 +145,10 @@ class ExportSettings:
     #: 名前の付いた目印をチャプターとして埋める（#330 2026-10-17 利用者の決定 既定は入）
     #: 効くのは :data:`CHAPTER_SUFFIXES` の入れ物だけ 本人の設定（Preferences）から渡す
     chapters: bool = True
+    #: ``video_codec`` が ``None`` のとき、どの作り手のエンコーダを先に試すか（#365）
+    #: :data:`~sashimono.engine.encoders.ENCODER_PRIORITIES` のどれか
+    #: 本人の設定（Preferences）から渡す
+    encoder_priority: str = PRIORITY_AUTO
 
 
 #: チャプターを埋める入れ物 mp4・mov は章の文字トラック、mkv は Chapters の要素で持つ
@@ -180,24 +195,22 @@ def write_chapters(container: av.container.OutputContainer, chapters: list[Chapt
         container.set_chapters(chapters)
 
 
-#: 開けるかを試すときの大きさ NVENC は小さすぎる画を断る（64x64 では開けない）ので、
-#: 書き出しでよく使う大きさに近い 16:9 で試す 小さくすると、使える NVENC まで外れる
-_PROBE_SIZE = (640, 360)
-
-
-def available_video_codecs() -> list[str]:
+def available_video_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
     """この環境で使える映像コーデックを、優先順に返す
 
-    入っているだけでは数えない 実際に開けたものだけを返す（#67）
-    QSV は FFmpeg に組み込まれていても、Intel の GPU や駆動が無い機械では開けない
-    入っているかだけで選ぶと、開けない QSV が既定になって書き出しが失敗する
+    入っているだけでは数えない 実際に開けて 1 コマ書けたものだけを返す（#67 #365）
+    QSV や AMF は FFmpeg に組み込まれていても、Intel や AMD の GPU や駆動が無い機械では開けない
+    入っているかだけで選ぶと、開けない QSV や AMF が既定になって書き出しが失敗する
+
+    ``priority`` の作り手のエンコーダを前へ寄せる
+    （:func:`~sashimono.engine.encoders.order_by_priority`） 知らない値は ``ValueError``
     """
-    return [name for name in VIDEO_CODEC_PREFERENCE if _opens(name)]
+    return order_by_priority([name for name in VIDEO_CODEC_PREFERENCE if _opens(name)], priority)
 
 
 @cache
 def _opens(name: str) -> bool:
-    """``name`` のエンコーダを開けるか 1 つにつき 1 度だけ試して覚える
+    """``name`` のエンコーダで書けるか 1 つにつき 1 度だけ試して覚える
 
     NVENC を開くのは 1 回 100 ms ほどかかる 書き出しの画面を開くたびに試すと、
     そのたびに待たされる 機械の GPU は起動中に変わらないので、覚えておいてよい
@@ -212,23 +225,58 @@ def _opens(name: str) -> bool:
 
 
 def _open_encoder(name: str) -> None:
-    """``name`` のエンコーダを yuv420p で開いてみる 開けなければ投げる
+    """``name`` のエンコーダを開いて 1 コマ書いてみる 書けなければ投げる
 
-    画素形式は :attr:`ExportSettings.pixel_format` の既定と同じ yuv420p に固定する
-    答えはコーデックごとに 1 つだけ覚えるので、書き出しごとの設定には追従できない
-    別の画素形式で開けないときは、コーデックを指定しない書き出しなら始めた時点で次の候補へ移る
+    試し方は控えの作成と同じ物を使う（:func:`~sashimono.engine.encoders.probe_encoder`）
+    名前をここに残すのは、試験が開けないエンコーダを真似るときにここを差し替えるため
     """
-    # create は種類の union を返す 映像の属性を触るので、ここで型を確定させる
-    context = cast("av.video.codeccontext.VideoCodecContext", av.CodecContext.create(name, "w"))
-    context.width, context.height = _PROBE_SIZE
-    context.pix_fmt = "yuv420p"
-    context.time_base = Fraction(1, 30)
-    # 開いた文脈は捨てるだけでよい PyAV は参照が切れたときに閉じる
-    context.open()
+    probe_encoder(name)
 
 
-class _EncoderOpenError(ExportError):
-    """エンコーダを開けなかった まだ 1 コマも書いていないので、別のコーデックでやり直せる"""
+class _EncoderError(ExportError):
+    """エンコーダが使えなかった 書きかけを捨てて、別のコーデックで最初からやり直せる"""
+
+
+class _EncoderOpenError(_EncoderError):
+    """エンコーダを開けなかった まだ 1 コマも書いていない"""
+
+
+class _EncoderWriteError(_EncoderError):
+    """開けたエンコーダが途中で書けなくなった（駆動の失敗など）
+
+    合成や多重化（mux）の失敗とは分ける そちらはコーデックを替えても直らないので、
+    やり直すと同じ所でもう 1 度落ちるまで待たされる
+    """
+
+
+def _fallback_notice(refused: list[tuple[str, _EncoderError]], used: str) -> str:
+    """次の候補で書き上げたときの知らせ 何で書いたかと、前の候補が使えなかった理由"""
+    reasons = " / ".join(str(error) for _codec, error in refused)
+    names = "、".join(codec for codec, _error in refused)
+    return f"{names} では書き出せなかったので、{used} で最初から書き出し直した（{reasons}）"
+
+
+def _video_options(codec: str, settings: ExportSettings) -> dict[str, str]:
+    """エンコーダへ渡す選択肢 既定（AMF の品質と上限のビットレート #365）に本人の指定を重ねる
+
+    本人の指定（:attr:`ExportSettings.options`）を後から重ねて勝たせる 既定を後にすると、
+    品質を名指しした人の指定が黙って消える
+    """
+    return {**encoder_options(codec, settings.video_bitrate), **settings.options}
+
+
+def _encode_frame(
+    video: av.video.stream.VideoStream, frame: av.video.frame.VideoFrame | None
+) -> list[av.Packet[Any]]:
+    """1 コマ（``None`` なら残り）をエンコードする 失敗したら :class:`_EncoderWriteError`
+
+    多重化（mux）はここに入れない エンコーダの失敗だけを、次の候補へ移れる失敗として拾う
+    """
+    try:
+        return video.encode(frame)
+    except av.error.FFmpegError as exc:
+        name = video.codec_context.name
+        raise _EncoderWriteError(f"映像のエンコーダ {name} が途中で書けなくなった ({exc})") from exc
 
 
 def _color_options_in(options: dict[str, str]) -> list[str]:
@@ -254,12 +302,17 @@ def export_project(
     *,
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    notice: Callable[[str], None] | None = None,
 ) -> Path:
     """プロジェクトを 1 本の動画ファイルへ書き出す
 
     ``should_cancel`` が真を返したら、書きかけのファイルを消して
     :class:`ExportError` を投げる 中途半端なファイルを残すと、書き出せたのか
     どうかが分からなくなる
+
+    コーデックを名指ししない書き出しで、候補のエンコーダが開けなかったり途中で書けなく
+    なったりしたら、次の候補で最初から書き出し直す 書き上げたら、何で書いたかを ``notice``
+    へ知らせる（#365） 黙って替えると、GPU で書いたつもりの人が遅さや画の違いの理由を探せない
     """
     start, end = settings.frame_range or (0, project.duration)
     total = end - start
@@ -269,7 +322,15 @@ def export_project(
     # 指定が無ければ、開けた候補を前から試す 試しに開けても、実際の大きさでは
     # 断られることがある（NVENC の H.264 は幅 4096 を超える画を開けない）
     # そのときに書き出しごと失敗させず、最後は libx264 まで落とす
-    codecs = [settings.video_codec] if settings.video_codec else available_video_codecs()
+    try:
+        codecs = (
+            [settings.video_codec]
+            if settings.video_codec
+            else available_video_codecs(settings.encoder_priority)
+        )
+    except ValueError as exc:
+        # 知らない優先を黙って自動にすると、選んだ物が効かない理由が分からない
+        raise ExportError(str(exc)) from exc
     if not codecs:
         raise ExportError("使える映像コーデックが見つからない")
 
@@ -309,20 +370,47 @@ def export_project(
     context = OffscreenGLContext()
     renderer = FrameRenderer(project, context=context, quality=FULL_QUALITY, decode_threads=threads)
     mixer = AudioMixer(project, smooth_history=settings.smooth_history)
+    #: 書けなかったコーデックと理由 次の候補で書き上げたときに、何で書いたかと一緒に知らせる
+    refused: list[tuple[str, _EncoderError]] = []
+    # 書き直しても進み具合を戻さない（#365 戻ると窓のバーや AI の export_status が下がる）
+    shown = MonotonicProgress(progress) if progress is not None else None
 
     try:
         for index, codec in enumerate(codecs):
             try:
                 _encode(
-                    project, settings, codec, start, end, renderer, mixer, progress, should_cancel
+                    project,
+                    settings,
+                    codec,
+                    start,
+                    end,
+                    renderer,
+                    mixer,
+                    shown.report if shown is not None else None,
+                    should_cancel,
                 )
-                break
-            except _EncoderOpenError:
-                # 開けなかっただけなら、まだ何も描いておらず音も進めていない
-                # 書きかけの入れ物だけ消して次へ移る 候補が尽きたら理由をそのまま伝える
+            except _EncoderError as exc:
+                # 書きかけの入れ物を消して次へ移る 候補が尽きたら理由をそのまま伝える
                 settings.path.unlink(missing_ok=True)
                 if index == len(codecs) - 1:
                     raise
+                refused.append((codec, exc))
+                if shown is not None:
+                    shown.start_again()
+                if isinstance(exc, _EncoderWriteError):
+                    # 途中まで描いて音も進めた 描く側と混ぜる側は前の音や絵を覚えている
+                    # （音の効果の残り・軌跡など）ので、作り直して最初から書き出し直す
+                    # 使い回すと、2 本目の頭に 1 本目の途中の音や絵が混ざる
+                    renderer.close()
+                    mixer.close()
+                    renderer = FrameRenderer(
+                        project, context=context, quality=FULL_QUALITY, decode_threads=threads
+                    )
+                    mixer = AudioMixer(project, smooth_history=settings.smooth_history)
+                continue
+            if refused and notice is not None:
+                notice(_fallback_notice(refused, codec))
+            break
     except BaseException:
         # 例外でもキャンセルでも、書きかけを残さない
         settings.path.unlink(missing_ok=True)
@@ -381,8 +469,9 @@ def _encode(
         tag_bt709(video)
         if settings.video_bitrate:
             video.bit_rate = settings.video_bitrate
-        if settings.options:
-            video.options = dict(settings.options)
+        options = _video_options(codec, settings)
+        if options:
+            video.options = dict(options)
 
         audio = None
         fifo = None
@@ -446,7 +535,7 @@ def _encode(
         # ここへ来るのは書き込みスレッドが終わった後だけ（`with` が待って join する）
         if audio is not None and fifo is not None:
             _flush_audio(container, audio, fifo)
-        container.mux(video.encode(None))
+        container.mux(_encode_frame(video, None))
 
 
 class _FrameWriter:
@@ -505,7 +594,7 @@ class _FrameWriter:
         frame = to_bt709(frame, self._pixel_format, reformatter=self._reformatter)
         frame.pts = index
         frame.time_base = self._frame_time_base
-        self._container.mux(self._video.encode(frame))
+        self._container.mux(_encode_frame(self._video, frame))
 
         # 進み具合は**書けた枚数**で出す 合成した枚数で出すと、パイプラインの
         # 深さのぶんだけ先へ進んで見え、100% になってから実際の書き込みを待つ
