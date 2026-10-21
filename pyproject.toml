@@ -112,8 +112,16 @@ files = ["src", "tests", "tools"]
 # faster_whisper と claude_agent_sdk は**任意の依存**で、既定では入らない
 # （字幕起こしと AI 連携の実行環境 合計 2 GB を超えるため） 入っていない
 # 環境でも型検査が通るようにしておく 入っている環境では実物で検査される
+# 話者の分離（sherpa_onnx とモデルを落とす huggingface_hub #323）も同じく後から入れる
 [[tool.mypy.overrides]]
-module = ["OpenGL.*", "faster_whisper.*", "sounddevice", "claude_agent_sdk.*"]
+module = [
+    "OpenGL.*",
+    "faster_whisper.*",
+    "sounddevice",
+    "claude_agent_sdk.*",
+    "sherpa_onnx.*",
+    "huggingface_hub.*",
+]
 ignore_missing_imports = true
 
 # 配る zip を作る道具（tools/build_package.py tools/check_bootloader.py）だけが使う物

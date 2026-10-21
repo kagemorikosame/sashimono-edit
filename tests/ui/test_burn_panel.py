@@ -293,7 +293,7 @@ class TestTheWindow:
         widget.shelf_provider = lambda: (entry,)
         widget.remember_look = True
         widget.last_look = template_choice(entry).key
-        request = widget._request([(None, 0)], title="置く", accept="置く", choose=False)
+        request = widget._request([Voice(None, 0)], title="置く", accept="置く", choose=False)
         dialog = BurnDialog(
             request, thumbnails=thumbnails, options=LibraryOptions(thumbnails=THUMBNAILS_SIMPLE)
         )
@@ -314,7 +314,7 @@ class TestTheWindow:
         library = widget.library_provider()
         library.aliases.save(_styled_alias("黄色"))
         library.aliases.save(_shape_alias())
-        request = widget._request([(None, 0)], title="置く", accept="置く", choose=False)
+        request = widget._request([Voice(None, 0)], title="置く", accept="置く", choose=False)
         dialog = BurnDialog(
             request, thumbnails=thumbnails, options=LibraryOptions(thumbnails=THUMBNAILS_SIMPLE)
         )
@@ -357,7 +357,7 @@ class TestInTheEditor:
         library.aliases.save(_styled_alias("黄色"))
         library.presets.save(_mincho())
         media = project.media[0]
-        second: Voice = (media.id, 2)
+        second = Voice(media.id, 2)
         panel = window._subtitles
 
         def through_the_window(request: BurnRequest) -> BurnAnswer | None:

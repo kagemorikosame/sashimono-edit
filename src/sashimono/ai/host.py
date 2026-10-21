@@ -335,7 +335,17 @@ class EditorHost(Protocol):
         ...
 
     def transcription_status(self) -> str:
-        """走っている起こしの様子"""
+        """走っている起こし（と話者の分離）の様子"""
+        ...
+
+    def start_speaker_separation(
+        self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
+    ) -> str:
+        """話者の分離を始める（#323） 戻り値は画面に出す短い文言 起こしと同じ列で順に走る
+
+        終わった物はその素材と音声の今の字幕へ話者を付ける 様子は :meth:`transcription_status`
+        ``speakers`` は話す人の数 ``None`` なら自動 部品が無い・字幕が無いと ``RuntimeError``
+        """
         ...
 
     @property
