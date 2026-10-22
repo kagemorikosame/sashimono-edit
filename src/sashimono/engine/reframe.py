@@ -75,6 +75,7 @@ __all__ = [
     "MIN_GATHERED",
     "MIN_STRENGTH",
     "Gathered",
+    "NoPlaceError",
     "ReframePlan",
     "ReframeRequest",
     "gather_signals",
@@ -445,6 +446,14 @@ class _Tracker:
         return frames
 
 
+class NoPlaceError(ReframeError):
+    """どこに枠を止めても、どこかのコマで背景の絵の外が映る
+
+    そのクリップだけ作り替えずに残すと縦の画面で配置が崩れるので、作品ごと断る（ほかの
+    クリップごとの断り :attr:`ReframePlan.skipped` とは分ける）
+    """
+
+
 def _common(areas: list[Area], clip: Clip) -> Area:
     """場面の間ずっと枠を置ける範囲 どの時刻の範囲にも入る所（重なり）
 
@@ -464,7 +473,7 @@ def _common(areas: list[Area], clip: Clip) -> Area:
             low[axis] = max(low[axis], middle - area.reach[axis])
             high[axis] = min(high[axis], middle + area.reach[axis])
     if low[0] > high[0] + 1e-6 or low[1] > high[1] + 1e-6:
-        raise ReframeError(
+        raise NoPlaceError(
             f"背景のクリップ {clip.id} は位置や拡大の動きが大きく、場面の間ずっと絵の中に収まる"
             "枠の位置がありません どこに止めても縦の画面の端に絵の外が映ります 動きを小さくするか、"
             "クリップを分けてから呼んでください"
@@ -619,11 +628,12 @@ def _mean_focus(curve: AnimatedValue, start: int, end: int) -> AnimatedValue:
 
 
 def _background_commands(
-    picture: _Picture,
+    tracker: _Tracker,
     focus: tuple[AnimatedValue, AnimatedValue],
     window: CropWindow,
     plan: ReframePlan,
 ) -> list[Command]:
+    picture = tracker.picture
     clip = picture.clip
     effect = fixed_transform(clip)
     params: dict[str, ParamValue] = dict(effect.params) if effect is not None else {}
@@ -634,13 +644,27 @@ def _background_commands(
         window_of(focus[1], clip.timeline_start, clip.timeline_end),
     )
     targets = list(local)
-    for axis, name in enumerate(("pos_x", "pos_y")):
-        if _animated(params.get(name)) and targets[axis].keyframes:
-            # 前からの位置の動きと枠の動きは 1 次の式で重ねられない 位置の動き（人が付けた寄りや
-            # パン）を残し、このクリップの間は枠を止める
-            targets[axis] = _mean_focus(focus[axis], clip.timeline_start, clip.timeline_end)
-            if str(clip.id) not in plan.held:
-                plan.held.append(str(clip.id))
+    held = [
+        axis
+        for axis, name in enumerate(("pos_x", "pos_y"))
+        if _animated(params.get(name)) and targets[axis].keyframes
+    ]
+    if held:
+        # 前からの位置の動きと枠の動きは 1 次の式で重ねられない 位置の動き（人が付けた寄りや
+        # パン）を残し、このクリップの間は枠を止める 止める所は場面ごとの枠の平均を、クリップの
+        # 全体で枠を置ける範囲（:func:`_common`）へ寄せた所 場面ごとには収まる枠でも、平均は
+        # パンする絵ではほかの場面の範囲の外になりうり、その場面で縦の画面の端に絵の外が映った
+        # （PR #388 の CodeRabbit の指摘）
+        # 数えるコマは場面と同じ決まり（:meth:`_Tracker.area_frames`）
+        start, end = clip.timeline_start, clip.timeline_end
+        area = _common([tracker.sample(f)[1] for f in tracker.area_frames(start, end)], clip)
+        mean = area.clamp(
+            _mean_focus(focus[0], start, end).static, _mean_focus(focus[1], start, end).static
+        )
+        for axis in held:
+            targets[axis] = AnimatedValue(static=mean[axis])
+        if str(clip.id) not in plan.held:
+            plan.held.append(str(clip.id))
     values = _transform_at(clip, 0)
     placement = picture.placed_new[0] / max(picture.placed_old[0], 1e-9)
     pivot = _pivot(values, picture.placed_old)
@@ -946,7 +970,9 @@ def plan_reframe(
         for tracker in trackers:
             picture = tracker.picture
             try:
-                commands = _background_commands(picture, focus, window, plan)
+                commands = _background_commands(tracker, focus, window, plan)
+            except NoPlaceError:
+                raise
             except ReframeError as exc:
                 plan.skipped.append((str(picture.clip.id), str(exc)))
                 continue

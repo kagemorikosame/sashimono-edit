@@ -278,13 +278,19 @@ def _panning(
     return replace(video, effects=effects)
 
 
-def _assert_on_the_picture(video_media: MediaItem, video: Clip, across: float = 0.2) -> None:
+def _assert_on_the_picture(
+    video_media: MediaItem,
+    video: Clip,
+    across: float = 0.2,
+    cuts: tuple[float, ...] = (),
+) -> None:
     """作り替えた後、どのコマでも枠が背景の絵（2 倍 1920 の幅）の中にある"""
     effect = fixed_transform(video)
     assert effect is not None
     before = _value(effect, "pos_x", 0.0)
     project = _project(video_media, (video,))
-    plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, across)])})
+    signal = _signal([(0.0, across)], cuts=cuts)
+    plan = plan_reframe(project, REQUEST, {video_media.id: signal})
     assert not plan.skipped
     done = _applied(project, plan.commands)
     k = 1920 / 1080
@@ -337,6 +343,29 @@ class TestTheBigPan:
         )
         # 被写体を絵の左端に置き、枠を範囲の左の端まで寄せる
         _assert_on_the_picture(video_media, replace(video, effects=effects), across=0.02)
+
+    def test_a_held_window_fits_every_shot(self, video_media: MediaItem) -> None:
+        # パンする背景は前からの位置の動きを残して枠を止める（場面ごとの枠の平均） 場面ごとには
+        # 収まる枠でも、平均がクリップ全体の範囲の外になると、別の場面で縦の画面の端に絵の外が映る
+        # （PR #388 の CodeRabbit の指摘） 長い場面で左端に寄せた枠と、短い場面の枠の平均が外れる
+        video = _panning(video_media)
+        _assert_on_the_picture(video_media, video, across=0.02, cuts=(250 / 30,))
+
+    def test_a_held_window_with_no_place_refuses_the_work(self, video_media: MediaItem) -> None:
+        # 場面ごとには収まるのにクリップ全体で収まる所が無いのに、そのクリップだけ作り替えずに
+        # 残すと、縦の画面で配置の崩れた背景が黙って残る 作品ごと断って理由を返す
+        video = _video(video_media)
+        pan = AnimatedValue(0.0, (Keyframe(0, -2000.0), Keyframe(299, 2000.0)))
+        effects = tuple(
+            e.with_param("pos_x", pan).with_param("scale", AnimatedValue(150.0))
+            if e.kind == TRANSFORM_EFFECT_KIND
+            else e
+            for e in video.effects
+        )
+        project = _project(video_media, (replace(video, effects=effects),))
+        signal = _signal([(0.0, 0.5)], cuts=(5.0,))
+        with pytest.raises(ReframeError, match="絵の中に収まる"):
+            plan_reframe(project, REQUEST, {video_media.id: signal})
 
     def test_no_place_on_the_picture_is_refused(self, video_media: MediaItem) -> None:
         # どこに止めても絵の外が映るのに作り替えると、黙って黒い帯の出る縦の作品になる

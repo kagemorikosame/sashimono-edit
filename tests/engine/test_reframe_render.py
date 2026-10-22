@@ -33,7 +33,8 @@ from sashimono.engine.decode import forget_probe, probe_media
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 from sashimono.engine.reframe import ReframeRequest, plan_reframe
 from sashimono.engine.render import FrameRenderer
-from sashimono.engine.scenes import analyze_scenes
+from sashimono.engine.scenes import SceneSignal, analyze_scenes
+from sashimono.engine.subject import SUBJECT_BINS, SUBJECT_SECONDS, SubjectTrack
 from tests.subject_video import FPS, HEIGHT, WIDTH, write_subject_video
 
 
@@ -229,6 +230,65 @@ def test_a_big_pan_shows_no_black_band(video: Path, gl_context: OffscreenGLConte
     renderer = FrameRenderer(document.project, context=gl_context)
     try:
         for frame in (0, duration // 2, duration - 1):
+            image = renderer.render(frame)
+            for edge in (image[:, :2], image[:, -2:]):
+                assert float(edge[:, :, 2].mean()) > 40, frame
+    finally:
+        renderer.close()
+
+
+def test_a_held_window_shows_no_black_band(video: Path, gl_context: OffscreenGLContext) -> None:
+    # パンする背景で枠を場面ごとの平均に止めると、平均がクリップ全体の範囲の外になり、
+    # 短い方の場面で縦の画面の端に黒い帯が出る
+    forget_probe(video)
+    media = probe_media(video)
+    settings = ProjectSettings(width=WIDTH, height=HEIGHT, frame_rate=FrameRate(FPS))
+    base = Project.create(settings, media=(media,))
+    track = Track(TrackKind.VIDEO, "V1")
+    base = base.with_timeline(replace(base.timeline, tracks=(track,)))
+    duration = FPS * 4
+    pan = AnimatedValue(0.0, (Keyframe(0, -200.0), Keyframe(duration - 1, 200.0)))
+    clip = with_fixed_items(
+        Clip(timeline_start=0, duration=duration, media_id=media.id, native_size=True),
+        picture=True,
+    )
+    clip = replace(
+        clip,
+        effects=tuple(
+            e.with_param("pos_x", pan).with_param("scale", AnimatedValue(200.0))
+            if e.kind == "transform"
+            else e
+            for e in clip.effects
+        ),
+    )
+    project = AddClip(track.id, clip).apply(base)
+    # 被写体は絵の左の端 100 コマ目（3.3 秒）で場面が切り替わる
+    times = np.arange(SUBJECT_SECONDS / 2, 4.0, SUBJECT_SECONDS)
+    columns = np.zeros((times.shape[0], SUBJECT_BINS), np.float32)
+    columns[:, 0] = 1.0
+    rows = np.zeros((times.shape[0], SUBJECT_BINS), np.float32)
+    rows[:, SUBJECT_BINS // 2] = 1.0
+    frames = np.arange(1, duration + 1, dtype=np.float64) / FPS
+    pixel = np.full(frames.shape, 0.01, np.float32)
+    pixel[99] = 0.8
+    signal = SceneSignal(
+        frames,
+        pixel,
+        pixel.copy(),
+        analyzed=4.0,
+        complete=True,
+        stream=0,
+        subject=SubjectTrack(times, columns, rows, np.full(times.shape, 0.02, np.float32)),
+    )
+    plan = plan_reframe(project, ReframeRequest(HEIGHT, WIDTH, AUTO, 1000, 90), {media.id: signal})
+    assert len(plan.shots) == 2
+    document = Document(project)
+    with document.checkpoint("作り替え"):
+        for command in plan.commands:
+            document.execute(command)
+    renderer = FrameRenderer(document.project, context=gl_context)
+    try:
+        for frame in (0, 60, 100, duration - 1):
             image = renderer.render(frame)
             for edge in (image[:, :2], image[:, -2:]):
                 assert float(edge[:, :, 2].mean()) > 40, frame
