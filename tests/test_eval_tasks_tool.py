@@ -18,9 +18,10 @@ from typing import Any
 import numpy as np
 import pytest
 
-from sashimono.core.commands import Document, RemoveMarkers
+from sashimono.core.commands import AddMarkers, Document
 from sashimono.core.io import load_project, save_project
 from sashimono.core.model import Transcript, TranscriptSegment
+from sashimono.core.model.timeline import Marker
 from tests.scene_video import CUTS, write_scene_video
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -173,7 +174,7 @@ def test_one_failing_task_keeps_the_other_results(
         commit="abc",
     )
     by_task = {(r["material"], r["task"]): r for r in records}
-    assert by_task["E01", "scenes"]["status"] == "ok"
+    assert by_task["E01", "scenes"]["reason"] == "no-answer"
     assert by_task["E02", "silence"]["status"] == "ok"
     assert by_task["E02", "subtitles"]["status"] == "ok"
     assert (by_task["E02", "export"]["status"], by_task["E02", "export"]["reason"]) == (
@@ -501,8 +502,8 @@ def test_tool_stage_round_trip(folder: tuple[ModuleType, Any, Any], tmp_path: Pa
     assert len(heard) == 2
     assert exported[0] == (eval_dir.exports / "E02.mp4", 2)
     by_task = {(r["material"], r["task"]): r for r in first}
-    assert by_task["E01", "scenes"]["metrics"]["f1"] == 1.0
-    assert by_task["E01", "scenes"]["metrics"]["answer"] == len(CUTS)
+    # 場面は人が一から付けるまで正解が無い（道具と道具を比べた数を残さない）
+    assert by_task["E01", "scenes"]["reason"] == "no-answer"
     assert by_task["E02", "silence"]["metrics"]["iou"] == 1.0
     assert by_task["E02", "subtitles"]["metrics"]["cer"] == 0.0
     assert by_task["E02", "talk"]["reason"] == "no-tool"
@@ -524,9 +525,11 @@ def test_adopt_reads_the_corrected_project(
     tool, eval_dir, book = folder
     tool.command_draft(eval_dir, book, ["E01"])
     draft = eval_dir.draft_path("E01", "scenes")
+    # 本人が素材を見て、最初の切り替わりを見落として目印を置いた形
     document = Document(load_project(draft))
-    first_marker = document.project.timeline.markers[0].frame
-    document.execute(RemoveMarkers((first_marker,)))
+    fps = float(document.project.rate.fps)
+    marks = tuple(Marker(frame=round(cut * fps), label="場面") for cut in CUTS[1:])
+    document.execute(AddMarkers(marks))
     save_project(document.project, draft)
 
     tool.command_adopt(eval_dir, "E01", "scenes")
@@ -622,6 +625,70 @@ def test_results_are_written_when_folders_share_names_with_the_tool(
             params=tool.ToolParams(asr_model=f"m{year}"),
             exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
         )
+
+
+def test_scenes_are_answered_from_scratch_by_a_person(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """場面の課題は目印の無い .sme だけを作り、仮の正解を持たず、run は no-answer で飛ばすこと
+
+    道具の下書きを仮の正解にすると、人が直す前の回は道具と道具を比べて F1 が実際より高く出て、
+    直し忘れがそのまま正解になり、道具を良くしても数が上がらない（#345 の決まり）
+    """
+    tool, eval_dir, book = folder
+    made = tool.command_draft(eval_dir, book, ["E01"])
+    assert made == ["E01 scenes"]
+    sheet = eval_dir.draft_path("E01", "scenes")
+    assert load_project(sheet).timeline.markers == ()
+    assert "scenes" not in eval_dir.read_answer("E01").get("tasks", {})
+    results = tmp_path / "r.jsonl"
+    [record] = tool.command_run(eval_dir, book, ["E01"], results=results, commit="")
+    assert (record["status"], record["reason"]) == ("skipped", "no-answer")
+
+    # 前の版の draft が残した道具の仮の正解とも比べず、次の draft で外す
+    stale = {"provisional": True, "source": "draft", "cuts": list(CUTS)}
+    eval_dir.write_answer("E01", {"material": "E01", "tasks": {"scenes": stale}})
+    [record] = tool.command_run(eval_dir, book, ["E01"], results=results, commit="")
+    assert record["reason"] == "no-answer"
+
+    # 目印を置いている途中の .sme は、--force でなければ上書きしない
+    document = Document(load_project(sheet))
+    document.execute(AddMarkers((Marker(frame=30, label="場面"),)))
+    save_project(document.project, sheet)
+    assert tool.command_draft(eval_dir, book, ["E01"]) == []
+    assert "scenes" not in eval_dir.read_answer("E01")["tasks"]
+    assert len(load_project(sheet).timeline.markers) == 1
+
+
+def test_results_file_does_not_mark_the_commit_dirty(tool: ModuleType, tmp_path: Path) -> None:
+    """台本が足した結果のファイルだけが変わった回は +dirty にならず、コードが変われば付くこと
+
+    落ちると、結果をコミットせずに 2 回目を回すだけで印が付き、コードを変えた回と
+    変えていない回を見分けられなくなる
+    """
+    import subprocess
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    results = tmp_path / "eval" / "results" / "tools.jsonl"
+    results.parent.mkdir(parents=True)
+    results.write_text("", encoding="utf-8")
+    code = tmp_path / "code.py"
+    code.write_text("x = 1\n", encoding="utf-8")
+    git("init", "-q")
+    git("add", ".")
+    git("commit", "-q", "-m", "first")
+
+    results.write_text('{"a": 1}\n', encoding="utf-8")
+    assert not tool.current_commit(tmp_path, results).endswith("+dirty")
+    code.write_text("x = 2\n", encoding="utf-8")
+    assert tool.current_commit(tmp_path, results).endswith("+dirty")
 
 
 def test_draft_keeps_human_answers(folder: tuple[ModuleType, Any, Any], tmp_path: Path) -> None:

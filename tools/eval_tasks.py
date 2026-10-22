@@ -824,19 +824,31 @@ def read_results(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def current_commit() -> str:
-    """今のコミット 書き換えたまま回したときは印を付ける（どの形で測ったかが曖昧になるため）"""
+def current_commit(root: Path = ROOT, results: Path = RESULTS_FILE) -> str:
+    """今のコミット 書き換えたまま回したときは印を付ける（どの形で測ったかが曖昧になるため）
+
+    台本が自分で足す結果のファイルは、書き換えの判定から外す 外さないと、結果をコミットせずに
+    2 回目を回すだけで必ず印が付き、コードを変えた回と変えていない回を見分けられない
+    """
     try:
         head = subprocess.run(
             ["git", "rev-parse", "--short=10", "HEAD"],
-            cwd=ROOT,
+            cwd=root,
             capture_output=True,
             text=True,
             check=True,
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=ROOT,
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--",
+                ".",
+                f":(exclude){results.relative_to(root).as_posix()}",
+            ],
+            cwd=root,
             capture_output=True,
             text=True,
             check=True,
@@ -868,7 +880,10 @@ def draft_project(media_path: Path, material: str, task: str, answer: Mapping[st
     """正解を直すための作品 課題ごとに 1 つ作る（1 つにまとめると直す所が混ざる）
 
     - 無音: 無音を詰めた後のタイムライン 人はクリップの端を直す
-    - 場面と話の区切り: 素材をそのまま置き、区切りに目印を置く 人は目印を足す・消す・動かす
+    - 話の区切り: 素材をそのまま置き、区切りに目印を置く 人は目印を足す・消す・動かす
+    - 場面: 素材をそのまま置くだけで目印は置かない 人が素材の全体を見て一から目印を置く
+      （#345 の決まり 道具の下書きから直すと、直し忘れがそのまま正解になって正解が道具の癖に寄り、
+      道具を良くしても数が上がらない）
     - 字幕: 素材に字幕を付ける 人は字幕のパネルで文と時刻を直す
     """
     from sashimono.engine.decode.probe import probe_media
@@ -886,11 +901,10 @@ def draft_project(media_path: Path, material: str, task: str, answer: Mapping[st
         ranges = plan_cuts(document.project, media.id, silences)
         if ranges:
             document.execute(RippleCut(ranges))
-    elif task in (SCENES, TALK):
-        points = [_span(item)[0] for item in answer["cuts" if task == SCENES else "boundaries"]]
+    elif task == TALK:
+        points = [_span(item)[0] for item in answer["boundaries"]]
         frames = sorted({round(moment * float(rate.fps)) for moment in points})
-        label = "場面" if task == SCENES else "区切り"
-        markers = tuple(Marker(frame=frame, label=label) for frame in frames if frame > 0)
+        markers = tuple(Marker(frame=frame, label="区切り") for frame in frames if frame > 0)
         if markers:
             document.execute(AddMarkers(markers))
     elif task == SUBTITLES:
@@ -1072,6 +1086,32 @@ def open_material(folder: EvalDir, material: str, path: Path | None) -> Opened:
     return Opened(answer, facts)
 
 
+def _blank_scenes_sheet(
+    folder: EvalDir, material: str, path: Path, tasks: dict[str, Any], *, force: bool
+) -> bool:
+    """場面の課題は、目印の無い .sme だけを作る 仮の正解は持たない 作ったら真
+
+    #345 の決まりで、場面（T3）だけは人が素材の全体を見て一から目印を置く 道具の下書きを
+    仮の正解にすると、人が直す前の回は道具と道具を比べて F1 が実際より高く出る
+    前の版が置いた道具の仮の正解は、ここで外す 残すと run がそれと比べてしまう
+    人が目印を置いている途中の .sme は、``force`` でなければ上書きしない（置いた手間が消える）
+    """
+    if tasks.pop(SCENES, None) is not None:
+        print(f"{material} {SCENES}: 道具の下書きの仮の正解を外した（場面は人が一から付ける）")
+    sheet = folder.draft_path(material, SCENES)
+    if sheet.exists() and not force:
+        print(f"{material} {SCENES}: 正解を付ける .sme があるので飛ばす（作り直すなら --force）")
+        return False
+    try:
+        folder.drafts.mkdir(parents=True, exist_ok=True)
+        save_project(draft_project(path, material, SCENES, {}), sheet)
+    except Exception as error:
+        print(f"{material} {SCENES}: .sme を作れなかった（{type(error).__name__}）")
+        return False
+    print(f"{material} {SCENES}: 目印の無い .sme を作った（素材の全体を見て一から目印を置く）")
+    return True
+
+
 def command_draft(
     folder: EvalDir,
     book: TaskBook,
@@ -1109,6 +1149,10 @@ def command_draft(
             existing = tasks.get(task)
             if existing is not None and not existing.get("provisional", True):
                 print(f"{material.id} {task}: 人が直した正解があるので触らない")
+                continue
+            if task == SCENES:
+                if _blank_scenes_sheet(folder, material.id, path, tasks, force=force):
+                    made.append(f"{material.id} {task}")
                 continue
             if existing is not None and not force:
                 print(f"{material.id} {task}: 仮の正解があるので飛ばす（作り直すなら --force）")
@@ -1225,6 +1269,10 @@ def command_run(
         for task in material.tasks:
             record: dict[str, object] = {**stamp, "material": material.id, "task": task}
             truth = answer.get("tasks", {}).get(task)
+            if task == SCENES and truth is not None and truth.get("provisional", True):
+                # 前の版の draft が残した道具の仮の正解とは比べない 道具と道具を比べた F1 が
+                # 本当の精度に見える 場面は人が一から付けた正解ができるまで数えない
+                truth = None
             if path is None or opened.reason:
                 # 素材が無いのは数える前の事情なので飛ばした扱い 読めなかったのは失敗
                 status = "skipped" if opened.reason == "no-material" else "failed"
