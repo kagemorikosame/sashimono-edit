@@ -521,6 +521,42 @@ def _stays_between(key: Keyframe) -> bool:
     return min(values) >= -1e-9 and max(values) <= 1.0 + 1e-9
 
 
+#: 透けるかもしれない合成の仕方以外の名前（ふつうに上へ重ねる）
+_OPAQUE_BLEND = "normal"
+#: 透明の欄（アルファ）を持つ画素の形式の目印 画像（PNG）や透過の動画は、絵の中に透ける所がある
+_ALPHA_FORMATS = ("rgba", "bgra", "argb", "abgr", "yuva", "gbrap", "ya8", "ya16", "pal8")
+
+
+def _see_through(project: Project, clip: Clip) -> bool:
+    """手前の背景のクリップが、どこか少しでも透けるかもしれないか（奥の背景が映るか）
+
+    どこが透けるかを正しく出すには絵を描くしかないので、透けうる物はどれも透けると数える
+    （数えすぎると枠を置ける範囲が狭まるだけで、透けた所に絵の外が映るよりよい）
+
+    - 不透明度が 1 でない時がある（フェードのキーフレームも）
+    - 合成の仕方がふつうでない・下のクリップで切り抜く
+    - 固定の欄でないエフェクトを積んでいる（マスク・クロマキー・透明度・切り抜きなど 種類を
+      選り分けずに数える）
+    - 素材が透明の欄を持つ（PNG の画像・透過の動画）
+    """
+    opacity = clip.opacity
+    if opacity.keyframes or opacity.static < 1.0:
+        return True
+    if clip.blend_mode != _OPAQUE_BLEND or clip.clip_to_below:
+        return True
+    if any(effect.enabled and not effect.fixed for effect in clip.effects):
+        return True
+    media = project.find_media(clip.media_id) if clip.media_id is not None else None
+    if media is None:
+        return False
+    stream = next(
+        (s for s in media.video_streams if s.index == clip.stream_index),
+        media.video_streams[0] if media.video_streams else None,
+    )
+    pixel_format = (stream.pixel_format or "").lower() if stream is not None else ""
+    return any(pixel_format.startswith(mark) for mark in _ALPHA_FORMATS)
+
+
 def _visible(timeline: Timeline) -> set[int]:
     return {id(track) for track in timeline.active_picture_tracks()}
 
@@ -549,6 +585,20 @@ def _shots(
             return None
         return max(showing, key=lambda t: order[id(t.picture.track)])
 
+    def through(frame: int) -> list[_Tracker]:
+        """いちばん手前の背景が透けるとき、奥に見える背景（手前から順に 透けない物で止める）"""
+        showing = sorted(
+            (t for t in candidates if t.picture.clip.contains(frame)),
+            key=lambda t: order[id(t.picture.track)],
+            reverse=True,
+        )
+        seen: list[_Tracker] = []
+        for upper, lower in pairwise(showing):
+            if not _see_through(project, upper.picture.clip):
+                break
+            seen.append(lower)
+        return seen
+
     spans: list[tuple[int, int, _Tracker]] = []
     for start, end in pairwise(events):
         if end <= start:
@@ -569,7 +619,19 @@ def _shots(
         # ぎりぎり収まるパンでその数コマだけ縦の画面の端に絵の外が映った
         # （PR #388 の CodeRabbit の指摘）
         frames = owner.area_frames(start, end)
-        area = _common([owner.sample(frame)[1] for frame in frames], owner.picture.clip)
+        areas = [owner.sample(frame)[1] for frame in frames]
+        # 手前の背景が透ける間は奥の背景も映る 奥の背景の枠も同じ枠なので、奥の絵の範囲にも収める
+        # 収めないと、半透明の手前の絵の向こうに奥の絵の外（黒）が透けて見える 範囲の分かれ目は
+        # 場面の中の背景の出入り（:data:`boundaries`）で、その間は奥に見える物が変わらない
+        cuts_inside = [frame for frame in boundaries if start < frame < end]
+        for head, tail in pairwise(sorted({start, end, *cuts_inside})):
+            for lower in through(head):
+                clip = lower.picture.clip
+                low = max(head, clip.timeline_start)
+                high = min(tail, clip.timeline_end)
+                if low < high:
+                    areas.extend(lower.sample(frame)[1] for frame in lower.area_frames(low, high))
+        area = _common(areas, owner.picture.clip)
         left, right = area.center[0] - area.reach[0], area.center[0] + area.reach[0]
         bottom, top = area.center[1] - area.reach[1], area.center[1] + area.reach[1]
         shots.append(

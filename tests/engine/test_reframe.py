@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from fractions import Fraction
+from typing import Any
 
 import numpy as np
 import pytest
@@ -428,6 +429,52 @@ class TestTheGroups:
         project = _project(video_media, (_video(video_media),), (group,), (_text("字幕"),))
         with pytest.raises(ReframeError, match="回っています"):
             plan_reframe(project, REQUEST, {})
+
+
+def _stacked(video_media: MediaItem, **front: Any) -> tuple[Project, Clip, Clip]:
+    """奥に等倍の背景、手前に 2 倍に拡げた背景を重ねた作品 ``front`` は手前のクリップの欄"""
+    back = _video(video_media)
+    upper = replace(_with_transform(_video(video_media), scale=200.0), **front)
+    return _project(video_media, (back,), (upper,)), back, upper
+
+
+class TestTheSeeThrough:
+    def test_an_opaque_front_keeps_its_own_range(self, video_media: MediaItem) -> None:
+        # 透けない手前の背景の範囲を奥の背景で狭めると、隠れて見えない奥の絵のために、手前の
+        # 被写体へ寄せられなくなる
+        project, _back, _upper = _stacked(video_media)
+        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.98)])})
+        assert plan.shots[0].focus[0] > 1000.0
+
+    def test_a_half_clear_front_keeps_the_back_on_its_picture(self, video_media: MediaItem) -> None:
+        # 半透明の手前の背景の範囲だけで枠を決めると、透けて見える奥の背景の枠が奥の絵の外へ
+        # 出て、手前の絵の向こうに黒が透ける
+        project, back, _upper = _stacked(video_media, opacity=AnimatedValue(0.5))
+        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.98)])})
+        assert not plan.skipped
+        done = _applied(project, plan.commands)
+        pos = _value(_transform(done, back), "pos_x", 0.0)
+        k = 1920 / 1080
+        for frame in (0, 150, 299):
+            focus = -pos.at(frame) / k
+            assert focus - 607.5 / 2 + 1e-6 >= -960.0, frame
+            assert focus + 607.5 / 2 <= 960.0 + 1e-6, frame
+
+    @pytest.mark.parametrize(
+        "front",
+        [
+            {"opacity": AnimatedValue(1.0, (Keyframe(0, 0.0), Keyframe(30, 1.0)))},
+            {"blend_mode": "screen"},
+        ],
+    )
+    def test_any_chance_of_showing_through_counts(
+        self, video_media: MediaItem, front: dict[str, Any]
+    ) -> None:
+        # フェードで出てくる・明るさで重ねる手前の背景も透ける時がある 数えないと、その時に
+        # 奥の絵の外が透けて見える
+        project, _back, _upper = _stacked(video_media, **front)
+        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.98)])})
+        assert plan.shots[0].focus[0] <= 656.25 + 1e-6
 
 
 class TestTheSpreadMotion:

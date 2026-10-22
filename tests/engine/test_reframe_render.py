@@ -296,6 +296,67 @@ def test_a_held_window_shows_no_black_band(video: Path, gl_context: OffscreenGLC
         renderer.close()
 
 
+def test_the_back_through_a_half_clear_front_shows_no_black(
+    video: Path, gl_context: OffscreenGLContext
+) -> None:
+    # 半透明の手前の背景の範囲だけで枠を決めると、奥の背景の枠が奥の絵の外へ出て、手前の絵の
+    # 向こうに黒が透ける（奥は等倍、手前は 3 倍で、被写体は絵の右の端）
+    forget_probe(video)
+    media = probe_media(video)
+    settings = ProjectSettings(width=WIDTH, height=HEIGHT, frame_rate=FrameRate(FPS))
+    base = Project.create(settings, media=(media,))
+    lower = Track(TrackKind.VIDEO, "V1")
+    upper = Track(TrackKind.VIDEO, "V2")
+    base = base.with_timeline(replace(base.timeline, tracks=(lower, upper)))
+    duration = FPS * 2
+
+    def placed(scale: float, opacity: float) -> Clip:
+        clip = with_fixed_items(
+            Clip(timeline_start=0, duration=duration, media_id=media.id, native_size=True),
+            picture=True,
+        )
+        return replace(
+            clip,
+            opacity=AnimatedValue(opacity),
+            effects=tuple(
+                e.with_param("scale", AnimatedValue(scale)) if e.kind == "transform" else e
+                for e in clip.effects
+            ),
+        )
+
+    project = AddClip(lower.id, placed(100.0, 1.0)).apply(base)
+    project = AddClip(upper.id, placed(300.0, 0.5)).apply(project)
+    times = np.arange(SUBJECT_SECONDS / 2, 2.0, SUBJECT_SECONDS)
+    columns = np.zeros((times.shape[0], SUBJECT_BINS), np.float32)
+    columns[:, SUBJECT_BINS - 1] = 1.0
+    rows = np.zeros((times.shape[0], SUBJECT_BINS), np.float32)
+    rows[:, SUBJECT_BINS // 2] = 1.0
+    frames = np.arange(1, duration + 1, dtype=np.float64) / FPS
+    flat = np.full(frames.shape, 0.01, np.float32)
+    signal = SceneSignal(
+        frames,
+        flat,
+        flat.copy(),
+        analyzed=2.0,
+        complete=True,
+        stream=0,
+        subject=SubjectTrack(times, columns, rows, np.full(times.shape, 0.02, np.float32)),
+    )
+    plan = plan_reframe(project, ReframeRequest(HEIGHT, WIDTH, AUTO, 1000, 90), {media.id: signal})
+    document = Document(project)
+    with document.checkpoint("作り替え"):
+        for command in plan.commands:
+            document.execute(command)
+    renderer = FrameRenderer(document.project, context=gl_context)
+    try:
+        image = renderer.render(FPS // 2)
+    finally:
+        renderer.close()
+    # 地は暗い青（青 70） 半分の手前と奥が重なれば 40 を超え、奥が黒なら 35 ほどに落ちる
+    for edge in (image[:, :2], image[:, -2:]):
+        assert float(edge[:, :, 2].mean()) > 45
+
+
 def test_no_black_band_at_the_edges(video: Path, gl_context: OffscreenGLContext) -> None:
     # 枠が絵の外へ出ると、縦の画面の端に黒い帯が出る（地は暗い青で、真っ黒にはならない）
     project = _reframed(video)
