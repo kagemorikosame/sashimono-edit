@@ -51,6 +51,12 @@ def malformed(rows: tuple[Entry, ...]) -> list[str]:
             wrong.append(f"{entry.key}: AI にできないはずなのに道具の名前がある")
         if entry.status in (Status.PARTIAL, Status.READ_ONLY, Status.HIDDEN) and not entry.note:
             wrong.append(f"{entry.key}: 足りない所か、出さない理由の案が無い")
+        if entry.status is Status.READ_ONLY and not entry.reads:
+            wrong.append(
+                f"{entry.key}: 読むだけの値が get_app_settings のどこにあるか（reads）が無い"
+            )
+        if entry.status is not Status.READ_ONLY and entry.reads:
+            wrong.append(f"{entry.key}: reads は読むだけの行（get_app_settings で読む）にだけ書く")
     return wrong
 
 
@@ -196,6 +202,14 @@ class TestRowsAreWellFormed:
         assert Status.HIDDEN.value == "出さない候補"
         hidden = [e for e in LEDGER if e.status is Status.HIDDEN]
         assert all(e.issue == 350 and DECIDED_READ_ONLY not in e.note for e in hidden)
+
+    def test_a_read_only_row_without_a_place_is_caught(self) -> None:
+        # 落ちると: 読むだけと決めた行を、値の在りかを書かずに足しても通り、AI が実は読めない
+        # 操作を「読める」と数える（#352 前は字幕パネルや更新の行がそうだった）
+        bare = Entry("メニュー/表示/設定…", Status.READ_ONLY, ("get_app_settings",), 350, "設定")
+        assert malformed((bare,)) == [
+            "メニュー/表示/設定…: 読むだけの値が get_app_settings のどこにあるか（reads）が無い"
+        ]
 
     def test_read_only_rows_cite_the_decision(self) -> None:
         # 落ちると: 「AI は読むだけ」が誰がいつ決めたことか分からず、候補と見分けが付かない

@@ -27,30 +27,42 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from sashimono.core.model import MediaId, Project
+from sashimono.core.model import Effect, MediaId, Project
+from sashimono.effects import registry
+from sashimono.effects.sources import source_registry
+from sashimono.effects.spec import FileSpec, TextSpec
+from sashimono.effects.strokes import STROKE
 
 __all__ = [
     "ASKED",
     "DESTINATION",
+    "FIELD_SENDS",
     "NAME_MARK",
+    "PATH_MARK",
     "PROJECT_MARK",
     "REMEMBERED_MARK",
     "TEXT_MARK",
+    "UNKNOWN_FIELD_SENDS",
     "NamedMedia",
     "Outbound",
     "SendAnswer",
     "SendChoice",
     "SendRequest",
+    "field_sends",
     "file_secrets",
     "hide_text",
+    "masked_value",
     "redact",
     "secret_pairs",
+    "sending",
     "text_secrets",
 ]
 
@@ -103,21 +115,22 @@ _LABELS: dict[Outbound, str] = {
 _DETAILS: dict[Outbound, str] = {
     Outbound.CONVERSATION: "AI の欄に書いた指示と、AI の質問への答え",
     Outbound.PROJECT: (
-        "解像度・長さ・トラック・クリップの位置と長さ・エフェクトの種類と値・シーン・操作の履歴"
+        "解像度・長さ・トラック・クリップの位置と長さ・エフェクトの種類と値・シーン・操作の履歴・"
+        "画面の表示（見えている範囲・再生・選んでいる物・進み具合）"
     ),
     Outbound.APP_SETTINGS: (
-        "本人の好み・ショートカット・画面配置・版・保存したプリセットとエイリアスと"
-        "テンプレートの棚の名前"
+        "本人の好み・ショートカット・画面配置・版・更新の様子・保存したプリセットとエイリアスと"
+        "テンプレートの棚の名前・互換性レポートの記録"
     ),
     Outbound.FILES: (
         "素材のファイル名と置き場のパス（ユーザー名を含むことがある）、作品と書き出しの場所、"
-        "テンプレートの棚のフォルダの名前"
+        "テンプレートの棚のフォルダの名前、エフェクトが読む画像とスクリプトの置き場の場所"
         " 断ると伏せ字にして送る"
     ),
     Outbound.TEXT: (
         "字幕起こしの結果の文と、テキストのクリップの文、目印の名前、作品の編集の方針の文、"
         "画面の中から読み取った文字（テロップ・看板・資料 手元の OCR で読み、絵は送らない）"
-        " 取り消しと操作の履歴では、名前に入った文を伏せ字にして送る"
+        " 取り消しと操作の履歴とクリップの値では、入った文を伏せ字にして送る"
     ),
     Outbound.FRAMES: "プレビューを描いた画像（指定したコマの絵 映っている人や画面もそのまま）",
 }
@@ -235,6 +248,8 @@ _ABSOLUTE_PATH = re.compile(
     + r"|(?:^|(?<=\s))[/\\][^\s\"'<>|*?/\\]+(?=$|\s)"
 )
 _PATH_MARK = "〔ファイルの場所〕"
+#: 場所の欄（:class:`FileSpec`）を値ごと伏せた印 文の中の場所を形で伏せた印と同じ
+PATH_MARK = _PATH_MARK
 
 #: 値ごと伏せる項目の名前 設定の中のフォルダ（``state_folder``・``export_folder``）や
 #: 一覧の ``path`` など 中身の形（正規表現）で見分けると、``/backup`` のような短い場所や、
@@ -330,6 +345,66 @@ def secret_pairs(table: Mapping[str, str]) -> list[tuple[str, str]]:
 #: 字幕と文字を伏せたときの印
 TEXT_MARK = "〔伏せ字〕"
 
+
+# --- 欄の型で伏せる（#391 の Codex の指摘）---
+#
+# 欄の値（テキストの文字・スクリプトの文字の欄・画像の場所など）は、文字列を表に集めて後から
+# 照らす伏せ方では漏れる 名前の text だけを集めると別の名前の文字の欄が、2 文字より短い値は
+# 表に入らず 1 文字の文が、場所の形と名前の形で見分けると「模様.png」のような相対の名前が、
+# どれも伏せずに送られた（Codex の指摘が 2 回続いた） 値を返す道具は結果を組む所で欄の型を
+# 引き、送らない設定ならその値そのものを印へ置き換える 長さや名前の形には頼らない
+# 表の照らし（:func:`text_secrets` :func:`redact`）は、型の無い所（字幕・エラーの文）の補いに残す
+
+#: 欄の型ごとに、値を送るのに要る許し この表が 1 か所の決まり（docs/development.md の
+#: 「人が画面で見ている物を AI も読む」と ``tests/ai/test_screen_reading.py`` が同じ表を持つ）
+#: 型を足すときは、人が書いた文か場所かを考えてここへ足す 書かない型は編集の構成として送る
+FIELD_SENDS: dict[type, frozenset[Outbound]] = {
+    TextSpec: frozenset({Outbound.TEXT}),
+    FileSpec: frozenset({Outbound.FILES}),
+}
+#: 定義の分からない種類（読み込んでいないスクリプト）の文字の値 文か場所か分からないので、
+#: 両方を許したときだけ送る
+UNKNOWN_FIELD_SENDS = frozenset({Outbound.TEXT, Outbound.FILES})
+
+#: 今動いている道具の結果にそのまま載せてよい物 ブリッジが道具を動かす間だけ立てる
+#: 立っていないのは編集画面の中から直に呼んだときで、結果は外へ出ないので全部を載せる
+_SENDABLE: ContextVar[frozenset[Outbound] | None] = ContextVar("sendable", default=None)
+
+
+@contextmanager
+def sending(kinds: frozenset[Outbound]) -> Iterator[None]:
+    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）"""
+    token = _SENDABLE.set(kinds)
+    try:
+        yield
+    finally:
+        _SENDABLE.reset(token)
+
+
+def field_sends(spec: object | None, *, known: bool = True) -> frozenset[Outbound]:
+    """欄の値を送るのに要る許し ``known`` が偽なら定義の分からない種類の欄"""
+    if not known:
+        return UNKNOWN_FIELD_SENDS
+    for kind, needs in FIELD_SENDS.items():
+        if isinstance(spec, kind):
+            return needs
+    return frozenset()
+
+
+def masked_value(value: Any, needs: frozenset[Outbound]) -> Any:
+    """送ってよくなければ、欄の値そのものを印へ置き換える 長さや形を問わない
+
+    空の文字は何も載っていないので残す（印にすると、書いてあるように読める）
+    文字でない値（数・色・印）は伏せない 文字の欄と場所の欄が持つのは文字だけ
+    """
+    if not needs or not isinstance(value, str) or value == "":
+        return value
+    allowed = _SENDABLE.get()
+    if allowed is None or needs <= allowed:
+        return value
+    return TEXT_MARK if Outbound.TEXT in needs - allowed else PATH_MARK
+
+
 #: 操作の名前の「動き: 対象」の対象のうち、伏せずに残す物 数と数え方だけ（「無音カット: 3 か所」）
 #: 中身の文字ではないので、残しても字幕や本文は外へ出ない
 _COUNT_ONLY = re.compile(r"[\d\s.,/]*(?:か所|件|本|個|コマ|フレーム|秒)?")
@@ -337,8 +412,36 @@ _COUNT_ONLY = re.compile(r"[\d\s.,/]*(?:か所|件|本|個|コマ|フレーム|�
 _QUOTED = re.compile(r"「[^」]*」")
 
 
+def _typed_texts(params: Mapping[str, object], specs: Iterable[object] | None) -> Iterator[str]:
+    """欄のうち、人が文字を書く欄（:class:`TextSpec`）の今の値
+
+    名前ではなく欄の型で見分ける AviUtl のスクリプトは文字の欄に好きな名前を付け、テキストにも
+    text のほかに文字の欄（タイマーの書式など）がある 名前の text だけを見ると、それらに本人が
+    書いた文を、字幕と文字を送らないと決めた人の所でも送る（#391 の Codex の指摘）
+    定義の分からない種類（読み込んでいないスクリプト）は、どの欄が文字か分からないので文字の値を
+    全部数える 伏せすぎて困るのは値が読めないことだけで、外へ出た文は取り戻せない
+    """
+    if specs is None:
+        yield from (value for value in params.values() if isinstance(value, str))
+        return
+    names = {spec.name for spec in specs if isinstance(spec, TextSpec)} | {"text"}
+    yield from (value for name, value in params.items() if name in names and isinstance(value, str))
+
+
+def _effect_texts(effects: Iterable[Effect]) -> Iterator[str]:
+    for effect in effects:
+        definition = registry.get(effect.kind)
+        yield from _typed_texts(
+            effect.params, definition.parameters if definition is not None else None
+        )
+
+
 def text_secrets(project: Project) -> list[str]:
-    """字幕と文字を伏せる表 字幕起こしの文と、テキストのクリップの文（メインとシーン） 長い順"""
+    """字幕と文字を伏せる表 字幕起こしの文と、クリップの文字の欄の文（メインとシーン） 長い順
+
+    文字の欄は中身・縁取りの層・エフェクト（場面切り替えの後の場面と、層に掛けた物も）のどれでも
+    欄の型で拾う（:func:`_typed_texts`）
+    """
     found: set[str] = set()
     for media in project.media:
         for _stream, transcript in media.transcripts:
@@ -346,8 +449,20 @@ def text_secrets(project: Project) -> list[str]:
     for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
         for track in timeline.tracks:
             for clip in track.clips:
-                if clip.source is not None and "text" in clip.source.params:
-                    found.add(str(clip.source.params["text"]))
+                source = clip.source
+                if source is not None:
+                    definition = source_registry.get(source.kind)
+                    found.update(
+                        _typed_texts(
+                            source.params,
+                            definition.parameters if definition is not None else None,
+                        )
+                    )
+                    for stroke in source.strokes:
+                        found.update(_typed_texts(stroke.params, STROKE.parameters))
+                        found.update(_effect_texts(stroke.effects))
+                found.update(_effect_texts(clip.effects))
+                found.update(_effect_texts(clip.after_effects))
     lines = {line for text in found for line in (text, *text.splitlines())}
     return sorted(
         (line for line in lines if len(line.strip()) >= _SHORTEST_SECRET),
@@ -356,13 +471,17 @@ def text_secrets(project: Project) -> list[str]:
     )
 
 
-def hide_text(value: Any, secrets: Iterable[str]) -> Any:
+def hide_text(value: Any, secrets: Iterable[str], *, labels: bool = True) -> Any:
     """操作の名前（取り消しと履歴の道具の結果）の中の文字を伏せる 元の値は変えない
 
     表（今ある字幕と本文）に載った文字を伏せたうえで、「動き: 対象」の対象と、かぎ括弧の中を
     伏せる 表だけでは足りない 名前は文の頭（12 文字）で切ってあり、消したテキストや
     直す前の字幕の文も、表から消えた後まで履歴の名前に残る 動き（「テキストを追加」）は
     残すので、AI はどの操作を取り消したかを読める
+
+    ``labels`` が偽なら表で伏せるだけにする 操作の名前でない結果（欄の値・検査の一覧・互換性
+    レポート #391）は、値そのものを型で伏せてあり（:func:`masked_value`）、「: 」の後や括弧の中を
+    伏せると、検査の説明や AviUtl の API の名前まで読めなくなる
     """
     pairs = list(secrets)
 
@@ -370,6 +489,8 @@ def hide_text(value: Any, secrets: Iterable[str]) -> Any:
         for secret in pairs:
             if secret in text:
                 text = text.replace(secret, TEXT_MARK)
+        if not labels:
+            return text
         text = _QUOTED.sub(f"「{TEXT_MARK}」", text)
         for separator in (": ", "："):
             head, found, tail = text.partition(separator)

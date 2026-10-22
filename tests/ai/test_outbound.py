@@ -11,7 +11,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,7 @@ import pytest
 from sashimono.ai import bridge as bridge_module
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.handoff import StopReason, TurnRecord, shelf_for
-from sashimono.ai.host import EditorHost, ToolError
+from sashimono.ai.host import CompatReport, EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.outbound import (
     ASKED,
@@ -36,14 +36,30 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
     secret_pairs,
+    text_secrets,
 )
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import template_choice
-from sashimono.core.commands import AddMarkers, RemoveMedia, SetStyleGuide, SetTranscript
-from sashimono.core.model import Marker, MediaItem, StyleGuide, Transcript
+from sashimono.core.commands import (
+    AddEffect,
+    AddMarkers,
+    ParamPath,
+    RemoveMedia,
+    SetParam,
+    SetStyleGuide,
+    SetTranscript,
+)
+from sashimono.core.model import ClipId, Effect, Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
+from sashimono.effects import registry
+from sashimono.effects.definition import EffectDefinition
+from sashimono.effects.spec import TextSpec
 from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.profile import SoundProfiler
+from sashimono.engine.checks.report import Problem, assemble
+from sashimono.engine.checks.scan import TEXT_OVERFLOW
 from sashimono.engine.vision import Box, ScreenKind, ScreenReport, ScreenSample, TextLine
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
@@ -164,61 +180,49 @@ class TestDeclarations:
     ) -> None:
         # 壊れると、宣言に無い物（素材の場所・字幕の文・絵）を返す道具が、尋ねずに送る
         # 読むだけの道具を全部、引数なしで動かして、結果の中身から宣言を確かめる
-        secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
-        texts = {segment.text for segment in transcript.segments}
+        texts = _reading_host(secret_host, transcript, tmp_path)
         media = secret_host.document.project.media[0]
-        # 保存した作品 書き出した動画を調べる道具（check_output）が、外の場所を書いて断る道を通る
-        secret_host.saved_at = tmp_path / "作品.sme"
-        # 場面の解析が失敗した素材 断りの文に素材の名前が入る
-        secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
-        # 画面の文字（#324） 画面に映った字幕の文を読んだ結果 読む道具が本人の文を返す道を通る
-        # 顔は調べられなかった素材 断りの文に素材の名前が入る
-        read = ScreenSample(1.0, lines=(TextLine(sorted(texts)[0], Box(0.0, 0.0, 80.0, 20.0)),))
-        secret_host.screen_states[(media.id, ScreenKind.TEXT)] = ScreenState(
-            ScreenReport(ScreenKind.TEXT, "試験", 640, 360, (read,), planned=1, complete=True),
-            running=False,
-        )
-        secret_host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(
-            None, running=False, failure="部品が無い"
-        )
-        # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
-        secret_host.library.aliases.save(_styled_alias(LOOK_NAME))
-        secret_host.shelf = [SHELF_ENTRY]
-        # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
-        named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
-        secret_host.apply_commands([AddMarkers(tuple(named))], "目印")
-        # 字幕の文を書いた編集の方針（#343） 方針を読む道具が本人の文を返し、照らす道具は返さない
-        sentence = sorted(texts)[0]
-        guide = StyleGuide(fonts=("源ノ角ゴシック",), subtitles=sentence, notes=sentence)
-        secret_host.apply_commands([SetStyleGuide(guide)], "方針")
-        # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
-        secret_host.export_state = {
-            "state": "done",
-            "progress": 1.0,
-            "path": str(SECRET_PATH),
-            "message": f"書き出しました: {SECRET_PATH}",
-        }
-        # 途中で止まった指示の引き継ぎ（#346） 指示に字幕の文、失敗した道具の文に素材の場所が載る
-        put_handoff(secret_host, f"「{sentence}」の所で切って", f"{SECRET_PATH} を開けません")
-        # 混ぜた音の推移（#322 #338） 音の道具が待たずに結果（数の並びとグラフの絵）を返す道を通る
-        # 入れないと、解析を頼んだだけの断りの文しか見ず、グラフの絵の宣言を外しても落ちない
-        profiler = SoundProfiler(48000, 2)
-        profiler.add(np.full((48000 * 2, 2), 0.1))
-        secret_host.heard = profiler.snapshot()
         checked = 0
         for operation in OPERATIONS:
             if operation.writes or operation.asks:
                 continue
-            example = READ_EXAMPLES.get(operation.name)
-            arguments = example(str(media.id)) if example is not None else {}
-            try:
-                result: object = operation(secret_host, arguments)
-            except ToolError as exc:
-                # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
-                result = str(exc)
             checked += 1
-            assert not undeclared(operation, result, sentences=texts, places=secrets)
+            result = _read(operation, secret_host, str(media.id))
+            assert not undeclared(operation, result, sentences=texts, places=READ_PLACES)
         assert checked >= 10
+
+    @pytest.mark.parametrize(
+        ("name", "kind"),
+        [
+            # 人が画面で見ている物を読む道具（#352）
+            ("get_clip", Outbound.TEXT),
+            ("get_clip", Outbound.FILES),
+            ("get_compat_report", Outbound.APP_SETTINGS),
+            ("get_compat_report", Outbound.FILES),
+            ("get_compat_report", Outbound.TEXT),
+            ("get_app_settings", Outbound.APP_SETTINGS),
+            ("get_app_settings", Outbound.FILES),
+        ],
+    )
+    def test_weakening_a_reading_declaration_is_caught(
+        self,
+        name: str,
+        kind: Outbound,
+        secret_host: FakeHost,
+        transcript: Transcript,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると（上の見張りが道具の結果に秘密を載せないまま動いていると）、読む道具の宣言から
+        # 本文や場所や設定を外しても通り、同意の窓に出ない物が外へ出る（#352 で足した道具も見る）
+        texts = _reading_host(secret_host, transcript, tmp_path)
+        operation = _operation(name)
+        weakened = replace(
+            operation, sends=operation.sends - {kind}, hidden=operation.hidden - {kind}
+        )
+        media = secret_host.document.project.media[0]
+        result = _read(weakened, secret_host, str(media.id))
+        assert not undeclared(operation, result, sentences=texts, places=READ_PLACES)
+        assert undeclared(weakened, result, sentences=texts, places=READ_PLACES)
 
     @pytest.mark.parametrize("name", ["analyze_audio", "audio_graph"])
     def test_the_sound_tools_declare_the_file_they_were_given(
@@ -283,6 +287,92 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
 }
+
+
+#: 読む道具の結果に出たら、名前と場所を送ると書くべき文字
+READ_PLACES = frozenset({str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name})
+#: アプリの設定と互換性レポートに入れる目印 結果に出たら、アプリの設定を送ると書くべき道具
+APP_MARK = "秘密の設定の目印"
+
+
+def _reading_host(host: FakeHost, transcript: Transcript, tmp_path: Path) -> set[str]:
+    """読むだけの道具が、宣言した物をどれも結果に載せうる作品にする 字幕の文の組を返す"""
+    texts = {segment.text for segment in transcript.segments}
+    media = host.document.project.media[0]
+    # 保存した作品 書き出した動画を調べる道具（check_output）が、外の場所を書いて断る道を通る
+    host.saved_at = tmp_path / "作品.sme"
+    # 場面の解析が失敗した素材 断りの文に素材の名前が入る
+    host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+    # 画面の文字（#324） 画面に映った字幕の文を読んだ結果 読む道具が本人の文を返す道を通る
+    # 顔は調べられなかった素材 断りの文に素材の名前が入る
+    read = ScreenSample(1.0, lines=(TextLine(sorted(texts)[0], Box(0.0, 0.0, 80.0, 20.0)),))
+    host.screen_states[(media.id, ScreenKind.TEXT)] = ScreenState(
+        ScreenReport(ScreenKind.TEXT, "試験", 640, 360, (read,), planned=1, complete=True),
+        running=False,
+    )
+    host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(
+        None, running=False, failure="部品が無い"
+    )
+    # 保存した見た目と棚（#328） 一覧の道具が本人の持ち物の名前と、棚のフォルダの名前を返す
+    host.library.aliases.save(_styled_alias(LOOK_NAME))
+    host.shelf = [SHELF_ENTRY]
+    # 字幕の文を名前にした目印 目印の一覧と目次（#330）が本人の文を返す道を通る
+    named = [Marker(frame, text) for frame, text in zip((0, 150), sorted(texts), strict=False)]
+    host.apply_commands([AddMarkers(tuple(named))], "目印")
+    # 字幕の文を書いた編集の方針（#343） 方針を読む道具が本人の文を返し、照らす道具は返さない
+    sentence = sorted(texts)[0]
+    guide = StyleGuide(fonts=("源ノ角ゴシック",), subtitles=sentence, notes=sentence)
+    host.apply_commands([SetStyleGuide(guide)], "方針")
+    # 書き出し終えた様子（#327） 書き出しの様子を読む道具が、書き出し先の場所を返す道を通る
+    host.export_state = {
+        "state": "done",
+        "progress": 1.0,
+        "path": str(SECRET_PATH),
+        "message": f"書き出しました: {SECRET_PATH}",
+    }
+    # 人が選んで設定パネルに出しているテキスト（#352） 本文は字幕の文、画像を読むエフェクトは
+    # 本人の名前の入った場所を読む クリップの値を読む道具（get_clip）がどちらも返す道を通る
+    _operation("add_text")(host, {"text": sentence})
+    clip = next(
+        c.id
+        for track in host.document.project.timeline.tracks
+        for c in track.clips
+        if c.source is not None and c.source.kind == "text"
+    )
+    image = Effect(kind="image_blend", params={"image_file": str(SECRET_PATH)})
+    host.apply_commands([AddEffect(clip, image)], "画像")
+    host.select_clip(clip)
+    # 互換性レポート（#352） 本人のアプリの記録 置き場と失敗の文に本人の名前の入った場所が入る
+    recorded = CompatibilityReport()
+    recorded.note_missing(APP_MARK)
+    recorded.note_failure(SECRET_PATH.name, f"開けない: {SECRET_PATH}")
+    # 読めなかった制御文字の行には、テキストの文やスクリプトの見出しの文が入りうる（#391）
+    recorded.note_control(f"<#ff0000>{sentence}")
+    host.compat = CompatReport.of(recorded, scripts=1, folders=(str(SECRET_PATH.parent),))
+    # アプリの設定 置き場のフォルダ（本人の名前の入った場所）と目印
+    host.settings = {
+        "preferences": {"theme": APP_MARK, "state_folder": str(SECRET_PATH.parent)},
+        "shortcuts": {"編集/分割": "S"},
+    }
+    # 途中で止まった指示の引き継ぎ（#346） 指示に字幕の文、失敗した道具の文に素材の場所が載る
+    put_handoff(host, f"「{sentence}」の所で切って", f"{SECRET_PATH} を開けません")
+    # 混ぜた音の推移（#322 #338） 音の道具が待たずに結果（数の並びとグラフの絵）を返す道を通る
+    # 入れないと、解析を頼んだだけの断りの文しか見ず、グラフの絵の宣言を外しても落ちない
+    profiler = SoundProfiler(48000, 2)
+    profiler.add(np.full((48000 * 2, 2), 0.1))
+    host.heard = profiler.snapshot()
+    return texts
+
+
+def _read(operation: Operation, host: FakeHost, media_id: str) -> object:
+    """読む道具を例の引数で動かした結果 断られたら断りの文（どちらも外へ送る）"""
+    example = READ_EXAMPLES.get(operation.name)
+    arguments = example(media_id) if example is not None else {}
+    try:
+        return operation(host, arguments)
+    except ToolError as exc:
+        # エラーの文も外へ送る 引数が要る道具は、断った文の中身を見る
+        return str(exc)
 
 
 def _ids(host: FakeHost) -> dict[str, str]:
@@ -466,8 +556,9 @@ def undeclared(
     has_place = any(place in text for place in places) or redact(result, []) != result
     if has_place and Outbound.FILES not in operation.sends:
         missing.append(f"{operation.name}: 名前と場所 {text[:200]}")
-    if LOOK_NAME in text and Outbound.APP_SETTINGS not in operation.sends:
+    if (LOOK_NAME in text or APP_MARK in text) and Outbound.APP_SETTINGS not in operation.sends:
         # 保存したプリセットとエイリアスの名前は本人の持ち物 アプリの設定として送ると書く
+        # 設定の値と互換性レポート（#352）も本人のアプリの物
         missing.append(f"{operation.name}: アプリの設定 {text[:200]}")
     return missing
 
@@ -1226,3 +1317,202 @@ class TestRedact:
         result = box.get("result")
         assert isinstance(result, ImageResult)
         assert format_timecode(30, host.project.rate) in result.caption
+
+
+# --- 型の無い文字を返す読む道具（#391 の CodeRabbit の指摘）---
+
+#: はみ出した字幕の文 検査の行の text に載る
+OVERFLOW_TEXT = "はみ出した秘密の字幕です"
+
+
+def _overflowing(host: FakeHost) -> None:
+    """字幕のはみ出しを 1 つ見つけて終わった検査の様子を入れる（検査そのものは走らせない）"""
+    operation = _operation("check_output")
+    operation(host, {"checks": ["text_overflow"], "wait_seconds": 0})
+    request = host.check_requests[-1]
+    base = assemble(
+        [],
+        start=request.start,
+        end=request.end or 300,
+        analyzed=request.end or 300,
+        fps=30.0,
+        complete=True,
+        limits=request.limits,
+        index=None,
+        loudness=None,
+        peak=None,
+        length_seconds=None,
+    )
+    problem = Problem(
+        kind=TEXT_OVERFLOW,
+        severity="medium",
+        start=0,
+        end=30,
+        detail="字が画面の外へ出て切れる",
+        measure={"text": OVERFLOW_TEXT, "overflow_px": 40},
+    )
+    host.check = CheckState(request=request, report=replace(base, problems=(problem,)))
+
+
+def _compat_with_text(host: FakeHost) -> None:
+    recorded = CompatibilityReport()
+    recorded.note_control(f"<#ff0000>{OVERFLOW_TEXT}")
+    recorded.note_missing(f"debug_print: {OVERFLOW_TEXT}")
+    recorded.note_missing("obj.getpixeldata")
+    recorded.note_failure("秘密.anm", "開けない: 秘密.anm")
+    host.compat = CompatReport.of(recorded, scripts=1, folders=("秘密のフォルダ",))
+
+
+class TestUntypedTextIsHidden:
+    @pytest.mark.parametrize(
+        ("name", "arguments", "prepare"),
+        [
+            ("check_output", {"checks": ["text_overflow"], "wait_seconds": 0}, _overflowing),
+            ("get_compat_report", {}, _compat_with_text),
+        ],
+    )
+    def test_refused_text_is_hidden_and_the_rest_is_read(
+        self,
+        host: FakeHost,
+        text_refused: EditorBridge,
+        name: str,
+        arguments: dict[str, Any],
+        prepare: Callable[[FakeHost], None],
+    ) -> None:
+        """壊れると、字幕のはみ出しの行の文や、互換性レポートの記録に混ざった本人の文
+        （制御文字の行・debug_print）を、字幕と文字を送らない人の所でもそのまま送る
+        道具そのものは断らず、文以外（種類・回数・時刻）は読める"""
+        prepare(host)
+        seen, box = _run(text_refused, name, arguments=arguments)
+        assert not seen
+        assert box.get("error") is None, box.get("error")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert OVERFLOW_TEXT not in sent
+        assert TEXT_MARK in sent
+
+    def test_places_in_the_report_are_hidden_when_names_are_refused(self, host: FakeHost) -> None:
+        """壊れると、互換性レポートの置き場や失敗の文の相対の名前（秘密.anm）が、名前と場所を
+        送らない人の所で場所の形に当たらずに外へ出る"""
+        _compat_with_text(host)
+        bridge = EditorBridge(host)
+        bridge.set_send_choices(
+            dict.fromkeys(ASKED, SendChoice.ALLOW) | {Outbound.FILES: SendChoice.DENY}
+        )
+        _seen, box = _run(bridge, "get_compat_report")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert "秘密" not in sent
+        assert '"count"' in sent
+
+    @pytest.mark.parametrize(
+        ("name", "arguments", "prepare"),
+        [
+            ("check_output", {"checks": ["text_overflow"], "wait_seconds": 0}, _overflowing),
+            ("get_compat_report", {}, _compat_with_text),
+        ],
+    )
+    def test_weakening_the_declaration_is_caught(
+        self,
+        host: FakeHost,
+        name: str,
+        arguments: dict[str, Any],
+        prepare: Callable[[FakeHost], None],
+    ) -> None:
+        """壊れると、本人の文を返す道具から字幕と文字の宣言を外しても見張りが気付かず、
+        設定画面と同意の窓に出ないまま文が送られる"""
+        prepare(host)
+        operation = _operation(name)
+        weakened = replace(
+            operation,
+            sends=operation.sends - {Outbound.TEXT},
+            hidden=operation.hidden - {Outbound.TEXT},
+        )
+        result = weakened(host, arguments)
+        assert not undeclared(operation, result, sentences={OVERFLOW_TEXT})
+        assert undeclared(weakened, result, sentences={OVERFLOW_TEXT})
+
+
+# --- 文字の欄（TextSpec）は名前に関係なく字幕と文字として伏せる（#391 の Codex の指摘）---
+
+#: テキストの「タイマーの書式」（text の名前ではない文字の欄）に書いた本人の文
+TYPED_TEXT = "書式に書いた秘密の文です"
+#: AviUtl のスクリプトの文字の欄（--text の名前を変えた物）に書いた本人の文
+SCRIPT_TEXT = "スクリプトの欄に書いた秘密の文"
+#: 文字の欄を持つスクリプトの種類 試験の間だけ登録する
+SCRIPT_KIND = "aviutl.script:試しの文字@試験"
+
+
+@pytest.fixture
+def scripted() -> Iterator[str]:
+    registry.register(
+        EffectDefinition(
+            kind=SCRIPT_KIND,
+            label="試しの文字",
+            category="試し",
+            parameters=(TextSpec("message", "文字", ""),),
+        )
+    )
+    yield SCRIPT_KIND
+    registry.unregister(SCRIPT_KIND)
+
+
+def _typed_texts(host: FakeHost, kind: str) -> ClipId:
+    """text 以外の名前の文字の欄に本人の文を書いたテキストを 1 本置いて選ぶ"""
+    _operation("add_text")(host, {"text": "見出し"})
+    clip = next(
+        c.id
+        for track in host.document.project.timeline.tracks
+        for c in track.clips
+        if c.source is not None and c.source.kind == "text"
+    )
+    host.apply_commands(
+        [
+            SetParam(ParamPath.of_source(clip, "timer_format"), TYPED_TEXT),
+            AddEffect(clip, Effect(kind=kind, params={"message": SCRIPT_TEXT})),
+        ],
+        "文字の欄",
+    )
+    host.select_clip(clip)
+    return clip
+
+
+class TestTypedTextIsHidden:
+    def test_every_text_field_is_in_the_table(self, host: FakeHost, scripted: str) -> None:
+        """壊れると、伏せ字の表が text の名前の欄しか集めず、スクリプトの文字の欄やタイマーの
+        書式に本人が書いた文を、字幕と文字を送らないと決めた人の所でもそのまま送る"""
+        _typed_texts(host, scripted)
+        secrets = text_secrets(host.document.project)
+        assert TYPED_TEXT in secrets
+        assert SCRIPT_TEXT in secrets
+
+    def test_reading_a_clip_hides_every_text_field(
+        self, host: FakeHost, scripted: str, text_refused: EditorBridge
+    ) -> None:
+        """壊れると、get_clip がスクリプトの文字の欄の文を、字幕と文字を送らない人の所でも
+        外へ送る"""
+        _typed_texts(host, scripted)
+        _seen, box = _run(text_refused, "get_clip")
+        assert box.get("error") is None, box.get("error")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert TYPED_TEXT not in sent
+        assert SCRIPT_TEXT not in sent
+        # 文字でない値（大きさ）は読める
+        assert '"size"' in sent
+
+    @pytest.mark.parametrize("kind", [Outbound.TEXT, Outbound.FILES])
+    def test_weakening_the_declaration_is_caught(
+        self, host: FakeHost, scripted: str, kind: Outbound
+    ) -> None:
+        """壊れると（get_clip が字幕と文字や名前と場所を送ると書かなくなると）、設定画面と
+        同意の窓に出ないまま、文字の欄と場所の欄の値が送られるのに、送る物の見張りが気付かない"""
+        clip = _typed_texts(host, scripted)
+        image = Effect(kind="image_blend", params={"image_file": str(SECRET_PATH)})
+        host.apply_commands([AddEffect(clip, image)], "画像")
+        operation = _operation("get_clip")
+        weakened = replace(
+            operation, sends=operation.sends - {kind}, hidden=operation.hidden - {kind}
+        )
+        # 編集画面の中から直に呼んだ形（許しを立てない）で、道具が返しうる物を全部見る
+        result = weakened(host, {})
+        sentences = {SCRIPT_TEXT, TYPED_TEXT}
+        assert not undeclared(operation, result, sentences=sentences, places=READ_PLACES)
+        assert undeclared(weakened, result, sentences=sentences, places=READ_PLACES)

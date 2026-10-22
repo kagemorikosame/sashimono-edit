@@ -387,6 +387,13 @@ class ExportDialog(QDialog):
         self._worker.failed.connect(self._on_failed)
         self._thread.start()
 
+    @property
+    def export_progress(self) -> float | None:
+        """書き出しの進み具合（0〜1） 走っていなければ ``None`` AI が人の書き出しを読む口（#352）"""
+        if self._worker is None:
+            return None
+        return self._progress.value() / self._progress.maximum()
+
     def _cancel_or_close(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
