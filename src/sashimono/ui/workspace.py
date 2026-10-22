@@ -29,6 +29,7 @@ from sashimono.ai.budget import (
     LimitAction,
     Limits,
 )
+from sashimono.ai.fixes import FIX_ROUNDS_RANGE
 from sashimono.ai.models import DEFAULT_EFFORT as DEFAULT_AI_EFFORT
 from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
@@ -636,6 +637,10 @@ class Preferences:
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
     check_loudness_target: int = -14
+    #: AI アシスタントが検査（#337）で見つけた問題を直して調べ直す回数の上限（#339）
+    #: どこまで任せるかは人で違う 0 は調べるだけで直さない 既定の 3 は、音量をそろえた後に
+    #: 音割れや字幕を直すような 2〜3 段の直しで足り、止まらない繰り返しは早めに人へ返す側
+    ai_fix_rounds: int = 3
     #: AI アシスタントが BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅（dB）
     #: 声を聞かせたい量は作品と BGM で違う AI に値を言わなければこれを使う 既定は放送や
     #: 配信の手引きでよく使う 10〜15 dB の真ん中の 12（:mod:`sashimono.core.mixing`）
@@ -1046,6 +1051,7 @@ class PreferenceStore:
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
+            ai_fix_rounds=_within(data.get("ai_fix_rounds"), FIX_ROUNDS_RANGE, plain.ai_fix_rounds),
             duck_depth_db=_within(
                 data.get("duck_depth_db"), DUCK_DEPTH_DB_RANGE, plain.duck_depth_db
             ),
