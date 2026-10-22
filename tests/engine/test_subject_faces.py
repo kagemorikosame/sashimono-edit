@@ -38,10 +38,12 @@ from sashimono.engine.subject import (
     SubjectTrack,
     best_center,
     face_profiles,
+    sample_grid,
     with_faces,
 )
 from sashimono.engine.vision import Box, Face, ScreenKind, ScreenReport, ScreenSample, scan_screen
 from sashimono.engine.vision.sampling import sample_times
+from tests.media_fixtures import ffmpeg_available, make_rotated
 from tests.subject_video import (
     DRAWING,
     EYE,
@@ -50,6 +52,7 @@ from tests.subject_video import (
     HEIGHT,
     WIDTH,
     write_drawing_video,
+    write_turned_video,
 )
 
 #: 縦の枠の幅（1920x1080 から 1080x1920 を切るときの割合）
@@ -313,3 +316,54 @@ class TestTheMadeVideo:
         report = replace(_faces_of(media, signal, FakeFaces()), stream=7)
         plan = _plan(media, replace(signal, stream=0), {media.id: report})
         assert not plan.shots[0].faces
+
+
+@pytest.fixture(scope="module", params=[90, 180, 270])
+def turned(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> tuple[MediaItem, SceneSignal]:
+    """回転の情報を持つ素材（回した後の右 3/4 に顔） ffmpeg が無い機械では飛ばす"""
+    if not ffmpeg_available():
+        pytest.skip("ffmpeg が PATH に無いので回転の情報を付けられない")
+    rotation = int(request.param)
+    folder = tmp_path_factory.mktemp(f"turned{rotation}")
+    raw = write_turned_video(folder / "raw.mp4", rotation)
+    # ffmpeg の -display_rotation は反時計回り 素材の回転（時計回り）にするには裏返す
+    path = make_rotated(folder, "turned.mp4", raw, (360 - rotation) % 360)
+    forget_probe(path)
+    media = probe_media(path)
+    assert media.video_streams[0].rotation == rotation
+    signal = analyze_scenes(path)
+    assert signal is not None
+    return media, signal
+
+
+class TestTurnedVideo:
+    """スマホの縦撮りのように回転の情報を持つ素材（#407 で見つけた #334 からの性質）
+
+    場面の解析は回す前の絵で数え、プレビュー・書き出し・顔の位置は回した後の絵で見る
+    """
+
+    def test_the_grid_reaches_the_far_edge(self) -> None:
+        # 整数の間隔で頭から拾うと、割り切れない大きさ（縦撮りの回す前 180x320・1080x1920）で
+        # 右と下が抜け、被写体が実際より左上に数えられる
+        for full, count in ((180, 64), (1080, 64), (1920, 114), (1920, 64)):
+            grid = sample_grid(full, count)
+            assert grid[0] < full / count
+            assert grid[-1] >= full - full / count - 1
+
+    def test_the_frame_goes_to_the_person(self, turned: tuple[MediaItem, SceneSignal]) -> None:
+        # 回さずに使うと、回す前の縦の分布を横の分布と読み、枠が真ん中か反対の端に決まって
+        # スマホで撮った話し手が映らない
+        media, signal = turned
+        assert _focus_share(_plan(media, signal, None)) == pytest.approx(0.75, abs=0.05)
+
+    def test_the_faces_agree_with_the_motion(self, turned: tuple[MediaItem, SceneSignal]) -> None:
+        # 顔（回した後の絵）と動きと肌色（回す前の絵）の向きが違うと、2 つの手がかりが別々の所を
+        # 指し、混ぜた枠がどちらでもない所に決まる
+        media, signal = turned
+        report = _faces_of(media, signal, FakeFaces())
+        assert any(sample.faces for sample in report.samples)
+        plan = _plan(media, signal, {media.id: report})
+        assert plan.shots[0].faces
+        assert _focus_share(plan) == pytest.approx(0.75, abs=0.05)

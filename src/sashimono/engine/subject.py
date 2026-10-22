@@ -60,6 +60,7 @@ __all__ = [
     "best_center",
     "face_profiles",
     "gathering",
+    "sample_grid",
     "skin_mask",
     "with_faces",
 ]
@@ -152,6 +153,35 @@ class SubjectTrack:
 
     def __len__(self) -> int:
         return int(self.times.shape[0])
+
+    def oriented(self, rotation: int) -> SubjectTrack:
+        """素材の回転（時計回り 0・90・180・270 :attr:`VideoStreamInfo.rotation`）を当てた並び
+
+        場面の解析は回す前の絵（デコーダの出したまま）で数えるが、プレビューと書き出しと
+        顔の位置（#324）は回した後の絵で見る 回さずに使うと、スマホの縦撮りで横の分布を
+        縦の分布として読み、枠が人のいない所に決まる（#407 で見つけた #334 からの性質）
+        控えは回す前のまま持ち、使う所で回す（回転の情報を読み直した素材でも控えが使える）
+
+        時計回り 90 度は、回した後の左からの位置が回す前の下からの位置、上からの位置が回す前の
+        左からの位置になる（``np.rot90(k=-1)`` と同じ）
+        """
+        turn = rotation % 360
+        if turn == 0 or len(self) == 0:
+            return self
+        if turn == 90:
+            columns, rows = self.rows[:, ::-1], self.columns
+        elif turn == 180:
+            columns, rows = self.columns[:, ::-1], self.rows[:, ::-1]
+        elif turn == 270:
+            columns, rows = self.rows, self.columns[:, ::-1]
+        else:
+            raise ValueError(f"回転は 90 度ごとです（{rotation}）")
+        return SubjectTrack(
+            times=self.times,
+            columns=np.ascontiguousarray(columns),
+            rows=np.ascontiguousarray(rows),
+            strength=self.strength,
+        )
 
     def centers(self, window: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
         """行ごとの枠の中心（横は左から、縦は上から 素材の幅と高さに対する割合）
@@ -385,6 +415,19 @@ def _normalized(values: np.ndarray) -> np.ndarray:
     return normalized
 
 
+def sample_grid(full: int, count: int) -> np.ndarray:
+    """``full`` 画素から ``count`` 個を等間隔に拾う位置（升の真ん中）
+
+    前は整数の間隔（``full // count``）で頭から拾っていて、割り切れない大きさでは絵の右と下が
+    抜けた 抜けた分だけ位置の割合が縮み、縦撮りのスマホの素材（回す前 1080x1920 なら右の 5%
+    合成の 180x320 なら 3 割）で被写体が実際より左上に数えられた（#407）
+    """
+    picked: np.ndarray = np.minimum(
+        ((np.arange(count) + 0.5) * full / max(count, 1)).astype(np.intp), full - 1
+    )
+    return picked
+
+
 def skin_mask(frame: av.VideoFrame, luma: np.ndarray) -> np.ndarray | None:
     """縮めた輝度 ``luma`` と同じ升の肌色の印 色を持たない素材（灰色）は ``None``
 
@@ -394,10 +437,8 @@ def skin_mask(frame: av.VideoFrame, luma: np.ndarray) -> np.ndarray | None:
     height, width = luma.shape
     layout = _DIRECT.get(frame.format.name)
     if layout is not None and frame.width >= width and frame.height >= height:
-        step_y = frame.height // height
-        step_x = frame.width // width
-        ys = step_y // 2 + np.arange(height) * step_y
-        xs = step_x // 2 + np.arange(width) * step_x
+        ys = sample_grid(frame.height, height)
+        xs = sample_grid(frame.width, width)
         sub_x, sub_y, interleaved, cb_first = layout
         if interleaved:
             plane = frame.planes[1]

@@ -277,6 +277,13 @@ def _stream_of(media: MediaItem, wanted: int) -> int | None:
     return media.video_streams[0].index
 
 
+def _rotation_of(media: MediaItem, wanted: int) -> int:
+    """デコーダが絵に当てる回転（時計回り） 選び方はデコーダと同じ（:func:`_stream_of`）"""
+    index = _stream_of(media, wanted)
+    stream = next((s for s in media.video_streams if s.index == index), None)
+    return 0 if stream is None else stream.rotation
+
+
 def _inside(
     center: tuple[float, float],
     half: tuple[float, float],
@@ -320,7 +327,13 @@ class _Tracker:
                 or signal.stream in (None, _stream_of(picture.media, picture.clip.stream_index))
             )
         )
-        self._subject = subject if usable else None
+        # 場面の解析は回す前の絵で数える プレビュー・書き出し・顔の位置と同じ回した後の向きへ
+        # 直す 直さないと、スマホの縦撮りで枠が人のいない所に決まる（#407）
+        self._subject = (
+            subject.oriented(_rotation_of(picture.media, picture.clip.stream_index))
+            if usable and subject is not None
+            else None
+        )
         #: 行ごとの、顔の位置を手がかりに使ったか（返事の ``faces`` に使う）
         self._faced: np.ndarray | None = None
         # 別の映像ストリームを調べた顔は使わない 同じ素材の別の絵の顔へ枠を寄せることになる

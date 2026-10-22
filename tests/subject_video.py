@@ -30,6 +30,7 @@ __all__ = [
     "WIDTH",
     "write_drawing_video",
     "write_subject_video",
+    "write_turned_video",
 ]
 
 WIDTH, HEIGHT, FPS = 320, 180, 30
@@ -93,6 +94,37 @@ def write_drawing_video(path: Path, seconds: int = 4) -> Path:
         stream.width, stream.height, stream.pix_fmt = WIDTH, HEIGHT, "yuv420p"
         for index in range(FPS * seconds):
             frame = av.VideoFrame.from_ndarray(_drawing(index), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return path
+
+
+def write_turned_video(path: Path, rotation: int, seconds: int = 2) -> Path:
+    """回して見る素材（スマホの縦撮りの形 #407）の、回す前の絵だけを焼く
+
+    回した後（時計回りに ``rotation`` 度）に、暗い青の地の右上（横の 3/4・上から 1/3）に目の
+    印の付いた顔が見える絵を、逆に回して書く 回転の情報は ffmpeg で付ける
+    （tests/media_fixtures.py の ``make_rotated``） 回す前と後で縦横が入れ替わる
+    90・270 度は、回す前が縦長
+    """
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=FPS)
+        turned = rotation in (90, 270)
+        stream.width = HEIGHT if turned else WIDTH
+        stream.height = WIDTH if turned else HEIGHT
+        stream.pix_fmt = "yuv420p"
+        for index in range(FPS * seconds):
+            # 顔は縦の真ん中から外す（上の 1/3） 真ん中だと、横と縦を取り違えても割合が
+            # たまたま近くなり、取り違えを見落とす
+            x, y = WIDTH * 3 // 4, HEIGHT // 3
+            upright = np.roll(_face(x, index), y - HEIGHT // 2, axis=0)
+            upright[y - 10 : y - 5, x - 12 : x - 6] = EYE
+            upright[y - 10 : y - 5, x + 6 : x + 12] = EYE
+            # 回した後が upright になる絵は、upright を反時計回りに同じだけ回した物
+            raw = np.ascontiguousarray(np.rot90(upright, k=rotation // 90))
+            frame = av.VideoFrame.from_ndarray(raw, format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode():

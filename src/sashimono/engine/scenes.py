@@ -33,7 +33,7 @@ import numpy as np
 
 from sashimono.engine.decode.probe import media_origin, moving_pictures
 from sashimono.engine.decode.rational import as_fraction
-from sashimono.engine.subject import SubjectScan, SubjectTrack, skin_mask
+from sashimono.engine.subject import SubjectScan, SubjectTrack, sample_grid, skin_mask
 
 __all__ = [
     "DEFAULT_MIN_SCENE",
@@ -397,12 +397,10 @@ def _luma(frame: av.VideoFrame) -> np.ndarray:
     if frame.format.name in _EIGHT_BIT_LUMA and frame.width >= width and frame.height >= height:
         plane = frame.planes[0]
         rows = np.frombuffer(plane, np.uint8).reshape(-1, plane.line_size)
-        rows = rows[: frame.height, : frame.width]
-        step_y = frame.height // height
-        step_x = frame.width // width
-        return np.ascontiguousarray(
-            rows[step_y // 2 :: step_y, step_x // 2 :: step_x][:height, :width]
-        )
+        # 拾う升は肌色（:func:`~sashimono.engine.subject.skin_mask`）と同じ 割り切れない
+        # 大きさでも絵の端まで拾う（#407）
+        picked = rows[np.ix_(sample_grid(frame.height, height), sample_grid(frame.width, width))]
+        return np.ascontiguousarray(picked, np.uint8)
     return frame.reformat(width=width, height=height, format="gray").to_ndarray()
 
 
