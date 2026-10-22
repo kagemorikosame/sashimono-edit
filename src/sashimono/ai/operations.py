@@ -32,6 +32,16 @@ from sashimono.ai.auto_fix import (
     plan_color_fix,
     plan_noise_fix,
 )
+from sashimono.ai.fixes import AUTO as FIX_AUTO
+from sashimono.ai.fixes import (
+    FIX_ACTIONS,
+    CheckTicket,
+    FixRound,
+    current_round,
+    fix_for,
+    settle_check,
+    start_check,
+)
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -2707,20 +2717,31 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
     request = _check_request(host, arguments)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    # 頼みの控えを取り、この後の直しを別の段に区切る（#339） 数えは結果を使えたときに確定する
+    # 引数を確かめた後にする 断った呼び出しで区切ると、引数を直して呼び直すだけで段が割れる
+    # 書き出した動画のファイルを調べるときは控えを取らず区切らない（直し方を返さないので
+    # 直す回が無い）
+    ticket = start_check(host.document, host.fix_rounds) if request.project is not None else None
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
-        return _check_result(host, request, state, arguments)
+        return _check_result(host, request, state, arguments, ticket)
     return Pending(
         wait=host.check_waiter(),
         seconds=wait,
-        then=lambda: _check_result(host, request, host.check_state(), arguments),
+        then=lambda: _check_result(host, request, host.check_state(), arguments, ticket),
     )
 
 
 def _check_result(
-    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+    host: EditorHost,
+    request: CheckRequest,
+    state: CheckState,
+    arguments: dict[str, Any],
+    ticket: CheckTicket | None,
 ) -> object:
+    # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
+    # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
     report = state.report
@@ -2729,6 +2750,21 @@ def _check_result(
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
     timeline = request.project is not None
+    # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
+    # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
+    # 古い作品の物で、今の作品へ直しを当てると消えた・動いたクリップを触る 取り消して同じ形へ
+    # 戻っただけなら同じ作品として直しを返す
+    stale = request.project is not None and _project(host) != request.project
+    # 途中までの結果（走っている・止められた・終わっていない）でも直さない 途中で直すと、続きを
+    # 読む呼び出しが調べ直しになって新しい回に数えられ、残りの問題を見ないまま直す
+    unsettled = stale or state.running or state.stopped or not report.complete
+    rounds: FixRound | None = None
+    if ticket is not None:
+        rounds = (
+            current_round(host.document, host.fix_rounds)
+            if unsettled
+            else settle_check(host.document, ticket, host.fix_rounds)
+        )
     rate = request.project.rate if request.project is not None else None
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
@@ -2749,12 +2785,21 @@ def _check_result(
             row["clip_ids"] = list(problem.clip_ids)
         if problem.ongoing:
             row["ongoing"] = True
+        # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
+        row["fix"] = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
     notes = [str(result.pop("note"))] if "note" in result else []
     severities: dict[str, int] = {}
+    fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
+        action = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        )
+        fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2769,7 +2814,10 @@ def _check_result(
             "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
             "counts": report.counts(),
             "severities": severities,
+            # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
+            "fixes": fixes,
         },
+        "fix_round": None if rounds is None else rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2795,14 +2843,56 @@ def _check_result(
         notes.append("問題は見つかりませんでした")
     elif not report.problems and report.checked:
         notes.append("調べた種類（checks）には問題がありませんでした")
-    if request.project is not None and _project(host) != request.project:
+    if stale:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
-            " 今の作品を調べるにはもう 1 度呼んでください"
+            " この結果からは直さず（直す回も数えていません）、もう 1 度呼んで今の作品を"
+            "調べ直し、その結果の fix に従ってください"
         )
+    elif unsettled and timeline:
+        notes.append(
+            "検査が終わっていないので、この結果からはまだ直さないでください（直す回も数えて"
+            "いません） 終わった結果の fix に従ってください"
+        )
+    else:
+        notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき
+    ``unsettled`` は使えない結果（途中まで・止められた・調べている間に作品が変わった）"""
+    if rounds is None:
+        return {"timeline": False}
+    return {"closed": rounds.closed, "unsettled": unsettled}
+
+
+def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:
+    """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds is None:
+        return [
+            "書き出した動画のファイルを調べた結果です 今の作品から書き出した物かは確かめて"
+            "いないので、今の作品は直さないでください 直すなら path を省いてタイムラインを"
+            "調べ直してください"
+        ]
+    if rounds.closed:
+        if rounds.limit == 0:
+            return [
+                "本人の設定で、検査の後に直さないことになっています（直す回数の上限 0）"
+                " この指示ではもう編集できません 見つかった問題を人へ伝えてください"
+            ]
+        return [
+            f"直す回数の上限（{rounds.limit} 回）に達しました この指示ではもう編集できません"
+            " 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を人へ伝えてください"
+        ]
+    if fixes[FIX_AUTO]:
+        return [
+            f"fix の action が auto の物を直してから、もう 1 度 check_output で調べてください"
+            f"（{rounds.next_round} 回目の直し 上限 {rounds.limit} 回）"
+        ]
+    return []
 
 
 # --- 音の推移と見分け（#322 #338）---
@@ -6584,7 +6674,12 @@ OPERATIONS: tuple[Operation, ...] = (
             "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
             " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
             " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
-            + PAGING_NOTE
+            " 各問題の fix は直し方（action が auto は直してよい・ask は人に尋ねてから・"
+            "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
+            " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
+            " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
+            "その指示ではもう編集できない path で書き出した動画を調べた結果は、今の作品から"
+            "書き出した物とは限らないので fix がどれも handoff になり、回数も数えない" + PAGING_NOTE
         ),
         schema=_schema(
             {
