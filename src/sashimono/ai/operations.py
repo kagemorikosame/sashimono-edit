@@ -2721,6 +2721,10 @@ def _check_result(
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
     report = state.report
+    if (state.failure is not None or report is None) and rounds is not None:
+        # 使えない結果で直す回を使わない 頼みが一致した後だけ戻す（別の検査に替わったときは、
+        # その検査を始めた呼び出しが数え直しているので、ここで戻すとそちらの数えを消す）
+        forget_check(host.document, rounds.limit)
     if state.failure is not None:
         raise ToolError(f"調べられませんでした: {state.failure}")
     if report is None:

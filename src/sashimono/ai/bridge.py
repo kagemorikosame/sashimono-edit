@@ -260,6 +260,11 @@ class EditorBridge:
         """
         # 量の上限は同意より先に見る 上限で止まる道具の同意を尋ねても、答えた後に断るだけになる
         self._keep_within_budget(operation)
+        # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを
+        # 尋ねると、人が答えた後で断るだけになる 量の上限の後にするのは、量の上限で止めたときは
+        # 「道具を使わずに終える」と返す方が、上限の種類にかかわらず AI の次の手が決まるため
+        if operation.writes and not operation.irreversible:
+            self._refuse_after_fix_limit(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -270,8 +275,6 @@ class EditorBridge:
             return self.ask(spec)
         if operation.irreversible:
             return self._run_irreversible(operation, arguments)
-        if operation.writes:
-            self._refuse_after_fix_limit(operation)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)
@@ -314,7 +317,8 @@ class EditorBridge:
     def _refuse_after_fix_limit(self, operation: Operation) -> None:
         """検査の直しの回数が上限に達した指示では、取り消せる編集を断る（#339）
 
-        回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 確かめの窓を出す前に断る
+        回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 送る前の同意と確かめの窓を
+        出す前に断る
         出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
         書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
         取り消せない操作の道を通るので、ここへは来ない

@@ -289,6 +289,43 @@ class TestChangedWhileWaiting:
         assert fresh["fix_round"]["closed"] is True
 
 
+class TestUnusableResults:
+    def test_a_failed_check_does_not_use_up_a_round(self, host: FakeHost) -> None:
+        """壊れると、検査が失敗して何も分からなかったのに直す回を使い、上限 1 なら調べ直した
+        後に直せない"""
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "AI の直し")
+        pending = _tool("check_output")(host, {"wait_seconds": 30})
+        assert isinstance(pending, Pending)
+        request: CheckRequest = host.check_requests[-1]
+        host.check = CheckState(request=request, failure="読めない")
+        with pytest.raises(ToolError, match="調べられません"):
+            pending.then()
+        assert not fixes_closed(host.document)
+        # 本物の窓は失敗した頼みを同じ頼みでも調べ直す 偽のホストでは様子を空へ戻して同じにする
+        host.check = CheckState()
+        fresh = _finish(host, [_MIXED_CLIP])
+        host.document.end_checkpoint()
+        assert fresh["fix_round"]["used"] == 1
+
+    def test_a_missing_report_does_not_use_up_a_round(self, host: FakeHost) -> None:
+        """壊れると、結果がまだ無いと断った呼び出しで直す回を使い、上限に達して直せなくなる"""
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "AI の直し")
+        pending = _tool("check_output")(host, {"wait_seconds": 30})
+        assert isinstance(pending, Pending)
+        request: CheckRequest = host.check_requests[-1]
+        host.check = CheckState(request=request)
+        with pytest.raises(ToolError, match="まだありません"):
+            pending.then()
+        host.document.end_checkpoint()
+        assert not fixes_closed(host.document)
+
+
 class TestAnswer:
     def test_each_problem_says_how_to_fix_it(self, host: FakeHost) -> None:
         """壊れると、AI はどの道具で直すか・尋ねるべきかを知らずに、見つけた物を
@@ -433,6 +470,24 @@ class TestBridge:
         host.document.end_checkpoint()
         assert "error" not in box, box
         assert host.document.project.name != "直し"
+
+    def test_it_refuses_before_asking_to_send(self, host: FakeHost) -> None:
+        """壊れると、上限で断ると決まっている道具のために「外へ送ってよいか」の窓が出て、
+        人が答えた後で断られる"""
+        self._closed(host)
+        # 送る物は既定の「尋ねる」のまま 文を送る道具を呼ぶ
+        bridge = EditorBridge(host, auto_approve=True)
+        operation = _tool("add_text")
+        assert Outbound.TEXT in operation.sends
+        done, box = call_in_thread(bridge, operation, {"text": "字幕", "frame": 0})
+        pump_until(bridge, done, timeout=2.0)
+        asked = bridge.take_send_request()
+        bridge.cancel()
+        done.wait(5.0)
+        host.document.end_checkpoint()
+        assert asked is None
+        assert isinstance(box.get("error"), ToolError)
+        assert "上限" in str(box["error"])
 
     def test_cancelling_an_export_still_works_after_the_limit(self, host: FakeHost) -> None:
         """壊れると、直す回数の上限に達した後、AI が始めた書き出しを AI が止められない"""
