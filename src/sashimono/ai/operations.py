@@ -254,7 +254,7 @@ from sashimono.engine.audio.speech import (
     voice_speech,
 )
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
 from sashimono.engine.checks import KINDS as CHECK_KINDS
 from sashimono.engine.checks import (
@@ -289,6 +289,7 @@ from sashimono.engine.encode import (
     export_target,
 )
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
+from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
 __all__ = [
     "ASK_USER",
@@ -2058,6 +2059,171 @@ def _scene_places(
                 continue
             places.append({"clip_id": str(clip.id), "frame": frame})
     return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
+
+
+# --- 画面の中身（文字と顔の位置 #324）---
+
+#: 顔の確からしさの下限の既定 手元の見本（群衆の写真）で本物の顔が 0.79〜0.92 だった
+#: OpenCV Zoo の見本の 0.9 では小さな顔の大半を落とし、0.5 では顔でない物も混ざる
+DEFAULT_FACE_SCORE = 0.8
+#: 下限として受け付ける範囲 覚えるのは 0.5 から
+#: （:data:`~sashimono.engine.vision.faces.SCORE_FLOOR`）
+FACE_SCORE_RANGE = (0.5, 1.0)
+#: 位置の決まりの説明 道具の説明と返事に同じ文を書く
+SCREEN_COORDINATES = (
+    "x と y は枠の中心で、絵（素材の映像）の中心からの画素 右と上が正（作品の位置と同じ向き）"
+    " width と height は枠の大きさ"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScreenQuery:
+    kind: ScreenKind
+    start: float | None
+    end: float | None
+    wait: float
+    min_score: float
+
+
+def _screen_query(arguments: dict[str, Any], kind: ScreenKind) -> _ScreenQuery:
+    start = _optional_number(arguments, "from_seconds", 0.0)
+    end = _optional_number(arguments, "to_seconds", 0.0)
+    if start is not None and end is not None and end <= start:
+        raise ToolError("to_seconds は from_seconds より後にしてください")
+    wait = _number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT)
+    score = _number_or(arguments, "min_score", DEFAULT_FACE_SCORE, *FACE_SCORE_RANGE)
+    return _ScreenQuery(kind, start, end, wait, score)
+
+
+def _detect_text(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の画面の中の文字を、場面ごとに数枚読んで返す"""
+    return _detect_screen(host, arguments, ScreenKind.TEXT)
+
+
+def _detect_faces(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の中の顔の位置を、場面ごとに数枚調べて返す"""
+    return _detect_screen(host, arguments, ScreenKind.FACES)
+
+
+def _detect_screen(host: EditorHost, arguments: dict[str, Any], kind: ScreenKind) -> object:
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    if not media.has_video:
+        raise ToolError(f"{media.name} には映像がありません（{kind.label}は映像の絵から調べます）")
+    query = _screen_query(arguments, kind)
+    # 頼むのは呼ばれた最初だけ 失敗した素材（部品が無かった）も、呼ばれたら頼み直す
+    # 部品を入れた後に AI が呼び直せば、そのまま調べ始める
+    host.request_screen(media, kind)
+    state = host.screen_state(media, kind)
+    if state.complete or not state.running or query.wait <= 0:
+        return _screen_result(host, media, query, state, arguments)
+    media_id = media.id
+
+    def finish() -> object:
+        # 待っている間に素材が外されたら、外したことを伝える（場面の検出と同じ）
+        again = _require_media(_project(host), str(media_id))
+        return _screen_result(host, again, query, host.screen_state(again, kind), arguments)
+
+    return Pending(wait=host.screen_waiter(media_id, kind), seconds=query.wait, then=finish)
+
+
+def _screen_rows(
+    project: Project, media: MediaItem, report: ScreenReport, query: _ScreenQuery
+) -> list[dict[str, Any]]:
+    stream = _video_stream(media, report.stream)
+    rows: list[dict[str, Any]] = []
+    for sample in report.samples:
+        if query.start is not None and sample.seconds < query.start:
+            continue
+        if query.end is not None and sample.seconds >= query.end:
+            continue
+        row: dict[str, Any] = {"source_seconds": round(sample.seconds, 3)}
+        if query.kind is ScreenKind.TEXT:
+            # 何も読めなかった絵は返さない 字の無い場面が大半の素材で、空の行が一覧を埋める
+            if not sample.lines:
+                continue
+            row["lines"] = [{"text": line.text, **line.box.to_json()} for line in sample.lines]
+        else:
+            faces = [face for face in sample.faces if face.score >= query.min_score]
+            # 顔の無い絵も返す 縦への作り替えでは「この場面に顔が無い」ことも手がかりになる
+            row["faces"] = [{**face.box.to_json(), "score": round(face.score, 3)} for face in faces]
+        row["timeline"] = _scene_places(project, media, stream, sample.seconds)
+        rows.append(row)
+    return rows
+
+
+def _screen_result(
+    host: EditorHost,
+    media: MediaItem,
+    query: _ScreenQuery,
+    state: ScreenState,
+    arguments: dict[str, Any],
+) -> object:
+    kind = query.kind
+    if state.report is None and state.failure is not None:
+        raise ToolError(f"{media.name} の{kind.label}を調べられませんでした: {state.failure}")
+    project = _project(host)
+    report = state.report
+    name = "samples"
+    if report is None:
+        # 場面の解析を待っているか、まだ 1 枚も調べていない
+        result = _paged([], arguments, name=name)
+        result.pop("note", None)
+        result |= {
+            "media_id": str(media.id),
+            "complete": False,
+            "kind": kind.value,
+            "note": (
+                f"場面の切り替わりを調べてから{kind.label}を調べます まだ 1 枚も調べていません"
+                " しばらくしてから同じ引数で呼ぶと続きを返します"
+                if state.running
+                else "調べるのが止まりました もう 1 度呼ぶと頼み直します"
+            ),
+        }
+        return result
+    rows = _screen_rows(project, media, report, query)
+    result = _paged(rows, arguments, name=name)
+    notes = [str(result.pop("note"))] if "note" in result else []
+    result |= {
+        "media_id": str(media.id),
+        "kind": kind.value,
+        "complete": report.complete,
+        "examined": len(report.samples),
+        "planned": report.planned,
+        "frame_width": report.width,
+        "frame_height": report.height,
+        "coordinates": SCREEN_COORDINATES,
+        "engine": report.engine,
+        "video_stream": _video_number(media, _video_stream(media, report.stream)),
+    }
+    if kind is ScreenKind.FACES:
+        result["min_score"] = query.min_score
+    else:
+        # どちらの方式で読んだか（本人の設定 Preferences.ocr_engine） 飾った文字が読めていない
+        # ときに、AI が「Windows の OCR で読んだから」と分かるように
+        result["ocr"] = ocr_of(report.engine)
+    if not report.by_scene:
+        notes.append(
+            "場面の切り替わりが分からなかったので、等間隔に調べました"
+            " detect_scenes が通るようになれば場面ごとに調べ直せます"
+        )
+    if not report.complete:
+        if state.running:
+            notes.append(
+                f"調べている途中です（{len(report.samples)} / {report.planned} 枚）"
+                " 調べた所までを返しました しばらくしてから同じ引数で呼ぶと続きを返します"
+            )
+        else:
+            notes.append("調べるのが止まりました もう 1 度呼ぶと頼み直します")
+    elif not rows:
+        notes.append(
+            "文字が読めた絵はありません（飾った文字・縦書き・小さな文字は読めないことがあります）"
+            if kind is ScreenKind.TEXT
+            else "見つかった顔はありません"
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
 
 
 # --- 完成物の検査（#337）---
@@ -5515,6 +5681,9 @@ _HIDDEN_IN_HISTORY = frozenset({Outbound.TEXT})
 #: 本文のための道具ではないので、字幕と文字を送らない人にも断らず、本文を伏せて返す
 #: 断ると、色や位置を変えるだけの頼みまで動かなくなる
 _HIDDEN_IN_VALUES = frozenset({Outbound.TEXT})
+#: 画面の中の文字（OCR #324） 読めた文字は画面に映った本人の文（テロップ・看板・資料）なので、
+#: 字幕と同じく字幕と文字に数える 断りの文に素材の名前が入る
+_SCREEN_TEXT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
 #: 保存したプリセット・エイリアスで字幕に見た目を着せる道具（#308） 見つからないと断る文に
@@ -5885,6 +6054,73 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_detect_scenes,
+        sends=_WITH_FILES,
+    ),
+    Operation(
+        name="detect_text",
+        description=(
+            "素材（動画）の画面の中の文字（テロップ・看板・スライド）を読む（OCR 読むだけ） "
+            "場面の切り替わりで素材を区切り、場面ごとに数枚を手元の OCR で読む"
+            "（絵は外へ送らない 読めた文字は送る） 文字のあった絵ごとに source_seconds（素材の秒）"
+            "・lines（文と枠）・timeline（その絵が出るタイムラインのフレーム preview_frame へ"
+            "渡せる）を返す " + SCREEN_COORDINATES + " 字幕やテキストを画面の文字に重ねずに"
+            "置くときや、スライドの切り替わりで切るときに使う 読む方式は本人の設定に従い、"
+            "結果の ocr に書く（windows は速いが飾った文字・縦書き・小さな文字は読めないことが"
+            "ある rapidocr は飾った文字も読むが遅い 方式は AI からは変えられない） 結果は覚え、"
+            "2 度目からは待たない 終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
+            "読んだ所までを返す（complete が false） 部品が入っていなければ理由と入れ方を返して断る"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "from_seconds": _number("この素材の秒から後の絵だけ"),
+                "to_seconds": _number("この素材の秒より前の絵だけ"),
+                "wait_seconds": _number(
+                    f"調べ終えていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 0 なら待たずに調べた所までを返す"
+                ),
+                **_paging(),
+            },
+            ["media_id"],
+        ),
+        handler=_detect_text,
+        # 読めた文字は画面に映った本人の文に当たる 字幕と同じく尋ねてから送る（#342）
+        # 断りの文に素材の名前が入る
+        sends=_SCREEN_TEXT,
+    ),
+    Operation(
+        name="detect_faces",
+        description=(
+            "素材（動画）の中の顔の位置を調べる（読むだけ） 場面の切り替わりで素材を区切り、"
+            "場面ごとに数枚を顔の検出（YuNet）で手元で調べる（絵は外へ送らない） 絵ごとに"
+            "source_seconds（素材の秒）・faces（枠と score 0〜1 の確からしさ）・timeline（その絵が"
+            "出るタイムラインのフレーム）を返す 顔の無かった絵も faces を空で返す "
+            + SCREEN_COORDINATES
+            + " 話し手へ寄る・縦の作品へ作り替える・字幕を顔に重ねずに置くときに使う "
+            "顔の向きや誰の顔かは分からない 横顔・とても小さな顔は見落とすことがある 結果は"
+            "覚え、2 度目からは待たない 終わっていなければ wait_seconds まで待つ 部品（画面の"
+            "解析）が入っていなければ断る" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "min_score": _number(
+                    f"返す顔の確からしさの下限（{FACE_SCORE_RANGE[0]:g}〜{FACE_SCORE_RANGE[1]:g}、"
+                    f"既定 {DEFAULT_FACE_SCORE:g}） 下げると小さな顔も拾うが、顔でない物も混ざる"
+                ),
+                "from_seconds": _number("この素材の秒から後の絵だけ"),
+                "to_seconds": _number("この素材の秒より前の絵だけ"),
+                "wait_seconds": _number(
+                    f"調べ終えていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 0 なら待たずに調べた所までを返す"
+                ),
+                **_paging(),
+            },
+            ["media_id"],
+        ),
+        handler=_detect_faces,
+        # 顔の位置は数だけ（作品の構成と同じ扱い） 断りの文に素材の名前が入る
         sends=_WITH_FILES,
     ),
     Operation(

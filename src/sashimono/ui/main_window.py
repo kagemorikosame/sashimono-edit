@@ -158,7 +158,13 @@ from sashimono.engine.audio.speech import (
     voice_speech,
 )
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import MediaAnalyzer, SceneState
+from sashimono.engine.cache import (
+    MediaAnalyzer,
+    SceneState,
+    ScreenAnalyzer,
+    ScreenState,
+    scenes_from,
+)
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.scan import LOUDNESS
@@ -167,6 +173,7 @@ from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.render import FrameRenderer, RenderQuality
+from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
@@ -213,6 +220,7 @@ from sashimono.ui.workspace import (
     LAYOUT_VERSION,
     SCENES_ALWAYS,
     SCENES_WITH_AI,
+    SCREEN_ON_IMPORT,
     Preferences,
     PreferenceStore,
     ShortcutStore,
@@ -416,6 +424,12 @@ class MainWindow(QMainWindow):
             sample_rate=self._document.project.settings.sample_rate,
             channels=self._document.project.settings.channels,
             scene_threads=self._preferences.scene_threads,
+        )
+        #: 画面の中身（文字と顔の位置 #324）を調べる係 場面の一覧は上の係に頼んで待つ
+        self._screen = ScreenAnalyzer(
+            scenes=scenes_from(self._analyzer, self._on_analysis_ready),
+            per_scene=self._preferences.screen_samples,
+            ocr=self._preferences.ocr_engine,
         )
         # 描画と書き出しの両方が見るので、窓を組み立てる前に決めておく
         native.set_enabled(self._preferences.native_modules)
@@ -1017,8 +1031,10 @@ class MainWindow(QMainWindow):
         reencoded = preferences.encoder_priority != self._preferences.encoder_priority
         previous = self._preferences
         scenes_before = self._scenes_on_import()
+        screen_before = self._screen_on_import()
         self._preferences = preferences
         self._apply_scene_preferences(scenes_before)
+        self._apply_screen_preferences(screen_before)
         try:
             PreferenceStore().save(preferences)
         except OSError as exc:
@@ -1112,6 +1128,21 @@ class MainWindow(QMainWindow):
         elif after and not before:
             for media in self._document.project.media:
                 self._analyzer.request_scenes(media, on_ready=self._on_analysis_ready)
+
+    def _apply_screen_preferences(self, before: bool) -> None:
+        """画面の中身（#324）の設定を当てる 枚数は次に調べる素材から効く
+
+        読み込んだときに調べるのを切ったら、走っている物を止める（場面の解析と同じ 切っても
+        裏で調べ続けるなら、切った意味が無い） 入れたら今の素材も調べる
+        """
+        self._screen.set_per_scene(self._preferences.screen_samples)
+        self._screen.set_ocr(self._preferences.ocr_engine)
+        after = self._screen_on_import()
+        if before and not after:
+            self._screen.cancel()
+        elif after and not before:
+            for media in self._document.project.media:
+                self._request_screen_all(media)
 
     def _apply_autosave_timer(self, preferences: Preferences) -> None:
         """退避の間隔と入り切りをタイマーへ当てる 再起動を待たずに効かせる
@@ -1680,6 +1711,7 @@ class MainWindow(QMainWindow):
         for media in previous.media:
             if media.id not in kept:
                 self._analyzer.forget(media.id)
+                self._screen.forget(media.id)
                 self._proxies.forget(media.id)
         # 前のプロジェクトで外した素材の覚えは捨てる 差し替えると取り消しの履歴も消え、
         # 戻ってくることは無い 新しいプロジェクトの素材は、開く所で全部頼んでいる
@@ -1945,6 +1977,7 @@ class MainWindow(QMainWindow):
         self.execute(RemoveMedia(target))
         if self._document.project.find_media(target) is None:
             self._analyzer.forget(target)
+            self._screen.forget(target)
             self._proxies.forget(target)
             # 取り消しで戻ったときに頼み直す（:meth:`_reanalyze_returned`）
             self._forgotten.add(target)
@@ -2166,6 +2199,33 @@ class MainWindow(QMainWindow):
         self._analyzer.request(
             media, on_ready=self._on_analysis_ready, scenes=self._scenes_on_import()
         )
+        if self._screen_on_import():
+            self._request_screen_all(media)
+
+    def _request_screen_all(self, media: MediaItem) -> None:
+        """読み込んだ素材の文字と顔を頼む 選んだ OCR の部品が無ければ文字は頼まない
+
+        RapidOCR を選んでいて入れていない人の所で頼むと、素材ごとに「部品が無い」失敗を積む
+        （AI が頼んだときは断りの理由と入れ方を返す）
+        """
+        for kind in ScreenKind:
+            if (
+                kind is ScreenKind.TEXT
+                and self._preferences.ocr_engine == OCR_RAPID
+                and not RAPIDOCR_PACK.status().ready
+            ):
+                continue
+            self._screen.request(media, kind)
+
+    def _screen_on_import(self) -> bool:
+        """読み込んだ素材の画面の中身を、頼まれる前に調べるか（``Preferences.screen_analysis``）
+
+        部品が入っていなければ調べない 入っていない機械で頼むと、素材ごとに「部品が無い」
+        失敗を積むだけになる 読み込みのたびに見るので、後から入れた人にも次の読み込みから効く
+        """
+        if self._preferences.screen_analysis != SCREEN_ON_IMPORT:
+            return False
+        return VISION_PACK.status().ready
 
     def _scenes_on_import(self) -> bool:
         """読み込んだ素材の場面の一覧を、頼まれる前に作るか（``Preferences.scene_analysis``）"""
@@ -3426,6 +3486,18 @@ class MainWindow(QMainWindow):
         analyzer = self._analyzer
         return lambda seconds: analyzer.wait_scenes(media_id, seconds)
 
+    def request_screen(self, media: MediaItem, kind: ScreenKind) -> None:
+        """AI が頼んだ素材の画面の中身を調べる 設定で読み込みのときに調べないでいても調べる"""
+        self._screen.request(media, kind)
+
+    def screen_state(self, media: MediaItem, kind: ScreenKind) -> ScreenState:
+        return self._screen.state(media, kind)
+
+    def screen_waiter(self, media_id: MediaId, kind: ScreenKind) -> Callable[[float], bool]:
+        # 窓を閉じた後に呼ばれても、閉じた係は待たずに返す（ScreenAnalyzer.close）
+        screen = self._screen
+        return lambda seconds: screen.wait(media_id, kind, seconds)
+
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
     ) -> str:
@@ -4039,6 +4111,7 @@ class MainWindow(QMainWindow):
             self._ai_renderer = None
         # 検査の走り係は自分のレンダラとコンテキストを持つ 止まるまで待ってから窓を壊す
         self._checks.close()
+        self._screen.close()
         self._analyzer.close()
         self._proxies.close()
         self._preview.shutdown()
