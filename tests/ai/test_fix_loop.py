@@ -32,7 +32,7 @@ from sashimono.ai.fixes import (
     fixes_closed,
 )
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import OPERATIONS, Operation, find_operation
+from sashimono.ai.operations import OPERATIONS, Operation, Pending, find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import Author, RenameProject
@@ -227,6 +227,66 @@ class TestFiles:
         assert host.document.checkpoint_label == "AI: 確かめて"
         host.document.end_checkpoint()
         assert host.document.history_labels[-1] == "AI: 確かめて"
+
+
+def _finish_after_edit(host: FakeHost, runs: list[Run]) -> dict[str, Any]:
+    """検査を頼んで待つ間に人がタイムラインを変え、その後で始めたときの作品の結果を読む"""
+    pending = _tool("check_output")(host, {"wait_seconds": 30})
+    assert isinstance(pending, Pending)
+    request: CheckRequest = host.check_requests[-1]
+    host.document.execute(RenameProject("待つ間の人の編集"), by=Author.PERSON)
+    report = assemble(
+        runs,
+        start=request.start,
+        end=request.end or 300,
+        analyzed=request.end or 300,
+        fps=30.0,
+        complete=True,
+        limits=request.limits,
+        index=None,
+        loudness=-14.2,
+        peak=0.5,
+        length_seconds=None,
+    )
+    host.check = CheckState(request=request, report=report)
+    result = pending.then()
+    assert isinstance(result, dict)
+    return result
+
+
+class TestChangedWhileWaiting:
+    """検査を待つ間に作品が変わったら、古い作品の問題から直しを返さない（Codex P2）
+
+    結果の問題とクリップ ID は調べ始めたときの作品の物 今の作品へ当てると、消えた・動いた
+    クリップへ set_param や clean_subtitles を当ててしまう
+    """
+
+    def test_no_fix_is_offered_for_a_stale_result(self, host: FakeHost) -> None:
+        """壊れると、待つ間に人が動かしたクリップの古い ID や位置へ、AI が直しを当てる"""
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        result = _finish_after_edit(host, [_MIXED_CLIP, Run(BLACK, 100, 110, {})])
+        host.document.end_checkpoint()
+        assert result["problems"]
+        for problem in result["problems"]:
+            assert problem["fix"]["action"] in (HANDOFF, LEAVE), problem
+            assert problem["fix"]["tools"] == []
+        assert result["summary"]["fixes"][AUTO] == 0
+        assert "1 回目の直し" not in result["note"]
+        assert "調べ直" in result["note"]
+
+    def test_a_stale_result_does_not_use_up_a_round(self, host: FakeHost) -> None:
+        """壊れると、待つ間に人が編集しただけで直す回が上限に達し、調べ直した後に直せない"""
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "AI の直し")
+        stale = _finish_after_edit(host, [_MIXED_CLIP])
+        assert stale["fix_round"]["used"] == 0
+        assert not fixes_closed(host.document)
+        fresh = _finish(host, [_MIXED_CLIP])
+        host.document.end_checkpoint()
+        assert fresh["fix_round"]["used"] == 1
+        assert fresh["fix_round"]["closed"] is True
 
 
 class TestAnswer:

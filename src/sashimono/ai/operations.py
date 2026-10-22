@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 
 from sashimono.ai.fixes import AUTO as FIX_AUTO
-from sashimono.ai.fixes import FIX_ACTIONS, FixRound, fix_for, start_check
+from sashimono.ai.fixes import FIX_ACTIONS, FixRound, fix_for, forget_check, start_check
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -2377,6 +2377,14 @@ def _check_result(
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
     timeline = request.project is not None
+    # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
+    # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
+    # 古い作品の物で、今の作品へ直しを当てると消えた・動いたクリップを触る 取り消して同じ形へ
+    # 戻っただけなら同じ作品として直しを返す
+    stale = request.project is not None and _project(host) != request.project
+    if stale and rounds is not None:
+        # 使えない結果で直す回を使わない 次に調べ直したときに数える
+        rounds = forget_check(host.document, rounds.limit)
     rate = request.project.rate if request.project is not None else None
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
@@ -2399,7 +2407,7 @@ def _check_result(
             row["ongoing"] = True
         # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
         row["fix"] = fix_for(
-            problem.kind, problem.severity, problem.measure, **_fix_state(rounds)
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, stale)
         ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
@@ -2408,7 +2416,9 @@ def _check_result(
     fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
-        action = fix_for(problem.kind, problem.severity, problem.measure, **_fix_state(rounds))
+        action = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, stale)
+        )
         fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
@@ -2453,22 +2463,25 @@ def _check_result(
         notes.append("問題は見つかりませんでした")
     elif not report.problems and report.checked:
         notes.append("調べた種類（checks）には問題がありませんでした")
-    if request.project is not None and _project(host) != request.project:
+    if stale:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
-            " 今の作品を調べるにはもう 1 度呼んでください"
+            " この結果からは直さず（直す回も数えていません）、もう 1 度呼んで今の作品を"
+            "調べ直し、その結果の fix に従ってください"
         )
-    notes.extend(_round_notes(rounds, fixes))
+    else:
+        notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
 
 
-def _fix_state(rounds: FixRound | None) -> dict[str, bool]:
-    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき"""
+def _fix_state(rounds: FixRound | None, stale: bool) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき
+    ``stale`` は調べている間に作品が変わったとき"""
     if rounds is None:
         return {"timeline": False}
-    return {"closed": rounds.closed}
+    return {"closed": rounds.closed, "stale": stale}
 
 
 def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:

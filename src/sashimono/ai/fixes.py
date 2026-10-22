@@ -52,6 +52,7 @@ __all__ = [
     "fix_for",
     "fix_label",
     "fixes_closed",
+    "forget_check",
     "start_check",
 ]
 
@@ -163,6 +164,11 @@ PASSES_AFTER_LIMIT = frozenset({"undo", "redo", "cancel_export"})
 #: 上限に達した後の直し方 直さずに人へ渡す
 _CLOSED = "直す回数の上限に達したので、直さずに人へ伝える"
 
+#: 調べている間に作品が変わったときの直し方 問題とクリップ ID は調べ始めたときの作品の物
+_STALE = (
+    "調べている間に作品が変わったので、この結果からは直さない もう 1 度調べ直して、その結果で直す"
+)
+
 #: 書き出した動画のファイルを調べたときの直し方 今の作品と同じ物かは分からないので直さない
 _FILE = (
     "書き出した動画のファイルの問題 今の作品から書き出した物かは確かめていないので、今の作品は"
@@ -183,6 +189,7 @@ def fix_for(
     *,
     closed: bool = False,
     timeline: bool = True,
+    stale: bool = False,
 ) -> Fix:
     """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す
 
@@ -193,6 +200,8 @@ def fix_for(
     fix = FIXES.get((kind, severity, _variant(kind, measure)), _UNKNOWN)
     if not timeline and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_FILE}（{fix.how}）")
+    if stale and fix.action in (AUTO, ASK):
+        return Fix(HANDOFF, (), f"{_STALE}（{fix.how}）")
     if closed and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_CLOSED}（{fix.how}）")
     return fix
@@ -236,6 +245,9 @@ class _Loop:
     checked: int | None = None
     used: int = 0
     closed: bool = False
+    #: 最後の :func:`start_check` の前の数え（``checked``・``used``・``closed``）
+    #: 調べる間に作品が変わって結果を使えなかったとき、:func:`forget_check` が戻す
+    previous: tuple[int | None, int, bool] | None = None
 
 
 #: 文書ごとの数え 文書を閉じたら一緒に消える（弱い参照） ホストに持たせないのは、
@@ -261,6 +273,7 @@ def start_check(document: Document, limit: int) -> FixRound:
     同じ作品のまま呼び直した（途中までの結果の続きを読む）だけなら数えない
     """
     loop = _loop(document)
+    loop.previous = (loop.checked, loop.used, loop.closed)
     changed = document.changes_by(Author.AI)
     if loop.checked is not None and changed != loop.checked and not loop.closed:
         loop.used += 1
@@ -271,6 +284,22 @@ def start_check(document: Document, limit: int) -> FixRound:
     next_round = loop.used + 1
     document.split_checkpoint(fix_label(next_round))
     return FixRound(loop.used, limit, next_round)
+
+
+def forget_check(document: Document, limit: int) -> FixRound:
+    """最後の :func:`start_check` の数えを戻す（調べる間に作品が変わり、結果で直せないとき）
+
+    戻さないと、使えなかった結果で直す回を 1 つ使い、上限 1 なら調べ直した後に直せない
+    AI の変更はまだ数えていない扱いに戻るので、次に調べ直したときにその回を数える
+    区切った段は戻さない（区切った後に AI は何も変えていないので、次の区切りは名前を替えるだけ）
+    """
+    loop = _loop(document)
+    if loop.previous is not None:
+        loop.checked, loop.used, loop.closed = loop.previous
+        loop.previous = None
+    if loop.closed or loop.used >= max(0, limit):
+        return FixRound(loop.used, limit, None)
+    return FixRound(loop.used, limit, loop.used + 1)
 
 
 def fixes_closed(document: Document) -> bool:
