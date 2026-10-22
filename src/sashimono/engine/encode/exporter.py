@@ -799,6 +799,18 @@ def _gpu_color_failures() -> Iterator[None]:
         raise _GpuColorError(f"GPU の色変換が書き出しの途中で使えなくなった ({exc})") from exc
 
 
+def _release_texture_quietly(texture: Texture) -> None:
+    """確かめに使ったテクスチャを返す 返すのを駆動が断っても、記録に残すだけにする
+
+    比べた結果はもう出ている 返せなかっただけで GPU をやめると、確かめに通った機械でも
+    遅い CPU の道になる
+    """
+    try:
+        texture.release()
+    except (ShaderError, GLLibraryError):
+        _log.warning("GPU の色変換を確かめたテクスチャを返せなかった", exc_info=True)
+
+
 def _discard_quietly(readback: YuvReadback[tuple[int, int]]) -> None:
     """使わないと決めた読み戻しを返す 返すのを駆動が断っても、記録に残すだけにする
 
@@ -854,14 +866,20 @@ def _agrees(
     """
     picture = _check_picture(width, height)
     try:
-        texture = Texture.from_array(picture, srgb=False)
-        try:
-            readback.push(texture.handle, _CHECK_TAG)
-            tag, planes = readback.pop()
-        finally:
-            texture.release()
+        texture = Texture(width, height, srgb=False)
     except (ShaderError, GLLibraryError):
         return False
+    # 作ってから上げる from_array で一度に作ると、上げる所で断られたときに作った 1 枚が
+    # 手元に残らず返せない 書き出すたびに GPU のメモリが 1 枚ぶん（4K で 33MB）ずつ減る
+    # GL のコンテキストを返すときに一緒に消えるかは駆動しだいなので、それには頼らない
+    try:
+        texture.upload(picture)
+        readback.push(texture.handle, _CHECK_TAG)
+        tag, planes = readback.pop()
+    except (ShaderError, GLLibraryError):
+        return False
+    finally:
+        _release_texture_quietly(texture)
     expected = bt709_planes(picture, pixel_format)
     if tag != _CHECK_TAG or planes.shape != expected.shape:
         return False

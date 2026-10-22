@@ -30,7 +30,6 @@ from sashimono.engine.decode import probe_media
 from sashimono.engine.encode import ExportError, ExportSettings, export_project, exporter
 from sashimono.engine.encoders import usable
 from sashimono.engine.gpu import ShaderError, yuv
-from sashimono.engine.gpu.glutil import Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE
 from sashimono.engine.render import FrameRenderer
 from tests.media_fixtures import SampleMedia
@@ -120,15 +119,45 @@ class _Texture:
     """Texture の代わり 上げた絵を、負の番号で読み戻しの偽物へ預ける
 
     合成したコマの番号（0 以上）と重ならないので、偽物はどちらの絵を変換するかを番号で見分ける
+    作った番号は返すまで ``readback.live_textures`` に残る 返し忘れはそこで分かる
     """
 
-    def __init__(self, uploads: dict[int, np.ndarray], image: np.ndarray) -> None:
-        self.handle = -1 - len(uploads)
-        uploads[self.handle] = image
-        self._uploads = uploads
+    def __init__(self, readback: _Readback, width: int, height: int, *, srgb: bool) -> None:
+        # 合成の結果（resolved_texture）は符号化済みの RGBA8 sRGB で上げると、読む時に
+        # リニアへ戻されて試験の絵が別の色になる
+        assert not srgb, "試験の絵を sRGB で上げた"
+        self._readback = readback
+        readback.textures_made += 1
+        self.handle = -readback.textures_made
+        readback.live_textures.add(self.handle)
+
+    def upload(self, image: np.ndarray) -> None:
+        if self._readback.refuse_upload:
+            raise ShaderError("テクスチャへ上げられない")
+        self._readback.uploads[self.handle] = image
 
     def release(self) -> None:
-        del self._uploads[self.handle]
+        self._readback.live_textures.discard(self.handle)
+        self._readback.uploads.pop(self.handle, None)
+        if self._readback.refuse_texture_release:
+            raise ShaderError("テクスチャを返せない")
+
+
+class _TextureMaker:
+    """exporter が使う ``Texture`` の代わり 作る口（``Texture(...)``）も ``from_array`` も受ける"""
+
+    def __init__(self, readback: _Readback) -> None:
+        self._readback = readback
+
+    def __call__(self, width: int, height: int, *, srgb: bool = True) -> _Texture:
+        return _Texture(self._readback, width, height, srgb=srgb)
+
+    def from_array(self, image: np.ndarray, *, srgb: bool = True) -> _Texture:
+        # 本物と同じく、作ってから上げる 上げる所で断られると作った 1 枚が手元に残る
+        height, width = image.shape[:2]
+        texture = self(width, height, srgb=srgb)
+        texture.upload(image)
+        return texture
 
 
 class _Readback:
@@ -152,6 +181,12 @@ class _Readback:
         self.picture = picture
         #: 上げた試験の絵 :class:`_Texture` が番号を付けて入れる
         self.uploads: dict[int, np.ndarray] = {}
+        #: 作ってまだ返していないテクスチャの番号と、作った数
+        self.live_textures: set[int] = set()
+        self.textures_made = 0
+        #: 真ならテクスチャへ上げる所・テクスチャを返す所で駆動が断る
+        self.refuse_upload = False
+        self.refuse_texture_release = False
         self._pending: deque[tuple[int, tuple[int, int]]] = deque()
         self.released = False
         self.pushed: list[int] = []
@@ -194,15 +229,9 @@ def _source(
         opened.append(fmt)
         return readback
 
-    def fake_texture(image: np.ndarray, *, srgb: bool = True) -> _Texture:
-        # 合成の結果（resolved_texture）は符号化済みの RGBA8 sRGB で上げると、読む時に
-        # リニアへ戻されて試験の絵が別の色になる
-        assert not srgb, "試験の絵を sRGB で上げた"
-        assert readback is not None
-        return _Texture(readback.uploads, image)
-
     monkeypatch.setattr(exporter, "open_readback", fake_open)
-    monkeypatch.setattr(Texture, "from_array", fake_texture)
+    if readback is not None:
+        monkeypatch.setattr(exporter, "Texture", _TextureMaker(readback))
     renderer = _Renderer(picture)
     source = exporter._FrameSource(cast("FrameRenderer", renderer), pixel_format, WIDTH, HEIGHT)
     return source, renderer, opened
@@ -420,6 +449,33 @@ class TestCleanup:
             exporter._release_quietly(source)
         assert readback.released
         assert not source.on_gpu
+        assert "返せなかった" in caplog.text, "返せなかったことが記録に残らない"
+
+    def test_the_check_texture_is_returned_when_uploading_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 作った後に上げる所で断られたテクスチャを返さないと、書き出すたびに GPU のメモリが
+        # 1 枚ぶん（4K で 33MB）ずつ残る GL のコンテキストを返すときに消えるかには頼らない
+        readback = _Readback("yuv420p")
+        readback.refuse_upload = True
+        source, renderer, _opened = _source(monkeypatch, readback)
+        assert readback.textures_made == 1, "試験の絵のテクスチャを作る所を通っていない"
+        assert readback.live_textures == set(), "上げられなかったテクスチャを返していない"
+        assert not source.on_gpu
+        assert readback.released
+        _run(source, 2)
+        assert renderer.rendered == [100, 101]
+
+    def test_a_refused_texture_release_keeps_the_check_result(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # 比べ終えた後にテクスチャを返すのを断られただけで GPU をやめると、確かめに通った
+        # 機械でも遅い CPU の道になる 黙って捨てると、返せなかったことも追えない
+        readback = _Readback("yuv420p")
+        readback.refuse_texture_release = True
+        with caplog.at_level("WARNING", logger=exporter.__name__):
+            source, _renderer, _opened = _source(monkeypatch, readback)
+        assert source.on_gpu
         assert "返せなかった" in caplog.text, "返せなかったことが記録に残らない"
 
     @pytest.mark.parametrize("why", ["disagrees", "refused"])
