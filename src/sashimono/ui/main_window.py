@@ -3525,6 +3525,10 @@ class MainWindow(QMainWindow):
         return float(self._preferences.check_loudness_target)
 
     @property
+    def fix_rounds(self) -> int:
+        return self._preferences.ai_fix_rounds
+
+    @property
     def duck_shape(self) -> DuckShape:
         return self._preferences.duck_shape
 

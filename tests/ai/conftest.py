@@ -111,6 +111,8 @@ class FakeHost:
         #: 待つ関数が呼ばれた秒と、待った結果
         self.check_waits: list[float] = []
         self.check_ready = True
+        #: 検査の直しの回数の上限（#339） 既定は設定と同じ 3
+        self.fix_limit = 3
         #: 混ぜた音の推移（#322） 入れておくと、頼まれた検査がこの推移で調べ終えた様子になる
         #: 入れなければ今までどおり、何も調べていない走っている様子から始まる
         self.heard: SoundProfile | None = None
@@ -281,6 +283,10 @@ class FakeHost:
     @property
     def loudness_target(self) -> float:
         return self.loudness
+
+    @property
+    def fix_rounds(self) -> int:
+        return self.fix_limit
 
     @property
     def duck_shape(self) -> DuckShape:
