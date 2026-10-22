@@ -26,6 +26,7 @@ from sashimono.effects.fills import fill_names, fill_specs, fill_unused
 from sashimono.effects.spec import (
     CheckSpec,
     ColorSpec,
+    FileSpec,
     FontSpec,
     FontStyleSpec,
     ParameterSpec,
@@ -589,7 +590,10 @@ SHAPE = SourceDefinition(
         TrackSpec("star_fade_out", "星のフェードアウト", 0, 10, 0.15, step=0.01, unit="秒"),
         # 音声波形（AviUtl2 の ``音声波形表示``） 素材の音を今の時刻から 1 画素 1 サンプルで描く
         # クリップが素材を持てばそちらを使い、無ければこの道の音を読む
-        TextSpec("audio_path", "音声波形の音声ファイル", "", multiline=False),
+        # ファイルの場所なので場所の欄（FileSpec） 文字の欄にしていたので、AI へ送る物の決まり
+        # （名前と場所を断った人には伏せる #391）で字幕と文字に数えられ、場所が伏せずに出た
+        # 値は前と同じ文字なので、保存した作品・互換の読み込み・描き方は変わらない
+        FileSpec("audio_path", "音声波形の音声ファイル"),
         TrackSpec("wave_volume", "音声波形の音量", 0, 500, 100, unit="%"),
         # 周波数ごとの大きさを下から塗る（AviUtl2 の スペクトラム表示）
         CheckSpec("wave_spectrum", "音声波形をスペクトラムにする", False),
