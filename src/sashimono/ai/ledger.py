@@ -206,6 +206,8 @@ LEDGER: tuple[Entry, ...] = (
         ),
     ),
     missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
+    # 縦動画への作り替え（#334） 2026-10-20 利用者の決定でメニューに足した AI と同じ所を通す
+    same("メニュー/ファイル/縦の作品に作り替える…", "reframe"),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
     same(
         "メニュー/ファイル/書き出し…", "export_video", note=_EXPORT_NOTE, safety=Safety.IRREVERSIBLE

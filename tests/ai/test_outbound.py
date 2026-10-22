@@ -416,6 +416,8 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
         "start_frame": 0,
         "end_frame": 20,
     },
+    # 縦動画への作り替え（#334） 追わずに真ん中を切り出す（解析を待たない）
+    "reframe": lambda _ids: {"width": 1080, "height": 1920, "follow": "center"},
     "set_subtitle_text": lambda ids: {
         "media_id": ids["media"],
         "segment_id": ids["segment"],
