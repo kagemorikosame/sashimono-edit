@@ -41,6 +41,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
@@ -115,6 +116,8 @@ class FakeHost:
         self.stream_strips: dict[tuple[MediaId, int | None], Filmstrip] = {}
         #: 音声ごとの波形 試験が入れる 無ければ stub_waveform
         self.waveforms: dict[tuple[MediaId, int | None], Waveform] = {}
+        #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
+        self.reframing = ReframeStyle()
         #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
         self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
@@ -306,6 +309,10 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self.reframing
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)

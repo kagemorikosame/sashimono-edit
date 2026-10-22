@@ -41,6 +41,13 @@ from sashimono.core.emphasis import (
 )
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
+from sashimono.core.reframe import (
+    REFRAME_FOLLOW_NAMES,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZE_NAMES,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+)
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE_MS_RANGE,
@@ -969,6 +976,7 @@ class PreferencesDialog(QDialog):
         self._add_emphasis_rows(form, preferences)
         self._add_seam_rows(form, preferences)
         self._add_auto_fix_rows(form, preferences)
+        self._add_reframe_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -1236,6 +1244,9 @@ class PreferencesDialog(QDialog):
             seam_audio_fade_ms=self._seam_audio.value(),
             auto_color_strength=self._auto_color_strength.value(),
             denoise_reduction_db=self._denoise_reduction.value(),
+            reframe_size=str(self._reframe_size.currentData()),
+            reframe_follow=str(self._reframe_follow.currentData()),
+            reframe_smooth_ms=self._reframe_smooth.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
             screen_analysis=str(self._screen_analysis.currentData()),
@@ -1439,6 +1450,44 @@ class PreferencesDialog(QDialog):
             "「ノイズ除去」は設定パネルで後から直せる"
         )
         form.addRow("ノイズを減らす量", self._denoise_reduction)
+
+    def _add_reframe_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """縦動画への作り替え（#334）の既定 どの縦の大きさで出すか・枠を止めるか追うかは人と
+        作品で違う AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        """
+        self._reframe_size = QComboBox(self)
+        for size in REFRAME_SIZES:
+            self._reframe_size.addItem(REFRAME_SIZE_NAMES[size], size)
+        self._reframe_size.setCurrentIndex(
+            max(0, self._reframe_size.findData(preferences.reframe_size))
+        )
+        self._reframe_size.setToolTip(
+            "AI アシスタントが横の作品を縦の作品に作り替えるときの大きさ 背景の動画は前の画面に"
+            "置いた枠の中を拡げて映すので、作る大きさが大きいほど拡げる倍率が上がり、絵が粗くなる"
+        )
+        form.addRow("縦動画への作り替え: 大きさ", self._reframe_size)
+        self._reframe_follow = QComboBox(self)
+        for follow in REFRAME_FOLLOWS:
+            self._reframe_follow.addItem(REFRAME_FOLLOW_NAMES[follow], follow)
+        self._reframe_follow.setCurrentIndex(
+            max(0, self._reframe_follow.findData(preferences.reframe_follow))
+        )
+        self._reframe_follow.setToolTip(
+            "枠を場面ごとに止めるか、被写体を追って動かすか 止めると三脚で撮ったように落ち着くが、"
+            "大きく動く人は枠から外れる 追うと外れにくいが、手持ちのカメラのように動き続ける"
+            " 被写体は動きと肌色から見積もる（顔は見分けない 肌色に近い壁や床にも寄る）"
+        )
+        form.addRow("縦動画への作り替え: 枠の動かし方", self._reframe_follow)
+        self._reframe_smooth = QSpinBox(self)
+        self._reframe_smooth.setRange(*REFRAME_SMOOTH_MS_RANGE)
+        self._reframe_smooth.setSingleStep(100)
+        self._reframe_smooth.setSuffix(" ms")
+        self._reframe_smooth.setValue(preferences.reframe_smooth_ms)
+        self._reframe_smooth.setToolTip(
+            "被写体を追うときにならす長さ 長いほどゆっくり動いて落ち着き、短いほど被写体に"
+            "ぴったり付くが手振りで揺れる 止める場面には効かない"
+        )
+        form.addRow("縦動画への作り替え: 追うときのならし", self._reframe_smooth)
 
     def _add_limit_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """AI が使う量の上限（#344） どこまで使ってよいかは契約と懐で人ごとに違う

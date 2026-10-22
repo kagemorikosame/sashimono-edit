@@ -50,7 +50,8 @@ TEXT_SOURCES = {
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
 #: テンプレートの棚（#328）も本人の置き場の物 名前はアプリの設定として送り、フォルダの名前は
 #: 名前と場所（一覧の folder の項目で伏せる） ファイルの場所は道具から返さない
-#: 強調の動きの強さと長さの既定（#331）も本人の設定 検査の直しの回数の上限（#339）も本人の設定で、
+#: 強調の動きの強さと長さの既定（#331）も本人の設定 縦動画への作り替えの既定（#334）も
+#: 検査の直しの回数の上限（#339）も本人の設定で、
 #: check_output が結果の fix_round に載せる（sends にアプリの設定を書いてある）
 OWN_LIBRARY = {
     "fix_rounds",
@@ -63,6 +64,7 @@ OWN_LIBRARY = {
     # 色と雑音の自動補正の強さ・下げる量の既定（#336）
     "auto_color_strength",
     "denoise_reduction",
+    "reframe_style",
     "template_shelf",
     # AI に見せる絵の長い辺の上限（#344） 絵を返す道具が縮めた訳と断りの文に載せる
     "image_edge",
@@ -248,6 +250,8 @@ class TestEveryTextSourceGoesThroughThePort:
             # 色と雑音の自動補正（#336） 結果に本人の設定の強さと下げる量の既定が載る
             "auto_color",
             "reduce_noise",
+            # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
+            "reframe",
             # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る
             "preview_frame",
             "contact_sheet",
