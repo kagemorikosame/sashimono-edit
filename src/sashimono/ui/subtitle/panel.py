@@ -1159,6 +1159,11 @@ class SubtitlePanel(QWidget):
         dialog.deleteLater()
         return answer if accepted else None
 
+    def selected_segments(self) -> tuple[SegmentId, ...]:
+        """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
+        rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        return tuple(self._rows[row][0] for row in rows if 0 <= row < len(self._rows))
+
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
         media = self._current_media()
