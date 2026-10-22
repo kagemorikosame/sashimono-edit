@@ -47,12 +47,14 @@ __all__ = [
     "HANDOFF",
     "LEAVE",
     "PASSES_AFTER_LIMIT",
+    "CheckTicket",
     "Fix",
     "FixRound",
+    "current_round",
     "fix_for",
     "fix_label",
     "fixes_closed",
-    "forget_check",
+    "settle_check",
     "start_check",
 ]
 
@@ -164,9 +166,11 @@ PASSES_AFTER_LIMIT = frozenset({"undo", "redo", "cancel_export"})
 #: 上限に達した後の直し方 直さずに人へ渡す
 _CLOSED = "直す回数の上限に達したので、直さずに人へ伝える"
 
-#: 調べている間に作品が変わったときの直し方 問題とクリップ ID は調べ始めたときの作品の物
-_STALE = (
-    "調べている間に作品が変わったので、この結果からは直さない もう 1 度調べ直して、その結果で直す"
+#: 使えない結果の直し方 途中までの結果や古い作品の問題とクリップ ID で直すと、調べ直しが新しい回に
+#: 数えられるか、消えた・動いたクリップを触る
+_UNSETTLED = (
+    "使えない結果（検査が終わっていない・止められた・調べている間に作品が変わった）なので、"
+    "この結果からは直さない 終わった結果か、調べ直した結果で直す"
 )
 
 #: 書き出した動画のファイルを調べたときの直し方 今の作品と同じ物かは分からないので直さない
@@ -189,7 +193,7 @@ def fix_for(
     *,
     closed: bool = False,
     timeline: bool = True,
-    stale: bool = False,
+    unsettled: bool = False,
 ) -> Fix:
     """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す
 
@@ -200,8 +204,8 @@ def fix_for(
     fix = FIXES.get((kind, severity, _variant(kind, measure)), _UNKNOWN)
     if not timeline and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_FILE}（{fix.how}）")
-    if stale and fix.action in (AUTO, ASK):
-        return Fix(HANDOFF, (), f"{_STALE}（{fix.how}）")
+    if unsettled and fix.action in (AUTO, ASK):
+        return Fix(HANDOFF, (), f"{_UNSETTLED}（{fix.how}）")
     if closed and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_CLOSED}（{fix.how}）")
     return fix
@@ -235,19 +239,33 @@ class FixRound:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CheckTicket:
+    """検査の頼み 1 つの控え
+
+    :func:`start_check` が渡し、結果を使えたら :func:`settle_check` へ返す
+
+    数えは頼みごとに持ち、結果を使えたときだけ確定する 頼んだ時点で数えると、頼みが替わる・
+    失敗する・結果が無い・途中で止まる・作品が変わる、のどの道でも使えない結果で直す回を使い、
+    戻し方を道ごとに足すことになる（#390 で道ごとの戻しを足し続けた反省）
+    """
+
+    #: 頼んだ指示（:attr:`Document.checkpoint_serial`） 指示が替わったら確定しない
+    serial: int
+    #: 頼んだときに AI が作品を変えた回数（:meth:`Document.changes_by`）
+    changed: int
+
+
 @dataclass(slots=True)
 class _Loop:
-    """1 つの指示の数え 指示（段）が替わると作り直す"""
+    """1 つの指示の数え 指示（段）が替わると作り直す 確定した数えだけを持つ"""
 
     serial: int
-    #: 前に調べたときに AI が作品を変えた回数（:meth:`Document.changes_by`） 同じなら、その間に
-    #: AI は何も直していない 人が手で変えただけの回は数えない
-    checked: int | None = None
+    #: 最後に使えた検査を頼んだときの AI の変更の回数 ``None`` はまだ使えた検査が無い
+    #: 同じなら、その間に AI は何も直していない 人が手で変えただけの回は数えない
+    settled: int | None = None
     used: int = 0
     closed: bool = False
-    #: 最後の :func:`start_check` の前の数え（``checked``・``used``・``closed``）
-    #: 調べる間に作品が変わって結果を使えなかったとき、:func:`forget_check` が戻す
-    previous: tuple[int | None, int, bool] | None = None
 
 
 #: 文書ごとの数え 文書を閉じたら一緒に消える（弱い参照） ホストに持たせないのは、
@@ -263,43 +281,54 @@ def _loop(document: Document) -> _Loop:
     return loop
 
 
-def start_check(document: Document, limit: int) -> FixRound:
-    """``check_output`` が調べ始めるたびに呼ぶ（編集画面のスレッド）
+def _counted(loop: _Loop, changed: int, limit: int) -> tuple[int, bool]:
+    """``changed`` の検査を確定したときの回数と、上限に達したか"""
+    used = loop.used
+    if loop.settled is not None and changed != loop.settled and not loop.closed:
+        used += 1
+    return used, loop.closed or used >= max(0, limit)
 
-    前に調べた後に AI の段で作品が変わっていれば、直した回を 1 つ数える（人の段だけで変わったなら
-    数えない 数えると、人が手で直した分だけ AI の直せる回が減る） 上限に達していなければ、
-    ここで指示の段を区切り、この後の直しを「AI: 検査の直し（n 回目）」の段にする
+
+def _round(used: int, closed: bool, limit: int) -> FixRound:
+    return FixRound(used, limit, None if closed else used + 1)
+
+
+def start_check(document: Document, limit: int) -> CheckTicket:
+    """``check_output`` が今のタイムラインを調べ始めるたびに呼ぶ（編集画面のスレッド）
+
+    数えは確定しない（結果を使えたときに :func:`settle_check` が確定する） ここでするのは、
+    この検査を確定したときの回が上限の前なら、指示の段を区切って、この後の直しを
+    「AI: 検査の直し（n 回目）」の段にすることだけ 結果を使えずに調べ直しても、AI がその間に
+    変えていなければ区切りは名前を替えるだけで、段は増えない
+    """
+    loop = _loop(document)
+    ticket = CheckTicket(document.checkpoint_serial, document.changes_by(Author.AI))
+    used, closed = _counted(loop, ticket.changed, limit)
+    if not closed:
+        document.split_checkpoint(fix_label(used + 1))
+    return ticket
+
+
+def settle_check(document: Document, ticket: CheckTicket, limit: int) -> FixRound:
+    """結果を使えた検査の数えを確定する 前に使えた検査の後に AI の段で作品が変わっていれば
+    1 回と数える（人の段だけで変わったなら数えない 数えると人が手で直した分だけ AI の
+    直せる回が減る）
+
     上限に達したら、この指示の残りの編集をブリッジが断る（:func:`fixes_closed`）
-    同じ作品のまま呼び直した（途中までの結果の続きを読む）だけなら数えない
+    同じ作品のまま続きを読み直しただけなら数えない 指示が替わった後の結果なら確定しない
     """
     loop = _loop(document)
-    loop.previous = (loop.checked, loop.used, loop.closed)
-    changed = document.changes_by(Author.AI)
-    if loop.checked is not None and changed != loop.checked and not loop.closed:
-        loop.used += 1
-    loop.checked = changed
-    if loop.closed or loop.used >= max(0, limit):
-        loop.closed = True
-        return FixRound(loop.used, limit, None)
-    next_round = loop.used + 1
-    document.split_checkpoint(fix_label(next_round))
-    return FixRound(loop.used, limit, next_round)
+    if ticket.serial != loop.serial:
+        return current_round(document, limit)
+    loop.used, loop.closed = _counted(loop, ticket.changed, limit)
+    loop.settled = ticket.changed
+    return _round(loop.used, loop.closed, limit)
 
 
-def forget_check(document: Document, limit: int) -> FixRound:
-    """最後の :func:`start_check` の数えを戻す（調べる間に作品が変わり、結果で直せないとき）
-
-    戻さないと、使えなかった結果で直す回を 1 つ使い、上限 1 なら調べ直した後に直せない
-    AI の変更はまだ数えていない扱いに戻るので、次に調べ直したときにその回を数える
-    区切った段は戻さない（区切った後に AI は何も変えていないので、次の区切りは名前を替えるだけ）
-    """
+def current_round(document: Document, limit: int) -> FixRound:
+    """確定した数え 結果を使えなかった検査はこれを返す（数えは動かさない）"""
     loop = _loop(document)
-    if loop.previous is not None:
-        loop.checked, loop.used, loop.closed = loop.previous
-        loop.previous = None
-    if loop.closed or loop.used >= max(0, limit):
-        return FixRound(loop.used, limit, None)
-    return FixRound(loop.used, limit, loop.used + 1)
+    return _round(loop.used, loop.closed, limit)
 
 
 def fixes_closed(document: Document) -> bool:

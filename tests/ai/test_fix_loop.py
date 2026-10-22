@@ -326,6 +326,162 @@ class TestUnusableResults:
         assert not fixes_closed(host.document)
 
 
+def _report(request: CheckRequest, runs: list[Run], *, complete: bool = True) -> Any:
+    end = request.end or 300
+    return assemble(
+        runs,
+        start=request.start,
+        end=end,
+        analyzed=end if complete else request.start + 30,
+        fps=30.0,
+        complete=complete,
+        limits=request.limits,
+        index=None,
+        loudness=-14.2,
+        peak=0.5,
+        length_seconds=None,
+    )
+
+
+def _pending(host: FakeHost, arguments: dict[str, Any]) -> Pending:
+    """検査を頼み、待つ所で返す（結果は試験が様子を入れてから then で読む）"""
+    pending = _tool("check_output")(host, {**arguments, "wait_seconds": 30})
+    assert isinstance(pending, Pending)
+    return pending
+
+
+def _usable(host: FakeHost) -> None:
+    _finish(host, [_MIXED_CLIP])
+
+
+def _person_only(host: FakeHost) -> None:
+    # 直した後の分は数えたいので、ここでは AI の直しの後に人も変え、続けて調べた結果を使う
+    host.document.execute(RenameProject("人の直し"), by=Author.PERSON)
+    _finish(host, [_MIXED_CLIP])
+
+
+def _read_twice(host: FakeHost) -> None:
+    _finish(host, [_MIXED_CLIP])
+    _tool("check_output")(host, {"wait_seconds": 0})
+
+
+def _stale(host: FakeHost) -> None:
+    _finish_after_edit(host, [_MIXED_CLIP])
+
+
+def _failed(host: FakeHost) -> None:
+    pending = _pending(host, {})
+    host.check = CheckState(request=host.check_requests[-1], failure="読めない")
+    with pytest.raises(ToolError):
+        pending.then()
+
+
+def _no_report(host: FakeHost) -> None:
+    pending = _pending(host, {})
+    host.check = CheckState(request=host.check_requests[-1])
+    with pytest.raises(ToolError):
+        pending.then()
+
+
+def _partial(host: FakeHost, *, running: bool) -> dict[str, Any]:
+    _tool("check_output")(host, {"wait_seconds": 0})
+    request: CheckRequest = host.check_requests[-1]
+    host.check = CheckState(
+        request=request,
+        report=_report(request, [_MIXED_CLIP], complete=False),
+        running=running,
+        stopped=not running,
+    )
+    result = _tool("check_output")(host, {"wait_seconds": 0})
+    assert isinstance(result, dict)
+    return result
+
+
+def _running(host: FakeHost) -> None:
+    result = _partial(host, running=True)
+    assert result["problems"][0]["fix"]["action"] == HANDOFF
+    assert "まだ直さないで" in result["note"]
+
+
+def _stopped(host: FakeHost) -> None:
+    result = _partial(host, running=False)
+    assert result["problems"][0]["fix"]["action"] == HANDOFF
+
+
+def _replaced_and_failed(host: FakeHost) -> None:
+    first = _pending(host, {})
+    second = _pending(host, {"to_frame": 60})
+    host.check = CheckState(request=host.check_requests[-1], failure="読めない")
+    for pending in (second, first):
+        with pytest.raises(ToolError):
+            pending.then()
+
+
+def _replaced_and_usable(host: FakeHost) -> None:
+    first = _pending(host, {})
+    second = _pending(host, {"to_frame": 60})
+    request: CheckRequest = host.check_requests[-1]
+    host.check = CheckState(request=request, report=_report(request, [_MIXED_CLIP]))
+    assert isinstance(second.then(), dict)
+    with pytest.raises(ToolError):
+        first.then()
+
+
+#: 道ごとに、AI が 1 回直した後の検査をその道で終えたとき、直した回を数えるか
+#: 数えるのは結果を使えた道だけ
+#: （docs/development.md の「検査で見つけた問題を AI が直す繰り返し」の表）
+_PATHS = [
+    ("使えた", _usable, True),
+    ("人の変更も混ざった後に使えた", _person_only, True),
+    ("同じ結果を読み直した", _read_twice, True),
+    ("待つ間に作品が変わった", _stale, False),
+    ("検査が失敗した", _failed, False),
+    ("結果がまだ無い", _no_report, False),
+    ("途中までの結果", _running, False),
+    ("止められた", _stopped, False),
+    ("別の検査に替わり、それも失敗した", _replaced_and_failed, False),
+    ("別の検査に替わり、そちらを使えた", _replaced_and_usable, True),
+]
+
+
+class TestRoundPaths:
+    @pytest.mark.parametrize(
+        ("path", "counted"),
+        [(path, counted) for _name, path, counted in _PATHS],
+        ids=[name for name, _path, _counted in _PATHS],
+    )
+    def test_a_round_is_counted_only_from_a_usable_result(
+        self, host: FakeHost, path: Any, counted: bool
+    ) -> None:
+        """壊れると、使えない検査の結果で直す回を使って上限 1 で直せなくなるか、同じ直しを
+        2 回に数えて早く止まる"""
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "AI の直し")
+        path(host)
+        assert fixes_closed(host.document) is counted
+        # 後で使える結果を読むと、この直しはちょうど 1 回に数えられる（2 回にも 0 回にもならない）
+        host.check = CheckState()
+        fresh = _finish(host, [_MIXED_CLIP])
+        host.document.end_checkpoint()
+        assert fresh["fix_round"]["used"] == 1
+        assert fresh["fix_round"]["closed"] is True
+
+    def test_a_file_check_never_counts(self, host: FakeHost, tmp_path: Path) -> None:
+        """壊れると、書き出した動画を確かめただけで今の作品の直す回が減る"""
+        host.exported_to = tmp_path
+        written = tmp_path / "前の書き出し.mp4"
+        written.write_bytes(b"x" * 10)
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "AI の直し")
+        _finish_file(host, written, [_MIXED_CLIP])
+        assert not fixes_closed(host.document)
+        host.document.end_checkpoint()
+
+
 class TestAnswer:
     def test_each_problem_says_how_to_fix_it(self, host: FakeHost) -> None:
         """壊れると、AI はどの道具で直すか・尋ねるべきかを知らずに、見つけた物を
