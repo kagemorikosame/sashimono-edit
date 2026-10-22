@@ -13,6 +13,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from packaging.requirements import Requirement
 from PySide6.QtCore import QTimer, Signal
@@ -169,6 +170,15 @@ class SetupSection(QWidget):
             size = status.download_mb(extra=self.extra)
             if size:
                 lines.append(f"ダウンロードは {_readable(size)} ほどです")
+        if status.missing_files:
+            # pip の外で落とす物は、取得元まで見せる 何がどこから来るのか分からないまま
+            # 落とし始めるのは不安が大きい（コマンドを先に見せるのと同じ理由）
+            for file in status.missing_files:
+                host = urlsplit(file.url).hostname or file.url
+                lines.append(
+                    f"pip の後に落とすもの: {file.label or file.name}"
+                    f"（{max(1, file.size // 1024)} KB {host} から 中身を sha256 で確かめる）"
+                )
         if self._update_note:
             lines.append(self._update_note)
         self._status.setText("\n".join(lines))
