@@ -190,6 +190,8 @@ class TestAppSettingsAreReadOnly:
             # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
             "check_state",
             "check_waiter",
+            # 互換性レポートと画面の表示の写し（#352） 読むだけで、記録を消す・表示を変える口は無い
+            "compat_report",
             # 音量の推移のグラフ（#338） 渡された中身を絵にするだけ 作品にも設定にも触らない
             "draw_sound_graph",
             "export_status",
@@ -225,6 +227,8 @@ class TestAppSettingsAreReadOnly:
             "stop_playback",
             "transcription_status",
             "undo",
+            # 人が見ている表示（#352） 読むだけで、何も変えない
+            "view_state",
             "waveform",
             # 色を測るサムネイルを読むだけ（#336） 作れていなければ None を返し、作るのは analyze
             "filmstrip",
