@@ -66,6 +66,7 @@ from sashimono.core.mixing import (
 )
 from sashimono.core.model import LayerMode, StyleGuide
 from sashimono.core.reframe import (
+    DEFAULT_REFRAME_FACES,
     DEFAULT_REFRAME_FOLLOW,
     DEFAULT_REFRAME_SIZE,
     DEFAULT_REFRAME_SMOOTH_MS,
@@ -689,6 +690,10 @@ class Preferences:
     reframe_follow: str = DEFAULT_REFRAME_FOLLOW
     #: 追うときにならす長さ（ミリ秒） 長いほどゆっくり動く
     reframe_smooth_ms: int = DEFAULT_REFRAME_SMOOTH_MS
+    #: 被写体の見積もりに顔の位置（#324 #407）も使うか 画面の解析の部品が入っているときだけ
+    #: 効く 既定は使う（入れた人は人の映る素材で使うことが多い） 顔を調べる間を待ちたく
+    #: ない人と、顔でない物（手元・品物）を映したい人が切る
+    reframe_faces: bool = DEFAULT_REFRAME_FACES
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -824,6 +829,7 @@ class Preferences:
             size=self.reframe_size,
             follow=self.reframe_follow,
             smooth_ms=self.reframe_smooth_ms,
+            faces=self.reframe_faces,
         )
 
     @property
@@ -1087,6 +1093,7 @@ class PreferenceStore:
             reframe_smooth_ms=_within(
                 data.get("reframe_smooth_ms"), REFRAME_SMOOTH_MS_RANGE, plain.reframe_smooth_ms
             ),
+            reframe_faces=_flag(data.get("reframe_faces"), plain.reframe_faces),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis
             ),

@@ -64,20 +64,31 @@ from sashimono.effects import registry
 from sashimono.effects.sources import TO_NATIVE_LAYOUT
 from sashimono.effects.spec import TrackSpec
 from sashimono.engine.cache.analyzer import SceneState
+from sashimono.engine.cache.screen_analyzer import ScreenState
 from sashimono.engine.gpu import fit_placement
 from sashimono.engine.render.outline import has_outline, media_pixel_size, transform_values
 from sashimono.engine.scenes import SceneSignal
-from sashimono.engine.subject import SUBJECT_SECONDS
+from sashimono.engine.subject import SUBJECT_SECONDS, with_faces
+from sashimono.engine.vision.report import ScreenReport
 
 __all__ = [
     "BACKGROUND_COVER",
+    "FACES_NONE",
+    "FACES_NO_PARTS",
+    "FACES_OFF",
+    "FACES_USED",
+    "FACES_WAITING",
     "MAX_PAN_WINDOWS",
     "MIN_GATHERED",
     "MIN_STRENGTH",
+    "FaceSummary",
     "Gathered",
+    "GatheredFaces",
     "NoPlaceError",
     "ReframePlan",
     "ReframeRequest",
+    "face_summary",
+    "gather_faces",
     "gather_signals",
     "plan_reframe",
     "tracked_media",
@@ -132,6 +143,8 @@ class ShotNote:
     points: int
     no_clue: bool
     clip_id: str
+    #: 顔の位置（#324 #407）を手がかりに使った 偽なら動きと肌色だけで見積もった
+    faces: bool = False
 
 
 @dataclass(slots=True)
@@ -291,6 +304,7 @@ class _Tracker:
         picture: _Picture,
         signal: SceneSignal | None,
         window: CropWindow,
+        faces: ScreenReport | None = None,
     ) -> None:
         self._project = project
         self.picture = picture
@@ -307,6 +321,21 @@ class _Tracker:
             )
         )
         self._subject = subject if usable else None
+        #: 行ごとの、顔の位置を手がかりに使ったか（返事の ``faces`` に使う）
+        self._faced: np.ndarray | None = None
+        # 別の映像ストリームを調べた顔は使わない 同じ素材の別の絵の顔へ枠を寄せることになる
+        if (
+            self._subject is not None
+            and signal is not None
+            and faces is not None
+            and (faces.stream is None or signal.stream is None or faces.stream == signal.stream)
+        ):
+            self._subject, self._faced = with_faces(
+                self._subject,
+                faces.samples,
+                (faces.width, faces.height),
+                [cut.seconds for cut in signal.cuts()],
+            )
         self._centers: tuple[np.ndarray, np.ndarray] | None = None
         self._gathered: np.ndarray | None = None
         if self._subject is not None:
@@ -350,19 +379,12 @@ class _Tracker:
         )
         weight = 0.0
         across, down = 0.5, 0.5
-        if self._subject is not None and self._centers is not None:
-            seconds = float(clip.picture_time(local, self._project.rate))
-            times = self._subject.times
-            index = int(np.clip(np.searchsorted(times, seconds), 0, len(times) - 1))
-            if index > 0 and abs(times[index - 1] - seconds) < abs(times[index] - seconds):
-                index -= 1
-            if abs(float(times[index]) - seconds) <= _NEAREST:
-                strength = float(self._subject.strength[index])
-                gathered = 1.0 if self._gathered is None else float(self._gathered[index])
-                if strength >= MIN_STRENGTH and gathered >= MIN_GATHERED:
-                    weight = strength * gathered
-                    across = float(self._centers[0][index])
-                    down = float(self._centers[1][index])
+        index = self._clue(frame)
+        if index is not None and self._subject is not None and self._centers is not None:
+            gathered = 1.0 if self._gathered is None else float(self._gathered[index])
+            weight = float(self._subject.strength[index]) * gathered
+            across = float(self._centers[0][index])
+            down = float(self._centers[1][index])
         if self._flip[0]:
             across = 1.0 - across
         if self._flip[1]:
@@ -370,6 +392,31 @@ class _Tracker:
         # 絵の中の点（左から across・上から down）の、支点からの画素（Y は上が正）
         x, y = placed_at(((across - 0.5) * placed[0], (0.5 - down) * placed[1]))
         return Sample(frame=frame, x=x, y=y, weight=weight), bounds
+
+    def _clue(self, frame: int) -> int | None:
+        """タイムラインの ``frame`` で手がかりに数える被写体の行 無い・薄い・散った行は ``None``"""
+        if self._subject is None or self._centers is None:
+            return None
+        clip = self.picture.clip
+        seconds = float(clip.picture_time(frame - clip.timeline_start, self._project.rate))
+        times = self._subject.times
+        index = int(np.clip(np.searchsorted(times, seconds), 0, len(times) - 1))
+        if index > 0 and abs(times[index - 1] - seconds) < abs(times[index] - seconds):
+            index -= 1
+        if abs(float(times[index]) - seconds) > _NEAREST:
+            return None
+        strength = float(self._subject.strength[index])
+        gathered = 1.0 if self._gathered is None else float(self._gathered[index])
+        if strength < MIN_STRENGTH or gathered < MIN_GATHERED:
+            return None
+        return index
+
+    def faced(self, frame: int) -> bool:
+        """``frame`` の枠の手がかりに、顔の位置（#407）を使ったか"""
+        if self._faced is None:
+            return False
+        index = self._clue(frame)
+        return index is not None and bool(self._faced[index])
 
     def area_frames(self, start: int, end: int) -> list[int]:
         """枠を置ける範囲を数えるコマ（タイムラインのフレーム ``start`` 以上 ``end`` 未満）
@@ -566,8 +613,11 @@ def _shots(
     timeline: Timeline,
     trackers: list[_Tracker],
     signals: Mapping[MediaId, SceneSignal],
-) -> list[tuple[Shot, _Tracker]]:
-    """背景の絵がいちばん手前の物の切り替わりと、素材の場面の切り替わりで区切った場面"""
+) -> list[tuple[Shot, _Tracker, bool]]:
+    """背景の絵がいちばん手前の物の切り替わりと、素材の場面の切り替わりで区切った場面
+
+    3 つ目は、場面の枠の手がかりに顔の位置（#407）を使ったか
+    """
     visible = _visible(timeline)
     order = {id(track): index for index, track in enumerate(timeline.tracks)}
     candidates = [t for t in trackers if id(t.picture.track) in visible and t.picture.clip.enabled]
@@ -611,9 +661,11 @@ def _shots(
         else:
             spans.append((start, end, owner))
     step = max(1, round(float(project.rate.fps) * SUBJECT_SECONDS))
-    shots: list[tuple[Shot, _Tracker]] = []
+    shots: list[tuple[Shot, _Tracker, bool]] = []
     for start, end, owner in spans:
-        samples = [owner.sample(frame)[0] for frame in range(start, end, step)]
+        sampled = range(start, end, step)
+        samples = [owner.sample(frame)[0] for frame in sampled]
+        faced = any(owner.faced(frame) for frame in sampled)
         # 枠を置ける範囲は、範囲がいちばん狭まりうるコマを全部数える（:meth:`_Tracker.area_frames`）
         # 被写体と同じ 0.25 秒ごとだけだと、場面の最後のコマやキーフレームの折れ目を数えず、
         # ぎりぎり収まるパンでその数コマだけ縦の画面の端に絵の外が映った
@@ -645,6 +697,7 @@ def _shots(
                     area=area,
                 ),
                 owner,
+                faced,
             )
         )
     return shots
@@ -970,11 +1023,15 @@ def _in(scene_id: SceneId | None, commands: Iterable[Command]) -> list[Command]:
 
 
 def plan_reframe(
-    project: Project, request: ReframeRequest, signals: Mapping[MediaId, SceneSignal]
+    project: Project,
+    request: ReframeRequest,
+    signals: Mapping[MediaId, SceneSignal],
+    faces: Mapping[MediaId, ScreenReport] | None = None,
 ) -> ReframePlan:
     """横の作品を ``request`` の大きさに作り替える命令を組む
 
     ``signals`` は背景の動画の場面の解析（被写体の並びを含む） 無い素材は真ん中を切り出す
+    ``faces`` は顔の位置を調べ終えた素材の結果（#324 #407） 無い素材は動きと肌色だけで見積もる
     ロックしたトラックで変える物があれば、何も組まずに断る（人が触らせないために掛けた物）
     """
     old = project.settings.resolution
@@ -1007,11 +1064,19 @@ def plan_reframe(
                         _placed(size, clip, old),
                         _placed(size, clip, new),
                     )
-                    trackers.append(_Tracker(project, picture, signals.get(media.id), window))
+                    trackers.append(
+                        _Tracker(
+                            project,
+                            picture,
+                            signals.get(media.id),
+                            window,
+                            None if faces is None else faces.get(media.id),
+                        )
+                    )
                 else:
                     overlays.append((track, clip))
         plans: list[ShotPlan] = []
-        for shot, owner in _shots(project, timeline, trackers, signals):
+        for shot, owner, faced in _shots(project, timeline, trackers, signals):
             shot_plan = plan_shot(
                 shot, request.follow, window.size, smooth_frames, max_step=max_step
             )
@@ -1026,6 +1091,7 @@ def plan_reframe(
                     points=len(shot_plan.points),
                     no_clue=shot_plan.no_clue,
                     clip_id=str(owner.picture.clip.id),
+                    faces=faced and not shot_plan.no_clue,
                 )
             )
         focus = focus_curves(plans) if plans else (AnimatedValue(), AnimatedValue())
@@ -1102,3 +1168,117 @@ def gather_signals(
         else:
             gathered.untracked.append(item.id)
     return gathered
+
+
+#: 顔の位置（#407）を使ったかの様子 AI の道具の返事の ``faces`` と、人の窓の知らせに使う
+#: 使った場面が 1 つでもある
+FACES_USED = "used"
+#: 調べ終えたが、手がかりにする顔が無かった（顔の映らない素材・顔として拾わないアバター）
+FACES_NONE = "none"
+#: 顔の位置をまだ調べている（その素材は動きと肌色だけで見積もった）
+FACES_WAITING = "waiting"
+#: 画面の解析の部品（#324）が入っていない
+FACES_NO_PARTS = "no_parts"
+#: 本人の設定か引数で使わないと選んだ・真ん中を切り出すので被写体を見ない
+FACES_OFF = "off"
+
+
+@dataclass(slots=True)
+class GatheredFaces:
+    """背景の動画ごとの顔の位置の様子（:func:`gather_faces`）"""
+
+    #: 調べ終えた結果
+    reports: dict[MediaId, ScreenReport] = field(default_factory=dict)
+    #: まだ調べている 待たずに動きと肌色だけで見積もる（断らない）
+    waiting: list[MediaId] = field(default_factory=list)
+    #: 調べられなかった（失敗の理由） 動きと肌色だけで見積もる
+    failed: dict[MediaId, str] = field(default_factory=dict)
+
+
+def gather_faces(
+    media: Iterable[MediaItem], state_of: Callable[[MediaItem], ScreenState]
+) -> GatheredFaces:
+    """顔の位置の様子を、使える・調べている・失敗したに分ける
+
+    調べている途中の写しは使わない 調べていない場面だけ顔が抜けて、場面ごとに手がかりの
+    重さが変わる 場面が分からず等間隔に調べた仮の結果（``by_scene`` が偽）は使う 枠を決める
+    場面の区切りは場面の解析の物で数えるので、絵の取り方が違っても同じ場面の顔を引ける
+    """
+    gathered = GatheredFaces()
+    for item in media:
+        state = state_of(item)
+        if state.report is not None and state.report.complete:
+            gathered.reports[item.id] = state.report
+        elif state.running:
+            gathered.waiting.append(item.id)
+        elif state.failure is not None:
+            gathered.failed[item.id] = state.failure
+    return gathered
+
+
+@dataclass(frozen=True, slots=True)
+class FaceSummary:
+    """顔の位置を使ったかのまとめ ``status`` は :data:`FACES_USED` などの値"""
+
+    status: str
+    #: 顔を手がかりに使った場面の数
+    shots: int
+    #: 人と AI に見せる文
+    note: str
+
+
+def face_summary(
+    plan: ReframePlan | None,
+    *,
+    wanted: bool,
+    parts_ready: bool,
+    gathered: GatheredFaces | None,
+) -> FaceSummary:
+    """作り替えに顔の位置を使ったかを、AI の道具と人の窓で同じ言葉にまとめる
+
+    ``wanted`` は使うと選んでいるか（本人の設定か引数 真ん中を切り出すなら偽）
+    ``parts_ready`` は画面の解析の部品が入っているか 言葉を入口ごとに書くと、同じ作り替えで
+    AI と人に違う理由を伝える
+    """
+    used = sum(1 for note in plan.shots if note.faces) if plan is not None else 0
+    if not wanted:
+        return FaceSummary(
+            FACES_OFF, 0, "顔の位置は使っていません（動きと肌色だけで見積もりました）"
+        )
+    if not parts_ready:
+        return FaceSummary(
+            FACES_NO_PARTS,
+            0,
+            "画面の解析の部品が入っていないので、顔の位置は使わず動きと肌色だけで見積もりました"
+            "（表示 → 設定… の〔画面の解析の部品…〕で入れると、次から顔の位置も使います）",
+        )
+    waiting = len(gathered.waiting) if gathered is not None else 0
+    if used:
+        note = f"{used} 個の場面で顔の位置も手がかりにしました"
+        if waiting:
+            note += (
+                f" 顔の位置をまだ調べている素材 {waiting} 本は動きと肌色だけで見積もりました"
+                "（調べ終えてから作り直すと顔も使います）"
+            )
+        return FaceSummary(FACES_USED, used, note)
+    if waiting:
+        return FaceSummary(
+            FACES_WAITING,
+            0,
+            "顔の位置をまだ調べているので、動きと肌色だけで見積もりました"
+            "（調べ終えてから作り直すと顔も使います）",
+        )
+    failed = gathered.failed if gathered is not None else {}
+    if failed and (gathered is None or not gathered.reports):
+        reason = next(iter(failed.values()))
+        return FaceSummary(
+            FACES_NONE,
+            0,
+            f"顔の位置を調べられなかったので、動きと肌色だけで見積もりました（{reason}）",
+        )
+    return FaceSummary(
+        FACES_NONE,
+        0,
+        "顔が見つからなかったので、動きと肌色だけで見積もりました"
+        "（獣のアバターや横を向いた顔など、顔として拾わない絵もあります）",
+    )

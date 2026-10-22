@@ -20,9 +20,10 @@ from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddScene
 from sashimono.core.model import MediaItem, Scene, Timeline
 from sashimono.core.reframe import ReframeStyle
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.scenes import SceneSignal
 from sashimono.engine.subject import SUBJECT_BINS, SUBJECT_SECONDS, SubjectTrack
+from sashimono.engine.vision import Box, Face, ScreenKind, ScreenReport, ScreenSample
 from tests.ai.conftest import RATE_30, FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
 
@@ -156,6 +157,103 @@ class TestTheResult:
         assert shot["mode"] == "steady"
         assert shot["focus_x"] > 300
         assert "save_project_as" in result["note"]
+
+
+def _faces(across: float) -> ScreenReport:
+    """横の ``across``（左から 0〜1）に顔のある、調べ終えた顔の位置（1920x1080 の素材）"""
+    face = Face(Box((across - 0.5) * 1920, 0.0, 120.0, 120.0), 0.9)
+    samples = tuple(ScreenSample(moment, faces=(face,)) for moment in (2.0, 5.0, 8.0))
+    return ScreenReport(ScreenKind.FACES, "偽の顔", 1920, 1080, samples, 3, True, stream=0)
+
+
+class TestTheFaces:
+    """顔の位置（#407）を被写体の手がかりに足す 部品は偽のホストの ``vision_ready`` で決める"""
+
+    def test_without_the_parts_it_says_so_and_does_not_ask(self, host: FakeHost) -> None:
+        # 部品の無い機械で顔を頼むと、素材ごとに「部品が無い」失敗を積む 黙ると、人は顔を
+        # 見ていると思い込む
+        host.scene_states[_media(host).id] = SceneState(_signal(0.8), running=False)
+        result = _call(host)
+        assert result["changed"] is True
+        assert result["faces"] == "no_parts"
+        assert host.screen_requests == []
+        assert "部品" in result["note"]
+
+    def test_the_faces_move_the_frame(self, host: FakeHost) -> None:
+        # 壊れると、顔の位置を調べ終えていても動きの側（右）へ枠が決まり、左の話し手が映らない
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(_faces(0.2), running=False)
+        result = _call(host)
+        assert host.screen_requests == [(media.id, ScreenKind.FACES)]
+        assert result["faces"] == "used"
+        assert result["face_shots"] == 1
+        shot = result["shots"][0]
+        assert shot["faces"] is True
+        assert shot["focus_x"] < -300
+
+    def test_the_argument_turns_them_off(self, host: FakeHost) -> None:
+        # 切れないと、手元や品物を映したい場面で枠が顔へ取られたままになる
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(_faces(0.2), running=False)
+        result = _call(host, faces=False)
+        assert result["faces"] == "off"
+        assert result["shots"][0]["focus_x"] > 300
+        assert host.screen_requests == []
+
+    def test_the_setting_turns_them_off(self, host: FakeHost) -> None:
+        # 設定で切っても効いたままなら、設定がある方が質が悪い
+        media = _media(host)
+        host.vision_ready = True
+        host.reframing = ReframeStyle(faces=False)
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(_faces(0.2), running=False)
+        assert _call(host)["faces"] == "off"
+
+    def test_faces_still_running_do_not_stop_the_work(self, host: FakeHost) -> None:
+        # 顔を待って断ると、顔を調べ終えるまで作り替えられない（動きと肌色で作れるのに）
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(None, running=True)
+        result = _call(host, wait_seconds=0)
+        assert result["changed"] is True
+        assert result["faces"] == "waiting"
+        assert result["shots"][0]["faces"] is False
+
+    def test_running_faces_are_waited_for(self, host: FakeHost) -> None:
+        # 待たずに作ると、場面の解析が終わってすぐの呼び出しで、いつも顔を使わずに作る
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(None, running=True)
+        pending = REFRAME(host, {})
+        assert isinstance(pending, Pending)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(_faces(0.2), running=False)
+        assert pending.wait(0.1)
+        result = pending.then()
+        assert isinstance(result, dict)
+        assert result["faces"] == "used"
+
+    def test_a_failure_is_told(self, host: FakeHost) -> None:
+        # 調べられなかった理由を伏せると、人は顔を使ったと思い込む
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(_signal(0.8), running=False)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(
+            None, running=False, failure="素材が開けない"
+        )
+        result = _call(host)
+        assert result["faces"] == "none"
+        assert "素材が開けない" in result["note"]
+
+    def test_a_bad_argument_is_refused(self, host: FakeHost) -> None:
+        # 文字列の "false" を真と読むと、切ったつもりの顔で枠が決まる
+        with pytest.raises(ToolError, match="faces"):
+            REFRAME(host, {"follow": "center", "faces": "false"})
 
 
 class TestTheRefusals:

@@ -1242,6 +1242,7 @@ class PreferencesDialog(QDialog):
             reframe_size=str(self._reframe_size.currentData()),
             reframe_follow=str(self._reframe_follow.currentData()),
             reframe_smooth_ms=self._reframe_smooth.value(),
+            reframe_faces=self._reframe_faces.isChecked(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
             screen_analysis=str(self._screen_analysis.currentData()),
@@ -1442,7 +1443,8 @@ class PreferencesDialog(QDialog):
         self._reframe_follow.setToolTip(
             "枠を場面ごとに止めるか、被写体を追って動かすか 止めると三脚で撮ったように落ち着くが、"
             "大きく動く人は枠から外れる 追うと外れにくいが、手持ちのカメラのように動き続ける"
-            " 被写体は動きと肌色から見積もる（顔は見分けない 肌色に近い壁や床にも寄る）"
+            " 被写体は動きと肌色から見積もる（画面の解析の部品が入っていれば顔の位置も使う"
+            " 部品が無いと顔は見分けず、肌色に近い壁や床にも寄る）"
         )
         form.addRow("縦動画への作り替え: 枠の動かし方", self._reframe_follow)
         self._reframe_smooth = QSpinBox(self)
@@ -1455,6 +1457,15 @@ class PreferencesDialog(QDialog):
             "ぴったり付くが手振りで揺れる 止める場面には効かない"
         )
         form.addRow("縦動画への作り替え: 追うときのならし", self._reframe_smooth)
+        self._reframe_faces = QCheckBox("顔の位置も手がかりにする", self)
+        self._reframe_faces.setChecked(preferences.reframe_faces)
+        self._reframe_faces.setToolTip(
+            "画面の解析の部品（〔画面の解析の部品…〕）が入っているとき、被写体の見積もりに顔の"
+            "位置も使う 肌色に近い絵や壁へ枠が寄りにくくなる 顔は場面ごとに数枚だけ調べる"
+            f"（1 枚の時間は {MEASURED_SCREEN_SAMPLE}） 獣のアバターなど顔として拾わない絵もある"
+            " 部品が無ければ切っているのと同じく動きと肌色だけで見積もる"
+        )
+        form.addRow("縦動画への作り替え: 顔", self._reframe_faces)
 
     def _add_limit_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """AI が使う量の上限（#344） どこまで使ってよいかは契約と懐で人ごとに違う
