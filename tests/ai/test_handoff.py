@@ -194,6 +194,25 @@ class TestChangesComeFromTheHistory:
         assert handoff is not None
         assert handoff.split is True
         assert "分かれています" in handoff.undo_note()
+        # 人が割る前の手も変えた手に残る 割った所で段の中の名前は消えるので、写しておかないと抜ける
+        assert handoff.changes == ("分割", "分割")
+
+    def test_changes_before_a_person_split_survive_an_idle_ai(self, loaded: Project) -> None:
+        # 壊れると、AI が 2 回変えた後に人が 1 回変え、AI が何もせずに止まると、引き継ぎに
+        # 「変えた手 0 件」「変えた物: 無し」と出て、人は AI の手が残っていることに気付かない
+        document = Document(loaded)
+        _ai_turn(document, cuts=2)
+        document.execute(SplitClip(_first_clip(document), 15), by=Author.PERSON)
+        record = TurnRecord()
+        record.begin("冒頭を切って")
+        record.capture(document)
+        document.end_checkpoint()
+        record.stop(StopReason.INTERRUPTED)
+        handoff = record.handoff(document, "AI: 冒頭を切って")
+        assert handoff is not None
+        assert handoff.changes == ("分割", "分割")
+        assert "変えた手 2 件" in handoff.headline()
+        assert "・無し" not in handoff.text()
 
     def test_capture_outside_an_instruction_keeps_what_was_taken(self, loaded: Project) -> None:
         # 壊れると、段を閉じた後にもう 1 度写すと空で上書きし、変えた手が要約から消える
@@ -420,6 +439,8 @@ class TestFixLoop:
         assert handoff is not None
         assert handoff.split is True
         assert "分かれています" in handoff.undo_note()
+        # 直しの回で区切った手と、人が割った前半の手（直し 1）の両方が残る
+        assert handoff.changes == ("直す", "直す", "直す")
 
     def test_the_limit_with_problems_left_is_a_stop(self, host: FakeHost) -> None:
         # 壊れると、直す回数の上限で止めた指示は AI が言葉で締めるだけなので止まらずに

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from sashimono.ai.fixes import fix_stop, steps_split_off
+from sashimono.ai.fixes import fix_stop
 from sashimono.core.commands import Document
 from sashimono.core.model import Project
 
@@ -306,13 +306,12 @@ class TurnRecord:
         """
         if not document.in_checkpoint:
             return
-        # 検査の直しの回で区切ると（#339）、先に積んだ段の中の手は段の中から読めなくなる
-        # 区切ったときに写した物を前に足す 足さないと前の回で直した手が要約から消える
-        earlier, parts = steps_split_off(document)
-        self._changes = earlier + document.steps_in_checkpoint
-        # 前半の段は、人が割った分と直しの回で区切った分の両方 区切った回より多ければ人が割った
-        self._split = document.parts_in_checkpoint > parts
-        self._fix_parts = parts
+        # 人が途中で変えて割ったときも、検査の直しの回で区切ったとき（#339）も、先に積んだ
+        # 段の中の手は段の中から読めなくなる 文書が先に積むときに写した名前を前に足す
+        # 名前を写すのは文書の 1 か所だけ（直しの回の側で写すと、人が割った分が漏れていた）
+        self._changes = document.steps_split_off + document.steps_in_checkpoint
+        self._split = document.parts_split_by_others > 0
+        self._fix_parts = document.parts_split_for_rounds
         # 直す回数の上限で止めた（#339） AI は止めた訳を聞いて言葉で締めるだけなので、ここで
         # 書かないと「止まらずに終えた」扱いになり、残った問題が人に届かない
         stopped = fix_stop(document)

@@ -102,6 +102,11 @@ class Document:
         #: 積んでも、この段（指示）の物として数える（:attr:`undo_in_checkpoint`）
         #: 段を覚えず ``before`` で見分けるのは、取り消して・やり直すと段が作り直されるため
         self._earlier_parts: list[Project] = []
+        #: 前半として先に積んだ段ごとの、段の中の小さな段の名前と、別の人の変更で割ったか
+        #: （偽なら検査の直しの回で区切った :meth:`split_checkpoint`） 段の ``before`` で引く
+        #: 先に積むと段の中の小さな段は捨てるので、ここに写さないと「この指示で変えた手」から
+        #: 前半の手が消える（引き継ぎ #346 が、AI が変えた後に人が割ると「変えた手 0 件」と出した）
+        self._earlier_steps: list[tuple[Project, tuple[str, ...], bool]] = []
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
@@ -239,6 +244,7 @@ class Document:
             self._checkpoint_by = by or Author.PERSON
             self._reset_inner()
             self._earlier_parts = []
+            self._earlier_steps = []
         elif self._checkpoint_depth == 1:
             self._nested_before = self._project
             self._nested_label = label
@@ -263,6 +269,7 @@ class Document:
         touched = self._inner_touched
         self._reset_inner()
         self._earlier_parts = []
+        self._earlier_steps = []
         changed = before is not None and before is not self._project
         if touched:
             # 段の中で変えた後は、段の外の古いやり直しは当てられない 段の中で最後に
@@ -326,6 +333,7 @@ class Document:
         if own_before is not None and own_before is not before:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
+            self._earlier_steps.append((own_before, self.steps_in_checkpoint, True))
         self._reset_inner()
         top = self._undo[-1] if self._undo else None
         continued = (
@@ -398,6 +406,7 @@ class Document:
         if own_before is not None and own_before is not self._project:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
+            self._earlier_steps.append((own_before, self.steps_in_checkpoint, False))
             self._reset_inner()
             # 新しい段を積んだので、前に取り消した物はやり直せない（人の変更で割るときと同じ）
             self._redo.clear()
@@ -437,14 +446,38 @@ class Document:
         """
         return any(self._is_earlier_part(entry) for entry in self._undo)
 
-    @property
-    def parts_in_checkpoint(self) -> int:
-        """開いている段（指示）の前半として、段の外の履歴に残っている段の数
+    def _parts_left(self) -> list[tuple[tuple[str, ...], bool]]:
+        """前半の段のうち、段の外の履歴に今も残っている物の（手の名前, 別の人が割ったか） 古い順
 
-        人の変更で割れた分と、検査の直しの回で区切った分（#339 :meth:`split_checkpoint`）の
-        両方を数える 引き継ぎ（#346）が、区切った回の数と比べて人が割ったかを見分けるのに使う
+        段の中で戻して段の外のやり直しへ移った前半は数えない 戻した手は作品に残っていない
         """
-        return sum(1 for entry in self._undo if self._is_earlier_part(entry))
+        if not self._checkpoint_depth:
+            return []
+        present = [entry.before for entry in self._undo if self._is_earlier_part(entry)]
+        return [
+            (steps, by_other)
+            for before, steps, by_other in self._earlier_steps
+            if any(before is part for part in present)
+        ]
+
+    @property
+    def steps_split_off(self) -> tuple[str, ...]:
+        """前半として先に積んだ段の中の小さな段の名前 古い順 段を開いていなければ空
+
+        :attr:`steps_in_checkpoint` は最後に割った後の手だけなので、前に足すと指示全体の手になる
+        人の変更で割った分も、検査の直しの回で区切った分（#339）も入る 引き継ぎ（#346）が使う
+        """
+        return tuple(name for steps, _ in self._parts_left() for name in steps)
+
+    @property
+    def parts_split_by_others(self) -> int:
+        """前半の段のうち、別の人の変更で割れた所の数（段の外に残っている物）"""
+        return sum(1 for _, by_other in self._parts_left() if by_other)
+
+    @property
+    def parts_split_for_rounds(self) -> int:
+        """前半の段のうち、検査の直しの回で区切った所の数（段の外に残っている物 #339）"""
+        return sum(1 for _, by_other in self._parts_left() if not by_other)
 
     def _is_earlier_part(self, entry: HistoryEntry) -> bool:
         return entry.by is self._checkpoint_by and any(

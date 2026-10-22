@@ -60,7 +60,6 @@ __all__ = [
     "refuse_after_limit",
     "settle_check",
     "start_check",
-    "steps_split_off",
 ]
 
 AUTO = "auto"
@@ -273,11 +272,6 @@ class _Loop:
     closed: bool = False
     #: 最後に確定した検査のときの上限（本人の設定）
     limit: int = 0
-    #: 直す回の段を区切って段の外へ先に積んだ小さな段の名前（古い順） 区切ると段の中の小さな段は
-    #: 履歴から読めなくなるので、引き継ぎ（#346）の「変えた手」のためにここで写しておく
-    steps: tuple[str, ...] = ()
-    #: 直す回の段を区切って先に積んだ段の数
-    parts: int = 0
     #: 上限に達した後の検査で、上限が無ければ直せた（auto か ask の）問題 最後に使えた検査の物
     left: tuple[str, ...] = ()
     #: 上限に達した後にブリッジが断った編集の数
@@ -321,13 +315,8 @@ def start_check(document: Document, limit: int) -> CheckTicket:
     ticket = CheckTicket(document.checkpoint_serial, document.changes_by(Author.AI))
     used, closed = _counted(loop, ticket.changed, limit)
     if not closed:
-        steps = document.steps_in_checkpoint
-        parts = document.parts_in_checkpoint
+        # 区切って先に積んだ段の中の手の名前は文書が覚える（Document.steps_split_off #346）
         document.split_checkpoint(fix_label(used + 1))
-        if document.parts_in_checkpoint > parts:
-            # 区切って先に積んだ（何も変えていなければ名前を替えるだけで、段の中に残る）
-            loop.steps += steps
-            loop.parts += 1
     return ticket
 
 
@@ -386,16 +375,6 @@ def leave_after_limit(document: Document, ticket: CheckTicket, left: tuple[str, 
     loop = _now(document)
     if loop is not None and loop.closed and ticket.serial == loop.serial:
         loop.left = left
-
-
-def steps_split_off(document: Document) -> tuple[tuple[str, ...], int]:
-    """今の指示で、直す回の段を区切って先に積んだ小さな段の名前と、先に積んだ段の数
-
-    引き継ぎ（#346）が段を閉じる前に写す 段の中の小さな段（:attr:`Document.steps_in_checkpoint`）
-    は最後の区切りの後の物だけなので、合わせないと前の回で直した手が要約から消える
-    """
-    loop = _now(document)
-    return ((), 0) if loop is None else (loop.steps, loop.parts)
 
 
 @dataclass(frozen=True, slots=True)
