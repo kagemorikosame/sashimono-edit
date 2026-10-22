@@ -55,7 +55,10 @@ from sashimono.effects import registry
 from sashimono.effects.definition import EffectDefinition
 from sashimono.effects.spec import TextSpec
 from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.profile import SoundProfiler
+from sashimono.engine.checks.report import Problem, assemble
+from sashimono.engine.checks.scan import TEXT_OVERFLOW
 from sashimono.engine.vision import Box, ScreenKind, ScreenReport, ScreenSample, TextLine
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
@@ -184,6 +187,7 @@ class TestDeclarations:
             ("get_clip", Outbound.FILES),
             ("get_compat_report", Outbound.APP_SETTINGS),
             ("get_compat_report", Outbound.FILES),
+            ("get_compat_report", Outbound.TEXT),
             ("get_app_settings", Outbound.APP_SETTINGS),
             ("get_app_settings", Outbound.FILES),
         ],
@@ -330,6 +334,8 @@ def _reading_host(host: FakeHost, transcript: Transcript, tmp_path: Path) -> set
     recorded = CompatibilityReport()
     recorded.note_missing(APP_MARK)
     recorded.note_failure(SECRET_PATH.name, f"開けない: {SECRET_PATH}")
+    # 読めなかった制御文字の行には、テキストの文やスクリプトの見出しの文が入りうる（#391）
+    recorded.note_control(f"<#ff0000>{sentence}")
     host.compat = CompatReport.of(recorded, scripts=1, folders=(str(SECRET_PATH.parent),))
     # アプリの設定 置き場のフォルダ（本人の名前の入った場所）と目印
     host.settings = {
@@ -1293,6 +1299,118 @@ class TestRedact:
         result = box.get("result")
         assert isinstance(result, ImageResult)
         assert format_timecode(30, host.project.rate) in result.caption
+
+
+# --- 型の無い文字を返す読む道具（#391 の CodeRabbit の指摘）---
+
+#: はみ出した字幕の文 検査の行の text に載る
+OVERFLOW_TEXT = "はみ出した秘密の字幕です"
+
+
+def _overflowing(host: FakeHost) -> None:
+    """字幕のはみ出しを 1 つ見つけて終わった検査の様子を入れる（検査そのものは走らせない）"""
+    operation = _operation("check_output")
+    operation(host, {"checks": ["text_overflow"], "wait_seconds": 0})
+    request = host.check_requests[-1]
+    base = assemble(
+        [],
+        start=request.start,
+        end=request.end or 300,
+        analyzed=request.end or 300,
+        fps=30.0,
+        complete=True,
+        limits=request.limits,
+        index=None,
+        loudness=None,
+        peak=None,
+        length_seconds=None,
+    )
+    problem = Problem(
+        kind=TEXT_OVERFLOW,
+        severity="medium",
+        start=0,
+        end=30,
+        detail="字が画面の外へ出て切れる",
+        measure={"text": OVERFLOW_TEXT, "overflow_px": 40},
+    )
+    host.check = CheckState(request=request, report=replace(base, problems=(problem,)))
+
+
+def _compat_with_text(host: FakeHost) -> None:
+    recorded = CompatibilityReport()
+    recorded.note_control(f"<#ff0000>{OVERFLOW_TEXT}")
+    recorded.note_missing(f"debug_print: {OVERFLOW_TEXT}")
+    recorded.note_missing("obj.getpixeldata")
+    recorded.note_failure("秘密.anm", "開けない: 秘密.anm")
+    host.compat = CompatReport.of(recorded, scripts=1, folders=("秘密のフォルダ",))
+
+
+class TestUntypedTextIsHidden:
+    @pytest.mark.parametrize(
+        ("name", "arguments", "prepare"),
+        [
+            ("check_output", {"checks": ["text_overflow"], "wait_seconds": 0}, _overflowing),
+            ("get_compat_report", {}, _compat_with_text),
+        ],
+    )
+    def test_refused_text_is_hidden_and_the_rest_is_read(
+        self,
+        host: FakeHost,
+        text_refused: EditorBridge,
+        name: str,
+        arguments: dict[str, Any],
+        prepare: Callable[[FakeHost], None],
+    ) -> None:
+        """壊れると、字幕のはみ出しの行の文や、互換性レポートの記録に混ざった本人の文
+        （制御文字の行・debug_print）を、字幕と文字を送らない人の所でもそのまま送る
+        道具そのものは断らず、文以外（種類・回数・時刻）は読める"""
+        prepare(host)
+        seen, box = _run(text_refused, name, arguments=arguments)
+        assert not seen
+        assert box.get("error") is None, box.get("error")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert OVERFLOW_TEXT not in sent
+        assert TEXT_MARK in sent
+
+    def test_places_in_the_report_are_hidden_when_names_are_refused(self, host: FakeHost) -> None:
+        """壊れると、互換性レポートの置き場や失敗の文の相対の名前（秘密.anm）が、名前と場所を
+        送らない人の所で場所の形に当たらずに外へ出る"""
+        _compat_with_text(host)
+        bridge = EditorBridge(host)
+        bridge.set_send_choices(
+            dict.fromkeys(ASKED, SendChoice.ALLOW) | {Outbound.FILES: SendChoice.DENY}
+        )
+        _seen, box = _run(bridge, "get_compat_report")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert "秘密" not in sent
+        assert '"count"' in sent
+
+    @pytest.mark.parametrize(
+        ("name", "arguments", "prepare"),
+        [
+            ("check_output", {"checks": ["text_overflow"], "wait_seconds": 0}, _overflowing),
+            ("get_compat_report", {}, _compat_with_text),
+        ],
+    )
+    def test_weakening_the_declaration_is_caught(
+        self,
+        host: FakeHost,
+        name: str,
+        arguments: dict[str, Any],
+        prepare: Callable[[FakeHost], None],
+    ) -> None:
+        """壊れると、本人の文を返す道具から字幕と文字の宣言を外しても見張りが気付かず、
+        設定画面と同意の窓に出ないまま文が送られる"""
+        prepare(host)
+        operation = _operation(name)
+        weakened = replace(
+            operation,
+            sends=operation.sends - {Outbound.TEXT},
+            hidden=operation.hidden - {Outbound.TEXT},
+        )
+        result = weakened(host, arguments)
+        assert not undeclared(operation, result, sentences={OVERFLOW_TEXT})
+        assert undeclared(weakened, result, sentences={OVERFLOW_TEXT})
 
 
 # --- 文字の欄（TextSpec）は名前に関係なく字幕と文字として伏せる（#391 の Codex の指摘）---

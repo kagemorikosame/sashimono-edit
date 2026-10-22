@@ -576,12 +576,16 @@ class EditorBridge:
         except ToolError as exc:
             if texts is None:
                 raise
-            raise ToolError(str(self._hide_text(str(exc), texts, hide_body))) from None
-        return result if texts is None else self._hide_text(result, texts, hide_body)
+            raise ToolError(
+                str(self._hide_text(str(exc), texts, hide_body, operation.labels))
+            ) from None
+        if texts is None:
+            return result
+        return self._hide_text(result, texts, hide_body, operation.labels)
 
-    def _hide_text(self, value: object, before: list[str], body: bool) -> object:
+    def _hide_text(self, value: object, before: list[str], body: bool, labels: bool) -> object:
         after = text_secrets(self._host.document.project) if body else []
-        return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
+        return hide_text(value, sorted({*before, *after}, key=len, reverse=True), labels=labels)
 
     def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""

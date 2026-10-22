@@ -1980,17 +1980,29 @@ _CLIP_NOTE = (
 def _get_compat_report(host: EditorHost, arguments: dict[str, Any]) -> object:
     report = host.compat_report()
     head: dict[str, Any] = {
+        # 要約は種類ごとの数だけ（「未実装 API 3 種」） 記録の文は入らない
         "summary": report.summary,
         "scripts": report.scripts,
-        # 置き場の場所 名前と場所を断った人には値ごと伏せる（項目の名前が folders で終わる）
-        "script_folders": list(report.folders),
+        "script_folders": [masked_value(folder, _PLACE_ONLY) for folder in report.folders],
     }
+    # 記録の文は型の無い文字（#391） 未実装の記録は作品の中の名前（オブジェクト・図形・画像の
+    # 名前）と debug_print の文を、制御文字はスクリプトの見出しやテキストの文を、失敗は場所を含む
+    # OS の文言を持ちうる どれも文か場所か分からないので、両方を許したときだけそのまま送る
+    # 種類と回数は残すので、送らない人の所でも穴の数と多さは読める
     rows: list[dict[str, Any]] = [
-        {"kind": "missing_api", "name": name, "count": count} for name, count in report.missing
+        {"kind": "missing_api", "name": masked_value(name, UNKNOWN_FIELD_SENDS), "count": count}
+        for name, count in report.missing
     ]
-    rows += [{"kind": "control", "name": line, "count": count} for line, count in report.controls]
     rows += [
-        {"kind": "failure", "name": script, "message": message}
+        {"kind": "control", "name": masked_value(line, UNKNOWN_FIELD_SENDS), "count": count}
+        for line, count in report.controls
+    ]
+    rows += [
+        {
+            "kind": "failure",
+            "name": masked_value(script, UNKNOWN_FIELD_SENDS),
+            "message": masked_value(message, UNKNOWN_FIELD_SENDS),
+        }
         for script, message in report.failures
     ]
     note = (
@@ -3222,6 +3234,9 @@ def _check_result(
             "detail": problem.detail,
             **problem.measure,
         }
+        if "text" in row:
+            # はみ出した字幕の文の頭（本人の文） 字幕と文字を送らない人には値ごと伏せる（#391）
+            row["text"] = masked_value(row["text"], _TEXT_ONLY)
         if rate is not None:
             row["timecode"] = format_timecode(problem.start, rate)
         if problem.clip_ids:
@@ -6596,6 +6611,11 @@ _LOOKS_AND_PLACES_IN_PROJECT = frozenset({Outbound.PROJECT, Outbound.APP_SETTING
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 字幕と文字 本人の文を返すが、道具の役目は文ではない物（検査の一覧・互換性レポート #391）は
+#: hidden にも書き、送らない人には断らずに値を型で伏せる（masked_value）
+_TEXT_ONLY = frozenset({Outbound.TEXT})
+#: 名前と場所だけ（置き場のフォルダ）
+_PLACE_ONLY = frozenset({Outbound.FILES})
 #: 音量の推移のグラフ（#338） 検査と同じ物に、絵（グラフの画像）が加わる 字幕は重なる時刻だけを
 #: 使い、文は返さない
 _SOUND_PICTURE = frozenset(
@@ -7216,7 +7236,10 @@ OPERATIONS: tuple[Operation, ...] = (
         # 調べられなかった理由の文には素材の名前や場所が入りうる 場所は形で、名前は表で伏せる
         # target は "timeline" も取るので、値ごと伏せる欄（name_keys）には入れない
         # 音量の基準（本人の設定 Preferences.check_loudness_target）も結果に載る
-        sends=_CHECKS,
+        # 字幕のはみ出しの行には、はみ出した文の頭（本人の文）が載る 字幕と文字を送らない人には
+        # 断らずに値ごと伏せる（#391 道具の役目は問題の一覧で、断ると黒いコマも調べられない）
+        sends=_CHECKS | _TEXT_ONLY,
+        hidden=_TEXT_ONLY,
     ),
     Operation(
         name="analyze_audio",
@@ -7333,9 +7356,11 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema(_paging()),
         handler=_get_compat_report,
-        # 本人のアプリが覚えた記録（作品の中身ではない） スクリプトの置き場の場所と、失敗の文に
-        # 混ざる場所（OS の文言）が入りうる
-        sends=_APP_SETTINGS,
+        # 本人のアプリが覚えた記録 スクリプトの置き場の場所と、失敗の文に混ざる場所（OS の文言）、
+        # 記録の文に混ざる作品の中の名前や文（オブジェクトの名前・debug_print・制御文字の行）が
+        # 入りうる 文は送らない人にも断らず、記録の文を値ごと伏せて種類と回数だけを返す（#391）
+        sends=_APP_SETTINGS | _TEXT_ONLY,
+        hidden=_TEXT_ONLY,
     ),
     # 編集の方針（#343） 人は ファイル → プロジェクト設定… で書く AI は読むだけ
     Operation(

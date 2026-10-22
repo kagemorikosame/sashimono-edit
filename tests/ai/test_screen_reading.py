@@ -469,7 +469,11 @@ class TestCompatReport:
         assert done.is_set() and "error" not in box
         text = json.dumps(box["result"], ensure_ascii=False)
         assert "秘密の人" not in text
-        assert "obj.getpixeldata" in text
+        # 記録の文は文か場所か分からないので伏せるが、種類と回数は読める（#391）
+        result = box["result"]
+        assert isinstance(result, dict)
+        assert [row["kind"] for row in result["records"]][:2] == ["missing_api", "missing_api"]
+        assert result["records"][0]["count"] == 3
 
 
 def test_the_reading_thread_is_not_the_editing_thread(host: FakeHost) -> None:

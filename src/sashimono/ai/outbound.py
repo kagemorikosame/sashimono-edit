@@ -471,13 +471,17 @@ def text_secrets(project: Project) -> list[str]:
     )
 
 
-def hide_text(value: Any, secrets: Iterable[str]) -> Any:
+def hide_text(value: Any, secrets: Iterable[str], *, labels: bool = True) -> Any:
     """操作の名前（取り消しと履歴の道具の結果）の中の文字を伏せる 元の値は変えない
 
     表（今ある字幕と本文）に載った文字を伏せたうえで、「動き: 対象」の対象と、かぎ括弧の中を
     伏せる 表だけでは足りない 名前は文の頭（12 文字）で切ってあり、消したテキストや
     直す前の字幕の文も、表から消えた後まで履歴の名前に残る 動き（「テキストを追加」）は
     残すので、AI はどの操作を取り消したかを読める
+
+    ``labels`` が偽なら表で伏せるだけにする 操作の名前でない結果（欄の値・検査の一覧・互換性
+    レポート #391）は、値そのものを型で伏せてあり（:func:`masked_value`）、「: 」の後や括弧の中を
+    伏せると、検査の説明や AviUtl の API の名前まで読めなくなる
     """
     pairs = list(secrets)
 
@@ -485,6 +489,8 @@ def hide_text(value: Any, secrets: Iterable[str]) -> Any:
         for secret in pairs:
             if secret in text:
                 text = text.replace(secret, TEXT_MARK)
+        if not labels:
+            return text
         text = _QUOTED.sub(f"「{TEXT_MARK}」", text)
         for separator in (": ", "："):
             head, found, tail = text.partition(separator)
