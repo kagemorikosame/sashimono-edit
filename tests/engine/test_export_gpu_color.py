@@ -422,6 +422,37 @@ class TestCleanup:
         assert not source.on_gpu
         assert "返せなかった" in caplog.text, "返せなかったことが記録に残らない"
 
+    @pytest.mark.parametrize("why", ["disagrees", "refused"])
+    def test_a_release_refused_after_the_check_falls_back_to_the_cpu(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, why: str
+    ) -> None:
+        # 確かめで GPU をやめた後に返すのを駆動が断ると、素の GL のエラーが書き出しを始める前に
+        # 外へ出る 書き直しの合図にもならず、CPU でなら書けた書き出しが丸ごと失敗する
+        if why == "disagrees":
+            readback = _Readback("yuv420p", skew=COLOR_TOLERANCE + 1)
+        else:
+            readback = _Readback("yuv420p")
+
+            def refuse_pop() -> tuple[tuple[int, int], np.ndarray]:
+                raise ShaderError("読み戻しのバッファを開けない")
+
+            monkeypatch.setattr(readback, "pop", refuse_pop)
+        real_release = readback.release
+
+        def refusing() -> None:
+            real_release()
+            raise ShaderError("バッファを返せない")
+
+        monkeypatch.setattr(readback, "release", refusing)
+        with caplog.at_level("WARNING", logger=exporter.__name__):
+            source, renderer, _opened = _source(monkeypatch, readback)
+        assert readback.released
+        assert not source.on_gpu
+        assert "返せなかった" in caplog.text, "返せなかったことが記録に残らない"
+        items = _run(source, 3)
+        assert all(image.ndim == 3 for _i, _n, image in items)
+        assert renderer.rendered == [100, 101, 102]
+
 
 # ここから下は実際に書き出す GPU の無い機械では飛ばす
 

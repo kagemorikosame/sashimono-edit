@@ -731,13 +731,17 @@ class _FrameSource:
         self._renderer = renderer
         self._readback: YuvReadback[tuple[int, int]] | None = None
         if pixel_format is not None:
+            # ここは _encode の try より前で、駆動の断りが素の GL のエラーのまま出ると、書き直しの
+            # 合図にもならずに書き出しが始まる前に失敗する どの GL の呼び出しも、断られたら
+            # CPU の道へ倒す open_readback と _agrees は中で受ける 残りは捨てるときの release
             with renderer.context:
                 readback: YuvReadback[tuple[int, int]] | None = open_readback(
                     width, height, pixel_format
                 )
                 if readback is not None and not _agrees(readback, pixel_format, width, height):
-                    # 食い違った GPU の変換は捨てる どのコマも CPU で変換する
-                    readback.release()
+                    # 食い違ったか確かめる途中で断られた GPU の変換は捨てる
+                    # どのコマも CPU で変換する
+                    _discard_quietly(readback)
                     readback = None
                 self._readback = readback
 
@@ -793,6 +797,18 @@ def _gpu_color_failures() -> Iterator[None]:
         yield
     except (ShaderError, GLLibraryError) as exc:
         raise _GpuColorError(f"GPU の色変換が書き出しの途中で使えなくなった ({exc})") from exc
+
+
+def _discard_quietly(readback: YuvReadback[tuple[int, int]]) -> None:
+    """使わないと決めた読み戻しを返す 返すのを駆動が断っても、記録に残すだけにする
+
+    もう CPU の道で書くと決めた後なので、返せなくても書き出しは続けられる 投げると、
+    CPU でなら書けた書き出しが始まる前に素の GL のエラーで失敗する
+    """
+    try:
+        readback.release()
+    except (ShaderError, GLLibraryError):
+        _log.warning("使わない GPU の読み戻しを返せなかった", exc_info=True)
 
 
 def _release_quietly(source: _FrameSource) -> None:
