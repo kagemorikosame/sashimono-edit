@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -35,7 +36,9 @@ from sashimono.core.model import ClipId, Effect, MediaItem, Project, StrokeId, T
 from sashimono.core.timebase import format_timecode
 from sashimono.effects import registry
 from sashimono.effects.definition import EffectDefinition
+from sashimono.effects.sources import source_registry
 from sashimono.effects.spec import FileSpec, TextSpec
+from sashimono.effects.strokes import STROKE
 from tests.ai.conftest import FakeHost
 from tests.ai.test_bridge import call_in_thread
 
@@ -247,6 +250,71 @@ class TestManyKeyframes:
         assert one["value"] == 8.0
         with pytest.raises(ToolError, match="無い"):
             run(host, "get_clip", clip_id=str(clip), effect_id=added["effect_id"], name="radiu")
+
+
+class TestAfterTheTransition:
+    def test_what_was_read_can_be_passed_back_to_change_it(self, host: FakeHost) -> None:
+        """壊れると、場面切り替えの後の場面のエフェクトを読んだ引数（after 付き）のまま
+        set_param・add_keyframe へ渡しても前の場面を探して断られ、後の場面の値を変えられない
+        （#391 の Codex の指摘）"""
+        run(host, "add_transition")
+        clip = next(
+            c
+            for track in host.document.project.timeline.tracks
+            for c in track.clips
+            if c.source is not None and c.source.kind == "transition"
+        )
+        after = Effect(kind="blur")
+        host.apply_commands([AddEffect(clip.id, after, after=True)], "後の場面へ")
+        read = run(host, "get_clip", clip_id=str(clip.id))
+        row = next(r for r in read["effects"] if r["effect_id"] == str(after.id))
+        where = {"clip_id": str(clip.id), "effect_id": row["effect_id"], "after": row["after"]}
+        run(host, "set_param", **where, name="radius", value=20)
+        run(host, "add_keyframe", **where, name="radius", frame=10, value=30)
+        radius = run(host, "get_clip", **where, name="radius")
+        assert [k["frame"] for k in radius["keyframes"]] == [10]
+        moved = host.document.project.timeline.locate_clip(clip.id)
+        assert moved is not None
+        assert moved[1].after_effects[0].params["radius"] != 8.0
+
+    def test_after_is_refused_without_an_effect(self, host: FakeHost) -> None:
+        """壊れると、after を中身の欄に付けた頼みが黙って前の場面の欄を変える"""
+        run(host, "add_text", text="見出し")
+        with pytest.raises(ToolError, match="after"):
+            run(
+                host,
+                "set_param",
+                clip_id=str(_text_clip(host)),
+                name="size",
+                value=10,
+                after=True,
+            )
+
+
+class TestLongValues:
+    def test_a_long_text_value_is_read_in_pieces(self, host: FakeHost) -> None:
+        """壊れると、長い本文や線の点を名前で読み直しても返事が上限を越えて打ち切られ、
+        後ろ半分を読む道が無い（#391 の Codex の指摘）"""
+        body = "".join(f"{n:05d}行目の本文\n" for n in range(3000))
+        run(host, "add_text", text="見出し")
+        clip = _text_clip(host)
+        host.apply_commands([SetParam(ParamPath.of_source(clip, "text"), body)], "長い本文")
+        pieces: list[str] = []
+        offset: int | None = 0
+        while offset is not None:
+            page = run(host, "get_clip", clip_id=str(clip), name="text", value_offset=offset)
+            assert len(json_text(page)) <= MAX_RESULT_CHARS
+            assert page["value_length"] == len(body)
+            pieces.append(page["value"])
+            offset = page.get("next_value_offset")
+        assert "".join(pieces) == body
+
+    def test_a_short_value_comes_whole(self, host: FakeHost) -> None:
+        """壊れると、短い値まで区切りの印が付き、AI が続きを探しに行く"""
+        run(host, "add_text", text="見出し")
+        one = run(host, "get_clip", clip_id=str(_text_clip(host)), name="text")
+        assert one["value"] == "見出し"
+        assert "next_value_offset" not in one
 
 
 class TestKeyframePosition:
@@ -501,14 +569,54 @@ FIELDS = [
 ]
 
 
+#: 場所を持つ欄の名前と表示名の手掛かり 文字の欄（TextSpec）にこれが付いていたら型の誤り
+_PLACE_NAME = re.compile(r"(?:^|_)(?:path|file|folder|dir|directory|image|picture|sound)s?(?:_|$)")
+_PLACE_LABEL = ("ファイル", "フォルダ", "場所", "パス", "画像")
+_FILE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{2,4}$")
+
+
+def looks_like_a_place(spec: object) -> bool:
+    """名前・表示名・既定値から、ファイルや場所を持つ欄に見えるか"""
+    name = str(getattr(spec, "name", ""))
+    label = str(getattr(spec, "label", ""))
+    default = getattr(spec, "default", "")
+    return (
+        _PLACE_NAME.search(name) is not None
+        or any(word in label for word in _PLACE_LABEL)
+        or (isinstance(default, str) and _FILE_SUFFIX.search(default) is not None)
+    )
+
+
+def places_typed_as_text() -> list[str]:
+    """組み込みの全種類（エフェクト・中身・縁取りの層）で、場所に見えるのに文字の欄の物"""
+    owners: list[tuple[str, tuple[Any, ...]]] = [
+        (definition.kind, definition.parameters) for definition in registry.all()
+    ]
+    owners += [(source.kind, source.parameters) for source in source_registry.all()]
+    owners.append(("縁取りの層", STROKE.parameters))
+    return [
+        f"{kind}: {spec.name}"
+        for kind, specs in owners
+        for spec in specs
+        if isinstance(spec, TextSpec) and looks_like_a_place(spec)
+    ]
+
+
 def _read_through_bridge(host: FakeHost, refused: set[Outbound]) -> dict[str, Any]:
-    bridge = EditorBridge(host)
+    return _through_bridge(host, "get_clip", {}, refused)
+
+
+def _through_bridge(
+    host: FakeHost, name: str, arguments: dict[str, Any], refused: set[Outbound]
+) -> dict[str, Any]:
+    """``refused`` を送らない人の所で、変更は自動で承認にして道具を動かした結果"""
+    bridge = EditorBridge(host, auto_approve=True)
     bridge.set_send_choices(
         {kind: SendChoice.DENY if kind in refused else SendChoice.ALLOW for kind in ASKED}
     )
-    operation = find_operation("get_clip")
+    operation = find_operation(name)
     assert operation is not None
-    done, box = call_in_thread(bridge, operation, {})
+    done, box = call_in_thread(bridge, operation, arguments)
     deadline = time.monotonic() + 5
     while not done.is_set() and time.monotonic() < deadline:
         bridge.pump()
@@ -554,6 +662,45 @@ class TestFieldsAreHiddenByType:
         host.select_clip(clip)
         read = field.place(host, clip, value)
         assert read(_read_through_bridge(host, set())) == value
+
+    def test_the_waveform_sound_file_is_hidden_as_a_place(self, host: FakeHost) -> None:
+        """壊れると、音声波形の音声ファイル（audio_path）が文字の欄として扱われ、字幕と文字を
+        許して名前と場所を断った人の所で「秘密.wav」のような相対の名前が外へ出る（#391 の Codex）"""
+        run(host, "add_shape", shape="waveform")
+        clip = next(
+            c.id
+            for track in host.document.project.timeline.tracks
+            for c in track.clips
+            if c.source is not None and c.source.kind == "shape"
+        )
+        host.apply_commands(
+            [SetParam(ParamPath.of_source(clip, "audio_path"), "秘密.wav")], "音声ファイル"
+        )
+        host.select_clip(clip)
+        assert _read_through_bridge(host, {Outbound.FILES})["params"]["audio_path"] == PATH_MARK
+        assert _read_through_bridge(host, set())["params"]["audio_path"] == "秘密.wav"
+        # 書く道具の結果の値（項目の名前が value で、場所の項目の名前では伏せられない）
+        changed = _through_bridge(
+            host,
+            "set_param",
+            {"clip_id": str(clip), "name": "audio_path", "value": "別の秘密.wav"},
+            {Outbound.FILES},
+        )
+        assert changed["value"] == PATH_MARK
+
+    def test_no_built_in_place_is_typed_as_text(self) -> None:
+        """壊れると、ファイルや場所を持つ欄を文字の欄（TextSpec）で定義した人がいても見張りが
+        気付かず、名前と場所を断った人の所でその場所が字幕と文字として送られる"""
+        assert not places_typed_as_text()
+
+    def test_a_place_typed_as_text_is_caught(self) -> None:
+        """壊れると、上の見張りが名前や既定値を見ずに通り、audio_path のような欄を見逃す"""
+        wrong = (
+            TextSpec("audio_path", "音声ファイル", ""),
+            TextSpec("logo", "ロゴの画像", "logo.png"),
+            TextSpec("message", "文字", ""),
+        )
+        assert [spec.name for spec in wrong if looks_like_a_place(spec)] == ["audio_path", "logo"]
 
     def test_numbers_are_not_hidden(self, host: FakeHost) -> None:
         """壊れると、文字と場所を送らない人の所で大きさや位置まで印になり、何も直せない"""

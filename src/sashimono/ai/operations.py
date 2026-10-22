@@ -1848,15 +1848,40 @@ def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
     return _shown(value, needs)
 
 
+def _value_in_pieces(head: dict[str, Any], value: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """動かない値 1 つ 長い文字（本文・線の点）と長い並び（格子・色の止まり）は区切って返す
+
+    区切らずに返すと、上限を越えた後ろが打ち切られ、続きを取る引数も無かった（#391 の Codex）
+    文字は文字の数、並びは要素の数で ``value_offset`` から区切り、続きは ``next_value_offset``
+    """
+    if not isinstance(value, str | list):
+        return {**head, "value": value}
+    start = max(0, _whole_number(arguments, "value_offset", 0))
+    size = max(1, len(value) - start)
+    while True:
+        piece = value[start : start + size]
+        result: dict[str, Any] = {**head, "value": piece}
+        if start or start + len(piece) < len(value):
+            result["value_length"] = len(value)
+            result["value_offset"] = start
+        if start + len(piece) < len(value):
+            result["next_value_offset"] = start + len(piece)
+            result["note"] = (
+                f"値が長いので {start} から {len(piece)} だけ返した 続きは value_offset に"
+                f" {start + len(piece)} を渡して読む（全 {len(value)}）"
+            )
+        if len(json_text(result)) <= MAX_RESULT_CHARS or size == 1:
+            return result
+        size = max(1, size * 3 // 4)
+
+
 def _get_one_value(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
     """値 1 つを読む キーフレームは offset と limit で区切り、全部を辿れるようにする"""
     path = _param_path(clip.id, arguments)
-    if arguments.get("after") is True:
-        path = replace(path, after=True)
     value = _one_value(clip, path)
     head: dict[str, Any] = {"clip_id": str(clip.id), "where": _param_location(path)}
     if not isinstance(value, AnimatedValue) or not value.is_animated:
-        return {**head, "value": _value_row(value, clip.duration, 0)}
+        return _value_in_pieces(head, _value_row(value, clip.duration, 0), arguments)
     if samples:
         head["samples"] = _sampled(value, clip.duration, samples)
     rows = [_keyframe_row(k) for k in value.keyframes]
@@ -4437,6 +4462,13 @@ def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
         raise ToolError("name が空です")
     effect_id = str(arguments.get("effect_id") or "")
     stroke_id = str(arguments.get("stroke_id") or "")
+    after = _flag_argument(arguments, "after", False)
+    if after:
+        # 場面切り替えの後の場面に積んだエフェクト get_clip が after を付けて返した引数を、
+        # そのまま書く道具へ渡せるようにする 渡せないと前の場面を探して見つからない（#391）
+        if not effect_id or stroke_id:
+            raise ToolError("after は場面切り替えの後の場面のエフェクト（effect_id）にだけ付けます")
+        return ParamPath.of_effect(clip_id, EffectId(effect_id), name, after=True)
     if stroke_id:
         # テキストの縁取りの層の項目か、層に掛けたエフェクトの項目
         if effect_id:
@@ -4488,7 +4520,10 @@ def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
     )
 
     if path.target is ParamTarget.EFFECT and path.effect_id is not None:
-        stack = stroke.effects if stroke is not None else clip.effects
+        if stroke is not None:
+            stack = stroke.effects
+        else:
+            stack = clip.after_effects if path.after else clip.effects
         effect = next((e for e in stack if e.id == path.effect_id), None)
         definition = registry.get(effect.kind) if effect is not None else None
         return definition.spec(path.name) if definition is not None else None
@@ -4553,6 +4588,11 @@ def _parse_color(text: str) -> tuple[float, ...] | None:
         channels.append(1.0)
     return tuple(channels)
 
+
+#: 書く道具の after の引数 get_clip が後の場面のエフェクトの行に付けて返す物と同じ
+_AFTER_ARGUMENT = _boolean(
+    "effect_id のエフェクトが場面切り替えの後の場面にある（get_clip の行の after をそのまま渡す）"
+)
 
 #: add_keyframe で選べる補間 曲線（bezier）は制御点を渡す口が無いので外す
 _KEY_INTERPOLATIONS = " / ".join(i.value for i in Interpolation if i is not Interpolation.BEZIER)
@@ -6673,6 +6713,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     " limit で区切って返す（全体の点が切られた値の more_keyframes の引数）"
                 ),
                 "effect_id": _string("name の値があるエフェクト"),
+                "value_offset": _integer(
+                    "name の値が長い文字や並びのとき、何文字目（何番目）から返すか"
+                    "（続きは返事の next_value_offset）"
+                ),
                 "stroke_id": _string(
                     "縁取りの層 name なしで渡すと、その層の値と層のエフェクト（offset で区切る）を"
                     "読む name と渡すとその層の値 1 つ"
@@ -7803,13 +7847,15 @@ OPERATIONS: tuple[Operation, ...] = (
                 "effect_id": _string("エフェクト"),
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
+                "after": _AFTER_ARGUMENT,
                 "name": _string("パラメータ名"),
                 "value": {"description": "新しい値"},
             },
             ["name", "value"],
         ),
         handler=_set_param,
-        sends=_WITH_TEXT,
+        # 返す値は場所の欄（画像・音声のファイル）なら場所 名前と場所を断った人には型で伏せる
+        sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
         hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
@@ -7822,6 +7868,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "effect_id": _string("エフェクト"),
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
+                "after": _AFTER_ARGUMENT,
                 "name": _string("パラメータ名"),
                 "frame": _integer(
                     "位置（クリップの頭から数えたフレーム get_clip の keyframes と同じ）"
