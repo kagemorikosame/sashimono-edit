@@ -367,6 +367,17 @@ class _Tracker:
         x, y = placed_at(((across - 0.5) * placed[0], (0.5 - down) * placed[1]))
         return Sample(frame=frame, x=x, y=y, weight=weight), bounds
 
+    @property
+    def moves(self) -> bool:
+        """配置の値（位置・拡大・回転・中心）がキーフレームで動くか"""
+        effect = fixed_transform(self.picture.clip)
+        if effect is None:
+            return False
+        return any(
+            isinstance(value, AnimatedValue) and bool(value.keyframes)
+            for value in effect.params.values()
+        )
+
     def home(self, frame: int) -> tuple[float, float]:
         return self.sample(frame)[1].center
 
@@ -464,13 +475,13 @@ def _shots(
     step = max(1, round(float(project.rate.fps) * SUBJECT_SECONDS))
     shots: list[tuple[Shot, _Tracker]] = []
     for start, end, owner in spans:
-        samples: list[Sample] = []
-        areas: list[Area] = []
-        for frame in range(start, end, step):
-            sample, area = owner.sample(frame)
-            samples.append(sample)
-            areas.append(area)
-        area = _common(areas, owner.picture.clip)
+        samples = [owner.sample(frame)[0] for frame in range(start, end, step)]
+        # 枠を置ける範囲は、配置が動くならどのコマでも数える 被写体と同じ 0.25 秒ごとだけだと、
+        # 場面の最後のコマやキーフレームの折れ目（行って戻るパンの端・行き過ぎて戻る曲線の山）を
+        # 数えず、ぎりぎり収まるパンでその数コマだけ縦の画面の端に絵の外が映った（PR #388 の
+        # CodeRabbit の指摘） 配置が動かなければ範囲も動かないので頭の 1 コマで足りる
+        frames = range(start, end) if owner.moves else range(start, start + 1)
+        area = _common([owner.sample(frame)[1] for frame in frames], owner.picture.clip)
         left, right = area.center[0] - area.reach[0], area.center[0] + area.reach[0]
         bottom, top = area.center[1] - area.reach[1], area.center[1] + area.reach[1]
         shots.append(

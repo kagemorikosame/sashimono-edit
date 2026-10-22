@@ -262,10 +262,12 @@ def _turned_on_screen(
     return pos + scale * (math.cos(turn) * point[0] - math.sin(turn) * point[1])
 
 
-def _panning(video_media: MediaItem) -> Clip:
-    """2 倍に拡げ、位置を -1000 から 1000 へ大きくパンする背景（ずっと前の画面を覆う）"""
+def _panning(
+    video_media: MediaItem, points: tuple[tuple[int, float], ...] = ((0, -1000.0), (299, 1000.0))
+) -> Clip:
+    """2 倍に拡げ、位置を ``points``（既定は -1000 から 1000）へ大きくパンする背景"""
     video = _video(video_media)
-    pan = AnimatedValue(0.0, (Keyframe(0, -1000.0), Keyframe(299, 1000.0)))
+    pan = AnimatedValue(0.0, tuple(Keyframe(frame, value) for frame, value in points))
     effects = tuple(
         e.with_param("pos_x", pan).with_param("scale", AnimatedValue(200.0))
         if e.kind == TRANSFORM_EFFECT_KIND
@@ -275,23 +277,43 @@ def _panning(video_media: MediaItem) -> Clip:
     return replace(video, effects=effects)
 
 
+def _assert_on_the_picture(video_media: MediaItem, video: Clip) -> None:
+    """作り替えた後、どのコマでも枠が背景の絵（2 倍 1920 の幅）の中にある"""
+    effect = fixed_transform(video)
+    assert effect is not None
+    before = _value(effect, "pos_x", 0.0)
+    project = _project(video_media, (video,))
+    plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.2)])})
+    assert not plan.skipped
+    done = _applied(project, plan.commands)
+    k = 1920 / 1080
+    pos = _value(_transform(done, video), "pos_x", 0.0)
+    half_picture = 2.0 * 1920 / 2
+    for frame in range(300):
+        focus = before.at(frame) - pos.at(frame) / k
+        assert before.at(frame) - half_picture <= focus - 607.5 / 2 + 1e-6, frame
+        assert focus + 607.5 / 2 <= before.at(frame) + half_picture + 1e-6, frame
+
+
 class TestTheBigPan:
     def test_the_window_stays_on_a_panning_picture(self, video_media: MediaItem) -> None:
         # 頭の時刻の範囲の中心に枠を残すと、大きくパンする背景で後の時刻に枠が絵の外へ出て、
         # 縦の画面の端に黒い帯が出る（PR #388 の Codex の指摘）
-        video = _panning(video_media)
-        project = _project(video_media, (video,))
-        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.2)])})
-        assert not plan.skipped
-        done = _applied(project, plan.commands)
-        k = 1920 / 1080
-        pos = _value(_transform(done, video), "pos_x", 0.0)
-        for frame in range(0, 300, 15):
-            before = -1000.0 + 2000.0 * min(frame, 299) / 299
-            focus = before - pos.at(frame) / k
-            half_picture = 2.0 * 1920 / 2
-            assert before - half_picture <= focus - 607.5 / 2 + 1e-6, frame
-            assert focus + 607.5 / 2 <= before + half_picture + 1e-6, frame
+        _assert_on_the_picture(video_media, _panning(video_media))
+
+    def test_a_pan_that_only_just_fits_stays_on_the_picture(self, video_media: MediaItem) -> None:
+        # 0.25 秒ごとに数えるだけだと、場面の最後のコマ（299）を数えず、ぎりぎり収まるパンで
+        # 最後の数コマだけ縦の画面の端に絵の外が映る（PR #388 の CodeRabbit の指摘）
+        video = _panning(video_media, ((0, -1610.0), (299, 1610.0)))
+        _assert_on_the_picture(video_media, video)
+
+    def test_a_pan_turning_between_samples_stays_on_the_picture(
+        self, video_media: MediaItem
+    ) -> None:
+        # 数えるコマの間にキーフレームの折れ目（行って戻るパンの端）があると、端まで行った所を
+        # 数えず、その数コマだけ枠が絵の外へ出る
+        video = _panning(video_media, ((0, -1600.0), (151, 1610.0), (299, -1600.0)))
+        _assert_on_the_picture(video_media, video)
 
     def test_no_place_on_the_picture_is_refused(self, video_media: MediaItem) -> None:
         # どこに止めても絵の外が映るのに作り替えると、黙って黒い帯の出る縦の作品になる
