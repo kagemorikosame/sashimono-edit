@@ -918,7 +918,8 @@ def runtime_note(new_abi: str, packs: Sequence[FeaturePack] | None = None) -> st
         return ""
     lead = (
         f"この版では Python が変わる（{python_abi()} → {new_abi}）ので、入れてある字幕起こし・"
-        "AI 連携の環境は入れ直しが要ります（消しはしません 入れ直すまでその機能は使えません）"
+        "AI 連携・画面の解析の環境は入れ直しが要ります（消しはしません 入れ直すまでその機能は"
+        "使えません）"
     )
     found = estimate(target, packs if packs is not None else _feature_packs())
     return lead if found is None else f"{lead}\n{describe(found)}"
@@ -930,8 +931,9 @@ def _feature_packs() -> tuple[FeaturePack, ...]:
     from sashimono.ai.environment import AI_PACK
     from sashimono.asr.environment import ASR_PACK
     from sashimono.asr.speakers import SPEAKER_PACK
+    from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
 
-    return (ASR_PACK, SPEAKER_PACK, AI_PACK)
+    return (ASR_PACK, SPEAKER_PACK, AI_PACK, VISION_PACK, RAPIDOCR_PACK)
 
 
 #: 移した物を名前で並べる数 多すぎると知らせの窓が画面からはみ出す

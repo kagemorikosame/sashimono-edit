@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QLabel,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -69,6 +70,14 @@ from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
 from sashimono.engine.scenes import MEASURED_SCENE_SECONDS
+from sashimono.engine.vision.parts import (
+    MEASURED_DECORATED_RATE,
+    MEASURED_FALSE_LINES,
+    MEASURED_OCR_SECONDS,
+    OCR_RAPID,
+    OCR_WINDOWS,
+)
+from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
@@ -94,6 +103,8 @@ from sashimono.ui.workspace import (
     SCENES_ALWAYS,
     SCENES_ON_DEMAND,
     SCENES_WITH_AI,
+    SCREEN_ON_DEMAND,
+    SCREEN_ON_IMPORT,
     SCRIPTS_MOVE_ASK,
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
@@ -177,6 +188,25 @@ SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
     (SCENES_WITH_AI, "AI アシスタントが入っているときだけ（既定）"),
     (SCENES_ALWAYS, "いつも調べる"),
     (SCENES_ON_DEMAND, "調べない（AI が頼んだときだけ）"),
+)
+
+#: 画面の中身（文字と顔の位置 #324）をいつ調べるか（:attr:`Preferences.screen_analysis`）
+SCREEN_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
+    (SCREEN_ON_DEMAND, "AI が頼んだときだけ（既定）"),
+    (SCREEN_ON_IMPORT, "読み込んだときに調べる（部品が入っていれば）"),
+)
+
+#: 画面の中の文字を読む方式（:attr:`Preferences.ocr_engine` 2026-10-21 本人の決定）
+OCR_CHOICES: tuple[tuple[str, str], ...] = (
+    (OCR_WINDOWS, "Windows の OCR（速い 既定）"),
+    (OCR_RAPID, "飾った文字も読む（遅い RapidOCR）"),
+)
+
+#: 場面ごとに画面の中身を調べる枚数（:attr:`Preferences.screen_samples`）
+SCREEN_SAMPLES: tuple[tuple[str, int], ...] = (
+    ("2 枚（速い）", 2),
+    ("4 枚（既定）", 4),
+    ("8 枚（場面の中の動きを拾う）", 8),
 )
 
 #: 場面を調べるのに使うデコードのスレッドの数 0 はすべて 名前の（）の前は実測の説明にも使う
@@ -989,6 +1019,7 @@ class PreferencesDialog(QDialog):
             + "（論理 20 コアの機械） 次に調べる素材から効く"
         )
         form.addRow("場面を調べるのに使う CPU", self._scene_threads)
+        self._add_screen_rows(form, preferences)
 
         self._ripple_playhead = QCheckBox(
             "削除して詰めたあと、再生ヘッドを削除した位置の頭へ動かす", self
@@ -1203,7 +1234,80 @@ class PreferencesDialog(QDialog):
             seam_audio_fade_ms=self._seam_audio.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
+            screen_analysis=str(self._screen_analysis.currentData()),
+            screen_samples=int(self._screen_samples.currentData()),
+            ocr_engine=str(self._ocr_engine.currentData()),
         )
+
+    def _add_screen_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """画面の中身（文字と顔の位置 #324）をいつ・どれだけ調べるか と、部品の導入の窓
+
+        読み込むたびに裏で調べるか、頼まれてから待つかは、機械の速さと使い方で答えが違う
+        """
+        self._screen_analysis = QComboBox(self)
+        for value, text in SCREEN_ANALYSIS_CHOICES:
+            self._screen_analysis.addItem(text, value)
+        self._screen_analysis.setCurrentIndex(
+            max(0, self._screen_analysis.findData(preferences.screen_analysis))
+        )
+        self._screen_analysis.setToolTip(
+            "AI アシスタントが画面の中の文字（テロップ・看板）と顔の位置を使うときに、"
+            "素材を読み込んだ時点で裏で調べておくか 調べるのは場面ごとに数枚で、結果は覚える"
+            "（素材を差し替えたら調べ直す） 「読み込んだときに調べる」は画面の解析の部品が"
+            "入っているときだけ効く 「AI が頼んだときだけ」でも、頼まれた素材はその場で調べる"
+            "（終わるまで AI が待つ）"
+        )
+        form.addRow("画面の文字と顔を調べる", self._screen_analysis)
+        self._screen_samples = QComboBox(self)
+        for label, count in SCREEN_SAMPLES:
+            self._screen_samples.addItem(label, count)
+        self._select(self._screen_samples, preferences.screen_samples)
+        self._screen_samples.setToolTip(
+            "場面の切り替わりで素材を区切り、1 つの場面で何枚の絵を調べるか 多いほど場面の中の"
+            "動き（歩く人・流れるテロップ）を拾うが、その分だけ待つ 1 枚に掛かるのは"
+            f" {MEASURED_SCREEN_SAMPLE}（場面の数 x 枚数だけ掛かる）"
+            " 変えると、次に調べる素材から効く"
+        )
+        form.addRow("画面を調べる枚数（場面ごと）", self._screen_samples)
+        parts = QPushButton("画面の解析の部品…", self)
+        parts.setToolTip(
+            "文字を読む Windows の OCR の包みと、顔の検出（onnxruntime と YuNet のモデル）を入れる"
+        )
+        parts.clicked.connect(self._open_vision_setup)
+        form.addRow("", parts)
+        self._ocr_engine = QComboBox(self)
+        for value, text in OCR_CHOICES:
+            self._ocr_engine.addItem(text, value)
+        self._ocr_engine.setCurrentIndex(max(0, self._ocr_engine.findData(preferences.ocr_engine)))
+        self._ocr_engine.setToolTip(
+            "AI アシスタントが画面の中の文字を読むときの方式 "
+            f"Windows の OCR は速い（{MEASURED_OCR_SECONDS[OCR_WINDOWS]}）が、飾った文字はほとんど"
+            "読めない 「飾った文字も読む」は RapidOCR で読み、遅い"
+            f"（{MEASURED_OCR_SECONDS[OCR_RAPID]}） 実素材の飾った題字で読めた字は"
+            f" Windows の OCR {MEASURED_DECORATED_RATE[OCR_WINDOWS]}・RapidOCR"
+            f" {MEASURED_DECORATED_RATE[OCR_RAPID]} 文字でない物（ゲームの模様など）を文字と読む"
+            f"誤りはどちらも同じくらい出る（同じ素材で 1 枚あたり Windows の OCR"
+            f" {MEASURED_FALSE_LINES[OCR_WINDOWS]}・RapidOCR {MEASURED_FALSE_LINES[OCR_RAPID]}）"
+            " RapidOCR は別の部品で、下のボタンから入れる"
+            "（入れずに選ぶと、AI の頼みは理由と入れ方を返して断る）"
+        )
+        form.addRow("画面の文字を読む方式", self._ocr_engine)
+        rapid = QPushButton("飾った文字の読み取りの部品…", self)
+        rapid.setToolTip(
+            "RapidOCR と OpenCV を入れる（90 MB ほど） 読むモデルは部品の中に入っている"
+        )
+        rapid.clicked.connect(self._open_rapidocr_setup)
+        form.addRow("", rapid)
+
+    def _open_vision_setup(self) -> None:
+        from sashimono.ui.vision_setup import VisionSetupDialog
+
+        VisionSetupDialog(self).exec()
+
+    def _open_rapidocr_setup(self) -> None:
+        from sashimono.ui.vision_setup import rapidocr_setup
+
+        rapidocr_setup(self).exec()
 
     def _add_emphasis_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """強調の動き（#331）の既定 どれだけ寄るか・どれだけ速く動くかは人と作品で違う
