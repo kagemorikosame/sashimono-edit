@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.ai.budget import IMAGE_EDGES, LimitAction
+from sashimono.ai.fixes import FIX_ROUNDS_RANGE
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
@@ -924,6 +925,20 @@ class PreferencesDialog(QDialog):
             " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
         )
         form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
+        # 検査の直しの回数（#339） どこまで AI に任せるかは人で違う
+        self._ai_fix_rounds = QSpinBox(self)
+        self._ai_fix_rounds.setRange(*FIX_ROUNDS_RANGE)
+        self._ai_fix_rounds.setSuffix(" 回")
+        self._ai_fix_rounds.setSpecialValueText("直さない（調べるだけ）")
+        self._ai_fix_rounds.setValue(preferences.ai_fix_rounds)
+        self._ai_fix_rounds.setToolTip(
+            "AI アシスタントが仕上がりを調べて（check_output）見つけた問題を、直して調べ直す回数の"
+            "上限 上限に達すると、その指示ではもう編集せず、残った問題を伝えて止まる"
+            " 直すのは音量の基準・混ぜた音の音割れ・止まった字幕のはみ出しだけで、隙間を詰める・"
+            "無音を削るなどは尋ねてから直す 直した回ごとに〔元に戻す〕1 回で戻せる"
+            " 0 にすると調べるだけで直さない"
+        )
+        form.addRow("AI が仕上がりを直す回数", self._ai_fix_rounds)
         # ダッキング（#329）の既定 声を聞かせたい量と BGM の動き方の好みは人と作品で違う
         # AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
         self._duck_depth = QSpinBox(self)
@@ -1210,6 +1225,7 @@ class PreferencesDialog(QDialog):
             ai_limit_action=str(self._limit_action.currentData()),
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
+            ai_fix_rounds=self._ai_fix_rounds.value(),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),
             duck_release_ms=self._duck_release.value(),
