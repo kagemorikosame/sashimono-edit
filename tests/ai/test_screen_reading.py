@@ -20,7 +20,7 @@ from sashimono.ai.host import CompatReport, ToolError
 from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.compat.aviutl.report import CompatibilityReport
-from sashimono.core.commands import AddEffect, ParamPath, SetWorkArea
+from sashimono.core.commands import AddEffect, ParamPath, SetKeyframe, SetWorkArea
 from sashimono.core.io.serialize import json_text
 from sashimono.core.model import ClipId, Effect, MediaItem, Project, Transcript
 from sashimono.core.timebase import format_timecode
@@ -158,6 +158,53 @@ class TestClipValues:
         assert first["count"] < first["total"]
         second = run(host, "get_clip", clip_id=str(clip), offset=first["next_offset"])
         assert second["offset"] == first["next_offset"]
+
+
+def _many_keys(host: FakeHost, count: int) -> ClipId:
+    """不透明度に ``count`` 個のキーフレームを打った頭のクリップ（読み込んだ細かな動きの代わり）"""
+    clip = _video(host.document.project)
+    path = ParamPath.of_clip(clip, "opacity")
+    host.apply_commands(
+        [SetKeyframe(path, frame, (frame % 10) / 10) for frame in range(count)], "細かな動き"
+    )
+    return clip
+
+
+class TestManyKeyframes:
+    def test_the_overview_says_which_values_were_cut(self, host: FakeHost) -> None:
+        """壊れると、キーフレームの多いクリップで点が黙って切られ、AI が欠けた曲線を全部だと
+        思って直し、読み込んだ細かな動きを崩す"""
+        clip = _many_keys(host, 300)
+        result = run(host, "get_clip", clip_id=str(clip))
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        opacity = result["opacity"]
+        assert opacity["keyframe_count"] == 300
+        assert len(opacity["keyframes"]) < 300
+        assert opacity["more_keyframes"] == {"target": "clip", "name": "opacity"}
+
+    def test_every_keyframe_of_one_value_can_be_read_in_pages(self, host: FakeHost) -> None:
+        """壊れると、切られた点を後から取る道が無く、読み込んだ細かな動きの後ろ半分を
+        AI が読めないまま、点を打ち直して形を壊す"""
+        clip = _many_keys(host, 1500)
+        frames: list[int] = []
+        offset: int | None = 0
+        while offset is not None:
+            page = run(
+                host, "get_clip", clip_id=str(clip), target="clip", name="opacity", offset=offset
+            )
+            assert len(json_text(page)) <= MAX_RESULT_CHARS
+            frames += [row["frame"] for row in page["keyframes"]]
+            offset = page.get("next_offset")
+        assert frames == list(range(1500))
+
+    def test_one_value_reads_its_default_and_refuses_an_unknown_name(self, host: FakeHost) -> None:
+        """壊れると、触っていない欄を名前で読むと何も返らず、無い名前の打ち間違いにも気付けない"""
+        clip = _video(host.document.project)
+        added = run(host, "add_effect", clip_id=str(clip), kind="blur")
+        one = run(host, "get_clip", clip_id=str(clip), effect_id=added["effect_id"], name="radius")
+        assert one["value"] == 8.0
+        with pytest.raises(ToolError, match="無い"):
+            run(host, "get_clip", clip_id=str(clip), effect_id=added["effect_id"], name="radiu")
 
 
 class TestKeyframePosition:

@@ -1668,58 +1668,114 @@ def _keyframe_row(keyframe: Keyframe) -> dict[str, Any]:
     return row
 
 
-def _value_row(value: ParamValue, duration: int, samples: int) -> Any:
-    """値 1 つ 動かない値は数のまま、キーフレームのある値は点の並び（と曲線の点）"""
+#: 全体を読むときに 1 つの値に載せるキーフレームの数 これより多い値は頭の点だけを載せ、全部の数と
+#: 1 つずつ読む引数（more_keyframes）を添える 全部を載せると、読み込んだ細かな動き（数百の点）の
+#: ある値が 1 つあるだけで返事が上限を越え、切られた点を後から取る道が無かった
+#: （#391 の Codex の指摘）
+OVERVIEW_KEYFRAMES = 8
+
+#: 値の在りか（set_param・add_keyframe・get_clip の引数の形 clip_id は除く）を作る
+Locate = Callable[[str], dict[str, Any]]
+
+
+def _value_row(
+    value: ParamValue,
+    duration: int,
+    samples: int,
+    where: dict[str, Any] | None = None,
+) -> Any:
+    """値 1 つ 動かない値は数のまま、キーフレームのある値は点の並び（と曲線の点）
+
+    ``where`` を渡すと全体を読む形で、点が :data:`OVERVIEW_KEYFRAMES` より多ければ頭だけを
+    載せて、全部の数と 1 つずつ読む引数を添える
+    """
     if isinstance(value, AnimatedValue):
         if not value.is_animated:
             return _rounded(value.static)
-        row: dict[str, Any] = {"keyframes": [_keyframe_row(k) for k in value.keyframes]}
+        keys = value.keyframes
+        row: dict[str, Any] = {}
+        if where is not None and len(keys) > OVERVIEW_KEYFRAMES:
+            row["keyframes"] = [_keyframe_row(k) for k in keys[:OVERVIEW_KEYFRAMES]]
+            row["keyframe_count"] = len(keys)
+            row["more_keyframes"] = where
+        else:
+            row["keyframes"] = [_keyframe_row(k) for k in keys]
         if samples:
-            # 点の間の形（加減速・曲線・名前付きの曲線）は点だけでは分からない グラフエディタと
-            # 同じ式（AnimatedValue.at）で、クリップの頭から終わりまでを等しく分けて引く
-            last = max(duration - 1, 0)
-            frames = sorted({round(last * i / (samples - 1)) for i in range(samples)})
-            row["samples"] = [[frame, _rounded(value.at(frame))] for frame in frames]
+            row["samples"] = _sampled(value, duration, samples)
         return row
     if isinstance(value, tuple):
         return [_rounded(entry) for entry in value]
     return value
 
 
-def _values(
-    params: dict[str, ParamValue], specs: tuple[Any, ...], duration: int, samples: int
-) -> dict[str, Any]:
+def _sampled(value: AnimatedValue, duration: int, samples: int) -> list[list[float]]:
+    # 点の間の形（加減速・曲線・名前付きの曲線）は点だけでは分からない グラフエディタと
+    # 同じ式（AnimatedValue.at）で、クリップの頭から終わりまでを等しく分けて引く
+    last = max(duration - 1, 0)
+    frames = sorted({round(last * i / (samples - 1)) for i in range(samples)})
+    return [[frame, _rounded(value.at(frame))] for frame in frames]
+
+
+def _merged(params: dict[str, ParamValue], specs: tuple[Any, ...]) -> dict[str, ParamValue]:
     """設定パネルと同じ値の並び 持っていない欄は既定の値（パネルもそれを出す）
 
     クリップが持つ値だけを返すと、触っていない欄が無い物に見え、AI は今の位置や大きさを
     知らないまま動かす 定義に無い値（読み込んだスクリプトの古い欄など）も残す
     """
-    names = [str(getattr(spec, "name", "")) for spec in specs]
     merged: dict[str, ParamValue] = {}
-    for spec, name in zip(specs, names, strict=True):
+    for spec in specs:
+        name = str(getattr(spec, "name", ""))
         if name in params:
             merged[name] = params[name]
         elif hasattr(spec, "default_value"):
             merged[name] = spec.default_value()
     for name, value in params.items():
         merged.setdefault(name, value)
-    return {name: _value_row(value, duration, samples) for name, value in merged.items()}
+    return merged
+
+
+def _values(
+    params: dict[str, ParamValue],
+    specs: tuple[Any, ...],
+    duration: int,
+    samples: int,
+    locate: Locate,
+) -> dict[str, Any]:
+    return {
+        name: _value_row(value, duration, samples, locate(name))
+        for name, value in _merged(params, specs).items()
+    }
+
+
+def _place(**fields: object) -> Locate:
+    """欄の名前から在りかを作る関数 名前のほかは ``fields``（effect_id・stroke_id など）"""
+    return lambda name: {**fields, "name": name}
 
 
 def _effect_rows(
-    effects: tuple[Effect, ...], duration: int, samples: int, *, after: bool = False
+    effects: tuple[Effect, ...],
+    duration: int,
+    samples: int,
+    *,
+    after: bool = False,
+    stroke_id: str | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for effect in effects:
         definition = registry.get(effect.kind)
         specs = definition.parameters if definition is not None else ()
+        place: dict[str, object] = {"effect_id": str(effect.id)}
+        if stroke_id is not None:
+            place["stroke_id"] = stroke_id
+        if after:
+            place["after"] = True
         row: dict[str, Any] = {
             "effect_id": str(effect.id),
             "kind": effect.kind,
             "label": definition.label if definition is not None else effect.kind,
             "enabled": effect.enabled,
             "fixed": effect.fixed,
-            "params": _values(effect.params, specs, duration, samples),
+            "params": _values(effect.params, specs, duration, samples, _place(**place)),
         }
         if after:
             # 場面切り替えの後の場面へ積んだエフェクト 前の場面の物と同じ種類が並びうる
@@ -1740,10 +1796,67 @@ def _curve_samples(arguments: dict[str, Any]) -> int:
     return raw
 
 
+def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
+    """在りかの値 持っていない欄は既定の値 無い欄は断る（打ち間違いを空の値で返さない）"""
+    if path.target is ParamTarget.CLIP:
+        if path.name != "opacity":
+            raise ToolError(
+                f"クリップ自身の欄でキーフレームを持てるのは opacity だけです（{path.name}）"
+                " ほかの欄は get_clip を name なしで読みます"
+            )
+        return clip.opacity
+    source = clip.source
+    stroke = None
+    if path.stroke_id is not None:
+        stroke = source.find_stroke(path.stroke_id) if source is not None else None
+        if stroke is None:
+            raise ToolError(f"縁取りの層が見つかりません: {path.stroke_id}")
+    if path.target is ParamTarget.SOURCE:
+        if stroke is not None:
+            params, specs = stroke.params, STROKE.parameters
+        elif source is not None:
+            made = source_registry.get(source.kind)
+            params, specs = source.params, made.parameters if made is not None else ()
+        else:
+            raise ToolError("このクリップは中身（テキストや図形）を持ちません effect_id を渡します")
+    else:
+        if stroke is not None:
+            stack = stroke.effects
+        else:
+            stack = clip.after_effects if path.after else clip.effects
+        effect = next((e for e in stack if e.id == path.effect_id), None)
+        if effect is None:
+            raise ToolError(f"エフェクトが見つかりません: {path.effect_id}")
+        definition = registry.get(effect.kind)
+        params, specs = effect.params, definition.parameters if definition is not None else ()
+    merged = _merged(params, specs)
+    if path.name not in merged:
+        known = "、".join(merged) or "（欄が無い）"
+        raise ToolError(f"{path.name} という欄は無いです 欄の名前: {known}")
+    return merged[path.name]
+
+
+def _get_one_value(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
+    """値 1 つを読む キーフレームは offset と limit で区切り、全部を辿れるようにする"""
+    path = _param_path(clip.id, arguments)
+    if arguments.get("after") is True:
+        path = replace(path, after=True)
+    value = _one_value(clip, path)
+    head: dict[str, Any] = {"clip_id": str(clip.id), "where": _param_location(path)}
+    if not isinstance(value, AnimatedValue) or not value.is_animated:
+        return {**head, "value": _value_row(value, clip.duration, 0)}
+    if samples:
+        head["samples"] = _sampled(value, clip.duration, samples)
+    rows = [_keyframe_row(k) for k in value.keyframes]
+    return _paged_after(head, rows, arguments, "keyframes", _CLIP_NOTE)
+
+
 def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     track, clip = _target_clip(host, arguments)
     project = _project(host)
     samples = _curve_samples(arguments)
+    if arguments.get("name"):
+        return _get_one_value(clip, arguments, samples)
     duration = clip.duration
     source = clip.source
     if clip.scene_id is not None:
@@ -1770,19 +1883,29 @@ def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
         "source_in_seconds": round(float(clip.source_in), 3),
         "hold_at_seconds": round(float(clip.hold_at), 3) if clip.hold_at is not None else None,
         # 不透明度は set_param の target=clip で変える
-        "opacity": _value_row(clip.opacity, duration, samples),
+        "opacity": _value_row(
+            clip.opacity, duration, samples, {"target": "clip", "name": "opacity"}
+        ),
     }
     if source is not None:
         definition = source_registry.get(source.kind)
         specs = definition.parameters if definition is not None else ()
-        head["params"] = _values(source.params, specs, duration, samples)
+        head["params"] = _values(source.params, specs, duration, samples, _place())
         if source.strokes:
             head["strokes"] = [
                 {
                     "stroke_id": str(stroke.id),
                     "enabled": stroke.enabled,
-                    "params": _values(stroke.params, STROKE.parameters, duration, samples),
-                    "effects": _effect_rows(stroke.effects, duration, samples),
+                    "params": _values(
+                        stroke.params,
+                        STROKE.parameters,
+                        duration,
+                        samples,
+                        _place(stroke_id=str(stroke.id)),
+                    ),
+                    "effects": _effect_rows(
+                        stroke.effects, duration, samples, stroke_id=str(stroke.id)
+                    ),
                 }
                 for stroke in source.strokes
             ]
@@ -1796,6 +1919,9 @@ _CLIP_NOTE = (
     "キーフレームの frame はクリップの頭から数える（タイムラインのフレームは start を足す）"
     " samples はクリップの頭から終わりまでを等しく分けた所の値 [frame, 値]"
     " 欄の名前は set_param・add_keyframe の name に、effect_id・stroke_id もそのまま渡せる"
+    f" 点が {OVERVIEW_KEYFRAMES} より多い値は頭の点だけを載せ、keyframe_count に全部の数、"
+    "more_keyframes に読む引数を添える その引数（name と effect_id など）を get_clip に渡すと"
+    "その値の点を全部 offset で区切って読める"
 )
 
 
@@ -6498,12 +6624,21 @@ OPERATIONS: tuple[Operation, ...] = (
             " クリップ自身の欄・不透明度・中身（テキストや図形）の値・縁取りの層・エフェクトの"
             "値（触っていない欄は既定の値） キーフレームのある値は点の並び（frame はクリップの"
             "頭から数える 補間の種類と曲線の制御点つき） samples を渡すと、点の間の形（曲線）も"
-            "等しく分けた所の値で返す 値を変える前に今の値を読む エフェクトの一覧（effects）は"
-            + PAGING_NOTE
+            "等しく分けた所の値で返す 値を変える前に今の値を読む 点の多い値は頭の点だけを載せ、"
+            "more_keyframes の引数で読み直すとその値の点を全部区切って読める エフェクトの一覧"
+            "（effects）は" + PAGING_NOTE
         ),
         schema=_schema(
             {
                 "clip_id": _string("読むクリップ 省くと選択中のクリップ（設定パネルに出ている物）"),
+                "name": _string(
+                    "値 1 つだけを読むときの欄の名前 渡すとその値のキーフレームを全部、offset と"
+                    " limit で区切って返す（全体の点が切られた値の more_keyframes の引数）"
+                ),
+                "effect_id": _string("name の値があるエフェクト"),
+                "stroke_id": _string("name の値がある縁取りの層"),
+                "target": _string("name の値の在りか source か clip（clip は opacity）"),
+                "after": _boolean("name の値が場面切り替えの後の場面のエフェクトにある"),
                 "samples": _integer(
                     f"キーフレームのある値ごとに曲線を引く点の数（2〜{MAX_CURVE_SAMPLES}"
                     " 省くと引かない）"

@@ -11,7 +11,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
     secret_pairs,
+    text_secrets,
 )
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
@@ -42,12 +43,17 @@ from sashimono.compat.subtitle_looks import template_choice
 from sashimono.core.commands import (
     AddEffect,
     AddMarkers,
+    ParamPath,
     RemoveMedia,
+    SetParam,
     SetStyleGuide,
     SetTranscript,
 )
-from sashimono.core.model import Effect, Marker, MediaItem, StyleGuide, Transcript
+from sashimono.core.model import ClipId, Effect, Marker, MediaItem, StyleGuide, Transcript
 from sashimono.core.timebase import format_timecode
+from sashimono.effects import registry
+from sashimono.effects.definition import EffectDefinition
+from sashimono.effects.spec import TextSpec
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks.profile import SoundProfiler
 from sashimono.engine.vision import Box, ScreenKind, ScreenReport, ScreenSample, TextLine
@@ -1287,3 +1293,88 @@ class TestRedact:
         result = box.get("result")
         assert isinstance(result, ImageResult)
         assert format_timecode(30, host.project.rate) in result.caption
+
+
+# --- 文字の欄（TextSpec）は名前に関係なく字幕と文字として伏せる（#391 の Codex の指摘）---
+
+#: テキストの「タイマーの書式」（text の名前ではない文字の欄）に書いた本人の文
+TYPED_TEXT = "書式に書いた秘密の文です"
+#: AviUtl のスクリプトの文字の欄（--text の名前を変えた物）に書いた本人の文
+SCRIPT_TEXT = "スクリプトの欄に書いた秘密の文"
+#: 文字の欄を持つスクリプトの種類 試験の間だけ登録する
+SCRIPT_KIND = "aviutl.script:試しの文字@試験"
+
+
+@pytest.fixture
+def scripted() -> Iterator[str]:
+    registry.register(
+        EffectDefinition(
+            kind=SCRIPT_KIND,
+            label="試しの文字",
+            category="試し",
+            parameters=(TextSpec("message", "文字", ""),),
+        )
+    )
+    yield SCRIPT_KIND
+    registry.unregister(SCRIPT_KIND)
+
+
+def _typed_texts(host: FakeHost, kind: str) -> ClipId:
+    """text 以外の名前の文字の欄に本人の文を書いたテキストを 1 本置いて選ぶ"""
+    _operation("add_text")(host, {"text": "見出し"})
+    clip = next(
+        c.id
+        for track in host.document.project.timeline.tracks
+        for c in track.clips
+        if c.source is not None and c.source.kind == "text"
+    )
+    host.apply_commands(
+        [
+            SetParam(ParamPath.of_source(clip, "timer_format"), TYPED_TEXT),
+            AddEffect(clip, Effect(kind=kind, params={"message": SCRIPT_TEXT})),
+        ],
+        "文字の欄",
+    )
+    host.select_clip(clip)
+    return clip
+
+
+class TestTypedTextIsHidden:
+    def test_every_text_field_is_in_the_table(self, host: FakeHost, scripted: str) -> None:
+        """壊れると、伏せ字の表が text の名前の欄しか集めず、スクリプトの文字の欄やタイマーの
+        書式に本人が書いた文を、字幕と文字を送らないと決めた人の所でもそのまま送る"""
+        _typed_texts(host, scripted)
+        secrets = text_secrets(host.document.project)
+        assert TYPED_TEXT in secrets
+        assert SCRIPT_TEXT in secrets
+
+    def test_reading_a_clip_hides_every_text_field(
+        self, host: FakeHost, scripted: str, text_refused: EditorBridge
+    ) -> None:
+        """壊れると、get_clip がスクリプトの文字の欄の文を、字幕と文字を送らない人の所でも
+        外へ送る"""
+        _typed_texts(host, scripted)
+        _seen, box = _run(text_refused, "get_clip")
+        assert box.get("error") is None, box.get("error")
+        sent = json.dumps(box["result"], ensure_ascii=False)
+        assert TYPED_TEXT not in sent
+        assert SCRIPT_TEXT not in sent
+        # 文字でない値（大きさ）は読める
+        assert '"size"' in sent
+
+    def test_weakening_the_declaration_is_caught(
+        self, host: FakeHost, scripted: str, text_refused: EditorBridge
+    ) -> None:
+        """壊れると（get_clip が字幕と文字を伏せて送ると書かなくなると）、表を通らずに結果を
+        そのまま返すのに、送る物の見張りが気付かない"""
+        _typed_texts(host, scripted)
+        operation = _operation("get_clip")
+        weakened = replace(
+            operation,
+            sends=operation.sends - {Outbound.TEXT},
+            hidden=operation.hidden - {Outbound.TEXT},
+        )
+        done, box = call_in_thread(text_refused, weakened, {})
+        answer_sends(text_refused, done, _never)
+        assert SCRIPT_TEXT in json.dumps(box["result"], ensure_ascii=False)
+        assert undeclared(weakened, box["result"], sentences={SCRIPT_TEXT, TYPED_TEXT})

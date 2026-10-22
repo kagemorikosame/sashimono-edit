@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from sashimono.core.model import MediaId, Project
+from sashimono.core.model import Effect, MediaId, Project
+from sashimono.effects import registry
+from sashimono.effects.sources import source_registry
+from sashimono.effects.spec import TextSpec
+from sashimono.effects.strokes import STROKE
 
 __all__ = [
     "ASKED",
@@ -338,8 +342,36 @@ _COUNT_ONLY = re.compile(r"[\d\s.,/]*(?:か所|件|本|個|コマ|フレーム|�
 _QUOTED = re.compile(r"「[^」]*」")
 
 
+def _typed_texts(params: Mapping[str, object], specs: Iterable[object] | None) -> Iterator[str]:
+    """欄のうち、人が文字を書く欄（:class:`TextSpec`）の今の値
+
+    名前ではなく欄の型で見分ける AviUtl のスクリプトは文字の欄に好きな名前を付け、テキストにも
+    text のほかに文字の欄（タイマーの書式など）がある 名前の text だけを見ると、それらに本人が
+    書いた文を、字幕と文字を送らないと決めた人の所でも送る（#391 の Codex の指摘）
+    定義の分からない種類（読み込んでいないスクリプト）は、どの欄が文字か分からないので文字の値を
+    全部数える 伏せすぎて困るのは値が読めないことだけで、外へ出た文は取り戻せない
+    """
+    if specs is None:
+        yield from (value for value in params.values() if isinstance(value, str))
+        return
+    names = {spec.name for spec in specs if isinstance(spec, TextSpec)} | {"text"}
+    yield from (value for name, value in params.items() if name in names and isinstance(value, str))
+
+
+def _effect_texts(effects: Iterable[Effect]) -> Iterator[str]:
+    for effect in effects:
+        definition = registry.get(effect.kind)
+        yield from _typed_texts(
+            effect.params, definition.parameters if definition is not None else None
+        )
+
+
 def text_secrets(project: Project) -> list[str]:
-    """字幕と文字を伏せる表 字幕起こしの文と、テキストのクリップの文（メインとシーン） 長い順"""
+    """字幕と文字を伏せる表 字幕起こしの文と、クリップの文字の欄の文（メインとシーン） 長い順
+
+    文字の欄は中身・縁取りの層・エフェクト（場面切り替えの後の場面と、層に掛けた物も）のどれでも
+    欄の型で拾う（:func:`_typed_texts`）
+    """
     found: set[str] = set()
     for media in project.media:
         for _stream, transcript in media.transcripts:
@@ -347,8 +379,20 @@ def text_secrets(project: Project) -> list[str]:
     for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
         for track in timeline.tracks:
             for clip in track.clips:
-                if clip.source is not None and "text" in clip.source.params:
-                    found.add(str(clip.source.params["text"]))
+                source = clip.source
+                if source is not None:
+                    definition = source_registry.get(source.kind)
+                    found.update(
+                        _typed_texts(
+                            source.params,
+                            definition.parameters if definition is not None else None,
+                        )
+                    )
+                    for stroke in source.strokes:
+                        found.update(_typed_texts(stroke.params, STROKE.parameters))
+                        found.update(_effect_texts(stroke.effects))
+                found.update(_effect_texts(clip.effects))
+                found.update(_effect_texts(clip.after_effects))
     lines = {line for text in found for line in (text, *text.splitlines())}
     return sorted(
         (line for line in lines if len(line.strip()) >= _SHORTEST_SECRET),
