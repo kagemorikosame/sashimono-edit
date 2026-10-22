@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -55,6 +56,8 @@ from sashimono.engine.render import (
     MAX_DECODE_THREADS,
     FrameRenderer,
 )
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # 型の宣言にしか無い（PyAV の .pyi） 実行時に読むと ImportError になる
@@ -600,9 +603,19 @@ def _encode(
                 if not pipeline.failed:
                     for item in source.drain(pipeline.reserve):
                         pipeline.submit(*item)
-        finally:
+        except BaseException:
             # 中止や失敗で抜けたときも、読み戻しのバッファを返す 書き込みのスレッドは
             # 上の with が終わらせてあり、もう GPU の配列を待っている者はいない
+            # 返すのに駆動が断っても、元の失敗を上げる 返す側の GL のエラーに差し替わると、
+            # 書き直しの合図（_GpuColorError）やエンコーダの失敗・中止が見分けられなくなり、
+            # CPU でなら書ける書き出しまで丸ごと失敗する
+            _release_quietly(source)
+            raise
+        # 書き終えた後に返すのを駆動が断ったら、CPU の色変換で頭から書き直す（_GpuColorError）
+        # 失敗として上げると、書けていたかもしれない動画ごと捨てて書き出しが失敗する
+        # そのまま使わないのは、片付けで断った駆動が、それまでの読み戻しでも黙って壊れた面を
+        # 返していないとは言えないため 書き直しは 1 回だけで、CPU の道に読み戻しは無い
+        with _gpu_color_failures():
             source.release()
 
         # 最後の 1 枚を渡した後、書き込みが終わるまでの間に押された中止もここで拾う
@@ -780,6 +793,17 @@ def _gpu_color_failures() -> Iterator[None]:
         yield
     except (ShaderError, GLLibraryError) as exc:
         raise _GpuColorError(f"GPU の色変換が書き出しの途中で使えなくなった ({exc})") from exc
+
+
+def _release_quietly(source: _FrameSource) -> None:
+    """失敗で抜ける途中に読み戻しを返す 返すのを駆動が断っても、記録に残すだけにする
+
+    投げると、抜ける理由になった元の失敗がこの GL のエラーに差し替わる
+    """
+    try:
+        source.release()
+    except (ShaderError, GLLibraryError):
+        _log.warning("書き出しの後片付けで GPU の読み戻しを返せなかった", exc_info=True)
 
 
 #: GPU の変換を確かめるときの読み戻しの印 合成したコマの印（通し番号は 0 から）と重ならない

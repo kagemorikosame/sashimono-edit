@@ -402,6 +402,26 @@ class TestCleanup:
         source.release()
         assert readback.released
 
+    def test_a_release_refused_while_failing_is_only_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # 失敗で抜ける途中の片付けで投げると、元の失敗（書き直しの合図・中止など）が
+        # 片付けの GL のエラーに差し替わり、CPU でなら書ける書き出しまで丸ごと失敗する
+        readback = _Readback("yuv420p")
+        real_release = readback.release
+
+        def refusing() -> None:
+            real_release()
+            raise ShaderError("バッファを返せない")
+
+        monkeypatch.setattr(readback, "release", refusing)
+        source, _renderer, _opened = _source(monkeypatch, readback)
+        with caplog.at_level("WARNING", logger=exporter.__name__):
+            exporter._release_quietly(source)
+        assert readback.released
+        assert not source.on_gpu
+        assert "返せなかった" in caplog.text, "返せなかったことが記録に残らない"
+
 
 # ここから下は実際に書き出す GPU の無い機械では飛ばす
 
@@ -681,6 +701,59 @@ class TestExport:
         assert len(notices) == 1 and "CPU" in notices[0]
         assert seen == sorted(seen), f"進み具合が戻った: {seen}"
         assert seen[-1] == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("pop_fails", [True, False], ids=["mid-way", "at-the-end"])
+    def test_a_refused_release_still_ends_in_a_cpu_video(
+        self,
+        moving_project: Project,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        pop_fails: bool,
+    ) -> None:
+        """読み戻しを返すのを駆動が断っても、CPU の色変換で書き直して書き上げる
+
+        途中で読み戻しが失敗した後の片付けで投げると、書き直しの合図がその GL のエラーに
+        差し替わり、CPU でなら書ける書き出しが丸ごと失敗する 最後まで書いた後の片付けで
+        断ったときも、失敗として上げると書き出しが失敗するので、CPU で頭から書き直す
+        """
+        pops = [0]
+        real_pop = yuv.YuvReadback.pop
+        real_release = yuv.YuvReadback.release
+        refused: list[bool] = []
+
+        def failing(
+            self: yuv.YuvReadback[tuple[int, int]],
+        ) -> tuple[tuple[int, int], np.ndarray]:
+            tag, image = real_pop(self)
+            if tag != exporter._CHECK_TAG:
+                pops[0] += 1
+                if pop_fails and pops[0] == 4:
+                    raise ShaderError("読み戻しのバッファを開けない")
+            return tag, image
+
+        def refusing(self: yuv.YuvReadback[tuple[int, int]]) -> None:
+            real_release(self)
+            # 試験の絵の確かめの後ではなく、書き出しの片付けで断ったことにする
+            if pops[0]:
+                refused.append(True)
+                raise ShaderError("バッファを返せない")
+
+        monkeypatch.setattr(yuv.YuvReadback, "pop", failing)
+        monkeypatch.setattr(yuv.YuvReadback, "release", refusing)
+        notices: list[str] = []
+        gpu = tmp_path / "gpu.mp4"
+        export_project(moving_project, _lossless(gpu, gpu_color=True), notice=notices.append)
+        monkeypatch.undo()
+        cpu = tmp_path / "cpu.mp4"
+        export_project(moving_project, _lossless(cpu, gpu_color=False))
+
+        assert refused == [True], "片付けで断る所を通っていない"
+        left, right = _planes(gpu), _planes(cpu)
+        assert len(left) == len(right) == 12
+        for number, (a, b) in enumerate(zip(left, right, strict=True)):
+            assert np.array_equal(a, b), f"{number} 枚目が CPU の道と違う"
+        assert _samples(gpu) == _samples(cpu) > 0
+        assert len(notices) == 1 and "CPU" in notices[0]
 
 
 def _samples(path: Path) -> int:
