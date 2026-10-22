@@ -199,6 +199,12 @@ EXCLUDED_MODULES = (
     "torch",
     "nvidia",
     "claude_agent_sdk",
+    # 画面の解析（#324）の部品 本体は関数の中でだけ import するが、PyInstaller は関数の中の
+    # import も辿るので、開発の .venv に入っていると積んでしまう onnxruntime は字幕起こしと共有
+    "onnxruntime",
+    "winrt",
+    "rapidocr",
+    "cv2",
     # pywin32 本体は使わない AI 連携（mcp）の依存として開発の .venv に入っていると、標準の
     # logging.handlers と numpy.testing の import から拾われ、pywintypes の DLL と、それを
     # 探す道へ足す差し込みまで積まれる CI（pywin32 が無い）で組んだ 0.1.0 の zip には無く、
@@ -224,7 +230,17 @@ EXCLUDED_MODULES = (
 #: 配布版に Python の本体は無いので、これらとその依存が使う標準ライブラリは配布版が持って
 #: いなければならない PyInstaller は本体が import する物しか積まないため、AI 連携を入れて
 #: 送った途端に ``No module named 'zoneinfo'`` で止まった（pydantic が読む 利用者の画面）
-RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2", "sherpa-onnx")
+RUNTIME_PACKAGES = (
+    "claude-agent-sdk",
+    "faster-whisper",
+    "ctranslate2",
+    # 話者の分離（#323）
+    "sherpa-onnx",
+    # 画面の解析（#324） 依存（winrt の名前空間ごとの包み）は辿って数える
+    "onnxruntime",
+    "winrt-Windows.Media.Ocr",
+    "rapidocr",
+)
 
 #: 本体も一部を使うので配布版に入り、後から入れる部品も使う包み **下の部品まで全部積む**
 #: 配布版に入った包みは、後から入れた置き場の同じ包みより先に読まれる（PyInstaller の
@@ -232,6 +248,20 @@ RUNTIME_PACKAGES = ("claude-agent-sdk", "faster-whisper", "ctranslate2", "sherpa
 #: ``cryptography.hazmat.primitives.ciphers.aead`` が無く、zoneinfo を足した次にそこで
 #: 落ちた（組み立ての確かめの exe の中での import で分かった）
 SHARED_WITH_ADD_ONS = ("cryptography", "attr", "attrs")
+
+#: 本体の numpy の中で、本体は読まないが後から入れる部品が読む物 OpenCV（RapidOCR が読む
+#: ``cv2`` #324）は numpy 1 の時代の入口 ``numpy.core.multiarray`` を読む numpy 2 では互換の
+#: ための薄い部品で、本体が読まないので積まれず、配布版の --add-on-check で
+#: ``No module named 'numpy.core.multiarray'`` になった 後から入れた置き場の numpy は、
+#: 配布版の numpy に隠れて読まれない numpy を丸ごと積むと試験や f2py まで入るので、互換の
+#: 部品だけを名指しする
+SHARED_HIDDEN_IMPORTS = (
+    "numpy.core",
+    "numpy.core.multiarray",
+    "numpy.core._multiarray_umath",
+    "numpy.core.umath",
+    "numpy.core.numeric",
+)
 
 #: 標準ライブラリで積まない物 画面の部品（Tk）・Python 自身の試験・開発の道具
 #: どれも Sashimono も後から入れる部品も使わない Tk は DLL と Tcl の書庫で 10 MB を超える
@@ -492,6 +522,8 @@ def pyinstaller_arguments(work: Path, dist: Path) -> list[str]:
     for package in SHARED_WITH_ADD_ONS:
         if importlib.util.find_spec(package) is not None:
             arguments += ["--collect-submodules", package]
+    for module in SHARED_HIDDEN_IMPORTS:
+        arguments += ["--hidden-import", module]
     for module in EXCLUDED_MODULES:
         arguments += ["--exclude-module", module]
     arguments.append(str(ROOT / "src" / "sashimono" / "__main__.py"))
