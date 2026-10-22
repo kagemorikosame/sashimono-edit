@@ -17,6 +17,8 @@ from sashimono.core.commands import AddScene, Command, Document
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
 from sashimono.core.emphasis import fixed_transform
 from sashimono.core.model import (
+    GROUP_KIND,
+    GROUP_LAYERS,
     AnimatedValue,
     Clip,
     Effect,
@@ -258,6 +260,100 @@ def _turned_on_screen(
     scale = _value(effect, "scale", 100.0).at(frame) / 100.0
     turn = -math.radians(_value(effect, "rotation", 0.0).at(frame))
     return pos + scale * (math.cos(turn) * point[0] - math.sin(turn) * point[1])
+
+
+def _panning(video_media: MediaItem) -> Clip:
+    """2 倍に拡げ、位置を -1000 から 1000 へ大きくパンする背景（ずっと前の画面を覆う）"""
+    video = _video(video_media)
+    pan = AnimatedValue(0.0, (Keyframe(0, -1000.0), Keyframe(299, 1000.0)))
+    effects = tuple(
+        e.with_param("pos_x", pan).with_param("scale", AnimatedValue(200.0))
+        if e.kind == TRANSFORM_EFFECT_KIND
+        else e
+        for e in video.effects
+    )
+    return replace(video, effects=effects)
+
+
+class TestTheBigPan:
+    def test_the_window_stays_on_a_panning_picture(self, video_media: MediaItem) -> None:
+        # 頭の時刻の範囲の中心に枠を残すと、大きくパンする背景で後の時刻に枠が絵の外へ出て、
+        # 縦の画面の端に黒い帯が出る（PR #388 の Codex の指摘）
+        video = _panning(video_media)
+        project = _project(video_media, (video,))
+        plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.2)])})
+        assert not plan.skipped
+        done = _applied(project, plan.commands)
+        k = 1920 / 1080
+        pos = _value(_transform(done, video), "pos_x", 0.0)
+        for frame in range(0, 300, 15):
+            before = -1000.0 + 2000.0 * min(frame, 299) / 299
+            focus = before - pos.at(frame) / k
+            half_picture = 2.0 * 1920 / 2
+            assert before - half_picture <= focus - 607.5 / 2 + 1e-6, frame
+            assert focus + 607.5 / 2 <= before + half_picture + 1e-6, frame
+
+    def test_no_place_on_the_picture_is_refused(self, video_media: MediaItem) -> None:
+        # どこに止めても絵の外が映るのに作り替えると、黙って黒い帯の出る縦の作品になる
+        video = _video(video_media)
+        pan = AnimatedValue(0.0, (Keyframe(0, -2500.0), Keyframe(299, 2500.0)))
+        effects = tuple(
+            e.with_param("pos_x", pan).with_param("scale", AnimatedValue(150.0))
+            if e.kind == TRANSFORM_EFFECT_KIND
+            else e
+            for e in video.effects
+        )
+        project = _project(video_media, (replace(video, effects=effects),))
+        with pytest.raises(ReframeError, match="絵の中に収まる"):
+            plan_reframe(project, REQUEST, {})
+
+
+def _group(**values: float) -> Clip:
+    """手前 1 本を受け持つグループ制御 配置に ``values`` を入れる"""
+    group = with_fixed_items(
+        Clip(
+            timeline_start=0,
+            duration=300,
+            source=GeneratedSource(kind=GROUP_KIND, params={GROUP_LAYERS: 1}),
+        ),
+        picture=True,
+    )
+    return _with_transform(group, **values)
+
+
+class TestTheGroups:
+    def test_a_group_over_captions_moves_with_them(self, video_media: MediaItem) -> None:
+        # グループ制御を外すと、字幕だけが新しい画面の比へ移り、グループの位置は元の画素のまま
+        # 残って、縦の画面で字幕の塊がずれる（PR #388 の Codex の指摘）
+        group = _group(pos_x=300.0, pos_y=-200.0)
+        caption = _text("字幕", pos_y=-100.0)
+        project = _project(video_media, (_video(video_media),), (group,), (caption,))
+        plan = plan_reframe(project, REQUEST, {})
+        done = _applied(project, plan.commands)
+        effect = _transform(done, group)
+        assert _value(effect, "pos_x", 0.0).static == pytest.approx(300.0 * 1080 / 1920)
+        assert _value(effect, "pos_y", 0.0).static == pytest.approx(-200.0 * 1920 / 1080)
+
+    def test_a_still_group_is_left_alone(self, video_media: MediaItem) -> None:
+        # 動かしていないグループ制御に配置の欄を足すと、取り消しの段に要らない変更が混ざる
+        group = _group()
+        project = _project(video_media, (_video(video_media),), (group,), (_text("字幕"),))
+        plan = plan_reframe(project, REQUEST, {})
+        assert str(group.id) not in plan.overlays
+
+    def test_a_group_moving_the_background_is_refused(self, video_media: MediaItem) -> None:
+        # 背景を受け持つグループの位置をそのまま残すと、縦の枠が背景からずれて黒い帯が出る
+        group = _group(pos_x=200.0)
+        project = _project(video_media, (group,), (_video(video_media),))
+        with pytest.raises(ReframeError, match="グループ制御"):
+            plan_reframe(project, REQUEST, {})
+
+    def test_a_turned_group_is_refused(self, video_media: MediaItem) -> None:
+        # 回したグループの位置を横と縦で別の比にすると、受け持つ字幕どうしの並びが崩れる
+        group = _group(rotation=15.0)
+        project = _project(video_media, (_video(video_media),), (group,), (_text("字幕"),))
+        with pytest.raises(ReframeError, match="回っています"):
+            plan_reframe(project, REQUEST, {})
 
 
 class TestTheSpreadMotion:

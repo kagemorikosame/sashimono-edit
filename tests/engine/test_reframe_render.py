@@ -18,7 +18,15 @@ import pytest
 
 from sashimono.core.commands import AddClip, Document
 from sashimono.core.commands.fixed import with_fixed_items
-from sashimono.core.model import AnimatedValue, Clip, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Keyframe,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+)
 from sashimono.core.reframe import AUTO
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import forget_probe, probe_media
@@ -183,6 +191,47 @@ def test_a_lowered_limit_is_kept(tmp_path: Path, gl_context: OffscreenGLContext)
     try:
         renderer.render(0)
         assert renderer._spill is None
+    finally:
+        renderer.close()
+
+
+def test_a_big_pan_shows_no_black_band(video: Path, gl_context: OffscreenGLContext) -> None:
+    # 大きくパンする背景で枠を頭の時刻の所に残すと、後の時刻に枠が絵の外へ出て黒い帯が出る
+    forget_probe(video)
+    media = probe_media(video)
+    settings = ProjectSettings(width=WIDTH, height=HEIGHT, frame_rate=FrameRate(FPS))
+    base = Project.create(settings, media=(media,))
+    track = Track(TrackKind.VIDEO, "V1")
+    base = base.with_timeline(replace(base.timeline, tracks=(track,)))
+    duration = FPS * 4
+    pan = AnimatedValue(0.0, (Keyframe(0, -250.0), Keyframe(duration - 1, 250.0)))
+    clip = with_fixed_items(
+        Clip(timeline_start=0, duration=duration, media_id=media.id, native_size=True),
+        picture=True,
+    )
+    clip = replace(
+        clip,
+        effects=tuple(
+            e.with_param("pos_x", pan).with_param("scale", AnimatedValue(300.0))
+            if e.kind == "transform"
+            else e
+            for e in clip.effects
+        ),
+    )
+    project = AddClip(track.id, clip).apply(base)
+    signal = analyze_scenes(video)
+    assert signal is not None
+    plan = plan_reframe(project, ReframeRequest(HEIGHT, WIDTH, AUTO, 1000, 90), {media.id: signal})
+    document = Document(project)
+    with document.checkpoint("作り替え"):
+        for command in plan.commands:
+            document.execute(command)
+    renderer = FrameRenderer(document.project, context=gl_context)
+    try:
+        for frame in (0, duration // 2, duration - 1):
+            image = renderer.render(frame)
+            for edge in (image[:, :2], image[:, -2:]):
+                assert float(edge[:, :, 2].mean()) > 40, frame
     finally:
         renderer.close()
 

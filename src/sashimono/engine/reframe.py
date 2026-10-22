@@ -29,6 +29,7 @@ from sashimono.core.emphasis import fixed_transform, transform_commands
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
+    ClipId,
     MediaId,
     MediaItem,
     ParamValue,
@@ -37,6 +38,7 @@ from sashimono.core.model import (
     Timeline,
     Track,
     TrackKind,
+    group_reaches,
 )
 from sashimono.core.reframe import (
     Area,
@@ -387,21 +389,37 @@ class _Tracker:
         return frames
 
 
-def _common(areas: list[Area]) -> Area:
-    """場面の間ずっと枠を置ける範囲 頭の範囲を、ほかの時刻の範囲に収まるまで縮める
+def _common(areas: list[Area], clip: Clip) -> Area:
+    """場面の間ずっと枠を置ける範囲 どの時刻の範囲にも入る所（重なり）
 
-    寄りやパンで絵が動くと範囲も動く 頭の範囲の中心からのずれ（絵の向きで見た大きさ）だけ
-    縮めれば、どの時刻の範囲にも入る（回す角度は頭の物を使う 回しながら動く絵では近い値）
+    寄りやパンで絵が動くと範囲も動く 絵の向きで見た横と縦の区間の重なりを取り、その真ん中を
+    中心にする 頭の範囲の中心のまま幅だけ縮めると、大きくパンする絵で頭の中心が後の時刻の
+    範囲から外れ、縦の画面の端に黒い帯が出た（PR #388 の Codex の指摘） 回す角度は頭の物を使う
+    （回しながら動く絵では近い値） 重ならなければ、どこに止めてもどこかの時刻で絵の外が映るので断る
     """
     first = areas[0]
     cos, sin = math.cos(first.turn), math.sin(first.turn)
-    reach_x, reach_y = first.reach
-    for area in areas[1:]:
-        dx = area.center[0] - first.center[0]
-        dy = area.center[1] - first.center[1]
-        reach_x = min(reach_x, max(0.0, area.reach[0] - abs(cos * dx + sin * dy)))
-        reach_y = min(reach_y, max(0.0, area.reach[1] - abs(-sin * dx + cos * dy)))
-    return Area(center=first.center, reach=(reach_x, reach_y), turn=first.turn)
+    low = [-math.inf, -math.inf]
+    high = [math.inf, math.inf]
+    for area in areas:
+        across = cos * area.center[0] + sin * area.center[1]
+        down = -sin * area.center[0] + cos * area.center[1]
+        for axis, middle in enumerate((across, down)):
+            low[axis] = max(low[axis], middle - area.reach[axis])
+            high[axis] = min(high[axis], middle + area.reach[axis])
+    if low[0] > high[0] + 1e-6 or low[1] > high[1] + 1e-6:
+        raise ReframeError(
+            f"背景のクリップ {clip.id} は位置や拡大の動きが大きく、場面の間ずっと絵の中に収まる"
+            "枠の位置がありません どこに止めても縦の画面の端に絵の外が映ります 動きを小さくするか、"
+            "クリップを分けてから呼んでください"
+        )
+    across = (low[0] + high[0]) / 2.0
+    down = (low[1] + high[1]) / 2.0
+    return Area(
+        center=(cos * across - sin * down, sin * across + cos * down),
+        reach=(max(0.0, (high[0] - low[0]) / 2.0), max(0.0, (high[1] - low[1]) / 2.0)),
+        turn=first.turn,
+    )
 
 
 def _visible(timeline: Timeline) -> set[int]:
@@ -452,7 +470,7 @@ def _shots(
             sample, area = owner.sample(frame)
             samples.append(sample)
             areas.append(area)
-        area = _common(areas)
+        area = _common(areas, owner.picture.clip)
         left, right = area.center[0] - area.reach[0], area.center[0] + area.reach[0]
         bottom, top = area.center[1] - area.reach[1], area.center[1] + area.reach[1]
         shots.append(
@@ -707,6 +725,68 @@ def _text_commands(
     return commands
 
 
+#: グループ制御の配置の欄と、動かしていないときの値
+_GROUP_MOVES = {"pos_x": 0.0, "pos_y": 0.0, "rotation": 0.0, "rotation_x": 0.0, "rotation_y": 0.0}
+
+
+def _moved(value: ParamValue | None, still: float) -> bool:
+    return _static(value, still) != still
+
+
+def _group_commands(
+    timeline: Timeline,
+    track: Track,
+    group: Clip,
+    backgrounds: set[ClipId],
+    window: CropWindow,
+) -> list[Command]:
+    """グループ制御の配置 受け持つ物と同じく、縦の画面の同じ割合の所へ置き直す
+
+    グループ制御の配置は受け持つクリップの配置の後ろへ足される（:mod:`sashimono.engine.render.groups`）
+    重ねた物は位置を画面の比で置き直すので、グループの位置も同じ比にすれば、合わせた位置も同じ
+    割合になる（拡大は画面の中央を中心に掛かるので、比で置き直した位置にもそのまま効く）
+    外すと、受け持つ物だけが新しい画面の比へ移り、グループの位置は元の画素のまま残ってずれる
+    （PR #388 の Codex の指摘）
+
+    次の 2 つは 1 次の式で置き直せないので、作品を変える前に断る
+    - 背景の動画や画像を受け持つ 背景は枠の中心をクリップの位置から引くが、グループの位置は
+      その後ろで足されるので、枠の動きをグループの位置へ移さないと枠が合わない
+    - 回す 回した後の位置を横と縦で別の比にすると、重ねた物どうしの並びが崩れる
+    """
+    effect = fixed_transform(group)
+    if effect is None or not effect.enabled:
+        return []
+    params = effect.params
+    if not any(_moved(params.get(name), still) for name, still in _GROUP_MOVES.items()):
+        return []
+    pictures = timeline.picture_tracks()
+    reached = [
+        clip
+        for other in pictures
+        if group_reaches(pictures, track.id, group, other.id)
+        for clip in other.clips
+        if clip.overlaps(group.timeline_start, group.timeline_end)
+    ]
+    if any(clip.id in backgrounds for clip in reached):
+        raise ReframeError(
+            f"グループ制御 {group.id} が背景の動画や画像を位置や回転で動かしています 縦の枠は"
+            "背景のクリップの位置で合わせるので、グループの動きと重ねると枠がずれます"
+            " グループ制御の位置と回転を既定に戻すか、グループ制御から背景を外してから"
+            "呼んでください"
+        )
+    if any(_moved(params.get(name), 0.0) for name in ("rotation", "rotation_x", "rotation_y")):
+        raise ReframeError(
+            f"グループ制御 {group.id} が回っています 回した後の位置を横と縦で別の比に置き直すと、"
+            "受け持つ物どうしの並びが崩れます 回転を既定に戻してから呼んでください"
+        )
+    old, new = window.old, window.new
+    changes = {
+        "pos_x": affine(params.get("pos_x"), new[0] / old[0], 0.0, 0.0),
+        "pos_y": affine(params.get("pos_y"), new[1] / old[1], 0.0, 0.0),
+    }
+    return _transform_edit(group, changes)
+
+
 def _in(scene_id: SceneId | None, commands: Iterable[Command]) -> list[Command]:
     if scene_id is None:
         return list(commands)
@@ -795,6 +875,18 @@ def plan_reframe(
                 locked.append(track.name)
             plan.commands.extend(_in(scene_id, commands))
             plan.overlays.append(str(clip.id))
+        background_ids = {tracker.picture.clip.id for tracker in trackers}
+        for track in timeline.tracks:
+            for clip in track.clips:
+                if not clip.is_group:
+                    continue
+                commands = _group_commands(timeline, track, clip, background_ids, window)
+                if not commands:
+                    continue
+                if track.locked:
+                    locked.append(track.name)
+                plan.commands.extend(_in(scene_id, commands))
+                plan.overlays.append(str(clip.id))
     if locked:
         names = "・".join(dict.fromkeys(locked))
         raise ReframeError(
