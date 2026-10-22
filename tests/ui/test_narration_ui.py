@@ -219,6 +219,38 @@ class TestDialog:
         finally:
             dialog.deleteLater()
 
+    def test_changing_the_place_forgets_the_voices_read_before(
+        self, qt_application: QApplication, engine: FakeVoiceEngine, told: list[str]
+    ) -> None:
+        # 壊れると、VOICEVOX の声を読んだ後に場所を AivisSpeech へ替えて〔規約を見る〕を押すと、
+        # 前のエンジンの声の持ち主の ID を新しいエンジンへ渡し、断られるか別のエンジンの規約と
+        # 表記を見せる（#401 の CodeRabbit の指摘）
+        del qt_application
+        aivis = FakeVoiceEngine(
+            manifest={"name": "AivisSpeech Engine", "brand_name": "AivisSpeech"},
+            speakers=[
+                {
+                    "name": "まお",
+                    "speaker_uuid": "a670e6b8-0852-45b2-8704-1bc9862f2fe6",
+                    "styles": [{"name": "ノーマル", "id": 888753760, "type": "talk"}],
+                }
+            ],
+            policies={"a670e6b8-0852-45b2-8704-1bc9862f2fe6": "まおの規約"},
+        )
+        with fake_voice_engine(aivis) as other:
+            dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
+            try:
+                dialog._read_voices()
+                dialog._narration_url.setText(other.url)
+                dialog._show_voice_terms()
+                assert len(told) == 1
+                assert "まおの規約" in told[0]
+                assert "AivisSpeech:まお" in told[0]
+                asked = [path for _method, path, _body in other.requests]
+                assert not any("388f246b" in path for path in asked)
+            finally:
+                dialog.deleteLater()
+
     def test_an_outside_place_keeps_the_dialog_open(
         self, qt_application: QApplication, told: list[str]
     ) -> None:

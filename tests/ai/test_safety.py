@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -234,6 +235,33 @@ class TestAppSettingsAreReadOnly:
             "write_snapshot",
             "write_subtitles",
         }
+        assert changes >= WRITING_PORTS
+
+    def test_the_document_names_the_writing_ports(self) -> None:
+        """壊れると、開発の文書の「EditorHost に足してよい口」の一覧と、試験が許す口が食い違い、
+        次に口を足す人がどの口を許されているかを読み違える（#335 の CodeRabbit の指摘）"""
+        text = (Path(__file__).parents[2] / "docs" / "development.md").read_text(encoding="utf-8")
+        start = text.index("足してよいのは作品の保存と書き出しの口")
+        end = text.index("- 区分の値は操作の台帳", start)
+        named = set(re.findall(r"`([a-z_]+)`", text[start:end]))
+        assert named & set(dir(EditorHost)) == WRITING_PORTS
+
+
+#: EditorHost の口のうち、作品を書く・書き出しを進める口（docs/development.md の一覧と照らす）
+#: 保存と書き出し（B1 #327）と、ナレーションの WAV（#335）
+WRITING_PORTS = frozenset(
+    {
+        "write_project",
+        "start_export",
+        "export_status",
+        "export_waiter",
+        "cancel_export",
+        "write_subtitles",
+        "write_snapshot",
+        "make_narration_folder",
+        "write_narration",
+    }
+)
 
 
 # --- 書ける場所 ---

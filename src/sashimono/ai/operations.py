@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import os
 import threading
@@ -334,6 +335,9 @@ from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
+#: 声を作る裏のスレッドの思っていない失敗を残す記録（#335）
+_LOG = logging.getLogger(__name__)
+
 __all__ = [
     "ASK_USER",
     "MAX_WAIT_SECONDS",
@@ -455,6 +459,10 @@ class Operation:
     #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
     #: トラック・シーン・エフェクトの名前は作品の中身の名前で、ここには書かない
     name_keys: frozenset[str] = field(default=frozenset(), kw_only=True)
+    #: 取り消せない操作のうち、作品も変える物（ナレーション #335 は WAV を書き、声を置く）
+    #: 検査の直しの回数の上限（#339）の後は、取り消せる編集と同じく断る 書かないと、保存や
+    #: 書き出しと同じ扱いで上限の後も通り、「これ以上は編集しません」の後に声が置かれる
+    edits: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
@@ -5752,6 +5760,16 @@ class _Job[T]:
             self._result = work(self._stopped)
         except EngineError as exc:
             self._error = exc
+        except Exception:
+            # 思っていない失敗（エンジンの壊れた返事を読む所の例外など）も、断りの文として返す
+            # 拾わないと終わった印だけが立ち、take が結果の無いまま AssertionError を出して、
+            # AI には訳の分からない失敗、人の窓では「作っています」のまま止まって見える
+            # 中身は記録に残し、画面と AI へは決まった文だけを出す（台本の文を混ぜない）
+            _LOG.exception("ナレーションの声を作る途中で思っていない失敗が起きた")
+            self._error = EngineError(
+                "声を作る途中で思っていない失敗が起きました 何も書いていません"
+                " エンジンを起動し直してから、もう 1 度頼んでください（詳しくはアプリの記録）"
+            )
         finally:
             self._done.set()
 
@@ -8752,6 +8770,8 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は書いた場所（名前と場所）・置いたクリップ（編集の構成）・声の名前と表記（本人の
         # 機械に入れた声と、本人の設定の既定）
         sends=_NARRATION,
+        # WAV を書くだけでなく声と字幕を置く 直しの回数の上限（#339）の後は断る
+        edits=True,
         name_keys=frozenset({"file"}),
     ),
     Operation(

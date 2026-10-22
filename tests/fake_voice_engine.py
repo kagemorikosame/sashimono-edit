@@ -168,6 +168,11 @@ def _handler(engine: FakeVoiceEngine) -> type[BaseHTTPRequestHandler]:
             speaker = int((query.get("speaker") or ["-1"])[0])
             if path == "/audio_query":
                 text = (query.get("text") or [""])[0]
+                if not any(char.isalnum() for char in text):
+                    # 読む物の無い文（記号だけ）は断る 読みの無い文を断るエンジンの形
+                    # （本物がどう返すかは版で違う 断る側を試せるようにする）
+                    self._json({"detail": "読める文字がありません"}, 422)
+                    return
                 if speaker not in engine.styles():
                     # 本物も声の ID が無ければ 422 で、本文に頼まれた物を書き返す
                     self._json({"detail": f"speaker {speaker} が無い 文: {text}"}, 422)

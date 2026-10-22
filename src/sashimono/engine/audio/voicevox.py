@@ -94,7 +94,11 @@ _MAX_BODY = 64 * 1024 * 1024
 _USER_AGENT = f"SashimonoEdit/{__version__} (narration)"
 #: 文の切れ目 ここで分けると、塊の境で読みが変わらない
 #: 句点は直に書くと文章の検査（tools/punctuation.py）に掛かるので、番号で持つ
-_SENTENCE_END = re.compile("(?<=[" + chr(0x3002) + r"．.！!？?\n])")
+#: 続く区切り記号（句点 2 つ・「！？」「...」）の間では切らない 切ると記号だけの塊をエンジンへ
+#: 渡し、読む物が無いと断られてナレーション全体が失敗する（記号は前の文の終わりに付けたままにする）
+#: 記号は決まった文字だけで組む（台本の文は式に入らない）
+_END_MARKS = chr(0x3002) + r"．.！!？?\n"
+_SENTENCE_END = re.compile(f"(?<=[{_END_MARKS}])(?![{_END_MARKS}])")
 #: 文の中の区切り 1 つの文が長すぎるときだけここで分ける
 _CLAUSE_END = re.compile(r"(?<=[、，,；;：:）)」』])")
 
@@ -472,7 +476,10 @@ def split_script(text: str, limit: int = PIECE_LIMIT) -> list[str]:
             current = part
         if current.strip():
             pieces.append(current.strip())
-    return pieces
+    # 読む文字の無い塊（記号と空白だけ）は送らない エンジンは読む物が無いと断り、
+    # 1 つの塊の失敗でナレーション全体が作れなくなる 字幕もこの塊から作るので、声の無い
+    # 字幕も出ない
+    return [piece for piece in pieces if any(char.isalnum() for char in piece)]
 
 
 def _fit(sentence: str, limit: int) -> list[str]:

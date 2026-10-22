@@ -208,6 +208,14 @@ class TestMakingTheVoice:
         expected = sum(len(text) for text in engine.texts) * SECONDS_PER_CHAR
         assert wav_seconds(data.wav) == pytest.approx(expected, abs=0.01)
 
+    def test_repeated_marks_do_not_make_the_engine_refuse(self, engine: FakeVoiceEngine) -> None:
+        # 壊れると、句点が 2 つ続く台本で記号だけの塊をエンジンへ送り、断られてナレーション
+        # 全体が作れない 字幕の文の割り方も同じ塊なので、声と字幕の数がそろう
+        maru = chr(0x3002)
+        spoken = VoiceEngine(engine.url).synthesize(f"はい{maru}{maru}次です{maru}", 3, Tuning())
+        assert engine.texts == [f"はい{maru}{maru}", f"次です{maru}"]
+        assert [line.text for line in spoken.lines] == engine.texts
+
     def test_each_sentence_keeps_its_own_length(self, engine: FakeVoiceEngine) -> None:
         # 壊れると、字幕を声の長さに合わせられず、2 文目の字幕が 1 文目の声のうちに出る
         spoken = VoiceEngine(engine.url).synthesize("はい。今日は長めに話します。", 3, Tuning())
@@ -249,6 +257,22 @@ class TestSplitting:
         pieces = split_script(text, 20)
         assert all(len(piece) <= 20 for piece in pieces)
         assert "".join(pieces) == text
+
+    def test_repeated_marks_stay_with_their_sentence(self) -> None:
+        # 壊れると、句点が 2 つ続く・「！？」「...」で終わる台本から記号だけの塊ができ、
+        # 読む物の無い塊をエンジンに断られてナレーション全体が作れない（#401 の CodeRabbit の指摘）
+        maru = chr(0x3002)
+        assert split_script(f"あ{maru}{maru}い") == [f"あ{maru}{maru}", "い"]
+        assert split_script("本当!?次へ") == ["本当!?", "次へ"]
+        assert split_script("えーと...そうです") == ["えーと...", "そうです"]
+        assert split_script(f"はい！？{maru}\n次です") == [f"はい！？{maru}", "次です"]
+
+    def test_pieces_without_anything_to_read_are_dropped(self) -> None:
+        # 壊れると、記号と空白だけの塊（行頭の句点など）をエンジンへ渡して断られるか、
+        # 声の無い字幕が 1 枚できる
+        maru = chr(0x3002)
+        assert split_script(f"{maru}{maru}{maru}") == []
+        assert split_script(f"{maru}あ{maru}") == [f"あ{maru}"]
 
     def test_blank_lines_are_dropped(self) -> None:
         # 壊れると、空の塊をエンジンへ渡して断られる

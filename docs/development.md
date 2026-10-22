@@ -276,7 +276,8 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
 - アプリ自身の設定（好み・ショートカット・画面配置・更新・ヘルプ）は、AI は読むだけ
   `EditorHost` に変える口を足さない（試験が落ちる 足してよいのは作品の保存と書き出しの口
   `write_project` `start_export` `export_status` `export_waiter` `cancel_export` `write_subtitles`
-  `write_snapshot` だけ）
+  `write_snapshot` と、ナレーション（#335）の作品のフォルダの narration を用意して WAV を書く口
+  `make_narration_folder` `write_narration` だけ `tests/ai/test_safety.py` がこの一覧と照らす）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
 ### AI の道具が外へ送る物と同意（#342）
@@ -447,7 +448,8 @@ AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.b
   `_keep_within_budget`）の後、送る前の同意と確かめの窓より先（断ると決まった道具のために尋ねない） 作品を変えない
   取り消し・やり直し・書き出しの中止（`undo` `redo` `cancel_export` `ai/fixes.py` の `PASSES_AFTER_LIMIT`）と、
   取り消せない保存と書き出し（`save_project` `save_project_as` `export_video` `export_subtitles`
-  `save_snapshot`）は通す
+  `save_snapshot`）は通す 取り消せない操作でも作品を変える物（`Operation.edits` ナレーションの
+  `generate_narration` #335 は WAV を書いて声と字幕を置く）は、取り消せる編集と同じく断る
 - 調べるたびに、その検査を確定したときの回が上限の前なら指示の段を区切り（`Document.split_checkpoint`）、ここから先を
   「AI: 検査の直し（n 回目）」の段にする 人は〔元に戻す〕1 回でその回の直しだけを戻せる 区切った前の
   段もその指示の物として数えるので、AI の `undo` の `this_instruction` は指示の全部を戻す

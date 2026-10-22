@@ -263,7 +263,8 @@ class EditorBridge:
         # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを
         # 尋ねると、人が答えた後で断るだけになる 量の上限の後にするのは、量の上限で止めたときは
         # 「道具を使わずに終える」と返す方が、上限の種類にかかわらず AI の次の手が決まるため
-        if operation.writes and not operation.irreversible:
+        if operation.writes and (not operation.irreversible or operation.edits):
+            # 取り消せない操作でも作品を変える物（Operation.edits ナレーション #335）は断る
             self._refuse_after_fix_limit(operation)
         self._agree_to_send(operation)
         if operation.asks:

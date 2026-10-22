@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -29,13 +30,14 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddCredits
+from sashimono.core.commands import AddCredits, Author
 from sashimono.core.io.atomic import expect_now
 from sashimono.core.model import TrackKind
-from sashimono.engine.audio.voicevox import NarrationSettings, wav_seconds
+from sashimono.engine.audio.voicevox import NarrationSettings, VoiceEngine, wav_seconds
 from sashimono.engine.decode import probe_media
 from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread
+from tests.ai.test_fix_loop import _MIXED_CLIP, _finish
 from tests.ai.test_outbound import undeclared
 from tests.ai.test_safety import _symlink_dir, answer_approvals
 from tests.fake_voice_engine import (
@@ -404,6 +406,42 @@ class TestMakingAndPlacing:
         assert SCRIPT not in str(box.get("error"))
         assert narrating.narrations == []
         assert narrating.document.project == before
+
+    def test_an_unexpected_failure_is_told_as_a_refusal(
+        self, narrating: FakeHost, monkeypatch: Any
+    ) -> None:
+        # 壊れると、声を作る裏のスレッドで思っていない例外（壊れた WAV を読む所など）が出たとき、
+        # 終わった印だけが立って結果が無く、AI には AssertionError、人の窓では「作っています」の
+        # まま止まって見える（#401 の CodeRabbit の指摘）
+        _listed(narrating)
+
+        def broken(*_args: object, **_kwargs: object) -> object:
+            raise struct.error("壊れた WAV の頭")
+
+        monkeypatch.setattr(VoiceEngine, "synthesize", broken)
+        before = narrating.document.project
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT})
+        error = box.get("error")
+        assert isinstance(error, ToolError), error
+        assert "思っていない失敗" in str(error)
+        assert "壊れた WAV の頭" not in str(error)
+        assert narrating.narrations == []
+        assert narrating.document.project == before
+
+    def test_the_fix_limit_also_stops_the_narration(self, narrating: FakeHost) -> None:
+        # 壊れると、検査の直しの回数の上限（#339）に達して「これ以上は編集しません」と伝えた後に、
+        # 取り消せない操作の道を通って声と字幕が置かれる
+        _listed(narrating)
+        narrating.fix_limit = 0
+        narrating.document.begin_checkpoint("AI: 調べて", by=Author.AI)
+        _finish(narrating, [_MIXED_CLIP])
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        seen, box = _run(bridge, GENERATE, {"text": SCRIPT})
+        narrating.document.end_checkpoint()
+        assert seen == []  # 確かめの窓を出す前に断る
+        assert "上限" in str(box.get("error"))
+        assert narrating.narrations == []
 
     def test_moving_the_project_while_the_voice_is_made_is_refused(
         self, narrating: FakeHost, engine: FakeVoiceEngine, tmp_path: Path

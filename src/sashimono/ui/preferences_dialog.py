@@ -1474,6 +1474,9 @@ class PreferencesDialog(QDialog):
         form.addRow("", self._narration_status)
         #: 読んだ声の一覧 規約を見るときに声の持ち主を探す
         self._narration_catalog: Catalog | None = None
+        # 場所を変えたら読んだ一覧を捨てる 残すと〔規約を見る〕が前のエンジンの声の持ち主の ID を
+        # 新しいエンジンへ渡し、断られるか別のエンジンの規約と表記を見せる
+        self._narration_url.textChanged.connect(self._forget_narration_catalog)
 
         def spin(bounds: tuple[int, int], value: int) -> QSpinBox:
             box = QSpinBox(self)
@@ -1505,6 +1508,9 @@ class PreferencesDialog(QDialog):
             " AI が作るときもこれに従う 〔ナレーションを作る…〕の窓ではその 1 回だけ変えられる"
         )
         form.addRow(self._narration_subtitles)
+
+    def _forget_narration_catalog(self, _text: str = "") -> None:
+        self._narration_catalog = None
 
     def _narration_engine(self) -> VoiceEngine | None:
         """欄の場所のエンジン 場所が受け付けられなければ理由を出して ``None``"""
