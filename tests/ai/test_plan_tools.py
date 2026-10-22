@@ -170,6 +170,19 @@ class TestPlanTools:
         _plan(host, 2)
         assert _read(host)["instruction"] == "全体の無音を詰めて、字幕を付けて書き出して"
 
+    def test_resuming_can_remake_a_plan_of_the_one_step_left(self, host: FakeHost) -> None:
+        # 壊れると（手順の下限を 2 に上げると）、残り 1 手順の続きで計画を作り直せず、
+        # 欄に古い手順が残ったまま AI が進め、どこまで済んだかが画面から読めない
+        plan = plan_for(host.document)
+        plan.begin_turn("無音を詰めて書き出して")
+        _plan(host, 2)
+        _mark(host, 1, "done")
+        plan.end_turn(interrupted=True)
+        plan.begin_turn(RESUME_PROMPT)
+        assert _plan(host, 1)["steps"] == 1
+        read = _read(host)
+        assert read["total"] == 1 and read["finished"] is False
+
     def test_the_tools_are_read_only_and_in_the_ledger(self) -> None:
         # 壊れると（取り消せる編集と書くと）、計画を書くたびに許可の確かめが出て、長い作業ほど
         # 人が席を外せない 台帳に無いと、画面の操作との突き合わせの見張りから外れる
