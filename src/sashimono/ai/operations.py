@@ -74,6 +74,7 @@ from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_probl
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
+from sashimono.compat.aviutl.report import is_known_record
 from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle
 from sashimono.compat.looks import (
     exo_commands,
@@ -1989,8 +1990,14 @@ def _get_compat_report(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 名前）と debug_print の文を、制御文字はスクリプトの見出しやテキストの文を、失敗は場所を含む
     # OS の文言を持ちうる どれも文か場所か分からないので、両方を許したときだけそのまま送る
     # 種類と回数は残すので、送らない人の所でも穴の数と多さは読める
+    # ただし AviUtl の決まった名前（obj.getpixeldata など）とちょうど一致する記録は、利用者の
+    # 文字が入る余地が無いのでそのまま送る どの API が足りないかを読めることがこの道具の役目
     rows: list[dict[str, Any]] = [
-        {"kind": "missing_api", "name": masked_value(name, UNKNOWN_FIELD_SENDS), "count": count}
+        {
+            "kind": "missing_api",
+            "name": name if is_known_record(name) else masked_value(name, UNKNOWN_FIELD_SENDS),
+            "count": count,
+        }
         for name, count in report.missing
     ]
     rows += [

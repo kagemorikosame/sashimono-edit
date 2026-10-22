@@ -29,7 +29,13 @@ from sashimono.ai.outbound import (
     Outbound,
     SendChoice,
 )
-from sashimono.compat.aviutl.report import CompatibilityReport
+from sashimono.compat.aviutl import objapi
+from sashimono.compat.aviutl.report import (
+    AVIUTL_OBJ_NAMES,
+    KNOWN_RECORDS,
+    CompatibilityReport,
+    is_known_record,
+)
 from sashimono.core.commands import AddEffect, ParamPath, SetKeyframe, SetParam, SetWorkArea
 from sashimono.core.io.serialize import json_text
 from sashimono.core.model import ClipId, Effect, MediaItem, Project, StrokeId, Transcript
@@ -425,6 +431,15 @@ class TestProjectView:
         assert row["volume_db"] == 0.0 and row["pan"] == 0.0
 
 
+#: 記録に混ざりうる利用者の文字 図形の名前・debug_print の文・画像の名前・場所
+USER_RECORDS = (
+    "図形の種類: 秘密の星",
+    "debug_print: 秘密の挨拶",
+    'obj.load("秘密.png")',
+    "C:/Users/秘密の人/scripts/a.anm",
+)
+
+
 def _report() -> CompatReport:
     recorded = CompatibilityReport()
     for _ in range(3):
@@ -469,11 +484,43 @@ class TestCompatReport:
         assert done.is_set() and "error" not in box
         text = json.dumps(box["result"], ensure_ascii=False)
         assert "秘密の人" not in text
-        # 記録の文は文か場所か分からないので伏せるが、種類と回数は読める（#391）
-        result = box["result"]
-        assert isinstance(result, dict)
-        assert [row["kind"] for row in result["records"]][:2] == ["missing_api", "missing_api"]
-        assert result["records"][0]["count"] == 3
+        assert "obj.getpixeldata" in text
+
+    @pytest.mark.parametrize("refused", [Outbound.FILES, Outbound.TEXT])
+    def test_known_api_names_are_read_and_the_rest_is_hidden(
+        self, host: FakeHost, refused: Outbound
+    ) -> None:
+        """壊れると、名前と場所か字幕と文字を送らない人の所で、どの AviUtl の API が足りないかを
+        AI が読めない（決まった名前まで伏せる）か、記録に混ざった利用者の図形の名前・
+        debug_print の文・画像の名前が外へ出る（#391）"""
+        recorded = CompatibilityReport()
+        recorded.note_missing("obj.getpixeldata")
+        recorded.note_missing("obj.zoom への代入")
+        for secret in USER_RECORDS:
+            recorded.note_missing(secret)
+        host.compat = CompatReport.of(recorded, scripts=1, folders=())
+        result = _through_bridge(host, "get_compat_report", {}, {refused})
+        names = [row["name"] for row in result["records"]]
+        assert "obj.getpixeldata" in names
+        assert "obj.zoom への代入" in names
+        text = json.dumps(result, ensure_ascii=False)
+        assert "秘密" not in text
+        assert names.count(TEXT_MARK) + names.count(PATH_MARK) == len(USER_RECORDS)
+
+    def test_the_known_names_are_fixed_names_only(self) -> None:
+        """壊れると、決まった名前の一覧に作品やスクリプトから組み立てた文字が混ざり、利用者の
+        文字がそのまま送られる 一覧が obj の受ける名前を欠くと、その API の名前が読めない"""
+        shape = re.compile(r"obj\.[a-z_0-9]+(?: への代入)?")
+        assert all(shape.fullmatch(record) for record in KNOWN_RECORDS)
+        accepted = (
+            set(objapi._READABLE)
+            | set(objapi._WRITABLE)
+            | set(objapi._IDENTIFIERS)
+            | {name.removeprefix("lua_") for name in dir(objapi.ObjApi) if name.startswith("lua_")}
+        )
+        assert accepted <= AVIUTL_OBJ_NAMES
+        assert not is_known_record('obj.load("秘密.png")')
+        assert not is_known_record("debug_print: obj.mes")
 
 
 def test_the_reading_thread_is_not_the_editing_thread(host: FakeHost) -> None:
