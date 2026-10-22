@@ -35,17 +35,36 @@ from sashimono.ai.environment import AI_PACK
 from sashimono.app import IMPORT_CHECK_FLAG, import_check
 from sashimono.asr.environment import ASR_PACK
 from sashimono.asr.speakers import SPEAKER_PACK
+from sashimono.engine.vision.parts import RAPIDOCR_PACK, VISION_PACK
 from sashimono.runtime import FeaturePack, install_arguments, is_frozen, run_pip_in_worker
 
 __all__ = ["ADD_ON_MODULES", "ADD_ON_PACKS", "INSTALL_TIMEOUT", "main", "self_command"]
 
-#: 確かめる機能 使う人が導入の欄で押す物と同じ
-ADD_ON_PACKS = (AI_PACK, ASR_PACK, SPEAKER_PACK)
+#: 確かめる機能 使う人が導入の欄で押す物と同じ 画面の解析（#324）は設定の窓から入れる
+#: 顔の検出のモデル（pip の外で落とす物）は確かめない 読み込みは onnxruntime の仕事で、
+#: 配布版で読めるかは onnxruntime の import で分かる 取りに行く所は試験が見る
+ADD_ON_PACKS = (AI_PACK, ASR_PACK, SPEAKER_PACK, VISION_PACK, RAPIDOCR_PACK)
 #: 入れた後に import する名前 送った途端・起こし始めた途端に読まれる物
+#: onnxruntime は winrt の包みより先に読む 逆の順ではアプリごと落ちる
+#: （:func:`sashimono.engine.vision.ocr.load_onnxruntime_first`）
 #: onnxruntime（字幕起こしの無音の判定が読む）を sherpa_onnx（話者の分離 #323）より先に読む
 #: どちらも onnxruntime.dll という名前の DLL を持ち、Windows は同じ名前の DLL を読み込み済みの
 #: 物で済ませることがある 使う人が起こしてから分ける順で、配布版の中でも読めることを見る
-ADD_ON_MODULES = ("claude_agent_sdk", "faster_whisper", "ctranslate2", "onnxruntime", "sherpa_onnx")
+ADD_ON_MODULES = (
+    "claude_agent_sdk",
+    "faster_whisper",
+    "ctranslate2",
+    "onnxruntime",
+    "sherpa_onnx",
+    # 飾った文字の読み取り（RapidOCR）と、それが読む OpenCV onnxruntime より後に読む
+    "cv2",
+    "rapidocr",
+    "winrt.windows.media.ocr",
+    "winrt.windows.graphics.imaging",
+    "winrt.windows.storage.streams",
+    "winrt.windows.globalization",
+    "winrt.windows.foundation.collections",
+)
 #: 段（機能ごとの pip と読む所）を 1 つ待つ秒数の既定（手元の組み立ての道具） 初めては
 #: 合わせて 200 MB ほど落とす 遅い回線でも待てるよう長めに CI は短い値を渡す
 #: （``--add-on-check <置き場> <秒数>``）
