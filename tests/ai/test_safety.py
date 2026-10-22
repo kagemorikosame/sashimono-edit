@@ -216,6 +216,11 @@ class TestAppSettingsAreReadOnly:
             "request_scenes",
             "scene_state",
             "scene_waiter",
+            # 画面の中身（#324） 頼むのは場面の解析と同じく本人のキャッシュへの解析だけで、
+            # 読み込みのときに調べるかの設定（Preferences.screen_analysis）は変えない
+            "request_screen",
+            "screen_state",
+            "screen_waiter",
             "seek",
             "select_clip",
             "select_clips",

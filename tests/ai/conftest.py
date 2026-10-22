@@ -46,10 +46,11 @@ from sashimono.core.model import (
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.report import assemble
+from sashimono.engine.vision import ScreenKind
 from tests.conftest import make_clip
 
 RATE_30 = FrameRate(30)
@@ -124,6 +125,12 @@ class FakeHost:
         #: 待つ関数が呼ばれた記録（素材, 秒） と、待った結果を決める関数
         self.scene_waits: list[tuple[MediaId, float]] = []
         self.scene_ready: Callable[[MediaId], bool] = lambda _media: True
+        #: 画面の中身（#324） 試験が（素材, 種類）ごとの様子を入れる 無ければ頼んでいない様子
+        self.screen_states: dict[tuple[MediaId, ScreenKind], ScreenState] = {}
+        self.screen_requests: list[tuple[MediaId, ScreenKind]] = []
+        self.screen_waits: list[tuple[MediaId, ScreenKind, float]] = []
+        #: 待った結果を決める関数 待つ間に様子を変えて、待った後の続きを試せる
+        self.screen_ready: Callable[[MediaId, ScreenKind], bool] = lambda _media, _kind: True
         #: 作品（.sme）の場所 既定はまだ保存していない作品
         self.saved_at: Path | None = None
         #: 書き出しの窓で前に選んだフォルダ 既定はまだ書き出していない
@@ -417,6 +424,19 @@ class FakeHost:
         def wait(seconds: float) -> bool:
             self.scene_waits.append((media_id, seconds))
             return self.scene_ready(media_id)
+
+        return wait
+
+    def request_screen(self, media: MediaItem, kind: ScreenKind) -> None:
+        self.screen_requests.append((media.id, kind))
+
+    def screen_state(self, media: MediaItem, kind: ScreenKind) -> ScreenState:
+        return self.screen_states.get((media.id, kind), ScreenState(None, running=False))
+
+    def screen_waiter(self, media_id: MediaId, kind: ScreenKind) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            self.screen_waits.append((media_id, kind, seconds))
+            return self.screen_ready(media_id, kind)
 
         return wait
 

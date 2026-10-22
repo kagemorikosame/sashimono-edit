@@ -43,6 +43,7 @@ from typing import TextIO, cast
 from packaging.version import InvalidVersion, Version
 
 from sashimono.core import userdirs
+from sashimono.model_files import RemoteFile, fetch_files, missing_files
 
 __all__ = [
     "ABI_MARKER",
@@ -147,6 +148,9 @@ class FeaturePack:
     #: コマンドの探し方 既定は PATH だけ PATH に載らない場所へ入る
     #: ものがあるので、機能ごとに差し替えられるようにしてある
     locate: Callable[[str], object | None] = shutil.which
+    #: pip では入らないファイル（学習済みのモデルなど 画面の解析の顔の検出 #324）
+    #: 導入のボタンで pip が終わった後に落として置く（:func:`install_runtime`）
+    files: tuple[RemoteFile, ...] = ()
 
     def status(self) -> PackStatus:
         return PackStatus(
@@ -155,6 +159,7 @@ class FeaturePack:
             extras=tuple(_package_status(n) for n in self.extra),
             missing_commands=tuple(c for c in self.commands if self.locate(c) is None),
             stale_abi=stale_runtime(self.key),
+            missing_files=missing_files(self.files),
         )
 
     def requirements(self, *, extra: bool) -> tuple[str, ...]:
@@ -174,6 +179,8 @@ class PackStatus:
     #: 本体の更新で Python が上がった後に立つ 立っている間は導入先を読まない
     #: （:func:`activate_runtime`）
     stale_abi: str | None = None
+    #: まだ置いていない、pip では入らないファイル（:attr:`FeaturePack.files`）
+    missing_files: tuple[RemoteFile, ...] = ()
 
     @property
     def installed(self) -> bool:
@@ -192,7 +199,12 @@ class PackStatus:
         ようになり、もう片方も名前の上では「入っている」に見えるが、古い拡張モジュールの
         import で落ちる
         """
-        return self.installed and not self.missing_commands and self.stale_abi is None
+        return (
+            self.installed
+            and not self.missing_commands
+            and self.stale_abi is None
+            and not self.missing_files
+        )
 
     @property
     def needs_upgrade(self) -> bool:
@@ -234,6 +246,11 @@ class PackStatus:
             missing = "、".join(self.missing_commands)
             hint = f" {self.pack.command_hint}" if self.pack.command_hint else ""
             return f"導入済み ただし {missing} が見つかりません {hint}"
+        if self.missing_files:
+            # 包みだけ入って取りに行けなかった（繋がらなかった・中身が合わなかった）
+            # 「導入済み」とだけ出すと、使う所で初めて落ちる
+            files = "、".join(file.label or file.name for file in self.missing_files)
+            return f"導入済み ただし {files} がありません 〔環境を更新〕で落とし直せます"
         if self.extras and not self.extra_installed:
             return f"導入済み {self.pack.extra_label}は入っていません"
         return "導入済み"
@@ -1388,6 +1405,10 @@ def _install_runtime_locked(
         # 入れ終えたときにだけ書く 途中で止めた導入先に今の印を書くと、前の Python 向けの
         # 拡張モジュールが残ったまま「合っている」として読まれる
         _mark_installed(target, pack.key)
+    if code == 0 and pack is not None and pack.files:
+        # pip が入れ終えてから取りに行く 先に落とすと、包みが入らなかったときに使えない物だけが
+        # 残る 開発の環境（導入先が無い）でも同じ置き場へ落とす 置き場は Python の版に関係しない
+        code = fetch_files(pack.files, on_output=on_output, should_cancel=should_cancel)
     return code
 
 
