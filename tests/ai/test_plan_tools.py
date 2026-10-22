@@ -403,6 +403,20 @@ class TestWhatIsSent:
         assert "編集ソフトを" not in text
         assert isinstance(result, dict) and len(result["steps"]) == 1
 
+    def test_a_quoted_piece_of_a_subtitle_is_hidden(self, secret_host: FakeHost) -> None:
+        # 壊れると、AI が字幕の一部だけを「」で手順に写したとき、表（字幕の行の全体）とは
+        # 一致しないので、字幕と文字を断った人にもその切れ端を送る 計画は AI が書いた文で
+        # 型の付いた欄ではないため、取り消しの名前と同じく形でも伏せる（#391 を取り込んだ所）
+        _operation("set_plan")(
+            secret_host, {"goal": "「編集ソフ」の誤字を直す", "steps": ["字幕を読む"]}
+        )
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.DENY))
+        done, box = call_in_thread(bridge, _operation("get_plan"), {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert box.get("error") is None
+        assert "編集ソフ" not in str(box.get("result"))
+
     def test_writing_a_plan_never_asks(self, host: FakeHost) -> None:
         # 壊れると、計画を書く前に送ってよいかの窓が出て、長い作業の頭で止まる
         bridge = EditorBridge(host)
