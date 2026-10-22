@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.ai.budget import IMAGE_EDGES, LimitAction
+from sashimono.ai.fixes import FIX_ROUNDS_RANGE
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
@@ -40,6 +41,13 @@ from sashimono.core.emphasis import (
 )
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
+from sashimono.core.reframe import (
+    REFRAME_FOLLOW_NAMES,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZE_NAMES,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+)
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE_MS_RANGE,
@@ -931,6 +939,20 @@ class PreferencesDialog(QDialog):
             " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
         )
         form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
+        # 検査の直しの回数（#339） どこまで AI に任せるかは人で違う
+        self._ai_fix_rounds = QSpinBox(self)
+        self._ai_fix_rounds.setRange(*FIX_ROUNDS_RANGE)
+        self._ai_fix_rounds.setSuffix(" 回")
+        self._ai_fix_rounds.setSpecialValueText("直さない（調べるだけ）")
+        self._ai_fix_rounds.setValue(preferences.ai_fix_rounds)
+        self._ai_fix_rounds.setToolTip(
+            "AI アシスタントが仕上がりを調べて（check_output）見つけた問題を、直して調べ直す回数の"
+            "上限 上限に達すると、その指示ではもう編集せず、残った問題を伝えて止まる"
+            " 直すのは音量の基準・混ぜた音の音割れ・止まった字幕のはみ出しだけで、隙間を詰める・"
+            "無音を削るなどは尋ねてから直す 直した回ごとに〔元に戻す〕1 回で戻せる"
+            " 0 にすると調べるだけで直さない"
+        )
+        form.addRow("AI が仕上がりを直す回数", self._ai_fix_rounds)
         # ダッキング（#329）の既定 声を聞かせたい量と BGM の動き方の好みは人と作品で違う
         # AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
         self._duck_depth = QSpinBox(self)
@@ -965,6 +987,7 @@ class PreferencesDialog(QDialog):
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
         self._add_seam_rows(form, preferences)
+        self._add_reframe_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
         # 尋ねる物ごとに 1 行 いつも送る物と送り先は、選べないので下の説明に書く
@@ -1219,6 +1242,7 @@ class PreferencesDialog(QDialog):
             ai_limit_action=str(self._limit_action.currentData()),
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
+            ai_fix_rounds=self._ai_fix_rounds.value(),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),
             duck_release_ms=self._duck_release.value(),
@@ -1232,6 +1256,9 @@ class PreferencesDialog(QDialog):
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
             seam_audio_fade_ms=self._seam_audio.value(),
+            reframe_size=str(self._reframe_size.currentData()),
+            reframe_follow=str(self._reframe_follow.currentData()),
+            reframe_smooth_ms=self._reframe_smooth.value(),
             scene_analysis=str(self._scene_analysis.currentData()),
             scene_threads=int(self._scene_threads.currentData()),
             screen_analysis=str(self._screen_analysis.currentData()),
@@ -1407,6 +1434,44 @@ class PreferencesDialog(QDialog):
             " 長いと話の頭と終わりが小さく聞こえる 0 で音は触らない"
         )
         form.addRow("つなぎ目: 音のフェード", self._seam_audio)
+
+    def _add_reframe_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """縦動画への作り替え（#334）の既定 どの縦の大きさで出すか・枠を止めるか追うかは人と
+        作品で違う AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        """
+        self._reframe_size = QComboBox(self)
+        for size in REFRAME_SIZES:
+            self._reframe_size.addItem(REFRAME_SIZE_NAMES[size], size)
+        self._reframe_size.setCurrentIndex(
+            max(0, self._reframe_size.findData(preferences.reframe_size))
+        )
+        self._reframe_size.setToolTip(
+            "AI アシスタントが横の作品を縦の作品に作り替えるときの大きさ 背景の動画は前の画面に"
+            "置いた枠の中を拡げて映すので、作る大きさが大きいほど拡げる倍率が上がり、絵が粗くなる"
+        )
+        form.addRow("縦動画への作り替え: 大きさ", self._reframe_size)
+        self._reframe_follow = QComboBox(self)
+        for follow in REFRAME_FOLLOWS:
+            self._reframe_follow.addItem(REFRAME_FOLLOW_NAMES[follow], follow)
+        self._reframe_follow.setCurrentIndex(
+            max(0, self._reframe_follow.findData(preferences.reframe_follow))
+        )
+        self._reframe_follow.setToolTip(
+            "枠を場面ごとに止めるか、被写体を追って動かすか 止めると三脚で撮ったように落ち着くが、"
+            "大きく動く人は枠から外れる 追うと外れにくいが、手持ちのカメラのように動き続ける"
+            " 被写体は動きと肌色から見積もる（顔は見分けない 肌色に近い壁や床にも寄る）"
+        )
+        form.addRow("縦動画への作り替え: 枠の動かし方", self._reframe_follow)
+        self._reframe_smooth = QSpinBox(self)
+        self._reframe_smooth.setRange(*REFRAME_SMOOTH_MS_RANGE)
+        self._reframe_smooth.setSingleStep(100)
+        self._reframe_smooth.setSuffix(" ms")
+        self._reframe_smooth.setValue(preferences.reframe_smooth_ms)
+        self._reframe_smooth.setToolTip(
+            "被写体を追うときにならす長さ 長いほどゆっくり動いて落ち着き、短いほど被写体に"
+            "ぴったり付くが手振りで揺れる 止める場面には効かない"
+        )
+        form.addRow("縦動画への作り替え: 追うときのならし", self._reframe_smooth)
 
     def _add_limit_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """AI が使う量の上限（#344） どこまで使ってよいかは契約と懐で人ごとに違う

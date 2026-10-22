@@ -29,6 +29,7 @@ from sashimono.ai.budget import (
     LimitAction,
     Limits,
 )
+from sashimono.ai.fixes import FIX_ROUNDS_RANGE
 from sashimono.ai.models import DEFAULT_EFFORT as DEFAULT_AI_EFFORT
 from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
@@ -64,6 +65,15 @@ from sashimono.core.mixing import (
     DuckShape,
 )
 from sashimono.core.model import LayerMode, StyleGuide
+from sashimono.core.reframe import (
+    DEFAULT_REFRAME_FOLLOW,
+    DEFAULT_REFRAME_SIZE,
+    DEFAULT_REFRAME_SMOOTH_MS,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+    ReframeStyle,
+)
 from sashimono.core.seams import (
     DEFAULT_SEAM_AUDIO_FADE_MS,
     DEFAULT_SEAM_CROSSFADE_MS,
@@ -636,6 +646,10 @@ class Preferences:
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
     check_loudness_target: int = -14
+    #: AI アシスタントが検査（#337）で見つけた問題を直して調べ直す回数の上限（#339）
+    #: どこまで任せるかは人で違う 0 は調べるだけで直さない 既定の 3 は、音量をそろえた後に
+    #: 音割れや字幕を直すような 2〜3 段の直しで足り、止まらない繰り返しは早めに人へ返す側
+    ai_fix_rounds: int = 3
     #: AI アシスタントが BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅（dB）
     #: 声を聞かせたい量は作品と BGM で違う AI に値を言わなければこれを使う 既定は放送や
     #: 配信の手引きでよく使う 10〜15 dB の真ん中の 12（:mod:`sashimono.core.mixing`）
@@ -673,6 +687,16 @@ class Preferences:
     seam_zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
     #: 音の継ぎ目のフェード（ミリ秒） 0 で音は触らない
     seam_audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
+    #: AI アシスタントが横の作品を縦の作品に作り替える（#334）ときの既定
+    #: どの縦の大きさで出すか・枠を止めるか追うかは人と作品で違う AI に値を言わなければこれを使う
+    #: （:mod:`sashimono.core.reframe`）
+    #: 作る大きさ（:data:`~sashimono.core.reframe.REFRAME_SIZES`） 既定はショート動画の 1080x1920
+    reframe_size: str = DEFAULT_REFRAME_SIZE
+    #: 枠の動かし方（:data:`~sashimono.core.reframe.REFRAME_FOLLOWS`） 既定は収まる場面は止め、
+    #: 外れる場面だけ追う（動き続ける枠は、知らない人が見ると酔いやすい）
+    reframe_follow: str = DEFAULT_REFRAME_FOLLOW
+    #: 追うときにならす長さ（ミリ秒） 長いほどゆっくり動く
+    reframe_smooth_ms: int = DEFAULT_REFRAME_SMOOTH_MS
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -799,6 +823,15 @@ class Preferences:
             crossfade_ms=self.seam_crossfade_ms,
             zoom_percent=self.seam_zoom_percent,
             audio_fade_ms=self.seam_audio_fade_ms,
+        )
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        """AI アシスタントの縦動画への作り替え（#334）の既定"""
+        return ReframeStyle(
+            size=self.reframe_size,
+            follow=self.reframe_follow,
+            smooth_ms=self.reframe_smooth_ms,
         )
 
     @property
@@ -1014,6 +1047,7 @@ class PreferenceStore:
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
+            ai_fix_rounds=_within(data.get("ai_fix_rounds"), FIX_ROUNDS_RANGE, plain.ai_fix_rounds),
             duck_depth_db=_within(
                 data.get("duck_depth_db"), DUCK_DEPTH_DB_RANGE, plain.duck_depth_db
             ),
@@ -1054,6 +1088,13 @@ class PreferenceStore:
             ),
             seam_audio_fade_ms=_within(
                 data.get("seam_audio_fade_ms"), SEAM_AUDIO_FADE_MS_RANGE, plain.seam_audio_fade_ms
+            ),
+            reframe_size=_choice(data.get("reframe_size"), REFRAME_SIZES, plain.reframe_size),
+            reframe_follow=_choice(
+                data.get("reframe_follow"), REFRAME_FOLLOWS, plain.reframe_follow
+            ),
+            reframe_smooth_ms=_within(
+                data.get("reframe_smooth_ms"), REFRAME_SMOOTH_MS_RANGE, plain.reframe_smooth_ms
             ),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis

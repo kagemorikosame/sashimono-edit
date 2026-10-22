@@ -17,10 +17,11 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.budget import DEFAULT_IMAGE_EDGE
-from sashimono.ai.host import EXPORT_RUNNING, ExportRequest, ToolError
+from sashimono.ai.host import EXPORT_RUNNING, CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
@@ -41,6 +42,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
@@ -103,6 +105,8 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
+        self.reframing = ReframeStyle()
         #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
         self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
@@ -110,6 +114,8 @@ class FakeHost:
         #: 待つ関数が呼ばれた秒と、待った結果
         self.check_waits: list[float] = []
         self.check_ready = True
+        #: 検査の直しの回数の上限（#339） 既定は設定と同じ 3
+        self.fix_limit = 3
         #: 混ぜた音の推移（#322） 入れておくと、頼まれた検査がこの推移で調べ終えた様子になる
         #: 入れなければ今までどおり、何も調べていない走っている様子から始まる
         self.heard: SoundProfile | None = None
@@ -154,6 +160,21 @@ class FakeHost:
         self.rules = LookRules()
         #: テンプレートの棚（#328） 既定は空 本人の AviUtl2 の置き場は読まない
         self.shelf: list[TemplateEntry] = []
+        #: 人が見ている表示（#352） 試験が入れる 既定は何も選んでいない、頭の 10 秒が見えている画面
+        self.screen = ViewState(
+            visible_frames=(0, 300),
+            pixels_per_frame=2.0,
+            playing=False,
+            graph_shown=False,
+            graph_path=None,
+            pool_media=None,
+            subtitle_media=None,
+            subtitle_stream=None,
+            subtitle_rows=(),
+            person_export=None,
+        )
+        #: 互換性レポート（#352） 試験が入れる 既定は記録の無いレポート
+        self.compat = CompatReport.of(CompatibilityReport(), scripts=0, folders=())
 
     @property
     def saved_looks(self) -> SavedLooks:
@@ -267,6 +288,10 @@ class FakeHost:
         return self.loudness
 
     @property
+    def fix_rounds(self) -> int:
+        return self.fix_limit
+
+    @property
     def duck_shape(self) -> DuckShape:
         return self.duck
 
@@ -277,6 +302,10 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self.reframing
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)
@@ -434,6 +463,12 @@ class FakeHost:
             return False
         self.export_state = {**self.export_state, "state": "cancelled"}
         return True
+
+    def view_state(self) -> ViewState:
+        return self.screen
+
+    def compat_report(self) -> CompatReport:
+        return self.compat
 
     def app_settings(self) -> dict[str, object]:
         return self.settings

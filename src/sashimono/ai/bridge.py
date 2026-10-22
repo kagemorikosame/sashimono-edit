@@ -30,6 +30,7 @@ from functools import partial
 from typing import Any
 
 from sashimono.ai.budget import LimitAction, Overrun, UsageMeter
+from sashimono.ai.fixes import PASSES_AFTER_LIMIT, fixes_closed
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
@@ -49,6 +50,7 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
     secret_pairs,
+    sending,
     text_secrets,
 )
 from sashimono.ai.safety import Consent
@@ -259,6 +261,11 @@ class EditorBridge:
         """
         # 量の上限は同意より先に見る 上限で止まる道具の同意を尋ねても、答えた後に断るだけになる
         self._keep_within_budget(operation)
+        # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを
+        # 尋ねると、人が答えた後で断るだけになる 量の上限の後にするのは、量の上限で止めたときは
+        # 「道具を使わずに終える」と返す方が、上限の種類にかかわらず AI の次の手が決まるため
+        if operation.writes and not operation.irreversible:
+            self._refuse_after_fix_limit(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -307,6 +314,24 @@ class EditorBridge:
                 result = self.call(partial(self._run, operation, result.step))
             else:
                 return result
+
+    def _refuse_after_fix_limit(self, operation: Operation) -> None:
+        """検査の直しの回数が上限に達した指示では、取り消せる編集を断る（#339）
+
+        回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 送る前の同意と確かめの窓を
+        出す前に断る
+        出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
+        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
+        取り消せない操作の道を通るので、ここへは来ない
+        """
+        if operation.name in PASSES_AFTER_LIMIT:
+            return
+        if self.call(lambda: fixes_closed(self._host.document)):
+            raise ToolError(
+                "この指示では、検査の後に直す回数の上限（本人の設定）に達しました これ以上は"
+                "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"
+                "ユーザーに伝えて終えてください 続けるかはユーザーが次の指示で決めます"
+            )
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
@@ -551,20 +576,28 @@ class EditorBridge:
         except ToolError as exc:
             if texts is None:
                 raise
-            raise ToolError(str(self._hide_text(str(exc), texts, hide_body))) from None
-        return result if texts is None else self._hide_text(result, texts, hide_body)
+            raise ToolError(
+                str(self._hide_text(str(exc), texts, hide_body, operation.labels))
+            ) from None
+        if texts is None:
+            return result
+        return self._hide_text(result, texts, hide_body, operation.labels)
 
-    def _hide_text(self, value: object, before: list[str], body: bool) -> object:
+    def _hide_text(self, value: object, before: list[str], body: bool, labels: bool) -> object:
         after = text_secrets(self._host.document.project) if body else []
-        return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
+        return hide_text(value, sorted({*before, *after}, key=len, reverse=True), labels=labels)
 
     def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""
         # 動かす前の名前も覚える 道具が素材を消すと、動かした後の作品からは名前が拾えない
         self._learn_names()
         hide = not self.may_send(Outbound.FILES)
+        # 欄の型で伏せる道具（get_clip など #391）が、結果を組む所で今の許しを引けるようにする
+        # 立てずに動かすと、編集画面の中から直に呼んだ扱いになり、欄の値を全部載せる
+        allowed = frozenset(kind for kind in Outbound if self.may_send(kind))
         try:
-            result = work()
+            with sending(allowed):
+                result = work()
         except (ToolError, ValueError, KeyError) as exc:
             if not hide:
                 raise

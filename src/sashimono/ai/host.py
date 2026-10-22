@@ -17,13 +17,15 @@ from typing import Protocol
 
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
-from sashimono.core.commands import Command, Document
+from sashimono.core.commands import Command, Document, ParamPath
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
-from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
+from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, SegmentId
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
@@ -33,10 +35,12 @@ from sashimono.engine.vision import ScreenKind
 __all__ = [
     "EXPORT_RUNNING",
     "EXPORT_STATES",
+    "CompatReport",
     "EditorHost",
     "ExportRequest",
     "SheetCanvas",
     "ToolError",
+    "ViewState",
 ]
 
 #: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
@@ -62,6 +66,66 @@ class ExportRequest:
     #: 許したときの書き出し先の身元（無ければ無かったこと） 置く直前に照らし、名前が現れたり
     #: 中身が変わったりしていれば置かずに断る（#327）
     expect: Expected
+
+
+@dataclass(frozen=True, slots=True)
+class ViewState:
+    """人が画面で見ている物のうち、作品の中に無い物（表示・再生・パネルの選択 #352）
+
+    作品の中身（クリップ・選択したクリップ・再生ヘッド）は :attr:`EditorHost.project` などで読む
+    ここは表示だけの状態で、AI はこれを読んで「人が今どこを見ているか」に合わせる 名前や場所は
+    持たない（ID と数だけ） 持たせると、名前と場所を断った人の所で伏せる表を通す口が要る
+    """
+
+    #: タイムラインに見えているフレームの範囲 ``[頭, 終わり)``
+    visible_frames: tuple[int, int]
+    #: タイムラインの 1 フレームの幅（画素） 拡大・縮小で変わる
+    pixels_per_frame: float
+    #: 再生しているか
+    playing: bool
+    #: グラフエディタのパネルを出しているか
+    graph_shown: bool
+    #: グラフエディタが出している値 選んでいなければ ``None``
+    graph_path: ParamPath | None
+    #: 素材一覧で選んでいる素材
+    pool_media: MediaId | None
+    #: 字幕パネルが出している素材と音声ストリームの番号（``None`` なら 1 本目）
+    subtitle_media: MediaId | None
+    subtitle_stream: int | None
+    #: 字幕パネルで選んでいる行
+    subtitle_rows: tuple[SegmentId, ...]
+    #: 人が書き出しの窓で始めた書き出しの進み具合（0〜1） 走っていなければ ``None``
+    #: AI が始めた書き出しは :meth:`EditorHost.export_status` で読む
+    person_export: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompatReport:
+    """互換性レポート（〔互換〕→〔互換性レポート…〕と同じ中身 #352）の写し
+
+    本人のアプリが覚えた記録で、作品の中身ではない スクリプトの置き場の場所と、失敗の文に
+    混ざる場所（OS の文言）を持ちうる 読む道具は名前と場所とアプリの設定を送ると書く
+    """
+
+    summary: str
+    #: 呼ばれた未実装の API の名前と回数 多い順
+    missing: tuple[tuple[str, int], ...]
+    #: 解釈できなかった制御文字と回数 多い順
+    controls: tuple[tuple[str, int], ...]
+    #: 実行や読み込みに失敗したスクリプトと、その文
+    failures: tuple[tuple[str, str], ...]
+    #: 読み込み済みのスクリプトの数
+    scripts: int
+    #: スクリプトを探しに行くフォルダ
+    folders: tuple[str, ...]
+
+    @classmethod
+    def of(
+        cls, report: CompatibilityReport, *, scripts: int, folders: tuple[str, ...]
+    ) -> CompatReport:
+        """記録の今の写し 窓と同じく多い順に並べる 写すのは、描く裏のスレッドが数え続けるため"""
+        missing, controls, failures = report.records()
+        return cls(report.summary(), missing, controls, failures, scripts, folders)
 
 
 class ToolError(RuntimeError):
@@ -249,6 +313,16 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def fix_rounds(self) -> int:
+        """検査で見つけた問題を AI が直して調べ直す回数の上限（#339 0 は調べるだけ）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_fix_rounds`）
+
+        どこまで AI に任せるかは人で違う 数えて止めるのはアプリ（:mod:`sashimono.ai.fixes`）
+        で、AI は引数で上限を変えられない 変えられると、止まらない繰り返しを AI が自分で許せる
+        """
+        ...
+
+    @property
     def duck_shape(self) -> DuckShape:
         """BGM を話している間だけ下げる（ダッキング #329）ときの既定の下げ幅と速さ
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.duck_shape`）
@@ -272,6 +346,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.seam_style`）
 
         溶かすか寄るか・どれだけの長さかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        """縦動画への作り替え（#334）の既定の大きさ・枠の動かし方・ならす長さ
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.reframe_style`）
+
+        どの縦の大きさで出すか・枠を止めるか追うかは人と作品で違う AI が引数で渡さなければこれを使う
         """
         ...
 
@@ -452,6 +535,17 @@ class EditorHost(Protocol):
         作品の外に名前を覚える所を足したら、ここからも返す 返さないと、別の作品を開いた後に
         その名前が伏せずに送られる（``tests/ui/test_remembered_names.py`` が見張る）
         """
+        ...
+
+    def view_state(self) -> ViewState:
+        """人が画面で見ている表示の状態（見えている範囲・再生・パネルの選択・書き出し #352）
+
+        読むだけ 変える口は置かない（拡大や再生を AI に出すかは #298 の決めること）
+        """
+        ...
+
+    def compat_report(self) -> CompatReport:
+        """互換性レポートの写し（#352） 読むだけ 記録を消す・読み直すのは人の窓だけ"""
         ...
 
     def app_settings(self) -> dict[str, object]:

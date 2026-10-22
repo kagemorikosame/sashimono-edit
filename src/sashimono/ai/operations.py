@@ -25,8 +25,18 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.fixes import AUTO as FIX_AUTO
+from sashimono.ai.fixes import (
+    FIX_ACTIONS,
+    CheckTicket,
+    FixRound,
+    current_round,
+    fix_for,
+    settle_check,
+    start_check,
+)
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
-from sashimono.ai.outbound import Outbound
+from sashimono.ai.outbound import UNKNOWN_FIELD_SENDS, Outbound, field_sends, masked_value
 from sashimono.ai.safety import (
     Consent,
     Safety,
@@ -64,6 +74,7 @@ from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_probl
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
+from sashimono.compat.aviutl.report import is_known_record
 from sashimono.compat.catalog import TemplateEntry, TemplateError, restyle
 from sashimono.compat.looks import (
     exo_commands,
@@ -136,7 +147,7 @@ from sashimono.core.commands import (
     trimmable,
     valid_marker_color,
 )
-from sashimono.core.commands.edit import STOP_LOCKED
+from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION, STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
 from sashimono.core.commands.layers import places_mixed
@@ -183,8 +194,10 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    Effect,
     EffectId,
     Interpolation,
+    Keyframe,
     Marker,
     MediaId,
     MediaItem,
@@ -197,8 +210,16 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
+    heard_stream,
 )
 from sashimono.core.projection import heard_timeline, project_timeline
+from sashimono.core.reframe import (
+    CENTER,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+    ReframeError,
+)
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -285,6 +306,24 @@ from sashimono.engine.encode import (
     available_video_codecs,
     chosen_range,
     export_target,
+)
+from sashimono.engine.highlights import DEFAULT_MIN_SECONDS as HIGHLIGHT_MIN_SECONDS
+from sashimono.engine.highlights import DEFAULT_THRESHOLD as HIGHLIGHT_THRESHOLD
+from sashimono.engine.highlights import LAUGHTER as HIGHLIGHT_LAUGHTER
+from sashimono.engine.highlights import (
+    LAUGHTER_LIMITS,
+    Highlight,
+    highlight_curves,
+)
+from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
+from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
+from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
+from sashimono.engine.reframe import (
+    ReframePlan,
+    ReframeRequest,
+    gather_signals,
+    plan_reframe,
+    tracked_media,
 )
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
@@ -835,6 +874,22 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 編集の方針（#343）を決めてあるか 中身は本人の文なので get_style_guide で読む
         # （字幕と文字として同意を取る） ここで有る無しだけを返し、読み忘れを防ぐ
         "has_style_guide": not project.style_guide.empty,
+        # 開いているタイムラインの書き出し範囲（ワークエリア #352） 人は目盛りの帯で見ている
+        # 読めないと、export_video の range を省いたときにどこが書き出されるのか AI に分からない
+        "work_area": _work_area(project),
+    }
+
+
+def _work_area(project: Project) -> dict[str, Any] | None:
+    area = project.timeline.work_area
+    if area is None:
+        return None
+    start, end = area
+    return {
+        "start_frame": start,
+        "end_frame": end,
+        "start_timecode": format_timecode(start, project.rate),
+        "end_timecode": format_timecode(end, project.rate),
     }
 
 
@@ -875,6 +930,10 @@ def _list_tracks(host: EditorHost, arguments: dict[str, Any]) -> object:
             "locked": track.locked,
             "muted": track.muted,
             "solo": track.solo,
+            # トラックの音量と定位 タイムラインの波形の大きさに出ている（#352）
+            # 読めないと、波形が小さく見える訳を AI がクリップの音量に探しに行く
+            "volume_db": track.volume_db,
+            "pan": track.pan,
         }
         for track in _project(host).timeline.tracks
     ]
@@ -964,11 +1023,28 @@ def _get_selection(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     project = _project(host)
     selected = host.selected_clip
+    screen = host.view_state()
+    subtitle_media = (
+        project.find_media(screen.subtitle_media) if screen.subtitle_media is not None else None
+    )
     return {
         "clip_id": str(selected) if selected is not None else None,
         "clip_ids": [str(clip_id) for clip_id in host.selected_clips],
         "playhead": host.playhead,
         "playhead_timecode": format_timecode(host.playhead, project.rate),
+        # 素材一覧と字幕パネルで人が選んでいる物（#352） 「この素材を起こして」「選んだ行を
+        # 直して」の「この」「選んだ」を、AI も人と同じ物として読む
+        "media_id": str(screen.pool_media) if screen.pool_media is not None else None,
+        "subtitles": {
+            "media_id": str(subtitle_media.id) if subtitle_media is not None else None,
+            # get_subtitles の audio と同じ 1 から数えた番号
+            "audio": (
+                _audio_number(subtitle_media, screen.subtitle_stream)
+                if subtitle_media is not None
+                else None
+            ),
+            "segment_ids": [str(segment) for segment in screen.subtitle_rows],
+        },
     }
 
 
@@ -1523,6 +1599,441 @@ def _get_app_settings(host: EditorHost, arguments: dict[str, Any]) -> object:
     return copy.deepcopy(host.app_settings())
 
 
+# --- 人が画面で見ている物（読み取りの同等性 #352）---
+
+#: 曲線を読むときの点の数の上限 グラフエディタの幅（数百画素）で形が分かる数 これより多いと
+#: 値の多いクリップで返事が上限を越え、エフェクトの一覧が 1 件ずつしか読めなくなる
+MAX_CURVE_SAMPLES = 60
+
+
+def _param_location(path: ParamPath) -> dict[str, Any]:
+    """値の在りかを、set_param・add_keyframe・get_clip の引数と同じ形で返す そのまま渡し直せる"""
+    where: dict[str, Any] = {"clip_id": str(path.clip_id), "name": path.name}
+    if path.target is ParamTarget.CLIP:
+        where["target"] = "clip"
+    if path.effect_id is not None:
+        where["effect_id"] = str(path.effect_id)
+    if path.stroke_id is not None:
+        where["stroke_id"] = str(path.stroke_id)
+    if path.after:
+        where["after"] = True
+    return where
+
+
+def _get_screen(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    project = _project(host)
+    screen = host.view_state()
+    start, end = screen.visible_frames
+    rate = project.rate
+    check = host.check_state()
+    exported = host.export_status()
+    graph = screen.graph_path
+    return {
+        "timeline": {
+            # 人が見ている範囲 「ここ」「見えている所」と言われたときの手掛かり
+            "from_frame": start,
+            "to_frame": end,
+            "from_timecode": format_timecode(start, rate),
+            "to_timecode": format_timecode(end, rate),
+            # 拡大の度合い 1 秒が何画素か（大きいほど寄っている）
+            "pixels_per_second": round(screen.pixels_per_frame * float(rate.fps), 3),
+        },
+        "playing": screen.playing,
+        "playhead": host.playhead,
+        "active_scene": str(host.active_scene) if host.active_scene is not None else None,
+        "graph_editor": {
+            "shown": screen.graph_shown,
+            # get_clip にそのまま渡すと、出ている曲線の値とキーフレームを読める
+            "value": _param_location(graph) if graph is not None else None,
+        },
+        # ステータスバーと書き出しの窓に出ている進み具合 名前と場所は載せない（書き出し先は
+        # export_status で読む 名前と場所として同意を取る）
+        "progress": {
+            "person_export": (
+                None if screen.person_export is None else round(screen.person_export, 3)
+            ),
+            "assistant_export": {
+                "state": exported.get("state"),
+                "progress": exported.get("progress"),
+            },
+            "check_output": {
+                "running": check.running,
+                "progress": round(check.progress, 3),
+            },
+        },
+    }
+
+
+def _rounded(value: float) -> float:
+    # 浮動小数の端（0.30000000000000004 など）は読む AI の邪魔なだけ 画面の欄と同じ程度に丸める
+    return round(float(value), 4)
+
+
+def _keyframe_row(keyframe: Keyframe) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "frame": keyframe.frame,
+        "value": _rounded(keyframe.value),
+        "interpolation": keyframe.interpolation.value,
+    }
+    if keyframe.control_points is not None and keyframe.interpolation is Interpolation.BEZIER:
+        row["control_points"] = [_rounded(point) for point in keyframe.control_points]
+    if keyframe.curve:
+        row["curve"] = keyframe.curve
+    return row
+
+
+#: 全体を読むときに 1 つの値に載せるキーフレームの数 これより多い値は頭の点だけを載せ、全部の数と
+#: 1 つずつ読む引数（more_keyframes）を添える 全部を載せると、読み込んだ細かな動き（数百の点）の
+#: ある値が 1 つあるだけで返事が上限を越え、切られた点を後から取る道が無かった
+#: （#391 の Codex の指摘）
+OVERVIEW_KEYFRAMES = 8
+
+#: 値の在りか（set_param・add_keyframe・get_clip の引数の形 clip_id は除く）を作る
+Locate = Callable[[str], dict[str, Any]]
+
+
+def _value_row(
+    value: ParamValue,
+    duration: int,
+    samples: int,
+    where: dict[str, Any] | None = None,
+) -> Any:
+    """値 1 つ 動かない値は数のまま、キーフレームのある値は点の並び（と曲線の点）
+
+    ``where`` を渡すと全体を読む形で、点が :data:`OVERVIEW_KEYFRAMES` より多ければ頭だけを
+    載せて、全部の数と 1 つずつ読む引数を添える
+    """
+    if isinstance(value, AnimatedValue):
+        if not value.is_animated:
+            return _rounded(value.static)
+        keys = value.keyframes
+        row: dict[str, Any] = {}
+        if where is not None and len(keys) > OVERVIEW_KEYFRAMES:
+            row["keyframes"] = [_keyframe_row(k) for k in keys[:OVERVIEW_KEYFRAMES]]
+            row["keyframe_count"] = len(keys)
+            row["more_keyframes"] = where
+        else:
+            row["keyframes"] = [_keyframe_row(k) for k in keys]
+        if samples:
+            row["samples"] = _sampled(value, duration, samples)
+        return row
+    if isinstance(value, tuple):
+        return [_rounded(entry) for entry in value]
+    return value
+
+
+def _sampled(value: AnimatedValue, duration: int, samples: int) -> list[list[float]]:
+    # 点の間の形（加減速・曲線・名前付きの曲線）は点だけでは分からない グラフエディタと
+    # 同じ式（AnimatedValue.at）で、クリップの頭から終わりまでを等しく分けて引く
+    last = max(duration - 1, 0)
+    frames = sorted({round(last * i / (samples - 1)) for i in range(samples)})
+    return [[frame, _rounded(value.at(frame))] for frame in frames]
+
+
+def _merged(
+    params: dict[str, ParamValue], specs: tuple[Any, ...] | None
+) -> dict[str, tuple[ParamValue, frozenset[Outbound]]]:
+    """設定パネルと同じ値の並びと、それぞれの値を送るのに要る許し（欄の型 #391）
+
+    持っていない欄は既定の値（パネルもそれを出す） クリップが持つ値だけを返すと、触っていない
+    欄が無い物に見え、AI は今の位置や大きさを知らないまま動かす 定義に無い値（読み込んだ
+    スクリプトの古い欄など）も残す ``specs`` が ``None`` なら定義の分からない種類で、どの欄が
+    文か場所か分からないので、文字の値は全部伏せる側に数える（:data:`UNKNOWN_FIELD_SENDS`）
+    """
+    merged: dict[str, tuple[ParamValue, frozenset[Outbound]]] = {}
+    for spec in specs or ():
+        name = str(getattr(spec, "name", ""))
+        needs = field_sends(spec)
+        if name in params:
+            merged[name] = (params[name], needs)
+        elif hasattr(spec, "default_value"):
+            merged[name] = (spec.default_value(), needs)
+    for name, value in params.items():
+        if name not in merged:
+            # 定義に無い欄 型が分からないので、定義の分からない種類と同じく伏せる側に数える
+            merged[name] = (value, UNKNOWN_FIELD_SENDS)
+    return merged
+
+
+def _shown(value: ParamValue, needs: frozenset[Outbound]) -> ParamValue:
+    """送ってよい形の値 文字の欄と場所の欄は、送らない設定なら値ごと印にする（#391）"""
+    shown: ParamValue = masked_value(value, needs)
+    return shown
+
+
+def _values(
+    params: dict[str, ParamValue],
+    specs: tuple[Any, ...] | None,
+    duration: int,
+    samples: int,
+    locate: Locate,
+) -> dict[str, Any]:
+    return {
+        name: _value_row(_shown(value, needs), duration, samples, locate(name))
+        for name, (value, needs) in _merged(params, specs).items()
+    }
+
+
+def _place(**fields: object) -> Locate:
+    """欄の名前から在りかを作る関数 名前のほかは ``fields``（effect_id・stroke_id など）"""
+    return lambda name: {**fields, "name": name}
+
+
+def _effect_rows(
+    effects: tuple[Effect, ...],
+    duration: int,
+    samples: int,
+    *,
+    after: bool = False,
+    stroke_id: str | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for effect in effects:
+        definition = registry.get(effect.kind)
+        specs = definition.parameters if definition is not None else None
+        place: dict[str, object] = {"effect_id": str(effect.id)}
+        if stroke_id is not None:
+            place["stroke_id"] = stroke_id
+        if after:
+            place["after"] = True
+        row: dict[str, Any] = {
+            "effect_id": str(effect.id),
+            "kind": effect.kind,
+            "label": definition.label if definition is not None else effect.kind,
+            "enabled": effect.enabled,
+            "fixed": effect.fixed,
+            "params": _values(effect.params, specs, duration, samples, _place(**place)),
+        }
+        if after:
+            # 場面切り替えの後の場面へ積んだエフェクト 前の場面の物と同じ種類が並びうる
+            row["after"] = True
+        rows.append(row)
+    return rows
+
+
+def _curve_samples(arguments: dict[str, Any]) -> int:
+    raw = arguments.get("samples", 0)
+    if raw is None or raw == 0:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ToolError("samples は整数で渡してください（0 で曲線を引かない）")
+    if not 2 <= raw <= MAX_CURVE_SAMPLES:
+        # 端へ寄せない 1 点では形にならず、多すぎる頼みは返事が上限を越えて一覧が欠ける
+        raise ToolError(f"samples は 2〜{MAX_CURVE_SAMPLES} にしてください（{raw} が来ました）")
+    return raw
+
+
+def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
+    """在りかの送ってよい形の値 持っていない欄は既定の値 無い欄は断る（打ち間違いを空の値で
+    返さない）"""
+    if path.target is ParamTarget.CLIP:
+        if path.name != "opacity":
+            raise ToolError(
+                f"クリップ自身の欄でキーフレームを持てるのは opacity だけです（{path.name}）"
+                " ほかの欄は get_clip を name なしで読みます"
+            )
+        return clip.opacity
+    source = clip.source
+    stroke = _require_stroke(clip, str(path.stroke_id)) if path.stroke_id is not None else None
+    specs: tuple[Any, ...] | None
+    if path.target is ParamTarget.SOURCE:
+        if stroke is not None:
+            params, specs = stroke.params, STROKE.parameters
+        elif source is not None:
+            made = source_registry.get(source.kind)
+            params, specs = source.params, made.parameters if made is not None else None
+        else:
+            raise ToolError("このクリップは中身（テキストや図形）を持ちません effect_id を渡します")
+    else:
+        if stroke is not None:
+            stack = stroke.effects
+        else:
+            stack = clip.after_effects if path.after else clip.effects
+        effect = next((e for e in stack if e.id == path.effect_id), None)
+        if effect is None:
+            raise ToolError(f"エフェクトが見つかりません: {path.effect_id}")
+        definition = registry.get(effect.kind)
+        params, specs = effect.params, definition.parameters if definition is not None else None
+    merged = _merged(params, specs)
+    if path.name not in merged:
+        known = "、".join(merged) or "（欄が無い）"
+        raise ToolError(f"{path.name} という欄は無いです 欄の名前: {known}")
+    value, needs = merged[path.name]
+    return _shown(value, needs)
+
+
+def _value_in_pieces(head: dict[str, Any], value: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """動かない値 1 つ 長い文字（本文・線の点）と長い並び（格子・色の止まり）は区切って返す
+
+    区切らずに返すと、上限を越えた後ろが打ち切られ、続きを取る引数も無かった（#391 の Codex）
+    文字は文字の数、並びは要素の数で ``value_offset`` から区切り、続きは ``next_value_offset``
+    """
+    if not isinstance(value, str | list):
+        return {**head, "value": value}
+    start = max(0, _whole_number(arguments, "value_offset", 0))
+    size = max(1, len(value) - start)
+    while True:
+        piece = value[start : start + size]
+        result: dict[str, Any] = {**head, "value": piece}
+        if start or start + len(piece) < len(value):
+            result["value_length"] = len(value)
+            result["value_offset"] = start
+        if start + len(piece) < len(value):
+            result["next_value_offset"] = start + len(piece)
+            result["note"] = (
+                f"値が長いので {start} から {len(piece)} だけ返した 続きは value_offset に"
+                f" {start + len(piece)} を渡して読む（全 {len(value)}）"
+            )
+        if len(json_text(result)) <= MAX_RESULT_CHARS or size == 1:
+            return result
+        size = max(1, size * 3 // 4)
+
+
+def _get_one_value(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
+    """値 1 つを読む キーフレームは offset と limit で区切り、全部を辿れるようにする"""
+    path = _param_path(clip.id, arguments)
+    value = _one_value(clip, path)
+    head: dict[str, Any] = {"clip_id": str(clip.id), "where": _param_location(path)}
+    if not isinstance(value, AnimatedValue) or not value.is_animated:
+        return _value_in_pieces(head, _value_row(value, clip.duration, 0), arguments)
+    if samples:
+        head["samples"] = _sampled(value, clip.duration, samples)
+    rows = [_keyframe_row(k) for k in value.keyframes]
+    return _paged_after(head, rows, arguments, "keyframes", _CLIP_NOTE)
+
+
+def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
+    track, clip = _target_clip(host, arguments)
+    project = _project(host)
+    samples = _curve_samples(arguments)
+    if arguments.get("name"):
+        return _get_one_value(clip, arguments, samples)
+    if arguments.get("stroke_id"):
+        return _get_stroke(clip, arguments, samples)
+    duration = clip.duration
+    source = clip.source
+    if clip.scene_id is not None:
+        kind = "scene"
+    elif source is not None:
+        kind = source.kind
+    else:
+        kind = "media"
+    head: dict[str, Any] = {
+        "clip_id": str(clip.id),
+        "track_id": str(track.id),
+        "kind": kind,
+        "media_id": str(clip.media_id) if clip.media_id is not None else None,
+        "scene_id": str(clip.scene_id) if clip.scene_id is not None else None,
+        "start": clip.timeline_start,
+        "duration": duration,
+        "start_timecode": format_timecode(clip.timeline_start, project.rate),
+        # クリップ自身の欄（set_clip_property で変える）
+        "enabled": clip.enabled,
+        "blend_mode": clip.blend_mode,
+        "clip_to_below": clip.clip_to_below,
+        "native_size": clip.native_size,
+        "speed": round(float(clip.speed), 4),
+        "source_in_seconds": round(float(clip.source_in), 3),
+        "hold_at_seconds": round(float(clip.hold_at), 3) if clip.hold_at is not None else None,
+        # 不透明度は set_param の target=clip で変える
+        "opacity": _value_row(
+            clip.opacity, duration, samples, {"target": "clip", "name": "opacity"}
+        ),
+    }
+    if source is not None:
+        definition = source_registry.get(source.kind)
+        specs = definition.parameters if definition is not None else None
+        head["params"] = _values(source.params, specs, duration, samples, _place())
+        if source.strokes:
+            # 層ごとの値とエフェクトは載せず、層の一覧だけ 全部を載せると層の多い字で返事が
+            # 上限を越えて切られ、切られた層を後から取る道が無かった（#391 の Codex の指摘）
+            # 値は stroke_id を渡して層ごとに読む（エフェクトは offset で区切る）
+            # 層は多くても MAX_STROKES（8）なので、一覧そのものは区切らなくても収まる
+            head["strokes"] = [
+                {
+                    "stroke_id": str(stroke.id),
+                    "enabled": stroke.enabled,
+                    "effect_count": len(stroke.effects),
+                }
+                for stroke in source.strokes
+            ]
+            head["stroke_count"] = len(source.strokes)
+    rows = _effect_rows(clip.effects, duration, samples)
+    rows += _effect_rows(clip.after_effects, duration, samples, after=True)
+    return _paged_after(head, rows, arguments, "effects", _CLIP_NOTE)
+
+
+def _get_stroke(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
+    """縁取りの層 1 つの値と、層に掛けたエフェクト（offset で区切る）"""
+    stroke = _require_stroke(clip, str(arguments["stroke_id"]))
+    place = str(stroke.id)
+    head: dict[str, Any] = {
+        "clip_id": str(clip.id),
+        "stroke_id": place,
+        "enabled": stroke.enabled,
+        "params": _values(
+            stroke.params, STROKE.parameters, clip.duration, samples, _place(stroke_id=place)
+        ),
+    }
+    rows = _effect_rows(stroke.effects, clip.duration, samples, stroke_id=place)
+    return _paged_after(head, rows, arguments, "effects", _CLIP_NOTE)
+
+
+#: get_clip の返事に添える読み方
+_CLIP_NOTE = (
+    "キーフレームの frame はクリップの頭から数える（タイムラインのフレームは start を足す）"
+    " samples はクリップの頭から終わりまでを等しく分けた所の値 [frame, 値]"
+    " 欄の名前は set_param・add_keyframe の name に、effect_id・stroke_id もそのまま渡せる"
+    f" 点が {OVERVIEW_KEYFRAMES} より多い値は頭の点だけを載せ、keyframe_count に全部の数、"
+    "more_keyframes に読む引数を添える その引数（name と effect_id など）を get_clip に渡すと"
+    "その値の点を全部 offset で区切って読める 縁取りの層の値と層のエフェクトは stroke_id だけを"
+    "渡して層ごとに読む 〔伏せ字〕〔ファイルの場所〕はユーザーが送らないと決めた文字と場所"
+)
+
+
+def _get_compat_report(host: EditorHost, arguments: dict[str, Any]) -> object:
+    report = host.compat_report()
+    head: dict[str, Any] = {
+        # 要約は種類ごとの数だけ（「未実装 API 3 種」） 記録の文は入らない
+        "summary": report.summary,
+        "scripts": report.scripts,
+        "script_folders": [masked_value(folder, _PLACE_ONLY) for folder in report.folders],
+    }
+    # 記録の文は型の無い文字（#391） 未実装の記録は作品の中の名前（オブジェクト・図形・画像の
+    # 名前）と debug_print の文を、制御文字はスクリプトの見出しやテキストの文を、失敗は場所を含む
+    # OS の文言を持ちうる どれも文か場所か分からないので、両方を許したときだけそのまま送る
+    # 種類と回数は残すので、送らない人の所でも穴の数と多さは読める
+    # ただし AviUtl の決まった名前（obj.getpixeldata など）とちょうど一致する記録は、利用者の
+    # 文字が入る余地が無いのでそのまま送る どの API が足りないかを読めることがこの道具の役目
+    rows: list[dict[str, Any]] = [
+        {
+            "kind": "missing_api",
+            "name": name if is_known_record(name) else masked_value(name, UNKNOWN_FIELD_SENDS),
+            "count": count,
+        }
+        for name, count in report.missing
+    ]
+    rows += [
+        {"kind": "control", "name": masked_value(line, UNKNOWN_FIELD_SENDS), "count": count}
+        for line, count in report.controls
+    ]
+    rows += [
+        {
+            "kind": "failure",
+            "name": masked_value(script, UNKNOWN_FIELD_SENDS),
+            "message": masked_value(message, UNKNOWN_FIELD_SENDS),
+        }
+        for script, message in report.failures
+    ]
+    note = (
+        "人が 互換 → 互換性レポート… で見る物と同じ 多い物から並ぶ missing_api は AviUtl の"
+        "スクリプトが呼んだまだ無い API、control は読めなかった制御文字、failure は読み込みや"
+        "実行に失敗したスクリプト 記録を消す・スクリプトを読み直すのは人だけ"
+    )
+    return _paged_after(head, rows, arguments, "records", note)
+
+
 # --- 編集の方針（#343）---
 
 #: 方針の道具が添える断り書き 方針は本人が AI に渡す決まり AI は変えない
@@ -2059,6 +2570,343 @@ def _scene_places(
     return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
 
 
+# --- 盛り上がり（#325）---
+
+#: 区間とみなす点数として受け付ける範囲 小さすぎると、普段の話し声のゆらぎまで区間に並ぶ
+HIGHLIGHT_THRESHOLD_RANGE = (0.1, 1.0)
+#: 最短の区間（秒）の上限 長くすると短い笑いや一瞬の歓声を拾えない
+MAX_HIGHLIGHT_MIN_SECONDS = 60.0
+#: 並べ方 ``score`` は強い順（既定 上位から見たい頼みが多い）、``time`` は時刻の順
+HIGHLIGHT_ORDERS = ("score", "time")
+
+
+@dataclass(frozen=True, slots=True)
+class _HighlightQuery:
+    signals: tuple[str, ...]
+    threshold: float
+    min_seconds: float
+    start: float | None
+    end: float | None
+    order: str
+    audio: int | None
+    wait: float
+
+
+def _highlight_query(media: MediaItem, arguments: dict[str, Any]) -> _HighlightQuery:
+    given = arguments.get("signals")
+    signals: tuple[str, ...]
+    if given is None:
+        signals = HIGHLIGHT_SIGNALS
+    else:
+        if not isinstance(given, list) or not given:
+            raise ToolError(f"signals は {'・'.join(HIGHLIGHT_SIGNALS)} から選んだ並びです")
+        unknown = [str(name) for name in given if name not in HIGHLIGHT_SIGNALS]
+        if unknown:
+            raise ToolError(
+                f"signals に知らない手がかりがあります: {', '.join(unknown)}"
+                f"（{'・'.join(HIGHLIGHT_SIGNALS)} から選ぶ）"
+            )
+        signals = tuple(name for name in HIGHLIGHT_SIGNALS if name in given)
+    order = str(arguments.get("order") or "score")
+    if order not in HIGHLIGHT_ORDERS:
+        raise ToolError(f"order は {'・'.join(HIGHLIGHT_ORDERS)} のどれかです")
+    start = _optional_number(arguments, "from_seconds", 0.0)
+    end = _optional_number(arguments, "to_seconds", 0.0)
+    if start is not None and end is not None and end <= start:
+        raise ToolError("to_seconds は from_seconds より後にしてください")
+    return _HighlightQuery(
+        signals=signals,
+        threshold=_number_or(
+            arguments, "threshold", HIGHLIGHT_THRESHOLD, *HIGHLIGHT_THRESHOLD_RANGE
+        ),
+        min_seconds=_number_or(
+            arguments, "min_seconds", HIGHLIGHT_MIN_SECONDS, 0.0, MAX_HIGHLIGHT_MIN_SECONDS
+        ),
+        start=start,
+        end=end,
+        order=order,
+        audio=_audio_stream(media, arguments),
+        wait=_number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT),
+    )
+
+
+def _find_highlights(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の盛り上がりの区間を一覧する 動きを見るのに場面の解析が要れば待ってから返す"""
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    query = _highlight_query(media, arguments)
+    hears = bool({HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD} & set(query.signals))
+    sees = HIGHLIGHT_MOTION in query.signals
+    if not (hears and media.has_audio) and not (sees and media.has_video):
+        # 調べられる手がかりが 1 つも無い 空の一覧を返すと「盛り上がりは無い」と読まれる
+        raise ToolError(
+            f"{media.name} では頼んだ手がかり（{'・'.join(query.signals)}）を調べられません"
+            " 笑い声と音量は音声から、動きは映像から見ます"
+        )
+    if not sees or not media.has_video:
+        return _highlight_result(host, media, query, None, arguments)
+    # 動きは場面の解析（#319 #321）が覚えた差の並びを使い回す 素材を読み直さない
+    host.request_scenes(media)
+    state = host.scene_state(media)
+    if state.complete or not state.running or query.wait <= 0:
+        return _highlight_result(host, media, query, state, arguments)
+    media_id = media.id
+
+    def finish() -> object:
+        # 待っている間に素材が外されたら断る（場面の検出と同じ）
+        again = _require_media(_project(host), str(media_id))
+        return _highlight_result(host, again, query, host.scene_state(again), arguments)
+
+    return Pending(wait=host.scene_waiter(media_id), seconds=query.wait, then=finish)
+
+
+def _highlight_result(
+    host: EditorHost,
+    media: MediaItem,
+    query: _HighlightQuery,
+    state: SceneState | None,
+    arguments: dict[str, Any],
+) -> object:
+    notes: list[str] = []
+    missing: list[str] = []
+    complete = True
+    waveform: Waveform | None = None
+    hears = [name for name in query.signals if name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD)]
+    if hears and media.has_audio:
+        # 音は取り込んだときに作った波形のピークを使い回す（無音カットと同じ物）
+        waveform = host.waveform(media, query.audio)
+        if waveform is None:
+            host.analyze(media)
+            complete = False
+            missing.extend(hears)
+            notes.append("音の解析（波形）がまだです 少し待ってから同じ引数で呼ぶと音も調べます")
+    elif hears:
+        missing.extend(hears)
+        notes.append("音声の無い素材なので、笑い声と音量は調べていません")
+    scenes: SceneSignal | None = None
+    if HIGHLIGHT_MOTION in query.signals:
+        if not media.has_video:
+            missing.append(HIGHLIGHT_MOTION)
+            notes.append("映像の無い素材なので、動きは調べていません")
+        elif state is not None:
+            scenes, complete = _highlight_scenes(media, state, notes, missing, complete)
+    transcript = media.transcript_for(query.audio)
+    if HIGHLIGHT_LAUGHTER in missing and transcript and transcript.segments:
+        # 波形を待つ間も、字幕の笑いの印（笑いの主な手がかり）で笑い声を探す 動きが
+        # 見られるときだけ外すと、取り込んだ直後の映像の素材で主な手がかりを黙って落とし、
+        # AI は unavailable を見て「笑いは調べていない」と読む
+        missing = [name for name in missing if name != HIGHLIGHT_LAUGHTER]
+    looked = [name for name in query.signals if name not in missing]
+    if not looked:
+        raise ToolError(" ".join(notes))
+    duration = float(media.duration)
+    curves = highlight_curves(
+        duration,
+        waveform=waveform,
+        scenes=scenes,
+        transcript=transcript if HIGHLIGHT_LAUGHTER in looked else None,
+        signals=looked,
+    )
+    found = [
+        item
+        for item in curves.highlights(query.threshold, query.min_seconds)
+        if (query.start is None or item.end > query.start)
+        and (query.end is None or item.start < query.end)
+    ]
+    if query.order == "score":
+        found.sort(key=lambda item: (-item.score, item.start))
+    project = _project(host)
+    # 区間を探したのと同じ絵と音を出すクリップの位置だけを返す 別の映像や別の音声の
+    # クリップを混ぜると、preview_range で見せる所に探した盛り上がりが無い
+    sources = _HighlightSources(
+        video=_video_stream(media, scenes.stream)
+        if scenes is not None and HIGHLIGHT_MOTION in looked
+        else None,
+        audio=media.transcript_stream(query.audio)
+        if any(name in looked for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD))
+        else None,
+    )
+    rows = [_highlight_row(project, media, item, looked, sources) for item in found]
+    common: dict[str, Any] = {
+        "media_id": str(media.id),
+        "signals": looked,
+        "complete": complete,
+        "duration_seconds": round(duration, 3),
+        "threshold": query.threshold,
+        "order": query.order,
+    }
+    if media.has_audio and hears:
+        common["audio"] = _audio_number(media, query.audio)
+    if missing:
+        common["unavailable"] = missing
+    if not rows and complete:
+        notes.append("盛り上がりが見つかりません threshold を下げると弱い所も拾います")
+
+    def page(given: dict[str, Any]) -> dict[str, Any]:
+        result = _paged(rows, given, name="highlights")
+        told = [str(result.pop("note"))] if "note" in result else []
+        result |= common
+        if told or notes:
+            result["note"] = " ".join(told + notes)
+        return result
+
+    # 一覧の外側（調べられなかった理由の文に素材の名前や失敗の文が入る）の分も上限に収める
+    # 一覧だけで見積もる _paged の取り置き（600 字）を越えると、返事の後ろが打ち切られる
+    result = page(arguments)
+    while len(json_text(result)) > MAX_RESULT_CHARS and result["count"] > 1:
+        result = page({**arguments, "limit": max(1, result["count"] * 3 // 4)})
+    return result
+
+
+def _highlight_scenes(
+    media: MediaItem,
+    state: SceneState,
+    notes: list[str],
+    missing: list[str],
+    complete: bool,
+) -> tuple[SceneSignal | None, bool]:
+    """場面の解析の今から、動きに使う差の並び 途中なら読んだ所までを使う"""
+    if state.signal is None:
+        missing.append(HIGHLIGHT_MOTION)
+        if state.failure is not None:
+            notes.append(f"{media.name} の映像を調べられず、動きは見ていません: {state.failure}")
+        else:
+            notes.append("映像の解析がまだなので、動きは見ていません 少し待って呼び直してください")
+        return None, False
+    signal = state.signal
+    if signal.broken:
+        # 呼び直しても同じ所で止まる 待てば続きが出ると読ませない（場面の検出と同じ）
+        # それでも後ろは読めていないので完了とは言わない（場面の検出の complete も偽）
+        # 受け取った complete を返すと、波形があるときや動きだけを頼んだときに true になり、
+        # 読めなかった後ろに盛り上がりは無いと読ませる
+        notes.append(
+            f"素材が途中で壊れていて、動きは {round(signal.analyzed, 1)} 秒までしか見ていません"
+            " 呼び直しても続きは出ません"
+        )
+        return signal, False
+    if not signal.complete:
+        notes.append(
+            f"映像の解析の途中です 動きは {round(signal.analyzed, 1)} 秒まで見ました"
+            " しばらくしてから同じ引数で呼ぶと続きも見ます"
+            if state.running
+            else "映像の解析が止まりました もう 1 度呼ぶと頼み直します"
+        )
+        return signal, False
+    return signal, complete
+
+
+@dataclass(frozen=True, slots=True)
+class _HighlightSources:
+    """区間を探した絵と音のストリーム（素材の中の ``index``） 調べていない側は ``None``"""
+
+    video: int | None
+    audio: int | None
+
+
+def _highlight_row(
+    project: Project,
+    media: MediaItem,
+    item: Highlight,
+    looked: list[str],
+    sources: _HighlightSources,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "start_seconds": item.start,
+        "end_seconds": item.end,
+        "peak_seconds": item.peak,
+        "score": round(item.score, 3),
+        "reasons": list(item.reasons),
+    }
+    for name, value in (
+        (HIGHLIGHT_LAUGHTER, item.laughter),
+        (HIGHLIGHT_LOUD, item.loud),
+        (HIGHLIGHT_MOTION, item.motion),
+    ):
+        if name in looked and value is not None:
+            row[name] = value
+    if item.laughter_from_subtitles:
+        row["laughter_from_subtitles"] = True
+    # 音の手がかりで拾っていない区間（動きだけ）は、音のクリップとして数えない 数えると
+    # 絵を止めた混合トラックのクリップで hold_at を越えた範囲を返し、preview_range で
+    # 止まった絵しか出ない所を見せる 絵の側は区間の手がかりに関係なく数える 笑いや音量の
+    # 区間でも、調べた映像を描くクリップならその時刻の絵が出る（止めた所までは）
+    # どの手がかりも半分に届かない区間（reasons が空）は、どちらで拾ったか分からないので両方を見る
+    heard = not item.reasons or any(
+        name in item.reasons for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD)
+    )
+    row["timeline"] = _highlight_places(
+        project, media, item, sources if heard else replace(sources, audio=None)
+    )
+    return row
+
+
+def _highlight_places(
+    project: Project, media: MediaItem, item: Highlight, sources: _HighlightSources
+) -> list[dict[str, Any]]:
+    """区間が出る今のタイムラインの範囲（フレーム） 頂の絵が出るフレームも添える
+
+    絵のクリップも音のクリップも見る 笑い声と音量は音のクリップにしか無いことがある
+    リンクした絵と音は同じ範囲になるので 1 つにまとめる（同じ範囲が 2 行並ぶと、AI が
+    2 か所あると読む）
+
+    絵は動きを調べた映像（``sources.video``）を描くクリップ、音は笑い声と音量を調べた音声
+    （``sources.audio``）を鳴らすクリップだけを数える（場面の検出の :func:`_scene_places` と
+    同じ訳） 鳴らす音声は :func:`heard_stream` で引く 混合トラックの ``stream_index`` は
+    絵の番号なので、それで比べると違う言語の音のクリップを返す 絵を止めた
+    （``hold_at``）クリップは止めた時刻までしか絵が進まないので、絵の範囲はそこで切る
+    音は止めないので切らない
+    """
+    rate = project.rate
+    start, end, peak = (Fraction(str(value)) for value in (item.start, item.end, item.peak))
+    places: dict[tuple[int, int], dict[str, Any]] = {}
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.media_id != media.id:
+                continue
+            low = max(start, clip.source_in)
+            high = min(end, clip.source_out(rate))
+            hears = (
+                sources.audio is not None
+                and project.plays_sound(track, clip)
+                and media.transcript_stream(heard_stream(track, clip)) == sources.audio
+            )
+            if not hears:
+                draws = (
+                    sources.video is not None
+                    and project.draws_picture(track, clip)
+                    and _video_stream(media, clip.stream_index) == sources.video
+                )
+                if not draws:
+                    continue
+                if clip.hold_at is not None:
+                    high = min(high, clip.hold_at)
+            if low >= high:
+                continue
+            first = clip.timeline_start + seconds_to_frame(
+                (low - clip.source_in) / clip.speed, rate, Rounding.FLOOR
+            )
+            last = clip.timeline_start + seconds_to_frame(
+                (high - clip.source_in) / clip.speed, rate, Rounding.CEIL
+            )
+            first, last = max(first, clip.timeline_start), min(last, clip.timeline_end)
+            if first >= last or (first, last) in places:
+                continue
+            place: dict[str, Any] = {
+                "clip_id": str(clip.id),
+                "start_frame": first,
+                "end_frame": last,
+            }
+            if low <= peak < high:
+                place["peak_frame"] = min(
+                    last - 1,
+                    clip.timeline_start
+                    + seconds_to_frame((peak - clip.source_in) / clip.speed, rate, Rounding.FLOOR),
+                )
+            places[(first, last)] = place
+    ordered = sorted(places.values(), key=lambda place: int(place["start_frame"]))
+    return ordered[:MAX_PLACES_PER_CUT]
+
+
 # --- 画面の中身（文字と顔の位置 #324）---
 
 #: 顔の確からしさの下限の既定 手元の見本（群衆の写真）で本物の顔が 0.79〜0.92 だった
@@ -2345,20 +3193,31 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
     request = _check_request(host, arguments)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    # 頼みの控えを取り、この後の直しを別の段に区切る（#339） 数えは結果を使えたときに確定する
+    # 引数を確かめた後にする 断った呼び出しで区切ると、引数を直して呼び直すだけで段が割れる
+    # 書き出した動画のファイルを調べるときは控えを取らず区切らない（直し方を返さないので
+    # 直す回が無い）
+    ticket = start_check(host.document, host.fix_rounds) if request.project is not None else None
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
-        return _check_result(host, request, state, arguments)
+        return _check_result(host, request, state, arguments, ticket)
     return Pending(
         wait=host.check_waiter(),
         seconds=wait,
-        then=lambda: _check_result(host, request, host.check_state(), arguments),
+        then=lambda: _check_result(host, request, host.check_state(), arguments, ticket),
     )
 
 
 def _check_result(
-    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+    host: EditorHost,
+    request: CheckRequest,
+    state: CheckState,
+    arguments: dict[str, Any],
+    ticket: CheckTicket | None,
 ) -> object:
+    # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
+    # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
     report = state.report
@@ -2367,6 +3226,21 @@ def _check_result(
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
     timeline = request.project is not None
+    # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
+    # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
+    # 古い作品の物で、今の作品へ直しを当てると消えた・動いたクリップを触る 取り消して同じ形へ
+    # 戻っただけなら同じ作品として直しを返す
+    stale = request.project is not None and _project(host) != request.project
+    # 途中までの結果（走っている・止められた・終わっていない）でも直さない 途中で直すと、続きを
+    # 読む呼び出しが調べ直しになって新しい回に数えられ、残りの問題を見ないまま直す
+    unsettled = stale or state.running or state.stopped or not report.complete
+    rounds: FixRound | None = None
+    if ticket is not None:
+        rounds = (
+            current_round(host.document, host.fix_rounds)
+            if unsettled
+            else settle_check(host.document, ticket, host.fix_rounds)
+        )
     rate = request.project.rate if request.project is not None else None
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
@@ -2381,18 +3255,30 @@ def _check_result(
             "detail": problem.detail,
             **problem.measure,
         }
+        if "text" in row:
+            # はみ出した字幕の文の頭（本人の文） 字幕と文字を送らない人には値ごと伏せる（#391）
+            row["text"] = masked_value(row["text"], _TEXT_ONLY)
         if rate is not None:
             row["timecode"] = format_timecode(problem.start, rate)
         if problem.clip_ids:
             row["clip_ids"] = list(problem.clip_ids)
         if problem.ongoing:
             row["ongoing"] = True
+        # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
+        row["fix"] = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
     notes = [str(result.pop("note"))] if "note" in result else []
     severities: dict[str, int] = {}
+    fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
+        action = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        )
+        fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2407,7 +3293,10 @@ def _check_result(
             "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
             "counts": report.counts(),
             "severities": severities,
+            # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
+            "fixes": fixes,
         },
+        "fix_round": None if rounds is None else rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2433,14 +3322,56 @@ def _check_result(
         notes.append("問題は見つかりませんでした")
     elif not report.problems and report.checked:
         notes.append("調べた種類（checks）には問題がありませんでした")
-    if request.project is not None and _project(host) != request.project:
+    if stale:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
-            " 今の作品を調べるにはもう 1 度呼んでください"
+            " この結果からは直さず（直す回も数えていません）、もう 1 度呼んで今の作品を"
+            "調べ直し、その結果の fix に従ってください"
         )
+    elif unsettled and timeline:
+        notes.append(
+            "検査が終わっていないので、この結果からはまだ直さないでください（直す回も数えて"
+            "いません） 終わった結果の fix に従ってください"
+        )
+    else:
+        notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき
+    ``unsettled`` は使えない結果（途中まで・止められた・調べている間に作品が変わった）"""
+    if rounds is None:
+        return {"timeline": False}
+    return {"closed": rounds.closed, "unsettled": unsettled}
+
+
+def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:
+    """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds is None:
+        return [
+            "書き出した動画のファイルを調べた結果です 今の作品から書き出した物かは確かめて"
+            "いないので、今の作品は直さないでください 直すなら path を省いてタイムラインを"
+            "調べ直してください"
+        ]
+    if rounds.closed:
+        if rounds.limit == 0:
+            return [
+                "本人の設定で、検査の後に直さないことになっています（直す回数の上限 0）"
+                " この指示ではもう編集できません 見つかった問題を人へ伝えてください"
+            ]
+        return [
+            f"直す回数の上限（{rounds.limit} 回）に達しました この指示ではもう編集できません"
+            " 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を人へ伝えてください"
+        ]
+    if fixes[FIX_AUTO]:
+        return [
+            f"fix の action が auto の物を直してから、もう 1 度 check_output で調べてください"
+            f"（{rounds.next_round} 回目の直し 上限 {rounds.limit} 回）"
+        ]
+    return []
 
 
 # --- 音の推移と見分け（#322 #338）---
@@ -3567,6 +4498,13 @@ def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
         raise ToolError("name が空です")
     effect_id = str(arguments.get("effect_id") or "")
     stroke_id = str(arguments.get("stroke_id") or "")
+    after = _flag_argument(arguments, "after", False)
+    if after:
+        # 場面切り替えの後の場面に積んだエフェクト get_clip が after を付けて返した引数を、
+        # そのまま書く道具へ渡せるようにする 渡せないと前の場面を探して見つからない（#391）
+        if not effect_id or stroke_id:
+            raise ToolError("after は場面切り替えの後の場面のエフェクト（effect_id）にだけ付けます")
+        return ParamPath.of_effect(clip_id, EffectId(effect_id), name, after=True)
     if stroke_id:
         # テキストの縁取りの層の項目か、層に掛けたエフェクトの項目
         if effect_id:
@@ -3586,9 +4524,19 @@ def _set_param(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
     value = arguments.get("value")
-    resolved = _coerce_param(_project(host), path, value)
+    project = _project(host)
+    resolved = _coerce_param(project, path, value)
+    spec = _spec_for(project, path)
     host.apply_commands([SetParam(path, resolved)], f"{path.name} を変更")
-    return {"name": path.name, "value": str(value)}
+    # 返す値も欄の型で伏せる（get_clip と同じ #391） 定義の分からない欄の文字は伏せる側に数える
+    # クリップ自身の欄（不透明度）は定義を持たないが文字ではない
+    if spec is not None:
+        needs = field_sends(spec)
+    elif path.target is ParamTarget.CLIP:
+        needs = frozenset()
+    else:
+        needs = UNKNOWN_FIELD_SENDS
+    return {"name": path.name, "value": masked_value(str(value), needs)}
 
 
 def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
@@ -3608,7 +4556,10 @@ def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
     )
 
     if path.target is ParamTarget.EFFECT and path.effect_id is not None:
-        stack = stroke.effects if stroke is not None else clip.effects
+        if stroke is not None:
+            stack = stroke.effects
+        else:
+            stack = clip.after_effects if path.after else clip.effects
         effect = next((e for e in stack if e.id == path.effect_id), None)
         definition = registry.get(effect.kind) if effect is not None else None
         return definition.spec(path.name) if definition is not None else None
@@ -3674,10 +4625,23 @@ def _parse_color(text: str) -> tuple[float, ...] | None:
     return tuple(channels)
 
 
+#: 書く道具の after の引数 get_clip が後の場面のエフェクトの行に付けて返す物と同じ
+_AFTER_ARGUMENT = _boolean(
+    "effect_id のエフェクトが場面切り替えの後の場面にある（get_clip の行の after をそのまま渡す）"
+)
+
+#: add_keyframe で選べる補間 曲線（bezier）は制御点を渡す口が無いので外す
+_KEY_INTERPOLATIONS = " / ".join(i.value for i in Interpolation if i is not Interpolation.BEZIER)
+
+
 def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
-    frame = int(arguments.get("frame", host.playhead))
+    # キーの位置はクリップの頭から数える（get_clip と設定パネルと同じ） 省いたときは設定パネルの
+    # ◆ と同じく再生ヘッドの所（クリップの外なら近い端） タイムラインの再生ヘッドをそのまま
+    # 使うと、頭が 0 でないクリップでは再生ヘッドよりずっと後ろ（クリップの外）にキーが入る
+    default = min(max(host.playhead - clip.timeline_start, 0), max(clip.duration - 1, 0))
+    frame = int(arguments.get("frame", default))
     try:
         value = float(arguments["value"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -3687,8 +4651,13 @@ def _add_keyframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     try:
         interpolation = Interpolation(name)
     except ValueError as exc:
-        choices = "、".join(i.value for i in Interpolation)
-        raise ToolError(f"補間は {choices} のどれかです") from exc
+        raise ToolError(f"補間は {_KEY_INTERPOLATIONS} のどれかです") from exc
+    if interpolation is Interpolation.BEZIER:
+        # 曲線は制御点が要るが、この道具では渡せない 渡さずに作ると点を作る所で落ち、AI には
+        # 何を直せばよいかの分からない失敗が返る
+        raise ToolError(
+            f"bezier は制御点が要るので打てません {_KEY_INTERPOLATIONS} から選んでください"
+        )
 
     host.apply_commands(
         [SetKeyframe(path, frame, value, interpolation)], f"{path.name} にキーフレーム"
@@ -3846,6 +4815,193 @@ def _emphasize(host: EditorHost, arguments: dict[str, Any]) -> object:
             ),
         }
     )
+    return result
+
+
+# --- 縦動画への再構図（#334）---
+
+#: 返事に載せる場面の数 長い作品で何百も並ぶと、返事がそれだけで埋まる 残りは数だけ書く
+_SHOTS_SHOWN = 40
+
+
+def _reframe_size(host: EditorHost, arguments: dict[str, Any]) -> tuple[int, int]:
+    """作る大きさ 省けば本人の設定（表示 → 設定… の縦動画への作り替え）"""
+    width, height = arguments.get("width"), arguments.get("height")
+    if (width is None) != (height is None):
+        raise ToolError(
+            "width と height は両方渡すか、両方省いてください（省くと本人の設定の大きさ）"
+        )
+    if width is None or height is None:
+        return host.reframe_style.resolution
+    size = (_integer_value(width, "width"), _integer_value(height, "height"))
+    for name, value in zip(("width", "height"), size, strict=True):
+        if not MIN_RESOLUTION <= value <= MAX_RESOLUTION or value % 2:
+            raise ToolError(
+                f"{name} は {MIN_RESOLUTION}〜{MAX_RESOLUTION} の偶数にしてください（{value}）"
+                " 書き出しの色の持ち方（yuv420p）は奇数の大きさを断る"
+            )
+    return size
+
+
+def _reframe_request(host: EditorHost, arguments: dict[str, Any]) -> ReframeRequest:
+    style = host.reframe_style
+    width, height = _reframe_size(host, arguments)
+    follow = arguments.get("follow", style.follow)
+    if not isinstance(follow, str) or follow not in REFRAME_FOLLOWS:
+        raise ToolError(
+            f"follow は {'・'.join(REFRAME_FOLLOWS)} のどれかです（{follow!r} が来ました）"
+        )
+    smooth = arguments.get("smooth_ms", style.smooth_ms)
+    smooth_ms = _integer_value(smooth, "smooth_ms")
+    low, high = REFRAME_SMOOTH_MS_RANGE
+    if not low <= smooth_ms <= high:
+        raise ToolError(f"smooth_ms は {low}〜{high} にしてください（{smooth_ms}）")
+    return ReframeRequest(width, height, follow, smooth_ms, host.subtitle_wrap_share)
+
+
+def _reframe(host: EditorHost, arguments: dict[str, Any]) -> object:
+    if host.active_scene is not None:
+        # 解像度は作品で 1 つ 開いたシーンだけを作り替えると、メインとほかのシーンが
+        # 縦の画面に横の配置のまま残る 道具はメインとすべてのシーンをまとめて変える
+        raise ToolError(
+            "シーンを開いたままでは作り替えられません（解像度は作品全体で 1 つなので、"
+            "メインとすべてのシーンをまとめて作り替えます） set_active_scene でメインに"
+            "戻してから呼んでください"
+        )
+    request = _reframe_request(host, arguments)
+    wait = _number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT)
+    project = _project(host)
+    if (request.width, request.height) == project.settings.resolution:
+        raise ToolError(f"作品はもう {request.width}x{request.height} です")
+    media = [] if request.follow == CENTER else tracked_media(project)
+    for item in media:
+        # 取り込み時の解析を切った人のところでも、被写体の並びが無ければここで頼む
+        host.request_scenes(item)
+    pending = [item.id for item in media if _still_analyzing(host.scene_state(item))]
+    if not pending or wait <= 0:
+        return _reframe_now(host, request)
+    waiters = [host.scene_waiter(media_id) for media_id in pending]
+
+    def ready(seconds: float) -> bool:
+        # ブリッジは中断を見ながら短い間ずつ呼ぶ 1 本ずつ待てば、待つ長さは呼ばれた秒を越えない
+        return all(waiter(seconds) for waiter in waiters)
+
+    return Pending(wait=ready, seconds=wait, then=lambda: _reframe_now(host, request))
+
+
+def _still_analyzing(state: SceneState) -> bool:
+    return not state.complete and state.running
+
+
+def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
+    """解析を待った後に呼ぶ 待つ間に作品が変わっていても、今の作品で組み直す"""
+    if host.active_scene is not None:
+        # 待つ間（最長 2 分）に人がシーンを開くと、読む作品のメインがシーンのタイムラインに
+        # 替わり、命令も開いたシーンへ包まれる メインとすべてのシーンの作り替えが別の所へ当たる
+        raise ToolError(
+            "解析を待っている間にシーンが開かれたので、何も変えていません"
+            " set_active_scene でメインに戻してから呼び直してください"
+        )
+    project = _project(host)
+    if (request.width, request.height) == project.settings.resolution:
+        raise ToolError(f"作品はもう {request.width}x{request.height} です")
+    media = [] if request.follow == CENTER else tracked_media(project)
+    gathered = gather_signals(media, host.scene_state)
+    untracked = [str(media_id) for media_id in gathered.untracked]
+    if gathered.waiting:
+        # 途中までの並びで組むと、読んでいない所の枠が真ん中に止まり、呼び直しても直らない
+        return {
+            "changed": False,
+            "complete": False,
+            "waiting_media": [str(media_id) for media_id in gathered.waiting],
+            "note": (
+                "被写体を見積もる解析（場面の解析と同じ読み込み）がまだ終わっていません"
+                " 何も変えていません しばらくしてから同じ引数で呼んでください"
+                " follow を center にすると待たずに真ん中を切り出します"
+            ),
+        }
+    try:
+        plan = plan_reframe(project, request, gathered.signals)
+    except ReframeError as exc:
+        raise ToolError(str(exc)) from exc
+    before = project.settings.resolution
+    host.apply_commands(plan.commands, f"縦の作品に作り替え: {request.width}x{request.height}")
+    return _reframe_result(plan, request, before, untracked)
+
+
+def _reframe_result(
+    plan: ReframePlan,
+    request: ReframeRequest,
+    before: tuple[int, int],
+    untracked: list[str],
+) -> dict[str, Any]:
+    window = plan.window
+    crop = window.size
+    shots = [
+        {
+            "scene_id": None if note.scene_id is None else str(note.scene_id),
+            "start_frame": note.start,
+            "end_frame": note.end,
+            "mode": note.mode,
+            # 枠の中心（前の画面の中央からの画素 Y は上が正） 追う場面は頭の位置
+            "focus_x": round(note.focus[0], 1),
+            "focus_y": round(note.focus[1], 1),
+            "keyframes": note.points,
+            "no_clue": note.no_clue,
+            "clip_id": note.clip_id,
+        }
+        for note in plan.shots[:_SHOTS_SHOWN]
+    ]
+    notes = [
+        "背景の動画と画像は、前の画面に置いた枠の中を縦の画面いっぱいに映すよう配置の"
+        "拡大率と位置の線を変えました（枠は場面ごとに被写体へ合わせ、動く場面は位置に"
+        "キーフレームを打ちました） 文字と重ねた物は縦の画面の同じ割合の所へ置き直し、"
+        "文字は縦の画面の幅で折り返しました 取り消し 1 回で横の作品に戻ります",
+        "今の作品を書き換えています 横の作品も残したいなら、人に save_project_as で別の名前に"
+        "保存するよう伝えてください",
+        "被写体は動きと肌色だけから見積もります（顔は見分けません 肌色に近い壁や床・"
+        "動く背景にも寄ります） preview_range か contact_sheet で枠に人が入っているかを"
+        "確かめ、外れた場面は背景のクリップの位置（pos_x）の点を set_param・add_keyframe で"
+        "直してください 字幕のはみ出しは check_output で調べられます",
+    ]
+    if any(note.no_clue for note in plan.shots):
+        notes.append("no_clue の場面は動きも肌色も見つからず、絵の真ん中を切り出しました")
+    if untracked:
+        notes.append(
+            "untracked_media の素材は場面の解析ができず、被写体を追わずに真ん中を切り出しました"
+        )
+    if plan.held:
+        notes.append(
+            "held_clips は前から位置が動いている（寄りやパン）ので、動きを残してそのクリップの間は"
+            "枠を止めました"
+        )
+    if plan.skipped:
+        notes.append(
+            "skipped のクリップは作り替えられず、前の配置のままです 理由を人に伝えてください"
+        )
+    result: dict[str, Any] = {
+        "changed": True,
+        "resolution": f"{request.width}x{request.height}",
+        "previous_resolution": f"{before[0]}x{before[1]}",
+        "follow": request.follow,
+        "smooth_ms": request.smooth_ms,
+        "crop": {
+            "width": round(crop[0], 1),
+            "height": round(crop[1], 1),
+            "scale_percent": round(window.scale * 100.0, 1),
+        },
+        "shots": shots,
+        "shot_count": len(plan.shots),
+        "backgrounds": len(plan.backgrounds),
+        "overlays": len(plan.overlays),
+        "wrapped_texts": len(plan.wrapped),
+        "held_clips": plan.held,
+        "skipped": [{"clip_id": clip_id, "reason": reason} for clip_id, reason in plan.skipped],
+        "untracked_media": untracked,
+        "note": " ".join(notes),
+    }
+    if len(plan.shots) > _SHOTS_SHOWN:
+        result["shots_note"] = f"場面は {len(plan.shots)} 個 頭の {_SHOTS_SHOWN} 個だけを載せました"
     return result
 
 
@@ -5663,6 +6819,11 @@ _LOOKS_AND_PLACES_IN_PROJECT = frozenset({Outbound.PROJECT, Outbound.APP_SETTING
 #: 仕上がりの検査（#337） 問題の時刻とクリップ ID に、本人の設定（音量の基準）と、
 #: 調べた動画の場所・調べられなかった理由（素材の名前が入りうる）が載る
 _CHECKS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 字幕と文字 本人の文を返すが、道具の役目は文ではない物（検査の一覧・互換性レポート #391）は
+#: hidden にも書き、送らない人には断らずに値を型で伏せる（masked_value）
+_TEXT_ONLY = frozenset({Outbound.TEXT})
+#: 名前と場所だけ（置き場のフォルダ）
+_PLACE_ONLY = frozenset({Outbound.FILES})
 #: 音量の推移のグラフ（#338） 検査と同じ物に、絵（グラフの画像）が加わる 字幕は重なる時刻だけを
 #: 使い、文は返さない
 _SOUND_PICTURE = frozenset(
@@ -5677,6 +6838,9 @@ _EMPHASIS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: ジャンプカットのつなぎ目（#332） フレームとクリップ ID に、本人の設定（処理の種類と長さの
 #: 既定）が載る 断る文に出るのはクリップ ID だけ
 _SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
+#: 縦動画への再構図（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さの既定が載る
+#: 素材の名前は返さない（解析を待つ素材も ID だけ）
+_REFRAME = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
 _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
@@ -5695,7 +6859,10 @@ _CONVERSATION = frozenset({Outbound.CONVERSATION})
 OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="get_project",
-        description="プロジェクトの設定（解像度・fps・長さ）と再生ヘッドの位置を返す",
+        description=(
+            "プロジェクトの設定（解像度・fps・長さ）と再生ヘッドの位置、開いているタイムラインの"
+            "書き出し範囲（work_area 無ければ null）を返す"
+        ),
         schema=_schema({}),
         handler=_get_project,
         sends=_WITH_FILES,
@@ -5735,10 +6902,71 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="get_selection",
-        description="選択中のクリップと再生ヘッドの位置",
+        description=(
+            "人が選んでいる物 タイムラインのクリップ（clip_id が設定パネルに出ている 1 本）・"
+            "再生ヘッドの位置・素材一覧で選んでいる素材（media_id）・字幕パネルが出している"
+            "素材と音声と選んでいる行（subtitles） 「これ」「選んだ」と言われたらまず読む"
+        ),
         schema=_schema({}),
         handler=_get_selection,
         sends=_STRUCTURE,
+    ),
+    # 人が画面で見ている物（読み取りの同等性 #352）
+    Operation(
+        name="get_screen",
+        description=(
+            "人が画面で見ている表示の様子を読む タイムラインに見えている範囲と拡大の度合い・"
+            "再生しているか・グラフエディタを出しているかと出している値（get_clip にそのまま"
+            "渡せる）・書き出しと仕上がりの検査の進み具合（人が書き出しの窓で始めた物も）"
+            " 「見えている所」「今出ているグラフ」と言われたときに読む 読むだけで表示は変えない"
+        ),
+        schema=_schema({}),
+        handler=_get_screen,
+        # 返すのはフレーム・ID・進み具合の数だけ 書き出し先の場所は返さない（export_status）
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="get_clip",
+        description=(
+            "クリップ 1 本の値を、設定パネルとグラフエディタに出ている物と同じだけ読む"
+            " クリップ自身の欄・不透明度・中身（テキストや図形）の値・縁取りの層・エフェクトの"
+            "値（触っていない欄は既定の値） キーフレームのある値は点の並び（frame はクリップの"
+            "頭から数える 補間の種類と曲線の制御点つき） samples を渡すと、点の間の形（曲線）も"
+            "等しく分けた所の値で返す 値を変える前に今の値を読む 点の多い値は頭の点だけを載せ、"
+            "more_keyframes の引数で読み直すとその値の点を全部区切って読める エフェクトの一覧"
+            "（effects）は" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("読むクリップ 省くと選択中のクリップ（設定パネルに出ている物）"),
+                "name": _string(
+                    "値 1 つだけを読むときの欄の名前 渡すとその値のキーフレームを全部、offset と"
+                    " limit で区切って返す（全体の点が切られた値の more_keyframes の引数）"
+                ),
+                "effect_id": _string("name の値があるエフェクト"),
+                "value_offset": _integer(
+                    "name の値が長い文字や並びのとき、何文字目（何番目）から返すか"
+                    "（続きは返事の next_value_offset）"
+                ),
+                "stroke_id": _string(
+                    "縁取りの層 name なしで渡すと、その層の値と層のエフェクト（offset で区切る）を"
+                    "読む name と渡すとその層の値 1 つ"
+                ),
+                "target": _string("name の値の在りか source か clip（clip は opacity）"),
+                "after": _boolean("name の値が場面切り替えの後の場面のエフェクトにある"),
+                "samples": _integer(
+                    f"キーフレームのある値ごとに曲線を引く点の数（2〜{MAX_CURVE_SAMPLES}"
+                    " 省くと引かない）"
+                ),
+                **_paging(),
+            }
+        ),
+        handler=_get_clip,
+        # 値にはテキストの本文（字幕と文字）と、画像を読むエフェクトのファイルの場所（名前と場所）が
+        # 入りうる 本文は値を変える道具と同じく、送らないと決めた人には断らずに伏せて返す
+        # 道具の役目は色や位置などの値を読むことで、断ると本文の無いクリップの値まで読めなくなる
+        sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
+        hidden=_HIDDEN_IN_VALUES,
     ),
     Operation(
         name="list_effects",
@@ -6017,6 +7245,59 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
     ),
     Operation(
+        name="find_highlights",
+        description=(
+            "素材の盛り上がりの区間を一覧する（読むだけ） 手がかりは笑い声（laughter）・"
+            "音量の山（loud 普段の大きさより大きい所）・動きの大きい所（motion 切り替わりを除いた"
+            "フレーム間の差）の 3 つで、どれも 0〜1 の点 score は「どれか 1 つでも強ければ高い」形"
+            "で合わせた点 素材を読み直さず、取り込んだときに作った波形と場面の解析を使うので速い"
+            " 区間の秒は素材の秒 timeline は区間が出る今のタイムラインの範囲（start_frame〜"
+            "end_frame）と頂（peak_frame preview_frame や preview_range へそのまま渡せる）"
+            " 見つけた区間は preview_range で動きを、字幕で中身を確かめてから使う"
+            f" 限り: {LAUGHTER_LIMITS} 音量の山は素材の中の普段との比べで、ずっと大きい素材では"
+            "山にならない 動きは画面全体の明るさの差なので、明るさが急に変わる所（フラッシュ・"
+            "照明）も動きに数え、小さく映った人の動きは拾いにくい"
+            " 映像の解析が終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
+            "読んだ所までで返す（complete が false）" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "signals": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(HIGHLIGHT_SIGNALS)},
+                    "description": "見る手がかり 省くと全部",
+                },
+                "threshold": _number(
+                    f"区間とみなす点 {HIGHLIGHT_THRESHOLD_RANGE[0]:g}〜"
+                    f"{HIGHLIGHT_THRESHOLD_RANGE[1]:g}（既定 {HIGHLIGHT_THRESHOLD:g}） 小さいほど"
+                    "弱い盛り上がりも拾う"
+                ),
+                "min_seconds": _number(
+                    f"これより短い区間は返さない秒（既定 {HIGHLIGHT_MIN_SECONDS:g}）"
+                ),
+                "from_seconds": _number("この素材の秒より後に掛かる区間だけ"),
+                "to_seconds": _number("この素材の秒より前に掛かる区間だけ"),
+                "order": {
+                    "type": "string",
+                    "enum": list(HIGHLIGHT_ORDERS),
+                    "description": "並べ方 score（強い順 既定）か time（時刻の順）",
+                },
+                "audio": _integer("調べる音声の番号（1 から 既定 1）"),
+                "wait_seconds": _number(
+                    f"映像の解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 0 なら待たずに読んだ所までで返す"
+                ),
+                **_paging(),
+            },
+            ["media_id"],
+        ),
+        handler=_find_highlights,
+        # 結果は素材の秒・点・タイムラインの位置（編集の構成） 調べられなかった理由の文には
+        # 素材の名前が入る 字幕は笑いの印を探すのに読むが、文は結果に入れない
+        sends=_WITH_FILES,
+    ),
+    Operation(
         name="detect_text",
         description=(
             "素材（動画）の画面の中の文字（テロップ・看板・スライド）を読む（OCR 読むだけ） "
@@ -6100,7 +7381,12 @@ OPERATIONS: tuple[Operation, ...] = (
             "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
             " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
             " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
-            + PAGING_NOTE
+            " 各問題の fix は直し方（action が auto は直してよい・ask は人に尋ねてから・"
+            "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
+            " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
+            " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
+            "その指示ではもう編集できない path で書き出した動画を調べた結果は、今の作品から"
+            "書き出した物とは限らないので fix がどれも handoff になり、回数も数えない" + PAGING_NOTE
         ),
         schema=_schema(
             {
@@ -6161,7 +7447,10 @@ OPERATIONS: tuple[Operation, ...] = (
         # 調べられなかった理由の文には素材の名前や場所が入りうる 場所は形で、名前は表で伏せる
         # target は "timeline" も取るので、値ごと伏せる欄（name_keys）には入れない
         # 音量の基準（本人の設定 Preferences.check_loudness_target）も結果に載る
-        sends=_CHECKS,
+        # 字幕のはみ出しの行には、はみ出した文の頭（本人の文）が載る 字幕と文字を送らない人には
+        # 断らずに値ごと伏せる（#391 道具の役目は問題の一覧で、断ると黒いコマも調べられない）
+        sends=_CHECKS | _TEXT_ONLY,
+        hidden=_TEXT_ONLY,
     ),
     Operation(
         name="analyze_audio",
@@ -6267,6 +7556,22 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_app_settings,
         sends=_APP_SETTINGS,
+    ),
+    Operation(
+        name="get_compat_report",
+        description=(
+            "互換性レポートを読む（画面の 互換 → 互換性レポート… と同じ中身） AviUtl の"
+            "スクリプトが呼んだまだ無い API・読めなかった制御文字・読み込めなかったスクリプトを"
+            "多い順に並べる 読み込んだ作品の見た目が AviUtl と違う訳を探すときに読む"
+            " 読むだけで、記録を消す・読み直すのは人だけ 一覧（records）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_get_compat_report,
+        # 本人のアプリが覚えた記録 スクリプトの置き場の場所と、失敗の文に混ざる場所（OS の文言）、
+        # 記録の文に混ざる作品の中の名前や文（オブジェクトの名前・debug_print・制御文字の行）が
+        # 入りうる 文は送らない人にも断らず、記録の文を値ごと伏せて種類と回数だけを返す（#391）
+        sends=_APP_SETTINGS | _TEXT_ONLY,
+        hidden=_TEXT_ONLY,
     ),
     # 編集の方針（#343） 人は ファイル → プロジェクト設定… で書く AI は読むだけ
     Operation(
@@ -6778,13 +8083,15 @@ OPERATIONS: tuple[Operation, ...] = (
                 "effect_id": _string("エフェクト"),
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
+                "after": _AFTER_ARGUMENT,
                 "name": _string("パラメータ名"),
                 "value": {"description": "新しい値"},
             },
             ["name", "value"],
         ),
         handler=_set_param,
-        sends=_WITH_TEXT,
+        # 返す値は場所の欄（画像・音声のファイル）なら場所 名前と場所を断った人には型で伏せる
+        sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
         hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
@@ -6797,10 +8104,16 @@ OPERATIONS: tuple[Operation, ...] = (
                 "effect_id": _string("エフェクト"),
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
+                "after": _AFTER_ARGUMENT,
                 "name": _string("パラメータ名"),
-                "frame": _integer("位置 省略すると再生ヘッド"),
+                "frame": _integer(
+                    "位置（クリップの頭から数えたフレーム get_clip の keyframes と同じ）"
+                    " 省略すると再生ヘッドの所"
+                ),
                 "value": _number("その位置での値"),
-                "interpolation": _string("linear / ease / hold / bezier"),
+                "interpolation": _string(
+                    f"次の点までの動き方 {_KEY_INTERPOLATIONS}（既定 linear）"
+                ),
             },
             ["name", "value"],
         ),
@@ -6884,6 +8197,54 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_emphasize,
         writes=True,
         sends=_EMPHASIS,
+    ),
+    Operation(
+        name="reframe",
+        description=(
+            "横の作品を縦（9:16 など）の作品に作り替える 解像度を変え、背景の動画と画像は前の画面に"
+            "置いた縦の枠の中を縦の画面いっぱいに映し、枠は場面ごとに被写体へ合わせる"
+            "（止める・追う） 文字・図形・小さい画像などの重ねた物は縦の画面の同じ割合の所へ"
+            "置き直し、文字は縦の画面の幅で折り返し、はみ出す位置なら内側へ寄せる"
+            " メインとすべてのシーンをまとめて変え、取り消し 1 回で戻る 今の作品を書き換えるので、"
+            "横の作品を残すなら save_project_as で別の名前に保存するよう人に伝える"
+            " 被写体は場面の解析（detect_scenes と同じ読み込み）のついでに、動きと肌色だけから"
+            "見積もる（顔や人は見分けない 肌色に近い壁や床・動く背景・焼き込まれた字幕の出入りにも"
+            "寄る 位置の細かさは素材の幅の 1/32 ほど） 解析が終わっていなければ wait_seconds まで"
+            "待ち、それでも終わらなければ何も変えずに戻る 終わったら preview_range か"
+            " contact_sheet で枠を確かめ、外れた場面は背景のクリップの pos_x の点を直す"
+            " 大きさ・枠の動かし方・ならす長さを省くと本人の設定（表示 → 設定… の"
+            "縦動画への作り替え）を使う 開いているシーンがあれば断る（メインに戻してから）"
+            " ロックしたトラックに動かす物があれば断る"
+        ),
+        schema=_schema(
+            {
+                "width": _integer(
+                    f"作る横の画素（偶数 width と height は両方か両方省く 省くと本人の設定"
+                    f" よく使うのは {'・'.join(REFRAME_SIZES)}）"
+                ),
+                "height": _integer("作る縦の画素（偶数）"),
+                "follow": {
+                    "type": "string",
+                    "enum": list(REFRAME_FOLLOWS),
+                    "description": (
+                        "枠の動かし方 auto は被写体が枠に収まる場面は止め、収まらない場面は追う"
+                        " steady は場面ごとに止める follow はなめらかに追う center は追わずに"
+                        "真ん中を切り出す（解析を待たない） 省くと本人の設定"
+                    ),
+                },
+                "smooth_ms": _integer(
+                    f"追うときにならす長さ（ミリ秒 {REFRAME_SMOOTH_MS_RANGE[0]}"
+                    f"〜{REFRAME_SMOOTH_MS_RANGE[1]} 長いほどゆっくり動く 省くと本人の設定）"
+                ),
+                "wait_seconds": _number(
+                    f"解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 待ちきれなければ何も変えずに戻る"
+                ),
+            }
+        ),
+        handler=_reframe,
+        writes=True,
+        sends=_REFRAME,
     ),
     Operation(
         name="set_subtitle_text",

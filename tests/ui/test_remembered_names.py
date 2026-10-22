@@ -50,15 +50,22 @@ TEXT_SOURCES = {
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
 #: テンプレートの棚（#328）も本人の置き場の物 名前はアプリの設定として送り、フォルダの名前は
 #: 名前と場所（一覧の folder の項目で伏せる） ファイルの場所は道具から返さない
-#: 強調の動きの強さと長さの既定（#331）も本人の設定
+#: 強調の動きの強さと長さの既定（#331）も本人の設定 縦動画への作り替えの既定（#334）も
+#: 検査の直しの回数の上限（#339）も本人の設定で、
+#: check_output が結果の fix_round に載せる（sends にアプリの設定を書いてある）
 OWN_LIBRARY = {
+    "fix_rounds",
     "saved_looks",
     "look_rules",
     "loudness_target",
     "duck_shape",
     "emphasis_style",
     "seam_style",
+    "reframe_style",
     "template_shelf",
+    # 互換性レポート（#352） 本人のアプリが覚えた記録 スクリプトの置き場の場所は一覧の
+    # script_folders の項目で値ごと伏せ、失敗の文に混ざる場所は形で伏せる
+    "compat_report",
     # AI に見せる絵の長い辺の上限（#344） 絵を返す道具が縮めた訳と断りの文に載せる
     "image_edge",
 }
@@ -79,6 +86,8 @@ PROJECT_SIDE = {
     "undo",
     "redo",
     "stop_playback",
+    # 人が見ている表示（#352） 返すのはフレーム・ID・進み具合の数だけで、名前と場所は持たない
+    "view_state",
     "render_png",
     # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く
     "start_sheet",
@@ -238,6 +247,10 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # 互換性レポート（#352） 本人のアプリの記録を返す
+            "get_compat_report",
+            # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
+            "reframe",
             # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る
             "preview_frame",
             "contact_sheet",
