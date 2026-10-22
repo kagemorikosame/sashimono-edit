@@ -162,6 +162,73 @@ class TestDeclarations:
         assert not [name for name in properties if "round" in name or "fix" in name]
 
 
+def _finish_file(host: FakeHost, path: Path, runs: list[Run]) -> dict[str, Any]:
+    """書き出した動画のファイルを調べ、終わった様子を入れてから結果を読む"""
+    arguments = {"path": str(path), "wait_seconds": 0}
+    _tool("check_output")(host, arguments)
+    request: CheckRequest = host.check_requests[-1]
+    report = assemble(
+        runs,
+        start=0,
+        end=300,
+        analyzed=300,
+        fps=30.0,
+        complete=True,
+        limits=request.limits,
+        index=None,
+        loudness=-20.0,
+        peak=0.5,
+        length_seconds=None,
+    )
+    host.check = CheckState(request=request, report=report)
+    result = _tool("check_output")(host, arguments)
+    assert isinstance(result, dict)
+    return result
+
+
+class TestFiles:
+    """書き出した動画のファイルを調べたときは、今の作品を変える直し方を返さない（Codex P1）
+
+    ファイルが今の作品から書き出した物かは確かめていない 古い書き出しや別の作品の動画でも
+    作品のフォルダか書き出しのフォルダにあれば調べられる
+    """
+
+    @pytest.fixture
+    def written(self, host: FakeHost, tmp_path: Path) -> Path:
+        host.exported_to = tmp_path
+        path = tmp_path / "前の書き出し.mp4"
+        path.write_bytes(b"x" * 10)
+        return path
+
+    def test_a_file_check_offers_no_fix_on_the_open_work(
+        self, host: FakeHost, written: Path
+    ) -> None:
+        """壊れると、古い書き出しや別の作品の動画の音量を見て、今開いている関係の無い作品の
+        音量を AI が normalize_loudness で変えてしまう"""
+        result = _finish_file(host, written, [_MIXED_CLIP, Run(BLACK, 100, 110, {})])
+        assert result["problems"]
+        for problem in result["problems"]:
+            assert problem["fix"]["action"] in (HANDOFF, LEAVE), problem
+            assert problem["fix"]["tools"] == []
+        assert result["summary"]["fixes"][AUTO] == 0
+        assert result["summary"]["fixes"][ASK] == 0
+        assert result["fix_round"] is None
+        assert "タイムラインを調べ直" in result["note"]
+
+    def test_a_file_check_does_not_count_or_split(self, host: FakeHost, written: Path) -> None:
+        """壊れると、書き出した動画を確かめただけで直す回が減るか、上限に達して編集を断られる"""
+        host.fix_limit = 0
+        host.document.begin_checkpoint("AI: 確かめて", by=Author.AI)
+        _fix(host, "編集")
+        _finish_file(host, written, [_MIXED_CLIP])
+        _fix(host, "続き")
+        _finish_file(host, written, [_MIXED_CLIP])
+        assert not fixes_closed(host.document)
+        assert host.document.checkpoint_label == "AI: 確かめて"
+        host.document.end_checkpoint()
+        assert host.document.history_labels[-1] == "AI: 確かめて"
+
+
 class TestAnswer:
     def test_each_problem_says_how_to_fix_it(self, host: FakeHost) -> None:
         """壊れると、AI はどの道具で直すか・尋ねるべきかを知らずに、見つけた物を

@@ -163,6 +163,12 @@ PASSES_AFTER_LIMIT = frozenset({"undo", "redo", "cancel_export"})
 #: 上限に達した後の直し方 直さずに人へ渡す
 _CLOSED = "直す回数の上限に達したので、直さずに人へ伝える"
 
+#: 書き出した動画のファイルを調べたときの直し方 今の作品と同じ物かは分からないので直さない
+_FILE = (
+    "書き出した動画のファイルの問題 今の作品から書き出した物かは確かめていないので、今の作品は"
+    "直さない 直すなら path を省いてタイムラインを調べ直す"
+)
+
 
 def _variant(kind: str, measure: Mapping[str, object]) -> str | None:
     if kind != CLIPPING:
@@ -171,10 +177,22 @@ def _variant(kind: str, measure: Mapping[str, object]) -> str | None:
 
 
 def fix_for(
-    kind: str, severity: str, measure: Mapping[str, object], *, closed: bool = False
+    kind: str,
+    severity: str,
+    measure: Mapping[str, object],
+    *,
+    closed: bool = False,
+    timeline: bool = True,
 ) -> Fix:
-    """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す"""
+    """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す
+
+    ``timeline`` が偽（書き出した動画のファイルを調べた）なら、直す物も人へ渡す ファイルが
+    今の作品から書き出した物かは確かめていない（古い書き出しや別の作品の動画も、作品のフォルダか
+    書き出しのフォルダにあれば調べられる） 直す道具を返すと、AI が関係の無い今の作品を変える
+    """
     fix = FIXES.get((kind, severity, _variant(kind, measure)), _UNKNOWN)
+    if not timeline and fix.action in (AUTO, ASK):
+        return Fix(HANDOFF, (), f"{_FILE}（{fix.how}）")
     if closed and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_CLOSED}（{fix.how}）")
     return fix

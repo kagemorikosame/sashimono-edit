@@ -2349,7 +2349,8 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
     # 直した回を数え、この後の直しを別の段に区切る（#339） 引数を確かめた後にする
     # 断った呼び出しまで数えると、AI が引数を直して呼び直すだけで直す回が減る
-    rounds = start_check(host.document, host.fix_rounds)
+    # 書き出した動画のファイルを調べるときは数えず区切らない（直し方を返さないので直す回が無い）
+    rounds = start_check(host.document, host.fix_rounds) if request.project is not None else None
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
@@ -2366,7 +2367,7 @@ def _check_result(
     request: CheckRequest,
     state: CheckState,
     arguments: dict[str, Any],
-    rounds: FixRound,
+    rounds: FixRound | None,
 ) -> object:
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
@@ -2398,7 +2399,7 @@ def _check_result(
             row["ongoing"] = True
         # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
         row["fix"] = fix_for(
-            problem.kind, problem.severity, problem.measure, closed=rounds.closed
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds)
         ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
@@ -2407,7 +2408,7 @@ def _check_result(
     fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
-        action = fix_for(problem.kind, problem.severity, problem.measure, closed=rounds.closed)
+        action = fix_for(problem.kind, problem.severity, problem.measure, **_fix_state(rounds))
         fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
@@ -2426,7 +2427,7 @@ def _check_result(
             # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
             "fixes": fixes,
         },
-        "fix_round": rounds.as_dict(),
+        "fix_round": None if rounds is None else rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2463,8 +2464,21 @@ def _check_result(
     return result
 
 
-def _round_notes(rounds: FixRound, fixes: dict[str, int]) -> list[str]:
+def _fix_state(rounds: FixRound | None) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき"""
+    if rounds is None:
+        return {"timeline": False}
+    return {"closed": rounds.closed}
+
+
+def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:
     """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds is None:
+        return [
+            "書き出した動画のファイルを調べた結果です 今の作品から書き出した物かは確かめて"
+            "いないので、今の作品は直さないでください 直すなら path を省いてタイムラインを"
+            "調べ直してください"
+        ]
     if rounds.closed:
         if rounds.limit == 0:
             return [
@@ -6144,7 +6158,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
             " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
             " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
-            "その指示ではもう編集できない" + PAGING_NOTE
+            "その指示ではもう編集できない path で書き出した動画を調べた結果は、今の作品から"
+            "書き出した物とは限らないので fix がどれも handoff になり、回数も数えない" + PAGING_NOTE
         ),
         schema=_schema(
             {
