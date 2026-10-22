@@ -376,6 +376,58 @@ def test_reason_and_status_outside_the_list_are_refused(tool: ModuleType, tmp_pa
     assert len(tool.read_results(results)) == 1
 
 
+def _strict_rows(path: Path) -> list[Any]:
+    """標準の JSON だけを読む NaN や Infinity が混じれば止まる（厳格な読み手と同じ）"""
+
+    def refuse(constant: str) -> Any:
+        raise ValueError(f"標準の JSON に無い値: {constant}")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line, parse_constant=refuse) for line in lines if line]
+
+
+def test_non_finite_numbers_never_reach_the_results(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NaN や Infinity は結果の行に裸で書かれず、引数なら断り、数えた値なら「測れない」にすること
+
+    書かれると標準の JSON でなくなり、厳格な読み手（ほかの言語や道具）が結果の行を読めない
+    引数の誤りを走らせた後の書く段で断ると数分が無駄になり、何がいけないかも分からない
+    """
+    tool, eval_dir, book = folder
+    results = tmp_path / "out.jsonl"
+    good = {"material": "E01", "task": "silence", "status": "ok", "stage": "tools"}
+    for bad in (
+        {"params": {"threshold_db": float("nan")}},
+        {"metrics": {"iou": float("inf")}},
+    ):
+        with pytest.raises(tool.LeakError):
+            tool.append_results(results, [{**good, **bad}], [])
+        assert not results.exists()
+
+    # 引数の入口と、台本から作るときの入口の両方で断る
+    with pytest.raises(SystemExit):
+        tool.main(["run", "--padding", "nan"])
+    assert "有限の数を入れる" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="有限の数"):
+        tool.ToolParams(silence_threshold_db=float("-inf"))
+
+    # 数えた値の -inf（無音の音量など）は、その回を止めずに「測れない」と書く
+    tool.command_draft(eval_dir, book, [], transcriber=_fake_transcriber)
+    records = tool.command_run(
+        eval_dir,
+        book,
+        ["E02"],
+        results=results,
+        transcriber=_fake_transcriber,
+        exporter=lambda *_: {"problems": 0, "loudness": float("-inf"), "complete": True},
+        commit="abc",
+    )
+    export = next(r for r in records if r["task"] == "export")
+    assert (export["status"], export["metrics"]["loudness"]) == ("ok", None)
+    assert len(_strict_rows(results)) == len(records)
+
+
 def test_reason_list_matches_the_docs(tool: ModuleType) -> None:
     """docs/evaluation.md の「状態と理由」の表と、台本の一覧が同じであること
 

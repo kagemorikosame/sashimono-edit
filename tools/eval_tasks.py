@@ -260,7 +260,8 @@ class EvalDir:
         # その場で上書きすると、書く途中で落ちたときに切れたファイルが残り、本人が数時間かけて
         # 直した正解（同じファイルに入っている）まで読めなくなる 作り直せないので fsync もする
         self.answers.mkdir(parents=True, exist_ok=True)
-        text = json.dumps(answer, ensure_ascii=False, indent=1)
+        # 裸の NaN を書くと、次に読むときに厳格な読み手が正解のファイルを読めない
+        text = json.dumps(answer, ensure_ascii=False, indent=1, allow_nan=False)
         write_atomic(self.answer_path(material), text + "\n", durable=True)
 
 
@@ -305,6 +306,20 @@ class ToolParams:
     scene_threshold: float | None = None
     min_scene: float | None = None
     asr_model: str | None = None
+
+    def __post_init__(self) -> None:
+        # nan や inf は結果の行に書けない（標準の JSON に無い値で、厳格な読み手が行を読めない）
+        # 道具を走らせてから書く段で止まると数分が無駄になるので、作る所で断る
+        for name in (
+            "silence_threshold_db",
+            "min_silence",
+            "padding",
+            "scene_threshold",
+            "min_scene",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{name} に有限の数でない値（{value}）は使えない")
 
     def record(self, task: str) -> dict[str, float | str]:
         """結果の行に残す値 課題に関係する物だけ"""
@@ -698,7 +713,36 @@ def subtitle_scores(
 # --- 結果の行 ---
 
 
+def finite_metrics(metrics: Mapping[str, object]) -> dict[str, object]:
+    """数えた値のうち有限でない数（無音の音量の -inf など）を ``None``（測れない）にする
+
+    そのまま渡すと書く前の確かめで止まり、その回のほかの課題の結果まで 1 行も残らない
+    数えた値は道具の都合で測れないことがあるので、止めずに「測れない」と書く
+    引数から来る値（params）は人が直せるので、ここでは直さず確かめで断る
+    """
+    return {
+        key: None if isinstance(value, float) and not math.isfinite(value) else value
+        for key, value in metrics.items()
+    }
+
+
+def finite_float(text: str) -> float:
+    """引数の数を読む nan や inf は、何がいけないかを書いて断る（結果の行に書けないため）"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"数ではない: {text}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            f"有限の数を入れる（nan や inf は結果の行に書けないので使えない）: {text}"
+        )
+    return value
+
+
 def _check_value(value: object, where: str, names: Sequence[str]) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        # 書くと標準の JSON に無い裸の NaN や Infinity になり、厳格な読み手が結果の行を読めない
+        raise LeakError(f"{where} が有限の数でない")
     if value is None or isinstance(value, bool | int | float):
         return
     if isinstance(value, str):
@@ -758,7 +802,10 @@ def append_results(
     _mend_tail(path)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         for record in records:
-            file.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+            # allow_nan=False は守りの 2 段目 確かめを抜けて来ても裸の NaN を書かずに止まる
+            file.write(
+                json.dumps(record, ensure_ascii=True, sort_keys=True, allow_nan=False) + "\n"
+            )
 
 
 class BrokenResultsError(RuntimeError):
@@ -1292,7 +1339,7 @@ def command_run(
                     record.update(
                         status="ok",
                         seconds=round(time.perf_counter() - began, 2),
-                        metrics=metrics,
+                        metrics=finite_metrics(metrics),
                         params={"subtitles": transcript is not None},
                     )
                 elif truth is None:
@@ -1306,7 +1353,9 @@ def command_run(
                             status="ok",
                             provisional=bool(truth.get("provisional", True)),
                             seconds=prediction.seconds,
-                            metrics=score(task, prediction.value, with_facts(truth, facts), book),
+                            metrics=finite_metrics(
+                                score(task, prediction.value, with_facts(truth, facts), book)
+                            ),
                             params=resolved.record(task),
                         )
             except TranscribeError as error:
@@ -1378,11 +1427,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def tool_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("ids", nargs="*", help="素材の番号（省くと全部）")
-        command.add_argument("--silence-threshold-db", type=float, default=-40.0)
-        command.add_argument("--min-silence", type=float, default=0.5)
-        command.add_argument("--padding", type=float, default=0.1)
-        command.add_argument("--scene-threshold", type=float)
-        command.add_argument("--min-scene", type=float)
+        command.add_argument("--silence-threshold-db", type=finite_float, default=-40.0)
+        command.add_argument("--min-silence", type=finite_float, default=0.5)
+        command.add_argument("--padding", type=finite_float, default=0.1)
+        command.add_argument("--scene-threshold", type=finite_float)
+        command.add_argument("--min-scene", type=finite_float)
         command.add_argument("--asr-model")
 
     draft = sub.add_parser("draft", help="仮の正解と直す用の .sme を作る")
