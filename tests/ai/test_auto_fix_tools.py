@@ -278,6 +278,29 @@ class TestAutoColor:
         assert work.host.analyzed == [work.media.id]
         assert work.host.document.project == work.project
 
+    def test_every_missing_thumbnail_is_asked_for_at_once(self, work: Work) -> None:
+        # 壊れると、何本かの素材を選んだとき 1 本目のサムネイル待ちで断り、残りの素材の用意を
+        # 頼まないので、素材の数だけ呼び直すことになる（#387 の CodeRabbit の指摘）
+        with pytest.raises(ToolError, match="サムネイルがまだ") as caught:
+            _call(
+                work.host,
+                "auto_color",
+                {"clip_ids": [str(work.picture.id), str(work.second.id)]},
+            )
+        assert sorted(work.host.analyzed) == sorted([work.media.id, work.other.id])
+        assert work.media.name in str(caught.value) and work.other.name in str(caught.value)
+        assert work.host.document.project == work.project
+
+    def test_a_missing_reference_is_asked_for_with_the_targets(self, work: Work) -> None:
+        # 壊れると、合わせる相手のサムネイル待ちで断ったとき、直すクリップの素材の用意を頼まない
+        with pytest.raises(ToolError, match="サムネイルがまだ"):
+            _call(
+                work.host,
+                "auto_color",
+                {"clip_ids": [str(work.picture.id)], "match_clip_id": str(work.second.id)},
+            )
+        assert sorted(work.host.analyzed) == sorted([work.media.id, work.other.id])
+
     def test_a_text_clip_is_refused(self, work: Work) -> None:
         # 壊れると、測る絵の無いテキストに補正を積み、色を整えたと返す
         with pytest.raises(ToolError, match="素材の絵を描くクリップではありません"):
@@ -375,6 +398,16 @@ class TestReduceNoise:
         assert operation is not None and Outbound.FILES in operation.sends
         assert work.host.analyzed == [work.media.id]
         assert work.host.document.project == work.project
+
+    def test_every_missing_waveform_is_asked_for_at_once(self, work: Work) -> None:
+        # 壊れると、何本かの素材を選んだとき 1 本目の波形待ちで断り、残りの素材の解析を頼まない
+        # （色の道具と同じ形の穴が無いことを見張る #387 の CodeRabbit の指摘）
+        other_sound = replace(make_clip(150, 150, work.other), stream_index=1)
+        work.host.apply_commands([AddClip(work.audio.id, other_sound)], "人")
+        with pytest.raises(ToolError, match="波形解析がまだ") as caught:
+            _call(work.host, "reduce_noise", {"track_id": str(work.audio.id)})
+        assert sorted(set(work.host.analyzed)) == sorted([work.media.id, work.other.id])
+        assert work.media.name in str(caught.value) and work.other.name in str(caught.value)
 
     def test_a_picture_clip_is_refused(self, work: Work) -> None:
         # 壊れると、音の鳴らない絵のクリップにノイズ除去を積み、減らしたと返す

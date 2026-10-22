@@ -28,6 +28,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     Effect,
+    MediaId,
     MediaItem,
     Project,
     Track,
@@ -171,11 +172,14 @@ def plan_color_fix(
     """クリップの絵を測り、拡張色調補正を積む（もうあれば置き換える）命令を作る"""
     if not request.exposure and not request.white_balance:
         raise ToolError("exposure と white_balance の両方を false にすると何も直しません")
-    reference: Any = None
+    model: Clip | None = None
     if request.match is not None:
         _, model = picture_clip(project, request.match, editing=False)
         if any(clip.id == model.id for clip in targets):
             raise ToolError("合わせる相手（match_clip_id）を直すクリップに入れないでください")
+    _require_strips(source, project, [*targets, *([model] if model is not None else [])])
+    reference: Any = None
+    if model is not None:
         reference = _clip_pixels(source, project, model, graded_head=True)
     rows: list[dict[str, Any]] = []
     unchanged: list[ClipId] = []
@@ -215,6 +219,32 @@ def plan_color_fix(
             row["notes"] = list(plan.notes)
         rows.append(row)
     return ColorFix(tuple(commands), tuple(rows), tuple(unchanged))
+
+
+def _require_strips(source: FixSource, project: Project, clips: list[Clip]) -> None:
+    """測るクリップの素材のサムネイルがそろっているかを先に見る 足りなければ全部の用意を頼んで断る
+
+    1 本ずつ測りながら断ると、1 本目のまだの素材で止まって残りの用意を頼まず、素材の数だけ
+    呼び直すことになる（#387 の CodeRabbit の指摘） 何も作らずに断るのは今までと同じ
+    名前は素材の名前なので、名前と場所を送らない人にはブリッジが伏せる（ほかの断りの文と同じ）
+    """
+    waiting: dict[MediaId, MediaItem] = {}
+    for clip in clips:
+        media = project.find_media(clip.media_id) if clip.media_id is not None else None
+        if media is None or media.id in waiting:
+            continue
+        strip = source.filmstrip(media, clip.stream_index)
+        if strip is None or strip.count == 0:
+            waiting[media.id] = media
+    if not waiting:
+        return
+    for media in waiting.values():
+        source.analyze(media)
+    names = "、".join(media.name for media in waiting.values())
+    raise ToolError(
+        f"{names} のサムネイルがまだできていません（取り込みの後に裏で作る） 何も変えていません"
+        " 少し待ってからもう 1 度呼んでください"
+    )
 
 
 def _clip_tiles(source: FixSource, project: Project, clip: Clip) -> list[Any]:
