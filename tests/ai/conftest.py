@@ -41,6 +41,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
@@ -112,6 +113,8 @@ class FakeHost:
         self.narration = NarrationSettings(url=CLOSED_ENGINE_URL)
         #: 書いたナレーションの WAV（場所と中身）
         self.narrations: list[tuple[Path, bytes]] = []
+        #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
+        self.reframing = ReframeStyle()
         #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
         self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
@@ -309,6 +312,10 @@ class FakeHost:
         # 本物と同じ書き方（書いてから名前を付け、許した後に現れた名前は潰さない）
         write_atomic_bytes(path, data, expect=expect)
         self.narrations.append((path, data))
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self.reframing
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)
