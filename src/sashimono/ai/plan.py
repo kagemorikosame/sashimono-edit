@@ -122,6 +122,9 @@ class Stopped(Enum):
     #: 使う量の上限（#344）で止めた 手順の途中で止まったかもしれない
     #: 応え終えた・中断と書くと、上限を広げれば続けられることが読めない
     LIMIT = "使う量の上限で止めました"
+    #: 検査の直しの回数の上限（#339）に達し、ブリッジが残りの編集を断った 手順の途中で
+    #: 止まったかもしれない 応え終えたと書くと、設定で回数を増やせば続けられることが読めない
+    FIX_LIMIT = "検査の直しの回数の上限で止めました"
     #: 頼まれずに応え終えた（質問した・できずに諦めたなど）
     ENDED = "手順を残して応え終えました"
 
@@ -346,11 +349,14 @@ class WorkPlan:
             self._paused = False
             self._stopped = None
 
-    def end_turn(self, *, interrupted: bool, limited: bool = False) -> None:
+    def end_turn(self, *, interrupted: bool, limited: bool = False, fixed: bool = False) -> None:
         """指示が終わった 手順が残っていれば、止まった訳を覚える
 
         ``limited`` は使う量の上限（#344）で止めた指示 上限で止めた後も道具を呼び続けて
         会話ごと止めた（中断）ときも、止めた訳は上限 会話の欄の区切りの行（「上限で停止」）と揃える
+        ``fixed`` は検査の直しの回数の上限（#339）に達した指示 区切りまで来て止めた後なら
+        ブリッジは区切りの方を先に断るので、訳は区切り まだ区切りに来ていなければ、残りの
+        編集を断ったのは回数の上限なので、止めを頼んであっても訳は回数の上限
         """
         with self._lock:
             unfinished = any(not step.state.finished for step in self._steps)
@@ -359,6 +365,10 @@ class WorkPlan:
                     self._stopped = Stopped.LIMIT
                 elif interrupted:
                     self._stopped = Stopped.INTERRUPTED
+                elif self._paused:
+                    self._stopped = Stopped.PAUSED
+                elif fixed:
+                    self._stopped = Stopped.FIX_LIMIT
                 elif self._pause_requested:
                     self._stopped = Stopped.PAUSED
                 else:

@@ -32,6 +32,7 @@ from functools import partial
 from typing import Any
 
 from sashimono.ai.budget import LimitAction, Overrun, UsageMeter
+from sashimono.ai.fixes import PASSES_AFTER_LIMIT, fixes_closed
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
@@ -266,12 +267,19 @@ class EditorBridge:
         道具の確かめの窓を出さない
         使う量の上限（#344）は区切りの後、同意の前に見る 止めた計画の道具に「上限を広げて
         続けますか」を尋ねると、広げた後に区切りで断るだけになる
+        検査の直しの回数の上限（#339）も区切りの後 先に見ると、区切りで止めた人の計画が
+        「直しの回数の上限」で止まったように読め、設定を変えても区切りで断るだけになる
         """
         paused = self.plan.refusal(operation.name)
         if paused:
             raise ToolError(paused)
         # 量の上限は同意より先に見る 上限で止まる道具の同意を尋ねても、答えた後に断るだけになる
         self._keep_within_budget(operation)
+        # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを
+        # 尋ねると、人が答えた後で断るだけになる 量の上限の後にするのは、量の上限で止めたときは
+        # 「道具を使わずに終える」と返す方が、上限の種類にかかわらず AI の次の手が決まるため
+        if operation.writes and not operation.irreversible:
+            self._refuse_after_fix_limit(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -320,6 +328,24 @@ class EditorBridge:
                 result = self.call(partial(self._run, operation, result.step))
             else:
                 return result
+
+    def _refuse_after_fix_limit(self, operation: Operation) -> None:
+        """検査の直しの回数が上限に達した指示では、取り消せる編集を断る（#339）
+
+        回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 送る前の同意と確かめの窓を
+        出す前に断る
+        出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
+        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
+        取り消せない操作の道を通るので、ここへは来ない
+        """
+        if operation.name in PASSES_AFTER_LIMIT:
+            return
+        if self.call(lambda: fixes_closed(self._host.document)):
+            raise ToolError(
+                "この指示では、検査の後に直す回数の上限（本人の設定）に達しました これ以上は"
+                "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"
+                "ユーザーに伝えて終えてください 続けるかはユーザーが次の指示で決めます"
+            )
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ

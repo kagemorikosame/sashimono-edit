@@ -57,6 +57,7 @@ from sashimono.ai.budget import (
     format_tokens,
 )
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
+from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
@@ -1662,7 +1663,12 @@ class ChatPanel(QWidget):
             counts += f"・絵 {used.images} 枚"
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
         # 手順が残っていれば、止まった訳を計画に残す（#340） 欄が〔続ける〕を出す
-        self._plan.end_turn(interrupted=self._stopping, limited=stopped is not None)
+        # 検査の直しの回数の上限（#339）は、この指示の段の番号が変わるまで残るので、終えた後に読める
+        self._plan.end_turn(
+            interrupted=self._stopping,
+            limited=stopped is not None,
+            fixed=fixes_closed(self._host.document),
+        )
         view = self._plan.view()
         if view is not None and view.stopped is Stopped.PAUSED:
             # 欄だけだと、区切りで止まったのか自分で終えたのかが会話の欄から読めない

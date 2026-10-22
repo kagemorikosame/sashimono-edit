@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import AI_ONLY
 from sashimono.ai.operations import OPERATIONS, Operation, find_operation
@@ -31,9 +32,11 @@ from sashimono.ai.plan import (
 )
 from sashimono.ai.safety import Safety
 from sashimono.ai.session import PLAN_RULES, AgentSession, system_prompt
+from sashimono.core.commands import Author
 from sashimono.core.model import MediaItem, Transcript
-from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.ai.test_fix_loop import _MIXED_CLIP, _finish
 from tests.ai.test_outbound import answer_sends, undeclared
 
 SECRET_PATH = Path("C:/Users/秘密の人/動画/結婚式の撮影.mp4")
@@ -440,3 +443,92 @@ class TestSessionSetting:
         assert (names >= PLAN_TOOLS) is plan
         assert not plan or len(names) == len(OPERATIONS)
         assert plan or not names & PLAN_TOOLS
+
+
+class TestWithTheFixLimit:
+    """検査の直しの回数の上限（#339）と、区切りの止め（#340）を一緒に使う
+
+    ブリッジが確かめる順は、区切りの止め → 量の上限 → 直しの回数の上限 → 同意 → 確かめの窓
+    """
+
+    @staticmethod
+    def _closed(host: FakeHost) -> None:
+        """この指示で直しの回数の上限に達した所にする（上限 0 で 1 回調べた）"""
+        host.fix_limit = 0
+        host.document.begin_checkpoint("AI: 調べて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        assert fixes_closed(host.document)
+
+    @staticmethod
+    def _split(bridge: EditorBridge, host: FakeHost) -> object:
+        clips = [clip for track in host.document.project.timeline.tracks for clip in track.clips]
+        done, box = call_in_thread(
+            bridge, _operation("split_clip"), {"clip_id": str(clips[0].id), "frame": 30}
+        )
+        pump_until(bridge, done)
+        return box.get("error")
+
+    def test_the_pause_is_refused_before_the_fix_limit(self, host: FakeHost) -> None:
+        # 壊れると、区切りで止めた人に「直しの回数の上限」の断りが返り、AI は止めた所を伝えず
+        # 回数の上限で終えたと伝える 人が回数を増やしても区切りで断るだけになる
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        _plan(host)
+        self._closed(host)
+        bridge.plan.request_pause()
+        _mark(host, 1, "done")
+        error = self._split(bridge, host)
+        host.document.end_checkpoint()
+        assert isinstance(error, ToolError) and str(error) == PAUSED_MESSAGE
+        assert bridge.take_approval() is None
+
+    def test_plan_tools_pass_after_the_fix_limit(self, host: FakeHost) -> None:
+        # 壊れると、直しの回数の上限に達した後に、止まった手順の印も書けず計画も読めない
+        # 続きの AI は済んだ手順をやり直す
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        _plan(host)
+        self._closed(host)
+        error = self._split(bridge, host)
+        assert isinstance(error, ToolError) and "上限" in str(error)
+        done, box = call_in_thread(
+            bridge, _operation("update_plan_step"), {"step": 1, "state": "failed"}
+        )
+        pump_until(bridge, done)
+        assert box.get("error") is None
+        done, box = call_in_thread(bridge, _operation("get_plan"), {})
+        pump_until(bridge, done)
+        host.document.end_checkpoint()
+        assert box.get("error") is None
+
+    @pytest.mark.parametrize(
+        ("interrupted", "limited", "pause", "reached", "stopped"),
+        [
+            (False, False, False, False, Stopped.FIX_LIMIT),
+            # 止めを頼んだが区切りに来る前に回数の上限で断られた 断ったのは回数の上限
+            (False, False, True, False, Stopped.FIX_LIMIT),
+            # 区切りまで来て止めた後は、ブリッジが区切りを先に断る
+            (False, False, True, True, Stopped.PAUSED),
+            (False, True, False, False, Stopped.LIMIT),
+            (True, False, False, False, Stopped.INTERRUPTED),
+        ],
+    )
+    def test_the_reason_names_the_fix_limit(
+        self,
+        host: FakeHost,
+        interrupted: bool,
+        limited: bool,
+        pause: bool,
+        reached: bool,
+        stopped: Stopped,
+    ) -> None:
+        # 壊れると、直しの回数の上限で止まった計画が「応え終えた」と残り、設定で回数を増やせば
+        # 続けられることが欄から読めない 区切りで止めた計画が回数の上限と書かれると、止めた人が
+        # 自分の止めが効いたかを読めない
+        plan = plan_for(host.document)
+        _plan(host)
+        _mark(host, 1, "running")
+        if pause:
+            plan.request_pause()
+        if reached:
+            _mark(host, 1, "done")
+        plan.end_turn(interrupted=interrupted, limited=limited, fixed=True)
+        assert _read(host)["stopped"] == stopped.value

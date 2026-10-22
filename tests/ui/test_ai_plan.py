@@ -14,6 +14,7 @@ import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from sashimono.ai.budget import LimitAction, Limits
+from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.plan import PAUSED_MESSAGE, RESUME_PROMPT, Stopped, plan_for
@@ -23,6 +24,8 @@ from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.plan_box import PAUSE_TEXT, PAUSING_TEXT
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.ai.test_fix_loop import _MIXED_CLIP, _finish
 from tests.ui.test_chat_panel import _ready, _RecordingSession
 
 
@@ -244,6 +247,29 @@ class TestPauseAndResume:
         assert widget._bridge.usage.stopped is None
         widget._handle(AgentEvent(EventKind.TURN_DONE))
         assert Stopped.PAUSED.value in widget._plan_box.stopped_text()
+
+    def test_a_fix_limit_stop_is_kept_as_the_reason(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、検査の直しの回数の上限（#339）で残りの編集を断られた計画が、欄に「応え終えた」
+        # と残る 設定で回数を増やせば続けられることも、手順の途中かもしれないことも読めない
+        widget, host, _ = made
+        host.fix_limit = 0
+        _send(widget, "仕上がりを直して書き出して")
+        _plan(host, "直す", "書き出す")
+        _mark(host, 1, "running")
+        _finish(host, [_MIXED_CLIP])
+        assert fixes_closed(host.document)
+        # 断るかの確かめは編集画面のスレッドへ頼むので、AI のスレッドの代わりに別のスレッドで呼ぶ
+        done, result = call_in_thread(widget._bridge, _operation("add_track"), {"kind": "video"})
+        pump_until(widget._bridge, done)
+        error = result.get("error")
+        assert isinstance(error, ToolError) and "上限" in str(error)
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        box = widget._plan_box
+        assert Stopped.FIX_LIMIT.value in box.stopped_text()
+        assert "AI が仕上がりを直す回数" in box.stopped_text()
+        assert box.resume_button.isEnabled()
 
     def test_resume_and_close_wait_while_answering(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
