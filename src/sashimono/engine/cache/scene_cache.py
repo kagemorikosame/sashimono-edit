@@ -9,11 +9,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 
 from sashimono.engine.scenes import SAMPLE_WIDTH, SceneSignal
+from sashimono.engine.subject import SUBJECT_BINS, SubjectTrack
 
 from .store import CacheStore, load_arrays, media_key, save_arrays
 
@@ -28,7 +30,9 @@ SUFFIX = ".scenes.npz"
 #: 素材でどのクリップに当てはまるかが分からないので読み直す
 #: 3 で途中で壊れた素材の印を持たせた（PR #358） 2 までは壊れた素材も読み終えた物として
 #: 書いていたので、後ろの切り替わりの無い一覧が残っている 読み直す
-FORMAT_VERSION = 3
+#: 4 で被写体のいそうな所（#334 縦動画への再構図）を持たせた 3 までの物には無く、縦の作品へ
+#: 作り替えるときに枠を真ん中から動かせないので読み直す
+FORMAT_VERSION = 4
 
 #: 番号が分からない（``None``）ときに書く値 ストリームの番号は 0 以上
 _NO_STREAM = -1
@@ -56,6 +60,11 @@ def save_scenes(store: CacheStore, key: str, signal: SceneSignal) -> Path | None
             "analyzed": np.array([signal.analyzed], np.float64),
             "stream": np.array([_NO_STREAM if signal.stream is None else signal.stream]),
             "broken": np.array([signal.broken]),
+            # 分布は 0〜1 の割合なので半精度で足りる 1 時間の素材で 1MB ほどに収まる
+            "subject_times": signal.subject.times,
+            "subject_columns": signal.subject.columns.astype(np.float16),
+            "subject_rows": signal.subject.rows.astype(np.float16),
+            "subject_strength": signal.subject.strength,
         },
         compressed=True,
     )
@@ -76,6 +85,9 @@ def load_scenes(store: CacheStore, key: str) -> SceneSignal | None:
             return None
         stream = int(data["stream"][0])
         broken = bool(data["broken"][0])
+        subject = _subject(data)
+        if subject is None:
+            return None
         return SceneSignal(
             times=times,
             pixel=pixel,
@@ -84,6 +96,26 @@ def load_scenes(store: CacheStore, key: str) -> SceneSignal | None:
             complete=not broken,
             stream=None if stream == _NO_STREAM else stream,
             broken=broken,
+            subject=subject,
         )
     except (KeyError, IndexError, ValueError):
         return None
+
+
+def _subject(data: Mapping[str, np.ndarray]) -> SubjectTrack | None:
+    """被写体の並び 形が合わなければ ``None``（読み直す） 合わないまま使うと、行と時刻が
+    ずれた所の分布で枠の位置を決める
+    """
+    times = np.asarray(data["subject_times"], np.float64)
+    columns = np.asarray(data["subject_columns"], np.float32)
+    rows = np.asarray(data["subject_rows"], np.float32)
+    strength = np.asarray(data["subject_strength"], np.float32)
+    count = times.shape[0]
+    if (
+        times.ndim != 1
+        or columns.shape != (count, SUBJECT_BINS)
+        or rows.shape != (count, SUBJECT_BINS)
+        or strength.shape != (count,)
+    ):
+        return None
+    return SubjectTrack(times=times, columns=columns, rows=rows, strength=strength)

@@ -25,6 +25,16 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.fixes import AUTO as FIX_AUTO
+from sashimono.ai.fixes import (
+    FIX_ACTIONS,
+    CheckTicket,
+    FixRound,
+    current_round,
+    fix_for,
+    settle_check,
+    start_check,
+)
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import (
@@ -136,7 +146,7 @@ from sashimono.core.commands import (
     trimmable,
     valid_marker_color,
 )
-from sashimono.core.commands.edit import STOP_LOCKED
+from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION, STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
 from sashimono.core.commands.layers import places_mixed
@@ -200,6 +210,13 @@ from sashimono.core.model import (
     heard_stream,
 )
 from sashimono.core.projection import heard_timeline, project_timeline
+from sashimono.core.reframe import (
+    CENTER,
+    REFRAME_FOLLOWS,
+    REFRAME_SIZES,
+    REFRAME_SMOOTH_MS_RANGE,
+    ReframeError,
+)
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -298,6 +315,13 @@ from sashimono.engine.highlights import (
 from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
+from sashimono.engine.reframe import (
+    ReframePlan,
+    ReframeRequest,
+    gather_signals,
+    plan_reframe,
+    tracked_media,
+)
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
@@ -2694,20 +2718,31 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
     request = _check_request(host, arguments)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    # 頼みの控えを取り、この後の直しを別の段に区切る（#339） 数えは結果を使えたときに確定する
+    # 引数を確かめた後にする 断った呼び出しで区切ると、引数を直して呼び直すだけで段が割れる
+    # 書き出した動画のファイルを調べるときは控えを取らず区切らない（直し方を返さないので
+    # 直す回が無い）
+    ticket = start_check(host.document, host.fix_rounds) if request.project is not None else None
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
-        return _check_result(host, request, state, arguments)
+        return _check_result(host, request, state, arguments, ticket)
     return Pending(
         wait=host.check_waiter(),
         seconds=wait,
-        then=lambda: _check_result(host, request, host.check_state(), arguments),
+        then=lambda: _check_result(host, request, host.check_state(), arguments, ticket),
     )
 
 
 def _check_result(
-    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+    host: EditorHost,
+    request: CheckRequest,
+    state: CheckState,
+    arguments: dict[str, Any],
+    ticket: CheckTicket | None,
 ) -> object:
+    # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
+    # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
     report = state.report
@@ -2716,6 +2751,21 @@ def _check_result(
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
     timeline = request.project is not None
+    # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
+    # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
+    # 古い作品の物で、今の作品へ直しを当てると消えた・動いたクリップを触る 取り消して同じ形へ
+    # 戻っただけなら同じ作品として直しを返す
+    stale = request.project is not None and _project(host) != request.project
+    # 途中までの結果（走っている・止められた・終わっていない）でも直さない 途中で直すと、続きを
+    # 読む呼び出しが調べ直しになって新しい回に数えられ、残りの問題を見ないまま直す
+    unsettled = stale or state.running or state.stopped or not report.complete
+    rounds: FixRound | None = None
+    if ticket is not None:
+        rounds = (
+            current_round(host.document, host.fix_rounds)
+            if unsettled
+            else settle_check(host.document, ticket, host.fix_rounds)
+        )
     rate = request.project.rate if request.project is not None else None
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
@@ -2736,12 +2786,21 @@ def _check_result(
             row["clip_ids"] = list(problem.clip_ids)
         if problem.ongoing:
             row["ongoing"] = True
+        # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
+        row["fix"] = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
     notes = [str(result.pop("note"))] if "note" in result else []
     severities: dict[str, int] = {}
+    fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
+        action = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        )
+        fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2756,7 +2815,10 @@ def _check_result(
             "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
             "counts": report.counts(),
             "severities": severities,
+            # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
+            "fixes": fixes,
         },
+        "fix_round": None if rounds is None else rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2782,14 +2844,56 @@ def _check_result(
         notes.append("問題は見つかりませんでした")
     elif not report.problems and report.checked:
         notes.append("調べた種類（checks）には問題がありませんでした")
-    if request.project is not None and _project(host) != request.project:
+    if stale:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
-            " 今の作品を調べるにはもう 1 度呼んでください"
+            " この結果からは直さず（直す回も数えていません）、もう 1 度呼んで今の作品を"
+            "調べ直し、その結果の fix に従ってください"
         )
+    elif unsettled and timeline:
+        notes.append(
+            "検査が終わっていないので、この結果からはまだ直さないでください（直す回も数えて"
+            "いません） 終わった結果の fix に従ってください"
+        )
+    else:
+        notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき
+    ``unsettled`` は使えない結果（途中まで・止められた・調べている間に作品が変わった）"""
+    if rounds is None:
+        return {"timeline": False}
+    return {"closed": rounds.closed, "unsettled": unsettled}
+
+
+def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:
+    """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds is None:
+        return [
+            "書き出した動画のファイルを調べた結果です 今の作品から書き出した物かは確かめて"
+            "いないので、今の作品は直さないでください 直すなら path を省いてタイムラインを"
+            "調べ直してください"
+        ]
+    if rounds.closed:
+        if rounds.limit == 0:
+            return [
+                "本人の設定で、検査の後に直さないことになっています（直す回数の上限 0）"
+                " この指示ではもう編集できません 見つかった問題を人へ伝えてください"
+            ]
+        return [
+            f"直す回数の上限（{rounds.limit} 回）に達しました この指示ではもう編集できません"
+            " 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を人へ伝えてください"
+        ]
+    if fixes[FIX_AUTO]:
+        return [
+            f"fix の action が auto の物を直してから、もう 1 度 check_output で調べてください"
+            f"（{rounds.next_round} 回目の直し 上限 {rounds.limit} 回）"
+        ]
+    return []
 
 
 # --- 音の推移と見分け（#322 #338）---
@@ -4195,6 +4299,193 @@ def _emphasize(host: EditorHost, arguments: dict[str, Any]) -> object:
             ),
         }
     )
+    return result
+
+
+# --- 縦動画への再構図（#334）---
+
+#: 返事に載せる場面の数 長い作品で何百も並ぶと、返事がそれだけで埋まる 残りは数だけ書く
+_SHOTS_SHOWN = 40
+
+
+def _reframe_size(host: EditorHost, arguments: dict[str, Any]) -> tuple[int, int]:
+    """作る大きさ 省けば本人の設定（表示 → 設定… の縦動画への作り替え）"""
+    width, height = arguments.get("width"), arguments.get("height")
+    if (width is None) != (height is None):
+        raise ToolError(
+            "width と height は両方渡すか、両方省いてください（省くと本人の設定の大きさ）"
+        )
+    if width is None or height is None:
+        return host.reframe_style.resolution
+    size = (_integer_value(width, "width"), _integer_value(height, "height"))
+    for name, value in zip(("width", "height"), size, strict=True):
+        if not MIN_RESOLUTION <= value <= MAX_RESOLUTION or value % 2:
+            raise ToolError(
+                f"{name} は {MIN_RESOLUTION}〜{MAX_RESOLUTION} の偶数にしてください（{value}）"
+                " 書き出しの色の持ち方（yuv420p）は奇数の大きさを断る"
+            )
+    return size
+
+
+def _reframe_request(host: EditorHost, arguments: dict[str, Any]) -> ReframeRequest:
+    style = host.reframe_style
+    width, height = _reframe_size(host, arguments)
+    follow = arguments.get("follow", style.follow)
+    if not isinstance(follow, str) or follow not in REFRAME_FOLLOWS:
+        raise ToolError(
+            f"follow は {'・'.join(REFRAME_FOLLOWS)} のどれかです（{follow!r} が来ました）"
+        )
+    smooth = arguments.get("smooth_ms", style.smooth_ms)
+    smooth_ms = _integer_value(smooth, "smooth_ms")
+    low, high = REFRAME_SMOOTH_MS_RANGE
+    if not low <= smooth_ms <= high:
+        raise ToolError(f"smooth_ms は {low}〜{high} にしてください（{smooth_ms}）")
+    return ReframeRequest(width, height, follow, smooth_ms, host.subtitle_wrap_share)
+
+
+def _reframe(host: EditorHost, arguments: dict[str, Any]) -> object:
+    if host.active_scene is not None:
+        # 解像度は作品で 1 つ 開いたシーンだけを作り替えると、メインとほかのシーンが
+        # 縦の画面に横の配置のまま残る 道具はメインとすべてのシーンをまとめて変える
+        raise ToolError(
+            "シーンを開いたままでは作り替えられません（解像度は作品全体で 1 つなので、"
+            "メインとすべてのシーンをまとめて作り替えます） set_active_scene でメインに"
+            "戻してから呼んでください"
+        )
+    request = _reframe_request(host, arguments)
+    wait = _number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT)
+    project = _project(host)
+    if (request.width, request.height) == project.settings.resolution:
+        raise ToolError(f"作品はもう {request.width}x{request.height} です")
+    media = [] if request.follow == CENTER else tracked_media(project)
+    for item in media:
+        # 取り込み時の解析を切った人のところでも、被写体の並びが無ければここで頼む
+        host.request_scenes(item)
+    pending = [item.id for item in media if _still_analyzing(host.scene_state(item))]
+    if not pending or wait <= 0:
+        return _reframe_now(host, request)
+    waiters = [host.scene_waiter(media_id) for media_id in pending]
+
+    def ready(seconds: float) -> bool:
+        # ブリッジは中断を見ながら短い間ずつ呼ぶ 1 本ずつ待てば、待つ長さは呼ばれた秒を越えない
+        return all(waiter(seconds) for waiter in waiters)
+
+    return Pending(wait=ready, seconds=wait, then=lambda: _reframe_now(host, request))
+
+
+def _still_analyzing(state: SceneState) -> bool:
+    return not state.complete and state.running
+
+
+def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
+    """解析を待った後に呼ぶ 待つ間に作品が変わっていても、今の作品で組み直す"""
+    if host.active_scene is not None:
+        # 待つ間（最長 2 分）に人がシーンを開くと、読む作品のメインがシーンのタイムラインに
+        # 替わり、命令も開いたシーンへ包まれる メインとすべてのシーンの作り替えが別の所へ当たる
+        raise ToolError(
+            "解析を待っている間にシーンが開かれたので、何も変えていません"
+            " set_active_scene でメインに戻してから呼び直してください"
+        )
+    project = _project(host)
+    if (request.width, request.height) == project.settings.resolution:
+        raise ToolError(f"作品はもう {request.width}x{request.height} です")
+    media = [] if request.follow == CENTER else tracked_media(project)
+    gathered = gather_signals(media, host.scene_state)
+    untracked = [str(media_id) for media_id in gathered.untracked]
+    if gathered.waiting:
+        # 途中までの並びで組むと、読んでいない所の枠が真ん中に止まり、呼び直しても直らない
+        return {
+            "changed": False,
+            "complete": False,
+            "waiting_media": [str(media_id) for media_id in gathered.waiting],
+            "note": (
+                "被写体を見積もる解析（場面の解析と同じ読み込み）がまだ終わっていません"
+                " 何も変えていません しばらくしてから同じ引数で呼んでください"
+                " follow を center にすると待たずに真ん中を切り出します"
+            ),
+        }
+    try:
+        plan = plan_reframe(project, request, gathered.signals)
+    except ReframeError as exc:
+        raise ToolError(str(exc)) from exc
+    before = project.settings.resolution
+    host.apply_commands(plan.commands, f"縦の作品に作り替え: {request.width}x{request.height}")
+    return _reframe_result(plan, request, before, untracked)
+
+
+def _reframe_result(
+    plan: ReframePlan,
+    request: ReframeRequest,
+    before: tuple[int, int],
+    untracked: list[str],
+) -> dict[str, Any]:
+    window = plan.window
+    crop = window.size
+    shots = [
+        {
+            "scene_id": None if note.scene_id is None else str(note.scene_id),
+            "start_frame": note.start,
+            "end_frame": note.end,
+            "mode": note.mode,
+            # 枠の中心（前の画面の中央からの画素 Y は上が正） 追う場面は頭の位置
+            "focus_x": round(note.focus[0], 1),
+            "focus_y": round(note.focus[1], 1),
+            "keyframes": note.points,
+            "no_clue": note.no_clue,
+            "clip_id": note.clip_id,
+        }
+        for note in plan.shots[:_SHOTS_SHOWN]
+    ]
+    notes = [
+        "背景の動画と画像は、前の画面に置いた枠の中を縦の画面いっぱいに映すよう配置の"
+        "拡大率と位置の線を変えました（枠は場面ごとに被写体へ合わせ、動く場面は位置に"
+        "キーフレームを打ちました） 文字と重ねた物は縦の画面の同じ割合の所へ置き直し、"
+        "文字は縦の画面の幅で折り返しました 取り消し 1 回で横の作品に戻ります",
+        "今の作品を書き換えています 横の作品も残したいなら、人に save_project_as で別の名前に"
+        "保存するよう伝えてください",
+        "被写体は動きと肌色だけから見積もります（顔は見分けません 肌色に近い壁や床・"
+        "動く背景にも寄ります） preview_range か contact_sheet で枠に人が入っているかを"
+        "確かめ、外れた場面は背景のクリップの位置（pos_x）の点を set_param・add_keyframe で"
+        "直してください 字幕のはみ出しは check_output で調べられます",
+    ]
+    if any(note.no_clue for note in plan.shots):
+        notes.append("no_clue の場面は動きも肌色も見つからず、絵の真ん中を切り出しました")
+    if untracked:
+        notes.append(
+            "untracked_media の素材は場面の解析ができず、被写体を追わずに真ん中を切り出しました"
+        )
+    if plan.held:
+        notes.append(
+            "held_clips は前から位置が動いている（寄りやパン）ので、動きを残してそのクリップの間は"
+            "枠を止めました"
+        )
+    if plan.skipped:
+        notes.append(
+            "skipped のクリップは作り替えられず、前の配置のままです 理由を人に伝えてください"
+        )
+    result: dict[str, Any] = {
+        "changed": True,
+        "resolution": f"{request.width}x{request.height}",
+        "previous_resolution": f"{before[0]}x{before[1]}",
+        "follow": request.follow,
+        "smooth_ms": request.smooth_ms,
+        "crop": {
+            "width": round(crop[0], 1),
+            "height": round(crop[1], 1),
+            "scale_percent": round(window.scale * 100.0, 1),
+        },
+        "shots": shots,
+        "shot_count": len(plan.shots),
+        "backgrounds": len(plan.backgrounds),
+        "overlays": len(plan.overlays),
+        "wrapped_texts": len(plan.wrapped),
+        "held_clips": plan.held,
+        "skipped": [{"clip_id": clip_id, "reason": reason} for clip_id, reason in plan.skipped],
+        "untracked_media": untracked,
+        "note": " ".join(notes),
+    }
+    if len(plan.shots) > _SHOTS_SHOWN:
+        result["shots_note"] = f"場面は {len(plan.shots)} 個 頭の {_SHOTS_SHOWN} 個だけを載せました"
     return result
 
 
@@ -6026,6 +6317,9 @@ _EMPHASIS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: ジャンプカットのつなぎ目（#332） フレームとクリップ ID に、本人の設定（処理の種類と長さの
 #: 既定）が載る 断る文に出るのはクリップ ID だけ
 _SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
+#: 縦動画への再構図（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さの既定が載る
+#: 素材の名前は返さない（解析を待つ素材も ID だけ）
+_REFRAME = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
 _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
@@ -6502,7 +6796,12 @@ OPERATIONS: tuple[Operation, ...] = (
             "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
             " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
             " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
-            + PAGING_NOTE
+            " 各問題の fix は直し方（action が auto は直してよい・ask は人に尋ねてから・"
+            "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
+            " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
+            " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
+            "その指示ではもう編集できない path で書き出した動画を調べた結果は、今の作品から"
+            "書き出した物とは限らないので fix がどれも handoff になり、回数も数えない" + PAGING_NOTE
         ),
         schema=_schema(
             {
@@ -7286,6 +7585,54 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_emphasize,
         writes=True,
         sends=_EMPHASIS,
+    ),
+    Operation(
+        name="reframe",
+        description=(
+            "横の作品を縦（9:16 など）の作品に作り替える 解像度を変え、背景の動画と画像は前の画面に"
+            "置いた縦の枠の中を縦の画面いっぱいに映し、枠は場面ごとに被写体へ合わせる"
+            "（止める・追う） 文字・図形・小さい画像などの重ねた物は縦の画面の同じ割合の所へ"
+            "置き直し、文字は縦の画面の幅で折り返し、はみ出す位置なら内側へ寄せる"
+            " メインとすべてのシーンをまとめて変え、取り消し 1 回で戻る 今の作品を書き換えるので、"
+            "横の作品を残すなら save_project_as で別の名前に保存するよう人に伝える"
+            " 被写体は場面の解析（detect_scenes と同じ読み込み）のついでに、動きと肌色だけから"
+            "見積もる（顔や人は見分けない 肌色に近い壁や床・動く背景・焼き込まれた字幕の出入りにも"
+            "寄る 位置の細かさは素材の幅の 1/32 ほど） 解析が終わっていなければ wait_seconds まで"
+            "待ち、それでも終わらなければ何も変えずに戻る 終わったら preview_range か"
+            " contact_sheet で枠を確かめ、外れた場面は背景のクリップの pos_x の点を直す"
+            " 大きさ・枠の動かし方・ならす長さを省くと本人の設定（表示 → 設定… の"
+            "縦動画への作り替え）を使う 開いているシーンがあれば断る（メインに戻してから）"
+            " ロックしたトラックに動かす物があれば断る"
+        ),
+        schema=_schema(
+            {
+                "width": _integer(
+                    f"作る横の画素（偶数 width と height は両方か両方省く 省くと本人の設定"
+                    f" よく使うのは {'・'.join(REFRAME_SIZES)}）"
+                ),
+                "height": _integer("作る縦の画素（偶数）"),
+                "follow": {
+                    "type": "string",
+                    "enum": list(REFRAME_FOLLOWS),
+                    "description": (
+                        "枠の動かし方 auto は被写体が枠に収まる場面は止め、収まらない場面は追う"
+                        " steady は場面ごとに止める follow はなめらかに追う center は追わずに"
+                        "真ん中を切り出す（解析を待たない） 省くと本人の設定"
+                    ),
+                },
+                "smooth_ms": _integer(
+                    f"追うときにならす長さ（ミリ秒 {REFRAME_SMOOTH_MS_RANGE[0]}"
+                    f"〜{REFRAME_SMOOTH_MS_RANGE[1]} 長いほどゆっくり動く 省くと本人の設定）"
+                ),
+                "wait_seconds": _number(
+                    f"解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 待ちきれなければ何も変えずに戻る"
+                ),
+            }
+        ),
+        handler=_reframe,
+        writes=True,
+        sends=_REFRAME,
     ),
     Operation(
         name="set_subtitle_text",

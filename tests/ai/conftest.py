@@ -41,6 +41,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
@@ -103,6 +104,8 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
+        self.reframing = ReframeStyle()
         #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
         self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
@@ -110,6 +113,8 @@ class FakeHost:
         #: 待つ関数が呼ばれた秒と、待った結果
         self.check_waits: list[float] = []
         self.check_ready = True
+        #: 検査の直しの回数の上限（#339） 既定は設定と同じ 3
+        self.fix_limit = 3
         #: 混ぜた音の推移（#322） 入れておくと、頼まれた検査がこの推移で調べ終えた様子になる
         #: 入れなければ今までどおり、何も調べていない走っている様子から始まる
         self.heard: SoundProfile | None = None
@@ -267,6 +272,10 @@ class FakeHost:
         return self.loudness
 
     @property
+    def fix_rounds(self) -> int:
+        return self.fix_limit
+
+    @property
     def duck_shape(self) -> DuckShape:
         return self.duck
 
@@ -277,6 +286,10 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self.reframing
 
     def request_check(self, request: CheckRequest) -> None:
         self.check_requests.append(request)
