@@ -12,9 +12,10 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from itertools import pairwise
 
@@ -30,6 +31,8 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    Interpolation,
+    Keyframe,
     MediaId,
     MediaItem,
     ParamValue,
@@ -367,16 +370,58 @@ class _Tracker:
         x, y = placed_at(((across - 0.5) * placed[0], (0.5 - down) * placed[1]))
         return Sample(frame=frame, x=x, y=y, weight=weight), bounds
 
-    @property
-    def moves(self) -> bool:
-        """配置の値（位置・拡大・回転・中心）がキーフレームで動くか"""
-        effect = fixed_transform(self.picture.clip)
-        if effect is None:
-            return False
-        return any(
-            isinstance(value, AnimatedValue) and bool(value.keyframes)
-            for value in effect.params.values()
+    def area_frames(self, start: int, end: int) -> list[int]:
+        """枠を置ける範囲を数えるコマ（タイムラインのフレーム ``start`` 以上 ``end`` 未満）
+
+        範囲の端は、絵の向きで見た位置と大きさの 1 次の式（回さなければ 位置 + 拡大 x 定数）
+        なので、すべての欄のキーフレームのコマで区切った区間ごとに、次のどちらかなら端は区間の
+        両端のコマで決まる 両端（とキーフレームの前後のコマ 止まる補間はキーフレームの 1 つ前の
+        コマで切り替わる）だけを数えれば、どのコマの範囲の重なりとも同じになる
+
+        - 区間で動く欄が直線（``LINEAR``）だけ 直線どうしを足しても直線
+        - 区間で動く欄が 1 つで、その補間が両端の値の間から出ない（:func:`_stays_between`）
+          イージング 3 種と、サイン・2 次〜5 次・指数・円・バウンス（止まる前に跳ねるが両端の間に
+          収まる）の曲線と、制御点が 0〜1 のベジェ
+
+        それ以外（行き過ぎて戻るバック・エラスティック、外へ出る制御点のベジェ、別々の曲線で
+        動く 2 つ以上の欄）は区間の中に山ができうるので、その区間はどのコマも数える
+        回転が動くと範囲の端が角度の三角関数で曲がるので、動く間はどのコマも数える
+        配置が動かなければ頭の 1 コマで足りる 前はどのコマも数えていて、60fps の 10 分の場面で
+        1.2 秒かかった（docs の表）
+        """
+        clip = self.picture.clip
+        effect = fixed_transform(clip)
+        moving = (
+            {}
+            if effect is None
+            else {
+                name: value
+                for name, value in effect.params.items()
+                if isinstance(value, AnimatedValue) and value.keyframes
+            }
         )
+        if not moving:
+            return [start]
+        if moving.keys() & {"rotation", "rotation_x", "rotation_y"}:
+            return list(range(start, end))
+        offset = clip.timeline_start
+        curves = list(moving.values())
+        edges = sorted({k.frame for curve in curves for k in curve.keyframes})
+        wanted = {start, end - 1}
+        for frame in edges:
+            wanted.update((frame + offset - 1, frame + offset, frame + offset + 1))
+        for left, right in pairwise(edges):
+            if right + offset < start or left + offset >= end:
+                continue
+            active = [key for curve in curves if (key := _moving_key(curve, left, right))]
+            if not active:
+                continue
+            if all(key.interpolation is Interpolation.LINEAR for key in active):
+                continue
+            if len(active) == 1 and _stays_between(active[0]):
+                continue
+            wanted.update(range(left + offset, right + offset + 1))
+        return sorted(frame for frame in wanted if start <= frame < end)
 
     def home(self, frame: int) -> tuple[float, float]:
         return self.sample(frame)[1].center
@@ -433,6 +478,40 @@ def _common(areas: list[Area], clip: Clip) -> Area:
     )
 
 
+def _moving_key(curve: AnimatedValue, left: int, right: int) -> Keyframe | None:
+    """``left``〜``right`` の区間で値を動かしているキーフレーム（区間の頭か前の点）
+
+    区間で止まっていれば ``None``
+    """
+    keys = curve.keyframes
+    before = [index for index, key in enumerate(keys) if key.frame <= left]
+    if not before or before[-1] + 1 >= len(keys):
+        return None
+    key, following = keys[before[-1]], keys[before[-1] + 1]
+    if following.frame < right or key.interpolation is Interpolation.HOLD:
+        return None
+    if math.isclose(key.value, following.value):
+        return None
+    return key
+
+
+@functools.cache
+def _stays_between(key: Keyframe) -> bool:
+    """この点から次の点への補間が、両端の値の間から出ないか
+
+    名前付きの曲線は形を式から読まず、細かく引いて確かめる（曲線を足しても、ここが自動で合う）
+    """
+    if key.interpolation in (Interpolation.LINEAR, Interpolation.HOLD):
+        return True
+    if key.interpolation is Interpolation.BEZIER:
+        points = key.control_points or (0.0, 0.0, 1.0, 1.0)
+        # 制御点が 0〜1 なら曲線は両端と制御点の囲む中にある
+        return 0.0 <= points[1] <= 1.0 and 0.0 <= points[3] <= 1.0
+    shape = AnimatedValue(0.0, (replace(key, frame=0, value=0.0), Keyframe(frame=1000, value=1.0)))
+    values = [shape.at(frame) for frame in range(1001)]
+    return min(values) >= -1e-9 and max(values) <= 1.0 + 1e-9
+
+
 def _visible(timeline: Timeline) -> set[int]:
     return {id(track) for track in timeline.active_picture_tracks()}
 
@@ -476,11 +555,11 @@ def _shots(
     shots: list[tuple[Shot, _Tracker]] = []
     for start, end, owner in spans:
         samples = [owner.sample(frame)[0] for frame in range(start, end, step)]
-        # 枠を置ける範囲は、配置が動くならどのコマでも数える 被写体と同じ 0.25 秒ごとだけだと、
-        # 場面の最後のコマやキーフレームの折れ目（行って戻るパンの端・行き過ぎて戻る曲線の山）を
-        # 数えず、ぎりぎり収まるパンでその数コマだけ縦の画面の端に絵の外が映った（PR #388 の
-        # CodeRabbit の指摘） 配置が動かなければ範囲も動かないので頭の 1 コマで足りる
-        frames = range(start, end) if owner.moves else range(start, start + 1)
+        # 枠を置ける範囲は、範囲がいちばん狭まりうるコマを全部数える（:meth:`_Tracker.area_frames`）
+        # 被写体と同じ 0.25 秒ごとだけだと、場面の最後のコマやキーフレームの折れ目を数えず、
+        # ぎりぎり収まるパンでその数コマだけ縦の画面の端に絵の外が映った
+        # （PR #388 の CodeRabbit の指摘）
+        frames = owner.area_frames(start, end)
         area = _common([owner.sample(frame)[1] for frame in frames], owner.picture.clip)
         left, right = area.center[0] - area.reach[0], area.center[0] + area.reach[0]
         bottom, top = area.center[1] - area.reach[1], area.center[1] + area.reach[1]

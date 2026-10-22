@@ -23,6 +23,7 @@ from sashimono.core.model import (
     Clip,
     Effect,
     GeneratedSource,
+    Interpolation,
     Keyframe,
     MediaItem,
     ParamValue,
@@ -277,13 +278,13 @@ def _panning(
     return replace(video, effects=effects)
 
 
-def _assert_on_the_picture(video_media: MediaItem, video: Clip) -> None:
+def _assert_on_the_picture(video_media: MediaItem, video: Clip, across: float = 0.2) -> None:
     """作り替えた後、どのコマでも枠が背景の絵（2 倍 1920 の幅）の中にある"""
     effect = fixed_transform(video)
     assert effect is not None
     before = _value(effect, "pos_x", 0.0)
     project = _project(video_media, (video,))
-    plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, 0.2)])})
+    plan = plan_reframe(project, REQUEST, {video_media.id: _signal([(0.0, across)])})
     assert not plan.skipped
     done = _applied(project, plan.commands)
     k = 1920 / 1080
@@ -314,6 +315,28 @@ class TestTheBigPan:
         # 数えず、その数コマだけ枠が絵の外へ出る
         video = _panning(video_media, ((0, -1600.0), (151, 1610.0), (299, -1600.0)))
         _assert_on_the_picture(video_media, video)
+
+    def test_an_overshooting_curve_stays_on_the_picture(self, video_media: MediaItem) -> None:
+        # 行き過ぎて戻る曲線（バック）は、キーフレームの間で端の値を越える 端のコマだけで範囲を
+        # 数えると、越えた所の数コマだけ枠が絵の外へ出る
+        video = _video(video_media)
+        pan = AnimatedValue(
+            0.0,
+            (
+                Keyframe(0, -600.0, Interpolation.EASE_OUT, curve="back"),
+                Keyframe(150, 1350.0),
+                Keyframe(299, 1350.0),
+            ),
+        )
+        assert max(pan.at(frame) for frame in range(150)) > 1350.0 + 100.0
+        effects = tuple(
+            e.with_param("pos_x", pan).with_param("scale", AnimatedValue(200.0))
+            if e.kind == TRANSFORM_EFFECT_KIND
+            else e
+            for e in video.effects
+        )
+        # 被写体を絵の左端に置き、枠を範囲の左の端まで寄せる
+        _assert_on_the_picture(video_media, replace(video, effects=effects), across=0.02)
 
     def test_no_place_on_the_picture_is_refused(self, video_media: MediaItem) -> None:
         # どこに止めても絵の外が映るのに作り替えると、黙って黒い帯の出る縦の作品になる
