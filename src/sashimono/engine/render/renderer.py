@@ -66,7 +66,7 @@ from sashimono.engine.render.groups import grouped
 from sashimono.engine.render.invalidate import image_paths
 from sashimono.engine.render.moving_text import MAX_SPRITE_SCREENS, Sprite, SpriteShelf, spot_of
 from sashimono.engine.render.outline import canvas_scale, is_generated, media_pixel_size
-from sashimono.engine.render.script_bake import ScriptEffectBaker
+from sashimono.engine.render.script_bake import BAKE_CANVAS_LIMIT, ScriptEffectBaker
 from sashimono.engine.render.scripts import (
     ScriptStage,
     is_scene_change,
@@ -208,6 +208,33 @@ def _placed_bounds(
         placement.left + right * scale_x,
         placement.top + bottom * scale_y,
     )
+
+
+#: はみ出した素材を通すバッファの一辺の上限（画素） エフェクトの係は RGBA16F のバッファを
+#: 何枚も持つ 一辺 12000 の画像を画素で置くと 1 枚で 1GB を超え、GPU のメモリが尽きる
+#: 焼き込みの作業場（:data:`~sashimono.engine.render.script_bake.BAKE_CANVAS_LIMIT`）と同じ値
+#: 8K の動画（7680）は超えるので前の道（画面の大きさで切ってから掛ける）で描く
+SPILL_LIMIT = BAKE_CANVAS_LIMIT
+
+
+def _spilling_buffer(
+    placement: Placement, screen_width: int, screen_height: int, limit: int = SPILL_LIMIT
+) -> tuple[int, int] | None:
+    """画面からはみ出して置いた絵を、はみ出した所ごと収めるバッファの大きさ 収まれば ``None``
+
+    画面との差を偶数にそろえる 奇数だと画面の中心へ半画素ずれて重なり、絵が 1 画素ぼける
+    一辺が ``limit`` を超える大きさは作らず ``None``（画面の大きさで切ってから掛ける前の道） 作ると
+    GPU のメモリが尽きるか、作れずにフレームごと描けなくなる
+    """
+    spill_x = math.ceil(placement.width - screen_width - 1e-6)
+    spill_y = math.ceil(placement.height - screen_height - 1e-6)
+    if spill_x <= 0 and spill_y <= 0:
+        return None
+    size = (
+        screen_width + max(0, spill_x + spill_x % 2),
+        screen_height + max(0, spill_y + spill_y % 2),
+    )
+    return size if max(size) <= limit else None
 
 
 def _object_sized(image: np.ndarray, found: Frame | None) -> tuple[np.ndarray, tuple[float, float]]:
@@ -527,6 +554,11 @@ class FrameRenderer:
             # エフェクト処理は合成と同じ全画面四角形を使い回す
             self._effects = EffectProcessor(width, height, self._compositor.quad)
             self._effects.canvas_encoded = self._encoded
+        #: 画面からはみ出す大きさに置いた素材を通す係（:meth:`_spill_effects`） 使うまで作らない
+        self._spill: EffectProcessor | None = None
+        #: はみ出した素材を通すバッファの一辺の上限 初めて使うときに GPU の上限と
+        #: :data:`SPILL_LIMIT` の小さい方を読む 試験は小さい値を入れて、超えたときの動きを確かめる
+        self.spill_limit: int | None = None
         # 画素で決める設定を合成の画素へ縮める割合 画質を落としたプレビューで 1 より小さい
         self._effects.pixel_scale = self._scale[0]
         #: 素材ごとのデコーダ 最近使ったものを残す
@@ -629,6 +661,8 @@ class FrameRenderer:
         # 差し替えるたびに前の画像が閉じるまで残り、長く編集するほどメモリを食う
         with self._context:
             self._effects.retain_images(image_paths(project))
+            if self._spill is not None:
+                self._spill.retain_images(image_paths(project))
 
     def set_decode_threads(self, threads: int) -> None:
         """レイヤーごとの並列デコードのスレッド数を変える 1 で並べない
@@ -1148,6 +1182,9 @@ class FrameRenderer:
                 texture.release()
             self._textures.clear()
             self._effects.release()
+            if self._spill is not None:
+                self._spill.release()
+                self._spill = None
             self._script_baker.release()
             if self._grab is not None:
                 self._grab.release()
@@ -1240,6 +1277,19 @@ class FrameRenderer:
             )
             return
 
+        limit = self._spill_limit()
+        buffer = _spilling_buffer(placement, screen_width, screen_height, limit)
+        if buffer is None and _spilling_buffer(placement, screen_width, screen_height, 10**9):
+            global_report.note_missing(
+                f"画面からはみ出した所のエフェクト（置いた絵 {placement.width:.0f}x"
+                f"{placement.height:.0f} が上限 {limit} を超え、画面の外は切って描いた）"
+            )
+        if buffer is not None:
+            self._draw_spilling(
+                texture, image, clip, gpu_effects, local_frame, rate, opacity, placement, buffer
+            )
+            return
+
         result = self._effects.apply(
             texture,
             gpu_effects,
@@ -1257,6 +1307,85 @@ class FrameRenderer:
             flip=False,
             blend=clip.blend_mode,
         )
+
+    def _draw_spilling(
+        self,
+        texture: Texture,
+        image: np.ndarray,
+        clip: Clip,
+        gpu_effects: tuple[Effect, ...],
+        local_frame: int,
+        rate: FrameRate,
+        opacity: float,
+        placement: Placement,
+        buffer: tuple[int, int],
+    ) -> None:
+        """画面からはみ出す大きさに置いた素材（画素で置いた 4K を 1080p の作品に置いた物、
+        縦の作品に作り替えた横の動画 #334）を、はみ出した所ごとエフェクトに通して置く
+
+        画面の大きさのバッファへ置いてからエフェクトを掛けると、はみ出した所がそこで切れ、
+        縮めたり動かしたりしても切れたままになる（縦の作品に作り替えた横の動画で、枠を寄せた
+        側が黒い帯になった） 画面と絵の両方を含む大きさのバッファで掛け、画面の中心に重ねて置く
+        バッファの中心は画面の中心と同じなので、位置の計算（画素）は変わらない
+        """
+        screen_width, screen_height = self._compositor.width, self._compositor.height
+        width, height = buffer
+        inner = Placement(
+            placement.left + (width - screen_width) / 2.0,
+            placement.top + (height - screen_height) / 2.0,
+            placement.width,
+            placement.height,
+        )
+        effects = self._spill_effects(width, height)
+        result = effects.apply(
+            texture,
+            gpu_effects,
+            frame=local_frame,
+            fps=float(rate.fps),
+            source_rect=inner.to_clip(width, height),
+            duration=clip.duration,
+            bounds=_placed_bounds(self._object_box_of(clip, image), image, inner),
+        )
+        self._compositor.draw_handle(
+            result.color,
+            Placement(
+                (screen_width - width) / 2.0,
+                (screen_height - height) / 2.0,
+                float(width),
+                float(height),
+            ),
+            opacity=opacity,
+            flip=False,
+            blend=clip.blend_mode,
+        )
+
+    def _spill_limit(self) -> int:
+        """はみ出した素材を通すバッファの一辺の上限 GL のコンテキストの中で読む"""
+        if self.spill_limit is None:
+            self.spill_limit = min(
+                SPILL_LIMIT,
+                int(GL.glGetIntegerv(GL.GL_MAX_TEXTURE_SIZE)),
+                int(GL.glGetIntegerv(GL.GL_MAX_RENDERBUFFER_SIZE)),
+            )
+        return self.spill_limit
+
+    def _spill_effects(self, width: int, height: int) -> EffectProcessor:
+        """はみ出した素材を通す、画面の物とは別のエフェクトの係（大きさが同じなら使い回す）
+
+        画面の係を毎フレーム大きくして戻すと、そのたびにバッファを作り直す 1080p の動画を縦の
+        1080x1920 に作り替えた作品で、1 フレームの描く時間が 7 ms から 15 ms に延びた
+        別に持てば作り直すのは大きさが変わったときだけになる
+        """
+        effects = self._spill
+        if effects is None:
+            effects = EffectProcessor(width, height, self._compositor.quad)
+            effects.retain_images(image_paths(self._project))
+            self._spill = effects
+        else:
+            effects.resize(width, height)
+        effects.canvas_encoded = self._encoded
+        effects.pixel_scale = self._scale[0]
+        return effects
 
     def _media_placement(self, clip: Clip, texture: Texture) -> Placement:
         """絵を置く矩形（合成先の画素）
@@ -2880,7 +3009,8 @@ class FrameRenderer:
         :func:`~sashimono.engine.render.image_spans` でその画像を使う範囲を出し、
         先読みした絵を捨てる GL は触らない
         """
-        return self._effects.stale_images()
+        stale = self._effects.stale_images()
+        return stale if self._spill is None else stale | self._spill.stale_images()
 
     def reopen_sources(self, media_ids: Collection[MediaId] | None = None) -> None:
         """デコーダを閉じる 次に要るときに開き直す
