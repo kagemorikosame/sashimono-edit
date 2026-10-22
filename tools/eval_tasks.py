@@ -1332,12 +1332,22 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     """課題ごとに、最新の回と 1 つ前の回の主な数と秒を並べる"""
     latest: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
+        key = (str(row["stage"]), str(row["material"]), str(row["task"]))
+        if row["task"] == SCENES:
+            # 場面は人が一から付けた正解だけで数える（#345） 前の版が道具の下書きを仮の正解に
+            # して数えた行は記録に残すが、道具と道具を比べた数なので表の数には使わない
+            # 使うと、人の正解で数えるまで 1.0 に近い数が今の精度に見え続ける
+            latest.setdefault(key, [])
+            if row.get("provisional") is not False:
+                continue
         if row.get("status") != "ok":
             continue
-        key = (str(row["stage"]), str(row["material"]), str(row["task"]))
         latest.setdefault(key, []).append(row)
     lines = ["段     番号 課題       数      前回    差      秒     正解"]
     for (stage, material, task), history in sorted(latest.items()):
+        if not history:
+            lines.append(f"{stage:6} {material:4} {task:10} まだ人の正解が無い")
+            continue
         name = HEADLINE[task]
         now = history[-1]
         value = float(now["metrics"][name])

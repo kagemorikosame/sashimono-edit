@@ -709,15 +709,34 @@ def test_report_marks_changed_params(tool: ModuleType) -> None:
 
     印が無いと、感度を変えて試した回の差を、コードを変えた効果と取り違える
     """
-    base = {"stage": "tools", "material": "E01", "task": "scenes", "status": "ok"}
+    base = {"stage": "tools", "material": "E01", "task": "silence", "status": "ok"}
     rows = [
-        {**base, "metrics": {"f1": 0.5}, "params": {"threshold": 0.15}, "provisional": True},
-        {**base, "metrics": {"f1": 0.75}, "params": {"threshold": 0.25}, "provisional": False},
+        {**base, "metrics": {"iou": 0.5}, "params": {"padding": 0.1}, "provisional": True},
+        {**base, "metrics": {"iou": 0.75}, "params": {"padding": 0.2}, "provisional": False},
     ]
     [_, line] = tool.report_lines(rows)
     assert "+0.2500" in line and "値が違う" in line and "正解が変わった" in line
-    [_, plain] = tool.report_lines([rows[0], {**rows[0], "metrics": {"f1": 0.5}}])
-    assert "値が違う" not in plain and "+0.0000" in plain
+    [_, plain] = tool.report_lines([rows[0], {**rows[0], "metrics": {"iou": 0.5}}])
+    assert "値が違う" not in plain and "+0.0000" in plain and "仮" in plain
+
+
+def test_report_ignores_provisional_scene_rows(tool: ModuleType) -> None:
+    """場面の課題では、道具の下書きを仮の正解にして数えた行を表の数に使わないこと
+
+    使うと、人が一から付けた正解で数えるまで、道具と道具を比べた 1.0 に近い数が今の精度に
+    見え続ける 記録の行は消さずに残すので、表の側で外す
+    """
+    base = {"stage": "tools", "material": "E09", "task": "scenes", "status": "ok"}
+    tool_vs_tool = {**base, "metrics": {"f1": 1.0}, "provisional": True}
+    [_, waiting] = tool.report_lines([tool_vs_tool, tool_vs_tool])
+    assert "まだ人の正解が無い" in waiting and "f1=" not in waiting
+    skipped = {**base, "status": "skipped", "reason": "no-answer"}
+    [_, still] = tool.report_lines([tool_vs_tool, skipped])
+    assert "まだ人の正解が無い" in still
+    human = {**base, "metrics": {"f1": 0.8}, "provisional": False}
+    [_, line] = tool.report_lines([tool_vs_tool, human, tool_vs_tool])
+    # 前回の数も人の正解の行から取る 仮の行との差を出すと、精度が落ちたように見える
+    assert "f1=0.8000" in line and "人" in line and "正解が変わった" not in line
 
 
 def test_eval_dir_must_be_outside_the_repository(tool: ModuleType) -> None:
