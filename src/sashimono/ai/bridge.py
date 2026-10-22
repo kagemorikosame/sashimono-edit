@@ -50,6 +50,7 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
     secret_pairs,
+    sending,
     text_secrets,
 )
 from sashimono.ai.safety import Consent
@@ -587,8 +588,12 @@ class EditorBridge:
         # 動かす前の名前も覚える 道具が素材を消すと、動かした後の作品からは名前が拾えない
         self._learn_names()
         hide = not self.may_send(Outbound.FILES)
+        # 欄の型で伏せる道具（get_clip など #391）が、結果を組む所で今の許しを引けるようにする
+        # 立てずに動かすと、編集画面の中から直に呼んだ扱いになり、欄の値を全部載せる
+        allowed = frozenset(kind for kind in Outbound if self.may_send(kind))
         try:
-            result = work()
+            with sending(allowed):
+                result = work()
         except (ToolError, ValueError, KeyError) as exc:
             if not hide:
                 raise

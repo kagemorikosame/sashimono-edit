@@ -36,7 +36,7 @@ from sashimono.ai.fixes import (
     start_check,
 )
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
-from sashimono.ai.outbound import Outbound
+from sashimono.ai.outbound import UNKNOWN_FIELD_SENDS, Outbound, field_sends, masked_value
 from sashimono.ai.safety import (
     Consent,
     Safety,
@@ -1716,34 +1716,47 @@ def _sampled(value: AnimatedValue, duration: int, samples: int) -> list[list[flo
     return [[frame, _rounded(value.at(frame))] for frame in frames]
 
 
-def _merged(params: dict[str, ParamValue], specs: tuple[Any, ...]) -> dict[str, ParamValue]:
-    """設定パネルと同じ値の並び 持っていない欄は既定の値（パネルもそれを出す）
+def _merged(
+    params: dict[str, ParamValue], specs: tuple[Any, ...] | None
+) -> dict[str, tuple[ParamValue, frozenset[Outbound]]]:
+    """設定パネルと同じ値の並びと、それぞれの値を送るのに要る許し（欄の型 #391）
 
-    クリップが持つ値だけを返すと、触っていない欄が無い物に見え、AI は今の位置や大きさを
-    知らないまま動かす 定義に無い値（読み込んだスクリプトの古い欄など）も残す
+    持っていない欄は既定の値（パネルもそれを出す） クリップが持つ値だけを返すと、触っていない
+    欄が無い物に見え、AI は今の位置や大きさを知らないまま動かす 定義に無い値（読み込んだ
+    スクリプトの古い欄など）も残す ``specs`` が ``None`` なら定義の分からない種類で、どの欄が
+    文か場所か分からないので、文字の値は全部伏せる側に数える（:data:`UNKNOWN_FIELD_SENDS`）
     """
-    merged: dict[str, ParamValue] = {}
-    for spec in specs:
+    merged: dict[str, tuple[ParamValue, frozenset[Outbound]]] = {}
+    for spec in specs or ():
         name = str(getattr(spec, "name", ""))
+        needs = field_sends(spec)
         if name in params:
-            merged[name] = params[name]
+            merged[name] = (params[name], needs)
         elif hasattr(spec, "default_value"):
-            merged[name] = spec.default_value()
+            merged[name] = (spec.default_value(), needs)
     for name, value in params.items():
-        merged.setdefault(name, value)
+        if name not in merged:
+            # 定義に無い欄 型が分からないので、定義の分からない種類と同じく伏せる側に数える
+            merged[name] = (value, UNKNOWN_FIELD_SENDS)
     return merged
+
+
+def _shown(value: ParamValue, needs: frozenset[Outbound]) -> ParamValue:
+    """送ってよい形の値 文字の欄と場所の欄は、送らない設定なら値ごと印にする（#391）"""
+    shown: ParamValue = masked_value(value, needs)
+    return shown
 
 
 def _values(
     params: dict[str, ParamValue],
-    specs: tuple[Any, ...],
+    specs: tuple[Any, ...] | None,
     duration: int,
     samples: int,
     locate: Locate,
 ) -> dict[str, Any]:
     return {
-        name: _value_row(value, duration, samples, locate(name))
-        for name, value in _merged(params, specs).items()
+        name: _value_row(_shown(value, needs), duration, samples, locate(name))
+        for name, (value, needs) in _merged(params, specs).items()
     }
 
 
@@ -1763,7 +1776,7 @@ def _effect_rows(
     rows: list[dict[str, Any]] = []
     for effect in effects:
         definition = registry.get(effect.kind)
-        specs = definition.parameters if definition is not None else ()
+        specs = definition.parameters if definition is not None else None
         place: dict[str, object] = {"effect_id": str(effect.id)}
         if stroke_id is not None:
             place["stroke_id"] = stroke_id
@@ -1797,7 +1810,8 @@ def _curve_samples(arguments: dict[str, Any]) -> int:
 
 
 def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
-    """在りかの値 持っていない欄は既定の値 無い欄は断る（打ち間違いを空の値で返さない）"""
+    """在りかの送ってよい形の値 持っていない欄は既定の値 無い欄は断る（打ち間違いを空の値で
+    返さない）"""
     if path.target is ParamTarget.CLIP:
         if path.name != "opacity":
             raise ToolError(
@@ -1806,17 +1820,14 @@ def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
             )
         return clip.opacity
     source = clip.source
-    stroke = None
-    if path.stroke_id is not None:
-        stroke = source.find_stroke(path.stroke_id) if source is not None else None
-        if stroke is None:
-            raise ToolError(f"縁取りの層が見つかりません: {path.stroke_id}")
+    stroke = _require_stroke(clip, str(path.stroke_id)) if path.stroke_id is not None else None
+    specs: tuple[Any, ...] | None
     if path.target is ParamTarget.SOURCE:
         if stroke is not None:
             params, specs = stroke.params, STROKE.parameters
         elif source is not None:
             made = source_registry.get(source.kind)
-            params, specs = source.params, made.parameters if made is not None else ()
+            params, specs = source.params, made.parameters if made is not None else None
         else:
             raise ToolError("このクリップは中身（テキストや図形）を持ちません effect_id を渡します")
     else:
@@ -1828,12 +1839,13 @@ def _one_value(clip: Clip, path: ParamPath) -> ParamValue:
         if effect is None:
             raise ToolError(f"エフェクトが見つかりません: {path.effect_id}")
         definition = registry.get(effect.kind)
-        params, specs = effect.params, definition.parameters if definition is not None else ()
+        params, specs = effect.params, definition.parameters if definition is not None else None
     merged = _merged(params, specs)
     if path.name not in merged:
         known = "、".join(merged) or "（欄が無い）"
         raise ToolError(f"{path.name} という欄は無いです 欄の名前: {known}")
-    return merged[path.name]
+    value, needs = merged[path.name]
+    return _shown(value, needs)
 
 
 def _get_one_value(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
@@ -1857,6 +1869,8 @@ def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     samples = _curve_samples(arguments)
     if arguments.get("name"):
         return _get_one_value(clip, arguments, samples)
+    if arguments.get("stroke_id"):
+        return _get_stroke(clip, arguments, samples)
     duration = clip.duration
     source = clip.source
     if clip.scene_id is not None:
@@ -1889,28 +1903,40 @@ def _get_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
     if source is not None:
         definition = source_registry.get(source.kind)
-        specs = definition.parameters if definition is not None else ()
+        specs = definition.parameters if definition is not None else None
         head["params"] = _values(source.params, specs, duration, samples, _place())
         if source.strokes:
+            # 層ごとの値とエフェクトは載せず、層の一覧だけ 全部を載せると層の多い字で返事が
+            # 上限を越えて切られ、切られた層を後から取る道が無かった（#391 の Codex の指摘）
+            # 値は stroke_id を渡して層ごとに読む（エフェクトは offset で区切る）
+            # 層は多くても MAX_STROKES（8）なので、一覧そのものは区切らなくても収まる
             head["strokes"] = [
                 {
                     "stroke_id": str(stroke.id),
                     "enabled": stroke.enabled,
-                    "params": _values(
-                        stroke.params,
-                        STROKE.parameters,
-                        duration,
-                        samples,
-                        _place(stroke_id=str(stroke.id)),
-                    ),
-                    "effects": _effect_rows(
-                        stroke.effects, duration, samples, stroke_id=str(stroke.id)
-                    ),
+                    "effect_count": len(stroke.effects),
                 }
                 for stroke in source.strokes
             ]
+            head["stroke_count"] = len(source.strokes)
     rows = _effect_rows(clip.effects, duration, samples)
     rows += _effect_rows(clip.after_effects, duration, samples, after=True)
+    return _paged_after(head, rows, arguments, "effects", _CLIP_NOTE)
+
+
+def _get_stroke(clip: Clip, arguments: dict[str, Any], samples: int) -> dict[str, Any]:
+    """縁取りの層 1 つの値と、層に掛けたエフェクト（offset で区切る）"""
+    stroke = _require_stroke(clip, str(arguments["stroke_id"]))
+    place = str(stroke.id)
+    head: dict[str, Any] = {
+        "clip_id": str(clip.id),
+        "stroke_id": place,
+        "enabled": stroke.enabled,
+        "params": _values(
+            stroke.params, STROKE.parameters, clip.duration, samples, _place(stroke_id=place)
+        ),
+    }
+    rows = _effect_rows(stroke.effects, clip.duration, samples, stroke_id=place)
     return _paged_after(head, rows, arguments, "effects", _CLIP_NOTE)
 
 
@@ -1921,7 +1947,8 @@ _CLIP_NOTE = (
     " 欄の名前は set_param・add_keyframe の name に、effect_id・stroke_id もそのまま渡せる"
     f" 点が {OVERVIEW_KEYFRAMES} より多い値は頭の点だけを載せ、keyframe_count に全部の数、"
     "more_keyframes に読む引数を添える その引数（name と effect_id など）を get_clip に渡すと"
-    "その値の点を全部 offset で区切って読める"
+    "その値の点を全部 offset で区切って読める 縁取りの層の値と層のエフェクトは stroke_id だけを"
+    "渡して層ごとに読む 〔伏せ字〕〔ファイルの場所〕はユーザーが送らないと決めた文字と場所"
 )
 
 
@@ -4429,9 +4456,19 @@ def _set_param(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
     value = arguments.get("value")
-    resolved = _coerce_param(_project(host), path, value)
+    project = _project(host)
+    resolved = _coerce_param(project, path, value)
+    spec = _spec_for(project, path)
     host.apply_commands([SetParam(path, resolved)], f"{path.name} を変更")
-    return {"name": path.name, "value": str(value)}
+    # 返す値も欄の型で伏せる（get_clip と同じ #391） 定義の分からない欄の文字は伏せる側に数える
+    # クリップ自身の欄（不透明度）は定義を持たないが文字ではない
+    if spec is not None:
+        needs = field_sends(spec)
+    elif path.target is ParamTarget.CLIP:
+        needs = frozenset()
+    else:
+        needs = UNKNOWN_FIELD_SENDS
+    return {"name": path.name, "value": masked_value(str(value), needs)}
 
 
 def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
@@ -6636,7 +6673,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     " limit で区切って返す（全体の点が切られた値の more_keyframes の引数）"
                 ),
                 "effect_id": _string("name の値があるエフェクト"),
-                "stroke_id": _string("name の値がある縁取りの層"),
+                "stroke_id": _string(
+                    "縁取りの層 name なしで渡すと、その層の値と層のエフェクト（offset で区切る）を"
+                    "読む name と渡すとその層の値 1 つ"
+                ),
                 "target": _string("name の値の在りか source か clip（clip は opacity）"),
                 "after": _boolean("name の値が場面切り替えの後の場面のエフェクトにある"),
                 "samples": _integer(

@@ -28,6 +28,8 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -36,25 +38,31 @@ from typing import Any, Protocol
 from sashimono.core.model import Effect, MediaId, Project
 from sashimono.effects import registry
 from sashimono.effects.sources import source_registry
-from sashimono.effects.spec import TextSpec
+from sashimono.effects.spec import FileSpec, TextSpec
 from sashimono.effects.strokes import STROKE
 
 __all__ = [
     "ASKED",
     "DESTINATION",
+    "FIELD_SENDS",
     "NAME_MARK",
+    "PATH_MARK",
     "PROJECT_MARK",
     "REMEMBERED_MARK",
     "TEXT_MARK",
+    "UNKNOWN_FIELD_SENDS",
     "NamedMedia",
     "Outbound",
     "SendAnswer",
     "SendChoice",
     "SendRequest",
+    "field_sends",
     "file_secrets",
     "hide_text",
+    "masked_value",
     "redact",
     "secret_pairs",
+    "sending",
     "text_secrets",
 ]
 
@@ -240,6 +248,8 @@ _ABSOLUTE_PATH = re.compile(
     + r"|(?:^|(?<=\s))[/\\][^\s\"'<>|*?/\\]+(?=$|\s)"
 )
 _PATH_MARK = "〔ファイルの場所〕"
+#: 場所の欄（:class:`FileSpec`）を値ごと伏せた印 文の中の場所を形で伏せた印と同じ
+PATH_MARK = _PATH_MARK
 
 #: 値ごと伏せる項目の名前 設定の中のフォルダ（``state_folder``・``export_folder``）や
 #: 一覧の ``path`` など 中身の形（正規表現）で見分けると、``/backup`` のような短い場所や、
@@ -334,6 +344,66 @@ def secret_pairs(table: Mapping[str, str]) -> list[tuple[str, str]]:
 
 #: 字幕と文字を伏せたときの印
 TEXT_MARK = "〔伏せ字〕"
+
+
+# --- 欄の型で伏せる（#391 の Codex の指摘）---
+#
+# 欄の値（テキストの文字・スクリプトの文字の欄・画像の場所など）は、文字列を表に集めて後から
+# 照らす伏せ方では漏れる 名前の text だけを集めると別の名前の文字の欄が、2 文字より短い値は
+# 表に入らず 1 文字の文が、場所の形と名前の形で見分けると「模様.png」のような相対の名前が、
+# どれも伏せずに送られた（Codex の指摘が 2 回続いた） 値を返す道具は結果を組む所で欄の型を
+# 引き、送らない設定ならその値そのものを印へ置き換える 長さや名前の形には頼らない
+# 表の照らし（:func:`text_secrets` :func:`redact`）は、型の無い所（字幕・エラーの文）の補いに残す
+
+#: 欄の型ごとに、値を送るのに要る許し この表が 1 か所の決まり（docs/development.md の
+#: 「人が画面で見ている物を AI も読む」と ``tests/ai/test_screen_reading.py`` が同じ表を持つ）
+#: 型を足すときは、人が書いた文か場所かを考えてここへ足す 書かない型は編集の構成として送る
+FIELD_SENDS: dict[type, frozenset[Outbound]] = {
+    TextSpec: frozenset({Outbound.TEXT}),
+    FileSpec: frozenset({Outbound.FILES}),
+}
+#: 定義の分からない種類（読み込んでいないスクリプト）の文字の値 文か場所か分からないので、
+#: 両方を許したときだけ送る
+UNKNOWN_FIELD_SENDS = frozenset({Outbound.TEXT, Outbound.FILES})
+
+#: 今動いている道具の結果にそのまま載せてよい物 ブリッジが道具を動かす間だけ立てる
+#: 立っていないのは編集画面の中から直に呼んだときで、結果は外へ出ないので全部を載せる
+_SENDABLE: ContextVar[frozenset[Outbound] | None] = ContextVar("sendable", default=None)
+
+
+@contextmanager
+def sending(kinds: frozenset[Outbound]) -> Iterator[None]:
+    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）"""
+    token = _SENDABLE.set(kinds)
+    try:
+        yield
+    finally:
+        _SENDABLE.reset(token)
+
+
+def field_sends(spec: object | None, *, known: bool = True) -> frozenset[Outbound]:
+    """欄の値を送るのに要る許し ``known`` が偽なら定義の分からない種類の欄"""
+    if not known:
+        return UNKNOWN_FIELD_SENDS
+    for kind, needs in FIELD_SENDS.items():
+        if isinstance(spec, kind):
+            return needs
+    return frozenset()
+
+
+def masked_value(value: Any, needs: frozenset[Outbound]) -> Any:
+    """送ってよくなければ、欄の値そのものを印へ置き換える 長さや形を問わない
+
+    空の文字は何も載っていないので残す（印にすると、書いてあるように読める）
+    文字でない値（数・色・印）は伏せない 文字の欄と場所の欄が持つのは文字だけ
+    """
+    if not needs or not isinstance(value, str) or value == "":
+        return value
+    allowed = _SENDABLE.get()
+    if allowed is None or needs <= allowed:
+        return value
+    return TEXT_MARK if Outbound.TEXT in needs - allowed else PATH_MARK
+
 
 #: 操作の名前の「動き: 対象」の対象のうち、伏せずに残す物 数と数え方だけ（「無音カット: 3 か所」）
 #: 中身の文字ではないので、残しても字幕や本文は外へ出ない

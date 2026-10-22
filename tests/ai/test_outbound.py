@@ -1362,19 +1362,21 @@ class TestTypedTextIsHidden:
         # 文字でない値（大きさ）は読める
         assert '"size"' in sent
 
+    @pytest.mark.parametrize("kind", [Outbound.TEXT, Outbound.FILES])
     def test_weakening_the_declaration_is_caught(
-        self, host: FakeHost, scripted: str, text_refused: EditorBridge
+        self, host: FakeHost, scripted: str, kind: Outbound
     ) -> None:
-        """壊れると（get_clip が字幕と文字を伏せて送ると書かなくなると）、表を通らずに結果を
-        そのまま返すのに、送る物の見張りが気付かない"""
-        _typed_texts(host, scripted)
+        """壊れると（get_clip が字幕と文字や名前と場所を送ると書かなくなると）、設定画面と
+        同意の窓に出ないまま、文字の欄と場所の欄の値が送られるのに、送る物の見張りが気付かない"""
+        clip = _typed_texts(host, scripted)
+        image = Effect(kind="image_blend", params={"image_file": str(SECRET_PATH)})
+        host.apply_commands([AddEffect(clip, image)], "画像")
         operation = _operation("get_clip")
         weakened = replace(
-            operation,
-            sends=operation.sends - {Outbound.TEXT},
-            hidden=operation.hidden - {Outbound.TEXT},
+            operation, sends=operation.sends - {kind}, hidden=operation.hidden - {kind}
         )
-        done, box = call_in_thread(text_refused, weakened, {})
-        answer_sends(text_refused, done, _never)
-        assert SCRIPT_TEXT in json.dumps(box["result"], ensure_ascii=False)
-        assert undeclared(weakened, box["result"], sentences={SCRIPT_TEXT, TYPED_TEXT})
+        # 編集画面の中から直に呼んだ形（許しを立てない）で、道具が返しうる物を全部見る
+        result = weakened(host, {})
+        sentences = {SCRIPT_TEXT, TYPED_TEXT}
+        assert not undeclared(operation, result, sentences=sentences, places=READ_PLACES)
+        assert undeclared(weakened, result, sentences=sentences, places=READ_PLACES)

@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import replace
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -18,12 +19,23 @@ import pytest
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import CompatReport, ToolError
 from sashimono.ai.operations import MAX_RESULT_CHARS, find_operation
-from sashimono.ai.outbound import ASKED, SendChoice
+from sashimono.ai.outbound import (
+    ASKED,
+    FIELD_SENDS,
+    PATH_MARK,
+    TEXT_MARK,
+    UNKNOWN_FIELD_SENDS,
+    Outbound,
+    SendChoice,
+)
 from sashimono.compat.aviutl.report import CompatibilityReport
-from sashimono.core.commands import AddEffect, ParamPath, SetKeyframe, SetWorkArea
+from sashimono.core.commands import AddEffect, ParamPath, SetKeyframe, SetParam, SetWorkArea
 from sashimono.core.io.serialize import json_text
-from sashimono.core.model import ClipId, Effect, MediaItem, Project, Transcript
+from sashimono.core.model import ClipId, Effect, MediaItem, Project, StrokeId, Transcript
 from sashimono.core.timebase import format_timecode
+from sashimono.effects import registry
+from sashimono.effects.definition import EffectDefinition
+from sashimono.effects.spec import FileSpec, TextSpec
 from tests.ai.conftest import FakeHost
 from tests.ai.test_bridge import call_in_thread
 
@@ -128,7 +140,37 @@ class TestClipValues:
         assert result["params"]["text"] == "見出し"
         assert result["params"]["size"] == 80.0
         assert result["strokes"][0]["stroke_id"] == stroke
-        assert "width" in result["strokes"][0]["params"]
+        layer = run(host, "get_clip", clip_id=clip, stroke_id=stroke)
+        assert "width" in layer["params"]
+
+    def test_many_strokes_are_read_layer_by_layer(self, host: FakeHost) -> None:
+        """壊れると、縁取りの層を何十も重ねた字で返事が上限を越えて切られ、切られた層の値と
+        層のエフェクトを後から取る道が無いまま、AI が見えた分だけで直す（#391 の Codex の指摘）"""
+        run(host, "add_text", text="見出し")
+        clip = _text_clip(host)
+        made = [run(host, "add_stroke", clip_id=str(clip))["stroke_id"] for _ in range(8)]
+        host.apply_commands(
+            [
+                AddEffect(clip, Effect(kind="blur"), stroke_id=StrokeId(stroke))
+                for stroke in made
+                for _ in range(40)
+            ],
+            "層ごとにぼかしを積む",
+        )
+        overview = run(host, "get_clip", clip_id=str(clip), samples=60)
+        assert len(json_text(overview)) <= MAX_RESULT_CHARS
+        assert overview["stroke_count"] == 8
+        assert [row["stroke_id"] for row in overview["strokes"]] == made
+        assert [row["effect_count"] for row in overview["strokes"]] == [40] * 8
+        effects: list[str] = []
+        offset: int | None = 0
+        while offset is not None:
+            layer = run(host, "get_clip", clip_id=str(clip), stroke_id=made[-1], offset=offset)
+            assert len(json_text(layer)) <= MAX_RESULT_CHARS
+            assert "width" in layer["params"]
+            effects += [row["effect_id"] for row in layer["effects"]]
+            offset = layer.get("next_offset")
+        assert len(set(effects)) == 40
 
     def test_the_effects_of_the_scene_after_a_transition_are_marked(self, host: FakeHost) -> None:
         """壊れると、場面切り替えの前と後の場面に積んだ同じ種類のエフェクトを AI が見分けられない"""
@@ -382,3 +424,141 @@ def test_the_reading_thread_is_not_the_editing_thread(host: FakeHost) -> None:
         bridge.pump()
         time.sleep(0.005)
     assert seen == [threading.get_ident()]
+
+
+# --- 欄の型で伏せる（#391 の Codex の指摘 2 回）---
+
+#: 欄の型ごとに、値を送るのに要る許し ``src/sashimono/ai/outbound.py`` の ``FIELD_SENDS`` と
+#: ``docs/development.md`` の「人が画面で見ている物を AI も読む」の表と同じ物を持つ
+FIELD_TABLE: dict[type, set[Outbound]] = {
+    TextSpec: {Outbound.TEXT},
+    FileSpec: {Outbound.FILES},
+}
+#: 定義の分からない種類の文字の値
+UNKNOWN_TABLE = {Outbound.TEXT, Outbound.FILES}
+#: 文字の欄と場所の欄に書きうる値 長さ・空白・相対の名前・ユーザー名入りの場所
+#: 表に集めて照らす伏せ方では、短い値と相対の名前が漏れた
+TRICKY_VALUES = ["字", " ", "模様.png", "C:/Users/秘密の人/模様.png", "ここだけの秘密の文です"]
+#: 文字の欄と場所の欄を好きな名前で持つスクリプト 試験の間だけ登録する
+SCRIPT_KIND = "aviutl.script:試しの欄@試験"
+#: 読み込んでいない（定義の分からない）スクリプト
+UNKNOWN_KIND = "aviutl.script:読み込んでいない@試験"
+
+
+@pytest.fixture
+def script_fields() -> Iterator[None]:
+    registry.register(
+        EffectDefinition(
+            kind=SCRIPT_KIND,
+            label="試しの欄",
+            category="試し",
+            parameters=(TextSpec("message", "文字", ""), FileSpec("picture", "画像")),
+        )
+    )
+    yield
+    registry.unregister(SCRIPT_KIND)
+
+
+@dataclass(frozen=True)
+class _Field:
+    """伏せ方を見る欄 1 つ どこに置き、結果のどこに出て、何の許しが要るか"""
+
+    label: str
+    #: 値を書き込んだテキストのクリップの、get_clip の結果の中の値を返す
+    place: Callable[[FakeHost, ClipId, str], Callable[[dict[str, Any]], Any]]
+    needs: set[Outbound]
+
+
+def _in_source(name: str) -> Callable[[FakeHost, ClipId, str], Callable[[dict[str, Any]], Any]]:
+    def place(host: FakeHost, clip: ClipId, value: str) -> Callable[[dict[str, Any]], Any]:
+        host.apply_commands([SetParam(ParamPath.of_source(clip, name), value)], "欄")
+        return lambda result: result["params"][name]
+
+    return place
+
+
+def _in_effect(
+    kind: str, name: str
+) -> Callable[[FakeHost, ClipId, str], Callable[[dict[str, Any]], Any]]:
+    def place(host: FakeHost, clip: ClipId, value: str) -> Callable[[dict[str, Any]], Any]:
+        effect = Effect(kind=kind, params={name: value})
+        host.apply_commands([AddEffect(clip, effect)], "欄")
+        effect_id = str(effect.id)
+        return lambda result: next(
+            row["params"][name] for row in result["effects"] if row["effect_id"] == effect_id
+        )
+
+    return place
+
+
+FIELDS = [
+    _Field("テキストの本文（text）", _in_source("text"), FIELD_TABLE[TextSpec]),
+    _Field("text 以外の名前の文字の欄", _in_source("timer_format"), FIELD_TABLE[TextSpec]),
+    _Field("縁取りの模様の画像（pattern）", _in_effect("border", "pattern"), FIELD_TABLE[FileSpec]),
+    _Field("スクリプトの文字の欄", _in_effect(SCRIPT_KIND, "message"), FIELD_TABLE[TextSpec]),
+    _Field("スクリプトの場所の欄", _in_effect(SCRIPT_KIND, "picture"), FIELD_TABLE[FileSpec]),
+    _Field("定義の分からないスクリプト", _in_effect(UNKNOWN_KIND, "anything"), UNKNOWN_TABLE),
+]
+
+
+def _read_through_bridge(host: FakeHost, refused: set[Outbound]) -> dict[str, Any]:
+    bridge = EditorBridge(host)
+    bridge.set_send_choices(
+        {kind: SendChoice.DENY if kind in refused else SendChoice.ALLOW for kind in ASKED}
+    )
+    operation = find_operation("get_clip")
+    assert operation is not None
+    done, box = call_in_thread(bridge, operation, {})
+    deadline = time.monotonic() + 5
+    while not done.is_set() and time.monotonic() < deadline:
+        bridge.pump()
+        time.sleep(0.005)
+    assert done.is_set() and "error" not in box, box.get("error")
+    result = box["result"]
+    assert isinstance(result, dict)
+    return result
+
+
+class TestFieldsAreHiddenByType:
+    def test_the_table_is_the_one_the_bridge_uses(self) -> None:
+        """壊れると、どの欄を字幕と文字・名前と場所として伏せるかが、決まりの表・説明・試験で
+        食い違い、表に足した型が伏せられないか、伏せたつもりの型が送られる"""
+        assert {kind: set(needs) for kind, needs in FIELD_SENDS.items()} == FIELD_TABLE
+        assert set(UNKNOWN_FIELD_SENDS) == UNKNOWN_TABLE
+
+    @pytest.mark.parametrize("field", FIELDS, ids=lambda field: field.label)
+    @pytest.mark.parametrize("value", TRICKY_VALUES)
+    def test_a_refused_field_is_hidden_whatever_its_value(
+        self, host: FakeHost, script_fields: None, field: _Field, value: str
+    ) -> None:
+        """壊れると、送らないと決めた文字や場所が、短い・空白・相対の名前・好きな欄の名前という
+        だけで伏せられずに get_clip から外へ出る（表に集めて照らす伏せ方の抜け）"""
+        del script_fields
+        run(host, "add_text", text="見出し")
+        clip = _text_clip(host)
+        host.select_clip(clip)
+        read = field.place(host, clip, value)
+        for refused in field.needs:
+            shown = read(_read_through_bridge(host, {refused}))
+            assert shown in (TEXT_MARK, PATH_MARK), (refused, shown)
+
+    @pytest.mark.parametrize("field", FIELDS, ids=lambda field: field.label)
+    @pytest.mark.parametrize("value", TRICKY_VALUES)
+    def test_an_allowed_field_is_sent_as_it_is(
+        self, host: FakeHost, script_fields: None, field: _Field, value: str
+    ) -> None:
+        """壊れると、送ってよいと決めた人にも値が印で返り、AI が今の文字や画像を読めずに直す"""
+        del script_fields
+        run(host, "add_text", text="見出し")
+        clip = _text_clip(host)
+        host.select_clip(clip)
+        read = field.place(host, clip, value)
+        assert read(_read_through_bridge(host, set())) == value
+
+    def test_numbers_are_not_hidden(self, host: FakeHost) -> None:
+        """壊れると、文字と場所を送らない人の所で大きさや位置まで印になり、何も直せない"""
+        run(host, "add_text", text="見出し", size=80)
+        host.select_clip(_text_clip(host))
+        result = _read_through_bridge(host, {Outbound.TEXT, Outbound.FILES})
+        assert result["params"]["size"] == 80.0
+        assert result["params"]["text"] == TEXT_MARK
