@@ -10,7 +10,8 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from functools import cache
 from pathlib import Path
@@ -270,11 +271,33 @@ class _EncoderWriteError(_EncoderError):
     """
 
 
-def _fallback_notice(refused: list[tuple[str, _EncoderError]], used: str) -> str:
-    """次の候補で書き上げたときの知らせ 何で書いたかと、前の候補が使えなかった理由"""
-    reasons = " / ".join(str(error) for _codec, error in refused)
-    names = "、".join(codec for codec, _error in refused)
-    return f"{names} では書き出せなかったので、{used} で最初から書き出し直した（{reasons}）"
+class _GpuColorError(ExportError):
+    """GPU の色変換か読み戻しが、書き出しの途中で使えなくなった（#372）
+
+    その場から CPU の道へ切り替えては続けられない 読み戻している途中のコマは GPU の
+    バッファごと捨てるしかなく、絵と音の一部はもう入れ物へ書いてある 続けるとコマが欠けるか
+    順が乱れるので、同じコーデックで頭から CPU の色変換で書き直す
+    """
+
+
+def _fallback_notice(
+    refused: list[tuple[str, _EncoderError]], used: str, gpu_failure: _GpuColorError | None
+) -> str:
+    """書き直して書き上げたときの知らせ 何で書いたかと、前の試みが使えなかった理由
+
+    エンコーダを替えたことと GPU の色変換をやめたことは、1 つにまとめて知らせる
+    分けると、1 回の書き出しで窓に知らせが 2 度出て、どちらが最後の状態か迷う
+    """
+    parts: list[str] = []
+    if refused:
+        reasons = " / ".join(str(error) for _codec, error in refused)
+        names = "、".join(codec for codec, _error in refused)
+        parts.append(
+            f"{names} では書き出せなかったので、{used} で最初から書き出し直した（{reasons}）"
+        )
+    if gpu_failure is not None:
+        parts.append(f"色変換を CPU に替えて最初から書き出し直した（{gpu_failure}）")
+    return " ".join(parts)
 
 
 def _video_options(codec: str, settings: ExportSettings) -> dict[str, str]:
@@ -334,6 +357,8 @@ def export_project(
     コーデックを名指ししない書き出しで、候補のエンコーダが開けなかったり途中で書けなく
     なったりしたら、次の候補で最初から書き出し直す 書き上げたら、何で書いたかを ``notice``
     へ知らせる（#365） 黙って替えると、GPU で書いたつもりの人が遅さや画の違いの理由を探せない
+    GPU の色変換（#372）が途中で使えなくなったときは、同じコーデックで色変換を CPU にして
+    頭から書き直し、同じ知らせにまとめて伝える
     """
     start, end = settings.frame_range or (0, project.duration)
     total = end - start
@@ -393,11 +418,15 @@ def export_project(
     mixer = AudioMixer(project, smooth_history=settings.smooth_history)
     #: 書けなかったコーデックと理由 次の候補で書き上げたときに、何で書いたかと一緒に知らせる
     refused: list[tuple[str, _EncoderError]] = []
+    #: 途中で使えなくなった GPU の色変換 CPU で書き直したときに、エンコーダの話と一緒に知らせる
+    gpu_failure: _GpuColorError | None = None
     # 書き直しても進み具合を戻さない（#365 戻ると窓のバーや AI の export_status が下がる）
     shown = MonotonicProgress(progress) if progress is not None else None
 
     try:
-        for index, codec in enumerate(codecs):
+        index = 0
+        while True:
+            codec = codecs[index]
             try:
                 _encode(
                     project,
@@ -410,28 +439,42 @@ def export_project(
                     shown.report if shown is not None else None,
                     should_cancel,
                 )
+            except _GpuColorError as exc:
+                # 同じコーデックのまま、色変換だけ CPU にして頭から書き直す（#372）
+                # CPU で書き直しても同じ所で落ちる物ではないので、候補は進めない
+                # gpu_color を切ってから書き直すので、2 度目はここへ来ない
+                settings.path.unlink(missing_ok=True)
+                if not settings.gpu_color:
+                    raise
+                gpu_failure = exc
+                settings = replace(settings, gpu_color=False)
             except _EncoderError as exc:
                 # 書きかけの入れ物を消して次へ移る 候補が尽きたら理由をそのまま伝える
                 settings.path.unlink(missing_ok=True)
                 if index == len(codecs) - 1:
                     raise
                 refused.append((codec, exc))
-                if shown is not None:
-                    shown.start_again()
-                if isinstance(exc, _EncoderWriteError):
-                    # 途中まで描いて音も進めた 描く側と混ぜる側は前の音や絵を覚えている
-                    # （音の効果の残り・軌跡など）ので、作り直して最初から書き出し直す
-                    # 使い回すと、2 本目の頭に 1 本目の途中の音や絵が混ざる
-                    renderer.close()
-                    mixer.close()
-                    renderer = FrameRenderer(
-                        project, context=context, quality=FULL_QUALITY, decode_threads=threads
-                    )
-                    mixer = AudioMixer(project, smooth_history=settings.smooth_history)
-                continue
-            if refused and notice is not None:
-                notice(_fallback_notice(refused, codec))
-            break
+                index += 1
+                if not isinstance(exc, _EncoderWriteError):
+                    # 開く前に断られた まだ何も描いていないので、描く側をそのまま使える
+                    if shown is not None:
+                        shown.start_again()
+                    continue
+            else:
+                if (refused or gpu_failure is not None) and notice is not None:
+                    notice(_fallback_notice(refused, codec, gpu_failure))
+                break
+            if shown is not None:
+                shown.start_again()
+            # 途中まで描いて音も進めた 描く側と混ぜる側は前の音や絵を覚えている
+            # （音の効果の残り・軌跡など）ので、作り直して最初から書き出し直す
+            # 使い回すと、書き直した頭に前の試みの途中の音や絵が混ざる
+            renderer.close()
+            mixer.close()
+            renderer = FrameRenderer(
+                project, context=context, quality=FULL_QUALITY, decode_threads=threads
+            )
+            mixer = AudioMixer(project, smooth_history=settings.smooth_history)
     except BaseException:
         # 例外でもキャンセルでも、書きかけを残さない
         settings.path.unlink(missing_ok=True)
@@ -702,18 +745,20 @@ class _FrameSource:
         with self._renderer.context:
             self._renderer.compose(frame_number)
             texture = self._renderer.compositor.resolved_texture()
-            readback.push(texture, (index, frame_number))
+            with _gpu_color_failures():
+                readback.push(texture, (index, frame_number))
             if not readback.full:
                 return []
             reserve()
-            (done, number), image = readback.pop()
+            with _gpu_color_failures():
+                (done, number), image = readback.pop()
         return [(done, number, image)]
 
     def drain(self, reserve: Callable[[], None]) -> Iterator[_Frame]:
         """読み戻している途中のコマを、合成した順に出す"""
         while self._readback is not None and self._readback.pending:
             reserve()
-            with self._renderer.context:
+            with self._renderer.context, _gpu_color_failures():
                 (index, frame_number), image = self._readback.pop()
             yield index, frame_number, image
 
@@ -723,6 +768,18 @@ class _FrameSource:
         if readback is not None:
             with self._renderer.context:
                 readback.release()
+
+
+@contextmanager
+def _gpu_color_failures() -> Iterator[None]:
+    """書き出しの途中で GPU の色変換や読み戻しを駆動が断ったら :class:`_GpuColorError` にする
+
+    素の GL の例外のまま出すと、CPU でなら書ける書き出しが丸ごと失敗する
+    """
+    try:
+        yield
+    except (ShaderError, GLLibraryError) as exc:
+        raise _GpuColorError(f"GPU の色変換が書き出しの途中で使えなくなった ({exc})") from exc
 
 
 #: GPU の変換を確かめるときの読み戻しの印 合成したコマの印（通し番号は 0 から）と重ならない

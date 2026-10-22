@@ -374,6 +374,34 @@ class TestCleanup:
         assert readback.released
         assert renderer.context.depth == 0
 
+    @pytest.mark.parametrize("where", ["frame", "drain"])
+    def test_a_readback_failure_mid_way_is_a_signal_to_start_again(
+        self, monkeypatch: pytest.MonkeyPatch, where: str
+    ) -> None:
+        # 素の GL の例外のまま出ると、CPU でなら書ける書き出しが丸ごと失敗する
+        # 書き出しの側が見分けられる合図にして、色変換を CPU にして頭から書き直させる
+        readback = _Readback("yuv420p")
+        popped = [0]
+        real_pop = readback.pop
+
+        def failing() -> tuple[tuple[int, int], np.ndarray]:
+            popped[0] += 1
+            # 1 回目は始める前の試験の絵 2 回目は 2 コマ目を入れて溜まりきったときの実のコマ
+            # 3 回目は drain で受け取る最後のコマ
+            if popped[0] >= (2 if where == "frame" else 3):
+                raise ShaderError("読み戻しのバッファを開けない")
+            return real_pop()
+
+        monkeypatch.setattr(readback, "pop", failing)
+        source, _renderer, _opened = _source(monkeypatch, readback)
+        assert source.on_gpu
+        with pytest.raises(exporter._GpuColorError, match="途中で使えなくなった"):
+            for index in range(2):
+                source.frame(index, index, lambda: None)
+            list(source.drain(lambda: None))
+        source.release()
+        assert readback.released
+
 
 # ここから下は実際に書き出す GPU の無い機械では飛ばす
 
@@ -577,3 +605,85 @@ class TestExport:
         assert seen == sorted(seen), f"進み具合が戻った: {seen}"
         assert seen[-1] == pytest.approx(1.0)
         assert len(_planes(output)) == 12
+
+    @pytest.mark.parametrize("depth", [0, 2])
+    def test_a_readback_failure_mid_way_writes_again_on_the_cpu(
+        self,
+        moving_project: Project,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        depth: int,
+    ) -> None:
+        """GPU の読み戻しが書き出しの途中で失敗しても、同じコーデックで CPU の色変換で書き上げる
+
+        素の GL の例外のまま出すと、CPU でなら書ける書き出しが丸ごと失敗して書きかけも消える
+        その場から CPU に切り替えると、読み戻している途中のコマが欠けるか順が乱れる
+        頭から書き直せば、CPU の道だけで書いた動画と 1 画素も違わず、音の長さもそろう
+        """
+        pops = [0]
+        real_pop = yuv.YuvReadback.pop
+
+        def failing(
+            self: yuv.YuvReadback[tuple[int, int]],
+        ) -> tuple[tuple[int, int], np.ndarray]:
+            tag, image = real_pop(self)
+            if tag != exporter._CHECK_TAG:
+                pops[0] += 1
+                # 実のコマを 4 枚受け取った所で駆動が断ったことにする 3 枚はもう書いてある
+                if pops[0] == 4:
+                    raise ShaderError("読み戻しのバッファを開けない")
+            return tag, image
+
+        opened: list[yuv.YuvReadback[tuple[int, int]]] = []
+        real_open = yuv.open_readback
+
+        def spy_open(width: int, height: int, fmt: str) -> yuv.YuvReadback[tuple[int, int]] | None:
+            readback: yuv.YuvReadback[tuple[int, int]] | None = real_open(width, height, fmt)
+            if readback is not None:
+                opened.append(readback)
+            return readback
+
+        # 書き直す前に書きかけを消したかを、書き始めるときにファイルがあるかで見る
+        left_over: list[bool] = []
+        real_encode = exporter._encode
+
+        def spy_encode(
+            project: Project, settings: ExportSettings, *arguments: Any, **options: Any
+        ) -> None:
+            left_over.append(settings.path.exists())
+            real_encode(project, settings, *arguments, **options)
+
+        monkeypatch.setattr(yuv.YuvReadback, "pop", failing)
+        monkeypatch.setattr(exporter, "open_readback", spy_open)
+        monkeypatch.setattr(exporter, "_encode", spy_encode)
+        seen: list[float] = []
+        notices: list[str] = []
+        gpu = tmp_path / "gpu.mp4"
+        export_project(
+            moving_project,
+            _lossless(gpu, gpu_color=True, depth=depth),
+            progress=seen.append,
+            notice=notices.append,
+        )
+        monkeypatch.undo()
+        cpu = tmp_path / "cpu.mp4"
+        export_project(moving_project, _lossless(cpu, gpu_color=False, depth=depth))
+
+        assert pops[0] == 4, "GPU の道で途中まで書いていない"
+        assert len(opened) == 1, "書き直しで、断った GPU の読み戻しをもう 1 度開いた"
+        assert opened[0].released, "読み戻しのバッファを返していない"
+        assert left_over == [False, False], "書きかけのファイルを残したまま書き直した"
+        left, right = _planes(gpu), _planes(cpu)
+        assert len(left) == len(right) == 12
+        for number, (a, b) in enumerate(zip(left, right, strict=True)):
+            assert np.array_equal(a, b), f"{number} 枚目が CPU の道と違う（欠けたか順が乱れた）"
+        assert _samples(gpu) == _samples(cpu) > 0, "書き直しで音の長さが変わった"
+        assert len(notices) == 1 and "CPU" in notices[0]
+        assert seen == sorted(seen), f"進み具合が戻った: {seen}"
+        assert seen[-1] == pytest.approx(1.0)
+
+
+def _samples(path: Path) -> int:
+    """音声の標本の数 書き直しで頭の音が重なったり欠けたりすると変わる"""
+    with av.open(str(path)) as container:
+        return sum(frame.samples for frame in container.decode(audio=0))
