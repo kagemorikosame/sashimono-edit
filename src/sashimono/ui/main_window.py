@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.host import ExportRequest, ToolError
+from sashimono.ai.host import CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -707,6 +707,9 @@ class MainWindow(QMainWindow):
         self._narration_timer = QTimer(self)
         self._narration_timer.setInterval(100)
         self._narration_timer.timeout.connect(self._check_narration)
+        #: 人が開いている書き出しの窓 開いている間だけ持つ AI が人の書き出しの進み具合を
+        #: 読むため（#352） 窓は閉じたら捨てるので、閉じた後まで持つと消えた窓を読む
+        self._person_export: ExportDialog | None = None
         self._assistant_export_indicator = ProgressIndicator(self, cancel_text="中止")
         stop = self._assistant_export_indicator.cancel_button
         if stop is not None:
@@ -3044,7 +3047,11 @@ class MainWindow(QMainWindow):
             chapters=self._preferences.export_chapters,
             encoder_priority=self._preferences.encoder_priority,
         )
-        dialog.exec()
+        self._person_export = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._person_export = None
         if dialog.embeds_chapters != self._preferences.export_chapters:
             # 窓で替えた章の埋め方を覚える 覚えないと、要らない人は書き出すたびに切り直す
             # 書き出さずに閉じても覚える 窓で選んだ時点で、本人の好みはそちらと分かる
@@ -3997,8 +4004,17 @@ class MainWindow(QMainWindow):
         # 載せると字幕と文字を送らないと決めた人の文まで外へ出る 有る無しだけを残す
         # （作品の方針は get_style_guide が字幕と文字として同意を取って読む）
         preferences["new_project_style_guide"] = not self._preferences.new_project_style_guide.empty
+        updates = self._updates
         return {
             "version": __version__,
+            # ヘルプの〔更新を確かめる…〕〔前の版に戻す…〕で人が見る物（#352）
+            # 版の数字だけ 置き場の場所は返さない
+            "update": {
+                "checks": updates.configured and self._preferences.update_check,
+                "checking": updates.busy,
+                "ready_version": updates.ready_version(),
+                "can_roll_back": updates.can_roll_back(),
+            },
             "preferences": preferences,
             "shortcuts": {
                 name: action.shortcut().toString(_PORTABLE)
@@ -4010,6 +4026,39 @@ class MainWindow(QMainWindow):
                 "読むだけです 変えるのは人だけです（表示 → 設定… / ショートカットの設定… など）"
             ),
         }
+
+    def view_state(self) -> ViewState:
+        """人が画面で見ている表示の状態（#352 :class:`EditorHost` を参照） 読むだけ"""
+        timeline = self._timeline
+        layout = timeline.view_layout
+        segments = self._subtitles.selected_segments()
+        dialog = self._person_export
+        return ViewState(
+            visible_frames=layout.visible_range(timeline.width()),
+            pixels_per_frame=layout.pixels_per_frame,
+            playing=self._playback.is_playing,
+            # isHidden で見る 窓を最小化している間も、出してあるパネルは出してある
+            graph_shown=not self._graph_dock.isHidden(),
+            graph_path=self._graph.path,
+            pool_media=self._media_pool.selected_media_id(),
+            subtitle_media=self._subtitles.media_id,
+            subtitle_stream=self._subtitles.stream,
+            subtitle_rows=segments,
+            person_export=dialog.export_progress if dialog is not None else None,
+        )
+
+    def compat_report(self) -> CompatReport:
+        """互換性レポートの写し（#352） 〔互換〕→〔互換性レポート…〕と同じ記録とスクリプトの一覧"""
+        # 窓と同じく使うときに読み込む（〔スクリプトを読み直す〕と同じ）
+        from sashimono.compat.aviutl import report as report_module
+        from sashimono.compat.aviutl.catalog import script_catalog
+
+        catalog = script_catalog()
+        return CompatReport.of(
+            report_module.global_report,
+            scripts=len(catalog.all()),
+            folders=tuple(str(root) for root in catalog.roots),
+        )
 
     # --- AI の保存と書き出し（B1 #327） ---
 

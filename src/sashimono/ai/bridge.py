@@ -50,6 +50,7 @@ from sashimono.ai.outbound import (
     hide_text,
     redact,
     secret_pairs,
+    sending,
     text_secrets,
 )
 from sashimono.ai.safety import Consent
@@ -576,20 +577,28 @@ class EditorBridge:
         except ToolError as exc:
             if texts is None:
                 raise
-            raise ToolError(str(self._hide_text(str(exc), texts, hide_body))) from None
-        return result if texts is None else self._hide_text(result, texts, hide_body)
+            raise ToolError(
+                str(self._hide_text(str(exc), texts, hide_body, operation.labels))
+            ) from None
+        if texts is None:
+            return result
+        return self._hide_text(result, texts, hide_body, operation.labels)
 
-    def _hide_text(self, value: object, before: list[str], body: bool) -> object:
+    def _hide_text(self, value: object, before: list[str], body: bool, labels: bool) -> object:
         after = text_secrets(self._host.document.project) if body else []
-        return hide_text(value, sorted({*before, *after}, key=len, reverse=True))
+        return hide_text(value, sorted({*before, *after}, key=len, reverse=True), labels=labels)
 
     def _guarded(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、名前と場所を送らないなら伏せる（:meth:`_run` の前半）"""
         # 動かす前の名前も覚える 道具が素材を消すと、動かした後の作品からは名前が拾えない
         self._learn_names()
         hide = not self.may_send(Outbound.FILES)
+        # 欄の型で伏せる道具（get_clip など #391）が、結果を組む所で今の許しを引けるようにする
+        # 立てずに動かすと、編集画面の中から直に呼んだ扱いになり、欄の値を全部載せる
+        allowed = frozenset(kind for kind in Outbound if self.may_send(kind))
         try:
-            result = work()
+            with sending(allowed):
+                result = work()
         except (ToolError, ValueError, KeyError) as exc:
             if not hide:
                 raise
