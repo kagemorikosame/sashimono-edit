@@ -44,6 +44,7 @@ from sashimono.core.model import (
     group_reaches,
 )
 from sashimono.core.reframe import (
+    CENTER,
     Area,
     CropWindow,
     ReframeError,
@@ -73,8 +74,10 @@ from sashimono.engine.vision.report import ScreenReport
 
 __all__ = [
     "BACKGROUND_COVER",
+    "FACES_CENTER",
     "FACES_NONE",
     "FACES_NO_PARTS",
+    "FACES_NO_VIDEO",
     "FACES_OFF",
     "FACES_USED",
     "FACES_WAITING",
@@ -1192,8 +1195,12 @@ FACES_NONE = "none"
 FACES_WAITING = "waiting"
 #: 画面の解析の部品（#324）が入っていない
 FACES_NO_PARTS = "no_parts"
-#: 本人の設定か引数で使わないと選んだ・真ん中を切り出すので被写体を見ない
+#: 本人の設定か引数（AI の道具の faces・人の窓の欄）で使わないと選んだ
 FACES_OFF = "off"
+#: 枠の動かし方が center（真ん中を切り出す） 被写体を見積もらないので顔も動きと肌色も使わない
+FACES_CENTER = "center"
+#: 被写体を追う背景の動画が無い（背景が画像だけ・背景が無い） 被写体を見積もる絵が無い
+FACES_NO_VIDEO = "no_video"
 
 
 @dataclass(slots=True)
@@ -1243,20 +1250,45 @@ class FaceSummary:
 def face_summary(
     plan: ReframePlan | None,
     *,
+    follow: str,
     wanted: bool,
+    videos: int,
     parts_ready: bool,
     gathered: GatheredFaces | None,
 ) -> FaceSummary:
     """作り替えに顔の位置を使ったかを、AI の道具と人の窓で同じ言葉にまとめる
 
-    ``wanted`` は使うと選んでいるか（本人の設定か引数 真ん中を切り出すなら偽）
-    ``parts_ready`` は画面の解析の部品が入っているか 言葉を入口ごとに書くと、同じ作り替えで
-    AI と人に違う理由を伝える
+    ``follow`` は枠の動かし方 ``wanted`` は本人の設定か引数で顔を使うと選んでいるか
+    ``videos`` は被写体を追う背景の動画の数（:func:`tracked_media`） ``parts_ready`` は画面の
+    解析の部品が入っているか 言葉を入口ごとに書くと、同じ作り替えで AI と人に違う理由を伝える
+
+    顔を使わなかった訳は 3 つに分けて別の値で返す（PR #408 の CodeRabbit の指摘） 1 つの「使って
+    いません 動きと肌色だけで見積もりました」にまとめると、真ん中を切り出した（被写体を見積もって
+    いない）作り替えや追う動画の無い作品でも動きと肌色で見積もったと読め、AI がそのまま人へ
+    誤って伝える 分けるのは、どの訳かで人のすること（動かし方を変える・設定を戻す・何もしない）が
+    違うため 動かし方と動画の無さを、本人の選びより先に見る（どちらも顔の設定に関係なく被写体を
+    見ない）
     """
     used = sum(1 for note in plan.shots if note.faces) if plan is not None else 0
+    if follow == CENTER:
+        return FaceSummary(
+            FACES_CENTER,
+            0,
+            "枠の動かし方が真ん中の切り出し（center）なので、被写体を見積もっていません"
+            "（顔の位置も動きと肌色も使っていません）",
+        )
+    if videos == 0:
+        return FaceSummary(
+            FACES_NO_VIDEO,
+            0,
+            "被写体を追う背景の動画が無いので、顔の位置も動きと肌色も使っていません",
+        )
     if not wanted:
         return FaceSummary(
-            FACES_OFF, 0, "顔の位置は使っていません（動きと肌色だけで見積もりました）"
+            FACES_OFF,
+            0,
+            "顔の位置を使わない選び（本人の設定か、この回の指定）なので、動きと肌色だけで"
+            "見積もりました",
         )
     if not parts_ready:
         return FaceSummary(
@@ -1266,32 +1298,30 @@ def face_summary(
             "（表示 → 設定… の〔画面の解析の部品…〕で入れると、次から顔の位置も使います）",
         )
     waiting = len(gathered.waiting) if gathered is not None else 0
-    if used:
-        note = f"{used} 個の場面で顔の位置も手がかりにしました"
-        if waiting:
-            note += (
-                f" 顔の位置をまだ調べている素材 {waiting} 本は動きと肌色だけで見積もりました"
-                "（調べ終えてから作り直すと顔も使います）"
-            )
-        return FaceSummary(FACES_USED, used, note)
+    failed = len(gathered.failed) if gathered is not None else 0
+    # 調べられなかった訳（失敗の文）は載せない 素材を開けない例外の文には素材の場所が入り、
+    # 名前と場所を送らない人の所でも reframe の返事（作品と設定だけを送ると宣言）で外へ出る
+    # 訳は detect_faces で確かめられる
+    rest = []
     if waiting:
-        return FaceSummary(
-            FACES_WAITING,
-            0,
-            "顔の位置をまだ調べているので、動きと肌色だけで見積もりました"
-            "（調べ終えてから作り直すと顔も使います）",
+        rest.append(
+            f"顔の位置をまだ調べている素材 {waiting} 本（調べ終えてから作り直すと顔も使います）"
         )
-    failed = gathered.failed if gathered is not None else {}
+    if failed:
+        rest.append(f"顔の位置を調べられなかった素材 {failed} 本（訳は detect_faces で分かります）")
+    tail = f" {'・'.join(rest)}は動きと肌色だけで見積もりました" if rest else ""
+    if used and plan is not None:
+        others = "（ほかの場面は動きと肌色だけ）" if used < len(plan.shots) else ""
+        return FaceSummary(
+            FACES_USED, used, f"{used} 個の場面で顔の位置も手がかりにしました{others}{tail}"
+        )
+    if waiting:
+        return FaceSummary(FACES_WAITING, 0, f"顔の位置は使っていません{tail}")
     if failed and (gathered is None or not gathered.reports):
-        reason = next(iter(failed.values()))
-        return FaceSummary(
-            FACES_NONE,
-            0,
-            f"顔の位置を調べられなかったので、動きと肌色だけで見積もりました（{reason}）",
-        )
+        return FaceSummary(FACES_NONE, 0, f"顔の位置は使っていません{tail}")
     return FaceSummary(
         FACES_NONE,
         0,
-        "顔が見つからなかったので、動きと肌色だけで見積もりました"
-        "（獣のアバターや横を向いた顔など、顔として拾わない絵もあります）",
+        "手がかりにできる顔が見つからなかったので、動きと肌色だけで見積もりました"
+        "（獣のアバターや横を向いた顔など、顔として拾わない絵もあります）" + tail,
     )

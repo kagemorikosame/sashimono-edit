@@ -4952,7 +4952,14 @@ def _reframe_now(host: EditorHost, request: ReframeRequest, *, faces: bool = Tru
         raise ToolError(str(exc)) from exc
     before = project.settings.resolution
     host.apply_commands(plan.commands, f"縦の作品に作り替え: {request.width}x{request.height}")
-    summary = face_summary(plan, wanted=wanted, parts_ready=parts, gathered=found)
+    summary = face_summary(
+        plan,
+        follow=request.follow,
+        wanted=faces,
+        videos=len(media),
+        parts_ready=parts,
+        gathered=found,
+    )
     return _reframe_result(plan, request, before, untracked, summary)
 
 
@@ -5030,7 +5037,8 @@ def _reframe_result(
         "held_clips": plan.held,
         "skipped": [{"clip_id": clip_id, "reason": reason} for clip_id, reason in plan.skipped],
         "untracked_media": untracked,
-        # 顔の位置を使ったか（used・none・waiting・no_parts・off）と、使った場面の数
+        # 顔の位置を使ったか（used・none・waiting・no_parts・off・center・no_video）と、
+        # 使った場面の数
         "faces": faces.status,
         "face_shots": faces.shots,
         "note": " ".join(notes),
@@ -8246,7 +8254,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "見積もり、画面の解析の部品が入っていれば detect_faces と同じ顔の位置も使う（顔の"
             "無い場面は肌色に近い壁や床・動く背景・焼き込まれた字幕の出入りにも寄る 獣の"
             "アバターなど顔として拾わない絵もある 位置の細かさは素材の幅の 1/32 ほど）"
-            " 返事の faces が used なら顔を使った（shots の faces は場面ごと）"
+            " 返事の faces が used なら顔を使った（shots の faces は場面ごと） off は顔を使わないと"
+            "選んだ center と no_video は被写体を見積もっていない"
             " 解析が終わっていなければ wait_seconds まで待ち、場面の解析が終わらなければ"
             "何も変えずに戻る 顔の位置だけが終わらなければ、その素材は動きと肌色だけで作る"
             " 終わったら preview_range か contact_sheet で枠を確かめ、外れた場面は"

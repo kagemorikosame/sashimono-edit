@@ -174,6 +174,8 @@ from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.reframe import (
+    FACES_CENTER,
+    FACES_OFF,
     GatheredFaces,
     ReframeRequest,
     face_summary,
@@ -2826,10 +2828,19 @@ class MainWindow(QMainWindow):
             return False
         self._on_project_changed()
         notes: list[str] = []
-        faces = face_summary(plan, wanted=wanted, parts_ready=parts, gathered=found)
-        if wanted:
-            # 顔を使ったか・使えなかった理由を出す 黙ると、部品を入れていない人は顔を見ていると
-            # 思い込み、調べている途中の人は作り直せば良くなることに気付かない
+        faces = face_summary(
+            plan,
+            follow=choice.follow,
+            wanted=choice.faces,
+            videos=len(media),
+            parts_ready=parts,
+            gathered=found,
+        )
+        if faces.status not in (FACES_CENTER, FACES_OFF):
+            # 顔を使ったか・使えなかった訳を出す 黙ると、部品を入れていない人は顔を見ていると
+            # 思い込み、調べている途中の人は作り直せば良くなることに気付かず、追う動画の無い
+            # 作品では被写体を追ったと思い込む 真ん中の切り出しと顔を切ったのは、いま窓で本人が
+            # 選んだ事なので繰り返さない（AI の道具は選んだのが AI なので、どの訳も返事に載せる）
             notes.append(faces.note)
         if gathered.untracked:
             # 解析できなかった素材（壊れた・読めない）は真ん中を切り出して作り替える

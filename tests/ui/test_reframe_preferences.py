@@ -419,6 +419,38 @@ class TestMenu:
         assert window.reframe_project()
         assert "部品が入っていない" in window.statusBar().currentMessage()
 
+    def test_the_window_tells_the_reason_apart(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 真ん中を切り出したのに「動きと肌色だけで見積もった」と出すと、人は被写体を追ったと
+        # 思い込む 追う動画の無い作品で黙ると、追えないことに気付かない（PR #408 の CodeRabbit）
+        monkeypatch.setattr(
+            main_window_module,
+            "VISION_PACK",
+            SimpleNamespace(status=lambda: SimpleNamespace(ready=True)),
+        )
+        window = MainWindow(_work(video_media), confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="center")
+        )
+        window.statusBar().clearMessage()
+        assert window.reframe_project()
+        assert "動きと肌色" not in window.statusBar().currentMessage()
+        empty = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(video_media,))
+        bare = MainWindow(empty, confirm_unsaved=False)
+        opened.append(bare)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="auto")
+        )
+        assert bare.reframe_project()
+        message = bare.statusBar().currentMessage()
+        assert "背景の動画が無い" in message
+        assert "動きと肌色だけで見積もりました" not in message
+
     def test_a_locked_track_says_why(
         self,
         opened: list[MainWindow],
