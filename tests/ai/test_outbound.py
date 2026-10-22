@@ -274,6 +274,7 @@ SHELF_ID = template_choice(SHELF_ENTRY).key
 #: 引数の要る読む道具の引数（素材の ID を受ける） 足したらここにも足す（足さないと落ちる）
 READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "detect_scenes": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    "find_highlights": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     # 画面の中身（#324） 文字は読めた文を返し、顔は断りの文に素材の名前を書く
     "detect_text": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     "detect_faces": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
@@ -874,6 +875,25 @@ class TestWaitingTools:
         # 壊れると、素材の名前の入った断りの文（映像がありません・調べられませんでした）を、
         # 名前と場所を断った人の所でも尋ねずに送る
         assert _operation("detect_scenes").sends == {Outbound.PROJECT, Outbound.FILES}
+
+    def test_find_highlights_sends_names_but_not_subtitles(
+        self, secret_host: FakeHost, transcript: Transcript
+    ) -> None:
+        """盛り上がりの道具（#325）は字幕を読んで笑いの印を探すが、文は返さない
+
+        壊れると、名前と場所を断った人の所で素材の名前入りの断りの文を尋ねずに送るか、
+        字幕を断った人の所で字幕の文を結果に載せて送る 宣言を弱めると見張りが落ちることも見る
+        """
+        media = secret_host.document.project.media[0]
+        secret_host.scene_states[media.id] = SceneState(None, running=False, failure="開けない")
+        operation = _operation("find_highlights")
+        result = operation(secret_host, {"media_id": str(media.id), "wait_seconds": 0})
+        secrets = {str(SECRET_PATH), SECRET_PATH.as_posix(), SECRET_PATH.name}
+        texts = {segment.text for segment in transcript.segments}
+        assert operation.sends == {Outbound.PROJECT, Outbound.FILES}
+        assert not undeclared(operation, result, sentences=texts, places=secrets)
+        weaker = replace(operation, sends=frozenset({Outbound.PROJECT}))
+        assert undeclared(weaker, result, sentences=texts, places=secrets)
 
 
 class TestPlacesOutsideTheTable:

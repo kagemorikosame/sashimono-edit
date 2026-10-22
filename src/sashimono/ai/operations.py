@@ -25,6 +25,16 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.fixes import AUTO as FIX_AUTO
+from sashimono.ai.fixes import (
+    FIX_ACTIONS,
+    CheckTicket,
+    FixRound,
+    current_round,
+    fix_for,
+    settle_check,
+    start_check,
+)
 from sashimono.ai.handoff import GET_HANDOFF, shelf_for
 from sashimono.ai.host import EXPORT_RUNNING, EditorHost, ExportRequest, ToolError
 from sashimono.ai.outbound import Outbound
@@ -198,6 +208,7 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
+    heard_stream,
 )
 from sashimono.core.projection import heard_timeline, project_timeline
 from sashimono.core.seams import (
@@ -287,6 +298,17 @@ from sashimono.engine.encode import (
     chosen_range,
     export_target,
 )
+from sashimono.engine.highlights import DEFAULT_MIN_SECONDS as HIGHLIGHT_MIN_SECONDS
+from sashimono.engine.highlights import DEFAULT_THRESHOLD as HIGHLIGHT_THRESHOLD
+from sashimono.engine.highlights import LAUGHTER as HIGHLIGHT_LAUGHTER
+from sashimono.engine.highlights import (
+    LAUGHTER_LIMITS,
+    Highlight,
+    highlight_curves,
+)
+from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
+from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
+from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
@@ -2077,6 +2099,343 @@ def _scene_places(
     return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
 
 
+# --- 盛り上がり（#325）---
+
+#: 区間とみなす点数として受け付ける範囲 小さすぎると、普段の話し声のゆらぎまで区間に並ぶ
+HIGHLIGHT_THRESHOLD_RANGE = (0.1, 1.0)
+#: 最短の区間（秒）の上限 長くすると短い笑いや一瞬の歓声を拾えない
+MAX_HIGHLIGHT_MIN_SECONDS = 60.0
+#: 並べ方 ``score`` は強い順（既定 上位から見たい頼みが多い）、``time`` は時刻の順
+HIGHLIGHT_ORDERS = ("score", "time")
+
+
+@dataclass(frozen=True, slots=True)
+class _HighlightQuery:
+    signals: tuple[str, ...]
+    threshold: float
+    min_seconds: float
+    start: float | None
+    end: float | None
+    order: str
+    audio: int | None
+    wait: float
+
+
+def _highlight_query(media: MediaItem, arguments: dict[str, Any]) -> _HighlightQuery:
+    given = arguments.get("signals")
+    signals: tuple[str, ...]
+    if given is None:
+        signals = HIGHLIGHT_SIGNALS
+    else:
+        if not isinstance(given, list) or not given:
+            raise ToolError(f"signals は {'・'.join(HIGHLIGHT_SIGNALS)} から選んだ並びです")
+        unknown = [str(name) for name in given if name not in HIGHLIGHT_SIGNALS]
+        if unknown:
+            raise ToolError(
+                f"signals に知らない手がかりがあります: {', '.join(unknown)}"
+                f"（{'・'.join(HIGHLIGHT_SIGNALS)} から選ぶ）"
+            )
+        signals = tuple(name for name in HIGHLIGHT_SIGNALS if name in given)
+    order = str(arguments.get("order") or "score")
+    if order not in HIGHLIGHT_ORDERS:
+        raise ToolError(f"order は {'・'.join(HIGHLIGHT_ORDERS)} のどれかです")
+    start = _optional_number(arguments, "from_seconds", 0.0)
+    end = _optional_number(arguments, "to_seconds", 0.0)
+    if start is not None and end is not None and end <= start:
+        raise ToolError("to_seconds は from_seconds より後にしてください")
+    return _HighlightQuery(
+        signals=signals,
+        threshold=_number_or(
+            arguments, "threshold", HIGHLIGHT_THRESHOLD, *HIGHLIGHT_THRESHOLD_RANGE
+        ),
+        min_seconds=_number_or(
+            arguments, "min_seconds", HIGHLIGHT_MIN_SECONDS, 0.0, MAX_HIGHLIGHT_MIN_SECONDS
+        ),
+        start=start,
+        end=end,
+        order=order,
+        audio=_audio_stream(media, arguments),
+        wait=_number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT),
+    )
+
+
+def _find_highlights(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の盛り上がりの区間を一覧する 動きを見るのに場面の解析が要れば待ってから返す"""
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    query = _highlight_query(media, arguments)
+    hears = bool({HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD} & set(query.signals))
+    sees = HIGHLIGHT_MOTION in query.signals
+    if not (hears and media.has_audio) and not (sees and media.has_video):
+        # 調べられる手がかりが 1 つも無い 空の一覧を返すと「盛り上がりは無い」と読まれる
+        raise ToolError(
+            f"{media.name} では頼んだ手がかり（{'・'.join(query.signals)}）を調べられません"
+            " 笑い声と音量は音声から、動きは映像から見ます"
+        )
+    if not sees or not media.has_video:
+        return _highlight_result(host, media, query, None, arguments)
+    # 動きは場面の解析（#319 #321）が覚えた差の並びを使い回す 素材を読み直さない
+    host.request_scenes(media)
+    state = host.scene_state(media)
+    if state.complete or not state.running or query.wait <= 0:
+        return _highlight_result(host, media, query, state, arguments)
+    media_id = media.id
+
+    def finish() -> object:
+        # 待っている間に素材が外されたら断る（場面の検出と同じ）
+        again = _require_media(_project(host), str(media_id))
+        return _highlight_result(host, again, query, host.scene_state(again), arguments)
+
+    return Pending(wait=host.scene_waiter(media_id), seconds=query.wait, then=finish)
+
+
+def _highlight_result(
+    host: EditorHost,
+    media: MediaItem,
+    query: _HighlightQuery,
+    state: SceneState | None,
+    arguments: dict[str, Any],
+) -> object:
+    notes: list[str] = []
+    missing: list[str] = []
+    complete = True
+    waveform: Waveform | None = None
+    hears = [name for name in query.signals if name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD)]
+    if hears and media.has_audio:
+        # 音は取り込んだときに作った波形のピークを使い回す（無音カットと同じ物）
+        waveform = host.waveform(media, query.audio)
+        if waveform is None:
+            host.analyze(media)
+            complete = False
+            missing.extend(hears)
+            notes.append("音の解析（波形）がまだです 少し待ってから同じ引数で呼ぶと音も調べます")
+    elif hears:
+        missing.extend(hears)
+        notes.append("音声の無い素材なので、笑い声と音量は調べていません")
+    scenes: SceneSignal | None = None
+    if HIGHLIGHT_MOTION in query.signals:
+        if not media.has_video:
+            missing.append(HIGHLIGHT_MOTION)
+            notes.append("映像の無い素材なので、動きは調べていません")
+        elif state is not None:
+            scenes, complete = _highlight_scenes(media, state, notes, missing, complete)
+    transcript = media.transcript_for(query.audio)
+    if HIGHLIGHT_LAUGHTER in missing and transcript and transcript.segments:
+        # 波形を待つ間も、字幕の笑いの印（笑いの主な手がかり）で笑い声を探す 動きが
+        # 見られるときだけ外すと、取り込んだ直後の映像の素材で主な手がかりを黙って落とし、
+        # AI は unavailable を見て「笑いは調べていない」と読む
+        missing = [name for name in missing if name != HIGHLIGHT_LAUGHTER]
+    looked = [name for name in query.signals if name not in missing]
+    if not looked:
+        raise ToolError(" ".join(notes))
+    duration = float(media.duration)
+    curves = highlight_curves(
+        duration,
+        waveform=waveform,
+        scenes=scenes,
+        transcript=transcript if HIGHLIGHT_LAUGHTER in looked else None,
+        signals=looked,
+    )
+    found = [
+        item
+        for item in curves.highlights(query.threshold, query.min_seconds)
+        if (query.start is None or item.end > query.start)
+        and (query.end is None or item.start < query.end)
+    ]
+    if query.order == "score":
+        found.sort(key=lambda item: (-item.score, item.start))
+    project = _project(host)
+    # 区間を探したのと同じ絵と音を出すクリップの位置だけを返す 別の映像や別の音声の
+    # クリップを混ぜると、preview_range で見せる所に探した盛り上がりが無い
+    sources = _HighlightSources(
+        video=_video_stream(media, scenes.stream)
+        if scenes is not None and HIGHLIGHT_MOTION in looked
+        else None,
+        audio=media.transcript_stream(query.audio)
+        if any(name in looked for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD))
+        else None,
+    )
+    rows = [_highlight_row(project, media, item, looked, sources) for item in found]
+    common: dict[str, Any] = {
+        "media_id": str(media.id),
+        "signals": looked,
+        "complete": complete,
+        "duration_seconds": round(duration, 3),
+        "threshold": query.threshold,
+        "order": query.order,
+    }
+    if media.has_audio and hears:
+        common["audio"] = _audio_number(media, query.audio)
+    if missing:
+        common["unavailable"] = missing
+    if not rows and complete:
+        notes.append("盛り上がりが見つかりません threshold を下げると弱い所も拾います")
+
+    def page(given: dict[str, Any]) -> dict[str, Any]:
+        result = _paged(rows, given, name="highlights")
+        told = [str(result.pop("note"))] if "note" in result else []
+        result |= common
+        if told or notes:
+            result["note"] = " ".join(told + notes)
+        return result
+
+    # 一覧の外側（調べられなかった理由の文に素材の名前や失敗の文が入る）の分も上限に収める
+    # 一覧だけで見積もる _paged の取り置き（600 字）を越えると、返事の後ろが打ち切られる
+    result = page(arguments)
+    while len(json_text(result)) > MAX_RESULT_CHARS and result["count"] > 1:
+        result = page({**arguments, "limit": max(1, result["count"] * 3 // 4)})
+    return result
+
+
+def _highlight_scenes(
+    media: MediaItem,
+    state: SceneState,
+    notes: list[str],
+    missing: list[str],
+    complete: bool,
+) -> tuple[SceneSignal | None, bool]:
+    """場面の解析の今から、動きに使う差の並び 途中なら読んだ所までを使う"""
+    if state.signal is None:
+        missing.append(HIGHLIGHT_MOTION)
+        if state.failure is not None:
+            notes.append(f"{media.name} の映像を調べられず、動きは見ていません: {state.failure}")
+        else:
+            notes.append("映像の解析がまだなので、動きは見ていません 少し待って呼び直してください")
+        return None, False
+    signal = state.signal
+    if signal.broken:
+        # 呼び直しても同じ所で止まる 待てば続きが出ると読ませない（場面の検出と同じ）
+        # それでも後ろは読めていないので完了とは言わない（場面の検出の complete も偽）
+        # 受け取った complete を返すと、波形があるときや動きだけを頼んだときに true になり、
+        # 読めなかった後ろに盛り上がりは無いと読ませる
+        notes.append(
+            f"素材が途中で壊れていて、動きは {round(signal.analyzed, 1)} 秒までしか見ていません"
+            " 呼び直しても続きは出ません"
+        )
+        return signal, False
+    if not signal.complete:
+        notes.append(
+            f"映像の解析の途中です 動きは {round(signal.analyzed, 1)} 秒まで見ました"
+            " しばらくしてから同じ引数で呼ぶと続きも見ます"
+            if state.running
+            else "映像の解析が止まりました もう 1 度呼ぶと頼み直します"
+        )
+        return signal, False
+    return signal, complete
+
+
+@dataclass(frozen=True, slots=True)
+class _HighlightSources:
+    """区間を探した絵と音のストリーム（素材の中の ``index``） 調べていない側は ``None``"""
+
+    video: int | None
+    audio: int | None
+
+
+def _highlight_row(
+    project: Project,
+    media: MediaItem,
+    item: Highlight,
+    looked: list[str],
+    sources: _HighlightSources,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "start_seconds": item.start,
+        "end_seconds": item.end,
+        "peak_seconds": item.peak,
+        "score": round(item.score, 3),
+        "reasons": list(item.reasons),
+    }
+    for name, value in (
+        (HIGHLIGHT_LAUGHTER, item.laughter),
+        (HIGHLIGHT_LOUD, item.loud),
+        (HIGHLIGHT_MOTION, item.motion),
+    ):
+        if name in looked and value is not None:
+            row[name] = value
+    if item.laughter_from_subtitles:
+        row["laughter_from_subtitles"] = True
+    # 音の手がかりで拾っていない区間（動きだけ）は、音のクリップとして数えない 数えると
+    # 絵を止めた混合トラックのクリップで hold_at を越えた範囲を返し、preview_range で
+    # 止まった絵しか出ない所を見せる 絵の側は区間の手がかりに関係なく数える 笑いや音量の
+    # 区間でも、調べた映像を描くクリップならその時刻の絵が出る（止めた所までは）
+    # どの手がかりも半分に届かない区間（reasons が空）は、どちらで拾ったか分からないので両方を見る
+    heard = not item.reasons or any(
+        name in item.reasons for name in (HIGHLIGHT_LAUGHTER, HIGHLIGHT_LOUD)
+    )
+    row["timeline"] = _highlight_places(
+        project, media, item, sources if heard else replace(sources, audio=None)
+    )
+    return row
+
+
+def _highlight_places(
+    project: Project, media: MediaItem, item: Highlight, sources: _HighlightSources
+) -> list[dict[str, Any]]:
+    """区間が出る今のタイムラインの範囲（フレーム） 頂の絵が出るフレームも添える
+
+    絵のクリップも音のクリップも見る 笑い声と音量は音のクリップにしか無いことがある
+    リンクした絵と音は同じ範囲になるので 1 つにまとめる（同じ範囲が 2 行並ぶと、AI が
+    2 か所あると読む）
+
+    絵は動きを調べた映像（``sources.video``）を描くクリップ、音は笑い声と音量を調べた音声
+    （``sources.audio``）を鳴らすクリップだけを数える（場面の検出の :func:`_scene_places` と
+    同じ訳） 鳴らす音声は :func:`heard_stream` で引く 混合トラックの ``stream_index`` は
+    絵の番号なので、それで比べると違う言語の音のクリップを返す 絵を止めた
+    （``hold_at``）クリップは止めた時刻までしか絵が進まないので、絵の範囲はそこで切る
+    音は止めないので切らない
+    """
+    rate = project.rate
+    start, end, peak = (Fraction(str(value)) for value in (item.start, item.end, item.peak))
+    places: dict[tuple[int, int], dict[str, Any]] = {}
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.media_id != media.id:
+                continue
+            low = max(start, clip.source_in)
+            high = min(end, clip.source_out(rate))
+            hears = (
+                sources.audio is not None
+                and project.plays_sound(track, clip)
+                and media.transcript_stream(heard_stream(track, clip)) == sources.audio
+            )
+            if not hears:
+                draws = (
+                    sources.video is not None
+                    and project.draws_picture(track, clip)
+                    and _video_stream(media, clip.stream_index) == sources.video
+                )
+                if not draws:
+                    continue
+                if clip.hold_at is not None:
+                    high = min(high, clip.hold_at)
+            if low >= high:
+                continue
+            first = clip.timeline_start + seconds_to_frame(
+                (low - clip.source_in) / clip.speed, rate, Rounding.FLOOR
+            )
+            last = clip.timeline_start + seconds_to_frame(
+                (high - clip.source_in) / clip.speed, rate, Rounding.CEIL
+            )
+            first, last = max(first, clip.timeline_start), min(last, clip.timeline_end)
+            if first >= last or (first, last) in places:
+                continue
+            place: dict[str, Any] = {
+                "clip_id": str(clip.id),
+                "start_frame": first,
+                "end_frame": last,
+            }
+            if low <= peak < high:
+                place["peak_frame"] = min(
+                    last - 1,
+                    clip.timeline_start
+                    + seconds_to_frame((peak - clip.source_in) / clip.speed, rate, Rounding.FLOOR),
+                )
+            places[(first, last)] = place
+    ordered = sorted(places.values(), key=lambda place: int(place["start_frame"]))
+    return ordered[:MAX_PLACES_PER_CUT]
+
+
 # --- 画面の中身（文字と顔の位置 #324）---
 
 #: 顔の確からしさの下限の既定 手元の見本（群衆の写真）で本物の顔が 0.79〜0.92 だった
@@ -2363,20 +2722,31 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     """完成物を調べる 終わっていなければ待ってから、待ちきれなければ途中までを返す"""
     request = _check_request(host, arguments)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
+    # 頼みの控えを取り、この後の直しを別の段に区切る（#339） 数えは結果を使えたときに確定する
+    # 引数を確かめた後にする 断った呼び出しで区切ると、引数を直して呼び直すだけで段が割れる
+    # 書き出した動画のファイルを調べるときは控えを取らず区切らない（直し方を返さないので
+    # 直す回が無い）
+    ticket = start_check(host.document, host.fix_rounds) if request.project is not None else None
     host.request_check(request)
     state = host.check_state()
     if not state.running or wait <= 0:
-        return _check_result(host, request, state, arguments)
+        return _check_result(host, request, state, arguments, ticket)
     return Pending(
         wait=host.check_waiter(),
         seconds=wait,
-        then=lambda: _check_result(host, request, host.check_state(), arguments),
+        then=lambda: _check_result(host, request, host.check_state(), arguments, ticket),
     )
 
 
 def _check_result(
-    host: EditorHost, request: CheckRequest, state: CheckState, arguments: dict[str, Any]
+    host: EditorHost,
+    request: CheckRequest,
+    state: CheckState,
+    arguments: dict[str, Any],
+    ticket: CheckTicket | None,
 ) -> object:
+    # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
+    # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
         raise ToolError("調べている間に別の検査に替わりました もう 1 度呼んでください")
     report = state.report
@@ -2385,6 +2755,21 @@ def _check_result(
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
     timeline = request.project is not None
+    # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
+    # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
+    # 古い作品の物で、今の作品へ直しを当てると消えた・動いたクリップを触る 取り消して同じ形へ
+    # 戻っただけなら同じ作品として直しを返す
+    stale = request.project is not None and _project(host) != request.project
+    # 途中までの結果（走っている・止められた・終わっていない）でも直さない 途中で直すと、続きを
+    # 読む呼び出しが調べ直しになって新しい回に数えられ、残りの問題を見ないまま直す
+    unsettled = stale or state.running or state.stopped or not report.complete
+    rounds: FixRound | None = None
+    if ticket is not None:
+        rounds = (
+            current_round(host.document, host.fix_rounds)
+            if unsettled
+            else settle_check(host.document, ticket, host.fix_rounds)
+        )
     rate = request.project.rate if request.project is not None else None
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
@@ -2405,12 +2790,21 @@ def _check_result(
             row["clip_ids"] = list(problem.clip_ids)
         if problem.ongoing:
             row["ongoing"] = True
+        # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
+        row["fix"] = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
     notes = [str(result.pop("note"))] if "note" in result else []
     severities: dict[str, int] = {}
+    fixes = dict.fromkeys(FIX_ACTIONS, 0)
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
+        action = fix_for(
+            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+        )
+        fixes[action.action] += 1
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2425,7 +2819,10 @@ def _check_result(
             "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
             "counts": report.counts(),
             "severities": severities,
+            # 直し方ごとの数 切って返した後ろの問題も数える（自動で直す物が残っていないかを読む）
+            "fixes": fixes,
         },
+        "fix_round": None if rounds is None else rounds.as_dict(),
     }
     if timeline:
         result["from_frame"] = request.start
@@ -2451,14 +2848,56 @@ def _check_result(
         notes.append("問題は見つかりませんでした")
     elif not report.problems and report.checked:
         notes.append("調べた種類（checks）には問題がありませんでした")
-    if request.project is not None and _project(host) != request.project:
+    if stale:
         notes.append(
             "調べている間に作品が変わりました 結果は調べ始めたときの作品の物です"
-            " 今の作品を調べるにはもう 1 度呼んでください"
+            " この結果からは直さず（直す回も数えていません）、もう 1 度呼んで今の作品を"
+            "調べ直し、その結果の fix に従ってください"
         )
+    elif unsettled and timeline:
+        notes.append(
+            "検査が終わっていないので、この結果からはまだ直さないでください（直す回も数えて"
+            "いません） 終わった結果の fix に従ってください"
+        )
+    else:
+        notes.extend(_round_notes(rounds, fixes))
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:
+    """直し方を決める状態 ``rounds`` が無いのは書き出した動画のファイルを調べたとき
+    ``unsettled`` は使えない結果（途中まで・止められた・調べている間に作品が変わった）"""
+    if rounds is None:
+        return {"timeline": False}
+    return {"closed": rounds.closed, "unsettled": unsettled}
+
+
+def _round_notes(rounds: FixRound | None, fixes: dict[str, int]) -> list[str]:
+    """直しの繰り返し（#339）の今を AI へ伝える文 上限に達したら止まるよう言い切る"""
+    if rounds is None:
+        return [
+            "書き出した動画のファイルを調べた結果です 今の作品から書き出した物かは確かめて"
+            "いないので、今の作品は直さないでください 直すなら path を省いてタイムラインを"
+            "調べ直してください"
+        ]
+    if rounds.closed:
+        if rounds.limit == 0:
+            return [
+                "本人の設定で、検査の後に直さないことになっています（直す回数の上限 0）"
+                " この指示ではもう編集できません 見つかった問題を人へ伝えてください"
+            ]
+        return [
+            f"直す回数の上限（{rounds.limit} 回）に達しました この指示ではもう編集できません"
+            " 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を人へ伝えてください"
+        ]
+    if fixes[FIX_AUTO]:
+        return [
+            f"fix の action が auto の物を直してから、もう 1 度 check_output で調べてください"
+            f"（{rounds.next_round} 回目の直し 上限 {rounds.limit} 回）"
+        ]
+    return []
 
 
 # --- 音の推移と見分け（#322 #338）---
@@ -6053,6 +6492,59 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
     ),
     Operation(
+        name="find_highlights",
+        description=(
+            "素材の盛り上がりの区間を一覧する（読むだけ） 手がかりは笑い声（laughter）・"
+            "音量の山（loud 普段の大きさより大きい所）・動きの大きい所（motion 切り替わりを除いた"
+            "フレーム間の差）の 3 つで、どれも 0〜1 の点 score は「どれか 1 つでも強ければ高い」形"
+            "で合わせた点 素材を読み直さず、取り込んだときに作った波形と場面の解析を使うので速い"
+            " 区間の秒は素材の秒 timeline は区間が出る今のタイムラインの範囲（start_frame〜"
+            "end_frame）と頂（peak_frame preview_frame や preview_range へそのまま渡せる）"
+            " 見つけた区間は preview_range で動きを、字幕で中身を確かめてから使う"
+            f" 限り: {LAUGHTER_LIMITS} 音量の山は素材の中の普段との比べで、ずっと大きい素材では"
+            "山にならない 動きは画面全体の明るさの差なので、明るさが急に変わる所（フラッシュ・"
+            "照明）も動きに数え、小さく映った人の動きは拾いにくい"
+            " 映像の解析が終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
+            "読んだ所までで返す（complete が false）" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "signals": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(HIGHLIGHT_SIGNALS)},
+                    "description": "見る手がかり 省くと全部",
+                },
+                "threshold": _number(
+                    f"区間とみなす点 {HIGHLIGHT_THRESHOLD_RANGE[0]:g}〜"
+                    f"{HIGHLIGHT_THRESHOLD_RANGE[1]:g}（既定 {HIGHLIGHT_THRESHOLD:g}） 小さいほど"
+                    "弱い盛り上がりも拾う"
+                ),
+                "min_seconds": _number(
+                    f"これより短い区間は返さない秒（既定 {HIGHLIGHT_MIN_SECONDS:g}）"
+                ),
+                "from_seconds": _number("この素材の秒より後に掛かる区間だけ"),
+                "to_seconds": _number("この素材の秒より前に掛かる区間だけ"),
+                "order": {
+                    "type": "string",
+                    "enum": list(HIGHLIGHT_ORDERS),
+                    "description": "並べ方 score（強い順 既定）か time（時刻の順）",
+                },
+                "audio": _integer("調べる音声の番号（1 から 既定 1）"),
+                "wait_seconds": _number(
+                    f"映像の解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}） 0 なら待たずに読んだ所までで返す"
+                ),
+                **_paging(),
+            },
+            ["media_id"],
+        ),
+        handler=_find_highlights,
+        # 結果は素材の秒・点・タイムラインの位置（編集の構成） 調べられなかった理由の文には
+        # 素材の名前が入る 字幕は笑いの印を探すのに読むが、文は結果に入れない
+        sends=_WITH_FILES,
+    ),
+    Operation(
         name="detect_text",
         description=(
             "素材（動画）の画面の中の文字（テロップ・看板・スライド）を読む（OCR 読むだけ） "
@@ -6136,7 +6628,12 @@ OPERATIONS: tuple[Operation, ...] = (
             "wait_seconds まで待ち、それでも終わらなければ調べた所までを返す（complete が false"
             " 同じ引数でもう 1 度呼ぶと続きを返す） 人はステータスバーの〔止める〕で止められる"
             " checks で種類を絞ると速い（音だけなら絵を描かない） 作品を変えてから呼ぶと調べ直す"
-            + PAGING_NOTE
+            " 各問題の fix は直し方（action が auto は直してよい・ask は人に尋ねてから・"
+            "handoff は直さず人へ伝える・leave は直さない tools は使う道具 how は直し方）"
+            " 直してからもう 1 度呼ぶと、直した回を fix_round に数え、直す回ごとに取り消し"
+            " 1 回で戻る段に分ける 本人の設定の上限に達すると fix_round の closed が真になり、"
+            "その指示ではもう編集できない path で書き出した動画を調べた結果は、今の作品から"
+            "書き出した物とは限らないので fix がどれも handoff になり、回数も数えない" + PAGING_NOTE
         ),
         schema=_schema(
             {
