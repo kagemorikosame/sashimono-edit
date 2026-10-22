@@ -65,6 +65,9 @@ OWN_LIBRARY = {
     "template_shelf",
     # カスタムオブジェクトの名前（#349） 本人の置き場のスクリプト 道具はアプリの設定を送ると書く
     "custom_objects",
+    # 互換性レポート（#352） 本人のアプリが覚えた記録 スクリプトの置き場の場所は一覧の
+    # script_folders の項目で値ごと伏せ、失敗の文に混ざる場所は形で伏せる
+    "compat_report",
     # AI に見せる絵の長い辺の上限（#344） 絵を返す道具が縮めた訳と断りの文に載せる
     "image_edge",
 }
@@ -100,6 +103,8 @@ PROJECT_SIDE = {
     "undo",
     "redo",
     "stop_playback",
+    # 人が見ている表示（#352） 返すのはフレーム・ID・進み具合の数だけで、名前と場所は持たない
+    "view_state",
     "render_png",
     # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く
     "start_sheet",
@@ -262,6 +267,8 @@ class TestEveryTextSourceGoesThroughThePort:
             # カスタムオブジェクト（#349） 一覧と、無い名前の断りに置き場のスクリプトの名前が載る
             "list_custom_objects",
             "add_custom_object",
+            # 互換性レポート（#352） 本人のアプリの記録を返す
+            "get_compat_report",
             # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
             "reframe",
             # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る

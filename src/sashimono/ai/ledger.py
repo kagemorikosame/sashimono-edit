@@ -92,6 +92,11 @@ class Entry:
     #: :attr:`expected_safety` の決まりで決める 対応する道具はこの区分と同じでなければならない
     #: 取り消せない操作（保存・書き出し）を取り消せる道具で受けると、確かめが省かれる
     safety: Safety | None = None
+    #: 読むだけの行（:attr:`Status.READ_ONLY`）で、人が画面で見る値が ``get_app_settings`` の
+    #: 結果のどこにあるか（``preferences.timeline_snap`` のように点でつなぐ #352）
+    #: ``tests/ui/test_screen_reading.py`` が本物の窓の設定の写しで辿る 書かないと、読むだけと
+    #: 決めた操作の値が実は写しに無く、AI が読めないまま「読める」と数える
+    reads: tuple[str, ...] = ()
 
     @property
     def expected_safety(self) -> Safety | None:
@@ -125,10 +130,15 @@ def missing(key: str, issue: int, note: str = "", safety: Safety | None = None) 
 _APP_SETTINGS = "get_app_settings"
 
 
-def read_only(key: str, what: str) -> Entry:
-    """アプリ自身の操作 AI は読むだけ（決定） 値は :data:`_APP_SETTINGS` で読む"""
+def read_only(key: str, what: str, *reads: str) -> Entry:
+    """アプリ自身の操作 AI は読むだけ（決定） 値は :data:`_APP_SETTINGS` の ``reads`` で読む"""
     return Entry(
-        key, Status.READ_ONLY, (_APP_SETTINGS,), _LINE_DRAWING, f"{what} {DECIDED_READ_ONLY}"
+        key,
+        Status.READ_ONLY,
+        (_APP_SETTINGS,),
+        _LINE_DRAWING,
+        f"{what} {DECIDED_READ_ONLY}",
+        reads=reads,
     )
 
 
@@ -146,7 +156,22 @@ _HELP = "ヘルプ"
 # まだ決めていない操作の理由の案（#298 の表の「AI には出さない候補」）
 _OUTSIDE = "エクスプローラーを開くだけで、プロジェクトを変えない 決定の 5 つに当たらず未決"
 #: 表示だけの操作を AI に出すかは #298 の「決めること」の 3 つ目 決まるまでは足す側に数える
-_VIEW = "表示だけの操作 出す意味があるかは未決（#298 の決めること）"
+#: 表示そのもの（見えている範囲・出ている曲線）は #352 で読めるようにした 行は「一部だけ」で、
+#: 足りないのは表示を変える操作 決まるまでは #350 に残す
+_ZOOM = (
+    "見えている範囲と拡大の度合いは get_screen で読める 表示を変える操作を AI に出すかは未決"
+    "（#298 の決めること）"
+)
+_GRAPH = (
+    "出ている値は get_screen、曲線（キーフレームと補間・点の間の形）は get_clip で読める"
+    " パネルを出す・閉じる操作を AI に出すかは未決（#298 の決めること）"
+)
+_LINE = (
+    "線の値（不透明度・音量のキーフレーム）は get_clip で読める 線を出すかの切り替え（表示だけ）を"
+    " AI に出すかは未決（#298 の決めること）"
+)
+#: 再生の行 動きは見られないが、再生しているかは読める
+_PLAYING = "AI は動きを見られない 範囲の連続フレームで確かめる 再生しているかは get_screen で読める"
 
 #: 書き出しの行に添える 書き出し先は決定の場所に限る 進み具合を読む道具と止める道具は
 #: 区分が違う（読むだけ・取り消せる）ので行には書かず、:data:`AI_ONLY` に置く（#327）
@@ -275,7 +300,7 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("メニュー/シーン/メインに戻る", "set_active_scene", safety=Safety.READ_ONLY),
     # --- メニュー 字幕 ---
-    read_only("メニュー/字幕/字幕パネル", _LAYOUT),
+    read_only("メニュー/字幕/字幕パネル", _LAYOUT, "layout.docks.subtitles.visible"),
     same("メニュー/字幕/起こす…", "transcribe"),
     same("メニュー/字幕/整形…", "clean_subtitles"),
     same("メニュー/字幕/無音カット…", "jet_cut"),
@@ -309,35 +334,53 @@ LEDGER: tuple[Entry, ...] = (
         "メニュー/互換/exe の隣のスクリプトを移す…",
         "アプリの置き場の整理で、編集ではない 更新のときに勧める物だが、更新に数えるかは未決",
     ),
-    missing(
+    same(
         "メニュー/互換/互換性レポート…",
-        352,
-        "読めなかった物を AI も読めるようにする",
-        Safety.READ_ONLY,
+        "get_compat_report",
+        note="窓と同じ記録を多い順に読む 窓の〔記録を消す〕〔スクリプトを読み直す〕は人だけ",
+        safety=Safety.READ_ONLY,
     ),
     # --- メニュー AI・表示・再生・ヘルプ ---
-    read_only("メニュー/AI/アシスタント", _LAYOUT),
-    missing("メニュー/表示/拡大", 350, _VIEW, Safety.READ_ONLY),
-    missing("メニュー/表示/縮小", 350, _VIEW, Safety.READ_ONLY),
-    missing("メニュー/表示/全体を表示", 350, _VIEW, Safety.READ_ONLY),
-    missing("メニュー/表示/グラフエディタ", 350, _VIEW, Safety.READ_ONLY),
+    read_only("メニュー/AI/アシスタント", _LAYOUT, "layout.docks.chat.visible"),
+    partial("メニュー/表示/拡大", "get_screen", issue=350, note=_ZOOM, safety=Safety.READ_ONLY),
+    partial("メニュー/表示/縮小", "get_screen", issue=350, note=_ZOOM, safety=Safety.READ_ONLY),
+    partial(
+        "メニュー/表示/全体を表示", "get_screen", issue=350, note=_ZOOM, safety=Safety.READ_ONLY
+    ),
+    partial(
+        "メニュー/表示/グラフエディタ",
+        "get_screen",
+        "get_clip",
+        issue=350,
+        note=_GRAPH,
+        safety=Safety.READ_ONLY,
+    ),
     same("メニュー/表示/トラックを高く", "set_track_height"),
     same("メニュー/表示/トラックを低く", "set_track_height"),
     same("メニュー/表示/トラックの高さを戻す", "set_track_height"),
-    read_only("メニュー/表示/画面配置を初期に戻す", _LAYOUT),
-    read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS),
-    read_only("メニュー/表示/設定…", _SETTINGS),
+    read_only(
+        "メニュー/表示/画面配置を初期に戻す", _LAYOUT, "layout.docks", "preferences.dock_tabs"
+    ),
+    read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS, "shortcuts"),
+    read_only("メニュー/表示/設定…", _SETTINGS, "preferences"),
     missing(
         "メニュー/再生/再生 / 停止",
         338,
-        "AI は動きを見られない 範囲の連続フレームで確かめる",
+        _PLAYING,
         Safety.READ_ONLY,
     ),
-    read_only("メニュー/ヘルプ/使い方", _HELP),
-    read_only("メニュー/ヘルプ/不具合・要望を送る", _HELP),
-    read_only("メニュー/ヘルプ/更新を確かめる…", _UPDATE),
-    read_only("メニュー/ヘルプ/前の版に戻す…", _UPDATE),
-    read_only("メニュー/ヘルプ/バージョン情報…", _HELP),
+    read_only("メニュー/ヘルプ/使い方", _HELP, "help.manual"),
+    read_only("メニュー/ヘルプ/不具合・要望を送る", _HELP, "help.report"),
+    read_only(
+        "メニュー/ヘルプ/更新を確かめる…",
+        _UPDATE,
+        "update.checks",
+        "update.checking",
+        "update.ready_version",
+        "preferences.update_check",
+    ),
+    read_only("メニュー/ヘルプ/前の版に戻す…", _UPDATE, "update.can_roll_back", "version"),
+    read_only("メニュー/ヘルプ/バージョン情報…", _HELP, "version"),
     # --- タイムラインの右クリック クリップの上 ---
     same("タイムラインの右クリック/再生ヘッドで分割", "split_clip"),
     same(
@@ -371,8 +414,20 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),
-    missing("タイムラインの右クリック/線に不透明度を出す", 350, _VIEW, Safety.READ_ONLY),
-    missing("タイムラインの右クリック/線に音量を出す", 350, _VIEW, Safety.READ_ONLY),
+    partial(
+        "タイムラインの右クリック/線に不透明度を出す",
+        "get_clip",
+        issue=350,
+        note=_LINE,
+        safety=Safety.READ_ONLY,
+    ),
+    partial(
+        "タイムラインの右クリック/線に音量を出す",
+        "get_clip",
+        issue=350,
+        note=_LINE,
+        safety=Safety.READ_ONLY,
+    ),
     # --- タイムラインの右クリック 空いた所 ---
     same("タイムラインの右クリック/フィルタを置く", "add_filter", note="track_id を渡す"),
     same("タイムラインの右クリック/追加/テキスト", "add_text"),
@@ -464,10 +519,11 @@ LEDGER: tuple[Entry, ...] = (
         "シーンの帯/置く｜ほかのシーンを、再生ヘッドの位置へ 1 本のクリップとして置く",
         "place_scene",
     ),
-    read_only("シーンの帯/磁石（吸着）", _SETTINGS),
+    read_only("シーンの帯/磁石（吸着）", _SETTINGS, "preferences.timeline_snap"),
     read_only(
         "シーンの帯/再生ヘッドの吸い付き（目盛りで動かすとき 掴んだ後に Shift で一時的に外す）",
         _SETTINGS,
+        "preferences.playhead_snap",
     ),
     # --- 再生の操作 ---
     same("再生の操作/先頭へ (Home)", "seek", safety=Safety.READ_ONLY),
@@ -475,7 +531,7 @@ LEDGER: tuple[Entry, ...] = (
     missing(
         "再生の操作/再生 / 停止 (Space)",
         338,
-        "AI は動きを見られない 範囲の連続フレームで確かめる",
+        _PLAYING,
         Safety.READ_ONLY,
     ),
     same("再生の操作/1 フレーム進む (→)", "seek", safety=Safety.READ_ONLY),
@@ -483,8 +539,10 @@ LEDGER: tuple[Entry, ...] = (
     # --- 素材一覧 ---
     same("素材一覧/読み込み…", "import_media"),
     same("素材一覧/タイムラインへ", "place_media"),
-    read_only("素材一覧/一覧｜名前・長さ・大きさを 1 行ずつ並べる", _SETTINGS),
-    read_only("素材一覧/アイコン｜サムネイルを大きく並べる", _SETTINGS),
+    read_only(
+        "素材一覧/一覧｜名前・長さ・大きさを 1 行ずつ並べる", _SETTINGS, "preferences.media_view"
+    ),
+    read_only("素材一覧/アイコン｜サムネイルを大きく並べる", _SETTINGS, "preferences.media_view"),
     same("素材一覧の右クリック/タイムラインへ置く", "place_media"),
     same("素材一覧の右クリック/字幕を起こす…", "transcribe"),
     hidden("素材一覧の右クリック/ファイルの場所を開く", _OUTSIDE),
@@ -627,7 +685,13 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("設定パネルの縁取りの〔効果〕/*/*", "add_effect", note="stroke_id を渡す"),
     same("設定パネルの ◆ の右クリック/アニメーションを解除", "clear_keyframes"),
-    missing("設定パネルの ◆ の右クリック/グラフエディタで開く", 350, _VIEW, Safety.READ_ONLY),
+    partial(
+        "設定パネルの ◆ の右クリック/グラフエディタで開く",
+        "get_clip",
+        issue=350,
+        note=_GRAPH,
+        safety=Safety.READ_ONLY,
+    ),
 )
 
 #: 画面のメニュー・右クリック・ボタンに当たらない道具と、その訳 道具を足して、台帳の

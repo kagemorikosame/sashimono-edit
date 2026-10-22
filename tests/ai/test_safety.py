@@ -192,6 +192,8 @@ class TestAppSettingsAreReadOnly:
             "alignment_commands",
             "check_state",
             "check_waiter",
+            # 互換性レポートと画面の表示の写し（#352） 読むだけで、記録を消す・表示を変える口は無い
+            "compat_report",
             # OS のクリップボードへ絵と文字を置く（#349） 作品もアプリの設定も変えない
             "copy_snapshot_image",
             "copy_text",
@@ -239,6 +241,8 @@ class TestAppSettingsAreReadOnly:
             "stop_playback",
             "transcription_status",
             "undo",
+            # 人が見ている表示（#352） 読むだけで、何も変えない
+            "view_state",
             "waveform",
             "write_project",
             "write_snapshot",
