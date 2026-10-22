@@ -97,6 +97,11 @@ PROJECT_SIDE = {
     "request_scenes",
     "scene_state",
     "scene_waiter",
+    # 画面の中身（#324） 調べるのは作品の素材の絵だけで、作品の外の名前を覚えない
+    # 読めた文字を返す道具は sends に字幕と文字を書く
+    "request_screen",
+    "screen_state",
+    "screen_waiter",
     # 仕上がりの検査（#337） 調べるのは作品か、作品と書き出しのフォルダの中の動画だけ
     "request_check",
     "check_state",
