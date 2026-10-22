@@ -50,12 +50,17 @@ __all__ = [
     "CheckTicket",
     "Fix",
     "FixRound",
+    "FixStop",
     "current_round",
     "fix_for",
     "fix_label",
+    "fix_stop",
     "fixes_closed",
+    "leave_after_limit",
+    "refuse_after_limit",
     "settle_check",
     "start_check",
+    "steps_split_off",
 ]
 
 AUTO = "auto"
@@ -266,6 +271,17 @@ class _Loop:
     settled: int | None = None
     used: int = 0
     closed: bool = False
+    #: 最後に確定した検査のときの上限（本人の設定）
+    limit: int = 0
+    #: 直す回の段を区切って段の外へ先に積んだ小さな段の名前（古い順） 区切ると段の中の小さな段は
+    #: 履歴から読めなくなるので、引き継ぎ（#346）の「変えた手」のためにここで写しておく
+    steps: tuple[str, ...] = ()
+    #: 直す回の段を区切って先に積んだ段の数
+    parts: int = 0
+    #: 上限に達した後の検査で、上限が無ければ直せた（auto か ask の）問題 最後に使えた検査の物
+    left: tuple[str, ...] = ()
+    #: 上限に達した後にブリッジが断った編集の数
+    refused: int = 0
 
 
 #: 文書ごとの数え 文書を閉じたら一緒に消える（弱い参照） ホストに持たせないのは、
@@ -305,7 +321,13 @@ def start_check(document: Document, limit: int) -> CheckTicket:
     ticket = CheckTicket(document.checkpoint_serial, document.changes_by(Author.AI))
     used, closed = _counted(loop, ticket.changed, limit)
     if not closed:
+        steps = document.steps_in_checkpoint
+        parts = document.parts_in_checkpoint
         document.split_checkpoint(fix_label(used + 1))
+        if document.parts_in_checkpoint > parts:
+            # 区切って先に積んだ（何も変えていなければ名前を替えるだけで、段の中に残る）
+            loop.steps += steps
+            loop.parts += 1
     return ticket
 
 
@@ -322,6 +344,7 @@ def settle_check(document: Document, ticket: CheckTicket, limit: int) -> FixRoun
         return current_round(document, limit)
     loop.used, loop.closed = _counted(loop, ticket.changed, limit)
     loop.settled = ticket.changed
+    loop.limit = limit
     return _round(loop.used, loop.closed, limit)
 
 
@@ -333,5 +356,78 @@ def current_round(document: Document, limit: int) -> FixRound:
 
 def fixes_closed(document: Document) -> bool:
     """今の指示が直す回数の上限に達したか 達したら、ブリッジは取り消せる編集を断る"""
+    loop = _now(document)
+    return loop is not None and loop.closed
+
+
+def _now(document: Document) -> _Loop | None:
+    """今の指示（段を閉じた後は最後に開いた指示）の数え 無ければ ``None``"""
     loop = _LOOPS.get(document)
-    return loop is not None and loop.serial == document.checkpoint_serial and loop.closed
+    return loop if loop is not None and loop.serial == document.checkpoint_serial else None
+
+
+def refuse_after_limit(document: Document) -> bool:
+    """上限に達した後の編集を断るか ブリッジが取り消せる編集の前に呼ぶ（編集画面のスレッド）
+
+    断るときは数えておく 引き継ぎ（#346）が、AI の言葉で締めた指示でも上限で止めたと書けるように
+    """
+    loop = _now(document)
+    if loop is None or not loop.closed:
+        return False
+    loop.refused += 1
+    return True
+
+
+def leave_after_limit(document: Document, ticket: CheckTicket, left: tuple[str, ...]) -> None:
+    """上限に達した後に使えた検査で、上限が無ければ直せた問題を覚える（``check_output`` が呼ぶ）
+
+    最後に使えた検査の物で置き換える 上限の後に人が直して調べ直し、何も残らなければ空になる
+    """
+    loop = _now(document)
+    if loop is not None and loop.closed and ticket.serial == loop.serial:
+        loop.left = left
+
+
+def steps_split_off(document: Document) -> tuple[tuple[str, ...], int]:
+    """今の指示で、直す回の段を区切って先に積んだ小さな段の名前と、先に積んだ段の数
+
+    引き継ぎ（#346）が段を閉じる前に写す 段の中の小さな段（:attr:`Document.steps_in_checkpoint`）
+    は最後の区切りの後の物だけなので、合わせないと前の回で直した手が要約から消える
+    """
+    loop = _now(document)
+    return ((), 0) if loop is None else (loop.steps, loop.parts)
+
+
+@dataclass(frozen=True, slots=True)
+class FixStop:
+    """直す回数の上限で止めた指示 引き継ぎ（#346）の止まった訳に使う"""
+
+    limit: int
+    #: 上限が無ければ直せた問題（:func:`leave_after_limit`）
+    left: tuple[str, ...]
+    #: 上限の後に断った編集の数
+    refused: int
+
+    def text(self) -> str:
+        parts = [f"検査の後に直す回数の上限（本人の設定 {self.limit} 回）に達しました"]
+        if self.left:
+            parts.append(f"直せる問題が {len(self.left)} 件残っています")
+        if self.refused:
+            parts.append(f"上限の後の編集を {self.refused} 回断りました")
+        return " ".join(parts)
+
+
+def fix_stop(document: Document) -> FixStop | None:
+    """今の指示が直す回数の上限で止まったか 止まっていなければ ``None``
+
+    上限に達しただけでは止まったとしない 最後の回で直し切ったなら、指示は済んでいる
+    上限の後に直せる問題が残った（上限 0 は調べるだけと本人が決めたので数えない）か、
+    上限の後の編集を断ったときだけ返す
+    """
+    loop = _now(document)
+    if loop is None or not loop.closed:
+        return None
+    left = loop.left if loop.limit else ()
+    if not left and not loop.refused:
+        return None
+    return FixStop(loop.limit, left, loop.refused)

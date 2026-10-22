@@ -26,6 +26,7 @@ from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.panel import HANDOFF_WHO
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
+from tests.ai.test_fix_loop import _MIXED_CLIP, _finish, _fix
 from tests.fake_clipboard import FakeClipboard
 from tests.ui.test_ai_budget import _call_in_thread, _poll_until
 from tests.ui.test_chat_panel import _ready, _RecordingSession
@@ -325,6 +326,47 @@ class TestTheUsageLimit:
         assert handoff.instruction == "字幕を付けて"
         assert handoff.reason is StopReason.ERROR
         assert "上限で停止" not in widget._view.toPlainText().split("字幕を付けて")[-1]
+
+
+class TestTheFixLimit:
+    """検査の後に直す回数の上限（#339）で止めた指示も、上限の訳で引き継ぐ"""
+
+    def test_problems_left_at_the_limit_hand_off(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、直す回数の上限で止めた指示は AI が言葉で締めるだけなので「完了」と区切られ、
+        # 直せずに残った問題と、前の回で直した手が人に届かない
+        widget, _ = recorded
+        host = _host(widget)
+        host.fix_limit = 1
+        _send(widget, "仕上げて")
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        _finish(host, [_MIXED_CLIP])
+        widget._handle(AgentEvent(EventKind.TEXT, text="上限なので残りを伝えます"))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert handoff.reason is StopReason.LIMIT
+        assert handoff.changes == ("直す",)
+        assert any("上限で直していない" in item for item in handoff.remaining)
+        assert "上限で停止" in widget._view.toPlainText()
+
+    def test_fixing_everything_in_the_last_round_hands_nothing_off(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、最後の回で直し切った指示にも「上限で止まりました」の要約が出て、
+        # 本当に止まった時に読まれない
+        widget, _ = recorded
+        host = _host(widget)
+        host.fix_limit = 1
+        _send(widget, "仕上げて")
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        _finish(host, [])
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert _shelved(widget) is None
+        assert "上限で停止" not in widget._view.toPlainText()
 
 
 class TestTheBox:

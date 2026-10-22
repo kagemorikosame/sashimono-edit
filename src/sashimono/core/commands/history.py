@@ -437,6 +437,15 @@ class Document:
         """
         return any(self._is_earlier_part(entry) for entry in self._undo)
 
+    @property
+    def parts_in_checkpoint(self) -> int:
+        """開いている段（指示）の前半として、段の外の履歴に残っている段の数
+
+        人の変更で割れた分と、検査の直しの回で区切った分（#339 :meth:`split_checkpoint`）の
+        両方を数える 引き継ぎ（#346）が、区切った回の数と比べて人が割ったかを見分けるのに使う
+        """
+        return sum(1 for entry in self._undo if self._is_earlier_part(entry))
+
     def _is_earlier_part(self, entry: HistoryEntry) -> bool:
         return entry.by is self._checkpoint_by and any(
             entry.before is part for part in self._earlier_parts

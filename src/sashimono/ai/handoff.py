@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from sashimono.ai.fixes import fix_stop, steps_split_off
 from sashimono.core.commands import Document
 from sashimono.core.model import Project
 
@@ -120,7 +121,8 @@ class Handoff:
     detail: str
     #: 指示の取り消しの段の名前（「AI: 〜」）
     checkpoint: str
-    #: 指示の中で変えた手（古い順） 作品の履歴の、段の中の小さな段の名前
+    #: 指示の中で変えた手（古い順） 作品の履歴の、段の中の小さな段の名前 検査の直しの回で
+    #: 区切って先に積んだ段の中の手（#339）も含む
     changes: tuple[str, ...]
     #: 指示の途中に人が変えたので、指示の段が 2 つ以上に割れた
     split: bool
@@ -137,16 +139,27 @@ class Handoff:
     ai_words: str
     #: 止まった時の作品 別の作品を開いた後に、前の作品の引き継ぎを返さないために持つ
     project: Project = field(repr=False, compare=False)
+    #: 検査の直しの回ごとに区切って先に積んだ段の数（#339） 人が割ったのとは分けて案内する
+    fix_parts: int = 0
 
     @property
     def changed(self) -> bool:
-        return bool(self.changes) or self.split
+        return bool(self.changes) or self.split or bool(self.fix_parts)
 
     def undo_note(self) -> str:
         """取り消しの段の案内"""
         if not self.changed:
             return "作品は変えていません"
-        note = f"Ctrl+Z で「{self.checkpoint}」を戻すと、この指示の前へ戻ります"
+        if self.fix_parts:
+            # 直しの回ごとに段が分かれている（#339） 1 回で指示の前へ戻ると読むと、最後の回の
+            # 直しだけを戻して止める
+            note = (
+                "Ctrl+Z で「AI: 検査の直し（n 回目）」の段から「"
+                f"{self.checkpoint}」の段まで順に戻すと、この指示の前へ戻ります"
+                "（検査の直しの回ごとに段を分けてあり、1 回ずつその回の直しだけを戻せます）"
+            )
+        else:
+            note = f"Ctrl+Z で「{self.checkpoint}」を戻すと、この指示の前へ戻ります"
         if self.split:
             note += "（途中で人が変えたので、指示の段が 2 つ以上に分かれています）"
         return note
@@ -195,6 +208,7 @@ class Handoff:
             "changes": list(self.changes),
             "checkpoint": self.checkpoint if self.changed else None,
             "split_by_person": self.split,
+            "fix_parts": self.fix_parts,
             "undo": self.undo_note(),
             "failures": list(self.failures),
             "refused": list(self.refused),
@@ -226,6 +240,7 @@ class TurnRecord:
         self._ai_words = ""
         self._changes: tuple[str, ...] = ()
         self._split = False
+        self._fix_parts = 0
 
     def begin(self, instruction: str) -> None:
         """次の指示に取りかかった 前の指示で集めた物を全部捨てる
@@ -241,6 +256,7 @@ class TurnRecord:
         self._ai_words = ""
         self._changes = ()
         self._split = False
+        self._fix_parts = 0
         self._instruction = _cut(instruction.strip(), INSTRUCTION_LIMIT)
 
     @property
@@ -290,8 +306,21 @@ class TurnRecord:
         """
         if not document.in_checkpoint:
             return
-        self._changes = document.steps_in_checkpoint
-        self._split = document.parts_left_in_checkpoint
+        # 検査の直しの回で区切ると（#339）、先に積んだ段の中の手は段の中から読めなくなる
+        # 区切ったときに写した物を前に足す 足さないと前の回で直した手が要約から消える
+        earlier, parts = steps_split_off(document)
+        self._changes = earlier + document.steps_in_checkpoint
+        # 前半の段は、人が割った分と直しの回で区切った分の両方 区切った回より多ければ人が割った
+        self._split = document.parts_in_checkpoint > parts
+        self._fix_parts = parts
+        # 直す回数の上限で止めた（#339） AI は止めた訳を聞いて言葉で締めるだけなので、ここで
+        # 書かないと「止まらずに終えた」扱いになり、残った問題が人に届かない
+        stopped = fix_stop(document)
+        if stopped is not None:
+            self.stop(StopReason.LIMIT, stopped.text())
+            for item in stopped.left:
+                if item not in self._remaining:
+                    self.remain(item)
 
     def handoff(self, document: Document, checkpoint: str) -> Handoff | None:
         """止まった指示の引き継ぎ 止まらずに終えたなら ``None``"""
@@ -319,6 +348,7 @@ class TurnRecord:
             remaining=tuple(self._remaining),
             ai_words=self._ai_words,
             project=document.project,
+            fix_parts=self._fix_parts,
         )
 
 

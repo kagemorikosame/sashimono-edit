@@ -25,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
 from sashimono.ai.fixes import (
     FIX_ACTIONS,
@@ -32,6 +33,7 @@ from sashimono.ai.fixes import (
     FixRound,
     current_round,
     fix_for,
+    leave_after_limit,
     settle_check,
     start_check,
 )
@@ -2805,6 +2807,21 @@ def _check_result(
             problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
         )
         fixes[action.action] += 1
+    if ticket is not None and rounds is not None and rounds.closed and not unsettled:
+        # 上限が無ければ直せた問題を覚える 引き継ぎ（#346）が、AI が言葉で締めた指示でも
+        # 上限で止めたと書き、残った問題を人へ渡せるように 使えない結果では覚えない（古い問題）
+        leave_after_limit(
+            host.document,
+            ticket,
+            tuple(
+                f"{CHECK_KIND_NAMES[problem.kind]}"
+                f"（{_problem_time(problem.start, report.fps, rate)}〜"
+                " 直す回数の上限で直していない）"
+                for problem in report.problems
+                if fix_for(problem.kind, problem.severity, problem.measure).action
+                in (FIX_AUTO, FIX_ASK)
+            ),
+        )
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -2864,6 +2881,13 @@ def _check_result(
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _problem_time(frame: int, fps: float, rate: FrameRate | None) -> str:
+    """問題の頭の時刻 人が引き継ぎ（#346）から場所を探せるよう、タイムラインの表示と同じ形で書く"""
+    if rate is None:
+        return f"{round(frame / fps, 3)} 秒"
+    return format_timecode(frame, rate)
 
 
 def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:

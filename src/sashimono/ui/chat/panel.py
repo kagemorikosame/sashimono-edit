@@ -1694,6 +1694,13 @@ class ChatPanel(QWidget):
             # 引き継ぎ（#346）にも上限の訳で渡す AI は止めた訳を聞いて言葉で締めるだけなので、
             # ここで書かないと「完了」扱いになり、何をやり残したかの要約が人に届かない
             self._record.stop(StopReason.LIMIT, stopped.text())
+        if self._checkpoint_open:
+            # 段を閉じる前に区切りの行を足す道もある 写すと直す回数の上限（#339）も読める
+            self._record.capture(self._host.document)
+        if outcome == "完了" and self._record.reason is StopReason.LIMIT:
+            # 検査の後に直す回数の上限で止めた（#339 写したときに訳を書く） AI は言葉で締めて
+            # 終わるので、そのままだと直せる問題を残したまま「完了」と読める
+            outcome = "上限で停止"
         counts = f"操作 {self._turn_tools} 件"
         if self._turn_failures:
             counts += f"・失敗 {self._turn_failures} 件"

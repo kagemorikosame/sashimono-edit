@@ -26,10 +26,11 @@ from sashimono.ai.handoff import (
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.outbound import TEXT_MARK, Outbound, SendChoice
 from sashimono.ai.session import LIMIT_DETAIL, EventKind, result_error
-from sashimono.core.commands import Author, Document, SplitClip
+from sashimono.core.commands import Author, Document, RenameProject, SplitClip
 from sashimono.core.model import MediaItem, Project, Transcript
-from tests.ai.conftest import FakeHost, make_loaded
-from tests.ai.test_bridge import call_in_thread
+from tests.ai.conftest import FakeHost, allow_sending, make_loaded
+from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.ai.test_fix_loop import _MIXED_CLIP, _finish, _fix
 from tests.ai.test_outbound import SECRET_PATH, answer_sends, put_handoff, undeclared
 
 
@@ -371,3 +372,100 @@ def test_the_tool_is_named_in_the_instructions() -> None:
     from sashimono.ai.session import system_prompt
 
     assert GET_HANDOFF in system_prompt()
+
+
+class TestFixLoop:
+    """検査の直しの繰り返し（#339）と合わせたときの引き継ぎ"""
+
+    def _record(self, host: FakeHost, *, stop: bool = False) -> TurnRecord:
+        record = TurnRecord()
+        record.begin("仕上げて")
+        record.capture(host.document)
+        host.document.end_checkpoint()
+        if stop:
+            record.stop(StopReason.ERROR, "落ちた")
+        return record
+
+    def test_every_round_is_kept_in_the_changes(self, host: FakeHost) -> None:
+        # 壊れると、直しの回で段を区切った後に止まった指示の要約から、前の回で直した手が消え、
+        # 「途中で人が変えた」と人のせいにした案内が出る
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _fix(host, "編集")
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 2")
+        handoff = self._record(host, stop=True).handoff(host.document, "AI: 仕上げて")
+        assert handoff is not None
+        assert handoff.changes == ("直す", "直す", "直す")
+        assert handoff.split is False
+        assert handoff.fix_parts == 2
+        note = handoff.undo_note()
+        assert "検査の直し" in note
+        assert "AI: 仕上げて" in note
+        assert "人が変えた" not in note
+
+    def test_a_person_splitting_a_fixed_instruction_is_still_pointed_out(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、直しの回の区切りと人の割り込みの区切りを取り違え、人が割った指示を
+        # 「直しの回ごと」とだけ案内する
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _fix(host, "編集")
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        host.document.execute(RenameProject("人の直し"), by=Author.PERSON)
+        _fix(host, "直し 2")
+        handoff = self._record(host, stop=True).handoff(host.document, "AI: 仕上げて")
+        assert handoff is not None
+        assert handoff.split is True
+        assert "分かれています" in handoff.undo_note()
+
+    def test_the_limit_with_problems_left_is_a_stop(self, host: FakeHost) -> None:
+        # 壊れると、直す回数の上限で止めた指示は AI が言葉で締めるだけなので止まらずに
+        # 終えた扱いになり、直せずに残った問題が人に届かない
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        assert _finish(host, [_MIXED_CLIP])["fix_round"]["closed"] is True
+        handoff = self._record(host).handoff(host.document, "AI: 仕上げて")
+        assert handoff is not None
+        assert handoff.reason is StopReason.LIMIT
+        assert "直す回数の上限" in handoff.detail
+        (left,) = handoff.remaining
+        assert "音割れ" in left
+        assert "上限で直していない" in left
+
+    def test_reaching_the_limit_with_nothing_left_is_not_a_stop(self, host: FakeHost) -> None:
+        # 壊れると、最後の回で直し切った指示にも「上限で止まりました」の要約が出る
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        assert _finish(host, [])["fix_round"]["closed"] is True
+        assert self._record(host).handoff(host.document, "AI: 仕上げて") is None
+
+    def test_checking_only_is_not_a_stop(self, host: FakeHost) -> None:
+        # 壊れると、上限 0（調べるだけ）と本人が決めた作品で調べるたびに「上限で止まりました」が出る
+        host.fix_limit = 0
+        host.document.begin_checkpoint("AI: 調べて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        assert self._record(host).handoff(host.document, "AI: 調べて") is None
+
+    def test_an_edit_refused_after_the_limit_is_a_stop(self, host: FakeHost) -> None:
+        # 壊れると、上限の後に断った編集があっても、AI が言葉で締めれば「完了」と読め、
+        # やろうとしてできなかったことが人に届かない
+        host.fix_limit = 0
+        host.document.begin_checkpoint("AI: 調べて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        tool = find_operation("add_track")
+        assert tool is not None
+        done, box = call_in_thread(bridge, tool, {"kind": "video"})
+        pump_until(bridge, done)
+        assert "上限" in str(box["error"])
+        handoff = self._record(host).handoff(host.document, "AI: 調べて")
+        assert handoff is not None
+        assert handoff.reason is StopReason.LIMIT
+        assert "1 回断りました" in handoff.detail
