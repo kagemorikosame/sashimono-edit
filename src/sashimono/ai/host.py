@@ -27,8 +27,9 @@ from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, SegmentId
 from sashimono.core.seams import SeamStyle
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.vision import ScreenKind
 
 __all__ = [
     "EXPORT_RUNNING",
@@ -36,9 +37,9 @@ __all__ = [
     "CompatReport",
     "EditorHost",
     "ExportRequest",
-    "ScreenState",
     "SheetCanvas",
     "ToolError",
+    "ViewState",
 ]
 
 #: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
@@ -67,7 +68,7 @@ class ExportRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ScreenState:
+class ViewState:
     """人が画面で見ている物のうち、作品の中に無い物（表示・再生・パネルの選択 #352）
 
     作品の中身（クリップ・選択したクリップ・再生ヘッド）は :attr:`EditorHost.project` などで読む
@@ -388,6 +389,29 @@ class EditorHost(Protocol):
         """
         ...
 
+    def request_screen(self, media: MediaItem, kind: ScreenKind) -> None:
+        """画面の中身（文字か顔の位置 #324）を調べるよう頼む 調べ終えた物・調べている物が
+        あれば何もしない 失敗した物（部品が無かった）は頼み直す
+
+        頼むのは本人のキャッシュへの解析だけで、読み込みのときに調べるかの設定
+        （``Preferences.screen_analysis``）は変えない
+        """
+        ...
+
+    def screen_state(self, media: MediaItem, kind: ScreenKind) -> ScreenState:
+        """画面の中身を調べた様子 調べ終えた結果か、調べた所までの写しと、失敗の理由
+
+        頼みはしない（:meth:`scene_state` と同じ 失敗の理由を読む前に頼み直すと理由が消える）
+        """
+        ...
+
+    def screen_waiter(self, media_id: MediaId, kind: ScreenKind) -> Callable[[float], bool]:
+        """画面の中身を調べ終えるまで、最長で引数の秒だけ待つ関数 終わっていれば真を返す
+
+        返す関数は**AI のスレッドから呼ばれる**（:meth:`scene_waiter` と同じ）
+        """
+        ...
+
     def start_transcription(
         self, media_id: MediaId, model: str, *, audio_stream: int | None = None
     ) -> str:
@@ -493,7 +517,7 @@ class EditorHost(Protocol):
         """
         ...
 
-    def screen_state(self) -> ScreenState:
+    def view_state(self) -> ViewState:
         """人が画面で見ている表示の状態（見えている範囲・再生・パネルの選択・書き出し #352）
 
         読むだけ 変える口は置かない（拡大や再生を AI に出すかは #298 の決めること）

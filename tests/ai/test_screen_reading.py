@@ -320,9 +320,9 @@ def test_the_reading_thread_is_not_the_editing_thread(host: FakeHost) -> None:
     seen: list[int] = []
 
     class _Watching(FakeHost):
-        def screen_state(self) -> Any:
+        def view_state(self) -> Any:
             seen.append(threading.get_ident())
-            return super().screen_state()
+            return super().view_state()
 
     watching = _Watching(host.document.project)
     bridge = EditorBridge(watching)
