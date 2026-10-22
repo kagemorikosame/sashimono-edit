@@ -141,6 +141,7 @@ from sashimono.core.model import (
     TrackId,
     heard_stream,
 )
+from sashimono.core.reframe import CENTER, ReframeError, ReframeStyle
 from sashimono.core.seams import (
     SEAM_NONE,
     SeamStyle,
@@ -174,6 +175,7 @@ from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
+from sashimono.engine.reframe import ReframeRequest, gather_signals, plan_reframe, tracked_media
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
 from sashimono.links import MANUAL_URL, REPORT_URL
@@ -207,6 +209,7 @@ from sashimono.ui.progress_display import (
     overall_fraction,
     row_notes,
 )
+from sashimono.ui.reframe_dialog import ask_reframe
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.seam_dialogs import ask_seams, ask_speed
 from sashimono.ui.subtitle import SubtitlePanel
@@ -746,6 +749,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._add(file_menu, "プロジェクト設定…", QKeySequence("Ctrl+Shift+P"), self.edit_settings)
         self._add(file_menu, "置き方の方式を切り替える…", QKeySequence(), self.switch_layer_mode)
+        self._add(file_menu, "縦の作品に作り替える…", QKeySequence(), self.reframe_project)
         file_menu.addSeparator()
         self._add(file_menu, "素材を読み込む…", QKeySequence("Ctrl+I"), self._import_dialog)
         self._add(file_menu, "書き出し…", QKeySequence("Ctrl+E"), self.export)
@@ -2779,6 +2783,74 @@ class MainWindow(QMainWindow):
         self._on_project_changed()
         return True
 
+    def reframe_project(self) -> bool:
+        """〔縦の作品に作り替える…〕 AI の道具 ``reframe`` と同じ所を通す（#334）
+
+        命令は :func:`plan_reframe` が組む
+
+        窓の既定は本人の設定で、窓で変えた値はその 1 回だけ 作り替えはメインとすべてのシーンに
+        掛かるので、開いているシーンの中へ包まずに実行する（:meth:`switch_layer_mode` と同じ）
+        人の段として取り消し 1 回で戻る
+
+        背景の動画の場面の解析が終わっていなければ、解析を頼んで何も変えない 途中までの並びで
+        作ると、読んでいない所の枠が真ん中に止まり、やり直しても直らない（AI の道具と同じ決まり）
+        変えたら真 やめたとき・待つとき・断られたときは偽
+        """
+        choice = ask_reframe(self, self._preferences.reframe_style)
+        if choice is None:
+            return False
+        project = self._document.project
+        width, height = choice.resolution
+        if (width, height) == project.settings.resolution:
+            self.statusBar().showMessage(f"作品はもう {width}x{height} です", 4000)
+            return False
+        media = [] if choice.follow == CENTER else tracked_media(project)
+        for item in media:
+            self._analyzer.request_scenes(item, on_ready=self._on_analysis_ready)
+        gathered = gather_signals(media, self._analyzer.scene_state)
+        if gathered.waiting:
+            self.statusBar().showMessage(
+                f"被写体を見積もる解析が終わっていない素材が {len(gathered.waiting)} 本あります"
+                " 解析が終わってからもう一度作り替えてください（枠の動かし方を「追わずに真ん中を"
+                "切り出す」にすると待たずに作れます）",
+                8000,
+            )
+            return False
+        request = ReframeRequest(
+            width, height, choice.follow, choice.smooth_ms, self._preferences.subtitle_wrap_share
+        )
+        try:
+            plan = plan_reframe(project, request, gathered.signals)
+            with self._document.checkpoint(
+                f"縦の作品に作り替え: {width}x{height}", by=Author.PERSON
+            ):
+                for command in plan.commands:
+                    self._document.execute(command)
+        except (ReframeError, ValueError, KeyError) as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            self._on_project_changed()
+            return False
+        self._on_project_changed()
+        notes: list[str] = []
+        if gathered.untracked:
+            # 解析できなかった素材（壊れた・読めない）は真ん中を切り出して作り替える
+            # 断ると、読めない
+            # 素材が 1 本あるだけで作品ごと作り替えられない 黙ると人は追えていないことに気付かない
+            # （AI の道具は返事の untracked_media で同じことを知らせる）
+            notes.append(
+                f"場面の解析ができなかった素材 {len(gathered.untracked)} 本は、被写体を追わずに"
+                "真ん中を切り出しました"
+            )
+        if plan.skipped:
+            notes.append(
+                f"作り替えられなかったクリップが {len(plan.skipped)} 本あります（"
+                + " / ".join(reason for _clip, reason in plan.skipped[:3])
+                + "）"
+            )
+        if notes:
+            self.statusBar().showMessage(" ".join(notes), 8000)
+        return True
+
     # --- 退避と復元 ---
 
     def autosave(self) -> None:
@@ -3655,6 +3727,10 @@ class MainWindow(QMainWindow):
     @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        return self._preferences.reframe_style
 
     @property
     def image_edge(self) -> int:

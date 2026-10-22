@@ -26,6 +26,7 @@ from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId
+from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
@@ -379,6 +380,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.seam_style`）
 
         溶かすか寄るか・どれだけの長さかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def reframe_style(self) -> ReframeStyle:
+        """縦動画への作り替え（#334）の既定の大きさ・枠の動かし方・ならす長さ
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.reframe_style`）
+
+        どの縦の大きさで出すか・枠を止めるか追うかは人と作品で違う AI が引数で渡さなければこれを使う
         """
         ...
 
