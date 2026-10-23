@@ -10,10 +10,12 @@ AI が絵を見て覚えた場面の説明まで引く 見つけた行を選ぶ�
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QLabel,
@@ -25,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.model import MediaItem, Project
-from sashimono.core.search import SCENE, SceneNote, search_media
+from sashimono.core.search import SCENE, Hit, SceneNote, search_media
 from sashimono.core.timebase import Rounding, format_timecode, seconds_to_frame
 
 __all__ = ["MAX_SHOWN", "MediaSearchDialog"]
@@ -38,6 +40,20 @@ MAX_SHOWN = 500
 _MEDIA = Qt.ItemDataRole.UserRole
 _SECONDS = Qt.ItemDataRole.UserRole + 1
 _STREAM = Qt.ItemDataRole.UserRole + 2
+
+
+@dataclass(frozen=True, slots=True)
+class _Answer:
+    """裏のスレッドで引いた答え 引いた作品も添える（並べる名前と時刻の刻みはその作品で引く）"""
+
+    project: Project
+    outcome: list[Hit] | ValueError
+
+
+class _Relay(QObject):
+    """裏のスレッドから窓の側へ答えを渡す口 引数は頼んだ番号と答え（:class:`_Answer`）"""
+
+    finished = Signal(int, object)
 
 
 class MediaSearchDialog(QDialog):
@@ -73,6 +89,17 @@ class MediaSearchDialog(QDialog):
         self._summary.setWordWrap(True)
         self._results = QListWidget(self)
         self._results.itemActivated.connect(self._activate)
+        #: 頼んだ検索の番号 答えの番号がこれと違えば捨てる
+        self._generation = 0
+        self._searching = False
+        # 窓ごとの走り場 全体の走り場（globalInstance）を使うと、閉じたときに clear で
+        # ほかの所が頼んだ仕事まで捨てる 1 本にするのは、打ち直した古い検索が走り続けても
+        # 新しい検索と CPU を取り合わないため（古い答えは捨てるので、待たせて構わない）
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        # 裏のスレッドから答えを受ける口 窓の側のスレッドに住むので、届くのは窓の側で回る
+        self._relay = _Relay(self)
+        self._relay.finished.connect(self._on_finished)
         layout = QVBoxLayout(self)
         layout.addWidget(self._field)
         layout.addWidget(self._summary)
@@ -92,19 +119,68 @@ class MediaSearchDialog(QDialog):
         return self._summary.text()
 
     def search(self) -> None:
-        """欄の言葉で探し直す 空なら一覧を空にする"""
+        """欄の言葉で探し直す 空なら一覧を空にする
+
+        引くのは裏のスレッド 全素材の字幕と場面の説明（控えのファイル）を読んで並べ替えるので、
+        大きな作品で窓の側で引くと、その間は打つことも閉じることもできない 作品は窓の側で
+        読んでから渡す（作品は書き換えない値なので、引く間に編集しても読んだときの作品で引く）
+        頼むたびに番号を進め、後から終わった古い頼みの答えは捨てる 捨てないと、短い語の
+        遅い検索が、後で打ち直した語の答えを上書きする
+        """
+        self._generation += 1
         words = self._field.text().split()
         self._results.clear()
         if not words:
+            self._searching = False
             self._summary.setText("探す言葉を打って Enter")
             return
         project = self._project()
-        try:
-            hits = search_media(project, words, notes_of=self._notes_of)
-        except ValueError:
+        generation = self._generation
+        notes_of = self._notes_of
+        relay = self._relay
+
+        def run() -> None:
+            outcome: list[Hit] | ValueError
+            try:
+                outcome = search_media(project, words, notes_of=notes_of)
+            except ValueError as exc:
+                outcome = exc
+            with contextlib.suppress(RuntimeError):
+                # 窓ごと消えた後に終わったとき 受け手はもう無いので答えは要らない
+                relay.finished.emit(generation, _Answer(project, outcome))
+
+        self._searching = True
+        self._summary.setText("探しています…")
+        # まだ走り出していない古い頼みは走らせない どうせ捨てる答えのために素材を読まない
+        self._pool.clear()
+        self._pool.start(run)
+
+    @property
+    def searching(self) -> bool:
+        """今の頼みの答えを待っているか"""
+        return self._searching
+
+    def done(self, result: int) -> None:
+        """閉じたら待っている頼みを捨てる 開き直して打つまで、前の答えで一覧を埋めない"""
+        self._generation += 1
+        self._searching = False
+        # まだ走り出していない頼みは走らせない 走っている物は終わるのを待たない（窓を閉じる
+        # 手を止めない） 終わった答えは番号が合わないので捨てられる
+        self._pool.clear()
+        super().done(result)
+
+    def _on_finished(self, generation: int, answer: object) -> None:
+        if generation != self._generation or not isinstance(answer, _Answer):
+            # 出し直した後か閉じた後に終わった古い頼み 今の答えを上書きしない
+            return
+        self._searching = False
+        if isinstance(answer.outcome, ValueError):
             # 揃えると空になる語（記号だけなど）は、どの行にも当たって絞れないので探さない
             self._summary.setText("記号だけの言葉では探せません")
             return
+        self._show(answer.project, answer.outcome)
+
+    def _show(self, project: Project, hits: list[Hit]) -> None:
         names = {media.id: media.name for media in project.media}
         rate = project.rate
         for hit in hits[:MAX_SHOWN]:

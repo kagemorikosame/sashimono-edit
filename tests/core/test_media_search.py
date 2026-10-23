@@ -268,3 +268,45 @@ class TestHitPlaces:
         media = _two_languages(video_media)
         project = _placed(media, (TrackKind.AUDIO, 0, 1), (TrackKind.AUDIO, 600, 2))
         assert [frame for _clip, frame in hit_places(project, media, 2.0, None)] == [60, 660]
+
+    def test_a_clip_cut_at_a_rounded_subtitle_start_is_a_place(
+        self, video_media: MediaItem
+    ) -> None:
+        # 壊れると、字幕の頭（10/3 秒）で切ったクリップが、3 桁に丸めた当たりの 3.333 秒より
+        # 後ろから始まるとして外れ、置いてあるのに「置いていない」と答える
+        media = _two_languages(video_media)
+        line = TranscriptSegment(start=Fraction(10, 3), end=Fraction(5), text="三分の十秒")
+        media = media.with_transcript(Transcript(segments=(line,)), 2)
+        clip = replace(make_clip(300, 90, media), source_in=Fraction(10, 3))
+        held = replace(make_clip(600, 90, media), hold_at=Fraction(2, 3))
+        project = _project(media).with_timeline(
+            replace(
+                _project(media).timeline,
+                tracks=(
+                    Track(kind=TrackKind.AUDIO, name="A2", clips=(replace(clip, stream_index=2),)),
+                    Track(kind=TrackKind.VIDEO, name="V", clips=(held,)),
+                ),
+            )
+        )
+        (hit,) = search_media(project, ["三分"], notes_of=_no_notes)
+        assert hit.start == 3.333
+        assert [frame for _clip, frame in hit_places(project, media, hit.start, 2)] == [300]
+        # 絵だけのクリップへの逃げ道も同じく許す 止めた時刻（2/3 秒）ちょうどの字幕は、丸めると
+        # 0.667 秒で止めた時刻より後ろになる
+        silent = project.with_timeline(
+            replace(project.timeline, tracks=(project.timeline.tracks[1],))
+        )
+        assert [frame for _clip, frame in hit_places(silent, media, 0.667, 2)] == [620]
+
+    def test_a_scene_note_is_compared_as_given(self, video_media: MediaItem) -> None:
+        # 壊れると、AI が渡した場面の秒にまで丸めの幅を当て、クリップの頭より前の場面を
+        # その頭のフレームとして示す
+        media = _two_languages(video_media)
+        clip = replace(make_clip(300, 90, media), source_in=Fraction(10, 3), stream_index=2)
+        project = _project(media).with_timeline(
+            replace(
+                _project(media).timeline,
+                tracks=(Track(kind=TrackKind.AUDIO, name="A2", clips=(clip,)),),
+            )
+        )
+        assert hit_places(project, media, 3.333, None) == []

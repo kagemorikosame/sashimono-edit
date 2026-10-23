@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
     QApplication,
@@ -109,7 +112,17 @@ def window(
 def _search(dialog: MediaSearchDialog, text: str) -> list[str]:
     dialog.field.setText(text)
     dialog.search()
+    _settle(dialog)
     return [dialog.results.item(row).text() for row in range(dialog.results.count())]
+
+
+def _settle(dialog: MediaSearchDialog, seconds: float = 10.0) -> None:
+    """裏のスレッドの検索が終わり、答えが窓に並ぶまで窓の側の事件を回す"""
+    deadline = time.monotonic() + seconds
+    while dialog.searching:
+        assert time.monotonic() < deadline, "検索が終わらない"
+        QApplication.processEvents()
+        time.sleep(0.005)
 
 
 class TestTheDialog:
@@ -152,6 +165,103 @@ class TestTheDialog:
         dialog = window.show_media_search()
         assert _search(dialog, "存在しない言葉") == []
         assert "空白で区切って" in dialog.summary
+
+
+class _Gates:
+    """場面の説明を読む所で、呼ばれた順に 1 つずつ止める 試験が開けるまで検索が終わらない"""
+
+    def __init__(self, count: int) -> None:
+        self.gates = [threading.Event() for _ in range(count)]
+        self.reached = [threading.Event() for _ in range(count)]
+        self._calls = 0
+        self._lock = threading.Lock()
+
+    def notes_of(self, _media: MediaItem) -> tuple[SceneNote, ...]:
+        with self._lock:
+            index = self._calls
+            self._calls += 1
+        if index < len(self.gates):
+            self.reached[index].set()
+            self.gates[index].wait(5)
+        return ()
+
+
+def _dialog(qt_application: QApplication, media: MediaItem, gates: _Gates) -> MediaSearchDialog:
+    del qt_application
+    lined = media.with_transcript(_transcript((2, "海に行きました"), (6, "山に登りました")))
+    project = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(lined,))
+    return MediaSearchDialog(lambda: project, gates.notes_of)
+
+
+def _spin(seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.005)
+
+
+class TestSearchingInTheBackground:
+    def test_the_window_keeps_working_while_searching(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、大きな作品で Enter を押すと全部の字幕と説明を読み終えるまで窓が固まり、
+        # 打ち直すことも閉じることもできない
+        gates = _Gates(1)
+        dialog = _dialog(qt_application, video_media, gates)
+        dialog.field.setText("海")
+        started = time.monotonic()
+        dialog.search()
+        assert time.monotonic() - started < 1.0
+        assert gates.reached[0].wait(5)
+        ticked: list[bool] = []
+        QTimer.singleShot(0, lambda: ticked.append(True))
+        _spin(0.1)
+        # 検索が止まっている間も窓の側の事件が回り、探していることが出ている
+        assert ticked == [True]
+        assert dialog.searching
+        assert "探しています" in dialog.summary
+        gates.gates[0].set()
+        _settle(dialog)
+        assert [dialog.results.item(row).text() for row in range(dialog.results.count())] != []
+        assert "海に行きました" in dialog.results.item(0).text()
+
+    def test_an_old_answer_does_not_replace_the_new_search(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、打ち直す前の語の遅い検索が後から終わり、今打った語の答えの代わりに並ぶ
+        gates = _Gates(2)
+        dialog = _dialog(qt_application, video_media, gates)
+        dialog.field.setText("海")
+        dialog.search()
+        assert gates.reached[0].wait(5)
+        dialog.field.setText("山")
+        dialog.search()
+        gates.gates[0].set()
+        # 古い検索が終わって答えが届いても、一覧は空のまま新しい答えを待つ
+        assert gates.reached[1].wait(5)
+        _spin(0.2)
+        assert dialog.results.count() == 0
+        assert dialog.searching
+        gates.gates[1].set()
+        _settle(dialog)
+        rows = [dialog.results.item(row).text() for row in range(dialog.results.count())]
+        assert len(rows) == 1 and "山に登りました" in rows[0]
+
+    def test_closing_drops_the_answer(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、閉じた後に終わった検索の答えが残り、開き直すと打っていない語の一覧が出る
+        gates = _Gates(1)
+        dialog = _dialog(qt_application, video_media, gates)
+        dialog.show()
+        dialog.field.setText("海")
+        dialog.search()
+        assert gates.reached[0].wait(5)
+        dialog.reject()
+        assert not dialog.searching
+        gates.gates[0].set()
+        _spin(0.3)
+        assert dialog.results.count() == 0
 
 
 class TestGoingThere:

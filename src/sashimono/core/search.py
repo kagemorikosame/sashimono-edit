@@ -178,6 +178,11 @@ def _seconds(value: Fraction) -> float:
     return round(float(value), 3)
 
 
+#: :func:`_seconds` で丸めた秒と元の秒の差の上限（3 桁の半分） 字幕の当たりの秒を
+#: クリップの頭や止めた時刻と比べるときにだけ許す
+_ROUNDED_SLACK = Fraction(1, 2000)
+
+
 def hears_stream(
     project: Project, media: MediaItem, stream: int | None
 ) -> Callable[[Track, Clip], bool] | None:
@@ -208,23 +213,36 @@ def media_places(
     media: MediaItem,
     seconds: float,
     accept: Callable[[Track, Clip], bool] | None = None,
+    *,
+    rounded: bool = False,
 ) -> list[tuple[Clip, int]]:
     """素材の ``seconds`` が流れる、今のタイムラインの（クリップ, フレーム） フレームの順
 
     見る（``accept``）のは素材のクリップだけ 止めた絵（``hold_at``）より後ろの時刻と、
     クリップの頭より前の時刻は流れないので外す フレームを CEIL で取るのは、その時刻の絵か
     音が最初に出るフレームにするため（場面の切り替わり #319 と同じ）
+
+    ``rounded`` は ``seconds`` が 3 桁に丸めた字幕の秒（:attr:`Hit.start`）のとき 丸めの分
+    （:data:`_ROUNDED_SLACK`）だけ頭と止めた時刻の外も許し、その時刻へ寄せる 許さないと、
+    字幕の頭（10/3 秒）で切ったクリップが丸めた 3.333 秒より後ろから始まるとして外れる
     """
     moment = Fraction(str(seconds))
+    slack = _ROUNDED_SLACK if rounded else Fraction(0)
     places: list[tuple[Clip, int]] = []
     for track in project.timeline.tracks:
         for clip in track.clips:
             if clip.media_id != media.id or (accept is not None and not accept(track, clip)):
                 continue
-            if moment < clip.source_in or (clip.hold_at is not None and moment > clip.hold_at):
+            if moment + slack < clip.source_in or (
+                clip.hold_at is not None and moment - slack > clip.hold_at
+            ):
                 continue
+            # 丸めの分だけ頭より前の時刻は、頭のフレームとして数える
+            at = max(moment, clip.source_in)
+            if clip.hold_at is not None:
+                at = min(at, max(clip.hold_at, clip.source_in))
             offset = seconds_to_frame(
-                (moment - clip.source_in) / clip.speed, project.rate, Rounding.CEIL
+                (at - clip.source_in) / clip.speed, project.rate, Rounding.CEIL
             )
             frame = clip.timeline_start + offset
             if frame < clip.timeline_end:
@@ -250,11 +268,16 @@ def hit_places(
     hears = hears_stream(project, media, stream)
     if hears is None:
         return media_places(project, media, seconds)
-    heard = media_places(project, media, seconds, hears)
+    # 字幕の当たりの秒は 3 桁に丸めてある（場面の説明は AI が渡した秒のままなので許さない）
+    heard = media_places(project, media, seconds, hears, rounded=True)
     if heard:
         return heard
     return media_places(
-        project, media, seconds, lambda track, clip: not project.plays_sound(track, clip)
+        project,
+        media,
+        seconds,
+        lambda track, clip: not project.plays_sound(track, clip),
+        rounded=True,
     )
 
 
