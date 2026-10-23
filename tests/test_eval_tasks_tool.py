@@ -428,6 +428,40 @@ def test_non_finite_numbers_never_reach_the_results(
     assert len(_strict_rows(results)) == len(records)
 
 
+def test_zero_scene_values_are_kept_or_refused(
+    tool: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """最短の場面 0 は既定値に置き換えずに渡して記録し、範囲の外の感度は走らせる前に断ること
+
+    ``or`` で既定値を選ぶと 0 を偽と見て、0 で試したつもりの回が既定値で数えられ、
+    結果の行にも渡していない値が書かれて、前後の比べを取り違える
+    """
+    from sashimono.engine.scenes import DEFAULT_THRESHOLD
+
+    params = tool.ToolParams(min_scene=0.0)
+    assert params.record("scenes") == {"threshold": DEFAULT_THRESHOLD, "min_scene": 0.0}
+
+    # 場面検出に実際に渡る値も同じ（素材は偽の解析で置き換える）
+    passed: list[tuple[float, float]] = []
+
+    class Signal:
+        def cuts(self, threshold: float, min_scene: float) -> list[Any]:
+            passed.append((threshold, min_scene))
+            return []
+
+    monkeypatch.setattr("sashimono.engine.scenes.analyze_scenes", lambda *_, **__: Signal())
+    assert tool.find_scenes(Path("x.mp4"), params) == []
+    assert passed == [(DEFAULT_THRESHOLD, 0.0)]
+
+    for bad in ({"scene_threshold": 0.0}, {"min_scene": -1.0}, {"asr_model": " "}):
+        with pytest.raises(tool.ParamsError):
+            tool.ToolParams(**bad)
+    # 外のフォルダは読まない 断るのは道具の値を作る所で、素材に触る前
+    monkeypatch.setattr(tool, "eval_dir", lambda _: None)
+    assert tool.main(["run", "--scene-threshold", "0"]) == 2
+    assert "scene_threshold は" in capsys.readouterr().err
+
+
 def test_reason_list_matches_the_docs(tool: ModuleType) -> None:
     """docs/evaluation.md の「状態と理由」の表と、台本の一覧が同じであること
 
@@ -718,7 +752,13 @@ def test_results_file_does_not_mark_the_commit_dirty(tool: ModuleType, tmp_path:
     落ちると、結果をコミットせずに 2 回目を回すだけで印が付き、コードを変えた回と
     変えていない回を見分けられなくなる
     """
+    import shutil
     import subprocess
+
+    # git の無い機械（最小の CI の箱など）では確かめようが無い 落とすと、この台本と関係の無い
+    # 機械の事情で verify が止まる 台本の側は git が無ければ unknown と書いて止まらない
+    if shutil.which("git") is None:
+        pytest.skip("git が無い機械では、書き換えの印は確かめられない")
 
     def git(*args: str) -> None:
         subprocess.run(

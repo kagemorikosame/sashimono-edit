@@ -296,6 +296,10 @@ def forbidden_names(folder: EvalDir, manifest: Mapping[str, Path]) -> list[str]:
 # --- 道具の段: 道具が使う処理を直に呼ぶ ---
 
 
+class ParamsError(ValueError):
+    """道具の値が使えない 走らせる前に、何がいけないかを人に分かる文で出す"""
+
+
 @dataclass(frozen=True, slots=True)
 class ToolParams:
     """道具の既定値 変える前と後を比べるために、引数で差し替えられるようにしておく"""
@@ -319,7 +323,44 @@ class ToolParams:
         ):
             value = getattr(self, name)
             if value is not None and not math.isfinite(value):
-                raise ValueError(f"{name} に有限の数でない値（{value}）は使えない")
+                raise ParamsError(f"{name} に有限の数でない値（{value}）は使えない")
+        self._check_scene_ranges()
+        if self.asr_model is not None and not self.asr_model.strip():
+            raise ParamsError("asr_model に空の名前は使えない（省くと既定のモデル）")
+
+    def _check_scene_ranges(self) -> None:
+        """場面の値は、アプリの AI の道具が受け付ける範囲だけを許す
+
+        範囲の外は、アプリでは選べない値なので測っても使い道が無い 感度 0 は手持ちの揺れや
+        圧縮のノイズまで切り替わりに数え、一覧が素材のフレーム数に近づく
+        最短の場面の 0 はアプリでも選べる（寄せずにすべて残す）ので許す
+        """
+        if self.scene_threshold is None and self.min_scene is None:
+            return
+        # 重いので、場面の値を変えたときだけ読む
+        from sashimono.ai.operations import MAX_MIN_SCENE_SECONDS, SCENE_THRESHOLD_RANGE
+
+        low, high = SCENE_THRESHOLD_RANGE
+        if self.scene_threshold is not None and not low <= self.scene_threshold <= high:
+            raise ParamsError(
+                f"scene_threshold は {low} から {high} の間にする"
+                "（アプリの場面検出が受け付ける範囲）"
+            )
+        if self.min_scene is not None and not 0.0 <= self.min_scene <= MAX_MIN_SCENE_SECONDS:
+            raise ParamsError(f"min_scene は 0 から {MAX_MIN_SCENE_SECONDS} 秒の間にする")
+
+    @property
+    def scene_values(self) -> tuple[float, float]:
+        """場面検出に渡す感度と最短の場面 省いた物は既定値
+
+        ``or`` で既定値を選ぶと 0.0 を偽と見て、最短の場面 0 が既定値の 0.5 に置き換わり、
+        結果の行にも渡していない値が書かれる
+        """
+        from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD
+
+        threshold = DEFAULT_THRESHOLD if self.scene_threshold is None else self.scene_threshold
+        min_scene = DEFAULT_MIN_SCENE if self.min_scene is None else self.min_scene
+        return threshold, min_scene
 
     def record(self, task: str) -> dict[str, float | str]:
         """結果の行に残す値 課題に関係する物だけ"""
@@ -330,16 +371,12 @@ class ToolParams:
                 "padding": self.padding,
             }
         if task == SCENES:
-            from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD
-
-            return {
-                "threshold": self.scene_threshold or DEFAULT_THRESHOLD,
-                "min_scene": self.min_scene or DEFAULT_MIN_SCENE,
-            }
+            threshold, min_scene = self.scene_values
+            return {"threshold": threshold, "min_scene": min_scene}
         if task == SUBTITLES:
             from sashimono.asr.backend import DEFAULT_MODEL
 
-            return {"model": self.asr_model or DEFAULT_MODEL}
+            return {"model": DEFAULT_MODEL if self.asr_model is None else self.asr_model}
         return {}
 
 
@@ -390,15 +427,13 @@ def kept_ranges(silences: Sequence[tuple[float, float]], duration: float) -> lis
 
 def find_scenes(path: Path, params: ToolParams) -> list[float]:
     """場面の切り替わり（新しい場面の最初の絵の秒） ``detect_scenes`` と同じ処理"""
-    from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, analyze_scenes
+    from sashimono.engine.scenes import analyze_scenes
 
     # 0 は機械のコアをすべて使う 評価は手元で 1 本ずつ回すので、ほかの仕事と取り合わない
     signal = analyze_scenes(path, threads=0)
     if signal is None:
         return []
-    cuts = signal.cuts(
-        params.scene_threshold or DEFAULT_THRESHOLD, params.min_scene or DEFAULT_MIN_SCENE
-    )
+    cuts = signal.cuts(*params.scene_values)
     return [cut.seconds for cut in cuts]
 
 
@@ -416,7 +451,11 @@ def transcribe_with_app(path: Path, params: ToolParams) -> Transcript | None:
     backend = asr_backend()
     if not backend.is_available():
         return None
-    options = TranscribeOptions(model=params.asr_model) if params.asr_model else TranscribeOptions()
+    options = (
+        TranscribeOptions()
+        if params.asr_model is None
+        else TranscribeOptions(model=params.asr_model)
+    )
     transcript = backend.transcribe(path, options)
     return None if transcript is None else clean_transcript(transcript)
 
@@ -1451,6 +1490,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 行の番号だけを出す 例外の流れ（Traceback）を見せても直す手がかりは増えない
         print(error)
         return 1
+    except ParamsError as error:
+        # 引数の読み違いと同じ扱い（argparse も 2 で返す） 何がいけないかだけを出す
+        print(error, file=sys.stderr)
+        return 2
 
 
 def _dispatch(arguments: argparse.Namespace) -> int:
