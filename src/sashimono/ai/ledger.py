@@ -189,23 +189,58 @@ _LIBRARY = (
     "読むだけと決めた（中身は list_looks で読み、当てる・置くは apply_preset・place_alias）"
 )
 
+#: コピーの行 作品は変えず、人の Ctrl+C と同じタイムラインの置き場へ写すだけ（#349）
+_COPY_NOTE = "人の Ctrl+C と同じ置き場へ写す（人の Ctrl+V でも貼れる） 作品は変えない"
+#: 貼り付けの行 paste_clips は人と同じ置き場から貼り、duplicate_clips は写しと貼りを 1 回で行う
+_PASTE_NOTE = (
+    "置き場から貼るのは paste_clips（人がコピーした物も貼れる） duplicate_clips は"
+    "コピーと貼り付けを 1 回で行う"
+)
+_INSERT_NOTE = "paste_clips の insert 押し出すトラックは本人の設定（挿入貼り付けで押し出す）のまま"
+_EFFECT_TRACK_NOTE = "add_track の effect（FX と番号の名前の映像トラック）"
+#: 場面切り替えの前の場面・後の場面（#349） add_effect の after で選ぶ
+_AFTER_NOTE = "場面切り替えの前の場面か後の場面かは add_effect の after で選ぶ"
+
+#: OS のクリップボードへ写す行（#349） 作品は変えないが絵と文字がアプリの外へ出るので、
+#: 送る物（絵・字幕と文字）を宣言して送る前の同意に乗せる（2026-10-20 利用者の決定）
+_OS_COPY_NOTE = "作品は変えない OS のクリップボードへ写すので、送る前の同意（#342）に乗る"
+
 LEDGER: tuple[Entry, ...] = (
     # --- メニュー ファイル ---
-    missing("メニュー/ファイル/新規", 349, safety=Safety.IRREVERSIBLE),
-    missing("メニュー/ファイル/開く…", 349, safety=Safety.IRREVERSIBLE),
+    # 開く・新規（#349） 2026-10-20 利用者の決定 毎回確かめ、保存していない変更があれば断る
+    same(
+        "メニュー/ファイル/新規",
+        "new_project",
+        note="省いた値は本人の「新しい作品」の設定 作った指示の中ではもう編集しない",
+        safety=Safety.IRREVERSIBLE,
+    ),
+    same(
+        "メニュー/ファイル/開く…",
+        "open_project",
+        note=(
+            "開けるのは作品のフォルダと書き出しの窓で前に選んだフォルダの中の .sme だけ"
+            " 開いた指示の中ではもう編集しない"
+        ),
+        safety=Safety.IRREVERSIBLE,
+    ),
     same("メニュー/ファイル/保存", "save_project", safety=Safety.IRREVERSIBLE),
     same("メニュー/ファイル/名前を付けて保存…", "save_project_as", safety=Safety.IRREVERSIBLE),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
-    partial(
+    same(
         "メニュー/ファイル/プロジェクト設定…",
+        "set_project_settings",
         "set_resolution",
-        issue=349,
         note=(
-            "解像度だけ fps・音の設定・背景などは無い 編集の方針（#343）は本人が AI に渡す"
-            "決まりなので AI は変えず、get_style_guide で読み check_style_guide で照らす"
+            "解像度と半透明の重ね合わせ（fps は窓でも作った後は変えられない） 編集の方針（#343）は"
+            "本人が AI に渡す決まりなので AI は変えず、get_style_guide で読み check_style_guide で"
+            "照らす 組み合わせの保存は本人の持ち物"
         ),
     ),
-    missing("メニュー/ファイル/置き方の方式を切り替える…", 349),
+    same(
+        "メニュー/ファイル/置き方の方式を切り替える…",
+        "switch_layer_mode",
+        note="変換するかは窓で毎回尋ねる所を convert で渡す シーンを開いていれば断る",
+    ),
     # 縦動画への作り替え（#334） 2026-10-20 利用者の決定でメニューに足した AI と同じ所を通す
     same("メニュー/ファイル/縦の作品に作り替える…", "reframe"),
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
@@ -225,33 +260,23 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/編集/再生ヘッドで分割", "split_clip"),
     same("メニュー/編集/削除", "delete_clips", "delete_clip"),
     same("メニュー/編集/削除して詰める", "delete_clips", "delete_clip"),
-    partial(
-        "メニュー/編集/コピー",
-        "duplicate_clips",
-        issue=349,
-        note="写しと貼り付けが 1 つにまとまっている クリップボードは使わない",
-    ),
-    missing("メニュー/編集/切り取り", 349),
-    partial(
+    same("メニュー/編集/コピー", "copy_clips", note=_COPY_NOTE, safety=Safety.READ_ONLY),
+    same("メニュー/編集/切り取り", "cut_clips"),
+    same(
         "メニュー/編集/貼り付け（再生ヘッドの位置）",
+        "paste_clips",
         "duplicate_clips",
-        issue=349,
-        note="コピーと同じ 1 つの道具 アプリのクリップボードからは貼れない",
+        note=_PASTE_NOTE,
     ),
-    missing("メニュー/編集/貼り付け（挿入）", 349),
-    missing(
-        "メニュー/編集/すべて選択",
-        349,
-        "select_clips に全部の ID を渡せば同じになる",
-        Safety.READ_ONLY,
-    ),
-    missing(
+    same("メニュー/編集/貼り付け（挿入）", "paste_clips", note=_INSERT_NOTE),
+    same("メニュー/編集/すべて選択", "select_all", safety=Safety.READ_ONLY),
+    same(
         "メニュー/編集/静止画をコピー",
-        349,
-        "プロジェクトを変えない（絵をクリップボードへ写す）",
-        Safety.READ_ONLY,
+        "copy_snapshot",
+        note=_OS_COPY_NOTE,
+        safety=Safety.READ_ONLY,
     ),
-    missing("メニュー/編集/書き出し範囲を解除", 349),
+    same("メニュー/編集/書き出し範囲を解除", "set_work_area", note="clear を真にする"),
     same("メニュー/編集/グループ化", "group_clips"),
     same("メニュー/編集/グループ解除", "ungroup_clips"),
     same("メニュー/編集/トラックをミュート", "set_track_state"),
@@ -261,14 +286,18 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/オブジェクト/テキストを追加", "add_text"),
     same("メニュー/オブジェクト/図形を追加", "add_shape"),
     same("メニュー/オブジェクト/場面切り替えを追加", "add_transition"),
-    missing("メニュー/オブジェクト/フィルタを追加", 349),
+    same("メニュー/オブジェクト/フィルタを追加", "add_filter"),
     # 一覧の窓（整理だけ 当てる・置く先は持たない show_library）
     hidden("メニュー/オブジェクト/プリセットとエイリアス…", _LIBRARY),
     # --- メニュー シーン ---
     same("メニュー/シーン/新しいシーン…", "add_scene"),
     same("メニュー/シーン/シーンを置く…", "place_scene"),
-    missing("メニュー/シーン/シーンの名前を変更…", 349),
-    missing("メニュー/シーン/シーンを削除", 349),
+    same("メニュー/シーン/シーンの名前を変更…", "rename_scene"),
+    same(
+        "メニュー/シーン/シーンを削除",
+        "remove_scene",
+        note="どこにも置かれていないシーンだけ 取り消し 1 回で戻る",
+    ),
     same("メニュー/シーン/メインに戻る", "set_active_scene", safety=Safety.READ_ONLY),
     # --- メニュー 字幕 ---
     read_only("メニュー/字幕/字幕パネル", _LAYOUT, "layout.docks.subtitles.visible"),
@@ -294,11 +323,11 @@ LEDGER: tuple[Entry, ...] = (
             "〔置く〕は place_template、〔選択中のクリップに適用〕は apply_template 棚は list_looks"
         ),
     ),
-    missing(
+    same(
         "メニュー/互換/スクリプトを読み直す",
-        349,
-        "置き場の AviUtl スクリプトを読み直すだけで、プロジェクトを変えない",
-        Safety.READ_ONLY,
+        "reload_scripts",
+        note="置き場の AviUtl スクリプトを読み直すだけで、プロジェクトを変えない",
+        safety=Safety.READ_ONLY,
     ),
     hidden("メニュー/互換/スクリプトフォルダを開く", _OUTSIDE),
     hidden(
@@ -354,20 +383,20 @@ LEDGER: tuple[Entry, ...] = (
     read_only("メニュー/ヘルプ/バージョン情報…", _HELP, "version"),
     # --- タイムラインの右クリック クリップの上 ---
     same("タイムラインの右クリック/再生ヘッドで分割", "split_clip"),
-    partial(
+    same(
         "タイムラインの右クリック/コピー",
-        "duplicate_clips",
-        issue=349,
-        note="写しと貼り付けが 1 つにまとまっている",
+        "copy_clips",
+        note=_COPY_NOTE,
+        safety=Safety.READ_ONLY,
     ),
-    missing("タイムラインの右クリック/切り取り", 349),
-    partial(
+    same("タイムラインの右クリック/切り取り", "cut_clips"),
+    same(
         "タイムラインの右クリック/貼り付け（再生ヘッドの位置）",
+        "paste_clips",
         "duplicate_clips",
-        issue=349,
-        note="アプリのクリップボードからは貼れない",
+        note=_PASTE_NOTE,
     ),
-    missing("タイムラインの右クリック/挿入して貼り付け", 349),
+    same("タイムラインの右クリック/挿入して貼り付け", "paste_clips", note=_INSERT_NOTE),
     same("タイムラインの右クリック/削除", "delete_clips", "delete_clip"),
     same("タイムラインの右クリック/削除して詰める", "delete_clips", "delete_clip"),
     same("タイムラインの右クリック/グループ化", "group_clips"),
@@ -400,13 +429,17 @@ LEDGER: tuple[Entry, ...] = (
         safety=Safety.READ_ONLY,
     ),
     # --- タイムラインの右クリック 空いた所 ---
-    missing("タイムラインの右クリック/フィルタを置く", 349),
+    same("タイムラインの右クリック/フィルタを置く", "add_filter", note="track_id を渡す"),
     same("タイムラインの右クリック/追加/テキスト", "add_text"),
     same("タイムラインの右クリック/追加/図形", "add_shape"),
     same("タイムラインの右クリック/追加/場面切り替え", "add_transition"),
-    missing("タイムラインの右クリック/追加/フィルタ", 349),
-    missing("タイムラインの右クリック/追加/グループ制御", 349),
-    missing("タイムラインの右クリック/追加/カスタムオブジェクト/*", 349, "AviUtl の .obj を置く"),
+    same("タイムラインの右クリック/追加/フィルタ", "add_filter"),
+    same("タイムラインの右クリック/追加/グループ制御", "add_group_control"),
+    same(
+        "タイムラインの右クリック/追加/カスタムオブジェクト/*",
+        "add_custom_object",
+        note="AviUtl の .obj を置く 一覧は list_custom_objects",
+    ),
     partial(
         "タイムラインの右クリック/追加/エイリアス/管理…（見本で選ぶ・名前や分類を変える・消す）",
         "place_alias",
@@ -430,30 +463,36 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/〔トラック〕 をソロ", "set_track_state"),
     same("タイムラインの右クリック/〔トラック〕 をロック", "set_track_state"),
     same("タイムラインの右クリック/〔トラック〕 の高さを戻す", "set_track_height"),
-    missing("タイムラインの右クリック/〔トラック〕 の名前を変更…", 349),
-    missing("タイムラインの右クリック/範囲を解除", 349, "書き出し範囲（ワークエリア）"),
+    same("タイムラインの右クリック/〔トラック〕 の名前を変更…", "rename_track"),
+    same(
+        "タイムラインの右クリック/範囲を解除",
+        "set_work_area",
+        note="書き出し範囲（ワークエリア） clear を真にする",
+    ),
     # --- タイムラインの右クリック 目盛りの目印（#330） ---
     same("タイムラインの右クリック/ここにマーカーを置く", "add_markers"),
     same("タイムラインの右クリック/マーカーの名前を変更…", "update_marker"),
     same("タイムラインの右クリック/マーカーを削除", "delete_markers"),
     same("タイムラインの右クリック/トラックを追加/映像トラック", "add_track"),
     same("タイムラインの右クリック/トラックを追加/音声トラック", "add_track"),
-    partial(
+    same(
         "タイムラインの右クリック/トラックを追加/エフェクトトラック（フィルタ用）",
         "add_track",
-        issue=349,
-        note="映像トラックは足せるが、フィルタ用（FX と番号の名前）を選ぶ引数が無い",
+        note=_EFFECT_TRACK_NOTE,
     ),
     same("タイムラインの右クリック/レイヤーを追加", "add_track"),
-    missing("タイムラインの右クリック/トラックを削除（〔トラック〕）", 349),
+    same(
+        "タイムラインの右クリック/トラックを削除（〔トラック〕）",
+        "remove_track",
+        note="空のトラックだけ（画面と同じ） 取り消し 1 回で戻る",
+    ),
     # --- タイムラインの〔＋ トラック追加〕 ---
     same("タイムラインの〔＋ トラック追加〕/映像トラック", "add_track"),
     same("タイムラインの〔＋ トラック追加〕/音声トラック", "add_track"),
-    partial(
+    same(
         "タイムラインの〔＋ トラック追加〕/エフェクトトラック（フィルタ用）",
         "add_track",
-        issue=349,
-        note="フィルタ用を選ぶ引数が無い",
+        note=_EFFECT_TRACK_NOTE,
     ),
     same("タイムラインの〔＋ トラック追加〕/レイヤー", "add_track"),
     # --- プレビューの右クリック ---
@@ -463,16 +502,19 @@ LEDGER: tuple[Entry, ...] = (
         note=_SNAPSHOT_NOTE,
         safety=Safety.IRREVERSIBLE,
     ),
-    missing(
+    same(
         "プレビューの右クリック/静止画をコピー",
-        349,
-        "プロジェクトを変えない（絵をクリップボードへ写す）",
-        Safety.READ_ONLY,
+        "copy_snapshot",
+        note=_OS_COPY_NOTE,
+        safety=Safety.READ_ONLY,
     ),
     # --- シーンの帯 ---
     same("シーンの帯/新規｜空のシーンを作って開く", "add_scene"),
-    missing("シーンの帯/名前｜開いているシーンの名前を変える", 349),
-    missing("シーンの帯/削除｜開いているシーンを消す（どこにも置かれていないときだけ）", 349),
+    same("シーンの帯/名前｜開いているシーンの名前を変える", "rename_scene"),
+    same(
+        "シーンの帯/削除｜開いているシーンを消す（どこにも置かれていないときだけ）",
+        "remove_scene",
+    ),
     same(
         "シーンの帯/置く｜ほかのシーンを、再生ヘッドの位置へ 1 本のクリップとして置く",
         "place_scene",
@@ -510,7 +552,11 @@ LEDGER: tuple[Entry, ...] = (
     same("素材一覧の右クリック/タイムラインへ置く", "place_media"),
     same("素材一覧の右クリック/字幕を起こす…", "transcribe"),
     hidden("素材一覧の右クリック/ファイルの場所を開く", _OUTSIDE),
-    missing("素材一覧の右クリック/プールから外す", 349),
+    same(
+        "素材一覧の右クリック/プールから外す",
+        "remove_media",
+        note="使っていない素材だけ ファイルは消さない 取り消し 1 回で戻る",
+    ),
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),
     same("字幕パネル/整形…", "clean_subtitles"),
@@ -529,17 +575,17 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("字幕パネル/書き出し…", "export_subtitles", safety=Safety.IRREVERSIBLE),
     same("字幕パネルの右クリック/ここへ移動", "seek", safety=Safety.READ_ONLY),
-    partial(
+    same(
         "字幕パネルの右クリック/文字をコピー",
+        "copy_subtitle_text",
         "get_subtitles",
-        issue=349,
-        note="本文は読めるが、クリップボードへは写さない",
+        note=f"本文を読むのは get_subtitles {_OS_COPY_NOTE}",
         safety=Safety.READ_ONLY,
     ),
     same("字幕パネルの右クリック/テキストとして置く", "place_subtitles"),
-    missing("字幕パネルの右クリック/再生ヘッドで分割", 349),
-    missing("字幕パネルの右クリック/次と結合", 349),
-    missing("字幕パネルの右クリック/削除", 349),
+    same("字幕パネルの右クリック/再生ヘッドで分割", "split_subtitle"),
+    same("字幕パネルの右クリック/次と結合", "merge_subtitles"),
+    same("字幕パネルの右クリック/削除", "delete_subtitle"),
     same("字幕パネルの右クリック/話者の名前を変える…", "rename_speaker"),
     # --- 設定パネル ---
     same(
@@ -565,43 +611,37 @@ LEDGER: tuple[Entry, ...] = (
         issue=350,
         note=f"当てるのは apply_preset {_LIBRARY}",
     ),
-    missing(
-        "設定パネル/有効｜この組の欄を掛けるかどうか 無効にすると既定の置き方・鳴り方に戻る", 349
+    same(
+        "設定パネル/有効｜この組の欄を掛けるかどうか 無効にすると既定の置き方・鳴り方に戻る",
+        "set_effect_enabled",
+        note="組の欄の ID を effect_ids にまとめて渡す",
     ),
-    missing("設定パネル/有効｜掛ける前と後を見比べる", 349, "エフェクトの有効の切り替え"),
-    missing("設定パネル/▲｜順番を変える 掛ける順で結果が変わる", 349, "エフェクトの並べ替え"),
-    missing("設定パネル/▼｜順番を変える 掛ける順で結果が変わる", 349, "エフェクトの並べ替え"),
-    missing("設定パネル/✕｜このエフェクトを外す", 349),
-    partial(
+    same("設定パネル/有効｜掛ける前と後を見比べる", "set_effect_enabled"),
+    same("設定パネル/▲｜順番を変える 掛ける順で結果が変わる", "move_effect"),
+    same("設定パネル/▼｜順番を変える 掛ける順で結果が変わる", "move_effect"),
+    same("設定パネル/✕｜このエフェクトを外す", "remove_effect"),
+    same(
         "設定パネル/◆｜再生位置のキーを打つ・消す",
         "add_keyframe",
-        issue=349,
-        note="打てるが消せない",
+        "remove_keyframe",
+        note="打つのは add_keyframe、消すのは remove_keyframe",
     ),
-    partial(
+    same(
         "設定パネル/◀｜前のキーへ再生位置を動かす",
-        "seek",
-        issue=349,
-        note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        "seek_keyframe",
         safety=Safety.READ_ONLY,
     ),
-    partial(
+    same(
         "設定パネル/▶｜次のキーへ再生位置を動かす",
-        "seek",
-        issue=349,
-        note="キーの位置が分かれば seek で動ける キーへ飛ぶ道具は無い",
+        "seek_keyframe",
         safety=Safety.READ_ONLY,
     ),
     same("設定パネル/解除", "set_clip_property", note="止めた絵を解く（hold_at を null）"),
-    partial(
+    same(
         "設定パネル/組み方を「標準」にする｜組み方を「標準」に変えて、この欄を使えるようにします"
         "（取り消しで戻せます）",
-        "set_param",
-        issue=349,
-        note=(
-            "AviUtl2 の組み方のテキストの灰色の欄に出る（#301） set_param で layout と anchor を"
-            "変えれば同じ値になるが、2 回の取り消しになり、選んだ何本かをまとめて切り替えられない"
-        ),
+        "use_standard_layout",
+        note="AviUtl2 の組み方のテキストの灰色の欄に出る（#301） 選んだ何本かを 1 回で切り替える",
     ),
     same(
         "設定パネル/＋ 縁取りを追加｜今の縁の外側に縁取りを足します"
@@ -617,11 +657,10 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("設定パネル/✕｜この縁取りを外す 掛けたエフェクトも一緒に外れる", "remove_stroke"),
     *(
-        partial(
+        same(
             f"設定パネル/{arrow}｜{place}へ揃える（見えている範囲の端を画面の端へ付ける）",
-            "set_param",
-            issue=349,
-            note="位置は set_param で変えられるが、見えている範囲の端へ揃える計算は無い",
+            "align_clip",
+            note="枠は画面と同じくプレビューの今のコマから取る",
         )
         for arrow, place in (
             ("↖", "左上"),
@@ -636,18 +675,8 @@ LEDGER: tuple[Entry, ...] = (
         )
     ),
     same("設定パネルの〔エフェクトを追加…〕/*/*", "add_effect"),
-    partial(
-        "設定パネルの〔エフェクトを追加…〕/前の場面へ/*/*",
-        "add_effect",
-        issue=349,
-        note="場面切り替えの前と後のどちらの場面へ積むかを選べない",
-    ),
-    partial(
-        "設定パネルの〔エフェクトを追加…〕/後の場面へ/*/*",
-        "add_effect",
-        issue=349,
-        note="場面切り替えの前と後のどちらの場面へ積むかを選べない",
-    ),
+    same("設定パネルの〔エフェクトを追加…〕/前の場面へ/*/*", "add_effect", note=_AFTER_NOTE),
+    same("設定パネルの〔エフェクトを追加…〕/後の場面へ/*/*", "add_effect", note=_AFTER_NOTE),
     hidden("設定パネルの〔プリセット…〕/この見た目を保存…", _LIBRARY),
     partial(
         "設定パネルの〔プリセット…〕/管理…（見本で選ぶ・名前や分類を変える・消す）",
@@ -661,7 +690,7 @@ LEDGER: tuple[Entry, ...] = (
         note="保存したプリセットを当てる（分類ごとの一覧） 当て方は本人の設定のまま",
     ),
     same("設定パネルの縁取りの〔効果〕/*/*", "add_effect", note="stroke_id を渡す"),
-    missing("設定パネルの ◆ の右クリック/アニメーションを解除", 349, "キーフレームを消す"),
+    same("設定パネルの ◆ の右クリック/アニメーションを解除", "clear_keyframes"),
     partial(
         "設定パネルの ◆ の右クリック/グラフエディタで開く",
         "get_clip",
@@ -716,6 +745,8 @@ AI_ONLY: dict[str, str] = {
     # 保存した見た目と棚の一覧（#328） 人は〔プリセット…〕と〔追加〕→〔エイリアス〕のメニューで
     # 名前を見て選ぶ 一覧を読むだけで、当てる・置くのは台帳の行の道具
     "list_looks": READING,
+    # カスタムオブジェクトの一覧（#349） 人は〔追加〕→〔カスタムオブジェクト〕の名前を見て選ぶ
+    "list_custom_objects": READING,
     "get_chapters": READING,
     # 編集の方針（#343） 人はプロジェクト設定の窓で読み書きする 窓の欄は台帳で数えない
     # （台帳はメニュー・右クリック・パネルのボタンだけ） 方針を変える道具は置かない
@@ -724,6 +755,8 @@ AI_ONLY: dict[str, str] = {
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,
+    # トラックの並べ替え（#349） 画面では見出しをつかんでドラッグする
+    "move_track": _GESTURE,
     "trim_clip": _GESTURE,
     "move_clip": _GESTURE,
     "move_clips": _GESTURE,

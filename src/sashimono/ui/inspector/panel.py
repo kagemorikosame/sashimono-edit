@@ -121,6 +121,7 @@ from sashimono.effects.strokes import (
     stroke_effect_definitions,
     takes_stroke_effect,
 )
+from sashimono.effects.unlock import unlock_commands
 from sashimono.engine.gpu import BlendMode
 from sashimono.ui import library_dialog, library_save
 from sashimono.ui.flow_layout import ElidedLabel
@@ -1218,20 +1219,8 @@ class InspectorPanel(QWidget):
             located = self._project.timeline.locate_clip(clip_id)
             if clip_id != primary.id and located is not None:
                 targets.append(located[1])
-        commands: list[Command] = []
-        switched = 0
-        for clip in targets:
-            source = clip.source
-            if source is None or source.kind != definition.kind:
-                continue
-            # 灰色になっていないクリップ（縦書きなど）は触らない 押したのは灰色を解くためで、
-            # 効いている設定まで書き換えると、選んでいただけのクリップの見た目が変わる
-            reasons = definition.locked_reasons(source.params).values()
-            if not any(definition.unlock_for(reason) == unlock for reason in reasons):
-                continue
-            switched += 1
-            for name, value in unlock.switch(source.params).items():
-                commands.append(SetParam(ParamPath.of_source(clip.id, name), value))
+        # どれを切り替えるか・入れる値は AI の道具（#349）と同じ所で決める
+        commands, switched = unlock_commands(targets, definition, unlock)
         if not commands:
             return
         label = unlock.button if switched == 1 else f"{unlock.button}（{switched} 本）"

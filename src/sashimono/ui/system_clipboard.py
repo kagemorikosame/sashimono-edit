@@ -41,6 +41,11 @@ def clipboard() -> Clipboard:
     return QGuiApplication.clipboard()
 
 
+def copy_text(text: str) -> None:
+    """文字を置く 字幕パネルの〔文字をコピー〕と AI の copy_subtitle_text（#349）が通る所"""
+    clipboard().setText(text)
+
+
 def replace(replacement: Clipboard | None) -> None:
     """クリップボードを差し替える ``None`` で OS のものへ戻す 試験のための口"""
     global _replacement
