@@ -12,21 +12,36 @@ import threading
 import time
 from collections.abc import Iterator
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddClip, Author
-from sashimono.core.model import MediaItem, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.emphasis import fixed_transform
+from sashimono.core.model import (
+    AnimatedValue,
+    MediaId,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+)
 from sashimono.core.reframe import REFRAME_FOLLOWS, REFRAME_SIZES, STEADY, ReframeStyle
 from sashimono.core.timebase import FrameRate
-from sashimono.engine.cache import SceneState
+from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.scenes import SceneSignal
+from sashimono.engine.subject import SUBJECT_BINS, SUBJECT_SECONDS, SubjectTrack
+from sashimono.engine.vision import Box, Face, ScreenKind, ScreenReport, ScreenSample
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.reframe_dialog import ReframeDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending
 from tests.conftest import make_clip
@@ -144,6 +159,36 @@ class TestPreference:
             encoding="utf-8",
         )
         assert PreferenceStore().load().reframe_style == ReframeStyle()
+
+    def test_the_faces_are_on_unless_turned_off(self, qt_application: QApplication) -> None:
+        # 既定で切ると、部品を入れた人も知らないうちに肌色の絵へ枠が寄ったままになる
+        # 設定画面で切れないと、手元を映したい人が毎回顔に枠を取られる
+        del qt_application
+        assert Preferences().reframe_style.faces is True
+        dialog = PreferencesDialog(Preferences())
+        try:
+            assert dialog._reframe_faces.isChecked()
+            dialog._reframe_faces.setChecked(False)
+            assert dialog.preferences().reframe_style.faces is False
+        finally:
+            dialog.deleteLater()
+        path = PreferenceStore().path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"reframe_faces": "no"}', encoding="utf-8")
+        assert PreferenceStore().load().reframe_faces is True
+        PreferenceStore().save(Preferences(reframe_faces=False))
+        assert PreferenceStore().load().reframe_style.faces is False
+
+    def test_the_menu_window_offers_the_faces(self, qt_application: QApplication) -> None:
+        # 窓で切れないと、1 回だけ顔を使わずに作りたい人が設定を書き換えて戻すことになる
+        del qt_application
+        dialog = ReframeDialog(ReframeStyle(faces=False))
+        try:
+            assert not dialog.faces_box.isChecked()
+            dialog.faces_box.setChecked(True)
+            assert dialog.choice().faces is True
+        finally:
+            dialog.deleteLater()
 
     def test_the_dialog_offers_and_returns_the_values(self, qt_application: QApplication) -> None:
         # 壊れると、設定画面で縦動画への作り替えの既定を変えても保存されない
@@ -282,6 +327,129 @@ class TestMenu:
         )
         assert window.reframe_project()
         assert "解析ができなかった素材 1 本" in window.statusBar().currentMessage()
+
+    def test_the_faces_are_asked_for_and_used(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、部品を入れて顔を調べ終えた人の作り替えでも、人の窓だけ顔を使わずに作る
+        # （AI の道具と違う縦の作品になる）か、使ったかどうかが分からない
+        window = MainWindow(_work(video_media), confirm_unsaved=False)
+        opened.append(window)
+        media = window.document.project.media[0]
+        times = np.arange(SUBJECT_SECONDS / 2, 10.0, SUBJECT_SECONDS)
+        columns = np.zeros((times.shape[0], SUBJECT_BINS), np.float32)
+        columns[:, 28] = 1.0
+        rows = np.zeros_like(columns)
+        rows[:, SUBJECT_BINS // 2] = 1.0
+        subject = SubjectTrack(times, columns, rows, np.full(times.shape, 0.02, np.float32))
+        frames = np.arange(1, 301, dtype=np.float64) / 30
+        flat = np.full(frames.shape, 0.01, np.float32)
+        signal = SceneSignal(
+            frames, flat, flat, analyzed=10.0, complete=True, stream=0, subject=subject
+        )
+        face = Face(Box(-0.3 * 1920, 0.0, 120.0, 120.0), 0.9)
+        report = ScreenReport(
+            ScreenKind.FACES,
+            "偽の顔",
+            1920,
+            1080,
+            tuple(ScreenSample(moment, faces=(face,)) for moment in (2.0, 5.0, 8.0)),
+            3,
+            True,
+            stream=0,
+        )
+        asked: list[tuple[MediaId, ScreenKind]] = []
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="steady")
+        )
+        monkeypatch.setattr(
+            main_window_module,
+            "VISION_PACK",
+            SimpleNamespace(status=lambda: SimpleNamespace(ready=True)),
+        )
+        monkeypatch.setattr(
+            window._analyzer, "scene_state", lambda _media: SceneState(signal, running=False)
+        )
+        monkeypatch.setattr(
+            window._screen, "request", lambda item, kind: asked.append((item.id, kind))
+        )
+        monkeypatch.setattr(
+            window._screen, "state", lambda _item, _kind: ScreenState(report, running=False)
+        )
+        assert window.reframe_project()
+        assert asked == [(media.id, ScreenKind.FACES)]
+        assert "顔の位置も手がかり" in window.statusBar().currentMessage()
+        transform = fixed_transform(window.document.project.timeline.tracks[0].clips[0])
+        assert transform is not None
+        position = transform.params["pos_x"]
+        assert isinstance(position, AnimatedValue)
+        # 顔は左（横の 0.2） 枠を左へ寄せると、絵は右へ動く
+        assert position.at(0) > 300
+
+    def test_without_the_parts_the_person_is_told(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 黙ると、部品を入れていない人は顔を見て枠を決めたと思い込む
+        window = MainWindow(_work(video_media), confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="auto")
+        )
+        monkeypatch.setattr(
+            main_window_module,
+            "VISION_PACK",
+            SimpleNamespace(status=lambda: SimpleNamespace(ready=False)),
+        )
+        monkeypatch.setattr(
+            window._analyzer,
+            "scene_state",
+            lambda _media: SceneState(None, running=False, failure="読めない"),
+        )
+        monkeypatch.setattr(
+            window._screen,
+            "request",
+            lambda *_args: pytest.fail("部品が無いのに顔を頼んだ"),
+        )
+        assert window.reframe_project()
+        assert "部品が入っていない" in window.statusBar().currentMessage()
+
+    def test_the_window_tells_the_reason_apart(
+        self,
+        opened: list[MainWindow],
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 真ん中を切り出したのに「動きと肌色だけで見積もった」と出すと、人は被写体を追ったと
+        # 思い込む 追う動画の無い作品で黙ると、追えないことに気付かない（PR #408 の CodeRabbit）
+        monkeypatch.setattr(
+            main_window_module,
+            "VISION_PACK",
+            SimpleNamespace(status=lambda: SimpleNamespace(ready=True)),
+        )
+        window = MainWindow(_work(video_media), confirm_unsaved=False)
+        opened.append(window)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="center")
+        )
+        window.statusBar().clearMessage()
+        assert window.reframe_project()
+        assert "動きと肌色" not in window.statusBar().currentMessage()
+        empty = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(video_media,))
+        bare = MainWindow(empty, confirm_unsaved=False)
+        opened.append(bare)
+        monkeypatch.setattr(
+            main_window_module, "ask_reframe", lambda *_args: ReframeStyle(follow="auto")
+        )
+        assert bare.reframe_project()
+        message = bare.statusBar().currentMessage()
+        assert "背景の動画が無い" in message
+        assert "動きと肌色だけで見積もりました" not in message
 
     def test_a_locked_track_says_why(
         self,

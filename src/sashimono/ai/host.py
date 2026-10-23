@@ -485,6 +485,15 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def vision_ready(self) -> bool:
+        """画面の解析の部品（#324 onnxruntime と顔の検出のモデル）が入っているか
+
+        縦への作り替え（#407）は、入っているときだけ顔の位置を頼む 入っていない機械で頼むと、
+        素材ごとに「部品が無い」失敗を積むだけになる
+        """
+        ...
+
+    @property
     def image_edge(self) -> int:
         """AI に見せる絵 1 枚の長い辺の上限（画素 #344）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_image_edge`）

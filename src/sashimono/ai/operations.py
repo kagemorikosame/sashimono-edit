@@ -380,8 +380,12 @@ from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
 from sashimono.engine.reframe import (
+    FaceSummary,
+    GatheredFaces,
     ReframePlan,
     ReframeRequest,
+    face_summary,
+    gather_faces,
     gather_signals,
     plan_reframe,
     tracked_media,
@@ -4982,6 +4986,7 @@ def _reframe(host: EditorHost, arguments: dict[str, Any]) -> object:
             "戻してから呼んでください"
         )
     request = _reframe_request(host, arguments)
+    faces = _flag_argument(arguments, "faces", host.reframe_style.faces)
     wait = _number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT)
     project = _project(host)
     if (request.width, request.height) == project.settings.resolution:
@@ -4990,23 +4995,37 @@ def _reframe(host: EditorHost, arguments: dict[str, Any]) -> object:
     for item in media:
         # 取り込み時の解析を切った人のところでも、被写体の並びが無ければここで頼む
         host.request_scenes(item)
-    pending = [item.id for item in media if _still_analyzing(host.scene_state(item))]
-    if not pending or wait <= 0:
-        return _reframe_now(host, request)
-    waiters = [host.scene_waiter(media_id) for media_id in pending]
+    looking = faces and bool(media) and host.vision_ready
+    if looking:
+        # 顔の位置（#407）も頼む 画面の解析は場面の解析を待ってから場面ごとに数枚を調べる
+        # 部品が無い機械では頼まない 頼むと素材ごとに「部品が無い」失敗を積むだけになる
+        for item in media:
+            host.request_screen(item, ScreenKind.FACES)
+    waiters = [
+        host.scene_waiter(item.id) for item in media if _still_analyzing(host.scene_state(item))
+    ]
+    if looking:
+        # 顔は待てるだけ待つ 待ちきれなければ、その素材は動きと肌色だけで作る（断らない）
+        waiters += [
+            host.screen_waiter(item.id, ScreenKind.FACES)
+            for item in media
+            if host.screen_state(item, ScreenKind.FACES).running
+        ]
+    if not waiters or wait <= 0:
+        return _reframe_now(host, request, faces=faces)
 
     def ready(seconds: float) -> bool:
         # ブリッジは中断を見ながら短い間ずつ呼ぶ 1 本ずつ待てば、待つ長さは呼ばれた秒を越えない
         return all(waiter(seconds) for waiter in waiters)
 
-    return Pending(wait=ready, seconds=wait, then=lambda: _reframe_now(host, request))
+    return Pending(wait=ready, seconds=wait, then=lambda: _reframe_now(host, request, faces=faces))
 
 
 def _still_analyzing(state: SceneState) -> bool:
     return not state.complete and state.running
 
 
-def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
+def _reframe_now(host: EditorHost, request: ReframeRequest, *, faces: bool = True) -> object:
     """解析を待った後に呼ぶ 待つ間に作品が変わっていても、今の作品で組み直す"""
     if host.active_scene is not None:
         # 待つ間（最長 2 分）に人がシーンを開くと、読む作品のメインがシーンのタイムラインに
@@ -5033,13 +5052,28 @@ def _reframe_now(host: EditorHost, request: ReframeRequest) -> object:
                 " follow を center にすると待たずに真ん中を切り出します"
             ),
         }
+    wanted = faces and bool(media)
+    parts = wanted and host.vision_ready
+    found: GatheredFaces | None = None
+    if parts:
+        found = gather_faces(media, lambda item: host.screen_state(item, ScreenKind.FACES))
     try:
-        plan = plan_reframe(project, request, gathered.signals)
+        plan = plan_reframe(
+            project, request, gathered.signals, None if found is None else found.reports
+        )
     except ReframeError as exc:
         raise ToolError(str(exc)) from exc
     before = project.settings.resolution
     host.apply_commands(plan.commands, f"縦の作品に作り替え: {request.width}x{request.height}")
-    return _reframe_result(plan, request, before, untracked)
+    summary = face_summary(
+        plan,
+        follow=request.follow,
+        wanted=faces,
+        videos=len(media),
+        parts_ready=parts,
+        gathered=found,
+    )
+    return _reframe_result(plan, request, before, untracked, summary)
 
 
 def _reframe_result(
@@ -5047,6 +5081,7 @@ def _reframe_result(
     request: ReframeRequest,
     before: tuple[int, int],
     untracked: list[str],
+    faces: FaceSummary,
 ) -> dict[str, Any]:
     window = plan.window
     crop = window.size
@@ -5061,6 +5096,8 @@ def _reframe_result(
             "focus_y": round(note.focus[1], 1),
             "keyframes": note.points,
             "no_clue": note.no_clue,
+            # 顔の位置（#407）も手がかりにしたか 偽の場面は動きと肌色だけで見積もった
+            "faces": note.faces,
             "clip_id": note.clip_id,
         }
         for note in plan.shots[:_SHOTS_SHOWN]
@@ -5072,10 +5109,12 @@ def _reframe_result(
         "文字は縦の画面の幅で折り返しました 取り消し 1 回で横の作品に戻ります",
         "今の作品を書き換えています 横の作品も残したいなら、人に save_project_as で別の名前に"
         "保存するよう伝えてください",
-        "被写体は動きと肌色だけから見積もります（顔は見分けません 肌色に近い壁や床・"
-        "動く背景にも寄ります） preview_range か contact_sheet で枠に人が入っているかを"
+        "被写体は動きと肌色から見積もり、画面の解析の部品が入っていれば顔の位置も使います"
+        "（顔の無い場面は肌色に近い壁や床・動く背景にも寄り、獣のアバターなど顔として拾わない"
+        "絵もあります） preview_range か contact_sheet で枠に人が入っているかを"
         "確かめ、外れた場面は背景のクリップの位置（pos_x）の点を set_param・add_keyframe で"
         "直してください 字幕のはみ出しは check_output で調べられます",
+        faces.note,
     ]
     if any(note.no_clue for note in plan.shots):
         notes.append("no_clue の場面は動きも肌色も見つからず、絵の真ん中を切り出しました")
@@ -5111,6 +5150,10 @@ def _reframe_result(
         "held_clips": plan.held,
         "skipped": [{"clip_id": clip_id, "reason": reason} for clip_id, reason in plan.skipped],
         "untracked_media": untracked,
+        # 顔の位置を使ったか（used・none・waiting・no_parts・off・center・no_video）と、
+        # 使った場面の数
+        "faces": faces.status,
+        "face_shots": faces.shots,
         "note": " ".join(notes),
     }
     if len(plan.shots) > _SHOTS_SHOWN:
@@ -9789,11 +9832,16 @@ OPERATIONS: tuple[Operation, ...] = (
             "置き直し、文字は縦の画面の幅で折り返し、はみ出す位置なら内側へ寄せる"
             " メインとすべてのシーンをまとめて変え、取り消し 1 回で戻る 今の作品を書き換えるので、"
             "横の作品を残すなら save_project_as で別の名前に保存するよう人に伝える"
-            " 被写体は場面の解析（detect_scenes と同じ読み込み）のついでに、動きと肌色だけから"
-            "見積もる（顔や人は見分けない 肌色に近い壁や床・動く背景・焼き込まれた字幕の出入りにも"
-            "寄る 位置の細かさは素材の幅の 1/32 ほど） 解析が終わっていなければ wait_seconds まで"
-            "待ち、それでも終わらなければ何も変えずに戻る 終わったら preview_range か"
-            " contact_sheet で枠を確かめ、外れた場面は背景のクリップの pos_x の点を直す"
+            " 被写体は場面の解析（detect_scenes と同じ読み込み）のついでに、動きと肌色から"
+            "見積もり、画面の解析の部品が入っていれば detect_faces と同じ顔の位置も使う（顔の"
+            "無い場面は肌色に近い壁や床・動く背景・焼き込まれた字幕の出入りにも寄る 獣の"
+            "アバターなど顔として拾わない絵もある 位置の細かさは素材の幅の 1/32 ほど）"
+            " 返事の faces が used なら顔を使った（shots の faces は場面ごと） off は顔を使わないと"
+            "選んだ center と no_video は被写体を見積もっていない"
+            " 解析が終わっていなければ wait_seconds まで待ち、場面の解析が終わらなければ"
+            "何も変えずに戻る 顔の位置だけが終わらなければ、その素材は動きと肌色だけで作る"
+            " 終わったら preview_range か contact_sheet で枠を確かめ、外れた場面は"
+            "背景のクリップの pos_x の点を直す"
             " 大きさ・枠の動かし方・ならす長さを省くと本人の設定（表示 → 設定… の"
             "縦動画への作り替え）を使う 開いているシーンがあれば断る（メインに戻してから）"
             " ロックしたトラックに動かす物があれば断る"
@@ -9821,6 +9869,11 @@ OPERATIONS: tuple[Operation, ...] = (
                 "wait_seconds": _number(
                     f"解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
                     f"既定 {DEFAULT_SCENE_WAIT:g}） 待ちきれなければ何も変えずに戻る"
+                ),
+                "faces": _boolean(
+                    "顔の位置も被写体の手がかりにするか（画面の解析の部品が入っているときだけ効く"
+                    " 省くと本人の設定 既定は使う） 顔でない物（手元・品物）を映したい場面で"
+                    "顔に枠が取られるときに false にする"
                 ),
             }
         ),
