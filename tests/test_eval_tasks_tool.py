@@ -462,6 +462,62 @@ def test_zero_scene_values_are_kept_or_refused(
     assert "scene_threshold は" in capsys.readouterr().err
 
 
+def test_model_names_are_checked_before_running(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path
+) -> None:
+    """モデルは Hugging Face の名前なら書け、置き場なら場所を伏せ、書けない値なら先に断ること
+
+    書く段で初めて止まると、字幕起こしを何分も走らせた後でその回が 1 行も残らない
+    置き場をそのまま書くと、本人のフォルダ名が公開の結果に載る
+    """
+    tool, eval_dir, book = folder
+    tool.command_draft(eval_dir, book, ["E02"], transcriber=_fake_transcriber)
+    results = tmp_path / "out.jsonl"
+    heard: list[Path] = []
+
+    def transcriber(path: Path, params: object) -> Transcript:
+        heard.append(path)
+        return _fake_transcriber(path, params)
+
+    def run(model: str) -> dict[str, Any]:
+        records = tool.command_run(
+            eval_dir,
+            book,
+            ["E02"],
+            results=results,
+            params=tool.ToolParams(asr_model=model),
+            transcriber=transcriber,
+            exporter=lambda *_: {"problems": 0, "loudness": None, "complete": True},
+            commit="abc",
+        )
+        return next(r for r in records if r["task"] == "subtitles")
+
+    hugging = run("Systran/faster-whisper-large-v3")
+    assert (hugging["status"], hugging["params"]["model"]) == (
+        "ok",
+        "Systran/faster-whisper-large-v3",
+    )
+    place = tmp_path / "モデル置き場" / "mywhisper"
+    place.mkdir(parents=True)
+    local = run(str(place))
+    assert local["params"]["model"] == tool.LOCAL_MODEL
+    text = results.read_text(encoding="utf-8")
+    assert "mywhisper" not in text and "\\u" not in text
+
+    # 書けない値（日本語・素材の名前の混じり）は、字幕起こしを呼ぶ前に断る 値は文に出さない
+    heard.clear()
+    for bad in ("日本語のモデル", "secretclip-large"):
+        with pytest.raises(tool.ParamsError) as caught:
+            run(bad)
+        assert bad not in str(caught.value)
+    assert heard == []
+    # 台本が決めたモデルの名前は、Local や large という名のフォルダに素材を置いても止めない
+    from sashimono.asr.backend import DEFAULT_MODEL
+
+    for own in (DEFAULT_MODEL, tool.LOCAL_MODEL):
+        tool.guard_record({"params": {"model": own}}, ["Local", DEFAULT_MODEL[:3]])
+
+
 def test_reason_list_matches_the_docs(tool: ModuleType) -> None:
     """docs/evaluation.md の「状態と理由」の表と、台本の一覧が同じであること
 
@@ -700,8 +756,8 @@ def test_results_are_written_when_folders_share_names_with_the_tool(
     )
     assert {r["task"]: r["status"] for r in records}["silence"] == "ok"
     assert len(tool.read_results(results)) == len(records) == 4
-    # 引数から来る値に置き場の名前が混じれば、今までどおり止める
-    with pytest.raises(tool.LeakError):
+    # 引数から来る値に置き場の名前が混じれば、今までどおり止める（走らせる前に断る）
+    with pytest.raises(tool.ParamsError):
         tool.command_run(
             eval_dir,
             book,

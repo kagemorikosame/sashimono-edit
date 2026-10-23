@@ -117,6 +117,11 @@ TALK_PAUSE_SECONDS = 1.5
 #: 結果の行に書いてよい文字 日本語と区切り記号（/ \）を通さないので、素材の名前・置き場・
 #: 字幕の文は形の上で入らない 版（0.2.3）・コミット・日時・番号（E04）はこれで書ける
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9._:+-]{0,64}$")
+#: 字幕起こしのモデルの名前のうち、Hugging Face の形（組織/名前 例 Systran/faster-whisper-large-v3）
+#: 結果の ``params.model`` にだけ許す 手元の置き場は :data:`LOCAL_MODEL` に置き換えて書く
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._-]{1,96}$")
+#: 手元のモデルの置き場を渡した回に、結果へ書く印 場所は書かない（本人の置き場が公開される）
+LOCAL_MODEL = "local-model"
 #: 結果の行の一番上の鍵 増やすときはここにも足す 知らない鍵は書かずに止まる
 _RECORD_KEYS = frozenset(
     {
@@ -296,6 +301,20 @@ def forbidden_names(folder: EvalDir, manifest: Mapping[str, Path]) -> list[str]:
 # --- 道具の段: 道具が使う処理を直に呼ぶ ---
 
 
+def _is_local_model(value: str) -> bool:
+    """字幕起こしのモデルの指定が、手元の置き場か
+
+    名前（large-v3）と Hugging Face の名前（組織/名前）は名前として扱う ただし手元に同じ名前の
+    フォルダがあれば、字幕起こしもそちらを読むので置き場として扱う
+    """
+    path = Path(value)
+    if "\\" in value or path.is_absolute() or path.drive or value.startswith((".", "~")):
+        return True
+    if path.exists():
+        return True
+    return "/" in value and not _MODEL_NAME.match(value)
+
+
 class ParamsError(ValueError):
     """道具の値が使えない 走らせる前に、何がいけないかを人に分かる文で出す"""
 
@@ -376,7 +395,10 @@ class ToolParams:
         if task == SUBTITLES:
             from sashimono.asr.backend import DEFAULT_MODEL
 
-            return {"model": DEFAULT_MODEL if self.asr_model is None else self.asr_model}
+            if self.asr_model is None:
+                return {"model": DEFAULT_MODEL}
+            # 手元の置き場は場所を伏せて印だけ書く 書くと本人のフォルダ名が公開の結果に載る
+            return {"model": LOCAL_MODEL if _is_local_model(self.asr_model) else self.asr_model}
         return {}
 
 
@@ -778,6 +800,13 @@ def finite_float(text: str) -> float:
     return value
 
 
+def _check_names(value: str, where: str, names: Sequence[str]) -> None:
+    lowered = value.lower()
+    for name in names:
+        if name.lower() in lowered:
+            raise LeakError(f"{where} に素材の名前か置き場が混じっている")
+
+
 def _check_value(value: object, where: str, names: Sequence[str]) -> None:
     if isinstance(value, float) and not math.isfinite(value):
         # 書くと標準の JSON に無い裸の NaN や Infinity になり、厳格な読み手が結果の行を読めない
@@ -787,12 +816,31 @@ def _check_value(value: object, where: str, names: Sequence[str]) -> None:
     if isinstance(value, str):
         if not _SAFE_TEXT.match(value):
             raise LeakError(f"{where} に書けない文字がある（英数字と . _ : + - だけ）")
-        lowered = value.lower()
-        for name in names:
-            if name.lower() in lowered:
-                raise LeakError(f"{where} に素材の名前か置き場が混じっている")
+        _check_names(value, where, names)
         return
     raise LeakError(f"{where} の値の形が書けない物（{type(value).__name__}）")
+
+
+def _own_models() -> tuple[str, str]:
+    from sashimono.asr.backend import DEFAULT_MODEL
+
+    return DEFAULT_MODEL, LOCAL_MODEL
+
+
+def check_params(params: ToolParams, names: Sequence[str]) -> None:
+    """結果の行に残す道具の値を、道具を走らせる前に確かめる だめなら :class:`ParamsError`
+
+    書く段で初めて止まると、字幕起こしや書き出しを数分走らせた後でその回が 1 行も残らない
+    確かめは書く段と同じ物を通す（別に書くと、片方だけ通る値ができる）
+    値そのものは文に出さない 置き場が混じっているかもしれない
+    """
+    for task in TASKS:
+        try:
+            guard_record({"params": params.record(task)}, names)
+        except LeakError as error:
+            raise ParamsError(
+                f"{error}（結果の行に書けない値なので、走らせる前に断った）"
+            ) from None
 
 
 def guard_record(record: Mapping[str, object], names: Sequence[str]) -> None:
@@ -823,6 +871,20 @@ def guard_record(record: Mapping[str, object], names: Sequence[str]) -> None:
         if isinstance(value, Mapping):
             for inner, item in value.items():
                 _check_value(str(inner), f"{key} の鍵", ())
+                if key == "params" and inner == "model" and item in _own_models():
+                    # 台本が決めたモデルの名前（既定のモデルと手元のモデルの印）は素材から来ない
+                    # 照らすと、Local や large という名のフォルダの下に素材を置いただけで止まる
+                    _check_value(item, f"{key}.{inner}", ())
+                    continue
+                if (
+                    key == "params"
+                    and inner == "model"
+                    and isinstance(item, str)
+                    and _MODEL_NAME.match(item)
+                ):
+                    # Hugging Face のモデルの名前（組織/名前）は / を持つが、場所ではないので許す
+                    _check_names(item, f"{key}.{inner}", names)
+                    continue
                 _check_value(item, f"{key}.{inner}", names)
         else:
             _check_value(value, key, own)
@@ -1339,6 +1401,7 @@ def command_run(
         _parse_results(_raw_text(results))
     manifest = folder.manifest()
     names = forbidden_names(folder, manifest)
+    check_params(resolved, names)
     stamp = {
         "date": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "version": __version__,
