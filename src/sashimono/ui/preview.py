@@ -631,15 +631,29 @@ class PreviewWidget(QOpenGLWidget):
         """
         if self._selection is None:
             return False
-        located = self._project.timeline.locate_clip(self._selection)
-        if located is None or located[0].locked:
+        commands = self.alignment_commands(self._selection, anchor)
+        if commands is None:
             return False
-        track, clip = located
-        if not self._project.draws_picture(track, clip):
-            return False
+        if commands:
+            label = next(a[1] for a in ALIGNMENTS if a[0] == anchor)
+            self.commands_requested.emit(commands, f"配置を{label}へ")
+        return True
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """``clip_id`` を ``anchor`` へ寄せる命令 寄せられなければ ``None``（実行はしない）
+
+        画面のボタン（:meth:`align_selected`）と AI の道具（#349）が同じ計算を通る 枠は今の
+        コマで描いた物から取るので、AI も人と同じく再生位置に映っている物だけを揃えられる
+        """
+        # 画面の外枠と同じ条件で断る 無効・ミュート・ほかのソロで映っていない物を AI だけが
+        # 動かせると、見えない絵を動かして揃えたと答え、人と AI で揃えられる相手が食い違う
+        shown = self._shown_clip(clip_id)
+        if shown is None or shown[0].locked:
+            return None
+        clip = shown[1]
         outline = self.outline_of(clip)
         if outline is None:
-            return False
+            return None
         changes = aligned_values(
             start_values(clip, self._frame - clip.timeline_start),
             bounding_box(outline.corners),
@@ -647,13 +661,9 @@ class PreviewWidget(QOpenGLWidget):
             anchor,
             scale=self.canvas_scale(),
         )
-        commands = transform_commands(
+        return transform_commands(
             self._project, clip.id, changes, self._frame, keyframes=self._keyframe_drag
         )
-        if commands:
-            label = next(a[1] for a in ALIGNMENTS if a[0] == anchor)
-            self.commands_requested.emit(commands, f"配置を{label}へ")
-        return True
 
     def _snap_targets(self, moving: ClipId) -> tuple[list[float], list[float]]:
         """掴んだ物のほかに今のコマで描いている物の枠と、画面の端と中央"""
@@ -776,15 +786,11 @@ class PreviewWidget(QOpenGLWidget):
         """
         if self._selection is None or not self._handles_enabled or self._playing:
             return None
-        located = self._project.timeline.locate_clip(self._selection)
-        if located is None:
+        shown = self._shown_clip(self._selection)
+        if shown is None:
             return None
-        track, clip = located
-        if not clip.enabled or not clip.timeline_start <= self._frame < clip.timeline_end:
-            return None
-        if not self._project.draws_picture(track, clip):
-            return None
-        if all(t.id != track.id for t in self._project.timeline.active_picture_tracks()):
+        track, clip = shown
+        if not clip.timeline_start <= self._frame < clip.timeline_end:
             return None
         effects = region_effects(clip)
         if not effects:
@@ -804,7 +810,20 @@ class PreviewWidget(QOpenGLWidget):
         """外枠を出す相手 いまのコマに絵を描いていなければ ``None``"""
         if self._selection is None or not self._handles_enabled or self._playing:
             return None
-        located = self._project.timeline.locate_clip(self._selection)
+        shown = self._shown_clip(self._selection)
+        if shown is None:
+            return None
+        track, clip = shown
+        outline = self.outline_of(clip)
+        return None if outline is None else (track, clip, outline)
+
+    def _shown_clip(self, clip_id: ClipId) -> tuple[Track, Clip] | None:
+        """画面に絵として映り得るクリップと、そのトラック 映らなければ ``None``
+
+        外枠・範囲の枠・配置のテンプレート（人のボタンと AI の道具）がここを通る 条件を
+        1 か所にまとめておかないと、どれかだけが映っていない物を掴んだり動かしたりする
+        """
+        located = self._project.timeline.locate_clip(clip_id)
         if located is None:
             return None
         track, clip = located
@@ -814,8 +833,7 @@ class PreviewWidget(QOpenGLWidget):
         # 物の枠が残ると、見えない絵を動かすことになる
         if all(t.id != track.id for t in self._project.timeline.active_picture_tracks()):
             return None
-        outline = self.outline_of(clip)
-        return None if outline is None else (track, clip, outline)
+        return located
 
     def _widget_corners(self, outline: Outline) -> list[Point]:
         corners = []

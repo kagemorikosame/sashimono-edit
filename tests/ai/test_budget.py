@@ -446,6 +446,24 @@ class TestBridge:
         assert notice is not None
         assert notice.kind is LimitKind.TURN_IMAGES
 
+    def test_copying_a_picture_out_is_not_counted_as_a_picture(self, host: FakeHost) -> None:
+        # 壊れると、絵の上限を使い切った人は、AI に絵を返さない〔静止画をコピー〕（copy_snapshot
+        # #349）まで上限で断られ、止めた扱いで指示ごと終わる
+        copy = _operation("copy_snapshot")
+        assert copy.returns_frames is False
+        assert PREVIEW.returns_frames is True
+        bridge = _bridge(host, Limits(turn_images=1, action=LimitAction.STOP))
+        done, box = call_in_thread(bridge, PREVIEW, {"frame": 0})
+        pump_until(bridge, done, WAIT)
+        assert "result" in box
+        done, box = call_in_thread(bridge, copy, {"frame": 0})
+        pump_until(bridge, done, WAIT)
+        assert "result" in box, box.get("error")
+        assert host.copied_frames == [0]
+        assert bridge.usage.stopped is None
+        sent = bridge.usage.turn_usage()
+        assert sent is not None and sent.images == 1
+
     def test_after_stopping_every_tool_is_refused(self, host: FakeHost) -> None:
         # 壊れると、上限で止めた後も絵を使わない道具は動き続け、指示が終わらない
         bridge = _bridge(host, Limits(turn_tokens=10, action=LimitAction.STOP))
