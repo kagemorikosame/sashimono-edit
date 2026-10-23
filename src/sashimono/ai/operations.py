@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import time
@@ -80,6 +81,7 @@ from sashimono.ai.style_check import COLOR as STYLE_COLOR
 from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.aviutl.custom_object import custom_object_clip
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
 from sashimono.compat.aviutl.report import is_known_record
@@ -384,6 +386,7 @@ __all__ = [
     "Operation",
     "Pending",
     "QuestionSpec",
+    "custom_object_key",
     "find_operation",
     "finish",
     "question_spec",
@@ -4921,6 +4924,15 @@ def _reframe_size(host: EditorHost, arguments: dict[str, Any]) -> tuple[int, int
         )
     if width is None or height is None:
         return host.reframe_style.resolution
+    return _picture_size(width, height)
+
+
+def _picture_size(width: object, height: object) -> tuple[int, int]:
+    """作品の縦横 画面の新規作成とプロジェクト設定（:class:`SetResolution`）と同じ範囲の偶数
+
+    範囲を道具ごとに書くと、どれかだけが画面で選べない大きさ（2x2 や 100000x100000）を通し、
+    最初の描画や書き出しで大きな絵を取りに行って固まる
+    """
     size = (_integer_value(width, "width"), _integer_value(height, "height"))
     for name, value in zip(("width", "height"), size, strict=True):
         if not MIN_RESOLUTION <= value <= MAX_RESOLUTION or value % 2:
@@ -6811,9 +6823,23 @@ def _reload_scripts(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"loaded": host.reload_scripts()}
 
 
+def custom_object_key(entry: ScriptEntry) -> str:
+    """カスタムオブジェクト 1 つを指す鍵 置き場のフォルダとファイルの名前を出さずに一意にする
+
+    名前だけで選ぶと、別の .obj と .obj2 に同じ名前の節があるとき、画面のメニューでは
+    どちらも置けるのに AI はどちらも選べない 識別子をそのまま渡すと置き場の場所（本人の
+    名前が入りうる #391 の名前と場所）が外へ出るので、指紋にする 鍵は置き場と節から作る
+    中身の指紋にすると、スクリプトを直すたびに覚えた鍵が外れる（棚の template_id と同じ）
+    """
+    return "obj:" + hashlib.sha256(entry.identifier.encode()).hexdigest()[:16]
+
+
 def _custom_object_rows(host: EditorHost) -> list[dict[str, str]]:
-    """置けるカスタムオブジェクトの名前と分類 置き場の場所は返さない（名前で選ぶ）"""
-    return [{"name": entry.label, "category": entry.category} for entry in host.custom_objects]
+    """置けるカスタムオブジェクトの鍵と名前と分類 置き場の場所は返さない（鍵か名前で選ぶ）"""
+    return [
+        {"key": custom_object_key(entry), "name": entry.label, "category": entry.category}
+        for entry in host.custom_objects
+    ]
 
 
 def _list_custom_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -6822,19 +6848,7 @@ def _list_custom_objects(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _add_custom_object(host: EditorHost, arguments: dict[str, Any]) -> object:
     """カスタムオブジェクト（AviUtl の .obj）を置く 右クリックの〔追加〕と同じ形のクリップ"""
-    name = str(arguments.get("name") or "")
-    found = [entry for entry in host.custom_objects if entry.label == name]
-    if not found:
-        names = "、".join(row["name"] for row in _custom_object_rows(host)[:30])
-        raise ToolError(
-            f"そのカスタムオブジェクトはありません: {name}（置けるのは {names or 'ありません'}"
-            " list_custom_objects で一覧を取れます）"
-        )
-    if len(found) > 1:
-        raise ToolError(
-            f"同じ名前のカスタムオブジェクトが {len(found)} 本あるので選べません: {name}"
-        )
-    entry = found[0]
+    entry = _chosen_custom_object(host, arguments)
     at_frame, duration, track_id = _place_spot(host, arguments)
     definition = registry.get(entry.identifier) or entry.definition()
     clip = custom_object_clip(definition.create(), duration=duration)
@@ -6844,6 +6858,35 @@ def _add_custom_object(host: EditorHost, arguments: dict[str, Any]) -> object:
     if placed is not None:
         host.select_clip(placed)
     return {"clip_id": str(placed) if placed is not None else None, "name": entry.label}
+
+
+def _chosen_custom_object(host: EditorHost, arguments: dict[str, Any]) -> ScriptEntry:
+    """``key`` か ``name`` で選んだカスタムオブジェクト 鍵を先に見る"""
+    key = str(arguments.get("key") or "")
+    if key:
+        by_key = [e for e in host.custom_objects if custom_object_key(e) == key]
+        if not by_key:
+            raise ToolError(
+                f"その鍵のカスタムオブジェクトはありません: {key}"
+                "（list_custom_objects の key で確かめてください）"
+            )
+        return by_key[0]
+    name = str(arguments.get("name") or "")
+    found = [entry for entry in host.custom_objects if entry.label == name]
+    if not found:
+        names = "、".join(row["name"] for row in _custom_object_rows(host)[:30])
+        raise ToolError(
+            f"そのカスタムオブジェクトはありません: {name}（置けるのは {names or 'ありません'}"
+            " list_custom_objects で一覧を取れます）"
+        )
+    if len(found) > 1:
+        # 候補の鍵を並べて断る 黙ってどれかを置くと、本人が思っていない方が置かれる
+        keys = "、".join(custom_object_key(entry) for entry in found)
+        raise ToolError(
+            f"同じ名前のカスタムオブジェクトが {len(found)} 本あります: {name}"
+            f" key に {keys} のどれかを渡して選んでください"
+        )
+    return found[0]
 
 
 #: 配置のテンプレートの寄せ先 設定パネルの ↖〜↘ と同じ名前と並び
@@ -7137,14 +7180,9 @@ def _new_settings(arguments: dict[str, Any]) -> tuple[tuple[int, int] | None, Fr
     """新しい作品の解像度とフレームレート 省けば本人の「新しい作品」の設定のまま"""
     resolution: tuple[int, int] | None = None
     if "width" in arguments or "height" in arguments:
-        try:
-            width, height = int(arguments["width"]), int(arguments["height"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ToolError("width と height は一緒に整数で渡してください") from exc
-        if width <= 0 or height <= 0 or width % 2 or height % 2:
-            # 奇数の縦横は書き出しでエンコーダに断られる（解像度の道具と同じ決まり）
-            raise ToolError(f"解像度は正の偶数にしてください: {width}x{height}")
-        resolution = (width, height)
+        if "width" not in arguments or "height" not in arguments:
+            raise ToolError("width と height は一緒に整数で渡してください")
+        resolution = _picture_size(arguments["width"], arguments["height"])
     rate: FrameRate | None = None
     if arguments.get("frame_rate") is not None:
         try:
@@ -9294,7 +9332,8 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="list_custom_objects",
         description=(
-            "置けるカスタムオブジェクト（AviUtl の .obj）の名前と分類 置くのは add_custom_object"
+            "置けるカスタムオブジェクト（AviUtl の .obj）の鍵（key）と名前と分類"
+            " 置くのは add_custom_object 同じ名前が並ぶ物は key で選ぶ"
         ),
         schema=_schema(_paging()),
         handler=_list_custom_objects,
@@ -9305,16 +9344,17 @@ OPERATIONS: tuple[Operation, ...] = (
         name="add_custom_object",
         description=(
             "カスタムオブジェクト（AviUtl の .obj）を置く（右クリックの〔追加〕と同じ）"
-            " 名前は list_custom_objects で分かる 値は set_param で変える 置いた物が選ばれる"
+            " 鍵と名前は list_custom_objects で分かる 同じ名前が並ぶときは key で選ぶ"
+            " 値は set_param で変える 置いた物が選ばれる"
         ),
         schema=_schema(
             {
-                "name": _string("置くカスタムオブジェクトの名前"),
+                "key": _string("置く物の鍵（list_custom_objects の key） name より先に見る"),
+                "name": _string("置くカスタムオブジェクトの名前（key を渡すなら要らない）"),
                 "at_frame": _integer("置く位置 省略すると再生ヘッド"),
                 "duration": _integer("長さ（フレーム、既定 150）"),
                 "track_id": _string("置きたいトラック 塞がっていればいつもの決まりで選ぶ"),
             },
-            ["name"],
         ),
         handler=_add_custom_object,
         sends=_SAVED_LOOKS,
@@ -10335,8 +10375,12 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema(
             {
-                "width": _integer("横の画素（偶数 height と一緒に）"),
-                "height": _integer("縦の画素（偶数 width と一緒に）"),
+                "width": _integer(
+                    f"横の画素（{MIN_RESOLUTION}〜{MAX_RESOLUTION} の偶数 height と一緒に）"
+                ),
+                "height": _integer(
+                    f"縦の画素（{MIN_RESOLUTION}〜{MAX_RESOLUTION} の偶数 width と一緒に）"
+                ),
                 "frame_rate": _number("フレームレート（30・29.97・60 など）"),
             }
         ),

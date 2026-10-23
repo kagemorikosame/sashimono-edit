@@ -20,6 +20,7 @@ from sashimono.ai.host import UNSAVED_REFUSAL, ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddMarkers, Author
+from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION
 from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.io.atomic import expect_now
 from sashimono.core.io.serialize import save_project
@@ -185,3 +186,21 @@ class TestNew:
         with pytest.raises(ToolError):
             NEW(host, arguments)
         assert host.document.project is before
+
+    @pytest.mark.parametrize(
+        ("width", "height"), [(2, 2), (100_000, 100_000), (1920, 8194), (14, 1080)]
+    )
+    def test_sizes_the_new_project_dialog_does_not_allow_are_refused(
+        self, host: FakeHost, width: int, height: int
+    ) -> None:
+        # 壊れると、画面の新規作成では選べない 2x2 や 100000x100000 の作品を AI が作り、
+        # 最初の描画や書き出しで大きな絵を取りに行って固まる
+        before = host.document.project
+        with pytest.raises(ToolError, match=f"{MIN_RESOLUTION}〜{MAX_RESOLUTION}"):
+            NEW(host, {"width": width, "height": height})
+        assert host.document.project is before
+
+    def test_the_edges_of_the_dialog_s_range_are_accepted(self, host: FakeHost) -> None:
+        # 壊れると、画面の新規作成で作れる一番小さい・大きい作品を AI だけが作れない
+        NEW(host, {"width": MIN_RESOLUTION, "height": MAX_RESOLUTION})
+        assert host.document.project.settings.resolution == (MIN_RESOLUTION, MAX_RESOLUTION)

@@ -10,7 +10,7 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
+from sashimono.ai.operations import custom_object_key, find_operation
 from sashimono.ai.outbound import ASKED, Outbound, SendChoice
 from sashimono.ai.safety import Safety
 from sashimono.compat.aviutl.catalog import ScriptCatalog
@@ -130,7 +130,7 @@ class TestScriptsAndCustomObjects:
         )
         host.scripts = [entry]
         assert run(host, "list_custom_objects")["custom_objects"] == [
-            {"name": "円", "category": entry.category}
+            {"key": custom_object_key(entry), "name": "円", "category": entry.category}
         ]
         before = host.document.project
         placed = run(host, "add_custom_object", name="円", at_frame=400)
@@ -141,6 +141,37 @@ class TestScriptsAndCustomObjects:
         assert [e.kind for e in clip.effects] == [entry.identifier, "flip", "transform"]
         assert host.selected_clip == clip.id
         _undo_returns(host, before)
+
+    def test_objects_sharing_a_name_are_picked_by_their_key(self, host: FakeHost) -> None:
+        # 壊れると、別の .obj と .obj2 に同じ名前の節があるだけで、画面のメニューでは
+        # どちらも置けるのに AI からはどちらも置けない
+        catalog = ScriptCatalog(roots=())
+        first = catalog.add_text("aviutl:私の素材/一.obj:円", "@円\n", kind="obj")
+        second = catalog.add_text("aviutl:私の素材/二.obj2:円", "@円\n", kind="obj")
+        host.scripts = [first, second]
+        rows = run(host, "list_custom_objects")["custom_objects"]
+        keys = [row["key"] for row in rows]
+        assert len(set(keys)) == 2
+        # 鍵に置き場のフォルダやファイルの名前を出さない（#391 の名前と場所は伏せる側）
+        assert not any(part in key for key in keys for part in ("私の素材", "一.obj", "二.obj2"))
+        placed = run(host, "add_custom_object", key=keys[1], at_frame=400)
+        located = host.document.project.timeline.locate_clip(ClipId(placed["clip_id"]))
+        assert located is not None
+        assert located[1].effects[0].kind == second.identifier
+
+    def test_a_shared_name_is_refused_with_the_keys_to_choose_from(self, host: FakeHost) -> None:
+        # 壊れると、名前で頼んだ AI は断られても次に何を渡せば置けるのか分からない
+        catalog = ScriptCatalog(roots=())
+        host.scripts = [
+            catalog.add_text("aviutl:一.obj:円", "@円\n", kind="obj"),
+            catalog.add_text("aviutl:二.obj2:円", "@円\n", kind="obj"),
+        ]
+        keys = [row["key"] for row in run(host, "list_custom_objects")["custom_objects"]]
+        before = host.document.project
+        with pytest.raises(ToolError) as caught:
+            run(host, "add_custom_object", name="円")
+        assert all(key in str(caught.value) for key in keys)
+        assert host.document.project is before
 
     def test_an_unknown_name_lists_what_can_be_placed(self, host: FakeHost) -> None:
         # 壊れると、AI は無い名前で置こうとし続け、何なら置けるのかが分からない
