@@ -1736,6 +1736,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "プロジェクトを切り替えたので、素材の読み込みを取り消した", 5000
             )
+        if self._media_search is not None:
+            # 探す窓は閉じても使い回す 前の作品の答えを捨てないと、新しい作品の画面に前の
+            # 作品の行が残って選べる 捨てるのは差し替えのときだけで、編集のたびの
+            # _on_project_changed では捨てない（字幕を直すたびに一覧が消えると探し直しになる
+            # 行き先は選んだときの作品で決めるので、編集の後に選んでも外れない）
+            self._media_search.forget()
         kept = {media.id for media in self._document.project.media}
         for media in previous.media:
             if media.id not in kept:

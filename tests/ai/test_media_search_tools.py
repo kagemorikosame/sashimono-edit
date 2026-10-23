@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -273,6 +274,29 @@ class TestTheSheet:
         media = _media(host)
         host.scene_states[media.id] = SceneState(_signal(cuts), running=False)
         return media
+
+    def test_copied_seconds_of_a_long_media_mark_the_scene_described(self, host: FakeHost) -> None:
+        # 壊れると、3 時間ほどの素材で場面の秒が有効数字 6 桁に丸められ（11169.889 が
+        # 11169.9）、AI が写して覚えた説明が場面と合わず、何度見ても説明ありにならない
+        project = host.document.project
+        long = replace(project.media[0], duration=Fraction(20000))
+        host.document.reset(replace(project, media=(long, *project.media[1:])))
+        host.scene_states[long.id] = SceneState(_signal([12345.678], until=20000.0), running=False)
+        asked = {"media_id": str(long.id), "max_scene_seconds": 600, "offset": 19, "count": 1}
+        first = SHEET(host, asked)
+        assert isinstance(first, ImageResult)
+        found = re.search(r"20\) ([0-9.]+)〜([0-9.]+) 秒", first.caption)
+        assert found is not None, first.caption
+        head, tail = float(found.group(1)), float(found.group(2))
+        _result(
+            REMEMBER,
+            host,
+            media_id=str(long.id),
+            scenes=[{"from_seconds": head, "to_seconds": tail, "text": "長い素材の場面"}],
+        )
+        again = SHEET(host, asked)
+        assert isinstance(again, ImageResult)
+        assert "20) " in again.caption and "（説明あり）" in again.caption
 
     def test_one_frame_per_scene_is_drawn_from_the_media(self, host: FakeHost) -> None:
         # 壊れると、AI が見る絵と説明を付ける場面（素材の秒）が食い違い、別の場面に説明が付く

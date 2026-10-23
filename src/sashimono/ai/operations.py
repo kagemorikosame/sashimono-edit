@@ -2898,7 +2898,10 @@ def _media_scene_sheet(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _seconds_label(value: float) -> str:
-    return f"{value:g}"
+    # 同じ場面かを決める _span_key と同じ小数第 2 位で出す AI はこの秒を写して
+    # remember_scene_descriptions へ渡す 有効数字 6 桁（:g）だと 10000 秒を越える素材で
+    # 12345.678 が 12345.7 になり、写した秒が場面と合わず、説明が置き換わらずに増え続ける
+    return f"{round(value, 2):.2f}".rstrip("0").rstrip(".")
 
 
 def _scene_sheet(

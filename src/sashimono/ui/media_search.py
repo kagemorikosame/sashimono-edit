@@ -160,6 +160,19 @@ class MediaSearchDialog(QDialog):
         """今の頼みの答えを待っているか"""
         return self._searching
 
+    def forget(self) -> None:
+        """作品を差し替えたときに前の作品の答えを捨てる 待っている頼みも捨てる
+
+        窓は閉じずに使い回すので、捨てないと前の作品の行が新しい作品の画面に残って選べる
+        選ぶと、新しい作品に無い素材 ID で行き先を探すことになる 打った語は残す
+        （Enter を押し直せば新しい作品で引ける）
+        """
+        self._generation += 1
+        self._searching = False
+        self._pool.clear()
+        self._results.clear()
+        self._summary.setText("作品を切り替えました Enter で新しい作品から探し直します")
+
     def done(self, result: int) -> None:
         """閉じたら待っている頼みを捨てる 開き直して打つまで、前の答えで一覧を埋めない"""
         self._generation += 1

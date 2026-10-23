@@ -166,6 +166,28 @@ class TestTheDialog:
         assert _search(dialog, "存在しない言葉") == []
         assert "空白で区切って" in dialog.summary
 
+    def test_switching_projects_drops_the_old_rows(
+        self, window: MainWindow, placed: MediaItem, tmp_path: Path
+    ) -> None:
+        # 壊れると、開いたまま（または閉じて使い回す）の窓に前の作品の行が残り、新しい作品の
+        # 画面でその行を選べる（新しい作品に無い素材へ行こうとする）
+        dialog = window.show_media_search()
+        assert _search(dialog, "ラーメン")
+        # 編集では消さない 字幕を直すたびに一覧が消えると探し直しになる
+        window.execute_all([SetTranscript(placed.id, _transcript((4, "直した字幕")))], "字幕")
+        assert dialog.results.count() == 1
+        window._adopt_new(Project.create(ProjectSettings(frame_rate=FrameRate(30))))
+        assert dialog.results.count() == 0
+        assert "切り替え" in dialog.summary
+        # 閉じた窓を開き直しても、開いた作品の前に引いた行は出ない
+        reopened = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(placed,))
+        window._adopt_opened(reopened, tmp_path / "一つ目.sme")
+        assert _search(dialog, "編集")
+        dialog.reject()
+        window._adopt_opened(reopened, tmp_path / "別の作品.sme")
+        assert window.show_media_search() is dialog
+        assert dialog.results.count() == 0
+
 
 class _Gates:
     """場面の説明を読む所で、呼ばれた順に 1 つずつ止める 試験が開けるまで検索が終わらない"""
