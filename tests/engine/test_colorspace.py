@@ -187,6 +187,34 @@ class TestReading:
         assert_close(rgb_at_bars(image), COLORS, tolerance=3)
 
 
+def _flat(source: str, width: int, height: int = 32) -> av.VideoFrame:
+    """1 色に塗った ``source`` のフレーム（Y・U・V・A を 90・140・160・200）"""
+    frame = av.VideoFrame(width, height, source)
+    for index, plane in enumerate(frame.planes):
+        plane.update(bytes([(90, 140, 160, 200)[index]]) * plane.buffer_size)
+    return frame
+
+
+class TestTheRightEdge:
+    @pytest.mark.parametrize("source", ["yuv420p", "yuv422p", "yuva420p"])
+    @pytest.mark.parametrize("width", [180, 1170, 1284, 1366, 2340])
+    def test_every_column_is_written(self, source: str, width: int) -> None:
+        # swscale は幅が 16 で割り切れない YUV を RGBA へ直すとき右の端の数画素を書かない
+        # 書かれない所は前に使ったメモリのままで、幅 1366 の画面録画や縦撮りの素材の端に
+        # ごみの色の帯が出て、縦への作り替えの顔の検出がその帯を顔と拾った（#407）
+        frame = _flat(source, width)
+        image = to_rgb_array(frame, "rgba")
+        assert image.shape == (32, width, 4)
+        assert np.abs(image.astype(int) - image[:, :1].astype(int)).max() <= 2
+
+    def test_a_divisible_width_is_left_alone(self) -> None:
+        # 割り切れる幅でまで端を直すと、ほとんどの素材の再生で 1 枚ごとに要らない変換が増える
+        frame = _flat("yuv420p", 1280)
+        image = to_rgb_array(frame, "rgba")
+        plain = frame.to_ndarray(format="rgba", src_colorspace=source_matrix(frame))
+        assert np.array_equal(image, plain)
+
+
 def gray_steps(color_range: ColorRange) -> av.VideoFrame:
     """Y が 16 / 128 / 235 の 3 段の灰色 範囲のタグだけを変えて使う
 

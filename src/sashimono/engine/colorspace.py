@@ -106,9 +106,66 @@ def _reformat(
     )
 
 
+#: 端を直す書式 素材を読む所が頼むのは RGBA だけなので、確かめたのも RGBA だけ
+_MENDED = frozenset({"rgba"})
+#: swscale の速い道が 1 度に書く幅 書かれないのは、これで割り切れない右の端の分まで
+_EDGE = 16
+
+
 def to_rgb_array(frame: av.video.frame.VideoFrame, pixel_format: str) -> np.ndarray:
-    """素材のフレームを RGB 系の配列へ 行列は :func:`source_matrix` で決める"""
-    return frame.to_ndarray(format=pixel_format, src_colorspace=source_matrix(frame))
+    """素材のフレームを RGB 系の配列へ 行列は :func:`source_matrix` で決める
+
+    幅が 16 で割り切れない YUV 420・422 の素材を RGBA へ直すと、swscale（libswscale 10.1
+    PyAV 19）は右の端の数画素を書かずに返すことがある（手元で幅 180・1170・1284・1366・2340
+    など YUV 444 と RGB24 への変換では起きない） 書かれない所は前に使ったメモリのままなので、
+    ごみの色の帯になる時と黒い帯になる時がある 縦撮りの素材ではその帯が回した後の上か下に
+    出て、顔の検出が帯を拾った（#407 tests/engine 全体を並べたときだけ落ちた試験の原因）
+    割り切れないときは、右の端の幅 16 の切れ端（割り切れるので書き漏らさない）を同じ行列で
+    直し、割り切れない分の列だけを写す 全体を別の道でもう 1 度直すと、幅 1366 の素材の再生で
+    1 枚ごとの変換が倍になる
+    """
+    matrix = source_matrix(frame)
+    image = frame.to_ndarray(format=pixel_format, src_colorspace=matrix)
+    rest = frame.width % _EDGE
+    if pixel_format not in _MENDED or rest == 0 or frame.width < _EDGE:
+        return image
+    if not frame.format.name.startswith("yuv") or frame.width % 2:
+        return image
+    piece = _right_strip(frame)
+    if piece is None:
+        return image
+    strip = piece.to_ndarray(format=pixel_format, src_colorspace=matrix)
+    mended = np.array(image, copy=True)
+    mended[:, -rest:] = strip[:, -rest:]
+    return mended
+
+
+def _right_strip(frame: av.video.frame.VideoFrame) -> av.video.frame.VideoFrame | None:
+    """平面ごとに持つ YUV のフレームの、右の端の幅 :data:`_EDGE` の切れ端 作れなければ ``None``
+
+    頭の列は偶数にする（色差を横に半分に縮めた書式で、色差の 1 列が輝度の 2 列に当たる）
+    """
+    start = frame.width - _EDGE
+    size = _sample_bytes(frame)
+    piece = av.video.frame.VideoFrame(_EDGE, frame.height, frame.format.name)
+    piece.colorspace = frame.colorspace
+    piece.color_range = frame.color_range
+    for source, target in zip(frame.planes, piece.planes, strict=True):
+        if source.width <= 0 or frame.width % source.width:
+            return None
+        step = frame.width // source.width
+        first = start // step * size
+        span = target.width * size
+        rows = np.frombuffer(source, np.uint8).reshape(source.height, source.line_size)
+        out = np.zeros((target.height, target.line_size), np.uint8)
+        out[:, :span] = rows[: target.height, first : first + span]
+        target.update(out.tobytes())
+    return piece
+
+
+def _sample_bytes(frame: av.video.frame.VideoFrame) -> int:
+    """平面の 1 つの値のバイト数（8 bit までは 1、それより深い色は 2）"""
+    return 2 if max(component.bits for component in frame.format.components) > 8 else 1
 
 
 def to_bt709(
