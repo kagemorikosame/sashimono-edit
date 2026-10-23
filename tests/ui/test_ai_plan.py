@@ -527,6 +527,30 @@ class TestPlanPreference:
         assert sessions[0].plan is False
         assert PLAN_RULES not in sessions[0].system_prompt
 
+    def test_resuming_waits_until_it_is_turned_back_on(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、計画を残して設定を切った後も〔続ける〕が押せ、計画の道具を渡さない新しい会話へ
+        # 「get_plan で確かめてから」と頼む AI は計画を読めず、元の指示も済んだ手順も分からない
+        # （Codex #392）
+        widget, host, sessions = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "done")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        box = widget._plan_box
+        assert box.resume_button.isEnabled() and box.off_text() == ""
+        widget.apply_preferences(Preferences(ai_plan_first=False))
+        assert box.resume_button.isEnabled() is False
+        assert "長い作業は、AI が先に計画を示す" in box.off_text()
+        widget.resume_plan()
+        assert RESUME_PROMPT not in sessions[0].prompts and not widget._queued
+        # 戻せばまた続けられる
+        widget.apply_preferences(Preferences(ai_plan_first=True))
+        assert box.resume_button.isEnabled() and box.off_text() == ""
+        widget.resume_plan()
+        assert list(widget._queued) == [RESUME_PROMPT]
+
     def test_changing_it_starts_a_new_conversation_when_idle(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
     ) -> None:

@@ -27,12 +27,25 @@ from sashimono.ai.plan import PlanView, StepState, Stopped
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.theme import Colors, themed_style
 
-__all__ = ["PAUSE_TEXT", "PAUSING_TEXT", "RESUME_TEXT", "PlanBox", "plan_progress"]
+__all__ = [
+    "PAUSE_TEXT",
+    "PAUSING_TEXT",
+    "PLAN_OFF_TEXT",
+    "RESUME_TEXT",
+    "PlanBox",
+    "plan_progress",
+]
 
 PAUSE_TEXT = "区切りで止める"
 #: 押した後 区切りに来るまでは今の手順が続くので、止まったと見えないようにする
 PAUSING_TEXT = "区切りで止めます…"
 RESUME_TEXT = "続ける"
+#: 設定で計画を切っている間の案内 計画の道具を渡さない会話へ「計画の続きから」と頼んでも、
+#: AI は get_plan を呼べず、元の指示も済んだ手順も読めない 押せない訳と戻し方を書く
+PLAN_OFF_TEXT = (
+    "〔続ける〕は 表示 → 設定… の「長い作業は、AI が先に計画を示す」を入れると押せます"
+    " 切っている間は AI が計画を読めません"
+)
 
 #: 止まった訳ごとに、次に何をすればよいかを添える 訳だけだと、続けてよいのかが分からない
 _STOPPED_HINTS = {
@@ -108,7 +121,7 @@ class PlanBox(QScrollArea):
         self.setVisible(False)
         #: 最後に描いた中身（版・動いているか・送れるか） 同じなら書き換えない
         #: 同じ文を書き直すだけでも、文字の欄は大きさを測り直して窓の配置をやり直す
-        self._drawn: tuple[int, bool, bool] | None = None
+        self._drawn: tuple[int, bool, bool, bool] | None = None
 
         inner = QWidget(self)
         self._title = QLabel(inner)
@@ -137,6 +150,10 @@ class PlanBox(QScrollArea):
         self._stopped = QLabel(inner)
         self._stopped.setWordWrap(True)
         themed_style(self._stopped, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+        self._off = QLabel(PLAN_OFF_TEXT, inner)
+        self._off.setWordWrap(True)
+        themed_style(self._off, lambda: f"color: {Colors.TEXT_MUTED.name()};")
+        self._off.setVisible(False)
 
         self._pause = QPushButton(PAUSE_TEXT, inner)
         self._pause.setToolTip(
@@ -159,6 +176,7 @@ class PlanBox(QScrollArea):
         layout.addLayout(header)
         layout.addWidget(self._steps)
         layout.addWidget(self._stopped)
+        layout.addWidget(self._off)
         layout.addWidget(buttons)
         self.setWidget(inner)
 
@@ -183,18 +201,26 @@ class PlanBox(QScrollArea):
     def stopped_text(self) -> str:
         return self._stopped.text()
 
-    def show_plan(self, view: PlanView | None, *, working: bool, ready: bool) -> bool:
+    def off_text(self) -> str:
+        """設定で計画を切っているときの案内 出していなければ空"""
+        return self._off.text() if not self._off.isHidden() else ""
+
+    def show_plan(
+        self, view: PlanView | None, *, working: bool, ready: bool, plan_on: bool = True
+    ) -> bool:
         """計画を見せる 描き直したら真 ``working`` は AI が応えている最中か
 
         ``ready`` は指示を送れる（AI の部品が入っている）か 送れない間に〔続ける〕を
         押せると、押しても何も起きない
+        ``plan_on`` は設定の「長い作業は、AI が先に計画を示す」 切っている間は会話に計画の
+        道具を渡さないので〔続ける〕を押せなくし、設定を戻す案内を出す（送れない間と同じ作法）
         """
         if view is None:
             changed = self._drawn is not None
             self._drawn = None
             self.setVisible(False)
             return changed
-        key = (view.version, working, ready)
+        key = (view.version, working, ready, plan_on)
         if key == self._drawn:
             return False
         self._drawn = key
@@ -216,7 +242,8 @@ class PlanBox(QScrollArea):
         self._pause.setEnabled(working and unfinished and not view.pause_requested)
         self._pause.setText(PAUSING_TEXT if view.pause_requested else PAUSE_TEXT)
         self._resume.setVisible(not working)
-        self._resume.setEnabled(not working and unfinished and ready)
+        self._resume.setEnabled(not working and unfinished and ready and plan_on)
+        self._off.setVisible(not working and unfinished and not plan_on)
         # 応えている間に閉じると、AI が書く先の計画が消え、手順の印を書けずに失敗が並ぶ
         self._close.setEnabled(not working)
         self.setVisible(True)

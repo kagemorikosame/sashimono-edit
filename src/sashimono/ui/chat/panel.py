@@ -1705,6 +1705,7 @@ class ChatPanel(QWidget):
             self._plan.view(),
             working=bool(self._queued),
             ready=self._setup.status.ready,
+            plan_on=self._plan_first,
         )
 
     def pause_plan(self) -> None:
@@ -1720,7 +1721,15 @@ class ChatPanel(QWidget):
     def resume_plan(self) -> None:
         """〔続ける〕 止めた所から残りの手順を頼む 応えている間は並べない"""
         view = self._plan.view()
-        if self._queued or view is None or view.finished or not self._setup.status.ready:
+        if (
+            self._queued
+            or view is None
+            or view.finished
+            or not self._setup.status.ready
+            # 設定で計画を切った会話には計画の道具が無く、「計画の続きから」と頼んでも
+            # AI は get_plan を呼べない（ボタンは押せなくしてあり、ここは押し漏れの守り）
+            or not self._plan_first
+        ):
             # 応えている間に並べると、今の指示の後ろで「続けて」が走り、止めた所が分からなくなる
             return
         self._submit(RESUME_PROMPT)
