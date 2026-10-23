@@ -30,7 +30,7 @@ from functools import partial
 from typing import Any
 
 from sashimono.ai.budget import LimitAction, Overrun, UsageMeter
-from sashimono.ai.fixes import PASSES_AFTER_LIMIT, fixes_closed
+from sashimono.ai.fixes import PASSES_AFTER_LIMIT, refuse_after_limit
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
@@ -326,7 +326,7 @@ class EditorBridge:
         """
         if operation.name in PASSES_AFTER_LIMIT:
             return
-        if self.call(lambda: fixes_closed(self._host.document)):
+        if self.call(lambda: refuse_after_limit(self._host.document)):
             raise ToolError(
                 "この指示では、検査の後に直す回数の上限（本人の設定）に達しました これ以上は"
                 "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"

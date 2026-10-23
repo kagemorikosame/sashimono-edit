@@ -429,6 +429,11 @@ class Preferences:
     #: アシスタントが指示をすべて終えたとき、別の窓を触っていたらタスクバーで知らせる
     #: 既定は切 頼んでいないのにタスクバーが光ると驚く 待つ間に別の作業をする人だけが入れる
     ai_done_alert: bool = False
+    #: アシスタントが途中で止まったら、何をやって・どこで止まったかの要約（引き継ぎ #346）を
+    #: AI の欄に出す 既定は入 止まったことに気付かないまま、半端な編集の上に次の指示を重ねると、
+    #: どこまで済んだか分からなくなる 毎回出るのが煩わしい人は切れる 切っても要約は作り、
+    #: AI は get_handoff で読める
+    ai_handoff: bool = True
     #: AI の部品（claude-agent-sdk と同梱の Claude Code）を自動で新しくする（配布版だけ）
     #: 既定は入 新しいモデルは新しい Claude Code でないと断られ、知らない人はエラーの
     #: 意味が分からず困る 1 日に 1 回まで PyPI を確かめ、試した範囲の中の版だけを裏で入れる
@@ -967,6 +972,7 @@ class PreferenceStore:
             chat_enter_sends=_flag(data.get("chat_enter_sends"), plain.chat_enter_sends),
             ai_busy_animation=_flag(data.get("ai_busy_animation"), plain.ai_busy_animation),
             ai_done_alert=_flag(data.get("ai_done_alert"), plain.ai_done_alert),
+            ai_handoff=_flag(data.get("ai_handoff"), plain.ai_handoff),
             ai_auto_update=_flag(data.get("ai_auto_update"), plain.ai_auto_update),
             match_video=_choice(data.get("match_video"), MATCH_MODES, plain.match_video),
             dock_tabs=_choice(data.get("dock_tabs"), DOCK_TAB_POSITIONS, plain.dock_tabs),

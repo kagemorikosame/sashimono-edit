@@ -6,13 +6,146 @@ AI が検査で見つけた問題を直すたびに、直した回だけを人�
 
 from __future__ import annotations
 
+import pytest
+
 from sashimono.core.commands import Author, Document, RenameProject
+from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.model import Project
 
 
 def _named(document: Document, *names: str) -> None:
     for name in names:
         document.execute(RenameProject(name))
+
+
+#: 名前を変えるコマンドの段の名前
+RENAMED = RenameProject("x").label
+
+
+class TestStepsSplitOff:
+    """前半として先に積んだ段の中の手の名前（#346 引き継ぎの「変えた手」に使う）"""
+
+    def test_names_split_off_by_a_person_are_kept(self, project: Project) -> None:
+        """壊れると、指示の途中で人が変えたとき、それまでに AI が変えた手の名前が消え、
+        AI がその後何もせずに止まると引き継ぎに「変えた手 0 件」と出る
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1", "2")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        assert document.steps_split_off == (RENAMED, RENAMED)
+        assert document.steps_in_checkpoint == ()
+        assert (document.parts_split_by_others, document.parts_split_for_rounds) == (1, 0)
+
+    def test_names_split_off_for_a_fix_round_are_kept(self, project: Project) -> None:
+        """壊れると、直しの回で区切った前の回の手が、引き継ぎから消える"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        assert document.split_checkpoint("AI: 検査の直し（1 回目）")
+        _named(document, "2")
+        assert document.steps_split_off == (RENAMED,)
+        assert (document.parts_split_by_others, document.parts_split_for_rounds) == (0, 1)
+
+    def test_both_kinds_of_split_keep_their_order(self, project: Project) -> None:
+        """壊れると、直しの回と人の割り込みが混ざった指示で、どちらかの手の名前が抜ける"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        _named(document, "2", "3")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        _named(document, "4")
+        assert document.steps_split_off == (RENAMED, RENAMED, RENAMED)
+        assert document.steps_in_checkpoint == (RENAMED,)
+        assert (document.parts_split_by_others, document.parts_split_for_rounds) == (1, 1)
+
+    def test_undoing_a_split_off_part_drops_its_names(self, project: Project) -> None:
+        """壊れると、指示の中で戻した前半の手も、引き継ぎに変えた手として残る"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1", "2")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        document.undo()
+        assert document.project is project
+        # == () と書くと、mypy が型を空のタプルに絞り、やり直した後の比べを通さない
+        assert not document.steps_split_off
+        assert document.parts_split_for_rounds == 0
+        document.redo()
+        assert document.steps_split_off == (RENAMED, RENAMED)
+
+    def test_names_do_not_carry_over_to_the_next_instruction(self, project: Project) -> None:
+        """壊れると、前の指示で割った前半の手が、次の指示の引き継ぎに混ざる"""
+        document = Document(project)
+        document.begin_checkpoint("AI: 前の指示", by=Author.AI)
+        _named(document, "1")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        document.end_checkpoint()
+        assert document.steps_split_off == ()
+        document.begin_checkpoint("AI: 次の指示", by=Author.AI)
+        assert document.steps_split_off == ()
+        assert document.parts_split_by_others == 0
+
+
+def _play(document: Document, moves: str) -> None:
+    """手の並びを文書に当てる 大文字 1 字は AI の道具 1 回（段の名前はその字）
+
+    ``|`` は直しの回で区切る ``p`` は人の変更 ``u`` は取り消し ``r`` はやり直し
+    """
+    for move in moves:
+        if move == "|":
+            assert document.split_checkpoint("AI: 検査の直し")
+        elif move == "p":
+            document.execute(RenameProject(f"人 {len(document.history_labels)}"), by=Author.PERSON)
+        elif move == "u":
+            document.undo()
+        elif move == "r":
+            document.redo()
+        else:
+            with document.checkpoint(move, by=Author.AI):
+                document.execute(RenameProject(move.lower()))
+
+
+#: 手の並び → 前半として残る手・人が割った数・直しの回で区切った数
+#: 段の外の前半を戻す・やり直す・人の変更が混ざる組み合わせを並べる
+_UNDO_TABLE = [
+    ("A|", ("A",), 0, 1),
+    # 戻した前半を同じ形から作り直す（CodeRabbit の指摘 #396） 戻した A を数えない
+    ("A|uB|", ("B",), 0, 1),
+    ("A|ur", ("A",), 0, 1),
+    ("A|urB|", ("A", "B"), 0, 2),
+    ("A|uuB|", ("B",), 0, 1),
+    # 人が変えた後に戻し、前半も戻して作り直す
+    ("A|puuB|", ("B",), 0, 1),
+    ("A|pB", ("A",), 0, 1),
+    ("ABpC", ("A", "B"), 1, 0),
+    ("AB|pC", ("A", "B"), 0, 1),
+    ("A|BpuC|", ("A", "B", "C"), 1, 2),
+    ("ApuuB", (), 0, 0),
+    ("ApuuBpC", ("B",), 1, 0),
+]
+
+
+class TestStepsSplitOffAcrossUndo:
+    @pytest.mark.parametrize(("moves", "steps", "by_others", "for_rounds"), _UNDO_TABLE)
+    def test_each_split_off_part_is_counted_once(
+        self,
+        project: Project,
+        moves: str,
+        steps: tuple[str, ...],
+        by_others: int,
+        for_rounds: int,
+    ) -> None:
+        """壊れると、段の外の前半を戻して同じ形から作り直したとき、戻した手が引き継ぎ（#346）の
+        変えた手に残り、直しの回の数も 1 多くなる
+        （同じ形の前半に、前の写しと今の写しの両方が当たる）
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _play(document, moves)
+        assert document.steps_split_off == steps
+        assert document.parts_split_by_others == by_others
+        assert document.parts_split_for_rounds == for_rounds
 
 
 class TestSplit:
@@ -124,3 +257,51 @@ class TestChangesBy:
             pass
         document.end_checkpoint()
         assert document.changes_by(Author.AI) == 0
+
+
+class TestReopenWithinInstruction:
+    """指示の中で作品を開き直した（#349 の開く・新規）ときの、割った前半の手と数え（#346）"""
+
+    def test_reopening_drops_the_names_split_off_from_the_closed_project(
+        self, project: Project
+    ) -> None:
+        """壊れると、AI が作品を開き直した後に止まった指示の引き継ぎに、閉じた作品の手が
+        「この作品で変えた手」として並び、人が開き直した作品に無い変更を探して戻そうとする
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        _named(document, "2")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        assert document.steps_split_off
+        document.reset(Project.create(), within_checkpoint=True)
+        assert not document.steps_split_off
+        assert not document.steps_in_checkpoint
+        assert (document.parts_split_by_others, document.parts_split_for_rounds) == (0, 0)
+
+    def test_the_ai_is_refused_but_the_person_is_counted_after_reopening(
+        self, project: Project
+    ) -> None:
+        """壊れると、開き直した後の AI の編集が通って指示の取り消しが前の作品の段を指すか、
+        人の変更まで断る・数え落として、検査の直しの回の数えが人の手を AI の手と取り違える
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        document.reset(Project.create(), within_checkpoint=True)
+        with pytest.raises(ValueError, match=REPLACED_REFUSAL):
+            document.execute(RenameProject("AI の続き"))
+        with (
+            pytest.raises(ValueError, match=REPLACED_REFUSAL),
+            document.checkpoint("AI の道具", by=Author.AI),
+        ):
+            _named(document, "2")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        assert document.changes_by(Author.AI) == 1
+        assert document.changes_by(Author.PERSON) == 1
+        # 人の変更で段が割れても、閉じた作品の前半の手は戻ってこない
+        assert not document.steps_split_off
+        document.end_checkpoint()
+        assert not document.replaced_in_checkpoint
