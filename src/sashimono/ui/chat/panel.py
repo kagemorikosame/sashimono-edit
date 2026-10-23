@@ -1418,8 +1418,13 @@ class ChatPanel(QWidget):
         if self._asking_send:
             return
         request = self._bridge.take_send_request()
-        if request is None or request.done.is_set():
-            # 画面が取り出す前に、中断で畳まれていた 出すと押しても何も起きない窓が残る
+        if request is None:
+            return
+        if request.done.is_set():
+            # 画面が取り出す前に、中断か時間切れで畳まれていた 出すと押しても何も起きない窓が
+            # 残る 送れずに終わったことは引き継ぎ（#346）に残す 残さないと、AI が断りを聞いて
+            # 普通に終えたとき、止まった訳が無くなり引き継ぎが作られない（Codex の指摘 #396）
+            self._refuse_folded_send(request)
             return
         self._asking_send = True
         try:
@@ -1438,6 +1443,7 @@ class ChatPanel(QWidget):
             return
         if not request.reply(answer):
             # 窓を出している間に、中断か時間切れで畳まれた 答えは AI へ届かない
+            self._refuse_folded_send(request)
             return
         if answer is SendAnswer.ALWAYS:
             choices = dict(self._bridge.send_choices)
@@ -1528,6 +1534,12 @@ class ChatPanel(QWidget):
             return f"今日: {today}", f"今日 AI が使った量: {today}"
         now = _usage_text(turn, limits, daily=False)
         return f"この指示: {now}", f"この指示: {now}\n今日: {today}"
+
+    def _refuse_folded_send(self, request: SendRequest) -> None:
+        """答えずに畳まれた送ってよいかの確かめを、引き継ぎの許されなかった物に書く"""
+        names = "・".join(kind.label for kind in request.kinds)
+        reason = request.reason or "答えずに閉じました"
+        self._record.refused(f"{request.tool}（{names} を送るか: {reason}）")
 
     # --- AI からの質問（#296） ---
 

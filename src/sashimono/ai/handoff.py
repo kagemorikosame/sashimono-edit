@@ -30,7 +30,6 @@ from typing import Any
 
 from sashimono.ai.fixes import fix_stop
 from sashimono.core.commands import Document
-from sashimono.core.model import Project
 
 __all__ = [
     "AI_WORDS_LIMIT",
@@ -137,8 +136,9 @@ class Handoff:
     remaining: tuple[str, ...]
     #: AI の最後の言葉 AI の言葉なので、確かめてから使う
     ai_words: str
-    #: 止まった時の作品 別の作品を開いた後に、前の作品の引き継ぎを返さないために持つ
-    project: Project = field(repr=False, compare=False)
+    #: 止まった時の作品の世代（:attr:`Document.generation`） 別の作品を開いた後に、前の作品の
+    #: 引き継ぎを返さないために持つ
+    generation: int = field(compare=False)
     #: 検査の直しの回ごとに区切って先に積んだ段の数（#339） 人が割ったのとは分けて案内する
     fix_parts: int = 0
 
@@ -150,6 +150,17 @@ class Handoff:
         """取り消しの段の案内"""
         if not self.changed:
             return "作品は変えていません"
+        if self.split:
+            # 人の段を挟んで AI の段が割れた 「Ctrl+Z でこの指示の前へ戻る」と言い切ると、AI の
+            # 変更だけを安全に戻せると読める 1 回では最後の AI の段だけが戻り、指示の前まで
+            # 戻すと間の人の変更も戻る（Codex の指摘 #396）
+            rounds = "（検査の直しの回ごとにも段を分けてあります）" if self.fix_parts else ""
+            return (
+                "途中で人が変えたので、この指示は人の変更の段を挟んで 2 つ以上の段に分かれて"
+                f"います{rounds} Ctrl+Z では一度には戻せません 1 回押すと最後の AI の段だけが戻り、"
+                f"「{self.checkpoint}」の前まで戻すと間の人の変更も一緒に戻ります 人の変更より"
+                "前の AI の段は、人の変更を戻さずには戻せません"
+            )
         if self.fix_parts:
             # 直しの回ごとに段が分かれている（#339） 1 回で指示の前へ戻ると読むと、最後の回の
             # 直しだけを戻して止める
@@ -160,8 +171,6 @@ class Handoff:
             )
         else:
             note = f"Ctrl+Z で「{self.checkpoint}」を戻すと、この指示の前へ戻ります"
-        if self.split:
-            note += "（途中で人が変えたので、指示の段が 2 つ以上に分かれています）"
         return note
 
     def headline(self) -> str:
@@ -348,7 +357,7 @@ class TurnRecord:
             refused=tuple(self._refused),
             remaining=tuple(self._remaining),
             ai_words=self._ai_words,
-            project=document.project,
+            generation=document.generation,
             fix_parts=self._fix_parts,
         )
 
@@ -391,18 +400,15 @@ class HandoffShelf:
     def current(self, document: Document) -> Handoff | None:
         """今の作品の引き継ぎ 別の作品を開いた後なら ``None``
 
-        止まった時の作品が、今の作品か履歴（取り消し・やり直し）に残っていれば同じ作品と
-        見る 別の作品を開くと履歴は消えるので、前の作品の引き継ぎは返さない 返すと、
-        別の作品のクリップを前の指示の続きで切り詰めかねない
+        作品を差し替えた回数（:attr:`Document.generation`）が止まった時と同じなら同じ作品と
+        見る 前の作品の引き継ぎを返すと、別の作品のクリップを前の指示の続きで切り詰めかねない
+        履歴の中の形で見ると、履歴の上限を超えて編集した後に同じ作品でも空になる（Codex #396）
         """
         with self._lock:
             latest = self._latest
-        if latest is None:
+        if latest is None or latest.generation != document.generation:
             return None
-        project = latest.project
-        if project is document.project or any(project is past for past in document.past_projects):
-            return latest
-        return None
+        return latest
 
 
 #: 文書ごとの棚 道具はホスト（編集画面）しか受け取らないので、文書から引く

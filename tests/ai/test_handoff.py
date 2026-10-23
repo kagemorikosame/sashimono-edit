@@ -34,6 +34,17 @@ from tests.ai.test_fix_loop import _MIXED_CLIP, _finish, _fix
 from tests.ai.test_outbound import SECRET_PATH, answer_sends, put_handoff, undeclared
 
 
+def assert_split_note(note: str) -> None:
+    """人が割った指示の取り消しの案内 一度には戻せないことと、人の段を巻き込むことを言う
+
+    「Ctrl+Z でこの指示の前へ戻ります」と言い切ったまま注記を足すと、AI の変更だけを
+    安全に戻せると読める（Codex の指摘 #396）
+    """
+    assert "この指示の前へ戻ります" not in note
+    assert "一度には戻せません" in note
+    assert "人の変更も一緒に戻ります" in note
+
+
 def _operation() -> Operation:
     found = find_operation(GET_HANDOFF)
     assert found is not None
@@ -193,7 +204,7 @@ class TestChangesComeFromTheHistory:
         handoff = record.handoff(document, "AI: 冒頭を切って")
         assert handoff is not None
         assert handoff.split is True
-        assert "分かれています" in handoff.undo_note()
+        assert_split_note(handoff.undo_note())
         # 人が割る前の手も変えた手に残る 割った所で段の中の名前は消えるので、写しておかないと抜ける
         assert handoff.changes == ("分割", "分割")
 
@@ -238,6 +249,15 @@ class TestShelf:
         shelf = shelf_for(document)
         shelf.put(handoff)
         return shelf
+
+    def test_more_edits_than_the_history_holds_keep_it(self, loaded: Project) -> None:
+        # 壊れると、止まった後に同じ作品で履歴の上限を超えて編集すると、止まった時の形が
+        # 履歴から落ち、別の作品を開いていないのに get_handoff が空になる（Codex の指摘 #396）
+        document = Document(loaded, history_limit=3)
+        shelf = self._put(document)
+        for number in range(5):
+            document.execute(RenameProject(f"名前 {number}"))
+        assert shelf.current(document) is not None
 
     def test_later_edits_and_undo_keep_it(self, loaded: Project) -> None:
         # 壊れると、止まった後に人が 1 手直しただけで、AI が引き継ぎを読めなくなる
@@ -438,7 +458,7 @@ class TestFixLoop:
         handoff = self._record(host, stop=True).handoff(host.document, "AI: 仕上げて")
         assert handoff is not None
         assert handoff.split is True
-        assert "分かれています" in handoff.undo_note()
+        assert_split_note(handoff.undo_note())
         # 直しの回で区切った手と、人が割った前半の手（直し 1）の両方が残る
         assert handoff.changes == ("直す", "直す", "直す")
 

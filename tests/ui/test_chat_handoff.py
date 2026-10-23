@@ -193,6 +193,45 @@ class TestEveryWayOfStopping:
         assert handoff is not None
         assert any("preview_frame" in item for item in handoff.refused)
 
+    def test_a_send_folded_before_it_was_shown_hands_off(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、送ってよいかの確かめが窓を出す前に時間切れで畳まれ、AI がそれを聞いて
+        # 普通に終えたとき、止まった訳が無くなり引き継ぎが作られない（Codex の指摘 #396）
+        widget, _ = recorded
+        _send(widget, "見て直して")
+        request = SendRequest(tool="preview_frame", kinds=(Outbound.FRAMES,))
+        request.give_up("送ってよいかの返事がありませんでした")
+        widget._bridge._send_requests.put(request)
+        widget._check_send()
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert handoff.reason is StopReason.DENIED
+        assert any("返事がありませんでした" in item for item in handoff.refused)
+
+    def test_a_send_folded_while_the_window_was_up_hands_off(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、窓を出している間に時間切れで畳まれた確かめが、引き継ぎの許されなかった物に
+        # 残らない（人は答えたつもりでも AI には届いていない）
+        widget, _ = recorded
+        _send(widget, "見て直して")
+
+        def answer_late(_parent: object, request: SendRequest) -> SendAnswer:
+            request.give_up("送ってよいかの返事がありませんでした")
+            return SendAnswer.UNTIL_CLOSE
+
+        widget.ask_send = answer_late
+        widget._bridge._send_requests.put(
+            SendRequest(tool="preview_frame", kinds=(Outbound.FRAMES,))
+        )
+        widget._check_send()
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        assert handoff is not None
+        assert any("preview_frame" in item for item in handoff.refused)
+
     def test_an_unanswered_question_hands_off(
         self, recorded: tuple[ChatPanel, list[_RecordingSession]]
     ) -> None:

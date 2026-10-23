@@ -81,6 +81,8 @@ class Document:
         #: 回数 #339）が、新しい指示に替わったことをこれで知る 名前で見分けると、同じ文の
         #: 指示を続けたときに数え直さない
         self._checkpoint_serial = 0
+        #: 作品を差し替えた回数（:attr:`generation`）
+        self._generation = 0
         #: 誰の変更を何回積んだか（:meth:`changes_by`） 段の中の段は閉じたときに 1 回と数える
         self._changes: dict[Author, int] = dict.fromkeys(Author, 0)
         #: 最後に積んだ段 続けて行う操作（ホイールで高さを変えるなど）は、この段が
@@ -383,6 +385,15 @@ class Document:
         return self._checkpoint_depth > 0
 
     @property
+    def generation(self) -> int:
+        """作品を差し替えた回数（:meth:`reset` のたびに 1 つ増える 編集・取り消しでは変わらない）
+
+        同じ作品のままかを見るのに使う（引き継ぎ #346） 履歴の中の形で見ると、履歴の上限を
+        超えて編集した後は止まった時の形が履歴から落ち、同じ作品なのに別の作品と見なす
+        """
+        return self._generation
+
+    @property
     def checkpoint_serial(self) -> int:
         """一番外の段を開いた回数 開くたびに 1 つ増える（段を開いていなくても前の値のまま）"""
         return self._checkpoint_serial
@@ -664,6 +675,7 @@ class Document:
         self._undo.clear()
         self._redo.clear()
         self._merge_anchor = None
+        self._generation += 1
         if self._checkpoint_depth:
             self._reset_inner()
             self._earlier_parts = []
