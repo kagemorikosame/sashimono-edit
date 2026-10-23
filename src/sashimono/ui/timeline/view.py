@@ -31,6 +31,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QGridLayout, QMenu, QWidget
 
+from sashimono.ai.auto_fix import can_auto_color
 from sashimono.core.clipboard import (
     ClipboardContent,
     copy_clips,
@@ -269,6 +270,12 @@ class TimelineView(QWidget):
     #: 右クリックの〔つなぎ目を目立たなくする…〕（#332） 選んだクリップの ID の並び
     #: つなぎ目を探して処理を尋ねるのは窓の側（AI の smooth_cuts と同じ所を通す）
     seams_requested = Signal(list)
+    #: 右クリックの〔色を自動で整える…〕（#336） 整えるクリップの ID の並び
+    #: 強さと直し方を尋ねて測るのは窓の側（AI の auto_color と同じ所を通す）
+    color_requested = Signal(list)
+    #: 右クリックの〔ノイズを自動で減らす…〕（#336） 減らすクリップの ID の並び
+    #: 量を尋ねて測るのは窓の側（AI の reduce_noise と同じ所を通す）
+    noise_requested = Signal(list)
     #: ビューは窓を知らない（テストで単体で作れるように） 知らせは信号で外へ出し、
     #: ステータスバーに出すのは窓の仕事にする
     status_message = Signal(str)
@@ -924,7 +931,8 @@ class TimelineView(QWidget):
         """:meth:`_glance` の中身 解析の結果から目安を求める"""
         picture, sound = clip_content(track, clip, item)
         if picture:
-            strip = self._analyzer.filmstrip(item)
+            # 映す映像の流れの絵で色を出す（映像と混合のトラックの stream_index は絵の流れ #336）
+            strip = self._analyzer.filmstrip(item, clip.stream_index)
             tint = filmstrip_tint(strip, clip, rate) if strip is not None else None
             if tint is not None:
                 return ClipGlance(tint=tint)
@@ -1015,7 +1023,7 @@ class TimelineView(QWidget):
         track = band.track
         entries: list[DetailedClip] = []
         # 解析は素材と音声の番号ごとに 1 度だけ引く 同じ素材のクリップが並ぶことが多い
-        found: dict[tuple[MediaId, int | None], tuple[Filmstrip | None, Waveform | None]] = {}
+        found: dict[tuple[MediaId, int | None, int], tuple[Filmstrip | None, Waveform | None]] = {}
         scenes: dict[SceneId, str] | None = None
         for clip, rect in clips:
             media = table.get(clip.media_id) if clip.media_id is not None else None
@@ -1024,11 +1032,17 @@ class TimelineView(QWidget):
             if media is not None:
                 # 鳴らす音の波形を出す 素材だけで引くと、音声が何本もある動画を音ごとに分けて
                 # 置いたとき、どのレイヤーにも 1 本目の波形が出る
+                # 絵も映す映像の流れの物を出す 1 本目だけだと、映像が 2 本ある素材の 2 本目の
+                # クリップに 1 本目のカメラの絵が並ぶ（#336）
                 stream = heard_stream(track, clip)
-                pair = found.get((media.id, stream))
+                key = (media.id, stream, clip.stream_index)
+                pair = found.get(key)
                 if pair is None:
-                    pair = (self._analyzer.filmstrip(media), self._analyzer.waveform(media, stream))
-                    found[(media.id, stream)] = pair
+                    pair = (
+                        self._analyzer.filmstrip(media, clip.stream_index),
+                        self._analyzer.waveform(media, stream),
+                    )
+                    found[key] = pair
                 strip, wave = pair
             scene_name: str | None = None
             if clip.scene_id is not None:
@@ -1883,6 +1897,21 @@ class TimelineView(QWidget):
                 functools.partial(self.seams_requested.emit, timed),
             )
             seams.setEnabled(bool(timed))
+            # 色と雑音の自動補正（#336） 素材の絵を描かない・音を鳴らさないクリップと
+            # ロックしたトラックだけなら灰色
+            colorable = [str(clip_id) for clip_id in self._editable_colorable()]
+            color = _action(
+                menu,
+                f"色を自動で整える…{count}",
+                functools.partial(self.color_requested.emit, colorable),
+            )
+            color.setEnabled(bool(colorable))
+            noise = _action(
+                menu,
+                f"ノイズを自動で減らす…{count}",
+                functools.partial(self.noise_requested.emit, sounds),
+            )
+            noise.setEnabled(bool(sounds))
             if hit[1].scene_id is not None:
                 scene_id = hit[1].scene_id
                 _action(
@@ -2045,6 +2074,16 @@ class TimelineView(QWidget):
         for clip_id in self._selection:
             located = project.timeline.locate_clip(clip_id)
             if located is not None and can_change_speed(project, *located):
+                found.append(clip_id)
+        return found
+
+    def _editable_colorable(self) -> list[ClipId]:
+        """選んでいるクリップのうち、色を測って直せる物（AI の auto_color と同じ決まり）"""
+        project = self._project
+        found: list[ClipId] = []
+        for clip_id in self._selection:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_auto_color(project, *located):
                 found.append(clip_id)
         return found
 

@@ -94,10 +94,10 @@ class PlainAnalyzer(MediaAnalyzer):
         self._show_filmstrips = filmstrips
         self._show_waveforms = waveforms
 
-    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
         if self._source is None or not self._show_filmstrips:
             return None
-        return self._source.filmstrip(media)
+        return self._source.filmstrip(media, stream)
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         if self._source is None or not self._show_waveforms:

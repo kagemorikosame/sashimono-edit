@@ -21,9 +21,20 @@ from functools import lru_cache
 import numpy as np
 
 from sashimono.effects.definition import EffectDefinition, registry
+from sashimono.effects.denoise import (
+    DEFAULT_REDUCTION_DB,
+    DEFAULT_SENSITIVITY_DB,
+    REDUCTION_DB_RANGE,
+    SENSITIVITY_DB_RANGE,
+    denoise,
+    denoise_history,
+)
 from sashimono.effects.spec import TrackSpec
 
-__all__ = ["AudioContext", "register_audio_effects"]
+__all__ = ["DENOISE_KIND", "AudioContext", "register_audio_effects"]
+
+#: ノイズ除去の種類（#336） AI の道具が同じクリップに掛け直すとき、前の物を探すのに使う
+DENOISE_KIND = "audio_denoise"
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +363,32 @@ def register_audio_effects() -> None:
             parameters=(TrackSpec("semitones", "音程", -24, 24, 0, step=0.1, unit="半音"),),
             audio_process=_pitch,
             audio_history=lambda _values: PITCH_WINDOW_SECONDS,
+        ),
+        # #336 一定に鳴り続ける雑音を下げる AI の reduce_noise もこれを積む
+        EffectDefinition(
+            kind=DENOISE_KIND,
+            label="ノイズ除去",
+            category="音",
+            parameters=(
+                TrackSpec(
+                    "reduction",
+                    "下げる量",
+                    *REDUCTION_DB_RANGE,
+                    DEFAULT_REDUCTION_DB,
+                    step=1,
+                    unit="dB",
+                ),
+                TrackSpec(
+                    "sensitivity",
+                    "雑音とみなす幅",
+                    *SENSITIVITY_DB_RANGE,
+                    DEFAULT_SENSITIVITY_DB,
+                    step=0.5,
+                    unit="dB",
+                ),
+            ),
+            audio_process=denoise,
+            audio_history=denoise_history,
         ),
     )
     for definition in definitions:
