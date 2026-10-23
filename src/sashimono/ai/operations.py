@@ -2924,15 +2924,20 @@ def _scene_sheet(
         )
     except SheetError as exc:
         raise ToolError(str(exc)) from exc
-    notes = host.scene_notes(media)
+    # 説明ありと書くのは、両端が同じ場面（remember と同じ _span_key）の説明があるときだけ
+    # 真ん中が古い説明の中にあるかで見ると、解析の途中で書いた仮の末尾の場面（解析できた所で
+    # 切った物）の説明が、解析を終えてのびた場面まで覆って見え、AI が見直さずにのびた分が
+    # 説明の無いまま検索から抜ける 途中の場面を書かせない方は採らない 長い素材は解析を
+    # 待たずに前から説明を作れる方が良く、両端で見れば仮の場面の説明も前の分の説明として残る
+    described = {_span_key(note) for note in host.scene_notes(media)}
     numbers = range(query.offset + 1, query.offset + len(chosen) + 1)
     labels = [
         f"{number}) {_seconds_label(head)}〜{_seconds_label(tail)} 秒"
         for number, (head, tail) in zip(numbers, chosen, strict=True)
     ]
     listed = [
-        label + ("（説明あり）" if any(n.start <= middle < n.end for n in notes) else "")
-        for label, middle in zip(labels, middles, strict=True)
+        label + ("（説明あり）" if (round(head, 2), round(tail, 2)) in described else "")
+        for label, (head, tail) in zip(labels, chosen, strict=True)
     ]
     caption = (
         f"素材 {media.id} の場面 {query.offset + 1}〜{query.offset + len(chosen)}"

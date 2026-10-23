@@ -55,10 +55,12 @@ class SceneNoteStore:
             held = self._held.get(key)
         if held is not None:
             return held
+        # 読むのは錠の外（探す窓の裏のスレッドから呼ばれ、読む間に AI の書き込みを待たせない）
+        # 読む間に remember が書いた物があれば、そちらを残す 読んだ物で上書きすると、書く前の
+        # 控えを読んだ古い中身で書いたばかりの説明を消し、同じ起動の中で引けなくなる
         loaded = _load(self._store.path_for(NAMESPACE, key, SUFFIX))
         with self._lock:
-            self._held[key] = loaded
-        return loaded
+            return self._held.setdefault(key, loaded)
 
     def remember(self, media: MediaItem, notes: Sequence[SceneNote]) -> None:
         """素材の説明を丸ごと置き換える 空なら控えを消す

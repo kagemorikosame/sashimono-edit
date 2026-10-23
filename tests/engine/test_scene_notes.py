@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from fractions import Fraction
 from pathlib import Path
 
@@ -62,6 +63,35 @@ class TestSceneNoteStore:
         path = store.prepare(NAMESPACE, notes_key(media.path), SUFFIX)
         path.write_text("{壊れた", encoding="utf-8")
         assert SceneNoteStore(store).notes(media) == ()
+
+    def test_notes_written_while_reading_are_kept(
+        self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、探す窓の裏のスレッドが控えを読んでいる間に AI が説明を書くと、読み終えた
+        # 古い中身（空）が書いたばかりの説明を上書きし、同じ起動の中で引けなくなる
+        from sashimono.engine.cache import scene_notes as module
+
+        notes = SceneNoteStore(store)
+        reading = threading.Event()
+        written = threading.Event()
+        original = module._load
+
+        def slow(path: Path) -> tuple[SceneNote, ...]:
+            loaded = original(path)
+            reading.set()
+            assert written.wait(5)
+            return loaded
+
+        monkeypatch.setattr(module, "_load", slow)
+        seen: list[tuple[SceneNote, ...]] = []
+        reader = threading.Thread(target=lambda: seen.append(notes.notes(media)))
+        reader.start()
+        assert reading.wait(5)
+        notes.remember(media, NOTES)
+        written.set()
+        reader.join(5)
+        assert seen == [NOTES]
+        assert notes.notes(media) == NOTES
 
     def test_an_unreadable_place_reads_as_no_notes(
         self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch

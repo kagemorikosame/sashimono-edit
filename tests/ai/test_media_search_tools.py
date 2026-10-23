@@ -324,6 +324,23 @@ class TestTheSheet:
         assert isinstance(result, ImageResult)
         assert "1) 0〜4 秒（説明あり）" in result.caption
 
+    def test_a_note_on_a_provisional_scene_does_not_cover_the_longer_one(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、解析の途中で書いた仮の末尾の場面（0〜4 秒）の説明が、解析を終えてのびた
+        # 場面（0〜5 秒）まで覆って「説明あり」になり、AI が見直さずにのびた分が検索から抜ける
+        media = self._host(host, [])
+        host.notes[media.path] = (SceneNote(start=0.0, end=4.0, text="海"),)
+        result = SHEET(host, {"media_id": str(media.id), "max_scene_seconds": 5})
+        assert isinstance(result, ImageResult)
+        assert "1) 0〜5 秒 / 2) 5〜10 秒" in result.caption
+        assert "説明あり" not in result.caption
+        # 両端が同じ場面の説明は、写し直して 3 桁より細かい差が出ても説明ありのまま
+        host.notes[media.path] = (SceneNote(start=0.0, end=5.0001, text="海"),)
+        again = SHEET(host, {"media_id": str(media.id), "max_scene_seconds": 5})
+        assert isinstance(again, ImageResult)
+        assert "1) 0〜5 秒（説明あり）" in again.caption
+
     def test_it_waits_for_the_analysis_on_the_ai_thread(self, host: FakeHost) -> None:
         # 壊れると、解析が終わる前の頼みで、画面のスレッドが止まるか、場面の無い 1 枚が来る
         media = _media(host)
