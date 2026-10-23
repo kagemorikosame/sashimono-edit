@@ -63,39 +63,19 @@ COMMANDS_WITHOUT_TOOLS: dict[str, Note] = {
         "設定パネルが前の版の縁取りを層へ移す下ごしらえ AI の縁取りの道具は層の ID を指すので、"
         "前の版の縁は指せない"
     ),
-    "ClearKeyframes": _person("キーフレームをまとめて消す（設定パネル）"),
-    "ConvertLayers": _person("置き方の方式の切り替え（ファイルメニュー）で置いた物を移す"),
-    "InsertGap": _person("挿入貼り付け（編集メニュー）が後ろを押して空ける"),
-    "MergeWithNext": _person("字幕を次の字幕とつなぐ（字幕パネル）"),
-    "MoveEffect": _person("エフェクトの並べ替え（設定パネル）"),
     "MoveKeyframe": _person("キーフレームを動かす（設定パネル・グラフエディタ）"),
-    "MoveTrack": _person("トラックの並べ替え（トラックの見出しのドラッグ）"),
-    "RemoveKeyframe": _person("キーフレームの削除（設定パネル・グラフエディタ）"),
-    "RemoveMedia": _person(
-        "素材一覧から素材を外す AI が消せるのは作品の中のクリップだけ（#341 の試験が止める） "
-        "足すときは取り消せない操作と同じく毎回確かめる（2026-10-14 の利用者の決定）"
-    ),
-    "RemoveScene": _person("シーンの削除（シーンメニュー）"),
-    "RemoveSegment": _person("字幕 1 枚の削除（字幕パネル）"),
-    "RemoveTrack": _person("トラックの削除（タイムラインの右クリック）"),
     "RenameProject": _neither(
         "作品の名前は保存したファイルの名前から付く 名前だけを変える入口は画面にも AI にも無い "
         "残すのは、作品を 1 段だけ確実に変える一番小さい命令として、履歴・取り消し・控え・"
         "自動保存の試験（tests の 11 ファイル）と字幕の速さを測る tools/bench_subtitles.py "
         "が使うため 外すと、それらが中身を変える命令を別に持つことになる"
     ),
-    "RenameScene": _person("シーンの名前の変更（シーンメニュー）"),
-    "RenameTrack": _person("トラックの名前の変更（トラックの見出し）"),
-    "SetBlending": _person("半透明の重ね合わせの方法（プロジェクト設定）"),
     "SetFrameRate": _person("フレームレートの変更（プロジェクト設定・動画に合わせる）"),
-    "SetLayerMode": _person("置き方の方式の切り替え（ファイルメニュー・プロジェクト設定）"),
     "SetStyleGuide": _person(
         "編集の方針は本人が AI に渡す決まりで、AI が緩められると意味が無いので"
         "道具を足さない（#343）",
         issue=None,
     ),
-    "SetWorkArea": _person("書き出し範囲の設定と解除（編集メニュー・目盛りのドラッグ）"),
-    "SplitSegment": _person("字幕 1 枚を 2 つに割る（字幕パネル）"),
     "TrimClips": _person(
         "選んだクリップをまとめて伸び縮み（タイムラインのドラッグ） AI は trim_clip を 1 本ずつ"
         "呼べば同じ形になるが、取り消しが本数だけ要る"

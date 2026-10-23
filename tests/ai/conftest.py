@@ -17,18 +17,27 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.budget import DEFAULT_IMAGE_EDGE
-from sashimono.ai.host import EXPORT_RUNNING, CompatReport, ExportRequest, ToolError, ViewState
+from sashimono.ai.host import (
+    EXPORT_RUNNING,
+    UNSAVED_REFUSAL,
+    CompatReport,
+    ExportRequest,
+    ToolError,
+    ViewState,
+)
 from sashimono.ai.outbound import ASKED, SendChoice
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
-from sashimono.core.io.serialize import save_project
+from sashimono.core.io.serialize import ProjectFileError, load_project, save_project
 from sashimono.core.io.subtitles import save_subtitles
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import (
@@ -77,6 +86,8 @@ class FakeHost:
 
     def __init__(self, project: Project) -> None:
         self._document = Document(project)
+        #: 保存した（か開いた・作った）時の作品 is_modified はこれと比べる
+        self.saved_project = project
         self.frame = 0
         self.selection: tuple[ClipId, ...] = ()
         self.scene: SceneId | None = None
@@ -162,6 +173,19 @@ class FakeHost:
         self.rules = LookRules()
         #: テンプレートの棚（#328） 既定は空 本人の AviUtl2 の置き場は読まない
         self.shelf: list[TemplateEntry] = []
+        #: タイムラインのコピーした中身（#349） 人の Ctrl+C と同じ置き場のふり
+        self.copied: ClipboardContent | None = None
+        #: 本人の設定の挿入貼り付けの押し出し方 既定は設定と同じく全トラック
+        self.insert_all_tracks = True
+        #: スクリプトの置き場（#349） 既定は空 本人の AviUtl の置き場は読まない
+        self.scripts: list[ScriptEntry] = []
+        self.reloads = 0
+        #: 配置のテンプレート（#349） 頼まれた（クリップ, 寄せ先）と、返す命令
+        self.alignments: list[tuple[ClipId, str]] = []
+        self.aligned: list[Command] | None = None
+        #: OS のクリップボードへ置いた静止画のフレームと文字（#349）
+        self.copied_frames: list[int] = []
+        self.copied_texts: list[str] = []
         #: 人が見ている表示（#352） 試験が入れる 既定は何も選んでいない、頭の 10 秒が見えている画面
         self.screen = ViewState(
             visible_frames=(0, 300),
@@ -235,6 +259,73 @@ class FakeHost:
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self.selection = tuple(clip_ids)
+
+    def copy_snapshot_image(self, frame: int) -> int:
+        # 絵は描かない（偽物） 本物と同じく終わりを指せば最後のフレームを描いたことにする
+        drawn = max(0, min(frame, self.project.duration - 1))
+        self.copied_frames.append(drawn)
+        return drawn
+
+    def copy_text(self, text: str) -> None:
+        self.copied_texts.append(text)
+
+    def reload_scripts(self) -> int:
+        self.reloads += 1
+        return len(self.scripts)
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        return tuple(self.scripts)
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        # 偽物は描かないので枠を持たない 試験が寄せた後の命令（か None）を入れる
+        self.alignments.append((clip_id, anchor))
+        return self.aligned
+
+    @property
+    def is_modified(self) -> bool:
+        # 本物と同じく同一性で比べる 保存した（か開いた・作った）時の作品のままか
+        return self._document.project is not self.saved_project
+
+    def open_project_file(self, path: Path) -> None:
+        # 本物と同じく、保存していなければ断り、AI の指示の段を開いたまま差し替える
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        try:
+            project = load_project(path)
+        except ProjectFileError as exc:
+            raise ToolError(f"開けませんでした: {exc}") from exc
+        self._document.reset(project, within_checkpoint=self._document.in_checkpoint)
+        self.saved_at = path
+        self.saved_project = project
+        self.scene = None
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        settings = ProjectSettings()
+        if resolution is not None:
+            settings = replace(settings, width=resolution[0], height=resolution[1])
+        if frame_rate is not None:
+            settings = replace(settings, frame_rate=frame_rate)
+        created = Project.create(settings)
+        self._document.reset(created, within_checkpoint=self._document.in_checkpoint)
+        self.saved_at = None
+        self.saved_project = created
+        self.scene = None
+
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        return self.copied
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        self.copied = content
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        return self.insert_all_tracks
 
     def apply_commands(self, commands: list[Command], label: str) -> None:
         if not commands:
@@ -418,6 +509,7 @@ class FakeHost:
     def write_project(self, path: Path, *, adopt: bool, expect: Expected) -> str:
         # 画面の〔保存〕と同じく、作品のファイルの書き方（書いてから置き換える）で書く
         save_project(self._document.project, path, expect=expect)
+        self.saved_project = self._document.project
         self.written.append(path)
         if adopt:
             self.saved_at = path

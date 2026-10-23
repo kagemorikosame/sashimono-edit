@@ -116,6 +116,7 @@ class ExportDialog(QDialog):
         decode_threads: int = DEFAULT_DECODE_THREADS,
         scene_name: str | None = None,
         smooth_history: bool = True,
+        gpu_color: bool = True,
         folder: Path | None = None,
         chapters: bool = True,
         encoder_priority: str = PRIORITY_AUTO,
@@ -147,6 +148,8 @@ class ExportDialog(QDialog):
         self._pipeline_depth = pipeline_depth
         self._decode_threads = decode_threads
         self._smooth_history = smooth_history
+        #: 色変換を GPU で行うか（#372） 機械の駆動との相性で決まる物なので、ここも本人の設定から
+        self._gpu_color = gpu_color
         self._encoder_priority = encoder_priority
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
@@ -361,6 +364,7 @@ class ExportDialog(QDialog):
             pipeline_depth=self._pipeline_depth,
             decode_threads=self._decode_threads,
             smooth_history=self._smooth_history,
+            gpu_color=self._gpu_color,
             chapters=self._chapters.isChecked(),
             encoder_priority=self._encoder_priority,
         )

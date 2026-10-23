@@ -17,9 +17,11 @@ from typing import Protocol
 
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import Command, Document, ParamPath
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
@@ -27,6 +29,7 @@ from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, SegmentId
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
+from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import CheckRequest, CheckState
@@ -35,6 +38,7 @@ from sashimono.engine.vision import ScreenKind
 __all__ = [
     "EXPORT_RUNNING",
     "EXPORT_STATES",
+    "UNSAVED_REFUSAL",
     "CompatReport",
     "EditorHost",
     "ExportRequest",
@@ -42,6 +46,13 @@ __all__ = [
     "ToolError",
     "ViewState",
 ]
+
+#: 保存していない変更があるのに作品を閉じようとした AI の開く・新規を断る文（#349）
+#: 2026-10-20 利用者の決定 黙って捨てず、保存するか人が窓で決めるかを案内する
+UNSAVED_REFUSAL = (
+    "保存していない変更があるので、今の作品を閉じません 先に save_project で保存するか、"
+    "人が〔開く…〕〔新規〕の窓で決めてください"
+)
 
 #: 書き出しの様子（:meth:`EditorHost.export_status` の ``state``）
 #: 走っている間は「書いている」「置いている」 終わった後は残りのどれか
@@ -199,6 +210,92 @@ class EditorHost(Protocol):
 
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         """選択を丸ごと入れ替える 空なら選択を解く"""
+        ...
+
+    def copy_snapshot_image(self, frame: int) -> int:
+        """``frame`` を画面の〔静止画をコピー〕と同じ描き方で OS のクリップボードへ置く（#349）
+
+        描いたフレームを返す（終わりを指していれば最後のフレーム） 作品は変えない
+        絵はアプリの外へ出るので、道具は映像の絵を送ると書き、送る前の同意（#342）に乗せる
+        """
+        ...
+
+    def copy_text(self, text: str) -> None:
+        """文字を OS のクリップボードへ置く（字幕パネルの〔文字をコピー〕と同じ #349）"""
+        ...
+
+    def reload_scripts(self) -> int:
+        """置き場の AviUtl スクリプトを読み直し、読み込んだ本数を返す
+
+        画面の〔スクリプトを読み直す〕と同じ（#349）
+
+        作品も本人の設定も変えない 置き場へ足したスクリプトを、アプリを開き直さずに使えるようにする
+        """
+        ...
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        """置けるカスタムオブジェクト（``.obj`` ``.obj2`` #349） 読むだけ
+
+        タイムラインの〔追加〕→〔カスタムオブジェクト〕と同じ一覧 名前は本人の置き場の持ち物
+        なので、返す道具はアプリの設定を送ると書く
+        """
+        ...
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """クリップを画面の ``anchor`` へ寄せる命令（設定パネルの配置のテンプレート #349）
+
+        枠は今のコマで描いた物から取る 再生位置に映っていない・ロックしている物は ``None``
+        命令を作るだけで実行しない（AI の印で :meth:`apply_commands` へ渡す）
+        """
+        ...
+
+    @property
+    def is_modified(self) -> bool:
+        """保存してから変えたか AI の開く・新規（#349）は、変えていれば今の作品を閉じない"""
+        ...
+
+    def open_project_file(self, path: Path) -> None:
+        """作品（``.sme``）を開いて今の作品と差し替える（AI の開く #349） 画面の〔開く…〕と同じ処理
+
+        ``path`` は確かめ済みの場所 窓は出さない 保存していない変更がある・読めない・別の窓で
+        開いているときは :class:`ToolError` AI の指示の段を開いていれば、その指示の残りの
+        編集は断る（:attr:`~sashimono.core.commands.Document.replaced_in_checkpoint`）
+        """
+        ...
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        """新しい作品へ差し替える（AI の新規 #349） 省いた値は本人の「新しい作品」の設定
+
+        保存していない変更があれば :class:`ToolError` 指示の残りの編集は開くと同じく断る
+        """
+        ...
+
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        """タイムラインのコピーした中身 無ければ ``None``
+
+        人の Ctrl+C・Ctrl+X と同じ置き場（#349）
+        """
+        ...
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        """AI のコピー・切り取りの中身を置く 人の Ctrl+V でも同じ物が貼れること
+
+        作品の中身の写しを置くだけで、アプリ自身の設定は変えない（読むだけの決定 #350 の外）
+        """
+        ...
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        """挿入貼り付けで全トラックを押し出すか
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.insert_paste`）
+
+        AI の挿入貼り付けも人の Ctrl+Shift+V と同じ押し出し方にする 食い違うと、頼み方で
+        ほかのトラックの字幕や音が貼った所の後ろでずれたりずれなかったりする
+        """
         ...
 
     def apply_commands(self, commands: list[Command], label: str) -> None:
