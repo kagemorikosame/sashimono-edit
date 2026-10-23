@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import threading
@@ -184,9 +185,51 @@ def test_waiting_for_the_first_picture_is_bounded() -> None:
     rotation = probe_module._display_rotation(
         cast(av.container.InputContainer, container), cast(av.VideoStream, object())
     )
-    assert rotation == 0
+    # 読めなかったと返す 黙って 0 にすると、縦撮りが横倒しのまま覚えられる（#407）
+    assert rotation is None
     # 上限ちょうどで止まる 数えてから止めると、上限の次の 1 つまで読む（#227 の CodeRabbit）
     assert container.read == ROTATION_PACKET_LIMIT
+
+
+def _fail_rotation(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
+    """頭の ``times`` 回だけ回転を読めなかったことにする 読みに来た回数を返す"""
+    real = probe_module._display_rotation
+    calls: list[int] = []
+
+    def flaky(container: av.container.InputContainer, stream: av.VideoStream) -> int | None:
+        calls.append(1)
+        if len(calls) <= times:
+            return None
+        return real(container, stream)
+
+    monkeypatch.setattr(probe_module, "_display_rotation", flaky)
+    return calls
+
+
+def test_an_unread_rotation_is_read_again_at_once(
+    media_dir: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1 度読めなかっただけで 0 にすると、スマホの縦撮りが横倒しで読み込まれる
+    rotated = make_rotated(media_dir, "unread_once_rot90.mp4", sample_av.path, 90)
+    calls = _fail_rotation(monkeypatch, 1)
+    assert probe_media(rotated).video_streams[0].rotation == 270
+    assert len(calls) == 2
+
+
+def test_an_unread_rotation_is_not_remembered(
+    media_dir: Path,
+    sample_av: SampleMedia,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 読めなかった 0 を覚えると、次に開くデコーダ（再生・書き出し・顔の位置）も横倒しのまま
+    # 黙っていると、後から記録を見ても横倒しの訳が分からない
+    rotated = make_rotated(media_dir, "unread_twice_rot90.mp4", sample_av.path, 90)
+    _fail_rotation(monkeypatch, 2)
+    with caplog.at_level(logging.WARNING, logger=probe_module.__name__):
+        assert probe_media(rotated).video_streams[0].rotation == 0
+    assert "回転を読めなかった" in caplog.text
+    assert probe_media(rotated).video_streams[0].rotation == 270
 
 
 def test_the_same_file_asked_at_once_is_opened_once(

@@ -123,6 +123,8 @@ class FakeHost:
         self.seams = SeamStyle()
         #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
         self.reframing = ReframeStyle()
+        #: 画面の解析の部品（#324）が入っているか 既定は CI と同じく入っていない
+        self.vision_ready = False
         #: AI に見せる絵の長い辺の上限（#344）の本人の設定 既定は設定と同じ
         self.image_edge = DEFAULT_IMAGE_EDGE
         self.check_requests: list[CheckRequest] = []
