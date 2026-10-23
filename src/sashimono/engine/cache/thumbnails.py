@@ -90,8 +90,10 @@ class Filmstrip:
         return self.sheet[:, start : start + self.tile_width]
 
 
-def filmstrip_key(path: Path, interval: Fraction, height: int) -> str:
-    return media_key(path, extra=f"fs{FORMAT_VERSION}:{interval}:{height}")
+def filmstrip_key(path: Path, interval: Fraction, height: int, *, stream: int | None = None) -> str:
+    """控えの鍵 ``stream`` は 2 本目以降の映像の流れだけが持つ（1 本目は前の版と同じ鍵）"""
+    picked = "" if stream is None else f":v{stream}"
+    return media_key(path, extra=f"fs{FORMAT_VERSION}:{interval}:{height}{picked}")
 
 
 def build_filmstrip(
