@@ -2506,6 +2506,11 @@ class Pending:
     wait: Callable[[float], bool]
     seconds: float
     then: Callable[[], object]
+    #: 中断されたときに裏の仕事を止める口 どのスレッドから呼んでもよい 省くと止めない
+    #: 中断すると ``then`` は呼ばれない 道具だけが使う仕事（ナレーションの声 #335）はこれを渡す
+    #: 渡さないと、待つのをやめた後も裏のスレッドが残りをエンジンへ頼み続ける 結果を後でも
+    #: 使う仕事（場面の解析・検査）と、人が許した書き出しは渡さない（docs/development.md）
+    stop: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -7549,7 +7554,8 @@ def _list_voices(host: EditorHost, arguments: dict[str, Any]) -> object:
         remember_voice_catalog(catalog)
         return _voices_result(settings, catalog, policy, terms_for, arguments)
 
-    return Pending(wait=job.wait, seconds=VOICE_LIST_WAIT, then=then)
+    # 中断されたら声の一覧を読むのもやめる（結果は then でしか使わない）
+    return Pending(wait=job.wait, seconds=VOICE_LIST_WAIT, then=then, stop=job.abandon)
 
 
 def _voices_result(
@@ -7838,7 +7844,8 @@ def _generate_narration(host: EditorHost, arguments: dict[str, Any], consent: Co
         # 待った後の続き 書く先は人が許した確かめの場所（consent.target）で、作り直さない
         return write_and_place_narration(host, plan, consent, job.take(), host.apply_commands)
 
-    return Pending(wait=job.wait, seconds=NARRATION_WAIT, then=_place_when_made)
+    # 中断されたら残りの文をエンジンへ頼まない 作った声は then でしか使わない
+    return Pending(wait=job.wait, seconds=NARRATION_WAIT, then=_place_when_made, stop=job.abandon)
 
 
 def write_and_place_narration(

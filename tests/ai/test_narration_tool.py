@@ -484,6 +484,35 @@ class TestMakingAndPlacing:
         assert "開き直した" in str(box.get("error"))
         assert narrating.narrations == []
 
+    def test_interrupting_stops_asking_the_engine(
+        self, narrating: FakeHost, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、人が AI の〔中断〕を押しても裏のスレッドが残り、最長 5 分ほど残りの文を
+        # エンジンへ頼み続ける（CPU とエンジンを使い続け、作った声は誰も使わない #401 の
+        # CodeRabbit の指摘）
+        _listed(narrating)
+        engine.synthesis_delay = 0.4
+        script = "一つ目の文です。二つ目の文です。三つ目の文です。四つ目の文です。"
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        done, box = call_in_thread(bridge, GENERATE, {"text": script})
+        deadline = time.monotonic() + 15
+        cancelled = False
+        while not done.is_set() and time.monotonic() < deadline:
+            bridge.pump()
+            approval = bridge.take_approval()
+            if approval is not None:
+                approval.allow()
+            if not cancelled and engine.texts:
+                bridge.cancel()
+                cancelled = True
+            time.sleep(0.005)
+        assert done.is_set()
+        assert "中断" in str(box.get("error"))
+        # 中断の後も裏で頼み続けていないか、文 2 つ分を作れる時間を待ってから見る
+        time.sleep(1.2)
+        assert len(engine.texts) == 1
+        assert narrating.narrations == []
+
     def test_moving_the_project_while_the_voice_is_made_is_refused(
         self, narrating: FakeHost, engine: FakeVoiceEngine, tmp_path: Path
     ) -> None:

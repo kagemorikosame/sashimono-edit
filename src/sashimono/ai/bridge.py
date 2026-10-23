@@ -359,6 +359,10 @@ class EditorBridge:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
                 return
+        # 中断された この後 ``then`` は呼ばれない（:meth:`call` が断る） 道具だけが使う裏の仕事は
+        # ここで止める 止めないと、ナレーションの残りの文をエンジンへ頼み続ける（#335）
+        if pending.stop is not None:
+            pending.stop()
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
