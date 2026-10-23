@@ -1757,7 +1757,7 @@ class ChatPanel(QWidget):
         if not self._show_handoffs:
             return
         self._handoff = handoff
-        self._say(HANDOFF_WHO, handoff.text())
+        self._say(HANDOFF_WHO, handoff.text(self._host.document))
         self._handoff_text.setText(f"引き継ぎ: {handoff.headline()}")
         self._handoff_box.setVisible(True)
 
@@ -1771,7 +1771,7 @@ class ChatPanel(QWidget):
         if handoff is None:
             return
         # アプリのクリップボードの口を通す 試験で偽物へ差し替えられ、本人のコピーを消さない
-        clipboard().setText(handoff.text())
+        clipboard().setText(handoff.text(self._host.document))
         self.status_message.emit("引き継ぎの要約をコピーしました")
 
     def continue_from_handoff(self) -> None:

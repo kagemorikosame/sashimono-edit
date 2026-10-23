@@ -14,10 +14,12 @@ from typing import Any
 import pytest
 
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.fixes import fix_label
 from sashimono.ai.handoff import (
     AI_WORDS_LIMIT,
     GET_HANDOFF,
     ITEMS_LIMIT,
+    Handoff,
     HandoffShelf,
     StopReason,
     TurnRecord,
@@ -86,10 +88,11 @@ class TestRecord:
             record.refused("split_clip（許可しませんでした）")
         else:
             record.stop(reason, "訳の文")
-        handoff = record.handoff(Document(loaded), "AI: 切って")
+        document = Document(loaded)
+        handoff = record.handoff(document, "AI: 切って")
         assert handoff is not None
         assert handoff.reason is reason
-        assert reason.label in handoff.text()
+        assert reason.label in handoff.text(document)
 
     def test_an_interrupt_wins_over_the_error_that_follows_it(self, loaded: Project) -> None:
         # 壊れると、人が〔中断〕を押したのに、巻き添えの「中断されました」のエラーで AI が
@@ -171,8 +174,8 @@ class TestChangesComeFromTheHistory:
         assert handoff.ai_words == "何も変えていません"
         # 書いた取り消しの段の名前が、本当に次に戻す段の名前と同じ
         assert document.undo_label == handoff.checkpoint
-        assert "Ctrl+Z" in handoff.undo_note()
-        assert "AI の言葉" in handoff.text()
+        assert "Ctrl+Z" in handoff.undo_note(document)
+        assert "AI の言葉" in handoff.text(document)
 
     def test_an_instruction_that_changed_nothing_says_so(self, loaded: Project) -> None:
         # 壊れると、何も変えずに止まった指示でも「Ctrl+Z で戻す」と案内し、人の前の編集を戻させる
@@ -186,8 +189,8 @@ class TestChangesComeFromTheHistory:
         handoff = record.handoff(document, "AI: 切って")
         assert handoff is not None
         assert handoff.changed is False
-        assert "Ctrl+Z" not in handoff.text()
-        assert handoff.as_dict()["checkpoint"] is None
+        assert "Ctrl+Z" not in handoff.text(document)
+        assert handoff.as_dict(document)["checkpoint"] is None
 
     def test_a_split_instruction_is_pointed_out(self, loaded: Project) -> None:
         # 壊れると、人が途中で変えて 2 段に割れた指示を、Ctrl+Z 1 回で戻し切れると案内してしまう
@@ -204,7 +207,7 @@ class TestChangesComeFromTheHistory:
         handoff = record.handoff(document, "AI: 冒頭を切って")
         assert handoff is not None
         assert handoff.split is True
-        assert_split_note(handoff.undo_note())
+        assert_split_note(handoff.undo_note(document))
         # 人が割る前の手も変えた手に残る 割った所で段の中の名前は消えるので、写しておかないと抜ける
         assert handoff.changes == ("分割", "分割")
 
@@ -223,7 +226,7 @@ class TestChangesComeFromTheHistory:
         assert handoff is not None
         assert handoff.changes == ("分割", "分割")
         assert "変えた手 2 件" in handoff.headline()
-        assert "・無し" not in handoff.text()
+        assert "・無し" not in handoff.text(document)
 
     def test_capture_outside_an_instruction_keeps_what_was_taken(self, loaded: Project) -> None:
         # 壊れると、段を閉じた後にもう 1 度写すと空で上書きし、変えた手が要約から消える
@@ -237,6 +240,104 @@ class TestChangesComeFromTheHistory:
         handoff = record.handoff(document, "AI: 冒頭を切って")
         assert handoff is not None
         assert handoff.changes == ("分割",)
+
+
+def _cut(document: Document, by: Author) -> None:
+    """頭のクリップの真ん中で切る AI なら道具 1 回分の段にする"""
+    clip = document.project.timeline.tracks[0].clips[0]
+    frame = (clip.timeline_start + clip.timeline_end) // 2
+    if by is Author.AI:
+        with document.checkpoint("分割", by=Author.AI):
+            document.execute(SplitClip(clip.id, frame))
+    else:
+        document.execute(SplitClip(clip.id, frame), by=Author.PERSON)
+
+
+def _stopped_after(document: Document, moves: str) -> Handoff:
+    """指示の段を開いて ``moves`` を当て、止まった引き継ぎを作る
+
+    ``a`` は AI の道具 1 回 ``p`` は人の変更 ``|`` は検査の直しの回で区切る
+    """
+    document.begin_checkpoint("AI: 冒頭を切って", by=Author.AI)
+    for move in moves:
+        if move == "|":
+            assert document.split_checkpoint(fix_label(1))
+        else:
+            _cut(document, Author.AI if move == "a" else Author.PERSON)
+    record = TurnRecord()
+    record.begin("冒頭を切って")
+    record.capture(document)
+    document.end_checkpoint()
+    record.stop(StopReason.ERROR)
+    handoff = record.handoff(document, "AI: 冒頭を切って")
+    assert handoff is not None
+    return handoff
+
+
+#: 指示の中の手・止まった後の手 → 案内に出る言葉・出ない言葉
+#: 取り消しの先頭が AI の段か人の段か、直しの回で区切ったか、割れていないかを組み合わせる
+_NOTE_TABLE = [
+    # 割れていない AI の段が先頭
+    ("a", "", ["「AI: 冒頭を切って」を戻すと、この指示の前へ戻ります"], ["人の変更"]),
+    # 割れていないが、止まった後に人が変えて人の段が先頭
+    ("a", "p", ["先に戻るのは人の変更", "先にそれを戻す必要"], ["1 回押すと"]),
+    # 人が割り、最後に AI が変えた AI の段が先頭
+    ("apa", "", ["1 回押すと最後の AI の段", "一度には戻せません"], ["先に戻るのは"]),
+    # 人が割り、AI は何も足さずに止まった 人の段が先頭（CodeRabbit の指摘 #396）
+    ("ap", "", ["先に戻るのは人の変更", "一度には戻せません"], ["1 回押すと"]),
+    # 直しの回で区切り、直しの回の段が先頭
+    ("a|a", "", ["検査の直し", "この指示の前へ戻ります"], ["人の変更", "先に戻るのは"]),
+    # 直しの回で区切った後に人が変えた
+    ("a|a", "p", ["先に戻るのは人の変更"], ["1 回押すと"]),
+    # 止まった後に人が人の段を戻した 先頭は AI の前半の段に戻る（読む時の並びで書く）
+    ("ap", "u", ["1 回押すと最後の AI の段"], ["先に戻るのは"]),
+    # 止まった後に別の指示の AI の段が積まれた
+    ("a", "n", ["この指示の後に積んだ段"], ["1 回押すと"]),
+]
+
+
+class TestUndoNoteFollowsTheHistory:
+    @pytest.mark.parametrize(("inside", "after", "said", "unsaid"), _NOTE_TABLE)
+    def test_the_note_names_what_ctrl_z_undoes_now(
+        self,
+        loaded: Project,
+        inside: str,
+        after: str,
+        said: list[str],
+        unsaid: list[str],
+    ) -> None:
+        # 壊れると、AI が変えた後に人が変えて AI が何も足さずに止まったとき、「1 回押すと最後の
+        # AI の段だけが戻る」と案内し、信じて Ctrl+Z を押した人の変更が消える 引き継ぎを作った
+        # 後に人が足したり戻したりしても、読む時の並びで案内する
+        document = Document(loaded)
+        handoff = _stopped_after(document, inside)
+        for move in after:
+            if move == "p":
+                _cut(document, Author.PERSON)
+            elif move == "u":
+                document.undo()
+            else:
+                with document.checkpoint("AI: 別の指示", by=Author.AI):
+                    _cut(document, Author.AI)
+        note = handoff.undo_note(document)
+        for words in said:
+            assert words in note
+        for words in unsaid:
+            assert words not in note
+
+    def test_an_instruction_still_open_is_judged_as_closed(self, loaded: Project) -> None:
+        # 壊れると、環境が使えずに段を閉じる前に引き継ぎを作る道で、開いている段の手を
+        # 「この指示の後に積んだ段」と取り違える
+        document = Document(loaded)
+        document.begin_checkpoint("AI: 冒頭を切って", by=Author.AI)
+        _cut(document, Author.AI)
+        record = TurnRecord()
+        record.begin("冒頭を切って")
+        record.capture(document)
+        record.stop(StopReason.ERROR)
+        handoff = record.handoff(document, "AI: 冒頭を切って")
+        assert handoff is not None
+        assert "この指示の前へ戻ります" in handoff.undo_note(document)
 
 
 class TestShelf:
@@ -439,7 +540,7 @@ class TestFixLoop:
         assert handoff.changes == ("直す", "直す", "直す")
         assert handoff.split is False
         assert handoff.fix_parts == 2
-        note = handoff.undo_note()
+        note = handoff.undo_note(host.document)
         assert "検査の直し" in note
         assert "AI: 仕上げて" in note
         assert "人が変えた" not in note
@@ -458,7 +559,7 @@ class TestFixLoop:
         handoff = self._record(host, stop=True).handoff(host.document, "AI: 仕上げて")
         assert handoff is not None
         assert handoff.split is True
-        assert_split_note(handoff.undo_note())
+        assert_split_note(handoff.undo_note(host.document))
         # 直しの回で区切った手と、人が割った前半の手（直し 1）の両方が残る
         assert handoff.changes == ("直す", "直す", "直す")
 

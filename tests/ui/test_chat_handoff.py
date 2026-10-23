@@ -329,7 +329,7 @@ class TestTheUsageLimit:
         handoff = _shelved(widget)
         assert handoff is not None
         assert handoff.reason is StopReason.LIMIT
-        assert "中断を押しました" not in handoff.text()
+        assert "中断を押しました" not in handoff.text(widget._host.document)
 
     def test_an_instruction_held_for_the_parts_update_does_not_inherit_the_limit(
         self, recorded: tuple[ChatPanel, list[_RecordingSession]], monkeypatch: pytest.MonkeyPatch
@@ -424,7 +424,7 @@ class TestTheBox:
         widget._handoff_copy.click()
         handoff = _shelved(widget)
         assert handoff is not None
-        assert fake_clipboard.text() == handoff.text()
+        assert fake_clipboard.text() == handoff.text(widget._host.document)
 
     def test_continuing_fills_the_input_without_sending(
         self, recorded: tuple[ChatPanel, list[_RecordingSession]]

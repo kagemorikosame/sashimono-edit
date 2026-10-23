@@ -2257,7 +2257,7 @@ def _get_handoff(host: EditorHost, arguments: dict[str, Any]) -> object:
             "handoff": None,
             "note": "引き継ぎはありません（途中で止まった指示が無いか、その後に別の作品を開いた）",
         }
-    result = found.as_dict()
+    result = found.as_dict(document)
     # 止まった後に終えた指示の数（今の指示は数えない） 0 でなければ、その後の指示で形が
     # 変わっているかもしれない
     result["later_instructions"] = shelf.later

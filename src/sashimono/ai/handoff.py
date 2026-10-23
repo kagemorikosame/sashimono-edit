@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from sashimono.ai.fixes import fix_stop
-from sashimono.core.commands import Document
+from sashimono.ai.fixes import fix_label, fix_stop
+from sashimono.core.commands import Author, Document
 
 __all__ = [
     "AI_WORDS_LIMIT",
@@ -59,6 +59,8 @@ ITEMS_LIMIT = 8
 AI_WORDS_LIMIT = 400
 #: 指示の長さ 要約の頭に載せる 長い指示は道具の返事 1 回に収まる長さで切る
 INSTRUCTION_LIMIT = 400
+#: 検査の直しの回の段の名前の頭（「AI: 検査の直し（n 回目）」 #339） この指示の AI の段かを見分ける
+_FIX_HEAD = fix_label(1).split("（")[0]
 
 
 class StopReason(Enum):
@@ -141,15 +143,57 @@ class Handoff:
     generation: int = field(compare=False)
     #: 検査の直しの回ごとに区切って先に積んだ段の数（#339） 人が割ったのとは分けて案内する
     fix_parts: int = 0
+    #: 止まった指示の段を開いた番号（:attr:`Document.checkpoint_serial`） 段がまだ開いているときに、
+    #: 開いている段がこの指示の物かを見分ける
+    serial: int = field(default=0, compare=False)
 
     @property
     def changed(self) -> bool:
         return bool(self.changes) or self.split or bool(self.fix_parts)
 
-    def undo_note(self) -> str:
-        """取り消しの段の案内"""
+    def _own_step(self, label: str | None) -> bool:
+        """``label`` がこの指示の AI の段の名前か（指示の段か、検査の直しの回の段）"""
+        if label is None:
+            return False
+        return label == self.checkpoint or (bool(self.fix_parts) and label.startswith(_FIX_HEAD))
+
+    def undo_top(self, document: Document) -> tuple[str | None, Author | None, bool]:
+        """今 Ctrl+Z を押すと戻る段の（名前, 誰の段か, この指示の AI の段か）
+
+        引き継ぎを作った時の形ではなく、読む時の文書の取り消しの並びから見る 作った後に人が
+        足したり戻したりしていれば、先頭の段は変わっている 指示の段がまだ開いていれば、閉じた
+        後の形（段の中の手があれば、その指示の段が先頭）で答える
+        """
+        if document.in_checkpoint and document.steps_in_checkpoint:
+            label = document.checkpoint_label
+            ours = document.checkpoint_serial == self.serial
+            return label, document.undo_by, ours
+        label, by = document.undo_label, document.undo_by
+        return label, by, by is Author.AI and self._own_step(label)
+
+    def undo_note(self, document: Document) -> str:
+        """取り消しの段の案内 ``document`` の今の取り消しの並びに合わせて書く"""
         if not self.changed:
             return "作品は変えていません"
+        label, by, ours = self.undo_top(document)
+        if not ours:
+            # 先頭が人の段（AI が変えた後に人が変え、AI は何も足さずに止まった）か、後から
+            # 積んだ段 「1 回押すと AI の段が戻る」と読んで押すと、人の変更が戻る
+            # （CodeRabbit の指摘 #396）
+            if label is None:
+                return "取り消しの履歴に、この指示の段はもう残っていません"
+            whose = "人の変更" if by is Author.PERSON else "この指示の後に積んだ段"
+            head = (
+                f"今 Ctrl+Z で先に戻るのは{whose}（「{label}」）です この指示の段を戻すには、"
+                "先にそれを戻す必要があり、戻すとその変更も消えます"
+            )
+            if self.split:
+                return (
+                    f"{head} この指示は途中で人が変えたので、人の変更の段を挟んで 2 つ以上の段に"
+                    f"分かれています 「{self.checkpoint}」の前まで戻すと間の人の変更も"
+                    "一緒に戻ります 一度には戻せません"
+                )
+            return f"{head} その後で「{self.checkpoint}」まで戻すと、この指示の前へ戻ります"
         if self.split:
             # 人の段を挟んで AI の段が割れた 「Ctrl+Z でこの指示の前へ戻る」と言い切ると、AI の
             # 変更だけを安全に戻せると読める 1 回では最後の AI の段だけが戻り、指示の前まで
@@ -157,9 +201,9 @@ class Handoff:
             rounds = "（検査の直しの回ごとにも段を分けてあります）" if self.fix_parts else ""
             return (
                 "途中で人が変えたので、この指示は人の変更の段を挟んで 2 つ以上の段に分かれて"
-                f"います{rounds} Ctrl+Z では一度には戻せません 1 回押すと最後の AI の段だけが戻り、"
-                f"「{self.checkpoint}」の前まで戻すと間の人の変更も一緒に戻ります 人の変更より"
-                "前の AI の段は、人の変更を戻さずには戻せません"
+                f"います{rounds} Ctrl+Z では一度には戻せません 1 回押すと最後の AI の段"
+                f"（「{label}」）だけが戻り、「{self.checkpoint}」の前まで戻すと間の人の変更も"
+                "一緒に戻ります 人の変更より前の AI の段は、人の変更を戻さずには戻せません"
             )
         if self.fix_parts:
             # 直しの回ごとに段が分かれている（#339） 1 回で指示の前へ戻ると読むと、最後の回の
@@ -179,7 +223,7 @@ class Handoff:
         # どの指示の要約かも書く 続けて送った指示が走っている間も欄は残るので、取り違えないように
         return f"{self.reason.label}・{what}（{self.checkpoint}）"
 
-    def text(self) -> str:
+    def text(self, document: Document) -> str:
         """人が読み、コピーする全文"""
         lines = [f"引き継ぎ: {self.reason.label}", f"指示: {self.instruction}"]
         if self.detail:
@@ -192,7 +236,7 @@ class Handoff:
         lines.extend(f"・{change}" for change in self.changes)
         if not self.changes:
             lines.append("・無し")
-        lines.append(f"取り消し: {self.undo_note()}")
+        lines.append(f"取り消し: {self.undo_note(document)}")
         for head, items in (
             ("失敗した操作", self.failures),
             ("許されなかった物", self.refused),
@@ -205,7 +249,7 @@ class Handoff:
             lines.append(f"AI の最後の言葉（AI の言葉なので確かめてから使う）: {self.ai_words}")
         return "\n".join(lines)
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, document: Document) -> dict[str, Any]:
         """AI へ返す形 履歴から組んだ欄と、AI の言葉を分けて渡す"""
         return {
             "instruction": self.instruction,
@@ -218,7 +262,7 @@ class Handoff:
             "checkpoint": self.checkpoint if self.changed else None,
             "split_by_person": self.split,
             "fix_parts": self.fix_parts,
-            "undo": self.undo_note(),
+            "undo": self.undo_note(document),
             "failures": list(self.failures),
             "refused": list(self.refused),
             "remaining": list(self.remaining),
@@ -358,6 +402,7 @@ class TurnRecord:
             remaining=tuple(self._remaining),
             ai_words=self._ai_words,
             generation=document.generation,
+            serial=document.checkpoint_serial,
             fix_parts=self._fix_parts,
         )
 
