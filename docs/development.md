@@ -262,8 +262,10 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   同じ処理をホスト（`write_project` `start_export` `write_subtitles` `write_snapshot`）に頼む
   字幕のファイルも書いてから置き換える（`save_subtitles`） 書き出しの設定は画面の窓と同じ
   `engine/encode/choices.py` で作る 道具を数える見張りは `tests/ai/test_source_safety.py`
-  消せるのはプロジェクトの中のクリップ（と縁取りの層・目印）だけで、どれも取り消し 1 回で戻る
-  変える道具を足したら、そこの一覧へも足す
+  消せるのはプロジェクトの中の物だけで、どれも取り消し 1 回で戻る クリップ（と縁取りの層・目印）
+  のほか、画面と同じ道具（#349）でクリップの中のエフェクトとキーフレーム・字幕の 1 枚・空のトラック・
+  置いていないシーン・使っていない素材の素材一覧の行を消せる 入れ物（トラック・シーン・素材）は
+  中身があれば道具が断り、素材のファイルは消さない 変える道具・消す命令を足したら、そこの一覧へも足す
 - 書き出しは長いので裏で進める（`ui/ai_export.py`） まずアプリのキャッシュの仮のファイルへ書き、
   終わったら書き出し先のフォルダを持って確かめ直し、新しい仮のファイルへ写して名前を付け替え、
   名前の先が自分の書いた物かを照らす 進み具合は `export_status`、止めるのは `cancel_export` と
@@ -276,7 +278,9 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
 - アプリ自身の設定（好み・ショートカット・画面配置・更新・ヘルプ）は、AI は読むだけ
   `EditorHost` に変える口を足さない（試験が落ちる 足してよいのは作品の保存と書き出しの口
   `write_project` `start_export` `export_status` `export_waiter` `cancel_export` `write_subtitles`
-  `write_snapshot` だけ）
+  `write_snapshot` と、#349 の作品を扱う口（コピーの置き場 `set_clipboard`・開く `open_project_file`・
+  新規 `start_new_project`・スクリプトの読み直し `reload_scripts`・配置の命令 `alignment_commands`・
+  OS のクリップボードへ写す `copy_snapshot_image` `copy_text`）だけ）
 - 区分の値は操作の台帳（#347）にそのまま載せられる文字にしてある
 
 ### AI の道具が外へ送る物と同意（#342）
@@ -352,6 +356,45 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
 `same` か `partial` へ書き換え、当たる操作が無ければ `AI_ONLY` に訳を書く 1 行 1 操作なので、
 並行して道具を足す PR どうしがぶつかるのは、同じ操作の行を書き換えたときだけ
 数は `ledger.counts()` で出せる
+
+### 画面と同じ道具（#349）
+
+台帳の「まだできない」「一部だけできる」の #349 の行（着手のとき 56）を、本格的な編集に要る物から
+全部埋めた どれも画面の同じ操作と同じ命令を通る
+
+- コピー・切り取り・貼り付け（`copy_clips` `cut_clips` `paste_clips`）の置き場は、人の Ctrl+C・Ctrl+X と
+  同じタイムラインの 1 つ（`EditorHost.clipboard` `set_clipboard`） AI だけの置き場を持つと、人のコピーを
+  AI が貼れず、AI の切り取りを人が貼り戻せない 間に人がコピーすると中身が変わるので、貼った道具は貼った
+  クリップを返す 写しと貼りを 1 回で済ます `duplicate_clips` も残す コピーは作品を変えないので読むだけ
+  挿入貼り付けの押し出し方は本人の設定（`Preferences.insert_paste`）を `insert_paste_all_tracks` で読む
+- 消す道具は画面と同じ所で断る 中身のあるトラック（`remove_track`）・どこかに置いたシーン
+  （`remove_scene` 確かめは作品全体で行う 開いている別のシーンの中で確かめるとメインに置いた物を
+  数え落とす）・使っている素材（`remove_media` 断る文に素材の名前を書かない）
+- 場面切り替えの後の場面のエフェクトは `after` で指す（`add_effect` `set_param` `add_keyframe` と
+  エフェクトの外し・並べ替え・入り切り） 場面切り替え以外で受けると断る `list_clips` は場面切り替えに
+  だけ `after_effects` を出す
+- キーフレームの位置はクリップの頭から数える 位置を省いたときは再生ヘッドからクリップの頭を引く
+  （前の `add_keyframe` はタイムラインのフレームのまま渡していて、頭が 0 でないクリップで別の所に付いた）
+  打つ `add_keyframe` だけは、再生ヘッドがクリップの外なら近い端へ寄せる（#352） 消す・固める道具は
+  寄せない 外を指したのに端のキーを消さないため
+- 字幕の分割の時刻は、字幕パネルと同じ `core/projection.py` の `source_seconds_at` で決める
+- 開く・新規（`open_project` `new_project`）は取り消せない操作で、毎回確かめる（2026-10-20 利用者の決定）
+  保存していない変更があれば断り、`save_project` か人の窓を案内する（`UNSAVED_REFUSAL`） 開けるのは
+  作品のフォルダと書き出しの窓で前に選んだフォルダの中の `.sme` だけ（`safety.openable_project`）
+  画面の〔開く…〕〔新規〕と同じ差し替え（`MainWindow._adopt_opened` `_adopt_new`）を通し、別の窓で
+  開いている作品は尋ねずに断る AI の指示の段は開いたまま差し替え（`Document.reset` の
+  `within_checkpoint`）、その指示の残りの AI の編集は断る（`replaced_in_checkpoint`） 指示の取り消しの段が
+  前の作品を指すため 人の編集は止めない
+- AI が素材一覧から外した素材も、〔プールから外す〕と同じく解析とプロキシを捨てる（`_forget_media`）
+- 置き方の方式の切り替え（`switch_layer_mode`）はメインとすべてのシーンに掛かるので、シーンを開いて
+  いれば断る（開いたまま当てるとシーンの中へ包まれ、メインが前の方式に残る）
+- 配置のテンプレート（`align_clip`）は画面と同じくプレビューが今のコマで描いた枠から命令を作る
+  （`EditorHost.alignment_commands`） 標準の組み方（`use_standard_layout`）は設定パネルのボタンと同じ
+  `effects/unlock.py` の `unlock_commands` で値を作る
+- OS のクリップボードへ写す道具（`copy_snapshot` `copy_subtitle_text`）は読むだけ（2026-10-20 利用者の決定）
+  作品は変えないが絵と文字がアプリの外へ出るので、送る物を映像の絵・字幕と文字と書き、送る前の同意
+  （#342）に乗せる 描き方と写す口は画面の〔静止画をコピー〕〔文字をコピー〕と同じ
+  （`MainWindow._copy_snapshot` `system_clipboard.copy_text`）
 
 ### 人が画面で見ている物を AI も読む（#352）
 
@@ -520,7 +563,8 @@ AI の 1 回の指示は、始めから終わりまで 1 つの段（`Document.b
   `_keep_within_budget`）の後、送る前の同意と確かめの窓より先（断ると決まった道具のために尋ねない） 作品を変えない
   取り消し・やり直し・書き出しの中止（`undo` `redo` `cancel_export` `ai/fixes.py` の `PASSES_AFTER_LIMIT`）と、
   取り消せない保存と書き出し（`save_project` `save_project_as` `export_video` `export_subtitles`
-  `save_snapshot`）は通す
+  `save_snapshot`）と、取り消せない開く・新規（`open_project` `new_project` #349）は通す どれも毎回確かめの窓を
+  出し、開く・新規の後はその指示の編集を `Document.replaced_in_checkpoint` で断るので、直しの続きにはならない
 - 色とノイズの自動補正（#336 `auto_color` `reduce_noise`）は作品を変える取り消せる編集なので、
   上限の後は断る側に入れる（`PASSES_AFTER_LIMIT` に足さない） `FIXES` の直し方にも足さない
   `check_output` には色かぶりや雑音を見つける種類が無く、当てる問題が無い 近いのは暗い絵（`black`
@@ -576,6 +620,9 @@ AI の 1 回の指示と 1 日に、使う量の上限を持つ（`ai/budget.py`
 - 確かめるのはブリッジが道具を動かす前（`EditorBridge._keep_within_budget` 送る前の同意より先）
   絵を返す道具（`sends` に `Outbound.FRAMES`）は、これから送る 1 枚を足して確かめる 絵の上限は
   絵を返す道具だけを止める 文を書いているだけの間は止めない（1 回の応答の長さは API が区切る）
+  絵を AI へ返さずアプリの外（OS のクリップボード）へ出す道具（`copy_snapshot` #349）は、同意は
+  絵と同じく取るが、`Operation.frames_elsewhere` を立てて絵の数にも絵の上限にも入れない
+  （`Operation.returns_frames`）
 - 当たったときは `Preferences.ai_limit_action` に従う 既定は止めて尋ねる（パネルの中の箱 〔続ける〕で
   設定の量だけ広げる 1 日の分はその日のうち 返事が無いまま 10 分で止める） 尋ねずに止めるときは、
   止めた訳を会話の欄に書く どちらも AI へは「道具を使わず、したことと残りを伝えて終える」よう返す

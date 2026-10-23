@@ -188,17 +188,27 @@ class TestAppSettingsAreReadOnly:
             "cancel_export",
             # 完成物の検査（#337） 調べるのは作品の写しで、アプリの設定は変えない
             # 音量の基準（Preferences.check_loudness_target）は読むだけ（loudness_target）
+            # 配置のテンプレート（#349） 寄せる命令を作るだけで、当てるのは apply_commands
+            "alignment_commands",
             "check_state",
             "check_waiter",
             # 互換性レポートと画面の表示の写し（#352） 読むだけで、記録を消す・表示を変える口は無い
             "compat_report",
+            # OS のクリップボードへ絵と文字を置く（#349） 作品もアプリの設定も変えない
+            "copy_snapshot_image",
+            "copy_text",
             # 音量の推移のグラフ（#338） 渡された中身を絵にするだけ 作品にも設定にも触らない
             "draw_sound_graph",
             "export_status",
             "export_waiter",
+            # 開く・新規（#349） 作品を差し替える 取り消せない操作の道具からだけ呼ぶ
+            # アプリ自身の設定は変えない（新しい作品の初めの値は本人の設定を読むだけ）
+            "open_project_file",
             "probe",
             # 取り消しとやり直し（#333） 人のメニューと同じく作品の履歴を辿るだけ
             "redo",
+            # スクリプトの置き場を読み直す（#349） 作品も本人の設定も変えない
+            "reload_scripts",
             # 作品の外で覚えている名前を読むだけ（#342 伏せ字の表に入れる） 何も変えない
             "remembered_names",
             "render_png",
@@ -217,7 +227,11 @@ class TestAppSettingsAreReadOnly:
             "select_clip",
             "select_clips",
             "set_active_scene",
+            # コピー・切り取りの中身を置く（#349） 置くのは作品の中身の写しで、人の Ctrl+C と
+            # 同じタイムラインの置き場 アプリ自身の設定は変えない
+            "set_clipboard",
             "start_export",
+            "start_new_project",
             # コマを並べた絵を描くだけ 作品にもアプリの設定にも触らない（#320）
             "start_sheet",
             # 話者の分離（#323） 字幕に話者を付けるだけで、アプリの設定は変えない

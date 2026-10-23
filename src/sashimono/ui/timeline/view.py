@@ -2288,6 +2288,24 @@ class TimelineView(QWidget):
     def has_clipboard(self) -> bool:
         return self._clipboard is not None
 
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        """コピーした中身 AI の貼り付け（#349）も人の Ctrl+C と同じ置き場から取る"""
+        return self._clipboard
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        """AI のコピー・切り取り（#349）の中身を置く 人の Ctrl+V でも同じ物が貼れるように
+
+        AI だけの置き場を別に持つと、人がコピーした物を AI に「貼って」と頼めず、AI が
+        切り取った物を人が貼り戻せない
+        """
+        self._clipboard = content
+
+    @property
+    def insert_all_tracks(self) -> bool:
+        """挿入貼り付けで全トラックを押し出すか（本人の設定 :attr:`Preferences.insert_paste`）"""
+        return self._insert_all_tracks
+
     def copy_selected(self) -> bool:
         """選んでいるクリップをコピーする リンクした相手も一緒に入る"""
         if not self._selection:

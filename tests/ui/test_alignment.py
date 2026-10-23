@@ -6,6 +6,8 @@ X・Y の数を打たずに、見えている範囲ごと画面の端や中央�
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from PySide6.QtWidgets import QApplication, QToolButton
 
@@ -70,6 +72,29 @@ class TestThePreview:
         widget = make_widget(project, clip.id)
         seen = _Recorder(widget)
         assert not widget.align_selected("center")
+        assert seen.committed == []
+
+    @pytest.mark.parametrize("hidden_by", ["disabled", "muted", "other_solo"])
+    def test_a_clip_not_on_the_screen_is_not_aligned(
+        self, make_widget: MakeWidget, hidden_by: str
+    ) -> None:
+        # 壊れると、AI の〔揃える〕が無効・ミュート・ほかのソロで映っていない絵を動かして
+        # 「揃えた」と答える 画面では外枠が出ず人は揃えられないので、人と AI の相手が食い違う
+        clip = _clip(_media())
+        if hidden_by == "disabled":
+            clip = replace(clip, enabled=False)
+        project, _ = _project(clip, _clip(_media("ソロ.png")))
+        timeline = project.timeline
+        first, second = timeline.tracks
+        if hidden_by == "muted":
+            first = replace(first, muted=True)
+        elif hidden_by == "other_solo":
+            second = replace(second, solo=True)
+        project = project.with_timeline(replace(timeline, tracks=(first, second)))
+        widget = make_widget(project, clip.id)
+        seen = _Recorder(widget)
+        assert widget.alignment_commands(clip.id, "top_left") is None
+        assert not widget.align_selected("top_left")
         assert seen.committed == []
 
 
