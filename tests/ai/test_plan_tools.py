@@ -444,6 +444,46 @@ class TestWhatIsSent:
         assert box.get("error") is None
         assert "編集ソフ" not in str(box.get("result"))
 
+    @pytest.mark.parametrize(
+        ("text", "files", "quote_seen", "place_seen"),
+        [
+            # 字幕と文字を許した人 名前と場所も許せば計画はそのまま読める
+            (SendChoice.ALLOW, SendChoice.ALLOW, True, True),
+            # 字幕と文字を断った人 「」の中と「: 」の後を伏せ、素材の場所は見せる
+            (SendChoice.DENY, SendChoice.ALLOW, False, True),
+            # 名前と場所だけを断った人 素材の名前と場所は表で伏せ、計画の文は読める
+            (SendChoice.ALLOW, SendChoice.DENY, True, False),
+        ],
+    )
+    def test_each_choice_hides_only_what_was_refused(
+        self,
+        secret_host: FakeHost,
+        text: SendChoice,
+        files: SendChoice,
+        quote_seen: bool,
+        place_seen: bool,
+    ) -> None:
+        # 壊れると、名前と場所だけを断った人にまで計画の「」の中と「: 」の後が伏せ字になり、
+        # 〔続ける〕で頼んだ AI が止めた所の中身を読めない か、断った名前や字幕の切れ端が出る
+        _operation("set_plan")(
+            secret_host,
+            {
+                "goal": "「編集ソフ」の誤字を直す",
+                "steps": [f"{SECRET_PATH.name} の字幕を読む: 2 か所を直す"],
+            },
+        )
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices(
+            {Outbound.TEXT: text, Outbound.FILES: files, Outbound.FRAMES: SendChoice.DENY}
+        )
+        done, box = call_in_thread(bridge, _operation("get_plan"), {})
+        answer_sends(bridge, done, lambda request: pytest.fail(f"尋ねた: {request.kinds}"))
+        assert box.get("error") is None
+        sent = str(box.get("result"))
+        assert ("編集ソフ" in sent) is quote_seen
+        assert ("2 か所を直す" in sent) is quote_seen
+        assert (SECRET_PATH.name in sent) is place_seen
+
     def test_writing_a_plan_never_asks(self, host: FakeHost) -> None:
         # 壊れると、計画を書く前に送ってよいかの窓が出て、長い作業の頭で止まる
         bridge = EditorBridge(host)
