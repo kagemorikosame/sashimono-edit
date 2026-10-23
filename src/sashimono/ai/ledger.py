@@ -414,6 +414,10 @@ LEDGER: tuple[Entry, ...] = (
     # 無音カットの窓の「つなぎ目も処理する」は jet_cut の smooth と同じ（窓の中の欄なので行は無い）
     same("タイムラインの右クリック/速度を変える…", "set_speed"),
     same("タイムラインの右クリック/つなぎ目を目立たなくする…", "smooth_cuts"),
+    # 色と雑音の自動補正（#336） 2026-10-20 利用者の決定で右クリックに足した AI と同じ計算
+    # （ai/auto_fix.py）を通す
+    same("タイムラインの右クリック/色を自動で整える…", "auto_color"),
+    same("タイムラインの右クリック/ノイズを自動で減らす…", "reduce_noise"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),

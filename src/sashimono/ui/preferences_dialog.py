@@ -60,6 +60,7 @@ from sashimono.core.seams import (
     SEAM_VIDEOS,
     SEAM_ZOOM_PERCENT_RANGE,
 )
+from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE
 from sashimono.engine.audio.voicevox import (
     AIVIS_ENGINE_URL,
     AUTO_VOICE,
@@ -71,6 +72,7 @@ from sashimono.engine.audio.voicevox import (
     VoiceEngine,
     check_engine_url,
 )
+from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     MEASURED_ONE_LAYER_MS,
@@ -1012,6 +1014,7 @@ class PreferencesDialog(QDialog):
         self._add_emphasis_rows(form, preferences)
         self._add_seam_rows(form, preferences)
         self._add_narration_rows(form, preferences)
+        self._add_auto_fix_rows(form, preferences)
         self._add_reframe_rows(form, preferences)
 
         # AI へ送る物（#342） 何が外へ出るかを、送る前に本人が決められるようにする
@@ -1293,6 +1296,8 @@ class PreferencesDialog(QDialog):
             narration_volume_percent=self._narration_volume.value(),
             narration_ai_picks_voice=self._narration_ai_picks.isChecked(),
             narration_subtitles=self._narration_subtitles.isChecked(),
+            auto_color_strength=self._auto_color_strength.value(),
+            denoise_reduction_db=self._denoise_reduction.value(),
             reframe_size=str(self._reframe_size.currentData()),
             reframe_follow=str(self._reframe_follow.currentData()),
             reframe_smooth_ms=self._reframe_smooth.value(),
@@ -1629,6 +1634,34 @@ class PreferencesDialog(QDialog):
             return check_engine_url(self._narration_url.text())
         except ValueError:
             return self._given.narration_engine_url
+
+    def _add_auto_fix_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """色と雑音を自動で直す（#336）ときの既定 どこまで直してよいかは人と素材で違う
+        AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
+        """
+        self._auto_color_strength = QSpinBox(self)
+        self._auto_color_strength.setRange(*AUTO_COLOR_STRENGTH_RANGE)
+        self._auto_color_strength.setSingleStep(10)
+        self._auto_color_strength.setSuffix(" %")
+        self._auto_color_strength.setValue(preferences.auto_color_strength)
+        self._auto_color_strength.setToolTip(
+            "AI アシスタントがクリップの色を自動で整える（明るさ・白のつり合い・クリップ同士の"
+            "色合わせ）ときの強さ 100 % で測ったとおりに直す 夕焼けの赤みや夜の暗さのように、"
+            "わざとそう撮った絵まで平らにしたくなければ小さくする 付けた補正は設定パネルの"
+            "「拡張色調補正」で後から直せる"
+        )
+        form.addRow("色を自動で整える強さ", self._auto_color_strength)
+        self._denoise_reduction = QSpinBox(self)
+        self._denoise_reduction.setRange(*AUTO_REDUCTION_DB_RANGE)
+        self._denoise_reduction.setSuffix(" dB")
+        self._denoise_reduction.setValue(preferences.denoise_reduction_db)
+        self._denoise_reduction.setToolTip(
+            "AI アシスタントが音のノイズ（空調・機械の音・マイクのサー）を自動で減らすときに"
+            "下げる量 6 dB で雑音がおよそ半分、12 dB で 4 分の 1、20 dB で 10 分の 1"
+            " 大きくすると声の小さい所まで削れて、水の中で話すような音になる 付けた"
+            "「ノイズ除去」は設定パネルで後から直せる"
+        )
+        form.addRow("ノイズを減らす量", self._denoise_reduction)
 
     def _add_reframe_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """縦動画への作り替え（#334）の既定 どの縦の大きさで出すか・枠を止めるか追うかは人と

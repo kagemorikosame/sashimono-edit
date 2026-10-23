@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
+from sashimono.ai.auto_fix import can_auto_color, plan_color_fix, plan_noise_fix
 from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.operations import (
     NarrationJob,
@@ -177,6 +178,7 @@ from sashimono.engine.cache import (
     scenes_from,
 )
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
+from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
@@ -201,6 +203,7 @@ from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
 from sashimono.ui.ai_sheet import AiSheet
 from sashimono.ui.ai_sound_graph import draw_sound_graph
+from sashimono.ui.auto_fix_dialogs import ask_color, ask_noise
 from sashimono.ui.backup_settings import (
     STATE_SUBFOLDER,
     describe_trim,
@@ -1344,6 +1347,12 @@ class MainWindow(QMainWindow):
         )
         self._timeline.seams_requested.connect(
             lambda clip_ids: self.smooth_seams([ClipId(str(c)) for c in clip_ids])
+        )
+        self._timeline.color_requested.connect(
+            lambda clip_ids: self.auto_color_clips([ClipId(str(c)) for c in clip_ids])
+        )
+        self._timeline.noise_requested.connect(
+            lambda clip_ids: self.reduce_noise_clips([ClipId(str(c)) for c in clip_ids])
         )
         self._timeline.scene_open_requested.connect(
             lambda scene_id: self.open_scene(SceneId(scene_id))
@@ -3735,6 +3744,9 @@ class MainWindow(QMainWindow):
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
         return self._analyzer.waveform(media, stream)
 
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
+        return self._analyzer.filmstrip(media, stream)
+
     def request_scenes(self, media: MediaItem) -> None:
         """AI が頼んだ素材の場面を調べる 設定で取り込み時の解析を切っていても読む"""
         self._analyzer.request_scenes(media, on_ready=self._on_analysis_ready)
@@ -3797,6 +3809,14 @@ class MainWindow(QMainWindow):
     @property
     def narration_settings(self) -> NarrationSettings:
         return self._preferences.narration_settings
+
+    @property
+    def auto_color_strength(self) -> int:
+        return self._preferences.auto_color_strength
+
+    @property
+    def denoise_reduction(self) -> int:
+        return self._preferences.denoise_reduction_db
 
     @property
     def reframe_style(self) -> ReframeStyle:
@@ -3970,6 +3990,81 @@ class MainWindow(QMainWindow):
         return self.execute_all(
             list(plan.commands), f"つなぎ目を目立たなくする: {len(plan.handled)} か所"
         )
+
+    # --- 色と雑音の自動補正（#336 タイムラインの右クリック） ---
+
+    def auto_color_clips(self, clip_ids: list[ClipId]) -> bool:
+        """〔色を自動で整える…〕 強さと直し方を尋ね、AI の ``auto_color`` と同じ計算
+        （:func:`plan_color_fix`）で拡張色調補正を積む
+
+        既定の強さは本人の設定で、窓で変えた値はその 1 回だけ 何本選んでいても取り消し 1 回で
+        戻る サムネイルがまだ無いなどで断られたら、理由をステータスバーに出して何も変えない
+        変えられたら真
+        """
+        project = self.view_project
+        targets: list[Clip] = []
+        for clip_id in clip_ids:
+            located = project.timeline.locate_clip(clip_id)
+            if located is not None and can_auto_color(project, *located):
+                targets.append(located[1])
+        if not targets:
+            self.statusBar().showMessage(
+                "動画か画像のクリップを選んでください（ロックは外す）", 5000
+            )
+            return False
+        chosen = {clip.id for clip in targets}
+        # 合わせる相手の候補は、選んでいない絵のクリップ（自分に合わせても何も変わらない）
+        partners = [
+            (clip.id, f"{track.name} {format_timecode(clip.timeline_start, project.rate)}")
+            for track in project.timeline.tracks
+            for clip in track.clips
+            if clip.id not in chosen and can_auto_color(project, track, clip, editing=False)
+        ]
+        choice = ask_color(self, self._preferences.auto_color_strength, partners)
+        if choice is None:
+            return False
+        try:
+            fix = plan_color_fix(self, project, targets, choice)
+        except ToolError as exc:
+            self.statusBar().showMessage(f"色を整えられません: {exc}", 8000)
+            return False
+        if not fix.commands:
+            self.statusBar().showMessage("どのクリップもすでに整っています", 5000)
+            return False
+        label = "色を合わせる" if choice.match is not None else "色を自動で整える"
+        return self.execute_all(list(fix.commands), f"{label}: {len(fix.rows)} 本")
+
+    def reduce_noise_clips(self, clip_ids: list[ClipId]) -> bool:
+        """〔ノイズを自動で減らす…〕 量を尋ね、AI の ``reduce_noise`` と同じ計算
+        （:func:`plan_noise_fix`）でノイズ除去を積む
+
+        既定の量は本人の設定で、窓で変えた値はその 1 回だけ 掛けなかったクリップの訳は
+        ステータスバーに出す 取り消し 1 回で戻る 変えられたら真
+        """
+        targets = self._sound_targets(clip_ids)
+        if not targets:
+            self.statusBar().showMessage("音を鳴らすクリップを選んでください", 5000)
+            return False
+        choice = ask_noise(self, self._preferences.denoise_reduction_db)
+        if choice is None:
+            return False
+        try:
+            fix = plan_noise_fix(self, self.view_project, targets, choice)
+        except ToolError as exc:
+            self.statusBar().showMessage(f"ノイズを減らせません: {exc}", 8000)
+            return False
+        reasons = "、".join(dict.fromkeys(row["reason"] for row in fix.skipped))
+        if not fix.commands:
+            self.statusBar().showMessage(f"どのクリップにも掛けませんでした（{reasons}）", 8000)
+            return False
+        if not self.execute_all(list(fix.commands), f"ノイズを減らす: {len(fix.rows)} 本"):
+            return False
+        if reasons:
+            self.statusBar().showMessage(
+                f"{len(fix.rows)} 本に掛け、{len(fix.skipped)} 本は掛けませんでした（{reasons}）",
+                8000,
+            )
+        return True
 
     def duck_clips(self, clip_ids: list[ClipId]) -> bool:
         """〔BGM を声に合わせて下げる…〕 声のトラックと下げ方を尋ね、話している間だけ下げる

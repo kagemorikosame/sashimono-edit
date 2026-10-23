@@ -29,6 +29,13 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.auto_fix import (
+    ColorRequest,
+    NoiseRequest,
+    picture_clip,
+    plan_color_fix,
+    plan_noise_fix,
+)
 from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
 from sashimono.ai.fixes import (
@@ -293,6 +300,11 @@ from sashimono.core.timebase import (
     seconds_to_frame,
 )
 from sashimono.effects import registry
+from sashimono.effects.denoise import (
+    AUTO_REDUCTION_DB_RANGE,
+    DEFAULT_SENSITIVITY_DB,
+    SENSITIVITY_DB_RANGE,
+)
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import (
@@ -347,6 +359,7 @@ from sashimono.engine.audio.voicevox import (
 )
 from sashimono.engine.audio.voicevox import SPEED_PERCENT_RANGE as VOICE_SPEED_RANGE
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
 from sashimono.engine.checks import KINDS as CHECK_KINDS
@@ -5990,6 +6003,72 @@ def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
 
 
+def _auto_color(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    targets = [picture_clip(project, clip_id)[1] for clip_id in _target_clips(host, arguments)]
+    strength = _limit_number(
+        arguments, "strength_percent", float(host.auto_color_strength), *AUTO_COLOR_STRENGTH_RANGE
+    )
+    match = arguments.get("match_clip_id")
+    request = ColorRequest(
+        strength=strength,
+        exposure=_flag_argument(arguments, "exposure", True),
+        white_balance=_flag_argument(arguments, "white_balance", True),
+        match=ClipId(str(match)) if match is not None else None,
+    )
+    fix = plan_color_fix(host, project, targets, request)
+    result: dict[str, Any] = {"clips": list(fix.rows), "strength_percent": strength}
+    if fix.unchanged:
+        result["unchanged_clip_ids"] = [str(clip_id) for clip_id in fix.unchanged]
+    if not fix.commands:
+        result["note"] = "どのクリップもすでに整っています 何も変えていません"
+        return result
+    label = "色を合わせる" if request.match is not None else "色を自動で整える"
+    host.apply_commands(list(fix.commands), f"{label}: {len(fix.rows)} 本")
+    result["note"] = (
+        "クリップの頭に拡張色調補正を積みました（前に自動で積んだ物があれば値を置き換え）"
+        " 人は設定パネルの「拡張色調補正」で直せます 取り消し 1 回で元に戻ります"
+        " 測ったのは素材の色で、上に重ねた物や後ろのエフェクトは見ていません"
+        " 仕上がりは preview_frame で確かめてください"
+    )
+    return result
+
+
+def _reduce_noise(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    targets = _picked_sound_clips(host, arguments, "clip_ids", "track_id")
+    request = NoiseRequest(
+        reduction=_limit_number(
+            arguments, "reduction_db", float(host.denoise_reduction), *AUTO_REDUCTION_DB_RANGE
+        ),
+        sensitivity=_limit_number(
+            arguments, "sensitivity_db", DEFAULT_SENSITIVITY_DB, *SENSITIVITY_DB_RANGE
+        ),
+        force=_flag_argument(arguments, "force", False),
+    )
+    fix = plan_noise_fix(host, project, targets, request)
+    result: dict[str, Any] = {
+        "clips": list(fix.rows),
+        "reduction_db": request.reduction,
+        "sensitivity_db": request.sensitivity,
+    }
+    if fix.skipped:
+        result["skipped"] = list(fix.skipped)
+    if not fix.commands:
+        result["note"] = (
+            "どのクリップにも掛けませんでした（skipped の理由） 掛けるなら force を true にします"
+        )
+        return result
+    host.apply_commands(list(fix.commands), f"ノイズを減らす: {len(fix.rows)} 本")
+    result["note"] = (
+        "音のエフェクト「ノイズ除去」を足しました（前からあれば値を置き換え）"
+        " 一定に鳴り続ける雑音（空調・機械の音・マイクのサー）を下げ、咳や物音のような"
+        "突然の音は残ります 人は設定パネルの「ノイズ除去」で量を直せます"
+        " 取り消し 1 回で元に戻ります"
+    )
+    return result
+
+
 def _seconds(value: object) -> Fraction:
     return Fraction(round(float(str(value)) * 100), 100)
 
@@ -8490,6 +8569,9 @@ _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 _VOICES = frozenset({Outbound.APP_SETTINGS})
 #: ナレーションを作って置く（#335） 書いた WAV の場所・置いたクリップ・声の名前と表記
 _NARRATION = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
+#: 色と雑音の自動補正（#336） 結果に本人の設定の強さ・下げる量の既定が載り、サムネイルや
+#: 波形の用意がまだのときの断りの文に素材の名前が入る 絵そのものは送らない（測った数だけ）
+_AUTO_FIX = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
 _SEAM_ARGUMENTS: dict[str, Any] = {
     "video": _string("映像の処理 crossfade・zoom・none 省くと本人の設定"),
@@ -10843,6 +10925,65 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_normalize_loudness,
         writes=True,
         sends=_CHECKS,
+    ),
+    Operation(
+        name="auto_color",
+        description=(
+            "クリップの色を自動で整える 素材の絵（サムネイル）を測り、暗い端を黒へ・明るい端を"
+            "白へ広げ（露出とコントラスト）、白や灰色の物の色かぶりを取る（白のつり合い）"
+            " match_clip_id を渡すと、そのクリップの明るさと色合い・彩度に寄せる（クリップ同士の"
+            "色合わせ） 値は拡張色調補正としてクリップの頭に積む（前に積んだ物があれば値を置き換え"
+            " 人が設定パネルで直せる） 強さを省くと本人の設定 取り消し 1 回で戻る"
+            " 掛けた後は preview_frame で確かめる"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": _clip_ids_schema(),
+                "match_clip_id": _string("色を合わせる相手のクリップ 省くと素材ごとに整える"),
+                "strength_percent": _number(
+                    f"強さ %（{AUTO_COLOR_STRENGTH_RANGE[0]}〜{AUTO_COLOR_STRENGTH_RANGE[1]}"
+                    " 100 で測ったとおりに直す 省くと本人の設定）"
+                ),
+                "exposure": _boolean("明るさ（露出とコントラスト）を直す（既定 true）"),
+                "white_balance": _boolean("白のつり合い（色かぶり）を直す（既定 true）"),
+            }
+        ),
+        handler=_auto_color,
+        writes=True,
+        sends=_AUTO_FIX,
+    ),
+    Operation(
+        name="reduce_noise",
+        description=(
+            "音のノイズ（空調・機械の音・マイクのサーのように一定に鳴り続ける雑音）を自動で減らす"
+            " クリップの波形から雑音の大きさを測り、聞こえる雑音があって静かな所（息継ぎ）がある"
+            "クリップにだけ、音のエフェクト「ノイズ除去」を足す（前からあれば値を置き換え）"
+            " 掛けなかったクリップは skipped に訳を書く 音楽や雑音に埋もれた声は声まで削れるので"
+            "掛けない（force で掛ける） 咳や物音のような突然の音は消えない 量を省くと本人の設定"
+            " 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "減らすクリップ track_id とどちらか",
+                },
+                "track_id": _string("減らすトラック（その上の音のクリップすべて）"),
+                "reduction_db": _number(
+                    f"下げる量 dB（{AUTO_REDUCTION_DB_RANGE[0]}〜{AUTO_REDUCTION_DB_RANGE[1]}"
+                    " 12 で雑音がおよそ 4 分の 1 大きいほど声も削れる 省くと本人の設定）"
+                ),
+                "sensitivity_db": _number(
+                    f"雑音とみなす幅 dB（{SENSITIVITY_DB_RANGE[0]:g}〜{SENSITIVITY_DB_RANGE[1]:g}"
+                    f" 既定 {DEFAULT_SENSITIVITY_DB:g} 大きいほど残る雑音が減り、小さな声も下がる）"
+                ),
+                "force": _boolean("測って掛けないと決めたクリップにも掛ける（既定 false）"),
+            }
+        ),
+        handler=_reduce_noise,
+        writes=True,
+        sends=_AUTO_FIX,
     ),
     Operation(
         name="place_sound",

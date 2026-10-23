@@ -86,6 +86,7 @@ from sashimono.core.seams import (
     SEAM_ZOOM_PERCENT_RANGE,
     SeamStyle,
 )
+from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE, DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.voicevox import (
     AUTO_VOICE,
     DEFAULT_ENGINE_URL,
@@ -94,6 +95,7 @@ from sashimono.engine.audio.voicevox import (
     NarrationSettings,
     check_engine_url,
 )
+from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE, DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.cache.screen_analyzer import (
     DEFAULT_SAMPLES_PER_SCENE,
@@ -721,6 +723,14 @@ class Preferences:
     #: 作った声に台本から字幕を付けるか（文ごとに区切り、声の長さに合わせる） 既定は付ける
     #: （2026-10-20 利用者の決定） 字幕を別に起こす人・字幕の要らない人は切れる AI も従う
     narration_subtitles: bool = True
+    #: AI アシスタントがクリップの色を自動で整える（#336）ときの強さ（%） 測ったとおりに直す
+    #: 量にこれを掛ける 既定は控えめ（:mod:`sashimono.engine.auto_color`） 夕焼けの赤みや
+    #: 夜の暗さのように、わざとそう撮った絵まで真っ平らにしないため
+    auto_color_strength: int = DEFAULT_AUTO_COLOR_STRENGTH
+    #: AI アシスタントが音のノイズを自動で減らす（#336）ときに下げる量（dB）
+    #: 大きいほど雑音は消えるが、声の小さい所まで削れて水の中で話すような音になる
+    #: 既定は 12 dB（雑音がおよそ 4 分の 1 :mod:`sashimono.effects.denoise`）
+    denoise_reduction_db: int = int(DEFAULT_REDUCTION_DB)
     #: AI アシスタントが横の作品を縦の作品に作り替える（#334）ときの既定
     #: どの縦の大きさで出すか・枠を止めるか追うかは人と作品で違う AI に値を言わなければこれを使う
     #: （:mod:`sashimono.core.reframe`）
@@ -1163,6 +1173,16 @@ class PreferenceStore:
                 data.get("narration_ai_picks_voice"), plain.narration_ai_picks_voice
             ),
             narration_subtitles=_flag(data.get("narration_subtitles"), plain.narration_subtitles),
+            auto_color_strength=_within(
+                data.get("auto_color_strength"),
+                AUTO_COLOR_STRENGTH_RANGE,
+                plain.auto_color_strength,
+            ),
+            denoise_reduction_db=_within(
+                data.get("denoise_reduction_db"),
+                AUTO_REDUCTION_DB_RANGE,
+                plain.denoise_reduction_db,
+            ),
             reframe_size=_choice(data.get("reframe_size"), REFRAME_SIZES, plain.reframe_size),
             reframe_follow=_choice(
                 data.get("reframe_follow"), REFRAME_FOLLOWS, plain.reframe_follow
