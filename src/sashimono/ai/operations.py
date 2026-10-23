@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 
+from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
 from sashimono.ai.fixes import (
     FIX_ACTIONS,
@@ -33,9 +34,11 @@ from sashimono.ai.fixes import (
     FixRound,
     current_round,
     fix_for,
+    leave_after_limit,
     settle_check,
     start_check,
 )
+from sashimono.ai.handoff import GET_HANDOFF, shelf_for
 from sashimono.ai.host import (
     EXPORT_RUNNING,
     UNSAVED_REFUSAL,
@@ -2244,6 +2247,23 @@ def _get_history(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
 
 
+def _get_handoff(host: EditorHost, arguments: dict[str, Any]) -> object:
+    del arguments
+    document = host.document
+    shelf = shelf_for(document)
+    found = shelf.current(document)
+    if found is None:
+        return {
+            "handoff": None,
+            "note": "引き継ぎはありません（途中で止まった指示が無いか、その後に別の作品を開いた）",
+        }
+    result = found.as_dict(document)
+    # 止まった後に終えた指示の数（今の指示は数えない） 0 でなければ、その後の指示で形が
+    # 変わっているかもしれない
+    result["later_instructions"] = shelf.later
+    return result
+
+
 # --- 目印（マーカー）とチャプター（#330）---
 
 #: 1 回で置ける目印の数 長い動画の場面ごとに置いても足りる数 これより多い頼みは、場面の
@@ -3362,6 +3382,21 @@ def _check_result(
             problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
         )
         fixes[action.action] += 1
+    if ticket is not None and rounds is not None and rounds.closed and not unsettled:
+        # 上限が無ければ直せた問題を覚える 引き継ぎ（#346）が、AI が言葉で締めた指示でも
+        # 上限で止めたと書き、残った問題を人へ渡せるように 使えない結果では覚えない（古い問題）
+        leave_after_limit(
+            host.document,
+            ticket,
+            tuple(
+                f"{CHECK_KIND_NAMES[problem.kind]}"
+                f"（{_problem_time(problem.start, report.fps, rate)}〜"
+                " 直す回数の上限で直していない）"
+                for problem in report.problems
+                if fix_for(problem.kind, problem.severity, problem.measure).action
+                in (FIX_AUTO, FIX_ASK)
+            ),
+        )
     result |= {
         "target": "timeline" if timeline else str(request.path),
         "complete": report.complete,
@@ -3421,6 +3456,13 @@ def _check_result(
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _problem_time(frame: int, fps: float, rate: FrameRate | None) -> str:
+    """問題の頭の時刻 人が引き継ぎ（#346）から場所を探せるよう、タイムラインの表示と同じ形で書く"""
+    if rate is None:
+        return f"{round(frame / fps, 3)} 秒"
+    return format_timecode(frame, rate)
 
 
 def _fix_state(rounds: FixRound | None, unsettled: bool) -> dict[str, bool]:
@@ -7856,6 +7898,9 @@ _SEAM_ARGUMENTS: dict[str, Any] = {
 }
 #: 本人の答え
 _CONVERSATION = frozenset({Outbound.CONVERSATION})
+#: 止まった指示の引き継ぎ（#346） 人の指示と AI の最後の言葉（会話）、変えた手の名前（履歴と
+#: 同じく素材の名前とテキストの文の頭が入る）、失敗した道具の文（素材の場所が入りうる）が載る
+_HANDOFF = frozenset({Outbound.CONVERSATION, Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 
 
 OPERATIONS: tuple[Operation, ...] = (
@@ -8027,6 +8072,21 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_history,
         sends=_HISTORY,
+        hidden=_HIDDEN_IN_HISTORY,
+        labels=True,
+    ),
+    # 途中で止まった指示の引き継ぎ（#346） 人は AI のパネルの引き継ぎの欄で読む
+    # 中身は人の指示の文と変えた手の名前なので、履歴と同じく字幕と文字は断っても動かして伏せる
+    Operation(
+        name=GET_HANDOFF,
+        description=(
+            "途中で止まった前の指示の引き継ぎ（止まった訳・変えた手・取り消しの段・失敗した操作・"
+            "許されなかった物・残り）を読む 止まった指示の続きを頼まれたら、まずこれを読む"
+            " changes と checkpoint は作品の履歴から組んだ物、ai_words は前の AI の言葉"
+        ),
+        schema=_schema({}),
+        handler=_get_handoff,
+        sends=_HANDOFF,
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
     ),

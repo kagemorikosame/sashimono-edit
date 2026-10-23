@@ -243,6 +243,21 @@ class TestLimits:
         meter.end_turn()
         assert meter.last_stop == overrun
 
+    def test_an_instruction_that_was_not_counted_does_not_inherit_the_stop(self) -> None:
+        # 壊れると、部品の入れ替え中に送って数え始める前に終わった指示が、前の指示の上限と
+        # 使った量を受け継ぎ、区切りの行と引き継ぎ（#346）に「上限で停止」と書かれる
+        meter = _meter(Limits(turn_tokens=10))
+        meter.begin_turn()
+        meter.record_message("a", {"output_tokens": 10})
+        overrun = meter.overrun()
+        assert overrun is not None
+        meter.stop(overrun)
+        meter.end_turn()
+        assert meter.last_stop == overrun
+        meter.end_turn()
+        assert meter.last_stop is None
+        assert meter.last == Usage()
+
 
 class TestDailyStore:
     def test_the_day_survives_closing_the_app(self, tmp_path: Path) -> None:
