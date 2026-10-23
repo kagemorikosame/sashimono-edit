@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from fractions import Fraction
 from pathlib import Path
@@ -108,6 +109,35 @@ class TestSceneNoteStore:
 
         monkeypatch.setattr(Path, "exists", denied)
         assert SceneNoteStore(store).notes(media) == ()
+
+    def test_notes_written_over_a_broken_file_while_reading_survive_a_restart(
+        self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、壊れた控えを読んでいる間に AI が正しい説明へ置き換えたとき、読み終えた側が
+        # 壊れていたとして新しい控えを消し、立ち上げ直すと書いたはずの説明が無くなる
+        path = store.prepare(NAMESPACE, notes_key(media.path), SUFFIX)
+        path.write_text("{壊れた", encoding="utf-8")
+        notes = SceneNoteStore(store)
+        reading = threading.Event()
+        written = threading.Event()
+        original = json.loads
+
+        def slow(text: str) -> object:
+            if text.startswith("{壊れた"):
+                reading.set()
+                assert written.wait(5)
+            return original(text)
+
+        monkeypatch.setattr(json, "loads", slow)
+        seen: list[tuple[SceneNote, ...]] = []
+        reader = threading.Thread(target=lambda: seen.append(notes.notes(media)))
+        reader.start()
+        assert reading.wait(5)
+        notes.remember(media, NOTES)
+        written.set()
+        reader.join(5)
+        assert seen == [NOTES]
+        assert SceneNoteStore(store).notes(media) == NOTES
 
     def test_a_broken_file_that_cannot_be_removed_reads_as_no_notes(
         self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch

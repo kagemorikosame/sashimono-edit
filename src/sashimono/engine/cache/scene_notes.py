@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import tempfile
@@ -101,7 +100,14 @@ def _save(path: Path, notes: tuple[SceneNote, ...]) -> None:
 
 
 def _load(path: Path) -> tuple[SceneNote, ...]:
-    """書いた説明を読む 壊れていれば消して空を返す（作り直せる物なので知らせない）"""
+    """書いた説明を読む 壊れていれば空を返す（作り直せる物なので知らせない）
+
+    壊れた控えは消さない 読んでから消すまでの間に remember が正しい控えへ置き換えると、
+    消す所がその新しい控えを消し、立ち上げ直すと書いたはずの説明が無くなる（AI が絵を
+    送り直して作り直す費用がかかる） 消す前に同じ物かを確かめても、確かめてから消すまでの
+    間に置き換わりうるので塞ぎきれない 残しておいても、次に書くときに書いてから置き換える
+    （:func:`_save`）ので上書きされ、それまでは読むたびに空として扱うだけで済む
+    """
     # 有るかを見る所も try の中に置く 置き場を読めない（権限が無い）と exists が投げ、
     # 検索の道具が控えの場所入りの OSError で落ちる 読めないなら覚えていないのと同じに扱う
     try:
@@ -118,7 +124,4 @@ def _load(path: Path) -> tuple[SceneNote, ...]:
             for row in data["notes"]
         )
     except (OSError, ValueError, KeyError, TypeError):
-        # 消せなくても空を返す 消す所で投げると、壊れた控え 1 つで検索が落ちる
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
         return ()
