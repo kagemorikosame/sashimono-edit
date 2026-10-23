@@ -35,6 +35,7 @@ from sashimono.core.model import AnimatedValue, Interpolation, Keyframe, ParamVa
 __all__ = [
     "AUTO",
     "CENTER",
+    "DEFAULT_REFRAME_FACES",
     "DEFAULT_REFRAME_FOLLOW",
     "DEFAULT_REFRAME_SIZE",
     "DEFAULT_REFRAME_SMOOTH_MS",
@@ -98,6 +99,12 @@ DEFAULT_REFRAME_FOLLOW = AUTO
 #: 1 秒は話しながら少し動く人に付いていけて、手振りでは揺れない長さ
 REFRAME_SMOOTH_MS_RANGE = (200, 5000)
 DEFAULT_REFRAME_SMOOTH_MS = 1000
+#: 被写体の見積もりに顔の位置（#324 の画面の解析 #407）を使うか 既定は使う
+#: 使うのは画面の解析の部品が入っているときだけで、入れた人は人の映る素材を扱うことが
+#: 多い 動きと肌色だけでは肌色に近い絵や壁へ枠が寄る（実素材の配信で 12 コマのどれにも
+#: アバターが入らなかった） 切るのは、顔を調べる間（場面ごとに数枚 1080p で 1 枚
+#: 0.1 秒ほど）を待ちたくない人と、顔でない物を映したい人
+DEFAULT_REFRAME_FACES = True
 
 #: 「収まる」と見なす被写体の動く幅（枠の幅に対する割合） 動く幅が枠の 6 割までなら、
 #: 止めた枠の真ん中に置けば両端にまだ余白が残る
@@ -125,6 +132,8 @@ class ReframeStyle:
     size: str = DEFAULT_REFRAME_SIZE
     follow: str = DEFAULT_REFRAME_FOLLOW
     smooth_ms: int = DEFAULT_REFRAME_SMOOTH_MS
+    #: 顔の位置も手がかりにするか（画面の解析の部品が入っているときだけ効く）
+    faces: bool = DEFAULT_REFRAME_FACES
 
     @property
     def resolution(self) -> tuple[int, int]:

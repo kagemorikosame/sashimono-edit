@@ -175,7 +175,17 @@ from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
-from sashimono.engine.reframe import ReframeRequest, gather_signals, plan_reframe, tracked_media
+from sashimono.engine.reframe import (
+    FACES_CENTER,
+    FACES_OFF,
+    GatheredFaces,
+    ReframeRequest,
+    face_summary,
+    gather_faces,
+    gather_signals,
+    plan_reframe,
+    tracked_media,
+)
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
 from sashimono.links import MANUAL_URL, REPORT_URL
@@ -2798,6 +2808,10 @@ class MainWindow(QMainWindow):
         背景の動画の場面の解析が終わっていなければ、解析を頼んで何も変えない 途中までの並びで
         作ると、読んでいない所の枠が真ん中に止まり、やり直しても直らない（AI の道具と同じ決まり）
         変えたら真 やめたとき・待つとき・断られたときは偽
+
+        顔の位置（#407）は、窓で使うと選んでいて画面の解析の部品が入っていれば頼む 調べ終えて
+        いない素材は待たずに動きと肌色だけで作り、ステータスバーでそう知らせる（AI の道具と同じ
+        言葉 :func:`face_summary`）
         """
         choice = ask_reframe(self, self._preferences.reframe_style)
         if choice is None:
@@ -2810,6 +2824,11 @@ class MainWindow(QMainWindow):
         media = [] if choice.follow == CENTER else tracked_media(project)
         for item in media:
             self._analyzer.request_scenes(item, on_ready=self._on_analysis_ready)
+        wanted = choice.faces and bool(media)
+        parts = wanted and VISION_PACK.status().ready
+        if parts:
+            for item in media:
+                self._screen.request(item, ScreenKind.FACES)
         gathered = gather_signals(media, self._analyzer.scene_state)
         if gathered.waiting:
             self.statusBar().showMessage(
@@ -2822,8 +2841,13 @@ class MainWindow(QMainWindow):
         request = ReframeRequest(
             width, height, choice.follow, choice.smooth_ms, self._preferences.subtitle_wrap_share
         )
+        found: GatheredFaces | None = None
+        if parts:
+            found = gather_faces(media, lambda item: self._screen.state(item, ScreenKind.FACES))
         try:
-            plan = plan_reframe(project, request, gathered.signals)
+            plan = plan_reframe(
+                project, request, gathered.signals, None if found is None else found.reports
+            )
             with self._document.checkpoint(
                 f"縦の作品に作り替え: {width}x{height}", by=Author.PERSON
             ):
@@ -2835,6 +2859,20 @@ class MainWindow(QMainWindow):
             return False
         self._on_project_changed()
         notes: list[str] = []
+        faces = face_summary(
+            plan,
+            follow=choice.follow,
+            wanted=choice.faces,
+            videos=len(media),
+            parts_ready=parts,
+            gathered=found,
+        )
+        if faces.status not in (FACES_CENTER, FACES_OFF):
+            # 顔を使ったか・使えなかった訳を出す 黙ると、部品を入れていない人は顔を見ていると
+            # 思い込み、調べている途中の人は作り直せば良くなることに気付かず、追う動画の無い
+            # 作品では被写体を追ったと思い込む 真ん中の切り出しと顔を切ったのは、いま窓で本人が
+            # 選んだ事なので繰り返さない（AI の道具は選んだのが AI なので、どの訳も返事に載せる）
+            notes.append(faces.note)
         if gathered.untracked:
             # 解析できなかった素材（壊れた・読めない）は真ん中を切り出して作り替える
             # 断ると、読めない
@@ -3057,6 +3095,7 @@ class MainWindow(QMainWindow):
             decode_threads=self._preferences.decode_threads,
             scene_name=self._active_scene_name(),
             smooth_history=self._preferences.smooth_audio_motion,
+            gpu_color=self._preferences.export_gpu_color,
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
             encoder_priority=self._preferences.encoder_priority,
@@ -3740,6 +3779,10 @@ class MainWindow(QMainWindow):
         return self._preferences.reframe_style
 
     @property
+    def vision_ready(self) -> bool:
+        return VISION_PACK.status().ready
+
+    @property
     def image_edge(self) -> int:
         return self._preferences.ai_image_edge
 
@@ -4265,6 +4308,7 @@ class MainWindow(QMainWindow):
                 pipeline_depth=self._preferences.export_pipeline_depth,
                 decode_threads=self._preferences.decode_threads,
                 smooth_history=self._preferences.smooth_audio_motion,
+                gpu_color=self._preferences.export_gpu_color,
                 chapters=self._preferences.export_chapters,
                 encoder_priority=self._preferences.encoder_priority,
             )

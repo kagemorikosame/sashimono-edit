@@ -66,6 +66,7 @@ from sashimono.core.mixing import (
 )
 from sashimono.core.model import LayerMode, StyleGuide
 from sashimono.core.reframe import (
+    DEFAULT_REFRAME_FACES,
     DEFAULT_REFRAME_FOLLOW,
     DEFAULT_REFRAME_SIZE,
     DEFAULT_REFRAME_SMOOTH_MS,
@@ -354,6 +355,14 @@ class Preferences:
     #: メモリの少ない機械では減らせるようにする 実測は
     #: :data:`sashimono.engine.encode.MEASURED_EXPORT_MS`
     export_pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
+    #: 書き出しの色変換（RGB から動画用の BT.709 の YUV へ）を GPU で行う（#372）
+    #: 既定は入 1080p で 1 コマ 17ms が 13ms ほどに縮み、色の差は 8bit の丸めの 1 まで
+    #: 書き出す前に、縞と乱数の試験の絵（書き出しと同じ大きさ）で CPU の変換と比べ、
+    #: 食い違えば自分で CPU へ戻る 合成した最初のコマで比べないのは、暗転や単色で始まる
+    #: 書き出しでは食い違いが差に出ないため 切れるように
+    #: するのは、手元で確かめていない GPU の駆動で絵が乱れたときに逃げられるようにするため
+    #: 実測は :data:`sashimono.engine.encode.MEASURED_GPU_COLOR_MS`
+    export_gpu_color: bool = True
     #: 書き出す動画に、名前の付いた目印（マーカー）をチャプターとして埋めるか（#330）
     #: 2026-10-17 に利用者が決めた 既定は入 埋めても再生には響かず、プレーヤーで章送りが
     #: できる 要らない人だけ切ればよい 書き出しの窓で替えた値もここへ覚える
@@ -694,6 +703,10 @@ class Preferences:
     reframe_follow: str = DEFAULT_REFRAME_FOLLOW
     #: 追うときにならす長さ（ミリ秒） 長いほどゆっくり動く
     reframe_smooth_ms: int = DEFAULT_REFRAME_SMOOTH_MS
+    #: 被写体の見積もりに顔の位置（#324 #407）も使うか 画面の解析の部品が入っているときだけ
+    #: 効く 既定は使う（入れた人は人の映る素材で使うことが多い） 顔を調べる間を待ちたく
+    #: ない人と、顔でない物（手元・品物）を映したい人が切る
+    reframe_faces: bool = DEFAULT_REFRAME_FACES
     #: 素材を読み込んだとき（とプロジェクトを開いたとき）に、場面の切り替わりを裏で調べて
     #: 覚えるか（#321） AI アシスタントの道具（detect_scenes）が使う 既定は AI アシスタントが
     #: 入っているときだけ 場面の解析は素材を全フレーム読むので、AI を使わない人の機械で
@@ -829,6 +842,7 @@ class Preferences:
             size=self.reframe_size,
             follow=self.reframe_follow,
             smooth_ms=self.reframe_smooth_ms,
+            faces=self.reframe_faces,
         )
 
     @property
@@ -930,6 +944,7 @@ class PreferenceStore:
             export_pipeline_depth=_depth(
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),
+            export_gpu_color=_flag(data.get("export_gpu_color"), plain.export_gpu_color),
             export_chapters=_flag(data.get("export_chapters"), plain.export_chapters),
             encoder_priority=_choice(
                 data.get("encoder_priority"), ENCODER_PRIORITIES, plain.encoder_priority
@@ -1093,6 +1108,7 @@ class PreferenceStore:
             reframe_smooth_ms=_within(
                 data.get("reframe_smooth_ms"), REFRAME_SMOOTH_MS_RANGE, plain.reframe_smooth_ms
             ),
+            reframe_faces=_flag(data.get("reframe_faces"), plain.reframe_faces),
             scene_analysis=_choice(
                 data.get("scene_analysis"), SCENE_ANALYSIS_MODES, plain.scene_analysis
             ),
