@@ -196,9 +196,15 @@ class TestRefusedBeforeAsking:
         assert GENERATE.consent is not None
         with pytest.raises(ToolError, match="既定の声だけ"):
             GENERATE.consent(narrating, {"text": SCRIPT, "voice_id": 3})
-        # 既定の声のままなら作れる
-        consent = GENERATE.consent(narrating, {"text": SCRIPT})
-        assert "四国めたん" in consent.detail
+        # 既定の声のままなら声の決まりでは断らない 書く確かめまで通るのは、書き終えるまで
+        # フォルダを持てる Windows だけ（pin_holds_the_folder） ほかの OS ではそこで断る
+        # （#401 の CodeRabbit の指摘 声の決まりで断ったのではないことだけを見る）
+        if sys.platform == "win32":
+            consent = GENERATE.consent(narrating, {"text": SCRIPT})
+            assert "四国めたん" in consent.detail
+        else:
+            with pytest.raises(ToolError, match="この OS では"):
+                GENERATE.consent(narrating, {"text": SCRIPT})
 
     def test_an_unknown_voice_is_refused(self, narrating: FakeHost) -> None:
         # 壊れると、一覧に無い声を頼んだのに確かめの窓が出て、許した後にエンジンに断られる
@@ -572,6 +578,20 @@ class TestTheDocumentsMatchTheCode:
         paragraph = readme[start : readme.index("\n\n", start)]
         assert "声ごとの規約を読み" not in paragraph
         assert "1 つの規約" in paragraph
+
+    def test_the_documents_separate_the_engine_from_the_ai_conversation(self) -> None:
+        """壊れると、README と開発の文書が「台本は外へ送らない」と言い切り、AI への指示に台本を
+        書いた人が、その指示も Anthropic へ送られないと思い込む（#401 の CodeRabbit の指摘）"""
+        readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+        start = readme.index("**台本を読み上げたナレーションを作って置けます**")
+        paragraph = readme[start : readme.index("\n\n", start)]
+        development = (_ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+        section = development[development.index("### ナレーションの生成（#335）") :]
+        section = section[: section.index("\n### ", 1)]
+        for text in (paragraph, section):
+            assert "Anthropic" in text
+            assert "AI への指示" in text
+            assert "台本の文は外へ\n送りません" not in text
 
 
 class TestCreditsAreTold:

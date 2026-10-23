@@ -9,9 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -34,8 +32,8 @@ from sashimono.engine.audio.voicevox import (
     Catalog,
     EngineError,
     NarrationSettings,
-    VoiceEngine,
 )
+from sashimono.ui.voice_fetch import Fetched, VoiceFetch, fetch_voices, terms_text
 
 __all__ = ["NarrationChoice", "NarrationDialog", "ask_narration"]
 
@@ -70,6 +68,8 @@ class NarrationDialog(QDialog):
         self._settings = settings
         #: 読んだ声の一覧 読めていなければ ``None``
         self.catalog: Catalog | None = None
+        #: エンジンへの問い合わせを裏で進める係
+        self._fetch = VoiceFetch(self)
 
         self._text = QPlainTextEdit(self)
         self._text.setPlaceholderText(
@@ -139,22 +139,52 @@ class NarrationDialog(QDialog):
         self._text.setPlainText(text)
 
     def read_voices(self, _checked: bool = False) -> None:
-        """エンジンから声の一覧を読む 読めなければ理由を窓の中に書く（別の窓は出さない）"""
+        """エンジンから声の一覧を読む 読めなければ理由を窓の中に書く（別の窓は出さない）
+
+        読むのは裏のスレッド エンジンが返事を止めても窓は固まらず、〔やめる〕を押せる
+        """
+        self._ask_engine(terms=False)
+
+    def _show_terms(self, _checked: bool = False) -> None:
+        """選んだ声の規約とエンジンの規約を、エンジンが返した文のまま見せる
+
+        アプリは中身を判断しない 一覧をまだ読んでいなければ、一緒に読む
+        """
+        self._ask_engine(terms=True)
+
+    @property
+    def reading(self) -> bool:
+        """エンジンに問い合わせている途中か"""
+        return self._fetch.running
+
+    def _ask_engine(self, *, terms: bool) -> None:
+        data = self._voice.currentData()
+        voice = int(data) if data is not None else self._settings.voice
         try:
-            engine = VoiceEngine(self._settings.url)
+            work = fetch_voices(self._settings.url, self.catalog, voice if terms else None)
         except EngineError as exc:
             self._status.setText(str(exc))
             self._update()
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            catalog = engine.catalog()
-        except EngineError as exc:
-            self._status.setText(str(exc))
+        if self._fetch.start(work, lambda fetched: self._fetched(terms, fetched)):
+            self._status.setText("エンジンに問い合わせています…")
+
+    def _fetched(self, terms: bool, fetched: Fetched) -> None:
+        catalog = fetched.catalog
+        if catalog is None:
+            self._status.setText(fetched.error)
             self._update()
             return
-        finally:
-            QApplication.restoreOverrideCursor()
+        if catalog is not self.catalog:
+            self._fill_voices(catalog)
+        if terms:
+            found = catalog.find(int(self._voice.currentData()))
+            if found is not None:
+                QMessageBox.information(
+                    self, "声の規約", terms_text(catalog, *found, fetched.policy or "")
+                )
+
+    def _fill_voices(self, catalog: Catalog) -> None:
         self.catalog = catalog
         wanted = self._voice.currentData()
         if wanted is None:
@@ -170,30 +200,6 @@ class NarrationDialog(QDialog):
             f"{catalog.engine_name or catalog.brand} の声 表記は「{catalog.brand}:声の名前」の形"
         )
         self._update()
-
-    def _show_terms(self, _checked: bool = False) -> None:
-        """選んだ声の規約を、エンジンが返した文のまま見せる アプリは中身を判断しない"""
-        catalog = self.catalog
-        if catalog is None:
-            self.read_voices()
-            catalog = self.catalog
-        if catalog is None:
-            return
-        found = catalog.find(int(self._voice.currentData()))
-        if found is None:
-            return
-        speaker, style = found
-        try:
-            policy = VoiceEngine(catalog.url).policy(speaker)
-        except EngineError as exc:
-            self._status.setText(str(exc))
-            return
-        QMessageBox.information(
-            self,
-            "声の規約",
-            f"{speaker.name}（{style.name}） 表記: {catalog.credit(speaker)}\n\n"
-            + (policy or "エンジンが規約の文を返しませんでした エンジンのアプリで確かめてください"),
-        )
 
     def _update(self) -> None:
         """台本が空か長すぎるとき・声が読めていないときは〔作る〕を押せなくする"""

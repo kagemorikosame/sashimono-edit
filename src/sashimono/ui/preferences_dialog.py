@@ -9,9 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -69,7 +67,6 @@ from sashimono.engine.audio.voicevox import (
     VOLUME_PERCENT_RANGE,
     Catalog,
     EngineError,
-    VoiceEngine,
     check_engine_url,
 )
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
@@ -114,6 +111,7 @@ from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import THEME_CHOICES
+from sashimono.ui.voice_fetch import Fetched, VoiceFetch, fetch_voices, terms_text
 from sashimono.ui.workspace import (
     AI_IMAGE_LIMITS,
     AI_MINUTE_LIMITS,
@@ -1518,6 +1516,8 @@ class PreferencesDialog(QDialog):
         form.addRow("", self._narration_status)
         #: 読んだ声の一覧 規約を見るときに声の持ち主を探す
         self._narration_catalog: Catalog | None = None
+        #: エンジンへの問い合わせを裏で進める係 返事を止めたエンジンで設定の窓を固めない
+        self._voice_fetch = VoiceFetch(self)
         # 場所を変えたら読んだ一覧を捨てる 残すと〔規約を見る〕が前のエンジンの声の持ち主の ID を
         # 新しいエンジンへ渡し、断られるか別のエンジンの規約と表記を見せる
         self._narration_url.textChanged.connect(self._forget_narration_catalog)
@@ -1554,32 +1554,70 @@ class PreferencesDialog(QDialog):
         form.addRow(self._narration_subtitles)
 
     def _forget_narration_catalog(self, _text: str = "") -> None:
-        self._narration_catalog = None
+        """場所を変えたら、読んだ一覧と選んでいた声を捨てる
 
-    def _narration_engine(self) -> VoiceEngine | None:
-        """欄の場所のエンジン 場所が受け付けられなければ理由を出して ``None``"""
-        try:
-            return VoiceEngine(self._narration_url.text())
-        except EngineError as exc:
-            self._narration_status.setText(str(exc))
-            return None
+        声の ID はエンジンごとに振り方が違い、別のエンジンでは同じ ID が別の声になる 残すと、
+        場所だけ替えて OK を押した人の既定の声が、知らない声になる 一覧の最初の声へ戻し、
+        新しい一覧から選び直してもらう
+        """
+        self._narration_catalog = None
+        box = self._narration_voice
+        if box.count() != 1 or box.currentData() != AUTO_VOICE:
+            box.clear()
+            box.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+            self._narration_status.setText(
+                "エンジンの場所を変えたので、既定の声を一覧の最初の声に戻した"
+                " 〔声の一覧を読む〕で選び直す"
+            )
 
     def _read_voices(self, _checked: bool = False) -> None:
         """エンジンの声を並べる 人が押したときだけ、自分の機械の中のエンジンへつなぐ
 
         窓は出さず、断りは欄の下に書く 止まった機械で窓を出すと、押すたびに閉じる手間が増える
+        読むのは裏のスレッド（:class:`~sashimono.ui.voice_fetch.VoiceFetch`） エンジンが返事を
+        止めても設定の窓は固まらない
         """
-        engine = self._narration_engine()
-        if engine is None:
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._ask_engine(terms=False)
+
+    def _show_voice_terms(self, _checked: bool = False) -> None:
+        """選んだ声の規約とエンジンの規約を、エンジンが返した文のまま見せる
+
+        アプリは中身を判断しない 一覧をまだ読んでいなければ、一緒に読む
+        """
+        self._ask_engine(terms=True)
+
+    def _ask_engine(self, *, terms: bool) -> None:
+        url = self._narration_url.text()
+        voice = int(self._narration_voice.currentData())
+        known = self._narration_catalog if terms else None
         try:
-            catalog = engine.catalog()
+            work = fetch_voices(url, known, voice if terms else None)
         except EngineError as exc:
             self._narration_status.setText(str(exc))
             return
-        finally:
-            QApplication.restoreOverrideCursor()
+        if self._voice_fetch.start(work, lambda fetched: self._fetched(url, terms, fetched)):
+            self._narration_status.setText("エンジンに問い合わせています…")
+
+    def _fetched(self, url: str, terms: bool, fetched: Fetched) -> None:
+        """読み終えた（画面のスレッド） 待つ間に場所を変えていたら、前の場所の答えは捨てる"""
+        if self._narration_url.text() != url:
+            self._narration_status.setText("エンジンの場所を変えたので、前の場所の答えは使わない")
+            return
+        if fetched.catalog is None:
+            self._narration_status.setText(fetched.error)
+            return
+        if fetched.catalog is not self._narration_catalog:
+            self._fill_voices(fetched.catalog)
+        if terms:
+            found = fetched.catalog.find(int(self._narration_voice.currentData()))
+            if found is None:
+                self._narration_status.setText("選んだ声がエンジンの一覧にありません")
+                return
+            QMessageBox.information(
+                self, "声の規約", terms_text(fetched.catalog, *found, fetched.policy or "")
+            )
+
+    def _fill_voices(self, catalog: Catalog) -> None:
         self._narration_catalog = catalog
         current = int(self._narration_voice.currentData())
         box = self._narration_voice
@@ -1598,31 +1636,6 @@ class PreferencesDialog(QDialog):
         self._narration_status.setText(
             f"{catalog.engine_name or catalog.brand} の声を {voices} 個読んだ"
             f" 表記は「{catalog.brand}:声の名前」の形で、書き出しのときに知らせる"
-        )
-
-    def _show_voice_terms(self, _checked: bool = False) -> None:
-        """選んだ声の規約を、エンジンが返した文のまま見せる アプリは中身を判断しない"""
-        if self._narration_catalog is None:
-            self._read_voices()
-        catalog = self._narration_catalog
-        engine = self._narration_engine()
-        if catalog is None or engine is None:
-            return
-        found = catalog.find(int(self._narration_voice.currentData()))
-        if found is None:
-            self._narration_status.setText("選んだ声がエンジンの一覧にありません")
-            return
-        speaker, style = found
-        try:
-            policy = engine.policy(speaker)
-        except EngineError as exc:
-            self._narration_status.setText(str(exc))
-            return
-        QMessageBox.information(
-            self,
-            "声の規約",
-            f"{speaker.name}（{style.name}） 表記: {catalog.credit(speaker)}\n\n"
-            + (policy or "エンジンが規約の文を返しませんでした エンジンのアプリで確かめてください"),
         )
 
     def _narration_url_value(self) -> str:

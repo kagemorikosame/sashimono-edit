@@ -82,6 +82,8 @@ class FakeVoiceEngine:
     queries: list[dict[str, Any]] = field(default_factory=list)
     #: 合成の前に待つ秒 待ちの試験で使う
     synthesis_delay: float = 0.0
+    #: 声の一覧を返す前に待つ秒 返事の遅いエンジンで窓が固まらないかを見る試験で使う
+    speakers_delay: float = 0.0
     #: 合成で返す番号 200 以外にすると断る
     synthesis_status: int = 200
     #: 全部の道に返す転送先 空でなければ 302 で飛ばす
@@ -151,6 +153,8 @@ def _handler(engine: FakeVoiceEngine) -> type[BaseHTTPRequestHandler]:
                 else:
                     self._json(engine.manifest)
             elif path == "/speakers":
+                if engine.speakers_delay:
+                    time.sleep(engine.speakers_delay)
                 self._json(engine.speakers)
             elif path == "/speaker_info":
                 uuid = (query.get("speaker_uuid") or [""])[0]

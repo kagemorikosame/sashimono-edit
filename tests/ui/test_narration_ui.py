@@ -43,6 +43,7 @@ from sashimono.ui.export_dialog import CREDIT_NOTE, ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.narration_dialog import NarrationChoice, NarrationDialog
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.voice_fetch import VoiceFetch
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending, make_loaded
 from tests.fake_clipboard import FakeClipboard
@@ -139,6 +140,15 @@ class TestPreference:
         assert loaded.narration_settings == chosen.narration_settings
 
 
+def _settle(fetch: VoiceFetch) -> None:
+    """エンジンへの問い合わせ（裏のスレッド）が終わり、窓へ返るまで画面の手を回す"""
+    deadline = time.monotonic() + 15
+    while fetch.running:
+        QApplication.processEvents()
+        time.sleep(0.005)
+        assert time.monotonic() < deadline, "エンジンへの問い合わせが終わらなかった"
+
+
 class TestDialog:
     def test_reading_the_engine_lists_voices_and_the_choice_is_returned(
         self, qt_application: QApplication, engine: FakeVoiceEngine
@@ -148,6 +158,7 @@ class TestDialog:
         dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
         try:
             dialog._read_voices()
+            _settle(dialog._voice_fetch)
             box = dialog._narration_voice
             names = [box.itemText(index) for index in range(box.count())]
             assert names == [
@@ -185,6 +196,7 @@ class TestDialog:
         )
         try:
             dialog._read_voices()
+            _settle(dialog._voice_fetch)
             assert "起動" in dialog._narration_status.text()
             # 選んでいた声は、エンジンが動いていなくても名前のまま残る
             assert dialog._narration_voice.currentText() == "ずんだもん（ノーマル）"
@@ -200,6 +212,7 @@ class TestDialog:
         dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url, narration_voice=42))
         try:
             dialog._read_voices()
+            _settle(dialog._voice_fetch)
             assert "このエンジンに無い" in dialog._narration_voice.currentText()
             assert dialog.preferences().narration_voice == 42
         finally:
@@ -213,6 +226,7 @@ class TestDialog:
         dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url, narration_voice=3))
         try:
             dialog._show_voice_terms()
+            _settle(dialog._voice_fetch)
             assert len(told) == 1
             assert "ずんだもんの規約 クレジットを書くこと" in told[0]
             assert "VOICEVOX:ずんだもん" in told[0]
@@ -241,13 +255,69 @@ class TestDialog:
             dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
             try:
                 dialog._read_voices()
+                _settle(dialog._voice_fetch)
                 dialog._narration_url.setText(other.url)
                 dialog._show_voice_terms()
+                _settle(dialog._voice_fetch)
                 assert len(told) == 1
                 assert "まおの規約" in told[0]
                 assert "AivisSpeech:まお" in told[0]
                 asked = [path for _method, path, _body in other.requests]
                 assert not any("388f246b" in path for path in asked)
+            finally:
+                dialog.deleteLater()
+
+    def test_a_slow_engine_does_not_freeze_the_settings(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、返事を止めたエンジンへ〔声の一覧を読む〕を押した人の設定の窓が、通信の
+        # 待ちの上限まで固まる（#401 の CodeRabbit の指摘）
+        del qt_application
+        engine.speakers_delay = 1.0
+        dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
+        try:
+            started = time.monotonic()
+            dialog._read_voices()
+            assert time.monotonic() - started < 0.5
+            assert "問い合わせています" in dialog._narration_status.text()
+            _settle(dialog._voice_fetch)
+            assert dialog._narration_voice.findData(3) >= 0
+        finally:
+            dialog.deleteLater()
+
+    def test_changing_the_place_resets_the_chosen_voice(self, qt_application: QApplication) -> None:
+        # 壊れると、別のエンジンでは同じ声の ID が別の声に当たるのに、場所だけ替えて OK を押した
+        # 人の既定の声が、知らない声になる（#401 の CodeRabbit の指摘）
+        del qt_application
+        dialog = PreferencesDialog(
+            Preferences(narration_voice=3, narration_voice_name="ずんだもん（ノーマル）")
+        )
+        try:
+            assert dialog.preferences().narration_voice == 3
+            dialog._narration_url.setText("http://127.0.0.1:10101")
+            assert dialog.preferences().narration_voice == AUTO_VOICE
+            assert dialog.preferences().narration_voice_name == ""
+            assert "選び直す" in dialog._narration_status.text()
+        finally:
+            dialog.deleteLater()
+
+    def test_the_engine_terms_are_shown_when_the_voice_has_none(
+        self, qt_application: QApplication, told: list[str]
+    ) -> None:
+        # 壊れると、声の規約が空のエンジンで「規約を返さなかった」と出し、エンジンが返した
+        # 利用規約を本人が見落とす（#401 の CodeRabbit の指摘）
+        del qt_application
+        with fake_voice_engine(FakeVoiceEngine(policies={})) as bare:
+            dialog = PreferencesDialog(
+                Preferences(narration_engine_url=bare.url, narration_voice=3)
+            )
+            try:
+                dialog._show_voice_terms()
+                _settle(dialog._voice_fetch)
+                assert len(told) == 1
+                assert "エンジンの利用規約" in told[0]
+                assert "VOICEVOX:ずんだもん" in told[0]
+                assert "返しませんでした" not in told[0]
             finally:
                 dialog.deleteLater()
 
@@ -369,6 +439,7 @@ class TestNarrationDialog:
             ok = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
             assert not ok.isEnabled()  # 声を読むまでは押せない
             dialog.read_voices()
+            _settle(dialog._fetch)
             assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
             assert not ok.isEnabled()  # 台本が空のうちは押せない
             dialog.set_text("こんにちは。")
@@ -389,11 +460,46 @@ class TestNarrationDialog:
         dialog = NarrationDialog(NarrationSettings(url=closed_engine_url()))
         try:
             dialog.read_voices()
+            _settle(dialog._fetch)
             dialog.set_text("こんにちは。")
             assert "起動" in dialog._status.text()
             assert not dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
         finally:
             dialog.deleteLater()
+
+    def test_a_slow_engine_does_not_freeze_the_narration_window(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、返事を止めたエンジンで〔ナレーションを作る…〕の窓が開く前から固まり、
+        # 〔やめる〕も押せない（#401 の CodeRabbit の指摘 設定の窓と同じ穴）
+        del qt_application
+        engine.speakers_delay = 1.0
+        dialog = NarrationDialog(NarrationSettings(url=engine.url, voice=3))
+        try:
+            started = time.monotonic()
+            dialog.read_voices()
+            assert time.monotonic() - started < 0.5
+            assert dialog.reading
+            _settle(dialog._fetch)
+            assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
+        finally:
+            dialog.deleteLater()
+
+    def test_the_narration_window_shows_the_engine_terms_too(
+        self, qt_application: QApplication, told: list[str]
+    ) -> None:
+        # 壊れると、ナレーションの窓の〔規約を見る〕が、声の規約が空のときにエンジンの利用規約を
+        # 見せない
+        del qt_application
+        with fake_voice_engine(FakeVoiceEngine(policies={})) as bare:
+            dialog = NarrationDialog(NarrationSettings(url=bare.url, voice=3))
+            try:
+                dialog._show_terms()
+                _settle(dialog._fetch)
+                assert len(told) == 1
+                assert "エンジンの利用規約" in told[0]
+            finally:
+                dialog.deleteLater()
 
     def test_a_too_long_script_cannot_be_made(
         self, qt_application: QApplication, engine: FakeVoiceEngine
@@ -403,6 +509,7 @@ class TestNarrationDialog:
         dialog = NarrationDialog(NarrationSettings(url=engine.url))
         try:
             dialog.read_voices()
+            _settle(dialog._fetch)
             dialog.set_text("あ" * (TEXT_LIMIT + 1))
             assert not dialog._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
         finally:
