@@ -21,6 +21,7 @@ import pytest
 
 from sashimono.ai import bridge as bridge_module
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.handoff import StopReason, TurnRecord, shelf_for
 from sashimono.ai.host import CompatReport, EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, Pending, find_operation
 from sashimono.ai.outbound import (
@@ -71,6 +72,17 @@ def _operation(name: str) -> Operation:
     found = find_operation(name)
     assert found is not None
     return found
+
+
+def put_handoff(host: FakeHost, instruction: str, failure: str) -> None:
+    """途中で止まった指示の引き継ぎ（#346）を置く AI は get_handoff で読む"""
+    record = TurnRecord()
+    record.begin(instruction)
+    record.failed(failure)
+    record.stop(StopReason.ERROR, failure)
+    handoff = record.handoff(host.document, "AI: 切って")
+    assert handoff is not None
+    shelf_for(host.document).put(handoff)
 
 
 @pytest.fixture
@@ -357,6 +369,8 @@ def _reading_host(host: FakeHost, transcript: Transcript, tmp_path: Path) -> set
         "preferences": {"theme": APP_MARK, "state_folder": str(SECRET_PATH.parent)},
         "shortcuts": {"編集/分割": "S"},
     }
+    # 途中で止まった指示の引き継ぎ（#346） 指示に字幕の文、失敗した道具の文に素材の場所が載る
+    put_handoff(host, f"「{sentence}」の所で切って", f"{SECRET_PATH} を開けません")
     # 混ぜた音の推移（#322 #338） 音の道具が待たずに結果（数の並びとグラフの絵）を返す道を通る
     # 入れないと、解析を頼んだだけの断りの文しか見ず、グラフの絵の宣言を外しても落ちない
     profiler = SoundProfiler(48000, 2)
@@ -1129,6 +1143,8 @@ def _marked_host(
     ]
     # 変える道具の例（WRITE_EXAMPLES）はテキストのクリップを指す
     _operation("add_text")(host, {"text": BODY_TEXT})
+    # 途中で止まった指示の引き継ぎ（#346） 失敗した道具の文に素材の場所が載る
+    put_handoff(host, "切って", f"C:/Users/{MARK}人/動画/{MARK}素材.mp4 を開けません")
     if scene == "消した後":
         placed = host.document.project.media[0]
         _operation("place_media")(host, {"media_id": str(placed.id)})

@@ -15,10 +15,11 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from sashimono.ai.budget import LimitAction, Limits
 from sashimono.ai.fixes import fixes_closed
+from sashimono.ai.handoff import Handoff, StopReason, shelf_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.plan import PAUSED_MESSAGE, RESUME_PROMPT, Stopped, plan_for
-from sashimono.ai.session import PLAN_RULES, AgentEvent, EventKind
+from sashimono.ai.session import LIMIT_DETAIL, PLAN_RULES, AgentEvent, EventKind
 from sashimono.core.model import MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.plan_box import PAUSE_TEXT, PAUSING_TEXT
@@ -88,6 +89,11 @@ def _mark(host: FakeHost, step: int, state: str) -> dict[str, Any]:
     result = _operation("update_plan_step")(host, {"step": step, "state": state})
     assert isinstance(result, dict)
     return result
+
+
+def _shelved(host: FakeHost) -> Handoff | None:
+    """棚に置いた今の作品の引き継ぎ（#346）"""
+    return shelf_for(host.document).current(host.document)
 
 
 def _log(widget: ChatPanel) -> str:
@@ -271,6 +277,25 @@ class TestPauseAndResume:
         assert "AI が仕上がりを直す回数" in box.stopped_text()
         assert box.resume_button.isEnabled()
 
+    def test_the_handoff_names_the_same_fix_limit(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、直しの回数の上限で手順を残した計画に、AI が言葉で締めて終えただけで引き継ぎが
+        # 作られず、計画は「直しの回数の上限」と言うのに引き継ぎは何も止まっていないことになる
+        widget, host, _ = made
+        host.fix_limit = 0
+        _send(widget, "仕上がりを直して書き出して")
+        _plan(host, "直す", "書き出す")
+        _mark(host, 1, "running")
+        _finish(host, [_MIXED_CLIP])
+        widget._handle(AgentEvent(EventKind.TEXT, text="直す回数の上限なのでここまでにします"))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.FIX_LIMIT.value in widget._plan_box.stopped_text()
+        handoff = _shelved(host)
+        assert handoff is not None and handoff.reason is StopReason.LIMIT
+        assert "直す回数の上限" in handoff.detail
+        assert "計画の手順が 2 個残っています（get_plan で読めます）" in handoff.remaining
+
     def test_resume_and_close_wait_while_answering(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
     ) -> None:
@@ -347,6 +372,75 @@ class TestPauseAndResume:
         widget._poll()
         assert widget._plan_box.isHidden() is True
         assert "前の作品の計画を閉じました" in _log(widget)
+
+
+class TestMatchesTheHandoff:
+    """計画の止まった訳（#340）と、止まった指示の引き継ぎ（#346）の訳が食い違わないこと"""
+
+    def test_an_interrupt_is_the_same_reason_in_both(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、引き継ぎに計画の手順が残ったことが載らず、続きの AI が計画を読まずに
+        # 前の指示の続きを始める
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める", "書き出す")
+        _mark(host, 1, "done")
+        widget.interrupt()
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.INTERRUPTED.value in widget._plan_box.stopped_text()
+        handoff = _shelved(host)
+        assert handoff is not None and handoff.reason is StopReason.INTERRUPTED
+        assert "計画の手順が 2 個残っています（get_plan で読めます）" in handoff.remaining
+
+    def test_a_person_interrupt_after_the_limit_is_an_interrupt_in_both(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、使う量の上限の後に人が〔中断〕を押した指示が、引き継ぎでは「中断」、計画の欄
+        # では「使う量の上限」と食い違い、どちらの訳で続ければよいか分からない
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "running")
+        _over_the_limit(widget)
+        with pytest.raises(ToolError, match="上限"):
+            widget._bridge.invoke(_operation("get_selection"), {})
+        widget.interrupt()
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.INTERRUPTED.value in widget._plan_box.stopped_text()
+        handoff = _shelved(host)
+        assert handoff is not None and handoff.reason is StopReason.INTERRUPTED
+
+    def test_a_claude_code_limit_is_a_limit_in_both(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、Claude Code の上限（手数・費用）で止まった計画が「手順を残して応え終えました」
+        # と残り、引き継ぎの「上限で止まりました」と食い違う 送り直せば続くことも欄から読めない
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "running")
+        widget._handle(AgentEvent(EventKind.ERROR, text="上限に達しました", detail=LIMIT_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.LIMIT.value in widget._plan_box.stopped_text()
+        handoff = _shelved(host)
+        assert handoff is not None and handoff.reason is StopReason.LIMIT
+
+    def test_pausing_makes_no_handoff(
+        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、人が区切りで止めただけの指示が「止まった」として引き継ぎの欄を出し、
+        # 計画の欄の〔続ける〕と引き継ぎの〔続きを頼む〕の 2 つの続け方が並ぶ
+        widget, host, _ = made
+        _send(widget, "無音を詰めて書き出して")
+        _plan(host, "無音を探す", "詰める")
+        _mark(host, 1, "running")
+        assert plan_for(host.document).request_pause()
+        _mark(host, 1, "done")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert Stopped.PAUSED.value in widget._plan_box.stopped_text()
+        assert _shelved(host) is None
+        assert widget._handoff_box.isHidden() is True
 
 
 class TestPlanPreference:

@@ -14,6 +14,7 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.fixes import fixes_closed
+from sashimono.ai.handoff import GET_HANDOFF
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import AI_ONLY
 from sashimono.ai.operations import OPERATIONS, Operation, find_operation
@@ -258,6 +259,20 @@ class TestPause:
         answer_sends(bridge, done, lambda _request: SendAnswer.ALWAYS)
         assert box.get("error") is None
 
+    def test_the_handoff_can_be_read_after_the_pause(self, host: FakeHost) -> None:
+        # 壊れると、区切りで止めた後の AI が引き継ぎ（#346）を読めず、前の指示で何が残ったかを
+        # 確かめないまま、済んだ手順と残りを言葉だけで人に伝える
+        bridge = EditorBridge(host)
+        _plan(host)
+        bridge.plan.request_pause()
+        _mark(host, 1, "done")
+        assert bridge.plan.refusal(GET_HANDOFF) == ""
+        done, box = call_in_thread(bridge, _operation(GET_HANDOFF), {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.ALWAYS)
+        assert box.get("error") is None
+        # 引き継ぎのほかの読むだけの道具は今までどおり断る（通すのは計画と引き継ぎだけ）
+        assert bridge.plan.refusal("list_clips") == PAUSED_MESSAGE
+
     def test_a_new_instruction_lifts_the_pause(self, host: FakeHost) -> None:
         # 壊れると、止めた後に送った指示（〔続ける〕も）まで全部断られる
         plan = plan_for(host.document)
@@ -282,10 +297,11 @@ class TestPause:
             (True, False, False, Stopped.INTERRUPTED),
             (False, True, False, Stopped.PAUSED),
             (False, False, False, Stopped.ENDED),
-            # 使う量の上限（#344）で止めた指示 止めた後も道具を呼び続けて会話ごと止めた
-            # （中断）ときも、訳は上限
+            # 使う量の上限（#344）で止めた指示 止めた後も道具を呼び続けてアプリが会話ごと
+            # 止めたときは、画面が中断と渡さないので訳は上限
             (False, False, True, Stopped.LIMIT),
-            (True, False, True, Stopped.LIMIT),
+            # 上限の後に人が〔中断〕を押した 引き継ぎ（#346）と同じく人の中断を一番強くする
+            (True, False, True, Stopped.INTERRUPTED),
         ],
     )
     def test_the_reason_for_stopping_is_kept(

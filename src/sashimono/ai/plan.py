@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from sashimono.ai.handoff import GET_HANDOFF
 from sashimono.ai.host import ToolError
 from sashimono.core.commands import Document
 
@@ -30,6 +31,7 @@ __all__ = [
     "GOAL_LIMIT",
     "INSTRUCTION_LIMIT",
     "NOTE_LIMIT",
+    "PASSES_AFTER_PAUSE",
     "PAUSED_MESSAGE",
     "PLAN_TOOLS",
     "RESUME_PROMPT",
@@ -51,6 +53,10 @@ GET_PLAN = "get_plan"
 #: 計画の道具 設定で計画を切った人の会話には渡さない 止めた後も計画の道具だけは通す
 #: （止めた所を書き終え、読めるように）
 PLAN_TOOLS = frozenset({SET_PLAN, UPDATE_PLAN_STEP, GET_PLAN})
+#: 区切りで止めた後も通す道具 計画の道具と、止まった指示の引き継ぎを読む道具（#346）
+#: 引き継ぎは読むだけで作品を変えず、続きを頼む前に前の指示で何が残ったかを知るのに要る
+#: 断ると、止めた後の AI が引き継ぎを確かめられず、残りを言葉だけで伝えることになる
+PASSES_AFTER_PAUSE = PLAN_TOOLS | {GET_HANDOFF}
 
 #: 手順の数 30 を超えると欄で追えない 超えるなら手順をまとめさせる 下限は 1 にしておく
 #: 続きの指示の中で、残り 1 手順の計画を作り直せるように 2 に上げると、残りが 1 つの続きで
@@ -315,8 +321,9 @@ class WorkPlan:
         """区切りで止めた後に断る文 断らない道具なら空
 
         計画の道具は通す 止めた後に済んだ印を書き終え、止めた所を読めるように
+        引き継ぎを読む道具（#346）も通す（:data:`PASSES_AFTER_PAUSE`）
         """
-        if tool in PLAN_TOOLS or not self.paused:
+        if tool in PASSES_AFTER_PAUSE or not self.paused:
             return ""
         return PAUSED_MESSAGE
 
@@ -354,8 +361,11 @@ class WorkPlan:
     def end_turn(self, *, interrupted: bool, limited: bool = False, fixed: bool = False) -> None:
         """指示が終わった 手順が残っていれば、止まった訳を覚える
 
-        ``limited`` は使う量の上限（#344）で止めた指示 上限で止めた後も道具を呼び続けて
-        会話ごと止めた（中断）ときも、止めた訳は上限 会話の欄の区切りの行（「上限で停止」）と揃える
+        ``interrupted`` は人が〔中断〕を押した指示 引き継ぎ（#346）と同じく一番強い訳にする
+        上限で止めた後も道具を呼び続けてアプリが会話ごと止めたときは、画面が中断と渡さない
+        （止めた訳は上限 引き継ぎも人の中断と書かない）
+        ``limited`` は使う量の上限（#344）か Claude Code の上限（手数・費用）で止めた指示
+        会話の欄の区切りの行（「上限で停止」）と揃える
         ``fixed`` は検査の直しの回数の上限（#339）に達した指示 区切りまで来て止めた後なら
         ブリッジは区切りの方を先に断るので、訳は区切り まだ区切りに来ていなければ、残りの
         編集を断ったのは回数の上限なので、止めを頼んであっても訳は回数の上限
@@ -363,10 +373,10 @@ class WorkPlan:
         with self._lock:
             unfinished = any(not step.state.finished for step in self._steps)
             if unfinished:
-                if limited:
-                    self._stopped = Stopped.LIMIT
-                elif interrupted:
+                if interrupted:
                     self._stopped = Stopped.INTERRUPTED
+                elif limited:
+                    self._stopped = Stopped.LIMIT
                 elif self._paused:
                     self._stopped = Stopped.PAUSED
                 elif fixed:

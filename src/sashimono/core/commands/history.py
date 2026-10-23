@@ -81,6 +81,8 @@ class Document:
         #: 回数 #339）が、新しい指示に替わったことをこれで知る 名前で見分けると、同じ文の
         #: 指示を続けたときに数え直さない
         self._checkpoint_serial = 0
+        #: 作品を差し替えた回数（:attr:`generation`）
+        self._generation = 0
         #: 誰の変更を何回積んだか（:meth:`changes_by`） 段の中の段は閉じたときに 1 回と数える
         self._changes: dict[Author, int] = dict.fromkeys(Author, 0)
         #: 最後に積んだ段 続けて行う操作（ホイールで高さを変えるなど）は、この段が
@@ -106,24 +108,17 @@ class Document:
         #: 積んでも、この段（指示）の物として数える（:attr:`undo_in_checkpoint`）
         #: 段を覚えず ``before`` で見分けるのは、取り消して・やり直すと段が作り直されるため
         self._earlier_parts: list[Project] = []
+        #: 前半として先に積んだ段ごとの、段の中の小さな段の名前と、別の人の変更で割ったか
+        #: （偽なら検査の直しの回で区切った :meth:`split_checkpoint`） 段の ``before`` で引く
+        #: 先に積むと段の中の小さな段は捨てるので、ここに写さないと「この指示で変えた手」から
+        #: 前半の手が消える（引き継ぎ #346 が、AI が変えた後に人が割ると「変えた手 0 件」と出した）
+        self._earlier_steps: list[tuple[Project, tuple[str, ...], bool]] = []
         #: 開いている一番外の段の中で作品を差し替えたか（:attr:`replaced_in_checkpoint`）
         self._replaced = False
         #: この文書が一度でも持った素材と作品の名前 :attr:`seen_media` を見る
         self._seen_media: set[SeenMedia] = set()
         self._seen_names: set[str] = set()
-        #: 別の作品へ差し替えた（:meth:`reset`）回数 :attr:`generation` を見る
-        self._generation = 0
         self._remember(project)
-
-    @property
-    def generation(self) -> int:
-        """別の作品へ差し替えるたびに 1 つ増える数
-
-        作品の外で、開いている作品に付けて持つ物（AI の作業の計画 #340）が、今の作品の物かを
-        見分けるのに使う 文書は作品を開き直しても同じ物を使い回すので、文書だけで見ると
-        前の作品の計画を次の作品で続けてしまう
-        """
-        return self._generation
 
     @property
     def seen_media(self) -> tuple[SeenMedia, ...]:
@@ -259,6 +254,7 @@ class Document:
             self._checkpoint_by = by or Author.PERSON
             self._reset_inner()
             self._earlier_parts = []
+            self._earlier_steps = []
         elif self._checkpoint_depth == 1:
             if self._replaced and (by or self._checkpoint_by) is Author.AI:
                 # 人の変更は通す 開き直した作品を人が触るのは止めない
@@ -287,6 +283,7 @@ class Document:
         touched = self._inner_touched
         self._reset_inner()
         self._earlier_parts = []
+        self._earlier_steps = []
         changed = before is not None and before is not self._project
         if touched:
             # 段の中で変えた後は、段の外の古いやり直しは当てられない 段の中で最後に
@@ -350,6 +347,7 @@ class Document:
         if own_before is not None and own_before is not before:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
+            self._note_earlier_steps(own_before, by_other=True)
         self._reset_inner()
         top = self._undo[-1] if self._undo else None
         continued = (
@@ -387,6 +385,18 @@ class Document:
         return self._checkpoint_depth > 0
 
     @property
+    def generation(self) -> int:
+        """作品を差し替えた回数（:meth:`reset` のたびに 1 つ増える 編集・取り消しでは変わらない）
+
+        同じ作品のままかを見るのに使う（引き継ぎ #346） 履歴の中の形で見ると、履歴の上限を
+        超えて編集した後は止まった時の形が履歴から落ち、同じ作品なのに別の作品と見なす
+        作品の外で開いている作品に付けて持つ物（AI の作業の計画 #340）も、今の作品の物かを
+        これで見分ける 文書は作品を開き直しても同じ物を使い回すので、文書だけで見ると
+        前の作品の計画を次の作品で続けてしまう
+        """
+        return self._generation
+
+    @property
     def checkpoint_serial(self) -> int:
         """一番外の段を開いた回数 開くたびに 1 つ増える（段を開いていなくても前の値のまま）"""
         return self._checkpoint_serial
@@ -422,6 +432,7 @@ class Document:
         if own_before is not None and own_before is not self._project:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
+            self._note_earlier_steps(own_before, by_other=False)
             self._reset_inner()
             # 新しい段を積んだので、前に取り消した物はやり直せない（人の変更で割るときと同じ）
             self._redo.clear()
@@ -460,6 +471,50 @@ class Document:
         別の人の段の下にあると戻せない AI に「前半は戻していない」と伝えるのに使う
         """
         return any(self._is_earlier_part(entry) for entry in self._undo)
+
+    def _note_earlier_steps(self, before: Project, *, by_other: bool) -> None:
+        """前半として先に積む段の、段の中の手の名前を写す（積む直前 段の中を捨てる前に呼ぶ）
+
+        同じ ``before`` の前の写しは捨てる 同じ形から前半を積み直すのは、前の前半を段の外で
+        戻した後だけで（戻さずに続けると ``before`` は新しい形になる）、戻した前半はもう
+        やり直せない（新しい段を積むとやり直しは消える） 残すと履歴の前半 1 つに前と今の
+        写しの両方が当たり、戻した手を変えた手に数え、区切った数も 1 多くなる（CodeRabbit #396）
+        """
+        self._earlier_steps = [noted for noted in self._earlier_steps if noted[0] is not before]
+        self._earlier_steps.append((before, self.steps_in_checkpoint, by_other))
+
+    def _parts_left(self) -> list[tuple[tuple[str, ...], bool]]:
+        """前半の段のうち、段の外の履歴に今も残っている物の（手の名前, 別の人が割ったか） 古い順
+
+        段の中で戻して段の外のやり直しへ移った前半は数えない 戻した手は作品に残っていない
+        """
+        if not self._checkpoint_depth:
+            return []
+        present = [entry.before for entry in self._undo if self._is_earlier_part(entry)]
+        return [
+            (steps, by_other)
+            for before, steps, by_other in self._earlier_steps
+            if any(before is part for part in present)
+        ]
+
+    @property
+    def steps_split_off(self) -> tuple[str, ...]:
+        """前半として先に積んだ段の中の小さな段の名前 古い順 段を開いていなければ空
+
+        :attr:`steps_in_checkpoint` は最後に割った後の手だけなので、前に足すと指示全体の手になる
+        人の変更で割った分も、検査の直しの回で区切った分（#339）も入る 引き継ぎ（#346）が使う
+        """
+        return tuple(name for steps, _ in self._parts_left() for name in steps)
+
+    @property
+    def parts_split_by_others(self) -> int:
+        """前半の段のうち、別の人の変更で割れた所の数（段の外に残っている物）"""
+        return sum(1 for _, by_other in self._parts_left() if by_other)
+
+    @property
+    def parts_split_for_rounds(self) -> int:
+        """前半の段のうち、検査の直しの回で区切った所の数（段の外に残っている物 #339）"""
+        return sum(1 for _, by_other in self._parts_left() if not by_other)
 
     def _is_earlier_part(self, entry: HistoryEntry) -> bool:
         return entry.by is self._checkpoint_by and any(
@@ -627,6 +682,7 @@ class Document:
         if self._checkpoint_depth:
             self._reset_inner()
             self._earlier_parts = []
+            self._earlier_steps = []
             self._checkpoint_before = project
             self._replaced = True
         self._set_project(project)

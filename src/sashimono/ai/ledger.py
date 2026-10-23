@@ -706,6 +706,9 @@ AI_ONLY: dict[str, str] = {
     "get_selection": READING,
     "list_effects": READING,
     "get_history": READING,
+    # 途中で止まった指示の引き継ぎ（#346） 人は AI のパネルの引き継ぎの欄で読む
+    # 欄の〔コピー〕〔続きを頼む〕はパネルの外のメニュー・右クリック・ボタンの操作ではない
+    "get_handoff": READING,
     "preview_frame": READING,
     "contact_sheet": READING,
     "preview_range": READING,
