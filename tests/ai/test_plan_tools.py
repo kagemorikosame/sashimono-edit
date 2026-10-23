@@ -344,6 +344,20 @@ class TestBelongsToTheProject:
         assert plan_for(host.document).view() is None
         assert _read(host)["plan"] is None
 
+    def test_the_ai_opening_a_project_within_the_instruction_closes_the_plan(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、AI が指示の中で新しい作品へ差し替えた（#349）後も前の作品の計画が残り、
+        # 〔続ける〕で前の作品の手順を新しい作品に当てに行く
+        host.document.begin_checkpoint("AI: 作り直して", by=Author.AI)
+        _plan(host)
+        host.saved_project = host.document.project
+        host.start_new_project(resolution=None, frame_rate=None)
+        assert host.document.replaced_in_checkpoint
+        assert plan_for(host.document).view() is None
+        assert _read(host)["plan"] is None
+        host.document.end_checkpoint()
+
     def test_the_bridge_sees_the_same_plan_after_reopening(
         self, host: FakeHost, video_media: MediaItem, transcript: Transcript
     ) -> None:

@@ -336,8 +336,8 @@ class EditorBridge:
         回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 送る前の同意と確かめの窓を
         出す前に断る
         出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
-        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
-        取り消せない操作の道を通るので、ここへは来ない
+        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しと
+        開く・新規（#349）は取り消せない操作の道を通るので、ここへは来ない
         """
         if operation.name in PASSES_AFTER_LIMIT:
             return
@@ -437,9 +437,10 @@ class EditorBridge:
         """上限に当たっていれば、設定に従って尋ねるか断る 続けてよければ戻る
 
         絵を返す道具は、これから送る 1 枚を足して確かめる 送ってから数えると、上限の 1 枚
-        先まで描いて送ってしまう
+        先まで描いて送ってしまう 絵をクリップボードへ出すだけの道具（``copy_snapshot``）は
+        AI へ絵を返さないので足さない
         """
-        adding = 1 if Outbound.FRAMES in operation.sends else 0
+        adding = 1 if operation.returns_frames else 0
         while (overrun := self.usage.overrun(adding_images=adding)) is not None:
             if self.usage.stopped is not None:
                 self._refused_after_stop += 1

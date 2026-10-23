@@ -63,6 +63,8 @@ OWN_LIBRARY = {
     "seam_style",
     "reframe_style",
     "template_shelf",
+    # カスタムオブジェクトの名前（#349） 本人の置き場のスクリプト 道具はアプリの設定を送ると書く
+    "custom_objects",
     # 互換性レポート（#352） 本人のアプリが覚えた記録 スクリプトの置き場の場所は一覧の
     # script_folders の項目で値ごと伏せ、失敗の文に混ざる場所は形で伏せる
     "compat_report",
@@ -82,6 +84,21 @@ PROJECT_SIDE = {
     "selected_clips",
     "select_clips",
     "apply_commands",
+    # コピー・切り取り・貼り付け（#349） 置き場はタイムラインの写しで、道具が返すのは
+    # クリップの ID と長さだけ 素材の消えた写しは貼る所で断る（断る文に名前は無い）
+    "clipboard",
+    "set_clipboard",
+    "insert_paste_all_tracks",
+    # 開く・新規（#349） 何も返さない 開いた作品の場所は remembered_names からも返す
+    "is_modified",
+    "open_project_file",
+    "start_new_project",
+    # スクリプトを読み直す（本数だけ返す）・配置のテンプレート（命令だけ返す #349）
+    "reload_scripts",
+    "alignment_commands",
+    # OS のクリップボードへ置く（#349） 返すのは描いたフレームだけ
+    "copy_snapshot_image",
+    "copy_text",
     # 取り消しとやり直し（#333） 作品の履歴を辿るだけで、何も返さない
     "undo",
     "redo",
@@ -247,6 +264,9 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # カスタムオブジェクト（#349） 一覧と、無い名前の断りに置き場のスクリプトの名前が載る
+            "list_custom_objects",
+            "add_custom_object",
             # 互換性レポート（#352） 本人のアプリの記録を返す
             "get_compat_report",
             # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
