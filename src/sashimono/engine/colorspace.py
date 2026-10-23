@@ -26,9 +26,11 @@ from av.video.reformatter import (
 
 __all__ = [
     "VideoReformatter",
+    "bt709_planes",
     "color_tags",
     "source_matrix",
     "tag_bt709",
+    "tag_frame_bt709",
     "to_bt709",
     "to_rgb_array",
 ]
@@ -142,9 +144,31 @@ def to_bt709(
     )
     # 色域と転送特性は値を変えずにタグだけ付ける reformat の dst_color_trc などに
     # 渡すと swscale が曲線の変換を試み、未対応の組み合わせでは失敗する
-    converted.color_primaries = ColorPrimaries.BT709
-    converted.color_trc = ColorTrc.BT709
+    tag_frame_bt709(converted)
     return converted
+
+
+def tag_frame_bt709(frame: av.video.frame.VideoFrame) -> None:
+    """BT.709 / limited で変換済みの YUV のフレームに、そのタグを付ける
+
+    :func:`to_bt709` の出すフレームと同じタグにする GPU で変換したフレーム（#372）は
+    タグが空のまま届くので、付けないと 2 つの道でエンコーダへ渡るフレームが食い違い、
+    エンコーダの側で行列を当て直す変換が挟まりうる
+    """
+    frame.colorspace = Colorspace.ITU709
+    frame.color_range = ColorRange.MPEG
+    frame.color_primaries = ColorPrimaries.BT709
+    frame.color_trc = ColorTrc.BT709
+
+
+def bt709_planes(image: np.ndarray, pixel_format: str) -> np.ndarray:
+    """RGBA の ``(高さ, 幅, 4)`` uint8 を、書き出しと同じ CPU の変換で YUV の面の配列へ
+
+    GPU の変換（#372）を確かめる物差し 形は PyAV の ``to_ndarray`` が返すもの
+    （yuv420p と nv12 なら ``(高さ x 1.5, 幅)``）
+    """
+    frame = av.video.frame.VideoFrame.from_ndarray(image, format="rgba")
+    return to_bt709(frame, pixel_format).to_ndarray()
 
 
 def color_tags(stream: av.video.stream.VideoStream) -> tuple[str, str]:

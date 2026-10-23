@@ -66,6 +66,7 @@ from sashimono.engine.encode import (
     MEASURED_DECODE_MS,
     MEASURED_EXPORT_MS,
     MEASURED_EXPORT_TOTAL_MS,
+    MEASURED_GPU_COLOR_MS,
 )
 from sashimono.engine.encoders import (
     PRIORITY_AMD,
@@ -350,6 +351,19 @@ class PreferencesDialog(QDialog):
             "メモリが足りない機械では「重ねない」にする"
         )
         form.addRow("書き出しの先読み", self._pipeline_depth)
+
+        cpu_ms, gpu_ms = MEASURED_GPU_COLOR_MS
+        self._export_gpu_color = QCheckBox("書き出しの色変換を GPU で行う（速い）", self)
+        self._export_gpu_color.setChecked(preferences.export_gpu_color)
+        self._export_gpu_color.setToolTip(
+            "合成した絵を動画用の色（BT.709）へ直す所を GPU で行い、運ぶ量も減らす "
+            f"1080p で素材を 3 枚重ねた書き出しが、1 コマ {cpu_ms}ms から {gpu_ms}ms になった "
+            "色の差は 8bit の丸めの 1 まで "
+            "書き出す前に、縞と乱数の試験の絵を書き出しと同じ大きさで CPU の変換と比べ、"
+            "食い違えば自分で CPU に戻る（暗転で始まる動画でも確かめられる） "
+            "書き出した動画の色や絵が乱れるときは切る"
+        )
+        form.addRow(self._export_gpu_color)
 
         self._export_chapters = QCheckBox("マーカーをチャプターとして埋める", self)
         self._export_chapters.setChecked(preferences.export_chapters)
@@ -1051,6 +1065,7 @@ class PreferencesDialog(QDialog):
         filling, showing = MEASURED_PREFETCH_MS
         compose, readback, convert, muxing = MEASURED_EXPORT_MS
         serial_ms, pipelined_ms = MEASURED_EXPORT_TOTAL_MS
+        cpu_ms, gpu_ms = MEASURED_GPU_COLOR_MS
         one_thread, many_threads = MEASURED_DECODE_MS
         note = QLabel(
             f"4K を 3 枚重ねたときの実測（1 コマ {BUDGET_MS:.1f}ms が 60fps の目安）\n"
@@ -1068,6 +1083,7 @@ class PreferencesDialog(QDialog):
             "（1920x1080 を 3 枚重ね、NVIDIA GPU）\n"
             f"後ろの 2 つを重ねると、書き出し全体で 1 枚 {serial_ms:.1f}ms の所が"
             f" {pipelined_ms:.1f}ms になる\n"
+            f"色変換を GPU で行うと、同じ書き出しが 1 枚 {cpu_ms}ms の所が {gpu_ms}ms になる\n"
             f"レイヤーを並べてデコードすると、同じ素材の合成が 1 枚 {one_thread:.1f}ms の所が"
             f" {many_threads:.1f}ms になる この機械で測るには tools\\bench_export.py",
             self,
@@ -1150,6 +1166,7 @@ class PreferencesDialog(QDialog):
             prefetch_budget_mb=int(self._prefetch_budget.currentData()),
             prefetch_thread=self._prefetch_thread.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
+            export_gpu_color=self._export_gpu_color.isChecked(),
             export_chapters=self._export_chapters.isChecked(),
             encoder_priority=str(self._encoder_priority.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
