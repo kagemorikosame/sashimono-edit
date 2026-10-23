@@ -314,7 +314,9 @@ class TurnRecord:
         self._fix_parts = document.parts_split_for_rounds
         # 直す回数の上限で止めた（#339） AI は止めた訳を聞いて言葉で締めるだけなので、ここで
         # 書かないと「止まらずに終えた」扱いになり、残った問題が人に届かない
-        stopped = fix_stop(document)
+        # 指示の中で作品を開き直した（#349 の開く・新規）後は書かない 上限と残った問題は閉じた
+        # 作品の物で、書くと続きを頼まれた AI が今の作品に無いクリップを直しに行く
+        stopped = None if document.replaced_in_checkpoint else fix_stop(document)
         if stopped is not None:
             self.stop(StopReason.LIMIT, stopped.text())
             for item in stopped.left:

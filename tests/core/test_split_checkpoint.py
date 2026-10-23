@@ -6,7 +6,10 @@ AI が検査で見つけた問題を直すたびに、直した回だけを人�
 
 from __future__ import annotations
 
+import pytest
+
 from sashimono.core.commands import Author, Document, RenameProject
+from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.model import Project
 
 
@@ -193,3 +196,51 @@ class TestChangesBy:
             pass
         document.end_checkpoint()
         assert document.changes_by(Author.AI) == 0
+
+
+class TestReopenWithinInstruction:
+    """指示の中で作品を開き直した（#349 の開く・新規）ときの、割った前半の手と数え（#346）"""
+
+    def test_reopening_drops_the_names_split_off_from_the_closed_project(
+        self, project: Project
+    ) -> None:
+        """壊れると、AI が作品を開き直した後に止まった指示の引き継ぎに、閉じた作品の手が
+        「この作品で変えた手」として並び、人が開き直した作品に無い変更を探して戻そうとする
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        _named(document, "2")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        assert document.steps_split_off
+        document.reset(Project.create(), within_checkpoint=True)
+        assert not document.steps_split_off
+        assert not document.steps_in_checkpoint
+        assert (document.parts_split_by_others, document.parts_split_for_rounds) == (0, 0)
+
+    def test_the_ai_is_refused_but_the_person_is_counted_after_reopening(
+        self, project: Project
+    ) -> None:
+        """壊れると、開き直した後の AI の編集が通って指示の取り消しが前の作品の段を指すか、
+        人の変更まで断る・数え落として、検査の直しの回の数えが人の手を AI の手と取り違える
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _named(document, "1")
+        document.split_checkpoint("AI: 検査の直し（1 回目）")
+        document.reset(Project.create(), within_checkpoint=True)
+        with pytest.raises(ValueError, match=REPLACED_REFUSAL):
+            document.execute(RenameProject("AI の続き"))
+        with (
+            pytest.raises(ValueError, match=REPLACED_REFUSAL),
+            document.checkpoint("AI の道具", by=Author.AI),
+        ):
+            _named(document, "2")
+        document.execute(RenameProject("人"), by=Author.PERSON)
+        assert document.changes_by(Author.AI) == 1
+        assert document.changes_by(Author.PERSON) == 1
+        # 人の変更で段が割れても、閉じた作品の前半の手は戻ってこない
+        assert not document.steps_split_off
+        document.end_checkpoint()
+        assert not document.replaced_in_checkpoint

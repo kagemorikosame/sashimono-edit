@@ -33,10 +33,30 @@ from sashimono.ai.command_ledger import COMMANDS_WITHOUT_TOOLS, Why
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import CHILD_ISSUES
 from sashimono.ai.operations import OPERATIONS, find_operation
+from sashimono.compat.aviutl.catalog import ScriptCatalog
 from sashimono.compat.looks import capture_preset
-from sashimono.core.commands import Command, Document, InScene, RemoveClip, RenameTrack
+from sashimono.core.commands import (
+    AddClip,
+    Command,
+    Document,
+    InScene,
+    ParamPath,
+    RemoveClip,
+    RenameTrack,
+    SetParam,
+)
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
-from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript
+from sashimono.core.io.atomic import expect_now
+from sashimono.core.io.serialize import save_project
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    MediaItem,
+    Project,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.core.model.ids import ClipId, TrackId
 from sashimono.effects.sources import TEXT
 from tests.ai.conftest import FakeHost
@@ -276,6 +296,117 @@ def _import_objects(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "import_objects", {"path": str(source)}
 
 
+def _with_effects(tool: str, **extra: Any) -> Example:
+    # エフェクトを 2 つ付けてから 1 つ目を指す 並べ替えは 2 つ無いと動かす先が無い
+    def example(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+        host = _text_host(material)
+        text = _ids(host)["text"]
+        effect = _run(host, "add_effect", clip_id=text, kind="blur")["effect_id"]
+        _run(host, "add_effect", clip_id=text, kind="blur")
+        if tool == "set_effect_enabled":
+            return host, tool, {"clip_id": text, "effect_ids": [effect], **extra}
+        return host, tool, {"clip_id": text, "effect_id": effect, **extra}
+
+    return example
+
+
+def _with_keyframes(tool: str) -> Example:
+    def example(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+        host = _text_host(material)
+        text = _ids(host)["text"]
+        frame = _run(host, "add_keyframe", clip_id=text, name="size", value=60)["frame"]
+        _run(host, "add_keyframe", clip_id=text, name="size", value=80, frame=frame + 10)
+        return host, tool, {"clip_id": text, "name": "size", "frame": frame}
+
+    return example
+
+
+def _paste(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    host = _text_host(material)
+    _run(host, "copy_clips", clip_ids=[_ids(host)["text"]])
+    return host, "paste_clips", {"insert": True}
+
+
+def _remove_track(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 中身のあるトラックは断るので、空のトラックを足してから消す
+    host = _text_host(material)
+    track = _run(host, "add_track", kind="video", name="空")["track_id"]
+    return host, "remove_track", {"track_id": track}
+
+
+def _scene(tool: str, **extra: Any) -> Example:
+    def example(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+        host = _text_host(material)
+        scene = _run(host, "add_scene", name="場面", open=False)["scene_id"]
+        return host, tool, {"scene_id": scene, **extra}
+
+    return example
+
+
+def _remove_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 使っている素材は断るので、置いたクリップを先に消す
+    host = _text_host(material)
+    ids = _ids(host)
+    _run(host, "delete_clip", clip_id=ids["video"])
+    return host, "remove_media", {"media_id": ids["media"]}
+
+
+def _split_subtitle(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 1 枚目の字幕は 1〜3 秒 その内側で割る
+    host = _text_host(material)
+    ids = _ids(host)
+    arguments = {"media_id": ids["media"], "segment_id": ids["segment"], "at_seconds": 2}
+    return host, "split_subtitle", arguments
+
+
+def _saved_host(material: Material) -> FakeHost:
+    """保存したての作品と、同じフォルダの別の作品 第二稿.sme 開く・新規は保存していないと断る"""
+    host = _text_host(material)
+    host.saved_at = material.tmp_path / "作品.sme"
+    host.write_project(host.saved_at, adopt=False, expect=expect_now(host.saved_at))
+    save_project(replace(Project.create(), name="第二稿"), material.tmp_path / "第二稿.sme")
+    return host
+
+
+def _open_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    return _saved_host(material), "open_project", {"path": "第二稿.sme"}
+
+
+def _new_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    return _saved_host(material), "new_project", {"width": 1280, "height": 720}
+
+
+def _custom_object(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    host = _text_host(material)
+    catalog = ScriptCatalog(roots=())
+    host.scripts = [catalog.add_text("aviutl:試験.obj:円", "@円\n", kind="obj")]
+    return host, "add_custom_object", {"name": "円", "at_frame": 400}
+
+
+def _align(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 偽のホストは描かないので枠を持たない プレビューが作る命令を入れておく
+    host = _text_host(material)
+    text = ClipId(_ids(host)["text"])
+    host.aligned = [SetParam(ParamPath.of_source(text, "size"), AnimatedValue(80.0))]
+    return host, "align_clip", {"clip_id": str(text), "anchor": "top_left"}
+
+
+def _standard_layout(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # AviUtl2 の組み方で灰色になっているテキストだけが切り替わる
+    host = _text_host(material)
+    greyed = with_fixed_items(
+        Clip(
+            timeline_start=400,
+            duration=90,
+            source=TEXT.create(text="字", layout="aviutl", align="right"),
+        ),
+        picture=True,
+    )
+    track = host.document.project.timeline.tracks[0]
+    host.apply_commands([AddClip(track.id, greyed)], "置く")
+    return host, "use_standard_layout", {"clip_ids": [str(greyed.id)]}
+
+
 #: ``WRITE_EXAMPLES`` の例では断られる道具と、別のコマンドを通る引数 足すときは、その例で
 #: 道具が断られずに通ることを ``test_every_example_goes_through`` が確かめる
 EXAMPLES: dict[str, Example] = {
@@ -305,6 +436,23 @@ EXAMPLES: dict[str, Example] = {
     "place_template": _template("place_template"),
     "apply_template": _template("apply_template"),
     "import_objects": _import_objects,
+    # 画面と同じ道具（#349） WRITE_EXAMPLES は無い物や中身のある入れ物を指して断られる道を見る
+    "paste_clips": _paste,
+    "remove_track": _remove_track,
+    "rename_scene": _scene("rename_scene", name="場面 2"),
+    "remove_scene": _scene("remove_scene"),
+    "remove_media": _remove_media,
+    "remove_effect": _with_effects("remove_effect"),
+    "move_effect": _with_effects("move_effect", index=1),
+    "set_effect_enabled": _with_effects("set_effect_enabled", enabled=False),
+    "remove_keyframe": _with_keyframes("remove_keyframe"),
+    "clear_keyframes": _with_keyframes("clear_keyframes"),
+    "split_subtitle": _split_subtitle,
+    "open_project": _open_project,
+    "new_project": _new_project,
+    "add_custom_object": _custom_object,
+    "align_clip": _align,
+    "use_standard_layout": _standard_layout,
 }
 
 

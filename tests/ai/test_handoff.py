@@ -490,3 +490,18 @@ class TestFixLoop:
         assert handoff is not None
         assert handoff.reason is StopReason.LIMIT
         assert "1 回断りました" in handoff.detail
+
+    def test_the_limit_of_a_closed_project_is_not_handed_to_the_reopened_one(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、直す回数の上限に達した後に AI が新しい作品へ差し替えた（#349）指示で、
+        # 閉じた作品の残った問題が新しい作品の引き継ぎに「残り」として並び、
+        # 続きを頼まれた AI が今の作品に無いクリップを直しに行く
+        host.fix_limit = 1
+        host.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _finish(host, [_MIXED_CLIP])
+        _fix(host, "直し 1")
+        assert _finish(host, [_MIXED_CLIP])["fix_round"]["closed"] is True
+        host.saved_project = host.document.project
+        host.start_new_project(resolution=None, frame_rate=None)
+        assert self._record(host).handoff(host.document, "AI: 仕上げて") is None
