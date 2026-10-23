@@ -88,6 +88,20 @@ def waveform_stream(media: MediaItem, stream: int | None) -> int | None:
     return stream if any(s.index == stream for s in media.audio_streams) else None
 
 
+def picture_stream(media: MediaItem, stream: int | None) -> int | None:
+    """サムネイルを引く鍵にする映像の流れの番号 1 本目の映像と、素材に無い番号は ``None``
+
+    :func:`waveform_stream` と同じ決まり デコーダは素材に無い番号を渡されると 1 本目を
+    開くので、鍵も 1 本目へ寄せる 1 本目を ``None`` にするのは、流れを区別する前に作った
+    控え（1 本目のシート）をそのまま使うため
+    """
+    if stream is None or not media.video_streams:
+        return None
+    if stream == media.video_streams[0].index:
+        return None
+    return stream if any(s.index == stream for s in media.video_streams) else None
+
+
 class MediaAnalyzer:
     """素材の波形とサムネイルを非同期に用意する
 
@@ -131,7 +145,9 @@ class MediaAnalyzer:
         self._scene_failures: dict[MediaId, str] = {}
         #: 波形は音声ストリームごとに持つ（:func:`waveform_stream`）
         self._waveforms: dict[tuple[MediaId, int | None], Waveform] = {}
-        self._filmstrips: dict[MediaId, Filmstrip] = {}
+        #: サムネイルも映像の流れごとに持つ（:func:`picture_stream`） 素材だけを鍵にすると、
+        #: 映像が 2 本ある素材の 2 本目のクリップの色を、1 本目の絵で測っていた（#336）
+        self._filmstrips: dict[tuple[MediaId, int | None], Filmstrip] = {}
         #: 実行中の解析 Future ではなく鍵の集合で持つ Future を辞書に
         #: 入れ直す形にすると、投入前に完了した場合に消し損ねる
         self._running: set[_JobKey] = set()
@@ -168,9 +184,10 @@ class MediaAnalyzer:
         with self._lock:
             return self._waveforms.get((media.id, waveform_stream(media, stream)))
 
-    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
+        """すでに用意できていれば返す 無ければ ``None`` ``stream`` は映像の流れ（省けば 1 本目）"""
         with self._lock:
-            return self._filmstrips.get(media.id)
+            return self._filmstrips.get((media.id, picture_stream(media, stream)))
 
     def scenes(self, media: MediaItem) -> SceneSignal | None:
         """読み終えた場面の並び 無いか、素材が変わっていれば ``None``
@@ -270,8 +287,14 @@ class MediaAnalyzer:
                 self._analyze_waveform,
                 on_ready,
             )
-        if media.has_video:
-            self._submit(("filmstrip", media.id, None), media, self._analyze_filmstrip, on_ready)
+        # 映像も全部の流れを作る 置いた後で絵の流れを切り替えたクリップの色も測れるように
+        for picture in media.video_streams:
+            self._submit(
+                ("filmstrip", media.id, picture_stream(media, picture.index)),
+                media,
+                self._analyze_filmstrip,
+                on_ready,
+            )
         if scenes:
             self.request_scenes(media, on_ready=on_ready)
 
@@ -280,7 +303,8 @@ class MediaAnalyzer:
         with self._lock:
             for owned in [key for key in self._waveforms if key[0] == media_id]:
                 del self._waveforms[owned]
-            self._filmstrips.pop(media_id, None)
+            for strip in [key for key in self._filmstrips if key[0] == media_id]:
+                del self._filmstrips[strip]
             self._scenes.pop(media_id, None)
             self._scene_failures.pop(media_id, None)
             self._halted.pop(media_id, None)
@@ -321,7 +345,7 @@ class MediaAnalyzer:
             elif kind == "scenes":
                 done = media.id in self._scenes
             else:
-                done = media.id in self._filmstrips
+                done = (media.id, key[2]) in self._filmstrips
             if done:
                 return
             if key in self._running:
@@ -424,7 +448,7 @@ class MediaAnalyzer:
             if isinstance(result, Waveform):
                 self._waveforms[(media_id, stream)] = result
             else:
-                self._filmstrips[media_id] = result
+                self._filmstrips[(media_id, stream)] = result
             return True
 
     def _publish_scenes(
@@ -468,7 +492,8 @@ class MediaAnalyzer:
         self, media: MediaItem, job: _JobKey, report: Callable[[float], None]
     ) -> bool:
         interval = _interval_for(media.duration)
-        key = filmstrip_key(media.path, interval, THUMBNAIL_HEIGHT)
+        stream = job[2]
+        key = filmstrip_key(media.path, interval, THUMBNAIL_HEIGHT, stream=stream)
         filmstrip = load_filmstrip(self._store, key)
 
         if filmstrip is None:
@@ -476,6 +501,7 @@ class MediaAnalyzer:
                 media.path,
                 interval=interval,
                 height=THUMBNAIL_HEIGHT,
+                stream_index=stream,
                 progress=report,
                 should_cancel=lambda: self._is_cancelled(job),
             )
@@ -483,7 +509,7 @@ class MediaAnalyzer:
                 return False
             save_filmstrip(self._store, key, filmstrip)
 
-        return self._publish("filmstrip", media.id, filmstrip)
+        return self._publish("filmstrip", media.id, filmstrip, stream)
 
     def _analyze_scenes(
         self, media: MediaItem, job: _JobKey, report: Callable[[float], None]

@@ -60,6 +60,7 @@ from sashimono.core.model import (
 from sashimono.core.model.ids import ClipId, TrackId
 from sashimono.effects.sources import TEXT
 from tests.ai.conftest import FakeHost
+from tests.ai.test_auto_fix_tools import Work, _strip, _waveform
 from tests.ai.test_look_tools import (
     _EXO_IMAGE,
     _empty_host,
@@ -71,6 +72,7 @@ from tests.ai.test_mix_tools import _measured, _Work
 from tests.ai.test_outbound import WRITE_EXAMPLES, _ids, _with_text_clip
 from tests.compat.test_subtitle_looks import _styled_alias
 from tests.core.test_seams import JumpCut
+from tests.engine.test_auto_color import _scene as _color_scene
 
 
 def _subclasses(base: type) -> Iterator[type]:
@@ -296,6 +298,24 @@ def _import_objects(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "import_objects", {"path": str(source)}
 
 
+def _auto_color(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # WRITE_EXAMPLES の作品にはサムネイルが無く、まだ用意できていないと断られる
+    # 暗くて色の寄った絵のシートを置いて、補正を積む道を通す
+
+    work = Work(material.video_media)
+    work.host.filmstrips[work.media.id] = _strip(_color_scene(dark=0.25, light=0.7))
+    return work.host, "auto_color", {"clip_ids": [str(work.picture.id)]}
+
+
+def _reduce_noise(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # WRITE_EXAMPLES は映像のクリップを指して、音を鳴らさないと断られる
+    # 黙った所に雑音が残る音のクリップを指して、ノイズ除去を積む道を通す
+
+    work = Work(material.video_media)
+    work.host.stub_waveform = _waveform(noise=0.01)
+    return work.host, "reduce_noise", {"clip_ids": [str(work.sound.id)]}
+
+
 def _with_effects(tool: str, **extra: Any) -> Example:
     # エフェクトを 2 つ付けてから 1 つ目を指す 並べ替えは 2 つ無いと動かす先が無い
     def example(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
@@ -436,6 +456,8 @@ EXAMPLES: dict[str, Example] = {
     "place_template": _template("place_template"),
     "apply_template": _template("apply_template"),
     "import_objects": _import_objects,
+    "auto_color": _auto_color,
+    "reduce_noise": _reduce_noise,
     # 画面と同じ道具（#349） WRITE_EXAMPLES は無い物や中身のある入れ物を指して断られる道を見る
     "paste_clips": _paste,
     "remove_track": _remove_track,
