@@ -87,6 +87,67 @@ class TestStepsSplitOff:
         assert document.parts_split_by_others == 0
 
 
+def _play(document: Document, moves: str) -> None:
+    """手の並びを文書に当てる 大文字 1 字は AI の道具 1 回（段の名前はその字）
+
+    ``|`` は直しの回で区切る ``p`` は人の変更 ``u`` は取り消し ``r`` はやり直し
+    """
+    for move in moves:
+        if move == "|":
+            assert document.split_checkpoint("AI: 検査の直し")
+        elif move == "p":
+            document.execute(RenameProject(f"人 {len(document.history_labels)}"), by=Author.PERSON)
+        elif move == "u":
+            document.undo()
+        elif move == "r":
+            document.redo()
+        else:
+            with document.checkpoint(move, by=Author.AI):
+                document.execute(RenameProject(move.lower()))
+
+
+#: 手の並び → 前半として残る手・人が割った数・直しの回で区切った数
+#: 段の外の前半を戻す・やり直す・人の変更が混ざる組み合わせを並べる
+_UNDO_TABLE = [
+    ("A|", ("A",), 0, 1),
+    # 戻した前半を同じ形から作り直す（CodeRabbit の指摘 #396） 戻した A を数えない
+    ("A|uB|", ("B",), 0, 1),
+    ("A|ur", ("A",), 0, 1),
+    ("A|urB|", ("A", "B"), 0, 2),
+    ("A|uuB|", ("B",), 0, 1),
+    # 人が変えた後に戻し、前半も戻して作り直す
+    ("A|puuB|", ("B",), 0, 1),
+    ("A|pB", ("A",), 0, 1),
+    ("ABpC", ("A", "B"), 1, 0),
+    ("AB|pC", ("A", "B"), 0, 1),
+    ("A|BpuC|", ("A", "B", "C"), 1, 2),
+    ("ApuuB", (), 0, 0),
+    ("ApuuBpC", ("B",), 1, 0),
+]
+
+
+class TestStepsSplitOffAcrossUndo:
+    @pytest.mark.parametrize(("moves", "steps", "by_others", "for_rounds"), _UNDO_TABLE)
+    def test_each_split_off_part_is_counted_once(
+        self,
+        project: Project,
+        moves: str,
+        steps: tuple[str, ...],
+        by_others: int,
+        for_rounds: int,
+    ) -> None:
+        """壊れると、段の外の前半を戻して同じ形から作り直したとき、戻した手が引き継ぎ（#346）の
+        変えた手に残り、直しの回の数も 1 多くなる
+        （同じ形の前半に、前の写しと今の写しの両方が当たる）
+        """
+        document = Document(project)
+        document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
+        _play(document, moves)
+        assert document.steps_split_off == steps
+        assert document.parts_split_by_others == by_others
+        assert document.parts_split_for_rounds == for_rounds
+
+
 class TestSplit:
     def test_each_fix_round_is_undone_on_its_own(self, project: Project) -> None:
         """壊れると、直した回を戻すつもりの Ctrl+Z 1 回で、指示の編集まで一緒に消える"""

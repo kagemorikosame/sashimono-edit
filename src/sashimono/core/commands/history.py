@@ -345,7 +345,7 @@ class Document:
         if own_before is not None and own_before is not before:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
-            self._earlier_steps.append((own_before, self.steps_in_checkpoint, True))
+            self._note_earlier_steps(own_before, by_other=True)
         self._reset_inner()
         top = self._undo[-1] if self._undo else None
         continued = (
@@ -418,7 +418,7 @@ class Document:
         if own_before is not None and own_before is not self._project:
             self._push_undo(HistoryEntry(self._checkpoint_label, own_before, self._checkpoint_by))
             self._earlier_parts.append(own_before)
-            self._earlier_steps.append((own_before, self.steps_in_checkpoint, False))
+            self._note_earlier_steps(own_before, by_other=False)
             self._reset_inner()
             # 新しい段を積んだので、前に取り消した物はやり直せない（人の変更で割るときと同じ）
             self._redo.clear()
@@ -457,6 +457,17 @@ class Document:
         別の人の段の下にあると戻せない AI に「前半は戻していない」と伝えるのに使う
         """
         return any(self._is_earlier_part(entry) for entry in self._undo)
+
+    def _note_earlier_steps(self, before: Project, *, by_other: bool) -> None:
+        """前半として先に積む段の、段の中の手の名前を写す（積む直前 段の中を捨てる前に呼ぶ）
+
+        同じ ``before`` の前の写しは捨てる 同じ形から前半を積み直すのは、前の前半を段の外で
+        戻した後だけで（戻さずに続けると ``before`` は新しい形になる）、戻した前半はもう
+        やり直せない（新しい段を積むとやり直しは消える） 残すと履歴の前半 1 つに前と今の
+        写しの両方が当たり、戻した手を変えた手に数え、区切った数も 1 多くなる（CodeRabbit #396）
+        """
+        self._earlier_steps = [noted for noted in self._earlier_steps if noted[0] is not before]
+        self._earlier_steps.append((before, self.steps_in_checkpoint, by_other))
 
     def _parts_left(self) -> list[tuple[tuple[str, ...], bool]]:
         """前半の段のうち、段の外の履歴に今も残っている物の（手の名前, 別の人が割ったか） 古い順
