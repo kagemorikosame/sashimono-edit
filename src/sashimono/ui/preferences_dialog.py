@@ -815,6 +815,14 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._ai_done_alert)
 
+        self._ai_handoff = QCheckBox("アシスタントが途中で止まったら引き継ぎの要約を出す", self)
+        self._ai_handoff.setChecked(preferences.ai_handoff)
+        self._ai_handoff.setToolTip(
+            "エラー・中断・上限・許可しなかった操作などで止まったとき、変えた物・取り消し方・"
+            "残りを AI の欄に出す 切っても要約は作り、AI に続きを頼むと読める"
+        )
+        form.addRow(self._ai_handoff)
+
         self._ai_auto_update = QCheckBox("AI の部品を自動で新しくする", self)
         self._ai_auto_update.setChecked(preferences.ai_auto_update)
         self._ai_auto_update.setToolTip(
@@ -1198,6 +1206,7 @@ class PreferencesDialog(QDialog):
             chat_enter_sends=self._chat_enter_sends.isChecked(),
             ai_busy_animation=self._ai_busy_animation.isChecked(),
             ai_done_alert=self._ai_done_alert.isChecked(),
+            ai_handoff=self._ai_handoff.isChecked(),
             ai_auto_update=self._ai_auto_update.isChecked(),
             match_video=str(self._match_video.currentData()),
             dock_tabs=str(self._dock_tabs.currentData()),
