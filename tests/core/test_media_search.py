@@ -15,18 +15,27 @@ from pathlib import Path
 import pytest
 
 from sashimono.core.commands.insert import media_alone
-from sashimono.core.model import MediaItem, Project, ProjectSettings, Transcript
+from sashimono.core.model import (
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.core.model.transcript import TranscriptSegment
 from sashimono.core.search import (
     SCENE,
     SUBTITLE,
     SceneNote,
     fold,
+    hit_places,
     prepared_queries,
     scene_spans,
     search_media,
 )
 from sashimono.core.timebase import FrameRate
+from tests.conftest import make_clip
 
 
 def _segment(start: int, text: str) -> TranscriptSegment:
@@ -212,3 +221,50 @@ class TestSceneNote:
         # 壊れると、時刻の無い説明や空の説明を覚え、引いたときに行けない場面や空の行が出る
         with pytest.raises(ValueError):
             SceneNote(start=start, end=end, text=text)
+
+
+def _two_languages(video_media: MediaItem) -> MediaItem:
+    """音声を 2 本（1 番と 2 番）持つ素材 2 番の音声にだけ字幕がある"""
+    second = replace(video_media.audio_streams[0], index=2)
+    both = replace(video_media, audio_streams=(video_media.audio_streams[0], second))
+    return _with_lines(both, "こんにちは", "編集ソフトを作ります", stream=2)
+
+
+def _placed(media: MediaItem, *clips: tuple[TrackKind, int, int]) -> Project:
+    """（トラックの種類, 置くフレーム, 鳴らす音声の番号）のクリップを 1 本ずつのトラックへ置く"""
+    project = _project(media)
+    tracks: list[Track] = []
+    for kind, start, stream in clips:
+        clip = replace(make_clip(start, 300, media), stream_index=stream)
+        tracks.append(Track(kind=kind, name=f"{kind.value}{start}", clips=(clip,)))
+    return project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+
+
+class TestHitPlaces:
+    def test_a_subtitle_goes_to_the_clip_that_plays_its_sound(self, video_media: MediaItem) -> None:
+        # 壊れると、同じ素材の別の言語の音のクリップへ行き、探した言葉の聞こえない所で止まる
+        media = _two_languages(video_media)
+        project = _placed(media, (TrackKind.AUDIO, 0, 1), (TrackKind.AUDIO, 600, 2))
+        (hit,) = search_media(project, ["作ります"], notes_of=_no_notes)
+        assert hit.stream == 2
+        places = hit_places(project, media, hit.start, hit.stream)
+        assert [frame for _clip, frame in places] == [660]
+
+    def test_only_another_language_is_no_place(self, video_media: MediaItem) -> None:
+        # 壊れると、別の言語の音しか置いていないのに、そこを言葉の場所として示す
+        media = _two_languages(video_media)
+        project = _placed(media, (TrackKind.AUDIO, 0, 1))
+        assert hit_places(project, media, 2.0, 2) == []
+
+    def test_a_picture_without_sound_is_still_a_place(self, video_media: MediaItem) -> None:
+        # 壊れると、絵だけを映像のトラックに置いた作品で「置いていない」と答え、AI が同じ素材を
+        # 置き直す 言葉の出る場面の絵は示せる
+        media = _two_languages(video_media)
+        project = _placed(media, (TrackKind.VIDEO, 30, 0), (TrackKind.AUDIO, 0, 1))
+        assert [frame for _clip, frame in hit_places(project, media, 2.0, 2)] == [90]
+
+    def test_a_scene_note_is_not_narrowed(self, video_media: MediaItem) -> None:
+        # 壊れると、音の番号を持たない場面の説明の当たりで、どのクリップへも行けない
+        media = _two_languages(video_media)
+        project = _placed(media, (TrackKind.AUDIO, 0, 1), (TrackKind.AUDIO, 600, 2))
+        assert [frame for _clip, frame in hit_places(project, media, 2.0, None)] == [60, 660]

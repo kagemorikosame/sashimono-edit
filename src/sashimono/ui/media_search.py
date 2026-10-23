@@ -37,6 +37,7 @@ MAX_SHOWN = 500
 #: 行に持たせる 素材の ID と素材の秒
 _MEDIA = Qt.ItemDataRole.UserRole
 _SECONDS = Qt.ItemDataRole.UserRole + 1
+_STREAM = Qt.ItemDataRole.UserRole + 2
 
 
 class MediaSearchDialog(QDialog):
@@ -46,8 +47,9 @@ class MediaSearchDialog(QDialog):
     字幕で探さない
     """
 
-    #: 見つけた所へ行くよう要求された 引数は素材 ID と素材の秒
-    found_activated = Signal(str, float)
+    #: 見つけた所へ行くよう要求された 引数は素材 ID と素材の秒と、字幕の当たりの音声ストリームの
+    #: 番号（場面の説明は None） 番号を渡さないと、同じ素材の別の言語の音のクリップへ行く
+    found_activated = Signal(str, float, object)
 
     def __init__(
         self,
@@ -113,6 +115,7 @@ class MediaSearchDialog(QDialog):
             item = QListWidgetItem(f"{names.get(hit.media_id, '')}  {when}  [{kind}]  {hit.text}")
             item.setData(_MEDIA, str(hit.media_id))
             item.setData(_SECONDS, hit.start)
+            item.setData(_STREAM, hit.stream)
             item.setToolTip(hit.text)
             self._results.addItem(item)
         if not hits:
@@ -129,4 +132,9 @@ class MediaSearchDialog(QDialog):
             self._results.setCurrentRow(0)
 
     def _activate(self, item: QListWidgetItem) -> None:
-        self.found_activated.emit(str(item.data(_MEDIA)), float(item.data(_SECONDS)))
+        stream = item.data(_STREAM)
+        self.found_activated.emit(
+            str(item.data(_MEDIA)),
+            float(item.data(_SECONDS)),
+            int(stream) if stream is not None else None,
+        )

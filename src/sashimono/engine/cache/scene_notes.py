@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -99,7 +100,12 @@ def _save(path: Path, notes: tuple[SceneNote, ...]) -> None:
 
 def _load(path: Path) -> tuple[SceneNote, ...]:
     """書いた説明を読む 壊れていれば消して空を返す（作り直せる物なので知らせない）"""
-    if not path.exists():
+    # 有るかを見る所も try の中に置く 置き場を読めない（権限が無い）と exists が投げ、
+    # 検索の道具が控えの場所入りの OSError で落ちる 読めないなら覚えていないのと同じに扱う
+    try:
+        if not path.exists():
+            return ()
+    except OSError:
         return ()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -110,5 +116,7 @@ def _load(path: Path) -> tuple[SceneNote, ...]:
             for row in data["notes"]
         )
     except (OSError, ValueError, KeyError, TypeError):
-        path.unlink(missing_ok=True)
+        # 消せなくても空を返す 消す所で投げると、壊れた控え 1 つで検索が落ちる
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
         return ()

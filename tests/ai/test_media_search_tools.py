@@ -29,9 +29,9 @@ from sashimono.ai.safety import Safety
 from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.core.commands import AddClip, SetTranscript
 from sashimono.core.io.serialize import json_text
-from sashimono.core.model import MediaId, MediaItem, Transcript
+from sashimono.core.model import MediaId, MediaItem, Track, TrackKind, Transcript
 from sashimono.core.model.transcript import TranscriptSegment
-from sashimono.core.search import SceneNote
+from sashimono.core.search import SceneNote, hit_places
 from sashimono.engine.cache import SceneState
 from sashimono.engine.scenes import SceneSignal
 from tests.ai.conftest import FakeHost
@@ -145,6 +145,42 @@ class TestSearch:
         clip = host.document.project.timeline.tracks[0].clips[0]
         assert hit["timeline"] == [{"clip_id": str(clip.id), "frame": 120}]
 
+    def test_a_subtitle_points_to_the_clip_that_plays_its_language(self, host: FakeHost) -> None:
+        # 壊れると、2 か国語の素材で別の言語の音のクリップの位置を返し、AI が探した言葉の
+        # 聞こえない所を preview で確かめる
+        first = _media(host).audio_streams[0]
+        second = replace(first, index=2)
+        media = MediaItem(
+            path=Path("C:/素材/二か国語.mp4"),
+            duration=Fraction(60),
+            video_streams=_media(host).video_streams,
+            audio_streams=(first, second),
+        ).with_transcript(
+            Transcript(
+                segments=(TranscriptSegment(start=Fraction(4), end=Fraction(6), text="英語で話す"),)
+            ),
+            2,
+        )
+        project = host.document.project
+        tracks = tuple(
+            Track(
+                kind=TrackKind.AUDIO,
+                name=f"A{stream}",
+                clips=(replace(make_clip(start, 300, media), stream_index=stream),),
+            )
+            for start, stream in ((0, 1), (600, 2))
+        )
+        host.document.reset(
+            replace(
+                project,
+                media=(*project.media, media),
+                timeline=replace(project.timeline, tracks=(*project.timeline.tracks, *tracks)),
+            )
+        )
+        result = _result(SEARCH, host, queries=["英語"])
+        (hit,) = result["hits"]
+        assert [place["frame"] for place in hit["timeline"]] == [600 + 120]
+
     def test_the_hint_for_nothing_found_tells_how_to_widen(self, host: FakeHost) -> None:
         # 壊れると、見つからなかったときに AI が言い換えも説明作りもせずに諦める
         result = _result(SEARCH, host, queries=["カレー"])
@@ -212,13 +248,13 @@ class TestSearch:
 
         _off_timeline(host, *(f"{n} 行目" for n in range(600)))
         looked: list[float] = []
-        original = operations._media_places
+        original = hit_places
 
-        def counted(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        def counted(*args: Any, **kwargs: Any) -> Any:
             looked.append(args[2])
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(operations, "_media_places", counted)
+        monkeypatch.setattr(operations, "hit_places", counted)
         result = _result(SEARCH, host, queries=["行目"], limit=10)
         assert result["count"] == 10
         assert len(looked) == 10
@@ -318,6 +354,29 @@ class TestTheSheet:
 
 
 class TestRemember:
+    def test_a_failed_write_is_told_without_the_cache_place(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、控えの置き場に書けない（空きが無い・権限が無い）ときに素の OSError が
+        # 伏せ字を通らずに AI へ渡り、ユーザー名入りの置き場の場所が外へ出る
+        place = r"C:\Users\本人の名前\AppData\Local\Sashimono\cache\scene_notes\ab\x.notes.json"
+
+        def full(_media: MediaItem, _notes: tuple[SceneNote, ...]) -> None:
+            raise OSError(28, "No space left on device", place)
+
+        monkeypatch.setattr(host, "remember_scene_notes", full)
+        media = _media(host)
+        with pytest.raises(ToolError) as caught:
+            REMEMBER(
+                host,
+                {
+                    "media_id": str(media.id),
+                    "scenes": [{"from_seconds": 0, "to_seconds": 4, "text": "海"}],
+                },
+            )
+        assert "本人の名前" not in str(caught.value)
+        assert "空き" in str(caught.value)
+
     def test_notes_are_kept_outside_the_project(self, host: FakeHost) -> None:
         # 壊れると、説明を覚えるたびに作品が変わり、取り消しの履歴が説明で埋まる
         before = host.document.project

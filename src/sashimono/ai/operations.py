@@ -243,6 +243,7 @@ from sashimono.core.search import (
     SUBTITLE,
     Hit,
     SceneNote,
+    hit_places,
     media_places,
     scene_spans,
     search_media,
@@ -2728,7 +2729,12 @@ def _hit_row(project: Project, hit: Hit) -> dict[str, Any]:
         row["audio"] = _audio_number(media, hit.stream)
         row["segment_id"] = str(hit.segment_id)
     # その場面が流れるタイムラインの位置 preview_frame へそのまま渡せる 置いていなければ空
-    row["timeline"] = _media_places(project, media, hit.start)
+    # 字幕の当たりは、その音を鳴らすクリップを選び、別の言語の音のクリップは選ばない 選ぶと、
+    # AI が探した言葉の聞こえない所を見て確かめる（人の窓と同じ hit_places）
+    row["timeline"] = [
+        {"clip_id": str(clip.id), "frame": frame}
+        for clip, frame in hit_places(project, media, hit.start, hit.stream)
+    ][:MAX_PLACES_PER_CUT]
     _clip_text(row, None)
     return row
 
@@ -2927,7 +2933,16 @@ def _remember_scene_descriptions(host: EditorHost, arguments: dict[str, Any]) ->
             f"素材 1 本に覚えられる説明は {MAX_NOTES_PER_MEDIA} 個までです"
             " 場面の区切り（media_scene_sheet の max_scene_seconds）を長くしてください"
         )
-    host.remember_scene_notes(media, tuple(merged))
+    try:
+        host.remember_scene_notes(media, tuple(merged))
+    except OSError as exc:
+        # 書けない理由（空きが無い・権限が無い）の文には控えの置き場の場所が入る ブリッジが
+        # 伏せ字に通すのは ToolError だけなので、そのまま投げると名前を送らないと決めた人の
+        # ユーザー名入りの場所が AI へ渡る 場所は書かずに、どうすればよいかだけを返す
+        raise ToolError(
+            "場面の説明を控えに書けませんでした 置き場の空きと権限を確かめてから、"
+            "もう 1 度呼んでください"
+        ) from exc
     return {
         "media_id": str(media.id),
         "remembered": len(fresh),

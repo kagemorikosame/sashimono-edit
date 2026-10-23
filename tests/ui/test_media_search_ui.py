@@ -155,6 +155,36 @@ class TestTheDialog:
 
 
 class TestGoingThere:
+    def test_a_subtitle_goes_to_the_clip_that_plays_its_language(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、2 か国語の素材で別の言語の音のクリップへ再生位置が飛び、探した言葉が
+        # 聞こえない所で止まる（窓が当たりの音声の番号を渡さない）
+        del qt_application
+        second = replace(video_media.audio_streams[0], index=2)
+        media = replace(
+            video_media, audio_streams=(video_media.audio_streams[0], second)
+        ).with_transcript(_transcript((4, "英語で話します")), 2)
+        project = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(media,))
+        tracks = tuple(
+            Track(
+                kind=TrackKind.AUDIO,
+                name=f"A{stream}",
+                clips=(replace(make_clip(start, 300, media), stream_index=stream),),
+            )
+            for start, stream in ((0, 1), (600, 2))
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        window = MainWindow(project, confirm_unsaved=False)
+        try:
+            dialog = window.show_media_search()
+            assert _search(dialog, "英語")
+            dialog.results.itemActivated.emit(dialog.results.item(0))
+            assert window.playhead == 600 + 120
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_a_placed_media_moves_the_playhead(self, window: MainWindow) -> None:
         # 壊れると、見つけた行を選んでも再生位置が動かず、人がタイムラインで探し直す
         dialog = window.show_media_search()

@@ -63,6 +63,36 @@ class TestSceneNoteStore:
         path.write_text("{壊れた", encoding="utf-8")
         assert SceneNoteStore(store).notes(media) == ()
 
+    def test_an_unreadable_place_reads_as_no_notes(
+        self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、控えの置き場を読めない（権限が無い）ときに有るかを見る所で OSError が出て、
+        # search_media が控えの場所入りの例外で落ち、字幕も引けなくなる
+        written = store.path_for(NAMESPACE, notes_key(media.path), SUFFIX)
+        original = Path.exists
+
+        def denied(path: Path, *args: object, **kwargs: object) -> bool:
+            if path == written:
+                raise PermissionError(13, "Access is denied", str(path))
+            return original(path)
+
+        monkeypatch.setattr(Path, "exists", denied)
+        assert SceneNoteStore(store).notes(media) == ()
+
+    def test_a_broken_file_that_cannot_be_removed_reads_as_no_notes(
+        self, store: CacheStore, media: MediaItem, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、壊れた控えを消せない（別のプログラムが掴んでいる）ときに消す所で OSError が
+        # 出て、壊れた控え 1 つで検索の道具ごと動かなくなる
+        path = store.prepare(NAMESPACE, notes_key(media.path), SUFFIX)
+        path.write_text("{壊れた", encoding="utf-8")
+
+        def held(_path: Path, missing_ok: bool = False) -> None:
+            raise PermissionError(13, "in use", str(_path))
+
+        monkeypatch.setattr(Path, "unlink", held)
+        assert SceneNoteStore(store).notes(media) == ()
+
     def test_forgetting_all_notes_removes_the_file(
         self, store: CacheStore, media: MediaItem
     ) -> None:

@@ -147,7 +147,7 @@ from sashimono.core.seams import (
     seams_touching,
     touching_scope,
 )
-from sashimono.core.search import SceneNote, media_places
+from sashimono.core.search import SceneNote, hit_places
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -3592,7 +3592,7 @@ class MainWindow(QMainWindow):
         dialog.field.setFocus()
         return dialog
 
-    def _go_to_found(self, media_id: str, seconds: float) -> None:
+    def _go_to_found(self, media_id: str, seconds: float, stream: int | None) -> None:
         """探す窓で選んだ所へ行く 開いているタイムラインに置いていれば、そこへ再生位置を動かす
 
         置いていなければ素材一覧でその素材を選び、置き方を知らせる 勝手に置かない
@@ -3603,7 +3603,9 @@ class MainWindow(QMainWindow):
         if media is None:
             self.statusBar().showMessage("その素材はもう作品にありません", 5000)
             return
-        places = media_places(project, media, seconds)
+        # 字幕の当たり（stream）は、その音を鳴らすクリップを行き先にする 照らさないと、
+        # 同じ素材の別の言語の音のクリップへ行き、探した言葉が聞こえない所で止まる
+        places = hit_places(project, media, seconds, stream)
         if places:
             clip, frame = places[0]
             self._seek(frame)

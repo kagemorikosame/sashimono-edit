@@ -23,7 +23,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
-from sashimono.core.model import Clip, MediaId, MediaItem, Project, SegmentId, Track
+from sashimono.core.model import (
+    Clip,
+    MediaId,
+    MediaItem,
+    Project,
+    SegmentId,
+    Track,
+    heard_stream,
+)
 from sashimono.core.timebase import Rounding, seconds_to_frame
 
 __all__ = [
@@ -33,6 +41,8 @@ __all__ = [
     "Hit",
     "SceneNote",
     "fold",
+    "hears_stream",
+    "hit_places",
     "media_places",
     "prepared_queries",
     "scene_spans",
@@ -168,6 +178,31 @@ def _seconds(value: Fraction) -> float:
     return round(float(value), 3)
 
 
+def hears_stream(
+    project: Project, media: MediaItem, stream: int | None
+) -> Callable[[Track, Clip], bool] | None:
+    """当たりの音声 ``stream`` を実際に鳴らすクリップだけを通す :func:`media_places` の ``accept``
+
+    字幕の当たり（:attr:`Hit.stream`）の行き先を決めるときに使う 照らさないと、同じ素材の
+    同じ時刻を含む別の言語の音のクリップへ行き、探した言葉が聞こえない所を示す
+    鳴らす番号は :func:`~sashimono.core.model.heard_stream` で引き、字幕の鍵と同じく
+    :meth:`~sashimono.core.model.MediaItem.transcript_stream` でそろえて
+    比べる（#394 と同じ照らし方）
+    場面の説明の当たり（``None``）は音を持たないので限らない（``None`` を返す）
+    """
+    if stream is None:
+        return None
+    wanted = media.transcript_stream(stream)
+
+    def hears(track: Track, clip: Clip) -> bool:
+        return (
+            project.plays_sound(track, clip)
+            and media.transcript_stream(heard_stream(track, clip)) == wanted
+        )
+
+    return hears
+
+
 def media_places(
     project: Project,
     media: MediaItem,
@@ -195,6 +230,32 @@ def media_places(
             if frame < clip.timeline_end:
                 places.append((clip, frame))
     return sorted(places, key=lambda place: place[1])
+
+
+def hit_places(
+    project: Project, media: MediaItem, seconds: float, stream: int | None
+) -> list[tuple[Clip, int]]:
+    """当たりの行き先（:func:`media_places`） 字幕の当たりは、その音を鳴らすクリップを選ぶ
+
+    人の〔探す…〕の窓と AI の search_media が同じここを通る
+
+    - 当たりの音声 ``stream`` を鳴らすクリップ（:func:`hears_stream`）があればそれだけ
+    - 無ければ音を鳴らさないクリップ（映像のトラックに絵だけを置いた物）
+      絵だけを置いた作品でも、言葉の出る場面の絵は示せる 外すと「置いていない」と答え、
+      AI が同じ素材を置き直す
+    - 別の音声を鳴らすクリップは選ばない 選ぶと、探した言葉の聞こえない所へ行く
+
+    場面の説明の当たり（``stream`` が ``None``）は限らない
+    """
+    hears = hears_stream(project, media, stream)
+    if hears is None:
+        return media_places(project, media, seconds)
+    heard = media_places(project, media, seconds, hears)
+    if heard:
+        return heard
+    return media_places(
+        project, media, seconds, lambda track, clip: not project.plays_sound(track, clip)
+    )
 
 
 def scene_spans(cuts: Sequence[float], end: float, longest: float) -> list[tuple[float, float]]:
