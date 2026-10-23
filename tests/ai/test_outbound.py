@@ -274,6 +274,10 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     # 書き出した動画を指す 調べられる場所の外なので、場所を書いて断る（#337）
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
+    # 前後のキーへ（#349） キーの無い欄は、名前を書いて断る
+    "seek_keyframe": lambda _media_id: {"name": "size"},
+    # 字幕の文字を OS のクリップボードへ（#349） 無い字幕は ID を書いて断る
+    "copy_subtitle_text": lambda media_id: {"media_id": media_id, "segment_id": "無い"},
 }
 
 
@@ -467,6 +471,45 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "place_template": lambda _ids: {"template_id": SHELF_ID},
     "apply_template": lambda ids: {"template_id": SHELF_ID, "clip_id": ids["text"]},
     "import_objects": lambda _ids: {"path": str(SECRET_PATH.with_suffix(".exo"))},
+    # 画面の操作と同じ道具（#349） 入れ物（トラック・素材）は中身があるので断る 断る文に
+    # 素材の名前を書かないかを見る 貼り付けはコピーした物が無いので断る
+    "cut_clips": lambda ids: {"clip_ids": [ids["text"]]},
+    "paste_clips": lambda _ids: {"insert": True},
+    "remove_track": lambda ids: {"track_id": ids["track"]},
+    "rename_track": lambda ids: {"track_id": ids["track"], "name": "V9"},
+    "move_track": lambda ids: {"track_id": ids["track"], "index": 0},
+    "rename_scene": lambda _ids: {"scene_id": "無い", "name": "場面"},
+    "remove_scene": lambda _ids: {"scene_id": "無い"},
+    "remove_media": lambda ids: {"media_id": ids["media"]},
+    "set_work_area": lambda _ids: {"start_frame": 0, "end_frame": 30},
+    "add_filter": lambda _ids: {},
+    "add_group_control": lambda _ids: {},
+    "remove_effect": lambda ids: {"clip_id": ids["text"], "effect_id": "無い"},
+    "move_effect": lambda ids: {"clip_id": ids["text"], "effect_id": "無い", "index": 0},
+    "set_effect_enabled": lambda ids: {
+        "clip_id": ids["text"],
+        "effect_ids": ["無い"],
+        "enabled": False,
+    },
+    "remove_keyframe": lambda ids: {"clip_id": ids["text"], "name": "size", "frame": 0},
+    "clear_keyframes": lambda ids: {"clip_id": ids["text"], "name": "size"},
+    "split_subtitle": lambda ids: {
+        "media_id": ids["media"],
+        "segment_id": ids["segment"],
+        "at_seconds": 0.5,
+    },
+    "merge_subtitles": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
+    "delete_subtitle": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
+    # 開く・新規（#349） 試験の作品は変えてあるので、どちらも保存していない変更で断る
+    "open_project": lambda _ids: {"path": "第二稿.sme"},
+    "new_project": lambda _ids: {"width": 1280, "height": 720},
+    # 作品の設定・置き方の方式・置く・揃える（#349） 無いカスタムオブジェクトは置き場の名前を
+    # 並べて断る 揃える枠は偽のホストに無いので断る
+    "switch_layer_mode": lambda _ids: {"convert": True},
+    "set_project_settings": lambda _ids: {"blending": "linear"},
+    "add_custom_object": lambda _ids: {"name": "無い"},
+    "align_clip": lambda ids: {"clip_id": ids["text"], "anchor": "center"},
+    "use_standard_layout": lambda ids: {"clip_ids": [ids["text"]]},
 }
 
 
