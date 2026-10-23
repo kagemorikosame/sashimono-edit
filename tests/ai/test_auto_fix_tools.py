@@ -261,6 +261,32 @@ class TestAutoColor:
         rows = result["clips"]
         assert isinstance(rows, list) and len(rows) == 1
 
+    def test_a_moving_grade_on_the_reference_is_read_frame_by_frame(self, work: Work) -> None:
+        # 壊れると、合わせる相手の補正をキーフレームで動かしているとき、使われない static の値で
+        # 相手の色を見積もり、描いた色と違う色へ合わせる（#387 の CodeRabbit の指摘） 相手の絵は
+        # 一色の灰色で、補正が頭の暗い所から終わりの明るい所へ動くので、描いた相手は暗い所から
+        # 明るい所まで広がる static（0）で読むと一色のまま見積もり、直す側の幅を縮める
+        moving = AnimatedValue(0.0, keyframes=(Keyframe(0, -40.0), Keyframe(149, 40.0)))
+        grade = registry.require(GRADE_KIND).create().with_param("luma_offset", moving)
+        work.host.apply_commands([AddEffect(work.second.id, grade, index=0)], "人")
+        work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.2, light=0.6))
+        work.host.filmstrips[work.other.id] = _strip(_scene(dark=0.5, light=0.5))
+        result = _call(
+            work.host,
+            "auto_color",
+            {
+                "clip_ids": [str(work.picture.id)],
+                "match_clip_id": str(work.second.id),
+                "white_balance": False,
+                "strength_percent": 100,
+            },
+        )
+        rows = result["clips"]
+        assert isinstance(rows, list)
+        span_before = rows[0]["before"]["white_percent"] - rows[0]["before"]["black_percent"]
+        span_after = rows[0]["after"]["white_percent"] - rows[0]["after"]["black_percent"]
+        assert span_after > span_before + 20
+
     def test_the_reference_cannot_be_one_of_the_targets(self, work: Work) -> None:
         # 壊れると、自分に合わせて何も変わらないのに、変えたと返す
         work.host.filmstrips[work.media.id] = _strip(_scene(dark=0.2, light=0.6))

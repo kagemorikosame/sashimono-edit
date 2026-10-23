@@ -42,6 +42,7 @@ __all__ = [
     "pixels_of",
     "plan_auto",
     "plan_match",
+    "thinned",
 ]
 
 #: 決めた値を入れるエフェクト（拡張色調補正）
@@ -150,11 +151,14 @@ def pixels_of(images: Iterable[np.ndarray]) -> np.ndarray:
         picked.append(flat[:, :3])
     if not picked:
         return np.zeros((0, 3))
-    joined = np.concatenate(picked).astype(np.float64) / 255.0
-    if len(joined) > _MAX_PIXELS:
-        # 等間隔に間引く 乱数で選ぶと、同じクリップで呼ぶたびに値が変わる
-        joined = joined[:: math.ceil(len(joined) / _MAX_PIXELS)]
-    return joined
+    return thinned(np.concatenate(picked).astype(np.float64) / 255.0)
+
+
+def thinned(rgb: np.ndarray) -> np.ndarray:
+    """測る画素を上限までに等間隔に間引く 乱数で選ぶと、同じクリップで呼ぶたびに値が変わる"""
+    if len(rgb) > _MAX_PIXELS:
+        return rgb[:: math.ceil(len(rgb) / _MAX_PIXELS)]
+    return rgb
 
 
 def measure(rgb: np.ndarray) -> ColorStats:

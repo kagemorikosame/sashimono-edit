@@ -12,8 +12,9 @@ AI の ``auto_color`` ``reduce_noise`` と、人の〔色を自動で整える�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from fractions import Fraction
 from typing import Any, Protocol
+
+import numpy as np
 
 from sashimono.ai.host import ToolError
 from sashimono.core.commands import (
@@ -44,6 +45,7 @@ from sashimono.engine.auto_color import (
     pixels_of,
     plan_auto,
     plan_match,
+    thinned,
 )
 from sashimono.engine.cache.thumbnails import Filmstrip
 
@@ -247,8 +249,14 @@ def _require_strips(source: FixSource, project: Project, clips: list[Clip]) -> N
     )
 
 
-def _clip_tiles(source: FixSource, project: Project, clip: Clip) -> list[Any]:
-    """クリップに映る範囲のサムネイル（RGBA） まだ無ければ用意を頼んで断る"""
+def _clip_tiles(source: FixSource, project: Project, clip: Clip) -> list[tuple[int, Any]]:
+    """クリップに映る範囲のサムネイル（RGBA）と、それを映すクリップの中のコマ
+
+    コマはクリップの頭から等間隔に選び、絵の時刻は描くときと同じ :meth:`Clip.picture_time`
+    （速度と止めた絵を含む）で引く コマを一緒に返すのは、キーフレームで動く補正をサムネイル
+    ごとに描くときと同じコマの値で当てるため（#387 の CodeRabbit の指摘）
+    同じサムネイルを指すコマは最初の 1 つだけを残す まだ無ければ用意を頼んで断る
+    """
     media = project.find_media(clip.media_id) if clip.media_id is not None else None
     if media is None:
         raise ToolError(f"{clip.id} の素材が見つかりません")
@@ -261,17 +269,16 @@ def _clip_tiles(source: FixSource, project: Project, clip: Clip) -> list[Any]:
             f"{media.name} のサムネイルがまだできていません（取り込みの後に裏で作る）"
             " 少し待ってからもう 1 度呼んでください"
         )
-    start = clip.source_in
-    end = clip.source_out(project.rate)
-    if clip.hold_at is not None:
-        end = min(end, max(clip.hold_at, start))
     picks = COLOR_SAMPLE_TILES
-    numbers = {
-        index
-        for step in range(picks)
-        if (index := strip.index_at(start + (end - start) * Fraction(step, picks))) is not None
-    }
-    return [tile for index in sorted(numbers) if (tile := strip.tile(index)) is not None]
+    frames: dict[int, int] = {}
+    for step in range(picks):
+        local = clip.duration * step // picks
+        index = strip.index_at(clip.picture_time(local, project.rate))
+        if index is not None:
+            frames.setdefault(index, local)
+    return [
+        (frames[index], tile) for index in sorted(frames) if (tile := strip.tile(index)) is not None
+    ]
 
 
 def _head_grade(clip: Clip) -> Effect | None:
@@ -304,19 +311,30 @@ def _clip_pixels(source: FixSource, project: Project, clip: Clip, *, graded_head
     合わせる相手は、色の自動補正を掛けた後の見え方に合わせる 素材のままの色に合わせると、
     整えたクリップに合わせたつもりで整える前の色へ寄る
     """
-    pixels = pixels_of(_clip_tiles(source, project, clip))
+    tiles = _clip_tiles(source, project, clip)
+    head = _head_grade(clip)
+    if not (graded_head and head is not None and head.enabled):
+        pixels = pixels_of([tile for _, tile in tiles])
+    else:
+        # 値はサムネイルを映すコマで引く（描くときと同じ AnimatedValue.at） static はキーフレームの
+        # ある値では使われないので、static で読むと描いた色と大きく違う色に合わせる
+        parts = [graded(pixels_of([tile]), _grade_values(head, frame)) for frame, tile in tiles]
+        parts = [part for part in parts if len(part)]
+        pixels = thinned(np.concatenate(parts)) if parts else np.zeros((0, 3))
     if len(pixels) == 0:
         raise ToolError(f"{clip.id} の絵がすべて透けていて色を測れません")
-    head = _head_grade(clip)
-    if graded_head and head is not None and head.enabled:
-        values: dict[str, float | bool] = {
-            name: value.static
-            for name, value in head.params.items()
-            if isinstance(value, AnimatedValue)
-        }
-        values |= {n: v for n, v in head.params.items() if isinstance(v, bool)}
-        pixels = graded(pixels, values)
     return pixels
+
+
+def _grade_values(head: Effect, frame: int) -> dict[str, float | bool]:
+    """拡張色調補正の値をクリップの頭から ``frame`` コマ目で解く（描画と同じ解き方）"""
+    values: dict[str, float | bool] = {
+        name: value.at(frame)
+        for name, value in head.params.items()
+        if isinstance(value, AnimatedValue)
+    }
+    values |= {name: value for name, value in head.params.items() if isinstance(value, bool)}
+    return values
 
 
 def _grade_commands(clip: Clip, params: dict[str, float]) -> tuple[list[Command], bool]:
