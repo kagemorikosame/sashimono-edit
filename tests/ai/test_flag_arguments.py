@@ -77,6 +77,10 @@ CASES: list[tuple[str, str, Callable[[FakeHost], dict[str, Any]]]] = [
         "locked",
         lambda host: {"track_id": str(host.document.project.timeline.tracks[0].id)},
     ),
+    # #349 で足した道具 取り込みのときに bool() で読んでいたのを直した
+    ("add_track", "effect", lambda host: {}),
+    ("set_work_area", "clear", lambda host: {}),
+    ("switch_layer_mode", "convert", lambda host: {}),
 ]
 
 

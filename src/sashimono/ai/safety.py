@@ -37,6 +37,7 @@ __all__ = [
     "Safety",
     "check_readable",
     "check_writable",
+    "openable_project",
     "pin_holds_the_folder",
     "pinned",
     "pinned_place",
@@ -281,6 +282,45 @@ def check_readable(raw: object, *, project_path: Path | None, export_folder: Pat
     if not any(_inside(resolved, root) for root in allowed):
         places = " / ".join(str(root) for root in allowed)
         raise ToolError(f"{resolved} は調べられる場所の外です 調べられるのは {places} の中だけです")
+    if not resolved.is_file():
+        raise ToolError(f"ファイルがありません: {resolved}")
+    return resolved
+
+
+def openable_project(host: EditorHost, raw: object) -> Path:
+    """AI が開く作品（``.sme`` #349）の場所を確かめ、解決した場所を返す 開けなければ断る
+
+    開けるのは書ける所と同じ 2 つのフォルダ（作品のフォルダと、書き出しの窓で前に選んだ
+    フォルダ）の中だけ（2026-10-20 利用者の決定） どこでも開けると、本人が AI に見せる
+    つもりの無い作品の中身（字幕・素材の名前）まで読み込んで外へ送る
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("path（開く作品の場所）を文字で渡してください")
+    roots = write_roots(host.project_path, host.export_folder)
+    if not roots:
+        raise ToolError(
+            "開ける場所がありません AI が開けるのは、作品のフォルダと書き出しの窓で選んだ"
+            "フォルダの中の作品だけです ほかの作品は人が〔開く…〕の窓で開いてください"
+        )
+    candidate = Path(raw.strip())
+    if any(":" in part for part in candidate.parts[1 if candidate.anchor else 0 :]):
+        raise ToolError(f"名前に「:」を含む場所は開けません: {raw}")
+    if ".." in candidate.parts:
+        raise ToolError(f"「..」を含む場所は開けません 場所をそのまま渡してください: {raw}")
+    if not candidate.is_absolute():
+        if host.project_path is None:
+            raise ToolError(
+                "作品をまだ保存していないので、相対の場所は使えません 絶対の場所を渡してください"
+            )
+        candidate = host.project_path.parent / candidate
+    resolved = candidate.resolve()
+    allowed = [root.resolve() for root in roots]
+    if not any(_inside(resolved, root) for root in allowed):
+        places = " / ".join(str(root) for root in allowed)
+        raise ToolError(
+            f"{resolved} は開ける場所の外です 開けるのは {places} の中だけです"
+            " ほかの作品は人が〔開く…〕の窓で開いてください"
+        )
     if not resolved.is_file():
         raise ToolError(f"ファイルがありません: {resolved}")
     return resolved
