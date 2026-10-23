@@ -518,6 +518,38 @@ def test_model_names_are_checked_before_running(
         tool.guard_record({"params": {"model": own}}, ["Local", DEFAULT_MODEL[:3]])
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--dir", "front", "run"], "front"),
+        (["run", "--dir", "back"], "back"),
+        (["--dir", "front", "run", "--dir", "back"], "back"),
+        (["draft", "E01", "--dir", "back"], "back"),
+        (["adopt", "E01", "scenes", "--dir", "back"], "back"),
+        (["report", "--dir", "back"], "back"),
+        (["run"], None),
+    ],
+)
+def test_dir_is_accepted_before_and_after_the_command(
+    tool: ModuleType, monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: str | None
+) -> None:
+    """--dir は命令の前に置いても後ろに置いても受け、両方なら後ろが勝つこと
+
+    一番上にだけ受けると、手順書どおり命令の後ろに置いたとき unrecognized arguments で止まる
+    命令の側の既定で前の値を空に上書きすると、前に置いた打ち方が黙って環境変数の所を読む
+    """
+    seen: list[Any] = []
+
+    def dispatch(arguments: Any) -> int:
+        # 外のフォルダは読まない 解釈した引数だけを見る
+        seen.append(arguments)
+        return 0
+
+    monkeypatch.setattr(tool, "_dispatch", dispatch)
+    assert tool.main(argv) == 0
+    assert seen[0].dir == expected
+
+
 def test_reason_list_matches_the_docs(tool: ModuleType) -> None:
     """docs/evaluation.md の「状態と理由」の表と、台本の一覧が同じであること
 

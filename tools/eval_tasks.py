@@ -1524,8 +1524,20 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else "")
-    parser.add_argument("--dir", help=f"評価のフォルダ（省くと {EVAL_DIR_VARIABLE}）")
+    folder_help = f"評価のフォルダ（省くと {EVAL_DIR_VARIABLE}）"
+    parser.add_argument("--dir", help=folder_help)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    def command_parser(name: str, help_text: str) -> argparse.ArgumentParser:
+        """命令ごとの parser 命令の後ろに置いた --dir も受ける
+
+        一番上にだけ足すと、手順書どおり命令の後ろに置いたとき unrecognized arguments で止まる
+        既定を SUPPRESS にして、命令の前に置いた値を空で上書きしない（前でも後ろでも動く
+        両方に置いたら後ろが勝つ）
+        """
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("--dir", default=argparse.SUPPRESS, help=folder_help)
+        return command
 
     def tool_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("ids", nargs="*", help="素材の番号（省くと全部）")
@@ -1536,16 +1548,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         command.add_argument("--min-scene", type=finite_float)
         command.add_argument("--asr-model")
 
-    draft = sub.add_parser("draft", help="仮の正解と直す用の .sme を作る")
+    draft = command_parser("draft", "仮の正解と直す用の .sme を作る")
     tool_options(draft)
     draft.add_argument("--force", action="store_true", help="仮の正解を作り直す")
-    adopt = sub.add_parser("adopt", help="直した .sme を正解にする")
+    adopt = command_parser("adopt", "直した .sme を正解にする")
     adopt.add_argument("id")
     adopt.add_argument("task", choices=ANSWERED)
     adopt.add_argument("--from", dest="source", type=Path, help="直した .sme（省くと下書きの所）")
-    run = sub.add_parser("run", help="道具の段を回して結果を足す")
+    run = command_parser("run", "道具の段を回して結果を足す")
     tool_options(run)
-    sub.add_parser("report", help="前回との差を出す")
+    # report はリポジトリの中の結果だけを読むので外のフォルダは使わないが、ほかの命令と同じ
+    # 打ち方（--dir 付き）で止まらないように受ける
+    command_parser("report", "前回との差を出す")
     arguments = parser.parse_args(argv)
     try:
         return _dispatch(arguments)

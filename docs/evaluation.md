@@ -38,7 +38,9 @@
    ```
 
    相対の場所は、このフォルダから読む
-2. 環境変数 `SASHIMONO_EVAL_DIR` にそのフォルダを入れる（または、命令ごとに `--dir J:\sashimono-eval` で指す）
+2. 環境変数 `SASHIMONO_EVAL_DIR` にそのフォルダを入れる（または、命令ごとに `--dir` で指す
+   例 `.venv\Scripts\python.exe tools\eval_tasks.py run --dir J:\sashimono-eval`
+   `--dir` は命令の前に置いても後ろに置いてもよい 両方に置いたら後ろの値を使う）
 3. 字幕の課題には字幕起こしの部品（faster-whisper）が要る 開発の環境（.venv）には入れず、
    配布版のアプリが画面のボタンから入れた部品（`%LOCALAPPDATA%\Sashimono\runtime`）を読む
    部品が無い機械や、別の Python 向けに入れた部品しか無い機械では、字幕の課題の下書きを作らず、
