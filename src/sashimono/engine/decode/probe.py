@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import logging
 import threading
 from collections import OrderedDict
 from fractions import Fraction
@@ -43,6 +44,8 @@ class ProbeError(Exception):
 #: 回転を読むために頭の 1 枚を待つ間に読むパケットの上限 B フレームやスレッドの遅れで
 #: 最初の数十パケットは絵が出ないことがあるので、それより十分多く取る
 ROTATION_PACKET_LIMIT = 256
+
+_log = logging.getLogger(__name__)
 
 #: 調べた結果を覚えておく素材の数 1 本あたり数百バイトなので、多めに持っても軽い
 PROBE_CACHE_SIZE = 512
@@ -140,7 +143,7 @@ def _facts(path: Path, identity: tuple[int, ...]) -> _Facts:
                 break
         waiting.wait()
     try:
-        facts = _read_facts(path)
+        facts, settled = _read_facts(path)
     except BaseException:
         with _lock:
             _finish(mine)
@@ -148,7 +151,9 @@ def _facts(path: Path, identity: tuple[int, ...]) -> _Facts:
         raise
     with _lock:
         # 調べている間に捨てられていたら覚えない 読み込み直した側の結果だけを残す
-        if _generation.get(path, 0) == mine[2]:
+        # 回転を読めなかった結果も覚えない 覚えると、たまたま読めなかった 1 回のせいで、縦撮りが
+        # 開き直すまでずっと横倒しのまま再生・書き出し・解析に使われる 次に頼まれたら読み直す
+        if settled and _generation.get(path, 0) == mine[2]:
             _cache[key] = facts
             while len(_cache) > PROBE_CACHE_SIZE:
                 _cache.popitem(last=False)
@@ -205,8 +210,12 @@ def _identity(path: Path) -> tuple[int, ...]:
     )
 
 
-def _read_facts(path: Path) -> _Facts:
-    """素材を開いて、長さとストリームを調べる"""
+def _read_facts(path: Path) -> tuple[_Facts, bool]:
+    """素材を開いて、長さとストリームを調べる 2 つ目は回転を全部読めたか
+
+    読めなかった回転は開き直して 1 度だけ読み直し、それでも読めなければ 0 として返す
+    （記録に残し、覚えずに次に頼まれたとき読み直す :func:`_facts`）
+    """
     try:
         container = av.open(str(path))
     except (av.error.FFmpegError, OSError) as exc:
@@ -221,18 +230,37 @@ def _read_facts(path: Path) -> _Facts:
             raise ProbeError(f"映像も音声も含まれていない: {path}")
         duration = Fraction(0) if is_still else _container_duration(container, origin)
         # 回転は最後に読む 頭の 1 枚を復号するので、ほかの値を読む前に進めない
-        rotations = [0] * len(pictures) if is_still else _rotations(path, container, pictures)
+        found: list[int | None] = (
+            [0] * len(pictures) if is_still else _rotations(path, container, pictures)
+        )
+        if None in found:
+            found = _read_again(path, found)
+        settled = None not in found
+        if not settled:
+            _log.warning("回転を読めなかったので 0 として扱い、次に開くときに読み直す: %s", path)
         video_streams = tuple(
-            _video_info(stream, rotation, origin)
-            for stream, rotation in zip(pictures, rotations, strict=True)
+            _video_info(stream, rotation or 0, origin)
+            for stream, rotation in zip(pictures, found, strict=True)
         )
 
-    return duration, video_streams, audio_streams
+    return (duration, video_streams, audio_streams), settled
+
+
+def _read_again(path: Path, found: list[int | None]) -> list[int | None]:
+    """読めなかった回転だけを、開き直して読み直す 読めた物はそのまま"""
+    try:
+        with av.open(str(path)) as again:
+            retry = _rotations(path, again, moving_pictures(again))
+    except (av.error.FFmpegError, OSError):
+        return found
+    if len(retry) != len(found):
+        return found
+    return [old if old is not None else new for old, new in zip(found, retry, strict=True)]
 
 
 def _rotations(
     path: Path, container: av.container.InputContainer, pictures: list[av.VideoStream]
-) -> list[int]:
+) -> list[int | None]:
     """映像ストリームごとの回転 表示行列はストリームごとに持つ
 
     1 本目の回転をほかへ写すと、向きの違う 2 本目（別のカメラの角度など）が横倒しになる
@@ -241,14 +269,14 @@ def _rotations(
     """
     if not pictures:
         return []
-    rotations = [_display_rotation(container, pictures[0])]
+    rotations: list[int | None] = [_display_rotation(container, pictures[0])]
     for stream in pictures[1:]:
         try:
             with av.open(str(path)) as again:
                 same = cast(av.VideoStream, again.streams[stream.index])
                 rotations.append(_display_rotation(again, same))
         except (av.error.FFmpegError, OSError, IndexError):
-            rotations.append(0)
+            rotations.append(None)
     return rotations
 
 
@@ -413,7 +441,7 @@ def _audio_info(stream: av.audio.stream.AudioStream) -> AudioStreamInfo:
     )
 
 
-def _display_rotation(container: av.container.InputContainer, stream: av.VideoStream) -> int:
+def _display_rotation(container: av.container.InputContainer, stream: av.VideoStream) -> int | None:
     """表示時に適用すべき時計回りの回転角を返す
 
     スマホの縦撮り素材は回転情報（表示行列）を持つのが普通で、無視すると横倒しで表示される
@@ -425,7 +453,8 @@ def _display_rotation(container: av.container.InputContainer, stream: av.VideoSt
     無い機械では回転を読めず、縦撮りが横倒しのままだった） 頭の 1 枚の復号は 1080p で 5ms、
     4K の H.265 で 30ms ほどで、ffprobe を起こす 35〜45ms より速い
 
-    取得できない場合は 0 を返し、素材の読み込み自体は続行する 読むパケットには上限
+    読めない場合は ``None`` を返す（読み込みは続け、呼ぶ側が読み直すか 0 として扱う
+    黙って 0 にすると、縦撮りが横倒しのまま控えに残る #407） 読むパケットには上限
     （:data:`ROTATION_PACKET_LIMIT`）を置く 絵を 1 枚も出さない映像（壊れた道・復号できない
     符号）で頭の 1 枚を待ち続けると、ファイルの終わりまで読み、大きな素材では読み込みや
     再生の始まりが止まる（前の ffprobe には 15 秒の上限があった）
@@ -438,10 +467,11 @@ def _display_rotation(container: av.container.InputContainer, stream: av.VideoSt
             if frames:
                 frame = frames[0]
                 break
-    except (av.error.FFmpegError, OSError, ValueError):
-        return 0
+    except (av.error.FFmpegError, OSError, ValueError) as exc:
+        _log.warning("回転を読む頭の 1 枚を復号できない: %s", exc)
+        return None
     if frame is None:
-        return 0
+        return None
     # 絵の回転は ffprobe と同じく反時計回りの角度 表示時に必要なのは時計回りなので反転する
     clockwise = round(-float(frame.rotation)) % 360
     return clockwise if clockwise in (0, 90, 180, 270) else 0
