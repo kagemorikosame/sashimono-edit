@@ -3308,6 +3308,9 @@ class MainWindow(QMainWindow):
             found.append("字幕を起こしています")
         if self._assistant_export.running:
             found.append("AI アシスタントが書き出しています")
+        if self._narration_job is not None:
+            # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
+            found.append("ナレーションの声を作っています")
         return found
 
     def _close_for_update(self) -> bool:
@@ -4210,6 +4213,14 @@ class MainWindow(QMainWindow):
             8000,
         )
 
+    def _stop_narration(self) -> None:
+        """作っている途中の声を止めて捨てる エンジンには次の文から頼まない 何も書かない"""
+        self._narration_timer.stop()
+        running = self._narration_job
+        self._narration_job = None
+        if running is not None:
+            running[0].abandon()
+
     def _apply_as_person(self, commands: list[Command], label: str) -> None:
         """人の操作として 1 段で当てる 断られたら :class:`ToolError`（呼んだ側が知らせる）"""
         try:
@@ -4360,6 +4371,9 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
         # 書きかけは捨てる 書き出し先は前のまま残る
         self._assistant_export.shutdown()
+        # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
+        # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
+        self._stop_narration()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()

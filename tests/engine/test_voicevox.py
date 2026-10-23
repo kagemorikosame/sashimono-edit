@@ -267,6 +267,16 @@ class TestSplitting:
         assert split_script("えーと...そうです") == ["えーと...", "そうです"]
         assert split_script(f"はい！？{maru}\n次です") == [f"はい！？{maru}", "次です"]
 
+    def test_a_dot_inside_numbers_and_names_does_not_split(self) -> None:
+        # 壊れると、「約3.5倍」が「約3.」「5倍」に割れて数字の読みの途中に間が入り、字幕も
+        # 2 枚に割れる 版（Ver.2）と場所（example.com）も同じ（#401 の CodeRabbit の指摘）
+        assert split_script("約3.5倍です") == ["約3.5倍です"]
+        assert split_script("Ver.2 を入れます") == ["Ver.2 を入れます"]
+        assert split_script("example.com を開く") == ["example.com を開く"]
+        # 文の終わりの . と、続く ... は今までどおり切れ目になる
+        assert split_script("Hello. World") == ["Hello.", "World"]
+        assert split_script("えーと...そうです") == ["えーと...", "そうです"]
+
     def test_pieces_without_anything_to_read_are_dropped(self) -> None:
         # 壊れると、記号と空白だけの塊（行頭の句点など）をエンジンへ渡して断られるか、
         # 声の無い字幕が 1 枚できる

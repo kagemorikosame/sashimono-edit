@@ -98,7 +98,11 @@ _USER_AGENT = f"SashimonoEdit/{__version__} (narration)"
 #: 渡し、読む物が無いと断られてナレーション全体が失敗する（記号は前の文の終わりに付けたままにする）
 #: 記号は決まった文字だけで組む（台本の文は式に入らない）
 _END_MARKS = chr(0x3002) + r"．.！!？?\n"
-_SENTENCE_END = re.compile(f"(?<=[{_END_MARKS}])(?![{_END_MARKS}])")
+#: 半角の . は小数（3.5）・版（Ver.2）・場所（example.com）の途中にも出る 後ろが半角英数字なら
+#: 切れ目にしない 切ると数字の読みの間に間が入り、字幕も 2 枚に割れる（声と字幕は同じ塊から
+#: 作るので、数はそろったまま）
+_STOP_MARKS = chr(0x3002) + r"．！!？?\n"
+_SENTENCE_END = re.compile(rf"(?:(?<=[{_STOP_MARKS}])|(?<=\.)(?![0-9A-Za-z]))(?![{_END_MARKS}])")
 #: 文の中の区切り 1 つの文が長すぎるときだけここで分ける
 _CLAUSE_END = re.compile(r"(?<=[、，,；;：:）)」』])")
 
@@ -237,13 +241,15 @@ def check_engine_url(raw: object) -> str:
     host = parts.hostname or ""
     if host.lower() != "localhost":
         try:
+            # ループバックの番地（127.0.0.0/8 と ::1）は全部許す どれも機械の外へ出ない
+            # 127.0.0.1 だけに絞ると、別の番地で待ち受けさせた人がつなげず、守りは何も増えない
             loopback = ipaddress.ip_address(host).is_loopback
         except ValueError:
             loopback = False
         if not loopback:
             raise ValueError(
-                f"エンジンの場所は自分の機械の中（127.0.0.1 か localhost）だけです: {text}"
-                " 台本の文を機械の外へ送らないため"
+                "エンジンの場所は自分の機械の中（127.0.0.1 などのループバックの番地か"
+                f" localhost）だけです: {text} 台本の文を機械の外へ送らないため"
             )
     shown = f"[{host}]" if ":" in host else host
     return f"http://{shown}" + (f":{port}" if port is not None else "")

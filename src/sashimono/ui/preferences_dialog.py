@@ -1454,7 +1454,8 @@ class PreferencesDialog(QDialog):
         self._narration_url.setToolTip(
             "AI アシスタントがナレーションの声を作るエンジンの場所 本人が入れて起動した"
             f" VOICEVOX（{DEFAULT_ENGINE_URL}）か AivisSpeech（{AIVIS_ENGINE_URL}）"
-            " 自分の機械の中（127.0.0.1 か localhost）だけを受け付け、台本の文を外へは送らない"
+            " 自分の機械の中（127.0.0.1 などのループバックの番地か localhost）だけを受け付け、"
+            "台本の文を外へは送らない"
         )
         form.addRow("ナレーション: エンジンの場所", self._narration_url)
 

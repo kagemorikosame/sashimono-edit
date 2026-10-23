@@ -519,6 +519,35 @@ class TestMenu:
         assert window.narration_settings.subtitles is True
 
     @WINDOWS_WRITES
+    def test_closing_while_making_stops_and_writes_nothing(
+        self,
+        opened: list[MainWindow],
+        engine: FakeVoiceEngine,
+        tmp_path: Path,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、声を作っている途中で窓を閉じても裏の待ちが残り、閉じた窓へ WAV を書いて声を
+        # 置きに来る 更新の再起動も作っている途中を止めずに進む（#401 の CodeRabbit の指摘）
+        window, _project = _saved_window(opened, tmp_path, video_media, transcript, engine.url)
+        catalog = VoiceEngine(engine.url).catalog()
+        engine.synthesis_delay = 0.5
+        choice = NarrationChoice("こんにちは。", 3, 100, 100, True)
+        monkeypatch.setattr(main_window_module, "ask_narration", lambda *_a: (choice, catalog))
+        window.create_narration()
+        assert "ナレーションの声を作っています" in window.update_blockers()
+        window.close()
+        assert window._narration_job is None
+        assert not window._narration_timer.isActive()
+        assert "ナレーションの声を作っています" not in window.update_blockers()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        assert not (tmp_path / "narration" / "narration_001.wav").exists()
+
+    @WINDOWS_WRITES
     def test_an_engine_failure_is_told_and_nothing_is_placed(
         self,
         opened: list[MainWindow],

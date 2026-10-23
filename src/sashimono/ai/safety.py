@@ -89,12 +89,18 @@ class Consent:
     #: （:class:`~sashimono.core.io.atomic.Expected`） 比べるときだけ使う 文に出した大きさと
     #: 時刻を、細かいまま照らすため
     basis: Expected | None = None
+    #: 箱にだけ出し、AI へ返す文には載せない本人の文（ナレーションの台本 #335）
+    #: ``detail`` は許した後に中身が変わったときの断りの文（AI へ返る）に入るので、宣言の外の
+    #: 物を入れない 台本のように人が見て判断したい本人の文はここに入れる 照らし合わせには入る
+    private: str = ""
 
     def text(self) -> str:
         """確かめの窓に出す文"""
         lines = [self.action, f"対象: {self.target}"]
         if self.detail:
             lines.append(self.detail)
+        if self.private:
+            lines.append(self.private)
         return "\n".join(lines)
 
 

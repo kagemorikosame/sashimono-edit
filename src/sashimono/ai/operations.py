@@ -6493,6 +6493,10 @@ class _Job[T]:
     def wait(self, seconds: float) -> bool:
         return self._done.wait(seconds)
 
+    def abandon(self) -> None:
+        """待つのをやめる 裏のスレッドは次の塊の前で止まる（結果は誰も取らない）"""
+        self._abandoned.set()
+
     def take(self, what: str) -> T:
         """終わっていれば結果を返す 終わっていなければ止めて断る"""
         if not self._done.is_set():
@@ -6616,6 +6620,8 @@ class NarrationPlan:
     subtitles: bool
     path: Path
     detail: str
+    #: 確かめの箱にだけ出す台本（:attr:`Consent.private` AI へ返る文に載せない）
+    private: str
 
 
 def _narration_text(arguments: dict[str, Any]) -> str:
@@ -6760,7 +6766,6 @@ def narration_plan(
         f"表記: {credit}（作品に覚え、書き出しのときに知らせます 声ごとの規約は list_voices と"
         "エンジンのアプリで確かめてください）",
         f"作品のフォルダに {NARRATION_FOLDER} フォルダを作ります" if making else "",
-        f"読ませる文（{len(text)} 文字 この文は自分の機械の中のエンジンへだけ渡します）:\n{text}",
     ]
     _refuse_elsewhere()
     return NarrationPlan(
@@ -6775,6 +6780,12 @@ def narration_plan(
         subtitles=subtitles,
         path=path,
         detail="\n".join(part for part in parts if part),
+        # 台本は確かめの箱にだけ出す detail に入れると、許した後に中身が変わったときの断りの文
+        # を通って AI へ返る（字幕と文字を送らないと決めた人の所でも）
+        private=(
+            f"読ませる文（{len(text)} 文字 この文は自分の機械の中のエンジンへだけ渡します）:"
+            f"\n{text}"
+        ),
     )
 
 
@@ -6788,6 +6799,7 @@ def narration_consent(
         target=str(plan.path),
         detail=plan.detail,
         basis=expect_now(plan.path),
+        private=plan.private,
     )
 
 
@@ -6810,6 +6822,10 @@ class NarrationJob:
     def wait(self, seconds: float) -> bool:
         """終わるまで最長で引数の秒だけ待つ 終わっていれば真"""
         return self._job.wait(seconds)
+
+    def abandon(self) -> None:
+        """作るのをやめる 窓を閉じるときなど エンジンには次の文から頼まない"""
+        self._job.abandon()
 
     def take(self) -> Spoken:
         """作った声 終わっていなければ止めて断り、エンジンの失敗は理由を書いて断る"""

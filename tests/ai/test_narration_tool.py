@@ -33,7 +33,12 @@ from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddCredits, Author
 from sashimono.core.io.atomic import expect_now
 from sashimono.core.model import TrackKind
-from sashimono.engine.audio.voicevox import NarrationSettings, VoiceEngine, wav_seconds
+from sashimono.engine.audio.voicevox import (
+    NarrationSettings,
+    VoiceEngine,
+    check_engine_url,
+    wav_seconds,
+)
 from sashimono.engine.decode import probe_media
 from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread
@@ -255,10 +260,31 @@ class TestMakingAndPlacing:
         assert consent.target.endswith("narration_001.wav")
         assert "ずんだもん（ノーマル）" in consent.detail
         assert "VOICEVOX:ずんだもん" in consent.detail
-        assert SCRIPT in consent.detail
+        # 台本は箱に出す（人が読んで許す）が、AI へ返る detail には入れない
+        assert SCRIPT in seen[0].summary
+        assert SCRIPT not in consent.detail
         assert "narration フォルダを作ります" in consent.detail
         assert folder_seen == [False]
         assert engine.texts  # 声はエンジンで作った
+
+    def test_a_change_while_asking_does_not_send_the_script(self, narrating: FakeHost) -> None:
+        # 壊れると、確かめの箱が出ている間に人が再生ヘッドを動かしたとき、照らし合わせの断りの
+        # 文に台本の全文が 2 回入って AI へ返り、字幕と文字を送らないと決めた人の文まで送る
+        # （#401 の CodeRabbit の指摘）
+        _listed(narrating)
+
+        def move(_approval: Approval) -> bool:
+            narrating.seek(narrating.playhead + 15)
+            return True
+
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT}, move)
+        error = str(box.get("error"))
+        assert "中身が変わりました" in error
+        assert "置く所" in error
+        assert "動画の切り方" not in error
+        assert "最後まで見て" not in error
+        assert narrating.narrations == []
 
     def test_the_wave_is_written_read_and_placed_and_undone_in_one_step(
         self, narrating: FakeHost
@@ -469,6 +495,39 @@ class TestMakingAndPlacing:
         assert done.is_set()
         assert "作品の場所が変わった" in str(box.get("error"))
         assert narrating.narrations == []
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+class TestTheDocumentsMatchTheCode:
+    def test_the_accepted_engine_places_are_described_as_they_are(self) -> None:
+        """壊れると、文書には 127.0.0.1・::1・localhost だけと書いてあるのに、実装は 127.0.0.2 など
+        ほかのループバックの番地も通し、読んだ人がどこまでつながるかを取り違える
+        （#401 の CodeRabbit の指摘）"""
+        assert check_engine_url("http://127.0.0.2:50021") == "http://127.0.0.2:50021"
+        development = (_ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+        policy = (_ROOT / "docs" / "code-signing-policy.md").read_text(encoding="utf-8")
+        section = development[development.index("### ナレーションの生成（#335）") :]
+        line = next(row for row in section.splitlines() if "check_engine_url" in row)
+        assert "127.0.0.0/8" in line
+        rows = [
+            row
+            for row in policy.splitlines()
+            if row.startswith(("| Narration voices", "| ナレーションの声"))
+        ]
+        assert len(rows) == 2
+        assert all("127.0.0.0/8" in row for row in rows)
+
+    def test_the_readme_says_list_voices_reads_one_voice_terms(self) -> None:
+        """壊れると、README は声ごとに規約を読むと書くのに、list_voices は頼んだ声か既定の声の
+        1 つだけを読み、読んだ人が全部の声の規約を確かめたつもりになる
+        （#401 の CodeRabbit の指摘）"""
+        readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+        start = readme.index("**台本を読み上げたナレーションを作って置けます**")
+        paragraph = readme[start : readme.index("\n\n", start)]
+        assert "声ごとの規約を読み" not in paragraph
+        assert "1 つの規約" in paragraph
 
 
 class TestCreditsAreTold:

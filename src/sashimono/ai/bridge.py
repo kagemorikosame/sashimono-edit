@@ -387,6 +387,8 @@ class EditorBridge:
                         f"今の場所: {again.target}）"
                     )
                 elif isinstance(again, Consent):
+                    # この文は AI へ返る 箱にだけ出す本人の文（Consent.private ナレーションの
+                    # 台本 #335）は載せない 載せると、字幕と文字を送らない人の文まで送る
                     what = f"中身が変わりました（許した時: {consent.detail} 今: {again.detail}）"
                 else:
                     what = "中身が変わりました"
