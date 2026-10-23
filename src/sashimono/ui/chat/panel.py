@@ -57,7 +57,7 @@ from sashimono.ai.budget import (
     format_tokens,
 )
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
-from sashimono.ai.fixes import fix_stop, fixes_closed
+from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, TurnRecord, shelf_for
 from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
@@ -1805,25 +1805,38 @@ class ChatPanel(QWidget):
         if used.images:
             counts += f"・絵 {used.images} 枚"
         self._append(_DIVIDER, f"{outcome}（{elapsed}・{counts}）")
-        # 計画の止まった訳（#340）を先に決め、引き継ぎ（#346）へ揃えてから要約を作る
-        self._end_plan(limited=stopped is not None)
+        # 止まった訳は引き継ぎ（#346）の記録で 1 つに決め、同じ訳を計画（#340）へ渡してから
+        # 要約を作る
+        self._settle_record()
+        self._end_plan(usage_limited=stopped is not None)
         self._hand_off()
         self._stopping = False
 
-    def _end_plan(self, *, limited: bool) -> None:
+    def _settle_record(self) -> None:
+        """引き継ぎの記録を締める 計画と引き継ぎは、ここで決まった訳を使う"""
+        if self._stopping and not self._halted:
+            # 上限で止めた後も道具を呼び続けたのでアプリが会話を止めた（#344）ときは、人の中断と
+            # 書かない 中断は訳の中で一番強く、上限の訳を隠して人が止めたように読める
+            self._record.stop(StopReason.INTERRUPTED, "人が〔中断〕を押しました")
+        if self._checkpoint_open:
+            # 段がまだ開いていれば（区切りの行を先に足す道）、変えた手と直しの回数の上限を写す
+            self._record.capture(self._host.document)
+
+    def _end_plan(self, *, usage_limited: bool) -> None:
         """計画（#340）に止まった訳を残す 手順が残っていれば欄が〔続ける〕を出す
 
-        訳は引き継ぎ（#346 :meth:`_hand_off`）と揃える 人の中断は一番強い訳で、上限で止めた後に
-        アプリが会話を止めた（``_halted``）ときは中断と書かない 上限は使う量の上限（#344）と
-        Claude Code の上限の両方 直しの回数の上限で手順が残ったときは、引き継ぎにも上限の訳と
-        残った手順の数を書く 直し切っていても手順が残れば頼まれたことは済んでおらず、計画は
-        「直しの回数の上限」と言うのに引き継ぎが何も出さないと、どちらを信じればよいか分からない
+        訳は引き継ぎ（#346）の記録（:meth:`_settle_record` で締めた物）をそのまま渡す 計画が
+        自分で決めると、エラーや接続の切れで止まった指示が計画では「応え終えた」と残る
+        直しの回数の上限で手順が残り、引き継ぎに訳が無いときは、引き継ぎにも上限の訳を書く
+        直し切っていても手順が残れば頼まれたことは済んでおらず、計画は「直しの回数の上限」と
+        言うのに引き継ぎが何も出さないと、どちらを信じればよいか分からない
         検査の直しの回数の上限（#339）は、この指示の段の番号が変わるまで残るので、終えた後に読める
         """
         document = self._host.document
         self._plan.end_turn(
-            interrupted=self._stopping and not self._halted,
-            limited=limited or self._turn_limited,
+            reason=self._record.reason,
+            usage_limited=usage_limited,
+            agent_limited=self._turn_limited,
             fixed=fixes_closed(document),
         )
         view = self._plan.view()
@@ -1834,9 +1847,9 @@ class ChatPanel(QWidget):
             # 人が止めたので引き継ぎは作らない（続きは計画の欄の〔続ける〕から頼める）
             self._note(f"計画を区切りで止めました（{plan_progress(view)}）")
             return
-        if view.stopped is Stopped.FIX_LIMIT and fix_stop(document) is None:
-            # 直せる問題が残った・編集を断ったときは、引き継ぎが段を写すときに詳しい訳を書く
-            # ここで先に書くと、同じ訳の文は最初の物が残るので詳しい方が消える
+        if view.stopped is Stopped.FIX_LIMIT and self._record.reason is None:
+            # 直せる問題が残った・編集を断ったときは、段を写したときに引き継ぎが詳しい訳を
+            # 書いている 訳が無いのは、直し切ったが手順が残ったときだけ
             self._record.stop(
                 StopReason.LIMIT,
                 "検査の後に直す回数の上限（本人の設定）に達し、計画の手順が残りました",
@@ -1859,13 +1872,8 @@ class ChatPanel(QWidget):
         切れた・部品が古い・環境が使えない）はどれも区切りの行を通るので、ここ 1 か所で拾える
         段がまだ開いていれば（区切りの行を先に足す道）、変えた手をここで履歴から写す
         """
-        if self._stopping and not self._halted:
-            # 上限で止めた後も道具を呼び続けたのでアプリが会話を止めた（#344）ときは、人の中断と
-            # 書かない 中断は訳の中で一番強く、上限の訳を隠して人が止めたように読める
-            self._record.stop(StopReason.INTERRUPTED, "人が〔中断〕を押しました")
+        self._settle_record()
         document = self._host.document
-        if self._checkpoint_open:
-            self._record.capture(document)
         handoff = self._record.handoff(document, self._checkpoint_label)
         shelf = shelf_for(document)
         if handoff is None:

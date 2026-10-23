@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from sashimono.ai.handoff import GET_HANDOFF
+from sashimono.ai.handoff import GET_HANDOFF, StopReason
 from sashimono.ai.host import ToolError
 from sashimono.core.commands import Document
 
@@ -121,7 +121,13 @@ _STATE_MARKS = {
 
 
 class Stopped(Enum):
-    """手順が残ったまま止まった訳 欄と get_plan に出す"""
+    """手順が残ったまま止まった訳 欄と get_plan に出す
+
+    止まった指示の引き継ぎ（#346 :class:`~sashimono.ai.handoff.StopReason`）の訳のどれにも
+    当たる物を持つ（:meth:`WorkPlan.end_turn` が引き継ぎの訳から決める） 上限だけは、
+    次にすることが違うので使う量・Claude Code・直しの回数の 3 つに分ける 引き継ぎの訳が
+    無い（止まらずに終えた）ときだけ、区切りと応え終えたを使う
+    """
 
     #: 〔区切りで止める〕 今の手順を終えた所で止まった
     PAUSED = "区切りで止めました"
@@ -133,8 +139,28 @@ class Stopped(Enum):
     #: 検査の直しの回数の上限（#339）に達し、ブリッジが残りの編集を断った 手順の途中で
     #: 止まったかもしれない 応え終えたと書くと、設定で回数を増やせば続けられることが読めない
     FIX_LIMIT = "検査の直しの回数の上限で止めました"
+    #: Claude Code の上限（手数・費用）で止まった 使う量の上限と分ける 設定の「AI の上限」を
+    #: 広げても変わらず、送り直せば続く
+    AGENT_LIMIT = "Claude Code の上限で止まりました"
+    #: 応えている途中で Claude Code との会話が閉じた 応え終えたと書くと、途中の手順を
+    #: 確かめずに続ける
+    DISCONNECTED = "接続が切れて止まりました"
+    #: エラーで止まった（例外・Claude Code の失敗・部品が古い）
+    ERROR = "エラーで止まりました"
+    #: 許されなかった操作・答えなかった質問・送るのを断った物があった
+    DENIED = "許されなかった操作があって止まりました"
     #: 頼まれずに応え終えた（質問した・できずに諦めたなど）
     ENDED = "手順を残して応え終えました"
+
+
+#: 引き継ぎの訳から計画の訳へ 上限（``LIMIT``）は 3 つに分けるので
+#: :meth:`WorkPlan._stopped_for` で決める
+_FROM_HANDOFF = {
+    StopReason.INTERRUPTED: Stopped.INTERRUPTED,
+    StopReason.DISCONNECTED: Stopped.DISCONNECTED,
+    StopReason.ERROR: Stopped.ERROR,
+    StopReason.DENIED: Stopped.DENIED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,39 +384,61 @@ class WorkPlan:
             self._paused = False
             self._stopped = None
 
-    def end_turn(self, *, interrupted: bool, limited: bool = False, fixed: bool = False) -> None:
+    def end_turn(
+        self,
+        *,
+        reason: StopReason | None = None,
+        usage_limited: bool = False,
+        agent_limited: bool = False,
+        fixed: bool = False,
+    ) -> None:
         """指示が終わった 手順が残っていれば、止まった訳を覚える
 
-        ``interrupted`` は人が〔中断〕を押した指示 引き継ぎ（#346）と同じく一番強い訳にする
-        上限で止めた後も道具を呼び続けてアプリが会話ごと止めたときは、画面が中断と渡さない
-        （止めた訳は上限 引き継ぎも人の中断と書かない）
-        ``limited`` は使う量の上限（#344）か Claude Code の上限（手数・費用）で止めた指示
-        会話の欄の区切りの行（「上限で停止」）と揃える
-        ``fixed`` は検査の直しの回数の上限（#339）に達した指示 区切りまで来て止めた後なら
-        ブリッジは区切りの方を先に断るので、訳は区切り まだ区切りに来ていなければ、残りの
-        編集を断ったのは回数の上限なので、止めを頼んであっても訳は回数の上限
+        ``reason`` は引き継ぎ（#346）に書いた止まった訳 画面は同じ訳を両方へ渡す 別々に決めると、
+        計画の欄は「応え終えた」なのに引き継ぎは「エラー」のように食い違い、どちらを信じて
+        続ければよいか分からない 訳があれば計画もその訳にし、無いときだけ区切りか応え終えた
+        （直しの回数の上限で引き継ぎが無いときは、画面がこの後に引き継ぎへ上限の訳を書く）
+        上限の訳（``LIMIT``）は ``usage_limited``（使う量の上限 #344）・``agent_limited``
+        （Claude Code の上限）・``fixed``（検査の直しの回数の上限 #339）で分ける 次にすることが違う
+        ``fixed`` は区切りまで来て止めた後なら、ブリッジは区切りの方を先に断るので、引き継ぎの訳が
+        無ければ訳は区切り まだ区切りに来ていなければ、残りの編集を断ったのは回数の上限
         """
+        if reason is None and (usage_limited or agent_limited):
+            reason = StopReason.LIMIT
         with self._lock:
             unfinished = any(not step.state.finished for step in self._steps)
             if unfinished:
-                if interrupted:
-                    self._stopped = Stopped.INTERRUPTED
-                elif limited:
-                    self._stopped = Stopped.LIMIT
-                elif self._paused:
-                    self._stopped = Stopped.PAUSED
-                elif fixed:
-                    self._stopped = Stopped.FIX_LIMIT
-                elif self._pause_requested:
-                    self._stopped = Stopped.PAUSED
-                else:
-                    self._stopped = Stopped.ENDED
+                self._stopped = self._stopped_for(reason, usage_limited, agent_limited, fixed)
             else:
                 # 終えた計画に止まった訳を残さない 残すと会話の欄が「区切りで止めました」と出す
                 self._stopped = None
             self._pause_requested = False
             self._paused = False
             self._version += 1
+
+    def _stopped_for(
+        self,
+        reason: StopReason | None,
+        usage_limited: bool,
+        agent_limited: bool,
+        fixed: bool,
+    ) -> Stopped:
+        """止まった訳を引き継ぎの訳から決める 錠の中で呼ぶ"""
+        if reason is StopReason.LIMIT:
+            if usage_limited:
+                return Stopped.LIMIT
+            if agent_limited:
+                return Stopped.AGENT_LIMIT
+            return Stopped.FIX_LIMIT if fixed else Stopped.LIMIT
+        if reason is not None:
+            return _FROM_HANDOFF[reason]
+        if self._paused:
+            return Stopped.PAUSED
+        if fixed:
+            return Stopped.FIX_LIMIT
+        if self._pause_requested:
+            return Stopped.PAUSED
+        return Stopped.ENDED
 
     def request_pause(self) -> bool:
         """〔区切りで止める〕 残りの手順が無い・もう頼んであるときは偽"""

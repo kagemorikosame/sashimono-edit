@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
+from sashimono.ai.bridge import Approval
 from sashimono.ai.budget import LimitAction, Limits
 from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.handoff import Handoff, StopReason, shelf_for
@@ -22,7 +23,7 @@ from sashimono.ai.plan import PAUSED_MESSAGE, RESUME_PROMPT, Stopped, plan_for
 from sashimono.ai.session import LIMIT_DETAIL, PLAN_RULES, AgentEvent, EventKind
 from sashimono.core.model import MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
-from sashimono.ui.chat.plan_box import PAUSE_TEXT, PAUSING_TEXT
+from sashimono.ui.chat.plan_box import _STOPPED_HINTS, PAUSE_TEXT, PAUSING_TEXT
 from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread, pump_until
@@ -374,24 +375,117 @@ class TestPauseAndResume:
         assert "前の作品の計画を閉じました" in _log(widget)
 
 
+def _end_by_interrupt(widget: ChatPanel, host: FakeHost) -> None:
+    widget.interrupt()
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_usage_limit(widget: ChatPanel, host: FakeHost) -> None:
+    _over_the_limit(widget)
+    with pytest.raises(ToolError, match="上限"):
+        widget._bridge.invoke(_operation("get_selection"), {})
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_agent_limit(widget: ChatPanel, host: FakeHost) -> None:
+    widget._handle(AgentEvent(EventKind.ERROR, text="上限に達しました", detail=LIMIT_DETAIL))
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_fix_limit_refusal(widget: ChatPanel, host: FakeHost) -> None:
+    host.fix_limit = 0
+    _finish(host, [_MIXED_CLIP])
+    done, result = call_in_thread(widget._bridge, _operation("add_track"), {"kind": "video"})
+    pump_until(widget._bridge, done)
+    assert isinstance(result.get("error"), ToolError)
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_after_the_fix_limit(widget: ChatPanel, host: FakeHost) -> None:
+    host.fix_limit = 0
+    _finish(host, [_MIXED_CLIP])
+    widget._handle(AgentEvent(EventKind.TEXT, text="直す回数の上限なのでここまでにします"))
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_lost_connection(widget: ChatPanel, host: FakeHost) -> None:
+    widget._handle(AgentEvent(EventKind.CLOSED))
+
+
+def _end_by_error(widget: ChatPanel, host: FakeHost) -> None:
+    widget._handle(AgentEvent(EventKind.ERROR, text="ProcessError: 落ちました"))
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_denial(widget: ChatPanel, host: FakeHost) -> None:
+    widget._bridge._approvals.put(Approval(tool="split_clip", summary="分割", arguments={}))
+    widget._check_approval()
+    widget._answer(False)
+    widget._handle(AgentEvent(EventKind.TEXT, text="許されなかったのでここまでにします"))
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_by_pause(widget: ChatPanel, host: FakeHost) -> None:
+    assert plan_for(host.document).request_pause()
+    _mark(host, 1, "done")
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
+def _end_on_its_own(widget: ChatPanel, host: FakeHost) -> None:
+    widget._handle(AgentEvent(EventKind.TEXT, text="どちらにしますか"))
+    widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+
 class TestMatchesTheHandoff:
     """計画の止まった訳（#340）と、止まった指示の引き継ぎ（#346）の訳が食い違わないこと"""
 
-    def test_an_interrupt_is_the_same_reason_in_both(
-        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
+    @pytest.mark.parametrize(
+        ("end", "stopped", "reason", "hint"),
+        [
+            (_end_by_interrupt, Stopped.INTERRUPTED, StopReason.INTERRUPTED, "確かめてから"),
+            (_end_by_usage_limit, Stopped.LIMIT, StopReason.LIMIT, "「AI の上限」"),
+            # Claude Code の上限は設定の「AI の上限」では変わらないので、そこへ案内しない
+            (_end_by_agent_limit, Stopped.AGENT_LIMIT, StopReason.LIMIT, "Claude Code の 1 回"),
+            (_end_by_fix_limit_refusal, Stopped.FIX_LIMIT, StopReason.LIMIT, "直す回数"),
+            (_end_after_the_fix_limit, Stopped.FIX_LIMIT, StopReason.LIMIT, "直す回数"),
+            (_end_by_lost_connection, Stopped.DISCONNECTED, StopReason.DISCONNECTED, "つなぎ直し"),
+            (_end_by_error, Stopped.ERROR, StopReason.ERROR, "エラーを確かめて"),
+            (_end_by_denial, Stopped.DENIED, StopReason.DENIED, "許さなかった物"),
+            # 人が区切りで止めた・AI が自分で応え終えたときは、止まった指示として引き継がない
+            (_end_by_pause, Stopped.PAUSED, None, "止めた所から"),
+            (_end_on_its_own, Stopped.ENDED, None, "残りの手順"),
+        ],
+    )
+    def test_every_way_of_stopping_names_the_same_reason(
+        self,
+        made: tuple[ChatPanel, FakeHost, list[_RecordingSession]],
+        end: Callable[[ChatPanel, FakeHost], None],
+        stopped: Stopped,
+        reason: StopReason | None,
+        hint: str,
     ) -> None:
-        # 壊れると、引き継ぎに計画の手順が残ったことが載らず、続きの AI が計画を読まずに
-        # 前の指示の続きを始める
+        # 壊れると、同じ指示が計画の欄では「手順を残して応え終えました」、引き継ぎでは「エラーで
+        # 止まりました」のように食い違い、どちらの訳を信じて続ければよいか分からない 欄の添え書きも
+        # 訳に合わないと、Claude Code の上限なのに設定の上限を広げに行くなど、違う直し方を案内する
         widget, host, _ = made
-        _send(widget, "無音を詰めて書き出して")
-        _plan(host, "無音を探す", "詰める", "書き出す")
-        _mark(host, 1, "done")
-        widget.interrupt()
-        widget._handle(AgentEvent(EventKind.TURN_DONE))
-        assert Stopped.INTERRUPTED.value in widget._plan_box.stopped_text()
+        _send(widget, "仕上がりを直して書き出して")
+        _plan(host, "直す", "書き出す")
+        _mark(host, 1, "running")
+        end(widget, host)
+        view = plan_for(host.document).view()
+        assert view is not None and view.stopped is stopped
+        assert stopped.value in widget._plan_box.stopped_text()
+        assert hint in widget._plan_box.stopped_text()
         handoff = _shelved(host)
-        assert handoff is not None and handoff.reason is StopReason.INTERRUPTED
-        assert "計画の手順が 2 個残っています（get_plan で読めます）" in handoff.remaining
+        if reason is None:
+            assert handoff is None
+        else:
+            assert handoff is not None and handoff.reason is reason
+            assert "計画の手順が" in " ".join(handoff.remaining)
+
+    def test_every_reason_has_a_hint(self) -> None:
+        # 壊れると、訳を足したときに添え書きが無く、欄を出す所で落ちて計画の欄が描けない
+        assert set(_STOPPED_HINTS) == set(Stopped)
 
     def test_a_person_interrupt_after_the_limit_is_an_interrupt_in_both(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
@@ -410,37 +504,6 @@ class TestMatchesTheHandoff:
         assert Stopped.INTERRUPTED.value in widget._plan_box.stopped_text()
         handoff = _shelved(host)
         assert handoff is not None and handoff.reason is StopReason.INTERRUPTED
-
-    def test_a_claude_code_limit_is_a_limit_in_both(
-        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
-    ) -> None:
-        # 壊れると、Claude Code の上限（手数・費用）で止まった計画が「手順を残して応え終えました」
-        # と残り、引き継ぎの「上限で止まりました」と食い違う 送り直せば続くことも欄から読めない
-        widget, host, _ = made
-        _send(widget, "無音を詰めて書き出して")
-        _plan(host, "無音を探す", "詰める")
-        _mark(host, 1, "running")
-        widget._handle(AgentEvent(EventKind.ERROR, text="上限に達しました", detail=LIMIT_DETAIL))
-        widget._handle(AgentEvent(EventKind.TURN_DONE))
-        assert Stopped.LIMIT.value in widget._plan_box.stopped_text()
-        handoff = _shelved(host)
-        assert handoff is not None and handoff.reason is StopReason.LIMIT
-
-    def test_pausing_makes_no_handoff(
-        self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
-    ) -> None:
-        # 壊れると、人が区切りで止めただけの指示が「止まった」として引き継ぎの欄を出し、
-        # 計画の欄の〔続ける〕と引き継ぎの〔続きを頼む〕の 2 つの続け方が並ぶ
-        widget, host, _ = made
-        _send(widget, "無音を詰めて書き出して")
-        _plan(host, "無音を探す", "詰める")
-        _mark(host, 1, "running")
-        assert plan_for(host.document).request_pause()
-        _mark(host, 1, "done")
-        widget._handle(AgentEvent(EventKind.TURN_DONE))
-        assert Stopped.PAUSED.value in widget._plan_box.stopped_text()
-        assert _shelved(host) is None
-        assert widget._handoff_box.isHidden() is True
 
 
 class TestPlanPreference:

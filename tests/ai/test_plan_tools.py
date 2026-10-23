@@ -14,7 +14,7 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.fixes import fixes_closed
-from sashimono.ai.handoff import GET_HANDOFF
+from sashimono.ai.handoff import GET_HANDOFF, StopReason
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import AI_ONLY
 from sashimono.ai.operations import OPERATIONS, Operation, find_operation
@@ -164,7 +164,7 @@ class TestPlanTools:
         plan = plan_for(host.document)
         plan.begin_turn("全体の無音を詰めて、字幕を付けて書き出して")
         _plan(host)
-        plan.end_turn(interrupted=True)
+        plan.end_turn(reason=StopReason.INTERRUPTED)
         plan.begin_turn(RESUME_PROMPT)
         assert _read(host)["instruction"] == "全体の無音を詰めて、字幕を付けて書き出して"
         # 続きの中で計画を作り直しても、元の頼みは「続けて」で上書きされない
@@ -178,7 +178,7 @@ class TestPlanTools:
         plan.begin_turn("無音を詰めて書き出して")
         _plan(host, 2)
         _mark(host, 1, "done")
-        plan.end_turn(interrupted=True)
+        plan.end_turn(reason=StopReason.INTERRUPTED)
         plan.begin_turn(RESUME_PROMPT)
         assert _plan(host, 1)["steps"] == 1
         read = _read(host)
@@ -279,7 +279,7 @@ class TestPause:
         _plan(host)
         plan.request_pause()
         _mark(host, 1, "done")
-        plan.end_turn(interrupted=False)
+        plan.end_turn()
         plan.begin_turn(RESUME_PROMPT)
         assert plan.refusal("split_clip") == ""
         assert _mark(host, 2, "running").get("paused") is None
@@ -314,7 +314,8 @@ class TestPause:
         _mark(host, 1, "running")
         if pause:
             plan.request_pause()
-        plan.end_turn(interrupted=interrupted, limited=limited)
+        reason = StopReason.INTERRUPTED if interrupted else None
+        plan.end_turn(reason=reason, usage_limited=limited)
         assert _read(host)["stopped"] == stopped.value
         view = plan.view()
         assert view is not None and view.stopped is stopped
@@ -324,7 +325,7 @@ class TestPause:
         plan = plan_for(host.document)
         _plan(host, 1)
         _mark(host, 1, "done")
-        plan.end_turn(interrupted=True)
+        plan.end_turn(reason=StopReason.INTERRUPTED)
         view = plan.view()
         assert view is not None and view.finished and view.stopped is None
 
@@ -344,7 +345,7 @@ class TestPause:
         assert _read(host)["stopped"] is None
         # 終えた後は、ほかの道具も断らない（止める所が残っていない）
         assert plan.refusal("split_clip") == ""
-        plan.end_turn(interrupted=False)
+        plan.end_turn()
         view = plan.view()
         assert view is not None and view.finished and view.stopped is None
         assert _read(host)["stopped"] is None
@@ -627,5 +628,6 @@ class TestWithTheFixLimit:
             plan.request_pause()
         if reached:
             _mark(host, 1, "done")
-        plan.end_turn(interrupted=interrupted, limited=limited, fixed=True)
+        reason = StopReason.INTERRUPTED if interrupted else None
+        plan.end_turn(reason=reason, usage_limited=limited, fixed=True)
         assert _read(host)["stopped"] == stopped.value
