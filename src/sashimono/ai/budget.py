@@ -415,6 +415,11 @@ class UsageMeter:
             turn = self._turn
             self._turn = None
             used = Usage()
+            # 数えていなかった指示（部品の入れ替え中に送り、渡す前に終わった指示など）も、
+            # 「最後に終えた指示」は今の指示 前の指示の量と上限を残すと、関係の無い指示の
+            # 区切りの行と引き継ぎ（#346）に「上限で停止」と前の量が書かれる
+            self.last = used
+            self.last_stop = None
             if turn is not None:
                 self._save(turn, force=True)
                 # 書けなかったときも、区切りの行には使った量を出す
