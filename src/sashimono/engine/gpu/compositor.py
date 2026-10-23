@@ -747,14 +747,8 @@ class Compositor:
         スクリプトへ渡すときに使う 事前乗算のまま渡すと、素材として重ねるときに
         不透明度がもう 1 度掛かって半透明の所が暗くなる
         """
-        # リニアの結果をもう 1 パス通して sRGB へ符号化する glReadPixels に
-        # RGBA16F から直接 uint8 で読ませると、変換式が実装依存になる
-        # 符号化のついでに上下も返しておく GL は左下から行を返すので、返して
-        # おけば CPU で並べ替えずに済む（4K で 33MB の写しが 1 回消える）
-        self._resolve(
-            self._resolved.handle, (0, 0, self.width, self.height), flip=True, straight=straight
-        )
-
+        # 符号化した先のフレームバッファが結ばれたまま戻るので、そのまま読む
+        self.resolved_texture(straight=straight)
         GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
         # 受け皿を先に作って、そこへ直接書かせる 受け取り先を省くと PyOpenGL が
         # bytes を作り、そこから numpy へもう 1 回写す 4K（1 枚 33MB）では
@@ -762,6 +756,23 @@ class Compositor:
         image = np.empty((self.height, self.width, 4), dtype=np.uint8)
         GL.glReadPixels(0, 0, self.width, self.height, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, image)
         return image
+
+    def resolved_texture(self, *, straight: bool = False) -> int:
+        """合成結果を sRGB 符号化した RGBA8 にして、そのテクスチャ番号を返す
+
+        :meth:`read` が CPU へ読み戻すのと同じ値（行 0 が絵の上の端） GPU の上で続けて
+        使うとき（書き出しの色変換 #372）にここから読む 別に符号化し直すと、
+        CPU の道と 8bit への丸め方が食い違い、同じ絵でも書き出しの色が変わる
+        次に合成するまでの間だけ使える（同じテクスチャへ上書きする）
+        """
+        # リニアの結果をもう 1 パス通して sRGB へ符号化する glReadPixels に
+        # RGBA16F から直接 uint8 で読ませると、変換式が実装依存になる
+        # 符号化のついでに上下も返しておく GL は左下から行を返すので、返して
+        # おけば CPU で並べ替えずに済む（4K で 33MB の写しが 1 回消える）
+        self._resolve(
+            self._resolved.handle, (0, 0, self.width, self.height), flip=True, straight=straight
+        )
+        return self._resolved.color
 
     def content_box(self) -> tuple[int, int, int, int] | None:
         """合成途中の絵で、不透明度が 0 でない範囲（画素、左・上・右・下 左上が原点）
