@@ -14,7 +14,7 @@ import platform
 import threading
 import time
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.host import CompatReport, ExportRequest, ToolError, ViewState
+from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -58,8 +58,10 @@ from sashimono.ai.safety import Consent, check_writable
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.aviutl import native, plugin
+from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
+from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import (
     AddClip,
     AddMedia,
@@ -220,6 +222,7 @@ from sashimono.ui.reframe_dialog import ask_reframe
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.seam_dialogs import ask_seams, ask_speed
 from sashimono.ui.subtitle import SubtitlePanel
+from sashimono.ui.system_clipboard import copy_text as copy_text_to_clipboard
 from sashimono.ui.text_keys import install_text_field_keys
 from sashimono.ui.theme import Colors, apply_theme, themed_style
 from sashimono.ui.timeline import TimelineArea, TimelineView
@@ -2000,6 +2003,15 @@ class MainWindow(QMainWindow):
         target = MediaId(media_id)
         self.execute(RemoveMedia(target))
         if self._document.project.find_media(target) is None:
+            self._forget_media((target,))
+
+    def _forget_media(self, gone: Iterable[MediaId]) -> None:
+        """素材一覧から外した素材の解析（波形・サムネイル・控え）を捨てる
+
+        人の〔プールから外す〕と AI の remove_media（#349）が通る所 AI の側で捨て忘れると、
+        もう使わない素材の波形をメモリに抱え続ける
+        """
+        for target in gone:
             self._analyzer.forget(target)
             self._screen.forget(target)
             self._proxies.forget(target)
@@ -2467,10 +2479,18 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         if answer != QDialog.DialogCode.Accepted:
             return
+        created = replace(Project.create(dialog.settings()), style_guide=dialog.style_guide())
+        self._adopt_new(created)
+
+    def _adopt_new(self, created: Project) -> None:
+        """新しい作品へ差し替える 画面の〔新規〕と AI の new_project（#349）が通る所
+
+        AI の指示の段を開いていれば開いたまま差し替える（:meth:`Document.reset`） 段を
+        閉じてから差し替えると、AI のパネルが後で閉じる段と数が食い違う
+        """
         self._playback.stop()
         previous = self._document.project
-        created = replace(Project.create(dialog.settings()), style_guide=dialog.style_guide())
-        self._document.reset(created)
+        self._document.reset(created, within_checkpoint=self._document.in_checkpoint)
         self._leave_project(previous)
         self._path = None
         self._release_lock()
@@ -2540,12 +2560,18 @@ class MainWindow(QMainWindow):
             return
         if not self._claim(Path(name)):
             return
+        self._adopt_opened(project, Path(name))
 
+    def _adopt_opened(self, project: Project, path: Path) -> None:
+        """開いた作品へ差し替える 画面の〔開く…〕と AI の open_project（#349）が通る所
+
+        AI の指示の段を開いていれば開いたまま差し替える（:meth:`_adopt_new` と同じ訳）
+        """
         self._playback.stop()
         previous = self._document.project
-        self._document.reset(project)
+        self._document.reset(project, within_checkpoint=self._document.in_checkpoint)
         self._leave_project(previous)
-        self._path = Path(name)
+        self._path = path
         self._mark_saved()
         self._on_project_changed()
         self._seek(0)
@@ -2657,8 +2683,11 @@ class MainWindow(QMainWindow):
         self._update_title()
         return saved
 
-    def _claim(self, path: Path) -> bool:
+    def _claim(self, path: Path, *, ask: bool = True) -> bool:
         """このファイルを開いている窓はここ、と錠で示す 別の窓が開いていれば尋ねる
+
+        ``ask`` が偽（AI の開く #349）なら尋ねずに偽を返す 窓を出すと、AI の確かめの欄とは
+        別に人が答える窓が増え、答えるまで AI の道具が止まる
 
         止めはしない 読み返すだけのこともあるので、知らせたうえで本人に選ばせる
         知らせずに開けると、両方で保存したとき後から保存した方が黙って勝つ
@@ -2666,6 +2695,8 @@ class MainWindow(QMainWindow):
         folder = project_presence_dir(path)
         if self._project_lock is not None and self._project_lock.path.parent == folder:
             return True
+        if others_holding(folder) and not ask:
+            return False
         if others_holding(folder) and self._confirm_unsaved:
             answer = QMessageBox.warning(
                 self,
@@ -3238,12 +3269,31 @@ class MainWindow(QMainWindow):
 
     def rescan_scripts(self) -> None:
         """スクリプトのフォルダを読み直す"""
+        count = self.reload_scripts()
+        self.statusBar().showMessage(f"スクリプトを {count} 本読み込んだ", 4000)
+
+    def reload_scripts(self) -> int:
+        """置き場の AviUtl スクリプトを読み直し、読み込んだ本数を返す
+
+        画面の〔スクリプトを読み直す〕と AI の reload_scripts（#349）が通る所 作品は変えない
+        """
         from sashimono.compat.aviutl.catalog import script_catalog
 
         catalog = script_catalog()
         catalog.scan()
-        count = catalog.register_all()
-        self.statusBar().showMessage(f"スクリプトを {count} 本読み込んだ", 4000)
+        return catalog.register_all()
+
+    @property
+    def custom_objects(self) -> tuple[ScriptEntry, ...]:
+        """AI に見せるカスタムオブジェクト
+
+        タイムラインの〔追加〕→〔カスタムオブジェクト〕と同じ一覧（#349）
+        """
+        return tuple(self._timeline.add_sources.custom_objects())
+
+    def alignment_commands(self, clip_id: ClipId, anchor: str) -> list[Command] | None:
+        """AI の配置のテンプレート（#349）も、設定パネルの ↖〜↘ と同じくプレビューの枠で計算する"""
+        return self._preview.alignment_commands(clip_id, anchor)
 
     def open_script_folder(self) -> None:
         """スクリプトを置く場所をエクスプローラで開く
@@ -3360,6 +3410,56 @@ class MainWindow(QMainWindow):
     def select_clips(self, clip_ids: list[ClipId]) -> None:
         self._timeline.set_selection(clip_ids)
 
+    @property
+    def clipboard(self) -> ClipboardContent | None:
+        """AI の貼り付け（#349）も、人の Ctrl+C・Ctrl+X と同じタイムラインの置き場から取る"""
+        return self._timeline.clipboard
+
+    def set_clipboard(self, content: ClipboardContent) -> None:
+        self._timeline.set_clipboard(content)
+
+    def open_project_file(self, path: Path) -> None:
+        """AI の〔開く…〕（#349） 画面と同じ読み方・錠・差し替えを通す 窓は出さない
+
+        保存していない変更があれば断る（2026-10-20 利用者の決定） 道具の確かめでも断るが、
+        確かめの欄が出ている間に人が編集した物を、ここで黙って捨てないよう見直す
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        try:
+            project = load_project(path)
+        except ProjectFileError as exc:
+            raise ToolError(f"開けませんでした: {exc}") from exc
+        if not self._claim(path, ask=False):
+            raise ToolError(
+                "この作品は別の Sashimono の窓で開いています 両方で保存すると後の方だけが残るので、"
+                "開くなら人が〔開く…〕の窓で決めてください"
+            )
+        self._adopt_opened(project, path)
+
+    def start_new_project(
+        self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
+    ) -> None:
+        """AI の〔新規〕（#349） 作る作品の初めの値は、画面の新規作成の窓と同じ本人の好み
+
+        置き方の方式と編集の方針は本人の「新しい作品」の設定 窓を通らない起動直後の空の
+        作品と同じ所（:meth:`_blank_project`）から作る
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        blank = self._blank_project()
+        settings = blank.settings
+        if resolution is not None:
+            settings = replace(settings, width=resolution[0], height=resolution[1])
+        if frame_rate is not None:
+            settings = replace(settings, frame_rate=frame_rate)
+        self._adopt_new(replace(Project.create(settings), style_guide=blank.style_guide))
+
+    @property
+    def insert_paste_all_tracks(self) -> bool:
+        """AI の挿入貼り付けも、人の Ctrl+Shift+V と同じ押し出し方（本人の設定）にする"""
+        return self._timeline.insert_all_tracks
+
     def apply_commands(self, commands: list[Command], label: str) -> None:
         """AI からのコマンドを実行する
 
@@ -3369,6 +3469,7 @@ class MainWindow(QMainWindow):
         """
         if not commands:
             return
+        before = {media.id for media in self._document.project.media}
         try:
             with self._document.checkpoint(label, by=Author.AI):
                 for command in commands:
@@ -3377,6 +3478,8 @@ class MainWindow(QMainWindow):
             raise ToolError(str(exc)) from exc
         finally:
             self._on_project_changed()
+        # AI が素材一覧から外した素材も、人の〔プールから外す〕と同じく解析を捨てる
+        self._forget_media(before - {media.id for media in self._document.project.media})
 
     @property
     def project(self) -> Project:
@@ -3551,13 +3654,33 @@ class MainWindow(QMainWindow):
 
     def copy_snapshot(self) -> None:
         """静止画をクリップボードへ置く"""
+        self._copy_snapshot(self._snapshot_frame())
+
+    def _copy_snapshot(self, frame: int) -> QImage:
+        """``frame`` を静止画にしてクリップボードへ置く 画面の〔静止画をコピー〕と AI の
+        copy_snapshot（#349）が通る所 描き方を 1 か所にして、貼った絵が食い違わないように
+        """
         from sashimono.ui.snapshot import copy_to_clipboard
 
-        image = self.snapshot_image()
+        image = self.snapshot_image(frame)
         copy_to_clipboard(image)
         self.statusBar().showMessage(
             f"静止画をクリップボードへコピーした（{image.width()}x{image.height()}）", 5000
         )
+        return image
+
+    def copy_snapshot_image(self, frame: int) -> int:
+        """AI の〔静止画をコピー〕（#349） 画面と同じく止めてから描き、描いたフレームを返す"""
+        from sashimono.ui.snapshot import snapshot_frame
+
+        self._playback.stop()
+        drawn = snapshot_frame(self.view_project, frame)
+        self._copy_snapshot(drawn)
+        return drawn
+
+    def copy_text(self, text: str) -> None:
+        """AI の字幕の〔文字をコピー〕（#349） 字幕パネルと同じクリップボードへ文字を置く"""
+        copy_text_to_clipboard(text)
 
     def probe(self, path: Path) -> MediaItem:
         forget_probe(path)

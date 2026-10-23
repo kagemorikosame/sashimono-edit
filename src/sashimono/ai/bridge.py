@@ -54,6 +54,7 @@ from sashimono.ai.outbound import (
     text_secrets,
 )
 from sashimono.ai.safety import Consent
+from sashimono.core.commands.history import REPLACED_REFUSAL
 
 __all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
 
@@ -267,6 +268,8 @@ class EditorBridge:
         if operation.writes and (not operation.irreversible or operation.edits):
             # 取り消せない操作でも作品を変える物（Operation.edits ナレーション #335）は断る
             self._refuse_after_fix_limit(operation)
+        if operation.edits:
+            self._refuse_after_reopen(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -322,8 +325,9 @@ class EditorBridge:
         回数を守るかを AI 任せにしない（2026-10-20 本人の決定） 送る前の同意と確かめの窓を
         出す前に断る
         出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
-        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しは
-        取り消せない操作の道を通るので、ここへは来ない
+        書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しと
+        開く・新規（#349）は取り消せない操作の道を通るので、ここへは来ない 取り消せない操作でも
+        作品を変える物（:attr:`Operation.edits` ナレーション #335）はここへ来て断られる
         """
         if operation.name in PASSES_AFTER_LIMIT:
             return
@@ -333,6 +337,16 @@ class EditorBridge:
                 "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"
                 "ユーザーに伝えて終えてください 続けるかはユーザーが次の指示で決めます"
             )
+
+    def _refuse_after_reopen(self, operation: Operation) -> None:
+        """この指示の中で作品を開き直した後は、ファイルを書いてから作品を変える道具を断る
+
+        開く・新規（#349）の後の AI の編集は文書（``Document.replaced_in_checkpoint``）が断るが、
+        ナレーション（:attr:`Operation.edits` #335）は確かめの窓を出して WAV を書いてから置くので、
+        置く所で断られると、開き直した作品のフォルダに誰も置かない WAV が残る 窓を出す前に断る
+        """
+        if self.call(lambda: self._host.document.replaced_in_checkpoint):
+            raise ToolError(f"{operation.name}: {REPLACED_REFUSAL}")
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
@@ -425,9 +439,10 @@ class EditorBridge:
         """上限に当たっていれば、設定に従って尋ねるか断る 続けてよければ戻る
 
         絵を返す道具は、これから送る 1 枚を足して確かめる 送ってから数えると、上限の 1 枚
-        先まで描いて送ってしまう
+        先まで描いて送ってしまう 絵をクリップボードへ出すだけの道具（``copy_snapshot``）は
+        AI へ絵を返さないので足さない
         """
-        adding = 1 if Outbound.FRAMES in operation.sends else 0
+        adding = 1 if operation.returns_frames else 0
         while (overrun := self.usage.overrun(adding_images=adding)) is not None:
             if self.usage.stopped is not None:
                 self._refused_after_stop += 1

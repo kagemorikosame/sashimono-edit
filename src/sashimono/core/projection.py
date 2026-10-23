@@ -35,6 +35,7 @@ __all__ = [
     "project_clip",
     "project_timeline",
     "sounding",
+    "source_seconds_at",
     "subtitle_stream",
     "subtitle_voice",
 ]
@@ -59,6 +60,29 @@ def subtitle_voice(project: Project, track: Track, clip: Clip, media: MediaItem)
     音を見ずに最初のクリップを使ったりすると、別の音の位置で字幕を割り、無音を切る
     """
     return media.transcript_stream(subtitle_stream(project, track, clip))
+
+
+def source_seconds_at(
+    project: Project, media: MediaItem, stream: int | None, frame: int
+) -> Fraction | None:
+    """タイムラインのフレームを、素材の ``stream`` の音のソース秒へ
+
+    その音のクリップが再生ヘッドの所に無ければ ``None``
+
+    字幕パネルの〔再生ヘッドで分割〕と AI の字幕の分割（#349）が同じ時刻で割るよう、1 か所に置く
+    見ている音の字幕を出すクリップから取る 最初に当たるクリップを使うと、リンクを外して
+    音声 2 だけを切り詰めたとき、音声 1 のクリップの時刻で音声 2 の字幕を割る（PR #231）
+    """
+    wanted = media.transcript_stream(stream)
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.media_id != media.id or not clip.contains(frame):
+                continue
+            if subtitle_voice(project, track, clip, media) != wanted:
+                continue
+            elapsed = (frame - clip.timeline_start) * project.rate.frame_duration
+            return clip.source_in + elapsed * clip.speed
+    return None
 
 
 @dataclass(frozen=True, slots=True)

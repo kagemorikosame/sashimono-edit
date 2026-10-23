@@ -469,6 +469,21 @@ class TestMakingAndPlacing:
         assert "上限" in str(box.get("error"))
         assert narrating.narrations == []
 
+    def test_reopening_the_project_in_the_instruction_stops_the_narration(
+        self, narrating: FakeHost
+    ) -> None:
+        # 壊れると、同じ指示の中で作品を開き直した（#349）後に確かめの窓が出て WAV を書き、
+        # 置く所で文書に断られて、開き直した作品のフォルダに誰も置かない WAV が残る
+        _listed(narrating)
+        narrating.document.begin_checkpoint("AI: 開いて読む", by=Author.AI)
+        narrating.document.reset(narrating.document.project, within_checkpoint=True)
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        seen, box = _run(bridge, GENERATE, {"text": SCRIPT})
+        narrating.document.end_checkpoint()
+        assert seen == []  # 確かめの窓を出す前に断る
+        assert "開き直した" in str(box.get("error"))
+        assert narrating.narrations == []
+
     def test_moving_the_project_while_the_voice_is_made_is_refused(
         self, narrating: FakeHost, engine: FakeVoiceEngine, tmp_path: Path
     ) -> None:
