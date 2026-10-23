@@ -54,7 +54,8 @@ class _Analyzer(MediaAnalyzer):
         self._fixed_filmstrips = filmstrips
         self._fixed_waveforms = waveforms
 
-    def filmstrip(self, media: MediaItem) -> Filmstrip | None:
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
+        del stream
         return self._fixed_filmstrips.get(media.id)
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:

@@ -61,6 +61,9 @@ OWN_LIBRARY = {
     "duck_shape",
     "emphasis_style",
     "seam_style",
+    # 色と雑音の自動補正の強さ・下げる量の既定（#336）
+    "auto_color_strength",
+    "denoise_reduction",
     "reframe_style",
     "template_shelf",
     # カスタムオブジェクトの名前（#349） 本人の置き場のスクリプト 道具はアプリの設定を送ると書く
@@ -122,6 +125,8 @@ PROJECT_SIDE = {
     "subtitle_wrap_share",
     "analyze",
     "waveform",
+    # 色を測るサムネイル（#336） 素材の絵の縮めた物 道具は測った数だけを返し、絵は送らない
+    "filmstrip",
     "request_scenes",
     "scene_state",
     "scene_waiter",
@@ -271,6 +276,9 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # 色と雑音の自動補正（#336） 結果に本人の設定の強さと下げる量の既定が載る
+            "auto_color",
+            "reduce_noise",
             # カスタムオブジェクト（#349） 一覧と、無い名前の断りに置き場のスクリプトの名前が載る
             "list_custom_objects",
             "add_custom_object",

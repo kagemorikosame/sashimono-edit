@@ -250,6 +250,8 @@ class TestAppSettingsAreReadOnly:
             # 人が見ている表示（#352） 読むだけで、何も変えない
             "view_state",
             "waveform",
+            # 色を測るサムネイルを読むだけ（#336） 作れていなければ None を返し、作るのは analyze
+            "filmstrip",
             "write_project",
             "write_snapshot",
             "write_subtitles",

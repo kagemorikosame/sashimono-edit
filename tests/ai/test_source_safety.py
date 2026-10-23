@@ -116,6 +116,10 @@ UNDOABLE_TOOLS = frozenset(
         "duck_audio",
         "normalize_loudness",
         "place_sound",
+        # 色と雑音の自動補正（#336） 素材はサムネイルと波形を読むだけ クリップにエフェクトを
+        # 積むか、その値を変えるだけで、元の素材は変えない
+        "auto_color",
+        "reduce_noise",
         # 画面の操作と同じ道具（#349） どれも画面と同じ命令で、取り消し 1 回で戻る
         "cut_clips",
         "paste_clips",

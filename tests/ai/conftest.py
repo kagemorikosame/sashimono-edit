@@ -55,8 +55,11 @@ from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
 from sashimono.core.timebase import FrameRate
+from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.auto_color import DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache import SceneState, ScreenState
+from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.report import assemble
@@ -121,6 +124,15 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: 色と雑音の自動補正（#336）の本人の設定 既定は設定と同じ
+        self.color_strength = DEFAULT_AUTO_COLOR_STRENGTH
+        self.noise_reduction = int(DEFAULT_REDUCTION_DB)
+        #: 素材ごとのサムネイルのシート 試験が入れる 無ければまだ用意できていない
+        self.filmstrips: dict[MediaId, Filmstrip] = {}
+        #: 映像の流れを名指しして引かれたときのシート（素材, 流れ）
+        self.stream_strips: dict[tuple[MediaId, int | None], Filmstrip] = {}
+        #: 音声ごとの波形 試験が入れる 無ければ stub_waveform
+        self.waveforms: dict[tuple[MediaId, int | None], Waveform] = {}
         #: 縦動画への作り替え（#334）の本人の設定 既定は設定と同じ
         self.reframing = ReframeStyle()
         #: 画面の解析の部品（#324）が入っているか 既定は CI と同じく入っていない
@@ -389,8 +401,19 @@ class FakeHost:
         self.analyzed.append(media.id)
 
     def waveform(self, media: MediaItem, stream: int | None = None) -> Waveform | None:
-        del media, stream
-        return self.stub_waveform
+        return self.waveforms.get((media.id, stream), self.stub_waveform)
+
+    def filmstrip(self, media: MediaItem, stream: int | None = None) -> Filmstrip | None:
+        # 流れを名指しした物を先に引く 無ければ素材の物（1 本目の映像）
+        return self.stream_strips.get((media.id, stream), self.filmstrips.get(media.id))
+
+    @property
+    def auto_color_strength(self) -> int:
+        return self.color_strength
+
+    @property
+    def denoise_reduction(self) -> int:
+        return self.noise_reduction
 
     @property
     def loudness_target(self) -> float:
