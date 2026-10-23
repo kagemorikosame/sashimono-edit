@@ -62,6 +62,7 @@ __all__ = [
     "masked_value",
     "redact",
     "secret_pairs",
+    "sendable_now",
     "sending",
     "text_secrets",
 ]
@@ -379,6 +380,16 @@ def sending(kinds: frozenset[Outbound]) -> Iterator[None]:
         yield
     finally:
         _SENDABLE.reset(token)
+
+
+def sendable_now(kind: Outbound) -> bool:
+    """今動いている道具の結果へ ``kind`` を載せてよいか 編集画面から直に呼んだときは真
+
+    型の付いた欄（:func:`masked_value`）でも、表と形（:func:`hide_text`）でも伏せられない物を返す
+    道具が、断られていれば欄ごと返さないために使う（計画の自由記述 #340）
+    """
+    allowed = _SENDABLE.get()
+    return allowed is None or kind in allowed
 
 
 def field_sends(spec: object | None, *, known: bool = True) -> frozenset[Outbound]:

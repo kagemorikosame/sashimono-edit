@@ -33,6 +33,7 @@ __all__ = [
     "NOTE_LIMIT",
     "PASSES_AFTER_PAUSE",
     "PAUSED_MESSAGE",
+    "PLAN_TEXT_HIDDEN",
     "PLAN_TOOLS",
     "RESUME_PROMPT",
     "SET_PLAN",
@@ -72,6 +73,12 @@ INSTRUCTION_LIMIT = 1000
 
 #: 〔続ける〕で送る指示 計画を作り直したときに、元の指示をこれで上書きしない目印にもする
 RESUME_PROMPT = "計画の続きから進めてください（get_plan で済んだ手順と止めた所を確かめてから）"
+
+#: 字幕と文字を送らない人へ get_plan が返す、目標・指示・手順・一言の代わりの印
+#: 計画の文は AI が書く自由記述で、字幕から写したかを見分けられない 表（字幕の行の全体）にも
+#: 形（「」や「: 」）にも当たらない切れ端が出るので、断った人には文ごと送らない（Codex #392）
+#: 印は伏せ字（〔伏せ字〕）と分ける 文の一部ではなく欄ごと伏せたと AI が読めるように
+PLAN_TEXT_HIDDEN = "〔字幕と文字を送らない設定なので伏せています〕"
 
 #: 区切りで止めた後に、道具を断るときの文 AI が次に何をすればよいかを書く
 PAUSED_MESSAGE = (
@@ -226,6 +233,10 @@ class WorkPlan:
         #: 区切りに来て止めた 止めた後は計画の道具しか通さない
         self._paused = False
         self._stopped: Stopped | None = None
+        #: 今の指示を始める前に止まっていた訳 〔続ける〕の指示が始まると止まった訳は外すが、
+        #: 続きの AI は初めの get_plan で何で止まったかを読んで、確かめ方を決める（Codex #392）
+        #: 今の指示が終わったら外す（次は今の指示の結果が止まった訳になる）
+        self._previous: Stopped | None = None
         self._version = 0
         #: 計画を付けた作品（:attr:`Document.generation`）
         self._generation = generation
@@ -312,20 +323,35 @@ class WorkPlan:
             result["message"] = PAUSED_MESSAGE
         return result
 
-    def read(self) -> dict[str, Any]:
-        """AI が読む計画 止めた所から続けるのに使う"""
+    def read(self, *, show_text: bool = True) -> dict[str, Any]:
+        """AI が読む計画 止めた所から続けるのに使う
+
+        ``show_text`` が偽（字幕と文字を送らない人）なら、目標・指示・手順・一言は
+        :data:`PLAN_TEXT_HIDDEN` にし、番号・進み具合・数・止まった訳（アプリが決めた値）だけを返す
+        空の一言は空のまま返す（印にすると、何か書いてあったように読める）
+        """
         with self._lock:
             if not self._steps:
                 return {"plan": None, "note": "計画はありません"}
             view = self._view()
             instruction = self._instruction
+            previous = self._previous
         if len(instruction) > INSTRUCTION_LIMIT:
             instruction = instruction[: INSTRUCTION_LIMIT - 1] + "…"
+
+        def free(text: str) -> str:
+            return text if show_text or not text else PLAN_TEXT_HIDDEN
+
         return {
-            "goal": view.goal,
-            "instruction": instruction,
+            "goal": free(view.goal),
+            "instruction": free(instruction),
             "steps": [
-                {"step": number, "title": step.title, "state": step.state.value, "note": step.note}
+                {
+                    "step": number,
+                    "title": free(step.title),
+                    "state": step.state.value,
+                    "note": free(step.note),
+                }
                 for number, step in enumerate(view.steps, start=1)
             ],
             "done": view.done,
@@ -334,6 +360,7 @@ class WorkPlan:
             "next_step": view.next_step,
             "finished": view.finished,
             "stopped": view.stopped.value if view.stopped is not None else None,
+            "previous_stop": previous.value if previous is not None else None,
         }
 
     # --- ブリッジから（AI のスレッド） ---
@@ -382,6 +409,9 @@ class WorkPlan:
                 self._version += 1
             self._pause_requested = False
             self._paused = False
+            # 止めは外す（外さないと続きの初めの道具から断られる）が、止まった訳は
+            # 前の訳として残す 消すと続きの初めの get_plan で何で止まったかが読めない
+            self._previous = self._stopped
             self._stopped = None
 
     def end_turn(
@@ -414,6 +444,7 @@ class WorkPlan:
                 self._stopped = None
             self._pause_requested = False
             self._paused = False
+            self._previous = None
             self._version += 1
 
     def _stopped_for(
@@ -460,6 +491,7 @@ class WorkPlan:
             self._pause_requested = False
             self._paused = False
             self._stopped = None
+            self._previous = None
             self._version += 1
 
     def follow(self, generation: int) -> bool:

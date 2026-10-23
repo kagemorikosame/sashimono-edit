@@ -22,6 +22,7 @@ from sashimono.ai.outbound import ASKED, Outbound, SendAnswer, SendChoice, SendR
 from sashimono.ai.plan import (
     GOAL_LIMIT,
     PAUSED_MESSAGE,
+    PLAN_TEXT_HIDDEN,
     PLAN_TOOLS,
     RESUME_PROMPT,
     STEP_LIMIT,
@@ -170,6 +171,31 @@ class TestPlanTools:
         # 続きの中で計画を作り直しても、元の頼みは「続けて」で上書きされない
         _plan(host, 2)
         assert _read(host)["instruction"] == "全体の無音を詰めて、字幕を付けて書き出して"
+
+    @pytest.mark.parametrize(
+        "reason", [StopReason.INTERRUPTED, StopReason.LIMIT, StopReason.DISCONNECTED]
+    )
+    def test_resuming_reads_why_the_plan_stopped(self, host: FakeHost, reason: StopReason) -> None:
+        # 壊れると、〔続ける〕の指示が始まった所で止まった訳が消え、続きの初めの get_plan では
+        # 何で止まったかが読めない 中断や上限で途中まで済んだ手順を確かめずに進める
+        plan = plan_for(host.document)
+        plan.begin_turn("無音を詰めて書き出して")
+        _plan(host)
+        _mark(host, 1, "running")
+        plan.end_turn(reason=reason)
+        stopped = _read(host)["stopped"]
+        assert stopped is not None
+        plan.begin_turn(RESUME_PROMPT)
+        read = _read(host)
+        # 今の指示はもう止まっていない 前に止まった訳は分けて返す
+        assert read["stopped"] is None
+        assert read["previous_stop"] == stopped
+        # 続きの指示が終われば、前の訳は今の指示の結果に置き換わる
+        _mark(host, 1, "done")
+        _mark(host, 2, "done")
+        _mark(host, 3, "done")
+        plan.end_turn()
+        assert _read(host)["previous_stop"] is None
 
     def test_resuming_can_remake_a_plan_of_the_one_step_left(self, host: FakeHost) -> None:
         # 壊れると（手順の下限を 2 に上げると）、残り 1 手順の続きで計画を作り直せず、
@@ -461,13 +487,41 @@ class TestWhatIsSent:
         assert box.get("error") is None
         assert "編集ソフ" not in str(box.get("result"))
 
+    def test_an_unquoted_piece_of_a_subtitle_is_not_sent_after_refusing(
+        self, secret_host: FakeHost
+    ) -> None:
+        # 壊れると、字幕と文字を許していた間に AI が字幕の一部を引用符なしで計画に写し、後から
+        # 断る設定へ変えても get_plan がその切れ端を送る 字幕の行の全体とは一致せず、「」や「: 」の
+        # 形にも当たらないので、表と形で伏せる仕組みでは見つけられない（Codex #392）
+        _operation("set_plan")(
+            secret_host, {"goal": "編集ソフの誤字を直す", "steps": ["編集ソフの所を読む"]}
+        )
+        _mark(secret_host, 1, "failed", "編集ソフが見つからない")
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices(
+            {
+                Outbound.TEXT: SendChoice.DENY,
+                Outbound.FILES: SendChoice.ALLOW,
+                Outbound.FRAMES: SendChoice.DENY,
+            }
+        )
+        done, box = call_in_thread(bridge, _operation("get_plan"), {})
+        answer_sends(bridge, done, lambda request: pytest.fail(f"尋ねた: {request.kinds}"))
+        assert box.get("error") is None
+        result = box.get("result")
+        assert "編集ソフ" not in str(result)
+        # アプリが決めた値（番号・進み具合・数）は読める 止めた所から続けるのに要る
+        assert isinstance(result, dict)
+        assert result["steps"][0]["state"] == "failed" and result["total"] == 1
+        assert result["goal"] == PLAN_TEXT_HIDDEN
+
     @pytest.mark.parametrize(
         ("text", "files", "quote_seen", "place_seen"),
         [
             # 字幕と文字を許した人 名前と場所も許せば計画はそのまま読める
             (SendChoice.ALLOW, SendChoice.ALLOW, True, True),
-            # 字幕と文字を断った人 「」の中と「: 」の後を伏せ、素材の場所は見せる
-            (SendChoice.DENY, SendChoice.ALLOW, False, True),
+            # 字幕と文字を断った人 計画の文は字幕から来たかを見分けられないので、文ごと送らない
+            (SendChoice.DENY, SendChoice.ALLOW, False, False),
             # 名前と場所だけを断った人 素材の名前と場所は表で伏せ、計画の文は読める
             (SendChoice.ALLOW, SendChoice.DENY, True, False),
         ],

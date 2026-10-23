@@ -53,7 +53,13 @@ from sashimono.ai.host import (
     ExportRequest,
     ToolError,
 )
-from sashimono.ai.outbound import UNKNOWN_FIELD_SENDS, Outbound, field_sends, masked_value
+from sashimono.ai.outbound import (
+    UNKNOWN_FIELD_SENDS,
+    Outbound,
+    field_sends,
+    masked_value,
+    sendable_now,
+)
 from sashimono.ai.plan import (
     GET_PLAN,
     GOAL_LIMIT,
@@ -517,11 +523,6 @@ class Operation:
     #: （:func:`~sashimono.ai.outbound.file_secrets`）では伏せられない
     #: 名前と場所か字幕と文字を許していなければ、対象を形で伏せる
     labels: bool = field(default=False, kw_only=True)
-    #: 名前と場所だけを断った人（字幕と文字は許した人）にも、``labels`` の形で伏せるか
-    #: 取り消しと履歴の名前は対象を 12 文字で切るので、素材の名前が表と一致せず形で伏せるしかない
-    #: 計画（#340）は AI が書いた文で名前は切れていないので表で伏せられる 形でも伏せると、
-    #: 字幕と文字を許した人にまで「」の中と「: 」の後が読めず、続きを頼んでも中身が分からない
-    labels_for_names: bool = field(default=True, kw_only=True)
     #: 結果のうち、作品や素材の名前そのものを返す欄の名前（``get_project`` の ``name`` など）
     #: 名前と場所を許していなければ、表（:func:`~sashimono.ai.outbound.file_secrets`）に
     #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
@@ -685,7 +686,9 @@ def _update_plan_step(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 def _get_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
-    return plan_for(host.document).read()
+    # 字幕と文字を断った人には計画の文を送らない 計画は AI が書く自由記述で、字幕から
+    # 写した切れ端を表でも形でも見分けられない（Codex #392）
+    return plan_for(host.document).read(show_text=sendable_now(Outbound.TEXT))
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -10942,13 +10945,10 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_plan,
         sends=_PLAN,
+        # 字幕と文字を断った人にも動かし、計画の文は欄ごと印にする（_get_plan） 計画は AI が
+        # 書いた文で、型の付いた欄ではなく（#391 の型で伏せる仕組みは効かない）、字幕の切れ端を
+        # 引用符なしで写すと表にも形にも当たらない 名前と場所は表で伏せる（_guarded）
         hidden=_HIDDEN_IN_PLAN,
-        # 計画は AI が書いた文で、型の付いた欄ではない（#391 の型で伏せる仕組みは効かない）
-        # 字幕の一部だけを「」で写すと表（行の全体）とは一致しないので、取り消しの名前と
-        # 同じく「」の中と「: 」の後を形でも伏せる 伏せないと断った人にも切れ端が出る
-        labels=True,
-        # 形で伏せるのは字幕と文字を断った人だけ 名前と場所は表で伏せる（_guarded）
-        labels_for_names=False,
     ),
 )
 

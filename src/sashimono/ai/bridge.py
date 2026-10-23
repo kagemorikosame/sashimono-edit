@@ -583,7 +583,7 @@ class EditorBridge:
         if hide_body:
             # 動かす前の文も表に入れる 取り消すと、取り消した操作が足した文は作品から消える
             texts = text_secrets(self._host.document.project)
-        elif operation.labels and operation.labels_for_names and not self.may_send(Outbound.FILES):
+        elif operation.labels and not self.may_send(Outbound.FILES):
             # 名前と場所だけを断った人 操作の名前の対象を形で伏せる（表は使わない）
             # 置いた後に消した素材の名前は今の作品に無く、表からは伏せられない
             texts = []
