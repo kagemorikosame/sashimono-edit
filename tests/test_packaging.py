@@ -1458,19 +1458,34 @@ class TestThePythonIsPatched:
         """版が読めないときも止める 通すと DLL の名前や形が変わった日から黙って確かめなくなる"""
         assert builder.python_problem(None, "zip に入った Python") is not None
 
-    def test_the_bundle_and_the_zip_are_read(self, builder: ModuleType, tmp_path: Path) -> None:
-        """組み立てたフォルダと zip の中の本体の DLL を読む python3.dll は本体と見ない"""
+    def test_python3_dll_is_not_taken_for_the_python_in_the_bundle_or_zip(
+        self, builder: ModuleType, tmp_path: Path
+    ) -> None:
+        """python3.dll（安定 ABI の取り次ぎ）を本体と取り違えると、版を誤って読む
+
+        本体（python3XX.dll）を積み損ねた物を python3.dll の版で通したり、取り次ぎの版が本体と
+        違えば、正しい配布物を古い Python として断ったりする フォルダと zip の両方で、本体が
+        無ければ読めない（None）とし、あれば本体の版を読むことを見る
+        """
         internal = tmp_path / "Sashimono" / "_internal"
         internal.mkdir(parents=True)
         (internal / "python3.dll").write_bytes(python_dll_bytes((3, 1, 0)))
         assert builder.bundled_python_version(internal) is None
+        assert builder.zip_python_version(self._zipped(internal, tmp_path / "only.zip")) is None
         (internal / "python314.dll").write_bytes(python_dll_bytes((3, 14, 9)))
         assert builder.bundled_python_version(internal) == (3, 14, 9)
-        archive = tmp_path / "out.zip"
+        assert builder.zip_python_version(self._zipped(internal, tmp_path / "both.zip")) == (
+            3,
+            14,
+            9,
+        )
+
+    @staticmethod
+    def _zipped(internal: Path, archive: Path) -> Path:
         with zipfile.ZipFile(archive, "w") as opened:
-            for path in internal.iterdir():
+            for path in sorted(internal.iterdir()):
                 opened.write(path, f"Sashimono/_internal/{path.name}")
-        assert builder.zip_python_version(archive) == (3, 14, 9)
+        return archive
 
     def test_an_old_python_stops_before_building(
         self,
