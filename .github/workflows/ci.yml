@@ -34,6 +34,9 @@ jobs:
         id: python
         with:
           python-version: ${{ matrix.python }}
+          # check-latest は付けない（#410） ここは試験だけで配る物を組まない 付けると PR ごと・
+          # 版ごとに版の一覧を取りにいき、実行機の版が古い間は毎回 Python を落として入れ直す
+          # 配る物と同じ最新の Python での試験は、タグのときに package.yml の検証が走らせる
 
       - uses: astral-sh/setup-uv@v10.2.0
         with:

@@ -60,6 +60,10 @@ jobs:
         with:
           # 配る版の Python zip の中の build-info.json と update.json の python_abi になる
           python-version: "3.14"
+          # 毎回 python.org の最新の 3.14 を取りにいく 書かないと実行機に先に入っている版が選ばれ、
+          # 0.2.2 は 3.14.8（ssl・zipfile などの脆弱性の修正）が出た後に 3.14.7 で組まれた（#410）
+          # 古いまま組んでいないかは build_package.py が下限（MINIMUM_PYTHON）で止める
+          check-latest: true
 
       - uses: astral-sh/setup-uv@v10.2.0
         with:

@@ -26,6 +26,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sashimono.update.signing import encrypt_private_key, public_key_text
+from tests.fake_python_dll import just_below, minimum_python, python_dll_bytes
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,8 +71,16 @@ def tool() -> ModuleType:
     return module
 
 
-def _zip_bytes(version: str = VERSION, abi: str = "cp314", build: int = 0) -> bytes:
-    """``build`` は組み直した回数 組み直すと exe の中身が変わり、zip の SHA-256 も変わる"""
+def _zip_bytes(
+    version: str = VERSION,
+    abi: str = "cp314",
+    build: int = 0,
+    python: tuple[int, int, int] | None = None,
+) -> bytes:
+    """``build`` は組み直した回数 組み直すと exe の中身が変わり、zip の SHA-256 も変わる
+
+    ``python`` は zip に入れる Python の版 既定は下限ちょうど（下限を上げても試験の zip が割らない）
+    """
     path_like = io.BytesIO()
     with zipfile.ZipFile(path_like, "w") as archive:
         archive.writestr("Sashimono/Sashimono.exe", b"MZ" + bytes([build]))
@@ -79,6 +88,9 @@ def _zip_bytes(version: str = VERSION, abi: str = "cp314", build: int = 0) -> by
             "Sashimono/build-info.json", json.dumps({"version": version, "python_abi": abi})
         )
         archive.writestr("Sashimono/_internal/PySide6/Qt6Core.dll", b"dll")
+        archive.writestr(
+            "Sashimono/_internal/python314.dll", python_dll_bytes(python or minimum_python())
+        )
     return path_like.getvalue()
 
 
@@ -1349,3 +1361,72 @@ def test_the_main_entry_has_no_flag_that_skips_the_question(tool: ModuleType) ->
     """確かめを全部飛ばす旗を足すと、公開を機械に任せられてしまう"""
     with pytest.raises(SystemExit):
         tool.main([VERSION, "--yes"])
+
+
+def _dotted(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+class TestThePythonInTheZip:
+    """zip に入った Python が下限より古ければ、署名と公開の前に止める（#410）
+
+    0.2.2 は脆弱性の修正（3.14.8）が出た後に 3.14.7 で組まれ、そのまま配られた 組み立てた
+    機械の Python ではなく、zip の中の DLL を読んで見る
+    """
+
+    def test_an_old_python_stops_before_signing(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """下限の 1 つ前の修正版で組んだ zip は、自己診断・署名・公開まで進まない
+
+        通すと、直っていない ssl や zipfile を全員の手元へ自動更新で配る
+        """
+        minimum = minimum_python()
+        old = just_below(minimum)
+        world.github.files[ZIP] = _zip_bytes(python=old)
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert f"Python {_dotted(old)} は下限 {_dotted(minimum)}" in out
+        assert world.smoked == [] and world.secrets == []
+        assert not world.published
+
+    def test_a_zip_without_a_readable_python_stops(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """版の読めない zip も止める 通すと DLL の形が変わった日から黙って確かめなくなる"""
+        path_like = io.BytesIO()
+        source = zipfile.ZipFile(io.BytesIO(world.github.files[ZIP]))
+        with source, zipfile.ZipFile(path_like, "w") as archive:
+            for name in source.namelist():
+                if not name.endswith("python314.dll"):
+                    archive.writestr(name, source.read(name))
+        world.github.files[ZIP] = path_like.getvalue()
+        assert world.main(tool) == 1
+        assert "Python の版が読めない" in capsys.readouterr().out
+        assert world.secrets == [] and not world.published
+
+    def test_the_minimum_or_newer_goes_on(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """下限ちょうどより新しい修正版も通す 次の修正版が出るたびに止まると出せない"""
+        major, minor, micro = minimum_python()
+        newer = (major, minor, micro + 1)
+        world.github.files[ZIP] = _zip_bytes(python=newer)
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        assert f"zip に入った Python は {_dotted(newer)}" in capsys.readouterr().out
+        assert world.published
+
+    def test_a_dry_run_counts_an_old_python(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """試しに見たときも [NG] として数える 本番で初めて気付くと、タグを打った後になる"""
+        old = _zip_bytes(python=just_below(minimum_python()))
+        world.github.files[ZIP] = old
+        folder = world.root / "dist" / "release"
+        folder.mkdir(parents=True)
+        (folder / ZIP).write_bytes(old)
+        assert world.main(tool, "--dry-run") == 1
+        assert "[NG] zip に入った Python" in capsys.readouterr().out
+        assert world.github.writes == []

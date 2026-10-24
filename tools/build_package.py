@@ -1156,6 +1156,94 @@ def _size(path: Path) -> str:
     return f"{total / (1024 * 1024):.0f} MB"
 
 
+#: 配る物を組み立てる Python の版の下限（#410） 配る zip には組み立てた Python がそのまま入り、
+#: 使う人の手元の ssl・zipfile・urllib はこの版の物になる 0.2.2 は 3.14.8 の脆弱性の修正が出た後に
+#: 3.14.7 で組まれていた（setup-python が実行機に先に入っていた版を選んだ）
+#: Python のセキュリティリリースが出たら上げる
+#: 手順は docs/development.md の「組み立てる Python の版」
+#: 組み立て（:func:`main`）とリリースの確かめ（tools/release.py）の両方がここを見る
+MINIMUM_PYTHON = (3, 14, 9)
+
+#: Windows の版情報（VS_VERSIONINFO）の名前と、固定の欄（VS_FIXEDFILEINFO）の頭の印
+#: python3XX.dll の版は文字の欄にもあるが、言語ごとの表を辿らずに読める固定の欄を使う
+_VERSION_INFO_KEY = "VS_VERSION_INFO\0".encode("utf-16-le")
+_FIXED_FILE_INFO_SIGNATURE = (0xFEEF04BD).to_bytes(4, "little")
+
+#: 組み立てたフォルダと zip の中の Python 本体の DLL（python3.dll は除く 版は同じだが、
+#: 名前に版の数字が無いので、どちらが本体かを取り違えないよう本体だけを見る）
+_PYTHON_DLL = re.compile(r"python3\d+\.dll", re.IGNORECASE)
+
+
+def running_python() -> tuple[int, int, int]:
+    """この道具を走らせている Python の版 組み立てはこの Python を zip へ積む"""
+    return (sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
+
+
+def version_text(version: Sequence[int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def dll_python_version(data: bytes) -> tuple[int, int, int] | None:
+    """python3XX.dll の中身から Python の版（3 つの数）を読む 読めなければ None
+
+    固定の欄の 3 つ目は ``micro * 1000 + 段階 * 10 + 番号`` で書かれる（CPython の
+    PC/python_ver_rc.h 正式版の 3.14.7 は 7150） 1000 で割れば micro が出る
+    開発機にある python314.dll（3.14.6 → 6150）と配った zip の物（3.14.7 → 7150）で確かめた
+    """
+    start = data.find(_VERSION_INFO_KEY)
+    while start >= 0:
+        end = start + len(_VERSION_INFO_KEY)
+        # 名前の後は 4 バイト境界まで詰め物が入る 印はその直後なので、少し先まで探す
+        found = data.find(_FIXED_FILE_INFO_SIGNATURE, end, end + 8)
+        if found >= 0 and len(data) >= found + 16:
+            high = int.from_bytes(data[found + 8 : found + 12], "little")
+            low = int.from_bytes(data[found + 12 : found + 16], "little")
+            return (high >> 16, high & 0xFFFF, (low >> 16) // 1000)
+        start = data.find(_VERSION_INFO_KEY, end)
+    return None
+
+
+def bundled_python_version(internal: Path) -> tuple[int, int, int] | None:
+    """組み立てたフォルダ（``_internal``）に入った Python の版 本体の DLL が無ければ None"""
+    for path in sorted(internal.glob("python3*.dll")):
+        if _PYTHON_DLL.fullmatch(path.name):
+            return dll_python_version(path.read_bytes())
+    return None
+
+
+def zip_python_version(archive: Path) -> tuple[int, int, int] | None:
+    """配る zip に入った Python の版 本体の DLL が無ければ None
+
+    zip の中の DLL を読む 組み立てた機械の Python ではなく、使う人の手元へ届く物を見る
+    """
+    with zipfile.ZipFile(archive) as opened:
+        for name in sorted(opened.namelist()):
+            parts = PurePosixPath(name).parts
+            if len(parts) >= 2 and parts[-2] == "_internal" and _PYTHON_DLL.fullmatch(parts[-1]):
+                return dll_python_version(opened.read(name))
+    return None
+
+
+def python_problem(
+    found: Sequence[int] | None, where: str, minimum: Sequence[int] = MINIMUM_PYTHON
+) -> str | None:
+    """組み立てに使う Python が下限より古い・版が読めないときの文言 足りていれば None
+
+    版が読めないときも止める 読めないのを通すと、DLL の名前や形が変わった日から黙って
+    確かめなくなる
+    """
+    if found is None:
+        return f"{where} の版が読めない（_internal の python3XX.dll が無いか形が違う）"
+    if tuple(found) < tuple(minimum):
+        return (
+            f"{where} {version_text(found)} は下限 {version_text(minimum)} より古い"
+            " 脆弱性の修正が入っていない Python で配る物を組まない"
+            "（CI なら setup-python の check-latest を見る 手元なら Python を上げて"
+            " .venv を作り直す 下限は tools/build_package.py の MINIMUM_PYTHON）"
+        )
+    return None
+
+
 def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true", help="組み立て済みを使う")
@@ -1177,6 +1265,12 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
     target.unlink(missing_ok=True)
 
     if not args.skip_build:
+        # 組み立てに 10 分ほど掛かるので、古い Python なら組む前に止める 手元の開発（verify）は
+        # ここを通らないので、開発機の Python が古くても試験は走る
+        problem = python_problem(running_python(), "組み立てに使う Python")
+        if problem:
+            print(f"[NG] {problem}")
+            return 1
         import PyInstaller.__main__
 
         write_version_file(work)
@@ -1184,6 +1278,12 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
             PyInstaller.__main__.run(pyinstaller_arguments(work, dist))
     if not (bundle / f"{APP_NAME}.exe").exists():
         print(f"{bundle} に {APP_NAME}.exe が無い 組み立てに失敗している")
+        return 1
+    # --skip-build では前に組んだ物を zip にするので、積んだ DLL の版でも見る 前に古い
+    # Python で組んだ物を、今の Python が新しいからといって通さない
+    problem = python_problem(bundled_python_version(bundle / "_internal"), "組み立てた物の Python")
+    if problem:
+        print(f"[NG] {problem}")
         return 1
 
     drop_unused_qt(bundle)
