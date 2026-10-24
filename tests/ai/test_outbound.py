@@ -278,6 +278,13 @@ SHELF_ID = template_choice(SHELF_ENTRY).key
 #: 引数の要る読む道具の引数（素材の ID を受ける） 足したらここにも足す（足さないと落ちる）
 READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     "detect_scenes": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    # 素材の意味検索（#326） 字幕の文を返す・素材の絵を描く・説明の文を受けて数だけ返す
+    "search_media": lambda _media_id: {"queries": ["今日", "作ります"]},
+    "media_scene_sheet": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    "remember_scene_descriptions": lambda media_id: {
+        "media_id": media_id,
+        "scenes": [{"from_seconds": 0, "to_seconds": 2, "text": "今日は"}],
+    },
     "find_highlights": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     # 画面の中身（#324） 文字は読めた文を返し、顔は断りの文に素材の名前を書く
     "detect_text": lambda media_id: {"media_id": media_id, "wait_seconds": 0},

@@ -87,7 +87,7 @@ from sashimono.core.commands import (
     place_media,
     switch_layer_mode,
 )
-from sashimono.core.commands.insert import with_known_video_end
+from sashimono.core.commands.insert import media_alone, with_known_video_end
 from sashimono.core.commands.project_format import retime_frame
 from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
 from sashimono.core.emphasis import (
@@ -157,6 +157,7 @@ from sashimono.core.seams import (
     seams_touching,
     touching_scope,
 )
+from sashimono.core.search import SceneNote, hit_places
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -178,6 +179,7 @@ from sashimono.engine.cache import (
     scenes_from,
 )
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
+from sashimono.engine.cache.scene_notes import SceneNoteStore
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.scan import LOUDNESS
@@ -219,6 +221,7 @@ from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
+from sashimono.ui.media_search import MediaSearchDialog
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
 from sashimono.ui.narration_dialog import ask_narration
 from sashimono.ui.playback import PlaybackController
@@ -453,6 +456,10 @@ class MainWindow(QMainWindow):
             channels=self._document.project.settings.channels,
             scene_threads=self._preferences.scene_threads,
         )
+        #: AI が絵を見て作った場面の説明（#326） 素材の解析と同じ置き場（engine/cache）に覚える
+        self._scene_notes = SceneNoteStore()
+        #: 素材を探す窓（#326） 1 つを使い回す 開くたびに作ると編集画面の子として残り続ける
+        self._media_search: MediaSearchDialog | None = None
         #: 画面の中身（文字と顔の位置 #324）を調べる係 場面の一覧は上の係に頼んで待つ
         self._screen = ScreenAnalyzer(
             scenes=scenes_from(self._analyzer, self._on_analysis_ready),
@@ -646,6 +653,7 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, pool_dock)
+        self._pool_dock = pool_dock
 
         inspector_dock = self._dock("オブジェクト設定", "inspector")
         inspector_dock.setWidget(self._inspector)
@@ -1328,6 +1336,7 @@ class MainWindow(QMainWindow):
         self._media_pool.insert_requested.connect(self._insert_media_by_id)
         self._media_pool.transcribe_requested.connect(self._transcribe_media)
         self._media_pool.remove_requested.connect(self._remove_media)
+        self._media_pool.search_requested.connect(self.show_media_search)
         self._timeline.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 4000)
         )
@@ -1753,6 +1762,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "プロジェクトを切り替えたので、素材の読み込みを取り消した", 5000
             )
+        if self._media_search is not None:
+            # 探す窓は閉じても使い回す 前の作品の答えを捨てないと、新しい作品の画面に前の
+            # 作品の行が残って選べる 捨てるのは差し替えのときだけで、編集のたびの
+            # _on_project_changed では捨てない（字幕を直すたびに一覧が消えると探し直しになる
+            # 行き先は選んだときの作品で決めるので、編集の後に選んでも外れない）
+            self._media_search.forget()
         kept = {media.id for media in self._document.project.media}
         for media in previous.media:
             if media.id not in kept:
@@ -3729,6 +3744,82 @@ class MainWindow(QMainWindow):
     def copy_text(self, text: str) -> None:
         """AI の字幕の〔文字をコピー〕（#349） 字幕パネルと同じクリップボードへ文字を置く"""
         copy_text_to_clipboard(text)
+
+    # --- 素材の意味検索（#326）---
+
+    def start_media_sheet(self, media: MediaItem, layout: SheetLayout) -> AiSheet:
+        """素材 1 本の中の絵を並べる 1 枚を用意する（場面の説明）
+
+        タイムラインに置いていない素材も見られるよう、素材だけを頭から置いた作品を描く
+        描き方は start_sheet と同じ（AI に見せる絵の描き手を使い回す）
+        """
+        # 場面は素材の長さ（音の方が長ければ音の終わり）まで数えるので、映像の終わりを持たない
+        # 古い作品の素材をそのまま置くと、映像より後ろの場面の絵が黒くなり、AI が黒い絵に
+        # 説明を付ける 素材一覧から置くときと同じく、開き直して添えてから置く（#402）
+        (known,) = with_known_video_end([media], _probe_or_none)
+        project = media_alone(self.view_project.settings, known)
+        full_width = project.settings.width
+
+        def render(frame: int, cell_width: int) -> np.ndarray:
+            # 升より小さく描いて引き伸ばすと字がにじむ（start_sheet と同じ）
+            divisor = max(1, full_width // max(cell_width, 1))
+            return self._render_for_ai(project, frame, divisor)
+
+        return AiSheet(layout, render)
+
+    def scene_notes(self, media: MediaItem) -> tuple[SceneNote, ...]:
+        return self._scene_notes.notes(media)
+
+    def remember_scene_notes(self, media: MediaItem, notes: tuple[SceneNote, ...]) -> None:
+        self._scene_notes.remember(media, notes)
+
+    def show_media_search(self) -> MediaSearchDialog:
+        """素材の字幕と場面の説明から探す窓を出す 開いていれば前へ出して欄に入る"""
+        dialog = self._media_search
+        if dialog is None:
+            # 作品は探すたびに読む 開いたまま編集しても、前の作品の字幕で探さない
+            dialog = MediaSearchDialog(
+                lambda: self._document.project, self._scene_notes.notes, self
+            )
+            dialog.found_activated.connect(self._go_to_found)
+            self._media_search = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.field.setFocus()
+        return dialog
+
+    def _go_to_found(self, media_id: str, seconds: float, stream: int | None) -> None:
+        """探す窓で選んだ所へ行く 開いているタイムラインに置いていれば、そこへ再生位置を動かす
+
+        置いていなければ素材一覧でその素材を選び、置き方を知らせる 勝手に置かない
+        （置くと作品が変わる 探しただけで取り消しの段が増える）
+        """
+        project = self.view_project
+        media = project.find_media(MediaId(media_id))
+        if media is None:
+            self.statusBar().showMessage("その素材はもう作品にありません", 5000)
+            return
+        # 字幕の当たり（stream）は、その音を鳴らすクリップを行き先にする 照らさないと、
+        # 同じ素材の別の言語の音のクリップへ行き、探した言葉が聞こえない所で止まる
+        places = hit_places(project, media, seconds, stream)
+        if places:
+            clip, frame = places[0]
+            self._seek(frame)
+            self._timeline.select(clip.id)
+            self.statusBar().showMessage(
+                f"見つけた所へ移動した（{format_timecode(frame, project.rate)}）", 5000
+            )
+            return
+        if self._media_pool.select_media(media.id):
+            # 素材一覧は字幕パネルとタブで重ねてある 字幕を前に出していたり一覧を閉じて
+            # いたりすると、選んだ行が見えず、案内の〔タイムラインへ〕がどの素材か分からない
+            self._pool_dock.show()
+            self._pool_dock.raise_()
+        self.statusBar().showMessage(
+            "この所は開いているタイムラインに置いていません 素材一覧の〔タイムラインへ〕で置けます",
+            8000,
+        )
 
     def probe(self, path: Path) -> MediaItem:
         forget_probe(path)

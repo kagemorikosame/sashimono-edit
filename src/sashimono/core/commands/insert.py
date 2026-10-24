@@ -39,8 +39,10 @@ from sashimono.core.model import (
     Clip,
     Effect,
     GeneratedSource,
+    LayerMode,
     MediaItem,
     Project,
+    ProjectSettings,
     Track,
     TrackId,
     TrackKind,
@@ -62,6 +64,7 @@ __all__ = [
     "insert_media",
     "is_effect_track",
     "lacks_video_end",
+    "media_alone",
     "new_track",
     "place_media",
     "with_known_video_end",
@@ -114,6 +117,27 @@ def insert_media(
         lambda kind, clip, commands: _find_or_create(project, kind, clip, commands),
         split_audio=split_audio,
     )
+
+
+def media_alone(settings: ProjectSettings, media: MediaItem) -> Project:
+    """素材 1 本だけを頭から置いた、素材の絵の大きさの作品（場面の説明の絵 #326）
+
+    作品のタイムラインに置いていない素材の中の絵を、AI に見せる絵と同じ描き方で描くため
+    素材の時刻 ``t`` 秒は、この作品の ``t`` 秒のフレームになる（置く所が 0 で頭を切らない）
+    作品の大きさを素材の表示の大きさ（回転の後）にするのは、拡大率 100% を素材の画素に
+    する置き方（``native_size``）で枠いっぱいに出すため 作品の大きさのままだと、縦の
+    素材や小さい素材が黒い縁の中に小さく出る 映像の無い素材は空の作品になる
+    """
+    if not media.has_video:
+        return Project.create(settings, media=(media,))
+    width, height = media.video_streams[0].display_size
+    alone = Project.create(
+        replace(settings, width=width, height=height, layer_mode=LayerMode.SEPARATED),
+        media=(media,),
+    )
+    for command in insert_media(alone, media, at_frame=0):
+        alone = command.apply(alone)
+    return alone
 
 
 def place_media(

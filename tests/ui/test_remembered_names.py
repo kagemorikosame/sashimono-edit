@@ -115,6 +115,11 @@ PROJECT_SIDE = {
     "render_png",
     # コマを並べた絵（#320） 描くのは作品の中身だけ 送る道具は sends に絵を書く
     "start_sheet",
+    # 場面の説明（#326） 描くのは作品の素材の絵だけ 覚えるのは AI が書いた説明の文と素材の秒で、
+    # 素材の名前と場所は持たない（鍵はハッシュ） 説明を返す search_media は sends に字幕と文字を書く
+    "start_media_sheet",
+    "scene_notes",
+    "remember_scene_notes",
     # 音量の推移のグラフ（#338） 描くのは道具が渡した時刻と値だけ 送る道具は sends に絵を書く
     "draw_sound_graph",
     "probe",
