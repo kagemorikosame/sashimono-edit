@@ -271,8 +271,24 @@ class CheckJob(QObject):
         def wait(seconds: float) -> bool:
             if progress is None:
                 return True
-            with progress.lock:
-                return progress.lock.wait_for(lambda: not progress.running, max(0.0, seconds))
+            limit = max(0.0, seconds)
+            deadline = time.monotonic() + limit
+            # 鍵を取るのも上限の中でする 上限なしで取ると、走り係が鍵を持ったまま重い仕事
+            # （字幕のはみ出しの測り）をしている間、AI のスレッドがここで止まり、ブリッジの
+            # 待つ上限も中断のボタンも効かなくなる（#405） 取れなければ「まだ」と返す
+            # ブリッジは短い間ずつ呼び直すので、次の呼び出しでまた取りに来る
+            taken = (
+                progress.lock.acquire(timeout=limit)
+                if limit > 0
+                else progress.lock.acquire(blocking=False)
+            )
+            if not taken:
+                return False
+            try:
+                remaining = max(0.0, deadline - time.monotonic())
+                return progress.lock.wait_for(lambda: not progress.running, remaining)
+            finally:
+                progress.lock.release()
 
         return wait
 

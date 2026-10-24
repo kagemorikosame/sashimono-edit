@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckReport, CheckRequest
 from tests.check_media import write_video
+from tests.waiting import GUARD_SECONDS
 
 
 @pytest.fixture
@@ -31,7 +32,8 @@ def _check(job: CheckJob, path: Path, limits: CheckLimits | None = None) -> Chec
     job.start(
         CheckRequest(limits or CheckLimits(), path=path, stamp=(stat.st_size, stat.st_mtime_ns))
     )
-    assert job.waiter()(60.0), "60 秒で調べ終わらなかった"
+    # 秒で区切ると遅い機械で調べ終える前に落ちる（#405） 終われば待つ関数はすぐ戻る
+    assert job.waiter()(GUARD_SECONDS), "調べ終わらなかった"
     state = job.state()
     assert state.failure is None, state.failure
     assert state.report is not None
@@ -246,13 +248,13 @@ class TestWrittenFiles:
         request = CheckRequest(CheckLimits(), path=path, stamp=(stat.st_size, stat.st_mtime_ns))
         job.start(request)
         job.stop()
-        assert job.waiter()(30.0)
+        assert job.waiter()(GUARD_SECONDS)
         state = job.state()
         assert state.stopped
         assert state.report is not None
         assert not state.report.complete
         job.start(request)
-        assert job.waiter()(60.0)
+        assert job.waiter()(GUARD_SECONDS)
         state = job.state()
         assert not state.stopped
         assert state.report is not None
@@ -263,7 +265,7 @@ class TestWrittenFiles:
         path = tmp_path / "broken.mp4"
         path.write_bytes(b"not a video")
         job.start(CheckRequest(CheckLimits(), path=path, stamp=(1, 1)))
-        assert job.waiter()(30.0)
+        assert job.waiter()(GUARD_SECONDS)
         state = job.state()
         assert not state.running
         assert state.failure is not None

@@ -39,6 +39,7 @@ from sashimono.update.state import (
 )
 from sashimono.update.swap import Launched, SwapPlan
 from tests.update.helpers import release
+from tests.waiting import wait_until
 
 NEWER = "9000.0.0"
 
@@ -675,7 +676,6 @@ class TestScriptsBesideTheExe:
         尋ねる設定では、一覧ができてから画面の側で尋ね、答えを受けてから裏で移す
         """
         import threading
-        import time
 
         from sashimono.update.portable import user_script_files as real_list
 
@@ -709,10 +709,13 @@ class TestScriptsBesideTheExe:
         controller._inform = inform  # type: ignore[method-assign]
         try:
             assert controller.offer_script_move()
-            deadline = time.monotonic() + 10
-            while not informed and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.02)
+            # 裏の仕事が終わる時間は機械の速さで変わる 秒で区切らない（#405）
+            wait_until(
+                lambda: bool(informed),
+                "裏の仕事の知らせ",
+                step=qt_application.processEvents,
+                pause=0.02,
+            )
             main = threading.main_thread().name
             assert threads["list"] != main and threads["ask"] == main
             assert informed and not mine.exists()
@@ -760,7 +763,6 @@ class TestScriptsBesideTheExe:
     ) -> None:
         """手で確かめたときの注意（scripts を辿る・導入先を測る）は裏のスレッドで作る"""
         import threading
-        import time
 
         controller = UpdateController(
             harness.window,
@@ -785,10 +787,13 @@ class TestScriptsBesideTheExe:
         setattr(controller, "_by_hand_notes", notes)  # noqa: B010 - 型の上では別の関数
         try:
             controller._tell_by_hand(True, "新しい版があります", "https://example.invalid", "cp314")
-            deadline = time.monotonic() + 10
-            while not shown and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.02)
+            # 裏の仕事が終わる時間は機械の速さで変わる 秒で区切らない（#405）
+            wait_until(
+                lambda: bool(shown),
+                "裏の仕事の知らせ",
+                step=qt_application.processEvents,
+                pause=0.02,
+            )
             assert threads and threads[0] != threading.main_thread().name
             assert shown and "注意" in shown[0]
         finally:
@@ -799,7 +804,6 @@ class TestScriptsBesideTheExe:
     ) -> None:
         """入れる前の確認の見積もり（導入先の大きさを最大 1.5 秒測る）は裏のスレッドで作る"""
         import threading
-        import time
 
         harness.controller.start()
         threads: list[str] = []
@@ -827,10 +831,13 @@ class TestScriptsBesideTheExe:
         setattr(controller, "_choose", choose)  # noqa: B010 - 型の上では別の関数
         try:
             controller.offer()
-            deadline = time.monotonic() + 10
-            while not asked and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.02)
+            # 裏の仕事が終わる時間は機械の速さで変わる 秒で区切らない（#405）
+            wait_until(
+                lambda: bool(asked),
+                "裏の仕事の知らせ",
+                step=qt_application.processEvents,
+                pause=0.02,
+            )
             assert threads and threads[0] != threading.main_thread().name
             assert asked
         finally:
@@ -843,7 +850,6 @@ class TestScriptsBesideTheExe:
         （PR #245 の Codex の指摘 元をよけたまま止まると、次の起動で入れ替えが先に走って消える）
         """
         import threading
-        import time
 
         from sashimono.update.portable import move_user_scripts as real_move
 
@@ -875,10 +881,13 @@ class TestScriptsBesideTheExe:
         try:
             assert controller.offer_script_move()
             # 一覧を作り終えた知らせは画面の側で受け取って、移しを裏へ出す
-            deadline = time.monotonic() + 10
-            while not inside.is_set() and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.02)
+            # 裏の仕事が終わる時間は機械の速さで変わる 秒で区切らない（#405）
+            wait_until(
+                lambda: bool(inside.is_set()),
+                "裏の仕事の知らせ",
+                step=qt_application.processEvents,
+                pause=0.02,
+            )
             assert inside.is_set()
             threading.Timer(0.3, release_move.set).start()
             assert controller.shutdown(timeout=10)
@@ -1025,10 +1034,13 @@ class TestScriptsBesideTheExe:
             # 移している間にもう一度呼んでも、2 つ目は始めない
             assert not controller.offer_script_move()
             release_move.set()
-            deadline = time.monotonic() + 10
-            while not notified and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.02)
+            # 裏の仕事が終わる時間は機械の速さで変わる 秒で区切らない（#405）
+            wait_until(
+                lambda: bool(notified),
+                "裏の仕事の知らせ",
+                step=qt_application.processEvents,
+                pause=0.02,
+            )
             assert threads and threads[0] != threading.main_thread().name
             assert len(notified) == 1 and not mine.exists()
             assert rescanned == [threading.main_thread().name]

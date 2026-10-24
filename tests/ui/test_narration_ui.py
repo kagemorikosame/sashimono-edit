@@ -26,8 +26,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddCredits, Author
 from sashimono.core.io.serialize import save_project
 from sashimono.core.model import MediaItem, Project, Transcript
@@ -45,9 +43,11 @@ from sashimono.ui.narration_dialog import NarrationChoice, NarrationDialog
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.voice_fetch import VoiceFetch
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import allow_sending, make_loaded
+from tests.ai.conftest import make_loaded
 from tests.fake_clipboard import FakeClipboard
 from tests.fake_voice_engine import FakeVoiceEngine, closed_engine_url, fake_voice_engine
+from tests.ui.ai_tool_calls import call_tool
+from tests.waiting import wait_until
 
 WINDOWS_WRITES = pytest.mark.skipif(
     sys.platform != "win32", reason="AI がファイルを書くのは Windows だけ（pin_holds_the_folder）"
@@ -142,11 +142,7 @@ class TestPreference:
 
 def _settle(fetch: VoiceFetch) -> None:
     """エンジンへの問い合わせ（裏のスレッド）が終わり、窓へ返るまで画面の手を回す"""
-    deadline = time.monotonic() + 15
-    while fetch.running:
-        QApplication.processEvents()
-        time.sleep(0.005)
-        assert time.monotonic() < deadline, "エンジンへの問い合わせが終わらなかった"
+    wait_until(lambda: not fetch.running, "エンジンへの問い合わせ", step=QApplication.processEvents)
 
 
 class TestDialog:
@@ -273,16 +269,19 @@ class TestDialog:
         # 壊れると、返事を止めたエンジンへ〔声の一覧を読む〕を押した人の設定の窓が、通信の
         # 待ちの上限まで固まる（#401 の CodeRabbit の指摘）
         del qt_application
-        engine.speakers_delay = 1.0
+        # 秒で遅らせて戻るまでの秒を測ると、遅い機械では試験の側が止まって秒が伸びる
+        # エンジンは試験が放すまで返さない 返す前に戻れたこと（この行の先へ進めたこと）で見る
+        gate = threading.Event()
+        engine.speakers_gate = gate
         dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
         try:
-            started = time.monotonic()
             dialog._read_voices()
-            assert time.monotonic() - started < 0.5
             assert "問い合わせています" in dialog._narration_status.text()
+            gate.set()
             _settle(dialog._voice_fetch)
             assert dialog._narration_voice.findData(3) >= 0
         finally:
+            gate.set()
             dialog.deleteLater()
 
     def test_pressing_again_while_asking_says_why_nothing_starts(
@@ -439,35 +438,12 @@ def opened(qt_application: QApplication) -> Iterator[list[MainWindow]]:
 
 
 def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ 取り消せない操作の確かめには許すで答える"""
-    operation = find_operation(name)
-    assert operation is not None
-    bridge = allow_sending(EditorBridge(window, auto_approve=True))
-    box: dict[str, Any] = {}
+    """AI のスレッドからブリッジ越しに道具を呼ぶ 取り消せない操作の確かめには許すで答える
 
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 60.0
-    while thread.is_alive():
-        bridge.pump()
-        approval = bridge.take_approval()
-        if approval is not None:
-            approval.allow()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+    待ちの上限は tests/ui/ai_tool_calls.py にまとめた 試験ごとに 60 秒で区切ると、
+    遅い機械では返る前に落ちる（#405）
+    """
+    return call_tool(window, name, arguments, allow_irreversible=True)
 
 
 class TestNarrationDialog:
@@ -515,16 +491,19 @@ class TestNarrationDialog:
         # 壊れると、返事を止めたエンジンで〔ナレーションを作る…〕の窓が開く前から固まり、
         # 〔やめる〕も押せない（#401 の CodeRabbit の指摘 設定の窓と同じ穴）
         del qt_application
-        engine.speakers_delay = 1.0
+        # 秒で遅らせて戻るまでの秒を測ると、遅い機械では試験の側が止まって秒が伸びる
+        # エンジンは試験が放すまで返さない 返す前に戻れたこと（この行の先へ進めたこと）で見る
+        gate = threading.Event()
+        engine.speakers_gate = gate
         dialog = NarrationDialog(NarrationSettings(url=engine.url, voice=3))
         try:
-            started = time.monotonic()
             dialog.read_voices()
-            assert time.monotonic() - started < 0.5
             assert dialog.reading
+            gate.set()
             _settle(dialog._fetch)
             assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
         finally:
+            gate.set()
             dialog.deleteLater()
 
     def test_pressing_again_in_the_narration_window_says_why(
@@ -611,11 +590,13 @@ def _saved_window(
 
 
 def _wait_for_narration(window: MainWindow) -> None:
-    deadline = time.monotonic() + 30
-    while window._narration_job is not None:
-        QApplication.processEvents()
-        time.sleep(0.01)
-        assert time.monotonic() < deadline, "ナレーションが終わらなかった"
+    """人が窓から頼んだナレーションを置き終えるまで待つ 秒で区切らない（tests/waiting.py）"""
+    wait_until(
+        lambda: window._narration_job is None,
+        "ナレーション",
+        step=QApplication.processEvents,
+        pause=0.01,
+    )
     QApplication.processEvents()
 
 

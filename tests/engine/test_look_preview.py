@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import time
-
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
@@ -25,6 +23,7 @@ from sashimono.engine.render.look_preview import (
     crop_to_content,
     sample_project,
 )
+from tests.waiting import wait_until
 
 
 def _clip(text: str = "見出し", duration: int = 60) -> Clip:
@@ -118,9 +117,8 @@ def test_stopping_drops_the_queue_instead_of_drawing_it_all(
     preset = Preset.capture("見出し", _clip())
     for number in range(300):
         worker.submit(str(number), preset)
-    deadline = time.monotonic() + 30
-    while not drawn and time.monotonic() < deadline:
-        time.sleep(0.001)
+    # 1 枚目が描けるまでの時間は機械の速さで変わる 秒で区切らず、描けた知らせを待つ（#405）
+    wait_until(lambda: bool(drawn), "1 枚目の見本", pause=0.001)
     worker.stop()
     qt_application.processEvents()
     assert 0 < len(drawn) < 30
@@ -188,10 +186,13 @@ class TestGpu:
         worker.start()
         try:
             worker.submit("a", Preset.capture("見出し", _clip()))
-            deadline = time.monotonic() + 30
-            while not received and time.monotonic() < deadline:
-                qt_application.processEvents()
-                time.sleep(0.01)
+            # 描ける時間は機械の速さで変わる 秒で区切らず、届くのを待つ（#405）
+            wait_until(
+                lambda: bool(received),
+                "見本の絵",
+                step=qt_application.processEvents,
+                pause=0.01,
+            )
         finally:
             worker.stop()
         ((key, result),) = received

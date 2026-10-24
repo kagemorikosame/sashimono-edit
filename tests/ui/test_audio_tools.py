@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
@@ -17,8 +15,7 @@ import pytest
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
-from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.operations import ImageResult, find_operation
+from sashimono.ai.operations import ImageResult
 from sashimono.ai.sound_graph import Band, SoundGraph
 from sashimono.core.commands import AddClip
 from sashimono.core.model import Clip, MediaItem, Project, ProjectSettings, Track, TrackKind
@@ -27,8 +24,8 @@ from sashimono.engine.checks.profile import SPEECH
 from sashimono.engine.decode.probe import probe_media
 from sashimono.ui.ai_sound_graph import BAND_COLORS, UNANALYZED, draw_sound_graph
 from sashimono.ui.main_window import MainWindow
-from tests.ai.conftest import allow_sending
 from tests.check_media import HEIGHT, WIDTH, tone, write_tone
+from tests.ui.ai_tool_calls import call_after_check
 
 
 @pytest.fixture(autouse=True)
@@ -89,39 +86,24 @@ def window(qt_application: QApplication, sound: MediaItem) -> Iterator[MainWindo
 
 
 def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ 画面のスレッドは仕事を拾い続ける"""
-    operation = find_operation(name)
-    assert operation is not None
-    bridge = allow_sending(EditorBridge(window, auto_approve=False))
-    box: dict[str, Any] = {}
+    """AI のスレッドからブリッジ越しに、調べ終えた後の答えを受け取る
 
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
+    道具に秒を渡して道具の中で待たせると、遅い機械では途中を返して落ちる（#405）
+    待ち方は tests/ui/ai_tool_calls.py の :func:`call_after_check`
+    """
+    finished = None if name == "audio_graph" else _complete
+    return call_after_check(window, name, arguments, finished)
 
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 120.0
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+
+def _complete(result: dict[str, Any]) -> bool:
+    return bool(result["complete"])
 
 
 class TestTimeline:
     def test_the_mixed_sound_is_read_as_numbers(self, window: MainWindow) -> None:
         # 壊れると、書き出す音（混ぜた音）の推移を AI が読めず、置き忘れた 3 秒の無音や
         # 音量の基準からのずれを、再生せずに見つけられない
-        result = _call(window, "analyze_audio", {"wait_seconds": 120, "points": 9})
+        result = _call(window, "analyze_audio", {"points": 9})
         assert result["complete"] is True
         assert result["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.3)
         silences = [row for row in result["segments"] if row["kind"] == "silence"]
@@ -130,15 +112,15 @@ class TestTimeline:
 
     def test_a_finished_check_is_not_mixed_again(self, window: MainWindow) -> None:
         # 壊れると、check_output の直後に音の道具を呼ぶたびに検査を頼み直し、同じ音を混ぜ直す
-        _call(window, "check_output", {"wait_seconds": 120, "checks": ["silence", "loudness"]})
+        _call(window, "check_output", {"checks": ["silence", "loudness"]})
         before = window.check_state().request
-        _call(window, "analyze_audio", {"wait_seconds": 120})
+        _call(window, "analyze_audio", {})
         assert window.check_state().request is before
 
     def test_the_graph_comes_back_as_a_real_picture(self, window: MainWindow) -> None:
         # 壊れると、グラフの絵が作れず（または大きさが頼みと違い）、AI が音の推移を目で
         # 確かめられない 帯の色が説明と合わないと、無音を話し声と読み違える
-        result = _call(window, "audio_graph", {"wait_seconds": 120, "width": 640, "marks": [120]})
+        result = _call(window, "audio_graph", {"width": 640, "marks": [120]})
         assert isinstance(result, ImageResult)
         image = QImage.fromData(result.png)
         assert (image.width(), image.height()) == (640, 320)

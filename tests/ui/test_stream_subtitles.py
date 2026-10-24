@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
@@ -36,6 +35,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.subtitle.panel import SubtitlePanel
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+from tests.waiting import wait_until
 
 
 def _movie(name: str = "録画", voices: int = 2) -> MediaItem:
@@ -121,12 +121,17 @@ def _texts(project: Project, media: MediaItem, stream: int) -> list[str]:
 
 
 def _settle(panel: SubtitlePanel) -> str:
-    deadline = time.monotonic() + 10.0
-    status = panel.poll_transcription()
-    while panel._jobs and time.monotonic() < deadline:
-        time.sleep(0.02)
-        status = panel.poll_transcription()
-    return status
+    """字幕起こしの依頼が全部片付くまで見張りを回し、最後の様子を返す
+
+    片付く時間は機械の速さで変わる 秒で区切らず、片付くのを待つ（#405 tests/waiting.py）
+    """
+    status = [panel.poll_transcription()]
+
+    def poll() -> None:
+        status[0] = panel.poll_transcription()
+
+    wait_until(lambda: not panel._jobs, "字幕起こし", step=poll, pause=0.02)
+    return status[0]
 
 
 class TestFromTheAssistant:
@@ -142,9 +147,7 @@ class TestFromTheAssistant:
         assert "順番待ち" in message
         service = panel._service
         assert service is not None
-        deadline = time.monotonic() + 5.0
-        while service.jobs()[0].waiting and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(lambda: not service.jobs()[0].waiting, "1 本目の起こし始め", pause=0.01)
         status = panel.poll_transcription()
         assert "順番待ち" in status and "起こしている" in status
         speaker.gate.set()
@@ -245,9 +248,7 @@ class TestCancellingWhileWaiting:
             dialog.deleteLater()
         speaker.gate.set()
         _settle(panel)
-        deadline = time.monotonic() + 5.0
-        while service.busy and time.monotonic() < deadline:
-            time.sleep(0.02)
+        wait_until(lambda: not service.busy, "起こしの係が空くの", pause=0.02)
         # 止めた依頼は走らない（音声 2 は起こされない）
         assert speaker.order == [1]
 
