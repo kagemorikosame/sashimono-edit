@@ -335,6 +335,17 @@ def test_character_error_rate(tool: ModuleType) -> None:
     assert tool.character_error_rate("", "") == 0.0
 
 
+def test_character_error_rate_counts_long_vowel_marks(tool: ModuleType) -> None:
+    """長音符（ー）の落としや足しを、聞き取りの誤りとして数えること
+
+    数えないと、正解が「ビール」で字幕が「ビル」でも誤り 0 になり、字幕起こしの悪化を見逃す
+    ほかの誤りの割合も、分母から長音符が抜けて変わる
+    """
+    assert tool.character_error_rate("ビル", "ビール") == pytest.approx(1 / 3, abs=1e-4)
+    assert tool.character_error_rate("ビール", "ビル") == pytest.approx(1 / 2, abs=1e-4)
+    assert tool.character_error_rate("ビール。", "ビール") == 0.0
+
+
 def test_guard_refuses_names_and_free_text(tool: ModuleType, tmp_path: Path) -> None:
     """素材の名前・置き場・日本語の文が混じった結果は、1 行も書かずに止まること
 

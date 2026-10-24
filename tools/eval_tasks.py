@@ -729,9 +729,9 @@ def point_scores(
 
 #: 文字の誤り率で比べない文字 字幕の整形（句点の付け方など）の好みで数が動くと、
 #: 聞き取りの良し悪しが見えなくなる
-_IGNORED_CHARACTERS = re.compile(
-    r"[\s、\N{IDEOGRAPHIC FULL STOP}，．,.!?！？「」『』（）()…・ー〜~]"
-)
+#: 長音符（ー）は外さない 語の一部で、落としたり足したりするのは聞き取りの誤り（ビール と ビル）
+#: 外すと、その誤りが 0 に見え、ほかの誤りの割合も分母が縮んで変わる
+_IGNORED_CHARACTERS = re.compile(r"[\s、\N{IDEOGRAPHIC FULL STOP}，．,.!?！？「」『』（）()…・〜~]")
 
 
 def character_error_rate(predicted: str, answer: str) -> float:
