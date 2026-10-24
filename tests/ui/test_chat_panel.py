@@ -579,12 +579,14 @@ class _RecordingSession:
         effort: str | None,
         system_prompt: str = SYSTEM_PROMPT,
         ask: bool = True,
+        plan: bool = True,
     ) -> None:
         del bridge
         self.model = model
         self.effort = effort
         self.system_prompt = system_prompt
         self.ask = ask
+        self.plan = plan
         self.prompts: list[str] = []
         self.closed = False
         self.busy = False

@@ -263,7 +263,7 @@ class TestTurningItOff:
             session_module, "build_server", lambda _bridge, **options: seen.append(options)
         )
         AgentSession(EditorBridge(host), ask=ask).server()
-        assert seen == [{"ask": ask}]
+        assert seen == [{"ask": ask, "plan": True}]
 
     @pytest.mark.parametrize("ask", [True, False])
     def test_the_server_leaves_the_tool_out_when_off(self, host: FakeHost, ask: bool) -> None:
