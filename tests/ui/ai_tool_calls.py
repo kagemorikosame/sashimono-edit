@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
+import traceback
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -18,7 +21,7 @@ from sashimono.ai.operations import find_operation
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import allow_sending
 
-__all__ = ["TOOL_TIMEOUT", "call_tool"]
+__all__ = ["TOOL_TIMEOUT", "call_tool", "dump_threads", "wait_for_check"]
 
 #: 道具が返るのを待つ上限（秒） 返ればすぐ戻るので、ふつうの速さは変わらない
 #: 本物の上限（``bridge.CALL_TIMEOUT`` 60 秒）より長くとる CI で pytest を 4〜6 本並べると、
@@ -55,9 +58,54 @@ def call_tool(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
         QApplication.processEvents()
         thread.join(0.01)
         if time.monotonic() > deadline:
+            # 畳む前に全部のスレッドの居場所を残す 畳んだ後だと、どこで止まっていたかが消える
+            # #405 は 600 秒止まったのに、記録からはどのスレッドが何を待っていたか分からなかった
+            dump_threads()
             bridge.cancel()
             thread.join(5.0)
             pytest.fail("道具が返らなかった")
     if "error" in box:
         raise box["error"]
     return box["result"]
+
+
+def wait_for_check(window: MainWindow, then: Callable[[], bool] | None = None) -> None:
+    """窓の裏の検査（音量の測りや仕上がりの検査）が終わるまで、画面の仕事を拾いながら待つ
+
+    道具に ``wait_seconds`` を渡して待たせると、その秒で測り終えない遅い機械では、
+    道具が「測っている途中」を返して試験が落ちる（#405） ここは秒で区切らず、検査の
+    終わりの知らせ（:meth:`MainWindow.check_waiter`）を待つ 速い機械では終わればすぐ戻る
+    :data:`TOOL_TIMEOUT` は止まったまま終わらない作りの崩れを見つけるためだけの上限
+
+    ``then`` は、測り終えた後に画面のスレッドが済ませる仕事（右クリックからの音量の
+    掛け算）が済んだか 走り係は終わったと記した後に知らせ（``changed``）を出すので、
+    終わったと分かった時にはまだ知らせが画面へ届いていないことがある 済むまで拾い続ける
+    """
+    waiter = window.check_waiter()
+    deadline = time.monotonic() + TOOL_TIMEOUT
+    # 待つのは 10 ms ずつ 待つ間も画面の仕事を拾わないと、検査の進みの知らせが溜まり続ける
+    while not waiter(0.01):
+        QApplication.processEvents()
+        if time.monotonic() > deadline:
+            dump_threads()
+            pytest.fail("検査が終わらなかった")
+    QApplication.processEvents()
+    while then is not None and not then():
+        QApplication.processEvents()
+        time.sleep(0.001)
+        if time.monotonic() > deadline:
+            dump_threads()
+            pytest.fail("測り終えた後の画面の仕事が済まなかった")
+
+
+def dump_threads() -> None:
+    """全部のスレッドの今の呼び出しの並びを標準エラーへ書く（pytest が落ちた試験に添える）
+
+    ``faulthandler`` は使わない pytest の取り込み方によっては標準エラーがファイルの
+    番号を持たず、書けずに例外で落ちる Qt のスレッド（検査の走り係）も、Python を
+    動かしている間はここに出る
+    """
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    for ident, frame in sys._current_frames().items():
+        print(f"--- スレッド {names.get(ident, ident)}", file=sys.stderr)
+        traceback.print_stack(frame, file=sys.stderr)

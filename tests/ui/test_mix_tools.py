@@ -7,8 +7,7 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any
@@ -48,7 +47,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.check_media import tone, write_tone
-from tests.ui.ai_tool_calls import call_tool
+from tests.ui.ai_tool_calls import call_tool, wait_for_check
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +141,29 @@ def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
     return call_tool(window, name, arguments)
 
 
+def _measured(
+    window: MainWindow,
+    name: str,
+    arguments: dict[str, Any],
+    finished: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any]:
+    """測る道具を、窓の検査が測り終えた後の答えで返す
+
+    道具に秒を渡して待たせない 渡した秒で測り終えない遅い機械では、道具が途中を返して
+    落ちる（#405） 1 回目は待たずに測り始めさせ、検査の終わりの知らせを待ってから
+    同じ引数で呼び直す 測り終えた頼みは使い回されるので、2 回目は待たずに答えが出る
+    1 回目のうちに測り終えていれば、それが答え（呼び直すと、そろえた後の作品を測り直す）
+    """
+    quick = {**arguments, "wait_seconds": 0}
+    first: dict[str, Any] = _call(window, name, quick)
+    if finished(first):
+        return first
+    wait_for_check(window)
+    again: dict[str, Any] = _call(window, name, quick)
+    assert finished(again), again
+    return again
+
+
 def _rms_db(project: Project, frame: int) -> float:
     mixer = AudioMixer(project)
     try:
@@ -164,10 +186,12 @@ class TestNormalize:
             ),
         )
         window = _window(opened, alone)
-        result = _call(window, "normalize_loudness", {"wait_seconds": 60})
+        result = _measured(window, "normalize_loudness", {}, lambda done: "measuring" not in done)
         assert result["measured_lufs"] == pytest.approx(-20.0, abs=0.5)
         assert result["gain_db"] == pytest.approx(6.0, abs=0.5)
-        check = _call(window, "check_output", {"checks": ["loudness"], "wait_seconds": 60})
+        check = _measured(
+            window, "check_output", {"checks": ["loudness"]}, lambda done: done["complete"]
+        )
         assert check["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.5)
         # 取り消し 1 回で測る前の音量へ戻る
         window.document.undo()
@@ -401,11 +425,8 @@ class TestRightClick:
         _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
         # 基準の既定は本人の設定（仕上がりを調べる音量の基準）
         assert asked == [-14.0]
-        deadline = time.monotonic() + 60.0
-        while window._pending_loudness is not None:
-            QApplication.processEvents()
-            time.sleep(0.01)
-            assert time.monotonic() < deadline, "測り終えなかった"
+        # 60 秒で区切ると、遅い機械では測り終える前に落ちる（#405） 検査の終わりの知らせを待つ
+        wait_for_check(window, then=lambda: window._pending_loudness is None)
         # BGM だけを測るので -20 LUFS から +6 dB 声のクリップは変えない
         assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(200.0, rel=0.06)
         voice_clip = window.document.project.timeline.tracks[0].clips[0]
