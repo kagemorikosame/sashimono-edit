@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ import pytest
 import sashimono.ai
 import sashimono.core
 import sashimono.ui
+from sashimono.ai import safety
 from sashimono.ai.command_ledger import COMMANDS_WITHOUT_TOOLS, Why
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import CHILD_ISSUES
@@ -564,7 +566,18 @@ def uncovered(
 
 
 @pytest.fixture
-def material(video_media: MediaItem, transcript: Transcript, tmp_path: Path) -> Iterator[Material]:
+def material(
+    video_media: MediaItem,
+    transcript: Transcript,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Material]:
+    # 書く道具（ナレーション #335）の例は、書き終えるまでフォルダを持てる OS でだけ書く所まで進む
+    # （safety.pin_holds_the_folder Windows だけ） ほかの OS で開発すると、例が書く前に断られ、
+    # その道のコマンド（表記の AddCredits など）を通らずに数えが崩れる（#401 の CodeRabbit の指摘）
+    # この見張りが見るのは道具が通すコマンドなので、どの OS でも持てる側として数える ほかの OS で
+    # 書く道具を断ることは tests/ai/test_save_and_export.py の TestOtherSystemsAreRefused が見る
+    monkeypatch.setattr(safety, "pin_holds_the_folder", lambda: True)
     with fake_voice_engine() as engine:
         yield Material(video_media, transcript, tmp_path, engine.url)
 
@@ -606,6 +619,15 @@ class TestEveryCommandHasAToolOrAReason:
         expected = {f"WRITE_EXAMPLES {name}" for name in WRITE_EXAMPLES if name in covered}
         assert set(refused) <= expected, {k: v for k, v in refused.items() if k not in expected}
         assert not {k for k in refused if k.startswith("EXAMPLES ")}
+
+    def test_the_examples_go_through_on_other_systems_too(
+        self, material: Material, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、Windows 以外で開発する機械では、ナレーションの例が書く確かめで断られ、上の
+        # 試験と数えの見張りが落ちる（CI は Windows だけなので気付かない #401 の CodeRabbit の指摘）
+        monkeypatch.setattr(safety, "sys", SimpleNamespace(platform="linux"))
+        _, refused = _used(material)
+        assert not {k for k in refused if k.startswith("EXAMPLES ")}, refused
 
     def test_a_refused_run_counts_nothing(self, material: Material) -> None:
         # 壊れると、1 本目を通して 2 本目で断られた道具（作品は checkpoint で元へ戻る）の

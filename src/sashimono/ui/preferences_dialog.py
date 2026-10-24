@@ -111,7 +111,7 @@ from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import THEME_CHOICES
-from sashimono.ui.voice_fetch import Fetched, VoiceFetch, fetch_voices, terms_text
+from sashimono.ui.voice_fetch import BUSY_TEXT, Fetched, VoiceFetch, fetch_voices, terms_text
 from sashimono.ui.workspace import (
     AI_IMAGE_LIMITS,
     AI_MINUTE_LIMITS,
@@ -1609,6 +1609,10 @@ class PreferencesDialog(QDialog):
             return
         if self._voice_fetch.start(work, lambda fetched: self._fetched(url, terms, fetched)):
             self._narration_status.setText("エンジンに問い合わせています…")
+        else:
+            # 前の問い合わせが終わるまで新しく始めない 黙っていると、押したことが効いたように
+            # 見え、前の答えが捨てられた後にもう 1 度押すことになる
+            self._narration_status.setText(BUSY_TEXT)
 
     def _fetched(self, url: str, terms: bool, fetched: Fetched) -> None:
         """読み終えた（画面のスレッド） 待つ間に場所を変えていたら、前の場所の答えは捨てる"""

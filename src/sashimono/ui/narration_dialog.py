@@ -33,7 +33,7 @@ from sashimono.engine.audio.voicevox import (
     EngineError,
     NarrationSettings,
 )
-from sashimono.ui.voice_fetch import Fetched, VoiceFetch, fetch_voices, terms_text
+from sashimono.ui.voice_fetch import BUSY_TEXT, Fetched, VoiceFetch, fetch_voices, terms_text
 
 __all__ = ["NarrationChoice", "NarrationDialog", "ask_narration"]
 
@@ -168,6 +168,9 @@ class NarrationDialog(QDialog):
             return
         if self._fetch.start(work, lambda fetched: self._fetched(terms, fetched)):
             self._status.setText("エンジンに問い合わせています…")
+        else:
+            # 設定の窓と同じく、前の問い合わせの途中で押されたことを黙って捨てない
+            self._status.setText(BUSY_TEXT)
 
     def _fetched(self, terms: bool, fetched: Fetched) -> None:
         catalog = fetched.catalog

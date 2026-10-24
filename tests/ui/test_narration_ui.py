@@ -285,6 +285,23 @@ class TestDialog:
         finally:
             dialog.deleteLater()
 
+    def test_pressing_again_while_asking_says_why_nothing_starts(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、返事の遅い場所で〔声の一覧を読む〕を押した後、場所を直してもう 1 度押しても
+        # 何も起きず、欄は「問い合わせています」のまま残って押したことが効いたように見える
+        # （#401 の CodeRabbit の指摘）
+        del qt_application
+        engine.speakers_delay = 1.0
+        dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
+        try:
+            dialog._read_voices()
+            dialog._read_voices()
+            assert "前の問い合わせが終わっていません" in dialog._narration_status.text()
+            _settle(dialog._voice_fetch)
+        finally:
+            dialog.deleteLater()
+
     def test_changing_the_place_resets_the_chosen_voice(self, qt_application: QApplication) -> None:
         # 壊れると、別のエンジンでは同じ声の ID が別の声に当たるのに、場所だけ替えて OK を押した
         # 人の既定の声が、知らない声になる（#401 の CodeRabbit の指摘）
@@ -482,6 +499,22 @@ class TestNarrationDialog:
             assert dialog.reading
             _settle(dialog._fetch)
             assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
+        finally:
+            dialog.deleteLater()
+
+    def test_pressing_again_in_the_narration_window_says_why(
+        self, qt_application: QApplication, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、ナレーションの窓でも前の問い合わせの途中に押した〔声の一覧を読む〕が黙って
+        # 捨てられる（設定の窓と同じ穴）
+        del qt_application
+        engine.speakers_delay = 1.0
+        dialog = NarrationDialog(NarrationSettings(url=engine.url))
+        try:
+            dialog.read_voices()
+            dialog.read_voices()
+            assert "前の問い合わせが終わっていません" in dialog._status.text()
+            _settle(dialog._fetch)
         finally:
             dialog.deleteLater()
 

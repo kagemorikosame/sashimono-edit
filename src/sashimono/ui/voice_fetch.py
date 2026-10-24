@@ -16,7 +16,10 @@ from PySide6.QtCore import QObject, QTimer
 
 from sashimono.engine.audio.voicevox import Catalog, EngineError, Speaker, Style, VoiceEngine
 
-__all__ = ["Fetched", "VoiceFetch", "fetch_voices", "terms_text"]
+__all__ = ["BUSY_TEXT", "Fetched", "VoiceFetch", "fetch_voices", "terms_text"]
+
+#: 前の問い合わせの途中で押されたときに窓へ出す文 黙って捨てると押したことが効いたように見える
+BUSY_TEXT = "前の問い合わせが終わっていません 終わってからもう 1 度押してください"
 
 _LOG = logging.getLogger(__name__)
 
