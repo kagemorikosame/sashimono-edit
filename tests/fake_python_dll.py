@@ -18,10 +18,20 @@ _API = 1013
 
 _FIXED_LENGTH = 52
 
+#: 版情報の 3 つ目の欄（16 ビット）に入る micro の上限 ``65 * 1000 + 150 = 65150`` まで入る
+#: 本物の DLL も同じ欄に書くので、これを超える micro の Python は版情報を持てない
+MAX_MICRO = (0xFFFF - _FINAL * 10) // 1000
+
 
 def python_dll_bytes(version: tuple[int, int, int]) -> bytes:
-    """``version`` の Python の DLL に見える中身 頭に本物と同じく PE の印と詰め物を置く"""
+    """``version`` の Python の DLL に見える中身 頭に本物と同じく PE の印と詰め物を置く
+
+    欄に入らない版は ValueError 黙って桁があふれた値を作ると、読む側の試験が版を比べる前に
+    別の理由で落ち、何を確かめたのかが分からなくなる
+    """
     major, minor, micro = version
+    if not (0 <= major <= 0xFFFF and 0 <= minor <= 0xFFFF and 0 <= micro <= MAX_MICRO):
+        raise ValueError(f"{version} は版情報の欄に入らない（micro は 0 から {MAX_MICRO}）")
     field3 = micro * 1000 + _FINAL * 10
     fixed = b"".join(
         value.to_bytes(4, "little")
@@ -50,9 +60,17 @@ def python_dll_bytes(version: tuple[int, int, int]) -> bytes:
 
 
 def just_below(version: tuple[int, int, int]) -> tuple[int, int, int]:
-    """``version`` のすぐ下の版 下限を 3.15.0 のような修正 0 の版へ上げても負の数を作らない"""
+    """``version`` のすぐ下の版 下限を 3.15.0 のような系列の頭へ上げても作れる版を返す
+
+    系列の頭なら 1 つ前の系列の、版情報に入るいちばん新しい micro（:data:`MAX_MICRO`）にする
+    負の数や欄に入らない micro を返すと、偽の DLL を作る所で落ちる
+    """
     major, minor, micro = version
-    return (major, minor, micro - 1) if micro else (major, minor - 1, 99)
+    if micro:
+        return (major, minor, micro - 1)
+    if minor:
+        return (major, minor - 1, MAX_MICRO)
+    raise ValueError(f"{version} のすぐ下の版は決められない（系列の数が 0）")
 
 
 def minimum_python() -> tuple[int, int, int]:

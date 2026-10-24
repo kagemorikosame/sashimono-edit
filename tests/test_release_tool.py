@@ -26,7 +26,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sashimono.update.signing import encrypt_private_key, public_key_text
-from tests.fake_python_dll import minimum_python, python_dll_bytes
+from tests.fake_python_dll import just_below, minimum_python, python_dll_bytes
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1381,12 +1381,13 @@ class TestThePythonInTheZip:
 
         通すと、直っていない ssl や zipfile を全員の手元へ自動更新で配る
         """
-        major, minor, micro = minimum_python()
-        world.github.files[ZIP] = _zip_bytes(python=(major, minor, micro - 1))
+        minimum = minimum_python()
+        old = just_below(minimum)
+        world.github.files[ZIP] = _zip_bytes(python=old)
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
         out = capsys.readouterr().out
-        assert f"Python {major}.{minor}.{micro - 1} は下限 {major}.{minor}.{micro}" in out
+        assert f"Python {_dotted(old)} は下限 {_dotted(minimum)}" in out
         assert world.smoked == [] and world.secrets == []
         assert not world.published
 
@@ -1410,18 +1411,18 @@ class TestThePythonInTheZip:
     ) -> None:
         """下限ちょうどより新しい修正版も通す 次の修正版が出るたびに止まると出せない"""
         major, minor, micro = minimum_python()
-        world.github.files[ZIP] = _zip_bytes(python=(major, minor, micro + 1))
+        newer = (major, minor, micro + 1)
+        world.github.files[ZIP] = _zip_bytes(python=newer)
         world.answers = ["y", "y"]
         assert world.main(tool) == 0
-        assert f"zip に入った Python は {major}.{minor}.{micro + 1}" in capsys.readouterr().out
+        assert f"zip に入った Python は {_dotted(newer)}" in capsys.readouterr().out
         assert world.published
 
     def test_a_dry_run_counts_an_old_python(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """試しに見たときも [NG] として数える 本番で初めて気付くと、タグを打った後になる"""
-        major, minor, micro = minimum_python()
-        old = _zip_bytes(python=(major, minor, micro - 1))
+        old = _zip_bytes(python=just_below(minimum_python()))
         world.github.files[ZIP] = old
         folder = world.root / "dist" / "release"
         folder.mkdir(parents=True)

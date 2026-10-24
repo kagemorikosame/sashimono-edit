@@ -1437,6 +1437,17 @@ class TestThePythonIsPatched:
         assert problem is not None
         assert builder.version_text(minimum) in problem and "MINIMUM_PYTHON" in problem
 
+    def test_the_version_below_a_new_series_can_be_faked(self, builder: ModuleType) -> None:
+        """下限を 3.15.0 のような系列の頭へ上げても、すぐ下の版の偽の DLL を作れて読める
+
+        作れないと、下限を上げた日に古い版を断る試験が版を比べる前に落ち、何も確かめなくなる
+        """
+        for minimum in ((3, 15, 0), (3, 14, 9)):
+            below = just_below(minimum)
+            assert below < minimum
+            assert builder.dll_python_version(python_dll_bytes(below)) == below
+            assert builder.python_problem(below, "組み立てに使う Python", minimum) is not None
+
     def test_the_minimum_or_newer_passes(self, builder: ModuleType) -> None:
         """下限ちょうどと新しい版は通す 次の修正版や次の版で組めなくなると出せない"""
         major, minor, micro = builder.MINIMUM_PYTHON
