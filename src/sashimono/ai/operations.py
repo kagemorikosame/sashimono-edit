@@ -5531,8 +5531,10 @@ def _reframe(host: EditorHost, arguments: dict[str, Any]) -> object:
         return _reframe_now(host, request, faces=faces)
 
     def ready(seconds: float) -> bool:
-        # ブリッジは中断を見ながら短い間ずつ呼ぶ 1 本ずつ待てば、待つ長さは呼ばれた秒を越えない
-        return all(waiter(seconds) for waiter in waiters)
+        # ブリッジは中断を見ながら短い間ずつ呼ぶ 1 本ずつに同じ秒を渡すと、素材の数だけ
+        # 待つ長さが伸び、中断が効くまでの遅れも伸びる 残りの秒を順に渡して、呼ばれた秒に収める
+        deadline = time.monotonic() + max(0.0, seconds)
+        return all(waiter(max(0.0, deadline - time.monotonic())) for waiter in waiters)
 
     return Pending(wait=ready, seconds=wait, then=lambda: _reframe_now(host, request, faces=faces))
 

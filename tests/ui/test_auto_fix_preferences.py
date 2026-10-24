@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -24,8 +22,6 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.ai.auto_fix import ColorRequest, NoiseRequest
-from sashimono.ai.bridge import EditorBridge
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import Author, SetTrackState
 from sashimono.core.model import ClipId, MediaItem, Project
 from sashimono.effects.audio import DENOISE_KIND
@@ -38,10 +34,10 @@ from sashimono.ui.auto_fix_dialogs import ColorDialog, NoiseDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
-from tests.ai.conftest import allow_sending
 from tests.ai.test_auto_fix_tools import _strip, _waveform
 from tests.core.test_seams import JumpCut
 from tests.engine.test_auto_color import _scene
+from tests.ui.ai_tool_calls import call_tool
 from tests.ui.test_seam_preferences import _menu_action
 
 
@@ -83,32 +79,12 @@ def opened(qt_application: QApplication) -> Iterator[list[MainWindow]]:
 
 
 def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道） 変更は自動で承認する"""
-    operation = find_operation(name)
-    assert operation is not None
-    bridge = allow_sending(EditorBridge(window, auto_approve=True))
-    box: dict[str, Any] = {}
+    """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道） 変更は自動で承認する
 
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 60.0
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+    待ちの上限は tests/ui/ai_tool_calls.py にまとめた 試験ごとに 60 秒で区切ると、
+    遅い機械では返る前に落ちる（#405）
+    """
+    return call_tool(window, name, arguments)
 
 
 def _prepared(

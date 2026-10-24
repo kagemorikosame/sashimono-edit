@@ -59,6 +59,7 @@ from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
+from tests.waiting import wait_until
 
 #: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
 #: （:func:`~sashimono.ai.safety.pin_holds_the_folder` ほかの OS では確かめの箱を出す前に断る）
@@ -141,19 +142,22 @@ def _drive(
     arguments: dict[str, Any],
     *,
     allow: bool = True,
-    timeout: float = 60.0,
     meanwhile: Callable[[], None] | None = None,
 ) -> tuple[_Asked, dict[str, object]]:
     """AI のスレッドのつもりで道具を呼ぶ 画面のイベントを回し、確かめの欄が出たら答える
 
     確かめを出すのも答えを受け取るのも AI パネルの本物の仕組み（見張りのタイマー）
+    書き出しが道具の待つ秒（``wait_seconds``）で終わらず途中を返したら、終わりの知らせを
+    待って、道具が待った後に返すのと同じ様子（:meth:`MainWindow.export_status`）に替える
+    遅い機械では書き出しが秒に収まらず、途中の様子で落ちる（#405） 書き出しは取り消せない
+    操作なので、呼び直して続きを受け取ることはできない
     """
     bridge: EditorBridge = window._chat._bridge
     asked = _Asked()
     done, box = call_in_thread(bridge, operation, arguments)
-    deadline = time.monotonic() + timeout
     panel = window._chat
-    while not done.is_set() and time.monotonic() < deadline:
+
+    def turn() -> None:
         QApplication.processEvents()
         if not panel._approval_box.isHidden() and panel._approval is not None:
             asked.texts.append(panel._approval_text.text())
@@ -166,9 +170,15 @@ def _drive(
                 panel._answer(False)
         if meanwhile is not None:
             meanwhile()
-        time.sleep(0.005)
-    assert done.is_set(), "道具が終わらなかった"
+
+    wait_until(done.is_set, "道具", step=turn)
     QApplication.processEvents()
+    result = box.get("result")
+    if isinstance(result, dict) and result.get("state") in EXPORT_RUNNING:
+        finished = window.export_waiter()
+        wait_until(lambda: finished(0.01), "書き出し", step=turn, pause=0.0)
+        QApplication.processEvents()
+        box["result"] = window.export_status()
     return asked, box
 
 
@@ -179,12 +189,9 @@ def _assert_irreversible_request(asked: _Asked) -> None:
     assert asked.allow_texts == [IRREVERSIBLE_ALLOW_TEXT]
 
 
-def _wait_until(condition: Callable[[], bool], timeout: float = 60.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition() and time.monotonic() < deadline:
-        QApplication.processEvents()
-        time.sleep(0.01)
-    assert condition()
+def _wait_until(condition: Callable[[], bool]) -> None:
+    """画面の仕事を拾いながら ``condition`` を待つ 秒で区切らない（待ち方は tests/waiting.py）"""
+    wait_until(condition, "書き出しの様子", step=QApplication.processEvents, pause=0.01)
 
 
 # --- 保存 ---

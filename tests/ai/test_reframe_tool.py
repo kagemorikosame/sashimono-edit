@@ -123,6 +123,28 @@ class TestTheAnalysis:
         assert result["changed"] is True
         assert host.project.settings.resolution == (1080, 1920)
 
+    def test_several_waits_share_the_seconds(self, host: FakeHost) -> None:
+        """壊れると、場面と顔のように待つ物が増えるほど 1 回の待ちが呼ばれた秒の何倍にも伸び、
+        中断のボタンが効くまでの遅れと、待つ上限を越える長さも伸びる
+        """
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(None, running=True)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(None, running=True)
+
+        def slow_scene(_media: object) -> bool:
+            # 場面の待ちが渡された秒を使い切った所（本物は上限まで待って戻る）
+            time.sleep(0.3)
+            return True
+
+        host.scene_ready = slow_scene
+        pending = REFRAME(host, {})
+        assert isinstance(pending, Pending)
+        pending.wait(0.4)
+        ((_media_id, _kind, seconds),) = host.screen_waits
+        # 場面で 0.3 秒使ったので、顔へ渡すのは残りだけ 同じ 0.4 秒を渡すと合わせて 0.7 秒
+        assert seconds <= 0.4 - 0.25
+
 
 class TestTheResult:
     def test_one_undo_brings_the_wide_work_back(self, host: FakeHost) -> None:

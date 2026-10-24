@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
@@ -36,6 +35,7 @@ from sashimono.ui.subtitle.panel import SPEAKER_COLUMN, SubtitlePanel
 from sashimono.ui.subtitle.speaker_dialog import SpeakerDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.asr.test_service import FakeBackend
+from tests.waiting import wait_until
 
 #: 2 人の対談 0〜3.5 秒が 1 人目、3.5〜10 秒が 2 人目
 TURNS = (
@@ -149,12 +149,17 @@ def _speakers_of(host: _Host, media: MediaItem) -> list[str | None]:
 
 
 def _settle(panel: SubtitlePanel) -> str:
-    deadline = time.monotonic() + 10.0
-    status = panel.poll_transcription()
-    while panel._jobs and time.monotonic() < deadline:
-        time.sleep(0.02)
-        status = panel.poll_transcription()
-    return status
+    """依頼が全部片付くまで見張りを回し、最後の様子を返す
+
+    片付く時間は機械の速さで変わる 秒で区切らず、片付くのを待つ（#405 tests/waiting.py）
+    """
+    status = [panel.poll_transcription()]
+
+    def poll() -> None:
+        status[0] = panel.poll_transcription()
+
+    wait_until(lambda: not panel._jobs, "話し手の聞き分け", step=poll, pause=0.02)
+    return status[0]
 
 
 class TestTheButton:
@@ -429,10 +434,9 @@ class TestTheWindow:
             assert dialog._run_button.isEnabled()
             dialog._count.setCurrentIndex(dialog._count.findData(3))
             dialog._start()
-            deadline = time.monotonic() + 10.0
-            while dialog.turns is None and time.monotonic() < deadline:
-                time.sleep(0.02)
-                dialog._poll()
+            wait_until(
+                lambda: dialog.turns is not None, "話し手の聞き分け", step=dialog._poll, pause=0.02
+            )
             assert speakers.asked[0].speakers == 3
             assert dialog.turns == TURNS and accepted
         finally:

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any
@@ -47,7 +47,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.check_media import tone, write_tone
-from tests.ui.ai_tool_calls import call_tool, wait_for_check
+from tests.ui.ai_tool_calls import call_after_check, call_tool, wait_for_check
 
 
 @pytest.fixture(autouse=True)
@@ -141,29 +141,6 @@ def _call(window: MainWindow, name: str, arguments: dict[str, Any]) -> Any:
     return call_tool(window, name, arguments)
 
 
-def _measured(
-    window: MainWindow,
-    name: str,
-    arguments: dict[str, Any],
-    finished: Callable[[dict[str, Any]], bool],
-) -> dict[str, Any]:
-    """測る道具を、窓の検査が測り終えた後の答えで返す
-
-    道具に秒を渡して待たせない 渡した秒で測り終えない遅い機械では、道具が途中を返して
-    落ちる（#405） 1 回目は待たずに測り始めさせ、検査の終わりの知らせを待ってから
-    同じ引数で呼び直す 測り終えた頼みは使い回されるので、2 回目は待たずに答えが出る
-    1 回目のうちに測り終えていれば、それが答え（呼び直すと、そろえた後の作品を測り直す）
-    """
-    quick = {**arguments, "wait_seconds": 0}
-    first: dict[str, Any] = _call(window, name, quick)
-    if finished(first):
-        return first
-    wait_for_check(window)
-    again: dict[str, Any] = _call(window, name, quick)
-    assert finished(again), again
-    return again
-
-
 def _rms_db(project: Project, frame: int) -> float:
     mixer = AudioMixer(project)
     try:
@@ -186,10 +163,13 @@ class TestNormalize:
             ),
         )
         window = _window(opened, alone)
-        result = _measured(window, "normalize_loudness", {}, lambda done: "measuring" not in done)
+        # 道具の中で秒を区切って待たせると、遅い機械では途中を返して落ちる（#405）
+        result = call_after_check(
+            window, "normalize_loudness", {}, lambda done: "measuring" not in done
+        )
         assert result["measured_lufs"] == pytest.approx(-20.0, abs=0.5)
         assert result["gain_db"] == pytest.approx(6.0, abs=0.5)
-        check = _measured(
+        check = call_after_check(
             window, "check_output", {"checks": ["loudness"]}, lambda done: done["complete"]
         )
         assert check["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.5)

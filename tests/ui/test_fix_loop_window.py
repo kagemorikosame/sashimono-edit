@@ -8,8 +8,6 @@ AI パネルと同じく指示の段を開き、小さい音の作品を check_o
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
@@ -20,7 +18,6 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, Q
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.fixes import AUTO, fix_label
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddClip, Author
 from sashimono.core.model import Clip, MediaItem, Project, ProjectSettings, Track, TrackKind
 from sashimono.core.timebase import FrameRate
@@ -30,6 +27,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.conftest import allow_sending
 from tests.check_media import tone, write_tone
+from tests.ui.ai_tool_calls import call_after_check, call_tool
 
 
 @pytest.fixture(autouse=True)
@@ -89,35 +87,24 @@ def _window(opened: list[MainWindow], project: Project) -> MainWindow:
     return window
 
 
-def _call(bridge: EditorBridge, name: str, arguments: dict[str, Any]) -> Any:
-    """AI のスレッドからブリッジ越しに道具を呼ぶ（本物の AI と同じ道）"""
-    operation = find_operation(name)
-    assert operation is not None
-    box: dict[str, Any] = {}
+def _checked(bridge: EditorBridge, window: MainWindow) -> dict[str, Any]:
+    """音量を調べ終えた check_output の答え
 
-    def work() -> None:
-        try:
-            box["result"] = bridge.invoke(operation, arguments)
-        except Exception as exc:
-            box["error"] = exc
-
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 120.0
-    while thread.is_alive():
-        bridge.pump()
-        QApplication.processEvents()
-        thread.join(0.01)
-        if time.monotonic() > deadline:
-            bridge.cancel()
-            thread.join(5.0)
-            pytest.fail("道具が返らなかった")
-    if "error" in box:
-        raise box["error"]
-    return box["result"]
+    道具に秒を渡して道具の中で待たせると、遅い機械では途中を返して落ちる（#405）
+    途中の答えは直しの回の数え（#339）を動かさないので、呼び直しても数えは変わらない
+    """
+    result: dict[str, Any] = call_after_check(
+        window, "check_output", {"checks": ["loudness"]}, _complete, bridge=bridge
+    )
+    return result
 
 
-_CHECK = {"checks": ["loudness"], "wait_seconds": 60}
+def _complete(result: dict[str, Any]) -> bool:
+    return bool(result["complete"])
+
+
+def _measured(result: dict[str, Any]) -> bool:
+    return "measuring" not in result
 
 
 class TestLoop:
@@ -131,16 +118,16 @@ class TestLoop:
         window.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
         try:
             # 調べる前の指示の編集 直した回を戻しても、これは残る
-            _call(bridge, "add_track", {"kind": "audio", "name": "BGM"})
+            call_tool(window, "add_track", {"kind": "audio", "name": "BGM"}, bridge=bridge)
             edited = window.document.project
-            first = _call(bridge, "check_output", _CHECK)
+            first = _checked(bridge, window)
             (problem,) = first["problems"]
             assert problem["kind"] == "loudness"
             assert problem["fix"]["action"] == AUTO
             assert first["fix_round"]["next_round"] == 1
             for name in problem["fix"]["tools"][:1]:
-                _call(bridge, name, {"wait_seconds": 60})
-            second = _call(bridge, "check_output", _CHECK)
+                call_after_check(window, name, {}, _measured, bridge=bridge)
+            second = _checked(bridge, window)
         finally:
             window.document.end_checkpoint()
 
@@ -162,10 +149,11 @@ class TestLoop:
         bridge = allow_sending(EditorBridge(window, auto_approve=True))
         window.document.begin_checkpoint("AI: 仕上げて", by=Author.AI)
         try:
-            result = _call(bridge, "check_output", _CHECK)
+            result = _checked(bridge, window)
             assert result["fix_round"]["closed"] is True
             with pytest.raises(ToolError, match="上限"):
-                _call(bridge, "normalize_loudness", {"wait_seconds": 60})
+                # 断るのは測る前 待たせる秒は要らない
+                call_tool(window, "normalize_loudness", {"wait_seconds": 0}, bridge=bridge)
         finally:
             window.document.end_checkpoint()
         assert window.document.project == project

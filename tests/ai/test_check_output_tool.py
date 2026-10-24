@@ -19,7 +19,8 @@ from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import RemoveClip
 from sashimono.core.model import SceneId
-from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
+from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
+from sashimono.engine.checks.job import _Progress
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, Run
 from tests.ai.conftest import FakeHost, allow_sending
@@ -359,6 +360,46 @@ class TestWaiting:
             assert "中断" in str(box.get("error", ""))
         finally:
             released.set()
+
+    def test_a_worker_holding_the_lock_does_not_outlast_the_wait(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、検査の走り係が鍵を持ったままの間、ブリッジの待ちが渡した秒を越えて
+        止まり続け、道具が返らない（#405 で 600 秒返らなかった道の 1 つ）
+
+        本物の係（:class:`CheckJob`）の待つ関数を使い、別のスレッドに鍵を持たせて
+        順番を決め打ちにする 待つ秒（0.5）で途中までの結果が返ればよい
+        """
+        _operation()(host, {"wait_seconds": 0})
+        request = host.check_requests[-1]
+        host.check = _state(request, running=True, analyzed=60)
+        job = CheckJob()
+        progress = _Progress(request, lambda: None)
+        job._progress = progress
+        monkeypatch.setattr(host, "check_waiter", job.waiter)
+        taken = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with progress.lock:
+                taken.set()
+                release.wait(60.0)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        try:
+            assert taken.wait(10.0)
+            bridge = allow_sending(EditorBridge(host))
+            done, box = call_in_thread(bridge, _operation(), {"wait_seconds": 0.5})
+            # 鍵が放されるまで（60 秒）は待たないこと 上限は遅い機械でも揺れない広さにする
+            pump_until(bridge, done, timeout=30.0)
+            assert done.is_set(), "鍵を持たれている間、道具が返らなかった"
+            result = box["result"]
+            assert isinstance(result, dict)
+            assert result["complete"] is False
+        finally:
+            release.set()
+            holder.join(10.0)
 
     def test_a_check_that_ends_while_waiting_returns_through_the_bridge(
         self, host: FakeHost, monkeypatch: pytest.MonkeyPatch

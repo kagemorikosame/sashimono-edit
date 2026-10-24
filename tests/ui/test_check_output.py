@@ -48,7 +48,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.check_media import HEIGHT, WIDTH, tone, write_tone, write_video
-from tests.ui.ai_tool_calls import call_tool
+from tests.ui.ai_tool_calls import call_after_check, call_tool, wait_for_check
 
 
 @pytest.fixture(autouse=True)
@@ -161,8 +161,20 @@ def _window(opened: list[MainWindow], project: Project) -> MainWindow:
 
 
 def _call(window: MainWindow, arguments: dict[str, Any]) -> Any:
-    """完成物の検査を本物の AI と同じ道で呼ぶ（待ちの上限は tests/ui/ai_tool_calls.py）"""
-    return call_tool(window, "check_output", arguments)
+    """完成物の検査を本物の AI と同じ道で呼び、調べ終えた後の答えを返す
+
+    道具の中で秒を区切って待たせると（省けば 30 秒）、遅い機械では途中を返して落ちる（#405）
+    待ち方は tests/ui/ai_tool_calls.py の :func:`call_after_check`
+    ``wait_seconds`` を渡すのは、待たない・待ちきれない道具の振る舞いそのものを見る試験だけ
+    そのまま渡して呼ぶ
+    """
+    if "wait_seconds" in arguments:
+        return call_tool(window, "check_output", arguments)
+    return call_after_check(window, "check_output", arguments, _complete)
+
+
+def _complete(result: dict[str, Any]) -> bool:
+    return bool(result["complete"])
 
 
 def _kinds(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -177,7 +189,7 @@ class TestTimeline:
     def test_a_clean_work_has_no_problems(self, opened: list[MainWindow], media: _Media) -> None:
         # 壊れると、仕上がった作品にまで問題を並べ、AI が直さなくてよい所を直しに行く
         window = _window(opened, _clean(media))
-        result = _call(window, {"wait_seconds": 120})
+        result = _call(window, {})
         assert result["complete"] is True
         assert result["problems"] == [], result["problems"]
         assert result["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.5)
@@ -193,7 +205,7 @@ class TestTimeline:
             pictures=(_clip(media.video, 0, 180, 0.0), _clip(media.video, 190, 90, 9.0)),
             sounds=(_clip(media.tone, 0, 280),),
         )
-        result = _call(_window(opened, project), {"wait_seconds": 120})
+        result = _call(_window(opened, project), {})
         (black,) = _kinds(result)["black"]
         assert (black["start_frame"], black["end_frame"]) == (180, 190)
         assert black["severity"] == "high"
@@ -206,7 +218,7 @@ class TestTimeline:
             pictures=(_clip(media.video, 0, 360, 0.0),),
             sounds=(_clip(media.tone, 0, 360),),
         )
-        result = _call(_window(opened, project), {"wait_seconds": 120})
+        result = _call(_window(opened, project), {})
         (freeze,) = _kinds(result)["freeze"]
         assert freeze["start_frame"] == pytest.approx(180, abs=2)
         assert freeze["end_frame"] == pytest.approx(270, abs=2)
@@ -357,7 +369,7 @@ class TestSound:
         stop = window._check_indicator.cancel_button
         assert stop is not None
         stop.click()
-        assert window._checks.waiter()(30.0)
+        wait_for_check(window)
         assert window._checks.state().stopped
         result = _call(window, {"checks": ["silence"], "wait_seconds": 0})
         assert "検査の途中です" in result["note"]
@@ -378,7 +390,7 @@ class TestSound:
         assert result["complete"] is False
         assert "同じ引数で呼ぶと続きを返します" in result["note"]
         window._checks.stop()
-        assert window._checks.waiter()(30.0)
+        wait_for_check(window)
 
     def test_closing_the_window_stops_the_check(
         self, qt_application: QApplication, media: _Media

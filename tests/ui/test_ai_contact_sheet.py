@@ -29,6 +29,7 @@ from sashimono.ui.ai_sheet import SHEET_BACKGROUND
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import allow_sending
 from tests.ai.test_bridge import call_in_thread
+from tests.waiting import wait_until
 
 pytestmark = pytest.mark.usefixtures("gpu")
 
@@ -211,15 +212,18 @@ class TestBigProject:
         done, box = call_in_thread(bridge, operation, {"count": 36})
         longest = 0.0
         turns = 0
-        deadline = time.monotonic() + 60.0
-        while not done.is_set() and time.monotonic() < deadline:
+
+        def turn() -> None:
+            nonlocal longest, turns
             started = time.monotonic()
             bridge.pump()
             QApplication.processEvents()
             longest = max(longest, time.monotonic() - started)
             turns += 1
-            time.sleep(0.002)
-        assert done.is_set(), "描き終わらない"
+
+        # 描き終える時間は機械の速さで変わる 秒で区切らず、描き終えた知らせを待つ（#405）
+        # 見るのは 1 回に手を返すまでの長さ（longest）で、全部を描く長さではない
+        wait_until(done.is_set, "コマの一覧を描くの", step=turn, pause=0.002)
         assert isinstance(box.get("result"), ImageResult), box.get("error")
         # 36 コマを 1 回で描くと 1 秒を超える 区切っていれば 0.1 秒と数コマぶんで手を返す
         assert longest < operations.SHEET_SLICE_SECONDS + 0.4
