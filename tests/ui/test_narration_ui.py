@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import replace
@@ -268,16 +269,19 @@ class TestDialog:
         # 壊れると、返事を止めたエンジンへ〔声の一覧を読む〕を押した人の設定の窓が、通信の
         # 待ちの上限まで固まる（#401 の CodeRabbit の指摘）
         del qt_application
-        engine.speakers_delay = 1.0
+        # 秒で遅らせて戻るまでの秒を測ると、遅い機械では試験の側が止まって秒が伸びる
+        # エンジンは試験が放すまで返さない 返す前に戻れたこと（この行の先へ進めたこと）で見る
+        gate = threading.Event()
+        engine.speakers_gate = gate
         dialog = PreferencesDialog(Preferences(narration_engine_url=engine.url))
         try:
-            started = time.monotonic()
             dialog._read_voices()
-            assert time.monotonic() - started < 0.5
             assert "問い合わせています" in dialog._narration_status.text()
+            gate.set()
             _settle(dialog._voice_fetch)
             assert dialog._narration_voice.findData(3) >= 0
         finally:
+            gate.set()
             dialog.deleteLater()
 
     def test_pressing_again_while_asking_says_why_nothing_starts(
@@ -487,16 +491,19 @@ class TestNarrationDialog:
         # 壊れると、返事を止めたエンジンで〔ナレーションを作る…〕の窓が開く前から固まり、
         # 〔やめる〕も押せない（#401 の CodeRabbit の指摘 設定の窓と同じ穴）
         del qt_application
-        engine.speakers_delay = 1.0
+        # 秒で遅らせて戻るまでの秒を測ると、遅い機械では試験の側が止まって秒が伸びる
+        # エンジンは試験が放すまで返さない 返す前に戻れたこと（この行の先へ進めたこと）で見る
+        gate = threading.Event()
+        engine.speakers_gate = gate
         dialog = NarrationDialog(NarrationSettings(url=engine.url, voice=3))
         try:
-            started = time.monotonic()
             dialog.read_voices()
-            assert time.monotonic() - started < 0.5
             assert dialog.reading
+            gate.set()
             _settle(dialog._fetch)
             assert dialog._voice.currentText() == "ずんだもん（ノーマル）"
         finally:
+            gate.set()
             dialog.deleteLater()
 
     def test_pressing_again_in_the_narration_window_says_why(

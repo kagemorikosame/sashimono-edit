@@ -59,7 +59,7 @@ from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
-from tests.waiting import wait_until
+from tests.waiting import GUARD_SECONDS, wait_until
 
 #: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
 #: （:func:`~sashimono.ai.safety.pin_holds_the_folder` ほかの OS では確かめの箱を出す前に断る）
@@ -676,7 +676,7 @@ class TestStoppingWhilePlacing:
 
         def held_copy(source: Path, path: Path, **options: Any) -> os.stat_result:
             entered.set()
-            release.wait(10)
+            release.wait(GUARD_SECONDS)
             return copy_atomic(source, path, **options)
 
         monkeypatch.setattr(ai_export, "run_export", fake_export)
@@ -691,7 +691,7 @@ class TestStoppingWhilePlacing:
                 lambda: target.resolve(),
             )
             # 画面のイベントは回さない 置き始めた知らせがまだ画面へ届いていない所を作る
-            assert entered.wait(10)
+            assert entered.wait(GUARD_SECONDS)
             assert job.status()["state"] == "rendering"
             assert job.cancel() is False
             release.set()

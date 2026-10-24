@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -384,10 +383,11 @@ class TestSound:
             sounds=tuple(_clip(media.tone, start, 360) for start in range(0, 36000, 360)),
         )
         window = _window(opened, project)
-        started = time.monotonic()
+        # かかった秒では見ない 遅い機械では、返るのが速くても試験の側が止まって秒が伸びる
+        # 調べ終える前に返ったこと（途中の答え）で、待ちきれずに返ったことを見る
         result = _call(window, {"checks": ["silence"], "wait_seconds": 0.5})
-        assert time.monotonic() - started < 10.0
         assert result["complete"] is False
+        assert window._checks.running
         assert "同じ引数で呼ぶと続きを返します" in result["note"]
         window._checks.stop()
         wait_for_check(window)

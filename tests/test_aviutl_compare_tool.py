@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 
 from sashimono.compat.aviutl import plugin
+from tests.waiting import GUARD_SECONDS
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -343,15 +344,19 @@ def test_a_session_that_timed_out_is_not_reused() -> None:
     """
     session = _PowerShell()
     try:
+        # 終わらない命令にする 数秒で終わる命令だと、遅い機械では上限を数え始める前に
+        # 終わってしまい、諦める道を通らない
         with pytest.raises(pytest.fail.Exception, match="返さなかった"):
-            session.run("Start-Sleep -Seconds 3", timeout=0.5)
+            session.run(
+                "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)",
+                timeout=0.5,
+            )
         # 諦めた時に止めてあること 止めないと、遅れた ok が次の命令の答えになる
-        assert session._process.wait(timeout=30) is not None
-        started = time.monotonic()
+        # 止めた物はすぐ終わる 上限は止め損ねたときに試験が戻らなくならないためだけ
+        assert session._process.wait(timeout=GUARD_SECONDS) is not None
+        # 次の命令は打たずに断る（送る前に断るので、上限まで待たない）
         with pytest.raises(pytest.fail.Exception, match="応答しなくなった"):
             session.run("New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null")
-        # 次の命令は上限（60 秒）まで待たずに断られる
-        assert time.monotonic() - started < 10.0
     finally:
         session.close()
 
@@ -528,7 +533,7 @@ def test_the_real_plugin_composes_with_the_sample(
         text=True,
         encoding="utf-8",
         env=environment,
-        timeout=60,
+        timeout=GUARD_SECONDS,
         check=True,
     )
     decorated = json.loads(result.stdout.strip().splitlines()[-1])[0]

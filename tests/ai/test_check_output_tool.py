@@ -25,6 +25,7 @@ from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, Run
 from tests.ai.conftest import FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.waiting import GUARD_SECONDS
 
 
 def _operation() -> Any:
@@ -368,7 +369,8 @@ class TestWaiting:
         止まり続け、道具が返らない（#405 で 600 秒返らなかった道の 1 つ）
 
         本物の係（:class:`CheckJob`）の待つ関数を使い、別のスレッドに鍵を持たせて
-        順番を決め打ちにする 待つ秒（0.5）で途中までの結果が返ればよい
+        順番を決め打ちにする 鍵は片付けまで放さない その間に途中までの結果が返ればよい
+        かかった秒では見ない 遅い機械では、返るのが速くても試験の側が止まって秒が伸びる
         """
         _operation()(host, {"wait_seconds": 0})
         request = host.check_requests[-1]
@@ -383,23 +385,24 @@ class TestWaiting:
         def hold() -> None:
             with progress.lock:
                 taken.set()
-                release.wait(60.0)
+                release.wait(GUARD_SECONDS)
 
         holder = threading.Thread(target=hold, daemon=True)
         holder.start()
         try:
-            assert taken.wait(10.0)
+            assert taken.wait(GUARD_SECONDS)
             bridge = allow_sending(EditorBridge(host))
             done, box = call_in_thread(bridge, _operation(), {"wait_seconds": 0.5})
-            # 鍵が放されるまで（60 秒）は待たないこと 上限は遅い機械でも揺れない広さにする
-            pump_until(bridge, done, timeout=30.0)
+            pump_until(bridge, done, timeout=GUARD_SECONDS)
             assert done.is_set(), "鍵を持たれている間、道具が返らなかった"
+            # 返ったのは鍵が放される前（鍵を持つスレッドはまだ持っている）
+            assert holder.is_alive()
             result = box["result"]
             assert isinstance(result, dict)
             assert result["complete"] is False
         finally:
             release.set()
-            holder.join(10.0)
+            holder.join(GUARD_SECONDS)
 
     def test_a_check_that_ends_while_waiting_returns_through_the_bridge(
         self, host: FakeHost, monkeypatch: pytest.MonkeyPatch

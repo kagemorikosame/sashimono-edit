@@ -26,6 +26,7 @@ from sashimono.engine.subject import SUBJECT_BINS, SUBJECT_SECONDS, SubjectTrack
 from sashimono.engine.vision import Box, Face, ScreenKind, ScreenReport, ScreenSample
 from tests.ai.conftest import RATE_30, FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.waiting import GUARD_SECONDS
 
 
 def _operation() -> Operation:
@@ -114,10 +115,11 @@ class TestTheAnalysis:
         host.scene_ready = finished
         # 確かめの窓は別の試験（test_bridge.py）が見る ここは待った後の続きだけを見る
         bridge = allow_sending(EditorBridge(host, auto_approve=True))
-        began = time.monotonic()
-        done, box = call_in_thread(bridge, REFRAME, {"wait_seconds": 5})
-        pump_until(bridge, done)
-        assert time.monotonic() - began < 5.0
+        done, box = call_in_thread(bridge, REFRAME, {"wait_seconds": 120})
+        pump_until(bridge, done, timeout=GUARD_SECONDS)
+        # 用意ができた 1 回目の待ちで抜けたこと（待つ上限の 120 秒まで待ち続けていない）
+        # かかった秒では見ない 遅い機械では、抜けるのが速くても試験の側が止まって秒が伸びる
+        assert len(host.scene_waits) == 1
         result = box["result"]
         assert isinstance(result, dict), result
         assert result["changed"] is True
