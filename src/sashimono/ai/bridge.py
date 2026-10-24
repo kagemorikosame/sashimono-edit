@@ -57,6 +57,7 @@ from sashimono.ai.outbound import (
 )
 from sashimono.ai.plan import WorkPlan, plan_for
 from sashimono.ai.safety import Consent
+from sashimono.core.commands.history import REPLACED_REFUSAL
 
 __all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
 
@@ -279,8 +280,11 @@ class EditorBridge:
         # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを
         # 尋ねると、人が答えた後で断るだけになる 量の上限の後にするのは、量の上限で止めたときは
         # 「道具を使わずに終える」と返す方が、上限の種類にかかわらず AI の次の手が決まるため
-        if operation.writes and not operation.irreversible:
+        if operation.writes and (not operation.irreversible or operation.edits):
+            # 取り消せない操作でも作品を変える物（Operation.edits ナレーション #335）は断る
             self._refuse_after_fix_limit(operation)
+        if operation.edits:
+            self._refuse_after_reopen(operation)
         self._agree_to_send(operation)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -337,7 +341,8 @@ class EditorBridge:
         出す前に断る
         出してから断ると、人が許したのに何も起きない 作品を変えない道具（取り消し・やり直し・
         書き出しの中止 :data:`~sashimono.ai.fixes.PASSES_AFTER_LIMIT`）は通す 保存と書き出しと
-        開く・新規（#349）は取り消せない操作の道を通るので、ここへは来ない
+        開く・新規（#349）は取り消せない操作の道を通るので、ここへは来ない 取り消せない操作でも
+        作品を変える物（:attr:`Operation.edits` ナレーション #335）はここへ来て断られる
         """
         if operation.name in PASSES_AFTER_LIMIT:
             return
@@ -347,6 +352,16 @@ class EditorBridge:
                 "編集しません 直した所と、残った問題（何が・どこに・なぜ直せなかったか）を"
                 "ユーザーに伝えて終えてください 続けるかはユーザーが次の指示で決めます"
             )
+
+    def _refuse_after_reopen(self, operation: Operation) -> None:
+        """この指示の中で作品を開き直した後は、ファイルを書いてから作品を変える道具を断る
+
+        開く・新規（#349）の後の AI の編集は文書（``Document.replaced_in_checkpoint``）が断るが、
+        ナレーション（:attr:`Operation.edits` #335）は確かめの窓を出して WAV を書いてから置くので、
+        置く所で断られると、開き直した作品のフォルダに誰も置かない WAV が残る 窓を出す前に断る
+        """
+        if self.call(lambda: self._host.document.replaced_in_checkpoint):
+            raise ToolError(f"{operation.name}: {REPLACED_REFUSAL}")
 
     def _wait(self, pending: Pending) -> None:
         """用意できるか、上限の秒が過ぎるか、中断されるまで待つ
@@ -359,6 +374,10 @@ class EditorBridge:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or pending.wait(min(WAIT_SLICE, remaining)):
                 return
+        # 中断された この後 ``then`` は呼ばれない（:meth:`call` が断る） 道具だけが使う裏の仕事は
+        # ここで止める 止めないと、ナレーションの残りの文をエンジンへ頼み続ける（#335）
+        if pending.stop is not None:
+            pending.stop()
 
     def _run_irreversible(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """取り消せない操作 「変更を自動で承認」も「以降は確認しない」も見ずに、毎回確かめる
@@ -401,6 +420,8 @@ class EditorBridge:
                         f"今の場所: {again.target}）"
                     )
                 elif isinstance(again, Consent):
+                    # この文は AI へ返る 箱にだけ出す本人の文（Consent.private ナレーションの
+                    # 台本 #335）は載せない 載せると、字幕と文字を送らない人の文まで送る
                     what = f"中身が変わりました（許した時: {consent.detail} 今: {again.detail}）"
                 else:
                     what = "中身が変わりました"

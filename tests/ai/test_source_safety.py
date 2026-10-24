@@ -18,6 +18,8 @@
 - 2026-10-17 に保存した見た目と棚を当てる・置く道具を足した（#328） プリセットとエイリアスの
   置き場・棚・``.exo`` は読むだけで、置き場の保存・名前の変更・削除の道具は無い
   （2026-10-17 本人の決定 AI は読むだけ）
+- 2026-10-20 にナレーションの道具を足した（#335） 書くのは作品のフォルダの narration の
+  新しい名前の WAV だけで、取り消せない操作として毎回確かめる 前に作った WAV も素材も書き換えない
 - 2026-10-20 に画面の操作と同じ道具を足した（#349） 消す物が増えた どれも画面の同じ操作と
   同じ命令で、プロジェクトの中だけを変え、取り消し 1 回で戻る ファイルには触らない
   - クリップの中の物 エフェクト（最初から持つ欄は外せない）・キーフレーム
@@ -48,6 +50,7 @@ import pytest
 import sashimono.ai.bridge
 import sashimono.ai.operations
 import sashimono.ai.safety
+import sashimono.ui.main_window
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.ai.safety import Safety
@@ -172,7 +175,15 @@ UNDOABLE_TOOLS = frozenset(
 #: test_save_and_export.py）で押さえる 足すときは、書く場所を pinned_place か書き出しの
 #: 片付け（ui/ai_export.py）に通してからここへ足す
 FILE_WRITING_TOOLS = frozenset(
-    {"save_project", "save_project_as", "export_video", "export_subtitles", "save_snapshot"}
+    {
+        "save_project",
+        "save_project_as",
+        "export_video",
+        "export_subtitles",
+        "save_snapshot",
+        # ナレーション（#335） 作品のフォルダの narration へ新しい名前の WAV を書く
+        "generate_narration",
+    }
 )
 
 #: 今の作品を閉じて差し替える道具（#349 開く・新規） ファイルは書かず読むだけだが、
@@ -187,6 +198,18 @@ _HOST_WRITERS = {
     "_export_video": {"start_export"},
     "_export_subtitles": {"write_subtitles"},
     "_save_snapshot": {"write_snapshot"},
+    # ナレーション（#335） 声を作り終えてから書く所 AI の道具と人の窓が同じ関数を通る
+    "write_and_place_narration": {"make_narration_folder", "write_narration"},
+}
+#: 上のうち、道具の本体（Operation.approved）ではなく、本体と人の窓が分け合う書く所
+#: 値は呼んでよい道具の本体と、人の窓の関数（どちらも許した中身を渡す）
+_SHARED_WRITERS = {
+    "write_and_place_narration": (
+        # AI の道具 声を待った後の続き（本体の中の関数）から呼ぶ
+        frozenset({"_generate_narration", "_place_when_made"}),
+        # 人の窓〔ナレーションを作る…〕 窓の OK で採った確かめの中身を渡す
+        frozenset({"_check_narration"}),
+    ),
 }
 
 #: 道具のコードが呼んではいけない、ファイルを書く・消す・動かす呼び出し
@@ -259,6 +282,16 @@ def _called_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _callers(tree: ast.Module, name: str) -> set[str]:
+    """``name`` を呼ぶ関数の名前（入れ子の関数は、外の関数と自分の両方で数える）"""
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and name in _called_names(ast.Module(body=node.body, type_ignores=[]))
+    }
+
+
 class TestCounted:
     def test_the_tools_that_change_things_are_the_ones_counted(self) -> None:
         # 壊れると、確かめていない変える道具が増え、元の素材やファイルに触るかを誰も見ていない
@@ -291,7 +324,16 @@ class TestCounted:
             if operation.name in FILE_WRITING_TOOLS:
                 assert operation.approved is not None, operation.name
                 handlers[operation.name] = operation.approved.__name__
-        assert set(handlers.values()) == set(_HOST_WRITERS)
+        bodies = {name for tools, _window in _SHARED_WRITERS.values() for name in tools}
+        assert set(handlers.values()) == (set(_HOST_WRITERS) - set(_SHARED_WRITERS)) | (
+            bodies & set(handlers.values())
+        )
+        # 分け合う書く所を呼ぶのは、決めた道具の本体（と本体の中の続き）と人の窓だけ
+        # ほかから呼ぶと、確かめを通らずに作品のフォルダへ書ける
+        for shared, (tools, window) in _SHARED_WRITERS.items():
+            assert _callers(tree, shared) == tools
+            assert _callers(_source(sashimono.ui.main_window), shared) == window
+            assert tools & set(handlers.values())
         # 本体の中で書く先の身元を採り直さない（確かめの中身の身元で照らす）
         tree = _source(sashimono.ai.operations)
         for node in ast.walk(tree):

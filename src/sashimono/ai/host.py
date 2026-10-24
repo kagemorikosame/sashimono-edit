@@ -31,6 +31,7 @@ from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
 from sashimono.core.timebase import FrameRate
+from sashimono.engine.audio.voicevox import NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.cache.thumbnails import Filmstrip
@@ -498,6 +499,15 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def narration_settings(self) -> NarrationSettings:
+        """ナレーションの生成（#335）の本人の設定（エンジンの場所・既定の声・速さ・音量・
+        AI が声を選んでよいか :attr:`~sashimono.ui.workspace.Preferences.narration_settings`）
+
+        どのエンジンをどこで動かすか・どの声が好きかは人と機械で違う 読むだけ
+        """
+        ...
+
+    @property
     def reframe_style(self) -> ReframeStyle:
         """縦動画への作り替え（#334）の既定の大きさ・枠の動かし方・ならす長さ
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.reframe_style`）
@@ -656,6 +666,25 @@ class EditorHost(Protocol):
 
         描いたフレームを返す（終わりを指していれば最後のフレーム） ``path`` は確かめ済みの場所
         書けなければ :class:`ToolError`
+        """
+        ...
+
+    def make_narration_folder(self) -> Path:
+        """作品のフォルダの下の ``narration`` を用意して返す（#335） 有ればそのまま返す
+
+        作るのは決まった名前の 1 つだけ（2026-10-20 利用者の決定 WAV は作品のフォルダの
+        ``narration\\`` へ書く） AI が名前を選べるフォルダを作る口にしない 作品をまだ保存して
+        いない・同じ名前のファイルがあるなど作れなければ :class:`ToolError`
+        書く場所の確かめは呼んだ側が :func:`~sashimono.ai.safety.pinned_place` で行う
+        """
+        ...
+
+    def write_narration(self, path: Path, data: bytes, *, expect: Expected) -> None:
+        """作ったナレーションの WAV を ``path`` へ書く（#335） 書いてから名前を付ける書き方で置く
+
+        ``path`` は確かめ済みの場所（:func:`~sashimono.ai.safety.pinned_place` の中で呼ぶ）
+        ``expect`` は許したときの身元 新しい名前に書くので、その間に同じ名前が現れていれば
+        置かずに断る 書けなければ :class:`ToolError`
         """
         ...
 

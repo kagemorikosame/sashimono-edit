@@ -131,6 +131,10 @@ class Project:
     #: 編集の方針（#343） 作品の見た目そのものの決まりなので、本人の好み（``Preferences``）
     #: ではなく作品に付ける 同じ作品を別の機械で開いても、AI が同じ方針で編集する
     style_guide: StyleGuide = field(default_factory=StyleGuide)
+    #: 書き出した動画に添える表記（「VOICEVOX:ずんだもん」など #335） 作った声の規約が
+    #: 求める物で、書き出しのときに知らせる 作品に付けるのは、別の機械で開いて書き出しても
+    #: 知らせ漏らさないため 足すのはナレーションを作る道具だけで、取り消し 1 回で戻る
+    credits: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.timeline.rate != self.settings.frame_rate:

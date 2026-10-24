@@ -15,7 +15,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
+import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -139,6 +142,7 @@ from sashimono.core.commands import (
     DEFAULT_GENERATED_FRAMES,
     MARKER_LABEL_LIMIT,
     AddClip,
+    AddCredits,
     AddEffect,
     AddMarkers,
     AddScene,
@@ -213,6 +217,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.convert import convert_layers, switch_layer_mode
 from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION, STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
+from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
@@ -277,6 +282,7 @@ from sashimono.core.model import (
     Track,
     TrackId,
     TrackKind,
+    Transcript,
     TranscriptSegment,
     heard_stream,
 )
@@ -364,6 +370,24 @@ from sashimono.engine.audio.speech import (
     speaks,
     voice_speech,
 )
+from sashimono.engine.audio.voicevox import (
+    INTONATION_PERCENT_RANGE,
+    NARRATION_FOLDER,
+    PITCH_RANGE,
+    TEXT_LIMIT,
+    VOLUME_PERCENT_RANGE,
+    Catalog,
+    EngineError,
+    NarrationSettings,
+    Speaker,
+    Spoken,
+    Style,
+    Tuning,
+    VoiceEngine,
+    split_script,
+    wav_seconds,
+)
+from sashimono.engine.audio.voicevox import SPEED_PERCENT_RANGE as VOICE_SPEED_RANGE
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState, ScreenState
@@ -425,20 +449,30 @@ from sashimono.engine.reframe import (
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
+#: 声を作る裏のスレッドの思っていない失敗を残す記録（#335）
+_LOG = logging.getLogger(__name__)
+
 __all__ = [
     "ASK_USER",
     "MAX_WAIT_SECONDS",
+    "NARRATION_MODEL",
     "OPERATIONS",
     "Choice",
     "Continue",
     "ImageResult",
+    "NarrationJob",
+    "NarrationPlan",
     "Operation",
     "Pending",
     "QuestionSpec",
     "custom_object_key",
     "find_operation",
     "finish",
+    "narration_consent",
+    "narration_plan",
     "question_spec",
+    "remember_voice_catalog",
+    "write_and_place_narration",
 ]
 
 #: プレビュー画像の既定の横幅 小さめにしてあるのは、AI が見るのは
@@ -540,6 +574,10 @@ class Operation:
     #: 頼らず、長さに関係なく値ごと伏せる 表だけだと 1 文字の名前や、表に入る前の名前が漏れる
     #: トラック・シーン・エフェクトの名前は作品の中身の名前で、ここには書かない
     name_keys: frozenset[str] = field(default=frozenset(), kw_only=True)
+    #: 取り消せない操作のうち、作品も変える物（ナレーション #335 は WAV を書き、声を置く）
+    #: 検査の直しの回数の上限（#339）の後は、取り消せる編集と同じく断る 書かないと、保存や
+    #: 書き出しと同じ扱いで上限の後も通り、「これ以上は編集しません」の後に声が置かれる
+    edits: bool = field(default=False, kw_only=True)
     #: 絵（``sends`` の :attr:`Outbound.FRAMES`）を AI への結果ではなくアプリの外（OS の
     #: クリップボード）へ出す道具か（``copy_snapshot`` #349） 同意は絵と同じく取るが、AI には
     #: 絵を返さないので、使う量の上限（#344）の送った絵には数えず、絵の上限でも止めない
@@ -1031,6 +1069,8 @@ def _get_project(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 編集の方針（#343）を決めてあるか 中身は本人の文なので get_style_guide で読む
         # （字幕と文字として同意を取る） ここで有る無しだけを返し、読み忘れを防ぐ
         "has_style_guide": not project.style_guide.empty,
+        # 作った声の表記（#335） 書き出した動画の概要欄などに入れてもらう物
+        "credits": list(project.credits),
         # 開いているタイムラインの書き出し範囲（ワークエリア #352） 人は目盛りの帯で見ている
         # 読めないと、export_video の range を省いたときにどこが書き出されるのか AI に分からない
         "work_area": _work_area(project),
@@ -2584,6 +2624,11 @@ class Pending:
     wait: Callable[[float], bool]
     seconds: float
     then: Callable[[], object]
+    #: 中断されたときに裏の仕事を止める口 どのスレッドから呼んでもよい 省くと止めない
+    #: 中断すると ``then`` は呼ばれない 道具だけが使う仕事（ナレーションの声 #335）はこれを渡す
+    #: 渡さないと、待つのをやめた後も裏のスレッドが残りをエンジンへ頼み続ける 結果を後でも
+    #: 使う仕事（場面の解析・検査）と、人が許した書き出しは渡さない（docs/development.md）
+    stop: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -7918,6 +7963,562 @@ def _save_snapshot(host: EditorHost, arguments: dict[str, Any], consent: Consent
     return {"saved": str(path), "frame": drawn, **_kept(consent)}
 
 
+# --- ナレーション（#335） ---
+#
+# 2026-10-20 に利用者が決めたこと（#335 の「決めたこと」）
+# - 声は本人が入れて起動した VOICEVOX 互換のエンジン（VOICEVOX・AivisSpeech）に作らせる
+#   部品は同梱せず、呼ぶのは自分の機械の中の HTTP だけ（engine/audio/voicevox.py）
+# - WAV は作品のフォルダの narration\ へ書く 保存していない作品では断り、保存を案内する
+# - 書く・読み込む・置くを 1 段にまとめ、取り消し 1 回で戻す（書いた WAV は消さない #341）
+# - 使った声の表記（クレジット）を作品に覚え、書き出しのときに知らせる
+# エンジンとの話は AI のスレッドで待つ（Pending） 編集画面のスレッドで待つと、声を作る
+# 数秒〜数十秒の間、画面が固まる
+
+#: 書く WAV の名前の頭 後ろに 3 桁の番号を付け、空いている一番小さい番号を使う
+#: 台本の文を名前に入れない 名前は結果と伏せ字の表を通って外へ出るので、本人の文が
+#: 名前と場所として送られてしまう
+NARRATION_PREFIX = "narration_"
+#: 台本から付けた字幕の印（Transcript.model） 起こした字幕と見分ける
+NARRATION_MODEL = "narration-script"
+#: 番号の上限 1 つの作品でこれを超えて作ることは無い 超えたら断り、フォルダを片付けてもらう
+MAX_NARRATION_FILES = 999
+#: 声の一覧を待つ秒 自分の機械の中なので、動いていればすぐ返る
+VOICE_LIST_WAIT = 15.0
+#: 声を作り終えるのを待つ上限（秒） 遅い機械の CPU で上限の長さの台本を作る時間より長く取る
+NARRATION_WAIT = 300.0
+
+#: エンジンの場所ごとの、list_voices で読んだ声の一覧 確かめの窓に声の名前と表記を出すのに使う
+#: 確かめの中身は編集画面のスレッドで作るので、そこでエンジンへつながない（動いていない
+#: エンジンへつなぐと、Windows では断られるまで 2 秒ほど画面が止まる）
+_VOICE_CATALOGS: dict[str, Catalog] = {}
+_CATALOG_LOCK = threading.Lock()
+
+
+def remember_voice_catalog(catalog: Catalog) -> None:
+    """読んだ声の一覧を控える list_voices と人の窓（〔ナレーションを作る…〕）が読んだ物"""
+    with _CATALOG_LOCK:
+        _VOICE_CATALOGS[catalog.url] = catalog
+
+
+def _known_catalog(url: str) -> Catalog | None:
+    with _CATALOG_LOCK:
+        return _VOICE_CATALOGS.get(url)
+
+
+class _Job[T]:
+    """エンジンとの話を裏のスレッドで進める 待つのは AI のスレッド（:class:`Pending`）
+
+    ``deadline`` を過ぎたら、塊の間で止まる 待つのをやめた道具（時間切れ・中断）の後で、
+    エンジンを使い続けない
+    """
+
+    def __init__(self, work: Callable[[Callable[[], bool]], T], seconds: float) -> None:
+        self._done = threading.Event()
+        self._result: T | None = None
+        self._error: EngineError | None = None
+        self._deadline = time.monotonic() + seconds + 5.0
+        self._abandoned = threading.Event()
+        thread = threading.Thread(
+            target=self._run, args=(work,), name="sashimono-narration", daemon=True
+        )
+        thread.start()
+
+    def _stopped(self) -> bool:
+        return self._abandoned.is_set() or time.monotonic() > self._deadline
+
+    def _run(self, work: Callable[[Callable[[], bool]], T]) -> None:
+        try:
+            self._result = work(self._stopped)
+        except EngineError as exc:
+            self._error = exc
+        except Exception:
+            # 思っていない失敗（エンジンの壊れた返事を読む所の例外など）も、断りの文として返す
+            # 拾わないと終わった印だけが立ち、take が結果の無いまま AssertionError を出して、
+            # AI には訳の分からない失敗、人の窓では「作っています」のまま止まって見える
+            # 中身は記録に残し、画面と AI へは決まった文だけを出す（台本の文を混ぜない）
+            _LOG.exception("ナレーションの声を作る途中で思っていない失敗が起きた")
+            self._error = EngineError(
+                "声を作る途中で思っていない失敗が起きました 何も書いていません"
+                " エンジンを起動し直してから、もう 1 度頼んでください（詳しくはアプリの記録）"
+            )
+        finally:
+            self._done.set()
+
+    def wait(self, seconds: float) -> bool:
+        return self._done.wait(seconds)
+
+    def abandon(self) -> None:
+        """待つのをやめる 裏のスレッドは次の塊の前で止まる（結果は誰も取らない）"""
+        self._abandoned.set()
+
+    def take(self, what: str) -> T:
+        """終わっていれば結果を返す 終わっていなければ止めて断る"""
+        if not self._done.is_set():
+            self._abandoned.set()
+            raise ToolError(f"{what}が時間内に終わりませんでした 何も書いていません")
+        if self._error is not None:
+            raise ToolError(str(self._error))
+        assert self._result is not None
+        return self._result
+
+
+def _voice_engine(settings: NarrationSettings) -> VoiceEngine:
+    try:
+        return VoiceEngine(settings.url)
+    except EngineError as exc:
+        raise ToolError(f"{exc}（表示 → 設定… の「ナレーション: エンジンの場所」）") from exc
+
+
+def _voice_label(speaker: Speaker, style: Style) -> str:
+    return f"{speaker.name}（{style.name}）"
+
+
+def _list_voices(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """エンジンの声の一覧を読む 声の規約は、頼んだ声か既定の声の 1 つだけ読む
+
+    全部の声の規約を読むと、声の数だけエンジンへ頼み、返事も道具の結果の上限を越える
+    """
+    settings = host.narration_settings
+    engine = _voice_engine(settings)
+    wanted = arguments.get("voice_id")
+    if wanted is not None and (isinstance(wanted, bool) or not isinstance(wanted, int)):
+        raise ToolError("voice_id は声の ID（整数）で渡してください")
+    terms_for = settings.voice if wanted is None else wanted
+
+    def work(stopped: Callable[[], bool]) -> tuple[Catalog, str]:
+        del stopped
+        catalog = engine.catalog()
+        found = catalog.find(terms_for)
+        policy = ""
+        if found is not None:
+            try:
+                policy = engine.policy(found[0])
+            except EngineError:
+                # 規約が読めなくても一覧は返す 規約はエンジンのアプリでも読める
+                policy = ""
+        return catalog, policy
+
+    job = _Job(work, VOICE_LIST_WAIT)
+
+    def then() -> object:
+        catalog, policy = job.take("エンジンの声の一覧を読むの")
+        remember_voice_catalog(catalog)
+        return _voices_result(settings, catalog, policy, terms_for, arguments)
+
+    # 中断されたら声の一覧を読むのもやめる（結果は then でしか使わない）
+    return Pending(wait=job.wait, seconds=VOICE_LIST_WAIT, then=then, stop=job.abandon)
+
+
+def _voices_result(
+    settings: NarrationSettings,
+    catalog: Catalog,
+    policy: str,
+    terms_for: int,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    rows = [
+        {
+            "speaker": speaker.name,
+            "credit": catalog.credit(speaker),
+            "styles": [{"voice_id": style.id, "name": style.name} for style in speaker.styles],
+        }
+        for speaker in catalog.speakers
+    ]
+    default = catalog.find(settings.voice)
+    found = catalog.find(terms_for)
+    common: dict[str, Any] = {
+        "engine": catalog.engine_name or catalog.brand,
+        "url": catalog.url,
+        "default_voice_id": default[1].id if default is not None else None,
+        "default_voice": _voice_label(*default) if default is not None else None,
+        "ai_may_choose_voice": settings.ai_picks_voice,
+        "terms_voice": _voice_label(*found) if found is not None else None,
+        # エンジンが返した声の規約の文 アプリは中身を判断しない（読むのは本人） 企業での
+        # 利用や非商用だけの声があるので、使う前にユーザーへ伝える
+        "terms": policy,
+    }
+    notes: list[str] = []
+    if default is None:
+        notes.append(
+            f"本人の設定の既定の声（ID {settings.voice}）がこのエンジンの一覧にありません"
+            " 表示 → 設定… で選び直してもらうか、voice_id を渡してください"
+        )
+    if found is None and terms_for != settings.voice:
+        notes.append(f"voice_id {terms_for} はこのエンジンの一覧にありません")
+    if not settings.ai_picks_voice:
+        notes.append("本人の設定で、AI は既定の声だけを使います（voice_id を渡すと断ります）")
+    if notes:
+        common["notes"] = notes
+    page = {**common, **_paged(rows, arguments, name="voices")}
+    while len(json_text(page)) > MAX_RESULT_CHARS and page["count"] > 1:
+        smaller = {**arguments, "limit": max(1, page["count"] * 3 // 4)}
+        page = {**common, **_paged(rows, smaller, name="voices")}
+    return page
+
+
+@dataclass(frozen=True, slots=True)
+class NarrationPlan:
+    """確かめに出す中身と、作って置くのに要る物 引数と作品から決まり、エンジンへはつながない
+
+    AI の道具（generate_narration）と人の窓（〔字幕〕→〔ナレーションを作る…〕）が同じ物を使う
+    """
+
+    text: str
+    settings: NarrationSettings
+    speaker: Speaker
+    style: Style
+    credit: str
+    tuning: Tuning
+    at_frame: int
+    track: TrackId | None
+    #: 台本から字幕を付けるか（本人の設定 人の窓ではその 1 回だけ変えられる）
+    subtitles: bool
+    path: Path
+    detail: str
+    #: 確かめの箱にだけ出す台本（:attr:`Consent.private` AI へ返る文に載せない）
+    private: str
+    #: 頼んだときの作品（:attr:`Document.generation`）と開いていたシーン 声を作る間に変われば
+    #: 書かずに断る（:func:`write_and_place_narration`）
+    generation: int = 0
+    scene: SceneId | None = None
+
+
+def _narration_text(arguments: dict[str, Any]) -> str:
+    raw = arguments.get("text")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("text（読ませる台本の文）を渡してください")
+    text = raw.strip()
+    if len(text) > TEXT_LIMIT:
+        # 文の中身は断りの文に入れない（外へ返るので、本人の文を送ることになる）
+        raise ToolError(
+            f"text が長すぎます（{len(text)} 文字 1 回に {TEXT_LIMIT} 文字まで）"
+            " 場面ごとに分けて、何回かに分けて頼んでください"
+        )
+    if not split_script(text):
+        raise ToolError("text に読める文がありません")
+    return text
+
+
+def _narration_voice(
+    arguments: dict[str, Any], settings: NarrationSettings, catalog: Catalog, *, person: bool
+) -> tuple[Speaker, Style]:
+    """声を決める 人が窓で選んだ声は「AI が声を選んでよいか」の設定に掛からない"""
+    raw = arguments.get("voice_id")
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int) or raw < 0):
+        raise ToolError(
+            "voice_id は声の ID（0 以上の整数 list_voices の voice_id）で渡してください"
+        )
+    default = catalog.find(settings.voice)
+    chosen_elsewhere = raw is not None and (default is None or raw != default[1].id)
+    if chosen_elsewhere and not person and not settings.ai_picks_voice:
+        raise ToolError(
+            "本人の設定で、AI は既定の声だけを使います voice_id を省いてください"
+            "（声を変えるなら、本人に 表示 → 設定… で既定の声を選んでもらいます）"
+        )
+    found = catalog.find(raw) if raw is not None else default
+    if found is None:
+        if raw is None:
+            raise ToolError(
+                f"本人の設定の既定の声（ID {settings.voice}）がエンジンの一覧にありません"
+                " list_voices の voice_id を渡すか、本人に 表示 → 設定… で"
+                "選び直してもらってください"
+            )
+        raise ToolError(
+            f"voice_id {raw} はエンジンの一覧にありません（list_voices で確かめてください）"
+        )
+    return found
+
+
+def _narration_track(project: Project, arguments: dict[str, Any]) -> TrackId | None:
+    raw = arguments.get("track_id")
+    if raw is None:
+        return None
+    track = next((t for t in project.timeline.tracks if str(t.id) == str(raw)), None)
+    if track is None or track.kind is TrackKind.VIDEO:
+        raise ToolError("track_id は音声トラックか混合トラックを指してください（list_tracks）")
+    return track.id
+
+
+def _narration_file(host: EditorHost, project_path: Path) -> tuple[Path, bool]:
+    """書く WAV の場所と、narration フォルダをこれから作るか
+
+    名前は空いている一番小さい番号 同じ名前の物を置き換えない（前に作った声を潰さない）
+    フォルダがまだ無ければ、フォルダの場所そのものを書ける場所の決まりに通す
+    （作品のフォルダの中か・リンクで外へ出ないか）
+    """
+    folder = project_path.parent / NARRATION_FOLDER
+    if folder.exists() and not folder.is_dir():
+        raise ToolError(
+            f"作品のフォルダに {NARRATION_FOLDER} という名前のファイルがあるので、"
+            "ナレーションを書くフォルダを作れません 名前を変えるか動かしてもらってください"
+        )
+    making = not folder.exists()
+    if making:
+        resolved = _write_target(host, str(folder))
+        return resolved / f"{NARRATION_PREFIX}001.wav", True
+    for number in range(1, MAX_NARRATION_FILES + 1):
+        candidate = folder / f"{NARRATION_PREFIX}{number:03d}.wav"
+        if not candidate.exists():
+            return _write_target(host, str(candidate)), False
+    raise ToolError(
+        f"{folder} に WAV が {MAX_NARRATION_FILES} 本あり、新しい名前を付けられません"
+        " 使わない物を片付けてもらってください"
+    )
+
+
+def narration_plan(
+    host: EditorHost, arguments: dict[str, Any], *, person: bool = False
+) -> NarrationPlan:
+    """台本・声・置く所・書く場所を確かめる エンジンへはつながない（声の一覧は控えから）
+
+    ``person`` は人の窓から頼んだか 人は自分で声を選ぶので、AI に声を選ばせない設定に掛けない
+    字幕の有る無しは、人の窓だけが ``subtitles`` で 1 回ごとに変えられる（AI は本人の設定に従う
+    2026-10-20 利用者の決定）
+    """
+    text = _narration_text(arguments)
+    project_path = host.project_path
+    if project_path is None:
+        raise ToolError(
+            "作品をまだ保存していないので、ナレーションの WAV を書く場所（作品のフォルダの"
+            f" {NARRATION_FOLDER}）がありません save_project_as で保存するか、人に"
+            "〔名前を付けて保存〕で保存してもらってから、もう 1 度頼んでください"
+        )
+    settings = host.narration_settings
+    engine = _voice_engine(settings)
+    catalog = _known_catalog(engine.url)
+    if catalog is None:
+        raise ToolError(
+            "先に list_voices を呼んで、エンジンが動いていることと声の一覧・規約を確かめて"
+            "ください（声の名前と表記を確かめの窓に出すのに使います）"
+        )
+    speaker, style = _narration_voice(arguments, settings, catalog, person=person)
+    tuning = Tuning(
+        speed_percent=_whole_within(
+            arguments, "speed_percent", settings.speed_percent, VOICE_SPEED_RANGE
+        ),
+        volume_percent=_whole_within(
+            arguments, "volume_percent", settings.volume_percent, VOLUME_PERCENT_RANGE
+        ),
+        pitch=_whole_within(arguments, "pitch", 0, PITCH_RANGE),
+        intonation_percent=_whole_within(
+            arguments, "intonation_percent", 100, INTONATION_PERCENT_RANGE
+        ),
+    )
+    subtitles = settings.subtitles
+    if person and "subtitles" in arguments:
+        subtitles = _flag_argument(arguments, "subtitles", subtitles)
+    project = _project(host)
+    at = _frame_argument(arguments, "at_frame", host.playhead)
+    if at < 0:
+        raise ToolError("at_frame は 0 以上です")
+    track = _narration_track(project, arguments)
+    path, making = _narration_file(host, project_path)
+    credit = catalog.credit(speaker)
+    parts = [
+        f"声: {_voice_label(speaker, style)}"
+        f"（{catalog.engine_name or catalog.brand} {catalog.url}）",
+        f"速さ {tuning.speed_percent}% / 音量 {tuning.volume_percent}%"
+        f" / 高さ {tuning.pitch} / 抑揚 {tuning.intonation_percent}%",
+        f"置く所: {format_timecode(at, project.rate)}（{at} フレーム）から"
+        + (f" トラック {track}" if track is not None else " 空いた音声トラック"),
+        "字幕: 台本から文ごとに付けます" if subtitles else "字幕: 付けません",
+        f"表記: {credit}（作品に覚え、書き出しのときに知らせます 声ごとの規約は list_voices と"
+        "エンジンのアプリで確かめてください）",
+        f"作品のフォルダに {NARRATION_FOLDER} フォルダを作ります" if making else "",
+    ]
+    _refuse_elsewhere()
+    return NarrationPlan(
+        text=text,
+        settings=settings,
+        speaker=speaker,
+        style=style,
+        credit=credit,
+        tuning=tuning,
+        at_frame=at,
+        track=track,
+        subtitles=subtitles,
+        path=path,
+        detail="\n".join(part for part in parts if part),
+        # 台本は確かめの箱にだけ出す detail に入れると、許した後に中身が変わったときの断りの文
+        # を通って AI へ返る（字幕と文字を送らないと決めた人の所でも）
+        private=(
+            f"読ませる文（{len(text)} 文字 この文は自分の機械の中のエンジンへだけ渡します）:"
+            f"\n{text}"
+        ),
+        generation=host.document.generation,
+        scene=host.active_scene,
+    )
+
+
+def narration_consent(
+    host: EditorHost, arguments: dict[str, Any], *, person: bool = False
+) -> Consent:
+    """確かめに出す中身 人の窓では窓の OK が確かめに当たり、ここで書く先の身元を採る"""
+    plan = narration_plan(host, arguments, person=person)
+    return Consent(
+        action="ナレーションの声を作り、WAV を書いてタイムラインに置きます",
+        target=str(plan.path),
+        detail=plan.detail,
+        basis=expect_now(plan.path),
+        private=plan.private,
+    )
+
+
+def _narration_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    return narration_consent(host, arguments)
+
+
+class NarrationJob:
+    """裏で声を作る 1 回 AI は :class:`Pending` で、人の窓はタイマーで終わりを待つ"""
+
+    def __init__(self, plan: NarrationPlan, seconds: float = NARRATION_WAIT) -> None:
+        engine = _voice_engine(plan.settings)
+
+        def work(stopped: Callable[[], bool]) -> Spoken:
+            return engine.synthesize(plan.text, plan.style.id, plan.tuning, stopped=stopped)
+
+        self.plan = plan
+        self._job = _Job(work, seconds)
+
+    def wait(self, seconds: float) -> bool:
+        """終わるまで最長で引数の秒だけ待つ 終わっていれば真"""
+        return self._job.wait(seconds)
+
+    def abandon(self) -> None:
+        """作るのをやめる 窓を閉じるときなど エンジンには次の文から頼まない"""
+        self._job.abandon()
+
+    def take(self) -> Spoken:
+        """作った声 終わっていなければ止めて断り、エンジンの失敗は理由を書いて断る"""
+        return self._job.take("声を作るの")
+
+
+def _generate_narration(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    if host.document.replaced_in_checkpoint:
+        # 確かめの窓が出ている間に作品を開き直した 声を作る前に断る（作ってから断ると無駄に待つ）
+        raise ToolError(f"generate_narration: {REPLACED_REFUSAL}")
+    plan = narration_plan(host, arguments)
+    job = NarrationJob(plan)
+
+    def _place_when_made() -> object:
+        # 待った後の続き 書く先は人が許した確かめの場所（consent.target）で、作り直さない
+        return write_and_place_narration(host, plan, consent, job.take(), host.apply_commands)
+
+    # 中断されたら残りの文をエンジンへ頼まない 作った声は then でしか使わない
+    return Pending(wait=job.wait, seconds=NARRATION_WAIT, then=_place_when_made, stop=job.abandon)
+
+
+def write_and_place_narration(
+    host: EditorHost,
+    plan: NarrationPlan,
+    consent: Consent,
+    spoken: Spoken,
+    apply: Callable[[list[Command], str], None],
+) -> dict[str, object]:
+    """作った声を書き、読み込み、置き、字幕と表記を付ける 1 回の ``apply`` で 1 段にまとめる
+
+    AI の道具は ``host.apply_commands``（AI の段）、人の窓は人の段で当てる関数を渡す
+    書く先は許した確かめの場所（``consent.target``） 待つ間に作品の場所が変わっていれば、
+    許した場所は今の作品のフォルダではないので断る 書いた WAV は、置くのに失敗しても消さない
+    （元の素材を壊さない #341 の考え方 人が素材として読み込み直せる）
+    """
+    target = Path(consent.target)
+    # 頼んだ後に作品を開き直した・別のシーンを開いた なら、書く前に断る 同じ作品のファイルを
+    # 開き直すと場所も確かめの中身も同じままで照らし合わせを通り、開き直した作品へ声を置き、
+    # 置く所で断られれば WAV だけが残る 別のシーンなら、頼んだ位置を別のタイムラインへ置く
+    document = host.document
+    if document.replaced_in_checkpoint:
+        raise ToolError(f"generate_narration: {REPLACED_REFUSAL}")
+    if document.generation != plan.generation:
+        raise ToolError(
+            "声を作っている間に作品を開き直したので、WAV を書いていません もう 1 度頼んでください"
+        )
+    if host.active_scene != plan.scene:
+        raise ToolError(
+            "声を作っている間に開いているシーンが変わったので、WAV を書いていません"
+            " 置きたいタイムラインを開いてから、もう 1 度頼んでください"
+        )
+    folder = host.make_narration_folder()
+    if os.path.normcase(str(folder.resolve())) != os.path.normcase(str(target.parent)):
+        raise ToolError(
+            "声を作っている間に作品の場所が変わったので、WAV を書いていません"
+            " もう 1 度頼んでください"
+        )
+    try:
+        with pinned_place(host, str(target)) as path:
+            host.write_narration(path, spoken.wav, expect=_basis(consent))
+    except OSError as exc:
+        raise ToolError(f"ナレーションの WAV を書けませんでした: {exc}") from exc
+    media = host.probe(path)
+    if not media.has_audio:
+        raise ToolError(f"書いた WAV に音がありません: {path}")
+    if plan.subtitles:
+        media = media.with_transcript(_script_transcript(spoken, plan.speaker.name))
+    project = _project(host)
+    placed = place_media(
+        project,
+        [media],
+        at_frame=plan.at_frame,
+        track_id=plan.track,
+        split_audio=host.splits_media,
+    )
+    commands: list[Command] = [
+        AddClip(command.track_id, with_fixed_items(command.clip, sound=True))
+        if isinstance(command, AddClip)
+        else command
+        for command in placed
+    ]
+    added = [command for command in commands if isinstance(command, AddClip)]
+    if not added:
+        raise ToolError(f"作った声の長さが無いので置けません（WAV は残っています: {path}）")
+    commands.append(AddCredits((plan.credit,)))
+    apply(commands, f"ナレーション: {path.name}")
+    host.analyze(media)
+    return {
+        "file": str(path),
+        "media_id": str(media.id),
+        "clip_ids": [str(command.clip.id) for command in added],
+        "track_ids": list(dict.fromkeys(str(command.track_id) for command in added)),
+        "from_frame": plan.at_frame,
+        "to_frame": max(command.clip.timeline_end for command in added),
+        "seconds": round(wav_seconds(spoken.wav), 3),
+        "voice": _voice_label(plan.speaker, plan.style),
+        "voice_id": plan.style.id,
+        "credit": plan.credit,
+        # 字幕の文は台本そのものなので数だけ返す（字幕と文字は get_subtitles で同意を取って読む）
+        "subtitle_lines": len(spoken.lines) if plan.subtitles else 0,
+        "note": (
+            "取り消し 1 回で、読み込み・置いた声・字幕・表記がまとめて戻ります（書いた WAV は"
+            "残ります） 表記は書き出しのときに人へ知らせます 動画の概要欄などに入れてもらって"
+            "ください"
+        ),
+    }
+
+
+#: 字幕の時刻の細かさ（秒） 素材の中の時刻は分数で持つので、浮動小数の長さを丸めて渡す
+_SUBTITLE_STEP = 1000
+
+
+def _script_transcript(spoken: Spoken, speaker: str) -> Transcript:
+    """台本の文ごとの字幕 作った声の文ごとの長さに合わせ、素材の頭から並べる
+
+    起こし直さずに台本の文をそのまま使う（読み上げた文なので、起こすより確か） 人が
+    書いた文として印を付け、字幕起こしをやり直しても上書きされないようにする
+    話者（#323）には読ませた声の名前を付ける 誰が話すかは分かっているので、分けなくても
+    get_subtitles と place_subtitles の speaker で、話者を分けた字幕と同じく声の名前で絞れる
+    付けないと、話者を分けた起こしの字幕と並べたときにナレーションだけ話者の無い行になる
+    """
+    segments: list[TranscriptSegment] = []
+    start = Fraction(0)
+    for line in spoken.lines:
+        end = start + Fraction(round(line.seconds * _SUBTITLE_STEP), _SUBTITLE_STEP)
+        segments.append(
+            TranscriptSegment(start=start, end=end, text=line.text, speaker=speaker, edited=True)
+        )
+        start = end
+    return Transcript(tuple(segments), language="ja", model=NARRATION_MODEL)
+
+
 #: 書き出しを待つ上限（秒） 長く待たせると、その間は AI が人の新しい指示に応えられない
 #: 長い書き出しは、待たずに戻って export_status で何度か見てもらう
 MAX_WAIT_SECONDS = 300
@@ -8035,12 +8636,35 @@ def _export_video(host: EditorHost, arguments: dict[str, Any], consent: Consent)
     # 置く直前に照らす基準は、人が許したときの身元 ここで採り直すと、照らし合わせの後の
     # 変更を新しい基準として受け入れてしまう
     host.start_export(replace(plan.request, expect=_basis(consent)))
+    credits = _credit_note(host)
     if wait > 0:
-        return _awaiting_export(host, wait)
+        pending = _awaiting_export(host, wait)
+        if not credits:
+            return pending
+        return replace(pending, then=lambda: {**host.export_status(), **credits})
     return {
         "started": str(plan.request.path),
         "next": "書き出しは裏で進みます export_status で進み具合を読めます"
         "（wait_seconds を付けると、その秒数まで終わるのを待ちます）",
+        **credits,
+    }
+
+
+def _credit_note(host: EditorHost) -> dict[str, object]:
+    """作品が覚えている表記（#335）を書き出しの答えに添える 無ければ空
+
+    人には書き出しの窓とステータスバーで知らせる AI にも返し、書き出した後に人へ伝えてもらう
+    （声の規約が表記を求める 忘れて困るのは本人）
+    """
+    credits = host.document.project.credits
+    if not credits:
+        return {}
+    return {
+        "credits": list(credits),
+        "credit_note": (
+            "この作品は音声合成の声を使っています 動画の概要欄などに表記を入れるよう、"
+            "ユーザーに伝えてください"
+        ),
     }
 
 
@@ -8395,6 +9019,10 @@ _SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 _REFRAME = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
 _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
+#: 声の一覧（#335） エンジンの名前・声の名前と規約の文・本人の設定（エンジンの場所と既定の声）
+_VOICES = frozenset({Outbound.APP_SETTINGS})
+#: ナレーションを作って置く（#335） 書いた WAV の場所・置いたクリップ・声の名前と表記
+_NARRATION = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: 色と雑音の自動補正（#336） 結果に本人の設定の強さ・下げる量の既定が載り、サムネイルや
 #: 波形の用意がまだのときの断りの文に素材の名前が入る 絵そのものは送らない（測った数だけ）
 _AUTO_FIX = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
@@ -11340,6 +11968,82 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は保存した場所とコマ 絵はファイルへ書くだけで、結果には載らない
         sends=_WITH_FILES,
         name_keys=frozenset({"saved", "previous_kept_as"}),
+    ),
+    Operation(
+        name="list_voices",
+        description=(
+            "ナレーションの声を作るエンジン（本人が入れて起動した VOICEVOX か AivisSpeech）の"
+            "声の一覧を読む 声ごとに voice_id・名前・書き出した動画に添える表記（credit）が並ぶ"
+            " 本人の設定の既定の声と、AI が声を選んでよいか（ai_may_choose_voice）も返す"
+            " terms は voice_id で頼んだ声（省くと既定の声）の、エンジンが返した規約の文"
+            " 企業での利用や非商用だけの声があるので、使う前にユーザーへ伝える"
+            " generate_narration の前に必ず 1 度呼ぶ エンジンが動いていなければ理由を書いて断る"
+            " 呼ぶのは自分の機械の中のエンジンだけで、外のサービスへはつながない" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "voice_id": _integer("規約の文を読みたい声（省くと既定の声）"),
+                **_paging(),
+            }
+        ),
+        handler=_list_voices,
+        # 返すのはエンジンの名前と声の一覧・規約の文と、本人の設定（エンジンの場所・既定の声）
+        # 作品の中身も素材の名前も返さない
+        sends=_VOICES,
+    ),
+    Operation(
+        name="generate_narration",
+        description=(
+            "台本の文をナレーションの声にして、タイムラインに置く 本人が入れて起動した"
+            " VOICEVOX か AivisSpeech のエンジンで作り、WAV を作品のフォルダの narration へ書き、"
+            "素材として読み込み、音声トラック（混合の作品では空いたレイヤー）の空いた所へ置く"
+            " 読み込み・置く・表記を覚えるのは取り消し 1 回で戻る（書いた WAV は残る）"
+            " ファイルを書くので毎回ユーザーに確かめる 先に list_voices を呼ぶこと"
+            f" 1 回に {TEXT_LIMIT} 文字まで 長い台本は場面ごとに分けて、at_frame をずらして"
+            "何回かに分ける 作品を保存していなければ断るので、先に保存してもらう"
+            " 使った声の表記（VOICEVOX:ずんだもん など）は作品に覚え、書き出しのときに"
+            "ユーザーへ知らせる 台本の文は自分の機械の中のエンジンへだけ渡し、結果には載らない"
+            " 本人の設定が入なら、台本から文ごとに字幕を付ける（声の長さに合わせる 素材の字幕"
+            "として字幕パネルに出る subtitle_lines が付けた数）"
+            " 人も〔字幕〕→〔ナレーションを作る…〕で同じことができる"
+        ),
+        schema=_schema(
+            {
+                "text": _string(f"読ませる台本の文（{TEXT_LIMIT} 文字まで）"),
+                "voice_id": _integer(
+                    "声（list_voices の voice_id） 省くと本人の設定の既定の声"
+                    " 本人が AI に声を選ばせない設定なら、渡すと断る"
+                ),
+                "at_frame": _integer("置く位置 省くと再生位置"),
+                "track_id": _string("置きたいトラック 埋まっていればほかの空いたトラックへ"),
+                "speed_percent": _integer(
+                    f"話す速さ %（{VOICE_SPEED_RANGE[0]}〜{VOICE_SPEED_RANGE[1]} 省くと本人の設定）"
+                ),
+                "volume_percent": _integer(
+                    f"声の大きさ %（{VOLUME_PERCENT_RANGE[0]}〜{VOLUME_PERCENT_RANGE[1]}"
+                    " 省くと本人の設定）"
+                ),
+                "pitch": _integer(f"声の高さ（{PITCH_RANGE[0]}〜{PITCH_RANGE[1]} 既定 0）"),
+                "intonation_percent": _integer(
+                    f"抑揚 %（{INTONATION_PERCENT_RANGE[0]}〜{INTONATION_PERCENT_RANGE[1]}"
+                    " 既定 100 AivisSpeech では感情の強さ）"
+                ),
+            },
+            ["text"],
+        ),
+        handler=_consented(_generate_narration, _narration_consent),
+        approved=_generate_narration,
+        writes=True,
+        irreversible=True,
+        consent=_narration_consent,
+        # 台本の文は本人（AI）の文で字幕と文字に当たるが、結果にもエラーの文にも載せない
+        # 渡す先は自分の機械の中のエンジンだけで、外（Anthropic）へは送らない
+        # 結果は書いた場所（名前と場所）・置いたクリップ（編集の構成）・声の名前と表記（本人の
+        # 機械に入れた声と、本人の設定の既定）
+        sends=_NARRATION,
+        # WAV を書くだけでなく声と字幕を置く 直しの回数の上限（#339）の後は断る
+        edits=True,
+        name_keys=frozenset({"file"}),
     ),
     Operation(
         name=ASK_USER,

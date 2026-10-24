@@ -87,6 +87,14 @@ from sashimono.core.seams import (
     SeamStyle,
 )
 from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE, DEFAULT_REDUCTION_DB
+from sashimono.engine.audio.voicevox import (
+    AUTO_VOICE,
+    DEFAULT_ENGINE_URL,
+    SPEED_PERCENT_RANGE,
+    VOLUME_PERCENT_RANGE,
+    NarrationSettings,
+    check_engine_url,
+)
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE, DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache.analyzer import DEFAULT_SCENE_THREADS
 from sashimono.engine.cache.screen_analyzer import (
@@ -701,6 +709,26 @@ class Preferences:
     seam_zoom_percent: int = DEFAULT_SEAM_ZOOM_PERCENT
     #: 音の継ぎ目のフェード（ミリ秒） 0 で音は触らない
     seam_audio_fade_ms: int = DEFAULT_SEAM_AUDIO_FADE_MS
+    #: AI アシスタントがナレーションの声を作る（#335）ときの既定 どのエンジンをどこで動かすか・
+    #: どの声が好きかは人と機械で違う（2026-10-20 利用者の決定 エンジンの場所と既定の声は
+    #: 設定画面に出す） 既定は VOICEVOX を入れて起動しただけでつながる場所と、エンジンの
+    #: 一覧の最初の声（声の ID はエンジンごとに違うので、決め打ちにすると片方で断られる）
+    #: エンジンの場所 自分の機械の中だけ
+    #: （:func:`~sashimono.engine.audio.voicevox.check_engine_url`）
+    narration_engine_url: str = DEFAULT_ENGINE_URL
+    #: 既定の声の ID ``AUTO_VOICE``（-1）はエンジンの一覧の最初の声
+    narration_voice: int = AUTO_VOICE
+    #: 既定の声の名前 エンジンが動いていないときにも、設定の窓で何を選んだかを見せる
+    narration_voice_name: str = ""
+    #: 話す速さと声の大きさ（%）
+    narration_speed_percent: int = 100
+    narration_volume_percent: int = 100
+    #: AI が既定と違う声を選んでよいか 既定は選んでよい 声は毎回の確かめの窓に出るので、
+    #: 知らない声で作られることは無い 切ると、いつも同じ声で読ませたい人が AI に選び直されない
+    narration_ai_picks_voice: bool = True
+    #: 作った声に台本から字幕を付けるか（文ごとに区切り、声の長さに合わせる） 既定は付ける
+    #: （2026-10-20 利用者の決定） 字幕を別に起こす人・字幕の要らない人は切れる AI も従う
+    narration_subtitles: bool = True
     #: AI アシスタントがクリップの色を自動で整える（#336）ときの強さ（%） 測ったとおりに直す
     #: 量にこれを掛ける 既定は控えめ（:mod:`sashimono.engine.auto_color`） 夕焼けの赤みや
     #: 夜の暗さのように、わざとそう撮った絵まで真っ平らにしないため
@@ -849,6 +877,19 @@ class Preferences:
             crossfade_ms=self.seam_crossfade_ms,
             zoom_percent=self.seam_zoom_percent,
             audio_fade_ms=self.seam_audio_fade_ms,
+        )
+
+    @property
+    def narration_settings(self) -> NarrationSettings:
+        """AI アシスタントのナレーションの生成（#335）の既定"""
+        return NarrationSettings(
+            url=self.narration_engine_url,
+            voice=self.narration_voice,
+            voice_name=self.narration_voice_name,
+            speed_percent=self.narration_speed_percent,
+            volume_percent=self.narration_volume_percent,
+            ai_picks_voice=self.narration_ai_picks_voice,
+            subtitles=self.narration_subtitles,
         )
 
     @property
@@ -1118,6 +1159,27 @@ class PreferenceStore:
             seam_audio_fade_ms=_within(
                 data.get("seam_audio_fade_ms"), SEAM_AUDIO_FADE_MS_RANGE, plain.seam_audio_fade_ms
             ),
+            narration_engine_url=_engine_url(
+                data.get("narration_engine_url"), plain.narration_engine_url
+            ),
+            narration_voice=_voice_id(data.get("narration_voice"), plain.narration_voice),
+            narration_voice_name=_text(
+                data.get("narration_voice_name"), plain.narration_voice_name
+            ),
+            narration_speed_percent=_within(
+                data.get("narration_speed_percent"),
+                SPEED_PERCENT_RANGE,
+                plain.narration_speed_percent,
+            ),
+            narration_volume_percent=_within(
+                data.get("narration_volume_percent"),
+                VOLUME_PERCENT_RANGE,
+                plain.narration_volume_percent,
+            ),
+            narration_ai_picks_voice=_flag(
+                data.get("narration_ai_picks_voice"), plain.narration_ai_picks_voice
+            ),
+            narration_subtitles=_flag(data.get("narration_subtitles"), plain.narration_subtitles),
             auto_color_strength=_within(
                 data.get("auto_color_strength"),
                 AUTO_COLOR_STRENGTH_RANGE,
@@ -1392,6 +1454,24 @@ def _within(value: object, bounds: tuple[int, int], default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return default
     return value if bounds[0] <= value <= bounds[1] else default
+
+
+def _engine_url(value: object, default: str) -> str:
+    """ナレーションのエンジンの場所（#335） 自分の機械の中の http だけ通す
+
+    手で書き換えた外の場所を通すと、台本の文が機械の外へ出る 壊れた値は既定へ戻す
+    """
+    try:
+        return check_engine_url(value)
+    except ValueError:
+        return default
+
+
+def _voice_id(value: object, default: int) -> int:
+    """声の ID 0 以上か、決めていない印（``AUTO_VOICE``）だけ通す"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    return value if value >= 0 or value == AUTO_VOICE else default
 
 
 def _text(value: object, default: str) -> str:

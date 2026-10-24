@@ -500,6 +500,9 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "cancel_export": lambda _ids: {},
     "export_subtitles": lambda _ids: {"path": "字幕.srt"},
     "save_snapshot": lambda _ids: {"path": "表紙.png"},
+    # ナレーション（#335） 台本の文は自分の機械の中のエンジンへだけ渡す 断りの文にも載せない
+    # （声を作って置いた結果に載らないことは test_narration_tool.py が見る）
+    "generate_narration": lambda _ids: {"text": ARG_TEXT},
     # 保存した見た目と棚（#328） 無い名前は、保存してある見た目の名前を並べて断る
     # 棚の 1 本は読めない場所（本人の名前の入ったフォルダ）を指し、場所を書いて断る道を通る
     "apply_preset": lambda ids: {"name": "無い見た目", "clip_ids": [ids["text"]]},

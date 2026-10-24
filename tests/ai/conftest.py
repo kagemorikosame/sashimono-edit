@@ -56,6 +56,7 @@ from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
+from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import DEFAULT_AUTO_COLOR_STRENGTH
 from sashimono.engine.cache import SceneState, ScreenState
@@ -67,6 +68,9 @@ from sashimono.engine.vision import ScreenKind
 from tests.conftest import make_clip
 
 RATE_30 = FrameRate(30)
+#: 誰も待ち受けていないエンジンの場所（9 番は discard で、ふつうは閉じている）
+#: 偽のホストの既定はここへ向け、試験が本物の VOICEVOX へつながらないようにする
+CLOSED_ENGINE_URL = "http://127.0.0.1:9"
 
 
 class FakeSheet:
@@ -124,6 +128,11 @@ class FakeHost:
         self.emphasis = EmphasisStyle()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
+        #: ナレーション（#335）の本人の設定 エンジンの場所は誰も待ち受けていない番号へ向ける
+        #: 既定の 50021 のままだと、VOICEVOX を起動している開発の機械で本物へつながる
+        self.narration = NarrationSettings(url=CLOSED_ENGINE_URL)
+        #: 書いたナレーションの WAV（場所と中身）
+        self.narrations: list[tuple[Path, bytes]] = []
         #: 色と雑音の自動補正（#336）の本人の設定 既定は設定と同じ
         self.color_strength = DEFAULT_AUTO_COLOR_STRENGTH
         self.noise_reduction = int(DEFAULT_REDUCTION_DB)
@@ -434,6 +443,23 @@ class FakeHost:
     @property
     def seam_style(self) -> SeamStyle:
         return self.seams
+
+    @property
+    def narration_settings(self) -> NarrationSettings:
+        return self.narration
+
+    def make_narration_folder(self) -> Path:
+        # 本物（MainWindow）と同じく、作品のフォルダの下の narration だけを作る
+        if self.saved_at is None:
+            raise ToolError("作品をまだ保存していないので、ナレーションを書く場所がありません")
+        folder = self.saved_at.parent / NARRATION_FOLDER
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    def write_narration(self, path: Path, data: bytes, *, expect: Expected) -> None:
+        # 本物と同じ書き方（書いてから名前を付け、許した後に現れた名前は潰さない）
+        write_atomic_bytes(path, data, expect=expect)
+        self.narrations.append((path, data))
 
     @property
     def reframe_style(self) -> ReframeStyle:

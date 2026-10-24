@@ -47,8 +47,15 @@ from PySide6.QtWidgets import (
 from sashimono import __version__
 from sashimono.ai.auto_fix import can_auto_color, plan_color_fix, plan_noise_fix
 from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
+from sashimono.ai.operations import (
+    NarrationJob,
+    narration_consent,
+    narration_plan,
+    remember_voice_catalog,
+    write_and_place_narration,
+)
 from sashimono.ai.outbound import Outbound, SendChoice
-from sashimono.ai.safety import check_writable
+from sashimono.ai.safety import Consent, check_writable
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.aviutl import native, plugin
@@ -162,6 +169,7 @@ from sashimono.engine.audio.speech import (
     speaks,
     voice_speech,
 )
+from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import (
     MediaAnalyzer,
@@ -207,7 +215,7 @@ from sashimono.ui.backup_settings import (
 )
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.emphasis_dialog import ask_emphasis
-from sashimono.ui.export_dialog import ExportDialog
+from sashimono.ui.export_dialog import ExportDialog, credit_text
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_save import UndoNotice, undo_offers
@@ -215,6 +223,7 @@ from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.media_search import MediaSearchDialog
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
+from sashimono.ui.narration_dialog import ask_narration
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.progress_display import (
@@ -717,6 +726,11 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出し（#327）も同じ右端に出し、人がいつでも止められるようにする
         # 書き出しの窓を使わないので、ここに出さないと走っていることも止め方も見えない
         self._assistant_export = AssistantExport(self)
+        #: 人の窓（〔ナレーションを作る…〕 #335）で裏で作っている声と、窓の OK で採った確かめの中身
+        self._narration_job: tuple[NarrationJob, Consent] | None = None
+        self._narration_timer = QTimer(self)
+        self._narration_timer.setInterval(100)
+        self._narration_timer.timeout.connect(self._check_narration)
         #: 人が開いている書き出しの窓 開いている間だけ持つ AI が人の書き出しの進み具合を
         #: 読むため（#352） 窓は閉じたら捨てるので、閉じた後まで持つと消えた窓を読む
         self._person_export: ExportDialog | None = None
@@ -896,6 +910,9 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+Shift+J"),
             self._subtitles.jet_cut,
         )
+        # ナレーション（#335） 台本から声と字幕を作って置く 2026-10-20 利用者の決定で人の入口を
+        # 足した AI の generate_narration と同じ処理を通す
+        self._add(subtitle_menu, "ナレーションを作る…", QKeySequence(), self.create_narration)
         subtitle_menu.addSeparator()
         self._add(subtitle_menu, "焼き込み", QKeySequence(), self._subtitles.burn)
         self._add(subtitle_menu, "書き出し…", QKeySequence(), self._subtitles.export_file)
@@ -3404,6 +3421,9 @@ class MainWindow(QMainWindow):
             found.append("字幕を起こしています")
         if self._assistant_export.running:
             found.append("AI アシスタントが書き出しています")
+        if self._narration_job is not None:
+            # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
+            found.append("ナレーションの声を作っています")
         return found
 
     def _close_for_update(self) -> bool:
@@ -3876,6 +3896,10 @@ class MainWindow(QMainWindow):
     @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
+
+    @property
+    def narration_settings(self) -> NarrationSettings:
+        return self._preferences.narration_settings
 
     @property
     def auto_color_strength(self) -> int:
@@ -4480,6 +4504,117 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"AI アシスタントが静止画を保存した: {path}", 5000)
         return drawn
 
+    def create_narration(self) -> None:
+        """〔字幕〕→〔ナレーションを作る…〕 台本と声を窓で選び、AI と同じ処理で作って置く（#335）
+
+        取り消せない操作（WAV を書く）の確かめは、人が窓で〔作る〕を押したことで足りる
+        （2026-10-20 利用者の決定） 声を作る間は画面を止めず、裏で作ってタイマーで終わりを見る
+        置いた物は人の段（``Author.PERSON``）として積み、取り消し 1 回で戻る
+        """
+        if self._narration_job is not None:
+            self.statusBar().showMessage("ナレーションの声を作っている途中です", 4000)
+            return
+        if self._path is None:
+            QMessageBox.information(
+                self,
+                "ナレーションを作る",
+                "作品をまだ保存していません WAV は作品のフォルダの narration へ書くので、"
+                "先に〔名前を付けて保存〕で保存してください",
+            )
+            return
+        self._playback.stop()
+        answer = ask_narration(self, self._preferences.narration_settings)
+        if answer is None:
+            return
+        choice, catalog = answer
+        remember_voice_catalog(catalog)
+        arguments = choice.arguments(self.playhead)
+        try:
+            plan = narration_plan(self, arguments, person=True)
+            consent = narration_consent(self, arguments, person=True)
+            job = NarrationJob(plan)
+        except ToolError as exc:
+            QMessageBox.warning(self, "ナレーションを作る", str(exc))
+            return
+        self._narration_job = (job, consent)
+        self.statusBar().showMessage("ナレーションの声を作っています…")
+        self._narration_timer.start()
+
+    def _check_narration(self) -> None:
+        """裏で作っている声が終わったら、書いて置く 終わるまでは次の回を待つ"""
+        running = self._narration_job
+        if running is None:
+            self._narration_timer.stop()
+            return
+        job, consent = running
+        if not job.wait(0):
+            return
+        self._narration_timer.stop()
+        self._narration_job = None
+        try:
+            result = write_and_place_narration(
+                self, job.plan, consent, job.take(), self._apply_as_person
+            )
+        except ToolError as exc:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "ナレーションを作る", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"ナレーションを置いた: {Path(str(result['file'])).name} 表記: {result['credit']}"
+            "（書き出しのときにも知らせます）",
+            8000,
+        )
+
+    def _stop_narration(self) -> None:
+        """作っている途中の声を止めて捨てる エンジンには次の文から頼まない 何も書かない"""
+        self._narration_timer.stop()
+        running = self._narration_job
+        self._narration_job = None
+        if running is not None:
+            running[0].abandon()
+
+    def _apply_as_person(self, commands: list[Command], label: str) -> None:
+        """人の操作として 1 段で当てる 断られたら :class:`ToolError`（呼んだ側が知らせる）"""
+        try:
+            with self._document.checkpoint(label, by=Author.PERSON):
+                for command in commands:
+                    self._document.execute(self._in_active_scene(command))
+        except (ValueError, KeyError) as exc:
+            raise ToolError(str(exc)) from exc
+        finally:
+            self._on_project_changed()
+
+    def make_narration_folder(self) -> Path:
+        """AI のナレーション（#335）を書くフォルダ 作品のフォルダの下の narration だけを作る"""
+        if self._path is None:
+            raise ToolError("作品をまだ保存していないので、ナレーションを書く場所がありません")
+        folder = self._path.parent / NARRATION_FOLDER
+        try:
+            # 上のフォルダは作らない 作品のフォルダが消えていたら、そこへは書かない
+            folder.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise ToolError(
+                f"ナレーションを書くフォルダを作れませんでした: {folder} ({exc})"
+            ) from exc
+        if not folder.is_dir():
+            raise ToolError(f"{folder} はフォルダではないので、ナレーションを書けません")
+        return folder
+
+    def write_narration(self, path: Path, data: bytes, *, expect: Expected) -> None:
+        """AI が作ったナレーションの WAV を、書いてから名前を付ける書き方で置く（#335）
+
+        新しい名前にだけ書く（:mod:`sashimono.ai.operations` が空いた番号を選ぶ） 許した後に
+        同じ名前が現れていれば置かずに断る（``expect``） 窓は出さない
+        """
+        try:
+            write_atomic_bytes(
+                path, data, expect=replace(expect, keep=self._preferences.backup_generations)
+            )
+        except OSError as exc:
+            raise ToolError(f"ナレーションの WAV を書けませんでした: {path} ({exc})") from exc
+        self._remember_written(path, expect)
+        self.statusBar().showMessage(f"AI アシスタントがナレーションを書いた: {path}", 5000)
+
     def start_export(self, request: ExportRequest) -> None:
         """AI の書き出し 画面の書き出しの窓と同じ作り方の設定で、同じ書き出しの処理を裏で回す"""
         if self._assistant_export.running:
@@ -4548,7 +4683,13 @@ class MainWindow(QMainWindow):
         # 終わったのに次に窓を出したとき進み具合が出たまま残る
         if not indicator.isHidden():
             indicator.hide()
-            self.statusBar().showMessage(str(status.get("message", "")), 8000)
+            message = str(status.get("message", ""))
+            credits = self._document.project.credits
+            if status.get("state") == "done" and credits:
+                # 作った声の表記（#335） AI が書き出したときも人へ知らせる AI の返事だけに
+                # 載せると、読み飛ばした人が表記を入れ忘れる（規約に反するのは本人）
+                message += f" 概要欄などに表記を入れてください: {credit_text(credits)}"
+            self.statusBar().showMessage(message, 15000 if credits else 8000)
 
     def show_chat(self) -> None:
         """AI パネルを前へ出す"""
@@ -4583,6 +4724,9 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
         # 書きかけは捨てる 書き出し先は前のまま残る
         self._assistant_export.shutdown()
+        # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
+        # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
+        self._stop_narration()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()

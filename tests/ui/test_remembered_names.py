@@ -61,6 +61,8 @@ OWN_LIBRARY = {
     "duck_shape",
     "emphasis_style",
     "seam_style",
+    # ナレーション（#335）のエンジンの場所と既定の声 使う道具は sends にアプリの設定を書く
+    "narration_settings",
     # 色と雑音の自動補正の強さ・下げる量の既定（#336）
     "auto_color_strength",
     "denoise_reduction",
@@ -146,6 +148,10 @@ PROJECT_SIDE = {
     # コマ・止められたか・待つ関数で、書いた場所は remembered_names からも返す
     "write_subtitles",
     "write_snapshot",
+    # ナレーション（#335） 書くのは作品のフォルダの narration だけ 返すのはそのフォルダの場所
+    # （作品の場所の下なので伏せ字の表に直に入る）で、書いた場所は remembered_names からも返す
+    "make_narration_folder",
+    "write_narration",
     "start_export",
     "export_waiter",
     "cancel_export",
@@ -276,6 +282,9 @@ class TestEveryTextSourceGoesThroughThePort:
             # つなぎ目（#332） 結果に本人の設定の処理の種類と長さの既定が載る
             "smooth_cuts",
             "jet_cut",
+            # ナレーション（#335） 結果と断りの文に本人の設定のエンジンの場所と既定の声が載る
+            "list_voices",
+            "generate_narration",
             # 色と雑音の自動補正（#336） 結果に本人の設定の強さと下げる量の既定が載る
             "auto_color",
             "reduce_noise",

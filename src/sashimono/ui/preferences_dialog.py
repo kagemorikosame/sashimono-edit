@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QFrame,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -56,6 +59,16 @@ from sashimono.core.seams import (
     SEAM_ZOOM_PERCENT_RANGE,
 )
 from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE
+from sashimono.engine.audio.voicevox import (
+    AIVIS_ENGINE_URL,
+    AUTO_VOICE,
+    DEFAULT_ENGINE_URL,
+    SPEED_PERCENT_RANGE,
+    VOLUME_PERCENT_RANGE,
+    Catalog,
+    EngineError,
+    check_engine_url,
+)
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
@@ -98,6 +111,7 @@ from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
 from sashimono.ui.theme import THEME_CHOICES
+from sashimono.ui.voice_fetch import BUSY_TEXT, Fetched, VoiceFetch, fetch_voices, terms_text
 from sashimono.ui.workspace import (
     AI_IMAGE_LIMITS,
     AI_MINUTE_LIMITS,
@@ -1008,6 +1022,7 @@ class PreferencesDialog(QDialog):
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
         self._add_seam_rows(form, preferences)
+        self._add_narration_rows(form, preferences)
         self._add_auto_fix_rows(form, preferences)
         self._add_reframe_rows(form, preferences)
 
@@ -1280,6 +1295,17 @@ class PreferencesDialog(QDialog):
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
             seam_audio_fade_ms=self._seam_audio.value(),
+            narration_engine_url=self._narration_url_value(),
+            narration_voice=int(self._narration_voice.currentData()),
+            narration_voice_name=(
+                ""
+                if self._narration_voice.currentData() == AUTO_VOICE
+                else self._narration_voice.currentText()
+            ),
+            narration_speed_percent=self._narration_speed.value(),
+            narration_volume_percent=self._narration_volume.value(),
+            narration_ai_picks_voice=self._narration_ai_picks.isChecked(),
+            narration_subtitles=self._narration_subtitles.isChecked(),
             auto_color_strength=self._auto_color_strength.value(),
             denoise_reduction_db=self._denoise_reduction.value(),
             reframe_size=str(self._reframe_size.currentData()),
@@ -1462,6 +1488,185 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("つなぎ目: 音のフェード", self._seam_audio)
 
+    def _add_narration_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """ナレーションの生成（#335）の既定 どのエンジンをどこで動かすか・どの声が好きかは
+        人と機械で違う（2026-10-20 利用者の決定 エンジンの場所と既定の声はここに出す）
+        """
+        self._narration_url = QLineEdit(preferences.narration_engine_url, self)
+        self._narration_url.setToolTip(
+            "AI アシスタントがナレーションの声を作るエンジンの場所 本人が入れて起動した"
+            f" VOICEVOX（{DEFAULT_ENGINE_URL}）か AivisSpeech（{AIVIS_ENGINE_URL}）"
+            " 自分の機械の中（127.0.0.1 などのループバックの番地か localhost）だけを受け付け、"
+            "台本の文を外へは送らない"
+        )
+        form.addRow("ナレーション: エンジンの場所", self._narration_url)
+
+        self._narration_voice = QComboBox(self)
+        self._narration_voice.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+        if preferences.narration_voice != AUTO_VOICE:
+            # エンジンが動いていなくても、選んだ声を名前で見せる（OK で黙って最初の声へ戻さない）
+            name = preferences.narration_voice_name or f"ID {preferences.narration_voice}"
+            self._narration_voice.addItem(name, preferences.narration_voice)
+            self._narration_voice.setCurrentIndex(1)
+        self._narration_voice.setToolTip(
+            "AI がナレーションに使う声 〔声の一覧を読む〕でエンジンの声を並べてから選ぶ"
+            " 声ごとに規約が違う（企業での利用や非商用だけの声がある）ので〔規約を見る〕で確かめる"
+        )
+        read = QPushButton("声の一覧を読む", self)
+        read.setToolTip("上の場所のエンジンから声の一覧を読む エンジンを起動しておく")
+        read.clicked.connect(self._read_voices)
+        terms = QPushButton("規約を見る", self)
+        terms.setToolTip("選んだ声の規約の文を、エンジンが返したまま見せる")
+        terms.clicked.connect(self._show_voice_terms)
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self._narration_voice, 1)
+        voice_row.addWidget(read)
+        voice_row.addWidget(terms)
+        form.addRow("ナレーション: 既定の声", voice_row)
+        self._narration_status = QLabel("", self)
+        self._narration_status.setWordWrap(True)
+        form.addRow("", self._narration_status)
+        #: 読んだ声の一覧 規約を見るときに声の持ち主を探す
+        self._narration_catalog: Catalog | None = None
+        #: エンジンへの問い合わせを裏で進める係 返事を止めたエンジンで設定の窓を固めない
+        self._voice_fetch = VoiceFetch(self)
+        # 場所を変えたら読んだ一覧を捨てる 残すと〔規約を見る〕が前のエンジンの声の持ち主の ID を
+        # 新しいエンジンへ渡し、断られるか別のエンジンの規約と表記を見せる
+        self._narration_url.textChanged.connect(self._forget_narration_catalog)
+
+        def spin(bounds: tuple[int, int], value: int) -> QSpinBox:
+            box = QSpinBox(self)
+            box.setRange(*bounds)
+            box.setSingleStep(5)
+            box.setSuffix(" %")
+            box.setValue(value)
+            return box
+
+        self._narration_speed = spin(SPEED_PERCENT_RANGE, preferences.narration_speed_percent)
+        self._narration_speed.setToolTip("ナレーションの話す速さ 100% はエンジンの既定の速さ")
+        form.addRow("ナレーション: 話す速さ", self._narration_speed)
+        self._narration_volume = spin(VOLUME_PERCENT_RANGE, preferences.narration_volume_percent)
+        self._narration_volume.setToolTip(
+            "ナレーションを作るときの声の大きさ 置いた後はクリップの音量の欄でも変えられる"
+        )
+        form.addRow("ナレーション: 声の大きさ", self._narration_volume)
+        self._narration_ai_picks = QCheckBox("AI がナレーションの声を選んでよい", self)
+        self._narration_ai_picks.setChecked(preferences.narration_ai_picks_voice)
+        self._narration_ai_picks.setToolTip(
+            "切ると、AI は上の既定の声だけを使う（頼んでも別の声にしない） 入れておいても、"
+            "どの声で作るかは毎回の確かめの窓に出る"
+        )
+        form.addRow(self._narration_ai_picks)
+        self._narration_subtitles = QCheckBox("作ったナレーションに台本から字幕を付ける", self)
+        self._narration_subtitles.setChecked(preferences.narration_subtitles)
+        self._narration_subtitles.setToolTip(
+            "台本の文ごとに字幕を区切り、作った声の長さに合わせて付ける（字幕パネルに出る）"
+            " AI が作るときもこれに従う 〔ナレーションを作る…〕の窓ではその 1 回だけ変えられる"
+        )
+        form.addRow(self._narration_subtitles)
+
+    def _forget_narration_catalog(self, _text: str = "") -> None:
+        """場所を変えたら、読んだ一覧と選んでいた声を捨てる
+
+        声の ID はエンジンごとに振り方が違い、別のエンジンでは同じ ID が別の声になる 残すと、
+        場所だけ替えて OK を押した人の既定の声が、知らない声になる 一覧の最初の声へ戻し、
+        新しい一覧から選び直してもらう
+        """
+        self._narration_catalog = None
+        box = self._narration_voice
+        if box.count() != 1 or box.currentData() != AUTO_VOICE:
+            box.clear()
+            box.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+            self._narration_status.setText(
+                "エンジンの場所を変えたので、既定の声を一覧の最初の声に戻した"
+                " 〔声の一覧を読む〕で選び直す"
+            )
+
+    def _read_voices(self, _checked: bool = False) -> None:
+        """エンジンの声を並べる 人が押したときだけ、自分の機械の中のエンジンへつなぐ
+
+        窓は出さず、断りは欄の下に書く 止まった機械で窓を出すと、押すたびに閉じる手間が増える
+        読むのは裏のスレッド（:class:`~sashimono.ui.voice_fetch.VoiceFetch`） エンジンが返事を
+        止めても設定の窓は固まらない
+        """
+        self._ask_engine(terms=False)
+
+    def _show_voice_terms(self, _checked: bool = False) -> None:
+        """選んだ声の規約とエンジンの規約を、エンジンが返した文のまま見せる
+
+        アプリは中身を判断しない 一覧をまだ読んでいなければ、一緒に読む
+        """
+        self._ask_engine(terms=True)
+
+    def _ask_engine(self, *, terms: bool) -> None:
+        url = self._narration_url.text()
+        voice = int(self._narration_voice.currentData())
+        known = self._narration_catalog if terms else None
+        try:
+            work = fetch_voices(url, known, voice if terms else None)
+        except EngineError as exc:
+            self._narration_status.setText(str(exc))
+            return
+        asked = voice if terms else None
+        if self._voice_fetch.start(work, lambda fetched: self._fetched(url, asked, fetched)):
+            self._narration_status.setText("エンジンに問い合わせています…")
+        else:
+            # 前の問い合わせが終わるまで新しく始めない 黙っていると、押したことが効いたように
+            # 見え、前の答えが捨てられた後にもう 1 度押すことになる
+            self._narration_status.setText(BUSY_TEXT)
+
+    def _fetched(self, url: str, asked: int | None, fetched: Fetched) -> None:
+        """読み終えた（画面のスレッド） 待つ間に場所を変えていたら、前の場所の答えは捨てる"""
+        if self._narration_url.text() != url:
+            self._narration_status.setText("エンジンの場所を変えたので、前の場所の答えは使わない")
+            return
+        if fetched.catalog is None:
+            self._narration_status.setText(fetched.error)
+            return
+        if fetched.catalog is not self._narration_catalog:
+            self._fill_voices(fetched.catalog)
+        if asked is not None:
+            # 規約の文は問い合わせた声の物 待つ間に欄を変えても、問い合わせた声で持ち主を探す
+            # 今の欄で探すと、後から選んだ声の名前と表記の下に前の声の規約を出す
+            found = fetched.catalog.find(asked)
+            if found is None:
+                self._narration_status.setText("選んだ声がエンジンの一覧にありません")
+                return
+            QMessageBox.information(
+                self, "声の規約", terms_text(fetched.catalog, *found, fetched.policy or "")
+            )
+
+    def _fill_voices(self, catalog: Catalog) -> None:
+        self._narration_catalog = catalog
+        current = int(self._narration_voice.currentData())
+        box = self._narration_voice
+        box.clear()
+        box.addItem("エンジンの一覧の最初の声", AUTO_VOICE)
+        for speaker in catalog.speakers:
+            for style in speaker.styles:
+                box.addItem(f"{speaker.name}（{style.name}）", style.id)
+        index = box.findData(current)
+        if index < 0:
+            # 今の声がこのエンジンに無い 黙って最初の声へ替えず、無いことを見せて残す
+            box.addItem(f"ID {current}（このエンジンに無い声）", current)
+            index = box.count() - 1
+        box.setCurrentIndex(index)
+        voices = sum(len(speaker.styles) for speaker in catalog.speakers)
+        self._narration_status.setText(
+            f"{catalog.engine_name or catalog.brand} の声を {voices} 個読んだ"
+            f" 表記は「{catalog.brand}:声の名前」の形で、書き出しのときに知らせる"
+        )
+
+    def _narration_url_value(self) -> str:
+        """欄のエンジンの場所 受け付けられない場所なら開いたときの値を残す
+
+        受け付けられない場所は :meth:`accept` が窓を開いたまま断る
+        """
+        try:
+            return check_engine_url(self._narration_url.text())
+        except ValueError:
+            return self._given.narration_engine_url
+
     def _add_auto_fix_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """色と雑音を自動で直す（#336）ときの既定 どこまで直してよいかは人と素材で違う
         AI が値を言わなければこれを使う 道具の引数で 1 回ごとに変えることもできる
@@ -1621,6 +1826,12 @@ class PreferencesDialog(QDialog):
 
         断られたら窓を開いたままにして、選び直せるようにする
         """
+        try:
+            check_engine_url(self._narration_url.text())
+        except ValueError as exc:
+            # 外の場所を黙って前の値へ戻すと、直したつもりの人が気付かない 窓を開いたまま知らせる
+            QMessageBox.warning(self, "設定", f"ナレーションのエンジンの場所: {exc}")
+            return
         approved: list[TrimItem] = []
         if not confirm_backup_changes(self, self._backups.before, self.preferences(), approved):
             return

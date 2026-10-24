@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,10 +30,11 @@ import pytest
 import sashimono.ai
 import sashimono.core
 import sashimono.ui
+from sashimono.ai import safety
 from sashimono.ai.command_ledger import COMMANDS_WITHOUT_TOOLS, Why
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import CHILD_ISSUES
-from sashimono.ai.operations import OPERATIONS, find_operation
+from sashimono.ai.operations import OPERATIONS, Pending, find_operation, finish
 from sashimono.compat.aviutl.catalog import ScriptCatalog
 from sashimono.compat.looks import capture_preset
 from sashimono.core.commands import (
@@ -59,6 +61,8 @@ from sashimono.core.model import (
 )
 from sashimono.core.model.ids import ClipId, TrackId
 from sashimono.effects.sources import TEXT
+from sashimono.engine.audio.voicevox import NarrationSettings
+from sashimono.engine.decode import probe_media
 from tests.ai.conftest import FakeHost
 from tests.ai.test_auto_fix_tools import Work, _strip, _waveform
 from tests.ai.test_look_tools import (
@@ -73,6 +77,7 @@ from tests.ai.test_outbound import WRITE_EXAMPLES, _ids, _with_text_clip
 from tests.compat.test_subtitle_looks import _styled_alias
 from tests.core.test_seams import JumpCut
 from tests.engine.test_auto_color import _scene as _color_scene
+from tests.fake_voice_engine import fake_voice_engine
 
 
 def _subclasses(base: type) -> Iterator[type]:
@@ -131,6 +136,8 @@ class Material:
     video_media: MediaItem
     transcript: Transcript
     tmp_path: Path
+    #: 偽の VOICEVOX 互換のエンジンの場所（ナレーション #335） 試験の間だけ 127.0.0.1 で待ち受ける
+    voice_url: str
 
 
 #: 例 1 つ 作品を組んで、動かす道具・引数・ホストを返す 組む間のコマンドは数えない
@@ -298,6 +305,22 @@ def _import_objects(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "import_objects", {"path": str(source)}
 
 
+def _generate_narration(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # WRITE_EXAMPLES の例は声の一覧を読む前で断られる（エンジンの無い CI と同じ道）
+    # 偽のエンジンへ向け、保存した作品で一覧を読んでから作る 声を置く命令と同じまとめで
+    # 表記（AddCredits）を足す道を通す
+    host = _text_host(material)
+    folder = material.tmp_path / "作品"
+    folder.mkdir()
+    host.saved_at = folder / "作品.sme"
+    host.write_project(host.saved_at, adopt=False, expect=expect_now(host.saved_at))
+    host.narration = NarrationSettings(url=material.voice_url)
+    # 書いた WAV を本物の読み方で読む 偽の素材は WAV の長さと合わず、置く所で断られる
+    setattr(host, "probe", probe_media)  # noqa: B010  メソッドへの代入を mypy が断るため
+    settle(_run(host, "list_voices"))
+    return host, "generate_narration", {"text": "今日は動画の切り方を話します。"}
+
+
 def _auto_color(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     # WRITE_EXAMPLES の作品にはサムネイルが無く、まだ用意できていないと断られる
     # 暗くて色の寄った絵のシートを置いて、補正を積む道を通す
@@ -456,6 +479,7 @@ EXAMPLES: dict[str, Example] = {
     "place_template": _template("place_template"),
     "apply_template": _template("apply_template"),
     "import_objects": _import_objects,
+    "generate_narration": _generate_narration,
     "auto_color": _auto_color,
     "reduce_noise": _reduce_noise,
     # 画面と同じ道具（#349） WRITE_EXAMPLES は無い物や中身のある入れ物を指して断られる道を見る
@@ -491,6 +515,18 @@ def _write_example(name: str) -> Example:
 Run = Callable[[Any, dict[str, Any]], Any]
 
 
+def settle(result: object) -> object:
+    """裏で待つ道具の答え（:class:`Pending` #321）を、ブリッジと同じく待ってから辿る
+
+    辿らないと、待った後の ``then`` で積むコマンド（ナレーション #335 の声を置く・表記を
+    足すなど）を数えず、AI が通すコマンドに要らない理由を求める
+    """
+    while isinstance(result, Pending):
+        result.wait(result.seconds)
+        result = finish(result.then())
+    return result
+
+
 def tally(operation: Run, host: FakeHost, arguments: dict[str, Any]) -> tuple[set[str], str | None]:
     """道具を 1 回動かし、作品に残ったコマンドと断りの文（通ったら None）を返す
 
@@ -499,7 +535,7 @@ def tally(operation: Run, host: FakeHost, arguments: dict[str, Any]) -> tuple[se
     """
     with recording() as seen:
         try:
-            operation(host, arguments)
+            settle(operation(host, arguments))
         except (ToolError, ValueError, KeyError) as exc:
             return set(), str(exc)
     return seen, None
@@ -530,8 +566,20 @@ def uncovered(
 
 
 @pytest.fixture
-def material(video_media: MediaItem, transcript: Transcript, tmp_path: Path) -> Material:
-    return Material(video_media, transcript, tmp_path)
+def material(
+    video_media: MediaItem,
+    transcript: Transcript,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Material]:
+    # 書く道具（ナレーション #335）の例は、書き終えるまでフォルダを持てる OS でだけ書く所まで進む
+    # （safety.pin_holds_the_folder Windows だけ） ほかの OS で開発すると、例が書く前に断られ、
+    # その道のコマンド（表記の AddCredits など）を通らずに数えが崩れる（#401 の CodeRabbit の指摘）
+    # この見張りが見るのは道具が通すコマンドなので、どの OS でも持てる側として数える ほかの OS で
+    # 書く道具を断ることは tests/ai/test_save_and_export.py の TestOtherSystemsAreRefused が見る
+    monkeypatch.setattr(safety, "pin_holds_the_folder", lambda: True)
+    with fake_voice_engine() as engine:
+        yield Material(video_media, transcript, tmp_path, engine.url)
 
 
 class TestEveryCommandHasAToolOrAReason:
@@ -571,6 +619,15 @@ class TestEveryCommandHasAToolOrAReason:
         expected = {f"WRITE_EXAMPLES {name}" for name in WRITE_EXAMPLES if name in covered}
         assert set(refused) <= expected, {k: v for k, v in refused.items() if k not in expected}
         assert not {k for k in refused if k.startswith("EXAMPLES ")}
+
+    def test_the_examples_go_through_on_other_systems_too(
+        self, material: Material, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、Windows 以外で開発する機械では、ナレーションの例が書く確かめで断られ、上の
+        # 試験と数えの見張りが落ちる（CI は Windows だけなので気付かない #401 の CodeRabbit の指摘）
+        monkeypatch.setattr(safety, "sys", SimpleNamespace(platform="linux"))
+        _, refused = _used(material)
+        assert not {k for k in refused if k.startswith("EXAMPLES ")}, refused
 
     def test_a_refused_run_counts_nothing(self, material: Material) -> None:
         # 壊れると、1 本目を通して 2 本目で断られた道具（作品は checkpoint で元へ戻る）の

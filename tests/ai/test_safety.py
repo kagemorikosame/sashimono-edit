@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -201,6 +202,9 @@ class TestAppSettingsAreReadOnly:
             "draw_sound_graph",
             "export_status",
             "export_waiter",
+            # ナレーション（#335） 作品のフォルダの下の narration を用意し、そこへ WAV を書く
+            # 作品を書く口で、アプリの設定は変えない 書く先は pinned_place で確かめた所だけ
+            "make_narration_folder",
             # 開く・新規（#349） 作品を差し替える 取り消せない操作の道具からだけ呼ぶ
             # アプリ自身の設定は変えない（新しい作品の初めの値は本人の設定を読むだけ）
             "open_project_file",
@@ -250,12 +254,49 @@ class TestAppSettingsAreReadOnly:
             # 人が見ている表示（#352） 読むだけで、何も変えない
             "view_state",
             "waveform",
+            "write_narration",
             # 色を測るサムネイルを読むだけ（#336） 作れていなければ None を返し、作るのは analyze
             "filmstrip",
             "write_project",
             "write_snapshot",
             "write_subtitles",
         }
+        assert changes >= WRITING_PORTS
+
+    def test_the_document_names_the_writing_ports(self) -> None:
+        """壊れると、開発の文書の「EditorHost に足してよい口」の一覧と、試験が許す口が食い違い、
+        次に口を足す人がどの口を許されているかを読み違える（#335 の CodeRabbit の指摘）"""
+        text = (Path(__file__).parents[2] / "docs" / "development.md").read_text(encoding="utf-8")
+        start = text.index("足してよいのは作品の保存と書き出しの口")
+        end = text.index("- 区分の値は操作の台帳", start)
+        named = set(re.findall(r"`([a-z_]+)`", text[start:end]))
+        assert named & set(dir(EditorHost)) == WRITING_PORTS
+
+
+#: EditorHost の口のうち、作品を書く・書き出しを進める口（docs/development.md の一覧と照らす）
+#: 保存と書き出し（B1 #327）と、作品を扱う口（#349）と、ナレーションの WAV（#335）
+WRITING_PORTS = frozenset(
+    {
+        "write_project",
+        "start_export",
+        "export_status",
+        "export_waiter",
+        "cancel_export",
+        "write_subtitles",
+        "write_snapshot",
+        "set_clipboard",
+        "open_project_file",
+        "start_new_project",
+        "reload_scripts",
+        "alignment_commands",
+        "copy_snapshot_image",
+        "copy_text",
+        "make_narration_folder",
+        "write_narration",
+        # 場面の説明を素材の解析の控えに覚える（#326） 文書の同じ一覧に書いてある
+        "remember_scene_notes",
+    }
+)
 
 
 # --- 書ける場所 ---
