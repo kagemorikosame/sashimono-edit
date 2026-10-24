@@ -1607,14 +1607,15 @@ class PreferencesDialog(QDialog):
         except EngineError as exc:
             self._narration_status.setText(str(exc))
             return
-        if self._voice_fetch.start(work, lambda fetched: self._fetched(url, terms, fetched)):
+        asked = voice if terms else None
+        if self._voice_fetch.start(work, lambda fetched: self._fetched(url, asked, fetched)):
             self._narration_status.setText("エンジンに問い合わせています…")
         else:
             # 前の問い合わせが終わるまで新しく始めない 黙っていると、押したことが効いたように
             # 見え、前の答えが捨てられた後にもう 1 度押すことになる
             self._narration_status.setText(BUSY_TEXT)
 
-    def _fetched(self, url: str, terms: bool, fetched: Fetched) -> None:
+    def _fetched(self, url: str, asked: int | None, fetched: Fetched) -> None:
         """読み終えた（画面のスレッド） 待つ間に場所を変えていたら、前の場所の答えは捨てる"""
         if self._narration_url.text() != url:
             self._narration_status.setText("エンジンの場所を変えたので、前の場所の答えは使わない")
@@ -1624,8 +1625,10 @@ class PreferencesDialog(QDialog):
             return
         if fetched.catalog is not self._narration_catalog:
             self._fill_voices(fetched.catalog)
-        if terms:
-            found = fetched.catalog.find(int(self._narration_voice.currentData()))
+        if asked is not None:
+            # 規約の文は問い合わせた声の物 待つ間に欄を変えても、問い合わせた声で持ち主を探す
+            # 今の欄で探すと、後から選んだ声の名前と表記の下に前の声の規約を出す
+            found = fetched.catalog.find(asked)
             if found is None:
                 self._narration_status.setText("選んだ声がエンジンの一覧にありません")
                 return

@@ -84,6 +84,8 @@ class FakeVoiceEngine:
     synthesis_delay: float = 0.0
     #: 声の一覧を返す前に待つ秒 返事の遅いエンジンで窓が固まらないかを見る試験で使う
     speakers_delay: float = 0.0
+    #: 声の規約を返す前に待つ秒 待つ間に声の欄を変える試験で使う
+    policy_delay: float = 0.0
     #: 合成で返す番号 200 以外にすると断る
     synthesis_status: int = 200
     #: 全部の道に返す転送先 空でなければ 302 で飛ばす
@@ -157,6 +159,8 @@ def _handler(engine: FakeVoiceEngine) -> type[BaseHTTPRequestHandler]:
                     time.sleep(engine.speakers_delay)
                 self._json(engine.speakers)
             elif path == "/speaker_info":
+                if engine.policy_delay:
+                    time.sleep(engine.policy_delay)
                 uuid = (query.get("speaker_uuid") or [""])[0]
                 if uuid not in engine.policies:
                     self._json({"detail": "該当する話者が見つかりません"}, 422)

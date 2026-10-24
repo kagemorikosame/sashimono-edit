@@ -32,7 +32,7 @@ from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddCredits, Author
 from sashimono.core.io.atomic import expect_now
-from sashimono.core.model import TrackKind
+from sashimono.core.model import SceneId, TrackKind
 from sashimono.engine.audio.voicevox import (
     NarrationSettings,
     VoiceEngine,
@@ -518,6 +518,72 @@ class TestMakingAndPlacing:
         time.sleep(1.2)
         assert len(engine.texts) == 1
         assert narrating.narrations == []
+
+    def test_reopening_while_asking_writes_nothing(
+        self, narrating: FakeHost, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、確かめの窓が出ている間に同じ作品を開き直すと、場所も中身も同じままで照らし
+        # 合わせを通り、声を作って WAV を書いた後に置く所で断られ、誰も置かない WAV が残る
+        # （#401 の CodeRabbit の指摘）
+        _listed(narrating)
+        project = narrating.document.project
+        narrating.document.begin_checkpoint("AI: 声を作って", by=Author.AI)
+
+        def reopen(_approval: Approval) -> bool:
+            narrating.document.reset(project, within_checkpoint=True)
+            return True
+
+        bridge = allow_sending(EditorBridge(narrating, auto_approve=True))
+        _seen, box = _run(bridge, GENERATE, {"text": SCRIPT}, reopen)
+        narrating.document.end_checkpoint()
+        assert "開き直した" in str(box.get("error"))
+        assert narrating.narrations == []
+        assert engine.texts == []
+
+    def test_reopening_while_the_voice_is_made_writes_nothing(
+        self, narrating: FakeHost, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、声を作っている間に同じ作品を開き直しても、開き直した作品へ頼む前の位置で声と
+        # 字幕を置く（頼んだときの作品とは別の作品）
+        self._change_while_making(
+            narrating, engine, lambda: narrating.document.reset(narrating.document.project)
+        )
+        assert narrating.narrations == []
+
+    def test_switching_the_scene_while_the_voice_is_made_writes_nothing(
+        self, narrating: FakeHost, engine: FakeVoiceEngine
+    ) -> None:
+        # 壊れると、声を作っている間に別のシーンを開くと、頼んだ位置をそのシーンのタイムラインへ置く
+        def switch() -> None:
+            narrating.scene = SceneId("ほかのシーン")
+
+        error = self._change_while_making(narrating, engine, switch)
+        assert "シーン" in error
+        assert narrating.narrations == []
+
+    @staticmethod
+    def _change_while_making(
+        host: FakeHost, engine: FakeVoiceEngine, change: Callable[[], None]
+    ) -> str:
+        """声を作り始めた所で ``change`` を呼び、道具の断りの文を返す"""
+        _listed(host)
+        engine.synthesis_delay = 0.4
+        bridge = allow_sending(EditorBridge(host, auto_approve=True))
+        done, box = call_in_thread(bridge, GENERATE, {"text": SCRIPT})
+        deadline = time.monotonic() + 15
+        changed = False
+        while not done.is_set() and time.monotonic() < deadline:
+            bridge.pump()
+            approval = bridge.take_approval()
+            if approval is not None:
+                approval.allow()
+            if not changed and engine.texts:
+                change()
+                changed = True
+            time.sleep(0.005)
+        bridge.pump()
+        assert done.is_set()
+        return str(box.get("error"))
 
     def test_moving_the_project_while_the_voice_is_made_is_refused(
         self, narrating: FakeHost, engine: FakeVoiceEngine, tmp_path: Path

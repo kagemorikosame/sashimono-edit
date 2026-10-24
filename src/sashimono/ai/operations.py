@@ -217,6 +217,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.convert import convert_layers, switch_layer_mode
 from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION, STOP_LOCKED
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
+from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
@@ -8176,6 +8177,10 @@ class NarrationPlan:
     detail: str
     #: 確かめの箱にだけ出す台本（:attr:`Consent.private` AI へ返る文に載せない）
     private: str
+    #: 頼んだときの作品（:attr:`Document.generation`）と開いていたシーン 声を作る間に変われば
+    #: 書かずに断る（:func:`write_and_place_narration`）
+    generation: int = 0
+    scene: SceneId | None = None
 
 
 def _narration_text(arguments: dict[str, Any]) -> str:
@@ -8340,6 +8345,8 @@ def narration_plan(
             f"読ませる文（{len(text)} 文字 この文は自分の機械の中のエンジンへだけ渡します）:"
             f"\n{text}"
         ),
+        generation=host.document.generation,
+        scene=host.active_scene,
     )
 
 
@@ -8387,6 +8394,9 @@ class NarrationJob:
 
 
 def _generate_narration(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    if host.document.replaced_in_checkpoint:
+        # 確かめの窓が出ている間に作品を開き直した 声を作る前に断る（作ってから断ると無駄に待つ）
+        raise ToolError(f"generate_narration: {REPLACED_REFUSAL}")
     plan = narration_plan(host, arguments)
     job = NarrationJob(plan)
 
@@ -8413,6 +8423,21 @@ def write_and_place_narration(
     （元の素材を壊さない #341 の考え方 人が素材として読み込み直せる）
     """
     target = Path(consent.target)
+    # 頼んだ後に作品を開き直した・別のシーンを開いた なら、書く前に断る 同じ作品のファイルを
+    # 開き直すと場所も確かめの中身も同じままで照らし合わせを通り、開き直した作品へ声を置き、
+    # 置く所で断られれば WAV だけが残る 別のシーンなら、頼んだ位置を別のタイムラインへ置く
+    document = host.document
+    if document.replaced_in_checkpoint:
+        raise ToolError(f"generate_narration: {REPLACED_REFUSAL}")
+    if document.generation != plan.generation:
+        raise ToolError(
+            "声を作っている間に作品を開き直したので、WAV を書いていません もう 1 度頼んでください"
+        )
+    if host.active_scene != plan.scene:
+        raise ToolError(
+            "声を作っている間に開いているシーンが変わったので、WAV を書いていません"
+            " 置きたいタイムラインを開いてから、もう 1 度頼んでください"
+        )
     folder = host.make_narration_folder()
     if os.path.normcase(str(folder.resolve())) != os.path.normcase(str(target.parent)):
         raise ToolError(

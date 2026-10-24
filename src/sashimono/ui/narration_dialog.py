@@ -166,13 +166,14 @@ class NarrationDialog(QDialog):
             self._status.setText(str(exc))
             self._update()
             return
-        if self._fetch.start(work, lambda fetched: self._fetched(terms, fetched)):
+        asked = voice if terms else None
+        if self._fetch.start(work, lambda fetched: self._fetched(asked, fetched)):
             self._status.setText("エンジンに問い合わせています…")
         else:
             # 設定の窓と同じく、前の問い合わせの途中で押されたことを黙って捨てない
             self._status.setText(BUSY_TEXT)
 
-    def _fetched(self, terms: bool, fetched: Fetched) -> None:
+    def _fetched(self, asked: int | None, fetched: Fetched) -> None:
         catalog = fetched.catalog
         if catalog is None:
             self._status.setText(fetched.error)
@@ -180,8 +181,9 @@ class NarrationDialog(QDialog):
             return
         if catalog is not self.catalog:
             self._fill_voices(catalog)
-        if terms:
-            found = catalog.find(int(self._voice.currentData()))
+        if asked is not None:
+            # 規約の文は問い合わせた声の物 待つ間に欄を変えても、名前と規約を食い違わせない
+            found = catalog.find(asked)
             if found is not None:
                 QMessageBox.information(
                     self, "声の規約", terms_text(catalog, *found, fetched.policy or "")

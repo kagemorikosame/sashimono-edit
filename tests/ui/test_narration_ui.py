@@ -302,6 +302,31 @@ class TestDialog:
         finally:
             dialog.deleteLater()
 
+    def test_the_terms_belong_to_the_voice_asked_for(
+        self, qt_application: QApplication, engine: FakeVoiceEngine, told: list[str]
+    ) -> None:
+        # 壊れると、〔規約を見る〕の返事を待つ間に声の欄を変えた人に、後から選んだ声の名前と表記の
+        # 下に前の声の規約を見せ、非商用だけの声などを別の声の規約で判断させる
+        # （#401 の CodeRabbit の指摘）
+        del qt_application
+        engine.speakers_delay = 0.5
+        dialog = PreferencesDialog(
+            Preferences(
+                narration_engine_url=engine.url,
+                narration_voice=3,
+                narration_voice_name="ずんだもん（ノーマル）",
+            )
+        )
+        try:
+            dialog._show_voice_terms()
+            dialog._narration_voice.setCurrentIndex(0)  # 待つ間に「最初の声」へ替える
+            _settle(dialog._voice_fetch)
+            assert len(told) == 1
+            assert told[0].startswith("ずんだもん（ノーマル）")
+            assert "ずんだもんの規約" in told[0]
+        finally:
+            dialog.deleteLater()
+
     def test_changing_the_place_resets_the_chosen_voice(self, qt_application: QApplication) -> None:
         # 壊れると、別のエンジンでは同じ声の ID が別の声に当たるのに、場所だけ替えて OK を押した
         # 人の既定の声が、知らない声になる（#401 の CodeRabbit の指摘）
@@ -515,6 +540,25 @@ class TestNarrationDialog:
             dialog.read_voices()
             assert "前の問い合わせが終わっていません" in dialog._status.text()
             _settle(dialog._fetch)
+        finally:
+            dialog.deleteLater()
+
+    def test_the_narration_window_terms_belong_to_the_voice_asked_for(
+        self, qt_application: QApplication, engine: FakeVoiceEngine, told: list[str]
+    ) -> None:
+        # 壊れると、ナレーションの窓でも、規約の返事を待つ間に声を替えた人に別の声の規約を見せる
+        del qt_application
+        dialog = NarrationDialog(NarrationSettings(url=engine.url, voice=3))
+        try:
+            dialog.read_voices()
+            _settle(dialog._fetch)
+            engine.policy_delay = 0.5
+            dialog._show_terms()
+            dialog._voice.setCurrentIndex(dialog._voice.findData(2))  # 待つ間に四国めたんへ
+            _settle(dialog._fetch)
+            assert len(told) == 1
+            assert told[0].startswith("ずんだもん（ノーマル）")
+            assert "ずんだもんの規約" in told[0]
         finally:
             dialog.deleteLater()
 
