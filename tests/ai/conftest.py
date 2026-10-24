@@ -53,6 +53,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
+from sashimono.core.search import SceneNote
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.waveform import Waveform
@@ -98,6 +99,10 @@ class FakeHost:
         self.rendered: list[tuple[int, int]] = []
         #: コマを並べた 1 枚（contact_sheet・preview_range） 用意した順
         self.sheets: list[FakeSheet] = []
+        #: 素材の中の絵を並べた 1 枚（場面の説明 #326） （素材, 1 枚） 用意した順
+        self.media_sheets: list[tuple[MediaId, FakeSheet]] = []
+        #: 覚えた場面の説明 本物と同じく素材のファイル（場所）で引く 素材の ID では引かない
+        self.notes: dict[Path, tuple[SceneNote, ...]] = {}
         self.analyzed: list[MediaId] = []
         self.probed: list[Path] = []
         self.stub_waveform: Waveform | None = None
@@ -370,6 +375,17 @@ class FakeHost:
         sheet = FakeSheet(layout)
         self.sheets.append(sheet)
         return sheet
+
+    def start_media_sheet(self, media: MediaItem, layout: SheetLayout) -> FakeSheet:
+        sheet = FakeSheet(layout)
+        self.media_sheets.append((media.id, sheet))
+        return sheet
+
+    def scene_notes(self, media: MediaItem) -> tuple[SceneNote, ...]:
+        return self.notes.get(media.path, ())
+
+    def remember_scene_notes(self, media: MediaItem, notes: tuple[SceneNote, ...]) -> None:
+        self.notes[media.path] = notes
 
     def draw_sound_graph(self, graph: SoundGraph) -> bytes:
         self.graphs.append(graph)

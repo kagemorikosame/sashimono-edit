@@ -18,6 +18,8 @@ SAME_THINGS = {
     "テンプレートの棚のフォルダの名前": "folder names of the template shelf",
     "やり直し": "redo",
     "編集の方針": "editing style guide",
+    # AI が絵を見て覚えた場面の説明（#326） 引くときに字幕と文字として送る
+    "場面の説明": "scene descriptions",
 }
 
 

@@ -51,6 +51,7 @@ from sashimono.ai.host import (
     UNSAVED_REFUSAL,
     EditorHost,
     ExportRequest,
+    SheetCanvas,
     ToolError,
 )
 from sashimono.ai.outbound import (
@@ -303,6 +304,17 @@ from sashimono.core.seams import (
     plan_smoothing,
     seams_after_cuts,
     touching_scope,
+)
+from sashimono.core.search import KINDS as SEARCH_KINDS
+from sashimono.core.search import (
+    SCENE,
+    SUBTITLE,
+    Hit,
+    SceneNote,
+    hit_places,
+    media_places,
+    scene_spans,
+    search_media,
 )
 from sashimono.core.timebase import (
     FrameRate,
@@ -848,8 +860,34 @@ DEFAULT_PAGE = 50
 MAX_PAGE = 300
 
 
+class _RowsOf[T]:
+    """``items`` を 1 件ずつ ``make`` で行にする一覧 行を作るのは切り出された分だけ
+
+    :func:`_paged` が見るのは件数と切り出した分だけ 先に全部の行を作ると、返事に入らない
+    何万件にも重い整形（タイムラインのクリップを全部見るなど）を掛け、道具が動く編集画面の
+    スレッドが止まる（PR #399 の CodeRabbit の指摘） 作った行は覚えておき、返事が長すぎて
+    件数を減らして切り直すときに作り直さない
+    """
+
+    def __init__(self, items: list[T], make: Callable[[T], Any]) -> None:
+        self._items = items
+        self._make = make
+        self._made: dict[int, Any] = {}
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, window: slice) -> list[Any]:
+        return [self._row(index) for index in range(*window.indices(len(self._items)))]
+
+    def _row(self, index: int) -> Any:
+        if index not in self._made:
+            self._made[index] = self._make(self._items[index])
+        return self._made[index]
+
+
 def _paged(
-    rows: list[Any],
+    rows: list[Any] | _RowsOf[Any],
     arguments: dict[str, Any],
     *,
     name: str = "items",
@@ -1710,6 +1748,11 @@ def _draw_sheet(
         f" {layout.width}x{layout.height} 画素）{note} 各コマの下に「タイムコード フレーム」: "
         + " / ".join(f"{index + 1}) {label}" for index, label in enumerate(labels))
     )
+    return _drawing(canvas, frames, labels, caption)
+
+
+def _drawing(canvas: SheetCanvas, frames: list[int], labels: list[str], caption: str) -> Continue:
+    """升を 1 つずつ描き、時間で区切って編集画面へ手を返す 描き終えたら 1 枚の絵を返す"""
     position = 0
 
     def step() -> object:
@@ -2187,7 +2230,11 @@ def _effect_label(kind: str) -> str:
 
 
 def _paged_after(
-    head: dict[str, Any], rows: list[Any], arguments: dict[str, Any], name: str, note: str
+    head: dict[str, Any],
+    rows: list[Any] | _RowsOf[Any],
+    arguments: dict[str, Any],
+    name: str,
+    note: str,
 ) -> dict[str, Any]:
     """``head`` の後ろに一覧 ``rows`` を切って並べた返事 合わせて上限に収める
 
@@ -2703,24 +2750,369 @@ def _scene_places(
     別の映像を出すクリップも外す（PR #358 の Codex の指摘 その絵には同じ切り替わりが無い）
     1 枚目を CEIL で取るのは、新しい場面の最初の絵が出るフレームにするため
     """
-    moment = Fraction(str(seconds))
-    places: list[dict[str, Any]] = []
-    for track in project.timeline.tracks:
-        for clip in track.clips:
-            if clip.media_id != media.id or not project.draws_picture(track, clip):
-                continue
-            if _video_stream(media, clip.stream_index) != stream:
-                continue
-            if moment < clip.source_in or (clip.hold_at is not None and moment > clip.hold_at):
-                continue
-            offset = seconds_to_frame(
-                (moment - clip.source_in) / clip.speed, project.rate, Rounding.CEIL
+
+    def shows(track: Track, clip: Clip) -> bool:
+        return project.draws_picture(track, clip) and _video_stream(media, clip.stream_index) == (
+            stream
+        )
+
+    return _media_places(project, media, seconds, shows)
+
+
+def _media_places(
+    project: Project,
+    media: MediaItem,
+    seconds: float,
+    accept: Callable[[Track, Clip], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """素材の ``seconds`` が流れる、今のタイムラインの位置（素材のクリップのうち ``accept`` の物）
+
+    人の〔探す…〕の窓も同じ :func:`~sashimono.core.search.media_places` で行き先を決める
+    """
+    places = media_places(project, media, seconds, accept)
+    return [{"clip_id": str(clip.id), "frame": frame} for clip, frame in places][
+        :MAX_PLACES_PER_CUT
+    ]
+
+
+# --- 素材の意味検索（#326）---
+
+#: 1 回に引ける語の数 言い換えを並べるには足り、何百もの語で全部の行に当てる使い方はさせない
+MAX_SEARCH_WORDS = 20
+#: 1 語の長さの上限 文を丸ごと渡しても部分一致では当たらないので、語に分けて渡させる
+MAX_SEARCH_WORD_CHARS = 100
+#: 字幕を起こしていない素材として並べる数 素材の多い作品で、並びが返事を埋めない
+MAX_UNTRANSCRIBED_LISTED = 20
+#: 場面の説明を作る単位の既定と範囲（秒） 切り替わりの無い長い場面をこの長さで等分する
+#: 30 秒なら 1 時間の 1 カットで 120 場面（36 コマの 1 枚で 4 枚 1 枚 600 トークンほど）
+DEFAULT_NOTE_SPAN = 30.0
+NOTE_SPAN_RANGE = (5.0, 600.0)
+#: 場面の説明の長さの上限（文字） 1〜2 文で足りる 長いと検索の返事 1 回に入る行が減る
+NOTE_TEXT_LIMIT = 300
+#: 1 回に覚えられる場面の数と、素材 1 本に覚えられる説明の数
+#: 30 秒ごとの場面で 16 時間ほど 越えるなら場面の区切り（max_scene_seconds）を長くする
+MAX_NOTES_PER_CALL = 100
+MAX_NOTES_PER_MEDIA = 2000
+#: 何も当たらなかったときの案内 書かないと、AI が言い換えも説明作りもせずに諦める
+_NOTHING_FOUND = (
+    "当たりませんでした 言い換え（ひらがな・漢字・別の言い方・話し言葉）を queries に並べて"
+    "引き直してください 字幕を起こしていない素材（no_subtitles）は transcribe で起こすと引けます"
+    " 話していない場面は、media_scene_sheet で場面の絵を見て remember_scene_descriptions で"
+    "説明を覚えると引けます（絵を送るので、本人に頼まれたときだけ）"
+)
+
+
+def _search_words(arguments: dict[str, Any]) -> list[str]:
+    raw = arguments.get("queries")
+    if not isinstance(raw, list) or not raw:
+        raise ToolError(
+            "queries は引く語の並び（1 つ以上）で渡してください 言い換えも並べて渡せます"
+        )
+    if len(raw) > MAX_SEARCH_WORDS:
+        raise ToolError(f"queries は {MAX_SEARCH_WORDS} 語までにしてください（{len(raw)} 語）")
+    words = _string_items(raw, "queries")
+    for index, word in enumerate(words):
+        if len(word) > MAX_SEARCH_WORD_CHARS:
+            raise ToolError(
+                f"queries の {index + 1} 個目が長すぎます（{MAX_SEARCH_WORD_CHARS} 文字まで）"
+                " 文ではなく、含まれていそうな語に分けて渡してください"
             )
-            frame = clip.timeline_start + offset
-            if frame >= clip.timeline_end:
-                continue
-            places.append({"clip_id": str(clip.id), "frame": frame})
-    return sorted(places, key=lambda place: int(place["frame"]))[:MAX_PLACES_PER_CUT]
+    return words
+
+
+def _search_kinds(arguments: dict[str, Any]) -> tuple[str, ...]:
+    raw = arguments.get("kinds")
+    if raw is None:
+        return SEARCH_KINDS
+    if not isinstance(raw, list) or not raw:
+        raise ToolError(f"kinds は {'・'.join(SEARCH_KINDS)} の並びで渡してください")
+    kinds = _string_items(raw, "kinds")
+    unknown = [kind for kind in kinds if kind not in SEARCH_KINDS]
+    if unknown:
+        # 黙って捨てると、綴りを間違えた種類を引かずに「無い」と答える
+        raise ToolError(f"kinds は {'・'.join(SEARCH_KINDS)} です（{'・'.join(unknown)} は無い）")
+    return tuple(kinds)
+
+
+def _search_media(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """作品の素材すべての字幕と、覚えた場面の説明から語を含む物を引く"""
+    project = _project(host)
+    words = _search_words(arguments)
+    kinds = _search_kinds(arguments)
+    wanted = arguments.get("media_id")
+    only = _require_media(project, str(wanted)) if wanted is not None else None
+    try:
+        hits = search_media(
+            project,
+            words,
+            notes_of=host.scene_notes,
+            media_id=only.id if only is not None else None,
+            kinds=kinds,
+        )
+    except ValueError as exc:
+        raise ToolError(f"{exc} queries の語を見直してください") from exc
+    searched = [media for media in project.media if only is None or media.id == only.id]
+    head: dict[str, Any] = {
+        "media_searched": len(searched),
+        # 起こしていない素材の字幕は引けない 並べておくと、AI が transcribe を勧められる
+        # 音の無い素材は起こせないので並べない
+        "no_subtitles": [
+            str(media.id) for media in searched if media.has_audio and not media.transcripts
+        ][:MAX_UNTRANSCRIBED_LISTED],
+    }
+    if SCENE in kinds:
+        head["media_with_scene_notes"] = sum(1 for media in searched if host.scene_notes(media))
+    # 行は返事に入るページの分だけ作る 1 行ごとにタイムラインのクリップを全部見るので、
+    # 短い語で何万行も当たり、詰めて何千本のクリップがある作品だと画面が止まる
+    rows = _RowsOf(hits, lambda hit: _hit_row(project, hit))
+    return _paged_after(head, rows, arguments, "hits", "" if hits else _NOTHING_FOUND)
+
+
+def _hit_row(project: Project, hit: Hit) -> dict[str, Any]:
+    media = project.require_media(hit.media_id)
+    row: dict[str, Any] = {
+        "kind": hit.kind,
+        "media_id": str(hit.media_id),
+        "source_seconds": hit.start,
+        "source_end_seconds": hit.end,
+        "text": hit.text,
+        "matched": list(hit.matched),
+    }
+    if hit.kind == SUBTITLE:
+        # get_subtitles・set_subtitle_text と同じ番号で指せるように、音声の番号と行の ID を添える
+        row["audio"] = _audio_number(media, hit.stream)
+        row["segment_id"] = str(hit.segment_id)
+    # その場面が流れるタイムラインの位置 preview_frame へそのまま渡せる 置いていなければ空
+    # 字幕の当たりは、その音を鳴らすクリップを選び、別の言語の音のクリップは選ばない 選ぶと、
+    # AI が探した言葉の聞こえない所を見て確かめる（人の窓と同じ hit_places）
+    row["timeline"] = [
+        {"clip_id": str(clip.id), "frame": frame}
+        for clip, frame in hit_places(project, media, hit.start, hit.stream)
+    ][:MAX_PLACES_PER_CUT]
+    _clip_text(row, None)
+    return row
+
+
+@dataclass(frozen=True, slots=True)
+class _SheetQuery:
+    offset: int
+    count: int
+    longest: float
+    threshold: float
+    cell: int
+    columns: int | None
+    wait: float
+
+
+def _sheet_query(arguments: dict[str, Any]) -> _SheetQuery:
+    """引数を先に全部確かめる 解析を待った後で断ると、待った時間が無駄になる"""
+    offset = _whole_number(arguments, "offset", 0)
+    if offset < 0:
+        raise ToolError(f"offset は 0 以上にしてください（{offset}）")
+    return _SheetQuery(
+        offset=offset,
+        count=_within(arguments, "count", SHEET_DEFAULT_COUNT, 1, SHEET_MAX_COUNT),
+        longest=_number_or(arguments, "max_scene_seconds", DEFAULT_NOTE_SPAN, *NOTE_SPAN_RANGE),
+        threshold=_number_or(arguments, "threshold", DEFAULT_THRESHOLD, *SCENE_THRESHOLD_RANGE),
+        cell=_within(arguments, "cell_width", SHEET_DEFAULT_CELL, MIN_CELL_WIDTH, MAX_CELL_WIDTH),
+        columns=(
+            None if arguments.get("columns") is None else _whole_number(arguments, "columns", 0)
+        ),
+        wait=_number_or(arguments, "wait_seconds", DEFAULT_SCENE_WAIT, 0.0, MAX_SCENE_WAIT),
+    )
+
+
+def _media_scene_sheet(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の場面ごとの真ん中の絵を 1 枚に並べる 説明を作るための絵（#326）"""
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    if not media.has_video:
+        # 名前は書かない この道具は名前と場所を送ると宣言していない（ID で伝わる）
+        raise ToolError(
+            f"素材 {media.id} には映像がありません 場面の絵は映像から描きます"
+            " 字幕は search_media で引けます"
+        )
+    query = _sheet_query(arguments)
+    host.request_scenes(media)
+    state = host.scene_state(media)
+    if state.complete or not state.running or query.wait <= 0:
+        return _scene_sheet(host, media, query, state)
+    media_id = media.id
+
+    def finish() -> object:
+        # 待っている間に素材が外されたら、外したことを伝える（detect_scenes と同じ）
+        again = _require_media(_project(host), str(media_id))
+        return _scene_sheet(host, again, query, host.scene_state(again))
+
+    return Pending(wait=host.scene_waiter(media_id), seconds=query.wait, then=finish)
+
+
+def _seconds_label(value: float) -> str:
+    # 同じ場面かを決める _span_key と同じ小数第 2 位で出す AI はこの秒を写して
+    # remember_scene_descriptions へ渡す 有効数字 6 桁（:g）だと 10000 秒を越える素材で
+    # 12345.678 が 12345.7 になり、写した秒が場面と合わず、説明が置き換わらずに増え続ける
+    return f"{round(value, 2):.2f}".rstrip("0").rstrip(".")
+
+
+def _scene_sheet(
+    host: EditorHost,
+    media: MediaItem,
+    query: _SheetQuery,
+    state: SceneState,
+) -> object:
+    if state.signal is None:
+        if state.failure is not None:
+            # 失敗の文には素材の場所が入りうる 理由は名前と場所を送ると宣言した detect_scenes で読む
+            raise ToolError(
+                f"素材 {media.id} の場面を調べられませんでした 理由は detect_scenes で読めます"
+            )
+        raise ToolError(
+            "場面の解析がまだ始まったばかりです wait_seconds を延ばすか、しばらくしてから"
+            " 同じ引数で呼び直してください"
+        )
+    signal = state.signal
+    duration = float(media.duration)
+    end = duration if signal.complete else min(signal.analyzed, duration)
+    cuts = [cut.seconds for cut in signal.cuts(query.threshold, DEFAULT_MIN_SCENE)]
+    spans = scene_spans(cuts, end, query.longest)
+    if not spans:
+        raise ToolError(
+            "描ける場面がありません（解析できた長さが 0 秒） 少し待って呼び直してください"
+        )
+    if query.offset >= len(spans):
+        raise ToolError(f"offset は 0〜{len(spans) - 1} にしてください（場面は {len(spans)} 個）")
+    chosen = spans[query.offset : query.offset + query.count]
+    rate = _project(host).rate
+    middles = [(head + tail) / 2 for head, tail in chosen]
+    frames = [seconds_to_frame(Fraction(str(middle)), rate, Rounding.FLOOR) for middle in middles]
+    try:
+        layout = sheet_layout(
+            len(frames),
+            cell_width=query.cell,
+            frame_size=media.video_streams[0].display_size,
+            columns=query.columns,
+            # 長い辺の上限は本人の設定（#344 contact_sheet と同じ） 渡さないと、上限を小さくした
+            # 人にも場面の 1 枚だけ 1568 画素で送る
+            max_edge=host.image_edge,
+        )
+    except SheetError as exc:
+        raise ToolError(str(exc)) from exc
+    # 説明ありと書くのは、両端が同じ場面（remember と同じ _span_key）の説明があるときだけ
+    # 真ん中が古い説明の中にあるかで見ると、解析の途中で書いた仮の末尾の場面（解析できた所で
+    # 切った物）の説明が、解析を終えてのびた場面まで覆って見え、AI が見直さずにのびた分が
+    # 説明の無いまま検索から抜ける 途中の場面を書かせない方は採らない 長い素材は解析を
+    # 待たずに前から説明を作れる方が良く、両端で見れば仮の場面の説明も前の分の説明として残る
+    described = {_span_key(note) for note in host.scene_notes(media)}
+    numbers = range(query.offset + 1, query.offset + len(chosen) + 1)
+    labels = [
+        f"{number}) {_seconds_label(head)}〜{_seconds_label(tail)} 秒"
+        for number, (head, tail) in zip(numbers, chosen, strict=True)
+    ]
+    listed = [
+        label + ("（説明あり）" if (round(head, 2), round(tail, 2)) in described else "")
+        for label, (head, tail) in zip(labels, chosen, strict=True)
+    ]
+    caption = (
+        f"素材 {media.id} の場面 {query.offset + 1}〜{query.offset + len(chosen)}"
+        f"（全 {len(spans)} 場面 {layout.columns} 列 x {layout.rows} 行 左上から右へ"
+        f" {layout.width}x{layout.height} 画素 各コマは場面の真ん中の絵 時刻は素材の秒）: "
+        + " / ".join(listed)
+        + " 場面ごとに、見えている物・人・場所・出来事を 1〜2 文で書き、"
+        "remember_scene_descriptions の scenes に from_seconds・to_seconds をこの秒のまま"
+        "渡して覚えてください（search_media で引けるようになります）"
+    )
+    following = query.offset + len(chosen)
+    if following < len(spans):
+        caption += f" 続きの場面は offset={following} で呼んでください"
+    if not signal.complete:
+        caption += (
+            f" 解析の途中です（{round(signal.analyzed, 1)} 秒まで） 後ろの場面は解析が"
+            "終わってから呼び直すと出ます"
+        )
+    # 再生しながら別の絵を描くと GL の資源を取り合う（contact_sheet と同じ）
+    host.stop_playback()
+    canvas = host.start_media_sheet(media, layout)
+    return _drawing(canvas, frames, labels, caption)
+
+
+def _scene_note(media: MediaItem, entry: object, index: int) -> SceneNote:
+    """覚える場面 1 つを確かめる 断る文に説明の文は書かない（字幕と文字を送ると宣言していない）"""
+    where = f"scenes の {index + 1} 個目"
+    if not isinstance(entry, dict):
+        raise ToolError(f"{where} は from_seconds・to_seconds・text を持つ物で渡してください")
+    times: list[float] = []
+    for key in ("from_seconds", "to_seconds"):
+        value = entry.get(key)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ToolError(f"{where} の {key} は秒の数で渡してください")
+        times.append(float(value))
+    start, end = times
+    duration = float(media.duration)
+    # 終わりは 1 フレームほどはみ出してよい 場面の区切りは 3 桁に丸めて返している
+    if duration > 0 and end > duration + 0.05:
+        raise ToolError(f"{where} の to_seconds が素材の長さ（{round(duration, 3)} 秒）を越えます")
+    text = entry.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ToolError(f"{where} の text（場面の説明）を書いてください")
+    if len(text.strip()) > NOTE_TEXT_LIMIT:
+        raise ToolError(f"{where} の text は {NOTE_TEXT_LIMIT} 文字までにしてください")
+    try:
+        return SceneNote(start=start, end=end, text=text.strip())
+    except ValueError as exc:
+        raise ToolError(f"{where}: {exc}") from exc
+
+
+def _span_key(note: SceneNote) -> tuple[float, float]:
+    # 同じ場面かは 0.01 秒で比べる 場面の区切りは 3 桁で返すので、AI が写し直しても同じになる
+    return round(note.start, 2), round(note.end, 2)
+
+
+def _remember_scene_descriptions(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """AI が作った場面の説明を素材ごとに覚える 作品の外に置くので作品は変えない"""
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    clear = _flag_argument(arguments, "clear", False)
+    raw = arguments.get("scenes")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise ToolError("scenes は覚える場面の並びで渡してください")
+    if not raw and not clear:
+        raise ToolError(
+            "scenes に覚える場面を 1 つ以上渡してください（全部忘れるときは clear を true に）"
+        )
+    if len(raw) > MAX_NOTES_PER_CALL:
+        raise ToolError(f"scenes は 1 回に {MAX_NOTES_PER_CALL} 個までにしてください")
+    fresh: dict[tuple[float, float], SceneNote] = {}
+    for index, entry in enumerate(raw):
+        note = _scene_note(media, entry, index)
+        # 同じ場面を 2 度渡したら後の物 説明を直した版を後ろに書くのが自然な書き方
+        fresh[_span_key(note)] = note
+    kept = [] if clear else [n for n in host.scene_notes(media) if _span_key(n) not in fresh]
+    merged = sorted([*kept, *fresh.values()], key=lambda note: (note.start, note.end))
+    if len(merged) > MAX_NOTES_PER_MEDIA:
+        raise ToolError(
+            f"素材 1 本に覚えられる説明は {MAX_NOTES_PER_MEDIA} 個までです"
+            " 場面の区切り（media_scene_sheet の max_scene_seconds）を長くしてください"
+        )
+    try:
+        host.remember_scene_notes(media, tuple(merged))
+    except OSError as exc:
+        # 書けない理由（空きが無い・権限が無い）の文には控えの置き場の場所が入る ブリッジが
+        # 伏せ字に通すのは ToolError だけなので、そのまま投げると名前を送らないと決めた人の
+        # ユーザー名入りの場所が AI へ渡る 場所は書かずに、どうすればよいかだけを返す
+        raise ToolError(
+            "場面の説明を控えに書けませんでした 置き場の空きと権限を確かめてから、"
+            "もう 1 度呼んでください"
+        ) from exc
+    return {
+        "media_id": str(media.id),
+        "remembered": len(fresh),
+        "total": len(merged),
+        "note": (
+            "search_media で引けます（作品の外に覚えるので、作品と取り消しの履歴は変わりません）"
+        ),
+    }
 
 
 # --- 盛り上がり（#325）---
@@ -8430,6 +8822,129 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_detect_scenes,
         sends=_WITH_FILES,
+    ),
+    # 素材の意味検索（#326） 字幕と、AI が絵を見て作って覚えた場面の説明から「あの場面」を引く
+    Operation(
+        name="search_media",
+        description=(
+            "作品の素材すべて（タイムラインに置いていない素材も）の字幕と、覚えた場面の説明"
+            "（remember_scene_descriptions）から、語を含む物を引く「あの場面」を探すときに使う"
+            " 表記のゆれ（全角と半角・ひらがなとカタカナ・大文字と小文字・空白）は揃えて比べる"
+            " 意味の近い言い換え（「食べた」と「食事」）は拾わないので、言い換えを queries に"
+            "並べるか、語を変えて何度か引く 多くの語が当たった物から並べ、各行に当たった語"
+            "（matched）を書く 時刻は素材の秒（source_seconds〜source_end_seconds） timeline は"
+            "その時刻が流れるタイムラインのフレーム（preview_frame へそのまま渡せる 置いて"
+            "いなければ空） 字幕の行は audio と segment_id で get_subtitles・set_subtitle_text の"
+            "行を指せる no_subtitles は字幕を起こしていない素材（transcribe で起こすと引ける）"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": MAX_SEARCH_WORDS,
+                    "description": (
+                        f"引く語（{MAX_SEARCH_WORDS} 語まで どれか 1 つを含めば当たる）"
+                        " 言い換え・別の書き方も並べる 文ではなく、含まれていそうな短い語にする"
+                    ),
+                },
+                "media_id": _string("この素材だけを引く（省くと作品の素材すべて）"),
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(SEARCH_KINDS)},
+                    "description": ("引く物 subtitle（字幕）・scene（場面の説明）（省くと両方）"),
+                },
+                **_paging(),
+            },
+            ["queries"],
+        ),
+        handler=_search_media,
+        # 字幕の文と場面の説明（どちらも字幕と文字）を返す 素材は ID で返し、名前は返さない
+        sends=_WITH_TEXT,
+    ),
+    Operation(
+        name="media_scene_sheet",
+        description=(
+            "素材（動画）の場面ごとの真ん中の絵を 1 枚に並べる 場面の説明を作るための絵で、"
+            "本人に頼まれたとき（話していない場面も探したい・素材の中身をまとめてほしい）だけ使う"
+            "（絵を送るので費用がかかる 勝手に全部の素材を見ない） タイムラインに置いていない"
+            "素材も見られる 場面は detect_scenes の切り替わりで分け、max_scene_seconds より長い"
+            "場面は等分する 見たら場面ごとに見えている物・人・場所・出来事を 1〜2 文で書き、"
+            "remember_scene_descriptions で覚えると search_media で引ける 説明済みの場面には"
+            "（説明あり）が付く 場面が多ければ offset で続きを見る 解析が終わっていなければ"
+            " wait_seconds まで待つ"
+            f" 1 枚の長い辺は {MAX_SHEET_EDGE} 画素までで、超えるときは升を縮める"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "offset": _integer("何番目の場面から（0 から 続きは返事に書く offset）"),
+                "count": _integer(
+                    f"並べる場面の数（1〜{SHEET_MAX_COUNT}、既定 {SHEET_DEFAULT_COUNT}）"
+                ),
+                "max_scene_seconds": _number(
+                    f"場面の長さの上限の秒（{NOTE_SPAN_RANGE[0]:g}〜{NOTE_SPAN_RANGE[1]:g}、"
+                    f"既定 {DEFAULT_NOTE_SPAN:g}） 長い場面はこの長さ以下に等分する"
+                ),
+                "threshold": _number(
+                    f"切り替わりの感度（detect_scenes と同じ 既定 {DEFAULT_THRESHOLD:g}）"
+                ),
+                "cell_width": _integer(
+                    f"1 コマの横幅（{MIN_CELL_WIDTH}〜{MAX_CELL_WIDTH}、既定 {SHEET_DEFAULT_CELL}）"
+                ),
+                "columns": _integer(f"列の数（1〜{MAX_COLUMNS}） 省くと升が大きく取れる数"),
+                "wait_seconds": _number(
+                    f"解析が終わっていないときに待つ秒（0〜{MAX_SCENE_WAIT:g}、"
+                    f"既定 {DEFAULT_SCENE_WAIT:g}）"
+                ),
+            },
+            ["media_id"],
+        ),
+        handler=_media_scene_sheet,
+        # 素材の絵と、場面の番号・素材の秒（作品の構成）を返す 素材の名前は書かない
+        sends=_WITH_FRAMES,
+    ),
+    Operation(
+        name="remember_scene_descriptions",
+        description=(
+            "media_scene_sheet で見た場面の説明を素材ごとに覚える 覚えた説明は search_media で"
+            "引ける from_seconds・to_seconds は media_scene_sheet に書いた場面の秒のまま渡す"
+            " 同じ場面をもう 1 度渡すと説明を置き換える clear を true にすると、その素材の説明を"
+            "先に全部忘れる 説明は作品の外（アプリの解析の控え）に覚えるので、作品も取り消しの"
+            "履歴も変わらない 同じ素材のファイルなら別の作品でも引ける"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材（list_media の media_id）"),
+                "scenes": {
+                    "type": "array",
+                    "maxItems": MAX_NOTES_PER_CALL,
+                    "description": f"覚える場面（1 回に {MAX_NOTES_PER_CALL} 個まで）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "from_seconds": _number("場面の頭（素材の秒）"),
+                            "to_seconds": _number("場面の終わり（素材の秒）"),
+                            "text": _string(
+                                f"場面の説明 見えている物・人・場所・出来事を 1〜2 文で"
+                                f"（{NOTE_TEXT_LIMIT} 文字まで）"
+                            ),
+                        },
+                        "required": ["from_seconds", "to_seconds", "text"],
+                        "additionalProperties": False,
+                    },
+                },
+                "clear": _boolean("真なら、この素材の説明を先に全部忘れる"),
+            },
+            ["media_id"],
+        ),
+        handler=_remember_scene_descriptions,
+        # 返すのは覚えた数だけ 説明の文は返さない
+        # （引くのは search_media で、字幕と文字として尋ねる）
+        # 作品を変えないので読むだけ（2026-10-20 利用者の決定 作品に書くなら取り消せる編集にする）
+        sends=_STRUCTURE,
     ),
     Operation(
         name="find_highlights",
