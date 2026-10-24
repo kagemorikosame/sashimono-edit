@@ -9,11 +9,17 @@ AviUtl2 の置き場へ写す手順を出す **利用者の設定へは書きに
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import importlib.util
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -22,6 +28,7 @@ import numpy as np
 import pytest
 
 from sashimono.compat.aviutl import plugin
+from tests.waiting import GUARD_SECONDS
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -187,23 +194,171 @@ class TestProfileCommand:
 #: 手順のうち、本人がそのまま打つ命令の行
 _COMMANDS = ("Copy-Item", "New-Item", "Move-Item", "Remove-Item")
 
+#: 試験の間ずっと開いておく PowerShell が回す輪 1 行に 1 つ、UTF-16 の base64 で命令を受け、
+#: 打てたら ``ok``、打てなければ ``error`` と理由（UTF-8 の base64）を返す
+#: 行き来を ASCII だけにするのは、日本語のパスを英語版 Windows（CI）の OEM の符号でも
+#: 化けさせずに渡すため ``Stop`` にするのは、途中の 1 つが打てずに後ろだけが通っても
+#: 「なぞれた」と読まないため（前は ``;`` でつないだ最後の命令の成否しか見ていなかった）
+_LOOP = """
+$ErrorActionPreference = 'Stop'
+[Console]::Out.WriteLine('ready')
+[Console]::Out.Flush()
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    try {
+        $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($line))
+        Invoke-Expression $text | Out-Null
+        [Console]::Out.WriteLine('ok')
+    } catch {
+        $reason = [Text.Encoding]::UTF8.GetBytes($_.ToString())
+        [Console]::Out.WriteLine('error ' + [Convert]::ToBase64String($reason))
+    }
+    [Console]::Out.Flush()
+}
+"""
 
-def _follow(lines: list[str], part: str) -> None:
+#: PowerShell が立ち上がって輪に入るまでの上限（秒） 手元では 0.2 秒ほどだが、CI の遅い機械で
+#: 並べて走らせると、1 本を立ち上げるだけで 60 秒を超えたことがある（#406） 立ち上げは
+#: 試験のファイルで 1 回だけなので、長く取っても速い機械の待ちは変わらない
+_START_TIMEOUT = 300.0
+#: 立ち上がった後の 1 回の命令（小さなファイルの写しと消し）の上限（秒） 返ればすぐ戻る
+_COMMAND_TIMEOUT = 60.0
+
+
+class _PowerShell:
+    """命令を打つ PowerShell 1 本 試験のファイルの間ずっと使い回す
+
+    前は手順を 1 回なぞるたびに powershell.exe を立ち上げていた 試験 5 本で 13 回になり、
+    命令そのもの（小さなファイルの写し）より立ち上げの方がずっと重い 遅い機械ではその
+    立ち上げが 60 秒の上限を超えて落ちた（#406） 1 本を使い回せば立ち上げは 1 回で済む
+
+    標準入力は自分の管にする 渡さないと xdist の働き手の標準入力（試験を配る管）を
+    PowerShell が受け継ぐ
+    """
+
+    def __init__(self) -> None:
+        script = base64.b64encode(_LOOP.encode("utf-16-le")).decode("ascii")
+        self._process = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="ascii",
+            errors="replace",
+        )
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        #: 輪の決まりに無い行（PowerShell が自分で出した警告など） 落ちたときに添える
+        self._noise: list[str] = []
+        #: 上限で諦めたか、途中で終わった 立ったら打たない（:meth:`_give_up`）
+        self._broken = False
+        # 読むのは別のスレッド 読みながら上限で諦めるには、塞がる読みを試験の外へ出すしかない
+        threading.Thread(target=self._read, daemon=True).start()
+        # 立ち上げで諦めたときも _expect が止める 落ちると fixture の close まで届かない
+        self._expect("ready", _START_TIMEOUT)
+
+    def _read(self) -> None:
+        stdout = self._process.stdout
+        assert stdout is not None
+        for line in stdout:
+            self._lines.put(line.rstrip("\r\n"))
+        self._lines.put(None)
+
+    def _expect(self, what: str, timeout: float) -> str:
+        """``what`` で始まる行か ``error`` の行を待つ"""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                line = self._lines.get(timeout=max(0.0, remaining))
+            except queue.Empty:
+                self._give_up()
+                pytest.fail(f"PowerShell が {timeout:g} 秒で {what} を返さなかった {self._noise}")
+            if line is None:
+                self._give_up()
+                pytest.fail(f"PowerShell が途中で終わった {self._noise}")
+            if line.startswith((what, "error")):
+                return line
+            self._noise.append(line)
+
+    def _give_up(self) -> None:
+        """この 1 本をもう使わない 止めておく
+
+        1 本を試験のファイルで使い回すので、諦めた命令の遅れた ``ok`` が残ると、次の命令の
+        答えとして受け取り、打てていない手順を「なぞれた」と読む 止まったまま残すと、
+        次の試験が上限まで待つ
+        """
+        self._broken = True
+        self._process.kill()
+
+    def run(self, command: str, timeout: float = _COMMAND_TIMEOUT) -> None:
+        """命令を 1 つ打ち、打てたことを確かめる"""
+        if self._broken:
+            pytest.fail(f"前の命令で PowerShell が応答しなくなったので打たない {self._noise}")
+        stdin = self._process.stdin
+        assert stdin is not None
+        stdin.write(base64.b64encode(command.encode("utf-16-le")).decode("ascii") + "\n")
+        stdin.flush()
+        answer = self._expect("ok", timeout)
+        if answer.startswith("error"):
+            reason = base64.b64decode(answer.removeprefix("error ")).decode("utf-8")
+            pytest.fail(f"打てなかった: {command}\n{reason}")
+
+    def close(self) -> None:
+        stdin = self._process.stdin
+        if stdin is not None:
+            # 諦めて止めた後は管がもう切れている 閉じるときの書き損じは捨てる
+            with contextlib.suppress(OSError):
+                stdin.close()
+        try:
+            self._process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+
+
+@pytest.fixture(scope="module")
+def powershell() -> Iterator[_PowerShell]:
+    session = _PowerShell()
+    yield session
+    session.close()
+
+
+def _follow(shell: _PowerShell, lines: list[str], part: str) -> None:
     """手順の命令を、書かれた順に PowerShell で打つ ``part`` は置く側か戻す側か
 
     文言を見るだけでは、打てない命令や順番の誤りを見逃す 実際に打って結果を見る
     """
     split = next(i for i, line in enumerate(lines) if line.startswith("比べ終わったら"))
     chosen = lines[:split] if part == "place" else lines[split:]
-    commands = [line.strip() for line in chosen if line.strip().startswith(_COMMANDS)]
-    if not commands:
-        return
-    subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", "; ".join(commands)],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    )
+    for line in chosen:
+        if line.strip().startswith(_COMMANDS):
+            shell.run(line.strip())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="手順は PowerShell の命令で出す")
+def test_a_session_that_timed_out_is_not_reused() -> None:
+    """壊れると、上限で諦めた命令の遅れた ``ok`` を次の命令の答えとして受け取り、打てて
+    いない手順を「なぞれた」と読む 止まった PowerShell も残り、次の試験が上限まで待つ
+
+    試験のファイルで使い回す 1 本とは別に立ち上げ、上限より長くかかる命令で順番を決め打ちにする
+    """
+    session = _PowerShell()
+    try:
+        # 終わらない命令にする 数秒で終わる命令だと、遅い機械では上限を数え始める前に
+        # 終わってしまい、諦める道を通らない
+        with pytest.raises(pytest.fail.Exception, match="返さなかった"):
+            session.run(
+                "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)",
+                timeout=0.5,
+            )
+        # 諦めた時に止めてあること 止めないと、遅れた ok が次の命令の答えになる
+        # 止めた物はすぐ終わる 上限は止め損ねたときに試験が戻らなくならないためだけ
+        assert session._process.wait(timeout=GUARD_SECONDS) is not None
+        # 次の命令は打たずに断る（送る前に断るので、上限まで待たない）
+        with pytest.raises(pytest.fail.Exception, match="応答しなくなった"):
+            session.run("New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null")
+    finally:
+        session.close()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="手順は PowerShell の命令で出す")
@@ -222,7 +377,7 @@ class TestFollowingTheGuide:
         return tmp_path / "aviutl2" / "compositefont" / "profiles.json"
 
     def test_a_folder_with_brackets_quotes_and_dollars_still_works(
-        self, tool: ModuleType, tmp_path: Path
+        self, tool: ModuleType, powershell: _PowerShell, tmp_path: Path
     ) -> None:
         """二重引用符と ``-Path`` では、``[`` ``]`` がワイルドカード、``$`` が変数として読まれ、
         見本も控えも見つからないまま置く手順も戻す手順も失敗する
@@ -235,58 +390,58 @@ class TestFollowingTheGuide:
         target.parent.mkdir(parents=True)
         target.write_text('{"元": 1}', encoding="utf-8")
         lines = tool.profile_guide(sample, target)
-        _follow(lines, "place")
+        _follow(powershell, lines, "place")
         assert target.read_text(encoding="utf-8") == '{"見本": 1}'
-        _follow(lines, "restore")
+        _follow(powershell, lines, "restore")
         assert target.read_text(encoding="utf-8") == '{"元": 1}'
 
     def test_restoring_brings_back_the_original(
-        self, tool: ModuleType, sample: Path, target: Path
+        self, tool: ModuleType, powershell: _PowerShell, sample: Path, target: Path
     ) -> None:
         """戻す手順が無いと、比べ終わったあとも見本の組み替えが普段の AviUtl2 に残る"""
         target.parent.mkdir(parents=True)
         target.write_text('{"本人": 1}', encoding="utf-8")
         lines = tool.profile_guide(sample, target)
-        _follow(lines, "place")
+        _follow(powershell, lines, "place")
         assert target.read_text(encoding="utf-8") == '{"見本": 1}'
-        _follow(lines, "restore")
+        _follow(powershell, lines, "restore")
         assert target.read_text(encoding="utf-8") == '{"本人": 1}'
         assert not tool.backup_of(target).exists()
 
     def test_restoring_removes_the_sample_when_there_was_nothing(
-        self, tool: ModuleType, sample: Path, target: Path
+        self, tool: ModuleType, powershell: _PowerShell, sample: Path, target: Path
     ) -> None:
         """元が無かったのに見本を残すと、置く前に無かった組み替えが居座る"""
         lines = tool.profile_guide(sample, target)
-        _follow(lines, "place")
+        _follow(powershell, lines, "place")
         assert target.read_text(encoding="utf-8") == '{"見本": 1}'
-        _follow(lines, "restore")
+        _follow(powershell, lines, "restore")
         assert not target.exists()
 
     def test_following_it_twice_keeps_the_original_backup(
-        self, tool: ModuleType, sample: Path, target: Path
+        self, tool: ModuleType, powershell: _PowerShell, sample: Path, target: Path
     ) -> None:
         """もう一度なぞると、置いたままの見本を「元の設定」として控えに上書きし、
         本人の設定へ戻せなくなる
         """
         target.parent.mkdir(parents=True)
         target.write_text('{"本人": 1}', encoding="utf-8")
-        _follow(tool.profile_guide(sample, target), "place")
+        _follow(powershell, tool.profile_guide(sample, target), "place")
         again = tool.profile_guide(sample, target)
         assert any("見本が置かれたまま" in line for line in again)
-        _follow(again, "place")
+        _follow(powershell, again, "place")
         assert tool.backup_of(target).read_text(encoding="utf-8") == '{"本人": 1}'
-        _follow(again, "restore")
+        _follow(powershell, again, "restore")
         assert target.read_text(encoding="utf-8") == '{"本人": 1}'
 
     def test_following_it_twice_without_an_original_still_cleans_up(
-        self, tool: ModuleType, sample: Path, target: Path
+        self, tool: ModuleType, powershell: _PowerShell, sample: Path, target: Path
     ) -> None:
         """2 度目の手順が控えを戻そうとすると、無い控えを探して止まり見本が残る"""
-        _follow(tool.profile_guide(sample, target), "place")
+        _follow(powershell, tool.profile_guide(sample, target), "place")
         again = tool.profile_guide(sample, target)
-        _follow(again, "place")
-        _follow(again, "restore")
+        _follow(powershell, again, "place")
+        _follow(powershell, again, "restore")
         assert not target.exists()
 
 
@@ -378,7 +533,7 @@ def test_the_real_plugin_composes_with_the_sample(
         text=True,
         encoding="utf-8",
         env=environment,
-        timeout=60,
+        timeout=GUARD_SECONDS,
         check=True,
     )
     decorated = json.loads(result.stdout.strip().splitlines()[-1])[0]

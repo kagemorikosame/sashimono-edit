@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +47,7 @@ from sashimono.ui.theme import Colors
 from sashimono.ui.timeline import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.media_fixtures import SampleMedia
+from tests.waiting import wait_until
 
 # --- 組み立て ---
 
@@ -501,12 +501,13 @@ class TestRealThumbnails:
             assert window.wait_for_imports()
             (media,) = window.document.project.media
             pool = window._media_pool
-            deadline = time.monotonic() + 30
-            while media.id not in pool._icons and time.monotonic() < deadline:
+
+            def turn() -> None:
                 QApplication.processEvents()
                 window._flush_analysis()
-                time.sleep(0.02)
-            assert media.id in pool._icons
+
+            # 解析が終わる時間は機械の速さで変わる 秒で区切らず、絵が届くのを待つ（#405）
+            wait_until(lambda: media.id in pool._icons, "素材の絵", step=turn, pause=0.02)
             assert window._analyzer.filmstrip(media) is not None
         finally:
             window.close()

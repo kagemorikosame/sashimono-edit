@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -28,6 +27,7 @@ from sashimono.core.model import MediaItem, Transcript
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import make_loaded
 from tests.ai.test_bridge import call_in_thread
+from tests.waiting import wait_until
 
 MARK = "ZZSECRET"
 
@@ -208,11 +208,8 @@ def _call(window: MainWindow, name: str) -> str:
     )
     operation = next(op for op in OPERATIONS if op.name == name)
     done, box = call_in_thread(bridge, operation, {})
-    deadline = time.monotonic() + 10
-    while not done.is_set() and time.monotonic() < deadline:
-        window._chat._poll()
-        time.sleep(0.005)
-    assert done.is_set()
+    # 返る時間は機械の速さで変わる 秒で区切らず、道具が返るのを待つ（#405）
+    wait_until(done.is_set, "道具", step=window._chat._poll)
     return json.dumps(
         {"result": box.get("result"), "error": str(box.get("error") or "")},
         ensure_ascii=False,

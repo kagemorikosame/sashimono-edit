@@ -23,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from tests.waiting import GUARD_SECONDS
+
 __all__ = ["DEFAULT_SPEAKERS", "FakeVoiceEngine", "closed_engine_url", "fake_voice_engine"]
 
 #: 既定の声の一覧 VOICEVOX の /speakers と同じ形 歌の声（sing）は文を読めないので選べない
@@ -84,6 +86,9 @@ class FakeVoiceEngine:
     synthesis_delay: float = 0.0
     #: 声の一覧を返す前に待つ秒 返事の遅いエンジンで窓が固まらないかを見る試験で使う
     speakers_delay: float = 0.0
+    #: 立つまで声の一覧を返さない 秒で待つ代わりに、試験が返す時を決める（秒の待ちは、遅い
+    #: 機械で試験の側が止まると待ちの長さと順番が入れ替わる）
+    speakers_gate: threading.Event | None = None
     #: 声の規約を返す前に待つ秒 待つ間に声の欄を変える試験で使う
     policy_delay: float = 0.0
     #: 合成で返す番号 200 以外にすると断る
@@ -157,7 +162,14 @@ def _handler(engine: FakeVoiceEngine) -> type[BaseHTTPRequestHandler]:
             elif path == "/speakers":
                 if engine.speakers_delay:
                     time.sleep(engine.speakers_delay)
-                self._json(engine.speakers)
+                if engine.speakers_gate is not None and not engine.speakers_gate.wait(
+                    GUARD_SECONDS
+                ):
+                    # 試験が放す前に上限が来たら、一覧は返さず断る 返すと、順番を決めたはずの
+                    # 試験が、放す前に届いた一覧を正しい答えとして受け取り、崩れを見逃す
+                    self._json({"detail": "gate timed out"}, 503)
+                else:
+                    self._json(engine.speakers)
             elif path == "/speaker_info":
                 if engine.policy_delay:
                     time.sleep(engine.policy_delay)

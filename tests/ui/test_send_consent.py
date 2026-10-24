@@ -7,7 +7,6 @@ AI の道具の呼び出しはスレッドを 1 本立てて行い、画面の�
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +29,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ai.test_bridge import call_in_thread
+from tests.waiting import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -76,13 +76,15 @@ def _preview(window: MainWindow) -> dict[str, object]:
     operation = find_operation("preview_frame")
     assert operation is not None
     done, box = call_in_thread(_bridge(window), operation, {"frame": 0, "width": 160})
-    deadline = time.monotonic() + 10
-    while not done.is_set() and time.monotonic() < deadline:
+
+    def turn() -> None:
         window._chat._poll()
         QApplication.processEvents()
-        time.sleep(0.005)
+
+    # 返る時間は機械の速さで変わる 秒で区切らず、道具が返るのを待つ（#405） 送る前の確かめを
+    # 待ったまま止まる崩れは、上限（tests/waiting.py）に当たって居場所と一緒に落ちる
+    wait_until(done.is_set, "道具（送る前の確かめを待ったまま止まっていないか）", step=turn)
     window._chat._poll()
-    assert done.is_set(), "道具が終わらなかった（送る前の確かめを待ったまま止まっている）"
     return box
 
 

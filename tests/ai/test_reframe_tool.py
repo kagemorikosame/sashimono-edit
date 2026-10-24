@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sashimono.ai import operations
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, Pending, find_operation
@@ -26,6 +27,7 @@ from sashimono.engine.subject import SUBJECT_BINS, SUBJECT_SECONDS, SubjectTrack
 from sashimono.engine.vision import Box, Face, ScreenKind, ScreenReport, ScreenSample
 from tests.ai.conftest import RATE_30, FakeHost, allow_sending
 from tests.ai.test_bridge import call_in_thread, pump_until
+from tests.waiting import GUARD_SECONDS
 
 
 def _operation() -> Operation:
@@ -114,14 +116,60 @@ class TestTheAnalysis:
         host.scene_ready = finished
         # 確かめの窓は別の試験（test_bridge.py）が見る ここは待った後の続きだけを見る
         bridge = allow_sending(EditorBridge(host, auto_approve=True))
-        began = time.monotonic()
-        done, box = call_in_thread(bridge, REFRAME, {"wait_seconds": 5})
-        pump_until(bridge, done)
-        assert time.monotonic() - began < 5.0
+        done, box = call_in_thread(bridge, REFRAME, {"wait_seconds": 120})
+        pump_until(bridge, done, timeout=GUARD_SECONDS)
+        # 用意ができた 1 回目の待ちで抜けたこと（待つ上限の 120 秒まで待ち続けていない）
+        # かかった秒では見ない 遅い機械では、抜けるのが速くても試験の側が止まって秒が伸びる
+        assert len(host.scene_waits) == 1
         result = box["result"]
         assert isinstance(result, dict), result
         assert result["changed"] is True
         assert host.project.settings.resolution == (1080, 1920)
+
+    def test_several_waits_share_the_seconds(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、場面と顔のように待つ物が増えるほど 1 回の待ちが呼ばれた秒の何倍にも伸び、
+        中断のボタンが効くまでの遅れと、待つ上限を越える長さも伸びる
+
+        本当には眠らない 道具の時計を偽にして、場面の待ちで 0.3 秒進める 本当に眠ると、
+        遅い機械では試験の側が止まった分も数えに入り、渡す秒が揺れる
+        """
+        media = _media(host)
+        host.vision_ready = True
+        host.scene_states[media.id] = SceneState(None, running=True)
+        host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(None, running=True)
+        clock = [1000.0]
+        monkeypatch.setattr(operations, "time", _Clock(clock))
+
+        def slow_scene(_media: object) -> bool:
+            # 場面の待ちが 0.3 秒を使った所（本物は渡された秒まで待って戻る）
+            clock[0] += 0.3
+            return True
+
+        host.scene_ready = slow_scene
+        pending = REFRAME(host, {})
+        assert isinstance(pending, Pending)
+        pending.wait(0.4)
+        ((_media_id, _kind, seconds),) = host.screen_waits
+        # 場面で 0.3 秒使ったので、顔へ渡すのは残りの 0.1 秒だけ 同じ 0.4 秒を渡すと合わせて 0.7 秒
+        assert seconds == pytest.approx(0.1)
+
+
+class _Clock:
+    """道具（operations）が読む ``time`` の代わり ``monotonic`` だけを試験の数にする
+
+    ほかの関数は本物へ渡す ``time`` そのものを替えると、ブリッジや pytest の時計まで止まる
+    """
+
+    def __init__(self, now: list[float]) -> None:
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now[0]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
 
 
 class TestTheResult:

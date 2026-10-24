@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -48,7 +47,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.check_media import tone, write_tone
-from tests.ui.ai_tool_calls import call_tool
+from tests.ui.ai_tool_calls import call_after_check, call_tool, wait_for_check
 
 
 @pytest.fixture(autouse=True)
@@ -164,10 +163,15 @@ class TestNormalize:
             ),
         )
         window = _window(opened, alone)
-        result = _call(window, "normalize_loudness", {"wait_seconds": 60})
+        # 道具の中で秒を区切って待たせると、遅い機械では途中を返して落ちる（#405）
+        result = call_after_check(
+            window, "normalize_loudness", {}, lambda done: "measuring" not in done
+        )
         assert result["measured_lufs"] == pytest.approx(-20.0, abs=0.5)
         assert result["gain_db"] == pytest.approx(6.0, abs=0.5)
-        check = _call(window, "check_output", {"checks": ["loudness"], "wait_seconds": 60})
+        check = call_after_check(
+            window, "check_output", {"checks": ["loudness"]}, lambda done: done["complete"]
+        )
         assert check["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.5)
         # 取り消し 1 回で測る前の音量へ戻る
         window.document.undo()
@@ -401,11 +405,8 @@ class TestRightClick:
         _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
         # 基準の既定は本人の設定（仕上がりを調べる音量の基準）
         assert asked == [-14.0]
-        deadline = time.monotonic() + 60.0
-        while window._pending_loudness is not None:
-            QApplication.processEvents()
-            time.sleep(0.01)
-            assert time.monotonic() < deadline, "測り終えなかった"
+        # 60 秒で区切ると、遅い機械では測り終える前に落ちる（#405） 検査の終わりの知らせを待つ
+        wait_for_check(window, then=lambda: window._pending_loudness is None)
         # BGM だけを測るので -20 LUFS から +6 dB 声のクリップは変えない
         assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(200.0, rel=0.06)
         voice_clip = window.document.project.timeline.tracks[0].clips[0]

@@ -29,6 +29,7 @@ from sashimono.update.swap import (
     take_result,
     wait_started,
 )
+from tests.waiting import GUARD_SECONDS, wait_until
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="入れ替え係は Windows の PowerShell"
@@ -61,11 +62,13 @@ def layout(tmp_path: Path) -> Layout:
 def _run(plan: SwapPlan, folder: Path) -> list[str]:
     launched = launch(plan, folder)
     assert wait_started(launched), launched.lines()
-    launched.process.wait(timeout=120)
+    launched.process.wait(timeout=GUARD_SECONDS)
     return take_result(folder)
 
 
-def _wait_for(path: Path, seconds: float = 20.0) -> bool:
+def _wait_for(path: Path, seconds: float = GUARD_SECONDS) -> bool:
+    # 入れ替え係は PowerShell で動く 立ち上げは遅い機械で数十秒かかる（#406 Issue #33）
+    # 秒で区切らず印のファイルを待つ 上限は止まったまま終わらない崩れのためだけ
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if path.exists():
@@ -193,7 +196,7 @@ class TestTheWorkingFolder:
         # 戻さないと、試験のプロセスが改名を断らせ、入れ替え係の作業場所を確かめられない
         os.chdir(tmp_path)
         assert wait_started(launched), launched.lines()
-        launched.process.wait(timeout=120)
+        launched.process.wait(timeout=GUARD_SECONDS)
         lines = take_result(folder)
         assert "install-locked" not in lines and "healthy" in lines, lines
         assert (layout.install / "version.txt").read_text(encoding="ascii") == "new"
@@ -259,7 +262,7 @@ class TestTheNewVersionsScript:
         launched = launch(_plan(layout), folder)
         assert launched.from_staged
         assert wait_started(launched), launched.lines()
-        launched.process.wait(timeout=120)
+        launched.process.wait(timeout=GUARD_SECONDS)
         lines = take_result(folder)
         assert "new-script" in lines and "healthy" in lines, lines
         assert (layout.install / "version.txt").read_text(encoding="ascii") == "new"
@@ -366,8 +369,8 @@ class TestTwoWindows:
             second = launch(_plan(layout), folder)
             assert not wait_started(second)
             assert second.lost_to_another()
-            second.process.wait(timeout=60)
-            first.process.wait(timeout=120)
+            second.process.wait(timeout=GUARD_SECONDS)
+            first.process.wait(timeout=GUARD_SECONDS)
         finally:
             window.kill()
         lines = take_result(folder)
@@ -392,9 +395,9 @@ class TestWhenEvenTheRestoreFails:
             launched = launch(_plan(layout), tmp_path / "update")
             assert wait_started(launched), launched.lines()
             # 今の版が previous へよけられたら、元の名前の所をふさいで戻しも断らせる
-            assert _wait_for(layout.previous / APP, 30)
+            assert _wait_for(layout.previous / APP)
             blocker.write_text("ふさぐ", encoding="utf-8")
-            launched.process.wait(timeout=120)
+            launched.process.wait(timeout=GUARD_SECONDS)
         finally:
             held.close()
         lines = take_result(tmp_path / "update")
@@ -517,12 +520,12 @@ def test_a_result_is_written_even_while_it_is_being_read(tmp_path: Path) -> None
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        deadline = time.monotonic() + 60
-        while not refused.exists() and process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+        # PowerShell の立ち上げは遅い機械で 60 秒を超えることがある（#406） 秒で区切らず、
+        # 断られた印か PowerShell の終わりを待つ
+        wait_until(lambda: refused.exists() or process.poll() is not None, "PowerShell", pause=0.05)
     finally:
         kernel.CloseHandle(handle)
-    _, error = process.communicate(timeout=60)
+    _, error = process.communicate(timeout=GUARD_SECONDS)
     assert process.returncode == 0, error.decode("cp932", "replace")
     assert refused.exists(), "書き足しが 1 度も断られずに通った（確かめになっていない）"
     assert "holding" in result.read_text(encoding="utf-8-sig")
@@ -560,7 +563,7 @@ def test_a_result_is_written_while_the_app_holds_it_open(tmp_path: Path) -> None
             [str(swap_module.powershell_path()), "-NoProfile", "-NonInteractive", "-Command", code],
             env={**os.environ, "RESULT": str(result)},
             capture_output=True,
-            timeout=60,
+            timeout=GUARD_SECONDS,
             check=False,
         )
     assert done.returncode == 0, done.stderr.decode("cp932", "replace")
