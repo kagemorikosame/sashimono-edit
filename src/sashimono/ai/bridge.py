@@ -11,6 +11,8 @@ Claude Agent SDK は自前の asyncio ループを別スレッドで回す そ�
 AI からの質問（ask_user #296）も同じ形で運び、答えが返るまで止まる
 外へ送る物の同意（#342 :mod:`sashimono.ai.outbound`）も同じ形で運ぶ 道具を動かす前に、
 結果に入りうる物（:attr:`Operation.sends`）のうちまだ許されていない物を尋ねる
+長い作業の計画（#340 :mod:`sashimono.ai.plan`）を人が区切りで止めた後は、計画の道具の
+ほかは動かさずに断る
 使う量の上限（#344 :mod:`sashimono.ai.budget`）も、道具を動かす前に確かめる 当たったら
 設定に従い、続けるかを尋ねるか、尋ねずに断る
 
@@ -53,6 +55,7 @@ from sashimono.ai.outbound import (
     sending,
     text_secrets,
 )
+from sashimono.ai.plan import WorkPlan, plan_for
 from sashimono.ai.safety import Consent
 
 __all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
@@ -213,6 +216,9 @@ class EditorBridge:
         usage: UsageMeter | None = None,
     ) -> None:
         self._host = host
+        #: 開いている作品の計画（#340） 文書は作品を開き直しても同じ物なので、作ったときに
+        #: 引いておけば AI のスレッドから編集画面を通さずに止めたかを見られる
+        self.plan: WorkPlan = plan_for(host.document)
         #: 画面のスレッドが 1 件を拾うのを待つ上限（秒） ``None`` は :data:`CALL_TIMEOUT`
         #: 本物の窓を並べて走らせる試験だけが長くする（画面のスレッドが他の試験の描画と
         #: GPU を取り合って止まっても、試験の結果は変わらないため）
@@ -258,7 +264,16 @@ class EditorBridge:
 
         外へ送る物の同意（#342）は、許可より先に取る 送らないと決まった道具の許可を
         尋ねても、許した後に断るだけになる
+        区切りで止めた後（#340）は、同意も許可も尋ねる前に断る 止めた人に、止めた後の
+        道具の確かめの窓を出さない
+        使う量の上限（#344）は区切りの後、同意の前に見る 止めた計画の道具に「上限を広げて
+        続けますか」を尋ねると、広げた後に区切りで断るだけになる
+        検査の直しの回数の上限（#339）も区切りの後 先に見ると、区切りで止めた人の計画が
+        「直しの回数の上限」で止まったように読め、設定を変えても区切りで断るだけになる
         """
+        paused = self.plan.refusal(operation.name)
+        if paused:
+            raise ToolError(paused)
         # 量の上限は同意より先に見る 上限で止まる道具の同意を尋ねても、答えた後に断るだけになる
         self._keep_within_budget(operation)
         # 直す回数の上限（#339）も同意より先に見る 断ると決まっている道具のために送ってよいかを

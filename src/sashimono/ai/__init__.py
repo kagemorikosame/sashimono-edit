@@ -9,6 +9,7 @@
 - :mod:`~sashimono.ai.host` — 編集ソフト側に求めること
 - :mod:`~sashimono.ai.bridge` — AI スレッドから UI スレッドへの橋渡しと確認
 - :mod:`~sashimono.ai.outbound` — 道具の結果として外へ送る物と、送る前の同意
+- :mod:`~sashimono.ai.plan` — 長い作業の計画と進み具合、区切りで止める・続ける
 - :mod:`~sashimono.ai.server` — 操作を MCP ツールへ包む
 - :mod:`~sashimono.ai.session` — SDK との会話
 

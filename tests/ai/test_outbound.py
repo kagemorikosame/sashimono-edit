@@ -293,6 +293,17 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
     # 書き出した動画を指す 調べられる場所の外なので、場所を書いて断る（#337）
     "check_output": lambda _media_id: {"path": str(SECRET_PATH), "wait_seconds": 0},
     "select_clips": lambda _media_id: {"clip_ids": []},
+    # 長い作業の計画（#340） AI が素材の場所と字幕の文を手順に書き写した計画 書く道具は
+    # 書いた文を返さず（指示と答えだけ）、読む道具（get_plan 後ろで動く）が場所と文を返す
+    "set_plan": lambda _media_id: {
+        "goal": "「編集ソフトを」の字幕を直して書き出す",
+        "steps": [f"{SECRET_PATH} の字幕を読む", "「作ります」の前で切る"],
+    },
+    "update_plan_step": lambda _media_id: {
+        "step": 1,
+        "state": "done",
+        "note": f"{SECRET_PATH.name} の「今日は」を直した",
+    },
     # 前後のキーへ（#349） キーの無い欄は、名前を書いて断る
     "seek_keyframe": lambda _media_id: {"name": "size"},
     # 字幕の文字を OS のクリップボードへ（#349） 無い字幕は ID を書いて断る
