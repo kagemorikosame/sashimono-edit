@@ -3796,6 +3796,41 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
 依存が何も入っていない機械（VC++ ランタイムなど Windows 側の部品も無い）での
 確認は、開発機ではできない **CI のまっさらな Windows で zip だけを持って確かめる**（Issue #33）
 
+### 組み立てる Python の版
+
+配る zip には組み立てた Python がそのまま入る 使う人の手元の ssl・zipfile・tarfile・urllib は
+その版の物なので、**脆弱性の修正が出た Python で組む**（#410） 0.2.2 は 3.14.8（9-30 公開
+ssl・zipfile・tarfile・urllib の修正）が出た後の 10-14 に 3.14.7 で組まれていた setup-python に
+`"3.14"` とだけ書いていて、実行機に先に入っていた版が選ばれた
+
+- 組み立てる workflow（`package.yml` の build `release.yml` はそれを呼ぶ）の setup-python には
+  `check-latest: true` を付ける 毎回 python.org の最新の修正版を取りにいく 組むジョブを足したときに
+  付け忘れていないかは `tests/test_release_workflow.py` が見る
+- 試験だけの workflow（`ci.yml`・`mutation.yml`）には付けない 配る物を組まないうえ、PR ごと・版ごとに
+  版の一覧を取りにいき、実行機の版が古い間は毎回 Python を落とし直す 配る物と同じ最新の Python での
+  試験は、タグのときに `package.yml` の検証が走らせる
+- 下限は `tools/build_package.py` の `MINIMUM_PYTHON` の 1 か所 組み立て（`build_package.py`）は
+  走らせている Python と、組み立てたフォルダに入った `python3XX.dll` の版を見て、下限より古ければ
+  組む前に止める リリースの道具（`tools/release.py` の段 4）は、落とした zip の中の DLL を読む
+  手元で組んだ確認用の zip でも、使う人へ届く物で見分けられる
+- 版は DLL の版情報の固定の欄（VS_FIXEDFILEINFO）から読む 3 つ目の欄は
+  `micro * 1000 + 段階 * 10 + 番号` で、正式版の 3.14.7 なら 7150（CPython の `PC/python_ver_rc.h`）
+- 手元の開発（`tools/verify.py`）は下限を見ない 開発機の Python が古くても試験は走る
+  手元で zip を組むときだけ、Python を下限以上へ上げて `.venv` を作り直す
+
+**下限を上げる時** 使っている系列（今は 3.14）の Python のセキュリティリリースが
+python.org（https://www.python.org/downloads/ と discuss.python.org の告知）に出たら、
+次のリリースを組む前に上げる
+
+1. `MINIMUM_PYTHON` を出た版にする（例 `(3, 14, 9)` → `(3, 14, 10)`） 試験は下限から作った版で
+   確かめるので、数字のほかに直す所は無い
+2. setup-python が新しい版を取れるかを Package の手動の実行（workflow_dispatch）で見る 版の一覧に
+   載るまで数日掛かることがあり、その間は組み立てが下限で止まる 止まったら待つ（下限を戻さない）
+3. 手元で zip を組むなら、手元の Python も上げて `.venv` を作り直す
+
+Python の系列を上げる（3.14 → 3.15）ときは、setup-python の `python-version` と下限を一緒に変える
+系列が変わると後から入れる部品の入れ直しが要る（下の「自動更新の仕組み」の python_abi）
+
 ### まっさらな Windows で zip から起動する（CI）
 
 `.github/workflows/package.yml` が zip を組み立て（build）、別の機械（clean-machine）へ zip だけを
@@ -4463,7 +4498,7 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 | 1. 前提 | 引数の版と `__version__` が同じ 手元が main で汚れていない origin/main と同じ 出す commit の CI と Package が success（走っている途中なら待つ） gh が使える 鍵が `TRUSTED_PUBLIC_KEYS` にある | ─ |
 | 2. タグ | `v<版>` を注釈付きで打って push する | push 済みのタグが main の歴史の中で同じ版の commit を指せば飛ばす それ以外なら止まる |
 | 3. 組み立て | Actions の Release（`release.yml`）がそのタグで終わるのを待つ | success なら飛ばす 落ちていれば止まる |
-| 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、展開する | 落とした zip が同じなら落とし直さない 公開済みなら下の「公開済みに打ち直したとき」 |
+| 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、zip に入った Python が下限より古くないかを見て（上の「組み立てる Python の版」）、展開する | 落とした zip が同じなら落とし直さない 公開済みなら下の「公開済みに打ち直したとき」 |
 | 5. ソース | 足りない物を `collect_sources.py` で集め、本体を上げ終えてから別の呼び出しで索引を上げる | 下書きの `sources-manifest.json` に載ったファイルが全部、同じ大きさと sha256 で下書きにあり、`sources-SHA256SUMS.txt` もあれば飛ばす 欠けていれば足りない分だけ上げ直す |
 | 6. 自己診断 | 展開した zip を `build_package.py` と同じ確かめ（`--self-check` ほか）に掛け、アプリを起こして「GL で描けていたか y/N」と尋ねる（`--skip-launch` で起こさない） Defender に誤検出されたら、普通の失敗と分けて組み直しを尋ねる（下の「6 で Defender に誤検出されたら」） | 同じ zip で通した印（`dist\release\release-checked.json`）があれば飛ばす |
 | 7. 目録と署名 | `update_sign.py` の manifest → sign（合言葉を尋ねる）→ verify → 下書きへ上げる | 下書きにあれば落として verify し、今の引数（`--minimum` など）と zip で作り直した目録と全部の項目が同じなら飛ばす 違えば止まり、消して打ち直すか前と同じ引数で打ち直すかを出す（道具は消さない） 手元に上げ損ねた署名済みの目録があれば同じく比べ、同じなら上げるだけ 違えば作り直して署名し直す |

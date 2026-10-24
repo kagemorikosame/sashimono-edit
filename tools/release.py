@@ -11,6 +11,7 @@ r"""リリースを 1 コマンドで終える（タグ → 下書きの確か�
 2. タグ ``v<版>`` 無ければ注釈付きで打って push する あれば、指す commit を確かめて飛ばす
 3. Actions の Release（release.yml）がそのタグで終わるのを待つ
 4. 下書き リリースが下書きであること zip を ``dist\release`` へ落とし、GitHub の digest と照らす
+   zip に入った Python が下限（``build_package.MINIMUM_PYTHON``）より古ければ止める
    公開済みなら差し替えず、目録が下書きのときと同じことを確かめて、公開した後の残りだけ続ける
 5. ソース 索引（``sources-manifest.json``）に載った物が全部下書きにあるか照らし、足りなければ
    ``collect_sources.py`` で集めて、本体 → 索引の順に上げる
@@ -756,8 +757,26 @@ class Release:
             self.done(f"zip を落とし、GitHub の物と照らした: {self.archive}")
         self.zip_sha256 = sha256_of(self.archive)
         self.zip_size = self.archive.stat().st_size
+        self.check_python()
         self.extract()
         return True
+
+    def check_python(self) -> None:
+        """zip に入った Python が下限（``build_package.MINIMUM_PYTHON``）より古ければ止める（#410）
+
+        組み立てた機械ではなく zip の中の DLL を読む Release の run が古い Python を拾っても、
+        手元で組んだ確認用の zip でも、使う人へ届く物で見分けられる 署名の前に止めるので、
+        組み直せば（下書きの zip を外して run を走らせ直す）同じ版のまま出せる
+        """
+        found = build_package.zip_python_version(self.archive)
+        problem = build_package.python_problem(found, "zip に入った Python")
+        if problem or found is None:
+            self.problem(
+                f"{problem} この zip は出せない 下書きの zip を外して Release の run を"
+                " 走らせ直す（package.yml の setup-python が最新の修正版を取る）"
+            )
+            return
+        self.done(f"zip に入った Python は {build_package.version_text(found)}")
 
     def matches(self, path: Path, asset: dict[str, Any]) -> bool:
         """手元の物が資産と同じか digest があれば sha256 で、無ければ大きさで"""

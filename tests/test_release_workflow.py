@@ -99,6 +99,30 @@ def test_the_clean_machine_brings_no_developer_tools() -> None:
     assert "download-artifact" in clean
 
 
+def test_the_build_takes_the_latest_python() -> None:
+    """配る zip を組むジョブの setup-python は、毎回最新の修正版を取りにいく（#410）
+
+    ``python-version: "3.14"`` だけでは実行機に先に入っている版が選ばれ、0.2.2 は
+    脆弱性の修正（3.14.8）が出た後に 3.14.7 で組まれた 組むジョブを足したときも外さない
+    """
+    building = {
+        f"{path.name}/{name}": text
+        for path in sorted(WORKFLOWS.glob("*.yml"))
+        for name, text in _jobs(path.read_text(encoding="utf-8")).items()
+        if "build_package.py" in text
+    }
+    assert "package.yml/build" in building
+    for name, text in building.items():
+        steps = text.split("- uses: ")[1:]
+        # 次の段の書き付けを拾わないよう、その段の中だけを見る
+        setups = [
+            step.split("\n      - ")[0] for step in steps if step.startswith("actions/setup-python")
+        ]
+        assert setups, name
+        for step in setups:
+            assert re.search(r"^          check-latest: true$", step, flags=re.M), name
+
+
 def test_the_tag_and_version_are_compared_before_a_release() -> None:
     """タグから呼ばれたときは、組み立てる前に版とタグを照らす（F-12-8）"""
     build = _jobs(PACKAGE)["build"]
