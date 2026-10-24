@@ -494,6 +494,17 @@ class TestDocument:
         assert not document.can_undo
         assert not document.can_redo
 
+    def test_reset_counts_a_new_generation(self, audio_media: MediaItem, project: Project) -> None:
+        # 数えないと、作品の外で作品に付けて持つ物（AI の作業の計画 #340）が、別の作品を開いた
+        # 後も前の作品の物のまま残り、〔続ける〕で別の作品を手順どおりに変える
+        # 編集では増えない（増えると、編集のたびに計画が閉じる）
+        document = Document(project)
+        start = document.generation
+        document.execute(AddMedia(audio_media))
+        assert document.generation == start
+        document.reset(project)
+        assert document.generation == start + 1
+
     def test_undo_on_empty_history_is_a_noop(self, project: Project) -> None:
         # 履歴が空のときの Ctrl+Z で落ちると、作品を開いた直後に押しただけでアプリが止まる
         document = Document(project)

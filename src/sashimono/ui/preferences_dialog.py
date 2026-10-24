@@ -950,6 +950,17 @@ class PreferencesDialog(QDialog):
             " 変えると、次の指示から新しい会話になる"
         )
         form.addRow(self._ai_ask_questions)
+
+        self._ai_plan_first = QCheckBox("長い作業は、AI が先に計画を示す", self)
+        self._ai_plan_first.setChecked(preferences.ai_plan_first)
+        self._ai_plan_first.setToolTip(
+            "手順が 3 つ以上かかる頼みは、AI アシスタントが始める前に目標と手順を AI のパネルに"
+            "出し、手順ごとに進み具合を書く 〔区切りで止める〕で今の手順を終えた所で止め、"
+            "〔続ける〕で止めた所から続きを頼める 計画を書く分だけ道具の呼び出しが増える"
+            "（手順 1 つに 2 回ほど） 切ると計画を書かずに進める"
+            " 変えると、次の指示から新しい会話になる"
+        )
+        form.addRow(self._ai_plan_first)
         self._check_loudness = QComboBox(self)
         for target, name in LOUDNESS_TARGETS:
             self._check_loudness.addItem(name, target)
@@ -1257,6 +1268,7 @@ class PreferencesDialog(QDialog):
             state_limit_mb=self._backups.state_limit_mb.value(),
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
             ai_ask_questions=self._ai_ask_questions.isChecked(),
+            ai_plan_first=self._ai_plan_first.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),

@@ -25,12 +25,14 @@ from sashimono.ai.console import hide_cli_console
 from sashimono.ai.environment import bundled_claude_cli, find_claude_cli
 from sashimono.ai.models import effort_for
 from sashimono.ai.operations import ASK_USER
+from sashimono.ai.plan import GET_PLAN, SET_PLAN, UPDATE_PLAN_STEP
 from sashimono.ai.server import SERVER_NAME, build_server
 from sashimono.core.model import LayerMode
 
 __all__ = [
     "ASK_RULES",
     "LIMIT_DETAIL",
+    "PLAN_RULES",
     "SYSTEM_PROMPT",
     "UPDATE_PARTS_LABEL",
     "AgentEvent",
@@ -160,7 +162,7 @@ _PROMPT = """\
   書き換えません
 - アプリ自身の設定（好み・ショートカット・画面配置・更新）は get_app_settings で
   読めますが、変えられません 変えたほうがよいときは、ユーザーに伝えてください
-{ask_rules}- 失敗したら、エラーの文面を読んで直してから再試行してください 同じ操作を
+{ask_rules}{plan_rules}- 失敗したら、エラーの文面を読んで直してから再試行してください 同じ操作を
   そのまま繰り返さないこと
 - 途中で止まった前の指示の続きを頼まれたら、まず get_handoff で引き継ぎ（変えた手・
   止まった訳・残り）を読み、今の形を確かめてから続けてください
@@ -186,17 +188,40 @@ ASK_RULES = f"""\
 """
 
 
-def system_prompt(layer_mode: str = LayerMode.SEPARATED, *, ask: bool = True) -> str:
+#: 長い作業の計画の決まり（#340） 設定の「長い作業は AI が先に計画を示す」が入のときだけ差し込む
+#: 1〜2 手の頼みにまで計画を書かせると、道具の呼び出しが増えて遅く、使う量も増える
+#: 止めた後に道具を呼び続けないよう、paused の読み方も書く（ブリッジも断るが、断られるまで呼ぶと
+#: そのたびに使う量が増える）
+PLAN_RULES = f"""\
+- 手順が 3 つ以上かかる頼み（何本ものクリップの整理・字幕を付けて書き出すまで など）は、
+  始める前に {SET_PLAN} で目標と手順を示してください 手順は画面に出て、ユーザーが
+  進み具合を見ます 1〜2 手で済む頼みには使いません
+- 手順に取りかかる時に {UPDATE_PLAN_STEP} で running、終えたら done（やめたら skipped、
+  できなければ failed と訳を note に）を書きます 結果に paused があれば、ユーザーが
+  区切りで止めました 道具を使わず、済んだ手順と残りを短く伝えて終えてください
+- 計画の続きを頼まれたら、{GET_PLAN} で済んだ手順と止めた所を読みます 止まった訳は
+  previous_stop にあります 区切りと応え終えた
+  ほかの訳（中断・上限・接続の切れ・エラー・許されなかった操作）で止まった手順は途中までしか
+  済んでいないことがあるので、今の作品を確かめてから続けます 止まった訳と変えた手は
+  get_handoff でも読めます 済んだ手順はやり直しません
+"""
+
+
+def system_prompt(
+    layer_mode: str = LayerMode.SEPARATED, *, ask: bool = True, plan: bool = True
+) -> str:
     """エージェントへの指示 ``layer_mode`` はプロジェクトの置き方の方式
 
     会話を始めるときの方式で書く 会話の途中で方式を変えることもあるので、確かめ方
     （get_project の layer_mode）も添えてある ``ask`` を切ると聞き返す基準を外す
-    （質問の道具も渡さないので、基準だけ残すと無い道具を呼ぼうとする）
+    （質問の道具も渡さないので、基準だけ残すと無い道具を呼ぼうとする） ``plan`` を
+    切ると計画の決まりを外す（同じく計画の道具も渡さない）
     """
     linked = _LINKED_CLIPS.get(layer_mode, _LINKED_CLIPS[LayerMode.SEPARATED])
     # format ではなく置き換えにする 指示の文に波括弧を書いたときに壊れないように
     prompt = _PROMPT.replace("{linked_clips}", linked)
-    return prompt.replace("{ask_rules}", ASK_RULES if ask else "")
+    prompt = prompt.replace("{ask_rules}", ASK_RULES if ask else "")
+    return prompt.replace("{plan_rules}", PLAN_RULES if plan else "")
 
 
 #: 分ける方式（モデルの既定）での指示 会話を作る側が方式を渡さないときに使う
@@ -240,6 +265,7 @@ class AgentSession:
         cwd: Path | None = None,
         system_prompt: str = SYSTEM_PROMPT,
         ask: bool = True,
+        plan: bool = True,
     ) -> None:
         self._bridge = bridge
         self._model = model or None
@@ -248,6 +274,8 @@ class AgentSession:
         self._system_prompt = system_prompt
         #: 質問の道具（ask_user）を渡すか 指示の文と揃える（設定の「AI が質問する」）
         self._ask = ask
+        #: 計画の道具（#340）を渡すか 指示の文と揃える（設定の「長い作業は計画を先に示す」）
+        self._plan = plan
 
         self._events: queue.Queue[AgentEvent] = queue.Queue()
         self._prompts: queue.Queue[str | None] = queue.Queue()
@@ -282,6 +310,11 @@ class AgentSession:
     def ask(self) -> bool:
         """質問の道具を渡しているか 会話の途中では変えられない（指示の文と同じ）"""
         return self._ask
+
+    @property
+    def plan(self) -> bool:
+        """計画の道具を渡しているか 会話の途中では変えられない（指示の文と同じ）"""
+        return self._plan
 
     @property
     def busy(self) -> bool:
@@ -413,10 +446,11 @@ class AgentSession:
 
     def server(self) -> Any:
         """この会話へ渡す道具のサーバ 設定で質問を切っていれば ask_user を入れない
+        計画を切っていれば計画の道具を入れない
 
         分けてあるのは、SDK の無い試験でも「質問の道具を渡すか」を確かめるため
         """
-        return build_server(self._bridge, ask=self._ask)
+        return build_server(self._bridge, ask=self._ask, plan=self._plan)
 
     def option_values(self) -> dict[str, Any]:
         """SDK へ渡す設定のうち、SDK を読まずに決まるもの
