@@ -42,12 +42,15 @@ def held(qt_application: QApplication) -> Iterator[_Held]:
     def hold() -> None:
         with progress.lock:
             taken.set()
-            release.wait(GUARD_SECONDS)
+            # 上限を付けない 上限で放すと、戻ったかを確かめる前に鍵が空き、鍵が空いた後に
+            # 戻った物を「持たれている間に戻った」と読む 放すのは片付け（finally）だけ
+            release.wait()
 
     holder = threading.Thread(target=hold, daemon=True)
     holder.start()
-    assert taken.wait(GUARD_SECONDS)
     try:
+        # 鍵を取れずに落ちたときも、片付けで放して止める
+        assert taken.wait(GUARD_SECONDS)
         yield _Held(job, holder)
     finally:
         release.set()

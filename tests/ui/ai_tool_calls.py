@@ -25,7 +25,6 @@ __all__ = [
     "call_after_check",
     "call_tool",
     "wait_for_check",
-    "wait_for_export",
 ]
 
 #: 道具が返るのを待つ上限（秒） 返ればすぐ戻るので、ふつうの速さは変わらない
@@ -114,8 +113,11 @@ def call_after_check(
         first = call_tool(window, name, quick, bridge=bridge)
     except ToolError:
         # 音の道具は、読み始めたばかりで答えが無いと途中の答えの代わりに断る（もう 1 度
-        # 呼ぶように言う） 終わりを待って呼び直す 本当の断り（場所が違うなど）は、
-        # 呼び直しても同じ断りになって、そのまま投げられる
+        # 呼ぶように言う） 終わりを待って呼び直す 検査を頼む前の断り（場所が違うなど）は
+        # 待つ物が無いので、そのまま投げる 頼んだ後の本当の断りは、呼び直しても同じ
+        # 断りになって投げられる
+        if window.check_state().request is None:
+            raise
         first = None
     if first is not None and finished is not None and finished(first):
         return first
@@ -137,16 +139,6 @@ def wait_for_check(window: MainWindow, then: Callable[[], bool] | None = None) -
     終わったと分かった時にはまだ知らせが画面へ届いていないことがある 済むまで拾い続ける
     """
     _wait_for(window.check_waiter(), "検査", then)
-
-
-def wait_for_export(window: MainWindow) -> None:
-    """AI の書き出しが終わるまで、画面の仕事を拾いながら待つ
-
-    書き出しは取り消せない操作なので、途中を返した道具を呼び直せない（呼び直すと
-    もう 1 度確かめて書き出す） 終わりの知らせ（:meth:`MainWindow.export_waiter`）を待ち、
-    結果は :meth:`MainWindow.export_status`（道具が待った後に返すのと同じ物）で読む
-    """
-    _wait_for(window.export_waiter(), "書き出し", None)
 
 
 def _wait_for(waiter: Callable[[float], bool], what: str, then: Callable[[], bool] | None) -> None:

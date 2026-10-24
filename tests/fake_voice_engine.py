@@ -162,9 +162,14 @@ def _handler(engine: FakeVoiceEngine) -> type[BaseHTTPRequestHandler]:
             elif path == "/speakers":
                 if engine.speakers_delay:
                     time.sleep(engine.speakers_delay)
-                if engine.speakers_gate is not None:
-                    engine.speakers_gate.wait(GUARD_SECONDS)
-                self._json(engine.speakers)
+                if engine.speakers_gate is not None and not engine.speakers_gate.wait(
+                    GUARD_SECONDS
+                ):
+                    # 試験が放す前に上限が来たら、一覧は返さず断る 返すと、順番を決めたはずの
+                    # 試験が、放す前に届いた一覧を正しい答えとして受け取り、崩れを見逃す
+                    self._json({"detail": "gate timed out"}, 503)
+                else:
+                    self._json(engine.speakers)
             elif path == "/speaker_info":
                 if engine.policy_delay:
                     time.sleep(engine.policy_delay)

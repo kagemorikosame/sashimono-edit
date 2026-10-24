@@ -40,7 +40,8 @@ def wait_until(
     while not done():
         if step is not None:
             step()
-        if time.monotonic() > deadline:
+        # 上限を見る前にもう 1 度確かめる ``step`` の間に終わった物を、上限の間際に落とさない
+        if time.monotonic() > deadline and not done():
             dump_threads()
             pytest.fail(f"{what}が {GUARD_SECONDS:g} 秒で終わらなかった")
         time.sleep(pause)

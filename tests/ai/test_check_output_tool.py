@@ -385,7 +385,9 @@ class TestWaiting:
         def hold() -> None:
             with progress.lock:
                 taken.set()
-                release.wait(GUARD_SECONDS)
+                # 上限を付けない 上限で放すと、返ったかを確かめる前に鍵が空き、鍵が空いた後に
+                # 返った物を「持たれている間に返った」と読む 放すのは片付け（finally）だけ
+                release.wait()
 
         holder = threading.Thread(target=hold, daemon=True)
         holder.start()

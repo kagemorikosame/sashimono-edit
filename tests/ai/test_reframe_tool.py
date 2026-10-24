@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sashimono.ai import operations
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, Pending, find_operation
@@ -125,18 +126,25 @@ class TestTheAnalysis:
         assert result["changed"] is True
         assert host.project.settings.resolution == (1080, 1920)
 
-    def test_several_waits_share_the_seconds(self, host: FakeHost) -> None:
+    def test_several_waits_share_the_seconds(
+        self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """壊れると、場面と顔のように待つ物が増えるほど 1 回の待ちが呼ばれた秒の何倍にも伸び、
         中断のボタンが効くまでの遅れと、待つ上限を越える長さも伸びる
+
+        本当には眠らない 道具の時計を偽にして、場面の待ちで 0.3 秒進める 本当に眠ると、
+        遅い機械では試験の側が止まった分も数えに入り、渡す秒が揺れる
         """
         media = _media(host)
         host.vision_ready = True
         host.scene_states[media.id] = SceneState(None, running=True)
         host.screen_states[(media.id, ScreenKind.FACES)] = ScreenState(None, running=True)
+        clock = [1000.0]
+        monkeypatch.setattr(operations, "time", _Clock(clock))
 
         def slow_scene(_media: object) -> bool:
-            # 場面の待ちが渡された秒を使い切った所（本物は上限まで待って戻る）
-            time.sleep(0.3)
+            # 場面の待ちが 0.3 秒を使った所（本物は渡された秒まで待って戻る）
+            clock[0] += 0.3
             return True
 
         host.scene_ready = slow_scene
@@ -144,8 +152,24 @@ class TestTheAnalysis:
         assert isinstance(pending, Pending)
         pending.wait(0.4)
         ((_media_id, _kind, seconds),) = host.screen_waits
-        # 場面で 0.3 秒使ったので、顔へ渡すのは残りだけ 同じ 0.4 秒を渡すと合わせて 0.7 秒
-        assert seconds <= 0.4 - 0.25
+        # 場面で 0.3 秒使ったので、顔へ渡すのは残りの 0.1 秒だけ 同じ 0.4 秒を渡すと合わせて 0.7 秒
+        assert seconds == pytest.approx(0.1)
+
+
+class _Clock:
+    """道具（operations）が読む ``time`` の代わり ``monotonic`` だけを試験の数にする
+
+    ほかの関数は本物へ渡す ``time`` そのものを替えると、ブリッジや pytest の時計まで止まる
+    """
+
+    def __init__(self, now: list[float]) -> None:
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now[0]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
 
 
 class TestTheResult:
