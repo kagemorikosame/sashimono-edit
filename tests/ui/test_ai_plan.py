@@ -156,6 +156,55 @@ class TestPlanBox:
         assert isinstance(read, dict)
         assert read["instruction"] == "全体の無音を詰めて、字幕を付けて書き出して"
 
+    def test_the_box_does_not_look_up_the_parts_on_every_tick(
+        self,
+        made: tuple[ChatPanel, FakeHost, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、見張りの時計（80 ミリ秒）ごとに計画の欄を合わせるたびに、部品の版・PATH・
+        # ファイルを編集画面のスレッドで調べ直し、遅いディスクでは画面が引っかかる
+        # （CodeRabbit #392）
+        from sashimono.ui.setup import SetupSection
+
+        widget, host, _ = made
+        _send(widget, "無音を詰めて")
+        _plan(host, "a", "b")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        status = SetupSection.status.fget(widget._setup)  # type: ignore[attr-defined]
+        looked: list[int] = []
+
+        def counted(_self: object) -> object:
+            looked.append(1)
+            return status
+
+        monkeypatch.setattr(SetupSection, "status", property(counted))
+        for _ in range(10):
+            widget._refresh_status()
+        assert looked == []
+        assert widget._plan_box.resume_button.isEnabled()
+
+    def test_the_resume_button_follows_the_parts_after_an_update(
+        self,
+        made: tuple[ChatPanel, FakeHost, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、使えるかを覚えた値が部品の入れ替えの後も古いまま残り、使えなくなった後も
+        # 〔続ける〕が押せる（押しても送れない）か、使えるようになっても押せない
+        from sashimono.ai import AI_PACK
+        from sashimono.runtime import PackageStatus, PackStatus
+        from sashimono.ui.setup import SetupSection
+
+        widget, host, _ = made
+        _send(widget, "無音を詰めて")
+        _plan(host, "a", "b")
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert widget._plan_box.resume_button.isEnabled()
+        broken = PackStatus(pack=AI_PACK, packages=(PackageStatus("claude-agent-sdk", None),))
+        assert broken.ready is False
+        monkeypatch.setattr(SetupSection, "status", property(lambda _self: broken))
+        widget._on_parts_updated(False, "")
+        assert widget._plan_box.resume_button.isEnabled() is False
+
     def test_a_long_goal_does_not_widen_the_panel(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
     ) -> None:

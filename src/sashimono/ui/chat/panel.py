@@ -353,6 +353,9 @@ class ChatPanel(QWidget):
         self._updater = updater if updater is not None else PartsUpdater(AI_PACK, self)
         self._updater.prepare = self._release_session
         self._updater.finished.connect(self._on_parts_updated)
+        #: AI 連携の環境が使えるか（:meth:`_refresh_availability` で覚える） 計画の欄は見張りの
+        #: 時計（80 ミリ秒）ごとに合わせるので、そのたびに部品の版・PATH・ファイルを調べ直さない
+        self._ready = False
 
         self._build()
         # 導入の欄から入れるときも、会話を先に畳ませて畳み終わるのを裏で待つ
@@ -784,6 +787,7 @@ class ChatPanel(QWidget):
     def _refresh_availability(self) -> None:
         status = self._setup.status
         ready = status.ready
+        self._ready = ready
         # 使えない間は導入の欄が入口なので開いたままにし、閉じられないようにする
         self._parts_close.setVisible(ready)
         self._parts_button.setEnabled(ready)
@@ -1118,6 +1122,8 @@ class ChatPanel(QWidget):
         """部品の入れ替えが終わった 持っておいた指示を新しい会話へ渡す"""
         retrying = self._retrying
         self._retrying = False
+        # 入れ替えた部品で使えるかが変わる 覚えた値を合わせないと計画の欄の〔続ける〕が古いまま
+        self._ready = self._setup.status.ready
         if succeeded and installed:
             self.status_message.emit(f"AI の部品を新しくしました（{installed}）")
         if retrying:
@@ -1704,7 +1710,7 @@ class ChatPanel(QWidget):
         self._plan_box.show_plan(
             self._plan.view(),
             working=bool(self._queued),
-            ready=self._setup.status.ready,
+            ready=self._ready,
             plan_on=self._plan_first,
         )
 
