@@ -39,6 +39,7 @@ from sashimono.runtime import (
     run_pip_here,
 )
 from sashimono.selfcheck import CheckResult, format_results, run_self_check
+from tests.fake_python_dll import just_below, minimum_python, python_dll_bytes
 
 ROOT = Path(__file__).resolve().parent.parent
 #: 試験が子として起こす本物の Python frozen の試験は sys.executable を exe へ差し替える
@@ -1400,6 +1401,96 @@ class TestNothingUncheckedIsLeft:
         # 組み立て済みの exe が無い＝組み立てに失敗した状態
         assert builder.main(["--skip-build"], dist=tmp_path) == 1
         assert not old.exists(), "組み立てに失敗したのに前の zip が残っている"
+
+
+class TestThePythonIsPatched:
+    """配る物は下限（MINIMUM_PYTHON）より古い Python で組まない（#410）
+
+    0.2.2 は脆弱性の修正（3.14.8）が出た後に 3.14.7 で組まれ、直っていない ssl や zipfile を
+    配った 下限は組み立てる時だけ見る 開発機の Python が古くても試験は走る
+    """
+
+    def test_the_version_is_read_from_the_dll(self, builder: ModuleType) -> None:
+        """DLL の版情報の 3 つ目の欄（micro * 1000 + 段階）から micro を出す
+
+        読み違えると 3.14.7 を 3.14.7150 と見て、古い Python を通す
+        """
+        assert builder.dll_python_version(python_dll_bytes((3, 14, 7))) == (3, 14, 7)
+        assert builder.dll_python_version(python_dll_bytes((3, 15, 12))) == (3, 15, 12)
+        assert builder.dll_python_version(b"MZ" + bytes(256)) is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Python の DLL は Windows だけ")
+    def test_the_real_dll_of_this_python_is_read(self, builder: ModuleType) -> None:
+        """本物の DLL で読む 偽物だけで確かめると、本物の並びと違っても気付けない"""
+        version = sys.version_info
+        dll = Path(sys.base_prefix) / f"python{version.major}{version.minor}.dll"
+        if not dll.is_file():
+            pytest.skip(f"{dll} が無い（python.org 以外の Python）")
+        expected = (version.major, version.minor, version.micro)
+        assert builder.dll_python_version(dll.read_bytes()) == expected
+
+    def test_older_than_the_minimum_is_refused(self, builder: ModuleType) -> None:
+        """下限のすぐ下の版は止める 文言に下限と直し方の手掛かりを出す"""
+        minimum = builder.MINIMUM_PYTHON
+        assert minimum == minimum_python()
+        problem = builder.python_problem(just_below(minimum), "組み立てに使う Python")
+        assert problem is not None
+        assert builder.version_text(minimum) in problem and "MINIMUM_PYTHON" in problem
+
+    def test_the_minimum_or_newer_passes(self, builder: ModuleType) -> None:
+        """下限ちょうどと新しい版は通す 次の修正版や次の版で組めなくなると出せない"""
+        major, minor, micro = builder.MINIMUM_PYTHON
+        for found in ((major, minor, micro), (major, minor, micro + 1), (major, minor + 1, 0)):
+            assert builder.python_problem(found, "組み立てに使う Python") is None, found
+
+    def test_an_unreadable_version_is_refused(self, builder: ModuleType) -> None:
+        """版が読めないときも止める 通すと DLL の名前や形が変わった日から黙って確かめなくなる"""
+        assert builder.python_problem(None, "zip に入った Python") is not None
+
+    def test_the_bundle_and_the_zip_are_read(self, builder: ModuleType, tmp_path: Path) -> None:
+        """組み立てたフォルダと zip の中の本体の DLL を読む python3.dll は本体と見ない"""
+        internal = tmp_path / "Sashimono" / "_internal"
+        internal.mkdir(parents=True)
+        (internal / "python3.dll").write_bytes(python_dll_bytes((3, 1, 0)))
+        assert builder.bundled_python_version(internal) is None
+        (internal / "python314.dll").write_bytes(python_dll_bytes((3, 14, 9)))
+        assert builder.bundled_python_version(internal) == (3, 14, 9)
+        archive = tmp_path / "out.zip"
+        with zipfile.ZipFile(archive, "w") as opened:
+            for path in internal.iterdir():
+                opened.write(path, f"Sashimono/_internal/{path.name}")
+        assert builder.zip_python_version(archive) == (3, 14, 9)
+
+    def test_an_old_python_stops_before_building(
+        self,
+        builder: ModuleType,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """古い Python では PyInstaller を走らせる前に止める 組み立てに 10 分ほど掛かる"""
+
+        def build_anyway(_work: Path) -> None:
+            raise AssertionError("古い Python のまま組み立てに進んだ")
+
+        monkeypatch.setattr(builder, "running_python", lambda: just_below(minimum_python()))
+        monkeypatch.setattr(builder, "write_version_file", build_anyway)
+        assert builder.main([], dist=tmp_path) == 1
+        assert "組み立てに使う Python" in capsys.readouterr().out
+
+    def test_an_old_bundle_is_not_zipped(
+        self, builder: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--skip-build で前に古い Python で組んだ物を zip にしない 今の Python は見ない"""
+        bundle = tmp_path / builder.APP_NAME
+        (bundle / "_internal").mkdir(parents=True)
+        (bundle / f"{builder.APP_NAME}.exe").write_bytes(b"MZ")
+        (bundle / "_internal" / "python314.dll").write_bytes(
+            python_dll_bytes(just_below(minimum_python()))
+        )
+        assert builder.main(["--skip-build"], dist=tmp_path) == 1
+        assert "組み立てた物の Python" in capsys.readouterr().out
+        assert list(tmp_path.glob("*.zip")) == []
 
 
 class TestTheExportCheckCountsFrames:
