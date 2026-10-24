@@ -10,6 +10,7 @@ AviUtl2 の置き場へ写す手順を出す **利用者の設定へは書きに
 from __future__ import annotations
 
 import base64
+import contextlib
 import importlib.util
 import json
 import os
@@ -247,8 +248,11 @@ class _PowerShell:
         self._lines: queue.Queue[str | None] = queue.Queue()
         #: 輪の決まりに無い行（PowerShell が自分で出した警告など） 落ちたときに添える
         self._noise: list[str] = []
+        #: 上限で諦めたか、途中で終わった 立ったら打たない（:meth:`_give_up`）
+        self._broken = False
         # 読むのは別のスレッド 読みながら上限で諦めるには、塞がる読みを試験の外へ出すしかない
         threading.Thread(target=self._read, daemon=True).start()
+        # 立ち上げで諦めたときも _expect が止める 落ちると fixture の close まで届かない
         self._expect("ready", _START_TIMEOUT)
 
     def _read(self) -> None:
@@ -266,20 +270,34 @@ class _PowerShell:
             try:
                 line = self._lines.get(timeout=max(0.0, remaining))
             except queue.Empty:
+                self._give_up()
                 pytest.fail(f"PowerShell が {timeout:g} 秒で {what} を返さなかった {self._noise}")
             if line is None:
+                self._give_up()
                 pytest.fail(f"PowerShell が途中で終わった {self._noise}")
             if line.startswith((what, "error")):
                 return line
             self._noise.append(line)
 
-    def run(self, command: str) -> None:
+    def _give_up(self) -> None:
+        """この 1 本をもう使わない 止めておく
+
+        1 本を試験のファイルで使い回すので、諦めた命令の遅れた ``ok`` が残ると、次の命令の
+        答えとして受け取り、打てていない手順を「なぞれた」と読む 止まったまま残すと、
+        次の試験が上限まで待つ
+        """
+        self._broken = True
+        self._process.kill()
+
+    def run(self, command: str, timeout: float = _COMMAND_TIMEOUT) -> None:
         """命令を 1 つ打ち、打てたことを確かめる"""
+        if self._broken:
+            pytest.fail(f"前の命令で PowerShell が応答しなくなったので打たない {self._noise}")
         stdin = self._process.stdin
         assert stdin is not None
         stdin.write(base64.b64encode(command.encode("utf-16-le")).decode("ascii") + "\n")
         stdin.flush()
-        answer = self._expect("ok", _COMMAND_TIMEOUT)
+        answer = self._expect("ok", timeout)
         if answer.startswith("error"):
             reason = base64.b64decode(answer.removeprefix("error ")).decode("utf-8")
             pytest.fail(f"打てなかった: {command}\n{reason}")
@@ -287,7 +305,9 @@ class _PowerShell:
     def close(self) -> None:
         stdin = self._process.stdin
         if stdin is not None:
-            stdin.close()
+            # 諦めて止めた後は管がもう切れている 閉じるときの書き損じは捨てる
+            with contextlib.suppress(OSError):
+                stdin.close()
         try:
             self._process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -312,6 +332,28 @@ def _follow(shell: _PowerShell, lines: list[str], part: str) -> None:
     for line in chosen:
         if line.strip().startswith(_COMMANDS):
             shell.run(line.strip())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="手順は PowerShell の命令で出す")
+def test_a_session_that_timed_out_is_not_reused() -> None:
+    """壊れると、上限で諦めた命令の遅れた ``ok`` を次の命令の答えとして受け取り、打てて
+    いない手順を「なぞれた」と読む 止まった PowerShell も残り、次の試験が上限まで待つ
+
+    試験のファイルで使い回す 1 本とは別に立ち上げ、上限より長くかかる命令で順番を決め打ちにする
+    """
+    session = _PowerShell()
+    try:
+        with pytest.raises(pytest.fail.Exception, match="返さなかった"):
+            session.run("Start-Sleep -Seconds 3", timeout=0.5)
+        # 諦めた時に止めてあること 止めないと、遅れた ok が次の命令の答えになる
+        assert session._process.wait(timeout=30) is not None
+        started = time.monotonic()
+        with pytest.raises(pytest.fail.Exception, match="応答しなくなった"):
+            session.run("New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null")
+        # 次の命令は上限（60 秒）まで待たずに断られる
+        assert time.monotonic() - started < 10.0
+    finally:
+        session.close()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="手順は PowerShell の命令で出す")
