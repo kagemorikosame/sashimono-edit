@@ -118,6 +118,8 @@ class MediaPoolWidget(QWidget):
     #: 本人が表示（一覧・アイコン）を切り替えた 引数は :data:`VIEW_MODES` のどれか
     #: 覚えておくのは窓の仕事（好みの設定に書く）
     view_mode_changed = Signal(str)
+    #: 素材の字幕と場面の説明から探す窓を開くよう要求された（#326）
+    search_requested = Signal()
 
     def __init__(self, project: Project, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -150,6 +152,11 @@ class MediaPoolWidget(QWidget):
         self._list.itemSelectionChanged.connect(
             lambda: self._insert_button.setEnabled(bool(self._list.selectedItems()))
         )
+        # 素材の意味検索（#326）の人の入口 AI の search_media と同じ引き方で、置いていない
+        # 素材の字幕と、AI が覚えた場面の説明まで引く 窓は編集画面が開く（作品と説明の控えを持つ）
+        search_button = QPushButton("探す…", self)
+        search_button.setToolTip("素材の字幕と場面の説明から、言葉を含む所を探す")
+        search_button.clicked.connect(lambda _checked=False: self.search_requested.emit())
 
         self._view_buttons = QButtonGroup(self)
         self._view_buttons.setExclusive(True)
@@ -158,6 +165,7 @@ class MediaPoolWidget(QWidget):
         buttons = FlowLayout()
         buttons.addWidget(import_button)
         buttons.addWidget(self._insert_button)
+        buttons.addWidget(search_button)
         for mode, text, tip in (
             (VIEW_LIST, "一覧", "名前・長さ・大きさを 1 行ずつ並べる"),
             (VIEW_ICONS, "アイコン", "サムネイルを大きく並べる"),
@@ -353,6 +361,19 @@ class MediaPoolWidget(QWidget):
             item.setText(text)
         if item.toolTip() != tooltip:
             item.setToolTip(tooltip)
+
+    def select_media(self, media_id: MediaId) -> bool:
+        """その素材の行を選んで見える所へ出す 無ければ偽
+
+        探す窓で見つけた素材がタイムラインに無いとき、どの素材かを一覧で示すため
+        """
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == str(media_id):
+                self._list.setCurrentItem(item)
+                self._list.scrollToItem(item)
+                return True
+        return False
 
     def selected_media_id(self) -> MediaId | None:
         items = self._list.selectedItems()
