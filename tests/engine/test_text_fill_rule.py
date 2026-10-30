@@ -73,7 +73,8 @@ def gap_pixels(ink: np.ndarray) -> int:
 
 def has_block() -> bool:
     """■ が字の外形いっぱいに塗られる書体か 字が無いと中の空いた豆腐の箱になり、数が読めない"""
-    return gap_pixels(alpha_of(text(BLOCK)) > 128) == 0 and bool(alpha_of(text(BLOCK)).any())
+    ink = alpha_of(text(BLOCK)) > 128
+    return bool(ink.any()) and gap_pixels(ink) == 0
 
 
 #: AviUtl の組み方の太字は入れない 太字は ``QPainterPath.united`` が輪郭を解いて重なりの無い形に
@@ -235,6 +236,94 @@ def test_outer_outline_merges_a_contour_crossing_itself() -> None:
 
     assert len(merged.toSubpathPolygons()) == 1
     assert merged.length() < path.length() * 0.9
+
+
+def test_outer_outline_finds_one_crossing_contour_in_a_long_text() -> None:
+    """長い文の中の 1 字の重なりも見つける 全体の長さだけで見ると埋もれて、線が字の中に残る"""
+    star = [QPointF(sin(pi * 0.8 * n), -cos(pi * 0.8 * n)) * 10.0 for n in range(5)]
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    path.addPolygon(QPolygonF(star))
+    path.closeSubpath()
+    for index in range(100):
+        path.addEllipse(QRectF(100.0 + index * 120.0, 0.0, 100.0, 100.0))
+
+    merged = sources._outer_outline(path)
+
+    assert merged != path
+    assert len(merged.toSubpathPolygons()) == 101
+
+
+def test_outer_outline_finds_contours_that_make_a_ring() -> None:
+    """2 つの輪郭が重なって外形と穴になると、輪郭の数は変わらないので長さで見つける"""
+    left = [(0, 0), (60, 0), (60, 20), (20, 20), (20, 80), (60, 80), (60, 100), (0, 100)]
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    for corners in (left, [(100 - x, y) for x, y in left]):
+        path.addPolygon(QPolygonF([QPointF(x, y) for x, y in corners]))
+        path.closeSubpath()
+
+    merged = sources._outer_outline(path)
+
+    assert len(merged.toSubpathPolygons()) == 2
+    assert merged.length() < path.length()
+
+
+def test_translucent_shadow_shows_no_line_of_inner_contours() -> None:
+    """半透明の影の濃さが字の中で揃う 重なった輪郭の線があると、そこだけ濃い筋が出る"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    source = text(
+        BLOCK * 2,
+        color=CLEAR,
+        letter_spacing=AnimatedValue(-50.0),
+        border_width=AnimatedValue(RING),
+        border_color=BLACK,
+        shadow_x=AnimatedValue(200.0),
+        shadow_color=(0.0, 0.0, 0.0, 0.5),
+    )
+
+    # 影を字から離して右側だけを見る 字の縁は不透明なので、重なると濃さが比べられない
+    alpha = alpha_of(source)[:, SIZE[0] * 2 // 3 :]
+    rows, columns = np.nonzero(alpha > 64)
+    assert rows.size
+    # 外形の線が届かない中ほどの濃さを見る
+    reach = int(RING) * 2 + 2
+    middle = alpha[
+        int(rows.min()) + reach : int(rows.max()) + 1 - reach,
+        int(columns.min()) + reach : int(columns.max()) + 1 - reach,
+    ]
+
+    assert middle.size
+    assert int(middle.max()) - int(middle.min()) <= 2
+
+
+def test_layers_work_out_the_outline_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """層と影がいくつあっても輪郭を解くのは 1 回 層の数だけ解くと長い字幕で描くのが遅くなる"""
+    calls: list[int] = []
+    work_out = sources._outer_outline
+
+    def counted(path: QPainterPath) -> QPainterPath:
+        calls.append(1)
+        return work_out(path)
+
+    monkeypatch.setattr(sources, "_outer_outline", counted)
+    rings = [
+        Stroke(params={"width": AnimatedValue(width), "color": RED, "position": position})
+        for width, position in ((2.0, "inside"), (4.0, "inside"), (2.0, "center"))
+    ]
+
+    alpha_of(
+        text(
+            "字",
+            *rings,
+            shadow_x=AnimatedValue(6.0),
+            shadow_y=AnimatedValue(-6.0),
+            shadow_color=(0.0, 0.0, 0.0, 0.5),
+        )
+    )
+
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("bold", [0, 1])

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import struct
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -1550,8 +1550,10 @@ def _paint_layers(
     変えた字も含めた全部の字で 1 つにする 見た目ごとに取ると、色を変えた字だけ別の
     グラデーションになる
     """
+    # 影と各層で同じ字の輪郭を解き直さないように、この描画の間だけ覚える
+    outlines: dict[int, QPainterPath] = {}
     for path, look, clip in layers:
-        made = _shadow_layer(path, look, painter, bases)
+        made = _shadow_layer(path, look, painter, bases, outlines)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
             # 影の面は絵の画素で作ってある 描く座標の縮め方を外してから重ねる
@@ -1566,11 +1568,11 @@ def _paint_layers(
     rings = [_rings(look) for _, look, _ in layers]
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, bases, under=True)
+        _paint_ring(painter, layers, rings, index, bases, outlines, under=True)
     for path, look, clip in layers:
         _fill_painted(painter, path, _fill_of(look, _FILL, "color"), bases, clip)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, bases, under=False)
+        _paint_ring(painter, layers, rings, index, bases, outlines, under=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1754,9 +1756,17 @@ def _inner_lines_hidden(ring: _Ring, look: Mapping[str, object], *, baked: bool)
     return isinstance(fill, QColor) and fill.alpha() == 255
 
 
-#: 輪郭を解いて長さがこの割合より縮んだら、重なりが消えたと見る 曲線を折れ線にしただけでも
-#: 縮むので、それより大きく取る（重なりの無い書体で、字 1 つの縮みは 24 画素で最大 1.0%）
-_OVERLAP_SHRINK = 0.98
+#: 輪郭を解いて長さがこの割合より縮んだら、重なりがあったと見る 折れ線どうしの比べなので
+#: 重なりが無ければ縮まない（496 書体の 68292 字で 0.00001% 以下、重なりは 0.001% 以上）
+_OVERLAP_SHRINK = 0.99999
+
+
+def _polyline(contours: Sequence[QPolygonF]) -> QPainterPath:
+    """折れ線の輪郭を WindingFill のパスにする 塗りの決まりが字と違うと解く結果が変わる"""
+    path = _glyph_outlines()
+    for contour in contours:
+        path.addPolygon(contour)
+    return path
 
 
 def _outer_outline(path: QPainterPath) -> QPainterPath:
@@ -1766,12 +1776,32 @@ def _outer_outline(path: QPainterPath) -> QPainterPath:
     字の外形に無い線が字の中を横切る（#415 塗りの決まりは線の形に関わらない）
     ``simplified`` は曲線を折れ線にして、線の縁が境の画素で少し動く 重なりの無い書体の絵が
     前の版から変わらないように、重なりが見つかった時だけ解いた形を使う
-    輪郭の数が変われば重なっていた 1 つの輪郭が自分と重なるときは数が変わらないので長さで見る
+
+    輪郭の数が変われば重なっていた 数が変わらないのは、1 つの輪郭が自分と重なるときと、輪郭
+    どうしが重なって外形と穴になるとき 長さの縮みで見つける 全体の長さだけで見ると、長い文の
+    中の 1 字の重なりが埋もれるので、輪郭ごとにも見る 曲線の長さは折れ線にすると縮むので、
+    比べる両方を折れ線にそろえる
     """
-    merged = path.simplified()
-    if len(merged.toSubpathPolygons()) != len(path.toSubpathPolygons()):
-        return merged
-    return merged if merged.length() < path.length() * _OVERLAP_SHRINK else path
+    contours = path.toSubpathPolygons()
+    whole = _polyline(contours)
+    merged = whole.simplified()
+    overlapped = len(merged.toSubpathPolygons()) != len(contours) or any(
+        shape.simplified().length() < shape.length() * _OVERLAP_SHRINK
+        for shape in (whole, *(_polyline([contour]) for contour in contours))
+    )
+    return merged if overlapped else path
+
+
+def _outline_once(path: QPainterPath, outlines: dict[int, QPainterPath]) -> QPainterPath:
+    """``path`` の :func:`_outer_outline` を 1 度だけ求める ``outlines`` は 1 回の描画の覚え
+
+    解くのは重いので、層の数だけ解くと長い字幕で手間が層の数の倍になる 鍵はパスの ``id``
+    で、覚えは :func:`_paint_layers` の中だけで使うので、パスは描き終えるまで消えない
+    """
+    key = id(path)
+    if key not in outlines:
+        outlines[key] = _outer_outline(path)
+    return outlines[key]
 
 
 def _paint_ring(
@@ -1780,6 +1810,7 @@ def _paint_ring(
     rings: list[tuple[_Ring, ...]],
     index: int,
     bases: _Bases,
+    outlines: dict[int, QPainterPath],
     *,
     under: bool,
 ) -> None:
@@ -1813,7 +1844,7 @@ def _paint_ring(
             _ring_path(
                 path
                 if _inner_lines_hidden(ring, shown, baked=apply is not None)
-                else _outer_outline(path),
+                else _outline_once(path, outlines),
                 ring,
             ),
             ring,
@@ -1952,7 +1983,11 @@ def _stroke(path: QPainterPath, width: float, join: str = "round") -> QPainterPa
 
 
 def _shadow_layer(
-    path: QPainterPath, values: dict[str, object], painter: QPainter, bases: _Bases
+    path: QPainterPath,
+    values: dict[str, object],
+    painter: QPainter,
+    bases: _Bases,
+    outlines: dict[int, QPainterPath],
 ) -> tuple[QImage, tuple[int, int]] | None:
     """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
@@ -1989,7 +2024,14 @@ def _shadow_layer(
     blur *= math.sqrt(abs(transform.determinant()))
     # 一番外へ出る縁取りの層の外形から影を落とす 層を持たない字は前からの縁取りの太さ
     outer = max(_rings(values), key=lambda ring: ring.outward, default=None)
-    outline = _ring_path(shifted, outer) if outer is not None and outer.outward > 0.0 else None
+    outline: QPainterPath | None = None
+    if outer is not None and outer.outward > 0.0:
+        # 半透明の単色の影は、縁の形と字の形を重ねて塗った所だけ濃くなるので、字の中の輪郭に
+        # 引いた線も濃く見える グラデーションの影は不透明の白で形を作るので隠れる
+        drawn_on = shifted
+        if paint is None and colour.alpha() < 255:
+            drawn_on = _outline_once(path, outlines).translated(offset_x, -offset_y)
+        outline = _ring_path(drawn_on, outer)
 
     drawn = transform.mapRect((outline if outline is not None else shifted).boundingRect())
     # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる 端の 0 の所も同じ値に
