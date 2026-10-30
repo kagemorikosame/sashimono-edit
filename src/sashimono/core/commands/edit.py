@@ -65,6 +65,7 @@ __all__ = [
     "TrimClips",
     "TrimRoom",
     "head_room",
+    "ripple_casualties",
     "ripple_moves_layers",
     "shifted_track",
     "tail_room",
@@ -228,7 +229,6 @@ class RemoveClip(Command):
             raise KeyError(f"クリップが見つからない: {self.clip_id}")
         _, clip = located
 
-        before = project
         targets = _linked_group(project, clip)
         # 消す前に組の全員のトラックを見る 移動とトリムはロックを見ていたのに、
         # 削除だけ素通しで、ロックしたトラックのクリップも消えていた
@@ -237,6 +237,8 @@ class RemoveClip(Command):
             locked = _require_track(project, track_id)
             if locked.locked:
                 raise ValueError(f"トラック {locked.name!r} はロックされている")
+        if self.ripple and self.layers:
+            return _ripple_out(project, targets)
         timeline = project.timeline
         for track_id, target in targets:
             track = _require_track(project, track_id)
@@ -250,8 +252,6 @@ class RemoveClip(Command):
                 ]
             timeline = timeline.replace_track(track.with_clips(tuple(remaining)))
             project = project.with_timeline(timeline)
-        if self.ripple and self.layers and _programme_gap(before, targets):
-            return _pull_layers(project, targets)
         return project
 
 
@@ -262,14 +262,93 @@ def _clip_span(targets: list[tuple[TrackId, Clip]]) -> tuple[int, int]:
     )
 
 
-def ripple_moves_layers(project: Project, clip_id: ClipId) -> bool:
-    """``clip_id`` を詰めて消すと、別のトラックの重ねの層も動くか（設定を切っていないとき）
+def _gathered(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[TrackId, Clip]]:
+    """消すクリップとリンクの相手 同じクリップは 1 度だけ"""
+    found: dict[ClipId, tuple[TrackId, Clip]] = {}
+    for clip_id in clip_ids:
+        located = project.timeline.locate_clip(clip_id)
+        if located is not None:
+            for track_id, clip in _linked_group(project, located[1]):
+                found.setdefault(clip.id, (track_id, clip))
+    return list(found.values())
+
+
+def _cuts(
+    targets: list[tuple[TrackId, Clip]],
+) -> list[tuple[tuple[int, int], list[tuple[TrackId, Clip]]]]:
+    """消すクリップを、時間のつながった塊ごとに分ける 後ろの塊から順に返す
+
+    重なった別々のクリップを 1 本ずつ判定すると、消す相手の片方が「残る絵」に数えられて
+    字幕が付いてこず、トラックごとに詰める量もずれる 塊ごとに 1 回の切りとして見る
+    後ろから返すのは、前を詰めると後ろの塊の時刻がずれるため
+    """
+    spans = tuple((clip.timeline_start, clip.timeline_end) for _, clip in targets)
+    return [
+        (
+            (start, end),
+            [
+                (track_id, clip)
+                for track_id, clip in targets
+                if start <= clip.timeline_start and clip.timeline_end <= end
+            ],
+        )
+        for start, end in reversed(_normalized(spans))
+    ]
+
+
+def ripple_moves_layers(project: Project, clip_ids: tuple[ClipId, ...]) -> bool:
+    """``clip_ids`` を一緒に詰めて消すと、別のトラックの重ねの層も動く所があるか
+    （設定を切っていないとき）
 
     AI の道具が答えに添える 動かなかったことが分からないと、AI は字幕と重ねの層が
     付いてきたと読み、ずれたまま先へ進む
     """
-    located = project.timeline.locate_clip(clip_id)
-    return located is not None and _programme_gap(project, _linked_group(project, located[1]))
+    cuts = _cuts(_gathered(project, clip_ids))
+    return any(_programme_gap(project, members) for _, members in cuts)
+
+
+def ripple_casualties(
+    before: Project, after: Project, clip_ids: tuple[ClipId, ...]
+) -> list[tuple[Track, Clip]]:
+    """詰めて消したときに、頼んでいないのに一緒に消えたクリップ ``before`` の中の位置で返す
+
+    消す範囲の中のテキストや音は、番組の時間と一緒に無くなる（:func:`_pull_layers`）
+    頼んだクリップとリンクの相手は数えない 切って短くなっただけの物も数えない（ID が残る）
+    黙って消えると AI も人も気付かないので、道具の答えと状態の行で知らせる
+    """
+    asked = {clip.id for _, clip in _gathered(before, clip_ids)}
+    return [
+        (track, clip)
+        for track in before.timeline.tracks
+        for clip in track.clips
+        if clip.id not in asked and after.timeline.locate_clip(clip.id) is None
+    ]
+
+
+def _ripple_out(project: Project, targets: list[tuple[TrackId, Clip]]) -> Project:
+    """``targets`` を詰めて消す 番組の時間が抜ける塊は全部のトラックを 1 回の切りにする
+
+    絵が続く塊は前と同じく消したクリップのトラックだけを詰める
+    """
+    for (start, end), members in _cuts(targets):
+        if _programme_gap(project, members):
+            project = _pull_layers(_without(project, members), members, start, end)
+            continue
+        for _, clip in sorted(members, key=lambda item: item[1].timeline_start, reverse=True):
+            if project.timeline.locate_clip(clip.id) is not None:
+                project = RemoveClip(clip.id, ripple=True).apply(project)
+    return project
+
+
+def _without(project: Project, members: list[tuple[TrackId, Clip]]) -> Project:
+    gone = {clip.id for _, clip in members}
+    timeline = project.timeline
+    for track_id in {track_id for track_id, _ in members}:
+        track = _require_track(project, track_id)
+        timeline = timeline.replace_track(
+            track.with_clips(tuple(c for c in track.clips if c.id not in gone))
+        )
+    return project.with_timeline(timeline)
 
 
 def _programme_gap(project: Project, targets: list[tuple[TrackId, Clip]]) -> bool:
@@ -345,22 +424,24 @@ def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) ->
     return held
 
 
-def _pull_layers(project: Project, targets: list[tuple[TrackId, Clip]]) -> Project:
-    """``targets`` を消して詰めた作品の、別のトラックも同じだけ詰める
+def _pull_layers(
+    project: Project, members: list[tuple[TrackId, Clip]], start: int, end: int
+) -> Project:
+    """``members`` を外した作品の ``[start, end)`` を、全部のトラックから同じだけ詰める
 
     消したクリップの後ろに合わせて置いた物（場面切り替え・焼き込んだ字幕・テロップ・効果音）が
     元の時刻に残ると、つなぎ目や話している絵からずれる 通しの確かめで AI が全部を戻す
     ことになった（#413） ロックしたトラックと、中身が範囲をまたいだトラックは動かさない
     目印と書き出す範囲も、中身と一緒に動かす
     """
-    start, end = _clip_span(targets)
     length = end - start
-    own = {track_id for track_id, _ in targets}
+    own = {track_id for track_id, _ in members}
     others = [track for track in project.timeline.tracks if track.id not in own]
-    held = _held_tracks(project, others, start, end)
+    # 消したクリップのトラックは必ず詰める 仲間をたどって残すと、番組の時間が詰まらない
+    held = _held_tracks(project, others, start, end) - own
     timeline = project.timeline
     regrouped: dict[GroupId, GroupId] = {}
-    for track in others:
+    for track in project.timeline.tracks:
         if track.id in held:
             continue
         pieces: list[Clip] = []
@@ -595,6 +676,13 @@ class RemoveClips(Command):
         located = [project.timeline.locate_clip(clip_id) for clip_id in self.clip_ids]
         if any(entry is None for entry in located):
             raise KeyError("消すクリップの一部が見つからない")
+        if self.ripple and self.layers:
+            targets = _gathered(project, self.clip_ids)
+            for track_id, _ in targets:
+                track = _require_track(project, track_id)
+                if track.locked:
+                    raise ValueError(f"トラック {track.name!r} はロックされている")
+            return _ripple_out(project, targets)
         ordered = sorted(
             (entry[1] for entry in located if entry is not None),
             key=lambda clip: clip.timeline_start,

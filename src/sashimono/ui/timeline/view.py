@@ -60,6 +60,7 @@ from sashimono.core.commands.edit import (
     MAX_TRACK_HEIGHT,
     MIN_TRACK_HEIGHT,
     head_room,
+    ripple_casualties,
     shifted_track,
     tail_room,
     trimmable,
@@ -2251,17 +2252,32 @@ class TimelineView(QWidget):
             if len(removed) > 1
             else RemoveClip(removed[0], ripple=ripple, layers=ripple and self._ripple_layers)
         )
+        before = self._project
         self._request([command], command.label)
-        if head is None:
-            return
         # ロックしたトラックで断られたとき（受け取った側が戻した）は、どれも残っている
         # そこで動かすと、何も消えていないのに再生ヘッドだけが飛び、消えたように見える
         if any(self._project.timeline.locate_clip(c) is not None for c in removed):
+            return
+        if ripple:
+            self._tell_casualties(before, removed)
+        if head is None:
             return
         # 末尾を消したときは、頭が新しい長さの先に出る そのままだと何も映らない所に
         # 再生ヘッドが残るので、新しい末尾へ寄せる
         self.set_playhead(min(head, self._project.duration))
         self.ripple_landed.emit(self._playhead)
+
+    def _tell_casualties(self, before: Project, removed: tuple[ClipId, ...]) -> None:
+        """頼んでいないのに一緒に消えたクリップを状態の行で知らせる（#413）
+
+        番組の時間と一緒に消えた字幕や音は、タイムラインの見た目だけでは気付きにくい
+        """
+        lost = ripple_casualties(before, self._project, tuple(removed))
+        if lost:
+            self.status_message.emit(
+                f"消した所に掛かっていた別のトラックの {len(lost)} 本も消えました"
+                "（Ctrl+Z で戻せます）"
+            )
 
     def set_ripple_playhead(self, enabled: bool) -> None:
         """削除して詰めたあと再生ヘッドを動かすか 設定（:attr:`Preferences.ripple_playhead`）から"""

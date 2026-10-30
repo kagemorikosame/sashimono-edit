@@ -19,7 +19,7 @@ from sashimono.core.commands import (
     RemoveClips,
     RippleCut,
 )
-from sashimono.core.commands.edit import ripple_moves_layers
+from sashimono.core.commands.edit import ripple_casualties, ripple_moves_layers
 from sashimono.core.commands.insert import insert_media
 from sashimono.core.model import (
     TRANSITION_KIND,
@@ -272,7 +272,7 @@ class TestWhenTheProgrammeGoesOn:
         over = make_clip(120, 30, video_media)
         project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
         project, text = _text_track(project, 200, 20)
-        assert not ripple_moves_layers(project, over.id)
+        assert not ripple_moves_layers(project, (over.id,))
         after = RemoveClip(over.id, ripple=True, layers=True).apply(project)
         assert _at(after, text) == (200, 20)
 
@@ -301,7 +301,7 @@ class TestWhenTheProgrammeGoesOn:
         effect = make_clip(120, 10, audio_media)
         project = _with_track(plain.project, Track(kind=TrackKind.AUDIO, name="効果音"), effect)
         project, text = _text_track(project, 220, 10)
-        assert not ripple_moves_layers(project, effect.id)
+        assert not ripple_moves_layers(project, (effect.id,))
         after = RemoveClip(effect.id, ripple=True, layers=True).apply(project)
         assert _at(after, text) == (220, 10)
 
@@ -316,6 +316,97 @@ class TestWhenTheProgrammeGoesOn:
         project, text = _text_track(plain.project, 220, 30)
         after = RemoveClip(plain.clips[1].id, ripple=False, layers=True).apply(project)
         assert _at(after, text) == (220, 30)
+
+
+class TestSeveralClipsTogether:
+    def test_overlapping_clips_are_one_cut(self, plain: _Plain, video_media: MediaItem) -> None:
+        """壊れると、重なった 2 本を消しても字幕が付いてこず、トラックごとに詰める量がずれる"""
+        over = make_clip(120, 30, video_media)
+        later = make_clip(250, 10, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over, later)
+        project, text = _text_track(project, 220, 10)
+        after = RemoveClips((plain.clips[1].id, over.id), ripple=True, layers=True).apply(project)
+        assert _at(after, plain.clips[2]) == (100, 100)
+        assert _at(after, later) == (150, 10)
+        assert _at(after, text) == (120, 10)
+
+    def test_the_order_of_the_selection_does_not_matter(
+        self, plain: _Plain, video_media: MediaItem
+    ) -> None:
+        """壊れると、選んだ順で詰まり方が変わる"""
+        over = make_clip(120, 30, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        project, text = _text_track(project, 220, 10)
+        after = RemoveClips((over.id, plain.clips[1].id), ripple=True, layers=True).apply(project)
+        assert _at(after, text) == (120, 10)
+
+    def test_a_cut_with_the_picture_going_on_and_a_gap_are_told_apart(
+        self, plain: _Plain, video_media: MediaItem
+    ) -> None:
+        """壊れると、絵が続く所の 1 本のせいで、番組の時間が抜ける所まで字幕が付いてこない"""
+        over = make_clip(20, 10, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        project, text = _text_track(project, 220, 10)
+        after = RemoveClips((over.id, plain.clips[1].id), ripple=True, layers=True).apply(project)
+        # 上の絵は下の絵が続くので字幕を動かさず、真ん中の 100 だけが字幕を動かす
+        assert _at(after, text) == (120, 10)
+
+    def test_a_locked_clip_stops_them_all(self, plain: _Plain, video_media: MediaItem) -> None:
+        """壊れると、途中まで消えてから断られ、どれが消えたのかを追えない"""
+        over = make_clip(120, 30, video_media)
+        track = Track(kind=TrackKind.VIDEO, name="V2", clips=(over,), locked=True)
+        project = plain.project.with_timeline(
+            replace(plain.project.timeline, tracks=(*plain.project.timeline.tracks, track))
+        )
+        with pytest.raises(ValueError, match="ロック"):
+            RemoveClips((plain.clips[1].id, over.id), ripple=True, layers=True).apply(project)
+
+    def test_the_order_of_several_gaps_keeps_the_amount(self, plain: _Plain) -> None:
+        """壊れると、前のすき間の分だけ後ろの字幕の詰める量がずれる"""
+        project, text = _text_track(plain.project, 250, 10)
+        ids = (plain.clips[0].id, plain.clips[1].id)
+        after = RemoveClips(ids, ripple=True, layers=True).apply(project)
+        assert _at(after, text) == (50, 10)
+
+    def test_the_answer_reads_the_whole_cut(self, plain: _Plain, video_media: MediaItem) -> None:
+        """壊れると、まとめて消せば動く層を「動かない」と AI に答える"""
+        over = make_clip(120, 30, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        assert not ripple_moves_layers(project, (plain.clips[1].id,))
+        assert ripple_moves_layers(project, (plain.clips[1].id, over.id))
+
+
+class TestWhatWentWithIt:
+    def test_a_sound_inside_the_gap_is_named(self, plain: _Plain, audio_media: MediaItem) -> None:
+        """壊れると、消すと頼んでいない音が黙って消える"""
+        inside = make_clip(150, 20, audio_media)
+        track = Track(kind=TrackKind.AUDIO, name="効果音")
+        project = _with_track(plain.project, track, inside)
+        after = plain.cut_middle(project)
+        lost = ripple_casualties(project, after, (plain.clips[1].id,))
+        assert [(found.id, clip.id) for found, clip in lost] == [(track.id, inside.id)]
+
+    def test_the_clip_asked_for_is_not_counted(self, plain: _Plain) -> None:
+        """壊れると、頼んだ 1 本まで「一緒に消えた」と言う"""
+        after = plain.cut_middle(plain.project)
+        assert ripple_casualties(plain.project, after, (plain.clips[1].id,)) == []
+
+    def test_a_linked_partner_is_not_counted(self, video_media: MediaItem) -> None:
+        """壊れると、映像を消しただけでリンクした音が消えたと毎回出る"""
+        project = _smoothed(video_media)
+        head = _pictures(project)[0]
+        after = RemoveClip(head.id, ripple=True, layers=True).apply(project)
+        lost = ripple_casualties(project, after, (head.id,))
+        assert [clip.source.kind for _, clip in lost if clip.source is not None] == [
+            TRANSITION_KIND
+        ]
+        assert all(clip.media_id is None for _, clip in lost)
+
+    def test_a_shortened_clip_is_not_counted(self, plain: _Plain) -> None:
+        """壊れると、短くなっただけの字幕を消えたと言う"""
+        project, _text = _text_track(plain.project, 50, 100)
+        after = plain.cut_middle(project)
+        assert ripple_casualties(project, after, (plain.clips[1].id,)) == []
 
 
 class TestRippleCutOnTransitions:

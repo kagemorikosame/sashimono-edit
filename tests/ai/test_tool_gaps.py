@@ -15,7 +15,7 @@ import pytest
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
-from sashimono.core.commands import AddClip, RippleCut, SetTrackState
+from sashimono.core.commands import AddClip, AddTrack, RemoveClip, RippleCut, SetTrackState
 from sashimono.core.commands.insert import insert_generated, insert_media
 from sashimono.core.mixing import db_to_ratio
 from sashimono.core.model import (
@@ -544,6 +544,97 @@ class TestWhatTheAnswerSays:
         music = Track(kind=TrackKind.AUDIO, name="BGM", clips=(make_clip(0, 200, audio_media),))
         project = project.with_timeline(replace(project.timeline, tracks=(picture, words, music)))
         return FakeHost(project), first, words, music
+
+    def test_a_sound_lost_in_the_gap_is_listed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、頼んでいない効果音が黙って消え、AI も人も気付かない"""
+        host, first, _words, _music = self._work(video_media, audio_media)
+        effect = make_clip(50, 10, audio_media)
+        extra = Track(kind=TrackKind.AUDIO, name="効果音")
+        host.apply_commands([AddTrack(extra), AddClip(extra.id, effect)], "効果音")
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["clips_removed"] == 1
+        assert result["removed_clips"] == [
+            {
+                "clip_id": str(effect.id),
+                "track_id": str(extra.id),
+                "start_frame": 50,
+                "end_frame": 60,
+            }
+        ]
+        assert "取り消し" in result["note"]
+
+    def test_nothing_lost_says_nothing(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、何も消えていないのに消えた欄が並び、AI が確かめに行く"""
+        host, first, _words, _music = self._work(video_media, audio_media)
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert "clips_removed" not in result
+
+    def test_many_lost_are_cut_short_but_counted(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、消えた行で答えが長くなり、残りの案内が読めない"""
+        host, first, _words, _music = self._work(video_media, audio_media)
+        extra = Track(kind=TrackKind.AUDIO, name="効果音")
+        clips = [make_clip(start, 2, audio_media) for start in range(0, 90, 3)]
+        host.apply_commands(
+            [AddTrack(extra), *(AddClip(extra.id, clip) for clip in clips)], "効果音"
+        )
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["clips_removed"] == 30
+        assert len(result["removed_clips"]) == 20
+
+    def test_cut_range_lists_what_it_took_from_other_tracks(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、範囲の中の字幕が消えたことが cut_range の答えから読めない"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        result = _run(host, "cut_range", start_frame=150, end_frame=170)
+        assert result["clips_removed"] == 1
+        assert result["removed_clips"][0]["track_id"] == str(words.id)
+
+    def test_only_music_cut_is_not_called_followed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、字幕の無い作品で BGM が切れただけなのに字幕が付いてきたと読む"""
+        host, first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([RemoveClip(host.project.timeline.tracks[1].clips[0].id)], "空に")
+        tune = make_clip(50, 100, audio_media)
+        extra = Track(kind=TrackKind.AUDIO, name="曲")
+        host.apply_commands([AddTrack(extra), AddClip(extra.id, tune)], "曲")
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is False
+        assert str(extra.id) in result["tracks_moved"]
+        assert str(words.id) not in result["tracks_moved"]
+
+    def test_one_subtitle_track_left_is_not_called_followed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、2 本の字幕のうち 1 本がずれたままなのに、付いてきたと読む"""
+        host, first, words, _music = self._work(video_media, audio_media)
+        second = Track(kind=TrackKind.VIDEO, name="字幕 2")
+        title = Clip(timeline_start=150, duration=10, source=TEXT.create(text="札"))
+        host.apply_commands([AddTrack(second), AddClip(second.id, title)], "字幕")
+        host.apply_commands([SetTrackState(second.id, locked=True)], "ロック")
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is False
+        assert result["tracks_moved"] == [str(words.id)]
+        assert str(second.id) in result["tracks_left"]
+
+    def test_overlapping_clips_answer_as_one_cut(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、まとめて消せば付いてくる字幕を、付いてこないと答える"""
+        host, first, words, _music = self._work(video_media, audio_media)
+        over = make_clip(20, 30, video_media)
+        extra = Track(kind=TrackKind.VIDEO, name="V2")
+        host.apply_commands([AddTrack(extra), AddClip(extra.id, over)], "重ね")
+        result = _run(host, "delete_clips", clip_ids=[str(first.id), str(over.id)], ripple=True)
+        assert result["layers_followed"] is True
+        assert str(words.id) in result["tracks_moved"]
 
     def test_a_track_left_behind_is_named(
         self, video_media: MediaItem, audio_media: MediaItem

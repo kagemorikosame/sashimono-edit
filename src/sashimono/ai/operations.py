@@ -219,6 +219,7 @@ from sashimono.core.commands.edit import (
     MAX_RESOLUTION,
     MIN_RESOLUTION,
     STOP_LOCKED,
+    ripple_casualties,
     ripple_moves_layers,
 )
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
@@ -4938,15 +4939,6 @@ def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"timeline_start": start}
 
 
-def _transition_ids(project: Project) -> set[ClipId]:
-    return {
-        clip.id
-        for track in project.timeline.tracks
-        for clip in track.clips
-        if clip.source is not None and clip.source.kind == TRANSITION.kind
-    }
-
-
 #: 切ると消える場面切り替えの案内 直し方が分からないと、AI は作り直しに全部を戻す
 _SEAM_AGAIN_NOTE = (
     "切った所に掛かっていた場面切り替えを外しました つなぎ目を処理し直すなら smooth_cuts を呼びます"
@@ -4975,7 +4967,8 @@ def _ripple_answer(
             own.update(t.id for t, _ in before.timeline.linked_clips(clip.link_group))
     moved, left = _moved_tracks(before, after, own, min(heads, default=0))
     answer: dict[str, object] = {
-        "layers_followed": bool(moved),
+        # 字幕と重ねの層が残らず付いてきたか BGM が切れただけでは真にしない
+        "layers_followed": _layers_followed(before, moved, left),
         "tracks_moved": moved,
         "tracks_left": left,
     }
@@ -4983,7 +4976,7 @@ def _ripple_answer(
     if left:
         if not host.ripple_follows_layers:
             reason = "本人の設定で切ってあるので、"
-        elif not any(ripple_moves_layers(before, clip_id) for clip_id in clip_ids):
+        elif not ripple_moves_layers(before, clip_ids):
             reason = "同じ時間に別の絵や音が残るので、"
         else:
             reason = "ロックしているか中身が消した所をまたぐので、"
@@ -4991,13 +4984,53 @@ def _ripple_answer(
             f"{reason}tracks_left のトラックは動かしていません 同じ所を切るなら cut_range を"
             "使います（ロックしたトラックは切れません）"
         )
-    removed = (_transition_ids(before) - _transition_ids(after)) - set(clip_ids)
-    if removed:
-        answer["transitions_removed"] = len(removed)
-        notes.append(_SEAM_AGAIN_NOTE)
+    notes.extend(_lost_clips(before, after, clip_ids, answer))
     if notes:
         answer["note"] = " ".join(notes)
     return answer
+
+
+def _layers_followed(before: Project, moved: list[str], left: list[str]) -> bool:
+    """動いたトラックに字幕か重ねの層があり、置いていかれた字幕と重ねの層が無いか"""
+
+    def has_layer(track_id: str) -> bool:
+        track = before.timeline.find_track(TrackId(track_id))
+        return track is not None and any(
+            clip.media_id is None and clip.scene_id is None for clip in track.clips
+        )
+
+    return any(map(has_layer, moved)) and not any(map(has_layer, left))
+
+
+def _lost_clips(
+    before: Project, after: Project, clip_ids: tuple[ClipId, ...], answer: dict[str, object]
+) -> list[str]:
+    """一緒に消えた物を答えに足し、添える案内を返す 黙って消すと AI も人も気付かない（#413）"""
+    lost = ripple_casualties(before, after, clip_ids)
+    transitions = [
+        clip for _, clip in lost if clip.source is not None and clip.source.kind == TRANSITION.kind
+    ]
+    others = [(track, clip) for track, clip in lost if clip not in transitions]
+    notes: list[str] = []
+    if transitions:
+        answer["transitions_removed"] = len(transitions)
+        notes.append(_SEAM_AGAIN_NOTE)
+    if others:
+        answer["clips_removed"] = len(others)
+        answer["removed_clips"] = [
+            {
+                "clip_id": str(clip.id),
+                "track_id": str(track.id),
+                "start_frame": clip.timeline_start,
+                "end_frame": clip.timeline_end,
+            }
+            for track, clip in others[:_SKIPPED_SHOWN]
+        ]
+        notes.append(
+            f"切った範囲の中にあった別のクリップ {len(others)} 本も消えました removed_clips の"
+            "フレームは切る前の位置です 残すなら取り消して別のトラックをロックします"
+        )
+    return notes
 
 
 def _moved_tracks(
@@ -5096,10 +5129,7 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
     if left:
         result["tracks_left"] = left
         notes.append("tracks_left のトラックはロックしているので切っていません")
-    removed = _transition_ids(project) - _transition_ids(_project(host))
-    if removed:
-        result["transitions_removed"] = len(removed)
-        notes.append(_SEAM_AGAIN_NOTE)
+    notes.extend(_lost_clips(project, _project(host), (), result))
     if notes:
         result["note"] = " ".join(notes)
     return result

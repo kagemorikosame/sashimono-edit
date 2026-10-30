@@ -424,6 +424,46 @@ class TestLayersFollow:
         finally:
             window.close()
 
+    def test_a_lost_clip_is_told_on_the_status_line(
+        self, qt_application: QApplication, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        # 壊れると、人の画面でも頼んでいない音や字幕が黙って消える
+        first = Clip(timeline_start=0, duration=30, media_id=video_media.id)
+        second = Clip(timeline_start=30, duration=30, media_id=video_media.id)
+        effect = Clip(timeline_start=10, duration=5, media_id=audio_media.id)
+        window = _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (first, second)),
+                Track(TrackKind.AUDIO, "効果音", (effect,)),
+                media=(video_media, audio_media),
+            ),
+        )
+        try:
+            told: list[str] = []
+            window._timeline.status_message.connect(told.append)
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert window.document.project.timeline.tracks[1].clips == ()
+            assert any("別のトラックの 1 本" in message for message in told)
+            assert "Ctrl+Z" in window.statusBar().currentMessage()
+        finally:
+            window.close()
+
+    def test_nothing_lost_tells_nothing(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、ふつうに詰めただけで毎回知らせが出る
+        window = self._with_title(qt_application, video_media)
+        try:
+            told: list[str] = []
+            window._timeline.status_message.connect(told.append)
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert not any("別のトラック" in message for message in told)
+        finally:
+            window.close()
+
     def test_the_default_follows(self) -> None:
         # 既定は知らない人が困らない側 切れていると詰めるたびに字幕がずれる
         assert Preferences().ripple_layers is True
