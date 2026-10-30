@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from math import cos, pi, sin
 
 import numpy as np
@@ -17,9 +18,24 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPolygonF
 
-from sashimono.core.model import AnimatedValue, GeneratedSource, ParamValue, Stroke
+from sashimono.compat.aviutl.text_tags import parse_tags
+from sashimono.core.commands import AddClip, AddTrack
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    GeneratedSource,
+    ParamValue,
+    Project,
+    ProjectSettings,
+    Stroke,
+    Track,
+    TrackKind,
+)
+from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import source_registry
 from sashimono.engine import sources
+from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.engine.sources import render_source_framed
 
 SIZE = (640, 360)
@@ -29,6 +45,16 @@ BLACK = (0.0, 0.0, 0.0, 1.0)
 RED = (1.0, 0.0, 0.0, 1.0)
 #: 字の外形そのものの四角 中の空きが無いので、輪郭どうしを重ねた所の穴だけが数に出る
 BLOCK = "■"
+
+
+@pytest.fixture(scope="module")
+def gl_context() -> Iterator[OffscreenGLContext]:
+    try:
+        context = OffscreenGLContext()
+    except GLContextError as exc:
+        pytest.skip(f"OpenGL コンテキストを作れない: {exc}")
+    yield context
+    context.release()
 
 
 def text(body: str, *strokes: Stroke, **params: ParamValue) -> GeneratedSource:
@@ -69,6 +95,23 @@ def gap_pixels(ink: np.ndarray) -> int:
             if found.size:
                 gaps += int(found[-1] - found[0] + 1 - found.size)
     return gaps
+
+
+def render_alpha(source: GeneratedSource, width: int, height: int, scale: float) -> np.ndarray:
+    image = render_source_framed(source, width, height, scale=(scale, scale))[0]
+    assert image is not None
+    return image[..., 3] > 128
+
+
+def assert_no_gap(ink: np.ndarray) -> None:
+    """外周の 1 画素を除いて、墨の行と列に空きが無いことを確かめる 縮めた絵は端が滑らかになる"""
+    rows, columns = np.nonzero(ink)
+    assert rows.size
+    inner = ink[
+        int(rows.min()) + 1 : int(rows.max()),
+        int(columns.min()) + 1 : int(columns.max()),
+    ]
+    assert gap_pixels(inner) == 0
 
 
 def has_block() -> bool:
@@ -324,6 +367,138 @@ def test_layers_work_out_the_outline_only_once(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert calls == [1]
+
+
+def inner_ring(width: float = RING) -> Stroke:
+    return Stroke(params={"width": AnimatedValue(width), "color": RED, "position": "inside"})
+
+
+#: 字どうしが別の層で重なる形 素の字と変形した字、色の違う字
+ACROSS_LAYERS: dict[str, GeneratedSource] = {
+    "素の字と変形した字": text(f"{BLOCK}<tw3>{BLOCK}", inner_ring(), layout="aviutl", color=CLEAR),
+    "色の違う字": text(
+        f"{BLOCK}<#00ff00>{BLOCK}",
+        inner_ring(),
+        layout="aviutl",
+        color=CLEAR,
+        letter_spacing=AnimatedValue(-50.0),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(ACROSS_LAYERS))
+def test_ring_ignores_the_border_between_layers(name: str) -> None:
+    """別の層の字が重なっても境に線を引かない 層ごとに引くと字の中に線が残る"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+
+    ink = alpha_of(ACROSS_LAYERS[name]) > 64
+    rows, columns = np.nonzero(ink)
+    assert rows.size
+
+    reach = int(RING) * 2 + 2
+    middle = ink[
+        int(rows.min()) + reach : int(rows.max()) + 1 - reach,
+        int(columns.min()) + reach : int(columns.max()) + 1 - reach,
+    ]
+
+    assert middle.size
+    assert not middle.any()
+
+
+def test_ring_across_layers_keeps_the_cut_at_the_frame() -> None:
+    """素の字と重なっても、変形した字は文字の枠で切る 外へ伸びた線を出さない（#184）"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    body = f"{BLOCK}<tw3>{BLOCK}"
+    source = text(body, inner_ring(), layout="aviutl", color=CLEAR)
+    plain = text(body, layout="aviutl")
+
+    # 塗りは枠で切られるので、線の右端は塗りの右端を越えない
+    ink = alpha_of(source) > 64
+    filled = alpha_of(plain) > 64
+
+    assert int(np.nonzero(ink.any(axis=0))[0].max()) <= int(np.nonzero(filled.any(axis=0))[0].max())
+
+
+def test_translucent_shadow_of_layers_is_even_where_they_overlap() -> None:
+    """別の層の字の影が重なっても濃さが揃う 層ごとに重ねると、重なった所だけ濃くなる"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    source = text(
+        f"{BLOCK}<#00ff00>{BLOCK}",
+        layout="aviutl",
+        color=CLEAR,
+        letter_spacing=AnimatedValue(-50.0),
+        shadow_x=AnimatedValue(200.0),
+        shadow_color=(0.0, 0.0, 0.0, 0.5),
+    )
+
+    alpha = alpha_of(source)
+
+    assert alpha.any()
+    # 影の色の不透明度 0.5 を超える所があれば、影が 2 重に重なっている
+    assert int(alpha.max()) <= 130
+
+
+def test_a_negative_shape_tag_stays_text() -> None:
+    """負の倍率の字は作らない 裏返した字は輪郭の向きが逆で、重なると WindingFill で穴になる
+
+    裏返しを読めるようにするときは、輪郭の向きをそろえてから集める
+    """
+    lines = parse_tags("<tw-1>字<th-1>字", 100.0)
+
+    assert lines[0].text == "<tw-1>字<th-1>字"
+
+
+#: 絵の大きさと、プレビューの縮め方（絵の画素 1 つが画面の画素いくつ分かの逆数）
+CANVASES = [(320, 180, 1.0), (1280, 720, 1.0), (1920, 1080, 1.0), (3840, 2160, 1.0)]
+
+
+@pytest.mark.parametrize("glyph_size", [24.0, 40.0, 100.0])
+@pytest.mark.parametrize(("width", "height", "scale"), CANVASES)
+def test_no_hole_at_any_canvas_or_glyph_size(
+    width: int, height: int, scale: float, glyph_size: float
+) -> None:
+    """絵の大きさや字の大きさが変わっても穴が開かない 塗りの決まりは大きさに依らないはず"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    source = text(
+        BLOCK * 2, size=AnimatedValue(glyph_size), letter_spacing=AnimatedValue(-glyph_size / 2.0)
+    )
+
+    assert_no_gap(render_alpha(source, width, height, scale))
+
+
+@pytest.mark.parametrize("scale", [0.5, 0.25])
+def test_no_hole_in_a_shrunk_preview(scale: float) -> None:
+    """画質を落としたプレビューでも穴が開かない 描く座標ごと縮めるので同じ形のはず"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    source = text(BLOCK * 2, letter_spacing=AnimatedValue(-50.0))
+
+    assert_no_gap(render_alpha(source, round(1280 * scale), round(720 * scale), scale))
+
+
+@pytest.mark.parametrize("divisor", [1, 2, 4])
+def test_no_hole_through_the_renderer(gl_context: OffscreenGLContext, divisor: int) -> None:
+    """プレビューと書き出しが通るレンダラでも穴が開かない 画質の 1/2 と 1/4 も同じ"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    settings = ProjectSettings(width=640, height=360, frame_rate=FrameRate(30))
+    project = Project.create(settings)
+    track = Track(kind=TrackKind.VIDEO, name="V")
+    source = text(BLOCK * 2, letter_spacing=AnimatedValue(-50.0))
+    for command in (AddTrack(track), AddClip(track.id, Clip(0, 10, source=source))):
+        project = command.apply(project)
+
+    renderer = FrameRenderer(project, context=gl_context, quality=RenderQuality(divisor))
+    try:
+        image = renderer.render(0)
+    finally:
+        renderer.close()
+
+    assert_no_gap(image[..., :3].mean(axis=2) > 128)
 
 
 @pytest.mark.parametrize("bold", [0, 1])

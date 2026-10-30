@@ -1551,8 +1551,8 @@ def _paint_layers(
     グラデーションになる
     """
     # 影と各層で同じ字の輪郭を解き直さないように、この描画の間だけ覚える
-    outlines: dict[int, QPainterPath] = {}
-    for path, look, clip in layers:
+    outlines: _Outlines = {}
+    for path, look, clip in _joined_shadows(layers):
         made = _shadow_layer(path, look, painter, bases, outlines)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
@@ -1756,6 +1756,9 @@ def _inner_lines_hidden(ring: _Ring, look: Mapping[str, object], *, baked: bool)
     return isinstance(fill, QColor) and fill.alpha() == 255
 
 
+#: 影の位置とぼかしの項目 :func:`_joined_shadows` で、同じ影かを比べる
+_SHADOW_PLACE = ("shadow_x", "shadow_y", "shadow_blur")
+
 #: 輪郭を解いて長さがこの割合より縮んだら、重なりがあったと見る 折れ線どうしの比べなので
 #: 重なりが無ければ縮まない（496 書体の 68292 字で 0.00001% 以下、重なりは 0.001% 以上）
 _OVERLAP_SHRINK = 0.99999
@@ -1785,23 +1788,116 @@ def _outer_outline(path: QPainterPath) -> QPainterPath:
     contours = path.toSubpathPolygons()
     whole = _polyline(contours)
     merged = whole.simplified()
-    overlapped = len(merged.toSubpathPolygons()) != len(contours) or any(
-        shape.simplified().length() < shape.length() * _OVERLAP_SHRINK
-        for shape in (whole, *(_polyline([contour]) for contour in contours))
+    overlapped = (
+        len(merged.toSubpathPolygons()) != len(contours)
+        or merged.length() < whole.length() * _OVERLAP_SHRINK
+        or any(
+            shape.simplified().length() < shape.length() * _OVERLAP_SHRINK
+            for shape in (_polyline([contour]) for contour in contours)
+        )
     )
     return merged if overlapped else path
 
 
-def _outline_once(path: QPainterPath, outlines: dict[int, QPainterPath]) -> QPainterPath:
-    """``path`` の :func:`_outer_outline` を 1 度だけ求める ``outlines`` は 1 回の描画の覚え
+#: 1 回の描画で解いた輪郭の覚え 鍵はパスの ``id`` で、値は（パス, 解いた形）
+#: パスも一緒に持つのは、途中で作ったパスが消えて同じ ``id`` が別のパスへ回らないように
+_Outlines = dict[int, tuple[QPainterPath, QPainterPath]]
 
-    解くのは重いので、層の数だけ解くと長い字幕で手間が層の数の倍になる 鍵はパスの ``id``
-    で、覚えは :func:`_paint_layers` の中だけで使うので、パスは描き終えるまで消えない
+
+def _outline_once(path: QPainterPath, outlines: _Outlines) -> QPainterPath:
+    """``path`` の :func:`_outer_outline` を 1 度だけ求める
+
+    解くのは重いので、層の数だけ解くと長い字幕で手間が層の数の倍になる
     """
     key = id(path)
     if key not in outlines:
-        outlines[key] = _outer_outline(path)
-    return outlines[key]
+        outlines[key] = (path, _outer_outline(path))
+    return outlines[key][1]
+
+
+def _overlapping(paths: Sequence[QPainterPath]) -> bool:
+    """どれか 2 つが重なるか"""
+    return any(
+        first.intersects(second)
+        for index, first in enumerate(paths)
+        for second in paths[index + 1 :]
+    )
+
+
+def _joined_shape(
+    parts: Sequence[_Layer], reach: float, shift: tuple[float, float] = (0.0, 0.0)
+) -> tuple[QPainterPath, QPainterPath | None]:
+    """重なった字の層を 1 つの輪郭にまとめて、まとめた形と切る形を返す
+
+    色や変形が違う字は別の層なので、層ごとに線を引くと字どうしの境に線が残る（#415）
+    変形した字だけは文字の枠で切る（#184） 素の字は切らないので、切る形には素の字の周り
+    （線や影が届く ``reach`` まで、``shift`` はその影のずれ）を足す
+    """
+    path = _glyph_outlines()
+    for shape, _look, _clip in parts:
+        path.addPath(shape)
+    frames = [clip for _shape, _look, clip in parts if clip is not None]
+    if not frames:
+        return path, None
+    allowed = QPainterPath(frames[0])
+    for shape, _look, clip in parts:
+        if clip is None:
+            around = _stroke(shape, reach).united(shape)
+            around.translate(*shift)
+            allowed = allowed.united(around)
+    return path, allowed
+
+
+def _joined_rings(
+    entries: list[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]],
+    *,
+    baked: bool,
+) -> list[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]]:
+    """同じ線で、重なった字の層を 1 つにまとめる 線が塗りに隠れる層はそのまま"""
+    alike: dict[_Ring, list[int]] = {}
+    for index, (_path, ring, _clip, look) in enumerate(entries):
+        if not _inner_lines_hidden(ring, look, baked=baked):
+            alike.setdefault(ring, []).append(index)
+    joined = list(entries)
+    merged_away: set[int] = set()
+    for ring, indices in alike.items():
+        if len(indices) < 2 or not _overlapping([entries[index][0] for index in indices]):
+            continue
+        parts = [(entries[index][0], entries[index][3], entries[index][2]) for index in indices]
+        path, clip = _joined_shape(parts, ring.width)
+        joined[indices[0]] = (path, ring, clip, entries[indices[0]][3])
+        merged_away.update(indices[1:])
+    return [entry for index, entry in enumerate(joined) if index not in merged_away]
+
+
+def _joined_shadows(layers: list[_Layer]) -> list[_Layer]:
+    """半透明の単色の影が同じで、重なった字の層を 1 つにまとめる
+
+    層ごとに影を作って重ねると、重なった所だけ濃くなる 不透明の影とグラデーションの影は、
+    重ねても形が同じなので触らない
+    """
+    alike: dict[tuple[object, ...], list[int]] = {}
+    for index, (_path, look, _clip) in enumerate(layers):
+        colour = _color(look.get("shadow_color"))
+        if paint_of(look, _SHADOW_FILL) is None and 0 < colour.alpha() < 255:
+            offsets = tuple(_number(look, name, 0.0) for name in _SHADOW_PLACE)
+            outer = max(_rings(look), key=lambda ring: ring.outward, default=None)
+            alike.setdefault((*offsets, colour.rgba(), outer), []).append(index)
+    joined = list(layers)
+    merged_away: set[int] = set()
+    for key, indices in alike.items():
+        if len(indices) < 2 or not _overlapping([layers[index][0] for index in indices]):
+            continue
+        look = layers[indices[0]][1]
+        blur = _number(look, "shadow_blur", 0.0)
+        widest = key[-1]
+        # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる（:func:`_shadow_layer`）
+        reach = 2.0 * blur + 2.0 + (widest.outward if isinstance(widest, _Ring) else 0.0)
+        shift = (_number(look, "shadow_x", 0.0), -_number(look, "shadow_y", 0.0))
+        path, clip = _joined_shape([layers[index] for index in indices], reach, shift)
+        joined[indices[0]] = (path, look, clip)
+        merged_away.update(indices[1:])
+    return [layer for index, layer in enumerate(joined) if index not in merged_away]
 
 
 def _paint_ring(
@@ -1810,7 +1906,7 @@ def _paint_ring(
     rings: list[tuple[_Ring, ...]],
     index: int,
     bases: _Bases,
-    outlines: dict[int, QPainterPath],
+    outlines: _Outlines,
     *,
     under: bool,
 ) -> None:
@@ -1838,6 +1934,7 @@ def _paint_ring(
     if first.effects >= 0 and isinstance(stacks, tuple) and first.effects < len(stacks):
         effects = stacks[first.effects]
     apply = baker if callable(baker) and effects else None
+    entries = _joined_rings(entries, baked=apply is not None)
     inside = any(ring.position == "inside" for _, ring, _, _ in entries)
     bands = [
         (
@@ -1987,7 +2084,7 @@ def _shadow_layer(
     values: dict[str, object],
     painter: QPainter,
     bases: _Bases,
-    outlines: dict[int, QPainterPath],
+    outlines: _Outlines,
 ) -> tuple[QImage, tuple[int, int]] | None:
     """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
