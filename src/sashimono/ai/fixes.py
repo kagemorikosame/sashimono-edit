@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from sashimono.core.commands import Author, Document
+from sashimono.core.mixing import DEFAULT_PEAK_CEILING_DB
 from sashimono.engine.checks.report import HIGH, LOW, MEDIUM
 from sashimono.engine.checks.scan import (
     BLACK,
@@ -76,6 +77,12 @@ FIX_ROUNDS_RANGE = (0, 10)
 _MIXED = "mixed"
 _SOURCE = "source"
 
+#: 音量が足りないのに、音の山が天井に当たっている物（同じだけ上げる道具ではもう上がらない）を
+#: 分ける印
+_AT_CEILING = "at_ceiling"
+#: 山がこれより天井に近ければ天井に当たっていると読む（dB） 測りと丸めの差
+_CEILING_SLACK_DB = 0.05
+
 
 @dataclass(frozen=True, slots=True)
 class Fix:
@@ -88,6 +95,12 @@ class Fix:
     def as_dict(self) -> dict[str, object]:
         return {"action": self.action, "tools": list(self.tools), "how": self.how}
 
+
+_RAISE_BLOCKED = (
+    "音の山が天井に当たっていて、全部を同じだけ上げる normalize_loudness ではもう上がらない"
+    " 山の出る音のクリップだけを set_volume で下げてから normalize_loudness を呼ぶか、"
+    "基準に届かないまま進めるかを人に尋ねる"
+)
 
 #: 種類と程度ごとの直し方 2026-10-20 に本人が決めた表（#339 の Issue の本文）
 #: 音割れだけは程度が 1 つなので、混ぜた音か素材かで分ける（3 つ目の値）
@@ -103,6 +116,17 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         AUTO,
         ("normalize_loudness",),
         "作品全体を基準の音量へそろえる 声と BGM の釣り合いは変わらない",
+    ),
+    # 通しの確かめで、auto のまま同じ道具を勧め続け、直す回数を使い切った（#413）
+    (LOUDNESS, HIGH, _AT_CEILING): Fix(
+        ASK,
+        ("set_volume", "normalize_loudness"),
+        _RAISE_BLOCKED,
+    ),
+    (LOUDNESS, MEDIUM, _AT_CEILING): Fix(
+        ASK,
+        ("set_volume", "normalize_loudness"),
+        _RAISE_BLOCKED,
     ),
     (CLIPPING, HIGH, _MIXED): Fix(
         AUTO,
@@ -184,7 +208,19 @@ _FILE = (
 )
 
 
-def _variant(kind: str, measure: Mapping[str, object]) -> str | None:
+def _at_ceiling(measure: Mapping[str, object], peak_db: float | None) -> bool:
+    short = measure.get("difference_lu")
+    return (
+        peak_db is not None
+        and peak_db >= DEFAULT_PEAK_CEILING_DB - _CEILING_SLACK_DB
+        and isinstance(short, int | float)
+        and short < 0
+    )
+
+
+def _variant(kind: str, measure: Mapping[str, object], peak_db: float | None) -> str | None:
+    if kind == LOUDNESS:
+        return _AT_CEILING if _at_ceiling(measure, peak_db) else None
     if kind != CLIPPING:
         return None
     return _MIXED if measure.get("over_full_scale") else _SOURCE
@@ -195,17 +231,20 @@ def fix_for(
     severity: str,
     measure: Mapping[str, object],
     *,
+    peak_db: float | None = None,
     closed: bool = False,
     timeline: bool = True,
     unsettled: bool = False,
 ) -> Fix:
     """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す
 
+    ``peak_db`` は測った音の山（dBFS） 音量が足りない問題の直し方を選ぶのに使う
+
     ``timeline`` が偽（書き出した動画のファイルを調べた）なら、直す物も人へ渡す ファイルが
     今の作品から書き出した物かは確かめていない（古い書き出しや別の作品の動画も、作品のフォルダか
     書き出しのフォルダにあれば調べられる） 直す道具を返すと、AI が関係の無い今の作品を変える
     """
-    fix = FIXES.get((kind, severity, _variant(kind, measure)), _UNKNOWN)
+    fix = FIXES.get((kind, severity, _variant(kind, measure, peak_db)), _UNKNOWN)
     if not timeline and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_FILE}（{fix.how}）")
     if unsettled and fix.action in (AUTO, ASK):

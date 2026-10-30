@@ -386,6 +386,8 @@ class TimelineView(QWidget):
         #: 削除して詰めたあと、再生ヘッドを消した所の頭（つなぎ目）へ動かすか
         #: （:meth:`set_ripple_playhead`） 既定は設定の既定と同じ
         self._ripple_playhead = True
+        #: 詰めて消すとき別のトラックの重ねの層も動かすか（:meth:`set_ripple_layers`）
+        self._ripple_layers = True
         #: ヘッダを掴んでトラックの順を入れ替えるドラッグ
         self._track_mover = TrackDragger(self._request)
         #: ドラッグ中に端へ寄ったら表示を送る
@@ -2245,9 +2247,9 @@ class TimelineView(QWidget):
         # 頭は消す前に求める 消した後のプロジェクトには、もう消したクリップが無い
         head = self._earliest_start(removed) if ripple and self._ripple_playhead else None
         command: Command = (
-            RemoveClips(removed, ripple=ripple)
+            RemoveClips(removed, ripple=ripple, layers=ripple and self._ripple_layers)
             if len(removed) > 1
-            else RemoveClip(removed[0], ripple=ripple)
+            else RemoveClip(removed[0], ripple=ripple, layers=ripple and self._ripple_layers)
         )
         self._request([command], command.label)
         if head is None:
@@ -2264,6 +2266,10 @@ class TimelineView(QWidget):
     def set_ripple_playhead(self, enabled: bool) -> None:
         """削除して詰めたあと再生ヘッドを動かすか 設定（:attr:`Preferences.ripple_playhead`）から"""
         self._ripple_playhead = enabled
+
+    def set_ripple_layers(self, enabled: bool) -> None:
+        """詰めて消すとき重ねの層も動かすか 設定（:attr:`Preferences.ripple_layers`）から"""
+        self._ripple_layers = enabled
 
     def _earliest_start(self, clip_ids: Iterable[ClipId]) -> int | None:
         """渡したクリップと、そのリンクの相手のうち、一番早い頭

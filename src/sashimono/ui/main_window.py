@@ -585,6 +585,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_split_audio(self._preferences.splits_media)
         self._timeline.set_insert_all_tracks(self._preferences.inserts_on_all_tracks)
         self._timeline.set_ripple_playhead(self._preferences.ripple_playhead)
+        self._timeline.set_ripple_layers(self._preferences.ripple_layers)
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
@@ -1112,6 +1113,7 @@ class MainWindow(QMainWindow):
         self._timeline.set_split_audio(preferences.splits_media)
         self._timeline.set_insert_all_tracks(preferences.inserts_on_all_tracks)
         self._timeline.set_ripple_playhead(preferences.ripple_playhead)
+        self._timeline.set_ripple_layers(preferences.ripple_layers)
         self._timeline.set_snap(preferences.timeline_snap, preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(preferences))
         self._scene_bar.set_snap(preferences.timeline_snap)
@@ -3550,6 +3552,10 @@ class MainWindow(QMainWindow):
         return self.view_project
 
     @property
+    def ripple_follows_layers(self) -> bool:
+        return self._preferences.ripple_layers
+
+    @property
     def splits_media(self) -> bool:
         """AI が素材を置くときも、画面から置くときと同じ設定に従う"""
         return self._preferences.splits_media
@@ -3869,6 +3875,13 @@ class MainWindow(QMainWindow):
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()
+
+    @property
+    def transcribing(self) -> bool:
+        return self._subtitles.transcribing
+
+    def transcription_waiter(self) -> Callable[[float], bool]:
+        return self._subtitles.transcription_waiter()
 
     def start_speaker_separation(
         self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
@@ -4724,6 +4737,9 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
         # 書きかけは捨てる 書き出し先は前のまま残る
         self._assistant_export.shutdown()
+        # 起こしの終わりを待っている AI を放す 窓を閉じると見張りのタイマーも止まり、片付いた
+        # 知らせが来ないまま待つ秒の上限まで残る
+        self._subtitles.release_transcription_waiters()
         # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
         # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
         self._stop_narration()

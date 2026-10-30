@@ -353,3 +353,87 @@ class TestPreferences:
         assert dialog.preferences() == chosen
         dialog._ripple_playhead.setChecked(True)
         assert dialog.preferences().ripple_playhead is True
+
+
+class TestLayersFollow:
+    """削除して詰めるとき、別のトラックの重ねの層も動かす設定（#413）"""
+
+    @staticmethod
+    def _with_title(qt_application: QApplication, video_media: MediaItem) -> MainWindow:
+        first = Clip(timeline_start=0, duration=30, media_id=video_media.id)
+        second = Clip(timeline_start=30, duration=30, media_id=video_media.id)
+        title = _text(40, 10)
+        return _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (first, second)),
+                Track(TrackKind.VIDEO, "T1", (title,)),
+                media=(video_media,),
+            ),
+        )
+
+    @staticmethod
+    def _title_start(window: MainWindow) -> int:
+        return window.document.project.timeline.tracks[1].clips[0].timeline_start
+
+    def test_the_title_moves_with_the_cut(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、画面で詰めた人のテロップと字幕が話している絵からずれる
+        window = self._with_title(qt_application, video_media)
+        try:
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert self._title_start(window) == 10
+        finally:
+            window.close()
+
+    def test_turning_it_off_leaves_the_title(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 切っても動くなら、設定がある方が質が悪い
+        window = self._with_title(qt_application, video_media)
+        try:
+            window._apply_preferences(replace(window._preferences, ripple_layers=False))
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert self._title_start(window) == 40
+        finally:
+            window.close()
+
+    def test_the_assistant_reads_the_same_setting(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、人が切った設定を AI の詰める削除が無視する
+        window = self._with_title(qt_application, video_media)
+        try:
+            assert window.ripple_follows_layers is True
+            window._apply_preferences(replace(window._preferences, ripple_layers=False))
+            assert window.ripple_follows_layers is False
+        finally:
+            window.close()
+
+    def test_the_default_follows(self) -> None:
+        # 既定は知らない人が困らない側 切れていると詰めるたびに字幕がずれる
+        assert Preferences().ripple_layers is True
+
+    def test_the_choice_is_saved(self, tmp_path: Path) -> None:
+        # 保存されないと、切った人が起動するたびに切り直すことになる
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(ripple_layers=False))
+        assert store.load().ripple_layers is False
+
+    def test_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 壊れた値で起動を止めない 項目ごとに既定へ戻す
+        path = tmp_path / "preferences.json"
+        path.write_text(json.dumps({"ripple_layers": "はい"}), encoding="utf-8")
+        assert PreferenceStore(path).load().ripple_layers is True
+
+    def test_the_dialog_shows_and_returns_it(self, qt_application: QApplication) -> None:
+        # 画面に出ていない、または OK で返らないと、設定画面から切れない
+        del qt_application
+        chosen = Preferences(ripple_layers=False)
+        dialog = PreferencesDialog(chosen)
+        assert dialog.preferences() == chosen
+        dialog._ripple_layers.setChecked(True)
+        assert dialog.preferences().ripple_layers is True

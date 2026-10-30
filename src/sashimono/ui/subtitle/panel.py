@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
@@ -168,6 +169,9 @@ class SubtitlePanel(QWidget):
         #: （:class:`TranscriptionService`）、
         #: 終わった物はどれもその素材と音声の字幕へ取り込む
         self._jobs: list[Job] = []
+        #: 起こしの列が片付いているか（:meth:`transcription_waiter`）
+        self._settled = threading.Event()
+        self._settled.set()
         #: 終わった起こしの知らせ 様子を聞かれたときに並べる
         self._job_notes: list[str] = []
         #: 起こしの知らせに書いた素材の名前と場所 知らせは作品を開き直しても残るので、
@@ -789,6 +793,7 @@ class SubtitlePanel(QWidget):
         options = TranscribeOptions(model=model, audio_stream=stream)
         waiting = self._service.busy
         self._jobs.append(self._service.start(media.id, media.path, options))
+        self._note_jobs()
         self.select_media(media.id)
         if waiting:
             return f"{media.name} の起こしを順番待ちに入れました 前の起こしが終わると始まります"
@@ -802,6 +807,26 @@ class SubtitlePanel(QWidget):
     def transcription_status(self) -> str:
         """走っている起こしの様子"""
         return self.poll_transcription()
+
+    def _note_jobs(self) -> None:
+        """起こしの列の様子を待つ人へ伝える 列を触ったら呼ぶ（編集画面のスレッド）"""
+        if self.transcribing:
+            self._settled.clear()
+        else:
+            self._settled.set()
+
+    def transcription_waiter(self) -> Callable[[float], bool]:
+        """起こしの列が片付くまで待つ関数 AI のスレッドから呼ばれる
+
+        ``_jobs`` を AI のスレッドから読まず、知らせの ``Event`` だけを見る 取り込みは
+        編集画面のスレッドの見張り（:meth:`poll_transcription`）がするので、知らせが立った
+        時には結果が作品へ入っている
+        """
+        return self._settled.wait
+
+    def release_transcription_waiters(self) -> None:
+        """待っている人を放す 窓を閉じるときに呼ぶ"""
+        self._settled.set()
 
     def poll_transcription(self) -> str:
         """AI から始めた起こしの様子を拾い、終わっていれば結果を取り込む
@@ -830,6 +855,7 @@ class SubtitlePanel(QWidget):
                 self._job_notes.append(f"{name}: {message}")
                 break
 
+        self._note_jobs()
         lines = []
         if self._service is not None:
             for job in self._service.jobs():
@@ -897,6 +923,7 @@ class SubtitlePanel(QWidget):
         options = SpeakerOptions(speakers=speakers, audio_stream=stream)
         waiting = self._service.busy
         self._jobs.append(self._service.start_speakers(media.id, media.path, options))
+        self._note_jobs()
         self.select_media(media.id)
         if waiting:
             return f"{media.name} の話者の分離を順番待ちに入れました 前の物が終わると始まります"

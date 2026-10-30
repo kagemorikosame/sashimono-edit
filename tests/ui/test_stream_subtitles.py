@@ -135,6 +135,37 @@ def _settle(panel: SubtitlePanel) -> str:
 
 
 class TestFromTheAssistant:
+    def test_the_waiter_opens_when_the_queue_is_empty(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 壊れると、AI は起こしの終わりを待てず、別の道具を時計代わりに呼び続ける（#413）
+        panel, host, first, _second = setup
+        waiter = panel.transcription_waiter()
+        assert waiter(0.0)
+        speaker.gate.clear()
+        panel.start_transcription(first.id, "tiny", audio_stream=1)
+        assert panel.transcribing
+        assert not waiter(0.0)
+        speaker.gate.set()
+        _settle(panel)
+        assert waiter(0.0)
+        # 知らせが立った時には結果が作品へ入っている
+        assert _texts(host.project, first, 1) == ["録画 の音声 1"]
+
+    def test_closing_lets_the_waiter_go(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 壊れると、閉じた窓の起こしを AI が待つ秒の上限まで待ち続ける
+        panel, _host, first, _second = setup
+        speaker.gate.clear()
+        panel.start_transcription(first.id, "tiny", audio_stream=1)
+        waiter = panel.transcription_waiter()
+        assert not waiter(0.0)
+        panel.release_transcription_waiters()
+        assert waiter(0.0)
+        speaker.gate.set()
+        _settle(panel)
+
     def test_two_requests_both_land(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
     ) -> None:

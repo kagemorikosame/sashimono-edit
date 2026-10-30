@@ -215,10 +215,20 @@ from sashimono.core.commands import (
     valid_marker_color,
 )
 from sashimono.core.commands.convert import convert_layers, switch_layer_mode
-from sashimono.core.commands.edit import MAX_RESOLUTION, MIN_RESOLUTION, STOP_LOCKED
+from sashimono.core.commands.edit import (
+    MAX_RESOLUTION,
+    MIN_RESOLUTION,
+    STOP_LOCKED,
+    ripple_moves_layers,
+)
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.history import REPLACED_REFUSAL
-from sashimono.core.commands.insert import new_track, place_media, with_known_video_end
+from sashimono.core.commands.insert import (
+    new_track,
+    place_media,
+    place_media_spans,
+    with_known_video_end,
+)
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
@@ -244,6 +254,7 @@ from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import merge_ranges, plan_cuts
 from sashimono.core.mixing import (
+    DEFAULT_PEAK_CEILING_DB,
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
@@ -410,6 +421,7 @@ from sashimono.engine.checks.profile import (
     SoundProfile,
     SoundSegment,
     classify,
+    suggest_silence,
 )
 from sashimono.engine.checks.profile import SILENCE as SOUND_SILENCE
 from sashimono.engine.checks.report import CheckReport, ClipIndex
@@ -1415,9 +1427,18 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
             | ({"segment_id": row["segment_id"], "truncated": True} if "truncated" in row else {})
             for index, row in enumerate(rows)
         ]
-    return _paged(rows, arguments, name="subtitles", truncated_note=_FULL_TEXT_NOTE)
+    result = _paged(rows, arguments, name="subtitles", truncated_note=_FULL_TEXT_NOTE)
+    if host.transcribing:
+        # 途中であることを返さないと、空の一覧を「字幕が無い」と読んで起こし直しに行く（#413）
+        result["transcribing"] = True
+        result["note"] = " ".join(filter(None, (result.get("note"), _TRANSCRIBING_NOTE)))
+    return result
 
 
+_TRANSCRIBING_NOTE = (
+    "字幕起こしの途中です 起こし終えた素材の字幕だけが並びます"
+    " transcription_status の wait_seconds で終わりを待てます"
+)
 #: 一覧で 1 行の本文を切り詰める長さ 1 行が長いと、ほかの行が 1 回の返事に入らない
 LONG_TEXT_CHARS = 2000
 #: segment_id で 1 行を読むときに 1 回で返す本文の長さ 返事の上限（12000）に収める
@@ -3856,7 +3877,11 @@ def _check_result(
             row["ongoing"] = True
         # 直し方（#339） 表は ai/fixes.py 上限に達した後は直す物も人へ渡す
         row["fix"] = fix_for(
-            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+            problem.kind,
+            problem.severity,
+            problem.measure,
+            peak_db=report.peak_db,
+            **_fix_state(rounds, unsettled),
         ).as_dict()
         rows.append(row)
     result = _paged(rows, arguments, name="problems")
@@ -3866,7 +3891,11 @@ def _check_result(
     for problem in report.problems:
         severities[problem.severity] = severities.get(problem.severity, 0) + 1
         action = fix_for(
-            problem.kind, problem.severity, problem.measure, **_fix_state(rounds, unsettled)
+            problem.kind,
+            problem.severity,
+            problem.measure,
+            peak_db=report.peak_db,
+            **_fix_state(rounds, unsettled),
         )
         fixes[action.action] += 1
     if ticket is not None and rounds is not None and rounds.closed and not unsettled:
@@ -3880,7 +3909,9 @@ def _check_result(
                 f"（{_problem_time(problem.start, report.fps, rate)}〜"
                 " 直す回数の上限で直していない）"
                 for problem in report.problems
-                if fix_for(problem.kind, problem.severity, problem.measure).action
+                if fix_for(
+                    problem.kind, problem.severity, problem.measure, peak_db=report.peak_db
+                ).action
                 in (FIX_AUTO, FIX_ASK)
             ),
         )
@@ -3996,6 +4027,8 @@ MAX_SOUND_POINTS = 200
 DEFAULT_SOUND_SILENCE_DB = -50.0
 #: 返す無音の最短（秒）の既定 話の区切り（0.5 秒ほどの間）を拾い、息継ぎは拾わない
 DEFAULT_SOUND_MIN_SILENCE = 0.5
+#: jet_cut の padding の既定（秒）
+_JET_CUT_PADDING = 0.1
 #: 一覧の種類 区間の見分けか、無音か
 SOUND_LISTS = ("segments", "silences")
 SOUND_LABEL_NAMES = {
@@ -4209,6 +4242,31 @@ def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     return _after_sound(host, wait, answer)
 
 
+def _jet_cut_hint(profile: SoundProfile, min_silence: float) -> dict[str, Any]:
+    """jet_cut の threshold_db の勧める値 当てずっぽうで切っては戻すのを防ぐ（#413）"""
+    best, nearby = suggest_silence(profile, min_silence, _JET_CUT_PADDING)
+    if best is None:
+        return {
+            "threshold_db": None,
+            "note": "話と間の音量の差が見分けられません 切れる無音は少なそうです",
+        }
+    return {
+        "threshold_db": best.threshold_db,
+        "min_silence": min_silence,
+        "cuts": best.cuts,
+        "seconds": best.seconds,
+        "nearby": [
+            {"threshold_db": row.threshold_db, "cuts": row.cuts, "seconds": row.seconds}
+            for row in nearby
+        ],
+        "note": (
+            "素材の音量のままの見込み jet_cut は音の山で見るので silences の silence_db とは"
+            "数が合わない 字幕があると既定の keep_speech が字幕のある区間を残すので、切れる数は"
+            "減る 字幕の中の間も詰めるなら keep_speech を false にする"
+        ),
+    }
+
+
 def _sound_numbers(
     request: CheckRequest,
     heard: _Heard,
@@ -4245,6 +4303,7 @@ def _sound_numbers(
     }
     if project is not None:
         head |= {"from_frame": request.start, "to_frame": request.end, "scene": request.scene}
+        head["jet_cut"] = _jet_cut_hint(profile, min_silence)
     else:
         head["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
 
@@ -4555,10 +4614,45 @@ def _set_resolution(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"resolution": f"{command.width}x{command.height}"}
 
 
+#: place_media に 1 回で渡せる区間の数 数千か所を一度に組むと編集画面が止まる
+MAX_PLACE_RANGES = 200
+
+
+def _media_spans(media: MediaItem, arguments: dict[str, Any]) -> list[tuple[Fraction, Fraction]]:
+    """引数 ``ranges`` を素材の秒の組へ 素材の外や逆向きの区間は、丸めずに断る
+
+    丸めて受けると、頼んだのと違う所が置かれたことに AI も人も気付かない
+    """
+    _no_explicit_null(arguments, "ranges")
+    raw = arguments["ranges"]
+    if not isinstance(raw, list) or not raw:
+        raise ToolError("ranges は start_seconds と end_seconds の組の配列で渡してください")
+    if len(raw) > MAX_PLACE_RANGES:
+        raise ToolError(f"ranges は {MAX_PLACE_RANGES} 個までです（{len(raw)} 個来ました）")
+    if media.is_still or media.duration <= 0:
+        raise ToolError(f"{media.name} は静止画か長さの無い素材なので、一部だけは置けません")
+    limit = float(media.duration)
+    spans: list[tuple[Fraction, Fraction]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ToolError(f"ranges の {index + 1} 個目は組で渡してください")
+        start = _optional_number(entry, "start_seconds", 0.0, limit)
+        end = _optional_number(entry, "end_seconds", 0.0, limit)
+        if start is None or end is None or end <= start:
+            raise ToolError(
+                f"ranges の {index + 1} 個目は start_seconds より後の end_seconds が要ります"
+            )
+        # ミリ秒で区切る 浮動小数のまま分数にすると分母が膨らみ、保存した作品が読みにくくなる
+        spans.append((Fraction(round(start * 1000), 1000), Fraction(round(end * 1000), 1000)))
+    return spans
+
+
 def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
     at_frame = arguments.get("at_frame")
+    if "ranges" in arguments:
+        return _place_spans(host, media, _media_spans(media, arguments), at_frame)
     commands = insert_media(
         project,
         _with_known_video_end(host, media),
@@ -4569,6 +4663,38 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError(f"{media.name} は長さが無いので置けません")
     host.apply_commands(commands, f"配置: {media.name}")
     return {"placed": media.name}
+
+
+def _place_spans(
+    host: EditorHost,
+    media: MediaItem,
+    spans: list[tuple[Fraction, Fraction]],
+    at_frame: object,
+) -> object:
+    """素材の一部を順に並べて置く 取り消し 1 回で全部戻る 置いたクリップの ID を返す"""
+    project = _project(host)
+    commands = place_media_spans(
+        project,
+        _with_known_video_end(host, media),
+        spans,
+        at_frame=project.duration if at_frame is None else _integer_value(at_frame, "at_frame"),
+        split_audio=host.splits_media,
+    )
+    host.apply_commands(commands, f"配置: {media.name}（{len(spans)} か所）")
+    parts: dict[int, dict[str, Any]] = {}
+    for command in commands:
+        if isinstance(command, AddClip):
+            clip = command.clip
+            part = parts.setdefault(
+                clip.timeline_start,
+                {"start": clip.timeline_start, "duration": clip.duration, "clip_ids": []},
+            )
+            part["clip_ids"].append(str(clip.id))
+    return {
+        "placed": media.name,
+        "clips": list(parts.values()),
+        "end_frame": max(part["start"] + part["duration"] for part in parts.values()),
+    }
 
 
 def _with_known_video_end(host: EditorHost, media: MediaItem) -> MediaItem:
@@ -4758,17 +4884,71 @@ def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"timeline_start": start}
 
 
+def _transition_ids(project: Project) -> set[ClipId]:
+    return {
+        clip.id
+        for track in project.timeline.tracks
+        for clip in track.clips
+        if clip.source is not None and clip.source.kind == TRANSITION.kind
+    }
+
+
+#: 切ると消える場面切り替えの案内 直し方が分からないと、AI は作り直しに全部を戻す
+_SEAM_AGAIN_NOTE = (
+    "切った所に掛かっていた場面切り替えを外しました つなぎ目を処理し直すなら smooth_cuts を呼びます"
+)
+
+
+def _ripple_answer(
+    host: EditorHost, before: Project, clip_ids: tuple[ClipId, ...]
+) -> dict[str, object]:
+    """詰めて消した答えに、別のトラックの重ねの層がどうなったかを添える
+
+    ``before`` は消す前の作品 重ねの層が付いてきたかを AI が読めないと、ずれたまま先へ進むか、
+    見に行くのに手数を使う（#413）
+    """
+    follows = host.ripple_follows_layers
+    followed = follows and any(ripple_moves_layers(before, clip_id) for clip_id in clip_ids)
+    answer: dict[str, object] = {"layers_followed": followed}
+    notes: list[str] = []
+    if not followed:
+        reason = "同じ時間に別の絵や音が残るので、" if follows else "本人の設定で切ってあるので、"
+        notes.append(
+            f"{reason}別のトラックの字幕と重ねの層は動かしていません"
+            " 全部のトラックから同じ所を切るなら cut_range を使います"
+        )
+    removed = (_transition_ids(before) - _transition_ids(_project(host))) - set(clip_ids)
+    if removed:
+        answer["transitions_removed"] = len(removed)
+        notes.append(_SEAM_AGAIN_NOTE)
+    if notes:
+        answer["note"] = " ".join(notes)
+    return answer
+
+
+def _removal(host: EditorHost, clip_ids: tuple[ClipId, ...], ripple: bool) -> dict[str, object]:
+    """クリップを消す命令を積む 詰めるときは本人の設定で別のトラックも動かす"""
+    before = _project(host)
+    layers = ripple and host.ripple_follows_layers
+    if len(clip_ids) > 1:
+        command: Command = RemoveClips(clip_ids, ripple=ripple, layers=layers)
+        host.apply_commands([command], command.label)
+    else:
+        host.apply_commands(
+            [RemoveClip(clip_ids[0], ripple=ripple, layers=layers)], "クリップを削除"
+        )
+    return _ripple_answer(host, before, clip_ids) if ripple else {}
+
+
 def _delete_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     ripple = _flag_argument(arguments, "ripple", False)
     members = _with_groups(host, (clip.id,))
+    # 1 本だけ消すと、画面で消したときと違って仲間が残る
+    extra = _removal(host, members, ripple)
     if len(members) > 1:
-        # 1 本だけ消すと、画面で消したときと違って仲間が残る
-        command = RemoveClips(members, ripple=ripple)
-        host.apply_commands([command], command.label)
-        return {"deleted": [str(clip_id) for clip_id in members], "ripple": ripple}
-    host.apply_commands([RemoveClip(clip.id, ripple=ripple)], "クリップを削除")
-    return {"deleted": str(clip.id), "ripple": ripple}
+        return {"deleted": [str(clip_id) for clip_id in members], "ripple": ripple, **extra}
+    return {"deleted": str(clip.id), "ripple": ripple, **extra}
 
 
 def _move_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -4784,9 +4964,38 @@ def _move_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _delete_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     clip_ids = _with_groups(host, _target_clips(host, arguments))
     ripple = _flag_argument(arguments, "ripple", False)
-    command = RemoveClips(clip_ids, ripple=ripple)
+    before = _project(host)
+    command = RemoveClips(clip_ids, ripple=ripple, layers=ripple and host.ripple_follows_layers)
     host.apply_commands([command], command.label)
-    return {"deleted": [str(clip_id) for clip_id in clip_ids], "ripple": ripple}
+    extra = _ripple_answer(host, before, clip_ids) if ripple else {}
+    return {"deleted": [str(clip_id) for clip_id in clip_ids], "ripple": ripple, **extra}
+
+
+def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """タイムラインの範囲を全部のトラックから切って詰める ジェットカットと同じ命令を通す
+
+    分割と削除を組み合わせるとトラックごとに切り直すことになり、1 本でも忘れるとずれる（#413）
+    """
+    project = _project(host)
+    start = _integer_value(arguments.get("start_frame"), "start_frame")
+    end = _integer_value(arguments.get("end_frame"), "end_frame")
+    if not 0 <= start < end <= project.duration:
+        raise ToolError(
+            f"範囲は 0 ≦ start_frame < end_frame ≦ {project.duration}（タイムラインの長さ）で"
+            f"渡してください（{start}〜{end} が来ました）"
+        )
+    host.apply_commands([RippleCut(((start, end),))], "範囲を切って詰める")
+    length = end - start
+    result: dict[str, object] = {
+        "removed_frames": length,
+        "removed_seconds": round(float(length * project.rate.frame_duration), 2),
+        "duration_frames": _project(host).duration,
+    }
+    removed = _transition_ids(project) - _transition_ids(_project(host))
+    if removed:
+        result["transitions_removed"] = len(removed)
+        result["note"] = _SEAM_AGAIN_NOTE
+    return result
 
 
 def _duplicate_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -5147,23 +5356,62 @@ def _param_path(clip_id: ClipId, arguments: dict[str, Any]) -> ParamPath:
     return ParamPath.of_source(clip_id, name)
 
 
+def _param_sends(project: Project, path: ParamPath) -> frozenset[Outbound]:
+    """返す値を伏せる種類 欄の型で決める（get_clip と同じ #391）
+
+    定義の分からない欄の文字は伏せる側に数える クリップ自身の欄（不透明度）は定義を
+    持たないが文字ではない
+    """
+    spec = _spec_for(project, path)
+    if spec is not None:
+        return field_sends(spec)
+    if path.target is ParamTarget.CLIP:
+        return frozenset()
+    return UNKNOWN_FIELD_SENDS
+
+
 def _set_param(host: EditorHost, arguments: dict[str, Any]) -> object:
+    if "clip_ids" in arguments:
+        return _set_param_on_many(host, arguments)
     _, clip = _target_clip(host, arguments)
     path = _param_path(clip.id, arguments)
     value = arguments.get("value")
     project = _project(host)
     resolved = _coerce_param(project, path, value)
-    spec = _spec_for(project, path)
+    needs = _param_sends(project, path)
     host.apply_commands([SetParam(path, resolved)], f"{path.name} を変更")
-    # 返す値も欄の型で伏せる（get_clip と同じ #391） 定義の分からない欄の文字は伏せる側に数える
-    # クリップ自身の欄（不透明度）は定義を持たないが文字ではない
-    if spec is not None:
-        needs = field_sends(spec)
-    elif path.target is ParamTarget.CLIP:
-        needs = frozenset()
-    else:
-        needs = UNKNOWN_FIELD_SENDS
     return {"name": path.name, "value": masked_value(str(value), needs)}
+
+
+def _set_param_on_many(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """同じ値を何本ものクリップへ 取り消し 1 回で戻る 1 本でも当てられなければ何も変えない
+
+    位置を揃えるのに本数ぶん呼ぶと手数が増える（通しの確かめで 6 回呼んだ #413）
+    """
+    if arguments.get("clip_id"):
+        raise ToolError("clip_id と clip_ids はどちらか一方で渡してください")
+    clip_ids = _target_clips(host, arguments)
+    project = _project(host)
+    value = arguments.get("value")
+    commands: list[Command] = []
+    needs: frozenset[Outbound] = frozenset()
+    trial = project
+    for clip_id in clip_ids:
+        path = _param_path(clip_id, arguments)
+        command = SetParam(path, _coerce_param(project, path, value))
+        needs |= _param_sends(project, path)
+        try:
+            # 先に手元で当ててみる 途中のクリップで断られたとき、前のクリップだけが変わらない
+            trial = command.apply(trial)
+        except (KeyError, ValueError) as exc:
+            raise ToolError(f"{clip_id} に {path.name} を渡せません: {exc}") from exc
+        commands.append(command)
+    host.apply_commands(commands, f"{commands[0].label}（{len(commands)} 本）")
+    return {
+        "name": str(arguments.get("name", "")),
+        "value": masked_value(str(value), needs),
+        "clip_ids": [str(clip_id) for clip_id in clip_ids],
+    }
 
 
 def _spec_for(project: Project, path: ParamPath) -> ParameterSpec | None:
@@ -5817,7 +6065,10 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 音声 2 のクリップでも音声 1 の無音を切る（PR #231 の指摘）
     ranges = plan_cuts(project, media.id, silences, stream=media.transcript_stream(stream))
     if not ranges:
-        raise ToolError("切れる無音が見つかりません threshold_db を上げてみてください")
+        raise ToolError(
+            "切れる無音が見つかりません threshold_db を上げてみてください"
+            "（analyze_audio の jet_cut が勧める値を返します）"
+        )
 
     removed = sum(end - start for start, end in ranges)
     cut = RippleCut(ranges)
@@ -6242,7 +6493,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         if not targets:
             raise ToolError("どのクリップも無効です 有効にしてから呼んでください")
     target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
-    ceiling = _limit_number(arguments, "peak_ceiling_db", -1.0, -20.0, 0.0)
+    ceiling = _limit_number(arguments, "peak_ceiling_db", DEFAULT_PEAK_CEILING_DB, -20.0, 0.0)
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
     start = min(clip.timeline_start for _, clip in targets)
     end = max(clip.timeline_end for _, clip in targets)
@@ -6261,6 +6512,10 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not host.check_state().running or wait <= 0:
         return finish()
     return Pending(wait=host.check_waiter(), seconds=wait, then=finish)
+
+
+#: これより小さい差は基準に合っていると読む（LU） 掛けても聞き分けられない
+_ON_TARGET_LU = 0.05
 
 
 def _apply_loudness(
@@ -6309,14 +6564,29 @@ def _apply_loudness(
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
+    # 掛けた後に基準へ届くか 掛ける量が小さいことと基準に合っていることは別
+    short = request.limits.loudness_target - measured - gain
+    reached = abs(short) < _ON_TARGET_LU
     result: dict[str, Any] = {
         "measured_lufs": round(measured, 1),
         "target_lufs": request.limits.loudness_target,
         "sample_peak_dbfs": None if report.peak_db is None else round(report.peak_db, 2),
         "clips": len(clips),
+        "reached": reached,
     }
-    if abs(gain) < 0.05:
-        result |= {"gain_db": 0.0, "note": "すでに基準に合っています 何も変えていません"}
+    if not reached:
+        result |= {"short_of_target_lu": round(short, 1), "limited_by": limited}
+    if abs(gain) < _ON_TARGET_LU:
+        result["gain_db"] = 0.0
+        if reached:
+            result["note"] = "すでに基準に合っています 何も変えていません"
+        else:
+            result["note"] = (
+                f"何も変えていません 基準まで {short:.1f} LU 足りませんが、"
+                f"{_limit_reason(limited, ceiling)}、全部を同じだけ上げる道具ではこれ以上"
+                "上がりません 山の出る音のクリップだけを set_volume で下げてから呼び直すか、"
+                "基準に届かないまま進めるかを人に尋ねてください"
+            )
         return result
     commands = gain_commands(clips, gain)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
@@ -6334,6 +6604,13 @@ def _apply_loudness(
             notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
     result["note"] = " ".join(notes)
     return result
+
+
+def _limit_reason(limited: list[str], ceiling: float) -> str:
+    """基準の手前で止めた訳の文 ``limited`` は :attr:`LoudnessGain.limited_by`"""
+    if "peak" in limited:
+        return f"音の山が上限 {ceiling:g} dBFS に当たっているので"
+    return f"音量の欄が上限 {VOLUME_LIMIT:g}% に当たっているので"
 
 
 def _fixed_param(clip: Clip, kind: str, name: str, value: float) -> Clip:
@@ -6505,7 +6782,16 @@ def _seconds(value: object) -> Fraction:
     return Fraction(round(float(str(value)) * 100), 100)
 
 
+def _transcription_answer(host: EditorHost) -> dict[str, object]:
+    # 様子を先に読む 読むときに終わった起こしを取り込むので、逆だと終わったのに走っていると返す
+    status = host.transcription_status()
+    return {"status": status, "transcribing": host.transcribing}
+
+
 def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
+    # 待つ秒は始める前に見る 始めてから断ると、AI が直して呼び直したときに「もう起こしている」で
+    # 断られる
+    wait = _wait_seconds(arguments)
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
     if not media.has_audio:
@@ -6523,16 +6809,31 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
         )
     except RuntimeError as exc:
         raise ToolError(str(exc)) from exc
-    return {
+    result = {
         "started": message,
-        "next": "しばらく待ってから transcription_status を見てください"
-        "終わったら get_subtitles で結果を取れます",
+        "next": "transcription_status に wait_seconds を付けると終わりを待てます"
+        " 終わったら get_subtitles で結果を取れます",
     }
+    if wait > 0:
+        return Pending(
+            wait=host.transcription_waiter(),
+            seconds=wait,
+            then=lambda: {**result, **_transcription_answer(host)},
+        )
+    return result
 
 
 def _transcription_status(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
-    return {"status": host.transcription_status()}
+    wait = _wait_seconds(arguments)
+    answer = _transcription_answer(host)
+    if wait > 0 and answer["transcribing"]:
+        # 画面のスレッドでは待たない（Pending） 別の道具を時計代わりに呼ばずに済む（#413）
+        return Pending(
+            wait=host.transcription_waiter(),
+            seconds=wait,
+            then=lambda: _transcription_answer(host),
+        )
+    return answer
 
 
 def _separate_speakers(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -9028,6 +9329,17 @@ _NARRATION = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS}
 #: 色と雑音の自動補正（#336） 結果に本人の設定の強さ・下げる量の既定が載り、サムネイルや
 #: 波形の用意がまだのときの断りの文に素材の名前が入る 絵そのものは送らない（測った数だけ）
 _AUTO_FIX = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES})
+#: 字幕起こしを待つ秒の説明 transcribe と transcription_status で同じ
+_TRANSCRIPTION_WAIT = (
+    f"片付くまで待つ秒（0〜{MAX_WAIT_SECONDS}、既定 0 は待たない） 待ちきれなければその時の様子を"
+    "返すので、もう 1 度呼ぶ"
+)
+#: 消す道具の説明 delete_clip と delete_clips で同じ
+_DELETE_NOTE = (
+    "{} ripple を真にすると後ろを詰める 番組の時間が抜けるとき（同じ時間に別の絵が残らないとき）は"
+    "別のトラックの字幕・テロップ・場面切り替えも動かす（本人の設定 答えの layers_followed で"
+    "読める） 曲がまたいだトラックは動かさない"
+)
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
 _SEAM_ARGUMENTS: dict[str, Any] = {
     "video": _string("映像の処理 crossfade・zoom・none 省くと本人の設定"),
@@ -9798,7 +10110,8 @@ OPERATIONS: tuple[Operation, ...] = (
             " check_output と同じ解析を使い回す 同じ範囲を前に調べていれば読み直さない"
             " 長い作品は裏で調べ、終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
             "調べた所までを返す（complete が false 同じ引数でもう 1 度呼ぶと続きを返す）"
-            " 絵で見るなら audio_graph" + _SOUND_LIMITS_NOTE + PAGING_NOTE
+            " タイムラインなら jet_cut に、無音カットの threshold_db の勧める値と切れる見込みを"
+            "返す 絵で見るなら audio_graph" + _SOUND_LIMITS_NOTE + PAGING_NOTE
         ),
         schema=_schema(
             {
@@ -9992,11 +10305,28 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="place_media",
-        description="読み込み済みの素材をタイムラインへ置く",
+        description=(
+            "読み込み済みの素材をタイムラインへ置く ranges を渡すと素材の一部だけを、渡した順に"
+            "隙間なく並べて置く 長い素材から何か所か取るときは全体を置いて分割せず ranges を使う"
+            " 取り消し 1 回で全部戻る"
+        ),
         schema=_schema(
             {
                 "media_id": _string("置く素材"),
                 "at_frame": _integer("置く位置 省略すると末尾"),
+                "ranges": {
+                    "type": "array",
+                    "description": f"置く素材の区間（素材の秒 {MAX_PLACE_RANGES} 個まで）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start_seconds": _number("区間の頭（素材の秒）"),
+                            "end_seconds": _number("区間の終わり（素材の秒）"),
+                        },
+                        "required": ["start_seconds", "end_seconds"],
+                        "additionalProperties": False,
+                    },
+                },
             },
             ["media_id"],
         ),
@@ -10141,7 +10471,7 @@ OPERATIONS: tuple[Operation, ...] = (
             "クリップの端を動かす head_delta は正で短く、負で頭を前へ伸ばす tail_delta は"
             "正で長くなる テキストや図形も頭を前へ伸ばせる 伸ばしすぎた分は、素材の先頭・"
             "前のクリップの終わり・タイムラインの先頭・後ろのクリップの頭で止め、結果の note と"
-            " stopped_at で知らせる"
+            " stopped_at で知らせる 頭を短くすると隙間が残る 後ろごと詰めるなら cut_range を使う"
         ),
         schema=_schema(
             {
@@ -10171,7 +10501,7 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="delete_clip",
-        description="クリップを消す ripple を真にすると後ろを詰める",
+        description=_DELETE_NOTE.format("クリップを消す"),
         schema=_schema({"clip_id": _string("対象"), "ripple": _boolean("詰めるか")}),
         handler=_delete_clip,
         sends=_STRUCTURE,
@@ -10238,9 +10568,29 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="delete_clips",
-        description="何本かのクリップをまとめて消す ripple を真にすると消したぶんを詰める",
+        description=_DELETE_NOTE.format("何本かのクリップをまとめて消す"),
         schema=_schema({"clip_ids": _clip_ids_schema(), "ripple": _boolean("詰めるか")}),
         handler=_delete_clips,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="cut_range",
+        description=(
+            "タイムラインの範囲を全部のトラックから切って後ろを詰める（字幕・テロップ・BGM・"
+            "場面切り替えも同じ所が切れる ロックしたトラックは切らない） 頭や途中の不要な所を"
+            "切るときに使う 分割と削除を組み合わせるより手数が少なく、層がずれない 範囲に掛かった"
+            "場面切り替えは外れるので、つなぎ目を処理し直すなら smooth_cuts を呼ぶ"
+            " 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "start_frame": _integer("切る範囲の頭（タイムラインのフレーム）"),
+                "end_frame": _integer("切る範囲の終わり（このフレームは残る）"),
+            },
+            ["start_frame", "end_frame"],
+        ),
+        handler=_cut_range,
         sends=_STRUCTURE,
         writes=True,
     ),
@@ -10949,10 +11299,17 @@ OPERATIONS: tuple[Operation, ...] = (
             "パラメータを変える effect_id を渡せばそのエフェクト、"
             "省略すればテキストや図形の中身（target=clip でクリップ自身）"
             " stroke_id を渡せば縁取りの層の項目（effect_id も渡せば層に掛けたエフェクト）"
+            " 同じ値を何本にも渡すときは clip_ids を使う（取り消し 1 回で戻り、1 本でも当てられ"
+            "なければ何も変えない）"
         ),
         schema=_schema(
             {
                 "clip_id": _string("対象"),
+                "clip_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "同じ値を渡すクリップ clip_id とは一緒に渡せない",
+                },
                 "effect_id": _string("エフェクト"),
                 "stroke_id": _string("縁取りの層"),
                 "target": _string("source か clip"),
@@ -11347,7 +11704,10 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="jet_cut",
-        description="無音区間をタイムラインからまとめて削って詰める",
+        description=(
+            "無音区間をタイムラインからまとめて削って詰める threshold_db は当てずっぽうで振らず、"
+            "先に analyze_audio の jet_cut が勧める値と切れる見込みを読む"
+        ),
         schema=_schema(
             {
                 "media_id": _string("素材"),
@@ -11483,7 +11843,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "同じ dB を掛けるので、声と BGM の釣り合いは変えない clip_ids を省くと作品全体"
             "（ミュートしていないトラックの音すべて）、渡すとそのクリップだけを混ぜて測る"
             " 音の山が peak_ceiling_db を超えるときと、音量の欄の上限 400% に当たるときは、"
-            "基準の手前で止めて limited_by に書く 測るのに時間がかかる 終わらなければ"
+            "基準の手前で止めて limited_by に書く（reached が false なら基準に届いていない）"
+            " 測るのに時間がかかる 終わらなければ"
             "何も変えずに measuring を返す（同じ引数でもう 1 度呼ぶと続きから）"
             " 取り消し 1 回で戻る"
         ),
@@ -11501,7 +11862,9 @@ OPERATIONS: tuple[Operation, ...] = (
                     )
                     + "）"
                 ),
-                "peak_ceiling_db": _number("音の山の上限 dBFS（-20〜0 既定 -1）"),
+                "peak_ceiling_db": _number(
+                    f"音の山の上限 dBFS（-20〜0 既定 {DEFAULT_PEAK_CEILING_DB:g}）"
+                ),
                 "wait_seconds": _number(
                     f"測り終えるまで待つ秒（0〜{MAX_CHECK_WAIT:g}、既定 {DEFAULT_CHECK_WAIT:g}）"
                 ),
@@ -11598,7 +11961,9 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="transcribe",
-        description="素材の字幕起こしを始める 終わるまで数分かかる",
+        description=(
+            "素材の字幕起こしを始める 終わるまで数分かかる wait_seconds を付けると終わりまで待つ"
+        ),
         schema=_schema(
             {
                 "media_id": _string("素材"),
@@ -11610,6 +11975,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "replace": _boolean(
                     "その音声に字幕があるとき置き換える（既定 false 既にあれば断る）"
                 ),
+                "wait_seconds": _number(_TRANSCRIPTION_WAIT),
             },
             ["media_id"],
         ),
@@ -11623,8 +11989,10 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "字幕起こしと話者の分離の様子を見る 走っている物と順番待ちの物を並べる"
             " 起こしと分離は 1 本ずつ順に走り、終わった物はその素材と音声の字幕へ入る"
+            " 終わりを待つときは別の道具を呼び続けず wait_seconds を付ける（transcribing が"
+            " false になれば片付いた）"
         ),
-        schema=_schema({}),
+        schema=_schema({"wait_seconds": _number(_TRANSCRIPTION_WAIT)}),
         handler=_transcription_status,
         sends=_WITH_FILES,
     ),

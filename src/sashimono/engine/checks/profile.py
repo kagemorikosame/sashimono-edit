@@ -247,6 +247,83 @@ class SoundProfile:
         return found
 
 
+@dataclass(frozen=True, slots=True)
+class SilenceChoice:
+    """無音カットのしきい値 1 つと、そこで切れる見込み"""
+
+    threshold_db: float
+    cuts: int
+    seconds: float
+
+
+#: 勧める値を探す下の端（dBFS） 録音の無音はこれより静かでも、切り分けの差は出ない
+_CHOICE_FLOOR_DB = -60
+#: 素の無音（デジタルの 0）が間にある音へ勧める値 間と話の間のどこでも同じだけ切れる
+_CLEAN_SILENCE_DB = -50.0
+#: しきい値を 1 dB 上げたときに増える切れる秒の、見分けの下限（秒と全体の割合の大きい方）
+_KNEE_SECONDS = 1.0
+_KNEE_SHARE = 0.005
+#: 増える所の上へ足す余裕（dB） 間の音量ちょうどでは、間の中の小さな山で区間が割れる
+_KNEE_MARGIN_DB = 1
+#: 話の大きな所（上から 1 割）からこれ以上静かな所だけを間と読む（dB） 鳴り続ける曲で、
+#: 曲の音量そのものを間と読まないため
+_SPEECH_GAP_DB = 10.0
+#: 勧める値の前後に並べる幅（dB）
+_NEARBY_DB = 3
+
+
+def _quiet_cuts(
+    peaks: np.ndarray, threshold_db: float, min_ticks: int, padding: float
+) -> tuple[int, float]:
+    """最大のサンプルが ``threshold_db`` を下回り続ける所のうち、切れる物の数と秒
+
+    ジェットカット（:func:`~sashimono.engine.audio.silence.detect_silence`）と同じく、音の山で
+    見て前後の余白を残す RMS で見る :meth:`SoundProfile.silences` と同じ値を渡しても切れる
+    数は合わない（通しの確かめで AI が読み違えた #413）
+    """
+    edges = np.diff(np.concatenate([[0], (peaks < threshold_db).astype(np.int8), [0]]))
+    lengths = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+    kept = lengths[lengths >= min_ticks]
+    return int(kept.size), round(float(kept.sum() * TICK_SECONDS - kept.size * 2 * padding), 1)
+
+
+def suggest_silence(
+    profile: SoundProfile, min_silence: float, padding: float
+) -> tuple[SilenceChoice | None, tuple[SilenceChoice, ...]]:
+    """無音カットの勧めるしきい値と、その前後の値で切れる見込み 勧められなければ ``None``
+
+    間の音量は素材ごとに違う 話の間の環境音に当たる所では、しきい値を 1 dB 上げたときに
+    切れる秒が大きく増える そこを越えた値を勧める 本物の素材 2 本（話の間が -36 と -33
+    あたり）で、AI が何度も切って戻して着いた値と 2 dB の内に入った（#413）
+    間が素の無音なら増える所が無いので、話より十分静かな値を返す 切れる物が増えない
+    （曲が鳴り続けている）なら勧めない
+    """
+    peaks = profile.peak_db()
+    if peaks.size == 0:
+        return None, ()
+    ticks = max(1, math.ceil((min_silence + 2 * padding) / TICK_SECONDS - 1e-9))
+
+    def choice(threshold: float) -> SilenceChoice:
+        cuts, seconds = _quiet_cuts(peaks, threshold, ticks, padding)
+        return SilenceChoice(threshold, cuts, seconds)
+
+    def around(threshold: float) -> tuple[SilenceChoice, ...]:
+        return tuple(choice(threshold + step) for step in (-_NEARBY_DB, 0, _NEARBY_DB))
+
+    quiet = float(np.percentile(peaks, 5))
+    if quiet <= _CHOICE_FLOOR_DB:
+        best = choice(_CLEAN_SILENCE_DB)
+        return (best, around(_CLEAN_SILENCE_DB)) if best.cuts else (None, ())
+    top = min(float(np.percentile(peaks, 50)), float(np.percentile(peaks, 90)) - _SPEECH_GAP_DB)
+    candidates = range(math.floor(quiet), math.ceil(top) + 1)
+    totals = [choice(float(value)).seconds for value in candidates]
+    rises = np.diff(totals)
+    if rises.size == 0 or rises.max() < max(_KNEE_SECONDS, _KNEE_SHARE * peaks.size * TICK_SECONDS):
+        return None, ()
+    threshold = float(candidates[int(rises.argmax()) + 1] + _KNEE_MARGIN_DB)
+    return choice(threshold), around(threshold)
+
+
 def _decibels(values: np.ndarray) -> np.ndarray:
     with np.errstate(divide="ignore"):
         return np.asarray(np.maximum(-120.0, 20.0 * np.log10(np.maximum(values, 0.0))))

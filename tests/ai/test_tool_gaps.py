@@ -1,0 +1,543 @@
+"""通しの確かめで分かった AI の道具の問題（#413）
+
+実際の素材で AI に編集を通して分かった物 手数が増える・誤った判断へ誘う所を道具の側で直す
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from fractions import Fraction
+from typing import Any
+
+import numpy as np
+import pytest
+
+from sashimono.ai.fixes import ASK, AUTO, fix_for
+from sashimono.ai.host import ToolError
+from sashimono.ai.operations import Pending, find_operation
+from sashimono.core.commands import AddClip, RippleCut
+from sashimono.core.commands.insert import insert_generated, insert_media
+from sashimono.core.mixing import db_to_ratio
+from sashimono.core.model import (
+    Clip,
+    LayerMode,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Transcript,
+)
+from sashimono.effects.sources import TEXT
+from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
+from sashimono.engine.checks.report import HIGH, MEDIUM, assemble
+from sashimono.engine.checks.scan import LOUDNESS
+from tests.ai.conftest import RATE_30, FakeHost, make_loaded
+from tests.ai.test_audio_tools import _voiced
+from tests.ai.test_mix_tools import _measured, _Work
+from tests.check_media import RATE
+from tests.conftest import make_clip
+
+
+def _run(host: FakeHost, tool: str, /, **arguments: Any) -> Any:
+    operation = find_operation(tool)
+    assert operation is not None
+    return operation(host, arguments)
+
+
+@pytest.fixture
+def work(transcript: Transcript, video_media: MediaItem) -> _Work:
+    return _Work(transcript, video_media)
+
+
+class TestNormalizeTellsTheTruth:
+    def test_a_ceiling_at_the_peak_is_not_called_already_there(self, work: _Work) -> None:
+        """通しの記録の再現 -20 LUFS で山が天井にあると、1 dB も上げられない
+
+        壊れると「すでに基準に合っています」と返り、基準に届いていないのに AI は直ったと読む
+        """
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        _measured(work.host, -20.3, -1.0)
+        result = _run(work.host, "normalize_loudness", wait_seconds=0)
+        assert result["gain_db"] == 0.0
+        assert result["limited_by"] == ["peak"]
+        assert result["reached"] is False
+        assert result["short_of_target_lu"] == pytest.approx(6.3)
+        assert "すでに" not in result["note"]
+
+    def test_a_small_rise_also_says_how_far_it_stopped(self, work: _Work) -> None:
+        """壊れると、途中で止まったときの足りない量が AI に見えず、また同じ道具を呼ぶ"""
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        _measured(work.host, -31.3, -12.0)
+        result = _run(work.host, "normalize_loudness", wait_seconds=0)
+        assert result["limited_by"] == ["peak"]
+        assert result["reached"] is False
+        assert result["short_of_target_lu"] == pytest.approx(6.3)
+
+    def test_a_loudness_on_target_is_still_on_target(self, work: _Work) -> None:
+        """壊れると、基準に合っている作品にも止まった訳を返す"""
+        _run(work.host, "normalize_loudness", wait_seconds=0)
+        _measured(work.host, -14.0, -1.0)
+        result = _run(work.host, "normalize_loudness", wait_seconds=0)
+        assert result["reached"] is True
+        assert "limited_by" not in result
+        assert "すでに基準に合っています" in result["note"]
+
+
+class TestCheckStopsRecommendingTheSameTool:
+    @pytest.mark.parametrize("severity", [HIGH, MEDIUM])
+    def test_a_quiet_work_at_the_ceiling_goes_to_the_person(self, severity: str) -> None:
+        """壊れると、上げられない音量を AI が同じ道具で直そうとして回数を使い切る"""
+        measure = {"lufs": -20.3, "target_lufs": -14.0, "difference_lu": -6.3}
+        fix = fix_for(LOUDNESS, severity, measure, peak_db=-1.0)
+        assert fix.action == ASK
+        assert "set_volume" in fix.tools
+
+    def test_room_left_stays_automatic(self) -> None:
+        """壊れると、まだ上げられる作品まで人に尋ねる"""
+        measure = {"lufs": -20.3, "target_lufs": -14.0, "difference_lu": -6.3}
+        assert fix_for(LOUDNESS, HIGH, measure, peak_db=-6.0).action == AUTO
+
+    def test_a_loud_work_stays_automatic(self) -> None:
+        """壊れると、下げれば直る大きすぎる作品まで人に尋ねる"""
+        measure = {"lufs": -8.0, "target_lufs": -14.0, "difference_lu": 6.0}
+        assert fix_for(LOUDNESS, HIGH, measure, peak_db=-1.0).action == AUTO
+
+    def test_the_check_result_uses_the_measured_peak(self, work: _Work) -> None:
+        """壊れると、表だけ直って check_output は auto を返し続ける"""
+        _run(work.host, "check_output", wait_seconds=0)
+        request: CheckRequest = work.host.check_requests[-1]
+        end = request.end or 300
+        report = assemble(
+            [],
+            start=request.start,
+            end=end,
+            analyzed=end,
+            fps=30.0,
+            complete=True,
+            limits=request.limits,
+            index=None,
+            loudness=-20.3,
+            peak=db_to_ratio(-1.0),
+            length_seconds=None,
+        )
+        work.host.check = CheckState(request=request, report=report)
+        result = _run(work.host, "check_output", wait_seconds=0)
+        rows = [row for row in result["problems"] if row["kind"] == LOUDNESS]
+        assert rows[0]["fix"]["action"] == ASK
+        assert result["summary"]["fixes"]["auto"] == 0
+
+
+def _empty(media: MediaItem) -> FakeHost:
+    project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(media,))
+    return FakeHost(project)
+
+
+class TestPlaceParts:
+    def test_parts_of_a_long_media_line_up(self, video_media: MediaItem) -> None:
+        """壊れると、長い素材から数か所を取るのに分割を何十回も呼ぶ"""
+        host = _empty(video_media)
+        result = _run(
+            host,
+            "place_media",
+            media_id=str(video_media.id),
+            ranges=[
+                {"start_seconds": 1, "end_seconds": 2},
+                {"start_seconds": 5, "end_seconds": 6.5},
+            ],
+        )
+        tracks = host.project.timeline.tracks
+        clips = sorted(
+            (clip for track in tracks for clip in track.clips),
+            key=lambda clip: (clip.timeline_start, str(clip.stream_index)),
+        )
+        assert sorted({(c.timeline_start, c.duration, c.source_in) for c in clips}) == [
+            (0, 30, Fraction(1)),
+            (30, 45, Fraction(5)),
+        ]
+        assert [part["start"] for part in result["clips"]] == [0, 30]
+        assert result["end_frame"] == 75
+
+    def test_one_undo_takes_them_all_back(self, video_media: MediaItem) -> None:
+        """壊れると、置いた数か所を 1 本ずつ戻すことになる"""
+        host = _empty(video_media)
+        before = host.project
+        _run(
+            host,
+            "place_media",
+            media_id=str(video_media.id),
+            ranges=[
+                {"start_seconds": 1, "end_seconds": 2},
+                {"start_seconds": 5, "end_seconds": 6},
+            ],
+        )
+        host.undo()
+        assert host.project == before
+
+    def test_the_picture_and_sound_stay_linked(self, video_media: MediaItem) -> None:
+        """壊れると、取り出した所の映像と音声が別々に動く"""
+        host = _empty(video_media)
+        _run(
+            host,
+            "place_media",
+            media_id=str(video_media.id),
+            ranges=[{"start_seconds": 1, "end_seconds": 2}],
+        )
+        clips = [clip for track in host.project.timeline.tracks for clip in track.clips]
+        assert len(clips) == 2
+        assert len({clip.link_group for clip in clips}) == 1
+        assert clips[0].link_group is not None
+
+    def test_the_ranges_start_at_at_frame(self, video_media: MediaItem) -> None:
+        """壊れると、頼んだ位置ではなく末尾へ置く"""
+        host = _empty(video_media)
+        _run(
+            host,
+            "place_media",
+            media_id=str(video_media.id),
+            at_frame=60,
+            ranges=[{"start_seconds": 1, "end_seconds": 2}],
+        )
+        assert host.project.timeline.tracks[0].clips[0].timeline_start == 60
+
+    @pytest.mark.parametrize(
+        "ranges",
+        [
+            [],
+            None,
+            "1-2",
+            [{"start_seconds": 2, "end_seconds": 1}],
+            [{"start_seconds": 2, "end_seconds": 2}],
+            [{"start_seconds": -1, "end_seconds": 1}],
+            [{"start_seconds": 9, "end_seconds": 11}],
+            [{"start_seconds": 1}],
+            [{"start_seconds": "1", "end_seconds": 2}],
+            [[1, 2]],
+        ],
+    )
+    def test_a_range_that_does_not_fit_is_refused(
+        self, video_media: MediaItem, ranges: object
+    ) -> None:
+        """壊れると、素材の外や逆向きの区間を黙って丸め、頼んだのと違う所が置かれる"""
+        host = _empty(video_media)
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(host, "place_media", media_id=str(video_media.id), ranges=ranges)
+        assert host.project == before
+
+    def test_a_still_has_no_part_to_take(self, video_media: MediaItem) -> None:
+        """壊れると、静止画の秒を指して何も映らないクリップを置く"""
+        still = replace(video_media, duration=Fraction(0), audio_streams=())
+        host = _empty(still)
+        with pytest.raises(ToolError, match="静止画"):
+            _run(
+                host,
+                "place_media",
+                media_id=str(still.id),
+                ranges=[{"start_seconds": 0, "end_seconds": 1}],
+            )
+
+    def test_without_ranges_the_whole_is_placed(self, video_media: MediaItem) -> None:
+        """壊れると、今までの呼び方で置いた素材の長さが変わる"""
+        host = _empty(video_media)
+        result = _run(host, "place_media", media_id=str(video_media.id))
+        assert result == {"placed": video_media.name}
+        assert host.project.timeline.tracks[0].clips[0].duration == 300
+
+
+class TestWaitForTranscription:
+    def test_the_status_can_wait_for_the_end(self, host: FakeHost) -> None:
+        """壊れると、AI が別の道具を時計代わりに呼び続ける"""
+        host.transcribing_now = True
+        result = _run(host, "transcription_status", wait_seconds=30)
+        assert isinstance(result, Pending)
+        assert result.seconds == 30
+        host.transcribing_now = False
+        host.transcription = "起こしも話者の分離も走っていません"
+        assert result.then() == {"status": host.transcription, "transcribing": False}
+
+    def test_without_waiting_the_status_comes_back_at_once(self, host: FakeHost) -> None:
+        """壊れると、今までの呼び方が待つようになる"""
+        result = _run(host, "transcription_status")
+        assert result == {"status": host.transcription, "transcribing": False}
+
+    def test_nothing_running_needs_no_wait(self, host: FakeHost) -> None:
+        """壊れると、走っていないのに待ち、応えが遅れる"""
+        result = _run(host, "transcription_status", wait_seconds=30)
+        assert not isinstance(result, Pending)
+
+    def test_transcribe_can_wait_too(self, host: FakeHost, video_media: MediaItem) -> None:
+        """壊れると、起こしを頼んだ後にもう 1 回待つ呼び出しが要る"""
+        host.transcribing_now = True
+        result = _run(
+            host, "transcribe", media_id=str(video_media.id), replace=True, wait_seconds=60
+        )
+        assert isinstance(result, Pending)
+        assert result.seconds == 60
+        done = result.then()
+        assert isinstance(done, dict)
+        assert "started" in done
+        assert done["transcribing"] is True
+
+    @pytest.mark.parametrize("value", ["10", True, float("nan")])
+    def test_a_bad_wait_is_refused_before_starting(
+        self, host: FakeHost, video_media: MediaItem, value: object
+    ) -> None:
+        """壊れると、始めてから断り、AI が呼び直すと「もう起こしている」で断られる"""
+        before = host.transcription
+        with pytest.raises(ToolError):
+            _run(host, "transcribe", media_id=str(video_media.id), replace=True, wait_seconds=value)
+        assert host.transcription == before
+
+
+class TestSubtitlesWhileTranscribing:
+    def test_an_empty_list_says_it_is_on_the_way(self, video_media: MediaItem) -> None:
+        """壊れると、起こしの途中の空を「字幕が無い」と読み、AI が起こし直す"""
+        host = _empty(video_media)
+        host.transcribing_now = True
+        result = _run(host, "get_subtitles")
+        assert result["subtitles"] == []
+        assert result["transcribing"] is True
+        assert "起こしの途中" in result["note"]
+
+    def test_finished_lists_do_not_mention_it(self, host: FakeHost) -> None:
+        """壊れると、走っていないのに待ち続ける"""
+        assert "transcribing" not in _run(host, "get_subtitles")
+
+
+class TestOneRowPerLine:
+    def test_a_linked_pair_gives_one_row(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """通しの記録の再現 リンクした映像と音声の組で、同じ行が 2 回ずつ返っていた
+
+        壊れると、字幕の読み直しの手数と返事の長さが倍になる
+        """
+        media = video_media.with_transcript(transcript)
+        project = Project.create(ProjectSettings(frame_rate=RATE_30, layer_mode=LayerMode.MIXED))
+        for command in insert_media(project, media, at_frame=0, split_audio=True):
+            project = command.apply(project)
+        result = _run(FakeHost(project), "get_subtitles")
+        assert [row["text"] for row in result["subtitles"]] == [
+            segment.text for segment in transcript.segments
+        ]
+
+    def test_the_same_media_placed_twice_keeps_both(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、2 回置いた素材の 2 回目の字幕が消える"""
+        project = make_loaded(video_media, transcript)
+        track = project.timeline.tracks[0]
+        media = project.media[0]
+        project = AddClip(track.id, make_clip(300, 300, media)).apply(project)
+        result = _run(FakeHost(project), "get_subtitles")
+        assert len(result["subtitles"]) == 2 * len(transcript.segments)
+
+
+def _alternating(floor_db: float) -> SoundProfile:
+    """話（-12 dBFS）と間（``floor_db``）が 1 秒ずつ交互の音の推移"""
+    rng = np.random.default_rng(1)
+    profiler = SoundProfiler(RATE, 2)
+    for index in range(20):
+        level = -12.0 if index % 2 == 0 else floor_db
+        noise = rng.uniform(-1.0, 1.0, (RATE, 2)).astype(np.float32)
+        profiler.add(noise * db_to_ratio(level))
+    return profiler.snapshot()
+
+
+class TestSuggestedThreshold:
+    def test_the_value_sits_above_the_pauses(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、AI が threshold_db を当てずっぽうで振り、切っては戻すを繰り返す"""
+        host = _voiced(video_media, transcript)
+        host.heard = _alternating(-46.0)
+        suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
+        assert -46.0 < suggestion["threshold_db"] < -12.0
+        # 間の 10 か所のうち、終わりの間の 1 秒も含めて全部を切れる
+        assert suggestion["cuts"] == 10
+        assert suggestion["seconds"] == pytest.approx(8.0, abs=1.0)
+        assert [row["threshold_db"] for row in suggestion["nearby"]] == sorted(
+            row["threshold_db"] for row in suggestion["nearby"]
+        )
+
+    def test_steady_music_has_no_value_to_suggest(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、切る所の無い音にも値を勧め、AI が曲の途中を切る"""
+        host = _voiced(video_media, transcript)
+        host.heard = _alternating(-12.0)
+        result = _run(host, "analyze_audio", points=0)
+        assert result["jet_cut"]["threshold_db"] is None
+
+
+class TestSameValueOnManyClips:
+    @staticmethod
+    def _texts(count: int, media: MediaItem, transcript: Transcript) -> tuple[FakeHost, list[Clip]]:
+        project = make_loaded(media, transcript)
+        clips: list[Clip] = []
+        for index in range(count):
+            commands = insert_generated(
+                project, TEXT.create(text="札"), at_frame=index * 30, duration=30
+            )
+            for command in commands:
+                project = command.apply(project)
+            clips.append(next(c.clip for c in commands if isinstance(c, AddClip)))
+        return FakeHost(project), clips
+
+    def test_one_call_sets_them_all(self, video_media: MediaItem, transcript: Transcript) -> None:
+        """通しの記録の再現 位置を揃えるのに set_param を 6 回呼んでいた"""
+        host, clips = self._texts(3, video_media, transcript)
+        result = _run(
+            host, "set_param", clip_ids=[str(c.id) for c in clips], name="pos_x", value=-300
+        )
+        assert result["clip_ids"] == [str(c.id) for c in clips]
+        for clip in clips:
+            located = host.project.timeline.locate_clip(clip.id)
+            assert located is not None
+            source = located[1].source
+            assert source is not None
+            assert source.params["pos_x"].static == -300  # type: ignore[union-attr]
+
+    def test_one_undo_takes_them_all_back(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、揃えた値を戻すのに本数ぶん取り消す"""
+        host, clips = self._texts(3, video_media, transcript)
+        before = host.project
+        _run(host, "set_param", clip_ids=[str(c.id) for c in clips], name="pos_x", value=-300)
+        host.undo()
+        assert host.project == before
+
+    def test_a_clip_that_cannot_take_it_stops_them_all(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、途中まで変わり、どれが変わったのかを AI も人も追えない"""
+        host, clips = self._texts(2, video_media, transcript)
+        movie = host.project.timeline.tracks[0].clips[0]
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(
+                host,
+                "set_param",
+                clip_ids=[str(clips[0].id), str(movie.id)],
+                name="pos_x",
+                value=-300,
+            )
+        assert host.project == before
+
+    def test_clip_id_and_clip_ids_together_are_refused(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、どちらかが黙って捨てられ、別のクリップが変わる"""
+        host, clips = self._texts(2, video_media, transcript)
+        with pytest.raises(ToolError):
+            _run(
+                host,
+                "set_param",
+                clip_id=str(clips[0].id),
+                clip_ids=[str(clips[1].id)],
+                name="pos_x",
+                value=1,
+            )
+
+    @pytest.mark.parametrize("value", [[], None])
+    def test_an_empty_list_does_not_fall_back_to_the_selection(
+        self, video_media: MediaItem, transcript: Transcript, value: object
+    ) -> None:
+        """壊れると、指したつもりの無い選択中のクリップが変わる"""
+        host, clips = self._texts(1, video_media, transcript)
+        host.selection = (clips[0].id,)
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(host, "set_param", clip_ids=value, name="pos_x", value=1)
+        assert host.project == before
+
+
+class TestCutRange:
+    def test_every_layer_loses_the_frames(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、頭を切るのに分割と削除を組み合わせ、層ごとに切り直すことになる"""
+        project = make_loaded(video_media, transcript)
+        commands = insert_generated(project, TEXT.create(text="札"), at_frame=100, duration=30)
+        for command in commands:
+            project = command.apply(project)
+        text = next(c.clip for c in commands if isinstance(c, AddClip))
+        host = FakeHost(project)
+        result = _run(host, "cut_range", start_frame=0, end_frame=30)
+        assert result["removed_frames"] == 30
+        assert host.project.timeline.duration == 270
+        located = host.project.timeline.locate_clip(text.id)
+        assert located is not None
+        assert located[1].timeline_start == 70
+
+    @pytest.mark.parametrize(
+        ("start", "end"), [(30, 30), (40, 30), (-1, 30), (0, 301), ("0", 30), (0.5, 30)]
+    )
+    def test_a_range_outside_is_refused(self, host: FakeHost, start: object, end: object) -> None:
+        """壊れると、範囲の外を頼んで何も切れないのに切ったと答える"""
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(host, "cut_range", start_frame=start, end_frame=end)
+        assert host.project == before
+
+    def test_one_undo_restores(self, host: FakeHost) -> None:
+        """壊れると、切った範囲が取り消し 1 回で戻らない"""
+        before = host.project
+        _run(host, "cut_range", start_frame=0, end_frame=30)
+        host.undo()
+        assert host.project == before
+
+
+class TestDeleteFollowsTheLayers:
+    @staticmethod
+    def _work(video_media: MediaItem, transcript: Transcript) -> tuple[FakeHost, Clip, Clip]:
+        project = make_loaded(video_media, transcript)
+        project = RippleCut(((100, 110),)).apply(project)
+        first = project.timeline.tracks[0].clips[0]
+        commands = insert_generated(project, TEXT.create(text="札"), at_frame=200, duration=30)
+        for command in commands:
+            project = command.apply(project)
+        text = next(c.clip for c in commands if isinstance(c, AddClip))
+        return FakeHost(project), first, text
+
+    def test_the_setting_decides(self, video_media: MediaItem, transcript: Transcript) -> None:
+        """壊れると、設定を切った人の AI も重ねの層を動かす"""
+        host, first, text = self._work(video_media, transcript)
+        host.ripple_layers = False
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is False
+        located = host.project.timeline.locate_clip(text.id)
+        assert located is not None
+        assert located[1].timeline_start == 200
+
+    def test_the_layers_follow_by_default(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、AI が詰めるたびに字幕と重ねの層がずれ、全部を戻すことになる"""
+        host, first, text = self._work(video_media, transcript)
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is True
+        located = host.project.timeline.locate_clip(text.id)
+        assert located is not None
+        assert located[1].timeline_start == 100
+
+    def test_delete_clips_takes_the_same_road(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、まとめて消す道具だけが重ねの層を置いていく"""
+        host, first, text = self._work(video_media, transcript)
+        result = _run(host, "delete_clips", clip_ids=[str(first.id)], ripple=True)
+        assert result["layers_followed"] is True
+        located = host.project.timeline.locate_clip(text.id)
+        assert located is not None
+        assert located[1].timeline_start == 100
+
+
+def test_set_param_keeps_its_one_clip_form(host: FakeHost) -> None:
+    """壊れると、前からの呼び方の答えの形が変わる"""
+    commands = insert_generated(host.project, TEXT.create(text="札"), at_frame=0, duration=30)
+    host.apply_commands(commands, "置く")
+    clip = next(c.clip for c in commands if isinstance(c, AddClip))
+    result = _run(host, "set_param", clip_id=str(clip.id), name="pos_x", value=5)
+    assert result == {"name": "pos_x", "value": "5"}

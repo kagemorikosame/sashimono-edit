@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.mixing import (
+    DEFAULT_PEAK_CEILING_DB,
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
@@ -40,9 +41,6 @@ __all__ = [
     "ask_duck",
     "ask_loudness",
 ]
-
-#: 音の山の上限（dBFS） 配信の多くが求める -1 dBTP に合わせる AI の道具の既定と同じ
-DEFAULT_PEAK_CEILING_DB = -1.0
 
 
 @dataclass(frozen=True, slots=True)

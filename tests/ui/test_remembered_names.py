@@ -124,6 +124,11 @@ PROJECT_SIDE = {
     "draw_sound_graph",
     "probe",
     "splits_media",
+    # 詰めるときの本人の設定（#413） 返すのは真偽だけ
+    "ripple_follows_layers",
+    # 起こしの様子（#413） 返すのは真偽と待つ関数だけで、名前は transcription_status の知らせに出る
+    "transcribing",
+    "transcription_waiter",
     "subtitle_wrap_share",
     "analyze",
     "waveform",
