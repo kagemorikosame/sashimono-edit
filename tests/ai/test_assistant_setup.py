@@ -30,6 +30,7 @@ from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.runtime import install_command
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.test_runtime_after_install import write_distribution
+from tests.waiting import wait_until
 
 
 @pytest.fixture
@@ -427,12 +428,8 @@ class TestClosingDropsPendingPrompts:
         folder = tmp_path / "まだ無い" / "作業場所"
         session = AgentSession(cast(EditorBridge, _QuietBridge()), cwd=folder)
         session.send("指示")
-        deadline = time.monotonic() + 5.0
-        while not _FakeClient.queried and time.monotonic() < deadline:
-            time.sleep(0.01)
-        session.close(wait=False)
-        assert session._thread is not None
-        session._thread.join(timeout=5.0)
+        wait_until(lambda: bool(_FakeClient.queried), "指示の受け取り")
+        session.close()
         assert folder.is_dir()
 
 

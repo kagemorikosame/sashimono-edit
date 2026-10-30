@@ -8,10 +8,10 @@ CI には SDK が入らないので、SDK の形は偽物で作る 値の形は�
 from __future__ import annotations
 
 import sys
-import time
 import types
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -26,6 +26,7 @@ from sashimono.ai.session import (
     result_error,
     with_login_hint,
 )
+from tests.waiting import wait_until
 
 SYNTHETIC = "<synthetic>"
 EXPIRED = "Failed to authenticate: OAuth session expired and could not be refreshed"
@@ -150,15 +151,15 @@ def _events(*messages: object) -> list[AgentEvent]:
 
 
 def _until(session: AgentSession, kind: EventKind) -> list[AgentEvent]:
-    """``kind`` の知らせが来るまで集める 来ないまま 5 秒たったら落とす"""
+    """``kind`` の知らせが来るまで集める"""
     seen: list[AgentEvent] = []
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        seen.extend(session.poll())
-        if any(event.kind is kind for event in seen):
-            return seen
-        time.sleep(0.01)
-    pytest.fail(f"{kind} が来ない: {seen}")
+    wait_until(
+        lambda: any(event.kind is kind for event in seen),
+        f"{kind} の知らせ",
+        step=lambda: seen.extend(session.poll()),
+        pause=0.01,
+    )
+    return seen
 
 
 def _expired_turn() -> list[object]:
@@ -265,13 +266,13 @@ class TestLoginFailure:
 
     def test_the_english_is_replaced(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # 壊れると、英語の文が残り、案内の前に読めない 1 行が出る
-        monkeypatch.setattr(session_module, "credentials_found", lambda: True)
+        monkeypatch.setattr(session_module, "uses_saved_login", lambda: True)
         assert "Failed" not in _events(*_expired_turn())[0].text
 
     def test_an_expired_login_says_to_type_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # 切れた人の窓では Claude Code が案内を出さないかもしれない 打つ物まで言う
         # 「案内に従って」だけだと、何も出ない窓の前で止まる
-        monkeypatch.setattr(session_module, "credentials_found", lambda: True)
+        monkeypatch.setattr(session_module, "uses_saved_login", lambda: False)
         text = with_login_hint(EXPIRED)
         assert "切れて" in text
         assert "/login" in text
@@ -280,10 +281,31 @@ class TestLoginFailure:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 初めての人に「切れています」と言うと、何かを壊したように読める
-        monkeypatch.setattr(session_module, "credentials_found", lambda: False)
+        monkeypatch.setattr(session_module, "uses_saved_login", lambda: False)
         text = with_login_hint("Not logged in · Please run /login")
         assert "切れて" not in text
         assert "ログイン…" in text
+
+    def test_a_wrong_api_key_is_not_called_an_expired_login(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 壊れると、環境変数の鍵を直す人に「切れています」と言い、/login へ向かわせる
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        (tmp_path / ".credentials.json").write_text("{}", encoding="utf-8")
+        text = with_login_hint("Invalid API key · Please run /login")
+        assert "切れて" not in text
+        assert "ANTHROPIC_API_KEY" in text
+
+    def test_a_saved_login_with_other_words_is_still_expired(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 文面は版で変わる 壊れると、保存したログインの人に /login が案内されない
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        (tmp_path / ".credentials.json").write_text("{}", encoding="utf-8")
+        assert "/login" in with_login_hint("API Error: 401 Unauthorized")
 
     def test_a_number_that_contains_401_is_not_a_login_failure(self) -> None:
         # 壊れると、番号に 401 を含むだけの失敗でログインを促し、原因を取り違える

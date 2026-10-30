@@ -25,8 +25,8 @@ from sashimono.ai.console import hide_cli_console
 from sashimono.ai.environment import (
     bundled_claude_cli,
     conversation_folder,
-    credentials_found,
     find_claude_cli,
+    uses_saved_login,
 )
 from sashimono.ai.models import effort_for
 from sashimono.ai.operations import ASK_USER
@@ -831,9 +831,10 @@ def _needs_login(text: str) -> bool:
 def _login_guide(text: str) -> str:
     """初めての人と切れた人で案内を分ける 初めての人に「切れた」と言うと、何かを壊したと読める
 
-    置き場があるかだけを見る 中身は読まない
+    Claude Code の文面は版で変わるので、文が切れたと言わなくても、保存したログインで使っている
+    人には切れた側を出す（どちらでも /login で直る） 中身は読まない
     """
-    return LOGIN_EXPIRED_GUIDE if credentials_found() or "expired" in text.lower() else LOGIN_HINT
+    return LOGIN_EXPIRED_GUIDE if uses_saved_login() or "expired" in text.lower() else LOGIN_HINT
 
 
 def with_login_hint(text: str) -> str:

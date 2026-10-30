@@ -32,6 +32,7 @@ __all__ = [
     "install_command",
     "open_login_window",
     "runtime_status",
+    "uses_saved_login",
 ]
 
 #: 一覧（:data:`sashimono.ai.models.MODELS`）のモデルがすべて使える、同梱の Claude Code の版
@@ -109,8 +110,23 @@ def credentials_found() -> bool:
     触る理由が無い 外れても案内を出すかどうかが変わるだけなので、使うのは
     止めない
     """
-    if any(os.environ.get(name) for name in _CREDENTIAL_VARIABLES):
-        return True
+    return _key_in_environment() or _saved_login_found()
+
+
+def uses_saved_login() -> bool:
+    """鍵を環境変数で渡さず、Claude Code に保存したログインで使っているか
+
+    ログインが切れるのはこの人だけ 環境変数の鍵が無効な人に「切れた」と言うと、
+    直す所を取り違える 中身は読まない
+    """
+    return _saved_login_found() and not _key_in_environment()
+
+
+def _key_in_environment() -> bool:
+    return any(os.environ.get(name) for name in _CREDENTIAL_VARIABLES)
+
+
+def _saved_login_found() -> bool:
     config = os.environ.get("CLAUDE_CONFIG_DIR")
     root = Path(config) if config else Path.home() / ".claude"
     return (root / ".credentials.json").is_file()

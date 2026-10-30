@@ -30,6 +30,8 @@ from sashimono.ai.safety import Consent
 from sashimono.ai.session import (
     ASK_RULES,
     LOGIN_DETAIL,
+    LOGIN_EXPIRED_GUIDE,
+    LOGIN_HINT,
     SYSTEM_PROMPT,
     AgentEvent,
     AgentSession,
@@ -894,9 +896,7 @@ class TestLogin:
     def _fail_login(self, widget: ChatPanel) -> None:
         widget._input.setPlainText("切って")
         widget.send()
-        widget._handle(
-            AgentEvent(EventKind.ERROR, text="ログインが切れています", detail=LOGIN_DETAIL)
-        )
+        widget._handle(AgentEvent(EventKind.ERROR, text=LOGIN_EXPIRED_GUIDE, detail=LOGIN_DETAIL))
         widget._handle(AgentEvent(EventKind.TURN_DONE))
 
     def test_a_failed_login_shows_the_button_even_with_credentials_on_disk(
@@ -923,6 +923,18 @@ class TestLogin:
         assert widget._login_box.isHidden() is False
         widget._refresh_availability()
         assert widget._login_box.isHidden() is False
+
+    def test_someone_who_never_logged_in_is_not_told_it_expired(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、エラーの文は「要ります」なのに、箱と引き継ぎが「切れています」と言う
+        widget, _ = recorded
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.ERROR, text=LOGIN_HINT, detail=LOGIN_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert widget._login_text.text() == LOGIN_HINT
+        assert "切れて" not in _text(widget)
 
     def test_a_reply_takes_the_button_down(
         self,

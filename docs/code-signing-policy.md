@@ -61,7 +61,7 @@ newer Claude Code, which comes bundled with the Claude Agent SDK. In the release
 assistant has been installed, the program reads the package list of `claude-agent-sdk` from the
 Python Package Index about one minute after startup, at most once a day (User-Agent
 `SashimonoEdit/<version> (component-check)`; nothing else). If a newer version within the tested
-range (`>=0.2.158,<0.3`) exists, it is installed in the background with pip into a separate folder
+range (`>=0.2.174,<0.3`) exists, it is installed in the background with pip into a separate folder
 and then swapped in, never while the assistant is answering. The same happens once if Claude Code
 refuses the selected model because it is too old. To turn this off, open View → Settings…
 (〔表示〕→〔設定…〕) and uncheck "Update the AI components automatically"
@@ -143,7 +143,7 @@ GET の頼みだけ（名乗りは `SashimonoEdit/<版> (auto-update)` プロジ
 Claude Agent SDK に同梱の新しい Claude Code でないと使えない 配布版で AI アシスタントを入れて
 あれば、起動して 1 分ほど後に Python Package Index から `claude-agent-sdk` の版の一覧を読む
 （1 日に 1 回まで 名乗りは `SashimonoEdit/<版> (component-check)` ほかには何も送らない） 試した範囲
-（`>=0.2.158,<0.3`）の中に新しい版があれば、pip で別の置き場へ裏で入れてから入れ替える
+（`>=0.2.174,<0.3`）の中に新しい版があれば、pip で別の置き場へ裏で入れてから入れ替える
 アシスタントが応えている間は入れない 選んだモデルが Claude Code が古いために断られたときも 1 度だけ
 同じことをする 切るには〔表示〕→〔設定…〕の「AI の部品を自動で新しくする」を外す ソースから
 動かした物はこれをしない

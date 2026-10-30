@@ -66,7 +66,6 @@ from sashimono.ai.plan import RESUME_PROMPT, Stopped
 from sashimono.ai.session import (
     LIMIT_DETAIL,
     LOGIN_DETAIL,
-    LOGIN_EXPIRED_GUIDE,
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
     AgentEvent,
@@ -108,7 +107,7 @@ _LOGIN_NOT_YET = (
     "（API キーを使う場合は環境変数 ANTHROPIC_API_KEY を設定し、ソフトを再起動します）"
 )
 #: ログインの失敗で止まった訳 直し方はエラーの文と案内の箱にあるので、引き継ぎには書かない
-_LOGIN_STOPPED = "Claude へのログインが切れていたため、応えられませんでした"
+_LOGIN_STOPPED = "Claude へのログインが必要だったため、応えられませんでした"
 #: AI が応えた印 これが来たらログインは通っている
 _ANSWERS = frozenset({EventKind.TEXT, EventKind.THINKING, EventKind.TOOL_USE})
 
@@ -896,9 +895,13 @@ class ChatPanel(QWidget):
             self._setup.status.ready and (self._login_failed or not credentials_found())
         )
 
-    def _set_login_failed(self, failed: bool) -> None:
-        self._login_failed = failed
-        self._login_text.setText(LOGIN_EXPIRED_GUIDE if failed else _LOGIN_NOT_YET)
+    def _set_login_failed(self, guide: str = "") -> None:
+        """ログインの失敗の案内を箱に出す 空なら下げる
+
+        文は会話が選んだ物をそのまま使う ここで決めると、初めての人にも「切れた」と出る
+        """
+        self._login_failed = bool(guide)
+        self._login_text.setText(guide or _LOGIN_NOT_YET)
         self._refresh_login()
 
     # --- モデルと考える深さ ---
@@ -1290,7 +1293,7 @@ class ChatPanel(QWidget):
 
         if self._login_failed and event.kind in _ANSWERS:
             # AI が応えたのでログインは直った 次の失敗まで案内を下げる
-            self._set_login_failed(False)
+            self._set_login_failed()
 
         if event.kind in (EventKind.TEXT, EventKind.ERROR):
             found = outdated_claude_code(event.text)
@@ -1336,7 +1339,7 @@ class ChatPanel(QWidget):
             self._turn_limited = self._turn_limited or limited
             login = event.detail == LOGIN_DETAIL
             if login:
-                self._set_login_failed(True)
+                self._set_login_failed(event.text)
             # ログインの案内は長い エラーの文に全文があるので、引き継ぎには訳だけを書く
             detail = _LOGIN_STOPPED if login else event.text
             self._record.stop(StopReason.LIMIT if limited else StopReason.ERROR, detail)
