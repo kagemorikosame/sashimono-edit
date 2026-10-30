@@ -4286,7 +4286,7 @@ def _jet_cut_hint(host: EditorHost, project: Project, min_silence: float) -> dic
         return {
             **named,
             "threshold_db": None,
-            "note": "話と間の音量の差が見分けられません 切れる無音は少なそうです",
+            "note": "話と間の音量の差が見分けられないか、min_silence より長い間がありません",
         }
     return {
         **named,
@@ -4968,8 +4968,7 @@ def _ripple_answer(
     first = min(heads, default=0)
     moved, left = _moved_tracks(before, after, own, first)
     answer: dict[str, object] = {
-        # 字幕と重ねの層が残らず付いてきたか BGM が切れただけでは真にしない
-        "layers_followed": _layers_followed(before, after, moved, left, first),
+        "layers_followed": _layers_followed(before, after, left, first),
         "tracks_moved": moved,
         "tracks_left": left,
     }
@@ -4995,30 +4994,35 @@ def _is_layer(clip: Clip) -> bool:
     return clip.media_id is None and clip.scene_id is None
 
 
-def _layers_followed(
-    before: Project, after: Project, moved: list[str], left: list[str], start: int
-) -> bool:
-    """字幕か重ねの層が実際に動き、``start`` より後ろに置いていかれた物が無いか
+def _shifted(old: Track, new: Track) -> list[Clip]:
+    """``new`` の中で前へ動いたクリップ 切って短くなっただけの物は動いたと数えない
 
-    トラックに字幕が有るかではなく、動いた字幕が残っているかを見る 字幕が消えただけのトラックや、
-    前の字幕が動かなかっただけのトラックを、付いてきたと読まないため
+    頭が同じなら、尻が切れただけで動いていない 新しい ID の物はまたいだクリップの後ろの片割れで、
+    消した所の後ろから詰まってきた物
     """
+    was = {clip.id: clip.timeline_start for clip in old.clips}
+    return [clip for clip in new.clips if was.get(clip.id) != clip.timeline_start]
 
-    def followed(track_id: str) -> bool:
-        old = before.timeline.find_track(TrackId(track_id))
-        new = after.timeline.find_track(TrackId(track_id))
-        if old is None or new is None:
-            return False
-        was = {clip.id: clip for clip in old.clips}
-        return any(_is_layer(clip) and was.get(clip.id) != clip for clip in new.clips)
 
-    def behind(track_id: str) -> bool:
-        track = before.timeline.find_track(TrackId(track_id))
-        return track is not None and any(
+def _layers_followed(before: Project, after: Project, left: list[str], start: int) -> bool | None:
+    """字幕と重ねの層が付いてきたか 真は動いた、偽は置いていかれた物がある
+
+    ``None`` は ``start`` より後ろに動かす字幕も重ねの層も無かった（元から無い・切った所で
+    消えた・尻が短くなっただけ） 偽と分けないと、失敗と読んで AI が見に行く
+    トラックに字幕が有るかではなく、実際に動いた字幕と残った字幕で答える BGM や効果音が
+    動いただけでは真にしない 消したクリップと同じレイヤーの字幕も数える
+    """
+    for track_id in left:
+        track = after.timeline.find_track(TrackId(track_id))
+        if track is not None and any(
             _is_layer(clip) and clip.timeline_end > start for clip in track.clips
-        )
-
-    return any(map(followed, moved)) and not any(map(behind, left))
+        ):
+            return False
+    for old in before.timeline.tracks:
+        new = after.timeline.find_track(old.id)
+        if new is not None and any(_is_layer(clip) for clip in _shifted(old, new)):
+            return True
+    return None
 
 
 def _lost_clips(
@@ -5061,10 +5065,11 @@ def _lost_clips(
 def _moved_tracks(
     before: Project, after: Project, own: set[TrackId], start: int
 ) -> tuple[list[str], list[str]]:
-    """``own`` の外のトラックのうち、動いた物と、``start`` より後ろに中身を残して動かなかった物
+    """``own`` の外のトラックのうち、中身が前へ動いた物と、``start`` より後ろに中身を残して
+    動かなかった物
 
     答えは実際の差で決める 動く見込みの判定だけで答えると、ロックして動かなかった字幕まで
-    動いたと読み、AI がずれたまま先へ進む
+    動いたと読み、AI がずれたまま先へ進む 切られて短くなっただけのトラックはどちらでもない
     """
     moved: list[str] = []
     left: list[str] = []
@@ -5072,9 +5077,11 @@ def _moved_tracks(
         if track.id in own:
             continue
         now = after.timeline.find_track(track.id)
-        if now is not None and now.clips != track.clips:
+        if now is None:
+            continue
+        if _shifted(track, now):
             moved.append(str(track.id))
-        elif any(clip.timeline_end > start for clip in track.clips):
+        elif any(clip.timeline_end > start for clip in now.clips):
             left.append(str(track.id))
     return moved, left
 
@@ -6255,7 +6262,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         result["smoothing"] = _seam_result(plan, style, clip_ids=False)
     host.apply_commands(commands, f"無音カット: {len(ranges)} か所")
     # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
-    asked = cut_targets(project, media.id, media.transcript_stream(stream))
+    asked = cut_targets(project, media.id, silences, stream=media.transcript_stream(stream))
     notes = _lost_clips(project, _project(host), asked, result)
     if notes:
         result["note"] = " ".join(notes)
@@ -9505,7 +9512,8 @@ _TRANSCRIPTION_WAIT = (
 _DELETE_NOTE = (
     "{} ripple を真にすると後ろを詰める 番組の時間が抜けるとき（同じ時間に別の絵が残らないとき）は"
     "別のトラックの字幕・テロップ・場面切り替えも動かす（本人の設定） 曲がまたいだトラックと"
-    "ロックしたトラックは動かさない 答えの tracks_moved と tracks_left で読める"
+    "ロックしたトラックは動かさない 答えの tracks_moved と tracks_left で読める layers_followed は"
+    "字幕と重ねの層が付いてきたら true、置いていかれた物があれば false、動かす物が無ければ null"
 )
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
 _SEAM_ARGUMENTS: dict[str, Any] = {

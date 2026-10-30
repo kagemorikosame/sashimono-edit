@@ -91,7 +91,12 @@ from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_spe
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
-from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
+from sashimono.engine.audio.silence import (
+    SilenceOptions,
+    TimeRange,
+    detect_silence,
+    keep_speech,
+)
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.render.look_preview import SAMPLE_TEXT
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -1029,7 +1034,9 @@ class SubtitlePanel(QWidget):
         if not answer:
             return
 
-        ranges = self._plan(media, dialog.options(), dialog.keep_speech)
+        silences = self._silences(media, dialog.options(), dialog.keep_speech)
+        voice = media.transcript_stream(self._stream)
+        ranges = plan_cuts(self._project, media.id, silences, stream=voice)
         if not ranges:
             self.status_message.emit("切る場所が見つかりませんでした")
             return
@@ -1050,7 +1057,7 @@ class SubtitlePanel(QWidget):
         self.commands_requested.emit(commands, f"無音カット: {len(ranges)} か所")
         # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
         # 断られたら作品は変わらないので何も数えない
-        asked = cut_targets(before, media.id, media.transcript_stream(self._stream))
+        asked = cut_targets(before, media.id, silences, stream=voice)
         notice = casualty_notice(ripple_casualties(before, self._project, asked))
         if notice:
             self.status_message.emit(notice)
@@ -1059,8 +1066,16 @@ class SubtitlePanel(QWidget):
         self, media: MediaItem, options: SilenceOptions, protect: bool
     ) -> tuple[tuple[int, int], ...]:
         """無音の検出からタイムライン上の切る範囲までを一続きに"""
-        # 見ている音の波形と字幕で決める マイクの声の無音で切りたいときに、ゲームの音で
-        # 決めると切れない
+        silences = self._silences(media, options, protect)
+        # 見ている音が 1 本目（None）でも番号にそろえて渡す None のままだと音で絞らない
+        return plan_cuts(
+            self._project, media.id, silences, stream=media.transcript_stream(self._stream)
+        )
+
+    def _silences(
+        self, media: MediaItem, options: SilenceOptions, protect: bool
+    ) -> tuple[TimeRange, ...]:
+        """見ている音の無音 マイクの声の無音で切りたいときに、ゲームの音で決めると切れない"""
         waveform = self._analyzer.waveform(media, self._stream)
         if waveform is None:
             return ()
@@ -1068,10 +1083,7 @@ class SubtitlePanel(QWidget):
         transcript = media.transcript_for(self._stream)
         if protect and transcript is not None:
             silences = keep_speech(silences, transcript)
-        # 見ている音が 1 本目（None）でも番号にそろえて渡す None のままだと音で絞らない
-        return plan_cuts(
-            self._project, media.id, silences, stream=media.transcript_stream(self._stream)
-        )
+        return silences
 
     def _selected_text(self) -> Clip | None:
         clip = self.template_provider()

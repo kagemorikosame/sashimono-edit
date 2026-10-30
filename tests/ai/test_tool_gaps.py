@@ -609,7 +609,68 @@ class TestWhatTheAnswerSays:
         host.apply_commands([AddClip(words.id, title)], "字幕")
         result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
         assert result["clips_removed"] == 1
-        assert result["layers_followed"] is False
+        assert result["layers_followed"] is None
+
+    def test_a_title_cut_at_its_tail_is_not_called_moved(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、消す所で終わる字幕が短くなっただけなのに、動いたと読む"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([RemoveClip(host.project.timeline.tracks[1].clips[0].id)], "空に")
+        title = Clip(timeline_start=50, duration=100, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, title)], "字幕")
+        second = host.project.timeline.tracks[0].clips[1]
+        result = _run(host, "delete_clip", clip_id=str(second.id), ripple=True)
+        assert str(words.id) not in result["tracks_moved"]
+        assert str(words.id) not in result["tracks_left"]
+        assert result["layers_followed"] is None
+
+    def test_a_long_title_cut_in_two_counts_as_moved(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、消す所をまたいだ字幕の後ろ半分が詰まったことを読めない"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([RemoveClip(host.project.timeline.tracks[1].clips[0].id)], "空に")
+        title = Clip(timeline_start=50, duration=200, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, title)], "字幕")
+        second = host.project.timeline.tracks[0].clips[1]
+        result = _run(host, "delete_clip", clip_id=str(second.id), ripple=True)
+        assert str(words.id) in result["tracks_moved"]
+        assert result["layers_followed"] is True
+
+    def test_one_clip_alone_has_nothing_to_follow(self, video_media: MediaItem) -> None:
+        """壊れると、付いてくる物が無い作品の答えを、付いてこなかったと読む"""
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(video_media,))
+        clip = make_clip(0, 100, video_media)
+        track = Track(kind=TrackKind.VIDEO, name="V1", clips=(clip,))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(track,))))
+        result = _run(host, "delete_clip", clip_id=str(clip.id), ripple=True)
+        assert result["layers_followed"] is None
+        assert result["tracks_moved"] == []
+        assert result["tracks_left"] == []
+        assert "note" not in result
+
+    def test_deleting_a_title_alone_keeps_the_picture(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、字幕 1 枚を詰めて消しただけで絵まで動いたと答える"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        title = host.project.timeline.tracks[1].clips[0]
+        result = _run(host, "delete_clip", clip_id=str(title.id), ripple=True)
+        assert result["layers_followed"] is None
+        assert str(words.id) not in result["tracks_moved"]
+
+    def test_a_title_on_the_same_layer_counts(self, video_media: MediaItem) -> None:
+        """壊れると、消したクリップと同じレイヤーの字幕が詰まっても、付いてきたと答えない"""
+        project = Project.create(
+            ProjectSettings(frame_rate=RATE_30, layer_mode=LayerMode.MIXED), media=(video_media,)
+        )
+        clip = make_clip(0, 100, video_media)
+        title = Clip(timeline_start=150, duration=10, source=TEXT.create(text="札"))
+        track = Track(kind=TrackKind.MIXED, name="L1", clips=(clip, title))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(track,))))
+        result = _run(host, "delete_clip", clip_id=str(clip.id), ripple=True)
+        assert result["layers_followed"] is True
 
     def test_a_title_before_the_gap_is_not_called_followed(
         self, video_media: MediaItem, audio_media: MediaItem
@@ -620,8 +681,8 @@ class TestWhatTheAnswerSays:
         host.apply_commands([AddClip(words.id, title)], "字幕")
         second = host.project.timeline.tracks[0].clips[1]
         result = _run(host, "delete_clip", clip_id=str(second.id), ripple=True)
-        assert str(words.id) in result["tracks_moved"]
-        assert result["layers_followed"] is False
+        assert str(words.id) not in result["tracks_moved"]
+        assert result["layers_followed"] is None
 
     def test_a_title_before_the_gap_on_a_stayed_track_does_not_count_as_left(
         self, video_media: MediaItem, audio_media: MediaItem
@@ -655,8 +716,8 @@ class TestWhatTheAnswerSays:
         extra = Track(kind=TrackKind.AUDIO, name="曲")
         host.apply_commands([AddTrack(extra), AddClip(extra.id, tune)], "曲")
         result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
-        assert result["layers_followed"] is False
-        assert str(extra.id) in result["tracks_moved"]
+        assert result["layers_followed"] is None
+        assert str(extra.id) not in result["tracks_left"]
         assert str(words.id) not in result["tracks_moved"]
 
     def test_one_subtitle_track_left_is_not_called_followed(
@@ -783,6 +844,17 @@ class TestJetCutSaysWhatWentWithIt:
         host.stub_waveform = make_waveform([(0.5, 300), (0.0, 200), (0.5, 5500)])
         result = _run(host, "jet_cut", media_id=str(media.id), audio=1, keep_speech=False)
         assert [row["clip_id"] for row in result["removed_clips"]] == [str(other.id)]
+
+    def test_a_placement_with_no_silence_of_its_own_is_listed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、同じ素材の話している所のクリップが別の所の範囲で消えても黙る"""
+        placed = make_clip(60, 5, video_media)
+        host, media, _extra = self._work(video_media, audio_media)
+        words = Track(kind=TrackKind.VIDEO, name="V2", clips=(placed,))
+        host.apply_commands([AddTrack(words)], "重ね")
+        result = _run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
+        assert [row["clip_id"] for row in result["removed_clips"]] == [str(placed.id)]
 
     def test_the_cut_media_is_not_counted(
         self, video_media: MediaItem, audio_media: MediaItem

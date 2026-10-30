@@ -110,23 +110,23 @@ class SilenceChoice:
     seconds: float
 
 
-#: 勧める値を読む区切りの長さ（秒） 細かい段階のまま何十回も数えると長い素材で画面が止まる
+#: 音の幅を読む区切りの長さ（秒） 細かいピークのままだと、話の中の一瞬の谷まで数に入る
 _CHOICE_TICK_SECONDS = 0.1
 #: これより静かな所は素の無音（デジタルの 0）と読む（dBFS） 間の音量を探す数に入れない
 #: 入れると素の無音が多い素材で、部屋の音の間の音量まで探しに行かない
 _DIGITAL_SILENCE_DB = -90.0
 #: 間が素の無音だけの音へ勧める値 間と話の間のどこでも同じだけ切れる
 _CLEAN_SILENCE_DB = -50.0
-#: 素の無音だけの音の話し声の頭打ちの下へ取る幅（dB）
+#: 素の無音だけの音で、話の一番静かな所の下へ取る幅（dB）
 _CLEAN_MARGIN_DB = 3.0
-#: しきい値を 1 dB 上げたときに増える切れる秒の、見分けの下限（秒と全体の割合の大きい方）
-_KNEE_SECONDS = 1.0
-_KNEE_SHARE = 0.005
 #: 増える所の上へ足す余裕（dB） 間の音量ちょうどでは、間の中の小さな山で区間が割れる
 _KNEE_MARGIN_DB = 1
-#: 話の大きな所（上から 1 割）からこれ以上静かな所だけを間と読む（dB） 鳴り続ける曲で、
-#: 曲の音量そのものを間と読まないため
-_SPEECH_GAP_DB = 10.0
+#: 話の大きな所を読むパーセント点 最大にしないのは、1 度のクリック音を話と読まないため
+#: 話がこれより少ない素材は話と間を見分けない
+_LOUD_PERCENTILE = 99.5
+#: 話の大きな所からこれ以上静かな所だけを間と読む（dB） 鳴り続ける曲で、曲の音量そのものを
+#: 間と読まないため 本物の素材の間は話の大きな所より 20 dB ほど下にある
+_SPEECH_GAP_DB = 15.0
 #: 勧める値の前後に並べる幅（dB）
 _NEARBY_DB = 3
 
@@ -136,15 +136,14 @@ def _quiet_cuts(
 ) -> tuple[int, float]:
     """音の山が ``threshold_db`` を下回り続ける所のうち、切れる物の数と秒
 
-    :func:`detect_silence` と同じく前後の余白を除いた長さで見る ``times`` は区切りの頭の時刻の
-    並び（終わりを足して 1 つ長い） 末尾の半端な区切りも実の長さで数える 丸ごと数えると、
-    jet_cut が切らない短い間まで見込みに入る
+    :func:`detect_silence` と同じ長さの決まりで見る ``times`` はピークの頭の時刻の並び
+    （終わりを足して 1 つ長い 終わりは音の長さで抑えてある）
     """
     edges = np.diff(np.concatenate([[0], (peaks < threshold_db).astype(np.int8), [0]]))
     kept = times[edges == -1] - times[edges == 1] - 2 * padding
     # 浮動小数の端数で、ちょうど最短の無音の長さの区間を落とさない
     kept = kept[kept >= min_silence - 1e-9]
-    return int(kept.size), round(float(kept.sum()), 1)
+    return int(kept.size), float(kept.sum())
 
 
 def choose_silence(
@@ -154,19 +153,29 @@ def choose_silence(
     padding: float,
     *,
     total: float = math.inf,
+    group: int = 1,
 ) -> tuple[SilenceChoice | None, tuple[SilenceChoice, ...]]:
-    """音の山の推移（区切り ``tick`` 秒ごとの dBFS）から、無音カットの勧めるしきい値を選ぶ
+    """音の山の推移（``tick`` 秒ごとの dBFS）から、無音カットの勧めるしきい値を選ぶ
 
     前後の値で切れる見込みも返す 勧められなければ ``(None, ())`` ``total`` は音の長さ（秒）
+    ``group`` は音の幅を読むときに束ねるピークの数 切れる見込みは束ねずに数える
+    束ねて数えると、区切りをまたいだ間が短く読まれ、:func:`detect_silence` と数が合わない
 
     間の音量は素材ごとに違う 話の間の環境音に当たる所では、しきい値を 1 dB 上げたときに
     切れる秒が大きく増える そこを越えた値を勧める 本物の素材では、AI が何度も切って
-    戻して着いた値と同じになった（#413） 間が素の無音だけなら増える所が無いので、話より
-    十分静かな値を返す 切れる物が増えない（曲が鳴り続けている）なら勧めない
-    素の無音は間の音量を探す数に入れない 素の無音と部屋の音の間の両方がある素材で、素の無音
-    だけを切る値を勧めないため
+    戻して着いた値と同じになった（#413）
+
+    探す範囲は、鳴っている一番静かな所から、話の大きな所の :data:`_SPEECH_GAP_DB` 下まで
+    間と話の割合に寄らない 下の端をパーセント点にすると間の少ない素材で、上の端を中央値に
+    すると間の多い素材で、間の音量が範囲から外れる
+
+    範囲が空なら音の幅が狭く、話と間を見分けられない（鳴り続ける曲・部屋の音だけ）
+    増える所が無ければ間は素の無音だけなので、話より静かな値を返す
+    どちらでも切れる所が無ければ勧めない 素の無音は間の音量を探す数に入れない 素の無音と
+    部屋の音の間の両方がある素材で、素の無音だけを切る値を勧めないため
     """
-    live = peaks[peaks > _DIGITAL_SILENCE_DB]
+    levels = np.maximum.reduceat(peaks, np.arange(0, peaks.size, group)) if peaks.size else peaks
+    live = levels[levels > _DIGITAL_SILENCE_DB]
     if live.size == 0:
         return None, ()
 
@@ -174,16 +183,16 @@ def choose_silence(
 
     def choice(threshold: float) -> SilenceChoice:
         cuts, seconds = _quiet_cuts(peaks, times, threshold, min_silence, padding)
-        return SilenceChoice(threshold, cuts, seconds)
+        return SilenceChoice(threshold, cuts, round(seconds, 1))
 
     def around(threshold: float) -> tuple[SilenceChoice, ...]:
         return tuple(choice(threshold + step) for step in (-_NEARBY_DB, 0, _NEARBY_DB))
 
-    # 上の端は話の大きな所から決める 中央値で止めると、間が半分を超える素材で間の音量に届かない
-    quiet, loud = (float(value) for value in np.percentile(live, (5, 90)))
-    candidates = range(math.floor(quiet), math.ceil(loud - _SPEECH_GAP_DB) + 1)
-    rises = np.diff([choice(float(value)).seconds for value in candidates])
-    if rises.size and rises.max() >= max(_KNEE_SECONDS, _KNEE_SHARE * peaks.size * tick):
+    quiet = float(live.min())
+    top = float(np.percentile(live, _LOUD_PERCENTILE)) - _SPEECH_GAP_DB
+    candidates = range(math.floor(quiet), math.ceil(top) + 1)
+    rises = np.diff([_quiet_cuts(peaks, times, v, min_silence, padding)[1] for v in candidates])
+    if rises.size and rises.max() > 0:
         threshold = float(candidates[int(rises.argmax()) + 1] + _KNEE_MARGIN_DB)
         return choice(threshold), around(threshold)
     clean = min(_CLEAN_SILENCE_DB, quiet - _CLEAN_MARGIN_DB)
@@ -202,11 +211,15 @@ def suggest_silence(
     if level.count == 0:
         return None, ()
     per_peak = level.samples_per_peak / waveform.sample_rate
-    group = max(1, round(_CHOICE_TICK_SECONDS / per_peak))
-    loudest = np.maximum.reduceat(_loudness(waveform), np.arange(0, level.count, group))
-    peaks = 20.0 * np.log10(np.maximum(loudest, 10.0 ** (_FLOOR_DB / 20.0)))
-    total = float(waveform.duration)
-    return choose_silence(peaks, group * per_peak, min_silence, padding, total=total)
+    peaks = 20.0 * np.log10(np.maximum(_loudness(waveform), 10.0 ** (_FLOOR_DB / 20.0)))
+    return choose_silence(
+        peaks,
+        per_peak,
+        min_silence,
+        padding,
+        total=float(waveform.duration),
+        group=max(1, round(_CHOICE_TICK_SECONDS / per_peak)),
+    )
 
 
 def keep_speech(

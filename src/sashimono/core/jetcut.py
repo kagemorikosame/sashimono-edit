@@ -71,13 +71,26 @@ def _cut_clips(project: Project, media_id: MediaId, stream: int | None) -> list[
     return used
 
 
-def cut_targets(project: Project, media_id: MediaId, stream: int | None) -> tuple[ClipId, ...]:
-    """:func:`plan_cuts` が切る範囲を決めるのに使うクリップ
+def cut_targets(
+    project: Project,
+    media_id: MediaId,
+    silences: Sequence[SourceRange],
+    *,
+    min_frames: int = 1,
+    stream: int | None = None,
+) -> tuple[ClipId, ...]:
+    """:func:`plan_cuts` に同じ引数を渡したとき、全部が無音で頼まれて消えるクリップ
 
-    無音カットが頼まれて切る相手 これ以外のクリップが範囲に収まって消えたら、頼んでいない物が
-    消えたことになるので知らせる（:func:`~sashimono.core.commands.edit.ripple_casualties`）
+    これ以外のクリップが範囲に収まって消えたら、ほかのクリップの無音に巻き込まれたことに
+    なるので知らせる（:func:`~sashimono.core.commands.edit.ripple_casualties`）
+    無音の範囲を持つだけでは足りない 話している所を含むクリップが丸ごと消えても黙ってしまう
     """
-    return tuple(clip.id for _, clip in _cut_clips(project, media_id, stream))
+    return tuple(
+        clip.id
+        for _, clip in _cut_clips(project, media_id, stream)
+        if merge_ranges(_project_clip(clip, silences, project.rate, min_frames))
+        == ((clip.timeline_start, clip.timeline_end),)
+    )
 
 
 def _project_clip(
