@@ -22,16 +22,24 @@ from typing import Any
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.console import hide_cli_console
-from sashimono.ai.environment import bundled_claude_cli, find_claude_cli
+from sashimono.ai.environment import (
+    bundled_claude_cli,
+    conversation_folder,
+    credentials_found,
+    find_claude_cli,
+)
 from sashimono.ai.models import effort_for
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.plan import GET_PLAN, SET_PLAN, UPDATE_PLAN_STEP
-from sashimono.ai.server import SERVER_NAME, build_server
+from sashimono.ai.server import MAX_MESSAGE_BYTES, SERVER_NAME, build_server
 from sashimono.core.model import LayerMode
 
 __all__ = [
     "ASK_RULES",
+    "AUTO_MEMORY_OFF",
     "LIMIT_DETAIL",
+    "LOGIN_DETAIL",
+    "LOGIN_EXPIRED_GUIDE",
     "PLAN_RULES",
     "SYSTEM_PROMPT",
     "UPDATE_PARTS_LABEL",
@@ -39,9 +47,11 @@ __all__ = [
     "AgentSession",
     "EventKind",
     "OutdatedClaudeCode",
+    "failure_event",
     "outdated_claude_code",
     "result_error",
     "system_prompt",
+    "with_login_hint",
 ]
 
 #: 置き方の方式ごとの、素材の絵と音の持ち方の説明 :func:`system_prompt` が差し込む
@@ -174,6 +184,8 @@ _PROMPT = """\
   止まった訳・残り）を読み、今の形を確かめてから続けてください
 
 返事は日本語で、簡潔に 作業の実況ではなく、やったことと結果を伝えてください
+道具の合間の短い説明、計画の手順と note、質問の文も日本語で書きます 道具の結果やエラーが
+英語でも、そのまま写さず日本語で伝えます ユーザーが別の言語で頼んだときだけ、その言語にします
 """
 
 
@@ -290,6 +302,11 @@ class AgentSession:
         self._client: Any = None
         self._busy = threading.Event()
         self._closed = threading.Event()
+        #: この Claude Code をこれ以上使えないので、次の指示は起動し直す
+        #: 会話のスレッドだけが読み書きする
+        self._finished = False
+        #: Claude Code が作った失敗の言葉と印（文, 印） 指示の結果が来るまで持っておく
+        self._made_up: tuple[str, str] | None = None
         #: 画面が前の指示の区切り（取り消しの段）を付け終えたか
         #: 付け終える前に次の指示を始めると、次の指示の編集が前の段へ混ざり、
         #: 1 回の取り消しで 2 つの指示の編集がまとめて戻る
@@ -331,6 +348,7 @@ class AgentSession:
         if self.running:
             return
         self._closed.clear()
+        self._finished = False
         # 前の接続が繋がる前に落ちると（Claude Code が見つからない・ログインが
         # まだ、など）、取られなかった指示が残る 残したまま繋ぎ直すと、画面が
         # 捨てた指示を黙って先に実行し、その編集が次の指示の取り消しの段へ入る
@@ -415,7 +433,7 @@ class AgentSession:
         try:
             asyncio.run(self._main())
         except Exception as exc:  # スレッドの外へ例外を出さない
-            self._emit(AgentEvent(EventKind.ERROR, text=_explain(exc)))
+            self._emit(_failure_of(exc))
         finally:
             self._loop = None
             self._client = None
@@ -428,8 +446,12 @@ class AgentSession:
         # 繋ぐ前に包む 繋いだ後では、claude.exe の黒い窓がもう開いている（#228）
         hide_cli_console()
         self._loop = asyncio.get_running_loop()
+        values = self.option_values()
+        # 無い場所を渡すと Claude Code を起動できない 初めての人の機械にはまだ無い
+        if values.get("cwd"):
+            Path(values["cwd"]).mkdir(parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
-            **self.option_values(),
+            **values,
             mcp_servers={SERVER_NAME: self.server()},
             can_use_tool=self._can_use_tool,
         )
@@ -437,7 +459,7 @@ class AgentSession:
         async with ClaudeSDKClient(options) as client:
             self._client = client
             self._emit(AgentEvent(EventKind.READY))
-            while not self._closed.is_set():
+            while not self._closed.is_set() and not self._finished:
                 await asyncio.to_thread(self._boundary.wait)
                 # 区切り待ちから起きたのが畳むためなら、次の指示を取り出さずに終わる
                 if self._closed.is_set():
@@ -475,7 +497,14 @@ class AgentSession:
             "setting_sources": [],
             "permission_mode": "default",
             "model": self._model,
-            "cwd": str(self._cwd) if self._cwd is not None else None,
+            "cwd": str(self._cwd or conversation_folder()),
+            # 本人の自動メモは「AI へ送る物」の同意の表に無い setting_sources を空にしても
+            # 文脈に入る（実物で確かめた） --bare でも止まるが、OAuth のログインを読まなくなる
+            "env": {AUTO_MEMORY_OFF: "1"},
+            # 会話の全文と、Claude Code が取っておく絵のファイルをホームの下に残さない
+            # このアプリは会話を再開しないので、残す値打ちが無い
+            "extra_args": {"no-session-persistence": None},
+            "max_buffer_size": MAX_MESSAGE_BYTES,
         }
         if self._effort is not None:
             # 指定しないときは渡さない 渡すと Claude Code の既定を上書きしてしまう
@@ -491,12 +520,17 @@ class AgentSession:
 
     async def _turn(self, client: Any, prompt: str) -> None:
         self._busy.set()
+        self._made_up = None
         try:
             await client.query(prompt)
             async for message in client.receive_response():
                 self._translate(message)
+            self._tell_made_up_failure()
         except Exception as exc:
-            self._emit(AgentEvent(EventKind.ERROR, text=_explain(exc)))
+            # SDK の読み取りはここで止まっている（1 通があふれたときを実物で確かめた） 同じ会話へ
+            # 次の指示を送っても返事が 1 つも来ず「完了」と出るので、畳んで次で起動し直す
+            self._finished = True
+            self._emit(_failure_of(exc))
         finally:
             self._busy.clear()
             self._emit(AgentEvent(EventKind.TURN_DONE))
@@ -532,6 +566,14 @@ class AgentSession:
             self._bridge.usage.record_message(
                 getattr(message, "message_id", None), getattr(message, "usage", None)
             )
+            if message.model == _MADE_UP_MODEL:
+                # AI の言葉ではない 流すと失敗の文が「Claude」の言葉として並び、引き継ぎにも
+                # 「AI の最後の言葉」として載る 失敗でない短い文は誰にも要らないので捨てる
+                code = getattr(message, "error", None)
+                if code:
+                    words = " ".join(b.text for b in message.content if isinstance(b, TextBlock))
+                    self._made_up = (words, str(code))
+                return
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     self._emit(AgentEvent(EventKind.TEXT, text=block.text))
@@ -560,7 +602,30 @@ class AgentSession:
             # 失敗した指示も使った分は払うので、成功と失敗の両方で数える
             self._bridge.usage.settle_output(getattr(message, "usage", None))
             if message.is_error:
-                self._emit(result_error(str(message.subtype or ""), message.result))
+                words, code = self._made_up or ("", "")
+                self._made_up = None
+                self._fail(
+                    result_error(str(message.subtype or ""), message.result or words, code=code)
+                )
+            else:
+                self._tell_made_up_failure()
+
+    def _tell_made_up_failure(self) -> None:
+        """失敗の結果が来なかったのに Claude Code が失敗の言葉を作っていたら、失敗として出す
+
+        黙って捨てると、応えられなかった指示が「完了」と出る
+        """
+        if self._made_up is not None:
+            words, code = self._made_up
+            self._made_up = None
+            self._fail(failure_event(words, code))
+
+    def _fail(self, event: AgentEvent) -> None:
+        if event.detail == LOGIN_DETAIL:
+            # 動き続ける Claude Code が、別の窓で入れ直したログインを読むかは確かめられない
+            # 畳んでおけば、次の指示は必ず新しいログインで始まる 文脈は引き継ぎで渡せる
+            self._finished = True
+        self._emit(event)
 
     def _emit(self, event: AgentEvent) -> None:
         self._events.put(event)
@@ -568,9 +633,32 @@ class AgentSession:
 
 #: Claude Code の上限（手数・費用）で止まったことを、ERROR の知らせの ``detail`` に書く印（#346）
 LIMIT_DETAIL = "limit"
+#: ログインの失敗を、ERROR の知らせの ``detail`` に書く印（#412） 画面はこれで〔ログイン…〕を出す
+LOGIN_DETAIL = "login"
+#: Claude Code の自動メモを止める環境変数（同梱の 2.1.310 と 2.1.314 で確かめた）
+AUTO_MEMORY_OFF = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+#: Claude Code が AI を通さずに作った言葉に付く、モデルの名前
+_MADE_UP_MODEL = "<synthetic>"
+#: Claude Code が失敗に付ける印のうち、ログイン以外の物の説明 英語の文だけでは、待てばよいのか
+#: 直すのかが分からない 元の文は問い合わせに要るので後ろに残す
+_FAILURE_WORDS = {
+    "rate_limit": "Claude の使える量の上限に達しました 時間をおいてから送り直してください",
+    "billing_error": "Claude の契約か支払いの状態のため応えられませんでした"
+    " アカウントを確かめてください",
+    "server_error": "Claude の側で問題が起きました 少し待ってから送り直してください",
+    "invalid_request": "Claude に頼みを受け付けてもらえませんでした",
+}
 
 
-def result_error(subtype: str, result: str | None) -> AgentEvent:
+def failure_event(text: str, code: str = "") -> AgentEvent:
+    """失敗の文と Claude Code の印（``AssistantMessage.error``）を、画面の知らせへ"""
+    if code == "authentication_failed" or _needs_login(text):
+        return AgentEvent(EventKind.ERROR, text=_login_guide(text), detail=LOGIN_DETAIL)
+    words = _FAILURE_WORDS.get(code)
+    return AgentEvent(EventKind.ERROR, text=f"{words}（元の文: {text}）" if words else text)
+
+
+def result_error(subtype: str, result: str | None, *, code: str = "") -> AgentEvent:
     """Claude Code が失敗で終えた知らせ（ResultMessage）を、画面の知らせへ
 
     手数や費用の上限（``error_max_turns``・``error_max_budget_usd`` など ``error_max`` で始まる）で
@@ -581,7 +669,7 @@ def result_error(subtype: str, result: str | None) -> AgentEvent:
     if subtype.startswith("error_max"):
         text = result or f"Claude Code の上限に達して止まりました（{subtype}）"
         return AgentEvent(EventKind.ERROR, text=text, detail=LIMIT_DETAIL)
-    return AgentEvent(EventKind.ERROR, text=with_login_hint(str(result or "失敗しました")))
+    return failure_event(str(result or "失敗しました"), code)
 
 
 async def _safe_interrupt(client: Any) -> None:
@@ -616,6 +704,13 @@ def _summarize(value: object, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _failure_of(exc: BaseException) -> AgentEvent:
+    """例外を画面の知らせへ ログインの案内に置き換えた文なら印を付ける"""
+    text = _explain(exc)
+    login = text in (LOGIN_HINT, LOGIN_EXPIRED_GUIDE)
+    return AgentEvent(EventKind.ERROR, text=text, detail=LOGIN_DETAIL if login else "")
+
+
 def _explain(exc: BaseException) -> str:
     """例外を、次にどうすればよいか分かる文へ"""
     missing = _missing_part(exc)
@@ -629,7 +724,13 @@ def _explain(exc: BaseException) -> str:
         )
     if name == "ProcessError":
         return with_login_hint(f"Claude Code の起動に失敗しました: {exc}")
-    return with_login_hint(f"{name}: {exc}")
+    if name == "CLIJSONDecodeError" and "maximum buffer size" in str(exc):
+        return (
+            f"Claude Code からの 1 回の返事が大きすぎて（上限 {MAX_MESSAGE_BYTES // 2**20} MB）"
+            "読み取れないため、会話を閉じました 作品はそのままです"
+            " 次に送ると新しい会話で始まるので、引き継ぎの〔続きを頼む〕から続けられます"
+        )
+    return with_login_hint(f"Claude Code とのやり取りで問題が起きました（{name}: {exc}）")
 
 
 #: 部品が読めないときの案内に書く、環境を入れ直す所
@@ -702,7 +803,10 @@ def outdated_claude_code(text: str) -> OutdatedClaudeCode | None:
 
 
 #: ログインが済んでいないときに Claude Code が返す文面の手掛かり（小文字で比べる）
-_LOGIN_MARKERS = ("/login", "api key", "not logged in", "authentication", "oauth", "401")
+#: 401 は単語として探す 番号の中の 401 でログインを促すと、原因を取り違える
+_LOGIN_MARKERS = re.compile(
+    r"/login|api key|not logged in|authentication|oauth|(?<!\d)401(?!\d)", re.IGNORECASE
+)
 
 #: ログインが要るときに添える案内
 LOGIN_HINT = (
@@ -712,13 +816,29 @@ LOGIN_HINT = (
 )
 
 
-def with_login_hint(text: str) -> str:
-    """ログインが済んでいないための失敗なら、次にすることを書き足す
+#: ログインが切れたときの案内 開いた窓に案内が出るとは限らないので、打つ物まで言う
+LOGIN_EXPIRED_GUIDE = (
+    "Claude へのログインが切れています アシスタント欄の「ログイン…」で Claude Code を開き、"
+    "開いた窓で /login と打ってログインし直してから、送り直してください"
+    "（API キーを使う場合は、環境変数 ANTHROPIC_API_KEY の値を確かめ、ソフトを再起動します）"
+)
 
-    Claude Code の文面は英語で「/login を実行して」と言うだけで、ソフトの中から
-    どこでそれをすればよいのかが分からない
+
+def _needs_login(text: str) -> bool:
+    return _LOGIN_MARKERS.search(text) is not None
+
+
+def _login_guide(text: str) -> str:
+    """初めての人と切れた人で案内を分ける 初めての人に「切れた」と言うと、何かを壊したと読める
+
+    置き場があるかだけを見る 中身は読まない
     """
-    lowered = text.lower()
-    if any(marker in lowered for marker in _LOGIN_MARKERS):
-        return f"{text}\n{LOGIN_HINT}"
-    return text
+    return LOGIN_EXPIRED_GUIDE if credentials_found() or "expired" in text.lower() else LOGIN_HINT
+
+
+def with_login_hint(text: str) -> str:
+    """ログインが済んでいないための失敗なら、次にすることを書いた文に置き換える
+
+    Claude Code の文面は英語で、ソフトの中のどこで直せばよいのかも分からないので、残さない
+    """
+    return _login_guide(text) if _needs_login(text) else text

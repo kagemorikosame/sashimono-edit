@@ -503,7 +503,7 @@ class TestLimitFromClaudeCode:
     def test_other_failures_stay_errors(self) -> None:
         # 壊れると、ログインが要る失敗まで「上限」と読め、ログインの案内も消える
         event = result_error("error_during_execution", "Not logged in /login")
-        assert event.detail == ""
+        assert event.detail != LIMIT_DETAIL
         assert "ログイン" in event.text
 
 

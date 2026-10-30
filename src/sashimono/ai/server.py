@@ -27,12 +27,31 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS, ImageResult, Operation
 from sashimono.ai.plan import PLAN_TOOLS
+from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.core.io.serialize import json_text
 
-__all__ = ["SERVER_NAME", "build_server", "build_tools", "tool_name", "tool_names"]
+__all__ = [
+    "MAX_MESSAGE_BYTES",
+    "SERVER_NAME",
+    "build_server",
+    "build_tools",
+    "tool_name",
+    "tool_names",
+]
 
 #: MCP サーバの名前 Claude 側でのツール名は ``mcp__sashimono__<ツール名>`` になる
 SERVER_NAME = "sashimono"
+
+#: 道具が返す 1 枚の絵の、縮まらないときの大きさ 長い辺の上限の正方形を RGBA のまま持つ形
+_LARGEST_IMAGE_BYTES = MAX_SHEET_EDGE * MAX_SHEET_EDGE * 4
+#: Claude Code から届く 1 通の上限（SDK の ``max_buffer_size``）
+#: 既定の 1 MiB では編集の途中で会話が落ちた Claude Code は道具の結果と ``tool_use_result`` に
+#: 同じ絵の base64 を書くので、絵が 2 回入り、PNG が 39 万バイトを超えるだけで既定を越える
+#: 絵の base64（4/3 倍）2 回分に、説明の文と JSON の分として 1 MiB を足す 絵を描く道具は
+#: どれも長い辺を :data:`MAX_SHEET_EDGE` までに収める 1 指示の絵の枚数（既定 30）は掛けない
+#: 道具の結果は 1 つずつ別の 1 通で届く（通しの確かめの記録で、並べて呼んだ道具も別の通だった）
+#: 上限は読むときの見張りで、前もって確保する量ではないので、大きくしても使う記憶は増えない
+MAX_MESSAGE_BYTES = (_LARGEST_IMAGE_BYTES * 4 // 3 + 4) * 2 + 1024 * 1024
 
 
 def tool_name(operation: Operation | str) -> str:

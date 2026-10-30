@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from sashimono.core.userdirs import state_root
 from sashimono.runtime import FeaturePack, PackStatus
 from sashimono.runtime import install_command as _install_command
 
@@ -25,6 +26,7 @@ __all__ = [
     "REQUIRED_PACKAGES",
     "bundled_claude_cli",
     "claude_cli",
+    "conversation_folder",
     "credentials_found",
     "find_claude_cli",
     "install_command",
@@ -36,14 +38,16 @@ __all__ = [
 #: Claude Opus 5.5 は 2.1.280 より前の Claude Code では「does not support this model」で
 #: 断られる（0.2.152 に同梱の 2.1.259 で、利用者の画面で起きた）
 #: 新しいモデルを一覧へ足すときは、ここと下の SDK の下限を一緒に上げる
-MINIMUM_CLAUDE_CODE = "2.1.280"
+#: 2.1.310 は、自動メモを止める変数と記録を残さない引数を実物の会話で確かめた版（#412）
+#: 本人のメモが同意の外で渡らないことをこの版で約束するので、古い部品のままにしない
+MINIMUM_CLAUDE_CODE = "2.1.310"
 
-#: SDK の下限 0.2.158 は Claude Code 2.1.280 を同梱する最初の版（PyPI の Windows の
-#: wheel の ``_cli_version.py`` で確かめた 0.2.156 は 2.1.276 0.2.157 は Windows の
-#: wheel が無く、配布版の pip は選べない） モデルとエフォートの指定は 0.2.152 から使える
+#: SDK の下限 0.2.174 は Claude Code 2.1.310 を同梱する（入れた SDK の ``claude.exe --version``
+#: で確かめた） Opus 5.5 に要る 2.1.280 は 0.2.158 から入るが、それより古い版で #412 の
+#: 設定が効くかは確かめていない モデルとエフォートの指定は 0.2.152 から使える
 #: 上限は試した系列（0.2）の外へ自動で上がらないため 0.3 で使い方が変わっても、
 #: 自動の更新が入れて会話が始まらなくなる、ということが起きない 新しい系列は試してから上げる
-REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.158,<0.3",)
+REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.174,<0.3",)
 
 
 def bundled_claude_cli() -> Path | None:
@@ -110,6 +114,16 @@ def credentials_found() -> bool:
     config = os.environ.get("CLAUDE_CONFIG_DIR")
     root = Path(config) if config else Path.home() / ".claude"
     return (root / ".credentials.json").is_file()
+
+
+def conversation_folder() -> Path:
+    """会話の間 Claude Code を置いておく、空のフォルダ
+
+    渡さないと起動した場所を受け継ぎ、その場所に紐付くメモや設定の持ち主になる（#412）
+    配布版でも起動の場所は開き方で変わるので、決めておく 道具は渡していないので、
+    Claude Code がこの中のファイルを読み書きすることは無い
+    """
+    return state_root() / "ai-conversation"
 
 
 def open_login_window(cli: Path) -> None:

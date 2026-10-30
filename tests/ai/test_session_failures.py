@@ -1,0 +1,356 @@
+"""会話が失敗したときの知らせ（#412）
+
+Claude Code が作った言葉（``model`` が ``<synthetic>``）を AI の言葉として流さない・ログインの失敗を
+見分ける・1 通が大きすぎても分かる文で止まり、次の指示で繋ぎ直せることを見る
+CI には SDK が入らないので、SDK の形は偽物で作る 値の形は通しの確かめの記録に合わせた
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+import types
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, cast
+
+import pytest
+
+from sashimono.ai import session as session_module
+from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.session import (
+    LOGIN_DETAIL,
+    AgentEvent,
+    AgentSession,
+    EventKind,
+    result_error,
+    with_login_hint,
+)
+
+SYNTHETIC = "<synthetic>"
+EXPIRED = "Failed to authenticate: OAuth session expired and could not be refreshed"
+
+
+@dataclass
+class _Text:
+    text: str
+
+
+@dataclass
+class _Assistant:
+    content: list[object]
+    model: str = "claude-opus-5-5"
+    error: str | None = None
+    usage: dict[str, int] | None = None
+    message_id: str | None = None
+
+
+@dataclass
+class _Result:
+    is_error: bool = False
+    subtype: str = "success"
+    result: str | None = None
+    usage: dict[str, int] | None = None
+
+
+@dataclass
+class _Unused:
+    """この試験の知らせには出てこない SDK の形"""
+
+    content: list[object] = field(default_factory=list)
+
+
+class _Usage:
+    def record_message(self, message_id: object, usage: object) -> None:
+        del message_id, usage
+
+    def settle_output(self, usage: object) -> None:
+        del usage
+
+
+class _Bridge:
+    usage = _Usage()
+
+    def resume(self) -> None:
+        return
+
+    def cancel(self) -> None:
+        return
+
+
+class _Client:
+    """ClaudeSDKClient の代わり 1 回の指示ごとに ``replies`` の頭を 1 つ使う"""
+
+    replies: ClassVar[list[list[object] | BaseException]] = []
+    made: ClassVar[int] = 0
+
+    def __init__(self, options: object) -> None:
+        del options
+        _Client.made += 1
+
+    async def __aenter__(self) -> _Client:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def query(self, prompt: str) -> None:
+        del prompt
+
+    async def receive_response(self) -> AsyncIterator[object]:
+        reply = _Client.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        for message in reply:
+            yield message
+
+    async def interrupt(self) -> None:
+        return
+
+
+@pytest.fixture(autouse=True)
+def sdk(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    fake: Any = types.ModuleType("claude_agent_sdk")
+    fake.AssistantMessage = _Assistant
+    fake.ResultMessage = _Result
+    fake.TextBlock = _Text
+    fake.ThinkingBlock = _Unused
+    fake.ToolResultBlock = _Unused
+    fake.ToolUseBlock = _Unused
+    fake.UserMessage = _Unused
+    fake.ClaudeAgentOptions = lambda **_kwargs: object()
+    fake.ClaudeSDKClient = _Client
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+    monkeypatch.setattr(session_module, "build_server", lambda _bridge, **_options: None)
+    monkeypatch.setattr(session_module, "hide_cli_console", lambda: None)
+    monkeypatch.setattr(AgentSession, "option_values", lambda _self: {})
+    _Client.replies = []
+    _Client.made = 0
+    _sessions.clear()
+    yield
+    # 落ちた試験の会話も畳む 残すと、会話のスレッドが指示を待ったままで、試験の終わりに止まる
+    for made in _sessions:
+        made.close()
+
+
+_sessions: list[AgentSession] = []
+
+
+def _session() -> AgentSession:
+    made = AgentSession(cast(EditorBridge, _Bridge()))
+    _sessions.append(made)
+    return made
+
+
+def _events(*messages: object) -> list[AgentEvent]:
+    session = _session()
+    for message in messages:
+        session._translate(message)
+    return session.poll()
+
+
+def _until(session: AgentSession, kind: EventKind) -> list[AgentEvent]:
+    """``kind`` の知らせが来るまで集める 来ないまま 5 秒たったら落とす"""
+    seen: list[AgentEvent] = []
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        seen.extend(session.poll())
+        if any(event.kind is kind for event in seen):
+            return seen
+        time.sleep(0.01)
+    pytest.fail(f"{kind} が来ない: {seen}")
+
+
+def _expired_turn() -> list[object]:
+    """ログインが切れたときに流れてくる形（Claude Code が作った言葉と、失敗の結果）"""
+    return [
+        _Assistant([_Text(EXPIRED)], model=SYNTHETIC, error="authentication_failed"),
+        _Result(is_error=True, result=EXPIRED),
+    ]
+
+
+class TestWordsClaudeCodeMade:
+    def test_a_made_up_failure_is_not_the_ai_speaking(self) -> None:
+        # 壊れると、同じ失敗の文が「Claude」の言葉として会話の欄に出て、引き継ぎにも
+        # 「AI の最後の言葉」として載り、1 つの失敗が 3 回並ぶ
+        events = _events(*_expired_turn())
+        assert [event.kind for event in events] == [EventKind.ERROR]
+
+    def test_the_real_ai_is_still_heard(self) -> None:
+        # 壊れると、本物の返事まで捨てて、AI が何も言わないように見える
+        events = _events(_Assistant([_Text("切りました")]), _Result())
+        assert [(event.kind, event.text) for event in events] == [(EventKind.TEXT, "切りました")]
+
+    def test_a_failure_without_a_failed_result_is_still_told(self) -> None:
+        # 結果が失敗の印を持たなくても、作られた言葉が失敗を言っていれば失敗として出す
+        # 捨てると、応えられなかった指示が黙って「完了」になる
+        events = _events(
+            _Assistant([_Text("Rate limited")], model=SYNTHETIC, error="rate_limit"),
+            _Result(is_error=False),
+        )
+        assert [event.kind for event in events] == [EventKind.ERROR]
+
+    def test_the_text_of_the_failure_comes_from_the_made_up_words(self) -> None:
+        # 結果に文が無いと「失敗しました」だけになり、何が起きたか分からない
+        events = _events(
+            _Assistant([_Text("API Error: 400 Bad things")], model=SYNTHETIC, error="unknown"),
+            _Result(is_error=True, result=None),
+        )
+        assert "Bad things" in events[0].text
+
+    def test_a_notice_that_is_not_a_failure_stays_quiet(self) -> None:
+        # 応えなかった印の短い文などを AI の言葉として並べない
+        assert _events(_Assistant([_Text("No response requested.")], model=SYNTHETIC)) == []
+
+    def test_a_failure_is_told_even_when_no_result_comes(self) -> None:
+        # 結果が来ないまま終わると、失敗の知らせが消えて「完了」と書かれる
+        session = _session()
+        _Client.replies = [
+            [_Assistant([_Text("Server down")], model=SYNTHETIC, error="server_error")]
+        ]
+        session.send("指示")
+        events = _until(session, EventKind.TURN_DONE)
+        session.close()
+        assert EventKind.ERROR in [event.kind for event in events]
+
+    def test_an_outdated_claude_code_is_still_seen(self) -> None:
+        # 画面は失敗の文から「部品が古い」を見分ける 訳の文で包んで元の文が消えると、
+        # 〔AI の部品を更新〕が出ない
+        text = "API Error: 400 Claude Code 2.1.259 does not support this model"
+        events = _events(
+            _Assistant([_Text(text)], model=SYNTHETIC, error="invalid_request"),
+            _Result(is_error=True, result=text),
+        )
+        assert session_module.outdated_claude_code(events[0].text) is not None
+
+
+class TestFailuresInJapanese:
+    def test_the_instructions_cover_the_words_between_tools(self) -> None:
+        # 「返事は」だけだと、道具の合間の説明や計画の手順は別の物と読まれ、英語で書かれる
+        for word in ("道具の合間", "計画の手順", "英語"):
+            assert word in session_module.system_prompt()
+
+    @pytest.mark.parametrize(
+        ("code", "word"),
+        [
+            ("rate_limit", "上限"),
+            ("billing_error", "契約"),
+            ("server_error", "Claude の側"),
+            ("invalid_request", "受け付け"),
+        ],
+    )
+    def test_known_failures_are_explained(self, code: str, word: str) -> None:
+        # 壊れると、英語の文だけが出て、待てばよいのか直すのかが分からない
+        event = result_error("success", "Some English text", code=code)
+        assert word in event.text
+        assert "Some English text" in event.text
+
+    def test_an_unknown_exception_says_what_failed_in_japanese(self) -> None:
+        # 壊れると、例外の名前と英語の文だけが会話の欄に出る
+        text = session_module._explain(RuntimeError("boom"))
+        assert "Claude Code" in text
+        assert "boom" in text
+
+
+class TestLoginFailure:
+    def test_the_failure_is_marked(self) -> None:
+        # 壊れると、画面が見分けられず〔ログイン…〕が出ないまま「ログイン…で」と言う
+        event = _events(*_expired_turn())[0]
+        assert event.detail == LOGIN_DETAIL
+
+    def test_the_code_alone_is_enough(self) -> None:
+        # 文面が変わっても、Claude Code が付けた印で見分ける
+        event = result_error("success", "Something new", code="authentication_failed")
+        assert event.detail == LOGIN_DETAIL
+
+    def test_the_english_is_replaced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 壊れると、英語の文が残り、案内の前に読めない 1 行が出る
+        monkeypatch.setattr(session_module, "credentials_found", lambda: True)
+        assert "Failed" not in _events(*_expired_turn())[0].text
+
+    def test_an_expired_login_says_to_type_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 切れた人の窓では Claude Code が案内を出さないかもしれない 打つ物まで言う
+        # 「案内に従って」だけだと、何も出ない窓の前で止まる
+        monkeypatch.setattr(session_module, "credentials_found", lambda: True)
+        text = with_login_hint(EXPIRED)
+        assert "切れて" in text
+        assert "/login" in text
+
+    def test_someone_who_never_logged_in_gets_the_first_guide(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 初めての人に「切れています」と言うと、何かを壊したように読める
+        monkeypatch.setattr(session_module, "credentials_found", lambda: False)
+        text = with_login_hint("Not logged in · Please run /login")
+        assert "切れて" not in text
+        assert "ログイン…" in text
+
+    def test_a_number_that_contains_401_is_not_a_login_failure(self) -> None:
+        # 壊れると、番号に 401 を含むだけの失敗でログインを促し、原因を取り違える
+        assert with_login_hint("frame 14012 failed") == "frame 14012 failed"
+        assert "ログイン" in with_login_hint("API Error: 401 Unauthorized")
+
+    def test_a_failed_start_is_marked_too(self) -> None:
+        # ログインがまだの機械では、指示の前に起動で落ちることがある 案内の文に置き換えた後も
+        # 印が付かないと、〔続きを頼む〕が出て先にログインへ向かわせられない
+        session = _session()
+        _Client.replies = [RuntimeError("Not logged in · Please run /login")]
+        session.send("指示")
+        events = _until(session, EventKind.CLOSED)
+        details = [event.detail for event in events if event.kind is EventKind.ERROR]
+        assert details == [LOGIN_DETAIL]
+
+    def test_the_conversation_is_closed_so_the_new_login_is_read(self) -> None:
+        # 動き続ける Claude Code が、別の窓で入れ直したログインを読むかは分からない
+        # 畳んで次の指示で起動し直せば、必ず新しいログインで始まる
+        session = _session()
+        _Client.replies = [_expired_turn(), [_Result()]]
+        session.send("1 つ目")
+        _until(session, EventKind.CLOSED)
+        assert session.running is False
+        session.send("2 つ目")
+        _until(session, EventKind.TURN_DONE)
+        session.close()
+        assert _Client.made == 2
+
+
+# SDK と同じ名前にする 見分けは名前で行う（SDK を読まずに文を作る所なので）
+_TooLargeError: type[Exception] = type("CLIJSONDecodeError", (Exception,), {})
+
+
+class TestMessageTooLarge:
+    def _failure(self) -> Exception:
+        return _TooLargeError(
+            "Failed to decode JSON: JSON message exceeded maximum buffer size of 1048576 bytes..."
+        )
+
+    def test_it_stops_with_words_a_person_can_read(self) -> None:
+        # 壊れると、例外の名前と英語の文だけが出て、何が起きたか分からない
+        text = session_module._explain(self._failure())
+        assert "CLIJSONDecodeError" not in text
+        assert "大きすぎ" in text
+        assert "続きを頼む" in text
+
+    def test_the_next_prompt_starts_a_new_conversation(self) -> None:
+        # あふれると SDK の読み取りが止まる（実物で確かめた） 同じ会話へ次の指示を送ると、
+        # 返事が 1 つも来ないまま「完了」と出る
+        session = _session()
+        _Client.replies = [self._failure(), [_Assistant([_Text("続けます")]), _Result()]]
+        session.send("1 つ目")
+        events = _until(session, EventKind.CLOSED)
+        assert [event.kind for event in events].count(EventKind.ERROR) == 1
+        assert session.running is False
+        session.send("2 つ目")
+        later = _until(session, EventKind.TURN_DONE)
+        session.close()
+        assert _Client.made == 2
+        assert [event.text for event in later if event.kind is EventKind.TEXT] == ["続けます"]
+
+    def test_the_real_sdk_error_is_recognized(self) -> None:
+        """SDK が名前か文面を変えると、見分けられずに英語のまま出る"""
+        del sys.modules["claude_agent_sdk"]
+        sdk = pytest.importorskip("claude_agent_sdk")
+        failure = sdk.CLIJSONDecodeError(
+            "JSON message exceeded maximum buffer size of 1048576 bytes", ValueError("over")
+        )
+        assert "大きすぎ" in session_module._explain(failure)
