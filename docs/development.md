@@ -354,6 +354,8 @@ AI の道具の結果は、そのまま Claude Code を通して Anthropic へ�
   ホームの下に残さない アプリは会話を再開しないので好みの分かれる所ではなく、設定には出さない
   前の版が残した記録（`~/.claude/projects`）は消さない 本人の物なので、消すかは本人が決める
 - `cwd` は `conversation_folder()` の空のフォルダ 渡さないと起動した場所を受け継ぐ
+  `CLAUDE_CONFIG_DIR` が相対だと場所ごとに指す先が変わるので、`claude_environment()` が絶対の場所に
+  直して会話とログインの窓へ渡す
   Claude Code は自分で環境の欄（作業場所の場所・OS など）とアカウントのメールを文脈に足す（実物で
   確かめた 止める設定は見つけていない） 作業場所の場所にはユーザー名が入るので、個人情報の扱いの表に書いた
 - `max_buffer_size` は `ai/server.py` の `MAX_MESSAGE_BYTES` Claude Code は道具の結果と

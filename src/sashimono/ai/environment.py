@@ -26,6 +26,7 @@ __all__ = [
     "REQUIRED_PACKAGES",
     "bundled_claude_cli",
     "claude_cli",
+    "claude_environment",
     "conversation_folder",
     "credentials_found",
     "find_claude_cli",
@@ -127,9 +128,20 @@ def _key_in_environment() -> bool:
 
 
 def _saved_login_found() -> bool:
-    config = os.environ.get("CLAUDE_CONFIG_DIR")
-    root = Path(config) if config else Path.home() / ".claude"
+    config = os.environ.get(_CONFIG_VARIABLE)
+    root = Path(config).absolute() if config else Path.home() / ".claude"
     return (root / ".credentials.json").is_file()
+
+
+def claude_environment() -> dict[str, str]:
+    """起動する Claude Code へ渡す環境変数のうち、このソフトが直す物
+
+    Claude Code の置き場の指定が相対だと、起動する場所で指す先が変わる 会話は専用のフォルダ、
+    ログインの窓はホームで開くので、そのままではログインの確かめ・会話・窓が別の場所を見る
+    このソフトの起動の場所を基準に絶対の場所へ直して、3 つを揃える
+    """
+    config = os.environ.get(_CONFIG_VARIABLE)
+    return {_CONFIG_VARIABLE: str(Path(config).absolute())} if config else {}
 
 
 def conversation_folder() -> Path:
@@ -152,9 +164,12 @@ def open_login_window(cli: Path) -> None:
     """
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     # 引数はここで決めた実行ファイルだけで、shell も通さない
-    subprocess.Popen([str(cli)], cwd=str(Path.home()), creationflags=flags)
+    environment = {**os.environ, **claude_environment()}
+    subprocess.Popen([str(cli)], cwd=str(Path.home()), env=environment, creationflags=flags)
 
 
+#: Claude Code の置き場を変える環境変数
+_CONFIG_VARIABLE = "CLAUDE_CONFIG_DIR"
 #: Claude Code が読む、鍵の入った環境変数 どれかがあればログインは要らない
 _CREDENTIAL_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 

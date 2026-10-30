@@ -166,6 +166,22 @@ class TestCredentials:
         environment.open_login_window(cli)
         assert started == [[str(cli)]]
 
+    def test_the_login_window_uses_the_same_config_folder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 窓はホームで開くので、相対の場所のままだと別の所へログインを保存する
+        # 壊れると、ログインし直しても会話がそれを読めず、同じ失敗を繰り返す
+        seen: list[str] = []
+
+        def popen(_argv: list[str], *, env: dict[str, str], **_kwargs: object) -> None:
+            seen.append(env["CLAUDE_CONFIG_DIR"])
+
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        environment.open_login_window(tmp_path / "claude.exe")
+        assert seen == [str(tmp_path / "設定")]
+
 
 def _session(model: str | None = None, effort: str | None = None) -> AgentSession:
     # 渡す設定を組み立てるだけで、ブリッジは使わない
@@ -245,6 +261,21 @@ class TestSessionOptions:
         folder = Path(_session().option_values()["cwd"])
         assert folder == environment.conversation_folder()
         assert (tmp_path / "local") in folder.parents
+
+    def test_a_relative_config_folder_stays_the_same_folder(
+        self, machine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 作業場所を決めたので、相対の場所をそのまま受け継ぐと Claude Code が別の場所を見る
+        # 壊れると、ログイン済みの人の会話がログインを見つけられず、案内の見分けも食い違う
+        del machine
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        assert _session().option_values()["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "設定")
+
+    def test_the_config_folder_is_left_alone_when_not_set(self, machine: Path) -> None:
+        # 壊れると、既定の置き場を使う人の Claude Code に要らない指定が渡る
+        del machine
+        assert "CLAUDE_CONFIG_DIR" not in _session().option_values()["env"]
 
     def test_a_chosen_folder_still_wins(self, machine: Path, tmp_path: Path) -> None:
         # 壊れると、作り手が場所を渡しても黙って無視され、試験や別の使い方で場所を選べない

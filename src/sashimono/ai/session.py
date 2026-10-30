@@ -24,6 +24,7 @@ from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.console import hide_cli_console
 from sashimono.ai.environment import (
     bundled_claude_cli,
+    claude_environment,
     conversation_folder,
     find_claude_cli,
     uses_saved_login,
@@ -500,7 +501,7 @@ class AgentSession:
             "cwd": str(self._cwd or conversation_folder()),
             # 本人の自動メモは「AI へ送る物」の同意の表に無い setting_sources を空にしても
             # 文脈に入る（実物で確かめた） --bare でも止まるが、OAuth のログインを読まなくなる
-            "env": {AUTO_MEMORY_OFF: "1"},
+            "env": {AUTO_MEMORY_OFF: "1", **claude_environment()},
             # 会話の全文と、Claude Code が取っておく絵のファイルをホームの下に残さない
             # このアプリは会話を再開しないので、残す値打ちが無い
             "extra_args": {"no-session-persistence": None},
