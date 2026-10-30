@@ -914,7 +914,7 @@ def _text_layers(
             return left + block_width - line_width
         return left + (block_width - line_width) / 2.0
 
-    path = QPainterPath()
+    path = _glyph_outlines()
     for index, line in enumerate(lines):
         x = start(metrics.horizontalAdvance(line), widest)
         baseline = top + line_height * index + metrics.ascent()
@@ -947,6 +947,19 @@ def _text_layers(
                 )
 
     return [(path, values, None)], None
+
+
+def _glyph_outlines() -> QPainterPath:
+    """字の輪郭を ``addPath`` で集める空のパス
+
+    ``addPath`` は渡した側の塗りの決まりを引き継がず、受け取る側の既定の OddEvenFill が残る
+    可変フォントの系統（Noto Sans JP など）は 1 つの字の中で輪郭が重なっていて、OddEvenFill
+    では重なった所が抜ける 字の白に穴が開いて下の黒い縁が透け、縁がガビガビに見える（#415）
+    ``addText`` で作った字は WindingFill なので、集める側も揃える
+    """
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    return path
 
 
 def _wrapped(text: str, width: float, metrics: QFontMetricsF, values: dict[str, object]) -> str:
@@ -1223,7 +1236,7 @@ def _aviutl_lines(
         for part, font, step, look, gap, shape in parts:
             x += gap
             plain = shape == (1.0, 1.0, 0.0)
-            target = paths.setdefault((look, not plain), QPainterPath())
+            target = paths.setdefault((look, not plain), _glyph_outlines())
             if plain:
                 target.addText(QPointF(x, baseline), font, part)
             else:
@@ -1729,6 +1742,38 @@ def _ring_path(path: QPainterPath, ring: _Ring) -> QPainterPath:
     return _stroke(path, ring.width, ring.join)
 
 
+def _inner_lines_hidden(ring: _Ring, look: Mapping[str, object], *, baked: bool) -> bool:
+    """字の中を通る輪郭に引いた線が、塗りに隠れて見えないか
+
+    隠れるのは、外側の層を不透明の単色の下に描くときだけ（字幕の縁はほとんどこれ）
+    塗りが透ければ線が透け、層のエフェクトは線を塗りの外へ運び、内側と中央の層は塗りの上に描く
+    """
+    if ring.position != "outside" or baked:
+        return False
+    fill = _fill_of(look, _FILL, "color")
+    return isinstance(fill, QColor) and fill.alpha() == 255
+
+
+#: 輪郭を解いて長さがこの割合より縮んだら、重なりが消えたと見る 曲線を折れ線にしただけでも
+#: 縮むので、それより大きく取る（重なりの無い書体で、字 1 つの縮みは 24 画素で最大 1.0%）
+_OVERLAP_SHRINK = 0.98
+
+
+def _outer_outline(path: QPainterPath) -> QPainterPath:
+    """重なった輪郭を解いて外形だけにした形 重なりが無ければ ``path`` のまま
+
+    可変フォントの系統の字は輪郭が重なっている 線は輪郭ごとに引かれるので、そのまま太らせると
+    字の外形に無い線が字の中を横切る（#415 塗りの決まりは線の形に関わらない）
+    ``simplified`` は曲線を折れ線にして、線の縁が境の画素で少し動く 重なりの無い書体の絵が
+    前の版から変わらないように、重なりが見つかった時だけ解いた形を使う
+    輪郭の数が変われば重なっていた 1 つの輪郭が自分と重なるときは数が変わらないので長さで見る
+    """
+    merged = path.simplified()
+    if len(merged.toSubpathPolygons()) != len(path.toSubpathPolygons()):
+        return merged
+    return merged if merged.length() < path.length() * _OVERLAP_SHRINK else path
+
+
 def _paint_ring(
     painter: QPainter,
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
@@ -1763,7 +1808,19 @@ def _paint_ring(
         effects = stacks[first.effects]
     apply = baker if callable(baker) and effects else None
     inside = any(ring.position == "inside" for _, ring, _, _ in entries)
-    bands = [(_ring_path(path, ring), ring, clip) for path, ring, clip, _ in entries]
+    bands = [
+        (
+            _ring_path(
+                path
+                if _inner_lines_hidden(ring, shown, baked=apply is not None)
+                else _outer_outline(path),
+                ring,
+            ),
+            ring,
+            clip,
+        )
+        for path, ring, clip, shown in entries
+    ]
     if apply is None and not inside:
         for band, ring, clip in bands:
             _fill_painted(painter, band, ring.fill, bases, clip)
