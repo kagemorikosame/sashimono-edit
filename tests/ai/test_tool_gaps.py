@@ -24,6 +24,8 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     ProjectSettings,
+    SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
     Transcript,
@@ -39,6 +41,7 @@ from tests.ai.test_audio_tools import _voiced
 from tests.ai.test_mix_tools import _measured, _Work
 from tests.check_media import RATE
 from tests.conftest import make_clip
+from tests.ui.test_subtitle_panel import make_waveform
 
 
 def _run(host: FakeHost, tool: str, /, **arguments: Any) -> Any:
@@ -665,6 +668,68 @@ class TestWhatTheAnswerSays:
         host.apply_commands([SetTrackState(words.id, locked=True)], "ロック")
         result = _run(host, "cut_range", start_frame=0, end_frame=30)
         assert result["tracks_left"] == [str(words.id)]
+
+
+class TestJetCutSaysWhatWentWithIt:
+    @staticmethod
+    def _work(
+        video_media: MediaItem, audio_media: MediaItem, *lost: Clip
+    ) -> tuple[FakeHost, MediaItem, Track]:
+        """1.6 秒鳴って 1.1 秒黙り、また鳴る素材を置いた作品 ``lost`` は無音の所に重ねる物"""
+        project = Project.create(
+            ProjectSettings(frame_rate=RATE_30), media=(video_media, audio_media)
+        )
+        main = Track(kind=TrackKind.VIDEO, name="V1", clips=(make_clip(0, 300, video_media),))
+        extra = Track(kind=TrackKind.AUDIO, name="重ね", clips=lost)
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(main, extra))))
+        host.stub_waveform = make_waveform([(0.5, 300), (0.0, 200), (0.5, 5500)])
+        return host, video_media, extra
+
+    def test_a_sound_in_the_silence_is_listed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、無音の所に置いた効果音が黙って消え、AI も人も気付かない"""
+        effect = make_clip(60, 5, audio_media)
+        host, media, extra = self._work(video_media, audio_media, effect)
+        result = _run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
+        assert result["clips_removed"] == 1
+        assert result["removed_clips"] == [
+            {
+                "clip_id": str(effect.id),
+                "track_id": str(extra.id),
+                "start_frame": 60,
+                "end_frame": 65,
+            }
+        ]
+        assert "subtitles_removed" not in result
+
+    def test_a_burned_subtitle_is_called_out(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、字幕の焼き込みが消えたことを効果音と見分けられず、字幕の抜けを見落とす"""
+        burned = Clip(
+            timeline_start=60,
+            duration=5,
+            source=TEXT.create(text="札"),
+            subtitle_origin=SubtitleOrigin(video_media.id, 1, SegmentId("s1")),
+        )
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(video_media,))
+        main = Track(kind=TrackKind.VIDEO, name="V1", clips=(make_clip(0, 300, video_media),))
+        words = Track(kind=TrackKind.VIDEO, name="字幕", clips=(burned,))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(main, words))))
+        host.stub_waveform = make_waveform([(0.5, 300), (0.0, 200), (0.5, 5500)])
+        result = _run(host, "jet_cut", media_id=str(video_media.id), keep_speech=False)
+        assert result["subtitles_removed"] == 1
+        assert result["removed_clips"][0]["subtitle"] is True
+        assert "字幕" in result["note"]
+
+    def test_the_cut_media_is_not_counted(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、切った素材の欠片まで「一緒に消えた」と毎回言う"""
+        host, media, _extra = self._work(video_media, audio_media)
+        result = _run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
+        assert "clips_removed" not in result
 
 
 class TestDeleteFollowsTheLayers:

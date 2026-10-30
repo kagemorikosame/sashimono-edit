@@ -22,6 +22,8 @@ from sashimono.core.model import (
     ClipId,
     MediaItem,
     Project,
+    SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
     new_group_id,
@@ -29,7 +31,9 @@ from sashimono.core.model import (
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.subtitle.dialogs import JetCutDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.test_subtitle_panel import make_waveform
 
 
 @pytest.fixture(autouse=True)
@@ -447,6 +451,37 @@ class TestLayersFollow:
             assert window.document.project.timeline.tracks[1].clips == ()
             assert any("別のトラックの 1 本" in message for message in told)
             assert "Ctrl+Z" in window.statusBar().currentMessage()
+        finally:
+            window.close()
+
+    def test_the_jet_cut_window_tells_it_in_the_real_window(
+        self,
+        qt_application: QApplication,
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、窓の無音カットは作品が変わる前に数えて、消えた字幕を知らせない
+        main = Clip(timeline_start=0, duration=300, media_id=video_media.id)
+        burned = replace(
+            _text(10, 5), subtitle_origin=SubtitleOrigin(video_media.id, 1, SegmentId("s1"))
+        )
+        window = _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (main,)),
+                Track(TrackKind.VIDEO, "字幕", (burned,)),
+                media=(video_media,),
+            ),
+        )
+        try:
+            panel = window._subtitles
+            panel.select_media(video_media.id)
+            waveform = make_waveform([(0.0, 400), (0.5, 1500)])
+            monkeypatch.setattr(panel._analyzer, "waveform", lambda *_args: waveform)
+            monkeypatch.setattr(JetCutDialog, "exec", lambda self: 1)
+            panel.jet_cut()
+            assert window.document.project.timeline.tracks[1].clips == ()
+            assert window.statusBar().currentMessage().startswith("焼き込んだ字幕 1 本")
         finally:
             window.close()
 

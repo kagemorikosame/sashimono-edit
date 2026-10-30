@@ -1592,7 +1592,9 @@ AI の書き出し（`export_video` #327）も同じ値を `build_settings` へ�
 - 重なった別々のクリップをまとめて消すときは、時間のつながった塊ごとに 1 回の切りとして見る（`_cuts`）
   1 本ずつ見ると、消す相手の片方が残る絵に数えられて字幕が付いてこず、トラックごとに詰める量もずれる
 - 範囲の中に収まる別のトラックの物は一緒に消える 黙って消えないよう、AI の答えの `clips_removed`
-  `removed_clips` と、人の状態の行で知らせる（`ripple_casualties`） `cut_range` の答えも同じ
+  `removed_clips` と、人の状態の行で知らせる（`ripple_casualties` `casualty_notice`） `cut_range` と `jet_cut`
+  の答えと、人の無音カットの窓も同じ 焼き込んだ字幕は `subtitles_removed` と `removed_clips` の `subtitle`、
+  人の文では頭に出す 字幕の欠けは見る人にそのまま届くので、効果音に紛れさせない
 - 切った所に掛かった場面切り替えは外す（`_cut_clip` 無音カットも同じ） 溶かす相手のつなぎ目が無くなり、
   欠片を残すと 1 コマの溶けが並ぶ 付け直しは `smooth_cuts`
 - 本人の設定 `Preferences.ripple_layers`（`表示 → 設定…` 既定は入り）で切れる コアの既定は偽で、

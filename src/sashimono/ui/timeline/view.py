@@ -59,6 +59,7 @@ from sashimono.core.commands.edit import (
     DEFAULT_TRACK_HEIGHT,
     MAX_TRACK_HEIGHT,
     MIN_TRACK_HEIGHT,
+    casualty_notice,
     head_room,
     ripple_casualties,
     shifted_track,
@@ -2272,12 +2273,9 @@ class TimelineView(QWidget):
 
         番組の時間と一緒に消えた字幕や音は、タイムラインの見た目だけでは気付きにくい
         """
-        lost = ripple_casualties(before, self._project, tuple(removed))
-        if lost:
-            self.status_message.emit(
-                f"消した所に掛かっていた別のトラックの {len(lost)} 本も消えました"
-                "（Ctrl+Z で戻せます）"
-            )
+        notice = casualty_notice(ripple_casualties(before, self._project, tuple(removed)))
+        if notice:
+            self.status_message.emit(notice)
 
     def set_ripple_playhead(self, enabled: bool) -> None:
         """削除して詰めたあと再生ヘッドを動かすか 設定（:attr:`Preferences.ripple_playhead`）から"""

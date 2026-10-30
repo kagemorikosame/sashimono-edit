@@ -66,6 +66,7 @@ from sashimono.core.commands import (
     subtitle_wrap_width,
     voice_label,
 )
+from sashimono.core.commands.edit import casualty_notice, ripple_casualties
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
 from sashimono.core.io.library import Library
@@ -1045,7 +1046,19 @@ class SubtitlePanel(QWidget):
                     SeamScope(jumps_only=True),
                 )
             )
+        before = self._project
         self.commands_requested.emit(commands, f"無音カット: {len(ranges)} か所")
+        # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
+        # 断られたら作品は変わらないので何も数えない
+        asked = tuple(
+            clip.id
+            for track in before.timeline.tracks
+            for clip in track.clips
+            if clip.media_id == media.id
+        )
+        notice = casualty_notice(ripple_casualties(before, self._project, asked))
+        if notice:
+            self.status_message.emit(notice)
 
     def _plan(
         self, media: MediaItem, options: SilenceOptions, protect: bool

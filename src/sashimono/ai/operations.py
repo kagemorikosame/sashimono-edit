@@ -5024,8 +5024,14 @@ def _lost_clips(
                 "start_frame": clip.timeline_start,
                 "end_frame": clip.timeline_end,
             }
+            # 字幕は見る人にそのまま届くので見分けられるようにする 本文は返さない
+            | ({"subtitle": True} if clip.subtitle_origin is not None else {})
             for track, clip in others[:_SKIPPED_SHOWN]
         ]
+        burned = sum(1 for _, clip in others if clip.subtitle_origin is not None)
+        if burned:
+            answer["subtitles_removed"] = burned
+            notes.append(f"焼き込んだ字幕 {burned} 本が消えました")
         notes.append(
             f"切った範囲の中にあった別のクリップ {len(others)} 本も消えました removed_clips の"
             "フレームは切る前の位置です 残すなら取り消して別のトラックをロックします"
@@ -6229,6 +6235,16 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         commands.append(SmoothCuts(frames, style, transition, jumps))
         result["smoothing"] = _seam_result(plan, style, clip_ids=False)
     host.apply_commands(commands, f"無音カット: {len(ranges)} か所")
+    # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
+    asked = tuple(
+        clip.id
+        for track in project.timeline.tracks
+        for clip in track.clips
+        if clip.media_id == media.id
+    )
+    notes = _lost_clips(project, _project(host), asked, result)
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 

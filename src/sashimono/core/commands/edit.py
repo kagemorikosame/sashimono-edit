@@ -64,6 +64,7 @@ __all__ = [
     "TrimClip",
     "TrimClips",
     "TrimRoom",
+    "casualty_notice",
     "head_room",
     "ripple_casualties",
     "ripple_moves_layers",
@@ -323,6 +324,23 @@ def ripple_casualties(
         for clip in track.clips
         if clip.id not in asked and after.timeline.locate_clip(clip.id) is None
     ]
+
+
+def casualty_notice(lost: list[tuple[Track, Clip]]) -> str:
+    """一緒に消えた物を人へ知らせる文 無ければ空
+
+    字幕の焼き込みを文の頭に出す 字幕が欠けると見る人にそのまま届くのに、効果音と同じ
+    数に紛れると見落とす
+    """
+    if not lost:
+        return ""
+    burned = sum(1 for _, clip in lost if clip.subtitle_origin is not None)
+    if burned:
+        return (
+            f"焼き込んだ字幕 {burned} 本も消えました"
+            f"（消した所に掛かっていた別のトラックの {len(lost)} 本のうち Ctrl+Z で戻せます）"
+        )
+    return f"消した所に掛かっていた別のトラックの {len(lost)} 本も消えました（Ctrl+Z で戻せます）"
 
 
 def _ripple_out(project: Project, targets: list[tuple[TrackId, Clip]]) -> Project:

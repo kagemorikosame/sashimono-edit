@@ -26,7 +26,17 @@ from sashimono.core.commands import (
     SetWorkArea,
     TrimClip,
 )
-from sashimono.core.model import AnimatedValue, Clip, MediaItem, Project, Transcript
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    MediaItem,
+    Project,
+    SegmentId,
+    SubtitleOrigin,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
@@ -419,6 +429,65 @@ class TestJetCut:
         assert commands[0].ranges == ((3, 27),)
         assert "無音カット" in label
         widget.deleteLater()
+
+    @staticmethod
+    def _cut(
+        placed: Project, monkeypatch: pytest.MonkeyPatch, lost: Clip
+    ) -> tuple[list[str], Project]:
+        """無音の所に ``lost`` を重ねた作品を無音カットし、状態の行の文と結果を返す"""
+        track = Track(kind=TrackKind.VIDEO, name="重ね", clips=(lost,))
+        project = placed.with_timeline(
+            replace(placed.timeline, tracks=(*placed.timeline.tracks, track))
+        )
+        widget = SubtitlePanel(project, StubAnalyzer(make_waveform([(0.0, 400), (0.5, 1500)])))
+
+        def apply(commands: list[Command], _label: str) -> None:
+            result = widget._project
+            for command in commands:
+                result = command.apply(result)
+            widget.set_project(result)
+
+        widget.commands_requested.connect(apply)
+        told: list[str] = []
+        widget.status_message.connect(told.append)
+        monkeypatch.setattr(JetCutDialog, "exec", lambda self: 1)
+        widget.jet_cut()
+        result = widget._project
+        widget.deleteLater()
+        return told, result
+
+    def test_a_text_in_the_silence_is_told(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、無音カットで重ねの物が黙って消え、人が気付かない
+        del qt_application
+        title = Clip(timeline_start=10, duration=5, source=TEXT.create(text="札"))
+        told, result = self._cut(placed, monkeypatch, title)
+        assert result.timeline.locate_clip(title.id) is None
+        assert any("別のトラックの 1 本" in message for message in told)
+
+    def test_a_burned_subtitle_is_told_first(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、字幕の焼き込みが欠けたことが効果音と同じ文に紛れて見落とす
+        del qt_application
+        burned = Clip(
+            timeline_start=10,
+            duration=5,
+            source=TEXT.create(text="札"),
+            subtitle_origin=SubtitleOrigin(placed.media[0].id, 1, SegmentId("s1")),
+        )
+        told, _result = self._cut(placed, monkeypatch, burned)
+        assert any(message.startswith("焼き込んだ字幕 1 本") for message in told)
+
+    def test_nothing_lost_tells_nothing(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、ふつうに無音を詰めただけで毎回知らせが出る
+        del qt_application
+        later = Clip(timeline_start=200, duration=5, source=TEXT.create(text="札"))
+        told, _result = self._cut(placed, monkeypatch, later)
+        assert not any("別のトラック" in message for message in told)
 
 
 class TestBurnAndExport:
