@@ -400,6 +400,19 @@ class TestSuggestedThreshold:
         suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
         assert -30.0 < suggestion["threshold_db"] < -12.0
 
+    def test_a_new_waveform_changes_the_answer(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、素材を解析し直した後も、前の波形で決めた値を AI に返す"""
+        host = _voiced(video_media, transcript)
+        host.heard = _mixed()
+        host.stub_waveform = _alternating(-46.0)
+        before = _run(host, "analyze_audio", points=0)["jet_cut"]
+        assert _run(host, "analyze_audio", points=0)["jet_cut"] == before
+        host.stub_waveform = _alternating(-30.0)
+        after = _run(host, "analyze_audio", points=0)["jet_cut"]
+        assert after["threshold_db"] != before["threshold_db"]
+
     def test_a_waveform_still_being_read_is_said_so(
         self, video_media: MediaItem, transcript: Transcript
     ) -> None:

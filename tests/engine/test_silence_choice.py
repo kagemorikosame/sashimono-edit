@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import gc
+from typing import Any
+
 import numpy as np
 import pytest
 
 from sashimono.core.mixing import db_to_ratio
+from sashimono.engine.audio import silence
 from sashimono.engine.audio.silence import (
     SilenceOptions,
     choose_silence,
@@ -221,3 +225,80 @@ class TestFromTheWaveform:
         assert best is not None
         found = detect_silence(waveform, SilenceOptions(threshold_db=best.threshold_db))
         assert best.cuts == len(found)
+
+
+class TestAskingAgain:
+    """勧める値は波形ごとに覚える 画面のスレッドで動くので、呼ぶたびに数えると長い素材で止まる"""
+
+    @pytest.fixture
+    def counted(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        calls: list[float] = []
+        real = silence.choose_silence
+
+        def counting(peaks: np.ndarray, *args: Any, **kwargs: Any) -> Any:
+            calls.append(float(peaks.size))
+            return real(peaks, *args, **kwargs)
+
+        monkeypatch.setattr(silence, "choose_silence", counting)
+        return calls
+
+    def test_the_same_waveform_is_counted_once(self, counted: list[float]) -> None:
+        """壊れると、analyze_audio を呼ぶたびに長い素材で画面が止まる"""
+        waveform = _waveform(*[(-12.0, 100), (-46.0, 100)] * 10)
+        first = suggest_silence(waveform, 0.5, 0.1)
+        assert suggest_silence(waveform, 0.5, 0.1) == first
+        assert len(counted) == 1
+
+    def test_a_new_waveform_is_counted_again(self, counted: list[float]) -> None:
+        """壊れると、素材が変わった後も前の素材の値を勧める"""
+        loud = suggest_silence(_waveform(*[(-12.0, 100), (-30.0, 100)] * 10), 0.5, 0.1)
+        quiet = suggest_silence(_waveform(*[(-12.0, 100), (-46.0, 100)] * 10), 0.5, 0.1)
+        assert loud[0] is not None
+        assert quiet[0] is not None
+        assert loud[0].threshold_db != quiet[0].threshold_db
+        assert len(counted) == 2
+
+    def test_a_waveform_with_the_same_values_is_not_mixed_up(self, counted: list[float]) -> None:
+        """壊れると、解析し直した波形を中身で比べて遅くなるか、ピークの配列で落ちる"""
+        runs = [(-12.0, 100), (-46.0, 100)] * 10
+        assert suggest_silence(_waveform(*runs), 0.5, 0.1) == suggest_silence(
+            _waveform(*runs), 0.5, 0.1
+        )
+        assert len(counted) == 2
+
+    def test_a_freed_waveform_does_not_answer_for_the_next(self, counted: list[float]) -> None:
+        """壊れると、捨てた波形の番号を次の波形が引き継いだとき、前の素材の値を返す"""
+        for floor in (-30.0, -46.0, -30.0, -46.0):
+            waveform = _waveform(*[(-12.0, 100), (floor, 100)] * 10)
+            best, _nearby = suggest_silence(waveform, 0.5, 0.1)
+            assert best is not None
+            assert floor < best.threshold_db <= floor + 2
+            del waveform
+            gc.collect()
+        assert len(counted) == 4
+
+    def test_another_length_is_counted_again(self, counted: list[float]) -> None:
+        """壊れると、最短の無音や余白を変えても前の長さの見込みを返す"""
+        waveform = _waveform(*[(-12.0, 100), (-46.0, 60)] * 10)
+        short = suggest_silence(waveform, 0.3, 0.1)
+        long = suggest_silence(waveform, 0.5, 0.1)
+        padded = suggest_silence(waveform, 0.3, 0.2)
+        assert short[0] is not None
+        assert long[0] is None
+        assert padded[0] is None or padded != short
+        assert len(counted) == 3
+
+    def test_no_value_is_remembered_too(self, counted: list[float]) -> None:
+        """壊れると、勧める値の無い長い素材で呼ぶたびに数え直す"""
+        waveform = _waveform((-14.0, 500))
+        assert suggest_silence(waveform, 0.5, 0.1) == (None, ())
+        assert suggest_silence(waveform, 0.5, 0.1) == (None, ())
+        assert len(counted) == 1
+
+    def test_the_memory_does_not_grow(self, counted: list[float]) -> None:
+        """壊れると、素材を次々開いたときに覚えた値が増え続ける"""
+        kept = [_waveform((-14.0, 20)) for _ in range(40)]
+        for waveform in kept:
+            suggest_silence(waveform, 0.5, 0.1)
+        assert len(counted) == 40
+        assert len(silence._SUGGESTED) <= silence._SUGGESTED_LIMIT

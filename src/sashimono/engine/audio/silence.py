@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import math
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from fractions import Fraction
 
@@ -130,6 +132,21 @@ _SPEECH_GAP_DB = 15.0
 #: 勧める値の前後に並べる幅（dB）
 _NEARBY_DB = 3
 
+#: 勧める値と前後の見込み
+type _Suggestion = tuple[SilenceChoice | None, tuple[SilenceChoice, ...]]
+
+#: 覚える答えの数 同じ作品を調べ直す間は 1 本目の素材の答えが残れば足りる
+_SUGGESTED_LIMIT = 32
+#: 波形・最短の無音・余白ごとの答え 画面の波形の絵（``ui/timeline/painter.py``）と同じく波形は
+#: 弱参照で持ち、取り出すときに同じ物かを確かめる 番号だけで引くと、捨てた波形の番号を次の
+#: 素材が引き継いだときに前の素材の値を返す 中身では比べない ピークの配列は比べると重く、
+#: ``Waveform`` はハッシュできない 素材を解析し直せば別の波形になるので、古い値は引かれない
+#: 2 時間の素材で数えると 0.4 秒ほど掛かり、道具は画面のスレッドで動くので、呼ぶたびに数えない
+#: 触るのも画面のスレッドだけなので鍵は持たない
+_SUGGESTED: OrderedDict[tuple[int, float, float], tuple[weakref.ref[Waveform], _Suggestion]] = (
+    OrderedDict()
+)
+
 
 def _quiet_cuts(
     peaks: np.ndarray, times: np.ndarray, threshold_db: float, min_silence: float, padding: float
@@ -154,7 +171,7 @@ def choose_silence(
     *,
     total: float = math.inf,
     group: int = 1,
-) -> tuple[SilenceChoice | None, tuple[SilenceChoice, ...]]:
+) -> _Suggestion:
     """音の山の推移（``tick`` 秒ごとの dBFS）から、無音カットの勧めるしきい値を選ぶ
 
     前後の値で切れる見込みも返す 勧められなければ ``(None, ())`` ``total`` は音の長さ（秒）
@@ -199,20 +216,24 @@ def choose_silence(
     return (choice(clean), around(clean)) if choice(clean).cuts else (None, ())
 
 
-def suggest_silence(
-    waveform: Waveform, min_silence: float, padding: float
-) -> tuple[SilenceChoice | None, tuple[SilenceChoice, ...]]:
+def suggest_silence(waveform: Waveform, min_silence: float, padding: float) -> _Suggestion:
     """素材の波形から無音カットの勧めるしきい値を選ぶ（:func:`choose_silence`）
 
     :func:`detect_silence` と同じ波形の音の山で見る タイムラインの混ぜた音で決めると、BGM や
     クリップの音量の分だけ素材の音とずれ、同じ値が別の所を切る
+    答えは波形ごとに覚える（:data:`_SUGGESTED`）
     """
     level = waveform.levels[0]
     if level.count == 0:
         return None, ()
+    key = (id(waveform), min_silence, padding)
+    entry = _SUGGESTED.get(key)
+    if entry is not None and entry[0]() is waveform:
+        _SUGGESTED.move_to_end(key)
+        return entry[1]
     per_peak = level.samples_per_peak / waveform.sample_rate
     peaks = 20.0 * np.log10(np.maximum(_loudness(waveform), 10.0 ** (_FLOOR_DB / 20.0)))
-    return choose_silence(
+    answer = choose_silence(
         peaks,
         per_peak,
         min_silence,
@@ -220,6 +241,11 @@ def suggest_silence(
         total=float(waveform.duration),
         group=max(1, round(_CHOICE_TICK_SECONDS / per_peak)),
     )
+    _SUGGESTED[key] = (weakref.ref(waveform), answer)
+    _SUGGESTED.move_to_end(key)
+    while len(_SUGGESTED) > _SUGGESTED_LIMIT:
+        _SUGGESTED.popitem(last=False)
+    return answer
 
 
 def keep_speech(
