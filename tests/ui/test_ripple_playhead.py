@@ -355,6 +355,17 @@ class TestPreferences:
         assert dialog.preferences().ripple_playhead is True
 
 
+class TestClosingTheWindow:
+    def test_a_waiting_assistant_is_let_go(self, qt_application: QApplication) -> None:
+        # 壊れると、閉じた窓の字幕起こしを AI が待つ秒の上限まで待ち続ける（#413）
+        window = _open(qt_application, _project(Track(TrackKind.VIDEO, "V1", (_text(0, 30),))))
+        waiter = window.transcription_waiter()
+        window._subtitles._settled.clear()
+        assert not waiter(0.0)
+        window.close()
+        assert waiter(0.0)
+
+
 class TestLayersFollow:
     """削除して詰めるとき、別のトラックの重ねの層も動かす設定（#413）"""
 

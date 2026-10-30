@@ -297,7 +297,12 @@ from sashimono.core.model import (
     TranscriptSegment,
     heard_stream,
 )
-from sashimono.core.projection import heard_timeline, project_timeline, source_seconds_at
+from sashimono.core.projection import (
+    heard_timeline,
+    project_timeline,
+    source_seconds_at,
+    subtitle_stream,
+)
 from sashimono.core.reframe import (
     CENTER,
     REFRAME_FOLLOWS,
@@ -421,7 +426,6 @@ from sashimono.engine.checks.profile import (
     SoundProfile,
     SoundSegment,
     classify,
-    suggest_silence,
 )
 from sashimono.engine.checks.profile import SILENCE as SOUND_SILENCE
 from sashimono.engine.checks.report import CheckReport, ClipIndex
@@ -4236,21 +4240,55 @@ def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
     def answer(state: CheckState) -> object:
         heard = _heard(host, request, state)
         return _sound_numbers(
-            request, heard, arguments, points, silence_db, min_silence, listing=listing
+            host, request, heard, arguments, points, silence_db, min_silence, listing=listing
         )
 
     return _after_sound(host, wait, answer)
 
 
-def _jet_cut_hint(profile: SoundProfile, min_silence: float) -> dict[str, Any]:
-    """jet_cut の threshold_db の勧める値 当てずっぽうで切っては戻すのを防ぐ（#413）"""
-    best, nearby = suggest_silence(profile, min_silence, _JET_CUT_PADDING)
+def _main_sound(project: Project) -> tuple[MediaItem, int | None] | None:
+    """タイムラインで一番長く鳴っている素材とその音声 素材の音が無ければ ``None``"""
+    frames: dict[tuple[MediaId, int | None], int] = {}
+    for track, clip in audible_clips(project):
+        if clip.media_id is not None:
+            key = (clip.media_id, subtitle_stream(project, track, clip))
+            frames[key] = frames.get(key, 0) + clip.duration
+    if not frames:
+        return None
+    media_id, stream = max(frames, key=lambda key: frames[key])
+    media = project.find_media(media_id)
+    return None if media is None else (media, stream)
+
+
+def _jet_cut_hint(host: EditorHost, project: Project, min_silence: float) -> dict[str, Any]:
+    """jet_cut の threshold_db の勧める値 当てずっぽうで切っては戻すのを防ぐ（#413）
+
+    jet_cut が見る物と同じ素材の波形で決める 混ぜた音で決めると、BGM やクリップの音量の分だけ
+    ずれ、同じ値が別の所を切る
+    """
+    main = _main_sound(project)
+    if main is None:
+        return {"threshold_db": None, "note": "タイムラインに素材の音がありません"}
+    media, stream = main
+    named = {"media_id": str(media.id), "audio": _audio_number(media, stream)}
+    waveform = host.waveform(media, stream)
+    if waveform is None:
+        return {
+            **named,
+            "threshold_db": None,
+            "note": "素材の波形の解析がまだ終わっていません もう 1 度呼ぶと読めます",
+        }
+    from sashimono.engine.audio.silence import suggest_silence
+
+    best, nearby = suggest_silence(waveform, min_silence, _JET_CUT_PADDING)
     if best is None:
         return {
+            **named,
             "threshold_db": None,
             "note": "話と間の音量の差が見分けられません 切れる無音は少なそうです",
         }
     return {
+        **named,
         "threshold_db": best.threshold_db,
         "min_silence": min_silence,
         "cuts": best.cuts,
@@ -4260,14 +4298,16 @@ def _jet_cut_hint(profile: SoundProfile, min_silence: float) -> dict[str, Any]:
             for row in nearby
         ],
         "note": (
-            "素材の音量のままの見込み jet_cut は音の山で見るので silences の silence_db とは"
-            "数が合わない 字幕があると既定の keep_speech が字幕のある区間を残すので、切れる数は"
+            "タイムラインで一番長く鳴っている素材の、素材全体の音の見込み jet_cut と同じ波形の"
+            "音の山で見るので silences の silence_db とは数が合わない タイムラインに置いていない"
+            "所も数える 字幕があると既定の keep_speech が字幕のある区間を残すので、切れる数は"
             "減る 字幕の中の間も詰めるなら keep_speech を false にする"
         ),
     }
 
 
 def _sound_numbers(
+    host: EditorHost,
     request: CheckRequest,
     heard: _Heard,
     arguments: dict[str, Any],
@@ -4303,7 +4343,7 @@ def _sound_numbers(
     }
     if project is not None:
         head |= {"from_frame": request.start, "to_frame": request.end, "scene": request.scene}
-        head["jet_cut"] = _jet_cut_hint(profile, min_silence)
+        head["jet_cut"] = _jet_cut_hint(host, project, min_silence)
     else:
         head["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
 
@@ -4618,7 +4658,9 @@ def _set_resolution(host: EditorHost, arguments: dict[str, Any]) -> object:
 MAX_PLACE_RANGES = 200
 
 
-def _media_spans(media: MediaItem, arguments: dict[str, Any]) -> list[tuple[Fraction, Fraction]]:
+def _media_spans(
+    project: Project, media: MediaItem, arguments: dict[str, Any]
+) -> list[tuple[Fraction, Fraction]]:
     """引数 ``ranges`` を素材の秒の組へ 素材の外や逆向きの区間は、丸めずに断る
 
     丸めて受けると、頼んだのと違う所が置かれたことに AI も人も気付かない
@@ -4631,19 +4673,28 @@ def _media_spans(media: MediaItem, arguments: dict[str, Any]) -> list[tuple[Frac
         raise ToolError(f"ranges は {MAX_PLACE_RANGES} 個までです（{len(raw)} 個来ました）")
     if media.is_still or media.duration <= 0:
         raise ToolError(f"{media.name} は静止画か長さの無い素材なので、一部だけは置けません")
-    limit = float(media.duration)
+    whole = Fraction(media.duration)
+    limit = float(whole)
     spans: list[tuple[Fraction, Fraction]] = []
     for index, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ToolError(f"ranges の {index + 1} 個目は組で渡してください")
         start = _optional_number(entry, "start_seconds", 0.0, limit)
         end = _optional_number(entry, "end_seconds", 0.0, limit)
-        if start is None or end is None or end <= start:
+        if start is None or end is None:
             raise ToolError(
-                f"ranges の {index + 1} 個目は start_seconds より後の end_seconds が要ります"
+                f"ranges の {index + 1} 個目は start_seconds と end_seconds の両方が要ります"
             )
         # ミリ秒で区切る 浮動小数のまま分数にすると分母が膨らみ、保存した作品が読みにくくなる
-        spans.append((Fraction(round(start * 1000), 1000), Fraction(round(end * 1000), 1000)))
+        # 丸めると素材の終わりをわずかに越えうるので、素材の長さで抑える
+        span = Fraction(round(start * 1000), 1000), min(Fraction(round(end * 1000), 1000), whole)
+        # 確かめは丸めた後の長さで見る 1 フレームに届かない区間は、置くと 1 フレームへ膨らむ
+        if seconds_to_frame(span[1] - span[0], project.rate, Rounding.NEAREST) < 1:
+            raise ToolError(
+                f"ranges の {index + 1} 個目は start_seconds より 1 フレーム以上後の"
+                " end_seconds が要ります"
+            )
+        spans.append(span)
     return spans
 
 
@@ -4652,7 +4703,7 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     media = _require_media(project, str(arguments.get("media_id", "")))
     at_frame = arguments.get("at_frame")
     if "ranges" in arguments:
-        return _place_spans(host, media, _media_spans(media, arguments), at_frame)
+        return _place_spans(host, media, _media_spans(project, media, arguments), at_frame)
     commands = insert_media(
         project,
         _with_known_video_end(host, media),
@@ -4680,7 +4731,6 @@ def _place_spans(
         at_frame=project.duration if at_frame is None else _integer_value(at_frame, "at_frame"),
         split_audio=host.splits_media,
     )
-    host.apply_commands(commands, f"配置: {media.name}（{len(spans)} か所）")
     parts: dict[int, dict[str, Any]] = {}
     for command in commands:
         if isinstance(command, AddClip):
@@ -4690,6 +4740,10 @@ def _place_spans(
                 {"start": clip.timeline_start, "duration": clip.duration, "clip_ids": []},
             )
             part["clip_ids"].append(str(clip.id))
+    if not parts:
+        # 積む前に断る 素材の登録だけが履歴に残らないように
+        raise ToolError(f"{media.name} には置ける絵も音もありません")
+    host.apply_commands(commands, f"配置: {media.name}（{len(spans)} か所）")
     return {
         "placed": media.name,
         "clips": list(parts.values()),
@@ -4907,23 +4961,64 @@ def _ripple_answer(
     ``before`` は消す前の作品 重ねの層が付いてきたかを AI が読めないと、ずれたまま先へ進むか、
     見に行くのに手数を使う（#413）
     """
-    follows = host.ripple_follows_layers
-    followed = follows and any(ripple_moves_layers(before, clip_id) for clip_id in clip_ids)
-    answer: dict[str, object] = {"layers_followed": followed}
+    after = _project(host)
+    own: set[TrackId] = set()
+    heads: list[int] = []
+    for clip_id in clip_ids:
+        located = before.timeline.locate_clip(clip_id)
+        if located is None:
+            continue
+        track, clip = located
+        heads.append(clip.timeline_start)
+        own.add(track.id)
+        if clip.link_group is not None:
+            own.update(t.id for t, _ in before.timeline.linked_clips(clip.link_group))
+    moved, left = _moved_tracks(before, after, own, min(heads, default=0))
+    answer: dict[str, object] = {
+        "layers_followed": bool(moved),
+        "tracks_moved": moved,
+        "tracks_left": left,
+    }
     notes: list[str] = []
-    if not followed:
-        reason = "同じ時間に別の絵や音が残るので、" if follows else "本人の設定で切ってあるので、"
+    if left:
+        if not host.ripple_follows_layers:
+            reason = "本人の設定で切ってあるので、"
+        elif not any(ripple_moves_layers(before, clip_id) for clip_id in clip_ids):
+            reason = "同じ時間に別の絵や音が残るので、"
+        else:
+            reason = "ロックしているか中身が消した所をまたぐので、"
         notes.append(
-            f"{reason}別のトラックの字幕と重ねの層は動かしていません"
-            " 全部のトラックから同じ所を切るなら cut_range を使います"
+            f"{reason}tracks_left のトラックは動かしていません 同じ所を切るなら cut_range を"
+            "使います（ロックしたトラックは切れません）"
         )
-    removed = (_transition_ids(before) - _transition_ids(_project(host))) - set(clip_ids)
+    removed = (_transition_ids(before) - _transition_ids(after)) - set(clip_ids)
     if removed:
         answer["transitions_removed"] = len(removed)
         notes.append(_SEAM_AGAIN_NOTE)
     if notes:
         answer["note"] = " ".join(notes)
     return answer
+
+
+def _moved_tracks(
+    before: Project, after: Project, own: set[TrackId], start: int
+) -> tuple[list[str], list[str]]:
+    """``own`` の外のトラックのうち、動いた物と、``start`` より後ろに中身を残して動かなかった物
+
+    答えは実際の差で決める 動く見込みの判定だけで答えると、ロックして動かなかった字幕まで
+    動いたと読み、AI がずれたまま先へ進む
+    """
+    moved: list[str] = []
+    left: list[str] = []
+    for track in before.timeline.tracks:
+        if track.id in own:
+            continue
+        now = after.timeline.find_track(track.id)
+        if now is not None and now.clips != track.clips:
+            moved.append(str(track.id))
+        elif any(clip.timeline_end > start for clip in track.clips):
+            left.append(str(track.id))
+    return moved, left
 
 
 def _removal(host: EditorHost, clip_ids: tuple[ClipId, ...], ripple: bool) -> dict[str, object]:
@@ -4991,10 +5086,22 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
         "removed_seconds": round(float(length * project.rate.frame_duration), 2),
         "duration_frames": _project(host).duration,
     }
+    notes: list[str] = []
+    # ロックしたトラックは切れない 切れたと読むと、そこだけずれたまま先へ進む
+    left = [
+        str(track.id)
+        for track in project.timeline.tracks
+        if track.locked and any(clip.timeline_end > start for clip in track.clips)
+    ]
+    if left:
+        result["tracks_left"] = left
+        notes.append("tracks_left のトラックはロックしているので切っていません")
     removed = _transition_ids(project) - _transition_ids(_project(host))
     if removed:
         result["transitions_removed"] = len(removed)
-        result["note"] = _SEAM_AGAIN_NOTE
+        notes.append(_SEAM_AGAIN_NOTE)
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 
@@ -9337,8 +9444,8 @@ _TRANSCRIPTION_WAIT = (
 #: 消す道具の説明 delete_clip と delete_clips で同じ
 _DELETE_NOTE = (
     "{} ripple を真にすると後ろを詰める 番組の時間が抜けるとき（同じ時間に別の絵が残らないとき）は"
-    "別のトラックの字幕・テロップ・場面切り替えも動かす（本人の設定 答えの layers_followed で"
-    "読める） 曲がまたいだトラックは動かさない"
+    "別のトラックの字幕・テロップ・場面切り替えも動かす（本人の設定） 曲がまたいだトラックと"
+    "ロックしたトラックは動かさない 答えの tracks_moved と tracks_left で読める"
 )
 #: つなぎ目の処理の引数 smooth_cuts と jet_cut（smooth）で同じ
 _SEAM_ARGUMENTS: dict[str, Any] = {
@@ -10110,8 +10217,10 @@ OPERATIONS: tuple[Operation, ...] = (
             " check_output と同じ解析を使い回す 同じ範囲を前に調べていれば読み直さない"
             " 長い作品は裏で調べ、終わっていなければ wait_seconds まで待ち、それでも終わらなければ"
             "調べた所までを返す（complete が false 同じ引数でもう 1 度呼ぶと続きを返す）"
-            " タイムラインなら jet_cut に、無音カットの threshold_db の勧める値と切れる見込みを"
-            "返す 絵で見るなら audio_graph" + _SOUND_LIMITS_NOTE + PAGING_NOTE
+            " タイムラインなら jet_cut に、一番長く鳴っている素材の元の音で見た無音カットの"
+            " threshold_db の勧める値と切れる見込みを返す 絵で見るなら audio_graph"
+            + _SOUND_LIMITS_NOTE
+            + PAGING_NOTE
         ),
         schema=_schema(
             {

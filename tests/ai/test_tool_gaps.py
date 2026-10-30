@@ -15,7 +15,7 @@ import pytest
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
-from sashimono.core.commands import AddClip, RippleCut
+from sashimono.core.commands import AddClip, RippleCut, SetTrackState
 from sashimono.core.commands.insert import insert_generated, insert_media
 from sashimono.core.mixing import db_to_ratio
 from sashimono.core.model import (
@@ -24,9 +24,12 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     ProjectSettings,
+    Track,
+    TrackKind,
     Transcript,
 )
 from sashimono.effects.sources import TEXT
+from sashimono.engine.audio.waveform import PeakLevel, Waveform
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
 from sashimono.engine.checks.report import HIGH, MEDIUM, assemble
@@ -207,6 +210,9 @@ class TestPlaceParts:
             "1-2",
             [{"start_seconds": 2, "end_seconds": 1}],
             [{"start_seconds": 2, "end_seconds": 2}],
+            # 丸めると長さが無くなる区間と、1 フレームに届かない区間
+            [{"start_seconds": 2, "end_seconds": 2.0001}],
+            [{"start_seconds": 2, "end_seconds": 2.01}],
             [{"start_seconds": -1, "end_seconds": 1}],
             [{"start_seconds": 9, "end_seconds": 11}],
             [{"start_seconds": 1}],
@@ -333,15 +339,24 @@ class TestOneRowPerLine:
         assert len(result["subtitles"]) == 2 * len(transcript.segments)
 
 
-def _alternating(floor_db: float) -> SoundProfile:
-    """話（-12 dBFS）と間（``floor_db``）が 1 秒ずつ交互の音の推移"""
-    rng = np.random.default_rng(1)
+def _mixed() -> SoundProfile:
+    """タイムラインの混ぜた音の推移 勧める値は読まないので、中身は何でもよい"""
     profiler = SoundProfiler(RATE, 2)
-    for index in range(20):
-        level = -12.0 if index % 2 == 0 else floor_db
-        noise = rng.uniform(-1.0, 1.0, (RATE, 2)).astype(np.float32)
-        profiler.add(noise * db_to_ratio(level))
+    profiler.add(np.full((RATE, 2), 0.1, dtype=np.float32))
     return profiler.snapshot()
+
+
+def _alternating(floor_db: float) -> Waveform:
+    """話（-12 dBFS）と間（``floor_db``）が 1 秒ずつ交互の素材の波形 1 秒は 100 ピーク"""
+    levels = np.repeat([db_to_ratio(-12.0), db_to_ratio(floor_db)], 100)
+    amplitude = np.tile(levels, 10).astype(np.float32)
+    peaks = np.stack([-amplitude, amplitude], axis=-1)[:, np.newaxis, :]
+    return Waveform(
+        sample_rate=48000,
+        channels=1,
+        total_samples=20 * 48000,
+        levels=(PeakLevel(480, peaks),),
+    )
 
 
 class TestSuggestedThreshold:
@@ -350,9 +365,11 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、AI が threshold_db を当てずっぽうで振り、切っては戻すを繰り返す"""
         host = _voiced(video_media, transcript)
-        host.heard = _alternating(-46.0)
+        host.heard = _mixed()
+        host.stub_waveform = _alternating(-46.0)
         suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
         assert -46.0 < suggestion["threshold_db"] < -12.0
+        assert suggestion["media_id"] == str(host.project.media[0].id)
         # 間の 10 か所のうち、終わりの間の 1 秒も含めて全部を切れる
         assert suggestion["cuts"] == 10
         assert suggestion["seconds"] == pytest.approx(8.0, abs=1.0)
@@ -365,9 +382,30 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、切る所の無い音にも値を勧め、AI が曲の途中を切る"""
         host = _voiced(video_media, transcript)
-        host.heard = _alternating(-12.0)
+        host.heard = _mixed()
+        host.stub_waveform = _alternating(-12.0)
         result = _run(host, "analyze_audio", points=0)
         assert result["jet_cut"]["threshold_db"] is None
+
+    def test_a_clip_turned_down_does_not_change_the_value(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、混ぜた音で決めた値を jet_cut が素材の音へ当て、別の所を切る"""
+        host = _voiced(video_media, transcript)
+        host.heard = _mixed()
+        host.stub_waveform = _alternating(-30.0)
+        suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
+        assert -30.0 < suggestion["threshold_db"] < -12.0
+
+    def test_a_waveform_still_being_read_is_said_so(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、解析の途中を「切れる無音が無い」と読む"""
+        host = _voiced(video_media, transcript)
+        host.heard = _mixed()
+        result = _run(host, "analyze_audio", points=0)
+        assert result["jet_cut"]["threshold_db"] is None
+        assert "波形" in result["jet_cut"]["note"]
 
 
 class TestSameValueOnManyClips:
@@ -487,6 +525,55 @@ class TestCutRange:
         _run(host, "cut_range", start_frame=0, end_frame=30)
         host.undo()
         assert host.project == before
+
+
+class TestWhatTheAnswerSays:
+    @staticmethod
+    def _work(
+        video_media: MediaItem, audio_media: MediaItem
+    ) -> tuple[FakeHost, Clip, Track, Track]:
+        """映像 2 本と、後ろの字幕のトラックと、全体をまたぐ BGM のトラックの作品"""
+        project = Project.create(
+            ProjectSettings(frame_rate=RATE_30), media=(video_media, audio_media)
+        )
+        first = make_clip(0, 100, video_media)
+        second = make_clip(100, 100, video_media)
+        title = Clip(timeline_start=150, duration=10, source=TEXT.create(text="札"))
+        picture = Track(kind=TrackKind.VIDEO, name="V1", clips=(first, second))
+        words = Track(kind=TrackKind.VIDEO, name="字幕", clips=(title,))
+        music = Track(kind=TrackKind.AUDIO, name="BGM", clips=(make_clip(0, 200, audio_media),))
+        project = project.with_timeline(replace(project.timeline, tracks=(picture, words, music)))
+        return FakeHost(project), first, words, music
+
+    def test_a_track_left_behind_is_named(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、BGM が動かないことも字幕が動いたことも AI に見えない"""
+        host, first, words, music = self._work(video_media, audio_media)
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is True
+        assert result["tracks_moved"] == [str(words.id)]
+        assert result["tracks_left"] == [str(music.id)]
+
+    def test_a_locked_subtitle_track_is_not_called_followed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、ロックして動かなかった字幕を動いたと答え、AI がずれたまま進む"""
+        host, first, words, music = self._work(video_media, audio_media)
+        host.apply_commands([SetTrackState(words.id, locked=True)], "ロック")
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["layers_followed"] is False
+        assert set(result["tracks_left"]) == {str(words.id), str(music.id)}
+        assert "cut_range" in result["note"]
+
+    def test_cut_range_names_the_locked_track(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、ロックして切れなかったトラックを切ったと読み、そこだけずれる"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([SetTrackState(words.id, locked=True)], "ロック")
+        result = _run(host, "cut_range", start_frame=0, end_frame=30)
+        assert result["tracks_left"] == [str(words.id)]
 
 
 class TestDeleteFollowsTheLayers:

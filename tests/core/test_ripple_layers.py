@@ -211,6 +211,28 @@ class TestWhatFollows:
         project = _with_track(plain.project, Track(kind=TrackKind.AUDIO, name="BGM"), first, second)
         assert _at(plain.cut_middle(project), second) == (250, 50)
 
+    def test_a_sound_inside_the_gap_does_not_hold_the_track(
+        self, plain: _Plain, audio_media: MediaItem
+    ) -> None:
+        """壊れると、消す範囲の中で終わる効果音 1 つのせいで、後ろの効果音が絵からずれる"""
+        inside = make_clip(150, 20, audio_media)
+        later = make_clip(250, 10, audio_media)
+        track = Track(kind=TrackKind.AUDIO, name="効果音")
+        after = plain.cut_middle(_with_track(plain.project, track, inside, later))
+        assert _at(after, inside) is None
+        assert _at(after, later) == (150, 10)
+
+    def test_a_sound_ending_in_the_gap_is_shortened(
+        self, plain: _Plain, audio_media: MediaItem
+    ) -> None:
+        """壊れると、消した時間へ掛かった音が残り、後ろの音が動けずにずれる"""
+        tail = make_clip(50, 100, audio_media)
+        later = make_clip(250, 10, audio_media)
+        track = Track(kind=TrackKind.AUDIO, name="効果音")
+        after = plain.cut_middle(_with_track(plain.project, track, tail, later))
+        assert _at(after, tail) == (50, 50)
+        assert _at(after, later) == (150, 10)
+
     def test_a_linked_partner_of_the_stayed_track_stays(
         self, plain: _Plain, video_media: MediaItem, audio_media: MediaItem
     ) -> None:
@@ -253,6 +275,24 @@ class TestWhenTheProgrammeGoesOn:
         assert not ripple_moves_layers(project, over.id)
         after = RemoveClip(over.id, ripple=True, layers=True).apply(project)
         assert _at(after, text) == (200, 20)
+
+    def test_a_disabled_picture_is_not_the_programme(
+        self, plain: _Plain, video_media: MediaItem
+    ) -> None:
+        """壊れると、映っていない絵のせいで字幕が付いてこず、消した絵とずれる"""
+        over = replace(make_clip(120, 30, video_media), enabled=False)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        project, text = _text_track(project, 220, 10)
+        assert _at(plain.cut_middle(project), text) == (120, 10)
+
+    def test_a_muted_track_is_not_the_programme(
+        self, plain: _Plain, video_media: MediaItem
+    ) -> None:
+        """壊れると、隠したトラックの絵のせいで字幕が付いてこず、消した絵とずれる"""
+        over = make_clip(120, 30, video_media)
+        track = Track(kind=TrackKind.VIDEO, name="V2", muted=True)
+        project, text = _text_track(_with_track(plain.project, track, over), 220, 10)
+        assert _at(plain.cut_middle(project), text) == (120, 10)
 
     def test_a_sound_under_other_sound_does_not_pull(
         self, plain: _Plain, audio_media: MediaItem

@@ -152,10 +152,10 @@ class TestFromTheAssistant:
         # 知らせが立った時には結果が作品へ入っている
         assert _texts(host.project, first, 1) == ["録画 の音声 1"]
 
-    def test_closing_lets_the_waiter_go(
+    def test_releasing_lets_the_waiter_go(
         self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
     ) -> None:
-        # 壊れると、閉じた窓の起こしを AI が待つ秒の上限まで待ち続ける
+        # 壊れると、放しても待ちが続く 窓を閉じる道は tests/ui/test_ripple_playhead.py が見る
         panel, _host, first, _second = setup
         speaker.gate.clear()
         panel.start_transcription(first.id, "tiny", audio_stream=1)

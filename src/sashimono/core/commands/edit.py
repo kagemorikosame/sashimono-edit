@@ -289,8 +289,14 @@ def _programme_gap(project: Project, targets: list[tuple[TrackId, Clip]]) -> boo
         project.draws_picture(_require_track(project, track_id), clip) for track_id, clip in targets
     )
     for track in project.timeline.tracks:
+        # 隠したトラックと無効のクリップは番組に出ていない 数えると、映っていない絵のせいで
+        # 字幕が付いてこず、消した絵とずれる
+        if track.muted:
+            continue
         for clip in track.clips:
-            if clip.id in own or not clip.overlaps(start, end) or not _content(clip):
+            if clip.id in own or not clip.enabled:
+                continue
+            if not clip.overlaps(start, end) or not _content(clip):
                 continue
             if not picture or project.draws_picture(track, clip):
                 return False
@@ -303,17 +309,21 @@ def _content(clip: Clip) -> bool:
 
 
 def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) -> set[TrackId]:
-    """詰めないトラック 消す範囲を中身がまたいでいる物と、その後ろのリンクとグループの仲間
+    """詰めないトラック ロックした物、消す範囲の前後へまたいだ中身がある物、それらの仲間
 
-    中身をまたいでいるトラックを動かすと、続きの曲が前の曲へ重なって削除ごと断られるか、
-    またいだ BGM の途中が切れて音が飛ぶ またいだ物だけを残して後ろを動かす手も無い
-    仲間も残すのは、片方だけ動くと映像と音声が黙ってずれるため
+    前後へまたいだ物があるトラックを動かすと、またいだ BGM の途中が切れて音が飛ぶ またいだ物
+    だけを残して後ろを動かすと、続きの曲が前の曲へ重なって削除ごと断られる
+    範囲の中で終わる・始まる音は消す時間の音なので、そこだけを切って後ろと一緒に動かす
+    まで止めると、効果音 1 つのせいで後ろの効果音が絵からずれる
+    リンクとグループの仲間も残すのは、片方だけ動くと映像と音声が黙ってずれるため
     """
-    held = {
-        track.id
-        for track in tracks
-        if track.locked or any(_content(clip) and clip.overlaps(start, end) for clip in track.clips)
-    }
+
+    def spans(clip: Clip) -> bool:
+        # 頭や終わりが範囲とそろった BGM もまたいだ物に数える 頭を切っただけで曲の頭が欠ける
+        covers = clip.timeline_start <= start and clip.timeline_end >= end
+        return _content(clip) and covers and clip.duration > end - start
+
+    held = {track.id for track in tracks if track.locked or any(spans(c) for c in track.clips)}
     timeline = project.timeline
     frontier = list(held)
     while frontier:
