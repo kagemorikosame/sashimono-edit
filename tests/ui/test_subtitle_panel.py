@@ -432,10 +432,13 @@ class TestJetCut:
 
     @staticmethod
     def _cut(
-        placed: Project, monkeypatch: pytest.MonkeyPatch, lost: Clip
+        placed: Project,
+        monkeypatch: pytest.MonkeyPatch,
+        lost: Clip,
+        kind: TrackKind = TrackKind.VIDEO,
     ) -> tuple[list[str], Project]:
         """無音の所に ``lost`` を重ねた作品を無音カットし、状態の行の文と結果を返す"""
-        track = Track(kind=TrackKind.VIDEO, name="重ね", clips=(lost,))
+        track = Track(kind=kind, name="重ね", clips=(lost,))
         project = placed.with_timeline(
             replace(placed.timeline, tracks=(*placed.timeline.tracks, track))
         )
@@ -479,6 +482,20 @@ class TestJetCut:
         )
         told, _result = self._cut(placed, monkeypatch, burned)
         assert any(message.startswith("焼き込んだ字幕 1 本") for message in told)
+
+    def test_another_voice_of_the_same_media_is_told(
+        self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、見ていない音声のクリップが消えても、切った素材の欠片と同じに扱って黙る
+        del qt_application
+        media = placed.media[0]
+        first = media.audio_streams[0]
+        two = replace(media, audio_streams=(first, replace(first, index=first.index + 1)))
+        project = placed.replace_media(two)
+        other = replace(make_clip(10, 5, two), stream_index=first.index + 1)
+        told, result = self._cut(project, monkeypatch, other, TrackKind.AUDIO)
+        assert result.timeline.locate_clip(other.id) is None
+        assert any("別のトラックの 1 本" in message for message in told)
 
     def test_nothing_lost_tells_nothing(
         self, qt_application: QApplication, placed: Project, monkeypatch: pytest.MonkeyPatch

@@ -14,11 +14,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from fractions import Fraction
 
-from sashimono.core.model import Clip, MediaId, Project
+from sashimono.core.model import Clip, ClipId, MediaId, Project, Track
 from sashimono.core.projection import subtitle_voice
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
-__all__ = ["FrameRange", "SourceRange", "merge_ranges", "plan_cuts"]
+__all__ = ["FrameRange", "SourceRange", "cut_targets", "merge_ranges", "plan_cuts"]
 
 #: ソース秒の区間 ``[start, end)``
 type SourceRange = tuple[Fraction, Fraction]
@@ -50,6 +50,13 @@ def plan_cuts(
     ``None`` は音で絞らない（1 本目の意味ではない） 無音を探した音があるなら、呼ぶ側が
     :meth:`MediaItem.transcript_stream` で番号にそろえて渡す
     """
+    ranges: list[FrameRange] = []
+    for _, clip in _cut_clips(project, media_id, stream):
+        ranges.extend(_project_clip(clip, silences, project.rate, min_frames))
+    return merge_ranges(ranges)
+
+
+def _cut_clips(project: Project, media_id: MediaId, stream: int | None) -> list[tuple[Track, Clip]]:
     media = project.find_media(media_id)
     used = [
         (track, clip)
@@ -61,10 +68,16 @@ def plan_cuts(
         wanted = media.transcript_stream(stream)
         hearing = [(t, c) for t, c in used if subtitle_voice(project, t, c, media) == wanted]
         used = hearing or used
-    ranges: list[FrameRange] = []
-    for _, clip in used:
-        ranges.extend(_project_clip(clip, silences, project.rate, min_frames))
-    return merge_ranges(ranges)
+    return used
+
+
+def cut_targets(project: Project, media_id: MediaId, stream: int | None) -> tuple[ClipId, ...]:
+    """:func:`plan_cuts` が切る範囲を決めるのに使うクリップ
+
+    無音カットが頼まれて切る相手 これ以外のクリップが範囲に収まって消えたら、頼んでいない物が
+    消えたことになるので知らせる（:func:`~sashimono.core.commands.edit.ripple_casualties`）
+    """
+    return tuple(clip.id for _, clip in _cut_clips(project, media_id, stream))
 
 
 def _project_clip(

@@ -39,6 +39,21 @@ class TestTheKnee:
             best.threshold_db + 3,
         ]
 
+    def test_mostly_pauses_still_get_a_value(self) -> None:
+        """壊れると、間が中央値になる素材で探す範囲が間の音量で止まり、値を勧められない"""
+        peaks = _ticks(*[(-12.0, 10), (-40.0, 24)] * 20)
+        assert float(np.median(peaks)) == -40.0
+        best, _nearby = choose_silence(peaks, _TICK, 0.5, 0.1)
+        assert best is not None
+        assert -40.0 < best.threshold_db <= -38.0
+
+    def test_music_with_quiet_passages_has_no_value(self) -> None:
+        """壊れると、探す範囲を広げたせいで、強弱のある曲の弱い所を間と読んで切る"""
+        assert choose_silence(_ticks(*[(-14.0, 40), (-20.0, 40)] * 10), _TICK, 0.5, 0.1) == (
+            None,
+            (),
+        )
+
     def test_steady_sound_has_no_value(self) -> None:
         """壊れると、鳴り続ける曲の音量を間と読み、曲の途中を切る"""
         assert choose_silence(_ticks((-14.0, 300)), _TICK, 0.5, 0.1) == (None, ())
@@ -85,6 +100,20 @@ class TestDigitalSilence:
 
 
 class TestFromTheWaveform:
+    def test_a_short_last_pause_is_counted_by_its_real_length(self) -> None:
+        """壊れると、末尾の半端な区切りを丸ごと数え、jet_cut が切らない間まで見込みに入る"""
+        loud, quiet = db_to_ratio(-12.0), db_to_ratio(-46.0)
+        levels = np.tile(np.repeat([loud, quiet], 100), 10)
+        # 最後の間は 0.65 秒 余白を引くと 0.45 秒で最短の 0.5 秒に届かない
+        amplitude = np.concatenate([levels, np.full(100, loud), np.full(65, quiet)])
+        amplitude = amplitude.astype(np.float32)
+        peaks = np.stack([-amplitude, amplitude], axis=-1)[:, np.newaxis, :]
+        waveform = Waveform(48000, 1, amplitude.size * 480, (PeakLevel(480, peaks),))
+        best, _nearby = suggest_silence(waveform, 0.5, 0.1)
+        assert best is not None
+        found = detect_silence(waveform, SilenceOptions(threshold_db=best.threshold_db))
+        assert best.cuts == len(found)
+
     @pytest.mark.parametrize("pause_db", [-46.0, -30.0])
     def test_it_agrees_with_what_jet_cut_finds(self, pause_db: float) -> None:
         """壊れると、見込みの数と jet_cut が実際に切る数が食い違う"""

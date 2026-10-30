@@ -253,7 +253,7 @@ from sashimono.core.io.atomic import Expected, expect_now
 from sashimono.core.io.presets import Preset
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
-from sashimono.core.jetcut import merge_ranges, plan_cuts
+from sashimono.core.jetcut import cut_targets, merge_ranges, plan_cuts
 from sashimono.core.mixing import (
     DEFAULT_PEAK_CEILING_DB,
     DUCK_ATTACK_MS_RANGE,
@@ -4965,10 +4965,11 @@ def _ripple_answer(
         own.add(track.id)
         if clip.link_group is not None:
             own.update(t.id for t, _ in before.timeline.linked_clips(clip.link_group))
-    moved, left = _moved_tracks(before, after, own, min(heads, default=0))
+    first = min(heads, default=0)
+    moved, left = _moved_tracks(before, after, own, first)
     answer: dict[str, object] = {
         # 字幕と重ねの層が残らず付いてきたか BGM が切れただけでは真にしない
-        "layers_followed": _layers_followed(before, moved, left),
+        "layers_followed": _layers_followed(before, after, moved, left, first),
         "tracks_moved": moved,
         "tracks_left": left,
     }
@@ -4990,16 +4991,34 @@ def _ripple_answer(
     return answer
 
 
-def _layers_followed(before: Project, moved: list[str], left: list[str]) -> bool:
-    """動いたトラックに字幕か重ねの層があり、置いていかれた字幕と重ねの層が無いか"""
+def _is_layer(clip: Clip) -> bool:
+    return clip.media_id is None and clip.scene_id is None
 
-    def has_layer(track_id: str) -> bool:
+
+def _layers_followed(
+    before: Project, after: Project, moved: list[str], left: list[str], start: int
+) -> bool:
+    """字幕か重ねの層が実際に動き、``start`` より後ろに置いていかれた物が無いか
+
+    トラックに字幕が有るかではなく、動いた字幕が残っているかを見る 字幕が消えただけのトラックや、
+    前の字幕が動かなかっただけのトラックを、付いてきたと読まないため
+    """
+
+    def followed(track_id: str) -> bool:
+        old = before.timeline.find_track(TrackId(track_id))
+        new = after.timeline.find_track(TrackId(track_id))
+        if old is None or new is None:
+            return False
+        was = {clip.id: clip for clip in old.clips}
+        return any(_is_layer(clip) and was.get(clip.id) != clip for clip in new.clips)
+
+    def behind(track_id: str) -> bool:
         track = before.timeline.find_track(TrackId(track_id))
         return track is not None and any(
-            clip.media_id is None and clip.scene_id is None for clip in track.clips
+            _is_layer(clip) and clip.timeline_end > start for clip in track.clips
         )
 
-    return any(map(has_layer, moved)) and not any(map(has_layer, left))
+    return any(map(followed, moved)) and not any(map(behind, left))
 
 
 def _lost_clips(
@@ -6236,12 +6255,7 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
         result["smoothing"] = _seam_result(plan, style, clip_ids=False)
     host.apply_commands(commands, f"無音カット: {len(ranges)} か所")
     # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
-    asked = tuple(
-        clip.id
-        for track in project.timeline.tracks
-        for clip in track.clips
-        if clip.media_id == media.id
-    )
+    asked = cut_targets(project, media.id, media.transcript_stream(stream))
     notes = _lost_clips(project, _project(host), asked, result)
     if notes:
         result["note"] = " ".join(notes)

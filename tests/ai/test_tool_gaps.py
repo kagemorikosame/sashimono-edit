@@ -599,6 +599,52 @@ class TestWhatTheAnswerSays:
         assert result["clips_removed"] == 1
         assert result["removed_clips"][0]["track_id"] == str(words.id)
 
+    def test_a_title_lost_in_the_gap_is_not_called_followed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、字幕が消えただけのトラックを、付いてきたと読む"""
+        host, first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([RemoveClip(host.project.timeline.tracks[1].clips[0].id)], "空に")
+        title = Clip(timeline_start=50, duration=10, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, title)], "字幕")
+        result = _run(host, "delete_clip", clip_id=str(first.id), ripple=True)
+        assert result["clips_removed"] == 1
+        assert result["layers_followed"] is False
+
+    def test_a_title_before_the_gap_is_not_called_followed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、動いていない前の字幕を理由に、消えた字幕のトラックを付いてきたと読む"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        title = Clip(timeline_start=50, duration=10, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, title)], "字幕")
+        second = host.project.timeline.tracks[0].clips[1]
+        result = _run(host, "delete_clip", clip_id=str(second.id), ripple=True)
+        assert str(words.id) in result["tracks_moved"]
+        assert result["layers_followed"] is False
+
+    def test_a_title_before_the_gap_on_a_stayed_track_does_not_count_as_left(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、置いていかれていない前の字幕のせいで、付いてきた字幕まで偽と答える"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        later = Clip(timeline_start=250, duration=10, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, later)], "後ろの字幕")
+        # BGM をまたがせて動かないトラックにする 字幕は消す所より前にあり、置いていかれていない
+        track = Track(
+            kind=TrackKind.MIXED,
+            name="重ね",
+            clips=(
+                Clip(timeline_start=5, duration=3, source=TEXT.create(text="札")),
+                make_clip(50, 150, audio_media),
+            ),
+        )
+        host.apply_commands([AddTrack(track)], "重ね")
+        second = host.project.timeline.tracks[0].clips[1]
+        result = _run(host, "delete_clip", clip_id=str(second.id), ripple=True)
+        assert str(track.id) in result["tracks_left"]
+        assert result["layers_followed"] is True
+
     def test_only_music_cut_is_not_called_followed(
         self, video_media: MediaItem, audio_media: MediaItem
     ) -> None:
@@ -722,6 +768,21 @@ class TestJetCutSaysWhatWentWithIt:
         assert result["subtitles_removed"] == 1
         assert result["removed_clips"][0]["subtitle"] is True
         assert "字幕" in result["note"]
+
+    def test_another_voice_of_the_same_media_is_listed(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、見ていない音声のクリップが消えても、切った素材の欠片と同じに扱って黙る"""
+        first = video_media.audio_streams[0]
+        media = replace(video_media, audio_streams=(first, replace(first, index=2)))
+        voice = Track(kind=TrackKind.AUDIO, name="A1", clips=(make_clip(0, 300, media),))
+        other = replace(make_clip(60, 5, media), stream_index=2)
+        second = Track(kind=TrackKind.AUDIO, name="A2", clips=(other,))
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(media,))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(voice, second))))
+        host.stub_waveform = make_waveform([(0.5, 300), (0.0, 200), (0.5, 5500)])
+        result = _run(host, "jet_cut", media_id=str(media.id), audio=1, keep_speech=False)
+        assert [row["clip_id"] for row in result["removed_clips"]] == [str(other.id)]
 
     def test_the_cut_media_is_not_counted(
         self, video_media: MediaItem, audio_media: MediaItem
