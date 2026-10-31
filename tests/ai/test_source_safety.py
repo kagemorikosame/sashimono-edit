@@ -83,6 +83,7 @@ UNDOABLE_TOOLS = frozenset(
         "move_clips",
         "delete_clip",
         "delete_clips",
+        "cut_range",
         "jet_cut",
         # つなぎ目（#332） 場面切り替えを置き、拡大率と音量フェードの欄を変えるだけ
         "smooth_cuts",

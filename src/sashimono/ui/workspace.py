@@ -664,6 +664,9 @@ class Preferences:
     #: 再生中に消したときは、止めずに頭から続ける（末尾に着いたら続きが無いので止める）
     #: 動いてほしくない人は切れば今までどおり
     ripple_playhead: bool = True
+    #: 削除して詰めるとき、別のトラックの字幕・重ねの層も同じだけ詰めるか（#413） 切ると前の動き
+    #: （消したクリップのトラックだけが詰まる）に戻る 既定は入り 切れたままだと字幕がずれる
+    ripple_layers: bool = True
     #: AI アシスタントの完成物の検査（#337）が比べる音量の基準（LUFS） 選べるのは
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
@@ -1114,6 +1117,7 @@ class PreferenceStore:
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
             ai_plan_first=_flag(data.get("ai_plan_first"), plain.ai_plan_first),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
+            ripple_layers=_flag(data.get("ripple_layers"), plain.ripple_layers),
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),

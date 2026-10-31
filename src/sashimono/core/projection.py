@@ -160,10 +160,24 @@ def project_timeline(project: Project) -> Iterator[ProjectedSubtitle]:
 
     同じ素材を複数回置けば、字幕もその回数だけ現れる これは意図した挙動で、
     素材を使い回したときに字幕が片方にしか出ないことの方が驚きが大きい
+
+    同じ時刻に同じ字幕が出る物は 1 つにする リンクした映像と音声はどちらも同じ素材の同じ所を
+    指すので、そのままだと字幕の一覧も字幕のファイルも同じ行が 2 回ずつ並ぶ（#413）
     """
     projected = list(_project_tracks(project, project.timeline, 0))
     projected.sort(key=lambda p: (p.start_frame, p.end_frame))
-    yield from projected
+    seen: set[tuple[object, ...]] = set()
+    for subtitle in projected:
+        key = (
+            subtitle.media_id,
+            subtitle.stream,
+            subtitle.segment.id,
+            subtitle.start_frame,
+            subtitle.end_frame,
+        )
+        if key not in seen:
+            seen.add(key)
+            yield subtitle
 
 
 def heard_timeline(project: Project) -> Iterator[ProjectedSubtitle]:

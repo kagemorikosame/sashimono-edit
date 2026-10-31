@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from itertools import accumulate
 
 from sashimono.core.commands.base import Command
 from sashimono.core.model import (
+    TRANSITION_KIND,
     AnimatedValue,
     Blending,
     Clip,
@@ -19,6 +22,7 @@ from sashimono.core.model import (
     Effect,
     GroupId,
     LayerMode,
+    Marker,
     MediaId,
     MediaItem,
     ParamValue,
@@ -32,6 +36,7 @@ from sashimono.core.model import (
     new_clip_id,
     new_group_id,
 )
+from sashimono.core.projection import sounding
 
 __all__ = [
     "STOP_LOCKED",
@@ -53,6 +58,7 @@ __all__ = [
     "RenameProject",
     "RenameTrack",
     "RippleCut",
+    "RippleReport",
     "SetBlending",
     "SetLayerMode",
     "SetResolution",
@@ -63,7 +69,11 @@ __all__ = [
     "TrimClip",
     "TrimClips",
     "TrimRoom",
+    "casualty_notice",
     "head_room",
+    "ripple_casualties",
+    "ripple_gaps",
+    "ripple_report",
     "shifted_track",
     "tail_room",
     "trimmable",
@@ -205,10 +215,16 @@ class RemoveClip(Command):
 
     ``ripple`` が真なら、同じトラックの後続クリップを詰める リンクされた
     映像・音声も同時に削除される
+
+    ``layers`` は詰めるときに別のトラックの重ねの層も動かすか（本人の設定
+    ``Preferences.ripple_layers`` から渡す） 動かす相手と動かさない相手は
+    :func:`_pull_layers` が決める コアの既定は偽 既定を真にすると、渡し忘れた入口が
+    画面と違う動きをする
     """
 
     clip_id: ClipId
     ripple: bool = False
+    layers: bool = False
 
     @property
     def label(self) -> str:
@@ -228,6 +244,8 @@ class RemoveClip(Command):
             locked = _require_track(project, track_id)
             if locked.locked:
                 raise ValueError(f"トラック {locked.name!r} はロックされている")
+        if self.ripple and self.layers:
+            return _ripple_out(project, targets)
         timeline = project.timeline
         for track_id, target in targets:
             track = _require_track(project, track_id)
@@ -242,6 +260,325 @@ class RemoveClip(Command):
             timeline = timeline.replace_track(track.with_clips(tuple(remaining)))
             project = project.with_timeline(timeline)
         return project
+
+
+def _clip_span(targets: list[tuple[TrackId, Clip]]) -> tuple[int, int]:
+    return (
+        min(clip.timeline_start for _, clip in targets),
+        max(clip.timeline_end for _, clip in targets),
+    )
+
+
+def _gathered(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[TrackId, Clip]]:
+    """消すクリップとリンクの相手 同じクリップは 1 度だけ
+
+    索引を 1 回だけ作る クリップごとに探すと、何百本も選んだときに選んだ数とタイムラインの
+    本数の掛け算になり、削除の間に編集画面が止まる
+    """
+    known: dict[ClipId, tuple[TrackId, Clip]] = {}
+    linked: dict[GroupId, list[tuple[TrackId, Clip]]] = {}
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            known[clip.id] = (track.id, clip)
+            if clip.link_group is not None:
+                linked.setdefault(clip.link_group, []).append((track.id, clip))
+    found: dict[ClipId, tuple[TrackId, Clip]] = {}
+    for clip_id in clip_ids:
+        entry = known.get(clip_id)
+        if entry is not None:
+            group = entry[1].link_group
+            for member in [entry] if group is None else linked[group]:
+                found.setdefault(member[1].id, member)
+    return list(found.values())
+
+
+def _cuts(
+    targets: list[tuple[TrackId, Clip]],
+) -> list[tuple[tuple[int, int], list[tuple[TrackId, Clip]]]]:
+    """消すクリップを、時間のつながった塊ごとに分ける 後ろの塊から順に返す
+
+    重なった別々のクリップを 1 本ずつ判定すると、消す相手の片方が「残る絵」に数えられて
+    字幕が付いてこず、トラックごとに詰める量もずれる 塊ごとに 1 回の切りとして見る
+    後ろから返すのは、前を詰めると後ろの塊の時刻がずれるため
+    """
+    cuts: list[tuple[tuple[int, int], list[tuple[TrackId, Clip]]]] = []
+    for item in sorted(targets, key=lambda entry: entry[1].timeline_start):
+        start, end = item[1].timeline_start, item[1].timeline_end
+        if cuts and start <= cuts[-1][0][1]:
+            (first, last), members = cuts[-1]
+            cuts[-1] = ((first, max(last, end)), members)
+            members.append(item)
+        else:
+            cuts.append(((start, end), [item]))
+    return cuts[::-1]
+
+
+def ripple_gaps(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[int, int]]:
+    """``clip_ids`` を一緒に詰めて消すと番組の時間が抜ける範囲 前の範囲から順に"""
+    cuts = _cuts(_gathered(project, clip_ids))
+    return [span for span, members in reversed(cuts) if _programme_gap(project, members)]
+
+
+@dataclass(frozen=True, slots=True)
+class RippleReport:
+    """詰めて消した後の、別のトラックの様子（:func:`ripple_report`）"""
+
+    #: クリップが正しい位置へ動いたトラック
+    moved: tuple[TrackId, ...]
+    #: 番組の時間に付いてこられなかったクリップがあるトラック 1 本が両方に入ることもある
+    left: tuple[TrackId, ...]
+    #: 字幕と重ねの層の結果 真は動いた、偽は置いていかれた物がある、``None`` は動かす物が無かった
+    layers_followed: bool | None
+
+
+def ripple_report(before: Project, after: Project, clip_ids: tuple[ClipId, ...]) -> RippleReport:
+    """詰めて消す前と後を比べて、別のトラックのクリップがどうなったかを答える
+
+    決まりは 1 つ 番組の時間が抜けた範囲（:func:`ripple_gaps`）から、クリップごとに居るべき
+    位置が決まる そこに居れば付いてきた、居なければ置いていかれた 動く見込みやトラック単位で
+    判定しないので、ロック・曲のまたぎ・設定の切り・範囲が 2 つある場合を分けなくてよい
+    消えたクリップは数えない（:func:`ripple_casualties`） またいで割れた後ろの片割れは新しい
+    ID を持ち、消した所の後ろから詰まってきた物として動いたに数える 消したクリップと同じ
+    トラックは詰まるのが当たり前なので、字幕の結果にだけ数えてトラックの一覧へ出さない
+    """
+    targets = _gathered(before, clip_ids)
+    asked = {clip.id for _, clip in targets}
+    own = {track_id for track_id, _ in targets}
+    gaps = ripple_gaps(before, clip_ids)
+
+    def pulled(frame: int) -> int:
+        return frame - sum(min(frame, end) - start for start, end in gaps if start < frame)
+
+    moved: list[TrackId] = []
+    left: list[TrackId] = []
+    layers: set[bool] = set()
+
+    def note(found: list[TrackId], track: Track, clip: Clip, *, went: bool) -> None:
+        if track.id not in own and track.id not in found:
+            found.append(track.id)
+        if not _content(clip):
+            layers.add(went)
+
+    for track in before.timeline.tracks:
+        now = after.timeline.find_track(track.id)
+        if now is None:
+            continue
+        was = {clip.id for clip in track.clips}
+        found = {clip.id: clip for clip in now.clips}
+        for clip in track.clips:
+            new = found.get(clip.id)
+            if new is None or clip.id in asked:
+                continue
+            kept = new.duration == clip.duration
+            wanted = pulled(clip.timeline_end) - pulled(clip.timeline_start)
+            if track.id not in own and (
+                new.timeline_start != pulled(clip.timeline_start)
+                or (kept and wanted != clip.duration)
+            ):
+                note(left, track, clip, went=False)
+            elif new.timeline_start != clip.timeline_start:
+                note(moved, track, clip, went=True)
+        for clip in now.clips:
+            if clip.id not in was:
+                note(moved, track, clip, went=True)
+    followed = None if not layers else False not in layers
+    return RippleReport(tuple(moved), tuple(left), followed)
+
+
+def ripple_casualties(
+    before: Project, after: Project, clip_ids: tuple[ClipId, ...]
+) -> list[tuple[Track, Clip]]:
+    """詰めて消したときに、頼んでいないのに一緒に消えたクリップ ``before`` の中の位置で返す
+
+    消す範囲の中のテキストや音は、番組の時間と一緒に無くなる（:func:`_pull_layers`）
+    頼んだクリップとリンクの相手は数えない 切って短くなっただけの物も数えない（ID が残る）
+    黙って消えると AI も人も気付かないので、道具の答えと状態の行で知らせる
+    """
+    asked = {clip.id for _, clip in _gathered(before, clip_ids)}
+    remaining = {clip.id for track in after.timeline.tracks for clip in track.clips}
+    return [
+        (track, clip)
+        for track in before.timeline.tracks
+        for clip in track.clips
+        if clip.id not in asked and clip.id not in remaining
+    ]
+
+
+def casualty_notice(lost: list[tuple[Track, Clip]]) -> str:
+    """一緒に消えた物を人へ知らせる文 無ければ空
+
+    字幕の焼き込みを文の頭に出す 字幕が欠けると見る人にそのまま届くのに、効果音と同じ
+    数に紛れると見落とす
+    """
+    if not lost:
+        return ""
+    burned = sum(1 for _, clip in lost if clip.subtitle_origin is not None)
+    if burned:
+        return (
+            f"焼き込んだ字幕 {burned} 本も消えました"
+            f"（消した所に掛かっていた別のトラックの {len(lost)} 本のうち Ctrl+Z で戻せます）"
+        )
+    return f"消した所に掛かっていた別のトラックの {len(lost)} 本も消えました（Ctrl+Z で戻せます）"
+
+
+def _ripple_out(project: Project, targets: list[tuple[TrackId, Clip]]) -> Project:
+    """``targets`` を詰めて消す 番組の時間が抜ける塊は全部のトラックを 1 回の切りにする
+
+    絵が続く塊は前と同じく消したクリップのトラックだけを詰める
+    """
+    for (start, end), members in _cuts(targets):
+        if _programme_gap(project, members):
+            project = _pull_layers(_without(project, members), members, start, end)
+            continue
+        for _, clip in sorted(members, key=lambda item: item[1].timeline_start, reverse=True):
+            if project.timeline.locate_clip(clip.id) is not None:
+                project = RemoveClip(clip.id, ripple=True).apply(project)
+    return project
+
+
+def _without(project: Project, members: list[tuple[TrackId, Clip]]) -> Project:
+    gone = {clip.id for _, clip in members}
+    timeline = project.timeline
+    for track_id in {track_id for track_id, _ in members}:
+        track = _require_track(project, track_id)
+        timeline = timeline.replace_track(
+            track.with_clips(tuple(c for c in track.clips if c.id not in gone))
+        )
+    return project.with_timeline(timeline)
+
+
+def _programme_gap(project: Project, targets: list[tuple[TrackId, Clip]]) -> bool:
+    """``targets`` を消すと番組の時間そのものが抜けるか ``project`` は消す前の作品
+
+    抜けるのは、消した範囲に同じ種類の中身が別のトラックに残らないとき 上に重ねた絵を
+    1 枚消したときや効果音を 1 つ消したときは、下の映像が続いているので番組の時間は減らない
+    そこで字幕まで前へ動かすと、話している絵からずれる（前の動きを守る）
+    絵を消したときは絵だけを見る 下に BGM が鳴り続けていても番組の切りに変わりはない
+    残るかは実際に映る・鳴る物で見る（:func:`_on_air`）
+    """
+    if not any(_content(clip) for _, clip in targets):
+        # 上に重ねた字幕やテロップを消しただけでは番組の時間は減らない
+        return False
+    start, end = _clip_span(targets)
+    own = {clip.id for _, clip in targets}
+    picture = any(
+        project.draws_picture(_require_track(project, track_id), clip) for track_id, clip in targets
+    )
+    shown, heard = _on_air(project)
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            if clip.id in own or not clip.overlaps(start, end) or not _content(clip):
+                continue
+            if clip.id in shown or (not picture and clip.id in heard):
+                return False
+    return True
+
+
+def _on_air(project: Project) -> tuple[set[ClipId], set[ClipId]]:
+    """実際に映るクリップと鳴るクリップ ミュート・ソロ・無効を描く側とミキサと同じ決まりで見る
+
+    自前でミュートだけを見ると、ソロで映っていない絵のせいで字幕が付いてこず、消した絵とずれる
+    ソロは絵と音で別に効くので、音のトラックをソロにしても絵は消えない
+    """
+    timeline = project.timeline
+    shown = {
+        clip.id
+        for track in timeline.active_picture_tracks()
+        for clip in track.clips
+        if clip.enabled and project.draws_picture(track, clip)
+    }
+    return shown, {clip.id for _, clip in sounding(project, timeline)}
+
+
+def _content(clip: Clip) -> bool:
+    """番組の中身か 素材とシーンが中身で、テキスト・図形・場面切り替えは上に重ねる物"""
+    return clip.media_id is not None or clip.scene_id is not None
+
+
+def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) -> set[TrackId]:
+    """詰めないトラック ロックした物、消す範囲の前後へまたいだ中身がある物、それらの仲間
+
+    前後へまたいだ物があるトラックを動かすと、またいだ BGM の途中が切れて音が飛ぶ またいだ物
+    だけを残して後ろを動かすと、続きの曲が前の曲へ重なって削除ごと断られる
+    範囲の中で終わる・始まる音は消す時間の音なので、そこだけを切って後ろと一緒に動かす
+    まで止めると、効果音 1 つのせいで後ろの効果音が絵からずれる
+    リンクとグループの仲間も残すのは、片方だけ動くと映像と音声が黙ってずれるため
+    """
+
+    shown, heard = _on_air(project)
+
+    def spans(clip: Clip) -> bool:
+        # 頭や終わりが範囲とそろった BGM もまたいだ物に数える 頭を切っただけで曲の頭が欠ける
+        covers = clip.timeline_start <= start and clip.timeline_end >= end
+        # 映らず鳴らない物は、後ろの物を止める理由にしない（:func:`_programme_gap` と同じ）
+        on_air = clip.id in shown or clip.id in heard
+        return _content(clip) and on_air and covers and clip.duration > end - start
+
+    held = {track.id for track in tracks if track.locked or any(spans(c) for c in track.clips)}
+    timeline = project.timeline
+    frontier = list(held)
+    while frontier:
+        track = timeline.find_track(frontier.pop())
+        if track is None:
+            continue
+        for clip in track.clips:
+            partners: list[tuple[Track, Clip]] = []
+            if clip.link_group is not None:
+                partners.extend(timeline.linked_clips(clip.link_group))
+            if clip.group_id is not None:
+                partners.extend(timeline.grouped_clips(clip.group_id))
+            # 残すクリップが範囲より前でも、仲間が後ろなら仲間を残す 仲間も前なら動かない
+            for partner_track, partner in partners:
+                if partner.timeline_end > start and partner_track.id not in held:
+                    held.add(partner_track.id)
+                    frontier.append(partner_track.id)
+    return held
+
+
+def _pull_layers(
+    project: Project, members: list[tuple[TrackId, Clip]], start: int, end: int
+) -> Project:
+    """``members`` を外した作品の ``[start, end)`` を、全部のトラックから同じだけ詰める
+
+    消したクリップの後ろに合わせて置いた物（場面切り替え・焼き込んだ字幕・テロップ・効果音）が
+    元の時刻に残ると、つなぎ目や話している絵からずれる 通しの確かめで AI が全部を戻す
+    ことになった（#413） ロックしたトラックと、中身が範囲をまたいだトラックは動かさない
+    目印と書き出す範囲も、中身と一緒に動かす
+    """
+    length = end - start
+    own = {track_id for track_id, _ in members}
+    others = [track for track in project.timeline.tracks if track.id not in own]
+    # 消したクリップのトラックは必ず詰める 仲間をたどって残すと、番組の時間が詰まらない
+    held = _held_tracks(project, others, start, end) - own
+    timeline = project.timeline
+    regrouped: dict[GroupId, GroupId] = {}
+    for track in project.timeline.tracks:
+        if track.id in held:
+            continue
+        pieces: list[Clip] = []
+        for clip in track.clips:
+            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped))
+        timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
+    markers = tuple(
+        replace(marker, frame=marker.frame - length) if marker.frame >= end else marker
+        for marker in timeline.markers
+        if not start <= marker.frame < end
+    )
+    return project.with_timeline(
+        replace(timeline, markers=markers, work_area=_pulled_area(timeline.work_area, start, end))
+    )
+
+
+def _pulled_area(area: tuple[int, int] | None, start: int, end: int) -> tuple[int, int] | None:
+    """``[start, end)`` を詰めたときの書き出し範囲 範囲の中身が全部消えたら外す"""
+    if area is None:
+        return None
+
+    def pulled(frame: int) -> int:
+        return frame - (end - start) if frame >= end else min(frame, start)
+
+    low, high = pulled(area[0]), pulled(area[1])
+    return (low, high) if low < high else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +775,8 @@ class RemoveClips(Command):
 
     clip_ids: tuple[ClipId, ...]
     ripple: bool = False
+    #: 詰めるときに別のトラックの重ねの層も動かすか（:class:`RemoveClip` と同じ）
+    layers: bool = False
 
     @property
     def label(self) -> str:
@@ -445,17 +784,24 @@ class RemoveClips(Command):
         return f"{len(self.clip_ids)} 本を削除{suffix}"
 
     def apply(self, project: Project) -> Project:
-        located = [project.timeline.locate_clip(clip_id) for clip_id in self.clip_ids]
-        if any(entry is None for entry in located):
+        known = {clip.id: clip for track in project.timeline.tracks for clip in track.clips}
+        if any(clip_id not in known for clip_id in self.clip_ids):
             raise KeyError("消すクリップの一部が見つからない")
+        if self.ripple and self.layers:
+            targets = _gathered(project, self.clip_ids)
+            for track_id, _ in targets:
+                track = _require_track(project, track_id)
+                if track.locked:
+                    raise ValueError(f"トラック {track.name!r} はロックされている")
+            return _ripple_out(project, targets)
         ordered = sorted(
-            (entry[1] for entry in located if entry is not None),
+            (known[clip_id] for clip_id in self.clip_ids),
             key=lambda clip: clip.timeline_start,
             reverse=True,
         )
         for clip in ordered:
             if project.timeline.locate_clip(clip.id) is not None:
-                project = RemoveClip(clip.id, ripple=self.ripple).apply(project)
+                project = RemoveClip(clip.id, self.ripple, self.layers).apply(project)
         return project
 
 
@@ -1357,19 +1703,20 @@ class RippleCut(Command):
     範囲に掛かったクリップは端が削られ、範囲をまたぐクリップは 2 つに分かれる
     ロックされたトラックには触れない 触れてしまうと、そのトラックだけ長さが
     変わらず、以降すべてがずれる
+
+    ``keep_area`` は書き出す範囲を切った分だけ詰めて残すか 無音カットは飛び飛びに何十か所も
+    切るので外す（前からの動き） 1 か所を切る :func:`cut_range` の道具は残す
     """
 
     ranges: tuple[tuple[int, int], ...]
+    keep_area: bool = False
 
     @property
     def label(self) -> str:
         return f"無音をカット: {len(self.ranges)} か所"
 
     def apply(self, project: Project) -> Project:
-        # 後ろから切る 前から切ると、切るたびに残りの範囲がずれて計算し直しになる
-        for start, end in sorted(_normalized(self.ranges), reverse=True):
-            project = _cut_range(project, start, end)
-        return project
+        return _cut_ranges(project, _normalized(self.ranges), keep_area=self.keep_area)
 
 
 def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
@@ -1383,29 +1730,55 @@ def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
     return merged
 
 
-def _cut_range(project: Project, start: int, end: int) -> Project:
-    """``[start, end)`` を全トラックから取り除き、後ろを詰める"""
-    length = end - start
-    timeline = project.timeline
-    # 範囲をまたいだクリップの右側に配り直すリンクグループ 左右が同じ
-    # グループに残ると、片方を消したときにもう片方まで消える 映像と音声で
-    # 同じ新グループを共有させたいので、この範囲の処理を通して覚えておく
-    regrouped: dict[GroupId, GroupId] = {}
+def _cut_ranges(project: Project, ranges: list[tuple[int, int]], *, keep_area: bool) -> Project:
+    """重ならず並んだ範囲 ``ranges`` を全トラックから取り除き、後ろを詰める
 
+    クリップごとに、前の範囲の長さの合計を 1 回で引く 範囲を 1 つずつ処理すると範囲の数と
+    クリップの数の掛け算だけクリップを作り直し、無音カットの 250 か所で 1 秒を超えて編集画面が
+    止まる（#413） 掛かる範囲だけは後ろから順に :func:`_cut_clip` を通す 後ろから切れば、
+    前の範囲の位置がずれない
+    """
+    if not ranges:
+        return project
+    starts = [start for start, _ in ranges]
+    ends = [end for _, end in ranges]
+    before = list(accumulate((end - start for start, end in ranges), initial=0))
+    # 範囲をまたいだクリップの右側に配り直すリンクグループ 左右が同じグループに残ると、片方を
+    # 消したときにもう片方まで消える 映像と音声で同じ新グループを共有させたいので、範囲ごとに
+    # 全トラックを通して覚えておく
+    regrouped: list[dict[GroupId, GroupId]] = [{} for _ in ranges]
+    timeline = project.timeline
     for track in timeline.tracks:
         if track.locked:
             continue
         pieces: list[Clip] = []
         for clip in track.clips:
-            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped))
+            first = bisect_right(ends, clip.timeline_start)
+            last = bisect_left(starts, clip.timeline_end)
+            parts = [clip]
+            for index in range(last - 1, first - 1, -1):
+                start, end = ranges[index]
+                parts = [
+                    cut
+                    for part in parts
+                    for cut in _cut_clip(project, part, start, end, end - start, regrouped[index])
+                ]
+            pieces.extend(
+                part.moved_to(part.timeline_start - before[first]) if before[first] else part
+                for part in parts
+            )
         timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
 
-    markers = tuple(
-        replace(marker, frame=marker.frame - length) if marker.frame >= end else marker
-        for marker in timeline.markers
-        if not (start <= marker.frame < end)
-    )
-    return project.with_timeline(replace(timeline, markers=markers, work_area=None))
+    markers: list[Marker] = []
+    for marker in timeline.markers:
+        index = bisect_right(ends, marker.frame)
+        if index >= len(ranges) or marker.frame < starts[index]:
+            frame = marker.frame - before[index]
+            markers.append(replace(marker, frame=frame) if frame != marker.frame else marker)
+    area = timeline.work_area if keep_area else None
+    for start, end in reversed(ranges):
+        area = _pulled_area(area, start, end)
+    return project.with_timeline(replace(timeline, markers=tuple(markers), work_area=area))
 
 
 def _cut_clip(
@@ -1421,6 +1794,10 @@ def _cut_clip(
         return [clip]
     if clip.timeline_start >= end:
         return [clip.moved_to(clip.timeline_start - length)]
+    if clip.source is not None and clip.source.kind == TRANSITION_KIND:
+        # 場面切り替えはつなぎ目の前後の絵を溶かす物で、そのつなぎ目は切ると無くなる 残りの
+        # 欠片を置くと 1 コマだけの溶けが並び、そこだけ絵が跳ねる 付け直しは smooth_cuts で
+        return []
 
     head = start - clip.timeline_start
     tail = clip.timeline_end - end

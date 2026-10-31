@@ -67,6 +67,7 @@ __all__ = [
     "media_alone",
     "new_track",
     "place_media",
+    "place_media_spans",
     "with_known_video_end",
     "with_video_end",
 ]
@@ -180,6 +181,39 @@ def place_media(
     return commands
 
 
+def place_media_spans(
+    project: Project,
+    media: MediaItem,
+    spans: Sequence[tuple[Fraction, Fraction]],
+    *,
+    at_frame: int,
+    split_audio: bool = False,
+) -> list[Command]:
+    """素材の一部（素材の秒の組 ``(頭, 終わり)``）を ``at_frame`` から順に隙間なく置く
+
+    長い素材から数か所を取るとき、全体を置いて分割と削除を繰り返すと 1 か所に何回も呼ぶ
+    （通しの確かめで分割を 20 回呼んだ #413） 頼んだ順に並べるので、素材の時刻の順でなくてもよい
+    映像と音声の置き方（``split_audio``）とリンクは :func:`insert_media` と同じ
+    """
+    commands: list[Command] = []
+    cursor = max(0, at_frame)
+    for span in spans:
+        placed = _place(
+            project,
+            media,
+            cursor,
+            _free_picker(project, cursor, None),
+            split_audio=split_audio,
+            span=span,
+        )
+        for command in placed:
+            project = command.apply(project)
+        commands.extend(placed)
+        ends = [c.clip.timeline_end for c in placed if isinstance(c, AddClip)]
+        cursor = max([cursor, *ends])
+    return commands
+
+
 def _place(
     project: Project,
     media: MediaItem,
@@ -187,8 +221,11 @@ def _place(
     pick: _TrackPicker,
     *,
     split_audio: bool,
+    span: tuple[Fraction, Fraction] | None = None,
 ) -> list[Command]:
     """素材を 1 本、``start`` から置くコマンド トラックは ``pick`` が決める
+
+    ``span`` は置く素材の範囲（秒） ``None`` なら全体
 
     混合の方式で音を分けて置くときは、2 本目からの置き先を ``pick`` に尋ねず、
     前に置いたレイヤーの次から探す（:func:`~sashimono.core.commands.layers.layer_after`）
@@ -198,7 +235,12 @@ def _place(
     if project.find_media(media.id) is None:
         commands.append(AddMedia(media))
 
-    duration = _timeline_duration(project, media)
+    source_in = Fraction(0) if span is None else span[0]
+    duration = (
+        _timeline_duration(project, media)
+        if span is None
+        else max(1, seconds_to_frame(span[1] - span[0], project.rate, Rounding.NEAREST))
+    )
     if duration <= 0:
         return commands
 
@@ -215,6 +257,7 @@ def _place(
                 timeline_start=start,
                 duration=duration,
                 media_id=media.id,
+                source_in=source_in,
                 stream_index=media.video_streams[0].index if media.has_video else 0,
                 link_group=group,
                 # 拡大率 100% を素材の画素にする（YMM4・AviUtl と同じ） 画面に収めると、
@@ -236,6 +279,7 @@ def _place(
             timeline_start=start,
             duration=duration,
             media_id=media.id,
+            source_in=source_in,
             stream_index=stream.index,
             link_group=group,
             effects=(default_volume_effect(), fixed_effect(FADE_EFFECT_KIND)),

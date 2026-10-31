@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
@@ -65,10 +66,11 @@ from sashimono.core.commands import (
     subtitle_wrap_width,
     voice_label,
 )
+from sashimono.core.commands.edit import casualty_notice, ripple_casualties
 from sashimono.core.commands.fixed import with_fixed_items
 from sashimono.core.io import SUBTITLE_FILTER, save_subtitles
 from sashimono.core.io.library import Library
-from sashimono.core.jetcut import plan_cuts
+from sashimono.core.jetcut import cut_targets, plan_cuts
 from sashimono.core.model import (
     Clip,
     GeneratedSource,
@@ -89,7 +91,12 @@ from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_spe
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
-from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
+from sashimono.engine.audio.silence import (
+    SilenceOptions,
+    TimeRange,
+    detect_silence,
+    keep_speech,
+)
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.render.look_preview import SAMPLE_TEXT
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -168,6 +175,9 @@ class SubtitlePanel(QWidget):
         #: （:class:`TranscriptionService`）、
         #: 終わった物はどれもその素材と音声の字幕へ取り込む
         self._jobs: list[Job] = []
+        #: 起こしの列が片付いているか（:meth:`transcription_waiter`）
+        self._settled = threading.Event()
+        self._settled.set()
         #: 終わった起こしの知らせ 様子を聞かれたときに並べる
         self._job_notes: list[str] = []
         #: 起こしの知らせに書いた素材の名前と場所 知らせは作品を開き直しても残るので、
@@ -789,6 +799,7 @@ class SubtitlePanel(QWidget):
         options = TranscribeOptions(model=model, audio_stream=stream)
         waiting = self._service.busy
         self._jobs.append(self._service.start(media.id, media.path, options))
+        self._note_jobs()
         self.select_media(media.id)
         if waiting:
             return f"{media.name} の起こしを順番待ちに入れました 前の起こしが終わると始まります"
@@ -802,6 +813,26 @@ class SubtitlePanel(QWidget):
     def transcription_status(self) -> str:
         """走っている起こしの様子"""
         return self.poll_transcription()
+
+    def _note_jobs(self) -> None:
+        """起こしの列の様子を待つ人へ伝える 列を触ったら呼ぶ（編集画面のスレッド）"""
+        if self.transcribing:
+            self._settled.clear()
+        else:
+            self._settled.set()
+
+    def transcription_waiter(self) -> Callable[[float], bool]:
+        """起こしの列が片付くまで待つ関数 AI のスレッドから呼ばれる
+
+        ``_jobs`` を AI のスレッドから読まず、知らせの ``Event`` だけを見る 取り込みは
+        編集画面のスレッドの見張り（:meth:`poll_transcription`）がするので、知らせが立った
+        時には結果が作品へ入っている
+        """
+        return self._settled.wait
+
+    def release_transcription_waiters(self) -> None:
+        """待っている人を放す 窓を閉じるときに呼ぶ"""
+        self._settled.set()
 
     def poll_transcription(self) -> str:
         """AI から始めた起こしの様子を拾い、終わっていれば結果を取り込む
@@ -830,6 +861,7 @@ class SubtitlePanel(QWidget):
                 self._job_notes.append(f"{name}: {message}")
                 break
 
+        self._note_jobs()
         lines = []
         if self._service is not None:
             for job in self._service.jobs():
@@ -897,6 +929,7 @@ class SubtitlePanel(QWidget):
         options = SpeakerOptions(speakers=speakers, audio_stream=stream)
         waiting = self._service.busy
         self._jobs.append(self._service.start_speakers(media.id, media.path, options))
+        self._note_jobs()
         self.select_media(media.id)
         if waiting:
             return f"{media.name} の話者の分離を順番待ちに入れました 前の物が終わると始まります"
@@ -1001,7 +1034,9 @@ class SubtitlePanel(QWidget):
         if not answer:
             return
 
-        ranges = self._plan(media, dialog.options(), dialog.keep_speech)
+        silences = self._silences(media, dialog.options(), dialog.keep_speech)
+        voice = media.transcript_stream(self._stream)
+        ranges = plan_cuts(self._project, media.id, silences, stream=voice)
         if not ranges:
             self.status_message.emit("切る場所が見つかりませんでした")
             return
@@ -1018,14 +1053,29 @@ class SubtitlePanel(QWidget):
                     SeamScope(jumps_only=True),
                 )
             )
+        before = self._project
         self.commands_requested.emit(commands, f"無音カット: {len(ranges)} か所")
+        # 無音の所に重ねた字幕や音は範囲と一緒に消える 切った素材の欠片は頼んだ物なので数えない
+        # 断られたら作品は変わらないので何も数えない
+        asked = cut_targets(before, media.id, silences, stream=voice)
+        notice = casualty_notice(ripple_casualties(before, self._project, asked))
+        if notice:
+            self.status_message.emit(notice)
 
     def _plan(
         self, media: MediaItem, options: SilenceOptions, protect: bool
     ) -> tuple[tuple[int, int], ...]:
         """無音の検出からタイムライン上の切る範囲までを一続きに"""
-        # 見ている音の波形と字幕で決める マイクの声の無音で切りたいときに、ゲームの音で
-        # 決めると切れない
+        silences = self._silences(media, options, protect)
+        # 見ている音が 1 本目（None）でも番号にそろえて渡す None のままだと音で絞らない
+        return plan_cuts(
+            self._project, media.id, silences, stream=media.transcript_stream(self._stream)
+        )
+
+    def _silences(
+        self, media: MediaItem, options: SilenceOptions, protect: bool
+    ) -> tuple[TimeRange, ...]:
+        """見ている音の無音 マイクの声の無音で切りたいときに、ゲームの音で決めると切れない"""
         waveform = self._analyzer.waveform(media, self._stream)
         if waveform is None:
             return ()
@@ -1033,10 +1083,7 @@ class SubtitlePanel(QWidget):
         transcript = media.transcript_for(self._stream)
         if protect and transcript is not None:
             silences = keep_speech(silences, transcript)
-        # 見ている音が 1 本目（None）でも番号にそろえて渡す None のままだと音で絞らない
-        return plan_cuts(
-            self._project, media.id, silences, stream=media.transcript_stream(self._stream)
-        )
+        return silences
 
     def _selected_text(self) -> Clip | None:
         clip = self.template_provider()

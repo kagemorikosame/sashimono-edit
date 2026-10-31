@@ -712,6 +712,9 @@ LEDGER: tuple[Entry, ...] = (
 READING = "人が画面を見て分かることを読む道具"
 _GESTURE = "画面ではドラッグや表の書き込みで行う 台帳はメニュー・右クリック・ボタンだけを数える"
 AI_ONLY: dict[str, str] = {
+    # 範囲を全部のトラックから切る（#413） 画面では範囲の頭と終わりで割って消す 画面の手順の
+    # 道具（split_clip delete_clip）は台帳の行にある
+    "cut_range": "画面では分割と削除を組み合わせる 層がずれないよう 1 回で切れる口を足した",
     "get_project": READING,
     "list_media": READING,
     "list_tracks": READING,

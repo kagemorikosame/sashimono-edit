@@ -112,6 +112,12 @@ class FakeHost:
         self.stub_waveform: Waveform | None = None
         self.probe_result: MediaItem | None = None
         self.transcription = "起こしは走っていません"
+        #: 起こしが走っているふり
+        self.transcribing_now = False
+        #: 待った秒 ``transcription_waiter`` の関数が呼ばれた順
+        self.transcription_waits: list[float] = []
+        #: 本人の設定の「詰めるとき重ねの層も動かす」 既定は設定と同じく動かす
+        self.ripple_layers = True
         self.transcribed_stream: int | None = None
         #: 話者の分離（#323）を頼まれた素材・音声・人数 断らせたいときは理由を入れる
         self.separated: tuple[MediaId, int | None, int | None] | None = None
@@ -243,6 +249,10 @@ class FakeHost:
     @property
     def splits_media(self) -> bool:
         return self.split_audio
+
+    @property
+    def ripple_follows_layers(self) -> bool:
+        return self.ripple_layers
 
     @property
     def subtitle_wrap_share(self) -> int:
@@ -553,6 +563,17 @@ class FakeHost:
 
     def transcription_status(self) -> str:
         return self.transcription
+
+    @property
+    def transcribing(self) -> bool:
+        return self.transcribing_now
+
+    def transcription_waiter(self) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            self.transcription_waits.append(seconds)
+            return not self.transcribing_now
+
+        return wait
 
     def start_speaker_separation(
         self, media_id: MediaId, *, audio_stream: int | None = None, speakers: int | None = None
