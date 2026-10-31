@@ -108,15 +108,15 @@ class TestMinimumVersion:
     def test_the_sdk_bundles_a_claude_code_that_knows_every_listed_model(self) -> None:
         """0.2.152 は Claude Code 2.1.259 を同梱し、Claude Opus 5.5 で断られた
 
-        0.2.158 が 2.1.280 を同梱する最初の版（PyPI の Windows の wheel の _cli_version.py で
-        確かめた） 下限が下がると、入れたばかりの人が Opus 5.5 を選んだ所で断られる
+        下限が下がると、入れたばかりの人が Opus 5.5 を選んだ所で断られる 0.2.174（2.1.310）は
+        本人のメモを止める設定と記録を残さない設定を実物で確かめた版で、下げるとその約束も外れる
         """
         (requirement,) = REQUIRED_PACKAGES
         parsed = Requirement(requirement)
         assert parsed.name == SDK
-        assert Version("0.2.157") not in parsed.specifier
-        assert Version("0.2.158") in parsed.specifier
-        assert Version(MINIMUM_CLAUDE_CODE) >= Version("2.1.280")
+        assert Version("0.2.173") not in parsed.specifier
+        assert Version("0.2.174") in parsed.specifier
+        assert Version(MINIMUM_CLAUDE_CODE) >= Version("2.1.310")
 
     def test_untested_major_versions_are_not_taken(self) -> None:
         # 0.3 で使い方が変わっても、自動の更新が入れて会話が始まらなくなることが無いように
@@ -179,7 +179,7 @@ class TestPackageIndex:
             asked.append(request)
             return io.BytesIO(json.dumps(INDEX).encode())
 
-        latest = latest_release(REQUIRED_PACKAGES[0], opener=opener)
+        latest = latest_release("claude-agent-sdk>=0.2.158,<0.3", opener=opener)
         assert latest is not None
         assert latest.allowed == "0.2.164"
         assert asked[0].full_url == f"https://pypi.org/pypi/{SDK}/json"

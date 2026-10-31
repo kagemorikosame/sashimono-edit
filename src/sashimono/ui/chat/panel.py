@@ -65,6 +65,7 @@ from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
 from sashimono.ai.plan import RESUME_PROMPT, Stopped
 from sashimono.ai.session import (
     LIMIT_DETAIL,
+    LOGIN_DETAIL,
     REINSTALL_HINT,
     UPDATE_PARTS_LABEL,
     AgentEvent,
@@ -98,6 +99,17 @@ BUDGET_STOP_TEXT = "ここで止める"
 #: そのまま出すと ** が本文に混ざる 見出しや表まで組む必要は無い
 _BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _CODE = re.compile(r"`([^`]+)`")
+
+#: ログインがまだに見える人への案内
+_LOGIN_NOT_YET = (
+    "Claude へのログインがまだのようです 「ログイン…」で Claude Code を開き、"
+    "案内に従ってログインしてください 済んだらそのまま指示を送れます"
+    "（API キーを使う場合は環境変数 ANTHROPIC_API_KEY を設定し、ソフトを再起動します）"
+)
+#: ログインの失敗で止まった訳 直し方はエラーの文と案内の箱にあるので、引き継ぎには書かない
+_LOGIN_STOPPED = "Claude へのログインが必要だったため、応えられませんでした"
+#: AI が応えた印 これが来たらログインは通っている
+_ANSWERS = frozenset({EventKind.TEXT, EventKind.THINKING, EventKind.TOOL_USE})
 
 #: 確かめの許すボタンの文言
 ALLOW_TEXT = "許可"
@@ -341,6 +353,10 @@ class ChatPanel(QWidget):
         self._handoff: Handoff | None = None
         #: 止まったときに引き継ぎを欄に出すか（設定） 切っても作って置き、AI は読める
         self._show_handoffs = True
+        #: ログインの失敗を見て、まだ AI が応えていない（#412）
+        self._login_failed = False
+        #: ログインの失敗の後、まだ〔ログイン…〕を押していない 続きを頼むのはその後
+        self._login_waiting = False
 
         # --- 部品が古くて断られたとき ---
         #: いまの指示で「Claude Code が古くて、このモデルを使えない」と断られた
@@ -460,12 +476,7 @@ class ChatPanel(QWidget):
         # ログインは Claude Code 自身の画面で済ませてもらう 鍵やパスワードを
         # このソフトの入力欄で受け取らない
         self._login_box = QFrame(self)
-        self._login_text = QLabel(
-            "Claude へのログインがまだのようです 「ログイン…」で Claude Code を開き、"
-            "案内に従ってログインしてください 済んだらそのまま指示を送れます"
-            "（API キーを使う場合は環境変数 ANTHROPIC_API_KEY を設定し、ソフトを再起動します）",
-            self._login_box,
-        )
+        self._login_text = QLabel(_LOGIN_NOT_YET, self._login_box)
         self._login_text.setWordWrap(True)
         themed_style(self._login_text, lambda: f"color: {Colors.TEXT_MUTED.name()};")
         self._login_button = QPushButton("ログイン…", self._login_box)
@@ -796,7 +807,7 @@ class ChatPanel(QWidget):
         self._input.setEnabled(ready)
         self._send_button.setEnabled(ready)
         # 入っていない間はログインの話をしない 導入の案内と重なって読みにくい
-        self._login_box.setVisible(ready and not credentials_found())
+        self._refresh_login()
         if not ready:
             self._say("案内", status.summary())
 
@@ -868,7 +879,36 @@ class ChatPanel(QWidget):
         except OSError as exc:
             self._say("エラー", f"Claude Code を開けませんでした: {exc}")
             return
-        self._note("Claude Code を別の窓で開きました 案内に従ってログインしてください")
+        self._note(
+            "Claude Code を別の窓で開きました 案内に従ってログインしてください"
+            " ログインが切れている場合は、開いた窓で /login と打ちます"
+        )
+        # 窓でログインし直せば、止まった指示の続きを頼める 済んだかはこちらから確かめられない
+        # ので、押した所で戻す 押さないうちは、頼んでも同じ失敗を繰り返すだけなので出さない
+        # 計画の〔続ける〕も同じ
+        self._login_waiting = False
+        self._handoff_continue.setVisible(True)
+        self._refresh_plan()
+
+    def _refresh_login(self) -> None:
+        """ログインの案内を出し入れする
+
+        置き場に鍵があっても切れていることがあるので、ログインの失敗を見た後は、
+        AI が応えるまで出したままにする
+        """
+        self._login_box.setVisible(
+            self._setup.status.ready and (self._login_failed or not credentials_found())
+        )
+
+    def _set_login_failed(self, guide: str = "") -> None:
+        """ログインの失敗の案内を箱に出す 空なら下げる
+
+        文は会話が選んだ物をそのまま使う ここで決めると、初めての人にも「切れた」と出る
+        """
+        self._login_failed = bool(guide)
+        self._login_waiting = bool(guide)
+        self._login_text.setText(guide or _LOGIN_NOT_YET)
+        self._refresh_login()
 
     # --- モデルと考える深さ ---
 
@@ -1032,7 +1072,7 @@ class ChatPanel(QWidget):
     def _submit(self, prompt: str) -> None:
         """指示を並べて会話へ渡す 入力欄から送った指示も、計画の〔続ける〕も同じ道を通る"""
         # 「ログイン…」から済ませたかもしれない 済んでいれば案内を下げる
-        self._login_box.setVisible(not credentials_found())
+        self._refresh_login()
         # 方式を変えても知らせは来ない 送る前に確かめ、前の指示がすべて終わっていれば
         # 今の方式の説明で会話を作り直す（指示が残っている間は、終わった所で当てる）
         self._restart_when_idle()
@@ -1257,6 +1297,10 @@ class ChatPanel(QWidget):
             # 何か返ってきたら繋がっている 起動の失敗はエラーで来るので数えない
             self._connected = True
 
+        if self._login_failed and event.kind in _ANSWERS:
+            # AI が応えたのでログインは直った 次の失敗まで案内を下げる
+            self._set_login_failed()
+
         if event.kind in (EventKind.TEXT, EventKind.ERROR):
             found = outdated_claude_code(event.text)
             if found is not None:
@@ -1299,7 +1343,12 @@ class ChatPanel(QWidget):
             # 上限（手数・費用）で止まったのは、エラーと分けて引き継ぐ 送り直せば続く
             limited = event.detail == LIMIT_DETAIL
             self._turn_limited = self._turn_limited or limited
-            self._record.stop(StopReason.LIMIT if limited else StopReason.ERROR, event.text)
+            login = event.detail == LOGIN_DETAIL
+            if login:
+                self._set_login_failed(event.text)
+            # ログインの案内は長い エラーの文に全文があるので、引き継ぎには訳だけを書く
+            detail = _LOGIN_STOPPED if login else event.text
+            self._record.stop(StopReason.LIMIT if limited else StopReason.ERROR, detail)
             self._say("エラー", event.text)
             if REINSTALL_HINT in event.text:
                 # 入れ直す所（環境の導入の欄）は、導入済みのときは隠している 出さないと、
@@ -1309,6 +1358,7 @@ class ChatPanel(QWidget):
             self._turns_done += 1
             if event.kind is EventKind.CLOSED and self._turn_started is not None:
                 # 応えている途中で会話が閉じた 続けて送ってあった指示も、もう返ってこない
+                self._turn_error = True
                 self._record.stop(
                     StopReason.DISCONNECTED, "応えている途中で Claude Code との会話が閉じました"
                 )
@@ -1710,7 +1760,7 @@ class ChatPanel(QWidget):
         self._plan_box.show_plan(
             self._plan.view(),
             working=bool(self._queued),
-            ready=self._ready,
+            ready=self._ready and not self._login_waiting,
             plan_on=self._plan_first,
         )
 
@@ -1900,6 +1950,8 @@ class ChatPanel(QWidget):
         self._handoff = handoff
         self._say(HANDOFF_WHO, handoff.text(self._host.document))
         self._handoff_text.setText(f"引き継ぎ: {handoff.headline()}")
+        # ログインが切れたままでは続きを頼んでも同じ失敗になる 先に〔ログイン…〕へ向かわせる
+        self._handoff_continue.setVisible(not self._login_waiting)
         self._handoff_box.setVisible(True)
 
     def _hide_handoff(self) -> None:
