@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
+from itertools import accumulate
 
 from sashimono.core.model import Clip, ClipId, MediaId, Project, Track
 from sashimono.core.projection import subtitle_voice
@@ -50,10 +53,35 @@ def plan_cuts(
     ``None`` は音で絞らない（1 本目の意味ではない） 無音を探した音があるなら、呼ぶ側が
     :meth:`MediaItem.transcript_stream` で番号にそろえて渡す
     """
+    index = _SilenceIndex.of(silences)
     ranges: list[FrameRange] = []
     for _, clip in _cut_clips(project, media_id, stream):
-        ranges.extend(_project_clip(clip, silences, project.rate, min_frames))
+        ranges.extend(_project_clip(clip, index, project.rate, min_frames))
     return merge_ranges(ranges)
+
+
+@dataclass(frozen=True, slots=True)
+class _SilenceIndex:
+    """無音を時刻順に並べ、クリップに掛かる所だけを引く
+
+    クリップごとに無音を全部見ると、250 か所の無音と数百本のクリップの掛け算になる
+    分数の比べは重いので、無音カットの時間の多くをここが占めた（#413）
+    """
+
+    ordered: tuple[SourceRange, ...]
+    starts: tuple[Fraction, ...]
+    #: ここまでの無音の終わりの最大 重なった無音があっても必ず増える並びになる
+    reach: tuple[Fraction, ...]
+
+    @classmethod
+    def of(cls, silences: Sequence[SourceRange]) -> _SilenceIndex:
+        ordered = tuple(sorted(silences))
+        reach = tuple(accumulate((end for _, end in ordered), max))
+        return cls(ordered, tuple(start for start, _ in ordered), reach)
+
+    def within(self, low: Fraction, high: Fraction) -> tuple[SourceRange, ...]:
+        """``[low, high)`` に掛かりうる無音"""
+        return self.ordered[bisect_right(self.reach, low) : bisect_left(self.starts, high)]
 
 
 def _cut_clips(project: Project, media_id: MediaId, stream: int | None) -> list[tuple[Track, Clip]]:
@@ -85,23 +113,24 @@ def cut_targets(
     なるので知らせる（:func:`~sashimono.core.commands.edit.ripple_casualties`）
     無音の範囲を持つだけでは足りない 話している所を含むクリップが丸ごと消えても黙ってしまう
     """
+    index = _SilenceIndex.of(silences)
     return tuple(
         clip.id
         for _, clip in _cut_clips(project, media_id, stream)
-        if merge_ranges(_project_clip(clip, silences, project.rate, min_frames))
+        if merge_ranges(_project_clip(clip, index, project.rate, min_frames))
         == ((clip.timeline_start, clip.timeline_end),)
     )
 
 
 def _project_clip(
-    clip: Clip, silences: Sequence[SourceRange], rate: FrameRate, min_frames: int
+    clip: Clip, silences: _SilenceIndex, rate: FrameRate, min_frames: int
 ) -> list[FrameRange]:
     """1 つのクリップに掛かる無音を、タイムラインのフレーム区間へ"""
     source_in = clip.source_in
     source_out = clip.source_out(rate)
 
     found: list[FrameRange] = []
-    for start, end in silences:
+    for start, end in silences.within(source_in, source_out):
         visible_start = max(start, source_in)
         visible_end = min(end, source_out)
         if visible_end <= visible_start:

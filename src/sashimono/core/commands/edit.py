@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from itertools import accumulate
 
 from sashimono.core.commands.base import Command
 from sashimono.core.model import (
@@ -20,6 +22,7 @@ from sashimono.core.model import (
     Effect,
     GroupId,
     LayerMode,
+    Marker,
     MediaId,
     MediaItem,
     ParamValue,
@@ -1702,10 +1705,7 @@ class RippleCut(Command):
         return f"無音をカット: {len(self.ranges)} か所"
 
     def apply(self, project: Project) -> Project:
-        # 後ろから切る 前から切ると、切るたびに残りの範囲がずれて計算し直しになる
-        for start, end in sorted(_normalized(self.ranges), reverse=True):
-            project = _cut_range(project, start, end, keep_area=self.keep_area)
-        return project
+        return _cut_ranges(project, _normalized(self.ranges), keep_area=self.keep_area)
 
 
 def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
@@ -1719,30 +1719,55 @@ def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
     return merged
 
 
-def _cut_range(project: Project, start: int, end: int, *, keep_area: bool) -> Project:
-    """``[start, end)`` を全トラックから取り除き、後ろを詰める"""
-    length = end - start
-    timeline = project.timeline
-    # 範囲をまたいだクリップの右側に配り直すリンクグループ 左右が同じ
-    # グループに残ると、片方を消したときにもう片方まで消える 映像と音声で
-    # 同じ新グループを共有させたいので、この範囲の処理を通して覚えておく
-    regrouped: dict[GroupId, GroupId] = {}
+def _cut_ranges(project: Project, ranges: list[tuple[int, int]], *, keep_area: bool) -> Project:
+    """重ならず並んだ範囲 ``ranges`` を全トラックから取り除き、後ろを詰める
 
+    クリップごとに、前の範囲の長さの合計を 1 回で引く 範囲を 1 つずつ処理すると範囲の数と
+    クリップの数の掛け算だけクリップを作り直し、無音カットの 250 か所で 1 秒を超えて編集画面が
+    止まる（#413） 掛かる範囲だけは後ろから順に :func:`_cut_clip` を通す 後ろから切れば、
+    前の範囲の位置がずれない
+    """
+    if not ranges:
+        return project
+    starts = [start for start, _ in ranges]
+    ends = [end for _, end in ranges]
+    before = list(accumulate((end - start for start, end in ranges), initial=0))
+    # 範囲をまたいだクリップの右側に配り直すリンクグループ 左右が同じグループに残ると、片方を
+    # 消したときにもう片方まで消える 映像と音声で同じ新グループを共有させたいので、範囲ごとに
+    # 全トラックを通して覚えておく
+    regrouped: list[dict[GroupId, GroupId]] = [{} for _ in ranges]
+    timeline = project.timeline
     for track in timeline.tracks:
         if track.locked:
             continue
         pieces: list[Clip] = []
         for clip in track.clips:
-            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped))
+            first = bisect_right(ends, clip.timeline_start)
+            last = bisect_left(starts, clip.timeline_end)
+            parts = [clip]
+            for index in range(last - 1, first - 1, -1):
+                start, end = ranges[index]
+                parts = [
+                    cut
+                    for part in parts
+                    for cut in _cut_clip(project, part, start, end, end - start, regrouped[index])
+                ]
+            pieces.extend(
+                part.moved_to(part.timeline_start - before[first]) if before[first] else part
+                for part in parts
+            )
         timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
 
-    markers = tuple(
-        replace(marker, frame=marker.frame - length) if marker.frame >= end else marker
-        for marker in timeline.markers
-        if not (start <= marker.frame < end)
-    )
-    area = _pulled_area(timeline.work_area, start, end) if keep_area else None
-    return project.with_timeline(replace(timeline, markers=markers, work_area=area))
+    markers: list[Marker] = []
+    for marker in timeline.markers:
+        index = bisect_right(ends, marker.frame)
+        if index >= len(ranges) or marker.frame < starts[index]:
+            frame = marker.frame - before[index]
+            markers.append(replace(marker, frame=frame) if frame != marker.frame else marker)
+    area = timeline.work_area if keep_area else None
+    for start, end in reversed(ranges):
+        area = _pulled_area(area, start, end)
+    return project.with_timeline(replace(timeline, markers=tuple(markers), work_area=area))
 
 
 def _cut_clip(
