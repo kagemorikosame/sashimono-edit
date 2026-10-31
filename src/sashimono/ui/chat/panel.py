@@ -355,6 +355,8 @@ class ChatPanel(QWidget):
         self._show_handoffs = True
         #: ログインの失敗を見て、まだ AI が応えていない（#412）
         self._login_failed = False
+        #: ログインの失敗の後、まだ〔ログイン…〕を押していない 続きを頼むのはその後
+        self._login_waiting = False
 
         # --- 部品が古くて断られたとき ---
         #: いまの指示で「Claude Code が古くて、このモデルを使えない」と断られた
@@ -883,7 +885,10 @@ class ChatPanel(QWidget):
         )
         # 窓でログインし直せば、止まった指示の続きを頼める 済んだかはこちらから確かめられない
         # ので、押した所で戻す 押さないうちは、頼んでも同じ失敗を繰り返すだけなので出さない
+        # 計画の〔続ける〕も同じ
+        self._login_waiting = False
         self._handoff_continue.setVisible(True)
+        self._refresh_plan()
 
     def _refresh_login(self) -> None:
         """ログインの案内を出し入れする
@@ -901,6 +906,7 @@ class ChatPanel(QWidget):
         文は会話が選んだ物をそのまま使う ここで決めると、初めての人にも「切れた」と出る
         """
         self._login_failed = bool(guide)
+        self._login_waiting = bool(guide)
         self._login_text.setText(guide or _LOGIN_NOT_YET)
         self._refresh_login()
 
@@ -1754,7 +1760,7 @@ class ChatPanel(QWidget):
         self._plan_box.show_plan(
             self._plan.view(),
             working=bool(self._queued),
-            ready=self._ready,
+            ready=self._ready and not self._login_waiting,
             plan_on=self._plan_first,
         )
 
@@ -1945,7 +1951,7 @@ class ChatPanel(QWidget):
         self._say(HANDOFF_WHO, handoff.text(self._host.document))
         self._handoff_text.setText(f"引き継ぎ: {handoff.headline()}")
         # ログインが切れたままでは続きを頼んでも同じ失敗になる 先に〔ログイン…〕へ向かわせる
-        self._handoff_continue.setVisible(not self._login_failed)
+        self._handoff_continue.setVisible(not self._login_waiting)
         self._handoff_box.setVisible(True)
 
     def _hide_handoff(self) -> None:
