@@ -4247,7 +4247,7 @@ def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
             host, request, heard, arguments, points, silence_db, min_silence, listing=listing
         )
 
-    waveform = _main_waveform(host, request.project)
+    waveform = _main_waveform(host, request.project) if _whole_timeline(request) else None
     if waveform is None:
         return _after_sound(host, wait, answer)
     sound_ready = host.check_waiter()
@@ -4263,6 +4263,14 @@ def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
         wait=prepare,
         seconds=max(wait, _PREPARE_SECONDS),
         then=lambda: answer(host.check_state()),
+    )
+
+
+def _whole_timeline(request: CheckRequest) -> bool:
+    return (
+        request.project is not None
+        and request.start == 0
+        and request.end >= request.project.duration
     )
 
 
@@ -4287,13 +4295,23 @@ def _main_waveform(host: EditorHost, project: Project | None) -> Waveform | None
 
 
 def _jet_cut_hint(
-    host: EditorHost, project: Project, min_silence: float, by_kind: dict[str, float]
+    host: EditorHost,
+    project: Project,
+    min_silence: float,
+    by_kind: dict[str, float],
+    *,
+    whole: bool,
+    complete: bool,
 ) -> dict[str, Any]:
     """jet_cut の threshold_db の勧める値 当てずっぽうで切っては戻すのを防ぐ（#413）
 
     jet_cut が見る物と同じ素材の波形で決める 混ぜた音で決めると、BGM やクリップの音量の分だけ
     ずれ、同じ値が別の所を切る 音の大きさだけでは打楽器と話を分けられないので、音楽が主の
     素材は話し声の見分け（``by_kind``）で断る
+
+    値は素材全体の物なので、見分けはタイムラインの全体（``whole``）を調べ終えた（``complete``）
+    結果でだけ読む 頭の話し声だけを調べた途中の結果や、話している範囲だけの結果で通すと、
+    音楽が主の素材に値を勧める
     """
     main = _main_sound(project)
     if main is None:
@@ -4307,6 +4325,13 @@ def _jet_cut_hint(
             "threshold_db": None,
             "note": "素材の波形の解析がまだ終わっていません もう 1 度呼ぶと読めます",
         }
+    if not whole or not complete:
+        note = (
+            "音の解析の途中です 調べ終えてからもう 1 度呼ぶと読めます"
+            if whole
+            else "素材全体の値なので、範囲を絞らずに全体を調べたときに返します"
+        )
+        return {**named, "threshold_db": None, "note": note}
     spoken = by_kind.get(SPEECH, 0.0) + by_kind.get(SPEECH_AND_MUSIC, 0.0)
     if by_kind.get(MUSIC, 0.0) > spoken:
         return {
@@ -4377,7 +4402,14 @@ def _sound_numbers(
     }
     if project is not None:
         head |= {"from_frame": request.start, "to_frame": request.end, "scene": request.scene}
-        head["jet_cut"] = _jet_cut_hint(host, project, min_silence, by_kind)
+        head["jet_cut"] = _jet_cut_hint(
+            host,
+            project,
+            min_silence,
+            by_kind,
+            whole=_whole_timeline(request),
+            complete=report.complete,
+        )
     else:
         head["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
 

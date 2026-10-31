@@ -33,13 +33,13 @@ from sashimono.core.model import (
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio import silence
 from sashimono.engine.audio.waveform import PeakLevel, Waveform
-from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.report import HIGH, MEDIUM, assemble
-from sashimono.engine.checks.scan import LOUDNESS
+from sashimono.engine.checks.scan import LOUDNESS, SOUND_KINDS
 from tests.ai.conftest import RATE_30, FakeHost, make_loaded
-from tests.ai.test_audio_tools import _heard, _spoken, _voiced
+from tests.ai.test_audio_tools import _done, _heard, _spoken, _voiced
 from tests.ai.test_mix_tools import _measured, _Work
-from tests.check_media import chord
+from tests.check_media import chord, talk
 from tests.conftest import make_clip
 from tests.ui.test_subtitle_panel import make_waveform
 
@@ -443,6 +443,52 @@ class TestSuggestedThreshold:
         assert hint["threshold_db"] is None
         assert "音楽" in hint["note"]
 
+    def test_a_partial_analysis_gives_no_value(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、頭の話し声だけを調べた途中の結果で音楽の素材に値を勧める"""
+        host = _voiced(video_media, transcript)
+        host.stub_waveform = _alternating(-46.0)
+        project = host.project
+        fresh = CheckRequest(
+            CheckLimits(kinds=SOUND_KINDS), project=project, start=0, end=project.duration
+        )
+        host.check = _done(fresh, _heard(talk(3.0)), running=True)
+        hint = _analyzed(host, wait_seconds=0)["jet_cut"]
+        assert hint["threshold_db"] is None
+        assert "調べ終えて" in hint["note"]
+
+    def test_a_narrow_range_gives_no_value(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、話している範囲だけを調べた結果で、音楽が主の素材全体に値を勧める"""
+        host = _voiced(video_media, transcript)
+        host.heard = _spoken()
+        host.stub_waveform = _alternating(-46.0)
+        hint = _analyzed(host, from_frame=30, to_frame=90)["jet_cut"]
+        assert hint["threshold_db"] is None
+        assert "全体" in hint["note"]
+
+    def test_a_narrow_range_counts_nothing(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、値を返さない範囲の呼び出しでも長い素材を数え、待ちが増える"""
+        host = _voiced(video_media, transcript)
+        host.heard = _spoken()
+        host.stub_waveform = _alternating(-46.0)
+        result = _run(host, "analyze_audio", points=0, from_frame=30, to_frame=90)
+        assert not isinstance(result, Pending)
+
+    def test_the_whole_range_named_gives_a_value(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、範囲を全体と同じに書いただけで値が出なくなる"""
+        host = _voiced(video_media, transcript)
+        host.heard = _spoken()
+        host.stub_waveform = _alternating(-46.0)
+        hint = _analyzed(host, from_frame=0, to_frame=host.project.duration)["jet_cut"]
+        assert hint["threshold_db"] is not None
+
     def test_a_new_waveform_changes_the_answer(
         self, video_media: MediaItem, transcript: Transcript
     ) -> None:
@@ -699,6 +745,9 @@ class TestWhatTheAnswerSays:
         result = _run(host, "delete_clips", clip_ids=[str(over.id), str(second.id)], ripple=True)
         assert str(words.id) not in result["tracks_left"]
         assert result["layers_followed"] is None
+        survivor = host.project.timeline.locate_clip(between.id)
+        assert survivor is not None
+        assert (survivor[1].timeline_start, survivor[1].duration) == (60, 10)
 
     def test_a_track_partly_moved_is_also_left(
         self, video_media: MediaItem, audio_media: MediaItem
