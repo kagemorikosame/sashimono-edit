@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from sashimono.core.userdirs import state_root
 from sashimono.runtime import FeaturePack, PackStatus
 from sashimono.runtime import install_command as _install_command
 
@@ -25,25 +26,31 @@ __all__ = [
     "REQUIRED_PACKAGES",
     "bundled_claude_cli",
     "claude_cli",
+    "claude_environment",
+    "conversation_folder",
+    "credential_variables",
     "credentials_found",
     "find_claude_cli",
     "install_command",
     "open_login_window",
     "runtime_status",
+    "uses_saved_login",
 ]
 
 #: 一覧（:data:`sashimono.ai.models.MODELS`）のモデルがすべて使える、同梱の Claude Code の版
 #: Claude Opus 5.5 は 2.1.280 より前の Claude Code では「does not support this model」で
 #: 断られる（0.2.152 に同梱の 2.1.259 で、利用者の画面で起きた）
 #: 新しいモデルを一覧へ足すときは、ここと下の SDK の下限を一緒に上げる
-MINIMUM_CLAUDE_CODE = "2.1.280"
+#: 2.1.310 は、自動メモを止める変数と記録を残さない引数を実物の会話で確かめた版（#412）
+#: 本人のメモが同意の外で渡らないことをこの版で約束するので、古い部品のままにしない
+MINIMUM_CLAUDE_CODE = "2.1.310"
 
-#: SDK の下限 0.2.158 は Claude Code 2.1.280 を同梱する最初の版（PyPI の Windows の
-#: wheel の ``_cli_version.py`` で確かめた 0.2.156 は 2.1.276 0.2.157 は Windows の
-#: wheel が無く、配布版の pip は選べない） モデルとエフォートの指定は 0.2.152 から使える
+#: SDK の下限 0.2.174 は Claude Code 2.1.310 を同梱する（入れた SDK の ``claude.exe --version``
+#: で確かめた） Opus 5.5 に要る 2.1.280 は 0.2.158 から入るが、それより古い版で #412 の
+#: 設定が効くかは確かめていない モデルとエフォートの指定は 0.2.152 から使える
 #: 上限は試した系列（0.2）の外へ自動で上がらないため 0.3 で使い方が変わっても、
 #: 自動の更新が入れて会話が始まらなくなる、ということが起きない 新しい系列は試してから上げる
-REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.158,<0.3",)
+REQUIRED_PACKAGES: tuple[str, ...] = ("claude-agent-sdk>=0.2.174,<0.3",)
 
 
 def bundled_claude_cli() -> Path | None:
@@ -105,11 +112,52 @@ def credentials_found() -> bool:
     触る理由が無い 外れても案内を出すかどうかが変わるだけなので、使うのは
     止めない
     """
-    if any(os.environ.get(name) for name in _CREDENTIAL_VARIABLES):
-        return True
-    config = os.environ.get("CLAUDE_CONFIG_DIR")
-    root = Path(config) if config else Path.home() / ".claude"
+    return _key_in_environment() or _saved_login_found()
+
+
+def uses_saved_login() -> bool:
+    """鍵を環境変数で渡さず、Claude Code に保存したログインで使っているか
+
+    ログインが切れるのはこの人だけ 環境変数の鍵が無効な人に「切れた」と言うと、
+    直す所を取り違える 中身は読まない
+    """
+    return _saved_login_found() and not _key_in_environment()
+
+
+def credential_variables() -> tuple[str, ...]:
+    """鍵が入っている環境変数の名前 値は読まない 案内で直す所を言うのに使う"""
+    return tuple(name for name in _CREDENTIAL_VARIABLES if os.environ.get(name))
+
+
+def _key_in_environment() -> bool:
+    return bool(credential_variables())
+
+
+def _saved_login_found() -> bool:
+    config = os.environ.get(_CONFIG_VARIABLE)
+    root = Path(config).absolute() if config else Path.home() / ".claude"
     return (root / ".credentials.json").is_file()
+
+
+def claude_environment() -> dict[str, str]:
+    """起動する Claude Code へ渡す環境変数のうち、このソフトが直す物
+
+    Claude Code の置き場の指定が相対だと、起動する場所で指す先が変わる 会話は専用のフォルダ、
+    ログインの窓はホームで開くので、そのままではログインの確かめ・会話・窓が別の場所を見る
+    このソフトの起動の場所を基準に絶対の場所へ直して、3 つを揃える
+    """
+    config = os.environ.get(_CONFIG_VARIABLE)
+    return {_CONFIG_VARIABLE: str(Path(config).absolute())} if config else {}
+
+
+def conversation_folder() -> Path:
+    """会話の間 Claude Code を置いておく、空のフォルダ
+
+    渡さないと起動した場所を受け継ぎ、その場所に紐付くメモや設定の持ち主になる（#412）
+    配布版でも起動の場所は開き方で変わるので、決めておく 道具は渡していないので、
+    Claude Code がこの中のファイルを読み書きすることは無い
+    """
+    return state_root() / "ai-conversation"
 
 
 def open_login_window(cli: Path) -> None:
@@ -122,9 +170,12 @@ def open_login_window(cli: Path) -> None:
     """
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     # 引数はここで決めた実行ファイルだけで、shell も通さない
-    subprocess.Popen([str(cli)], cwd=str(Path.home()), creationflags=flags)
+    environment = {**os.environ, **claude_environment()}
+    subprocess.Popen([str(cli)], cwd=str(Path.home()), env=environment, creationflags=flags)
 
 
+#: Claude Code の置き場を変える環境変数
+_CONFIG_VARIABLE = "CLAUDE_CONFIG_DIR"
 #: Claude Code が読む、鍵の入った環境変数 どれかがあればログインは要らない
 _CREDENTIAL_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 

@@ -29,6 +29,9 @@ from sashimono.ai.operations import ASK_USER, question_spec
 from sashimono.ai.safety import Consent
 from sashimono.ai.session import (
     ASK_RULES,
+    LOGIN_DETAIL,
+    LOGIN_EXPIRED_GUIDE,
+    LOGIN_HINT,
     SYSTEM_PROMPT,
     AgentEvent,
     AgentSession,
@@ -890,6 +893,125 @@ class TestLogin:
         widget._login_button.click()
         assert opened == [cli]
 
+    def _fail_login(self, widget: ChatPanel) -> None:
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.ERROR, text=LOGIN_EXPIRED_GUIDE, detail=LOGIN_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+
+    def test_a_failed_login_shows_the_button_even_with_credentials_on_disk(
+        self,
+        recorded: tuple[ChatPanel, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ファイルがあっても切れていることがある 壊れると「ログイン…で」と言うのにボタンが無く、
+        # 画面の中から直せない
+        from sashimono.ui.chat import panel as panel_module
+
+        widget, _ = recorded
+        monkeypatch.setattr(panel_module, "credentials_found", lambda: True)
+        widget._refresh_availability()
+        assert widget._login_box.isHidden() is True
+
+        self._fail_login(widget)
+        assert widget._login_box.isHidden() is False
+        assert "切れて" in widget._login_text.text()
+        assert "/login" in widget._login_text.text()
+
+        # 次の指示を送っても、答えが返るまでは直ったと分からない
+        widget._submit("もう一度")
+        assert widget._login_box.isHidden() is False
+        widget._refresh_availability()
+        assert widget._login_box.isHidden() is False
+
+    def test_someone_who_never_logged_in_is_not_told_it_expired(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、エラーの文は「要ります」なのに、箱と引き継ぎが「切れています」と言う
+        widget, _ = recorded
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.ERROR, text=LOGIN_HINT, detail=LOGIN_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert widget._login_text.text() == LOGIN_HINT
+        assert "切れて" not in _text(widget)
+
+    def test_a_reply_takes_the_button_down(
+        self,
+        recorded: tuple[ChatPanel, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、ログインし直して応えが返るようになっても、切れた案内が出続ける
+        from sashimono.ui.chat import panel as panel_module
+
+        widget, _ = recorded
+        monkeypatch.setattr(panel_module, "credentials_found", lambda: True)
+        self._fail_login(widget)
+        widget._handle(AgentEvent(EventKind.TEXT, text="切りました"))
+        assert widget._login_box.isHidden() is True
+        assert "切れて" not in widget._login_text.text()
+
+    def test_continuing_is_not_offered_until_logging_in(
+        self,
+        recorded: tuple[ChatPanel, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると、ログインが切れたまま〔続きを頼む〕を押して、同じ失敗を繰り返す
+        # 〔ログイン…〕を押した後は、頼めるように戻す
+        from sashimono.ui.chat import panel as panel_module
+
+        widget, _ = recorded
+        self._fail_login(widget)
+        assert widget._handoff_box.isHidden() is False
+        assert widget._handoff_continue.isHidden() is True
+        assert widget._handoff_copy.isHidden() is False
+
+        monkeypatch.setattr(panel_module, "claude_cli", lambda: tmp_path / "claude.exe")
+        monkeypatch.setattr(panel_module, "open_login_window", lambda _cli: None)
+        widget._login_button.click()
+        assert widget._handoff_continue.isHidden() is False
+
+    def test_other_failures_still_offer_continuing(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、送り直せば続く失敗でも続きを頼めなくなる
+        widget, _ = recorded
+        self._fail_login(widget)
+        widget._input.setPlainText("次")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.TEXT, text="始めます"))
+        widget._handle(AgentEvent(EventKind.ERROR, text="ProcessError: 落ちました"))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert widget._handoff_continue.isHidden() is False
+
+    def test_the_same_guide_is_not_repeated_in_the_handoff(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # 壊れると、エラーの文と引き継ぎの訳に同じ長い案内が並ぶ
+        widget, _ = recorded
+        guide = "Claude へのログインが切れています 開いた窓で /login と打ちます"
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.ERROR, text=guide, detail=LOGIN_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert _text(widget).count(guide) == 1
+
+    def test_opening_the_window_says_what_to_type(
+        self,
+        recorded: tuple[ChatPanel, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # 切れた人の窓に案内が出るとは限らない 壊れると、開いた窓の前で何もできない
+        from sashimono.ui.chat import panel as panel_module
+
+        widget, _ = recorded
+        monkeypatch.setattr(panel_module, "claude_cli", lambda: tmp_path / "claude.exe")
+        monkeypatch.setattr(panel_module, "open_login_window", lambda _cli: None)
+        widget._login_button.click()
+        assert "/login" in _text(widget)
+
 
 class TestLoginHint:
     def test_a_login_failure_says_where_to_log_in(self) -> None:
@@ -1033,6 +1155,18 @@ class TestRunningStatus:
         widget._handle(AgentEvent(EventKind.CLOSED))
         assert "失敗（" in _text(widget)
         assert _status(widget) == "待機中"
+
+    def test_a_conversation_closing_mid_turn_is_not_called_finished(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # エラーの知らせが無くても、応える途中で閉じた指示は済んでいない
+        # 壊れると、応えが返らなかった指示の区切りに「完了」と出る
+        widget, _ = recorded
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.CLOSED))
+        assert "失敗（" in _text(widget)
+        assert "完了（" not in _text(widget)
 
     def test_a_turn_ending_without_a_prompt_adds_no_divider(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]

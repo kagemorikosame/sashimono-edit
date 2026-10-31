@@ -6,10 +6,13 @@ SDK は import しない 配る先の機械と同じく、SDK の中身は偽物
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import ClassVar, cast
@@ -18,12 +21,17 @@ import pytest
 
 from sashimono.ai import environment
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.budget import IMAGE_EDGES
 from sashimono.ai.environment import AI_PACK
 from sashimono.ai.models import effort_for
-from sashimono.ai.session import AgentSession, EventKind
+from sashimono.ai.operations import ImageResult
+from sashimono.ai.server import MAX_RESULT_CHARS, _content
+from sashimono.ai.session import AUTO_MEMORY_OFF, AgentSession, EventKind
+from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.runtime import install_command
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.test_runtime_after_install import write_distribution
+from tests.waiting import wait_until
 
 
 @pytest.fixture
@@ -51,7 +59,7 @@ def machine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 
 def _install_sdk(site: Path, *, bundled: bool = True) -> Path:
-    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.158")
+    write_distribution(site, "claude-agent-sdk", "claude_agent_sdk", "0.2.174")
     cli = site / "claude_agent_sdk" / "_bundled" / "claude.exe"
     if bundled:
         cli.parent.mkdir(parents=True)
@@ -94,8 +102,8 @@ class TestBundledClaudeCode:
         assert "--upgrade" in command
 
     def test_a_prerelease_of_the_required_version_is_older(self, machine: Path) -> None:
-        # 0.2.158rc1 は 0.2.158 より前の版 同じと読むと、足りない SDK で入力欄が開く
-        write_distribution(machine, "claude-agent-sdk", "claude_agent_sdk", "0.2.158rc1")
+        # 0.2.174rc1 は 0.2.174 より前の版 同じと読むと、足りない SDK で入力欄が開く
+        write_distribution(machine, "claude-agent-sdk", "claude_agent_sdk", "0.2.174rc1")
         status = environment.runtime_status()
         assert status.needs_upgrade is True
         assert status.ready is False
@@ -103,7 +111,7 @@ class TestBundledClaudeCode:
     def test_a_newer_version_is_accepted(self, machine: Path) -> None:
         # 新しい版まで古いと読むと、入れ直しても入力欄が開かない
         _install_sdk(machine)
-        (machine / "claude_agent_sdk-0.2.158.dist-info").rename(
+        (machine / "claude_agent_sdk-0.2.174.dist-info").rename(
             machine / "claude_agent_sdk-0.10.0.dist-info"
         )
         (machine / "claude_agent_sdk-0.10.0.dist-info" / "METADATA").write_text(
@@ -144,6 +152,18 @@ class TestCredentials:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         assert environment.credentials_found() is True
 
+    def test_a_relative_config_folder_finds_the_saved_login(
+        self, machine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、相対の置き場を使う人のログインを見つけられず、案内と箱の見分けが外れる
+        del machine
+        (tmp_path / "設定").mkdir()
+        (tmp_path / "設定" / ".credentials.json").write_text("{}", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        assert environment.credentials_found() is True
+        assert environment.uses_saved_login() is True
+
     def test_the_login_window_runs_only_claude_code(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -158,6 +178,22 @@ class TestCredentials:
         cli = tmp_path / "claude.exe"
         environment.open_login_window(cli)
         assert started == [[str(cli)]]
+
+    def test_the_login_window_uses_the_same_config_folder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 窓はホームで開くので、相対の場所のままだと別の所へログインを保存する
+        # 壊れると、ログインし直しても会話がそれを読めず、同じ失敗を繰り返す
+        seen: list[str] = []
+
+        def popen(_argv: list[str], *, env: dict[str, str], **_kwargs: object) -> None:
+            seen.append(env["CLAUDE_CONFIG_DIR"])
+
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        environment.open_login_window(tmp_path / "claude.exe")
+        assert seen == [str(tmp_path / "設定")]
 
 
 def _session(model: str | None = None, effort: str | None = None) -> AgentSession:
@@ -208,6 +244,104 @@ class TestSessionOptions:
         fields = set(sdk.ClaudeAgentOptions.__dataclass_fields__)
         values = _session("claude-sonnet-5", "low").option_values()
         assert set(values) <= fields
+
+    def test_the_automatic_memo_is_turned_off(self, machine: Path) -> None:
+        # 壊れると、本人のメモが「AI へ送る物」の同意の外で Anthropic へ渡る
+        # setting_sources が空でも止まらない（実物で確かめた）
+        del machine
+        assert _session().option_values()["env"][AUTO_MEMORY_OFF] == "1"
+
+    def test_the_conversation_is_not_written_to_disk(self, machine: Path) -> None:
+        # 壊れると、字幕と絵を含む会話の全文が利用者のホームの下に残る
+        del machine
+        assert _session().option_values()["extra_args"] == {"no-session-persistence": None}
+
+    def test_the_bundled_claude_code_knows_the_flag(self) -> None:
+        """知らない引数は Claude Code が断るので、会話が始まらなくなる"""
+        cli = environment.bundled_claude_cli()
+        if cli is None:
+            pytest.skip("同梱の Claude Code が無い")
+        shown = subprocess.run([str(cli), "--help"], capture_output=True, check=True)
+        assert b"--no-session-persistence" in shown.stdout
+
+    def test_the_conversation_has_its_own_folder(
+        self, machine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、起動した場所（リポジトリや本人のフォルダ）を受け継ぎ、そこに紐付く物が混ざる
+        del machine
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        monkeypatch.chdir(tmp_path)
+        folder = Path(_session().option_values()["cwd"])
+        assert folder == environment.conversation_folder()
+        assert (tmp_path / "local") in folder.parents
+
+    def test_a_relative_config_folder_stays_the_same_folder(
+        self, machine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 作業場所を決めたので、相対の場所をそのまま受け継ぐと Claude Code が別の場所を見る
+        # 壊れると、ログイン済みの人の会話がログインを見つけられず、案内の見分けも食い違う
+        del machine
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        assert _session().option_values()["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "設定")
+
+    def test_the_config_folder_is_left_alone_when_not_set(self, machine: Path) -> None:
+        # 壊れると、既定の置き場を使う人の Claude Code に要らない指定が渡る
+        del machine
+        assert "CLAUDE_CONFIG_DIR" not in _session().option_values()["env"]
+
+    def test_a_chosen_folder_still_wins(self, machine: Path, tmp_path: Path) -> None:
+        # 壊れると、作り手が場所を渡しても黙って無視され、試験や別の使い方で場所を選べない
+        del machine
+        session = AgentSession(cast(EditorBridge, object()), cwd=tmp_path)
+        assert session.option_values()["cwd"] == str(tmp_path)
+
+    def test_a_long_text_result_never_reaches_claude_code(self) -> None:
+        # Claude Code は長い結果をホームの下のファイルへ逃がす 記録を止めても残るので（実物で
+        # 確かめた）、壊れると字幕の全文がファイルに残り、道具を持たない AI は読めもしない
+        sent = _content("あ" * (MAX_RESULT_CHARS + 1))
+        assert sent["is_error"] is True
+        assert "あ" not in sent["content"][0]["text"]
+        assert "絞って" in sent["content"][0]["text"]
+        assert "is_error" not in _content("あ" * MAX_RESULT_CHARS)
+
+    def test_dense_text_is_not_moved_to_a_file_by_its_token_count(self, machine: Path) -> None:
+        # 漢字の多い文は 1 文字が 1 トークンを超えることがある 既定の 25000 トークンのままだと、
+        # 文字数の上限より先に Claude Code がファイルへ逃がす
+        del machine
+        limit = int(_session().option_values()["env"]["MAX_MCP_OUTPUT_TOKENS"])
+        assert limit >= MAX_RESULT_CHARS * 3
+
+    def test_every_picture_size_the_settings_offer_fits_the_message(self) -> None:
+        # 設定で選べる長い辺を上限より大きくすると、1 通の上限の見積もりが外れて会話が落ちる
+        assert max(IMAGE_EDGES) <= MAX_SHEET_EDGE
+
+    def test_a_single_message_can_hold_the_largest_picture(self, machine: Path) -> None:
+        # 壊れると、Claude Code が絵を 2 回書いた 1 通が上限を越えて、編集の途中で会話が落ちる
+        # 絵は上限の大きさのまま、縮まらない中身（乱数）で作る
+        del machine
+        side = MAX_SHEET_EDGE
+        png = _png(side, side)
+        sent = _content(ImageResult(png=png, caption="説明"))
+        # 実物の 1 通は道具の結果と tool_use_result に同じ絵が入る
+        line = json.dumps({"content": sent["content"], "tool_use_result": sent["content"]})
+        assert len(png) > side * side * 4
+        assert len(line) <= _session().option_values()["max_buffer_size"]
+
+
+def _png(width: int, height: int) -> bytes:
+    """縮まらない RGBA の PNG 上限を見る試験で、一番重い絵として使う"""
+    row = bytes(1 + width * 4)
+    # 行ごとに乱数を作ると 1000 万バイトの乱数で遅い 圧縮せずに置くので同じ行の繰り返しでよい
+    raw = (row[:1] + os.urandom(width * 4)) * height
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    head = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    body = zlib.compress(raw, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + chunk(b"IDAT", body) + chunk(b"IEND", b"")
 
 
 class _QuietBridge:
@@ -338,6 +472,29 @@ class TestClosingDropsPendingPrompts:
         session._thread.join(timeout=5.0)
         assert session._thread.is_alive() is False
         assert _FakeClient.queried == ["1 つ目"]
+
+    def test_the_conversation_folder_is_made_before_starting(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 壊れると、初めての人の機械に作業場所が無く、Claude Code が起動できずに会話が始まらない
+        import types
+
+        from sashimono.ai import session as session_module
+
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.ClaudeAgentOptions = lambda **_kwargs: object()  # type: ignore[attr-defined]
+        fake.ClaudeSDKClient = _FakeClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+        monkeypatch.setattr(session_module, "build_server", lambda _bridge, **_options: None)
+        monkeypatch.setattr(session_module, "hide_cli_console", lambda: None)
+        _FakeClient.queried = []
+
+        folder = tmp_path / "まだ無い" / "作業場所"
+        session = AgentSession(cast(EditorBridge, _QuietBridge()), cwd=folder)
+        session.send("指示")
+        wait_until(lambda: bool(_FakeClient.queried), "指示の受け取り")
+        session.close()
+        assert folder.is_dir()
 
 
 class TestPreferences:
