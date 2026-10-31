@@ -491,6 +491,38 @@ def test_joining_keeps_overlap_of_opposite_contours() -> None:
     assert joined_rings(first, second)[0][0].contains(QPointF(75.0, 50.0))
 
 
+def fill_layer(
+    box: QRectF, color: ParamValue
+) -> tuple[QPainterPath, dict[str, object], QPainterPath | None]:
+    path = QPainterPath()
+    path.addRect(box)
+    return path, {"color": color}, None
+
+
+def test_layers_between_keep_the_drawing_order() -> None:
+    """間の層が組と重なるならまとめない まとめると後の字が間の層の下へ回り、色が変わる"""
+    red, blue = (1.0, 0.0, 0.0, 0.5), (0.0, 0.0, 1.0, 0.5)
+    layers = [
+        fill_layer(QRectF(0.0, 0.0, 100.0, 100.0), red),
+        fill_layer(QRectF(40.0, 0.0, 100.0, 100.0), blue),
+        fill_layer(QRectF(80.0, 0.0, 100.0, 100.0), red),
+    ]
+
+    assert sources._painted_once(layers, sources._fill_key) is layers
+
+
+def test_layers_between_that_stay_clear_do_not_block_joining() -> None:
+    """間の層が離れていればまとめる 上下は入れ替わっても重ならないので色は変わらない"""
+    red, blue = (1.0, 0.0, 0.0, 0.5), (0.0, 0.0, 1.0, 0.5)
+    layers = [
+        fill_layer(QRectF(0.0, 0.0, 100.0, 100.0), red),
+        fill_layer(QRectF(0.0, 500.0, 100.0, 100.0), blue),
+        fill_layer(QRectF(80.0, 0.0, 100.0, 100.0), red),
+    ]
+
+    assert len(sources._painted_once(layers, sources._fill_key)) == 2
+
+
 def test_a_lone_layer_is_passed_through_untouched() -> None:
     """層が 1 つの字幕は何も調べない 字幕はほとんどこれで、毎コマの手間を増やさない"""
     look: dict[str, object] = {"color": CLEAR}

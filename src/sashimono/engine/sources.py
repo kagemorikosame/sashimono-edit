@@ -1906,6 +1906,18 @@ def _joined_layers(parts: Sequence[_Layer]) -> list[_Layer]:
     return [(whole, look, frame), (_united(free), look, _outside_of(frame))]
 
 
+def _crossed_by_another(layers: Sequence[_Layer], members: Sequence[int]) -> bool:
+    """組の字の間に描く別の層が組と重なるか
+
+    まとめると組は先頭の字の位置で描くので、後の字と間の層の上下が入れ替わる 半透明の字は
+    上下で色が変わるので、そのときはまとめず、2 重に塗られる方を残す
+    """
+    others = set(range(members[0] + 1, members[-1])).difference(members)
+    return any(
+        layers[other][0].intersects(layers[member][0]) for other in others for member in members
+    )
+
+
 def _painted_once(
     layers: list[_Layer],
     key: Callable[[dict[str, object]], tuple[float, Hashable] | None],
@@ -1934,6 +1946,8 @@ def _painted_once(
         shapes = [layers[index][0] for index in indices]
         for group in _touching(shapes, reaches[value]) if len(indices) > 1 else ():
             members = [indices[place] for place in group]
+            if _crossed_by_another(layers, members):
+                continue
             placed[members[0]] = _joined_layers([layers[index] for index in members])
             dropped.update(members)
     if not placed:
