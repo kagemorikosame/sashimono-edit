@@ -261,6 +261,17 @@ class TestWhatFollows:
         )
         assert _at(plain.cut_middle(project), partner) == (250, 5)
 
+    @pytest.mark.parametrize("hidden", ["disabled", "muted"])
+    def test_music_that_is_not_playing_does_not_hold_the_track(
+        self, plain: _Plain, audio_media: MediaItem, hidden: str
+    ) -> None:
+        """壊れると、鳴っていない曲のせいで、同じトラックの効果音が絵からずれる"""
+        music = replace(make_clip(0, 240, audio_media), enabled=hidden != "disabled")
+        effect = make_clip(250, 10, audio_media)
+        track = Track(kind=TrackKind.AUDIO, name="BGM", muted=hidden == "muted")
+        after = plain.cut_middle(_with_track(plain.project, track, music, effect))
+        assert _at(after, effect) == (150, 10)
+
     def test_a_locked_track_stays(self, plain: _Plain) -> None:
         """壊れると、人が動かさないと決めたトラックが動く"""
         text_clip = Clip(timeline_start=250, duration=10, source=TEXT.create(text="札"))
@@ -421,6 +432,25 @@ class TestWhatWentWithIt:
         project, _text = _text_track(plain.project, 50, 100)
         after = plain.cut_middle(project)
         assert ripple_casualties(project, after, (plain.clips[1].id,)) == []
+
+
+class TestRippleCutAndTheWorkArea:
+    def test_the_silence_cut_still_drops_it(self, plain: _Plain) -> None:
+        """壊れると、無音カットの前からの動きが変わる"""
+        project = plain.project.with_timeline(replace(plain.project.timeline, work_area=(50, 250)))
+        assert RippleCut(((100, 120),)).apply(project).timeline.work_area is None
+
+    def test_keeping_it_follows_the_cut(self, plain: _Plain) -> None:
+        """壊れると、範囲を切っただけで書き出す範囲が外れ、次の書き出しが全体になる"""
+        project = plain.project.with_timeline(replace(plain.project.timeline, work_area=(50, 250)))
+        after = RippleCut(((100, 120),), keep_area=True).apply(project)
+        assert after.timeline.work_area == (50, 230)
+
+    def test_a_cut_over_all_of_it_drops_it(self, plain: _Plain) -> None:
+        """壊れると、中身の無くなった書き出す範囲が残り、長さ 0 の書き出しになる"""
+        project = plain.project.with_timeline(replace(plain.project.timeline, work_area=(100, 120)))
+        after = RippleCut(((90, 130),), keep_area=True).apply(project)
+        assert after.timeline.work_area is None
 
 
 class TestRippleCutOnTransitions:

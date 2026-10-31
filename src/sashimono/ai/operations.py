@@ -4724,6 +4724,17 @@ def _set_resolution(host: EditorHost, arguments: dict[str, Any]) -> object:
 MAX_PLACE_RANGES = 200
 
 
+def _placed_frame(arguments: dict[str, Any]) -> int | None:
+    """引数 ``at_frame`` 省けば ``None`` 負の値は頭へ丸めずに断る"""
+    raw = arguments.get("at_frame")
+    if raw is None:
+        return None
+    frame = _integer_value(raw, "at_frame")
+    if frame < 0:
+        raise ToolError(f"at_frame は 0 以上で渡してください（{frame} が来ました）")
+    return frame
+
+
 def _media_spans(
     project: Project, media: MediaItem, arguments: dict[str, Any]
 ) -> list[tuple[Fraction, Fraction]]:
@@ -4767,13 +4778,15 @@ def _media_spans(
 def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     media = _require_media(project, str(arguments.get("media_id", "")))
-    at_frame = arguments.get("at_frame")
+    at_frame = _placed_frame(arguments)
+    # 区間は開き直した後の素材で確かめる 古い作品の素材は短いファイルに差し替わっていることがある
+    fresh = _with_known_video_end(host, media)
     if "ranges" in arguments:
-        return _place_spans(host, media, _media_spans(project, media, arguments), at_frame)
+        return _place_spans(host, fresh, _media_spans(project, fresh, arguments), at_frame)
     commands = insert_media(
         project,
-        _with_known_video_end(host, media),
-        at_frame=int(at_frame) if at_frame is not None else None,
+        fresh,
+        at_frame=at_frame,
         split_audio=host.splits_media,
     )
     if not commands:
@@ -4786,15 +4799,15 @@ def _place_spans(
     host: EditorHost,
     media: MediaItem,
     spans: list[tuple[Fraction, Fraction]],
-    at_frame: object,
+    at_frame: int | None,
 ) -> object:
     """素材の一部を順に並べて置く 取り消し 1 回で全部戻る 置いたクリップの ID を返す"""
     project = _project(host)
     commands = place_media_spans(
         project,
-        _with_known_video_end(host, media),
+        media,
         spans,
-        at_frame=project.duration if at_frame is None else _integer_value(at_frame, "at_frame"),
+        at_frame=project.duration if at_frame is None else at_frame,
         split_audio=host.splits_media,
     )
     parts: dict[int, dict[str, Any]] = {}
@@ -5055,6 +5068,14 @@ def _lost_clips(
     if transitions:
         answer["transitions_removed"] = len(transitions)
         notes.append(_SEAM_AGAIN_NOTE)
+    marks = len(before.timeline.markers) - len(after.timeline.markers)
+    if marks > 0:
+        answer["markers_removed"] = marks
+    area = after.timeline.work_area
+    if area != before.timeline.work_area:
+        answer["work_area"] = None if area is None else list(area)
+        if area is None:
+            notes.append("書き出す範囲が外れました 次の書き出しは全体になります")
     if others:
         answer["clips_removed"] = len(others)
         answer["removed_clips"] = [
@@ -5137,7 +5158,10 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"範囲は 0 ≦ start_frame < end_frame ≦ {project.duration}（タイムラインの長さ）で"
             f"渡してください（{start}〜{end} が来ました）"
         )
-    host.apply_commands([RippleCut(((start, end),))], "範囲を切って詰める")
+    if all(track.locked for track in project.timeline.tracks):
+        # 何も切れないのに切ったと答えない
+        raise ToolError("どのトラックもロックしているので切れません ロックを外してください")
+    host.apply_commands([RippleCut(((start, end),), keep_area=True)], "範囲を切って詰める")
     length = end - start
     result: dict[str, object] = {
         "removed_frames": length,
@@ -5532,6 +5556,41 @@ def _param_sends(project: Project, path: ParamPath) -> frozenset[Outbound]:
     return UNKNOWN_FIELD_SENDS
 
 
+def _param_command(project: Project, path: ParamPath, value: object) -> SetParam:
+    """値を欄の型へ寄せた命令 型の違う値は、どのクリップのどの欄かを書いて断る
+
+    欄の定義の寄せ方はファイルから読んだ値のためにあり、合わない値を黙って既定へ戻す そのまま
+    通すと、AI は変えたつもりの欄が既定に戻ったことに気付かない
+    """
+    where = f"{path.clip_id} の {path.name}"
+    if value is None:
+        raise ToolError(f"{where} に渡す value がありません")
+    spec = _spec_for(project, path)
+    if isinstance(spec, TrackSpec) and not _is_number(value):
+        raise ToolError(f"{where} は数の欄です 数で渡してください")
+    if isinstance(spec, SelectSpec) and str(value) not in dict(spec.choices):
+        raise ToolError(f"{where} は {'・'.join(dict(spec.choices))} のどれかです")
+    if (
+        isinstance(spec, ColorSpec)
+        and not isinstance(value, list)
+        and _parse_color(str(value)) is None
+    ):
+        raise ToolError(f"{where} は #RRGGBB か #RRGGBBAA か [R, G, B, A] で渡してください")
+    try:
+        return SetParam(path, _coerce_param(project, path, value))
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"{where} に渡せない値です: {exc}") from exc
+
+
+def _is_number(value: object) -> bool:
+    if isinstance(value, bool | int | float):
+        return True
+    try:
+        return isinstance(value, str) and math.isfinite(float(value))
+    except ValueError:
+        return False
+
+
 def _set_param(host: EditorHost, arguments: dict[str, Any]) -> object:
     if "clip_ids" in arguments:
         return _set_param_on_many(host, arguments)
@@ -5539,9 +5598,9 @@ def _set_param(host: EditorHost, arguments: dict[str, Any]) -> object:
     path = _param_path(clip.id, arguments)
     value = arguments.get("value")
     project = _project(host)
-    resolved = _coerce_param(project, path, value)
+    command = _param_command(project, path, value)
     needs = _param_sends(project, path)
-    host.apply_commands([SetParam(path, resolved)], f"{path.name} を変更")
+    host.apply_commands([command], f"{path.name} を変更")
     return {"name": path.name, "value": masked_value(str(value), needs)}
 
 
@@ -5560,7 +5619,7 @@ def _set_param_on_many(host: EditorHost, arguments: dict[str, Any]) -> object:
     trial = project
     for clip_id in clip_ids:
         path = _param_path(clip_id, arguments)
-        command = SetParam(path, _coerce_param(project, path, value))
+        command = _param_command(project, path, value)
         needs |= _param_sends(project, path)
         try:
             # 先に手元で当ててみる 途中のクリップで断られたとき、前のクリップだけが変わらない

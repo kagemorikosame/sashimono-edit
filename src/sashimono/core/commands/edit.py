@@ -266,13 +266,25 @@ def _clip_span(targets: list[tuple[TrackId, Clip]]) -> tuple[int, int]:
 
 
 def _gathered(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[TrackId, Clip]]:
-    """消すクリップとリンクの相手 同じクリップは 1 度だけ"""
+    """消すクリップとリンクの相手 同じクリップは 1 度だけ
+
+    索引を 1 回だけ作る クリップごとに探すと、何百本も選んだときに選んだ数とタイムラインの
+    本数の掛け算になり、削除の間に編集画面が止まる
+    """
+    known: dict[ClipId, tuple[TrackId, Clip]] = {}
+    linked: dict[GroupId, list[tuple[TrackId, Clip]]] = {}
+    for track in project.timeline.tracks:
+        for clip in track.clips:
+            known[clip.id] = (track.id, clip)
+            if clip.link_group is not None:
+                linked.setdefault(clip.link_group, []).append((track.id, clip))
     found: dict[ClipId, tuple[TrackId, Clip]] = {}
     for clip_id in clip_ids:
-        located = project.timeline.locate_clip(clip_id)
-        if located is not None:
-            for track_id, clip in _linked_group(project, located[1]):
-                found.setdefault(clip.id, (track_id, clip))
+        entry = known.get(clip_id)
+        if entry is not None:
+            group = entry[1].link_group
+            for member in [entry] if group is None else linked[group]:
+                found.setdefault(member[1].id, member)
     return list(found.values())
 
 
@@ -285,18 +297,16 @@ def _cuts(
     字幕が付いてこず、トラックごとに詰める量もずれる 塊ごとに 1 回の切りとして見る
     後ろから返すのは、前を詰めると後ろの塊の時刻がずれるため
     """
-    spans = tuple((clip.timeline_start, clip.timeline_end) for _, clip in targets)
-    return [
-        (
-            (start, end),
-            [
-                (track_id, clip)
-                for track_id, clip in targets
-                if start <= clip.timeline_start and clip.timeline_end <= end
-            ],
-        )
-        for start, end in reversed(_normalized(spans))
-    ]
+    cuts: list[tuple[tuple[int, int], list[tuple[TrackId, Clip]]]] = []
+    for item in sorted(targets, key=lambda entry: entry[1].timeline_start):
+        start, end = item[1].timeline_start, item[1].timeline_end
+        if cuts and start <= cuts[-1][0][1]:
+            (first, last), members = cuts[-1]
+            cuts[-1] = ((first, max(last, end)), members)
+            members.append(item)
+        else:
+            cuts.append(((start, end), [item]))
+    return cuts[::-1]
 
 
 def ripple_gaps(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[int, int]]:
@@ -381,11 +391,12 @@ def ripple_casualties(
     黙って消えると AI も人も気付かないので、道具の答えと状態の行で知らせる
     """
     asked = {clip.id for _, clip in _gathered(before, clip_ids)}
+    remaining = {clip.id for track in after.timeline.tracks for clip in track.clips}
     return [
         (track, clip)
         for track in before.timeline.tracks
         for clip in track.clips
-        if clip.id not in asked and after.timeline.locate_clip(clip.id) is None
+        if clip.id not in asked and clip.id not in remaining
     ]
 
 
@@ -481,9 +492,15 @@ def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) ->
     def spans(clip: Clip) -> bool:
         # 頭や終わりが範囲とそろった BGM もまたいだ物に数える 頭を切っただけで曲の頭が欠ける
         covers = clip.timeline_start <= start and clip.timeline_end >= end
-        return _content(clip) and covers and clip.duration > end - start
+        return clip.enabled and _content(clip) and covers and clip.duration > end - start
 
-    held = {track.id for track in tracks if track.locked or any(spans(c) for c in track.clips)}
+    # 無効のクリップと隠したトラックは鳴らないので、後ろの物を止める理由にしない
+    # （:func:`_programme_gap` が番組に数えないのと同じ）
+    held = {
+        track.id
+        for track in tracks
+        if track.locked or (not track.muted and any(spans(c) for c in track.clips))
+    }
     timeline = project.timeline
     frontier = list(held)
     while frontier:
@@ -753,8 +770,8 @@ class RemoveClips(Command):
         return f"{len(self.clip_ids)} 本を削除{suffix}"
 
     def apply(self, project: Project) -> Project:
-        located = [project.timeline.locate_clip(clip_id) for clip_id in self.clip_ids]
-        if any(entry is None for entry in located):
+        known = {clip.id: clip for track in project.timeline.tracks for clip in track.clips}
+        if any(clip_id not in known for clip_id in self.clip_ids):
             raise KeyError("消すクリップの一部が見つからない")
         if self.ripple and self.layers:
             targets = _gathered(project, self.clip_ids)
@@ -764,7 +781,7 @@ class RemoveClips(Command):
                     raise ValueError(f"トラック {track.name!r} はロックされている")
             return _ripple_out(project, targets)
         ordered = sorted(
-            (entry[1] for entry in located if entry is not None),
+            (known[clip_id] for clip_id in self.clip_ids),
             key=lambda clip: clip.timeline_start,
             reverse=True,
         )
@@ -1672,9 +1689,13 @@ class RippleCut(Command):
     範囲に掛かったクリップは端が削られ、範囲をまたぐクリップは 2 つに分かれる
     ロックされたトラックには触れない 触れてしまうと、そのトラックだけ長さが
     変わらず、以降すべてがずれる
+
+    ``keep_area`` は書き出す範囲を切った分だけ詰めて残すか 無音カットは飛び飛びに何十か所も
+    切るので外す（前からの動き） 1 か所を切る :func:`cut_range` の道具は残す
     """
 
     ranges: tuple[tuple[int, int], ...]
+    keep_area: bool = False
 
     @property
     def label(self) -> str:
@@ -1683,7 +1704,7 @@ class RippleCut(Command):
     def apply(self, project: Project) -> Project:
         # 後ろから切る 前から切ると、切るたびに残りの範囲がずれて計算し直しになる
         for start, end in sorted(_normalized(self.ranges), reverse=True):
-            project = _cut_range(project, start, end)
+            project = _cut_range(project, start, end, keep_area=self.keep_area)
         return project
 
 
@@ -1698,7 +1719,7 @@ def _normalized(ranges: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
     return merged
 
 
-def _cut_range(project: Project, start: int, end: int) -> Project:
+def _cut_range(project: Project, start: int, end: int, *, keep_area: bool) -> Project:
     """``[start, end)`` を全トラックから取り除き、後ろを詰める"""
     length = end - start
     timeline = project.timeline
@@ -1720,7 +1741,8 @@ def _cut_range(project: Project, start: int, end: int) -> Project:
         for marker in timeline.markers
         if not (start <= marker.frame < end)
     )
-    return project.with_timeline(replace(timeline, markers=markers, work_area=None))
+    area = _pulled_area(timeline.work_area, start, end) if keep_area else None
+    return project.with_timeline(replace(timeline, markers=markers, work_area=area))
 
 
 def _cut_clip(

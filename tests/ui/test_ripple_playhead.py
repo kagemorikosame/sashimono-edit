@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +35,7 @@ from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.subtitle.dialogs import JetCutDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.ui.test_subtitle_panel import make_waveform
+from tests.waiting import GUARD_SECONDS
 
 
 @pytest.fixture(autouse=True)
@@ -366,8 +368,13 @@ class TestClosingTheWindow:
         waiter = window.transcription_waiter()
         window._subtitles._settled.clear()
         assert not waiter(0.0)
+        answers: list[bool] = []
+        waiting = threading.Thread(target=lambda: answers.append(waiter(GUARD_SECONDS)))
+        waiting.start()
         window.close()
-        assert waiter(0.0)
+        waiting.join(GUARD_SECONDS)
+        # 上限まで待ち切ると偽が返る 真なら閉じたときに放された
+        assert answers == [True]
 
 
 class TestLayersFollow:

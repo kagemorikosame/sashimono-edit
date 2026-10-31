@@ -1644,7 +1644,9 @@ AI の書き出し（`export_video` #327）も同じ値を `build_settings` へ�
   欠片を残すと 1 コマの溶けが並ぶ 付け直しは `smooth_cuts`
 - 本人の設定 `Preferences.ripple_layers`（`表示 → 設定…` 既定は入り）で切れる コアの既定は偽で、
   入口（画面の `TimelineView.delete_selected` と AI の道具）が必ず渡す
-- AI には、ロックしていない全部のトラックから同じ範囲を切る `cut_range`（`RippleCut` を通す）もある
+- AI には、ロックしていない全部のトラックから同じ範囲を切る `cut_range`（`RippleCut` を通す）もある 書き出す
+  範囲は切った分だけ詰めて残す（`keep_area`） 無音カットは飛び飛びに切るので前と同じく外す どの道具も、
+  書き出す範囲が変われば `work_area`、目印が消えれば `markers_removed` を答えに出す
   詰める削除の答えの `tracks_moved` `tracks_left` `layers_followed` は `ripple_report` が 1 つの決まりで出す
   番組の時間が抜けた範囲からクリップごとに居るべき位置を決め、消す前と後を比べる 居れば付いてきた、居なければ
   置いていかれた（曲のまたぎのように短くなるはずの物が同じ長さのままなのも置いていかれた）トラック単位で

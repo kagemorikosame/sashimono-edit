@@ -15,12 +15,20 @@ import pytest
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Pending, find_operation
-from sashimono.core.commands import AddClip, AddTrack, RemoveClip, RippleCut, SetTrackState
+from sashimono.core.commands import (
+    AddClip,
+    AddMarkers,
+    AddTrack,
+    RemoveClip,
+    RippleCut,
+    SetTrackState,
+)
 from sashimono.core.commands.insert import insert_generated, insert_media
 from sashimono.core.mixing import db_to_ratio
 from sashimono.core.model import (
     Clip,
     LayerMode,
+    Marker,
     MediaItem,
     Project,
     ProjectSettings,
@@ -233,6 +241,33 @@ class TestPlaceParts:
             _run(host, "place_media", media_id=str(video_media.id), ranges=ranges)
         assert host.project == before
 
+    def test_a_shorter_file_on_disk_is_checked(self, video_media: MediaItem) -> None:
+        """壊れると、開き直して短くなった素材の外を読むクリップを置く"""
+        host = _empty(video_media)
+        host.probe_result = replace(video_media, duration=Fraction(2))
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(
+                host,
+                "place_media",
+                media_id=str(video_media.id),
+                ranges=[{"start_seconds": 5, "end_seconds": 6}],
+            )
+        assert host.project == before
+
+    @pytest.mark.parametrize("at_frame", ["十", -1, 1.5, True])
+    @pytest.mark.parametrize("with_ranges", [False, True])
+    def test_a_bad_position_is_refused(
+        self, video_media: MediaItem, at_frame: object, with_ranges: bool
+    ) -> None:
+        """壊れると、素の ValueError で落ちるか、負の位置を黙って頭へ置く"""
+        host = _empty(video_media)
+        before = host.project
+        ranges = {"ranges": [{"start_seconds": 1, "end_seconds": 2}]} if with_ranges else {}
+        with pytest.raises(ToolError):
+            _run(host, "place_media", media_id=str(video_media.id), at_frame=at_frame, **ranges)
+        assert host.project == before
+
     def test_a_still_has_no_part_to_take(self, video_media: MediaItem) -> None:
         """壊れると、静止画の秒を指して何も映らないクリップを置く"""
         still = replace(video_media, duration=Fraction(0), audio_streams=())
@@ -399,6 +434,8 @@ class TestSuggestedThreshold:
         host = _voiced(video_media, transcript)
         host.heard = _spoken()
         host.stub_waveform = _alternating(-30.0)
+        clip = host.project.timeline.tracks[0].clips[0]
+        _run(host, "set_volume", clip_ids=[str(clip.id)], volume_percent=50)
         suggestion = _analyzed(host)["jet_cut"]
         assert -30.0 < suggestion["threshold_db"] < -12.0
 
@@ -568,6 +605,37 @@ class TestSameValueOnManyClips:
             )
         assert host.project == before
 
+    @pytest.mark.parametrize("value", ["数でない", ["札"], [None], None])
+    @pytest.mark.parametrize("many", [False, True])
+    def test_a_bad_value_is_refused_and_names_the_clip(
+        self, video_media: MediaItem, transcript: Transcript, value: object, many: bool
+    ) -> None:
+        """壊れると、素の例外が道具の外へ出て、AI がどのクリップで何を直すか分からない"""
+        host, clips = self._texts(2, video_media, transcript)
+        before = host.project
+        target: dict[str, Any] = (
+            {"clip_ids": [str(c.id) for c in clips]} if many else {"clip_id": str(clips[0].id)}
+        )
+        with pytest.raises(ToolError) as refused:
+            _run(host, "set_param", name="pos_x", value=value, **target)
+        assert str(clips[0].id) in str(refused.value)
+        assert "pos_x" in str(refused.value)
+        assert host.project == before
+
+    @pytest.mark.parametrize("many", [False, True])
+    def test_a_missing_value_is_refused(
+        self, video_media: MediaItem, transcript: Transcript, many: bool
+    ) -> None:
+        """壊れると、値を渡し忘れた本文欄に None という文字が入る"""
+        host, clips = self._texts(1, video_media, transcript)
+        before = host.project
+        target: dict[str, Any] = (
+            {"clip_ids": [str(clips[0].id)]} if many else {"clip_id": str(clips[0].id)}
+        )
+        with pytest.raises(ToolError):
+            _run(host, "set_param", name="text", **target)
+        assert host.project == before
+
     def test_clip_id_and_clip_ids_together_are_refused(
         self, video_media: MediaItem, transcript: Transcript
     ) -> None:
@@ -613,6 +681,46 @@ class TestCutRange:
         located = host.project.timeline.locate_clip(text.id)
         assert located is not None
         assert located[1].timeline_start == 70
+
+    def test_the_work_area_follows(self, host: FakeHost) -> None:
+        """壊れると、範囲を切っただけで書き出す範囲が外れ、次の書き出しが全体になる"""
+        project = host.project
+        host.document.reset(project.with_timeline(replace(project.timeline, work_area=(50, 200))))
+        result = _run(host, "cut_range", start_frame=0, end_frame=30)
+        assert host.project.timeline.work_area == (20, 170)
+        assert result["work_area"] == [20, 170]
+
+    def test_one_undo_restores_the_work_area(self, host: FakeHost) -> None:
+        """壊れると、取り消しても書き出す範囲が詰めた後のまま残る"""
+        project = host.project
+        host.document.reset(project.with_timeline(replace(project.timeline, work_area=(50, 200))))
+        _run(host, "cut_range", start_frame=0, end_frame=30)
+        host.undo()
+        assert host.project.timeline.work_area == (50, 200)
+
+    def test_a_work_area_cut_away_is_said_so(self, host: FakeHost) -> None:
+        """壊れると、書き出す範囲が消えたことに気付かず全体を書き出す"""
+        project = host.project
+        host.document.reset(project.with_timeline(replace(project.timeline, work_area=(50, 60))))
+        result = _run(host, "cut_range", start_frame=40, end_frame=70)
+        assert result["work_area"] is None
+        assert "書き出す範囲" in result["note"]
+
+    def test_a_marker_cut_away_is_counted(self, host: FakeHost) -> None:
+        """壊れると、切った所の目印が黙って消える"""
+        host.apply_commands([AddMarkers((Marker(frame=50), Marker(frame=200)))], "目印")
+        result = _run(host, "cut_range", start_frame=40, end_frame=70)
+        assert result["markers_removed"] == 1
+        assert [marker.frame for marker in host.project.timeline.markers] == [170]
+
+    def test_all_tracks_locked_is_refused(self, host: FakeHost) -> None:
+        """壊れると、何も切れないのに切ったと答える"""
+        track = host.project.timeline.tracks[0]
+        host.apply_commands([SetTrackState(track.id, locked=True)], "ロック")
+        before = host.project
+        with pytest.raises(ToolError):
+            _run(host, "cut_range", start_frame=0, end_frame=30)
+        assert host.project == before
 
     @pytest.mark.parametrize(
         ("start", "end"), [(30, 30), (40, 30), (-1, 30), (0, 301), ("0", 30), (0.5, 30)]
@@ -1001,6 +1109,17 @@ class TestJetCutSaysWhatWentWithIt:
         host.apply_commands([AddTrack(words)], "重ね")
         result = _run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
         assert [row["clip_id"] for row in result["removed_clips"]] == [str(placed.id)]
+
+    def test_a_dropped_work_area_is_said_so(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、無音カットで書き出す範囲が外れたことに気付かず全体を書き出す"""
+        host, media, _extra = self._work(video_media, audio_media)
+        project = host.project
+        host.document.reset(project.with_timeline(replace(project.timeline, work_area=(0, 200))))
+        result = _run(host, "jet_cut", media_id=str(media.id), keep_speech=False)
+        assert result["work_area"] is None
+        assert "書き出す範囲" in result["note"]
 
     def test_the_cut_media_is_not_counted(
         self, video_media: MediaItem, audio_media: MediaItem
