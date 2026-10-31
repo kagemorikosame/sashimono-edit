@@ -1352,6 +1352,7 @@ class ChatPanel(QWidget):
             self._turns_done += 1
             if event.kind is EventKind.CLOSED and self._turn_started is not None:
                 # 応えている途中で会話が閉じた 続けて送ってあった指示も、もう返ってこない
+                self._turn_error = True
                 self._record.stop(
                     StopReason.DISCONNECTED, "応えている途中で Claude Code との会話が閉じました"
                 )

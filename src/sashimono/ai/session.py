@@ -32,7 +32,12 @@ from sashimono.ai.environment import (
 from sashimono.ai.models import effort_for
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.plan import GET_PLAN, SET_PLAN, UPDATE_PLAN_STEP
-from sashimono.ai.server import MAX_MESSAGE_BYTES, SERVER_NAME, build_server
+from sashimono.ai.server import (
+    MAX_MESSAGE_BYTES,
+    MCP_OUTPUT_TOKENS,
+    SERVER_NAME,
+    build_server,
+)
 from sashimono.core.model import LayerMode
 
 __all__ = [
@@ -304,8 +309,12 @@ class AgentSession:
         self._busy = threading.Event()
         self._closed = threading.Event()
         #: この Claude Code をこれ以上使えないので、次の指示は起動し直す
-        #: 会話のスレッドだけが読み書きする
         self._finished = False
+        #: 会話のスレッドが終わると決めた 決めた後に送られた指示は、新しいスレッドで受ける
+        self._ended = False
+        #: 終わると決める所と、指示を積む所を並べる 並べないと、空と見て終わるのと同時に積まれた
+        #: 指示が、誰も取り出さないキューに残る
+        self._sending = threading.RLock()
         #: Claude Code が作った失敗の言葉と印（文, 印） 指示の結果が来るまで持っておく
         self._made_up: tuple[str, str] | None = None
         #: 画面が前の指示の区切り（取り消しの段）を付け終えたか
@@ -318,7 +327,7 @@ class AgentSession:
 
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._thread is not None and self._thread.is_alive() and not self._ended
 
     @property
     def model(self) -> str | None:
@@ -346,10 +355,19 @@ class AgentSession:
         return self._busy.is_set()
 
     def start(self) -> None:
+        with self._sending:
+            self._start()
+
+    def _start(self) -> None:
         if self.running:
             return
+        if self._finished:
+            # 畳み終えた知らせを画面がまだ拾っていない 区切りは TURN_DONE で済んでいるので捨てる
+            # 残すと、今から送る指示まで「閉じた」と画面が消す
+            self._drop_closed()
         self._closed.clear()
         self._finished = False
+        self._ended = False
         # 前の接続が繋がる前に落ちると（Claude Code が見つからない・ログインが
         # まだ、など）、取られなかった指示が残る 残したまま繋ぎ直すと、画面が
         # 捨てた指示を黙って先に実行し、その編集が次の指示の取り消しの段へ入る
@@ -360,9 +378,10 @@ class AgentSession:
 
     def send(self, prompt: str) -> None:
         """指示を送る まだ繋がっていなければ繋いでから送る"""
-        self.start()
-        self._bridge.resume()
-        self._prompts.put(prompt)
+        with self._sending:
+            self.start()
+            self._bridge.resume()
+            self._prompts.put(prompt)
 
     def acknowledge_turn(self) -> None:
         """TURN_DONE を受けて区切りを付け終えた 次の指示を始めてよい
@@ -431,15 +450,29 @@ class AgentSession:
     # --- エージェントスレッド ---
 
     def _run(self) -> None:
-        try:
-            asyncio.run(self._main())
-        except Exception as exc:  # スレッドの外へ例外を出さない
-            self._emit(_failure_of(exc))
-        finally:
-            self._loop = None
-            self._client = None
-            self._busy.clear()
-            self._emit(AgentEvent(EventKind.CLOSED))
+        while True:
+            try:
+                asyncio.run(self._main())
+            except Exception as exc:  # スレッドの外へ例外を出さない
+                self._emit(_failure_of(exc))
+            finally:
+                self._loop = None
+                self._client = None
+                self._busy.clear()
+            with self._sending:
+                if self._finished and not self._closed.is_set() and not self._prompts.empty():
+                    # Claude Code を畳んでいる間に送られた指示がある 画面は TURN_DONE を見て
+                    # 受け付けたので、CLOSED を出すと捨ててしまう 起動し直して渡す
+                    self._finished = False
+                    continue
+                self._ended = True
+                self._emit(AgentEvent(EventKind.CLOSED))
+                return
+
+    def _drop_closed(self) -> None:
+        for event in self.poll():
+            if event.kind is not EventKind.CLOSED:
+                self._emit(event)
 
     async def _main(self) -> None:
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -501,7 +534,12 @@ class AgentSession:
             "cwd": str(self._cwd or conversation_folder()),
             # 本人の自動メモは「AI へ送る物」の同意の表に無い setting_sources を空にしても
             # 文脈に入る（実物で確かめた） --bare でも止まるが、OAuth のログインを読まなくなる
-            "env": {AUTO_MEMORY_OFF: "1", **claude_environment()},
+            # 長い結果をファイルへ逃がすトークンの数も上げる（server.py の MCP_OUTPUT_TOKENS）
+            "env": {
+                AUTO_MEMORY_OFF: "1",
+                "MAX_MCP_OUTPUT_TOKENS": str(MCP_OUTPUT_TOKENS),
+                **claude_environment(),
+            },
             # 会話の全文と、Claude Code が取っておく絵のファイルをホームの下に残さない
             # このアプリは会話を再開しないので、残す値打ちが無い
             "extra_args": {"no-session-persistence": None},

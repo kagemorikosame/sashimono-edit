@@ -21,10 +21,11 @@ import pytest
 
 from sashimono.ai import environment
 from sashimono.ai.bridge import EditorBridge
+from sashimono.ai.budget import IMAGE_EDGES
 from sashimono.ai.environment import AI_PACK
 from sashimono.ai.models import effort_for
 from sashimono.ai.operations import ImageResult
-from sashimono.ai.server import _content
+from sashimono.ai.server import MAX_RESULT_CHARS, _content
 from sashimono.ai.session import AUTO_MEMORY_OFF, AgentSession, EventKind
 from sashimono.ai.sheet import MAX_SHEET_EDGE
 from sashimono.runtime import install_command
@@ -282,6 +283,26 @@ class TestSessionOptions:
         del machine
         session = AgentSession(cast(EditorBridge, object()), cwd=tmp_path)
         assert session.option_values()["cwd"] == str(tmp_path)
+
+    def test_a_long_text_result_never_reaches_claude_code(self) -> None:
+        # Claude Code は長い結果をホームの下のファイルへ逃がす 記録を止めても残るので（実物で
+        # 確かめた）、壊れると字幕の全文がファイルに残り、道具を持たない AI は読めもしない
+        sent = _content("あ" * (MAX_RESULT_CHARS + 1))
+        assert sent["is_error"] is True
+        assert "あ" not in sent["content"][0]["text"]
+        assert "絞って" in sent["content"][0]["text"]
+        assert "is_error" not in _content("あ" * MAX_RESULT_CHARS)
+
+    def test_dense_text_is_not_moved_to_a_file_by_its_token_count(self, machine: Path) -> None:
+        # 漢字の多い文は 1 文字が 1 トークンを超えることがある 既定の 25000 トークンのままだと、
+        # 文字数の上限より先に Claude Code がファイルへ逃がす
+        del machine
+        limit = int(_session().option_values()["env"]["MAX_MCP_OUTPUT_TOKENS"])
+        assert limit >= MAX_RESULT_CHARS * 3
+
+    def test_every_picture_size_the_settings_offer_fits_the_message(self) -> None:
+        # 設定で選べる長い辺を上限より大きくすると、1 通の上限の見積もりが外れて会話が落ちる
+        assert max(IMAGE_EDGES) <= MAX_SHEET_EDGE
 
     def test_a_single_message_can_hold_the_largest_picture(self, machine: Path) -> None:
         # 壊れると、Claude Code が絵を 2 回書いた 1 通が上限を越えて、編集の途中で会話が落ちる

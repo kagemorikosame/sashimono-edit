@@ -32,6 +32,8 @@ from sashimono.core.io.serialize import json_text
 
 __all__ = [
     "MAX_MESSAGE_BYTES",
+    "MAX_RESULT_CHARS",
+    "MCP_OUTPUT_TOKENS",
     "SERVER_NAME",
     "build_server",
     "build_tools",
@@ -52,6 +54,15 @@ _LARGEST_IMAGE_BYTES = MAX_SHEET_EDGE * MAX_SHEET_EDGE * 4
 #: 道具の結果は 1 つずつ別の 1 通で届く（通しの確かめの記録で、並べて呼んだ道具も別の通だった）
 #: 上限は読むときの見張りで、前もって確保する量ではないので、大きくしても使う記憶は増えない
 MAX_MESSAGE_BYTES = (_LARGEST_IMAGE_BYTES * 4 // 3 + 4) * 2 + 1024 * 1024
+
+#: 道具の結果の文の上限（文字） Claude Code は約 5 万文字を超えた結果を、記録を止めていても
+#: ホームの下のファイルへ逃がし、頭だけを AI へ渡す（2.1.314 で 4.5 万文字は届き、6 万文字は
+#: 逃がされた） 字幕の全文が残るうえ、道具を持たない AI はファイルを読めないので、ここで断って
+#: 絞らせる 一覧の道具はこれより短く切って返すので、ふだんの結果は当たらない
+MAX_RESULT_CHARS = 45_000
+#: Claude Code の ``MAX_MCP_OUTPUT_TOKENS`` トークンの数でも逃がすので（既定 25000）、
+#: 上限いっぱいの文が当たらない値にする 漢字の多い文でも 1 文字 3 トークンには届かない
+MCP_OUTPUT_TOKENS = MAX_RESULT_CHARS * 3
 
 
 def tool_name(operation: Operation | str) -> str:
@@ -142,6 +153,11 @@ def _content(result: object) -> dict[str, Any]:
     # 効果の値には読めないバイトを持つ文字が入りうる そのまま渡すと、返事を
     # UTF-8 にする所で落ちる（json_text を参照）
     text = result if isinstance(result, str) else json_text(result, default=str)
+    if len(text) > MAX_RESULT_CHARS:
+        return _error(
+            f"結果が長すぎます（{len(text)} 文字 上限 {MAX_RESULT_CHARS} 文字）"
+            " offset と limit、言葉や時刻で絞ってください"
+        )
     return {"content": [{"type": "text", "text": text}]}
 
 

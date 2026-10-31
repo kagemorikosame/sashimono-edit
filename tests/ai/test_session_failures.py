@@ -7,7 +7,9 @@ CI には SDK が入らないので、SDK の形は偽物で作る 値の形は�
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import types
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -84,6 +86,8 @@ class _Client:
 
     replies: ClassVar[list[list[object] | BaseException]] = []
     made: ClassVar[int] = 0
+    #: 立つまで終了処理を終えない 無ければすぐ終える
+    leaving: ClassVar[threading.Event | None] = None
 
     def __init__(self, options: object) -> None:
         del options
@@ -93,7 +97,9 @@ class _Client:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
-        return None
+        leaving = _Client.leaving
+        if leaving is not None:
+            await asyncio.to_thread(leaving.wait)
 
     async def query(self, prompt: str) -> None:
         del prompt
@@ -127,9 +133,12 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(AgentSession, "option_values", lambda _self: {})
     _Client.replies = []
     _Client.made = 0
+    _Client.leaving = None
     _sessions.clear()
     yield
     # 落ちた試験の会話も畳む 残すと、会話のスレッドが指示を待ったままで、試験の終わりに止まる
+    if _Client.leaving is not None:
+        _Client.leaving.set()
     for made in _sessions:
         made.close()
 
@@ -367,6 +376,63 @@ class TestMessageTooLarge:
         session.close()
         assert _Client.made == 2
         assert [event.text for event in later if event.kind is EventKind.TEXT] == ["続けます"]
+
+    def _held_shutdown(self) -> threading.Event:
+        """Claude Code の終了処理を止めておく 戻り値を立てると終わる"""
+        release = threading.Event()
+        _Client.leaving = release
+        return release
+
+    def test_a_prompt_sent_while_closing_runs_in_the_next_conversation(self) -> None:
+        # 壊れると、失敗の後すぐに〔続きを頼む〕を送った指示が、終わる会話のキューに入って捨てられ、
+        # 画面も「閉じた」と待ちの指示を消す
+        release = self._held_shutdown()
+        session = _session()
+        _Client.replies = [self._failure(), [_Assistant([_Text("続けます")]), _Result()]]
+        session.send("1 つ目")
+        seen = _until(session, EventKind.TURN_DONE)
+        session.acknowledge_turn()
+        session.send("続きを頼む")
+        release.set()
+        seen += _until(session, EventKind.TEXT)
+        assert _Client.made == 2
+        assert EventKind.CLOSED not in [event.kind for event in seen]
+
+    def test_a_prompt_sent_while_closing_after_a_login_failure_is_not_lost(self) -> None:
+        # ログインの失敗の後も同じ畳み方をする 壊れると、ログインし直して送った指示が消える
+        release = self._held_shutdown()
+        session = _session()
+        _Client.replies = [_expired_turn(), [_Assistant([_Text("直りました")]), _Result()]]
+        session.send("1 つ目")
+        _until(session, EventKind.TURN_DONE)
+        session.acknowledge_turn()
+        session.send("もう一度")
+        release.set()
+        later = _until(session, EventKind.TEXT)
+        assert [event.text for event in later if event.kind is EventKind.TEXT] == ["直りました"]
+
+    def test_a_prompt_queued_during_the_failed_turn_runs_next(self) -> None:
+        # 応えている間に続けて送った指示も同じ 壊れると、失敗の巻き添えで黙って消える
+        release = self._held_shutdown()
+        session = _session()
+        _Client.replies = [self._failure(), [_Assistant([_Text("続けます")]), _Result()]]
+        session.send("1 つ目")
+        session.send("2 つ目")
+        _until(session, EventKind.TURN_DONE)
+        session.acknowledge_turn()
+        release.set()
+        later = _until(session, EventKind.TEXT)
+        assert [event.text for event in later if event.kind is EventKind.TEXT] == ["続けます"]
+
+    def test_a_prompt_sent_before_the_screen_saw_the_close_is_not_undone(self) -> None:
+        # 畳み終えた知らせを画面が拾う前に送ると、古い知らせが新しい指示を「閉じた」と消す
+        session = _session()
+        _Client.replies = [self._failure(), [_Assistant([_Text("続けます")]), _Result()]]
+        session.send("1 つ目")
+        wait_until(lambda: _Client.made == 1 and not session.running, "畳み終わり")
+        session.send("2 つ目")
+        seen = _until(session, EventKind.TEXT)
+        assert EventKind.CLOSED not in [event.kind for event in seen]
 
     def test_the_real_sdk_error_is_recognized(self) -> None:
         """SDK が名前か文面を変えると、見分けられずに英語のまま出る"""

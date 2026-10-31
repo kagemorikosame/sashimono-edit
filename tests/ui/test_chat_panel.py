@@ -1156,6 +1156,18 @@ class TestRunningStatus:
         assert "失敗（" in _text(widget)
         assert _status(widget) == "待機中"
 
+    def test_a_conversation_closing_mid_turn_is_not_called_finished(
+        self, recorded: tuple[ChatPanel, list[_RecordingSession]]
+    ) -> None:
+        # エラーの知らせが無くても、応える途中で閉じた指示は済んでいない
+        # 壊れると、応えが返らなかった指示の区切りに「完了」と出る
+        widget, _ = recorded
+        widget._input.setPlainText("切って")
+        widget.send()
+        widget._handle(AgentEvent(EventKind.CLOSED))
+        assert "失敗（" in _text(widget)
+        assert "完了（" not in _text(widget)
+
     def test_a_turn_ending_without_a_prompt_adds_no_divider(
         self, timed: tuple[ChatPanel, list[_RecordingSession], _Clock]
     ) -> None:
