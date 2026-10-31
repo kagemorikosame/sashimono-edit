@@ -88,12 +88,16 @@ class _Client:
     made: ClassVar[int] = 0
     #: 立つまで終了処理を終えない 無ければすぐ終える
     leaving: ClassVar[threading.Event | None] = None
+    #: 真なら Claude Code の起動に失敗する
+    broken: ClassVar[bool] = False
 
     def __init__(self, options: object) -> None:
         del options
         _Client.made += 1
 
     async def __aenter__(self) -> _Client:
+        if _Client.broken:
+            raise RuntimeError("起動に失敗しました")
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -136,6 +140,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     _Client.replies = []
     _Client.made = 0
     _Client.leaving = None
+    _Client.broken = False
     _sessions.clear()
     yield
     # 落ちた試験の会話も畳む 残すと、会話のスレッドが指示を待ったままで、試験の終わりに止まる
@@ -373,6 +378,32 @@ class TestLoginFailure:
 
 # SDK と同じ名前にする 見分けは名前で行う（SDK を読まずに文を作る所なので）
 _TooLargeError: type[Exception] = type("CLIJSONDecodeError", (Exception,), {})
+
+
+class TestFailedStart:
+    def test_a_prompt_sent_before_the_screen_saw_the_failure_does_not_run(self) -> None:
+        # 画面は閉じた知らせで待ちの指示を全部消し、始まらなかった指示として残す 同じ指示を裏で
+        # 走らせると、画面が見ていない会話で編集だけが進み、取り消しの段にも入らない
+        session = _session()
+        _Client.broken = True
+        session.send("1 つ目")
+        wait_until(lambda: not session.running, "起動の失敗")
+        _Client.broken = False
+        session.send("2 つ目")
+        assert session.running is False
+        assert _Client.made == 1
+
+    def test_the_prompt_after_the_screen_saw_the_failure_starts_again(self) -> None:
+        # 壊れると、起動に失敗した後はいつまでも指示が走らない
+        session = _session()
+        _Client.broken = True
+        session.send("1 つ目")
+        _until(session, EventKind.CLOSED)
+        _Client.broken = False
+        _Client.replies = [[_Assistant([_Text("始めます")]), _Result()]]
+        session.send("2 つ目")
+        later = _until(session, EventKind.TEXT)
+        assert [event.text for event in later if event.kind is EventKind.TEXT] == ["始めます"]
 
 
 class TestMessageTooLarge:

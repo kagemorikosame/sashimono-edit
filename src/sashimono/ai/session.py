@@ -380,6 +380,11 @@ class AgentSession:
     def send(self, prompt: str) -> None:
         """指示を送る まだ繋がっていなければ繋いでから送る"""
         with self._sending:
+            if not self.running and not self._finished and self._closed_unread():
+                # 起動に失敗した知らせを画面がまだ拾っていない 画面はそれを見て待ちの指示を全部
+                # 消し、始まらなかった指示として残す ここで走らせると、画面の見ていない会話で
+                # 編集だけが進む
+                return
             self.start()
             self._bridge.resume()
             self._prompts.put(prompt)
@@ -469,6 +474,10 @@ class AgentSession:
                 self._ended = True
                 self._emit(AgentEvent(EventKind.CLOSED))
                 return
+
+    def _closed_unread(self) -> bool:
+        with self._events.mutex:
+            return any(event.kind is EventKind.CLOSED for event in self._events.queue)
 
     def _drop_closed(self) -> None:
         for event in self.poll():
