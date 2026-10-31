@@ -27,7 +27,7 @@ from sashimono.ai.handoff import (
 )
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.outbound import TEXT_MARK, Outbound, SendChoice
-from sashimono.ai.session import LIMIT_DETAIL, EventKind, result_error
+from sashimono.ai.session import LIMIT_DETAIL, LOGIN_DETAIL, EventKind, result_error
 from sashimono.core.commands import Author, Document, RenameProject, SplitClip
 from sashimono.core.model import MediaItem, Project, Transcript
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
@@ -503,7 +503,7 @@ class TestLimitFromClaudeCode:
     def test_other_failures_stay_errors(self) -> None:
         # 壊れると、ログインが要る失敗まで「上限」と読め、ログインの案内も消える
         event = result_error("error_during_execution", "Not logged in /login")
-        assert event.detail == ""
+        assert event.detail == LOGIN_DETAIL
         assert "ログイン" in event.text
 
 

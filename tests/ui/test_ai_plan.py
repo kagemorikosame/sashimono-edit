@@ -20,7 +20,7 @@ from sashimono.ai.handoff import Handoff, StopReason, shelf_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.plan import PAUSED_MESSAGE, RESUME_PROMPT, Stopped, plan_for
-from sashimono.ai.session import LIMIT_DETAIL, PLAN_RULES, AgentEvent, EventKind
+from sashimono.ai.session import LIMIT_DETAIL, LOGIN_DETAIL, PLAN_RULES, AgentEvent, EventKind
 from sashimono.core.model import MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.plan_box import _STOPPED_HINTS, PAUSE_TEXT, PAUSING_TEXT
@@ -204,6 +204,27 @@ class TestPlanBox:
         monkeypatch.setattr(SetupSection, "status", property(lambda _self: broken))
         widget._on_parts_updated(False, "")
         assert widget._plan_box.resume_button.isEnabled() is False
+
+    def test_resuming_waits_for_the_login_button_after_a_login_failure(
+        self,
+        made: tuple[ChatPanel, FakeHost, list[_RecordingSession]],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # 壊れると、ログインが切れたまま〔続ける〕を押して同じ失敗を繰り返す 〔続きを頼む〕と揃える
+        from sashimono.ui.chat import panel as panel_module
+
+        widget, host, _ = made
+        _send(widget, "無音を詰めて")
+        _plan(host, "a", "b")
+        widget._handle(AgentEvent(EventKind.ERROR, text="切れています", detail=LOGIN_DETAIL))
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        assert widget._plan_box.resume_button.isEnabled() is False
+
+        monkeypatch.setattr(panel_module, "claude_cli", lambda: tmp_path / "claude.exe")
+        monkeypatch.setattr(panel_module, "open_login_window", lambda _cli: None)
+        widget._login_button.click()
+        assert widget._plan_box.resume_button.isEnabled()
 
     def test_a_long_goal_does_not_widen_the_panel(
         self, made: tuple[ChatPanel, FakeHost, list[_RecordingSession]]
