@@ -128,6 +128,8 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     fake.ClaudeAgentOptions = lambda **_kwargs: object()
     fake.ClaudeSDKClient = _Client
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(session_module, "build_server", lambda _bridge, **_options: None)
     monkeypatch.setattr(session_module, "hide_cli_console", lambda: None)
     monkeypatch.setattr(AgentSession, "option_values", lambda _self: {})
@@ -305,6 +307,30 @@ class TestLoginFailure:
         text = with_login_hint("Invalid API key · Please run /login")
         assert "切れて" not in text
         assert "ANTHROPIC_API_KEY" in text
+
+    @pytest.mark.parametrize(
+        "name", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
+    )
+    def test_a_rejected_key_names_the_variable_to_fix(
+        self, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Claude Code は環境変数の鍵を保存したログインより先に使う 壊れると、/login の案内に
+        # 従っても無効な鍵が残り、同じ失敗を繰り返す 値は書かず、名前だけを言う
+        monkeypatch.setenv(name, "ZZ412")
+        event = result_error("success", EXPIRED, code="authentication_failed")
+        assert event.detail == LOGIN_DETAIL
+        assert name in event.text
+        assert "/login" not in event.text
+        assert "ZZ412" not in event.text
+
+    def test_a_rejected_key_at_startup_is_marked_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 壊れると、起動で断られた人の画面に〔ログイン…〕の箱が出ず、〔続きを頼む〕が出る
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ZZ412")
+        session = _session()
+        _Client.replies = [RuntimeError("API Error: 401 Unauthorized")]
+        session.send("指示")
+        events = _until(session, EventKind.CLOSED)
+        assert [event.detail for event in events if event.kind is EventKind.ERROR] == [LOGIN_DETAIL]
 
     def test_a_saved_login_with_other_words_is_still_expired(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

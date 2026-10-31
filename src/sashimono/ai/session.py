@@ -26,6 +26,7 @@ from sashimono.ai.environment import (
     bundled_claude_cli,
     claude_environment,
     conversation_folder,
+    credential_variables,
     find_claude_cli,
     uses_saved_login,
 )
@@ -746,7 +747,7 @@ def _summarize(value: object, limit: int = 160) -> str:
 def _failure_of(exc: BaseException) -> AgentEvent:
     """例外を画面の知らせへ ログインの案内に置き換えた文なら印を付ける"""
     text = _explain(exc)
-    login = text in (LOGIN_HINT, LOGIN_EXPIRED_GUIDE)
+    login = text in (LOGIN_HINT, LOGIN_EXPIRED_GUIDE) or text.startswith(_KEY_REJECTED)
     return AgentEvent(EventKind.ERROR, text=text, detail=LOGIN_DETAIL if login else "")
 
 
@@ -863,6 +864,11 @@ LOGIN_EXPIRED_GUIDE = (
 )
 
 
+#: 環境変数の鍵が断られたときの案内の頭 Claude Code は環境変数の鍵を保存したログインより先に
+#: 使うので、/login では直らない
+_KEY_REJECTED = "Claude が環境変数の鍵を受け付けませんでした"
+
+
 def _needs_login(text: str) -> bool:
     return _LOGIN_MARKERS.search(text) is not None
 
@@ -873,6 +879,10 @@ def _login_guide(text: str) -> str:
     Claude Code の文面は版で変わるので、文が切れたと言わなくても、保存したログインで使っている
     人には切れた側を出す（どちらでも /login で直る） 中身は読まない
     """
+    given = credential_variables()
+    if given:
+        names = "・".join(given)
+        return f"{_KEY_REJECTED} {names} の値を確かめるか消して、ソフトを再起動してください"
     return LOGIN_EXPIRED_GUIDE if uses_saved_login() or "expired" in text.lower() else LOGIN_HINT
 
 

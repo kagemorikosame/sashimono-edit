@@ -152,6 +152,18 @@ class TestCredentials:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         assert environment.credentials_found() is True
 
+    def test_a_relative_config_folder_finds_the_saved_login(
+        self, machine: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、相対の置き場を使う人のログインを見つけられず、案内と箱の見分けが外れる
+        del machine
+        (tmp_path / "設定").mkdir()
+        (tmp_path / "設定" / ".credentials.json").write_text("{}", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "設定")
+        assert environment.credentials_found() is True
+        assert environment.uses_saved_login() is True
+
     def test_the_login_window_runs_only_claude_code(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

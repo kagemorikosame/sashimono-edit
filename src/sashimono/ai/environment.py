@@ -28,6 +28,7 @@ __all__ = [
     "claude_cli",
     "claude_environment",
     "conversation_folder",
+    "credential_variables",
     "credentials_found",
     "find_claude_cli",
     "install_command",
@@ -123,8 +124,13 @@ def uses_saved_login() -> bool:
     return _saved_login_found() and not _key_in_environment()
 
 
+def credential_variables() -> tuple[str, ...]:
+    """鍵が入っている環境変数の名前 値は読まない 案内で直す所を言うのに使う"""
+    return tuple(name for name in _CREDENTIAL_VARIABLES if os.environ.get(name))
+
+
 def _key_in_environment() -> bool:
-    return any(os.environ.get(name) for name in _CREDENTIAL_VARIABLES)
+    return bool(credential_variables())
 
 
 def _saved_login_found() -> bool:
