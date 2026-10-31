@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,8 @@ from sashimono.core.model import (
     ClipId,
     MediaItem,
     Project,
+    SegmentId,
+    SubtitleOrigin,
     Track,
     TrackKind,
     new_group_id,
@@ -29,7 +32,10 @@ from sashimono.core.model import (
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.subtitle.dialogs import JetCutDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.test_subtitle_panel import make_waveform
+from tests.waiting import GUARD_SECONDS
 
 
 @pytest.fixture(autouse=True)
@@ -353,3 +359,174 @@ class TestPreferences:
         assert dialog.preferences() == chosen
         dialog._ripple_playhead.setChecked(True)
         assert dialog.preferences().ripple_playhead is True
+
+
+class TestClosingTheWindow:
+    def test_a_waiting_assistant_is_let_go(self, qt_application: QApplication) -> None:
+        # 壊れると、閉じた窓の字幕起こしを AI が待つ秒の上限まで待ち続ける（#413）
+        window = _open(qt_application, _project(Track(TrackKind.VIDEO, "V1", (_text(0, 30),))))
+        waiter = window.transcription_waiter()
+        window._subtitles._settled.clear()
+        assert not waiter(0.0)
+        answers: list[bool] = []
+        waiting = threading.Thread(target=lambda: answers.append(waiter(GUARD_SECONDS)))
+        waiting.start()
+        window.close()
+        waiting.join(GUARD_SECONDS)
+        # 上限まで待ち切ると偽が返る 真なら閉じたときに放された
+        assert answers == [True]
+
+
+class TestLayersFollow:
+    """削除して詰めるとき、別のトラックの重ねの層も動かす設定（#413）"""
+
+    @staticmethod
+    def _with_title(qt_application: QApplication, video_media: MediaItem) -> MainWindow:
+        first = Clip(timeline_start=0, duration=30, media_id=video_media.id)
+        second = Clip(timeline_start=30, duration=30, media_id=video_media.id)
+        title = _text(40, 10)
+        return _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (first, second)),
+                Track(TrackKind.VIDEO, "T1", (title,)),
+                media=(video_media,),
+            ),
+        )
+
+    @staticmethod
+    def _title_start(window: MainWindow) -> int:
+        return window.document.project.timeline.tracks[1].clips[0].timeline_start
+
+    def test_the_title_moves_with_the_cut(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、画面で詰めた人のテロップと字幕が話している絵からずれる
+        window = self._with_title(qt_application, video_media)
+        try:
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert self._title_start(window) == 10
+        finally:
+            window.close()
+
+    def test_turning_it_off_leaves_the_title(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 切っても動くなら、設定がある方が質が悪い
+        window = self._with_title(qt_application, video_media)
+        try:
+            window._apply_preferences(replace(window._preferences, ripple_layers=False))
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert self._title_start(window) == 40
+        finally:
+            window.close()
+
+    def test_the_assistant_reads_the_same_setting(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、人が切った設定を AI の詰める削除が無視する
+        window = self._with_title(qt_application, video_media)
+        try:
+            assert window.ripple_follows_layers is True
+            window._apply_preferences(replace(window._preferences, ripple_layers=False))
+            assert window.ripple_follows_layers is False
+        finally:
+            window.close()
+
+    def test_a_lost_clip_is_told_on_the_status_line(
+        self, qt_application: QApplication, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        # 壊れると、人の画面でも頼んでいない音や字幕が黙って消える
+        first = Clip(timeline_start=0, duration=30, media_id=video_media.id)
+        second = Clip(timeline_start=30, duration=30, media_id=video_media.id)
+        effect = Clip(timeline_start=10, duration=5, media_id=audio_media.id)
+        window = _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (first, second)),
+                Track(TrackKind.AUDIO, "効果音", (effect,)),
+                media=(video_media, audio_media),
+            ),
+        )
+        try:
+            told: list[str] = []
+            window._timeline.status_message.connect(told.append)
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert window.document.project.timeline.tracks[1].clips == ()
+            assert any("別のトラックの 1 本" in message for message in told)
+            assert "Ctrl+Z" in window.statusBar().currentMessage()
+        finally:
+            window.close()
+
+    def test_the_jet_cut_window_tells_it_in_the_real_window(
+        self,
+        qt_application: QApplication,
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、窓の無音カットは作品が変わる前に数えて、消えた字幕を知らせない
+        main = Clip(timeline_start=0, duration=300, media_id=video_media.id)
+        burned = replace(
+            _text(10, 5), subtitle_origin=SubtitleOrigin(video_media.id, 1, SegmentId("s1"))
+        )
+        window = _open(
+            qt_application,
+            _project(
+                Track(TrackKind.VIDEO, "V1", (main,)),
+                Track(TrackKind.VIDEO, "字幕", (burned,)),
+                media=(video_media,),
+            ),
+        )
+        try:
+            panel = window._subtitles
+            panel.select_media(video_media.id)
+            waveform = make_waveform([(0.0, 400), (0.5, 1500)])
+            monkeypatch.setattr(panel._analyzer, "waveform", lambda *_args: waveform)
+            monkeypatch.setattr(JetCutDialog, "exec", lambda self: 1)
+            panel.jet_cut()
+            assert window.document.project.timeline.tracks[1].clips == ()
+            assert window.statusBar().currentMessage().startswith("焼き込んだ字幕 1 本")
+        finally:
+            window.close()
+
+    def test_nothing_lost_tells_nothing(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        # 壊れると、ふつうに詰めただけで毎回知らせが出る
+        window = self._with_title(qt_application, video_media)
+        try:
+            told: list[str] = []
+            window._timeline.status_message.connect(told.append)
+            window.select_clip(_clip(window, 0, 0))
+            _ripple_by_menu(window)
+            assert not any("別のトラック" in message for message in told)
+        finally:
+            window.close()
+
+    def test_the_default_follows(self) -> None:
+        # 既定は知らない人が困らない側 切れていると詰めるたびに字幕がずれる
+        assert Preferences().ripple_layers is True
+
+    def test_the_choice_is_saved(self, tmp_path: Path) -> None:
+        # 保存されないと、切った人が起動するたびに切り直すことになる
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(Preferences(ripple_layers=False))
+        assert store.load().ripple_layers is False
+
+    def test_a_broken_value_falls_back(self, tmp_path: Path) -> None:
+        # 壊れた値で起動を止めない 項目ごとに既定へ戻す
+        path = tmp_path / "preferences.json"
+        path.write_text(json.dumps({"ripple_layers": "はい"}), encoding="utf-8")
+        assert PreferenceStore(path).load().ripple_layers is True
+
+    def test_the_dialog_shows_and_returns_it(self, qt_application: QApplication) -> None:
+        # 画面に出ていない、または OK で返らないと、設定画面から切れない
+        del qt_application
+        chosen = Preferences(ripple_layers=False)
+        dialog = PreferencesDialog(chosen)
+        assert dialog.preferences() == chosen
+        dialog._ripple_layers.setChecked(True)
+        assert dialog.preferences().ripple_layers is True

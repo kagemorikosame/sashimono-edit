@@ -67,6 +67,7 @@ from sashimono.core.commands.insert import (
     insert_generated,
     insert_media,
     place_media,
+    place_media_spans,
 )
 from sashimono.core.commands.markers import (
     MARKER_LABEL_LIMIT,
@@ -214,6 +215,7 @@ __all__ = [
     "match_commands",
     "new_scene",
     "place_media",
+    "place_media_spans",
     "reorder_group",
     "resolve_param",
     "subtitle_voices",

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 
 import pytest
@@ -17,15 +18,18 @@ from sashimono.core.commands import (
     SetTranscript,
     insert_media,
 )
-from sashimono.core.jetcut import merge_ranges, plan_cuts
+from sashimono.core.jetcut import cut_targets, merge_ranges, plan_cuts
 from sashimono.core.model import (
     Clip,
     MediaItem,
     Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
     Transcript,
 )
 from sashimono.core.projection import project_timeline
-from tests.conftest import make_clip
+from tests.conftest import RATE_30, make_clip
 
 #: 素材の無音区間（ソース秒） 発話は 1-3 / 4-6 / 7-9 秒にある
 SILENCES = (
@@ -262,3 +266,40 @@ def test_the_silence_of_voice_two_is_cut_where_voice_two_plays() -> None:
     assert plan_cuts(project, media.id, quiet, stream=2) == ((15, 30),)
     # 音を渡さなければ前と同じく、素材のクリップすべての位置で切る
     assert plan_cuts(project, media.id, quiet) == ((15, 30), (75, 90))
+
+
+class TestCutTargets:
+    """無音カットが頼まれて消す相手（#413）"""
+
+    @staticmethod
+    def _work(media: MediaItem) -> tuple[Project, Clip, Clip]:
+        """素材の 2〜4 秒が無音 A は素材を頭から、B は別のトラックの 3〜4 秒に素材の頭を置く"""
+        whole = make_clip(0, 300, media)
+        other = make_clip(90, 30, media)
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(media,))
+        tracks = (
+            Track(kind=TrackKind.VIDEO, name="V1", clips=(whole,)),
+            Track(kind=TrackKind.VIDEO, name="V2", clips=(other,)),
+        )
+        return project.with_timeline(replace(project.timeline, tracks=tracks)), whole, other
+
+    def test_a_clip_with_no_silence_of_its_own_is_not_asked(self, video_media: MediaItem) -> None:
+        """壊れると、自分に無音の無いクリップが別の所の範囲で消えても、頼んだ物に数えて黙る"""
+        project, whole, other = self._work(video_media)
+        silences = ((Fraction(2), Fraction(4)),)
+        assert plan_cuts(project, video_media.id, silences) == ((60, 120),)
+        assert cut_targets(project, video_media.id, silences) == ()
+        assert whole.id not in cut_targets(project, video_media.id, silences)
+        assert other.id not in cut_targets(project, video_media.id, silences)
+
+    def test_a_clip_all_silence_is_asked(self, video_media: MediaItem) -> None:
+        """壊れると、全部が無音で頼まれて消えたクリップまで一緒に消えたと知らせる"""
+        project, _whole, other = self._work(video_media)
+        silences = ((Fraction(0), Fraction(1)),)
+        assert other.id in cut_targets(project, video_media.id, silences)
+
+    def test_a_clip_partly_silent_is_not_asked(self, video_media: MediaItem) -> None:
+        """壊れると、話している所を含むクリップが丸ごと消えても黙る"""
+        project, _whole, other = self._work(video_media)
+        silences = ((Fraction(1, 2), Fraction(4)),)
+        assert other.id not in cut_targets(project, video_media.id, silences)

@@ -1095,6 +1095,21 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._ripple_playhead)
 
+        self._ripple_layers = QCheckBox(
+            "削除して詰めたとき、別のトラックの字幕と重ねの層も一緒に詰める", self
+        )
+        self._ripple_layers.setChecked(preferences.ripple_layers)
+        self._ripple_layers.setToolTip(
+            "「削除して詰める」と AI の詰める削除で、番組の時間が抜けるとき（同じ時間に別の絵が"
+            "残らないとき）だけ、ほかのトラックの字幕・テロップ・場面切り替え・効果音も同じだけ"
+            "前へ動かす 消した所に掛かった字幕とテロップは一緒に消え、場面切り替えは外れる"
+            " 消した所の前後へ曲がまたいでいるトラックとロックしたトラックは動かさない"
+            " 消した所で終わる音はそこで切って一緒に動かし、消した所に収まる音は一緒に消える"
+            "（消えたら状態の行で知らせる）"
+            " 切ると、消したクリップのトラックだけが詰まる"
+        )
+        form.addRow(self._ripple_layers)
+
         # 測った値をそのまま置く 「なんとなく軽くなる」ではなく、
         # どの組が 60fps に入るのかを見て選べるようにする
         # 数は控えの側（sashimono.engine.cache.proxy）から取る ここへ直に書くと、
@@ -1271,6 +1286,7 @@ class PreferencesDialog(QDialog):
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ai_plan_first=self._ai_plan_first.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
+            ripple_layers=self._ripple_layers.isChecked(),
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),
             ai_send_files=self._send_value(Outbound.FILES),

@@ -429,6 +429,7 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "trim_clip": lambda ids: {"clip_id": ids["video"], "tail_delta": -10},
     "move_clip": lambda ids: {"clip_id": ids["video"], "timeline_start": 10},
     "delete_clip": lambda ids: {"clip_id": ids["video"]},
+    "cut_range": lambda _ids: {"start_frame": 0, "end_frame": 10},
     "add_scene": lambda _ids: {"name": "場面"},
     "place_scene": lambda _ids: {"scene_id": "無い"},
     "group_clips": lambda ids: {"clip_ids": [ids["video"], ids["text"]]},

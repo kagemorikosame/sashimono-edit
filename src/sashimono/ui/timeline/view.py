@@ -59,7 +59,9 @@ from sashimono.core.commands.edit import (
     DEFAULT_TRACK_HEIGHT,
     MAX_TRACK_HEIGHT,
     MIN_TRACK_HEIGHT,
+    casualty_notice,
     head_room,
+    ripple_casualties,
     shifted_track,
     tail_room,
     trimmable,
@@ -386,6 +388,8 @@ class TimelineView(QWidget):
         #: 削除して詰めたあと、再生ヘッドを消した所の頭（つなぎ目）へ動かすか
         #: （:meth:`set_ripple_playhead`） 既定は設定の既定と同じ
         self._ripple_playhead = True
+        #: 詰めて消すとき別のトラックの重ねの層も動かすか（:meth:`set_ripple_layers`）
+        self._ripple_layers = True
         #: ヘッダを掴んでトラックの順を入れ替えるドラッグ
         self._track_mover = TrackDragger(self._request)
         #: ドラッグ中に端へ寄ったら表示を送る
@@ -2245,25 +2249,41 @@ class TimelineView(QWidget):
         # 頭は消す前に求める 消した後のプロジェクトには、もう消したクリップが無い
         head = self._earliest_start(removed) if ripple and self._ripple_playhead else None
         command: Command = (
-            RemoveClips(removed, ripple=ripple)
+            RemoveClips(removed, ripple=ripple, layers=ripple and self._ripple_layers)
             if len(removed) > 1
-            else RemoveClip(removed[0], ripple=ripple)
+            else RemoveClip(removed[0], ripple=ripple, layers=ripple and self._ripple_layers)
         )
+        before = self._project
         self._request([command], command.label)
-        if head is None:
-            return
         # ロックしたトラックで断られたとき（受け取った側が戻した）は、どれも残っている
         # そこで動かすと、何も消えていないのに再生ヘッドだけが飛び、消えたように見える
         if any(self._project.timeline.locate_clip(c) is not None for c in removed):
+            return
+        if ripple:
+            self._tell_casualties(before, removed)
+        if head is None:
             return
         # 末尾を消したときは、頭が新しい長さの先に出る そのままだと何も映らない所に
         # 再生ヘッドが残るので、新しい末尾へ寄せる
         self.set_playhead(min(head, self._project.duration))
         self.ripple_landed.emit(self._playhead)
 
+    def _tell_casualties(self, before: Project, removed: tuple[ClipId, ...]) -> None:
+        """頼んでいないのに一緒に消えたクリップを状態の行で知らせる（#413）
+
+        番組の時間と一緒に消えた字幕や音は、タイムラインの見た目だけでは気付きにくい
+        """
+        notice = casualty_notice(ripple_casualties(before, self._project, tuple(removed)))
+        if notice:
+            self.status_message.emit(notice)
+
     def set_ripple_playhead(self, enabled: bool) -> None:
         """削除して詰めたあと再生ヘッドを動かすか 設定（:attr:`Preferences.ripple_playhead`）から"""
         self._ripple_playhead = enabled
+
+    def set_ripple_layers(self, enabled: bool) -> None:
+        """詰めて消すとき重ねの層も動かすか 設定（:attr:`Preferences.ripple_layers`）から"""
+        self._ripple_layers = enabled
 
     def _earliest_start(self, clip_ids: Iterable[ClipId]) -> int | None:
         """渡したクリップと、そのリンクの相手のうち、一番早い頭

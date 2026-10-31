@@ -250,6 +250,8 @@ class TestAppSettingsAreReadOnly:
             "start_transcription",
             "stop_playback",
             "transcription_status",
+            # 起こしの終わりを待つ関数（#413） 待つだけで、作品にも設定にも触らない
+            "transcription_waiter",
             "undo",
             # 人が見ている表示（#352） 読むだけで、何も変えない
             "view_state",

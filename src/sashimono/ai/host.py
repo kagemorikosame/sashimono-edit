@@ -370,6 +370,12 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def ripple_follows_layers(self) -> bool:
+        """詰めて消すとき別のトラックの重ねの層も動かすか
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ripple_layers`）"""
+        ...
+
+    @property
     def splits_media(self) -> bool:
         """動画の映像と音声を別のトラックへ分けて置くか 音声が何本もあれば音ごとに分ける
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.media_split`）
@@ -610,6 +616,19 @@ class EditorHost(Protocol):
 
     def transcription_status(self) -> str:
         """走っている起こし（と話者の分離）の様子"""
+        ...
+
+    @property
+    def transcribing(self) -> bool:
+        """起こしか話者の分離が走っているか・順番を待っているか（#413）"""
+        ...
+
+    def transcription_waiter(self) -> Callable[[float], bool]:
+        """走っている起こしと話者の分離が片付くまで、最長で引数の秒だけ待つ関数
+
+        片付いていれば真を返す 返す関数は**AI のスレッドから呼ばれる**
+        （:meth:`scene_waiter` と同じ）
+        """
         ...
 
     def start_speaker_separation(

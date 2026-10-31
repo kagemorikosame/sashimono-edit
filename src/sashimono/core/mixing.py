@@ -36,6 +36,7 @@ __all__ = [
     "DEFAULT_DUCK_ATTACK_MS",
     "DEFAULT_DUCK_DEPTH_DB",
     "DEFAULT_DUCK_RELEASE_MS",
+    "DEFAULT_PEAK_CEILING_DB",
     "DUCK_ATTACK_MS_RANGE",
     "DUCK_DEPTH_DB_RANGE",
     "DUCK_RELEASE_MS_RANGE",
@@ -278,6 +279,11 @@ def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
         for track in project.timeline.tracks
     )
     return replace(project, timeline=replace(project.timeline, tracks=tracks))
+
+
+#: 音の山の上限の既定（dBFS） 配信の多くが求める -1 dBTP に合わせる 窓と AI の道具と
+#: 検査の直し方が同じ値を見る
+DEFAULT_PEAK_CEILING_DB = -1.0
 
 
 @dataclass(frozen=True, slots=True)
