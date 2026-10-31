@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from math import cos, pi, sin
 
@@ -419,6 +420,94 @@ def test_ring_across_layers_keeps_the_cut_at_the_frame() -> None:
     filled = alpha_of(plain) > 64
 
     assert int(np.nonzero(ink.any(axis=0))[0].max()) <= int(np.nonzero(filled.any(axis=0))[0].max())
+
+
+def outside_frame(source: GeneratedSource) -> np.ndarray:
+    """文字の枠の上下の外の墨 ``False`` にした枠の中は比べない"""
+    image, framed = render_source_framed(source, *SIZE)
+    assert image is not None and framed is not None
+    ink = image[..., 3] > 64
+    ink[math.floor(framed[1]) - 1 : math.ceil(framed[3]) + 1] = False
+    return ink
+
+
+def test_transformed_glyph_stays_inside_the_frame_near_a_plain_glyph() -> None:
+    """素の字の近くでも、変形した字の線は枠の外へ出さない 出ると #184 で切った字の縁が戻る"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    centre = Stroke(params={"width": AnimatedValue(60.0), "color": RED, "position": "center"})
+    joined = text(f"{BLOCK}<tw3><th3>{BLOCK}", centre, layout="aviutl", color=CLEAR)
+    # 変形した字を点まで小さくすると、枠の外に残るのは素の字の線だけになる
+    alone = text(f"{BLOCK}<tw0.001><th0.001>{BLOCK}", centre, layout="aviutl", color=CLEAR)
+
+    expected = outside_frame(alone)
+
+    assert expected.any()
+    assert int((outside_frame(joined) != expected).sum()) <= 8
+
+
+def ring_entry(
+    box: QRectF, *, reverse: bool = False, color: ParamValue = WHITE
+) -> tuple[QPainterPath, sources._Ring, QPainterPath | None, dict[str, object]]:
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    path.addRect(box)
+    shape = path.toReversed() if reverse else path
+    shape.setFillRule(Qt.FillRule.WindingFill)
+    return shape, sources._Ring(width=3.0, colour=RED), None, {"color": color}
+
+
+def test_opaque_glyph_joins_a_translucent_partner() -> None:
+    """不透明の字の線も、重なった相手が透けるならまとめる 残すと相手の塗りを透けて線が見える"""
+    opaque = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0))
+    translucent = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0), color=(1.0, 1.0, 1.0, 0.5))
+
+    joined = sources._joined_rings([opaque, translucent], baked=False)
+
+    assert len(joined) == 1
+
+
+def test_opaque_glyphs_keep_their_own_rings() -> None:
+    """線が全部塗りに隠れる字はまとめない 字幕の縁はほとんどこれで、絵も手間も前のままにする"""
+    first = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0))
+    second = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0))
+
+    assert sources._joined_rings([first, second], baked=False) == [first, second]
+
+
+def test_joining_keeps_overlap_of_opposite_contours() -> None:
+    """輪郭の向きが逆の書体が重なっても、重なった所を残す 足すだけだと巻き数が消えて穴になる"""
+    first = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0), color=CLEAR)
+    second = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0), reverse=True, color=CLEAR)
+
+    joined = sources._joined_rings([first, second], baked=False)
+
+    assert joined[0][0].contains(QPointF(75.0, 50.0))
+
+
+def test_a_font_tag_makes_its_own_layer() -> None:
+    """書体の違う字は別の層にする 輪郭の向きが逆の書体を 1 つのパスへ足すと、重なりが穴になる"""
+    assert len(layers_of(text(f"{BLOCK}{BLOCK}", layout="aviutl"))) == 1
+    assert len(layers_of(text(f"{BLOCK}<@Courier New>{BLOCK}", layout="aviutl"))) == 2
+
+
+def test_overlap_check_compares_only_near_shapes() -> None:
+    """離れた字は ``intersects`` を呼ばずに外す 字ごとに色を変えると組の数が 2 乗で増える"""
+    calls: list[int] = []
+
+    class Counted(QPainterPath):
+        def intersects(self, other: object) -> bool:
+            calls.append(1)
+            return False
+
+    paths = []
+    for index in range(50):
+        path = Counted()
+        path.addRect(QRectF(index * 20.0, 0.0, 10.0, 10.0))
+        paths.append(path)
+
+    assert not sources._overlapping(paths)
+    assert calls == []
 
 
 def test_translucent_shadow_of_layers_is_even_where_they_overlap() -> None:

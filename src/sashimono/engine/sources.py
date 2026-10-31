@@ -1220,7 +1220,9 @@ def _aviutl_lines(
     top = centre_y - block_height * _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5)
 
     # 見た目ごとに、そのまま置いた字と変形した字を分けて持つ（:data:`_Group`）
-    paths: dict[tuple[_Look, bool], QPainterPath] = {}
+    # 書体でも分ける 輪郭の向きが逆の書体を 1 つのパスへ足すと、重なりの巻き数が消えて穴になる
+    # （Yu Gothic UI と源ノ角ゴシック VF を重ねると穴が開いた #415）
+    paths: dict[tuple[_Look, bool, str], QPainterPath] = {}
     # 伸ばしたり回したりした字は文字の枠（テキストの入れ物）で切る AviUtl2 の絵は枠の大きさ
     # なので、はみ出した所は描かれない（``H<th2>H`` の真ん中の字が枠の上下で切れた #184）
     # 切るのは描くとき（:func:`_paint_layers`） 字の形を先に切ると、後から付ける縁と影が
@@ -1236,7 +1238,7 @@ def _aviutl_lines(
         for part, font, step, look, gap, shape in parts:
             x += gap
             plain = shape == (1.0, 1.0, 0.0)
-            target = paths.setdefault((look, not plain), _glyph_outlines())
+            target = paths.setdefault((look, not plain, font.family()), _glyph_outlines())
             if plain:
                 target.addText(QPointF(x, baseline), font, part)
             else:
@@ -1263,7 +1265,7 @@ def _aviutl_lines(
         line_top += pitch + after
 
     groups: list[_Group] = []
-    for (look, shaped), path in paths.items():
+    for (look, shaped, _family), path in paths.items():
         embolden = look.embolden
         drawn = _emboldened(path, embolden) if embolden > 0.0 else path
         groups.append((drawn, look, frame if shaped else None))
@@ -1816,58 +1818,99 @@ def _outline_once(path: QPainterPath, outlines: _Outlines) -> QPainterPath:
 
 
 def _overlapping(paths: Sequence[QPainterPath]) -> bool:
-    """どれか 2 つが重なるか"""
-    return any(
-        first.intersects(second)
-        for index, first in enumerate(paths)
-        for second in paths[index + 1 :]
-    )
+    """どれか 2 つが重なるか
+
+    字ごとに色を変えた字幕は層が字の数だけあるので、外接の四角の左端で並べて、四角が横に
+    届く相手とだけ比べる 全部の組を比べると字の数の 2 乗で増え、描くたびに繰り返す
+    """
+    boxed = sorted(((path.boundingRect(), path) for path in paths), key=lambda item: item[0].left())
+    for index, (box, path) in enumerate(boxed):
+        for other_box, other in boxed[index + 1 :]:
+            if other_box.left() > box.right():
+                break
+            if box.intersects(other_box) and path.intersects(other):
+                return True
+    return False
 
 
-def _joined_shape(
-    parts: Sequence[_Layer], reach: float, shift: tuple[float, float] = (0.0, 0.0)
-) -> tuple[QPainterPath, QPainterPath | None]:
-    """重なった字の層を 1 つの輪郭にまとめて、まとめた形と切る形を返す
+def _outside_of(frame: QPainterPath) -> QPainterPath:
+    """``frame`` の外全部 塗りの決まりは既定の OddEvenFill のままで、中の四角が抜ける"""
+    room = 1_000_000.0
+    outside = QPainterPath()
+    outside.addRect(frame.boundingRect().adjusted(-room, -room, room, room))
+    outside.addPath(frame)
+    return outside
+
+
+def _joined_layers(parts: Sequence[_Layer]) -> list[_Layer]:
+    """重なった字の層を 1 つの外形にまとめた層にする
 
     色や変形が違う字は別の層なので、層ごとに線を引くと字どうしの境に線が残る（#415）
-    変形した字だけは文字の枠で切る（#184） 素の字は切らないので、切る形には素の字の周り
-    （線や影が届く ``reach`` まで、``shift`` はその影のずれ）を足す
+    パスを足すだけだと、輪郭の向きが逆の書体の重なりが消えるので、形として合わせる
+
+    変形した字は文字の枠で切る（#184） 枠の中だけ全体の外形で描き、枠の外は切らない素の字を
+    それぞれの形のままで描く 枠の外に変形した字は見えないので、素の字の輪郭がそのまま外形で、
+    2 つの切る形は重ならないので半透明でも 2 重にならない
     """
-    path = _glyph_outlines()
-    for shape, _look, _clip in parts:
-        path.addPath(shape)
-    frames = [clip for _shape, _look, clip in parts if clip is not None]
-    if not frames:
-        return path, None
-    allowed = QPainterPath(frames[0])
-    for shape, _look, clip in parts:
-        if clip is None:
-            around = _stroke(shape, reach).united(shape)
-            around.translate(*shift)
-            allowed = allowed.united(around)
-    return path, allowed
+    joined, look, _clip = parts[0]
+    for shape, _look, _clip in parts[1:]:
+        joined = joined.united(shape)
+    frame = next((clip for _shape, _look, clip in parts if clip is not None), None)
+    if frame is None:
+        return [(joined, look, None)]
+    outside = _outside_of(frame)
+    free = [(shape, own, outside) for shape, own, clip in parts if clip is None]
+    return [(joined, look, frame), *free]
 
 
-def _joined_rings(
-    entries: list[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]],
-    *,
-    baked: bool,
-) -> list[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]]:
-    """同じ線で、重なった字の層を 1 つにまとめる 線が塗りに隠れる層はそのまま"""
+def _with_joined[T](
+    items: Sequence[T], groups: Sequence[list[int]], join: Callable[[list[int]], list[T]]
+) -> list[T]:
+    """``groups`` の番号の並びを ``join`` の結果に置き換える 置く所は組の先頭の位置"""
+    placed = {indices[0]: join(indices) for indices in groups}
+    dropped = {index for indices in groups for index in indices}
+    result: list[T] = []
+    for index, item in enumerate(items):
+        if index in placed:
+            result.extend(placed[index])
+        elif index not in dropped:
+            result.append(item)
+    return result
+
+
+#: 縁取りの層を描く字 1 つぶん 輪郭・層・切る形・字の見た目
+_RingEntry = tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]
+
+
+def _joined_rings(entries: list[_RingEntry], *, baked: bool) -> list[_RingEntry]:
+    """同じ線で、重なった字の層を 1 つにまとめる
+
+    どの字の線も塗りに隠れるときはまとめない 1 字でも透けるとまとめる 透けない字の線も、
+    重なった相手の塗りを透けて見える
+    """
     alike: dict[_Ring, list[int]] = {}
-    for index, (_path, ring, _clip, look) in enumerate(entries):
-        if not _inner_lines_hidden(ring, look, baked=baked):
-            alike.setdefault(ring, []).append(index)
-    joined = list(entries)
-    merged_away: set[int] = set()
-    for ring, indices in alike.items():
-        if len(indices) < 2 or not _overlapping([entries[index][0] for index in indices]):
-            continue
-        parts = [(entries[index][0], entries[index][3], entries[index][2]) for index in indices]
-        path, clip = _joined_shape(parts, ring.width)
-        joined[indices[0]] = (path, ring, clip, entries[indices[0]][3])
-        merged_away.update(indices[1:])
-    return [entry for index, entry in enumerate(joined) if index not in merged_away]
+    for index, entry in enumerate(entries):
+        alike.setdefault(entry[1], []).append(index)
+
+    def seen(indices: list[int]) -> bool:
+        return not all(
+            _inner_lines_hidden(entries[index][1], entries[index][3], baked=baked)
+            for index in indices
+        )
+
+    def join(indices: list[int]) -> list[_RingEntry]:
+        ring = entries[indices[0]][1]
+        parts = [(entries[i][0], entries[i][3], entries[i][2]) for i in indices]
+        return [(shape, ring, clip, look) for shape, look, clip in _joined_layers(parts)]
+
+    groups = [
+        indices
+        for indices in alike.values()
+        if len(indices) > 1
+        and seen(indices)
+        and _overlapping([entries[index][0] for index in indices])
+    ]
+    return _with_joined(entries, groups, join)
 
 
 def _joined_shadows(layers: list[_Layer]) -> list[_Layer]:
@@ -1883,21 +1926,14 @@ def _joined_shadows(layers: list[_Layer]) -> list[_Layer]:
             offsets = tuple(_number(look, name, 0.0) for name in _SHADOW_PLACE)
             outer = max(_rings(look), key=lambda ring: ring.outward, default=None)
             alike.setdefault((*offsets, colour.rgba(), outer), []).append(index)
-    joined = list(layers)
-    merged_away: set[int] = set()
-    for key, indices in alike.items():
-        if len(indices) < 2 or not _overlapping([layers[index][0] for index in indices]):
-            continue
-        look = layers[indices[0]][1]
-        blur = _number(look, "shadow_blur", 0.0)
-        widest = key[-1]
-        # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる（:func:`_shadow_layer`）
-        reach = 2.0 * blur + 2.0 + (widest.outward if isinstance(widest, _Ring) else 0.0)
-        shift = (_number(look, "shadow_x", 0.0), -_number(look, "shadow_y", 0.0))
-        path, clip = _joined_shape([layers[index] for index in indices], reach, shift)
-        joined[indices[0]] = (path, look, clip)
-        merged_away.update(indices[1:])
-    return [layer for index, layer in enumerate(joined) if index not in merged_away]
+    groups = [
+        indices
+        for indices in alike.values()
+        if len(indices) > 1 and _overlapping([layers[index][0] for index in indices])
+    ]
+    return _with_joined(
+        layers, groups, lambda indices: _joined_layers([layers[i] for i in indices])
+    )
 
 
 def _paint_ring(
