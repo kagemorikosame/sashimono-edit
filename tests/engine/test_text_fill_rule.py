@@ -464,10 +464,7 @@ def joined_rings(
     *entries: tuple[QPainterPath, sources._Ring, QPainterPath | None, dict[str, object]],
 ) -> list[tuple[QPainterPath, dict[str, object], QPainterPath | None]]:
     layers = [(path, look, clip) for path, _ring, clip, look in entries]
-    rings = {id(look): ring for _path, ring, _clip, look in entries}
-    return sources._painted_once(
-        layers, sources._ring_key(entries, baked=False), lambda look: rings[id(look)].width
-    )
+    return sources._painted_once(layers, sources._ring_key(entries, baked=False))
 
 
 def test_opaque_glyph_joins_a_translucent_partner() -> None:
@@ -503,7 +500,7 @@ def fill_layer(
 
 
 def painted_fills(layers: list[sources._Layer]) -> list[sources._Layer]:
-    return sources._painted_once(layers, sources._fill_key, sources._fill_output)
+    return sources._painted_once(layers, sources._fill_key)
 
 
 def test_layers_between_keep_the_drawing_order() -> None:
@@ -518,13 +515,13 @@ def test_layers_between_keep_the_drawing_order() -> None:
     assert painted_fills(layers) is layers
 
 
-def test_layers_between_that_stay_clear_do_not_block_joining() -> None:
-    """間の層が離れていればまとめる 上下は入れ替わっても重ならないので色は変わらない"""
+def test_neighbouring_layers_are_joined() -> None:
+    """描く順の続いた同じ色の字はまとめる 2 回塗ると、重なった所だけ濃くなる"""
     red, blue = (1.0, 0.0, 0.0, 0.5), (0.0, 0.0, 1.0, 0.5)
     layers = [
         fill_layer(QRectF(0.0, 0.0, 100.0, 100.0), red),
-        fill_layer(QRectF(0.0, 500.0, 100.0, 100.0), blue),
         fill_layer(QRectF(80.0, 0.0, 100.0, 100.0), red),
+        fill_layer(QRectF(40.0, 0.0, 100.0, 100.0), blue),
     ]
 
     joined = painted_fills(layers)
@@ -534,75 +531,6 @@ def test_layers_between_that_stay_clear_do_not_block_joining() -> None:
     assert joined[0][0].contains(QPointF(150.0, 50.0))
 
 
-def test_a_transparent_layer_between_does_not_block_joining() -> None:
-    """透明の字は何も描かないので上下が無い 妨げると、同じ色の字が 2 重に塗られて濃くなる"""
-    red = (1.0, 0.0, 0.0, 0.5)
-    layers = [
-        fill_layer(QRectF(0.0, 0.0, 100.0, 100.0), red),
-        fill_layer(QRectF(40.0, 0.0, 100.0, 100.0), CLEAR),
-        fill_layer(QRectF(80.0, 0.0, 100.0, 100.0), red),
-    ]
-
-    assert len(painted_fills(layers)) == 2
-
-
-def shadow_layer(left: float, x: float, color: ParamValue) -> sources._Layer:
-    path = QPainterPath()
-    path.addRect(QRectF(left, 0.0, 100.0, 100.0))
-    return path, {"color": WHITE, "shadow_x": x, "shadow_color": color}, None
-
-
-def painted_shadows(layers: list[sources._Layer]) -> list[sources._Layer]:
-    return sources._painted_once(layers, sources._shadow_key, sources._shadow_output)
-
-
-def test_a_layer_without_shadow_does_not_block_joining_shadows() -> None:
-    """影の無い字は影の順に関わらない 妨げると、同じ影が 2 重に重なって濃くなる"""
-    half = (0.0, 0.0, 0.0, 0.5)
-    layers = [
-        shadow_layer(0.0, 6.0, half),
-        shadow_layer(40.0, 0.0, CLEAR),
-        shadow_layer(80.0, 6.0, half),
-    ]
-
-    assert len(painted_shadows(layers)) == 2
-
-
-def test_a_shadow_landing_on_the_group_blocks_joining() -> None:
-    """間の字が離れていても、その影が組に届くならまとめない 上下が入れ替わって色が変わる"""
-    half = (0.0, 0.0, 0.0, 0.5)
-    layers = [
-        shadow_layer(0.0, 6.0, half),
-        shadow_layer(600.0, -560.0, (1.0, 0.0, 0.0, 0.5)),
-        shadow_layer(80.0, 6.0, half),
-    ]
-
-    assert painted_shadows(layers) is layers
-
-
-def test_a_band_reaching_the_group_blocks_joining() -> None:
-    """間の字が離れていても、その線の帯が組に届くならまとめない"""
-    half = (1.0, 0.0, 0.0, 0.5)
-    other = sources._Ring(width=30.0, colour=(0.0, 0.0, 1.0, 0.5))
-    first, second = (ring_entry(QRectF(left, 0.0, 100.0, 100.0)) for left in (0.0, 80.0))
-    ring = sources._Ring(width=3.0, colour=half)
-    clear: dict[str, object] = {"color": CLEAR}
-    white: dict[str, object] = {"color": WHITE}
-    below = fill_layer(QRectF(120.0, 110.0, 40.0, 40.0), WHITE)[0]
-
-    joined = joined_rings(
-        (first[0], ring, None, clear),
-        (below, other, None, white),
-        (second[0], ring, None, dict(clear)),
-    )
-
-    assert len(joined) == 3
-
-
-def must_not_run_either(_look: dict[str, object]) -> float:
-    raise AssertionError
-
-
 def test_a_lone_layer_is_passed_through_untouched() -> None:
     """層が 1 つの字幕は何も調べない 字幕はほとんどこれで、毎コマの手間を増やさない"""
     look: dict[str, object] = {"color": CLEAR}
@@ -610,10 +538,10 @@ def test_a_lone_layer_is_passed_through_untouched() -> None:
         (QPainterPath(), look, None)
     ]
 
-    def must_not_run(_look: dict[str, object]) -> tuple[float, str]:
+    def must_not_run(_look: dict[str, object]) -> str:
         raise AssertionError
 
-    assert sources._painted_once(only, must_not_run, must_not_run_either) is only
+    assert sources._painted_once(only, must_not_run) is only
 
 
 def test_a_font_tag_makes_its_own_layer() -> None:
@@ -639,17 +567,7 @@ def test_groups_hold_only_shapes_that_touch() -> None:
     for path, left in zip(paths, (0.0, 50.0, 500.0, 1000.0), strict=True):
         path.addRect(QRectF(left, 0.0, 100.0, 100.0))
 
-    assert sources._touching(paths, 0.0) == [[0, 1]]
-
-
-def test_bands_that_touch_form_a_group() -> None:
-    """字が離れていても、線の帯が届くなら組にする 半透明の帯が別々に重なると濃くなる"""
-    paths = [QPainterPath() for _ in range(2)]
-    for path, left in zip(paths, (0.0, 110.0), strict=True):
-        path.addRect(QRectF(left, 0.0, 100.0, 100.0))
-
-    assert sources._touching(paths, 0.0) == []
-    assert sources._touching(paths, 6.0) == [[0, 1]]
+    assert sources._touching(paths) == [[0, 1]]
 
 
 HALF_RED = (1.0, 0.0, 0.0, 0.5)
@@ -676,13 +594,6 @@ ONCE: dict[str, GeneratedSource] = {
         shadow_x=AnimatedValue(200.0),
         shadow_fill_type="linear",
         shadow_fill_gradient=(0.0, *HALF_RED, 1.0, *HALF_RED),
-    ),
-    "隣の字に届く半透明の縁": text(
-        f"{BLOCK}<#00ff00>{BLOCK}",
-        layout="aviutl",
-        color=CLEAR,
-        border_width=AnimatedValue(20.0),
-        border_color=HALF_RED,
     ),
 }
 
