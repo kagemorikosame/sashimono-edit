@@ -299,7 +299,7 @@ def test_outer_outline_finds_one_crossing_contour_in_a_long_text() -> None:
 
 
 def test_outer_outline_finds_contours_that_make_a_ring() -> None:
-    """2 つの輪郭が重なって外形と穴になると、輪郭の数は変わらないので長さで見つける"""
+    """2 つの輪郭が重なって外形と穴になっても見つける 見逃すと字の中に線が残る"""
     left = [(0, 0), (60, 0), (60, 20), (20, 20), (20, 80), (60, 80), (60, 100), (0, 100)]
     path = QPainterPath()
     path.setFillRule(Qt.FillRule.WindingFill)

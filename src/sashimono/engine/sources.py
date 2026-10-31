@@ -952,7 +952,7 @@ def _text_layers(
 
 
 def _glyph_outlines() -> QPainterPath:
-    """字の輪郭を ``addPath`` で集める空のパス
+    """字の輪郭を集める空のパス 字を集める所はどの組み方もここから始める
 
     ``addPath`` は渡した側の塗りの決まりを引き継がず、受け取る側の既定の OddEvenFill が残る
     可変フォントの系統（Noto Sans JP など）は 1 つの字の中で輪郭が重なっていて、OddEvenFill
@@ -1450,7 +1450,7 @@ def _vertical_text_path(
     # 寄った 2026-10-15 に AviUtl2 v2.1.6a で測った） 標準の組み方は前からどおり列を上で揃える
     # （揃え方を変えると、前の版の縦書きの字幕の短い列が動く）
     column_share = _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5) if aviutl else 0.0
-    path = QPainterPath()
+    path = _glyph_outlines()
     for column_index, column in enumerate(glyphs):
         x = left - column_width * column_index
         column_top = top + (length(tallest) - length(len(column))) * column_share
