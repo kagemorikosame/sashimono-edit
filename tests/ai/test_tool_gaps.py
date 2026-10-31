@@ -867,7 +867,8 @@ class TestWhatTheAnswerSays:
         pictures = [make_clip(start, 100, video_media) for start in (0, 100, 200)]
         early = Clip(timeline_start=120, duration=10, source=TEXT.create(text="札"))
         late = Clip(timeline_start=350, duration=10, source=TEXT.create(text="札"))
-        tune = make_clip(190, 130, audio_media)
+        # 混合のレイヤーの音は audio_stream を持つクリップだけが鳴る
+        tune = replace(make_clip(190, 130, audio_media), audio_stream=0)
         main = Track(kind=TrackKind.VIDEO, name="V1", clips=tuple(pictures))
         mixed = Track(kind=TrackKind.MIXED, name="L1", clips=(early, tune, late))
         host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(main, mixed))))
@@ -951,7 +952,7 @@ class TestWhatTheAnswerSays:
             name="重ね",
             clips=(
                 Clip(timeline_start=5, duration=3, source=TEXT.create(text="札")),
-                make_clip(50, 150, audio_media),
+                replace(make_clip(50, 150, audio_media), audio_stream=0),
             ),
         )
         host.apply_commands([AddTrack(track)], "重ね")

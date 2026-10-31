@@ -18,6 +18,7 @@ from sashimono.core.commands import (
     RemoveClip,
     RemoveClips,
     RippleCut,
+    SetTrackState,
 )
 from sashimono.core.commands.edit import ripple_casualties, ripple_gaps
 from sashimono.core.commands.insert import insert_media
@@ -272,6 +273,20 @@ class TestWhatFollows:
         after = plain.cut_middle(_with_track(plain.project, track, music, effect))
         assert _at(after, effect) == (150, 10)
 
+    def test_music_hidden_by_solo_does_not_hold_the_track(
+        self, plain: _Plain, audio_media: MediaItem
+    ) -> None:
+        """壊れると、ソロで鳴っていない曲のせいで、同じトラックの効果音が絵からずれる"""
+        music = make_clip(0, 240, audio_media)
+        effect = make_clip(250, 10, audio_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.AUDIO, name="BGM"), music, effect)
+        project = _with_track(
+            project,
+            Track(kind=TrackKind.AUDIO, name="声", solo=True),
+            make_clip(0, 10, audio_media),
+        )
+        assert _at(plain.cut_middle(project), effect) == (150, 10)
+
     def test_a_locked_track_stays(self, plain: _Plain) -> None:
         """壊れると、人が動かさないと決めたトラックが動く"""
         text_clip = Clip(timeline_start=250, duration=10, source=TEXT.create(text="札"))
@@ -318,6 +333,48 @@ class TestWhenTheProgrammeGoesOn:
         track = Track(kind=TrackKind.VIDEO, name="V2", muted=True)
         project, text = _text_track(_with_track(plain.project, track, over), 220, 10)
         assert _at(plain.cut_middle(project), text) == (120, 10)
+
+    def test_a_picture_hidden_by_solo_is_not_the_programme(
+        self, plain: _Plain, video_media: MediaItem
+    ) -> None:
+        """壊れると、ソロで映っていない絵のせいで字幕も場面切り替えも置いていかれる"""
+        over = make_clip(120, 30, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        project, text = _text_track(project, 220, 10)
+        located = project.timeline.locate_clip(text.id)
+        assert located is not None
+        project = SetTrackState(plain.track.id, solo=True).apply(project)
+        project = SetTrackState(located[0].id, solo=True).apply(project)
+        assert ripple_gaps(project, (plain.clips[1].id,)) == [(100, 200)]
+        assert _at(plain.cut_middle(project), text) == (120, 10)
+
+    def test_a_sound_solo_does_not_hide_the_picture(
+        self, plain: _Plain, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、音のトラックをソロにしただけで、映っている絵を番組から外して字幕がずれる"""
+        over = make_clip(120, 30, video_media)
+        project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
+        project = _with_track(
+            project,
+            Track(kind=TrackKind.AUDIO, name="A1", solo=True),
+            make_clip(0, 10, audio_media),
+        )
+        project, text = _text_track(project, 220, 10)
+        assert _at(plain.cut_middle(project), text) == (220, 10)
+
+    def test_a_sound_hidden_by_solo_is_not_the_programme(self, audio_media: MediaItem) -> None:
+        """壊れると、声だけの作品で、ソロで鳴っていない音のせいで字幕が付いてこない"""
+        voice = [make_clip(start, 100, audio_media) for start in (0, 100, 200)]
+        other = make_clip(120, 30, audio_media)
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(audio_media,))
+        tracks = (
+            Track(kind=TrackKind.AUDIO, name="声", clips=tuple(voice), solo=True),
+            Track(kind=TrackKind.AUDIO, name="別", clips=(other,)),
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        project, text = _text_track(project, 220, 10)
+        after = RemoveClip(voice[1].id, ripple=True, layers=True).apply(project)
+        assert _at(after, text) == (120, 10)
 
     def test_a_sound_under_other_sound_does_not_pull(
         self, plain: _Plain, audio_media: MediaItem

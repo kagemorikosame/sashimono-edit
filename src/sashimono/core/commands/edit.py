@@ -36,6 +36,7 @@ from sashimono.core.model import (
     new_clip_id,
     new_group_id,
 )
+from sashimono.core.projection import sounding
 
 __all__ = [
     "STOP_LOCKED",
@@ -453,6 +454,7 @@ def _programme_gap(project: Project, targets: list[tuple[TrackId, Clip]]) -> boo
     1 枚消したときや効果音を 1 つ消したときは、下の映像が続いているので番組の時間は減らない
     そこで字幕まで前へ動かすと、話している絵からずれる（前の動きを守る）
     絵を消したときは絵だけを見る 下に BGM が鳴り続けていても番組の切りに変わりはない
+    残るかは実際に映る・鳴る物で見る（:func:`_on_air`）
     """
     if not any(_content(clip) for _, clip in targets):
         # 上に重ねた字幕やテロップを消しただけでは番組の時間は減らない
@@ -462,19 +464,30 @@ def _programme_gap(project: Project, targets: list[tuple[TrackId, Clip]]) -> boo
     picture = any(
         project.draws_picture(_require_track(project, track_id), clip) for track_id, clip in targets
     )
+    shown, heard = _on_air(project)
     for track in project.timeline.tracks:
-        # 隠したトラックと無効のクリップは番組に出ていない 数えると、映っていない絵のせいで
-        # 字幕が付いてこず、消した絵とずれる
-        if track.muted:
-            continue
         for clip in track.clips:
-            if clip.id in own or not clip.enabled:
+            if clip.id in own or not clip.overlaps(start, end) or not _content(clip):
                 continue
-            if not clip.overlaps(start, end) or not _content(clip):
-                continue
-            if not picture or project.draws_picture(track, clip):
+            if clip.id in shown or (not picture and clip.id in heard):
                 return False
     return True
+
+
+def _on_air(project: Project) -> tuple[set[ClipId], set[ClipId]]:
+    """実際に映るクリップと鳴るクリップ ミュート・ソロ・無効を描く側とミキサと同じ決まりで見る
+
+    自前でミュートだけを見ると、ソロで映っていない絵のせいで字幕が付いてこず、消した絵とずれる
+    ソロは絵と音で別に効くので、音のトラックをソロにしても絵は消えない
+    """
+    timeline = project.timeline
+    shown = {
+        clip.id
+        for track in timeline.active_picture_tracks()
+        for clip in track.clips
+        if clip.enabled and project.draws_picture(track, clip)
+    }
+    return shown, {clip.id for _, clip in sounding(project, timeline)}
 
 
 def _content(clip: Clip) -> bool:
@@ -492,18 +505,16 @@ def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) ->
     リンクとグループの仲間も残すのは、片方だけ動くと映像と音声が黙ってずれるため
     """
 
+    shown, heard = _on_air(project)
+
     def spans(clip: Clip) -> bool:
         # 頭や終わりが範囲とそろった BGM もまたいだ物に数える 頭を切っただけで曲の頭が欠ける
         covers = clip.timeline_start <= start and clip.timeline_end >= end
-        return clip.enabled and _content(clip) and covers and clip.duration > end - start
+        # 映らず鳴らない物は、後ろの物を止める理由にしない（:func:`_programme_gap` と同じ）
+        on_air = clip.id in shown or clip.id in heard
+        return _content(clip) and on_air and covers and clip.duration > end - start
 
-    # 無効のクリップと隠したトラックは鳴らないので、後ろの物を止める理由にしない
-    # （:func:`_programme_gap` が番組に数えないのと同じ）
-    held = {
-        track.id
-        for track in tracks
-        if track.locked or (not track.muted and any(spans(c) for c in track.clips))
-    }
+    held = {track.id for track in tracks if track.locked or any(spans(c) for c in track.clips)}
     timeline = project.timeline
     frontier = list(held)
     while frontier:
