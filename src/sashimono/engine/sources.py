@@ -9,9 +9,11 @@ Qt の描画系（``QPainter``）を使う 日本語の禁則処理やフォン�
 
 from __future__ import annotations
 
+import functools
+import itertools
 import math
 import struct
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -914,7 +916,7 @@ def _text_layers(
             return left + block_width - line_width
         return left + (block_width - line_width) / 2.0
 
-    path = QPainterPath()
+    path = _glyph_outlines()
     for index, line in enumerate(lines):
         x = start(metrics.horizontalAdvance(line), widest)
         baseline = top + line_height * index + metrics.ascent()
@@ -947,6 +949,19 @@ def _text_layers(
                 )
 
     return [(path, values, None)], None
+
+
+def _glyph_outlines() -> QPainterPath:
+    """字の輪郭を集める空のパス 字を集める所はどの組み方もここから始める
+
+    ``addPath`` は渡した側の塗りの決まりを引き継がず、受け取る側の既定の OddEvenFill が残る
+    可変フォントの系統（Noto Sans JP など）は 1 つの字の中で輪郭が重なっていて、OddEvenFill
+    では重なった所が抜ける 字の白に穴が開いて下の黒い縁が透け、縁がガビガビに見える（#415）
+    ``addText`` で作った字は WindingFill なので、集める側も揃える
+    """
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    return path
 
 
 def _wrapped(text: str, width: float, metrics: QFontMetricsF, values: dict[str, object]) -> str:
@@ -1207,7 +1222,9 @@ def _aviutl_lines(
     top = centre_y - block_height * _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5)
 
     # 見た目ごとに、そのまま置いた字と変形した字を分けて持つ（:data:`_Group`）
-    paths: dict[tuple[_Look, bool], QPainterPath] = {}
+    # 書体でも分ける 輪郭の向きが逆の書体を 1 つのパスへ足すと、重なりの巻き数が消えて穴になる
+    # （Yu Gothic UI と源ノ角ゴシック VF を重ねると穴が開いた #415）
+    paths: dict[tuple[_Look, bool, str], QPainterPath] = {}
     # 伸ばしたり回したりした字は文字の枠（テキストの入れ物）で切る AviUtl2 の絵は枠の大きさ
     # なので、はみ出した所は描かれない（``H<th2>H`` の真ん中の字が枠の上下で切れた #184）
     # 切るのは描くとき（:func:`_paint_layers`） 字の形を先に切ると、後から付ける縁と影が
@@ -1223,7 +1240,7 @@ def _aviutl_lines(
         for part, font, step, look, gap, shape in parts:
             x += gap
             plain = shape == (1.0, 1.0, 0.0)
-            target = paths.setdefault((look, not plain), QPainterPath())
+            target = paths.setdefault((look, not plain, font.family()), _glyph_outlines())
             if plain:
                 target.addText(QPointF(x, baseline), font, part)
             else:
@@ -1250,7 +1267,7 @@ def _aviutl_lines(
         line_top += pitch + after
 
     groups: list[_Group] = []
-    for (look, shaped), path in paths.items():
+    for (look, shaped, _family), path in paths.items():
         embolden = look.embolden
         drawn = _emboldened(path, embolden) if embolden > 0.0 else path
         groups.append((drawn, look, frame if shaped else None))
@@ -1433,7 +1450,7 @@ def _vertical_text_path(
     # 寄った 2026-10-15 に AviUtl2 v2.1.6a で測った） 標準の組み方は前からどおり列を上で揃える
     # （揃え方を変えると、前の版の縦書きの字幕の短い列が動く）
     column_share = _VERTICAL_SHARE.get(str(values.get("valign", "middle")), 0.5) if aviutl else 0.0
-    path = QPainterPath()
+    path = _glyph_outlines()
     for column_index, column in enumerate(glyphs):
         x = left - column_width * column_index
         column_top = top + (length(tallest) - length(len(column))) * column_share
@@ -1537,8 +1554,10 @@ def _paint_layers(
     変えた字も含めた全部の字で 1 つにする 見た目ごとに取ると、色を変えた字だけ別の
     グラデーションになる
     """
-    for path, look, clip in layers:
-        made = _shadow_layer(path, look, painter, bases)
+    # 影と各層で同じ字の輪郭を解き直さないように、この描画の間だけ覚える
+    outlines: _Outlines = {}
+    for path, look, clip in _painted_once(layers, _shadow_key):
+        made = _shadow_layer(path, look, painter, bases, outlines)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
             # 影の面は絵の画素で作ってある 描く座標の縮め方を外してから重ねる
@@ -1553,11 +1572,11 @@ def _paint_layers(
     rings = [_rings(look) for _, look, _ in layers]
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, bases, under=True)
-    for path, look, clip in layers:
+        _paint_ring(painter, layers, rings, index, bases, outlines, under=True)
+    for path, look, clip in _painted_once(layers, _fill_key):
         _fill_painted(painter, path, _fill_of(look, _FILL, "color"), bases, clip)
     for index in reversed(range(depth)):
-        _paint_ring(painter, layers, rings, index, bases, under=False)
+        _paint_ring(painter, layers, rings, index, bases, outlines, under=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1729,12 +1748,247 @@ def _ring_path(path: QPainterPath, ring: _Ring) -> QPainterPath:
     return _stroke(path, ring.width, ring.join)
 
 
+def _inner_lines_hidden(ring: _Ring, look: Mapping[str, object], *, baked: bool) -> bool:
+    """字の中を通る輪郭に引いた線が、塗りに隠れて見えないか
+
+    隠れるのは、外側の層を不透明の単色の下に描くときだけ（字幕の縁はほとんどこれ）
+    塗りが透ければ線が透け、層のエフェクトは線を塗りの外へ運び、内側と中央の層は塗りの上に描く
+    """
+    if ring.position != "outside" or baked:
+        return False
+    fill = _fill_of(look, _FILL, "color")
+    return isinstance(fill, QColor) and fill.alpha() == 255
+
+
+#: 輪郭を解いて長さがこの割合より縮んだら、重なりがあったと見る 折れ線どうしの比べなので
+#: 重なりが無ければ縮まない（496 書体の 68292 字で 0.00001% 以下、重なりは 0.001% 以上）
+_OVERLAP_SHRINK = 0.99999
+
+
+def _polyline(contours: Sequence[QPolygonF]) -> QPainterPath:
+    """折れ線の輪郭を WindingFill のパスにする 塗りの決まりが字と違うと解く結果が変わる"""
+    path = _glyph_outlines()
+    for contour in contours:
+        path.addPolygon(contour)
+    return path
+
+
+def _outer_outline(path: QPainterPath) -> QPainterPath:
+    """重なった輪郭を解いて外形だけにした形 重なりが無ければ ``path`` のまま
+
+    可変フォントの系統の字は輪郭が重なっている 線は輪郭ごとに引かれるので、そのまま太らせると
+    字の外形に無い線が字の中を横切る（#415 塗りの決まりは線の形に関わらない）
+    ``simplified`` は曲線を折れ線にして、線の縁が境の画素で少し動く 重なりの無い書体の絵が
+    前の版から変わらないように、重なりが見つかった時だけ解いた形を使う
+
+    輪郭の数が変われば重なっていた 数が変わらないのは、1 つの輪郭が自分と重なるときと、輪郭
+    どうしが重なって外形と穴になるとき 長さの縮みで見つける 全体の長さだけで見ると、長い文の
+    中の 1 字の重なりが埋もれるので、輪郭ごとにも見る 曲線の長さは折れ線にすると縮むので、
+    比べる両方を折れ線にそろえる
+    """
+    contours = path.toSubpathPolygons()
+    whole = _polyline(contours)
+    merged = whole.simplified()
+    overlapped = (
+        len(merged.toSubpathPolygons()) != len(contours)
+        or merged.length() < whole.length() * _OVERLAP_SHRINK
+        or any(
+            shape.simplified().length() < shape.length() * _OVERLAP_SHRINK
+            for shape in (_polyline([contour]) for contour in contours)
+        )
+    )
+    return merged if overlapped else path
+
+
+#: 1 回の描画で解いた輪郭の覚え 鍵はパスの ``id`` で、値は（パス, 解いた形）
+#: パスも一緒に持つのは、途中で作ったパスが消えて同じ ``id`` が別のパスへ回らないように
+_Outlines = dict[int, tuple[QPainterPath, QPainterPath]]
+
+
+def _outline_once(path: QPainterPath, outlines: _Outlines) -> QPainterPath:
+    """``path`` の :func:`_outer_outline` を 1 度だけ求める
+
+    解くのは重いので、層の数だけ解くと長い字幕で手間が層の数の倍になる
+    """
+    key = id(path)
+    if key not in outlines:
+        outlines[key] = (path, _outer_outline(path))
+    return outlines[key][1]
+
+
+def _near_pairs(boxes: Sequence[QRectF]) -> Iterator[tuple[int, int]]:
+    """横に届く四角の組の番号
+
+    字ごとに色を変えた字幕は層が字の数だけあるので、左端で並べて、届く相手とだけ組にする
+    全部の組を見ると字の数の 2 乗で増え、描くたびに繰り返す
+    """
+    order = sorted(range(len(boxes)), key=lambda index: boxes[index].left())
+    for place, first in enumerate(order):
+        for second in itertools.islice(order, place + 1, None):
+            if boxes[second].left() > boxes[first].right():
+                break
+            yield first, second
+
+
+def _touching(paths: Sequence[QPainterPath]) -> list[list[int]]:
+    """重なった字の組（番号の並び） 1 字の組は入れない"""
+    boxes = [path.boundingRect() for path in paths]
+    parent = list(range(len(paths)))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for first, second in _near_pairs(boxes):
+        if (
+            root(first) != root(second)
+            and boxes[first].intersects(boxes[second])
+            and paths[first].intersects(paths[second])
+        ):
+            parent[root(second)] = root(first)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(paths)):
+        groups.setdefault(root(index), []).append(index)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def _outside_of(frame: QPainterPath) -> QPainterPath:
+    """``frame`` の外全部 塗りの決まりは既定の OddEvenFill のままで、中の四角が抜ける
+
+    Qt は四角の切る形を画素へ丸めるので、抜く四角も同じに丸める 丸めないと、枠と外の形が
+    端数の所の 1 行で重なる 縮めたプレビューはずれるが、1 行の濃さの差で済む
+    """
+
+    def rounded(value: float) -> float:
+        return float(math.floor(value + 0.5))
+
+    box = frame.boundingRect()
+    hole = QRectF(
+        QPointF(rounded(box.left()), rounded(box.top())),
+        QPointF(rounded(box.right()), rounded(box.bottom())),
+    )
+    room = 1_000_000.0
+    outside = QPainterPath()
+    outside.addRect(box.adjusted(-room, -room, room, room))
+    outside.addRect(hole)
+    return outside
+
+
+def _united(paths: Sequence[QPainterPath]) -> QPainterPath:
+    """足すのではなく形として合わせる 足すだけだと、輪郭の向きが逆の書体の重なりが消える"""
+    return functools.reduce(QPainterPath.united, paths)
+
+
+def _joined_layers(parts: Sequence[_Layer]) -> list[_Layer]:
+    """重なった字の層を 1 つの外形にまとめた層にする
+
+    変形した字は文字の枠で切る（#184） 枠の中は全体の外形で描き、枠の外は切らない素の字の
+    外形を描く 枠の外に変形した字は見えないので、それが外形になる 2 つの切る形は重ならない
+    ので、半透明でも 2 重にならない
+    """
+    look = parts[0][1]
+    whole = _united([shape for shape, _look, _clip in parts])
+    frame = next((clip for _shape, _look, clip in parts if clip is not None), None)
+    if frame is None:
+        return [(whole, look, None)]
+    free = [shape for shape, _look, clip in parts if clip is None]
+    if not free:
+        return [(whole, look, frame)]
+    return [(whole, look, frame), (_united(free), look, _outside_of(frame))]
+
+
+def _painted_once(
+    layers: list[_Layer], key: Callable[[dict[str, object]], Hashable | None]
+) -> list[_Layer]:
+    """同じ物を塗る字の層のうち、輪郭が重なって描く順の続いた組を 1 つにまとめる
+
+    色や変形や書体が違う字は別の層なので、層ごとに描くと字どうしの境に線が残り、半透明の物は
+    重なった所だけ濃くなる（#415）
+
+    ``key`` は字の見た目から同じ物かを比べる値を返す ``None`` はまとめなくてよい字で、重ねても
+    絵が変わらない不透明の物 字幕はほとんど層が 1 つで、不透明の字が何色あっても何もしない
+
+    確かに効く組だけをまとめる 間に別の層を挟む組は、まとめると上下が入れ替わって色が変わる
+    ので、層ごとに描く 字が離れていて帯だけが届く所も層ごとのまま どちらも半透明なら 2 重に
+    塗られるが、前の版からの絵で、見分ける判定を足すより壊れにくい
+    """
+    if len(layers) < 2:
+        return layers
+    alike: dict[Hashable, list[int]] = {}
+    for index, (_path, look, _clip) in enumerate(layers):
+        value = key(look)
+        if value is not None:
+            alike.setdefault(value, []).append(index)
+    placed: dict[int, list[_Layer]] = {}
+    dropped: set[int] = set()
+    for indices in alike.values():
+        for group in _touching([layers[index][0] for index in indices]):
+            members = [indices[place] for place in group]
+            if members[-1] - members[0] + 1 == len(members):
+                placed[members[0]] = _joined_layers([layers[index] for index in members])
+                dropped.update(members)
+    if not placed:
+        return layers
+    result: list[_Layer] = []
+    for index, layer in enumerate(layers):
+        if index in placed:
+            result.extend(placed[index])
+        elif index not in dropped:
+            result.append(layer)
+    return result
+
+
+def _fill_key(look: dict[str, object]) -> Hashable | None:
+    """:func:`_painted_once` の字の塗り 不透明の単色はまとめない"""
+    fill = _fill_of(look, _FILL, "color")
+    if isinstance(fill, QColor):
+        return None if fill.alpha() == 255 else fill.rgba()
+    return fill
+
+
+def _shadow_key(look: dict[str, object]) -> Hashable | None:
+    """:func:`_painted_once` の影 不透明の単色はまとめない"""
+    colour = _color(look.get("shadow_color"))
+    paint = paint_of(look, _SHADOW_FILL)
+    if paint is None and colour.alpha() in (0, 255):
+        return None
+    place = tuple(_number(look, name, 0.0) for name in ("shadow_x", "shadow_y", "shadow_blur"))
+    outer = max(_rings(look), key=lambda ring: ring.outward, default=None)
+    return (*place, outer, colour.rgba() if paint is None else paint)
+
+
+def _ring_key(
+    entries: Sequence[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]],
+    *,
+    baked: bool,
+) -> Callable[[dict[str, object]], Hashable | None]:
+    """:func:`_painted_once` の縁取りの層
+
+    1 字でも線が透けるなら同じ線の字をまとめる 透けない字の線も、相手の塗りを透けて見える
+    """
+    rings = {id(look): ring for _path, ring, _clip, look in entries}
+    seen = {
+        ring
+        for _path, ring, _clip, look in entries
+        if not _inner_lines_hidden(ring, look, baked=baked)
+    }
+
+    def key(look: dict[str, object]) -> Hashable | None:
+        ring = rings[id(look)]
+        return ring if ring in seen else None
+
+    return key
+
+
 def _paint_ring(
     painter: QPainter,
     layers: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]],
     rings: list[tuple[_Ring, ...]],
     index: int,
     bases: _Bases,
+    outlines: _Outlines,
     *,
     under: bool,
 ) -> None:
@@ -1762,8 +2016,26 @@ def _paint_ring(
     if first.effects >= 0 and isinstance(stacks, tuple) and first.effects < len(stacks):
         effects = stacks[first.effects]
     apply = baker if callable(baker) and effects else None
+    rings_by_look = {id(shown): ring for _path, ring, _clip, shown in entries}
+    joined = _painted_once(
+        [(path, shown, clip) for path, _ring, clip, shown in entries],
+        _ring_key(entries, baked=apply is not None),
+    )
+    entries = [(path, rings_by_look[id(shown)], clip, shown) for path, shown, clip in joined]
     inside = any(ring.position == "inside" for _, ring, _, _ in entries)
-    bands = [(_ring_path(path, ring), ring, clip) for path, ring, clip, _ in entries]
+    bands = [
+        (
+            _ring_path(
+                path
+                if _inner_lines_hidden(ring, shown, baked=apply is not None)
+                else _outline_once(path, outlines),
+                ring,
+            ),
+            ring,
+            clip,
+        )
+        for path, ring, clip, shown in entries
+    ]
     if apply is None and not inside:
         for band, ring, clip in bands:
             _fill_painted(painter, band, ring.fill, bases, clip)
@@ -1895,7 +2167,11 @@ def _stroke(path: QPainterPath, width: float, join: str = "round") -> QPainterPa
 
 
 def _shadow_layer(
-    path: QPainterPath, values: dict[str, object], painter: QPainter, bases: _Bases
+    path: QPainterPath,
+    values: dict[str, object],
+    painter: QPainter,
+    bases: _Bases,
+    outlines: _Outlines,
 ) -> tuple[QImage, tuple[int, int]] | None:
     """文字の影を別の面に描いて、面と面を置く左上（絵の画素）を返す 影が無ければ ``None``
 
@@ -1932,7 +2208,14 @@ def _shadow_layer(
     blur *= math.sqrt(abs(transform.determinant()))
     # 一番外へ出る縁取りの層の外形から影を落とす 層を持たない字は前からの縁取りの太さ
     outer = max(_rings(values), key=lambda ring: ring.outward, default=None)
-    outline = _ring_path(shifted, outer) if outer is not None and outer.outward > 0.0 else None
+    outline: QPainterPath | None = None
+    if outer is not None and outer.outward > 0.0:
+        # 半透明の単色の影は、縁の形と字の形を重ねて塗った所だけ濃くなるので、字の中の輪郭に
+        # 引いた線も濃く見える グラデーションの影は不透明の白で形を作るので隠れる
+        drawn_on = shifted
+        if paint is None and colour.alpha() < 255:
+            drawn_on = _outline_once(path, outlines).translated(offset_x, -offset_y)
+        outline = _ring_path(drawn_on, outer)
 
     drawn = transform.mapRect((outline if outline is not None else shifted).boundingRect())
     # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる 端の 0 の所も同じ値に
