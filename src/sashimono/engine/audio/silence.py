@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -121,8 +122,8 @@ _DIGITAL_SILENCE_DB = -90.0
 _CLEAN_SILENCE_DB = -50.0
 #: 素の無音だけの音で、話の一番静かな所の下へ取る幅（dB）
 _CLEAN_MARGIN_DB = 3.0
-#: 増える所の上へ足す余裕（dB） 間の音量ちょうどでは、間の中の小さな山で区間が割れる
-_KNEE_MARGIN_DB = 1
+#: 1 dB でこれだけ（全体の割合）切れる秒が増えて初めて間の音量と読む 小さな山で止まらないため
+_HUMP_SHARE = 0.01
 #: 話の大きな所を読むパーセント点 最大にしないのは、1 度のクリック音を話と読まないため
 #: 話がこれより少ない素材は話と間を見分けない
 _LOUD_PERCENTILE = 99.5
@@ -141,11 +142,12 @@ _SUGGESTED_LIMIT = 32
 #: 弱参照で持ち、取り出すときに同じ物かを確かめる 番号だけで引くと、捨てた波形の番号を次の
 #: 素材が引き継いだときに前の素材の値を返す 中身では比べない ピークの配列は比べると重く、
 #: ``Waveform`` はハッシュできない 素材を解析し直せば別の波形になるので、古い値は引かれない
-#: 2 時間の素材で数えると 0.4 秒ほど掛かり、道具は画面のスレッドで動くので、呼ぶたびに数えない
-#: 触るのも画面のスレッドだけなので鍵は持たない
+#: 2 時間の素材で数えると 0.4 秒ほど掛かるので、呼ぶたびに数えない AI のスレッドで数えて
+#: 画面のスレッドが読むので鍵で守る 数える間は鍵を持たない
 _SUGGESTED: OrderedDict[tuple[int, float, float], tuple[weakref.ref[Waveform], _Suggestion]] = (
     OrderedDict()
 )
+_SUGGESTED_LOCK = threading.Lock()
 
 
 def _quiet_cuts(
@@ -163,6 +165,24 @@ def _quiet_cuts(
     return int(kept.size), float(kept.sum())
 
 
+def _hump_end(rises: np.ndarray, floor: float) -> int | None:
+    """切れる秒の増え方 ``rises`` の最初の山が終わる位置（値の並びの番号） 山が無ければ ``None``
+
+    間の音量の所で増え方が山になり、越えると落ちて、話の谷へ入るとまた増え続ける 全体で一番
+    増える所を選ぶと、話の谷の増え方が間の山を上回る素材で話を切る（本物の素材で -24 dB を
+    勧めた） そこで最初の山を取る 山の頂上の半分より落ちた所が山の終わり
+    """
+    peak, top = 0.0, None
+    for index, rise in enumerate(rises.tolist()):
+        if rise > peak and rise >= floor:
+            peak, top = rise, index
+        elif top is not None and rise < peak / 2:
+            return index
+    if top is not None:
+        return top + 1
+    return int(rises.argmax()) + 1 if rises.size and rises.max() > 0 else None
+
+
 def choose_silence(
     peaks: np.ndarray,
     tick: float,
@@ -178,18 +198,14 @@ def choose_silence(
     ``group`` は音の幅を読むときに束ねるピークの数 切れる見込みは束ねずに数える
     束ねて数えると、区切りをまたいだ間が短く読まれ、:func:`detect_silence` と数が合わない
 
-    間の音量は素材ごとに違う 話の間の環境音に当たる所では、しきい値を 1 dB 上げたときに
-    切れる秒が大きく増える そこを越えた値を勧める 本物の素材では、AI が何度も切って
-    戻して着いた値と同じになった（#413）
+    やることは 1 つ 鳴っている一番静かな所から話の大きな所の :data:`_SPEECH_GAP_DB` 下までの
+    値を 1 dB ずつ試し、切れる秒の増え方の最初の山（:func:`_hump_end`）が終わる値を勧める
+    話の間の環境音の所が山になる 本物の素材では AI が何度も切って戻して着いた値と同じになった
+    試す値が 2 つに満たないか増える所が無ければ、話と間の差が :data:`_SPEECH_GAP_DB` に届かない
+    か、間が素の無音だけ 素の無音で切れるときだけ、話より静かな値を返す
+    素の無音は音の幅を読む数に入れない 部屋の音の間の音量を探せなくなるため
 
-    探す範囲は、鳴っている一番静かな所から、話の大きな所の :data:`_SPEECH_GAP_DB` 下まで
-    間と話の割合に寄らない 下の端をパーセント点にすると間の少ない素材で、上の端を中央値に
-    すると間の多い素材で、間の音量が範囲から外れる
-
-    範囲が空なら音の幅が狭く、話と間を見分けられない（鳴り続ける曲・部屋の音だけ）
-    増える所が無ければ間は素の無音だけなので、話より静かな値を返す
-    どちらでも切れる所が無ければ勧めない 素の無音は間の音量を探す数に入れない 素の無音と
-    部屋の音の間の両方がある素材で、素の無音だけを切る値を勧めないため
+    音楽の打楽器と話は音の山では分けられない 音楽が主の素材は呼ぶ側が断る
     """
     levels = np.maximum.reduceat(peaks, np.arange(0, peaks.size, group)) if peaks.size else peaks
     live = levels[levels > _DIGITAL_SILENCE_DB]
@@ -207,10 +223,12 @@ def choose_silence(
 
     quiet = float(live.min())
     top = float(np.percentile(live, _LOUD_PERCENTILE)) - _SPEECH_GAP_DB
-    candidates = range(math.floor(quiet), math.ceil(top) + 1)
-    rises = np.diff([_quiet_cuts(peaks, times, v, min_silence, padding)[1] for v in candidates])
-    if rises.size and rises.max() > 0:
-        threshold = float(candidates[int(rises.argmax()) + 1] + _KNEE_MARGIN_DB)
+    # ちょうど差のある間を切るには、間の音量の 1 つ上の値まで試す
+    candidates = range(math.floor(quiet), math.ceil(top) + 2)
+    gains = [_quiet_cuts(peaks, times, v, min_silence, padding)[1] for v in candidates]
+    end = _hump_end(np.diff(gains), _HUMP_SHARE * peaks.size * tick)
+    if end is not None:
+        threshold = float(candidates[end])
         return choice(threshold), around(threshold)
     clean = min(_CLEAN_SILENCE_DB, quiet - _CLEAN_MARGIN_DB)
     return (choice(clean), around(clean)) if choice(clean).cuts else (None, ())
@@ -227,10 +245,11 @@ def suggest_silence(waveform: Waveform, min_silence: float, padding: float) -> _
     if level.count == 0:
         return None, ()
     key = (id(waveform), min_silence, padding)
-    entry = _SUGGESTED.get(key)
-    if entry is not None and entry[0]() is waveform:
-        _SUGGESTED.move_to_end(key)
-        return entry[1]
+    with _SUGGESTED_LOCK:
+        entry = _SUGGESTED.get(key)
+        if entry is not None and entry[0]() is waveform:
+            _SUGGESTED.move_to_end(key)
+            return entry[1]
     per_peak = level.samples_per_peak / waveform.sample_rate
     peaks = 20.0 * np.log10(np.maximum(_loudness(waveform), 10.0 ** (_FLOOR_DB / 20.0)))
     answer = choose_silence(
@@ -241,10 +260,11 @@ def suggest_silence(waveform: Waveform, min_silence: float, padding: float) -> _
         total=float(waveform.duration),
         group=max(1, round(_CHOICE_TICK_SECONDS / per_peak)),
     )
-    _SUGGESTED[key] = (weakref.ref(waveform), answer)
-    _SUGGESTED.move_to_end(key)
-    while len(_SUGGESTED) > _SUGGESTED_LIMIT:
-        _SUGGESTED.popitem(last=False)
+    with _SUGGESTED_LOCK:
+        _SUGGESTED[key] = (weakref.ref(waveform), answer)
+        _SUGGESTED.move_to_end(key)
+        while len(_SUGGESTED) > _SUGGESTED_LIMIT:
+            _SUGGESTED.popitem(last=False)
     return answer
 
 

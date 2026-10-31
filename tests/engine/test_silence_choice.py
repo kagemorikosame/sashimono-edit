@@ -43,6 +43,29 @@ class TestTheKnee:
             best.threshold_db + 3,
         ]
 
+    def test_the_first_hump_wins_over_the_valleys_of_talk(self) -> None:
+        """壊れると、話の谷の増え方が間の山を上回る素材で、話を切る値を勧める（本物の素材で起きた）"""
+        rises = np.array([0.0, 4.0, 9.0, 12.0, 8.0, 2.5, 3.0, 12.0, 13.0, 17.0])
+        assert silence._hump_end(rises, 2.6) == 5
+
+    def test_small_bumps_before_the_hump_are_passed(self) -> None:
+        """壊れると、数か所の短い間の小さな山で止まり、ほとんど切れない値を勧める"""
+        rises = np.array([2.4, 0.8, 1.5, 3.7, 8.0, 12.0, 2.0])
+        assert silence._hump_end(rises, 2.6) == 6
+
+    def test_a_hump_at_the_end_of_the_range(self) -> None:
+        """壊れると、探す範囲の端で山が終わらない素材で値が出ない"""
+        assert silence._hump_end(np.array([0.0, 5.0]), 1.0) == 2
+
+    def test_a_small_rise_on_a_long_clip_still_counts(self) -> None:
+        """壊れると、長い素材の短い間が割合の下限に届かず、切れるのに値が出ない"""
+        assert silence._hump_end(np.array([0.0, 0.5, 0.0]), 10.0) == 2
+
+    def test_no_rise_has_no_hump(self) -> None:
+        """壊れると、切れる物が増えない音に値を勧める"""
+        assert silence._hump_end(np.zeros(4), 1.0) is None
+        assert silence._hump_end(np.empty(0), 1.0) is None
+
     def test_mostly_pauses_still_get_a_value(self) -> None:
         """壊れると、間が中央値になる素材で探す範囲が間の音量で止まり、値を勧められない"""
         peaks = _ticks(*[(-12.0, 10), (-40.0, 24)] * 20)
@@ -57,6 +80,18 @@ class TestTheKnee:
             None,
             (),
         )
+
+    def test_pauses_just_at_the_gap_get_a_value(self) -> None:
+        """壊れると、話と間の差がちょうど 15 dB の素材で、切れる間があるのに値が出ない"""
+        best, _nearby = choose_silence(_ticks(*[(-12.0, 20), (-27.0, 20)] * 10), _TICK, 0.5, 0.1)
+        assert best is not None
+        assert best.threshold_db > -27.0
+        assert best.cuts == 10
+
+    def test_pauses_closer_than_the_gap_have_no_value(self) -> None:
+        """壊れると、話と間の差の小さい音で、話の弱い所まで間と読む"""
+        peaks = _ticks(*[(-12.0, 20), (-26.0, 20)] * 10)
+        assert choose_silence(peaks, _TICK, 0.5, 0.1) == (None, ())
 
     def test_steady_sound_has_no_value(self) -> None:
         """壊れると、鳴り続ける曲の音量を間と読み、曲の途中を切る"""
@@ -173,6 +208,17 @@ def _waveform(*runs: tuple[float, int]) -> Waveform:
 
 
 class TestFromTheWaveform:
+    def test_a_counted_last_pause_has_its_real_seconds(self) -> None:
+        """壊れると、末尾の半端な間の秒が実際より長く AI へ渡る"""
+        waveform = _waveform(*[(-12.0, 100), (-46.0, 100)] * 5, (-12.0, 100), (-46.0, 85))
+        best, _nearby = suggest_silence(waveform, 0.5, 0.1)
+        assert best is not None
+        found = detect_silence(waveform, SilenceOptions(threshold_db=best.threshold_db))
+        assert best.cuts == len(found) == 6
+        assert best.seconds == pytest.approx(
+            float(sum(end - start for start, end in found)), abs=0.1
+        )
+
     @pytest.mark.parametrize("offset", [0, 3, 5, 7, 9])
     def test_a_pause_across_the_ticks_is_not_lost(self, offset: int) -> None:
         """壊れると、0.1 秒の区切りをまたいだ 0.7 秒の間が短く読まれ、切れるのに値が出ない"""

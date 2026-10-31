@@ -19,7 +19,7 @@ from sashimono.core.commands import (
     RemoveClips,
     RippleCut,
 )
-from sashimono.core.commands.edit import ripple_casualties, ripple_moves_layers
+from sashimono.core.commands.edit import ripple_casualties, ripple_gaps
 from sashimono.core.commands.insert import insert_media
 from sashimono.core.model import (
     TRANSITION_KIND,
@@ -247,6 +247,20 @@ class TestWhatFollows:
         assert _at(after, picture) == (250, 30)
         assert _at(after, sound) == (250, 30)
 
+    def test_a_partner_of_an_earlier_locked_clip_stays(self, plain: _Plain) -> None:
+        """壊れると、消す所より前のロックしたクリップの仲間だけが動き、組の並びが崩れる"""
+        group = new_group_id()
+        fixed = Clip(timeline_start=10, duration=5, source=TEXT.create(text="札"), group_id=group)
+        partner = Clip(
+            timeline_start=250, duration=5, source=TEXT.create(text="札"), group_id=group
+        )
+        locked = Track(kind=TrackKind.VIDEO, name="T1", clips=(fixed,), locked=True)
+        others = Track(kind=TrackKind.VIDEO, name="T2", clips=(partner,))
+        project = plain.project.with_timeline(
+            replace(plain.project.timeline, tracks=(*plain.project.timeline.tracks, locked, others))
+        )
+        assert _at(plain.cut_middle(project), partner) == (250, 5)
+
     def test_a_locked_track_stays(self, plain: _Plain) -> None:
         """壊れると、人が動かさないと決めたトラックが動く"""
         text_clip = Clip(timeline_start=250, duration=10, source=TEXT.create(text="札"))
@@ -272,7 +286,7 @@ class TestWhenTheProgrammeGoesOn:
         over = make_clip(120, 30, video_media)
         project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
         project, text = _text_track(project, 200, 20)
-        assert not ripple_moves_layers(project, (over.id,))
+        assert not ripple_gaps(project, (over.id,))
         after = RemoveClip(over.id, ripple=True, layers=True).apply(project)
         assert _at(after, text) == (200, 20)
 
@@ -301,7 +315,7 @@ class TestWhenTheProgrammeGoesOn:
         effect = make_clip(120, 10, audio_media)
         project = _with_track(plain.project, Track(kind=TrackKind.AUDIO, name="効果音"), effect)
         project, text = _text_track(project, 220, 10)
-        assert not ripple_moves_layers(project, (effect.id,))
+        assert not ripple_gaps(project, (effect.id,))
         after = RemoveClip(effect.id, ripple=True, layers=True).apply(project)
         assert _at(after, text) == (220, 10)
 
@@ -372,8 +386,8 @@ class TestSeveralClipsTogether:
         """壊れると、まとめて消せば動く層を「動かない」と AI に答える"""
         over = make_clip(120, 30, video_media)
         project = _with_track(plain.project, Track(kind=TrackKind.VIDEO, name="V2"), over)
-        assert not ripple_moves_layers(project, (plain.clips[1].id,))
-        assert ripple_moves_layers(project, (plain.clips[1].id, over.id))
+        assert not ripple_gaps(project, (plain.clips[1].id,))
+        assert ripple_gaps(project, (plain.clips[1].id, over.id)) == [(100, 200)]
 
 
 class TestWhatWentWithIt:

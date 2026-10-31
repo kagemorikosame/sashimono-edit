@@ -220,7 +220,7 @@ from sashimono.core.commands.edit import (
     MIN_RESOLUTION,
     STOP_LOCKED,
     ripple_casualties,
-    ripple_moves_layers,
+    ripple_report,
 )
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.history import REPLACED_REFUSAL
@@ -380,6 +380,7 @@ from sashimono.effects.strokes import (
     takes_stroke_effect,
 )
 from sashimono.effects.unlock import unlock_commands
+from sashimono.engine.audio.silence import suggest_silence
 from sashimono.engine.audio.speech import (
     SPEECH_SOURCES,
     SpeechError,
@@ -4034,6 +4035,8 @@ DEFAULT_SOUND_SILENCE_DB = -50.0
 DEFAULT_SOUND_MIN_SILENCE = 0.5
 #: jet_cut の padding の既定（秒）
 _JET_CUT_PADDING = 0.1
+#: 勧める値を数えるためにブリッジへ渡す最短の待ち（秒）
+_PREPARE_SECONDS = 1.0
 #: 一覧の種類 区間の見分けか、無音か
 SOUND_LISTS = ("segments", "silences")
 SOUND_LABEL_NAMES = {
@@ -4244,7 +4247,23 @@ def _analyze_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
             host, request, heard, arguments, points, silence_db, min_silence, listing=listing
         )
 
-    return _after_sound(host, wait, answer)
+    waveform = _main_waveform(host, request.project)
+    if waveform is None:
+        return _after_sound(host, wait, answer)
+    sound_ready = host.check_waiter()
+
+    def prepare(seconds: float) -> bool:
+        # 勧める値は細かいピークを全部数えるので、AI のスレッドで先に数えて覚えさせる 道具は画面の
+        # スレッドで動き、長い素材では止まる（答えを作る then は覚えた物を読むだけ）
+        suggest_silence(waveform, min_silence, _JET_CUT_PADDING)
+        return wait <= 0 or sound_ready(seconds)
+
+    # 待つ秒が 0 でも 0 より長く渡す ブリッジは残りの秒が無いと wait を呼ばない
+    return Pending(
+        wait=prepare,
+        seconds=max(wait, _PREPARE_SECONDS),
+        then=lambda: answer(host.check_state()),
+    )
 
 
 def _main_sound(project: Project) -> tuple[MediaItem, int | None] | None:
@@ -4261,11 +4280,20 @@ def _main_sound(project: Project) -> tuple[MediaItem, int | None] | None:
     return None if media is None else (media, stream)
 
 
-def _jet_cut_hint(host: EditorHost, project: Project, min_silence: float) -> dict[str, Any]:
+def _main_waveform(host: EditorHost, project: Project | None) -> Waveform | None:
+    """勧める値を読む波形 タイムラインで一番長く鳴っている素材の物"""
+    main = None if project is None else _main_sound(project)
+    return None if main is None else host.waveform(*main)
+
+
+def _jet_cut_hint(
+    host: EditorHost, project: Project, min_silence: float, by_kind: dict[str, float]
+) -> dict[str, Any]:
     """jet_cut の threshold_db の勧める値 当てずっぽうで切っては戻すのを防ぐ（#413）
 
     jet_cut が見る物と同じ素材の波形で決める 混ぜた音で決めると、BGM やクリップの音量の分だけ
-    ずれ、同じ値が別の所を切る
+    ずれ、同じ値が別の所を切る 音の大きさだけでは打楽器と話を分けられないので、音楽が主の
+    素材は話し声の見分け（``by_kind``）で断る
     """
     main = _main_sound(project)
     if main is None:
@@ -4279,8 +4307,13 @@ def _jet_cut_hint(host: EditorHost, project: Project, min_silence: float) -> dic
             "threshold_db": None,
             "note": "素材の波形の解析がまだ終わっていません もう 1 度呼ぶと読めます",
         }
-    from sashimono.engine.audio.silence import suggest_silence
-
+    spoken = by_kind.get(SPEECH, 0.0) + by_kind.get(SPEECH_AND_MUSIC, 0.0)
+    if by_kind.get(MUSIC, 0.0) > spoken:
+        return {
+            **named,
+            "threshold_db": None,
+            "note": "音楽が主の素材です 曲の弱い所を切らないよう、無音カットの値は勧めません",
+        }
     best, nearby = suggest_silence(waveform, min_silence, _JET_CUT_PADDING)
     if best is None:
         return {
@@ -4344,7 +4377,7 @@ def _sound_numbers(
     }
     if project is not None:
         head |= {"from_frame": request.start, "to_frame": request.end, "scene": request.scene}
-        head["jet_cut"] = _jet_cut_hint(host, project, min_silence)
+        head["jet_cut"] = _jet_cut_hint(host, project, min_silence, by_kind)
     else:
         head["frame_note"] = "フレームは書き出した動画のコマの番号（0 から）"
 
@@ -4954,75 +4987,27 @@ def _ripple_answer(
     見に行くのに手数を使う（#413）
     """
     after = _project(host)
-    own: set[TrackId] = set()
-    heads: list[int] = []
-    for clip_id in clip_ids:
-        located = before.timeline.locate_clip(clip_id)
-        if located is None:
-            continue
-        track, clip = located
-        heads.append(clip.timeline_start)
-        own.add(track.id)
-        if clip.link_group is not None:
-            own.update(t.id for t, _ in before.timeline.linked_clips(clip.link_group))
-    first = min(heads, default=0)
-    moved, left = _moved_tracks(before, after, own, first)
+    report = ripple_report(before, after, clip_ids)
     answer: dict[str, object] = {
-        "layers_followed": _layers_followed(before, after, left, first),
-        "tracks_moved": moved,
-        "tracks_left": left,
+        "layers_followed": report.layers_followed,
+        "tracks_moved": [str(track_id) for track_id in report.moved],
+        "tracks_left": [str(track_id) for track_id in report.left],
     }
     notes: list[str] = []
-    if left:
-        if not host.ripple_follows_layers:
-            reason = "本人の設定で切ってあるので、"
-        elif not ripple_moves_layers(before, clip_ids):
-            reason = "同じ時間に別の絵や音が残るので、"
-        else:
-            reason = "ロックしているか中身が消した所をまたぐので、"
+    if report.left:
+        reason = (
+            "ロックしているか中身が消した所をまたぐので、"
+            if host.ripple_follows_layers
+            else "本人の設定で切ってあるので、"
+        )
         notes.append(
-            f"{reason}tracks_left のトラックは動かしていません 同じ所を切るなら cut_range を"
-            "使います（ロックしたトラックは切れません）"
+            f"{reason}tracks_left のトラックに番組の時間に付いてこられなかった物があります"
+            " 同じ所を切るなら cut_range を使います（ロックしたトラックは切れません）"
         )
     notes.extend(_lost_clips(before, after, clip_ids, answer))
     if notes:
         answer["note"] = " ".join(notes)
     return answer
-
-
-def _is_layer(clip: Clip) -> bool:
-    return clip.media_id is None and clip.scene_id is None
-
-
-def _shifted(old: Track, new: Track) -> list[Clip]:
-    """``new`` の中で前へ動いたクリップ 切って短くなっただけの物は動いたと数えない
-
-    頭が同じなら、尻が切れただけで動いていない 新しい ID の物はまたいだクリップの後ろの片割れで、
-    消した所の後ろから詰まってきた物
-    """
-    was = {clip.id: clip.timeline_start for clip in old.clips}
-    return [clip for clip in new.clips if was.get(clip.id) != clip.timeline_start]
-
-
-def _layers_followed(before: Project, after: Project, left: list[str], start: int) -> bool | None:
-    """字幕と重ねの層が付いてきたか 真は動いた、偽は置いていかれた物がある
-
-    ``None`` は ``start`` より後ろに動かす字幕も重ねの層も無かった（元から無い・切った所で
-    消えた・尻が短くなっただけ） 偽と分けないと、失敗と読んで AI が見に行く
-    トラックに字幕が有るかではなく、実際に動いた字幕と残った字幕で答える BGM や効果音が
-    動いただけでは真にしない 消したクリップと同じレイヤーの字幕も数える
-    """
-    for track_id in left:
-        track = after.timeline.find_track(TrackId(track_id))
-        if track is not None and any(
-            _is_layer(clip) and clip.timeline_end > start for clip in track.clips
-        ):
-            return False
-    for old in before.timeline.tracks:
-        new = after.timeline.find_track(old.id)
-        if new is not None and any(_is_layer(clip) for clip in _shifted(old, new)):
-            return True
-    return None
 
 
 def _lost_clips(
@@ -5060,30 +5045,6 @@ def _lost_clips(
             "フレームは切る前の位置です 残すなら取り消して別のトラックをロックします"
         )
     return notes
-
-
-def _moved_tracks(
-    before: Project, after: Project, own: set[TrackId], start: int
-) -> tuple[list[str], list[str]]:
-    """``own`` の外のトラックのうち、中身が前へ動いた物と、``start`` より後ろに中身を残して
-    動かなかった物
-
-    答えは実際の差で決める 動く見込みの判定だけで答えると、ロックして動かなかった字幕まで
-    動いたと読み、AI がずれたまま先へ進む 切られて短くなっただけのトラックはどちらでもない
-    """
-    moved: list[str] = []
-    left: list[str] = []
-    for track in before.timeline.tracks:
-        if track.id in own:
-            continue
-        now = after.timeline.find_track(track.id)
-        if now is None:
-            continue
-        if _shifted(track, now):
-            moved.append(str(track.id))
-        elif any(clip.timeline_end > start for clip in now.clips):
-            left.append(str(track.id))
-    return moved, left
 
 
 def _removal(host: EditorHost, clip_ids: tuple[ClipId, ...], ripple: bool) -> dict[str, object]:

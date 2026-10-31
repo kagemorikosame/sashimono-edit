@@ -31,15 +31,15 @@ from sashimono.core.model import (
     Transcript,
 )
 from sashimono.effects.sources import TEXT
+from sashimono.engine.audio import silence
 from sashimono.engine.audio.waveform import PeakLevel, Waveform
 from sashimono.engine.checks import CheckRequest, CheckState
-from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
 from sashimono.engine.checks.report import HIGH, MEDIUM, assemble
 from sashimono.engine.checks.scan import LOUDNESS
 from tests.ai.conftest import RATE_30, FakeHost, make_loaded
-from tests.ai.test_audio_tools import _voiced
+from tests.ai.test_audio_tools import _heard, _spoken, _voiced
 from tests.ai.test_mix_tools import _measured, _Work
-from tests.check_media import RATE
+from tests.check_media import chord
 from tests.conftest import make_clip
 from tests.ui.test_subtitle_panel import make_waveform
 
@@ -342,11 +342,13 @@ class TestOneRowPerLine:
         assert len(result["subtitles"]) == 2 * len(transcript.segments)
 
 
-def _mixed() -> SoundProfile:
-    """タイムラインの混ぜた音の推移 勧める値は読まないので、中身は何でもよい"""
-    profiler = SoundProfiler(RATE, 2)
-    profiler.add(np.full((RATE, 2), 0.1, dtype=np.float32))
-    return profiler.snapshot()
+def _analyzed(host: FakeHost, **arguments: Any) -> Any:
+    """analyze_audio を呼び、勧める値を数える待ちがあればブリッジと同じく済ませて答えを読む"""
+    result = _run(host, "analyze_audio", points=0, **arguments)
+    if isinstance(result, Pending):
+        result.wait(result.seconds)
+        return result.then()
+    return result
 
 
 def _alternating(floor_db: float) -> Waveform:
@@ -368,9 +370,9 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、AI が threshold_db を当てずっぽうで振り、切っては戻すを繰り返す"""
         host = _voiced(video_media, transcript)
-        host.heard = _mixed()
+        host.heard = _spoken()
         host.stub_waveform = _alternating(-46.0)
-        suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
+        suggestion = _analyzed(host)["jet_cut"]
         assert -46.0 < suggestion["threshold_db"] < -12.0
         assert suggestion["media_id"] == str(host.project.media[0].id)
         # 間の 10 か所のうち、終わりの間の 1 秒も含めて全部を切れる
@@ -385,9 +387,9 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、切る所の無い音にも値を勧め、AI が曲の途中を切る"""
         host = _voiced(video_media, transcript)
-        host.heard = _mixed()
+        host.heard = _spoken()
         host.stub_waveform = _alternating(-12.0)
-        result = _run(host, "analyze_audio", points=0)
+        result = _analyzed(host)
         assert result["jet_cut"]["threshold_db"] is None
 
     def test_a_clip_turned_down_does_not_change_the_value(
@@ -395,22 +397,63 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、混ぜた音で決めた値を jet_cut が素材の音へ当て、別の所を切る"""
         host = _voiced(video_media, transcript)
-        host.heard = _mixed()
+        host.heard = _spoken()
         host.stub_waveform = _alternating(-30.0)
-        suggestion = _run(host, "analyze_audio", points=0)["jet_cut"]
+        suggestion = _analyzed(host)["jet_cut"]
         assert -30.0 < suggestion["threshold_db"] < -12.0
+
+    def test_the_counting_is_left_to_the_assistant_thread(
+        self,
+        video_media: MediaItem,
+        transcript: Transcript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """壊れると、長い素材の最初の 1 回で編集画面が止まる（道具は画面のスレッドで動く）"""
+        calls: list[int] = []
+        real = silence.choose_silence
+
+        def counting(peaks: np.ndarray, *args: Any, **kwargs: Any) -> Any:
+            calls.append(peaks.size)
+            return real(peaks, *args, **kwargs)
+
+        monkeypatch.setattr(silence, "choose_silence", counting)
+        host = _voiced(video_media, transcript)
+        host.heard = _spoken()
+        host.stub_waveform = _alternating(-46.0)
+        result = _run(host, "analyze_audio", points=0, wait_seconds=0)
+        assert isinstance(result, Pending)
+        # 待つ秒が 0 でもブリッジが wait を呼ぶ長さを渡す 呼ばれないと then が画面のスレッドで数える
+        assert result.seconds > 0
+        assert calls == []
+        assert result.wait(result.seconds)
+        assert len(calls) == 1
+        answer = result.then()
+        assert isinstance(answer, dict)
+        assert answer["jet_cut"]["threshold_db"] is not None
+        assert len(calls) == 1
+
+    def test_music_with_beats_has_no_value(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        """壊れると、周期的な打楽器を話と読み、下の曲を間と読んで切る"""
+        host = _voiced(video_media, Transcript(segments=(), language="ja", model="tiny"))
+        host.heard = _heard(chord(10.0))
+        host.stub_waveform = _alternating(-46.0)
+        hint = _analyzed(host)["jet_cut"]
+        assert hint["threshold_db"] is None
+        assert "音楽" in hint["note"]
 
     def test_a_new_waveform_changes_the_answer(
         self, video_media: MediaItem, transcript: Transcript
     ) -> None:
         """壊れると、素材を解析し直した後も、前の波形で決めた値を AI に返す"""
         host = _voiced(video_media, transcript)
-        host.heard = _mixed()
+        host.heard = _spoken()
         host.stub_waveform = _alternating(-46.0)
-        before = _run(host, "analyze_audio", points=0)["jet_cut"]
-        assert _run(host, "analyze_audio", points=0)["jet_cut"] == before
+        before = _analyzed(host)["jet_cut"]
+        assert _analyzed(host)["jet_cut"] == before
         host.stub_waveform = _alternating(-30.0)
-        after = _run(host, "analyze_audio", points=0)["jet_cut"]
+        after = _analyzed(host)["jet_cut"]
         assert after["threshold_db"] != before["threshold_db"]
 
     def test_a_waveform_still_being_read_is_said_so(
@@ -418,8 +461,8 @@ class TestSuggestedThreshold:
     ) -> None:
         """壊れると、解析の途中を「切れる無音が無い」と読む"""
         host = _voiced(video_media, transcript)
-        host.heard = _mixed()
-        result = _run(host, "analyze_audio", points=0)
+        host.heard = _spoken()
+        result = _analyzed(host)
         assert result["jet_cut"]["threshold_db"] is None
         assert "波形" in result["jet_cut"]["note"]
 
@@ -637,6 +680,45 @@ class TestWhatTheAnswerSays:
         assert str(words.id) not in result["tracks_moved"]
         assert str(words.id) not in result["tracks_left"]
         assert result["layers_followed"] is None
+        survivor = host.project.timeline.locate_clip(title.id)
+        assert survivor is not None
+        assert (survivor[1].timeline_start, survivor[1].duration) == (50, 50)
+
+    def test_a_title_between_two_cuts_is_not_left_behind(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、絵が続く所の 1 本も消しただけで、動かなくてよい字幕を置いていかれたと読む"""
+        host, _first, words, _music = self._work(video_media, audio_media)
+        host.apply_commands([RemoveClip(host.project.timeline.tracks[1].clips[0].id)], "空に")
+        between = Clip(timeline_start=60, duration=10, source=TEXT.create(text="札"))
+        host.apply_commands([AddClip(words.id, between)], "字幕")
+        over = make_clip(20, 30, video_media)
+        extra = Track(kind=TrackKind.VIDEO, name="V2")
+        host.apply_commands([AddTrack(extra), AddClip(extra.id, over)], "重ね")
+        second = host.project.timeline.tracks[0].clips[1]
+        result = _run(host, "delete_clips", clip_ids=[str(over.id), str(second.id)], ripple=True)
+        assert str(words.id) not in result["tracks_left"]
+        assert result["layers_followed"] is None
+
+    def test_a_track_partly_moved_is_also_left(
+        self, video_media: MediaItem, audio_media: MediaItem
+    ) -> None:
+        """壊れると、曲がまたいだ切りの分だけ字幕がずれたまま、付いてきたと読む"""
+        project = Project.create(
+            ProjectSettings(frame_rate=RATE_30), media=(video_media, audio_media)
+        )
+        pictures = [make_clip(start, 100, video_media) for start in (0, 100, 200)]
+        early = Clip(timeline_start=120, duration=10, source=TEXT.create(text="札"))
+        late = Clip(timeline_start=350, duration=10, source=TEXT.create(text="札"))
+        tune = make_clip(190, 130, audio_media)
+        main = Track(kind=TrackKind.VIDEO, name="V1", clips=tuple(pictures))
+        mixed = Track(kind=TrackKind.MIXED, name="L1", clips=(early, tune, late))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(main, mixed))))
+        ids = [str(pictures[0].id), str(pictures[2].id)]
+        result = _run(host, "delete_clips", clip_ids=ids, ripple=True)
+        assert result["tracks_moved"] == [str(mixed.id)]
+        assert result["tracks_left"] == [str(mixed.id)]
+        assert result["layers_followed"] is False
 
     def test_a_long_title_cut_in_two_counts_as_moved(
         self, video_media: MediaItem, audio_media: MediaItem
@@ -669,9 +751,11 @@ class TestWhatTheAnswerSays:
         """壊れると、字幕 1 枚を詰めて消しただけで絵まで動いたと答える"""
         host, _first, words, _music = self._work(video_media, audio_media)
         title = host.project.timeline.tracks[1].clips[0]
+        picture = host.project.timeline.tracks[0]
         result = _run(host, "delete_clip", clip_id=str(title.id), ripple=True)
         assert result["layers_followed"] is None
         assert str(words.id) not in result["tracks_moved"]
+        assert str(picture.id) not in result["tracks_moved"]
 
     def test_a_title_on_the_same_layer_counts(self, video_media: MediaItem) -> None:
         """壊れると、消したクリップと同じレイヤーの字幕が詰まっても、付いてきたと答えない"""

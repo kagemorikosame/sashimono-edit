@@ -54,6 +54,7 @@ __all__ = [
     "RenameProject",
     "RenameTrack",
     "RippleCut",
+    "RippleReport",
     "SetBlending",
     "SetLayerMode",
     "SetResolution",
@@ -67,7 +68,8 @@ __all__ = [
     "casualty_notice",
     "head_room",
     "ripple_casualties",
-    "ripple_moves_layers",
+    "ripple_gaps",
+    "ripple_report",
     "shifted_track",
     "tail_room",
     "trimmable",
@@ -297,15 +299,76 @@ def _cuts(
     ]
 
 
-def ripple_moves_layers(project: Project, clip_ids: tuple[ClipId, ...]) -> bool:
-    """``clip_ids`` を一緒に詰めて消すと、別のトラックの重ねの層も動く所があるか
-    （設定を切っていないとき）
-
-    AI の道具が答えに添える 動かなかったことが分からないと、AI は字幕と重ねの層が
-    付いてきたと読み、ずれたまま先へ進む
-    """
+def ripple_gaps(project: Project, clip_ids: tuple[ClipId, ...]) -> list[tuple[int, int]]:
+    """``clip_ids`` を一緒に詰めて消すと番組の時間が抜ける範囲 前の範囲から順に"""
     cuts = _cuts(_gathered(project, clip_ids))
-    return any(_programme_gap(project, members) for _, members in cuts)
+    return [span for span, members in reversed(cuts) if _programme_gap(project, members)]
+
+
+@dataclass(frozen=True, slots=True)
+class RippleReport:
+    """詰めて消した後の、別のトラックの様子（:func:`ripple_report`）"""
+
+    #: クリップが正しい位置へ動いたトラック
+    moved: tuple[TrackId, ...]
+    #: 番組の時間に付いてこられなかったクリップがあるトラック 1 本が両方に入ることもある
+    left: tuple[TrackId, ...]
+    #: 字幕と重ねの層の結果 真は動いた、偽は置いていかれた物がある、``None`` は動かす物が無かった
+    layers_followed: bool | None
+
+
+def ripple_report(before: Project, after: Project, clip_ids: tuple[ClipId, ...]) -> RippleReport:
+    """詰めて消す前と後を比べて、別のトラックのクリップがどうなったかを答える
+
+    決まりは 1 つ 番組の時間が抜けた範囲（:func:`ripple_gaps`）から、クリップごとに居るべき
+    位置が決まる そこに居れば付いてきた、居なければ置いていかれた 動く見込みやトラック単位で
+    判定しないので、ロック・曲のまたぎ・設定の切り・範囲が 2 つある場合を分けなくてよい
+    消えたクリップは数えない（:func:`ripple_casualties`） またいで割れた後ろの片割れは新しい
+    ID を持ち、消した所の後ろから詰まってきた物として動いたに数える 消したクリップと同じ
+    トラックは詰まるのが当たり前なので、字幕の結果にだけ数えてトラックの一覧へ出さない
+    """
+    targets = _gathered(before, clip_ids)
+    asked = {clip.id for _, clip in targets}
+    own = {track_id for track_id, _ in targets}
+    gaps = ripple_gaps(before, clip_ids)
+
+    def pulled(frame: int) -> int:
+        return frame - sum(min(frame, end) - start for start, end in gaps if start < frame)
+
+    moved: list[TrackId] = []
+    left: list[TrackId] = []
+    layers: set[bool] = set()
+
+    def note(found: list[TrackId], track: Track, clip: Clip, *, went: bool) -> None:
+        if track.id not in own and track.id not in found:
+            found.append(track.id)
+        if not _content(clip):
+            layers.add(went)
+
+    for track in before.timeline.tracks:
+        now = after.timeline.find_track(track.id)
+        if now is None:
+            continue
+        was = {clip.id for clip in track.clips}
+        found = {clip.id: clip for clip in now.clips}
+        for clip in track.clips:
+            new = found.get(clip.id)
+            if new is None or clip.id in asked:
+                continue
+            kept = new.duration == clip.duration
+            wanted = pulled(clip.timeline_end) - pulled(clip.timeline_start)
+            if track.id not in own and (
+                new.timeline_start != pulled(clip.timeline_start)
+                or (kept and wanted != clip.duration)
+            ):
+                note(left, track, clip, went=False)
+            elif new.timeline_start != clip.timeline_start:
+                note(moved, track, clip, went=True)
+        for clip in now.clips:
+            if clip.id not in was:
+                note(moved, track, clip, went=True)
+    followed = None if not layers else False not in layers
+    return RippleReport(tuple(moved), tuple(left), followed)
 
 
 def ripple_casualties(
@@ -428,15 +491,14 @@ def _held_tracks(project: Project, tracks: list[Track], start: int, end: int) ->
         if track is None:
             continue
         for clip in track.clips:
-            if clip.timeline_end <= start:
-                continue
             partners: list[tuple[Track, Clip]] = []
             if clip.link_group is not None:
                 partners.extend(timeline.linked_clips(clip.link_group))
             if clip.group_id is not None:
                 partners.extend(timeline.grouped_clips(clip.group_id))
-            for partner_track, _ in partners:
-                if partner_track.id not in held:
+            # 残すクリップが範囲より前でも、仲間が後ろなら仲間を残す 仲間も前なら動かない
+            for partner_track, partner in partners:
+                if partner.timeline_end > start and partner_track.id not in held:
                     held.add(partner_track.id)
                     frontier.append(partner_track.id)
     return held
