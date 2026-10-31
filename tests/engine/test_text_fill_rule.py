@@ -415,19 +415,22 @@ def test_ring_across_layers_keeps_the_cut_at_the_frame() -> None:
     source = text(body, inner_ring(), layout="aviutl", color=CLEAR)
     plain = text(body, layout="aviutl")
 
-    # 塗りは枠で切られるので、線の右端は塗りの右端を越えない
-    ink = alpha_of(source) > 64
-    filled = alpha_of(plain) > 64
+    # 塗りは枠で切られるので、線の右端は塗りの右端を越えない 左端は素の字の線の分だけ出る
+    ink = np.nonzero((alpha_of(source) > 64).any(axis=0))[0]
+    filled = np.nonzero((alpha_of(plain) > 64).any(axis=0))[0]
 
-    assert int(np.nonzero(ink.any(axis=0))[0].max()) <= int(np.nonzero(filled.any(axis=0))[0].max())
+    assert int(ink.max()) <= int(filled.max())
+    assert int(ink.min()) >= int(filled.min()) - 2
 
 
 def outside_frame(source: GeneratedSource) -> np.ndarray:
-    """文字の枠の上下の外の墨 ``False`` にした枠の中は比べない"""
+    """文字の枠の外の墨 ``False`` にした枠の中は比べない"""
     image, framed = render_source_framed(source, *SIZE)
     assert image is not None and framed is not None
     ink = image[..., 3] > 64
-    ink[math.floor(framed[1]) - 1 : math.ceil(framed[3]) + 1] = False
+    left, top = math.floor(framed[0]) - 1, math.floor(framed[1]) - 1
+    right, bottom = math.ceil(framed[2]) + 1, math.ceil(framed[3]) + 1
+    ink[top:bottom, left:right] = False
     return ink
 
 
@@ -457,14 +460,19 @@ def ring_entry(
     return shape, sources._Ring(width=3.0, colour=RED), None, {"color": color}
 
 
+def joined_rings(
+    *entries: tuple[QPainterPath, sources._Ring, QPainterPath | None, dict[str, object]],
+) -> list[tuple[QPainterPath, dict[str, object], QPainterPath | None]]:
+    layers = [(path, look, clip) for path, _ring, clip, look in entries]
+    return sources._painted_once(layers, sources._ring_key(entries, baked=False))
+
+
 def test_opaque_glyph_joins_a_translucent_partner() -> None:
     """不透明の字の線も、重なった相手が透けるならまとめる 残すと相手の塗りを透けて線が見える"""
     opaque = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0))
     translucent = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0), color=(1.0, 1.0, 1.0, 0.5))
 
-    joined = sources._joined_rings([opaque, translucent], baked=False)
-
-    assert len(joined) == 1
+    assert len(joined_rings(opaque, translucent)) == 1
 
 
 def test_opaque_glyphs_keep_their_own_rings() -> None:
@@ -472,7 +480,7 @@ def test_opaque_glyphs_keep_their_own_rings() -> None:
     first = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0))
     second = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0))
 
-    assert sources._joined_rings([first, second], baked=False) == [first, second]
+    assert len(joined_rings(first, second)) == 2
 
 
 def test_joining_keeps_overlap_of_opposite_contours() -> None:
@@ -480,34 +488,105 @@ def test_joining_keeps_overlap_of_opposite_contours() -> None:
     first = ring_entry(QRectF(0.0, 0.0, 100.0, 100.0), color=CLEAR)
     second = ring_entry(QRectF(50.0, 0.0, 100.0, 100.0), reverse=True, color=CLEAR)
 
-    joined = sources._joined_rings([first, second], baked=False)
+    assert joined_rings(first, second)[0][0].contains(QPointF(75.0, 50.0))
 
-    assert joined[0][0].contains(QPointF(75.0, 50.0))
+
+def test_a_lone_layer_is_passed_through_untouched() -> None:
+    """層が 1 つの字幕は何も調べない 字幕はほとんどこれで、毎コマの手間を増やさない"""
+    look: dict[str, object] = {"color": CLEAR}
+    only: list[tuple[QPainterPath, dict[str, object], QPainterPath | None]] = [
+        (QPainterPath(), look, None)
+    ]
+
+    def must_not_run(_look: dict[str, object]) -> tuple[float, str]:
+        raise AssertionError
+
+    assert sources._painted_once(only, must_not_run) is only
 
 
 def test_a_font_tag_makes_its_own_layer() -> None:
     """書体の違う字は別の層にする 輪郭の向きが逆の書体を 1 つのパスへ足すと、重なりが穴になる"""
     assert len(layers_of(text(f"{BLOCK}{BLOCK}", layout="aviutl"))) == 1
+    if not QFont("Courier New").exactMatch():
+        pytest.skip("Courier New が入っていない")
     assert len(layers_of(text(f"{BLOCK}<@Courier New>{BLOCK}", layout="aviutl"))) == 2
 
 
-def test_overlap_check_compares_only_near_shapes() -> None:
-    """離れた字は ``intersects`` を呼ばずに外す 字ごとに色を変えると組の数が 2 乗で増える"""
-    calls: list[int] = []
+def test_only_boxes_reaching_sideways_are_compared() -> None:
+    """横に届かない四角は比べない 字ごとに色を変えると、全部の組では字の数の 2 乗で増える"""
+    apart = [QRectF(index * 20.0, 0.0, 10.0, 10.0) for index in range(50)]
+    assert list(sources._near_pairs(apart)) == []
 
-    class Counted(QPainterPath):
-        def intersects(self, other: object) -> bool:
-            calls.append(1)
-            return False
+    rows = [QRectF(0.0, 0.0, 10.0, 10.0), QRectF(5.0, 50.0, 10.0, 10.0)]
+    assert list(sources._near_pairs(rows)) == [(0, 1)]
 
-    paths = []
-    for index in range(50):
-        path = Counted()
-        path.addRect(QRectF(index * 20.0, 0.0, 10.0, 10.0))
-        paths.append(path)
 
-    assert not sources._overlapping(paths)
-    assert calls == []
+def test_groups_hold_only_shapes_that_touch() -> None:
+    """重なった字だけを組にする 離れた字まで形を合わせると、描くたびに無駄な計算が増える"""
+    paths = [QPainterPath() for _ in range(4)]
+    for path, left in zip(paths, (0.0, 50.0, 500.0, 1000.0), strict=True):
+        path.addRect(QRectF(left, 0.0, 100.0, 100.0))
+
+    assert sources._touching(paths, 0.0) == [[0, 1]]
+
+
+def test_bands_that_touch_form_a_group() -> None:
+    """字が離れていても、線の帯が届くなら組にする 半透明の帯が別々に重なると濃くなる"""
+    paths = [QPainterPath() for _ in range(2)]
+    for path, left in zip(paths, (0.0, 110.0), strict=True):
+        path.addRect(QRectF(left, 0.0, 100.0, 100.0))
+
+    assert sources._touching(paths, 0.0) == []
+    assert sources._touching(paths, 6.0) == [[0, 1]]
+
+
+HALF_RED = (1.0, 0.0, 0.0, 0.5)
+#: 重なった所が 2 重に塗られると、不透明度 0.5 のはずの所が 0.75 になる
+ONCE: dict[str, GeneratedSource] = {
+    "書体の違う半透明の字の塗り": text(
+        f"{BLOCK}<@Courier New>{BLOCK}",
+        layout="aviutl",
+        color=HALF_RED,
+        letter_spacing=AnimatedValue(-50.0),
+    ),
+    "枠の外で重なる素の字の線": text(
+        f"{BLOCK}<#00ff00>{BLOCK}<tw3>{BLOCK}",
+        Stroke(params={"width": AnimatedValue(60.0), "color": HALF_RED, "position": "outside"}),
+        layout="aviutl",
+        color=CLEAR,
+        letter_spacing=AnimatedValue(-50.0),
+    ),
+    "グラデーションの影": text(
+        f"{BLOCK}<#00ff00>{BLOCK}",
+        layout="aviutl",
+        color=CLEAR,
+        letter_spacing=AnimatedValue(-50.0),
+        shadow_x=AnimatedValue(200.0),
+        shadow_fill_type="linear",
+        shadow_fill_gradient=(0.0, *HALF_RED, 1.0, *HALF_RED),
+    ),
+    "隣の字に届く半透明の縁": text(
+        f"{BLOCK}<#00ff00>{BLOCK}",
+        layout="aviutl",
+        color=CLEAR,
+        border_width=AnimatedValue(20.0),
+        border_color=HALF_RED,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(ONCE))
+def test_translucent_paint_lands_only_once(name: str) -> None:
+    """半透明の物は重なった所でも 1 回だけ塗る 2 回塗ると、そこだけ濃い筋が出る"""
+    if not has_block():
+        pytest.skip("■ を塗り切る書体が無い")
+    if "@Courier New" in str(ONCE[name].params["text"]) and not QFont("Courier New").exactMatch():
+        pytest.skip("Courier New が入っていない")
+
+    alpha = alpha_of(ONCE[name])
+
+    assert alpha.any()
+    assert int(alpha.max()) <= 130
 
 
 def test_translucent_shadow_of_layers_is_even_where_they_overlap() -> None:

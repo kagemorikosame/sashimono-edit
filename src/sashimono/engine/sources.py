@@ -9,9 +9,11 @@ Qt の描画系（``QPainter``）を使う 日本語の禁則処理やフォン�
 
 from __future__ import annotations
 
+import functools
+import itertools
 import math
 import struct
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -1554,7 +1556,7 @@ def _paint_layers(
     """
     # 影と各層で同じ字の輪郭を解き直さないように、この描画の間だけ覚える
     outlines: _Outlines = {}
-    for path, look, clip in _joined_shadows(layers):
+    for path, look, clip in _painted_once(layers, _shadow_key):
         made = _shadow_layer(path, look, painter, bases, outlines)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
@@ -1571,7 +1573,7 @@ def _paint_layers(
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
         _paint_ring(painter, layers, rings, index, bases, outlines, under=True)
-    for path, look, clip in layers:
+    for path, look, clip in _painted_once(layers, _fill_key):
         _fill_painted(painter, path, _fill_of(look, _FILL, "color"), bases, clip)
     for index in reversed(range(depth)):
         _paint_ring(painter, layers, rings, index, bases, outlines, under=False)
@@ -1758,9 +1760,6 @@ def _inner_lines_hidden(ring: _Ring, look: Mapping[str, object], *, baked: bool)
     return isinstance(fill, QColor) and fill.alpha() == 255
 
 
-#: 影の位置とぼかしの項目 :func:`_joined_shadows` で、同じ影かを比べる
-_SHADOW_PLACE = ("shadow_x", "shadow_y", "shadow_blur")
-
 #: 輪郭を解いて長さがこの割合より縮んだら、重なりがあったと見る 折れ線どうしの比べなので
 #: 重なりが無ければ縮まない（496 書体の 68292 字で 0.00001% 以下、重なりは 0.001% 以上）
 _OVERLAP_SHRINK = 0.99999
@@ -1817,123 +1816,184 @@ def _outline_once(path: QPainterPath, outlines: _Outlines) -> QPainterPath:
     return outlines[key][1]
 
 
-def _overlapping(paths: Sequence[QPainterPath]) -> bool:
-    """どれか 2 つが重なるか
+def _near_pairs(boxes: Sequence[QRectF]) -> Iterator[tuple[int, int]]:
+    """横に届く四角の組の番号
 
-    字ごとに色を変えた字幕は層が字の数だけあるので、外接の四角の左端で並べて、四角が横に
-    届く相手とだけ比べる 全部の組を比べると字の数の 2 乗で増え、描くたびに繰り返す
+    字ごとに色を変えた字幕は層が字の数だけあるので、左端で並べて、届く相手とだけ組にする
+    全部の組を見ると字の数の 2 乗で増え、描くたびに繰り返す
     """
-    boxed = sorted(((path.boundingRect(), path) for path in paths), key=lambda item: item[0].left())
-    for index, (box, path) in enumerate(boxed):
-        for other_box, other in boxed[index + 1 :]:
-            if other_box.left() > box.right():
+    order = sorted(range(len(boxes)), key=lambda index: boxes[index].left())
+    for place, first in enumerate(order):
+        for second in itertools.islice(order, place + 1, None):
+            if boxes[second].left() > boxes[first].right():
                 break
-            if box.intersects(other_box) and path.intersects(other):
-                return True
-    return False
+            yield first, second
+
+
+def _touching(paths: Sequence[QPainterPath], reach: float) -> list[list[int]]:
+    """重なった字の組（番号の並び） ``reach`` まで太らせて重なる物も組にする 1 字の組は入れない"""
+    boxes = [path.boundingRect().adjusted(-reach, -reach, reach, reach) for path in paths]
+    bands: dict[int, QPainterPath] = {}
+
+    def band(index: int) -> QPainterPath:
+        if index not in bands:
+            bands[index] = _stroke(paths[index], reach)
+        return bands[index]
+
+    parent = list(range(len(paths)))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for first, second in _near_pairs(boxes):
+        if root(first) == root(second) or not boxes[first].intersects(boxes[second]):
+            continue
+        if paths[first].intersects(paths[second]) or (
+            reach > 0.0 and band(first).intersects(band(second))
+        ):
+            parent[root(second)] = root(first)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(paths)):
+        groups.setdefault(root(index), []).append(index)
+    return [group for group in groups.values() if len(group) > 1]
 
 
 def _outside_of(frame: QPainterPath) -> QPainterPath:
-    """``frame`` の外全部 塗りの決まりは既定の OddEvenFill のままで、中の四角が抜ける"""
+    """``frame`` の外全部 塗りの決まりは既定の OddEvenFill のままで、中の四角が抜ける
+
+    Qt は四角の切る形を画素へ丸めるので、抜く四角も同じに丸める 丸めないと、枠と外の形が
+    端数の所の 1 行で重なる 縮めたプレビューはずれるが、1 行の濃さの差で済む
+    """
+
+    def rounded(value: float) -> float:
+        return float(math.floor(value + 0.5))
+
+    box = frame.boundingRect()
+    hole = QRectF(
+        QPointF(rounded(box.left()), rounded(box.top())),
+        QPointF(rounded(box.right()), rounded(box.bottom())),
+    )
     room = 1_000_000.0
     outside = QPainterPath()
-    outside.addRect(frame.boundingRect().adjusted(-room, -room, room, room))
-    outside.addPath(frame)
+    outside.addRect(box.adjusted(-room, -room, room, room))
+    outside.addRect(hole)
     return outside
+
+
+def _united(paths: Sequence[QPainterPath]) -> QPainterPath:
+    """足すのではなく形として合わせる 足すだけだと、輪郭の向きが逆の書体の重なりが消える"""
+    return functools.reduce(QPainterPath.united, paths)
 
 
 def _joined_layers(parts: Sequence[_Layer]) -> list[_Layer]:
     """重なった字の層を 1 つの外形にまとめた層にする
 
-    色や変形が違う字は別の層なので、層ごとに線を引くと字どうしの境に線が残る（#415）
-    パスを足すだけだと、輪郭の向きが逆の書体の重なりが消えるので、形として合わせる
-
-    変形した字は文字の枠で切る（#184） 枠の中だけ全体の外形で描き、枠の外は切らない素の字を
-    それぞれの形のままで描く 枠の外に変形した字は見えないので、素の字の輪郭がそのまま外形で、
-    2 つの切る形は重ならないので半透明でも 2 重にならない
+    変形した字は文字の枠で切る（#184） 枠の中は全体の外形で描き、枠の外は切らない素の字の
+    外形を描く 枠の外に変形した字は見えないので、それが外形になる 2 つの切る形は重ならない
+    ので、半透明でも 2 重にならない
     """
-    joined, look, _clip = parts[0]
-    for shape, _look, _clip in parts[1:]:
-        joined = joined.united(shape)
+    look = parts[0][1]
+    whole = _united([shape for shape, _look, _clip in parts])
     frame = next((clip for _shape, _look, clip in parts if clip is not None), None)
     if frame is None:
-        return [(joined, look, None)]
-    outside = _outside_of(frame)
-    free = [(shape, own, outside) for shape, own, clip in parts if clip is None]
-    return [(joined, look, frame), *free]
+        return [(whole, look, None)]
+    free = [shape for shape, _look, clip in parts if clip is None]
+    if not free:
+        return [(whole, look, frame)]
+    return [(whole, look, frame), (_united(free), look, _outside_of(frame))]
 
 
-def _with_joined[T](
-    items: Sequence[T], groups: Sequence[list[int]], join: Callable[[list[int]], list[T]]
-) -> list[T]:
-    """``groups`` の番号の並びを ``join`` の結果に置き換える 置く所は組の先頭の位置"""
-    placed = {indices[0]: join(indices) for indices in groups}
-    dropped = {index for indices in groups for index in indices}
-    result: list[T] = []
-    for index, item in enumerate(items):
+def _painted_once(
+    layers: list[_Layer],
+    key: Callable[[dict[str, object]], tuple[float, Hashable] | None],
+) -> list[_Layer]:
+    """同じ物を塗る字の層のうち、重なった物を 1 つにまとめる
+
+    色や変形や書体が違う字は別の層なので、層ごとに描くと字どうしの境に線が残り、半透明の物は
+    重なった所だけ濃くなる（#415）
+
+    ``key`` は字の見た目から（届く距離, 同じ物かを比べる値）を返す ``None`` はまとめなくて
+    よい字で、重ねても絵が変わらない不透明の物 字幕はほとんど層が 1 つで、不透明の字が
+    何色あっても何もしない どちらも前の版と同じ絵と手間のまま
+    """
+    if len(layers) < 2:
+        return layers
+    alike: dict[Hashable, list[int]] = {}
+    reaches: dict[Hashable, float] = {}
+    for index, (_path, look, _clip) in enumerate(layers):
+        found = key(look)
+        if found is not None:
+            alike.setdefault(found[1], []).append(index)
+            reaches[found[1]] = found[0]
+    placed: dict[int, list[_Layer]] = {}
+    dropped: set[int] = set()
+    for value, indices in alike.items():
+        shapes = [layers[index][0] for index in indices]
+        for group in _touching(shapes, reaches[value]) if len(indices) > 1 else ():
+            members = [indices[place] for place in group]
+            placed[members[0]] = _joined_layers([layers[index] for index in members])
+            dropped.update(members)
+    if not placed:
+        return layers
+    result: list[_Layer] = []
+    for index, layer in enumerate(layers):
         if index in placed:
             result.extend(placed[index])
         elif index not in dropped:
-            result.append(item)
+            result.append(layer)
     return result
 
 
-#: 縁取りの層を描く字 1 つぶん 輪郭・層・切る形・字の見た目
-_RingEntry = tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]
+def _fill_key(look: dict[str, object]) -> tuple[float, Hashable] | None:
+    """:func:`_painted_once` の字の塗り 不透明の単色はまとめない"""
+    fill = _fill_of(look, _FILL, "color")
+    if isinstance(fill, QColor):
+        return None if fill.alpha() == 255 else (0.0, fill.rgba())
+    return 0.0, fill
 
 
-def _joined_rings(entries: list[_RingEntry], *, baked: bool) -> list[_RingEntry]:
-    """同じ線で、重なった字の層を 1 つにまとめる
+def _shadow_key(look: dict[str, object]) -> tuple[float, Hashable] | None:
+    """:func:`_painted_once` の影 不透明の単色はまとめない"""
+    colour = _color(look.get("shadow_color"))
+    paint = paint_of(look, _SHADOW_FILL)
+    if paint is None and colour.alpha() in (0, 255):
+        return None
+    blur = _number(look, "shadow_blur", 0.0)
+    outer = max(_rings(look), key=lambda ring: ring.outward, default=None)
+    # 箱ぼかしを 2 回掛けるので、ぼかしの幅の 2 倍まで広がる（:func:`_shadow_layer`）
+    reach = 2.0 * blur + (outer.outward if outer is not None else 0.0)
+    place = (_number(look, "shadow_x", 0.0), _number(look, "shadow_y", 0.0), blur)
+    return reach, (*place, outer, colour.rgba() if paint is None else paint)
 
-    どの字の線も塗りに隠れるときはまとめない 1 字でも透けるとまとめる 透けない字の線も、
-    重なった相手の塗りを透けて見える
+
+def _ring_key(
+    entries: Sequence[tuple[QPainterPath, _Ring, QPainterPath | None, dict[str, object]]],
+    *,
+    baked: bool,
+) -> Callable[[dict[str, object]], tuple[float, Hashable] | None]:
+    """:func:`_painted_once` の縁取りの層
+
+    1 字でも線が透けるなら同じ線の字をまとめる 透けない字の線も、相手の塗りを透けて見える
+    半透明の線は字が離れていても帯が重なると濃くなるので、線の太さまで届く字もまとめる
     """
-    alike: dict[_Ring, list[int]] = {}
-    for index, entry in enumerate(entries):
-        alike.setdefault(entry[1], []).append(index)
+    rings = {id(look): ring for _path, ring, _clip, look in entries}
+    seen = {
+        ring
+        for _path, ring, _clip, look in entries
+        if not _inner_lines_hidden(ring, look, baked=baked)
+    }
 
-    def seen(indices: list[int]) -> bool:
-        return not all(
-            _inner_lines_hidden(entries[index][1], entries[index][3], baked=baked)
-            for index in indices
-        )
+    def key(look: dict[str, object]) -> tuple[float, Hashable] | None:
+        ring = rings[id(look)]
+        translucent = ring.paint is not None or _color(ring.colour).alpha() < 255
+        if ring not in seen and not translucent:
+            return None
+        return (ring.width if translucent else 0.0), ring
 
-    def join(indices: list[int]) -> list[_RingEntry]:
-        ring = entries[indices[0]][1]
-        parts = [(entries[i][0], entries[i][3], entries[i][2]) for i in indices]
-        return [(shape, ring, clip, look) for shape, look, clip in _joined_layers(parts)]
-
-    groups = [
-        indices
-        for indices in alike.values()
-        if len(indices) > 1
-        and seen(indices)
-        and _overlapping([entries[index][0] for index in indices])
-    ]
-    return _with_joined(entries, groups, join)
-
-
-def _joined_shadows(layers: list[_Layer]) -> list[_Layer]:
-    """半透明の単色の影が同じで、重なった字の層を 1 つにまとめる
-
-    層ごとに影を作って重ねると、重なった所だけ濃くなる 不透明の影とグラデーションの影は、
-    重ねても形が同じなので触らない
-    """
-    alike: dict[tuple[object, ...], list[int]] = {}
-    for index, (_path, look, _clip) in enumerate(layers):
-        colour = _color(look.get("shadow_color"))
-        if paint_of(look, _SHADOW_FILL) is None and 0 < colour.alpha() < 255:
-            offsets = tuple(_number(look, name, 0.0) for name in _SHADOW_PLACE)
-            outer = max(_rings(look), key=lambda ring: ring.outward, default=None)
-            alike.setdefault((*offsets, colour.rgba(), outer), []).append(index)
-    groups = [
-        indices
-        for indices in alike.values()
-        if len(indices) > 1 and _overlapping([layers[index][0] for index in indices])
-    ]
-    return _with_joined(
-        layers, groups, lambda indices: _joined_layers([layers[i] for i in indices])
-    )
+    return key
 
 
 def _paint_ring(
@@ -1970,7 +2030,12 @@ def _paint_ring(
     if first.effects >= 0 and isinstance(stacks, tuple) and first.effects < len(stacks):
         effects = stacks[first.effects]
     apply = baker if callable(baker) and effects else None
-    entries = _joined_rings(entries, baked=apply is not None)
+    rings_by_look = {id(shown): ring for _path, ring, _clip, shown in entries}
+    joined = _painted_once(
+        [(path, shown, clip) for path, _ring, clip, shown in entries],
+        _ring_key(entries, baked=apply is not None),
+    )
+    entries = [(path, rings_by_look[id(shown)], clip, shown) for path, shown, clip in joined]
     inside = any(ring.position == "inside" for _, ring, _, _ in entries)
     bands = [
         (
