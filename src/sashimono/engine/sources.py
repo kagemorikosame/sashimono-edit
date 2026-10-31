@@ -1556,7 +1556,7 @@ def _paint_layers(
     """
     # 影と各層で同じ字の輪郭を解き直さないように、この描画の間だけ覚える
     outlines: _Outlines = {}
-    for path, look, clip in _painted_once(layers, _shadow_key):
+    for path, look, clip in _painted_once(layers, _shadow_key, _shadow_output):
         made = _shadow_layer(path, look, painter, bases, outlines)
         if made is not None:
             shadow, (shadow_left, shadow_top) = made
@@ -1573,7 +1573,7 @@ def _paint_layers(
     depth = max((len(found) for found in rings), default=0)
     for index in reversed(range(depth)):
         _paint_ring(painter, layers, rings, index, bases, outlines, under=True)
-    for path, look, clip in _painted_once(layers, _fill_key):
+    for path, look, clip in _painted_once(layers, _fill_key, _fill_output):
         _fill_painted(painter, path, _fill_of(look, _FILL, "color"), bases, clip)
     for index in reversed(range(depth)):
         _paint_ring(painter, layers, rings, index, bases, outlines, under=False)
@@ -1906,21 +1906,32 @@ def _joined_layers(parts: Sequence[_Layer]) -> list[_Layer]:
     return [(whole, look, frame), (_united(free), look, _outside_of(frame))]
 
 
-def _crossed_by_another(layers: Sequence[_Layer], members: Sequence[int]) -> bool:
-    """組の字の間に描く別の層が組と重なるか
+def _crossed_by_another(
+    layers: Sequence[_Layer],
+    members: Sequence[int],
+    reach: float,
+    output: Callable[[dict[str, object]], float | None],
+) -> bool:
+    """組の字の間に描く別の層が組と重なるか ``reach`` は組の描く物が字から届く距離
 
     まとめると組は先頭の字の位置で描くので、後の字と間の層の上下が入れ替わる 半透明の字は
     上下で色が変わるので、そのときはまとめず、2 重に塗られる方を残す
+    ``output`` は層の描く物が字から届く距離 ``None`` は何も描かない層で、上下が無いので妨げない
     """
-    others = set(range(members[0] + 1, members[-1])).difference(members)
-    return any(
-        layers[other][0].intersects(layers[member][0]) for other in others for member in members
-    )
+    shapes = [layers[member][0] for member in members]
+    for other in set(range(members[0] + 1, members[-1])).difference(members):
+        distance = output(layers[other][1])
+        if distance is not None:
+            groups = _touching([layers[other][0], *shapes], reach + distance)
+            if any(0 in group for group in groups):
+                return True
+    return False
 
 
 def _painted_once(
     layers: list[_Layer],
     key: Callable[[dict[str, object]], tuple[float, Hashable] | None],
+    output: Callable[[dict[str, object]], float | None],
 ) -> list[_Layer]:
     """同じ物を塗る字の層のうち、重なった物を 1 つにまとめる
 
@@ -1930,6 +1941,7 @@ def _painted_once(
     ``key`` は字の見た目から（届く距離, 同じ物かを比べる値）を返す ``None`` はまとめなくて
     よい字で、重ねても絵が変わらない不透明の物 字幕はほとんど層が 1 つで、不透明の字が
     何色あっても何もしない どちらも前の版と同じ絵と手間のまま
+    ``output`` は :func:`_crossed_by_another` に渡す
     """
     if len(layers) < 2:
         return layers
@@ -1946,7 +1958,7 @@ def _painted_once(
         shapes = [layers[index][0] for index in indices]
         for group in _touching(shapes, reaches[value]) if len(indices) > 1 else ():
             members = [indices[place] for place in group]
-            if _crossed_by_another(layers, members):
+            if _crossed_by_another(layers, members, reaches[value], output):
                 continue
             placed[members[0]] = _joined_layers([layers[index] for index in members])
             dropped.update(members)
@@ -1967,6 +1979,22 @@ def _fill_key(look: dict[str, object]) -> tuple[float, Hashable] | None:
     if isinstance(fill, QColor):
         return None if fill.alpha() == 255 else (0.0, fill.rgba())
     return 0.0, fill
+
+
+def _fill_output(look: dict[str, object]) -> float | None:
+    """:func:`_crossed_by_another` の字の塗り 透明の単色は何も描かない"""
+    fill = _fill_of(look, _FILL, "color")
+    return None if isinstance(fill, QColor) and fill.alpha() == 0 else 0.0
+
+
+def _shadow_output(look: dict[str, object]) -> float | None:
+    """:func:`_crossed_by_another` の影 ずれも足した距離 判定は :func:`_shadow_layer` と同じ"""
+    x, y = _number(look, "shadow_x", 0.0), _number(look, "shadow_y", 0.0)
+    blur = _number(look, "shadow_blur", 0.0)
+    if (x, y, blur) == (0.0, 0.0, 0.0) or not _shadow_visible(look):
+        return None
+    outer = max((ring.outward for ring in _rings(look)), default=0.0)
+    return abs(x) + abs(y) + 2.0 * blur + outer
 
 
 def _shadow_key(look: dict[str, object]) -> tuple[float, Hashable] | None:
@@ -2048,6 +2076,7 @@ def _paint_ring(
     joined = _painted_once(
         [(path, shown, clip) for path, _ring, clip, shown in entries],
         _ring_key(entries, baked=apply is not None),
+        lambda shown: rings_by_look[id(shown)].width,
     )
     entries = [(path, rings_by_look[id(shown)], clip, shown) for path, shown, clip in joined]
     inside = any(ring.position == "inside" for _, ring, _, _ in entries)
