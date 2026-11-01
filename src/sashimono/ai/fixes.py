@@ -209,6 +209,13 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         (),
         "シーンの中のクリップの切れ目で、波形の解析もまだ シーンを開いて直すかを人に伝える",
     ),
+    # シーンの中の焼き込みは、開いているタイムラインの道具では文字に届かない
+    (SUBTITLE_WORDS, MEDIUM, _INSIDE_SCENE): Fix(
+        HANDOFF,
+        (),
+        "シーンの中の焼き込み字幕の語が残した音に無い set_active_scene でシーンを開いて"
+        " scene_clip_id の文字を直すか、シーンを置いたクリップの端を動かすかを人に伝える",
+    ),
     (SUBTITLE_WORDS, MEDIUM, None): Fix(
         ASK,
         ("trim_clip", "set_subtitle_text", "set_param"),
@@ -255,7 +262,7 @@ def _at_ceiling(measure: Mapping[str, object], peak_db: float | None) -> bool:
 
 
 def _variant(kind: str, measure: Mapping[str, object], peak_db: float | None) -> str | None:
-    if kind == WORD_CUT:
+    if kind in (WORD_CUT, SUBTITLE_WORDS):
         return _INSIDE_SCENE if measure.get("inside_scene") else None
     if kind == LOUDNESS:
         return _AT_CEILING if _at_ceiling(measure, peak_db) else None

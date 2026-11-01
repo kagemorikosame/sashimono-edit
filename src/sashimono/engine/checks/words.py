@@ -12,8 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from sashimono.core.model import MediaId, MediaItem, Project, Word
-from sashimono.core.projection import heard_pieces, heard_timeline
+from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
+from sashimono.core.projection import burned_subtitles, heard_pieces, heard_timeline
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -224,7 +224,11 @@ def _subtitle_problem(
     media_id: MediaId,
     missing: list[Word],
     heard: list[HeardWord],
+    scene_clip: str | None,
 ) -> Problem:
+    values: dict[str, float | int | str | bool] = (
+        {} if scene_clip is None else {"scene_clip_id": scene_clip, "inside_scene": True}
+    )
     return Problem(
         SUBTITLE_WORDS,
         MEDIUM,
@@ -237,9 +241,19 @@ def _subtitle_problem(
             "missing": "".join(word.text for word in missing),
             "segment_id": segment_id,
             "media_id": str(media_id),
+            **values,
         },
         clip_ids,
     )
+
+
+def _owner(project: Project, segment_id: SegmentId, stream: int) -> MediaId | None:
+    """素材の印の無い焼き込み字幕の、行を持つ素材 前の版の字幕の印は素材を持たないことがある"""
+    for media in project.media:
+        transcript = media.transcript_for(stream)
+        if transcript is not None and any(s.id == segment_id for s in transcript.segments):
+            return media.id
+    return None
 
 
 def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
@@ -249,7 +263,14 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
     done: set[tuple[str, int, int, str]] = set()
 
     def look(
-        segment_id: str, media_id: MediaId, stream: int, text: str, low: int, high: int, clip: str
+        segment_id: str,
+        media_id: MediaId,
+        stream: int,
+        text: str,
+        low: int,
+        high: int,
+        clip: str,
+        scene_clip: str | None = None,
     ) -> None:
         media = project.find_media(media_id)
         transcript = None if media is None else media.transcript_for(stream)
@@ -272,36 +293,31 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
         # 判定は字幕全体で、返す区間だけ調べた範囲へ切る ほかの問題は範囲の中に収まる
         area = (max(low, start), min(high, end))
         problems.append(
-            _subtitle_problem(text, *area, (clip,), segment_id, media_id, missing, kept)
+            _subtitle_problem(text, *area, (clip,), segment_id, media_id, missing, kept, scene_clip)
         )
 
     # 焼き込んだ字幕を先に見る 見る人に出るのは焼き込んだ文字で、出す長さも文言も変えられる
     # 焼き込んだ行の文言は焼き込んだ文字で見る 行の文言と比べ直すと、文字を直しても消えない
     burned: set[str] = set()
-    # 描かれない字幕は見る人に届かない 走査は描画と同じ決まりにする
-    for track in project.timeline.active_picture_tracks():
-        for clip in track.clips:
-            origin = clip.subtitle_origin
-            if (
-                origin is None
-                or origin.media_id is None
-                or clip.source is None
-                or not clip.enabled
-                or not project.draws_picture(track, clip)
-                or clip.timeline_end <= start
-                or clip.timeline_start >= end
-            ):
-                continue
-            burned.add(str(origin.segment_id))
-            look(
-                str(origin.segment_id),
-                origin.media_id,
-                origin.stream,
-                str(clip.source.params.get("text", "")),
-                clip.timeline_start,
-                clip.timeline_end,
-                str(clip.id),
-            )
+    # 描かれない字幕は見る人に届かない シーンの中も置いた窓を通して外の時刻で見る
+    for item in burned_subtitles(project):
+        origin = item.origin
+        media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
+        source = item.clip.source
+        if media_id is None or source is None or item.end <= start or item.start >= end:
+            continue
+        burned.add(str(origin.segment_id))
+        look(
+            str(origin.segment_id),
+            media_id,
+            origin.stream,
+            str(source.params.get("text", "")),
+            # シーンを速度付きで置くと 1 コマの途中に当たる 映っているコマを全部含むよう広げる
+            math.floor(item.start),
+            math.ceil(item.end),
+            str(item.clip_id),
+            str(item.clip.id) if item.nested else None,
+        )
     for subtitle in heard_timeline(project):
         if subtitle.media_id is None or subtitle.end_frame <= start or subtitle.start_frame >= end:
             continue

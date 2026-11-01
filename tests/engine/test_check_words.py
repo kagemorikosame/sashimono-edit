@@ -20,7 +20,7 @@ from sashimono.core.model import (
     new_media_id,
 )
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.checks import HIGH, MEDIUM
+from sashimono.engine.checks import HIGH, MEDIUM, Problem
 from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
 from sashimono.engine.checks.words import WordReport, check_words
 from tests.words_helpers import in_scene, placed, sample_transcript, segment, spoken, wave
@@ -209,6 +209,108 @@ def test_a_work_without_material_sound_is_not_skipped(video_media: MediaItem) ->
     """切れ目が無いのに調べられなかったと返すと、文字だけの作品の検査のたびに案内が付く"""
     project = placed(video_media)
     assert _check(project, wave()) == WordReport()
+
+
+class TestBurnedInScene:
+    """#420 の出発点 ハイライトのシーンの最後の片で、字幕の文の後半が音に入っていなかった"""
+
+    def _scene(self, media: MediaItem, window: Clip, *, inner_off: bool = False) -> Project:
+        """素材の音を丸ごと持つシーンに、最初の行の字幕を素材の 1.0〜2.6 秒の所へ焼き込む"""
+        transcript = media.transcript_for()
+        assert transcript is not None
+        origin = SubtitleOrigin(media.id, media.transcript_stream(), transcript.segments[0].id)
+        text = Clip(
+            30,
+            48,
+            source=GeneratedSource(kind="text", params={"text": "カメラを作ります"}),
+            subtitle_origin=origin,
+        )
+        burned = Track(kind=TrackKind.VIDEO, name="字幕", clips=(text,), muted=inner_off)
+        inner = placed(media, _clip(media, 0, 300, Fraction(0)))
+        inner = inner.with_timeline(
+            replace(inner.timeline, tracks=(*inner.timeline.tracks, burned))
+        )
+        return in_scene(inner, window)
+
+    def _found(self, project: Project) -> list[Problem]:
+        return [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS]
+
+    def test_the_window_cuts_the_second_half(self, video_media: MediaItem) -> None:
+        """壊れると、シーンの中の字幕の後半が音に無いことを検査で拾えない"""
+        media = _media(video_media)
+        window = Clip(100, 24, source_in=Fraction(1))
+        (problem,) = self._found(self._scene(media, window))
+        assert (problem.start, problem.end) == (100, 124)
+        assert problem.measure["heard"] == "カメラを"
+        assert problem.measure["missing"] == "作ります"
+        assert problem.clip_ids == (str(window.id),)
+        assert problem.measure["inside_scene"] is True
+
+    def test_the_speed_is_taken_back(self, video_media: MediaItem) -> None:
+        # 壊れると、2 倍速で置いたシーンの字幕を別のコマで比べ、残った語を読み違える
+        media = _media(video_media)
+        window = Clip(0, 12, source_in=Fraction(1), speed=Fraction(2))
+        (problem,) = self._found(self._scene(media, window))
+        assert (problem.start, problem.end) == (0, 12)
+        assert problem.measure["missing"] == "作ります"
+
+    def test_the_fix_goes_to_the_person(self, video_media: MediaItem) -> None:
+        # 壊れると、開いているタイムラインの道具で届かない文字を AI が直しに行く
+        media = _media(video_media)
+        (problem,) = self._found(self._scene(media, Clip(0, 24, source_in=Fraction(1))))
+        assert fix_for(SUBTITLE_WORDS, MEDIUM, problem.measure).action == "handoff"
+
+    def test_a_whole_line_is_fine(self, video_media: MediaItem) -> None:
+        # 壊れると、切っていないシーンの字幕まで問題になる
+        media = _media(video_media)
+        assert self._found(self._scene(media, Clip(0, 60, source_in=Fraction(1)))) == []
+
+    def test_a_line_outside_the_window_is_not_seen(self, video_media: MediaItem) -> None:
+        # 壊れると、シーンの窓の外の映らない字幕を問題にする
+        media = _media(video_media)
+        assert self._found(self._scene(media, Clip(0, 30, source_in=Fraction(5)))) == []
+
+    def test_a_muted_inner_track_is_not_seen(self, video_media: MediaItem) -> None:
+        # 壊れると、シーンの中で消した字幕の文言を直しに行く
+        media = _media(video_media)
+        window = Clip(0, 24, source_in=Fraction(1))
+        # 素材の字幕の行としては切れ目をまたぐので、残るのは焼き込みを指さない問題だけ
+        found = self._found(self._scene(media, window, inner_off=True))
+        assert all("scene_clip_id" not in problem.measure for problem in found)
+
+    def test_a_scene_that_is_not_placed_is_not_seen(self, video_media: MediaItem) -> None:
+        # 壊れると、書き出しに出ないシーンの字幕まで問題にする word_cut の走査と同じ決まり
+        media = _media(video_media)
+        project = self._scene(media, Clip(0, 24, source_in=Fraction(1)))
+        emptied = project.with_timeline(replace(project.timeline, tracks=()))
+        assert self._found(emptied) == []
+
+    def test_only_the_asked_range(self, video_media: MediaItem) -> None:
+        # 壊れると、範囲の判定にシーンの中の時刻を使い、頼んだ範囲の字幕を見逃す
+        media = _media(video_media)
+        project = self._scene(media, Clip(100, 24, source_in=Fraction(1)))
+        report = check_words(project, 0, 50, WORD_KINDS, lambda _media, _stream: wave())
+        assert [p for p in report.problems if p.kind == SUBTITLE_WORDS] == []
+        report = check_words(project, 110, 120, WORD_KINDS, lambda _media, _stream: wave())
+        (problem,) = [p for p in report.problems if p.kind == SUBTITLE_WORDS]
+        assert (problem.start, problem.end) == (110, 120)
+
+    def test_an_origin_without_the_material(self, video_media: MediaItem) -> None:
+        # 壊れると、素材の印の無い前の版の焼き込みを調べず、問題が無いと読む
+        media = _media(video_media)
+        project = self._scene(media, Clip(0, 24, source_in=Fraction(1)))
+        (scene,) = project.scenes
+        tracks = []
+        for track in scene.timeline.tracks:
+            clips = tuple(
+                replace(clip, subtitle_origin=replace(clip.subtitle_origin, media_id=None))
+                if clip.subtitle_origin is not None
+                else clip
+                for clip in track.clips
+            )
+            tracks.append(replace(track, clips=clips))
+        changed = replace(scene, timeline=replace(scene.timeline, tracks=tuple(tracks)))
+        assert len(self._found(replace(project, scenes=(changed,)))) == 1
 
 
 class TestSubtitleWords:

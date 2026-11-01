@@ -20,6 +20,7 @@ from sashimono.core.model import (
     MediaId,
     MediaItem,
     Project,
+    SubtitleOrigin,
     Timeline,
     Track,
     TrackId,
@@ -30,8 +31,10 @@ from sashimono.core.model import (
 from sashimono.core.timebase import FrameRate, Rounding, seconds_to_frame
 
 __all__ = [
+    "BurnedSubtitle",
     "HeardPiece",
     "ProjectedSubtitle",
+    "burned_subtitles",
     "heard_pieces",
     "heard_timeline",
     "project_clip",
@@ -287,6 +290,21 @@ def _heard_pieces(project: Project, timeline: Timeline, depth: int) -> Iterator[
         )
 
 
+def _scene_window(
+    start: Fraction, end: Fraction, clip: Clip, rate: FrameRate
+) -> tuple[Fraction, Fraction] | None:
+    """シーンの中の ``[start, end)`` のうち、シーンを置いたクリップの窓に入る所 無ければ ``None``"""
+    scene_start = clip.source_in / rate.frame_duration
+    scene_end = scene_start + clip.duration * clip.speed
+    low, high = max(start, scene_start), min(end, scene_end)
+    return (low, high) if low < high else None
+
+
+def _outer_frame(frame: Fraction, clip: Clip, rate: FrameRate) -> Fraction:
+    """シーンの中のフレームを、シーンを置いたクリップの外の時刻へ 写し方は描画と同じ"""
+    return clip.timeline_start + (frame - clip.source_in / rate.frame_duration) / clip.speed
+
+
 def _placed_pieces(
     inner: Iterator[HeardPiece], clip: Clip, rate: FrameRate, track_id: TrackId
 ) -> Iterator[HeardPiece]:
@@ -295,24 +313,80 @@ def _placed_pieces(
     窓の端で切れた所も素材の秒へ戻す シーンを置いたクリップの端が語の途中に当たる形を
     見逃さないため 写し方は描画と同じ（:func:`_place_scene`）
     """
-    scene_start = clip.source_in / rate.frame_duration
-    scene_end = scene_start + clip.duration * clip.speed
     for piece in inner:
-        low = max(piece.start, scene_start)
-        high = min(piece.end, scene_end)
-        if low >= high:
+        window = _scene_window(piece.start, piece.end, clip, rate)
+        if window is None:
             continue
+        low, high = window
         yield replace(
             piece,
             source_start=piece.seconds_at(low, rate),
             source_end=piece.seconds_at(high, rate),
-            start=clip.timeline_start + (low - scene_start) / clip.speed,
-            end=clip.timeline_start + (high - scene_start) / clip.speed,
+            start=_outer_frame(low, clip, rate),
+            end=_outer_frame(high, clip, rate),
             speed=piece.speed * clip.speed,
             clip_id=clip.id,
             track_id=track_id,
             inner_clip_id=piece.inner_clip_id or piece.clip_id,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class BurnedSubtitle:
+    """書き出しに映る、字幕から焼き込んだテキスト 1 つ シーンの中の物は外の時刻へ戻した物"""
+
+    #: 焼き込んだテキストのクリップ（シーンの中の物はシーンの中のクリップのまま）
+    clip: Clip
+    origin: SubtitleOrigin
+    #: タイムラインの範囲（フレーム） ``end`` は含まない シーンの窓の外は切り詰めてある
+    start: Fraction
+    end: Fraction
+    #: 開いているタイムラインの上のクリップ シーンの中の物は、シーンを置いたクリップ
+    clip_id: ClipId
+    #: シーンの中のテキストか
+    nested: bool = False
+
+
+def burned_subtitles(project: Project) -> list[BurnedSubtitle]:
+    """書き出しに映る焼き込み字幕を、タイムラインの順に返す（#420）
+
+    字幕の文言と音の食い違いの検査が使う ハイライトはシーンに組むことが多く、シーンの中を
+    見ないと、切った片の字幕の文の後半が音に無い形を拾えない シーンをたどる範囲と窓の決まりは
+    :func:`heard_pieces` と同じで、見る側は描画と同じく映るトラックと有効なクリップだけ
+    どのシーンも置かれている所からたどるので、置いていないシーンの字幕は返さない
+    """
+    found = _burned(project, project.timeline, 0)
+    return sorted(found, key=lambda burned: (burned.start, burned.end))
+
+
+def _burned(project: Project, timeline: Timeline, depth: int) -> Iterator[BurnedSubtitle]:
+    rate = project.rate
+    for track in timeline.active_picture_tracks():
+        for clip in track.clips:
+            if not clip.enabled or not project.draws_picture(track, clip):
+                continue
+            if clip.scene_id is not None:
+                scene = project.find_scene(clip.scene_id)
+                if scene is None or depth >= MAX_SCENE_DEPTH:
+                    continue
+                for inner in _burned(project, scene.timeline, depth + 1):
+                    window = _scene_window(inner.start, inner.end, clip, rate)
+                    if window is not None:
+                        yield replace(
+                            inner,
+                            start=_outer_frame(window[0], clip, rate),
+                            end=_outer_frame(window[1], clip, rate),
+                            clip_id=clip.id,
+                            nested=True,
+                        )
+            elif clip.subtitle_origin is not None and clip.source is not None:
+                yield BurnedSubtitle(
+                    clip,
+                    clip.subtitle_origin,
+                    Fraction(clip.timeline_start),
+                    Fraction(clip.timeline_end),
+                    clip.id,
+                )
 
 
 def _project_tracks(
