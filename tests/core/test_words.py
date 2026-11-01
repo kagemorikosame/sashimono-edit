@@ -159,6 +159,23 @@ class TestAttachWords:
         before = Transcript((line,))
         assert attach_words(before, Transcript()) == before
 
+    def test_a_long_line_behind_a_short_one_gets_its_word(self) -> None:
+        # 壊れると、重なる短い行の陰で長い行の語を捨て、words_only で持っていた語の時刻まで消える
+        long = TranscriptSegment(Fraction(0), Fraction(10), "長い行")
+        short = TranscriptSegment(Fraction(2), Fraction(3), "短い行")
+        recognized = Transcript((segment(spoken(Fraction(4), "あ", Fraction(1))),))
+        attached = attach_words(Transcript((long, short)), recognized)
+        assert [word.text for word in attached.segments[0].words] == ["あ"]
+        assert attached.segments[1].words == ()
+
+    def test_a_tie_goes_to_the_earlier_line(self) -> None:
+        # 壊れると、同じだけ重なる語の入る行が変わり、起こし直すたびに字幕の語が動く
+        first = TranscriptSegment(Fraction(1), Fraction(3), "前")
+        second = TranscriptSegment(Fraction(1), Fraction(3), "後")
+        recognized = Transcript((segment(spoken(Fraction(2), "あ", Fraction(1, 2))),))
+        attached = attach_words(Transcript((first, second)), recognized)
+        assert [len(line.words) for line in attached.segments] == [1, 0]
+
     def test_a_word_outside_every_line_is_dropped(self) -> None:
         # 消した行の語を残すと、人が消した言葉が字幕の語として返る
         line = segment(spoken(Fraction(1), "あ"))

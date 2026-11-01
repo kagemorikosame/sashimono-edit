@@ -176,13 +176,13 @@ def attach_words(transcript: Transcript, recognized: Transcript) -> Transcript:
         return transcript
     groups: list[list[Word]] = [[] for _ in transcript.segments]
     starts = [segment.start for segment in transcript.segments]
+    reach = list(accumulate((segment.end for segment in transcript.segments), max))
     for word in transcript_words(recognized):
-        # 語に重なる候補は、語の頭より前に始まる最後の行から、語の終わりより前に始まる最後の行まで
-        first = max(0, bisect.bisect_right(starts, word.start) - 1)
-        last = bisect.bisect_left(starts, word.end)
         best: int | None = None
         best_overlap = Fraction(0)
-        for index in range(first, min(last + 1, len(starts))):
+        # 行は重なることがある 語の頭の直前の行から数えると、先に始まる長い行を候補から落とす
+        # 同じだけ重なるときは前の行へ入れるので、頭の順に見る
+        for index in reversed(_reaching(starts, reach, word.start, word.end)):
             segment = transcript.segments[index]
             overlap = min(segment.end, word.end) - max(segment.start, word.start)
             if overlap > best_overlap:
