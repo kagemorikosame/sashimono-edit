@@ -7,7 +7,15 @@ from fractions import Fraction
 
 import pytest
 
-from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript, Word
+from sashimono.core.model import (
+    Clip,
+    MediaItem,
+    Track,
+    TrackKind,
+    Transcript,
+    TranscriptSegment,
+    Word,
+)
 from sashimono.core.projection import heard_pieces
 from sashimono.core.words import (
     CUT_IN,
@@ -19,6 +27,7 @@ from sashimono.core.words import (
     phrases,
     transcript_words,
     unheard_words,
+    untimed_sounds,
     word_at,
 )
 from tests.words_helpers import RATE, in_scene, placed, sample_transcript, segment, spoken
@@ -215,6 +224,24 @@ class TestCutEdges:
         )
         assert len(cut_edges(project, 0, 61)) == 4
 
+    def test_a_one_frame_skip_of_the_material_is_a_cut(self, video_media: MediaItem) -> None:
+        # 壊れると、素材を 1 コマ飛ばして語が欠けたつなぎ目を分割と読み、切れ目を見逃す
+        project = placed(
+            video_media,
+            _clip(video_media, 0, 30, Fraction(1)),
+            _clip(video_media, 30, 30, Fraction(2) + Fraction(1, 30)),
+        )
+        assert len(cut_edges(project, 0, 60)) == 4
+
+    def test_rounding_of_a_speed_change_is_not_a_cut(self, video_media: MediaItem) -> None:
+        # 壊れると、速度を変えたクリップの長さの丸めの差で、ただの分割を切れ目として返す
+        project = placed(
+            video_media,
+            _clip(video_media, 0, 30, Fraction(1), speed=Fraction(3, 2)),
+            _clip(video_media, 30, 30, Fraction(5, 2) + Fraction(1, 60), speed=Fraction(3, 2)),
+        )
+        assert len(cut_edges(project, 0, 60)) == 2
+
     def test_a_jump_is_a_cut(self, video_media: MediaItem) -> None:
         # 壊れると、飛ばしてつないだ所を分割と読み、切れ目を見逃す
         project = placed(
@@ -234,6 +261,27 @@ class TestCutEdges:
         project = placed(video_media, _clip(video_media, 30, 30, Fraction(1)))
         assert [edge.side for edge in cut_edges(project, 0, 40)] == [CUT_IN]
         assert [edge.side for edge in cut_edges(project, 40, 90)] == [CUT_OUT]
+
+
+class TestUntimedSounds:
+    def test_a_heard_line_without_words(self, video_media: MediaItem) -> None:
+        """壊れると、語の無い行の所を調べたと読み、切れ目が無事と返る"""
+        lines = (
+            segment(spoken(Fraction(1), "カメラ")),
+            TranscriptSegment(Fraction(5), Fraction(6), "手で足した行"),
+        )
+        media = video_media.with_transcript(Transcript(lines, language="ja"))
+        heard = placed(media, _clip(media, 0, 30, Fraction(5)))
+        assert untimed_sounds(heard, 0, 30) == {(media.id, media.transcript_stream())}
+
+    def test_a_line_that_is_not_used_does_not_count(self, video_media: MediaItem) -> None:
+        # 壊れると、置いていない所の行 1 本で作品全体が調べられない扱いになる
+        lines = (
+            segment(spoken(Fraction(1), "カメラ")),
+            TranscriptSegment(Fraction(5), Fraction(6), "手で足した行"),
+        )
+        media = video_media.with_transcript(Transcript(lines, language="ja"))
+        assert untimed_sounds(placed(media, _clip(media, 0, 30, Fraction(1))), 0, 30) == set()
 
 
 class TestHeardWords:

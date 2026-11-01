@@ -37,7 +37,9 @@ __all__ = [
     "phrases",
     "transcript_words",
     "unheard_words",
+    "untimed_sounds",
     "word_at",
+    "wordless_lines",
 ]
 
 #: クリップの音の頭と終わり どちらの端かで、音を残す側が変わる
@@ -56,6 +58,8 @@ _PREFIXES = frozenset("おご御")
 _SENTENCE_ENDS = ("です", "ます", "ました", "ません", "でした", "ください")
 #: 文の終わりの形の後に付く助詞 ここでは区切らない（「ですか」「ますね」「ですが」）
 _ENDING_PARTICLES = "かねよなわぞが"
+#: 等速の音のつなぎ目で、素材の時刻の端数と読む差（秒） 取り込みの時刻の刻み（ミリ秒）
+_SOURCE_ROUNDING = Fraction(1, 1000)
 _HIRAGANA, _KATAKANA, _KANJI, _LATIN, _MARK = range(5)
 
 
@@ -263,6 +267,17 @@ def _neighbours(index: _Index, piece: HeardPiece, frame: Fraction) -> Iterator[H
             yield other
 
 
+def _rounding(piece: HeardPiece, other: HeardPiece, frame_seconds: Fraction) -> Fraction:
+    """つなぎ目の素材の時刻の差のうち、丸めと読む大きさ
+
+    等速の分割は分数のまま割るので差が出ない 許すのはミリ秒へ丸めた取り込みの端数だけ 1 コマも
+    許すと、素材を 1 コマ飛ばしたつなぎ目を分割と読み、語が欠けても返さない 速度を変えると長さを
+    コマへ丸めるので、速度を掛けた音だけ 1 コマ分の素材の時刻を許す
+    """
+    speed = max(piece.speed, other.speed)
+    return _SOURCE_ROUNDING if speed == 1 and piece.speed == other.speed else frame_seconds * speed
+
+
 def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
     """タイムラインの ``[start, end]`` の中で、素材の音が途切れる端を返す
 
@@ -279,15 +294,15 @@ def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
         media = project.find_media(piece.media_id)
         if media is None:
             continue
-        # 素材の時刻の差は 1 コマ分許す 速度を掛けた音は 1 コマで素材がそれだけ進む タイムラインの
-        # 端はちょうど合う物だけ 1 コマ空いた所は無音が出るので、つながっていない
-        allowed = max(frame_seconds * piece.speed, frame_seconds)
+        # タイムラインの端はちょうど合う物だけ 1 コマ空いた所は無音が出るので、つながっていない
         continued_from = any(
-            other.end == piece.start and abs(other.source_end - piece.source_start) <= allowed
+            other.end == piece.start
+            and abs(other.source_end - piece.source_start) <= _rounding(piece, other, frame_seconds)
             for other in _neighbours(tails, piece, piece.start)
         )
         continues = any(
-            other.start == piece.end and abs(other.source_start - piece.source_end) <= allowed
+            other.start == piece.end
+            and abs(other.source_start - piece.source_end) <= _rounding(piece, other, frame_seconds)
             for other in _neighbours(heads, piece, piece.end)
         )
         ends_media = media.duration > 0 and piece.source_end >= media.duration - frame_seconds
@@ -296,6 +311,39 @@ def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
         if start < piece.end <= end and not ends_media and not continues:
             edges.append(CutEdge(piece, CUT_OUT, piece.source_end, piece.end))
     return edges
+
+
+def wordless_lines(transcript: Transcript | None) -> tuple[TranscriptSegment, ...]:
+    """語の時刻が無い字幕の行 手で足した行や、語の時刻が入る前の行"""
+    if transcript is None:
+        return ()
+    return tuple(segment for segment in transcript.segments if not segment.words)
+
+
+def untimed_sounds(project: Project, start: int, end: int) -> set[tuple[MediaId, int]]:
+    """タイムラインの ``[start, end)`` で鳴る音のうち、語の時刻が揃っていない音
+
+    字幕の一部の行だけ語の時刻を持つ音も入れる 語の無い行の所は切れ目も文言も比べられないので、
+    入れないと、調べていない所を無事と読む 見るのは鳴っている行だけ 使っていない所の行まで見ると、
+    置いていない行 1 本で作品全体が調べられない扱いになる
+    """
+    found: set[tuple[MediaId, int]] = set()
+    lines: dict[tuple[MediaId, int], tuple[TranscriptSegment, ...] | None] = {}
+    for piece in heard_pieces(project):
+        if piece.end <= start or piece.start >= end:
+            continue
+        key = (piece.media_id, piece.stream)
+        if key not in lines:
+            media = project.find_media(piece.media_id)
+            transcript = None if media is None else media.transcript_for(piece.stream)
+            # 細かく切った作品で行を毎回なめないよう、語の無い行だけを控える ふつうは空
+            lines[key] = wordless_lines(transcript) if phrases(transcript) else None
+        wordless = lines[key]
+        low = piece.seconds_at(max(piece.start, Fraction(start)), project.rate)
+        high = piece.seconds_at(min(piece.end, Fraction(end)), project.rate)
+        if wordless is None or any(line.overlaps(low, high) for line in wordless):
+            found.add(key)
+    return found
 
 
 def heard_between(

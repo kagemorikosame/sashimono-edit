@@ -12,7 +12,15 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript, new_media_id
+from sashimono.core.model import (
+    Clip,
+    MediaItem,
+    Track,
+    TrackKind,
+    Transcript,
+    TranscriptSegment,
+    new_media_id,
+)
 from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS, Run
@@ -45,7 +53,68 @@ def _host(media: MediaItem, *clips: Clip) -> FakeHost:
     return host
 
 
+class TestOverlappingSounds:
+    """シーンを置いたクリップの ID は、中の音すべてに当たる"""
+
+    def _scene(self, *clips: tuple[MediaItem, Clip]) -> tuple[FakeHost, Clip]:
+        tracks = tuple(
+            Track(TrackKind.AUDIO, name=f"A{n}", clips=(clip,))
+            for n, (_, clip) in enumerate(clips, 1)
+        )
+        media = tuple(dict.fromkeys(item for item, _ in clips))
+        inner = replace(placed(clips[0][0]), media=media)
+        inner = inner.with_timeline(replace(inner.timeline, tracks=tracks))
+        window = Clip(0, 60, source_in=Fraction(0))
+        host = FakeHost(in_scene(inner, window))
+        host.stub_waveform = wave()
+        return host, window
+
+    def test_the_voice_is_chosen_over_the_music(
+        self, video_media: MediaItem, media: MediaItem
+    ) -> None:
+        # 壊れると、シーンの ID を渡しても BGM が選ばれ、字幕が無いと断られる
+        music = replace(video_media, id=new_media_id())
+        host, window = self._scene(
+            (music, _clip(music, 0, 60, Fraction(0))),
+            (media, _clip(media, 0, 60, Fraction(1))),
+        )
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
+        assert result["word"]["text"] == "カメラを"
+
+    def test_two_voices_ask_which(self, video_media: MediaItem, media: MediaItem) -> None:
+        # 壊れると、並びの最初の話し手を黙って選び、別の人の語の境目で切る
+        other = replace(media, id=new_media_id())
+        second = _clip(other, 0, 60, Fraction(1))
+        host, window = self._scene((media, _clip(media, 0, 60, Fraction(1))), (other, second))
+        with pytest.raises(ToolError, match="scene_clip_id"):
+            _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(second.id))
+        assert result["media_id"] == str(other.id)
+
+    def test_heard_words_names_the_inner_clip(self, media: MediaItem) -> None:
+        # 壊れると、語を読んだ音を word_boundaries で指す ID が分からない
+        inner = _clip(media, 0, 60, Fraction(1))
+        host, _ = self._scene((media, inner))
+        (row, *_) = _call(host, "heard_words")["heard"]
+        assert row["scene_clip_id"] == str(inner.id)
+
+
 class TestWordBoundaries:
+    def test_a_line_without_words_is_not_called_clean(self, video_media: MediaItem) -> None:
+        # 壊れると、語の時刻の無い行の中を「語の途中ではない」と答え、声の途中で切る
+        lines = (
+            *sample_transcript().segments,
+            TranscriptSegment(Fraction(6), Fraction(7), "手で足した行"),
+        )
+        media = video_media.with_transcript(Transcript(lines, language="ja"))
+        host = _host(media, _clip(media, 0, 60, Fraction(6)))
+        result = _call(host, "word_boundaries", frame=15)
+        assert result["has_words"] is False
+        assert result["inside_word"] is None
+        assert "words_only" in result["note"]
+        # 語の時刻のある所は今までどおり読める
+        assert _call(host, "word_boundaries", media_id=str(media.id), seconds=1.4)["has_words"]
+
     def test_it_only_reads(self) -> None:
         # 壊れると、語の境目を読むたびに確かめの箱が出る
         assert _tool("word_boundaries").safety is Safety.READ_ONLY
@@ -276,8 +345,7 @@ class TestCheckOutput:
         )
         host = FakeHost(project)
         host.stub_waveform = wave()
-        with pytest.raises(ToolError, match="字幕がありません"):
-            _call(host, "word_boundaries", frame=12)
+        assert _call(host, "word_boundaries", frame=12)["word"]["text"] == "カメラを"
         result = _call(host, "word_boundaries", frame=12, clip_id=str(voice.id))
         assert result["word"]["text"] == "カメラを"
         with pytest.raises(ToolError, match="クリップ"):
@@ -288,13 +356,13 @@ class TestCheckOutput:
 
         壊れると、手掛かりにならない量を返し、AI が自分で量を決めることになる
         """
-        clip = _clip(media, 0, 60, Fraction(17, 10))
+        clip = _clip(media, 60, 60, Fraction(17, 10))
         host = _host(media, clip)
         host.stub_waveform = wave(((0.0, 1.0), (1.72, 1.76), (2.6, 12.0)))
         (cut,) = self._finished(host, checks=[WORD_CUT])["problems"]
-        assert cut["suggested_source_seconds"] == 1.8
-        assert cut["suggested_kind"] == "word_edge"
-        assert cut["suggested_head_delta"] == 3
+        # 語を残す向きが届くので、語の頭まで戻す
+        assert cut["suggested_source_seconds"] <= 1.0
+        assert cut["suggested_head_delta"] < 0
         _call(host, "trim_clip", clip_id=str(clip.id), head_delta=cut["suggested_head_delta"])
         assert self._finished(host, checks=[WORD_CUT])["problems"] == []
 

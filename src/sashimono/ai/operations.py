@@ -355,8 +355,9 @@ from sashimono.core.words import (
     heard_between,
     heard_words,
     phrases,
-    transcript_words,
+    untimed_sounds,
     word_at,
+    wordless_lines,
 )
 from sashimono.effects import registry
 from sashimono.effects.denoise import (
@@ -7190,6 +7191,33 @@ def _word_row(word: Word) -> dict[str, object]:
     }
 
 
+def _word_piece(project: Project, at: int, wanted: str) -> HeardPiece | None:
+    """語の境目を見る音 同じ時刻に音が重なるときは字幕のある音を選ぶ
+
+    BGM が先に並ぶと、声の語ではなく字幕が無いという断りを返す シーンを置いたクリップの ID は
+    中の音すべてに当たるので、字幕のある音が 2 本以上残れば黙って選ばず、中のクリップを尋ねる
+    """
+    found = [
+        piece
+        for piece in heard_pieces(project)
+        if piece.start <= at < piece.end
+        and (not wanted or wanted in (str(piece.clip_id), str(piece.inner_clip_id)))
+    ]
+    with_lines = []
+    for piece in found:
+        media = project.find_media(piece.media_id)
+        if media is not None and media.transcript_for(piece.stream) is not None:
+            with_lines.append(piece)
+    chosen = with_lines or found
+    if wanted and len({(piece.media_id, piece.stream) for piece in chosen}) > 1:
+        inner = sorted(str(piece.inner_clip_id) for piece in chosen)
+        raise ToolError(
+            f"クリップ {wanted} のフレーム {at} では音が重なっています"
+            f" scene_clip_id のどれかを clip_id に渡してください: {', '.join(inner)}"
+        )
+    return chosen[0] if chosen else None
+
+
 def _word_target(
     project: Project, arguments: dict[str, Any]
 ) -> tuple[MediaItem, int, Fraction, HeardPiece | None]:
@@ -7198,16 +7226,7 @@ def _word_target(
     if frame is not None:
         at = _integer_value(frame, "frame")
         wanted = str(arguments.get("clip_id") or "")
-        # 同じ時刻に BGM と声が重なると、並びの最初の音が BGM のことがある 声のクリップを指せる
-        piece = next(
-            (
-                p
-                for p in heard_pieces(project)
-                if p.start <= at < p.end
-                and (not wanted or wanted in (str(p.clip_id), str(p.inner_clip_id)))
-            ),
-            None,
-        )
+        piece = _word_piece(project, at, wanted)
         media = None if piece is None else project.find_media(piece.media_id)
         if piece is None or media is None:
             named = f"クリップ {wanted} の" if wanted else ""
@@ -7232,14 +7251,14 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"{media.name} の音声 {_audio_number(media, stream)} にはまだ字幕がありません"
             " 先に transcribe で起こしてください"
         )
-    words = phrases(transcript)
-    has_words = bool(words)
-    if not has_words:
-        # 語の時刻が無くても、字幕の行の切れ目と波形で切り所は読める 断ると起こし直しの間 AI が
-        # 手探りで切ることになる
-        words = tuple(Word(s.start, s.end, s.text) for s in transcript.segments)
+    timed = phrases(transcript)
+    lines = tuple(Word(s.start, s.end, s.text) for s in wordless_lines(transcript))
+    # 語の時刻の無い行の中では語の途中かを言えない 語の無い所を「途中ではない」と答えない
+    has_words = bool(timed) and not any(w.start <= seconds < w.end for w in lines)
+    # 語の時刻が無い行も、行の切れ目と波形で切り所は読める 断ると起こし直しの間 AI が手探りで切る
+    words = tuple(sorted((*timed, *lines), key=lambda w: (w.start, w.end)))
     waveform = host.waveform(media, stream)
-    inside = word_at(words, seconds) if has_words else None
+    inside = word_at(timed, seconds) if has_words else None
     rows = []
     for point in cut_points(words, waveform, seconds, Fraction(round(window * 100), 100)):
         row: dict[str, object] = {
@@ -7306,7 +7325,8 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
     last: tuple[object, ...] | None = None
     for item in heard_words(project, start, end):
         # シーンを置いたクリップの中では素材が替わる クリップだけで束ねると別の素材の語が混ざる
-        key = (item.piece.clip_id, item.piece.media_id, item.piece.stream)
+        inner = item.piece.inner_clip_id
+        key = (item.piece.clip_id, inner, item.piece.media_id, item.piece.stream)
         if rows and key == last:
             rows[-1]["text"] = f"{rows[-1]['text']}{item.word.text}"
             rows[-1]["end_frame"] = math.ceil(item.frame)
@@ -7320,14 +7340,10 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
                 "start_frame": math.floor(item.frame),
                 "end_frame": math.ceil(item.frame),
             }
+            # word_boundaries の clip_id へ渡せるよう、シーンの中のクリップも返す
+            | ({"scene_clip_id": str(inner)} if inner is not None else {})
         )
-    silent = {
-        (piece.media_id, piece.stream)
-        for piece in heard_pieces(project)
-        if piece.start < end
-        and piece.end > start
-        and not _has_word_times(project, piece.media_id, piece.stream)
-    }
+    silent = untimed_sounds(project, start, end)
     result = _paged(rows, arguments, name="heard")
     if silent:
         # 音声ごとに返す audio を省いて足すと、語の時刻のある 1 本目を起こし直すことになる
@@ -7347,16 +7363,12 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
                 (
                     result.get("note"),
                     "no_words の音声には語の時刻が無く、鳴る語を読めません"
-                    " transcribe の words_only に同じ audio を渡すと足せます",
+                    " transcribe の words_only に同じ audio を渡すと足せます"
+                    "（字幕の無い音は起こします）",
                 ),
             )
         )
     return result
-
-
-def _has_word_times(project: Project, media_id: MediaId, stream: int) -> bool:
-    media = project.find_media(media_id)
-    return media is not None and bool(transcript_words(media.transcript_for(stream)))
 
 
 def _subtitle_transcript(
@@ -12493,12 +12505,16 @@ OPERATIONS: tuple[Operation, ...] = (
             "unchecked（波形がまだ）の順に語尾がつながりやすくなる in_seconds は音の入り、"
             "out_seconds は音の出に使う（frame で指すと in_frame と out_frame も返す）"
             " 語は認識の字を文節ほどに束ねた物で、時刻は見積もり"
-            " has_words が false なら字幕の行の切れ目で見る（transcribe の words_only で足せる）"
+            " has_words が false なら、語の時刻の無い字幕の行の切れ目で見る"
+            "（transcribe の words_only で足せる）"
         ),
         schema=_schema(
             {
                 "frame": _integer("タイムラインのフレーム"),
-                "clip_id": _string("frame で鳴る音が重なるときに見るクリップ 省くと並びの最初の音"),
+                "clip_id": _string(
+                    "frame で音が重なるときに見るクリップ（シーンの中なら scene_clip_id"
+                    " の値も渡せる） 省くと字幕のある音のうち並びの最初"
+                ),
                 "media_id": _string("素材 frame を省くときに渡す"),
                 "seconds": _number("素材の中の秒 frame を省くときに渡す"),
                 "audio": _integer("音声の番号（1 から 省くと 1 本目 media_id で指すとき）"),

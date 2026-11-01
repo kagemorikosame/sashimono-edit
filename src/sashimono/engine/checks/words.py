@@ -24,6 +24,7 @@ from sashimono.core.words import (
     heard_words,
     phrases,
     unheard_words,
+    untimed_sounds,
     word_at,
 )
 from sashimono.engine.audio.waveform import Waveform
@@ -82,7 +83,12 @@ def _extends(edge: CutEdge, target: Fraction) -> bool:
 
 
 def _suggested(edge: CutEdge, points: list[CutPoint], word: Word) -> CutPoint | None:
-    """端を動かす先 声が続く境目より音の下がる境目を、縮める向きより伸ばす向きを選ぶ"""
+    """端を動かす先 語を残す向きを先に選び、その中で声が続く境目より音の下がる境目を選ぶ
+
+    伸ばせないときだけ縮め、語の外へ出る最小の量にする 向きを重みで比べると、語の頭の近くの切れ目で
+    語を丸ごと落とす提案が勝ち、high の auto の直しとして語が黙って消える 縮める向きで静かな所を
+    探すと、間にある別の語まで落とす
+    """
 
     def moved(point: CutPoint) -> Fraction:
         return abs(_target(edge, point, word) - edge.seconds)
@@ -90,13 +96,12 @@ def _suggested(edge: CutEdge, points: list[CutPoint], word: Word) -> CutPoint | 
     near = [point for point in points if moved(point) <= _REACH]
     if not near:
         return None
-    return min(
-        near,
-        key=lambda point: (
-            point.kind == JOINED,
-            moved(point) * (1 if _extends(edge, _target(edge, point, word)) else 2),
-        ),
-    )
+
+    def order(point: CutPoint) -> tuple[bool, bool, Fraction]:
+        extends = _extends(edge, _target(edge, point, word))
+        return (not extends, extends and point.kind == JOINED, moved(point))
+
+    return min(near, key=order)
 
 
 def _at_placed_edge(project: Project, edge: CutEdge) -> bool:
@@ -256,11 +261,15 @@ def _owner(project: Project, segment_id: SegmentId, stream: int) -> MediaId | No
     return None
 
 
-def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
-    """字幕の文言と残した音の食い違い 字幕の行が音の切れ目をまたぐ形を見る"""
+def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Problem], int]:
+    """字幕の文言と残した音の食い違い 字幕の行が音の切れ目をまたぐ形を見る
+
+    戻り値は（問題、語の時刻が無く比べられなかった字幕の行の数）
+    """
     heard = heard_words(project)
     problems: list[Problem] = []
     done: set[tuple[str, int, int, str]] = set()
+    blind: set[str] = set()
 
     def look(
         segment_id: str,
@@ -280,7 +289,10 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
             return
         done.add(key)
         segment = next((s for s in transcript.segments if str(s.id) == segment_id), None)
-        if segment is None or not segment.words:
+        if segment is None:
+            return
+        if not segment.words:
+            blind.add(segment_id)
             return
         missing = unheard_words(segment, heard, media_id, stream, low, high)
         kept = [
@@ -298,7 +310,8 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
 
     # 焼き込んだ字幕を先に見る 見る人に出るのは焼き込んだ文字で、出す長さも文言も変えられる
     # 焼き込んだ行の文言は焼き込んだ文字で見る 行の文言と比べ直すと、文字を直しても消えない
-    burned: set[str] = set()
+    # 行だけで覚えない 同じ行を別の所へ置いた焼き込んでいない字幕まで検査から外れる
+    burned: dict[tuple[str, MediaId, int], list[tuple[int, int]]] = {}
     # 描かれない字幕は見る人に届かない シーンの中も置いた窓を通して外の時刻で見る
     for item in burned_subtitles(project):
         origin = item.origin
@@ -306,15 +319,16 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
         source = item.clip.source
         if media_id is None or source is None or item.end <= start or item.start >= end:
             continue
-        burned.add(str(origin.segment_id))
+        low, high = math.floor(item.start), math.ceil(item.end)
+        burned.setdefault((str(origin.segment_id), media_id, origin.stream), []).append((low, high))
         look(
             str(origin.segment_id),
             media_id,
             origin.stream,
             str(source.params.get("text", "")),
             # シーンを速度付きで置くと 1 コマの途中に当たる 映っているコマを全部含むよう広げる
-            math.floor(item.start),
-            math.ceil(item.end),
+            low,
+            high,
             str(item.clip_id),
             str(item.clip.id) if item.nested else None,
         )
@@ -323,7 +337,8 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
             continue
         if not (subtitle.clipped_head or subtitle.clipped_tail):
             continue
-        if str(subtitle.segment.id) in burned:
+        placed = burned.get((str(subtitle.segment.id), subtitle.media_id, subtitle.stream), [])
+        if any(low < subtitle.end_frame and subtitle.start_frame < high for low, high in placed):
             continue
         shown = subtitle.duration * project.rate.frame_duration
         if shown < _SLIVER_SECONDS:
@@ -337,12 +352,7 @@ def _subtitle_words(project: Project, start: int, end: int) -> list[Problem]:
             subtitle.end_frame,
             str(subtitle.clip_id),
         )
-    return problems
-
-
-def _has_words(project: Project, key: tuple[MediaId, int]) -> bool:
-    media = project.find_media(key[0])
-    return media is not None and bool(phrases(media.transcript_for(key[1])))
+    return problems, len(blind)
 
 
 def _has_subtitles(project: Project, key: tuple[MediaId, int]) -> bool:
@@ -366,20 +376,30 @@ def check_words(
     if WORD_CUT in wanted:
         cuts, checked, missing = _word_cuts(project, start, end, waveform_of)
         problems += cuts
+    blind = 0
     if SUBTITLE_WORDS in wanted:
-        problems += _subtitle_words(project, start, end)
+        lines, blind = _subtitle_words(project, start, end)
+        problems += lines
     sounding = {
         (piece.media_id, piece.stream)
         for piece in heard_pieces(project)
         if piece.start < end and piece.end > start
     }
+    lacking = untimed_sounds(project, start, end)
+    timed = sounding - lacking
+    untimed = {key for key in lacking if _has_subtitles(project, key)}
     if not sounding:
         # 素材の音を置いていなければ切れ目も無い 調べられなかったと返すと、文字だけの作品の
         # 検査のたびに語の時刻の案内が付く 焼き込んだ字幕だけが残った問題は返す
-        return WordReport(tuple(problems))
-    timed = {key for key in sounding if _has_words(project, key)}
-    untimed = {key for key in sounding - timed if _has_subtitles(project, key)}
-    if not timed:
+        pass
+    elif not timed and not untimed:
+        # 字幕の無い音だけ 話し声が無いとは言えないので調べたことにしない 足す字幕も無い
+        skipped |= wanted
+        notes.append(
+            "字幕の無い音だけが鳴っているので、語の境目は調べていません"
+            " 話している音なら transcribe で起こすと調べられます"
+        )
+    elif not timed:
         # 調べたことにしない 語の時刻が無いのに問題 0 件と読むと、切れ目は無事と言ったことになる
         skipped |= wanted
         notes.append(
@@ -397,5 +417,12 @@ def check_words(
         notes.append(
             f"字幕の無い音が {len(missing)} 本あり、その切れ目は調べていません"
             f"（調べた切れ目 {checked} か所）"
+        )
+    if blind and SUBTITLE_WORDS not in skipped:
+        # 音の無い所の焼き込みも同じ 比べられなかった行を問題 0 件へ混ぜない
+        skipped.add(SUBTITLE_WORDS)
+        notes.append(
+            f"語の時刻が無い字幕の行が {blind} 行あり、文言と音を比べていません"
+            " transcribe の words_only で足せます"
         )
     return WordReport(tuple(problems), tuple(notes), frozenset(skipped))

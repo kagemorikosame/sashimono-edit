@@ -17,6 +17,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
     Transcript,
+    TranscriptSegment,
     new_media_id,
 )
 from sashimono.engine.audio.waveform import Waveform
@@ -192,7 +193,7 @@ class TestNoWordTimes:
         assert "語の時刻が無い音" in " ".join(report.notes)
 
     def test_a_sound_without_subtitles_is_only_counted(self, video_media: MediaItem) -> None:
-        # 壊れると、BGM を置いただけの作品が毎回調べられなかった扱いになる
+        # 壊れると、話を調べられた作品に BGM を足しただけで調べられなかった扱いになる
         media = _media(video_media)
         other = replace(video_media, id=new_media_id())
         project = placed(media, _clip(media, 0, 24, Fraction(1)))
@@ -209,6 +210,68 @@ def test_a_work_without_material_sound_is_not_skipped(video_media: MediaItem) ->
     """切れ目が無いのに調べられなかったと返すと、文字だけの作品の検査のたびに案内が付く"""
     project = placed(video_media)
     assert _check(project, wave()) == WordReport()
+
+
+def test_only_sounds_without_subtitles(video_media: MediaItem) -> None:
+    """字幕の無い音だけなら調べたことにせず、足す字幕の無い案内は出さない
+
+    壊れると、切れ目を調べたように読むか、無い字幕へ語の時刻を足しに行く
+    """
+    project = placed(video_media, _clip(video_media, 0, 30, Fraction(1)))
+    report = _check(project, wave())
+    assert report.skipped == WORD_KINDS
+    assert "words_only" not in " ".join(report.notes)
+    assert "transcribe" in " ".join(report.notes)
+
+
+def test_a_cut_on_a_line_without_words_is_not_counted_as_checked(video_media: MediaItem) -> None:
+    # 壊れると、語の時刻が一部だけある音で、語の無い行の切れ目を調べたと読む
+    lines = (
+        segment(spoken(Fraction(1), "カメラ")),
+        TranscriptSegment(Fraction(5), Fraction(6), "手で足した行"),
+    )
+    media = video_media.with_transcript(Transcript(lines, language="ja"))
+    report = _check(placed(media, _clip(media, 0, 15, Fraction(5))), wave())
+    assert report.skipped == WORD_KINDS
+
+
+def test_the_suggestion_keeps_the_word(video_media: MediaItem) -> None:
+    """語の前半で出を切り、語の頭の近くに谷がある形
+
+    壊れると、語の頭まで縮める提案が勝ち、high の auto の直しで語が黙って消える
+    """
+    line = segment(spoken(Fraction(1), "カメラ", Fraction(2, 10)))
+    following = segment(spoken(Fraction(162, 100), "はい"))
+    media = video_media.with_transcript(Transcript((line, following), language="ja"))
+    sound = wave(((0.0, 1.0), (1.04, 1.08), (1.6, 1.64), (2.1, 12.0)))
+    project = placed(media, _clip(media, 0, 3, Fraction(11, 10)))
+    (measure,) = [
+        found
+        for found in _cuts(_check(project, sound, kinds=frozenset({WORD_CUT})))
+        if found["side"] == "out"
+    ]
+    target = measure["suggested_source_seconds"]
+    assert isinstance(target, float)
+    assert target >= 1.6
+    delta = measure["suggested_tail_delta"]
+    assert isinstance(delta, int)
+    assert delta > 0
+
+
+def test_shrinking_is_the_last_resort(video_media: MediaItem) -> None:
+    """語の終わりの近くの入りで、語の頭が届かない形 語の外へ出る最小の量を返す
+
+    壊れると、動かす先が今の切れ目と同じ値になり、直す手掛かりにならない
+    """
+    line = segment(spoken(Fraction(1), "あ" * 10))
+    following = segment(spoken(Fraction(3), "はい"))
+    media = video_media.with_transcript(Transcript((line, following), language="ja"))
+    sound = wave(((0.0, 1.0), (2.93, 2.97), (3.4, 12.0)))
+    project = placed(media, _clip(media, 0, 60, Fraction(285, 100)))
+    (measure,) = _cuts(_check(project, sound, kinds=frozenset({WORD_CUT})))
+    assert measure["suggested_source_seconds"] == 3.0
+    assert measure["suggested_kind"] == "word_edge"
+    assert measure["suggested_head_delta"] == 5
 
 
 class TestBurnedInScene:
@@ -314,6 +377,22 @@ class TestBurnedInScene:
 
 
 class TestSubtitleWords:
+    def test_a_burned_line_without_words_is_not_checked(self, video_media: MediaItem) -> None:
+        # 壊れると、音の無い所の語の時刻の無い焼き込みを比べずに「問題なし」と返す
+        line = TranscriptSegment(Fraction(1), Fraction(2), "言っていない言葉")
+        media = video_media.with_transcript(Transcript((line,), language="ja"))
+        report = _check(self._burned(placed(media), media, "言っていない言葉", 24), wave())
+        assert report.skipped == frozenset({SUBTITLE_WORDS})
+        assert "words_only" in " ".join(report.notes)
+
+    def test_another_placing_of_a_burned_line_is_looked_at(self, video_media: MediaItem) -> None:
+        # 壊れると、焼き込みが 1 つあるだけで、別の所に置いた同じ行の切れ目の食い違いを見逃す
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 60, Fraction(1)), _clip(media, 90, 24, Fraction(1)))
+        project = self._burned(project, media, "カメラを作ります", 48)
+        (problem,) = [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS]
+        assert problem.start == 90
+
     def _burned(self, project: Project, media: MediaItem, text: str, duration: int) -> Project:
         transcript = media.transcript_for()
         assert transcript is not None
