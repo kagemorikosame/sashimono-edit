@@ -17,6 +17,7 @@ from itertools import pairwise
 import numpy as np
 
 from sashimono.core.model import Word
+from sashimono.core.words import WordMap
 from sashimono.engine.audio.waveform import Waveform
 
 __all__ = [
@@ -26,8 +27,10 @@ __all__ = [
     "VALLEY",
     "WORD_EDGE",
     "CutPoint",
+    "CutReading",
     "cut_points",
     "level_at",
+    "read_cut",
 ]
 
 #: 語の間に音の切れ目がある（息継ぎより長い間）
@@ -135,6 +138,29 @@ def level_at(waveform: Waveform | None, seconds: Fraction) -> float | None:
     if levels.size == 0:
         return None
     return float(_held(levels).min()) - _reference(waveform, seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class CutReading:
+    """素材の 1 点を切ったときの読み取り 検査と ``word_boundaries`` が同じ答えを使う"""
+
+    #: その点を中に含む語 無ければ ``None``
+    word: Word | None
+    #: 語で確かめられたか 偽なら、語の途中かを言えない
+    known: bool
+
+
+def read_cut(words: WordMap, waveform: Waveform | None, seconds: Fraction) -> CutReading:
+    """``seconds`` が語の途中かを読む
+
+    語の無い所は、音が静かと分かるときだけ確かめられたと数える 語の間の無音はふつうにあるので一律に
+    断らず、声が続く所と波形がまだの所を「言えない」にする
+    """
+    word = words.word_at(seconds)
+    if word is not None or not words.unworded_at(seconds):
+        return CutReading(word, True)
+    level = level_at(waveform, seconds)
+    return CutReading(None, level is not None and level <= QUIET_DB)
 
 
 def _between(waveform: Waveform, before: Word, after: Word, reference: float) -> CutPoint:

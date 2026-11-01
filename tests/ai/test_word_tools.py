@@ -88,7 +88,7 @@ class TestOverlappingSounds:
         other = replace(media, id=new_media_id())
         second = _clip(other, 0, 60, Fraction(1))
         host, window = self._scene((media, _clip(media, 0, 60, Fraction(1))), (other, second))
-        with pytest.raises(ToolError, match="scene_clip_id"):
+        with pytest.raises(ToolError, match="音が重なっています"):
             _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
         result = _call(host, "word_boundaries", frame=12, clip_id=str(second.id))
         assert result["media_id"] == str(other.id)
@@ -98,23 +98,27 @@ class TestOverlappingSounds:
         first = _clip(media, 0, 60, Fraction(1))
         second = _clip(media, 0, 60, Fraction(4))
         host, window = self._scene((media, first), (media, second))
-        with pytest.raises(ToolError, match="scene_clip_id"):
+        with pytest.raises(ToolError, match="音が重なっています"):
             _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
         result = _call(host, "word_boundaries", frame=12, clip_id=str(second.id))
         assert result["scene_clip_id"] == str(second.id)
 
-    def test_the_same_scene_placed_twice_is_not_a_dead_end(self, media: MediaItem) -> None:
-        # 壊れると、これ以上絞れない ID を案内し続け、AI が同じ呼び方を繰り返す
+    def test_the_same_scene_placed_twice_asks_for_the_placing(self, media: MediaItem) -> None:
+        # 壊れると、重ねて置いた片方の時刻で黙って答え、もう片方の切れ目を読み違える
         inner = _clip(media, 0, 60, Fraction(1))
-        host, window = self._scene((media, inner))
+        host, _ = self._scene((media, inner))
         project = host.project
         track = project.timeline.tracks[0]
-        again = Track(TrackKind.VIDEO, name="V2", clips=(replace(window, id=new_clip_id()),))
+        # 同じ時刻の同じ音は 1 本に数える 別の所を見せる窓だけが別の語を鳴らす
+        other = replace(track.clips[0], id=new_clip_id(), source_in=Fraction(1))
+        again = Track(TrackKind.VIDEO, name="V2", clips=(other,))
         changed = project.with_timeline(replace(project.timeline, tracks=(track, again)))
         host = FakeHost(changed)
         host.stub_waveform = wave()
-        result = _call(host, "word_boundaries", frame=12, clip_id=str(inner.id))
-        assert result["scene_clip_id"] == str(inner.id)
+        with pytest.raises(ToolError, match=str(other.id)):
+            _call(host, "word_boundaries", frame=12, clip_id=str(inner.id))
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(other.id))
+        assert result["clip_id"] == str(other.id)
 
     def test_heard_words_names_the_inner_clip(self, media: MediaItem) -> None:
         # 壊れると、語を読んだ音を word_boundaries で指す ID が分からない
@@ -133,6 +137,7 @@ class TestWordBoundaries:
         )
         media = video_media.with_transcript(Transcript(lines, language="ja"))
         host = _host(media, _clip(media, 0, 60, Fraction(6)))
+        host.stub_waveform = wave(())
         result = _call(host, "word_boundaries", frame=15)
         assert result["has_words"] is False
         assert result["inside_word"] is None
@@ -239,6 +244,16 @@ def test_a_voiced_gap_in_a_line_is_not_called_clean(video_media: MediaItem) -> N
     result = _call(host, "word_boundaries", frame=60)
     assert result["has_words"] is False
     assert result["inside_word"] is None
+
+
+def test_a_gap_without_a_waveform_is_not_called_clean(video_media: MediaItem) -> None:
+    # 壊れると、波形の解析がまだの間だけ語の無い所を「語の途中ではない」と答える
+    words = spoken(Fraction(1), "カメラ")
+    line = TranscriptSegment(Fraction(1), Fraction(4), "カメラと足した文", words)
+    media = video_media.with_transcript(Transcript((line,), language="ja"))
+    host = _host(media, _clip(media, 0, 90, Fraction(1)))
+    host.stub_waveform = None
+    assert _call(host, "word_boundaries", frame=60)["inside_word"] is None
 
 
 class TestHeardWords:

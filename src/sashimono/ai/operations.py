@@ -352,13 +352,10 @@ from sashimono.core.timebase import (
 )
 from sashimono.core.words import (
     HeardWord,
+    WordMap,
     heard_between,
     heard_words,
-    in_word_gap,
-    phrases,
     untimed_sounds,
-    word_at,
-    wordless_lines,
 )
 from sashimono.effects import registry
 from sashimono.effects.denoise import (
@@ -421,7 +418,7 @@ from sashimono.engine.audio.voicevox import (
 )
 from sashimono.engine.audio.voicevox import SPEED_PERCENT_RANGE as VOICE_SPEED_RANGE
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.audio.word_cuts import QUIET_DB, cut_points, level_at
+from sashimono.engine.audio.word_cuts import cut_points, level_at, read_cut
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
@@ -7195,8 +7192,9 @@ def _word_row(word: Word) -> dict[str, object]:
 def _word_piece(project: Project, at: int, wanted: str) -> HeardPiece | None:
     """語の境目を見る音 同じ時刻に音が重なるときは字幕のある音を選ぶ
 
-    BGM が先に並ぶと、声の語ではなく字幕が無いという断りを返す シーンを置いたクリップの ID は
-    中の音すべてに当たるので、字幕のある音が 2 本以上残れば黙って選ばず、中のクリップを尋ねる
+    BGM が先に並ぶと、声の語ではなく字幕が無いという断りを返す クリップを指しても音が 2 本以上
+    残るのは、シーンの ID が中の音に広く当たるときと、中のクリップの ID が重ねて置いたシーンの
+    両方に当たるとき どちらも黙って選ばず、もう片方の ID を案内して絞ってもらう
     """
     found = [
         piece
@@ -7211,12 +7209,11 @@ def _word_piece(project: Project, at: int, wanted: str) -> HeardPiece | None:
             with_lines.append(piece)
     chosen = with_lines or found
     # 同じ素材の同じ音でも、素材の別の時刻を重ねれば別の語が鳴る 素材では見分けずに数で見る
-    # 中のクリップ自身を指した頼みは、同じシーンを重ねて置いたときだけ 2 本残る それ以上絞る ID は
-    # 無いので断らない 断ると同じ ID を案内し続ける どの音かは答えの clip_id に載る
-    narrower = sorted({str(p.inner_clip_id) for p in chosen if p.inner_clip_id} - {wanted})
-    if wanted and len(chosen) > 1 and narrower:
+    if wanted and len(chosen) > 1:
+        ids = {str(p.clip_id) for p in chosen} | {str(p.inner_clip_id) for p in chosen}
+        narrower = sorted(ids - {wanted, "None"})
         raise ToolError(
-            f"クリップ {wanted} のフレーム {at} では音が重なっています scene_clip_id のどれかを"
+            f"クリップ {wanted} のフレーム {at} では音が重なっています 次のどれかを"
             f" clip_id に渡してください: {', '.join(narrower[:_SKIPPED_SHOWN])}"
         )
     return chosen[0] if chosen else None
@@ -7255,20 +7252,14 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
             f"{media.name} の音声 {_audio_number(media, stream)} にはまだ字幕がありません"
             " 先に transcribe で起こしてください"
         )
-    timed = phrases(transcript)
-    lines = tuple(Word(s.start, s.end, s.text) for s in wordless_lines(transcript))
+    spoken = WordMap(transcript)
     waveform = host.waveform(media, stream)
+    # 語の途中かは検査と同じ読み取りで答える 語の無い所を「途中ではない」と答えない
+    reading = read_cut(spoken, waveform, seconds)
+    has_words = bool(spoken.phrases) and reading.known
+    inside = reading.word
+    words = spoken.units
     level = level_at(waveform, seconds)
-    # 語の時刻の無い行の中と、語の付いた行の語の無い所で声が続く所は、語の途中かを言えない
-    # 語の無い所を「途中ではない」と答えない
-    has_words = (
-        bool(timed)
-        and not any(w.start <= seconds < w.end for w in lines)
-        and not (level is not None and level > QUIET_DB and in_word_gap(transcript, seconds))
-    )
-    # 語の時刻が無い行も、行の切れ目と波形で切り所は読める 断ると起こし直しの間 AI が手探りで切る
-    words = tuple(sorted((*timed, *lines), key=lambda w: (w.start, w.end)))
-    inside = word_at(timed, seconds) if has_words else None
     rows = []
     for point in cut_points(words, waveform, seconds, Fraction(round(window * 100), 100)):
         row: dict[str, object] = {

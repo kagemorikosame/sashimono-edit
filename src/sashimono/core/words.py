@@ -20,6 +20,7 @@ import bisect
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from itertools import accumulate
 
 from sashimono.core.model import MediaId, Project, Transcript, TranscriptSegment, Word
 from sashimono.core.projection import HeardPiece, heard_pieces
@@ -30,11 +31,11 @@ __all__ = [
     "WORD_MARGIN",
     "CutEdge",
     "HeardWord",
+    "WordMap",
     "attach_words",
     "cut_edges",
     "heard_between",
     "heard_words",
-    "in_word_gap",
     "phrases",
     "transcript_words",
     "unheard_words",
@@ -324,22 +325,47 @@ def wordless_lines(transcript: Transcript | None) -> tuple[TranscriptSegment, ..
     return tuple(segment for segment in transcript.segments if not segment.words)
 
 
-def in_word_gap(transcript: Transcript | None, seconds: Fraction) -> bool:
-    """語の付いた字幕の行の、語の無い所か 語から :data:`_GAP_REACH` より離れた所だけ
+class WordMap:
+    """1 つの音の語の読み取り 語の途中か・語で確かめられる所かを、道具と検査が同じ答えで読む
 
-    字幕を伸ばした行や文言を足した行は、語が行の一部にしか付かない ここで話していると、語の途中
-    かを語の時刻から言えない 話しているかは語の時刻から分からないので、波形と合わせて読む
+    別々に判定すると、語の時刻の無い行と、語が行の一部にしか付かない行の扱いが所ごとに食い違う
     """
-    if transcript is None:
+
+    def __init__(self, transcript: Transcript | None) -> None:
+        self.phrases = phrases(transcript)
+        self.lines = () if transcript is None else transcript.segments
+        self._starts = [line.start for line in self.lines]
+        # 行は頭の順に並ぶが重なることがある そこまでの一番遅い終わりで、前の行を見切る所を決める
+        self._reach = list(accumulate((line.end for line in self.lines), max))
+
+    @property
+    def units(self) -> tuple[Word, ...]:
+        """語と、語の時刻の無い行を時刻の順に並べた物 切り所を探す単位
+
+        語の時刻の無い行も行の切れ目と波形で切り所は読める 外すと起こし直すまで AI が手探りで切る
+        """
+        bare = (Word(line.start, line.end, line.text) for line in self.lines if not line.words)
+        return tuple(sorted((*self.phrases, *bare), key=lambda word: (word.start, word.end)))
+
+    def word_at(self, seconds: Fraction) -> Word | None:
+        return word_at(self.phrases, seconds)
+
+    def unworded_at(self, seconds: Fraction) -> bool:
+        """字幕の行の中で、語の時刻から語の途中かを言えない所か
+
+        語の時刻の無い行の中と、語が行の一部にしか付かない行の語から離れた所 話しているかは語の
+        時刻から分からないので、波形と合わせて読む（:func:`~sashimono.engine.audio.word_cuts.read_cut`）
+        """
+        index = bisect.bisect_right(self._starts, seconds)
+        for at in range(index - 1, -1, -1):
+            if self._reach[at] <= seconds:
+                break
+            line = self.lines[at]
+            if seconds < line.end and not any(
+                word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in line.words
+            ):
+                return True
         return False
-    segments = transcript.segments
-    index = bisect.bisect_right(segments, seconds, key=lambda segment: segment.start) - 1
-    if index < 0:
-        return False
-    line = segments[index]
-    if not line.words or seconds >= line.end:
-        return False
-    return not any(word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in line.words)
 
 
 def untimed_sounds(project: Project, start: int, end: int) -> set[tuple[MediaId, int]]:

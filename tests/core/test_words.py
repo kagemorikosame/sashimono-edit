@@ -20,11 +20,11 @@ from sashimono.core.projection import heard_pieces
 from sashimono.core.words import (
     CUT_IN,
     CUT_OUT,
+    WordMap,
     attach_words,
     cut_edges,
     heard_between,
     heard_words,
-    in_word_gap,
     phrases,
     transcript_words,
     unheard_words,
@@ -264,25 +264,42 @@ class TestCutEdges:
         assert [edge.side for edge in cut_edges(project, 40, 90)] == [CUT_OUT]
 
 
-class TestWordGap:
+class TestWordMap:
     def _line(self) -> Transcript:
         words = spoken(Fraction(1), "カメラ")
         return Transcript((TranscriptSegment(Fraction(1), Fraction(4), "カメラと足した文", words),))
 
     def test_far_from_the_words(self) -> None:
         # 壊れると、語が行の一部にしか付かない行の語の無い所を、語の途中ではないと読む
-        assert in_word_gap(self._line(), Fraction(3))
+        assert WordMap(self._line()).unworded_at(Fraction(3))
+
+    def test_every_line_at_the_point_is_read(self) -> None:
+        # 壊れると、重なる字幕の行の後ろの行だけを見て、前の行の語の無い所を確かめたと読む
+        words = spoken(Fraction(1), "カメラ")
+        long = TranscriptSegment(Fraction(1), Fraction(5), "長い行", words)
+        short = segment(spoken(Fraction(29, 10), "はい"))
+        assert WordMap(Transcript((long, short))).unworded_at(Fraction(3))
+
+    def test_a_finished_line_does_not_count(self) -> None:
+        # 壊れると、字幕の行の間まで語の無い所と読み、切れ目を未検査にする
+        lines = (segment(spoken(Fraction(1), "あ")), segment(spoken(Fraction(4), "い")))
+        assert not WordMap(Transcript(lines)).unworded_at(Fraction(3))
+
+    def test_a_line_without_words_is_a_unit(self) -> None:
+        # 壊れると、語の時刻の無い行の切れ目を切り所として返せない
+        line = TranscriptSegment(Fraction(1), Fraction(2), "行")
+        words = WordMap(Transcript((line,)))
+        assert [unit.text for unit in words.units] == ["行"]
+        assert words.unworded_at(Fraction(3, 2))
 
     @pytest.mark.parametrize("seconds", [Fraction(17, 10), Fraction(5), Fraction(1, 2)])
     def test_near_the_words_or_outside_the_line(self, seconds: Fraction) -> None:
         # 壊れると、語の時刻のずれだけの所や、字幕の無い所まで未検査になる
-        assert not in_word_gap(self._line(), seconds)
+        assert not WordMap(self._line()).unworded_at(seconds)
 
-    def test_a_line_without_words_is_not_a_gap(self) -> None:
-        # 壊れると、語の無い行を別の案内で二重に数える
-        line = TranscriptSegment(Fraction(1), Fraction(2), "行")
-        assert not in_word_gap(Transcript((line,)), Fraction(3, 2))
-        assert not in_word_gap(None, Fraction(1))
+    def test_no_subtitles(self) -> None:
+        # 壊れると、字幕の無い音の読み取りで検査が落ちる
+        assert not WordMap(None).unworded_at(Fraction(1))
 
 
 class TestUntimedSounds:

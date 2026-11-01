@@ -19,14 +19,12 @@ from sashimono.core.words import (
     CUT_IN,
     CutEdge,
     HeardWord,
+    WordMap,
     cut_edges,
     heard_between,
     heard_words,
-    in_word_gap,
     phrases,
     unheard_words,
-    untimed_sounds,
-    word_at,
 )
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
@@ -36,6 +34,7 @@ from sashimono.engine.audio.word_cuts import (
     CutPoint,
     cut_points,
     level_at,
+    read_cut,
 )
 from sashimono.engine.checks.report import HIGH, MEDIUM, Problem
 from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
@@ -154,38 +153,38 @@ def _word_cuts(
 ) -> tuple[list[Problem], int, set[tuple[MediaId, int]], int]:
     """言葉の途中の切れ目
 
-    戻り値は（問題、調べた端の数、語の時刻が無い音、語の無い所で声が続く端の数）
+    戻り値は（問題、調べた端の数、字幕の無い音、語で確かめられなかった端の数）
     """
     problems: list[Problem] = []
     checked = 0
     unknown = 0
     missing: set[tuple[MediaId, int]] = set()
-    words: dict[tuple[MediaId, int], tuple[Word, ...]] = {}
+    maps: dict[tuple[MediaId, int], WordMap] = {}
     for edge in cut_edges(project, start, end):
         key = (edge.piece.media_id, edge.piece.stream)
         media = project.find_media(key[0])
         if media is None:
             continue
-        if key not in words:
-            words[key] = phrases(media.transcript_for(key[1]))
-        if not words[key]:
+        if key not in maps:
+            maps[key] = WordMap(media.transcript_for(key[1]))
+        words = maps[key]
+        if not words.lines:
             missing.add(key)
             continue
-        checked += 1
-        word = word_at(words[key], edge.seconds)
-        if word is None:
-            # 語が行の一部にしか付かない行では、語の外でも話していることがある 語の間の無音は
-            # ふつうにあるので、行を一律に未検査にせず、切った所に声が続く端だけを数える
-            if in_word_gap(media.transcript_for(key[1]), edge.seconds):
-                level = level_at(waveform_of(media, key[1]), edge.seconds)
-                unknown += level is not None and level > QUIET_DB
-            continue
         waveform = waveform_of(media, key[1])
+        reading = read_cut(words, waveform, edge.seconds)
+        if not reading.known or not words.phrases:
+            unknown += 1
+            continue
+        checked += 1
+        word = reading.word
+        if word is None:
+            continue
         level = level_at(waveform, edge.seconds)
         if level is not None and level <= QUIET_DB:
             # 語の時刻の上では途中でも、音が静かなら語は欠けない 語の時刻のずれのことが多い
             continue
-        point = _suggested(edge, cut_points(words[key], waveform, edge.seconds, _REACH), word)
+        point = _suggested(edge, cut_points(words.phrases, waveform, edge.seconds, _REACH), word)
         name = "入り" if edge.side == CUT_IN else "出"
         # 出は残った最後のコマで返す 切った位置のコマは次の音か、作品の終わりの外に当たる
         frame = int(edge.frame) if edge.side == CUT_IN else max(0, math.ceil(edge.frame) - 1)
@@ -365,6 +364,11 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
     return problems, len(blind)
 
 
+def _has_phrases(project: Project, key: tuple[MediaId, int]) -> bool:
+    media = project.find_media(key[0])
+    return media is not None and bool(phrases(media.transcript_for(key[1])))
+
+
 def _has_subtitles(project: Project, key: tuple[MediaId, int]) -> bool:
     media = project.find_media(key[0])
     transcript = None if media is None else media.transcript_for(key[1])
@@ -395,33 +399,22 @@ def check_words(
         for piece in heard_pieces(project)
         if piece.start < end and piece.end > start
     }
-    lacking = untimed_sounds(project, start, end)
-    timed = sounding - lacking
-    untimed = {key for key in lacking if _has_subtitles(project, key)}
-    if not sounding:
-        # 素材の音を置いていなければ切れ目も無い 調べられなかったと返すと、文字だけの作品の
-        # 検査のたびに語の時刻の案内が付く 焼き込んだ字幕だけが残った問題は返す
-        pass
-    elif not timed and not untimed:
+    # 語の時刻が 1 つも無い作品だけを作品の単位で断る ほかは切れ目と行を 1 つずつ読んだ数で決める
+    # 音の単位で断ると、語の無い所に切れ目が無い作品まで調べられなかった扱いになる
+    timed = {key for key in sounding if _has_phrases(project, key)}
+    if sounding and not timed and not any(_has_subtitles(project, key) for key in sounding):
         # 字幕の無い音だけ 話し声が無いとは言えないので調べたことにしない 足す字幕も無い
         skipped |= wanted
         notes.append(
             "字幕の無い音だけが鳴っているので、語の境目は調べていません"
             " 話している音なら transcribe で起こすと調べられます"
         )
-    elif not timed:
+    elif sounding and not timed:
         # 調べたことにしない 語の時刻が無いのに問題 0 件と読むと、切れ目は無事と言ったことになる
         skipped |= wanted
         notes.append(
             "鳴っている素材に語の時刻が無いので、語の境目と字幕の文言は調べていません"
             " transcribe の words_only で今の字幕に語の時刻を足せます"
-        )
-    elif untimed:
-        # 問題 0 件と返すと、語の時刻の無い音の字幕まで無事と読む 見つけた問題は返す
-        skipped |= wanted
-        notes.append(
-            f"字幕に語の時刻が無い音が {len(untimed)} 本あり、その音の切れ目と字幕は調べていません"
-            " transcribe の words_only で足せます"
         )
     elif missing:
         notes.append(
@@ -429,12 +422,12 @@ def check_words(
             f"（調べた切れ目 {checked} か所）"
         )
     if unknown and WORD_CUT not in skipped:
-        # 問題 0 件と返すと、語の途中かを読めなかった切れ目まで無事と読む
+        # 問題 0 件と返すと、語の途中かを読めなかった切れ目まで無事と読む 見つけた問題は返す
         skipped.add(WORD_CUT)
         notes.append(
-            f"語の付いていない所で声が続く切れ目が {unknown} か所あり、言葉の途中かを確かめて"
-            "いません 字幕の行の一部にしか語の時刻が無い所です transcribe の words_only で足すか、"
-            "その所は人が聞いて確かめてください"
+            f"語で確かめられない切れ目が {unknown} か所あり、言葉の途中かを見ていません"
+            " 語の時刻の無い所で声が続くか、波形の解析がまだの所です"
+            " transcribe の words_only で足すか、その所は人が聞いて確かめてください"
         )
     if blind and SUBTITLE_WORDS not in skipped:
         # 音の無い所の焼き込みも同じ 比べられなかった行を問題 0 件へ混ぜない

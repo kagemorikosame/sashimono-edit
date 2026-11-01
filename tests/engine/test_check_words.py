@@ -190,7 +190,7 @@ class TestNoWordTimes:
         project = project.with_timeline(replace(project.timeline, tracks=(changed,)))
         report = _check(project, wave())
         assert report.skipped == WORD_KINDS
-        assert "語の時刻が無い音" in " ".join(report.notes)
+        assert "語の時刻が無い字幕の行" in " ".join(report.notes)
 
     def test_a_sound_without_subtitles_is_only_counted(self, video_media: MediaItem) -> None:
         # 壊れると、話を調べられた作品に BGM を足しただけで調べられなかった扱いになる
@@ -231,8 +231,19 @@ def test_a_cut_on_a_line_without_words_is_not_counted_as_checked(video_media: Me
         TranscriptSegment(Fraction(5), Fraction(6), "手で足した行"),
     )
     media = video_media.with_transcript(Transcript(lines, language="ja"))
-    report = _check(placed(media, _clip(media, 0, 15, Fraction(5))), wave())
-    assert report.skipped == WORD_KINDS
+    project = placed(media, _clip(media, 0, 15, Fraction(5)))
+    assert _check(project, wave(())).skipped == WORD_KINDS
+
+
+def test_a_line_without_words_away_from_the_cut_stays_checked(video_media: MediaItem) -> None:
+    # 壊れると、切っていない所の 1 行で切れ目の検査全体が調べられない扱いになる
+    lines = (
+        segment(spoken(Fraction(1), "カメラ")),
+        TranscriptSegment(Fraction(2), Fraction(3), "手で足した行"),
+    )
+    media = video_media.with_transcript(Transcript(lines, language="ja"))
+    project = placed(media, _clip(media, 0, 90, Fraction(1)))
+    assert _check(project, wave(())).skipped == frozenset()
 
 
 class TestPartlyWordedLine:
@@ -249,6 +260,10 @@ class TestPartlyWordedLine:
         report = _check(self._project(video_media), wave(((0.0, 1.0), (4.0, 12.0))))
         assert WORD_CUT in report.skipped
         assert "words_only" in " ".join(report.notes)
+
+    def test_without_a_waveform_it_is_not_checked(self, video_media: MediaItem) -> None:
+        # 壊れると、波形の解析がまだの切れ目を無事と返す 語のある所の medium と同じく未確認にする
+        assert WORD_CUT in _check(self._project(video_media), None).skipped
 
     def test_a_quiet_cut_stays_checked(self, video_media: MediaItem) -> None:
         # 壊れると、語の間の無音を切っただけで未検査になり、ほとんどの作品が調べられない
