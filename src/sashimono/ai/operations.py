@@ -7256,7 +7256,7 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
     waveform = host.waveform(media, stream)
     # 語の途中かは検査と同じ読み取りで答える 語の無い所を「途中ではない」と答えない
     reading = read_cut(spoken, waveform, seconds)
-    has_words = bool(spoken.phrases) and reading.known
+    has_words = reading.timed
     inside = reading.word
     words = spoken.units
     level = level_at(waveform, seconds)
@@ -7283,7 +7283,7 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
         "audio": _audio_number(media, stream),
         "source_seconds": round(float(seconds), 3),
         "has_words": has_words,
-        "inside_word": None if not has_words else inside is not None,
+        "inside_word": None if not reading.known else inside is not None,
         "word": None if inside is None else _word_row(inside),
         "before": [_word_row(w) for w in words if w.end <= seconds][-3:],
         "after": [_word_row(w) for w in words if w.start >= seconds][:3],
@@ -7303,7 +7303,8 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
     ]
     if not has_words:
         notes.append(
-            "ここには語の時刻が無いので、字幕の行の切れ目で見ました 語の途中かは分かりません"
+            "ここには語の時刻が無いので、字幕の行の切れ目で見ました inside_word は音で読んだ物で、"
+            "null なら語の途中かは分かりません"
             " transcribe の words_only で今の字幕に語の時刻を足せます"
         )
     if waveform is None:
@@ -12511,7 +12512,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "unchecked（波形がまだ）の順に語尾がつながりやすくなる in_seconds は音の入り、"
             "out_seconds は音の出に使う（frame で指すと in_frame と out_frame も返す）"
             " 語は認識の字を文節ほどに束ねた物で、時刻は見積もり"
-            " has_words が false なら、語の時刻の無い字幕の行の切れ目で見る"
+            " has_words が false なら、語の時刻の無い字幕の行の切れ目で見て、inside_word は音で"
+            "読む（静かな所は false、言えない所は null）"
             "（transcribe の words_only で足せる）"
         ),
         schema=_schema(

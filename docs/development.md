@@ -910,7 +910,8 @@ AI は音を聞けず、静止画しか見られない 音は数の並び（`ana
 - **語の時刻が無い作品** `transcribe` の `words_only` が起こし直し、語の時刻だけを今の字幕へ写す
   （`core/words.py` の `attach_words` 文言・話者・編集の印は変えない 語は重なりの一番長い行へ入れ、
   どの行にも重ならない語は捨てる） `word_boundaries` は語の時刻が無くても字幕の行の切れ目と波形で
-  答え、`has_words` が false になる
+  答え、`has_words` が false になる `has_words` は語の時刻が届くかだけを表し、音で読めたかは
+  `inside_word`（言えなければ null）で別に返す
 - **文と音を比べる** `get_subtitles` の `heard` は音の切れ目をまたぐ行だけに付ける（`heard: true` で
   全部の行） 手で書いたテロップは `heard_words` でタイムラインの範囲の語を読む
 

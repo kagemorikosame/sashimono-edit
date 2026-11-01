@@ -146,21 +146,24 @@ class CutReading:
 
     #: その点を中に含む語 無ければ ``None``
     word: Word | None
-    #: 語で確かめられたか 偽なら、語の途中かを言えない
+    #: 語の時刻が届く所か 語の時刻で読めたかと音で読めたかを分けて返す 混ぜると、静かな所で語の
+    #: 時刻を足す案内が消える
+    timed: bool
+    #: 語の途中でないと言えるか、語の途中と分かったか 偽なら語の途中かを言えない
     known: bool
 
 
 def read_cut(words: WordMap, waveform: Waveform | None, seconds: Fraction) -> CutReading:
     """``seconds`` が語の途中かを読む
 
-    語の無い所は、音が静かと分かるときだけ確かめられたと数える 語の間の無音はふつうにあるので一律に
-    断らず、声が続く所と波形がまだの所を「言えない」にする
+    語の時刻が届かない所は、音が静かと分かるときだけ確かめられたと数える 語の間の無音はふつうにある
+    ので一律に断らず、声が続く所と波形がまだの所を「言えない」にする
     """
     word = words.word_at(seconds)
-    if word is not None or not words.unworded_at(seconds):
-        return CutReading(word, True)
+    if bool(words.phrases) and (word is not None or not words.unworded_at(seconds)):
+        return CutReading(word, True, True)
     level = level_at(waveform, seconds)
-    return CutReading(None, level is not None and level <= QUIET_DB)
+    return CutReading(None, False, level is not None and level <= QUIET_DB)
 
 
 def _between(waveform: Waveform, before: Word, after: Word, reference: float) -> CutPoint:

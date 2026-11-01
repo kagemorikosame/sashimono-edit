@@ -40,7 +40,6 @@ __all__ = [
     "transcript_words",
     "unheard_words",
     "untimed_sounds",
-    "word_at",
     "wordless_lines",
 ]
 
@@ -152,19 +151,15 @@ def phrases(transcript: Transcript | None) -> tuple[Word, ...]:
     return tuple(sorted(grouped, key=lambda word: (word.start, word.end)))
 
 
-def word_at(words: Sequence[Word], seconds: Fraction) -> Word | None:
-    """``seconds`` を中に含む語 語の頭と終わりから :data:`WORD_MARGIN` より内側に入る物だけ
+def _reaching(starts: Sequence[Fraction], reach: Sequence[Fraction], seconds: Fraction) -> range:
+    """頭の順に並んだ区間のうち、``seconds`` に届きうる物の番号を後ろから
 
-    語の時刻は見積もりなので、端ちょうどは語の途中と読まない
+    区間は重なることがある すぐ前の区間の終わりで見切ると、先に始まる長い区間が陰に隠れるので、
+    そこまでの一番遅い終わり（``reach``）で見切る
     """
-    index = bisect.bisect_right([word.start for word in words], seconds)
-    for word in reversed(words[:index]):
-        if word.start + WORD_MARGIN < seconds < word.end - WORD_MARGIN:
-            return word
-        # 語は前から順に並ぶので、終わりが届かなくなったら先は見なくてよい
-        if word.end <= seconds:
-            break
-    return None
+    last = bisect.bisect_right(starts, seconds) - 1
+    first = bisect.bisect_right(reach, seconds)
+    return range(last, first - 1, -1)
 
 
 def attach_words(transcript: Transcript, recognized: Transcript) -> Transcript:
@@ -334,9 +329,10 @@ class WordMap:
     def __init__(self, transcript: Transcript | None) -> None:
         self.phrases = phrases(transcript)
         self.lines = () if transcript is None else transcript.segments
-        self._starts = [line.start for line in self.lines]
-        # 行は頭の順に並ぶが重なることがある そこまでの一番遅い終わりで、前の行を見切る所を決める
-        self._reach = list(accumulate((line.end for line in self.lines), max))
+        self._line_starts = [line.start for line in self.lines]
+        self._line_reach = list(accumulate((line.end for line in self.lines), max))
+        self._word_starts = [word.start for word in self.phrases]
+        self._word_reach = list(accumulate((word.end for word in self.phrases), max))
 
     @property
     def units(self) -> tuple[Word, ...]:
@@ -348,7 +344,15 @@ class WordMap:
         return tuple(sorted((*self.phrases, *bare), key=lambda word: (word.start, word.end)))
 
     def word_at(self, seconds: Fraction) -> Word | None:
-        return word_at(self.phrases, seconds)
+        """``seconds`` を中に含む語 語の頭と終わりから :data:`WORD_MARGIN` より内側に入る物だけ
+
+        語の時刻は見積もりなので、端ちょうどは語の途中と読まない
+        """
+        for at in _reaching(self._word_starts, self._word_reach, seconds):
+            word = self.phrases[at]
+            if word.start + WORD_MARGIN < seconds < word.end - WORD_MARGIN:
+                return word
+        return None
 
     def unworded_at(self, seconds: Fraction) -> bool:
         """字幕の行の中で、語の時刻から語の途中かを言えない所か
@@ -356,10 +360,7 @@ class WordMap:
         語の時刻の無い行の中と、語が行の一部にしか付かない行の語から離れた所 話しているかは語の
         時刻から分からないので、波形と合わせて読む（:func:`~sashimono.engine.audio.word_cuts.read_cut`）
         """
-        index = bisect.bisect_right(self._starts, seconds)
-        for at in range(index - 1, -1, -1):
-            if self._reach[at] <= seconds:
-                break
+        for at in _reaching(self._line_starts, self._line_reach, seconds):
             line = self.lines[at]
             if seconds < line.end and not any(
                 word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in line.words

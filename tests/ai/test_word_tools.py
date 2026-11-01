@@ -198,6 +198,7 @@ class TestWordBoundaries:
         """語の時刻の無い作品でも切り所を返す 断ると起こし直すまで手探りで切る"""
         media = video_media.with_transcript(transcript)
         host = _host(media, _clip(media, 0, 150, Fraction(0)))
+        host.stub_waveform = wave(())
         result = _call(host, "word_boundaries", frame=105, window_seconds=3)
         assert result["has_words"] is False
         assert result["inside_word"] is None
@@ -244,6 +245,21 @@ def test_a_voiced_gap_in_a_line_is_not_called_clean(video_media: MediaItem) -> N
     result = _call(host, "word_boundaries", frame=60)
     assert result["has_words"] is False
     assert result["inside_word"] is None
+
+
+def test_a_quiet_line_without_words_still_says_so(video_media: MediaItem) -> None:
+    """語の時刻の有無と、音で読めたかは別の値
+
+    壊れると、静かな所で語の時刻を足す案内が消え、語の時刻があると読む
+    """
+    line = TranscriptSegment(Fraction(6), Fraction(7), "手で足した行")
+    lines = (*sample_transcript().segments, line)
+    media = video_media.with_transcript(Transcript(lines, language="ja"))
+    host = _host(media, _clip(media, 0, 60, Fraction(6)))
+    result = _call(host, "word_boundaries", frame=15)
+    assert result["has_words"] is False
+    assert result["inside_word"] is False
+    assert "words_only" in result["note"]
 
 
 def test_a_gap_without_a_waveform_is_not_called_clean(video_media: MediaItem) -> None:

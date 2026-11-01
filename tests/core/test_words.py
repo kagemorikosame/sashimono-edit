@@ -29,7 +29,6 @@ from sashimono.core.words import (
     transcript_words,
     unheard_words,
     untimed_sounds,
-    word_at,
 )
 from tests.words_helpers import RATE, in_scene, placed, sample_transcript, segment, spoken
 
@@ -109,18 +108,24 @@ class TestPhrases:
 class TestWordAt:
     def test_inside_a_phrase(self) -> None:
         # 壊れると、語の途中で切った所を見逃す
-        words = phrases(sample_transcript())
-        found = word_at(words, Fraction(14, 10))
+        words = WordMap(sample_transcript())
+        found = words.word_at(Fraction(14, 10))
         assert found is not None and found.text == "カメラを"
 
     @pytest.mark.parametrize("seconds", [Fraction(1), Fraction(105, 100), Fraction(177, 100)])
     def test_the_edges_are_not_inside(self, seconds: Fraction) -> None:
         """語の時刻は見積もり 壊れると語の境目で切った所まで言葉の途中と読む"""
-        assert word_at(phrases(sample_transcript()), seconds) is None
+        assert WordMap(sample_transcript()).word_at(seconds) is None
 
     def test_a_pause_is_not_inside(self) -> None:
         # 壊れると、話の間を語の途中と読み、安全な切れ目を問題にする
-        assert word_at(phrases(sample_transcript()), Fraction(3)) is None
+        assert WordMap(sample_transcript()).word_at(Fraction(3)) is None
+
+    def test_a_long_word_behind_a_short_one_is_found(self) -> None:
+        # 壊れると、重なる短い語の陰で長い語を見逃し、語の途中の切れ目を調べ済みとして返す
+        lines = (segment(spoken(Fraction(1), "あ" * 10)), segment(spoken(Fraction(15, 10), "い")))
+        found = WordMap(Transcript(lines, language="ja")).word_at(Fraction(2))
+        assert found is not None and found.text == "あ" * 10
 
 
 class TestAttachWords:

@@ -173,7 +173,7 @@ def _word_cuts(
             continue
         waveform = waveform_of(media, key[1])
         reading = read_cut(words, waveform, edge.seconds)
-        if not reading.known or not words.phrases:
+        if not reading.known:
             unknown += 1
             continue
         checked += 1
