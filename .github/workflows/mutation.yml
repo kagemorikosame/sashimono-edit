@@ -36,7 +36,7 @@ jobs:
           python-version: "3.14"
           # check-latest は付けない 試験の検出力を見るだけで配る物を組まない（ci.yml と同じ理由 #410）
 
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: false
 
