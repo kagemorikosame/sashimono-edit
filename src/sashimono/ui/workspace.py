@@ -671,6 +671,11 @@ class Preferences:
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
     check_loudness_target: int = -14
+    #: 字幕起こしで語の時刻も取るか（#420） 取ると AI が語の境目で切れ、字幕の下に残った語も
+    #: 読める 実物の素材で起こす時間は素材によって 0.8〜2 倍（large-v3 と GPU）・1.1〜1.2 倍
+    #: （small と CPU）だった 既定は入り 切ると起こしは速いことがあるが、切り抜きが言葉の途中で
+    #: 切れやすくなる 起こしの窓のチェックの初めの値もこれ
+    word_timestamps: bool = True
     #: AI アシスタントが検査（#337）で見つけた問題を直して調べ直す回数の上限（#339）
     #: どこまで任せるかは人で違う 0 は調べるだけで直さない 既定の 3 は、音量をそろえた後に
     #: 音割れや字幕を直すような 2〜3 段の直しで足り、止まらない繰り返しは早めに人へ返す側
@@ -1121,6 +1126,7 @@ class PreferenceStore:
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
+            word_timestamps=_flag(data.get("word_timestamps"), plain.word_timestamps),
             ai_fix_rounds=_within(data.get("ai_fix_rounds"), FIX_ROUNDS_RANGE, plain.ai_fix_rounds),
             duck_depth_db=_within(
                 data.get("duck_depth_db"), DUCK_DEPTH_DB_RANGE, plain.duck_depth_db

@@ -974,6 +974,15 @@ class PreferencesDialog(QDialog):
             " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
         )
         form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
+        # 語の時刻（#420） 起こす時間と切る位置の確かさの釣り合いは人で違う
+        self._word_timestamps = QCheckBox("字幕起こしで語の時刻も取る", self)
+        self._word_timestamps.setChecked(preferences.word_timestamps)
+        self._word_timestamps.setToolTip(
+            "語ごとの時刻を取ると、AI アシスタントが切る前に語の境目を確かめ、言葉の途中で切れた"
+            "所と字幕の文言と音の食い違いを調べられる 起こす時間は素材によって変わり、長いときは"
+            "2 倍ほどになる 切っても、語の時刻が要るときは AI が今の字幕へ足せる"
+        )
+        form.addRow(self._word_timestamps)
         # 検査の直しの回数（#339） どこまで AI に任せるかは人で違う
         self._ai_fix_rounds = QSpinBox(self)
         self._ai_fix_rounds.setRange(*FIX_ROUNDS_RANGE)
@@ -1298,6 +1307,7 @@ class PreferencesDialog(QDialog):
             ai_limit_action=str(self._limit_action.currentData()),
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
+            word_timestamps=self._word_timestamps.isChecked(),
             ai_fix_rounds=self._ai_fix_rounds.value(),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),

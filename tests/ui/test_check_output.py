@@ -193,7 +193,9 @@ class TestTimeline:
         assert result["problems"] == [], result["problems"]
         assert result["summary"]["integrated_lufs"] == pytest.approx(-14.0, abs=0.5)
         assert result["length_seconds"] == pytest.approx(9.0)
-        assert "問題は見つかりませんでした" in result["note"]
+        # 字幕の無い素材は語の境目を調べられない 調べたと言わずに分けて伝える（#420）
+        assert result["skipped_checks"] == ["word_cut", "subtitle_words"]
+        assert "調べた種類（checks）には問題がありませんでした" in result["note"]
 
     def test_a_gap_between_clips_is_a_black_frame(
         self, opened: list[MainWindow], media: _Media

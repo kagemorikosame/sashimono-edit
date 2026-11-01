@@ -85,6 +85,7 @@ class TranscribeDialog(QDialog):
         *,
         stream: int | None = None,
         status: Callable[[], PackStatus] | None = None,
+        words: bool = False,
     ) -> None:
         """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）
 
@@ -98,6 +99,7 @@ class TranscribeDialog(QDialog):
         self.resize(560, 420)
 
         self._media = media
+        self._words_wanted = words
         self._first_stream = stream
         # 省いたときは呼ぶたびにこのモジュールの runtime_status を引く 引数の既定に
         # 関数そのものを書くと定義した時点の物に固まり、試験が差し替えても効かない
@@ -149,7 +151,8 @@ class TranscribeDialog(QDialog):
         self._prompt = QLineEdit(self)
         self._prompt.setPlaceholderText("固有名詞など（任意）")
 
-        self._words = QCheckBox("単語ごとの時刻も取る（分割の精度が上がる・遅くなる）", self)
+        self._words = QCheckBox("語ごとの時刻も取る（分割と AI の切る位置の精度が上がる）", self)
+        self._words.setChecked(self._words_wanted)
         self._gpu = QCheckBox("GPU を使う", self)
         self._gpu.setChecked(True)
         self._gpu.toggled.connect(self._describe_install)

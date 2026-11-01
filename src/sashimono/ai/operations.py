@@ -20,7 +20,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from fractions import Fraction
@@ -296,9 +296,13 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
     TranscriptSegment,
+    Word,
     heard_stream,
 )
 from sashimono.core.projection import (
+    HeardPiece,
+    ProjectedSubtitle,
+    heard_pieces,
     heard_timeline,
     project_timeline,
     source_seconds_at,
@@ -345,6 +349,14 @@ from sashimono.core.timebase import (
     format_timecode,
     frame_to_seconds,
     seconds_to_frame,
+)
+from sashimono.core.words import (
+    HeardWord,
+    heard_between,
+    heard_words,
+    phrases,
+    transcript_words,
+    word_at,
 )
 from sashimono.effects import registry
 from sashimono.effects.denoise import (
@@ -407,6 +419,7 @@ from sashimono.engine.audio.voicevox import (
 )
 from sashimono.engine.audio.voicevox import SPEED_PERCENT_RANGE as VOICE_SPEED_RANGE
 from sashimono.engine.audio.waveform import Waveform
+from sashimono.engine.audio.word_cuts import cut_points, level_at
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
@@ -430,8 +443,9 @@ from sashimono.engine.checks.profile import (
     classify,
 )
 from sashimono.engine.checks.profile import SILENCE as SOUND_SILENCE
-from sashimono.engine.checks.report import CheckReport, ClipIndex
+from sashimono.engine.checks.report import CheckReport, ClipIndex, sorted_problems
 from sashimono.engine.checks.scan import LOUDNESS, SOUND_KINDS
+from sashimono.engine.checks.words import check_words
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
     CONTAINER_SUFFIXES,
@@ -1388,8 +1402,11 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         text_offset = max(0, int(arguments.get("text_offset", 0) or 0))
     except (TypeError, ValueError) as exc:
         raise ToolError("text_offset は整数で渡してください") from exc
+    all_heard = _flag_argument(arguments, "heard", False)
     low, high = _frame_window(project, arguments)
     rows = []
+    # 行ごとに数え直さず使い回す 字幕の行の数だけクリップをたどると、長い作品で待たされる
+    spoken = heard_words(project)
     for subtitle in project_timeline(project):
         if one and str(subtitle.segment.id) != one:
             continue
@@ -1423,6 +1440,7 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
             }
             # 話者（#323）は付いている行だけ 分けていない作品の返事を長くしない
             | ({"speaker": speaker} if speaker else {})
+            | _heard_row(subtitle, spoken, all_heard)
         )
     for row in rows:
         _clip_text(row, text_offset if one else None)
@@ -1430,6 +1448,7 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         rows = [
             {"n": index, "time": row["start_timecode"], "text": row["text"]}
             | ({"speaker": row["speaker"]} if "speaker" in row else {})
+            | ({"heard": row["heard"]} if "heard" in row else {})
             | ({"segment_id": row["segment_id"], "truncated": True} if "truncated" in row else {})
             for index, row in enumerate(rows)
         ]
@@ -1439,6 +1458,23 @@ def _get_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         result["transcribing"] = True
         result["note"] = " ".join(filter(None, (result.get("note"), _TRANSCRIBING_NOTE)))
     return result
+
+
+def _heard_row(
+    subtitle: ProjectedSubtitle, spoken: Sequence[HeardWord], everything: bool
+) -> dict[str, Any]:
+    """字幕の下に残った語（#420） AI は音を聞けず、切った後の文言が音と合うかを読む手段が無い
+
+    既定は音の切れ目をまたぐ行だけ 切っていない行まで返すと、字幕の一覧の長さが倍になる
+    """
+    if subtitle.media_id is None or not subtitle.segment.words:
+        return {}
+    if not (everything or subtitle.clipped_head or subtitle.clipped_tail):
+        return {}
+    words = heard_between(
+        spoken, subtitle.media_id, subtitle.stream, subtitle.start_frame, subtitle.end_frame
+    )
+    return {"heard": "".join(item.word.text for item in words)}
 
 
 _TRANSCRIBING_NOTE = (
@@ -3691,6 +3727,8 @@ def _screen_result(
 
 # --- 完成物の検査（#337）---
 
+#: 検査の問題のうち本人の文が入る欄
+_CHECK_TEXT_KEYS = ("text", "heard", "missing")
 #: 検査が終わっていないときに待つ秒の既定と上限 待つのは AI のスレッドで、画面は止めない
 #: 上限を置くのは、長い作品で会話が何分も止まったように見えないため 待ちきれなければ
 #: 調べた所までを返し、続きはもう 1 度呼んで受け取る（場面の検出 #358 と同じ）
@@ -3826,6 +3864,26 @@ def _check_output(host: EditorHost, arguments: dict[str, Any]) -> object:
     )
 
 
+def _with_words(host: EditorHost, request: CheckRequest, report: CheckReport) -> CheckReport:
+    """語の時刻で調べた問題（#420）を足す 調べ始めたときの作品で見る
+
+    波形の解析は編集画面の係が持つので、走り係ではなくここで読む 語の時刻と解析済みの波形だけを
+    見るので、途中までの結果を呼び直したときも同じ物が返る
+    """
+    project = request.project
+    if project is None:
+        return report
+    found = check_words(project, request.start, request.end, report.limits.kinds, host.waveform)
+    if not found.problems and not found.notes and not found.skipped:
+        return report
+    return replace(
+        report,
+        problems=tuple(sorted_problems((*report.problems, *found.problems))),
+        notes=(*report.notes, *found.notes),
+        skipped=report.skipped | found.skipped,
+    )
+
+
 def _check_result(
     host: EditorHost,
     request: CheckRequest,
@@ -3842,6 +3900,7 @@ def _check_result(
         raise ToolError(f"調べられませんでした: {state.failure}")
     if report is None:
         raise ToolError("検査の結果がまだありません もう 1 度呼んでください")
+    report = _with_words(host, request, report)
     timeline = request.project is not None
     # 待つ間に作品が変わったか 見比べ方は下の注意書きと音の道具（_heard）と同じく値の比べ
     # （モデルは frozen なので、同じ中身なら同じ作品） 変わっていれば問題のクリップ ID と位置は
@@ -3872,9 +3931,10 @@ def _check_result(
             "detail": problem.detail,
             **problem.measure,
         }
-        if "text" in row:
-            # はみ出した字幕の文の頭（本人の文） 字幕と文字を送らない人には値ごと伏せる（#391）
-            row["text"] = masked_value(row["text"], _TEXT_ONLY)
+        for key in _CHECK_TEXT_KEYS:
+            if key in row:
+                # 字幕の文と残した語（本人の文） 字幕と文字を送らない人には値ごと伏せる（#391）
+                row[key] = masked_value(row[key], _TEXT_ONLY)
         if rate is not None:
             row["timecode"] = format_timecode(problem.start, rate)
         if problem.clip_ids:
@@ -7023,15 +7083,23 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not media.has_audio:
         raise ToolError(f"{media.name} に音声がありません")
     stream = _audio_stream(media, arguments)
-    if media.transcript_for(stream) is not None and not _flag_argument(arguments, "replace", False):
+    words_only = _flag_argument(arguments, "words_only", False)
+    replacing = _flag_argument(arguments, "replace", False)
+    if words_only and replacing:
+        raise ToolError("words_only は今の字幕を残す頼みなので、replace とは一緒に使えません")
+    if media.transcript_for(stream) is not None and not (replacing or words_only):
         # 黙って置き換えると、人が直した字幕まで消える 置き換えるかは頼む側が決める
         raise ToolError(
             f"{media.name} の音声 {_audio_number(media, stream)} には字幕があります"
-            " 置き換えるときは replace を true にしてください"
+            " 置き換えるときは replace を true にしてください 語の時刻だけを足すときは"
+            " words_only を true にしてください（文言と話者は変わりません）"
         )
     try:
         message = host.start_transcription(
-            media.id, str(arguments.get("model", "large-v3")), audio_stream=stream
+            media.id,
+            str(arguments.get("model", "large-v3")),
+            audio_stream=stream,
+            words_only=words_only,
         )
     except RuntimeError as exc:
         raise ToolError(str(exc)) from exc
@@ -7100,6 +7168,170 @@ def _separate_speakers(host: EditorHost, arguments: dict[str, Any]) -> object:
         "next": "しばらく待ってから transcription_status を見てください"
         " 終わったら get_subtitles の speaker で誰の字幕かが分かります",
     }
+
+
+#: word_boundaries の見る幅の既定と上限（秒） 上限まで広げても語の境目は MAX_POINTS 個まで
+DEFAULT_WORD_WINDOW = 2.0
+MAX_WORD_WINDOW = 10.0
+#: 語の境目の両側に書く文の長さ 語の時刻が無い字幕の行は 1 行が長い
+_WORD_TEXT_CHARS = 30
+
+
+def _word_text(text: str) -> object:
+    """語の境目の道具が返す文 字幕と文字を送らない人には値ごと伏せる 時刻は返せる"""
+    return masked_value(text[:_WORD_TEXT_CHARS], _TEXT_ONLY)
+
+
+def _word_row(word: Word) -> dict[str, object]:
+    return {
+        "text": _word_text(word.text),
+        "start_seconds": round(float(word.start), 3),
+        "end_seconds": round(float(word.end), 3),
+    }
+
+
+def _word_target(
+    project: Project, arguments: dict[str, Any]
+) -> tuple[MediaItem, int, Fraction, HeardPiece | None]:
+    """語の境目を見る所 タイムラインのフレームか、素材と秒か"""
+    frame = arguments.get("frame")
+    if frame is not None:
+        at = _integer_value(frame, "frame")
+        piece = next((p for p in heard_pieces(project) if p.start <= at < p.end), None)
+        media = None if piece is None else project.find_media(piece.media_id)
+        if piece is None or media is None:
+            raise ToolError(f"フレーム {at} で鳴っている素材の音がありません")
+        return media, piece.stream, piece.seconds_at(at, project.rate), piece
+    if arguments.get("seconds") is None:
+        raise ToolError("frame か、media_id と seconds（素材の秒）を渡してください")
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    stream = media.transcript_stream(_audio_stream(media, arguments))
+    seconds = _limit_number(arguments, "seconds", 0.0, 0.0, 864000.0)
+    return media, stream, Fraction(round(seconds * 1000), 1000), None
+
+
+def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """指定の時刻の前後の語と、切ってよい位置（#420） AI は音を聞けないので、切る前にここで読む"""
+    project = _project(host)
+    window = _limit_number(arguments, "window_seconds", DEFAULT_WORD_WINDOW, 0.2, MAX_WORD_WINDOW)
+    media, stream, seconds, piece = _word_target(project, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None:
+        raise ToolError(
+            f"{media.name} の音声 {_audio_number(media, stream)} にはまだ字幕がありません"
+            " 先に transcribe で起こしてください"
+        )
+    words = phrases(transcript)
+    has_words = bool(words)
+    if not has_words:
+        # 語の時刻が無くても、字幕の行の切れ目と波形で切り所は読める 断ると起こし直しの間 AI が
+        # 手探りで切ることになる
+        words = tuple(Word(s.start, s.end, s.text) for s in transcript.segments)
+    waveform = host.waveform(media, stream)
+    inside = word_at(words, seconds) if has_words else None
+    rows = []
+    for point in cut_points(words, waveform, seconds, Fraction(round(window * 100), 100)):
+        row: dict[str, object] = {
+            "kind": point.kind,
+            "in_seconds": round(float(point.in_seconds), 3),
+            "out_seconds": round(float(point.out_seconds), 3),
+            "before": _word_text(point.before[-_WORD_TEXT_CHARS:]),
+            "after": _word_text(point.after),
+            "distance_seconds": round(float(point.distance(seconds)), 3),
+        }
+        if point.level_db is not None:
+            row["level_db"] = point.level_db
+            row["quiet_seconds"] = round(point.quiet_seconds, 2)
+        if piece is not None:
+            # 入りは手前へ、出は後ろへ丸める 語の端を削らない
+            row["in_frame"] = math.floor(piece.frame_at(point.in_seconds, project.rate))
+            row["out_frame"] = math.ceil(piece.frame_at(point.out_seconds, project.rate))
+        rows.append(row)
+    level = level_at(waveform, seconds)
+    result: dict[str, object] = {
+        "media_id": str(media.id),
+        "audio": _audio_number(media, stream),
+        "source_seconds": round(float(seconds), 3),
+        "has_words": has_words,
+        "inside_word": None if not has_words else inside is not None,
+        "word": None if inside is None else _word_row(inside),
+        "before": [_word_row(w) for w in words if w.end <= seconds][-3:],
+        "after": [_word_row(w) for w in words if w.start >= seconds][:3],
+        "cut_points": rows,
+    }
+    if level is not None:
+        result["level_db"] = round(level, 1)
+    if piece is not None:
+        result["clip_id"] = str(piece.clip_id)
+        result["frame"] = _integer_value(arguments["frame"], "frame")
+        if piece.inner_clip_id is not None:
+            result["scene_clip_id"] = str(piece.inner_clip_id)
+    notes = [
+        "kind は pause（話の間）が一番安全で、valley（音の谷）・joined（語の境目だが声が続く）の"
+        "順に語尾がつながりやすい in_seconds と in_frame は音の入り、out_seconds と out_frame は"
+        "音の出に使う"
+    ]
+    if not has_words:
+        notes.append(
+            "語の時刻が無いので、字幕の行の切れ目で見ました 行の中の語の境目は分かりません"
+            " transcribe の words_only で今の字幕に語の時刻を足せます"
+        )
+    if waveform is None:
+        notes.append(
+            "波形の解析がまだなので、音を確かめていません（unchecked） もう 1 度呼ぶと読めます"
+        )
+    result["note"] = " ".join(notes)
+    return result
+
+
+def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """タイムラインの範囲で鳴る語（#420） 手で書いた字幕やテロップの文言を音と比べる"""
+    project = _project(host)
+    start = _frame_argument(arguments, "from_frame", 0)
+    end = _frame_argument(arguments, "to_frame", project.duration)
+    if not 0 <= start < end:
+        raise ToolError(f"範囲は 0 ≦ from_frame < to_frame で渡してください（{start}〜{end}）")
+    rows: list[dict[str, object]] = []
+    for item in heard_words(project, start, end):
+        if rows and rows[-1]["clip_id"] == str(item.piece.clip_id):
+            rows[-1]["text"] = f"{rows[-1]['text']}{item.word.text}"
+            rows[-1]["end_frame"] = math.ceil(item.frame)
+            continue
+        rows.append(
+            {
+                "clip_id": str(item.piece.clip_id),
+                "media_id": str(item.piece.media_id),
+                "text": item.word.text,
+                "start_frame": math.floor(item.frame),
+                "end_frame": math.ceil(item.frame),
+            }
+        )
+    silent = {
+        str(piece.media_id)
+        for piece in heard_pieces(project)
+        if piece.start < end
+        and piece.end > start
+        and not _has_word_times(project, piece.media_id, piece.stream)
+    }
+    result = _paged(rows, arguments, name="heard")
+    if silent:
+        result["no_words"] = sorted(silent)
+        result["note"] = " ".join(
+            filter(
+                None,
+                (
+                    result.get("note"),
+                    "no_words の素材には語の時刻が無く、鳴る語を読めません"
+                    " transcribe の words_only で足せます",
+                ),
+            )
+        )
+    return result
+
+
+def _has_word_times(project: Project, media_id: MediaId, stream: int) -> bool:
+    media = project.find_media(media_id)
+    return media is not None and bool(transcript_words(media.transcript_for(stream)))
 
 
 def _subtitle_transcript(
@@ -9724,7 +9956,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "タイムラインに出る字幕を、表示位置つきで一覧する 誤植を探すときは compact で"
             "行の番号・時刻・本文だけを読み、contains（言葉）や時刻で絞る 直すときは"
             " replace_subtitle_text で「誤 → 正」をまとめて渡す 話者を分けた字幕の行は"
-            " speaker（誰が話しているか）を持つ" + PAGING_NOTE
+            " speaker（誰が話しているか）を持つ 音の切れ目をまたぐ行は heard（字幕の下に残った"
+            "音の語 語の時刻があるときだけ）を持つ 本文が heard より長ければ、言っていない言葉が"
+            "字幕に出ている" + PAGING_NOTE
         ),
         schema=_schema(
             {
@@ -9743,6 +9977,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "from_seconds": _number("この秒より後に出る字幕だけ（タイムラインの秒）"),
                 "to_seconds": _number("この秒より前に出始める字幕だけ（ちょうどから出る物は外す）"),
                 "compact": _boolean("行の番号・時刻・本文だけを返す（軽い一覧）"),
+                "heard": _boolean("すべての行に heard を付ける（既定は音の切れ目をまたぐ行だけ）"),
                 **_paging(),
             }
         ),
@@ -10242,7 +10477,12 @@ OPERATIONS: tuple[Operation, ...] = (
             "止まった絵（freeze）・無音（silence）・音割れ（clipping）・音量の基準（loudness "
             "ITU-R BS.1770 の積分ラウドネス）・字幕のはみ出し（text_overflow"
             " 画面の外へ出て切れる字）・"
-            "長さ（length expected_seconds を渡したとき）を調べる 既定は今のタイムライン"
+            "長さ（length expected_seconds を渡したとき）・言葉の途中の切れ目（word_cut クリップの"
+            "音の入りと出が語の途中で、切った所に声が続く シーンの中と速度変更も元の時刻で見る"
+            " suggested_head_delta か suggested_tail_delta は trim_clip へそのまま渡せる）・"
+            "字幕と音の食い違い（subtitle_words 字幕の文言の語が残した音に無い heard は残った語、"
+            "missing は無い語）を調べる word_cut と subtitle_words は語の時刻が要り、タイムライン"
+            "だけ 既定は今のタイムライン"
             "（書き出す前の、描いた絵と混ぜた音） path を渡すと書き出した動画のファイルを調べる"
             "（作品のフォルダと書き出しのフォルダの中だけ 字幕のはみ出しは調べられない"
             " AAC など圧縮した音では音割れを取りこぼすことがある）"
@@ -12192,6 +12432,8 @@ OPERATIONS: tuple[Operation, ...] = (
         name="transcribe",
         description=(
             "素材の字幕起こしを始める 終わるまで数分かかる wait_seconds を付けると終わりまで待つ"
+            " 語の時刻は本人の設定で取る（既定は取る） 語の時刻が無い字幕には words_only で足せる"
+            "（word_boundaries の has_words が false のとき）"
         ),
         schema=_schema(
             {
@@ -12204,6 +12446,9 @@ OPERATIONS: tuple[Operation, ...] = (
                 "replace": _boolean(
                     "その音声に字幕があるとき置き換える（既定 false 既にあれば断る）"
                 ),
+                "words_only": _boolean(
+                    "語の時刻だけを今の字幕へ足す 文言と話者は変えない（既定 false）"
+                ),
                 "wait_seconds": _number(_TRANSCRIPTION_WAIT),
             },
             ["media_id"],
@@ -12212,6 +12457,53 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
         name_keys=frozenset({"started"}),
         writes=True,
+    ),
+    Operation(
+        name="word_boundaries",
+        description=(
+            "指定の時刻の前後の語と、切ってよい位置を返す（読むだけ） 音を切る・つなぐ前に読む"
+            " frame（タイムライン）か、media_id と seconds（素材の秒）で指す inside_word が真なら"
+            "言葉の途中 cut_points は語の境目を近い順に並べ、語の時刻を音の波形で補った位置を返す"
+            " kind は pause（話の間）・valley（音の谷）・joined（語の境目だが声が続く）・"
+            "unchecked（波形がまだ）の順に語尾がつながりやすくなる in_seconds は音の入り、"
+            "out_seconds は音の出に使う（frame で指すと in_frame と out_frame も返す）"
+            " 語は認識の字を文節ほどに束ねた物で、時刻は見積もり"
+            " has_words が false なら字幕の行の切れ目で見る（transcribe の words_only で足せる）"
+        ),
+        schema=_schema(
+            {
+                "frame": _integer("タイムラインのフレーム"),
+                "media_id": _string("素材 frame を省くときに渡す"),
+                "seconds": _number("素材の中の秒 frame を省くときに渡す"),
+                "audio": _integer("音声の番号（1 から 省くと 1 本目 media_id で指すとき）"),
+                "window_seconds": _number(
+                    f"前後に見る秒（0.2〜{MAX_WORD_WINDOW:g}、既定 {DEFAULT_WORD_WINDOW:g}）"
+                ),
+            }
+        ),
+        handler=_word_boundaries,
+        # 語は本人の文 字幕と文字を送らない人には語を伏せて時刻を返す 断ると切る位置まで読めない
+        # 断りの文に素材の名前が入る
+        sends=_WITH_TEXT | _WITH_FILES,
+        hidden=_TEXT_ONLY,
+    ),
+    Operation(
+        name="heard_words",
+        description=(
+            "タイムラインの範囲で実際に鳴る語を返す（読むだけ） 切った後に字幕やテロップの文言と"
+            "残した音が合っているかを比べる シーンの中と速度変更も元の素材の語へ戻して読む"
+            " 語の時刻が無い素材は no_words に並ぶ（transcribe の words_only で足せる）"
+            + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "from_frame": _integer("このフレームから（既定 0）"),
+                "to_frame": _integer("このフレームの手前まで（既定 終わり）"),
+                **_paging(),
+            }
+        ),
+        handler=_heard_words,
+        sends=_WITH_TEXT,
     ),
     Operation(
         name="transcription_status",

@@ -41,6 +41,7 @@ from sashimono.engine.checks.scan import (
     PICTURE_KINDS,
     SOUND_KINDS,
     TEXT_OVERFLOW,
+    WORD_KINDS,
     AudioScan,
     CheckLimits,
     Run,
@@ -507,6 +508,11 @@ def _check_file(path: Path, progress: _Progress) -> None:
             progress.skip(
                 frozenset({TEXT_OVERFLOW}),
                 "書き出した動画からは字幕のはみ出しを調べられません（字の形が残らない）"
+                " タイムラインを調べると分かります",
+            )
+            progress.skip(
+                WORD_KINDS,
+                "書き出した動画からは語の境目を調べられません（語の時刻は素材の字幕にある）"
                 " タイムラインを調べると分かります",
             )
             if audio is None:

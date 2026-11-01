@@ -11,6 +11,8 @@
 | 音量の基準 | 6 LU を超えて外れる | 幅を超えて外れる | - |
 | 字幕のはみ出し | 画面の外へ出て切れる | 余白（安全域）にだけ入る | 動く字幕（テロップなど） |
 | 長さ | - | 目安から外れる | - |
+| 言葉の途中の切れ目 | 語の中で切れ声が続く | 語の中で切れた（波形がまだで音は未確認） | - |
+| 字幕と音の食い違い | - | 字幕の文言の語が残した音に無い | - |
 
 頭と終わりの黒と無音を low にするのは、フェードの入りと抜けで普通に作る形だから
 直すかどうかは AI と人が絵を見て決める（:func:`preview_frame` で確かめる）
@@ -19,7 +21,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from sashimono.core.model import MediaItem, Project
@@ -31,7 +33,9 @@ from sashimono.engine.checks.scan import (
     LENGTH,
     LOUDNESS,
     SILENCE,
+    SUBTITLE_WORDS,
     TEXT_OVERFLOW,
+    WORD_CUT,
     CheckLimits,
     Run,
 )
@@ -46,6 +50,7 @@ __all__ = [
     "ClipIndex",
     "Problem",
     "assemble",
+    "sorted_problems",
 ]
 
 HIGH = "high"
@@ -172,6 +177,13 @@ class CheckReport:
         return found
 
 
+def sorted_problems(problems: Iterable[Problem]) -> list[Problem]:
+    """問題を返す順に並べる 語の時刻の問題を後から足す所も同じ順にする"""
+    return sorted(
+        problems, key=lambda problem: (problem.start, _ORDER[problem.severity], problem.kind)
+    )
+
+
 def assemble(
     runs: list[Run],
     *,
@@ -235,7 +247,7 @@ def assemble(
                     },
                 )
             )
-    problems.sort(key=lambda problem: (problem.start, _ORDER[problem.severity], problem.kind))
+    problems = sorted_problems(problems)
     peak_db = None if peak is None else (-120.0 if peak <= 0 else 20.0 * math.log10(peak))
     return CheckReport(
         problems=tuple(problems),
@@ -332,4 +344,6 @@ KIND_NAMES: Mapping[str, str] = {
     LOUDNESS: "音量の基準",
     TEXT_OVERFLOW: "字幕のはみ出し",
     LENGTH: "長さ",
+    WORD_CUT: "言葉の途中の切れ目",
+    SUBTITLE_WORDS: "字幕と音の食い違い",
 }

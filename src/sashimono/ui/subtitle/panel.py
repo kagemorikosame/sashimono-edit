@@ -89,6 +89,7 @@ from sashimono.core.projection import (
 from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_speakers
 from sashimono.core.timebase import format_timecode, seconds_to_frame
+from sashimono.core.words import attach_words
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.silence import (
@@ -175,6 +176,11 @@ class SubtitlePanel(QWidget):
         #: （:class:`TranscriptionService`）、
         #: 終わった物はどれもその素材と音声の字幕へ取り込む
         self._jobs: list[Job] = []
+        #: 語の時刻だけを今の字幕へ足す依頼（#420） 依頼の窓の控えではなく ID で持つ 依頼は窓を
+        #: 閉じた後も走り、終わりは :meth:`poll_transcription` が拾う
+        self._words_only: set[int] = set()
+        #: 起こしで語の時刻も取るか 本人の設定（``Preferences.word_timestamps``）
+        self.word_timestamps = True
         #: 起こしの列が片付いているか（:meth:`transcription_waiter`）
         self._settled = threading.Event()
         self._settled.set()
@@ -754,7 +760,9 @@ class SubtitlePanel(QWidget):
             # パネルは開けるようにしておく
             self._service = TranscriptionService(default_backend())
 
-        dialog = TranscribeDialog(media, self._service, self, stream=self._stream)
+        dialog = TranscribeDialog(
+            media, self._service, self, stream=self._stream, words=self.word_timestamps
+        )
         answer = dialog.exec()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
@@ -772,11 +780,20 @@ class SubtitlePanel(QWidget):
             self._continue_with_speakers(media.id, dialog.chosen_stream)
 
     def start_transcription(
-        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+        self,
+        media_id: MediaId,
+        model: str,
+        *,
+        audio_stream: int | None = None,
+        word_timestamps: bool = False,
+        words_only: bool = False,
     ) -> str:
         """起こしを頼む AI からの依頼を受ける入口 走っている物があれば順番待ちに入る
 
         同じ素材の同じ音をすでに頼んでいれば断る（2 回起こしても同じ結果を 2 回取り込むだけ）
+
+        ``words_only`` は語の時刻だけを今の字幕へ足す（#420） 文言と話者は変えない 起こし直すと
+        語の時刻のためだけに人が直した字幕が消える
         """
         """起こしを始める AI からの依頼を受ける入口
 
@@ -796,9 +813,14 @@ class SubtitlePanel(QWidget):
         stream = media.transcript_stream(audio_stream)
         if self._service.find(media.id, stream) is not None:
             raise RuntimeError(f"{media.name} のその音声はもう起こしています（順番待ちを含む）")
-        options = TranscribeOptions(model=model, audio_stream=stream)
+        options = TranscribeOptions(
+            model=model, audio_stream=stream, word_timestamps=word_timestamps or words_only
+        )
         waiting = self._service.busy
-        self._jobs.append(self._service.start(media.id, media.path, options))
+        job = self._service.start(media.id, media.path, options)
+        self._jobs.append(job)
+        if words_only:
+            self._words_only.add(id(job))
         self._note_jobs()
         self.select_media(media.id)
         if waiting:
@@ -849,13 +871,25 @@ class SubtitlePanel(QWidget):
                 self._last_progress.pop(id(job), None)
                 name = self._describe_job(job)
                 message = event.message or "終了した"
+                words_only = id(job) in self._words_only
+                self._words_only.discard(id(job))
+                current = self._project.find_media(job.media_id)
+                existing = None if current is None else current.transcript_for(job.stream)
                 if event.kind is JobKind.DONE and event.transcript is not None:
-                    # 頼んだ素材と音へ取り込む 表で見ている素材や音には依らない
-                    self.commands_requested.emit(
-                        [SetTranscript(job.media_id, event.transcript, stream=job.stream)],
-                        f"字幕を起こす: {name}",
-                    )
-                    self._continue_with_speakers(job.media_id, job.stream)
+                    if words_only and existing is not None:
+                        # 取り込むときの字幕へ写す 起こしている間に人が直した文言も残る
+                        merged = attach_words(existing, event.transcript)
+                        self.commands_requested.emit(
+                            [SetTranscript(job.media_id, merged, stream=job.stream)],
+                            f"語の時刻を足す: {name}",
+                        )
+                    else:
+                        # 頼んだ素材と音へ取り込む 表で見ている素材や音には依らない
+                        self.commands_requested.emit(
+                            [SetTranscript(job.media_id, event.transcript, stream=job.stream)],
+                            f"字幕を起こす: {name}",
+                        )
+                        self._continue_with_speakers(job.media_id, job.stream)
                 elif event.kind is JobKind.DONE and event.speakers is not None:
                     message = self._apply_speakers(job.media_id, job.stream, event.speakers)
                 self._job_notes.append(f"{name}: {message}")

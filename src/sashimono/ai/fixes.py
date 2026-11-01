@@ -36,7 +36,9 @@ from sashimono.engine.checks.scan import (
     LENGTH,
     LOUDNESS,
     SILENCE,
+    SUBTITLE_WORDS,
     TEXT_OVERFLOW,
+    WORD_CUT,
 )
 
 __all__ = [
@@ -179,6 +181,25 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
     ),
     (SILENCE, LOW, None): Fix(LEAVE, (), "頭か終わりの無音 フェードの演出ならそのままでよい"),
     (LENGTH, MEDIUM, None): Fix(HANDOFF, (), "どこを削るか・足すかは中身の判断なので、人に伝える"),
+    # 端を数コマ動かすだけで、話の中身も全体の流れも変わらないので auto（#420）
+    (WORD_CUT, HIGH, None): Fix(
+        AUTO,
+        ("trim_clip",),
+        "言葉の途中で切れている suggested の head_delta か tail_delta を trim_clip へ渡して語の"
+        "境目へ動かす suggested が無ければ word_boundaries で切ってよい位置を読む",
+    ),
+    (WORD_CUT, MEDIUM, None): Fix(
+        AUTO,
+        ("trim_clip",),
+        "語の時刻の上では途中だが、波形の解析がまだで音を確かめていない word_boundaries で切って"
+        "よい位置を読み、trim_clip で動かす",
+    ),
+    (SUBTITLE_WORDS, MEDIUM, None): Fix(
+        ASK,
+        ("trim_clip", "set_subtitle_text", "set_param"),
+        "字幕の文言の語が残した音に入っていない 音を伸ばすか（trim_clip）、文言を heard に合わせて"
+        "直すか（set_subtitle_text 焼き込んだ字幕は set_param）を人に尋ねてから直す",
+    ),
 }
 
 #: 表に無い組み合わせ 黙って直すより、人へ渡す側に倒す

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Iterator
 from dataclasses import replace
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import QApplication
 
 from sashimono.asr.backend import Progress, ShouldCancel, TranscribeOptions
 from sashimono.asr.service import TranscriptionService
-from sashimono.core.commands import Command
+from sashimono.core.commands import Command, SetTranscript
 from sashimono.core.model import (
     AudioStreamInfo,
     Clip,
@@ -30,11 +31,14 @@ from sashimono.core.model import (
     Transcript,
     TranscriptSegment,
     VideoStreamInfo,
+    Word,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import MediaAnalyzer
+from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.subtitle.panel import SubtitlePanel
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.waiting import wait_until
 
 
@@ -57,6 +61,10 @@ class _Speaker:
         self.gate = threading.Event()
         self.gate.set()
         self.order: list[int | None] = []
+        #: 頼まれた語の時刻 順に
+        self.words: list[bool] = []
+        #: 語の時刻の付いた結果を返す
+        self.with_words = False
 
     @property
     def name(self) -> str:
@@ -76,8 +84,10 @@ class _Speaker:
         del progress, should_cancel
         self.gate.wait(5.0)
         self.order.append(options.audio_stream)
+        self.words.append(options.word_timestamps)
         text = f"{path.stem} の音声 {options.audio_stream}"
-        return Transcript((TranscriptSegment(Fraction(1), Fraction(2), text),))
+        words = (Word(Fraction(1), Fraction(2), "語"),) if self.with_words else ()
+        return Transcript((TranscriptSegment(Fraction(1), Fraction(2), text, words),))
 
 
 class _Host:
@@ -132,6 +142,84 @@ def _settle(panel: SubtitlePanel) -> str:
 
     wait_until(lambda: not panel._jobs, "字幕起こし", step=poll, pause=0.02)
     return status[0]
+
+
+class TestWordTimes:
+    """語の時刻（#420）を本人の設定どおりに頼み、字幕の文言を守る"""
+
+    def test_the_preference_reaches_the_request(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        """切っても語の時刻を取ると、設定がある方が質が悪い"""
+        panel, _host, first, second = setup
+        panel.start_transcription(first.id, "tiny", word_timestamps=True)
+        panel.start_transcription(second.id, "tiny", word_timestamps=False)
+        _settle(panel)
+        assert speaker.words == [True, False]
+
+    def test_words_only_asks_for_words_even_when_turned_off(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 語の時刻を足す頼みで語の時刻を取らないと、字幕の語を全部消す
+        panel, _host, first, _second = setup
+        panel.start_transcription(first.id, "tiny", word_timestamps=False, words_only=True)
+        _settle(panel)
+        assert speaker.words == [True]
+
+    def test_words_only_keeps_the_subtitles(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        """壊れると、語の時刻のためだけに人が直した文言が消える"""
+        panel, host, first, _second = setup
+        speaker.with_words = True
+        line = TranscriptSegment(Fraction(1), Fraction(2), "人が直した文")
+        host._apply([SetTranscript(first.id, Transcript((line,)), stream=1)], "字幕")
+        panel.start_transcription(first.id, "tiny", audio_stream=1, words_only=True)
+        _settle(panel)
+        assert _texts(host.project, first, 1) == ["人が直した文"]
+        transcript = host.project.require_media(first.id).transcript_for(1)
+        assert transcript is not None
+        assert [word.text for word in transcript.segments[0].words] == ["語"]
+
+    def test_words_only_without_subtitles_makes_them(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 壊れると、字幕の無い素材に頼んだ起こしの結果を捨てる
+        panel, host, first, _second = setup
+        speaker.with_words = True
+        panel.start_transcription(first.id, "tiny", audio_stream=1, words_only=True)
+        _settle(panel)
+        assert _texts(host.project, first, 1) == ["録画 の音声 1"]
+
+    def test_the_setting_is_on_the_settings_screen(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        """壊れると、起こす時間と語の時刻の釣り合いを本人が選べず、決め打ちの動きになる"""
+        del qt_application
+        assert Preferences().word_timestamps is True
+        chosen = Preferences(word_timestamps=False)
+        dialog = PreferencesDialog(chosen)
+        try:
+            assert dialog.preferences().word_timestamps is False
+        finally:
+            dialog.deleteLater()
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(chosen)
+        assert store.load().word_timestamps is False
+        # 壊れた値で起動を止めない 既定（入り）へ戻す
+        store.path.write_text(json.dumps({"word_timestamps": "壊れた"}), "utf-8")
+        assert store.load().word_timestamps is True
+
+    def test_the_dialog_starts_from_the_setting(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 壊れると、窓から起こす人に設定が効かない
+        _panel, _host, first, _second = setup
+        service = TranscriptionService(speaker)
+        for wanted in (True, False):
+            dialog = TranscribeDialog(first, service, words=wanted)
+            assert dialog._words.isChecked() is wanted
+            dialog.deleteLater()
 
 
 class TestFromTheAssistant:

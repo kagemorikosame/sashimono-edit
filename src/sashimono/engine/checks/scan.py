@@ -29,7 +29,10 @@ __all__ = [
     "PICTURE_KINDS",
     "SILENCE",
     "SOUND_KINDS",
+    "SUBTITLE_WORDS",
     "TEXT_OVERFLOW",
+    "WORD_CUT",
+    "WORD_KINDS",
     "AudioScan",
     "CheckLimits",
     "Run",
@@ -43,12 +46,29 @@ CLIPPING = "clipping"
 LOUDNESS = "loudness"
 TEXT_OVERFLOW = "text_overflow"
 LENGTH = "length"
+#: 言葉の途中で切れた音（#420）
+WORD_CUT = "word_cut"
+#: 字幕の文言のうち、残した音に入っていない語（#420）
+SUBTITLE_WORDS = "subtitle_words"
 #: 調べる種類 並びは返す一覧の説明の順
-KINDS = (BLACK, FREEZE, SILENCE, CLIPPING, LOUDNESS, TEXT_OVERFLOW, LENGTH)
+KINDS = (
+    BLACK,
+    FREEZE,
+    SILENCE,
+    CLIPPING,
+    LOUDNESS,
+    TEXT_OVERFLOW,
+    LENGTH,
+    WORD_CUT,
+    SUBTITLE_WORDS,
+)
 #: 絵を描かないと調べられない種類 頼まれなければ絵を描かずに済み、音だけなら何倍も速い
 PICTURE_KINDS = frozenset({BLACK, FREEZE})
 #: 音を混ぜないと調べられない種類
 SOUND_KINDS = frozenset({SILENCE, CLIPPING, LOUDNESS})
+#: 語の時刻で調べる種類 絵も混ぜた音も要らず、タイムラインの作品からすぐ数えられる
+#: 書き出した動画には語の時刻が無いので、タイムラインだけ
+WORD_KINDS = frozenset({WORD_CUT, SUBTITLE_WORDS})
 
 #: 黒いコマとみなす、暗い画素の割合 FFmpeg の blackdetect の既定（pic_th 0.98）
 #: 1 にすると、隅のロゴや字幕が 1 つ載っただけの黒い画面を見落とす
