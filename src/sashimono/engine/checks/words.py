@@ -22,6 +22,7 @@ from sashimono.core.words import (
     cut_edges,
     heard_between,
     heard_words,
+    in_word_gap,
     phrases,
     unheard_words,
     untimed_sounds,
@@ -150,10 +151,14 @@ def _edge_values(
 
 def _word_cuts(
     project: Project, start: int, end: int, waveform_of: WaveformOf
-) -> tuple[list[Problem], int, set[tuple[MediaId, int]]]:
-    """言葉の途中の切れ目 戻り値は（問題、調べた端の数、語の時刻が無い音）"""
+) -> tuple[list[Problem], int, set[tuple[MediaId, int]], int]:
+    """言葉の途中の切れ目
+
+    戻り値は（問題、調べた端の数、語の時刻が無い音、語の無い所で声が続く端の数）
+    """
     problems: list[Problem] = []
     checked = 0
+    unknown = 0
     missing: set[tuple[MediaId, int]] = set()
     words: dict[tuple[MediaId, int], tuple[Word, ...]] = {}
     for edge in cut_edges(project, start, end):
@@ -169,6 +174,11 @@ def _word_cuts(
         checked += 1
         word = word_at(words[key], edge.seconds)
         if word is None:
+            # 語が行の一部にしか付かない行では、語の外でも話していることがある 語の間の無音は
+            # ふつうにあるので、行を一律に未検査にせず、切った所に声が続く端だけを数える
+            if in_word_gap(media.transcript_for(key[1]), edge.seconds):
+                level = level_at(waveform_of(media, key[1]), edge.seconds)
+                unknown += level is not None and level > QUIET_DB
             continue
         waveform = waveform_of(media, key[1])
         level = level_at(waveform, edge.seconds)
@@ -195,7 +205,7 @@ def _word_cuts(
                 (str(edge.piece.clip_id),),
             )
         )
-    return problems, checked, missing
+    return problems, checked, missing, unknown
 
 
 def _plain(text: str) -> str:
@@ -371,10 +381,10 @@ def check_words(
     problems: list[Problem] = []
     notes: list[str] = []
     skipped: set[str] = set()
-    checked = 0
+    checked = unknown = 0
     missing: set[tuple[MediaId, int]] = set()
     if WORD_CUT in wanted:
-        cuts, checked, missing = _word_cuts(project, start, end, waveform_of)
+        cuts, checked, missing, unknown = _word_cuts(project, start, end, waveform_of)
         problems += cuts
     blind = 0
     if SUBTITLE_WORDS in wanted:
@@ -417,6 +427,14 @@ def check_words(
         notes.append(
             f"字幕の無い音が {len(missing)} 本あり、その切れ目は調べていません"
             f"（調べた切れ目 {checked} か所）"
+        )
+    if unknown and WORD_CUT not in skipped:
+        # 問題 0 件と返すと、語の途中かを読めなかった切れ目まで無事と読む
+        skipped.add(WORD_CUT)
+        notes.append(
+            f"語の付いていない所で声が続く切れ目が {unknown} か所あり、言葉の途中かを確かめて"
+            "いません 字幕の行の一部にしか語の時刻が無い所です transcribe の words_only で足すか、"
+            "その所は人が聞いて確かめてください"
         )
     if blind and SUBTITLE_WORDS not in skipped:
         # 音の無い所の焼き込みも同じ 比べられなかった行を問題 0 件へ混ぜない

@@ -24,6 +24,7 @@ from sashimono.core.words import (
     cut_edges,
     heard_between,
     heard_words,
+    in_word_gap,
     phrases,
     transcript_words,
     unheard_words,
@@ -261,6 +262,27 @@ class TestCutEdges:
         project = placed(video_media, _clip(video_media, 30, 30, Fraction(1)))
         assert [edge.side for edge in cut_edges(project, 0, 40)] == [CUT_IN]
         assert [edge.side for edge in cut_edges(project, 40, 90)] == [CUT_OUT]
+
+
+class TestWordGap:
+    def _line(self) -> Transcript:
+        words = spoken(Fraction(1), "カメラ")
+        return Transcript((TranscriptSegment(Fraction(1), Fraction(4), "カメラと足した文", words),))
+
+    def test_far_from_the_words(self) -> None:
+        # 壊れると、語が行の一部にしか付かない行の語の無い所を、語の途中ではないと読む
+        assert in_word_gap(self._line(), Fraction(3))
+
+    @pytest.mark.parametrize("seconds", [Fraction(17, 10), Fraction(5), Fraction(1, 2)])
+    def test_near_the_words_or_outside_the_line(self, seconds: Fraction) -> None:
+        # 壊れると、語の時刻のずれだけの所や、字幕の無い所まで未検査になる
+        assert not in_word_gap(self._line(), seconds)
+
+    def test_a_line_without_words_is_not_a_gap(self) -> None:
+        # 壊れると、語の無い行を別の案内で二重に数える
+        line = TranscriptSegment(Fraction(1), Fraction(2), "行")
+        assert not in_word_gap(Transcript((line,)), Fraction(3, 2))
+        assert not in_word_gap(None, Fraction(1))
 
 
 class TestUntimedSounds:

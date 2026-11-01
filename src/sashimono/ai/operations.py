@@ -354,6 +354,7 @@ from sashimono.core.words import (
     HeardWord,
     heard_between,
     heard_words,
+    in_word_gap,
     phrases,
     untimed_sounds,
     word_at,
@@ -420,7 +421,7 @@ from sashimono.engine.audio.voicevox import (
 )
 from sashimono.engine.audio.voicevox import SPEED_PERCENT_RANGE as VOICE_SPEED_RANGE
 from sashimono.engine.audio.waveform import Waveform
-from sashimono.engine.audio.word_cuts import cut_points, level_at
+from sashimono.engine.audio.word_cuts import QUIET_DB, cut_points, level_at
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.checks import KIND_NAMES as CHECK_KIND_NAMES
@@ -7209,11 +7210,14 @@ def _word_piece(project: Project, at: int, wanted: str) -> HeardPiece | None:
         if media is not None and media.transcript_for(piece.stream) is not None:
             with_lines.append(piece)
     chosen = with_lines or found
-    if wanted and len({(piece.media_id, piece.stream) for piece in chosen}) > 1:
-        inner = sorted(str(piece.inner_clip_id) for piece in chosen)
+    # 同じ素材の同じ音でも、素材の別の時刻を重ねれば別の語が鳴る 素材では見分けずに数で見る
+    # 中のクリップ自身を指した頼みは、同じシーンを重ねて置いたときだけ 2 本残る それ以上絞る ID は
+    # 無いので断らない 断ると同じ ID を案内し続ける どの音かは答えの clip_id に載る
+    narrower = sorted({str(p.inner_clip_id) for p in chosen if p.inner_clip_id} - {wanted})
+    if wanted and len(chosen) > 1 and narrower:
         raise ToolError(
-            f"クリップ {wanted} のフレーム {at} では音が重なっています"
-            f" scene_clip_id のどれかを clip_id に渡してください: {', '.join(inner)}"
+            f"クリップ {wanted} のフレーム {at} では音が重なっています scene_clip_id のどれかを"
+            f" clip_id に渡してください: {', '.join(narrower[:_SKIPPED_SHOWN])}"
         )
     return chosen[0] if chosen else None
 
@@ -7253,11 +7257,17 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
         )
     timed = phrases(transcript)
     lines = tuple(Word(s.start, s.end, s.text) for s in wordless_lines(transcript))
-    # 語の時刻の無い行の中では語の途中かを言えない 語の無い所を「途中ではない」と答えない
-    has_words = bool(timed) and not any(w.start <= seconds < w.end for w in lines)
+    waveform = host.waveform(media, stream)
+    level = level_at(waveform, seconds)
+    # 語の時刻の無い行の中と、語の付いた行の語の無い所で声が続く所は、語の途中かを言えない
+    # 語の無い所を「途中ではない」と答えない
+    has_words = (
+        bool(timed)
+        and not any(w.start <= seconds < w.end for w in lines)
+        and not (level is not None and level > QUIET_DB and in_word_gap(transcript, seconds))
+    )
     # 語の時刻が無い行も、行の切れ目と波形で切り所は読める 断ると起こし直しの間 AI が手探りで切る
     words = tuple(sorted((*timed, *lines), key=lambda w: (w.start, w.end)))
-    waveform = host.waveform(media, stream)
     inside = word_at(timed, seconds) if has_words else None
     rows = []
     for point in cut_points(words, waveform, seconds, Fraction(round(window * 100), 100)):
@@ -7277,7 +7287,6 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
             row["in_frame"] = math.floor(piece.frame_at(point.in_seconds, project.rate))
             row["out_frame"] = math.ceil(piece.frame_at(point.out_seconds, project.rate))
         rows.append(row)
-    level = level_at(waveform, seconds)
     result: dict[str, object] = {
         "media_id": str(media.id),
         "audio": _audio_number(media, stream),
@@ -7303,7 +7312,7 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
     ]
     if not has_words:
         notes.append(
-            "語の時刻が無いので、字幕の行の切れ目で見ました 行の中の語の境目は分かりません"
+            "ここには語の時刻が無いので、字幕の行の切れ目で見ました 語の途中かは分かりません"
             " transcribe の words_only で今の字幕に語の時刻を足せます"
         )
     if waveform is None:
@@ -7344,31 +7353,37 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
             | ({"scene_clip_id": str(inner)} if inner is not None else {})
         )
     silent = untimed_sounds(project, start, end)
-    result = _paged(rows, arguments, name="heard")
-    if silent:
+    if not silent:
+        return _paged(rows, arguments, name="heard")
+
+    def order(key: tuple[MediaId, int]) -> tuple[bool, str, int]:
+        media = project.find_media(key[0])
+        lined = media is not None and media.transcript_for(key[1]) is not None
+        return (not lined, str(key[0]), _audio_number(media, key[1]))
+
+    # 効果音を並べた作品は字幕の無い音が何百本にもなる 全部返すと返事の上限を越えて、道具の失敗に
+    # 置き換わる 足せる音（字幕のある音）を先に並べて切り、数は別に返す
+    listed = sorted(silent, key=order)
+    head: dict[str, Any] = {
         # 音声ごとに返す audio を省いて足すと、語の時刻のある 1 本目を起こし直すことになる
-        result["no_words"] = sorted(
-            (
-                {
-                    "media_id": str(media_id),
-                    "audio": _audio_number(project.find_media(media_id), stream),
-                }
-                for media_id, stream in silent
-            ),
-            key=lambda row: (str(row["media_id"]), int(str(row["audio"]))),
-        )
-        result["note"] = " ".join(
-            filter(
-                None,
-                (
-                    result.get("note"),
-                    "no_words の音声には語の時刻が無く、鳴る語を読めません"
-                    " transcribe の words_only に同じ audio を渡すと足せます"
-                    "（字幕の無い音は起こします）",
-                ),
-            )
-        )
-    return result
+        "no_words": [
+            {
+                "media_id": str(media_id),
+                "audio": _audio_number(project.find_media(media_id), stream),
+            }
+            for media_id, stream in listed[:_SKIPPED_SHOWN]
+        ],
+        "no_words_total": len(listed),
+    }
+    return _paged_after(
+        head,
+        rows,
+        arguments,
+        "heard",
+        "no_words の音声には語の時刻が無く、鳴る語を読めません"
+        " transcribe の words_only に同じ audio を渡すと足せます（字幕の無い音は起こします）"
+        " 字幕のある音から順に並べ、no_words_total が全部の数です",
+    )
 
 
 def _subtitle_transcript(

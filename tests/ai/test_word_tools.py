@@ -9,9 +9,10 @@ from typing import Any
 import pytest
 
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import OPERATIONS
+from sashimono.ai.operations import MAX_RESULT_CHARS, OPERATIONS
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
+from sashimono.core.io.serialize import json_text
 from sashimono.core.model import (
     Clip,
     MediaItem,
@@ -19,13 +20,14 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
     TranscriptSegment,
+    new_clip_id,
     new_media_id,
 )
 from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import BLACK, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS, Run
 from tests.ai.conftest import FakeHost
-from tests.words_helpers import in_scene, placed, sample_transcript, wave
+from tests.words_helpers import in_scene, placed, sample_transcript, spoken, wave
 
 
 def _tool(name: str) -> Any:
@@ -90,6 +92,29 @@ class TestOverlappingSounds:
             _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
         result = _call(host, "word_boundaries", frame=12, clip_id=str(second.id))
         assert result["media_id"] == str(other.id)
+
+    def test_the_same_sound_at_two_times_asks_which(self, media: MediaItem) -> None:
+        # 壊れると、同じ素材の別の時刻を重ねた所で片方を黙って選び、別の語の境目で切る
+        first = _clip(media, 0, 60, Fraction(1))
+        second = _clip(media, 0, 60, Fraction(4))
+        host, window = self._scene((media, first), (media, second))
+        with pytest.raises(ToolError, match="scene_clip_id"):
+            _call(host, "word_boundaries", frame=12, clip_id=str(window.id))
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(second.id))
+        assert result["scene_clip_id"] == str(second.id)
+
+    def test_the_same_scene_placed_twice_is_not_a_dead_end(self, media: MediaItem) -> None:
+        # 壊れると、これ以上絞れない ID を案内し続け、AI が同じ呼び方を繰り返す
+        inner = _clip(media, 0, 60, Fraction(1))
+        host, window = self._scene((media, inner))
+        project = host.project
+        track = project.timeline.tracks[0]
+        again = Track(TrackKind.VIDEO, name="V2", clips=(replace(window, id=new_clip_id()),))
+        changed = project.with_timeline(replace(project.timeline, tracks=(track, again)))
+        host = FakeHost(changed)
+        host.stub_waveform = wave()
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(inner.id))
+        assert result["scene_clip_id"] == str(inner.id)
 
     def test_heard_words_names_the_inner_clip(self, media: MediaItem) -> None:
         # 壊れると、語を読んだ音を word_boundaries で指す ID が分からない
@@ -204,7 +229,53 @@ class TestWordBoundaries:
         assert Outbound.TEXT in _tool("heard_words").sends
 
 
+def test_a_voiced_gap_in_a_line_is_not_called_clean(video_media: MediaItem) -> None:
+    # 壊れると、語が行の一部にしか付かない行の語の無い所を「語の途中ではない」と答える
+    words = spoken(Fraction(1), "カメラ")
+    line = TranscriptSegment(Fraction(1), Fraction(4), "カメラと足した文", words)
+    media = video_media.with_transcript(Transcript((line,), language="ja"))
+    host = _host(media, _clip(media, 0, 90, Fraction(1)))
+    host.stub_waveform = wave(((0.0, 1.0), (4.0, 12.0)))
+    result = _call(host, "word_boundaries", frame=60)
+    assert result["has_words"] is False
+    assert result["inside_word"] is None
+
+
 class TestHeardWords:
+    def test_many_sounds_without_words_stay_in_the_budget(self, video_media: MediaItem) -> None:
+        """効果音を並べた作品の形
+
+        壊れると、一覧が返事の上限を越えて道具の失敗に置き換わり、語も読めない
+        """
+        spoken_media = video_media.with_transcript(sample_transcript())
+        sounds = [replace(video_media, id=new_media_id()) for _ in range(400)]
+        project = replace(placed(spoken_media), media=(*sounds, spoken_media))
+        clips = (
+            *(_clip(item, n * 2, 2, Fraction(0)) for n, item in enumerate(sounds)),
+            _clip(spoken_media, 800, 30, Fraction(1)),
+        )
+        track = Track(TrackKind.AUDIO, name="A1", clips=clips)
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(track,))))
+        result = _call(host, "heard_words")
+        assert len(json_text(result)) <= MAX_RESULT_CHARS
+        assert result["no_words_total"] == 400
+        assert len(result["no_words"]) < 400
+
+    def test_a_sound_that_can_be_fixed_comes_first(
+        self, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 壊れると、切った一覧に足せる音が入らず、効果音の名前だけが返る
+        lined = replace(video_media.with_transcript(transcript), id=new_media_id())
+        sounds = [replace(video_media, id=new_media_id()) for _ in range(30)]
+        project = replace(placed(lined), media=(*sounds, lined))
+        clips = (
+            *(_clip(item, n * 2, 2, Fraction(0)) for n, item in enumerate(sounds)),
+            _clip(lined, 100, 30, Fraction(1)),
+        )
+        track = Track(TrackKind.AUDIO, name="A1", clips=clips)
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=(track,))))
+        assert _call(host, "heard_words")["no_words"][0]["media_id"] == str(lined.id)
+
     def test_a_scene_keeps_each_material_apart(
         self, video_media: MediaItem, media: MediaItem
     ) -> None:

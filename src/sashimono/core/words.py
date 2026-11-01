@@ -34,6 +34,7 @@ __all__ = [
     "cut_edges",
     "heard_between",
     "heard_words",
+    "in_word_gap",
     "phrases",
     "transcript_words",
     "unheard_words",
@@ -58,6 +59,9 @@ _PREFIXES = frozenset("おご御")
 _SENTENCE_ENDS = ("です", "ます", "ました", "ません", "でした", "ください")
 #: 文の終わりの形の後に付く助詞 ここでは区切らない（「ですか」「ますね」「ですが」）
 _ENDING_PARTICLES = "かねよなわぞが"
+#: 語の無い所と読む、語からの距離（秒） 語の時刻のずれ（9 割が 0.09 秒以内）の 3 倍ほど
+#: 短いと語の時刻のずれだけの所を語の無い所と読み、語の末尾の声を未検査にする
+_GAP_REACH = Fraction(3, 10)
 #: 等速の音のつなぎ目で、素材の時刻の端数と読む差（秒） 取り込みの時刻の刻み（ミリ秒）
 _SOURCE_ROUNDING = Fraction(1, 1000)
 _HIRAGANA, _KATAKANA, _KANJI, _LATIN, _MARK = range(5)
@@ -318,6 +322,24 @@ def wordless_lines(transcript: Transcript | None) -> tuple[TranscriptSegment, ..
     if transcript is None:
         return ()
     return tuple(segment for segment in transcript.segments if not segment.words)
+
+
+def in_word_gap(transcript: Transcript | None, seconds: Fraction) -> bool:
+    """語の付いた字幕の行の、語の無い所か 語から :data:`_GAP_REACH` より離れた所だけ
+
+    字幕を伸ばした行や文言を足した行は、語が行の一部にしか付かない ここで話していると、語の途中
+    かを語の時刻から言えない 話しているかは語の時刻から分からないので、波形と合わせて読む
+    """
+    if transcript is None:
+        return False
+    segments = transcript.segments
+    index = bisect.bisect_right(segments, seconds, key=lambda segment: segment.start) - 1
+    if index < 0:
+        return False
+    line = segments[index]
+    if not line.words or seconds >= line.end:
+        return False
+    return not any(word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in line.words)
 
 
 def untimed_sounds(project: Project, start: int, end: int) -> set[tuple[MediaId, int]]:

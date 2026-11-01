@@ -235,6 +235,27 @@ def test_a_cut_on_a_line_without_words_is_not_counted_as_checked(video_media: Me
     assert report.skipped == WORD_KINDS
 
 
+class TestPartlyWordedLine:
+    """語が行の一部にしか付かない行 語の無い所が話か無音かは波形で分ける"""
+
+    def _project(self, video_media: MediaItem) -> Project:
+        words = spoken(Fraction(1), "カメラ")
+        line = TranscriptSegment(Fraction(1), Fraction(4), "カメラと足した文", words)
+        media = video_media.with_transcript(Transcript((line,), language="ja"))
+        return placed(media, _clip(media, 0, 60, Fraction(1)))
+
+    def test_a_voiced_cut_is_not_counted_as_checked(self, video_media: MediaItem) -> None:
+        # 壊れると、語の無い所で声の途中を切っても word_cut が問題 0 件の調査済みになる
+        report = _check(self._project(video_media), wave(((0.0, 1.0), (4.0, 12.0))))
+        assert WORD_CUT in report.skipped
+        assert "words_only" in " ".join(report.notes)
+
+    def test_a_quiet_cut_stays_checked(self, video_media: MediaItem) -> None:
+        # 壊れると、語の間の無音を切っただけで未検査になり、ほとんどの作品が調べられない
+        report = _check(self._project(video_media), wave(((0.0, 1.0), (2.0, 12.0))))
+        assert WORD_CUT not in report.skipped
+
+
 def test_the_suggestion_keeps_the_word(video_media: MediaItem) -> None:
     """語の前半で出を切り、語の頭の近くに谷がある形
 
