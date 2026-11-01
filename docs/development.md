@@ -4113,8 +4113,16 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
   どのモジュールの物か分からない Qt のファイルがあれば止まる
 - 落とすと `dist\sources` にアーカイブと `sources-SHA256SUMS.txt` `sources-manifest.json`
   （取得元・版・sha256）ができる 上流が sha256 を公開している物は照合し、合わなければ止まる
-- 版は `tools/collect_sources.py` に手で書いてある 入っている PyAV（の FFmpeg）と PySide6 の
-  版と食い違うと落とす前に止まる 上げたら一覧と `THIRD_PARTY_NOTICES.md` を一緒に直す
+- 版は `tools/collect_sources.py` に手で書いてある 組み立てたフォルダから実際に積んだ版を読み、
+  食い違うと落とす前に止まる 上げたら一覧と `THIRD_PARTY_NOTICES.md` を一緒に直す
+  道具を動かす Python 環境の版は見ない 開発用の `.venv` と配る zip の部品は版が違うことがある
+  （0.2.3 では `.venv` が PySide6 6.12.0・FFmpeg 9.0.2、zip が 6.11.2・8.1.2 で、正しい zip を止めた）
+  - FFmpeg は `_internal\av.libs` の FFmpeg 本体の DLL すべての版情報の `ProductVersion`
+    （`FileVersion` は avcodec などの版で FFmpeg の版ではない）
+  - Qt は `_internal\PySide6\Qt6Core.dll` の版情報の `FileVersion`
+  - PySide6 は DLL に版情報が無いので、同じ版で作られる `_internal\shiboken6\Shiboken.pyd` の
+    `__version_info__` の隣の版
+  - 読めないときも止まる 部品の組み立て方が変わって読めなくなったら、読み方を直す
 - x264 の本家（code.videolan.org）は道具からの取得をボット避けの画面で断るので、同じ
   コミットを持つ GitHub の写しから落とす
 

@@ -292,11 +292,8 @@ class TestOnlyWhatIsBundled:
         _, unknown = tool.bundled_qt_modules(pyside)
         assert unknown == ["Qt6Multimedia.dll"]
 
-    def test_it_needs_a_built_bundle(
-        self, tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_it_needs_a_built_bundle(self, tool: ModuleType, tmp_path: Path) -> None:
         # 組み立てる前に走らせると、何を添付すればよいか決められない
-        monkeypatch.setattr(tool, "installed_mismatches", list)
         assert tool.main(["--check"], dist=tmp_path) == 1
 
     def test_every_module_has_a_source(self, tool: ModuleType) -> None:
@@ -339,11 +336,11 @@ class TestTheList:
             assert source.name.split()[0] in notices, source.name
 
     def test_a_version_mismatch_stops_the_tool(
-        self, tool: ModuleType, monkeypatch: pytest.MonkeyPatch
+        self, tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 版が食い違ったまま先へ進むと、
         # --check が zip に積んだのと別の版の入手先を確かめて [ok] を出す
-        monkeypatch.setattr(tool, "installed_mismatches", lambda: ["積んでいる FFmpeg は 9.0"])
+        _bundle(tool, tmp_path, ffmpeg="9.0.2")
         called: list[object] = []
 
         def check(sources: object) -> list[str]:
@@ -351,5 +348,123 @@ class TestTheList:
             return []
 
         monkeypatch.setattr(tool, "check_urls", check)
-        assert tool.main(["--check"]) == 1
+        assert tool.main(["--check"], dist=tmp_path) == 1
         assert called == [], "版が食い違っているのに先へ進んだ"
+
+
+def _version_block(**fields: str) -> bytes:
+    """DLL の版情報の資源と同じ並びの塊 名前の後の詰め物と、前後の別のデータも付ける"""
+    body = "VS_VERSION_INFO\0\0".encode("utf-16-le") + b"\xbd\x04\xef\xfe" + b"\0" * 48
+    for name, value in fields.items():
+        # 実物は 4 バイト境界にそろえるので、名前の長さによって NUL が 1 つ増える
+        padding = "\0" if len(name) % 2 else ""
+        body += f"{name}\0{padding}{value}\0".encode("utf-16-le")
+    header = (len(body) + 6).to_bytes(2, "little") + b"\x34\x00\x00\x00"
+    # 塊の外の同じ名前は、版情報を読むコードが持つ文字列に当たる これを読んではいけない
+    outside = "ProductVersion\x000.0.0\0".encode("utf-16-le")
+    return outside + header + body + outside
+
+
+def _bundle(
+    tool: ModuleType,
+    dist: Path,
+    *,
+    ffmpeg: str | None = None,
+    qt: str | None = None,
+    pyside: str | None = None,
+) -> Path:
+    """組み立てたフォルダと同じ形を作る 版を省くと一覧と同じ版で揃う"""
+    internal: Path = dist / tool.BUNDLE_NAME / "_internal"
+    for folder in ("av.libs", "PySide6", "shiboken6"):
+        (internal / folder).mkdir(parents=True)
+    for name in ("avcodec-62-aa.dll", "avutil-60-bb.dll"):
+        (internal / "av.libs" / name).write_bytes(
+            _version_block(
+                FileVersion="62.28.102",
+                ProductVersion=ffmpeg if ffmpeg is not None else tool.FFMPEG_VERSION,
+            )
+        )
+    # 別の部品の DLL は FFmpeg の版を持たない これを読むと、正しい物まで止まる
+    (internal / "av.libs" / "libx265-cc.dll").write_bytes(b"no version")
+    (internal / "PySide6" / "Qt6Core.dll").write_bytes(
+        _version_block(FileVersion=qt if qt is not None else f"{tool.QT_VERSION}.0")
+    )
+    shiboken = pyside if pyside is not None else tool.QT_VERSION
+    (internal / "shiboken6" / "Shiboken.pyd").write_bytes(
+        b"__version_info__\0\0\0" + shiboken.encode("ascii") + b"\0\0__version__"
+    )
+    return internal
+
+
+class TestBundledVersions:
+    """版は配る物から読む 道具を動かす環境の版は、配る物の版とは限らない"""
+
+    def test_a_matching_bundle_passes(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 壊れると、正しい zip でもリリースの段 5 が止まる
+        assert tool.bundled_mismatches(_bundle(tool, tmp_path)) == []
+
+    def test_the_tool_does_not_look_at_its_own_environment(self) -> None:
+        """0.2.3 の段 5 で止まった形 開発用の環境の版が違っても、配る物が合っていれば通す
+
+        道具を動かす環境の av や PySide6 を読むと、結果が .venv の版で変わる
+        """
+        source = (ROOT / "tools" / "collect_sources.py").read_text(encoding="utf-8")
+        assert "import av" not in source
+        assert "import PySide6" not in source
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ({"ffmpeg": "9.0.2"}, "積んでいる FFmpeg は 9.0.2"),
+            ({"qt": "6.12.0.0"}, "積んでいる Qt は 6.12.0.0"),
+            ({"pyside": "6.12.0"}, "積んでいる PySide6 は 6.12.0"),
+        ],
+    )
+    def test_a_different_part_is_named(
+        self, tool: ModuleType, tmp_path: Path, version: dict[str, str], expected: str
+    ) -> None:
+        # 壊れると、どの部品の版を直せばよいか分からない
+        problems = tool.bundled_mismatches(_bundle(tool, tmp_path, **version))
+        assert problems
+        assert all(expected in problem for problem in problems)
+
+    def test_one_stale_dll_is_enough(self, tool: ModuleType, tmp_path: Path) -> None:
+        # 1 つだけ見ると、古い DLL が混ざった組み立ての分のソースを添付し損ねる
+        internal = _bundle(tool, tmp_path)
+        (internal / "av.libs" / "avutil-60-bb.dll").write_bytes(
+            _version_block(ProductVersion="8.0")
+        )
+        problems = tool.bundled_mismatches(internal)
+        assert len(problems) == 1
+        assert "avutil-60-bb.dll" in problems[0]
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["av.libs/avutil-60-bb.dll", "PySide6/Qt6Core.dll", "shiboken6/Shiboken.pyd"],
+    )
+    def test_an_unreadable_version_stops_it(
+        self, tool: ModuleType, tmp_path: Path, missing: str
+    ) -> None:
+        """読めない版は通さない 確かめないまま別の版のソースを添付することになる"""
+        internal = _bundle(tool, tmp_path)
+        (internal / missing).write_bytes(b"built differently")
+        problems = tool.bundled_mismatches(internal)
+        assert len(problems) == 1
+        assert "確かめられない" in problems[0]
+
+    def test_missing_ffmpeg_dlls_stop_it(self, tool: ModuleType, tmp_path: Path) -> None:
+        # DLL の名前の決まりが変わると 1 つも見つからない 見る物が無いだけで通してはいけない
+        internal = _bundle(tool, tmp_path)
+        for path in (internal / "av.libs").glob("av*.dll"):
+            path.unlink()
+        assert any("確かめられない" in problem for problem in tool.bundled_mismatches(internal))
+
+    def test_the_field_is_read_inside_the_version_block(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        # 塊の外の同じ文字列を読むと、関係の無い値で判定する
+        path = tmp_path / "a.dll"
+        path.write_bytes(_version_block(ProductVersion="8.1.2"))
+        assert tool.dll_version_field(path, "ProductVersion") == "8.1.2"
+        path.write_bytes(_version_block(FileVersion="1.0"))
+        assert tool.dll_version_field(path, "ProductVersion") is None
