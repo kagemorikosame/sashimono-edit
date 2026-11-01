@@ -65,7 +65,7 @@ jobs:
           # 古いまま組んでいないかは build_package.py が下限（MINIMUM_PYTHON）で止める
           check-latest: true
 
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: false
 
