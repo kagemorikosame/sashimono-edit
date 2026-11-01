@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 from typing import Any
 
@@ -11,10 +12,10 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import OPERATIONS
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.model import Clip, MediaItem, Transcript
+from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript, new_media_id
 from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.report import assemble
-from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
+from sashimono.engine.checks.scan import BLACK, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS, Run
 from tests.ai.conftest import FakeHost
 from tests.words_helpers import in_scene, placed, sample_transcript, wave
 
@@ -135,6 +136,22 @@ class TestWordBoundaries:
 
 
 class TestHeardWords:
+    def test_a_scene_keeps_each_material_apart(
+        self, video_media: MediaItem, media: MediaItem
+    ) -> None:
+        # 壊れると、シーンの中で素材が替わっても 1 行に混ざり、別の素材の語が最初の素材の語になる
+        other = replace(video_media, id=new_media_id()).with_transcript(sample_transcript())
+        inner = replace(placed(media), media=(media, other))
+        track = Track(
+            TrackKind.AUDIO,
+            name="A1",
+            clips=(_clip(media, 0, 24, Fraction(1)), _clip(other, 24, 12, Fraction(4))),
+        )
+        inner = inner.with_timeline(replace(inner.timeline, tracks=(track,)))
+        host = FakeHost(in_scene(inner, Clip(0, 36, source_in=Fraction(0))))
+        result = _call(host, "heard_words")
+        assert [row["media_id"] for row in result["heard"]] == [str(media.id), str(other.id)]
+
     def test_each_clip_reads_its_own_words(self, media: MediaItem) -> None:
         # 壊れると、どのクリップの語か分からず、直す相手を選べない
         first = _clip(media, 0, 24, Fraction(1))
@@ -156,7 +173,7 @@ class TestHeardWords:
         host = _host(media, _clip(media, 0, 60, Fraction(0)))
         result = _call(host, "heard_words")
         assert result["heard"] == []
-        assert result["no_words"] == [str(media.id)]
+        assert result["no_words"] == [{"media_id": str(media.id), "audio": 1}]
         assert "words_only" in result["note"]
 
     def test_a_bad_range(self, media: MediaItem) -> None:
@@ -214,11 +231,11 @@ class TestTranscribe:
 
 
 class TestCheckOutput:
-    def _done(self, host: FakeHost) -> None:
+    def _done(self, host: FakeHost, runs: tuple[Run, ...] = ()) -> None:
         """最後の頼みを調べ終えた様子にする"""
         request = host.check_requests[-1]
         report = assemble(
-            [],
+            list(runs),
             start=request.start,
             end=request.end,
             analyzed=request.end,
@@ -237,6 +254,49 @@ class TestCheckOutput:
         _tool("check_output")(host, arguments)
         self._done(host)
         return _call(host, "check_output", **arguments)
+
+    def test_word_problems_sort_with_the_rest(self, media: MediaItem) -> None:
+        # 壊れると、語の問題だけ一覧の後ろに固まり、時刻の順に読めない
+        host = _host(media, _clip(media, 0, 12, Fraction(1)), _clip(media, 40, 20, Fraction(8)))
+        arguments = {"checks": ["black", WORD_CUT], "wait_seconds": 0}
+        _tool("check_output")(host, arguments)
+        self._done(host, (Run(BLACK, 3, 5, {}), Run(BLACK, 20, 30, {})))
+        result = _call(host, "check_output", **arguments)
+        assert [row["kind"] for row in result["problems"]] == ["black", WORD_CUT, "black"]
+
+    def test_the_clip_picks_the_voice(self, video_media: MediaItem, media: MediaItem) -> None:
+        # 壊れると、BGM が先に並ぶ所で声の語の境目を読めず、字幕が無いと断られる
+        music = replace(video_media, id=new_media_id())
+        voice = _clip(media, 0, 60, Fraction(1))
+        project = placed(music, _clip(music, 0, 60, Fraction(0)))
+        track = Track(kind=TrackKind.AUDIO, name="A2", clips=(voice,))
+        project = replace(project, media=(music, media))
+        project = project.with_timeline(
+            replace(project.timeline, tracks=(*project.timeline.tracks, track))
+        )
+        host = FakeHost(project)
+        host.stub_waveform = wave()
+        with pytest.raises(ToolError, match="字幕がありません"):
+            _call(host, "word_boundaries", frame=12)
+        result = _call(host, "word_boundaries", frame=12, clip_id=str(voice.id))
+        assert result["word"]["text"] == "カメラを"
+        with pytest.raises(ToolError, match="クリップ"):
+            _call(host, "word_boundaries", frame=12, clip_id="無いクリップ")
+
+    def test_the_suggested_move_leaves_the_word(self, media: MediaItem) -> None:
+        """通しの確かめの形 語の終わりの近くの入りで、動かす先が今の切れ目と同じ値で返った
+
+        壊れると、手掛かりにならない量を返し、AI が自分で量を決めることになる
+        """
+        clip = _clip(media, 0, 60, Fraction(17, 10))
+        host = _host(media, clip)
+        host.stub_waveform = wave(((0.0, 1.0), (1.72, 1.76), (2.6, 12.0)))
+        (cut,) = self._finished(host, checks=[WORD_CUT])["problems"]
+        assert cut["suggested_source_seconds"] == 1.8
+        assert cut["suggested_kind"] == "word_edge"
+        assert cut["suggested_head_delta"] == 3
+        _call(host, "trim_clip", clip_id=str(clip.id), head_delta=cut["suggested_head_delta"])
+        assert self._finished(host, checks=[WORD_CUT])["problems"] == []
 
     def test_a_cut_inside_a_word_is_returned(self, media: MediaItem) -> None:
         # 壊れると、言葉の途中の切れ目を AI が直せない

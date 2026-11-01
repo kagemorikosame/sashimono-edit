@@ -54,8 +54,8 @@ _PHRASE_GAP = Fraction(12, 100)
 _PREFIXES = frozenset("おご御")
 #: 文の終わりの形 ひらがなが続くと字の種類では区切れない所
 _SENTENCE_ENDS = ("です", "ます", "ました", "ません", "でした", "ください")
-#: 文の終わりの形の後に付く助詞 ここでは区切らない（「ですか」「ますね」）
-_ENDING_PARTICLES = frozenset("かねよなわぞ")
+#: 文の終わりの形の後に付く助詞 ここでは区切らない（「ですか」「ますね」「ですが」）
+_ENDING_PARTICLES = "かねよなわぞが"
 _HIRAGANA, _KATAKANA, _KANJI, _LATIN, _MARK = range(5)
 
 
@@ -99,7 +99,11 @@ def _breaks(so_far: str, word: Word, following: Word, later: Word | None) -> boo
         and _letter_kind(later.text[0]) == _KANJI
     ):
         return True
-    if so_far.endswith(_SENTENCE_ENDS) and following.text[0] not in _ENDING_PARTICLES:
+    # 助詞の後ろも文の切れ目 「ですか|はい」を束ねると、その間で切った所まで語の途中と読む
+    if (
+        so_far.rstrip(_ENDING_PARTICLES).endswith(_SENTENCE_ENDS)
+        and following.text[0] not in _ENDING_PARTICLES
+    ):
         return True
     # ひらがなの後に漢字・カタカナ・英数が来る所が文節の頭になることが多い 送り仮名と助詞は
     # 前の語の後ろに付くので、逆の向きでは区切らない
@@ -161,6 +165,9 @@ def attach_words(transcript: Transcript, recognized: Transcript) -> Transcript:
     語は重なりが一番長い字幕の行へ入れる どの行にも重ならない語は捨てる 行を消した所の語を
     残すと、消した言葉が字幕の語として返る
     """
+    # 認識が語を 1 つも返さないときは写さない 全部の行の語を空にすると、持っていた語の時刻が消える
+    if not transcript_words(recognized):
+        return transcript
     groups: list[list[Word]] = [[] for _ in transcript.segments]
     starts = [segment.start for segment in transcript.segments]
     for word in transcript_words(recognized):
@@ -250,12 +257,10 @@ def _index(pieces: Iterable[HeardPiece], edge: Callable[[HeardPiece], Fraction])
 
 
 def _neighbours(index: _Index, piece: HeardPiece, frame: Fraction) -> Iterator[HeardPiece]:
-    """``frame`` の前後 1 コマに端がある、同じ素材の同じ音の並び 丸めの分の 1 コマは許す"""
-    middle = round(frame)
-    for number in (middle - 1, middle, middle + 1):
-        for other in index.get((piece.media_id, piece.stream, number), ()):
-            if other is not piece:
-                yield other
+    """``frame`` に端がある、同じ素材の同じ音の並び"""
+    for other in index.get((piece.media_id, piece.stream, round(frame)), ()):
+        if other is not piece:
+            yield other
 
 
 def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
@@ -274,16 +279,15 @@ def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
         media = project.find_media(piece.media_id)
         if media is None:
             continue
-        # 許す差は 1 コマ分の素材の時刻 速度を掛けた音は 1 コマで素材がそれだけ進む
+        # 素材の時刻の差は 1 コマ分許す 速度を掛けた音は 1 コマで素材がそれだけ進む タイムラインの
+        # 端はちょうど合う物だけ 1 コマ空いた所は無音が出るので、つながっていない
         allowed = max(frame_seconds * piece.speed, frame_seconds)
         continued_from = any(
-            abs(other.end - piece.start) <= 1
-            and abs(other.source_end - piece.source_start) <= allowed
+            other.end == piece.start and abs(other.source_end - piece.source_start) <= allowed
             for other in _neighbours(tails, piece, piece.start)
         )
         continues = any(
-            abs(other.start - piece.end) <= 1
-            and abs(other.source_start - piece.source_end) <= allowed
+            other.start == piece.end and abs(other.source_start - piece.source_end) <= allowed
             for other in _neighbours(heads, piece, piece.end)
         )
         ends_media = media.duration > 0 and piece.source_end >= media.duration - frame_seconds

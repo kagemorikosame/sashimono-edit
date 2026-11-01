@@ -111,7 +111,7 @@ class TestLevelAt:
         sound = wave(((0.0, 12.0),))
         level = level_at(sound, Fraction(1))
         assert level is not None
-        assert level <= 0
+        assert level <= QUIET_DB
 
     def test_past_the_end(self) -> None:
         # 壊れると、素材の終わりより後を見た所で検査が落ちる

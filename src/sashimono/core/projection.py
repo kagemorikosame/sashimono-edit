@@ -244,7 +244,16 @@ def heard_pieces(project: Project) -> list[HeardPiece]:
     seen: set[tuple[object, ...]] = set()
     unique: list[HeardPiece] = []
     for piece in sorted(pieces, key=lambda p: (p.start, p.end)):
-        key = (piece.media_id, piece.stream, piece.source_start, piece.start, piece.end)
+        # 速度が違えば別の音 頭と長さが同じでも、片方を落とすとその語と切れ目が消える
+        key = (
+            piece.media_id,
+            piece.stream,
+            piece.source_start,
+            piece.source_end,
+            piece.start,
+            piece.end,
+            piece.speed,
+        )
         if key not in seen:
             seen.add(key)
             unique.append(piece)

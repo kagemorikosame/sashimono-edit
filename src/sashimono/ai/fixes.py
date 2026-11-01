@@ -82,6 +82,8 @@ _SOURCE = "source"
 #: 音量が足りないのに、音の山が天井に当たっている物（同じだけ上げる道具ではもう上がらない）を
 #: 分ける印
 _AT_CEILING = "at_ceiling"
+#: 言葉の途中の切れ目のうち、シーンの中のクリップの間にある物を分ける印
+_INSIDE_SCENE = "inside_scene"
 #: 山がこれより天井に近ければ天井に当たっていると読む（dB） 測りと丸めの差
 _CEILING_SLACK_DB = 0.05
 
@@ -188,11 +190,24 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         "言葉の途中で切れている suggested の head_delta か tail_delta を trim_clip へ渡して語の"
         "境目へ動かす suggested が無ければ word_boundaries で切ってよい位置を読む",
     ),
+    # 波形が無いと語の時刻だけで動かすことになり、動かした後の検査も音を見ない（#420）
     (WORD_CUT, MEDIUM, None): Fix(
-        AUTO,
+        ASK,
         ("trim_clip",),
         "語の時刻の上では途中だが、波形の解析がまだで音を確かめていない word_boundaries で切って"
-        "よい位置を読み、trim_clip で動かす",
+        "よい位置を読み、動かすかを人に尋ねてから trim_clip で動かす",
+    ),
+    # シーンの中の切れ目は、置いたクリップの端を動かしても残り、窓の端の絵と音だけが変わる
+    (WORD_CUT, HIGH, _INSIDE_SCENE): Fix(
+        HANDOFF,
+        (),
+        "シーンの中のクリップの切れ目で、シーンを置いたクリップの端を動かしても直らない"
+        " set_active_scene でシーンを開いて scene_clip_id のクリップを直すかを人に伝える",
+    ),
+    (WORD_CUT, MEDIUM, _INSIDE_SCENE): Fix(
+        HANDOFF,
+        (),
+        "シーンの中のクリップの切れ目で、波形の解析もまだ シーンを開いて直すかを人に伝える",
     ),
     (SUBTITLE_WORDS, MEDIUM, None): Fix(
         ASK,
@@ -240,6 +255,8 @@ def _at_ceiling(measure: Mapping[str, object], peak_db: float | None) -> bool:
 
 
 def _variant(kind: str, measure: Mapping[str, object], peak_db: float | None) -> str | None:
+    if kind == WORD_CUT:
+        return _INSIDE_SCENE if measure.get("inside_scene") else None
     if kind == LOUDNESS:
         return _AT_CEILING if _at_ceiling(measure, peak_db) else None
     if kind != CLIPPING:

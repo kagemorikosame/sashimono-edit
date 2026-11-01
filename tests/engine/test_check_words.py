@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from fractions import Fraction
 
+import pytest
+
+from sashimono.ai.fixes import fix_for
 from sashimono.core.model import (
     Clip,
     GeneratedSource,
@@ -18,10 +21,9 @@ from sashimono.core.model import (
 )
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.checks import HIGH, MEDIUM
-from sashimono.engine.checks.report import sorted_problems
 from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
 from sashimono.engine.checks.words import WordReport, check_words
-from tests.words_helpers import in_scene, placed, sample_transcript, wave
+from tests.words_helpers import in_scene, placed, sample_transcript, segment, spoken, wave
 
 
 def _media(video_media: MediaItem) -> MediaItem:
@@ -127,8 +129,24 @@ class TestWordCut:
         (measure,) = _cuts(_check(project, wave()))
         assert measure["source_seconds"] == 1.4
         assert "scene_clip_id" in measure
-        # シーンの中のクリップは trim_clip の相手にならない 間違った相手へ量を返さない
+        # 置いたクリップの窓の端は trim_clip で動かせる
+        assert measure["inside_scene"] is False
+        assert "suggested_tail_delta" in measure
+
+    def test_a_cut_between_clips_inside_a_scene(self, video_media: MediaItem) -> None:
+        """壊れると、外側の端を動かす量を返し、切れ目は残ったまま窓の端だけが変わる"""
+        media = _media(video_media)
+        inner = placed(
+            media,
+            _clip(media, 0, 12, Fraction(1)),
+            _clip(media, 12, 12, Fraction(8)),
+        )
+        project = in_scene(inner, Clip(0, 300, source_in=Fraction(0)))
+        report = _check(project, wave(), kinds=frozenset({WORD_CUT}))
+        (measure,) = [m for m in _cuts(report) if m["side"] == "out"]
+        assert measure["inside_scene"] is True
         assert "suggested_tail_delta" not in measure
+        assert fix_for(WORD_CUT, HIGH, measure).action == "handoff"
 
     def test_the_scene_clip_is_named(self, video_media: MediaItem) -> None:
         # 壊れると、シーンの中のクリップの ID を返し、AI が開いている画面で見つけられない
@@ -144,13 +162,6 @@ class TestWordCut:
         media = _media(video_media)
         project = placed(media, _clip(media, 0, 12, Fraction(1)))
         assert _check(project, wave(), kinds=frozenset({"black"})) == WordReport()
-
-    def test_problems_sort_with_the_rest(self, video_media: MediaItem) -> None:
-        # 壊れると、語の問題だけ一覧の後ろに固まり、時刻の順に読めない
-        media = _media(video_media)
-        project = placed(media, _clip(media, 0, 12, Fraction(1)))
-        problems = _check(project, wave()).problems
-        assert sorted_problems(reversed(problems)) == sorted_problems(problems)
 
 
 class TestNoWordTimes:
@@ -177,8 +188,21 @@ class TestNoWordTimes:
         changed = replace(track, clips=(*track.clips, _clip(other, 30, 30, Fraction(1))))
         project = project.with_timeline(replace(project.timeline, tracks=(changed,)))
         report = _check(project, wave())
+        assert report.skipped == WORD_KINDS
+        assert "語の時刻が無い音" in " ".join(report.notes)
+
+    def test_a_sound_without_subtitles_is_only_counted(self, video_media: MediaItem) -> None:
+        # 壊れると、BGM を置いただけの作品が毎回調べられなかった扱いになる
+        media = _media(video_media)
+        other = replace(video_media, id=new_media_id())
+        project = placed(media, _clip(media, 0, 24, Fraction(1)))
+        project = replace(project, media=(media, other))
+        track = project.timeline.tracks[0]
+        changed = replace(track, clips=(*track.clips, _clip(other, 30, 30, Fraction(1))))
+        project = project.with_timeline(replace(project.timeline, tracks=(changed,)))
+        report = _check(project, wave())
         assert report.skipped == frozenset()
-        assert "語の時刻の無い音" in " ".join(report.notes)
+        assert "字幕の無い音" in " ".join(report.notes)
 
 
 def test_a_work_without_material_sound_is_not_skipped(video_media: MediaItem) -> None:
@@ -213,6 +237,68 @@ class TestSubtitleWords:
         assert problem.measure["heard"] == "カメラを"
         assert problem.measure["missing"] == "作ります"
         assert problem.measure["text"] == "カメラを作ります"
+
+    def test_no_sound_left_still_reports_the_words(self, video_media: MediaItem) -> None:
+        # 壊れると、音を消して字幕だけが残った作品で、言っていない言葉に気付けない
+        media = _media(video_media)
+        project = self._burned(placed(media), media, "カメラを作ります", 24)
+        (problem,) = _check(project, wave()).problems
+        assert problem.kind == SUBTITLE_WORDS
+
+    def test_a_repeated_word_is_not_counted_twice(self, video_media: MediaItem) -> None:
+        """同じ字が繰り返す文の後半を切り、字幕を前半に直した形
+
+        壊れると、残した語の字を鳴らない語と数え、直した字幕を報告し続ける
+        """
+        line = segment(spoken(Fraction(1), "はいはい"))
+        media = video_media.with_transcript(Transcript((line,), language="ja"))
+        project = placed(media, _clip(media, 0, 12, Fraction(1)))
+        project = self._burned(project, media, "はい", 12)
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_longer_copy_is_looked_at_too(self, video_media: MediaItem) -> None:
+        # 壊れると、同じ行を頭をそろえて短く置いた方が、長い方の検査を止める
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 24, Fraction(1)))
+        project = self._burned(project, media, "カメラを", 12)
+        project = self._burned(project, media, "カメラを作ります", 24)
+        (problem,) = [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS]
+        assert problem.end == 24
+
+    @pytest.mark.parametrize("off", ["muted", "disabled"])
+    def test_a_subtitle_nobody_sees_is_not_reported(self, video_media: MediaItem, off: str) -> None:
+        # 壊れると、消音したトラックや無効のクリップの字幕の文言を直しに行く
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 300, Fraction(1)))
+        project = self._burned(project, media, "カメラを作ります", 12)
+        tracks = list(project.timeline.tracks)
+        burned = tracks[-1]
+        tracks[-1] = (
+            replace(burned, muted=True)
+            if off == "muted"
+            else replace(burned, clips=(replace(burned.clips[0], enabled=False),))
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_the_problem_stays_inside_the_asked_range(self, video_media: MediaItem) -> None:
+        # 壊れると、頼んだ範囲の外のフレームを返す
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 24, Fraction(1)))
+        project = self._burned(project, media, "カメラを作ります", 24)
+        report = check_words(project, 6, 12, WORD_KINDS, lambda _media, _stream: wave())
+        (problem,) = [p for p in report.problems if p.kind == SUBTITLE_WORDS]
+        assert (problem.start, problem.end) == (6, 12)
+
+    def test_a_sliver_of_a_subtitle_is_not_reported(self, video_media: MediaItem) -> None:
+        """通しの確かめの形 起こした字幕の行が音の残り端に 3 コマだけ掛かった
+
+        壊れると、人にも AI にも見えない数コマの字幕が 3 回の検査で残り続けた
+        """
+        media = _media(video_media)
+        # 素材の 2.5〜4.5 秒 「作ります」の行の終わりの 0.1 秒だけが 3 コマ掛かる
+        project = placed(media, _clip(media, 0, 60, Fraction(5, 2)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
 
     def test_a_shortened_subtitle_is_fine(self, video_media: MediaItem) -> None:
         # 字幕を残した音に合わせて直した形 語は行に残っているので、文言で見ないと直しても消えない

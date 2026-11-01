@@ -7197,10 +7197,21 @@ def _word_target(
     frame = arguments.get("frame")
     if frame is not None:
         at = _integer_value(frame, "frame")
-        piece = next((p for p in heard_pieces(project) if p.start <= at < p.end), None)
+        wanted = str(arguments.get("clip_id") or "")
+        # 同じ時刻に BGM と声が重なると、並びの最初の音が BGM のことがある 声のクリップを指せる
+        piece = next(
+            (
+                p
+                for p in heard_pieces(project)
+                if p.start <= at < p.end
+                and (not wanted or wanted in (str(p.clip_id), str(p.inner_clip_id)))
+            ),
+            None,
+        )
         media = None if piece is None else project.find_media(piece.media_id)
         if piece is None or media is None:
-            raise ToolError(f"フレーム {at} で鳴っている素材の音がありません")
+            named = f"クリップ {wanted} の" if wanted else ""
+            raise ToolError(f"フレーム {at} で鳴っている{named}素材の音がありません")
         return media, piece.stream, piece.seconds_at(at, project.rate), piece
     if arguments.get("seconds") is None:
         raise ToolError("frame か、media_id と seconds（素材の秒）を渡してください")
@@ -7292,11 +7303,15 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not 0 <= start < end:
         raise ToolError(f"範囲は 0 ≦ from_frame < to_frame で渡してください（{start}〜{end}）")
     rows: list[dict[str, object]] = []
+    last: tuple[object, ...] | None = None
     for item in heard_words(project, start, end):
-        if rows and rows[-1]["clip_id"] == str(item.piece.clip_id):
+        # シーンを置いたクリップの中では素材が替わる クリップだけで束ねると別の素材の語が混ざる
+        key = (item.piece.clip_id, item.piece.media_id, item.piece.stream)
+        if rows and key == last:
             rows[-1]["text"] = f"{rows[-1]['text']}{item.word.text}"
             rows[-1]["end_frame"] = math.ceil(item.frame)
             continue
+        last = key
         rows.append(
             {
                 "clip_id": str(item.piece.clip_id),
@@ -7307,7 +7322,7 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
             }
         )
     silent = {
-        str(piece.media_id)
+        (piece.media_id, piece.stream)
         for piece in heard_pieces(project)
         if piece.start < end
         and piece.end > start
@@ -7315,14 +7330,24 @@ def _heard_words(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
     result = _paged(rows, arguments, name="heard")
     if silent:
-        result["no_words"] = sorted(silent)
+        # 音声ごとに返す audio を省いて足すと、語の時刻のある 1 本目を起こし直すことになる
+        result["no_words"] = sorted(
+            (
+                {
+                    "media_id": str(media_id),
+                    "audio": _audio_number(project.find_media(media_id), stream),
+                }
+                for media_id, stream in silent
+            ),
+            key=lambda row: (str(row["media_id"]), int(str(row["audio"]))),
+        )
         result["note"] = " ".join(
             filter(
                 None,
                 (
                     result.get("note"),
-                    "no_words の素材には語の時刻が無く、鳴る語を読めません"
-                    " transcribe の words_only で足せます",
+                    "no_words の音声には語の時刻が無く、鳴る語を読めません"
+                    " transcribe の words_only に同じ audio を渡すと足せます",
                 ),
             )
         )
@@ -12473,6 +12498,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema(
             {
                 "frame": _integer("タイムラインのフレーム"),
+                "clip_id": _string("frame で鳴る音が重なるときに見るクリップ 省くと並びの最初の音"),
                 "media_id": _string("素材 frame を省くときに渡す"),
                 "seconds": _number("素材の中の秒 frame を省くときに渡す"),
                 "audio": _integer("音声の番号（1 から 省くと 1 本目 media_id で指すとき）"),
@@ -12492,8 +12518,8 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "タイムラインの範囲で実際に鳴る語を返す（読むだけ） 切った後に字幕やテロップの文言と"
             "残した音が合っているかを比べる シーンの中と速度変更も元の素材の語へ戻して読む"
-            " 語の時刻が無い素材は no_words に並ぶ（transcribe の words_only で足せる）"
-            + PAGING_NOTE
+            " 語の時刻が無い音声は no_words に media_id と audio で並ぶ（transcribe の"
+            " words_only に同じ audio を渡すと足せる）" + PAGING_NOTE
         ),
         schema=_schema(
             {

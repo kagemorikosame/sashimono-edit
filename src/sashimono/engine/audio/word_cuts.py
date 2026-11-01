@@ -24,6 +24,7 @@ __all__ = [
     "PAUSE",
     "UNCHECKED",
     "VALLEY",
+    "WORD_EDGE",
     "CutPoint",
     "cut_points",
     "level_at",
@@ -37,6 +38,8 @@ VALLEY = "valley"
 JOINED = "joined"
 #: 波形の解析がまだで、音を確かめていない
 UNCHECKED = "unchecked"
+#: 切り所が語の内側に入ったので語の端まで出した 音の谷ではなく語の時刻で決めた位置
+WORD_EDGE = "word_edge"
 
 #: 音の大きさを見る刻み（秒） 語の谷（30 ms ほど）を捉えられ、波形の一番細かい段階より粗い
 _STEP = Fraction(1, 100)
@@ -107,7 +110,9 @@ def _reference(waveform: Waveform, seconds: Fraction) -> float:
     # 話している所だけで見る 間の無音まで数えると、間の多い素材で話の大きさを小さく読む
     spoken = levels[levels > _NEARLY_SILENT_DB]
     if spoken.size == 0:
-        return _NEARLY_SILENT_DB
+        # 周りに話が無い 全部が静かと読める基準を返す 決まった値を基準にすると、雑音だけの所を
+        # 基準に近い大きさと読み、声が続くと判定する
+        return float(levels.max()) - QUIET_DB + _FLAT_DB
     return float(np.percentile(spoken, _REFERENCE_PERCENTILE))
 
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 
 import pytest
 
-from sashimono.core.model import Clip, MediaItem, TrackKind, Transcript, Word
+from sashimono.core.model import Clip, MediaItem, Track, TrackKind, Transcript, Word
 from sashimono.core.projection import heard_pieces
 from sashimono.core.words import (
     CUT_IN,
@@ -67,6 +68,9 @@ class TestPhrases:
             ("そうですはい", ["そうです", "はい"]),
             # 文の終わりの形に助詞が付く所は区切らない
             ("そうですか", ["そうですか"]),
+            # 助詞の後ろは文の切れ目 束ねるとその間で切った所まで語の途中と読む
+            ("そうですかはい", ["そうですか", "はい"]),
+            ("そうですよね", ["そうですよね"]),
         ],
     )
     def test_kana_runs(self, text: str, expected: list[str]) -> None:
@@ -134,6 +138,12 @@ class TestAttachWords:
         attached = attach_words(Transcript((first, second)), recognized)
         assert [len(line.words) for line in attached.segments] == [0, 1]
 
+    def test_no_recognized_words_keep_what_is_there(self) -> None:
+        # 壊れると、語の時刻を足す頼みで持っていた語の時刻まで消える
+        line = segment(spoken(Fraction(1), "あ"))
+        before = Transcript((line,))
+        assert attach_words(before, Transcript()) == before
+
     def test_a_word_outside_every_line_is_dropped(self) -> None:
         # 消した行の語を残すと、人が消した言葉が字幕の語として返る
         line = segment(spoken(Fraction(1), "あ"))
@@ -160,6 +170,17 @@ class TestHeardPieces:
         assert (piece.start, piece.end) == (Fraction(60), Fraction(90))
         assert piece.speed == 2
 
+    def test_the_same_head_at_another_speed_stays(self, video_media: MediaItem) -> None:
+        # 壊れると、速度だけ違う音の片方が消え、その語と切れ目を調べない
+        slow = _clip(video_media, 0, 30, Fraction(1))
+        fast = _clip(video_media, 0, 30, Fraction(1), speed=Fraction(2))
+        project = placed(video_media, slow)
+        other = Track(kind=TrackKind.AUDIO, name="A2", clips=(fast,))
+        project = project.with_timeline(
+            replace(project.timeline, tracks=(*project.timeline.tracks, other))
+        )
+        assert sorted(piece.speed for piece in heard_pieces(project)) == [1, 2]
+
     def test_a_muted_track_is_not_heard(self, video_media: MediaItem) -> None:
         # 壊れると、鳴らないクリップの切れ目を問題として返す
         clip = _clip(video_media, 0, 30, Fraction(1), enabled=False)
@@ -184,6 +205,15 @@ class TestCutEdges:
             _clip(video_media, 30, 30, Fraction(2)),
         )
         assert [edge.seconds for edge in cut_edges(project, 0, 60)] == [Fraction(1), Fraction(3)]
+
+    def test_a_one_frame_gap_is_a_cut(self, video_media: MediaItem) -> None:
+        # 壊れると、1 コマ無音が出るつなぎ目を分割と読み、切れ目を見逃す
+        project = placed(
+            video_media,
+            _clip(video_media, 0, 30, Fraction(1)),
+            _clip(video_media, 31, 30, Fraction(2)),
+        )
+        assert len(cut_edges(project, 0, 61)) == 4
 
     def test_a_jump_is_a_cut(self, video_media: MediaItem) -> None:
         # 壊れると、飛ばしてつないだ所を分割と読み、切れ目を見逃す
