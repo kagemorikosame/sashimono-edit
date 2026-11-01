@@ -426,7 +426,7 @@ def check_words(
         skipped.add(WORD_CUT)
         notes.append(
             f"語で確かめられない切れ目が {unknown} か所あり、言葉の途中かを見ていません"
-            " 語の時刻の無い所で声が続くか、波形の解析がまだの所です"
+            " 語の時刻の無い所（字幕の無い所も）で音が続くか、波形の解析がまだの所です"
             " transcribe の words_only で足すか、その所は人が聞いて確かめてください"
         )
     if blind and SUBTITLE_WORDS not in skipped:

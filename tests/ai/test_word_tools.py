@@ -247,6 +247,15 @@ def test_a_voiced_gap_in_a_line_is_not_called_clean(video_media: MediaItem) -> N
     assert result["inside_word"] is None
 
 
+def test_a_voiced_point_outside_the_subtitles_is_not_called_clean(media: MediaItem) -> None:
+    # 壊れると、字幕の無い所で声が続くのに「語の途中ではない」と答える
+    host = _host(media, _clip(media, 0, 60, Fraction(3)))
+    host.stub_waveform = wave(((0.0, 1.0),))
+    result = _call(host, "word_boundaries", frame=0)
+    assert result["has_words"] is False
+    assert result["inside_word"] is None
+
+
 def test_a_quiet_line_without_words_still_says_so(video_media: MediaItem) -> None:
     """語の時刻の有無と、音で読めたかは別の値
 

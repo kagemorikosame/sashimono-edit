@@ -243,7 +243,18 @@ def test_a_line_without_words_away_from_the_cut_stays_checked(video_media: Media
     )
     media = video_media.with_transcript(Transcript(lines, language="ja"))
     project = placed(media, _clip(media, 0, 90, Fraction(1)))
-    assert _check(project, wave(())).skipped == frozenset()
+    assert _check(project, wave(((3.5, 12.0),))).skipped == frozenset()
+
+
+def test_a_voiced_cut_outside_the_subtitles_is_not_checked(video_media: MediaItem) -> None:
+    """語の時刻のある音で、字幕の行の外で声が続く切れ目
+
+    壊れると、字幕を消した所や認識が拾わなかった所の切れ目を無事と返す
+    """
+    media = _media(video_media)
+    project = placed(media, _clip(media, 0, 60, Fraction(3)))
+    assert WORD_CUT in _check(project, wave(((0.0, 1.0),))).skipped
+    assert WORD_CUT not in _check(project, wave()).skipped
 
 
 class TestPartlyWordedLine:

@@ -151,14 +151,16 @@ def phrases(transcript: Transcript | None) -> tuple[Word, ...]:
     return tuple(sorted(grouped, key=lambda word: (word.start, word.end)))
 
 
-def _reaching(starts: Sequence[Fraction], reach: Sequence[Fraction], seconds: Fraction) -> range:
-    """頭の順に並んだ区間のうち、``seconds`` に届きうる物の番号を後ろから
+def _reaching(
+    starts: Sequence[Fraction], reach: Sequence[Fraction], low: Fraction, high: Fraction
+) -> range:
+    """頭の順に並んだ区間のうち、``[low, high]`` に届きうる物の番号を後ろから
 
     区間は重なることがある すぐ前の区間の終わりで見切ると、先に始まる長い区間が陰に隠れるので、
     そこまでの一番遅い終わり（``reach``）で見切る
     """
-    last = bisect.bisect_right(starts, seconds) - 1
-    first = bisect.bisect_right(reach, seconds)
+    last = bisect.bisect_right(starts, high) - 1
+    first = bisect.bisect_right(reach, low)
     return range(last, first - 1, -1)
 
 
@@ -320,6 +322,10 @@ def wordless_lines(transcript: Transcript | None) -> tuple[TranscriptSegment, ..
     return tuple(segment for segment in transcript.segments if not segment.words)
 
 
+def _near(words: Iterable[Word], seconds: Fraction) -> bool:
+    return any(word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in words)
+
+
 class WordMap:
     """1 つの音の語の読み取り 語の途中か・語で確かめられる所かを、道具と検査が同じ答えで読む
 
@@ -348,25 +354,28 @@ class WordMap:
 
         語の時刻は見積もりなので、端ちょうどは語の途中と読まない
         """
-        for at in _reaching(self._word_starts, self._word_reach, seconds):
+        for at in _reaching(self._word_starts, self._word_reach, seconds, seconds):
             word = self.phrases[at]
             if word.start + WORD_MARGIN < seconds < word.end - WORD_MARGIN:
                 return word
         return None
 
     def unworded_at(self, seconds: Fraction) -> bool:
-        """字幕の行の中で、語の時刻から語の途中かを言えない所か
+        """語の時刻から語の途中かを言えない所か 語から :data:`_GAP_REACH` より離れた所
 
-        語の時刻の無い行の中と、語が行の一部にしか付かない行の語から離れた所 話しているかは語の
-        時刻から分からないので、波形と合わせて読む（:func:`~sashimono.engine.audio.word_cuts.read_cut`）
+        行の中は行の語で見る 語の時刻の無い行と、語が行の一部にしか付かない行の語の無い所がこれに
+        当たる 行の外は作品の語で見る 字幕を消した所や認識が拾わなかった所でも話していることがある
+        話しているかは語の時刻から分からないので、波形と合わせて読む
+        （:func:`~sashimono.engine.audio.word_cuts.read_cut`）
         """
-        for at in _reaching(self._line_starts, self._line_reach, seconds):
-            line = self.lines[at]
-            if seconds < line.end and not any(
-                word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in line.words
-            ):
-                return True
-        return False
+        here = _reaching(self._line_starts, self._line_reach, seconds, seconds)
+        groups = [self.lines[at].words for at in here if seconds < self.lines[at].end]
+        return not all(_near(words, seconds) for words in groups or [self._nearby(seconds)])
+
+    def _nearby(self, seconds: Fraction) -> tuple[Word, ...]:
+        low, high = seconds - _GAP_REACH, seconds + _GAP_REACH
+        reached = _reaching(self._word_starts, self._word_reach, low, high)
+        return tuple(self.phrases[at] for at in reached)
 
 
 def untimed_sounds(project: Project, start: int, end: int) -> set[tuple[MediaId, int]]:

@@ -285,10 +285,15 @@ class TestWordMap:
         short = segment(spoken(Fraction(29, 10), "はい"))
         assert WordMap(Transcript((long, short))).unworded_at(Fraction(3))
 
-    def test_a_finished_line_does_not_count(self) -> None:
-        # 壊れると、字幕の行の間まで語の無い所と読み、切れ目を未検査にする
+    def test_outside_every_line_is_unworded(self) -> None:
+        # 壊れると、字幕を消した所で声が続く切れ目を、語の途中ではないと読む
         lines = (segment(spoken(Fraction(1), "あ")), segment(spoken(Fraction(4), "い")))
-        assert not WordMap(Transcript(lines)).unworded_at(Fraction(3))
+        assert WordMap(Transcript(lines)).unworded_at(Fraction(3))
+
+    def test_next_to_a_word_outside_the_line_is_worded(self) -> None:
+        # 壊れると、語のすぐ後で切った所まで行の外として未検査になる
+        lines = (segment(spoken(Fraction(1), "あ")),)
+        assert not WordMap(Transcript(lines)).unworded_at(Fraction(13, 10))
 
     def test_a_line_without_words_is_a_unit(self) -> None:
         # 壊れると、語の時刻の無い行の切れ目を切り所として返せない
@@ -297,14 +302,13 @@ class TestWordMap:
         assert [unit.text for unit in words.units] == ["行"]
         assert words.unworded_at(Fraction(3, 2))
 
-    @pytest.mark.parametrize("seconds", [Fraction(17, 10), Fraction(5), Fraction(1, 2)])
-    def test_near_the_words_or_outside_the_line(self, seconds: Fraction) -> None:
-        # 壊れると、語の時刻のずれだけの所や、字幕の無い所まで未検査になる
-        assert not WordMap(self._line()).unworded_at(seconds)
+    def test_near_the_words(self) -> None:
+        # 壊れると、語の時刻のずれだけの所まで未検査になる
+        assert not WordMap(self._line()).unworded_at(Fraction(17, 10))
 
     def test_no_subtitles(self) -> None:
         # 壊れると、字幕の無い音の読み取りで検査が落ちる
-        assert not WordMap(None).unworded_at(Fraction(1))
+        assert WordMap(None).unworded_at(Fraction(1))
 
 
 class TestUntimedSounds:

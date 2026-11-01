@@ -156,11 +156,11 @@ class CutReading:
 def read_cut(words: WordMap, waveform: Waveform | None, seconds: Fraction) -> CutReading:
     """``seconds`` が語の途中かを読む
 
-    語の時刻が届かない所は、音が静かと分かるときだけ確かめられたと数える 語の間の無音はふつうにある
-    ので一律に断らず、声が続く所と波形がまだの所を「言えない」にする
+    語の時刻が届かない所は、字幕の行の中でも外でも、音が静かと分かるときだけ確かめられたと数える
+    語の間の無音はふつうにあるので一律に断らず、声が続く所と波形がまだの所を「言えない」にする
     """
     word = words.word_at(seconds)
-    if bool(words.phrases) and (word is not None or not words.unworded_at(seconds)):
+    if word is not None or not words.unworded_at(seconds):
         return CutReading(word, True, True)
     level = level_at(waveform, seconds)
     return CutReading(None, False, level is not None and level <= QUIET_DB)
