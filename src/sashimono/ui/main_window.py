@@ -2183,6 +2183,7 @@ class MainWindow(QMainWindow):
         panel.remember_look = preferences.subtitle_look_remember
         panel.last_look = preferences.subtitle_look_last
         panel.speakers_after_transcribe = preferences.speakers_after_transcribe
+        panel.word_timestamps = preferences.word_timestamps
 
     def _remember_subtitle_look(self, key: str) -> None:
         """字幕を置いた見た目を覚える 覚える設定のときだけ書く（切っていれば設定を書き換えない）"""
@@ -3869,9 +3870,20 @@ class MainWindow(QMainWindow):
         return lambda seconds: screen.wait(media_id, kind, seconds)
 
     def start_transcription(
-        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+        self,
+        media_id: MediaId,
+        model: str,
+        *,
+        audio_stream: int | None = None,
+        words_only: bool = False,
     ) -> str:
-        return self._subtitles.start_transcription(media_id, model, audio_stream=audio_stream)
+        return self._subtitles.start_transcription(
+            media_id,
+            model,
+            audio_stream=audio_stream,
+            word_timestamps=self._preferences.word_timestamps,
+            words_only=words_only,
+        )
 
     def transcription_status(self) -> str:
         return self._subtitles.transcription_status()

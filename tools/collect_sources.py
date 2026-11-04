@@ -12,7 +12,9 @@ zip は GPL の条件で配る（THIRD_PARTY_NOTICES.md） GPL と LGPL は、�
 合わなければ消して止まる
 
 版は手で書いてある 積んでいる部品の版と食い違ったまま落とすと、別の版のソースを
-添付することになるので、落とす前に入っている PyAV と PySide6 の版と突き合わせる
+添付することになるので、落とす前に組み立てたフォルダ（``dist\\Sashimono\\_internal``）の
+DLL から実際に積んだ版を読んで突き合わせる 道具を動かす Python 環境の版は見ない
+開発用の .venv と配る zip の部品は版が違うことがある（0.2.3 で正しい zip を NG にした）
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import contextlib
 import hashlib
 import io
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -41,6 +44,17 @@ FFMPEG_VERSION = "8.1.2"
 QT_VERSION = "6.11.2"
 #: tools/build_package.py が組み立てるフォルダの名前 積んだ Qt をここから数える
 BUNDLE_NAME = "Sashimono"
+#: FFmpeg 本体の DLL の名前の頭 av.libs には x264 など別の部品の DLL も並ぶ
+FFMPEG_DLLS = (
+    "avcodec-",
+    "avdevice-",
+    "avfilter-",
+    "avformat-",
+    "avutil-",
+    "swresample-",
+    "swscale-",
+)
+_SHIBOKEN_VERSION = re.compile(rb"__version_info__\0+(\d+\.\d+\.\d+)\0")
 #: Qt の置き場は major.minor のフォルダの下にある 版から作り、上げたときの直し忘れを防ぐ
 _QT_SERIES = ".".join(QT_VERSION.split(".")[:2])
 _QT = f"https://download.qt.io/official_releases/qt/{_QT_SERIES}/{QT_VERSION}/submodules"
@@ -213,21 +227,81 @@ def _open(request: urllib.request.Request) -> IO[bytes]:
     return response
 
 
-def installed_mismatches() -> list[str]:
-    """一覧の版と、いま入っている（＝zip に積む）部品の版の食い違い
+def dll_version_field(path: Path, name: str) -> str | None:
+    """DLL の版情報の資源から文字の欄（``ProductVersion`` など）を読む 無ければ None
+
+    資源の塊の中だけを探す ファイル全体から探すと、版情報を読む側のコードが持つ同じ文字列に
+    当たる 読むだけで DLL は開かない 載せると中のコードが走り、Windows 以外でも試せなくなる
+    """
+    data = path.read_bytes()
+    marker = data.find("VS_VERSION_INFO".encode("utf-16-le"))
+    # 塊の頭は名前の 6 バイト前 全体の長さ・値の長さ・種類の 3 つが 2 バイトずつ並ぶ
+    if marker < 6:
+        return None
+    length = int.from_bytes(data[marker - 6 : marker - 4], "little")
+    block = data[marker : marker - 6 + length]
+    key = f"{name}\0".encode("utf-16-le")
+    found = block.find(key)
+    if found < 0:
+        return None
+    value = block[found + len(key) :]
+    # 名前の後には 4 バイト境界までの詰め物が入るので、頭の NUL を飛ばす
+    text = value[: len(value) // 2 * 2].decode("utf-16-le", "replace").lstrip("\0")
+    return text.partition("\0")[0] or None
+
+
+def _ffmpeg_mismatches(internal: Path) -> list[str]:
+    # FFmpeg の版は DLL ごとの ProductVersion にある FileVersion は avcodec などの版（62.28.102）
+    # で FFmpeg の版ではない 1 つだけ見ると、版の混ざった組み立てを見逃すので全部見る
+    libs = internal / "av.libs"
+    dlls = sorted(path for path in libs.glob("*.dll") if path.name.startswith(FFMPEG_DLLS))
+    if not dlls:
+        return [f"{libs} に FFmpeg の DLL が無く、積んだ版を確かめられない"]
+    problems = []
+    for dll in dlls:
+        version = dll_version_field(dll, "ProductVersion")
+        if version is None:
+            problems.append(f"{dll.name} から版を読めず、積んだ FFmpeg を確かめられない")
+        elif version != FFMPEG_VERSION:
+            problems.append(f"積んでいる FFmpeg は {version}（{dll.name}） 一覧は {FFMPEG_VERSION}")
+    return problems
+
+
+def _qt_mismatches(internal: Path) -> list[str]:
+    core = internal / "PySide6" / "Qt6Core.dll"
+    version = dll_version_field(core, "FileVersion") if core.is_file() else None
+    if version is None:
+        return [f"{core} から版を読めず、積んだ Qt を確かめられない"]
+    # 版情報は 4 桁（6.11.2.0） 一覧の版は 3 桁なので長さをそろえて比べる
+    if version.split(".")[:3] != QT_VERSION.split("."):
+        return [f"積んでいる Qt は {version} 一覧は {QT_VERSION}"]
+    return []
+
+
+def _pyside_mismatches(internal: Path) -> list[str]:
+    # PySide6 の DLL には版情報の資源が無く、__init__.py も実行ファイルの中に固めてある
+    # 同じ版で作られる shiboken6 の拡張に、``__version_info__`` の隣で版の文字列が入っている
+    extension = internal / "shiboken6" / "Shiboken.pyd"
+    found = _SHIBOKEN_VERSION.search(extension.read_bytes()) if extension.is_file() else None
+    if found is None:
+        return [f"{extension} から版を読めず、積んだ PySide6 を確かめられない"]
+    version = found.group(1).decode("ascii")
+    if version != QT_VERSION:
+        return [f"積んでいる PySide6 は {version} 一覧は {QT_VERSION}"]
+    return []
+
+
+def bundled_mismatches(internal: Path) -> list[str]:
+    """一覧の版と、組み立てたフォルダに実際に積んだ部品の版の食い違い
 
     PyAV や PySide6 を上げたのに一覧を直し忘れると、別の版のソースを添付してしまう
+    版を読めないときも食い違いとして返す 確かめられないまま通すと同じことが起きる
     """
-    import av._core
-    import PySide6
-
-    problems = []
-    ffmpeg = str(av._core.ffmpeg_version_info)
-    if ffmpeg != FFMPEG_VERSION:
-        problems.append(f"積んでいる FFmpeg は {ffmpeg} 一覧は {FFMPEG_VERSION}")
-    if PySide6.__version__ != QT_VERSION:
-        problems.append(f"積んでいる PySide6 は {PySide6.__version__} 一覧は {QT_VERSION}")
-    return problems
+    return [
+        *_ffmpeg_mismatches(internal),
+        *_qt_mismatches(internal),
+        *_pyside_mismatches(internal),
+    ]
 
 
 def bundled_qt_modules(pyside: Path) -> tuple[set[str], list[str]]:
@@ -406,19 +480,20 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="入手先に届くかだけ見る")
     args = parser.parse_args(argv)
 
-    mismatches = installed_mismatches()
-    for mismatch in mismatches:
-        print(f"[NG] {mismatch}（tools/collect_sources.py の版を直す）")
-    if mismatches:
-        return 1
-
     dist = dist if dist is not None else ROOT / "dist"
-    pyside = dist / BUNDLE_NAME / "_internal" / "PySide6"
+    internal = dist / BUNDLE_NAME / "_internal"
+    pyside = internal / "PySide6"
     if not pyside.is_dir():
         # 積んだ物を数えずに添付する物を決めると、積んでいない Qt のモジュールまで落とすか、
         # 積んだ物を落とし損ねる
         print(f"[NG] {pyside} が無い 先に tools/build_package.py で組み立てる")
         return 1
+    mismatches = bundled_mismatches(internal)
+    for mismatch in mismatches:
+        print(f"[NG] {mismatch}（積んだ物か tools/collect_sources.py の版を直す）")
+    if mismatches:
+        return 1
+
     modules, unknown = bundled_qt_modules(pyside)
     for name in unknown:
         print(f"[NG] どの Qt のモジュールの物か分からない: {name}（QT_FILE_MODULES に足す）")

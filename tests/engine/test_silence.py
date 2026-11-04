@@ -13,7 +13,12 @@ import numpy as np
 import pytest
 
 from sashimono.core.model import Transcript, TranscriptSegment
-from sashimono.engine.audio.silence import SilenceOptions, detect_silence, keep_speech
+from sashimono.engine.audio.silence import (
+    SilenceOptions,
+    detect_silence,
+    keep_speech,
+    suggest_silence,
+)
 from sashimono.engine.audio.waveform import (
     BASE_SAMPLES_PER_PEAK,
     PeakLevel,
@@ -108,6 +113,41 @@ class TestDetectSilence:
         # 明示的に指定したときだけ、間の短い音ごと 1 つにまとめる
         absorb = SilenceOptions(padding=Fraction(0), min_keep=at(40))
         assert detect_silence(waveform, absorb) == ((at(0), at(420)),)
+
+    def test_a_noise_blip_does_not_split_the_silence(self) -> None:
+        """通しの確かめの形 雑音の 11 ms の山がしきい値を越え、無音が割れた
+
+        壊れると、両側の余白を足した 0.2 秒ほどの雑音だけの片が切り抜きに残る
+        """
+        waveform = make_waveform([(0.5, 200), (0.0, 200), (0.05, 2), (0.0, 200), (0.5, 200)])
+        options = SilenceOptions(padding=at(20), threshold_db=-36.0)
+        assert detect_silence(waveform, options) == ((at(220), at(582)),)
+
+    @pytest.mark.parametrize("peaks", [12, 38, 56])
+    def test_a_short_reply_is_kept(self, peaks: int) -> None:
+        """「はい」ほどの短い相づち（0.05〜0.3 秒）は残す
+
+        壊れると、間に挟まった返事まで雑音として詰めて消す
+        """
+        waveform = make_waveform([(0.5, 200), (0.0, 200), (0.5, peaks), (0.0, 200), (0.5, 200)])
+        options = SilenceOptions(padding=Fraction(0))
+        assert len(detect_silence(waveform, options)) == 2
+
+    def test_a_blip_between_short_pauses_makes_no_new_cut(self) -> None:
+        # 壊れると、切らない短い間どうしをまとめて、前は切らなかった所を新しく切る
+        waveform = make_waveform([(0.5, 200), (0.0, 60), (0.05, 2), (0.0, 60), (0.5, 200)])
+        options = SilenceOptions(padding=Fraction(0), threshold_db=-36.0, min_silence=at(100))
+        assert detect_silence(waveform, options) == ()
+
+    def test_the_suggestion_counts_the_same_cuts(self) -> None:
+        # 壊れると、勧める値の見込みの数と、その値で jet_cut が切る数が食い違う
+        waveform = make_waveform([(0.5, 200), (0.0, 200), (0.05, 2), (0.0, 200), (0.5, 200)])
+        best, _ = suggest_silence(waveform, float(at(100)), 0.0)
+        assert best is not None
+        options = SilenceOptions(
+            padding=Fraction(0), threshold_db=best.threshold_db, min_silence=at(100)
+        )
+        assert best.cuts == len(detect_silence(waveform, options)) == 1
 
     def test_an_empty_waveform_yields_nothing(self) -> None:
         # 長さ 0 の波形で空を返せないと、長さ 0 の音声の素材に無音カットを掛けたとき

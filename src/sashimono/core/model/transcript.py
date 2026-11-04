@@ -18,10 +18,11 @@ __all__ = ["Transcript", "TranscriptSegment", "Word"]
 
 @dataclass(frozen=True, slots=True)
 class Word:
-    """単語単位のタイムスタンプ
+    """語の単位のタイムスタンプ
 
-    既定では取得しない設定にするが、内部的にはクリップ分割時の境界決定に使う
-    単語境界で切れれば、字幕が文の途中でぶつ切りにならない
+    クリップ分割の境界の決定と、AI が語の境目で切るのに使う（#420）
+    Whisper の語は日本語では 1 字ほどの単位で、語の境目としては
+    :func:`sashimono.core.words.phrases` が束ねた物を読む
     """
 
     start: Fraction

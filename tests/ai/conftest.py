@@ -119,6 +119,7 @@ class FakeHost:
         #: 本人の設定の「詰めるとき重ねの層も動かす」 既定は設定と同じく動かす
         self.ripple_layers = True
         self.transcribed_stream: int | None = None
+        self.transcribed_words_only = False
         #: 話者の分離（#323）を頼まれた素材・音声・人数 断らせたいときは理由を入れる
         self.separated: tuple[MediaId, int | None, int | None] | None = None
         self.speakers_refusal = ""
@@ -554,11 +555,17 @@ class FakeHost:
         return wait
 
     def start_transcription(
-        self, media_id: MediaId, model: str, *, audio_stream: int | None = None
+        self,
+        media_id: MediaId,
+        model: str,
+        *,
+        audio_stream: int | None = None,
+        words_only: bool = False,
     ) -> str:
         self.transcription = f"{model} で開始"
         #: 起こすように頼まれた音声ストリームの番号
         self.transcribed_stream = audio_stream
+        self.transcribed_words_only = words_only
         return f"{media_id} の起こしを始めました"
 
     def transcription_status(self) -> str:

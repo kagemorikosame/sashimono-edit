@@ -23,6 +23,7 @@ from sashimono.core.model import Transcript
 from sashimono.engine.audio.waveform import Waveform
 
 __all__ = [
+    "BLIP_SECONDS",
     "SilenceChoice",
     "SilenceOptions",
     "TimeRange",
@@ -37,6 +38,14 @@ type TimeRange = tuple[Fraction, Fraction]
 
 #: 無音判定の下限 これより静かな環境音は無いものとして扱う
 _FLOOR_DB = -120.0
+#: 切る無音 2 つの間に残る音がこれ以下の長さなら、2 つを 1 つにまとめる（秒 余白は数えない）
+#: 雑音の一瞬の山がしきい値を越えると無音が 2 つに割れ、両側の余白を足した 0.2 秒ほどの雑音
+#: だけの片が残る（通しの確かめで、11 ms の山から 0.23 秒の片ができた） 日本語の 1 拍は 0.1 秒
+#: ほどで、短い相づちでも声の続きはこれより長いので、これ以下は話ではなく雑音の山と読む
+#: :attr:`SilenceOptions.min_keep` が 0 でもまとめる ``min_keep`` は話を消しうる長さまでまとめる
+#: 物で、呼ぶ側が指定したときだけ効く（画面と AI の道具はまだ出していない） まとめるのは
+#: どちらも切る無音のときだけで、切らない無音を新しく切ることはしない
+BLIP_SECONDS = Fraction(1, 20)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +58,10 @@ class SilenceOptions:
     min_silence: Fraction = field(default_factory=lambda: Fraction(1, 2))
     #: 無音の前後に残す余白 発話の立ち上がりを切り落とさないため
     padding: Fraction = field(default_factory=lambda: Fraction(1, 10))
-    #: 無音に挟まれた発話がこれより短ければ、その発話ごと落とす 0 なら落とさない
-    #: 舌打ちやマウスの音だけが残るのを防ぐが、既定では切らない側に倒す
+    #: 無音に挟まれた発話がこれより短ければ、その発話ごと落とす 0 なら発話は落とさない
+    #: ただし 0 でも、切る無音 2 つの間に残る :data:`BLIP_SECONDS`（0.05 秒）以下の音は、話では
+    #: なく雑音の山として無音にまとめる 舌打ちやマウスの音だけが残るのを防ぐが、既定では切らない
+    #: 側に倒す
     min_keep: Fraction = field(default_factory=lambda: Fraction(0))
 
     def __post_init__(self) -> None:
@@ -99,6 +110,8 @@ def detect_silence(
         if stop - start >= resolved.min_silence:
             ranges.append((start, stop))
 
+    # 余白を足す前の残る音の長さで比べる 余白の分は話ではない
+    ranges = _absorb_short_speech(ranges, BLIP_SECONDS + 2 * resolved.padding, inclusive=True)
     if resolved.min_keep > 0:
         ranges = _absorb_short_speech(ranges, resolved.min_keep)
     return tuple(ranges)
@@ -159,10 +172,15 @@ def _quiet_cuts(
     （終わりを足して 1 つ長い 終わりは音の長さで抑えてある）
     """
     edges = np.diff(np.concatenate([[0], (peaks < threshold_db).astype(np.int8), [0]]))
-    kept = times[edges == -1] - times[edges == 1] - 2 * padding
+    starts = times[edges == 1] + padding
+    ends = times[edges == -1] - padding
     # 浮動小数の端数で、ちょうど最短の無音の長さの区間を落とさない
-    kept = kept[kept >= min_silence - 1e-9]
-    return int(kept.size), float(kept.sum())
+    long = ends - starts >= min_silence - 1e-9
+    starts, ends = starts[long], ends[long]
+    # 間に一瞬の音しか残らない 2 つは 1 つに切る（:data:`BLIP_SECONDS`）
+    gaps = starts[1:] - ends[:-1]
+    joined = gaps <= float(BLIP_SECONDS) + 2 * padding + 1e-9
+    return int(starts.size - joined.sum()), float((ends - starts).sum() + gaps[joined].sum())
 
 
 def _hump_end(rises: np.ndarray, floor: float) -> int | None:
@@ -314,14 +332,20 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return [(int(edges[i]), int(edges[i + 1])) for i in range(0, len(edges), 2)]
 
 
-def _absorb_short_speech(ranges: list[TimeRange], min_keep: Fraction) -> list[TimeRange]:
-    """無音に挟まれた短い発話を、前後の無音ごと 1 つにまとめる"""
+def _absorb_short_speech(
+    ranges: list[TimeRange], min_keep: Fraction, *, inclusive: bool = False
+) -> list[TimeRange]:
+    """無音に挟まれた短い発話を、前後の無音ごと 1 つにまとめる
+
+    ``inclusive`` なら同じ長さもまとめる
+    """
     if not ranges:
         return ranges
     merged = [ranges[0]]
     for start, end in ranges[1:]:
         previous_start, previous_end = merged[-1]
-        if start - previous_end < min_keep:
+        gap = start - previous_end
+        if gap < min_keep or (inclusive and gap == min_keep):
             merged[-1] = (previous_start, end)
         else:
             merged.append((start, end))

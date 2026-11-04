@@ -89,8 +89,8 @@ class TranscribeOptions:
     beam_size: int = 5
     #: 無音区間を先に落としてから認識に掛ける 長い無音での幻聴が減る
     vad_filter: bool = True
-    #: 単語単位のタイムスタンプ 既定は切る 取得コストが上がる割に、使うのは
-    #: クリップ分割時の境界決定だけなので、必要な素材でだけ入れる
+    #: 語の単位のタイムスタンプ 分割の境界の決定と、AI が語の境目で切るのに使う（#420）
+    #: ここの既定は切りで、画面と AI の入口が本人の設定（``Preferences.word_timestamps``）から渡す
     word_timestamps: bool = False
     #: 固有名詞などを与えると認識が寄る
     initial_prompt: str = ""

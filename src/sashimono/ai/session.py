@@ -148,6 +148,10 @@ _PROMPT = """\
   山・動きの大きい区間を取り、timeline の範囲を preview_range で、話の中身を字幕で
   確かめてから使ってください 点は手がかりの候補で、笑い声は話し声や音楽と取り違える
   ことがあります
+- 音を切るとき（切り抜き・trim_clip・split_clip・cut_range）は、切る前に word_boundaries で
+  語の境目を読み、inside_word が真の所では切らず cut_points の位置を使ってください AI は音を
+  聞けないので、音量だけで決めると言葉の途中で切れます 切った後は check_output の word_cut と
+  subtitle_words を見て、get_subtitles の heard で字幕の文言が残した音と合うかを確かめます
 - 目次（チャプター）は、話の区切りに名前の付いた目印（マーカー）を add_markers で置き、
   get_chapters で作ります warnings があれば、そのまま渡さずユーザーに伝えてください
 - 話の要所を目立たせる動き（寄る・ずらす・一瞬ふくらむ・揺らす）は、add_keyframe を
