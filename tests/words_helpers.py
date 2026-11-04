@@ -59,13 +59,17 @@ def sample_transcript() -> Transcript:
 def wave(
     quiet: tuple[tuple[float, float], ...] = ((0.0, 1.0), (2.6, 4.0), (4.4, 12.0)),
     seconds: float = 12.0,
+    floor: float = _QUIET,
 ) -> Waveform:
-    """話している所は大きく、``quiet`` の区間（秒）だけ静かな波形 既定は sample_transcript に合う"""
+    """話している所は大きく、``quiet`` の区間（秒）だけ静かな波形 既定は sample_transcript に合う
+
+    ``floor`` は静かな所の振幅 雑音のある部屋の録音を作るときに上げる
+    """
     count = round(seconds * _SAMPLE_RATE / _SAMPLES_PER_PEAK)
     amplitude = np.full(count, _LOUD, dtype=np.float32)
     per_second = _SAMPLE_RATE / _SAMPLES_PER_PEAK
     for low, high in quiet:
-        amplitude[round(low * per_second) : round(high * per_second)] = _QUIET
+        amplitude[round(low * per_second) : round(high * per_second)] = floor
     peaks = np.stack((-amplitude, amplitude), axis=-1)[:, np.newaxis, :]
     return Waveform(
         sample_rate=_SAMPLE_RATE,

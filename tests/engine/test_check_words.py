@@ -246,6 +246,19 @@ def test_a_line_without_words_away_from_the_cut_stays_checked(video_media: Media
     assert _check(project, wave(((3.5, 12.0),))).skipped == frozenset()
 
 
+def test_a_silence_cut_with_room_noise_stays_checked(video_media: MediaItem) -> None:
+    """通しの確かめの形 雑音のある部屋の録音を無音カットで切った
+
+    話の間が話の大きさから -18 dB ほどまでしか下がらない 壊れると、語の無い所の切れ目の半分を
+    声が続くと読み、word_cut 全体が未検査になって言葉の途中の切れ目を返さない
+    """
+    media = _media(video_media)
+    # 素材の 3.0〜3.5 秒 「作ります」の後と「はい」の前の話の間だけを残す
+    project = placed(media, _clip(media, 0, 15, Fraction(3)))
+    report = _check(project, wave(floor=0.06), kinds=frozenset({WORD_CUT}))
+    assert report.skipped == frozenset()
+
+
 def test_a_voiced_cut_outside_the_subtitles_is_not_checked(video_media: MediaItem) -> None:
     """語の時刻のある音で、字幕の行の外で声が続く切れ目
 

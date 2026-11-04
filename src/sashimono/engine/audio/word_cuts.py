@@ -25,6 +25,7 @@ __all__ = [
     "PAUSE",
     "UNCHECKED",
     "VALLEY",
+    "VOICED_DB",
     "WORD_EDGE",
     "CutPoint",
     "CutReading",
@@ -58,6 +59,12 @@ _NEARLY_SILENT_DB = -55.0
 #: 語の中が -7〜-8 これより浅いと語の中まで静かと読み、深いと録音の雑音の多い素材で谷を
 #: 1 つも拾えない
 QUIET_DB = -24.0
+#: 語の時刻の無い所で、声が続くと読む大きさ（話の大きさから dB） 語の中（-7〜-8）と語の境目の谷
+#: （-17〜-23）の間 話の 0.5 秒以上の間を素材 6 本で測ると、ここを越えるのはおおむね 1 割に満たず
+#: （笑い声や音楽が重なる素材は別）、語の中の声は 5〜7 割が越える :data:`QUIET_DB` で分けると、
+#: 台所の雑音のある素材では無音カットの切れ目（話の間）が -15〜-23 にとどまり、42 か所のうち
+#: 22 か所を声が続くと読んで検査全体が止まった 語の無い所は確かな声だけを「言えない」にする
+VOICED_DB = -12.0
 #: 声が続く所で同じ小ささと読む差（dB）
 _FLAT_DB = 1.0
 #: 静かな所を読むときに、続いて静かであることを求めるコマの数 1 つだけ低いのは波の 0 交差
@@ -156,14 +163,15 @@ class CutReading:
 def read_cut(words: WordMap, waveform: Waveform | None, seconds: Fraction) -> CutReading:
     """``seconds`` が語の途中かを読む
 
-    語の時刻が届かない所は、字幕の行の中でも外でも、音が静かと分かるときだけ確かめられたと数える
-    語の間の無音はふつうにあるので一律に断らず、声が続く所と波形がまだの所を「言えない」にする
+    語の時刻が届かない所は、字幕の行の中でも外でも、声が続くと分かる所と波形がまだの所だけを
+    「言えない」にする 語の間の無音はふつうにあり、雑音のある素材では静かと言い切れるほど下がらない
+    語の時刻のある所の判定（語の途中か）はここでは変えない
     """
     word = words.word_at(seconds)
     if word is not None or not words.unworded_at(seconds):
         return CutReading(word, True, True)
     level = level_at(waveform, seconds)
-    return CutReading(None, False, level is not None and level <= QUIET_DB)
+    return CutReading(None, False, level is not None and level <= VOICED_DB)
 
 
 def _between(waveform: Waveform, before: Word, after: Word, reference: float) -> CutPoint:
