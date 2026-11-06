@@ -572,12 +572,26 @@ class TestSubtitleWords:
         project = self._burned(project, media, "カメラを作ります", 1)
         tracks = list(project.timeline.tracks)
         rate = project.rate
-        start = seconds_to_frame(Fraction(3, 2), rate)
-        end = seconds_to_frame(Fraction(26, 10), rate)
+        # 行の頭を声へ寄せた 0.5 秒と、好みで遅く出す 1.5 秒を足した所から出す
+        start = seconds_to_frame(Fraction(3), rate)
+        end = seconds_to_frame(Fraction(4), rate)
         burned = replace(tracks[-1].clips[0], timeline_start=start, duration=end - start)
         tracks[-1] = replace(tracks[-1], clips=(burned,))
         project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
         assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_shifted_line_over_cut_sound_is_still_reported(self, video_media: MediaItem) -> None:
+        # 好みで遅く出した行でも、音を切って消した語は欠けとして返す 表示の外の語を広く聞こえる
+        # 側に数えすぎると、本当に切った語まで見逃す
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 24, Fraction(1)))
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        burned = replace(tracks[-1].clips[0], timeline_start=12, duration=36)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        (problem,) = [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS]
+        assert problem.measure["missing"] == "作ります"
 
     def test_one_particle_is_not_reported(self, video_media: MediaItem) -> None:
         # 語の時刻のずれでも 1 字の助詞は落ちる 毎回返すと本当の食い違いが埋もれる

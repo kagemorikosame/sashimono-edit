@@ -14,6 +14,7 @@ from fractions import Fraction
 
 from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
 from sashimono.core.projection import burned_subtitles, heard_pieces, heard_timeline
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -24,8 +25,8 @@ from sashimono.core.words import (
     heard_between,
     heard_words,
     phrases,
-    unheard_words,
 )
+from sashimono.engine.audio.voice_edges import REACH
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
     JOINED,
@@ -49,10 +50,11 @@ _MIN_UNHEARD_CHARS = 2
 #: 短く、1 束も言い切らない 起こした字幕の行は切れ目で自動で切り詰められるので、前後の語の時刻の
 #: ずれ（0.1 秒）でも数コマ掛かることがあり、これを返すと直しようが無いまま検査に残り続ける
 _SLIVER_SECONDS = Fraction(1, 2)
-#: 字幕の行の前後でも聞こえる語と数える幅（秒） 行の時刻を声へ寄せる（#426 前後 0.5 秒まで）と、
-#: 語の時刻の方が行より早い所で最初の語が行の頭の外に出る 行の中だけで数えると、聞こえている
-#: 語を残した音に無いと報告する
-_HEARD_SLACK = Fraction(1, 2)
+#: 字幕の行の前後でも聞こえる語と数える幅（秒） 行の時刻を声へ寄せる（#426 前後
+#: :data:`REACH` まで）・好みでずらす（:data:`OFFSET_MS_RANGE` まで）と、語が行の表示の外に出る
+#: 行の中だけで数えると、音を切っていないのに聞こえている語を残した音に無いと報告する
+#: 語は行ごとに別の物なので、この幅の中で鳴れば音は残っている 切って消した語はどこでも鳴らない
+_HEARD_SLACK = REACH + Fraction(max(abs(ms) for ms in OFFSET_MS_RANGE), 1000)
 #: 文言と語を比べるときに外す字 句読点は認識の語と字幕の文言で付き方が違う
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()\n")
 
@@ -308,13 +310,17 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
         if not segment.words:
             blind.add(segment_id)
             return
-        near = (low - slack, high + slack)
-        missing = unheard_words(segment, heard, media_id, stream, *near)
-        kept = [
+        # 字幕が出ている間に鳴る音の片だけで数える その片が行の表示の外（寄せた・ずらした分）で
+        # 鳴らす語も聞こえる側 別の所に置いた同じ所の音の片まで数えると、そちらで鳴る語のせいで
+        # この置き方の欠けを見逃す
+        local = [
             item
-            for item in heard_between(heard, media_id, stream, *near)
-            if item.word in segment.words
+            for item in heard_between(heard, media_id, stream, low - slack, high + slack)
+            if item.piece.start < high and item.piece.end > low
         ]
+        sounding = {item.word for item in local}
+        missing = [word for word in segment.words if word not in sounding]
+        kept = [item for item in local if item.word in segment.words]
         if not missing or not _claims(text, missing, kept):
             return
         # 判定は字幕全体で、返す区間だけ調べた範囲へ切る ほかの問題は範囲の中に収まる

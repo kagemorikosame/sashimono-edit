@@ -9,7 +9,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sashimono.core.model import MediaId, SegmentId, Transcript, TranscriptSegment, Word
+from sashimono.core.commands import SetTranscript
+from sashimono.core.model import (
+    MediaId,
+    Project,
+    SegmentId,
+    Transcript,
+    TranscriptSegment,
+    Word,
+)
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.engine.audio.voice_edges import (
     fit_to_voice,
@@ -266,6 +274,20 @@ class TestRetimeCommand:
             only={SegmentId("b")},
         )
         assert command is None
+
+    def test_all_lines_moved_early_stay_at_or_after_zero(self, project: Project) -> None:
+        # 2 行とも 0 秒で止まると、先頭の行の頭が負になって命令が断られ、何も合わせられない
+        media = project.media[0]
+        transcript = Transcript((_segment(0.1, 0.5, "一", "a"), _segment(0.6, 1.0, "二", "b")))
+        placed = SetTranscript(media.id, transcript).apply(project)
+        command = retime_command(
+            media.id, transcript, SubtitleTiming(fit_to_voice=False, start_offset_ms=-1000), None
+        )
+        assert command is not None
+        moved = command.apply(placed).require_media(media.id).transcript_for(None)
+        assert moved is not None
+        assert all(s.start >= 0 and s.end > s.start for s in moved.segments)
+        assert moved.segments[0].end <= moved.segments[1].start
 
     def test_nothing_to_move_gives_no_command(self) -> None:
         # 空の命令を履歴に積むと、何も変わらない「元に戻す」が 1 つ増える

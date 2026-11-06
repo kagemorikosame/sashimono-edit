@@ -145,14 +145,16 @@ def retime_command(
             if index + 1 < len(lines) and _apart(segment, lines[index + 1])
             else None
         )
-        if low is not None and high is not None and high - low < least:
-            # 前後の行の間に見える長さが残らない 動かすと潰れるか重なるので、この行は動かさない
+        floor = max(Fraction(0), low) if low is not None else Fraction(0)
+        if high is not None and high - floor < least:
+            # 前後の行の間（と 0 秒より後）に見える長さが残らない 動かすと潰れるか重なるか負の
+            # 時刻になるので、この行は動かさない 後の行の限りも元の時刻で決める
+            edges[index] = [segment.start, segment.end]
             continue
         if high is not None:
             start = min(start, high - least)
             end = min(end, high)
-        if low is not None:
-            start = max(start, low)
+        start = max(start, floor)
         end = max(end, start + least)
         edges[index] = [start, end]
         if (start, end) != (segment.start, segment.end):
