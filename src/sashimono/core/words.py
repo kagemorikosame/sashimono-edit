@@ -37,6 +37,7 @@ __all__ = [
     "heard_between",
     "heard_words",
     "phrases",
+    "split_seam",
     "transcript_words",
     "unheard_words",
     "untimed_sounds",
@@ -280,6 +281,20 @@ def _rounding(piece: HeardPiece, other: HeardPiece, frame_seconds: Fraction) -> 
     return _SOURCE_ROUNDING if speed == 1 and piece.speed == other.speed else frame_seconds * speed
 
 
+def split_seam(earlier: HeardPiece, later: HeardPiece, frame_seconds: Fraction) -> bool:
+    """``earlier`` の終わりに ``later`` が分割しただけでつながるか 音が途切れない所
+
+    同じ素材の同じ音で、タイムラインの端がちょうど合い（1 コマ空いた所は無音が出る）、素材の
+    時刻が丸めの差の内で続く所 :func:`cut_edges` と字幕の文言の確かめが同じ答えを使う
+    """
+    return (
+        earlier.media_id == later.media_id
+        and earlier.stream == later.stream
+        and earlier.end == later.start
+        and abs(later.source_start - earlier.source_end) <= _rounding(later, earlier, frame_seconds)
+    )
+
+
 def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
     """タイムラインの ``[start, end]`` の中で、素材の音が途切れる端を返す
 
@@ -296,15 +311,12 @@ def cut_edges(project: Project, start: int, end: int) -> list[CutEdge]:
         media = project.find_media(piece.media_id)
         if media is None:
             continue
-        # タイムラインの端はちょうど合う物だけ 1 コマ空いた所は無音が出るので、つながっていない
         continued_from = any(
-            other.end == piece.start
-            and abs(other.source_end - piece.source_start) <= _rounding(piece, other, frame_seconds)
+            split_seam(other, piece, frame_seconds)
             for other in _neighbours(tails, piece, piece.start)
         )
         continues = any(
-            other.start == piece.end
-            and abs(other.source_start - piece.source_end) <= _rounding(piece, other, frame_seconds)
+            split_seam(piece, other, frame_seconds)
             for other in _neighbours(heads, piece, piece.end)
         )
         ends_media = media.duration > 0 and piece.source_end >= media.duration - frame_seconds

@@ -13,7 +13,12 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 
 from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
-from sashimono.core.projection import burned_subtitles, heard_pieces, heard_timeline
+from sashimono.core.projection import (
+    HeardPiece,
+    burned_subtitles,
+    heard_pieces,
+    heard_timeline,
+)
 from sashimono.core.subtitle_timing import OFFSET_MS_RANGE
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
@@ -25,6 +30,7 @@ from sashimono.core.words import (
     heard_between,
     heard_words,
     phrases,
+    split_seam,
 )
 from sashimono.engine.audio.voice_edges import REACH
 from sashimono.engine.audio.waveform import Waveform
@@ -313,11 +319,12 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
         # 字幕が出ている間に鳴る音の片だけで数える その片が行の表示の外（寄せた・ずらした分）で
         # 鳴らす語も聞こえる側 別の所に置いた同じ所の音の片まで数えると、そちらで鳴る語のせいで
         # この置き方の欠けを見逃す
-        local = [
-            item
-            for item in heard_between(heard, media_id, stream, low - slack, high + slack)
-            if item.piece.start < high and item.piece.end > low
-        ]
+        # 分割しただけでつながる片は 1 つの音として数える 割っただけの前の片の語も鳴っている
+        near = heard_between(heard, media_id, stream, low - slack, high + slack)
+        playing = _joined_pieces(
+            [item.piece for item in near], low, high, project.rate.frame_duration
+        )
+        local = [item for item in near if item.piece in playing]
         sounding = {item.word for item in local}
         missing = [word for word in segment.words if word not in sounding]
         kept = [item for item in local if item.word in segment.words]
@@ -374,6 +381,30 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
             str(subtitle.clip_id),
         )
     return problems, len(blind)
+
+
+def _joined_pieces(
+    pieces: list[HeardPiece], low: int, high: int, frame_seconds: Fraction
+) -> list[HeardPiece]:
+    """``[low, high)`` に鳴る音の片と、それに分割しただけでつながる片（同じ素材の同じ音）"""
+    candidates: list[HeardPiece] = []
+    for piece in pieces:
+        if piece not in candidates:
+            candidates.append(piece)
+    found = [piece for piece in candidates if piece.start < high and piece.end > low]
+    grown = True
+    while grown:
+        grown = False
+        for piece in candidates:
+            if piece in found:
+                continue
+            if any(
+                split_seam(piece, other, frame_seconds) or split_seam(other, piece, frame_seconds)
+                for other in found
+            ):
+                found.append(piece)
+                grown = True
+    return found
 
 
 def _has_phrases(project: Project, key: tuple[MediaId, int]) -> bool:

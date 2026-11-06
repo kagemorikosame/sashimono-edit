@@ -580,6 +580,26 @@ class TestSubtitleWords:
         project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
         assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
 
+    def test_a_shifted_line_over_a_plain_split_is_fine(self, video_media: MediaItem) -> None:
+        # 割っただけで音が続く所で、前の片が字幕の表示と重ならないからと語を欠けと読むと、
+        # 音を何も消していないのに直せない問題が残る（PR #434 の CodeRabbit の指摘）
+        media = _media(video_media)
+        # 素材を 1.4 秒で割っただけ 「カメ」は前の片で鳴り、字幕は 3〜4 秒に出す
+        rate = video_media.video_streams[0].frame_rate
+        seam = seconds_to_frame(Fraction(7, 5), rate)
+        project = placed(
+            media,
+            _clip(media, 0, seam, Fraction(0)),
+            _clip(media, seam, 240 - seam, Fraction(7, 5)),
+        )
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        start, end = (seconds_to_frame(Fraction(n), project.rate) for n in (3, 4))
+        burned = replace(tracks[-1].clips[0], timeline_start=start, duration=end - start)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
     def test_a_shifted_line_over_cut_sound_is_still_reported(self, video_media: MediaItem) -> None:
         # 好みで遅く出した行でも、音を切って消した語は欠けとして返す 表示の外の語を広く聞こえる
         # 側に数えすぎると、本当に切った語まで見逃す
