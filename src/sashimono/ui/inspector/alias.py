@@ -13,6 +13,11 @@
 
 組にするのはクリップの ID・エフェクト（前の場面と後の場面）の ID・縁取りの層と層の
 エフェクトの ID 並びの何番目どうしで組む 数が違えば組まない（構成が違うので作り直す）
+
+エフェクトと層の ID は、組にした 2 本のクリップの物だけを入れ替える エフェクトの ID は
+プロジェクトの中で 1 つとは限らない（クリップを割ると、両方の片が同じ ID のエフェクトを
+持つ） 割った片を一緒に選んでいるとき、その片へのまとめ当ての命令まで入れ替えると、
+片に無い ID を指して当たらない（Codex の指摘）
 """
 
 from __future__ import annotations
@@ -46,7 +51,11 @@ def _strokes(clip: Clip) -> tuple[Stroke, ...]:
 class IdSwap:
     """元の ID と今の ID を入れ替える組 両向きに持つ 空なら何もしない"""
 
-    pairs: Mapping[str, str] = field(default_factory=dict)
+    #: クリップの ID の組 どこに出てきても入れ替える
+    clips: Mapping[str, str] = field(default_factory=dict)
+    #: エフェクトと縁取りの層の ID の組 組にしたクリップの中と、組にしたクリップを指す
+    #: 命令・在りかの中でだけ入れ替える
+    inner: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def between(cls, built: Clip, current: Clip) -> IdSwap | None:
@@ -63,7 +72,7 @@ class IdSwap:
             or len(_strokes(built)) != len(_strokes(current))
         ):
             return None
-        pairs: list[tuple[str, str]] = [(built.id, current.id)]
+        pairs: list[tuple[str, str]] = []
         pairs.extend(_stack_pairs(built.effects, current.effects))
         pairs.extend(_stack_pairs(built.after_effects, current.after_effects))
         for held, other in zip(_strokes(built), _strokes(current), strict=True):
@@ -71,17 +80,17 @@ class IdSwap:
                 return None
             pairs.append((held.id, other.id))
             pairs.extend(_stack_pairs(held.effects, other.effects))
-        both: dict[str, str] = {}
+        inner: dict[str, str] = {}
         for mine, theirs in pairs:
             if mine == theirs:
                 continue
-            both[mine] = theirs
-            both[theirs] = mine
-        return cls(both)
+            inner[mine] = theirs
+            inner[theirs] = mine
+        return cls({built.id: current.id, current.id: built.id}, inner)
 
     @property
     def active(self) -> bool:
-        return bool(self.pairs)
+        return bool(self.clips)
 
     def project(self, project: Project) -> Project:
         """組の ID を持つクリップの ID を入れ替えたプロジェクト ほかのクリップはそのまま
@@ -93,10 +102,10 @@ class IdSwap:
             return project
         timeline = project.timeline
         for track in timeline.tracks:
-            if not any(clip.id in self.pairs for clip in track.clips):
+            if not any(clip.id in self.clips for clip in track.clips):
                 continue
             clips = tuple(
-                self.apply(clip) if clip.id in self.pairs else clip for clip in track.clips
+                self.apply(clip) if clip.id in self.clips else clip for clip in track.clips
             )
             timeline = timeline.replace_track(track.with_clips(clips))
         return project.with_timeline(timeline)
@@ -106,33 +115,44 @@ class IdSwap:
 
         命令はデータクラスの欄を辿って作り直す データクラスでない命令は中が読めず、
         元の ID のまま外へ出ると、選んでいないクリップへ値が入る 見落とさないよう止める
+
+        クリップを指す物（``clip_id`` を持つ命令・在りか、クリップそのもの）の中では、
+        そのクリップが組にした物のときだけエフェクトと層の ID を入れ替える 指す先の無い
+        物（エフェクトの ID の文字だけなど）は、主のクリップの物として入れ替える
         """
         if not self.active:
             return value
         # 作り直した物は入れた物と同じ型（同じデータクラスか、同じ入れ物）
-        return cast("_T", self._swap(value))
+        return cast("_T", self._swap(value, inside=True))
 
-    def _swap(self, value: object) -> object:
+    def _swap(self, value: object, *, inside: bool) -> object:
         if isinstance(value, str):
             # ID は str の NewType 列挙の値（str を継いだ物）は組に入らないのでそのまま
-            return self.pairs.get(value, value)
+            if value in self.clips:
+                return self.clips[value]
+            return self.inner.get(value, value) if inside else value
         if isinstance(value, tuple):
-            return tuple(self._swap(item) for item in value)
+            return tuple(self._swap(item, inside=inside) for item in value)
         if isinstance(value, list):
-            return [self._swap(item) for item in value]
+            return [self._swap(item, inside=inside) for item in value]
         if isinstance(value, frozenset):
-            return frozenset(self._swap(item) for item in value)
+            return frozenset(self._swap(item, inside=inside) for item in value)
         if isinstance(value, MappingProxyType):
-            return MappingProxyType({key: self._swap(item) for key, item in value.items()})
+            return MappingProxyType(
+                {key: self._swap(item, inside=inside) for key, item in value.items()}
+            )
         if isinstance(value, dict):
-            return {key: self._swap(item) for key, item in value.items()}
+            return {key: self._swap(item, inside=inside) for key, item in value.items()}
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            owner = value.id if isinstance(value, Clip) else getattr(value, "clip_id", None)
+            if isinstance(owner, str):
+                inside = owner in self.clips
             changes: dict[str, object] = {}
             for each in dataclasses.fields(value):
                 if not each.init:
                     continue
                 before = getattr(value, each.name)
-                after = self._swap(before)
+                after = self._swap(before, inside=inside)
                 if after is not before and after != before:
                     changes[each.name] = after
             return dataclasses.replace(value, **changes) if changes else value

@@ -27,6 +27,7 @@ from sashimono.core.commands import (
     ParamPath,
     SetKeyframe,
     SetParam,
+    SplitClip,
 )
 from sashimono.core.commands.base import Command as BaseCommand
 from sashimono.core.model import AnimatedValue, Clip, ClipId, Effect, Project, Track, TrackKind
@@ -250,6 +251,37 @@ class TestSameLayout:
         assert sent.commands == [
             SetParam(ParamPath.of_clip(second.id, "opacity"), AnimatedValue(0.5))
         ]
+
+    def test_a_split_piece_chosen_together_keeps_its_effect(self, panel: InspectorPanel) -> None:
+        """壊れると、割った片を一緒に選んでいるとき、片へのまとめ当てが片に無いエフェクトの
+        ID を指して当たらない（割った片は同じ ID のエフェクトを持つ Codex の指摘）"""
+        project = _texts(("blur",), ("blur",))
+        first, second = _clips(project)
+        project = SplitClip(first.id, first.timeline_start + 10).apply(project)
+        pieces = [c for c in _clips(project) if c.id != second.id]
+        head, tail = sorted(pieces, key=lambda c: c.timeline_start)
+        assert head.effects[0].id == tail.effects[0].id
+        panel.set_project(project)
+        panel.set_clip(head.id)
+        body = _body(panel)
+        panel.set_selection((second.id, tail.id))
+        assert _body(panel) is body
+        sent = _Sent(panel)
+        _number(panel, str(head.effects[0].id), "radius").value_changed.emit(AnimatedValue(3.0))
+        assert sent.commands == [
+            SetParam(
+                ParamPath.of_effect(second.id, second.effects[0].id, "radius"),
+                AnimatedValue(3.0),
+            ),
+            SetParam(
+                ParamPath.of_effect(tail.id, tail.effects[0].id, "radius"),
+                AnimatedValue(3.0),
+            ),
+        ]
+        # 当ててみる 片に無い ID を指していると、ここで当たらずに落ちる
+        changed = project
+        for command in sent.commands:
+            changed = command.apply(changed)
 
     def test_typing_history_does_not_follow(self, panel: InspectorPanel) -> None:
         """壊れると、前のクリップで打った分を欄の中の取り消し（Ctrl+Z）で戻す操作が、
