@@ -343,7 +343,12 @@ from sashimono.core.search import (
     scene_spans,
     search_media,
 )
-from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming
+from sashimono.core.subtitle_timing import (
+    BURNED_NOTE,
+    OFFSET_MS_RANGE,
+    SubtitleTiming,
+    burned_copies,
+)
 from sashimono.core.timebase import (
     FrameRate,
     Rounding,
@@ -8187,7 +8192,8 @@ def _retime_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError(
             "segment_ids は字幕の ID（get_subtitles の segment_id）の配列で渡してください"
         )
-    only = {SegmentId(s) for s in _string_items(raw, "segment_ids")} if raw else None
+    # 空の配列は「選んだ行が無い」 全部の行と読むと、頼まれていない行まで動く
+    only = {SegmentId(s) for s in _string_items(raw, "segment_ids")} if raw is not None else None
     if only is not None:
         known = {s.id for s in transcript.segments}
         missing = sorted(str(s) for s in only - known)
@@ -8206,7 +8212,12 @@ def _retime_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
         return {"moved": 0, "segments": []}
     host.apply_commands([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
     before = {s.id: s for s in transcript.segments}
+    burned = burned_copies(
+        _project(host), media.id, media.transcript_stream(stream), [t[0] for t in command.times]
+    )
+    notes = {"burned_unchanged": burned, "note": BURNED_NOTE.format(count=burned)} if burned else {}
     return {
+        **notes,
         "moved": len(command.times),
         # 返事の上限に収める 動いた量は先頭の数行で分かる
         "segments": [
@@ -11566,6 +11577,7 @@ OPERATIONS: tuple[Operation, ...] = (
             " 寄せるのは前後 0.5 秒の声の出だしと終わりまで ずらす量は今の時刻から数える"
             "（2 回当てると 2 回ずれる） 次の行の頭は越えない 取り消し 1 回で戻る"
             " 返す segments は動いた行の頭と終わりの差（秒 先頭の 20 行まで）"
+            " 焼き込んだテキストは付いてこない（burned_unchanged に数を返す 焼き込み直す）"
         ),
         schema=_schema(
             {

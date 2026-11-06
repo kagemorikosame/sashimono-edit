@@ -7,13 +7,28 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 
-from sashimono.core.model import TranscriptSegment
+from sashimono.core.model import MediaId, Project, SegmentId, TranscriptSegment
+from sashimono.core.projection import burned_subtitles
 
-__all__ = ["MIN_LENGTH", "OFFSET_MS_RANGE", "SubtitleTiming", "retimed", "shifted"]
+__all__ = [
+    "BURNED_NOTE",
+    "MIN_LENGTH",
+    "OFFSET_MS_RANGE",
+    "SubtitleTiming",
+    "burned_copies",
+    "retimed",
+    "shifted",
+]
+
+#: 焼き込んだテキストが元の時刻のまま残ることの案内 字幕パネルと AI の返事で同じ文にする
+BURNED_NOTE = (
+    "焼き込んだテキスト {count} 個は元の時刻のままです"
+    " 合わせた時刻で出すには、テキストを消して焼き込み直してください"
+)
 
 #: ずらした後の行の長さの下限（秒） 終わりを早めすぎた行が 0 秒になって見えなくなるのを防ぐ
 #: 元からこれより短い行は元の長さまで
@@ -56,18 +71,21 @@ def shifted(
     負は早める 頭は 0 より前へ出さない 元は離れていた行どうしは重ねない（終わりを次の行の頭で
     止める） 重ねると焼き込みで前の字幕が切り詰められ、どちらの行が出ているか分からなくなる
     並びは開始の昇順のまま（頭はどの行も同じだけ動く）
+
+    頭を早めて 0 秒で止まった行どうしは同じ頭になる 次の行の頭で止めると前の行が 0 秒に潰れて
+    書き出しから消えるので、そのときだけは重ねて残す（見えないより重なる方がまし）
     """
     starts = [max(Fraction(0), start + start_offset) for start, _ in times]
     out: list[tuple[Fraction, Fraction]] = []
     for index, (start, end) in enumerate(times):
         new_start = starts[index]
-        limit: Fraction | None = None
-        if index + 1 < len(times) and end <= times[index + 1][0]:
-            limit = max(starts[index + 1], new_start)
-        # 短すぎる行を延ばすのも次の行の頭まで 重ならないことの方を先に守る
         least = new_start + min(end - start, MIN_LENGTH)
-        new_end = max(end + end_offset, least if limit is None else min(least, limit))
-        out.append((new_start, new_end if limit is None else min(new_end, limit)))
+        new_end = max(end + end_offset, least)
+        if index + 1 < len(times) and end <= times[index + 1][0]:
+            limit = starts[index + 1]
+            if limit >= least:
+                new_end = min(new_end, limit)
+        out.append((new_start, new_end))
     return out
 
 
@@ -86,3 +104,23 @@ def retimed(
         for segment, (start, end) in zip(segments, times, strict=True)
     ]
     return tuple(sorted(updated, key=lambda s: (s.start, s.end)))
+
+
+def burned_copies(
+    project: Project, media_id: MediaId, stream: int, segment_ids: Collection[SegmentId]
+) -> int:
+    """時刻を合わせた行から焼き込んだ、映るテキストのクリップの数
+
+    焼き込んだテキストは字幕の行とは別のクリップで、行の時刻を動かしても付いてこない 数を
+    知らせないと、合わせたつもりの字幕が書き出しでは元の時刻で出る ``stream`` は
+    :meth:`MediaItem.transcript_stream` でそろえた番号
+    """
+    wanted = set(segment_ids)
+    clips = {
+        item.clip.id
+        for item in burned_subtitles(project)
+        if item.origin.segment_id in wanted
+        and item.origin.stream == stream
+        and item.origin.media_id in (None, media_id)
+    }
+    return len(clips)

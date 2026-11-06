@@ -23,7 +23,7 @@ import numpy as np
 
 from sashimono.core.commands.subtitle import RetimeSegments
 from sashimono.core.model import MediaId, SegmentId, Transcript, TranscriptSegment
-from sashimono.core.subtitle_timing import SubtitleTiming, retimed, shifted
+from sashimono.core.subtitle_timing import MIN_LENGTH, SubtitleTiming, retimed, shifted
 from sashimono.engine.audio.waveform import Waveform
 
 __all__ = [
@@ -138,13 +138,22 @@ def retime_command(
         if chosen is not None and segment.id not in chosen:
             continue
         start, end = edges[index]
-        if index > 0 and _apart(lines[index - 1], segment):
-            start = max(start, edges[index - 1][1])
-        if index + 1 < len(lines) and _apart(segment, lines[index + 1]):
-            limit = edges[index + 1][0]
-            start = min(start, limit)
-            end = min(end, limit)
-        end = max(start, end)
+        least = min(segment.end - segment.start, MIN_LENGTH)
+        low = edges[index - 1][1] if index > 0 and _apart(lines[index - 1], segment) else None
+        high = (
+            edges[index + 1][0]
+            if index + 1 < len(lines) and _apart(segment, lines[index + 1])
+            else None
+        )
+        if low is not None and high is not None and high - low < least:
+            # 前後の行の間に見える長さが残らない 動かすと潰れるか重なるので、この行は動かさない
+            continue
+        if high is not None:
+            start = min(start, high - least)
+            end = min(end, high)
+        if low is not None:
+            start = max(start, low)
+        end = max(end, start + least)
         edges[index] = [start, end]
         if (start, end) != (segment.start, segment.end):
             times.append((segment.id, start, end))

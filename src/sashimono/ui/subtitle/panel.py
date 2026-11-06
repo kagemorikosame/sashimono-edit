@@ -88,7 +88,7 @@ from sashimono.core.projection import (
 )
 from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_speakers
-from sashimono.core.subtitle_timing import SubtitleTiming
+from sashimono.core.subtitle_timing import BURNED_NOTE, SubtitleTiming, burned_copies
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.core.words import attach_words
 from sashimono.effects.seams import seam_transition
@@ -1102,6 +1102,14 @@ class SubtitlePanel(QWidget):
             self.status_message.emit("動かす字幕はありませんでした（もう声に合っています）")
             return
         self.commands_requested.emit([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
+        burned = burned_copies(
+            self._project,
+            media.id,
+            media.transcript_stream(self._stream),
+            [segment_id for segment_id, _, _ in command.times],
+        )
+        if burned:
+            self.status_message.emit(BURNED_NOTE.format(count=burned))
 
     def _ask_retime(self, selected: int) -> tuple[SubtitleTiming, bool] | None:
         dialog = RetimeDialog(self.timing, selected=selected, parent=self)

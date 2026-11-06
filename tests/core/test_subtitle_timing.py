@@ -37,6 +37,11 @@ class TestShifted:
         ((start, end),) = shifted([(F(1), F(2))], F(0), F(-1))
         assert end - start == MIN_LENGTH
 
+    def test_lines_stopped_at_zero_do_not_vanish(self) -> None:
+        # 頭を早めて 2 行とも 0 秒で止まると、前の行が次の行の頭で 0 秒に潰れて書き出しから消える
+        out = shifted([(F(1, 10), F(1, 2)), (F(3, 5), F(1))], F(-1), F(0))
+        assert all(end - start > 0 for start, end in out)
+
     def test_the_order_stays(self) -> None:
         # 並びが崩れると、字幕の不変条件で作品へ入れられない
         out = shifted([(F(1), F(2)), (F(2), F(3)), (F(5), F(6))], F(-1, 2), F(1, 2))

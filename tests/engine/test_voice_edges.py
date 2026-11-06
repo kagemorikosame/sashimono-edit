@@ -249,6 +249,24 @@ class TestRetimeCommand:
         assert end <= _f(1.6)
         assert start <= end
 
+    def test_a_line_without_room_stays(self) -> None:
+        # 前後の行の間に見える長さが残らないのに動かすと、行が潰れるか隣と重なる
+        transcript = Transcript(
+            (
+                _segment(1.0, 1.5, "一", "a"),
+                _segment(1.5, 1.55, "二", "b"),
+                _segment(1.55, 2.0, "三", "c"),
+            )
+        )
+        command = retime_command(
+            MediaId("m"),
+            transcript,
+            SubtitleTiming(fit_to_voice=False, start_offset_ms=-300),
+            None,
+            only={SegmentId("b")},
+        )
+        assert command is None
+
     def test_nothing_to_move_gives_no_command(self) -> None:
         # 空の命令を履歴に積むと、何も変わらない「元に戻す」が 1 つ増える
         line = _segment(1.0, 2.0, "文", "a")

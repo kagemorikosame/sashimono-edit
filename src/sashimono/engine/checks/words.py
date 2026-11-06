@@ -49,6 +49,10 @@ _MIN_UNHEARD_CHARS = 2
 #: 短く、1 束も言い切らない 起こした字幕の行は切れ目で自動で切り詰められるので、前後の語の時刻の
 #: ずれ（0.1 秒）でも数コマ掛かることがあり、これを返すと直しようが無いまま検査に残り続ける
 _SLIVER_SECONDS = Fraction(1, 2)
+#: 字幕の行の前後でも聞こえる語と数える幅（秒） 行の時刻を声へ寄せる（#426 前後 0.5 秒まで）と、
+#: 語の時刻の方が行より早い所で最初の語が行の頭の外に出る 行の中だけで数えると、聞こえている
+#: 語を残した音に無いと報告する
+_HEARD_SLACK = Fraction(1, 2)
 #: 文言と語を比べるときに外す字 句読点は認識の語と字幕の文言で付き方が違う
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()\n")
 
@@ -276,6 +280,7 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
     戻り値は（問題、語の時刻が無く比べられなかった字幕の行の数）
     """
     heard = heard_words(project)
+    slack = seconds_to_frame(_HEARD_SLACK, project.rate, Rounding.CEIL)
     problems: list[Problem] = []
     done: set[tuple[str, int, int, str]] = set()
     blind: set[str] = set()
@@ -303,10 +308,11 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
         if not segment.words:
             blind.add(segment_id)
             return
-        missing = unheard_words(segment, heard, media_id, stream, low, high)
+        near = (low - slack, high + slack)
+        missing = unheard_words(segment, heard, media_id, stream, *near)
         kept = [
             item
-            for item in heard_between(heard, media_id, stream, low, high)
+            for item in heard_between(heard, media_id, stream, *near)
             if item.word in segment.words
         ]
         if not missing or not _claims(text, missing, kept):

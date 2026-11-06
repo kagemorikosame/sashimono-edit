@@ -20,6 +20,7 @@ from sashimono.core.model import (
     TranscriptSegment,
     new_media_id,
 )
+from sashimono.core.timebase import seconds_to_frame
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.checks import HIGH, MEDIUM, Problem
 from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
@@ -559,6 +560,23 @@ class TestSubtitleWords:
         # 壊れると、切っていない字幕まで食い違いとして返す
         media = _media(video_media)
         project = placed(media, _clip(media, 0, 60, Fraction(1)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_line_fitted_after_its_first_words_is_fine(self, video_media: MediaItem) -> None:
+        """字幕の行の頭を声へ寄せて（#426）、語の時刻より少し後ろから出す形
+
+        壊れると、音を切っていないのに、行の頭の外に出た最初の語を残した音に無いと報告する
+        """
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 240, Fraction(0)))
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        rate = project.rate
+        start = seconds_to_frame(Fraction(3, 2), rate)
+        end = seconds_to_frame(Fraction(26, 10), rate)
+        burned = replace(tracks[-1].clips[0], timeline_start=start, duration=end - start)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
         assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
 
     def test_one_particle_is_not_reported(self, video_media: MediaItem) -> None:

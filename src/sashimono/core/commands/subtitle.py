@@ -296,14 +296,19 @@ class RetimeSegments(Command):
     def apply(self, project: Project) -> Project:
         if not self.times:
             raise ValueError("時刻を合わせる字幕がありません")
-        transcript = project.require_media(self.media_id).transcript_for(self.stream)
+        item = project.require_media(self.media_id)
+        transcript = item.transcript_for(self.stream)
+        if transcript is None:
+            raise KeyError(f"素材に字幕が無い: {item.name}")
+        # 行の ID を 1 度だけ索引にする 行ごとに頭から探すと、全部の行を合わせる命令が行の数の
+        # 2 乗で重くなり、長い素材で編集画面が止まる
+        known = {s.id for s in transcript.segments}
         for segment_id, start, end in self.times:
             # 無い行はここで断る 黙って飛ばすと、合わせたつもりの行がずれたまま残る
-            transcript, _ = _locate(project, self.media_id, segment_id, self.stream)
+            if segment_id not in known:
+                raise KeyError(f"字幕が見つからない: {segment_id}")
             if end < start or start < 0:
                 raise ValueError(f"字幕の時刻が逆か負: {start} .. {end}")
-        if transcript is None:
-            raise KeyError("素材に字幕が無い")
         wanted = {segment_id: (start, end) for segment_id, start, end in self.times}
         segments = [
             replace(s, start=wanted[s.id][0], end=wanted[s.id][1]) if s.id in wanted else s

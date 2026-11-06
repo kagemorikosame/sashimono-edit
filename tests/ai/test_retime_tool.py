@@ -77,3 +77,27 @@ class TestRetimeSubtitles:
                 start_offset_ms=-100,
                 segment_ids=["無い"],
             )
+
+    def test_an_empty_choice_moves_nothing(self, host: FakeHost) -> None:
+        # 空の配列を全部の行と読むと、頼まれていない行まで早く出る
+        before = host.document.project
+        result = run(
+            host,
+            "retime_subtitles",
+            media_id=_media(host),
+            fit_voice=False,
+            start_offset_ms=-200,
+            segment_ids=[],
+        )
+        assert result == {"moved": 0, "segments": []}
+        assert host.document.project == before
+
+    def test_burned_text_is_told_to_be_left_behind(self, host: FakeHost) -> None:
+        # 焼き込んだテキストは行と別のクリップで付いてこない 知らせないと、合わせたつもりの
+        # 字幕が書き出しでは元の時刻で出る
+        run(host, "place_subtitles", media_id=_media(host))
+        result = run(
+            host, "retime_subtitles", media_id=_media(host), fit_voice=False, end_offset_ms=300
+        )
+        assert result["burned_unchanged"] >= 1
+        assert "焼き込み直して" in result["note"]
