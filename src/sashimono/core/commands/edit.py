@@ -850,11 +850,6 @@ class SplitClips(Command):
                     f"[{clip.timeline_start}, {clip.timeline_end}) の外"
                 )
             pending.append(clip)
-        if locked_groups(timeline, self.clip_ids):
-            raise ValueError(
-                "グループの中にロックしたレイヤーのクリップがあるので分割できません"
-                "（一部だけ割ると、束ねた物の長さが食い違います）"
-            )
 
         targets: dict[ClipId, Clip] = {}
         while pending:
@@ -870,6 +865,13 @@ class SplitClips(Command):
             # またがない相手は割らない リンク先の長さが違うときに片方だけ割ると同期が崩れ、
             # グループの短い仲間はその位置に中身が無い（前に残る）
             pending.extend(p for _, p in partners if p.id not in targets and _straddles(p, frame))
+        # 広げた後の全員で確かめる 渡したクリップのグループだけを見ると、リンクの相手が入った
+        # 別のグループのロックした仲間まで割ってしまう（Codex の指摘 #435）
+        if locked_groups(timeline, targets):
+            raise ValueError(
+                "グループの中にロックしたレイヤーのクリップがあるので分割できません"
+                "（一部だけ割ると、束ねた物の長さが食い違います）"
+            )
 
         # 後ろは新しいリンクにする 元のままだと、割ってできた左右が同じリンクに残り、片方を
         # 消すともう片方まで消える 映像・音声の後ろどうしで同じ新しいリンクを持つので、

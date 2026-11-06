@@ -140,6 +140,18 @@ class TestSplitting:
         with pytest.raises(ValueError, match="ロック"):
             SplitClips((clips[0].id,), 40).apply(project)
 
+    def test_a_locked_member_reached_through_a_link_refuses_too(self) -> None:
+        # 渡したクリップのグループだけを見ると、リンクの相手が入った別のグループのロックした仲間を
+        # 割ってしまう（Codex の指摘 #435） ロックしたレイヤーの物は人が守りたくて止めている
+        project, clips = _grouped((0, 100), (0, 100), locked=1)
+        lone = Clip(timeline_start=0, duration=100, source=TEXT.create(), link_group=GroupId("L"))
+        tracks = list(project.timeline.tracks)
+        tracks[0] = replace(tracks[0], clips=(replace(clips[0], link_group=GroupId("L")),))
+        tracks.append(Track(TrackKind.MIXED, "レイヤー 3", (lone,)))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        with pytest.raises(ValueError, match="ロック"):
+            SplitClips((lone.id,), 40).apply(project)
+
     def test_one_undo_brings_the_group_back(self) -> None:
         # 取り消しで分けたグループが戻らないと、割る前の束ね方を人が組み直すことになる
         project, clips = _grouped((0, 100), (0, 30))
