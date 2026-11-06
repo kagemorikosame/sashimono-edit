@@ -516,6 +516,17 @@ class TestMarqueeAnnounces:
     所を囲むと 1 回の動きに 100 ms 以上かかって枠が指に追いつかなかった
     """
 
+    @pytest.fixture(autouse=True)
+    def _released(self, view: TimelineView) -> Iterator[None]:
+        """試験の後でボタンを離す 押したまま終える試験（離す知らせが来ない形）がある
+
+        離さないと QTest が押したままと覚え、後で走る別の試験のドラッグが動かない
+        （スクロールバーを掴む試験が、全部を直列で走らせたときだけ落ちた）
+        """
+        yield
+        QTest.mouseRelease(view, Qt.MouseButton.RightButton, pos=_point(view, 0, 35))
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 35))
+
     def _heard(self, view: TimelineView) -> list[str]:
         heard: list[str] = []
         view.selection_changed.connect(heard.append)
