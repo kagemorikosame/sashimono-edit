@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
+    QFocusEvent,
     QKeyEvent,
     QMouseEvent,
     QPainter,
@@ -314,6 +315,12 @@ class TimelineView(QWidget):
         #: 問わない AI が選んだものも含む） Shift での範囲選択そのものは起点を
         #: 動かさない 動かすと、Shift を押したまま範囲を広げ直せない
         self._anchor: ClipId | None = None
+        #: 選択を変えたのに、まだ :attr:`selection_changed` を出していない 囲んでいる途中は
+        #: 出さない（#429） 枠にクリップが 1 本入るたびに設定パネルを作り直すと、1 回の動きに
+        #: 100 ms 以上かかって枠が指に追いつかなかった 離したときにまとめて出す
+        self._unannounced = False
+        #: :meth:`_group_members` の控え どのタイムラインから作ったかと、その表
+        self._group_cache: tuple[Timeline, dict[ClipId, tuple[ClipId, ...]]] | None = None
         self._last_height_change = -HEIGHT_MERGE_SECONDS
         self._drag = DragState()
         self._follow_playhead = True
@@ -747,22 +754,43 @@ class TimelineView(QWidget):
         primary = self.selected_clip
         return tuple(c for c in self._selection if c not in self._pulled or c == primary)
 
-    def set_selection(self, clip_ids: Iterable[ClipId], *, pulled: Iterable[ClipId] = ()) -> None:
+    def set_selection(
+        self,
+        clip_ids: Iterable[ClipId],
+        *,
+        pulled: Iterable[ClipId] = (),
+        announce: bool = True,
+    ) -> None:
         """選択を丸ごと入れ替える 重なった ID は 1 つにする（最後の位置を残す）
 
         ``pulled`` はグループの仲間として引き込んだだけのクリップ（:attr:`edit_targets`）
+        ``announce`` が偽なら :attr:`selection_changed` をまだ出さない 囲んでいる途中の
+        選択がそれで、離したとき（:meth:`announce_selection`）にまとめて 1 回出す
         """
         ordered = tuple(reversed(dict.fromkeys(reversed(tuple(clip_ids)))))
         kept = frozenset(pulled) & frozenset(ordered)
         if ordered == self._selection and kept == self._pulled:
+            if announce:
+                # 囲んでいる途中の選択と同じ物を選び直した（全選択など） 待っている知らせを
+                # 出す 出さないと、離すまで設定パネルが前の選択のまま残る
+                self.announce_selection()
             return
         self._selection = ordered
         self._pulled = kept
         self._anchor = self.selected_clip
-        # 主のクリップが同じでも知らせる 選択から外したクリップへ、設定パネルの
-        # まとめ当てが届いてしまう
-        self.selection_changed.emit(self.selected_clip or "")
+        self._unannounced = not announce
+        if announce:
+            # 主のクリップが同じでも知らせる 選択から外したクリップへ、設定パネルの
+            # まとめ当てが届いてしまう
+            self.selection_changed.emit(self.selected_clip or "")
         self.update()
+
+    def announce_selection(self) -> None:
+        """まだ知らせていない選択（囲んでいる途中の物）を知らせる 無ければ何もしない"""
+        if not self._unannounced:
+            return
+        self._unannounced = False
+        self.selection_changed.emit(self.selected_clip or "")
 
     def select_all(self) -> None:
         """全トラックのクリップを選ぶ ロックしたトラックも含める（見るだけなら困らない）"""
@@ -1277,6 +1305,9 @@ class TimelineView(QWidget):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt の命名規約
+        # 前の囲みの離す知らせが届かなかった（押したまま窓を切り替えた）ときの残り
+        # 知らせないままだと、設定パネルが前の選択のまま残る
+        self.announce_selection()
         if event.button() != Qt.MouseButton.LeftButton:
             return
         position = event.position().toPoint()
@@ -1690,7 +1721,8 @@ class TimelineView(QWidget):
             self._value_lines.release()
             return
         if drag.kind is DragKind.MARQUEE:
-            # 選択は動かしている間に決まっている 枠を消すだけ
+            # 選択は動かしている間に決まっている 設定パネルなどへ知らせて枠を消す
+            self.announce_selection()
             if len(self._selection) > 1:
                 self.status_message.emit(f"{len(self._selection)} 本を選択")
             self.update()
@@ -2132,6 +2164,16 @@ class TimelineView(QWidget):
             return
         event.accept()
 
+    def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802 - Qt の命名規約
+        # 囲んでいる途中でほかの窓へ移ると、離す知らせが来ないことがある 囲みをやめてから
+        # 知らせる やめないと、端の送りの時計が囲みを続け、知らせた後も選択が変わり続ける
+        if self._drag.kind is DragKind.MARQUEE:
+            self._edge_scroll.stop()
+            self._drag = DragState()
+            self.update()
+        self.announce_selection()
+        super().focusOutEvent(event)
+
     # --- 操作 ---
 
     def toggle_selected_track(self, attribute: str) -> bool:
@@ -2509,6 +2551,7 @@ class TimelineView(QWidget):
         self.set_selection(
             (*self._drag.marquee_base, *caught),
             pulled=(self._pulled | set(caught)) - set(inside),
+            announce=False,
         )
         self.update()
 
@@ -2546,12 +2589,37 @@ class TimelineView(QWidget):
         self.set_selection((*members, clip_id), pulled=(c for c in members if c != clip_id))
 
     def _group_of(self, clip_id: ClipId) -> tuple[ClipId, ...]:
-        """グループの仲間（自分を含む） グループに入っていなければ自分だけ"""
+        """グループの仲間（自分を含む） グループに入っていなければ自分だけ
+
+        仲間は :meth:`_group_members` の表から引く 1 本ごとに全クリップを舐めると、囲みで
+        枠に入った本数×全体の掛け算になり、2000 本を束ねた所を囲むと 1 回の動きが
+        最悪 46 ms かかった（#429）
+        """
+        return self._group_members().get(clip_id, (clip_id,))
+
+    def _group_members(self) -> dict[ClipId, tuple[ClipId, ...]]:
+        """グループに入ったクリップ → 仲間（自分を含み、トラックの並び順）の表
+
+        タイムラインが変わったときだけ作り直す（タイムラインは作り替えで変わるので、
+        同じ物かどうかで足りる） 並びは :meth:`Timeline.grouped_clips` と同じにする
+        """
         timeline = self._project.timeline
-        located = timeline.locate_clip(clip_id)
-        if located is None or located[1].group_id is None:
-            return (clip_id,)
-        return tuple(clip.id for _, clip in timeline.grouped_clips(located[1].group_id))
+        cached = self._group_cache
+        if cached is not None and cached[0] is timeline:
+            return cached[1]
+        groups: dict[GroupId, list[ClipId]] = {}
+        for track in timeline.tracks:
+            for clip in track.clips:
+                if clip.group_id is not None:
+                    groups.setdefault(clip.group_id, []).append(clip.id)
+        members = {
+            member: together
+            for listed in groups.values()
+            for together in (tuple(listed),)
+            for member in together
+        }
+        self._group_cache = (timeline, members)
+        return members
 
     def _clips_in_rect(self, rect: QRect) -> list[ClipId]:
         """枠に少しでも掛かったクリップ 全部を収めなくても選べる方が囲みやすい

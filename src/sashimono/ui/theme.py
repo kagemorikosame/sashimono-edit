@@ -581,9 +581,15 @@ def themed_style(widget: QWidget, make: Callable[[], str]) -> None:
     ``widget.setStyleSheet(f"color: {Colors.TEXT_MUTED.name()};")`` と書くと、
     その時のテーマの色が文字列に残り、切り替えても部品だけ前の色のまま残る
     同じ部品に 2 度当てたら、あとの作り方だけを覚える
+
+    今と同じスタイルシートなら当て直さない（#431） Qt は同じ文字列でも見た目を計算し直し、
+    設定パネルのキーフレームの ◀ ◆ ▶ では編集 1 回で 250 回ほど当て直して数 ms 掛かっていた
+    作り方は同じでも覚え直す（テーマを切り替えたときに、あとの作り方で作り直すため）
     """
     _styled[widget] = make
-    widget.setStyleSheet(make())
+    sheet = make()
+    if widget.styleSheet() != sheet:
+        widget.setStyleSheet(sheet)
 
 
 def _restyle() -> None:
