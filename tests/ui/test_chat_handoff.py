@@ -17,7 +17,7 @@ from sashimono.ai.bridge import Approval, Question
 from sashimono.ai.budget import LimitAction, Limits
 from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, shelf_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import UNGROUP_QUESTION, question_spec
+from sashimono.ai.operations import UNGROUP_CHOICES, QuestionSpec, question_spec
 from sashimono.ai.outbound import Outbound, SendAnswer, SendRequest
 from sashimono.ai.session import LIMIT_DETAIL, AgentEvent, EventKind
 from sashimono.core.commands import SplitClips
@@ -180,7 +180,8 @@ class TestEveryWayOfStopping:
         # 残らず、続きを頼まれた AI が同じ解除をまた試す（CodeRabbit の指摘 #435）
         widget, _ = recorded
         _send(widget, "トラックを移して")
-        widget._bridge._questions.put(Question(UNGROUP_QUESTION, gate="ungroup_clips"))
+        spec = QuestionSpec("グループを解除しますか", UNGROUP_CHOICES)
+        widget._bridge._questions.put(Question(spec, gate="ungroup_clips"))
         widget._check_question()
         widget._reply_question(selected, written)
         widget._handle(AgentEvent(EventKind.TURN_DONE))

@@ -36,6 +36,7 @@ from sashimono.ai.fixes import PASSES_AFTER_LIMIT, refuse_after_limit
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
+    FirstAsk,
     ImageResult,
     Operation,
     Pending,
@@ -304,8 +305,24 @@ class EditorBridge:
             return self._run_irreversible(operation, arguments)
         if operation.asks_first is not None and self.ask_first:
             # 尋ねた答えを許可の代わりにする 続けて許可の窓も出すと、同じことを 2 度聞かれる
-            self._agree_first(operation.name, operation.asks_first)
-            return self._execute(operation, arguments)
+            first = operation.asks_first
+            asked = self.call(partial(first, self._host, arguments))
+            if not isinstance(asked, FirstAsk):
+                raise ToolError(f"{operation.name} が問いの形を返しませんでした")
+            self._agree_first(operation.name, asked.spec)
+
+            def pinned() -> object:
+                # 答える間に人が選び直したり束を組み直したりしていたら、許した物と違う物を
+                # 解くことになる 編集画面のスレッドで、動かす直前に作り直して比べる
+                again = first(self._host, asked.arguments)
+                if again.basis != asked.basis:
+                    raise ToolError(
+                        "答える間に対象のグループが変わったので、動かしていません"
+                        " もう 1 度確かめてから呼び直してください"
+                    )
+                return operation.start(self._host, asked.arguments)
+
+            return self._execute(operation, asked.arguments, body=pinned)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)

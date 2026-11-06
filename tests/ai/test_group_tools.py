@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +18,9 @@ import pytest
 from sashimono.ai import operations as operations_module
 from sashimono.ai.bridge import EditorBridge, Question
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import UNGROUP_QUESTION, Operation, find_operation
+from sashimono.ai.operations import UNGROUP_CHOICES, Operation, find_operation
 from sashimono.ai.session import system_prompt
-from sashimono.core.commands import GroupClips, RippleCut
+from sashimono.core.commands import Command, GroupClips, RippleCut
 from sashimono.core.model import (
     Clip,
     GroupId,
@@ -149,6 +149,26 @@ class TestCuttingKeepsGroups:
         host.apply_commands([RippleCut(((20, 30), (50, 60)))], "無音をカット")
         assert _group(host, clips[0]) == _group(host, clips[1]) == clips[0].group_id
 
+    def test_the_silence_cut_tool_keeps_the_front_group(self, host: FakeHost) -> None:
+        # 道具の jet_cut を通しても、前に残った物は人が付けたグループのまま 後ろの欠片は
+        # 分割と同じく新しい束になる（#428 で確かめるよう求められた道具の呼び出し）
+        from tests.ui.test_subtitle_panel import make_waveform
+
+        project = host.document.project
+        video = project.timeline.tracks[0].clips[0]
+        caption = Clip(timeline_start=0, duration=video.duration, source=TEXT.create())
+        tracks = (*project.timeline.tracks, Track(TrackKind.VIDEO, "V2", (caption,)))
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        grouped = FakeHost(GroupClips((video.id, caption.id)).apply(project))
+        grouped.stub_waveform = make_waveform([(0.5, 700), (0.0, 400), (0.5, 800)])
+        group = _group(grouped, video)
+        result = _run(grouped, "jet_cut", media_id=str(project.media[0].id), keep_speech=False)
+        assert result["cuts"] == 1
+        assert _group(grouped, video) == _group(grouped, caption) == group
+        backs = [c for c in _all(grouped) if c.id not in (video.id, caption.id)]
+        assert len(backs) == 2
+        assert len({c.group_id for c in backs}) == 1 and backs[0].group_id not in (None, group)
+
     def test_cutting_clips_out_keeps_other_groups(self) -> None:
         # 切り取りはグループごと切る 残した別のグループまで解けると、束が黙って消える
         host, clips = _grouped((0, 100), (0, 100), (200, 50), (200, 50))
@@ -178,6 +198,21 @@ class TestCuttingKeepsGroups:
             _run(host, "move_clip", clip_id=str(clips[0].id), track_id=str(target))
         assert "ungroup_clips" not in str(caught.value)
         assert "ユーザーに確かめ" in str(caught.value)
+
+
+@dataclass(frozen=True, slots=True)
+class _Swap(Command):
+    """作品を差し替える 答える間に人が束を組み直したことを、履歴に載せて作る"""
+
+    project: Project
+
+    @property
+    def label(self) -> str:
+        return "組み直し"
+
+    def apply(self, project: Project) -> Project:
+        del project
+        return self.project
 
 
 def test_no_message_advises_ungrouping() -> None:
@@ -213,7 +248,7 @@ class TestAskingBeforeUngrouping:
         bridge = EditorBridge(host, auto_approve=True)
         done, box = call_in_thread(bridge, self._ungroup(), {"clip_ids": [str(clips[0].id)]})
         question = _take(bridge, done)
-        assert question.spec == UNGROUP_QUESTION
+        assert question.spec.choices == UNGROUP_CHOICES
         question.reply(("解除しない",))
         pump_until(bridge, done)
         assert isinstance(box.get("error"), ToolError)
@@ -231,6 +266,50 @@ class TestAskingBeforeUngrouping:
         assert bridge.take_approval() is None
         assert "error" not in box
         assert _group(host, clips[0]) is None and _group(host, clips[1]) is None
+
+    def test_the_question_says_how_much_will_be_ungrouped(self) -> None:
+        # 何を解くかが出ないと、思っていたより大きな束を解こうとしていても気付けない
+        # （CodeRabbit の指摘 #435）
+        host, clips = _grouped((0, 100), (0, 100), (0, 100))
+        bridge = EditorBridge(host, auto_approve=True)
+        done, _box = call_in_thread(bridge, self._ungroup(), {"clip_ids": [str(clips[0].id)]})
+        question = _take(bridge, done)
+        assert "グループ 1 個" in question.spec.text
+        assert "クリップ 3 本" in question.spec.text
+        question.reply(("解除しない",))
+        pump_until(bridge, done)
+
+    def test_choosing_again_while_asked_does_not_change_the_target(self) -> None:
+        # clip_ids を省くと選択中のクリップを解く 答える間に人が選び直したクリップを解くと、
+        # 許したのと違う束が解ける（CodeRabbit の指摘 #435）
+        host, clips = _grouped((0, 100), (0, 100), (200, 50), (200, 50))
+        project = GroupClips((clips[2].id, clips[3].id)).apply(host.document.project)
+        host = FakeHost(project)
+        other = _group(host, clips[2])
+        host.select_clips([clips[0].id])
+        bridge = EditorBridge(host, auto_approve=True)
+        done, box = call_in_thread(bridge, self._ungroup(), {})
+        question = _take(bridge, done)
+        host.select_clips([clips[2].id])
+        question.reply(("解除する",))
+        pump_until(bridge, done)
+        assert "error" not in box
+        assert _group(host, clips[0]) is None
+        assert _group(host, clips[2]) == _group(host, clips[3]) == other
+
+    def test_a_group_changed_while_asked_is_left_alone(self) -> None:
+        # 答える間に束が組み直されたのに解くと、人が見て許したのと違う束が消える
+        host, clips = _grouped((0, 100), (0, 100), (200, 50))
+        bridge = EditorBridge(host, auto_approve=True)
+        done, box = call_in_thread(bridge, self._ungroup(), {"clip_ids": [str(clips[0].id)]})
+        question = _take(bridge, done)
+        regrouped = GroupClips((clips[0].id, clips[2].id)).apply(host.document.project)
+        host.document.execute(_Swap(regrouped))
+        question.reply(("解除する",))
+        pump_until(bridge, done)
+        assert "変わった" in str(box.get("error"))
+        assert _group(host, clips[0]) is not None
+        assert _group(host, clips[0]) == _group(host, clips[2])
 
     def test_the_written_reason_reaches_the_assistant(self) -> None:
         # 書いた答えが届かないと、AI は断られた訳が分からず、同じ頼み方でまた尋ねる
