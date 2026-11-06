@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QDoubleSpinBox,
     QLineEdit,
     QPlainTextEdit,
@@ -85,6 +86,13 @@ def window(qt_application: QApplication) -> Iterator[MainWindow]:
     del qt_application
     created = _shown(MainWindow(_project(), confirm_unsaved=False))
     created._timeline.select(_clip_ids(created)[0])
+    # 設定パネルを広げ、欄を並べ終えてから触る 設定パネルの最小の幅は中身から決まり（#431 で
+    # 並べた後に測るようになった）、その幅ではスライダーがつまみ 1 つ分しかなく、掴んで
+    # 動かしても値が変わらない
+    dock = created._inspector.parentWidget()
+    assert isinstance(dock, QDockWidget)
+    created.resizeDocks([dock], [700], Qt.Orientation.Horizontal)
+    _flush()
     yield created
     created.close()
 

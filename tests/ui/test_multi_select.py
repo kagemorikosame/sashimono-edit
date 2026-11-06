@@ -11,7 +11,8 @@ from collections.abc import Iterator
 from dataclasses import replace
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtGui import QFocusEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -27,6 +28,7 @@ from sashimono.core.commands import (
     SetTrackHeights,
     SplitClip,
     TrimClips,
+    UngroupClips,
     insert_media,
 )
 from sashimono.core.model import (
@@ -47,6 +49,7 @@ from sashimono.ui.timeline import TimelineView
 _CTRL = Qt.KeyboardModifier.ControlModifier
 _SHIFT = Qt.KeyboardModifier.ShiftModifier
 _LEFT = Qt.MouseButton.LeftButton
+_NONE = Qt.KeyboardModifier.NoModifier
 
 
 def _project() -> Project:
@@ -504,6 +507,89 @@ class TestGroupedValues:
         assert {a, c} <= set(view.selected_clips)
         assert a in view.edit_targets
         assert c not in view.edit_targets
+
+
+class TestMarqueeAnnounces:
+    """囲んでいる途中は設定パネルなどへ知らせず、離したときに 1 回だけ知らせる（#429）
+
+    枠にクリップが 1 本入るたびに知らせると、そのたびに設定パネルを作り直し、200 本の
+    所を囲むと 1 回の動きに 100 ms 以上かかって枠が指に追いつかなかった
+    """
+
+    def _heard(self, view: TimelineView) -> list[str]:
+        heard: list[str] = []
+        view.selection_changed.connect(heard.append)
+        return heard
+
+    def _drag(self, view: TimelineView, *, modifiers: Qt.KeyboardModifier = _NONE) -> None:
+        QTest.mousePress(view, _LEFT, modifiers, _point(view, 0, 35))
+        QTest.mouseMove(view, _point(view, 0, 20))
+        QTest.mouseMove(view, _point(view, 0, 5))
+
+    def test_only_the_release_announces(self, view: TimelineView) -> None:
+        """壊れると、囲んでいる間ずっと設定パネルが作り直され、枠が引っ掛かる"""
+        a, _b, _c = _ids(view)
+        heard = self._heard(view)
+        self._drag(view)
+        assert heard == []
+        assert view.selected_clips == (a,)
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 5))
+        assert heard == [a]
+
+    def test_adding_with_ctrl_also_waits(self, view: TimelineView) -> None:
+        """壊れると、Ctrl で足す囲みだけ途中で知らせ続け、同じように重い"""
+        a, b, _c = _ids(view)
+        view.select(b)
+        heard = self._heard(view)
+        self._drag(view, modifiers=_CTRL)
+        assert heard == []
+        QTest.mouseRelease(view, _LEFT, _CTRL, _point(view, 0, 5))
+        assert heard == [a]
+        assert set(view.selected_clips) == {a, b}
+
+    def test_leaving_the_window_announces(self, view: TimelineView) -> None:
+        """壊れると、囲んでいる途中でほかの窓へ移ったとき（離す知らせが来ない）、設定パネルが
+        前の選択のまま残る"""
+        a, _b, _c = _ids(view)
+        heard = self._heard(view)
+        self._drag(view)
+        QApplication.sendEvent(
+            view, QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason)
+        )
+        assert heard == [a]
+
+    def test_a_lost_release_is_announced_by_the_next_press(self, view: TimelineView) -> None:
+        """壊れると、離す知らせが届かなかった囲みの選択を、設定パネルが知らないまま残る"""
+        a, _b, _c = _ids(view)
+        heard = self._heard(view)
+        self._drag(view)
+        QTest.mousePress(view, Qt.MouseButton.RightButton, pos=_point(view, 0, 35))
+        assert heard == [a]
+
+    def test_escape_while_dragging_still_ends_with_the_box(self, view: TimelineView) -> None:
+        """壊れると、途中の Esc で外した選択のまま設定パネルが残り、離した後の選択と食い違う"""
+        a, _b, _c = _ids(view)
+        heard = self._heard(view)
+        self._drag(view)
+        QTest.keyClick(view, Qt.Key.Key_Escape)
+        QTest.mouseMove(view, _point(view, 0, 4))
+        QTest.mouseRelease(view, _LEFT, pos=_point(view, 0, 4))
+        assert heard[-1] == a
+        assert view.selected_clips == (a,)
+
+
+class TestGroupLookup:
+    def test_the_members_follow_the_timeline(self, view: TimelineView) -> None:
+        """壊れると、グループを解いた後も囲みや選択で前の仲間が一緒に選ばれる（#429 で
+        仲間を表に覚えるようにした）"""
+        a, b, c = _ids(view)
+        view.set_project(GroupClips((a, c)).apply(view.project))
+        assert view._group_of(a) == (a, c)
+        assert view._group_of(b) == (b,)
+        view.set_project(UngroupClips((a, c)).apply(view.project))
+        assert view._group_of(a) == (a,)
+        view.set_project(GroupClips((b, c)).apply(view.project))
+        assert view._group_of(c) == (b, c)
 
 
 class TestLockedGroup:

@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,14 +24,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sashimono.core.commands import AddClip, Command, InsertGap, SetTrackHeights
+from sashimono.core.commands import (
+    AddClip,
+    AddMedia,
+    AddTrack,
+    Command,
+    InsertGap,
+    MoveClip,
+    SetFrameRate,
+    SetTrackHeights,
+)
 from sashimono.core.io import others_holding, project_presence_dir
 from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind
+from sashimono.core.timebase import FrameRate
 from sashimono.effects.sources import TEXT
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.preferences_dialog import PreferencesDialog
+from sashimono.ui.text_keys import TextFieldKeys
 from sashimono.ui.theme import Metrics
 from sashimono.ui.timeline import TimelineView
 from sashimono.ui.workspace import (
@@ -189,11 +201,25 @@ def _held(widget: QWidget, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> bool:
     キーを打って窓のショートカットが動いたかで見ると、窓が活性にならない機械（CI の
     Windows）では、守りが外れていても動かずに通り、守りが効いていても欄の外の試験が落ちる
     """
+    _focus(widget)
     event = QKeyEvent(QEvent.Type.ShortcutOverride, key, modifiers)
     # Qt もショートカットを探す前に受け取っていない印にしてから送る
     event.ignore()
     QApplication.sendEvent(widget, event)
     return event.isAccepted()
+
+
+def _focus(widget: QWidget) -> None:
+    """``widget`` へフォーカスを置く キーの知らせはフォーカスのある部品にしか来ない
+
+    見張りはフォーカスを受けた欄へ入る（#432） 活性でない窓では ``setFocus`` しても
+    アプリのフォーカスは動かないので、窓が活性になったときに Qt が出す知らせを真似る
+    """
+    widget.setFocus()
+    if QApplication.focusWidget() is not widget:
+        application = QApplication.instance()
+        assert isinstance(application, QApplication)
+        application.focusChanged.emit(QApplication.focusWidget(), widget)
 
 
 def _field_text(field: QWidget) -> str:
@@ -208,8 +234,8 @@ def _field_text(field: QWidget) -> str:
 class TestKeysWhileTyping:
     """入力欄に打っている間は、欄が使うキーで窓のショートカットを動かさない
 
-    見張り（:class:`TextFieldKeys`）はアプリに入れ、窓が活性かどうかを見ない どの試験も
-    窓が活性でない形と、出した形（活性になるかは機械しだい）の両方で見る
+    見張り（:class:`TextFieldKeys`）はフォーカスを受けた欄に入り、窓が活性かどうかを見ない
+    どの試験も窓が活性でない形と、出した形（活性になるかは機械しだい）の両方で見る
     """
 
     @pytest.fixture(params=["hidden", "shown"])
@@ -245,6 +271,7 @@ class TestKeysWhileTyping:
             field.selectAll()
         fake_clipboard.setText("12")
         before = shown.document.project
+        _focus(field)
         QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, CTRL_SHIFT))
         assert "12" in _field_text(field)
         assert shown.document.project == before
@@ -299,8 +326,37 @@ class TestKeysWhileTyping:
         shown._apply_shortcuts({"編集/貼り付け（挿入）": "Ctrl+Shift+B"})
         field = QLineEdit(shown)
         fake_clipboard.setText("12")
+        _focus(field)
         QApplication.sendEvent(field, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_B, CTRL_SHIFT))
         assert "12" not in field.text()
+
+    def test_events_outside_the_fields_do_not_go_through_python(
+        self, shown: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、マウスの動きや描き直しのたびに見張りの Python が走り、設定パネルを
+        作り直す 1 回でも数十 ms 重くなる（#432 アプリ全体に入れていた頃は 1 回で 1.8 万回）"""
+        seen: list[QEvent.Type] = []
+        original = TextFieldKeys.eventFilter
+
+        def counting(self: TextFieldKeys, watched: QObject, event: QEvent) -> bool:
+            seen.append(event.type())
+            return original(self, watched, event)
+
+        monkeypatch.setattr(TextFieldKeys, "eventFilter", counting)
+        _focus(QLineEdit(shown))
+        seen.clear()
+        QApplication.sendEvent(
+            shown._timeline,
+            QMouseEvent(
+                QEvent.Type.MouseMove,
+                QPointF(5, 5),
+                QPointF(5, 5),
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+        assert seen == []
 
     def test_the_window_action_still_inserts(self, shown: MainWindow) -> None:
         # 欄の外で押したときに動く窓の項目 活性に依らないように項目を直に引く
@@ -367,6 +423,65 @@ class TestTrackHeight:
         (command,) = commands
         assert isinstance(command, SetTrackHeights)
         assert len(command.heights) == 2
+
+
+#: 一覧を作り直したかを見る印 作り直すと行が新しくなり、印が消える
+_ROW_MARK = Qt.ItemDataRole.UserRole + 90
+
+
+class TestMediaPoolRebuild:
+    """編集のたびに素材の一覧を作り直さない（#432）"""
+
+    def _pool(self, media: MediaItem) -> tuple[MediaPoolWidget, Project]:
+        track = Track(TrackKind.VIDEO, "V1")
+        project = AddTrack(track).apply(Project.create(media=(media,)))
+        project = AddClip(track.id, Clip(timeline_start=0, duration=30, media_id=media.id)).apply(
+            project
+        )
+        pool = MediaPoolWidget(project)
+        pool._list.item(0).setData(_ROW_MARK, "前の行")
+        return pool, project
+
+    def test_an_edit_that_keeps_the_media_keeps_the_rows(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        """壊れると、クリップを動かすたびに素材の数だけ行を作り直し、素材 1000 本で編集 1 回に
+        20 ms ほど乗る"""
+        del qt_application
+        pool, project = self._pool(video_media)
+        track = project.timeline.tracks[0]
+        moved = MoveClip(track.clips[0].id, 10, track.id).apply(project)
+        assert moved.media is project.media
+        pool.set_project(moved)
+        assert pool._list.item(0).data(_ROW_MARK) == "前の行"
+
+    def test_adding_and_undoing_media_still_rebuilds(
+        self, qt_application: QApplication, video_media: MediaItem, tmp_path: Path
+    ) -> None:
+        """壊れると、素材を足しても一覧に出ず、取り消しても消えない"""
+        del qt_application
+        pool, project = self._pool(video_media)
+        added = AddMedia(MediaItem(path=tmp_path / "足した.wav", duration=Fraction(3))).apply(
+            project
+        )
+        pool.set_project(added)
+        assert pool._list.count() == 2
+        pool.set_project(project)
+        assert pool._list.count() == 1
+
+    def test_a_new_frame_rate_rewrites_the_lengths(
+        self, qt_application: QApplication, video_media: MediaItem
+    ) -> None:
+        """壊れると、プロジェクトのフレームレートを変えても素材の長さが前のコマ数のまま出る"""
+        del qt_application
+        # フレームレートはクリップの無いプロジェクトでしか変えられない
+        project = Project.create(media=(video_media,))
+        pool = MediaPoolWidget(project)
+        pool._list.item(0).setData(_ROW_MARK, "前の行")
+        changed = SetFrameRate(FrameRate(60)).apply(project)
+        assert changed.media is project.media
+        pool.set_project(changed)
+        assert pool._list.item(0).data(_ROW_MARK) is None
 
 
 class TestMediaPoolMenu:
