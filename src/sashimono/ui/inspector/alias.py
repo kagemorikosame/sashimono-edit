@@ -35,6 +35,11 @@ __all__ = ["IdSwap"]
 
 _T = TypeVar("_T")
 
+#: 人が入れた値を持つ欄 中の文字は ID ではないので入れ替えない 本文に ID と同じ文字を
+#: 打つと、別の ID の文字に書き換わって保存される（CodeRabbit の指摘） 値の型
+#: （:data:`~sashimono.core.model.ParamValue`）は ID を持たない
+_VALUES = frozenset({"value", "params", "static", "keyframes"})
+
 
 def _stack_pairs(
     built: tuple[Effect, ...], current: tuple[Effect, ...]
@@ -150,7 +155,7 @@ class IdSwap:
                 inside = owner in self.clips
             changes: dict[str, object] = {}
             for each in dataclasses.fields(value):
-                if not each.init:
+                if not each.init or each.name in _VALUES:
                     continue
                 before = getattr(value, each.name)
                 after = self._swap(before, inside=inside)

@@ -26,6 +26,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -317,8 +318,14 @@ class InspectorPanel(QWidget):
         #: 何のクリップの設定を見ているか（種類・名前・トラック）
         self._title = ClipHeader(self)
 
-        self._body, self._body_layout = _new_body()
+        #: 送りに入れる台 作り直しても残す（入れ替えると送りの位置が頭へ戻る）
+        self._body = QWidget(self)
+        self._holder = QVBoxLayout(self._body)
+        self._holder.setContentsMargins(0, 0, 0, 0)
+        #: 欄を並べる中身 作り直すたびに新しい物と入れ替える（:meth:`_rebuild`）
+        self._content, self._body_layout = _new_content()
         self._body_layout.addStretch(1)
+        self._holder.addWidget(self._content)
 
         scroll = QScrollArea(self)
         scroll.setWidget(self._body)
@@ -450,6 +457,8 @@ class InspectorPanel(QWidget):
             return
         primary = clip_ids[0] if clip_ids else None
         same_primary = self._real_selection[:1] == clip_ids[:1]
+        if not same_primary and not self._busy():
+            self._commit_typing()
         if not same_primary and self._busy():
             # スライダーを押している最中 作り直すと掴んでいた部品が消えてドラッグが切れ、
             # 向け直すと掴んだまま別のクリップの値を動かす 離したとき（:meth:`_after_interaction`）
@@ -464,6 +473,23 @@ class InspectorPanel(QWidget):
             self._retarget_others()
             return
         self._rebuild()
+
+    def _commit_typing(self) -> None:
+        """打ちかけて確定していない欄（数の欄・ファイルの欄）を、今の選びのうちに確定する
+
+        選びを変えてから確定させると、欄を離れたときの確定が新しい選びへ当たる（向け直した
+        欄では新しいクリップの値になる） 確定した命令はここで窓へ届き、今の選びのまま当たる
+        """
+        focus = self.window().focusWidget()
+        if focus is None or not self._body.isAncestorOf(focus):
+            return
+        if isinstance(focus, QAbstractSpinBox):
+            # 打った数字は離れるか Enter で確定する（打つたびには確定しない）
+            focus.interpretText()
+        elif isinstance(focus, QLineEdit) and focus.isModified():
+            # 2 度確定しないよう、確定した印を先に付ける（離れたときの確定は直したときだけ）
+            focus.setModified(False)
+            focus.editingFinished.emit()
 
     def _retarget_others(self) -> None:
         """出ている欄のまま、選びだけが変わった 値を入れ直す
@@ -486,7 +512,14 @@ class InspectorPanel(QWidget):
                 owner.forget_typing()
             else:
                 owner.continue_typing(None)
-        self._refresh_values()
+        if moved:
+            self._refresh_values()
+            return
+        # 主のクリップが同じなら値は変わらない 見出しの本数だけ直す 値まで入れ直すと、
+        # 数の欄に打ちかけて確定していない数字が、AI が選びを足しただけで消える
+        clip = self._clip()
+        if clip is not None:
+            self._show_identity(clip)
 
     def _selection_key(self) -> _SelectionKey:
         """今の選択を比べる形 主のクリップと、まとめて当てるほかのクリップの集まり
@@ -680,24 +713,30 @@ class InspectorPanel(QWidget):
         self._virtual_strokes.clear()
         self._focus_owners.clear()
         self._refreshers.clear()
-        # 新しい欄は、まだ画面に出ていない別の台へ組んでから 1 度で差し替える（#431）
+        # 新しい欄は、まだ画面に出ていない別の中身へ組んでから 1 度で差し替える（#431）
         # 出ている台へ 1 つずつ足すと、足すたびに Qt が見た目（スタイルシート）を当て直し、
-        # 選び直し 1 回の半分ほどがここに消えていた 古い台は見張り（WheelGuard）の探し先
+        # 選び直し 1 回の半分ほどがここに消えていた 古い中身は見張り（WheelGuard）の探し先
         # からも外れるので、新しく作った欄だけを探せばよい
-        self._body, self._body_layout = _new_body()
+        old = self._content
+        self._content, self._body_layout = _new_content()
         self._build()
-        self._wheel_guard.watch(self._body)
+        self._wheel_guard.watch(self._content)
         # 差し替えより先に覚える 古い台を外すとフォーカスが外れ、欄の確定（ファイルの欄の
         # 打ち終わり）から編集が来ることがある そこで前の構成と比べると、もう 1 度作り直す
         self._shown_layout = self._layout_key()
         self._shown_selection = self._selection_key()
         self._shown_values = self._values_key()
+        # 台は入れ替えず中身だけを入れ替える 台ごと入れ替えると送りの位置が頭へ戻り、
+        # 下の方のエフェクトを足した・触ったときに触っていた所が見えなくなる
+        self._holder.replaceWidget(old, self._content)
+        # すぐに出す 待つと、出す前の（隠れた）欄では中身の幅が測れない
+        self._content.show()
         # すぐには消さない 欄の知らせ（選び替えなど）の途中から作り直しに来ることがあり、
         # 知らせを出している部品をその場で消すと、戻った先で消えた部品を触って落ちる
-        old = self._scroll.takeWidget()
-        self._scroll.setWidget(self._body)
-        if old is not None:
-            old.deleteLater()
+        # 台から外しておく 残すと、消えるまでの間は古い欄も台の子として探される
+        old.hide()
+        old.setParent(None)
+        old.deleteLater()
         # 中身の幅は画面に出して見た目が当たってから測る 出す前は字の大きさが違う
         self._fit_width()
         if focus is not None:
@@ -1515,7 +1554,7 @@ class InspectorPanel(QWidget):
                         clip, effect, position, stroke=stroke, stroke_number=index + 1
                     )
                 )
-        add = QPushButton("＋ 縁取りを追加", self._body)
+        add = QPushButton("＋ 縁取りを追加", self._content)
         add.setObjectName("add_stroke")
         full = len(strokes) >= MAX_STROKES
         add.setEnabled(not full)
@@ -1760,8 +1799,11 @@ class InspectorPanel(QWidget):
         else:
             command = SetKeyframe(path, local, animated.at(local))
             label = "キーフレームを打つ"
+        # 出す前に今のクリップの在りかにしておく 出した命令で欄を作り直すと入れ替えが
+        # 消え、後から戻すと元のクリップの在りかをグラフエディタへ渡す
+        focused = self._swap.apply(path)
         self._send([command], label)
-        self.param_focused.emit(self._swap.apply(path))
+        self.param_focused.emit(focused)
 
     def _step_to_key(self, path: ParamPath, direction: int) -> None:
         """前（``-1``）か次（``1``）のキーへ再生位置を動かす クリップの外のキーは見ない"""
@@ -2279,8 +2321,8 @@ def _fraction(value: ParamValue, scale: int) -> Fraction:
     return Fraction(number).limit_denominator(1_000_000) / scale
 
 
-def _new_body() -> tuple[QWidget, QVBoxLayout]:
-    """欄を並べる台 送り（:class:`QScrollArea`）へ入れるまで画面には出ない"""
+def _new_content() -> tuple[QWidget, QVBoxLayout]:
+    """欄を並べる中身 台へ入れるまで画面には出ない"""
     body = QWidget()
     layout = QVBoxLayout(body)
     layout.setContentsMargins(8, 4, 8, 8)

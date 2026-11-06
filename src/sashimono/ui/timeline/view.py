@@ -770,6 +770,10 @@ class TimelineView(QWidget):
         ordered = tuple(reversed(dict.fromkeys(reversed(tuple(clip_ids)))))
         kept = frozenset(pulled) & frozenset(ordered)
         if ordered == self._selection and kept == self._pulled:
+            if announce:
+                # 囲んでいる途中の選択と同じ物を選び直した（全選択など） 待っている知らせを
+                # 出す 出さないと、離すまで設定パネルが前の選択のまま残る
+                self.announce_selection()
             return
         self._selection = ordered
         self._pulled = kept
@@ -2161,8 +2165,12 @@ class TimelineView(QWidget):
         event.accept()
 
     def focusOutEvent(self, event: QFocusEvent) -> None:  # noqa: N802 - Qt の命名規約
-        # 囲んでいる途中でほかの窓へ移ると、離す知らせが来ないことがある 設定パネルが
-        # 前の選択のまま残らないよう、ここで知らせる
+        # 囲んでいる途中でほかの窓へ移ると、離す知らせが来ないことがある 囲みをやめてから
+        # 知らせる やめないと、端の送りの時計が囲みを続け、知らせた後も選択が変わり続ける
+        if self._drag.kind is DragKind.MARQUEE:
+            self._edge_scroll.stop()
+            self._drag = DragState()
+            self.update()
         self.announce_selection()
         super().focusOutEvent(event)
 

@@ -250,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--repeat", type=int, default=5, help="選び直しと編集を何往復するか")
     args = parser.parse_args(argv)
+    if args.repeat < 1:
+        parser.error("--repeat は 1 以上にする")
     app = QApplication.instance() or QApplication([])
     assert isinstance(app, QApplication)
 

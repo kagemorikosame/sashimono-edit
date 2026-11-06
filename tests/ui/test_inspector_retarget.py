@@ -89,7 +89,7 @@ class _Sent:
 
 
 def _body(panel: InspectorPanel) -> QWidget:
-    return panel._body
+    return panel._content
 
 
 def _number(panel: InspectorPanel, owner: str, name: str) -> TrackEditor:
@@ -306,6 +306,62 @@ class TestSameLayout:
         assert not area.document().isUndoAvailable()
 
 
+class TestTypedButNotCommitted:
+    def _typed(self, panel: InspectorPanel, text: str) -> QDoubleSpinBox:
+        """不透明度の数の欄にフォーカスを置き、確定せずに打つ"""
+        box = _number(panel, "clip", "opacity").findChild(QDoubleSpinBox)
+        assert box is not None
+        panel.window().show()
+        box.setFocus()
+        _flush()
+        line = box.lineEdit()
+        line.selectAll()
+        line.insert(text)
+        return box
+
+    def test_a_number_being_typed_reaches_the_old_clip(self, panel: InspectorPanel) -> None:
+        """壊れると、打ちかけの数字が選び替えた後で確定し、新しく選んだクリップへ入る"""
+        project = _texts((), ())
+        first, second = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        sent = _Sent(panel)
+        self._typed(panel, "0.25")
+        panel.set_clip(second.id)
+        assert sent.commands == [
+            SetParam(ParamPath.of_clip(first.id, "opacity"), AnimatedValue(0.25))
+        ]
+
+    def test_adding_others_keeps_the_typed_number(self, panel: InspectorPanel) -> None:
+        """壊れると、AI が選びを足しただけで打ちかけの数字が消える"""
+        project = _texts((), ())
+        first, second = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        box = self._typed(panel, "0.25")
+        panel.set_selection((first.id, second.id))
+        assert box.lineEdit().text().startswith("0.25")
+
+
+class TestScroll:
+    def test_a_rebuild_keeps_the_scroll(self, panel: InspectorPanel) -> None:
+        """壊れると、エフェクトを足すたびに設定パネルが頭へ戻り、触っていた所を探し直す"""
+        project = _texts(("blur", "mosaic", "blur", "mosaic"), ())
+        first, _second = _clips(project)
+        panel.resize(400, 300)
+        panel.show()
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        _flush()
+        bar = panel._scroll.verticalScrollBar()
+        assert bar.maximum() > 200
+        bar.setValue(200)
+        blur = registry.require("blur").create()
+        panel.set_project(AddEffect(first.id, blur).apply(project))
+        _flush()
+        assert bar.value() == 200
+
+
 class TestDifferentLayout:
     def test_a_different_effect_list_rebuilds(self, panel: InspectorPanel) -> None:
         """壊れると、エフェクトの違うクリップへ選び替えても前のクリップの欄が並んだまま残る"""
@@ -434,6 +490,16 @@ class TestIdSwap:
         swap = IdSwap.between(first, second)
         assert swap is not None
         assert swap.apply({first.id: first.id}) == {second.id: second.id}
+
+    def test_typed_text_is_not_taken_for_an_id(self) -> None:
+        """壊れると、本文に ID と同じ文字を打ったとき、別の ID の文字に書き換わって入る"""
+        first, second = self._pair()
+        swap = IdSwap.between(first, second)
+        assert swap is not None
+        command = SetParam(ParamPath.of_source(first.id, "text"), str(first.effects[0].id))
+        assert swap.apply(command) == SetParam(
+            ParamPath.of_source(second.id, "text"), str(first.effects[0].id)
+        )
 
     def test_a_different_count_is_not_paired(self) -> None:
         """壊れると、数の違う並びを何番目どうしで組み、違うエフェクトへ値が入る"""

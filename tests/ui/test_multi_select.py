@@ -558,6 +558,26 @@ class TestMarqueeAnnounces:
         )
         assert heard == [a]
 
+    def test_choosing_the_same_while_dragging_announces(self, view: TimelineView) -> None:
+        """壊れると、囲みと同じ物を選び直した（全選択など）ときに知らせず、離すまで
+        設定パネルが前の選択のまま残る"""
+        a, _b, _c = _ids(view)
+        heard = self._heard(view)
+        self._drag(view)
+        view.set_selection((a,))
+        assert heard == [a]
+
+    def test_leaving_the_window_ends_the_box(self, view: TimelineView) -> None:
+        """壊れると、知らせた後も端の送りが囲みを続け、設定パネルと違う選択に変わり続ける"""
+        heard = self._heard(view)
+        self._drag(view)
+        QApplication.sendEvent(
+            view, QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason)
+        )
+        QTest.mouseMove(view, _point(view, 1, 5))
+        assert view.selected_clips == (_ids(view)[0],)
+        assert len(heard) == 1
+
     def test_a_lost_release_is_announced_by_the_next_press(self, view: TimelineView) -> None:
         """壊れると、離す知らせが届かなかった囲みの選択を、設定パネルが知らないまま残る"""
         a, _b, _c = _ids(view)
