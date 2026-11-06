@@ -20,11 +20,14 @@ from sashimono.engine.colorspace import color_tags
 from sashimono.engine.decode.rational import as_fraction
 
 __all__ = [
+    "KEYFRAME_SCAN_GAPS",
+    "KEYFRAME_SCAN_SECONDS",
     "PROBE_CACHE_SIZE",
     "ROTATION_PACKET_LIMIT",
     "ProbeError",
     "clear_probe_cache",
     "forget_probe",
+    "keyframe_gap",
     "media_origin",
     "moving_pictures",
     "probe_media",
@@ -49,6 +52,16 @@ _log = logging.getLogger(__name__)
 
 #: 調べた結果を覚えておく素材の数 1 本あたり数百バイトなので、多めに持っても軽い
 PROBE_CACHE_SIZE = 512
+
+#: キーフレームの間隔を調べるときに、最初のキーフレームから読む長さ（秒 素材の中の時刻）
+#: 全部を読むと長い録画で何秒も掛かる 頭の数秒は場面の切り替わりでキーフレームが
+#: 細かく入ることがあるので、決まった間隔が 1 回は現れる長さを取る
+KEYFRAME_SCAN_SECONDS = Fraction(12)
+
+#: キーフレームの間隔を調べるときに、これだけの間隔を見たら読むのをやめる
+#: 全部がキーフレームの素材（ProRes や MJPEG）は 1 つずつが重いので、12 秒ぶん読むと
+#: 数百 MB になる 間隔の短い素材はこれで早く切り上がる
+KEYFRAME_SCAN_GAPS = 8
 
 _Facts = tuple[Fraction, tuple[VideoStreamInfo, ...], tuple[AudioStreamInfo, ...]]
 
@@ -475,3 +488,76 @@ def _display_rotation(container: av.container.InputContainer, stream: av.VideoSt
     # 絵の回転は ffprobe と同じく反時計回りの角度 表示時に必要なのは時計回りなので反転する
     clockwise = round(-float(frame.rotation)) % 360
     return clockwise if clockwise in (0, 90, 180, 270) else 0
+
+
+def keyframe_gap(
+    path: Path, stream_index: int | None = None, *, enough: Fraction | None = None
+) -> Fraction | None:
+    """映像の頭から見た、キーフレームから次のキーフレーム（か終わり）までの一番長い間（秒）
+
+    飛んだ先の 1 コマを出すには、手前のキーフレームから順に復号し直すしかない この間が
+    長い素材ほど、再生位置を動かすたびに待たされる（:mod:`sashimono.engine.cache.proxy` の表）
+    控えを作るかを決めるためだけに使う
+
+    パケットを取り出すだけで復号はしない 読むのは最初のキーフレームから
+    :data:`KEYFRAME_SCAN_SECONDS` ぶんか、:data:`KEYFRAME_SCAN_GAPS` 個の間隔を見るまで
+    ``enough`` を渡すと、それより長い間を見た所でやめて、その時点の長さを返す
+    長いと分かれば十分なので、50 秒間隔の素材を 50 秒ぶん読まずに済む
+    どちらで止めても、返すのは読んだ所までの長さ 本当の間はそれより長いことがある
+
+    素材の終わりまでに次のキーフレームが無ければ、最後のパケットまでを間として数える
+    短い素材でキーフレームが頭に 1 つだけなら、その素材のどこへ飛んでも頭から読み直すため
+    映像が無い・キーフレームが 1 つも無い・開けないときは ``None``（分からない）
+    """
+    try:
+        container = av.open(str(path))
+    except (av.error.FFmpegError, OSError):
+        return None
+    with container:
+        pictures = moving_pictures(container)
+        if not pictures:
+            return None
+        stream = (
+            pictures[0]
+            if stream_index is None
+            else next((s for s in pictures if s.index == stream_index), pictures[0])
+        )
+        if stream.time_base is None:
+            return None
+        base = as_fraction(stream.time_base)
+        first: Fraction | None = None
+        last: Fraction | None = None
+        latest: Fraction | None = None
+        longest = Fraction(0)
+        gaps = 0
+        try:
+            for packet in container.demux(stream):
+                if packet.pts is None:
+                    continue
+                at = packet.pts * base
+                # B フレームは表示の順と並びが違い、前のパケットより早い時刻を持つ
+                # 一番後ろの時刻で数えないと、間が縮んで見える
+                latest = at if latest is None else max(latest, at)
+                if packet.is_keyframe:
+                    if last is not None and at > last:
+                        longest = max(longest, at - last)
+                        gaps += 1
+                    if first is None:
+                        first = at
+                    last = at if last is None else max(last, at)
+                elif last is not None:
+                    longest = max(longest, latest - last)
+                if enough is not None and longest > enough:
+                    return longest
+                if first is not None and (
+                    gaps >= KEYFRAME_SCAN_GAPS or latest - first >= KEYFRAME_SCAN_SECONDS
+                ):
+                    return longest
+        except (av.error.FFmpegError, OSError, ValueError) as exc:
+            # 途中で壊れていても、そこまでに見た間は本物 分からないにはしない
+            _log.warning("キーフレームの間隔を読む途中で止まった: %s (%s)", path, exc)
+        if last is None:
+            return None
+        if latest is not None:
+            longest = max(longest, latest - last)
+        return longest

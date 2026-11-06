@@ -339,6 +339,11 @@ class Preferences:
     use_proxy: bool = True
     #: 控えの縦の画素数
     proxy_height: int = 540
+    #: キーフレームの間隔が長い素材（録画ソフトの既定で撮った物など）は、1080p 以下でも控えを作る
+    #: 既定は入 飛ぶたびに待たされる理由は、知らない人には分からない 控えを作る間は
+    #: CPU か GPU を使うので、それを嫌う人は切れる 線と実測は
+    #: :data:`sashimono.engine.cache.proxy.KEYFRAME_GAP_LIMIT` の所の表
+    proxy_long_gop: bool = True
     #: 高さが :data:`AUTO_QUALITY_HEIGHT` 以上の素材を読み込んだら、プレビューの画質を自動で落とす
     #: 画面の大きさは見ない（設定画面の文言は ``preferences_dialog.AUTO_QUALITY_TEXT``）
     auto_quality: bool = True
@@ -999,6 +1004,7 @@ class PreferenceStore:
         return Preferences(
             use_proxy=_flag(data.get("use_proxy"), plain.use_proxy),
             proxy_height=_size(data.get("proxy_height"), plain.proxy_height),
+            proxy_long_gop=_flag(data.get("proxy_long_gop"), plain.proxy_long_gop),
             auto_quality=_flag(data.get("auto_quality"), plain.auto_quality),
             auto_quality_divisor=_divisor(
                 data.get("auto_quality_divisor"), plain.auto_quality_divisor
