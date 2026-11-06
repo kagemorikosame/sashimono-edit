@@ -104,6 +104,13 @@ def main() -> int:
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--jumps", type=int, default=80)
     args = parser.parse_args()
+    # 素材を作ってから落ちると、何分も待たせた後に IndexError で終わる 先に断る
+    if args.jumps <= 0:
+        parser.error("--jumps は 1 以上にする")
+    if args.seconds <= 2:
+        parser.error("--seconds は 2 より大きくする（終わりの 2 秒へは飛ばない）")
+    if any(gap <= 0 for gap in args.gaps):
+        parser.error("--gaps は 1 以上にする")
     if shutil.which("ffmpeg") is None:
         print("ffmpeg が無いので測らない")
         return 0

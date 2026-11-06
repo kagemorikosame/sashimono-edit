@@ -1081,10 +1081,6 @@ class MainWindow(QMainWindow):
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
         reencoded = preferences.encoder_priority != self._preferences.encoder_priority
-        # 間隔の長い素材への控え（#430）を切り替えたときも作り直す 置き場が切ったことを
-        # 覚えて作った控えを返さなくなり、走っている変換も止まる 入れたときは下で全部の
-        # 素材を頼み直すので、間隔を調べ直して作る
-        regopped = preferences.proxy_long_gop != self._preferences.proxy_long_gop
         previous = self._preferences
         scenes_before = self._scenes_on_import()
         screen_before = self._screen_on_import()
@@ -1099,7 +1095,7 @@ class MainWindow(QMainWindow):
         # 予約を今の好みにそろえる 決まりは起動の頭と同じ（update.flow.reconcile）
         self._updates.apply_preferences(preferences)
 
-        if resized or stopped or reencoded or regopped:
+        if resized or stopped or reencoded:
             self._proxies.close()
             self._proxies = ProxyBuilder(
                 ProxyStore(height=preferences.proxy_height, long_gop=preferences.proxy_long_gop),
@@ -1107,6 +1103,10 @@ class MainWindow(QMainWindow):
             )
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
+        # 間隔の長い素材への控え（#430）は係を作り直さずに切り替える 作り直すと走っている
+        # 4K の変換まで止まる 係は置き場を替え、切ったときは小さい素材の変換だけを止める
+        # 入れたときは下で全部の素材を頼み直すので、間隔を調べ直して作る
+        self._proxies.set_long_gop(preferences.proxy_long_gop)
         if not preferences.pool_progress:
             # 次の間隔を待たずに外す 切ったのに行の後ろに古い割合が残って見える
             self._media_pool.set_progress({})

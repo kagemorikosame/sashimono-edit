@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
@@ -519,7 +520,9 @@ def keyframe_gap(
 
     素材の終わりまでに次のキーフレームが無ければ、最後のパケットまでを間として数える
     短い素材でキーフレームが頭に 1 つだけなら、その素材のどこへ飛んでも頭から読み直すため
-    映像が無い・キーフレームが 1 つも無い・開けないときも ``None``
+    映像が無い・キーフレームが 1 つも無い・開けないときも ``None`` 途中で読めなくなったときも、
+    ``enough`` より長い間をもう見ていなければ ``None`` 短い値を返すと、一時の読み損ないで
+    「控えは要らない」と決まってしまう
     """
     deadline = time.monotonic() + KEYFRAME_SCAN_TIMEOUT
     try:
@@ -541,37 +544,62 @@ def keyframe_gap(
         base = as_fraction(stream.time_base)
         try:
             head = _scan_gaps(container, stream, base, enough, deadline)
-            if head is None or (enough is not None and head > enough):
-                return head
-            middle = _middle_of(container)
+            if head is None or (enough is not None and head.longest > enough):
+                return None if head is None else head.longest
+            middle = _middle_of(container, head.reached)
             if middle is None:
-                return head
+                return head.longest
             # 真ん中の手前のキーフレームへ戻ってから、頭と同じ読み方で読む
             container.seek(int(middle / base), stream=stream, backward=True)
             later = _scan_gaps(container, stream, base, enough, deadline)
         except _TooSlowError:
             _log.warning("キーフレームの間隔を読むのに時間が掛かりすぎた: %s", path)
             return None
-        except (av.error.FFmpegError, OSError, ValueError) as exc:
-            # 真ん中へ飛べない素材もある 頭で見た間は本物なので、分からないにはしない
+        except _ReadFailedError as exc:
+            # 長いと分かる前に読めなくなった 短い値を返すと、呼ぶ側が「要らない」と覚え、
+            # 置き場が直った後も調べ直さない 分からないにして、次に頼まれたとき読み直させる
             _log.warning("キーフレームの間隔を読む途中で止まった: %s (%s)", path, exc)
-            return head
-        return head if later is None else max(head, later)
+            return exc.longest if enough is not None and exc.longest > enough else None
+        except (av.error.FFmpegError, OSError, ValueError) as exc:
+            # 真ん中へ飛べなかった 一時の読み損ないかもしれないので、短いとは決めない
+            _log.warning("キーフレームの間隔を読む途中で止まった: %s (%s)", path, exc)
+            return None
+        return head.longest if later is None else max(head.longest, later.longest)
 
 
 class _TooSlowError(Exception):
     """キーフレームの間隔を読むのに :data:`KEYFRAME_SCAN_TIMEOUT` より掛かった"""
 
 
-def _middle_of(container: av.container.InputContainer) -> Fraction | None:
-    """真ん中も読む値打ちがあれば、その時刻（秒） 頭で読んだ範囲と重なる短い素材は ``None``"""
+class _ReadFailedError(Exception):
+    """キーフレームの間隔を読む途中で読めなくなった ``longest`` はそれまでに見た一番長い間"""
+
+    def __init__(self, longest: Fraction, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.longest = longest
+
+
+@dataclass(frozen=True, slots=True)
+class _Scanned:
+    """1 か所を読んだ結果"""
+
+    #: 見た中で一番長い間（秒）
+    longest: Fraction
+    #: 読み終えた所の時刻（秒 PTS の数え方）
+    reached: Fraction
+
+
+def _middle_of(container: av.container.InputContainer, reached: Fraction) -> Fraction | None:
+    """真ん中も読むなら、その時刻（秒） 頭で真ん中まで読み終えていれば ``None``
+
+    素材の長さだけで決めない 間隔を数えて早く切り上げると、20 秒の素材でも 3 秒しか
+    読んでいないことがあり、後ろの長い間隔を見落とす
+    """
     if container.duration is None:
         return None
-    length = Fraction(container.duration, av.time_base)
-    if length <= 2 * KEYFRAME_SCAN_SECONDS:
-        return None
     start = Fraction(container.start_time or 0, av.time_base)
-    return start + length / 2
+    middle = start + Fraction(container.duration, av.time_base) / 2
+    return middle if middle > reached else None
 
 
 def _scan_gaps(
@@ -580,12 +608,11 @@ def _scan_gaps(
     base: Fraction,
     enough: Fraction | None,
     deadline: float,
-) -> Fraction | None:
+) -> _Scanned | None:
     """今の位置からパケットを読み、最初のキーフレームから見た一番長い間
 
-    キーフレームが無ければ ``None``
-
-    止める決まりは :func:`keyframe_gap` に書いた 時間が掛かりすぎたら :class:`_TooSlowError`
+    キーフレームが無ければ ``None`` 止める決まりは :func:`keyframe_gap` に書いた
+    時間が掛かりすぎたら :class:`_TooSlowError`、途中で読めなくなったら :class:`_ReadFailedError`
     """
     first: Fraction | None = None
     last: Fraction | None = None
@@ -612,16 +639,14 @@ def _scan_gaps(
             elif last is not None:
                 longest = max(longest, latest - last)
             if enough is not None and longest > enough:
-                return longest
+                return _Scanned(longest, latest)
             if first is not None and (
                 gaps >= KEYFRAME_SCAN_GAPS or latest - first >= KEYFRAME_SCAN_SECONDS
             ):
-                return longest
+                return _Scanned(longest, latest)
     except (av.error.FFmpegError, OSError, ValueError) as exc:
-        # 途中で壊れていても、そこまでに見た間は本物 分からないにはしない
-        _log.warning("キーフレームの間隔を読む途中で止まった: %s", exc)
-    if last is None:
+        raise _ReadFailedError(longest, exc) from exc
+    if last is None or latest is None:
         return None
-    if latest is not None:
-        longest = max(longest, latest - last)
-    return longest
+    # 終わりまで読んだ 最後のキーフレームから終わりまでも間に数える
+    return _Scanned(max(longest, latest - last), latest)

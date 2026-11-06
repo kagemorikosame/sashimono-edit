@@ -75,8 +75,9 @@ def _ffmpeg(path: Path, arguments: str) -> Path:
 class _Counted:
     """開いた素材の包み 取り出したパケットを数える PyAV の型は差し替えられないので包む"""
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, fail_after: int | None = None) -> None:
         self._inner = inner
+        self._fail_after = fail_after
         self.packets = 0
 
     def __enter__(self) -> _Counted:
@@ -88,6 +89,9 @@ class _Counted:
 
     def demux(self, *args: object, **kwargs: object) -> Iterator[Any]:
         for packet in self._inner.demux(*args, **kwargs):
+            if self._fail_after is not None and self.packets >= self._fail_after:
+                # 外付けの円盤が抜けた・共有フォルダが切れたときの読み損ない
+                raise OSError("読めなくなった")
             self.packets += 1
             yield packet
 
@@ -95,13 +99,18 @@ class _Counted:
         return getattr(self._inner, name)
 
 
-def _count_packets(monkeypatch: pytest.MonkeyPatch) -> list[_Counted]:
-    """これから間隔を読むときに開く素材を包み、その一覧を返す"""
+def _count_packets(
+    monkeypatch: pytest.MonkeyPatch, *, fail_after: int | None = None
+) -> list[_Counted]:
+    """これから間隔を読むときに開く素材を包み、その一覧を返す
+
+    ``fail_after`` を渡すと、その数のパケットを出した後で読み損なう
+    """
     opened: list[_Counted] = []
     original = av.open
 
     def counting(*args: Any, **kwargs: Any) -> _Counted:
-        container = _Counted(original(*args, **kwargs))
+        container = _Counted(original(*args, **kwargs), fail_after)
         opened.append(container)
         return container
 
@@ -141,7 +150,7 @@ class TestReadingTheGap:
         # 最後まで読んでから上限の所の値を返す作りでも通るので、読んだパケットを数える
         monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_SECONDS", Fraction(2))
         # 真ん中も読む（6 秒は上限の 2 倍より長い）ので、その分を外して頭だけを数える
-        monkeypatch.setattr(probe_module, "_middle_of", lambda container: None)
+        monkeypatch.setattr(probe_module, "_middle_of", lambda container, reached: None)
         opened = _count_packets(monkeypatch)
         gap = keyframe_gap(sample_long_gop.path)
         assert gap is not None
@@ -164,6 +173,8 @@ class TestReadingTheGap:
         assert whole is not None
         assert whole > Fraction(4)
         monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_GAPS", 2)
+        # 頭で切り上げた後は真ん中も読むので、その分を外して頭だけを数える
+        monkeypatch.setattr(probe_module, "_middle_of", lambda container, reached: None)
         opened = _count_packets(monkeypatch)
         assert keyframe_gap(path) == Fraction(2, 5)
         # 3 つ目のキーフレーム（0.8 秒）と並べ替えの幅のぶん 60 個を全部読めば落ちる
@@ -182,8 +193,32 @@ class TestReadingTheGap:
         gap = keyframe_gap(path, enough=Fraction(1))
         assert gap is not None
         assert gap > Fraction(1)
-        monkeypatch.setattr(probe_module, "_middle_of", lambda container: None)
+        monkeypatch.setattr(probe_module, "_middle_of", lambda container, reached: None)
         assert keyframe_gap(path, enough=Fraction(1)) == Fraction(2, 5), "頭だけでも長く出ている"
+
+    def test_an_early_stop_still_reads_the_middle(
+        self, media_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 間隔を数えて頭を早く切り上げたのに、素材が短いからと真ん中を読まないと、
+        # 頭の 0.8 秒しか見ずに後ろの 5 秒の間を見落とす 読み終えた所で決める
+        path = _ffmpeg(
+            media_dir / "short_then_long.mp4",
+            "-f lavfi -i testsrc2=size=160x120:rate=10:duration=6 -c:v libx264 "
+            "-g 1000 -keyint_min 1000 -sc_threshold 0 -force_key_frames 0,0.4,0.8",
+        )
+        monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_GAPS", 2)
+        gap = keyframe_gap(path)
+        assert gap is not None
+        assert gap > Fraction(4)
+
+    def test_a_read_error_before_a_long_gap_is_unknown(
+        self, sample_long: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 読めなくなった所までの短い値を返すと、呼ぶ側が「要らない」と覚え、置き場が
+        # 直った後も調べ直さない 分からないにする
+        opened = _count_packets(monkeypatch, fail_after=5)
+        assert keyframe_gap(sample_long.path) is None
+        assert opened
 
     def test_a_slow_read_gives_up(
         self, sample_long_gop: SampleMedia, monkeypatch: pytest.MonkeyPatch
@@ -411,3 +446,115 @@ class TestBuildingInTheBackground:
         assert ready == []
         assert snapshot.total == 0
         assert store.find(media) is None
+
+
+@pytest.mark.skipif(not proxy_codecs(), reason="控えを作れるコーデックが無い")
+class TestSwitching:
+    """設定で間隔の長い素材への控えを切り替える 係は作り直さない"""
+
+    @pytest.fixture
+    def gate(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Event]:
+        """変換を差し替え、開くまで止めておく 止めるよう言われたら作らずに戻る"""
+        release = threading.Event()
+
+        def fake(source: Path, target: Path, **kwargs: Any) -> Path | None:
+            should_cancel = kwargs["should_cancel"]
+            while not release.is_set():
+                if should_cancel():
+                    return None
+                time.sleep(0.01)
+            target.write_bytes(b"made")
+            return target
+
+        monkeypatch.setattr(proxy_module, "create_proxy", fake)
+        yield release
+        release.set()
+
+    def test_switching_off_keeps_a_4k_conversion(
+        self, sample_av: SampleMedia, tmp_path: Path, gate: threading.Event
+    ) -> None:
+        # 4K の変換まで止めると、小さい素材の設定を触っただけで最初からやり直しになる
+        store = ProxyStore(CacheStore(tmp_path), height=120)
+        builder = ProxyBuilder(store)
+        media = probe_media(sample_av.path)
+        tall = replace(
+            media, video_streams=(replace(media.video_streams[0], width=3840, height=2160),)
+        )
+        ready: list[MediaId] = []
+        try:
+            builder.request(tall, on_ready=ready.append)
+            builder.set_long_gop(False)
+            gate.set()
+            _settle(builder)
+        finally:
+            builder.close()
+        assert ready == [tall.id]
+        assert builder.store.long_gop is False
+
+    def test_switching_off_stops_a_small_conversion(
+        self, sample_long_gop: SampleMedia, tmp_path: Path, gate: threading.Event
+    ) -> None:
+        # 切ったのに裏で変換が続くと、切った後も CPU か GPU を使い続ける
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120))
+        media = probe_media(sample_long_gop.path)
+        ready: list[MediaId] = []
+        try:
+            builder.request(media, on_ready=ready.append)
+            limit = time.monotonic() + 30.0
+            while builder.progress(media.id) is None and time.monotonic() < limit:
+                time.sleep(0.01)
+            assert builder.progress(media.id) is not None, "変換が始まらない"
+            builder.set_long_gop(False)
+            _settle(builder)
+            snapshot = builder.poll()
+        finally:
+            builder.close()
+        assert ready == []
+        assert snapshot.total == 0, "止めた変換を数えたまま"
+
+    def test_switching_back_on_makes_it_again(
+        self, sample_long_gop: SampleMedia, tmp_path: Path, gate: threading.Event
+    ) -> None:
+        # 入れ直した後に頼まれても作らないと、1 度切っただけで録画の控えが二度とできない
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120, long_gop=False))
+        media = probe_media(sample_long_gop.path)
+        ready: list[MediaId] = []
+        try:
+            builder.set_long_gop(True)
+            gate.set()
+            builder.request(media, on_ready=ready.append)
+            _settle(builder)
+        finally:
+            builder.close()
+        assert ready == [media.id]
+
+
+class TestAStalledRead:
+    def test_it_does_not_hold_the_builder(
+        self, sample_long_gop: SampleMedia, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 共有フォルダの読み込みが止まったまま待つと、1 本ずつ回す係がほかの素材の控えを
+        # いつまでも作らず、窓を閉じてもプロセスが終わらない 待つ上限で区切って先へ進む
+        release = threading.Event()
+
+        def stuck(*args: object, **kwargs: object) -> Fraction | None:
+            release.wait(30.0)
+            return Fraction(50)
+
+        monkeypatch.setattr(proxy_module, "keyframe_gap", stuck)
+        monkeypatch.setattr(proxy_module, "SCAN_WAIT_SECONDS", 0.2)
+        store = ProxyStore(CacheStore(tmp_path), height=120)
+        builder = ProxyBuilder(store)
+        media = probe_media(sample_long_gop.path)
+        try:
+            started = time.monotonic()
+            builder.request(media)
+            _settle(builder)
+            waited = time.monotonic() - started
+        finally:
+            release.set()
+            builder.close()
+        assert waited < 10.0
+        assert store.find(media) is None
+        # 分からないまま覚えない 置き場が戻れば、次に頼まれたとき調べ直す
+        assert not builder._short

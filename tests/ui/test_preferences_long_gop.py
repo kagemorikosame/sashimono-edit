@@ -81,10 +81,15 @@ class TestTheWindowFollowsIt:
 
     def test_turning_it_off_reaches_the_store(self, window: MainWindow) -> None:
         # 届かないと、切っても作り続け、作った控えも使い続ける
+        # 係は作り直さない 作り直すと走っている 4K の変換まで止まる（小さい素材の変換だけを
+        # 止めるのは tests/engine/test_proxy_long_gop.py の TestSwitching）
         before = window._proxies
+        store = window._proxies.store
         window._apply_preferences(Preferences(proxy_long_gop=False))
-        assert window._proxies is not before, "走っている変換を止めていない"
+        assert window._proxies is before, "4K の変換まで止めている"
         assert window._proxies.store.long_gop is False
+        # 置き場が替わらないと、プレビューが素材を開き直さず、作った控えのまま映り続ける
+        assert window._proxies.store is not store
         assert window._preview._proxies is window._proxies.store
 
     def test_turning_it_back_on_reaches_the_store(self, window: MainWindow) -> None:

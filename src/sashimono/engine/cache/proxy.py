@@ -121,6 +121,7 @@ from sashimono.engine.cache.progress import JobBoard, ProgressSnapshot
 from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
 from sashimono.engine.decode import ProbeError, VideoDecoder, keyframe_gap, probe_media
+from sashimono.engine.decode.probe import KEYFRAME_SCAN_TIMEOUT
 from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.encoders import (
     PRIORITY_AUTO,
@@ -258,6 +259,10 @@ class ProxyStore:
     def long_gop(self) -> bool:
         """キーフレームの間隔が長い小さい素材にも控えを使うか"""
         return self._long_gop
+
+    def with_long_gop(self, enabled: bool) -> ProxyStore:
+        """同じ置き場・同じ大きさで、``long_gop`` だけを替えた物"""
+        return ProxyStore(self._store, height=self._height, long_gop=enabled)
 
     def key_for(self, media: MediaItem, version: int = FORMAT_VERSION) -> str:
         # 縦の画素数を鍵に混ぜる 設定を変えたときに、前の大きさの控えを掴まない
@@ -539,6 +544,41 @@ def _duration_of(
     return 0.0
 
 
+#: 間隔を調べるのを待つ上限（秒） 調べる側の上限（:data:`KEYFRAME_SCAN_TIMEOUT`）に少し足す
+#: 調べる側の上限は読み込みが返ってきた所でしか効かない 共有フォルダの読み込みが
+#: 止まったままだと戻らないので、待つ側でも区切る
+SCAN_WAIT_SECONDS = KEYFRAME_SCAN_TIMEOUT + 1.0
+
+
+def _gap_in_time(media: MediaItem) -> Fraction | None:
+    """素材のキーフレームの間隔を、待つ上限の中で調べる 間に合わなければ ``None``（分からない）
+
+    調べるのは使い捨ての裏のスレッド（daemon） 控えの係は 1 本ずつ回すので、係のスレッドで
+    読み込みが止まると、ほかの素材の控えがいつまでも作られず、窓を閉じてもプロセスが
+    終わらない 間に合わなかったスレッドは置いていく 止まった読み込みは Python から
+    割り込めないが、daemon なので終了は妨げない
+    """
+    found: list[Fraction | None] = []
+    done = threading.Event()
+
+    def scan() -> None:
+        try:
+            found.append(
+                keyframe_gap(
+                    media.path,
+                    media.video_streams[0].index if media.video_streams else None,
+                    enough=KEYFRAME_GAP_LIMIT,
+                )
+            )
+        finally:
+            done.set()
+
+    threading.Thread(target=scan, name="sashimono-keyframes", daemon=True).start()
+    if not done.wait(SCAN_WAIT_SECONDS) or not found:
+        return None
+    return found[0]
+
+
 class ProxyBuilder:
     """控えをバックグラウンドで作る
 
@@ -583,6 +623,9 @@ class ProxyBuilder:
         #: 設定を当て直すたびに全部の素材を頼み直すので、覚えないと毎回読み直す
         #: 鍵は素材の大きさと更新時刻を含むので、差し替えた素材は調べ直す
         self._short: set[str] = set()
+        #: 走っている物のうち、間隔を調べて決める小さい素材 設定で間隔の長い素材への控えを
+        #: 切ったとき、これだけを止める（:meth:`set_long_gop`）
+        self._small: set[MediaId] = set()
 
     @property
     def store(self) -> ProxyStore:
@@ -643,6 +686,8 @@ class ProxyBuilder:
                 return
             self._cancelled.discard(media.id)
             self._running.add(media.id)
+            if check:
+                self._small.add(media.id)
             self._begin(media, counted=not check)
         self._launch(media, on_ready, on_progress)
 
@@ -662,11 +707,7 @@ class ProxyBuilder:
         要らなければ覚えておく 分からなかった（開けない・キーフレームが無い）ときは
         覚えない 一時的に読めなかっただけなら、次に頼まれたときに調べ直せる
         """
-        gap = keyframe_gap(
-            media.path,
-            media.video_streams[0].index if media.video_streams else None,
-            enough=KEYFRAME_GAP_LIMIT,
-        )
+        gap = _gap_in_time(media)
         if is_worth_proxying(media, gap):
             return True
         if gap is not None:
@@ -740,6 +781,7 @@ class ProxyBuilder:
                     # 見つけられず、外した素材の控えを作り始める（解析と同じ）
                     if again is None:
                         self._running.discard(media.id)
+                        self._small.discard(media.id)
             if stopped or skipped:
                 self._board.drop(media.id)
             elif made is None:
@@ -772,6 +814,24 @@ class ProxyBuilder:
                 self._board.drop(media.id)
                 return
             self._executor.submit(run)
+
+    def set_long_gop(self, enabled: bool) -> None:
+        """間隔の長い小さい素材にも控えを作るかを切り替える（本人の設定）
+
+        係を作り直さない 作り直すと走っている 4K の変換まで止まり、最初からになる
+        置き場は新しい物に替える 読む側（プレビュー）は置き場が替われば素材を開き直すので、
+        切ったときは作った控えから元の素材へ、入れたときは控えへ切り替わる
+        切ったときは、走っている小さい素材の調べと変換だけを止める 走り続けると、
+        切った後も裏で CPU か GPU を使い続ける
+        """
+        with self._lock:
+            if enabled == self._store.long_gop:
+                return
+            self._store = self._store.with_long_gop(enabled)
+            if not enabled:
+                self._cancelled.update(self._small)
+                for media_id in self._small:
+                    self._again.pop(media_id, None)
 
     def forget(self, media_id: MediaId) -> None:
         """素材を外したときに、作りかけを止める"""
