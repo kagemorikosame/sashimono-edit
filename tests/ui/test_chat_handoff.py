@@ -17,7 +17,7 @@ from sashimono.ai.bridge import Approval, Question
 from sashimono.ai.budget import LimitAction, Limits
 from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, shelf_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import question_spec
+from sashimono.ai.operations import UNGROUP_QUESTION, question_spec
 from sashimono.ai.outbound import Outbound, SendAnswer, SendRequest
 from sashimono.ai.session import LIMIT_DETAIL, AgentEvent, EventKind
 from sashimono.core.commands import SplitClips
@@ -160,6 +160,35 @@ class TestEveryWayOfStopping:
         assert any("split_clip" in item for item in handoff.refused)
         # AI の言葉は AI の言葉として分けて残す
         assert handoff.ai_words == "全部済みました"
+
+    @pytest.mark.parametrize(
+        ("selected", "written", "refused"),
+        [
+            (("解除しない",), "", True),
+            ((), "字幕と一緒に動かしたい", True),
+            (("解除する",), "", False),
+        ],
+    )
+    def test_declining_to_ungroup_hands_off(
+        self,
+        recorded: tuple[ChatPanel, list[_RecordingSession]],
+        selected: tuple[str, ...],
+        written: str,
+        refused: bool,
+    ) -> None:
+        # グループを解く前の問いで断ったのは、許可を断ったのと同じ 失敗にだけ数えると引き継ぎに
+        # 残らず、続きを頼まれた AI が同じ解除をまた試す（CodeRabbit の指摘 #435）
+        widget, _ = recorded
+        _send(widget, "トラックを移して")
+        widget._bridge._questions.put(Question(UNGROUP_QUESTION, gate="ungroup_clips"))
+        widget._check_question()
+        widget._reply_question(selected, written)
+        widget._handle(AgentEvent(EventKind.TURN_DONE))
+        handoff = _shelved(widget)
+        found = [] if handoff is None else [i for i in handoff.refused if "ungroup_clips" in i]
+        assert bool(found) is refused
+        if written:
+            assert written in found[0]
 
     def test_an_approval_folded_before_an_answer_hands_off(
         self, recorded: tuple[ChatPanel, list[_RecordingSession]]

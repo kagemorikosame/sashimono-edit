@@ -64,6 +64,8 @@ from sashimono.core.commands.edit import (
     locked_groups,
     ripple_casualties,
     shifted_track,
+    split_refusal,
+    split_targets,
     tail_room,
     trimmable,
 )
@@ -2181,24 +2183,6 @@ class TimelineView(QWidget):
                     seen.add(clip.link_group)
                 targets.append(clip)
 
-        blocked = self._locked_groups(clip.id for clip in targets)
-        if blocked:
-            if chosen:
-                self._refuse_locked_group((clip.id for clip in targets), "分割")
-                return
-            # 何も選ばずに切るときは、ほかのクリップは切る 断ったグループだけを知らせる
-            targets = [clip for clip in targets if clip.group_id not in blocked]
-            self._refuse_locked_group(
-                (
-                    c.id
-                    for t in self._project.timeline.tracks
-                    for c in t.clips
-                    if c.group_id in blocked
-                ),
-                "そのグループは分割",
-            )
-            if not targets:
-                return
         if chosen and not targets:
             # 黙って何もしないと、キーが効いていないのか選び方が違うのか分からない
             # ロックが理由なのに「位置にない」と出すと、再生ヘッドを動かし直すだけで終わる
@@ -2207,6 +2191,34 @@ class TimelineView(QWidget):
                 if locked_hit
                 else "選んだクリップは再生ヘッドの位置にありません"
             )
+            return
+        # ロックで断るかは、リンクとグループをたどって一緒に割る単位（split_targets）で決める
+        # 渡した物だけを見ると、リンクの相手のレイヤーやその相手のグループにあるロックを
+        # 見落とし、命令ごと断られて関係の無い物まで割れない（CodeRabbit の指摘 #435）
+        timeline = self._project.timeline
+        if chosen:
+            refusal = split_refusal(
+                timeline, split_targets(timeline, (c.id for c in targets), frame)
+            )
+            if refusal is not None:
+                self.status_message.emit(f"{refusal} ロックを外してから分割してください")
+                return
+        else:
+            # 何も選ばずに切るときは、ほかのクリップは切る 断った組だけを知らせる
+            kept: list[Clip] = []
+            refusals: list[str] = []
+            for clip in targets:
+                refusal = split_refusal(timeline, split_targets(timeline, (clip.id,), frame))
+                if refusal is None:
+                    kept.append(clip)
+                else:
+                    refusals.append(refusal)
+            if refusals:
+                self.status_message.emit(f"{refusals[0]} その組は分割しませんでした")
+            targets = kept
+        if not targets:
+            # 空の命令を積むと、何も変わらない 1 段が履歴に載り、やり直しの履歴も消える
+            # （CodeRabbit の指摘 #435）
             return
         # 後ろの片割れのグループの分け方は SplitClips が決める（AI の split_clip と同じ入口
         # #427） ここで数えて渡していた頃は、1 本だけ割ったときに後ろが元のグループに残った

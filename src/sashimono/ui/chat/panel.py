@@ -1745,6 +1745,12 @@ class ChatPanel(QWidget):
         if question.free_text:
             parts.append(question.free_text)
         self._say("答え", "\n".join(parts))
+        go = question.spec.choices[0].label
+        if question.gate and go not in question.selected:
+            # 動かす前の問いを断ったのは許可を断ったのと同じ 失敗にだけ数えると、止まった後の
+            # 引き継ぎに残らず、続きを頼まれた AI が同じ操作をまた試す（CodeRabbit の指摘 #435）
+            answer = "・".join(parts) or "答えなし"
+            self._record.refused(f"{question.gate}（{go} を選ばず: {answer}）")
         self._refresh_status()
 
     def _hide_question(self) -> None:

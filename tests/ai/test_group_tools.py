@@ -119,6 +119,22 @@ class TestSplitClip:
         assert "ungroup_clips" not in str(caught.value)
         assert "ユーザーに確かめ" in str(caught.value)
 
+    def test_a_locked_partner_through_a_link_also_points_at_asking(self) -> None:
+        # リンクの相手の側のロックで断られたときに案内が無いと、AI は解いて進む道を探す
+        # （CodeRabbit の指摘 #435）
+        host, clips = _grouped((0, 100), (0, 100), locked=1)
+        link = GroupId("L")
+        lone = Clip(timeline_start=0, duration=100, source=TEXT.create(), link_group=link)
+        project = host.document.project
+        tracks = list(project.timeline.tracks)
+        tracks[0] = replace(tracks[0], clips=(replace(clips[0], link_group=link),))
+        tracks.append(Track(TrackKind.MIXED, "レイヤー 3", (lone,)))
+        host = FakeHost(project.with_timeline(replace(project.timeline, tracks=tuple(tracks))))
+        with pytest.raises(ToolError, match="ロック") as caught:
+            _run(host, "split_clip", clip_id=str(lone.id), frame=40)
+        assert "ungroup_clips" not in str(caught.value)
+        assert "ユーザーに確かめ" in str(caught.value)
+
 
 class TestCuttingKeepsGroups:
     def test_cutting_a_range_keeps_the_front_group(self) -> None:
@@ -141,6 +157,18 @@ class TestCuttingKeepsGroups:
         _run(host, "cut_clips", clip_ids=[str(clips[2].id)])
         assert {c.id for c in _all(host)} == {clips[0].id, clips[1].id}
         assert _group(host, clips[0]) == _group(host, clips[1]) == clips[0].group_id
+
+    def test_cutting_a_locked_group_does_not_suggest_ungrouping(self) -> None:
+        # 断りの文の言い換え（「グループを外してから」など）は文字の見張りをすり抜ける 実際に
+        # 断らせて、解除を勧めずに確かめ方を返すことを見る（CodeRabbit の指摘 #435）
+        host, clips = _grouped((0, 100), (0, 100), locked=1)
+        before = host.document.project
+        with pytest.raises(ToolError, match="ロック") as caught:
+            _run(host, "cut_clips", clip_ids=[str(clips[0].id)])
+        assert "ungroup" not in str(caught.value)
+        assert "グループを解" not in str(caught.value) and "グループを外" not in str(caught.value)
+        assert "ユーザーに確かめ" in str(caught.value)
+        assert host.document.project == before
 
     def test_moving_to_another_track_does_not_suggest_ungrouping(self) -> None:
         # 断りの文が ungroup_clips を勧めていたので、AI はトラックを移すために束を解いた（#428）

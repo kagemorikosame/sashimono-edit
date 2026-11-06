@@ -222,6 +222,8 @@ from sashimono.core.commands.edit import (
     locked_groups,
     ripple_casualties,
     ripple_report,
+    split_refusal,
+    split_targets,
 )
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.history import REPLACED_REFUSAL
@@ -5010,12 +5012,17 @@ def _split_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     frame = int(arguments.get("frame", host.playhead))
     project = _project(host)
-    if locked_groups(project.timeline, (clip.id,)):
-        # グループを解けば割れるが、人が付けた束を AI が黙って解くことになる（#428）
-        raise ToolError(
-            "グループの中にロックしたレイヤーのクリップがあるので分割できません"
-            " グループは解かずに、ロックを外してよいかをユーザーに確かめてください"
+    # リンクの相手とその相手のグループまで広げた単位で確かめる 渡した 1 本だけを見ると、
+    # 相手の側のロックで断られたときに確かめ方の案内が付かない（CodeRabbit の指摘 #435）
+    if _straddles_clip(clip, frame):
+        refusal = split_refusal(
+            project.timeline, split_targets(project.timeline, (clip.id,), frame)
         )
+        if refusal is not None:
+            # グループを解けば割れることがあるが、人が付けた束を AI が黙って解くことになる（#428）
+            raise ToolError(
+                f"{refusal} グループは解かずに、ロックを外してよいかをユーザーに確かめてください"
+            )
     before = {c.id for track in project.timeline.tracks for c in track.clips}
     host.apply_commands([SplitClips((clip.id,), frame)], "クリップを分割")
     # 仲間も割れたことと後ろの ID を返す 返さないと、AI は割った本数を知らずに list_clips を
@@ -5027,6 +5034,11 @@ def _split_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
         if c.id not in before
     ]
     return {"split_at": frame, "new_clips": backs}
+
+
+def _straddles_clip(clip: Clip, frame: int) -> bool:
+    """割る位置がクリップの内側か 外なら命令に任せ、位置が外れていると答えさせる"""
+    return clip.timeline_start < frame < clip.timeline_end
 
 
 def _trim_clip(host: EditorHost, arguments: dict[str, Any]) -> object:

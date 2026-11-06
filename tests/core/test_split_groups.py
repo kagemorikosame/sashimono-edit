@@ -22,6 +22,7 @@ from sashimono.core.commands import (
     SplitClips,
     insert_media,
 )
+from sashimono.core.commands.edit import split_targets
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -151,6 +152,30 @@ class TestSplitting:
         project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
         with pytest.raises(ValueError, match="ロック"):
             SplitClips((lone.id,), 40).apply(project)
+
+    def test_a_linked_partner_on_a_locked_layer_refuses(self) -> None:
+        # リンクの相手の音声だけをロックしても、映像を割ると音声まで割れた（CodeRabbit の指摘
+        # #435） ロックしたレイヤーは人が守りたくて止めている
+        base = Project.create(ProjectSettings(layer_mode=LayerMode.MIXED))
+        link = GroupId("L")
+        picture = Clip(timeline_start=0, duration=100, source=TEXT.create(), link_group=link)
+        sound = Clip(timeline_start=0, duration=100, source=TEXT.create(), link_group=link)
+        tracks = (
+            Track(TrackKind.MIXED, "レイヤー 1", (picture,)),
+            Track(TrackKind.MIXED, "レイヤー 2", (sound,), locked=True),
+        )
+        project = base.with_timeline(replace(base.timeline, tracks=tracks))
+        with pytest.raises(ValueError, match="ロック"):
+            SplitClips((picture.id,), 40).apply(project)
+
+    def test_many_straddling_members_are_gathered_once_each(self) -> None:
+        # 仲間を 1 本ごとに数え直すと、同じ位置をまたぐ物が多いほど掛け算で遅くなり、画面が
+        # 止まる（CodeRabbit の指摘 #435） 300 本の束でも全員が 1 度ずつ割れる
+        project, clips = _grouped(*[(0, 100)] * 300)
+        targets = split_targets(project.timeline, (clips[0].id,), 40)
+        assert len(targets) == 300
+        split = SplitClips((clips[0].id,), 40).apply(project)
+        assert len(_all(split)) == 600
 
     def test_one_undo_brings_the_group_back(self) -> None:
         # 取り消しで分けたグループが戻らないと、割る前の束ね方を人が組み直すことになる

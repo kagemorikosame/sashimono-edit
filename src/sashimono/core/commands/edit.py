@@ -78,6 +78,8 @@ __all__ = [
     "ripple_gaps",
     "ripple_report",
     "shifted_track",
+    "split_refusal",
+    "split_targets",
     "tail_room",
     "trimmable",
 ]
@@ -825,7 +827,7 @@ class SplitClips(Command):
     前は呼ぶ側が新しいグループの組を渡していて、渡さない入口（1 本だけ割る画面の分割・AI）では
     後ろが元のグループに残った 1 本だけを割る命令（SplitClip）も、同じ理由で無くした
 
-    ロックしたトラックのクリップを含むグループは割らない（:func:`locked_groups`）
+    ロックしたレイヤーの物を含むときは何も割らない（:func:`split_refusal`）
     """
 
     clip_ids: tuple[ClipId, ...]
@@ -838,7 +840,6 @@ class SplitClips(Command):
     def apply(self, project: Project) -> Project:
         timeline = project.timeline
         frame = self.frame
-        pending: list[Clip] = []
         for clip_id in self.clip_ids:
             located = timeline.locate_clip(clip_id)
             if located is None:
@@ -849,29 +850,10 @@ class SplitClips(Command):
                     f"分割位置がクリップの内側にない: {frame} は "
                     f"[{clip.timeline_start}, {clip.timeline_end}) の外"
                 )
-            pending.append(clip)
-
-        targets: dict[ClipId, Clip] = {}
-        while pending:
-            clip = pending.pop()
-            if clip.id in targets:
-                continue
-            targets[clip.id] = clip
-            partners: list[tuple[Track, Clip]] = []
-            if clip.link_group is not None:
-                partners.extend(timeline.linked_clips(clip.link_group))
-            if clip.group_id is not None:
-                partners.extend(timeline.grouped_clips(clip.group_id))
-            # またがない相手は割らない リンク先の長さが違うときに片方だけ割ると同期が崩れ、
-            # グループの短い仲間はその位置に中身が無い（前に残る）
-            pending.extend(p for _, p in partners if p.id not in targets and _straddles(p, frame))
-        # 広げた後の全員で確かめる 渡したクリップのグループだけを見ると、リンクの相手が入った
-        # 別のグループのロックした仲間まで割ってしまう（Codex の指摘 #435）
-        if locked_groups(timeline, targets):
-            raise ValueError(
-                "グループの中にロックしたレイヤーのクリップがあるので分割できません"
-                "（一部だけ割ると、束ねた物の長さが食い違います）"
-            )
+        targets = split_targets(timeline, self.clip_ids, frame)
+        refusal = split_refusal(timeline, targets)
+        if refusal is not None:
+            raise ValueError(refusal)
 
         # 後ろは新しいリンクにする 元のままだと、割ってできた左右が同じリンクに残り、片方を
         # 消すともう片方まで消える 映像・音声の後ろどうしで同じ新しいリンクを持つので、
@@ -903,6 +885,83 @@ class SplitClips(Command):
                 )
             timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
         return project.with_timeline(timeline)
+
+
+def split_targets(timeline: Timeline, clip_ids: Iterable[ClipId], frame: int) -> dict[ClipId, Clip]:
+    """``clip_ids`` を ``frame`` で割るときに一緒に割る物（渡した物を含む）
+
+    リンクの相手とグループの仲間のうち ``frame`` をまたぐ物を、相手の相手までたどる
+    またがない相手は割らない リンク先の長さが違うときに片方だけ割ると同期が崩れ、グループの
+    短い仲間はその位置に中身が無い（前に残る） 画面は断る単位を決めるのにも使う
+    （:meth:`TimelineView.split_at_playhead`）
+
+    リンクとグループの索引を 1 度だけ作り、どのリンクとグループも 1 度だけ広げる 1 本ごとに
+    タイムライン全体を探すと、同じ位置をまたぐ物が多いほど掛け算で遅くなり、編集画面が止まる
+    """
+    links: dict[GroupId, list[Clip]] = {}
+    groups: dict[GroupId, list[Clip]] = {}
+    known: dict[ClipId, Clip] = {}
+    for track in timeline.tracks:
+        for clip in track.clips:
+            known[clip.id] = clip
+            if clip.link_group is not None:
+                links.setdefault(clip.link_group, []).append(clip)
+            if clip.group_id is not None:
+                groups.setdefault(clip.group_id, []).append(clip)
+    targets: dict[ClipId, Clip] = {}
+    pending = [known[clip_id] for clip_id in clip_ids if clip_id in known]
+    spread: set[tuple[str, GroupId]] = set()
+    while pending:
+        clip = pending.pop()
+        if clip.id in targets:
+            continue
+        targets[clip.id] = clip
+        for kind, key, index in (
+            ("link", clip.link_group, links),
+            ("group", clip.group_id, groups),
+        ):
+            if key is None or (kind, key) in spread:
+                continue
+            spread.add((kind, key))
+            pending.extend(p for p in index[key] if p.id not in targets and _straddles(p, frame))
+    return targets
+
+
+def split_refusal(timeline: Timeline, targets: Iterable[ClipId]) -> str | None:
+    """``targets``（:func:`split_targets` で広げた物）を割れない訳 割れるなら ``None``
+
+    広げた後の全員で確かめる 渡したクリップだけを見ると、リンクの相手がロックしたレイヤーに
+    あるときや、相手が入った別のグループにロックした仲間がいるときに、ロックした物まで割って
+    しまう（Codex と CodeRabbit の指摘 #435） ロックしたレイヤーは人が守りたくて止めている
+    """
+    wanted = set(targets)
+    groups: set[GroupId] = set()
+    locked: Track | None = None
+    for track in timeline.tracks:
+        for clip in track.clips:
+            if clip.id not in wanted:
+                continue
+            if track.locked and locked is None:
+                locked = track
+            if clip.group_id is not None:
+                groups.add(clip.group_id)
+    # グループの訳を先に出す ロックした仲間がまたいでいると、仲間のレイヤーのロックにも
+    # 当たるが、人が直すのはグループの扱いの方で、レイヤーの名前だけでは訳が分からない
+    if any(
+        track.locked and clip.group_id in groups
+        for track in timeline.tracks
+        for clip in track.clips
+    ):
+        return (
+            "グループの中にロックしたレイヤーのクリップがあるので分割できません"
+            "（一部だけ割ると、束ねた物の長さが食い違います）"
+        )
+    if locked is not None:
+        return (
+            f"レイヤー {locked.name!r} はロックされているので、そこにある相手と一緒に"
+            "分割できません（片方だけ割ると、映像と音声の組が食い違います）"
+        )
+    return None
 
 
 def _straddles(clip: Clip, frame: int) -> bool:
