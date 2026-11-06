@@ -428,6 +428,13 @@ class TestIdSwap:
         effect = Effect("blur")
         assert swap.apply(AddEffect(first.id, effect)) == AddEffect(second.id, effect)
 
+    def test_the_keys_of_a_table_are_swapped(self) -> None:
+        """壊れると、クリップの ID を鍵に持つ表を運ぶ命令で、鍵だけ元のクリップのまま残る"""
+        first, second = self._pair()
+        swap = IdSwap.between(first, second)
+        assert swap is not None
+        assert swap.apply({first.id: first.id}) == {second.id: second.id}
+
     def test_a_different_count_is_not_paired(self) -> None:
         """壊れると、数の違う並びを何番目どうしで組み、違うエフェクトへ値が入る"""
         first, _ = self._pair()

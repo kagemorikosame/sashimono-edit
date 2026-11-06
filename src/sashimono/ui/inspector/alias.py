@@ -137,12 +137,13 @@ class IdSwap:
             return [self._swap(item, inside=inside) for item in value]
         if isinstance(value, frozenset):
             return frozenset(self._swap(item, inside=inside) for item in value)
-        if isinstance(value, MappingProxyType):
-            return MappingProxyType(
-                {key: self._swap(item, inside=inside) for key, item in value.items()}
-            )
-        if isinstance(value, dict):
-            return {key: self._swap(item, inside=inside) for key, item in value.items()}
+        if isinstance(value, MappingProxyType | dict):
+            # 鍵も入れ替える クリップの ID を鍵に持つ表がある（変換の命令の運ぶ物など）
+            swapped = {
+                self._swap(key, inside=inside): self._swap(item, inside=inside)
+                for key, item in value.items()
+            }
+            return MappingProxyType(swapped) if isinstance(value, MappingProxyType) else swapped
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             owner = value.id if isinstance(value, Clip) else getattr(value, "clip_id", None)
             if isinstance(owner, str):
