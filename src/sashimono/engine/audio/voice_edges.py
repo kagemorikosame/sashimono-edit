@@ -122,20 +122,41 @@ def retime_command(
     動かした行は前の行の終わりより前へ出さず、次の行の頭を越えないよう止め直す
     """
     moved = {s.id: s for s in retime(transcript.segments, timing, loudness)}
-    chosen = set(only) if only is not None else None
-    # 元の行の順（字幕は頭の昇順が不変条件）のまま限りを当てる 動かした後の頭で並べ直すと、
-    # 大きくずらした行が選ばなかった隣の行を追い越したときに前後が入れ替わり、重なりを
-    # 止められない（PR #434 の Codex の指摘）
-    lines = transcript.segments
-    edges = [
-        [moved[s.id].start, moved[s.id].end]
-        if chosen is None or s.id in chosen
-        else [s.start, s.end]
-        for s in lines
+    chosen = {s.id for s in transcript.segments} if only is None else set(only)
+    # 動かせない行を動かさない行へ回したら、前の行の限りが変わるので頭から決め直す 回す行が
+    # 増えなくなるまで繰り返す（行の数だけで止まる） 1 回で済ませると、続けて選んだ行の後ろの
+    # 方を戻したときに、先に動かした前の行と重なる（PR #434 の Codex の指摘）
+    while True:
+        edges, stuck = _bounded(transcript.segments, moved, chosen)
+        if not stuck:
+            break
+        chosen -= stuck
+    times = [
+        (segment.id, start, end)
+        for segment, (start, end) in zip(transcript.segments, edges, strict=True)
+        if segment.id in chosen and (start, end) != (segment.start, segment.end)
     ]
-    times: list[tuple[SegmentId, Fraction, Fraction]] = []
+    if not times:
+        return None
+    return RetimeSegments(media_id, tuple(times), stream=stream)
+
+
+def _bounded(
+    lines: Sequence[TranscriptSegment],
+    moved: dict[SegmentId, TranscriptSegment],
+    chosen: set[SegmentId],
+) -> tuple[list[tuple[Fraction, Fraction]], set[SegmentId]]:
+    """選んだ行を前後の行の間に止めた時刻と、見える長さが残らず動かせない行
+
+    元の行の順（字幕は頭の昇順が不変条件）のまま限りを当てる 動かした後の頭で並べ直すと、
+    大きくずらした行が選ばなかった隣の行を追い越したときに前後が入れ替わり、重なりを止められない
+    """
+    edges = [
+        (moved[s.id].start, moved[s.id].end) if s.id in chosen else (s.start, s.end) for s in lines
+    ]
+    stuck: set[SegmentId] = set()
     for index, segment in enumerate(lines):
-        if chosen is not None and segment.id not in chosen:
+        if segment.id not in chosen:
             continue
         start, end = edges[index]
         least = min(segment.end - segment.start, MIN_LENGTH)
@@ -148,20 +169,15 @@ def retime_command(
         floor = max(Fraction(0), low) if low is not None else Fraction(0)
         if high is not None and high - floor < least:
             # 前後の行の間（と 0 秒より後）に見える長さが残らない 動かすと潰れるか重なるか負の
-            # 時刻になるので、この行は動かさない 後の行の限りも元の時刻で決める
-            edges[index] = [segment.start, segment.end]
+            # 時刻になる
+            stuck.add(segment.id)
             continue
         if high is not None:
             start = min(start, high - least)
             end = min(end, high)
         start = max(start, floor)
-        end = max(end, start + least)
-        edges[index] = [start, end]
-        if (start, end) != (segment.start, segment.end):
-            times.append((segment.id, start, end))
-    if not times:
-        return None
-    return RetimeSegments(media_id, tuple(times), stream=stream)
+        edges[index] = (start, max(end, start + least))
+    return edges, stuck
 
 
 def _apart(earlier: TranscriptSegment, later: TranscriptSegment) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import wave
 from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -288,6 +289,30 @@ class TestRetimeCommand:
         assert moved is not None
         assert all(s.start >= 0 and s.end > s.start for s in moved.segments)
         assert moved.segments[0].end <= moved.segments[1].start
+
+    def test_a_line_left_behind_is_not_run_over(self) -> None:
+        # 続けて選んだ行の後ろの方を動かせずに戻すと、先に動かした前の行がその行と次の行に
+        # 重なっていた（PR #434 の Codex の指摘）
+        transcript = Transcript(
+            (
+                _segment(1.0, 1.5, "一", "a"),
+                _segment(1.6, 2.1, "二", "b"),
+                _segment(2.2, 2.7, "三", "c"),
+            )
+        )
+        command = retime_command(
+            MediaId("m"),
+            transcript,
+            SubtitleTiming(fit_to_voice=False, start_offset_ms=1000, end_offset_ms=1000),
+            None,
+            only={SegmentId("a"), SegmentId("b")},
+        )
+        final = {s.id: (s.start, s.end) for s in transcript.segments}
+        if command is not None:
+            final.update({i: (start, end) for i, start, end in command.times})
+        spans = sorted(final.values())
+        assert all(left[1] <= right[0] for left, right in pairwise(spans))
+        assert all(end > start for start, end in spans)
 
     def test_nothing_to_move_gives_no_command(self) -> None:
         # 空の命令を履歴に積むと、何も変わらない「元に戻す」が 1 つ増える
