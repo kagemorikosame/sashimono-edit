@@ -51,6 +51,7 @@ from sashimono.ui.timeline.zoom_scrollbar import ZoomScrollBar
 
 _LEFT = Qt.MouseButton.LeftButton
 _NONE = Qt.KeyboardModifier.NoModifier
+_NONE_BUTTON = Qt.MouseButton.NoButton
 
 
 def _text(start: int, duration: int, **changes: object) -> Clip:
@@ -361,8 +362,20 @@ def _hover(widget: QWidget, point: QPoint) -> None:
 
 
 def _drag_bar(bar: ZoomScrollBar, start: QPoint, end: QPoint) -> None:
+    """つまみを押したまま動かして離す
+
+    動かすのは出来事を直に渡す（:func:`_hover` と同じ） ``QTest.mouseMove`` は画面のある
+    環境では本物のマウスを動かし、届くのが離した後になることがあって、直列で全部の試験を
+    走らせたときだけ動かずに落ちた
+    """
     QTest.mousePress(bar, _LEFT, _NONE, start)
-    QTest.mouseMove(bar, end)
+    local = QPointF(end)
+    QApplication.sendEvent(
+        bar,
+        QMouseEvent(
+            QEvent.Type.MouseMove, local, QPointF(bar.mapToGlobal(end)), _NONE_BUTTON, _LEFT, _NONE
+        ),
+    )
     QTest.mouseRelease(bar, _LEFT, _NONE, end)
 
 
