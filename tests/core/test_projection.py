@@ -17,6 +17,8 @@ from sashimono.core.commands import (
     AddTrack,
     MoveClip,
     RemoveClip,
+    RetimeSegments,
+    RippleCut,
     SetTranscript,
     SplitClip,
     TrimClip,
@@ -255,3 +257,46 @@ class TestEdgeCases:
         placed = AddClip(track.id, make_clip(0, 300, video_media)).apply(with_media)
         broken = placed.with_media(tuple(m for m in placed.media if m.id != video_media.id))
         assert list(project_timeline(broken)) == []
+
+
+class TestRetimedSubtitles:
+    """時刻を声に合わせた字幕（#426）も、速度変更・トリム・無音カットの後の位置に出る"""
+
+    def test_retimed_lines_follow_trim_and_speed(
+        self, project: Project, video_media: MediaItem, transcript: Transcript
+    ) -> None:
+        # 合わせた時刻を素材の秒で持たずにタイムラインの位置で持つと、頭を切った・倍速にした
+        # クリップで、合わせ直した字幕がまた声とずれる
+        with_transcript = SetTranscript(video_media.id, transcript).apply(project)
+        first = transcript.segments[0]
+        retimed = RetimeSegments(
+            video_media.id, ((first.id, Fraction(3, 2), Fraction(5, 2)),)
+        ).apply(with_transcript)
+        track = retimed.timeline.tracks[0]
+        clip = Clip(
+            timeline_start=0,
+            duration=150,
+            media_id=video_media.id,
+            source_in=Fraction(1, 2),
+            speed=Fraction(2),
+        )
+        placed = AddClip(track.id, clip).apply(retimed)
+        # 素材の 1.5〜2.5 秒は、頭の 0.5 秒を切った倍速のクリップで 0.5〜1 秒 = 15〜30 フレーム
+        assert _texts_with_bounds(placed)[0] == ("今日は", 15, 30)
+
+    def test_retimed_lines_follow_a_cut(self, project_with_subtitles: Project) -> None:
+        # 無音カットで前を詰めた後も、合わせ直した字幕が詰めた後の位置に出る
+        track = project_with_subtitles.timeline.tracks[0]
+        media_id = track.clips[0].media_id
+        assert media_id is not None
+        transcript = project_with_subtitles.require_media(media_id).transcript_for(None)
+        assert transcript is not None
+        second = transcript.segments[1]
+        retimed = RetimeSegments(
+            media_id, ((second.id, Fraction(42, 10), Fraction(57, 10)),)
+        ).apply(project_with_subtitles)
+        # 無音カットと同じ命令で 3〜3.5 秒（90〜105 フレーム）を切って詰める
+        moved = RippleCut(((90, 105),)).apply(retimed)
+        # 4.2 秒は 126 フレーム 前を 15 フレーム詰めたので 111
+        bounds = {text: (start, end) for text, start, end in _texts_with_bounds(moved)}
+        assert bounds["編集ソフトを"] == (111, 156)
