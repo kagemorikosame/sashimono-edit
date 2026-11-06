@@ -24,7 +24,7 @@ from sashimono.core.commands import (
     RippleCut,
     SetFrameRate,
     SetLayerMode,
-    SplitClip,
+    SplitClips,
     TrimClip,
     new_scene,
     reorder_group,
@@ -373,7 +373,7 @@ class TestCommands:
         # 落とすと、分けた後半だけ音が消える・絵が出る
         clip = mixed_project.timeline.tracks[0].clips[0]
         project = _set_clip(mixed_project, replace(clip, show_picture=False))
-        split = SplitClip(clip.id, 30).apply(project)
+        split = SplitClips((clip.id,), 30).apply(project)
         halves = split.timeline.tracks[0].clips
         assert len(halves) == 2
         assert all(h.audio_stream == 1 and not h.show_picture for h in halves)

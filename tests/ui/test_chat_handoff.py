@@ -20,7 +20,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import question_spec
 from sashimono.ai.outbound import Outbound, SendAnswer, SendRequest
 from sashimono.ai.session import LIMIT_DETAIL, AgentEvent, EventKind
-from sashimono.core.commands import SplitClip
+from sashimono.core.commands import SplitClips
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.panel import HANDOFF_WHO
@@ -89,8 +89,8 @@ def _cut_twice(widget: ChatPanel) -> None:
     """AI が指示の中で 2 回切った（道具 2 回分の段）"""
     host = _host(widget)
     first = host.document.project.timeline.tracks[0].clips[0].id
-    host.apply_commands([SplitClip(first, 90)], "分割")
-    host.apply_commands([SplitClip(first, 60)], "分割")
+    host.apply_commands([SplitClips((first,), 90)], "分割")
+    host.apply_commands([SplitClips((first,), 60)], "分割")
 
 
 def _logged(widget: ChatPanel) -> list[str]:

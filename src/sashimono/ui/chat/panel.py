@@ -937,6 +937,7 @@ class ChatPanel(QWidget):
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
+        self._bridge.ask_first = preferences.ai_ask_before_ungroup
         # 上限は次の道具の前から効く 応えている途中で変えても、会話を作り直さずに済む
         self._bridge.usage.limits = preferences.budget_limits()
         self._refresh_status()

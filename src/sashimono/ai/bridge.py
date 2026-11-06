@@ -239,6 +239,10 @@ class EditorBridge:
         self._cancel = threading.Event()
         #: 変更系を確認なしで通すか 既定は偽
         self.auto_approve = auto_approve
+        #: 動かす前の問い（:attr:`Operation.asks_first` グループの解除 #428）を尋ねるか
+        #: 本人の設定（:attr:`Preferences.ai_ask_before_ungroup`）で切れる 切ると、ほかの
+        #: 取り消せる編集と同じ許可の窓（自動で承認なら無し）だけになる
+        self.ask_first = True
         #: 「このツールは以降ずっと許可」と言われたもの
         self._always: set[str] = set()
         #: UI が取り出して、まだ返事をもらっていない確認 中断のときに畳む
@@ -295,6 +299,10 @@ class EditorBridge:
             return self.ask(spec)
         if operation.irreversible:
             return self._run_irreversible(operation, arguments)
+        if operation.asks_first is not None and self.ask_first:
+            # 尋ねた答えを許可の代わりにする 続けて許可の窓も出すと、同じことを 2 度聞かれる
+            self._agree_first(operation.asks_first)
+            return self._execute(operation, arguments)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)
@@ -686,6 +694,23 @@ class EditorBridge:
             return None
         self._sending = request
         return request
+
+    def _agree_first(self, spec: QuestionSpec) -> None:
+        """動かす前の問い（:attr:`Operation.asks_first`）を尋ね、最初の選択肢でなければ断る
+
+        書いた答えも断りの文に添える 「この 2 本だけは解いてよい」などの訳を AI が読めないと、
+        同じ頼み方で何度も尋ねることになる
+        """
+        answer = self.ask(spec)
+        selected = answer.get("selected")
+        if isinstance(selected, list) and spec.choices[0].label in selected:
+            return
+        written = answer.get("free_text")
+        reason = f"（ユーザーの答え: {written}）" if written else ""
+        raise ToolError(
+            f"ユーザーが「{spec.choices[0].label}」を選ばなかったので、動かしていません{reason}"
+            " この操作をせずに進めるか、どうするかをユーザーに確かめてください"
+        )
 
     def _approved(self, operation: Operation, arguments: dict[str, Any]) -> bool:
         if self.auto_approve or operation.name in self._always:

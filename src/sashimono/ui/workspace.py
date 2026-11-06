@@ -658,6 +658,11 @@ class Preferences:
     #: 道具の呼び出しが増える（手順 1 つに 2 回ほど）ので、速さと使う量を取る人は切れる
     #: 切ると計画の道具を渡さず、指示の文からも計画の決まりを外す
     ai_plan_first: bool = True
+    #: AI アシスタントがグループを解く（``ungroup_clips``）前に、解いてよいかを尋ねる（#428）
+    #: 「変更を自動で承認」でも尋ねる 既定は入 知らない人ほど、カットを頼んだだけで束ねた
+    #: クリップが黙ってばらばらになり、後で仲間を動かしたときにずれて困る 任せきりで
+    #: 止まってほしくない人は切れる 切ると、ほかの編集と同じ許可の窓だけになる
+    ai_ask_before_ungroup: bool = True
     #: 削除して詰めたあと（Shift+Delete と右クリックの「削除して詰める」）、再生ヘッドを
     #: 消した所の頭（つなぎ目）へ動かす（Issue #299） 既定は入 詰めると後ろが前へ寄り、
     #: 元の位置はつなぎ目と関係の無い所を指す つなぎ目を確かめたい人が多い
@@ -1121,6 +1126,9 @@ class PreferenceStore:
             restyle_keep_wrap=_flag(data.get("restyle_keep_wrap"), plain.restyle_keep_wrap),
             ai_ask_questions=_flag(data.get("ai_ask_questions"), plain.ai_ask_questions),
             ai_plan_first=_flag(data.get("ai_plan_first"), plain.ai_plan_first),
+            ai_ask_before_ungroup=_flag(
+                data.get("ai_ask_before_ungroup"), plain.ai_ask_before_ungroup
+            ),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
             ripple_layers=_flag(data.get("ripple_layers"), plain.ripple_layers),
             check_loudness_target=_loudness_target(

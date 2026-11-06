@@ -25,7 +25,7 @@ from sashimono.core.commands import (
     SetClipProperty,
     SetParam,
     SetTrackHeights,
-    SplitClip,
+    SplitClips,
     TrimClips,
     insert_media,
 )
@@ -546,7 +546,7 @@ class TestLockedGroup:
         received = _received(view)
         view.split_at_playhead()
         (commands,) = received
-        assert [c.clip_id for c in commands if isinstance(c, SplitClip)] == [extra.id]
+        assert [c.clip_ids for c in commands if isinstance(c, SplitClips)] == [(extra.id,)]
         assert len(commands) == 1
         assert any("グループ" in m for m in messages)
 

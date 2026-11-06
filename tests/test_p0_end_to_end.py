@@ -16,7 +16,7 @@ from sashimono.core.commands import (
     Document,
     RemoveClip,
     SetTranscript,
-    SplitClip,
+    SplitClips,
 )
 from sashimono.core.io import load_project, save_project
 from sashimono.core.model import (
@@ -65,7 +65,7 @@ def test_edit_save_reload_and_undo(
 
     # カット編集 冒頭 2 秒を切り落として詰める
     placed_clip = document.project.timeline.tracks[0].clips[0]
-    document.execute(SplitClip(placed_clip.id, 60))
+    document.execute(SplitClips((placed_clip.id,), 60))
     head = document.project.timeline.tracks[0].clips[0]
     document.execute(RemoveClip(head.id, ripple=True))
 
@@ -108,7 +108,7 @@ def test_ai_style_batch_edit_is_one_undo(
         for cut_at in (240, 180, 90):
             clip = document.project.timeline.tracks[0].clip_at(cut_at)
             assert clip is not None
-            document.execute(SplitClip(clip.id, cut_at))
+            document.execute(SplitClips((clip.id,), cut_at))
 
     assert len(document.project.timeline.tracks[0].clips) == 4
     assert len(document.history_labels) == steps_before + 1

@@ -50,7 +50,7 @@ from sashimono.core.commands import (
     RenameTrack,
     SetTrackHeights,
     SetTrackState,
-    SplitClip,
+    SplitClips,
     TrimClip,
     TrimClips,
     UngroupClips,
@@ -61,6 +61,7 @@ from sashimono.core.commands.edit import (
     MIN_TRACK_HEIGHT,
     casualty_notice,
     head_room,
+    locked_groups,
     ripple_casualties,
     shifted_track,
     tail_room,
@@ -82,7 +83,6 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
     heard_stream,
-    new_group_id,
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio import Waveform
@@ -2154,15 +2154,11 @@ class TimelineView(QWidget):
     def split_at_playhead(self) -> None:
         """再生ヘッドの位置でクリップを分割する S キー・編集メニュー・右クリックの共通の入口
 
-        選んでいるクリップがあれば、選んだものだけを切る（リンクした映像・音声の相手は
-        :class:`SplitClip` が一緒に割る） 何も選んでいなければ、再生ヘッドの下にある
-        全部を切る どちらもロックしたトラックは切らない
+        選んでいるクリップがあれば、選んだものだけを切る（リンクした映像・音声の相手と
+        グループの仲間は :class:`SplitClips` が一緒に割る） 何も選んでいなければ、再生ヘッドの
+        下にある全部を切る どちらもロックしたトラックは切らない
         選択を見ずに全部を切っていたので、1 本だけ切るつもりで、ほかのレイヤーの
         字幕や BGM まで切れていた（Issue #27）
-
-        リンクされた映像・音声は 1 つのコマンドで一緒に割れるので、グループごとに
-        1 回だけ発行する 両方に出すと、2 回目は「すでに割れている」失敗になり、
-        意味のないエラーがステータスバーに出る
         """
         frame = self._playhead
         chosen = set(self._selection)
@@ -2212,28 +2208,9 @@ class TimelineView(QWidget):
                 else "選んだクリップは再生ヘッドの位置にありません"
             )
             return
-        # グループの 2 本以上を割るときは、後ろの片割れどうしを新しいグループにまとめる
-        # 全部の命令へ同じ組を渡す（取り消しは 1 回で全部戻る）
-        split_ids = {clip.id for clip in targets}
-        for clip in targets:
-            if clip.link_group is not None:
-                split_ids.update(
-                    member.id
-                    for _, member in self._project.timeline.linked_clips(clip.link_group)
-                    if member.contains(frame)
-                )
-        counts: dict[GroupId, int] = {}
-        for track in self._project.timeline.tracks:
-            for clip in track.clips:
-                if clip.id in split_ids and clip.group_id is not None:
-                    counts[clip.group_id] = counts.get(clip.group_id, 0) + 1
-        new_groups = tuple(
-            (group, new_group_id()) for group, count in sorted(counts.items()) if count >= 2
-        )
-        self._request(
-            [SplitClip(clip.id, frame, new_groups=new_groups) for clip in targets],
-            "再生ヘッドで分割",
-        )
+        # 後ろの片割れのグループの分け方は SplitClips が決める（AI の split_clip と同じ入口
+        # #427） ここで数えて渡していた頃は、1 本だけ割ったときに後ろが元のグループに残った
+        self._request([SplitClips(tuple(clip.id for clip in targets), frame)], "再生ヘッドで分割")
 
     def delete_selected(self, *, ripple: bool = False) -> None:
         """選んでいるクリップを消す ``ripple`` なら後ろを詰め、再生ヘッドをつなぎ目へ動かす
@@ -2515,20 +2492,9 @@ class TimelineView(QWidget):
     def _locked_groups(self, clip_ids: Iterable[ClipId]) -> set[GroupId]:
         """渡したクリップのグループのうち、ロックしたトラックのクリップを含む物
 
-        グループはまとめて割る・消す・動かす組 一部がロックで動かないまま残りだけに
-        当てると、束ねた物の頭や長さが食い違い、束ねた意味が崩れる（利用者の要望）
+        決まりはコア（:func:`locked_groups`）に 1 つだけ置き、AI の道具と同じ物で断る
         """
-        timeline = self._project.timeline
-        groups: set[GroupId] = set()
-        for clip_id in clip_ids:
-            located = timeline.locate_clip(clip_id)
-            if located is not None and located[1].group_id is not None:
-                groups.add(located[1].group_id)
-        return {
-            group
-            for group in groups
-            if any(track.locked for track, _ in timeline.grouped_clips(group))
-        }
+        return locked_groups(self._project.timeline, clip_ids)
 
     def _refuse_locked_group(self, clip_ids: Iterable[ClipId], action: str) -> bool:
         """ロックしたクリップを含むグループがあれば、理由を出して真を返す（何もしない）"""

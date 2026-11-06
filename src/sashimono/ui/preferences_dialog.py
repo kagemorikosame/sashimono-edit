@@ -961,6 +961,15 @@ class PreferencesDialog(QDialog):
             " 変えると、次の指示から新しい会話になる"
         )
         form.addRow(self._ai_plan_first)
+
+        self._ai_ask_before_ungroup = QCheckBox("AI がグループを解く前に聞く", self)
+        self._ai_ask_before_ungroup.setChecked(preferences.ai_ask_before_ungroup)
+        self._ai_ask_before_ungroup.setToolTip(
+            "AI アシスタントがグループを解除する前に、解除してよいかを AI のパネルで尋ねる"
+            "〔変更を自動で承認〕を入れていても尋ねる 〔解除しない〕を選ぶと、AI はグループを"
+            "残したまま続ける 切ると、ほかの編集と同じ許可の確かめだけになる"
+        )
+        form.addRow(self._ai_ask_before_ungroup)
         self._check_loudness = QComboBox(self)
         for target, name in LOUDNESS_TARGETS:
             self._check_loudness.addItem(name, target)
@@ -1294,6 +1303,7 @@ class PreferencesDialog(QDialog):
             restyle_keep_wrap=self._restyle_keep_wrap.isChecked(),
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ai_plan_first=self._ai_plan_first.isChecked(),
+            ai_ask_before_ungroup=self._ai_ask_before_ungroup.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
             ripple_layers=self._ripple_layers.isChecked(),
             ai_send_frames=self._send_value(Outbound.FRAMES),

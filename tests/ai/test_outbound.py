@@ -113,10 +113,22 @@ def answer_sends(
                 request.give_up("閉じました")
             else:
                 request.reply(answer)
+        _agree_first(bridge)
         time.sleep(0.005)
     bridge.pump()
     assert done.is_set(), "道具が終わらなかった（送る前の確かめを待ったまま止まっている）"
     return seen
+
+
+def _agree_first(bridge: EditorBridge) -> None:
+    """動かす前の問い（グループの解除 #428 ``Operation.asks_first``）に最初の選択肢で答える
+
+    答えないと、問いを持つ道具は「変更を自動で承認」でも返事を待って終わらない 答えて動かすと、
+    その道具の結果まで漏れを見られる
+    """
+    question = bridge.take_question()
+    if question is not None:
+        question.reply((question.spec.choices[0].label,))
 
 
 def _never(request: SendRequest) -> SendAnswer:
@@ -1127,6 +1139,7 @@ def _answer_sends_and_allow(bridge: EditorBridge, done: threading.Event) -> None
         approval = bridge.take_approval()
         if approval is not None:
             approval.allow()
+        _agree_first(bridge)
         time.sleep(0.005)
     bridge.pump()
     assert done.is_set(), "道具が終わらなかった"
