@@ -123,23 +123,30 @@ def retime_command(
     """
     moved = {s.id: s for s in retime(transcript.segments, timing, loudness)}
     chosen = set(only) if only is not None else None
-    final = [moved[s.id] if chosen is None or s.id in chosen else s for s in transcript.segments]
-    final.sort(key=lambda s: (s.start, s.end))
-    original = {s.id: s for s in transcript.segments}
-    edges = [[s.start, s.end] for s in final]
+    # 元の行の順（字幕は頭の昇順が不変条件）のまま限りを当てる 動かした後の頭で並べ直すと、
+    # 大きくずらした行が選ばなかった隣の行を追い越したときに前後が入れ替わり、重なりを
+    # 止められない（PR #434 の Codex の指摘）
+    lines = transcript.segments
+    edges = [
+        [moved[s.id].start, moved[s.id].end]
+        if chosen is None or s.id in chosen
+        else [s.start, s.end]
+        for s in lines
+    ]
     times: list[tuple[SegmentId, Fraction, Fraction]] = []
-    for index, segment in enumerate(final):
+    for index, segment in enumerate(lines):
         if chosen is not None and segment.id not in chosen:
             continue
         start, end = edges[index]
-        if index > 0 and _apart(original[final[index - 1].id], original[segment.id]):
+        if index > 0 and _apart(lines[index - 1], segment):
             start = max(start, edges[index - 1][1])
-        if index + 1 < len(final) and _apart(original[segment.id], original[final[index + 1].id]):
-            end = min(end, final[index + 1].start)
+        if index + 1 < len(lines) and _apart(segment, lines[index + 1]):
+            limit = edges[index + 1][0]
+            start = min(start, limit)
+            end = min(end, limit)
         end = max(start, end)
         edges[index] = [start, end]
-        before = original[segment.id]
-        if (start, end) != (before.start, before.end):
+        if (start, end) != (segment.start, segment.end):
             times.append((segment.id, start, end))
     if not times:
         return None

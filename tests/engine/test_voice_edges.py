@@ -233,6 +233,22 @@ class TestRetimeCommand:
         ((_, _start, end),) = command.times
         assert end == _f(2.0)
 
+    def test_a_chosen_line_does_not_jump_over_its_neighbour(self) -> None:
+        # 大きくずらした行が選ばなかった隣の行を追い越すと、前後が入れ替わって重なりを止められず、
+        # 焼き込みで隣の字幕が欠ける（PR #434 の Codex の指摘）
+        transcript = Transcript((_segment(1.0, 1.5, "一", "a"), _segment(1.6, 2.1, "二", "b")))
+        command = retime_command(
+            MediaId("m"),
+            transcript,
+            SubtitleTiming(fit_to_voice=False, start_offset_ms=1000, end_offset_ms=1000),
+            None,
+            only={SegmentId("a")},
+        )
+        assert command is not None
+        ((_, start, end),) = command.times
+        assert end <= _f(1.6)
+        assert start <= end
+
     def test_nothing_to_move_gives_no_command(self) -> None:
         # 空の命令を履歴に積むと、何も変わらない「元に戻す」が 1 つ増える
         line = _segment(1.0, 2.0, "文", "a")
