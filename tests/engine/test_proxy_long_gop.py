@@ -10,10 +10,14 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import av
 import pytest
 
 import sashimono.engine.cache.proxy as proxy_module
@@ -68,6 +72,43 @@ def _ffmpeg(path: Path, arguments: str) -> Path:
     return path
 
 
+class _Counted:
+    """開いた素材の包み 取り出したパケットを数える PyAV の型は差し替えられないので包む"""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.packets = 0
+
+    def __enter__(self) -> _Counted:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._inner.__exit__(*args)
+
+    def demux(self, *args: object, **kwargs: object) -> Iterator[Any]:
+        for packet in self._inner.demux(*args, **kwargs):
+            self.packets += 1
+            yield packet
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _count_packets(monkeypatch: pytest.MonkeyPatch) -> list[_Counted]:
+    """これから間隔を読むときに開く素材を包み、その一覧を返す"""
+    opened: list[_Counted] = []
+    original = av.open
+
+    def counting(*args: Any, **kwargs: Any) -> _Counted:
+        container = _Counted(original(*args, **kwargs))
+        opened.append(container)
+        return container
+
+    monkeypatch.setattr(av, "open", counting)
+    return opened
+
+
 def _settle(builder: ProxyBuilder) -> None:
     """裏の仕事が全部終わるまで待つ 係は 1 本ずつ順に回すので、後ろへ足した空の仕事を待てばよい"""
     builder._executor.submit(lambda: None).result(timeout=60.0)
@@ -96,11 +137,17 @@ class TestReadingTheGap:
     def test_it_reads_only_the_head(
         self, sample_long_gop: SampleMedia, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 読む長さの上限を外すと、3 時間の録画を最後まで読むことになる
+        # 読む長さの上限を外すと、3 時間の録画を最後まで読むことになる 返す値だけ見ると、
+        # 最後まで読んでから上限の所の値を返す作りでも通るので、読んだパケットを数える
         monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_SECONDS", Fraction(2))
+        # 真ん中も読む（6 秒は上限の 2 倍より長い）ので、その分を外して頭だけを数える
+        monkeypatch.setattr(probe_module, "_middle_of", lambda container: None)
+        opened = _count_packets(monkeypatch)
         gap = keyframe_gap(sample_long_gop.path)
         assert gap is not None
         assert gap <= Fraction(2) + _REORDER
+        # 6 秒 10fps で 60 個 2 秒と並べ替えの幅のぶんで止まる
+        assert sum(container.packets for container in opened) <= 26
 
     def test_it_stops_after_enough_gaps(
         self, media_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -117,7 +164,35 @@ class TestReadingTheGap:
         assert whole is not None
         assert whole > Fraction(4)
         monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_GAPS", 2)
+        opened = _count_packets(monkeypatch)
         assert keyframe_gap(path) == Fraction(2, 5)
+        # 3 つ目のキーフレーム（0.8 秒）と並べ替えの幅のぶん 60 個を全部読めば落ちる
+        assert sum(container.packets for container in opened) <= 12
+
+    def test_a_long_middle_is_found(self, media_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 冒頭の場面の切り替わりでキーフレームが細かく入った録画を、頭だけ見て短いと
+        # 見誤ると、後ろの長い間隔のまま飛ぶたびに待たされる 真ん中も読む
+        path = _ffmpeg(
+            media_dir / "short_head.mp4",
+            "-f lavfi -i testsrc2=size=160x120:rate=10:duration=10 -c:v libx264 "
+            "-g 1000 -keyint_min 1000 -sc_threshold 0 "
+            "-force_key_frames expr:lt(t,4.1)*gte(t,n_forced*0.4)",
+        )
+        monkeypatch.setattr(probe_module, "KEYFRAME_SCAN_SECONDS", Fraction(2))
+        gap = keyframe_gap(path, enough=Fraction(1))
+        assert gap is not None
+        assert gap > Fraction(1)
+        monkeypatch.setattr(probe_module, "_middle_of", lambda container: None)
+        assert keyframe_gap(path, enough=Fraction(1)) == Fraction(2, 5), "頭だけでも長く出ている"
+
+    def test_a_slow_read_gives_up(
+        self, sample_long_gop: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 遅い場所の素材を読み続けると、1 本ずつ回す控えの係がほかの素材を後回しにし続ける
+        # 時計だけを進める 本当に遅い置き場は試験で作れない
+        clock = iter(range(0, 10_000, 10))
+        monkeypatch.setattr(probe_module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+        assert keyframe_gap(sample_long_gop.path) is None
 
     def test_audio_only_is_unknown(self, media_dir: Path) -> None:
         # 音だけの素材で値を返すと、映像の無い素材を控えの変換へ回して失敗を数える
