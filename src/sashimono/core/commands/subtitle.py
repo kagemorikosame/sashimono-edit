@@ -39,6 +39,7 @@ __all__ = [
     "MergeWithNext",
     "RemoveSegment",
     "RenameSpeaker",
+    "RetimeSegments",
     "SetSegmentSpeaker",
     "SetSegmentText",
     "SplitSegment",
@@ -274,6 +275,41 @@ class MergeWithNext(Command):
         return _store(
             project, self.media_id, _rebuilt(transcript, [*remaining, merged]), self.stream
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RetimeSegments(Command):
+    """字幕の行の時刻を付け替える（#426 字幕パネルの〔時刻を合わせる…〕）
+
+    ``times`` は ``(行の ID, 頭, 終わり)`` 本文・語の時刻・話者・編集済みの印は変えない
+    （時刻を直しただけで本文を直したことにすると、起こし直しで守る行が増える）
+    """
+
+    media_id: MediaId
+    times: tuple[tuple[SegmentId, Fraction, Fraction], ...]
+    stream: int | None = None
+
+    @property
+    def label(self) -> str:
+        return "字幕の時刻を合わせる"
+
+    def apply(self, project: Project) -> Project:
+        if not self.times:
+            raise ValueError("時刻を合わせる字幕がありません")
+        transcript = project.require_media(self.media_id).transcript_for(self.stream)
+        for segment_id, start, end in self.times:
+            # 無い行はここで断る 黙って飛ばすと、合わせたつもりの行がずれたまま残る
+            transcript, _ = _locate(project, self.media_id, segment_id, self.stream)
+            if end < start or start < 0:
+                raise ValueError(f"字幕の時刻が逆か負: {start} .. {end}")
+        if transcript is None:
+            raise KeyError("素材に字幕が無い")
+        wanted = {segment_id: (start, end) for segment_id, start, end in self.times}
+        segments = [
+            replace(s, start=wanted[s.id][0], end=wanted[s.id][1]) if s.id in wanted else s
+            for s in transcript.segments
+        ]
+        return _store(project, self.media_id, _rebuilt(transcript, segments), self.stream)
 
 
 class Voice(NamedTuple):

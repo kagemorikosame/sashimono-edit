@@ -343,6 +343,7 @@ from sashimono.core.search import (
     scene_spans,
     search_media,
 )
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming
 from sashimono.core.timebase import (
     FrameRate,
     Rounding,
@@ -8162,6 +8163,67 @@ def _delete_subtitle(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"deleted": str(segment_id)}
 
 
+def _retime_subtitles(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """字幕の行の時刻を声に合わせ、ずらす（字幕パネルの〔時刻を合わせる…〕 #426）
+
+    文言・語の時刻・話者は変えない 寄せるのに解析済みの波形を使い、無ければ断る（寄せずに
+    ずらすだけで返すと、声に合わせたつもりの字幕がずれたまま残る）
+    """
+    from sashimono.engine.audio.voice_edges import loudness_of_waveform, retime_command
+
+    media = _require_media(_project(host), str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None or not transcript.segments:
+        raise ToolError("この素材のこの音声には字幕がありません（get_subtitles で確かめる）")
+    timing = SubtitleTiming(
+        fit_to_voice=_flag_argument(arguments, "fit_voice", True),
+        start_offset_ms=_whole_within(arguments, "start_offset_ms", 0, OFFSET_MS_RANGE),
+        end_offset_ms=_whole_within(arguments, "end_offset_ms", 0, OFFSET_MS_RANGE),
+    )
+    _no_explicit_null(arguments, "segment_ids")
+    raw = arguments.get("segment_ids")
+    if raw is not None and not isinstance(raw, list):
+        raise ToolError(
+            "segment_ids は字幕の ID（get_subtitles の segment_id）の配列で渡してください"
+        )
+    only = {SegmentId(s) for s in _string_items(raw, "segment_ids")} if raw else None
+    if only is not None:
+        known = {s.id for s in transcript.segments}
+        missing = sorted(str(s) for s in only - known)
+        if missing:
+            raise ToolError(
+                f"字幕が見つかりません: {', '.join(missing)}（get_subtitles で ID が分かる）"
+            )
+    loudness = None
+    if timing.fit_to_voice:
+        waveform = host.waveform(media, stream)
+        if waveform is None:
+            raise ToolError("この音声の波形の解析がまだ終わっていません 少し待ってください")
+        loudness = loudness_of_waveform(waveform)
+    command = retime_command(media.id, transcript, timing, loudness, stream=stream, only=only)
+    if command is None:
+        return {"moved": 0, "segments": []}
+    host.apply_commands([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
+    before = {s.id: s for s in transcript.segments}
+    return {
+        "moved": len(command.times),
+        # 返事の上限に収める 動いた量は先頭の数行で分かる
+        "segments": [
+            {
+                "segment_id": str(segment_id),
+                "start_delta_seconds": round(float(start - before[segment_id].start), 3),
+                "end_delta_seconds": round(float(end - before[segment_id].end), 3),
+            }
+            for segment_id, start, end in command.times[:MAX_RETIMED_ROWS]
+        ],
+    }
+
+
+#: :func:`_retime_subtitles` が返す行の数の上限 何百行も返すと会話の費用だけが増える
+MAX_RETIMED_ROWS = 20
+
+
 # --- 作品の設定・置き方の方式・配置のテンプレートなど（#349 2 回目） ---
 
 #: 置き方の方式を切り替えたときに返す、引き継げない物の数の上限 1 回の返事に収める
@@ -11493,6 +11555,39 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id", "segment_id"],
         ),
         handler=_delete_subtitle,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
+        name="retime_subtitles",
+        description=(
+            "字幕の行の頭と終わりを声に合わせ、好みの分だけずらす（字幕パネルの〔時刻を合わせる…〕）"
+            " 文言・語の時刻・話者は変えない 字幕が声より早く出る・遅く消えるときに使う"
+            " 寄せるのは前後 0.5 秒の声の出だしと終わりまで ずらす量は今の時刻から数える"
+            "（2 回当てると 2 回ずれる） 次の行の頭は越えない 取り消し 1 回で戻る"
+            " 返す segments は動いた行の頭と終わりの差（秒 先頭の 20 行まで）"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+                "fit_voice": _boolean("声の出だしと終わりへ寄せる（既定 true 波形の解析が要る）"),
+                "start_offset_ms": _integer("頭をずらすミリ秒 負は早く出す（-1000〜2000 既定 0）"),
+                "end_offset_ms": _integer(
+                    "終わりをずらすミリ秒 正は遅く消す（-1000〜2000 既定 0）"
+                ),
+                "segment_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "合わせる字幕の ID（get_subtitles の segment_id） 省けば全部",
+                },
+            },
+            ["media_id"],
+        ),
+        handler=_retime_subtitles,
         sends=_STRUCTURE,
         writes=True,
     ),

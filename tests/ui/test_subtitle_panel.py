@@ -20,6 +20,7 @@ from sashimono.core.commands import (
     AddClip,
     Command,
     RenameProject,
+    RetimeSegments,
     RippleCut,
     SetSegmentText,
     SetTranscript,
@@ -37,6 +38,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
@@ -778,10 +780,12 @@ class TestDialogsAreFreed:
         # 壊れると、字幕の窓を開け閉めするたびに見えない窓が溜まり、長く使うほど重くなる
         del qt_application
         from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog
-        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 
         # 開く所だけを差し替える 開くと押す人を待って止まる 取り消したことにする
-        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog):
+        from sashimono.ui.subtitle.timing import RetimeDialog
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog, RetimeDialog):
             monkeypatch.setattr(dialog, "exec", lambda self: 0)
         widget = SubtitlePanel(placed, StubAnalyzer(make_waveform([(0.5, 400)])))
         try:
@@ -790,10 +794,90 @@ class TestDialogsAreFreed:
                 widget.clean()
                 widget.jet_cut()
                 widget.burn()
+                widget.retime()
             opened = {type(child).__name__ for child in widget.findChildren(QDialog)}
             QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
             # 窓が本当に開いたこと 開いていなければ、残らないのは当たり前で何も言えない
-            assert opened == {"TranscribeDialog", "CleanupDialog", "JetCutDialog", "BurnDialog"}
+            assert opened == {
+                "TranscribeDialog",
+                "CleanupDialog",
+                "JetCutDialog",
+                "BurnDialog",
+                "RetimeDialog",
+            }
             assert widget.findChildren(QDialog) == []
+        finally:
+            widget.deleteLater()
+
+
+class TestRetime:
+    """起こした後の字幕の時刻を声に合わせ直す（#426 字幕パネルの〔時刻を合わせる…〕）"""
+
+    #: 1.2〜2.8 秒だけ声がある波形 1 つ目の字幕（1〜3 秒）は声より 0.2 秒早く出て遅く消える
+    VOICE = ((0.0, 225), (0.5, 300), (0.0, 1500))
+
+    def _panel(
+        self, placed: Project, waveform: Waveform | None
+    ) -> tuple[SubtitlePanel, list[tuple[list[Command], str]]]:
+        widget = SubtitlePanel(placed, StubAnalyzer(waveform))
+        issued: list[tuple[list[Command], str]] = []
+        widget.commands_requested.connect(lambda commands, label: issued.append((commands, label)))
+        return widget, issued
+
+    def test_the_first_line_moves_to_the_voice(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 壊れると、前の版で起こした字幕を起こし直さずに声へ合わせる道が無い（文言の直しが消える）
+        del qt_application
+        widget, issued = self._panel(placed, make_waveform(list(self.VOICE)))
+        try:
+            widget.ask_retime = lambda selected: (SubtitleTiming(), False)
+            widget.retime()
+            ((commands, _label),) = issued
+            (command,) = commands
+            assert isinstance(command, RetimeSegments)
+            ((_, start, end),) = command.times
+            assert float(start) == pytest.approx(1.2, abs=0.02)
+            assert float(end) == pytest.approx(2.8, abs=0.02)
+        finally:
+            widget.deleteLater()
+
+    def test_without_a_waveform_it_does_not_pretend(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 寄せずにずらすだけで済ますと、声に合わせたつもりの字幕がずれたまま残る
+        del qt_application
+        widget, issued = self._panel(placed, None)
+        messages: list[str] = []
+        widget.status_message.connect(messages.append)
+        try:
+            widget.ask_retime = lambda selected: (SubtitleTiming(), False)
+            widget.retime()
+            assert issued == []
+            assert messages == ["波形の解析がまだ終わっていません"]
+        finally:
+            widget.deleteLater()
+
+    def test_only_the_selected_rows_shift(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 壊れると、1 行だけ早めたいのに全部の行が動く
+        del qt_application
+        widget, issued = self._panel(placed, None)
+        try:
+            widget._table.selectRow(1)
+            seen: list[int] = []
+
+            def ask(selected: int) -> tuple[SubtitleTiming, bool]:
+                seen.append(selected)
+                return SubtitleTiming(fit_to_voice=False, start_offset_ms=-300), True
+
+            widget.ask_retime = ask
+            widget.retime()
+            ((commands, _label),) = issued
+            (command,) = commands
+            assert isinstance(command, RetimeSegments)
+            assert seen == [1]
+            assert [(float(s), float(e)) for _, s, e in command.times] == [(3.7, 6.0)]
         finally:
             widget.deleteLater()

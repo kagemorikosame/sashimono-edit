@@ -86,6 +86,7 @@ from sashimono.core.seams import (
     SEAM_ZOOM_PERCENT_RANGE,
     SeamStyle,
 )
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming
 from sashimono.effects.denoise import AUTO_REDUCTION_DB_RANGE, DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.voicevox import (
     AUTO_VOICE,
@@ -676,6 +677,17 @@ class Preferences:
     #: （small と CPU）だった 既定は入り 切ると起こしは速いことがあるが、切り抜きが言葉の途中で
     #: 切れやすくなる 起こしの窓のチェックの初めの値もこれ
     word_timestamps: bool = True
+    #: 起こした字幕の行の頭と終わりを、近くの声の出だしと終わりへ寄せる（#426） 既定は入り
+    #: 寄せないと、合成の声の 3 組で頭が 0.2〜0.3 秒早く出て、終わりが早くも遅くもずれた
+    #: （利用者の「字幕が声より早く出て遅く消える」） 寄せると頭のずれは 9 割が 0.09 秒以内
+    #: 音楽や雑音の上で話す素材で寄せ方が合わない人は切れる 起こしの窓の初めの値もこれ
+    subtitle_fit_voice: bool = True
+    #: 起こした字幕の頭をずらす（ミリ秒 負は早く出す #426） 既定 0 は声の出だしに合わせる
+    #: 少し前から出ている方が読み始めやすい人は負にする
+    subtitle_start_offset_ms: int = 0
+    #: 起こした字幕の終わりをずらす（ミリ秒 正は遅く消す #426） 既定 0 は声の終わりに合わせる
+    #: 声が終わってすぐ消えると読み切れない人は正にする 次の行の頭は越えない
+    subtitle_end_offset_ms: int = 0
     #: AI アシスタントが検査（#337）で見つけた問題を直して調べ直す回数の上限（#339）
     #: どこまで任せるかは人で違う 0 は調べるだけで直さない 既定の 3 は、音量をそろえた後に
     #: 音割れや字幕を直すような 2〜3 段の直しで足り、止まらない繰り返しは早めに人へ返す側
@@ -855,6 +867,15 @@ class Preferences:
     def subtitle_wrap_share(self) -> int:
         """字幕の折り返しの幅（画面の幅の %） 切ってあれば 0（折り返さない）"""
         return self.subtitle_wrap_percent if self.subtitle_wrap else 0
+
+    @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        """起こした字幕の時刻の合わせ方（#426）"""
+        return SubtitleTiming(
+            fit_to_voice=self.subtitle_fit_voice,
+            start_offset_ms=self.subtitle_start_offset_ms,
+            end_offset_ms=self.subtitle_end_offset_ms,
+        )
 
     @property
     def duck_shape(self) -> DuckShape:
@@ -1127,6 +1148,15 @@ class PreferenceStore:
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
             word_timestamps=_flag(data.get("word_timestamps"), plain.word_timestamps),
+            subtitle_fit_voice=_flag(data.get("subtitle_fit_voice"), plain.subtitle_fit_voice),
+            subtitle_start_offset_ms=_within(
+                data.get("subtitle_start_offset_ms"),
+                OFFSET_MS_RANGE,
+                plain.subtitle_start_offset_ms,
+            ),
+            subtitle_end_offset_ms=_within(
+                data.get("subtitle_end_offset_ms"), OFFSET_MS_RANGE, plain.subtitle_end_offset_ms
+            ),
             ai_fix_rounds=_within(data.get("ai_fix_rounds"), FIX_ROUNDS_RANGE, plain.ai_fix_rounds),
             duck_depth_db=_within(
                 data.get("duck_depth_db"), DUCK_DEPTH_DB_RANGE, plain.duck_depth_db

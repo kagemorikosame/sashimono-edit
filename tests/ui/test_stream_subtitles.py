@@ -33,6 +33,7 @@ from sashimono.core.model import (
     VideoStreamInfo,
     Word,
 )
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -65,6 +66,8 @@ class _Speaker:
         self.words: list[bool] = []
         #: 語の時刻の付いた結果を返す
         self.with_words = False
+        #: 頼まれた字幕の時刻の合わせ方 順に（#426）
+        self.timings: list[SubtitleTiming] = []
 
     @property
     def name(self) -> str:
@@ -85,6 +88,7 @@ class _Speaker:
         self.gate.wait(5.0)
         self.order.append(options.audio_stream)
         self.words.append(options.word_timestamps)
+        self.timings.append(options.timing)
         text = f"{path.stem} の音声 {options.audio_stream}"
         words = (Word(Fraction(1), Fraction(2), "語"),) if self.with_words else ()
         return Transcript((TranscriptSegment(Fraction(1), Fraction(2), text, words),))
@@ -219,6 +223,72 @@ class TestWordTimes:
         for wanted in (True, False):
             dialog = TranscribeDialog(first, service, words=wanted)
             assert dialog._words.isChecked() is wanted
+            dialog.deleteLater()
+
+
+class TestSubtitleTiming:
+    """起こした字幕の時刻の合わせ方（#426）を本人の設定どおりに頼む"""
+
+    def test_the_preference_reaches_the_request(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        """壊れると、設定で選んだ「少し早く出す」が AI から頼んだ起こしに効かない"""
+        panel, _host, first, second = setup
+        chosen = SubtitleTiming(fit_to_voice=False, start_offset_ms=-200, end_offset_ms=300)
+        panel.timing = chosen
+        panel.start_transcription(first.id, "tiny")
+        panel.start_transcription(second.id, "tiny", timing=SubtitleTiming())
+        _settle(panel)
+        assert speaker.timings == [chosen, SubtitleTiming()]
+
+    def test_adding_words_leaves_the_times_alone(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 語の時刻だけを足す頼みで行を寄せると、人が合わせた行の時刻まで動いたように見える
+        panel, _host, first, _second = setup
+        panel.start_transcription(first.id, "tiny", words_only=True, timing=SubtitleTiming())
+        _settle(panel)
+        assert speaker.timings == [SubtitleTiming(fit_to_voice=False)]
+
+    def test_the_setting_is_on_the_settings_screen(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        """壊れると、寄せ方が合わない素材の人と、字幕を早めに出したい人が選べない"""
+        del qt_application
+        assert Preferences().subtitle_timing == SubtitleTiming()
+        chosen = Preferences(
+            subtitle_fit_voice=False, subtitle_start_offset_ms=-250, subtitle_end_offset_ms=400
+        )
+        dialog = PreferencesDialog(chosen)
+        try:
+            assert dialog.preferences().subtitle_timing == chosen.subtitle_timing
+        finally:
+            dialog.deleteLater()
+        store = PreferenceStore(tmp_path / "preferences.json")
+        store.save(chosen)
+        assert store.load().subtitle_timing == chosen.subtitle_timing
+        # 壊れた値と範囲の外で起動を止めない 項目ごとに既定へ戻す
+        store.path.write_text(
+            json.dumps(
+                {
+                    "subtitle_fit_voice": "壊れた",
+                    "subtitle_start_offset_ms": -99999,
+                    "subtitle_end_offset_ms": 1.5,
+                }
+            ),
+            "utf-8",
+        )
+        assert store.load().subtitle_timing == SubtitleTiming()
+
+    def test_the_dialog_starts_from_the_setting(
+        self, setup: tuple[SubtitlePanel, _Host, MediaItem, MediaItem], speaker: _Speaker
+    ) -> None:
+        # 壊れると、窓から起こす人に設定が効かず、窓で変えた値も起こしへ届かない
+        _panel, _host, first, _second = setup
+        service = TranscriptionService(speaker)
+        for wanted in (SubtitleTiming(), SubtitleTiming(False, -100, 600)):
+            dialog = TranscribeDialog(first, service, timing=wanted)
+            assert dialog.timing() == wanted
             dialog.deleteLater()
 
 

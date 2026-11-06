@@ -45,6 +45,7 @@ from sashimono.asr import (
 )
 from sashimono.asr.service import Job
 from sashimono.core.model import MediaItem, Transcript
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.runtime import (
     LEFT_RUNNING_NOTE,
     PackStatus,
@@ -54,6 +55,7 @@ from sashimono.runtime import (
     restart_note,
     snapshot_runtime_modules,
 )
+from sashimono.ui.subtitle.timing import FIT_VOICE_TEXT, offset_box
 from sashimono.ui.theme import Colors, themed_style
 
 __all__ = ["TranscribeDialog"]
@@ -86,8 +88,11 @@ class TranscribeDialog(QDialog):
         stream: int | None = None,
         status: Callable[[], PackStatus] | None = None,
         words: bool = False,
+        timing: SubtitleTiming | None = None,
     ) -> None:
         """``stream`` は初めに選んでおく音声ストリームの番号（選んだクリップが鳴らす音）
+
+        ``words`` と ``timing`` は窓の初めの値（本人の設定 語の時刻と、字幕の時刻の合わせ方）
 
         ``status`` は起こしの環境の導入状況を返す関数 省けば今の機械を調べる
         画面写真の道具は、導入済みの機械でも初めて使う人の画面（未導入）を撮るために
@@ -100,6 +105,7 @@ class TranscribeDialog(QDialog):
 
         self._media = media
         self._words_wanted = words
+        self._timing_wanted = timing if timing is not None else SubtitleTiming()
         self._first_stream = stream
         # 省いたときは呼ぶたびにこのモジュールの runtime_status を引く 引数の既定に
         # 関数そのものを書くと定義した時点の物に固まり、試験が差し替えても効かない
@@ -153,6 +159,17 @@ class TranscribeDialog(QDialog):
 
         self._words = QCheckBox("語ごとの時刻も取る（分割と AI の切る位置の精度が上がる）", self)
         self._words.setChecked(self._words_wanted)
+        # 字幕の時刻（#426） 寄せ方が合わない素材と、出す早さの好みは人で違う 初めの値は設定
+        self._fit_voice = QCheckBox(FIT_VOICE_TEXT, self)
+        self._fit_voice.setChecked(self._timing_wanted.fit_to_voice)
+        self._fit_voice.setToolTip(
+            "起こした後で、行の頭と終わりを近く（前後 0.5 秒）の声の出だしと終わりへ寄せる"
+            " 寄せないと字幕が声より早く出ることがある"
+        )
+        self._start_offset = offset_box(self, self._timing_wanted.start_offset_ms)
+        self._start_offset.setToolTip("負は声より早く出す 0 で声の出だし")
+        self._end_offset = offset_box(self, self._timing_wanted.end_offset_ms)
+        self._end_offset.setToolTip("正は声より遅く消す 0 で声の終わり 次の行の頭は越えない")
         self._gpu = QCheckBox("GPU を使う", self)
         self._gpu.setChecked(True)
         self._gpu.toggled.connect(self._describe_install)
@@ -181,6 +198,9 @@ class TranscribeDialog(QDialog):
         form.addRow("言語", self._language)
         form.addRow("ヒント", self._prompt)
         form.addRow("", self._words)
+        form.addRow("", self._fit_voice)
+        form.addRow("出す時刻をずらす", self._start_offset)
+        form.addRow("消す時刻をずらす", self._end_offset)
         form.addRow("", self._gpu)
 
         self._status = QLabel(self)
@@ -346,6 +366,14 @@ class TranscribeDialog(QDialog):
 
     # --- 起こし ---
 
+    def timing(self) -> SubtitleTiming:
+        """窓で選んだ字幕の時刻の合わせ方"""
+        return SubtitleTiming(
+            fit_to_voice=self._fit_voice.isChecked(),
+            start_offset_ms=self._start_offset.value(),
+            end_offset_ms=self._end_offset.value(),
+        )
+
     def _ask_replace(self, name: str) -> bool:
         answer = QMessageBox.question(
             self,
@@ -383,6 +411,7 @@ class TranscribeDialog(QDialog):
             word_timestamps=self._words.isChecked(),
             initial_prompt=self._prompt.text().strip(),
             audio_stream=stream,
+            timing=self.timing(),
         )
         # 走っている起こし（AI から頼んだ物など）があれば順番待ちに入る 同時には走らせない
         waiting = self._service.busy

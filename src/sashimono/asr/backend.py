@@ -11,12 +11,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
 from sashimono.core.model import Transcript
+from sashimono.core.subtitle_timing import SubtitleTiming
 
 __all__ = [
     "MODELS",
@@ -97,6 +98,9 @@ class TranscribeOptions:
     #: 起こす音声ストリームの番号（:attr:`AudioStreamInfo.index`） ``None`` なら 1 本目
     #: ゲームの録画（ゲームの音とマイクの声）のように音声が何本もある素材で、声の方を選ぶ
     audio_stream: int | None = None
+    #: 起こした行の時刻の合わせ方（#426 声に寄せる・ずらす） ここの既定は何もしない形で、
+    #: 画面と AI の入口が本人の設定（``Preferences.subtitle_timing``）から渡す
+    timing: SubtitleTiming = field(default_factory=lambda: SubtitleTiming(fit_to_voice=False))
 
     def __post_init__(self) -> None:
         if self.beam_size < 1:
