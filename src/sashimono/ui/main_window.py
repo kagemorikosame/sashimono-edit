@@ -472,7 +472,10 @@ class MainWindow(QMainWindow):
         #: プレビュー用の控えを作る係 **書き出しには渡さない**
         #: 渡すと、画面では気付かないまま低解像度の絵が最終出力に入る
         self._proxies = ProxyBuilder(
-            ProxyStore(height=self._preferences.proxy_height),
+            ProxyStore(
+                height=self._preferences.proxy_height,
+                long_gop=self._preferences.proxy_long_gop,
+            ),
             encoder_priority=self._preferences.encoder_priority,
         )
         self._analysis_dirty = False
@@ -1095,11 +1098,15 @@ class MainWindow(QMainWindow):
         if resized or stopped or reencoded:
             self._proxies.close()
             self._proxies = ProxyBuilder(
-                ProxyStore(height=preferences.proxy_height),
+                ProxyStore(height=preferences.proxy_height, long_gop=preferences.proxy_long_gop),
                 encoder_priority=preferences.encoder_priority,
             )
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
+        # 間隔の長い素材への控え（#430）は係を作り直さずに切り替える 作り直すと走っている
+        # 4K の変換まで止まる 係は置き場を替え、切ったときは小さい素材の変換だけを止める
+        # 入れたときは下で全部の素材を頼み直すので、間隔を調べ直して作る
+        self._proxies.set_long_gop(preferences.proxy_long_gop)
         if not preferences.pool_progress:
             # 次の間隔を待たずに外す 切ったのに行の後ろに古い割合が残って見える
             self._media_pool.set_progress({})

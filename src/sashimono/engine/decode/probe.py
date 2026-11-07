@@ -6,7 +6,9 @@ import hashlib
 import itertools
 import logging
 import threading
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
@@ -20,11 +22,15 @@ from sashimono.engine.colorspace import color_tags
 from sashimono.engine.decode.rational import as_fraction
 
 __all__ = [
+    "KEYFRAME_SCAN_GAPS",
+    "KEYFRAME_SCAN_SECONDS",
+    "KEYFRAME_SCAN_TIMEOUT",
     "PROBE_CACHE_SIZE",
     "ROTATION_PACKET_LIMIT",
     "ProbeError",
     "clear_probe_cache",
     "forget_probe",
+    "keyframe_gap",
     "media_origin",
     "moving_pictures",
     "probe_media",
@@ -49,6 +55,20 @@ _log = logging.getLogger(__name__)
 
 #: 調べた結果を覚えておく素材の数 1 本あたり数百バイトなので、多めに持っても軽い
 PROBE_CACHE_SIZE = 512
+
+#: キーフレームの間隔を調べるときに、最初のキーフレームから読む長さ（秒 素材の中の時刻）
+#: 全部を読むと長い録画で何秒も掛かる 頭の数秒は場面の切り替わりでキーフレームが
+#: 細かく入ることがあるので、決まった間隔が 1 回は現れる長さを取る
+KEYFRAME_SCAN_SECONDS = Fraction(12)
+
+#: キーフレームの間隔を調べるときに、これだけの間隔を見たら読むのをやめる
+#: 全部がキーフレームの素材（ProRes や MJPEG）は 1 つずつが重いので、12 秒ぶん読むと
+#: 数百 MB になる 間隔の短い素材はこれで早く切り上がる
+KEYFRAME_SCAN_GAPS = 8
+
+#: キーフレームの間隔を読むのに使ってよい時間（秒） 手元の 1080p は 1 本 10〜20ms で済む
+#: 越えるのは遅い場所の素材で、待ち続けるとほかの素材の控えが後回しになり続ける
+KEYFRAME_SCAN_TIMEOUT = 5.0
 
 _Facts = tuple[Fraction, tuple[VideoStreamInfo, ...], tuple[AudioStreamInfo, ...]]
 
@@ -475,3 +495,158 @@ def _display_rotation(container: av.container.InputContainer, stream: av.VideoSt
     # 絵の回転は ffprobe と同じく反時計回りの角度 表示時に必要なのは時計回りなので反転する
     clockwise = round(-float(frame.rotation)) % 360
     return clockwise if clockwise in (0, 90, 180, 270) else 0
+
+
+def keyframe_gap(
+    path: Path, stream_index: int | None = None, *, enough: Fraction | None = None
+) -> Fraction | None:
+    """映像の中で見た、キーフレームから次のキーフレーム（か終わり）までの一番長い間（秒）
+
+    飛んだ先の 1 コマを出すには、手前のキーフレームから順に復号し直すしかない この間が
+    長い素材ほど、再生位置を動かすたびに待たされる（:mod:`sashimono.engine.cache.proxy` の表）
+    控えを作るかを決めるためだけに使う
+
+    パケットを取り出すだけで復号はしない 全部は読まず、頭と真ん中の 2 か所を見る
+    1 か所で読むのは、最初のキーフレームから :data:`KEYFRAME_SCAN_SECONDS` ぶんか、
+    :data:`KEYFRAME_SCAN_GAPS` 個の間隔を見るまで 頭だけだと、冒頭の場面の切り替わりで
+    キーフレームが細かく入った録画を、後ろが長い間隔でも短いと見誤る
+    ``enough`` を渡すと、それより長い間を見た所でやめて、その時点の長さを返す
+    長いと分かれば十分なので、50 秒間隔の素材を 50 秒ぶん読まずに済む
+    どこで止めても、返すのは読んだ所までの長さ 本当の間はそれより長いことがある
+
+    読むのに :data:`KEYFRAME_SCAN_TIMEOUT` 秒より掛かったら ``None``（分からない）にする
+    控えを作る係は 1 本ずつ回すので、遅い場所（つないだ先の共有フォルダなど）の素材を
+    読み続けると、ほかの素材の控えがいつまでも作られない
+
+    素材の終わりまでに次のキーフレームが無ければ、最後のパケットまでを間として数える
+    短い素材でキーフレームが頭に 1 つだけなら、その素材のどこへ飛んでも頭から読み直すため
+    映像が無い・キーフレームが 1 つも無い・開けないときも ``None`` 途中で読めなくなったときも、
+    ``enough`` より長い間をもう見ていなければ ``None`` 短い値を返すと、一時の読み損ないで
+    「控えは要らない」と決まってしまう
+    """
+    deadline = time.monotonic() + KEYFRAME_SCAN_TIMEOUT
+    try:
+        # 開く・読むが止まったままにならないよう FFmpeg の側にも上限を渡す（つないだ先の素材で効く）
+        container = av.open(str(path), timeout=KEYFRAME_SCAN_TIMEOUT)
+    except (av.error.FFmpegError, OSError):
+        return None
+    with container:
+        pictures = moving_pictures(container)
+        if not pictures:
+            return None
+        stream = (
+            pictures[0]
+            if stream_index is None
+            else next((s for s in pictures if s.index == stream_index), pictures[0])
+        )
+        if stream.time_base is None:
+            return None
+        base = as_fraction(stream.time_base)
+        try:
+            head = _scan_gaps(container, stream, base, enough, deadline)
+            if head is None or (enough is not None and head.longest > enough):
+                return None if head is None else head.longest
+            middle = _middle_of(container, head.reached)
+            if middle is None:
+                return head.longest
+            # 真ん中の手前のキーフレームへ戻ってから、頭と同じ読み方で読む
+            container.seek(int(middle / base), stream=stream, backward=True)
+            later = _scan_gaps(container, stream, base, enough, deadline)
+        except _TooSlowError:
+            _log.warning("キーフレームの間隔を読むのに時間が掛かりすぎた: %s", path)
+            return None
+        except _ReadFailedError as exc:
+            # 長いと分かる前に読めなくなった 短い値を返すと、呼ぶ側が「要らない」と覚え、
+            # 置き場が直った後も調べ直さない 分からないにして、次に頼まれたとき読み直させる
+            _log.warning("キーフレームの間隔を読む途中で止まった: %s (%s)", path, exc)
+            return exc.longest if enough is not None and exc.longest > enough else None
+        except (av.error.FFmpegError, OSError, ValueError) as exc:
+            # 真ん中へ飛べなかった 一時の読み損ないかもしれないので、短いとは決めない
+            _log.warning("キーフレームの間隔を読む途中で止まった: %s (%s)", path, exc)
+            return None
+        return head.longest if later is None else max(head.longest, later.longest)
+
+
+class _TooSlowError(Exception):
+    """キーフレームの間隔を読むのに :data:`KEYFRAME_SCAN_TIMEOUT` より掛かった"""
+
+
+class _ReadFailedError(Exception):
+    """キーフレームの間隔を読む途中で読めなくなった ``longest`` はそれまでに見た一番長い間"""
+
+    def __init__(self, longest: Fraction, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.longest = longest
+
+
+@dataclass(frozen=True, slots=True)
+class _Scanned:
+    """1 か所を読んだ結果"""
+
+    #: 見た中で一番長い間（秒）
+    longest: Fraction
+    #: 読み終えた所の時刻（秒 PTS の数え方）
+    reached: Fraction
+
+
+def _middle_of(container: av.container.InputContainer, reached: Fraction) -> Fraction | None:
+    """真ん中も読むなら、その時刻（秒） 頭で真ん中まで読み終えていれば ``None``
+
+    素材の長さだけで決めない 間隔を数えて早く切り上げると、20 秒の素材でも 3 秒しか
+    読んでいないことがあり、後ろの長い間隔を見落とす
+    """
+    if container.duration is None:
+        return None
+    start = Fraction(container.start_time or 0, av.time_base)
+    middle = start + Fraction(container.duration, av.time_base) / 2
+    return middle if middle > reached else None
+
+
+def _scan_gaps(
+    container: av.container.InputContainer,
+    stream: av.VideoStream,
+    base: Fraction,
+    enough: Fraction | None,
+    deadline: float,
+) -> _Scanned | None:
+    """今の位置からパケットを読み、最初のキーフレームから見た一番長い間
+
+    キーフレームが無ければ ``None`` 止める決まりは :func:`keyframe_gap` に書いた
+    時間が掛かりすぎたら :class:`_TooSlowError`、途中で読めなくなったら :class:`_ReadFailedError`
+    """
+    first: Fraction | None = None
+    last: Fraction | None = None
+    latest: Fraction | None = None
+    longest = Fraction(0)
+    gaps = 0
+    try:
+        for packet in container.demux(stream):
+            if time.monotonic() > deadline:
+                raise _TooSlowError
+            if packet.pts is None:
+                continue
+            at = packet.pts * base
+            # B フレームは表示の順と並びが違い、前のパケットより早い時刻を持つ
+            # 一番後ろの時刻で数えないと、間が縮んで見える
+            latest = at if latest is None else max(latest, at)
+            if packet.is_keyframe:
+                if last is not None and at > last:
+                    longest = max(longest, at - last)
+                    gaps += 1
+                if first is None:
+                    first = at
+                last = at if last is None else max(last, at)
+            elif last is not None:
+                longest = max(longest, latest - last)
+            if enough is not None and longest > enough:
+                return _Scanned(longest, latest)
+            if first is not None and (
+                gaps >= KEYFRAME_SCAN_GAPS or latest - first >= KEYFRAME_SCAN_SECONDS
+            ):
+                return _Scanned(longest, latest)
+    except (av.error.FFmpegError, OSError, ValueError) as exc:
+        raise _ReadFailedError(longest, exc) from exc
+    if last is None or latest is None:
+        return None
+    # 終わりまで読んだ 最後のキーフレームから終わりまでも間に数える
+    return _Scanned(max(longest, latest - last), latest)

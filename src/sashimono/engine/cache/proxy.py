@@ -60,6 +60,38 @@
   （1 枚の値は 95 パーセンタイル、175 秒は 90 枚の実測の合計 割り算で一致はしない
   中央の重さは 95 パーセンタイルより軽い）
 
+キーフレームの間隔（#430）
+
+``.venv\\Scripts\\python.exe tools\\bench_seek.py``（1920x1080 30fps 60 秒の素材を
+キーフレームの間隔だけ変えて作り、ランダムな 80 か所へ飛んで 1 コマ出すまで
+控えは 50 秒間隔の素材から :func:`create_proxy` で作った 540p 版 2 の控えは
+変える前の :func:`create_proxy` で同じ素材から作り、40 か所で測った）
+
+======================= ========== ================
+読む物                    中央値       95 パーセンタイル
+======================= ========== ================
+元 1 秒間隔                21.9ms     29.7ms
+元 2 秒間隔                23.6ms     36.3ms
+元 4 秒間隔                31.1ms     50.1ms
+元 8 秒間隔                46.7ms     90.2ms
+元 16 秒間隔               79.9ms     170.8ms
+元 50 秒間隔               197.3ms    419.4ms
+控え 8.3 秒間隔（版 2）     39.4ms     60.2ms
+控え 0.5 秒間隔（版 3）     5.8ms      7.6ms
+======================= ========== ================
+
+読み取れること
+
+* **飛ぶ待ちを決めるのはキーフレームの間隔** 2 秒までは 1 秒と変わらず、4 秒で少し増え、
+  8 秒から先は間隔に比例して増える 素材の長さそのものはほとんど響かない
+* **1080p でも間隔が長ければ控えが効く** 50 秒間隔なら 197.3 → 5.8ms
+* **控え自身の間隔も短くないと効かない** 版 2 までの控えは符号化器の既定（250 コマ
+  30fps で 8.3 秒）のままで、540p に縮めても 39.4ms 1080p で 2 秒間隔の元（23.6ms）より遅かった
+  版 3 から 0.5 秒ごとにキーフレームを置く（:data:`PROXY_KEYFRAME_SECONDS`）
+* 線は :data:`KEYFRAME_GAP_LIMIT`（4 秒） 4 秒までは元のまま読んでも 2 秒間隔と 8ms ほどしか
+  違わず、変換で CPU か GPU を使う方が損 8 秒では倍になる 録画ソフトの既定に多い
+  250 コマごと（60fps で 4.2 秒 30fps で 8.3 秒）は線を超えるので控えを作る
+
 控えを使うのは**プレビューだけ** 書き出しは必ず元の素材から読む 混ざると、
 画面では気付かないまま低解像度の絵が最終出力に入る
 
@@ -69,6 +101,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from collections.abc import Callable
@@ -87,7 +120,8 @@ from sashimono.core.model import MediaId, MediaItem
 from sashimono.engine.cache.progress import JobBoard, ProgressSnapshot
 from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
-from sashimono.engine.decode import ProbeError, VideoDecoder, probe_media
+from sashimono.engine.decode import ProbeError, VideoDecoder, keyframe_gap, probe_media
+from sashimono.engine.decode.probe import KEYFRAME_SCAN_TIMEOUT
 from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.encoders import (
     PRIORITY_AUTO,
@@ -98,12 +132,16 @@ from sashimono.engine.encoders import (
 )
 
 __all__ = [
+    "KEYFRAME_GAP_LIMIT",
+    "MEASURED_KEYFRAME_SEEK_MS",
     "MEASURED_PREFETCH_MS",
     "PROXY_HEIGHT",
+    "PROXY_KEYFRAME_SECONDS",
     "ProxyBuilder",
     "ProxyStore",
     "create_proxy",
     "is_worth_proxying",
+    "needs_keyframe_check",
     "proxy_codecs",
 ]
 
@@ -125,14 +163,31 @@ PROXY_HEIGHT = 540
 
 #: 控えを作る値打ちがある縦の画素数 これ以下なら元のまま読む方が速い
 #: 変換にかかる時間の方が、再生で取り返す時間より長くなる
+#: ただしキーフレームの間隔が長い素材は別（:data:`KEYFRAME_GAP_LIMIT`）
 MIN_SOURCE_HEIGHT = 1081
+
+#: これより長い間キーフレームが無い素材は、小さくても控えを作る（秒 上の表の「線」）
+#: 飛ぶたびに遠くのキーフレームから読み直すので、縦の画素数が小さくても飛ぶ待ちが長い
+KEYFRAME_GAP_LIMIT = Fraction(4)
+
+#: 控えに置くキーフレームの間隔（秒） 飛んだ先の 1 コマを出すのに読み直す量を決める
+#: 符号化器の既定（250 コマ）に任せると 30fps で 8.3 秒になり、控えなのに飛ぶ待ちが残る
+#: 0 にして全部をキーフレームにしないのは、同じビットレートで絵が粗くなり、
+#: NVENC が B フレームの数より短い間隔を断るため
+PROXY_KEYFRAME_SECONDS = Fraction(1, 2)
+
+#: 上の表の、元 1080p の 2 秒・8 秒・50 秒間隔と 0.5 秒間隔の控え（中央値 ミリ秒）
+#: 設定の画面がここから文言を組み立てる
+MEASURED_KEYFRAME_SEEK_MS = (23.6, 46.7, 197.3, 5.8)
 
 #: 控えの置き場（:class:`~sashimono.engine.cache.store.CacheStore` の名前空間）
 NAMESPACE = "proxy"
 
 #: 控えの中身の版 作り方を変えて、前の控えをそのまま読むと絵が違ってしまうときに上げる
 #: 2: BT.709 へ変換してタグを付けるようにした（#61）
-FORMAT_VERSION = 2
+#: 3: キーフレームを 0.5 秒ごとに置くようにした（#430） 絵は同じだが、版 2 の控えは
+#: 8 秒ほどの間隔で、飛ぶ待ちが元の 1080p より長いことがある 作り直させる
+FORMAT_VERSION = 3
 
 #: 控えに使うコーデックの優先順 GPU のエンコーダは CPU をほとんど使わないので、
 #: 変換しながら編集を続けられる 無い環境では CPU の libx264 へ落ちる
@@ -152,14 +207,26 @@ def proxy_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
     return order_by_priority([name for name in CODEC_PREFERENCE if usable(name)], priority)
 
 
-def is_worth_proxying(media: MediaItem) -> bool:
+def is_worth_proxying(media: MediaItem, keyframe_gap: Fraction | None = None) -> bool:
     """控えを作る値打ちがあるか
 
-    小さい素材まで変換すると、待たされるだけで速くならない
+    小さい素材まで変換すると、待たされるだけで速くならない ただしキーフレームの間隔が
+    :data:`KEYFRAME_GAP_LIMIT` より長い素材（``keyframe_gap`` 調べていなければ ``None``）は、
+    小さくても飛ぶたびに待たされるので作る
     """
     if not media.has_video or media.is_still:
         return False
-    return any(stream.display_size[1] >= MIN_SOURCE_HEIGHT for stream in media.video_streams)
+    if any(stream.display_size[1] >= MIN_SOURCE_HEIGHT for stream in media.video_streams):
+        return True
+    return keyframe_gap is not None and keyframe_gap > KEYFRAME_GAP_LIMIT
+
+
+def needs_keyframe_check(media: MediaItem) -> bool:
+    """大きさでは決まらず、キーフレームの間隔を調べて決める素材か
+
+    大きい素材は調べなくても作る 調べると、4K の素材のたびに無駄に読むことになる
+    """
+    return media.has_video and not media.is_still and not is_worth_proxying(media)
 
 
 class ProxyStore:
@@ -167,21 +234,51 @@ class ProxyStore:
 
     :class:`~sashimono.engine.cache.store.CacheStore` の上に乗る 作るのは
     :func:`create_proxy` で、こちらは「どこに置くか」と「あるか」だけを見る
+
+    ``long_gop`` は、キーフレームの間隔が長い小さい素材にも控えを使うか（本人の設定）
+    切ったときは作らないだけでなく、前に作った控えも :meth:`find` で返さない 返すと、
+    切ったのに 1080p の素材が粗い控えのまま映り続ける
     """
 
-    def __init__(self, store: CacheStore | None = None, *, height: int = PROXY_HEIGHT) -> None:
+    def __init__(
+        self,
+        store: CacheStore | None = None,
+        *,
+        height: int = PROXY_HEIGHT,
+        long_gop: bool = True,
+    ) -> None:
         self._store = store if store is not None else CacheStore()
         self._height = height
+        self._long_gop = long_gop
 
     @property
     def height(self) -> int:
         return self._height
 
-    def key_for(self, media: MediaItem) -> str:
+    @property
+    def long_gop(self) -> bool:
+        """キーフレームの間隔が長い小さい素材にも控えを使うか"""
+        return self._long_gop
+
+    def with_long_gop(self, enabled: bool) -> ProxyStore:
+        """同じ置き場・同じ大きさで、``long_gop`` だけを替えた物"""
+        return ProxyStore(self._store, height=self._height, long_gop=enabled)
+
+    def key_for(self, media: MediaItem, version: int = FORMAT_VERSION) -> str:
         # 縦の画素数を鍵に混ぜる 設定を変えたときに、前の大きさの控えを掴まない
         # 書式の版も混ぜる 版 1 の控えはタグが無く元の行列のままなので、今の読み方では
         # BT.601 とみなされて色がずれる 版を上げれば作り直される
-        return media_key(media.path, extra=f"proxy{self._height}v{FORMAT_VERSION}")
+        return media_key(media.path, extra=f"proxy{self._height}v{version}")
+
+    def discard_older(self, media: MediaItem) -> None:
+        """同じ素材・同じ大きさの、前の版の控えを捨てる 今の版を作り終えたときに呼ぶ
+
+        置き場には古い物を片付ける仕組みが無い 版を上げると前の控えはもう読まれないのに、
+        素材 1 本ぶんの控え（1080p の 1 分で十数 MB）がずっと残る
+        """
+        for version in range(1, FORMAT_VERSION):
+            path = self._store.path_for(NAMESPACE, self.key_for(media, version), ".mp4")
+            path.unlink(missing_ok=True)
 
     def path_for(self, media: MediaItem) -> Path:
         """控えの置き場 まだ無くてもパスは返す"""
@@ -189,6 +286,8 @@ class ProxyStore:
 
     def find(self, media: MediaItem) -> Path | None:
         """使える控え 無ければ ``None``"""
+        if not self._long_gop and needs_keyframe_check(media):
+            return None
         path = self.path_for(media)
         try:
             return path if path.stat().st_size > 0 else None
@@ -344,6 +443,11 @@ def _transcode(
             if options:
                 video.options = dict(options)
             video.time_base = stream.time_base
+            # 飛んだ先を早く出すための控えなので、キーフレームを細かく置く（上の表）
+            # B フレームも切る NVENC は B フレームの数 + 1 より短い間隔を断り、
+            # 断られると CPU の libx264 まで落ちて変換が遅くなる
+            video.codec_context.gop_size = _keyframe_every(as_fraction(rate))
+            video.codec_context.max_b_frames = 0
 
             for frame in container.decode(stream):
                 if should_cancel is not None and should_cancel():
@@ -364,6 +468,15 @@ def _transcode(
     if progress is not None:
         progress(1.0)
     return True
+
+
+def _keyframe_every(rate: Fraction) -> int:
+    """控えのキーフレームを何コマごとに置くか（:data:`PROXY_KEYFRAME_SECONDS` をコマに直す）
+
+    2 コマより細かくしない NVENC は 1 コマごと（全部キーフレーム）を B フレームが
+    無くても断る 低いフレームレート（1fps の定点の録画など）で 0 や 1 になるのを防ぐ
+    """
+    return max(2, round(rate * PROXY_KEYFRAME_SECONDS))
 
 
 def _shrunk(frame: av.VideoFrame, size: tuple[int, int], rotation: int) -> av.VideoFrame:
@@ -431,6 +544,41 @@ def _duration_of(
     return 0.0
 
 
+#: 間隔を調べるのを待つ上限（秒） 調べる側の上限（:data:`KEYFRAME_SCAN_TIMEOUT`）に少し足す
+#: 調べる側の上限は読み込みが返ってきた所でしか効かない 共有フォルダの読み込みが
+#: 止まったままだと戻らないので、待つ側でも区切る
+SCAN_WAIT_SECONDS = KEYFRAME_SCAN_TIMEOUT + 1.0
+
+
+def _gap_in_time(media: MediaItem) -> Fraction | None:
+    """素材のキーフレームの間隔を、待つ上限の中で調べる 間に合わなければ ``None``（分からない）
+
+    調べるのは使い捨ての裏のスレッド（daemon） 控えの係は 1 本ずつ回すので、係のスレッドで
+    読み込みが止まると、ほかの素材の控えがいつまでも作られず、窓を閉じてもプロセスが
+    終わらない 間に合わなかったスレッドは置いていく 止まった読み込みは Python から
+    割り込めないが、daemon なので終了は妨げない
+    """
+    found: list[Fraction | None] = []
+    done = threading.Event()
+
+    def scan() -> None:
+        try:
+            found.append(
+                keyframe_gap(
+                    media.path,
+                    media.video_streams[0].index if media.video_streams else None,
+                    enough=KEYFRAME_GAP_LIMIT,
+                )
+            )
+        finally:
+            done.set()
+
+    threading.Thread(target=scan, name="sashimono-keyframes", daemon=True).start()
+    if not done.wait(SCAN_WAIT_SECONDS) or not found:
+        return None
+    return found[0]
+
+
 class ProxyBuilder:
     """控えをバックグラウンドで作る
 
@@ -471,6 +619,13 @@ class ProxyBuilder:
         #: 画面へ出す進み具合 ``_progress`` は描画の側が 1 本ずつ引くためのもので、
         #: 何本のうち何本目か・失敗したかは持たない
         self._board = JobBoard()
+        #: キーフレームの間隔を調べて、控えは要らないと分かった素材（控えの鍵）
+        #: 設定を当て直すたびに全部の素材を頼み直すので、覚えないと毎回読み直す
+        #: 鍵は素材の大きさと更新時刻を含むので、差し替えた素材は調べ直す
+        self._short: set[str] = set()
+        #: 走っている物のうち、間隔を調べて決める小さい素材 設定で間隔の長い素材への控えを
+        #: 切ったとき、これだけを止める（:meth:`set_long_gop`）
+        self._small: set[MediaId] = set()
 
     @property
     def store(self) -> ProxyStore:
@@ -504,12 +659,26 @@ class ProxyBuilder:
         on_ready: Callable[[MediaId], None] | None = None,
         on_progress: Callable[[MediaId], None] | None = None,
     ) -> None:
-        """控えを作るよう予約する すでにあるもの・作っている最中のものは何もしない"""
-        if not is_worth_proxying(media) or self._store.find(media) is not None:
+        """控えを作るよう予約する すでにあるもの・作っている最中のものは何もしない
+
+        小さい素材は、裏のスレッドでキーフレームの間隔を調べてから決める（#430）
+        読むのは頭と真ん中の十数秒ずつのパケットだけ（:func:`keyframe_gap`）でも、画面のスレッドで
+        読むと素材を読み込むたびに手が止まる
+        """
+        check = needs_keyframe_check(media)
+        if check and not self._store.long_gop:
             return
+        if not check and not is_worth_proxying(media):
+            return
+        if self._store.find(media) is not None:
+            return
+        # 鍵はファイルの大きさと時刻を読んで作るので、錠の外で求める
+        key = self._store.key_for(media) if check else None
 
         with self._lock:
             if self._closed:
+                return
+            if key is not None and key in self._short:
                 return
             if media.id in self._running:
                 if media.id in self._cancelled:
@@ -517,9 +686,35 @@ class ProxyBuilder:
                 return
             self._cancelled.discard(media.id)
             self._running.add(media.id)
+            if check:
+                self._small.add(media.id)
+            self._begin(media, counted=not check)
+        self._launch(media, on_ready, on_progress)
+
+    def _begin(self, media: MediaItem, *, counted: bool) -> None:
+        """変換を数え始める ``_lock`` を持って呼ぶ
+
+        調べてから決める素材（``counted`` が偽）は、作ると決まるまで数えない 数えると、
+        間隔の短い 1080p を読み込むたびに「控えを作っています」が出て、何もできずに消える
+        """
+        if counted:
             self._progress[media.id] = 0.0
             self._board.start(media.id, media.id)
-        self._launch(media, on_ready, on_progress)
+
+    def _long_enough(self, media: MediaItem) -> bool:
+        """キーフレームの間隔を調べて、控えを作るか決める 裏のスレッドで呼ぶ
+
+        要らなければ覚えておく 分からなかった（開けない・キーフレームが無い）ときは
+        覚えない 一時的に読めなかっただけなら、次に頼まれたときに調べ直せる
+        """
+        gap = _gap_in_time(media)
+        if is_worth_proxying(media, gap):
+            return True
+        if gap is not None:
+            key = self._store.key_for(media)
+            with self._lock:
+                self._short.add(key)
+        return False
 
     def _launch(
         self,
@@ -540,24 +735,37 @@ class ProxyBuilder:
             with self._lock:
                 return media.id in self._cancelled
 
+        check = needs_keyframe_check(media)
+
         def run() -> None:
             made: Path | None = None
             # 止められていたかどうかを、消す前に控えておく 消してから見ると
             # 分からなくなり、閉じたあとに「控えができた」と伝えてしまう
             stopped = False
             failure: str | None = None
+            # 調べた結果、控えは要らなかった 失敗ではないので数えずに外す
+            skipped = False
             try:
-                made = create_proxy(
-                    media.path,
-                    self._store.prepare(media),
-                    height=self._store.height,
-                    # 1 本目の映像だけを控えにする 読む側（レンダラ）も
-                    # 1 本目を指すクリップにしか渡さない
-                    stream_index=media.video_streams[0].index if media.video_streams else None,
-                    encoder_priority=self._encoder_priority,
-                    progress=report,
-                    should_cancel=cancelled,
-                )
+                if check:
+                    skipped = cancelled() or not self._long_enough(media)
+                    if not skipped:
+                        with self._lock:
+                            # 調べている間に外された素材は数え始めない 数えると、
+                            # 一覧に無い素材の分が全体の割合に一瞬混ざる
+                            if media.id not in self._cancelled and not self._closed:
+                                self._begin(media, counted=True)
+                if not skipped:
+                    made = create_proxy(
+                        media.path,
+                        self._store.prepare(media),
+                        height=self._store.height,
+                        # 1 本目の映像だけを控えにする 読む側（レンダラ）も
+                        # 1 本目を指すクリップにしか渡さない
+                        stream_index=media.video_streams[0].index if media.video_streams else None,
+                        encoder_priority=self._encoder_priority,
+                        progress=report,
+                        should_cancel=cancelled,
+                    )
             except Exception as exc:  # 裏のスレッドの例外は誰にも見えずに消える
                 # 投げ直さずに失敗として数える 前は executor の中で黙って消え、
                 # 控えが無いまま「作っている最中」にも見えなかった
@@ -573,7 +781,8 @@ class ProxyBuilder:
                     # 見つけられず、外した素材の控えを作り始める（解析と同じ）
                     if again is None:
                         self._running.discard(media.id)
-            if stopped:
+                        self._small.discard(media.id)
+            if stopped or skipped:
                 self._board.drop(media.id)
             elif made is None:
                 # 開けない・映像の大きさが分からない素材は None で返る 何も出さないと、
@@ -581,6 +790,10 @@ class ProxyBuilder:
                 self._board.finish(media.id, failure or "控えを作れなかった")
             else:
                 self._board.finish(media.id)
+                # 前の控えを開いたままの読み手がいると Windows では消せない 残っても
+                # 読まれないだけなので、できた控えの知らせは止めない
+                with contextlib.suppress(OSError):
+                    self._store.discard_older(media)
             # 止められていたなら伝えない 伝えると、窓を閉じている最中や
             # 控えを切った直後に「控えができた」として描き直しが走る
             if made is not None and not stopped and on_ready is not None:
@@ -588,8 +801,7 @@ class ProxyBuilder:
             if again is not None:
                 with self._lock:
                     # 間に外されていれば ``_cancelled`` に入っている 次の変換はすぐ止まる
-                    self._progress[media.id] = 0.0
-                    self._board.start(media.id, media.id)
+                    self._begin(again[0], counted=not needs_keyframe_check(again[0]))
                 self._launch(*again)
 
         with self._lock:
@@ -602,6 +814,24 @@ class ProxyBuilder:
                 self._board.drop(media.id)
                 return
             self._executor.submit(run)
+
+    def set_long_gop(self, enabled: bool) -> None:
+        """間隔の長い小さい素材にも控えを作るかを切り替える（本人の設定）
+
+        係を作り直さない 作り直すと走っている 4K の変換まで止まり、最初からになる
+        置き場は新しい物に替える 読む側（プレビュー）は置き場が替われば素材を開き直すので、
+        切ったときは作った控えから元の素材へ、入れたときは控えへ切り替わる
+        切ったときは、走っている小さい素材の調べと変換だけを止める 走り続けると、
+        切った後も裏で CPU か GPU を使い続ける
+        """
+        with self._lock:
+            if enabled == self._store.long_gop:
+                return
+            self._store = self._store.with_long_gop(enabled)
+            if not enabled:
+                self._cancelled.update(self._small)
+                for media_id in self._small:
+                    self._again.pop(media_id, None)
 
     def forget(self, media_id: MediaId) -> None:
         """素材を外したときに、作りかけを止める"""

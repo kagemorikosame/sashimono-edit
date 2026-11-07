@@ -655,7 +655,10 @@ class TestBuildingInTheBackground:
         assert store.find(media) is not None
 
     def test_a_small_source_is_left_alone(self, sample_av: SampleMedia, tmp_path: Path) -> None:
-        """1080p 以下は作らない 待たされるだけで速くならない"""
+        """1080p 以下でキーフレームの間隔が短い素材は作らない 待たされるだけで速くならない
+
+        間隔の長い素材は作る（tests/engine/test_proxy_long_gop.py）
+        """
         store = ProxyStore(CacheStore(tmp_path), height=120)
         builder = ProxyBuilder(store)
         media = probe_media(sample_av.path)
