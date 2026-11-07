@@ -222,7 +222,8 @@ class TestProxyRequestWhileCancelling:
             return target
 
         monkeypatch.setattr(proxy_module, "create_proxy", fake)
-        # 控えを作るのは 1080 を超える素材だけ（is_worth_proxying）
+        # 大きさだけで作ると決まる素材にする（is_worth_proxying） 1080p 以下は裏でキーフレームの
+        # 間隔を調べてから決めるので、変換が始まるまでの順が変わる
         stream = replace(video_media.video_streams[0], width=3840, height=2160)
         video_media = replace(video_media, video_streams=(stream,))
         builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path / "cache")))
