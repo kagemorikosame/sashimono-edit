@@ -592,6 +592,25 @@ class TextEditor(ParameterEditor):
         （タイマーの書式の 1 文字目など）の前後で取り消しの段が分かれる"""
         self._typing_since = since
 
+    def forget_typing(self) -> None:
+        """打ち続けと欄の中の取り消しを捨てる 欄をそのまま別のクリップへ向け直したとき
+
+        欄の中の取り消し（Ctrl+Z）を残すと、前のクリップで打った分を戻す操作が、
+        向け直した先のクリップへの編集になる 作り直していた頃は新しい欄で何も残らなかった
+        """
+        self._typing_since = None
+        if self._multiline:
+            self._area.document().clearUndoRedoStacks()
+        else:
+            # 1 行の欄は取り消しだけを消す口が無い 同じ本文を入れ直すと消える
+            self._updating = True
+            try:
+                position = self._line.cursorPosition()
+                self._line.setText(self._line.text())
+                self._line.setCursorPosition(position)
+            finally:
+                self._updating = False
+
     def _on_text(self, text: str) -> None:
         if self._updating:
             return

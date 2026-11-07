@@ -222,6 +222,34 @@ class TestSwitching:
         finally:
             shiboken6.delete(label)
 
+    def test_the_same_sheet_is_not_set_again(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、同じ見た目を当て直すたびに Qt が計算し直し、設定パネルの ◀ ◆ ▶ を
+        編集のたびに 250 回当て直して数 ms 重くなる（#431）"""
+        label = QLabel()
+        try:
+            themed_style(label, lambda: f"color: {Colors.TEXT.name()};")
+            calls: list[str] = []
+            original = QLabel.setStyleSheet
+
+            def counted(widget: QLabel, sheet: str) -> None:
+                calls.append(sheet)
+                original(widget, sheet)
+
+            monkeypatch.setattr(QLabel, "setStyleSheet", counted)
+            themed_style(label, lambda: f"color: {Colors.TEXT.name()};")
+            assert calls == []
+            # 作り方は覚え直す テーマを切り替えたら、あとから渡した作り方で作り直す
+            themed_style(label, lambda: f"color: {Colors.TEXT.name()}; font-weight: bold;")
+            assert len(calls) == 1
+            apply_theme(qt_application, THEME_LIGHT)
+            assert "bold" in label.styleSheet()
+            assert PALETTES[THEME_LIGHT]["TEXT"].name() in label.styleSheet()
+        finally:
+            apply_theme(qt_application, THEME_DARK)
+            shiboken6.delete(label)
+
     def test_a_deleted_part_does_not_stop_the_switch(self, qt_application: QApplication) -> None:
         # 消えた部品へ当て直そうとして例外になると、そこで切り替えが止まって半分だけ変わる
         label = QLabel()

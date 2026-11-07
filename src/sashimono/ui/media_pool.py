@@ -190,7 +190,7 @@ class MediaPoolWidget(QWidget):
 
         self.setAcceptDrops(True)
         self._apply_view_mode()
-        self.set_project(project)
+        self._fill()
 
     # --- 表示の切り替えとサムネイル ---
 
@@ -296,9 +296,22 @@ class MediaPoolWidget(QWidget):
 
         選択は素材 ID で復元する 行番号で覚えると、素材を消したときに
         別のものが選ばれる
+
+        素材の一覧（``project.media``）とフレームレートが前と同じ物なら作り直さない（#432）
+        クリップを動かすなどの編集では一覧はそのまま同じ物が渡り、毎回作り直すと素材
+        1000 本で編集 1 回に 20 ms ほど乗っていた 素材を足す・外す・名前を変えるなどの
+        命令は一覧を作り直すので、別の物になって作り直す
         """
-        selected = self.selected_media_id()
+        previous = self._project
         self._project = project
+        if previous.media is project.media and previous.rate == project.rate:
+            return
+        self._fill()
+
+    def _fill(self) -> None:
+        """今のプロジェクトの素材で一覧を作り直す"""
+        project = self._project
+        selected = self.selected_media_id()
         # 外した素材と、中身のファイルが差し替わった素材の絵は捨てる 外した素材の分を
         # 残すと抱え続け、差し替わった分を残すと前のファイルの絵が出続ける
         present = {media.id: media.path for media in project.media}
