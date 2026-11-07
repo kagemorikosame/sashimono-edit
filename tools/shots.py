@@ -1334,15 +1334,19 @@ def wiki_subtitle_install(context: Context) -> QImage:
     """
     from sashimono.asr import TranscriptionService, default_backend
     from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+    from sashimono.ui.workspace import Preferences
 
     with editor(sample_project()) as window:
         import_sample(window, context)
         media = window.project.media[0]
+        # 窓の初めの値は字幕パネルが本人の設定から渡す 渡さないと窓の引数の既定（語の時刻は
+        # 取らない）で撮れ、初めて使う人が見る画面（設定の既定は取る）と食い違う
         dialog = TranscribeDialog(
             media,
             TranscriptionService(default_backend()),
             window,
             status=asr_not_installed,
+            words=Preferences().word_timestamps,
         )
         return _grab_dialog(dialog, marks=("環境を導入",))
 
