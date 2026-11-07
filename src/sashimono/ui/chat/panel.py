@@ -937,6 +937,7 @@ class ChatPanel(QWidget):
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
+        self._bridge.ask_first = preferences.ai_ask_before_ungroup
         # 上限は次の道具の前から効く 応えている途中で変えても、会話を作り直さずに済む
         self._bridge.usage.limits = preferences.budget_limits()
         self._refresh_status()
@@ -1744,6 +1745,12 @@ class ChatPanel(QWidget):
         if question.free_text:
             parts.append(question.free_text)
         self._say("答え", "\n".join(parts))
+        go = question.spec.choices[0].label
+        if question.gate and go not in question.selected:
+            # 動かす前の問いを断ったのは許可を断ったのと同じ 失敗にだけ数えると、止まった後の
+            # 引き継ぎに残らず、続きを頼まれた AI が同じ操作をまた試す（CodeRabbit の指摘 #435）
+            answer = "・".join(parts) or "答えなし"
+            self._record.refused(f"{question.gate}（{go} を選ばず: {answer}）")
         self._refresh_status()
 
     def _hide_question(self) -> None:

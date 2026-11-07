@@ -26,7 +26,7 @@ from sashimono.core.commands import (
     ParamPath,
     SetKeyframe,
     SetTrackHeights,
-    SplitClip,
+    SplitClips,
 )
 from sashimono.core.model import (
     AnimatedValue,
@@ -155,8 +155,8 @@ class TestSplit:
         view.set_playhead(50)
         view.split_at_playhead()
         ((command,),) = harness.received
-        assert isinstance(command, SplitClip)
-        assert command.clip_id == first.id
+        assert isinstance(command, SplitClips)
+        assert command.clip_ids == (first.id,)
         assert [len(t.clips) for t in view.project.timeline.tracks] == [2, 1]
 
     def test_everything_under_the_playhead_without_a_selection(

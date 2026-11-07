@@ -23,7 +23,7 @@ from sashimono.core.commands import (
     SetKeyframe,
     SetParam,
     SetStrokeEnabled,
-    SplitClip,
+    SplitClips,
     resolve_param,
 )
 from sashimono.core.io import Preset
@@ -264,7 +264,7 @@ class TestEditingLayers:
             SetKeyframe(
                 ParamPath.of_stroke_effect(clip_id, StrokeId("a"), blur.id, "radius"), 40, 20.0
             ),
-            SplitClip(clip_id, 20),
+            SplitClips((clip_id,), 20),
         )
         clips = sorted(state.timeline.tracks[0].clips, key=lambda clip: clip.timeline_start)
         after = clips[1].source

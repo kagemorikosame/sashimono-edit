@@ -38,7 +38,7 @@ from sashimono.ai.session import (
     EventKind,
     system_prompt,
 )
-from sashimono.core.commands import SetLayerMode, SplitClip
+from sashimono.core.commands import SetLayerMode, SplitClips
 from sashimono.core.model import LayerMode, MediaItem, Project, Transcript
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.chat.panel import IRREVERSIBLE_ALLOW_TEXT, IRREVERSIBLE_HEAD, _Input
@@ -283,10 +283,10 @@ class TestCheckpoint:
 
         widget._open_checkpoint("冒頭を切って")
         # AI が 3 回操作した、という想定
-        host.apply_commands([SplitClip(clip, 60)], "分割")
-        host.apply_commands([SplitClip(clip, 30)], "分割")
+        host.apply_commands([SplitClips((clip,), 60)], "分割")
+        host.apply_commands([SplitClips((clip,), 30)], "分割")
         second = host.document.project.timeline.tracks[0].clips[-1].id
-        host.apply_commands([SplitClip(second, 120)], "分割")
+        host.apply_commands([SplitClips((second,), 120)], "分割")
         widget._close_checkpoint()
 
         assert len(host.document.project.timeline.tracks[0].clips) == 4
@@ -300,7 +300,7 @@ class TestCheckpoint:
         widget, host = panel
         widget._open_checkpoint("あ" * 100)
         clip = host.document.project.timeline.tracks[0].clips[0].id
-        host.apply_commands([SplitClip(clip, 60)], "分割")
+        host.apply_commands([SplitClips((clip,), 60)], "分割")
         widget._close_checkpoint()
         assert len(host.document.history_labels[0]) <= 28
 
@@ -319,7 +319,7 @@ class TestCheckpoint:
         widget, host = panel
         widget._open_checkpoint("切って")
         clip = host.document.project.timeline.tracks[0].clips[0].id
-        host.apply_commands([SplitClip(clip, 60)], "分割")
+        host.apply_commands([SplitClips((clip,), 60)], "分割")
         widget._handle(AgentEvent(EventKind.TURN_DONE))
         assert host.document.can_undo is True
 
@@ -330,7 +330,7 @@ class TestCheckpoint:
         widget, host = panel
         widget._open_checkpoint("途中で閉じる")
         clip = host.document.project.timeline.tracks[0].clips[0].id
-        host.apply_commands([SplitClip(clip, 60)], "分割")
+        host.apply_commands([SplitClips((clip,), 60)], "分割")
         widget.close_session()
         assert host.document.in_checkpoint is False
         assert host.document.can_undo is True
@@ -835,12 +835,12 @@ class TestQueuedPrompts:
         widget.send()
         widget._input.setPlainText("2 つ目")
         widget.send()
-        host.apply_commands([SplitClip(clip, 60)], "分割")  # 1 つ目の指示の編集
+        host.apply_commands([SplitClips((clip,), 60)], "分割")  # 1 つ目の指示の編集
         widget._handle(AgentEvent(EventKind.TURN_DONE))
         # 段を付け替え終えてから、次の指示を始めさせる
         assert made[0].acknowledged == 1
         assert host.document.in_checkpoint is True
-        host.apply_commands([SplitClip(clip, 30)], "分割")  # 2 つ目の指示の編集
+        host.apply_commands([SplitClips((clip,), 30)], "分割")  # 2 つ目の指示の編集
         widget._handle(AgentEvent(EventKind.TURN_DONE))
 
         assert host.document.history_labels == ("AI: 1 つ目", "AI: 2 つ目")

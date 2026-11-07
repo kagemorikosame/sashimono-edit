@@ -12,12 +12,13 @@ import pytest
 import shiboken6
 from PySide6.QtWidgets import QApplication, QCheckBox
 
+from sashimono.ai.operations import find_operation
 from sashimono.core.commands import (
     Command,
     Document,
     GroupClips,
     MoveClip,
-    SplitClip,
+    SplitClips,
     UngroupClips,
     insert_media,
 )
@@ -41,6 +42,7 @@ from sashimono.selfcheck import _bundled_files
 from sashimono.ui.inspector.panel import InspectorPanel
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.timeline import TimelineView
+from tests.ai.conftest import FakeHost
 
 
 def _apply(project: Project, commands: list[Command]) -> Project:
@@ -119,10 +121,10 @@ class TestUngroupingLinks:
 
 
 class TestCuttingGroups:
-    def _grouped(self) -> tuple[Project, Clip, Clip]:
+    def _grouped(self, second_length: int = 100) -> tuple[Project, Clip, Clip]:
         base = Project.create(ProjectSettings(layer_mode=LayerMode.MIXED))
         first = Clip(timeline_start=0, duration=100, source=TEXT.create())
-        second = Clip(timeline_start=0, duration=100, source=TEXT.create())
+        second = Clip(timeline_start=0, duration=second_length, source=TEXT.create())
         tracks = (
             Track(TrackKind.MIXED, "レイヤー 1", (first,)),
             Track(TrackKind.MIXED, "レイヤー 2", (second,)),
@@ -132,10 +134,8 @@ class TestCuttingGroups:
         )
         return project, first, second
 
-    def test_the_back_halves_become_their_own_group(self, qt_application: QApplication) -> None:
-        # 割った後も全体が 1 つのグループのままだと、前と後ろを別々に選べない（利用者の報告）
-        del qt_application
-        project, first, second = self._grouped()
+    def _split_on_screen(self, project: Project, frame: int) -> Document:
+        """グループ全体を選んで再生ヘッドで割る（S キーと同じ入口）"""
         view = TimelineView(project, MediaAnalyzer(sample_rate=48000, channels=2))
         document = Document(project)
         try:
@@ -147,30 +147,73 @@ class TestCuttingGroups:
                 view.set_project(document.project)
 
             view.commands_requested.connect(run)
-            view.set_selection((first.id, second.id))
-            view.set_playhead(40, follow=False)
+            view.set_selection(tuple(c.id for c in _clips(project)))
+            view.set_playhead(frame, follow=False)
             view.split_at_playhead()
-            clips = _clips(document.project)
-            front = {c.group_id for c in clips if c.timeline_start == 0}
-            back = {c.group_id for c in clips if c.timeline_start == 40}
-            assert len(front) == 1 and len(back) == 1
-            assert front != back and None not in front | back
-            document.undo()
-            assert document.project == project
+            return document
         finally:
             view.deleteLater()
 
-    def test_a_single_split_keeps_the_group(self) -> None:
-        # 1 本だけ割ったとき（相手を渡さない）は今までどおり同じグループに残す
-        project, first, _ = self._grouped()
-        split = SplitClip(first.id, 40).apply(project)
-        assert len({c.group_id for c in _clips(split)}) == 1
+    def test_the_back_halves_become_their_own_group(self, qt_application: QApplication) -> None:
+        # 割った後も全体が 1 つのグループのままだと、前と後ろを別々に選べない（利用者の報告）
+        del qt_application
+        project, _, _ = self._grouped()
+        document = self._split_on_screen(project, 40)
+        clips = _clips(document.project)
+        front = {c.group_id for c in clips if c.timeline_start == 0}
+        back = {c.group_id for c in clips if c.timeline_start == 40}
+        assert len(front) == 1 and len(back) == 1
+        assert front != back and None not in front | back
+        document.undo()
+        assert document.project == project
+
+    def test_a_lone_back_half_leaves_the_group(self, qt_application: QApplication) -> None:
+        # グループの 1 本だけが再生ヘッドをまたぐとき、後ろが元のグループに残ると、後ろを
+        # 選んだだけで前ともう 1 本まで選ばれ、動かすとまとめて動いた（#427 B の形）
+        del qt_application
+        project, _, _ = self._grouped(second_length=30)
+        (group,) = {c.group_id for c in _clips(project)}
+        document = self._split_on_screen(project, 40)
+        (back,) = [c for c in _clips(document.project) if c.timeline_start == 40]
+        assert back.group_id is None
+        assert {c.group_id for c in _clips(document.project) if c.id != back.id} == {group}
+        document.undo()
+        assert document.project == project
+
+    @pytest.mark.parametrize("second_length", [100, 30])
+    def test_the_screen_and_the_assistant_split_alike(
+        self, qt_application: QApplication, second_length: int
+    ) -> None:
+        # 画面で割った形と AI の split_clip で割った形が違うと、同じ頼みでも束ね方が変わり、
+        # AI に任せた所だけ後ろが前と一緒に動く（#427）
+        del qt_application
+        project, first, _ = self._grouped(second_length=second_length)
+        screen = self._split_on_screen(project, 40).project
+        host = FakeHost(project)
+        operation = find_operation("split_clip")
+        assert operation is not None
+        operation(host, {"clip_id": str(first.id), "frame": 40})
+        assistant = host.document.project
+
+        def shape(split: Project) -> list[tuple[int, int, int]]:
+            # グループの ID は割るたびに新しく作るので、何本が同じ束にいるかで比べる
+            clips = _clips(split)
+            return sorted(
+                (
+                    c.timeline_start,
+                    c.duration,
+                    sum(1 for o in clips if c.group_id is not None and o.group_id == c.group_id),
+                )
+                for c in clips
+            )
+
+        assert shape(screen) == shape(assistant)
 
     def test_linked_halves_split_the_same_way(self, video_media: MediaItem) -> None:
         # リンクも前と後ろで別の組になる（前の片割れどうし・後ろの片割れどうし）
         project = _placed(video_media)
         picture, _ = _clips(project)
-        split = SplitClip(picture.id, 60).apply(project)
+        split = SplitClips((picture.id,), 60).apply(project)
         front = {c.link_group for c in _clips(split) if c.timeline_start == 0}
         back = {c.link_group for c in _clips(split) if c.timeline_start == 60}
         assert len(front) == 1 and len(back) == 1 and front != back

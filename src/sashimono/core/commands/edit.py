@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import accumulate
@@ -65,16 +67,19 @@ __all__ = [
     "SetTrackHeights",
     "SetTrackState",
     "SetTranscript",
-    "SplitClip",
+    "SplitClips",
     "TrimClip",
     "TrimClips",
     "TrimRoom",
     "casualty_notice",
     "head_room",
+    "locked_groups",
     "ripple_casualties",
     "ripple_gaps",
     "ripple_report",
     "shifted_track",
+    "split_refusal",
+    "split_targets",
     "tail_room",
     "trimmable",
 ]
@@ -552,12 +557,16 @@ def _pull_layers(
     held = _held_tracks(project, others, start, end) - own
     timeline = project.timeline
     regrouped: dict[GroupId, GroupId] = {}
-    for track in project.timeline.tracks:
-        if track.id in held:
-            continue
+    cut = [track for track in project.timeline.tracks if track.id not in held]
+    # 範囲をまたいで切れる物の後ろの欠片は、分割と同じ決まりでグループを分ける
+    # （:func:`_back_groups`）
+    groups = _back_groups(
+        clip.group_id for track in cut for clip in track.clips if _cuts_through(clip, start, end)
+    )
+    for track in cut:
         pieces: list[Clip] = []
         for clip in track.clips:
-            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped))
+            pieces.extend(_cut_clip(project, clip, start, end, length, regrouped, groups))
         timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
     markers = tuple(
         replace(marker, frame=marker.frame - length) if marker.frame >= end else marker
@@ -806,62 +815,199 @@ class RemoveClips(Command):
 
 
 @dataclass(frozen=True, slots=True)
-class SplitClip(Command):
-    """クリップを ``frame`` の位置で 2 つに割る
+class SplitClips(Command):
+    """クリップを ``frame`` の位置で 2 つに割る 画面の分割と AI の ``split_clip`` の入口（#427）
 
-    左側は元の ID を保ち、右側が新しい ID を得る リンクされた映像・音声も
-    同じ位置で割られるので、片方だけずれることはない
+    左側は元の ID を保ち、右側が新しい ID を得る 渡したクリップに加えて、リンクした映像・音声と
+    グループの仲間のうち ``frame`` をまたぐ物も一緒に割る グループは一緒に割る組で、1 本ずつ
+    割ると、割るたびに後ろの片割れが元のグループに残った（AI の ``split_clip``）
+
+    後ろの片割れのグループは :func:`_back_groups` の決まりで分ける 仲間を集めてから 1 度に
+    決めるので、呼ぶ側が新しいグループを用意しなくても、画面と AI で同じ分かれ方になる
+    前は呼ぶ側が新しいグループの組を渡していて、渡さない入口（1 本だけ割る画面の分割・AI）では
+    後ろが元のグループに残った 1 本だけを割る命令（SplitClip）も、同じ理由で無くした
+
+    ロックしたレイヤーの物を含むときは何も割らない（:func:`split_refusal`）
     """
 
-    clip_id: ClipId
+    clip_ids: tuple[ClipId, ...]
     frame: int
-    #: 右側（後ろ）の片割れを移すグループ（元のグループ, 新しいグループ）の組
-    #: グループの何本かをまとめて割るとき、呼ぶ側が 1 つの新しいグループを決めて、同じ組を
-    #: 全部の割る命令へ渡す 渡さなければ右側も元のグループに残る（1 本だけ割ったとき）
-    #: 右側を元のグループに残すと、割った後もグループ全体が 1 つのままで、前と後ろを
-    #: 別々に選べない（利用者の報告）
-    new_groups: tuple[tuple[GroupId, GroupId], ...] = ()
 
     @property
     def label(self) -> str:
         return "クリップを分割"
 
     def apply(self, project: Project) -> Project:
-        located = project.timeline.locate_clip(self.clip_id)
-        if located is None:
-            raise KeyError(f"クリップが見つからない: {self.clip_id}")
-        _, clip = located
-        if not (clip.timeline_start < self.frame < clip.timeline_end):
-            raise ValueError(
-                f"分割位置がクリップの内側にない: {self.frame} は "
-                f"[{clip.timeline_start}, {clip.timeline_end}) の外"
-            )
-
         timeline = project.timeline
-        # 右側は新しいリンクグループにする 元のままだと、分割してできた左右が
-        # 同じグループに残り、片方を削除するともう片方まで消える 新しいグループを
-        # 映像・音声の右側どうしで共有するので、分割後もリンクは保たれる
-        right_group = new_group_id() if clip.link_group is not None else None
+        frame = self.frame
+        for clip_id in self.clip_ids:
+            located = timeline.locate_clip(clip_id)
+            if located is None:
+                raise KeyError(f"クリップが見つからない: {clip_id}")
+            clip = located[1]
+            if not _straddles(clip, frame):
+                raise ValueError(
+                    f"分割位置がクリップの内側にない: {frame} は "
+                    f"[{clip.timeline_start}, {clip.timeline_end}) の外"
+                )
+        targets = split_targets(timeline, self.clip_ids, frame)
+        refusal = split_refusal(timeline, targets)
+        if refusal is not None:
+            raise ValueError(refusal)
 
-        for track_id, target in _linked_group(project, clip):
-            if not target.contains(self.frame):
-                # リンク先の長さが違う場合 片方だけ割ると同期が崩れるので何もしない
+        # 後ろは新しいリンクにする 元のままだと、割ってできた左右が同じリンクに残り、片方を
+        # 消すともう片方まで消える 映像・音声の後ろどうしで同じ新しいリンクを持つので、
+        # 割った後もリンクは保たれる
+        links = {
+            clip.link_group: new_group_id()
+            for clip in targets.values()
+            if clip.link_group is not None
+        }
+        groups = _back_groups(clip.group_id for clip in targets.values())
+        for track in timeline.tracks:
+            if not any(clip.id in targets for clip in track.clips):
                 continue
-            track = timeline.find_track(track_id)
-            if track is None:
-                continue
-            left, right = _halves(
-                project,
-                target,
-                self.frame,
-                link_group=right_group,
-                group_id=dict(self.new_groups).get(target.group_id, target.group_id)
-                if target.group_id is not None
-                else None,
-            )
-            others = tuple(c for c in track.clips if c.id != target.id)
-            timeline = timeline.replace_track(track.with_clips((*others, left, right)))
+            pieces: list[Clip] = []
+            for clip in track.clips:
+                if clip.id not in targets:
+                    pieces.append(clip)
+                    continue
+                pieces.extend(
+                    _halves(
+                        project,
+                        clip,
+                        frame,
+                        link_group=links.get(clip.link_group)
+                        if clip.link_group is not None
+                        else None,
+                        group_id=groups.get(clip.group_id) if clip.group_id is not None else None,
+                    )
+                )
+            timeline = timeline.replace_track(track.with_clips(tuple(pieces)))
         return project.with_timeline(timeline)
+
+
+def split_targets(timeline: Timeline, clip_ids: Iterable[ClipId], frame: int) -> dict[ClipId, Clip]:
+    """``clip_ids`` を ``frame`` で割るときに一緒に割る物（渡した物を含む）
+
+    リンクの相手とグループの仲間のうち ``frame`` をまたぐ物を、相手の相手までたどる
+    またがない相手は割らない リンク先の長さが違うときに片方だけ割ると同期が崩れ、グループの
+    短い仲間はその位置に中身が無い（前に残る） 画面は断る単位を決めるのにも使う
+    （:meth:`TimelineView.split_at_playhead`）
+
+    リンクとグループの索引を 1 度だけ作り、どのリンクとグループも 1 度だけ広げる 1 本ごとに
+    タイムライン全体を探すと、同じ位置をまたぐ物が多いほど掛け算で遅くなり、編集画面が止まる
+    """
+    links: dict[GroupId, list[Clip]] = {}
+    groups: dict[GroupId, list[Clip]] = {}
+    known: dict[ClipId, Clip] = {}
+    for track in timeline.tracks:
+        for clip in track.clips:
+            known[clip.id] = clip
+            if clip.link_group is not None:
+                links.setdefault(clip.link_group, []).append(clip)
+            if clip.group_id is not None:
+                groups.setdefault(clip.group_id, []).append(clip)
+    targets: dict[ClipId, Clip] = {}
+    pending = [known[clip_id] for clip_id in clip_ids if clip_id in known]
+    spread: set[tuple[str, GroupId]] = set()
+    while pending:
+        clip = pending.pop()
+        if clip.id in targets:
+            continue
+        targets[clip.id] = clip
+        for kind, key, index in (
+            ("link", clip.link_group, links),
+            ("group", clip.group_id, groups),
+        ):
+            if key is None or (kind, key) in spread:
+                continue
+            spread.add((kind, key))
+            pending.extend(p for p in index[key] if p.id not in targets and _straddles(p, frame))
+    return targets
+
+
+def split_refusal(timeline: Timeline, targets: Iterable[ClipId]) -> str | None:
+    """``targets``（:func:`split_targets` で広げた物）を割れない訳 割れるなら ``None``
+
+    広げた後の全員で確かめる 渡したクリップだけを見ると、リンクの相手がロックしたレイヤーに
+    あるときや、相手が入った別のグループにロックした仲間がいるときに、ロックした物まで割って
+    しまう（Codex と CodeRabbit の指摘 #435） ロックしたレイヤーは人が守りたくて止めている
+    """
+    wanted = set(targets)
+    groups: set[GroupId] = set()
+    locked: Track | None = None
+    for track in timeline.tracks:
+        for clip in track.clips:
+            if clip.id not in wanted:
+                continue
+            if track.locked and locked is None:
+                locked = track
+            if clip.group_id is not None:
+                groups.add(clip.group_id)
+    # グループの訳を先に出す ロックした仲間がまたいでいると、仲間のレイヤーのロックにも
+    # 当たるが、人が直すのはグループの扱いの方で、レイヤーの名前だけでは訳が分からない
+    if any(
+        track.locked and clip.group_id in groups
+        for track in timeline.tracks
+        for clip in track.clips
+    ):
+        return (
+            "グループの中にロックしたレイヤーのクリップがあるので分割できません"
+            "（一部だけ割ると、束ねた物の長さが食い違います）"
+        )
+    if locked is not None and len(wanted) == 1:
+        # 相手のいない 1 本なら、相手の話を出すと、人はありもしない組を探すことになる
+        # （CodeRabbit の指摘 #435）
+        return f"レイヤー {locked.name!r} はロックされているので分割できません"
+    if locked is not None:
+        return (
+            f"レイヤー {locked.name!r} はロックされているので、そこにある相手と一緒に"
+            "分割できません（片方だけ割ると、映像と音声の組が食い違います）"
+        )
+    return None
+
+
+def _straddles(clip: Clip, frame: int) -> bool:
+    """``frame`` で割れるか 頭や終わりちょうどで割ると、長さ 0 の片割れができる"""
+    return clip.timeline_start < frame < clip.timeline_end
+
+
+def _back_groups(groups: Iterable[GroupId | None]) -> dict[GroupId, GroupId | None]:
+    """同じ所で割った後ろの片割れが入るグループ（元のグループ → 行き先）（#427）
+
+    ``groups`` は割ったクリップのグループを 1 本ずつ 後ろの片割れは元のグループに残さない
+    残すと、割った後もグループ全体が 1 つのままで、後ろを選ぶと前や仲間まで一緒に選ばれ、
+    まとめて動く（利用者の報告）
+
+    同じグループの後ろが 2 本以上なら、後ろどうしを 1 つの新しいグループにまとめる 一緒に
+    束ねた物（映像とテロップなど）が、割っただけでばらばらになるのを避けるため 1 本だけなら
+    グループから外す 1 本だけのグループは束ねる相手がおらず、グループの無い物と見分けが
+    付かないのに、仲間を足すときなどに見えない束が残る
+
+    分割（:class:`SplitClips`）・挿入貼り付け（:class:`InsertGap`）・範囲を切って詰める
+    （:class:`RippleCut` と詰める削除）が同じ決まりを使う 入口ごとに決まりが違うと、同じ形の
+    グループが割り方によって前と後ろで束ねられたままになる
+    """
+    counts = Counter(group for group in groups if group is not None)
+    return {group: new_group_id() if count >= 2 else None for group, count in counts.items()}
+
+
+def locked_groups(timeline: Timeline, clip_ids: Iterable[ClipId]) -> set[GroupId]:
+    """渡したクリップのグループのうち、ロックしたトラックのクリップを含む物
+
+    グループはまとめて割る・消す・切り取る・動かす組 一部がロックで動かないまま残りだけに
+    当てると、束ねた物の頭や長さが食い違い、束ねた意味が崩れる（利用者の要望） 画面と AI の
+    道具が同じ決まりで断るよう、ここに 1 つだけ置く
+    """
+    groups: set[GroupId] = set()
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is not None and located[1].group_id is not None:
+            groups.add(located[1].group_id)
+    return {
+        group for group in groups if any(track.locked for track, _ in timeline.grouped_clips(group))
+    }
 
 
 def _halves(
@@ -874,7 +1020,7 @@ def _halves(
 ) -> tuple[Clip, Clip]:
     """``target`` を ``frame`` で割った前後 後ろは新しい ID で、渡したリンクとグループに入る
 
-    分割（:class:`SplitClip`）と挿入（:class:`InsertGap`）が同じ割り方をする 別々に書くと、
+    分割（:class:`SplitClips`）と挿入（:class:`InsertGap`）が同じ割り方をする 別々に書くと、
     片方だけキーフレームや素材の読み始めの数え直しを忘れる
     """
     left_duration = frame - target.timeline_start
@@ -953,18 +1099,17 @@ class InsertGap(Command):
         links = {
             clip.link_group: new_group_id() for clip in straddling if clip.link_group is not None
         }
-        behind: dict[GroupId, int] = {}
-        for track in moving:
-            for clip in track.clips:
-                if clip.group_id is not None and clip.timeline_end > frame:
-                    behind[clip.group_id] = behind.get(clip.group_id, 0) + 1
-        # 後ろ側が 1 本だけなら元のグループに残す（:class:`SplitClip` を 1 本だけ割ったときと同じ）
-        # 1 本だけのグループを作っても束ねる意味が無い
-        groups = {
-            clip.group_id: new_group_id()
-            for clip in straddling
-            if clip.group_id is not None and behind[clip.group_id] >= 2
-        }
+        # 後ろ側（割った後ろ半分と、丸ごと後ろにいる仲間）のグループは分割と同じ決まりで分ける
+        # （:func:`_back_groups` 2 本以上なら新しいグループ、割った後ろ半分 1 本だけなら外す）
+        # 決め直すのは割ったクリップのいるグループだけ 丸ごと後ろへずれる物しかいない
+        # グループは、前後に分かれないので束ね方を変えない
+        split_groups = {clip.group_id for clip in straddling if clip.group_id is not None}
+        groups = _back_groups(
+            clip.group_id
+            for track in moving
+            for clip in track.clips
+            if clip.group_id in split_groups and clip.timeline_end > frame
+        )
 
         def after(clip: Clip, start: int) -> Clip:
             return replace(
@@ -1748,6 +1893,21 @@ def _cut_ranges(project: Project, ranges: list[tuple[int, int]], *, keep_area: b
     # 全トラックを通して覚えておく
     regrouped: list[dict[GroupId, GroupId]] = [{} for _ in ranges]
     timeline = project.timeline
+    # 後ろの欠片のグループは範囲ごとに分割と同じ決まりで分ける（:func:`_back_groups`） 何本が
+    # またいだかは全トラックを見終えるまで分からないので、切る前に数える 範囲ごとに分けるのは、
+    # 何か所も切った後の欠片どうしが 1 つのグループに残らないようにするため
+    straddled: list[list[GroupId]] = [[] for _ in ranges]
+    for track in timeline.tracks:
+        if track.locked:
+            continue
+        for clip in track.clips:
+            if clip.group_id is None:
+                continue
+            first = bisect_right(ends, clip.timeline_start)
+            for index in range(first, bisect_left(starts, clip.timeline_end)):
+                if _cuts_through(clip, *ranges[index]):
+                    straddled[index].append(clip.group_id)
+    groups = [_back_groups(found) for found in straddled]
     for track in timeline.tracks:
         if track.locked:
             continue
@@ -1761,7 +1921,9 @@ def _cut_ranges(project: Project, ranges: list[tuple[int, int]], *, keep_area: b
                 parts = [
                     cut
                     for part in parts
-                    for cut in _cut_clip(project, part, start, end, end - start, regrouped[index])
+                    for cut in _cut_clip(
+                        project, part, start, end, end - start, regrouped[index], groups[index]
+                    )
                 ]
             pieces.extend(
                 part.moved_to(part.timeline_start - before[first]) if before[first] else part
@@ -1788,13 +1950,17 @@ def _cut_clip(
     end: int,
     length: int,
     regrouped: dict[GroupId, GroupId],
+    groups: dict[GroupId, GroupId | None],
 ) -> list[Clip]:
-    """1 つのクリップから範囲を抜く 残るのは 0 個・1 個・2 個のどれか"""
+    """1 つのクリップから範囲を抜く 残るのは 0 個・1 個・2 個のどれか
+
+    ``groups`` は範囲をまたいだクリップの後ろの欠片が入るグループ（:func:`_back_groups`）
+    """
     if clip.timeline_end <= start:
         return [clip]
     if clip.timeline_start >= end:
         return [clip.moved_to(clip.timeline_start - length)]
-    if clip.source is not None and clip.source.kind == TRANSITION_KIND:
+    if _transition(clip):
         # 場面切り替えはつなぎ目の前後の絵を溶かす物で、そのつなぎ目は切ると無くなる 残りの
         # 欠片を置くと 1 コマだけの溶けが並び、そこだけ絵が跳ねる 付け直しは smooth_cuts で
         return []
@@ -1803,7 +1969,7 @@ def _cut_clip(
     tail = clip.timeline_end - end
     if head <= 0 and tail <= 0:
         return []
-    # 残る部分のキーフレームは、割るとき（:class:`SplitClip`）と同じく分けて数え直す
+    # 残る部分のキーフレームは、割るとき（:class:`SplitClips`）と同じく分けて数え直す
     # そのまま写すと、後ろに残った部分の動きが削った長さだけ前へずれる
     if head > 0 and tail <= 0:
         return [replace(_split_animation(clip, head)[0], duration=head)]
@@ -1818,10 +1984,25 @@ def _cut_clip(
         duration=tail,
         source_in=clip.source_in + consumed,
         link_group=_regroup(clip.link_group, regrouped) if head > 0 else clip.link_group,
+        group_id=groups.get(clip.group_id)
+        if head > 0 and clip.group_id is not None
+        else clip.group_id,
     )
     if head <= 0:
         return [right]
     return [replace(_split_animation(clip, head)[0], duration=head), right]
+
+
+def _transition(clip: Clip) -> bool:
+    return clip.source is not None and clip.source.kind == TRANSITION_KIND
+
+
+def _cuts_through(clip: Clip, start: int, end: int) -> bool:
+    """範囲 ``[start, end)`` を抜くと前と後ろの 2 つに分かれるか（:func:`_cut_clip` と同じ判定）
+
+    場面切り替えは範囲に掛かると丸ごと消えるので、後ろの欠片を数えない
+    """
+    return clip.timeline_start < start and clip.timeline_end > end and not _transition(clip)
 
 
 def _regroup(group: GroupId | None, regrouped: dict[GroupId, GroupId]) -> GroupId | None:

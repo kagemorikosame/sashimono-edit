@@ -17,7 +17,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from sashimono.asr import CleanupOptions, clean_transcript
-from sashimono.core.commands import RippleCut, SetClipProperty, SetTranscript, SplitClip
+from sashimono.core.commands import RippleCut, SetClipProperty, SetTranscript, SplitClips
 from sashimono.core.io import load_project, save_subtitles
 from sashimono.core.jetcut import plan_cuts
 from sashimono.core.model import (
@@ -141,7 +141,7 @@ class TestSubtitleFlow:
 
         # --- 分割 ---
         video_clip = _first_clip(after)
-        window.execute(SplitClip(video_clip.id, video_clip.timeline_start + 10))
+        window.execute(SplitClips((video_clip.id,), video_clip.timeline_start + 10))
         assert_subtitles_point_at_the_same_audio(window._document.project, media)
 
         # --- 速度変更 ---

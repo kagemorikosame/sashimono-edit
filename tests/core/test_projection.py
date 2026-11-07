@@ -20,7 +20,7 @@ from sashimono.core.commands import (
     RetimeSegments,
     RippleCut,
     SetTranscript,
-    SplitClip,
+    SplitClips,
     TrimClip,
 )
 from sashimono.core.model import (
@@ -98,7 +98,7 @@ class TestFollowsEditing:
     def test_splitting_divides_the_subtitles(self, project_with_subtitles: Project) -> None:
         # 3.5 秒（105 フレーム）で割る 1 枚目は左、2・3 枚目は右に入る
         clip = project_with_subtitles.timeline.tracks[0].clips[0]
-        split = SplitClip(clip.id, 105).apply(project_with_subtitles)
+        split = SplitClips((clip.id,), 105).apply(project_with_subtitles)
 
         left, right = split.timeline.tracks[0].clips
         projected = list(project_timeline(split))
@@ -113,13 +113,13 @@ class TestFollowsEditing:
         # 分割は見た目を変えない操作 字幕の位置も変わってはいけない
         before = _texts_with_bounds(project_with_subtitles)
         clip = project_with_subtitles.timeline.tracks[0].clips[0]
-        split = SplitClip(clip.id, 105).apply(project_with_subtitles)
+        split = SplitClips((clip.id,), 105).apply(project_with_subtitles)
         assert _texts_with_bounds(split) == before
 
     def test_ripple_delete_pulls_subtitles_along(self, project_with_subtitles: Project) -> None:
         # 前半 2 秒を切り取って詰めると、残った字幕が 2 秒分前へ来る
         clip = project_with_subtitles.timeline.tracks[0].clips[0]
-        split = SplitClip(clip.id, 60).apply(project_with_subtitles)
+        split = SplitClips((clip.id,), 60).apply(project_with_subtitles)
         head = split.timeline.tracks[0].clips[0]
         rippled = RemoveClip(head.id, ripple=True).apply(split)
 
