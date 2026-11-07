@@ -385,25 +385,28 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
 
 def _joined_pieces(
     pieces: list[HeardPiece], low: int, high: int, frame_seconds: Fraction
-) -> list[HeardPiece]:
-    """``[low, high)`` に鳴る音の片と、それに分割しただけでつながる片（同じ素材の同じ音）"""
-    candidates: list[HeardPiece] = []
-    for piece in pieces:
-        if piece not in candidates:
-            candidates.append(piece)
-    found = [piece for piece in candidates if piece.start < high and piece.end > low]
-    grown = True
-    while grown:
-        grown = False
-        for piece in candidates:
-            if piece in found:
-                continue
+) -> set[HeardPiece]:
+    """``[low, high)`` に鳴る音の片と、それに分割しただけでつながる片（同じ素材の同じ音）
+
+    片は語の数だけ重ねて渡ってくる 重複を落とさずに総当たりすると、細かく切った作品で
+    字幕の行ごとに語の数の 2 乗だけ回る 新しく加わった片の隣だけを探せば、同じ組を見直さない
+    """
+    rest = set(pieces)
+    found = {piece for piece in rest if piece.start < high and piece.end > low}
+    rest -= found
+    frontier = list(found)
+    while frontier and rest:
+        joined = {
+            piece
+            for piece in rest
             if any(
                 split_seam(piece, other, frame_seconds) or split_seam(other, piece, frame_seconds)
-                for other in found
-            ):
-                found.append(piece)
-                grown = True
+                for other in frontier
+            )
+        }
+        rest -= joined
+        found |= joined
+        frontier = list(joined)
     return found
 
 
