@@ -400,6 +400,10 @@ class Release:
     smoke: Callable[[Path, Path], int] = smoke_test
     launch: Callable[[Path], int] = launch_app
     collect: Callable[[Path], int] = field(default=lambda dist: collect_sources.main([], dist=dist))
+    #: ソースの入手先に届かない物を返す（中身は落とさない） 試験では差し替える
+    reach: Callable[[], list[str]] = field(
+        default=lambda: collect_sources.check_urls(collect_sources.SOURCES)
+    )
     #: Defender の検出の記録を読む（読むだけ） 試験では差し替える
     detections: Callable[[], list[dict[str, Any]]] = read_detections
     #: 試しに見た（--dry-run）ときの、済んでいない前提
@@ -503,6 +507,8 @@ class Release:
         # タグがあれば、それが出す commit main がその後に進んでいても、組み立てたのはタグの commit
         self.commit = tag_commit or head
         self.check_runs()
+        if not tag_commit:
+            self.check_sources_reachable()
         if self.key is not None:
             self.key = resolve_key(self.key)
             try:
@@ -518,6 +524,21 @@ class Release:
                 )
             else:
                 print(f"鍵: {key_label(index)}")
+
+    def check_sources_reachable(self) -> None:
+        """添付するソースの入手先に、今も届くか（タグを打つ前だけ見る）
+
+        上流はタグやリリースを消すことがある（0.2.4 で pyav-ffmpeg の 8.1.2-1 が消えた）
+        見ずにタグを打つと、組み立てを待った後の 5 で初めて落ちて、公開が止まる
+        ここなら dry-run で気付け、``collect_sources.py`` の取得元を直してから打てる
+        積んだ Qt のモジュールは組み立てるまで分からないので、一覧の全部を見る
+        """
+        for problem in self.reach():
+            # 置き場が一時的に応えないこともある（ffmpeg.org は手元の確かめで 1 度だけ落ちた）
+            self.problem(
+                f"{problem}（一時的なら打ち直す 消えていれば"
+                " tools/collect_sources.py の SOURCES の取得元を直す）"
+            )
 
     def remote_refs(self) -> dict[str, str]:
         """origin の main とタグ 取ってくる（fetch）と手元を書き換えるので、読むだけにする"""

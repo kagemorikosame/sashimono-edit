@@ -57,6 +57,9 @@ FFMPEG_DLLS = (
 _SHIBOKEN_VERSION = re.compile(rb"__version_info__\0+(\d+\.\d+\.\d+)\0")
 #: Qt の置き場は major.minor のフォルダの下にある 版から作り、上げたときの直し忘れを防ぐ
 _QT_SERIES = ".".join(QT_VERSION.split(".")[:2])
+#: 前のリリースに添付した写しの置き場 上流から消えた物はここから落とす
+_OWN_RELEASES = "https://github.com/kagemorikosame/sashimono-edit/releases/download"
+
 _QT = f"https://download.qt.io/official_releases/qt/{_QT_SERIES}/{QT_VERSION}/submodules"
 
 
@@ -145,7 +148,10 @@ SOURCES: tuple[Source, ...] = (
     Source(
         "pyav-ffmpeg",
         "8.1.2-1",
-        "https://github.com/PyAV-Org/pyav-ffmpeg/archive/refs/tags/8.1.2-1.tar.gz",
+        # 上流（github.com/PyAV-Org/pyav-ffmpeg）は 2026-11 に 8.1.2-1 のタグとリリースを消した
+        # 0.2.3 のリリースに添付した写しから落とす 中身は 0.2.3 のときに上流から落とした物と
+        # 同じ（sha256 は 0.2.3 の sources-SHA256SUMS.txt の値と照らした）
+        f"{_OWN_RELEASES}/v0.2.3/pyav-ffmpeg-8.1.2-1.tar.gz",
         # 組み立ての手順と FFmpeg・LAME・libvpx へ当てた差分 ソースと一緒に渡さないと、
         # 積んだ DLL と同じ物を組み立て直せない
         None,

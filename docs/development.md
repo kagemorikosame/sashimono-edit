@@ -4304,6 +4304,13 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
 ```
 
 - `--check` は入手先に届くかだけを見る（中身は落とさない） 落とすと 100 MB ほど
+- **上流は置き場を消すことがある** 0.2.4 では、0.2.3 のときに落とせた pyav-ffmpeg の `8.1.2-1` の
+  タグとリリースが上流から消え、5 の段で 404 で止まった（タグを打ち、組み立てを待った後）
+  - `release.py` はタグを打つ前の 1 の段で、一覧の全部の入手先に届くかを見る dry-run でも出る
+  - 消えた物は、前のリリースに添付した写し（`_OWN_RELEASES`）から落とす 写しの sha256 は、
+    その版の `sources-SHA256SUMS.txt` と照らしてから一覧を直す 中身が同じなので、渡すソースは変わらない
+  - 一時的に応えない置き場もある（ffmpeg.org は手元の確かめで 1 度だけ届かなかった） 打ち直して
+    通れば直さない
 - Qt のソースは、組み立てたフォルダ（`dist\Sashimono`）に積んだ Qt のファイルが属する
   モジュールの分だけ落とす（`QT_FILE_MODULES`） 先に `tools/build_package.py` を走らせる
   どのモジュールの物か分からない Qt のファイルがあれば止まる
@@ -4853,7 +4860,7 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 
 | 段 | すること | 済んでいれば |
 |---|---|---|
-| 1. 前提 | 引数の版と `__version__` が同じ 手元が main で汚れていない origin/main と同じ 出す commit の CI と Package が success（走っている途中なら待つ） gh が使える 鍵が `TRUSTED_PUBLIC_KEYS` にある | ─ |
+| 1. 前提 | 引数の版と `__version__` が同じ 手元が main で汚れていない origin/main と同じ 出す commit の CI と Package が success（走っている途中なら待つ） gh が使える 鍵が `TRUSTED_PUBLIC_KEYS` にある タグがまだ無ければ、添付するソースの入手先（`collect_sources.SOURCES` の全部）に届く | ─ |
 | 2. タグ | `v<版>` を注釈付きで打って push する | push 済みのタグが main の歴史の中で同じ版の commit を指せば飛ばす それ以外なら止まる |
 | 3. 組み立て | Actions の Release（`release.yml`）がそのタグで終わるのを待つ | success なら飛ばす 落ちていれば止まる |
 | 4. 下書き | リリースが下書きか確かめ、zip を `dist\release` へ落として GitHub の digest と照らし、zip に入った Python が下限より古くないかを見て（上の「組み立てる Python の版」）、展開する | 落とした zip が同じなら落とし直さない 公開済みなら下の「公開済みに打ち直したとき」 |
