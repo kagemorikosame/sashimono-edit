@@ -77,6 +77,15 @@ class Source:
     filename: str
     #: Qt のモジュール名 zip に積んだ Qt のファイルがこのモジュールの物のときだけ添付する
     qt_module: str | None = None
+    #: 前のリリースの ``sources-SHA256SUMS.txt`` に記録した sha256 上流から消えて写しから落とす物に
+    #: 付ける 照合はするが上流の公開値ではないので、manifest の
+    #: ``verified_against_upstream`` は偽のまま
+    recorded_sha256: str | None = None
+
+    @property
+    def expected_sha256(self) -> str | None:
+        """照らす sha256 上流の公開値が無ければ、前に記録した値"""
+        return self.sha256 or self.recorded_sha256
 
 
 #: Qt のモジュール ソースは 1 モジュール 1 アーカイブで配られる
@@ -157,6 +166,8 @@ SOURCES: tuple[Source, ...] = (
         None,
         "BSD-3-Clause（組み立ての手順と差分）",
         "pyav-ffmpeg-8.1.2-1.tar.gz",
+        # 写しが差し替えられていないかを、0.2.3 の sources-SHA256SUMS.txt の値で照らす
+        recorded_sha256="a3bd63dba5336ec47766f8e59ba065d16342002d922c2f96cfed9d1a9b6da6d8",
     ),
     Source(
         "x264",
@@ -407,10 +418,11 @@ def download(
     target = folder / source.filename
     if target.exists():
         existing = _sha256(target)
-        if source.sha256 is not None and existing == source.sha256:
+        expected = source.expected_sha256
+        if expected is not None and existing == expected:
             return existing
         if (
-            source.sha256 is None
+            expected is None
             and previous is not None
             and previous.get("url") == source.url
             and previous.get("version") == source.version
@@ -431,6 +443,11 @@ def download(
         if source.sha256 is not None and actual != source.sha256:
             raise RuntimeError(
                 f"{source.name}: sha256 が上流の公開値と合わない（{actual} / {source.sha256}）"
+            )
+        if source.recorded_sha256 is not None and actual != source.recorded_sha256:
+            raise RuntimeError(
+                f"{source.name}: sha256 が前のリリースに記録した値と合わない"
+                f"（{actual} / {source.recorded_sha256}）"
             )
         # 書き終えて照合してから名前を付ける 途中で止まった物を完成品と取り違えない
         partial.replace(target)
