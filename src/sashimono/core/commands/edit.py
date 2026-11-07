@@ -956,6 +956,10 @@ def split_refusal(timeline: Timeline, targets: Iterable[ClipId]) -> str | None:
             "グループの中にロックしたレイヤーのクリップがあるので分割できません"
             "（一部だけ割ると、束ねた物の長さが食い違います）"
         )
+    if locked is not None and len(wanted) == 1:
+        # 相手のいない 1 本なら、相手の話を出すと、人はありもしない組を探すことになる
+        # （CodeRabbit の指摘 #435）
+        return f"レイヤー {locked.name!r} はロックされているので分割できません"
     if locked is not None:
         return (
             f"レイヤー {locked.name!r} はロックされているので、そこにある相手と一緒に"

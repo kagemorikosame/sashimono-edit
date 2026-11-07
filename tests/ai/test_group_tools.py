@@ -128,6 +128,19 @@ class TestSplitClip:
         assert "ungroup_clips" not in str(caught.value)
         assert "ユーザーに確かめ" in str(caught.value)
 
+    def test_a_lone_clip_on_a_locked_layer_does_not_mention_partners(self) -> None:
+        # 相手のいない 1 本で相手や束の話をすると、AI はありもしない組や束を探しに行く
+        # （CodeRabbit の指摘 #435）
+        base = Project.create(ProjectSettings(layer_mode=LayerMode.MIXED))
+        lone = Clip(timeline_start=0, duration=100, source=TEXT.create())
+        track = Track(TrackKind.MIXED, "レイヤー 1", (lone,), locked=True)
+        host = FakeHost(base.with_timeline(replace(base.timeline, tracks=(track,))))
+        with pytest.raises(ToolError, match="ロックされているので分割できません") as caught:
+            _run(host, "split_clip", clip_id=str(lone.id), frame=40)
+        assert "相手" not in str(caught.value)
+        assert "グループ" not in str(caught.value)
+        assert "ユーザーに確かめ" in str(caught.value)
+
     def test_a_locked_partner_through_a_link_also_points_at_asking(self) -> None:
         # リンクの相手の側のロックで断られたときに案内が無いと、AI は解いて進む道を探す
         # （CodeRabbit の指摘 #435）

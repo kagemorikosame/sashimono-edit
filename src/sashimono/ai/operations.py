@@ -5033,14 +5033,16 @@ def _split_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
     # リンクの相手とその相手のグループまで広げた単位で確かめる 渡した 1 本だけを見ると、
     # 相手の側のロックで断られたときに確かめ方の案内が付かない（CodeRabbit の指摘 #435）
     if _straddles_clip(clip, frame):
-        refusal = split_refusal(
-            project.timeline, split_targets(project.timeline, (clip.id,), frame)
-        )
-        if refusal is not None:
+        targets = split_targets(project.timeline, (clip.id,), frame)
+        refusal = split_refusal(project.timeline, targets)
+        if refusal is not None and len(targets) > 1:
             # グループを解けば割れることがあるが、人が付けた束を AI が黙って解くことになる（#428）
             raise ToolError(
                 f"{refusal} グループは解かずに、ロックを外してよいかをユーザーに確かめてください"
             )
+        if refusal is not None:
+            # 相手のいない 1 本なら解く束が無い 束の話を足すと、AI が無い束を探しに行く
+            raise ToolError(f"{refusal} ロックを外してよいかをユーザーに確かめてください")
     before = {c.id for track in project.timeline.tracks for c in track.clips}
     host.apply_commands([SplitClips((clip.id,), frame)], "クリップを分割")
     # 仲間も割れたことと後ろの ID を返す 返さないと、AI は割った本数を知らずに list_clips を
