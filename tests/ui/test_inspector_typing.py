@@ -85,6 +85,9 @@ def window(qt_application: QApplication) -> Iterator[MainWindow]:
     del qt_application
     created = _shown(MainWindow(_project(), confirm_unsaved=False))
     created._timeline.select(_clip_ids(created)[0])
+    # 欄を並べ終えてから触る 設定パネルは組んだ欄を出した台へ 1 度で差し替えるので（#431）、
+    # 並べ終える前の欄は大きさが決まっていない
+    _flush()
     yield created
     created.close()
 
@@ -276,7 +279,7 @@ class TestOtherFields:
         assert isinstance(editor, TrackEditor)
         slider = editor.findChild(QSlider)
         assert slider is not None
-        handle = _handle_center(slider)
+        handle = _handle_center(_widened(slider))
         QTest.mousePress(slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle)
         clip_id = _clip_ids(window)[0]
         try:
@@ -314,9 +317,10 @@ class TestOtherFields:
         slider = editor.findChild(QSlider)
         box = editor.findChild(QDoubleSpinBox)
         assert slider is not None and box is not None
-        handle = _handle_center(slider)
         clip_id = _clip_ids(window)[0]
-        QTest.mousePress(slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle)
+        # つまみを押した形はスライダー自身に作らせる マウスで押すと、つまみの真ん中でも
+        # 幅によっては 1 目盛りずれた所へ飛び、押す前の値が変わる（見たいのは押している間）
+        slider.setSliderDown(True)
         try:
             window.execute_all(
                 [SetParam(ParamPath.of_source(clip_id, "size"), AnimatedValue(100.0))], "外から"
@@ -325,9 +329,7 @@ class TestOtherFields:
             # 押している間は押す前の値のまま（跳ねさせない）
             assert box.value() == 64
         finally:
-            QTest.mouseRelease(
-                slider, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle
-            )
+            slider.setSliderDown(False)
             _flush()
         assert _source(window, clip_id, "size") == AnimatedValue(100.0)
         assert box.value() == 100
@@ -462,6 +464,17 @@ class TestSeveralClips:
             assert _source(window, second, "text") == "テキスト"
         finally:
             window.close()
+
+
+def _widened(slider: QSlider) -> QSlider:
+    """掴んで動かせる幅をスライダーに持たせる
+
+    設定パネルの最小の幅は中身から決まり（#431 で並べた後に測るようになった）、狭い画面
+    （CI の実行機）ではスライダーがつまみ 1 つ分の幅しかなく、掴んで動かしても値が変わらない
+    """
+    slider.setMinimumWidth(240)
+    _flush()
+    return slider
 
 
 def _handle_center(slider: QSlider) -> QPoint:
