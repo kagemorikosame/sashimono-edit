@@ -112,6 +112,7 @@ from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
+from sashimono.ui.subtitle.timing import offset_box
 from sashimono.ui.theme import THEME_CHOICES
 from sashimono.ui.voice_fetch import BUSY_TEXT, Fetched, VoiceFetch, fetch_voices, terms_text
 from sashimono.ui.workspace import (
@@ -1014,6 +1015,28 @@ class PreferencesDialog(QDialog):
             "2 倍ほどになる 切っても、語の時刻が要るときは AI が今の字幕へ足せる"
         )
         form.addRow(self._word_timestamps)
+        # 字幕の時刻（#426） 寄せ方が合う素材と、字幕を出す早さの好みは人で違う
+        self._subtitle_fit_voice = QCheckBox("起こした字幕の時刻を声に合わせる", self)
+        self._subtitle_fit_voice.setChecked(preferences.subtitle_fit_voice)
+        self._subtitle_fit_voice.setToolTip(
+            "字幕起こしの後で、行の頭と終わりを近く（前後 0.5 秒）の声の出だしと終わりへ寄せる"
+            " 寄せないと字幕が声より 0.2〜0.3 秒早く出ることがある（合成の声で測った値）"
+            " 寄せると頭のずれは 9 割が 0.09 秒以内"
+            " 音楽や大きな雑音の上で話す素材で合わないときは切る"
+        )
+        form.addRow(self._subtitle_fit_voice)
+        self._subtitle_start_offset = offset_box(self, preferences.subtitle_start_offset_ms)
+        self._subtitle_start_offset.setToolTip(
+            "起こした字幕を出す時刻をずらす 負は声より早く出す（読み始めやすい人向け）"
+            " 0 で声の出だし"
+        )
+        form.addRow("起こした字幕を出す時刻", self._subtitle_start_offset)
+        self._subtitle_end_offset = offset_box(self, preferences.subtitle_end_offset_ms)
+        self._subtitle_end_offset.setToolTip(
+            "起こした字幕を消す時刻をずらす 正は声より遅く消す（読み切れない人向け） 0 で声の終わり"
+            " 次の行の頭は越えない"
+        )
+        form.addRow("起こした字幕を消す時刻", self._subtitle_end_offset)
         # 検査の直しの回数（#339） どこまで AI に任せるかは人で違う
         self._ai_fix_rounds = QSpinBox(self)
         self._ai_fix_rounds.setRange(*FIX_ROUNDS_RANGE)
@@ -1344,6 +1367,9 @@ class PreferencesDialog(QDialog):
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
             word_timestamps=self._word_timestamps.isChecked(),
+            subtitle_fit_voice=self._subtitle_fit_voice.isChecked(),
+            subtitle_start_offset_ms=self._subtitle_start_offset.value(),
+            subtitle_end_offset_ms=self._subtitle_end_offset.value(),
             ai_fix_rounds=self._ai_fix_rounds.value(),
             duck_depth_db=self._duck_depth.value(),
             duck_attack_ms=self._duck_attack.value(),

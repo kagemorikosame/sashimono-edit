@@ -552,6 +552,12 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     },
     "merge_subtitles": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
     "delete_subtitle": lambda ids: {"media_id": ids["media"], "segment_id": ids["segment"]},
+    # 時刻を合わせる（#426） 試験の作品には波形が無いので、ずらすだけを頼む
+    "retime_subtitles": lambda ids: {
+        "media_id": ids["media"],
+        "fit_voice": False,
+        "start_offset_ms": -200,
+    },
     # 開く・新規（#349） 試験の作品は変えてあるので、どちらも保存していない変更で断る
     "open_project": lambda _ids: {"path": "第二稿.sme"},
     "new_project": lambda _ids: {"width": 1280, "height": 720},

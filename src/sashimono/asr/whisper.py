@@ -26,6 +26,7 @@ from sashimono.asr.backend import (
     to_source_time,
 )
 from sashimono.asr.environment import register_cuda_libraries, runtime_status
+from sashimono.asr.timing import adjust_timing
 from sashimono.core.model import Transcript, TranscriptSegment, Word
 from sashimono.engine.decode import AudioDecoder, ProbeError, probe_media
 
@@ -209,8 +210,9 @@ class FasterWhisperBackend:
 
         if progress is not None:
             progress(1.0, f"{len(collected)} 文")
+        samples = audio if isinstance(audio, np.ndarray) else None
         return Transcript(
-            segments=tuple(_ordered(collected)),
+            segments=adjust_timing(collected, options, samples, WHISPER_SAMPLE_RATE),
             language=language,
             model=options.model,
         )
@@ -332,13 +334,3 @@ def _to_segment(raw: Any) -> TranscriptSegment | None:
         words.append(Word(start=word_start, end=max(word_start, word_end), text=word_text))
 
     return TranscriptSegment(start=start, end=end, text=text, words=tuple(words))
-
-
-def _ordered(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
-    """開始時刻の昇順に整える
-
-    :class:`~sashimono.core.model.Transcript` は順序を不変条件にしている 認識器が
-    まれに前後した時刻を返すので、モデルへ渡す前にここで揃える 例外にして
-    起こし全体を捨てるのは割に合わない
-    """
-    return sorted(segments, key=lambda s: (s.start, s.end))

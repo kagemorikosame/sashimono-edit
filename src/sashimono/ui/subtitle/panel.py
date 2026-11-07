@@ -88,6 +88,7 @@ from sashimono.core.projection import (
 )
 from sashimono.core.seams import SeamScope, SeamStyle, SmoothCuts, seams_after_cuts
 from sashimono.core.speakers import SpeakerTurn, assign_speakers, transcript_speakers
+from sashimono.core.subtitle_timing import BURNED_NOTE, SubtitleTiming, burned_copies
 from sashimono.core.timebase import format_timecode, seconds_to_frame
 from sashimono.core.words import attach_words
 from sashimono.effects.seams import seam_transition
@@ -98,6 +99,7 @@ from sashimono.engine.audio.silence import (
     detect_silence,
     keep_speech,
 )
+from sashimono.engine.audio.voice_edges import loudness_of_waveform, retime_command
 from sashimono.engine.cache import MediaAnalyzer
 from sashimono.engine.render.look_preview import SAMPLE_TEXT
 from sashimono.ui.export_dialog import RANGE_ALL, RANGE_WORK_AREA
@@ -111,6 +113,7 @@ from sashimono.ui.subtitle.dialogs import (
 )
 from sashimono.ui.subtitle.look_picker import LookSources
 from sashimono.ui.subtitle.speaker_dialog import SpeakerDialog
+from sashimono.ui.subtitle.timing import RetimeDialog
 from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 from sashimono.ui.system_clipboard import copy_text
 from sashimono.ui.theme import Colors, theme_signals, themed_style
@@ -181,6 +184,8 @@ class SubtitlePanel(QWidget):
         self._words_only: set[int] = set()
         #: 起こしで語の時刻も取るか 本人の設定（``Preferences.word_timestamps``）
         self.word_timestamps = True
+        #: 起こした字幕の時刻の合わせ方 本人の設定（``Preferences.subtitle_timing`` #426）
+        self.timing = SubtitleTiming()
         #: 起こしの列が片付いているか（:meth:`transcription_waiter`）
         self._settled = threading.Event()
         self._settled.set()
@@ -212,6 +217,9 @@ class SubtitlePanel(QWidget):
         self.last_look = ""
         #: 焼き込む話し手と見た目を尋ねる 試験で差し替える
         self.ask_burn: Callable[[BurnRequest], BurnAnswer | None] = self._ask_burn
+        #: 時刻の合わせ方と、選んだ行だけかを尋ねる（#426） 引数は選んでいる行の数 やめたら
+        #: ``None`` 試験で差し替える
+        self.ask_retime: Callable[[int], tuple[SubtitleTiming, bool] | None] = self._ask_retime
         #: 起こしている物の最後の進み具合（依頼ごと）
         self._last_progress: dict[int, str] = {}
         #: 起こし終えたら続けて話者を分けるか（``Preferences.speakers_after_transcribe`` #323）
@@ -247,6 +255,11 @@ class SubtitlePanel(QWidget):
             "誰が話しているかを見分けて字幕に付ける（この機械で動き、音は外へ送らない）"
             " 焼き込みは話者ごとに別のレイヤーへ入る"
         )
+        self._retime_button = self._button("時刻を合わせる…", self.retime)
+        self._retime_button.setToolTip(
+            "起こした字幕の行の頭と終わりを声に合わせ、好みの分だけずらす 文言は変えない"
+            " 前の版で起こした字幕が声より早く出るときに使う"
+        )
         self._cut_button = self._button("無音カット…", self.jet_cut)
         self._burn_button = self._button("焼き込み", self.burn)
         self._place_rows_button = self._button("選んだ行を置く", self.place_selected_rows)
@@ -266,6 +279,7 @@ class SubtitlePanel(QWidget):
         actions = flow_of(
             self._clean_button,
             self._speakers_button,
+            self._retime_button,
             self._cut_button,
             self._burn_button,
             self._place_rows_button,
@@ -603,6 +617,7 @@ class SubtitlePanel(QWidget):
         has_segments = bool(self._segments())
         self._clean_button.setEnabled(has_segments)
         self._speakers_button.setEnabled(has_segments)
+        self._retime_button.setEnabled(has_segments)
         self._burn_button.setEnabled(has_segments)
         self._place_rows_button.setEnabled(has_segments)
         self._export_button.setEnabled(has_segments)
@@ -761,7 +776,12 @@ class SubtitlePanel(QWidget):
             self._service = TranscriptionService(default_backend())
 
         dialog = TranscribeDialog(
-            media, self._service, self, stream=self._stream, words=self.word_timestamps
+            media,
+            self._service,
+            self,
+            stream=self._stream,
+            words=self.word_timestamps,
+            timing=self.timing,
         )
         answer = dialog.exec()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
@@ -787,18 +807,17 @@ class SubtitlePanel(QWidget):
         audio_stream: int | None = None,
         word_timestamps: bool = False,
         words_only: bool = False,
+        timing: SubtitleTiming | None = None,
     ) -> str:
         """起こしを頼む AI からの依頼を受ける入口 走っている物があれば順番待ちに入る
 
+        ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
+        :meth:`transcription_status` で見る
         同じ素材の同じ音をすでに頼んでいれば断る（2 回起こしても同じ結果を 2 回取り込むだけ）
 
         ``words_only`` は語の時刻だけを今の字幕へ足す（#420） 文言と話者は変えない 起こし直すと
         語の時刻のためだけに人が直した字幕が消える
-        """
-        """起こしを始める AI からの依頼を受ける入口
-
-        ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
-        :meth:`transcription_status` で見る
+        ``timing`` は起こした行の時刻の合わせ方（#426） 省くと本人の設定（``self.timing``）に従う
         """
         media = self._project.find_media(media_id)
         if media is None:
@@ -814,7 +833,15 @@ class SubtitlePanel(QWidget):
         if self._service.find(media.id, stream) is not None:
             raise RuntimeError(f"{media.name} のその音声はもう起こしています（順番待ちを含む）")
         options = TranscribeOptions(
-            model=model, audio_stream=stream, word_timestamps=word_timestamps or words_only
+            model=model,
+            audio_stream=stream,
+            word_timestamps=word_timestamps or words_only,
+            # 語の時刻だけを足す頼みは行の時刻を使わない（今の字幕の時刻はそのまま）
+            timing=(
+                SubtitleTiming(fit_to_voice=False)
+                if words_only
+                else (timing if timing is not None else self.timing)
+            ),
         )
         waiting = self._service.busy
         job = self._service.start(media.id, media.path, options)
@@ -1040,6 +1067,67 @@ class SubtitlePanel(QWidget):
                 [SetTranscript(media.id, dialog.result_transcript(), stream=self._stream)],
                 "字幕を整形",
             )
+
+    def retime(self) -> None:
+        """起こした字幕の時刻を声に合わせ直す（#426） 文言・語の時刻・話者は変えない"""
+        media = self._current_media()
+        transcript = media.transcript_for(self._stream) if media is not None else None
+        if media is None or transcript is None or not transcript.segments:
+            self.status_message.emit("時刻を合わせる字幕がありません")
+            return
+        selected = self.selected_segments()
+        answer = self.ask_retime(len(selected))
+        if answer is None:
+            return
+        timing, only_selected = answer
+        # 窓を開いている間に起こしが終わって字幕が差し替わることがある 開く前の字幕で作ると、
+        # 消えた行を指して命令が断られる
+        media = self._current_media()
+        transcript = media.transcript_for(self._stream) if media is not None else None
+        if media is None or transcript is None or not transcript.segments:
+            self.status_message.emit("時刻を合わせる字幕がありません")
+            return
+        loudness = None
+        if timing.fit_to_voice:
+            waveform = self._analyzer.waveform(media, self._stream)
+            if waveform is None:
+                # 寄せずにずらすだけにすると、寄せたつもりで声とずれたまま残る
+                self.status_message.emit("波形の解析がまだ終わっていません")
+                return
+            loudness = loudness_of_waveform(waveform)
+        command = retime_command(
+            media.id,
+            transcript,
+            timing,
+            loudness,
+            stream=self._stream,
+            only=selected if only_selected else None,
+        )
+        if command is None:
+            self.status_message.emit("動かす字幕はありませんでした（もう声に合っています）")
+            return
+        before = self._segments()
+        self.commands_requested.emit([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
+        if self._segments() == before:
+            # 断られた 焼き込みの注意で断りの知らせを上書きしない 作品が同じものかでは決めない
+            # シーンを開いていると、断られても組み直した作品が渡ってくる
+            return
+        burned = burned_copies(
+            self._project,
+            media.id,
+            media.transcript_stream(self._stream),
+            [segment_id for segment_id, _, _ in command.times],
+        )
+        if burned:
+            self.status_message.emit(BURNED_NOTE.format(count=burned))
+
+    def _ask_retime(self, selected: int) -> tuple[SubtitleTiming, bool] | None:
+        dialog = RetimeDialog(self.timing, selected=selected, parent=self)
+        accepted = dialog.exec()
+        answer = (dialog.timing(), dialog.only_selected)
+        # 開くたびに作る窓 閉じたら捨てる
+        dialog.deleteLater()
+        return answer if accepted else None
 
     def jet_cut(self) -> None:
         media = self._current_media()

@@ -20,6 +20,7 @@ from sashimono.core.model import (
     TranscriptSegment,
     new_media_id,
 )
+from sashimono.core.timebase import seconds_to_frame
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.checks import HIGH, MEDIUM, Problem
 from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
@@ -560,6 +561,57 @@ class TestSubtitleWords:
         media = _media(video_media)
         project = placed(media, _clip(media, 0, 60, Fraction(1)))
         assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_line_fitted_after_its_first_words_is_fine(self, video_media: MediaItem) -> None:
+        """字幕の行の頭を声へ寄せて（#426）、語の時刻より少し後ろから出す形
+
+        壊れると、音を切っていないのに、行の頭の外に出た最初の語を残した音に無いと報告する
+        """
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 240, Fraction(0)))
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        rate = project.rate
+        # 行の頭を声へ寄せた 0.5 秒と、好みで遅く出す 1.5 秒を足した所から出す
+        start = seconds_to_frame(Fraction(3), rate)
+        end = seconds_to_frame(Fraction(4), rate)
+        burned = replace(tracks[-1].clips[0], timeline_start=start, duration=end - start)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_shifted_line_over_a_plain_split_is_fine(self, video_media: MediaItem) -> None:
+        # 割っただけで音が続く所で、前の片が字幕の表示と重ならないからと語を欠けと読むと、
+        # 音を何も消していないのに直せない問題が残る（PR #434 の CodeRabbit の指摘）
+        media = _media(video_media)
+        # 素材を 1.4 秒で割っただけ 「カメ」は前の片で鳴り、字幕は 3〜4 秒に出す
+        rate = video_media.video_streams[0].frame_rate
+        seam = seconds_to_frame(Fraction(7, 5), rate)
+        project = placed(
+            media,
+            _clip(media, 0, seam, Fraction(0)),
+            _clip(media, seam, 240 - seam, Fraction(7, 5)),
+        )
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        start, end = (seconds_to_frame(Fraction(n), project.rate) for n in (3, 4))
+        burned = replace(tracks[-1].clips[0], timeline_start=start, duration=end - start)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        assert [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS] == []
+
+    def test_a_shifted_line_over_cut_sound_is_still_reported(self, video_media: MediaItem) -> None:
+        # 好みで遅く出した行でも、音を切って消した語は欠けとして返す 表示の外の語を広く聞こえる
+        # 側に数えすぎると、本当に切った語まで見逃す
+        media = _media(video_media)
+        project = placed(media, _clip(media, 0, 24, Fraction(1)))
+        project = self._burned(project, media, "カメラを作ります", 1)
+        tracks = list(project.timeline.tracks)
+        burned = replace(tracks[-1].clips[0], timeline_start=12, duration=36)
+        tracks[-1] = replace(tracks[-1], clips=(burned,))
+        project = project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+        (problem,) = [p for p in _check(project, wave()).problems if p.kind == SUBTITLE_WORDS]
+        assert problem.measure["missing"] == "作ります"
 
     def test_one_particle_is_not_reported(self, video_media: MediaItem) -> None:
         # 語の時刻のずれでも 1 字の助詞は落ちる 毎回返すと本当の食い違いが埋もれる

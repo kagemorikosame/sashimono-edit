@@ -20,6 +20,7 @@ from sashimono.core.commands import (
     AddClip,
     Command,
     RenameProject,
+    RetimeSegments,
     RippleCut,
     SetSegmentText,
     SetTranscript,
@@ -37,6 +38,7 @@ from sashimono.core.model import (
     TrackKind,
     Transcript,
 )
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.waveform import BASE_SAMPLES_PER_PEAK, PeakLevel, Waveform
 from sashimono.engine.cache import MediaAnalyzer
@@ -778,10 +780,12 @@ class TestDialogsAreFreed:
         # 壊れると、字幕の窓を開け閉めするたびに見えない窓が溜まり、長く使うほど重くなる
         del qt_application
         from sashimono.ui.subtitle.dialogs import BurnDialog, CleanupDialog
-        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
 
         # 開く所だけを差し替える 開くと押す人を待って止まる 取り消したことにする
-        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog):
+        from sashimono.ui.subtitle.timing import RetimeDialog
+        from sashimono.ui.subtitle.transcribe_dialog import TranscribeDialog
+
+        for dialog in (TranscribeDialog, CleanupDialog, JetCutDialog, BurnDialog, RetimeDialog):
             monkeypatch.setattr(dialog, "exec", lambda self: 0)
         widget = SubtitlePanel(placed, StubAnalyzer(make_waveform([(0.5, 400)])))
         try:
@@ -790,10 +794,144 @@ class TestDialogsAreFreed:
                 widget.clean()
                 widget.jet_cut()
                 widget.burn()
+                widget.retime()
             opened = {type(child).__name__ for child in widget.findChildren(QDialog)}
             QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
             # 窓が本当に開いたこと 開いていなければ、残らないのは当たり前で何も言えない
-            assert opened == {"TranscribeDialog", "CleanupDialog", "JetCutDialog", "BurnDialog"}
+            assert opened == {
+                "TranscribeDialog",
+                "CleanupDialog",
+                "JetCutDialog",
+                "BurnDialog",
+                "RetimeDialog",
+            }
             assert widget.findChildren(QDialog) == []
+        finally:
+            widget.deleteLater()
+
+
+class TestRetime:
+    """起こした後の字幕の時刻を声に合わせ直す（#426 字幕パネルの〔時刻を合わせる…〕）"""
+
+    #: 1.2〜2.8 秒だけ声がある波形 1 つ目の字幕（1〜3 秒）は声より 0.2 秒早く出て遅く消える
+    VOICE = ((0.0, 225), (0.5, 300), (0.0, 1500))
+
+    def _panel(
+        self, placed: Project, waveform: Waveform | None
+    ) -> tuple[SubtitlePanel, list[tuple[list[Command], str]]]:
+        widget = SubtitlePanel(placed, StubAnalyzer(waveform))
+        issued: list[tuple[list[Command], str]] = []
+        widget.commands_requested.connect(lambda commands, label: issued.append((commands, label)))
+        return widget, issued
+
+    def test_the_first_line_moves_to_the_voice(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 壊れると、前の版で起こした字幕を起こし直さずに声へ合わせる道が無い（文言の直しが消える）
+        del qt_application
+        widget, issued = self._panel(placed, make_waveform(list(self.VOICE)))
+        try:
+            widget.ask_retime = lambda selected: (SubtitleTiming(), False)
+            widget.retime()
+            ((commands, _label),) = issued
+            (command,) = commands
+            assert isinstance(command, RetimeSegments)
+            ((_, start, end),) = command.times
+            assert float(start) == pytest.approx(1.2, abs=0.02)
+            assert float(end) == pytest.approx(2.8, abs=0.02)
+        finally:
+            widget.deleteLater()
+
+    def test_without_a_waveform_it_does_not_pretend(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 寄せずにずらすだけで済ますと、声に合わせたつもりの字幕がずれたまま残る
+        del qt_application
+        widget, issued = self._panel(placed, None)
+        messages: list[str] = []
+        widget.status_message.connect(messages.append)
+        try:
+            widget.ask_retime = lambda selected: (SubtitleTiming(), False)
+            widget.retime()
+            assert issued == []
+            assert messages == ["波形の解析がまだ終わっていません"]
+        finally:
+            widget.deleteLater()
+
+    def test_only_the_selected_rows_shift(
+        self, qt_application: QApplication, placed: Project
+    ) -> None:
+        # 壊れると、1 行だけ早めたいのに全部の行が動く
+        del qt_application
+        widget, issued = self._panel(placed, None)
+        try:
+            widget._table.selectRow(1)
+            seen: list[int] = []
+
+            def ask(selected: int) -> tuple[SubtitleTiming, bool]:
+                seen.append(selected)
+                return SubtitleTiming(fit_to_voice=False, start_offset_ms=-300), True
+
+            widget.ask_retime = ask
+            widget.retime()
+            ((commands, _label),) = issued
+            (command,) = commands
+            assert isinstance(command, RetimeSegments)
+            assert seen == [1]
+            assert [(float(s), float(e)) for _, s, e in command.times] == [(3.7, 6.0)]
+        finally:
+            widget.deleteLater()
+
+    def _with_burned_line(self, placed: Project) -> Project:
+        media = placed.media[0]
+        transcript = media.transcript_for(None)
+        assert transcript is not None
+        origin = SubtitleOrigin(media.id, media.transcript_stream(None), transcript.segments[0].id)
+        clip = Clip(timeline_start=30, duration=60, source=TEXT.create(text="今日は"))
+        clip = replace(clip, subtitle_origin=origin)
+        track = Track(kind=TrackKind.VIDEO, name="字幕")
+        with_track = placed.with_timeline(
+            replace(placed.timeline, tracks=(*placed.timeline.tracks, track))
+        )
+        return AddClip(track.id, clip).apply(with_track)
+
+    @pytest.mark.parametrize("outcome", ["accepted", "refused", "rebuilt"])
+    def test_the_burned_note_only_follows_a_change(
+        self, qt_application: QApplication, placed: Project, outcome: str
+    ) -> None:
+        # 断られた命令の後に注意を出すと、断りの知らせを上書きし、合っていない時刻を合わせた
+        # ように見せる（PR #434 の CodeRabbit の指摘）
+        # rebuilt はシーンを開いているときの断り 断られても組み直した作品が渡ってくる
+        del qt_application
+        project = self._with_burned_line(placed)
+        widget = SubtitlePanel(project, StubAnalyzer(None))
+        messages: list[str] = []
+        widget.status_message.connect(messages.append)
+
+        def apply(commands: list[Command], _label: str) -> None:
+            if outcome == "accepted":
+                changed = widget._project
+                for command in commands:
+                    changed = command.apply(changed)
+                widget.set_project(changed)
+            elif outcome == "rebuilt":
+                widget.set_project(replace(widget._project))
+
+        widget.commands_requested.connect(apply)
+        try:
+            widget.ask_retime = lambda selected: (
+                SubtitleTiming(fit_to_voice=False, end_offset_ms=200),
+                False,
+            )
+            widget.retime()
+            noted = [m for m in messages if "焼き込んだテキスト" in m]
+            assert noted == (
+                [
+                    "焼き込んだテキスト 1 個は元の時刻のままです 合わせた時刻で出すには、"
+                    "テキストを消して焼き込み直してください"
+                ]
+                if outcome == "accepted"
+                else []
+            )
         finally:
             widget.deleteLater()

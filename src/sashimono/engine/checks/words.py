@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 
 from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
-from sashimono.core.projection import burned_subtitles, heard_pieces, heard_timeline
+from sashimono.core.projection import (
+    HeardPiece,
+    burned_subtitles,
+    heard_pieces,
+    heard_timeline,
+)
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -24,8 +30,9 @@ from sashimono.core.words import (
     heard_between,
     heard_words,
     phrases,
-    unheard_words,
+    split_seam,
 )
+from sashimono.engine.audio.voice_edges import REACH
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
     JOINED,
@@ -49,6 +56,11 @@ _MIN_UNHEARD_CHARS = 2
 #: 短く、1 束も言い切らない 起こした字幕の行は切れ目で自動で切り詰められるので、前後の語の時刻の
 #: ずれ（0.1 秒）でも数コマ掛かることがあり、これを返すと直しようが無いまま検査に残り続ける
 _SLIVER_SECONDS = Fraction(1, 2)
+#: 字幕の行の前後でも聞こえる語と数える幅（秒） 行の時刻を声へ寄せる（#426 前後
+#: :data:`REACH` まで）・好みでずらす（:data:`OFFSET_MS_RANGE` まで）と、語が行の表示の外に出る
+#: 行の中だけで数えると、音を切っていないのに聞こえている語を残した音に無いと報告する
+#: 語は行ごとに別の物なので、この幅の中で鳴れば音は残っている 切って消した語はどこでも鳴らない
+_HEARD_SLACK = REACH + Fraction(max(abs(ms) for ms in OFFSET_MS_RANGE), 1000)
 #: 文言と語を比べるときに外す字 句読点は認識の語と字幕の文言で付き方が違う
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()\n")
 
@@ -276,6 +288,7 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
     戻り値は（問題、語の時刻が無く比べられなかった字幕の行の数）
     """
     heard = heard_words(project)
+    slack = seconds_to_frame(_HEARD_SLACK, project.rate, Rounding.CEIL)
     problems: list[Problem] = []
     done: set[tuple[str, int, int, str]] = set()
     blind: set[str] = set()
@@ -303,12 +316,18 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
         if not segment.words:
             blind.add(segment_id)
             return
-        missing = unheard_words(segment, heard, media_id, stream, low, high)
-        kept = [
-            item
-            for item in heard_between(heard, media_id, stream, low, high)
-            if item.word in segment.words
-        ]
+        # 字幕が出ている間に鳴る音の片だけで数える その片が行の表示の外（寄せた・ずらした分）で
+        # 鳴らす語も聞こえる側 別の所に置いた同じ所の音の片まで数えると、そちらで鳴る語のせいで
+        # この置き方の欠けを見逃す
+        # 分割しただけでつながる片は 1 つの音として数える 割っただけの前の片の語も鳴っている
+        near = heard_between(heard, media_id, stream, low - slack, high + slack)
+        playing = _joined_pieces(
+            [item.piece for item in near], low, high, project.rate.frame_duration
+        )
+        local = [item for item in near if item.piece in playing]
+        sounding = {item.word for item in local}
+        missing = [word for word in segment.words if word not in sounding]
+        kept = [item for item in local if item.word in segment.words]
         if not missing or not _claims(text, missing, kept):
             return
         # 判定は字幕全体で、返す区間だけ調べた範囲へ切る ほかの問題は範囲の中に収まる
@@ -362,6 +381,33 @@ def _subtitle_words(project: Project, start: int, end: int) -> tuple[list[Proble
             str(subtitle.clip_id),
         )
     return problems, len(blind)
+
+
+def _joined_pieces(
+    pieces: list[HeardPiece], low: int, high: int, frame_seconds: Fraction
+) -> set[HeardPiece]:
+    """``[low, high)`` に鳴る音の片と、それに分割しただけでつながる片（同じ素材の同じ音）
+
+    片は語の数だけ重ねて渡ってくる 重複を落とさずに総当たりすると、細かく切った作品で
+    字幕の行ごとに語の数の 2 乗だけ回る 新しく加わった片の隣だけを探せば、同じ組を見直さない
+    """
+    rest = set(pieces)
+    found = {piece for piece in rest if piece.start < high and piece.end > low}
+    rest -= found
+    frontier = list(found)
+    while frontier and rest:
+        joined = {
+            piece
+            for piece in rest
+            if any(
+                split_seam(piece, other, frame_seconds) or split_seam(other, piece, frame_seconds)
+                for other in frontier
+            )
+        }
+        rest -= joined
+        found |= joined
+        frontier = list(joined)
+    return found
 
 
 def _has_phrases(project: Project, key: tuple[MediaId, int]) -> bool:

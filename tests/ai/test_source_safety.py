@@ -145,6 +145,8 @@ UNDOABLE_TOOLS = frozenset(
         "split_subtitle",
         "merge_subtitles",
         "delete_subtitle",
+        # 字幕の行の時刻だけを変える（#426） 波形は読むだけ
+        "retime_subtitles",
         # 作品の設定・置き方の方式・置く・揃える（#349） どれも画面と同じ命令で取り消し 1 回
         "switch_layer_mode",
         "set_project_settings",
