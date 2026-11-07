@@ -113,6 +113,14 @@ class TextFieldKeys(QObject):
             return True
         return any(pressed == held for keys in self._held.values() for held in keys)
 
+    def watch(self, widget: QWidget | None) -> None:
+        """``widget`` が文字を打つ欄なら見張る 同じ欄へ何度入れても Qt は 1 つにまとめる
+
+        読むだけかどうかはキーが来たときに見る（後から書けるようになる欄がある）
+        """
+        if isinstance(widget, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox)):
+            widget.installEventFilter(self)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         kind = event.type()
         if kind not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
@@ -135,14 +143,23 @@ class TextFieldKeys(QObject):
 
 
 def install_text_field_keys(app: QApplication) -> TextFieldKeys:
-    """アプリ全体へ見張りを入れる 何度呼んでも 1 つだけ（窓を開くたびに呼ばれる）
+    """フォーカスを受けた入力欄へ見張りを入れる 何度呼んでも 1 つだけ（窓を開くたびに呼ばれる）
 
-    窓ではなくアプリへ入れるのは、設定画面のような別の窓の欄も同じに扱うため
+    窓ではなくアプリのフォーカスの知らせ（``focusChanged``）で入れるのは、設定画面のような
+    別の窓の欄も同じに扱うため
+
+    アプリ全体のイベントフィルタにはしない（#432） 見たいのは入力欄のキーだけなのに、
+    マウスの動きや描き直しまで全部のイベントが Python を通り、設定パネルを作り直す
+    1 回で 1.8 万回、選び直し 1 回で数十 ms がここに消えていた キーの知らせ
+    （ShortcutOverride と KeyPress）はフォーカスのある部品にしか来ないので、フォーカスを
+    受けた時点で入れれば取りこぼさない 窓が活性でない間に欄へフォーカスを置いた
+    （作り直しで戻した）ときも、窓が活性になった所で Qt が同じ知らせを出す
     """
     existing = app.property(_INSTALLED)
     if isinstance(existing, TextFieldKeys):
         return existing
     keys = TextFieldKeys(app)
-    app.installEventFilter(keys)
+    app.focusChanged.connect(lambda _old, new: keys.watch(new))
+    keys.watch(app.focusWidget())
     app.setProperty(_INSTALLED, keys)
     return keys
