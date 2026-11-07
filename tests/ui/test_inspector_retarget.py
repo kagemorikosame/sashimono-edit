@@ -27,7 +27,7 @@ from sashimono.core.commands import (
     ParamPath,
     SetKeyframe,
     SetParam,
-    SplitClip,
+    SplitClips,
 )
 from sashimono.core.commands.base import Command as BaseCommand
 from sashimono.core.model import AnimatedValue, Clip, ClipId, Effect, Project, Track, TrackKind
@@ -257,7 +257,7 @@ class TestSameLayout:
         ID を指して当たらない（割った片は同じ ID のエフェクトを持つ Codex の指摘）"""
         project = _texts(("blur",), ("blur",))
         first, second = _clips(project)
-        project = SplitClip(first.id, first.timeline_start + 10).apply(project)
+        project = SplitClips((first.id,), first.timeline_start + 10).apply(project)
         pieces = [c for c in _clips(project) if c.id != second.id]
         head, tail = sorted(pieces, key=lambda c: c.timeline_start)
         assert head.effects[0].id == tail.effects[0].id

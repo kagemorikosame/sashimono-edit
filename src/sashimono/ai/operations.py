@@ -187,7 +187,7 @@ from sashimono.core.commands import (
     SetTrackState,
     SetTranscript,
     SetWorkArea,
-    SplitClip,
+    SplitClips,
     SplitSegment,
     SubtitleTemplate,
     TrimClip,
@@ -219,8 +219,11 @@ from sashimono.core.commands.edit import (
     MAX_RESOLUTION,
     MIN_RESOLUTION,
     STOP_LOCKED,
+    locked_groups,
     ripple_casualties,
     ripple_report,
+    split_refusal,
+    split_targets,
 )
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.history import REPLACED_REFUSAL
@@ -278,6 +281,7 @@ from sashimono.core.model import (
     ClipId,
     Effect,
     EffectId,
+    GroupId,
     Interpolation,
     Keyframe,
     LayerMode,
@@ -614,11 +618,27 @@ class Operation:
     #: 絵を返さないので、使う量の上限（#344）の送った絵には数えず、絵の上限でも止めない
     #: 数えると、絵の上限に当たった人は貼るための写しまで AI に頼めなくなる
     frames_elsewhere: bool = field(default=False, kw_only=True)
+    #: 動かす前に人へ尋ねる問い（#428） 最初の選択肢を選んだときだけ動かし、答えを操作の
+    #: 許可として扱う（もう 1 度「許可しますか」は出さない） 「変更を自動で承認」でも尋ねる
+    #: 人が付けた束を解くなど、取り消せても AI に任せたくない操作に付ける 許可の窓だけだと
+    #: 「グループを解除する」の重さが伝わらず、自動で承認なら確かめも出ない
+    #: 尋ねるかは本人の設定で切れる（:attr:`EditorBridge.ask_first`）
+    #: 問いは編集画面のスレッドで、今の作品から作る（:class:`FirstAsk`） 何に効くかを決めてから
+    #: 尋ね、許された後は決めた引数のまま、対象が変わっていないことを確かめてから動かす
+    #: 尋ねる前に対象を決めないと、clip_ids を省いた呼び出しで、答える間に選び直した別の
+    #: クリップのグループを解いてしまう（CodeRabbit の指摘 #435）
+    asks_first: Callable[[EditorHost, dict[str, Any]], FirstAsk] | None = field(
+        default=None, kw_only=True
+    )
 
     def __post_init__(self) -> None:
         if not self.sends:
             # 結果を返す以上、何かは送る 空にすると、何も送らない道具と見分けが付かない
             raise ValueError(f"{self.name}: 結果に入りうる物（sends）を書いてください")
+        if self.asks_first is not None and (not self.writes or self.irreversible):
+            # 尋ねた答えを許可の代わりにするので、許可を求めない道具や、毎回別の確かめを出す
+            # 取り消せない操作に付けると、確かめが 2 つになるか、尋ねる意味が無い
+            raise ValueError(f"{self.name}: asks_first は取り消せる編集の道具だけです")
         if self.frames_elsewhere and Outbound.FRAMES not in self.sends:
             # 絵を外へ出さない道具に書いても意味が無い 書き違いで同意を取らずに絵を出さないよう断る
             raise ValueError(f"{self.name}: frames_elsewhere は sends に絵を書いた道具だけです")
@@ -665,6 +685,17 @@ CHOICES_RANGE = (2, 4)
 QUESTION_LIMIT = 200
 LABEL_LIMIT = 16
 DESCRIPTION_LIMIT = 60
+
+
+@dataclass(frozen=True, slots=True)
+class FirstAsk:
+    """動かす前の問い（:attr:`Operation.asks_first`）と、それで決めた対象"""
+
+    spec: QuestionSpec
+    #: 許されたら動かす引数 省いた対象（選択中など）を決めて入れた物
+    arguments: dict[str, Any]
+    #: 何に効くかの写し 許した後に作り直して比べ、違えば動かさない
+    basis: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -4991,10 +5022,43 @@ def _add_transition(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _split_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """クリップを割る リンクの相手とグループの仲間も、同じ位置をまたぐ物は一緒に割る（#427）
+
+    画面の分割と同じ :class:`SplitClips` を通す 前は 1 本だけを割っていたので、割るたびに
+    後ろの片割れが元のグループに残り、前と後ろが一緒に選ばれて動いた
+    """
     _, clip = _target_clip(host, arguments)
     frame = int(arguments.get("frame", host.playhead))
-    host.apply_commands([SplitClip(clip.id, frame)], "クリップを分割")
-    return {"split_at": frame}
+    project = _project(host)
+    # リンクの相手とその相手のグループまで広げた単位で確かめる 渡した 1 本だけを見ると、
+    # 相手の側のロックで断られたときに確かめ方の案内が付かない（CodeRabbit の指摘 #435）
+    if _straddles_clip(clip, frame):
+        targets = split_targets(project.timeline, (clip.id,), frame)
+        refusal = split_refusal(project.timeline, targets)
+        if refusal is not None and len(targets) > 1:
+            # グループを解けば割れることがあるが、人が付けた束を AI が黙って解くことになる（#428）
+            raise ToolError(
+                f"{refusal} グループは解かずに、ロックを外してよいかをユーザーに確かめてください"
+            )
+        if refusal is not None:
+            # 相手のいない 1 本なら解く束が無い 束の話を足すと、AI が無い束を探しに行く
+            raise ToolError(f"{refusal} ロックを外してよいかをユーザーに確かめてください")
+    before = {c.id for track in project.timeline.tracks for c in track.clips}
+    host.apply_commands([SplitClips((clip.id,), frame)], "クリップを分割")
+    # 仲間も割れたことと後ろの ID を返す 返さないと、AI は割った本数を知らずに list_clips を
+    # 読み直すか、仲間を同じ位置でもう 1 度割ろうとして失敗する
+    backs = [
+        str(c.id)
+        for track in _project(host).timeline.tracks
+        for c in track.clips
+        if c.id not in before
+    ]
+    return {"split_at": frame, "new_clips": backs}
+
+
+def _straddles_clip(clip: Clip, frame: int) -> bool:
+    """割る位置がクリップの内側か 外なら命令に任せ、位置が外れていると答えさせる"""
+    return clip.timeline_start < frame < clip.timeline_end
 
 
 def _trim_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -5064,8 +5128,9 @@ def _move_clip(host: EditorHost, arguments: dict[str, Any]) -> object:
         # トラックを移すと仲間の行き先が決まらないので断る 今のトラックの指定は移動ではない
         if track_id and track_id != str(track.id):
             raise ToolError(
-                "グループに入ったクリップはトラックを移せません"
-                "（ungroup_clips で解くか、時刻だけ move_clips で動かしてください）"
+                "グループに入ったクリップはトラックを移せません 時刻だけなら move_clips で"
+                "仲間ごと動かせます トラックを移すなら、グループを解いてよいかを"
+                "先にユーザーに確かめてください"
             )
         command = MoveClips(members, start - clip.timeline_start)
         host.apply_commands([command], command.label)
@@ -7618,6 +7683,62 @@ def _group_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"grouped": [str(clip_id) for clip_id in clip_ids]}
 
 
+#: グループを解く前に人へ尋ねる問いの選択肢（#428） 最初が「解く」
+#: AI がカットの途中で止まったときに解いて進めると、人が付けた束が黙って消え、後で仲間を
+#: 動かしたときにずれる
+UNGROUP_CHOICES = (
+    Choice("解除する", "グループを解いて続ける"),
+    Choice("解除しない", "グループを残す AI は解かずに続ける"),
+)
+
+
+def _ungroup_question(host: EditorHost, arguments: dict[str, Any]) -> FirstAsk:
+    """解く前の問い 解くグループとリンクと、そこに入っているクリップの本数を出す
+
+    数で出すのは、問いの欄が狭く、名前を並べると読み切れないため 本数が分かれば、思っていた
+    より大きな束を解こうとしているかに気付ける 決めた clip_ids を引数に入れて返し、許された
+    後はそれで解く
+    """
+    clip_ids = _target_clips(host, arguments)
+    timeline = _project(host).timeline
+    groups: set[GroupId] = set()
+    links: set[GroupId] = set()
+    for clip_id in clip_ids:
+        located = timeline.locate_clip(clip_id)
+        if located is None:
+            raise ToolError(f"クリップが見つかりません: {clip_id}（list_clips で確かめてください）")
+        if located[1].group_id is not None:
+            groups.add(located[1].group_id)
+        if located[1].link_group is not None:
+            links.add(located[1].link_group)
+    if not groups and not links:
+        # 解く物が無いのに尋ねると、人は何かが解けると思って答え、その答えが無駄になる
+        raise ToolError(
+            "指定したクリップはグループにもリンクにも入っていないので、解除する対象がありません"
+        )
+    # 写しには ID だけでなく所属も入れる 答える間に別のクリップが束へ足されたり、
+    # 束の中の 1 本が別の束へ移ったりしても、ID の集まりだけでは気付けない（CodeRabbit の指摘 #435）
+    members = frozenset(
+        (clip.id, clip.group_id, clip.link_group)
+        for track in timeline.tracks
+        for clip in track.clips
+        if clip.group_id in groups or clip.link_group in links
+    )
+    parts = [f"グループ {len(groups)} 個"] if groups else []
+    if links:
+        parts.append(f"映像と音のリンク {len(links)} 組")
+    spec = QuestionSpec(
+        text=(
+            f"AI が {'と'.join(parts) or 'グループ'}（クリップ {len(members)} 本）を解除しようと"
+            "しています 解除すると、束ねたクリップが別々に選ばれ、別々に動くようになります"
+            " 解除しますか"
+        ),
+        choices=UNGROUP_CHOICES,
+    )
+    pinned = {**arguments, "clip_ids": [str(clip_id) for clip_id in clip_ids]}
+    return FirstAsk(spec, pinned, (frozenset(groups), frozenset(links), members))
+
+
 def _ungroup_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     clip_ids = _target_clips(host, arguments)
     command = UngroupClips(clip_ids)
@@ -7667,16 +7788,10 @@ def _select_all(host: EditorHost, arguments: dict[str, Any]) -> object:
 def _locked_groups(project: Project, clip_ids: tuple[ClipId, ...]) -> bool:
     """ロックしたトラックのクリップを含むグループに入ったクリップがあるか
 
-    画面の切り取りと同じく断る（:meth:`TimelineView._refuse_locked_group`） 一部だけ消すと、
-    束ねた物の頭や長さが食い違う
+    画面の切り取りと同じ決まり（:func:`locked_groups`）で断る 一部だけ消すと、束ねた物の
+    頭や長さが食い違う
     """
-    timeline = project.timeline
-    groups = set()
-    for clip_id in clip_ids:
-        located = timeline.locate_clip(clip_id)
-        if located is not None and located[1].group_id is not None:
-            groups.add(located[1].group_id)
-    return any(track.locked for group in groups for track, _ in timeline.grouped_clips(group))
+    return bool(locked_groups(project.timeline, clip_ids))
 
 
 def _copy_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -7698,7 +7813,7 @@ def _cut_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
     if _locked_groups(project, clip_ids):
         raise ToolError(
             "グループの中にロックしたレイヤーのクリップがあるので切り取れません"
-            " ロックを外すか、グループを解除してください"
+            " グループは解かずに、ロックを外してよいかをユーザーに確かめてください"
         )
     content = copy_clips(project, clip_ids)
     if not content.clips:
@@ -10970,7 +11085,12 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="split_clip",
-        description="クリップを分割する clip_id を省くと選択中のクリップ",
+        description=(
+            "クリップを分割する clip_id を省くと選択中のクリップ リンクした映像と音声と、"
+            "グループの仲間のうち同じ位置をまたぐ物も一緒に割る 割った後ろどうしは新しい"
+            "グループになり（後ろが 1 本だけならグループから外れる）、前とまたがない仲間は元の"
+            "グループに残る new_clips が後ろの ID"
+        ),
         schema=_schema(
             {"clip_id": _string("対象"), "frame": _integer("分割位置 省略すると再生ヘッド")}
         ),
@@ -11059,11 +11179,15 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="ungroup_clips",
-        description="クリップが入っているグループを、仲間ごと解く",
+        description=(
+            "クリップが入っているグループを、仲間ごと解く グループはユーザーが作った束なので、"
+            "頼まれたときだけ使う 動かす前にアプリがユーザーへ解いてよいかを尋ねる"
+        ),
         schema=_schema({"clip_ids": _clip_ids_schema()}),
         handler=_ungroup_clips,
         sends=_STRUCTURE,
         writes=True,
+        asks_first=_ungroup_question,
     ),
     Operation(
         name="move_clips",

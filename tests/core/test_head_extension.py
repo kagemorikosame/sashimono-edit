@@ -22,7 +22,7 @@ from sashimono.core.commands import (
     AddScene,
     Document,
     RippleCut,
-    SplitClip,
+    SplitClips,
     TrimClip,
     TrimClips,
     TrimRoom,
@@ -340,7 +340,7 @@ class TestCuttingKeepsSourceIn:
     def test_splitting_leaves_it_alone(self, project: Project, name: str) -> None:
         # 割るたびに右側の source_in が溜まり、意味の無い値が保存したファイルに残る
         clip = _generated(_SOURCES[name].create(), start=0, duration=60)
-        split = SplitClip(clip.id, 20).apply(_with(project, clip))
+        split = SplitClips((clip.id,), 20).apply(_with(project, clip))
         assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, 0]
 
     def test_a_still_picture_keeps_it_when_split(self, project: Project) -> None:
@@ -348,7 +348,7 @@ class TestCuttingKeepsSourceIn:
         still = _still()
         project = replace(project, media=(*project.media, still))
         clip = make_clip(0, 60, still)
-        split = SplitClip(clip.id, 30).apply(_with(project, clip))
+        split = SplitClips((clip.id,), 30).apply(_with(project, clip))
         assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, 0]
 
     def test_a_video_still_moves_on_when_split(
@@ -356,7 +356,7 @@ class TestCuttingKeepsSourceIn:
     ) -> None:
         # 動画の右側が頭から読み直すと、割っただけで右側の絵が巻き戻る
         clip = make_clip(0, 60, video_media)
-        split = SplitClip(clip.id, 30).apply(_with(project, clip))
+        split = SplitClips((clip.id,), 30).apply(_with(project, clip))
         assert [c.source_in for c in split.timeline.tracks[0].clips] == [0, Fraction(1)]
 
     def test_a_jet_cut_leaves_it_alone(self, project: Project) -> None:

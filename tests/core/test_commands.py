@@ -18,7 +18,7 @@ from sashimono.core.commands import (
     RemoveTrack,
     RenameProject,
     SetTranscript,
-    SplitClip,
+    SplitClips,
     TrimClip,
 )
 from sashimono.core.model import (
@@ -211,7 +211,7 @@ class TestSplit:
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
 
-        split = SplitClip(clip.id, 20).apply(placed)
+        split = SplitClips((clip.id,), 20).apply(placed)
         clips = _only_track(split).clips
         assert [(c.timeline_start, c.duration) for c in clips] == [(0, 20), (20, 40)]
 
@@ -221,7 +221,7 @@ class TestSplit:
         clip = make_clip(0, 60, video_media, source_in=1)
         placed = AddClip(track.id, clip).apply(project)
 
-        split = SplitClip(clip.id, 30).apply(placed)
+        split = SplitClips((clip.id,), 30).apply(placed)
         left, right = _only_track(split).clips
         # 左が 30 フレーム = 1 秒を消費したので、右は 1 + 1 = 2 秒から始まる
         assert left.source_in == Fraction(1)
@@ -233,7 +233,7 @@ class TestSplit:
         clip = Clip(timeline_start=0, duration=60, media_id=video_media.id, speed=Fraction(2))
         placed = AddClip(track.id, clip).apply(project)
 
-        split = SplitClip(clip.id, 30).apply(placed)
+        split = SplitClips((clip.id,), 30).apply(placed)
         _, right = _only_track(split).clips
         # 2 倍速なので 30 フレーム（1 秒）の再生で 2 秒分のソースを消費する
         assert right.source_in == Fraction(2)
@@ -244,7 +244,7 @@ class TestSplit:
         track = _only_track(project)
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
-        left, right = _only_track(SplitClip(clip.id, 30).apply(placed)).clips
+        left, right = _only_track(SplitClips((clip.id,), 30).apply(placed)).clips
         assert left.id == clip.id
         assert right.id != clip.id
 
@@ -258,7 +258,7 @@ class TestSplit:
         clip = make_clip(0, 60, video_media)
         placed = AddClip(track.id, clip).apply(project)
         with pytest.raises(ValueError, match="分割位置"):
-            SplitClip(clip.id, frame).apply(placed)
+            SplitClips((clip.id,), frame).apply(placed)
 
     def test_split_follows_linked_audio(self, video_media: MediaItem, project: Project) -> None:
         # 映像と音声がリンクしていれば、片方を割るともう片方も同じ位置で割れる
@@ -271,7 +271,7 @@ class TestSplit:
         placed = AddClip(_only_track(with_track).id, video_clip).apply(with_track)
         placed = AddClip(audio_track.id, audio_clip).apply(placed)
 
-        split = SplitClip(video_clip.id, 25).apply(placed)
+        split = SplitClips((video_clip.id,), 25).apply(placed)
         video_bounds = [(c.timeline_start, c.duration) for c in split.timeline.tracks[0].clips]
         audio_bounds = [(c.timeline_start, c.duration) for c in split.timeline.tracks[1].clips]
         assert video_bounds == audio_bounds == [(0, 25), (25, 35)]
@@ -290,7 +290,7 @@ class TestSplit:
         placed = AddClip(_only_track(with_track).id, video_clip).apply(with_track)
         placed = AddClip(audio_track.id, audio_clip).apply(placed)
 
-        split = SplitClip(video_clip.id, 25).apply(placed)
+        split = SplitClips((video_clip.id,), 25).apply(placed)
         video_left, video_right = split.timeline.tracks[0].clips
         audio_left, audio_right = split.timeline.tracks[1].clips
 
@@ -311,7 +311,7 @@ class TestSplit:
         placed = AddClip(_only_track(with_track).id, video_clip).apply(with_track)
         placed = AddClip(audio_track.id, audio_clip).apply(placed)
 
-        split = SplitClip(video_clip.id, 25).apply(placed)
+        split = SplitClips((video_clip.id,), 25).apply(placed)
         head = split.timeline.tracks[0].clips[0]
         removed = RemoveClip(head.id, ripple=True).apply(split)
 

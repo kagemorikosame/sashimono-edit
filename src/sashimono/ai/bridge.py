@@ -36,6 +36,7 @@ from sashimono.ai.fixes import PASSES_AFTER_LIMIT, refuse_after_limit
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import (
     Continue,
+    FirstAsk,
     ImageResult,
     Operation,
     Pending,
@@ -135,6 +136,9 @@ class Question:
     """
 
     spec: QuestionSpec
+    #: 動かす前の問い（:attr:`Operation.asks_first`）なら、その道具の名前 AI の ask_user なら空
+    #: 画面は最初の選択肢を選ばなかった答えを、引き継ぎに許されなかった物として残す
+    gate: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     answered: bool = False
     #: 選んだ選択肢の名前（選んだ順ではなく、選択肢の並び順）
@@ -239,6 +243,10 @@ class EditorBridge:
         self._cancel = threading.Event()
         #: 変更系を確認なしで通すか 既定は偽
         self.auto_approve = auto_approve
+        #: 動かす前の問い（:attr:`Operation.asks_first` グループの解除 #428）を尋ねるか
+        #: 本人の設定（:attr:`Preferences.ai_ask_before_ungroup`）で切れる 切ると、ほかの
+        #: 取り消せる編集と同じ許可の窓（自動で承認なら無し）だけになる
+        self.ask_first = True
         #: 「このツールは以降ずっと許可」と言われたもの
         self._always: set[str] = set()
         #: UI が取り出して、まだ返事をもらっていない確認 中断のときに畳む
@@ -295,6 +303,26 @@ class EditorBridge:
             return self.ask(spec)
         if operation.irreversible:
             return self._run_irreversible(operation, arguments)
+        if operation.asks_first is not None and self.ask_first:
+            # 尋ねた答えを許可の代わりにする 続けて許可の窓も出すと、同じことを 2 度聞かれる
+            first = operation.asks_first
+            asked = self.call(partial(first, self._host, arguments))
+            if not isinstance(asked, FirstAsk):
+                raise ToolError(f"{operation.name} が問いの形を返しませんでした")
+            self._agree_first(operation.name, asked.spec)
+
+            def pinned() -> object:
+                # 答える間に人が選び直したり束を組み直したりしていたら、許した物と違う物を
+                # 解くことになる 編集画面のスレッドで、動かす直前に作り直して比べる
+                again = first(self._host, asked.arguments)
+                if again.basis != asked.basis:
+                    raise ToolError(
+                        "答える間に対象のグループが変わったので、動かしていません"
+                        " もう 1 度確かめてから呼び直してください"
+                    )
+                return operation.start(self._host, asked.arguments)
+
+            return self._execute(operation, asked.arguments, body=pinned)
         if operation.writes and not self._approved(operation, arguments):
             raise ToolError("ユーザーがこの操作を許可しませんでした")
         return self._execute(operation, arguments)
@@ -687,6 +715,23 @@ class EditorBridge:
         self._sending = request
         return request
 
+    def _agree_first(self, tool: str, spec: QuestionSpec) -> None:
+        """動かす前の問い（:attr:`Operation.asks_first`）を尋ね、最初の選択肢でなければ断る
+
+        書いた答えも断りの文に添える 「この 2 本だけは解いてよい」などの訳を AI が読めないと、
+        同じ頼み方で何度も尋ねることになる
+        """
+        answer = self.ask(spec, gate=tool)
+        selected = answer.get("selected")
+        if isinstance(selected, list) and spec.choices[0].label in selected:
+            return
+        written = answer.get("free_text")
+        reason = f"（ユーザーの答え: {written}）" if written else ""
+        raise ToolError(
+            f"ユーザーが「{spec.choices[0].label}」を選ばなかったので、動かしていません{reason}"
+            " この操作をせずに進めるか、どうするかをユーザーに確かめてください"
+        )
+
     def _approved(self, operation: Operation, arguments: dict[str, Any]) -> bool:
         if self.auto_approve or operation.name in self._always:
             return True
@@ -708,13 +753,13 @@ class EditorBridge:
             approval.deny("確認の返事がありませんでした")
         return approval.allowed
 
-    def ask(self, spec: QuestionSpec) -> dict[str, object]:
+    def ask(self, spec: QuestionSpec, *, gate: str = "") -> dict[str, object]:
         """画面に質問を出し、答えを待つ 答えなければ失敗にする
 
         失敗で返すのは、返事が無いのに推測で進めさせないため 答えの代わりに空の
         結果を返すと、AI は「どれでもよい」と読んで、聞いた意味が無くなる
         """
-        question = Question(spec)
+        question = Question(spec, gate=gate)
         self._questions.put(question)
         if self._cancel.is_set():
             # 積んだ後に確かめる 積む前に確かめると、確かめてから積むまでの間に中断された

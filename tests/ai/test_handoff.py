@@ -28,7 +28,7 @@ from sashimono.ai.handoff import (
 from sashimono.ai.operations import Operation, find_operation
 from sashimono.ai.outbound import TEXT_MARK, Outbound, SendChoice
 from sashimono.ai.session import LIMIT_DETAIL, LOGIN_DETAIL, EventKind, result_error
-from sashimono.core.commands import Author, Document, RenameProject, SplitClip
+from sashimono.core.commands import Author, Document, RenameProject, SplitClips
 from sashimono.core.model import MediaItem, Project, Transcript
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread, pump_until
@@ -63,7 +63,7 @@ def _ai_turn(document: Document, label: str = "AI: 冒頭を切って", cuts: in
     # 頭のクリップを後ろから切っていく 前から切ると、頭のクリップが切る位置より短くなる
     for frame in (90, 60, 30)[:cuts]:
         with document.checkpoint("分割", by=Author.AI):
-            document.execute(SplitClip(_first_clip(document), frame))
+            document.execute(SplitClips((_first_clip(document),), frame))
 
 
 class TestRecord:
@@ -196,9 +196,9 @@ class TestChangesComeFromTheHistory:
         # 壊れると、人が途中で変えて 2 段に割れた指示を、Ctrl+Z 1 回で戻し切れると案内してしまう
         document = Document(loaded)
         _ai_turn(document, cuts=1)
-        document.execute(SplitClip(_first_clip(document), 15), by=Author.PERSON)
+        document.execute(SplitClips((_first_clip(document),), 15), by=Author.PERSON)
         with document.checkpoint("分割", by=Author.AI):
-            document.execute(SplitClip(_first_clip(document), 5))
+            document.execute(SplitClips((_first_clip(document),), 5))
         record = TurnRecord()
         record.begin("冒頭を切って")
         record.capture(document)
@@ -216,7 +216,7 @@ class TestChangesComeFromTheHistory:
         # 「変えた手 0 件」「変えた物: 無し」と出て、人は AI の手が残っていることに気付かない
         document = Document(loaded)
         _ai_turn(document, cuts=2)
-        document.execute(SplitClip(_first_clip(document), 15), by=Author.PERSON)
+        document.execute(SplitClips((_first_clip(document),), 15), by=Author.PERSON)
         record = TurnRecord()
         record.begin("冒頭を切って")
         record.capture(document)
@@ -248,9 +248,9 @@ def _cut(document: Document, by: Author) -> None:
     frame = (clip.timeline_start + clip.timeline_end) // 2
     if by is Author.AI:
         with document.checkpoint("分割", by=Author.AI):
-            document.execute(SplitClip(clip.id, frame))
+            document.execute(SplitClips((clip.id,), frame))
     else:
-        document.execute(SplitClip(clip.id, frame), by=Author.PERSON)
+        document.execute(SplitClips((clip.id,), frame), by=Author.PERSON)
 
 
 def _stopped_after(document: Document, moves: str) -> Handoff:
@@ -364,7 +364,7 @@ class TestShelf:
         # 壊れると、止まった後に人が 1 手直しただけで、AI が引き継ぎを読めなくなる
         document = Document(loaded)
         shelf = self._put(document)
-        document.execute(SplitClip(_first_clip(document), 30))
+        document.execute(SplitClips((_first_clip(document),), 30))
         assert shelf.current(document) is not None
         document.undo()
         document.undo()

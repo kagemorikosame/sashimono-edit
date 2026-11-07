@@ -15,7 +15,7 @@ from fractions import Fraction
 
 import pytest
 
-from sashimono.core.commands import AddClip, RippleCut, SetClipProperty, SplitClip, TrimClip
+from sashimono.core.commands import AddClip, RippleCut, SetClipProperty, SplitClips, TrimClip
 from sashimono.core.io import (
     FORMAT_VERSION,
     ProjectFileError,
@@ -93,7 +93,7 @@ class TestEditing:
         持っていると、後半は 0 から数え直して動き出す
         """
         (clip,) = _clips(held)
-        _, right = _clips(SplitClip(clip.id, 200).apply(held))
+        _, right = _clips(SplitClips((clip.id,), 200).apply(held))
         assert right.source_in > Fraction(5)
         assert set(_times(right)) == {Fraction(5)}
 
@@ -101,7 +101,7 @@ class TestEditing:
         # 割っても、各フレームに出る絵は割る前と同じ 止める所が前半の長さの分ずれると、
         # 割った所から後の絵が早く止まる
         (clip,) = _clips(held)
-        left, right = _clips(SplitClip(clip.id, 60).apply(held))
+        left, right = _clips(SplitClips((clip.id,), 60).apply(held))
         assert _times(left) + _times(right) == _times(clip)
 
     def test_trimming_the_head_past_the_hold_freezes_the_rest(self, held: Project) -> None:
@@ -172,7 +172,7 @@ class TestFile:
     def test_the_later_half_of_a_split_keeps_its_hold_after_saving(self, held: Project) -> None:
         # 割った後半も保存して開き直せる（別の ID でも止める位置を持つ）
         (clip,) = _clips(held)
-        split = SplitClip(clip.id, 200).apply(held)
+        split = SplitClips((clip.id,), 200).apply(held)
         reopened = project_from_dict(project_to_dict(split))
         assert [c.hold_at for c in _clips(reopened)] == [Fraction(5), Fraction(5)]
 

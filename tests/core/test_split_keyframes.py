@@ -14,7 +14,7 @@ from dataclasses import replace
 
 import pytest
 
-from sashimono.core.commands import Document, RippleCut, SplitClip
+from sashimono.core.commands import Document, RippleCut, SplitClips
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -63,14 +63,14 @@ class TestSplit:
     def test_the_motion_stays_where_it_was_on_the_timeline(self) -> None:
         # 後ろへキーをそのまま写すと、後ろのクリップの頭からまたフェードが始まる
         project, clip = _project(FADE)
-        split = SplitClip(clip.id, START + 50).apply(project)
+        split = SplitClips((clip.id,), START + 50).apply(project)
         for frame in range(START, START + DURATION):
             assert _opacity_at(split, frame) == pytest.approx(clip.opacity.at(frame - START))
 
     def test_each_side_gets_a_key_at_the_cut_and_drops_the_rest(self) -> None:
         # 範囲の外に出たキーを残すと、描く所の無い点がグラフだけに残る
         project, clip = _project(FADE)
-        before, after = _pieces(SplitClip(clip.id, START + 50).apply(project))
+        before, after = _pieces(SplitClips((clip.id,), START + 50).apply(project))
         assert [(k.frame, k.value) for k in before.opacity.keyframes] == [
             (0, 0.0),
             (49, pytest.approx(0.49)),
@@ -84,7 +84,7 @@ class TestSplit:
         # 後ろのキーを割った位置から数え直さないと、後ろのクリップの動きが割った長さだけ遅れ、
         # クリップの外へ出て消える
         project, clip = _project(_keys(Keyframe(80, 0.2), Keyframe(110, 0.9)))
-        before, after = _pieces(SplitClip(clip.id, START + 60).apply(project))
+        before, after = _pieces(SplitClips((clip.id,), START + 60).apply(project))
         assert not before.opacity.is_animated
         assert before.opacity.static == pytest.approx(0.2)
         assert [k.frame for k in after.opacity.keyframes] == [20, 50]
@@ -92,7 +92,7 @@ class TestSplit:
     def test_keys_only_before_the_cut_leave_the_second_part_still(self) -> None:
         # 前にしか無いキーを後ろへも写すと、後ろのクリップの頭でまた同じ動きが始まる
         project, clip = _project(_keys(Keyframe(0, 0.2), Keyframe(20, 0.9)))
-        before, after = _pieces(SplitClip(clip.id, START + 60).apply(project))
+        before, after = _pieces(SplitClips((clip.id,), START + 60).apply(project))
         assert [k.frame for k in before.opacity.keyframes] == [0, 20]
         assert not after.opacity.is_animated
         assert after.opacity.static == pytest.approx(0.9)
@@ -105,7 +105,7 @@ class TestSplit:
         # 割る所で曲線を切らずに直線の点を足すと、イージングの形が崩れる
         eased = _keys(Keyframe(10, 0.0, interpolation=interpolation), Keyframe(110, 1.0))
         project, clip = _project(eased)
-        split = SplitClip(clip.id, START + 47).apply(project)
+        split = SplitClips((clip.id,), START + 47).apply(project)
         for frame in range(START, START + DURATION):
             assert _opacity_at(split, frame) == pytest.approx(
                 clip.opacity.at(frame - START), abs=1e-6
@@ -115,7 +115,7 @@ class TestSplit:
         # 不透明度だけ直すと、文字の大きさや位置のキーは後ろのクリップでずれたまま
         size = _keys(Keyframe(0, 20.0), Keyframe(100, 120.0))
         project, clip = _project(FADE, size=size)
-        _, after = _pieces(SplitClip(clip.id, START + 50).apply(project))
+        _, after = _pieces(SplitClips((clip.id,), START + 50).apply(project))
         assert after.source is not None
         moved = after.source.params["size"]
         assert isinstance(moved, AnimatedValue)
@@ -128,7 +128,7 @@ class TestSplit:
         # 取り消しても元の 1 本に戻らないと、キーを入れたクリップを割り間違えたら動きを打ち直す
         project, clip = _project(FADE)
         document = Document(project)
-        document.execute(SplitClip(clip.id, START + 50))
+        document.execute(SplitClips((clip.id,), START + 50))
         document.undo()
         assert _pieces(document.project) == (clip,)
 

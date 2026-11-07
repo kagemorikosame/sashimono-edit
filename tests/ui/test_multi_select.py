@@ -26,7 +26,7 @@ from sashimono.core.commands import (
     SetClipProperty,
     SetParam,
     SetTrackHeights,
-    SplitClip,
+    SplitClips,
     TrimClips,
     UngroupClips,
     insert_media,
@@ -35,6 +35,7 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    GroupId,
     MediaItem,
     Project,
     Track,
@@ -651,6 +652,53 @@ class TestLockedGroup:
         assert received == []
         assert any("ロック" in m and "グループ" in m for m in messages)
 
+    def test_nothing_under_the_playhead_sends_nothing(self, view: TimelineView) -> None:
+        # 空の命令を送ると、何も変わらない 1 段が履歴に載り、やり直しの履歴も消える
+        # （CodeRabbit の指摘 #435）
+        view.select(None)
+        view.set_playhead(100_000)
+        received = _received(view)
+        view.split_at_playhead()
+        assert received == []
+
+    def test_a_link_into_a_locked_group_skips_only_that_pair(self, view: TimelineView) -> None:
+        # 選ばずに割るとき、リンクの先のグループにロックした仲間がいる組を外さないと、命令ごと
+        # 断られて関係の無いクリップまで割れない（CodeRabbit の指摘 #435）
+        link, group = GroupId("L"), GroupId("G")
+
+        def text(link_group: GroupId | None = None, group_id: GroupId | None = None) -> Clip:
+            return Clip(
+                timeline_start=0,
+                duration=30,
+                source=TEXT.create(),
+                link_group=link_group,
+                group_id=group_id,
+            )
+
+        cut = text(link_group=link)
+        partner = text(link_group=link, group_id=group)
+        guarded = text(group_id=group)
+        extra = text()
+        tracks = (
+            Track(TrackKind.VIDEO, "V1", (cut,)),
+            Track(TrackKind.VIDEO, "V2", (guarded,), locked=True),
+            Track(TrackKind.VIDEO, "V3", (partner,)),
+            Track(TrackKind.VIDEO, "V4", (extra,)),
+        )
+        project = view.project
+        view.set_project(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        messages: list[str] = []
+        view.status_message.connect(messages.append)
+        view.select(None)
+        view.set_playhead(10)
+        received = _received(view)
+        view.split_at_playhead()
+        (commands,) = received
+        (split,) = commands
+        assert isinstance(split, SplitClips)
+        assert split.clip_ids == (extra.id,)
+        assert any("ロック" in m for m in messages)
+
     def test_splitting_everything_skips_only_the_group(self, view: TimelineView) -> None:
         # 何も選ばずに切るときは、グループの外のクリップは今までどおり切る
         _a, _b, _c, messages = self._locked_group(view)
@@ -663,7 +711,7 @@ class TestLockedGroup:
         received = _received(view)
         view.split_at_playhead()
         (commands,) = received
-        assert [c.clip_id for c in commands if isinstance(c, SplitClip)] == [extra.id]
+        assert [c.clip_ids for c in commands if isinstance(c, SplitClips)] == [(extra.id,)]
         assert len(commands) == 1
         assert any("グループ" in m for m in messages)
 

@@ -27,7 +27,7 @@ from sashimono.core.commands import (
     SetFrameRate,
     SetLayerMode,
     SetTranscript,
-    SplitClip,
+    SplitClips,
     TrimClip,
     burn_subtitles,
     format_to_match,
@@ -508,7 +508,7 @@ class TestEditing:
     def test_split_keeps_picture_and_sound(self, placed: Project) -> None:
         # 分けた後半が音を失うと、切った所から先が無音になる
         (clip,) = self._clips(placed)
-        halves = self._clips(SplitClip(clip.id, 90).apply(placed))
+        halves = self._clips(SplitClips((clip.id,), 90).apply(placed))
         assert [(c.timeline_start, c.duration) for c in halves] == [(0, 90), (90, 210)]
         assert all(c.audio_stream == 1 and c.show_picture for c in halves)
         assert halves[1].source_in == Fraction(3)
