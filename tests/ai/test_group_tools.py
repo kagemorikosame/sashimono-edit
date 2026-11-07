@@ -60,6 +60,15 @@ def _grouped(*spans: tuple[int, int], locked: int | None = None) -> tuple[FakeHo
     return FakeHost(project), [c for t in timeline.tracks for c in t.clips]
 
 
+def _with_lone_clip() -> tuple[FakeHost, Clip]:
+    """2 本のグループと、どこにも入っていない 1 本"""
+    host, _clips = _grouped((0, 100), (0, 100))
+    lone = Clip(timeline_start=300, duration=50, source=TEXT.create())
+    project = host.document.project
+    tracks = (*project.timeline.tracks, Track(TrackKind.MIXED, "レイヤー 3", (lone,)))
+    return FakeHost(project.with_timeline(replace(project.timeline, tracks=tracks))), lone
+
+
 def _take(bridge: EditorBridge, done: threading.Event) -> Question:
     """画面のスレッドの代わりに仕事を拾いながら、問いが出るのを待つ
 
@@ -266,6 +275,45 @@ class TestAskingBeforeUngrouping:
         assert bridge.take_approval() is None
         assert "error" not in box
         assert _group(host, clips[0]) is None and _group(host, clips[1]) is None
+
+    def test_nothing_to_ungroup_is_refused_without_asking(self) -> None:
+        # 解く物が無いのに尋ねると、人の答えが無駄になる（CodeRabbit の指摘 #435）
+        host, lone = _with_lone_clip()
+        bridge = EditorBridge(host, auto_approve=True)
+        done, box = call_in_thread(bridge, self._ungroup(), {"clip_ids": [str(lone.id)]})
+        pump_until(bridge, done)
+        assert "解除する対象がありません" in str(box.get("error"))
+        assert bridge._questions.empty()
+
+    def test_a_clip_joining_the_group_while_asked_is_left_alone(self) -> None:
+        # 答える間に別のクリップが束へ足されたら、人が見て許した本数と違う束を解くことになる
+        # ID の集まりだけを比べると、足された 1 本に気付けない（CodeRabbit の指摘 #435）
+        host, lone = _with_lone_clip()
+        grouped = next(
+            c for t in host.document.project.timeline.tracks for c in t.clips if c.group_id
+        )
+        group = grouped.group_id
+        bridge = EditorBridge(host, auto_approve=True)
+        done, box = call_in_thread(bridge, self._ungroup(), {"clip_ids": [str(grouped.id)]})
+        question = _take(bridge, done)
+        project = host.document.project
+        tracks = tuple(
+            replace(
+                track,
+                clips=tuple(
+                    replace(clip, group_id=group) if clip.id == lone.id else clip
+                    for clip in track.clips
+                ),
+            )
+            for track in project.timeline.tracks
+        )
+        host.document.execute(
+            _Swap(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        )
+        question.reply(("解除する",))
+        pump_until(bridge, done)
+        assert "変わった" in str(box.get("error"))
+        assert _group(host, grouped) == _group(host, lone) == group
 
     def test_the_question_says_how_much_will_be_ungrouped(self) -> None:
         # 何を解くかが出ないと、思っていたより大きな束を解こうとしていても気付けない

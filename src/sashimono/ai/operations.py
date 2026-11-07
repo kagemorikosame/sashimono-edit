@@ -7709,8 +7709,15 @@ def _ungroup_question(host: EditorHost, arguments: dict[str, Any]) -> FirstAsk:
             groups.add(located[1].group_id)
         if located[1].link_group is not None:
             links.add(located[1].link_group)
+    if not groups and not links:
+        # 解く物が無いのに尋ねると、人は何かが解けると思って答え、その答えが無駄になる
+        raise ToolError(
+            "指定したクリップはグループにもリンクにも入っていないので、解除する対象がありません"
+        )
+    # 写しには ID だけでなく所属も入れる 答える間に別のクリップが束へ足されたり、
+    # 束の中の 1 本が別の束へ移ったりしても、ID の集まりだけでは気付けない（CodeRabbit の指摘 #435）
     members = frozenset(
-        clip.id
+        (clip.id, clip.group_id, clip.link_group)
         for track in timeline.tracks
         for clip in track.clips
         if clip.group_id in groups or clip.link_group in links
