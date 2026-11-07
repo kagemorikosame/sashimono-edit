@@ -68,6 +68,8 @@ def _ffmpeg(path: Path, arguments: str) -> Path:
         if not libx264_available():
             pytest.skip("ffmpeg に libx264 が無い")
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *arguments.split()]
+        # 引数は試験に書いた固定の文字列と一時フォルダのパスだけ shell は通さない
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         subprocess.run([*command, str(path)], check=True, capture_output=True)
     return path
 
