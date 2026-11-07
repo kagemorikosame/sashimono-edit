@@ -1082,6 +1082,13 @@ class SubtitlePanel(QWidget):
         if answer is None:
             return
         timing, only_selected = answer
+        # 窓を開いている間に起こしが終わって字幕が差し替わることがある 開く前の字幕で作ると、
+        # 消えた行を指して命令が断られる
+        media = self._current_media()
+        transcript = media.transcript_for(self._stream) if media is not None else None
+        if media is None or transcript is None or not transcript.segments:
+            self.status_message.emit("時刻を合わせる字幕がありません")
+            return
         loudness = None
         if timing.fit_to_voice:
             waveform = self._analyzer.waveform(media, self._stream)
@@ -1101,10 +1108,11 @@ class SubtitlePanel(QWidget):
         if command is None:
             self.status_message.emit("動かす字幕はありませんでした（もう声に合っています）")
             return
-        before = self._project
+        before = self._segments()
         self.commands_requested.emit([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
-        if self._project is before:
-            # 断られた 作品は変わっていないので、焼き込みの注意で断りの知らせを上書きしない
+        if self._segments() == before:
+            # 断られた 焼き込みの注意で断りの知らせを上書きしない 作品が同じものかでは決めない
+            # シーンを開いていると、断られても組み直した作品が渡ってくる
             return
         burned = burned_copies(
             self._project,

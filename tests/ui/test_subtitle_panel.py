@@ -895,12 +895,13 @@ class TestRetime:
         )
         return AddClip(track.id, clip).apply(with_track)
 
-    @pytest.mark.parametrize("accepted", [True, False])
+    @pytest.mark.parametrize("outcome", ["accepted", "refused", "rebuilt"])
     def test_the_burned_note_only_follows_a_change(
-        self, qt_application: QApplication, placed: Project, accepted: bool
+        self, qt_application: QApplication, placed: Project, outcome: str
     ) -> None:
         # 断られた命令の後に注意を出すと、断りの知らせを上書きし、合っていない時刻を合わせた
         # ように見せる（PR #434 の CodeRabbit の指摘）
+        # rebuilt はシーンを開いているときの断り 断られても組み直した作品が渡ってくる
         del qt_application
         project = self._with_burned_line(placed)
         widget = SubtitlePanel(project, StubAnalyzer(None))
@@ -908,11 +909,13 @@ class TestRetime:
         widget.status_message.connect(messages.append)
 
         def apply(commands: list[Command], _label: str) -> None:
-            if accepted:
+            if outcome == "accepted":
                 changed = widget._project
                 for command in commands:
                     changed = command.apply(changed)
                 widget.set_project(changed)
+            elif outcome == "rebuilt":
+                widget.set_project(replace(widget._project))
 
         widget.commands_requested.connect(apply)
         try:
@@ -927,7 +930,7 @@ class TestRetime:
                     "焼き込んだテキスト 1 個は元の時刻のままです 合わせた時刻で出すには、"
                     "テキストを消して焼き込み直してください"
                 ]
-                if accepted
+                if outcome == "accepted"
                 else []
             )
         finally:
