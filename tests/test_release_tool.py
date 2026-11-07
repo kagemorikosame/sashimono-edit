@@ -564,6 +564,8 @@ class TestTheSourcesCanBeReached:
         assert world.reached == 0
 
     def test_without_a_tag_it_looks_once(self, tool: ModuleType, world: World) -> None:
+        # 見ないままだと、上流が消えた入手先にタグを打ってから気付く 2 度見ると打つたびに
+        # 1 分ほど余計に待つ
         world.github.remote_tag = None
         world.answers = ["y", "n"]
         assert world.main(tool) == 0
