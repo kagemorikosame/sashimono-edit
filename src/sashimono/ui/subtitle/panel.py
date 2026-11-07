@@ -811,15 +811,13 @@ class SubtitlePanel(QWidget):
     ) -> str:
         """起こしを頼む AI からの依頼を受ける入口 走っている物があれば順番待ちに入る
 
+        ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
+        :meth:`transcription_status` で見る
         同じ素材の同じ音をすでに頼んでいれば断る（2 回起こしても同じ結果を 2 回取り込むだけ）
 
         ``words_only`` は語の時刻だけを今の字幕へ足す（#420） 文言と話者は変えない 起こし直すと
         語の時刻のためだけに人が直した字幕が消える
-        """
-        """起こしを始める AI からの依頼を受ける入口
-
-        ダイアログを開かずに走らせる 数分かかるので、終わったかどうかは
-        :meth:`transcription_status` で見る
+        ``timing`` は起こした行の時刻の合わせ方（#426） 省くと本人の設定（``self.timing``）に従う
         """
         media = self._project.find_media(media_id)
         if media is None:
