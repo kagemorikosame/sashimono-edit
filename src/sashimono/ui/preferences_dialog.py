@@ -72,6 +72,8 @@ from sashimono.engine.audio.voicevox import (
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
+    KEYFRAME_GAP_LIMIT,
+    MEASURED_KEYFRAME_SEEK_MS,
     MEASURED_ONE_LAYER_MS,
     MEASURED_PREFETCH_MS,
     MEASURED_THREE_LAYERS_MS,
@@ -173,6 +175,12 @@ PROXY_HEIGHTS: tuple[tuple[str, int], ...] = (
 #: 1080p の画面で 1080p の素材を置いた人が「画面と同じなのに下がらない」と迷う
 AUTO_QUALITY_TEXT = (
     f"高さが {AUTO_QUALITY_HEIGHT - 1} を超える素材があれば、プレビューの画質を下げる"
+)
+
+#: キーフレームの間隔が長い素材にも控えを作る項目の文言 線は控えの側の定数から作る
+#: 「録画」と書くのは、どんな素材が当たるのかを知らない人にも見当が付くように
+PROXY_LONG_GOP_TEXT = (
+    f"キーフレームが {float(KEYFRAME_GAP_LIMIT):g} 秒より長く空く素材（録画など）にも控えを作る"
 )
 
 #: 自動で落とすときの分母
@@ -312,6 +320,20 @@ class PreferencesDialog(QDialog):
             self._proxy_height.addItem(label, height)
         self._select(self._proxy_height, preferences.proxy_height)
         form.addRow("控えの大きさ", self._proxy_height)
+
+        self._proxy_long_gop = QCheckBox(PROXY_LONG_GOP_TEXT, self)
+        self._proxy_long_gop.setChecked(preferences.proxy_long_gop)
+        # 数は控えの側（sashimono.engine.cache.proxy）から取る 理由は下の説明の欄と同じ
+        short, long, longest, proxied = MEASURED_KEYFRAME_SEEK_MS
+        self._proxy_long_gop.setToolTip(
+            f"キーフレームが {float(KEYFRAME_GAP_LIMIT):g} 秒より長く空く素材"
+            "（録画ソフトの既定で撮った物など）は、1080p 以下でも控えを作る\n"
+            "飛ぶたびに遠くのキーフレームから読み直すので、再生位置を動かすと待たされる\n"
+            f"1080p で飛んで 1 コマ出すまでの実測: 2 秒間隔 {short}ms ／ 8 秒間隔 {long}ms ／"
+            f" 50 秒間隔 {longest}ms ／ 控え {proxied}ms\n"
+            "控えを作る間は CPU か GPU を使う 切ると作らず、作った控えも使わない"
+        )
+        form.addRow(self._proxy_long_gop)
 
         self._auto_quality = QCheckBox(AUTO_QUALITY_TEXT, self)
         self._auto_quality.setChecked(preferences.auto_quality)
@@ -1185,6 +1207,9 @@ class PreferencesDialog(QDialog):
         self._fit_to_screen(body)
 
         self._use_proxy.toggled.connect(self._proxy_height.setEnabled)
+        # 控えを切っていれば、どの素材にも作らない 選べても効かない項目は出さない
+        self._use_proxy.toggled.connect(self._proxy_long_gop.setEnabled)
+        self._proxy_long_gop.setEnabled(preferences.use_proxy)
         self._prefetch.toggled.connect(self._prefetch_budget.setEnabled)
         self._prefetch_budget.setEnabled(preferences.prefetch)
         self._prefetch.toggled.connect(self._prefetch_thread.setEnabled)
@@ -1231,6 +1256,7 @@ class PreferencesDialog(QDialog):
             self._given,
             use_proxy=self._use_proxy.isChecked(),
             proxy_height=int(self._proxy_height.currentData()),
+            proxy_long_gop=self._proxy_long_gop.isChecked(),
             auto_quality=self._auto_quality.isChecked(),
             auto_quality_divisor=int(self._auto_divisor.currentData()),
             prefetch=self._prefetch.isChecked(),

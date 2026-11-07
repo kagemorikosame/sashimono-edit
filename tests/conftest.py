@@ -495,6 +495,23 @@ def sample_long(media_dir: Path) -> SampleMedia:
 
 
 @pytest.fixture(scope="session")
+def sample_long_gop(media_dir: Path) -> SampleMedia:
+    """キーフレームが頭の 1 つだけの 6 秒の映像（10fps） 録画ソフトの長い間隔の代わり
+
+    本物の 1080p の録画を作ると試験が重い 控えを作るかは間隔だけで決まるので、
+    小さい絵で間隔だけを長くする 10fps にしたのはコマ数を減らして速く作るため
+    """
+    return make_sample(
+        media_dir,
+        "long_gop.mp4",
+        fps="10",
+        duration=6.0,
+        audio=False,
+        keyframe_interval=1000,
+    )
+
+
+@pytest.fixture(scope="session")
 def sample_ntsc(media_dir: Path) -> SampleMedia:
     """29.97fps の素材 分数フレームレートの扱いを確かめるため"""
     return make_sample(media_dir, "ntsc.mp4", fps="30000/1001", duration=2.0)
