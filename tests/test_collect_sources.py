@@ -132,6 +132,54 @@ class TestCollect:
             tool.download(_source(tool, f"{server}/archive", "0" * 64), tmp_path)
         assert list(tmp_path.iterdir()) == []
 
+    def test_a_copy_is_checked_against_what_was_recorded(
+        self, tool: ModuleType, server: str, tmp_path: Path
+    ) -> None:
+        """上流から消えて前のリリースの写しから落とす物は、前に記録した sha256 で照らす
+
+        照らさないと、写しが差し替えられても気付かずに配る 上流の公開値ではないので、
+        manifest に上流と照らしたとは書かない
+        """
+        recorded = hashlib.sha256(ARCHIVE).hexdigest()
+        copy = tool.Source(
+            "sample",
+            "1.0",
+            f"{server}/archive",
+            None,
+            "GPL-2.0-or-later",
+            "sample-1.0.tar.gz",
+            recorded_sha256=recorded,
+        )
+        entry = json.loads(tool.collect([copy], tmp_path).read_text(encoding="utf-8"))[0]
+        assert entry["sha256"] == recorded
+        assert entry["verified_against_upstream"] is False
+
+        # 前に落とした物も、記録した値と合えば落とし直さない
+        _Handler.requests.clear()
+        tool.download(copy, tmp_path)
+        assert _Handler.requests == []
+
+        wrong = tool.Source(
+            "sample",
+            "1.0",
+            f"{server}/archive",
+            None,
+            "GPL-2.0-or-later",
+            "other-1.0.tar.gz",
+            recorded_sha256="0" * 64,
+        )
+        with pytest.raises(RuntimeError, match="前のリリースに記録した値"):
+            tool.download(wrong, tmp_path)
+        assert not (tmp_path / "other-1.0.tar.gz").exists()
+
+    def test_the_pyav_ffmpeg_copy_carries_the_value_from_0_2_3(self, tool: ModuleType) -> None:
+        # 値が無いと、写しを照らさずに配る 0.2.3 の sources-SHA256SUMS.txt と同じ値
+        (pyav,) = [source for source in tool.SOURCES if source.name == "pyav-ffmpeg"]
+        assert pyav.sha256 is None
+        assert pyav.recorded_sha256 == (
+            "a3bd63dba5336ec47766f8e59ba065d16342002d922c2f96cfed9d1a9b6da6d8"
+        )
+
     def test_a_bot_page_is_not_taken_for_the_source(
         self, tool: ModuleType, server: str, tmp_path: Path
     ) -> None:

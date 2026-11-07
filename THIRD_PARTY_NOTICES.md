@@ -53,7 +53,7 @@ GPL の条件で配ります** Sashimono 本体の MIT は GPL と両立する�
 ### Python の包みの中の DLL
 
 PyAV の wheel（18.1.0）の DLL は、https://github.com/PyAV-Org/pyav-ffmpeg のタグ `8.1.2-1` が
-組み立てた物です（PyAV の `scripts/ffmpeg-8.1.json` がこのタグを指す） 版はそのタグの
+組み立てた物です（タグは 2026-11 に上流から消えました 中身は下の表の写しにあります）（PyAV の `scripts/ffmpeg-8.1.json` がこのタグを指す） 版はそのタグの
 `scripts/pkg.py` と、DLL に埋め込まれた版の表記から確かめました GCC 実行時ライブラリ・
 libiconv・winpthreads・zlib は、組み立てに使った MSYS2 の MinGW から写された物です
 
@@ -112,7 +112,7 @@ pip の後に次の所から落とし、決めた sha256 と大きさで照ら�
 | 部品 | 版 | 取得元 |
 |---|---|---|
 | FFmpeg | 8.1.2 | https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz |
-| pyav-ffmpeg（組み立ての手順と FFmpeg・LAME・libvpx への差分） | 8.1.2-1 | https://github.com/PyAV-Org/pyav-ffmpeg/archive/refs/tags/8.1.2-1.tar.gz |
+| pyav-ffmpeg（組み立ての手順と FFmpeg・LAME・libvpx への差分） | 8.1.2-1 | https://github.com/kagemorikosame/sashimono-edit/releases/download/v0.2.3/pyav-ffmpeg-8.1.2-1.tar.gz（上流が 2026-11 にタグを消したので、0.2.3 のリリースに添付した写し） |
 | x264 | b35605ace3ddf7c1a5d67a2eb553f034aef41d55 | https://github.com/mirror/x264/archive/b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz |
 | x265 | 4.2 | https://bitbucket.org/multicoreware/x265_git/downloads/x265_4.2.tar.gz |
 | LAME | 3.100 | https://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz |

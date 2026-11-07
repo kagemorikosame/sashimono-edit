@@ -57,6 +57,9 @@ FFMPEG_DLLS = (
 _SHIBOKEN_VERSION = re.compile(rb"__version_info__\0+(\d+\.\d+\.\d+)\0")
 #: Qt の置き場は major.minor のフォルダの下にある 版から作り、上げたときの直し忘れを防ぐ
 _QT_SERIES = ".".join(QT_VERSION.split(".")[:2])
+#: 前のリリースに添付した写しの置き場 上流から消えた物はここから落とす
+_OWN_RELEASES = "https://github.com/kagemorikosame/sashimono-edit/releases/download"
+
 _QT = f"https://download.qt.io/official_releases/qt/{_QT_SERIES}/{QT_VERSION}/submodules"
 
 
@@ -74,6 +77,15 @@ class Source:
     filename: str
     #: Qt のモジュール名 zip に積んだ Qt のファイルがこのモジュールの物のときだけ添付する
     qt_module: str | None = None
+    #: 前のリリースの ``sources-SHA256SUMS.txt`` に記録した sha256 上流から消えて写しから落とす物に
+    #: 付ける 照合はするが上流の公開値ではないので、manifest の
+    #: ``verified_against_upstream`` は偽のまま
+    recorded_sha256: str | None = None
+
+    @property
+    def expected_sha256(self) -> str | None:
+        """照らす sha256 上流の公開値が無ければ、前に記録した値"""
+        return self.sha256 or self.recorded_sha256
 
 
 #: Qt のモジュール ソースは 1 モジュール 1 アーカイブで配られる
@@ -145,12 +157,17 @@ SOURCES: tuple[Source, ...] = (
     Source(
         "pyav-ffmpeg",
         "8.1.2-1",
-        "https://github.com/PyAV-Org/pyav-ffmpeg/archive/refs/tags/8.1.2-1.tar.gz",
+        # 上流（github.com/PyAV-Org/pyav-ffmpeg）は 2026-11 に 8.1.2-1 のタグとリリースを消した
+        # 0.2.3 のリリースに添付した写しから落とす 中身は 0.2.3 のときに上流から落とした物と
+        # 同じ（sha256 は 0.2.3 の sources-SHA256SUMS.txt の値と照らした）
+        f"{_OWN_RELEASES}/v0.2.3/pyav-ffmpeg-8.1.2-1.tar.gz",
         # 組み立ての手順と FFmpeg・LAME・libvpx へ当てた差分 ソースと一緒に渡さないと、
         # 積んだ DLL と同じ物を組み立て直せない
         None,
         "BSD-3-Clause（組み立ての手順と差分）",
         "pyav-ffmpeg-8.1.2-1.tar.gz",
+        # 写しが差し替えられていないかを、0.2.3 の sources-SHA256SUMS.txt の値で照らす
+        recorded_sha256="a3bd63dba5336ec47766f8e59ba065d16342002d922c2f96cfed9d1a9b6da6d8",
     ),
     Source(
         "x264",
@@ -401,10 +418,11 @@ def download(
     target = folder / source.filename
     if target.exists():
         existing = _sha256(target)
-        if source.sha256 is not None and existing == source.sha256:
+        expected = source.expected_sha256
+        if expected is not None and existing == expected:
             return existing
         if (
-            source.sha256 is None
+            expected is None
             and previous is not None
             and previous.get("url") == source.url
             and previous.get("version") == source.version
@@ -425,6 +443,11 @@ def download(
         if source.sha256 is not None and actual != source.sha256:
             raise RuntimeError(
                 f"{source.name}: sha256 が上流の公開値と合わない（{actual} / {source.sha256}）"
+            )
+        if source.recorded_sha256 is not None and actual != source.recorded_sha256:
+            raise RuntimeError(
+                f"{source.name}: sha256 が前のリリースに記録した値と合わない"
+                f"（{actual} / {source.recorded_sha256}）"
             )
         # 書き終えて照合してから名前を付ける 途中で止まった物を完成品と取り違えない
         partial.replace(target)

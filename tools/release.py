@@ -400,6 +400,15 @@ class Release:
     smoke: Callable[[Path, Path], int] = smoke_test
     launch: Callable[[Path], int] = launch_app
     collect: Callable[[Path], int] = field(default=lambda dist: collect_sources.main([], dist=dist))
+    #: ソースの入手先に届かない物を返す（中身は落とさない） 試験では差し替える
+    #: 見るのは Qt のモジュール以外の物 Qt のどのモジュールを積むかは組み立てるまで分からず、
+    #: 一覧の全部を見ると、積まないモジュールの置き場の都合で止まる Qt は公式の置き場が古い版も
+    #: 残すので、積んだ分は 5 で落とせば足りる
+    reach: Callable[[], list[str]] = field(
+        default=lambda: collect_sources.check_urls(
+            source for source in collect_sources.SOURCES if source.qt_module is None
+        )
+    )
     #: Defender の検出の記録を読む（読むだけ） 試験では差し替える
     detections: Callable[[], list[dict[str, Any]]] = read_detections
     #: 試しに見た（--dry-run）ときの、済んでいない前提
@@ -519,6 +528,22 @@ class Release:
             else:
                 print(f"鍵: {key_label(index)}")
 
+    def check_sources_reachable(self) -> None:
+        """添付するソースの入手先に、今も届くか（タグを打つ直前だけ見る）
+
+        上流はタグやリリースを消すことがある（0.2.4 で pyav-ffmpeg の 8.1.2-1 が消えた）
+        見ずにタグを打つと、組み立てを待った後の 5 で初めて落ちて、公開が止まる
+        ここなら dry-run で気付け、``collect_sources.py`` の取得元を直してから打てる
+        見た後で消える物は防げない そのときは 5 で止まるので、取得元を直して打ち直す
+        （タグは main の歴史にあれば打ち直さずに続く）
+        """
+        for problem in self.reach():
+            # 置き場が一時的に応えないこともある（ffmpeg.org は手元の確かめで 1 度だけ落ちた）
+            self.problem(
+                f"{problem}（一時的なら打ち直す 消えていれば"
+                " tools/collect_sources.py の SOURCES の取得元を直す）"
+            )
+
     def remote_refs(self) -> dict[str, str]:
         """origin の main とタグ 取ってくる（fetch）と手元を書き換えるので、読むだけにする"""
         out = self.call(
@@ -607,6 +632,9 @@ class Release:
             self.check_tag_commit(pushed)
             self.done(f"{self.tag} は push 済み（{pushed[:7]}）")
             return
+        # 打つ直前に、読み直した origin のタグで決める 1 の段で見ると、その後でタグが消された
+        # ときに見ないまま打つ
+        self.check_sources_reachable()
         local = self.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{self.tag}^{{commit}}"])
         head = self.call("git", "rev-parse", "HEAD", what="手元の確かめ").strip()
         if local.returncode == 0 and local.stdout.strip() != head:

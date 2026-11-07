@@ -280,6 +280,9 @@ class World:
     launched: list[Path] = field(default_factory=list)
     collected: list[Path] = field(default_factory=list)
     fetched: list[str] = field(default_factory=list)
+    #: ソースの入手先の確かめで届かなかった物と、確かめた回数
+    unreachable: list[str] = field(default_factory=list)
+    reached: int = 0
     smoke_result: int = 0
     latest: bytes = b""
     passphrase: str = PASSPHRASE
@@ -326,6 +329,10 @@ class World:
             (folder / name).write_bytes(data)
         return 0
 
+    def reach(self) -> list[str]:
+        self.reached += 1
+        return list(self.unreachable)
+
     def fetch(self, url: str) -> bytes:
         self.fetched.append(url)
         return self.latest or self.github.files["update.json"]
@@ -344,6 +351,8 @@ class World:
             "smoke": self.smoke,
             "launch": self.launch,
             "collect": self.collect,
+            # 本物の入手先へは行かない
+            "reach": self.reach,
             # 本物の Defender の記録は読まない
             "detections": self.detections,
         }
@@ -518,6 +527,67 @@ class TestPrerequisites:
         world.answers = ["y", "y"]
         assert world.main(tool) == 1
         assert world.github.writes == []
+
+
+class TestTheSourcesCanBeReached:
+    def test_an_unreachable_source_stops_before_tagging(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """0.2.4 で上流の pyav-ffmpeg が消え、タグを打って組み立てを待った後の 5 で止まった
+
+        打つ前に止めないと、出せないタグが残り、直した後は組み立てを待ち直す
+        """
+        world.github.remote_tag = None
+        world.unreachable = ["届かない: pyav-ffmpeg https://example.invalid/8.1.2-1.tar.gz"]
+        assert world.main(tool) == 1
+        assert "届かない: pyav-ffmpeg" in capsys.readouterr().out
+        assert world.github.writes == []
+
+    def test_a_dry_run_names_the_unreachable_source(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # dry-run で見えないと、本番を打つまで気付けない
+        world.github.remote_tag = None
+        world.unreachable = ["届かない: pyav-ffmpeg https://example.invalid/8.1.2-1.tar.gz"]
+        assert world.main(tool, "--dry-run") == 1
+        out = capsys.readouterr().out
+        assert "[NG] 届かない: pyav-ffmpeg" in out
+        assert "SOURCES の取得元を直す" in out
+        assert world.github.writes == []
+
+    def test_after_the_tag_it_does_not_look_again(self, tool: ModuleType, world: World) -> None:
+        # タグの後は 5 が実際に落とす 入手先を見に行くと、ソースを上げ終えた後の
+        # 公開まで、上流の都合で止まる
+        world.unreachable = ["届かない: pyav-ffmpeg https://example.invalid/8.1.2-1.tar.gz"]
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert world.reached == 0
+
+    def test_qt_modules_are_left_to_the_sources_step(
+        self, tool: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Qt はどのモジュールを積むかが組み立てるまで分からない 全部を見ると、積まない
+        # モジュールの置き場の都合で、出せる版のタグを打てなくなる
+        seen: list[str] = []
+
+        def check(sources: Any) -> list[str]:
+            seen.extend(source.name for source in sources)
+            return []
+
+        monkeypatch.setattr(tool.collect_sources, "check_urls", check)
+        assert tool.Release(version=VERSION).reach() == []
+        assert "pyav-ffmpeg" in seen and "FFmpeg" in seen
+        # PySide6 はどの組み立てにも積むので見る
+        assert "PySide6 / shiboken6" in seen
+        assert not any(name.startswith("Qt ") for name in seen)
+
+    def test_without_a_tag_it_looks_once(self, tool: ModuleType, world: World) -> None:
+        # 見ないままだと、上流が消えた入手先にタグを打ってから気付く 2 度見ると打つたびに
+        # 1 分ほど余計に待つ
+        world.github.remote_tag = None
+        world.answers = ["y", "n"]
+        assert world.main(tool) == 0
+        assert world.reached == 1
 
 
 class TestTheTag:
