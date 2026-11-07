@@ -1101,7 +1101,11 @@ class SubtitlePanel(QWidget):
         if command is None:
             self.status_message.emit("動かす字幕はありませんでした（もう声に合っています）")
             return
+        before = self._project
         self.commands_requested.emit([command], f"字幕の時刻を合わせる: {len(command.times)} 行")
+        if self._project is before:
+            # 断られた 作品は変わっていないので、焼き込みの注意で断りの知らせを上書きしない
+            return
         burned = burned_copies(
             self._project,
             media.id,

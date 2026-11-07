@@ -881,3 +881,54 @@ class TestRetime:
             assert [(float(s), float(e)) for _, s, e in command.times] == [(3.7, 6.0)]
         finally:
             widget.deleteLater()
+
+    def _with_burned_line(self, placed: Project) -> Project:
+        media = placed.media[0]
+        transcript = media.transcript_for(None)
+        assert transcript is not None
+        origin = SubtitleOrigin(media.id, media.transcript_stream(None), transcript.segments[0].id)
+        clip = Clip(timeline_start=30, duration=60, source=TEXT.create(text="今日は"))
+        clip = replace(clip, subtitle_origin=origin)
+        track = Track(kind=TrackKind.VIDEO, name="字幕")
+        with_track = placed.with_timeline(
+            replace(placed.timeline, tracks=(*placed.timeline.tracks, track))
+        )
+        return AddClip(track.id, clip).apply(with_track)
+
+    @pytest.mark.parametrize("accepted", [True, False])
+    def test_the_burned_note_only_follows_a_change(
+        self, qt_application: QApplication, placed: Project, accepted: bool
+    ) -> None:
+        # 断られた命令の後に注意を出すと、断りの知らせを上書きし、合っていない時刻を合わせた
+        # ように見せる（PR #434 の CodeRabbit の指摘）
+        del qt_application
+        project = self._with_burned_line(placed)
+        widget = SubtitlePanel(project, StubAnalyzer(None))
+        messages: list[str] = []
+        widget.status_message.connect(messages.append)
+
+        def apply(commands: list[Command], _label: str) -> None:
+            if accepted:
+                changed = widget._project
+                for command in commands:
+                    changed = command.apply(changed)
+                widget.set_project(changed)
+
+        widget.commands_requested.connect(apply)
+        try:
+            widget.ask_retime = lambda selected: (
+                SubtitleTiming(fit_to_voice=False, end_offset_ms=200),
+                False,
+            )
+            widget.retime()
+            noted = [m for m in messages if "焼き込んだテキスト" in m]
+            assert noted == (
+                [
+                    "焼き込んだテキスト 1 個は元の時刻のままです 合わせた時刻で出すには、"
+                    "テキストを消して焼き込み直してください"
+                ]
+                if accepted
+                else []
+            )
+        finally:
+            widget.deleteLater()

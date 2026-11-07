@@ -134,6 +134,15 @@ class TestFitToVoice:
 
 
 class TestLoudness:
+    def test_long_sound_reads_the_same_in_pieces(self) -> None:
+        # 塊ごとに読む所で継ぎ目を取り違えると、60 秒ごとに音の大きさがずれ、その近くの行が
+        # 別の所へ寄る
+        samples = np.random.default_rng(1).uniform(-0.5, 0.5, 130 * RATE).astype(np.float32)
+        hop = RATE // 100
+        whole = np.abs(samples).reshape(-1, hop).max(axis=1)
+        expected = 20.0 * np.log10(np.maximum(whole, 1e-6))
+        assert np.array_equal(loudness_of_samples(samples, RATE), expected.astype(np.float32))
+
     def test_the_waveform_reads_like_the_samples(self, tmp_path: Path) -> None:
         # 起こした直後（読んだ音）と後から合わせ直す（解析した波形）で寄せる先が違うと、同じ字幕が
         # 合わせ直すたびに動く

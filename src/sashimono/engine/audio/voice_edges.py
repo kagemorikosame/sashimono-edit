@@ -61,6 +61,8 @@ _REFERENCE_PERCENTILE = 90.0
 _NEARLY_SILENT_DB = -55.0
 #: これより短い山は声と読まない（コマ数） 机を叩いたような一瞬の音で頭を早めない
 _HOLD_STEPS = 3
+#: 音の大きさを作るときに 1 度に読むコマ数（60 秒分） 一時の配列を小さく保つ
+_LOUDNESS_CHUNK_STEPS = 6000
 #: これより短い谷は声の続きと読む（コマ数 0.12 秒） 語の間の息継ぎで文の終わりを早めない
 _GAP_STEPS = 12
 
@@ -71,8 +73,14 @@ def loudness_of_samples(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     count = len(samples) // hop
     if count <= 0:
         return np.zeros(0, dtype=np.float32)
-    frames = np.abs(np.asarray(samples[: count * hop], dtype=np.float32)).reshape(count, hop)
-    return np.asarray(20.0 * np.log10(np.maximum(frames.max(axis=1), 1e-6)), dtype=np.float32)
+    peaks = np.empty(count, dtype=np.float32)
+    # 塊ごとに絶対値を取る 全長で取ると、起こした音（1 時間で 230MB）と同じ長さの配列がもう
+    # 1 つ並ぶ（音を読む所が避けているのと同じ形）
+    for first in range(0, count, _LOUDNESS_CHUNK_STEPS):
+        last = min(count, first + _LOUDNESS_CHUNK_STEPS)
+        block = np.asarray(samples[first * hop : last * hop], dtype=np.float32)
+        peaks[first:last] = np.abs(block).reshape(last - first, hop).max(axis=1)
+    return np.asarray(20.0 * np.log10(np.maximum(peaks, 1e-6)), dtype=np.float32)
 
 
 def loudness_of_waveform(waveform: Waveform) -> np.ndarray:
