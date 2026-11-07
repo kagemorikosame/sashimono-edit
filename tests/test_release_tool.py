@@ -563,6 +563,24 @@ class TestTheSourcesCanBeReached:
         assert world.main(tool) == 0
         assert world.reached == 0
 
+    def test_qt_modules_are_left_to_the_sources_step(
+        self, tool: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Qt はどのモジュールを積むかが組み立てるまで分からない 全部を見ると、積まない
+        # モジュールの置き場の都合で、出せる版のタグを打てなくなる
+        seen: list[str] = []
+
+        def check(sources: Any) -> list[str]:
+            seen.extend(source.name for source in sources)
+            return []
+
+        monkeypatch.setattr(tool.collect_sources, "check_urls", check)
+        assert tool.Release(version=VERSION).reach() == []
+        assert "pyav-ffmpeg" in seen and "FFmpeg" in seen
+        # PySide6 はどの組み立てにも積むので見る
+        assert "PySide6 / shiboken6" in seen
+        assert not any(name.startswith("Qt ") for name in seen)
+
     def test_without_a_tag_it_looks_once(self, tool: ModuleType, world: World) -> None:
         # 見ないままだと、上流が消えた入手先にタグを打ってから気付く 2 度見ると打つたびに
         # 1 分ほど余計に待つ
