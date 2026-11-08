@@ -29,6 +29,7 @@ from sashimono.ai.outbound import (
     frame_sample,
     from_arguments,
     from_result,
+    masked_value,
     sendable_now,
     text_sample,
 )
@@ -376,6 +377,41 @@ class TestFromTheReview:
         log = SendLog(SendLogStore(path))
         assert log.entries() == []
         assert "古い" not in path.read_text(encoding="utf-8")
+
+    def test_text_in_a_typed_field_is_logged(self, host: FakeHost) -> None:
+        # 壊れると、クリップの値（欄の名前は text とは限らない）に入った本文を許して送っても、
+        # 記録と最後に送った物に出ない（CodeRabbit の指摘 #450）
+        valued = Operation(
+            name="valued",
+            description="",
+            schema={},
+            handler=lambda _host, _arguments: {
+                "params": {"caption": masked_value("値に入った本文", frozenset({Outbound.TEXT}))}
+            },
+            sends=frozenset({Outbound.PROJECT, Outbound.TEXT}),
+            hidden=frozenset({Outbound.TEXT}),
+        )
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.ALLOW})
+        done, box = call_in_thread(bridge, valued, {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert box.get("result") == {"params": {"caption": "値に入った本文"}}
+        assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("値に入った本文",)
+
+    def test_closing_the_window_does_not_run_the_check(self, host: FakeHost) -> None:
+        # 壊れると、確かめの窓を閉じただけで検査が頼まれ、直しの回数と区切り（#339）が進む
+        bridge = EditorBridge(host)
+        checks_when_asked: list[int] = []
+
+        def close(_request: SendRequest) -> None:
+            checks_when_asked.append(len(host.check_requests))
+
+        arguments = {"checks": ["text_overflow"], "wait_seconds": 0}
+        seen, box = _run(bridge, "check_output", close, arguments)
+        assert len(seen) == 1
+        assert checks_when_asked == [0]
+        assert host.check_requests == []
+        assert isinstance(box.get("error"), ToolError)
 
 
 class TestEachCall:

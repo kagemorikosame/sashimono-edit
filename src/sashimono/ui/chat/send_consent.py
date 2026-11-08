@@ -41,6 +41,7 @@ from sashimono.ai.outbound import (
     SendRequest,
     clip_line,
 )
+from sashimono.ui.flow_layout import FlowLayout
 
 __all__ = [
     "SEND_ALWAYS_TEXT",
@@ -159,8 +160,6 @@ class SendConsentDialog(QDialog):
         self._request = request
         self.answer: SendAnswer | None = None
         self.setWindowTitle("AI へ送る物の確かめ")
-        # 説明の文が細く折れて縦に伸びると、詳細を開いたときに画面に収まらない
-        self.setMinimumWidth(MINIMUM_WIDTH)
         outer = QVBoxLayout(self)
         self._outer = outer
         # ボタンのほかは全部を 1 つの巻物に入れる 大きな字や長い見出し、開いた詳細で中身が
@@ -202,8 +201,9 @@ class SendConsentDialog(QDialog):
         self._scroller.setWidgetResizable(True)
         self._scroller.setFrameShape(QScrollArea.Shape.NoFrame)
         outer.addWidget(self._scroller)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
+        # 狭い画面ではボタンを折り返す 横に並べたままだと、窓が画面より広くなり端のボタンを押せない
+        self._buttons = QWidget(self)
+        buttons = FlowLayout(self._buttons)
         self.always = QPushButton(SEND_ALWAYS_TEXT, self)
         self.once = QPushButton(SEND_THIS_TIME_TEXT if request.each_call else SEND_ONCE_TEXT, self)
         self.deny = QPushButton(SEND_DENY_TEXT, self)
@@ -214,10 +214,11 @@ class SendConsentDialog(QDialog):
         ):
             button.setAutoDefault(False)
             button.clicked.connect(lambda _checked=False, chosen=answer: self._choose(chosen))
+            button.setParent(self._buttons)
             buttons.addWidget(button)
         self.deny.setDefault(True)
         self.deny.setFocus()
-        outer.addLayout(buttons)
+        outer.addWidget(self._buttons)
         self._fit_to_screen()
 
     def _choose(self, answer: SendAnswer) -> None:
@@ -243,19 +244,29 @@ class SendConsentDialog(QDialog):
         return details
 
     def _fit_to_screen(self) -> None:
-        """中身の大きさで開く ただし画面に収める（残りは巻物で読む ボタンは巻物の外）"""
+        """中身の大きさで開く ただし画面に収める（残りは巻物で読む ボタンは巻物の外）
+
+        幅は :data:`MINIMUM_WIDTH` を目安にするが、画面より狭い所では画面に合わせる
+        説明の文が細く折れて縦に伸びるのは巻物で読めるが、画面からはみ出した所は押せない
+        """
         wanted = self._body.sizeHint()
         bar = self._scroller.verticalScrollBar().sizeHint().width()
         margins = self._outer.contentsMargins()
-        extra = margins.top() + margins.bottom()
-        buttons = self.deny.sizeHint().height() + extra + 16
+        extra = margins.top() + margins.bottom() + margins.left() + margins.right()
         width = max(MINIMUM_WIDTH, wanted.width() + bar + 24)
-        height = wanted.height() + buttons + 8
+        height_limit: int | None = None
         screen = self.screen()
         if screen is not None:
             available = screen.availableGeometry()
             width = min(width, int(available.width() * 0.9))
-            height = min(height, int(available.height() * SCREEN_SHARE))
+            height_limit = int(available.height() * SCREEN_SHARE)
+        self.setMinimumWidth(min(MINIMUM_WIDTH, width))
+        inner = max(1, width - extra)
+        flow = self._buttons.layout()
+        buttons = flow.heightForWidth(inner) if flow is not None else 0
+        height = wanted.height() + buttons + extra + 16
+        if height_limit is not None:
+            height = min(height, height_limit)
         self.resize(width, height)
 
 

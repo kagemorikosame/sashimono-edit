@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QApplication,
@@ -401,6 +401,32 @@ class TestPreviewInTheWindow:
                 shown = dialog.details.findChild(QPlainTextEdit) if dialog.details else None
                 assert shown is not None
                 assert "ほか 4800 件" in shown.toPlainText()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def test_a_narrow_screen_wraps_the_buttons(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、幅の狭い画面で窓が画面より広くなり、端のボタンを押せない
+        # （CodeRabbit の指摘 #450）
+        del qt_application
+        request = SendRequest(tool="preview_frame", kinds=(Outbound.FRAMES,))
+        dialog = SendConsentDialog(request)
+        try:
+            screen = dialog.screen()
+            assert screen is not None
+            real = screen.availableGeometry()
+            narrow = QRect(real.x(), real.y(), 360, real.height())
+            monkeypatch.setattr(type(screen), "availableGeometry", lambda _self: narrow)
+            dialog._fit_to_screen()
+            dialog.show()
+            QApplication.processEvents()
+            assert dialog.width() <= narrow.width()
+            for button in (dialog.always, dialog.once, dialog.deny):
+                assert button.isVisible()
+                corner = button.mapTo(dialog, button.rect().bottomRight())
+                assert dialog.rect().contains(corner), button.text()
         finally:
             dialog.close()
             dialog.deleteLater()

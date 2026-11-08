@@ -307,9 +307,13 @@ def _all_texts(value: Any) -> Iterator[str]:
             yield from _all_texts(entry)
 
 
-def text_sample(value: Any, keys: frozenset[str]) -> Sample:
-    """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行"""
-    lines = [line for text in _texts_under(value, keys) for line in text.splitlines() if line]
+def text_sample(value: Any, keys: frozenset[str], fields: Iterable[str] = ()) -> Sample:
+    """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行
+
+    ``fields`` は文字の欄から伏せずに載せた値（:func:`sending` の ``passed``）
+    """
+    texts = [*_texts_under(value, keys), *fields]
+    lines = [line for text in texts for line in text.splitlines() if line]
     return Sample(
         Outbound.TEXT,
         count=len(lines),
@@ -408,13 +412,18 @@ def build_samples(
     *,
     pairs: Iterable[tuple[str, str]] = (),
     name_keys: Iterable[str] = (),
+    fields: Iterable[str] = (),
 ) -> tuple[Sample, ...]:
-    """送る物の種類ごとの下見 ``value`` は道具の結果か引数（``preview.source`` で決まる）"""
+    """送る物の種類ごとの下見 ``value`` は道具の結果か引数（``preview.source`` で決まる）
+
+    ``fields`` は文字の欄から伏せずに載せた値（:func:`text_sample`）
+    """
+    texts = list(fields)
     table = list(pairs)
     samples: list[Sample] = []
     for kind in kinds:
         if kind is Outbound.TEXT:
-            sample = text_sample(value, preview.text_keys)
+            sample = text_sample(value, preview.text_keys, texts)
         elif kind is Outbound.FRAMES:
             sample = frame_sample(value)
         elif kind is Outbound.FILES:
@@ -649,13 +658,23 @@ UNKNOWN_FIELD_SENDS = frozenset({Outbound.TEXT, Outbound.FILES})
 _SENDABLE: ContextVar[frozenset[Outbound] | None] = ContextVar("sendable", default=None)
 
 
+#: 型の付いた欄（:func:`masked_value`）が伏せずに通した字幕と文字 送った物の下見と記録に数える
+#: 欄の名前は道具ごと・エフェクトごとに違い（``text`` とは限らない）、名前では拾えないため
+_PASSED_TEXT: ContextVar[list[str] | None] = ContextVar("passed_text", default=None)
+
+
 @contextmanager
-def sending(kinds: frozenset[Outbound]) -> Iterator[None]:
-    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）"""
+def sending(kinds: frozenset[Outbound], passed: list[str] | None = None) -> Iterator[None]:
+    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）
+
+    ``passed`` を渡すと、文字の欄から伏せずに載せた値をそこへ足す
+    """
     token = _SENDABLE.set(kinds)
+    passed_token = _PASSED_TEXT.set(passed)
     try:
         yield
     finally:
+        _PASSED_TEXT.reset(passed_token)
         _SENDABLE.reset(token)
 
 
@@ -689,6 +708,9 @@ def masked_value(value: Any, needs: frozenset[Outbound]) -> Any:
         return value
     allowed = _SENDABLE.get()
     if allowed is None or needs <= allowed:
+        passed = _PASSED_TEXT.get()
+        if passed is not None and Outbound.TEXT in needs:
+            passed.append(value)
         return value
     return TEXT_MARK if Outbound.TEXT in needs - allowed else PATH_MARK
 
