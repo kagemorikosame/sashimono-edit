@@ -276,6 +276,7 @@ from sashimono.ui.workspace import (
     ShortcutStore,
     Workspace,
     apply_dock_tabs,
+    apply_switch_interval,
 )
 
 if TYPE_CHECKING:
@@ -544,6 +545,7 @@ class MainWindow(QMainWindow):
         #: 画面の止まりの見張り（#442 の 0 番） 設定か環境変数で入れたときだけ動く
         self._stall_monitor = StallMonitor(self)
         self._apply_stall_watch(self._preferences)
+        apply_switch_interval(self._preferences)
         self._analysis_dirty = False
         #: 解析ができた素材 次の間隔でタイムラインの細い帯の目安を求め直させる
         #: ワーカースレッドが足し、画面のスレッドが取り出すので錠で守る（``_proxied`` と同じ）
@@ -1219,6 +1221,7 @@ class MainWindow(QMainWindow):
         self._preview.set_prefetch_thread(preferences.prefetch_thread)
         self._preview.set_prefetch_yield(preferences.prefetch_yield)
         self._apply_stall_watch(preferences)
+        apply_switch_interval(preferences)
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
         self._preview.set_keyframe_drag(preferences.keyframe_drag)

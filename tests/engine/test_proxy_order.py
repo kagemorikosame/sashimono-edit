@@ -164,13 +164,19 @@ class TestStatusText:
         clock = Clock()
         proxy = JobBoard(clock=clock)
         proxy.start("a", MediaId("a"), weight=60.0)
-        proxy.start("b", MediaId("b"), weight=600.0)
+        proxy.start("b", MediaId("b"), weight=300.0)
+        proxy.start("c", MediaId("c"), weight=300.0)
         proxy.report("a", 0.0)
         clock.now = 30.0
         proxy.finish("a")
         text = describe_background(proxy.poll(), JobBoard().poll())
-        assert "残り 1 本" in text
-        assert "およそ 5 分" in text
+        assert text == "控え 1/3 本 33%（残り 2 本 およそ 5 分）"
+
+    def test_a_single_proxy_does_not_repeat_the_count(self) -> None:
+        """1 本だけなら「0/1 本」と並べて「残り 1 本」とは書かない"""
+        proxy = JobBoard()
+        proxy.start("a", MediaId("a"), weight=60.0)
+        assert describe_background(proxy.poll(), JobBoard().poll()) == "控え 0/1 本 0%"
 
     @pytest.mark.parametrize(
         ("seconds", "expected"),

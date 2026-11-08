@@ -579,9 +579,7 @@ class TestParkedPanels:
         assert _body(panel) is body
         assert _opacity(panel) == pytest.approx(0.9)
 
-    def test_going_back_and_forth_between_layouts_reuses_both(
-        self, panel: InspectorPanel
-    ) -> None:
+    def test_going_back_and_forth_between_layouts_reuses_both(self, panel: InspectorPanel) -> None:
         """壊れると、文字と映像のように構成の違うクリップを行き来するたびに組み直す"""
         project = _texts(("blur",), (), ("blur",))
         first, second, third = _clips(project)

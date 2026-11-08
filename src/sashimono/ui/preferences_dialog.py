@@ -127,6 +127,7 @@ from sashimono.ui.workspace import (
     DOCK_TABS_TOP,
     INSERT_ALL_TRACKS,
     INSERT_TARGET_TRACKS,
+    MEASURED_SWITCH,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
     PROXY_UNUSED_LATER,
@@ -352,7 +353,8 @@ class PreferencesDialog(QDialog):
         self._proxy_process.setToolTip(
             "控えをアプリの中のスレッドで作ると、画面や先読みと取り合って遅くなり、"
             "作っている間は操作も重くなる\n"
-            f"編集画面を動かしながら作った実測: スレッド {thread_speed:g} 倍速 ／ "
+            "画面を操作しながら、裏で先読みや解析が動いている所で作った実測: "
+            f"スレッド {thread_speed:g} 倍速 ／ "
             f"別のプロセス {process_speed:g} 倍速\n"
             "子のプロセスを起こせない機械では、入れたままでもスレッドで作る"
         )
@@ -423,6 +425,17 @@ class PreferencesDialog(QDialog):
             "切ると操作中も貯め続ける（操作の直後の再生で先読みが効くのが少し早い）"
         )
         form.addRow(self._prefetch_yield)
+
+        (slow_click, slow_proxy), (quick_click, quick_proxy) = MEASURED_SWITCH
+        self._responsive_switch = QCheckBox("裏の処理より画面の応答を優先する", self)
+        self._responsive_switch.setChecked(preferences.responsive_switch)
+        self._responsive_switch.setToolTip(
+            "アプリの中の裏の処理（先読み・解析）と画面が取り合うとき、画面へ早く順番を回す\n"
+            f"裏で Python が回り続けている間に 1 本選ぶ実測: {slow_click:g}ms → {quick_click:g}ms\n"
+            f"そのぶん裏の処理は遅くなる（同じ所でスレッドで作る控え: {slow_proxy:g} 倍速 → "
+            f"{quick_proxy:g} 倍速） 別のプロセスで作る控えには影響しない"
+        )
+        form.addRow(self._responsive_switch)
 
         self._pipeline_depth = QComboBox(self)
         for label, depth in PIPELINE_DEPTHS:
@@ -1350,6 +1363,7 @@ class PreferencesDialog(QDialog):
             prefetch_budget_mb=int(self._prefetch_budget.currentData()),
             prefetch_thread=self._prefetch_thread.isChecked(),
             prefetch_yield=self._prefetch_yield.isChecked(),
+            responsive_switch=self._responsive_switch.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_gpu_color=self._export_gpu_color.isChecked(),
             export_chapters=self._export_chapters.isChecked(),

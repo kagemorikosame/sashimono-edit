@@ -91,9 +91,7 @@ def _tall(path: Path) -> MediaItem:
 class TestProxyInAnotherProcess:
     def test_the_proxy_is_made_by_a_child(self, tmp_path: Path, sample_av: SampleMedia) -> None:
         """壊れると、設定で別のプロセスを選んでも控えができない"""
-        builder = ProxyBuilder(
-            ProxyStore(CacheStore(tmp_path), height=120), separate_process=True
-        )
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120), separate_process=True)
         media = _tall(sample_av.path)
         ready: list[MediaId] = []
         try:
@@ -115,9 +113,7 @@ class TestProxyInAnotherProcess:
             raise WorkerUnavailableError("起こせない")
 
         monkeypatch.setattr(proxy_module, "run_in_process", refuse)
-        builder = ProxyBuilder(
-            ProxyStore(CacheStore(tmp_path), height=120), separate_process=True
-        )
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120), separate_process=True)
         media = _tall(sample_av.path)
         done = threading.Event()
         try:
@@ -139,9 +135,7 @@ class TestProxyInAnotherProcess:
 
         monkeypatch.setattr(proxy_module, "run_in_process", crash)
         monkeypatch.setattr(proxy_module, "create_proxy", lambda *a, **k: called.append(a))
-        builder = ProxyBuilder(
-            ProxyStore(CacheStore(tmp_path), height=120), separate_process=True
-        )
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120), separate_process=True)
         media = _tall(sample_av.path)
         try:
             builder.request(media)

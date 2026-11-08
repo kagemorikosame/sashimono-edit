@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,7 @@ __all__ = [
     "LAYOUT_VERSION",
     "LIMIT_ACTIONS",
     "MAX_PREFETCH_MB",
+    "MEASURED_SWITCH",
     "MEDIA_SPLIT",
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
@@ -133,6 +135,7 @@ __all__ = [
     "PROXY_UNUSED_LATER",
     "PROXY_UNUSED_MODES",
     "PROXY_UNUSED_ON_USE",
+    "RESPONSIVE_SWITCH_S",
     "SCENES_ALWAYS",
     "SCENES_ON_DEMAND",
     "SCENES_WITH_AI",
@@ -150,6 +153,7 @@ __all__ = [
     "ShortcutStore",
     "Workspace",
     "apply_dock_tabs",
+    "apply_switch_interval",
     "config_root",
     "find_conflicts",
 ]
@@ -309,6 +313,17 @@ PROXY_UNUSED_LATER = "later"
 PROXY_UNUSED_ON_USE = "on_use"
 PROXY_UNUSED_MODES = (PROXY_UNUSED_LATER, PROXY_UNUSED_ON_USE)
 
+#: 画面の応答を優先するときの Python のスレッドの切り替えの間隔（秒）
+#: :attr:`Preferences.responsive_switch` の入り
+#: 切ったときは Python の既定（5ms）へ戻す
+RESPONSIVE_SWITCH_S = 0.001
+DEFAULT_SWITCH_S = 0.005
+
+#: ``tools/bench_contention.py --busy-thread`` の実測（2026-11-08 1080p60 60 秒 中央値）
+#: Python を回し続ける裏のスレッドがある間の、選ぶ操作 1 回（ms）と、アプリの中のスレッドで
+#: 作る控えの速さ（倍速） 切り替え 5ms のとき / 1ms のとき 設定の画面がここから文言を作る
+MEASURED_SWITCH = ((913.5, 0.3), (149.0, 1.4))
+
 #: 場面の解析に使うデコードのスレッドの数として選べる物 0 はすべて（PyAV に任せる）
 SCENE_THREAD_CHOICES = (1, 2, 4, 0)
 
@@ -392,6 +407,12 @@ class Preferences:
     #: クリック 1 回の応答が遅れることがある 止めている間は貯まらないので、操作のすぐ後に
     #: 再生すると先読みの効きが少し遅れる 操作中も貯め続けたい人は切れる
     prefetch_yield: bool = True
+    #: Python のスレッドの切り替えを細かくして、画面の応答を優先する（#442 C の 3 #440）
+    #: 既定は入 裏のスレッドが Python を動かしている間、画面のスレッドは切り替えのたびに最大で
+    #: 切り替えの間隔（Python の既定 5ms）待たされ、1 回の操作が数百 ms 止まることがある
+    #: 細かくすると、裏のスレッドの処理は切り替えの分だけ遅くなる（実測は
+    #: :data:`MEASURED_SWITCH`） 裏の処理を少しでも速く終えたい人は切れる
+    responsive_switch: bool = True
     #: 書き出しで、GPU の合成を書き込み（色変換・エンコード・mux）の何枚ぶん先へ進めるか
     #: 0 で直列（1 枚ずつ、スレッドを使わない）
     #: 既定は 2 1 枚ぶんは画面 1 枚の RGBA（1080p で 8MB、4K で 33MB）なので、
@@ -1031,6 +1052,17 @@ class Preferences:
         return self.auto_quality_divisor
 
 
+def apply_switch_interval(preferences: Preferences) -> None:
+    """Python のスレッドの切り替えの間隔を設定に合わせる（:data:`RESPONSIVE_SWITCH_S`）
+
+    プロセス全体に効く 控えの作成は別のプロセスなので影響を受けない 影響を受けるのは
+    アプリの中に残る裏のスレッド（先読み・解析）で、切り替えの分だけ遅くなる
+    """
+    sys.setswitchinterval(
+        RESPONSIVE_SWITCH_S if preferences.responsive_switch else DEFAULT_SWITCH_S
+    )
+
+
 class PreferenceStore:
     """:class:`Preferences` の読み書き
 
@@ -1073,6 +1105,7 @@ class PreferenceStore:
             prefetch_budget_mb=_budget(data.get("prefetch_budget_mb"), plain.prefetch_budget_mb),
             prefetch_thread=_flag(data.get("prefetch_thread"), plain.prefetch_thread),
             prefetch_yield=_flag(data.get("prefetch_yield"), plain.prefetch_yield),
+            responsive_switch=_flag(data.get("responsive_switch"), plain.responsive_switch),
             export_pipeline_depth=_depth(
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),

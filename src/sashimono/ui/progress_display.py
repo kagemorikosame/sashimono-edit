@@ -116,13 +116,12 @@ def describe_background(proxy: ProgressSnapshot, analysis: ProgressSnapshot) -> 
     if proxy.busy:
         # 残りの本数とおよその時間も添える（#441） 1 本ごとの割合だけでは、長い録画の控えを
         # 何本・いつまで待つのかが分からなかった
-        left = [f"残り {proxy.remaining} 本"]
+        # 残りが 1 本なら本数は書かない 「0/1 本」の隣に「残り 1 本」と並べても何も足さない
+        left = [f"残り {proxy.remaining} 本"] if proxy.remaining > 1 else []
         if proxy.remaining_seconds is not None:
             left.append(f"およそ {rough_duration(proxy.remaining_seconds)}")
-        parts.append(
-            f"控え {proxy.finished}/{proxy.total} 本 {round(proxy.fraction * 100)}%"
-            f"（{' '.join(left)}）"
-        )
+        text = f"控え {proxy.finished}/{proxy.total} 本 {round(proxy.fraction * 100)}%"
+        parts.append(f"{text}（{' '.join(left)}）" if left else text)
     if analysis.busy:
         # 解析は波形・サムネイル・場面の一覧（#321）を合わせて数える 前は「波形とサムネイル」と
         # 書いていたが、場面を調べている間もそう出ると、何に CPU を使っているのかを取り違える
