@@ -4341,6 +4341,7 @@ Discussions で確かめた報告（再現した不具合、取り掛かると�
   `sashimono.links.REPORT_URL`（Discussions のカテゴリを選ぶ画面）を指す
 - Issue の雛形は置かず、白紙の Issue も閉じてある（`.github/ISSUE_TEMPLATE/config.yml`）
   Issue を作る画面は Discussions の各カテゴリへの案内だけを出す 書き込み権限のある人は白紙で作れる
+  開発者が作るときは `docs/issue-templates/` の雛形と `tools\new_issue.py` を使う（下の「Issue の書き方」）
 - カテゴリの書き込み欄は `.github/DISCUSSION_TEMPLATE/<スラッグ>.yml` 受け付けるのは
   `body` `labels` `title` だけ（Issue の雛形の `name` `description` は書かない）
 
@@ -4359,6 +4360,85 @@ Discussions で確かめた報告（再現した不具合、取り掛かると�
 カテゴリを開いたときの URL（`/discussions/categories/<スラッグ>`）で確かめる 変えたら
 書き込み欄のファイルの名前、`config.yml` の行き先、`sashimono.links.DISCUSSION_CATEGORIES` を
 一緒に直す（`tests/test_help_links.py` が食い違いを落とす）
+
+### Issue の書き方（#376）
+
+Issue を書くのは人・AI・並行して動く別のエージェントと複数いる 書く人によって節が
+あったり無かったり、ラベルやロードマップへの登録が抜けたりしないよう、**開発者の Issue は
+雛形から `tools\new_issue.py` で作る** 白紙から `gh issue create` で作らない
+
+雛形は `docs/issue-templates/` に置く `.github/ISSUE_TEMPLATE/` には置かない
+（上の「報告の受け口」 置くと使う人が Discussions を通らずに Issue を作れてしまう
+`tests/test_new_issue_tool.py` が、そこに `config.yml` 以外が増えたら落とす）
+GitHub の Issue フォーム（`.yml`）を使わないのも同じ理由
+
+| 種類 | 雛形 | 既定の種類のラベル | 必須の節 |
+|---|---|---|---|
+| 新機能 | `feature.md` | `enhancement` | 一行の目的・今の状態・目標・確かめること |
+| 不具合 | `bug.md` | `bug` | 一行の目的・症状・再現の手順・確かめること |
+| 調査・親 | `investigation.md` | `enhancement` | 一行の目的・調べた結果・チェックリスト |
+
+必須でない節は、要らなければ空のまま残してよい 道具が送る前に外す（小さな不具合は
+必須の節だけで足りる 雛形を重くして書く人が手で作り始めると、そろえる意味が無くなる）
+雛形の中の `<!-- -->` の注意書きも送る前に外す 必須の印はこの注意書きの頭の「必須」で、
+道具はそれを読んで確かめる 雛形の節を変えるときは注意書きの印も一緒に直す
+
+```
+.venv\Scripts\python.exe tools\new_issue.py draft feature .work\issue.md
+.venv\Scripts\python.exe tools\new_issue.py create feature --title "題" --area 編集の土台 --size 中 --milestone 0.2.6 --body-file .work\issue.md --dry-run
+.venv\Scripts\python.exe tools\new_issue.py create feature --title "題" --area 編集の土台 --size 中 --milestone 0.2.6 --body-file .work\issue.md
+```
+
+`create` が一度に行うこと 1 つでも引っ掛かれば、何も作らずに止まる
+
+1. 必須の節がそろって埋まっているか 空の任意の節は外して知らせる
+2. 題と本文に句点が無いか Issue はリポジトリの外なので `tools\punctuation.py` の検査が届かない
+   `--fix` を付けると同じ決まりで直し、手元のファイルにも書き戻す
+3. ラベルを付ける（下の 4 種類）
+4. マイルストーンを付ける
+5. 公開のロードマップ（プロジェクト 3）に足し、Status を「未着手」、「大きさ」の欄をラベルに合わせる
+
+作った後のロードマップへの登録だけで止まったとき（`gh` に `project` の権限が無いなど）は、
+`gh auth refresh -s project` を打ってから `tools\new_issue.py register <番号>` でやり直す
+何度打っても項目は 1 つにしかならない
+
+#### ラベル
+
+| 種類 | ラベル | 付け方 |
+|---|---|---|
+| 種類 | `bug` `enhancement` `決めるだけ` | 必ず 1 つ 雛形の既定と違うときは `--type` |
+| 分野 | `編集の土台` `配る準備` `互換: AviUtl` `互換: YMM4` | 必ず決める どれにも当たらない（開発の段取りなど）ときは `--area なし` |
+| 大きさ | `小`（半日） `中`（PR 1 本ぶん） `大`（PR 1 本では収まらない） | 必ず 1 つ |
+| 状態 | `材料待ち` `本人の手が要る` | 当たるときだけ `--state`（重ねてよい） |
+
+分野と大きさを省けないようにしてあるのは、急いでいる人や AI が付け忘れたまま作るため
+`なし` を選ぶのは手間だが、付け忘れと「当たらない」を見分けられる
+
+#### マイルストーンとロードマップ
+
+- マイルストーンは必ず付ける 次に出す版に入れる物はその版、決まっていない物は
+  その次の版（あとで動かせる） 付けないと、版ごとの板の見え方から漏れる
+- ロードマップの Status は、作ると「未着手」 着手したら「作業中」、PR を出したら
+  「レビュー中」、マージしたら「完了」へ動かす（道具が受け持つのは「未着手」まで）
+- ロードマップに載せるのは Issue だけで、PR は載せない
+
+#### 親と子に分ける
+
+大きさが「大」の物（PR 1 本に収まらない物）は、1 本にまとめると着手の単位が分からない
+`investigation` の雛形で親の Issue にし、チェックリストを着手の単位ごとに子の Issue へ分ける
+子は `--parent <親の番号>` で作ると、GitHub の sub-issue として親に付く
+`feature` や `bug` を「大」で作ろうとすると、道具がこの分け方を勧める（止めはしない）
+
+#### このプロジェクトの決まりへの言及
+
+雛形に節があるので、埋めるときに次を書き落とさない
+
+- 好みが分かれる所は設定画面へ（新機能の「設定画面に出す項目」 無ければ「なし」と理由）
+- 互換層は実物で確かめる（「確かめること」に、実際の配布物で確かめる本数）
+- 試験は失敗の仕方を書く（「確かめること」に、壊れたときに使う人に何が起きるか）
+- 使う人の報告から起こした物は、元の Discussion へのリンクを冒頭に書く
+
+前からある Issue は書き直さない 新しく作る物から当てはめる
 
 ### 色の範囲
 

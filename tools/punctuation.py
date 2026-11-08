@@ -245,6 +245,35 @@ def scan(path: Path) -> list[Hit]:
     return scan_python(path) if path.suffix == ".py" else scan_text(path)
 
 
+def find_in_text(text: str) -> list[tuple[int, int]]:
+    """リポジトリの外の文章（Issue の本文など）にある句点の行と桁（どちらも 1 から）
+
+    ファイルを介さずに見る口 ``tools/new_issue.py`` が送る前の本文を見る
+    Issue の本文は送ってしまうとこの検査の外になり、混ざっても誰も気付かない（#376）
+    """
+    starts = _offsets(text)
+    found: list[tuple[int, int]] = []
+    for index, character in enumerate(text):
+        if character == MARU:
+            line = text.count("\n", 0, index) + 1
+            found.append((line, index - starts[line - 1] + 1))
+    return found
+
+
+def fix_text(text: str) -> str:
+    """文章の句点を、ファイルの書き換えと同じ決まりで消すか半角空白にする
+
+    決まりを 2 か所に持つと、Issue の本文とリポジトリの中で直り方が食い違う
+    """
+    # 置き換え先は元の文で先に決める（fix と同じ） 書き換えながら決めると、
+    # 続いた句点の扱いが前の書き換えに引きずられる
+    original = text
+    marks = [i for i, character in enumerate(original) if character == MARU]
+    for index in reversed(marks):
+        text = text[:index] + _replacement(original, index) + text[index + 1 :]
+    return text
+
+
 def fix(path: Path, hits: list[Hit]) -> None:
     """後ろから書き換える 前から直すと、後ろの位置がずれる"""
     if not _is_inside(path, ROOT):
