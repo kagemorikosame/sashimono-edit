@@ -58,11 +58,13 @@ class TestOrder:
         assert order == [media[1].id, media[3].id, media[2].id, media[0].id]
 
     def test_unused_media_keep_the_pool_order(self) -> None:
+        """壊れると、使っていない素材の作る順が毎回入れ替わり、一覧の上から待つ人の見当が外れる"""
         media = [_media(name) for name in "abc"]
         project = _project(media, [])
         assert proxy_order(project, 0) == [item.id for item in media]
 
     def test_used_media(self) -> None:
+        """壊れると、置いたときに作る設定で、使い始めた素材の控えが頼まれない"""
         media = [_media(name) for name in "ab"]
         assert used_media(_project(media, [(1, 0)])) == {media[1].id}
 
@@ -138,6 +140,7 @@ class TestRemainingTime:
         assert board.poll().remaining_seconds is None
 
     def test_finished_work_keeps_the_speed(self) -> None:
+        """壊れると、1 本終えるたびに速さが分からなくなり、次の素材の見込みが数秒消える"""
         clock = Clock()
         board = JobBoard(clock=clock)
         board.start("a", MediaId("a"), weight=60.0)
@@ -161,6 +164,7 @@ class TestRemainingTime:
 
 class TestStatusText:
     def test_the_count_and_time_left_are_shown(self) -> None:
+        """壊れると、何本・何分待つのかがステータスバーに出ない"""
         clock = Clock()
         proxy = JobBoard(clock=clock)
         proxy.start("a", MediaId("a"), weight=60.0)
@@ -183,4 +187,5 @@ class TestStatusText:
         [(20, "1 分足らず"), (61, "2 分"), (3600, "1 時間"), (3700, "1 時間 2 分")],
     )
     def test_rough_duration(self, seconds: float, expected: str) -> None:
+        """壊れると、見込みが秒まで出て、数割ずれる見込みが正確そうに見える"""
         assert rough_duration(seconds) == expected
