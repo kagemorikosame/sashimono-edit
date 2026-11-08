@@ -77,11 +77,14 @@ class ExportRequest:
     range_choice: str
     #: 映像のコーデック ``None`` なら自動（使えなければ次の候補へ落ちる）
     codec: str | None
-    #: 映像のビットレート（Mbps）
+    #: 映像のビットレート（Mbps） ``match_bitrate`` なら上限
     bitrate_mbps: int
     #: 許したときの書き出し先の身元（無ければ無かったこと） 置く直前に照らし、名前が現れたり
     #: 中身が変わったりしていれば置かずに断る（#327）
     expect: Expected
+    #: 置いた素材に合わせた値を、書き出すスレッドで求めるか（#414） 素材のファイルの大きさを
+    #: 読むので、許す前の画面のスレッドで求めると、応えないネットワークの共有で画面が固まる
+    match_bitrate: bool = False
 
 
 @dataclass(frozen=True, slots=True)

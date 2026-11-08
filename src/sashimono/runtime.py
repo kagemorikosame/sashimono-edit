@@ -1404,10 +1404,11 @@ def _install_runtime_locked(
         runtime_abi(target)
     # 一緒に入れる機能が前の Python 向けのとき、--upgrade の無い pip は入っている物を残す
     # 残ったまま今の印を付けると、読めない拡張を使えると読む（PR #451 の CodeRabbit の指摘）
+    # 自分で打った pip の短い形（-U）も同じ 見落とすと、入れ直したのに古い印が残って毎回求める
     keeps_old = (
         companion is not None
         and stale_runtime(companion.key) is not None
-        and "--upgrade" not in argv
+        and not any(word in ("--upgrade", "-U") for word in argv)
     )
 
     own = _own_pip_arguments(argv)

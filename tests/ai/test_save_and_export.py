@@ -39,6 +39,7 @@ from sashimono.core.io.subtitles import subtitles_in_range, to_srt, to_vtt
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.projection import project_timeline
 from sashimono.engine.encode import RANGE_ALL, RANGE_WORK_AREA, BitrateChoice
+from sashimono.engine.encode import choices as choices_module
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_safety import _hard_link, _symlink_dir, answer_approvals
@@ -396,6 +397,35 @@ class TestExport:
         seen, _box = _run(bridge, EXPORT, {"path": str(saved.saved_at.parent / "a.mp4")})
         assert "20 Mbps" in seen[0].summary
         assert saved.exports[-1].bitrate_mbps == 20
+
+    @WINDOWS_WRITES
+    def test_a_matched_bitrate_is_left_to_the_export_thread(
+        self, saved: FakeHost, codecs: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """許す前（画面のスレッド）で素材の大きさを読まない 応えない共有で画面が固まる"""
+        del codecs
+        assert saved.saved_at is not None
+        saved.bitrate = BitrateChoice(auto=True, mbps=20)
+
+        def frozen(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError("許す前に素材の大きさを読んだ")
+
+        monkeypatch.setattr(choices_module, "matched_bitrate_mbps", frozen)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
+        seen, _box = _run(bridge, EXPORT, {"path": str(saved.saved_at.parent / "a.mp4")})
+        assert "素材に合わせる（上限 20 Mbps）" in seen[0].summary
+        assert saved.exports[-1].bitrate_mbps == 20
+        assert saved.exports[-1].match_bitrate is True
+
+    @WINDOWS_WRITES
+    def test_a_given_bitrate_is_not_matched(self, saved: FakeHost, codecs: list[str]) -> None:
+        """AI が数を決めたら、その数で書き出す 書き出すスレッドで合わせ直さない"""
+        del codecs
+        assert saved.saved_at is not None
+        saved.bitrate = BitrateChoice(auto=True, mbps=20)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
+        _run(bridge, EXPORT, {"path": str(saved.saved_at.parent / "a.mp4"), "bitrate_mbps": 8})
+        assert saved.exports[-1].match_bitrate is False
 
     @WINDOWS_WRITES
     def test_the_range_follows_the_export_window(self, saved: FakeHost, codecs: list[str]) -> None:

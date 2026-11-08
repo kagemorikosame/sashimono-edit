@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from sashimono.core.model import Project, ProjectSettings
 from sashimono.engine.encode import DEFAULT_BITRATE_MBPS, BitrateChoice
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.waiting import wait_until
 
 #: 変えた値（既定と違う物）
 CHANGED: dict[str, Any] = {
@@ -104,5 +105,62 @@ def test_the_matched_bitrate_arrives_later(qt_application: QApplication) -> None
         dialog._bitrate.setValue(20)
         dialog._on_bitrate_found(token, 7)
         assert dialog._bitrate.value() == 20
+    finally:
+        dialog.deleteLater()
+
+
+def test_the_matched_bitrate_comes_from_the_worker(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """裏のスレッドで求めた値が、知らせを通って欄へ届く
+
+    ハンドラーだけを見ると、スレッドの起動や知らせの接続が壊れても通る
+    """
+    from sashimono.engine.encode import choices
+    from sashimono.ui.export_dialog import ExportDialog
+
+    monkeypatch.setattr(choices, "matched_bitrate_mbps", lambda *_a, **_k: 7)
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        wait_until(
+            lambda: dialog._bitrate.value() == 7,
+            "素材に合わせた値",
+            step=qt_application.processEvents,
+        )
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_new_scene_starts_from_the_cap(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """前のシーンの低い値のまま押すと、求め終える前に低く書き出す（CodeRabbit の指摘）"""
+    from sashimono.engine.encode import choices
+    from sashimono.ui import export_dialog
+    from sashimono.ui.export_dialog import ExportDialog
+
+    del qt_application
+
+    def unreadable(*_args: object, **_kwargs: object) -> int:
+        raise OSError("応えない共有")
+
+    monkeypatch.setattr(choices, "matched_bitrate_mbps", unreadable)
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        dialog._set_bitrate(5)
+        dialog._match_bitrate(project)
+        assert dialog._bitrate.value() == 30
+        # 計算の枠が埋まっていても、上限で出してスレッドを増やさない
+        taken = [export_dialog._BITRATE_SLOTS.acquire(blocking=False) for _ in range(2)]
+        try:
+            dialog._set_bitrate(5)
+            dialog._match_bitrate(project)
+            assert dialog._bitrate.value() == 30
+        finally:
+            for held in taken:
+                if held:
+                    export_dialog._BITRATE_SLOTS.release()
     finally:
         dialog.deleteLater()

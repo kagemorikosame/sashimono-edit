@@ -122,6 +122,11 @@ class _ExportWorker(QObject):
             self.finished.emit(str(path))
 
 
+#: 素材に合わせるビットレートを同時に求める数の上限（どの窓からも合わせて） 応えないネットワークの
+#: 共有で止まった計算が、シーンを替えたり窓を開き直したりするたびに増えて残らないようにする
+_BITRATE_SLOTS = threading.BoundedSemaphore(2)
+
+
 class ExportDialog(QDialog):
     """書き出しの設定と実行"""
 
@@ -325,6 +330,11 @@ class ExportDialog(QDialog):
         token = object()
         self._bitrate_token = token
         choice = self._bitrate_choice
+        # 求め終えるまでは上限を出す 前のシーンの低い値のまま押すと、そのまま低く書き出す
+        self._set_bitrate(choice.mbps)
+        if not _BITRATE_SLOTS.acquire(blocking=False):
+            # 前の計算が応えない共有で止まっている 窓を開くたびに待つスレッドを増やさず上限で出す
+            return
 
         def work() -> None:
             try:
@@ -332,6 +342,8 @@ class ExportDialog(QDialog):
             except (OSError, ValueError):
                 # 求められなければ上限のまま 窓は落とさない
                 return
+            finally:
+                _BITRATE_SLOTS.release()
             try:
                 self._bitrate_found.emit(token, value)
             except RuntimeError:

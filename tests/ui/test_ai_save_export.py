@@ -812,3 +812,38 @@ class TestPlacingIsGuarded:
         finally:
             window.close()
             window.deleteLater()
+
+
+class TestTheMatchedBitrate:
+    """素材に合わせたビットレートは書き出すスレッドで求める（PR #451 の CodeRabbit の指摘）"""
+
+    def _settings(self, tmp_path: Path) -> ExportSettings:
+        return ExportSettings(path=tmp_path / "a.mp4", video_bitrate=20_000_000)
+
+    # 壊れると、素材に合わせると決めた人の AI の書き出しが、いつも上限の大きさになる
+    def test_the_worker_lowers_the_bitrate_to_the_material(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sashimono.engine.encode import choices
+
+        monkeypatch.setattr(choices, "matched_bitrate_mbps", lambda *_a, **_k: 6)
+        worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
+        assert worker._matched(self._settings(tmp_path)).video_bitrate == 6_000_000
+
+    def test_an_unreadable_material_keeps_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """読めなくても書き出しは止めない 上限で出す"""
+        from sashimono.engine.encode import choices
+
+        def unreadable(*_args: object, **_kwargs: object) -> int:
+            raise OSError("応えない共有")
+
+        monkeypatch.setattr(choices, "matched_bitrate_mbps", unreadable)
+        worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
+        assert worker._matched(self._settings(tmp_path)).video_bitrate == 20_000_000
+
+    # 壊れると、AI が決めた数や決め打ちの設定を、書き出すスレッドで黙って下げる
+    def test_a_fixed_bitrate_is_kept(self, tmp_path: Path) -> None:
+        worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None)
+        assert worker._matched(self._settings(tmp_path)).video_bitrate == 20_000_000

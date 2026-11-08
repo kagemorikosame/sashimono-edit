@@ -446,19 +446,23 @@ def _shown_lines(project: Project, start: int, end: int) -> dict[tuple[MediaId, 
     焼き込んだ文字は元の行とは別に動かせる（行を合わせ直しても文字は元の時刻のまま） 元の行で
     見ると、行だけを直して文字が残ったずれを通してしまい、文字だけを動かして合わせた形をずれと読む
     同じ行を焼き込んだ所は、焼き込んでいない行としては数えない（見る人に出るのは文字の方）
+    続けて映る所は範囲で絞る前にまとめる 先に絞ると、範囲の頭で切れた後半だけを行の全体と読み、
+    声に合った字幕の頭をずれと言う（PR #451 の CodeRabbit の指摘）
     """
     shown: dict[tuple[MediaId, int], list[_Shown]] = {}
     burned: dict[tuple[MediaId, int], list[_Shown]] = {}
+    # 素材・音・行ごとの、いちばん後に足した所 長いタイムラインで、行ごとに前の全部を探さない
+    latest: dict[tuple[tuple[MediaId, int], str], _Shown] = {}
     for item in burned_subtitles(project):
         origin = item.origin
         media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
-        if media_id is None or item.end <= start or item.start >= end:
+        if media_id is None:
             continue
         burned.setdefault((media_id, origin.stream), []).append(
             _Shown(str(origin.segment_id), item.start, item.end, [str(item.clip_id)], True)
         )
     for subtitle in heard_timeline(project):
-        if subtitle.media_id is None or subtitle.end_frame <= start or subtitle.start_frame >= end:
+        if subtitle.media_id is None:
             continue
         key = (subtitle.media_id, subtitle.stream)
         segment = str(subtitle.segment.id)
@@ -469,26 +473,47 @@ def _shown_lines(project: Project, start: int, end: int) -> dict[tuple[MediaId, 
             for copy in burned.get(key, [])
         ):
             continue
-        lines = shown.setdefault(key, [])
         # 開始位置の順に来るので、続けて映る所は直前の同じ行へ足す
-        found = next((line for line in reversed(lines) if line.segment_id == segment), None)
+        found = latest.get((key, segment))
         if found is None or subtitle.start_frame > found.end:
-            lines.append(
-                _Shown(
-                    segment,
-                    Fraction(subtitle.start_frame),
-                    Fraction(subtitle.end_frame),
-                    [str(subtitle.clip_id)],
-                    False,
-                )
+            found = _Shown(
+                segment,
+                Fraction(subtitle.start_frame),
+                Fraction(subtitle.end_frame),
+                [str(subtitle.clip_id)],
+                False,
             )
+            shown.setdefault(key, []).append(found)
+            latest[(key, segment)] = found
             continue
         found.end = max(found.end, Fraction(subtitle.end_frame))
         if str(subtitle.clip_id) not in found.clip_ids:
             found.clip_ids.append(str(subtitle.clip_id))
     for key, copies in burned.items():
         shown.setdefault(key, []).extend(copies)
-    return shown
+    return {
+        key: inside
+        for key, lines in shown.items()
+        if (inside := [line for line in lines if line.end > start and line.start < end])
+    }
+
+
+def _placed_with(heard: list[HeardPiece], line: _Shown) -> list[HeardPiece]:
+    """字幕 ``line`` の声として比べる配置 同じ素材を離れた所にも置いたとき、そちらで比べない
+
+    焼き込んでいない行は、行を出したクリップの音だけ 焼き込んだ文字は元のクリップと切り離せる
+    ので、文字の映る所にいちばん近い配置 どこでも比べると、頭を切った行の頭を離れた配置で
+    見つけて、大きなずれと要らない直しを返す（PR #451 の CodeRabbit の指摘）
+    """
+    if not line.burned:
+        return [piece for piece in heard if str(piece.clip_id) in line.clip_ids]
+    gaps = [
+        (max(Fraction(0), piece.start - line.end, line.start - piece.end), piece) for piece in heard
+    ]
+    if not gaps:
+        return []
+    nearest = min(gap for gap, _ in gaps)
+    return [piece for gap, piece in gaps if gap == nearest]
 
 
 def _projected(
@@ -539,7 +564,7 @@ def _subtitle_timing(
     寄せた時刻は本人の設定のずらし（``timing`` の頭と終わりのミリ秒）も足した物と比べる 足さないと、
     わざと早く出している人の字幕を全部ずれと読む 比べるのはタイムラインの上（映る時刻） 素材の秒で
     比べると、速度を変えたクリップのずれ（半速なら倍）を見落とす
-    戻り値は（問題、波形が無く比べられなかった所の数、寄せた所を切って比べられなかった所の数）
+    戻り値は（問題、波形が無く比べられなかった所の数、寄せた頭か終わりを切って比べられなかった行の数）
     """
     problems: list[Problem] = []
     unknown = unplaced = 0
@@ -574,11 +599,14 @@ def _subtitle_timing(
             target = fitted.get(line.segment_id)
             if target is None:
                 continue
-            head = _projected(heard, target.start, line.start, project)
-            tail = _projected(heard, target.end, line.end, project)
-            if head is None and tail is None:
-                # 寄せた頭も終わりも切って鳴らない 比べる相手が無いのを、合っていると読まない
+            placed = _placed_with(heard, line)
+            head = _projected(placed, target.start, line.start, project)
+            tail = _projected(placed, target.end, line.end, project)
+            if head is None or tail is None:
+                # 寄せた端を切って鳴らない 比べられない端を、合っていると読まない 片端でも数える
+                # （残った端が合っていても、切った側の字幕が声の無い所に映っているかもしれない）
                 unplaced += 1
+            if head is None and tail is None:
                 continue
             early = None if head is None else (line.start - head) * frame
             late = None if tail is None else (line.end - tail) * frame
@@ -645,9 +673,9 @@ def check_words(
             if unplaced:
                 skipped.add(SUBTITLE_TIMING)
                 notes.append(
-                    f"声の頭と終わりをどちらも切った所に映る字幕が {unplaced} 行あり、出る時刻と"
-                    "声を比べていません 字幕が声の無い所に映っていないかを preview_frame で"
-                    "確かめてください"
+                    f"声の頭か終わりを切った所に映る字幕が {unplaced} 行あり、切った側の端は"
+                    "声と比べていません（残った端は比べています） 字幕が声の無い所に映って"
+                    "いないかを preview_frame で確かめてください"
                 )
         else:
             skipped.add(SUBTITLE_TIMING)

@@ -18,7 +18,14 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
-from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
+from sashimono.core.commands import (
+    AddClip,
+    AddEffect,
+    AddScene,
+    SetClipProperty,
+    SetTrackState,
+    new_scene,
+)
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, fixed_effect
 from sashimono.core.commands.volume import clip_volume
 from sashimono.core.mixing import (
@@ -38,6 +45,8 @@ from sashimono.core.model import (
     TranscriptSegment,
 )
 from sashimono.core.timebase import FrameRate
+from sashimono.effects import registry
+from sashimono.effects.audio import LIMITER_KIND
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.decode.probe import probe_media
 from sashimono.ui import main_window as main_window_module
@@ -414,6 +423,28 @@ class TestRightClick:
         voice_clip = window.document.project.timeline.tracks[0].clips[0]
         assert clip_volume(voice_clip).static == 100.0
         window.document.undo()
+        assert window.document.project == project
+
+    def test_a_capped_gain_is_not_called_on_target(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """前のリミッターで 1 dB も上げられないのを「すでに基準の音量」と言わない（CodeRabbit）
+
+        言うと、基準に 6 LU 足りないまま書き出す
+        """
+        monkeypatch.setattr(
+            main_window_module, "ask_loudness", lambda *_args: LoudnessChoice(-14.0)
+        )
+        project, _voice, bgm = _project(media)
+        (clip,) = next(t for t in project.timeline.tracks if t.id == bgm.id).clips
+        limiter = registry.require(LIMITER_KIND).create(ceiling=-20.0)
+        project = AddEffect(clip.id, limiter).apply(project)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window, then=lambda: window._pending_loudness is None)
+        message = window.statusBar().currentMessage()
+        assert "すでに基準" not in message
+        assert "足りない" in message
         assert window.document.project == project
 
 

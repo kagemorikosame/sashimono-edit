@@ -153,6 +153,27 @@ def test_group_metrics_notice_merged_groups(tool: ModuleType, tmp_path: Path) ->
     assert tool.group_metrics(tool.grouped_project(audio, "E02").project)["merged"] == 0
 
 
+def test_group_metrics_see_merged_fragments_after_a_split(tool: ModuleType, tmp_path: Path) -> None:
+    """まとめた後に前半を割ると、後ろの片割れは新しいグループへ移る 最後の断片だけで決めると
+    前の断片のまとまりを見落とし、merged が 0 になる（PR #451 の CodeRabbit の指摘）
+    """
+    from sashimono.core.commands import GroupClips, SplitClips
+
+    audio = _write_talk(tmp_path / "talk.wav")
+    document = tool.grouped_project(audio, "E02")
+    every = tuple(clip.id for track in document.project.timeline.tracks for clip in track.clips)
+    document.execute(GroupClips(every))
+    heading = next(
+        clip
+        for track in document.project.timeline.tracks
+        for clip in track.clips
+        if clip.source is not None and clip.source.params.get("text") == "前半"
+    )
+    middle = (heading.timeline_start + heading.timeline_end) // 2
+    document.execute(SplitClips((heading.id,), middle))
+    assert tool.group_metrics(document.project)["merged"] == 1
+
+
 def test_the_ai_stage_needs_consent(folder: tuple[ModuleType, Any, Any], tmp_path: Path) -> None:
     """素材の名前・字幕・絵を外へ送るので、同意の印が無ければ 1 行も書かずに止まる"""
     tool, eval_dir, book = folder
@@ -207,6 +228,8 @@ def test_the_ai_stage_writes_its_counts(
         eval_dir, book, [], allow_send=True, results=results, runner=untouched, commit=""
     )
     assert (record["status"], record["reason"]) == ("failed", "ai-no-cut")
+    # モデルごとに切らずに終えた回数を比べるので、成功の行と同じくモデルを書く
+    assert record["params"] == {"model": "default"}
     assert "しゃべり" not in results.read_text(encoding="utf-8")
 
 

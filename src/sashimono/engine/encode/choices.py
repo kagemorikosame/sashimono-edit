@@ -13,7 +13,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sashimono.core.commands import export_range
-from sashimono.core.model import MediaItem, Project, SceneId, Timeline
+from sashimono.core.model import (
+    Clip,
+    MediaId,
+    MediaItem,
+    Project,
+    SceneId,
+    Timeline,
+    VideoStreamInfo,
+)
 from sashimono.engine.encode.exporter import ExportSettings
 
 __all__ = [
@@ -74,59 +82,85 @@ def _file_size(path: Path) -> int:
 _MAX_SCENE_DEPTH = 16
 
 
+def _drawn(project: Project, timeline: Timeline) -> Iterator[Clip]:
+    """``timeline`` で書き出しに映るクリップ 描画と同じ決まり（映るトラック・有効・絵を描く）
+
+    消音・非表示のトラックや無効のクリップを数えると、映らない高い素材に引かれて自動の値が
+    上限まで上がり、要らない大きさで書き出す（PR #451 の CodeRabbit の指摘）
+    """
+    for track in timeline.active_picture_tracks():
+        for clip in track.clips:
+            if clip.enabled and project.draws_picture(track, clip):
+                yield clip
+
+
 def _timelines(project: Project) -> Iterator[Timeline]:
-    """書き出すタイムラインと、そこに置いたシーン（入れ子も）のタイムライン
+    """書き出すタイムラインと、そこに映るシーン（入れ子も）のタイムライン
 
     置いていないシーンは書き出さないので数えない 数えると、選んだシーンの外の高い素材に
     引かれて、低い素材の場面だけを書き出すときも大きなファイルになる（PR #451 の CodeRabbit）
+    同じシーンへ浅い道からも届くなら浅い方でたどり直す 先に深い道で着いて止めると、浅い道
+    なら上限の内側で描く子のシーンを数え落とす
     """
-    seen: set[SceneId] = set()
+    reached: dict[SceneId, int] = {}
     stack: list[tuple[Timeline, int]] = [(project.timeline, 0)]
     while stack:
         timeline, depth = stack.pop()
         yield timeline
         if depth >= _MAX_SCENE_DEPTH:
             continue
-        for track in timeline.tracks:
-            for clip in track.clips:
-                if clip.scene_id is None or clip.scene_id in seen:
-                    continue
-                seen.add(clip.scene_id)
-                scene = project.find_scene(clip.scene_id)
-                if scene is not None:
-                    stack.append((scene.timeline, depth + 1))
+        for clip in _drawn(project, timeline):
+            if clip.scene_id is None or reached.get(clip.scene_id, _MAX_SCENE_DEPTH + 1) <= depth:
+                continue
+            reached[clip.scene_id] = depth + 1
+            scene = project.find_scene(clip.scene_id)
+            if scene is not None:
+                stack.append((scene.timeline, depth + 1))
 
 
-def _audio_bits_per_second(media: MediaItem) -> float:
-    """非圧縮の音（PCM）の 1 秒の量（ビット） 圧縮した音は映像に比べて小さいので数えない
+#: 数字で幅を書かない PCM の 1 標本のビット数 μ-law と A-law は 8 ビット
+_PCM_DEPTHS = {"pcm_mulaw": 8, "pcm_alaw": 8}
+
+
+def _audio_bits(media: MediaItem) -> float:
+    """非圧縮の音（PCM）の全体の量（ビット） 圧縮した音は映像に比べて小さいので数えない
 
     多チャンネルの PCM を入れた素材（録画機の mov）は音だけで数 Mbps あり、ファイルの大きさを
-    そのまま映像の量と読むと、映像の低い素材まで上限で書き出す
+    そのまま映像の量と読むと、映像の低い素材まで上限で書き出す 音の長さは素材の記録に無いので
+    素材の長さで見る 音が短い素材で引きすぎた分は :func:`matched_bitrate_mbps` が受ける
     """
     total = 0.0
     for stream in media.audio_streams:
         codec = stream.codec.lower()
         if not codec.startswith("pcm_"):
             continue
-        depth = int("".join(letter for letter in codec if letter.isdigit()) or 16)
+        digits = "".join(letter for letter in codec if letter.isdigit())
+        depth = int(digits) if digits else _PCM_DEPTHS.get(codec, 16)
         total += stream.sample_rate * stream.channels * depth
-    return total
+    return total * float(media.duration)
 
 
-def _placed_videos(project: Project) -> list[MediaItem]:
-    """書き出すタイムライン（と置いたシーンの中）の、動く絵を持つ素材 静止画は数えない"""
+def _placed_videos(project: Project) -> list[tuple[MediaItem, VideoStreamInfo]]:
+    """書き出しに映る、動く絵を持つ素材と、クリップが描く映像の道 静止画は数えない
+
+    道は描画と同じく、クリップの ``stream_index`` の道（無ければ 1 本目 ``engine/decode/video.py``）
+    1 本目で見ると、2 本目の大きい道を描くクリップの自動の値が低すぎる
+    """
     wanted = {
-        clip.media_id
+        (clip.media_id, clip.stream_index)
         for timeline in _timelines(project)
-        for track in timeline.tracks
-        for clip in track.clips
+        for clip in _drawn(project, timeline)
         if clip.media_id is not None
     }
-    return [
-        media
-        for media in project.media
-        if media.id in wanted and media.has_video and not media.is_still and media.duration > 0
-    ]
+    found: dict[tuple[MediaId, int], tuple[MediaItem, VideoStreamInfo]] = {}
+    for media_id, index in wanted:
+        media = project.find_media(media_id)
+        if media is None or not media.has_video or media.is_still or media.duration <= 0:
+            continue
+        streams = media.video_streams
+        stream = next((s for s in streams if s.index == index), streams[0])
+        found[(media_id, stream.index)] = (media, stream)
+    return list(found.values())
 
 
 def matched_bitrate_mbps(
@@ -136,9 +170,10 @@ def matched_bitrate_mbps(
 
     ``project`` は書き出す形（:func:`export_target` で選んだシーンを差し込んだ物）
     素材のビットレートはファイルの大きさを長さで割って求める 非圧縮の音の分は引く（圧縮した音は
-    映像に比べて小さく、多めに見積もる向きなので崩れない） 作品の大きさと fps が素材と違えば、
-    1 秒の画素の数の比で直す 比べる映像は描画と同じ 1 本目（``engine/decode/video.py``）
-    素材が何本もあれば一番高い物に合わせる（低い方に合わせると、その素材の場面が崩れる）
+    映像に比べて小さく、多めに見積もる向きなので崩れない） 引いて映像の分が残らなければ（音が
+    素材より短い PCM で引きすぎた）引かずに見る 低く見積もって画質を落とすより、大きめに出す方へ
+    倒す 作品の大きさと fps が素材と違えば、1 秒の画素の数の比で直す 比べる映像はクリップが
+    描く道 素材が何本もあれば一番高い物に合わせる（低い方に合わせると、その素材の場面が崩れる）
     読めない素材（外したドライブ）は数えない ファイルの大きさを読むので、画面の窓は
     スレッドの外から呼ぶ（ネットワークの共有が応えないと待つ）
     """
@@ -146,18 +181,20 @@ def matched_bitrate_mbps(
     settings = project.settings
     out_rate = settings.width * settings.height * float(settings.frame_rate.fps)
     best: float | None = None
-    for media in _placed_videos(project):
-        try:
-            size = measure(media.path)
-        except OSError:
-            continue
-        stream = media.video_streams[0]
+    sizes: dict[Path, int | None] = {}
+    for media, stream in _placed_videos(project):
+        if media.path not in sizes:
+            try:
+                sizes[media.path] = measure(media.path)
+            except OSError:
+                sizes[media.path] = None
+        size = sizes[media.path]
         pixels = stream.width * stream.height * float(stream.frame_rate.fps)
-        if size <= 0 or pixels <= 0:
+        if size is None or size <= 0 or pixels <= 0:
             continue
-        bits = size * 8 / float(media.duration) - _audio_bits_per_second(media)
-        if bits <= 0:
-            continue
+        whole = size * 8
+        video = whole - _audio_bits(media)
+        bits = (video if video > 0 else whole) / float(media.duration)
         scaled = bits * out_rate / pixels
         best = scaled if best is None else max(best, scaled)
     if best is None:

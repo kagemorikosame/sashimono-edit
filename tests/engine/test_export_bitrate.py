@@ -154,3 +154,123 @@ def test_a_nested_scene_counts(video_media: MediaItem) -> None:
     project, _ = _with_scene(video_media, placed=True)
     size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
     assert matched_bitrate_mbps(project, size_of=size_of) == 10
+
+
+def test_mu_law_audio_is_eight_bits(video_media: MediaItem) -> None:
+    """μ-law は 8 ビット 16 ビットとして引くと、4 Mbps の素材を 3 Mbps で書き出す（CodeRabbit）"""
+    pcm = AudioStreamInfo(
+        index=1, sample_rate=48000, channels=8, time_base=Fraction(1, 48000), codec="pcm_mulaw"
+    )
+    media = replace(video_media, path=Path("C:/素材/rec.mov"), audio_streams=(pcm,))
+    project = make_loaded(media, _no_words())
+    size = (4_000_000 + 48000 * 8 * 8) * 10 // 8
+    assert matched_bitrate_mbps(project, size_of=_sizes(rec=size)) == 5
+
+
+def test_too_much_audio_to_subtract_keeps_the_whole(video_media: MediaItem) -> None:
+    """音が素材より短い PCM を全長で引くと映像の分が残らない そこで素材を外すと低い値になる"""
+    pcm = AudioStreamInfo(
+        index=1, sample_rate=48000, channels=8, time_base=Fraction(1, 48000), codec="pcm_s24le"
+    )
+    media = replace(video_media, path=Path("C:/素材/rec.mov"), audio_streams=(pcm,))
+    project = make_loaded(media, _no_words())
+    # 10 秒の 4 Mbps の映像と、1 秒だけの 8ch PCM
+    size = (4_000_000 * 10 + 48000 * 8 * 24) // 8
+    # 引かずに 4.9 Mbps と見て、1.25 倍を切り上げて 7 Mbps
+    assert matched_bitrate_mbps(project, size_of=_sizes(rec=size)) == 7
+
+
+def test_a_hidden_scene_does_not_count(video_media: MediaItem) -> None:
+    """消音・非表示のトラックのシーンは映らない 数えると要らない大きさで書き出す（CodeRabbit）"""
+    project, _ = _with_scene(video_media, placed=True)
+    tracks = tuple(
+        replace(track, muted=True) if track.name == "V2" else track
+        for track in project.timeline.tracks
+    )
+    project = project.with_timeline(replace(project.timeline, tracks=tracks))
+    size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
+    assert matched_bitrate_mbps(project, size_of=size_of) == 3
+
+
+def test_a_disabled_clip_does_not_count(video_media: MediaItem) -> None:
+    # 壊れると、無効にして映らないシーンの高い素材に引かれて、大きなファイルで書き出す
+    project, _ = _with_scene(video_media, placed=True)
+    outer = project.timeline.tracks[-1]
+    off = replace(outer, clips=tuple(replace(clip, enabled=False) for clip in outer.clips))
+    project = project.with_timeline(
+        replace(project.timeline, tracks=(*project.timeline.tracks[:-1], off))
+    )
+    size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
+    assert matched_bitrate_mbps(project, size_of=size_of) == 3
+
+
+def test_the_chosen_video_stream_is_used(video_media: MediaItem) -> None:
+    """クリップが描く道で見る 1 本目で見ると、別の大きさの道を描くクリップの値がずれる"""
+    (first,) = video_media.video_streams
+    big = replace(first, index=5, width=first.width * 2, height=first.height * 2)
+    media = replace(video_media, path=Path("C:/素材/two.mp4"), video_streams=(first, big))
+    project = make_loaded(media, _no_words())
+    size_of = _sizes(two=TWO_MBPS * 8)
+    # 1 本目なら 16 Mbps の 1.25 倍で 20 Mbps
+    assert matched_bitrate_mbps(project, size_of=size_of) == 20
+    track = next(t for t in project.timeline.tracks if t.kind is TrackKind.VIDEO)
+    chosen = replace(track, clips=tuple(replace(c, stream_index=5) for c in track.clips))
+    project = project.with_timeline(
+        replace(
+            project.timeline,
+            tracks=tuple(chosen if t.id == track.id else t for t in project.timeline.tracks),
+        )
+    )
+    # 4 倍の画素の道を描くので 4 Mbps 相当 1.25 倍で 5 Mbps
+    assert matched_bitrate_mbps(project, size_of=size_of) == 5
+
+
+def test_a_shared_scene_reached_deep_first_is_walked_again(video_media: MediaItem) -> None:
+    """深い道で先に着いたシーンを、浅い道からもたどる 止めると、その中の高い素材を数え落とす"""
+    project, inner_id = _with_scene(video_media, placed=False)
+    inner = project.find_scene(inner_id)
+    assert inner is not None
+    # 高い素材を入れた「山場」を置いただけのシーン これを深い道と浅い道の両方から置く
+    shared = Scene(
+        name="共有",
+        timeline=replace(
+            project.timeline,
+            tracks=(
+                Track(kind=TrackKind.VIDEO, name="V", clips=(Clip(0, 300, scene_id=inner_id),)),
+            ),
+        ),
+    )
+    chain: list[Scene] = []
+    below = shared.id
+    # 15 段のシーンの底に「共有」を置く 「共有」は深さ 16 で、中の「山場」へは進まない
+    for depth in range(15):
+        step = Scene(
+            name=f"段 {depth}",
+            timeline=replace(
+                project.timeline,
+                tracks=(
+                    Track(kind=TrackKind.VIDEO, name="V", clips=(Clip(0, 300, scene_id=below),)),
+                ),
+            ),
+        )
+        chain.append(step)
+        below = step.id
+    # 浅い道は 1 段を挟んで「共有」へ（深さ 2） 鎖を後の段に置くと鎖から先にたどり、
+    # 浅い道が「共有」に着くのは鎖の底で先に着いた後になる
+    middle = Scene(
+        name="中継ぎ",
+        timeline=replace(
+            project.timeline,
+            tracks=(
+                Track(kind=TrackKind.VIDEO, name="V", clips=(Clip(0, 300, scene_id=shared.id),)),
+            ),
+        ),
+    )
+    near = Track(kind=TrackKind.VIDEO, name="近", clips=(Clip(0, 300, scene_id=middle.id),))
+    far = Track(kind=TrackKind.VIDEO, name="遠", clips=(Clip(0, 300, scene_id=below),))
+    project = replace(project, scenes=(*project.scenes, shared, middle, *chain))
+    project = project.with_timeline(
+        replace(project.timeline, tracks=(*project.timeline.tracks, near, far))
+    )
+    size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
+    assert matched_bitrate_mbps(project, size_of=size_of) == 10

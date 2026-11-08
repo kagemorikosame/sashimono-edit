@@ -173,6 +173,12 @@ class TestReviewFixes:
         line = _line(1.0, 2.0, ("え", 1.0, 1.2), ("ぇ", 1.2, 1.4), ("と", 1.4, 1.6))
         assert [s.text for s in filler_spans(Transcript((line,), language="ja"))] == ["えぇと"]
 
+    def test_a_small_vowel_making_another_sound_is_kept(self) -> None:
+        """「ウィーン」の「ぃ」は伸ばす音ではない 「うーん」と読むと地名の語を切る"""
+        assert filler_key("ウィーン") != filler_key("うーん")
+        line = _line(1.0, 2.0, ("ウィーン", 1.0, 1.6))
+        assert filler_spans(Transcript((line,), language="ja")) == []
+
     def test_long_marks_split_into_words_are_joined(self) -> None:
         """「え」「ー」「ー」「と」と分かれても全体を切る
 
@@ -191,6 +197,11 @@ class TestReviewFixes:
         apart = _line(1.0, 3.0, ("え", 1.0, 1.2), ("ーと", 2.5, 2.8))
         assert filler_spans(Transcript((apart,), language="ja")) == []
 
+    def test_a_gap_of_exactly_the_phrase_gap_is_a_break(self) -> None:
+        """語の区切りと同じ境目 ちょうど 0.12 秒の間の音まで切らない"""
+        line = _line(1.0, 2.0, ("え", 1.0, 1.2), ("ーと", 1.32, 1.6))
+        assert filler_spans(Transcript((line,), language="ja")) == []
+
     def test_only_the_given_word_is_cut_from_the_timeline(self, video_media: MediaItem) -> None:
         """数だけ見ると、頼んでいない「えーと」まで切っても通る 切った所で確かめる"""
         host = filler_host(video_media)
@@ -200,6 +211,15 @@ class TestReviewFixes:
         # 「あのー」は 4.0〜4.7 秒（30fps で 120〜141） 「えーと」（30〜48）は残る
         assert [(p["start_frame"], p["end_frame"]) for p in result["places"]] == [(120, 141)]
         assert result["removed_frames"] == 21
+        # 計画だけでなく、当てた後の作品からも「あのー」だけが抜けたのを見る
+        project = host.document.project
+        voiced = [
+            (clip.source_in, clip.source_out(project.rate))
+            for track in project.timeline.tracks
+            for clip in track.clips
+            if clip.media_id is not None
+        ]
+        assert voiced == [(F(0), F(4)), (F(47, 10), F(10))]
 
     def test_a_locked_track_is_reported(self, video_media: MediaItem) -> None:
         """声だけが詰まってロックした字幕が後ろでずれる 黙ると同期が崩れたまま進む"""

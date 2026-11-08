@@ -166,7 +166,13 @@ class SetupSection(QWidget):
         companion = self._pack.extra_pack
         # 追加分の包みが入っていても、その機能の落とす物（モデル）が無ければまだ選べる
         # 選べないまま印が付いていると、本人が選ばずに落とし始める（PR #451 の CodeRabbit の指摘）
-        extra_files = missing_files(companion.files) if companion is not None else ()
+        # 包みが入っていないうちは見なくても選べる 見るのは入った後だけにして、窓を開くたびの
+        # ファイルの確かめを増やさない
+        extra_files = (
+            missing_files(companion.files)
+            if companion is not None and status.extra_installed
+            else ()
+        )
         self._extra.setEnabled((not status.extra_installed or bool(extra_files)) and not self.busy)
 
         lines = [status.summary()]

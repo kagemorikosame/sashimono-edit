@@ -206,10 +206,11 @@ class TestTheCompanion:
         assert install_runtime(self.PACK, extra=True, command=command) == 0
         assert stale_runtime("companion") == OLD
 
-    def test_an_upgraded_companion_is_marked(self, target: Path) -> None:
-        """入れ直したら今の印 付けないと、入れ直した後も古いと見て読まない"""
+    @pytest.mark.parametrize("flag", ["--upgrade", "-U"])
+    def test_an_upgraded_companion_is_marked(self, target: Path, flag: str) -> None:
+        """入れ直したら今の印 付けないと、入れ直した後も古いと見て読まない（短い -U も同じ）"""
         self._mark_old(target)
-        command = [sys.executable, "-c", "pass", "--upgrade"]
+        command = [sys.executable, "-c", "pass", flag]
         assert install_runtime(self.PACK, extra=True, command=command) == 0
         marks = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))
         assert marks["companion"] == python_abi()

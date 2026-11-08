@@ -202,3 +202,28 @@ def test_a_line_whose_voice_was_cut_is_not_counted_as_checked(video_media: Media
     report = _burned_check(project)
     assert report.problems == ()
     assert SUBTITLE_TIMING in report.skipped
+
+
+def test_only_the_later_half_of_a_split_clip_is_checked(video_media: MediaItem) -> None:
+    """分けたクリップの後半だけを調べても、前半から続く行の頭をずれと読まない（CodeRabbit）"""
+    ((start, end),) = _fitted((1.0, 2.6))
+    media = _media(video_media, (float(start), float(end)))
+    head = Clip(timeline_start=0, duration=45, media_id=media.id)
+    rest = Clip(timeline_start=45, duration=255, media_id=media.id, source_in=Fraction(3, 2))
+    project = placed(media, head, rest)
+    report = check_words(project, 45, project.duration, KINDS, lambda _m, _s: VOICE)
+    assert report.problems == ()
+
+
+def test_a_cut_head_is_not_found_in_a_far_copy(video_media: MediaItem) -> None:
+    """頭を切った行の頭を、離れた所に置いた同じ素材で見つけると大きなずれと要らない直しになる"""
+    ((start, end),) = _fitted((1.0, 2.6))
+    media = _media(video_media, (float(start), float(end)))
+    cut = Clip(timeline_start=0, duration=60, media_id=media.id, source_in=Fraction(3, 2))
+    copy = Clip(timeline_start=200, duration=90, media_id=media.id)
+    project = placed(media, cut, copy)
+    report = check_words(project, 0, project.duration, KINDS, lambda _m, _s: VOICE)
+    assert report.problems == ()
+    # 切った側の端は比べていない 合っているとは言わない
+    assert SUBTITLE_TIMING in report.skipped
+    assert any("頭か終わり" in note for note in report.notes)

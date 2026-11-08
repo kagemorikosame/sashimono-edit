@@ -49,6 +49,7 @@ from sashimono.ai.auto_fix import (
     can_auto_color,
     has_limiter,
     limited_ceiling,
+    limited_peak,
     limiter_commands,
     plan_color_fix,
     plan_noise_fix,
@@ -4294,7 +4295,8 @@ class MainWindow(QMainWindow):
         if choice is None:
             return False
         # 無効のクリップはミキサが鳴らさず測りに入らない 掛けると有効に戻したときにずれる
-        clips = [clip for _, clip in targets if clip.enabled]
+        enabled = [(track, clip) for track, clip in targets if clip.enabled]
+        clips = [clip for _, clip in enabled]
         if not clips:
             self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
             return False
@@ -4310,7 +4312,7 @@ class MainWindow(QMainWindow):
             MAX_LIMITER_DB if choice.limiter and not any(has_limiter(c) for c in clips) else 0.0
         )
         self._pending_loudness = _PendingLoudness(
-            request, project, tuple(clips), choice.ceiling, squeeze
+            request, project, tuple(enabled), choice.ceiling, squeeze
         )
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
@@ -4347,25 +4349,36 @@ class MainWindow(QMainWindow):
             )
             return
         # 前に積んだリミッターの上限より上へは上げない（AI の normalize_loudness と同じ）
+        clips = [clip for _, clip in pending.targets]
         decided = loudness_gain(
-            pending.clips,
+            clips,
             measured=report.loudness,
             peak_db=report.peak_db,
             target=pending.request.limits.loudness_target,
-            ceiling=limited_ceiling(pending.clips, pending.ceiling),
+            ceiling=limited_ceiling(pending.targets, pending.ceiling),
             squeeze=pending.squeeze,
         )
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
         squeezed = decided.squeeze_db >= 0.05
-        if not moved and not squeezed:
-            self.statusBar().showMessage("すでに基準の音量です", 5000)
-            return
         target = pending.request.limits.loudness_target
-        commands = gain_commands(pending.clips, decided.gain_db) if moved else []
+        if not moved and not squeezed:
+            short = target - report.loudness
+            if abs(short) < 0.05 or not decided.limited_by:
+                self.statusBar().showMessage("すでに基準の音量です", 5000)
+            else:
+                # 上限で 1 dB も上げられなかったのを「基準の音量」と言うと、足りないまま進める
+                self.statusBar().showMessage(
+                    f"音量を変えなかった 基準まで {short:.1f} LU 足りないが、音の山か前に積んだ"
+                    "リミッターの上限、または音量の欄の上限でこれ以上上がらない"
+                    " リミッターの上限か、山の出るクリップの音量を見直してください",
+                    10000,
+                )
+            return
+        commands = gain_commands(clips, decided.gain_db) if moved else []
         try:
             if squeezed:
-                commands += limiter_commands(pending.clips, pending.ceiling)
+                commands += limiter_commands(pending.targets, pending.ceiling)
         except ToolError as error:
             self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
             return
@@ -4373,7 +4386,12 @@ class MainWindow(QMainWindow):
             return
         stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
         if squeezed:
-            stopped += f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた"
+            stopped += (
+                f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた（その分、音量は少し下がる）"
+            )
+            held = limited_peak(pending.targets, pending.ceiling)
+            if held > pending.ceiling + 0.05:
+                stopped += f" トラックの音量で、山は {held:g} dBFS まで上がる"
         changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(
             f"{changed}（測った音量 {report.loudness:.1f} LUFS）{stopped}",
@@ -4729,6 +4747,7 @@ class MainWindow(QMainWindow):
                 protected=protected,
             ),
             replace(request.expect, keep=self._preferences.backup_generations),
+            match_bitrate=request.match_bitrate,
         )
 
     def export_status(self) -> dict[str, object]:
@@ -4828,7 +4847,8 @@ class _PendingLoudness:
     request: CheckRequest
     #: 測り始めたときの作品 測る間に変わったら当てない
     project: Project
-    clips: tuple[Clip, ...]
+    #: そろえるクリップと、その置かれたトラック（リミッターの後に掛かる音量を見る）
+    targets: tuple[tuple[Track, Clip], ...]
     ceiling: float
     #: リミッターで抑えてよい山の量（dB #414） 0 なら抑えない
     squeeze: float = 0.0

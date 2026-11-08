@@ -64,6 +64,7 @@ from sashimono.core.io.atomic import write_atomic  # noqa: E402
 from sashimono.core.jetcut import plan_cuts  # noqa: E402
 from sashimono.core.model import (  # noqa: E402
     Clip,
+    GroupId,
     MediaItem,
     Project,
     ProjectSettings,
@@ -755,16 +756,15 @@ def group_metrics(project: Project) -> dict[str, float | int]:
     groups = {clip.group_id for _, clip in clips if clip.group_id is not None}
     # 前半と後半の見出しが同じグループに入ったら、2 つのグループが 1 つにまとまった 重なる組は
     # どれも同じグループのままなので割合は 1.0 のまま残る 別々に動かせないのは束ねが崩れた形
-    titles = {
-        str(clip.source.params.get("text")): clip.group_id
-        for _, clip in clips
-        if clip.source is not None and clip.source.params.get("text") in _GROUP_TITLES
-    }
-    merged = int(
-        len(titles) == len(_GROUP_TITLES)
-        and None not in titles.values()
-        and len(set(titles.values())) == 1
-    )
+    # 見出しは切ると何本にも分かれる 見出しごとに残った断片のグループを全部集めて比べる
+    # 1 本ずつ上書きすると、最後の断片だけで決まり、まとまったままの所を見落とす
+    titles: dict[str, set[GroupId]] = {title: set() for title in _GROUP_TITLES}
+    for _, clip in clips:
+        text = clip.source.params.get("text") if clip.source is not None else None
+        if text in _GROUP_TITLES and clip.group_id is not None:
+            titles[str(text)].add(clip.group_id)
+    first, *rest = titles.values()
+    merged = int(bool(first.intersection(*rest)))
     return {
         "kept_share": 0.0 if merged else (round(same / pairs, 4) if pairs else 1.0),
         "merged": merged,
@@ -1926,6 +1926,8 @@ def command_ai_run(
                     status="failed",
                     reason="ai-no-cut",
                     metrics=finite_metrics({**metrics, **run.metrics()}),
+                    # モデルごとに切らずに終えた回数を比べる 無いと、どのモデルの失敗か分からない
+                    params={"model": model or "default"},
                 )
             else:
                 record.update(

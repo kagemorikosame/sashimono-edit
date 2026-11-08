@@ -32,7 +32,7 @@ from sashimono.ai.safety import pinned
 from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
-from sashimono.engine.encode import ExportError, ExportSettings
+from sashimono.engine.encode import BitrateChoice, ExportError, ExportSettings
 from sashimono.engine.encode import export_project as run_export
 
 __all__ = ["AssistantExport", "scratch_folder"]
@@ -62,10 +62,13 @@ class _Worker(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        match_bitrate: bool = False,
     ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
+        #: 素材に合わせたビットレートをここ（書き出すスレッド）で求めるか 設定の値は上限
+        self._match_bitrate = match_bitrate
         self._check = check
         self._expect = expect
         self._cancel = threading.Event()
@@ -108,13 +111,26 @@ class _Worker(QObject):
             with contextlib.suppress(OSError):
                 scratch.unlink(missing_ok=True)
 
+    def _matched(self, settings: ExportSettings) -> ExportSettings:
+        """素材に合わせたビットレートにした設定 求められなければ上限のまま（書き出しは止めない）"""
+        cap = settings.video_bitrate
+        if not self._match_bitrate or not cap:
+            return settings
+        choice = BitrateChoice(auto=True, mbps=cap // 1_000_000)
+        try:
+            mbps = choice.for_project(self._project)
+        except (OSError, ValueError):
+            return settings
+        return replace(settings, video_bitrate=mbps * 1_000_000)
+
     def _export(self, scratch: Path) -> None:
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
+        settings = self._matched(self._settings)
         try:
             run_export(
                 self._project,
-                replace(self._settings, path=scratch),
+                replace(settings, path=scratch),
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
                 notice=notes.append,
@@ -198,8 +214,14 @@ class AssistantExport(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        *,
+        match_bitrate: bool = False,
     ) -> None:
-        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
+        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）
+
+        ``match_bitrate`` なら、設定のビットレートを上限に、素材に合わせた値を書き出す
+        スレッドで求める
+        """
         if self.running:
             raise ToolError("書き出しがもう走っています")
         self._state = "rendering"
@@ -210,7 +232,7 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
-        self._worker = _Worker(project, settings, check, expect)
+        self._worker = _Worker(project, settings, check, expect, match_bitrate)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

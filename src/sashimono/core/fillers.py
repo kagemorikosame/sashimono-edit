@@ -58,6 +58,23 @@ _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()")
 _SMALL_VOWELS = frozenset("ぁぃぅぇぉ")
 
 
+def _vowel(letter: str) -> str:
+    """ひらがな 1 字の母音（``A`` など） 母音で終わらない字（ん・記号）は空"""
+    name = unicodedata.name(letter, "")
+    if not name.startswith("HIRAGANA LETTER") or name[-1] not in "AIUEO":
+        return ""
+    return name[-1]
+
+
+def _stretches(before: str, small: str) -> bool:
+    """小さい母音 ``small`` が、前の字 ``before`` の音を伸ばしているか
+
+    前の字と同じ母音のときだけ伸ばす音 「ウィーン」の「ぃ」は「う」と合わせて別の音を作るので、
+    伸ばす記号に替えると「うーん」になり、言いよどみとして切られる（PR #451 の CodeRabbit の指摘）
+    """
+    return before == "ー" or (bool(_vowel(before)) and _vowel(before) == _vowel(small))
+
+
 @dataclass(frozen=True, slots=True)
 class FillerSpan:
     """見つかった言いよどみ 1 つ 時刻は素材の秒"""
@@ -82,7 +99,7 @@ def filler_key(text: str) -> str:
         code = ord(letter)
         if 0x30A1 <= code <= 0x30F6:
             letter = chr(code - 0x60)
-        if letter in _SMALL_VOWELS and out:
+        if letter in _SMALL_VOWELS and out and _stretches(out[-1], letter):
             letter = "ー"
         if letter == "ー" and out and out[-1] == "ー":
             continue
@@ -120,7 +137,8 @@ def _in_line(words: Sequence[Word], wanted: set[str], longest: int) -> Iterable[
         joined = ""
         last: int | None = None
         for stop in range(index, min(len(words), index + _MAX_WORDS)):
-            if stop > index and words[stop].start - words[stop - 1].end > PHRASE_GAP:
+            # 語の区切り（words._breaks）と同じ境目 ちょうど PHRASE_GAP の間も束ねない
+            if stop > index and words[stop].start - words[stop - 1].end >= PHRASE_GAP:
                 break
             # 束ねた後もそろえる 「え」「ー」「ー」「と」と分かれると、伸ばす記号が続いて残る
             joined = filler_key(joined + keys[stop])

@@ -34,6 +34,7 @@ from sashimono.ai.auto_fix import (
     NoiseRequest,
     has_limiter,
     limited_ceiling,
+    limited_peak,
     limiter_commands,
     picture_clip,
     plan_color_fix,
@@ -6981,9 +6982,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     host.request_check(request)
 
     def finish() -> object:
-        return _apply_loudness(
-            host, project, request, [clip for _, clip in targets], ceiling, squeeze
-        )
+        return _apply_loudness(host, project, request, targets, ceiling, squeeze)
 
     if not host.check_state().running or wait <= 0:
         return finish()
@@ -6998,7 +6997,7 @@ def _apply_loudness(
     host: EditorHost,
     project: Project,
     request: CheckRequest,
-    clips: list[Clip],
+    targets: list[tuple[Track, Clip]],
     ceiling: float,
     squeeze: float = 0.0,
 ) -> object:
@@ -7007,6 +7006,7 @@ def _apply_loudness(
     ``squeeze`` はリミッターで抑えてよい山の量（dB #414） 山が天井を越える分だけ、どのクリップにも
     リミッターを積む
     """
+    clips = [clip for _, clip in targets]
     state = host.check_state()
     if state.request != request:
         raise ToolError("測っている間に別の検査に替わりました もう 1 度呼んでください")
@@ -7037,7 +7037,7 @@ def _apply_loudness(
         )
     measured = report.loudness
     # 前に積んだリミッターの上限より上へは上げない 上げた分は潰れて、基準に届いたと嘘を答える
-    cap = limited_ceiling(clips, ceiling)
+    cap = limited_ceiling(targets, ceiling)
     decided = loudness_gain(
         clips,
         measured=measured,
@@ -7078,7 +7078,7 @@ def _apply_loudness(
         return result
     commands = gain_commands(clips, gain) if moved else []
     if squeezed:
-        commands += limiter_commands(clips, ceiling)
+        commands += limiter_commands(targets, ceiling)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
         "gain_db": round(gain, 2) if moved else 0.0,
@@ -7094,17 +7094,32 @@ def _apply_loudness(
     )
     if squeezed:
         overlap = _overlapping(clips)
+        held = limited_peak(targets, ceiling)
+        raised = None if report.peak_db is None else report.peak_db + (gain if moved else 0.0)
         result |= {
             "limiter_db": round(decided.squeeze_db, 1),
             # リミッターはクリップごと 重なって鳴る音の和は上限を越えうるので、言い切らない
-            "expected_peak_dbfs": None if overlap else ceiling,
+            "expected_peak_dbfs": None
+            if overlap
+            else round(held if raised is None else min(raised, held), 2),
+            # 抑えた分だけ音量は測った値より下がる どれだけ下がるかは山の続き方で決まり、
+            # 測る前の値から言い切ると、目標より大きく下がっても届いたと答える 届かないと
+            # 分かっている所は、抑えるとさらに下がるだけなので false のまま
+            "reached": None if reached else False,
+            "expected_lufs": None,
+            "loudness_rechecked": False,
         }
         notes.append(
             f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
             "どの音のクリップにも"
             "最後にリミッター（上限は同じ値）を積みました 山だけを抑えるので、音量は見込みより"
-            "わずかに下がります"
+            "下がります 基準に届いたかは check_output の loudness で測り直してください"
         )
+        if held > ceiling + _ON_TARGET_LU:
+            notes.append(
+                f"トラックの音量か定位で、リミッターの後の山が {held:g} dBFS まで上がります"
+                " そのトラックの音量を下げてから呼び直してください"
+            )
         if overlap:
             result["mixed_peak_checked"] = False
             notes.append(
@@ -9767,8 +9782,11 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     codec = None if raw_codec == AUTO else raw_codec
     # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
     raw_bitrate = arguments.get("bitrate_mbps")
+    # 素材に合わせる値は書き出すスレッドで求める ここ（画面のスレッド 許す前）で素材の大きさを
+    # 読むと、応えないネットワークの共有で窓が出る前に画面が固まる（PR #451 の CodeRabbit の指摘）
+    match = raw_bitrate is None and host.export_bitrate.auto
     if raw_bitrate is None:
-        raw_bitrate = host.export_bitrate.for_project(target)
+        raw_bitrate = host.export_bitrate.mbps
     low, high = BITRATE_RANGE_MBPS
     if isinstance(raw_bitrate, bool) or not isinstance(raw_bitrate, int):
         raise ToolError(f"bitrate_mbps は {low}〜{high} の整数で渡してください")
@@ -9784,7 +9802,8 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     parts = [
         f"{what} の{span}（{format_timecode(start, rate)} 〜 {format_timecode(end, rate)}、"
         f"{end - start} フレーム）",
-        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / {raw_bitrate} Mbps",
+        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / "
+        + (f"素材に合わせる（上限 {raw_bitrate} Mbps）" if match else f"{raw_bitrate} Mbps"),
         _replacing(path, "ファイル"),
     ]
     request = ExportRequest(
@@ -9793,6 +9812,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         range_choice=RANGE_ALL if frame_range is None else RANGE_WORK_AREA,
         codec=codec,
         bitrate_mbps=raw_bitrate,
+        match_bitrate=match,
         # 許したときの書き出し先 描く数分の間に名前が現れたり中身が変わったりしたら置かない
         expect=expect_now(path),
     )

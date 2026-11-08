@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
+from sashimono.ai.auto_fix import limited_ceiling
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
@@ -22,13 +25,30 @@ from sashimono.core.commands.fixed import (
     with_fixed_items,
 )
 from sashimono.core.mixing import MAX_LIMITER_DB
-from sashimono.core.model import AnimatedValue, Clip, Keyframe, MediaItem, Transcript
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Interpolation,
+    Keyframe,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+    Transcript,
+)
+from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
 from sashimono.effects.audio import LIMITER_KIND, AudioContext
 from sashimono.effects.limiter import limit, limiter_history
+from sashimono.engine.audio import AudioMixer
+from sashimono.engine.audio.mixer import HISTORY_WINDOW
 from sashimono.engine.checks.report import HIGH, MEDIUM
 from sashimono.engine.checks.scan import LOUDNESS
+from sashimono.engine.decode.probe import probe_media
+from tests.ai.conftest import FakeHost
 from tests.ai.test_mix_tools import _measured, _Work
+from tests.check_media import tone, write_tone
 
 RATE = 48_000
 
@@ -46,6 +66,15 @@ def work(transcript: Transcript, video_media: MediaItem) -> _Work:
 
 def _kinds(clip: Clip) -> list[str]:
     return [effect.kind for effect in clip.effects]
+
+
+def _track_volume(work: _Work, db: float) -> None:
+    """声のトラックの音量を ``db`` にした作品へ替える（リミッターの後に掛かる音量）"""
+    tracks = tuple(
+        replace(track, volume_db=db) if track.id == work.voice_track.id else track
+        for track in work.project.timeline.tracks
+    )
+    work.host = FakeHost(work.project.with_timeline(replace(work.project.timeline, tracks=tracks)))
 
 
 def _tone(seconds: float = 1.0, level: float = 0.3) -> np.ndarray:
@@ -102,6 +131,34 @@ class TestTheEffect:
         # 区切りの頭はまだ絞っている（引き継がないと元の大きさで鳴る）
         assert float(np.abs(later[history : history + 100]).max()) < 0.29
 
+    def test_the_mixer_carries_the_history_across_windows(self, tmp_path: Path) -> None:
+        """ミキサの区切りの直前の山で絞った分は、区切りの後も戻りきるまで続く
+
+        ``limit`` へ履歴を直に渡すだけでは、ミキサが前の音を読み戻さなくなっても通る
+        後半だけを新しいミキサで鳴らし、通して鳴らした後半と比べる
+        """
+        samples = tone(1.0, -20.0)
+        boundary = HISTORY_WINDOW
+        samples[boundary - 200 : boundary - 100] = 0.9
+        path = write_tone(tmp_path / "peak.wav", samples)
+        media = probe_media(path)
+        limiter = registry.require(LIMITER_KIND).create(ceiling=-10.0, release=150.0)
+        clip = Clip(timeline_start=0, duration=30, media_id=media.id, effects=(limiter,))
+        base = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=(media,))
+        track = Track(kind=TrackKind.AUDIO, name="声", clips=(clip,))
+        project = base.with_timeline(replace(base.timeline, tracks=(track,)))
+        count = len(samples) - boundary
+        whole_mixer, later_mixer = AudioMixer(project), AudioMixer(project)
+        try:
+            whole = whole_mixer.render(0, len(samples))
+            later = later_mixer.render(boundary, count)
+        finally:
+            whole_mixer.close()
+            later_mixer.close()
+        # 区切りの直後はまだ絞っている（戻る途中） 読み戻さないと素の -20 dBFS の波になる
+        assert np.abs(whole[boundary : boundary + 480]).max() < 10 ** (-20 / 20) * 0.9
+        np.testing.assert_allclose(later, whole[boundary:], atol=1e-4)
+
     def test_a_volume_added_later_goes_before_the_limiter(self) -> None:
         """固定の音量を持たない古いクリップへ後から音量を足すと、リミッターの後に掛かって山が越える"""
         effects = (registry.require(LIMITER_KIND).create(),)
@@ -124,7 +181,11 @@ class TestNormalize:
         _run(work)
         _measured(work.host, -18.0, -1.0)
         result = _run(work)
-        assert result["reached"] is True
+        # 抑えた分だけ音量は下がる 測る前の値から届いたとは言い切らない
+        assert result["reached"] is None
+        assert result["expected_lufs"] is None
+        assert result["loudness_rechecked"] is False
+        assert "loudness" in result["note"]
         assert result["gain_db"] == pytest.approx(4.0)
         assert result["limiter_db"] == pytest.approx(4.0)
         for clip in (work.clip(work.voice.id), work.clip(work.bgm.id)):
@@ -159,7 +220,7 @@ class TestNormalize:
         _measured(work.host, -14.0, 2.0)
         result = _run(work)
         assert result["gain_db"] == 0.0
-        assert result["reached"] is True
+        assert result["reached"] is None
         assert result["limiter_db"] == pytest.approx(3.0)
         assert _kinds(work.clip(work.voice.id))[-1] == LIMITER_KIND
 
@@ -197,6 +258,43 @@ class TestNormalize:
         assert result["reached"] is False
         assert LIMITER_KIND not in _kinds(work.clip(work.bgm.id))
 
+    def test_a_louder_track_lowers_the_new_limiter(self, work: _Work) -> None:
+        """+6 dB のトラックに -1 dBFS で積むと、書き出しの山は +5 dBFS になる（CodeRabbit）"""
+        _track_volume(work, 6.0)
+        ids = [str(work.voice.id)]
+        _run(work, clip_ids=ids)
+        _measured(work.host, -18.0, -1.0)
+        result = _run(work, clip_ids=ids)
+        limiter = work.clip(work.voice.id).effects[-1]
+        assert limiter.kind == LIMITER_KIND
+        assert limiter.params["ceiling"] == AnimatedValue(static=-7.0)
+        assert result["expected_peak_dbfs"] == -1.0
+
+    def test_a_track_too_loud_for_the_limiter_is_told(self, work: _Work) -> None:
+        """上限の範囲（-20 dBFS まで）で収め切れない分は、守れると言わない"""
+        _track_volume(work, 24.0)
+        ids = [str(work.voice.id)]
+        _run(work, clip_ids=ids)
+        _measured(work.host, -18.0, -1.0)
+        result = _run(work, clip_ids=ids)
+        # 上げた山は -1 + 4 = +3 dBFS リミッターは -20 dBFS（書き出しで +4）までしか下げられない
+        assert result["expected_peak_dbfs"] == 3.0
+        assert "トラックの音量" in result["note"]
+
+    def test_an_old_limiter_on_a_quieter_track_caps_where_it_is_heard(self, work: _Work) -> None:
+        """-6 dB のトラックの -10 dBFS のリミッターは、書き出しで -16 dBFS に山を止める
+
+        測った山は -16 dBFS 上限の -10 と比べると 6 dB 上げられると読んで、潰れた分を届いたと答える
+        """
+        _track_volume(work, -6.0)
+        effect = registry.require(LIMITER_KIND).create(ceiling=-10.0)
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
+        _run(work)
+        _measured(work.host, -24.0, -16.0)
+        result = _run(work)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is False
+
     def test_switched_off_keeps_the_old_way(self, work: _Work) -> None:
         """設定で切った人の作品に、黙ってリミッターを積まない"""
         work.host.limiter = False
@@ -225,6 +323,41 @@ class TestNormalize:
         _measured(work.host, -18.0, -1.0)
         with pytest.raises(ToolError, match="キーフレーム"):
             _run(work)
+
+
+class TestTheCeilingInUse:
+    """前に積んだリミッターが実際に山を止める所 リミッターと同じ読み方をする"""
+
+    def _limited(self, clip: Clip, ceiling: float = 0.0, volume_db: float = 0.0) -> float:
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=volume_db)
+        return limited_ceiling([(track, clip)], ceiling)
+
+    def test_an_omitted_ceiling_is_the_default(self, work: _Work) -> None:
+        # 壊れると、上限を省いたリミッター（-1 dBFS で潰す）の上へ上げて、届いたと答える
+        effect = registry.require(LIMITER_KIND).create()
+        bare = replace(effect, params={k: v for k, v in effect.params.items() if k != "ceiling"})
+        clip = replace(work.voice, effects=(*work.voice.effects, bare))
+        assert self._limited(clip) == pytest.approx(-1.0)
+
+    def test_an_overshooting_curve_is_seen(self, work: _Work) -> None:
+        """back の曲線はキーフレームの値より下へ行き過ぎる その谷でも潰れる"""
+        effect = registry.require(LIMITER_KIND).create()
+        moving = AnimatedValue(
+            -1.0,
+            (
+                Keyframe(0, -3.0, Interpolation.EASE_IN_OUT, curve="back"),
+                Keyframe(30, -1.0),
+            ),
+        )
+        clip = replace(work.voice, effects=(effect.with_param("ceiling", moving),))
+        assert self._limited(clip) < -3.0
+
+    def test_a_disabled_track_gain_is_not_applied_to_video(self, work: _Work) -> None:
+        """映像トラックの音量はミキサが使わない（置いたシーンの音だけを鳴らす）"""
+        effect = registry.require(LIMITER_KIND).create(ceiling=-10.0)
+        clip = replace(work.voice, effects=(effect,))
+        track = Track(kind=TrackKind.VIDEO, name="V", volume_db=-6.0)
+        assert limited_ceiling([(track, clip)], 0.0) == pytest.approx(-10.0)
 
 
 class TestCheckOutput:
