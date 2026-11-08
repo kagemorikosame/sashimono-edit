@@ -129,6 +129,7 @@ _NO_GRANT = _CallGrant()
 
 
 def _current() -> _CallGrant:
+    """今の呼び出しの許し 呼び出しの外なら何も足さない許し"""
     return _CALL.get() or _NO_GRANT
 
 

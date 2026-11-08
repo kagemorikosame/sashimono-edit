@@ -56,6 +56,7 @@ class SentKind:
 
     @property
     def amount(self) -> str:
+        """件数の短い文（:attr:`Sample.amount` と同じ書き方）"""
         return Sample(self.kind, count=self.count, chars=self.chars).amount
 
 
@@ -93,6 +94,7 @@ class _Store(Protocol):
 
 
 def _entry_json(entry: SentEntry) -> dict[str, Any]:
+    """記録 1 件をファイルの形にする 中身は持たない"""
     return {
         "at": entry.at.isoformat(timespec="seconds"),
         "tool": entry.tool,
@@ -141,6 +143,7 @@ class SendLogStore:
     """
 
     def __init__(self, path: Path) -> None:
+        """``path`` に記録を置く"""
         self.path = path
 
     def load(self) -> list[SentEntry]:
@@ -163,6 +166,7 @@ class SendLogStore:
         return True
 
     def _read(self) -> list[SentEntry]:
+        """ファイルの記録を全部読む 壊れた物は落とし、読めなければ空"""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -173,6 +177,7 @@ class SendLogStore:
         return [entry for item in raw if (entry := _entry_of(item)) is not None]
 
     def add(self, entry: SentEntry) -> bool:
+        """1 件足して書き戻す 書けなくても AI は止めず、偽を返す"""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with held_for_update(self._lock_path()):
@@ -183,6 +188,7 @@ class SendLogStore:
         return True
 
     def clear(self) -> bool:
+        """記録のファイルを消す 消せたか"""
         try:
             with held_for_update(self._lock_path()):
                 self.path.unlink(missing_ok=True)
@@ -191,14 +197,17 @@ class SendLogStore:
         return True
 
     def _lock_path(self) -> Path:
+        """読んで書き戻すまでを守る錠のファイル"""
         return self.path.with_name(self.path.name + ".lock")
 
     def _write(self, entries: Iterable[SentEntry]) -> None:
+        """記録を丸ごと書き直す 途中で止まっても壊れないよう、置き換えで書く"""
         data = {"entries": [_entry_json(entry) for entry in entries]}
         write_atomic(self.path, json.dumps(data, ensure_ascii=False, indent=1))
 
 
 def _trimmed(entries: list[SentEntry], now: datetime) -> list[SentEntry]:
+    """日数と件数の上限を超えた古い記録を落とす"""
     oldest = now - timedelta(days=KEEP_DAYS)
     return [entry for entry in entries if entry.at > oldest][-KEEP_ENTRIES:]
 
@@ -207,20 +216,25 @@ class MemoryLogStore:
     """覚えない置き場（試験・CLI） 記録はこの置き場が生きている間だけ持つ"""
 
     def __init__(self) -> None:
+        """空の記録で始める"""
         self._entries: list[SentEntry] = []
 
     def load(self) -> list[SentEntry]:
+        """残っている記録の写し"""
         return list(self._entries)
 
     def add(self, entry: SentEntry) -> bool:
+        """1 件足し、上限を超えた古い物を落とす"""
         self._entries = _trimmed([*self._entries, entry], entry.at)
         return True
 
     def clear(self) -> bool:
+        """全部消す"""
         self._entries = []
         return True
 
     def prune(self) -> bool:
+        """古い記録を落とす"""
         self._entries = _trimmed(self._entries, datetime.now().astimezone())
         return True
 
@@ -232,6 +246,7 @@ class SendLog:
     """
 
     def __init__(self, store: _Store | None = None) -> None:
+        """``store`` に記録を置く 渡さなければ覚えない置き場"""
         self.store: _Store = store if store is not None else MemoryLogStore()
         #: 記録を残すか（設定） 切っても最後に送った物は持つ 画面で確かめる手段は残す
         self.keep = True

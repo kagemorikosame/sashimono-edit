@@ -308,6 +308,7 @@ class PreferencesDialog(QDialog):
         *,
         send_log: SendLog | None = None,
     ) -> None:
+        """今の設定から項目を並べる ``send_log`` があれば送った物を見るボタンを出す"""
         super().__init__(parent)
         #: 開いたときの設定 :meth:`preferences` はここから画面の項目だけを変える
         self._given = preferences
@@ -1873,6 +1874,7 @@ class PreferencesDialog(QDialog):
             form.addRow("AI へ送った物", show)
 
     def _show_sent(self) -> None:
+        """「送った物を見る…」の窓を開く"""
         from sashimono.ui.chat.sent_record import SentRecordDialog
 
         if self._send_log is None:

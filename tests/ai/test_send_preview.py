@@ -116,6 +116,22 @@ class TestSamples:
         # 見出しにだけ切って出す
         assert len(clip_line(sample.lines[0])) == SAMPLE_LINE_CHARS
 
+    def test_a_field_value_is_counted_once_and_only_as_returned(self) -> None:
+        # 壊れると、text の欄にも入った値を二重に数えるか、切り詰めて返した長い本文を全部の長さで
+        # 数え、記録が実際に送った量より多くなる（CodeRabbit の指摘 #450）
+        long = "長い本文" * 40
+        returned = long[:60]
+        value = {"text": "同じ本文", "params": {"caption": "同じ本文", "body": returned}}
+        sample = text_sample(value, frozenset({"text"}), ["同じ本文", long, "返していない本文"])
+        assert sample.lines == ("同じ本文", "同じ本文", returned)
+        assert sample.chars == len("同じ本文") * 2 + len(returned)
+
+    def test_a_short_word_that_happens_to_start_a_field_is_not_counted(self) -> None:
+        # 壊れると、欄の名前（"te" など）が本文の頭と重なっただけで本文として数えられる
+        value = {"name": "長い", "params": {"caption": "長い本文" * 10}}
+        sample = text_sample(value, frozenset({"text"}), ["長い本文" * 10])
+        assert sample.lines == ("長い本文" * 10,)
+
     def test_frames_carry_the_picture_that_is_sent(self) -> None:
         # 壊れると、窓に出す絵と送る絵が別になり、どのコマが出るかを見誤る
         image = ImageResult(png=b"png", caption="12.0 秒のコマ")

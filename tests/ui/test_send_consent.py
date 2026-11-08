@@ -432,6 +432,41 @@ class TestPreviewInTheWindow:
             dialog.deleteLater()
 
 
+class TestNarrowerThanAButton:
+    def test_buttons_can_still_be_reached(
+        self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、大きな字で 1 つのボタンも入らない幅のとき、窓の最小の幅がボタンに引っ張られて
+        # 画面からはみ出し、押せない（CodeRabbit の指摘 #450）
+        del qt_application
+        request = SendRequest(tool="preview_frame", kinds=(Outbound.FRAMES,))
+        dialog = SendConsentDialog(request)
+        try:
+            font = dialog.font()
+            font.setPointSizeF(font.pointSizeF() * 3)
+            dialog.setFont(font)
+            screen = dialog.screen()
+            assert screen is not None
+            real = screen.availableGeometry()
+            narrow = QRect(real.x(), real.y(), 200, real.height())
+            monkeypatch.setattr(type(screen), "availableGeometry", lambda _self: narrow)
+            dialog._fit_to_screen()
+            dialog.show()
+            QApplication.processEvents()
+            assert dialog.width() <= narrow.width()
+            scroller = dialog._button_scroller
+            assert scroller.isVisible()
+            corner = scroller.mapTo(dialog, scroller.rect().bottomRight())
+            assert dialog.rect().contains(corner)
+            # ボタンの並びが入り切らない分は横に巻いて届く
+            bar = scroller.horizontalScrollBar()
+            widest = max(b.width() for b in (dialog.always, dialog.once, dialog.deny))
+            assert widest <= scroller.viewport().width() + bar.maximum()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+
 class TestSentRecord:
     def test_the_settings_show_the_last_sent_and_the_record(
         self, window: MainWindow, rendered: list[int], monkeypatch: pytest.MonkeyPatch

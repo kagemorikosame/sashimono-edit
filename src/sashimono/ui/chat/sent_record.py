@@ -35,6 +35,7 @@ class SentRecordDialog(QDialog):
     """最後に送った物と、送った物の記録"""
 
     def __init__(self, log: SendLog, parent: QWidget | None = None) -> None:
+        """最後に送った物と、記録の一覧を並べる"""
         super().__init__(parent)
         self._log = log
         self.setWindowTitle("AI へ送った物")
@@ -84,6 +85,7 @@ class SentRecordDialog(QDialog):
         self.resize(640, 560)
 
     def _fill(self) -> None:
+        """記録の一覧を新しい順に出す 多いときは古い物を省く"""
         entries = self._log.entries()
         lines = [entry.text() for entry in entries[:SHOWN_ENTRIES]]
         if len(entries) > SHOWN_ENTRIES:
@@ -91,6 +93,7 @@ class SentRecordDialog(QDialog):
         self.entries.setPlainText("\n".join(lines) if lines else "記録はありません")
 
     def _clear(self) -> None:
+        """確かめてから、記録と最後に送った物を消す"""
         answer = QMessageBox.question(
             self,
             CLEAR_TEXT,

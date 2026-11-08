@@ -297,6 +297,7 @@ def _texts_under(value: Any, keys: frozenset[str]) -> Iterator[str]:
 
 
 def _all_texts(value: Any) -> Iterator[str]:
+    """欄の中の文字を全部、順に返す（並びと辞書もたどる）"""
     if isinstance(value, str):
         yield value
     elif isinstance(value, Mapping):
@@ -307,12 +308,43 @@ def _all_texts(value: Any) -> Iterator[str]:
             yield from _all_texts(entry)
 
 
+#: 文字の欄の値が、結果の中で切り詰められていても同じ値と見なす長さ（文字）
+#: 長い本文は結果に収めるために頭だけを残して切る（:func:`~sashimono.ai.operations._fit`）
+#: 短い文字（欄の名前・種類）が偶然に頭と重なっても本文と数えないよう、ある程度の長さを要る
+_FIELD_PREFIX = 20
+
+
+def _texts_outside(value: Any, keys: frozenset[str]) -> Iterator[str]:
+    """``keys`` の欄の外にある文字を順に返す（:func:`_texts_under` が数えない物）"""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, entry in value.items():
+            if key not in keys:
+                yield from _texts_outside(entry, keys)
+    elif isinstance(value, list | tuple):
+        for entry in value:
+            yield from _texts_outside(entry, keys)
+
+
+def _from_fields(text: str, fields: frozenset[str]) -> bool:
+    """結果の文字が、文字の欄から伏せずに載せた値（かその頭）か"""
+    if text in fields:
+        return True
+    return len(text) >= _FIELD_PREFIX and any(field.startswith(text) for field in fields)
+
+
 def text_sample(value: Any, keys: frozenset[str], fields: Iterable[str] = ()) -> Sample:
     """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行
 
-    ``fields`` は文字の欄から伏せずに載せた値（:func:`sending` の ``passed``）
+    ``fields`` は文字の欄から伏せずに載せた値（:func:`sending` の ``passed``） 値そのものは
+    数えず、結果に実際に載った文字のうち、その値か頭に当たる物を数える 切り詰めて返した欄は
+    返した分だけを数え、``keys`` の欄に入った物は二重に数えない
     """
-    texts = [*_texts_under(value, keys), *fields]
+    passed = frozenset(field for field in fields if field)
+    texts = list(_texts_under(value, keys))
+    if passed:
+        texts += [text for text in _texts_outside(value, keys) if _from_fields(text, passed)]
     lines = [line for text in texts for line in text.splitlines() if line]
     return Sample(
         Outbound.TEXT,
@@ -372,6 +404,7 @@ def file_sample(
     seen: set[str] = set()
 
     def look(key: object, text: str) -> None:
+        """1 つの文字を伏せてみて、変わったら「元 → 後」に足す"""
         if not text or text in seen:
             return
         after = hide(key, text)
@@ -380,6 +413,7 @@ def file_sample(
             found.append((text, str(after)))
 
     def walk(key: object, item: Any) -> None:
+        """結果をたどり、文字と絵の説明を :func:`look` へ渡す"""
         if isinstance(item, str):
             look(key, item)
         elif isinstance(item, Mapping):
@@ -811,6 +845,7 @@ def hide_text(value: Any, secrets: Iterable[str], *, labels: bool = True) -> Any
         return text
 
     def walk(item: Any) -> Any:
+        """結果をたどり、文字と絵の説明を :func:`look` へ渡す"""
         if isinstance(item, str):
             return one(item)
         if isinstance(item, Mapping):
@@ -851,6 +886,7 @@ def _redactor(
     long = [(secret, mark) for secret, mark in pairs if len(secret) >= _SHORTEST_SECRET]
 
     def walk(item: Any) -> Any:
+        """結果をたどり、文字と絵の説明を :func:`look` へ渡す"""
         if isinstance(item, str):
             for secret, mark in long:
                 if secret in item:

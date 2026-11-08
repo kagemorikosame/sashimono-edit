@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -92,6 +92,7 @@ class SampleView(QWidget):
     """種類 1 つの下見の中身 行の一覧と絵（設定画面の「最後に送った物」でも使う）"""
 
     def __init__(self, sample: Sample, parent: QWidget | None = None) -> None:
+        """見出し・注意・絵・行の順に並べる"""
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -156,6 +157,7 @@ class SendConsentDialog(QDialog):
     """送ってよいかの窓 答えは :attr:`answer`（✕・Esc なら ``None``）"""
 
     def __init__(self, request: SendRequest, parent: QWidget | None = None) -> None:
+        """問いと説明、見出し、詳細のボタン、答えのボタンを並べる"""
         super().__init__(parent)
         self._request = request
         self.answer: SendAnswer | None = None
@@ -218,14 +220,30 @@ class SendConsentDialog(QDialog):
             buttons.addWidget(button)
         self.deny.setDefault(True)
         self.deny.setFocus()
-        outer.addWidget(self._buttons)
+        # ボタンの並びも巻物に入れる 折り返しても 1 つのボタンが画面より広い（大きな字で狭い画面）
+        # ときは、横に巻いて全体を押せるようにする 巻物に入れないと、窓の最小の幅がボタンの幅に
+        # 引っ張られ、画面からはみ出す
+        self._button_scroller = QScrollArea(self)
+        self._button_scroller.setWidget(self._buttons)
+        self._button_scroller.setWidgetResizable(True)
+        self._button_scroller.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._button_scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(self._button_scroller)
         self._fit_to_screen()
 
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802  Qt の名前に合わせる
+        """字の大きさが変わったら測り直す ボタンの並びの高さは字の大きさで決まる"""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "_button_scroller"):
+            self._fit_to_screen()
+
     def _choose(self, answer: SendAnswer) -> None:
+        """押したボタンの答えを持って閉じる"""
         self.answer = answer
         self.accept()
 
     def _show_details(self, shown: bool) -> None:
+        """詳細を開け閉めする 初めて開いたときに中身を作る"""
         self.toggle.setText(HIDE_DETAILS_TEXT if shown else SHOW_DETAILS_TEXT)
         self.toggle.setArrowType(Qt.ArrowType.DownArrow if shown else Qt.ArrowType.RightArrow)
         if self.details is None and shown:
@@ -236,6 +254,7 @@ class SendConsentDialog(QDialog):
         self._fit_to_screen()
 
     def _build_details(self) -> QWidget:
+        """種類ごとの下見の中身（行と絵）を並べる"""
         details = QWidget(self._body)
         column = QVBoxLayout(details)
         column.setContentsMargins(0, 0, 0, 0)
@@ -264,6 +283,11 @@ class SendConsentDialog(QDialog):
         inner = max(1, width - extra)
         flow = self._buttons.layout()
         buttons = flow.heightForWidth(inner) if flow is not None else 0
+        widest = max(button.sizeHint().width() for button in (self.always, self.once, self.deny))
+        if widest > inner:
+            # 1 つのボタンも入らない幅 横の巻物の棒の分だけ高くして、棒がボタンに重ならないように
+            buttons += self._button_scroller.horizontalScrollBar().sizeHint().height()
+        self._button_scroller.setFixedHeight(buttons)
         height = wanted.height() + buttons + extra + 16
         if height_limit is not None:
             height = min(height, height_limit)
