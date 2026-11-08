@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
@@ -22,6 +23,7 @@ from sashimono.core.model import Clip, Project, ProjectSettings, Track, TrackKin
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import probe_media
 from sashimono.engine.package.archive import PACKAGE_SUFFIX, OpenedPackage, PackResult
+from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.package_dialog import PackageExportDialog
 from tests.ai.conftest import allow_sending
@@ -135,3 +137,61 @@ def test_the_person_exports_from_the_menu_and_the_choice_is_remembered(
     assert (tmp_path / f"人の持ち出し{PACKAGE_SUFFIX}").is_file()
     assert window._preferences.package_whole and window._preferences.package_keep_metadata
     assert told and "書き出しました" in told[0]
+
+
+def _held_open(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """展開を、試験が放すまで終わらせない（展開している間に人が何かをする場面を作る）"""
+    release = threading.Event()
+    # 窓が読み込んだ名前を差し替える（公開の名前ではないので辞書から引く）
+    real = vars(main_window_module)["unpack_package"]
+
+    def held(*args: object, **kwargs: object) -> object:
+        assert release.wait(60)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(main_window_module, "unpack_package", held)
+    return release
+
+
+@WINDOWS_WRITES
+def test_edits_made_while_unpacking_are_kept(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """展開している間に人が編集したのに、終わった所で差し替えると、その編集が黙って消える"""
+    call_tool(
+        window, "export_package", {"path": f"持ち出し{PACKAGE_SUFFIX}"}, allow_irreversible=True
+    )
+    _wait_package(window)
+    release = _held_open(monkeypatch)
+    call_tool(
+        window, "open_package", {"path": f"持ち出し{PACKAGE_SUFFIX}"}, allow_irreversible=True
+    )
+    before = window.project_path
+    window.document.execute(AddTrack(Track(TrackKind.AUDIO, "展開中に足した")))
+    release.set()
+    _wait_package(window)
+    assert window.project_path == before
+    assert any(track.name == "展開中に足した" for track in window.document.project.timeline.tracks)
+    assert "開いていません" in str(window.package_status()["message"])
+
+
+@WINDOWS_WRITES
+def test_another_work_opened_while_unpacking_stays_open(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_av: SampleMedia
+) -> None:
+    """展開している間に別の作品を開いたのに、終わった所で差し替えると、その作品から離れる"""
+    call_tool(
+        window, "export_package", {"path": f"持ち出し{PACKAGE_SUFFIX}"}, allow_irreversible=True
+    )
+    _wait_package(window)
+    release = _held_open(monkeypatch)
+    call_tool(
+        window, "open_package", {"path": f"持ち出し{PACKAGE_SUFFIX}"}, allow_irreversible=True
+    )
+    other = window.project_path.parent / "別の作品.sme"  # type: ignore[union-attr]
+    save_project(_project(sample_av), other)
+    window.open_project_file(other)
+    release.set()
+    _wait_package(window)
+    assert window.project_path == other
+    assert "別の作品を開いた" in str(window.package_status()["message"])

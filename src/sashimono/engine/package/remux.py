@@ -28,6 +28,7 @@ import av
 import av.error
 import numpy as np
 
+from sashimono.engine.decode.audio import AudioDecoder
 from sashimono.engine.decode.probe import ProbeError, media_origin, moving_pictures, probe_media
 from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.decode.video import VideoDecoder
@@ -196,6 +197,10 @@ def _write(
         kept = _kept_streams(reader)
         if kept is None:
             return False
+        if keep_metadata and len(kept) < len(reader.streams):
+            # 付け足しの情報を残すと選んだのに、後ろの道（位置の記録など）を落とすと選んだ意味が
+            # 無い まるごと入れる（#449 の CodeRabbit の指摘）
+            return False
         origin = media_origin(reader)
         video = moving_pictures(reader)
         guide = video[0] if video else kept[0]
@@ -243,6 +248,9 @@ def _write(
             reader.seek(0)
             anchored: set[int] = set()
             for packet in reader.demux(*kept):
+                # 遅く始まる道があると、頭のパケットを探すのに長く読む その間も止められるように
+                if cancelled():
+                    raise Cancelled
                 index = packet.stream.index
                 if index in anchored or _seconds(packet) is None:
                     continue
@@ -276,7 +284,7 @@ def _copy_span(
     for _ in range(_SEEK_TRIES):
         assert target is not None
         reader.seek(max(0, int(target / time_base)), stream=guide, backward=True)
-        first = _first_keyframe(reader, guide)
+        first = _first_keyframe(reader, guide, cancelled)
         if first is None or first <= head or target <= 0:
             break
         # 着いたキーフレームが区間の頭より後ろ さらに前から探す
@@ -325,10 +333,12 @@ def _copy_span(
 
 
 def _first_keyframe(
-    reader: av.container.InputContainer, guide: av.stream.Stream
+    reader: av.container.InputContainer, guide: av.stream.Stream, cancelled: Callable[[], bool]
 ) -> Fraction | None:
     """今の位置から読んで最初のキーフレームの時刻 無ければ ``None``"""
     for packet in reader.demux(guide):
+        if cancelled():
+            raise Cancelled
         if packet.is_keyframe and _seconds(packet) is not None:
             return _seconds(packet)
     return None
@@ -363,20 +373,59 @@ def _same_as_source(source: Path, target: Path, spans: list[Span]) -> bool:
             new.pixel_format,
         ):
             return False
-    if not before.video_streams:
-        return True
     try:
-        with VideoDecoder(source) as original, VideoDecoder(target) as copied:
-            for span in spans:
-                moment = max(Fraction(0), span.start)
-                old_frame = original.frame_at(moment)
-                new_frame = copied.frame_at(moment)
-                if old_frame is None and new_frame is None:
-                    continue
-                if old_frame is None or new_frame is None:
-                    return False
-                if not np.array_equal(old_frame, new_frame):
-                    return False
-    except (ProbeError, av.error.FFmpegError, OSError):
+        # 映像の道は全部見る キーフレームの位置は道ごとに違い、最初の道で切った所が 2 本目の
+        # 道のキーフレームより後ろだと、2 本目の区間の頭の絵が欠ける（#449 の CodeRabbit の指摘）
+        for stream in before.video_streams:
+            if not _same_pictures(source, target, stream.index, spans):
+                return False
+        # 音の道も区間の頭を比べる AAC は前のパケットを読まないと頭が違う音になる
+        for audio in before.audio_streams:
+            if not _same_sound(source, target, audio.index, audio.sample_rate, spans):
+                return False
+    except (ProbeError, av.error.FFmpegError, OSError, ValueError):
         return False
+    return True
+
+
+#: 音を比べる長さ（秒） 区間の頭の、前の音に頼る所を見るのに足りる
+_SOUND_CHECK = Fraction(1, 4)
+#: 音の違いを許す幅（振幅 -80 dB） AAC は解き始める所で前の窓の重なりが違い、同じパケットでも
+#: 1e-5（-98 dB）ほどの差が残る（実物で測った） 聞こえない差で切り出しを捨てないよう、それより
+#: 大きく、パケットの欠け（区間の頭の音が別物になる）よりずっと小さい幅にする
+#: 比べる速さは素材の速さのまま 変換して比べると、変換の位相のずれ（0.002）で同じ音でも違って見える
+_SOUND_TOLERANCE = 1e-4
+
+
+def _same_pictures(source: Path, target: Path, index: int, spans: list[Span]) -> bool:
+    with VideoDecoder(source, index) as original, VideoDecoder(target, index) as copied:
+        for span in spans:
+            moment = max(Fraction(0), span.start)
+            old_frame = original.frame_at(moment)
+            new_frame = copied.frame_at(moment)
+            if old_frame is None and new_frame is None:
+                continue
+            if old_frame is None or new_frame is None:
+                return False
+            if not np.array_equal(old_frame, new_frame):
+                return False
+    return True
+
+
+def _same_sound(
+    source: Path, target: Path, index: int, sample_rate: int, spans: list[Span]
+) -> bool:
+    with (
+        AudioDecoder(source, sample_rate=sample_rate, stream_index=index) as original,
+        AudioDecoder(target, sample_rate=sample_rate, stream_index=index) as copied,
+    ):
+        for span in spans:
+            moment = max(Fraction(0), span.start)
+            length = min(_SOUND_CHECK, max(Fraction(0), span.end - moment)) or _SOUND_CHECK
+            old = original.read_seconds(moment, length)
+            new = copied.read_seconds(moment, length)
+            if old.shape != new.shape:
+                return False
+            if old.size and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE:
+                return False
     return True

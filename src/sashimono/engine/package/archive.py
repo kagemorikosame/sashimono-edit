@@ -40,7 +40,7 @@ from sashimono.core.io.serialize import (
     save_project,
 )
 from sashimono.core.model import MediaId, MediaItem, Project
-from sashimono.engine.package.plan import Usage, map_paths, usage
+from sashimono.engine.package.plan import Usage, map_paths, unknown_kinds, usage
 from sashimono.engine.package.remux import Cancelled, Span, cut_media, output_format
 from sashimono.engine.package.scrub import scrub_image, scrubbable
 
@@ -249,6 +249,15 @@ def write_package(
         raise PackageError(
             "素材のファイルが見つからないので、パッケージにできません: " + "、".join(missing)
         )
+    unknown = unknown_kinds(project)
+    if unknown:
+        # どの欄がファイルかを定義から読めないので、元の PC の場所が欄に残ったまま人へ渡り、
+        # 指すファイルも入らない 読み込んでから書き出してもらう（#449 の CodeRabbit の指摘）
+        raise PackageError(
+            "読み込んでいないスクリプトのエフェクトがあるので、パッケージにできません"
+            " スクリプトを読み込むか、そのエフェクトを外してから書き出してください: "
+            + "、".join(unknown[:10])
+        )
 
     entries: list[_Entry] = []
 
@@ -312,8 +321,17 @@ def write_package(
                 done += entry.weight
             # 中の名前は書いてから決まる（切り出すと入れ物が変わり、拡張子が変わることがある）
             names = {entry.media_id: entry.name for entry in entries if entry.media_id is not None}
-            packed = map_paths(
+            # 中の場所は番号だけなので、表示の名前が空の素材は元のファイルの名前を残す
+            # 残さないと、開いた先の素材一覧とクリップに 0001.mp4 と出て、どの素材か分からない
+            named = replace(
                 project,
+                media=tuple(
+                    replace(item, display_name=item.display_name or Path(item.path).name)
+                    for item in project.media
+                ),
+            )
+            packed = map_paths(
+                named,
                 lambda item: Path(names[item.id]) if item.id in names else _unused_place(item),
                 missing_name,
             )
@@ -359,6 +377,23 @@ def write_package(
 UNUSED_PREFIX = "unused"
 
 
+#: 展開した先で、パッケージに無いファイルを指させる場所（作らない）
+MISSING_FOLDER = "missing"
+#: 使っていない素材の場所の形 名前 1 つだけ（``..`` や区切りを含めて外を指させない）
+_UNUSED_NAME = re.compile(rf"{UNUSED_PREFIX}/[^/\\:]+")
+
+
+def _safe_file_name(value: str) -> str:
+    """場所の最後の名前だけを、ファイルの名前に使えない文字を除いて取り出す"""
+    last = re.split(r"[/\\]", value)[-1]
+    return re.sub(r'[<>:"|?*\x00-\x1f]', "_", last).strip(" .") or "ファイル"
+
+
+def _looks_like_place(value: str) -> bool:
+    """場所に見える文字か（共有のフォルダ・ドライブから始まる・区切りで始まる）"""
+    return bool(re.match(r"^(?:[\\/]|[A-Za-z]:)", value.strip()))
+
+
 def _unused_place(item: MediaItem) -> Path:
     """使っていない素材の場所 元のフォルダ（ユーザー名が入る）は捨てて名前だけ残す"""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(item.path).name).strip(" .") or "素材"
@@ -391,19 +426,12 @@ def _put_entry(
             entry.metadata_removed = True
             _put_bytes(zipped, entry, cleaned)
             return
-    if not options.keep_metadata and not _plain_audio(source):
+    if not options.keep_metadata:
+        # 形で決め打ちせず、取り除けずにそのまま入れた物は全部知らせる WAV の BWF のように、
+        # 音のファイルも作った人の名前などを持ちうる（#449 の CodeRabbit の指摘）
         metadata_kept.append(entry.original)
     with source.open("rb") as reader:
         _put_stream(zipped, entry, reader, source.stat().st_size, cancelled)
-
-
-#: 付け足しの情報に場所を持たない形 そのまま入れても「取り除けなかった」とは知らせない
-#: 曲の名前などの札は持ちうるが、撮った場所や機器の名前は持たない
-_PLAIN_AUDIO = frozenset({".wav", ".flac", ".mp3", ".ogg", ".opus", ".aac"})
-
-
-def _plain_audio(source: Path) -> bool:
-    return source.suffix.lower() in _PLAIN_AUDIO
 
 
 def _put_cut(
@@ -618,6 +646,10 @@ def open_package(
             if info.file_size != item.size:
                 raise PackageError(f"パッケージの中身の大きさが目録と違います: {item.path}")
 
+        # 一覧の形も展開の前に確かめる 展開の後に読み違えると、取り出したフォルダが残ったまま
+        # 失敗し、開き直すたびにフォルダが増える（#449 の CodeRabbit の指摘）
+        fonts = _names_list(manifest, "fonts")
+        scripts = _names_list(manifest, "scripts")
         total = sum(item.size for item in listed) + project_listed.size
         root.mkdir(parents=True, exist_ok=True)
         _require_space(root, total, "展開先")
@@ -646,8 +678,6 @@ def open_package(
             shutil.rmtree(work, ignore_errors=True)
             raise
     progress(1.0, "取り出しました")
-    fonts = tuple(value for value in manifest.get("fonts", []) if isinstance(value, str))
-    scripts = tuple(value for value in manifest.get("scripts", []) if isinstance(value, str))
     made_by = manifest.get("app_version")
     return OpenedPackage(
         project_path=folder / project_path.name,
@@ -657,6 +687,13 @@ def open_package(
         scripts=scripts,
         made_by=made_by if isinstance(made_by, str) else "",
     )
+
+
+def _names_list(manifest: dict[str, Any], key: str) -> tuple[str, ...]:
+    raw = manifest.get(key, [])
+    if not isinstance(raw, list) or not all(isinstance(value, str) for value in raw):
+        raise PackageError(f"パッケージの目録が壊れています（{key}）")
+    return tuple(raw)
 
 
 def _verified_bytes(zipped: zipfile.ZipFile, item: _Listed) -> bytes:
@@ -699,13 +736,37 @@ def _relocated(project_bytes: bytes, folder: Path, names: set[str], name: str) -
         raise PackageError(f"パッケージの中の作品が読めません: {exc}") from exc
     for item in project.media:
         place = item.path.as_posix()
-        if place not in names and not place.startswith(f"{UNUSED_PREFIX}/"):
+        if place not in names and not _UNUSED_NAME.fullmatch(place):
             raise PackageError(f"作品が指す素材がパッケージに入っていません: {item.display_name}")
 
     def file(value: str) -> str:
-        return str(folder / value) if value in names else value
+        # 目録に無い場所は、パッケージの外を指す 細工したパッケージが共有のフォルダ（UNC）を
+        # 指させると、描くたびにその機械へつなぎ、Windows の認証を試みる 展開した先の無い場所へ
+        # 置き換え、外へ読みに行かせない（#449 の CodeRabbit の指摘）
+        if value in names:
+            return str(folder / value)
+        return str(folder / MISSING_FOLDER / _safe_file_name(value))
 
-    relocated = map_paths(project, lambda item: folder / item.path.as_posix(), file)
+    def unknown(value: str) -> str:
+        # この PC に無いスクリプトの欄 どれがファイルかは分からないが、中の名前と同じ文字は
+        # 入れたファイルを指していた物なので付け替える（後でスクリプトを入れても画像が見つかる）
+        # 場所に見える文字は外を指さないよう無い場所へ置き換え、ほかの文字はそのまま
+        if value in names:
+            return str(folder / value)
+        if _looks_like_place(value):
+            return str(folder / MISSING_FOLDER / _safe_file_name(value))
+        return value
+
+    relocated = map_paths(
+        project,
+        lambda item: (
+            folder / item.path.as_posix()
+            if item.path.as_posix() in names
+            else folder / UNUSED_PREFIX / _safe_file_name(item.path.as_posix())
+        ),
+        file,
+        unknown=unknown,
+    )
     if name and (not relocated.name or relocated.name == "無題"):
         relocated = replace(relocated, name=name)
     return relocated

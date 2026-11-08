@@ -50,13 +50,10 @@ def scrub_image(data: bytes, suffix: str) -> bytes | None:
     return None
 
 
-def _scrub_jpeg(data: bytes) -> bytes | None:
-    if not data.startswith(_SOI):
-        return None
-    out = bytearray(_SOI)
-    orientation: int | None = None
+def _segments(data: bytes) -> list[tuple[int, bytes]] | None:
+    """SOS の前までの印と塊の並び 最後は SOS から終わりまで 読めなければ ``None``"""
+    found: list[tuple[int, bytes]] = []
     position = 2
-    inserted = False
     while position < len(data):
         if data[position] != 0xFF:
             return None
@@ -66,33 +63,47 @@ def _scrub_jpeg(data: bytes) -> bytes | None:
             position += 1
             continue
         if marker == _SOS:
-            if not inserted:
-                out += _orientation_segment(orientation)
-            out += data[position:]
-            return bytes(out)
+            found.append((marker, data[position:]))
+            return found
         if 0xD0 <= marker <= 0xD7 or marker == 0x01:
             # 長さを持たない印
-            out += data[position : position + 2]
+            found.append((marker, data[position : position + 2]))
             position += 2
             continue
         (length,) = struct.unpack(">H", data[position + 2 : position + 4])
         segment = data[position : position + 2 + length]
         if len(segment) < 2 + length:
             return None
-        body = segment[4:]
-        if marker == 0xE1 and body.startswith(b"Exif\x00\x00"):
-            orientation = _read_orientation(body[6:]) or orientation
+        found.append((marker, segment))
+        position += 2 + length
+    return None
+
+
+def _scrub_jpeg(data: bytes) -> bytes | None:
+    if not data.startswith(_SOI):
+        return None
+    segments = _segments(data)
+    if segments is None:
+        return None
+    # 向きは SOS までのどの EXIF にあってもよい 先に全部を読んでから置く 画素の表（DQT）の
+    # 後ろに EXIF がある写真で、置いた後に見つけた向きを落とすと寝た絵になる
+    # （#449 の CodeRabbit の指摘）
+    orientation: int | None = None
+    for marker, segment in segments:
+        if marker == 0xE1 and segment[4:].startswith(b"Exif\x00\x00"):
+            orientation = _read_orientation(segment[10:]) or orientation
+    out = bytearray(_SOI)
+    inserted = False
+    for marker, segment in segments:
         is_app = 0xE0 <= marker <= 0xEF
         if (is_app and marker not in _KEPT_APPS) or marker == _COM:
-            position += 2 + length
             continue
         if not inserted and marker not in _KEPT_APPS:
             # 向きは APP0 の後ろ、画素の表（DQT など）の前に置く
             out += _orientation_segment(orientation)
             inserted = True
         out += segment
-        position += 2 + length
-    return None
+    return bytes(out)
 
 
 def _read_orientation(tiff: bytes) -> int | None:

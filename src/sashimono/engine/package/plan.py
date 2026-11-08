@@ -38,6 +38,7 @@ __all__ = [
     "map_paths",
     "media_spans",
     "scripts_used",
+    "unknown_kinds",
     "usage",
 ]
 
@@ -219,9 +220,27 @@ def usage(project: Project, margin: Fraction, *, whole: bool = False) -> Usage:
     )
 
 
+#: 文字を付け替える関数
+Change = Callable[[str], str]
+
+
 def _map_params(
-    params: dict[str, ParamValue], names: set[str], change: Callable[[str], str]
+    params: dict[str, ParamValue],
+    specs: tuple[object, ...] | None,
+    files: Change,
+    unknown: Change | None,
 ) -> dict[str, ParamValue]:
+    """欄の値を付け替える ファイルの欄は ``files`` で、定義の分からない種類の欄は ``unknown`` で
+
+    定義の分からない種類（読み込んでいないスクリプト）はどの欄がファイルか分からないので、
+    ``unknown`` を渡したときだけ文字の欄を全部渡す（何を変えるかは関数が決める）
+    """
+    if specs is None:
+        if unknown is None:
+            return params
+        names, change = {name for name, value in params.items() if isinstance(value, str)}, unknown
+    else:
+        names, change = _file_names(specs), files
     if not names:
         return params
     changed = dict(params)
@@ -232,41 +251,39 @@ def _map_params(
     return changed if changed != params else params
 
 
-def _map_effect(effect: Effect, change: Callable[[str], str]) -> Effect:
-    names = _file_names(_specs_of(effect.kind, source=False))
-    params = _map_params(effect.params, names, change)
+def _map_effect(effect: Effect, files: Change, unknown: Change | None) -> Effect:
+    params = _map_params(effect.params, _specs_of(effect.kind, source=False), files, unknown)
     return effect if params is effect.params else replace(effect, params=params)
 
 
-def _map_stroke(stroke: Stroke, change: Callable[[str], str]) -> Stroke:
-    params = _map_params(stroke.params, _file_names(STROKE.parameters), change)
-    effects = tuple(_map_effect(effect, change) for effect in stroke.effects)
+def _map_stroke(stroke: Stroke, files: Change, unknown: Change | None) -> Stroke:
+    params = _map_params(stroke.params, STROKE.parameters, files, unknown)
+    effects = tuple(_map_effect(effect, files, unknown) for effect in stroke.effects)
     return replace(stroke, params=params, effects=effects)
 
 
-def _map_clip(clip: Clip, change: Callable[[str], str]) -> Clip:
+def _map_clip(clip: Clip, files: Change, unknown: Change | None) -> Clip:
     source = clip.source
     if source is not None:
-        names = _file_names(_specs_of(source.kind, source=True))
         source = replace(
             source,
-            params=_map_params(source.params, names, change),
-            strokes=tuple(_map_stroke(stroke, change) for stroke in source.strokes),
+            params=_map_params(source.params, _specs_of(source.kind, source=True), files, unknown),
+            strokes=tuple(_map_stroke(stroke, files, unknown) for stroke in source.strokes),
         )
     return replace(
         clip,
         source=source,
-        effects=tuple(_map_effect(effect, change) for effect in clip.effects),
-        after_effects=tuple(_map_effect(effect, change) for effect in clip.after_effects),
+        effects=tuple(_map_effect(effect, files, unknown) for effect in clip.effects),
+        after_effects=tuple(_map_effect(effect, files, unknown) for effect in clip.after_effects),
     )
 
 
-def _map_timeline(timeline: Timeline, change: Callable[[str], str]) -> Timeline:
+def _map_timeline(timeline: Timeline, files: Change, unknown: Change | None) -> Timeline:
     tracks = tuple(
         replace(
             track,
-            effects=tuple(_map_effect(effect, change) for effect in track.effects),
-            clips=tuple(_map_clip(clip, change) for clip in track.clips),
+            effects=tuple(_map_effect(effect, files, unknown) for effect in track.effects),
+            clips=tuple(_map_clip(clip, files, unknown) for clip in track.clips),
         )
         for track in timeline.tracks
     )
@@ -276,20 +293,39 @@ def _map_timeline(timeline: Timeline, change: Callable[[str], str]) -> Timeline:
 def map_paths(
     project: Project,
     media: Callable[[MediaItem], Path],
-    files: Callable[[str], str],
+    files: Change,
+    *,
+    unknown: Change | None = None,
 ) -> Project:
     """素材の場所と、設定が指すファイルの場所を付け替えた作品を返す
 
     パッケージへ入れるときは中の相対の場所へ、開くときは展開した先の場所へ付け替える
     設定の欄は定義の型（:class:`FileSpec`）で見分ける（名前で決めると、スクリプトの
-    好きな名前のファイルの欄を取りこぼす）
+    好きな名前のファイルの欄を取りこぼす） 定義の分からない種類の欄は ``unknown`` を渡した
+    ときだけ付け替える（開くときに、その PC に無いスクリプトの欄も中の名前から付け替えるため）
     """
     return replace(
         project,
         media=tuple(replace(item, path=media(item)) for item in project.media),
-        timeline=_map_timeline(project.timeline, files),
+        timeline=_map_timeline(project.timeline, files, unknown),
         scenes=tuple(
-            replace(scene, timeline=_map_timeline(scene.timeline, files))
+            replace(scene, timeline=_map_timeline(scene.timeline, files, unknown))
             for scene in project.scenes
         ),
     )
+
+
+def unknown_kinds(project: Project) -> tuple[str, ...]:
+    """定義の分からない（読み込んでいない）エフェクトと生成物の種類 重なりを除いて出てきた順
+
+    どの欄がファイルを指すか分からないので、パッケージにはできない 欄に元の PC の場所が
+    残ったまま人へ渡り、指すファイルも入らない
+    """
+    seen: dict[str, None] = {}
+    for effect in _all_effects(project):
+        if registry.get(effect.kind) is None:
+            seen.setdefault(effect.kind, None)
+    for source in _sources(project):
+        if source_registry.get(source.kind) is None:
+            seen.setdefault(source.kind, None)
+    return tuple(seen)

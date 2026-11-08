@@ -771,6 +771,8 @@ class MainWindow(QMainWindow):
         # 持ち出し用パッケージ（#423）の書き出しと展開 数十 GB になりうるので裏で回し、右端に
         # 進み具合と〔止める〕を出す 人の窓と AI の道具が同じ 1 本を使う
         self._package = PackageJob(self)
+        #: 展開を始めたときの作品の世代（:attr:`Document.generation`）
+        self._package_from = 0
         self._package_indicator = ProgressIndicator(self, cancel_text="止める")
         stop = self._package_indicator.cancel_button
         if stop is not None:
@@ -3310,6 +3312,8 @@ class MainWindow(QMainWindow):
     def _start_package_open(self, package: Path, *, by_assistant: bool) -> None:
         """展開を裏で始める 終わったら :meth:`_package_ended` が作品へ差し替える"""
         root = package_root(self._preferences)
+        # 始めたときに開いていた作品 展開している間に別の作品を開いたら、終わっても差し替えない
+        self._package_from = self._document.generation
 
         def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
             return unpack_package(package, root, progress=progress, cancelled=cancelled)
@@ -3333,6 +3337,16 @@ class MainWindow(QMainWindow):
         if kind != "open" or not isinstance(result, OpenedPackage):
             return
         opened = result
+        # 展開した先の場所は様子の文に載る 開いても開かなくても伏せ字の表に入れる
+        job.remember(str(opened.folder), str(opened.project_path))
+        if self._document.generation != self._package_from:
+            # 展開している間に別の作品を開いた 黙って差し替えると、その作品から離れてしまう
+            # （#449 の CodeRabbit の指摘）
+            job.note(
+                f"展開しました（{opened.folder}）が、その間に別の作品を開いたので開いていません"
+                " 開くなら〔開く…〕で展開した作品を選んでください"
+            )
+            return
         # 展開している間に編集した物を黙って捨てない 人には尋ね、AI の展開なら開かずに知らせる
         if self.is_modified and (job.by_assistant or not self._confirm_discard()):
             job.note(

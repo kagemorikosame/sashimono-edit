@@ -78,13 +78,20 @@ class PackageJob(QObject):
         self._started = 0.0
         self._ended = 0.0
         self.result: object = None
+        #: 終わりの扱い（ended の受け手）が済むまで立つ 受け手が窓を出している間に次の仕事を
+        #: 始めると、前の仕事の終わりで待つ印（_idle）が立ち、次の仕事を待つ AI が走っている
+        #: 最中に起きる（#449 の CodeRabbit の指摘）
+        self._finishing = False
+        #: 書き出し先・開いたパッケージのほかに覚える名前（展開した先のフォルダなど）
+        self._names: list[str] = []
         #: 走っていない間は立っている AI のスレッドが終わりを待つのに使う
         self._idle = threading.Event()
         self._idle.set()
 
     @property
     def running(self) -> bool:
-        return self._state == PACKAGE_RUNNING
+        """走っているか、終わりの扱いの最中か（どちらの間も次の仕事を始めない）"""
+        return self._state == PACKAGE_RUNNING or self._finishing
 
     @property
     def kind(self) -> str:
@@ -141,6 +148,7 @@ class PackageJob(QObject):
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
+            self._thread.deleteLater()
             self._thread = None
         self._worker = None
         self._idle.set()
@@ -149,9 +157,18 @@ class PackageJob(QObject):
         verb = "持ち出し用に書き出し中" if self._kind == "export" else "パッケージを展開中"
         return f"{verb}: {self._text}" if self._text else verb, self._progress
 
+    def remember(self, *names: str) -> None:
+        """様子（:meth:`status` の message）に載せる名前を覚える 作品を開き直しても消さない"""
+        self._names.extend(name for name in names if name and name not in self._names)
+
     def remembered_names(self) -> tuple[str, ...]:
-        """書き出し先・開いたパッケージの場所（#342 伏せ字の表に入れる）"""
-        return (str(self._path),) if self._path is not None else ()
+        """書き出し先・開いたパッケージ・展開した先の場所（#342 伏せ字の表に入れる）
+
+        開かずに終わった展開の先も残す 様子の文に載るので、名前と場所を送らないと決めた人の
+        所で伏せないと、展開したフォルダ（ユーザー名を含む）が外へ出る
+        """
+        names = [str(self._path)] if self._path is not None else []
+        return (*names, *self._names)
 
     def status(self) -> dict[str, object]:
         """AI へ返す様子"""
@@ -192,10 +209,16 @@ class PackageJob(QObject):
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
+            # 終わったスレッドは窓の子として残る 繰り返すと溜まるので片付けを頼む
+            self._thread.deleteLater()
             self._thread = None
         self._worker = None
         # 終わりの扱い（開いた作品へ差し替えるなど）を済ませてから待っている AI を起こす
-        # 先に起こすと、AI が差し替える前の作品を読む
-        self.ended.emit(self._kind, result)
+        # 先に起こすと、AI が差し替える前の作品を読む 扱いの最中は次の仕事を始めさせない
+        self._finishing = True
+        try:
+            self.ended.emit(self._kind, result)
+        finally:
+            self._finishing = False
         self._idle.set()
         self.changed.emit()

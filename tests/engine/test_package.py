@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import struct
@@ -24,13 +25,14 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     Effect,
+    GeneratedSource,
     MediaId,
     MediaItem,
     Project,
     Track,
     TrackKind,
 )
-from sashimono.engine.decode import VideoDecoder, probe_media
+from sashimono.engine.decode import AudioDecoder, VideoDecoder, probe_media
 from sashimono.engine.package import archive
 from sashimono.engine.package.archive import (
     PACKAGE_SUFFIX,
@@ -70,8 +72,12 @@ def _video(directory: Path, name: str = "package-long.mp4", seconds: int = 8) ->
     return path
 
 
-def _frames_equal(a: Path, b: Path, spans: list[Span]) -> bool:
-    with VideoDecoder(a) as left, VideoDecoder(b) as right:
+def _frames_equal(a: Path, b: Path, spans: list[Span], *, index: int | None = None) -> bool:
+    """使う範囲の絵がコマごとに同じで、音も標本ごとに同じか（音の道があれば）
+
+    絵だけを比べると、音のパケットを写し漏らしても通ってしまう
+    """
+    with VideoDecoder(a, index) as left, VideoDecoder(b, index) as right:
         for span in spans:
             moment = span.start
             while moment <= span.end:
@@ -79,7 +85,39 @@ def _frames_equal(a: Path, b: Path, spans: list[Span]) -> bool:
                 if one is None or two is None or not np.array_equal(one, two):
                     return False
                 moment += Fraction(1001, 30000)
+    return _sound_equal(a, b, spans)
+
+
+def _sound_equal(a: Path, b: Path, spans: list[Span]) -> bool:
+    for stream in probe_media(a).audio_streams:
+        with (
+            AudioDecoder(a, sample_rate=stream.sample_rate, stream_index=stream.index) as left,
+            AudioDecoder(b, sample_rate=stream.sample_rate, stream_index=stream.index) as right,
+        ):
+            for span in spans:
+                one = left.read_seconds(span.start, span.end - span.start)
+                two = right.read_seconds(span.start, span.end - span.start)
+                if one.shape != two.shape or not np.allclose(one, two, atol=1e-4):
+                    return False
     return True
+
+
+def _rewrite(package: Path, change: object) -> None:
+    """パッケージの作品と目録を書き換える（細工したパッケージを作る） SHA-256 は合わせ直す"""
+    assert callable(change)
+    with zipfile.ZipFile(package) as zipped:
+        files = {name: zipped.read(name) for name in zipped.namelist()}
+    manifest = json.loads(files["manifest.json"])
+    project = json.loads(files["project.sme"])
+    change(manifest, project)
+    data = json.dumps(project, ensure_ascii=False).encode("utf-8")
+    files["project.sme"] = data
+    manifest["project"]["size"] = len(data)
+    manifest["project"]["sha256"] = hashlib.sha256(data).hexdigest()
+    files["manifest.json"] = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    with zipfile.ZipFile(package, "w") as zipped:
+        for name, content in files.items():
+            zipped.writestr(name, content)
 
 
 def _project(media: list[MediaItem], clips: list[Clip]) -> Project:
@@ -158,6 +196,42 @@ class TestCut:
         with av.open(str(target)) as after:
             assert "location" in after.metadata
 
+    def test_keeping_metadata_does_not_drop_trailing_streams(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """残すと選んだのに後ろの道（字幕・位置の記録）を落とすと選んだ意味が無い まるごと入れる"""
+        source = media_dir / "package-trailing.mkv"
+        if not source.exists():
+            subtitles = media_dir / "package-trailing.srt"
+            subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n", encoding="utf-8")
+            _ffmpeg("-i", str(_video(media_dir)), "-i", str(subtitles), "-map", "0", "-map", "1",
+                    "-c", "copy", str(source))  # fmt: skip
+        target = tmp_path / "kept.mkv"
+        span = [Span(Fraction(2), Fraction(3))]
+        assert not cut_media(source, target, span, muxer="matroska", keep_metadata=True)
+        assert cut_media(source, target, span, muxer="matroska")
+
+    def test_every_picture_stream_keeps_its_frames(self, media_dir: Path, tmp_path: Path) -> None:
+        """2 本目の映像の道はキーフレームの位置が違う 最初の道で切ると 2 本目の頭の絵が欠ける"""
+        source = media_dir / "package-two-pictures.mkv"
+        if not source.exists():
+            other = media_dir / "package-other-gop.mp4"
+            _ffmpeg("-f", "lavfi", "-i", "testsrc=size=96x64:rate=30000/1001:duration=8",
+                    "-c:v", "libx264", "-g", "45", "-pix_fmt", "yuv420p", str(other))  # fmt: skip
+            _ffmpeg("-i", str(_video(media_dir)), "-i", str(other), "-map", "0:v", "-map", "1:v",
+                    "-map", "0:a", "-c", "copy", str(source))  # fmt: skip
+        item = probe_media(source)
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [_clip(item, 0, 30, Fraction(33, 10))]),
+            package,
+            PackOptions(margin=Fraction(0)),
+            scratch=tmp_path / "s",
+        )
+        moved = load_project(open_package(package, tmp_path / "opened").project_path).media[0]
+        span = [Span(Fraction(33, 10), Fraction(43, 10))]
+        assert _frames_equal(source, moved.path, span, index=1)
+
     def test_stopping_leaves_nothing(self, media_dir: Path, tmp_path: Path) -> None:
         """止めた後に書きかけが残ると、ディスクに使えないファイルが溜まる"""
         target = tmp_path / "stopped.mp4"
@@ -203,7 +277,6 @@ class TestPlan:
 
     def test_fonts_and_scripts_are_listed(self, media_dir: Path) -> None:
         """書体と配布物のスクリプトは入れない 一覧に出ないと、開いた人が何が足りないかを知れない"""
-        from sashimono.core.model import GeneratedSource
 
         text = Clip(
             timeline_start=0,
@@ -275,6 +348,112 @@ class TestRoundTrip:
         again = load_project(opened.project_path)
         assert [m.id for m in again.media] == [item.id, spare.id]
         assert str(tmp_path) not in str(again.media[1].path.relative_to(opened.folder))
+
+    def test_an_unloaded_script_stops_the_export(self, media_dir: Path, tmp_path: Path) -> None:
+        """読み込んでいないスクリプトはどの欄がファイルか分からず、元の PC の場所が残ったまま渡る"""
+        item = probe_media(_video(media_dir))
+        unknown = Effect(
+            kind="aviutl:無い/無い.anm:無い", params={"file": "C:/Users/秘密/画像.png"}
+        )
+        clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(unknown,))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        with pytest.raises(PackageError, match="読み込んでいないスクリプト"):
+            write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
+        assert not package.exists()
+
+    def test_a_file_outside_the_package_is_not_followed(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """細工した作品が共有のフォルダを指すと、描くたびにその機械へつないで認証を試みる"""
+        item = probe_media(_video(media_dir))
+        blend = Effect(kind="image_blend", params={"image_file": str(_picture(tmp_path))})
+        clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(blend,))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
+
+        def point_outside(_manifest: dict[str, object], project: dict[str, object]) -> None:
+            clips = project["timeline"]["tracks"][0]["clips"]  # type: ignore[index]
+            clips[0]["effects"][0]["params"]["image_file"] = r"\\attacker\share\x.png"
+            clips[0]["source"] = {
+                "kind": "aviutl:無い/無い.anm:無い",
+                "params": {"f": "files/0002.png", "g": "//attacker/y"},
+            }
+
+        _rewrite(package, point_outside)
+        opened = open_package(package, tmp_path / "opened")
+        clip = load_project(opened.project_path).timeline.tracks[0].clips[0]
+        image = clip.effects[0].params["image_file"]
+        assert isinstance(image, str) and Path(image).is_relative_to(opened.folder)
+        assert "attacker" not in str(clip.source)
+
+    def test_a_file_for_a_missing_script_is_moved_too(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """開く PC にスクリプトが無くても、入れたファイルを指す欄は展開した先へ付け替える
+        付け替えないと、後でスクリプトを入れても画像が見つからない"""
+        item = probe_media(_video(media_dir))
+        blend = Effect(kind="image_blend", params={"image_file": str(_picture(tmp_path))})
+        clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(blend,))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
+
+        def make_unknown(_manifest: dict[str, object], project: dict[str, object]) -> None:
+            effect = project["timeline"]["tracks"][0]["clips"][0]["effects"][0]  # type: ignore[index]
+            effect["kind"] = "aviutl:無い/無い.anm:無い"
+
+        _rewrite(package, make_unknown)
+        opened = open_package(package, tmp_path / "opened")
+        params = load_project(opened.project_path).timeline.tracks[0].clips[0].effects[0].params
+        assert Path(str(params["image_file"])) == opened.folder / "files" / "0001.png"
+
+    def test_the_media_keeps_its_name(self, media_dir: Path, tmp_path: Path) -> None:
+        """中の名前は番号だけなので、名前を残さないと開いた先で 0001.mp4 としか出ない"""
+        item = replace(probe_media(_video(media_dir)), display_name="")
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [_clip(item, 0, 30, Fraction(1))]),
+            package,
+            PackOptions(),
+            scratch=tmp_path / "s",
+        )
+        moved = load_project(open_package(package, tmp_path / "opened").project_path).media[0]
+        assert moved.display_name == item.path.name
+
+    def test_sound_files_kept_as_they_are_are_reported(self, tmp_path: Path) -> None:
+        """WAV も作った人の名前などを持ちうる 取り除けずに入れたのに黙ると、気付かずに渡す"""
+        sound = tmp_path / "声.wav"
+        _ffmpeg("-f", "lavfi", "-i", "sine=duration=2", "-metadata", "artist=秘密の人", str(sound))
+        item = probe_media(sound)
+        clip = _clip(item, 0, 30, Fraction(0))
+        result = write_package(
+            _project([item], [clip]),
+            tmp_path / f"p{PACKAGE_SUFFIX}",
+            PackOptions(),
+            scratch=tmp_path / "s",
+        )
+        assert result.metadata_kept == ("声.wav",)
+
+    def test_a_broken_font_list_leaves_nothing_behind(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """展開の後に目録の形で落ちると、取り出したフォルダが残り、開き直すたびに増える"""
+        item = probe_media(_video(media_dir))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [_clip(item, 0, 30, Fraction(1))]),
+            package,
+            PackOptions(),
+            scratch=tmp_path / "s",
+        )
+
+        def break_fonts(manifest: dict[str, object], _project: dict[str, object]) -> None:
+            manifest["fonts"] = None
+
+        _rewrite(package, break_fonts)
+        with pytest.raises(PackageError, match="fonts"):
+            open_package(package, tmp_path / "opened")
+        opened = tmp_path / "opened"
+        assert not opened.exists() or not list(opened.iterdir())
 
     def test_a_broken_package_is_not_opened(self, media_dir: Path, tmp_path: Path) -> None:
         """壊れた素材のまま開くと、編集の途中で絵が崩れて原因が分からない 展開した物も残さない"""
@@ -437,6 +616,17 @@ class TestScrub:
         assert struct.unpack(">HHIHH", tiff[10:22])[0] == 0x0112
         assert struct.unpack(">H", tiff[18:20])[0] == 6
         assert cleaned.endswith(b"PIXELS\xff\xd9")
+
+    def test_an_exif_after_the_tables_keeps_the_turn(self) -> None:
+        """画素の表の後ろに EXIF がある写真で向きを落とすと、寝た絵になる"""
+        original = _jpeg_with_exif(8)
+        start = original.index(b"\xff\xe1")
+        end = original.index(b"\xff\xdb")
+        moved = original[:start] + original[end:-12] + original[start:end] + original[-12:]
+        cleaned = scrub_image(moved, ".jpg")
+        assert cleaned is not None and b"GPS-SECRET-PLACE" not in cleaned
+        tiff = cleaned[cleaned.index(b"Exif\x00\x00") + 6 :]
+        assert struct.unpack(">H", tiff[18:20])[0] == 8
 
     def test_an_upright_jpeg_gets_no_exif(self) -> None:
         """向きが既定なら EXIF ごと要らない 空の EXIF を足すと読めない読み手がある"""
