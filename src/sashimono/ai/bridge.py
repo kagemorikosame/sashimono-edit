@@ -353,6 +353,11 @@ class EditorBridge:
             result = self._invoke(operation, arguments)
             self._log_sent(operation, result)
             return result
+        except ToolError as error:
+            # 断りや失敗の文も AI へ返る 文に混ざった名前や場所も送った物として数える
+            # （件数が 0 の物は残らないので、名前の無いただの断りは記録に載らない）
+            self._log_sent(operation, str(error))
+            raise
         finally:
             _CALL.reset(token)
 

@@ -264,6 +264,28 @@ class TestLogFromTheResult:
         assert box.get("result") == {"text": "結果に入った文"}
         assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("結果に入った文",)
 
+    def test_a_failure_that_carries_a_place_is_logged(self, secret_host: FakeHost) -> None:
+        # 壊れると、失敗の文に混ざって AI へ返った素材の場所が、送った物の記録から抜ける
+        # （Sourcery の指摘 #450）
+        def fail(_host: object, _arguments: dict[str, Any]) -> object:
+            raise ToolError(f"{SECRET_PATH} を開けませんでした")
+
+        failing = Operation(
+            name="failing",
+            description="",
+            schema={},
+            handler=fail,
+            sends=frozenset({Outbound.PROJECT, Outbound.FILES}),
+            preview=from_result(),
+        )
+        bridge = EditorBridge(secret_host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.FILES: SendChoice.ALLOW})
+        done, box = call_in_thread(bridge, failing, {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert isinstance(box.get("error"), ToolError)
+        (entry,) = bridge.send_log.entries()
+        assert entry.kinds == (SentKind(Outbound.FILES, 1),)
+
 
 class TestEachCall:
     def test_it_asks_again_on_the_next_call(self, host: FakeHost) -> None:
