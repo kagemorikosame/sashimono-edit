@@ -89,7 +89,7 @@ class Hit:
         return f"{self.path.relative_to(ROOT).as_posix()}:{self.line}:{self.column + 1}"
 
 
-def _replacement(text: str, index: int) -> str:
+def _replacement(text: str, index: int, keep: Sequence[tuple[int, int]] = ()) -> str:
     following = text[index + 1] if index + 1 < len(text) else "\n"
     for mark in ("**", "`"):
         if text.startswith(mark, index + 1):
@@ -98,9 +98,24 @@ def _replacement(text: str, index: int) -> str:
             # 詰まって読めない 両方とも一度そうなった
             # 段落の頭からここまでに出た数が奇数なら、いまは記号の中（= 閉じ）
             # 行の頭から数えると、行をまたぐ太字で閉じを開きと取り違える
-            inside = text.count(mark, _paragraph_start(text, index), index) % 2 == 1
-            return "" if inside else " "
+            # 残す範囲（コードなど）の中の記号は数えない 数えると「`**`」のような
+            # コードの中の記号で開きと閉じが入れ替わり、区切りの空白を入れ損なう
+            count = _count_outside(text, mark, _paragraph_start(text, index), index, keep)
+            return "" if count % 2 == 1 else " "
     return "" if following in _CLOSERS else " "
+
+
+def _count_outside(
+    text: str, mark: str, start: int, end: int, keep: Sequence[tuple[int, int]]
+) -> int:
+    """start から end までに、残す範囲の外で mark が出た数（重ならずに数える）"""
+    count = 0
+    index = text.find(mark, start, end)
+    while index != -1:
+        if not any(low <= index < high for low, high in keep):
+            count += 1
+        index = text.find(mark, index + len(mark), end)
+    return count
 
 
 def _paragraph_start(text: str, index: int) -> int:
@@ -285,7 +300,7 @@ def fix_text(text: str, keep: Spans = ()) -> str:
     # 続いた句点の扱いが前の書き換えに引きずられる
     original = text
     for index in reversed(_prose_marks(original, keep)):
-        text = text[:index] + _replacement(original, index) + text[index + 1 :]
+        text = text[:index] + _replacement(original, index, keep) + text[index + 1 :]
     return text
 
 

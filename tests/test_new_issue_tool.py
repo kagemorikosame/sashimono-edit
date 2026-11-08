@@ -82,7 +82,11 @@ class FakeGh:
             self.bodies.append(body_file.read_bytes().decode("utf-8"))
             return f"Creating issue\n{URL}\n"
         if key == "issue list":
-            return json.dumps([{"title": title, "url": URL} for title in self.same_title])
+            # 題は検索に渡さず、開いた物を引いて比べる 渡すと題の中の「label:」が条件になる
+            assert "--search" not in arguments
+            others = [{"title": "別の題", "url": URL + "0"}]
+            same = [{"title": title, "url": URL} for title in self.same_title]
+            return json.dumps(others + same)
         if key == "project view":
             return json.dumps(PROJECT)
         if key == "project field-list":
@@ -91,9 +95,11 @@ class FakeGh:
             return ""
         if key == "project item-add":
             return json.dumps({"id": "I-1"})
-        if key == "issue view" and arguments[-1] == "projectItems":
-            items = [{"title": PROJECT["title"], "status": {"name": self.status}}]
-            return json.dumps({"projectItems": items if self.status else []})
+        if key == "api graphql":
+            # 足した項目の ID で引いたときだけ Status を返す 別の物で引いたら空
+            asked = "item=I-1" in arguments and self.status
+            value = {"name": self.status} if asked else None
+            return json.dumps({"data": {"node": {"fieldValueByName": value}}})
         if key == "issue view":
             return json.dumps({"url": URL, "labels": [{"name": name} for name in self.labels]})
         raise AssertionError(f"思っていない gh の命令: {arguments}")
@@ -219,6 +225,62 @@ def test_code_is_kept_as_data(tool: ModuleType) -> None:
     assert tool.fix_punctuation(f"外{MARU}`中{MARU}`") == f"外 `中{MARU}`"
 
 
+def test_escaped_backtick_does_not_open_code(tool: ModuleType) -> None:
+    # \` を開きと取ると、その後ろの文章をコードと見て、句点が残ったまま公開される
+    text = f"記号 \\`本文{MARU}\\` の後\n"
+    assert tool.check_punctuation("題", text) == ["句点がある（本文の 1 行 8 文字目）"]
+    assert MARU not in tool.fix_punctuation(text)
+
+
+def test_fence_inside_quote_is_kept(tool: ModuleType) -> None:
+    # 引用して貼ったログの句点やコメントを直すと、再現できない報告になる
+    body = f"目的\n\n## 症状\n\n> ```\n> <!-- 貼った -->\n> 字幕{MARU}\n> ```\n"
+    checked = tool.check_body(body, ["症状"])
+    assert "> <!-- 貼った -->\n" in checked.body
+    assert tool.check_punctuation("題", body) == []
+    assert tool.fix_punctuation(body) == body
+
+
+def test_fence_inside_list_is_kept(tool: ModuleType) -> None:
+    # 手順の中に貼ったログを本文と取ると、再現の手順から句点が消える
+    body = f"1. 開く\n   ```\n   字幕{MARU}\n   ```\n- ```\n  ログ{MARU}\n  ```\n"
+    assert tool.check_punctuation("題", body) == []
+
+
+def test_vertical_tab_does_not_start_a_line(tool: ModuleType) -> None:
+    # 垂直タブの後ろの ``` を囲みの開きと取ると、後ろの文章の句点を見逃す
+    text = f"前\v```\n後ろの文{MARU}\n"
+    assert tool.check_punctuation("題", text) == ["句点がある（本文の 2 行 5 文字目）"]
+    assert MARU not in tool.fix_punctuation(text)
+
+
+def test_inline_code_across_lines_is_kept(tool: ModuleType) -> None:
+    # 行をまたぐコードの中のコメントや句点を直すと、貼った再現用の文字列が変わる
+    body = f"目的 `a\n<!-- 貼った -->{MARU}`\n\n## 症状\n\n落ちる\n"
+    checked = tool.check_body(body, ["症状"])
+    assert f"<!-- 貼った -->{MARU}`" in checked.body
+    assert tool.check_punctuation("題", body) == []
+
+
+def test_comment_after_code_with_comment_mark_is_removed(tool: ModuleType) -> None:
+    # コードの中の <!-- から探すと、後ろの注意書きまで残り、雛形の文が公開される
+    text = "記号 `<!--` を書く <!-- 雛形の注意書き -->\n"
+    assert tool.strip_comments(text) == "記号 `<!--` を書く \n"
+
+
+def test_unclosed_fence_keeps_trailing_blank_lines(tool: ModuleType) -> None:
+    # 閉じの無い囲みで終わるログの末尾を詰めると、貼った出力が変わる
+    body = "目的\n\n## 症状\n\n```\nログ\n\n\n"
+    assert tool.check_body(body, ["症状"]).body.endswith("```\nログ\n\n\n")
+    assert tool.check_body("目的\n\n\n\n", []).body == "目的\n"
+
+
+def test_bold_mark_inside_code_is_not_counted(tool: ModuleType) -> None:
+    # コードの中の ** を太字の開きと数えると、次の文の太字の前の空白を入れ損なう
+    text = f"記号 `**` を受ける{MARU}**次の文**\n"
+    assert tool.fix_punctuation(text) == "記号 `**` を受ける **次の文**\n"
+
+
 def test_punctuation_in_title_and_body_is_found(tool: ModuleType) -> None:
     # Issue はリポジトリの外で、句点の検査が届かない ここで拾わないと混ざったまま残る
     found = tool.check_punctuation(f"題{MARU}", f"一行目\v続き\n二行目{MARU}次\n")
@@ -329,6 +391,21 @@ def test_same_title_stops_a_second_issue(
     gh = FakeGh(same_title=["落ちる"])
     assert run_main(tool, gh, *create_bug(body, "--allow-same-title")) == 0
     assert gh.calls[0][:2] == ["issue", "create"]
+
+
+def test_same_title_with_search_words_is_found(tool: ModuleType) -> None:
+    # 題の「label:bug」を検索の条件と読まれると、同じ題の Issue を見逃して 2 本作る
+    gh = FakeGh(same_title=["label:bug の表示を直す"])
+    assert tool.same_titles("label:bug の表示を直す", gh) == [URL]
+
+
+def test_too_many_open_issues_stops_the_title_check(
+    tool: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 上限で切れたまま「同じ題は無い」と答えると、見えない所にある同じ Issue を作り直す
+    monkeypatch.setattr(tool, "OPEN_ISSUE_LIMIT", 1)
+    with pytest.raises(tool.IssueError, match="確かめ切れない"):
+        tool.same_titles("落ちる", FakeGh())
 
 
 def test_refused_body_creates_nothing(
@@ -447,6 +524,16 @@ def test_register_keeps_progressed_status(tool: ModuleType) -> None:
     gh = FakeGh(status="作業中")
     assert run_main(tool, gh, "register", "999") == 0
     assert edits_of(gh) == {("F-size", "Z-m")}
+
+
+def test_register_reads_status_of_added_item_just_before_editing(tool: ModuleType) -> None:
+    # 足す前や板の名前で読むと、別の板の Status や間に進んだ Status を見誤り、
+    # 「未着手」へ戻したり付け忘れたりする
+    gh = FakeGh(status="作業中")
+    tool.register(URL, "中", run=gh)
+    steps = [" ".join(call[:2]) for call in gh.calls]
+    assert steps[-3:] == ["project item-add", "api graphql", "project item-edit"]
+    assert "item=I-1" in gh.calls[-2]
 
 
 def test_unknown_project_option_stops_before_adding(tool: ModuleType) -> None:

@@ -4396,8 +4396,9 @@ GitHub の Issue フォーム（`.yml`）を使わないのも同じ理由
    `--fix` を付けると同じ決まりで直し、手元のファイル（リポジトリの中の物だけ）にも書き戻す
    コードの囲みとインラインのコードの中はデータとして見ない 字幕整形の不具合を再現する文や
    ログから句点を消すと、再現できない報告になる 貼った `<!-- -->` もそこでは残す
-3. 同じ題の開いた Issue が無いか（やり直しや並行するエージェントで 2 本作らない
-   別の物なら `--allow-same-title`）
+3. 同じ題の開いた Issue が無いか（やり直しで 2 本作らない 別の物なら `--allow-same-title`）
+   並行するエージェントが同じ時に確かめると両方とも通るので、これだけでは重複を防げない
+   並行して進めるときは、Issue を作る担当を 1 人（1 つのセッション）に決める
 4. ラベル（下の 4 種類）とマイルストーンを付けて、本家（`kagemorikosame/sashimono-edit`）に作る
    手元の gh が fork を既定にしていても本家に作る
 5. 公開のロードマップ（プロジェクト 3）に足し、Status を「未着手」、「大きさ」の欄をラベルに合わせる
@@ -4406,11 +4407,13 @@ GitHub の Issue フォーム（`.yml`）を使わないのも同じ理由
 止まったときのやり直し方
 
 - **4 で止まった**（gh が失敗した・120 秒で返らなかった） GitHub 側では作られたかもしれない
-  `gh issue list --search "題 in:title"` で確かめ、作られていれば `register <番号>` で登録だけを行う
+  `gh issue list --repo kagemorikosame/sashimono-edit --author @me --limit 5` で確かめ、
+  作られていれば `.venv\Scripts\python.exe tools\new_issue.py register <番号>` で登録だけを行う
   `--parent` で作った子なら親に付いているかも見て、付いていなければ GitHub の画面で親に付ける
   `create` は打ち直さない
 - **5 で止まった**（`gh` に `project` の権限が無いなど） `gh auth refresh -s project` を打ってから
-  `tools\new_issue.py register <番号>` でやり直す 何度打っても項目は 1 つにしかならない
+  `.venv\Scripts\python.exe tools\new_issue.py register <番号>` でやり直す
+  何度打っても項目は 1 つにしかならない
   既に Status が付いていれば変えない（作業中やレビュー中の物を「未着手」へ戻さない）
   大きさのラベルがちょうど 1 つでなければ止まる
 

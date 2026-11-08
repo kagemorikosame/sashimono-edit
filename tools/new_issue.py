@@ -80,6 +80,12 @@ STATUS_FIELD = "Status"
 STATUS_NEW = "未着手"
 SIZE_FIELD = "大きさ"
 
+#: 同じ題を探すときに引く開いた Issue の上限 gh が 100 本ずつに分けて引く
+OPEN_ISSUE_LIMIT = 5000
+
+#: 道具を打つときの頭 .py の関連付けが無い Windows でもそのまま打てる形で案内する
+COMMAND = r".venv\Scripts\python.exe tools\new_issue.py"
+
 #: gh 1 回を待つ上限（秒） 待ち続けると、止まったのか遅いのかが分からないまま固まる
 GH_TIMEOUT = 120
 
@@ -87,10 +93,17 @@ GH_TIMEOUT = 120
 LEAD = "（冒頭）"
 
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _REQUIRED = re.compile(r"<!--\s*必須")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+# 引用（>）とリストの印の後ろに置いた囲みも囲みと取る 取らないと、引用して貼ったログの
+# 句点や <!-- --> を本文として直してしまう 行の頭の字下げは数えない（狭く取るより、
+# コードを本文と取り違えて再現の材料を壊す方が困る）
+_FENCE = re.compile(r"^(?:[ \t]*(?:>|(?:[-+*]|\d{1,9}[.)])(?=[ \t])))*[ \t]*(`{3,}|~{3,})(.*)$")
+#: Markdown の行の区切り（LF・CR・CRLF） splitlines は垂直タブなどでも割るので、
+#: 行の途中の ``` を行の頭と取り違え、後ろの文章をコードと見て句点を見逃す
+_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+_BLANK_LINE = re.compile(r"(?:\r\n|\r|\n)[ \t]*(?:\r\n|\r|\n)")
+_COMMENT_OPEN = "<!--"
+_COMMENT_CLOSE = "-->"
 
 
 class IssueError(Exception):
@@ -129,23 +142,76 @@ def fenced_lines(lines: Sequence[str]) -> list[bool]:
     return flags
 
 
+def split_lines(text: str) -> list[str]:
+    """Markdown の改行（LF・CR・CRLF）だけで割る 改行は行に残す"""
+    return _LINE.findall(text)
+
+
 def code_spans(text: str) -> list[tuple[int, int]]:
     """コードの囲みとインラインのコードが占める文字の範囲
 
     ここは貼ったログや再現用の文字列で、データとして元のまま送る
     句点を消したり ``<!-- -->`` を注意書きとして外したりすると、再現できない報告になる
     """
-    lines = text.splitlines(keepends=True)
+    lines = split_lines(text)
     spans: list[tuple[int, int]] = []
     offset = 0
+    prose_start = 0
     for line, fenced in zip(lines, fenced_lines(lines), strict=True):
         if fenced:
+            spans += _inline_spans(text, prose_start, offset)
             spans.append((offset, offset + len(line)))
-        else:
-            for match in _INLINE_CODE.finditer(line):
-                spans.append((offset + match.start(), offset + match.end()))
+            prose_start = offset + len(line)
         offset += len(line)
+    spans += _inline_spans(text, prose_start, len(text))
+    return sorted(spans)
+
+
+def _inline_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    r"""囲みの外のインラインのコード（CommonMark と同じ読み方）
+
+    閉じは開きと同じ数の ` の並びで、段落（空行まで）の中なら行をまたいでよい
+    行ごとに探すと、行をまたぐコードの中の句点や ``<!-- -->`` を本文として直してしまう
+    ``\``` は文字の ` で、コードの開きにしない 開きと取ると、その後ろの文章の句点を見逃す
+    """
+    spans: list[tuple[int, int]] = []
+    index = start
+    while index < end:
+        character = text[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character != "`":
+            index += 1
+            continue
+        run = index
+        while run < end and text[run] == "`":
+            run += 1
+        blank = _BLANK_LINE.search(text, run, end)
+        close = _closing_run(text, run, blank.start() if blank else end, run - index)
+        if close is None:
+            # 閉じの無い ` はただの文字 後ろの ` を新しい開きとして探し直す
+            index = run
+            continue
+        spans.append((index, close + run - index))
+        index = close + run - index
     return spans
+
+
+def _closing_run(text: str, start: int, end: int, width: int) -> int | None:
+    """start から end までで、ちょうど width 個の ` が並ぶ所の頭"""
+    index = start
+    while index < end:
+        if text[index] != "`":
+            index += 1
+            continue
+        run = index
+        while run < end and text[run] == "`":
+            run += 1
+        if run - index == width:
+            return index
+        index = run
+    return None
 
 
 def _inside(index: int, spans: Sequence[tuple[int, int]]) -> bool:
@@ -172,7 +238,7 @@ def split_sections(body: str) -> list[Section]:
     sections: list[Section] = []
     title, level, heading = LEAD, 0, ""
     collected: list[str] = []
-    lines = body.splitlines(keepends=True)
+    lines = split_lines(body)
     for line, fenced in zip(lines, fenced_lines(lines), strict=True):
         match = None if fenced else _HEADING.match(line.rstrip("\r\n"))
         if match is None:
@@ -194,15 +260,25 @@ def required_sections(template: str) -> list[str]:
 
 
 def strip_comments(text: str) -> str:
-    """雛形の注意書き（``<!-- -->``）を外す コードの中に貼ったコメントは残す"""
+    """雛形の注意書き（``<!-- -->``）を外す コードの中に貼ったコメントは残す
+
+    開きはコードの外の物だけを探す コードの中の ``<!--`` から探し始めると、その後ろの
+    注意書きの ``-->`` までを 1 つと取り、まとめて残してしまう
+    """
     spans = code_spans(text)
     pieces: list[str] = []
     last = 0
-    for match in _COMMENT.finditer(text):
-        if _inside(match.start(), spans):
+    index = text.find(_COMMENT_OPEN)
+    while index != -1:
+        if _inside(index, spans):
+            index = text.find(_COMMENT_OPEN, index + 1)
             continue
-        pieces.append(text[last : match.start()])
-        last = match.end()
+        close = text.find(_COMMENT_CLOSE, index + len(_COMMENT_OPEN))
+        if close == -1:
+            break
+        pieces.append(text[last:index])
+        last = close + len(_COMMENT_CLOSE)
+        index = text.find(_COMMENT_OPEN, last)
     pieces.append(text[last:])
     return "".join(pieces)
 
@@ -271,15 +347,26 @@ def _tidy(text: str) -> str:
     """
     lines = text.replace("\r\n", "\n").split("\n")
     out: list[str] = []
+    kept: list[bool] = []
     for line, fenced in zip(lines, fenced_lines(lines), strict=True):
         if fenced:
             out.append(line)
+            kept.append(True)
             continue
         line = line.rstrip()
         if not line and (not out or not out[-1]):
             continue
         out.append(line)
-    return "\n".join(out).strip("\n") + "\n"
+        kept.append(False)
+    # 末尾の空行は囲みの外の物だけ詰める 閉じの無い囲みで終わる本文は、末尾の空行も
+    # 貼ったログのうち（split の最後の空の要素は最後の改行の分で、付け直すので外す）
+    if out and not out[-1]:
+        out.pop()
+        kept.pop()
+    while out and not out[-1] and not kept[-1]:
+        out.pop()
+        kept.pop()
+    return "\n".join(out) + "\n"
 
 
 def check_punctuation(title: str, body: str) -> list[str]:
@@ -420,14 +507,25 @@ def _option_id(fields: list[dict[str, object]], name: str, option: str) -> Choic
     raise IssueError(f"ロードマップに欄「{name}」が無い")
 
 
-def _current_status(url: str, project_title: str, run: Runner) -> str:
-    """その Issue のロードマップでの今の Status（載っていなければ空）"""
-    issue = json.loads(run(["issue", "view", url, "--repo", REPOSITORY, "--json", "projectItems"]))
-    for item in issue.get("projectItems") or []:
-        if item.get("title") == project_title:
-            status = item.get("status") or {}
-            return str(status.get("name") or "")
-    return ""
+_STATUS_QUERY = (
+    "query($item: ID!) { node(id: $item) { ... on ProjectV2Item {"
+    f' fieldValueByName(name: "{STATUS_FIELD}") {{'
+    " ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }"
+)
+
+
+def _current_status(item_id: str, run: Runner) -> str:
+    """ロードマップの項目の今の Status（空なら空の文字）
+
+    項目の ID で引く 板の名前で Issue の projectItems から探すと、同じ名前の別の板の
+    Status を見て、こちらの板の Status を付け忘れる
+    """
+    answer = json.loads(
+        run(["api", "graphql", "-f", f"query={_STATUS_QUERY}", "-f", f"item={item_id}"])
+    )
+    node = (answer.get("data") or {}).get("node") or {}
+    value = node.get("fieldValueByName") or {}
+    return str(value.get("name") or "")
 
 
 def register(url: str, size: str, run: Runner = run_gh) -> None:
@@ -436,6 +534,8 @@ def register(url: str, size: str, run: Runner = run_gh) -> None:
     足すのは何度やっても 1 つ（gh project item-add は既にあればその項目を返す）
     途中で止まっても、register をやり直せば同じ形になる
     既に Status が付いていれば変えない 作業中やレビュー中の物を「未着手」へ戻さないため
+    板の API には「空のときだけ書く」が無いので、Status は足した後の書く直前に読む
+    前もって読むと、その間に誰かが進めた Status を「未着手」で上書きしうる
     """
     if size not in SIZE_LABELS:
         raise IssueError(f"大きさ {size!r} はロードマップの欄に無い（{' '.join(SIZE_LABELS)}）")
@@ -445,10 +545,10 @@ def register(url: str, size: str, run: Runner = run_gh) -> None:
     # 選択肢は足す前にすべて引く 足した後で欄が無いと分かると、Status の無い項目が板に残る
     status = _option_id(fields, STATUS_FIELD, STATUS_NEW)
     sized = _option_id(fields, SIZE_FIELD, size)
-    choices = [sized]
-    if not _current_status(url, str(project.get("title", "")), run):
-        choices.insert(0, status)
     item_id = str(json.loads(run(["project", "item-add", *common, "--url", url]))["id"])
+    choices = [sized]
+    if not _current_status(item_id, run):
+        choices.insert(0, status)
     for choice in choices:
         run(
             [
@@ -517,7 +617,11 @@ def same_titles(title: str, run: Runner) -> list[str]:
     """同じ題の開いた Issue の URL
 
     作った後の応答が切れてやり直したときや、並行するエージェントが同じ物を立てたときに、
-    同じ Issue が 2 本並ぶのを防ぐ 検索は語で当たるので、題がそのまま同じ物だけを拾う
+    同じ Issue が 2 本並ぶのを防ぐ 並行するエージェントが同じ時に確かめると両方とも
+    通るので、これだけでは防げない（同じ物を立てる担当は 1 人に決める docs/development.md）
+
+    検索（--search）には題を渡さない 「label:bug の表示」のような題は条件として読まれ、
+    同じ題の Issue を見逃す 開いた物をすべて引き、題そのもので比べる
     """
     found = json.loads(
         run(
@@ -528,15 +632,16 @@ def same_titles(title: str, run: Runner) -> list[str]:
                 REPOSITORY,
                 "--state",
                 "open",
-                "--search",
-                f"{title} in:title",
                 "--json",
                 "title,url",
                 "--limit",
-                "100",
+                str(OPEN_ISSUE_LIMIT),
             ]
         )
     )
+    if len(found) >= OPEN_ISSUE_LIMIT:
+        # 上限で切れていると、同じ題の物が見えないまま「無い」と答えてしまう
+        raise IssueError(f"開いた Issue が {OPEN_ISSUE_LIMIT} 本以上あり、同じ題を確かめ切れない")
     return [str(issue["url"]) for issue in found if str(issue["title"]).strip() == title]
 
 
@@ -544,7 +649,7 @@ def _retry_hint(url: str) -> str:
     number = url.rstrip("/").rsplit("/", 1)[-1]
     return (
         "gh に project の権限が無いなら gh auth refresh -s project を打ってから、"
-        f"tools\\new_issue.py register {number} でやり直す（create を打ち直すと 2 本になる）"
+        f"{COMMAND} register {number} でやり直す（create を打ち直すと 2 本になる）"
     )
 
 
@@ -558,8 +663,8 @@ def create(request: Request, run: Runner = run_gh) -> str:
             output = run(create_arguments(request, body_file))
         except IssueError as error:
             raise IssueError(
-                f"{error}\n作られたかどうかは gh issue list --repo {REPOSITORY} --search "
-                f'"{request.title} in:title" で確かめる 作られていれば register <番号> で'
+                f"{error}\n作られたかどうかは gh issue list --repo {REPOSITORY} --author @me "
+                f"--limit 5 で確かめる 作られていれば {COMMAND} register <番号> で"
                 "ロードマップに登録する（親が付いていなければ GitHub の画面で親に付ける）"
             ) from error
     url = output.strip().splitlines()[-1].strip()
