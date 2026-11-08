@@ -125,9 +125,10 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
         start = clip.source_in
         end = clip.source_out(rate)
         if clip.hold_at is not None:
-            # 読む時刻は止める時刻で頭打ちになる（止めた後はそこの絵を出し続ける）
+            # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer）
+            # 絵の読む所（止める時刻まで）と音の読む所の和を入れる 終わりを止める時刻へ縮めると、
+            # 音を鳴らすクリップの止めた後の音が持ち出した先で欠ける（#449 の Codex の指摘）
             start = min(start, clip.hold_at)
-            end = min(end, clip.hold_at)
         sample_rate = project.settings.sample_rate
         lookback = Fraction(history_seconds(clip, rate, sample_rate)).limit_denominator(sample_rate)
         start -= lookback * clip.speed

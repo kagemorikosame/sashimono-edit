@@ -225,6 +225,7 @@ def packed_summary(result: PackResult) -> str:
     text += _listed("範囲だけを切り出せず、全体を入れた素材", result.whole_instead)
     text += _listed("付け足しの情報を取り除けずに入れた物", result.metadata_kept)
     text += _listed("見つからなかったファイル（設定が指していた物）", result.missing_files)
+    text += _listed("使っていないので入れなかった素材（素材一覧には残る）", result.unused_media)
     return text
 
 

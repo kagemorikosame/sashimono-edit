@@ -20,7 +20,16 @@ import numpy as np
 import pytest
 
 from sashimono.core.io.serialize import load_project
-from sashimono.core.model import AnimatedValue, Clip, Effect, MediaItem, Project, Track, TrackKind
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    Effect,
+    MediaId,
+    MediaItem,
+    Project,
+    Track,
+    TrackKind,
+)
 from sashimono.engine.decode import VideoDecoder, probe_media
 from sashimono.engine.package import archive
 from sashimono.engine.package.archive import (
@@ -185,6 +194,13 @@ class TestPlan:
         found = media_spans(project, Fraction(0))[item.id]
         assert found is not None and found[0].start <= 3
 
+    def test_a_held_picture_still_keeps_its_sound(self, media_dir: Path) -> None:
+        """絵を止めても音は長さの分だけ読み続ける 止めた時刻で切ると持ち出した先で音が欠ける"""
+        item = probe_media(_video(media_dir))
+        clip = replace(_clip(item, 0, 90, Fraction(1)), hold_at=Fraction(3, 2))
+        found = media_spans(_project([item], [clip]), Fraction(0))[item.id]
+        assert found is not None and found[0].start == 1 and found[-1].end >= 3
+
     def test_fonts_and_scripts_are_listed(self, media_dir: Path) -> None:
         """書体と配布物のスクリプトは入れない 一覧に出ないと、開いた人が何が足りないかを知れない"""
         from sashimono.core.model import GeneratedSource
@@ -246,6 +262,19 @@ class TestRoundTrip:
                 if name.endswith((".sme", ".json")):
                     assert str(item.path.parent) not in zipped.read(name).decode("utf-8")
             assert all(info.compress_type == zipfile.ZIP_STORED for info in zipped.infolist())
+
+    def test_an_unused_media_does_not_block_opening(self, media_dir: Path, tmp_path: Path) -> None:
+        """素材一覧に使っていない素材があるだけで開けないと、書き出せたのに渡した先で開けない"""
+        item = probe_media(_video(media_dir))
+        spare = replace(probe_media(_picture(tmp_path)), id=MediaId("spare"))
+        project = _project([item, spare], [_clip(item, 0, 30, Fraction(1))])
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        result = write_package(project, package, PackOptions(), scratch=tmp_path / "s")
+        assert result.media_count == 1 and result.unused_media == ("模様.png",)
+        opened = open_package(package, tmp_path / "opened")
+        again = load_project(opened.project_path)
+        assert [m.id for m in again.media] == [item.id, spare.id]
+        assert str(tmp_path) not in str(again.media[1].path.relative_to(opened.folder))
 
     def test_a_broken_package_is_not_opened(self, media_dir: Path, tmp_path: Path) -> None:
         """壊れた素材のまま開くと、編集の途中で絵が崩れて原因が分からない 展開した物も残さない"""

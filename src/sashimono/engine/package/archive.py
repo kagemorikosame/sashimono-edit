@@ -136,6 +136,8 @@ class PackResult:
     whole_instead: tuple[str, ...]
     #: 設定が指していたのに見つからなかったファイル（元の名前）
     missing_files: tuple[str, ...]
+    #: 素材一覧にあってもタイムラインで使っていないので入れなかった素材（元の名前）
+    unused_media: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,7 +313,9 @@ def write_package(
             # 中の名前は書いてから決まる（切り出すと入れ物が変わり、拡張子が変わることがある）
             names = {entry.media_id: entry.name for entry in entries if entry.media_id is not None}
             packed = map_paths(
-                project, lambda item: Path(names.get(item.id, Path(item.path).name)), missing_name
+                project,
+                lambda item: Path(names[item.id]) if item.id in names else _unused_place(item),
+                missing_name,
             )
             project_bytes = json_text(project_to_dict(packed)).encode("utf-8")
             project_entry = _Entry(PROJECT_ENTRY, "project", Path(), "")
@@ -342,7 +346,23 @@ def write_package(
         metadata_kept=tuple(metadata_kept),
         whole_instead=tuple(whole_instead),
         missing_files=tuple(missing_files),
+        unused_media=tuple(
+            item.display_name or Path(item.path).name
+            for item in project.media
+            if item.id not in found.spans
+        ),
     )
+
+
+#: 使っていない素材を指す場所の頭（パッケージの中には無い） 素材一覧の行と字幕の起こし結果を
+#: 残すため、素材一覧からは消さずに、無いと分かる場所を指させる（開いた先では見つからない素材）
+UNUSED_PREFIX = "unused"
+
+
+def _unused_place(item: MediaItem) -> Path:
+    """使っていない素材の場所 元のフォルダ（ユーザー名が入る）は捨てて名前だけ残す"""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(item.path).name).strip(" .") or "素材"
+    return Path(UNUSED_PREFIX) / name
 
 
 def _put_entry(
@@ -678,7 +698,8 @@ def _relocated(project_bytes: bytes, folder: Path, names: set[str], name: str) -
     except (ValueError, ProjectFileError) as exc:
         raise PackageError(f"パッケージの中の作品が読めません: {exc}") from exc
     for item in project.media:
-        if item.path.as_posix() not in names:
+        place = item.path.as_posix()
+        if place not in names and not place.startswith(f"{UNUSED_PREFIX}/"):
             raise PackageError(f"作品が指す素材がパッケージに入っていません: {item.display_name}")
 
     def file(value: str) -> str:
