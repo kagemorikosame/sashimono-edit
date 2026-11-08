@@ -40,7 +40,14 @@ from sashimono.core.io.serialize import (
     save_project,
 )
 from sashimono.core.model import MediaId, MediaItem, Project
-from sashimono.engine.package.plan import Usage, map_paths, unknown_kinds, usage
+from sashimono.engine.package.plan import (
+    Usage,
+    file_fields,
+    folder_kinds,
+    map_paths,
+    unknown_kinds,
+    usage,
+)
 from sashimono.engine.package.remux import Cancelled, Span, cut_media, output_format
 from sashimono.engine.package.scrub import scrub_image, scrubbable
 
@@ -258,6 +265,15 @@ def write_package(
             " スクリプトを読み込むか、そのエフェクトを外してから書き出してください: "
             + "、".join(unknown[:10])
         )
+    folders = folder_kinds(project)
+    if folders:
+        # フォルダはまだ入れられない 欄に元の PC の場所（ユーザー名が入る）が残ったまま人へ渡る
+        # （#449 の CodeRabbit の指摘）
+        raise PackageError(
+            "フォルダを指すエフェクトがあるので、パッケージにできません"
+            " フォルダの欄を空にするか、そのエフェクトを外してから書き出してください: "
+            + "、".join(folders[:10])
+        )
 
     entries: list[_Entry] = []
 
@@ -389,11 +405,6 @@ def _safe_file_name(value: str) -> str:
     return re.sub(r'[<>:"|?*\x00-\x1f]', "_", last).strip(" .") or "ファイル"
 
 
-def _looks_like_place(value: str) -> bool:
-    """場所に見える文字か（共有のフォルダ・ドライブから始まる・区切りで始まる）"""
-    return bool(re.match(r"^(?:[\\/]|[A-Za-z]:)", value.strip()))
-
-
 def _unused_place(item: MediaItem) -> Path:
     """使っていない素材の場所 元のフォルダ（ユーザー名が入る）は捨てて名前だけ残す"""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(item.path).name).strip(" .") or "素材"
@@ -512,6 +523,8 @@ def _manifest(
             "sha256": project_entry.sha256,
         },
         "name": project.name,
+        # ファイルを指す欄の在りか 開く PC にスクリプトが無くても、この欄だけを付け替える
+        "file_fields": list(file_fields(project)),
         "entries": [
             {
                 "path": entry.name,
@@ -650,6 +663,7 @@ def open_package(
         # 失敗し、開き直すたびにフォルダが増える（#449 の CodeRabbit の指摘）
         fonts = _names_list(manifest, "fonts")
         scripts = _names_list(manifest, "scripts")
+        fields = set(_names_list(manifest, "file_fields"))
         total = sum(item.size for item in listed) + project_listed.size
         root.mkdir(parents=True, exist_ok=True)
         _require_space(root, total, "展開先")
@@ -669,7 +683,7 @@ def open_package(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _extract(zipped, item, destination, cancelled)
                 done += item.size
-            project = _relocated(project_bytes, folder, set(names), str(name))
+            project = _relocated(project_bytes, folder, set(names), str(name), fields)
             project_path = work / f"{_safe_folder_name(project.name)}{SUFFIX}"
             # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中
             save_project(project, project_path)
@@ -728,7 +742,9 @@ def _extract(
         raise PackageError(f"パッケージの中身が壊れています（SHA-256 が合わない）: {item.path}")
 
 
-def _relocated(project_bytes: bytes, folder: Path, names: set[str], name: str) -> Project:
+def _relocated(
+    project_bytes: bytes, folder: Path, names: set[str], name: str, fields: set[str]
+) -> Project:
     """中の相対の場所を、展開した先の場所へ付け替えた作品"""
     try:
         project = project_from_dict(json.loads(project_bytes.decode("utf-8")))
@@ -747,14 +763,16 @@ def _relocated(project_bytes: bytes, folder: Path, names: set[str], name: str) -
             return str(folder / value)
         return str(folder / MISSING_FOLDER / _safe_file_name(value))
 
-    def unknown(value: str) -> str:
-        # この PC に無いスクリプトの欄 どれがファイルかは分からないが、中の名前と同じ文字は
-        # 入れたファイルを指していた物なので付け替える（後でスクリプトを入れても画像が見つかる）
-        # 場所に見える文字は外を指さないよう無い場所へ置き換え、ほかの文字はそのまま
+    def unknown(where: str, value: str) -> str:
+        # この PC に無いスクリプトの欄 書き出した側が記したファイルの欄（fields）は、ファイルの
+        # 欄と同じに付け替える（後でスクリプトを入れても画像が見つかり、外も指さない）
+        # 記していない欄は文字の欄なので触らない 場所に見えるだけの文（/字幕 など）を書き換えると、
+        # スクリプトを入れた後の出力が変わる（#449 の CodeRabbit の指摘）
+        # 記していない古いパッケージのため、中の名前と同じ文字だけは付け替える
+        if where in fields:
+            return file(value)
         if value in names:
             return str(folder / value)
-        if _looks_like_place(value):
-            return str(folder / MISSING_FOLDER / _safe_file_name(value))
         return value
 
     relocated = map_paths(

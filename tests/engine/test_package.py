@@ -32,8 +32,9 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
+from sashimono.effects.spec import FileSpec
 from sashimono.engine.decode import AudioDecoder, VideoDecoder, probe_media
-from sashimono.engine.package import archive
+from sashimono.engine.package import archive, plan, remux
 from sashimono.engine.package.archive import (
     PACKAGE_SUFFIX,
     PackageError,
@@ -97,6 +98,9 @@ def _sound_equal(a: Path, b: Path, spans: list[Span]) -> bool:
             for span in spans:
                 one = left.read_seconds(span.start, span.end - span.start)
                 two = right.read_seconds(span.start, span.end - span.start)
+                # 解けなかった所は無音で埋まり、両方とも無音なら同じに見える
+                if left.decode_error is not None or right.decode_error is not None:
+                    return False
                 if one.shape != two.shape or not np.allclose(one, two, atol=1e-4):
                     return False
     return True
@@ -213,12 +217,14 @@ class TestCut:
 
     def test_every_picture_stream_keeps_its_frames(self, media_dir: Path, tmp_path: Path) -> None:
         """2 本目の映像の道はキーフレームの位置が違う 最初の道で切ると 2 本目の頭の絵が欠ける"""
+        # 先に元の動画を作る libx264 の無い ffmpeg では、ここで飛ぶ（下の libx264 で落とさない）
+        base = _video(media_dir)
         source = media_dir / "package-two-pictures.mkv"
         if not source.exists():
             other = media_dir / "package-other-gop.mp4"
             _ffmpeg("-f", "lavfi", "-i", "testsrc=size=96x64:rate=30000/1001:duration=8",
                     "-c:v", "libx264", "-g", "45", "-pix_fmt", "yuv420p", str(other))  # fmt: skip
-            _ffmpeg("-i", str(_video(media_dir)), "-i", str(other), "-map", "0:v", "-map", "1:v",
+            _ffmpeg("-i", str(base), "-i", str(other), "-map", "0:v", "-map", "1:v",
                     "-map", "0:a", "-c", "copy", str(source))  # fmt: skip
         item = probe_media(source)
         package = tmp_path / f"p{PACKAGE_SUFFIX}"
@@ -243,6 +249,51 @@ class TestCut:
                 muxer="mp4",
                 cancelled=lambda: True,
             )
+        assert not target.exists()
+
+    def test_stopping_while_checking_leaves_nothing(self, media_dir: Path, tmp_path: Path) -> None:
+        """写し終えた後の確かめも止められる 止められないと、窓を閉じても比べ終わるまで待たされる"""
+        source = _video(media_dir)
+        span = [Span(Fraction(1), Fraction(2))]
+        checking = False
+        real = remux._same_as_source
+
+        def spy(*arguments: object) -> bool:
+            # 確かめに入ったら止めるよう頼む（写す間は止めない）
+            nonlocal checking
+            checking = True
+            return real(*arguments)  # type: ignore[arg-type]
+
+        target = tmp_path / "checking.mp4"
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(remux, "_same_as_source", spy)
+            with pytest.raises(Cancelled):
+                cut_media(source, target, span, muxer="mp4", cancelled=lambda: checking)
+        assert checking and not target.exists()
+
+    def test_surround_sound_is_checked_in_every_channel(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """2 つへ混ぜて比べると、混ぜると消える LFE の欠けを見落とす 道のチャンネルのまま比べる"""
+        source = media_dir / "package-surround.mp4"
+        if not source.exists():
+            _ffmpeg("-i", str(_video(media_dir)), "-f", "lavfi", "-i",
+                    "sine=frequency=220:duration=8", "-filter_complex",
+                    "[1:a]pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0[a]", "-map", "0:v",
+                    "-map", "[a]", "-c:v", "copy", "-c:a", "aac", str(source))  # fmt: skip
+        target = tmp_path / "surround.mp4"
+        assert cut_media(source, target, [Span(Fraction(2), Fraction(3))], muxer="mp4")
+        assert probe_media(target).audio_streams[0].channels == 6
+
+    def test_unreadable_sound_is_not_trusted(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """解けなかった所は無音で埋まる 両方とも無音なら同じに見えるので、確かめられないとする"""
+        monkeypatch.setattr(AudioDecoder, "decode_error", property(lambda _self: "壊れた"))
+        target = tmp_path / "broken.mp4"
+        assert not cut_media(
+            _video(media_dir), target, [Span(Fraction(2), Fraction(3))], muxer="mp4"
+        )
         assert not target.exists()
 
 
@@ -371,20 +422,46 @@ class TestRoundTrip:
         package = tmp_path / f"p{PACKAGE_SUFFIX}"
         write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
 
-        def point_outside(_manifest: dict[str, object], project: dict[str, object]) -> None:
+        def point_outside(manifest: dict[str, object], project: dict[str, object]) -> None:
             clips = project["timeline"]["tracks"][0]["clips"]  # type: ignore[index]
             clips[0]["effects"][0]["params"]["image_file"] = r"\\attacker\share\x.png"
             clips[0]["source"] = {
                 "kind": "aviutl:無い/無い.anm:無い",
-                "params": {"f": "files/0002.png", "g": "//attacker/y"},
+                "params": {"f": "files/0002.png", "g": "//attacker/y", "t": "/字幕"},
             }
+            # 書き出した側が g をファイルの欄と記した（スクリプトの無い PC でも付け替える）
+            fields = manifest["file_fields"]
+            assert isinstance(fields, list)
+            fields.append(f"source:{clips[0]['id']}/g")
 
         _rewrite(package, point_outside)
         opened = open_package(package, tmp_path / "opened")
         clip = load_project(opened.project_path).timeline.tracks[0].clips[0]
         image = clip.effects[0].params["image_file"]
         assert isinstance(image, str) and Path(image).is_relative_to(opened.folder)
+        assert clip.source is not None
         assert "attacker" not in str(clip.source)
+        # ファイルの欄と記していない文字は、場所に見えても文のまま残す
+        assert clip.source.params["t"] == "/字幕"
+
+    def test_a_folder_field_stops_the_export(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """フォルダはまだ入れられない 書き出すと欄に元の PC の場所（ユーザー名）が残って渡る"""
+        item = probe_media(_video(media_dir))
+        effect = Effect(kind="image_blend", params={"image_file": "C:/Users/秘密/素材"})
+        clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(effect,))
+        folder = (FileSpec("image_file", "フォルダ", directory=True),)
+        real = plan._specs_of
+        monkeypatch.setattr(
+            plan,
+            "_specs_of",
+            lambda kind, *, source: folder if kind == "image_blend" else real(kind, source=source),
+        )
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        with pytest.raises(PackageError, match="フォルダを指すエフェクト"):
+            write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
+        assert not package.exists()
 
     def test_a_file_for_a_missing_script_is_moved_too(
         self, media_dir: Path, tmp_path: Path
@@ -421,6 +498,8 @@ class TestRoundTrip:
 
     def test_sound_files_kept_as_they_are_are_reported(self, tmp_path: Path) -> None:
         """WAV も作った人の名前などを持ちうる 取り除けずに入れたのに黙ると、気付かずに渡す"""
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg が無いので素材を作れない")
         sound = tmp_path / "声.wav"
         _ffmpeg("-f", "lavfi", "-i", "sine=duration=2", "-metadata", "artist=秘密の人", str(sound))
         item = probe_media(sound)
@@ -627,6 +706,32 @@ class TestScrub:
         assert cleaned is not None and b"GPS-SECRET-PLACE" not in cleaned
         tiff = cleaned[cleaned.index(b"Exif\x00\x00") + 6 :]
         assert struct.unpack(">H", tiff[18:20])[0] == 8
+
+    def test_metadata_between_scans_and_after_the_end_goes(self) -> None:
+        """段階的な JPEG は走査の間にも注記を置ける 終わりの後ろの別の絵も EXIF を持つ"""
+        original = _jpeg_with_exif(6)
+        head = original[: original.index(b"\xff\xda")]
+        comment = b"NAME-SECRET"
+        xmp = b"http://ns.adobe.com/xap/1.0/\x00PLACE-SECRET"
+        dht = b"\xff\xc4" + struct.pack(">H", 3) + b"\x00"
+        scans = (
+            b"\xff\xda\x00\x02SCAN1\xff\x00a"
+            + b"\xff\xfe" + struct.pack(">H", len(comment) + 2) + comment
+            + b"\xff\xe1" + struct.pack(">H", len(xmp) + 2) + xmp
+            + dht
+            + b"\xff\xda\x00\x02SCAN2\xff\xd0b"
+            + b"\xff\xd9"
+        )  # fmt: skip
+        cleaned = scrub_image(head + scans + b"TRAILER-SECRET", ".jpg")
+        assert cleaned is not None
+        for secret in (b"NAME-SECRET", b"PLACE-SECRET", b"TRAILER-SECRET", b"GPS-SECRET-PLACE"):
+            assert secret not in cleaned
+        assert b"SCAN1\xff\x00a" in cleaned and dht in cleaned
+        assert cleaned.endswith(b"SCAN2\xff\xd0b\xff\xd9")
+
+    def test_a_jpeg_without_its_end_is_left_alone(self) -> None:
+        """終わりが無い（途中で切れた）JPEG は読み違えうる 取り除いたと言わず、そのまま入れる"""
+        assert scrub_image(_jpeg_with_exif(6)[:-2], ".jpg") is None
 
     def test_an_upright_jpeg_gets_no_exif(self) -> None:
         """向きが既定なら EXIF ごと要らない 空の EXIF を足すと読めない読み手がある"""

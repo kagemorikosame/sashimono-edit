@@ -33,7 +33,9 @@ from sashimono.engine.package.remux import Span, spans_union
 
 __all__ = [
     "Usage",
+    "file_fields",
     "file_paths",
+    "folder_kinds",
     "fonts_used",
     "map_paths",
     "media_spans",
@@ -222,18 +224,23 @@ def usage(project: Project, margin: Fraction, *, whole: bool = False) -> Usage:
 
 #: 文字を付け替える関数
 Change = Callable[[str], str]
+#: 欄の在りか（:func:`file_fields` の札）と文字を受け取って付け替える関数
+Keyed = Callable[[str, str], str]
 
 
 def _map_params(
     params: dict[str, ParamValue],
     specs: tuple[object, ...] | None,
-    files: Change,
-    unknown: Change | None,
+    owner: str,
+    files: Keyed,
+    unknown: Keyed | None,
 ) -> dict[str, ParamValue]:
     """欄の値を付け替える ファイルの欄は ``files`` で、定義の分からない種類の欄は ``unknown`` で
 
     定義の分からない種類（読み込んでいないスクリプト）はどの欄がファイルか分からないので、
-    ``unknown`` を渡したときだけ文字の欄を全部渡す（何を変えるかは関数が決める）
+    ``unknown`` を渡したときだけ文字の欄を全部渡す（何を変えるかは関数が決める） 関数には
+    欄の在りか（``owner/欄の名前``）も渡す 書き出したときに記したファイルの欄だけを開く側で
+    付け替えられるようにするため
     """
     if specs is None:
         if unknown is None:
@@ -247,27 +254,39 @@ def _map_params(
     for name in names:
         value = params.get(name)
         if isinstance(value, str) and value:
-            changed[name] = change(value)
+            changed[name] = change(f"{owner}/{name}", value)
     return changed if changed != params else params
 
 
-def _map_effect(effect: Effect, files: Change, unknown: Change | None) -> Effect:
-    params = _map_params(effect.params, _specs_of(effect.kind, source=False), files, unknown)
+def _map_effect(effect: Effect, files: Keyed, unknown: Keyed | None) -> Effect:
+    params = _map_params(
+        effect.params,
+        _specs_of(effect.kind, source=False),
+        f"effect:{effect.id}",
+        files,
+        unknown,
+    )
     return effect if params is effect.params else replace(effect, params=params)
 
 
-def _map_stroke(stroke: Stroke, files: Change, unknown: Change | None) -> Stroke:
-    params = _map_params(stroke.params, STROKE.parameters, files, unknown)
+def _map_stroke(stroke: Stroke, files: Keyed, unknown: Keyed | None) -> Stroke:
+    params = _map_params(stroke.params, STROKE.parameters, f"stroke:{stroke.id}", files, unknown)
     effects = tuple(_map_effect(effect, files, unknown) for effect in stroke.effects)
     return replace(stroke, params=params, effects=effects)
 
 
-def _map_clip(clip: Clip, files: Change, unknown: Change | None) -> Clip:
+def _map_clip(clip: Clip, files: Keyed, unknown: Keyed | None) -> Clip:
     source = clip.source
     if source is not None:
         source = replace(
             source,
-            params=_map_params(source.params, _specs_of(source.kind, source=True), files, unknown),
+            params=_map_params(
+                source.params,
+                _specs_of(source.kind, source=True),
+                f"source:{clip.id}",
+                files,
+                unknown,
+            ),
             strokes=tuple(_map_stroke(stroke, files, unknown) for stroke in source.strokes),
         )
     return replace(
@@ -278,7 +297,7 @@ def _map_clip(clip: Clip, files: Change, unknown: Change | None) -> Clip:
     )
 
 
-def _map_timeline(timeline: Timeline, files: Change, unknown: Change | None) -> Timeline:
+def _map_timeline(timeline: Timeline, files: Keyed, unknown: Keyed | None) -> Timeline:
     tracks = tuple(
         replace(
             track,
@@ -295,24 +314,76 @@ def map_paths(
     media: Callable[[MediaItem], Path],
     files: Change,
     *,
-    unknown: Change | None = None,
+    unknown: Keyed | None = None,
 ) -> Project:
     """素材の場所と、設定が指すファイルの場所を付け替えた作品を返す
 
     パッケージへ入れるときは中の相対の場所へ、開くときは展開した先の場所へ付け替える
     設定の欄は定義の型（:class:`FileSpec`）で見分ける（名前で決めると、スクリプトの
     好きな名前のファイルの欄を取りこぼす） 定義の分からない種類の欄は ``unknown`` を渡した
-    ときだけ付け替える（開くときに、その PC に無いスクリプトの欄も中の名前から付け替えるため）
+    ときだけ、欄の在りかと文字を渡して付け替える（開く PC に無いスクリプトの欄のため）
     """
+
+    def keyed(_where: str, value: str) -> str:
+        return files(value)
+
     return replace(
         project,
         media=tuple(replace(item, path=media(item)) for item in project.media),
-        timeline=_map_timeline(project.timeline, files, unknown),
+        timeline=_map_timeline(project.timeline, keyed, unknown),
         scenes=tuple(
-            replace(scene, timeline=_map_timeline(scene.timeline, files, unknown))
+            replace(scene, timeline=_map_timeline(scene.timeline, keyed, unknown))
             for scene in project.scenes
         ),
     )
+
+
+def file_fields(project: Project) -> tuple[str, ...]:
+    """ファイルを指す欄の在りか（``effect:<id>/欄`` など 値の入っている物だけ）
+
+    パッケージの目録に記す 開く PC にスクリプトが無いと、どの欄がファイルかを定義から
+    読めない 記しておけば、その欄だけを展開した先へ付け替え、ほかの文字（``/字幕`` のような
+    場所に見える文）は書き換えない（#449 の CodeRabbit の指摘）
+    """
+    seen: dict[str, None] = {}
+
+    def note(where: str, value: str) -> str:
+        seen.setdefault(where, None)
+        return value
+
+    replace(
+        project,
+        timeline=_map_timeline(project.timeline, note, None),
+        scenes=tuple(
+            replace(scene, timeline=_map_timeline(scene.timeline, note, None))
+            for scene in project.scenes
+        ),
+    )
+    return tuple(seen)
+
+
+def folder_kinds(project: Project) -> tuple[str, ...]:
+    """フォルダを指す欄に値の入ったエフェクトと生成物の種類 重なりを除いて出てきた順
+
+    フォルダはまだパッケージに入れられない 欄の値（元の PC の場所 ユーザー名が入る）が
+    そのまま人へ渡るので、書き出しを断る（#449 の CodeRabbit の指摘）
+    """
+    seen: dict[str, None] = {}
+
+    def check(kind: str, params: dict[str, ParamValue], specs: tuple[object, ...] | None) -> None:
+        for spec in specs or ():
+            if isinstance(spec, FileSpec) and spec.directory:
+                value = params.get(spec.name)
+                if isinstance(value, str) and value:
+                    seen.setdefault(kind, None)
+
+    for effect in _all_effects(project):
+        check(effect.kind, effect.params, _specs_of(effect.kind, source=False))
+    for source in _sources(project):
+        check(source.kind, source.params, _specs_of(source.kind, source=True))
+        for stroke in source.strokes:
+            check("stroke", stroke.params, STROKE.parameters)
+    return tuple(seen)
 
 
 def unknown_kinds(project: Project) -> tuple[str, ...]:

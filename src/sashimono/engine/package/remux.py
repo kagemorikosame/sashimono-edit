@@ -178,7 +178,13 @@ def cut_media(
         raise
     except (av.error.FFmpegError, OSError, ValueError, ProbeError):
         written = False
-    if written and _same_as_source(source, target, merged):
+    try:
+        same = written and _same_as_source(source, target, merged, cancelled)
+    except Cancelled:
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+        raise
+    if same:
         return True
     with contextlib.suppress(OSError):
         target.unlink(missing_ok=True)
@@ -344,11 +350,15 @@ def _first_keyframe(
     return None
 
 
-def _same_as_source(source: Path, target: Path, spans: list[Span]) -> bool:
+def _same_as_source(
+    source: Path, target: Path, spans: list[Span], cancelled: Callable[[], bool]
+) -> bool:
     """写した素材が、使う区間で元と同じ絵を出すか
 
     入れ物によって時刻の丸め（matroska は 1ms）や頭の時刻の書き方が違う 推測で信じず、
     素材の原点・道の並び・回転・色・区間の頭の絵（画素ごと）を元と比べる
+    区間が多いと比べるのにも時間が掛かるので、区間ごとに止めるよう頼まれたかを見る
+    （窓を閉じたときに、比べ終わるまで待たせない）
     """
     try:
         before = probe_media(source)
@@ -377,11 +387,13 @@ def _same_as_source(source: Path, target: Path, spans: list[Span]) -> bool:
         # 映像の道は全部見る キーフレームの位置は道ごとに違い、最初の道で切った所が 2 本目の
         # 道のキーフレームより後ろだと、2 本目の区間の頭の絵が欠ける（#449 の CodeRabbit の指摘）
         for stream in before.video_streams:
-            if not _same_pictures(source, target, stream.index, spans):
+            if not _same_pictures(source, target, stream.index, spans, cancelled):
                 return False
         # 音の道も区間の頭を比べる AAC は前のパケットを読まないと頭が違う音になる
         for audio in before.audio_streams:
-            if not _same_sound(source, target, audio.index, audio.sample_rate, spans):
+            if not _same_sound(
+                source, target, audio.index, audio.sample_rate, audio.channels, spans, cancelled
+            ):
                 return False
     except (ProbeError, av.error.FFmpegError, OSError, ValueError):
         return False
@@ -397,9 +409,13 @@ _SOUND_CHECK = Fraction(1, 4)
 _SOUND_TOLERANCE = 1e-4
 
 
-def _same_pictures(source: Path, target: Path, index: int, spans: list[Span]) -> bool:
+def _same_pictures(
+    source: Path, target: Path, index: int, spans: list[Span], cancelled: Callable[[], bool]
+) -> bool:
     with VideoDecoder(source, index) as original, VideoDecoder(target, index) as copied:
         for span in spans:
+            if cancelled():
+                raise Cancelled
             moment = max(Fraction(0), span.start)
             old_frame = original.frame_at(moment)
             new_frame = copied.frame_at(moment)
@@ -412,14 +428,34 @@ def _same_pictures(source: Path, target: Path, index: int, spans: list[Span]) ->
     return True
 
 
+#: 音を比べられるチャンネルの数（読み手が並びを知っている物） ほかの数はまるごと入れる
+_SOUND_CHANNELS = frozenset({1, 2, 6, 8})
+
+
 def _same_sound(
-    source: Path, target: Path, index: int, sample_rate: int, spans: list[Span]
+    source: Path,
+    target: Path,
+    index: int,
+    sample_rate: int,
+    channels: int,
+    spans: list[Span],
+    cancelled: Callable[[], bool],
 ) -> bool:
+    # チャンネルは素材のまま全部比べる 2 つへ混ぜて比べると、5.1 の LFE（混ぜると消える）の
+    # 欠けを見落とす 比べられない数なら確かめられないので切り出さない（#449 の CodeRabbit の指摘）
+    if channels not in _SOUND_CHANNELS:
+        return False
     with (
-        AudioDecoder(source, sample_rate=sample_rate, stream_index=index) as original,
-        AudioDecoder(target, sample_rate=sample_rate, stream_index=index) as copied,
+        AudioDecoder(
+            source, sample_rate=sample_rate, channels=channels, stream_index=index
+        ) as original,
+        AudioDecoder(
+            target, sample_rate=sample_rate, channels=channels, stream_index=index
+        ) as copied,
     ):
         for span in spans:
+            if cancelled():
+                raise Cancelled
             moment = max(Fraction(0), span.start)
             length = min(_SOUND_CHECK, max(Fraction(0), span.end - moment)) or _SOUND_CHECK
             old = original.read_seconds(moment, length)
@@ -428,4 +464,8 @@ def _same_sound(
                 return False
             if old.size and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE:
                 return False
+        # 解けなかった所は読み手が無音で埋める 両方が無音なら同じに見えるので、解けなかったら
+        # 確かめられなかったとして切り出さない（#449 の CodeRabbit の指摘）
+        if original.decode_error is not None or copied.decode_error is not None:
+            return False
     return True

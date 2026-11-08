@@ -24,6 +24,10 @@ _SOS = 0xDA
 _KEPT_APPS = frozenset({0xE0, 0xE2, 0xEE})
 #: 落とす印 APP1（EXIF と XMP）・APP13（IPTC）とほかの APP、COM（注記）
 _COM = 0xFE
+#: 絵の終わり
+_EOI = 0xD9
+#: APP2 のうち、後ろに付けた別の絵（MPF）の目次 後ろの絵は落とすので目次も落とす
+_MPF = b"MPF\x00"
 
 #: PNG の頭と、落とす塊 eXIf（EXIF）と文字の塊（tEXt・zTXt・iTXt XMP もここに入る）と時刻
 _PNG_HEAD = b"\x89PNG\r\n\x1a\n"
@@ -96,14 +100,75 @@ def _scrub_jpeg(data: bytes) -> bytes | None:
     inserted = False
     for marker, segment in segments:
         is_app = 0xE0 <= marker <= 0xEF
-        if (is_app and marker not in _KEPT_APPS) or marker == _COM:
+        if (is_app and marker not in _KEPT_APPS) or marker == _COM or _is_mpf(marker, segment):
             continue
         if not inserted and marker not in _KEPT_APPS:
             # 向きは APP0 の後ろ、画素の表（DQT など）の前に置く
             out += _orientation_segment(orientation)
             inserted = True
+        if marker == _SOS:
+            scans = _scrub_scans(segment)
+            if scans is None:
+                return None
+            segment = scans
         out += segment
     return bytes(out)
+
+
+def _is_mpf(marker: int, segment: bytes) -> bool:
+    return marker == 0xE2 and segment[4:].startswith(_MPF)
+
+
+def _scrub_scans(tail: bytes) -> bytes | None:
+    """最初の SOS から後ろ 走査の間の APP と COM、絵の終わりより後ろを落とす
+
+    段階的な JPEG は走査を何度も重ね、その間にも APP や注記を置ける 最初の SOS までしか
+    見ないと、そこに入った名前や場所が残ったのに取り除いたと知らせてしまう 終わり（EOI）の
+    後ろには別の絵（MPF の縮小版・深度）を付ける機器があり、その絵も EXIF を持つので落とす
+    （#449 の CodeRabbit の指摘） 形が読めなければ ``None``（呼ぶ側が取り除けなかったと知らせる）
+    """
+    out = bytearray()
+    position = 0
+    size = len(tail)
+    while position + 1 < size:
+        if tail[position] != 0xFF:
+            return None
+        marker = tail[position + 1]
+        if marker == 0xFF:
+            position += 1
+            continue
+        if marker == _EOI:
+            out += tail[position : position + 2]
+            return bytes(out)
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            out += tail[position : position + 2]
+            position += 2
+            continue
+        (length,) = struct.unpack(">H", tail[position + 2 : position + 4])
+        segment = tail[position : position + 2 + length]
+        if len(segment) < 2 + length:
+            return None
+        dropped = (0xE0 <= marker <= 0xEF) or marker == _COM
+        if not dropped:
+            out += segment
+        position += 2 + length
+        if marker == _SOS:
+            # 画素の符号は次の印まで 0xFF 0x00（詰めた 0xFF）と RST は符号の中の物
+            begin = position
+            while True:
+                position = tail.find(b"\xff", position)
+                if position < 0 or position + 1 >= size:
+                    return None
+                following = tail[position + 1]
+                if following == 0x00 or 0xD0 <= following <= 0xD7:
+                    position += 2
+                    continue
+                if following == 0xFF:
+                    position += 1
+                    continue
+                break
+            out += tail[begin:position]
+    return None
 
 
 def _read_orientation(tiff: bytes) -> int | None:
