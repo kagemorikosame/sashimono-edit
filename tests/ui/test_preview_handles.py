@@ -708,8 +708,9 @@ class TestTheOverlayIsDrawnOnEveryPath:
         def __init__(self) -> None:
             self.compositor = TestTheOverlayIsDrawnOnEveryPath._Compositor()
 
-        def compose(self, frame: int) -> None:
-            del frame
+        def compose(self, frame: int, **options: object) -> None:
+            # プレビューは何も無い所の地（#456）も渡す 受け取れないと描く道で落ちる
+            del frame, options
 
         def close(self) -> None:
             pass

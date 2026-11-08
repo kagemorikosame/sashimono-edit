@@ -91,6 +91,15 @@ from sashimono.engine.encoders import (
     PRIORITY_CPU,
     PRIORITY_INTEL,
 )
+from sashimono.engine.render.backdrop import (
+    FILL_BLACK,
+    FILL_CHECKER,
+    FILL_DARK,
+    FILL_LIGHT,
+    MARGIN_BLACK,
+    MARGIN_GRAY,
+    MARGIN_THEME,
+)
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
@@ -146,6 +155,8 @@ __all__ = [
     "ENCODER_PRIORITY_CHOICES",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
+    "PREVIEW_FILL_CHOICES",
+    "PREVIEW_MARGIN_CHOICES",
     "PROXY_HEIGHTS",
     "QUALITY_DIVISORS",
     "SCENE_ANALYSIS_CHOICES",
@@ -227,6 +238,22 @@ SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
 SCREEN_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
     (SCREEN_ON_DEMAND, "AI が頼んだときだけ（既定）"),
     (SCREEN_ON_IMPORT, "読み込んだときに調べる（部品が入っていれば）"),
+)
+
+#: プレビューで何も描いていない所の地（:attr:`Preferences.preview_fill` #456）
+#: 色は見本の絵の地（「見本の地」）と同じ 黒は書き出しと同じ見え方なので既定にする
+PREVIEW_FILL_CHOICES: tuple[tuple[str, str], ...] = (
+    (FILL_BLACK, "黒（既定 書き出しと同じ）"),
+    (FILL_CHECKER, "市松模様"),
+    (FILL_DARK, "暗い地"),
+    (FILL_LIGHT, "明るい地"),
+)
+
+#: プレビューの画面の外の余白（:attr:`Preferences.preview_margin` #456）
+PREVIEW_MARGIN_CHOICES: tuple[tuple[str, str], ...] = (
+    (MARGIN_GRAY, "暗い灰色（既定）"),
+    (MARGIN_BLACK, "黒"),
+    (MARGIN_THEME, "テーマに合わせる"),
 )
 
 #: 画面の中の文字を読む方式（:attr:`Preferences.ocr_engine` 2026-10-21 本人の決定）
@@ -555,6 +582,30 @@ class PreferencesDialog(QDialog):
             "プレビューの絵そのもの（書き出す色）はテーマで変わらない"
         )
         form.addRow("画面の色（テーマ）", self._theme)
+        self._preview_fill = QComboBox(self)
+        for value, text in PREVIEW_FILL_CHOICES:
+            self._preview_fill.addItem(text, value)
+        self._preview_fill.setCurrentIndex(
+            max(0, self._preview_fill.findData(preferences.preview_fill))
+        )
+        self._preview_fill.setToolTip(
+            "プレビューの画面の中で、どのクリップも描いていない所に敷く地 "
+            "黒い映像と見分けたいときに市松などへ変える "
+            "書き出しとスナップショットはどれを選んでも黒 "
+            "黒以外のときはプレビューの左下に「書き出しでは黒」の印が出る 地は見本の絵の地と同じ色"
+        )
+        form.addRow("プレビューの何も無い所", self._preview_fill)
+        self._preview_margin = QComboBox(self)
+        for value, text in PREVIEW_MARGIN_CHOICES:
+            self._preview_margin.addItem(text, value)
+        self._preview_margin.setCurrentIndex(
+            max(0, self._preview_margin.findData(preferences.preview_margin))
+        )
+        self._preview_margin.setToolTip(
+            "プレビューの枠と作品の縦横比が違うときにできる、画面の外の帯の色 "
+            "書き出しには入らない 「テーマに合わせる」はプレビューの周りと同じ色"
+        )
+        form.addRow("プレビューの画面の外", self._preview_margin)
         self._preview_handles = QCheckBox("プレビューで外枠を出して直接動かす", self)
         self._preview_handles.setChecked(preferences.preview_handles)
         self._preview_handles.setToolTip(
@@ -1306,6 +1357,8 @@ class PreferencesDialog(QDialog):
             match_video=str(self._match_video.currentData()),
             dock_tabs=str(self._dock_tabs.currentData()),
             preview_handles=self._preview_handles.isChecked(),
+            preview_fill=str(self._preview_fill.currentData()),
+            preview_margin=str(self._preview_margin.currentData()),
             keyframe_drag=str(self._keyframe_drag.currentData()),
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),

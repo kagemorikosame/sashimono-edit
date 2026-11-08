@@ -199,6 +199,7 @@ from sashimono.engine.reframe import (
     tracked_media,
 )
 from sashimono.engine.render import FrameRenderer, RenderQuality
+from sashimono.engine.render.backdrop import fill_backdrop
 from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
 from sashimono.links import MANUAL_URL, REPORT_URL
 from sashimono.ui import hdr_notice, media_match
@@ -578,6 +579,9 @@ class MainWindow(QMainWindow):
             prefetch_thread=self._preferences.prefetch_thread,
         )
         self._preview.set_handles_enabled(self._preferences.preview_handles)
+        self._preview.set_backdrop(
+            fill_backdrop(self._preferences.preview_fill), self._preferences.preview_margin
+        )
         self._preview.set_keyframe_drag(self._preferences.keyframe_drag)
         self._preview.set_snap(self._preferences.preview_snap, self._preferences.snap_distance)
         self._transport = TransportBar(project.rate, self)
@@ -1140,6 +1144,9 @@ class MainWindow(QMainWindow):
         self._preview.set_prefetch_thread(preferences.prefetch_thread)
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
+        self._preview.set_backdrop(
+            fill_backdrop(preferences.preview_fill), preferences.preview_margin
+        )
         self._preview.set_keyframe_drag(preferences.keyframe_drag)
         self._preview.set_snap(preferences.preview_snap, preferences.snap_distance)
         if native.enabled() != preferences.native_modules:
