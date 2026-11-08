@@ -130,6 +130,9 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "PROXY_UNUSED_LATER",
+    "PROXY_UNUSED_MODES",
+    "PROXY_UNUSED_ON_USE",
     "SCENES_ALWAYS",
     "SCENES_ON_DEMAND",
     "SCENES_WITH_AI",
@@ -300,6 +303,12 @@ SCREEN_ON_DEMAND = "on_demand"
 SCREEN_ON_IMPORT = "on_import"
 SCREEN_ANALYSIS_MODES = (SCREEN_ON_DEMAND, SCREEN_ON_IMPORT)
 
+#: タイムラインで使っていない素材の控えをどうするか :attr:`Preferences.proxy_unused` の値（#441）
+#: 使っている素材の後で作る・使い始めたときに作る
+PROXY_UNUSED_LATER = "later"
+PROXY_UNUSED_ON_USE = "on_use"
+PROXY_UNUSED_MODES = (PROXY_UNUSED_LATER, PROXY_UNUSED_ON_USE)
+
 #: 場面の解析に使うデコードのスレッドの数として選べる物 0 はすべて（PyAV に任せる）
 SCENE_THREAD_CHOICES = (1, 2, 4, 0)
 
@@ -345,6 +354,19 @@ class Preferences:
     #: CPU か GPU を使うので、それを嫌う人は切れる 線と実測は
     #: :data:`sashimono.engine.cache.proxy.KEYFRAME_GAP_LIMIT` の所の表
     proxy_long_gop: bool = True
+    #: 控えを別のプロセスで作る（#440） 切るとアプリの中のスレッドで作る
+    #: 既定は入 同じプロセスのスレッドで作ると、画面や先読みと GIL を取り合って単体の
+    #: 8 分の 1 ほどの速さになり、作っている間は画面の操作も重くなる（実測は
+    #: :mod:`sashimono.engine.cache.proxy` の表） 子を起こせない機械では自分でスレッドへ戻る
+    #: 切れるようにするのは、子のプロセスが見張りのソフトに止められるなど、手元の事情で
+    #: 起こしたくない人のため
+    proxy_process: bool = True
+    #: タイムラインで使っていない素材の控えをどうするか（#441）
+    #: 既定は後回しで作る（``later``） 使っている素材を先に作り、それが済んでから残りを作る
+    #: 作らずにおくと、後から使い始めた所で控えが無く、飛ぶたびに待たされる（知らない人ほど
+    #: 理由が分からない） 素材を大量に読み込んで一部しか使わない人は、使い始めたときに作る
+    #: （``on_use``）にすれば CPU と GPU と置き場を使わずに済む
+    proxy_unused: str = PROXY_UNUSED_LATER
     #: 高さが :data:`AUTO_QUALITY_HEIGHT` 以上の素材を読み込んだら、プレビューの画質を自動で落とす
     #: 画面の大きさは見ない（設定画面の文言は ``preferences_dialog.AUTO_QUALITY_TEXT``）
     auto_quality: bool = True
@@ -365,6 +387,11 @@ class Preferences:
     #: するのは、ドライバとの相性で絵が乱れたときに逃げられるようにするため
     #: 実測は :data:`sashimono.engine.render.background.MEASURED_PREFETCH_STALL_MS`
     prefetch_thread: bool = True
+    #: タイムラインやプレビューを操作している間は先読みを止め、手が止まってから貯める（#442 C）
+    #: 既定は入 先読みの走り係は別のスレッドでも Python を動かすので、操作の最中に貯めると
+    #: クリック 1 回の応答が遅れることがある 止めている間は貯まらないので、操作のすぐ後に
+    #: 再生すると先読みの効きが少し遅れる 操作中も貯め続けたい人は切れる
+    prefetch_yield: bool = True
     #: 書き出しで、GPU の合成を書き込み（色変換・エンコード・mux）の何枚ぶん先へ進めるか
     #: 0 で直列（1 枚ずつ、スレッドを使わない）
     #: 既定は 2 1 枚ぶんは画面 1 枚の RGBA（1080p で 8MB、4K で 33MB）なので、
@@ -416,6 +443,11 @@ class Preferences:
     #: 既定は入 HDR を知らない人ほど、褪せた絵をソフトの不具合だと受け取る
     #: 知っていて HDR の素材を何度も読み込む人は、窓が邪魔なので切れるようにする
     hdr_notice: bool = True
+    #: 画面の止まり（30ms を超えて操作を受け付けなかった所）を、その瞬間の処理の並びと一緒に
+    #: 記録する（#442 の 0 番 不具合の報告用） 既定は切 見張りのスレッドが 1 秒に何十回も
+    #: 起きて少しだけ重くなり、記録も溜まる カクつきを報告するときだけ入れてもらう
+    #: 環境変数 ``SASHIMONO_STALL_WATCH`` でも入る（:mod:`sashimono.stall_watch`）
+    stall_watch: bool = False
     #: AviUtl2 の汎用プラグイン（``.aux2``）を全部読んで、スクリプトが引くモジュールを探す
     #: 既定は切 切っている間は、名前を出すと確かめたプラグイン（合成フォントの
     #: ``comfont.aux2``）だけを読む 全部を読むと、関係の無いプラグインが初期化で
@@ -1031,6 +1063,8 @@ class PreferenceStore:
             use_proxy=_flag(data.get("use_proxy"), plain.use_proxy),
             proxy_height=_size(data.get("proxy_height"), plain.proxy_height),
             proxy_long_gop=_flag(data.get("proxy_long_gop"), plain.proxy_long_gop),
+            proxy_process=_flag(data.get("proxy_process"), plain.proxy_process),
+            proxy_unused=_choice(data.get("proxy_unused"), PROXY_UNUSED_MODES, plain.proxy_unused),
             auto_quality=_flag(data.get("auto_quality"), plain.auto_quality),
             auto_quality_divisor=_divisor(
                 data.get("auto_quality_divisor"), plain.auto_quality_divisor
@@ -1038,6 +1072,7 @@ class PreferenceStore:
             prefetch=_flag(data.get("prefetch"), plain.prefetch),
             prefetch_budget_mb=_budget(data.get("prefetch_budget_mb"), plain.prefetch_budget_mb),
             prefetch_thread=_flag(data.get("prefetch_thread"), plain.prefetch_thread),
+            prefetch_yield=_flag(data.get("prefetch_yield"), plain.prefetch_yield),
             export_pipeline_depth=_depth(
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),
@@ -1050,6 +1085,7 @@ class PreferenceStore:
             native_modules=_flag(data.get("native_modules"), plain.native_modules),
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
             hdr_notice=_flag(data.get("hdr_notice"), plain.hdr_notice),
+            stall_watch=_flag(data.get("stall_watch"), plain.stall_watch),
             all_aviutl_plugins=_flag(data.get("all_aviutl_plugins"), plain.all_aviutl_plugins),
             media_view=_choice(data.get("media_view"), VIEW_MODES, plain.media_view),
             ai_model=_choice(data.get("ai_model"), tuple(m.id for m in AI_MODELS), plain.ai_model),

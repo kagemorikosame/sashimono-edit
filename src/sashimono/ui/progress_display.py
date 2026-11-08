@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QPushButton, QWidget
 
 from sashimono.core.model import MediaId
@@ -19,6 +21,7 @@ __all__ = [
     "describe_import",
     "finished_message",
     "overall_fraction",
+    "rough_duration",
     "row_notes",
 ]
 
@@ -92,6 +95,17 @@ def overall_fraction(proxy: ProgressSnapshot, analysis: ProgressSnapshot) -> flo
     return min(1.0, done / total)
 
 
+def rough_duration(seconds: float) -> str:
+    """残り時間のおよその言い方 秒までは出さない（見込みは数割ずれるので、細かく出すと嘘になる）"""
+    if seconds < 60:
+        return "1 分足らず"
+    minutes = math.ceil(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} 分"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} 時間 {rest} 分" if rest else f"{hours} 時間"
+
+
 def describe_background(proxy: ProgressSnapshot, analysis: ProgressSnapshot) -> str:
     """ステータスバーに出す 1 行 走っている方だけを並べる
 
@@ -100,7 +114,15 @@ def describe_background(proxy: ProgressSnapshot, analysis: ProgressSnapshot) -> 
     """
     parts: list[str] = []
     if proxy.busy:
-        parts.append(f"控え {proxy.finished}/{proxy.total} 本 {round(proxy.fraction * 100)}%")
+        # 残りの本数とおよその時間も添える（#441） 1 本ごとの割合だけでは、長い録画の控えを
+        # 何本・いつまで待つのかが分からなかった
+        left = [f"残り {proxy.remaining} 本"]
+        if proxy.remaining_seconds is not None:
+            left.append(f"およそ {rough_duration(proxy.remaining_seconds)}")
+        parts.append(
+            f"控え {proxy.finished}/{proxy.total} 本 {round(proxy.fraction * 100)}%"
+            f"（{' '.join(left)}）"
+        )
     if analysis.busy:
         # 解析は波形・サムネイル・場面の一覧（#321）を合わせて数える 前は「波形とサムネイル」と
         # 書いていたが、場面を調べている間もそう出ると、何に CPU を使っているのかを取り違える
