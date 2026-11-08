@@ -28,6 +28,7 @@ from sashimono.ai.outbound import (
     frame_sample,
     from_arguments,
     from_result,
+    sendable_now,
     text_sample,
 )
 from sashimono.ai.send_log import KEEP_DAYS, SendLog, SendLogStore, SentEntry, SentKind
@@ -209,6 +210,59 @@ def _clip_count(host: FakeHost) -> int:
 
 
 # --- 呼び出しごとに尋ねる ---
+
+
+class TestCallsSideBySide:
+    """道具は並んで呼ばれる（呼び出しごとに別のスレッドで invoke する Codex の指摘 #450）"""
+
+    def test_a_preview_grant_does_not_leak_to_another_call(self, secret_host: FakeHost) -> None:
+        # 壊れると、字幕の下見のために立てた許しが、返事を待つ間に呼ばれた別の道具にも効き、
+        # 尋ねていない本文を伏せずに送る
+        probe = Operation(
+            name="probe",
+            description="",
+            schema={},
+            handler=lambda _host, _arguments: {"sendable": sendable_now(Outbound.TEXT)},
+            sends=frozenset({Outbound.PROJECT, Outbound.TEXT}),
+            hidden=frozenset({Outbound.TEXT}),
+        )
+        bridge = EditorBridge(secret_host)
+        seen_elsewhere: list[object] = []
+
+        def answer(_request: SendRequest) -> SendAnswer:
+            done, box = call_in_thread(bridge, probe, {})
+            while not done.is_set():
+                bridge.pump()
+            seen_elsewhere.append(box.get("result"))
+            seen_elsewhere.append(bridge.may_send(Outbound.TEXT))
+            return SendAnswer.DENY
+
+        _seen, box = _run(bridge, "get_subtitles", answer)
+        assert seen_elsewhere == [{"sendable": False}, False]
+        assert "result" not in box
+
+
+class TestLogFromTheResult:
+    def test_a_tool_previewed_from_its_arguments_is_logged_from_its_result(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、引数から下見を作る道具（保存など）の記録が引数で数えられ、実際に返した
+        # 場所や本文が記録から抜ける（Codex の指摘 #450）
+        writer = Operation(
+            name="writer",
+            description="",
+            schema={},
+            handler=lambda _host, _arguments: {"text": "結果に入った文"},
+            writes=True,
+            sends=frozenset({Outbound.PROJECT, Outbound.TEXT}),
+            preview=from_arguments(),
+        )
+        bridge = EditorBridge(host, auto_approve=True)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.ALLOW})
+        done, box = call_in_thread(bridge, writer, {"text": "引数の文"})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert box.get("result") == {"text": "結果に入った文"}
+        assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("結果に入った文",)
 
 
 class TestEachCall:
