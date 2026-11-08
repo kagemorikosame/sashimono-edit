@@ -10,7 +10,9 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
+import os
 import platform
+import re
 import threading
 import time
 import weakref
@@ -46,7 +48,14 @@ from PySide6.QtWidgets import (
 
 from sashimono import __version__
 from sashimono.ai.auto_fix import can_auto_color, plan_color_fix, plan_noise_fix
-from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
+from sashimono.ai.host import (
+    UNSAVED_REFUSAL,
+    CompatReport,
+    ExportRequest,
+    PackageRequest,
+    ToolError,
+    ViewState,
+)
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -55,7 +64,7 @@ from sashimono.ai.operations import (
     write_and_place_narration,
 )
 from sashimono.ai.outbound import Outbound, SendChoice
-from sashimono.ai.safety import Consent, check_writable
+from sashimono.ai.safety import Consent, check_writable, pinned
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.aviutl import native, plugin
@@ -187,6 +196,14 @@ from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
 from sashimono.engine.encode import build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
+from sashimono.engine.package.archive import (
+    PACKAGE_SUFFIX,
+    OpenedPackage,
+    PackOptions,
+    PackResult,
+    write_package,
+)
+from sashimono.engine.package.archive import open_package as unpack_package
 from sashimono.engine.reframe import (
     FACES_CENTER,
     FACES_OFF,
@@ -224,6 +241,13 @@ from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.media_search import MediaSearchDialog
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
 from sashimono.ui.narration_dialog import ask_narration
+from sashimono.ui.package_dialog import (
+    PackageExportDialog,
+    opened_summary,
+    package_root,
+    packed_summary,
+)
+from sashimono.ui.package_job import PackageJob
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.progress_display import (
@@ -744,6 +768,16 @@ class MainWindow(QMainWindow):
             stop.clicked.connect(self._assistant_export.cancel)
         self._assistant_export.changed.connect(self._show_assistant_export)
         self.statusBar().addPermanentWidget(self._assistant_export_indicator)
+        # 持ち出し用パッケージ（#423）の書き出しと展開 数十 GB になりうるので裏で回し、右端に
+        # 進み具合と〔止める〕を出す 人の窓と AI の道具が同じ 1 本を使う
+        self._package = PackageJob(self)
+        self._package_indicator = ProgressIndicator(self, cancel_text="止める")
+        stop = self._package_indicator.cancel_button
+        if stop is not None:
+            stop.clicked.connect(self._package.cancel)
+        self._package.changed.connect(self._show_package)
+        self._package.ended.connect(self._package_ended)
+        self.statusBar().addPermanentWidget(self._package_indicator)
         # AI の完成物の検査（#337）は長い作品で数分かかる 裏で走っていると分かるように出し、
         # 人がその場で止められるようにする
         self._checks = CheckJob(self)
@@ -783,6 +817,7 @@ class MainWindow(QMainWindow):
         file_menu = self._menu("ファイル")
         self._add(file_menu, "新規", QKeySequence.StandardKey.New, self.new_project)
         self._add(file_menu, "開く…", QKeySequence.StandardKey.Open, self.open_project)
+        self._add(file_menu, "持ち出し用パッケージを開く…", QKeySequence(), self.open_package)
         self._add(file_menu, "保存", QKeySequence.StandardKey.Save, self.save_project)
         self._add(file_menu, "名前を付けて保存…", QKeySequence("Ctrl+Shift+S"), self.save_as)
         self._add(
@@ -795,6 +830,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._add(file_menu, "素材を読み込む…", QKeySequence("Ctrl+I"), self._import_dialog)
         self._add(file_menu, "書き出し…", QKeySequence("Ctrl+E"), self.export)
+        self._add(file_menu, "持ち出し用に書き出す…", QKeySequence(), self.export_package)
         self._snapshot_save_action = self._add(
             # triggered の checked（偽）が保存先として渡らないよう、引数なしで呼ぶ
             file_menu,
@@ -3176,6 +3212,158 @@ class MainWindow(QMainWindow):
         # この後で結果を読む間は残る
         dialog.deleteLater()
 
+    # --- 持ち出し用パッケージ（#423）---
+
+    def export_package(self) -> None:
+        """〔持ち出し用に書き出す…〕 作品と素材を 1 つのファイルにまとめる（裏で回す）"""
+        if self._package.running:
+            QMessageBox.information(
+                self,
+                "持ち出し用に書き出す",
+                "持ち出し用パッケージの書き出しか展開がもう走っています",
+            )
+            return
+        self._playback.stop()
+        project = self._document.project
+        folder = (
+            self._path.parent if self._path is not None else (self.export_folder or Path.home())
+        )
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", project.name).strip(" .") or "作品"
+        dialog = PackageExportDialog(self._preferences, folder / f"{stem}{PACKAGE_SUFFIX}", self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            # 窓で選んだ物を覚える 次に開いた窓の初めの値になる
+            self._remember_preferences(dialog.remembered(self._preferences))
+            target, options = dialog.target(), dialog.options()
+        finally:
+            dialog.deleteLater()
+        if target.exists():
+            answer = QMessageBox.question(
+                self,
+                "持ち出し用に書き出す",
+                f"{target} はもうあります 置き換えますか（書き終えるまで前のファイルは残ります）",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_package_export(project, target, options, expect=None, check=None)
+
+    def open_package(self) -> None:
+        """〔持ち出し用パッケージを開く…〕 作業用のフォルダへ展開して普段の作品として開く"""
+        if self._package.running:
+            QMessageBox.information(
+                self,
+                "持ち出し用パッケージを開く",
+                "持ち出し用パッケージの書き出しか展開がもう走っています",
+            )
+            return
+        if not self._confirm_discard():
+            return
+        name, _ = QFileDialog.getOpenFileName(
+            self,
+            "持ち出し用パッケージを開く",
+            "",
+            f"Sashimono Edit 持ち出し用パッケージ (*{PACKAGE_SUFFIX})",
+        )
+        if name:
+            self._start_package_open(Path(name), by_assistant=False)
+
+    def _start_package_export(
+        self,
+        project: Project,
+        target: Path,
+        options: PackOptions,
+        *,
+        expect: Expected | None,
+        check: Callable[[], Path] | None,
+        by_assistant: bool = False,
+    ) -> None:
+        """書き出しを裏で始める ``check`` を渡すと、書き出し先のフォルダを持ったまま書く（AI）
+
+        書き終えるまで数分かかる その間にフォルダや名前を差し替えられて、確かめていない所へ
+        書かないよう、AI の書き出しはフォルダを開いたまま持ち、持った後にもう 1 度確かめる
+        （:func:`~sashimono.ai.safety.pinned` AI の書き出し #327 と同じ）
+        """
+        scratch = userdirs.cache_root() / "package-scratch"
+
+        def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
+            def write(path: Path) -> PackResult:
+                return write_package(
+                    project,
+                    path,
+                    options,
+                    scratch=scratch,
+                    progress=progress,
+                    cancelled=cancelled,
+                    expect=expect,
+                )
+
+            if check is None:
+                return write(target)
+            with pinned(check) as path:
+                if os.path.normcase(str(path)) != os.path.normcase(str(target)):
+                    raise ToolError(f"書き出し先が確かめた時と変わりました: {target} → {path}")
+                return write(path)
+
+        self._package.start("export", target, work, by_assistant=by_assistant)
+
+    def _start_package_open(self, package: Path, *, by_assistant: bool) -> None:
+        """展開を裏で始める 終わったら :meth:`_package_ended` が作品へ差し替える"""
+        root = package_root(self._preferences)
+
+        def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
+            return unpack_package(package, root, progress=progress, cancelled=cancelled)
+
+        self._package.start("open", package, work, by_assistant=by_assistant)
+
+    def _package_ended(self, kind: str, result: object) -> None:
+        """書き出しか展開が終わった 展開なら作品へ差し替え、入れなかった物・足りない物を知らせる"""
+        job = self._package
+        status = job.status()
+        if result is None:
+            if status.get("state") == "failed" and not job.by_assistant:
+                QMessageBox.warning(self, "持ち出し用パッケージ", str(status.get("message", "")))
+            return
+        if kind == "export" and isinstance(result, PackResult):
+            summary = packed_summary(result)
+            job.note(summary)
+            if not job.by_assistant:
+                QMessageBox.information(self, "持ち出し用に書き出しました", summary)
+            return
+        if kind != "open" or not isinstance(result, OpenedPackage):
+            return
+        opened = result
+        # 展開している間に編集した物を黙って捨てない 人には尋ね、AI の展開なら開かずに知らせる
+        if self.is_modified and (job.by_assistant or not self._confirm_discard()):
+            job.note(
+                f"展開しました（{opened.folder}）が、保存していない変更があるので開いていません"
+                " 開くなら〔開く…〕で展開した作品を選んでください"
+            )
+            return
+        if not self._claim(opened.project_path, ask=not job.by_assistant):
+            job.note(f"展開しました（{opened.folder}）が、別の窓で開いているので開いていません")
+            return
+        self._adopt_opened(opened.project, opened.project_path)
+        lacking = opened_summary(opened)
+        job.note(f"開きました: {opened.project_path}" + (f"\n{lacking}" if lacking else ""))
+        if lacking and not job.by_assistant:
+            QMessageBox.information(self, "持ち出し用パッケージを開きました", lacking)
+
+    def _show_package(self) -> None:
+        """パッケージの進み具合をステータスバーへ出す 終わったら知らせて隠す"""
+        job = self._package
+        indicator = self._package_indicator
+        if job.running:
+            text, fraction = job.progress_text()
+            indicator.show_progress(
+                f"{text} {round(fraction * 100)}%", fraction, tooltip=str(job.status().get("path"))
+            )
+            return
+        if not indicator.isHidden():
+            indicator.hide()
+            message = str(job.status().get("message", "")).split("\n", 1)[0]
+            self.statusBar().showMessage(message, 8000)
+
     def _active_scene_name(self) -> str | None:
         """開いているシーンの名前 メインなら ``None``"""
         if self._active_scene is None:
@@ -3432,6 +3620,9 @@ class MainWindow(QMainWindow):
             found.append("字幕を起こしています")
         if self._assistant_export.running:
             found.append("AI アシスタントが書き出しています")
+        if self._package.running:
+            # 再起動すると書きかけ・展開しかけを捨てる（前のファイルは残るが、やり直しになる）
+            found.append("持ち出し用パッケージを書き出しているか展開しています")
         if self._narration_job is not None:
             # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
             found.append("ナレーションの声を作っています")
@@ -4365,11 +4556,18 @@ class MainWindow(QMainWindow):
         """
         names = set(self._subtitles.remembered_names()) | self._left_paths | self._ai_written
         names.update(self._assistant_export.remembered_names())
+        # パッケージの書き出し先と開いたパッケージ（#423） 様子（package_status）に残る
+        names.update(self._package.remembered_names())
         if self._path is not None:
             names.add(str(self._path))
         names.update(
             folder
-            for folder in (self._preferences.state_folder, self._preferences.export_folder)
+            for folder in (
+                self._preferences.state_folder,
+                self._preferences.export_folder,
+                self._preferences.package_folder,
+                str(package_root(self._preferences)),
+            )
             if folder
         )
         return tuple(sorted(names))
@@ -4687,6 +4885,49 @@ class MainWindow(QMainWindow):
             replace(request.expect, keep=self._preferences.backup_generations),
         )
 
+    def start_package_export(self, request: PackageRequest) -> None:
+        """AI の〔持ち出し用に書き出す…〕（#423） 画面と同じ書き方を裏で回す
+
+        書き出し先は、始めた時の作品の場所と素材で確かめ直す（:meth:`start_export` と同じ訳）
+        """
+        if self._package.running:
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        project_path, export_folder = self._path, self.export_folder
+        protected = tuple(media.path for media in self._document.project.media)
+        raw = str(request.path)
+        self._playback.stop()
+        self._start_package_export(
+            self._document.project,
+            request.path,
+            PackOptions(
+                whole=request.whole, margin=request.margin, keep_metadata=request.keep_metadata
+            ),
+            expect=replace(request.expect, keep=self._preferences.backup_generations),
+            check=lambda: check_writable(
+                raw, project_path=project_path, export_folder=export_folder, protected=protected
+            ),
+            by_assistant=True,
+        )
+
+    def start_package_open(self, path: Path) -> None:
+        """AI の〔持ち出し用パッケージを開く…〕（#423） 展開し終えたら作品へ差し替える
+
+        保存していない変更があれば断る（:meth:`open_project_file` と同じ 2026-10-20 利用者の決定）
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        if self._package.running:
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        self._playback.stop()
+        self._start_package_open(path, by_assistant=True)
+
+    def package_status(self) -> dict[str, object]:
+        return self._package.status()
+
+    def package_waiter(self) -> Callable[[float], bool]:
+        # 窓を閉じた後に呼ばれても、閉じた係は待たずに返す（PackageJob.shutdown）
+        return self._package.wait
+
     def export_status(self) -> dict[str, object]:
         return self._assistant_export.status()
 
@@ -4758,6 +4999,9 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
         # 書きかけは捨てる 書き出し先は前のまま残る
         self._assistant_export.shutdown()
+        # パッケージの書き出しと展開も止めてから閉じる 書きかけと展開しかけは消え、
+        # 前のファイルは残る
+        self._package.shutdown()
         # 起こしの終わりを待っている AI を放す 窓を閉じると見張りのタイマーも止まり、片付いた
         # 知らせが来ないまま待つ秒の上限まで残る
         self._subtitles.release_transcription_waiters()

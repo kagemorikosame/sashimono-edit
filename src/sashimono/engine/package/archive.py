@@ -49,6 +49,7 @@ __all__ = [
     "PACKAGE_FORMAT",
     "PACKAGE_SUFFIX",
     "PACKAGE_VERSION",
+    "RIGHTS_NOTE",
     "Cancelled",
     "OpenedPackage",
     "PackOptions",
@@ -71,6 +72,10 @@ PACKAGE_FORMAT = "sashimono-package"
 PACKAGE_VERSION = 1
 #: 読むのに要る版の下限（今の形を読むのに要るのは 1）
 PACKAGE_MINIMUM = 1
+#: 素材の権利の断り 書き出しの窓と AI の確かめの箱の両方に出す
+RIGHTS_NOTE = (
+    "素材をそのまま入れます 渡す相手に素材を使わせてよいか（権利）は、持ち出す人が確かめてください"
+)
 #: 目録の名前
 MANIFEST = "manifest.json"
 #: 作品の名前（パッケージの中）

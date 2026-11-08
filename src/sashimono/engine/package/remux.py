@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import av
 import av.error
@@ -130,7 +131,7 @@ def _kept_streams(container: av.container.InputContainer) -> list[av.stream.Stre
     return sorted(streams, key=lambda stream: stream.index)
 
 
-def _seconds(packet: av.Packet) -> Fraction | None:
+def _seconds(packet: av.Packet[Any]) -> Fraction | None:
     """パケットの表示の時刻（秒 PTS の数え方） 分からなければ復号の時刻"""
     stamp = packet.pts if packet.pts is not None else packet.dts
     if stamp is None or packet.time_base is None:
@@ -138,7 +139,7 @@ def _seconds(packet: av.Packet) -> Fraction | None:
     return stamp * as_fraction(packet.time_base)
 
 
-def _decode_seconds(packet: av.Packet) -> Fraction | None:
+def _decode_seconds(packet: av.Packet[Any]) -> Fraction | None:
     stamp = packet.dts if packet.dts is not None else packet.pts
     if stamp is None or packet.time_base is None:
         return None
@@ -219,7 +220,7 @@ def _write(
             last_dts: dict[int, int] = {}
             picture_indices = {stream.index for stream in video}
 
-            def put(packet: av.Packet) -> None:
+            def put(packet: av.Packet[Any]) -> None:
                 index = packet.stream.index
                 stamp = packet.pts if packet.pts is not None else packet.dts
                 if stamp is None or stamp in written[index]:
@@ -264,7 +265,7 @@ def _copy_span(
     picture_indices: set[int],
     origin: Fraction,
     span: Span,
-    put: Callable[[av.Packet], None],
+    put: Callable[[av.Packet[Any]], None],
     cancelled: Callable[[], bool],
 ) -> None:
     """1 つの区間を写す 映像は区間の頭より前のキーフレームから、終わりの少し後ろまで"""

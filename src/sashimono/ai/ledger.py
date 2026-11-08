@@ -225,6 +225,11 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("メニュー/ファイル/保存", "save_project", safety=Safety.IRREVERSIBLE),
     same("メニュー/ファイル/名前を付けて保存…", "save_project_as", safety=Safety.IRREVERSIBLE),
+    same(
+        "メニュー/ファイル/持ち出し用パッケージを開く…",
+        "open_package",
+        safety=Safety.IRREVERSIBLE,
+    ),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
     same(
         "メニュー/ファイル/プロジェクト設定…",
@@ -246,6 +251,11 @@ LEDGER: tuple[Entry, ...] = (
     same("メニュー/ファイル/素材を読み込む…", "import_media"),
     same(
         "メニュー/ファイル/書き出し…", "export_video", note=_EXPORT_NOTE, safety=Safety.IRREVERSIBLE
+    ),
+    same(
+        "メニュー/ファイル/持ち出し用に書き出す…",
+        "export_package",
+        safety=Safety.IRREVERSIBLE,
     ),
     same(
         "メニュー/ファイル/静止画を保存…",
@@ -793,6 +803,8 @@ AI_ONLY: dict[str, str] = {
     "update_plan_step": "AI が計画の手順の進み具合を書く 画面に同じ入口は無い",
     "get_plan": "人が AI のパネルの計画の欄を見て分かることを読む（止めた所から続ける）",
     "export_status": READING,
+    # 持ち出し用パッケージ（#423）の様子 人はステータスバーの進み具合と終わりの知らせで見る
+    "package_status": READING,
     "cancel_export": (
         "AI が始めた書き出しを止める 画面ではステータスバーの〔中止〕（台帳はメニュー・"
         "右クリック・パネルのボタンだけを数え、ステータスバーは数えない）"

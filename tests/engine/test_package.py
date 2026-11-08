@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from sashimono.core.io.serialize import load_project
-from sashimono.core.model import Clip, Effect, MediaItem, Project, Track, TrackKind
+from sashimono.core.model import AnimatedValue, Clip, Effect, MediaItem, Project, Track, TrackKind
 from sashimono.engine.decode import VideoDecoder, probe_media
 from sashimono.engine.package import archive
 from sashimono.engine.package.archive import (
@@ -44,7 +44,7 @@ def _ffmpeg(*arguments: str) -> None:
     )
 
 
-def _video(directory: Path, name: str = "long.mp4", seconds: int = 8) -> Path:
+def _video(directory: Path, name: str = "package-long.mp4", seconds: int = 8) -> Path:
     """GOP 1 秒・B フレームありの 8 秒の動画 撮った場所と機器の名前を持たせる"""
     if not libx264_available():
         pytest.skip("ffmpeg に libx264 が無いので実素材のテストを飛ばす")
@@ -87,7 +87,7 @@ class TestCut:
     def test_the_used_range_keeps_every_pixel_and_shrinks_the_file(
         self, media_dir: Path, tmp_path: Path
     ) -> None:
-        """使う範囲の絵が 1 画素でも違えば、品質そのままの約束が崩れる 小さくならなければ範囲だけ入れる意味が無い"""
+        """使う範囲の絵が 1 画素でも違えば品質の約束が崩れる 小さくならなければ切る意味が無い"""
         source = _video(media_dir)
         spans = [Span(Fraction(3), Fraction(4))]
         muxer, extension = output_format(source) or ("", "")
@@ -97,7 +97,7 @@ class TestCut:
         assert _frames_equal(source, target, spans)
 
     def test_two_far_ranges_share_one_file(self, media_dir: Path, tmp_path: Path) -> None:
-        """離れた 2 つの範囲を 1 つのファイルに入れても、どちらの絵も元と同じでないと後ろの方のクリップが崩れる"""
+        """離れた 2 つの範囲を 1 つに入れたとき後ろの範囲の絵が崩れると後ろのクリップが壊れる"""
         source = _video(media_dir)
         spans = [Span(Fraction(1), Fraction(3, 2)), Span(Fraction(6), Fraction(13, 2))]
         muxer, extension = output_format(source) or ("", "")
@@ -106,8 +106,8 @@ class TestCut:
         assert _frames_equal(source, target, spans)
 
     def test_matroska_keeps_the_frames_too(self, media_dir: Path, tmp_path: Path) -> None:
-        """matroska は時刻を 1ms に丸める 丸めで隣の絵を出すなら写した後の確かめで見つけないといけない"""
-        source = media_dir / "long.mkv"
+        """matroska は時刻を 1ms に丸める 丸めで隣の絵を出すなら写した後の確かめで見つける"""
+        source = media_dir / "package-long.mkv"
         if not source.exists():
             _ffmpeg("-i", str(_video(media_dir)), "-c", "copy", str(source))
         spans = [Span(Fraction(2), Fraction(5, 2)), Span(Fraction(5), Fraction(6))]
@@ -118,7 +118,7 @@ class TestCut:
 
     def test_a_late_starting_media_keeps_its_clock(self, media_dir: Path, tmp_path: Path) -> None:
         """頭が 0 より後ろの素材で原点がずれると、作品の中の時刻がすべて別の絵を指す"""
-        source = make_delayed(media_dir, "late.mp4", _video(media_dir), 2.5)
+        source = make_delayed(media_dir, "package-late.mp4", _video(media_dir), 2.5)
         spans = [Span(Fraction(3), Fraction(4))]
         target = tmp_path / "late.mp4"
         assert cut_media(source, target, spans, muxer="mp4")
@@ -126,7 +126,7 @@ class TestCut:
 
     def test_rotation_stays_and_the_location_goes(self, media_dir: Path, tmp_path: Path) -> None:
         """回転を落とすと縦の動画が寝る 撮った場所を残すと、渡した相手に住まいが分かる"""
-        source = make_rotated(media_dir, "turned.mp4", _video(media_dir), 90)
+        source = make_rotated(media_dir, "package-turned.mp4", _video(media_dir), 90)
         target = tmp_path / "turned.mp4"
         assert cut_media(source, target, [Span(Fraction(2), Fraction(3))], muxer="mp4")
         assert (
@@ -180,7 +180,7 @@ class TestPlan:
         """リバーブは頭より前の音を読む 入れないと別の PC で響きの頭が欠ける"""
         item = probe_media(_video(media_dir))
         clip = _clip(item, 0, 30, Fraction(5))
-        reverb = Effect(kind="audio_reverb", params={"decay": 2.0})
+        reverb = Effect(kind="audio_reverb", params={"decay": AnimatedValue(static=2.0)})
         project = _project([item], [replace(clip, effects=(reverb,))])
         found = media_spans(project, Fraction(0))[item.id]
         assert found is not None and found[0].start <= 3

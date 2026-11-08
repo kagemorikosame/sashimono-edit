@@ -45,6 +45,9 @@ TEXT_SOURCES = {
     # ファイルを残した場所・控えの置き場が入る 書いた場所と残した場所は remembered_names から返す
     "write_project",
     "export_status",
+    # 持ち出し用パッケージ（#423） 様子に書き出し先・開いたパッケージ・展開した作品の場所と、
+    # 素材と書体の名前が入る 場所は remembered_names から返し、素材の名前は作品の物
+    "package_status",
 }
 #: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337、
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
@@ -100,6 +103,10 @@ PROJECT_SIDE = {
     "is_modified",
     "open_project_file",
     "start_new_project",
+    # 持ち出し用パッケージ（#423） 何も返さない 様子は package_status が返し、待つ関数は真偽だけ
+    "start_package_export",
+    "start_package_open",
+    "package_waiter",
     # スクリプトを読み直す（本数だけ返す）・配置のテンプレート（命令だけ返す #349）
     "reload_scripts",
     "alignment_commands",

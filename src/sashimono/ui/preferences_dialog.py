@@ -109,6 +109,7 @@ from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THU
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT
 from sashimono.ui.media_match import MATCH_CHOICES
 from sashimono.ui.media_pool import VIEW_ICONS, VIEW_LIST
+from sashimono.ui.package_dialog import PackageFolderField
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_CHOICES
 from sashimono.ui.project_settings_dialog import LAYER_MODE_CHOICES
 from sashimono.ui.style_guide_dialog import StyleGuideRow
@@ -693,6 +694,15 @@ class PreferencesDialog(QDialog):
             "保存できない 入れると印が最初から入る どちらでも前の内容はごみ箱へ移り、戻せる"
         )
         form.addRow(self._save_overwrite)
+
+        # 持ち出し用パッケージ（#423）は素材ごと展開するので数十 GB になりうる 空きのある
+        # 別のドライブへ移したい人がいる 空は既定（本人の置き場の下）
+        self._package_folder = PackageFolderField(preferences.package_folder, self)
+        self._package_folder.setToolTip(
+            "〔持ち出し用パッケージを開く…〕で素材ごと取り出す場所 開くたびに作品ごとのフォルダを"
+            "作る 要らなくなったフォルダは手で消してよい"
+        )
+        form.addRow("持ち出し用パッケージを開く場所", self._package_folder)
 
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
@@ -1319,6 +1329,7 @@ class PreferencesDialog(QDialog):
             library_confirm_delete=self._library_confirm_delete.isChecked(),
             shelf_thumbnails=self._shelf_thumbnails.isChecked(),
             save_overwrite_without_asking=self._save_overwrite.isChecked(),
+            package_folder=self._package_folder.folder(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

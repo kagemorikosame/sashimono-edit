@@ -239,6 +239,12 @@ class TestAppSettingsAreReadOnly:
             # 同じタイムラインの置き場 アプリ自身の設定は変えない
             "set_clipboard",
             "start_export",
+            # 持ち出し用パッケージ（#423）の書き出しと展開 書くのは許した書き出し先と、アプリ自身の
+            # 展開の置き場だけ アプリの設定（展開するフォルダ）は変えない
+            "start_package_export",
+            "start_package_open",
+            "package_status",
+            "package_waiter",
             # 素材 1 本の絵を並べた 1 枚を描くだけ（#326） start_sheet と同じく何も変えない
             "start_media_sheet",
             "start_new_project",
@@ -297,6 +303,11 @@ WRITING_PORTS = frozenset(
         "write_narration",
         # 場面の説明を素材の解析の控えに覚える（#326） 文書の同じ一覧に書いてある
         "remember_scene_notes",
+        # 持ち出し用パッケージ（#423） 文書の同じ一覧に書いてある
+        "start_package_export",
+        "start_package_open",
+        "package_status",
+        "package_waiter",
     }
 )
 
