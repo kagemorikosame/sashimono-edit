@@ -245,20 +245,39 @@ class TestRemainingTime:
         board.start("b", MediaId("b"), weight=30.0)
         assert board.poll().remaining_seconds == pytest.approx(10.0)
 
-    def test_the_start_up_is_part_of_the_speed(self) -> None:
-        """壊れると、子の起動とエンコーダの用意の分が速さから抜け、短い素材が多いと残り時間を
-        実際より大幅に短く見積もる
+    def test_each_waiting_job_adds_its_start_up(self) -> None:
+        """壊れると、子の起動とエンコーダの用意の分が見込みから抜け、長い素材の後に短い素材が
+        多く待つとき、残り時間を実際より大幅に短く見積もる
         """
         clock = Clock()
         board = JobBoard(clock=clock)
+        board.start("long", MediaId("long"), weight=60.0)
+        for index in range(100):
+            board.start(index, MediaId(f"short{index}"), weight=1.0)
+        board.begin("long")
+        clock.now = 10.0
+        board.report("long", 0.0)
+        clock.now = 20.0
+        board.report("long", 0.5)
+        # 起動 10 秒 → 10 秒で 30 秒ぶん（3 倍速） 残りは（30 + 100）÷ 3 に、待っている
+        # 100 本の起動 10 秒ずつを足す
+        assert board.poll().remaining_seconds == pytest.approx(130 / 3 + 1000)
+
+    def test_a_job_starting_up_adds_only_what_is_left(self) -> None:
+        """壊れると、起動の途中の 1 本にも起動をまるごと足し、見込みが長く出る"""
+        clock = Clock()
+        board = JobBoard(clock=clock)
         board.start("a", MediaId("a"), weight=60.0)
+        board.start("b", MediaId("b"), weight=60.0)
         board.begin("a")
         clock.now = 10.0
         board.report("a", 0.0)
         clock.now = 20.0
-        board.report("a", 0.5)
-        # 20 秒で 30 秒ぶん 残り 30 秒ぶんは 20 秒（起動の 10 秒を抜くと 10 秒になる）
-        assert board.poll().remaining_seconds == pytest.approx(20.0)
+        board.finish("a")
+        board.begin("b")
+        clock.now = 24.0
+        # 10 秒で 60 秒ぶん（6 倍速） 残り 60 秒ぶんは 10 秒 起動は平均 10 秒のうち 4 秒が過ぎた
+        assert board.poll().remaining_seconds == pytest.approx(10.0 + 6.0)
 
     def test_failed_work_is_not_counted_as_speed(self) -> None:
         """壊れると、開けずにすぐ落ちた素材で、見込みが速すぎる側へずれる"""

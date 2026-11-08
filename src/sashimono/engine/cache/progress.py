@@ -95,6 +95,12 @@ class JobBoard:
         self._weights: dict[Hashable, float] = {}
         #: 走り始めた時刻（最初に進み具合が来た時刻） 待っている間は速さに数えない
         self._began: dict[Hashable, float] = {}
+        #: 待ちから出て取り掛かった時刻（:meth:`begin`） 最初の進み具合が来るまでが起動の分
+        self._entered: dict[Hashable, float] = {}
+        #: ここまでに測った起動の分（子の起動とエンコーダの用意）の合計と本数
+        #: 起動は素材の長さに比べず 1 本ごとに掛かるので、速さとは別に 1 本あたりで見込む
+        self._overhead_seconds = 0.0
+        self._overhead_count = 0
         #: ここまでに終えた重さと、それに掛かった秒数 ひと続きを数え直しても残す
         #: 速さはこの機械とこの種類の仕事の物で、次のひと続きの見込みにもそのまま使える
         self._done_weight = 0.0
@@ -127,22 +133,28 @@ class JobBoard:
             self._stamp += 1
 
     def begin(self, key: Hashable) -> None:
-        """待ちから出て、実際に取り掛かった 速さはここから測る
+        """待ちから出て、実際に取り掛かった ここから最初の進み具合までを起動の分として測る
 
-        最初の進み具合から測ると、子のプロセスの起動とエンコーダの用意の分が抜ける
-        短い素材が多いと、その分だけ残り時間を短く見積もる 呼ばない仕事は最初の
-        :meth:`report` から測る
+        起動（子のプロセスの起動とエンコーダの用意）は素材の長さに関わらず 1 本ごとに掛かる
+        速さに混ぜると、長い素材の後に短い素材が多く待つとき、待っている本数分の起動が
+        見込みから抜けて大幅に短く出る 呼ばない仕事は起動の分を見込まない
         """
         with self._lock:
-            if key in self._active:
-                self._began.setdefault(key, self._clock())
+            if key in self._active and key not in self._began:
+                self._entered.setdefault(key, self._clock())
 
     def report(self, key: Hashable, value: float) -> None:
         with self._lock:
             entry = self._active.get(key)
             if entry is not None:
                 self._active[key] = (entry[0], max(0.0, min(1.0, value)))
-                self._began.setdefault(key, self._clock())
+                if key not in self._began:
+                    now = self._clock()
+                    self._began[key] = now
+                    entered = self._entered.pop(key, None)
+                    if entered is not None:
+                        self._overhead_seconds += max(0.0, now - entered)
+                        self._overhead_count += 1
 
     def finish(self, key: Hashable, failure: str | None = None) -> None:
         """仕事が終わった ``failure`` があれば失敗として数える
@@ -155,6 +167,7 @@ class JobBoard:
                 return
             weight = self._weights.pop(key, None)
             began = self._began.pop(key, None)
+            self._entered.pop(key, None)
             if failure is None and weight is not None and began is not None:
                 # 失敗した仕事は速さに数えない すぐ落ちた物を数えると、見込みが速すぎる
                 self._done_weight += weight
@@ -173,6 +186,7 @@ class JobBoard:
         with self._lock:
             self._weights.pop(key, None)
             self._began.pop(key, None)
+            self._entered.pop(key, None)
             if self._active.pop(key, None) is not None:
                 self._stamp += 1
 
@@ -190,6 +204,7 @@ class JobBoard:
                     del table[key]
                     self._weights.pop(key, None)
                     self._began.pop(key, None)
+                    self._entered.pop(key, None)
             self._stamp += 1
 
     def poll(self) -> ProgressSnapshot:
@@ -221,6 +236,8 @@ class JobBoard:
         速さは終えた仕事と走っている仕事の両方から出す 1 本目の長い素材の途中でも見込みが
         出るように、走っている分も数える 測った長さが :data:`MIN_MEASURE_S` に満たないうちは
         速さがまだ揺れるので出さない
+        起動の分（:meth:`begin`）を測れていれば、まだ起動を済ませていない 1 本ごとにその
+        平均を足す 起動中の 1 本は、平均のうちまだ過ぎていない分だけを足す
         """
         if not self._weights:
             return None
@@ -228,6 +245,8 @@ class JobBoard:
         weight = self._done_weight
         seconds = self._done_seconds
         left = 0.0
+        overhead = self._overhead_seconds / self._overhead_count if self._overhead_count else 0.0
+        starting = 0.0
         for key, total in self._weights.items():
             entry = self._active.get(key)
             value = entry[1] if entry is not None else 0.0
@@ -235,10 +254,13 @@ class JobBoard:
             if began is not None:
                 weight += total * value
                 seconds += max(0.0, now - began)
+            else:
+                entered = self._entered.get(key)
+                starting += overhead if entered is None else max(0.0, overhead - (now - entered))
             left += total * (1.0 - value)
         if seconds < MIN_MEASURE_S or weight <= 0:
             return None
-        return left / (weight / seconds)
+        return left / (weight / seconds) + starting
 
     def settle(self, seen: ProgressSnapshot) -> bool:
         """画面が ``seen`` で「終わった」を見届けたので、ひと続きの数を 0 へ戻す
