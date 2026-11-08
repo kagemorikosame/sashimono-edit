@@ -35,7 +35,7 @@ from sashimono.engine.gpu import GLContextError
 from sashimono.engine.render import Invalidation, PreviewCache, RenderQuality
 from sashimono.engine.render.background import WAIT_FOR_WORKER_S, BackgroundPrefetch
 from sashimono.engine.render.prefetch import CacheSurface
-from sashimono.ui.preview import PreviewWidget
+from sashimono.ui.preview import HOLD_AFTER_INPUT_MS, PreviewWidget
 from tests.ui.test_preview_prefetch import StubCache, StubRenderer, _project
 
 
@@ -730,6 +730,28 @@ class TestHoldWhileOperating:
         widget._hold_timer.timeout.emit()
         assert background.named("pause") == [False]
         assert not widget.holding_prefetch
+
+    def test_the_wait_starts_over_with_each_operation(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """壊れると、操作を続けている最中に最初の操作から数えて先読みが動き出すか、
+        手を止めても待ちが始まらず先読みが戻らない
+        """
+        widget, _, background = running
+        widget.hold_prefetch()
+        assert widget._hold_timer.isActive()
+        assert widget._hold_timer.interval() == HOLD_AFTER_INPUT_MS
+        time.sleep(0.15)
+        before = widget._hold_timer.remainingTime()
+        widget.hold_prefetch()
+        assert widget._hold_timer.remainingTime() > before, "続けた操作で待ちが数え直されない"
+        background.calls.clear()
+        deadline = time.monotonic() + 5.0
+        while widget.holding_prefetch and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        assert not widget.holding_prefetch
+        assert background.named("pause") == [False]
 
     def test_switched_off_it_never_pauses(
         self, running: tuple[PreviewWidget, StubCache, StubBackground]

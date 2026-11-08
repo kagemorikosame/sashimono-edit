@@ -619,9 +619,14 @@ class TestParkedPanels:
         kinds = [("blur",), ("mosaic",), ("blur", "blur"), ("mosaic", "mosaic"), ()]
         project = _texts(*kinds)
         panel.set_project(project)
-        for clip in _clips(project):
+        clips = _clips(project)
+        panel.set_clip(clips[0].id)
+        evicted = panel._content
+        for clip in clips[1:]:
             panel.set_clip(clip.id)
         assert len(panel._parked) == PARKED_PANELS
+        _flush()
+        assert not shiboken6.isValid(evicted), "追い出した欄が壊されずに残っている"
 
     def test_nothing_chosen_shows_an_empty_panel(self, panel: InspectorPanel) -> None:
         """壊れると、選びを外しても前のクリップの欄と見出しが出たまま残る"""

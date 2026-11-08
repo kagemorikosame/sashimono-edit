@@ -126,6 +126,17 @@ class JobBoard:
             self._failures.pop(key, None)
             self._stamp += 1
 
+    def begin(self, key: Hashable) -> None:
+        """待ちから出て、実際に取り掛かった 速さはここから測る
+
+        最初の進み具合から測ると、子のプロセスの起動とエンコーダの用意の分が抜ける
+        短い素材が多いと、その分だけ残り時間を短く見積もる 呼ばない仕事は最初の
+        :meth:`report` から測る
+        """
+        with self._lock:
+            if key in self._active:
+                self._began.setdefault(key, self._clock())
+
     def report(self, key: Hashable, value: float) -> None:
         with self._lock:
             entry = self._active.get(key)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import json
+import math
 import os
 import sys
 import threading
@@ -76,7 +77,8 @@ def threshold_from_env(environ: Mapping[str, str] | None = None) -> float | None
     """環境変数で入れたときの線（ミリ秒） 入っていなければ ``None``
 
     ``0`` と空と数でない値は入っていない扱い 打ち間違いで毎コマ記録されるより、
-    動かない方が困らない
+    動かない方が困らない ``inf`` のような限りの無い値も同じ 通すと見張りのスレッドが
+    待つ長さを求める所で落ち、入っているように見えて何も記録しない
     """
     value = (os.environ if environ is None else environ).get(ENV_FLAG, "").strip()
     if not value or value == "0":
@@ -87,7 +89,7 @@ def threshold_from_env(environ: Mapping[str, str] | None = None) -> float | None
         threshold = float(value)
     except ValueError:
         return None
-    return threshold if threshold > 0 else None
+    return threshold if math.isfinite(threshold) and threshold > 0 else None
 
 
 @dataclass(slots=True)
@@ -202,16 +204,20 @@ class StallWatch:
                 f"{Path(entry.filename).name}:{entry.lineno} {entry.name}"
                 for entry in traceback.extract_stack(frame, limit=STACK_DEPTH)
             ]
-            found[names.get(ident, str(ident))] = lines
+            # 名前で引く 同じ名前のスレッド（取り消して頼み直した読み込みの係など）が
+            # 並ぶと片方が消えるので、2 本目からは番号を添える ``MainThread`` は 1 本だけなので
+            # 名前のまま残り、手引きの読み方（MainThread の並びを見る）は変わらない
+            name = names.get(ident, str(ident))
+            found[name if name not in found else f"{name} #{ident}"] = lines
         return found
 
     def _write(self, stall: _Stall, ended: float) -> None:
-        with self._lock:
-            pauses = [
-                {"generation": generation, "ms": round(length, 1)}
-                for finished, generation, length in self._gc
-                if stall.began <= finished <= ended
-            ]
+        history = self._gc_history()
+        pauses = [
+            {"generation": generation, "ms": round(length, 1)}
+            for finished, generation, length in history
+            if stall.began <= finished <= ended
+        ]
         record = {
             "time": datetime.now().isoformat(timespec="milliseconds"),
             "stall_ms": round((ended - stall.began) * 1000, 1),
@@ -232,6 +238,20 @@ class StallWatch:
         self.recorded += 1
 
     # --- ごみ集め ---
+
+    def _gc_history(self) -> list[tuple[float, int, float]]:
+        """ごみ集めの記録を写す 写している最中に :meth:`_on_gc` が足すと写しが失敗する
+
+        ごみ集めはこのスレッドの写しの中でも走りうるので、錠では防げない（錠を待つ
+        知らせが同じスレッドで錠を取りに行き、止まる） 何度か写し直し、だめなら空にする
+        ごみ集めの欄が空になるだけで、見張りのスレッドは落ちない
+        """
+        for _ in range(5):
+            try:
+                return list(self._gc)
+            except RuntimeError:
+                continue
+        return []
 
     def _on_gc(self, phase: str, info: dict[str, int]) -> None:
         now = self._clock()
@@ -271,6 +291,13 @@ class StallWatch:
         thread.join(timeout=1.0)
         with contextlib.suppress(ValueError):
             gc.callbacks.remove(self._on_gc)
+        # 止まっている最中に止められた分（閉じる処理そのものが重かった等）も書く
+        # 書かないと、写したはずの並びが次の打ちを待たずに捨てられる
+        with self._lock:
+            stall, self._stall = self._stall, None
+        if stall is not None:
+            self._pending.append((stall, self._clock()))
+        self.flush()
 
     @property
     def running(self) -> bool:

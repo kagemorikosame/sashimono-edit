@@ -124,7 +124,7 @@ import av.error
 import av.video.stream
 import numpy as np
 
-from sashimono.core.model import MediaId, MediaItem, Project
+from sashimono.core.model import MediaId, MediaItem, Project, SceneId
 from sashimono.core.model.timeline import Timeline
 from sashimono.engine.cache.progress import JobBoard, ProgressSnapshot
 from sashimono.engine.cache.store import CacheStore, media_key
@@ -268,10 +268,17 @@ def needs_keyframe_check(media: MediaItem) -> bool:
 _OTHER_SCENE = 1 << 40
 
 
-def _distances(timeline: Timeline, playhead: int, base: int, found: dict[MediaId, int]) -> None:
+def _distances(
+    project: Project,
+    timeline: Timeline,
+    playhead: int,
+    base: int,
+    found: dict[MediaId, int],
+    inside: frozenset[SceneId] = frozenset(),
+) -> None:
     for track in timeline.tracks:
         for clip in track.clips:
-            if clip.media_id is None:
+            if clip.media_id is None and clip.scene_id is None:
                 continue
             if clip.timeline_start <= playhead < clip.timeline_end:
                 distance = 0
@@ -279,6 +286,21 @@ def _distances(timeline: Timeline, playhead: int, base: int, found: dict[MediaId
                 distance = min(
                     abs(clip.timeline_start - playhead), abs(clip.timeline_end - 1 - playhead)
                 )
+            if clip.scene_id is not None:
+                # 置いたシーンの中も、再生位置が指す所からの近さで並べる 中を見ないと、
+                # 再生位置で見えている素材が、ほかのシーンにだけある素材と同じ後ろへ回る
+                # 外れていればクリップの端の所を起点にし、離れている分を下駄に足す
+                scene = project.find_scene(clip.scene_id)
+                if scene is None or scene.id in inside:
+                    continue
+                local = min(max(playhead - clip.timeline_start, 0), clip.duration - 1)
+                rate = timeline.rate
+                inner = int(clip.picture_time(local, rate) / rate.frame_duration)
+                _distances(
+                    project, scene.timeline, inner, base + distance, found, inside | {scene.id}
+                )
+                continue
+            assert clip.media_id is not None
             current = found.get(clip.media_id)
             if current is None or base + distance < current:
                 found[clip.media_id] = base + distance
@@ -293,9 +315,9 @@ def proxy_order(project: Project, playhead: int, active: Timeline | None = None)
     見ていない所の分だけになる
     """
     found: dict[MediaId, int] = {}
-    _distances(active if active is not None else project.timeline, playhead, 0, found)
+    _distances(project, active if active is not None else project.timeline, playhead, 0, found)
     for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
-        _distances(timeline, 0, _OTHER_SCENE, found)
+        _distances(project, timeline, 0, _OTHER_SCENE, found)
     used = sorted(found, key=lambda media_id: found[media_id])
     taken = set(used)
     return [*used, *(media.id for media in project.media if media.id not in taken)]
@@ -304,9 +326,9 @@ def proxy_order(project: Project, playhead: int, active: Timeline | None = None)
 def used_media(project: Project) -> set[MediaId]:
     """どこかのタイムライン（シーンも）のクリップが指している素材"""
     found: dict[MediaId, int] = {}
-    _distances(project.timeline, 0, 0, found)
+    _distances(project, project.timeline, 0, 0, found)
     for scene in project.scenes:
-        _distances(scene.timeline, 0, 0, found)
+        _distances(project, scene.timeline, 0, 0, found)
     return set(found)
 
 
@@ -927,7 +949,10 @@ class ProxyBuilder:
                             # 一覧に無い素材の分が全体の割合に一瞬混ざる
                             if media.id not in self._cancelled and not self._closed:
                                 self._begin(media, counted=True)
-                if not skipped:
+                # 待っている間に外された素材は、子を起こす前にやめる 起こすと消した素材を
+                # 開きに行き、その分だけ使っている素材の控えが遅れる
+                if not skipped and not cancelled():
+                    self._board.begin(media.id)
                     made = self._make(media, report, cancelled)
             except Exception as exc:  # 裏のスレッドの例外は誰にも見えずに消える
                 # 投げ直さずに失敗として数える 前は executor の中で黙って消え、
@@ -1080,4 +1105,7 @@ class ProxyBuilder:
             self._closed = True
             self._cancelled.update(self._running)
             self._again.clear()
+            # 待っている手は素材と知らせ先（画面の部品）を抱えている 消さないと、設定で
+            # 係を作り直した後も古い係ごと残り、次に開き直すまで解放されない
+            self._waiting.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)

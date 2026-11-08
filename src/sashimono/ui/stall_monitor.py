@@ -13,10 +13,30 @@ from PySide6.QtCore import QObject, Qt, QTimer
 
 from sashimono.stall_watch import DEFAULT_THRESHOLD_MS, StallWatch
 
-__all__ = ["BEAT_MS", "StallMonitor"]
+__all__ = ["BEAT_MS", "MIN_THRESHOLD_MS", "StallMonitor"]
 
 #: 何ミリ秒ごとに打つか 線（既定 30ms）より十分に短くする
 BEAT_MS = 10
+
+#: 線の下限 打つ間隔の 2 倍より短い線では、止まっていない普段の打ちの揺れまで
+#: 止まりとして記録され、並びの写しと書き込みが本物の止まりを埋もれさせる
+MIN_THRESHOLD_MS = BEAT_MS * 2
+
+
+class _Held:
+    """見張りを持つ所 部品が壊されたときにも止められるよう、部品の外に置く
+
+    ``destroyed`` に部品自身のメソッドをつなぐと、知らせが来る頃には Python の側が
+    もう使えないことがある Qt のタイマーには触らない（部品と一緒に消えている）
+    """
+
+    def __init__(self) -> None:
+        self.watch: StallWatch | None = None
+
+    def stop(self, *_args: object) -> None:
+        watch, self.watch = self.watch, None
+        if watch is not None:
+            watch.stop()
 
 
 class StallMonitor(QObject):
@@ -25,7 +45,10 @@ class StallMonitor(QObject):
     def __init__(self, parent: QObject | None = None, *, path: Path | None = None) -> None:
         super().__init__(parent)
         self._path = path
-        self._watch: StallWatch | None = None
+        self._held = _Held()
+        # 閉じるのを断った窓が deleteLater で壊されると、stop を通らない 見張りのスレッドと
+        # ごみ集めの知らせが残り、壊れた部品の分まで記録を書き続ける
+        self.destroyed.connect(self._held.stop)
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(BEAT_MS)
@@ -33,19 +56,21 @@ class StallMonitor(QObject):
 
     @property
     def watch(self) -> StallWatch | None:
-        return self._watch
+        return self._held.watch
 
     def set_threshold(self, threshold_ms: float | None) -> None:
         """``None`` で止める 数なら、その線で見張る（線が変われば立て直す）"""
         if threshold_ms is None:
             self.stop()
             return
-        if self._watch is not None and self._watch.threshold_ms == threshold_ms:
+        threshold_ms = max(threshold_ms, MIN_THRESHOLD_MS)
+        current = self._held.watch
+        if current is not None and current.threshold_ms == threshold_ms:
             return
         self.stop()
-        self._watch = StallWatch(self._path, threshold_ms=threshold_ms)
-        self._watch.start()
-        self._watch.beat()
+        watch = self._held.watch = StallWatch(self._path, threshold_ms=threshold_ms)
+        watch.start()
+        watch.beat()
         self._timer.start()
 
     def start(self) -> None:
@@ -53,10 +78,9 @@ class StallMonitor(QObject):
 
     def stop(self) -> None:
         self._timer.stop()
-        watch, self._watch = self._watch, None
-        if watch is not None:
-            watch.stop()
+        self._held.stop()
 
     def _beat(self) -> None:
-        if self._watch is not None:
-            self._watch.beat()
+        watch = self._held.watch
+        if watch is not None:
+            watch.beat()

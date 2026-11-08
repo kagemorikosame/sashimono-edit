@@ -107,6 +107,7 @@ from sashimono.engine.worker import run_in_process  # noqa: E402
 
 if not _IN_CHILD:
     from sashimono.ui.main_window import MainWindow
+    from sashimono.ui.workspace import Preferences, PreferenceStore
 
 #: 何もしない間の画面の操作を、何秒ぶん測るか
 IDLE_SECONDS = 5.0
@@ -183,13 +184,21 @@ Job = Callable[[Path, Path, Callable[[], bool]], float]
 
 def _proxy_thread(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
     target = scratch / f"proxy-thread-{time.perf_counter_ns()}.mp4"
-    create_proxy(source, target, should_cancel=stop)
+    _made(create_proxy(source, target, should_cancel=stop))
     return float(probe_media(source).duration)
+
+
+def _made(result: object) -> None:
+    """控えができなかったら投げる 投げないと、使えるエンコーダが無い・変換に失敗した回まで
+    素材の長さを返し、何もしなかった速さが速い控えとして表に載る
+    """
+    if result is None:
+        raise RuntimeError("控えを作れなかった（使えるエンコーダが無いか、変換に失敗した）")
 
 
 def _proxy_process(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
     target = scratch / f"proxy-process-{time.perf_counter_ns()}.mp4"
-    run_in_process(
+    made = run_in_process(
         proxy_job,
         {
             "source": str(source),
@@ -201,6 +210,7 @@ def _proxy_process(source: Path, scratch: Path, stop: Callable[[], bool]) -> flo
         },
         should_cancel=stop,
     )
+    _made(made)
     return float(probe_media(source).duration)
 
 
@@ -336,6 +346,9 @@ def build_window(app: QApplication, source: Path) -> Scene:
         project = AddClip(track.id, clip).apply(project)
     media: MediaItem = replace(probe_media(source), path=_base / "missing.mp4")
     project = AddMedia(media).apply(project)
+    # 窓を作る前に控えを切る 4K の素材なら無い場所でも控えの係が動き出し、エンコーダの
+    # 確かめが温めより長引くと、何もしない間の測りに重なって比べる元が歪む
+    PreferenceStore().save(replace(Preferences(), use_proxy=False))
     for index in range(2):
         clip = Clip(timeline_start=index * 600, duration=540, media_id=media.id)
         project = AddClip(tracks[0].id, clip).apply(project)
@@ -401,8 +414,12 @@ def drive(
     app: QApplication,
     ops: dict[str, Callable[[int], None]],
     keep_going: Callable[[], bool],
+    starts: dict[str, list[float]] | None = None,
 ) -> dict[str, list[float]]:
-    """``keep_going`` が真の間、操作を順に繰り返し、1 回ずつの時間（ms）を返す"""
+    """``keep_going`` が真の間、操作を順に繰り返し、1 回ずつの時間（ms）を返す
+
+    ``starts`` を渡すと、操作ごとに始めた時刻（``time.perf_counter``）もそこへ積む
+    """
     times: dict[str, list[float]] = {name: [] for name in ops}
     n = 0
     while keep_going():
@@ -411,6 +428,8 @@ def drive(
             action(n)
             _settle(app)
             times[name].append((time.perf_counter() - began) * 1000)
+            if starts is not None:
+                starts.setdefault(name, []).append(began)
         n += 1
     return times
 
@@ -426,6 +445,10 @@ def run_contended(
     """裏の処理を走らせながら操作を繰り返す 速さと操作の時間を返す"""
     done = threading.Event()
     answer: list[float] = []
+    #: 裏の処理が終わった時刻 速さはここまでで割り、操作もここまでに始めた物だけを数える
+    #: 操作の 1 周の途中で終わると、残りの操作の分まで分母に入って速さが低く出て、
+    #: 取り合いの無くなった後の操作まで「取り合っている間」に混ざる
+    ended: list[float] = []
 
     def run() -> None:
         try:
@@ -433,17 +456,24 @@ def run_contended(
         except Exception as exc:  # 理由は出して、操作の側を止める
             print(f"    画面を動かしながら走らせられなかった: {type(exc).__name__}: {exc}")
         finally:
+            ended.append(time.perf_counter())
             done.set()
 
     began = time.perf_counter()
     worker = threading.Thread(target=run, name="bench-job", daemon=True)
+    starts: dict[str, list[float]] = {}
     with spinner:
         worker.start()
-        times = drive(app, ops, lambda: not done.is_set())
+        times = drive(app, ops, lambda: not done.is_set(), starts)
         worker.join()
-    elapsed = time.perf_counter() - began
+    finished = ended[0] if ended else time.perf_counter()
+    elapsed = finished - began
     speed = answer[0] / elapsed if answer and answer[0] > 0 and elapsed > 0 else None
-    return speed, times
+    overlapped = {
+        name: [ms for ms, at in zip(values, starts.get(name, []), strict=True) if at < finished]
+        for name, values in times.items()
+    }
+    return speed, overlapped
 
 
 # --- 出す ---
@@ -493,7 +523,10 @@ def main(argv: list[str] | None = None) -> int:
         "--switch-interval",
         type=float,
         default=None,
-        help="Python のスレッドの切り替え間隔（秒 sys.setswitchinterval） 既定は 0.005",
+        help=(
+            "Python のスレッドの切り替え間隔（秒 sys.setswitchinterval） 省くと窓の設定のまま"
+            "（画面の応答を優先する設定なら 0.001）"
+        ),
     )
     parser.add_argument(
         "--busy-thread",
@@ -509,9 +542,6 @@ def main(argv: list[str] | None = None) -> int:
     if shutil.which("ffmpeg") is None:
         print("ffmpeg が無いので測れない")
         return 0
-    if args.switch_interval is not None:
-        sys.setswitchinterval(args.switch_interval)
-    print(f"切り替え間隔 {sys.getswitchinterval() * 1000:g}ms")
 
     scratch = _base / "work"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -523,6 +553,11 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([])
     assert isinstance(app, QApplication)
     scene = build_window(app, source)
+    # 窓を作った後に当てる 窓は設定（画面の応答を優先する 既定は入）から間隔を 1ms へ
+    # 書き換えるので、先に当てると指定した間隔で測ったことにならない
+    if args.switch_interval is not None:
+        sys.setswitchinterval(args.switch_interval)
+    print(f"切り替え間隔 {sys.getswitchinterval() * 1000:g}ms")
     ops = operations(app, scene)
     # 1 度ずつ回して温める 初めの 1 回は部品の型を読む分が乗る
     drive(app, ops, iter([True, False]).__next__)

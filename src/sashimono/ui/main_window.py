@@ -424,6 +424,11 @@ class _InputHold(QObject):
             QEvent.Type.MouseButtonDblClick,
             QEvent.Type.Wheel,
             QEvent.Type.KeyPress,
+            # 素材一覧からの引き込みも操作のうち 落とす所を探している間に先読みが
+            # 走ると、置き場の印の描き直しが遅れる
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.Drop,
         }
     )
 
@@ -537,8 +542,15 @@ class MainWindow(QMainWindow):
             encoder_priority=self._preferences.encoder_priority,
             separate_process=self._preferences.proxy_process,
         )
-        #: 控えを作る順を最後に渡したときの（作品, 再生位置, 時刻） 変わったときだけ求め直す
-        self._proxy_order_seen: tuple[Project | None, int, float] = (None, -1, 0.0)
+        #: 控えを作る順を最後に渡したときの（作品, 開いていたタイムライン, 再生位置, 時刻）
+        #: 変わったときだけ求め直す タイムラインも見るのは、再生位置が同じままシーンを
+        #: 開き替えたときも、新しく開いた方の素材を先にするため
+        self._proxy_order_seen: tuple[Project | None, object, int, float] = (
+            None,
+            None,
+            -1,
+            0.0,
+        )
         #: タイムラインで使っている素材（:func:`used_media`）を求めたときの作品と答え
         #: 素材を頼む道は素材の数だけ回るので、作品が同じ間は使い回す
         self._used_cache: tuple[Project | None, set[MediaId]] = (None, set())
@@ -546,6 +558,11 @@ class MainWindow(QMainWindow):
         #: 上の使い回しとは分けて持つ 素材を 1 本だけ頼む道（テンプレートを置く等）も
         #: 上を求め直すので、同じ印にすると、その作品で使い始めたほかの素材を頼み損ねる
         self._used_requested: Project | None = None
+        #: 置いたときに作る設定で、もう頼んだ素材 作れずに失敗した素材を、関わりの無い
+        #: 編集のたびに頼み直して失敗の知らせを出し続けないため 係を作り直したとき・
+        #: 設定を替えたとき・作品を開いたときに空にする 素材を戻す道は
+        #: :meth:`_request_proxy` から直に頼むので、ここに載っていても頼み直せる
+        self._proxy_asked: set[MediaId] = set()
         #: 画面の止まりの見張り（#442 の 0 番） 設定か環境変数で入れたときだけ動く
         self._stall_monitor = StallMonitor(self)
         self._apply_stall_watch(self._preferences)
@@ -603,8 +620,15 @@ class MainWindow(QMainWindow):
         self._connect_drops()
         self._connect_preview_menu()
         self._input_hold = _InputHold(self._preview.hold_prefetch, self)
-        self._timeline.installEventFilter(self._input_hold)
-        self._preview.installEventFilter(self._input_hold)
+        # スクロールバーはタイムラインの外に並ぶ別の部品で、ビューに付けた見張りには
+        # 届かない 付けないと、つまみの端を引いて拡大している間も先読みが走り続ける
+        for watched in (
+            self._timeline,
+            self._timeline.horizontal_scroll_bar,
+            self._timeline.vertical_scroll_bar,
+            self._preview,
+        ):
+            watched.installEventFilter(self._input_hold)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(ANALYSIS_REFRESH_MS)
@@ -631,9 +655,7 @@ class MainWindow(QMainWindow):
         # 渡されたプロジェクトの素材にも効かせる コマンドラインや関連付けから
         # 開く道はここを通るだけで、_on_project_changed を通らない
         # 抜けると、4K のプロジェクトを開いても最初の 1 回だけ等倍のまま重い
-        for media in self.view_project.media:
-            self._request_proxy(media)
-        self._order_proxies(force=True)
+        self._request_all_proxies()
         self._apply_auto_quality()
         # 起動で読み込んだ物（部品・モジュール・開いたプロジェクト）を、自動のごみ集めから外す
         # 窓を出し終えてからにする 組み立ての途中の一時的な物まで外さないため
@@ -1185,11 +1207,23 @@ class MainWindow(QMainWindow):
                 encoder_priority=preferences.encoder_priority,
                 separate_process=preferences.proxy_process,
             )
-            self._proxy_order_seen = (None, -1, 0.0)
+            self._proxy_order_seen = (None, None, -1, 0.0)
             # 新しい係はまだ何も頼まれていない
             self._used_requested = None
+            self._proxy_asked.clear()
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
+        if preferences.proxy_unused != previous.proxy_unused:
+            self._used_requested = None
+            self._proxy_asked.clear()
+            if preferences.proxy_unused == PROXY_UNUSED_ON_USE:
+                # 待っている使っていない素材の控えを取り消す 残すと、置いたときに作ると
+                # 選んだ後も読み込んだだけの素材を作り続け、CPU と GPU と置き場を使う
+                # 後で置けば :meth:`_request_newly_used` がまた頼む
+                used = self._used_media()
+                for media in self.view_project.media:
+                    if media.id not in used:
+                        self._proxies.forget(media.id)
         # 間隔の長い素材への控え（#430）は係を作り直さずに切り替える 作り直すと走っている
         # 4K の変換まで止まる 係は置き場を替え、切ったときは小さい素材の変換だけを止める
         # 入れたときは下で全部の素材を頼み直すので、間隔を調べ直して作る
@@ -1243,8 +1277,7 @@ class MainWindow(QMainWindow):
             # 探す範囲が変わると、見つかるモジュールが変わって絵が変わる
             plugin.set_scan_all(preferences.all_aviutl_plugins)
             self._preview.refresh_all()
-        for media in self.view_project.media:
-            self._request_proxy(media)
+        self._request_all_proxies()
         self._apply_auto_quality()
         self._apply_autosave_timer(preferences)
         if state_root_for(preferences) != state_root_for(previous):
@@ -2414,6 +2447,19 @@ class MainWindow(QMainWindow):
 
         return runtime_status().installed
 
+    def _request_all_proxies(self) -> None:
+        """今の作品の素材をすべて、作る順（:func:`proxy_order`）に頼む
+
+        先に順を渡し、頼むのもその順にする 1 本目は係が空いていればすぐ走るので、
+        素材一覧の並びで頼むと、先頭にある使っていない長い動画から作り始め、
+        プレビューで見ている素材の控えがその後になる
+        """
+        ranked = self._order_proxies(force=True)
+        order = {media_id: index for index, media_id in enumerate(ranked)}
+        last = len(order)
+        for media in sorted(self.view_project.media, key=lambda item: order.get(item.id, last)):
+            self._request_proxy(media)
+
     def _request_proxy(self, media: MediaItem) -> None:
         """控えを作るよう頼む 設定で切っていれば何もしない
 
@@ -2429,6 +2475,7 @@ class MainWindow(QMainWindow):
         ):
             # 使い始めたときに作る（#441） 置いたときは :meth:`_request_newly_used` が頼む
             return
+        self._proxy_asked.add(media.id)
         self._proxies.request(media, on_ready=self._on_proxy_ready)
 
     def _used_media(self) -> set[MediaId]:
@@ -2455,28 +2502,34 @@ class MainWindow(QMainWindow):
             return
         used = self._used_media()
         for media in root.media:
-            if media.id in used:
+            if media.id in used and media.id not in self._proxy_asked:
+                self._proxy_asked.add(media.id)
                 self._proxies.request(media, on_ready=self._on_proxy_ready)
         self._used_requested = root
 
-    def _order_proxies(self, *, force: bool = False) -> None:
+    def _order_proxies(self, *, force: bool = False) -> list[MediaId]:
         """控えを作る順を係へ渡す（#441） 待っている物が 2 本以上あるときだけ求める
 
         使っている素材を再生位置に近い順に、その後に使っていない素材 作品か再生位置が
         変わったときだけ、:data:`PROXY_ORDER_INTERVAL_S` に 1 回まで求め直す
+        求めた順を返す 求めなかったときは空（頼む道が同じ順を 2 度求めないため）
         """
         if not force and self._proxies.waiting() < 2:
-            return
+            return []
         root = self._document.project
+        active = self.view_project.timeline
         playhead = self._timeline.playhead
-        seen, frame, at = self._proxy_order_seen
+        seen, opened, frame, at = self._proxy_order_seen
         now = time.monotonic()
         if not force and (
-            (seen is root and frame == playhead) or now - at < PROXY_ORDER_INTERVAL_S
+            (seen is root and opened is active and frame == playhead)
+            or now - at < PROXY_ORDER_INTERVAL_S
         ):
-            return
-        self._proxy_order_seen = (root, playhead, now)
-        self._proxies.set_order(proxy_order(root, playhead, self.view_project.timeline))
+            return []
+        self._proxy_order_seen = (root, active, playhead, now)
+        order = proxy_order(root, playhead, active)
+        self._proxies.set_order(order)
+        return order
 
     def _freeze_long_lived(self) -> None:
         """今あるオブジェクトを、自動のごみ集めの対象から外す（#442 B）
@@ -2785,10 +2838,10 @@ class MainWindow(QMainWindow):
         self._mark_saved()
         self._on_project_changed()
         self._seek(0)
+        self._proxy_asked.clear()
         for media in project.media:
             self._request_analysis(media)
-            self._request_proxy(media)
-        self._order_proxies(force=True)
+        self._request_all_proxies()
         self._freeze_long_lived()
 
     def save_project(self) -> bool:
@@ -3290,10 +3343,10 @@ class MainWindow(QMainWindow):
         self._saved = None
         self._on_project_changed()
         self._seek(0)
+        self._proxy_asked.clear()
         for media in project.media:
             self._request_analysis(media)
-            self._request_proxy(media)
-        self._order_proxies(force=True)
+        self._request_all_proxies()
         self._freeze_long_lived()
 
         self.autosave()

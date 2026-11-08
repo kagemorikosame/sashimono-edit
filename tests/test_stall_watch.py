@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from types import FrameType
 
@@ -116,9 +118,70 @@ def test_the_thread_starts_and_stops(tmp_path: Path) -> None:
 
     watch = StallWatch(tmp_path / "stalls.jsonl")
     watch.start()
-    assert watch.running and watch._on_gc in gc.callbacks
-    watch.stop()
+    thread = watch._thread
+    try:
+        assert watch.running and watch._on_gc in gc.callbacks
+        assert thread is not None and thread.is_alive()
+    finally:
+        watch.stop()
     assert not watch.running and watch._on_gc not in gc.callbacks
+    assert not thread.is_alive(), "止めた後も見張りのスレッドが回っている"
+
+
+def test_a_stall_cut_short_by_stopping_is_still_written(tmp_path: Path) -> None:
+    """壊れると、止まっている最中に見張りを止めた（閉じる処理が重かった）分の並びが捨てられる"""
+    clock = Clock()
+    watch = _watch(tmp_path, clock)
+    watch.start()
+    watch.beat()
+    clock.now = 0.100
+    watch.check()
+    watch.stop()
+    [record] = _records(watch.path)
+    assert record["stall_ms"] == 100.0
+
+
+def test_threads_with_the_same_name_are_kept_apart(tmp_path: Path) -> None:
+    """壊れると、同じ名前の係が 2 本あるとき片方の並びが上書きされ、止めた方を見落とす"""
+    release = threading.Event()
+    twins = [threading.Thread(target=release.wait, name="twin", daemon=True) for _ in range(2)]
+    for thread in twins:
+        thread.start()
+    try:
+        stacks = StallWatch(tmp_path / "stalls.jsonl")._stacks()
+    finally:
+        release.set()
+        for thread in twins:
+            thread.join()
+    assert len([name for name in stacks if name.startswith("twin")]) == 2
+    # 1 本目は名前のまま（MainThread を名前で探す読み方が変わらない）
+    assert "twin" in stacks
+
+
+def test_a_collection_while_copying_the_history_does_not_stop_the_watch(
+    tmp_path: Path,
+) -> None:
+    """壊れると、記録を写す途中でごみ集めが終わったとき見張りのスレッドが落ち、以後何も記録しない"""
+
+    class Shaky(deque[tuple[float, int, float]]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.left = 1
+
+        def __iter__(self) -> Iterator[tuple[float, int, float]]:
+            if self.left:
+                self.left -= 1
+                raise RuntimeError("deque mutated during iteration")
+            return super().__iter__()
+
+    clock = Clock()
+    watch = _watch(tmp_path, clock)
+    watch._gc = Shaky()
+    watch.beat()
+    clock.now = 0.100
+    watch.beat()
+    watch.flush()
+    assert watch.recorded == 1
 
 
 def test_the_environment_variable() -> None:
@@ -127,4 +190,8 @@ def test_the_environment_variable() -> None:
     assert threshold_from_env({"SASHIMONO_STALL_WATCH": "50"}) == 50.0
     assert threshold_from_env({"SASHIMONO_STALL_WATCH": "0"}) is None
     assert threshold_from_env({"SASHIMONO_STALL_WATCH": "x"}) is None
+    # 限りの無い値も入っていない扱い 通すと見張りのスレッドが待つ長さを求めて落ちる
+    assert threshold_from_env({"SASHIMONO_STALL_WATCH": "inf"}) is None
+    assert threshold_from_env({"SASHIMONO_STALL_WATCH": "1e309"}) is None
+    assert threshold_from_env({"SASHIMONO_STALL_WATCH": "nan"}) is None
     assert threshold_from_env({}) is None

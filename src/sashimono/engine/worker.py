@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import multiprocessing
+import os
 import threading
 import time
 import weakref
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CANCEL_GRACE_S",
+    "START_TIMEOUT_S",
     "WorkerCrashedError",
     "WorkerError",
     "WorkerFailedError",
@@ -54,6 +56,12 @@ __all__ = [
 #: 控えの作成は 1 コマごとに確かめるので普通は 0.1 秒もかからない 待たずに止めると、
 #: 書きかけの消し損ねと、エンコーダ（NVENC）の後片付けの飛ばしが起きる
 CANCEL_GRACE_S = 3.0
+
+#: 子が「起きた」を送ってくるまで待つ長さ（秒） 起きた後の仕事の長さには掛けない
+#: 配布版は exe ごと読み直すので、冷えた機械で見張りのソフトが中を調べると 10 秒を超える
+#: ことがある 短くするとそういう機械で毎回スレッドへ戻り、無いと子が起動の途中で
+#: 固まったときに控えの係と自己診断が止まったままになる
+START_TIMEOUT_S = 60.0
 
 #: 親が子からの知らせを待つ 1 回の長さ（秒） やめるかどうかもこの間隔で見る
 POLL_S = 0.1
@@ -104,22 +112,28 @@ def run_in_process[T](
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     name: str = "sashimono-worker",
+    start_timeout_s: float = START_TIMEOUT_S,
 ) -> T | None:
     """``job(progress=..., should_cancel=..., **kwargs)`` を別のプロセスで走らせて結果を返す
 
     やめたときは ``None`` 呼ぶ側のスレッドはほとんど眠って待つ（GIL を手放す）
     """
     context = _context()
-    # 子 → 親（知らせ）と 親 → 子（やめて）を別の管にする
-    news_out, news_in = context.Pipe(duplex=False)
-    stop_out, stop_in = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_child_main, args=(news_in, stop_out, job, kwargs), name=name, daemon=True
-    )
+    ends: list[_Channel] = []
     try:
+        # 子 → 親（知らせ）と 親 → 子（やめて）を別の管にする
+        # 管を作る所から包む ハンドルが尽きた機械で管を作れないのも「起こせない」のうちで、
+        # 包まないとスレッドへ戻れば作れる控えまで失敗になる
+        news_out, news_in = context.Pipe(duplex=False)
+        ends += (news_out, news_in)
+        stop_out, stop_in = context.Pipe(duplex=False)
+        ends += (stop_out, stop_in)
+        process = context.Process(
+            target=_child_main, args=(news_in, stop_out, job, kwargs), name=name, daemon=True
+        )
         process.start()
     except Exception as exc:  # 起こせない理由は環境ごとに違う（OSError・pickle の失敗など）
-        for end in (news_out, news_in, stop_out, stop_in):
+        for end in ends:
             end.close()
         raise WorkerUnavailableError(f"別のプロセスを起こせなかった: {exc}") from exc
     # 子に渡した端は親の側で閉じる 閉じないと、子が落ちても管の向こうが開いたままに見え、
@@ -129,7 +143,7 @@ def run_in_process[T](
     with _LIVE_LOCK:
         _LIVE.add(process)
     try:
-        return _wait(process, news_out, stop_in, progress, should_cancel)
+        return _wait(process, news_out, stop_in, progress, should_cancel, start_timeout_s)
     finally:
         if process.is_alive():
             process.terminate()
@@ -146,10 +160,17 @@ def _wait[T](
     stop: _Channel,
     progress: Callable[[float], None] | None,
     should_cancel: Callable[[], bool] | None,
+    start_timeout_s: float = START_TIMEOUT_S,
 ) -> T | None:
     started = False
     stopping_since: float | None = None
+    began = time.monotonic()
     while True:
+        if not started and stopping_since is None and time.monotonic() - began >= start_timeout_s:
+            process.terminate()
+            raise WorkerUnavailableError(
+                f"別のプロセスが {start_timeout_s:g} 秒たっても起きなかった"
+            )
         if stopping_since is None and should_cancel is not None and should_cancel():
             stopping_since = time.monotonic()
             # 子がもう終わっていれば送れない 下の読みで終わりを拾う
@@ -276,13 +297,18 @@ def probe_job(
     steps: int = 3,
     fail: bool = False,
     wait_s: float = 0.0,
+    crash: bool = False,
 ) -> str | None:
     """子が起きて仕事を受け、知らせを返せるかを確かめる小さな仕事
 
     配る zip の自己診断（:mod:`sashimono.selfcheck`）が、配布版の exe で子を起こせるかを
     見るのに使う 控えのような本物の仕事は素材が要り、自己診断の機械では作れない
     ``wait_s`` の間はやめると言われるまで待つ（取り消しの確かめ用）
+    ``crash`` は例外を通さずにプロセスごと終わる（素材のせいで FFmpeg が落ちたときの真似）
     """
+    if crash:
+        # 起きた後に落ちたことを親が見分けられるか確かめるため、「起きた」の後で終わる
+        os._exit(3)
     for step in range(1, steps + 1):
         progress(step / steps)
     if fail:

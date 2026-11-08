@@ -14,6 +14,7 @@ from sashimono.core.model import (
     MediaId,
     MediaItem,
     Project,
+    Scene,
     Track,
     TrackKind,
     VideoStreamInfo,
@@ -63,6 +64,43 @@ class TestOrder:
         project = _project(media, [])
         assert proxy_order(project, 0) == [item.id for item in media]
 
+    def test_media_inside_a_placed_scene_follow_the_playhead(self) -> None:
+        """壊れると、再生位置がシーンを置いたクリップの上にあるとき、そこで見えている素材の
+        控えが、ほかのシーンにだけある素材と同じ後ろへ回り、プレビューが長く重いまま待たされる
+        """
+        media = [_media(name) for name in "abc"]
+        base = Project.create()
+        inner = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S1",
+                    (
+                        Clip(timeline_start=0, duration=30, media_id=media[2].id),
+                        Clip(timeline_start=500, duration=30, media_id=media[1].id),
+                    ),
+                ),
+            ),
+        )
+        scene = Scene("場面", inner)
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (
+                        Clip(timeline_start=0, duration=600, scene_id=scene.id),
+                        Clip(timeline_start=2000, duration=30, media_id=media[0].id),
+                    ),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=(scene,)).with_timeline(main)
+        # 再生位置 510 はシーンの中の 510 コマ目（b の上） c はシーンの頭で 481 コマ離れる
+        assert proxy_order(project, 510) == [media[1].id, media[2].id, media[0].id]
+
     def test_used_media(self) -> None:
         """壊れると、置いたときに作る設定で、使い始めた素材の控えが頼まれない"""
         media = [_media(name) for name in "ab"]
@@ -101,6 +139,63 @@ class TestBuilderOrder:
             for _ in media:
                 assert done.acquire(timeout=30.0)
             assert made == ["a", "d", "b", "c"]
+        finally:
+            gate.set()
+            builder.close()
+
+    def test_a_removed_waiting_proxy_is_not_started(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、待っている間に外した素材でも子を起こして開きに行き、使っている素材の控えが遅れる"""
+        gate = threading.Event()
+        made: list[str] = []
+        started = threading.Event()
+
+        def fake(source: Path, target: Path, **_kwargs: object) -> Path:
+            made.append(source.stem)
+            started.set()
+            gate.wait(30.0)
+            target.write_bytes(b"proxy")
+            return target
+
+        monkeypatch.setattr(proxy_module, "create_proxy", fake)
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path)))
+        first, removed, kept = (_media(name) for name in "abc")
+        done = threading.Event()
+        try:
+            builder.request(first)
+            assert started.wait(30.0)
+            builder.request(removed)
+            builder.request(kept, on_ready=lambda _id: done.set())
+            builder.forget(removed.id)
+            gate.set()
+            assert done.wait(30.0)
+            assert made == ["a", "c"]
+        finally:
+            gate.set()
+            builder.close()
+
+    def test_closing_lets_go_of_waiting_proxies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、設定で係を作り直した後も、古い係が待っている素材と知らせ先を抱えたまま残る"""
+        gate = threading.Event()
+        started = threading.Event()
+
+        def fake(source: Path, target: Path, **_kwargs: object) -> Path:
+            started.set()
+            gate.wait(30.0)
+            return target
+
+        monkeypatch.setattr(proxy_module, "create_proxy", fake)
+        builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path)))
+        try:
+            builder.request(_media("a"))
+            assert started.wait(30.0)
+            builder.request(_media("b"))
+            assert builder.waiting() == 1
+            builder.close()
+            assert builder.waiting() == 0
         finally:
             gate.set()
             builder.close()
@@ -150,6 +245,21 @@ class TestRemainingTime:
         board.start("b", MediaId("b"), weight=30.0)
         assert board.poll().remaining_seconds == pytest.approx(10.0)
 
+    def test_the_start_up_is_part_of_the_speed(self) -> None:
+        """壊れると、子の起動とエンコーダの用意の分が速さから抜け、短い素材が多いと残り時間を
+        実際より大幅に短く見積もる
+        """
+        clock = Clock()
+        board = JobBoard(clock=clock)
+        board.start("a", MediaId("a"), weight=60.0)
+        board.begin("a")
+        clock.now = 10.0
+        board.report("a", 0.0)
+        clock.now = 20.0
+        board.report("a", 0.5)
+        # 20 秒で 30 秒ぶん 残り 30 秒ぶんは 20 秒（起動の 10 秒を抜くと 10 秒になる）
+        assert board.poll().remaining_seconds == pytest.approx(20.0)
+
     def test_failed_work_is_not_counted_as_speed(self) -> None:
         """壊れると、開けずにすぐ落ちた素材で、見込みが速すぎる側へずれる"""
         clock = Clock()
@@ -177,7 +287,9 @@ class TestStatusText:
         assert text == "控え 1/3 本 33%（残り 2 本 およそ 5 分）"
 
     def test_a_single_proxy_does_not_repeat_the_count(self) -> None:
-        """1 本だけなら「0/1 本」と並べて「残り 1 本」とは書かない"""
+        """壊れると、1 本だけのときに「0/1 本」の隣へ「残り 1 本」と同じ数が並び、
+        ステータスバーが煩雑になる
+        """
         proxy = JobBoard()
         proxy.start("a", MediaId("a"), weight=60.0)
         assert describe_background(proxy.poll(), JobBoard().poll()) == "控え 0/1 本 0%"

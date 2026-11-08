@@ -476,12 +476,20 @@ class InspectorPanel(QWidget):
             # 同じ構成の欄がもう出ている（主が同じか、構成が同じクリップへの選び替え）
             self._retarget_others()
             return
+        # フォーカスのある欄は、取っておく前に覚える 取っておくと欄が隠れてフォーカスが外れ、
+        # 組み直しの側（:meth:`_rebuild`）では戻す先を見失う 打っている最中に AI が構成の
+        # 違うクリップを選ぶと、共通の欄（名前など）へ打ち続けられなくなる
+        place = self._focused_place()
         if primary is not None and self._unpark():
+            if place is not None:
+                self._restore_focus(place)
             return
         # 今の欄は捨てずに取っておく 空いた所を押して選びを外し、また同じ種類のクリップを
         # 選ぶと、外したときと選んだときで 2 回組み直していた（#442 A）
         self._park()
         self._rebuild()
+        if place is not None:
+            self._restore_focus(place)
 
     def _park(self) -> None:
         """出している欄を外して取っておく 代わりに空の中身を出す

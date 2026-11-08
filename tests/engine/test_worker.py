@@ -19,6 +19,7 @@ from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
 from sashimono.engine.cache.store import CacheStore
 from sashimono.engine.decode import probe_media
 from sashimono.engine.worker import (
+    WorkerCrashedError,
     WorkerFailedError,
     WorkerUnavailableError,
     probe_job,
@@ -81,6 +82,47 @@ class TestRunInProcess:
         with pytest.raises(WorkerUnavailableError):
             run_in_process(probe_job, {})
 
+    def test_running_out_of_pipes_is_also_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、ハンドルが尽きて管を作れない機械で、スレッドへ戻せば作れる控えまで失敗になる"""
+        closed: list[object] = []
+
+        class Starved:
+            made = 0
+
+            def Pipe(self, duplex: bool = True) -> tuple[object, object]:  # noqa: N802
+                Starved.made += 1
+                if Starved.made > 1:
+                    raise OSError("ハンドルが尽きた")
+
+                class End:
+                    def close(self) -> None:
+                        closed.append(self)
+
+                return End(), End()
+
+        monkeypatch.setattr(worker_module, "_context", Starved)
+        with pytest.raises(WorkerUnavailableError):
+            run_in_process(probe_job, {})
+        assert len(closed) == 2, "作れた方の管を閉じていない"
+
+    def test_a_child_that_never_wakes_up_is_given_up(self) -> None:
+        """壊れると、起動の途中で固まった子を待ち続け、控えの係と自己診断が止まったままになる"""
+        began = time.monotonic()
+        with pytest.raises(WorkerUnavailableError, match="起きなかった"):
+            # 子の起動は 0.2 秒ほど掛かるので、0 秒ではまず「起きた」が届かない
+            run_in_process(probe_job, {}, start_timeout_s=0.0)
+        assert time.monotonic() - began < 10.0
+        assert not list(worker_module._LIVE), "起きなかった子が残っている"
+
+    def test_a_crash_after_starting_is_a_crash(self) -> None:
+        """壊れると、素材のせいで落ちた子を「起こせなかった」と取り違え、同じ素材をアプリの中で
+        読み直してアプリごと落ちる
+        """
+        with pytest.raises(WorkerCrashedError):
+            run_in_process(probe_job, {"crash": True})
+
 
 def _tall(path: Path) -> MediaItem:
     media = probe_media(path)
@@ -89,8 +131,17 @@ def _tall(path: Path) -> MediaItem:
 
 
 class TestProxyInAnotherProcess:
-    def test_the_proxy_is_made_by_a_child(self, tmp_path: Path, sample_av: SampleMedia) -> None:
-        """壊れると、設定で別のプロセスを選んでも控えができない"""
+    def test_the_proxy_is_made_by_a_child(
+        self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、設定で別のプロセスを選んでも控えができない（スレッドで作っていても気付けない）"""
+        jobs: list[object] = []
+
+        def recording(job: object, *args: object, **kwargs: object) -> object:
+            jobs.append(job)
+            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(proxy_module, "run_in_process", recording)
         builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120), separate_process=True)
         media = _tall(sample_av.path)
         ready: list[MediaId] = []
@@ -100,6 +151,7 @@ class TestProxyInAnotherProcess:
             found = builder.store.find(media)
             assert found is not None and found.stat().st_size > 0
             assert builder.separate_process
+            assert jobs == [proxy_module.proxy_job], "子を通さずに作っている"
             assert not list(found.parent.glob("*.part")), "書きかけが残っている"
         finally:
             builder.close()
