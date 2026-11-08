@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase, QRawFont
 from PySide6.QtWidgets import QApplication
 
 from sashimono.effects.sources import TEXT
+from sashimono.engine import sources
 from sashimono.engine.sources import render_source
 
 WIDTH, HEIGHT = 640, 200
@@ -98,3 +99,39 @@ def test_vertical_text_uses_the_same_bold() -> None:
     expected = _ink("Bahnschrift", LATIN, bold=True, vertical=True)
     drawn = _ink("Bahnschrift SemiBold", LATIN, bold=True, vertical=True)
     assert drawn == pytest.approx(expected, rel=0.02)
+
+
+def test_glyphs_from_a_fallback_family_are_bold_too() -> None:
+    """壊れると、Bahnschrift の日本語のように書体に無い字だけが、太字の欄を入れても細字で出る
+
+    可変フォントの太字は太さの軸で掛ける Qt の太字の印を立てないので、代わりの書体へ
+    太字が渡らないと、同じ行の中で英字だけ太く仮名と漢字が細い字になる
+    """
+    _needs("Bahnschrift Light")
+    assert (
+        _ink("Bahnschrift Light", JAPANESE, bold=True) > _ink("Bahnschrift Light", JAPANESE) * 1.3
+    )
+
+
+def test_a_series_at_the_axis_maximum_draws_as_before() -> None:
+    """壊れると、軸の上限（Black の 900）の書体で太字が前の版と違う字で出る
+
+    上限で軸を回しても字は変わらないので、前と同じく Qt の太字に任せる
+    """
+    _needs("Noto Serif JP Black")
+    font = QFont("Noto Serif JP Black")
+    font.setPixelSize(96)
+    assert sources._weight_axis_maximum(QRawFont.fromFont(font)) == pytest.approx(900.0)
+    drawn = sources._text_font({"font": "Noto Serif JP Black", "bold": True}, 96)
+    assert drawn.bold()
+
+
+def test_the_weight_axis_is_read_from_the_font_table() -> None:
+    """壊れると、可変フォントを固定の書体と見なして前の崩れ（既定の太さへ戻る）に戻る"""
+    _needs("Bahnschrift")
+    font = QFont("Bahnschrift")
+    font.setPixelSize(96)
+    assert sources._weight_axis_maximum(QRawFont.fromFont(font)) == pytest.approx(700.0)
+    fixed = QFont("Yu Gothic UI")
+    fixed.setPixelSize(96)
+    assert sources._weight_axis_maximum(QRawFont.fromFont(fixed)) is None

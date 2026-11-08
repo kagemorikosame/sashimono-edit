@@ -1035,32 +1035,40 @@ def _embolden(font: QFont) -> None:
 
     太さの軸（wght）を持つ可変フォントは、選ばれた面のまま軸を回して太くする 同じ書体の
     Bold の面と同じ字になる 元が 700 より太い（Black）ときは、その太さのまま残す
-    軸を持たない書体は今までどおり Qt の太字に任せる（太字の面を探し、無ければ合成で太らせる）
+    書体に無い字（Bahnschrift の日本語など）は Qt が代わりの書体で描くが、軸を回した字は
+    代わりの書体でも太字の面を選ぶ（試験で見ている）
+
+    軸を持たない書体と、元の太さが軸の上限に届いている書体は、今までどおり Qt の太字に任せる
+    （太字の面を探し、無ければ合成で太らせる） 上限で軸を回しても字が変わらず、太字が消える
     """
     weight = QFontInfo(font).weight()
-    if _has_weight_axis(QRawFont.fromFont(font)):
+    heaviest = _weight_axis_maximum(QRawFont.fromFont(font))
+    if heaviest is not None and weight < heaviest:
         font.setVariableAxis(QFont.Tag("wght"), float(max(_BOLD_WEIGHT, weight)))
     else:
         font.setBold(True)
 
 
-def _has_weight_axis(raw: QRawFont) -> bool:
-    """太さの軸（wght）を持つ可変フォントか ``fvar`` 表の軸の並びを読む
+def _weight_axis_maximum(raw: QRawFont) -> float | None:
+    """可変フォントの太さの軸（wght）の上限 軸を持たなければ ``None``
 
-    ``fvar`` を持つだけでは決めない 字の幅や大きさの軸しか持たない可変フォントで軸を回すと、
-    太さが変わらないまま太字が消える
+    ``fvar`` 表の軸の並びを読む ``fvar`` を持つだけでは決めない 字の幅や大きさの軸しか
+    持たない可変フォントで軸を回すと、太さが変わらないまま太字が消える
     """
     if not raw.isValid():
-        return False
+        return None
     table = bytes(raw.fontTable("fvar").data())
     if len(table) < 12:
-        return False
+        return None
     axes, _reserved, count, size = struct.unpack(">HHHH", table[4:12])
     for index in range(count):
         begin = axes + index * size
-        if table[begin : begin + 4] == b"wght":
-            return True
-    return False
+        record = table[begin : begin + 16]
+        if len(record) == 16 and record[:4] == b"wght":
+            # 軸の記録は 名前・下限・既定・上限 の順 数は 16.16 の固定小数
+            top = int.from_bytes(record[12:16], "big", signed=True)
+            return top / 65536.0
+    return None
 
 
 def drawn_bold_italic(values: Mapping[str, object], bold: bool, italic: bool) -> tuple[bool, bool]:
