@@ -5,10 +5,21 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 
 from sashimono.ai.fixes import ASK, AUTO, fix_for
-from sashimono.core.model import Clip, MediaItem, Transcript, TranscriptSegment
+from sashimono.core.model import (
+    Clip,
+    GeneratedSource,
+    MediaItem,
+    Project,
+    SubtitleOrigin,
+    Track,
+    TrackKind,
+    Transcript,
+    TranscriptSegment,
+)
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.engine.audio.voice_edges import fit_to_voice, loudness_of_waveform
 from sashimono.engine.audio.waveform import Waveform
@@ -98,3 +109,48 @@ def test_the_fix_is_retiming_unless_held(video_media: MediaItem) -> None:
     assert fix_for(plain.kind, plain.severity, plain.measure).tools == ("retime_subtitles",)
     (edited,) = _check(_media(video_media, (0.6, 2.6), edited=True)).problems
     assert fix_for(edited.kind, edited.severity, edited.measure).action == ASK
+
+
+def _burned(media: MediaItem, start: int, end: int) -> Project:
+    """素材を頭から置き、最初の行を ``start``〜``end`` フレームへ焼き込んだ作品"""
+    transcript = media.transcript_for()
+    assert transcript is not None
+    origin = SubtitleOrigin(media.id, media.transcript_stream(), transcript.segments[0].id)
+    text = Clip(
+        start,
+        end - start,
+        source=GeneratedSource(kind="text", params={"text": "行"}),
+        subtitle_origin=origin,
+    )
+    project = placed(media, Clip(timeline_start=0, duration=300, media_id=media.id))
+    track = Track(kind=TrackKind.VIDEO, name="字幕", clips=(text,))
+    return project.with_timeline(
+        replace(project.timeline, tracks=(*project.timeline.tracks, track))
+    )
+
+
+def _burned_check(project: Project) -> WordReport:
+    return check_words(project, 0, project.duration, KINDS, lambda _m, _s: VOICE)
+
+
+def test_burned_text_left_behind_is_found(video_media: MediaItem) -> None:
+    """元の行を合わせ直しても焼き込んだ文字は元の時刻のまま 行で見ると、ずれた文字を通してしまう
+
+    （PR #451 の Codex の指摘）
+    """
+    ((start, end),) = _fitted((1.0, 2.6))
+    media = _media(video_media, (float(start), float(end)))
+    # 文字は 0.6 秒（18 フレーム）から 声より 0.4 秒早い
+    (problem,) = _burned_check(_burned(media, 18, round(float(end) * 30))).problems
+    assert problem.measure["burned"] is True
+    assert float(problem.measure["start_offset_seconds"]) < -0.3
+    (fix,) = [fix_for(problem.kind, problem.severity, problem.measure)]
+    assert fix.action == ASK
+
+
+def test_burned_text_moved_onto_the_voice_is_fine(video_media: MediaItem) -> None:
+    """文字だけを声へ動かして合わせた形を、元の行のずれで知らせない"""
+    ((start, end),) = _fitted((1.0, 2.6))
+    media = _media(video_media, (0.6, 2.6))
+    project = _burned(media, round(float(start) * 30), round(float(end) * 30))
+    assert _burned_check(project).problems == ()

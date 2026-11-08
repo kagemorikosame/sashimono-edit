@@ -4306,7 +4306,7 @@ class MainWindow(QMainWindow):
         )
         # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると 6 dB を越えて重なる
         squeeze = (
-            MAX_LIMITER_DB if choice.limiter and not all(has_limiter(c) for c in clips) else 0.0
+            MAX_LIMITER_DB if choice.limiter and not any(has_limiter(c) for c in clips) else 0.0
         )
         self._pending_loudness = _PendingLoudness(
             request, project, tuple(clips), choice.ceiling, squeeze

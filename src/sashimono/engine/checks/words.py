@@ -432,47 +432,101 @@ class _Shown:
     low: int
     high: int
     clip_ids: list[str]
-    burned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Burned:
+    """焼き込んだ字幕のテキスト 1 つ 時刻は実際に映る範囲（タイムラインのフレーム）"""
+
+    segment_id: str
+    start: Fraction
+    end: Fraction
+    clip_id: str
 
 
 def _shown_lines(
     project: Project, start: int, end: int
-) -> dict[tuple[MediaId, int], dict[str, _Shown]]:
-    """``[start, end)`` に出る字幕の行を、素材と音ごとに集める 焼き込んだ物も含める"""
+) -> tuple[dict[tuple[MediaId, int], dict[str, _Shown]], dict[tuple[MediaId, int], list[_Burned]]]:
+    """``[start, end)`` に出る字幕を、素材と音ごとに集める（焼き込んでいない行、焼き込んだ文字）
+
+    焼き込んだ文字は元の行とは別に動かせる（行を合わせ直しても文字は元の時刻のまま） 元の行で
+    見ると、行だけを直して文字が残ったずれを通してしまい、文字だけを動かして合わせた形をずれと読む
+    同じ行を焼き込んだ所は、焼き込んでいない行としては数えない（見る人に出るのは文字の方）
+    """
     shown: dict[tuple[MediaId, int], dict[str, _Shown]] = {}
-
-    def add(
-        key: tuple[MediaId, int], segment: str, low: int, high: int, clip: str, burned: bool
-    ) -> None:
-        lines = shown.setdefault(key, {})
-        found = lines.get(segment)
-        if found is None:
-            lines[segment] = _Shown(low, high, [clip], burned)
-            return
-        found.low, found.high = min(found.low, low), max(found.high, high)
-        if clip not in found.clip_ids:
-            found.clip_ids.append(clip)
-        found.burned = found.burned or burned
-
+    burned: dict[tuple[MediaId, int], list[_Burned]] = {}
     for item in burned_subtitles(project):
         origin = item.origin
         media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
         if media_id is None or item.end <= start or item.start >= end:
             continue
-        low, high = math.floor(item.start), math.ceil(item.end)
-        add((media_id, origin.stream), str(origin.segment_id), low, high, str(item.clip_id), True)
+        burned.setdefault((media_id, origin.stream), []).append(
+            _Burned(str(origin.segment_id), item.start, item.end, str(item.clip_id))
+        )
     for subtitle in heard_timeline(project):
         if subtitle.media_id is None or subtitle.end_frame <= start or subtitle.start_frame >= end:
             continue
-        add(
-            (subtitle.media_id, subtitle.stream),
-            str(subtitle.segment.id),
-            subtitle.start_frame,
-            subtitle.end_frame,
-            str(subtitle.clip_id),
-            False,
+        key = (subtitle.media_id, subtitle.stream)
+        segment = str(subtitle.segment.id)
+        if any(
+            copy.segment_id == segment
+            and copy.start < subtitle.end_frame
+            and subtitle.start_frame < copy.end
+            for copy in burned.get(key, [])
+        ):
+            continue
+        lines = shown.setdefault(key, {})
+        found = lines.get(segment)
+        if found is None:
+            lines[segment] = _Shown(
+                subtitle.start_frame, subtitle.end_frame, [str(subtitle.clip_id)]
+            )
+            continue
+        found.low, found.high = (
+            min(found.low, subtitle.start_frame),
+            max(found.high, subtitle.end_frame),
         )
-    return shown
+        if str(subtitle.clip_id) not in found.clip_ids:
+            found.clip_ids.append(str(subtitle.clip_id))
+    return shown, burned
+
+
+def _projected(
+    pieces: list[HeardPiece], seconds: Fraction, near: Fraction, project: Project
+) -> Fraction | None:
+    """素材の秒が鳴るタイムラインのフレーム 同じ所が何度も鳴るときは ``near`` に近い方"""
+    frames = [
+        piece.frame_at(seconds, project.rate)
+        for piece in pieces
+        if piece.source_start <= seconds <= piece.source_end
+    ]
+    if not frames:
+        return None
+    return min(frames, key=lambda frame: abs(frame - near))
+
+
+def _timing_problem(
+    low: int,
+    high: int,
+    early: Fraction,
+    late: Fraction,
+    clip_ids: tuple[str, ...],
+    values: dict[str, float | int | str | bool],
+) -> Problem:
+    return Problem(
+        SUBTITLE_TIMING,
+        MEDIUM,
+        low,
+        high,
+        "字幕の出る・消える時刻が声とずれている",
+        {
+            # 正は声より遅い 負は声より早い（設定のずらしを足した後の所から）
+            "start_offset_seconds": round(float(early), 3),
+            "end_offset_seconds": round(float(late), 3),
+            **values,
+        },
+        clip_ids,
+    )
 
 
 def _subtitle_timing(
@@ -481,23 +535,36 @@ def _subtitle_timing(
     """字幕の行の頭と終わりが、声へ寄せた時刻（#426 と同じ寄せ方）から離れている行
 
     寄せた時刻は本人の設定のずらし（``timing`` の頭と終わりのミリ秒）も足した物と比べる 足さないと、
-    わざと早く出している人の字幕を全部ずれと読む 戻り値は（問題、波形が無く比べられなかった行の数）
+    わざと早く出している人の字幕を全部ずれと読む 焼き込んだ文字は実際に映る範囲を、寄せた時刻を
+    タイムラインへ投影した所と比べる 戻り値は（問題、波形が無く比べられなかった行の数）
     """
     problems: list[Problem] = []
     unknown = 0
     wanted = SubtitleTiming(True, timing.start_offset_ms, timing.end_offset_ms)
-    for (media_id, stream), lines in _shown_lines(project, start, end).items():
+    frame = project.rate.frame_duration
+    shown, burned = _shown_lines(project, start, end)
+    pieces = heard_pieces(project)
+    for key in {*shown, *burned}:
+        media_id, stream = key
+        lines = shown.get(key, {})
+        copies = burned.get(key, [])
         media = project.find_media(media_id)
         transcript = None if media is None else media.transcript_for(stream)
         if media is None or transcript is None or not transcript.segments:
             continue
         waveform = waveform_of(media, stream)
         if waveform is None:
-            unknown += len(lines)
+            unknown += len(lines) + len(copies)
             continue
         fitted = {
             str(s.id): s
             for s in retime(transcript.segments, wanted, loudness_of_waveform(waveform))
+        }
+        common: dict[str, float | int | str | bool] = {
+            "media_id": str(media_id),
+            "stream": stream,
+            "start_offset_ms": timing.start_offset_ms,
+            "end_offset_ms": timing.end_offset_ms,
         }
         for segment in transcript.segments:
             line = lines.get(str(segment.id))
@@ -508,28 +575,51 @@ def _subtitle_timing(
             late = segment.end - target.end
             if max(abs(early), abs(late)) < TIMING_TOLERANCE:
                 continue
+            values: dict[str, float | int | str | bool] = {
+                "segment_id": str(segment.id),
+                "burned": False,
+                "edited": segment.edited,
+            }
             problems.append(
-                Problem(
-                    SUBTITLE_TIMING,
-                    MEDIUM,
+                _timing_problem(
                     max(line.low, start),
                     min(line.high, end),
-                    "字幕の出る・消える時刻が声とずれている",
-                    {
-                        "segment_id": str(segment.id),
-                        "media_id": str(media_id),
-                        "stream": stream,
-                        # 正は声より遅い 負は声より早い（設定のずらしを足した後の所から）
-                        "start_offset_seconds": round(float(early), 3),
-                        "end_offset_seconds": round(float(late), 3),
-                        "start_offset_ms": timing.start_offset_ms,
-                        "end_offset_ms": timing.end_offset_ms,
-                        "burned": line.burned,
-                        "edited": segment.edited,
-                    },
+                    early,
+                    late,
                     tuple(line.clip_ids),
+                    {**common, **values},
                 )
             )
+        heard = [piece for piece in pieces if (piece.media_id, piece.stream) == key]
+        for copy in copies:
+            target = fitted.get(copy.segment_id)
+            if target is None:
+                continue
+            head = _projected(heard, target.start, copy.start, project)
+            tail = _projected(heard, target.end, copy.end, project)
+            if head is None or tail is None:
+                # 寄せた所が切って鳴らない（声の端を切った片） 比べる相手が無い
+                continue
+            early = (copy.start - head) * frame
+            late = (copy.end - tail) * frame
+            if max(abs(early), abs(late)) < TIMING_TOLERANCE:
+                continue
+            values = {
+                "segment_id": copy.segment_id,
+                "burned": True,
+                "edited": False,
+            }
+            problems.append(
+                _timing_problem(
+                    max(math.floor(copy.start), start),
+                    min(math.ceil(copy.end), end),
+                    early,
+                    late,
+                    (copy.clip_id,),
+                    {**common, **values},
+                )
+            )
+    problems.sort(key=lambda problem: (problem.start, problem.end))
     return problems, unknown
 
 

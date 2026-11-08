@@ -6950,8 +6950,10 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     ceiling = _limit_number(arguments, "peak_ceiling_db", DEFAULT_PEAK_CEILING_DB, -20.0, 0.0)
     # 山を抑えるかは本人の設定（#414） 測る前に読む 測り終えてから断ると測り直しになる
     squeeze = MAX_LIMITER_DB if _flag_argument(arguments, "limiter", host.loudness_limiter) else 0.0
-    if all(has_limiter(clip) for _, clip in targets):
+    if any(has_limiter(clip) for _, clip in targets):
         # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると上限の 6 dB を越えて重なる
+        # 1 本でも積んであれば抑えない 後から足したクリップに引かれて抑えた所を上げ直すと、
+        # 前のクリップだけが積み重ねて潰れる（PR #451 の Codex の指摘）
         squeeze = 0.0
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
     start = min(clip.timeline_start for _, clip in targets)
@@ -7097,11 +7099,12 @@ def _apply_loudness(
 def _limitable(host: EditorHost) -> bool:
     """天井に当たった音量を、リミッターを積んでまだ上げられるか 検査の直し方を選ぶのに使う
 
-    鳴るクリップのどれにもリミッターがあれば、もう抑えた後の音なので上げられない（尋ねる側へ回す）
+    鳴るクリップのどれかにリミッターがあれば、もう抑えた後の音なので上げられない（尋ねる側へ回す
+    ``normalize_loudness`` も 1 本でも積んであれば抑えない）
     """
     if not host.loudness_limiter:
         return False
-    return not all(has_limiter(clip) for _, clip in audible_clips(_project(host)))
+    return not any(has_limiter(clip) for _, clip in audible_clips(_project(host)))
 
 
 def _limit_reason(limited: list[str], ceiling: float) -> str:

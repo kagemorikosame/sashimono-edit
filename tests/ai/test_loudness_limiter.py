@@ -13,7 +13,7 @@ import pytest
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
-from sashimono.core.commands import AddEffect, SetParam
+from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
 from sashimono.core.commands.fixed import VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.mixing import MAX_LIMITER_DB
@@ -126,6 +126,17 @@ class TestNormalize:
         limiters = [k for k in _kinds(work.clip(work.voice.id)) if k == LIMITER_KIND]
         assert limiters == [LIMITER_KIND]
 
+    def test_a_new_clip_does_not_reopen_the_limiting(self, work: _Work) -> None:
+        """抑えた作品へクリップを足して呼び直しても、前のクリップを重ねて潰さない（Codex の指摘）"""
+        effect = registry.require(LIMITER_KIND).create()
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
+        _run(work)
+        _measured(work.host, -18.0, -1.0)
+        result = _run(work)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is False
+        assert LIMITER_KIND not in _kinds(work.clip(work.bgm.id))
+
     def test_switched_off_keeps_the_old_way(self, work: _Work) -> None:
         """設定で切った人の作品に、黙ってリミッターを積まない"""
         work.host.limiter = False
@@ -136,13 +147,17 @@ class TestNormalize:
         assert LIMITER_KIND not in _kinds(work.clip(work.voice.id))
 
     def test_a_moving_ceiling_is_not_overwritten(self, work: _Work) -> None:
-        """人がキーフレームで動かした上限を、1 つの値で黙って消さない"""
+        """人がキーフレームで動かした上限を、1 つの値で黙って消さない
+
+        切ってあるリミッターは効いていないので入れ直す側 そのとき動きを潰さない
+        """
         effect = registry.require(LIMITER_KIND).create()
         moving = AnimatedValue(-1.0, (Keyframe(0, -3.0), Keyframe(30, -1.0)))
         work.host.apply_commands(
             [
                 AddEffect(work.voice.id, effect),
                 SetParam(ParamPath.of_effect(work.voice.id, effect.id, "ceiling"), moving),
+                SetEffectEnabled(work.voice.id, effect.id, False),
             ],
             "人のリミッター",
         )
