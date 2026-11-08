@@ -900,8 +900,12 @@ def _text_layers(
         plain_font.setStyleName("")
         plain_font.setItalic(resolved.italic())
     else:
-        emboldened = font.bold()
+        # 可変フォントの太字は太さの軸で掛ける（:func:`_embolden`）ので ``font.bold()`` は
+        # 偽のまま 太字の欄で見ないと、可変フォントの太字だけ中心へ戻さなくなる
+        emboldened = bool(values.get("bold", False))
     plain_font.setBold(False)
+    # 太さの軸も外す 残すと比べる細字まで太字の太さになり、戻す量が 0 になる
+    plain_font.unsetVariableAxis(QFont.Tag("wght"))
     plain_metrics = QFontMetricsF(plain_font)
     plain_widest = max((plain_metrics.horizontalAdvance(line) for line in lines), default=0.0)
 
@@ -1010,9 +1014,53 @@ def _text_font(values: Mapping[str, object], size: int) -> QFont:
         if style in QFontDatabase.styles(family):
             font.setStyleName(style)
         return font
-    font.setBold(bool(values.get("bold", False)))
+    # 斜体を先に掛ける 太字の太さは斜体の面で見る（斜体の面だけ太さが違う書体がある）
     font.setItalic(bool(values.get("italic", False)))
+    if bool(values.get("bold", False)):
+        _embolden(font)
     return font
+
+
+#: 太字の太さ（OpenType の wght） Qt の太字（``QFont.Weight.Bold``）と同じ値
+_BOLD_WEIGHT = 700
+
+
+def _embolden(font: QFont) -> None:
+    """``font`` を太字にする 太字は元の太さより細くならない（#419）
+
+    Windows は可変フォントの名前付きの太さを別のファミリ（「Noto Serif JP Medium」）として並べる
+    そこへ Qt の太字（太さ 700 の面を探す）を頼むと、そのファミリに 700 の面が無いので、
+    可変フォントの既定の太さ（Noto Serif JP なら ExtraLight）へ戻してから合成の太字で太らせる
+    Medium の太字が Medium より細く出て、SemiBold は 600 を太字に数えて何も変わらない
+
+    太さの軸（wght）を持つ可変フォントは、選ばれた面のまま軸を回して太くする 同じ書体の
+    Bold の面と同じ字になる 元が 700 より太い（Black）ときは、その太さのまま残す
+    軸を持たない書体は今までどおり Qt の太字に任せる（太字の面を探し、無ければ合成で太らせる）
+    """
+    weight = QFontInfo(font).weight()
+    if _has_weight_axis(QRawFont.fromFont(font)):
+        font.setVariableAxis(QFont.Tag("wght"), float(max(_BOLD_WEIGHT, weight)))
+    else:
+        font.setBold(True)
+
+
+def _has_weight_axis(raw: QRawFont) -> bool:
+    """太さの軸（wght）を持つ可変フォントか ``fvar`` 表の軸の並びを読む
+
+    ``fvar`` を持つだけでは決めない 字の幅や大きさの軸しか持たない可変フォントで軸を回すと、
+    太さが変わらないまま太字が消える
+    """
+    if not raw.isValid():
+        return False
+    table = bytes(raw.fontTable("fvar").data())
+    if len(table) < 12:
+        return False
+    axes, _reserved, count, size = struct.unpack(">HHHH", table[4:12])
+    for index in range(count):
+        begin = axes + index * size
+        if table[begin : begin + 4] == b"wght":
+            return True
+    return False
 
 
 def drawn_bold_italic(values: Mapping[str, object], bold: bool, italic: bool) -> tuple[bool, bool]:
