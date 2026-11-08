@@ -63,6 +63,7 @@ from sashimono.ai.models import EFFORTS, MODELS, effort_for, find_model
 from sashimono.ai.operations import ASK_USER
 from sashimono.ai.outbound import SendAnswer, SendChoice, SendRequest
 from sashimono.ai.plan import RESUME_PROMPT, Stopped
+from sashimono.ai.send_log import SendLog, SendLogStore
 from sashimono.ai.session import (
     LIMIT_DETAIL,
     LOGIN_DETAIL,
@@ -90,6 +91,8 @@ __all__ = ["ChatPanel"]
 
 #: 1 日に使った量を残すファイル（本人の設定の置き場 #344） 外へは送らない
 USAGE_FILE = "ai_usage.json"
+#: AI へ送った物の記録（#425 :mod:`sashimono.ai.send_log`） 置き場は設定と同じ
+SEND_LOG_FILE = "ai_sends.json"
 
 #: 上限に当たったときの箱の頭と、ボタンの文言
 BUDGET_HEAD = "AI が使う量の上限に達しました 続けますか？"
@@ -280,7 +283,9 @@ class ChatPanel(QWidget):
         self._host = host
         # 1 日の量はアプリを閉じても残す（#344） 置き場は設定と同じ（試験は一時フォルダへ向く）
         self._bridge = EditorBridge(
-            host, usage=UsageMeter(DailyUsageStore(config_root() / USAGE_FILE))
+            host,
+            usage=UsageMeter(DailyUsageStore(config_root() / USAGE_FILE)),
+            send_log=SendLog(SendLogStore(config_root() / SEND_LOG_FILE)),
         )
         self._session: AgentSession | None = None
         #: 画面に出している「上限に達しました 続けますか」（#344）
@@ -920,6 +925,11 @@ class ChatPanel(QWidget):
     def effort(self) -> str:
         return str(self._effort.currentData())
 
+    @property
+    def send_log(self) -> SendLog:
+        """AI へ送った物の記録（#425） 設定画面の「送った物を見る…」が読む"""
+        return self._bridge.send_log
+
     def apply_preferences(self, preferences: Preferences) -> None:
         """本人の好み（設定画面か、前に欄の上で選んだもの）を当てる"""
         self._input.enter_sends = preferences.chat_enter_sends
@@ -937,6 +947,8 @@ class ChatPanel(QWidget):
         self._updater.set_enabled(preferences.ai_auto_update)
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
+        self._bridge.ask_each_call = preferences.ai_send_ask_each_call
+        self._bridge.send_log.keep = preferences.ai_send_log
         self._bridge.ask_first = preferences.ai_ask_before_ungroup
         # 上限は次の道具の前から効く 応えている途中で変えても、会話を作り直さずに済む
         self._bridge.usage.limits = preferences.budget_limits()
@@ -1547,6 +1559,8 @@ class ChatPanel(QWidget):
                 self.send_allowed.emit(kind.value)
             self._bridge.set_send_choices(choices)
             self._note(f"{names} を送ります（次からは尋ねません 表示 → 設定… で変えられます）")
+        elif answer is SendAnswer.UNTIL_CLOSE and request.each_call:
+            self._note(f"{names} を今回は送ります（次に使うときにまた尋ねます）")
         elif answer is SendAnswer.UNTIL_CLOSE:
             self._note(f"{names} をアプリを閉じるまで送ります")
         else:

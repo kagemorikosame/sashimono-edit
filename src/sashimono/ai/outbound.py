@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -49,21 +49,33 @@ __all__ = [
     "PATH_MARK",
     "PROJECT_MARK",
     "REMEMBERED_MARK",
+    "SAMPLE_HEAD",
+    "SAMPLE_LINES",
+    "SAMPLE_LINE_CHARS",
     "TEXT_MARK",
     "UNKNOWN_FIELD_SENDS",
     "NamedMedia",
     "Outbound",
+    "Preview",
+    "PreviewSource",
+    "Sample",
     "SendAnswer",
     "SendChoice",
     "SendRequest",
+    "build_samples",
     "field_sends",
+    "file_sample",
     "file_secrets",
+    "frame_sample",
+    "from_arguments",
+    "from_result",
     "hide_text",
     "masked_value",
     "redact",
     "secret_pairs",
     "sendable_now",
     "sending",
+    "text_sample",
     "text_secrets",
 ]
 
@@ -171,6 +183,248 @@ class SendAnswer(StrEnum):
     DENY = "deny"
 
 
+class PreviewSource(StrEnum):
+    """下見を何から作るか（#425）"""
+
+    #: 先に道具を動かし、結果を保留して、その結果から作る 読み取りだけの道具に限る
+    #: 送ると答えたら、保留した結果をそのまま AI へ返す 下見と送る物が食い違わない
+    RESULT = "result"
+    #: 道具の引数から作る 作品を変える道具・アプリの外へ何かを出す道具（クリップボード）
+    #: 確かめる前に動かすと、断っても作品や外が変わってしまう
+    ARGUMENTS = "arguments"
+
+
+@dataclass(frozen=True, slots=True)
+class Preview:
+    """道具ごとの下見の作り方（:attr:`~sashimono.ai.operations.Operation.preview` #425）
+
+    ``sends`` と同じく道具ごとに書く 書かないと道具を作れない 読み取りだけに見える道具でも、
+    クリップボードへ写す物は先に動かすと断っても写ってしまう 動かしてよいかは道具を書いた人
+    にしか分からないので、``writes`` から決めずに書かせる
+    """
+
+    source: PreviewSource
+    #: 字幕と文字として下見に出す欄の名前 結果（か引数）の中で、この名前の欄の文字を数える
+    #: 欄の名前で見るのは、ID や秒や種類の名前まで「文字」と数えると、送る文の量が読めないため
+    text_keys: frozenset[str] = frozenset({"text"})
+
+
+def from_result(*text_keys: str) -> Preview:
+    """先に動かして結果から下見を作る 欄を書かなければ ``text`` だけを数える"""
+    return Preview(PreviewSource.RESULT, frozenset(text_keys or ("text",)))
+
+
+def from_arguments(*text_keys: str) -> Preview:
+    """引数から下見を作る 欄を書かなければ ``text`` だけを数える"""
+    return Preview(PreviewSource.ARGUMENTS, frozenset(text_keys or ("text",)))
+
+
+#: 下見に持つ行の上限 字幕の多い作品で全部を持つと、窓を開くのが重くなる
+#: 件数（:attr:`Sample.count`）は上限に関係なく全部を数える
+SAMPLE_LINES = 200
+#: 1 行の長さの上限（文字） 長い本文 1 つで窓の幅が広がらないように
+SAMPLE_LINE_CHARS = 200
+#: 窓を開いたときに、詳細を開かずに見せる行の数
+SAMPLE_HEAD = 3
+
+
+@dataclass(frozen=True, slots=True)
+class Sample:
+    """送る物の種類 1 つの下見（#425）"""
+
+    kind: Outbound
+    #: 件数 字幕と文字は行、絵は枚、名前と場所は名前の数
+    count: int
+    #: 字幕と文字の文字数 ほかの種類は 0
+    chars: int = 0
+    #: 下見の行（上限 :data:`SAMPLE_LINES` まで） 名前と場所は「元 → 伏せた後」
+    lines: tuple[str, ...] = ()
+    #: 絵（PNG） 映像の絵だけ
+    images: tuple[bytes, ...] = ()
+    #: 添える注意（引数から作った・ユーザー名を含む）
+    note: str = ""
+
+    @property
+    def amount(self) -> str:
+        """件数の短い文 記録と窓の見出しに出す"""
+        if self.kind is Outbound.TEXT:
+            return f"{self.count} 行 {self.chars} 文字"
+        if self.kind is Outbound.FRAMES:
+            return f"{self.count} 枚"
+        return f"{self.count} 件"
+
+    @property
+    def omitted(self) -> int:
+        """上限で下見から落とした行の数 絵は 1 枚ずつが行の代わりなので数えない"""
+        if self.kind is Outbound.FRAMES:
+            return 0
+        return max(0, self.count - len(self.lines))
+
+
+def _clip_line(text: str) -> str:
+    line = " ".join(text.split())
+    if len(line) <= SAMPLE_LINE_CHARS:
+        return line
+    return line[: SAMPLE_LINE_CHARS - 1] + "…"
+
+
+def _texts_under(value: Any, keys: frozenset[str]) -> Iterator[str]:
+    """``keys`` の欄に入った文字を順に返す 欄の中の並び・辞書もたどる"""
+    if isinstance(value, Mapping):
+        for key, entry in value.items():
+            if key in keys:
+                yield from _all_texts(entry)
+            else:
+                yield from _texts_under(entry, keys)
+    elif isinstance(value, list | tuple):
+        for entry in value:
+            yield from _texts_under(entry, keys)
+
+
+def _all_texts(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for entry in value.values():
+            yield from _all_texts(entry)
+    elif isinstance(value, list | tuple):
+        for entry in value:
+            yield from _all_texts(entry)
+
+
+def text_sample(value: Any, keys: frozenset[str]) -> Sample:
+    """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行"""
+    lines = [line for text in _texts_under(value, keys) for line in text.splitlines() if line]
+    return Sample(
+        Outbound.TEXT,
+        count=len(lines),
+        chars=sum(len(line) for line in lines),
+        lines=tuple(_clip_line(line) for line in lines[:SAMPLE_LINES]),
+    )
+
+
+def _images(value: Any) -> Iterator[Any]:
+    """結果の中の絵（:class:`~sashimono.ai.operations.ImageResult`） 型は形で見分ける
+
+    ここから operations を読むと、operations がこのモジュールを読むので輪になる
+    """
+    if isinstance(value, bytes):
+        return
+    png = getattr(value, "png", None)
+    if isinstance(png, bytes):
+        yield value
+    elif isinstance(value, Mapping):
+        for entry in value.values():
+            yield from _images(entry)
+    elif isinstance(value, list | tuple):
+        for entry in value:
+            yield from _images(entry)
+
+
+def frame_sample(value: Any) -> Sample:
+    """映像の絵の下見 送る絵そのものと、添える説明（コマの位置）"""
+    found = list(_images(value))
+    captions = tuple(
+        _clip_line(str(getattr(image, "caption", ""))) for image in found if image.caption
+    )
+    return Sample(
+        Outbound.FRAMES,
+        count=len(found),
+        lines=captions,
+        images=tuple(image.png for image in found),
+    )
+
+
+def _user_name() -> str:
+    """場所に混ざるユーザー名 分からなければ空"""
+    try:
+        return Path.home().name
+    except (OSError, RuntimeError):
+        return ""
+
+
+def file_sample(
+    value: Any, pairs: Iterable[tuple[str, str]], name_keys: Iterable[str] = ()
+) -> Sample:
+    """素材の名前と場所の下見 名前ごとに「元 → 伏せた後」
+
+    伏せた後の形は :func:`redact` そのもので作る 断ったときに実際に送る形と食い違わないように
+    """
+    hide = _redactor(pairs, name_keys)
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def look(key: object, text: str) -> None:
+        if not text or text in seen:
+            return
+        after = hide(key, text)
+        if after != text:
+            seen.add(text)
+            found.append((text, str(after)))
+
+    def walk(key: object, item: Any) -> None:
+        if isinstance(item, str):
+            look(key, item)
+        elif isinstance(item, Mapping):
+            for name, entry in item.items():
+                walk(name, entry)
+        elif isinstance(item, list | tuple):
+            for entry in item:
+                walk(key, entry)
+        else:
+            caption = getattr(item, "caption", None)
+            if isinstance(caption, str):
+                look(None, caption)
+
+    walk(None, value)
+    user = _user_name()
+    with_user = sum(1 for before, _after in found if len(user) >= 2 and user in before)
+    note = f"ユーザー名「{user}」を含む物が {with_user} 件あります" if with_user else ""
+    return Sample(
+        Outbound.FILES,
+        count=len(found),
+        lines=tuple(
+            f"{_clip_line(before)} → {_clip_line(after)}" for before, after in found[:SAMPLE_LINES]
+        ),
+        note=note,
+    )
+
+
+def build_samples(
+    kinds: Iterable[Outbound],
+    value: Any,
+    preview: Preview,
+    *,
+    pairs: Iterable[tuple[str, str]] = (),
+    name_keys: Iterable[str] = (),
+) -> tuple[Sample, ...]:
+    """送る物の種類ごとの下見 ``value`` は道具の結果か引数（``preview.source`` で決まる）"""
+    table = list(pairs)
+    samples: list[Sample] = []
+    for kind in kinds:
+        if kind is Outbound.TEXT:
+            sample = text_sample(value, preview.text_keys)
+        elif kind is Outbound.FRAMES:
+            sample = frame_sample(value)
+        elif kind is Outbound.FILES:
+            sample = file_sample(value, table, name_keys)
+        else:
+            continue
+        if preview.source is PreviewSource.ARGUMENTS:
+            # 結果はまだ無い 引数に無い物（道具が読んで返す名前など）も送りうると添える
+            extra = "道具の引数から作った下見です 結果に入る物はここに出ません"
+            sample = Sample(
+                sample.kind,
+                count=sample.count,
+                chars=sample.chars,
+                lines=sample.lines,
+                images=sample.images,
+                note=f"{sample.note} {extra}".strip(),
+            )
+        samples.append(sample)
+    return tuple(samples)
+
+
 @dataclass(slots=True)
 class SendRequest:
     """送ってよいかの確かめ 1 件
@@ -183,6 +437,11 @@ class SendRequest:
     tool: str
     #: まだ同意を取っていない物（:data:`ASKED` の順）
     kinds: tuple[Outbound, ...]
+    #: 送る物の下見（#425） 種類ごとに 1 つ 作れなかった種類は無い
+    samples: tuple[Sample, ...] = ()
+    #: 道具の呼び出しごとに尋ねているか（設定） 窓は「アプリを閉じるまで送る」の代わりに
+    #: 「今回は送る」を出す
+    each_call: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     answer: SendAnswer | None = None
     #: 答えずに畳んだわけ
@@ -210,7 +469,14 @@ class SendRequest:
     def text(self) -> str:
         """確かめの窓に出す文"""
         lines = [f"AI アシスタントが、次の物を {DESTINATION} へ送ろうとしています"]
-        lines += [f"・{kind.label}: {kind.detail}" for kind in self.kinds]
+        amounts = {sample.kind: sample.amount for sample in self.samples}
+        for kind in self.kinds:
+            amount = amounts.get(kind)
+            lines.append(
+                f"・{kind.label}（{amount}）: {kind.detail}"
+                if amount
+                else f"・{kind.label}: {kind.detail}"
+            )
         lines.append(f"使う道具: {self.tool}")
         lines.append(
             "送った物の扱いは Anthropic の規約と個人情報の方針によります"
@@ -530,6 +796,17 @@ def redact(value: Any, table: Iterable[tuple[str, str]], name_keys: Iterable[str
     :attr:`~sashimono.ai.operations.Operation.name_keys` で決める） 表に載っていなくても、
     短くても、値ごと伏せる
     """
+    return _redactor(table, name_keys)(None, value)
+
+
+def _redactor(
+    table: Iterable[tuple[str, str]], name_keys: Iterable[str] = ()
+) -> Callable[[object, Any], Any]:
+    """:func:`redact` の伏せ方 欄の名前と値を受けて伏せた値を返す（欄が無ければ ``None``）
+
+    下見（:func:`file_sample`）は欄ごとに伏せる前と後を並べる 欄ごとに :func:`redact` を
+    呼ぶと、短い名前の正規表現を欄の数だけ作り直し、長い一覧で窓が出るまで待たせる
+    """
     pairs = list(table)
     names = frozenset(name_keys)
     # 短い名前は、前後が語の続きでない所だけで伏せる（:data:`_SHORTEST_SECRET`）
@@ -571,4 +848,4 @@ def redact(value: Any, table: Iterable[tuple[str, str]], name_keys: Iterable[str
             return [whole(entry, mark) for entry in item]
         return item
 
-    return walk(value)
+    return value_of

@@ -58,9 +58,14 @@ from sashimono.ai.host import (
     ToolError,
 )
 from sashimono.ai.outbound import (
+    ASKED,
     UNKNOWN_FIELD_SENDS,
     Outbound,
+    Preview,
+    PreviewSource,
     field_sends,
+    from_arguments,
+    from_result,
     masked_value,
     sendable_now,
 )
@@ -636,11 +641,27 @@ class Operation:
     asks_first: Callable[[EditorHost, dict[str, Any]], FirstAsk] | None = field(
         default=None, kw_only=True
     )
+    #: 送る前の確かめの窓に出す下見の作り方（#425 :class:`~sashimono.ai.outbound.Preview`）
+    #: 同意の要る物（:data:`~sashimono.ai.outbound.ASKED`）を ``sends`` に書いた道具は省けない
+    #: 先に動かしてよい（読み取りだけで、外にも何も出さない）かは道具を書いた人にしか
+    #: 分からない 決め打ちにすると、クリップボードへ写す道具を断った後も写してしまう
+    preview: Preview | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sends:
             # 結果を返す以上、何かは送る 空にすると、何も送らない道具と見分けが付かない
             raise ValueError(f"{self.name}: 結果に入りうる物（sends）を書いてください")
+        if self.asked_kinds and self.preview is None:
+            # 書き忘れると、確かめの窓に何も出ないまま送ってよいかを尋ねる
+            raise ValueError(f"{self.name}: 確かめの窓の下見の作り方（preview）を書いてください")
+        if (
+            self.preview is not None
+            and self.preview.source is PreviewSource.RESULT
+            and (self.writes or self.asks or self.frames_elsewhere)
+        ):
+            # 結果から作る下見は、確かめる前に道具を動かす 作品を変える・外へ出す道具を先に
+            # 動かすと、断っても変わった物が戻らない
+            raise ValueError(f"{self.name}: 結果から下見を作れるのは読み取りだけの道具です")
         if self.asks_first is not None and (not self.writes or self.irreversible):
             # 尋ねた答えを許可の代わりにするので、許可を求めない道具や、毎回別の確かめを出す
             # 取り消せない操作に付けると、確かめが 2 つになるか、尋ねる意味が無い
@@ -658,6 +679,11 @@ class Operation:
         # 変えない道具・質問の道具を取り消せないと書くと、確かめの窓だけが出て中身が無い
         if self.consent is None or not self.writes or self.asks:
             raise ValueError(f"{self.name}: 取り消せない操作は writes と consent が要ります")
+
+    @property
+    def asked_kinds(self) -> tuple[Outbound, ...]:
+        """送る前に同意を取る物（:data:`ASKED` の順） 伏せて送る物（``hidden``）は尋ねない"""
+        return tuple(kind for kind in ASKED if kind in self.sends and kind not in self.hidden)
 
     @property
     def returns_frames(self) -> bool:
@@ -10063,6 +10089,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_project,
         sends=_WITH_FILES,
+        preview=from_result(),
         name_keys=frozenset({"name"}),
     ),
     Operation(
@@ -10071,6 +10098,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
         sends=_WITH_FILES,
+        preview=from_result(),
         name_keys=frozenset({"name"}),
     ),
     Operation(
@@ -10095,6 +10123,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_list_clips,
         sends=_WITH_FILES,
+        preview=from_result(),
         name_keys=frozenset({"media"}),
     ),
     Operation(
@@ -10163,6 +10192,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 入りうる 本文は値を変える道具と同じく、送らないと決めた人には断らずに伏せて返す
         # 道具の役目は色や位置などの値を読むことで、断ると本文の無いクリップの値まで読めなくなる
         sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
+        preview=from_result(),
         hidden=_HIDDEN_IN_VALUES,
     ),
     Operation(
@@ -10215,6 +10245,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_get_subtitles,
         sends=_WITH_TEXT,
+        preview=from_result(),
     ),
     Operation(
         name="get_history",
@@ -10225,6 +10256,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_history,
         sends=_HISTORY,
+        preview=from_result(),
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
     ),
@@ -10240,6 +10272,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_handoff,
         sends=_HANDOFF,
+        preview=from_result(),
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
     ),
@@ -10254,6 +10287,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_list_markers,
         # 目印の名前は本人の文（話の区切りの見出し） 字幕と文字として尋ねる
         sends=_WITH_TEXT,
+        preview=from_result("label"),
     ),
     Operation(
         name="add_markers",
@@ -10290,6 +10324,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 置いた目印を名前ごと返す（前後の空白を落とした後の名前を AI が確かめるため）
         # 字幕と文字を送らない人には、add_text と同じく道具を動かさずに断る
         sends=_WITH_TEXT,
+        preview=from_arguments("label"),
         writes=True,
     ),
     Operation(
@@ -10306,6 +10341,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_update_marker,
         sends=_WITH_TEXT,
+        preview=from_arguments("label"),
         writes=True,
     ),
     Operation(
@@ -10338,6 +10374,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema(_paging()),
         handler=_get_chapters,
         sends=_WITH_TEXT,
+        preview=from_result("title", "youtube"),
     ),
     Operation(
         name="preview_frame",
@@ -10356,6 +10393,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_preview_frame,
         sends=_WITH_FRAMES,
+        preview=from_result(),
     ),
     Operation(
         name="contact_sheet",
@@ -10391,6 +10429,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_contact_sheet,
         # 絵（何コマも並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
         sends=_WITH_FRAMES,
+        preview=from_result(),
     ),
     Operation(
         name="preview_range",
@@ -10419,6 +10458,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_preview_range,
         # 絵（続いたコマを並べた 1 枚）と、説明の時刻・フレーム番号（作品の構成）を返す
         sends=_WITH_FRAMES,
+        preview=from_result(),
     ),
     Operation(
         name="detect_scenes",
@@ -10458,6 +10498,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_detect_scenes,
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     # 素材の意味検索（#326） 字幕と、AI が絵を見て作って覚えた場面の説明から「あの場面」を引く
     Operation(
@@ -10499,6 +10540,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_search_media,
         # 字幕の文と場面の説明（どちらも字幕と文字）を返す 素材は ID で返し、名前は返さない
         sends=_WITH_TEXT,
+        preview=from_result(),
     ),
     Operation(
         name="media_scene_sheet",
@@ -10541,6 +10583,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_media_scene_sheet,
         # 素材の絵と、場面の番号・素材の秒（作品の構成）を返す 素材の名前は書かない
         sends=_WITH_FRAMES,
+        preview=from_result(),
     ),
     Operation(
         name="remember_scene_descriptions",
@@ -10634,6 +10677,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は素材の秒・点・タイムラインの位置（編集の構成） 調べられなかった理由の文には
         # 素材の名前が入る 字幕は笑いの印を探すのに読むが、文は結果に入れない
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     Operation(
         name="detect_text",
@@ -10667,6 +10711,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 読めた文字は画面に映った本人の文に当たる 字幕と同じく尋ねてから送る（#342）
         # 断りの文に素材の名前が入る
         sends=_SCREEN_TEXT,
+        preview=from_result(),
     ),
     Operation(
         name="detect_faces",
@@ -10701,6 +10746,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_detect_faces,
         # 顔の位置は数だけ（作品の構成と同じ扱い） 断りの文に素材の名前が入る
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     Operation(
         name="check_output",
@@ -10793,6 +10839,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 字幕のはみ出しの行には、はみ出した文の頭（本人の文）が載る 字幕と文字を送らない人には
         # 断らずに値ごと伏せる（#391 道具の役目は問題の一覧で、断ると黒いコマも調べられない）
         sends=_CHECKS | _TEXT_ONLY,
+        preview=from_result(),
         hidden=_TEXT_ONLY,
     ),
     Operation(
@@ -10848,6 +10895,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 数の並び（作品の構成）と、音量の基準（本人の設定） 書き出した動画を調べたときは
         # target に場所が入り、調べられなかった理由の文に素材の名前が入りうる（check_output と同じ）
         sends=_CHECKS,
+        preview=from_result(),
     ),
     Operation(
         name="audio_graph",
@@ -10892,6 +10940,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 絵（グラフ）は同意を取ってから送る（#342） 説明の文は作品の構成と音量の基準
         # 書き出した動画を描いたときは説明に場所が入る
         sends=_SOUND_PICTURE,
+        preview=from_result(),
     ),
     Operation(
         name="get_app_settings",
@@ -10902,6 +10951,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_app_settings,
         sends=_APP_SETTINGS,
+        preview=from_result(),
     ),
     Operation(
         name="get_compat_report",
@@ -10917,6 +10967,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 記録の文に混ざる作品の中の名前や文（オブジェクトの名前・debug_print・制御文字の行）が
         # 入りうる 文は送らない人にも断らず、記録の文を値ごと伏せて種類と回数だけを返す（#391）
         sends=_APP_SETTINGS | _TEXT_ONLY,
+        preview=from_result(),
         hidden=_TEXT_ONLY,
     ),
     # 編集の方針（#343） 人は ファイル → プロジェクト設定… で書く AI は読むだけ
@@ -10932,6 +10983,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_get_style_guide,
         # 字幕の見た目・テンポ・そのほかは本人の文 字幕と文字として尋ね、断られたら動かさない
         sends=_WITH_TEXT,
+        preview=from_result("notes", "subtitles", "tempo"),
     ),
     Operation(
         name="check_style_guide",
@@ -11001,6 +11053,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_import_media,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"imported"}),
         writes=True,
     ),
@@ -11033,6 +11086,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_place_media,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"placed"}),
         writes=True,
     ),
@@ -11107,6 +11161,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_add_text,
         sends=_WITH_TEXT,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -11870,6 +11925,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"frame": _integer("描くフレーム 省くと再生ヘッドの位置")}),
         handler=_copy_snapshot,
         sends=_WITH_FRAMES,
+        preview=from_arguments(),
         frames_elsewhere=True,
     ),
     Operation(
@@ -11888,6 +11944,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_copy_subtitle_text,
         sends=_WITH_TEXT,
+        preview=from_arguments(),
     ),
     Operation(
         name="set_track_height",
@@ -12066,6 +12123,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_set_param,
         # 返す値は場所の欄（画像・音声のファイル）なら場所 名前と場所を断った人には型で伏せる
         sends=frozenset({Outbound.PROJECT, Outbound.TEXT, Outbound.FILES}),
+        preview=from_arguments(),
         hidden=_HIDDEN_IN_VALUES,
         writes=True,
     ),
@@ -12247,6 +12305,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_set_subtitle_text,
         sends=_WITH_TEXT,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12275,6 +12334,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_replace_subtitle_text,
         sends=_WITH_TEXT,
+        preview=from_arguments("from", "to"),
         writes=True,
     ),
     Operation(
@@ -12334,6 +12394,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_place_subtitles,
         sends=_WITH_LOOKS,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12354,6 +12415,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_list_looks,
         # 本人が保存した名前（アプリの設定）と、棚のフォルダの名前（本人の置き場の名前）
         sends=_LOOKS_AND_PLACES,
+        preview=from_result(),
     ),
     Operation(
         name="apply_preset",
@@ -12414,6 +12476,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_place_template,
         # 読めない理由の文と素材の数え方に、棚や素材の場所が入りうる
         sends=_LOOKS_AND_PLACES_IN_PROJECT,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12431,6 +12494,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_apply_template,
         sends=_LOOKS_AND_PLACES_IN_PROJECT,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12444,6 +12508,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"path": _string("読み込むファイルの場所")}, ["path"]),
         handler=_import_objects,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12473,6 +12538,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_jet_cut,
         sends=_JET_CUT,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -12579,6 +12645,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_duck_audio,
         writes=True,
         sends=_DUCKING,
+        preview=from_arguments(),
     ),
     Operation(
         name="normalize_loudness",
@@ -12617,6 +12684,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_normalize_loudness,
         writes=True,
         sends=_CHECKS,
+        preview=from_arguments(),
     ),
     Operation(
         name="auto_color",
@@ -12643,6 +12711,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_auto_color,
         writes=True,
         sends=_AUTO_FIX,
+        preview=from_arguments(),
     ),
     Operation(
         name="reduce_noise",
@@ -12676,6 +12745,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_reduce_noise,
         writes=True,
         sends=_AUTO_FIX,
+        preview=from_arguments(),
     ),
     Operation(
         name="place_sound",
@@ -12702,6 +12772,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_place_sound,
         writes=True,
         sends=_WITH_FILES,
+        preview=from_arguments(),
     ),
     Operation(
         name="transcribe",
@@ -12730,6 +12801,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_transcribe,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"started"}),
         writes=True,
     ),
@@ -12766,6 +12838,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 語は本人の文 字幕と文字を送らない人には語を伏せて時刻を返す 断ると切る位置まで読めない
         # 断りの文に素材の名前が入る
         sends=_WITH_TEXT | _WITH_FILES,
+        preview=from_result(),
         hidden=_TEXT_ONLY,
     ),
     Operation(
@@ -12785,6 +12858,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_heard_words,
         sends=_WITH_TEXT,
+        preview=from_result(),
     ),
     Operation(
         name="transcription_status",
@@ -12797,6 +12871,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"wait_seconds": _number(_TRANSCRIPTION_WAIT)}),
         handler=_transcription_status,
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     # 話者の分離（#323） 画面では字幕パネルの〔話者を分ける…〕 分けるのはこの機械で、音は
     # 外へ送らない（Outbound に音の区分が無いのはそのため） 結果は字幕の行の speaker に入り、
@@ -12827,6 +12902,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_separate_speakers,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"started"}),
         writes=True,
     ),
@@ -12848,6 +12924,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_rename_speaker,
         sends=_WITH_TEXT,
+        preview=from_arguments("from", "to"),
         writes=True,
     ),
     Operation(
@@ -12870,6 +12947,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_set_subtitle_speaker,
         sends=_WITH_TEXT,
+        preview=from_arguments("speaker"),
         writes=True,
     ),
     Operation(
@@ -12892,6 +12970,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_undo,
         sends=_HISTORY,
+        preview=from_arguments(),
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
         writes=True,
@@ -12907,6 +12986,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_redo,
         # 結果はやり直した操作の名前 取り消しと同じく、名前に素材の名前と文の頭が入る
         sends=_HISTORY,
+        preview=from_arguments(),
         hidden=_HIDDEN_IN_HISTORY,
         labels=True,
         writes=True,
@@ -12927,6 +13007,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は保存した場所と、置き換える前の作品を残した場所 知らせの文には控えの置き場が入る
         # 名前と場所を断った人には伏せる（場所の欄は値ごと）
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"saved", "previous_kept_as"}),
     ),
     Operation(
@@ -12953,6 +13034,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は保存した場所と、置き換える前の作品を残した場所 知らせの文には控えの置き場が入る
         # 名前と場所を断った人には伏せる（場所の欄は値ごと）
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"saved", "previous_kept_as"}),
     ),
     Operation(
@@ -12975,6 +13057,7 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_open_consent,
         # 開いた作品の場所と名前を返す 名前と場所を断った人には値ごと伏せる
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"opened", "name"}),
     ),
     Operation(
@@ -13049,6 +13132,7 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_export_consent,
         # 結果は書き出し先の場所 待ったときは書き出しの様子（場所と、終わりの文に場所が入る）
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"started"}),
     ),
     Operation(
@@ -13069,6 +13153,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 様子には書き出し先の場所と、終わりの文（場所・置き換える前のファイルを残した場所・
         # 失敗の理由に素材の名前）が入る
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     Operation(
         name="cancel_export",
@@ -13080,6 +13165,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_cancel_export,
         # 止めた後の様子に書き出し先の場所が入る
         sends=_WITH_FILES,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
@@ -13115,6 +13201,7 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_subtitles_consent,
         # 結果は書いた場所だけ 字幕の文はファイルへ書くだけで、結果には載らない
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"written", "previous_kept_as"}),
     ),
     Operation(
@@ -13139,6 +13226,7 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_snapshot_consent,
         # 結果は保存した場所とコマ 絵はファイルへ書くだけで、結果には載らない
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"saved", "previous_kept_as"}),
     ),
     Operation(
@@ -13213,6 +13301,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は書いた場所（名前と場所）・置いたクリップ（編集の構成）・声の名前と表記（本人の
         # 機械に入れた声と、本人の設定の既定）
         sends=_NARRATION,
+        preview=from_arguments(),
         # WAV を書くだけでなく声と字幕を置く 直しの回数の上限（#339）の後は断る
         edits=True,
         name_keys=frozenset({"file"}),
@@ -13336,6 +13425,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({}),
         handler=_get_plan,
         sends=_PLAN,
+        preview=from_result(),
         # 字幕と文字を断った人にも動かし、計画の文は欄ごと印にする（_get_plan） 計画は AI が
         # 書いた文で、型の付いた欄ではなく（#391 の型で伏せる仕組みは効かない）、字幕の切れ端を
         # 引用符なしで写すと表にも形にも当たらない 名前と場所は表で伏せる（_guarded）

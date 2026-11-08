@@ -33,6 +33,7 @@ from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
 from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
+from sashimono.ai.send_log import KEEP_DAYS, SendLog
 from sashimono.core.emphasis import (
     EMPHASIS_EASING_NAMES,
     EMPHASIS_EASINGS,
@@ -300,10 +301,18 @@ class PreferencesDialog(QDialog):
             height = min(height, int(available.height() * 0.9))
         self.resize(width, height)
 
-    def __init__(self, preferences: Preferences, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        preferences: Preferences,
+        parent: QWidget | None = None,
+        *,
+        send_log: SendLog | None = None,
+    ) -> None:
         super().__init__(parent)
         #: 開いたときの設定 :meth:`preferences` はここから画面の項目だけを変える
         self._given = preferences
+        #: AI へ送った物の記録（#425） 渡されなければ記録を見るボタンを出さない（AI の欄の無い所）
+        self._send_log = send_log
         self.setWindowTitle("設定")
 
         form = QFormLayout()
@@ -1113,6 +1122,7 @@ class PreferencesDialog(QDialog):
         )
         sends_note.setWordWrap(True)
         form.addRow(sends_note)
+        self._add_sent_rows(form, preferences)
         self._add_limit_rows(form, preferences)
         self._scene_analysis = QComboBox(self)
         for value, text in SCENE_ANALYSIS_CHOICES:
@@ -1358,6 +1368,8 @@ class PreferencesDialog(QDialog):
             ai_send_frames=self._send_value(Outbound.FRAMES),
             ai_send_text=self._send_value(Outbound.TEXT),
             ai_send_files=self._send_value(Outbound.FILES),
+            ai_send_ask_each_call=self._send_each_call.isChecked(),
+            ai_send_log=self._send_log_box.isChecked(),
             ai_limit_turn_tokens=_tokens(self._limit_turn_tokens, self._given.ai_limit_turn_tokens),
             ai_limit_turn_images=self._limit_turn_images.value(),
             ai_limit_turn_minutes=self._limit_turn_minutes.value(),
@@ -1831,6 +1843,43 @@ class PreferencesDialog(QDialog):
             " 部品が無ければ切っているのと同じく動きと肌色だけで見積もる"
         )
         form.addRow("縦動画への作り替え: 顔", self._reframe_faces)
+
+    def _add_sent_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """送る前の確かめの細かさと、送った物の記録（#425）"""
+        self._send_each_call = QCheckBox("送る前の確かめを、道具を使うたびに出す", self)
+        self._send_each_call.setChecked(preferences.ai_send_ask_each_call)
+        self._send_each_call.setToolTip(
+            "切ってあると、種類ごとにアプリを閉じるまで 1 回だけ尋ねる"
+            "（「アプリを閉じるまで送る」）"
+            " 入れると、AI が字幕や絵を読むたびに中身の下見を出して尋ねる（「今回は送る」）"
+            " 細かく確かめられるが、絵を何枚も見る作業では何度も尋ねられる"
+            " 「尋ねずに送る」にした物は、どちらでも尋ねない"
+        )
+        form.addRow(self._send_each_call)
+        self._send_log_box = QCheckBox(
+            "AI へ送った物の記録を残す（日時・道具・種類・件数だけ）", self
+        )
+        self._send_log_box.setChecked(preferences.ai_send_log)
+        self._send_log_box.setToolTip(
+            f"AI が {DESTINATION} へ送るたびに、いつ・どの道具で・何を何件送ったかをこの機械に残す"
+            f" 中身（字幕の文・絵・場所）は残さない 残すのは {KEEP_DAYS} 日まで"
+            " 最後に送った物の中身は、アプリを閉じるまで下の「送った物を見る」で確かめられる"
+        )
+        form.addRow(self._send_log_box)
+        if self._send_log is not None:
+            show = QPushButton("送った物を見る…", self)
+            show.setToolTip("最後に送った物の下見と、送った物の記録を見る 記録はここで消せる")
+            show.clicked.connect(self._show_sent)
+            form.addRow("AI へ送った物", show)
+
+    def _show_sent(self) -> None:
+        from sashimono.ui.chat.sent_record import SentRecordDialog
+
+        if self._send_log is None:
+            return
+        dialog = SentRecordDialog(self._send_log, self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _add_limit_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """AI が使う量の上限（#344） どこまで使ってよいかは契約と懐で人ごとに違う
