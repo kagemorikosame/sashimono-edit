@@ -542,6 +542,10 @@ class MainWindow(QMainWindow):
         #: タイムラインで使っている素材（:func:`used_media`）を求めたときの作品と答え
         #: 素材を頼む道は素材の数だけ回るので、作品が同じ間は使い回す
         self._used_cache: tuple[Project | None, set[MediaId]] = (None, set())
+        #: 使っている素材の控えを全部頼み終えた作品（置いたときに作る設定 #441）
+        #: 上の使い回しとは分けて持つ 素材を 1 本だけ頼む道（テンプレートを置く等）も
+        #: 上を求め直すので、同じ印にすると、その作品で使い始めたほかの素材を頼み損ねる
+        self._used_requested: Project | None = None
         #: 画面の止まりの見張り（#442 の 0 番） 設定か環境変数で入れたときだけ動く
         self._stall_monitor = StallMonitor(self)
         self._apply_stall_watch(self._preferences)
@@ -1182,6 +1186,8 @@ class MainWindow(QMainWindow):
                 separate_process=preferences.proxy_process,
             )
             self._proxy_order_seen = (None, -1, 0.0)
+            # 新しい係はまだ何も頼まれていない
+            self._used_requested = None
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
         # 間隔の長い素材への控え（#430）は係を作り直さずに切り替える 作り直すと走っている
@@ -2444,13 +2450,14 @@ class MainWindow(QMainWindow):
             PROXY_UNUSED_ON_USE
         ):
             return
-        before = self._used_cache[0]
-        used = self._used_media()
-        if before is self._document.project:
+        root = self._document.project
+        if self._used_requested is root:
             return
-        for media in self._document.project.media:
+        used = self._used_media()
+        for media in root.media:
             if media.id in used:
                 self._proxies.request(media, on_ready=self._on_proxy_ready)
+        self._used_requested = root
 
     def _order_proxies(self, *, force: bool = False) -> None:
         """控えを作る順を係へ渡す（#441） 待っている物が 2 本以上あるときだけ求める
