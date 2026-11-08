@@ -59,6 +59,7 @@ __all__ = [
     "NoiseRequest",
     "can_auto_color",
     "has_limiter",
+    "limited_ceiling",
     "limiter_commands",
     "picture_clip",
     "plan_color_fix",
@@ -69,6 +70,29 @@ __all__ = [
 def has_limiter(clip: Clip) -> bool:
     """リミッターが効いているクリップか（#414）"""
     return any(effect.kind == LIMITER_KIND and effect.enabled for effect in clip.effects)
+
+
+def limited_ceiling(clips: list[Clip] | tuple[Clip, ...], ceiling: float) -> float:
+    """音量をそろえるときの山の天井 ``ceiling`` と、効いているリミッターの上限の低い方（dBFS）
+
+    音量の欄はリミッターの前に掛かる 上限より上へ上げた分はリミッターが潰すので、測った音量より
+    上がらないのに基準に届いたと答える（PR #451 の CodeRabbit の指摘） 上限をキーフレームで
+    動かしていれば、その一番低い所で見る
+    """
+    lowest = ceiling
+    for clip in clips:
+        for effect in clip.effects:
+            if effect.kind != LIMITER_KIND or not effect.enabled:
+                continue
+            value = effect.params.get("ceiling")
+            if isinstance(value, AnimatedValue):
+                points = [k.value for k in value.keyframes] if value.is_animated else [value.static]
+            elif isinstance(value, int | float):
+                points = [float(value)]
+            else:
+                continue
+            lowest = min(lowest, *points)
+    return lowest
 
 
 def limiter_commands(clips: list[Clip] | tuple[Clip, ...], ceiling: float) -> list[Command]:

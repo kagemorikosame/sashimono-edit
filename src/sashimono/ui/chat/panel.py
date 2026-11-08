@@ -1513,13 +1513,14 @@ class ChatPanel(QWidget):
         self._approval = None
         self._approval_box.setVisible(False)
         if allowed:
-            if always and not approval.irreversible:
-                self._bridge.allow_always(approval.tool)
-            if turn and not approval.irreversible:
-                self._bridge.allow_turn()
-            approval.allow()
-        else:
-            approval.deny()
+            # 先に許す 時間切れや中断で畳んだ後の確かめなら、以降を許す印も付けない
+            # 付けると、次の指示の編集が確かめずに通る
+            if approval.allow():
+                if always and not approval.irreversible:
+                    self._bridge.allow_always(approval.tool)
+                if turn and not approval.irreversible:
+                    self._bridge.allow_turn()
+        elif approval.deny():
             self._record.refused(f"{approval.tool}（許可しませんでした）")
         self._refresh_status()
 

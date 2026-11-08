@@ -187,3 +187,29 @@ class TestInstalling:
         _extension(target, "ctranslate2", OLD)
         install_runtime(ASR_PACK, command=[sys.executable, "-c", "raise SystemExit(1)"])
         assert stale_runtime(ASR_PACK.key) == OLD
+
+
+class TestTheCompanion:
+    """AI 連携と一緒に入れる機能の印（#414 PR #451 の CodeRabbit の指摘）"""
+
+    COMPANION = FeaturePack(key="companion", label="画面", required=())
+    PACK = FeaturePack(key="main", label="本体", required=(), extra_pack=COMPANION)
+
+    def _mark_old(self, target: Path) -> None:
+        marks = {"main": python_abi(), "companion": OLD}
+        (target / ABI_MARKER).write_text(json.dumps(marks), encoding="utf-8")
+
+    def test_an_old_companion_is_not_marked_without_upgrade(self, target: Path) -> None:
+        """入れ直さない pip は前の拡張を残す 今の印を付けると読めない部品を使えると読む"""
+        self._mark_old(target)
+        command = [sys.executable, "-c", "pass"]
+        assert install_runtime(self.PACK, extra=True, command=command) == 0
+        assert stale_runtime("companion") == OLD
+
+    def test_an_upgraded_companion_is_marked(self, target: Path) -> None:
+        """入れ直したら今の印 付けないと、入れ直した後も古いと見て読まない"""
+        self._mark_old(target)
+        command = [sys.executable, "-c", "pass", "--upgrade"]
+        assert install_runtime(self.PACK, extra=True, command=command) == 0
+        marks = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))
+        assert marks["companion"] == python_abi()

@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import replace
 from fractions import Fraction
 
+import pytest
+
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.core.model import (
     Clip,
@@ -154,3 +156,49 @@ def test_burned_text_moved_onto_the_voice_is_fine(video_media: MediaItem) -> Non
     media = _media(video_media, (0.6, 2.6))
     project = _burned(media, round(float(start) * 30), round(float(end) * 30))
     assert _burned_check(project).problems == ()
+
+
+def test_a_slowed_clip_is_compared_on_screen(video_media: MediaItem) -> None:
+    """半速で置くと素材の 0.2 秒のずれは映る時刻で 0.4 秒 素材の秒で比べると見落とす（PR #451）"""
+    ((start, end),) = _fitted((1.0, 2.6))
+    media = _media(video_media, (float(start) - 0.2, float(end)))
+    slow = Clip(timeline_start=0, duration=600, media_id=media.id, speed=Fraction(1, 2))
+    project = placed(media, slow)
+    report = check_words(project, 0, project.duration, KINDS, lambda _m, _s: VOICE)
+    (problem,) = report.problems
+    assert float(problem.measure["start_offset_seconds"]) == pytest.approx(-0.4, abs=0.05)
+    # 等速なら 0.2 秒で、気付く幅の内側
+    assert _check(media).problems == ()
+
+
+def test_far_apart_copies_are_reported_apart(video_media: MediaItem) -> None:
+    """同じ行を離れた 2 か所に置いたら 2 つの問題 1 つにまとめると間の関係の無い所まで範囲に入る"""
+    media = _media(video_media, (0.6, 2.6))
+    first = Clip(timeline_start=0, duration=90, media_id=media.id)
+    second = Clip(timeline_start=200, duration=90, media_id=media.id)
+    project = placed(media, first, second)
+    report = check_words(project, 0, project.duration, KINDS, lambda _m, _s: VOICE)
+    assert [(p.start, p.end) for p in report.problems] == [(18, 78), (218, 278)]
+    assert all(p.measure["audio"] == 1 for p in report.problems)
+
+
+def test_a_line_whose_voice_was_cut_is_not_counted_as_checked(video_media: MediaItem) -> None:
+    """声を切った所に焼き込んだ文字だけが残ると比べる相手が無い
+
+    問題 0 件と読むと、ずれは無いと言うことになる
+    """
+    media = _media(video_media, (0.6, 2.6))
+    project = _burned(media, 18, 78)
+    later = Clip(timeline_start=0, duration=150, media_id=media.id, source_in=Fraction(5))
+    project = project.with_timeline(
+        replace(
+            project.timeline,
+            tracks=(
+                replace(project.timeline.tracks[0], clips=(later,)),
+                *project.timeline.tracks[1:],
+            ),
+        )
+    )
+    report = _burned_check(project)
+    assert report.problems == ()
+    assert SUBTITLE_TIMING in report.skipped

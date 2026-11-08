@@ -103,9 +103,10 @@
 | `export-error` | 理由 | 書き出しか書き出した動画の検査が失敗した |
 | `tool-error` | 理由 | 素材を読めなかったか、ほかの道具が失敗した |
 | `answer-error` | 理由 | 正解のファイルを読めなかった |
-| `no-consent` | 理由 | AI の段を送る物の同意なしに回そうとした |
+| `no-consent` | 理由 | AI の段を送る物の同意なしに回そうとした（案内を出して止まるので、結果の行には書かない 決まった名前として持つだけ） |
 | `ai-error` | 理由 | AI の段の会話が失敗した（ログインの切れ・道具の例外など） |
 | `ai-timeout` | 理由 | AI の段の指示が上限の秒までに終わらなかった |
+| `ai-no-cut` | 理由 | AI の段で、AI が何も切らずに終えた（グループが残ったのは切っていないから 数は残すが成功と並べない） |
 
 ### 仮の正解
 
@@ -155,7 +156,7 @@ Sashimono Edit で開いて直し、上書き保存してから `adopt` で取�
 | 場面ごとに切る | `f1` ±2 フレームの中で 1 対 1 に組む | `precision` `recall` |
 | 字幕を付ける | `cer` 文字の誤り率（句読点と空白は数えない 長音符「ー」は語の一部なので数える） | `edge_f1` 字幕の頭と終わりの一致（±0.5 秒） |
 | 見どころを選ぶ | `f1` 正解の区間に重なる道具の区間があれば当たり | `precision` `recall` と、無音と同じ `iou` `edge_median` |
-| グループを保つ | `kept_share` 時刻の重なる別のトラックのクリップの組のうち、同じグループに居る組の割合（1.0 が全部残った） | `pairs` `groups` `loose_clips` `cuts`（道具の段） AI の段は `ungroup_calls`（`ungroup_clips` を呼んだ回数）`ungroup_questions`（解く前の問いが出た回数）`questions` `tool_calls` `refused_irreversible` |
+| グループを保つ | `kept_share` 時刻の重なる別のトラックのクリップの組のうち、同じグループに居る組の割合（1.0 が全部残った 前半と後半が 1 つのグループにまとまったら 0） | `merged`（前半と後半がまとまったら 1） `pairs` `groups` `loose_clips` `cuts`（道具の段） AI の段は `removed_seconds`（切って詰めた秒 0 なら `ai-no-cut`） `ungroup_calls`（`ungroup_clips` を呼んだ回数）`ungroup_questions`（解く前の問いが出た回数）`questions` `tool_calls` `refused_irreversible` |
 | 字幕を焼き込んで書き出す | `problems` 書き出した動画の検査で見つかった問題の数（正解とは比べない） | `count_<種類>` 種類ごとの数 `loudness` 音量（LUFS） `length_error` 長さのずれ（秒） `subtitle_clips` 焼き込んだ字幕の数 `export_seconds` `check_seconds` |
 
 許す幅は `eval/tasks.json` の `tolerances` で変えられる かかった秒は、道具の処理（波形や

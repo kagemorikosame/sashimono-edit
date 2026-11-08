@@ -70,14 +70,51 @@ def _file_size(path: Path) -> int:
     return path.stat().st_size
 
 
+#: 中のシーンをたどる深さの上限 シーンを互いに置き合うと終わらない
+_MAX_SCENE_DEPTH = 16
+
+
 def _timelines(project: Project) -> Iterator[Timeline]:
-    yield project.timeline
-    for scene in project.scenes:
-        yield scene.timeline
+    """書き出すタイムラインと、そこに置いたシーン（入れ子も）のタイムライン
+
+    置いていないシーンは書き出さないので数えない 数えると、選んだシーンの外の高い素材に
+    引かれて、低い素材の場面だけを書き出すときも大きなファイルになる（PR #451 の CodeRabbit）
+    """
+    seen: set[SceneId] = set()
+    stack: list[tuple[Timeline, int]] = [(project.timeline, 0)]
+    while stack:
+        timeline, depth = stack.pop()
+        yield timeline
+        if depth >= _MAX_SCENE_DEPTH:
+            continue
+        for track in timeline.tracks:
+            for clip in track.clips:
+                if clip.scene_id is None or clip.scene_id in seen:
+                    continue
+                seen.add(clip.scene_id)
+                scene = project.find_scene(clip.scene_id)
+                if scene is not None:
+                    stack.append((scene.timeline, depth + 1))
+
+
+def _audio_bits_per_second(media: MediaItem) -> float:
+    """非圧縮の音（PCM）の 1 秒の量（ビット） 圧縮した音は映像に比べて小さいので数えない
+
+    多チャンネルの PCM を入れた素材（録画機の mov）は音だけで数 Mbps あり、ファイルの大きさを
+    そのまま映像の量と読むと、映像の低い素材まで上限で書き出す
+    """
+    total = 0.0
+    for stream in media.audio_streams:
+        codec = stream.codec.lower()
+        if not codec.startswith("pcm_"):
+            continue
+        depth = int("".join(letter for letter in codec if letter.isdigit()) or 16)
+        total += stream.sample_rate * stream.channels * depth
+    return total
 
 
 def _placed_videos(project: Project) -> list[MediaItem]:
-    """タイムライン（とシーンの中）に置いた、動く絵を持つ素材 静止画は数えない"""
+    """書き出すタイムライン（と置いたシーンの中）の、動く絵を持つ素材 静止画は数えない"""
     wanted = {
         clip.media_id
         for timeline in _timelines(project)
@@ -97,10 +134,13 @@ def matched_bitrate_mbps(
 ) -> int | None:
     """置いた素材に合わせたビットレート（Mbps） 合わせる素材が無ければ ``None``
 
-    素材のビットレートはファイルの大きさを長さで割って求める（音の分も入るが、映像に比べて
-    小さく、多めに見積もる向きなので崩れない） 作品の大きさと fps が素材と違えば、1 秒の画素の
-    数の比で直す 素材が何本もあれば一番高い物に合わせる（低い方に合わせると、その素材の場面が
-    崩れる） 読めない素材（外したドライブ）は数えない
+    ``project`` は書き出す形（:func:`export_target` で選んだシーンを差し込んだ物）
+    素材のビットレートはファイルの大きさを長さで割って求める 非圧縮の音の分は引く（圧縮した音は
+    映像に比べて小さく、多めに見積もる向きなので崩れない） 作品の大きさと fps が素材と違えば、
+    1 秒の画素の数の比で直す 比べる映像は描画と同じ 1 本目（``engine/decode/video.py``）
+    素材が何本もあれば一番高い物に合わせる（低い方に合わせると、その素材の場面が崩れる）
+    読めない素材（外したドライブ）は数えない ファイルの大きさを読むので、画面の窓は
+    スレッドの外から呼ぶ（ネットワークの共有が応えないと待つ）
     """
     measure = size_of or _file_size
     settings = project.settings
@@ -115,7 +155,9 @@ def matched_bitrate_mbps(
         pixels = stream.width * stream.height * float(stream.frame_rate.fps)
         if size <= 0 or pixels <= 0:
             continue
-        bits = size * 8 / float(media.duration)
+        bits = size * 8 / float(media.duration) - _audio_bits_per_second(media)
+        if bits <= 0:
+            continue
         scaled = bits * out_rate / pixels
         best = scaled if best is None else max(best, scaled)
     if best is None:

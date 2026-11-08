@@ -48,6 +48,7 @@ from sashimono import __version__
 from sashimono.ai.auto_fix import (
     can_auto_color,
     has_limiter,
+    limited_ceiling,
     limiter_commands,
     plan_color_fix,
     plan_noise_fix,
@@ -4345,20 +4346,23 @@ class MainWindow(QMainWindow):
                 "測るあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください", 8000
             )
             return
+        # 前に積んだリミッターの上限より上へは上げない（AI の normalize_loudness と同じ）
         decided = loudness_gain(
             pending.clips,
             measured=report.loudness,
             peak_db=report.peak_db,
             target=pending.request.limits.loudness_target,
-            ceiling=pending.ceiling,
+            ceiling=limited_ceiling(pending.clips, pending.ceiling),
             squeeze=pending.squeeze,
         )
-        if abs(decided.gain_db) < 0.05:
+        moved = abs(decided.gain_db) >= 0.05
+        # 音量を変えなくても、山が天井を越えていればリミッターは積む
+        squeezed = decided.squeeze_db >= 0.05
+        if not moved and not squeezed:
             self.statusBar().showMessage("すでに基準の音量です", 5000)
             return
         target = pending.request.limits.loudness_target
-        commands = gain_commands(pending.clips, decided.gain_db)
-        squeezed = decided.squeeze_db >= 0.05
+        commands = gain_commands(pending.clips, decided.gain_db) if moved else []
         try:
             if squeezed:
                 commands += limiter_commands(pending.clips, pending.ceiling)
@@ -4370,9 +4374,9 @@ class MainWindow(QMainWindow):
         stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
         if squeezed:
             stopped += f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた"
+        changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(
-            f"音量を {decided.gain_db:+.1f} dB 変えた"
-            f"（測った音量 {report.loudness:.1f} LUFS）{stopped}",
+            f"{changed}（測った音量 {report.loudness:.1f} LUFS）{stopped}",
             8000,
         )
 

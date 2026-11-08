@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.model_files import missing_files
 from sashimono.package_index import Latest, latest_release
 from sashimono.runtime import (
     LEFT_RUNNING_NOTE,
@@ -42,6 +43,7 @@ from sashimono.runtime import (
     refresh_runtime,
     restart_note,
     snapshot_runtime_modules,
+    stale_runtime,
 )
 from sashimono.ui.theme import Colors, themed_style
 
@@ -161,7 +163,11 @@ class SetupSection(QWidget):
         """導入状況を見直して表示を作り直す"""
         status = self.status
         self._button.setText("環境を更新" if status.installed else "環境を導入")
-        self._extra.setEnabled(not status.extra_installed and not self.busy)
+        companion = self._pack.extra_pack
+        # 追加分の包みが入っていても、その機能の落とす物（モデル）が無ければまだ選べる
+        # 選べないまま印が付いていると、本人が選ばずに落とし始める（PR #451 の CodeRabbit の指摘）
+        extra_files = missing_files(companion.files) if companion is not None else ()
+        self._extra.setEnabled((not status.extra_installed or bool(extra_files)) and not self.busy)
 
         lines = [status.summary()]
         if not status.installed:
@@ -174,6 +180,14 @@ class SetupSection(QWidget):
             # pip の外で落とす物は、取得元まで見せる 何がどこから来るのか分からないまま
             # 落とし始めるのは不安が大きい（コマンドを先に見せるのと同じ理由）
             for file in status.missing_files:
+                host = urlsplit(file.url).hostname or file.url
+                lines.append(
+                    f"pip の後に落とすもの: {file.label or file.name}"
+                    f"（{max(1, file.size // 1024)} KB {host} から 中身を sha256 で確かめる）"
+                )
+        if self.extra:
+            # 一緒に入れる機能の落とす物も、落とす前に取得元と大きさを見せる
+            for file in extra_files:
                 host = urlsplit(file.url).hostname or file.url
                 lines.append(
                     f"pip の後に落とすもの: {file.label or file.name}"
@@ -382,7 +396,13 @@ class SetupSection(QWidget):
         self.finished.emit(succeeded)
 
     def _command(self) -> list[str]:
-        upgrade = self.status.needs_upgrade or self._force_upgrade
+        companion = self._pack.extra_pack
+        # 一緒に入れる機能（AI 連携の画面の解析）だけが前の Python 向けでも入れ直す 入れ直さないと、
+        # 読めない拡張が残ったまま文字を読めない
+        stale_extra = (
+            self.extra and companion is not None and stale_runtime(companion.key) is not None
+        )
+        upgrade = self.status.needs_upgrade or self._force_upgrade or stale_extra
         return install_command(self._pack, extra=self.extra, upgrade=upgrade)
 
 

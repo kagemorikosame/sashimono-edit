@@ -21,7 +21,7 @@ from sashimono.ai.session import AgentEvent, EventKind
 from sashimono.core.commands import Document, RemoveClip, SplitClips
 from sashimono.core.io import load_project, save_project
 from tests.scene_video import write_scene_video
-from tests.test_eval_tasks_tool import _fake_transcriber, _write_talk, tool
+from tests.test_eval_tasks_tool import _write_talk, tool
 
 __all__ = ["tool"]
 
@@ -94,8 +94,13 @@ def test_highlights_are_answered_from_scratch(
     assert answer["provisional"] is False
     assert len(answer["ranges"]) == 1
     assert answer["ranges"][0][1] < eval_dir.read_answer("E01")["duration"]
+
+    def deaf(*_args: object) -> None:
+        # 音の無い素材を起こすと失敗して、動きで選べる見どころまで asr-error になる
+        raise AssertionError("音の無い素材を字幕起こしへ渡した")
+
     [record] = tool.command_run(
-        eval_dir, book, ["E01"], results=results, commit="", transcriber=_fake_transcriber
+        eval_dir, book, ["E01"], results=results, commit="", transcriber=deaf
     )
     assert record["status"] == "ok"
     assert {"f1", "precision", "recall", "iou"} <= set(record["metrics"])
@@ -126,12 +131,26 @@ def test_group_metrics_notice_a_dissolved_group(tool: ModuleType, tmp_path: Path
     audio = _write_talk(tmp_path / "talk.wav")
     document = tool.grouped_project(audio, "E02")
     before = tool.group_metrics(document.project)
-    assert before["kept_share"] == 1.0
-    assert before["groups"] == 2
+    assert (before["kept_share"], before["pairs"], before["groups"]) == (1.0, 2, 2)
     first = document.project.timeline.tracks[0].clips[0]
     document.execute(UngroupClips((first.id,)))
     after = tool.group_metrics(document.project)
-    assert after["kept_share"] < 1.0
+    # 解いた前半の組だけが別々になる 1.0 より下がるだけを見ると 0.25 などの誤りを通す
+    assert (after["kept_share"], after["pairs"], after["groups"]) == (0.5, 2, 1)
+
+
+def test_group_metrics_notice_merged_groups(tool: ModuleType, tmp_path: Path) -> None:
+    """前半と後半を 1 つにまとめても重なる組は同じグループのまま 見分けないと 1.0 と書く"""
+    from sashimono.core.commands import GroupClips
+
+    audio = _write_talk(tmp_path / "talk.wav")
+    document = tool.grouped_project(audio, "E02")
+    every = tuple(clip.id for track in document.project.timeline.tracks for clip in track.clips)
+    document.execute(GroupClips(every))
+    merged = tool.group_metrics(document.project)
+    assert merged["merged"] == 1
+    assert merged["kept_share"] == 0.0
+    assert tool.group_metrics(tool.grouped_project(audio, "E02").project)["merged"] == 0
 
 
 def test_the_ai_stage_needs_consent(folder: tuple[ModuleType, Any, Any], tmp_path: Path) -> None:
@@ -152,7 +171,8 @@ def test_the_ai_stage_writes_its_counts(
 
     def runner(*_args: object, **_kwargs: object) -> tuple[Any, dict[str, float | int]]:
         run = tool.AiRun(tool_calls=5, ungroup_questions=1, questions=1, finished=True)
-        return run, {"kept_share": 1.0, "pairs": 4, "groups": 4, "loose_clips": 0, "clips": 8}
+        metrics = {"kept_share": 1.0, "pairs": 4, "groups": 4, "loose_clips": 0, "clips": 8}
+        return run, {**metrics, "removed_seconds": 3.5}
 
     [record] = tool.command_ai_run(
         eval_dir, book, [], allow_send=True, results=results, runner=runner, commit=""
@@ -169,6 +189,24 @@ def test_the_ai_stage_writes_its_counts(
         eval_dir, book, [], allow_send=True, results=results, runner=broken, commit=""
     )
     assert (record["status"], record["reason"]) == ("failed", "ai-error")
+
+    def timed_out(*_args: object, **_kwargs: object) -> tuple[Any, dict[str, float | int]]:
+        return tool.AiRun(finished=False, failed=False), {}
+
+    # 時間切れを ai-error と書くと、会話の失敗と見分けられない
+    [record] = tool.command_ai_run(
+        eval_dir, book, [], allow_send=True, results=results, runner=timed_out, commit=""
+    )
+    assert record["reason"] == "ai-timeout"
+
+    def untouched(*_args: object, **_kwargs: object) -> tuple[Any, dict[str, float | int]]:
+        return tool.AiRun(tool_calls=1, finished=True), {"kept_share": 1.0, "removed_seconds": 0}
+
+    # 切らずに終えた回は、グループが残っていて当たり前 成功と並べると見どころが読めない
+    [record] = tool.command_ai_run(
+        eval_dir, book, [], allow_send=True, results=results, runner=untouched, commit=""
+    )
+    assert (record["status"], record["reason"]) == ("failed", "ai-no-cut")
     assert "しゃべり" not in results.read_text(encoding="utf-8")
 
 
@@ -231,3 +269,4 @@ def test_the_ai_stage_counts_the_ungroup_question(
     assert run.ungroup_questions == 1
     assert run.tool_calls == 2
     assert metrics["kept_share"] == 1.0
+    assert metrics["removed_seconds"] > 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 from typing import Any
 
@@ -10,7 +11,16 @@ import pytest
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.core.fillers import filler_key, filler_spans
-from sashimono.core.model import MediaItem, Transcript, TranscriptSegment, Word
+from sashimono.core.model import (
+    Clip,
+    GeneratedSource,
+    MediaItem,
+    Track,
+    TrackKind,
+    Transcript,
+    TranscriptSegment,
+    Word,
+)
 from tests.ai.conftest import FakeHost, make_loaded
 
 F = Fraction
@@ -152,3 +162,54 @@ class TestTheTool:
         host = FakeHost(make_loaded(video_media, Transcript((line,), language="ja")))
         with pytest.raises(ToolError, match="書かずに返す"):
             _run(host, media_id=str(host.document.project.media[0].id))
+
+
+class TestReviewFixes:
+    """PR #451 の CodeRabbit の指摘"""
+
+    def test_a_small_vowel_is_a_long_mark(self) -> None:
+        """「えぇと」は「えーと」と同じ音 揃えないと、この書き方の言いよどみが音に残る"""
+        assert filler_key("えぇと") == filler_key("えーと")
+        line = _line(1.0, 2.0, ("え", 1.0, 1.2), ("ぇ", 1.2, 1.4), ("と", 1.4, 1.6))
+        assert [s.text for s in filler_spans(Transcript((line,), language="ja"))] == ["えぇと"]
+
+    def test_long_marks_split_into_words_are_joined(self) -> None:
+        """「え」「ー」「ー」「と」と分かれても全体を切る
+
+        揃えずに束ねると「えー」だけを切って後半の音が残る
+        """
+        line = _line(
+            1.0, 2.0, ("え", 1.0, 1.2), ("ー", 1.2, 1.3), ("ー", 1.3, 1.4), ("と", 1.4, 1.6)
+        )
+        spans = filler_spans(Transcript((line,), language="ja"))
+        assert [(s.start, s.end) for s in spans] == [(F(1), F(8, 5))]
+
+    def test_far_apart_words_are_not_joined(self) -> None:
+        """離れた「え」と「ーと」を束ねると、間の別の声まで切る"""
+        line = _line(1.0, 3.0, ("え", 1.0, 1.2), ("今", 1.3, 2.4), ("ーと", 2.5, 2.8))
+        assert filler_spans(Transcript((line,), language="ja")) == []
+        apart = _line(1.0, 3.0, ("え", 1.0, 1.2), ("ーと", 2.5, 2.8))
+        assert filler_spans(Transcript((apart,), language="ja")) == []
+
+    def test_only_the_given_word_is_cut_from_the_timeline(self, video_media: MediaItem) -> None:
+        """数だけ見ると、頼んでいない「えーと」まで切っても通る 切った所で確かめる"""
+        host = filler_host(video_media)
+        result = _run(
+            host, media_id=str(host.document.project.media[0].id), words=["あのー"], only_words=True
+        )
+        # 「あのー」は 4.0〜4.7 秒（30fps で 120〜141） 「えーと」（30〜48）は残る
+        assert [(p["start_frame"], p["end_frame"]) for p in result["places"]] == [(120, 141)]
+        assert result["removed_frames"] == 21
+
+    def test_a_locked_track_is_reported(self, video_media: MediaItem) -> None:
+        """声だけが詰まってロックした字幕が後ろでずれる 黙ると同期が崩れたまま進む"""
+        project = make_loaded(video_media, SPOKEN)
+        text = Clip(0, 300, source=GeneratedSource(kind="text", params={"text": "題"}))
+        locked = Track(kind=TrackKind.VIDEO, name="文字", clips=(text,), locked=True)
+        project = project.with_timeline(
+            replace(project.timeline, tracks=(*project.timeline.tracks, locked))
+        )
+        host = FakeHost(project)
+        result = _run(host, media_id=str(project.media[0].id))
+        assert result["tracks_left"] == [str(locked.id)]
+        assert "tracks_left" in result["note"]

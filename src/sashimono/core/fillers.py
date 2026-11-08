@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 from sashimono.core.model import Transcript, Word
+from sashimono.core.words import PHRASE_GAP
 
 __all__ = [
     "AUDIO_FILLERS",
@@ -53,6 +54,8 @@ _MAX_WORDS = 6
 _MIN_SECONDS = Fraction(1, 10)
 #: 比べるときに外す字 句読点と空白は語に付いたり付かなかったりする
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()")
+#: 伸ばす音として書かれる小さい母音 「えぇと」「あぁ」は「えーと」「あー」と同じ音
+_SMALL_VOWELS = frozenset("ぁぃぅぇぉ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +82,8 @@ def filler_key(text: str) -> str:
         code = ord(letter)
         if 0x30A1 <= code <= 0x30F6:
             letter = chr(code - 0x60)
+        if letter in _SMALL_VOWELS and out:
+            letter = "ー"
         if letter == "ー" and out and out[-1] == "ー":
             continue
         out.append(letter)
@@ -92,7 +97,8 @@ def filler_spans(
 
     1 つの行の中で、続く語を束ねた文字が言いよどみと同じ所を探す 長い方を先に取る（「えー」を
     先に取ると「えーと」の「と」が残る） 束ねは語の切れ目でだけ始めて終える 語の途中で切ると、
-    隣の語の音まで削る
+    隣の語の音まで削る 間の空いた語は束ねない（語の区切りと同じ :data:`PHRASE_GAP`） 束ねると、
+    離れた「え」と「ーと」の間の別の声まで切る
     """
     if transcript is None:
         return []
@@ -114,7 +120,10 @@ def _in_line(words: Sequence[Word], wanted: set[str], longest: int) -> Iterable[
         joined = ""
         last: int | None = None
         for stop in range(index, min(len(words), index + _MAX_WORDS)):
-            joined += keys[stop]
+            if stop > index and words[stop].start - words[stop - 1].end > PHRASE_GAP:
+                break
+            # 束ねた後もそろえる 「え」「ー」「ー」「と」と分かれると、伸ばす記号が続いて残る
+            joined = filler_key(joined + keys[stop])
             if len(joined) > longest:
                 break
             if joined in wanted:

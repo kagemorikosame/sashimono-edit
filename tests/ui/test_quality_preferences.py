@@ -80,3 +80,29 @@ def test_the_export_window_starts_from_the_choice(qt_application: QApplication) 
         assert dialog._bitrate.value() == 30
     finally:
         dialog.deleteLater()
+
+
+def test_the_matched_bitrate_arrives_later(qt_application: QApplication) -> None:
+    """素材の大きさは窓のスレッドの外で読む 届いた値は欄へ入るが、人が替えた値と古い頼みは残す
+
+    窓のスレッドで読むと、応えない共有のドライブの間は窓が出ず固まる（PR #451 の CodeRabbit）
+    """
+    from sashimono.ui.export_dialog import ExportDialog
+
+    del qt_application
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        # 出るまでは上限
+        assert dialog._bitrate.value() == 30
+        token = object()
+        dialog._bitrate_token = token
+        dialog._on_bitrate_found(object(), 5)
+        assert dialog._bitrate.value() == 30
+        dialog._on_bitrate_found(token, 5)
+        assert dialog._bitrate.value() == 5
+        dialog._bitrate.setValue(20)
+        dialog._on_bitrate_found(token, 7)
+        assert dialog._bitrate.value() == 20
+    finally:
+        dialog.deleteLater()

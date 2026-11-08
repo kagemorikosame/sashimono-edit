@@ -15,12 +15,17 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
-from sashimono.core.commands.fixed import VOLUME_EFFECT_KIND, with_fixed_items
+from sashimono.core.commands.fixed import (
+    VOLUME_EFFECT_KIND,
+    fixed_slot,
+    loose_slot,
+    with_fixed_items,
+)
 from sashimono.core.mixing import MAX_LIMITER_DB
 from sashimono.core.model import AnimatedValue, Clip, Keyframe, MediaItem, Transcript
 from sashimono.effects import registry
 from sashimono.effects.audio import LIMITER_KIND, AudioContext
-from sashimono.effects.limiter import limit
+from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.checks.report import HIGH, MEDIUM
 from sashimono.engine.checks.scan import LOUDNESS
 from tests.ai.test_mix_tools import _measured, _Work
@@ -80,6 +85,29 @@ class TestTheEffect:
         later = limit(samples, values, AudioContext(0, RATE, RATE, keep_from=20_000))
         assert np.allclose(later[20_000:], whole[20_000:])
 
+    def test_a_slice_with_history_matches_the_whole(self) -> None:
+        """区切りの直前の山の戻りを、前の音として読んだ分から引き継ぐ
+
+        同じ配列を渡すだけでは、前の音を読まずに後の区切りで絞りを忘れる壊れ方を見落とす
+        （PR #451 の CodeRabbit の指摘）
+        """
+        samples = _tone()
+        samples[29_900:29_950] *= 4.0
+        values = {"ceiling": -1.0, "release": 50}
+        whole = limit(samples, values, AudioContext(0, RATE, RATE))
+        history = round(limiter_history(values) * RATE)
+        begin = 30_000 - history
+        later = limit(samples[begin:], values, AudioContext(begin, RATE, RATE, keep_from=history))
+        assert np.allclose(later[history:], whole[30_000:], atol=1e-6)
+        # 区切りの頭はまだ絞っている（引き継がないと元の大きさで鳴る）
+        assert float(np.abs(later[history : history + 100]).max()) < 0.29
+
+    def test_a_volume_added_later_goes_before_the_limiter(self) -> None:
+        """固定の音量を持たない古いクリップへ後から音量を足すと、リミッターの後に掛かって山が越える"""
+        effects = (registry.require(LIMITER_KIND).create(),)
+        assert fixed_slot(effects, VOLUME_EFFECT_KIND) == 0
+        assert loose_slot(effects) == 0
+
     def test_it_is_placed_after_the_volume(self, work: _Work) -> None:
         """前に積むと、後から掛かる音量の欄で山が上限を越える"""
         clip = with_fixed_items(work.voice, sound=True)
@@ -99,9 +127,41 @@ class TestNormalize:
         assert result["reached"] is True
         assert result["gain_db"] == pytest.approx(4.0)
         assert result["limiter_db"] == pytest.approx(4.0)
-        assert result["expected_peak_dbfs"] == -1.0
         for clip in (work.clip(work.voice.id), work.clip(work.bgm.id)):
             assert _kinds(clip)[-1] == LIMITER_KIND
+        # 声と BGM は重なって鳴る クリップごとのリミッターでは和の山を言い切れない
+        assert result["expected_peak_dbfs"] is None
+        assert result["mixed_peak_checked"] is False
+        assert "clipping" in result["note"]
+
+    def test_a_single_clip_peak_is_promised(self, work: _Work) -> None:
+        """重ならない音なら、リミッターの上限がそのまま書き出しの山になる"""
+        _run(work, clip_ids=[str(work.voice.id)])
+        _measured(work.host, -18.0, -1.0)
+        result = _run(work, clip_ids=[str(work.voice.id)])
+        assert result["expected_peak_dbfs"] == -1.0
+        assert "mixed_peak_checked" not in result
+
+    def test_an_old_low_limiter_caps_the_gain(self, work: _Work) -> None:
+        """-10 dBFS で抑えた音を上げても潰れるだけ 届いたと答えると、小さいまま書き出す"""
+        effect = registry.require(LIMITER_KIND).create(ceiling=-10.0)
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
+        _run(work)
+        _measured(work.host, -18.0, -10.0)
+        result = _run(work)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is False
+        assert result["limited_by"] == ["peak"]
+
+    def test_a_peak_over_the_ceiling_is_limited_without_gain(self, work: _Work) -> None:
+        """基準に合っていても、山が天井を越えたまま残すと書き出しで割れる"""
+        _run(work)
+        _measured(work.host, -14.0, 2.0)
+        result = _run(work)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is True
+        assert result["limiter_db"] == pytest.approx(3.0)
+        assert _kinds(work.clip(work.voice.id))[-1] == LIMITER_KIND
 
     def test_the_limiting_is_capped(self, work: _Work) -> None:
         """壊れると、山を何 dB でも潰して、話し声の立ち上がりまで平たくなる"""

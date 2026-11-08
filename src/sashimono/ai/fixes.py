@@ -244,15 +244,17 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
     (SUBTITLE_TIMING, MEDIUM, None): Fix(
         AUTO,
         ("retime_subtitles",),
-        "字幕の行の時刻が声とずれている retime_subtitles に media_id と segment_ids と、"
-        "start_offset_ms と end_offset_ms（本人の設定のずらし 問題に書いてある値）を渡して合わせる",
+        "字幕の行の時刻が声とずれている retime_subtitles に media_id と audio と segment_ids と、"
+        "start_offset_ms と end_offset_ms（本人の設定のずらし どれも問題に書いてある値）を渡して"
+        "合わせる",
     ),
     (SUBTITLE_TIMING, MEDIUM, _HELD): Fix(
         ASK,
         ("retime_subtitles",),
         "焼き込んだ字幕か、人が直した行の時刻が声とずれている 焼き込んだ字幕は合わせた後に"
         "焼き込み直しが要り、人が直した行はわざとの時刻かもしれないので、合わせるかを人に"
-        "尋ねてから retime_subtitles で合わせる",
+        "尋ねてから retime_subtitles で合わせる（引数は問題に書いてある media_id と audio と"
+        " segment_ids と start_offset_ms と end_offset_ms）",
     ),
     (SUBTITLE_WORDS, MEDIUM, None): Fix(
         ASK,

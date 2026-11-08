@@ -1396,11 +1396,19 @@ def _install_runtime_locked(
     extra: bool = False,
 ) -> int:
     target = runtime_target_dir()
+    companion = pack.extra_pack if pack is not None and extra else None
     if target is not None:
         target.mkdir(parents=True, exist_ok=True)
         # 入れる前の中身の印を書き残す（印が無い導入先だけ） 入れた後に数えると、
         # 今入れた物の印と、入れ直していない機能の古い印が混ざって決められない
         runtime_abi(target)
+    # 一緒に入れる機能が前の Python 向けのとき、--upgrade の無い pip は入っている物を残す
+    # 残ったまま今の印を付けると、読めない拡張を使えると読む（PR #451 の CodeRabbit の指摘）
+    keeps_old = (
+        companion is not None
+        and stale_runtime(companion.key) is not None
+        and "--upgrade" not in argv
+    )
 
     own = _own_pip_arguments(argv)
     if own is not None:
@@ -1415,9 +1423,8 @@ def _install_runtime_locked(
         # pip が入れ終えてから取りに行く 先に落とすと、包みが入らなかったときに使えない物だけが
         # 残る 開発の環境（導入先が無い）でも同じ置き場へ落とす 置き場は Python の版に関係しない
         code = fetch_files(pack.files, on_output=on_output, should_cancel=should_cancel)
-    companion = pack.extra_pack if pack is not None and extra else None
     if code == 0 and companion is not None:
-        if target is not None:
+        if target is not None and not keeps_old:
             _mark_installed(target, companion.key)
         if companion.files:
             code = fetch_files(companion.files, on_output=on_output, should_cancel=should_cancel)

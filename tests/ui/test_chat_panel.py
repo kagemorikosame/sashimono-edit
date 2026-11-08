@@ -211,6 +211,18 @@ class TestApproval:
         widget._bridge.end_turn()
         assert widget._bridge._turn_allowed is False
 
+    def test_a_settled_request_gives_no_turn_allowance(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 時間切れで畳んだ後に押すと、次の指示まで確かめずに編集が進む（PR #451 の CodeRabbit）
+        widget, _ = panel
+        approval = self._pending(widget)
+        approval.deny("確認の返事がありませんでした")
+        widget._answer(True, turn=True, always=True)
+        assert approval.allowed is False
+        assert widget._bridge._turn_allowed is False
+        assert "split_clip" not in widget._bridge._always
+
     def test_an_irreversible_request_offers_no_turn_allowance(
         self, panel: tuple[ChatPanel, FakeHost]
     ) -> None:

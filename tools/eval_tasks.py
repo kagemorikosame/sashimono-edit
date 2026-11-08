@@ -115,6 +115,7 @@ REASONS = (
     "no-consent",
     "ai-error",
     "ai-timeout",
+    "ai-no-cut",
 )
 
 #: 課題の定義と、結果を足していく所（どちらもリポジトリの中）
@@ -429,6 +430,8 @@ class MediaFacts:
 
     duration: float
     fps: float
+    #: 音を持つか 無い素材を字幕起こしへ渡すと失敗し、見どころまで asr-error になる
+    has_audio: bool = True
 
 
 def media_facts(path: Path) -> MediaFacts:
@@ -436,7 +439,7 @@ def media_facts(path: Path) -> MediaFacts:
 
     media = probe_media(path)
     fps = float(media.video_streams[0].frame_rate.fps) if media.video_streams else 0.0
-    return MediaFacts(float(media.duration), fps)
+    return MediaFacts(float(media.duration), fps, media.has_audio)
 
 
 def find_silences(path: Path, params: ToolParams) -> list[tuple[float, float]]:
@@ -684,6 +687,10 @@ GROUP_INSTRUCTION = (
 )
 
 
+#: グループの課題の前半と後半の見出し 2 つのグループがまとまったかを見分けるのに使う
+_GROUP_TITLES = ("前半", "後半")
+
+
 def grouped_project(media_path: Path, material: str) -> Document:
     """素材を置き、前半と後半に分けて、それぞれ映像・音声・テロップを 1 つのグループにした作品
 
@@ -704,11 +711,11 @@ def grouped_project(media_path: Path, material: str) -> Document:
     placed = [clip.id for track in project.timeline.tracks for clip in track.clips]
     document.execute(SplitClips(tuple(placed), middle))
     titles = (
-        Clip(timeline_start=0, duration=middle, source=TEXT.create(text="前半")),
+        Clip(timeline_start=0, duration=middle, source=TEXT.create(text=_GROUP_TITLES[0])),
         Clip(
             timeline_start=middle,
             duration=project.duration - middle,
-            source=TEXT.create(text="後半"),
+            source=TEXT.create(text=_GROUP_TITLES[1]),
         ),
     )
     document.execute(AddTrack(Track(TrackKind.VIDEO, "テロップ", titles)))
@@ -746,8 +753,21 @@ def group_metrics(project: Project) -> dict[str, float | int]:
                 pairs += 1
                 same += int(clip.group_id is not None and clip.group_id == other.group_id)
     groups = {clip.group_id for _, clip in clips if clip.group_id is not None}
+    # 前半と後半の見出しが同じグループに入ったら、2 つのグループが 1 つにまとまった 重なる組は
+    # どれも同じグループのままなので割合は 1.0 のまま残る 別々に動かせないのは束ねが崩れた形
+    titles = {
+        str(clip.source.params.get("text")): clip.group_id
+        for _, clip in clips
+        if clip.source is not None and clip.source.params.get("text") in _GROUP_TITLES
+    }
+    merged = int(
+        len(titles) == len(_GROUP_TITLES)
+        and None not in titles.values()
+        and len(set(titles.values())) == 1
+    )
     return {
-        "kept_share": round(same / pairs, 4) if pairs else 1.0,
+        "kept_share": 0.0 if merged else (round(same / pairs, 4) if pairs else 1.0),
+        "merged": merged,
         "pairs": pairs,
         "groups": len(groups),
         "loose_clips": sum(1 for _, clip in clips if clip.group_id is None),
@@ -919,11 +939,16 @@ def run_ai_groups(
     sheet.parent.mkdir(parents=True, exist_ok=True)
     save_project(document.project, sheet)
     window = MainWindow(load_project(sheet), path=sheet, confirm_unsaved=False)
+    before = document.project.duration
     try:
         run = drive_ai(window, GROUP_INSTRUCTION, session_factory, timeout=timeout)
-        metrics = group_metrics(window.document.project)
+        after = window.document.project
+        metrics = group_metrics(after)
     finally:
         window.close()
+    # 切らずに終えた回は、グループが残っていて当たり前 数えないと切れなかった回まで成功に見える
+    removed = (before - after.duration) * after.rate.frame_duration
+    metrics["removed_seconds"] = round(float(removed), 2)
     return run, metrics
 
 
@@ -1302,6 +1327,7 @@ def current_commit(root: Path = ROOT, results: Path = RESULTS_FILE) -> str:
 
     台本が自分で足す結果のファイルは、書き換えの判定から外す 外さないと、結果をコミットせずに
     2 回目を回すだけで必ず印が付き、コードを変えた回と変えていない回を見分けられない
+    外すのは結果のフォルダごと（道具の段の ``tools.jsonl`` と AI の段の ``ai.jsonl``）
     """
     try:
         head = subprocess.run(
@@ -1319,7 +1345,7 @@ def current_commit(root: Path = ROOT, results: Path = RESULTS_FILE) -> str:
                 "--untracked-files=no",
                 "--",
                 ".",
-                f":(exclude){results.relative_to(root).as_posix()}",
+                f":(exclude){results.parent.relative_to(root).as_posix()}",
             ],
             cwd=root,
             capture_output=True,
@@ -1499,7 +1525,9 @@ def predict(
         value = {"segments": segments_of(transcript)}
     elif task == HIGHLIGHTS:
         # 字幕起こしの部品が無ければ音と動きだけで選ぶ（道具の段の find_highlights と同じ）
-        value = {"ranges": find_highlight_ranges(path, facts.duration, transcriber(path, params))}
+        # 音の無い素材は起こさない 起こすと失敗して、動きで選べる見どころまで数えられない
+        words = transcriber(path, params) if facts.has_audio else None
+        value = {"ranges": find_highlight_ranges(path, facts.duration, words)}
     else:
         # 話の区切りの道具は無い AI の段（後で作る）で数える
         return Prediction(None, 0.0, "no-tool")
@@ -1892,6 +1920,13 @@ def command_ai_run(
                 continue
             if run.failed or not run.finished:
                 record.update(status="failed", reason="ai-error" if run.failed else "ai-timeout")
+            elif float(metrics.get("removed_seconds", 0.0)) <= 0.0:
+                # 切らずに終えた グループが残ったのは切っていないから 成功と並べない
+                record.update(
+                    status="failed",
+                    reason="ai-no-cut",
+                    metrics=finite_metrics({**metrics, **run.metrics()}),
+                )
             else:
                 record.update(
                     status="ok",

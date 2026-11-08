@@ -106,13 +106,15 @@ def fixed_slot(effects: tuple[Effect, ...] | list[Effect], kind: str) -> int:
 
     自分より後ろに並ぶはずの固定の項目の前 無ければ列の末尾 途中に割り込ませると、
     音量のあとに反転が来るなど、パネルの欄の並びとエフェクトの掛かる順が食い違う
+    末尾に置く種類（:data:`LAST_KINDS` のリミッター）よりも前 固定の音量を持たない古いクリップへ
+    後から音量を足すと、リミッターの後に掛かって山が上限を越える
     """
     rank = fixed_rank(kind)
     return next(
         (
             index
             for index, effect in enumerate(effects)
-            if effect.fixed and fixed_rank(effect.kind) > rank
+            if (effect.fixed and fixed_rank(effect.kind) > rank) or effect.kind in LAST_KINDS
         ),
         len(effects),
     )
@@ -122,9 +124,17 @@ def loose_slot(effects: tuple[Effect, ...] | list[Effect]) -> int:
     """ふつうのエフェクトを足す位置 最初の固定の項目の前
 
     末尾へ足すと、足したぼかしが置いた後の絵に掛かり、YMM4 で同じ設定にした絵と変わる
-    （回した絵の縁がぼけずに切れる 拡大した絵のぼかしが拡大率で太らない）
+    （回した絵の縁がぼけずに切れる 拡大した絵のぼかしが拡大率で太らない） 固定の項目が無くても
+    末尾のリミッター（:data:`LAST_KINDS`）よりは前 後ろに足した音の欄で山が上限を越える
     """
-    return next((index for index, effect in enumerate(effects) if effect.fixed), len(effects))
+    return next(
+        (
+            index
+            for index, effect in enumerate(effects)
+            if effect.fixed or effect.kind in LAST_KINDS
+        ),
+        len(effects),
+    )
 
 
 def takes_picture_items(clip: Clip) -> bool:

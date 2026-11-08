@@ -10,11 +10,23 @@ from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
-from sashimono.core.model import MediaItem, Project, ProjectSettings, Transcript
+from sashimono.core.model import (
+    AudioStreamInfo,
+    Clip,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Scene,
+    SceneId,
+    Track,
+    TrackKind,
+    Transcript,
+)
 from sashimono.engine.encode import (
     DEFAULT_BITRATE_MBPS,
     MATCH_FLOOR_MBPS,
     BitrateChoice,
+    export_target,
     matched_bitrate_mbps,
 )
 from tests.ai.conftest import make_loaded
@@ -91,3 +103,54 @@ def test_the_duration_is_used(video_media: MediaItem) -> None:
     longer = replace(video_media, path=Path("C:/素材/low.mp4"), duration=Fraction(20))
     project = make_loaded(longer, _no_words())
     assert matched_bitrate_mbps(project, size_of=_sizes(low=TWO_MBPS)) == 2
+
+
+def test_uncompressed_audio_is_not_read_as_picture(video_media: MediaItem) -> None:
+    """録画機の 8ch PCM は音だけで 9 Mbps 映像の量と読むと、4 Mbps の素材まで上限で書き出す"""
+    pcm = AudioStreamInfo(
+        index=1, sample_rate=48000, channels=8, time_base=Fraction(1, 48000), codec="pcm_s24le"
+    )
+    media = replace(video_media, path=Path("C:/素材/rec.mov"), audio_streams=(pcm,))
+    project = make_loaded(media, _no_words())
+    size = (4_000_000 + 48000 * 8 * 24) * 10 // 8
+    # 映像の 4 Mbps の 1.25 倍で 5 Mbps
+    assert matched_bitrate_mbps(project, size_of=_sizes(rec=size)) == 5
+
+
+def _with_scene(video_media: MediaItem, *, placed: bool) -> tuple[Project, SceneId]:
+    """低い素材をメインに置き、高い素材だけのシーンを作った作品
+
+    ``placed`` ならシーンもメインに置く
+    """
+    project = make_loaded(replace(video_media, path=Path("C:/素材/low.mp4")), _no_words())
+    high = MediaItem(
+        path=Path("C:/素材/high.mp4"),
+        duration=video_media.duration,
+        video_streams=video_media.video_streams,
+    )
+    inner = Track(kind=TrackKind.VIDEO, name="V1", clips=(Clip(0, 300, media_id=high.id),))
+    scene = Scene(name="山場", timeline=replace(project.timeline, tracks=(inner,)))
+    project = replace(project, media=(*project.media, high), scenes=(scene,))
+    if placed:
+        outer = Track(kind=TrackKind.VIDEO, name="V2", clips=(Clip(0, 300, scene_id=scene.id),))
+        project = project.with_timeline(
+            replace(project.timeline, tracks=(*project.timeline.tracks, outer))
+        )
+    return project, scene.id
+
+
+def test_only_the_exported_scene_counts(video_media: MediaItem) -> None:
+    """選んだ物の外の高い素材に引かれると、低い素材の場面だけでも大きなファイルになる"""
+    size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
+    project, scene_id = _with_scene(video_media, placed=False)
+    # メインには低い素材だけ 置いていないシーンの素材は書き出さない
+    assert matched_bitrate_mbps(project, size_of=size_of) == 3
+    # シーンを書き出すなら、その中の高い素材に合わせる
+    assert matched_bitrate_mbps(export_target(project, scene_id), size_of=size_of) == 10
+
+
+def test_a_nested_scene_counts(video_media: MediaItem) -> None:
+    """メインに置いたシーンの中の素材も書き出す 数えないと、その場面が崩れる"""
+    project, _ = _with_scene(video_media, placed=True)
+    size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
+    assert matched_bitrate_mbps(project, size_of=size_of) == 10

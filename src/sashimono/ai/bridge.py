@@ -101,7 +101,12 @@ class _Work:
 
 @dataclass(slots=True)
 class Approval:
-    """確認待ちの 1 件"""
+    """確認待ちの 1 件
+
+    答えるのは画面のスレッド、時間切れと中断で畳むのは AI のスレッド 先に決まった方だけを残す
+    畳んだ後に押された許可を通すと、次の指示に「この指示の間は許可」が付き、確かめずに編集する
+    （PR #451 の CodeRabbit の指摘）
+    """
 
     tool: str
     summary: str
@@ -116,14 +121,26 @@ class Approval:
     def irreversible(self) -> bool:
         return self.consent is not None
 
-    def allow(self) -> None:
-        self.allowed = True
-        self.done.set()
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def deny(self, reason: str = "ユーザーが許可しませんでした") -> None:
-        self.allowed = False
-        self.reason = reason
-        self.done.set()
+    def allow(self) -> bool:
+        """許す すでに畳まれていたら何もせず偽を返す"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.allowed = True
+            self.done.set()
+            return True
+
+    def deny(self, reason: str = "ユーザーが許可しませんでした") -> bool:
+        """断る すでに決まっていたら何もせず偽を返す（先に押された許可を消さない）"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.allowed = False
+            self.reason = reason
+            self.done.set()
+            return True
 
 
 @dataclass(slots=True)

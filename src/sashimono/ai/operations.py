@@ -33,6 +33,7 @@ from sashimono.ai.auto_fix import (
     ColorRequest,
     NoiseRequest,
     has_limiter,
+    limited_ceiling,
     limiter_commands,
     picture_clip,
     plan_color_fix,
@@ -5314,12 +5315,7 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
         "duration_frames": _project(host).duration,
     }
     notes: list[str] = []
-    # ロックしたトラックは切れない 切れたと読むと、そこだけずれたまま先へ進む
-    left = [
-        str(track.id)
-        for track in project.timeline.tracks
-        if track.locked and any(clip.timeline_end > start for clip in track.clips)
-    ]
+    left = _locked_left(project, start)
     if left:
         result["tracks_left"] = left
         notes.append("tracks_left のトラックはロックしているので切っていません")
@@ -5327,6 +5323,18 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _locked_left(project: Project, start: int) -> list[str]:
+    """``start`` より後ろに物があるロックしたトラック 詰めても動かず、そこだけずれたまま残る
+
+    切れたと読むと、ずれたまま先へ進む（``cut_range`` と ``cut_fillers`` が答えに書く）
+    """
+    return [
+        str(track.id)
+        for track in project.timeline.tracks
+        if track.locked and any(clip.timeline_end > start for clip in track.clips)
+    ]
 
 
 def _duplicate_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -6538,6 +6546,11 @@ def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
     ]
     if len(ranges) > MAX_FILLERS_SHOWN:
         result["places_more"] = len(ranges) - MAX_FILLERS_SHOWN
+    left = _locked_left(project, min(start for start, _ in ranges))
+    if left:
+        # 声だけが詰まって、ロックした映像や字幕が後ろでずれる 黙ると同期が崩れたまま進む
+        result["tracks_left"] = left
+        notes.append("tracks_left のトラックはロックしているので切っていません")
     asked = cut_targets(
         project,
         media.id,
@@ -7023,12 +7036,14 @@ def _apply_loudness(
             "測っている間に作品が変わりました 何も変えていません もう 1 度呼ぶと測り直します"
         )
     measured = report.loudness
+    # 前に積んだリミッターの上限より上へは上げない 上げた分は潰れて、基準に届いたと嘘を答える
+    cap = limited_ceiling(clips, ceiling)
     decided = loudness_gain(
         clips,
         measured=measured,
         peak_db=report.peak_db,
         target=request.limits.loudness_target,
-        ceiling=ceiling,
+        ceiling=cap,
         squeeze=squeeze,
     )
     gain = decided.gain_db
@@ -7045,45 +7060,66 @@ def _apply_loudness(
     }
     if not reached:
         result |= {"short_of_target_lu": round(short, 1), "limited_by": limited}
-    if abs(gain) < _ON_TARGET_LU:
+    moved = abs(gain) >= _ON_TARGET_LU
+    # 丸めの誤差ほどの越えでは積まない 0.05 dB は聞き分けられず、効かないリミッターが残るだけ
+    # 音量を変えなくても山が天井を越えていれば積む 基準に合った音の山を割れたまま残さない
+    squeezed = decided.squeeze_db >= _ON_TARGET_LU
+    if not moved and not squeezed:
         result["gain_db"] = 0.0
         if reached:
             result["note"] = "すでに基準に合っています 何も変えていません"
         else:
             result["note"] = (
                 f"何も変えていません 基準まで {short:.1f} LU 足りませんが、"
-                f"{_limit_reason(limited, ceiling)}、全部を同じだけ上げる道具ではこれ以上"
+                f"{_limit_reason(limited, cap)}、全部を同じだけ上げる道具ではこれ以上"
                 "上がりません 山の出る音のクリップだけを set_volume で下げてから呼び直すか、"
                 "基準に届かないまま進めるかを人に尋ねてください"
             )
         return result
-    commands = gain_commands(clips, gain)
-    # 丸めの誤差ほどの越えでは積まない 0.05 dB は聞き分けられず、効かないリミッターが残るだけ
-    squeezed = decided.squeeze_db >= _ON_TARGET_LU
+    commands = gain_commands(clips, gain) if moved else []
     if squeezed:
         commands += limiter_commands(clips, ceiling)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
-        "gain_db": round(gain, 2),
-        "expected_lufs": round(measured + gain, 1),
-        "expected_peak_dbfs": None if report.peak_db is None else round(report.peak_db + gain, 2),
+        "gain_db": round(gain, 2) if moved else 0.0,
+        "expected_lufs": round(measured + (gain if moved else 0.0), 1),
+        "expected_peak_dbfs": None
+        if report.peak_db is None
+        else round(report.peak_db + (gain if moved else 0.0), 2),
     }
-    notes = ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+    notes = (
+        ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+        if moved
+        else ["音量は基準に合っているので変えていません"]
+    )
     if squeezed:
+        overlap = _overlapping(clips)
         result |= {
             "limiter_db": round(decided.squeeze_db, 1),
-            "expected_peak_dbfs": ceiling,
+            # リミッターはクリップごと 重なって鳴る音の和は上限を越えうるので、言い切らない
+            "expected_peak_dbfs": None if overlap else ceiling,
         }
         notes.append(
             f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
             "どの音のクリップにも"
             "最後にリミッター（上限は同じ値）を積みました 山だけを抑えるので、音量は見込みより"
-            "わずかに下がります 重なった音の和は上限を越えることがあるので、check_output で"
-            "確かめてください"
+            "わずかに下がります"
         )
+        if overlap:
+            result["mixed_peak_checked"] = False
+            notes.append(
+                "リミッターはクリップごとに掛かるので、重なって鳴る音の和は上限を越えることが"
+                "あります check_output の clipping で確かめ、越えていればその区間の音を"
+                " set_volume で下げてください"
+            )
     if limited:
         result["limited_by"] = limited
-        if "peak" in limited and squeezed:
+        if "peak" in limited and cap < ceiling:
+            notes.append(
+                f"前に積んだリミッターの上限 {cap:g} dBFS より上へは上げられないので、"
+                "基準の手前で止めました そのリミッターの上限を上げるか、外してから呼び直せます"
+            )
+        elif "peak" in limited and squeezed:
             notes.append(
                 f"リミッターで {MAX_LIMITER_DB:g} dB 抑えても山が {ceiling:g} dBFS を超えるので、"
                 "基準の手前で止めました"
@@ -7094,6 +7130,17 @@ def _apply_loudness(
             notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
     result["note"] = " ".join(notes)
     return result
+
+
+def _overlapping(clips: list[Clip]) -> bool:
+    """同じ時刻に 2 本以上が鳴るか（トラックをまたいで見る）"""
+    spans = sorted((clip.timeline_start, clip.timeline_end) for clip in clips)
+    reach = None
+    for begin, finish in spans:
+        if reach is not None and begin < reach:
+            return True
+        reach = finish if reach is None else max(reach, finish)
+    return False
 
 
 def _limitable(host: EditorHost) -> bool:
@@ -9721,7 +9768,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
     raw_bitrate = arguments.get("bitrate_mbps")
     if raw_bitrate is None:
-        raw_bitrate = host.export_bitrate.for_project(whole)
+        raw_bitrate = host.export_bitrate.for_project(target)
     low, high = BITRATE_RANGE_MBPS
     if isinstance(raw_bitrate, bool) or not isinstance(raw_bitrate, int):
         raise ToolError(f"bitrate_mbps は {low}〜{high} の整数で渡してください")
@@ -12635,7 +12682,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "変えない（文言は clean_subtitles） 語の時刻が要る（無ければ transcribe の words_only）"
             " 字幕起こしは言いよどみを書かないことが多く、書かなかった物は探せない 驚きの「えっ」"
             "と、意味を持ちうる「まあ」「なんか」は既定では切らない（words で足せる） 切った後は"
-            " check_output の word_cut で言葉の途中になっていないかを確かめる 取り消し 1 回で戻る"
+            " check_output の word_cut で言葉の途中になっていないかを確かめる ロックしたトラックは"
+            "切らず、答えの tracks_left に書く 取り消し 1 回で戻る"
         ),
         schema=_schema(
             {
