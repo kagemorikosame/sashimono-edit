@@ -160,6 +160,29 @@ class TestApproval:
         pump_until(bridge, done)
         assert bridge.take_approval() is None
 
+    def test_allowing_the_turn_covers_every_tool_until_it_ends(self, host: FakeHost) -> None:
+        """〔この指示の間は許可〕（#414） 1 本の編集で確かめが 41〜75 回出て、人が張り付いた
+
+        壊れると、道具の種類の数だけ押すことになるか、次の指示まで黙って編集が進む
+        """
+        clip = str(host.document.project.timeline.tracks[0].clips[0].id)
+        bridge = EditorBridge(host)
+        bridge.begin_turn()
+        bridge.allow_turn()
+        done, _ = call_in_thread(bridge, WRITE, {"clip_id": clip, "frame": 100})
+        pump_until(bridge, done)
+        assert bridge.take_approval() is None
+        bridge.end_turn()
+        bridge.begin_turn()
+        done, _ = call_in_thread(bridge, WRITE, {"clip_id": clip, "frame": 50})
+        approval = None
+        while approval is None:
+            bridge.pump()
+            approval = bridge.take_approval()
+            time.sleep(0.005)
+        approval.deny()
+        pump_until(bridge, done)
+
     def test_forgetting_always_brings_the_question_back(self, host: FakeHost) -> None:
         # 〔常に許可〕を取り消しても効いたままだと、利用者の知らないうちに AI が編集を続ける
         bridge = EditorBridge(host)

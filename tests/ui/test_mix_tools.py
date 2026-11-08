@@ -395,8 +395,10 @@ class TestRightClick:
         # 壊れると、右クリックでそろえても基準の音量にならないか、測る間に画面が固まる
         asked: list[float] = []
 
-        def answer(_parent: object, target: float) -> LoudnessChoice:
+        def answer(_parent: object, target: float, limiter: bool) -> LoudnessChoice:
             asked.append(target)
+            # リミッターの初めの値は本人の設定（#414 既定は入り）
+            assert limiter is True
             return LoudnessChoice(-14.0)
 
         monkeypatch.setattr(main_window_module, "ask_loudness", answer)
@@ -440,5 +442,16 @@ class TestDialogs:
         dialog = LoudnessDialog(-23.0)
         try:
             assert dialog.choice() == LoudnessChoice(-23.0, -1.0)
+        finally:
+            dialog.deleteLater()
+
+    def test_the_loudness_dialog_offers_the_limiter(self, qt_application: QApplication) -> None:
+        # 壊れると、リミッターを切った人の窓で入ったまま開き、OK だけで山を抑えてしまう（#414）
+        del qt_application
+        dialog = LoudnessDialog(-14.0, limiter=False)
+        try:
+            assert dialog.choice().limiter is False
+            dialog.limiter_box.setChecked(True)
+            assert dialog.choice().limiter is True
         finally:
             dialog.deleteLater()

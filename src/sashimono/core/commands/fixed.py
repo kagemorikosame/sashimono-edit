@@ -22,6 +22,8 @@ __all__ = [
     "FADE_EFFECT_KIND",
     "FIXED_ORDER",
     "FLIP_EFFECT_KIND",
+    "LAST_KINDS",
+    "LIMITER_EFFECT_KIND",
     "PICTURE_FIXED",
     "SOUND_FIXED",
     "TRANSFORM_EFFECT_KIND",
@@ -42,6 +44,11 @@ TRANSFORM_EFFECT_KIND = "transform"
 VOLUME_EFFECT_KIND = "audio_volume"
 #: 音のフェード（YMM4 の音声の「フェードイン」「フェードアウト」）
 FADE_EFFECT_KIND = "audio_fade"
+#: リミッター（#414） 固定の項目ではないが、音量とフェードの**後**に積む 前に積むと、
+#: 後から掛かる音量の欄で山が上限を越え、抑えたつもりの音が割れる
+LIMITER_EFFECT_KIND = "audio_limiter"
+#: 足すときに固定の項目の後（末尾）へ入る種類
+LAST_KINDS = (LIMITER_EFFECT_KIND,)
 
 #: 絵を持つクリップの固定の項目 反転してから置く（YMM4 は裏返してから回す）
 PICTURE_FIXED = (FLIP_EFFECT_KIND, TRANSFORM_EFFECT_KIND)

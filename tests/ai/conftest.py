@@ -54,6 +54,7 @@ from sashimono.core.model import (
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
@@ -64,6 +65,7 @@ from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.report import assemble
+from sashimono.engine.encode import BitrateChoice
 from sashimono.engine.vision import ScreenKind
 from tests.conftest import make_clip
 
@@ -129,6 +131,12 @@ class FakeHost:
         self.wrap_share = 90
         #: 完成物の検査（#337） 本人の設定の音量の基準と、頼まれた検査・試験が入れる様子
         self.loudness = -14.0
+        #: 音量をそろえるときに山をリミッターで抑えるか（#414 本人の設定の既定は入り）
+        self.limiter = True
+        #: 字幕の時刻の合わせ方（#426 本人の設定の既定）
+        self.timing = SubtitleTiming()
+        #: 書き出しのビットレートの決め方（#414） 試験の素材の大きさに左右されないよう決め打ち
+        self.bitrate = BitrateChoice(auto=False)
         #: ダッキング（#329）の本人の設定 既定は設定と同じ
         self.duck = DuckShape()
         #: 強調の動き（#331）の本人の設定 既定は設定と同じ
@@ -438,6 +446,18 @@ class FakeHost:
     @property
     def loudness_target(self) -> float:
         return self.loudness
+
+    @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        return self.timing
+
+    @property
+    def loudness_limiter(self) -> bool:
+        return self.limiter
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        return self.bitrate
 
     @property
     def fix_rounds(self) -> int:

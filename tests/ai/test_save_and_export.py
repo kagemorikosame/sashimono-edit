@@ -38,7 +38,7 @@ from sashimono.core.io.serialize import load_project
 from sashimono.core.io.subtitles import subtitles_in_range, to_srt, to_vtt
 from sashimono.core.model import MediaItem, Transcript
 from sashimono.core.projection import project_timeline
-from sashimono.engine.encode import RANGE_ALL, RANGE_WORK_AREA
+from sashimono.engine.encode import RANGE_ALL, RANGE_WORK_AREA, BitrateChoice
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_safety import _hard_link, _symlink_dir, answer_approvals
@@ -385,6 +385,17 @@ class TestExport:
                 expect=Expected(None),
             )
         ]
+
+    @WINDOWS_WRITES
+    def test_the_bitrate_follows_the_preference(self, saved: FakeHost, codecs: list[str]) -> None:
+        # 壊れると、窓では本人の決めた値なのに、AI の書き出しだけ 12 Mbps 決め打ちに戻る（#414）
+        del codecs
+        assert saved.saved_at is not None
+        saved.bitrate = BitrateChoice(auto=False, mbps=20)
+        bridge = allow_sending(EditorBridge(saved, auto_approve=True))
+        seen, _box = _run(bridge, EXPORT, {"path": str(saved.saved_at.parent / "a.mp4")})
+        assert "20 Mbps" in seen[0].summary
+        assert saved.exports[-1].bitrate_mbps == 20
 
     @WINDOWS_WRITES
     def test_the_range_follows_the_export_window(self, saved: FakeHost, codecs: list[str]) -> None:

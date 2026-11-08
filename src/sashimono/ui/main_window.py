@@ -45,7 +45,13 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.auto_fix import can_auto_color, plan_color_fix, plan_noise_fix
+from sashimono.ai.auto_fix import (
+    can_auto_color,
+    has_limiter,
+    limiter_commands,
+    plan_color_fix,
+    plan_noise_fix,
+)
 from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.operations import (
     NarrationJob,
@@ -127,6 +133,7 @@ from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.mixing import (
+    MAX_LIMITER_DB,
     DuckShape,
     gain_commands,
     loudness_gain,
@@ -158,6 +165,7 @@ from sashimono.core.seams import (
     touching_scope,
 )
 from sashimono.core.search import SceneNote, hit_places
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -185,7 +193,7 @@ from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckSt
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
-from sashimono.engine.encode import build_settings, chosen_range, export_target
+from sashimono.engine.encode import BitrateChoice, build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
 from sashimono.engine.reframe import (
     FACES_CENTER,
@@ -3151,6 +3159,7 @@ class MainWindow(QMainWindow):
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
             encoder_priority=self._preferences.encoder_priority,
+            bitrate=self._preferences.export_bitrate,
         )
         self._person_export = dialog
         try:
@@ -3916,6 +3925,18 @@ class MainWindow(QMainWindow):
         return float(self._preferences.check_loudness_target)
 
     @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        return self._preferences.subtitle_timing
+
+    @property
+    def loudness_limiter(self) -> bool:
+        return self._preferences.loudness_limiter
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        return self._preferences.export_bitrate
+
+    @property
     def fix_rounds(self) -> int:
         return self._preferences.ai_fix_rounds
 
@@ -4264,7 +4285,11 @@ class MainWindow(QMainWindow):
         if not targets:
             self.statusBar().showMessage("音を鳴らすクリップを選んでください", 5000)
             return False
-        choice = ask_loudness(self, float(self._preferences.check_loudness_target))
+        choice = ask_loudness(
+            self,
+            float(self._preferences.check_loudness_target),
+            self._preferences.loudness_limiter,
+        )
         if choice is None:
             return False
         # 無効のクリップはミキサが鳴らさず測りに入らない 掛けると有効に戻したときにずれる
@@ -4279,7 +4304,13 @@ class MainWindow(QMainWindow):
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
         )
-        self._pending_loudness = _PendingLoudness(request, project, tuple(clips), choice.ceiling)
+        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると 6 dB を越えて重なる
+        squeeze = (
+            MAX_LIMITER_DB if choice.limiter and not all(has_limiter(c) for c in clips) else 0.0
+        )
+        self._pending_loudness = _PendingLoudness(
+            request, project, tuple(clips), choice.ceiling, squeeze
+        )
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
         self._finish_loudness()
@@ -4320,16 +4351,25 @@ class MainWindow(QMainWindow):
             peak_db=report.peak_db,
             target=pending.request.limits.loudness_target,
             ceiling=pending.ceiling,
+            squeeze=pending.squeeze,
         )
         if abs(decided.gain_db) < 0.05:
             self.statusBar().showMessage("すでに基準の音量です", 5000)
             return
         target = pending.request.limits.loudness_target
-        if not self.execute_all(
-            gain_commands(pending.clips, decided.gain_db), f"音量を {target:g} LUFS へそろえる"
-        ):
+        commands = gain_commands(pending.clips, decided.gain_db)
+        squeezed = decided.squeeze_db >= 0.05
+        try:
+            if squeezed:
+                commands += limiter_commands(pending.clips, pending.ceiling)
+        except ToolError as error:
+            self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
+            return
+        if not self.execute_all(commands, f"音量を {target:g} LUFS へそろえる"):
             return
         stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
+        if squeezed:
+            stopped += f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた"
         self.statusBar().showMessage(
             f"音量を {decided.gain_db:+.1f} dB 変えた"
             f"（測った音量 {report.loudness:.1f} LUFS）{stopped}",
@@ -4786,3 +4826,5 @@ class _PendingLoudness:
     project: Project
     clips: tuple[Clip, ...]
     ceiling: float
+    #: リミッターで抑えてよい山の量（dB #414） 0 なら抑えない
+    squeeze: float = 0.0

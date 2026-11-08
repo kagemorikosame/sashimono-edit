@@ -32,6 +32,8 @@ import numpy as np
 from sashimono.ai.auto_fix import (
     ColorRequest,
     NoiseRequest,
+    has_limiter,
+    limiter_commands,
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
@@ -262,6 +264,7 @@ from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
+    MAX_LIMITER_DB,
     VOLUME_LIMIT,
     DuckShape,
     audible_clips,
@@ -3909,7 +3912,14 @@ def _with_words(host: EditorHost, request: CheckRequest, report: CheckReport) ->
     project = request.project
     if project is None:
         return report
-    found = check_words(project, request.start, request.end, report.limits.kinds, host.waveform)
+    found = check_words(
+        project,
+        request.start,
+        request.end,
+        report.limits.kinds,
+        host.waveform,
+        host.subtitle_timing,
+    )
     if not found.problems and not found.notes and not found.skipped:
         return report
     return replace(
@@ -3954,6 +3964,9 @@ def _check_result(
             else settle_check(host.document, ticket, host.fix_rounds)
         )
     rate = request.project.rate if request.project is not None else None
+    # 天井に当たった音量をリミッターでまだ上げられるか（#414）
+    # 書き出したファイルは直さないので見ない
+    limitable = timeline and _limitable(host)
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
         row: dict[str, Any] = {
@@ -3983,6 +3996,7 @@ def _check_result(
             problem.severity,
             problem.measure,
             peak_db=report.peak_db,
+            limiter=limitable,
             **_fix_state(rounds, unsettled),
         ).as_dict()
         rows.append(row)
@@ -3997,6 +4011,7 @@ def _check_result(
             problem.severity,
             problem.measure,
             peak_db=report.peak_db,
+            limiter=limitable,
             **_fix_state(rounds, unsettled),
         )
         fixes[action.action] += 1
@@ -6451,6 +6466,89 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     return result
 
 
+#: :func:`_cut_fillers` が返す所の数の上限 何百か所も並べると会話の費用だけが増える
+MAX_FILLERS_SHOWN = 30
+
+
+def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """言いよどみ（えーと・あのー）の音を切って詰める（#414） 無音カットと同じ命令を通す
+
+    字幕の文言は変えない（文言からは clean_subtitles が落とす） 語の時刻が無い字幕は探せない
+    """
+    from sashimono.core.fillers import AUDIO_FILLERS, filler_spans
+
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None or not transcript.segments:
+        raise ToolError(
+            f"{media.name} のこの音声には字幕がありません transcribe で起こしてください"
+        )
+    if not any(segment.words for segment in transcript.segments):
+        raise ToolError(
+            "字幕に語の時刻がありません transcribe の words_only で今の字幕に語の時刻を"
+            "足すと探せます"
+        )
+    _no_explicit_null(arguments, "words")
+    raw = arguments.get("words")
+    if raw is not None and not isinstance(raw, list):
+        raise ToolError("words は言いよどみの語（えーと など）の配列で渡してください")
+    extra = _string_items(raw, "words") if raw is not None else []
+    if _flag_argument(arguments, "only_words", False):
+        if not extra:
+            raise ToolError("only_words が true なら words に 1 つ以上の語を渡してください")
+        wanted: tuple[str, ...] = tuple(extra)
+    else:
+        wanted = (*AUDIO_FILLERS, *extra)
+    spans = filler_spans(transcript, wanted)
+    if not spans:
+        raise ToolError(
+            "字幕の語に言いよどみが見つかりません 字幕起こしは言いよどみを書かずに返すことが多く、"
+            "書かなかった言いよどみは探せません 間の長い所は jet_cut で詰められます"
+        )
+    ranges = plan_cuts(
+        project,
+        media.id,
+        [(span.start, span.end) for span in spans],
+        stream=media.transcript_stream(stream),
+    )
+    if not ranges:
+        raise ToolError(
+            f"言いよどみが {len(spans)} か所ありましたが、どれもタイムラインに置いた範囲の外です"
+        )
+    removed = sum(end - start for start, end in ranges)
+    host.apply_commands([RippleCut(ranges)], f"言いよどみを詰める: {len(ranges)} か所")
+    rate = project.rate
+    result: dict[str, object] = {
+        "found": len(spans),
+        "cuts": len(ranges),
+        "removed_frames": removed,
+        "removed_seconds": round(float(removed * rate.frame_duration), 2),
+        # 文言は返さない（字幕と文字の同意 #342 の外で本人の文を渡さない） 時刻だけで足りる
+        "places": [
+            {"start_frame": start, "end_frame": end, "timecode": format_timecode(start, rate)}
+            for start, end in ranges[:MAX_FILLERS_SHOWN]
+        ],
+    }
+    notes = [
+        "字幕の文言の言いよどみはそのまま残っています 文言からも落とすなら clean_subtitles を"
+        "使ってください 切った所が言葉の途中になっていないかは check_output の word_cut で"
+        "確かめられます"
+    ]
+    if len(ranges) > MAX_FILLERS_SHOWN:
+        result["places_more"] = len(ranges) - MAX_FILLERS_SHOWN
+    asked = cut_targets(
+        project,
+        media.id,
+        [(span.start, span.end) for span in spans],
+        stream=media.transcript_stream(stream),
+    )
+    notes.extend(_lost_clips(project, _project(host), asked, result))
+    result["note"] = " ".join(notes)
+    return result
+
+
 # --- ジャンプカットのつなぎ目（#332 B6） ---
 #
 # 詰めたつなぎ目へ、人が手で付けるのと同じ物を付ける（core/seams.py） クロスフェードは
@@ -6850,6 +6948,11 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
             raise ToolError("どのクリップも無効です 有効にしてから呼んでください")
     target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
     ceiling = _limit_number(arguments, "peak_ceiling_db", DEFAULT_PEAK_CEILING_DB, -20.0, 0.0)
+    # 山を抑えるかは本人の設定（#414） 測る前に読む 測り終えてから断ると測り直しになる
+    squeeze = MAX_LIMITER_DB if _flag_argument(arguments, "limiter", host.loudness_limiter) else 0.0
+    if all(has_limiter(clip) for _, clip in targets):
+        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると上限の 6 dB を越えて重なる
+        squeeze = 0.0
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
     start = min(clip.timeline_start for _, clip in targets)
     end = max(clip.timeline_end for _, clip in targets)
@@ -6863,7 +6966,9 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     host.request_check(request)
 
     def finish() -> object:
-        return _apply_loudness(host, project, request, [clip for _, clip in targets], ceiling)
+        return _apply_loudness(
+            host, project, request, [clip for _, clip in targets], ceiling, squeeze
+        )
 
     if not host.check_state().running or wait <= 0:
         return finish()
@@ -6880,8 +6985,13 @@ def _apply_loudness(
     request: CheckRequest,
     clips: list[Clip],
     ceiling: float,
+    squeeze: float = 0.0,
 ) -> object:
-    """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない"""
+    """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない
+
+    ``squeeze`` はリミッターで抑えてよい山の量（dB #414） 山が天井を越える分だけ、どのクリップにも
+    リミッターを積む
+    """
     state = host.check_state()
     if state.request != request:
         raise ToolError("測っている間に別の検査に替わりました もう 1 度呼んでください")
@@ -6917,6 +7027,7 @@ def _apply_loudness(
         peak_db=report.peak_db,
         target=request.limits.loudness_target,
         ceiling=ceiling,
+        squeeze=squeeze,
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
@@ -6945,6 +7056,10 @@ def _apply_loudness(
             )
         return result
     commands = gain_commands(clips, gain)
+    # 丸めの誤差ほどの越えでは積まない 0.05 dB は聞き分けられず、効かないリミッターが残るだけ
+    squeezed = decided.squeeze_db >= _ON_TARGET_LU
+    if squeezed:
+        commands += limiter_commands(clips, ceiling)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
         "gain_db": round(gain, 2),
@@ -6952,14 +7067,41 @@ def _apply_loudness(
         "expected_peak_dbfs": None if report.peak_db is None else round(report.peak_db + gain, 2),
     }
     notes = ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+    if squeezed:
+        result |= {
+            "limiter_db": round(decided.squeeze_db, 1),
+            "expected_peak_dbfs": ceiling,
+        }
+        notes.append(
+            f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
+            "どの音のクリップにも"
+            "最後にリミッター（上限は同じ値）を積みました 山だけを抑えるので、音量は見込みより"
+            "わずかに下がります 重なった音の和は上限を越えることがあるので、check_output で"
+            "確かめてください"
+        )
     if limited:
         result["limited_by"] = limited
-        if "peak" in limited:
+        if "peak" in limited and squeezed:
+            notes.append(
+                f"リミッターで {MAX_LIMITER_DB:g} dB 抑えても山が {ceiling:g} dBFS を超えるので、"
+                "基準の手前で止めました"
+            )
+        elif "peak" in limited:
             notes.append(f"音の山が {ceiling:g} dBFS を超えるので、基準の手前で止めました")
         if "volume_limit" in limited:
             notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
     result["note"] = " ".join(notes)
     return result
+
+
+def _limitable(host: EditorHost) -> bool:
+    """天井に当たった音量を、リミッターを積んでまだ上げられるか 検査の直し方を選ぶのに使う
+
+    鳴るクリップのどれにもリミッターがあれば、もう抑えた後の音なので上げられない（尋ねる側へ回す）
+    """
+    if not host.loudness_limiter:
+        return False
+    return not all(has_limiter(clip) for _, clip in audible_clips(_project(host)))
 
 
 def _limit_reason(limited: list[str], ceiling: float) -> str:
@@ -9573,7 +9715,10 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     if raw_codec != AUTO and raw_codec not in codecs:
         raise ToolError(f"codec は {AUTO} か、使える物（{', '.join(codecs)}）から選んでください")
     codec = None if raw_codec == AUTO else raw_codec
-    raw_bitrate = arguments.get("bitrate_mbps", DEFAULT_BITRATE_MBPS)
+    # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
+    raw_bitrate = arguments.get("bitrate_mbps")
+    if raw_bitrate is None:
+        raw_bitrate = host.export_bitrate.for_project(whole)
     low, high = BITRATE_RANGE_MBPS
     if isinstance(raw_bitrate, bool) or not isinstance(raw_bitrate, int):
         raise ToolError(f"bitrate_mbps は {low}〜{high} の整数で渡してください")
@@ -10012,6 +10157,8 @@ _SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 _REFRAME = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
 _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
+#: 書き出し（#414） 確かめの箱と結果に、本人の設定と素材から決めたビットレートが載る
+_EXPORT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: 声の一覧（#335） エンジンの名前・声の名前と規約の文・本人の設定（エンジンの場所と既定の声）
 _VOICES = frozenset({Outbound.APP_SETTINGS})
 #: ナレーションを作って置く（#335） 書いた WAV の場所・置いたクリップ・声の名前と表記
@@ -10713,8 +10860,10 @@ OPERATIONS: tuple[Operation, ...] = (
             "音の入りと出が語の途中で、切った所に声が続く シーンの中と速度変更も元の時刻で見る"
             " suggested_head_delta か suggested_tail_delta は trim_clip へそのまま渡せる）・"
             "字幕と音の食い違い（subtitle_words 字幕の文言の語が残した音に無い heard は残った語、"
-            "missing は無い語）を調べる word_cut と subtitle_words は語の時刻が要り、タイムライン"
-            "だけ 既定は今のタイムライン"
+            "missing は無い語）・字幕の時刻のずれ（subtitle_timing 行の出る・消える時刻が声から"
+            "0.25 秒以上離れた行 start_offset_seconds と end_offset_seconds は正が声より遅い 本人の"
+            "設定のずらしを足した所と比べる）を調べる word_cut と subtitle_words は語の時刻、"
+            "subtitle_timing は波形の解析が要り、どれもタイムラインだけ 既定は今のタイムライン"
             "（書き出す前の、描いた絵と混ぜた音） path を渡すと書き出した動画のファイルを調べる"
             "（作品のフォルダと書き出しのフォルダの中だけ 字幕のはみ出しは調べられない"
             " AAC など圧縮した音では音割れを取りこぼすことがある）"
@@ -12476,12 +12625,44 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="cut_fillers",
+        description=(
+            "言いよどみ（えーと・えっと・あのー・えー・あー・うーん など）の音を、字幕の語の"
+            "時刻から探してタイムラインから削って詰める（#414 無音カットと同じ詰め方） 字幕の文言は"
+            "変えない（文言は clean_subtitles） 語の時刻が要る（無ければ transcribe の words_only）"
+            " 字幕起こしは言いよどみを書かないことが多く、書かなかった物は探せない 驚きの「えっ」"
+            "と、意味を持ちうる「まあ」「なんか」は既定では切らない（words で足せる） 切った後は"
+            " check_output の word_cut で言葉の途中になっていないかを確かめる 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+                "words": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "既定の言いよどみに足す語（まあ など）",
+                },
+                "only_words": _boolean("true なら既定の言いよどみを使わず words だけを探す"),
+            },
+            ["media_id"],
+        ),
+        handler=_cut_fillers,
+        sends=_WITH_FILES,
+        writes=True,
+    ),
+    Operation(
         name="smooth_cuts",
         description=(
             "ジャンプカットのつなぎ目を目立たなくする frames を省くと、同じ素材を飛び飛びに"
             "つないだ所（無音を詰めた所など）を探す video は crossfade（場面切り替えの短い"
             "クロスフェードを重ねる）zoom（後ろのクリップを 1 本おきに少し拡大する パンチイン）"
-            "none（映像は触らない） 音は継ぎ目の前後に短いフェードを入れて「プツッ」を消す"
+            "none（映像は触らない） 三脚で据えた話し手のように同じ構図が続く映像は、"
+            "crossfade では人が跳ぶのが見えて隠れないので zoom を選ぶ"
+            " 音は継ぎ目の前後に短いフェードを入れて「プツッ」を消す"
             " 省いた値は本人の設定 同じ所へ掛け直しても重ならない"
         ),
         schema=_schema(
@@ -12586,7 +12767,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "音量をラウドネスの基準（ITU-R BS.1770 の積分ラウドネス）へそろえる 測った音へ"
             "同じ dB を掛けるので、声と BGM の釣り合いは変えない clip_ids を省くと作品全体"
             "（ミュートしていないトラックの音すべて）、渡すとそのクリップだけを混ぜて測る"
-            " 音の山が peak_ceiling_db を超えるときと、音量の欄の上限 400% に当たるときは、"
+            " 音の山が peak_ceiling_db を超えるときは、limiter が true ならリミッターで山を抑えて"
+            "上げ（limiter_db に抑えた量）、それでも届かないときと音量の欄の上限 400% に"
+            "当たるときは、"
             "基準の手前で止めて limited_by に書く（reached が false なら基準に届いていない）"
             " 測るのに時間がかかる 終わらなければ"
             "何も変えずに measuring を返す（同じ引数でもう 1 度呼ぶと続きから）"
@@ -12609,6 +12792,14 @@ OPERATIONS: tuple[Operation, ...] = (
                 "peak_ceiling_db": _number(
                     f"音の山の上限 dBFS（-20〜0 既定 {DEFAULT_PEAK_CEILING_DB:g}）"
                 ),
+                "limiter": {
+                    "type": "boolean",
+                    "description": (
+                        "山が上限に当たって基準に届かないとき、音のクリップの最後にリミッターを"
+                        f"積んで山を {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げるか（省くと本人の"
+                        "設定 既定は true） false なら山の手前で止める"
+                    ),
+                },
                 "wait_seconds": _number(
                     f"測り終えるまで待つ秒（0〜{MAX_CHECK_WAIT:g}、既定 {DEFAULT_CHECK_WAIT:g}）"
                 ),
@@ -13032,8 +13223,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     "h264_nvenc / h264_amf / h264_qsv / libx264 などこの機械で使える物"
                 ),
                 "bitrate_mbps": _integer(
-                    f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps、"
-                    f"既定 {DEFAULT_BITRATE_MBPS}）"
+                    f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps）"
+                    " 省くと画面の書き出しの窓と同じ初めの値（本人の設定で、置いた素材に合わせて"
+                    f"上限 {DEFAULT_BITRATE_MBPS} Mbps か、決めた値）"
+                    " 素材より高くしても見た目は良くならず、ファイルだけが大きくなる"
                 ),
                 "wait_seconds": _number(
                     f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
@@ -13048,7 +13241,7 @@ OPERATIONS: tuple[Operation, ...] = (
         irreversible=True,
         consent=_export_consent,
         # 結果は書き出し先の場所 待ったときは書き出しの様子（場所と、終わりの文に場所が入る）
-        sends=_WITH_FILES,
+        sends=_EXPORT,
         name_keys=frozenset({"started"}),
     ),
     Operation(

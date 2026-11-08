@@ -477,6 +477,8 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 無い見た目を頼むと、保存してある見た目の名前を並べて断る（#308）
     "place_subtitles": lambda ids: {"media_id": ids["media"], "look_name": "無い見た目"},
     "jet_cut": lambda ids: {"media_id": ids["media"], "smooth": True},
+    # 言いよどみ（#414） 例の作品の字幕には語の時刻が無いので、素材の名前を書かずに断る
+    "cut_fillers": lambda ids: {"media_id": ids["media"]},
     # 再生速度とつなぎ目（#332） 動画のクリップを半分の速さにし、10 フレーム目をつなぎ目として扱う
     "set_speed": lambda ids: {"clip_ids": [ids["video"]], "speed_percent": 50},
     "smooth_cuts": lambda _ids: {"frames": [10]},

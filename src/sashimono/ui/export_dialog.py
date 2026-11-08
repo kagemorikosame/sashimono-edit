@@ -34,10 +34,10 @@ from sashimono.core.model import Project, Scene, SceneId
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
-    DEFAULT_BITRATE_MBPS,
     DEFAULT_PIPELINE_DEPTH,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    BitrateChoice,
     ExportError,
     ExportSettings,
     available_video_codecs,
@@ -138,8 +138,11 @@ class ExportDialog(QDialog):
         folder: Path | None = None,
         chapters: bool = True,
         encoder_priority: str = PRIORITY_AUTO,
+        bitrate: BitrateChoice | None = None,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
+
+        ``bitrate`` はビットレートの欄の初めの値の決め方（本人の設定 #414） 省くと前からの決め打ち
 
         ``encoder_priority`` はどの作り手のエンコーダを先に試すか（本人の設定 #365）
         コーデックの並びと「自動」の中身がこれに従う
@@ -202,8 +205,14 @@ class ExportDialog(QDialog):
 
         self._bitrate = QSpinBox(self)
         self._bitrate.setRange(*BITRATE_RANGE_MBPS)
-        self._bitrate.setValue(DEFAULT_BITRATE_MBPS)
+        choice = bitrate if bitrate is not None else BitrateChoice(auto=False)
+        self._bitrate.setValue(choice.for_project(project))
         self._bitrate.setSuffix(" Mbps")
+        if choice.auto:
+            # 決め打ちでない訳が分からないと、毎回違う初めの値を不具合と読む
+            self._bitrate.setToolTip(
+                f"置いた素材に合わせた値（上限 {choice.mbps} Mbps） 表示 → 設定… で決め打ちにできる"
+            )
 
         self._scene = QComboBox(self)
         self._scene.addItem("メイン", None)

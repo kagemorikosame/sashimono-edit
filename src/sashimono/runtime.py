@@ -151,6 +151,10 @@ class FeaturePack:
     #: pip では入らないファイル（学習済みのモデルなど 画面の解析の顔の検出 #324）
     #: 導入のボタンで pip が終わった後に落として置く（:func:`install_runtime`）
     files: tuple[RemoteFile, ...] = ()
+    #: 追加分（``extra``）として一緒に入れる別の機能（#414 AI 連携と画面の解析）
+    #: 追加分を入れ終えたらその機能の印を付け、pip では入らないファイル（顔の検出のモデル）も
+    #: 落とす 落とさないと、包みは入ったのにその機能が「使えない」のまま残る
+    extra_pack: FeaturePack | None = None
 
     def status(self) -> PackStatus:
         return PackStatus(
@@ -1096,7 +1100,7 @@ def install_runtime(
     with writing_runtime(on_output, should_cancel) as granted:
         if not granted:
             return 1
-        return _install_runtime_locked(pack, argv, on_output, should_cancel)
+        return _install_runtime_locked(pack, argv, on_output, should_cancel, extra=extra)
 
 
 #: 導入先（配布版の ``runtime``）へ書く物を 1 本ずつにする錠 導入のボタン（字幕起こしと
@@ -1388,6 +1392,8 @@ def _install_runtime_locked(
     argv: list[str],
     on_output: Callable[[str], None] | None,
     should_cancel: Callable[[], bool] | None,
+    *,
+    extra: bool = False,
 ) -> int:
     target = runtime_target_dir()
     if target is not None:
@@ -1409,6 +1415,12 @@ def _install_runtime_locked(
         # pip が入れ終えてから取りに行く 先に落とすと、包みが入らなかったときに使えない物だけが
         # 残る 開発の環境（導入先が無い）でも同じ置き場へ落とす 置き場は Python の版に関係しない
         code = fetch_files(pack.files, on_output=on_output, should_cancel=should_cancel)
+    companion = pack.extra_pack if pack is not None and extra else None
+    if code == 0 and companion is not None:
+        if target is not None:
+            _mark_installed(target, companion.key)
+        if companion.files:
+            code = fetch_files(companion.files, on_output=on_output, should_cancel=should_cancel)
     return code
 
 

@@ -287,6 +287,7 @@ class SetupSection(QWidget):
         if upgrade:
             self._force_upgrade = True
         argv = self._command()
+        extra = self.extra
         # pip が上書きする前の読み込み済みの物を、この導入の分として控える
         self._before = snapshot_runtime_modules()
         self._log.setVisible(True)
@@ -314,6 +315,8 @@ class SetupSection(QWidget):
                     before()
                 code = install_runtime(
                     pack=self._pack,
+                    # 追加分と一緒に入れる機能（AI 連携の画面の解析 #414）の後始末に要る
+                    extra=extra,
                     command=argv,
                     on_output=self._log_queue.put,
                     should_cancel=cancel.is_set,

@@ -19,7 +19,7 @@ from sashimono.core.projection import (
     heard_pieces,
     heard_timeline,
 )
-from sashimono.core.subtitle_timing import OFFSET_MS_RANGE
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -32,7 +32,7 @@ from sashimono.core.words import (
     phrases,
     split_seam,
 )
-from sashimono.engine.audio.voice_edges import REACH
+from sashimono.engine.audio.voice_edges import REACH, loudness_of_waveform, retime
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
     JOINED,
@@ -44,7 +44,7 @@ from sashimono.engine.audio.word_cuts import (
     read_cut,
 )
 from sashimono.engine.checks.report import HIGH, MEDIUM, Problem
-from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
+from sashimono.engine.checks.scan import SUBTITLE_TIMING, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
 
 __all__ = ["WordReport", "check_words"]
 
@@ -61,6 +61,10 @@ _SLIVER_SECONDS = Fraction(1, 2)
 #: 行の中だけで数えると、音を切っていないのに聞こえている語を残した音に無いと報告する
 #: 語は行ごとに別の物なので、この幅の中で鳴れば音は残っている 切って消した語はどこでも鳴らない
 _HEARD_SLACK = REACH + Fraction(max(abs(ms) for ms in OFFSET_MS_RANGE), 1000)
+#: 字幕の出る・消える時刻が声からこれだけ離れていたら知らせる（秒 #414） 声へ寄せた後のずれは
+#: 合成の声で 9 割が 0.09 秒以内（#426） 読む人が字幕と声のずれに気付くのは 0.2〜0.3 秒から
+#: 寄せた後の揺れで知らせないよう、気付く側の端に置いた
+TIMING_TOLERANCE = Fraction(1, 4)
 #: 文言と語を比べるときに外す字 句読点は認識の語と字幕の文言で付き方が違う
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()\n")
 
@@ -421,10 +425,126 @@ def _has_subtitles(project: Project, key: tuple[MediaId, int]) -> bool:
     return transcript is not None and bool(transcript.segments)
 
 
+@dataclass(slots=True)
+class _Shown:
+    """タイムラインに出る字幕の行 1 つ（同じ行の出方をまとめた物）"""
+
+    low: int
+    high: int
+    clip_ids: list[str]
+    burned: bool = False
+
+
+def _shown_lines(
+    project: Project, start: int, end: int
+) -> dict[tuple[MediaId, int], dict[str, _Shown]]:
+    """``[start, end)`` に出る字幕の行を、素材と音ごとに集める 焼き込んだ物も含める"""
+    shown: dict[tuple[MediaId, int], dict[str, _Shown]] = {}
+
+    def add(
+        key: tuple[MediaId, int], segment: str, low: int, high: int, clip: str, burned: bool
+    ) -> None:
+        lines = shown.setdefault(key, {})
+        found = lines.get(segment)
+        if found is None:
+            lines[segment] = _Shown(low, high, [clip], burned)
+            return
+        found.low, found.high = min(found.low, low), max(found.high, high)
+        if clip not in found.clip_ids:
+            found.clip_ids.append(clip)
+        found.burned = found.burned or burned
+
+    for item in burned_subtitles(project):
+        origin = item.origin
+        media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
+        if media_id is None or item.end <= start or item.start >= end:
+            continue
+        low, high = math.floor(item.start), math.ceil(item.end)
+        add((media_id, origin.stream), str(origin.segment_id), low, high, str(item.clip_id), True)
+    for subtitle in heard_timeline(project):
+        if subtitle.media_id is None or subtitle.end_frame <= start or subtitle.start_frame >= end:
+            continue
+        add(
+            (subtitle.media_id, subtitle.stream),
+            str(subtitle.segment.id),
+            subtitle.start_frame,
+            subtitle.end_frame,
+            str(subtitle.clip_id),
+            False,
+        )
+    return shown
+
+
+def _subtitle_timing(
+    project: Project, start: int, end: int, waveform_of: WaveformOf, timing: SubtitleTiming
+) -> tuple[list[Problem], int]:
+    """字幕の行の頭と終わりが、声へ寄せた時刻（#426 と同じ寄せ方）から離れている行
+
+    寄せた時刻は本人の設定のずらし（``timing`` の頭と終わりのミリ秒）も足した物と比べる 足さないと、
+    わざと早く出している人の字幕を全部ずれと読む 戻り値は（問題、波形が無く比べられなかった行の数）
+    """
+    problems: list[Problem] = []
+    unknown = 0
+    wanted = SubtitleTiming(True, timing.start_offset_ms, timing.end_offset_ms)
+    for (media_id, stream), lines in _shown_lines(project, start, end).items():
+        media = project.find_media(media_id)
+        transcript = None if media is None else media.transcript_for(stream)
+        if media is None or transcript is None or not transcript.segments:
+            continue
+        waveform = waveform_of(media, stream)
+        if waveform is None:
+            unknown += len(lines)
+            continue
+        fitted = {
+            str(s.id): s
+            for s in retime(transcript.segments, wanted, loudness_of_waveform(waveform))
+        }
+        for segment in transcript.segments:
+            line = lines.get(str(segment.id))
+            target = fitted.get(str(segment.id))
+            if line is None or target is None:
+                continue
+            early = segment.start - target.start
+            late = segment.end - target.end
+            if max(abs(early), abs(late)) < TIMING_TOLERANCE:
+                continue
+            problems.append(
+                Problem(
+                    SUBTITLE_TIMING,
+                    MEDIUM,
+                    max(line.low, start),
+                    min(line.high, end),
+                    "字幕の出る・消える時刻が声とずれている",
+                    {
+                        "segment_id": str(segment.id),
+                        "media_id": str(media_id),
+                        "stream": stream,
+                        # 正は声より遅い 負は声より早い（設定のずらしを足した後の所から）
+                        "start_offset_seconds": round(float(early), 3),
+                        "end_offset_seconds": round(float(late), 3),
+                        "start_offset_ms": timing.start_offset_ms,
+                        "end_offset_ms": timing.end_offset_ms,
+                        "burned": line.burned,
+                        "edited": segment.edited,
+                    },
+                    tuple(line.clip_ids),
+                )
+            )
+    return problems, unknown
+
+
 def check_words(
-    project: Project, start: int, end: int, kinds: frozenset[str], waveform_of: WaveformOf
+    project: Project,
+    start: int,
+    end: int,
+    kinds: frozenset[str],
+    waveform_of: WaveformOf,
+    timing: SubtitleTiming | None = None,
 ) -> WordReport:
-    """タイムラインの ``[start, end)`` を語の時刻で調べる"""
+    """タイムラインの ``[start, end)`` を語の時刻で調べる
+
+    ``timing`` は本人の字幕の時刻の設定（#426） 声へ寄せない人の字幕は、時刻のずれを調べない
+    """
     wanted = kinds & WORD_KINDS
     if not wanted:
         return WordReport()
@@ -440,6 +560,24 @@ def check_words(
     if SUBTITLE_WORDS in wanted:
         lines, blind = _subtitle_words(project, start, end)
         problems += lines
+    if SUBTITLE_TIMING in wanted:
+        chosen = timing if timing is not None else SubtitleTiming()
+        if chosen.fit_to_voice:
+            late, deaf = _subtitle_timing(project, start, end, waveform_of, chosen)
+            problems += late
+            if deaf:
+                # 比べられなかった行を問題 0 件へ混ぜない
+                skipped.add(SUBTITLE_TIMING)
+                notes.append(
+                    f"波形の解析がまだの音の字幕が {deaf} 行あり、出る時刻と声を比べていません"
+                    " 解析が終わってから調べ直してください"
+                )
+        else:
+            skipped.add(SUBTITLE_TIMING)
+            notes.append(
+                "本人の設定で字幕の時刻を声に合わせない（起こした字幕の時刻を声に合わせる が切）"
+                "ので、字幕の時刻は調べていません"
+            )
     sounding = {
         (piece.media_id, piece.stream)
         for piece in heard_pieces(project)
@@ -448,16 +586,23 @@ def check_words(
     # 語の時刻が 1 つも無い作品だけを作品の単位で断る ほかは切れ目と行を 1 つずつ読んだ数で決める
     # 音の単位で断ると、語の無い所に切れ目が無い作品まで調べられなかった扱いになる
     timed = {key for key in sounding if _has_phrases(project, key)}
-    if sounding and not timed and not any(_has_subtitles(project, key) for key in sounding):
+    # 語の時刻で調べる種類 字幕の時刻（#414）は語ではなく行と波形で見るので、語の有無で断らない
+    worded = wanted & {WORD_CUT, SUBTITLE_WORDS}
+    if (
+        worded
+        and sounding
+        and not timed
+        and not any(_has_subtitles(project, key) for key in sounding)
+    ):
         # 字幕の無い音だけ 話し声が無いとは言えないので調べたことにしない 足す字幕も無い
-        skipped |= wanted
+        skipped |= worded
         notes.append(
             "字幕の無い音だけが鳴っているので、語の境目は調べていません"
             " 話している音なら transcribe で起こすと調べられます"
         )
-    elif sounding and not timed:
+    elif worded and sounding and not timed:
         # 調べたことにしない 語の時刻が無いのに問題 0 件と読むと、切れ目は無事と言ったことになる
-        skipped |= wanted
+        skipped |= worded
         notes.append(
             "鳴っている素材に語の時刻が無いので、語の境目と字幕の文言は調べていません"
             " transcribe の words_only で今の字幕に語の時刻を足せます"

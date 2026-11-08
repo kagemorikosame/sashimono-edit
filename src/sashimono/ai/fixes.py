@@ -36,6 +36,7 @@ from sashimono.engine.checks.scan import (
     LENGTH,
     LOUDNESS,
     SILENCE,
+    SUBTITLE_TIMING,
     SUBTITLE_WORDS,
     TEXT_OVERFLOW,
     WORD_CUT,
@@ -82,8 +83,14 @@ _SOURCE = "source"
 #: 音量が足りないのに、音の山が天井に当たっている物（同じだけ上げる道具ではもう上がらない）を
 #: 分ける印
 _AT_CEILING = "at_ceiling"
+#: 天井に当たっているが、リミッターで山を抑えればまだ上げられる物（#414 本人の設定が入りで、
+#: 鳴るクリップにまだリミッターが積まれていない）
+_LIMITABLE = "limitable"
 #: 言葉の途中の切れ目のうち、シーンの中のクリップの間にある物を分ける印
 _INSIDE_SCENE = "inside_scene"
+#: 字幕の時刻のずれのうち、焼き込んだ字幕か人が直した行（#414） 合わせ直すと焼き直しが要るか、
+#: 人がわざと決めた時刻を戻すことになる
+_HELD = "held"
 #: 山がこれより天井に近ければ天井に当たっていると読む（dB） 測りと丸めの差
 _CEILING_SLACK_DB = 0.05
 
@@ -106,6 +113,12 @@ _RAISE_BLOCKED = (
     "基準に届かないまま進めるかを人に尋ねる"
 )
 
+_RAISE_WITH_LIMITER = (
+    "音の山が天井に当たっている normalize_loudness が音のクリップの最後にリミッターを積んで山だけを"
+    "抑え、基準まで上げる（limiter_db に抑えた量） それでも reached が false なら、山の出る音の"
+    "クリップだけを set_volume で下げるか、基準に届かないまま進めるかを人に尋ねる"
+)
+
 #: 種類と程度ごとの直し方 2026-10-20 に本人が決めた表（#339 の Issue の本文）
 #: 音割れだけは程度が 1 つなので、混ぜた音か素材かで分ける（3 つ目の値）
 #: 種類か程度を足したらここにも足す 足さないと :func:`fix_for` が人へ渡す側に倒すが、
@@ -122,6 +135,17 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         "作品全体を基準の音量へそろえる 声と BGM の釣り合いは変わらない",
     ),
     # 通しの確かめで、auto のまま同じ道具を勧め続け、直す回数を使い切った（#413）
+    # 山だけを抑えれば上がる（#414） 抑えるのは 1 度だけ（積んだ後は _AT_CEILING へ回る）
+    (LOUDNESS, HIGH, _LIMITABLE): Fix(
+        AUTO,
+        ("normalize_loudness",),
+        _RAISE_WITH_LIMITER,
+    ),
+    (LOUDNESS, MEDIUM, _LIMITABLE): Fix(
+        AUTO,
+        ("normalize_loudness",),
+        _RAISE_WITH_LIMITER,
+    ),
     (LOUDNESS, HIGH, _AT_CEILING): Fix(
         ASK,
         ("set_volume", "normalize_loudness"),
@@ -216,6 +240,20 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         "シーンの中の焼き込み字幕の語が残した音に無い set_active_scene でシーンを開いて"
         " scene_clip_id の文字を直すか、シーンを置いたクリップの端を動かすかを人に伝える",
     ),
+    # 行の時刻だけを声へ寄せ直す 文言も音も変わらず、取り消し 1 回で戻る（#414）
+    (SUBTITLE_TIMING, MEDIUM, None): Fix(
+        AUTO,
+        ("retime_subtitles",),
+        "字幕の行の時刻が声とずれている retime_subtitles に media_id と segment_ids と、"
+        "start_offset_ms と end_offset_ms（本人の設定のずらし 問題に書いてある値）を渡して合わせる",
+    ),
+    (SUBTITLE_TIMING, MEDIUM, _HELD): Fix(
+        ASK,
+        ("retime_subtitles",),
+        "焼き込んだ字幕か、人が直した行の時刻が声とずれている 焼き込んだ字幕は合わせた後に"
+        "焼き込み直しが要り、人が直した行はわざとの時刻かもしれないので、合わせるかを人に"
+        "尋ねてから retime_subtitles で合わせる",
+    ),
     (SUBTITLE_WORDS, MEDIUM, None): Fix(
         ASK,
         ("trim_clip", "set_subtitle_text", "set_param"),
@@ -261,11 +299,17 @@ def _at_ceiling(measure: Mapping[str, object], peak_db: float | None) -> bool:
     )
 
 
-def _variant(kind: str, measure: Mapping[str, object], peak_db: float | None) -> str | None:
+def _variant(
+    kind: str, measure: Mapping[str, object], peak_db: float | None, limiter: bool
+) -> str | None:
     if kind in (WORD_CUT, SUBTITLE_WORDS):
         return _INSIDE_SCENE if measure.get("inside_scene") else None
+    if kind == SUBTITLE_TIMING:
+        return _HELD if measure.get("burned") or measure.get("edited") else None
     if kind == LOUDNESS:
-        return _AT_CEILING if _at_ceiling(measure, peak_db) else None
+        if not _at_ceiling(measure, peak_db):
+            return None
+        return _LIMITABLE if limiter else _AT_CEILING
     if kind != CLIPPING:
         return None
     return _MIXED if measure.get("over_full_scale") else _SOURCE
@@ -277,6 +321,7 @@ def fix_for(
     measure: Mapping[str, object],
     *,
     peak_db: float | None = None,
+    limiter: bool = False,
     closed: bool = False,
     timeline: bool = True,
     unsettled: bool = False,
@@ -284,12 +329,13 @@ def fix_for(
     """問題 1 つの直し方 ``closed`` なら（上限に達した後）直す物も人へ渡す
 
     ``peak_db`` は測った音の山（dBFS） 音量が足りない問題の直し方を選ぶのに使う
+    ``limiter`` はリミッターで山を抑えればまだ上げられるか（#414） 偽なら天井に当たった音量は尋ねる
 
     ``timeline`` が偽（書き出した動画のファイルを調べた）なら、直す物も人へ渡す ファイルが
     今の作品から書き出した物かは確かめていない（古い書き出しや別の作品の動画も、作品のフォルダか
     書き出しのフォルダにあれば調べられる） 直す道具を返すと、AI が関係の無い今の作品を変える
     """
-    fix = FIXES.get((kind, severity, _variant(kind, measure, peak_db)), _UNKNOWN)
+    fix = FIXES.get((kind, severity, _variant(kind, measure, peak_db, limiter)), _UNKNOWN)
     if not timeline and fix.action in (AUTO, ASK):
         return Fix(HANDOFF, (), f"{_FILE}（{fix.how}）")
     if unsettled and fix.action in (AUTO, ASK):

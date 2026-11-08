@@ -36,7 +36,7 @@ from sashimono.core.model import (
     heard_stream,
 )
 from sashimono.effects import registry
-from sashimono.effects.audio import DENOISE_KIND
+from sashimono.effects.audio import DENOISE_KIND, LIMITER_KIND
 from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import (
@@ -58,10 +58,45 @@ __all__ = [
     "NoiseFix",
     "NoiseRequest",
     "can_auto_color",
+    "has_limiter",
+    "limiter_commands",
     "picture_clip",
     "plan_color_fix",
     "plan_noise_fix",
 ]
+
+
+def has_limiter(clip: Clip) -> bool:
+    """リミッターが効いているクリップか（#414）"""
+    return any(effect.kind == LIMITER_KIND and effect.enabled for effect in clip.effects)
+
+
+def limiter_commands(clips: list[Clip] | tuple[Clip, ...], ceiling: float) -> list[Command]:
+    """どのクリップにもリミッターを積む もうあれば上限だけを置き換える（重ねて掛けない #414）
+
+    AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕が同じここを通る 積む位置は
+    音量とフェードの後（``AddEffect`` が決める）
+    """
+    commands: list[Command] = []
+    for clip in clips:
+        found = next((effect for effect in clip.effects if effect.kind == LIMITER_KIND), None)
+        if found is None:
+            effect = registry.require(LIMITER_KIND).create(ceiling=ceiling)
+            commands.append(AddEffect(clip.id, effect))
+            continue
+        value = found.params.get("ceiling")
+        if isinstance(value, AnimatedValue) and value.is_animated:
+            # 人が付けた動きを 1 つの値で黙って消さない（ノイズ除去の掛け直しと同じ）
+            raise ToolError(
+                f"{clip.id} のリミッターは上限をキーフレームで動かしています 置き換えると動きが"
+                "消えるので触りません limiter を false にして呼び直すか、設定パネルで直してください"
+            )
+        path = ParamPath.of_effect(clip.id, found.id, "ceiling")
+        commands.append(SetParam(path, AnimatedValue(static=ceiling)))
+        if not found.enabled:
+            commands.append(SetEffectEnabled(clip.id, found.id, True))
+    return commands
+
 
 #: 色を測るのに使うサムネイルの枚数の上限 0.5 秒ごとの絵なので、長いクリップでも
 #: 等間隔に間引いてこれだけを見る 明るさの分布と色の平均はこの数で落ち着く

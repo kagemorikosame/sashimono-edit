@@ -113,6 +113,8 @@ _ANSWERS = frozenset({EventKind.TEXT, EventKind.THINKING, EventKind.TOOL_USE})
 
 #: 確かめの許すボタンの文言
 ALLOW_TEXT = "許可"
+#: 指示 1 回分をまとめて許すボタンの文（#414）
+TURN_TEXT = "この指示の間は許可"
 #: 取り消せない操作（#350）の確かめの頭と、許すボタンの文言 ふだんの確かめと見分けが付き、
 #: 押すと戻せないことが押す前に読めるようにする
 IRREVERSIBLE_HEAD = "取り消せない操作です 「元に戻す」では戻りません 実行しますか？"
@@ -292,6 +294,8 @@ class ChatPanel(QWidget):
         #: 会話を作ったときの置き方の方式 指示の文をこの方式で書いたので、変わったら作り直す
         self._session_mode = ""
         self._approval: Approval | None = None
+        #: 設定の「〔変更を自動で承認〕を入れた状態で始める」の最後に当てた値（#414）
+        self._auto_default = False
         #: 画面に出している AI からの質問（#296） 出ている間は、入力欄から送った文を答えにする
         self._question: Question | None = None
         #: あいまいなときに AI に質問させるか（設定） 会話を作るときに指示の文と道具へ渡す
@@ -506,6 +510,14 @@ class ChatPanel(QWidget):
         self._approval_allow.clicked.connect(lambda: self._answer(True))
         self._approval_always = QPushButton("以降は確認しない", self._approval_box)
         self._approval_always.clicked.connect(lambda: self._answer(True, always=True))
+        # 1 本の編集で確かめが 41〜75 回出た（#414） 道具ごとの「以降は確認しない」では
+        # 道具の種類の数だけ押すことになるので、指示 1 回分をまとめて許す口も置く
+        self._approval_turn = QPushButton(TURN_TEXT, self._approval_box)
+        self._approval_turn.setToolTip(
+            "この指示が終わるまで、取り消せる編集を確かめずに進める 保存・書き出しなど"
+            "取り消せない操作と、AI へ送る物の確かめは出る 次の指示ではまた確かめる"
+        )
+        self._approval_turn.clicked.connect(lambda: self._answer(True, turn=True))
         deny = QPushButton("拒否", self._approval_box)
         deny.clicked.connect(lambda: self._answer(False))
 
@@ -514,6 +526,7 @@ class ChatPanel(QWidget):
         approval_buttons.addStretch(1)
         approval_buttons.addWidget(deny)
         approval_buttons.addWidget(self._approval_always)
+        approval_buttons.addWidget(self._approval_turn)
         approval_buttons.addWidget(self._approval_allow)
 
         approval_layout = QVBoxLayout(self._approval_box)
@@ -938,6 +951,11 @@ class ChatPanel(QWidget):
         self._updater.schedule()
         self._bridge.set_send_choices(preferences.send_choices())
         self._bridge.ask_first = preferences.ai_ask_before_ungroup
+        if preferences.ai_auto_approve != self._auto_default:
+            # 設定が変わったときだけ合わせる 毎回入れ直すと、パネルで切った人の選びを
+            # 関係の無い設定の変更が戻してしまう
+            self._auto_default = preferences.ai_auto_approve
+            self._auto.setChecked(preferences.ai_auto_approve)
         # 上限は次の道具の前から効く 応えている途中で変えても、会話を作り直さずに済む
         self._bridge.usage.limits = preferences.budget_limits()
         self._refresh_status()
@@ -1477,6 +1495,7 @@ class ChatPanel(QWidget):
         # 取り消せない操作は毎回確かめる（2026-10-14 利用者の決定） 「以降は確認しない」を
         # 出すと、押しても効かないボタンになる 許すボタンも、何が起きるかの言葉にする
         self._approval_always.setVisible(not irreversible)
+        self._approval_turn.setVisible(not irreversible)
         self._approval_allow.setText(IRREVERSIBLE_ALLOW_TEXT if irreversible else ALLOW_TEXT)
         self._approval_box.setVisible(True)
         if irreversible:
@@ -1487,7 +1506,7 @@ class ChatPanel(QWidget):
             if not window.isActiveWindow():
                 QApplication.alert(window)
 
-    def _answer(self, allowed: bool, *, always: bool = False) -> None:
+    def _answer(self, allowed: bool, *, always: bool = False, turn: bool = False) -> None:
         approval = self._approval
         if approval is None:
             return
@@ -1496,6 +1515,8 @@ class ChatPanel(QWidget):
         if allowed:
             if always and not approval.irreversible:
                 self._bridge.allow_always(approval.tool)
+            if turn and not approval.irreversible:
+                self._bridge.allow_turn()
             approval.allow()
         else:
             approval.deny()

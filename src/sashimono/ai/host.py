@@ -30,12 +30,14 @@ from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, S
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.voicevox import NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.encode import BitrateChoice
 from sashimono.engine.vision import ScreenKind
 
 __all__ = [
@@ -464,6 +466,33 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.check_loudness_target`）
 
         配信か放送かで答えが違う（-14 と -23 では 9 LU 違う） AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        """起こした字幕の時刻の合わせ方（#426）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.subtitle_timing`）
+
+        仕上がりの検査（#414）が字幕の時刻のずれを、本人のずらしを足した所と比べるのに使う
+        """
+        ...
+
+    @property
+    def loudness_limiter(self) -> bool:
+        """音量をそろえるとき、届かなければ山をリミッターで抑えるか（#414）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.loudness_limiter`）
+
+        山の立ち上がりを残したい作品もある AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        """書き出しのビットレートの既定の決め方（#414）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.export_bitrate`）
+
+        画面の書き出しの窓と同じ物 AI が ``bitrate_mbps`` を渡さなければこれで決める
         """
         ...
 

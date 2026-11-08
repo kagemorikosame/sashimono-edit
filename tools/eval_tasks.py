@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -51,7 +51,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from sashimono import __version__  # noqa: E402
-from sashimono.core.commands import AddMarkers, Document, RippleCut, SetTranscript  # noqa: E402
+from sashimono.core.commands import (  # noqa: E402
+    AddMarkers,
+    AddTrack,
+    Document,
+    RippleCut,
+    SetTranscript,
+)
 from sashimono.core.commands.insert import insert_media  # noqa: E402
 from sashimono.core.io import load_project, save_project  # noqa: E402
 from sashimono.core.io.atomic import write_atomic  # noqa: E402
@@ -75,12 +81,21 @@ SUBTITLES = "subtitles"
 #: 字幕を焼き込んで書き出し、書き出した動画を検査する 正解と比べる課題ではなく、
 #: 書き出せたかと、検査（``check_output`` と同じ）で見つかった問題の数を数える
 EXPORT = "export"
-TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT)
+#: 見どころを選ぶ（#414） 人が素材の全体を見て残した区間を正解にし、``find_highlights`` と同じ
+#: 処理の区間と比べる
+HIGHLIGHTS = "highlights"
+#: グループを保ったままカットする（#437） 正解は持たず、カットの後にグループが残ったかと、
+#: AI の段では ``ungroup_clips`` を呼んだ・尋ねた回数を数える
+GROUPS = "groups"
+TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT, HIGHLIGHTS, GROUPS)
 #: 正解を持つ課題 下書きと取り込みはこれだけ
-ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES)
+ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES, HIGHLIGHTS)
+#: 道具の下書きを仮の正解にせず、人が素材の全体を見て一から付ける課題（#345 の決まり）
+#: 下書きから直すと、直し忘れがそのまま正解になって正解が道具の癖に寄る
+BLANK_SHEETS = (SCENES, HIGHLIGHTS)
 
-#: 結果の行の段 道具の段だけ AI の段を作るときにここへ足す
-STAGES = ("tools",)
+#: 結果の行の段 道具の段（AI を通さない）と、AI に指示を出して測る段（#437）
+STAGES = ("tools", "ai")
 #: 結果の行の状態
 STATUSES = ("ok", "skipped", "failed")
 #: 数えなかった理由 結果の行の ``reason`` はこの中の物だけを書ける
@@ -97,11 +112,17 @@ REASONS = (
     "export-error",
     "tool-error",
     "answer-error",
+    "no-consent",
+    "ai-error",
+    "ai-timeout",
 )
 
 #: 課題の定義と、結果を足していく所（どちらもリポジトリの中）
 TASKS_FILE = ROOT / "eval" / "tasks.json"
 RESULTS_FILE = ROOT / "eval" / "results" / "tools.jsonl"
+#: AI の段の結果 道具の段と分けるのは、AI の段は本人が同意して回したときだけ増え、回すたびに
+#: 費用がかかるので、道具の段の行と混ぜると前回との差の読み方を取り違えやすいため
+AI_RESULTS_FILE = ROOT / "eval" / "results" / "ai.jsonl"
 
 #: 外のフォルダを指す環境変数
 EVAL_DIR_VARIABLE = "SASHIMONO_EVAL_DIR"
@@ -459,6 +480,30 @@ def find_scenes(path: Path, params: ToolParams) -> list[float]:
     return [cut.seconds for cut in cuts]
 
 
+def find_highlight_ranges(
+    path: Path, duration: float, transcript: Transcript | None
+) -> list[list[float]]:
+    """見どころの区間（素材の秒） ``find_highlights`` と同じ手がかりと既定のしきい値
+
+    字幕があれば笑いの印を主な手がかりにする（道具と同じ） 字幕起こしの部品が無ければ音と動きだけ
+    """
+    from sashimono.engine.audio.waveform import analyze_waveform
+    from sashimono.engine.decode.probe import probe_media
+    from sashimono.engine.highlights import highlight_curves
+    from sashimono.engine.scenes import analyze_scenes
+
+    # 音の無い素材の波形・絵の無い素材の場面は読めない（読むと失敗する） 道具と同じく、
+    # 無い手がかりは調べずに返す
+    media = probe_media(path)
+    curves = highlight_curves(
+        duration,
+        waveform=analyze_waveform(path) if media.has_audio else None,
+        scenes=analyze_scenes(path, threads=0) if media.has_video else None,
+        transcript=transcript,
+    )
+    return [[found.start, found.end] for found in curves.highlights()]
+
+
 #: 字幕起こしを返す物 試験では偽物に差し替える 入っていなければ None
 type Transcriber = Callable[[Path, ToolParams], Transcript | None]
 
@@ -630,6 +675,258 @@ def export_and_check(
     return metrics
 
 
+# --- グループを保つ（#437） ---
+
+#: AI の段でグループの課題に出す指示 素材の名前も中身も言わない（どの素材でも同じ文で比べる）
+#: 保存と書き出しを止めるのは、評価の実行が本人のフォルダへ書かないため（確かめの窓でも断る）
+GROUP_INSTRUCTION = (
+    "話していない間を詰めて、テンポよく見られるようにしてください 保存と書き出しはしないでください"
+)
+
+
+def grouped_project(media_path: Path, material: str) -> Document:
+    """素材を置き、前半と後半に分けて、それぞれ映像・音声・テロップを 1 つのグループにした作品
+
+    人がテロップと話し手を束ねてからカットを頼む形 前半と後半で別のグループにするのは、
+    カットでグループがまとめて 1 つになる崩れ（#427）も数えられるようにするため
+    """
+    from sashimono.core.commands import GroupClips, SplitClips
+    from sashimono.core.model import Track, TrackKind
+    from sashimono.effects.sources import TEXT
+    from sashimono.engine.decode.probe import probe_media
+
+    media = probe_media(media_path)
+    document = _project_for(media, f"{material} {GROUPS}")
+    project = document.project
+    middle = project.duration // 2
+    if middle <= 0:
+        raise ValueError("素材が短すぎてグループを 2 つに分けられない")
+    placed = [clip.id for track in project.timeline.tracks for clip in track.clips]
+    document.execute(SplitClips(tuple(placed), middle))
+    titles = (
+        Clip(timeline_start=0, duration=middle, source=TEXT.create(text="前半")),
+        Clip(
+            timeline_start=middle,
+            duration=project.duration - middle,
+            source=TEXT.create(text="後半"),
+        ),
+    )
+    document.execute(AddTrack(Track(TrackKind.VIDEO, "テロップ", titles)))
+    for low, high in ((0, middle), (middle, document.project.duration)):
+        members = tuple(
+            clip.id
+            for track in document.project.timeline.tracks
+            for clip in track.clips
+            if clip.timeline_start >= low and clip.timeline_end <= high
+        )
+        document.execute(GroupClips(members))
+    return document
+
+
+def group_metrics(project: Project) -> dict[str, float | int]:
+    """カットの後にグループが残っているか
+
+    ``kept_share`` は、時刻の重なる別のトラックのクリップの組のうち、同じグループに居る組の割合
+    前半と後半のグループは時刻で分かれているので、重なる組はどれも同じグループの仲間だった物
+    解かれると 1.0 より下がる 割った後ろの片割れが 1 本だけになった物（#427 の決まりで
+    グループから外れる）は、重なる相手が居ないので数に入らない
+    """
+    clips = [
+        (index, clip) for index, track in enumerate(project.timeline.tracks) for clip in track.clips
+    ]
+    pairs = same = 0
+    for position, (track, clip) in enumerate(clips):
+        for other_track, other in clips[position + 1 :]:
+            if other_track == track:
+                continue
+            if (
+                clip.timeline_start < other.timeline_end
+                and other.timeline_start < clip.timeline_end
+            ):
+                pairs += 1
+                same += int(clip.group_id is not None and clip.group_id == other.group_id)
+    groups = {clip.group_id for _, clip in clips if clip.group_id is not None}
+    return {
+        "kept_share": round(same / pairs, 4) if pairs else 1.0,
+        "pairs": pairs,
+        "groups": len(groups),
+        "loose_clips": sum(1 for _, clip in clips if clip.group_id is None),
+        "clips": len(clips),
+    }
+
+
+def cut_groups_with_tools(path: Path, params: ToolParams) -> dict[str, float | int]:
+    """道具の段 無音カット（``jet_cut`` と同じ命令）をグループの作品に掛けて数える"""
+    document = grouped_project(path, "tools")
+    media = document.project.media[0]
+    silences = [
+        (Fraction(a).limit_denominator(1000), Fraction(b).limit_denominator(1000))
+        for a, b in find_silences(path, params)
+    ]
+    ranges = plan_cuts(document.project, media.id, silences)
+    if ranges:
+        document.execute(RippleCut(ranges))
+    return {**group_metrics(document.project), "cuts": len(ranges)}
+
+
+@dataclass(slots=True)
+class AiRun:
+    """AI の段の 1 回で数えた物"""
+
+    tool_calls: int = 0
+    ungroup_calls: int = 0
+    ungroup_questions: int = 0
+    questions: int = 0
+    refused_irreversible: int = 0
+    finished: bool = False
+    failed: bool = False
+
+    def metrics(self) -> dict[str, int]:
+        return {
+            "tool_calls": self.tool_calls,
+            "ungroup_calls": self.ungroup_calls,
+            "ungroup_questions": self.ungroup_questions,
+            "questions": self.questions,
+            "refused_irreversible": self.refused_irreversible,
+        }
+
+
+class SessionLike(Protocol):
+    """AI の段が使う会話の形（:class:`~sashimono.ai.session.AgentSession` と同じ口）"""
+
+    def send(self, prompt: str) -> None: ...
+
+    def poll(self) -> list[Any]: ...
+
+    def close(self, *, wait: bool = True) -> None: ...
+
+
+#: 会話を作る物（ブリッジと作品の置き方の方式から） 試験では偽の会話へ差し替える
+type SessionFactory = Callable[[Any, str], SessionLike]
+
+#: AI の段の 1 つの指示を待つ上限（秒） 長い素材の無音カットと確かめで 10 分ほどかかる
+AI_TIMEOUT_SECONDS = 1800.0
+#: 〔グループを解く前に聞く〕の問いに返す選択肢の位置 0 が〔解除する〕、1 が〔解除しない〕
+#: 評価ではグループを残す答えを返し、残したまま AI がカットを終えられるかを見る
+_KEEP_GROUP = 1
+
+
+def real_session(model: str | None) -> SessionFactory:
+    """本物の AI（Claude Code）との会話を作る物 指示の文は画面の AI のパネルと同じ"""
+
+    def make(bridge: Any, layer_mode: str) -> SessionLike:
+        from sashimono.ai.session import AgentSession, system_prompt
+
+        return AgentSession(
+            bridge,
+            model=model,
+            system_prompt=system_prompt(layer_mode, ask=True, plan=False),
+            ask=True,
+            plan=False,
+        )
+
+    return make
+
+
+def drive_ai(
+    window: Any,
+    instruction: str,
+    session_factory: SessionFactory,
+    *,
+    timeout: float = AI_TIMEOUT_SECONDS,
+) -> AiRun:
+    """本物の編集画面で AI に指示を 1 つ出し、終わるまで確かめの窓と問いに答える
+
+    取り消せる編集は許し（変更を自動で承認と同じ）、取り消せない操作（保存・書き出し）は断る
+    グループを解く前の問いには〔解除しない〕、ほかの問いには決めずに進めるよう書いて返す
+    外へ送る物はどれも許す（呼ぶ側が本人の同意を取ってから呼ぶ）
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from sashimono.ai.bridge import EditorBridge
+    from sashimono.ai.outbound import ASKED, SendChoice
+    from sashimono.ai.session import EventKind
+
+    bridge = EditorBridge(window, auto_approve=True)
+    bridge.set_send_choices(dict.fromkeys(ASKED, SendChoice.ALLOW))
+    bridge.ask_first = True
+    run = AiRun()
+    session = session_factory(bridge, window.document.project.settings.layer_mode)
+    bridge.begin_turn()
+    session.send(instruction)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline and not (run.finished or run.failed):
+            _answer_once(bridge, run)
+            for event in session.poll():
+                if event.kind is EventKind.TOOL_USE:
+                    run.tool_calls += 1
+                    run.ungroup_calls += int(event.tool == "ungroup_clips")
+                elif event.kind is EventKind.TURN_DONE:
+                    run.finished = True
+                elif event.kind in (EventKind.ERROR, EventKind.CLOSED):
+                    run.failed = True
+            QApplication.processEvents()
+            time.sleep(0.01)
+    finally:
+        bridge.end_turn()
+        bridge.cancel()
+        session.close(wait=False)
+    return run
+
+
+def _answer_once(bridge: Any, run: AiRun) -> None:
+    """画面が出すはずの確かめと問いに 1 回ずつ答える（AI のパネルの代わり）"""
+    bridge.pump()
+    approval = bridge.take_approval()
+    if approval is not None:
+        if approval.irreversible:
+            run.refused_irreversible += 1
+            approval.deny("評価の実行では保存と書き出しをしません")
+        else:
+            approval.allow()
+    question = bridge.take_question()
+    if question is not None:
+        run.questions += 1
+        if question.gate == "ungroup_clips":
+            run.ungroup_questions += 1
+            question.reply((question.spec.choices[_KEEP_GROUP].label,))
+        else:
+            question.reply(
+                free_text="評価の実行なので答えられません 決めずに進められる所まで進めてください"
+            )
+    budget = bridge.take_budget_request()
+    if budget is not None:
+        budget.reply(False)
+
+
+def run_ai_groups(
+    path: Path,
+    sheet: Path,
+    material: str,
+    session_factory: SessionFactory,
+    *,
+    timeout: float = AI_TIMEOUT_SECONDS,
+) -> tuple[AiRun, dict[str, float | int]]:
+    """AI の段のグループの課題 グループの作品を本物の編集画面で開き、AI にカットを頼む
+
+    作品は外のフォルダの ``drafts`` に置く（AI が書ける場所を作品のフォルダに限るため）
+    """
+    from sashimono.ui.main_window import MainWindow
+
+    _application()
+    document = grouped_project(path, material)
+    sheet.parent.mkdir(parents=True, exist_ok=True)
+    save_project(document.project, sheet)
+    window = MainWindow(load_project(sheet), path=sheet, confirm_unsaved=False)
+    try:
+        run = drive_ai(window, GROUP_INSTRUCTION, session_factory, timeout=timeout)
+        metrics = group_metrics(window.document.project)
+    finally:
+        window.close()
+    return run, metrics
+
+
 # --- 一致率 ---
 
 
@@ -682,6 +979,34 @@ def interval_scores(
         "kept_seconds": round(sum(mine) * GRID_SECONDS, 2),
         "answer_kept_seconds": round(sum(truth) * GRID_SECONDS, 2),
     }
+
+
+def range_scores(
+    predicted: Sequence[Sequence[float]], answer: Sequence[Sequence[float]], duration: float
+) -> dict[str, float | None]:
+    """見どころの区間の一致 重なりの一致（:func:`interval_scores`）に、区間の当たりを足す
+
+    見どころは区間の数が少なく、端の位置より「その場面を選んだか」が大事 正解の区間に 1 つでも
+    重なる道具の区間があれば当たり（再現率）、道具の区間が正解のどれかに重なれば当たり（適合率）
+    """
+    scores: dict[str, float | None] = dict(interval_scores(predicted, answer, duration))
+
+    def overlaps(item: Sequence[float], others: Sequence[Sequence[float]]) -> bool:
+        return any(float(item[0]) < float(b) and float(a) < float(item[1]) for a, b in others)
+
+    found = sum(1 for item in answer if overlaps(item, predicted))
+    right = sum(1 for item in predicted if overlaps(item, answer))
+    precision = right / len(predicted) if predicted else (1.0 if not answer else 0.0)
+    recall = found / len(answer) if answer else (1.0 if not predicted else 0.0)
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    scores |= {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "predicted": len(predicted),
+        "answer": len(answer),
+    }
+    return scores
 
 
 def _span(item: float | Sequence[float]) -> tuple[float, float]:
@@ -1032,6 +1357,7 @@ def draft_project(media_path: Path, material: str, task: str, answer: Mapping[st
     - 場面: 素材をそのまま置くだけで目印は置かない 人が素材の全体を見て一から目印を置く
       （#345 の決まり 道具の下書きから直すと、直し忘れがそのまま正解になって正解が道具の癖に寄り、
       道具を良くしても数が上がらない）
+    - 見どころ: 場面と同じ決まりで素材をそのまま置くだけ 人が見どころでない所を消して残す
     - 字幕: 素材に字幕を付ける 人は字幕のパネルで文と時刻を直す
     """
     from sashimono.engine.decode.probe import probe_media
@@ -1109,7 +1435,7 @@ def answer_from_project(project: Project, media_path: Path, task: str) -> dict[s
     """直した作品から正解を取り出す :func:`draft_project` の逆"""
     media, clips = _clips_of(project, media_path)
     rate = project.rate
-    if task == SILENCE:
+    if task in (SILENCE, HIGHLIGHTS):
         ranges = sorted((float(clip.source_in), float(clip.source_out(rate))) for clip in clips)
         merged: list[list[float]] = []
         for start, end in ranges:
@@ -1118,7 +1444,8 @@ def answer_from_project(project: Project, media_path: Path, task: str) -> dict[s
                 merged[-1][1] = max(merged[-1][1], end)
             else:
                 merged.append([start, end])
-        return {"kept": [[round(a, 3), round(b, 3)] for a, b in merged]}
+        rounded = [[round(a, 3), round(b, 3)] for a, b in merged]
+        return {"kept" if task == SILENCE else "ranges": rounded}
     if task in (SCENES, TALK):
         moments = [
             moment
@@ -1170,6 +1497,9 @@ def predict(
         if transcript is None:
             return Prediction(None, 0.0, "asr-missing")
         value = {"segments": segments_of(transcript)}
+    elif task == HIGHLIGHTS:
+        # 字幕起こしの部品が無ければ音と動きだけで選ぶ（道具の段の find_highlights と同じ）
+        value = {"ranges": find_highlight_ranges(path, facts.duration, transcriber(path, params))}
     else:
         # 話の区切りの道具は無い AI の段（後で作る）で数える
         return Prediction(None, 0.0, "no-tool")
@@ -1199,6 +1529,10 @@ def score(
         return point_scores(value["cuts"], answer["cuts"], tolerances.scene_frames / fps)
     if task == TALK:
         return point_scores(value["boundaries"], answer["boundaries"], tolerances.talk_seconds)
+    if task == HIGHLIGHTS:
+        return range_scores(value["ranges"], answer["ranges"], float(answer["duration"]))
+    if task == GROUPS:
+        raise ValueError("グループの課題は正解と比べない")
     return subtitle_scores(value["segments"], answer["segments"], tolerances.subtitle_seconds)
 
 
@@ -1234,29 +1568,38 @@ def open_material(folder: EvalDir, material: str, path: Path | None) -> Opened:
     return Opened(answer, facts)
 
 
-def _blank_scenes_sheet(
-    folder: EvalDir, material: str, path: Path, tasks: dict[str, Any], *, force: bool
-) -> bool:
-    """場面の課題は、目印の無い .sme だけを作る 仮の正解は持たない 作ったら真
+#: 白紙の下書きを作ったときに出す、人がすること
+_BLANK_GUIDES = {
+    SCENES: "目印の無い .sme を作った（素材の全体を見て一から目印を置く）",
+    HIGHLIGHTS: (
+        "素材をそのまま置いた .sme を作った（見どころでない所を消して、見どころだけを残す）"
+    ),
+}
 
-    #345 の決まりで、場面（T3）だけは人が素材の全体を見て一から目印を置く 道具の下書きを
-    仮の正解にすると、人が直す前の回は道具と道具を比べて F1 が実際より高く出る
+
+def _blank_sheet(
+    folder: EvalDir, material: str, path: Path, tasks: dict[str, Any], task: str, *, force: bool
+) -> bool:
+    """人が一から付ける課題（場面・見どころ）は、素材をそのまま置いた .sme だけを作る 作ったら真
+
+    #345 の決まりで、場面（T3）と見どころは人が素材の全体を見て一から付ける 道具の下書きを
+    仮の正解にすると、人が直す前の回は道具と道具を比べて数が実際より高く出る
     前の版が置いた道具の仮の正解は、ここで外す 残すと run がそれと比べてしまう
-    人が目印を置いている途中の .sme は、``force`` でなければ上書きしない（置いた手間が消える）
+    人が付けている途中の .sme は、``force`` でなければ上書きしない（付けた手間が消える）
     """
-    if tasks.pop(SCENES, None) is not None:
-        print(f"{material} {SCENES}: 道具の下書きの仮の正解を外した（場面は人が一から付ける）")
-    sheet = folder.draft_path(material, SCENES)
+    if tasks.pop(task, None) is not None:
+        print(f"{material} {task}: 道具の下書きの仮の正解を外した（人が一から付ける）")
+    sheet = folder.draft_path(material, task)
     if sheet.exists() and not force:
-        print(f"{material} {SCENES}: 正解を付ける .sme があるので飛ばす（作り直すなら --force）")
+        print(f"{material} {task}: 正解を付ける .sme があるので飛ばす（作り直すなら --force）")
         return False
     try:
         folder.drafts.mkdir(parents=True, exist_ok=True)
-        save_project(draft_project(path, material, SCENES, {}), sheet)
+        save_project(draft_project(path, material, task, {}), sheet)
     except Exception as error:
-        print(f"{material} {SCENES}: .sme を作れなかった（{type(error).__name__}）")
+        print(f"{material} {task}: .sme を作れなかった（{type(error).__name__}）")
         return False
-    print(f"{material} {SCENES}: 目印の無い .sme を作った（素材の全体を見て一から目印を置く）")
+    print(f"{material} {task}: {_BLANK_GUIDES[task]}")
     return True
 
 
@@ -1298,8 +1641,8 @@ def command_draft(
             if existing is not None and not existing.get("provisional", True):
                 print(f"{material.id} {task}: 人が直した正解があるので触らない")
                 continue
-            if task == SCENES:
-                if _blank_scenes_sheet(folder, material.id, path, tasks, force=force):
+            if task in BLANK_SHEETS:
+                if _blank_sheet(folder, material.id, path, tasks, task, force=force):
                     made.append(f"{material.id} {task}")
                 continue
             if existing is not None and not force:
@@ -1418,9 +1761,9 @@ def command_run(
         for task in material.tasks:
             record: dict[str, object] = {**stamp, "material": material.id, "task": task}
             truth = answer.get("tasks", {}).get(task)
-            if task == SCENES and truth is not None and truth.get("provisional", True):
+            if task in BLANK_SHEETS and truth is not None and truth.get("provisional", True):
                 # 前の版の draft が残した道具の仮の正解とは比べない 道具と道具を比べた F1 が
-                # 本当の精度に見える 場面は人が一から付けた正解ができるまで数えない
+                # 本当の精度に見える 場面と見どころは人が一から付けた正解ができるまで数えない
                 truth = None
             if path is None or opened.reason:
                 # 素材が無いのは数える前の事情なので飛ばした扱い 読めなかったのは失敗
@@ -1443,6 +1786,16 @@ def command_run(
                         seconds=round(time.perf_counter() - began, 2),
                         metrics=finite_metrics(metrics),
                         params={"subtitles": transcript is not None},
+                    )
+                elif task == GROUPS:
+                    # 正解は持たない 無音カットの後にグループが残ったかを数える
+                    began = time.perf_counter()
+                    kept = cut_groups_with_tools(path, resolved)
+                    record.update(
+                        status="ok",
+                        seconds=round(time.perf_counter() - began, 2),
+                        metrics=finite_metrics(kept),
+                        params=resolved.record(SILENCE),
                     )
                 elif truth is None:
                     record.update(status="skipped", reason="no-answer")
@@ -1475,8 +1828,92 @@ def command_run(
     return records
 
 
+#: AI の段の同意が無いときの断り 送る物を先に言う（#342 の同意の表と同じ物）
+NO_CONSENT = (
+    "AI の段は、素材の名前と場所・字幕の文・映像の絵を Claude Code を通して Anthropic へ送ります"
+    " 送ってよいと確かめたら --allow-send を付けて回してください"
+)
+
+
+def command_ai_run(
+    folder: EvalDir,
+    book: TaskBook,
+    chosen: Sequence[str],
+    *,
+    allow_send: bool,
+    results: Path = AI_RESULTS_FILE,
+    session_factory: SessionFactory | None = None,
+    model: str | None = None,
+    timeout: float = AI_TIMEOUT_SECONDS,
+    commit: str | None = None,
+    runner: Callable[..., tuple[AiRun, dict[str, float | int]]] | None = None,
+) -> list[dict[str, object]]:
+    """AI の段を回して結果を足す 今あるのはグループの課題だけ（#437）
+
+    同意が無ければ 1 行も書かずに止まる 1 つの素材で会話が失敗しても、ほかの素材は回す
+    """
+    if not allow_send:
+        raise SystemExit(NO_CONSENT)
+    if model is not None and not _SAFE_TEXT.match(model):
+        raise ParamsError("--model には英数字と . _ : + - だけの名前を渡す")
+    factory = session_factory if session_factory is not None else real_session(model)
+    drive = runner if runner is not None else run_ai_groups
+    if results.exists():
+        _parse_results(_raw_text(results))
+    manifest = folder.manifest()
+    names = forbidden_names(folder, manifest)
+    stamp = {
+        "date": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "version": __version__,
+        "commit": commit if commit is not None else current_commit(),
+        "stage": "ai",
+    }
+    records: list[dict[str, object]] = []
+    for material in _materials(book, chosen):
+        for task in material.tasks:
+            if task != GROUPS:
+                # AI の段で数えるのはグループの課題だけ ほかは道具の段で数える
+                continue
+            record: dict[str, object] = {**stamp, "material": material.id, "task": task}
+            path = manifest.get(material.id)
+            if path is None or not path.is_file():
+                record.update(status="skipped", reason="no-material")
+                records.append(record)
+                continue
+            began = time.perf_counter()
+            try:
+                sheet = folder.drafts / f"{material.id}_{GROUPS}_ai.sme"
+                run, metrics = drive(path, sheet, material.id, factory, timeout=timeout)
+            except Exception as error:
+                # 例外の文には素材の置き場が混じりうる 型の名前だけを出す
+                print(f"{material.id} {task}: AI の段が失敗した（{type(error).__name__}）")
+                record.update(status="failed", reason="ai-error")
+                records.append(record)
+                continue
+            if run.failed or not run.finished:
+                record.update(status="failed", reason="ai-error" if run.failed else "ai-timeout")
+            else:
+                record.update(
+                    status="ok",
+                    seconds=round(time.perf_counter() - began, 2),
+                    metrics=finite_metrics({**metrics, **run.metrics()}),
+                    params={"model": model or "default"},
+                )
+            records.append(record)
+    append_results(results, records, names)
+    return records
+
+
 #: 表に出す主な数 課題ごとに 1 つ
-HEADLINE = {SILENCE: "iou", SCENES: "f1", TALK: "f1", SUBTITLES: "cer", EXPORT: "problems"}
+HEADLINE = {
+    SILENCE: "iou",
+    SCENES: "f1",
+    TALK: "f1",
+    SUBTITLES: "cer",
+    EXPORT: "problems",
+    HIGHLIGHTS: "f1",
+    GROUPS: "kept_share",
+}
 
 
 def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -1484,9 +1921,9 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     latest: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = (str(row["stage"]), str(row["material"]), str(row["task"]))
-        if row["task"] == SCENES:
-            # 場面は人が一から付けた正解だけで数える（#345） 前の版が道具の下書きを仮の正解に
-            # して数えた行は記録に残すが、道具と道具を比べた数なので表の数には使わない
+        if row["task"] in BLANK_SHEETS:
+            # 場面と見どころは人が一から付けた正解だけで数える（#345） 前の版が道具の下書きを
+            # 仮の正解にして数えた行は記録に残すが、道具と道具を比べた数なので表の数には使わない
             # 使うと、人の正解で数えるまで 1.0 に近い数が今の精度に見え続ける
             latest.setdefault(key, [])
             if row.get("provisional") is not False:
@@ -1557,6 +1994,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     adopt.add_argument("--from", dest="source", type=Path, help="直した .sme（省くと下書きの所）")
     run = command_parser("run", "道具の段を回して結果を足す")
     tool_options(run)
+    ai_run = command_parser("ai-run", "AI の段（グループを保つ）を回して結果を足す")
+    ai_run.add_argument("ids", nargs="*", help="素材の番号（省くと全部）")
+    ai_run.add_argument(
+        "--allow-send",
+        action="store_true",
+        help="素材の名前・字幕・絵を Claude（Anthropic）へ送ってよいと確かめた",
+    )
+    ai_run.add_argument("--model", help="AI のモデル（省くと Claude Code の既定）")
+    ai_run.add_argument(
+        "--timeout", type=finite_float, default=AI_TIMEOUT_SECONDS, help="1 つの指示を待つ秒"
+    )
     # report はリポジトリの中の結果だけを読むので外のフォルダは使わないが、ほかの命令と同じ
     # 打ち方（--dir 付き）で止まらないように受ける
     command_parser("report", "前回との差を出す")
@@ -1573,11 +2021,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
 
+def _all_results() -> list[dict[str, Any]]:
+    """道具の段と AI の段の結果をまとめて読む 無い方は空"""
+    rows: list[dict[str, Any]] = []
+    for path in (RESULTS_FILE, AI_RESULTS_FILE):
+        if path.exists():
+            rows.extend(read_results(path))
+    return rows
+
+
 def _dispatch(arguments: argparse.Namespace) -> int:
     if arguments.command == "report":
-        print("\n".join(report_lines(read_results(RESULTS_FILE))))
+        print("\n".join(report_lines(_all_results())))
         return 0
     folder = eval_dir(arguments.dir)
+    if arguments.command == "ai-run":
+        records = command_ai_run(
+            folder,
+            load_tasks(),
+            arguments.ids,
+            allow_send=arguments.allow_send,
+            model=arguments.model,
+            timeout=arguments.timeout,
+        )
+        for record in records:
+            if record["status"] != "ok":
+                print(f"{record['material']} {record['task']}: 数えなかった（{record['reason']}）")
+        print("\n".join(report_lines(_all_results())))
+        return 0
     if arguments.command == "adopt":
         command_adopt(folder, arguments.id, arguments.task, arguments.source)
         return 0
@@ -1597,7 +2068,7 @@ def _dispatch(arguments: argparse.Namespace) -> int:
     for record in records:
         if record["status"] != "ok":
             print(f"{record['material']} {record['task']}: 数えなかった（{record['reason']}）")
-    print("\n".join(report_lines(read_results(RESULTS_FILE))))
+    print("\n".join(report_lines(_all_results())))
     return 0
 
 
