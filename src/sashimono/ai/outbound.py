@@ -63,6 +63,7 @@ __all__ = [
     "SendChoice",
     "SendRequest",
     "build_samples",
+    "clip_line",
     "field_sends",
     "file_sample",
     "file_secrets",
@@ -207,6 +208,10 @@ class Preview:
     #: 字幕と文字として下見に出す欄の名前 結果（か引数）の中で、この名前の欄の文字を数える
     #: 欄の名前で見るのは、ID や秒や種類の名前まで「文字」と数えると、送る文の量が読めないため
     text_keys: frozenset[str] = frozenset({"text"})
+    #: 引数から作る道具で、引数に無い送る物を先に読む口（作品を変えず、外へも出さない読み取り）
+    #: クリップボードへ字幕を写す道具は、引数が字幕の ID だけなので、本文を読まないと何を
+    #: 写すのかが窓に出ない 読めなければ引数から作る 編集画面のスレッドで呼ぶ
+    reader: Callable[[Any, dict[str, Any]], object] | None = None
 
 
 def from_result(*text_keys: str) -> Preview:
@@ -214,15 +219,21 @@ def from_result(*text_keys: str) -> Preview:
     return Preview(PreviewSource.RESULT, frozenset(text_keys or ("text",)))
 
 
-def from_arguments(*text_keys: str) -> Preview:
-    """引数から下見を作る 欄を書かなければ ``text`` だけを数える"""
-    return Preview(PreviewSource.ARGUMENTS, frozenset(text_keys or ("text",)))
+def from_arguments(
+    *text_keys: str, reader: Callable[[Any, dict[str, Any]], object] | None = None
+) -> Preview:
+    """引数から下見を作る 欄を書かなければ ``text`` だけを数える
+
+    ``reader`` は :attr:`Preview.reader`
+    """
+    return Preview(PreviewSource.ARGUMENTS, frozenset(text_keys or ("text",)), reader)
 
 
 #: 下見に持つ行の上限 字幕の多い作品で全部を持つと、窓を開くのが重くなる
 #: 件数（:attr:`Sample.count`）は上限に関係なく全部を数える
 SAMPLE_LINES = 200
-#: 1 行の長さの上限（文字） 長い本文 1 つで窓の幅が広がらないように
+#: 見出しの 1 行の長さの上限（文字） 長い本文 1 つで窓の幅が広がらないように
+#: 詳細の行は切らない（:func:`clip_line`）
 SAMPLE_LINE_CHARS = 200
 #: 窓を開いたときに、詳細を開かずに見せる行の数
 SAMPLE_HEAD = 3
@@ -261,7 +272,11 @@ class Sample:
         return max(0, self.count - len(self.lines))
 
 
-def _clip_line(text: str) -> str:
+def clip_line(text: str) -> str:
+    """見出しに出す 1 行 長い本文 1 つで窓の幅が広がらないように切る
+
+    下見の行そのものは切らずに持つ 詳細と「最後に送った物」では、送った文を全部読めるように
+    """
     line = " ".join(text.split())
     if len(line) <= SAMPLE_LINE_CHARS:
         return line
@@ -299,7 +314,7 @@ def text_sample(value: Any, keys: frozenset[str]) -> Sample:
         Outbound.TEXT,
         count=len(lines),
         chars=sum(len(line) for line in lines),
-        lines=tuple(_clip_line(line) for line in lines[:SAMPLE_LINES]),
+        lines=tuple(lines[:SAMPLE_LINES]),
     )
 
 
@@ -324,9 +339,7 @@ def _images(value: Any) -> Iterator[Any]:
 def frame_sample(value: Any) -> Sample:
     """映像の絵の下見 送る絵そのものと、添える説明（コマの位置）"""
     found = list(_images(value))
-    captions = tuple(
-        _clip_line(str(getattr(image, "caption", ""))) for image in found if image.caption
-    )
+    captions = tuple(str(getattr(image, "caption", "")) for image in found if image.caption)
     return Sample(
         Outbound.FRAMES,
         count=len(found),
@@ -383,9 +396,7 @@ def file_sample(
     return Sample(
         Outbound.FILES,
         count=len(found),
-        lines=tuple(
-            f"{_clip_line(before)} → {_clip_line(after)}" for before, after in found[:SAMPLE_LINES]
-        ),
+        lines=tuple(f"{before} → {after}" for before, after in found[:SAMPLE_LINES]),
         note=note,
     )
 

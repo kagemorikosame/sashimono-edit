@@ -28,13 +28,19 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from sashimono.ai.outbound import SAMPLE_HEAD, Outbound, Sample, SendAnswer, SendRequest
+from sashimono.ai.outbound import (
+    SAMPLE_HEAD,
+    Outbound,
+    Sample,
+    SendAnswer,
+    SendRequest,
+    clip_line,
+)
 
 __all__ = [
     "SEND_ALWAYS_TEXT",
@@ -58,6 +64,8 @@ HIDE_DETAILS_TEXT = "詳細を閉じる"
 #: 絵の下見の大きさ（画素） 何枚並んでも窓の幅に収まり、映っている物は見分けられる大きさ
 THUMBNAIL_WIDTH = 240
 THUMBNAIL_HEIGHT = 160
+#: 窓が使う画面の高さの割合 これより高い中身は巻物で読む
+SCREEN_SHARE = 0.85
 #: 窓の幅の下限（画素） 狭い画面でも収まり、説明の文が 1 行に 30 文字ほど入る幅
 MINIMUM_WIDTH = 560
 #: 行の下見の高さ（行） これより長い分は欄の中で巻いて読む 窓が画面からはみ出さないように
@@ -71,7 +79,7 @@ def sample_heading(sample: Sample) -> str:
     head = list(sample.lines[:SAMPLE_HEAD]) if sample.kind is not Outbound.FRAMES else []
     if head:
         more = len(sample.lines) - len(head) + sample.omitted
-        heading += "\n" + "\n".join(f"  {line}" for line in head)
+        heading += "\n" + "\n".join(f"  {clip_line(line)}" for line in head)
         if more > 0:
             heading += f"\n  …ほか {more} 件"
     if sample.note:
@@ -153,24 +161,30 @@ class SendConsentDialog(QDialog):
         self.setWindowTitle("AI へ送る物の確かめ")
         # 説明の文が細く折れて縦に伸びると、詳細を開いたときに画面に収まらない
         self.setMinimumWidth(MINIMUM_WIDTH)
-        layout = QVBoxLayout(self)
-        question = QLabel("AI アシスタントへ、次の物を送ってよいですか？", self)
+        outer = QVBoxLayout(self)
+        self._outer = outer
+        # ボタンのほかは全部を 1 つの巻物に入れる 大きな字や長い見出し、開いた詳細で中身が
+        # 画面より高くなっても、窓は画面に収め、ボタンはいつも見えるようにする
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        question = QLabel("AI アシスタントへ、次の物を送ってよいですか？", body)
         font = question.font()
         font.setBold(True)
         question.setFont(font)
         layout.addWidget(question)
-        self.info = QLabel(request.text(), self)
+        self.info = QLabel(request.text(), body)
         self.info.setWordWrap(True)
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.info)
         self.headings: list[QLabel] = []
         for sample in request.samples:
-            heading = QLabel(sample_heading(sample), self)
+            heading = QLabel(sample_heading(sample), body)
             heading.setWordWrap(True)
             heading.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.headings.append(heading)
             layout.addWidget(heading)
-        self.toggle = QToolButton(self)
+        self.toggle = QToolButton(body)
         self.toggle.setText(SHOW_DETAILS_TEXT)
         self.toggle.setCheckable(True)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -178,9 +192,16 @@ class SendConsentDialog(QDialog):
         self.toggle.setVisible(bool(request.samples))
         self.toggle.toggled.connect(self._show_details)
         layout.addWidget(self.toggle)
+        layout.addStretch(1)
         #: 開いたときに作る 開かない人の所で絵を読み込まない
-        self.details: QScrollArea | None = None
+        self.details: QWidget | None = None
         self._layout = layout
+        self._body = body
+        self._scroller = QScrollArea(self)
+        self._scroller.setWidget(body)
+        self._scroller.setWidgetResizable(True)
+        self._scroller.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer.addWidget(self._scroller)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         self.always = QPushButton(SEND_ALWAYS_TEXT, self)
@@ -196,7 +217,8 @@ class SendConsentDialog(QDialog):
             buttons.addWidget(button)
         self.deny.setDefault(True)
         self.deny.setFocus()
-        layout.addLayout(buttons)
+        outer.addLayout(buttons)
+        self._fit_to_screen()
 
     def _choose(self, answer: SendAnswer) -> None:
         self.answer = answer
@@ -210,32 +232,31 @@ class SendConsentDialog(QDialog):
             self._layout.insertWidget(self._layout.indexOf(self.toggle) + 1, self.details)
         if self.details is not None:
             self.details.setVisible(shown)
-        self.adjustSize()
         self._fit_to_screen()
 
-    def _build_details(self) -> QScrollArea:
-        body = QWidget(self)
-        column = QVBoxLayout(body)
+    def _build_details(self) -> QWidget:
+        details = QWidget(self._body)
+        column = QVBoxLayout(details)
+        column.setContentsMargins(0, 0, 0, 0)
         for sample in self._request.samples:
-            column.addWidget(SampleView(sample, body))
-        column.addStretch(1)
-        scroll = QScrollArea(self)
-        scroll.setWidget(body)
-        scroll.setWidgetResizable(True)
-        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        scroll.setMinimumHeight(min(body.sizeHint().height() + 8, 360))
-        return scroll
+            column.addWidget(SampleView(sample, details))
+        return details
 
     def _fit_to_screen(self) -> None:
-        """開いた詳細で窓が画面からはみ出さないようにする 残りは巻物で読む"""
+        """中身の大きさで開く ただし画面に収める（残りは巻物で読む ボタンは巻物の外）"""
+        wanted = self._body.sizeHint()
+        bar = self._scroller.verticalScrollBar().sizeHint().width()
+        margins = self._outer.contentsMargins()
+        extra = margins.top() + margins.bottom()
+        buttons = self.deny.sizeHint().height() + extra + 16
+        width = max(MINIMUM_WIDTH, wanted.width() + bar + 24)
+        height = wanted.height() + buttons + 8
         screen = self.screen()
-        if screen is None:
-            return
-        available = screen.availableGeometry()
-        self.resize(
-            min(self.width(), int(available.width() * 0.9)),
-            min(self.height(), int(available.height() * 0.85)),
-        )
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, int(available.width() * 0.9))
+            height = min(height, int(available.height() * SCREEN_SHARE))
+        self.resize(width, height)
 
 
 def ask_send(parent: QWidget | None, request: SendRequest) -> SendAnswer | None:

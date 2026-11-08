@@ -54,6 +54,7 @@ from sashimono.ai.outbound import (
     SendRequest,
     build_samples,
     file_secrets,
+    from_result,
     hide_text,
     redact,
     secret_pairs,
@@ -390,6 +391,9 @@ class EditorBridge:
         if held is not None:
             # 下見のために先に動かした結果 送ると答えたので、そのまま返す 動かし直すと、
             # 下見で見せた物と別の物（間に変わった字幕・描き直した絵）を送りうる
+            # 答えた後に中断が来ていたら返さない 止めた人の所へ結果が届き、送った記録にも載る
+            if self._cancel.is_set():
+                raise ToolError("中断されました")
             return held.release(self.usage)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
@@ -696,6 +700,13 @@ class EditorBridge:
             # 引数の中の名前を伏せた後の形を見せるため、今の作品の名前を表に入れておく
             self.call(self._learn_names)
             shown = arguments
+            reader = preview.reader
+            if reader is not None:
+                try:
+                    shown = self.call(partial(reader, self._host, arguments))
+                except ToolError:
+                    # 読めない（字幕が無い・ID が違う）なら道具も同じ訳で断る 下見は引数で出す
+                    shown = arguments
         samples = build_samples(
             pending,
             shown,
@@ -793,14 +804,15 @@ class EditorBridge:
         記録は引数から下見を作る道具でも、実際に返した結果から作る 引数は AI が書いた物で、
         外へ出るのは結果の方 引数で数えると、保存の道具が返す場所などが記録から抜ける
         """
-        kinds = [kind for kind in operation.asked_kinds if self.may_send(kind)]
-        preview = operation.preview
-        if not kinds or preview is None:
+        # 伏せて送る物（hidden）も、許してあれば伏せずに送るので数える
+        kinds = [kind for kind in ASKED if kind in operation.sends and self.may_send(kind)]
+        if not kinds:
             return
+        keys = operation.preview.text_keys if operation.preview is not None else None
         samples = build_samples(
             kinds,
             result,
-            Preview(PreviewSource.RESULT, preview.text_keys),
+            Preview(PreviewSource.RESULT, keys) if keys is not None else from_result(),
             pairs=self._name_pairs(),
             name_keys=operation.name_keys,
         )

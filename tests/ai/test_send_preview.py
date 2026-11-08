@@ -24,6 +24,7 @@ from sashimono.ai.outbound import (
     SendChoice,
     SendRequest,
     build_samples,
+    clip_line,
     file_sample,
     frame_sample,
     from_arguments,
@@ -102,14 +103,17 @@ class TestSamples:
         assert sample.lines == ("今日は", "晴れ", "です")
         assert sample.amount == "3 行 7 文字"
 
-    def test_long_text_is_cut_but_counted_in_full(self) -> None:
-        # 壊れると、字幕の多い作品で窓が重くなるか、数が下見の分だけになり少なく見える
+    def test_many_lines_are_capped_but_counted_in_full(self) -> None:
+        # 壊れると、字幕の多い作品で窓が重くなるか、数が下見の分だけになり少なく見えるか、
+        # 詳細で長い文が切れて送った文を全部読めない（CodeRabbit の指摘 #450）
         rows = [{"text": "あ" * (SAMPLE_LINE_CHARS + 50)} for _ in range(SAMPLE_LINES + 10)]
         sample = text_sample(rows, frozenset({"text"}))
         assert sample.count == SAMPLE_LINES + 10
         assert len(sample.lines) == SAMPLE_LINES
         assert sample.omitted == 10
-        assert all(len(line) == SAMPLE_LINE_CHARS for line in sample.lines)
+        assert all(len(line) == SAMPLE_LINE_CHARS + 50 for line in sample.lines)
+        # 見出しにだけ切って出す
+        assert len(clip_line(sample.lines[0])) == SAMPLE_LINE_CHARS
 
     def test_frames_carry_the_picture_that_is_sent(self) -> None:
         # 壊れると、窓に出す絵と送る絵が別になり、どのコマが出るかを見誤る
@@ -285,6 +289,93 @@ class TestLogFromTheResult:
         assert isinstance(box.get("error"), ToolError)
         (entry,) = bridge.send_log.entries()
         assert entry.kinds == (SentKind(Outbound.FILES, 1),)
+
+
+class TestFromTheReview:
+    """CodeRabbit の指摘（#450）"""
+
+    def test_the_copied_subtitle_shows_before_copying(self, secret_host: FakeHost) -> None:
+        # 壊れると、字幕を写す道具の窓に ID しか出ず、どの文が写るかを見ずに答えさせる
+        media = secret_host.document.project.media[0]
+        (_stream, transcript) = media.transcripts[0]
+        segment = transcript.segments[1]
+        bridge = EditorBridge(secret_host)
+        copied_when_asked: list[int] = []
+
+        def deny(_request: SendRequest) -> SendAnswer:
+            copied_when_asked.append(len(secret_host.copied_texts))
+            return SendAnswer.DENY
+
+        arguments = {"media_id": str(media.id), "segment_id": str(segment.id)}
+        seen, _box = _run(bridge, "copy_subtitle_text", deny, arguments)
+        (sample,) = seen[0].samples
+        assert sample.lines == (segment.text,)
+        assert copied_when_asked == [0]
+        assert secret_host.copied_texts == []
+
+    def test_the_check_is_not_run_before_asking(self) -> None:
+        # 壊れると、断った下見の分まで検査の直しの回数と区切り（#339）が進む
+        preview = _operation("check_output").preview
+        assert preview is not None
+        assert preview.source is PreviewSource.ARGUMENTS
+
+    def test_speaker_names_count_as_text(self) -> None:
+        # 壊れると、本人が付けた話者の名前が送る文の数から抜ける
+        preview = _operation("get_subtitles").preview
+        assert preview is not None
+        assert {"text", "speaker", "heard"} <= preview.text_keys
+
+    def test_text_sent_through_a_hiding_tool_is_logged_once_allowed(self, host: FakeHost) -> None:
+        # 壊れると、伏せる道具（get_clip など）が許された本文をそのまま送っても記録に残らない
+        quoting = Operation(
+            name="quoting",
+            description="",
+            schema={},
+            handler=lambda _host, _arguments: {"text": "許した本文"},
+            sends=frozenset({Outbound.PROJECT, Outbound.TEXT}),
+            hidden=frozenset({Outbound.TEXT}),
+        )
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.ALLOW})
+        done, _box = call_in_thread(bridge, quoting, {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("許した本文",)
+
+    def test_an_interrupt_after_answering_returns_nothing(self, host: FakeHost) -> None:
+        # 壊れると、送ると答えた直後に止めた人の所へ、保留した絵が届いて記録にも載る
+        bridge = EditorBridge(host)
+
+        def answer_then_stop(request: SendRequest) -> None:
+            request.reply(SendAnswer.UNTIL_CLOSE)
+            bridge.cancel()
+
+        done, box = call_in_thread(bridge, _operation("preview_frame"), {})
+        answer_sends(bridge, done, answer_then_stop)
+        assert isinstance(box.get("error"), ToolError)
+        assert bridge.send_log.entries() == []
+
+    def test_a_time_without_a_zone_is_read(self, tmp_path: Path) -> None:
+        # 壊れると、時差の無い時刻が 1 件あるだけで、比べるところで落ちて記録を読めない
+        path = tmp_path / "ai_sends.json"
+        now = datetime.now().replace(microsecond=0)
+        kinds = {"text": {"count": 1}}
+        entries = [{"at": now.isoformat(), "tool": "t", "kinds": kinds}]
+        path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        store = SendLogStore(path)
+        (entry,) = store.load()
+        assert entry.at.tzinfo is not None
+        store.add(SentEntry(datetime.now().astimezone(), "u", (SentKind(Outbound.TEXT, 1),)))
+        assert [item.tool for item in store.load()] == ["t", "u"]
+
+    def test_old_entries_leave_the_file_when_viewed(self, tmp_path: Path) -> None:
+        # 壊れると、送らない日が続くと約束の日数より古い記録がファイルに残り続ける
+        path = tmp_path / "ai_sends.json"
+        old = (datetime.now().astimezone() - timedelta(days=KEEP_DAYS + 5)).isoformat()
+        entries = [{"at": old, "tool": "古い", "kinds": {"text": {"count": 1}}}]
+        path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        log = SendLog(SendLogStore(path))
+        assert log.entries() == []
+        assert "古い" not in path.read_text(encoding="utf-8")
 
 
 class TestEachCall:

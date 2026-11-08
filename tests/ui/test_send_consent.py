@@ -361,22 +361,48 @@ class TestPreviewInTheWindow:
         finally:
             dialog.deleteLater()
 
-    def test_a_long_preview_fits_the_screen(self, qt_application: QApplication) -> None:
-        # 壊れると、字幕の多い作品で窓が画面からはみ出し、ボタンを押せない
+    @pytest.mark.parametrize("opened", [False, True])
+    def test_a_long_preview_fits_the_screen_and_keeps_the_buttons(
+        self, qt_application: QApplication, opened: bool
+    ) -> None:
+        # 壊れると、字幕の多い作品や大きな字で窓が画面からはみ出し、ボタンを押せない
         del qt_application
-        lines = tuple(f"とても長い字幕の行 {number}" for number in range(SAMPLE_LINES))
-        sample = Sample(Outbound.TEXT, count=5000, chars=90000, lines=lines)
-        request = SendRequest(tool="get_subtitles", kinds=(Outbound.TEXT,), samples=(sample,))
+        lines = tuple(f"とても長い字幕の行 {number} " * 4 for number in range(SAMPLE_LINES))
+        text = Sample(Outbound.TEXT, count=5000, chars=90000, lines=lines)
+        places = tuple(
+            f"C:/Users/本人/動画/素材 {number}.mp4 → 〔素材 m_{number}〕" for number in range(60)
+        )
+        files = Sample(
+            Outbound.FILES,
+            count=60,
+            lines=places,
+            note="ユーザー名「本人」を含む物が 60 件あります",
+        )
+        request = SendRequest(
+            tool="get_subtitles", kinds=(Outbound.TEXT, Outbound.FILES), samples=(text, files)
+        )
         dialog = SendConsentDialog(request)
         try:
-            dialog.toggle.setChecked(True)
+            font = dialog.font()
+            font.setPointSizeF(font.pointSizeF() * 2)
+            dialog.setFont(font)
+            dialog.show()
+            dialog.toggle.setChecked(opened)
+            QApplication.processEvents()
             screen = dialog.screen()
             assert screen is not None
-            assert dialog.height() <= screen.availableGeometry().height()
-            text = dialog.details.findChild(QPlainTextEdit) if dialog.details else None
-            assert text is not None
-            assert "ほか 4800 件" in text.toPlainText()
+            available = screen.availableGeometry()
+            assert dialog.frameGeometry().height() <= available.height()
+            for button in (dialog.always, dialog.once, dialog.deny):
+                assert button.isVisible()
+                inside = button.mapTo(dialog, button.rect().bottomRight())
+                assert dialog.rect().contains(inside), button.text()
+            if opened:
+                shown = dialog.details.findChild(QPlainTextEdit) if dialog.details else None
+                assert shown is not None
+                assert "ほか 4800 件" in shown.toPlainText()
         finally:
+            dialog.close()
             dialog.deleteLater()
 
 

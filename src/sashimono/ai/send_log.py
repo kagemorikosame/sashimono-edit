@@ -89,6 +89,8 @@ class _Store(Protocol):
 
     def clear(self) -> bool: ...
 
+    def prune(self) -> bool: ...
+
 
 def _entry_json(entry: SentEntry) -> dict[str, Any]:
     return {
@@ -111,6 +113,10 @@ def _entry_of(value: object) -> SentEntry | None:
         when = datetime.fromisoformat(at)
     except ValueError:
         return None
+    if when.tzinfo is None:
+        # 手で書き換えた時刻など、時差の無い物はこの機械の時刻と見なす 時差の有る物と
+        # 比べると TypeError になり、記録を読めなくなる
+        when = when.astimezone()
     found: list[SentKind] = []
     for kind in ASKED:
         raw = kinds.get(kind.value)
@@ -138,6 +144,25 @@ class SendLogStore:
         self.path = path
 
     def load(self) -> list[SentEntry]:
+        """残っている記録 :data:`KEEP_DAYS` より古い物は出さない（ファイルからは :meth:`prune`）"""
+        oldest = datetime.now().astimezone() - timedelta(days=KEEP_DAYS)
+        return [entry for entry in self._read() if entry.at > oldest]
+
+    def prune(self) -> bool:
+        """古い記録をファイルから落とす 送らない日が続いても、約束の日数より長く残さない"""
+        try:
+            if not self.path.exists():
+                return True
+            with held_for_update(self._lock_path()):
+                entries = self._read()
+                kept = _trimmed(entries, datetime.now().astimezone())
+                if len(kept) != len(entries):
+                    self._write(kept)
+        except OSError:
+            return False
+        return True
+
+    def _read(self) -> list[SentEntry]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -151,7 +176,7 @@ class SendLogStore:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with held_for_update(self._lock_path()):
-                kept = _trimmed([*self.load(), entry], entry.at)
+                kept = _trimmed([*self._read(), entry], entry.at)
                 self._write(kept)
         except OSError:
             return False
@@ -195,6 +220,10 @@ class MemoryLogStore:
         self._entries = []
         return True
 
+    def prune(self) -> bool:
+        self._entries = _trimmed(self._entries, datetime.now().astimezone())
+        return True
+
 
 class SendLog:
     """送った物の記録と、最後に送った物の下見
@@ -233,7 +262,8 @@ class SendLog:
             return {kind: self._last[kind] for kind in ASKED if kind in self._last}
 
     def entries(self) -> list[SentEntry]:
-        """残した記録 新しい順"""
+        """残した記録 新しい順 見るときに古い物をファイルから落とす"""
+        self.store.prune()
         return list(reversed(self.store.load()))
 
     def clear(self) -> bool:

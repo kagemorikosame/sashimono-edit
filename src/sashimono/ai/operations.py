@@ -8617,6 +8617,13 @@ def _copy_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
     }
 
 
+def _subtitle_to_copy(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """copy_subtitle_text が写す本文 確かめの窓の下見に出す（写さない）"""
+    media, segment_id, stream = _segment_target(host, arguments)
+    segment = next(s for s in _transcript_of(host, media.id, stream) if s.id == segment_id)
+    return {"text": segment.text}
+
+
 def _copy_subtitle_text(host: EditorHost, arguments: dict[str, Any]) -> object:
     """字幕 1 枚の本文を OS のクリップボードへ置く（字幕パネルの〔文字をコピー〕）
 
@@ -10245,7 +10252,8 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_get_subtitles,
         sends=_WITH_TEXT,
-        preview=from_result(),
+        # 話者の名前（本人が付けた名前）と、音の切れ目の語（heard）も本文と同じく数える
+        preview=from_result("text", "speaker", "heard"),
     ),
     Operation(
         name="get_history",
@@ -10839,7 +10847,9 @@ OPERATIONS: tuple[Operation, ...] = (
         # 字幕のはみ出しの行には、はみ出した文の頭（本人の文）が載る 字幕と文字を送らない人には
         # 断らずに値ごと伏せる（#391 道具の役目は問題の一覧で、断ると黒いコマも調べられない）
         sends=_CHECKS | _TEXT_ONLY,
-        preview=from_result(),
+        # 先に動かさない 調べるたびに検査の直しの回数と区切り（#339）が進み、断った下見の分も
+        # 数えてしまう
+        preview=from_arguments(),
         hidden=_TEXT_ONLY,
     ),
     Operation(
@@ -11944,7 +11954,8 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_copy_subtitle_text,
         sends=_WITH_TEXT,
-        preview=from_arguments(),
+        # 引数は字幕の ID だけ 写す本文を先に読んで窓に出す（読むだけで、写すのは答えた後）
+        preview=from_arguments(reader=_subtitle_to_copy),
     ),
     Operation(
         name="set_track_height",
