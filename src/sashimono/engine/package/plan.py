@@ -61,12 +61,14 @@ class Usage:
 
 
 def _timelines(project: Project) -> Iterator[Timeline]:
+    """作品の時間軸すべて（本編と場面）"""
     yield project.timeline
     for scene in project.scenes:
         yield scene.timeline
 
 
 def _clips(project: Project) -> Iterator[tuple[Timeline, Clip]]:
+    """作品のクリップすべてと、その時間軸"""
     for timeline in _timelines(project):
         for track in timeline.tracks:
             for clip in track.clips:
@@ -87,12 +89,14 @@ def _all_effects(project: Project) -> Iterator[Effect]:
 
 
 def _sources(project: Project) -> Iterator[GeneratedSource]:
+    """作品の生成物（テキスト・図形など）すべて"""
     for _timeline, clip in _clips(project):
         if clip.source is not None:
             yield clip.source
 
 
 def _specs_of(kind: str, *, source: bool) -> tuple[object, ...] | None:
+    """種類の欄の定義 読み込んでいない種類なら ``None``"""
     definition = source_registry.get(kind) if source else registry.get(kind)
     return definition.parameters if definition is not None else None
 
@@ -163,6 +167,7 @@ def file_paths(project: Project) -> tuple[str, ...]:
     seen: dict[str, None] = {}
 
     def note(value: str) -> str:
+        """見つけた物を覚え、値はそのまま返す"""
         if value:
             seen.setdefault(value, None)
         return value
@@ -184,6 +189,7 @@ def fonts_used(project: Project) -> tuple[str, ...]:
 def _note_fonts(
     params: dict[str, ParamValue], specs: tuple[object, ...] | None, seen: dict[str, None]
 ) -> None:
+    """書体の欄の値を ``seen`` へ足す"""
     if specs is None:
         return
     for spec in specs:
@@ -259,10 +265,11 @@ def _map_params(
 
 
 def _map_effect(effect: Effect, files: Keyed, unknown: Keyed | None) -> Effect:
+    """エフェクトの欄を付け替える"""
     params = _map_params(
         effect.params,
         _specs_of(effect.kind, source=False),
-        f"effect:{effect.id}",
+        f"effect:{effect.kind}:{effect.id}",
         files,
         unknown,
     )
@@ -270,12 +277,16 @@ def _map_effect(effect: Effect, files: Keyed, unknown: Keyed | None) -> Effect:
 
 
 def _map_stroke(stroke: Stroke, files: Keyed, unknown: Keyed | None) -> Stroke:
-    params = _map_params(stroke.params, STROKE.parameters, f"stroke:{stroke.id}", files, unknown)
+    """縁取りの層と、そこに掛けたエフェクトの欄を付け替える"""
+    params = _map_params(
+        stroke.params, STROKE.parameters, f"stroke:{STROKE.kind}:{stroke.id}", files, unknown
+    )
     effects = tuple(_map_effect(effect, files, unknown) for effect in stroke.effects)
     return replace(stroke, params=params, effects=effects)
 
 
 def _map_clip(clip: Clip, files: Keyed, unknown: Keyed | None) -> Clip:
+    """クリップの生成物とエフェクトの欄を付け替える"""
     source = clip.source
     if source is not None:
         source = replace(
@@ -283,7 +294,7 @@ def _map_clip(clip: Clip, files: Keyed, unknown: Keyed | None) -> Clip:
             params=_map_params(
                 source.params,
                 _specs_of(source.kind, source=True),
-                f"source:{clip.id}",
+                f"source:{source.kind}:{clip.id}",
                 files,
                 unknown,
             ),
@@ -298,6 +309,7 @@ def _map_clip(clip: Clip, files: Keyed, unknown: Keyed | None) -> Clip:
 
 
 def _map_timeline(timeline: Timeline, files: Keyed, unknown: Keyed | None) -> Timeline:
+    """時間軸のトラックとクリップの欄を付け替える"""
     tracks = tuple(
         replace(
             track,
@@ -325,6 +337,7 @@ def map_paths(
     """
 
     def keyed(_where: str, value: str) -> str:
+        """欄の在りかを使わない呼び手の関数へつなぐ"""
         return files(value)
 
     return replace(
@@ -339,7 +352,9 @@ def map_paths(
 
 
 def file_fields(project: Project) -> tuple[str, ...]:
-    """ファイルを指す欄の在りか（``effect:<id>/欄`` など 値の入っている物だけ）
+    """ファイルを指す欄の在りか（``effect:<種類>:<id>/欄`` など 値の入っている物だけ）
+
+    種類も札に入れる 別の作品から貼った物などで id が重なっても、種類が違えば別の欄として扱う
 
     パッケージの目録に記す 開く PC にスクリプトが無いと、どの欄がファイルかを定義から
     読めない 記しておけば、その欄だけを展開した先へ付け替え、ほかの文字（``/字幕`` のような
@@ -348,6 +363,7 @@ def file_fields(project: Project) -> tuple[str, ...]:
     seen: dict[str, None] = {}
 
     def note(where: str, value: str) -> str:
+        """見つけた物を覚え、値はそのまま返す"""
         seen.setdefault(where, None)
         return value
 
@@ -371,6 +387,7 @@ def folder_kinds(project: Project) -> tuple[str, ...]:
     seen: dict[str, None] = {}
 
     def check(kind: str, params: dict[str, ParamValue], specs: tuple[object, ...] | None) -> None:
+        """フォルダの欄に値があれば、その種類を覚える"""
         for spec in specs or ():
             if isinstance(spec, FileSpec) and spec.directory:
                 value = params.get(spec.name)

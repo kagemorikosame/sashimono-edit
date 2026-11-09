@@ -285,6 +285,34 @@ class TestCut:
         assert cut_media(source, target, [Span(Fraction(2), Fraction(3))], muxer="mp4")
         assert probe_media(target).audio_streams[0].channels == 6
 
+    def test_a_missing_lfe_is_noticed(self, tmp_path: Path) -> None:
+        """LFE だけが違う 2 本は、2 つへ混ぜると同じに見える 道のチャンネルのまま比べれば違う"""
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg が無いので素材を作れない")
+        paths = []
+        for name, lfe in (("with.wav", "c0"), ("without.wav", "0*c0")):
+            path = tmp_path / name
+            _ffmpeg("-f", "lavfi", "-i", "sine=frequency=60:duration=2", "-filter_complex",
+                    f"pan=5.1|FL=c0|FR=c0|FC=c0|LFE={lfe}|BL=c0|BR=c0", str(path))  # fmt: skip
+            paths.append(path)
+        stream = probe_media(paths[0]).audio_streams[0]
+        span = [Span(Fraction(0), Fraction(1))]
+        assert remux._same_sound(paths[0], paths[0], stream.index, stream.sample_rate, 6, span,
+                                 lambda: False)  # fmt: skip
+        assert not remux._same_sound(paths[0], paths[1], stream.index, stream.sample_rate, 6,
+                                     span, lambda: False)  # fmt: skip
+
+    def test_unreadable_pictures_are_not_trusted(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """両方とも絵が読めないと、どちらも無いので同じに見える 確かめられないとする"""
+        monkeypatch.setattr(VideoDecoder, "decode_error", property(lambda _self: "壊れた"))
+        target = tmp_path / "broken-picture.mp4"
+        assert not cut_media(
+            _video(media_dir), target, [Span(Fraction(2), Fraction(3))], muxer="mp4"
+        )
+        assert not target.exists()
+
     def test_unreadable_sound_is_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -427,12 +455,19 @@ class TestRoundTrip:
             clips[0]["effects"][0]["params"]["image_file"] = r"\\attacker\share\x.png"
             clips[0]["source"] = {
                 "kind": "aviutl:無い/無い.anm:無い",
-                "params": {"f": "files/0002.png", "g": "//attacker/y", "t": "/字幕"},
+                "params": {
+                    "f": "files/0002.png",
+                    "g": "C:/Users/秘密/y.png",
+                    "u": r"\\attacker\z",
+                    "n": "files/0001.png",
+                    "t": "/字幕",
+                },
             }
             # 書き出した側が g をファイルの欄と記した（スクリプトの無い PC でも付け替える）
+            # u は記さずに共有のフォルダを指させる（細工したパッケージ）
             fields = manifest["file_fields"]
             assert isinstance(fields, list)
-            fields.append(f"source:{clips[0]['id']}/g")
+            fields.append(f"source:aviutl:無い/無い.anm:無い:{clips[0]['id']}/g")
 
         _rewrite(package, point_outside)
         opened = open_package(package, tmp_path / "opened")
@@ -441,8 +476,10 @@ class TestRoundTrip:
         assert isinstance(image, str) and Path(image).is_relative_to(opened.folder)
         assert clip.source is not None
         assert "attacker" not in str(clip.source)
-        # ファイルの欄と記していない文字は、場所に見えても文のまま残す
+        assert Path(str(clip.source.params["g"])) == opened.folder / "missing" / "y.png"
+        # ファイルの欄と記していない文字は、場所に見えても、中の名前と同じでも文のまま残す
         assert clip.source.params["t"] == "/字幕"
+        assert clip.source.params["n"] == "files/0001.png"
 
     def test_a_folder_field_stops_the_export(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -464,7 +501,7 @@ class TestRoundTrip:
         assert not package.exists()
 
     def test_a_file_for_a_missing_script_is_moved_too(
-        self, media_dir: Path, tmp_path: Path
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """開く PC にスクリプトが無くても、入れたファイルを指す欄は展開した先へ付け替える
         付け替えないと、後でスクリプトを入れても画像が見つからない"""
@@ -473,13 +510,15 @@ class TestRoundTrip:
         clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(blend,))
         package = tmp_path / f"p{PACKAGE_SUFFIX}"
         write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
-
-        def make_unknown(_manifest: dict[str, object], project: dict[str, object]) -> None:
-            effect = project["timeline"]["tracks"][0]["clips"][0]["effects"][0]  # type: ignore[index]
-            effect["kind"] = "aviutl:無い/無い.anm:無い"
-
-        _rewrite(package, make_unknown)
+        # 開く PC には定義が無い（スクリプトを入れていない）
+        real = plan._specs_of
+        monkeypatch.setattr(
+            plan,
+            "_specs_of",
+            lambda kind, *, source: None if kind == "image_blend" else real(kind, source=source),
+        )
         opened = open_package(package, tmp_path / "opened")
+        monkeypatch.undo()
         params = load_project(opened.project_path).timeline.tracks[0].clips[0].effects[0].params
         assert Path(str(params["image_file"])) == opened.folder / "files" / "0001.png"
 
@@ -714,11 +753,14 @@ class TestScrub:
         comment = b"NAME-SECRET"
         xmp = b"http://ns.adobe.com/xap/1.0/\x00PLACE-SECRET"
         dht = b"\xff\xc4" + struct.pack(">H", 3) + b"\x00"
+        # Adobe の APP14 は色の並びの印 走査の間にあっても、落とすと色が変わる
+        adobe = b"\xff\xee" + struct.pack(">H", 14) + b"Adobe\x00\x64\x00\x00\x00\x00\x01"
         scans = (
             b"\xff\xda\x00\x02SCAN1\xff\x00a"
             + b"\xff\xfe" + struct.pack(">H", len(comment) + 2) + comment
             + b"\xff\xe1" + struct.pack(">H", len(xmp) + 2) + xmp
             + dht
+            + adobe
             + b"\xff\xda\x00\x02SCAN2\xff\xd0b"
             + b"\xff\xd9"
         )  # fmt: skip
@@ -726,7 +768,7 @@ class TestScrub:
         assert cleaned is not None
         for secret in (b"NAME-SECRET", b"PLACE-SECRET", b"TRAILER-SECRET", b"GPS-SECRET-PLACE"):
             assert secret not in cleaned
-        assert b"SCAN1\xff\x00a" in cleaned and dht in cleaned
+        assert b"SCAN1\xff\x00a" in cleaned and dht in cleaned and adobe in cleaned
         assert cleaned.endswith(b"SCAN2\xff\xd0b\xff\xd9")
 
     def test_a_jpeg_without_its_end_is_left_alone(self) -> None:

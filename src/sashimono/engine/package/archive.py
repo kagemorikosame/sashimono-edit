@@ -184,6 +184,7 @@ class _Entry:
 
 
 def _media_name(number: int, source: Path, suffix: str | None = None) -> str:
+    """中の素材の名前（番号と拡張子だけ 元のフォルダと名前は入れない）"""
     extension = suffix if suffix is not None else source.suffix.lower()
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", extension):
         extension = ""
@@ -191,6 +192,7 @@ def _media_name(number: int, source: Path, suffix: str | None = None) -> str:
 
 
 def _file_name(number: int, source: Path) -> str:
+    """設定が指すファイルの中の名前（番号と拡張子だけ）"""
     extension = source.suffix.lower()
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", extension):
         extension = ""
@@ -207,6 +209,7 @@ def _estimate(item: MediaItem, spans: list[Span] | None, size: int) -> int:
 
 
 def _free_space(folder: Path) -> int:
+    """``folder`` のあるディスクの空き（バイト） 試験で差し替える"""
     probe = folder
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
@@ -214,6 +217,7 @@ def _free_space(folder: Path) -> int:
 
 
 def _require_space(folder: Path, needed: int, what: str) -> None:
+    """空きが ``size`` より少なければ、書く前に断る"""
     free = _free_space(folder)
     wanted = int(needed * _SPACE_RATIO) + _SPACE_EXTRA
     if free < wanted:
@@ -224,6 +228,7 @@ def _require_space(folder: Path, needed: int, what: str) -> None:
 
 
 def _megabytes(size: int) -> str:
+    """大きさを人が読む形にする（知らせの文に使う）"""
     if size >= 1 << 30:
         return f"{size / (1 << 30):.1f} GB"
     return f"{size / (1 << 20):.0f} MB"
@@ -316,6 +321,7 @@ def write_package(
         _require_space(scratch, largest, "作業用のフォルダ（アプリのキャッシュ）")
 
     def missing_name(value: str) -> str:
+        """設定が指すファイルの中の名前 入れなかった物は名前だけ"""
         # 見つからないファイルは場所を捨てて名前だけにする 元のフォルダ（ユーザー名が入る）を
         # 人へ渡すパッケージに残さないため 開いた先でも見つからないのは元の PC と同じ
         return file_names.get(value, Path(value).name)
@@ -325,6 +331,7 @@ def write_package(
     done = 0
 
     def fill(handle: BinaryIO) -> None:
+        """パッケージの中身を書く（書き終えるまで前のファイルは無傷）"""
         nonlocal done
         with zipfile.ZipFile(
             handle, "w", compression=zipfile.ZIP_STORED, allowZip64=True
@@ -405,6 +412,12 @@ def _safe_file_name(value: str) -> str:
     return re.sub(r'[<>:"|?*\x00-\x1f]', "_", last).strip(" .") or "ファイル"
 
 
+def _network_place(value: str) -> bool:
+    """共有のフォルダ（UNC）を指す文字か 開くと別の機械へつなぐ"""
+    head = value.strip()[:2]
+    return len(head) == 2 and all(char in "/\\" for char in head)
+
+
 def _unused_place(item: MediaItem) -> Path:
     """使っていない素材の場所 元のフォルダ（ユーザー名が入る）は捨てて名前だけ残す"""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(item.path).name).strip(" .") or "素材"
@@ -482,6 +495,7 @@ def _put_cut(
 
 
 def _put_bytes(zipped: zipfile.ZipFile, entry: _Entry, data: bytes) -> None:
+    """中身をそのまま入れ、大きさと SHA-256 を記す"""
     entry.size = len(data)
     entry.sha256 = hashlib.sha256(data).hexdigest()
     zipped.writestr(entry.name, data)
@@ -494,6 +508,7 @@ def _put_stream(
     size: int,
     cancelled: Callable[[], bool],
 ) -> None:
+    """ファイルを少しずつ写して入れ、大きさと SHA-256 を記す（大きな素材を丸ごと読まない）"""
     digest = hashlib.sha256()
     written = 0
     info = zipfile.ZipInfo(entry.name)
@@ -512,6 +527,7 @@ def _put_stream(
 def _manifest(
     project: Project, entries: list[_Entry], project_entry: _Entry, found: Usage
 ) -> dict[str, Any]:
+    """目録（``manifest.json``）の中身"""
     return {
         "format": PACKAGE_FORMAT,
         "version": PACKAGE_VERSION,
@@ -561,12 +577,15 @@ def _manifest(
 
 @dataclass(frozen=True, slots=True)
 class _Listed:
+    """目録に書かれた中身 1 つ（場所・大きさ・SHA-256）"""
+
     path: str
     size: int
     sha256: str
 
 
 def _read_manifest(zipped: zipfile.ZipFile) -> dict[str, Any]:
+    """目録を読み、形と版を確かめる 読めなければ断る"""
     try:
         raw = zipped.read(MANIFEST)
         manifest = json.loads(raw.decode("utf-8"))
@@ -590,6 +609,7 @@ def _read_manifest(zipped: zipfile.ZipFile) -> dict[str, Any]:
 
 
 def _listed(raw: object, *, project: bool = False) -> _Listed:
+    """目録の 1 項目を形で照らして読む 展開先の外を指す名前は断る"""
     if not isinstance(raw, dict):
         raise PackageError("パッケージの目録が壊れています（項目）")
     path, size, sha256 = raw.get("path"), raw.get("size"), raw.get("sha256")
@@ -607,11 +627,13 @@ def _listed(raw: object, *, project: bool = False) -> _Listed:
 
 
 def _safe_folder_name(name: str) -> str:
+    """作品の名前から、フォルダの名前に使える物を作る"""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return cleaned[:60] or "作品"
 
 
 def _unique_folder(root: Path, name: str) -> Path:
+    """``root`` の下の、まだ無いフォルダの場所（同じ名前なら番号を付ける）"""
     candidate = root / name
     number = 2
     while candidate.exists():
@@ -663,7 +685,8 @@ def open_package(
         # 失敗し、開き直すたびにフォルダが増える（#449 の CodeRabbit の指摘）
         fonts = _names_list(manifest, "fonts")
         scripts = _names_list(manifest, "scripts")
-        fields = set(_names_list(manifest, "file_fields"))
+        # 記していない古い形のパッケージは None（名前が同じ文字だけを付け替える）
+        fields = set(_names_list(manifest, "file_fields")) if "file_fields" in manifest else None
         total = sum(item.size for item in listed) + project_listed.size
         root.mkdir(parents=True, exist_ok=True)
         _require_space(root, total, "展開先")
@@ -704,6 +727,7 @@ def open_package(
 
 
 def _names_list(manifest: dict[str, Any], key: str) -> tuple[str, ...]:
+    """目録の名前の一覧（書体・スクリプト・欄）を形で照らして読む"""
     raw = manifest.get(key, [])
     if not isinstance(raw, list) or not all(isinstance(value, str) for value in raw):
         raise PackageError(f"パッケージの目録が壊れています（{key}）")
@@ -711,6 +735,7 @@ def _names_list(manifest: dict[str, Any], key: str) -> tuple[str, ...]:
 
 
 def _verified_bytes(zipped: zipfile.ZipFile, item: _Listed) -> bytes:
+    """中身を読み、大きさと SHA-256 を目録と照らす"""
     try:
         data = zipped.read(item.path)
     except (zipfile.BadZipFile, OSError) as exc:
@@ -723,6 +748,7 @@ def _verified_bytes(zipped: zipfile.ZipFile, item: _Listed) -> bytes:
 def _extract(
     zipped: zipfile.ZipFile, item: _Listed, destination: Path, cancelled: Callable[[], bool]
 ) -> None:
+    """中身を 1 つ取り出しながら SHA-256 を照らす 違えば断る"""
     digest = hashlib.sha256()
     written = 0
     try:
@@ -743,7 +769,11 @@ def _extract(
 
 
 def _relocated(
-    project_bytes: bytes, folder: Path, names: set[str], name: str, fields: set[str]
+    project_bytes: bytes,
+    folder: Path,
+    names: set[str],
+    name: str,
+    fields: set[str] | None,
 ) -> Project:
     """中の相対の場所を、展開した先の場所へ付け替えた作品"""
     try:
@@ -756,6 +786,7 @@ def _relocated(
             raise PackageError(f"作品が指す素材がパッケージに入っていません: {item.display_name}")
 
     def file(value: str) -> str:
+        """ファイルの欄の値を、展開した先の場所へ付け替える"""
         # 目録に無い場所は、パッケージの外を指す 細工したパッケージが共有のフォルダ（UNC）を
         # 指させると、描くたびにその機械へつなぎ、Windows の認証を試みる 展開した先の無い場所へ
         # 置き換え、外へ読みに行かせない（#449 の CodeRabbit の指摘）
@@ -764,15 +795,22 @@ def _relocated(
         return str(folder / MISSING_FOLDER / _safe_file_name(value))
 
     def unknown(where: str, value: str) -> str:
+        """この PC に無いスクリプトの欄の値を付け替える"""
         # この PC に無いスクリプトの欄 書き出した側が記したファイルの欄（fields）は、ファイルの
         # 欄と同じに付け替える（後でスクリプトを入れても画像が見つかり、外も指さない）
         # 記していない欄は文字の欄なので触らない 場所に見えるだけの文（/字幕 など）を書き換えると、
         # スクリプトを入れた後の出力が変わる（#449 の CodeRabbit の指摘）
-        # 記していない古いパッケージのため、中の名前と同じ文字だけは付け替える
-        if where in fields:
+        # 名前が同じ文字だけを付け替えるのは、記していない古いパッケージのときだけ 記した物で
+        # これをすると、たまたま中の名前と同じ文の欄まで書き換わる（#449 の CodeRabbit の指摘）
+        # 共有のフォルダ（UNC）を指す文字は、記していなくても外を指さない場所へ置き換える
+        # 細工したパッケージが欄を記さずに置くと、後でスクリプトを入れたときに描くたびその機械へ
+        # つなぎ、Windows の認証を試みる 文として // や \\ で始まる物はまず無い
+        if fields is not None and where in fields:
             return file(value)
-        if value in names:
+        if fields is None and value in names:
             return str(folder / value)
+        if _network_place(value):
+            return str(folder / MISSING_FOLDER / _safe_file_name(value))
         return value
 
     relocated = map_paths(

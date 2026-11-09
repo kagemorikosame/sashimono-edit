@@ -84,6 +84,7 @@ def _segments(data: bytes) -> list[tuple[int, bytes]] | None:
 
 
 def _scrub_jpeg(data: bytes) -> bytes | None:
+    """JPEG から付け足しの情報を落とし、向きだけを残す"""
     if not data.startswith(_SOI):
         return None
     segments = _segments(data)
@@ -116,6 +117,7 @@ def _scrub_jpeg(data: bytes) -> bytes | None:
 
 
 def _is_mpf(marker: int, segment: bytes) -> bool:
+    """後ろに付けた別の絵の目次（MPF の APP2）か"""
     return marker == 0xE2 and segment[4:].startswith(_MPF)
 
 
@@ -148,7 +150,10 @@ def _scrub_scans(tail: bytes) -> bytes | None:
         segment = tail[position : position + 2 + length]
         if len(segment) < 2 + length:
             return None
-        dropped = (0xE0 <= marker <= 0xEF) or marker == _COM
+        # Adobe の APP14 は色の並び（YCC か RGB か）の印で、走査の間に置かれても絵の色を決める
+        # 落とすと色が変わるので残す 中身が Adobe の物だけを見分ける（#449 の CodeRabbit の指摘）
+        adobe = marker == 0xEE and segment[4:].startswith(b"Adobe")
+        dropped = ((0xE0 <= marker <= 0xEF) and not adobe) or marker == _COM
         if not dropped:
             out += segment
         position += 2 + length
@@ -205,6 +210,7 @@ def _orientation_segment(orientation: int | None) -> bytes:
 
 
 def _scrub_png(data: bytes) -> bytes | None:
+    """PNG から文字の塊と時刻と EXIF を落とす"""
     if not data.startswith(_PNG_HEAD):
         return None
     out = bytearray(_PNG_HEAD)

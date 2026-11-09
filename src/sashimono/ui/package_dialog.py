@@ -78,9 +78,11 @@ class PackageFolderField(QWidget):
         layout.addWidget(reset)
 
     def folder(self) -> str:
+        """選んだ場所 空は既定の場所"""
         return self.line.text().strip()
 
     def _choose(self) -> None:
+        """場所を選ぶ窓を出す"""
         start = self.line.text() or str(state_root())
         chosen = QFileDialog.getExistingDirectory(self, "持ち出し用パッケージを開く場所", start)
         if chosen:
@@ -148,6 +150,7 @@ class PackageExportDialog(QDialog):
         layout.addWidget(buttons)
 
     def target(self) -> Path:
+        """書き出し先 拡張子が .smex でなければ足す"""
         path = Path(self._path.text().strip())
         return (
             path
@@ -156,6 +159,7 @@ class PackageExportDialog(QDialog):
         )
 
     def options(self) -> PackOptions:
+        """窓で選んだ書き出し方"""
         return PackOptions(
             whole=self._whole.isChecked(),
             margin=Fraction(self._margin.value()),
@@ -174,6 +178,7 @@ class PackageExportDialog(QDialog):
         )
 
     def _choose(self) -> None:
+        """場所を選ぶ窓を出す"""
         chosen, _ = QFileDialog.getSaveFileName(
             self,
             "持ち出し用パッケージの書き出し先",
@@ -184,6 +189,7 @@ class PackageExportDialog(QDialog):
             self._path.setText(str(Path(chosen)))
 
     def _accept(self) -> None:
+        """書き出し先を確かめてから閉じる"""
         text = self._path.text().strip()
         if not text or not Path(text).is_absolute():
             QMessageBox.warning(self, "書き出せない", "書き出し先を選んでください")
@@ -209,6 +215,7 @@ def missing_scripts(scripts: tuple[str, ...]) -> list[str]:
 
 
 def _listed(title: str, names: list[str] | tuple[str, ...]) -> str:
+    """名前の一覧を知らせの文の 1 段にする 空なら空"""
     if not names:
         return ""
     shown = "、".join(names[:20])

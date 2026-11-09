@@ -27,6 +27,8 @@ Work = Callable[[Callable[[float, str], None], Callable[[], bool]], object]
 
 
 class _Worker(QObject):
+    """裏のスレッドで仕事を 1 つ回し、進み具合と終わりを知らせる"""
+
     progressed = Signal(float, str)
     finished = Signal(object)
     failed = Signal(str)
@@ -38,9 +40,11 @@ class _Worker(QObject):
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
+        """止めるよう頼む"""
         self._cancel.set()
 
     def run(self) -> None:
+        """仕事を回し、終わり方に合わせて知らせる"""
         try:
             result = self._work(self.progressed.emit, self._cancel.is_set)
         except Cancelled:
@@ -108,6 +112,7 @@ class PackageJob(QObject):
         return self._idle.wait(seconds)
 
     def start(self, kind: str, path: Path, work: Work, *, by_assistant: bool = False) -> None:
+        """仕事を裏で始める 走っていれば断る"""
         if self.running:
             raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
         self._state = PACKAGE_RUNNING
@@ -154,6 +159,7 @@ class PackageJob(QObject):
         self._idle.set()
 
     def progress_text(self) -> tuple[str, float]:
+        """ステータスバーへ出す文と進み具合"""
         verb = "持ち出し用に書き出し中" if self._kind == "export" else "パッケージを展開中"
         return f"{verb}: {self._text}" if self._text else verb, self._progress
 
@@ -188,21 +194,26 @@ class PackageJob(QObject):
         self.changed.emit()
 
     def _on_progress(self, value: float, text: str) -> None:
+        """進み具合を覚えて知らせる"""
         self._progress = value
         self._text = text
         self.changed.emit()
 
     def _on_finished(self, result: object) -> None:
+        """書き終えた・開き終えた"""
         self.result = result
         self._finish("done", "終わりました", result)
 
     def _on_failed(self, message: str) -> None:
+        """失敗した"""
         self._finish("failed", message, None)
 
     def _on_cancelled(self) -> None:
+        """止めた"""
         self._finish("cancelled", "止めました 書き出し先と開いている作品は前のままです", None)
 
     def _finish(self, state: str, message: str, result: object) -> None:
+        """終わりの扱いをまとめる"""
         self._state = state
         self._message = message
         self._ended = time.monotonic()

@@ -72,6 +72,7 @@ class Span:
     end: Fraction
 
     def __post_init__(self) -> None:
+        """終わりが頭より前の区間を断る"""
         if self.end < self.start:
             raise ValueError(f"区間の終わりが頭より前: {self.start} - {self.end}")
 
@@ -141,6 +142,7 @@ def _seconds(packet: av.Packet[Any]) -> Fraction | None:
 
 
 def _decode_seconds(packet: av.Packet[Any]) -> Fraction | None:
+    """パケットの解く順の時刻（秒） 分からなければ ``None``"""
     stamp = packet.dts if packet.dts is not None else packet.pts
     if stamp is None or packet.time_base is None:
         return None
@@ -199,6 +201,7 @@ def _write(
     keep_metadata: bool,
     cancelled: Callable[[], bool],
 ) -> bool:
+    """使う区間のパケットを写して書く 書けなければ偽"""
     with av.open(str(source)) as reader:
         kept = _kept_streams(reader)
         if kept is None:
@@ -232,6 +235,7 @@ def _write(
             picture_indices = {stream.index for stream in video}
 
             def put(packet: av.Packet[Any]) -> None:
+                """パケットを 1 つ書く 同じ時刻の物は 2 度書かない"""
                 index = packet.stream.index
                 stamp = packet.pts if packet.pts is not None else packet.dts
                 if stamp is None or stamp in written[index]:
@@ -412,13 +416,24 @@ _SOUND_TOLERANCE = 1e-4
 def _same_pictures(
     source: Path, target: Path, index: int, spans: list[Span], cancelled: Callable[[], bool]
 ) -> bool:
-    with VideoDecoder(source, index) as original, VideoDecoder(target, index) as copied:
+    """区間の頭の絵が画素ごとに同じか 読めなかった所があれば、確かめられなかったとして偽"""
+    # 読み手にも止める頼みを渡す 区間の頭はキーフレームから読み進めるので、長い GOP の
+    # 高い解像度では 1 枚に時間が掛かり、窓を閉じても待たされる（#449 の CodeRabbit の指摘）
+    with (
+        VideoDecoder(source, index, should_stop=cancelled) as original,
+        VideoDecoder(target, index, should_stop=cancelled) as copied,
+    ):
         for span in spans:
             if cancelled():
                 raise Cancelled
             moment = max(Fraction(0), span.start)
             old_frame = original.frame_at(moment)
             new_frame = copied.frame_at(moment)
+            if cancelled():
+                raise Cancelled
+            # 両方とも読めずに絵が無いと同じに見える 音と同じく、読めなかったら切り出さない
+            if original.decode_error is not None or copied.decode_error is not None:
+                return False
             if old_frame is None and new_frame is None:
                 continue
             if old_frame is None or new_frame is None:
@@ -441,6 +456,7 @@ def _same_sound(
     spans: list[Span],
     cancelled: Callable[[], bool],
 ) -> bool:
+    """区間の頭の音が素材のチャンネルのまま同じか 読めなかった所があれば偽"""
     # チャンネルは素材のまま全部比べる 2 つへ混ぜて比べると、5.1 の LFE（混ぜると消える）の
     # 欠けを見落とす 比べられない数なら確かめられないので切り出さない（#449 の CodeRabbit の指摘）
     if channels not in _SOUND_CHANNELS:
