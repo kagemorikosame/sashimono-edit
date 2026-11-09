@@ -110,7 +110,12 @@ def _timelines(project: Project) -> Iterator[Timeline]:
         if depth >= _MAX_SCENE_DEPTH:
             continue
         for clip in _drawn(project, timeline):
-            if clip.scene_id is None or reached.get(clip.scene_id, _MAX_SCENE_DEPTH + 1) <= depth:
+            # 同じ深さで着いたのもたどり直さない 同じシーンを各段に 2 つ置くと、16 段で 13 万回
+            # たどって、書き出しの窓の枠を埋める（PR #451 の CodeRabbit の指摘）
+            if (
+                clip.scene_id is None
+                or reached.get(clip.scene_id, _MAX_SCENE_DEPTH + 1) <= depth + 1
+            ):
                 continue
             reached[clip.scene_id] = depth + 1
             scene = project.find_scene(clip.scene_id)
@@ -194,7 +199,10 @@ def matched_bitrate_mbps(
             continue
         whole = size * 8
         video = whole - _audio_bits(media)
-        bits = (video if video > 0 else whole) / float(media.duration)
+        # 映像の道の長さで割る 音の方が長い素材を入れ物の長さで割ると、映像の量を低く見積もる
+        end = stream.end_time
+        seconds = float(end) if end is not None and end > 0 else float(media.duration)
+        bits = (video if video > 0 else whole) / seconds
         scaled = bits * out_rate / pixels
         best = scaled if best is None else max(best, scaled)
     if best is None:

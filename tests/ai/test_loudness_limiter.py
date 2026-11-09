@@ -295,6 +295,58 @@ class TestNormalize:
         assert result["gain_db"] == 0.0
         assert result["reached"] is False
 
+    def test_a_quiet_clip_with_a_low_limiter_does_not_lower_the_rest(self, work: _Work) -> None:
+        """静かな声の -20 dBFS のリミッターで、山を出す BGM ごと全体を下げない（CodeRabbit）
+
+        壊れると、上げたい作品の音量を -18 dB 下げる 測った山は混ぜた音の物で、声の山ではない
+        """
+        effect = registry.require(LIMITER_KIND).create(ceiling=-20.0)
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
+        _run(work)
+        _measured(work.host, -18.0, -1.0)
+        result = _run(work)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is False
+        assert result["limited_by"] == ["peak"]
+
+    def test_lowering_through_an_old_limiter_is_not_promised(self, work: _Work) -> None:
+        """抑えていたリミッターの前で下げると、抑えていた分が戻って掛けた量ほどは下がらない
+
+        壊れると、基準より大きいまま「届いた」と答えて書き出す
+        """
+        effect = registry.require(LIMITER_KIND).create()
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
+        _run(work)
+        _measured(work.host, -10.0, -1.0)
+        result = _run(work)
+        assert result["gain_db"] == pytest.approx(-4.0)
+        assert result["reached"] is None
+        assert result["expected_lufs"] is None
+        assert result["loudness_rechecked"] is False
+        assert "loudness" in result["note"]
+
+    def test_a_misplaced_old_limiter_is_put_back_at_the_end(self, work: _Work) -> None:
+        """読み込んだファイルで音量の欄より前にある切ったリミッターを、そのまま入れ直さない
+
+        壊れると、上げた音量の山がリミッターの後で上限を越える
+        """
+        effect = registry.require(LIMITER_KIND).create()
+        work.host.apply_commands(
+            [
+                AddEffect(work.voice.id, effect, index=0),
+                SetEffectEnabled(work.voice.id, effect.id, False),
+            ],
+            "前の並びのリミッター",
+        )
+        _run(work)
+        _measured(work.host, -18.0, -1.0)
+        _run(work)
+        clip = work.clip(work.voice.id)
+        limiters = [e for e in clip.effects if e.kind == LIMITER_KIND]
+        assert len(limiters) == 1
+        assert clip.effects[-1] is limiters[0]
+        assert limiters[0].enabled
+
     def test_switched_off_keeps_the_old_way(self, work: _Work) -> None:
         """設定で切った人の作品に、黙ってリミッターを積まない"""
         work.host.limiter = False

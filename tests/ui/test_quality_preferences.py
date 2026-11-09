@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -152,12 +154,24 @@ def test_a_new_scene_starts_from_the_cap(
         dialog._set_bitrate(5)
         dialog._match_bitrate(project)
         assert dialog._bitrate.value() == 30
-        # 計算の枠が埋まっていても、上限で出してスレッドを増やさない
-        taken = [export_dialog._BITRATE_SLOTS.acquire(blocking=False) for _ in range(2)]
+        # 計算の枠が埋まっていても、上限で出してスレッドを増やさない 前の計算が枠を返すのを
+        # 待ってから 2 つとも取る（取れなかった枠があると、枠を消しても通る）
+        taken = [export_dialog._BITRATE_SLOTS.acquire(timeout=5) for _ in range(2)]
+        started: list[str] = []
+
+        def counted(*_args: object, **kwargs: object) -> threading.Thread:
+            started.append(str(kwargs.get("name")))
+            return threading.Thread(target=lambda: None)
+
+        monkeypatch.setattr(
+            export_dialog, "threading", SimpleNamespace(Thread=counted, Event=threading.Event)
+        )
         try:
+            assert taken == [True, True]
             dialog._set_bitrate(5)
             dialog._match_bitrate(project)
             assert dialog._bitrate.value() == 30
+            assert started == []
         finally:
             for held in taken:
                 if held:

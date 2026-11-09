@@ -37,6 +37,12 @@ from sashimono.engine.encode import export_project as run_export
 
 __all__ = ["AssistantExport", "scratch_folder"]
 
+#: 素材に合わせたビットレートを求める裏の処理を同時に走らせる数 応えない共有で止まった処理は
+#: 中止しても残るので、数を絞らないと書き出すたびに止まったスレッドが増える
+_ESTIMATE_SLOTS = threading.BoundedSemaphore(2)
+#: 求めている間に中止を見る間隔（秒）
+_ESTIMATE_POLL = 0.05
+
 
 def scratch_folder() -> Path:
     """書き出しの仮のファイルを置く所 アプリ自身のキャッシュの中
@@ -111,22 +117,45 @@ class _Worker(QObject):
             with contextlib.suppress(OSError):
                 scratch.unlink(missing_ok=True)
 
-    def _matched(self, settings: ExportSettings) -> ExportSettings:
-        """素材に合わせたビットレートにした設定 求められなければ上限のまま（書き出しは止めない）"""
+    def _matched(self, settings: ExportSettings) -> ExportSettings | None:
+        """素材に合わせたビットレートにした設定 求められなければ上限のまま（書き出しは止めない）
+
+        求めるのはさらに別のスレッド ファイルの大きさを読むので、応えない共有の素材で止まると
+        中止しても書き出しが「書いている」のまま終わらない 待つ間も中止を見て、頼まれたら結果を
+        待たずに ``None``（中止）を返す 止まった処理が枠を埋めていれば、待たずに上限で書く
+        """
         cap = settings.video_bitrate
         if not self._match_bitrate or not cap:
             return settings
-        choice = BitrateChoice(auto=True, mbps=cap // 1_000_000)
-        try:
-            mbps = choice.for_project(self._project)
-        except (OSError, ValueError):
+        if not _ESTIMATE_SLOTS.acquire(blocking=False):
             return settings
-        return replace(settings, video_bitrate=mbps * 1_000_000)
+        choice = BitrateChoice(auto=True, mbps=cap // 1_000_000)
+        found: list[int] = []
+
+        def work() -> None:
+            try:
+                found.append(choice.for_project(self._project))
+            except (OSError, ValueError):
+                pass
+            finally:
+                _ESTIMATE_SLOTS.release()
+
+        thread = threading.Thread(target=work, name="export-bitrate", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._cancel.wait(_ESTIMATE_POLL):
+                return None
+        if not found:
+            return settings
+        return replace(settings, video_bitrate=found[0] * 1_000_000)
 
     def _export(self, scratch: Path) -> None:
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
         settings = self._matched(self._settings)
+        if settings is None:
+            self.cancelled.emit()
+            return
         try:
             run_export(
                 self._project,

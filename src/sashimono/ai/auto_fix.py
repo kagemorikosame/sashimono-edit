@@ -23,6 +23,7 @@ from sashimono.core.commands import (
     AddEffect,
     Command,
     ParamPath,
+    RemoveEffect,
     SetEffectEnabled,
     SetParam,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "NoiseFix",
     "NoiseRequest",
     "can_auto_color",
+    "clips_overlap",
     "has_limiter",
     "limited_ceiling",
     "limited_peak",
@@ -77,6 +79,21 @@ __all__ = [
 def has_limiter(clip: Clip) -> bool:
     """リミッターが効いているクリップか（#414）"""
     return any(effect.kind == LIMITER_KIND and effect.enabled for effect in clip.effects)
+
+
+def clips_overlap(clips: Sequence[Clip]) -> bool:
+    """同じ時刻に 2 本以上が鳴るか（トラックをまたいで見る）
+
+    リミッターはクリップごとに掛かるので、重なって鳴る音の和は上限を越えうる AI の道具と
+    人の〔音量を基準にそろえる…〕が同じここで見て、確かめ直すよう伝える
+    """
+    spans = sorted((clip.timeline_start, clip.timeline_end) for clip in clips)
+    reach = None
+    for begin, finish in spans:
+        if reach is not None and begin < reach:
+            return True
+        reach = finish if reach is None else max(reach, finish)
+    return False
 
 
 #: 補間の行き過ぎ（back・elastic）を拾うため、キーフレームの間を何点で見るか 上限の山と谷は
@@ -128,7 +145,10 @@ def _lowest_ceiling(effect: Effect) -> float:
 
 
 def limited_ceiling(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:
-    """音量をそろえるときの山の天井 ``ceiling`` と、効いているリミッターが書き出しで止める所の低い方
+    """``ceiling`` と、効いているリミッターが書き出しで止める所の低い方 上げる量の上限に使う
+
+    :func:`~sashimono.core.mixing.loudness_gain` の ``raise_ceiling`` へ渡す 上げる量だけを
+    止め、下げる理由にはしない
 
     音量の欄はリミッターの前に掛かる 上限より上へ上げた分はリミッターが潰すので、測った音量より
     上がらないのに基準に届いたと答える（PR #451 の CodeRabbit の指摘） 測った山はトラックの音量の
@@ -185,6 +205,13 @@ def limiter_commands(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> l
                 f"{clip.id} のリミッターは上限をキーフレームで動かしています 置き換えると動きが"
                 "消えるので触りません limiter を false にして呼び直すか、設定パネルで直してください"
             )
+        if found is not clip.effects[-1]:
+            # 読み込んだファイルでは、無効のリミッターが音量の欄やほかの音のエフェクトより前に
+            # あることがある そのまま有効にすると、後で上げた音量の山を抑えない 末尾へ積み直す
+            # （固定の欄はまたいで動かせないので、動かすのでなく外して足す）
+            effect = registry.require(LIMITER_KIND).create(ceiling=local)
+            commands += [RemoveEffect(clip.id, found.id), AddEffect(clip.id, effect)]
+            continue
         path = ParamPath.of_effect(clip.id, found.id, "ceiling")
         commands.append(SetParam(path, AnimatedValue(static=local)))
         if not found.enabled:

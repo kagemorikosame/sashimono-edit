@@ -32,6 +32,7 @@ import numpy as np
 from sashimono.ai.auto_fix import (
     ColorRequest,
     NoiseRequest,
+    clips_overlap,
     has_limiter,
     limited_ceiling,
     limited_peak,
@@ -7043,8 +7044,9 @@ def _apply_loudness(
         measured=measured,
         peak_db=report.peak_db,
         target=request.limits.loudness_target,
-        ceiling=cap,
+        ceiling=ceiling,
         squeeze=squeeze,
+        raise_ceiling=cap if cap < ceiling else None,
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
@@ -7092,8 +7094,20 @@ def _apply_loudness(
         if moved
         else ["音量は基準に合っているので変えていません"]
     )
+    if moved and any(has_limiter(clip) for clip in clips):
+        # 前に積んだリミッターを通る音は、掛けた dB どおりには動かない 下げると抑えていた分が
+        # 戻り、上げるとクリップの山が上限に当たって潰れる 測る前の値から届いたと言い切らない
+        result |= {
+            "reached": None if reached else False,
+            "expected_lufs": None,
+            "loudness_rechecked": False,
+        }
+        notes.append(
+            "前に積んだリミッターを通る音なので、音量は掛けた量どおりには動きません"
+            " 基準に届いたかは check_output の loudness で測り直してください"
+        )
     if squeezed:
-        overlap = _overlapping(clips)
+        overlap = clips_overlap(clips)
         held = limited_peak(targets, ceiling)
         raised = None if report.peak_db is None else report.peak_db + (gain if moved else 0.0)
         result |= {
@@ -7145,17 +7159,6 @@ def _apply_loudness(
             notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
     result["note"] = " ".join(notes)
     return result
-
-
-def _overlapping(clips: list[Clip]) -> bool:
-    """同じ時刻に 2 本以上が鳴るか（トラックをまたいで見る）"""
-    spans = sorted((clip.timeline_start, clip.timeline_end) for clip in clips)
-    reach = None
-    for begin, finish in spans:
-        if reach is not None and begin < reach:
-            return True
-        reach = finish if reach is None else max(reach, finish)
-    return False
 
 
 def _limitable(host: EditorHost) -> bool:

@@ -309,6 +309,7 @@ def loudness_gain(
     target: float,
     ceiling: float,
     squeeze: float = 0.0,
+    raise_ceiling: float | None = None,
 ) -> LoudnessGain:
     """測った積分ラウドネス ``measured`` を ``target`` へ寄せる量（dB）
 
@@ -316,6 +317,9 @@ def loudness_gain(
     ``squeeze`` はリミッターで抑えてよい量（dB） 山が天井をその分だけ越える所まで上げる
     どれかのクリップの線が欄の上限を超える所でも止める 超えた分は鳴らないので、そろえた
     つもりの音量にならない
+    ``raise_ceiling`` は前に積んだリミッターが山を止める所 そこより上へは上げないが、下げる
+    理由にはしない 測った山は混ぜた音の物で、どのクリップの山かは分からない 静かなクリップの
+    低い上限で全体を下げると、そろえるはずの音量が大きく下がる（PR #451 の CodeRabbit の指摘）
     """
     gain = target - measured
     limited: list[str] = []
@@ -323,6 +327,15 @@ def loudness_gain(
     if peak_db is not None and peak_db + gain > ceiling + room:
         gain = ceiling + room - peak_db
         limited.append("peak")
+    if (
+        raise_ceiling is not None
+        and peak_db is not None
+        and gain > 0
+        and peak_db + gain > raise_ceiling
+    ):
+        gain = max(0.0, raise_ceiling - peak_db)
+        if "peak" not in limited:
+            limited.append("peak")
     top = max((loudest(clip_volume(clip)) for clip in clips), default=0.0)
     if top > 0 and top * db_to_ratio(gain) > VOLUME_LIMIT:
         gain = ratio_to_db(VOLUME_LIMIT / top)

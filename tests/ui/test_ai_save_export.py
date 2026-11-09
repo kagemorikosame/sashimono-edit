@@ -24,6 +24,7 @@ from typing import Any
 
 import av
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
@@ -51,7 +52,12 @@ from sashimono.core.model import (
 )
 from sashimono.core.projection import project_timeline
 from sashimono.core.timebase import FrameRate
-from sashimono.engine.encode import ExportSettings, available_video_codecs, export_project
+from sashimono.engine.encode import (
+    ExportError,
+    ExportSettings,
+    available_video_codecs,
+    export_project,
+)
 from sashimono.ui import ai_export, main_window
 from sashimono.ui.ai_export import scratch_folder
 from sashimono.ui.backup_settings import state_root_for
@@ -828,7 +834,9 @@ class TestTheMatchedBitrate:
 
         monkeypatch.setattr(choices, "matched_bitrate_mbps", lambda *_a, **_k: 6)
         worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
-        assert worker._matched(self._settings(tmp_path)).video_bitrate == 6_000_000
+        matched = worker._matched(self._settings(tmp_path))
+        assert matched is not None
+        assert matched.video_bitrate == 6_000_000
 
     def test_an_unreadable_material_keeps_the_cap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -841,9 +849,82 @@ class TestTheMatchedBitrate:
 
         monkeypatch.setattr(choices, "matched_bitrate_mbps", unreadable)
         worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
-        assert worker._matched(self._settings(tmp_path)).video_bitrate == 20_000_000
+        matched = worker._matched(self._settings(tmp_path))
+        assert matched is not None
+        assert matched.video_bitrate == 20_000_000
+
+    def test_the_matched_bitrate_reaches_the_export(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """求めた値を書き出しへ渡す 壊れると、求めても上限の大きさで書き出す（CodeRabbit）"""
+        from sashimono.engine.encode import choices
+
+        monkeypatch.setattr(choices, "matched_bitrate_mbps", lambda *_a, **_k: 6)
+        used: list[ExportSettings] = []
+
+        def export(_project: Project, settings: ExportSettings, **_kwargs: object) -> None:
+            used.append(settings)
+            raise ExportError("ここで止める")
+
+        monkeypatch.setattr(ai_export, "run_export", export)
+        worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
+        worker._export(tmp_path / "scratch.mp4")
+        assert [s.video_bitrate for s in used] == [6_000_000]
+
+    def test_a_stuck_estimate_can_be_cancelled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """応えない共有で止まった見積もりを待たずに中止する
+
+        壊れると、中止しても書き出しが「書いている」のまま終わらず、アプリを閉じても待ち続ける
+        """
+        from sashimono.engine.encode import choices
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def stuck(*_args: object, **_kwargs: object) -> int:
+            started.set()
+            release.wait(10)
+            return 6
+
+        monkeypatch.setattr(choices, "matched_bitrate_mbps", stuck)
+        worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
+        cancelled: list[bool] = []
+        # 書き出しのスレッドから出る知らせを、ここでそのまま受ける（画面のスレッドの順番を待たない）
+        worker.cancelled.connect(lambda: cancelled.append(True), Qt.ConnectionType.DirectConnection)
+        runner = threading.Thread(target=worker._export, args=(tmp_path / "scratch.mp4",))
+        runner.start()
+        try:
+            assert started.wait(5)
+            assert worker.cancel()
+            runner.join(5)
+            assert not runner.is_alive()
+            assert cancelled == [True]
+        finally:
+            release.set()
+
+    def test_full_slots_keep_the_cap(self, tmp_path: Path) -> None:
+        """止まった見積もりが枠を埋めていたら、待たずに上限で書く
+
+        壊れると、止まったスレッドが書き出すたびに増えるか、次の書き出しが始まらない
+        """
+        slots = ai_export._ESTIMATE_SLOTS
+        held = 0
+        while slots.acquire(blocking=False):
+            held += 1
+        try:
+            worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None, True)
+            matched = worker._matched(self._settings(tmp_path))
+            assert matched is not None
+            assert matched.video_bitrate == 20_000_000
+        finally:
+            for _ in range(held):
+                slots.release()
 
     # 壊れると、AI が決めた数や決め打ちの設定を、書き出すスレッドで黙って下げる
     def test_a_fixed_bitrate_is_kept(self, tmp_path: Path) -> None:
         worker = ai_export._Worker(Project.create(), self._settings(tmp_path), Path, None)
-        assert worker._matched(self._settings(tmp_path)).video_bitrate == 20_000_000
+        matched = worker._matched(self._settings(tmp_path))
+        assert matched is not None
+        assert matched.video_bitrate == 20_000_000

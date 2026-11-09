@@ -214,3 +214,34 @@ class TestTheCompanion:
         assert install_runtime(self.PACK, extra=True, command=command) == 0
         marks = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))
         assert marks["companion"] == python_abi()
+
+
+def test_the_first_install_shows_the_companion_files(
+    target: Path, qt_application: QApplication
+) -> None:
+    """初めて一緒に入れるときも、落とすモデルの名前と取得元を先に見せる
+
+    壊れると、何も見せないまま印の付いた導入で YuNet を落とし始める（PR #451 の CodeRabbit の指摘）
+    """
+    del target, qt_application
+    from sashimono.model_files import RemoteFile
+    from sashimono.ui.setup import SetupSection
+
+    model = RemoteFile(
+        name="companion-test-model.onnx",
+        url="https://example.com/companion-test-model.onnx",
+        sha256="0" * 64,
+        size=4096,
+        label="顔を探すモデル",
+    )
+    companion = FeaturePack(key="companion", label="画面", required=(), files=(model,))
+    pack = FeaturePack(key="main", label="本体", required=(), extra_pack=companion)
+    section = SetupSection(pack)
+    try:
+        section._extra.setChecked(False)
+        assert "顔を探すモデル" not in section._status.text()
+        section._extra.setChecked(True)
+        assert "顔を探すモデル" in section._status.text()
+        assert "example.com" in section._status.text()
+    finally:
+        section.deleteLater()

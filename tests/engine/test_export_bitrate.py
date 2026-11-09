@@ -26,6 +26,7 @@ from sashimono.engine.encode import (
     DEFAULT_BITRATE_MBPS,
     MATCH_FLOOR_MBPS,
     BitrateChoice,
+    choices,
     export_target,
     matched_bitrate_mbps,
 )
@@ -274,3 +275,48 @@ def test_a_shared_scene_reached_deep_first_is_walked_again(video_media: MediaIte
     )
     size_of = _sizes(low=TWO_MBPS, high=TWO_MBPS * 4)
     assert matched_bitrate_mbps(project, size_of=size_of) == 10
+
+
+def test_the_video_length_is_used(video_media: MediaItem) -> None:
+    """音の方が長い素材は映像の道の長さで割る
+
+    入れ物の長さで割ると 2 Mbps の映像を 1 Mbps と読んで、低く書き出す（CodeRabbit）
+    """
+    (stream,) = video_media.video_streams
+    media = replace(
+        video_media,
+        path=Path("C:/素材/long_audio.mp4"),
+        duration=Fraction(20),
+        video_streams=(replace(stream, end_time=Fraction(10)),),
+    )
+    project = make_loaded(media, _no_words())
+    # 10 秒の映像で 2 Mbps 入れ物の 20 秒で割ると 1 Mbps と読んで下限の 2 Mbps になる
+    assert matched_bitrate_mbps(project, size_of=_sizes(long_audio=TWO_MBPS)) == 3
+
+
+def test_a_scene_reached_twice_at_the_same_depth_is_walked_once(video_media: MediaItem) -> None:
+    """同じシーンを各段に 2 つ置いても、段ごとに 1 度だけたどる
+
+    壊れると、16 段で 13 万回たどり、書き出しの窓のビットレートがいつまでも決まらない（CodeRabbit）
+    """
+    project, inner_id = _with_scene(video_media, placed=False)
+    below = inner_id
+    scenes: list[Scene] = []
+    for depth in range(6):
+        clips = (Clip(0, 300, scene_id=below), Clip(300, 300, scene_id=below))
+        step = Scene(
+            name=f"段 {depth}",
+            timeline=replace(
+                project.timeline, tracks=(Track(kind=TrackKind.VIDEO, name="V", clips=clips),)
+            ),
+        )
+        scenes.append(step)
+        below = step.id
+    twice = (Clip(0, 300, scene_id=below), Clip(300, 300, scene_id=below))
+    outer = Track(kind=TrackKind.VIDEO, name="外", clips=twice)
+    project = replace(project, scenes=(*project.scenes, *scenes))
+    project = project.with_timeline(
+        replace(project.timeline, tracks=(*project.timeline.tracks, outer))
+    )
+    # メインと 6 段と「山場」で 8 枚 2 つずつたどると 2 の 7 乗を越える
+    assert len(list(choices._timelines(project))) == 8

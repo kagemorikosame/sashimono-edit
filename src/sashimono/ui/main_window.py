@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 from sashimono import __version__
 from sashimono.ai.auto_fix import (
     can_auto_color,
+    clips_overlap,
     has_limiter,
     limited_ceiling,
     limited_peak,
@@ -4355,8 +4356,9 @@ class MainWindow(QMainWindow):
             measured=report.loudness,
             peak_db=report.peak_db,
             target=pending.request.limits.loudness_target,
-            ceiling=limited_ceiling(pending.targets, pending.ceiling),
+            ceiling=pending.ceiling,
             squeeze=pending.squeeze,
+            raise_ceiling=limited_ceiling(pending.targets, pending.ceiling),
         )
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
@@ -4392,6 +4394,14 @@ class MainWindow(QMainWindow):
             held = limited_peak(pending.targets, pending.ceiling)
             if held > pending.ceiling + 0.05:
                 stopped += f" トラックの音量で、山は {held:g} dBFS まで上がる"
+            if clips_overlap(clips):
+                # リミッターはクリップごと 重なって鳴る音の和は上限を越えうる
+                stopped += (
+                    " 重なって鳴る所は音が割れることがある AI アシスタントの check_output で"
+                    "音割れを確かめてください"
+                )
+        elif moved and any(has_limiter(clip) for clip in clips):
+            stopped += " 前に積んだリミッターを通る音なので、音量は変えた量どおりには動かない"
         changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(
             f"{changed}（測った音量 {report.loudness:.1f} LUFS）{stopped}",
