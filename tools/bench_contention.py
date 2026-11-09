@@ -4,6 +4,7 @@ r"""裏の処理と画面の操作の取り合いを測る（#443 の段階 1 #4
     .venv\Scripts\python.exe tools\bench_contention.py --jobs proxy-thread proxy-process
     .venv\Scripts\python.exe tools\bench_contention.py --size 3840x2160 --rate 30 --seconds 60
     .venv\Scripts\python.exe tools\bench_contention.py --switch-interval 0.0005
+    .venv\Scripts\python.exe tools\bench_contention.py --onscreen --prefetch --jobs scenes-process
 
 裏の処理 × 画面の操作 の表を出す 裏の処理を 1 つずつ走らせ、その間ずっと画面の操作を
 繰り返す 見る値は 2 つ
@@ -24,15 +25,22 @@ GL は offscreen では作れないので、書き出しを測るときはこち
 続けるスレッドを 1 本足す アプリの中で先読みや解析が動いている状態に近い 控えの作成が
 アプリの中で単体の 8 分の 1 になった（#440）のは、この取り合いがあるとき
 
+``--prefetch`` を付けると、窓のプレビューと GL を共有した本物の先読みの走り係を、素材を
+``--prefetch-layers`` 枚（既定 3）重ねたプロジェクトで回し続ける（``--onscreen`` が要る #453）
+貯め終えて休まないよう 0.5 秒ごとに貯めた絵を捨てさせる 窓の先読みは操作の間は止まる
+（設定 ``prefetch_yield``）が、こちらは止めないので、いちばん重い場合になる
+重ねた物（Python のスレッドか先読み）を入れたときは、裏の処理の無い「重ねた物だけ」の行も出す
+
 裏の処理
 
 - ``proxy-thread`` 控えをアプリの中のスレッドで作る（0.2.4 までの作り）
 - ``proxy-process`` 控えを別のプロセスで作る（#440）
 - ``scenes`` 場面の解析 ``thumbnails`` サムネイル ``waveform`` 波形
 - ``export`` 書き出し（GL を作れない機械では飛ばす）
+- ``scenes-process`` ``thumbnails-process`` ``waveform-process`` ``export-process`` 同じ物を
+  別のプロセスで（#453） 既定では測らない スレッドの物と並べて比べたいときに選ぶ
 - ``python`` Python を回し続けるだけのスレッド 先読みの走り係のように、裏で Python が
-  止まらずに動いている場合の上限の目安（先読みそのものは共有した GL が要り、
-  画面を出さない測りでは作れない）
+  止まらずに動いている場合の上限の目安（本物の先読みは ``--prefetch``）
 
 文字起こしは測らない 部品とモデルを別に入れる物で、入っている機械でしか動かない
 
@@ -57,7 +65,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 if isinstance(sys.stdout, io.TextIOWrapper):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # 行ごとに出す ファイルへ向けて長く測るとき、どこまで進んだかが見えないため
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -83,6 +92,7 @@ if not _IN_CHILD:
 
 from sashimono.core.commands import AddClip, AddMedia, AddTrack, MoveClip  # noqa: E402
 from sashimono.core.model import (  # noqa: E402
+    AnimatedValue,
     Clip,
     ClipId,
     MediaItem,
@@ -230,8 +240,41 @@ def _waveform(source: Path, _scratch: Path, stop: Callable[[], bool]) -> float:
 
 
 def _export(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
+    # 書き出しの部品は GL と Qt の画面の部品を読む 頭で読むと、控えの子（この台本を読み直す）の
+    # 起動にまで乗り、別のプロセスの控えが実際より遅く出る
     from sashimono.engine.encode.exporter import ExportSettings, export_project
 
+    project, seconds = _export_project(source)
+    export_project(
+        project,
+        ExportSettings(path=scratch / f"export-{time.perf_counter_ns()}.mp4"),
+        should_cancel=stop,
+    )
+    return seconds
+
+
+def _scenes_process(source: Path, _scratch: Path, stop: Callable[[], bool]) -> float:
+    _done(run_in_process(analyze_scenes, {"path": source}, should_cancel=stop))
+    return float(probe_media(source).duration)
+
+
+def _thumbnails_process(source: Path, _scratch: Path, stop: Callable[[], bool]) -> float:
+    _done(run_in_process(build_filmstrip, {"path": source}, should_cancel=stop))
+    return float(probe_media(source).duration)
+
+
+def _waveform_process(source: Path, _scratch: Path, stop: Callable[[], bool]) -> float:
+    _done(run_in_process(analyze_waveform, {"path": source}, should_cancel=stop))
+    return float(probe_media(source).duration)
+
+
+def _done(result: object) -> None:
+    """子が何も返さなかったら投げる（:func:`_made` と同じ理由）"""
+    if result is None:
+        raise RuntimeError("別のプロセスの処理が結果を返さなかった")
+
+
+def _export_project(source: Path) -> tuple[Project, float]:
     media = probe_media(source)
     rate = media.video_streams[0].frame_rate if media.video_streams else FrameRate(30)
     frames = int(media.duration * rate.fps)
@@ -242,12 +285,25 @@ def _export(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
     project = AddClip(track.id, Clip(timeline_start=0, duration=frames, media_id=media.id)).apply(
         project
     )
-    export_project(
-        project,
-        ExportSettings(path=scratch / f"export-{time.perf_counter_ns()}.mp4"),
-        should_cancel=stop,
+    return project, float(media.duration)
+
+
+def _export_process(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
+    from sashimono.engine.encode.export_job import export_job
+    from sashimono.engine.encode.exporter import ExportSettings
+
+    project, seconds = _export_project(source)
+    _done(
+        run_in_process(
+            export_job,
+            {
+                "project": project,
+                "settings": ExportSettings(path=scratch / f"export-{time.perf_counter_ns()}.mp4"),
+            },
+            should_cancel=stop,
+        )
     )
-    return float(media.duration)
+    return seconds
 
 
 def _python(_source: Path, _scratch: Path, stop: Callable[[], bool]) -> float:
@@ -263,11 +319,18 @@ JOBS: dict[str, Job] = {
     "proxy-thread": _proxy_thread,
     "proxy-process": _proxy_process,
     "scenes": _scenes,
+    "scenes-process": _scenes_process,
     "thumbnails": _thumbnails,
+    "thumbnails-process": _thumbnails_process,
     "waveform": _waveform,
+    "waveform-process": _waveform_process,
     "export": _export,
+    "export-process": _export_process,
     "python": _python,
 }
+
+#: 何も選ばなかったときに測る物 別のプロセスの道は、スレッドの道と並べて比べたいときに選ぶ
+DEFAULT_JOBS = ("proxy-thread", "proxy-process", "scenes", "thumbnails", "waveform", "export")
 
 
 class Spinner:
@@ -298,7 +361,110 @@ class Spinner:
             self._thread = None
 
 
-def run_alone(job: Job, source: Path, scratch: Path, spinner: Spinner) -> float | None:
+class Prefetcher:
+    """本物の先読みの走り係を回し続ける（``--prefetch``）
+
+    窓の先読みと同じ :class:`BackgroundPrefetch` を、窓のプレビューと GL を共有して作る
+    素材を ``layers`` 枚重ねたプロジェクトを描かせ、貯め終えて休まないように、決まった
+    間隔で貯めた絵を捨てて再生ヘッドを動かす 窓の先読みは操作の間は止まる（設定
+    ``prefetch_yield``）が、こちらは止めない 手が止まって先読みが動き出した所へ裏の処理が
+    重なった、いちばん重い場合を測るため
+    """
+
+    #: 貯めた絵を捨てて描き直させる間隔（秒） 1080p を 3 枚重ねて 1 コマ 10ms 前後なので、
+    #: 0.5 秒あれば数十コマ描き、貯め終えて休む前に次を頼める
+    REFRESH_S = 0.5
+
+    def __init__(self, scene: Scene | None, source: Path, layers: int, budget_mb: int) -> None:
+        self._scene = scene
+        self._source = source
+        self._layers = layers
+        self._budget = budget_mb * 1024 * 1024
+        self._stop = threading.Event()
+        self._feeder: threading.Thread | None = None
+        self._background: object | None = None
+        #: 描いたコマの数 走り係が本当に動いていたかを出すため
+        self.drawn = 0
+
+    def _project(self) -> tuple[Project, int]:
+        media = probe_media(self._source)
+        rate = media.video_streams[0].frame_rate if media.video_streams else FrameRate(60)
+        frames = int(media.duration * rate.fps)
+        project = Project.create(ProjectSettings(width=1920, height=1080, frame_rate=rate))
+        project = AddMedia(media).apply(project)
+        for index in range(self._layers):
+            track = Track(kind=TrackKind.VIDEO, name=f"V{index + 1}")
+            project = AddTrack(track).apply(project)
+            # 半透明にする 不透明だと上の 1 枚で下が隠れ、重ねた分を描かずに済ます道に入りうる
+            clip = Clip(
+                timeline_start=0,
+                duration=frames,
+                media_id=media.id,
+                opacity=AnimatedValue(0.5),
+            )
+            project = AddClip(track.id, clip).apply(project)
+        return project, frames
+
+    def __enter__(self) -> Prefetcher:
+        if self._scene is None:
+            return self
+        from sashimono.engine.render.background import BackgroundPrefetch
+        from sashimono.engine.render.invalidate import Invalidation
+        from sashimono.engine.render.renderer import FULL_QUALITY
+
+        preview = self._scene.window._preview
+        project, frames = self._project()
+        background = BackgroundPrefetch(
+            project,
+            share=preview.context(),
+            quality=FULL_QUALITY,
+            proxies=None,
+            decode_threads=2,
+            budget_bytes=self._budget,
+            playhead=0,
+        )
+        self._background = background
+        self._stop.clear()
+
+        def feed() -> None:
+            n = 0
+            while not self._stop.wait(self.REFRESH_S):
+                self.drawn += len(background.cached)
+                n += 1
+                background.invalidate(Invalidation.all())
+                background.set_playhead((n * 977) % max(1, frames - 120))
+
+        self._feeder = threading.Thread(target=feed, name="bench-prefetch-feed", daemon=True)
+        self._feeder.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._feeder is not None:
+            self._feeder.join()
+            self._feeder = None
+        background, self._background = self._background, None
+        if background is not None:
+            background.close()  # type: ignore[attr-defined]
+
+
+class Load:
+    """裏の処理に重ねる物（Python の回るスレッドと先読み）をまとめて入れ切りする"""
+
+    def __init__(self, *parts: Spinner | Prefetcher) -> None:
+        self._parts = parts
+
+    def __enter__(self) -> Load:
+        for part in self._parts:
+            part.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        for part in reversed(self._parts):
+            part.__exit__(*exc)
+
+
+def run_alone(job: Job, source: Path, scratch: Path, spinner: Load) -> float | None:
     """画面を動かさずに走らせた速さ 失敗したら ``None``"""
     began = time.perf_counter()
     try:
@@ -440,7 +606,7 @@ def run_contended(
     job: Job,
     source: Path,
     scratch: Path,
-    spinner: Spinner,
+    spinner: Load,
 ) -> tuple[float | None, dict[str, list[float]]]:
     """裏の処理を走らせながら操作を繰り返す 速さと操作の時間を返す"""
     done = threading.Event()
@@ -513,7 +679,7 @@ def report(idle: dict[str, list[float]], results: list[JobResult]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
-        "--jobs", nargs="+", choices=sorted(JOBS), default=list(JOBS), help="測る裏の処理"
+        "--jobs", nargs="+", choices=sorted(JOBS), default=list(DEFAULT_JOBS), help="測る裏の処理"
     )
     parser.add_argument("--size", default="1920x1080", help="素材の大きさ")
     parser.add_argument("--rate", type=int, default=60, help="素材のフレームレート")
@@ -536,7 +702,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--onscreen", action="store_true", help="窓を本物の画面に出す（書き出しの GL が要るとき）"
     )
+    parser.add_argument(
+        "--prefetch",
+        action="store_true",
+        help="裏の処理の間、本物の先読みの走り係を回し続ける（--onscreen が要る）",
+    )
+    parser.add_argument("--prefetch-layers", type=int, default=3, help="先読みに重ねる素材の枚数")
+    parser.add_argument(
+        "--prefetch-mb", type=int, default=256, help="先読みに使う GPU のメモリ（MB）"
+    )
     args = parser.parse_args(argv)
+    if args.prefetch and not args.onscreen:
+        # 走り係は窓のプレビューと GL を共有する offscreen では共有した GL を作れない
+        print("--prefetch は --onscreen と一緒に使う")
+        return 2
     if not args.onscreen:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     if shutil.which("ffmpeg") is None:
@@ -566,10 +745,22 @@ def main(argv: list[str] | None = None) -> int:
     until = time.perf_counter() + IDLE_SECONDS
     idle = drive(app, ops, lambda: time.perf_counter() < until)
 
-    spinner = Spinner(args.busy_thread)
+    prefetcher = Prefetcher(
+        scene if args.prefetch else None, source, args.prefetch_layers, args.prefetch_mb
+    )
+    spinner = Load(Spinner(args.busy_thread), prefetcher)
     if args.busy_thread:
         print("Python を回し続けるスレッドを足して測る")
     results: list[JobResult] = []
+    if args.busy_thread or args.prefetch:
+        if args.prefetch:
+            print(f"先読みの走り係を回し続けて測る（{args.prefetch_layers} 枚重ね）")
+        # 重ねた物だけの操作も測る 裏の処理が足した分と、重ねた物そのものの分を分けて読むため
+        print("重ねた物だけで操作を測っている")
+        until = time.perf_counter() + IDLE_SECONDS
+        with spinner:
+            loaded = drive(app, ops, lambda: time.perf_counter() < until)
+        results.append(JobResult("（重ねた物だけ）", None, None, loaded))
     for name in args.jobs:
         print(f"{name}: 単体")
         job = JOBS[name]
@@ -581,6 +772,9 @@ def main(argv: list[str] | None = None) -> int:
         results.append(JobResult(name, alone, speed if name != "python" else None, times))
 
     report(idle, results)
+    if args.prefetch:
+        # 走り係が本当に描いていたか 0 なら先読みは重なっておらず、表は先読み無しと同じ
+        print(f"先読みが描いたコマ（捨てる前に数えた数の合計）: {prefetcher.drawn}")
     scene.window.close()
     scene.window.deleteLater()
     _settle(app)

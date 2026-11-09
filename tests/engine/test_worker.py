@@ -8,16 +8,21 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
 from sashimono.core.model import MediaId, MediaItem
 from sashimono.engine import worker as worker_module
+from sashimono.engine.audio.waveform import analyze_waveform
+from sashimono.engine.cache import analyzer as analyzer_module
 from sashimono.engine.cache import proxy as proxy_module
+from sashimono.engine.cache.analyzer import MediaAnalyzer
 from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
 from sashimono.engine.cache.store import CacheStore
 from sashimono.engine.decode import probe_media
+from sashimono.engine.scenes import SceneSignal, scenes_job
 from sashimono.engine.worker import (
     WorkerCrashedError,
     WorkerFailedError,
@@ -44,6 +49,13 @@ class TestRunInProcess:
         seen: list[float] = []
         assert run_in_process(probe_job, {"value": "子"}, progress=seen.append) == "子"
         assert seen and seen[-1] == 1.0
+
+    def test_partial_values_reach_the_parent_in_order(self) -> None:
+        """壊れると、場面を別のプロセスで読む間、AI が途中までの切り替わりを受け取れない"""
+        seen: list[object] = []
+        answer = run_in_process(probe_job, {"value": "子", "steps": 3}, partial=seen.append)
+        assert answer == "子"
+        assert seen == ["子 1", "子 2", "子 3"]
 
     def test_a_failure_in_the_child_reaches_the_parent(self) -> None:
         """壊れると、子の中の失敗が黙って消え、控えが無いまま「作れなかった」も出ない"""
@@ -196,3 +208,124 @@ class TestProxyInAnotherProcess:
             assert "途中で終わった" in builder.poll().failures[media.id]
         finally:
             builder.close()
+
+
+class TestAnalysisInAnotherProcess:
+    """素材の解析（波形・サムネイル・場面）を別のプロセスで読む（#453）"""
+
+    def test_waveform_filmstrip_and_scenes_are_read_by_children(
+        self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、設定で別のプロセスを選んでも解析がアプリの中で走り、画面と取り合ったまま"""
+        jobs: list[object] = []
+
+        def recording(job: object, *args: object, **kwargs: object) -> object:
+            jobs.append(job)
+            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(analyzer_module, "run_in_process", recording)
+        # 試験の素材は 2 秒しかない 長さの下限を外して、寄せる種類が子を通るかを見る
+        monkeypatch.setattr(analyzer_module, "PROCESS_MIN_SECONDS", {"scenes": 0, "waveform": 0})
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media = probe_media(sample_av.path)
+        ready = threading.Event()
+        try:
+            analyzer.request(media, scenes=True, on_ready=lambda _id: ready.set())
+            assert _wait(
+                lambda: (
+                    analyzer.waveform(media) is not None
+                    and analyzer.filmstrip(media) is not None
+                    and analyzer.scenes(media) is not None
+                )
+            )
+            # サムネイルは取り合っても落ちないので寄せない（スレッドで読む）
+            assert set(jobs) == {analyze_waveform, scenes_job}
+            signal = analyzer.scenes(media)
+            assert signal is not None and signal.complete
+        finally:
+            analyzer.close()
+
+    def test_partial_scenes_from_the_child_are_shown_while_reading(self, tmp_path: Path) -> None:
+        """壊れると、長い素材を別のプロセスで読む間、AI が途中までの切り替わりを受け取れない"""
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media_id = MediaId("m")
+        signal = SceneSignal.empty(stream=0)
+        with analyzer._lock:
+            analyzer._running.add(("scenes", media_id, None))
+            analyzer._partials[media_id] = signal
+        try:
+            media = MediaItem(path=tmp_path / "x.mp4", duration=Fraction(1), id=media_id)
+            state = analyzer.scene_state(media)
+            assert state.running and state.signal is signal
+            # 止めた後も、届いていた所までを残す（同じ所で止めたスレッドの読みと同じ扱い）
+            analyzer.cancel_scenes()
+            assert analyzer._halted[media_id] is signal
+        finally:
+            analyzer.close()
+
+    def test_it_falls_back_to_a_thread(
+        self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、子を起こせない機械で波形もサムネイルも出なくなる"""
+
+        def refuse(*_args: object, **_kwargs: object) -> None:
+            raise WorkerUnavailableError("起こせない")
+
+        monkeypatch.setattr(analyzer_module, "run_in_process", refuse)
+        monkeypatch.setattr(analyzer_module, "PROCESS_MIN_SECONDS", {"waveform": 0})
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media = probe_media(sample_av.path)
+        try:
+            analyzer.request(media)
+            assert _wait(
+                lambda: (
+                    analyzer.waveform(media) is not None and analyzer.filmstrip(media) is not None
+                )
+            )
+            assert not analyzer.separate_process, "起こせなかったことを覚えていない"
+        finally:
+            analyzer.close()
+
+    def test_short_media_stay_in_a_thread(
+        self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、短い素材を読むたびに子を起こして部品を読み直し、1 本に 1 秒ずつ余計に待つ"""
+        jobs: list[object] = []
+
+        def recording(job: object, *args: object, **kwargs: object) -> object:
+            jobs.append(job)
+            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(analyzer_module, "run_in_process", recording)
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media = probe_media(sample_av.path)
+        try:
+            analyzer.request(media, scenes=True)
+            assert _wait(
+                lambda: analyzer.waveform(media) is not None and analyzer.scenes(media) is not None
+            )
+            assert jobs == []
+        finally:
+            analyzer.close()
+
+    def test_a_crash_is_a_failure_not_a_retry(
+        self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、素材のせいで子が落ちたとき、同じ素材をアプリの中で読み直してアプリごと落ちる"""
+        here: list[object] = []
+
+        def crash(*_args: object, **_kwargs: object) -> None:
+            raise worker_module.WorkerCrashedError("途中で終わった")
+
+        monkeypatch.setattr(analyzer_module, "run_in_process", crash)
+        monkeypatch.setattr(analyzer_module, "PROCESS_MIN_SECONDS", {"waveform": 0})
+        monkeypatch.setattr(analyzer_module, "analyze_waveform", lambda *a, **k: here.append(a))
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media = probe_media(sample_av.path)
+        try:
+            analyzer.request(media)
+            assert _wait(lambda: analyzer.poll().failed >= 1)
+            assert here == []
+            assert analyzer.separate_process, "落ちたのを起こせないと取り違えた"
+        finally:
+            analyzer.close()

@@ -234,6 +234,7 @@ from sashimono.ui.chat import ChatPanel
 from sashimono.ui.emphasis_dialog import ask_emphasis
 from sashimono.ui.export_dialog import ExportDialog, credit_text
 from sashimono.ui.graph_editor import GraphEditor
+from sashimono.ui.idle_collect import IdleCollect
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
@@ -518,6 +519,7 @@ class MainWindow(QMainWindow):
             sample_rate=self._document.project.settings.sample_rate,
             channels=self._document.project.settings.channels,
             scene_threads=self._preferences.scene_threads,
+            separate_process=self._preferences.analysis_process,
         )
         #: AI が絵を見て作った場面の説明（#326） 素材の解析と同じ置き場（engine/cache）に覚える
         self._scene_notes = SceneNoteStore()
@@ -566,6 +568,10 @@ class MainWindow(QMainWindow):
         #: 画面の止まりの見張り（#442 の 0 番） 設定か環境変数で入れたときだけ動く
         self._stall_monitor = StallMonitor(self)
         self._apply_stall_watch(self._preferences)
+        #: ごみ集めの全体回を手が止まってから回す（#455） 設定で入れたときだけ動く
+        #: 再生の係はこの後で作るので、再生中かは呼ばれたときに引く
+        self._idle_collect = IdleCollect(lambda: self._playback.is_playing, self)
+        self._idle_collect.set_manual(self._preferences.gc_manual)
         apply_switch_interval(self._preferences)
         self._analysis_dirty = False
         #: 解析ができた素材 次の間隔でタイムラインの細い帯の目安を求め直させる
@@ -619,7 +625,7 @@ class MainWindow(QMainWindow):
         self._connect()
         self._connect_drops()
         self._connect_preview_menu()
-        self._input_hold = _InputHold(self._preview.hold_prefetch, self)
+        self._input_hold = _InputHold(self._on_input, self)
         # スクロールバーはタイムラインの外に並ぶ別の部品で、ビューに付けた見張りには
         # 届かない 付けないと、つまみの端を引いて拡大している間も先読みが走り続ける
         for watched in (
@@ -1261,6 +1267,7 @@ class MainWindow(QMainWindow):
         self._preview.set_prefetch_thread(preferences.prefetch_thread)
         self._preview.set_prefetch_yield(preferences.prefetch_yield)
         self._apply_stall_watch(preferences)
+        self._idle_collect.set_manual(preferences.gc_manual)
         apply_switch_interval(preferences)
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
@@ -1302,6 +1309,7 @@ class MainWindow(QMainWindow):
         AI が頼んだときに待たされる
         """
         self._analyzer.set_scene_threads(self._preferences.scene_threads)
+        self._analyzer.set_separate_process(self._preferences.analysis_process)
         after = self._scenes_on_import()
         if before and not after:
             self._analyzer.cancel_scenes()
@@ -2543,6 +2551,11 @@ class MainWindow(QMainWindow):
         gc.collect()
         gc.freeze()
 
+    def _on_input(self) -> None:
+        """タイムラインかプレビューに操作が来た 先読みを止め、手が止まるのを待ち直す"""
+        self._preview.hold_prefetch()
+        self._idle_collect.poke()
+
     def _apply_stall_watch(self, preferences: Preferences) -> None:
         """画面の止まりの見張りを、設定と環境変数に合わせて入り切りする"""
         threshold = threshold_from_env()
@@ -3373,6 +3386,7 @@ class MainWindow(QMainWindow):
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
             encoder_priority=self._preferences.encoder_priority,
+            separate_process=self._preferences.export_process,
         )
         self._person_export = dialog
         try:
@@ -4907,6 +4921,7 @@ class MainWindow(QMainWindow):
                 protected=protected,
             ),
             replace(request.expect, keep=self._preferences.backup_generations),
+            separate_process=self._preferences.export_process,
         )
 
     def export_status(self) -> dict[str, object]:
@@ -4999,6 +5014,7 @@ class MainWindow(QMainWindow):
         # 閉じた後も控えを作り続ける子がタスクマネージャーに残る
         stop_workers()
         self._stall_monitor.stop()
+        self._idle_collect.close()
         self._preview.shutdown()
         super().closeEvent(event)
 

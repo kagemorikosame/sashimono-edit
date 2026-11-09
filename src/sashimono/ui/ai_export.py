@@ -33,7 +33,7 @@ from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
 from sashimono.engine.encode import ExportError, ExportSettings
-from sashimono.engine.encode import export_project as run_export
+from sashimono.engine.encode.export_job import export_anywhere
 
 __all__ = ["AssistantExport", "scratch_folder"]
 
@@ -62,10 +62,13 @@ class _Worker(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        *,
+        separate_process: bool = False,
     ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
+        self._separate_process = separate_process
         self._check = check
         self._expect = expect
         self._cancel = threading.Event()
@@ -112,9 +115,10 @@ class _Worker(QObject):
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
         try:
-            run_export(
+            export_anywhere(
                 self._project,
                 replace(self._settings, path=scratch),
+                separate_process=self._separate_process,
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
                 notice=notes.append,
@@ -198,8 +202,13 @@ class AssistantExport(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        *,
+        separate_process: bool = False,
     ) -> None:
-        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
+        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）
+
+        ``separate_process`` は別のプロセスで書き出すか（本人の設定 ``export_process`` #453）
+        """
         if self.running:
             raise ToolError("書き出しがもう走っています")
         self._state = "rendering"
@@ -210,7 +219,7 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
-        self._worker = _Worker(project, settings, check, expect)
+        self._worker = _Worker(project, settings, check, expect, separate_process=separate_process)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

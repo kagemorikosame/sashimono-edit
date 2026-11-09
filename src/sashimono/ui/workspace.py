@@ -376,6 +376,17 @@ class Preferences:
     #: 切れるようにするのは、子のプロセスが見張りのソフトに止められるなど、手元の事情で
     #: 起こしたくない人のため
     proxy_process: bool = True
+    #: 素材の解析（波形・サムネイル・場面）を別のプロセスで行う（#453） 切るとアプリの中のスレッド
+    #: 既定は入 解析は 1 コマごとに Python を動かすので、同じプロセスだと先読みや画面と GIL を
+    #: 取り合って遅くなり、操作も重くなる（実測は
+    #: :data:`sashimono.engine.cache.analyzer.MEASURED_ANALYSIS`） 子を起こせない機械では
+    #: 自分でスレッドへ戻る 切れるようにするのは :attr:`proxy_process` と同じ理由
+    analysis_process: bool = True
+    #: 書き出しを別のプロセスで行う（#453） 子の中で GL を作れない機械では自分でスレッドへ戻る
+    #: 既定は入 同じプロセスで書くと、書いている間に先読みや再生と取り合う（実測は
+    #: :data:`sashimono.engine.encode.export_job.MEASURED_EXPORT_SPEED`） 切れるようにするのは、
+    #: 子の GL がドライバとの相性で絵を乱したときに逃げられるようにするため
+    export_process: bool = True
     #: タイムラインで使っていない素材の控えをどうするか（#441）
     #: 既定は後回しで作る（``later``） 使っている素材を先に作り、それが済んでから残りを作る
     #: 作らずにおくと、後から使い始めた所で控えが無く、飛ぶたびに待たされる（知らない人ほど
@@ -413,6 +424,12 @@ class Preferences:
     #: 細かくすると、裏のスレッドの処理は切り替えの分だけ遅くなる（実測は
     #: :data:`MEASURED_SWITCH`） 裏の処理を少しでも速く終えたい人は切れる
     responsive_switch: bool = True
+    #: ごみ集めの全体回（世代 2）を自動で走らせず、手が止まったときに回す（#455 #442 B の後半）
+    #: 既定は切 大きなプロジェクトでは全体回が 1 回 36ms ほどあり、選ぶ・動かす最中に当たると
+    #: 1〜2 コマ止まる 手で回すと止まりは手が止まった後へ寄るが、操作し続ける間は集めるのが
+    #: 遅れ（上限 :data:`sashimono.gc_policy.MAX_DEFER_S`）、メモリが少し増えたまま残る
+    #: 実機の止まりの記録で全体回が多いと分かった人が入れられるようにする
+    gc_manual: bool = False
     #: 書き出しで、GPU の合成を書き込み（色変換・エンコード・mux）の何枚ぶん先へ進めるか
     #: 0 で直列（1 枚ずつ、スレッドを使わない）
     #: 既定は 2 1 枚ぶんは画面 1 枚の RGBA（1080p で 8MB、4K で 33MB）なので、
@@ -1096,6 +1113,8 @@ class PreferenceStore:
             proxy_height=_size(data.get("proxy_height"), plain.proxy_height),
             proxy_long_gop=_flag(data.get("proxy_long_gop"), plain.proxy_long_gop),
             proxy_process=_flag(data.get("proxy_process"), plain.proxy_process),
+            analysis_process=_flag(data.get("analysis_process"), plain.analysis_process),
+            export_process=_flag(data.get("export_process"), plain.export_process),
             proxy_unused=_choice(data.get("proxy_unused"), PROXY_UNUSED_MODES, plain.proxy_unused),
             auto_quality=_flag(data.get("auto_quality"), plain.auto_quality),
             auto_quality_divisor=_divisor(
@@ -1106,6 +1125,7 @@ class PreferenceStore:
             prefetch_thread=_flag(data.get("prefetch_thread"), plain.prefetch_thread),
             prefetch_yield=_flag(data.get("prefetch_yield"), plain.prefetch_yield),
             responsive_switch=_flag(data.get("responsive_switch"), plain.responsive_switch),
+            gc_manual=_flag(data.get("gc_manual"), plain.gc_manual),
             export_pipeline_depth=_depth(
                 data.get("export_pipeline_depth"), plain.export_pipeline_depth
             ),

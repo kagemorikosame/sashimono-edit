@@ -195,3 +195,47 @@ def test_the_environment_variable() -> None:
     assert threshold_from_env({"SASHIMONO_STALL_WATCH": "1e309"}) is None
     assert threshold_from_env({"SASHIMONO_STALL_WATCH": "nan"}) is None
     assert threshold_from_env({}) is None
+
+
+def test_our_files_are_written_with_their_folder() -> None:
+    """壊れると、設定パネルの panel.py と会話の panel.py が同じ名前になり、原因を取り違える"""
+    from sashimono.stall_watch import _where
+
+    inspector = str(Path("C:/x/src/sashimono/ui/inspector/panel.py"))
+    chat = str(Path("C:/x/_internal/sashimono/ui/chat/panel.py"))
+    assert _where(inspector) == "sashimono/ui/inspector/panel.py"
+    assert _where(chat) == "sashimono/ui/chat/panel.py"
+    assert _where(str(Path("C:/x/src/sashimono/app.py"))) == "sashimono/app.py"
+    # 外の部品は名前だけ 置き場まで書くと、本人の名前の入ったパスが記録に残る
+    assert _where(str(Path("C:/Users/someone/python/threading.py"))) == "threading.py"
+
+
+def test_memory_is_written_with_each_stall(tmp_path: Path) -> None:
+    """壊れると、ごみ集めを手で回したときにメモリが増え続けているかを記録から読めない"""
+    from sashimono.memory_usage import MemoryUsage
+
+    clock = Clock()
+    watch = StallWatch(
+        tmp_path / "stalls.jsonl",
+        threshold_ms=30.0,
+        clock=clock,
+        frames=_frames,
+        memory=lambda: MemoryUsage(resident_mb=512.04, private_mb=700.06),
+    )
+    watch.beat()
+    clock.now = 0.100
+    watch.beat()
+    watch.flush()
+    [record] = _records(watch.path)
+    assert record["memory_mb"] == {"resident": 512.0, "private": 700.1}
+
+
+def test_the_memory_of_this_process_can_be_read() -> None:
+    """壊れると、記録のメモリの欄がいつも空になる（Windows の呼び方を間違えると黙って None）"""
+    from sashimono.memory_usage import process_memory
+
+    usage = process_memory()
+    assert usage is not None
+    assert usage.resident_mb > 1
+    if sys.platform == "win32":
+        assert usage.private_mb is not None and usage.private_mb > 1

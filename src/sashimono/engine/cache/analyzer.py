@@ -13,16 +13,19 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import Any
 
 from sashimono.core.model import MediaId, MediaItem
 from sashimono.engine.audio.waveform import Waveform, analyze_waveform
-from sashimono.engine.scenes import SceneScan, SceneSignal, analyze_scenes
+from sashimono.engine.scenes import SceneScan, SceneSignal, analyze_scenes, scenes_job
+from sashimono.engine.worker import WorkerUnavailableError, run_in_process
 
 from .progress import JobBoard, ProgressSnapshot
 from .scene_cache import load_scenes, save_scenes, scenes_key
@@ -38,7 +41,15 @@ from .thumbnails import (
 )
 from .waveform_cache import load_waveform, save_waveform, waveform_key
 
-__all__ = ["DEFAULT_SCENE_THREADS", "MediaAnalyzer", "SceneState", "waveform_stream"]
+__all__ = [
+    "DEFAULT_SCENE_THREADS",
+    "MEASURED_ANALYSIS",
+    "MediaAnalyzer",
+    "SceneState",
+    "waveform_stream",
+]
+
+_log = logging.getLogger(__name__)
 
 #: 失敗したときに画面へ出す名前
 _KIND_NAMES = {"waveform": "波形", "filmstrip": "サムネイル", "scenes": "場面の一覧"}
@@ -50,6 +61,32 @@ MAX_WORKERS = 2
 #: 少なめにするのは、裏で読む間も編集と再生に CPU を残すため 実測は
 #: :data:`sashimono.engine.scenes.MEASURED_SCENE_SECONDS`
 DEFAULT_SCENE_THREADS = 2
+
+#: 先読みを回しながら画面を操作している所で、場面を解析した速さ（倍速）
+#: アプリの中のスレッド / 別のプロセス 設定の画面がここから文言を作る
+#: ``tools/bench_contention.py --onscreen --prefetch``（2026-11-09 1080p60 60 秒 RTX 5060 Ti）
+MEASURED_ANALYSIS = (5.2, 6.0)
+
+#: 別のプロセスへ寄せる素材の長さの下限（秒） 種類 → 秒 表に無い種類はいつもスレッドで読む
+#:
+#: 子の起動は 0.1 秒だが、子の中で解析の部品（numpy・PyAV ほか）を読むのに 0.8 秒かかり、
+#: 1 本ごとに 0.9 秒前後乗る 同じ所で測った速さ（倍速 単体 → 先読みと画面の操作の最中）
+#:
+#: ========  =================  ==================
+#: 種類      スレッド           別のプロセス
+#: ========  =================  ==================
+#: 場面      8.8 → 5.2          5.7 → 6.0
+#: サムネ    22.4 → 24.5        17.9 → 17.1
+#: 波形      105.4 → 68.7       27.9 → 30.4
+#: ========  =================  ==================
+#:
+#: - 場面は 1 コマごとに Python で差を求めるので、取り合うとスレッドは単体の 6 割まで落ちる
+#:   Python を回し続けるスレッドが重なると 1.6 倍速まで落ちた 起動の分を払っても寄せる
+#:   短い素材は起動の分が勝つので、30 秒より短い物はスレッドで読む
+#: - サムネイルは飛び飛びに読むだけで Python をほとんど動かさず、取り合っても落ちない 寄せない
+#: - 波形はスレッドでも十分に速く、60 秒の素材では起動の分の方が重い 取り合いで 65% に落ちる分と
+#:   起動の 0.9 秒が釣り合うのが 5 分前後なので、それより長い物（長い録画）だけ寄せる
+PROCESS_MIN_SECONDS: dict[str, float] = {"scenes": 30.0, "waveform": 300.0}
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +153,13 @@ class MediaAnalyzer:
         channels: int = 2,
         max_workers: int = MAX_WORKERS,
         scene_threads: int = DEFAULT_SCENE_THREADS,
+        separate_process: bool = False,
     ) -> None:
+        """``separate_process`` が真なら、素材を読む仕事を別のプロセスで走らせる（#453）
+
+        読む仕事は 1 コマごとに Python を動かすので、同じプロセスのスレッドだと画面と先読みと
+        GIL を取り合い、どちらも遅くなる 子を起こせない機械では、以後スレッドで読む
+        """
         self._store = store if store is not None else CacheStore()
         self._sample_rate = sample_rate
         self._channels = channels
@@ -128,6 +171,9 @@ class MediaAnalyzer:
             max_workers=1, thread_name_prefix="sashimono-scenes"
         )
         self._scene_threads = scene_threads
+        self._separate_process = separate_process
+        #: 子を起こせなかった 以後この係ではスレッドで読む（素材ごとに起動の失敗を待たない）
+        self._process_broken = False
         self._lock = threading.Lock()
         #: 場面の解析が終わる（止まる・落ちるも）たびに起こす AI の道具が待つ
         #: 錠は上の物を共にする 別の錠にすると、終わりを書く所と待つ所の間で見落とす
@@ -137,6 +183,8 @@ class MediaAnalyzer:
         self._scenes: dict[MediaId, tuple[str, SceneSignal]] = {}
         #: 読んでいる途中の場面の並び 途中までを AI に渡すため
         self._scans: dict[MediaId, SceneScan] = {}
+        #: 別のプロセスで読んでいる場面の、子から届いた途中の写し（``_scans`` の代わり）
+        self._partials: dict[MediaId, SceneSignal] = {}
         #: 止めた（:meth:`cancel_scenes`）解析が読んだ所までの写し 止めた後も AI の道具が
         #: 説明どおり読んだ所までを返せるように残す（PR #358 の Codex の指摘） 頼み直すか、
         #: 読み終えるか、素材を外すまで持つ
@@ -214,8 +262,9 @@ class MediaAnalyzer:
             running = ("scenes", media.id, None) in self._running
             failure = self._scene_failures.get(media.id)
             scan = self._scans.get(media.id)
+            sent = self._partials.get(media.id)
             halted = self._halted.get(media.id)
-        partial = scan.snapshot() if scan is not None else halted
+        partial = scan.snapshot() if scan is not None else sent if sent is not None else halted
         return SceneState(partial, running=running, failure=failure)
 
     def request_scenes(
@@ -246,6 +295,15 @@ class MediaAnalyzer:
                 self._changed.wait(remaining)
             return True
 
+    @property
+    def separate_process(self) -> bool:
+        """読む仕事を今、別のプロセスで走らせているか（起こせない機械では偽になる）"""
+        return self._separate_process and not self._process_broken
+
+    def set_separate_process(self, enabled: bool) -> None:
+        """読む仕事を別のプロセスで走らせるか 次に始める仕事から効く"""
+        self._separate_process = enabled
+
     def set_scene_threads(self, threads: int) -> None:
         """場面の解析に使うデコードのスレッドの数 次に始める解析から効く 0 はすべて"""
         self._scene_threads = max(0, threads)
@@ -261,8 +319,11 @@ class MediaAnalyzer:
             stopping = [key for key in self._running if key[0] == "scenes"]
             for key in stopping:
                 scan = self._scans.get(key[1])
+                sent = self._partials.get(key[1])
                 if scan is not None:
                     self._halted[key[1]] = scan.snapshot()
+                elif sent is not None:
+                    self._halted[key[1]] = sent
             self._cancelled.update(stopping)
             for job in [key for key in self._again if key[0] == "scenes"]:
                 del self._again[job]
@@ -466,6 +527,40 @@ class MediaAnalyzer:
         with self._lock:
             return self._closed or key in self._cancelled
 
+    def _in_process(
+        self,
+        job: Callable[..., Any],
+        kwargs: dict[str, Any],
+        key: _JobKey,
+        media: MediaItem,
+        report: Callable[[float], None],
+        partial: Callable[[Any], None] | None = None,
+    ) -> tuple[bool, Any]:
+        """別のプロセスで走らせる ``(走らせたか, 結果)`` 走らせなかったら呼ぶ側がスレッドで読む
+
+        子が仕事の途中で落ちた・仕事が失敗したときは投げる（:meth:`_launch` が失敗として数える）
+        スレッドで読み直さない 素材のせいで FFmpeg が落ちたのなら、今度はアプリごと落ちる
+        """
+        minimum = PROCESS_MIN_SECONDS.get(key[0])
+        if not self.separate_process or minimum is None or media.duration < minimum:
+            # 短い素材と寄せない種類は、子の起動の分の方が重い（:data:`PROCESS_MIN_SECONDS`）
+            return False, None
+        try:
+            result = run_in_process(
+                job,
+                kwargs,
+                progress=report,
+                should_cancel=lambda: self._is_cancelled(key),
+                partial=partial,
+                name=f"sashimono-{key[0]}",
+            )
+        except WorkerUnavailableError as exc:
+            _log.warning("素材の解析を別のプロセスで走らせられないので、スレッドで読む: %s", exc)
+            with self._lock:
+                self._process_broken = True
+            return False, None
+        return True, result
+
     def _analyze_waveform(
         self, media: MediaItem, job: _JobKey, report: Callable[[float], None]
     ) -> bool:
@@ -474,14 +569,17 @@ class MediaAnalyzer:
         waveform = load_waveform(self._store, key)
 
         if waveform is None:
-            waveform = analyze_waveform(
-                media.path,
-                sample_rate=self._sample_rate,
-                channels=self._channels,
-                stream_index=stream,
-                progress=report,
-                should_cancel=lambda: self._is_cancelled(job),
-            )
+            options: dict[str, Any] = {
+                "path": media.path,
+                "sample_rate": self._sample_rate,
+                "channels": self._channels,
+                "stream_index": stream,
+            }
+            ran, waveform = self._in_process(analyze_waveform, options, job, media, report)
+            if not ran:
+                waveform = analyze_waveform(
+                    **options, progress=report, should_cancel=lambda: self._is_cancelled(job)
+                )
             if waveform is None:
                 return False
             save_waveform(self._store, key, waveform)
@@ -497,14 +595,17 @@ class MediaAnalyzer:
         filmstrip = load_filmstrip(self._store, key)
 
         if filmstrip is None:
-            filmstrip = build_filmstrip(
-                media.path,
-                interval=interval,
-                height=THUMBNAIL_HEIGHT,
-                stream_index=stream,
-                progress=report,
-                should_cancel=lambda: self._is_cancelled(job),
-            )
+            options: dict[str, Any] = {
+                "path": media.path,
+                "interval": interval,
+                "height": THUMBNAIL_HEIGHT,
+                "stream_index": stream,
+            }
+            ran, filmstrip = self._in_process(build_filmstrip, options, job, media, report)
+            if not ran:
+                filmstrip = build_filmstrip(
+                    **options, progress=report, should_cancel=lambda: self._is_cancelled(job)
+                )
             if filmstrip is None:
                 return False
             save_filmstrip(self._store, key, filmstrip)
@@ -518,26 +619,51 @@ class MediaAnalyzer:
         signal = load_scenes(self._store, key)
 
         if signal is None:
-            scan = SceneScan()
-            with self._lock:
-                self._scans[media.id] = scan
+
+            def received(partial: SceneSignal) -> None:
+                with self._lock:
+                    if job not in self._cancelled:
+                        self._partials[media.id] = partial
+
             try:
-                signal = analyze_scenes(
-                    media.path,
-                    threads=self._scene_threads,
-                    scan=scan,
-                    progress=report,
-                    should_cancel=lambda: self._is_cancelled(job),
+                ran, signal = self._in_process(
+                    scenes_job,
+                    {"path": media.path, "threads": self._scene_threads},
+                    job,
+                    media,
+                    report,
+                    partial=received,
                 )
             finally:
                 with self._lock:
-                    if self._scans.get(media.id) is scan:
-                        del self._scans[media.id]
+                    self._partials.pop(media.id, None)
+            if not ran:
+                signal = self._scenes_here(media, job, report)
             if signal is None:
                 return False
             save_scenes(self._store, key, signal)
 
         return self._publish_scenes(job, media.id, key, signal)
+
+    def _scenes_here(
+        self, media: MediaItem, job: _JobKey, report: Callable[[float], None]
+    ) -> SceneSignal | None:
+        """このプロセスのスレッドで場面を読む 途中の並びは AI が直に写す"""
+        scan = SceneScan()
+        with self._lock:
+            self._scans[media.id] = scan
+        try:
+            return analyze_scenes(
+                media.path,
+                threads=self._scene_threads,
+                scan=scan,
+                progress=report,
+                should_cancel=lambda: self._is_cancelled(job),
+            )
+        finally:
+            with self._lock:
+                if self._scans.get(media.id) is scan:
+                    del self._scans[media.id]
 
 
 def _interval_for(duration: Fraction) -> Fraction:
