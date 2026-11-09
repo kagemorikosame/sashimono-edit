@@ -106,10 +106,12 @@ def test_glyphs_from_a_fallback_family_are_bold_too() -> None:
 
     可変フォントの太字は太さの軸で掛ける Qt の太字の印を立てないので、代わりの書体へ
     太字が渡らないと、同じ行の中で英字だけ太く仮名と漢字が細い字になる
+    代わりに選ばれる書体は機械で違い、太る割合も違う（手元で 2.7 倍・CI で 1.26 倍）
+    太字が渡らなければ 1 倍のままなので、ほかの試験と同じ 1.1 倍で見分ける
     """
     _needs("Bahnschrift Light")
     assert (
-        _ink("Bahnschrift Light", JAPANESE, bold=True) > _ink("Bahnschrift Light", JAPANESE) * 1.3
+        _ink("Bahnschrift Light", JAPANESE, bold=True) > _ink("Bahnschrift Light", JAPANESE) * 1.1
     )
 
 
