@@ -361,6 +361,9 @@ def check_reference(count: Count) -> None:
     映ったコマが 1 枚で間隔が無く、止まりの数でも見分けられない 素材は毎コマ絵が
     変わる物を使う前提なので、映った fps が低すぎる回と、窓が出るのが遅れて頭が
     止まって写った回を断る
+
+    枠に ffplay ではない動く絵（別の窓の動画など）が入っていると、ここは通ってしまう
+    数字からは見分けられないので、撮っている間に人が目で確かめる（:func:`count_reference`）
     """
     if count.shown_fps < REFERENCE_MIN_FPS:
         raise SystemExit(
@@ -418,6 +421,14 @@ def count_reference(
         # ffplay が先に終わっていると、机の上を撮って低い数字を基準として出すことになる
         if player.poll() is not None:
             raise SystemExit("ffplay が映し始める前に終わった 素材の場所と ffplay を確かめる")
+        # 数字では ffplay の絵か、枠に入った別の動く絵かを見分けられない 撮っている間に
+        # 枠の中が ffplay の窓だけかを人が見て、違えば止めて撮り直せるように知らせる
+        print(
+            "ffplay の窓が枠にぴったり重なり、ほかの動く絵が枠に入っていないかを目で確かめる"
+            " 違っていたら Ctrl+C で止めて --region を直す",
+            file=sys.stderr,
+            flush=True,
+        )
 
         def still_playing() -> None:
             # 撮り終えた直後に見る 数え終えてからだと、数えている間に ffplay が普通に
