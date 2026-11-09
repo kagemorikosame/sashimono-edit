@@ -20,6 +20,7 @@ import av
 import numpy as np
 import pytest
 
+from sashimono.core.commands import Document, TrimClip
 from sashimono.core.io.serialize import load_project
 from sashimono.core.model import (
     AnimatedValue,
@@ -28,6 +29,7 @@ from sashimono.core.model import (
     GeneratedSource,
     MediaId,
     MediaItem,
+    PackedSpan,
     Project,
     Track,
     TrackKind,
@@ -696,6 +698,29 @@ class TestRoundTrip:
         opened = open_package(package, tmp_path / "opened")
         moved = load_project(opened.project_path).media[0]
         assert _frames_equal(item.path, moved.path, [Span(Fraction(0), Fraction(7))])
+        # まるごと入れた素材は範囲を持たない 持たせると、入っている所まで断る
+        assert moved.packed == ()
+
+    def test_the_opened_work_knows_which_range_is_inside(
+        self, media_dir: Path, tmp_path: Path
+    ) -> None:
+        """範囲を持たないと、開いた先で範囲の外へトリムを伸ばしたクリップが黙って何も出さない"""
+        item = probe_media(_video(media_dir))
+        clip = _clip(item, 60, 30, Fraction(2))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [clip]),
+            package,
+            PackOptions(margin=Fraction(1, 2)),
+            scratch=tmp_path / "s",
+        )
+        opened = open_package(package, tmp_path / "opened")
+        again = load_project(opened.project_path)
+        assert again.media[0].packed == (PackedSpan(Fraction(3, 2), Fraction(7, 2)),)
+        document = Document(again)
+        with pytest.raises(ValueError, match="持ち出し用パッケージに入っている範囲"):
+            document.execute(TrimClip(clip.id, head_delta=-30))
+        document.execute(TrimClip(clip.id, head_delta=-10))
 
 
 def _picture(directory: Path) -> Path:

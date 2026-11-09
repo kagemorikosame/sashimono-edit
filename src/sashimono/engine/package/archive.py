@@ -39,7 +39,7 @@ from sashimono.core.io.serialize import (
     project_to_dict,
     save_project,
 )
-from sashimono.core.model import MediaId, MediaItem, Project
+from sashimono.core.model import MediaId, MediaItem, PackedSpan, Project
 from sashimono.engine.package.plan import (
     Usage,
     file_fields,
@@ -346,10 +346,23 @@ def write_package(
             names = {entry.media_id: entry.name for entry in entries if entry.media_id is not None}
             # 中の場所は番号だけなので、表示の名前が空の素材は元のファイルの名前を残す
             # 残さないと、開いた先の素材一覧とクリップに 0001.mp4 と出て、どの素材か分からない
+            # 範囲だけを入れた素材には、入っている区間を持たせる（#445） 開いた先で範囲の外を
+            # 読む編集を、理由を言って断るため（持たせないと黙って錨の絵か何も無い所が出る）
+            packed = {
+                entry.media_id: _packed_spans(by_id[entry.media_id], entry.spans)
+                for entry in entries
+                if entry.media_id is not None and entry.spans is not None and not entry.whole
+            }
             named = replace(
                 project,
                 media=tuple(
-                    replace(item, display_name=item.display_name or Path(item.path).name)
+                    replace(
+                        item,
+                        display_name=item.display_name or Path(item.path).name,
+                        # まるごと入れた素材は元の区間のまま（展開した作品をもう 1 度持ち出すと、
+                        # 元のファイルにも区間の中しか無い）
+                        packed=packed.get(item.id, item.packed),
+                    )
                     for item in project.media
                 ),
             )
@@ -422,6 +435,23 @@ def _unused_place(item: MediaItem) -> Path:
     """使っていない素材の場所 元のフォルダ（ユーザー名が入る）は捨てて名前だけ残す"""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(item.path).name).strip(" .") or "素材"
     return Path(UNUSED_PREFIX) / name
+
+
+def _packed_spans(item: MediaItem, spans: list[Span]) -> tuple[PackedSpan, ...]:
+    """切り出した区間を、作品の素材に持たせる形にする
+
+    展開した作品をもう 1 度持ち出したときは、元のファイルにも前の区間しか無い 余裕を足した
+    区間が前の区間の外へはみ出した所は無いので、前の区間と重なる所だけにする
+    """
+    if not item.packed:
+        return tuple(PackedSpan(span.start, span.end) for span in spans)
+    found = []
+    for span in spans:
+        for earlier in item.packed:
+            start, end = max(span.start, earlier.start), min(span.end, earlier.end)
+            if start <= end:
+                found.append(PackedSpan(start, end))
+    return tuple(found)
 
 
 def _put_entry(

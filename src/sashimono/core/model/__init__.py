@@ -33,7 +33,7 @@ from sashimono.core.model.ids import (
     new_stroke_id,
     new_track_id,
 )
-from sashimono.core.model.media import AudioStreamInfo, MediaItem, VideoStreamInfo
+from sashimono.core.model.media import AudioStreamInfo, MediaItem, PackedSpan, VideoStreamInfo
 from sashimono.core.model.project import Blending, LayerMode, Project, ProjectSettings, Scene
 from sashimono.core.model.stroke import (
     LEGACY_BORDER_COLOR,
@@ -100,6 +100,7 @@ __all__ = [
     "Marker",
     "MediaId",
     "MediaItem",
+    "PackedSpan",
     "ParamValue",
     "Project",
     "ProjectSettings",

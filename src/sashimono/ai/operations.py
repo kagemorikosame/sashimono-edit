@@ -1179,6 +1179,21 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
                 str(number): len(item.transcript_for(stream.index) or ())
                 for number, stream in enumerate(item.audio_streams, start=1)
             },
+            # 素材のファイルが無い（別の PC へ移した作品 #447） 絵は映らず音は無音になる
+            # relink_media で付け替えられる
+            "missing": not Path(item.path).is_file(),
+            # 持ち出し用パッケージで範囲だけを入れた素材の、入っている区間（秒 #445）
+            # 外を読む編集は断られるので、AI は先にここで読める所を知る
+            **(
+                {
+                    "packed_seconds": [
+                        [round(float(span.start), 3), round(float(span.end), 3)]
+                        for span in item.packed
+                    ]
+                }
+                if item.packed
+                else {}
+            ),
         }
         for item in project.media
         if not wanted or wanted in item.name
@@ -10203,7 +10218,12 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_media",
-        description="メディアプールの素材を一覧する media_id はここで得る" + PAGING_NOTE,
+        description=(
+            "メディアプールの素材を一覧する media_id はここで得る missing が true の素材はファイルが"
+            "見つからない（relink_media で付け替える） packed_seconds がある素材は持ち出し用"
+            "パッケージで入っている区間だけがあり、外を読む編集は断られる"
+        )
+        + PAGING_NOTE,
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
         sends=_WITH_FILES,

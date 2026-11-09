@@ -15,6 +15,7 @@ from pathlib import Path
 
 from sashimono.core.commands.base import Command
 from sashimono.core.model import MediaId, Project
+from sashimono.core.packed import packed_refusal
 
 __all__ = ["REPLACED_REFUSAL", "Author", "Document", "HistoryEntry", "SeenMedia"]
 
@@ -172,6 +173,11 @@ class Document:
         updated = command.apply(self._project)
         if updated is self._project:
             return updated
+        refusal = packed_refusal(self._project, updated)
+        if refusal is not None:
+            # 持ち出し用パッケージの範囲の外は素材が無い（#445） コマンドごとでなくここで断るので、
+            # 画面の操作も AI の道具も、後から足すコマンドも同じ理由で断られる
+            raise ValueError(refusal)
 
         author = by or (self._checkpoint_by if self._checkpoint_depth else Author.PERSON)
         if self._replaced and author is Author.AI:

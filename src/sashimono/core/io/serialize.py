@@ -36,6 +36,7 @@ from sashimono.core.model import (
     Marker,
     MediaId,
     MediaItem,
+    PackedSpan,
     ParamValue,
     Project,
     ProjectSettings,
@@ -557,6 +558,19 @@ def _media_to_json(item: MediaItem) -> dict[str, Any]:
             {"stream": index, "transcript": _transcript_to_json(transcript)}
             for index, transcript in item.transcripts
         ],
+        # 持ち出し用パッケージで範囲だけを入れた素材のときだけ書く（#445） 前の本体は項目を
+        # 知らずに捨てて開く（範囲の外を断らないだけで、絵と時刻は同じ） 版を上げて開けなく
+        # するより、開けて編集できる方が困らない
+        **(
+            {
+                "packed": [
+                    [_fraction_to_json(span.start), _fraction_to_json(span.end)]
+                    for span in item.packed
+                ]
+            }
+            if item.packed
+            else {}
+        ),
     }
 
 
@@ -614,6 +628,7 @@ def _media_from_json(raw: object, version: int) -> MediaItem:
         audio_streams=tuple(audio_streams),
         display_name=_get_str(data, "display_name"),
         id=MediaId(_get_str(data, "id")),
+        packed=_packed_from_json(data),
     )
     # 7 までは素材に 1 つ（1 本目の音声の字幕） 8 からは音声ストリームごと
     legacy = data.get("transcript")
@@ -625,6 +640,18 @@ def _media_from_json(raw: object, version: int) -> MediaItem:
             _transcript_from_json(pair.get("transcript")), _get_int(pair, "stream")
         )
     return item
+
+
+def _packed_from_json(data: dict[str, Any]) -> tuple[PackedSpan, ...]:
+    """持ち出し用パッケージに入っている区間（#445） 無ければ空（素材の全体がある）"""
+    spans = []
+    for raw in _get_list(data, "packed"):
+        if not isinstance(raw, list) or len(raw) != 2:
+            raise ProjectFileError(f"packed の区間の形が違う: {raw!r}")
+        spans.append(
+            PackedSpan(_fraction_from_json(raw[0], "packed"), _fraction_from_json(raw[1], "packed"))
+        )
+    return tuple(spans)
 
 
 # --- タイムライン ---------------------------------------------------------

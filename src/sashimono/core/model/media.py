@@ -19,6 +19,7 @@ __all__ = [
     "WIDE_GAMUT_PRIMARIES",
     "AudioStreamInfo",
     "MediaItem",
+    "PackedSpan",
     "VideoStreamInfo",
 ]
 
@@ -109,6 +110,25 @@ class AudioStreamInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedSpan:
+    """持ち出し用パッケージに入っている素材の区間（秒 素材の原点から ``[start, end]``）#445
+
+    パッケージは使っている範囲だけを入れるので、開いた先では区間の外に絵も音も無い
+    """
+
+    start: Fraction
+    end: Fraction
+
+    def __post_init__(self) -> None:
+        if self.end < self.start:
+            raise ValueError(f"区間の終わりが頭より前: {self.start} - {self.end}")
+
+    def covers(self, start: Fraction, end: Fraction) -> bool:
+        """``[start, end]`` がこの区間に収まるか"""
+        return self.start <= start and end <= self.end
+
+
+@dataclass(frozen=True, slots=True)
 class MediaItem:
     """メディアプールに登録された 1 つの素材"""
 
@@ -125,10 +145,19 @@ class MediaItem:
     #: 空ならファイル名を表示名として使う
     display_name: str = ""
     id: MediaId = field(default_factory=new_media_id)
+    #: 持ち出し用パッケージで使っている範囲だけを入れた素材の、入っている区間（#445）
+    #: 空なら素材の全体がある 区間の外を読む編集は :mod:`sashimono.core.packed` が断る
+    #: 持たせないと、範囲の外へトリムを伸ばしたクリップが黙って錨の絵か何も無い所を出し、
+    #: なぜ絵が出ないのかが人にも AI にも分からない
+    packed: tuple[PackedSpan, ...] = ()
 
     def __post_init__(self) -> None:
         if self.duration < 0:
             raise ValueError(f"長さが負: {self.duration}")
+
+    def covers(self, start: Fraction, end: Fraction) -> bool:
+        """素材の ``[start, end]`` を読めるか 範囲を持たない素材はどこでも読める"""
+        return not self.packed or any(span.covers(start, end) for span in self.packed)
 
     @property
     def name(self) -> str:

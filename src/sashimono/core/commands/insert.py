@@ -235,11 +235,19 @@ def _place(
     if project.find_media(media.id) is None:
         commands.append(AddMedia(media))
 
+    rounding = Rounding.NEAREST
+    if span is None and media.packed:
+        # 持ち出し用パッケージで範囲だけを入れた素材は、入っている区間に収めて置く（#445）
+        # 全体を置こうとすると範囲の外を読むので断られ、素材一覧から置き直せなくなる
+        # 区間が何か所かあれば一番長い所 切り捨てるのは、丸めて 1 コマ外へ出ると断られるため
+        longest = max(media.packed, key=lambda packed: packed.end - packed.start)
+        span = (longest.start, longest.end)
+        rounding = Rounding.FLOOR
     source_in = Fraction(0) if span is None else span[0]
     duration = (
         _timeline_duration(project, media)
         if span is None
-        else max(1, seconds_to_frame(span[1] - span[0], project.rate, Rounding.NEAREST))
+        else max(1, seconds_to_frame(span[1] - span[0], project.rate, rounding))
     )
     if duration <= 0:
         return commands
