@@ -45,33 +45,49 @@ os.environ["LOCALAPPDATA"] = str(_base / "local")
 from sashimono.memory_usage import process_memory  # noqa: E402
 
 
-def _private_mb() -> float:
+def _memory_mb() -> tuple[float, float]:
+    """（コミット, 作業セット） コミットを測れない OS では作業セットを 2 つ並べる"""
     usage = process_memory()
     if usage is None:
-        return 0.0
-    return usage.private_mb if usage.private_mb is not None else usage.resident_mb
+        return 0.0, 0.0
+    private = usage.private_mb if usage.private_mb is not None else usage.resident_mb
+    return private, usage.resident_mb
 
 
 class Steps:
-    """段ごとのメモリを積み、前の段との差を出す"""
+    """段ごとのメモリを積み、前の段との差を出す
+
+    コミット（確保した分）と作業セット（実際に物理メモリに載っている分）を並べる
+    タスクマネージャーの「メモリ」は作業セットに近く、コミットだけを見ると、確保しただけで
+    使っていない分（OpenBLAS の作業の領域など）まで重く見える
+    """
 
     def __init__(self) -> None:
-        self._rows: list[tuple[str, float]] = []
+        self._rows: list[tuple[str, float, float]] = []
 
     def mark(self, name: str) -> float:
         gc.collect()
-        value = _private_mb()
+        private, resident = _memory_mb()
         previous = self._rows[-1][1] if self._rows else 0.0
-        self._rows.append((name, value))
-        print(f"{name}: {value:.0f} MB（+{value - previous:.0f}）")
-        return value
+        self._rows.append((name, private, resident))
+        print(
+            f"{name}: コミット {private:.0f} MB（+{private - previous:.0f}）"
+            f" 作業セット {resident:.0f} MB"
+        )
+        return private
 
     def table(self) -> str:
-        lines = ["| 段 | コミット MB | 前の段から |", "|---|---|---|"]
-        previous = 0.0
-        for name, value in self._rows:
-            lines.append(f"| {name} | {value:.0f} | +{value - previous:.0f} |")
-            previous = value
+        lines = [
+            "| 段 | コミット MB | 前の段から | 作業セット MB | 前の段から |",
+            "|---|---|---|---|---|",
+        ]
+        before = (0.0, 0.0)
+        for name, private, resident in self._rows:
+            lines.append(
+                f"| {name} | {private:.0f} | +{private - before[0]:.0f} | {resident:.0f} | "
+                f"+{resident - before[1]:.0f} |"
+            )
+            before = (private, resident)
         return "\n".join(lines)
 
 
