@@ -29,10 +29,19 @@ from sashimono.effects.spec import FileSpec, FontSpec
 from sashimono.effects.strokes import STROKE
 from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.decode.probe import STILL_SUFFIXES
-from sashimono.engine.package.remux import Span, spans_union
+from sashimono.engine.package.remux import (
+    EDITING_CODECS,
+    REENCODE_CRF,
+    REENCODE_LEAST_PSNR,
+    Span,
+    spans_union,
+)
 
 __all__ = [
+    "EDITING_NAMES",
+    "REENCODE_NOTE",
     "Usage",
+    "editing_media",
     "file_fields",
     "file_paths",
     "folder_kinds",
@@ -153,6 +162,50 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
     return {
         key: (spans_union(spans) if spans is not None else None) for key, spans in found.items()
     }
+
+
+#: 編集用の大きな形式の呼び名（窓と知らせに出す） 無い物は符号の名前のまま出す
+EDITING_NAMES = {
+    "prores": "ProRes",
+    "dnxhd": "DNxHD・DNxHR",
+    "rawvideo": "無圧縮",
+    "v210": "無圧縮 10bit",
+    "v410": "無圧縮 10bit 4:4:4",
+    "cfhd": "CineForm",
+    "huffyuv": "HuffYUV",
+    "ffvhuff": "HuffYUV",
+    "utvideo": "Ut Video",
+    "magicyuv": "MagicYUV",
+}
+
+
+#: 符号にし直すと何が変わるか（窓と AI の確かめの箱に出す #446）
+#: 大きさと差は、ffmpeg で作った 1080p の試験の素材（3 秒）で測った値（PR に記す）
+REENCODE_NOTE = (
+    f"映像だけを H.264（CRF {REENCODE_CRF}）にし直します 色の深さと色差の間引き（10bit 4:2:2 など）"
+    "と時刻は元のまま、音は元のまま入れます\n"
+    "画質は元と完全には同じになりません 元との差は PSNR 50〜55 dB ほど（目では見分けにくい程度）"
+    f"で、{REENCODE_LEAST_PSNR:.0f} dB に届かない素材と、小さくならない素材は元のまま入れます\n"
+    "大きさの目安は ProRes 422 HQ・DNxHR HQ で元の 1.5〜4 割、無圧縮で数 % です"
+    "（絵の細かさで大きく変わります） 符号にし直す分、書き出しに時間が掛かります"
+)
+
+
+def editing_media(project: Project) -> tuple[str, ...]:
+    """使っている素材のうち編集用の大きな形式の物（``名前（ProRes）`` の形 #446）
+
+    素材の情報（取り込んだときに読んだ符号の名前）で見る 書き出しの窓を開くたびに
+    素材を開き直すと、数十本の素材で窓が出るまで待たされる
+    """
+    used = media_spans(project, Fraction(0))
+    found: list[str] = []
+    for item in project.media:
+        if item.id not in used:
+            continue
+        codecs = [stream.codec for stream in item.video_streams if stream.codec in EDITING_CODECS]
+        if codecs:
+            found.append(f"{item.name}（{EDITING_NAMES.get(codecs[0], codecs[0])}）")
+    return tuple(found)
 
 
 def _is_still(item: MediaItem) -> bool:

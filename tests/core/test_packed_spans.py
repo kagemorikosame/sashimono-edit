@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from sashimono.core.commands import AddClip, Command, Document, TrimClip
-from sashimono.core.commands.speed import ChangeSpeed
 from sashimono.core.commands.insert import place_media
+from sashimono.core.commands.speed import ChangeSpeed
 from sashimono.core.io.serialize import load_project, project_from_dict, project_to_dict
 from sashimono.core.io.serialize import save_project as save
 from sashimono.core.model import (
@@ -55,9 +55,9 @@ def _media(packed: tuple[PackedSpan, ...]) -> MediaItem:
     )
 
 
-def _document(packed: tuple[PackedSpan, ...] = (PackedSpan(Fraction(10), Fraction(20)),)) -> (
-    tuple[Document, Clip]
-):
+def _document(
+    packed: tuple[PackedSpan, ...] = (PackedSpan(Fraction(10), Fraction(20)),),
+) -> tuple[Document, Clip]:
     item = _media(packed)
     # 素材の 12 秒から 3 秒（90 コマ）を読むクリップ 入っている範囲は 10〜20 秒
     clip = Clip(timeline_start=600, duration=90, media_id=item.id, source_in=Fraction(12))
@@ -137,7 +137,7 @@ class TestRefusal:
         """2 か所の範囲の間は素材が無いので、またぐと途中が抜ける"""
         packed = (PackedSpan(Fraction(10), Fraction(14)), PackedSpan(Fraction(16), Fraction(20)))
         document, clip = _document(packed)
-        with pytest.raises(ValueError, match="10.0〜14.0 秒、16.0〜20.0 秒"):
+        with pytest.raises(ValueError, match=r"10\.0〜14\.0 秒、16\.0〜20\.0 秒"):
             document.execute(TrimClip(clip.id, tail_delta=30))
 
     def test_media_without_ranges_is_never_checked(self) -> None:
@@ -157,9 +157,7 @@ class TestPlacing:
         with document.checkpoint("置く"):
             for command in commands:
                 document.execute(command)
-        placed = [
-            c.clip for c in commands if isinstance(c, AddClip) and c.clip.media_id == item.id
-        ]
+        placed = [c.clip for c in commands if isinstance(c, AddClip) and c.clip.media_id == item.id]
         assert placed
         for clip in placed:
             assert clip.source_in == Fraction(30)

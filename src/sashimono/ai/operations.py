@@ -478,6 +478,7 @@ from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
 from sashimono.engine.package.archive import PACKAGE_SUFFIX, RIGHTS_NOTE
+from sashimono.engine.package.plan import REENCODE_NOTE, editing_media
 from sashimono.engine.reframe import (
     FaceSummary,
     GatheredFaces,
@@ -8864,6 +8865,7 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
     _wait_seconds(arguments)
     whole = _package_flag(arguments, "whole")
     keep = _package_flag(arguments, "keep_metadata")
+    reencode = _package_flag(arguments, "reencode")
     margin = arguments.get("margin_seconds", _PACKAGE_MARGIN_DEFAULT)
     low, high = _PACKAGE_MARGIN_RANGE
     if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
@@ -8876,7 +8878,15 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
         + ("全体を入れます" if whole else f"使っている範囲だけ（前後 {margin} 秒）を入れます"),
         "撮った場所などの付け足しの情報を"
         + ("残します" if keep else "取り除きます（回転と色の情報は残ります）"),
-        "画質と音質は元のまま 書体と AviUtl のスクリプトは入れません",
+        (
+            "編集用の大きな形式の素材を H.264 にし直します: "
+            + ("、".join(editing_media(host.document.project)) or "（対象の素材はありません）")
+            + "\n"
+            + REENCODE_NOTE
+            if reencode
+            else "画質と音質は元のまま"
+        ),
+        "書体と AviUtl のスクリプトは入れません",
         RIGHTS_NOTE,
         _replacing(path, "ファイル"),
     ]
@@ -8886,6 +8896,7 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
         margin=Fraction(margin),
         keep_metadata=keep,
         expect=expect_now(path),
+        reencode=reencode,
     )
     _refuse_elsewhere()
     return _PackagePlan(request=request, detail="\n".join(part for part in parts if part))
@@ -10219,9 +10230,9 @@ OPERATIONS: tuple[Operation, ...] = (
     Operation(
         name="list_media",
         description=(
-            "メディアプールの素材を一覧する media_id はここで得る missing が true の素材はファイルが"
-            "見つからない（relink_media で付け替える） packed_seconds がある素材は持ち出し用"
-            "パッケージで入っている区間だけがあり、外を読む編集は断られる"
+            "メディアプールの素材を一覧する media_id はここで得る missing が true の素材は"
+            "ファイルが見つからない（relink_media で付け替える） packed_seconds がある素材は"
+            "持ち出し用パッケージで入っている区間だけがあり、外を読む編集は断られる"
         )
         + PAGING_NOTE,
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
@@ -13214,10 +13225,11 @@ OPERATIONS: tuple[Operation, ...] = (
             + PACKAGE_SUFFIX
             + "）にまとめて、素材の無い別の PC でも"
             "開いて編集・書き出しできるようにする（画面の〔持ち出し用に書き出す…〕と同じ）"
-            " 毎回ユーザーに確かめる 画質と音質は元のまま（再エンコードしない） 既定は使っている"
-            "範囲だけを入れ、撮った場所などの付け足しの情報を取り除く 書体と AviUtl のスクリプトは"
-            "入れない 書き出しは裏で進み、すぐ戻る 様子は package_status で読む 書けるのは今の"
-            "作品のフォルダと、書き出しの窓で前に選んだフォルダの中だけ"
+            " 毎回ユーザーに確かめる 既定は画質と音質が元のまま（再エンコードしない）"
+            " 既定は使っている範囲だけを入れ、撮った場所などの付け足しの情報を取り除く"
+            " 書体と AviUtl のスクリプトは入れない 書き出しは裏で進み、すぐ戻る"
+            " 様子は package_status で読む 書けるのは今の作品のフォルダと、"
+            "書き出しの窓で前に選んだフォルダの中だけ"
         ),
         schema=_schema(
             {
@@ -13235,6 +13247,11 @@ OPERATIONS: tuple[Operation, ...] = (
                 ),
                 "keep_metadata": _boolean(
                     "撮った場所・機器の名前などを残す（既定 false は取り除く 回転と色は残る）"
+                ),
+                "reencode": _boolean(
+                    "ProRes・DNxHR・無圧縮などの編集用の大きな形式の映像を H.264 にし直して小さく"
+                    "する（既定 false 画質がわずかに変わるので、ユーザーが小さくしたいと言った"
+                    "ときだけ true にする）"
                 ),
                 "wait_seconds": _number(
                     f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"

@@ -3,6 +3,10 @@
 書き出しの窓は、何を入れるか（使う範囲だけ・素材の全体）と、付け足しの情報（撮った場所
 など）を残すかを選ぶ 既定は知らない人が困らない側（使う範囲だけ・取り除く）
 選んだ物は覚えて、次に開いた窓の初めの値にする
+
+編集用の大きな形式を符号にし直す選択（#446）だけは覚えない 画質を元のまま持ち出す約束
+（#423）から外れる選択なので、前に 1 度選んだだけで次からも黙って画質が変わると困る
+作品にその形式の素材があるときだけ押せるようにし、何が変わるかを窓に書く
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ from sashimono.engine.package.archive import (
     PackOptions,
     PackResult,
 )
+from sashimono.engine.package.plan import REENCODE_NOTE
+from sashimono.engine.package.remux import Reencoded
 from sashimono.ui.workspace import PACKAGE_MARGINS, Preferences
 
 __all__ = [
@@ -93,7 +99,12 @@ class PackageExportDialog(QDialog):
     """持ち出し用に書き出す窓 OK で書き出し先と選び方が決まる（書くのは呼ぶ側）"""
 
     def __init__(
-        self, preferences: Preferences, suggested: Path, parent: QWidget | None = None
+        self,
+        preferences: Preferences,
+        suggested: Path,
+        parent: QWidget | None = None,
+        *,
+        editing: tuple[str, ...] = (),
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("持ち出し用に書き出す")
@@ -126,14 +137,40 @@ class PackageExportDialog(QDialog):
             "回転と色の情報は切っていても残る 画質と音質はどちらでも元のまま"
         )
 
+        self._reencode = QCheckBox(
+            "編集用の大きな形式（ProRes・DNxHR・無圧縮など）を H.264 にし直して小さくする"
+            "（画質がわずかに変わる）",
+            self,
+        )
+        # 覚えない（モジュールの説明） いつも切った状態から始める
+        self._reencode.setChecked(False)
+        self._reencode.setEnabled(bool(editing))
+        self._reencode_note = QLabel(
+            (
+                "対象: "
+                + "、".join(editing[:10])
+                + (f" ほか {len(editing) - 10}" if len(editing) > 10 else "")
+                if editing
+                else "この作品には編集用の大きな形式の素材がありません"
+            )
+            + "\n"
+            + REENCODE_NOTE,
+            self,
+        )
+        self._reencode_note.setWordWrap(True)
+        self._reencode_note.setEnabled(bool(editing))
+
         form = QFormLayout()
         form.addRow("書き出し先", place)
         form.addRow("入れる素材", self._used)
         form.addRow("", self._whole)
         form.addRow("前後の余裕", self._margin)
         form.addRow(self._keep)
+        form.addRow(self._reencode)
+        form.addRow(self._reencode_note)
         note = QLabel(
-            "画質と音質は元のまま（再エンコードしない） 書体と AviUtl のスクリプトは入れない"
+            "上の選択を切っていれば、画質と音質は元のまま（再エンコードしない） "
+            "書体と AviUtl のスクリプトは入れない"
             "（配る許しが物ごとに違うため） 使っている物の一覧を書き出した後に知らせる\n"
             + RIGHTS_NOTE,
             self,
@@ -164,6 +201,7 @@ class PackageExportDialog(QDialog):
             whole=self._whole.isChecked(),
             margin=Fraction(self._margin.value()),
             keep_metadata=self._keep.isChecked(),
+            reencode=self._reencode.isChecked(),
         )
 
     def remembered(self, preferences: Preferences) -> Preferences:
@@ -233,7 +271,21 @@ def packed_summary(result: PackResult) -> str:
     text += _listed("付け足しの情報を取り除けずに入れた物", result.metadata_kept)
     text += _listed("見つからなかったファイル（設定が指していた物）", result.missing_files)
     text += _listed("使っていないので入れなかった素材（素材一覧には残る）", result.unused_media)
+    text += _listed(
+        "H.264 にし直して入れた素材（元との差 PSNR・大きさ）",
+        [_reencoded_text(name, report) for name, report in result.reencoded],
+    )
+    text += _listed(
+        "し直せず（差が大きい・小さくならない・形が合わない）元のまま入れた素材",
+        result.not_reencoded,
+    )
     return text
+
+
+def _reencoded_text(name: str, report: Reencoded) -> str:
+    """符号にし直した素材 1 つの知らせ"""
+    shrink = f" {report.after / report.before:.0%} の大きさ" if report.before else ""
+    return f"{name}（{report.psnr:.1f} dB{shrink}）"
 
 
 def opened_summary(opened: OpenedPackage) -> str:

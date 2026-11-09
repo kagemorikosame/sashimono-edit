@@ -26,6 +26,7 @@ from sashimono.engine.package.archive import PACKAGE_SUFFIX, OpenedPackage, Pack
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.package_dialog import PackageExportDialog
+from sashimono.ui.workspace import Preferences
 from tests.ai.conftest import allow_sending
 from tests.media_fixtures import SampleMedia
 from tests.ui.ai_tool_calls import call_tool
@@ -137,6 +138,26 @@ def test_the_person_exports_from_the_menu_and_the_choice_is_remembered(
     assert (tmp_path / f"人の持ち出し{PACKAGE_SUFFIX}").is_file()
     assert window._preferences.package_whole and window._preferences.package_keep_metadata
     assert told and "書き出しました" in told[0]
+
+
+def test_reencoding_starts_off_and_says_what_changes(
+    qt_application: QApplication, tmp_path: Path
+) -> None:
+    """し直す選択を覚えたり既定で入れたりすると、品質そのままのつもりの持ち出しで絵が変わる
+    対象の素材が無いのに押せると、何も変わらないのに画質が変わる選択に見える（#446）"""
+    preferences = Preferences()
+    none = PackageExportDialog(preferences, tmp_path / "a.smex")
+    assert not none._reencode.isEnabled() and not none.options().reencode
+    some = PackageExportDialog(preferences, tmp_path / "a.smex", editing=("本編.mov（ProRes）",))
+    assert some._reencode.isEnabled() and not some._reencode.isChecked()
+    # 何が変わるかを窓に書く（対象・符号・画質の扱い）
+    note = some._reencode_note.text()
+    assert "本編.mov（ProRes）" in note and "H.264" in note and "PSNR" in note
+    some._reencode.setChecked(True)
+    assert some.options().reencode
+    # 覚えない 次に開いた窓はまた切った状態から
+    again = PackageExportDialog(some.remembered(preferences), tmp_path / "a.smex", editing=("x",))
+    assert not again._reencode.isChecked()
 
 
 def _held_open(monkeypatch: pytest.MonkeyPatch) -> threading.Event:

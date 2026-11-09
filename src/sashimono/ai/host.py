@@ -98,6 +98,8 @@ class PackageRequest:
     keep_metadata: bool
     #: 許したときの書き出し先の身元（:attr:`ExportRequest.expect` と同じ）
     expect: Expected
+    #: 編集用の大きな形式を H.264 にし直す（#446 画面の窓と同じく既定は偽）
+    reencode: bool = False
 
 
 @dataclass(frozen=True, slots=True)

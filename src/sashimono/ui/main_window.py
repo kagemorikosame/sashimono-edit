@@ -204,6 +204,7 @@ from sashimono.engine.package.archive import (
     write_package,
 )
 from sashimono.engine.package.archive import open_package as unpack_package
+from sashimono.engine.package.plan import editing_media
 from sashimono.engine.reframe import (
     FACES_CENTER,
     FACES_OFF,
@@ -3231,7 +3232,12 @@ class MainWindow(QMainWindow):
             self._path.parent if self._path is not None else (self.export_folder or Path.home())
         )
         stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", project.name).strip(" .") or "作品"
-        dialog = PackageExportDialog(self._preferences, folder / f"{stem}{PACKAGE_SUFFIX}", self)
+        dialog = PackageExportDialog(
+            self._preferences,
+            folder / f"{stem}{PACKAGE_SUFFIX}",
+            self,
+            editing=editing_media(project),
+        )
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -4914,7 +4920,10 @@ class MainWindow(QMainWindow):
             self._document.project,
             request.path,
             PackOptions(
-                whole=request.whole, margin=request.margin, keep_metadata=request.keep_metadata
+                whole=request.whole,
+                margin=request.margin,
+                keep_metadata=request.keep_metadata,
+                reencode=request.reencode,
             ),
             expect=replace(request.expect, keep=self._preferences.backup_generations),
             check=lambda: check_writable(
