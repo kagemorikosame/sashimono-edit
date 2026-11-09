@@ -63,6 +63,7 @@ UNDOABLE_TOOLS = frozenset(
     {
         # 素材・トラック・プロジェクトの設定
         "import_media",
+        "relink_media",
         "place_media",
         "add_track",
         "set_track_state",

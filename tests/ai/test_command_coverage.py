@@ -203,6 +203,14 @@ def _import_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "import_media", {"paths": [str(path)]}
 
 
+def _relink_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    host = _text_host(material)
+    path = material.tmp_path / "移した先.mp4"
+    path.write_bytes(b"")
+    # 空のファイルは素材として読めず違う素材に見えるので、確かめを越えて付け替えさせる
+    return host, "relink_media", {"media_id": _ids(host)["media"], "path": str(path), "force": True}
+
+
 def _place_subtitles(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     host = _text_host(material)
     return host, "place_subtitles", {"media_id": _ids(host)["media"]}
@@ -469,6 +477,7 @@ EXAMPLES: dict[str, Example] = {
     "place_scene": _place_scene,
     "add_text in a scene": _in_scene,
     "import_media": _import_media,
+    "relink_media": _relink_media,
     "place_subtitles": _place_subtitles,
     "jet_cut": _jet_cut,
     "smooth_cuts": _smooth_cuts,

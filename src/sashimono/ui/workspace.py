@@ -818,6 +818,11 @@ class Preferences:
     #: （``%LOCALAPPDATA%\Sashimono\packages``） 素材ごと取り出すので数十 GB になりうる
     #: 空きのある別のドライブへ移したい人がいるので、設定画面で選べるようにする
     package_folder: str = ""
+    #: 作品を開くとき、素材を作品のフォルダから見た相対の場所で先に探す（#447）
+    #: 偽（既定）は前と同じく保存したときの場所を先に見て、無ければ相対の場所を見る
+    #: 作品のフォルダを写して別の作品にした人は、写した先の素材を指してほしいことがあり、
+    #: 元の素材を指してほしい人もいる 既定は前の版と同じ物を開く側
+    media_relative_first: bool = False
     #: 持ち出し用に書き出す窓で前に選んだ物 好みではなく覚えている物なので設定画面には出さない
     #: 窓の既定は知らない人が困らない側（使う範囲だけ・前後 1 秒・付け足しの情報を取り除く）
     #: 素材をまるごと入れる
@@ -1282,6 +1287,9 @@ class PreferenceStore:
             ocr_engine=_choice(data.get("ocr_engine"), OCR_ENGINES, plain.ocr_engine),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
             package_folder=_folder(data.get("package_folder"), plain.package_folder),
+            media_relative_first=_flag(
+                data.get("media_relative_first"), plain.media_relative_first
+            ),
             package_whole=_flag(data.get("package_whole"), plain.package_whole),
             package_margin_seconds=_within(
                 data.get("package_margin_seconds"), PACKAGE_MARGINS, plain.package_margin_seconds

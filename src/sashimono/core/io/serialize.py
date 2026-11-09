@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -519,10 +521,26 @@ def _transcript_from_json(raw: object) -> Transcript:
 # --- 素材 -----------------------------------------------------------------
 
 
-def _media_to_json(item: MediaItem) -> dict[str, Any]:
+def _relative_place(path: Path, base: Path | None) -> dict[str, str]:
+    """作品のフォルダから見た素材の場所（#447） 書けないときは空
+
+    作品と素材をフォルダごと別の場所や別の PC へ移しても、同じ並びなら見つけられるように、
+    絶対の場所と一緒に書く 別のドライブにある素材は相対の場所で表せないので書かない
+    """
+    if base is None or not path.is_absolute():
+        return {}
+    try:
+        relative = os.path.relpath(path, base)
+    except ValueError:
+        return {}
+    return {"relative": Path(relative).as_posix()}
+
+
+def _media_to_json(item: MediaItem, base: Path | None = None) -> dict[str, Any]:
     return {
         "id": item.id,
         "path": str(item.path),
+        **_relative_place(Path(item.path), base),
         "duration": _fraction_to_json(item.duration),
         "display_name": item.display_name,
         "video_streams": [
@@ -574,7 +592,35 @@ def _media_to_json(item: MediaItem) -> dict[str, Any]:
     }
 
 
-def _media_from_json(raw: object, version: int) -> MediaItem:
+def _media_place(
+    data: dict[str, Any], base: Path | None, relative_first: bool, exists: Callable[[Path], bool]
+) -> Path:
+    """素材の場所 絶対の場所と、作品のフォルダから見た相対の場所（#447）のうち、ある方
+
+    どちらも無ければ絶対の場所（見つからない素材の知らせに、元の場所として出す）
+    相対の場所を先に見るかは本人の設定（``Preferences.media_relative_first``） 既定は前と同じ
+    絶対の場所が先 作品のフォルダを写して別の作品にした人は、写した先の素材を指してほしい
+    ことがあり、人によって答えが違う
+    """
+    absolute = Path(_get_str(data, "path"))
+    relative = data.get("relative")
+    if base is None or not isinstance(relative, str) or not relative:
+        return absolute
+    near = Path(os.path.normpath(base / relative))
+    order = (near, absolute) if relative_first else (absolute, near)
+    for place in order:
+        if exists(place):
+            return place
+    return absolute
+
+
+def _media_from_json(
+    raw: object,
+    version: int,
+    base: Path | None = None,
+    relative_first: bool = False,
+    exists: Callable[[Path], bool] = Path.is_file,
+) -> MediaItem:
     data = _require(raw, "media")
     video_streams = []
     for s in _get_list(data, "video_streams"):
@@ -622,7 +668,7 @@ def _media_from_json(raw: object, version: int) -> MediaItem:
         )
 
     item = MediaItem(
-        path=Path(_get_str(data, "path")),
+        path=_media_place(data, base, relative_first, exists),
         duration=_fraction_from_json(data.get("duration", 0), "duration"),
         video_streams=tuple(video_streams),
         audio_streams=tuple(audio_streams),
@@ -899,8 +945,11 @@ def style_guide_from_json(raw: object) -> StyleGuide:
     )
 
 
-def project_to_dict(project: Project) -> dict[str, Any]:
-    """プロジェクトを JSON にできる辞書へ"""
+def project_to_dict(project: Project, *, base: Path | None = None) -> dict[str, Any]:
+    """プロジェクトを JSON にできる辞書へ ``base`` は作品のファイルを置くフォルダ
+
+    ``base`` を渡すと、素材ごとにそこから見た相対の場所も書く（#447）
+    """
     settings = project.settings
     extra: dict[str, Any] = {}
     if not project.style_guide.empty:
@@ -923,7 +972,7 @@ def project_to_dict(project: Project) -> dict[str, Any]:
             "blending": settings.blending,
             "layer_mode": settings.layer_mode,
         },
-        "media": [_media_to_json(m) for m in project.media],
+        "media": [_media_to_json(m, base) for m in project.media],
         "timeline": _timeline_to_json(project.timeline),
         "scenes": [
             {"id": scene.id, "name": scene.name, "timeline": _timeline_to_json(scene.timeline)}
@@ -933,8 +982,12 @@ def project_to_dict(project: Project) -> dict[str, Any]:
     }
 
 
-def project_from_dict(data: object) -> Project:
+def project_from_dict(
+    data: object, *, base: Path | None = None, relative_first: bool = False
+) -> Project:
     """:func:`project_to_dict` の出力からプロジェクトを復元する
+
+    ``base`` は作品のファイルのあるフォルダ 渡すと素材の相対の場所（#447）も見る
 
     壊れた値はどの段で見つかっても :class:`ProjectFileError` にして返す 型を 1 つずつ
     確かめる検査をすり抜けた値は、モデルの検査（ValueError）や数の変換（TypeError
@@ -942,7 +995,7 @@ def project_from_dict(data: object) -> Project:
     壊れたファイル 1 つで起動ごと落ちる
     """
     try:
-        return _project_from_dict(data)
+        return _project_from_dict(data, base, relative_first)
     except ProjectFileError:
         raise
     except (
@@ -958,7 +1011,7 @@ def project_from_dict(data: object) -> Project:
         raise ProjectFileError(f"壊れた値がある: {exc}") from exc
 
 
-def _project_from_dict(data: object) -> Project:
+def _project_from_dict(data: object, base: Path | None, relative_first: bool) -> Project:
     root = _require(data, "プロジェクト")
 
     format_name = _get_str(root, "format")
@@ -1006,7 +1059,9 @@ def _project_from_dict(data: object) -> Project:
         return Project(
             settings=settings,
             timeline=timeline,
-            media=tuple(_media_from_json(m, version) for m in _get_list(root, "media")),
+            media=tuple(
+                _media_from_json(m, version, base, relative_first) for m in _get_list(root, "media")
+            ),
             name=_get_str(root, "name", "無題"),
             scenes=scenes,
             # 9 までのファイルと、方針を決めていない作品には項目が無い 空の方針で開く
@@ -1043,17 +1098,22 @@ def _scene_from_json(raw: object) -> Scene:
     )
 
 
-def save_project(project: Project, path: Path, *, expect: Expected | None = None) -> None:
+def save_project(
+    project: Project, path: Path, *, expect: Expected | None = None, relative: bool = True
+) -> None:
     """プロジェクトをファイルへ書き出す
 
     一時ファイルへ書いてから差し替える 書き込み中に落ちても、既存のプロジェクト
     ファイルは無傷で残る 編集作業をまるごと失うのが一番痛い失敗なので、
     ここは常に atomic にする ``expect`` は :func:`~sashimono.core.io.atomic.write_atomic` と同じ
     （AI の保存が、許した後に書く先が変わっていないかを照らす #327）
+    ``relative`` が真なら素材の相対の場所も書く（#447） 作品と関係の無い場所へ書く物
+    （自動の退避）は偽 退避のフォルダから数えた場所は、開き直したときに別の物を指しうる
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(path, json_text(project_to_dict(project)), durable=True, expect=expect)
+    base = path.parent.resolve() if relative else None
+    write_atomic(path, json_text(project_to_dict(project, base=base)), durable=True, expect=expect)
 
 
 #: 形式を上げる前の写しに足す尻（``名前.sme.bak``）
@@ -1091,8 +1151,8 @@ def keep_pre_upgrade_copy(path: Path, source: Path | None = None) -> Path | None
     return copy
 
 
-def load_project(path: Path) -> Project:
-    """プロジェクトファイルを読み込む"""
+def load_project(path: Path, *, relative_first: bool = False) -> Project:
+    """プロジェクトファイルを読み込む ``relative_first`` は :func:`_media_place` を見る"""
     path = Path(path)
     try:
         text = path.read_text(encoding="utf-8")
@@ -1103,7 +1163,7 @@ def load_project(path: Path) -> Project:
     except (json.JSONDecodeError, RecursionError) as exc:
         raise ProjectFileError(f"JSON として読めない: {path} ({exc})") from exc
 
-    project = project_from_dict(data)
+    project = project_from_dict(data, base=path.parent.resolve(), relative_first=relative_first)
     # ファイル名をプロジェクト名の既定にする 名前が入っていない古いファイル対策
     if not project.name or project.name == "無題":
         project = replace(project, name=path.stem)

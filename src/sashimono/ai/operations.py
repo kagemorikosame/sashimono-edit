@@ -320,6 +320,7 @@ from sashimono.core.reframe import (
     REFRAME_SMOOTH_MS_RANGE,
     ReframeError,
 )
+from sashimono.core.relink import RelinkMedia, missing_media
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -490,6 +491,7 @@ from sashimono.engine.reframe import (
     plan_reframe,
     tracked_media,
 )
+from sashimono.engine.relink_check import plan_relink
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
@@ -4781,6 +4783,40 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"imported": added}
 
 
+def _relink_media(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """見つからない素材のファイルを付け替える（画面の〔見つからない素材を探し直す…〕と同じ #447）"""
+    project = host.document.project
+    item = _require_media(project, str(arguments.get("media_id", "")))
+    raw = arguments.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("path に付け替える先のファイルの場所を渡してください")
+    chosen = Path(raw)
+    if not chosen.is_file():
+        raise ToolError(f"ファイルがありません: {chosen}")
+    force = _package_flag(arguments, "force")
+    search = arguments.get("search_others", True)
+    if not isinstance(search, bool):
+        raise ToolError("search_others は true か false で渡してください")
+    plan = plan_relink(project, item.id, chosen, search=search)
+    if plan.concern is not None and not force:
+        # 画面の窓は人に尋ねる所 AI は黙って付け替えず、訳を返して人に確かめさせる
+        raise ToolError(
+            f"選んだファイルは作品の覚えている素材と違うようです: {plan.concern}"
+            " クリップの時刻が別の絵を指すことがあるので付け替えていません ユーザーに確かめて、"
+            "それでもよければ force を true にして頼み直してください"
+        )
+    by_id = {media.id: media for media in project.media}
+    host.apply_commands([RelinkMedia(plan.changes)], f"素材を付け替える: {item.name}")
+    return {
+        "relinked": [
+            {"media_id": str(media_id), "name": by_id[media_id].name, "path": str(place)}
+            for media_id, place in plan.changes
+        ],
+        "skipped": [{"name": name, "reason": reason} for name, reason in plan.skipped],
+        "still_missing": len(missing_media(host.document.project)),
+    }
+
+
 def _add_track(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     # 省いたときは方式に合わせる 混合の作品で映像トラックを足すと、AI が置いた物だけ
@@ -8818,10 +8854,21 @@ def _open_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
     # 別の場所を指す（実行の前の照らし合わせで同じと確かめてある）
     path = Path(consent.target)
     host.open_project_file(path)
+    lost = len(missing_media(host.document.project))
     return {
         "opened": str(path),
         "name": host.document.project.name,
         "note": "この指示の中では、開いた作品をもう編集しません 続きは次の指示で頼んでください",
+        # 人が〔開く…〕で開いたときは窓で知らせる所（#447） AI には数で知らせる
+        **(
+            {
+                "missing_media": lost,
+                "missing_note": "ファイルが見つからない素材があります list_media の missing で"
+                "どれかを見て、次の指示で relink_media で付け替えられます",
+            }
+            if lost
+            else {}
+        ),
     }
 
 
@@ -11169,6 +11216,32 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_import_media,
         sends=_WITH_FILES,
         name_keys=frozenset({"imported"}),
+        writes=True,
+    ),
+    Operation(
+        name="relink_media",
+        description=(
+            "ファイルが見つからない素材（list_media の missing）を、別の場所のファイルへ付け替える"
+            "（画面の〔見つからない素材を探し直す…〕と同じ） 取り消し 1 回で戻る 既定では、同じ"
+            "フォルダか同じ並びのフォルダにある残りの見つからない素材も名前で見つけてまとめて"
+            "付け替える 長さや道の数が違うファイルは付け替えずに訳を返す"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("付け替える素材の media_id（list_media で得る）"),
+                "path": _string("付け替える先のファイルの場所"),
+                "search_others": _boolean(
+                    "残りの見つからない素材も同じフォルダで探す（既定 true）"
+                ),
+                "force": _boolean(
+                    "長さや道の数が違っても付け替える（既定 false ユーザーが確かめたときだけ）"
+                ),
+            },
+            ["media_id", "path"],
+        ),
+        handler=_relink_media,
+        sends=_WITH_FILES,
+        name_keys=frozenset({"name"}),
         writes=True,
     ),
     Operation(

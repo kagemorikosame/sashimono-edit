@@ -430,6 +430,7 @@ def _ids(host: FakeHost) -> dict[str, str]:
 #: 引数が合わずに断られる物もあるが、それでよい 断った文も外へ送るので中身を見る
 WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "import_media": lambda _ids: {"paths": [str(SECRET_PATH)]},
+    "relink_media": lambda ids: {"media_id": ids["media"], "path": str(SECRET_PATH), "force": True},
     "place_media": lambda ids: {"media_id": ids["media"]},
     "add_track": lambda _ids: {"kind": "video", "name": "V9"},
     "set_track_state": lambda ids: {"track_id": ids["track"], "muted": True},
