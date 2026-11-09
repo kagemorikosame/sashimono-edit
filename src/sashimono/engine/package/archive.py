@@ -107,6 +107,12 @@ _GOP_GUESS = Fraction(10)
 #: 付け足しの情報を取り除くとき、手元に読み込む静止画の大きさの上限
 _SCRUB_LIMIT = 256 << 20
 
+#: 目録と作品を手元へ読み込むときの大きさの上限 どちらもまるごと読んで JSON にするので、
+#: 細工したパッケージが巨大な物を置くと、開くだけで編集画面がメモリを使い切って落ちる
+#: （#449 の CodeRabbit の指摘） 目録は名前と数の一覧、作品は長い物でも数十 MB に収まる
+_MANIFEST_LIMIT = 16 << 20
+_PROJECT_LIMIT = 512 << 20
+
 
 class PackageError(Exception):
     """パッケージを書けない・開けない 文はそのまま人へ見せる"""
@@ -412,10 +418,18 @@ def _safe_file_name(value: str) -> str:
     return re.sub(r'[<>:"|?*\x00-\x1f]', "_", last).strip(" .") or "ファイル"
 
 
-def _network_place(value: str) -> bool:
-    """共有のフォルダ（UNC）を指す文字か 開くと別の機械へつなぐ"""
-    head = value.strip()[:2]
-    return len(head) == 2 and all(char in "/\\" for char in head)
+def _outside_place(value: str) -> bool:
+    """パッケージの外を指す文字か 共有のフォルダ（UNC）かドライブから始まる場所
+
+    共有のフォルダは開くと別の機械へつなぐ ドライブから始まる場所は開いた PC の手元の
+    ファイル（人が選んでいない物）を読む ``/字幕`` のような斜線 1 つで始まる文は Windows では
+    場所にならないので外す
+    """
+    text = value.strip()
+    head = text[:2]
+    if len(head) == 2 and all(char in "/\\" for char in head):
+        return True
+    return re.match(r"[A-Za-z]:[/\\]", text) is not None
 
 
 def _unused_place(item: MediaItem) -> Path:
@@ -587,7 +601,7 @@ class _Listed:
 def _read_manifest(zipped: zipfile.ZipFile) -> dict[str, Any]:
     """目録を読み、形と版を確かめる 読めなければ断る"""
     try:
-        raw = zipped.read(MANIFEST)
+        raw = _bounded_read(zipped, MANIFEST, _MANIFEST_LIMIT, "目録")
         manifest = json.loads(raw.decode("utf-8"))
     except KeyError as exc:
         raise PackageError(
@@ -606,6 +620,21 @@ def _read_manifest(zipped: zipfile.ZipFile) -> dict[str, Any]:
             f"（パッケージの形 {minimum}、この版が読めるのは {PACKAGE_VERSION} まで）"
         )
     return manifest
+
+
+def _bounded_read(zipped: zipfile.ZipFile, path: str, limit: int, label: str) -> bytes:
+    """中身を ``limit`` バイトまで読む 超えれば断る
+
+    中の見出しの大きさは細工できるので、先に見出しで断り、読むときも上限の 1 つ先までしか
+    手元に置かない（見出しが小さく偽っていても、それ以上は読まない）
+    """
+    if zipped.getinfo(path).file_size > limit:
+        raise PackageError(f"パッケージの{label}が大きすぎます（{limit >> 20} MB まで）")
+    with zipped.open(path) as reader:
+        data = reader.read(limit + 1)
+    if len(data) > limit:
+        raise PackageError(f"パッケージの{label}が大きすぎます（{limit >> 20} MB まで）")
+    return data
 
 
 def _listed(raw: object, *, project: bool = False) -> _Listed:
@@ -685,8 +714,11 @@ def open_package(
         # 失敗し、開き直すたびにフォルダが増える（#449 の CodeRabbit の指摘）
         fonts = _names_list(manifest, "fonts")
         scripts = _names_list(manifest, "scripts")
-        # 記していない古い形のパッケージは None（名前が同じ文字だけを付け替える）
-        fields = set(_names_list(manifest, "file_fields")) if "file_fields" in manifest else None
+        # 記していなければ空 欄の在りかを記さない形は公開していない
+        fields = set(_names_list(manifest, "file_fields"))
+        if project_listed.size > _PROJECT_LIMIT:
+            # 作品はまるごと読んで JSON にする 取り出し始める前に断り、仮のフォルダも作らない
+            raise PackageError(f"パッケージの作品が大きすぎます（{_PROJECT_LIMIT >> 20} MB まで）")
         total = sum(item.size for item in listed) + project_listed.size
         root.mkdir(parents=True, exist_ok=True)
         _require_space(root, total, "展開先")
@@ -707,6 +739,15 @@ def open_package(
                 _extract(zipped, item, destination, cancelled)
                 done += item.size
             project = _relocated(project_bytes, folder, set(names), str(name), fields)
+            folders = folder_kinds(project)
+            if folders:
+                # フォルダの欄は書き出しで断っているので、値があるのは細工したパッケージ 置いた
+                # 場所（共有のフォルダなど）を描くたびに読みに行くので開かない（#449 の CodeRabbit
+                # の指摘）
+                raise PackageError(
+                    "フォルダを指すエフェクトに値があるので、このパッケージは開けません: "
+                    + "、".join(folders[:10])
+                )
             project_path = work / f"{_safe_folder_name(project.name)}{SUFFIX}"
             # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中
             save_project(project, project_path)
@@ -737,7 +778,7 @@ def _names_list(manifest: dict[str, Any], key: str) -> tuple[str, ...]:
 def _verified_bytes(zipped: zipfile.ZipFile, item: _Listed) -> bytes:
     """中身を読み、大きさと SHA-256 を目録と照らす"""
     try:
-        data = zipped.read(item.path)
+        data = _bounded_read(zipped, item.path, _PROJECT_LIMIT, "作品")
     except (zipfile.BadZipFile, OSError) as exc:
         raise PackageError(f"パッケージの中身が壊れています: {item.path} ({exc})") from exc
     if len(data) != item.size or hashlib.sha256(data).hexdigest() != item.sha256:
@@ -773,7 +814,7 @@ def _relocated(
     folder: Path,
     names: set[str],
     name: str,
-    fields: set[str] | None,
+    fields: set[str],
 ) -> Project:
     """中の相対の場所を、展開した先の場所へ付け替えた作品"""
     try:
@@ -800,16 +841,15 @@ def _relocated(
         # 欄と同じに付け替える（後でスクリプトを入れても画像が見つかり、外も指さない）
         # 記していない欄は文字の欄なので触らない 場所に見えるだけの文（/字幕 など）を書き換えると、
         # スクリプトを入れた後の出力が変わる（#449 の CodeRabbit の指摘）
-        # 名前が同じ文字だけを付け替えるのは、記していない古いパッケージのときだけ 記した物で
-        # これをすると、たまたま中の名前と同じ文の欄まで書き換わる（#449 の CodeRabbit の指摘）
-        # 共有のフォルダ（UNC）を指す文字は、記していなくても外を指さない場所へ置き換える
-        # 細工したパッケージが欄を記さずに置くと、後でスクリプトを入れたときに描くたびその機械へ
-        # つなぎ、Windows の認証を試みる 文として // や \\ で始まる物はまず無い
-        if fields is not None and where in fields:
+        # 名前が同じだけの文は付け替えない たまたま中の名前と同じ文の欄まで書き換わる
+        # 外を指す文字（共有のフォルダ・ドライブから始まる場所）は、記していなくても展開した先の
+        # 無い場所へ置き換える 細工したパッケージが欄を記さずに置くと、後でスクリプトを入れた
+        # ときに、共有のフォルダなら描くたびその機械へつないで Windows の認証を試み、手元の場所
+        # なら人が選んでいないファイルが出力に混ざる（#449 の CodeRabbit の指摘） 正しく書き出した
+        # パッケージでは、外を指す値はファイルの欄（記してある）にしか入らない
+        if where in fields:
             return file(value)
-        if fields is None and value in names:
-            return str(folder / value)
-        if _network_place(value):
+        if _outside_place(value):
             return str(folder / MISSING_FOLDER / _safe_file_name(value))
         return value
 
