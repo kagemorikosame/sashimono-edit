@@ -45,7 +45,9 @@ from sashimono.engine.encode import (
     chosen_range,
     export_target,
 )
-from sashimono.engine.encode.export_job import export_anywhere
+
+# 試験が差し替える名前は前のまま（書き出しの偽物を ``run_export`` へ当てる）
+from sashimono.engine.encode.export_job import export_anywhere as run_export
 from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 from sashimono.ui.system_clipboard import clipboard
@@ -110,7 +112,7 @@ class _ExportWorker(QObject):
 
     def run(self) -> None:
         try:
-            path = export_anywhere(
+            path = run_export(
                 self._project,
                 self._settings,
                 separate_process=self._separate_process,

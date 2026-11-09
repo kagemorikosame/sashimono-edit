@@ -42,9 +42,7 @@ def decode_speed(path: Path, seconds: float, hwaccel: str | None) -> tuple[float
     """頭から ``seconds`` 秒を読んで CPU の配列へ写す速さ（倍速, 枚数） 開けなければ ``None``"""
     from av.codec.hwaccel import HWAccel
 
-    accel = (
-        None if hwaccel is None else HWAccel(device_type=hwaccel, allow_software_fallback=False)
-    )
+    accel = None if hwaccel is None else HWAccel(device_type=hwaccel, allow_software_fallback=False)
     try:
         container = av.open(str(path), "r", hwaccel=accel)
     except (av.error.FFmpegError, ValueError, TypeError) as exc:

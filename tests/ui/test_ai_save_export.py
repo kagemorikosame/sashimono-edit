@@ -790,6 +790,8 @@ class TestPlacingIsGuarded:
         real = export_project
 
         def export_then_link(project: Project, settings: ExportSettings, **options: Any) -> Path:
+            # 子へ回すかの指定は書き出しそのもの（export_project）には無い
+            options.pop("separate_process", None)
             written = real(project, settings, **options)
             os.link(original, target)
             return written

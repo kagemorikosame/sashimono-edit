@@ -33,7 +33,9 @@ from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
 from sashimono.engine.encode import ExportError, ExportSettings
-from sashimono.engine.encode.export_job import export_anywhere
+
+# 試験が差し替える名前は前のまま（書き出しの偽物を ``run_export`` へ当てる）
+from sashimono.engine.encode.export_job import export_anywhere as run_export
 
 __all__ = ["AssistantExport", "scratch_folder"]
 
@@ -115,7 +117,7 @@ class _Worker(QObject):
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
         try:
-            export_anywhere(
+            run_export(
                 self._project,
                 replace(self._settings, path=scratch),
                 separate_process=self._separate_process,
