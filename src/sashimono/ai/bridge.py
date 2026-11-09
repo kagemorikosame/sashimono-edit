@@ -114,10 +114,6 @@ class _CallGrant:
     kinds: frozenset[Outbound] = frozenset()
     #: 下見のために先に動かしている間か 送るかが決まるまで、絵を送った数に数えない
     previewing: bool = False
-    #: この呼び出しで文字の欄から伏せずに載せた値（:func:`~sashimono.ai.outbound.sending`）
-    #: 欄の名前では拾えない本文（クリップの値など）を、下見と記録に数える
-    #: 許しを置き換えても同じ並びを引き継ぐ（:func:`_grant`）
-    passed: list[str] = field(default_factory=list)
 
 
 #: 今の呼び出しの許し :meth:`EditorBridge.invoke` が呼び出しの文脈に立て、
@@ -135,13 +131,7 @@ def _current() -> _CallGrant:
 
 def _grant(kinds: frozenset[Outbound], *, previewing: bool = False) -> None:
     """この呼び出しの許しを置き換える :meth:`EditorBridge.invoke` が立てた文脈の中だけで呼ぶ"""
-    _CALL.set(_CallGrant(kinds, previewing, _current().passed))
-
-
-def _passed() -> list[str] | None:
-    """この呼び出しの文字の欄の数え 呼び出しの外なら ``None``（数えない）"""
-    grant = _CALL.get()
-    return grant.passed if grant is not None else None
+    _CALL.set(_CallGrant(kinds, previewing))
 
 
 def _under(grant: _CallGrant, work: Callable[[], object]) -> object:
@@ -462,11 +452,6 @@ class EditorBridge:
         ``body`` を渡すと道具の代わりにそれを動かす（取り消せない操作で、許した中身と照らす #327）
         場面の解析（#321）と書き出し（#327）は同じ :class:`Pending` で待つ
         """
-        # 文字の欄の数えは、返す結果を作る 1 回分だけにする 名前と場所を断って動かし直すと、
-        # 下見のために先に動かした分と二重に数える
-        passed = _passed()
-        if passed is not None:
-            passed.clear()
         work = body if body is not None else partial(operation.start, self._host, arguments)
         result = self.call(partial(self._run, operation, work))
         while True:
@@ -729,7 +714,6 @@ class EditorBridge:
             preview,
             pairs=self._name_pairs(),
             name_keys=operation.name_keys,
-            fields=_current().passed if held is not None else (),
         )
         request = SendRequest(
             tool=operation.name,
@@ -832,7 +816,6 @@ class EditorBridge:
             Preview(PreviewSource.RESULT, keys) if keys is not None else from_result(),
             pairs=self._name_pairs(),
             name_keys=operation.name_keys,
-            fields=_current().passed,
         )
         self.send_log.add(operation.name, samples)
 
@@ -883,7 +866,7 @@ class EditorBridge:
         # 立てずに動かすと、編集画面の中から直に呼んだ扱いになり、欄の値を全部載せる
         allowed = frozenset(kind for kind in Outbound if self.may_send(kind))
         try:
-            with sending(allowed, _passed()):
+            with sending(allowed):
                 result = work()
         except (ToolError, ValueError, KeyError) as exc:
             if not hide:

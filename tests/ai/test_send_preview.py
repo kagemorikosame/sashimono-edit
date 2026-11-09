@@ -12,7 +12,7 @@ import pytest
 
 from sashimono.ai.bridge import EditorBridge
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import OPERATIONS, ImageResult, Operation
+from sashimono.ai.operations import OPERATIONS, ImageResult, Operation, _fit
 from sashimono.ai.outbound import (
     ASKED,
     SAMPLE_LINE_CHARS,
@@ -23,6 +23,7 @@ from sashimono.ai.outbound import (
     SendAnswer,
     SendChoice,
     SendRequest,
+    SentText,
     build_samples,
     clip_line,
     file_sample,
@@ -34,10 +35,12 @@ from sashimono.ai.outbound import (
     text_sample,
 )
 from sashimono.ai.send_log import KEEP_DAYS, SendLog, SendLogStore, SentEntry, SentKind
+from sashimono.core.commands import ParamPath, SetParam
 from sashimono.core.model import MediaItem, Transcript
 from tests.ai.conftest import FakeHost, make_loaded
 from tests.ai.test_bridge import call_in_thread
 from tests.ai.test_outbound import SECRET_PATH, _operation, _run, answer_sends
+from tests.ai.test_screen_reading import _text_clip, run
 
 
 @pytest.fixture
@@ -117,43 +120,59 @@ class TestSamples:
         assert len(clip_line(sample.lines[0])) == SAMPLE_LINE_CHARS
 
     def test_a_field_value_is_counted_once_and_only_as_returned(self) -> None:
-        # 壊れると、text の欄にも入った値を二重に数えるか、切り詰めて返した長い本文を全部の長さで
-        # 数え、記録が実際に送った量より多くなる（CodeRabbit の指摘 #450）
-        long = "長い本文" * 40
-        returned = long[:60]
-        value = {"text": "同じ本文", "params": {"caption": "同じ本文", "body": returned}}
-        sample = text_sample(value, frozenset({"text"}), ["同じ本文", long, "返していない本文"])
+        # 壊れると、text の欄にも入った値を二重に数えるか、印の付かない同じ文字まで本文と数え、
+        # 記録が実際に送った量より多くなる（CodeRabbit の指摘 #450）
+        returned = SentText("長い本文" * 15)
+        value = {
+            "text": "同じ本文",
+            "params": {"caption": SentText("同じ本文"), "body": returned, "kind": "同じ本文"},
+        }
+        sample = text_sample(value, frozenset({"text"}))
         assert sample.lines == ("同じ本文", "同じ本文", returned)
         assert sample.chars == len("同じ本文") * 2 + len(returned)
-
-    def test_a_short_word_that_happens_to_start_a_field_is_not_counted(self) -> None:
-        # 壊れると、欄の名前（"te" など）が本文の頭と重なっただけで本文として数えられる
-        value = {"name": "長い", "params": {"caption": "長い本文" * 10}}
-        sample = text_sample(value, frozenset({"text"}), ["長い本文" * 10])
-        assert sample.lines == ("長い本文" * 10,)
 
     def test_a_field_name_equal_to_the_value_is_not_counted(self) -> None:
         # 壊れると、text の欄に text と書いたとき、結果の欄の名前まで本文と数え、1 行 4 文字が
         # 2 行 8 文字になる（CodeRabbit の指摘 #450）
-        value = {"name": "text", "value": "text", "kind": "text"}
-        sample = text_sample(value, frozenset(), ["text"])
+        value = {"name": "text", "value": SentText("text"), "kind": "text"}
+        sample = text_sample(value, frozenset())
         assert (sample.count, sample.chars) == (1, 4)
 
-    def test_a_later_page_of_a_long_value_is_counted(self) -> None:
-        # 壊れると、値を区切って返した 2 ページ目より後ろは本文の頭と重ならず、記録から抜ける
-        # （CodeRabbit の指摘 #450）
-        body = "".join(f"{n:03d}番目の文。" for n in range(40))
-        page = body[100:160]
-        value = {"name": "text", "value": page, "value_offset": 100, "value_length": len(body)}
-        sample = text_sample(value, frozenset(), [body])
-        assert sample.lines == (page,)
+    def test_a_long_field_name_inside_the_body_does_not_take_its_place(self) -> None:
+        # 壊れると、本文に含まれる 20 文字以上の欄の名前が先に本文と見なされ、本文の方が
+        # 下見と記録から抜ける（CodeRabbit の指摘 #450）
+        name = "caption_text_for_the_opening_title"
+        body = SentText(f"ここに {name} と書いた本文")
+        sample = text_sample({"name": name, "value": body}, frozenset())
+        assert sample.lines == (body,)
 
-    def test_a_cut_value_is_counted_without_the_mark(self) -> None:
-        # 壊れると、切り詰めの印（…）が付いた本文が元の値の一部と見なされず、記録から抜ける
-        body = "長い本文" * 40
-        cut = body[:80] + "…"
-        sample = text_sample({"value": cut}, frozenset(), [body])
-        assert sample.lines == (cut,)
+    def test_a_later_page_of_a_long_value_is_counted(self, host: FakeHost) -> None:
+        # 壊れると、値を区切って返した 2 ページ目より後ろが下見と記録から抜ける
+        # （CodeRabbit の指摘 #450）
+        body = "".join(f"{n:05d}行目の本文\n" for n in range(3000))
+        run(host, "add_text", text="見出し")
+        clip = _text_clip(host)
+        host.apply_commands([SetParam(ParamPath.of_source(clip, "text"), body)], "長い本文")
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.ALLOW})
+        arguments = {"clip_id": str(clip), "name": "text", "value_offset": 1}
+        done, box = call_in_thread(bridge, _operation("get_clip"), arguments)
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        page = box["result"]
+        assert isinstance(page, dict)
+        assert page["value_offset"] == 1
+        assert "next_value_offset" in page
+        sample = bridge.send_log.last()[Outbound.TEXT].sample
+        assert sample.chars == len(page["value"].replace("\n", ""))
+        assert sample.lines[0] == page["value"].splitlines()[0]
+
+    def test_a_cut_value_keeps_its_mark(self) -> None:
+        # 壊れると、上限に収めるために切り詰めた本文が印を失い、下見と記録から抜ける
+        body = SentText("長い本文" * 400)
+        fitted = _fit({"value": body}, 400)
+        assert isinstance(fitted["value"], SentText)
+        sample = text_sample(fitted, frozenset())
+        assert sample.lines == (fitted["value"],)
 
     def test_frames_carry_the_picture_that_is_sent(self) -> None:
         # 壊れると、窓に出す絵と送る絵が別になり、どのコマが出るかを見誤る

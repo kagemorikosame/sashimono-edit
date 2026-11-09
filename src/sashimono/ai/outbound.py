@@ -76,6 +76,7 @@ __all__ = [
     "secret_pairs",
     "sendable_now",
     "sending",
+    "sent_piece",
     "text_sample",
     "text_secrets",
 ]
@@ -308,13 +309,6 @@ def _all_texts(value: Any) -> Iterator[str]:
             yield from _all_texts(entry)
 
 
-#: 文字の欄の値が、結果の中で一部だけ載っていても同じ値と見なす長さ（文字）
-#: 長い本文は結果に収めるために頭だけを残して切り（:func:`~sashimono.ai.operations._fit`）、
-#: 値を読む道具は区切って続きを返す（``value_offset``） 短い文字（欄の名前・種類）が偶然に
-#: 本文の一部と重なっても本文と数えないよう、ある程度の長さを要る
-_FIELD_PREFIX = 20
-
-
 def _texts_outside(value: Any, keys: frozenset[str]) -> Iterator[str]:
     """``keys`` の欄の外にある文字を順に返す（:func:`_texts_under` が数えない物）"""
     if isinstance(value, str):
@@ -328,38 +322,36 @@ def _texts_outside(value: Any, keys: frozenset[str]) -> Iterator[str]:
             yield from _texts_outside(entry, keys)
 
 
-def _take_field(text: str, fields: list[str]) -> bool:
-    """結果の文字が、文字の欄から伏せずに載せた値（かその一部）なら、その値を 1 つ使い切る
+class SentText(str):
+    """文字の欄から伏せずに結果へ載せた値 結果の中の位置を、文字の型で持ち運ぶ
 
-    1 つの値は結果の 1 か所にしか当てない 当てた値を残すと、値と同じ文字の欄の名前
-    （``text`` の欄に ``text`` と書いた時の ``"name": "text"``）まで本文と数え、送った量が
-    実際より多くなる 一部は切り詰めの印（…）を除いた残りで、区切って返した後ろの部分も当たる
+    欄の名前は道具ごと・エフェクトごとに違い（``text`` とは限らない）、名前では本文を拾えない
+    値の一致で探すと、値と同じ欄の名前や、本文に含まれる欄の名前まで本文と数え、区切って
+    返した後ろのページは逆に抜ける（CodeRabbit の指摘 #450） 型で印を付ければ、結果の中で
+    実際に本文が入った所だけを数えられる 中身はただの文字なので、JSON にもそのまま書ける
     """
-    if text in fields:
-        fields.remove(text)
-        return True
-    piece = text.removesuffix("…")
-    if len(piece) < _FIELD_PREFIX:
-        return False
-    for whole in fields:
-        if piece in whole:
-            fields.remove(whole)
-            return True
-    return False
+
+    __slots__ = ()
 
 
-def text_sample(value: Any, keys: frozenset[str], fields: Iterable[str] = ()) -> Sample:
+def sent_piece(whole: str, piece: str) -> str:
+    """``whole`` から切り出した ``piece`` 元が :class:`SentText` なら、切った物にも印を付け直す
+
+    文字を切ると型は ``str`` に戻る 区切って返す・切り詰めて返す所で付け直さないと、
+    送った本文が下見と記録から抜ける
+    """
+    return SentText(piece) if isinstance(whole, SentText) else piece
+
+
+def text_sample(value: Any, keys: frozenset[str]) -> Sample:
     """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行
 
-    ``fields`` は文字の欄から伏せずに載せた値（:func:`sending` の ``passed``） 値そのものは
-    数えず、結果に実際に載った文字のうち、その値かその一部に当たる物を、値 1 つにつき 1 か所
-    だけ数える 切り詰めて返した欄と区切って返した欄は返した分だけを数え、``keys`` の欄に
-    入った物は二重に数えない
+    ``keys`` の欄の外でも、文字の欄から伏せずに載せた値（:class:`SentText`）は数える
+    切り詰めて返した欄と区切って返した欄は返した分だけを数え、``keys`` の欄に入った物は
+    二重に数えない
     """
-    passed = [field for field in fields if field]
     texts = list(_texts_under(value, keys))
-    if passed:
-        texts += [text for text in _texts_outside(value, keys) if _take_field(text, passed)]
+    texts += [text for text in _texts_outside(value, keys) if isinstance(text, SentText)]
     lines = [line for text in texts for line in text.splitlines() if line]
     return Sample(
         Outbound.TEXT,
@@ -461,18 +453,13 @@ def build_samples(
     *,
     pairs: Iterable[tuple[str, str]] = (),
     name_keys: Iterable[str] = (),
-    fields: Iterable[str] = (),
 ) -> tuple[Sample, ...]:
-    """送る物の種類ごとの下見 ``value`` は道具の結果か引数（``preview.source`` で決まる）
-
-    ``fields`` は文字の欄から伏せずに載せた値（:func:`text_sample`）
-    """
-    texts = list(fields)
+    """送る物の種類ごとの下見 ``value`` は道具の結果か引数（``preview.source`` で決まる）"""
     table = list(pairs)
     samples: list[Sample] = []
     for kind in kinds:
         if kind is Outbound.TEXT:
-            sample = text_sample(value, preview.text_keys, texts)
+            sample = text_sample(value, preview.text_keys)
         elif kind is Outbound.FRAMES:
             sample = frame_sample(value)
         elif kind is Outbound.FILES:
@@ -707,23 +694,13 @@ UNKNOWN_FIELD_SENDS = frozenset({Outbound.TEXT, Outbound.FILES})
 _SENDABLE: ContextVar[frozenset[Outbound] | None] = ContextVar("sendable", default=None)
 
 
-#: 型の付いた欄（:func:`masked_value`）が伏せずに通した字幕と文字 送った物の下見と記録に数える
-#: 欄の名前は道具ごと・エフェクトごとに違い（``text`` とは限らない）、名前では拾えないため
-_PASSED_TEXT: ContextVar[list[str] | None] = ContextVar("passed_text", default=None)
-
-
 @contextmanager
-def sending(kinds: frozenset[Outbound], passed: list[str] | None = None) -> Iterator[None]:
-    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）
-
-    ``passed`` を渡すと、文字の欄から伏せずに載せた値をそこへ足す
-    """
+def sending(kinds: frozenset[Outbound]) -> Iterator[None]:
+    """この間に動く道具の結果へ、``kinds`` だけをそのまま載せる（ブリッジが道具を包む）"""
     token = _SENDABLE.set(kinds)
-    passed_token = _PASSED_TEXT.set(passed)
     try:
         yield
     finally:
-        _PASSED_TEXT.reset(passed_token)
         _SENDABLE.reset(token)
 
 
@@ -757,10 +734,8 @@ def masked_value(value: Any, needs: frozenset[Outbound]) -> Any:
         return value
     allowed = _SENDABLE.get()
     if allowed is None or needs <= allowed:
-        passed = _PASSED_TEXT.get()
-        if passed is not None and Outbound.TEXT in needs:
-            passed.append(value)
-        return value
+        # 文字の欄の値は印を付けて返す 送った物の下見と記録が、結果の中の本文の位置を拾う
+        return SentText(value) if Outbound.TEXT in needs else value
     return TEXT_MARK if Outbound.TEXT in needs - allowed else PATH_MARK
 
 
@@ -903,12 +878,15 @@ def _redactor(
     def walk(item: Any) -> Any:
         """結果をたどり、文字と絵の説明を :func:`look` へ渡す"""
         if isinstance(item, str):
+            text = item
             for secret, mark in long:
-                if secret in item:
-                    item = item.replace(secret, mark)
+                if secret in text:
+                    text = text.replace(secret, mark)
             for pattern, mark in short:
-                item = pattern.sub(mark, item)
-            return _ABSOLUTE_PATH.sub(_PATH_MARK, item)
+                text = pattern.sub(mark, text)
+            # 名前を伏せた後も送る本文に変わりはない 印を付け直さないと、名前と場所を断った人の
+            # 下見と記録から、送った本文が抜ける
+            return sent_piece(item, _ABSOLUTE_PATH.sub(_PATH_MARK, text))
         if isinstance(item, Mapping):
             return {walk(key): value_of(key, entry) for key, entry in item.items()}
         if isinstance(item, list | tuple):

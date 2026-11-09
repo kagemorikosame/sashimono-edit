@@ -68,6 +68,7 @@ from sashimono.ai.outbound import (
     from_result,
     masked_value,
     sendable_now,
+    sent_piece,
 )
 from sashimono.ai.plan import (
     GET_PLAN,
@@ -1091,7 +1092,7 @@ _KEEP_CHARS = 80
 def _fit(row: Any, limit: int) -> Any:
     """1 件を ``limit`` 字（JSON）に収める 一番長い文字列から半分に切り、足りなければ
     一番長い配列を半分にする 切った件には ``truncated`` を付ける"""
-    fitted = json.loads(json_text(row))
+    fitted = _copied(row)
     cut = False
     while len(json_text(fitted)) > limit:
         place = _longest(fitted, str, _KEEP_CHARS) or _longest(fitted, list, 1)
@@ -1099,13 +1100,29 @@ def _fit(row: Any, limit: int) -> Any:
             break
         holder, key, value = place
         if isinstance(value, str):
-            holder[key] = value[: len(value) // 2] + "…"
+            holder[key] = sent_piece(value, value[: len(value) // 2] + "…")
         else:
             holder[key] = value[: len(value) // 2]
         cut = True
     if cut and isinstance(fitted, dict):
         fitted["truncated"] = True
     return fitted
+
+
+def _copied(value: Any) -> Any:
+    """切り詰めるための写し 入れ物（辞書・並び）だけを写す
+
+    送った本文の印（:class:`~sashimono.ai.outbound.SentText`）は残す
+
+    JSON を書いて読み直して写すと印が消え、切り詰めた本文が下見と記録から抜ける
+    """
+    if isinstance(value, dict):
+        return {str(key): _copied(entry) for key, entry in value.items()}
+    if isinstance(value, list | tuple):
+        return [_copied(entry) for entry in value]
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return json.loads(json_text(value))
 
 
 def _longest(value: Any, kind: type, floor: int) -> tuple[Any, Any, Any] | None:
@@ -2218,7 +2235,11 @@ def _value_in_pieces(head: dict[str, Any], value: Any, arguments: dict[str, Any]
     start = max(0, _whole_number(arguments, "value_offset", 0))
     size = max(1, len(value) - start)
     while True:
-        piece = value[start : start + size]
+        piece = (
+            sent_piece(value, value[start : start + size])
+            if isinstance(value, str)
+            else value[start : start + size]
+        )
         result: dict[str, Any] = {**head, "value": piece}
         if start or start + len(piece) < len(value):
             result["value_length"] = len(value)
