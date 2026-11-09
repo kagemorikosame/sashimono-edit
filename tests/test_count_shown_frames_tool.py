@@ -107,6 +107,51 @@ class TestCounting:
         assert row.startswith(r"| 前\|後 2 回目 | 1.0 |")
 
 
+class TestReference:
+    def test_a_still_desktop_is_not_used_as_the_reference(self, tool: ModuleType) -> None:
+        # 窓が出なかったり枠がずれたりすると、止まった机の上を撮る 映ったコマは 1 枚で
+        # 間隔が無く止まりも数えられないので、映った fps で断る 断らないと低い基準が出る
+        captured = [k / 60 for k in range(1200)]
+        still = tool.summarize("ffplay", captured, captured[:1])
+        with pytest.raises(SystemExit, match="映っていない"):
+            tool.check_reference(still)
+
+    def test_a_late_window_is_not_used_as_the_reference(self, tool: ModuleType) -> None:
+        # 窓が出るのが遅れると頭が止まって写る 止まりのある回は基準に使わない
+        captured = [k / 60 for k in range(1200)]
+        shown = [0.0, *captured[30:]]
+        with pytest.raises(SystemExit, match="止まり"):
+            tool.check_reference(tool.summarize("ffplay", captured, shown))
+
+    def test_a_moving_reference_is_accepted(self, tool: ModuleType) -> None:
+        # 毎コマ動く素材を映せていれば通す
+        captured = [k / 60 for k in range(1200)]
+        tool.check_reference(tool.summarize("ffplay", captured, captured))
+
+    def test_the_player_is_checked_before_counting(
+        self, tool: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 数え終えてから見ると、数えている間に ffplay が普通に終わった回まで「撮っている
+        # 間に終わった」と断る 撮り終えた直後、数える前に確かめる
+        order: list[str] = []
+
+        def fake_run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            order.append("撮る")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def fake_analyze(source: list[str], label: str, **options: object) -> object:
+            del source, label, options
+            order.append("数える")
+            return None
+
+        monkeypatch.setattr(tool, "_ffmpeg", lambda name="ffmpeg": name)
+        monkeypatch.setattr(tool.subprocess, "run", fake_run)
+        monkeypatch.setattr(tool, "_analyze", fake_analyze)
+        tool.capture_screen((0, 0, 2, 2), 1.0, "画面", on_captured=lambda: order.append("確かめる"))
+        assert order == ["撮る", "確かめる", "数える"]
+
+
 class TestGrabArguments:
     def test_ddagrab_sends_only_updates_from_the_region(self, tool: ModuleType) -> None:
         # 決まった間隔で同じ絵を足すと、画面の切り替わりとの拍のずれで落とす（gdigrab と同じ）

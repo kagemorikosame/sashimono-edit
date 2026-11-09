@@ -197,10 +197,12 @@ class AudioPlayer:
                 block = self._mixer.render(cursor, count)
                 # 出力段で 1 度だけ頭打ちにする 途中で潰すと、後段の調整で
                 # 潰れた音しか扱えなくなる
-                stream.write(np.clip(block, -1.0, 1.0))
+                # 戻り値はデバイスが空になったか（アンダーラン） 書き込みの間が短くても、
+                # 出口のバッファが小さければ空になることがある
+                underflowed = stream.write(np.clip(block, -1.0, 1.0))
                 cursor += count
                 buffered = int(stream.latency * self._mixer.sample_rate)
-                self._advance(count, buffered)
+                self._advance(count, buffered, underflowed=bool(underflowed))
         except (sd.PortAudioError, RuntimeError):
             # デバイスが抜かれた等 再生を諦めるが、アプリは落とさない
             pass
@@ -211,7 +213,7 @@ class AudioPlayer:
             if not self._stop.is_set() and self._on_finished is not None:
                 self._on_finished()
 
-    def _advance(self, count: int, buffered: int) -> None:
+    def _advance(self, count: int, buffered: int, *, underflowed: bool = False) -> None:
         """かたまりを 1 つ書き終えた 位置を進め、この時刻を補いの起点に足す
 
         書き込みはデバイスに空きができるまで戻らないので、戻った時刻はおおよそ
@@ -219,6 +221,11 @@ class AudioPlayer:
 
         書いた量がまだバッファに収まっている（鳴り始める前の）間は補わない
         鳴っていない所を経過で進めると、音より先に映像が動き出す
+
+        デバイスが空になった後（``underflowed`` か、前の書き込みから :data:`UNDERRUN_BLOCKS`
+        より空いた）は覚えた時刻を捨てる 鳴っていなかった間も古い時刻から進めると、
+        詰め直している途中の音より映像が先へ出る 空になった直後の位置は、バッファが
+        満ちている前提で引くので本当の位置より手前で、そこから補っても先へは出ない
         """
         with self._lock:
             self._written += count
@@ -227,7 +234,7 @@ class AudioPlayer:
             self._position = max(self._start_sample, self._start_sample + heard)
             now = self._clock()
             gap = UNDERRUN_BLOCKS * BLOCK_SAMPLES / self._mixer.sample_rate
-            if self._anchors and now - self._anchors[-1][0] > gap:
+            if underflowed or (self._anchors and now - self._anchors[-1][0] > gap):
                 self._anchors.clear()
             if heard > 0:
                 self._anchors.append((now, self._position))

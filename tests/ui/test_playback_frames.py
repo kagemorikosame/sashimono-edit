@@ -394,6 +394,20 @@ class TestRewinds:
         clock.now += 0.005
         assert player.position_sample <= player._position + int(0.005 * RATE) + 1
 
+    def test_an_underrun_the_device_reports_restarts_the_fill(self) -> None:
+        # 出口のバッファが小さいと、書き込みの間が 2 かたまりより短くても空になる
+        # 書き込みが知らせた空を見ずに古い時刻から進めると、映像が音より先へ出る
+        player, clock = _player()
+        for block in range(8):
+            clock.now = block * BLOCK_SECONDS
+            player._advance(BLOCK_SAMPLES, BUFFERED)
+        # 35 ms 空いた（2 かたまりの 43 ms より短い）書き込みが、空になったと知らせる
+        clock.now = 7 * BLOCK_SECONDS + 0.035
+        player._advance(BLOCK_SAMPLES, BUFFERED, underflowed=True)
+        base = player._position
+        clock.now += 0.005
+        assert player.position_sample <= base + int(0.005 * RATE) + 1
+
     def test_a_dying_device_does_not_move_the_playhead_back(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

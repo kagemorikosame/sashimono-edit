@@ -43,7 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +70,10 @@ CAPTURE_SHORTFALL = 0.98
 #: 撮る長さに足す待ちの上限（秒） ddagrab は画面が書き換わらないと ``-t`` を過ぎても
 #: 次の 1 枚を待ち続けて終わらないことがあるので、ここで打ち切る
 CAPTURE_GRACE = 30.0
+
+#: ffplay の基準でこれより映った fps が低ければ、絵が枠に映っていなかったと見る
+#: 毎コマ絵が変わる素材なら、gdigrab で撮っても 45 fps 前後は数えられる
+REFERENCE_MIN_FPS = 20.0
 
 #: ffplay が窓を出して映し始めるまでの待ち（秒） 窓が出る前から撮ると、頭の静止を止まりと数える
 REFERENCE_WARMUP = 1.5
@@ -289,8 +293,12 @@ def capture_screen(
     *,
     grabber: str = GRABBERS[0],
     output: int = 0,
+    on_captured: Callable[[], None] | None = None,
 ) -> Count:
     """画面の枠を撮ってから数える
+
+    ``on_captured`` は撮り終えた直後、数える前に呼ぶ 数えるのに数秒かかるので、撮った間の
+    ことを確かめるならここで行う（数えている間の出来事と混ざらない）
 
     撮りながら間引くと、比べる手間で撮る側が遅れてコマを落とす いったん可逆で
     書き出し、撮り終えてから数える 書き出しは速さ優先（``ultrafast`` の可逆）
@@ -332,6 +340,8 @@ def capture_screen(
             ) from exc
         if result.returncode != 0:
             raise SystemExit(f"画面を撮れなかった:\n{result.stderr[-2000:]}")
+        if on_captured is not None:
+            on_captured()
         # gdigrab は撮れた長さで割り、途中で止まったら短いと印を付ける ddagrab は絵が
         # 止まると何も届かず長さが縮むので、頼んだ長さで割る
         fixed = grabber == "gdigrab"
@@ -341,6 +351,26 @@ def capture_screen(
             seconds=None if fixed else seconds,
             fixed_rate=fixed,
             requested=seconds if fixed else None,
+        )
+
+
+def check_reference(count: Count) -> None:
+    """ffplay の絵が枠に映っていたかを数えた結果から見る 映っていなければ断る
+
+    窓が出なかった・枠が窓とずれていると、机の上の止まった絵を撮る 止まった絵は
+    映ったコマが 1 枚で間隔が無く、止まりの数でも見分けられない 素材は毎コマ絵が
+    変わる物を使う前提なので、映った fps が低すぎる回と、窓が出るのが遅れて頭が
+    止まって写った回を断る
+    """
+    if count.shown_fps < REFERENCE_MIN_FPS:
+        raise SystemExit(
+            f"ffplay の絵が {count.shown_fps:.1f} fps しか映っていない 窓が出なかったか、"
+            "枠が窓とずれている 基準に使わず撮り直す"
+        )
+    if count.stalls:
+        raise SystemExit(
+            f"ffplay の絵に 0.1 秒を越えた止まりが {count.stalls} 回あった 窓が出るのが"
+            "遅れたか、枠が窓とずれている 基準に使わず撮り直す"
         )
 
 
@@ -388,15 +418,17 @@ def count_reference(
         # ffplay が先に終わっていると、机の上を撮って低い数字を基準として出すことになる
         if player.poll() is not None:
             raise SystemExit("ffplay が映し始める前に終わった 素材の場所と ffplay を確かめる")
-        count = capture_screen(region, seconds, label, grabber=grabber, output=output)
-        if player.poll() is not None:
-            raise SystemExit("撮っている間に ffplay が終わった --start と素材の長さを確かめる")
-        # 窓が出る前の机の上を撮ると、頭が止まって見える 止まりのある回は基準に使わない
-        if count.stalls:
-            raise SystemExit(
-                f"ffplay の絵に 0.1 秒を越えた止まりが {count.stalls} 回あった 窓が出るのが"
-                "遅れたか、枠が窓とずれている 基準に使わず撮り直す"
-            )
+
+        def still_playing() -> None:
+            # 撮り終えた直後に見る 数え終えてからだと、数えている間に ffplay が普通に
+            # 終わった回まで「撮っている間に終わった」と断る
+            if player.poll() is not None:
+                raise SystemExit("撮っている間に ffplay が終わった --start と素材の長さを確かめる")
+
+        count = capture_screen(
+            region, seconds, label, grabber=grabber, output=output, on_captured=still_playing
+        )
+        check_reference(count)
         return count
     finally:
         player.kill()
