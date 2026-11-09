@@ -907,7 +907,10 @@ class InspectorPanel(QWidget):
 
     def _restore_focus(self, place: _FocusPlace) -> None:
         """作り直した後、同じ値の欄の同じ部品へフォーカスを戻す 欄が消えていれば戻さない"""
-        owner = self._focus_owners.get(place.key)
+        # 覚えた鍵は本当の ID 取っておいた欄を出し直したときは、欄が組んだクリップの ID で
+        # 引くので、入れ替えの組で戻す（組は両向きなので同じ :meth:`_real_key` で戻る）
+        # 戻さないと、エフェクトの文字の欄へ打っていたときにフォーカスを見失う
+        owner = self._focus_owners.get(self._real_key(place.key))
         if owner is None:
             return
         target: QWidget | None = owner

@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 from sashimono.stall_watch import StallWatch, threshold_from_env
 
@@ -139,6 +140,42 @@ def test_a_stall_cut_short_by_stopping_is_still_written(tmp_path: Path) -> None:
     watch.stop()
     [record] = _records(watch.path)
     assert record["stall_ms"] == 100.0
+
+
+def test_stopping_during_a_slow_write_keeps_the_order(tmp_path: Path) -> None:
+    """壊れると、前の記録の書き込みが 1 秒を超えたとき、止めた側が後の記録を先に書き、
+    記録の順が入れ替わる
+    """
+    clock = Clock()
+    watch = _watch(tmp_path, clock)
+    writing = threading.Event()
+    release = threading.Event()
+    written: list[tuple[float, str]] = []
+    real_write = watch._write
+
+    def slow_write(stall: Any, ended: float) -> None:
+        writing.set()
+        release.wait(30.0)
+        written.append((ended, threading.current_thread().name))
+        real_write(stall, ended)
+
+    watch._write = slow_write  # type: ignore[method-assign]
+    watch.beat()
+    clock.now = 0.100
+    watch.check()
+    watch.beat()
+    watch.start()
+    thread = watch._thread
+    assert thread is not None
+    assert writing.wait(30.0)
+    clock.now = 0.300
+    watch.check()
+    clock.now = 0.400
+    watch.stop()
+    release.set()
+    thread.join(30.0)
+    assert [ended for ended, _name in written] == [0.100, 0.400]
+    assert {name for _ended, name in written} == {"sashimono-stall-watch"}
 
 
 def test_threads_with_the_same_name_are_kept_apart(tmp_path: Path) -> None:

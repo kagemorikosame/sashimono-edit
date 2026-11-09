@@ -268,14 +268,33 @@ def needs_keyframe_check(media: MediaItem) -> bool:
 _OTHER_SCENE = 1 << 40
 
 
+#: 一度たどったシーンの起点 シーンの ID・中の再生位置・外の時間への縮み → いちばん小さい下駄
+#: 同じ起点なら中の距離は同じなので、下駄が大きい再訪は何も縮めない 覚えずに毎回たどると、
+#: 同じシーンを何か所にも置いて入れ子にした作品で、たどる数が段の数の指数で増える
+_Seen = dict[tuple[SceneId, int, Fraction], Fraction]
+
+
 def _distances(
     project: Project,
     timeline: Timeline,
     playhead: int,
-    base: int,
-    found: dict[MediaId, int],
+    base: Fraction,
+    found: dict[MediaId, Fraction],
+    *,
+    deep: bool = True,
+    scale: Fraction = Fraction(1),
     inside: frozenset[SceneId] = frozenset(),
+    seen: _Seen | None = None,
 ) -> None:
+    """``timeline`` の素材の、再生位置からの距離（いちばん外の時間軸のコマ数）を ``found`` へ入れる
+
+    ``scale`` はこのタイムラインの 1 コマが外の何コマに当たるか 10 倍速で置いたシーンの中の
+    100 コマ先は、外では 10 コマ先に見える 縮めずに足すと、外のすぐ先の素材より後へ回る
+    ``deep`` が偽なら置いたシーンの中へ入らない どのタイムラインもそれぞれ 1 度ずつ数える
+    呼び方（使っている素材を集めるとき）で、中へ入ると同じシーンを何度も数えることになる
+    """
+    if seen is None:
+        seen = {}
     for track in timeline.tracks:
         for clip in track.clips:
             if clip.media_id is None and clip.scene_id is None:
@@ -286,24 +305,38 @@ def _distances(
                 distance = min(
                     abs(clip.timeline_start - playhead), abs(clip.timeline_end - 1 - playhead)
                 )
+            reach = base + distance * scale
             if clip.scene_id is not None:
                 # 置いたシーンの中も、再生位置が指す所からの近さで並べる 中を見ないと、
                 # 再生位置で見えている素材が、ほかのシーンにだけある素材と同じ後ろへ回る
                 # 外れていればクリップの端の所を起点にし、離れている分を下駄に足す
                 scene = project.find_scene(clip.scene_id)
-                if scene is None or scene.id in inside:
+                if not deep or scene is None or scene.id in inside:
                     continue
                 local = min(max(playhead - clip.timeline_start, 0), clip.duration - 1)
                 rate = timeline.rate
                 inner = int(clip.picture_time(local, rate) / rate.frame_duration)
+                inner_scale = scale / clip.speed
+                key = (scene.id, inner, inner_scale)
+                best = seen.get(key)
+                if best is not None and best <= reach:
+                    continue
+                seen[key] = reach
                 _distances(
-                    project, scene.timeline, inner, base + distance, found, inside | {scene.id}
+                    project,
+                    scene.timeline,
+                    inner,
+                    reach,
+                    found,
+                    scale=inner_scale,
+                    inside=inside | {scene.id},
+                    seen=seen,
                 )
                 continue
             assert clip.media_id is not None
             current = found.get(clip.media_id)
-            if current is None or base + distance < current:
-                found[clip.media_id] = base + distance
+            if current is None or reach < current:
+                found[clip.media_id] = reach
 
 
 def proxy_order(project: Project, playhead: int, active: Timeline | None = None) -> list[MediaId]:
@@ -314,10 +347,13 @@ def proxy_order(project: Project, playhead: int, active: Timeline | None = None)
     素材一覧の並びのまま最後に置く 開いてすぐ見る所の控えが先にできれば、待つのは
     見ていない所の分だけになる
     """
-    found: dict[MediaId, int] = {}
-    _distances(project, active if active is not None else project.timeline, playhead, 0, found)
+    found: dict[MediaId, Fraction] = {}
+    _distances(
+        project, active if active is not None else project.timeline, playhead, Fraction(0), found
+    )
+    # ほかのタイムラインは全部並べて見るので、置いたシーンの中へは入らない
     for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
-        _distances(project, timeline, 0, _OTHER_SCENE, found)
+        _distances(project, timeline, 0, Fraction(_OTHER_SCENE), found, deep=False)
     used = sorted(found, key=lambda media_id: found[media_id])
     taken = set(used)
     return [*used, *(media.id for media in project.media if media.id not in taken)]
@@ -325,10 +361,9 @@ def proxy_order(project: Project, playhead: int, active: Timeline | None = None)
 
 def used_media(project: Project) -> set[MediaId]:
     """どこかのタイムライン（シーンも）のクリップが指している素材"""
-    found: dict[MediaId, int] = {}
-    _distances(project, project.timeline, 0, 0, found)
-    for scene in project.scenes:
-        _distances(project, scene.timeline, 0, 0, found)
+    found: dict[MediaId, Fraction] = {}
+    for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
+        _distances(project, timeline, 0, Fraction(0), found, deep=False)
     return set(found)
 
 

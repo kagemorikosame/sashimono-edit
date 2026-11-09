@@ -101,6 +101,93 @@ class TestOrder:
         # 再生位置 510 はシーンの中の 510 コマ目（b の上） c はシーンの頭で 481 コマ離れる
         assert proxy_order(project, 510) == [media[1].id, media[2].id, media[0].id]
 
+    def test_a_fast_scene_counts_in_outer_frames(self) -> None:
+        """壊れると、10 倍速で置いたシーンの中の素材を外の 10 倍遠くに数え、外ですぐ先に見える
+        素材の控えが、外のもっと先の素材より後へ回る
+        """
+        media = [_media(name) for name in "ab"]
+        base = Project.create()
+        inner = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S1",
+                    (Clip(timeline_start=500, duration=30, media_id=media[0].id),),
+                ),
+            ),
+        )
+        scene = Scene("場面", inner)
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (
+                        Clip(
+                            timeline_start=0,
+                            duration=100,
+                            scene_id=scene.id,
+                            speed=Fraction(10),
+                        ),
+                        Clip(timeline_start=160, duration=30, media_id=media[1].id),
+                    ),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=(scene,)).with_timeline(main)
+        # a はシーンの中で 500 コマ先 10 倍速なので外では 50 コマ先 b は 160 コマ先
+        assert proxy_order(project, 0) == [media[0].id, media[1].id]
+
+    def test_a_scene_placed_twice_at_every_depth_is_walked_once(self) -> None:
+        """壊れると、同じシーンを 2 か所に置いて入れ子にした作品で、たどる数が段の数の指数で
+        増え、作品を開くたびに画面が長く止まる
+        """
+        media = [_media("a")]
+        base = Project.create()
+        leaf = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S",
+                    (Clip(timeline_start=0, duration=30, media_id=media[0].id),),
+                ),
+            ),
+        )
+        scenes = [Scene("0", leaf)]
+        for depth in range(1, 40):
+            below = scenes[-1].id
+            timeline = replace(
+                base.timeline,
+                tracks=(
+                    Track(
+                        TrackKind.VIDEO,
+                        "S",
+                        (
+                            Clip(timeline_start=0, duration=30, scene_id=below),
+                            Clip(timeline_start=100, duration=30, scene_id=below),
+                        ),
+                    ),
+                ),
+            )
+            scenes.append(Scene(str(depth), timeline))
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (Clip(timeline_start=0, duration=30, scene_id=scenes[-1].id),),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=tuple(scenes)).with_timeline(main)
+        # 覚えずにたどると 2 の 40 乗で終わらない
+        assert proxy_order(project, 0) == [media[0].id]
+        assert used_media(project) == {media[0].id}
+
     def test_used_media(self) -> None:
         """壊れると、置いたときに作る設定で、使い始めた素材の控えが頼まれない"""
         media = [_media(name) for name in "ab"]

@@ -2181,6 +2181,9 @@ class MainWindow(QMainWindow):
             self._analyzer.forget(target)
             self._screen.forget(target)
             self._proxies.forget(target)
+            # 頼んだ印も消す 残すと、使い始めたときに作る設定で、作っている途中に外して
+            # 取り消しで戻した素材の控えを、使い始めても二度と頼まない
+            self._proxy_asked.discard(target)
             # 取り消しで戻ったときに頼み直す（:meth:`_reanalyze_returned`）
             self._forgotten.add(target)
 

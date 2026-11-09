@@ -109,6 +109,24 @@ def test_a_failed_proxy_is_not_asked_again_on_every_edit(
     assert asked == [item.id]
 
 
+def test_removed_and_returned_media_are_asked_again(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、作っている途中に外して取り消しで戻した素材の控えを、また使い始めても頼まない"""
+    asked: list[MediaId] = []
+    monkeypatch.setattr(window._proxies, "request", lambda media, **_kwargs: asked.append(media.id))
+    monkeypatch.setattr(window._proxies, "forget", lambda _media_id: None)
+    item = _media("returned")
+    _placed(window, item)
+    window._request_newly_used()
+    assert asked == [item.id]
+    window._forget_media([item.id])
+    # 戻した作品は前と別の物 同じ物を渡すと、見直し済みとして何もしない
+    window._document.reset(replace(window._document.project))
+    window._request_newly_used()
+    assert asked == [item.id, item.id]
+
+
 def test_unused_media_are_not_requested(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
