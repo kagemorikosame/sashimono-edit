@@ -132,6 +132,29 @@ class TestSamples:
         sample = text_sample(value, frozenset({"text"}), ["長い本文" * 10])
         assert sample.lines == ("長い本文" * 10,)
 
+    def test_a_field_name_equal_to_the_value_is_not_counted(self) -> None:
+        # 壊れると、text の欄に text と書いたとき、結果の欄の名前まで本文と数え、1 行 4 文字が
+        # 2 行 8 文字になる（CodeRabbit の指摘 #450）
+        value = {"name": "text", "value": "text", "kind": "text"}
+        sample = text_sample(value, frozenset(), ["text"])
+        assert (sample.count, sample.chars) == (1, 4)
+
+    def test_a_later_page_of_a_long_value_is_counted(self) -> None:
+        # 壊れると、値を区切って返した 2 ページ目より後ろは本文の頭と重ならず、記録から抜ける
+        # （CodeRabbit の指摘 #450）
+        body = "".join(f"{n:03d}番目の文。" for n in range(40))
+        page = body[100:160]
+        value = {"name": "text", "value": page, "value_offset": 100, "value_length": len(body)}
+        sample = text_sample(value, frozenset(), [body])
+        assert sample.lines == (page,)
+
+    def test_a_cut_value_is_counted_without_the_mark(self) -> None:
+        # 壊れると、切り詰めの印（…）が付いた本文が元の値の一部と見なされず、記録から抜ける
+        body = "長い本文" * 40
+        cut = body[:80] + "…"
+        sample = text_sample({"value": cut}, frozenset(), [body])
+        assert sample.lines == (cut,)
+
     def test_frames_carry_the_picture_that_is_sent(self) -> None:
         # 壊れると、窓に出す絵と送る絵が別になり、どのコマが出るかを見誤る
         image = ImageResult(png=b"png", caption="12.0 秒のコマ")

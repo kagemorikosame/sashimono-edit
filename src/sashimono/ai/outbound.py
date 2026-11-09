@@ -308,9 +308,10 @@ def _all_texts(value: Any) -> Iterator[str]:
             yield from _all_texts(entry)
 
 
-#: 文字の欄の値が、結果の中で切り詰められていても同じ値と見なす長さ（文字）
-#: 長い本文は結果に収めるために頭だけを残して切る（:func:`~sashimono.ai.operations._fit`）
-#: 短い文字（欄の名前・種類）が偶然に頭と重なっても本文と数えないよう、ある程度の長さを要る
+#: 文字の欄の値が、結果の中で一部だけ載っていても同じ値と見なす長さ（文字）
+#: 長い本文は結果に収めるために頭だけを残して切り（:func:`~sashimono.ai.operations._fit`）、
+#: 値を読む道具は区切って続きを返す（``value_offset``） 短い文字（欄の名前・種類）が偶然に
+#: 本文の一部と重なっても本文と数えないよう、ある程度の長さを要る
 _FIELD_PREFIX = 20
 
 
@@ -327,24 +328,38 @@ def _texts_outside(value: Any, keys: frozenset[str]) -> Iterator[str]:
             yield from _texts_outside(entry, keys)
 
 
-def _from_fields(text: str, fields: frozenset[str]) -> bool:
-    """結果の文字が、文字の欄から伏せずに載せた値（かその頭）か"""
+def _take_field(text: str, fields: list[str]) -> bool:
+    """結果の文字が、文字の欄から伏せずに載せた値（かその一部）なら、その値を 1 つ使い切る
+
+    1 つの値は結果の 1 か所にしか当てない 当てた値を残すと、値と同じ文字の欄の名前
+    （``text`` の欄に ``text`` と書いた時の ``"name": "text"``）まで本文と数え、送った量が
+    実際より多くなる 一部は切り詰めの印（…）を除いた残りで、区切って返した後ろの部分も当たる
+    """
     if text in fields:
+        fields.remove(text)
         return True
-    return len(text) >= _FIELD_PREFIX and any(field.startswith(text) for field in fields)
+    piece = text.removesuffix("…")
+    if len(piece) < _FIELD_PREFIX:
+        return False
+    for whole in fields:
+        if piece in whole:
+            fields.remove(whole)
+            return True
+    return False
 
 
 def text_sample(value: Any, keys: frozenset[str], fields: Iterable[str] = ()) -> Sample:
     """字幕と文字の下見 行数・文字数と、先頭から :data:`SAMPLE_LINES` 行
 
     ``fields`` は文字の欄から伏せずに載せた値（:func:`sending` の ``passed``） 値そのものは
-    数えず、結果に実際に載った文字のうち、その値か頭に当たる物を数える 切り詰めて返した欄は
-    返した分だけを数え、``keys`` の欄に入った物は二重に数えない
+    数えず、結果に実際に載った文字のうち、その値かその一部に当たる物を、値 1 つにつき 1 か所
+    だけ数える 切り詰めて返した欄と区切って返した欄は返した分だけを数え、``keys`` の欄に
+    入った物は二重に数えない
     """
-    passed = frozenset(field for field in fields if field)
+    passed = [field for field in fields if field]
     texts = list(_texts_under(value, keys))
     if passed:
-        texts += [text for text in _texts_outside(value, keys) if _from_fields(text, passed)]
+        texts += [text for text in _texts_outside(value, keys) if _take_field(text, passed)]
     lines = [line for text in texts for line in text.splitlines() if line]
     return Sample(
         Outbound.TEXT,
