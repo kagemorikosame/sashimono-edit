@@ -4403,18 +4403,24 @@ GitHub の Issue フォーム（`.yml`）を使わないのも同じ理由
    手元の gh が fork を既定にしていても本家に作る
 5. 公開のロードマップ（プロジェクト 3）に足し、Status を「未着手」、「大きさ」の欄をラベルに合わせる
    欄と選択肢は足す前にすべて確かめる（足した後で止まると Status の無い項目が残るため）
+   「大きさ」の欄は、そのときのラベルを写すだけ あとで大きさのラベルを変えたら
+   `register` を打ち直して欄を合わせる（作ったり登録したりしている途中には変えない）
 
 止まったときのやり直し方
 
 - **4 で止まった**（gh が失敗した・120 秒で返らなかった） GitHub 側では作られたかもしれない
-  `gh issue list --repo kagemorikosame/sashimono-edit --author @me --limit 5` で確かめ、
-  作られていれば `.venv\Scripts\python.exe tools\new_issue.py register <番号>` で登録だけを行う
+  `gh issue list --repo kagemorikosame/sashimono-edit --author @me --state all --limit 20` で確かめ
+  （閉じられた物も出す 見つからなければ `--limit` を増やす）、作られていれば `.venv\Scripts\python.exe tools\new_issue.py register <番号>` で登録だけを行う
   `--parent` で作った子なら親に付いているかも見て、付いていなければ GitHub の画面で親に付ける
   `create` は打ち直さない
 - **5 で止まった**（`gh` に `project` の権限が無いなど） `gh auth refresh -s project` を打ってから
   `.venv\Scripts\python.exe tools\new_issue.py register <番号>` でやり直す
+  `GH_TOKEN` か `GITHUB_TOKEN` を使っているときは `gh auth refresh` ではそのトークンが変わらない
+  `project` の権限のあるトークンに替えてから打つ
   何度打っても項目は 1 つにしかならない
   既に Status が付いていれば変えない（作業中やレビュー中の物を「未着手」へ戻さない）
+  板の API には「空のときだけ書く」が無いので、`register` が終わるまで板の Status は手で変えない
+  （空と読んだ直後に変えると「未着手」で上書きされる）
   大きさのラベルがちょうど 1 つでなければ止まる
 
 `--parent` は gh の `issue create --parent` を使う これを知らない古い gh は、作る前に

@@ -81,15 +81,18 @@ class FakeGh:
             body_file = Path(arguments[arguments.index("--body-file") + 1])
             self.bodies.append(body_file.read_bytes().decode("utf-8"))
             return f"Creating issue\n{URL}\n"
-        if key == "issue list":
-            # 題は検索に渡さず、開いた物を引いて比べる 渡すと題の中の「label:」が条件になる
-            assert "--search" not in arguments
+        if key == "api --paginate":
+            # 題は検索に渡さず、開いた物を最後のページまで引いて比べる
+            # 渡すと題の中の「label:」が条件になり、件数で切ると上限の先の同じ題を見逃す
+            assert "state=open" in arguments[2]
             others = [{"title": "別の題", "url": URL + "0"}]
             same = [{"title": title, "url": URL} for title in self.same_title]
-            return json.dumps(others + same)
+            return "".join(json.dumps(issue) + "\n" for issue in others + same)
         if key == "project view":
             return json.dumps(PROJECT)
         if key == "project field-list":
+            # 既定の 30 個で切ると、欄が増えたときに Status や大きさが漏れる
+            assert arguments[arguments.index("--limit") + 1] == "100"
             return json.dumps(FIELDS)
         if key == "project item-edit":
             return ""
@@ -275,6 +278,43 @@ def test_unclosed_fence_keeps_trailing_blank_lines(tool: ModuleType) -> None:
     assert tool.check_body("目的\n\n\n\n", []).body == "目的\n"
 
 
+def test_unclosed_fence_in_quote_ends_with_the_quote(tool: ModuleType) -> None:
+    # 引用の中の閉じ忘れた囲みを最後まで延ばすと、後ろの必須の節をコードと取って止める
+    body = f"目的\n\n> ```\n> ログ\n\n## 症状\n\n落ちる{MARU}\n"
+    assert tool.check_body(body, ["症状"]).errors == []
+    assert tool.check_punctuation("題", body) == ["句点がある（本文の 8 行 4 文字目）"]
+
+
+def test_unclosed_fence_in_list_ends_with_the_item(tool: ModuleType) -> None:
+    # リストの中の閉じ忘れた囲みを最後まで延ばすと、項目の後ろの文章の句点を見逃す
+    body = f"- ```\n  ログ\n後ろの文{MARU}\n"
+    assert tool.fenced_lines(tool.split_lines(body)) == [True, True, False]
+    assert tool.check_punctuation("題", body) != []
+
+
+def test_indented_code_is_kept(tool: ModuleType) -> None:
+    # 4 字下げで貼った再現用の文を本文と取ると、句点を消したりコメントの例を外したりする
+    body = f"目的\n\n## 症状\n\n    字幕{MARU}\n    <!-- 例 -->\n\n落ちる\n"
+    assert tool.check_punctuation("題", body) == []
+    assert tool.fix_punctuation(body) == body
+    assert f"    字幕{MARU}\n    <!-- 例 -->\n" in tool.check_body(body, ["症状"]).body
+    # 段落の途中の 4 字下げは段落の続きで、句点の検査から外さない
+    assert tool.check_punctuation("題", f"文\n    続き{MARU}\n") != []
+
+
+def test_inline_code_does_not_cross_headings(tool: ModuleType) -> None:
+    # 閉じの無い ` が見出しを越えて次の ` と組むと、間の文章の句点を見逃す
+    body = f"目的 `a\n## 症状\n落ちる{MARU} `b\n"
+    assert tool.check_punctuation("題", body) == ["句点がある（本文の 3 行 4 文字目）"]
+
+
+def test_heading_inside_comment_is_not_a_section(tool: ModuleType) -> None:
+    # 注意書きの中の見出しで必須の節を埋めたことにすると、公開では消えて節が無くなる
+    body = "目的\n\n<!--\n## 症状\n落ちる\n-->\n"
+    checked = tool.check_body(body, ["症状"])
+    assert checked.errors == ["必須の節「症状」が無い"]
+
+
 def test_bold_mark_inside_code_is_not_counted(tool: ModuleType) -> None:
     # コードの中の ** を太字の開きと数えると、次の文の太字の前の空白を入れ損なう
     text = f"記号 `**` を受ける{MARU}**次の文**\n"
@@ -354,7 +394,7 @@ def test_create_sends_labels_milestone_and_registers(tool: ModuleType, tmp_path:
         str(body),
     )
     assert code == 0
-    assert gh.calls[0][:2] == ["issue", "list"]
+    assert gh.calls[0][:2] == ["api", "--paginate"]
     create = gh.calls[1]
     assert create[:2] == ["issue", "create"]
     # fork を既定にした gh でも本家に作る
@@ -381,7 +421,7 @@ def test_same_title_stops_a_second_issue(
     body.write_bytes(filled_bug().encode("utf-8"))
     gh = FakeGh(same_title=["落ちる"])
     assert run_main(tool, gh, *create_bug(body)) == 1
-    assert [call[:2] for call in gh.calls] == [["issue", "list"]]
+    assert [call[:2] for call in gh.calls] == [["api", "--paginate"]]
     assert "register" in capsys.readouterr().err
 
     # 語が当たっただけの別の題は止めない
@@ -399,13 +439,11 @@ def test_same_title_with_search_words_is_found(tool: ModuleType) -> None:
     assert tool.same_titles("label:bug の表示を直す", gh) == [URL]
 
 
-def test_too_many_open_issues_stops_the_title_check(
-    tool: ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # 上限で切れたまま「同じ題は無い」と答えると、見えない所にある同じ Issue を作り直す
-    monkeypatch.setattr(tool, "OPEN_ISSUE_LIMIT", 1)
-    with pytest.raises(tool.IssueError, match="確かめ切れない"):
-        tool.same_titles("落ちる", FakeGh())
+def test_pull_requests_are_not_counted_as_same_title(tool: ModuleType) -> None:
+    # 同じ題の PR を Issue と取ると、作るべき Issue を作れない
+    gh = FakeGh()
+    tool.same_titles("落ちる", gh)
+    assert "select(.pull_request | not)" in " ".join(gh.calls[0])
 
 
 def test_refused_body_creates_nothing(
