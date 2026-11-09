@@ -14,7 +14,7 @@ from types import ModuleType
 
 import pytest
 
-from tests.media_fixtures import ffmpeg_available
+from tests.media_fixtures import encoder_available, ffmpeg_available
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -89,6 +89,23 @@ class TestCounting:
         assert rule.count("---") == header.count("|") - 1
         assert "| 画面 | 20.0 | 1200 | 600 | 30.0 |" in row
 
+    def test_a_capture_that_stopped_early_is_marked_short(self, tool: ModuleType) -> None:
+        # 撮る側が途中で止まると、撮れたコマが密でも 20 秒の数字にならない 印が無いと
+        # 短い間の fps を 20 秒の結果として並べてしまう
+        captured = [k / 60 for k in range(600)]
+        count = tool.summarize("試し", captured, captured, requested=20.0)
+        assert not count.low
+        assert count.short
+        assert "20 秒より短い" in tool.format_table([count])
+
+    def test_labels_cannot_break_the_table(self, tool: ModuleType) -> None:
+        # ``|`` や改行が欄に入ると、後ろの数字が別の列へずれる
+        captured = [k / 60 for k in range(60)]
+        table = tool.format_table([tool.summarize("前|後\n2 回目", captured, captured)])
+        row = table.splitlines()[2]
+        assert len(table.splitlines()) == 3
+        assert row.startswith(r"| 前\|後 2 回目 | 1.0 |")
+
 
 class TestGrabArguments:
     def test_ddagrab_sends_only_updates_from_the_region(self, tool: ModuleType) -> None:
@@ -115,7 +132,10 @@ class TestGrabArguments:
             tool.grab_arguments("x11grab", (0, 0, 2, 2), 1.0)
 
 
-@pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg が無いので素材を作れない")
+@pytest.mark.skipif(
+    not (ffmpeg_available() and encoder_available("ffv1")),
+    reason="ffmpeg か ffv1 の符号化器が無いので素材を作れない",
+)
 class TestCountFile:
     def _make(self, path: Path, rate: int) -> Path:
         # 速さ ``rate`` で動く絵を 60fps へ並べ直す 30 なら同じ絵が 2 枚ずつ続く

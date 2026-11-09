@@ -67,6 +67,10 @@ STALL_SECONDS = 0.1
 #: 撮る側が落とした間は映ったコマも数えられず、映ったコマの数が実際より低く出る
 CAPTURE_SHORTFALL = 0.98
 
+#: 撮る長さに足す待ちの上限（秒） ddagrab は画面が書き換わらないと ``-t`` を過ぎても
+#: 次の 1 枚を待ち続けて終わらないことがあるので、ここで打ち切る
+CAPTURE_GRACE = 30.0
+
 #: ffplay が窓を出して映し始めるまでの待ち（秒） 窓が出る前から撮ると、頭の静止を止まりと数える
 REFERENCE_WARMUP = 1.5
 
@@ -94,6 +98,8 @@ class Count:
     stalls: int
     #: 決まった間隔で撮った（``gdigrab``・素材） 撮れたコマが秒数 × 60 に届くはずの撮り方
     fixed_rate: bool = True
+    #: 頼んだ撮る長さ 撮る側が途中で止まると、撮れたコマが密でも長さが足りない
+    requested: float | None = None
 
     @property
     def shown_fps(self) -> float:
@@ -103,6 +109,20 @@ class Count:
     def low(self) -> bool:
         """撮る側が追いつかず、映ったコマの数が低めに出ている"""
         return self.fixed_rate and self.captured < self.seconds * CAPTURE_RATE * CAPTURE_SHORTFALL
+
+    @property
+    def short(self) -> bool:
+        """撮る側が頼んだ長さより早く止まった 映った fps はその分だけの数字になる"""
+        return self.requested is not None and self.seconds < self.requested * CAPTURE_SHORTFALL
+
+    @property
+    def note(self) -> str:
+        notes = []
+        if self.low:
+            notes.append("撮る側が追いつかず低め")
+        if self.short:
+            notes.append(f"頼んだ {self.requested:.0f} 秒より短い")
+        return " ".join(notes)
 
 
 def parse_showinfo(text: str) -> dict[int, list[float]]:
@@ -120,6 +140,7 @@ def summarize(
     *,
     seconds: float | None = None,
     fixed_rate: bool = True,
+    requested: float | None = None,
 ) -> Count:
     """撮れたコマの時刻と映ったコマの時刻から、並べる数字を出す
 
@@ -138,7 +159,14 @@ def summarize(
     else:
         median = p95 = 0.0
     stalls = sum(1 for gap in intervals if gap > STALL_SECONDS)
-    return Count(label, seconds, len(captured), len(shown), median, p95, stalls, fixed_rate)
+    return Count(
+        label, seconds, len(captured), len(shown), median, p95, stalls, fixed_rate, requested
+    )
+
+
+def _cell(text: str) -> str:
+    """表の 1 つの欄に収める ``|`` や改行がそのまま入ると、後ろの数字が別の列へずれる"""
+    return " ".join(text.replace("|", r"\|").splitlines())
 
 
 def format_table(counts: Sequence[Count]) -> str:
@@ -149,11 +177,10 @@ def format_table(counts: Sequence[Count]) -> str:
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for count in counts:
-        note = "撮る側が追いつかず低め" if count.low else ""
         lines.append(
-            f"| {count.label} | {count.seconds:.1f} | {count.captured} | {count.shown} "
+            f"| {_cell(count.label)} | {count.seconds:.1f} | {count.captured} | {count.shown} "
             f"| {count.shown_fps:.1f} | {count.interval_median_ms:.1f} ms "
-            f"| {count.interval_p95_ms:.1f} ms | {count.stalls} | {note} |"
+            f"| {count.interval_p95_ms:.1f} ms | {count.stalls} | {count.note} |"
         )
     return "\n".join(lines)
 
@@ -211,7 +238,12 @@ def _ffmpeg(name: str = "ffmpeg") -> str:
 
 
 def _analyze(
-    source: list[str], label: str, *, seconds: float | None = None, fixed_rate: bool = True
+    source: list[str],
+    label: str,
+    *,
+    seconds: float | None = None,
+    fixed_rate: bool = True,
+    requested: float | None = None,
 ) -> Count:
     """ffmpeg に間引かせて ``showinfo`` を読む
 
@@ -246,6 +278,7 @@ def _analyze(
         times.get(_SHOWN_INDEX, []),
         seconds=seconds,
         fixed_rate=fixed_rate,
+        requested=requested,
     )
 
 
@@ -283,14 +316,31 @@ def capture_screen(
             "0",
             str(clip),
         ]
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=seconds + CAPTURE_GRACE,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SystemExit(
+                f"{seconds + CAPTURE_GRACE:.0f} 秒たっても撮り終わらなかった 撮る枠の画面が"
+                "書き換わっていないか、枠が画面の外にある"
+            ) from exc
         if result.returncode != 0:
             raise SystemExit(f"画面を撮れなかった:\n{result.stderr[-2000:]}")
+        # gdigrab は撮れた長さで割り、途中で止まったら短いと印を付ける ddagrab は絵が
+        # 止まると何も届かず長さが縮むので、頼んだ長さで割る
         fixed = grabber == "gdigrab"
         return _analyze(
-            ["-i", str(clip)], label, seconds=None if fixed else seconds, fixed_rate=fixed
+            ["-i", str(clip)],
+            label,
+            seconds=None if fixed else seconds,
+            fixed_rate=fixed,
+            requested=seconds if fixed else None,
         )
 
 
@@ -335,7 +385,19 @@ def count_reference(
     player = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(REFERENCE_WARMUP)
-        return capture_screen(region, seconds, label, grabber=grabber, output=output)
+        # ffplay が先に終わっていると、机の上を撮って低い数字を基準として出すことになる
+        if player.poll() is not None:
+            raise SystemExit("ffplay が映し始める前に終わった 素材の場所と ffplay を確かめる")
+        count = capture_screen(region, seconds, label, grabber=grabber, output=output)
+        if player.poll() is not None:
+            raise SystemExit("撮っている間に ffplay が終わった --start と素材の長さを確かめる")
+        # 窓が出る前の机の上を撮ると、頭が止まって見える 止まりのある回は基準に使わない
+        if count.stalls:
+            raise SystemExit(
+                f"ffplay の絵に 0.1 秒を越えた止まりが {count.stalls} 回あった 窓が出るのが"
+                "遅れたか、枠が窓とずれている 基準に使わず撮り直す"
+            )
+        return count
     finally:
         player.kill()
         player.wait()

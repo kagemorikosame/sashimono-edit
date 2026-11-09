@@ -76,12 +76,14 @@ class _SteppingPlayer(AudioPlayer):
             self._anchors.clear()
 
 
-def _controller(monkeypatch: pytest.MonkeyPatch) -> tuple[PlaybackController, _SteppingPlayer]:
+def _controller(
+    monkeypatch: pytest.MonkeyPatch, seconds: int = 10
+) -> tuple[PlaybackController, _SteppingPlayer]:
     _SteppingPlayer.clock = _Clock()
     monkeypatch.setattr(playback_module, "AudioPlayer", _SteppingPlayer)
     settings = ProjectSettings(width=64, height=48, frame_rate=FrameRate(60))
     base = Project.create(settings)
-    clip = Clip(timeline_start=0, duration=60 * 10, source=TEXT.create(text="x"))
+    clip = Clip(timeline_start=0, duration=60 * seconds, source=TEXT.create(text="x"))
     track = Track(TrackKind.VIDEO, "V1", clips=(clip,))
     controller = PlaybackController(base.with_timeline(replace(base.timeline, tracks=(track,))))
     player = controller._player
@@ -277,6 +279,10 @@ class TestFillLimits:
         player.stop()
 
 
+#: 見回りのたびに出ていたコマ（知らせずに同じコマを続けた回も含む） 最後の _play_on_vsync の分
+held: list[tuple[float, int]] = []
+
+
 def _play_on_vsync(
     controller: PlaybackController,
     player: _SteppingPlayer,
@@ -291,6 +297,7 @@ def _play_on_vsync(
     音の時計は揺れずに進むものとし（補いが効いた後の姿）、見回りの時刻だけを動かす
     """
     shown: list[tuple[float, int]] = []
+    held.clear()
     controller.frame_changed.connect(lambda frame: shown.append((player.clock.now, frame)))
     controller.play()
     jitter = random.Random(60)
@@ -303,6 +310,7 @@ def _play_on_vsync(
             player._written = player._position + BUFFERED
             player._anchors.clear()
         controller._tick()
+        held.append((player.clock.now, controller.frame))
         tick += 1
     controller.close()
     return shown
@@ -345,14 +353,17 @@ class TestTicksOnTheDisplayRate:
     ) -> None:
         # 画面が 59.94Hz で素材が 60fps 位相は 16 秒ほどで 1 周する 避けられない飛びは
         # 1 周に 1 回で、境目の近くを通る間に何度も行き来しない
-        controller, player = _controller(monkeypatch)
-        shown = _play_on_vsync(
-            controller, player, 9.5, period=1001 / 60000, offset=0.0, wobble=0.003
-        )
-        settled = [frame for moment, frame in shown if moment > 1.0]
-        steps = [b - a for a, b in itertools.pairwise(settled)]
-        assert steps.count(2) <= 1
+        # 3 周ぶん回し、回り込みのたびに戻ったり何度も飛んだりしないかを、知らせずに同じ
+        # コマを続けた回も含めて見る
+        controller, player = _controller(monkeypatch, seconds=60)
+        _play_on_vsync(controller, player, 52.0, period=1001 / 60000, offset=0.0, wobble=0.003)
+        settled = [(moment, frame) for moment, frame in held if moment > 1.0]
+        steps = [b - a for (_, a), (_, b) in itertools.pairwise(settled)]
+        # 画面の方が遅いので、1 周に 1 回だけ 1 コマ飛ぶ 同じコマが続く回は無い
         assert all(step in (1, 2) for step in steps)
+        assert 2 <= steps.count(2) <= 4
+        for moment, frame in settled:
+            assert -1.25 <= frame - moment * 60 <= 1.25
 
     @pytest.mark.parametrize(
         ("interval", "fps"),
@@ -366,3 +377,38 @@ class TestTicksOnTheDisplayRate:
         for tick in range(600):
             phase.frame(tick * interval * fps)
         assert abs(phase.bias) < 0.05
+
+
+class TestRewinds:
+    def test_an_underrun_restarts_the_fill(self) -> None:
+        # 書く側が遅れてデバイスが空になった後は、鳴っていなかった間も古い時刻から
+        # 進めると、詰め直している途中の音より映像が先へ出る
+        player, clock = _player()
+        for block in range(8):
+            clock.now = block * BLOCK_SECONDS
+            player._advance(BLOCK_SAMPLES, BUFFERED)
+        # 0.2 秒書けなかった後、空いたバッファへ一気に詰め直す
+        clock.now = 7 * BLOCK_SECONDS + 0.2
+        for _ in range(4):
+            player._advance(BLOCK_SAMPLES, BUFFERED)
+        clock.now += 0.005
+        assert player.position_sample <= player._position + int(0.005 * RATE) + 1
+
+    def test_a_dying_device_does_not_move_the_playhead_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 位相の補正で音より先のコマを出した後に出口が止まると、補正しない位置は 1 つ
+        # 手前になる 知らせると再生ヘッドと再開する所が戻る
+        controller, player = _controller(monkeypatch)
+        frames: list[int] = []
+        controller.frame_changed.connect(frames.append)
+        controller.play()
+        controller._frame = 40
+        with player._lock:
+            player._position = 39 * 800 + 10
+        player.running = False
+        controller._tick()
+        assert frames == []
+        assert controller.frame == 40
+        assert not controller.is_playing
+        controller.close()

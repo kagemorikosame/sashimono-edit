@@ -50,6 +50,12 @@ EXTRAPOLATE_LIMIT = 2 * BLOCK_SAMPLES
 #: パソコンの時計の速さの差（ppm）がたまって先へ出るので、最近の分だけを見る
 ANCHOR_WINDOW = 8
 
+#: 前の書き込みからこのかたまりの数の時間より空いたら、覚えた時刻を捨てて補いを始め直す
+#: 書く側が遅れてデバイスが空になった（アンダーラン）後は、鳴っていなかった間も
+#: 古い時刻から経過で進めると、詰め直している途中の音より映像が先へ出る
+#: 手元の MME では書き込みが戻る間隔の 95% が 30 ms なので、2 かたまり（約 43 ms）で分ける
+UNDERRUN_BLOCKS = 2
+
 
 class PlaybackError(RuntimeError):
     """音声出力を開けない"""
@@ -219,8 +225,12 @@ class AudioPlayer:
             # 書き込んだ分から、まだデバイスのバッファに残っている分を引く
             heard = self._written - buffered
             self._position = max(self._start_sample, self._start_sample + heard)
+            now = self._clock()
+            gap = UNDERRUN_BLOCKS * BLOCK_SAMPLES / self._mixer.sample_rate
+            if self._anchors and now - self._anchors[-1][0] > gap:
+                self._anchors.clear()
             if heard > 0:
-                self._anchors.append((self._clock(), self._position))
+                self._anchors.append((now, self._position))
             else:
                 self._anchors.clear()
 

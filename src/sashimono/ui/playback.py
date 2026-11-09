@@ -220,7 +220,9 @@ class PlaybackController(QObject):
                 # デバイスが抜かれた等 止まった所で止める 最後に読んだ位置も知らせる
                 # 知らせないと再生ヘッドが前の回の所に残り、そこから再生し直すことになる
                 frame = _sample_to_frame(position, self._project.rate, self._mixer.sample_rate)
-                if frame != self._frame:
+                # 先へ進んだときだけ知らせる 位相の補正で音より先のコマを出していると、
+                # 補正しない位置は 1 つ手前になり、再生ヘッドと再開する所が戻る
+                if frame > self._frame:
                     self._frame = frame
                     self.frame_changed.emit(frame)
                 self.stop()
