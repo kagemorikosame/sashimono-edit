@@ -51,16 +51,30 @@ class TestCounting:
     def test_intervals_and_stalls(self, tool: ModuleType) -> None:
         # 間隔と止まりを取り違えると、規則的な飛び（#463）と長い止まり（#455）を見分けられない
         captured = [k / 60 for k in range(600)]
-        # 2 コマに 1 回しか変わらず、途中で 0.2 秒止まる
-        shown = [k / 30 for k in range(100)] + [100 / 30 + 0.2 + k / 30 for k in range(100)]
+        # 2 コマに 1 回しか変わらず、途中で 0.2 秒止まる 最後は撮り終える 1 コマ前まで動く
+        shown = [k / 30 for k in range(100)] + [100 / 30 + 0.2 + k / 30 for k in range(194)]
         count = tool.summarize("試し", captured, shown)
         assert count.seconds == pytest.approx(10.0)
         assert count.captured == 600
-        assert count.shown == 200
-        assert count.shown_fps == pytest.approx(20.0)
+        assert count.shown == 294
+        assert count.shown_fps == pytest.approx(29.4)
         assert count.interval_median_ms == pytest.approx(1000 / 30)
         assert count.stalls == 1
         assert not count.low
+
+    def test_a_picture_frozen_until_the_end_is_a_stall(self, tool: ModuleType) -> None:
+        # 間隔は映ったコマの間にしかできない 後半ずっと止まったまま撮り終えた回を数えないと、
+        # 半分止まった ffplay を止まり 0 回の基準として通す（#467 Codex）
+        captured = [k / 60 for k in range(1200)]
+        count = tool.summarize("試し", captured, captured[:600])
+        assert count.stalls == 1
+        with pytest.raises(SystemExit, match="止まり"):
+            tool.check_reference(count)
+
+    def test_the_last_frame_alone_is_not_a_stall(self, tool: ModuleType) -> None:
+        # 最後のコマの 1 コマ分は撮っている間 これを止まりに数えると、毎回 1 回ずつ増える
+        captured = [k / 60 for k in range(1200)]
+        assert tool.summarize("試し", captured, captured).stalls == 0
 
     def test_a_capture_that_fell_behind_is_marked_low(self, tool: ModuleType) -> None:
         # 撮る側が落とした間は映ったコマも数えられない 数字だけ並べると、再生の落としと

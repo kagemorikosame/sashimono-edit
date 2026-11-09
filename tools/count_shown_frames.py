@@ -163,6 +163,13 @@ def summarize(
     else:
         median = p95 = 0.0
     stalls = sum(1 for gap in intervals if gap > STALL_SECONDS)
+    # 最後に映ったコマから撮り終えるまでも止まりに数える 間隔は映ったコマの間にしか
+    # できないので、途中で固まってそのまま撮り終えた回は長く止まっても 0 回になり、
+    # 後半が止まった ffplay を基準として通してしまう
+    if shown:
+        origin = captured[0] if captured else shown[0]
+        if origin + seconds - shown[-1] > STALL_SECONDS:
+            stalls += 1
     return Count(
         label, seconds, len(captured), len(shown), median, p95, stalls, fixed_rate, requested
     )
