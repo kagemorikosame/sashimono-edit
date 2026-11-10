@@ -309,6 +309,10 @@ class ExportDialog(QDialog):
         self._on_scene_changed()
 
     def _set_bitrate(self, value: int) -> None:
+        """窓の側でビットレートの欄を書き換える
+
+        本人が書き換えた印を付けないため 付くと、素材に合わせて求めた値で書き直さなくなる
+        """
         self._bitrate_writing = True
         try:
             self._bitrate.setValue(value)
@@ -316,6 +320,10 @@ class ExportDialog(QDialog):
             self._bitrate_writing = False
 
     def _on_bitrate_edited(self) -> None:
+        """本人がビットレートを変えたら、後から求めた値で書き換えない
+
+        書き換えると本人の選んだ値が消える
+        """
         if not self._bitrate_writing:
             self._bitrate_touched = True
 
@@ -337,6 +345,10 @@ class ExportDialog(QDialog):
             return
 
         def work() -> None:
+            """素材の大きさを読んでビットレートを求める
+
+            応えない共有で止まっても窓が固まらないように、窓とは別のスレッドで走らせる
+            """
             try:
                 value = choice.for_project(project)
             except (OSError, ValueError):
@@ -353,6 +365,11 @@ class ExportDialog(QDialog):
         threading.Thread(target=work, name="sashimono-export-bitrate", daemon=True).start()
 
     def _on_bitrate_found(self, token: object, value: int) -> None:
+        """求め終えた値を欄へ出す
+
+        前に選んでいたシーンの値と、本人が書き換えた後の値は捨てる 出すと、今の選択と合わない値で
+        書き出す
+        """
         if token is not self._bitrate_token or self._bitrate_touched:
             return
         self._set_bitrate(value)

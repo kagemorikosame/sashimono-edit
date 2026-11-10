@@ -131,6 +131,11 @@ def filler_spans(
 
 
 def _in_line(words: Sequence[Word], wanted: set[str], longest: int) -> Iterable[FillerSpan]:
+    """1 行の中の言いよどみの区間
+
+    字幕起こしは「え」「ー」「と」のように語を細かく分けるので、続く語を束ねて比べる 間が空いた
+    所では束ねない（間の声まで切る） 一番長く合った所を取るのは、短い方で止めると残りが残るため
+    """
     keys = [filler_key(word.text) for word in words]
     index = 0
     while index < len(words):

@@ -304,6 +304,10 @@ def _at_ceiling(measure: Mapping[str, object], peak_db: float | None) -> bool:
 def _variant(
     kind: str, measure: Mapping[str, object], peak_db: float | None, limiter: bool
 ) -> str | None:
+    """同じ種類と重さの問題でも直し方が違う場合の印 印が無ければ種類と重さだけで直し方を引く
+
+    分けないと、焼き込んだ字幕や天井に当たった音量まで、ふつうの物と同じ道具で直そうとする
+    """
     if kind in (WORD_CUT, SUBTITLE_WORDS):
         return _INSIDE_SCENE if measure.get("inside_scene") else None
     if kind == SUBTITLE_TIMING:

@@ -436,6 +436,10 @@ class MediaFacts:
 
 
 def media_facts(path: Path) -> MediaFacts:
+    """正解と比べるのに使う素材の長さ・fps・音の有無
+
+    音の有無も持つのは、音の無い素材を字幕起こしへ渡すと失敗し、見どころまで asr-error になるため
+    """
     from sashimono.engine.decode.probe import probe_media
 
     media = probe_media(path)
@@ -1017,6 +1021,10 @@ def range_scores(
     scores: dict[str, float | None] = dict(interval_scores(predicted, answer, duration))
 
     def overlaps(item: Sequence[float], others: Sequence[Sequence[float]]) -> bool:
+        """区間が他のどれかに重なるか
+
+        端が触れるだけでは重ならない 隣り合う区間を当たりにすると、外した場面まで当たりに数える
+        """
         return any(float(item[0]) < float(b) and float(a) < float(item[1]) for a, b in others)
 
     found = sum(1 for item in answer if overlaps(item, predicted))
@@ -1547,6 +1555,10 @@ def with_facts(truth: Mapping[str, Any], facts: MediaFacts) -> dict[str, Any]:
 def score(
     task: str, value: Mapping[str, Any], answer: Mapping[str, Any], book: TaskBook
 ) -> Mapping[str, float | None]:
+    """課題ごとに道具の答えと正解を比べる
+
+    書き出しの課題は正解を持たないので断る 黙って空の点を返すと、失敗した課題に見える
+    """
     tolerances = book.tolerances
     if task == EXPORT:
         raise ValueError("書き出しの課題は正解と比べない")
@@ -1997,6 +2009,7 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """評価の命令を読む ``--dir`` は命令の前にも後ろにも置ける（どちらで打っても同じに動く）"""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else "")
     folder_help = f"評価のフォルダ（省くと {EVAL_DIR_VARIABLE}）"
     parser.add_argument("--dir", help=folder_help)
@@ -2068,6 +2081,10 @@ def _all_results() -> list[dict[str, Any]]:
 
 
 def _dispatch(arguments: argparse.Namespace) -> int:
+    """命令ごとの処理へ渡す
+
+    ``report`` だけは評価のフォルダを決めない 記録から読むので、フォルダの無い機械でも打てる
+    """
     if arguments.command == "report":
         print("\n".join(report_lines(_all_results())))
         return 0

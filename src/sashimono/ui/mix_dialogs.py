@@ -125,6 +125,10 @@ class LoudnessDialog(QDialog):
     def __init__(
         self, target: float, parent: QWidget | None = None, *, limiter: bool = True
     ) -> None:
+        """``limiter`` は〔リミッターで山を抑える〕の初めの値 本人の設定を渡す
+
+        窓で決め打つと、設定で切った人にも OK を押すだけでリミッターが積まれる
+        """
         super().__init__(parent)
         self.setWindowTitle("音量を基準にそろえる")
         form = QFormLayout(self)

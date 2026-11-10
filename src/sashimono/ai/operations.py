@@ -3941,6 +3941,11 @@ def _check_result(
     arguments: dict[str, Any],
     ticket: CheckTicket | None,
 ) -> object:
+    """検査の結果を AI へ返す形にする
+
+    頼みと違う・失敗した・まだ無い結果は断る 待つ間に作品が変わった・途中までの結果には直し方を
+    付けない 古い作品の位置で直すと、消えた・動いたクリップを触る
+    """
     # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
     # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
@@ -6941,6 +6946,11 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """``normalize_loudness`` の道具 ``clip_ids`` を省くと、書き出しで鳴る音の全体を測る
+
+    選択を使わないのは、たまたま選んでいた 1 本だけが変わるのを防ぐため リミッターを使うかは
+    本人の設定が既定で、測る前に決める（測り終えてから断ると測り直しになる）
+    """
     project = _project(host)
     # 明示の null を省いたのと同じに読むと、選んだつもりの 1 本ではなく作品全体が変わる
     _no_explicit_null(arguments, "clip_ids")

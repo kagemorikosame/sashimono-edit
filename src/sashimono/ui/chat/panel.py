@@ -1475,6 +1475,11 @@ class ChatPanel(QWidget):
         QApplication.alert(window)
 
     def _check_approval(self) -> None:
+        """ブリッジに積まれた確かめを画面へ出す
+
+        出している確かめを、ブリッジ側が中断や時間切れで畳んだら画面からも下げる 下げないと、
+        押しても効かない許可のボタンが残る
+        """
         showing = self._approval
         if showing is not None:
             # 中断でブリッジ側が畳んだ確認は、画面からも下げる
@@ -1507,6 +1512,11 @@ class ChatPanel(QWidget):
                 QApplication.alert(window)
 
     def _answer(self, allowed: bool, *, always: bool = False, turn: bool = False) -> None:
+        """画面の確かめへの答えをブリッジへ渡す
+
+        先に許してから以降を許す印を付けるのは、時間切れで畳んだ確かめに印だけが付くのを防ぐため
+        付くと、次の指示の編集が確かめずに通る
+        """
         approval = self._approval
         if approval is None:
             return

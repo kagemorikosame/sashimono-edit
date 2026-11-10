@@ -1395,6 +1395,10 @@ def _install_runtime_locked(
     *,
     extra: bool = False,
 ) -> int:
+    """導入の本体 :func:`writing_runtime` で導入先を押さえている間だけ呼ぶ
+
+    2 つの導入が同じ所へ同時に書くと、どちらが入れた中身かも、付けた印が正しいかも決められない
+    """
     target = runtime_target_dir()
     companion = pack.extra_pack if pack is not None and extra else None
     if target is not None:

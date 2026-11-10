@@ -133,6 +133,11 @@ class _Worker(QObject):
         found: list[int] = []
 
         def work() -> None:
+            """素材に合わせたビットレートを求める 求めるのは別のスレッド
+
+            応えない共有を読むと止まるので、待つ側が中止を見られるようにする 枠は必ず返す
+            （返さないと、次からずっと上限で書き出す）
+            """
             try:
                 found.append(choice.for_project(self._project))
             except (OSError, ValueError):
@@ -150,6 +155,10 @@ class _Worker(QObject):
         return replace(settings, video_bitrate=found[0] * 1_000_000)
 
     def _export(self, scratch: Path) -> None:
+        """一時の場所へ書き出す 見積もりを中止したら書き出さずに中止を知らせる
+
+        一時の場所へ書くのは、途中で止めたときに本人のファイルを半端な物で上書きしないため
+        """
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
         settings = self._matched(self._settings)

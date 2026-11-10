@@ -329,6 +329,7 @@ class SetupSection(QWidget):
         self._code = -1
 
         def run() -> None:
+            """導入を別のスレッドで走らせる 窓のスレッドで pip を待つと、終わるまで画面が固まる"""
             # 同じく終わった印は finally で立てる 立たないと導入中のまま押せなくなる
             code = 1
             try:
@@ -403,6 +404,10 @@ class SetupSection(QWidget):
         self.finished.emit(succeeded)
 
     def _command(self) -> list[str]:
+        """pip に渡す導入の命令 一緒に入れる機能が前の Python 向けなら入れ直しを付ける
+
+        付けないと pip は入っている物を残し、読めない拡張が残ったまま入れたと読む
+        """
         companion = self._pack.extra_pack
         # 一緒に入れる機能（AI 連携の画面の解析）だけが前の Python 向けでも入れ直す 入れ直さないと、
         # 読めない拡張が残ったまま文字を読めない

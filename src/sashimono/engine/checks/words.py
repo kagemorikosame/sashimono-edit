@@ -538,6 +538,10 @@ def _timing_problem(
     clip_ids: tuple[str, ...],
     values: dict[str, float | int | str | bool],
 ) -> Problem:
+    """比べられた端のずれだけを書いた問題
+
+    比べられなかった端（寄せた所を切った）を 0 と書くと、合っていると読まれる
+    """
     # 正は声より遅い 負は声より早い（設定のずらしを足した後の所から 映る時刻の秒）
     # 比べられなかった端（寄せた所を切った）は書かない 0 と書くと、合っていると読む
     offsets: dict[str, float | int | str | bool] = {}

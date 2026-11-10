@@ -1058,6 +1058,10 @@ class PreferenceStore:
 
     @staticmethod
     def _parse(data: dict[str, Any] | None) -> Preferences:
+        """保存した設定を読む 欄ごとに形を確かめ、外れた値は既定に戻す
+
+        手で書き換えたファイルや前の版のファイルで、起動できなくなるのを防ぐ
+        """
         if data is None:
             return Preferences()
         plain = Preferences()

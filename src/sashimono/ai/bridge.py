@@ -755,6 +755,10 @@ class EditorBridge:
         )
 
     def _approved(self, operation: Operation, arguments: dict[str, Any]) -> bool:
+        """確かめずに通すのは、自動の承認・この指示の間は許す・以降も許す、のどれかのときだけ
+
+        それ以外は画面の確かめを待つ 待つ間は AI のスレッドが止まるので、画面のスレッドでは呼ばない
+        """
         if self.auto_approve or self._turn_allowed or operation.name in self._always:
             return True
 
