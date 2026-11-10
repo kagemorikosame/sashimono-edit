@@ -40,6 +40,7 @@ from sashimono.ai.auto_fix import (
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
+    raise_cap,
 )
 from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
@@ -7046,7 +7047,7 @@ def _apply_loudness(
         target=request.limits.loudness_target,
         ceiling=ceiling,
         squeeze=squeeze,
-        raise_ceiling=cap if cap < ceiling else None,
+        raise_ceiling=raise_cap(targets, ceiling),
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)

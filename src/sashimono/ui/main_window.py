@@ -49,11 +49,11 @@ from sashimono.ai.auto_fix import (
     can_auto_color,
     clips_overlap,
     has_limiter,
-    limited_ceiling,
     limited_peak,
     limiter_commands,
     plan_color_fix,
     plan_noise_fix,
+    raise_cap,
 )
 from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
 from sashimono.ai.operations import (
@@ -4358,7 +4358,7 @@ class MainWindow(QMainWindow):
             target=pending.request.limits.loudness_target,
             ceiling=pending.ceiling,
             squeeze=pending.squeeze,
-            raise_ceiling=limited_ceiling(pending.targets, pending.ceiling),
+            raise_ceiling=raise_cap(pending.targets, pending.ceiling),
         )
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む

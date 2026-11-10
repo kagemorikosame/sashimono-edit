@@ -72,6 +72,7 @@ __all__ = [
     "picture_clip",
     "plan_color_fix",
     "plan_noise_fix",
+    "raise_cap",
     "track_gain_db",
 ]
 
@@ -160,6 +161,17 @@ def limited_ceiling(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> fl
             if effect.kind == LIMITER_KIND and effect.enabled:
                 lowest = min(lowest, _lowest_ceiling(effect) + track_gain_db(track))
     return lowest
+
+
+def raise_cap(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float | None:
+    """:func:`~sashimono.core.mixing.loudness_gain` の ``raise_ceiling`` に渡す値
+
+    前に積んだリミッターが ``ceiling`` より下で止めるときだけ、その所を返す それ以外は None
+    ``ceiling`` を渡すと、新しく積むリミッターで山を抑えて（squeeze）上げる分まで止め、
+    設定でリミッターを入れても基準に届かない 画面と AI の両方がここを通る（PR #451 の CodeRabbit）
+    """
+    cap = limited_ceiling(targets, ceiling)
+    return cap if cap < ceiling else None
 
 
 def limiter_ceiling(track: Track, ceiling: float) -> float:

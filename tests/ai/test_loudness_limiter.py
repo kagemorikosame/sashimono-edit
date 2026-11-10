@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from sashimono.ai.auto_fix import limited_ceiling
+from sashimono.ai.auto_fix import limited_ceiling, raise_cap
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
@@ -410,6 +410,18 @@ class TestTheCeilingInUse:
         clip = replace(work.voice, effects=(effect,))
         track = Track(kind=TrackKind.VIDEO, name="V", volume_db=-6.0)
         assert limited_ceiling([(track, clip)], 0.0) == pytest.approx(-10.0)
+
+    def test_no_old_limiter_leaves_the_squeeze_free(self, work: _Work) -> None:
+        """壊れると、画面の〔音量を基準にそろえる…〕だけ山を天井で止め、リミッターを入れても届かない"""
+        track = Track(kind=TrackKind.AUDIO, name="声")
+        assert raise_cap([(track, work.voice)], -1.0) is None
+
+    def test_a_low_old_limiter_still_caps_the_raise(self, work: _Work) -> None:
+        # 壊れると、前のリミッターが潰す所より上へ上げて、届いたと答える
+        effect = registry.require(LIMITER_KIND).create(ceiling=-10.0)
+        clip = replace(work.voice, effects=(*work.voice.effects, effect))
+        track = Track(kind=TrackKind.AUDIO, name="声")
+        assert raise_cap([(track, clip)], -1.0) == pytest.approx(-10.0)
 
 
 class TestCheckOutput:
