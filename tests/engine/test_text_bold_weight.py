@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6.QtGui import QFont, QFontDatabase, QRawFont
+from PySide6.QtCore import QPointF
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPainterPath, QRawFont
 from PySide6.QtWidgets import QApplication
 
 from sashimono.effects.sources import TEXT
@@ -113,6 +114,47 @@ def test_glyphs_from_a_fallback_family_are_bold_too() -> None:
     assert (
         _ink("Bahnschrift Light", JAPANESE, bold=True) > _ink("Bahnschrift Light", JAPANESE) * 1.1
     )
+
+
+@pytest.mark.parametrize(
+    "family", ["Bahnschrift Light", "Bahnschrift SemiBold", "Segoe UI Variable Display Light"]
+)
+@pytest.mark.parametrize("body", ["永田あア", "한국어", "ภาษาไทย"])
+def test_fallback_glyphs_match_the_qt_bold_face(family: str, body: str) -> None:
+    """壊れると、書体に無い字だけが、前の版の太字（Qt の太字の印）と違う太さの代わりの書体で出る
+
+    代わりの書体（游ゴシック・Malgun Gothic・Leelawadee など）は可変フォントでないことが多く、
+    太さの軸では太らない Qt が代わりの書体の面を、軸の太さから前と同じ太字の面へ選ぶことを、
+    前の版と同じ ``setBold`` の字と比べて押さえる（字の量が同じなら同じ面）
+    書体に含まれる字は比べない（そこは前の版が崩れていた所）
+    """
+    _needs(family)
+    plain = sources._text_font({"font": family}, 96)
+    if sources._weight_axis_maximum(QRawFont.fromFont(plain)) is None:
+        pytest.skip(f"{family} は可変フォントでない")
+    if QRawFont.fromFont(plain).supportsCharacter(body[0]):
+        pytest.skip(f"{family} は {body} を持っている（代わりの書体を使わない）")
+    reference = QFont(plain)
+    reference.setBold(True)
+    expected = _path_ink(reference, body)
+    if expected == 0.0:
+        pytest.skip(f"{body} を描ける代わりの書体が入っていない")
+    drawn = _path_ink(sources._text_font({"font": family, "bold": True}, 96), body)
+    assert drawn == pytest.approx(expected, rel=0.02)
+
+
+def _path_ink(font: QFont, body: str) -> float:
+    """``font`` で ``body`` を描いた字の量（画素） 代わりの書体も Qt が選ぶまま描く"""
+    path = QPainterPath()
+    path.addText(QPointF(0.0, 120.0), font, body)
+    image = QImage(WIDTH, HEIGHT, QImage.Format.Format_Grayscale8)
+    image.fill(0)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.fillPath(path, QColor(255, 255, 255))
+    painter.end()
+    pixels = np.frombuffer(image.constBits(), dtype=np.uint8, count=image.sizeInBytes())
+    return float(pixels.astype(np.float64).sum() / 255.0)
 
 
 def test_a_series_at_the_axis_maximum_draws_as_before() -> None:
