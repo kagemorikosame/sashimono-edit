@@ -77,6 +77,7 @@ from sashimono.engine.cache.proxy import (
     MEASURED_KEYFRAME_SEEK_MS,
     MEASURED_ONE_LAYER_MS,
     MEASURED_PREFETCH_MS,
+    MEASURED_PROXY_SPEED,
     MEASURED_THREE_LAYERS_MS,
 )
 from sashimono.engine.checks import LOUDNESS_TARGETS
@@ -92,6 +93,15 @@ from sashimono.engine.encoders import (
     PRIORITY_CPU,
     PRIORITY_INTEL,
 )
+from sashimono.engine.render.backdrop import (
+    FILL_BLACK,
+    FILL_CHECKER,
+    FILL_DARK,
+    FILL_LIGHT,
+    MARGIN_BLACK,
+    MARGIN_GRAY,
+    MARGIN_THEME,
+)
 from sashimono.engine.render.background import MEASURED_PREFETCH_STALL_MS
 from sashimono.engine.render.look_preview import MEASURED_LOOK_MS
 from sashimono.engine.render.prefetch import BYTES_PER_FRAME_PIXEL
@@ -104,6 +114,7 @@ from sashimono.engine.vision.parts import (
     OCR_WINDOWS,
 )
 from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
+from sashimono.stall_watch import DEFAULT_THRESHOLD_MS, default_log_path
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
@@ -126,8 +137,11 @@ from sashimono.ui.workspace import (
     DOCK_TABS_TOP,
     INSERT_ALL_TRACKS,
     INSERT_TARGET_TRACKS,
+    MEASURED_SWITCH,
     MEDIA_SPLIT,
     MEDIA_TOGETHER,
+    PROXY_UNUSED_LATER,
+    PROXY_UNUSED_ON_USE,
     SCENES_ALWAYS,
     SCENES_ON_DEMAND,
     SCENES_WITH_AI,
@@ -147,6 +161,8 @@ __all__ = [
     "ENCODER_PRIORITY_CHOICES",
     "PIPELINE_DEPTHS",
     "PREFETCH_BUDGETS",
+    "PREVIEW_FILL_CHOICES",
+    "PREVIEW_MARGIN_CHOICES",
     "PROXY_HEIGHTS",
     "QUALITY_DIVISORS",
     "SCENE_ANALYSIS_CHOICES",
@@ -183,6 +199,12 @@ AUTO_QUALITY_TEXT = (
 #: 「録画」と書くのは、どんな素材が当たるのかを知らない人にも見当が付くように
 PROXY_LONG_GOP_TEXT = (
     f"キーフレームが {float(KEYFRAME_GAP_LIMIT):g} 秒より長く空く素材（録画など）にも控えを作る"
+)
+
+#: 使っていない素材の控えの扱い（#441） 値と画面の文言
+PROXY_UNUSED_CHOICES: tuple[tuple[str, str], ...] = (
+    (PROXY_UNUSED_LATER, "使っている素材の後で作る（既定）"),
+    (PROXY_UNUSED_ON_USE, "タイムラインに置いたときに作る"),
 )
 
 #: 自動で落とすときの分母
@@ -228,6 +250,22 @@ SCENE_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
 SCREEN_ANALYSIS_CHOICES: tuple[tuple[str, str], ...] = (
     (SCREEN_ON_DEMAND, "AI が頼んだときだけ（既定）"),
     (SCREEN_ON_IMPORT, "読み込んだときに調べる（部品が入っていれば）"),
+)
+
+#: プレビューで何も描いていない所の地（:attr:`Preferences.preview_fill` #456）
+#: 色は見本の絵の地（「見本の地」）と同じ 黒は書き出しと同じ見え方なので既定にする
+PREVIEW_FILL_CHOICES: tuple[tuple[str, str], ...] = (
+    (FILL_BLACK, "黒（既定 書き出しと同じ）"),
+    (FILL_CHECKER, "市松模様"),
+    (FILL_DARK, "暗い地"),
+    (FILL_LIGHT, "明るい地"),
+)
+
+#: プレビューの画面の外の余白（:attr:`Preferences.preview_margin` #456）
+PREVIEW_MARGIN_CHOICES: tuple[tuple[str, str], ...] = (
+    (MARGIN_GRAY, "暗い灰色（既定）"),
+    (MARGIN_BLACK, "黒"),
+    (MARGIN_THEME, "テーマに合わせる"),
 )
 
 #: 画面の中の文字を読む方式（:attr:`Preferences.ocr_engine` 2026-10-21 本人の決定）
@@ -346,6 +384,32 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._proxy_long_gop)
 
+        thread_speed, process_speed = MEASURED_PROXY_SPEED
+        self._proxy_process = QCheckBox("控えを別のプロセスで作る（速く、操作を止めない）", self)
+        self._proxy_process.setChecked(preferences.proxy_process)
+        self._proxy_process.setToolTip(
+            "控えをアプリの中のスレッドで作ると、画面や先読みと取り合って遅くなり、"
+            "作っている間は操作も重くなる\n"
+            "画面を操作しながら、裏で先読みや解析が動いている所で作った実測: "
+            f"スレッド {thread_speed:g} 倍速 ／ "
+            f"別のプロセス {process_speed:g} 倍速\n"
+            "子のプロセスを起こせない機械では、入れたままでもスレッドで作る"
+        )
+        form.addRow(self._proxy_process)
+
+        self._proxy_unused = QComboBox(self)
+        for value, text in PROXY_UNUSED_CHOICES:
+            self._proxy_unused.addItem(text, value)
+        self._proxy_unused.setCurrentIndex(
+            max(0, self._proxy_unused.findData(preferences.proxy_unused))
+        )
+        self._proxy_unused.setToolTip(
+            "控えは、タイムラインで使っている素材（再生位置に近い所を使う物から）を先に作る\n"
+            "使っていない素材の控えを、その後で作るか、タイムラインに置いたときに作るか\n"
+            "置いたときに作ると CPU・GPU と置き場を使わずに済むが、置いた直後は控えが無い"
+        )
+        form.addRow("使っていない素材の控え", self._proxy_unused)
+
         self._auto_quality = QCheckBox(AUTO_QUALITY_TEXT, self)
         self._auto_quality.setChecked(preferences.auto_quality)
         self._auto_quality.setToolTip(
@@ -388,6 +452,27 @@ class PreferencesDialog(QDialog):
             "共有した GL を作れない機械では、入れたままでも画面のスレッドで先読みする"
         )
         form.addRow(self._prefetch_thread)
+
+        self._prefetch_yield = QCheckBox("操作している間は先読みを止める", self)
+        self._prefetch_yield.setChecked(preferences.prefetch_yield)
+        self._prefetch_yield.setToolTip(
+            "タイムラインとプレビューを触っている間は先読みを貯めず、手が止まってから貯める\n"
+            "先読みは別のスレッドでも Python を動かすので、操作の最中に貯めると"
+            "クリックの応答が遅れることがある\n"
+            "切ると操作中も貯め続ける（操作の直後の再生で先読みが効くのが少し早い）"
+        )
+        form.addRow(self._prefetch_yield)
+
+        (slow_click, slow_proxy), (quick_click, quick_proxy) = MEASURED_SWITCH
+        self._responsive_switch = QCheckBox("裏の処理より画面の応答を優先する", self)
+        self._responsive_switch.setChecked(preferences.responsive_switch)
+        self._responsive_switch.setToolTip(
+            "アプリの中の裏の処理（先読み・解析）と画面が取り合うとき、画面へ早く順番を回す\n"
+            f"裏で Python が回り続けている間に 1 本選ぶ実測: {slow_click:g}ms → {quick_click:g}ms\n"
+            f"そのぶん裏の処理は遅くなる（同じ所でスレッドで作る控え: {slow_proxy:g} 倍速 → "
+            f"{quick_proxy:g} 倍速） 別のプロセスで作る控えには影響しない"
+        )
+        form.addRow(self._responsive_switch)
 
         self._pipeline_depth = QComboBox(self)
         for label, depth in PIPELINE_DEPTHS:
@@ -491,6 +576,17 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._hdr_notice)
 
+        self._stall_watch = QCheckBox("画面の止まりを記録する（カクつきの報告用）", self)
+        self._stall_watch.setChecked(preferences.stall_watch)
+        self._stall_watch.setToolTip(
+            f"操作を {DEFAULT_THRESHOLD_MS:g}ms より長く受け付けなかった所を、その瞬間の"
+            "処理の並びとごみ集めの時間と一緒に書き残す\n"
+            f"置き場: {default_log_path()}\n"
+            "カクつきを報告するときに入れて、起きた後にこのファイルを添えてもらう 普段は切る"
+            "（見張りの分だけ少し重くなり、記録も溜まる）"
+        )
+        form.addRow(self._stall_watch)
+
         # 一覧の上のボタンでも切り替えられる ここにも置くのは、設定を開いて OK を
         # 押したときに、ボタンで選んだ表示を黙って既定へ戻さないため
         self._media_view = QComboBox(self)
@@ -565,6 +661,30 @@ class PreferencesDialog(QDialog):
             "プレビューの絵そのもの（書き出す色）はテーマで変わらない"
         )
         form.addRow("画面の色（テーマ）", self._theme)
+        self._preview_fill = QComboBox(self)
+        for value, text in PREVIEW_FILL_CHOICES:
+            self._preview_fill.addItem(text, value)
+        self._preview_fill.setCurrentIndex(
+            max(0, self._preview_fill.findData(preferences.preview_fill))
+        )
+        self._preview_fill.setToolTip(
+            "プレビューの画面の中で、どのクリップも描いていない所に敷く地 "
+            "黒い映像と見分けたいときに市松などへ変える "
+            "書き出しとスナップショットはどれを選んでも黒 "
+            "黒以外のときはプレビューの左下に「書き出しでは黒」の印が出る 地は見本の絵の地と同じ色"
+        )
+        form.addRow("プレビューの何も無い所", self._preview_fill)
+        self._preview_margin = QComboBox(self)
+        for value, text in PREVIEW_MARGIN_CHOICES:
+            self._preview_margin.addItem(text, value)
+        self._preview_margin.setCurrentIndex(
+            max(0, self._preview_margin.findData(preferences.preview_margin))
+        )
+        self._preview_margin.setToolTip(
+            "プレビューの枠と作品の縦横比が違うときにできる、画面の外の帯の色 "
+            "書き出しには入らない 「テーマに合わせる」はプレビューの周りと同じ色"
+        )
+        form.addRow("プレビューの画面の外", self._preview_margin)
         self._preview_handles = QCheckBox("プレビューで外枠を出して直接動かす", self)
         self._preview_handles.setChecked(preferences.preview_handles)
         self._preview_handles.setToolTip(
@@ -1248,6 +1368,12 @@ class PreferencesDialog(QDialog):
         self._prefetch_budget.setEnabled(preferences.prefetch)
         self._prefetch.toggled.connect(self._prefetch_thread.setEnabled)
         self._prefetch_thread.setEnabled(preferences.prefetch)
+        self._prefetch.toggled.connect(self._prefetch_yield.setEnabled)
+        self._prefetch_yield.setEnabled(preferences.prefetch)
+        self._use_proxy.toggled.connect(self._proxy_process.setEnabled)
+        self._proxy_process.setEnabled(preferences.use_proxy)
+        self._use_proxy.toggled.connect(self._proxy_unused.setEnabled)
+        self._proxy_unused.setEnabled(preferences.use_proxy)
         self._auto_quality.toggled.connect(self._auto_divisor.setEnabled)
         self._proxy_height.setEnabled(preferences.use_proxy)
         self._auto_divisor.setEnabled(preferences.auto_quality)
@@ -1291,11 +1417,15 @@ class PreferencesDialog(QDialog):
             use_proxy=self._use_proxy.isChecked(),
             proxy_height=int(self._proxy_height.currentData()),
             proxy_long_gop=self._proxy_long_gop.isChecked(),
+            proxy_process=self._proxy_process.isChecked(),
+            proxy_unused=str(self._proxy_unused.currentData()),
             auto_quality=self._auto_quality.isChecked(),
             auto_quality_divisor=int(self._auto_divisor.currentData()),
             prefetch=self._prefetch.isChecked(),
             prefetch_budget_mb=int(self._prefetch_budget.currentData()),
             prefetch_thread=self._prefetch_thread.isChecked(),
+            prefetch_yield=self._prefetch_yield.isChecked(),
+            responsive_switch=self._responsive_switch.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_gpu_color=self._export_gpu_color.isChecked(),
             export_chapters=self._export_chapters.isChecked(),
@@ -1305,6 +1435,7 @@ class PreferencesDialog(QDialog):
             native_modules=self._native_modules.isChecked(),
             pool_progress=self._pool_progress.isChecked(),
             hdr_notice=self._hdr_notice.isChecked(),
+            stall_watch=self._stall_watch.isChecked(),
             all_aviutl_plugins=self._all_plugins.isChecked(),
             media_view=str(self._media_view.currentData()),
             ai_model=str(self._ai_model.currentData()),
@@ -1317,6 +1448,8 @@ class PreferencesDialog(QDialog):
             match_video=str(self._match_video.currentData()),
             dock_tabs=str(self._dock_tabs.currentData()),
             preview_handles=self._preview_handles.isChecked(),
+            preview_fill=str(self._preview_fill.currentData()),
+            preview_margin=str(self._preview_margin.currentData()),
             keyframe_drag=str(self._keyframe_drag.currentData()),
             value_lines=self._value_lines.isChecked(),
             detail_min_width=self._detail_min_width.value(),

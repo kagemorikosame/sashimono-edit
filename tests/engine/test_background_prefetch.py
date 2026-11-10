@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -207,11 +208,11 @@ class TestWhatItHandsOver:
         resume = threading.Event()
         original = FrameRenderer.compose
 
-        def held(renderer: FrameRenderer, frame: int) -> None:
+        def held(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             if threading.current_thread() is not threading.main_thread() and not resume.is_set():
                 started.set()
                 resume.wait(10)
-            original(renderer, frame)
+            original(renderer, frame, **options)
 
         # 描き終えて載せるかどうか決めた直後で走り係を止める 止めないと、次に受け取る
         # 編集の頼みがすぐに古い絵を外すので、古い絵が出ている間を見逃す
@@ -261,11 +262,11 @@ class TestWaitingForTheWorker:
         started = threading.Event()
         original = FrameRenderer.compose
 
-        def quick(renderer: FrameRenderer, frame: int) -> None:
+        def quick(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             if threading.current_thread() is not threading.main_thread():
                 started.set()
                 time.sleep(0.05)
-            original(renderer, frame)
+            original(renderer, frame, **options)
 
         monkeypatch.setattr(FrameRenderer, "compose", quick)
         background = _start(_gray_project(), screen_context, 1)
@@ -291,11 +292,11 @@ class TestWaitingForTheWorker:
         resume = threading.Event()
         original = FrameRenderer.compose
 
-        def stuck(renderer: FrameRenderer, frame: int) -> None:
+        def stuck(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             if threading.current_thread() is not threading.main_thread() and not resume.is_set():
                 started.set()
                 resume.wait(10)
-            original(renderer, frame)
+            original(renderer, frame, **options)
 
         monkeypatch.setattr(FrameRenderer, "compose", stuck)
         background = _start(_gray_project(), screen_context, 1)
@@ -517,7 +518,7 @@ class TestLifecycle:
         original_compose = FrameRenderer.compose
         original_close = FrameRenderer.close
 
-        def slow(renderer: FrameRenderer, frame: int) -> None:
+        def slow(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             started.set()
             time.sleep(0.2)
             original_compose(renderer, frame)
@@ -573,7 +574,7 @@ class TestWhenItRuns:
         """
         dropped = MediaId("broken-proxy")
 
-        def failing(renderer: FrameRenderer, frame: int) -> None:
+        def failing(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             if threading.current_thread() is threading.main_thread():
                 return
             renderer._discarded.add(dropped)
@@ -600,10 +601,10 @@ class TestWhenItRuns:
         original = FrameRenderer.compose
         failures = [RuntimeError("デコーダが開けない")]
 
-        def once(renderer: FrameRenderer, frame: int) -> None:
+        def once(renderer: FrameRenderer, frame: int, **options: Any) -> None:
             if failures and threading.current_thread() is not threading.main_thread():
                 raise failures.pop()
-            original(renderer, frame)
+            original(renderer, frame, **options)
 
         monkeypatch.setattr(FrameRenderer, "compose", once)
         background = _start(_gray_project(), screen_context, 2)

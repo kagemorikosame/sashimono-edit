@@ -560,3 +560,80 @@ def test_a_single_line_field_forgets_its_history(qt_application: QApplication) -
     editor.forget_typing()
     assert not line.isUndoAvailable()
     assert line.text() == "足した"
+
+
+class TestParkedPanels:
+    """選びを外したり、構成の違うクリップを行き来したりしても組み直さない（#442 A）"""
+
+    def test_choosing_after_nothing_reuses_the_panel(self, panel: InspectorPanel) -> None:
+        """壊れると、空いた所を押して選び直すたびに、外すときと選ぶときで 2 回組み直す"""
+        project = _texts((), ())
+        first, second = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        body = _body(panel)
+        panel.set_selection(())
+        assert _body(panel) is not body
+        assert not body.isVisible()
+        panel.set_clip(second.id)
+        assert _body(panel) is body
+        assert _opacity(panel) == pytest.approx(0.9)
+
+    def test_going_back_and_forth_between_layouts_reuses_both(self, panel: InspectorPanel) -> None:
+        """壊れると、文字と映像のように構成の違うクリップを行き来するたびに組み直す"""
+        project = _texts(("blur",), (), ("blur",))
+        first, second, third = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        blurred = _body(panel)
+        panel.set_clip(second.id)
+        plain = _body(panel)
+        panel.set_clip(third.id)
+        assert _body(panel) is blurred
+        panel.set_clip(second.id)
+        assert _body(panel) is plain
+
+    def test_a_reused_panel_edits_only_the_new_clip(self, panel: InspectorPanel) -> None:
+        """壊れると、取っておいた欄を出し直したとき、触った値が前に出していたクリップへ当たる"""
+        project = _texts(("blur",), (), ("blur",))
+        first, _second, third = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        panel.set_selection(())
+        panel.set_clip(third.id)
+        sent = _Sent(panel)
+        _number(panel, "clip", "opacity").value_changed.emit(AnimatedValue(0.5))
+        _number(panel, str(first.effects[0].id), "radius").value_changed.emit(AnimatedValue(3.0))
+        assert sent.commands == [
+            SetParam(ParamPath.of_clip(third.id, "opacity"), AnimatedValue(0.5)),
+            SetParam(
+                ParamPath.of_effect(third.id, third.effects[0].id, "radius"),
+                AnimatedValue(3.0),
+            ),
+        ]
+
+    def test_only_a_few_panels_are_kept(self, panel: InspectorPanel) -> None:
+        """壊れると、構成の数だけ隠れた欄が溜まり、メモリと後片付けが増え続ける"""
+        from sashimono.ui.inspector.panel import PARKED_PANELS
+
+        kinds = [("blur",), ("mosaic",), ("blur", "blur"), ("mosaic", "mosaic"), ()]
+        project = _texts(*kinds)
+        panel.set_project(project)
+        clips = _clips(project)
+        panel.set_clip(clips[0].id)
+        evicted = panel._content
+        for clip in clips[1:]:
+            panel.set_clip(clip.id)
+        assert len(panel._parked) == PARKED_PANELS
+        _flush()
+        assert not shiboken6.isValid(evicted), "追い出した欄が壊されずに残っている"
+
+    def test_nothing_chosen_shows_an_empty_panel(self, panel: InspectorPanel) -> None:
+        """壊れると、選びを外しても前のクリップの欄と見出しが出たまま残る"""
+        project = _texts(())
+        (first,) = _clips(project)
+        panel.set_project(project)
+        panel.set_clip(first.id)
+        panel.set_selection(())
+        assert panel._editors == {}
+        assert not panel._add_button.isEnabled()

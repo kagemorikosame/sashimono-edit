@@ -20,6 +20,7 @@ from OpenGL import GL
 from OpenGL.error import GLError
 
 from sashimono.engine.gpu import Framebuffer, ShaderError
+from sashimono.engine.render.backdrop import BLACK, Backdrop
 from sashimono.engine.render.invalidate import Invalidation
 from sashimono.engine.render.renderer import FrameRenderer
 
@@ -270,10 +271,13 @@ class PreviewCache:
         *,
         budget_bytes: int,
         forget: Callable[[int], None] | None = None,
+        backdrop: Backdrop = BLACK,
     ) -> None:
         self._renderer = renderer
         width, height = renderer.size
         self._cache = FrameCache(width, height, budget_bytes=budget_bytes, forget=forget)
+        #: 何も描いていない所に敷く地（#456） 取ってある絵はこの地で描いた物
+        self._backdrop = backdrop
 
     @property
     def cache(self) -> FrameCache:
@@ -296,6 +300,21 @@ class PreviewCache:
     def invalidate(self, invalidation: Invalidation) -> int:
         return self._cache.invalidate(invalidation)
 
+    @property
+    def backdrop(self) -> Backdrop:
+        return self._backdrop
+
+    def set_backdrop(self, backdrop: Backdrop) -> None:
+        """敷く地を変える 違う地なら取ってある絵を全部捨てる
+
+        取ってある絵には前の地が焼き込まれている 捨てないと、設定を変えた後も
+        貯めた所だけ前の地のまま出て、再生と停止で見え方が変わる
+        """
+        if backdrop == self._backdrop:
+            return
+        self._backdrop = backdrop
+        self._cache.invalidate(Invalidation.all())
+
     def clear(self) -> None:
         self._cache.clear()
 
@@ -316,7 +335,7 @@ class PreviewCache:
             surface = self._cache.store(frame, lambda target: self._compose_into(frame, target))
         if surface is None:
             # 置く場所が無い 取っておかずにそのまま画面へ出す
-            self._renderer.compose(frame)
+            self._renderer.compose(frame, backdrop=self._backdrop)
             self._renderer.compositor.present(framebuffer, viewport)
             return False
         self._renderer.compositor.show(surface.color, framebuffer, viewport)
@@ -357,7 +376,7 @@ class PreviewCache:
         return None
 
     def _compose_into(self, frame: int, surface: CacheSurface) -> None:
-        self._renderer.compose(frame)
+        self._renderer.compose(frame, backdrop=self._backdrop)
         # 余白を付けずに、取っておく絵いっぱいへ書く 付けてしまうと、
         # 出すときにもう 1 度余白が付いて内側へ縮む
         self._renderer.compositor.present(
