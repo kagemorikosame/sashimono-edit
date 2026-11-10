@@ -13,8 +13,17 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPainterPath, QRawFont
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QRawFont,
+    QTextLayout,
+)
 from PySide6.QtWidgets import QApplication
 
 from sashimono.effects.sources import TEXT
@@ -136,16 +145,33 @@ def test_fallback_glyphs_match_the_qt_bold_face(family: str, body: str) -> None:
         pytest.skip(f"{family} は {body} を持っている（代わりの書体を使わない）")
     reference = QFont(plain)
     reference.setBold(True)
-    expected = _path_ink(reference, body)
-    if expected == 0.0:
+    if not _has_every_glyph(reference, body):
         pytest.skip(f"{body} を描ける代わりの書体が入っていない")
+    expected = _path_ink(reference, body)
     drawn = _path_ink(sources._text_font({"font": family, "bold": True}, 96), body)
     assert drawn == pytest.approx(expected, rel=0.02)
+
+
+def _has_every_glyph(font: QFont, body: str) -> bool:
+    """Qt が ``body`` のすべての字に、どれかの書体の字形を見つけたか
+
+    代わりの書体が無くても Qt は欠字の四角（字形番号 0）を描くので、字の量が 0 か
+    どうかでは見分けられない 欠字の四角どうしを比べても代わりの書体の太さは確かめられない
+    """
+    layout = QTextLayout(body, font)
+    layout.beginLayout()
+    layout.createLine()
+    layout.endLayout()
+    runs = layout.glyphRuns()
+    return bool(runs) and all(0 not in run.glyphIndexes() for run in runs)
 
 
 def _path_ink(font: QFont, body: str) -> float:
     """``font`` で ``body`` を描いた字の量（画素） 代わりの書体も Qt が選ぶまま描く"""
     path = QPainterPath()
+    # 字を描く側の文字のパスと同じ塗り規則にする 既定の OddEvenFill のままだと、
+    # 輪郭が重なる字形で重なりが抜け、表示と違う量を比べてしまう
+    path.setFillRule(Qt.FillRule.WindingFill)
     path.addText(QPointF(0.0, 120.0), font, body)
     image = QImage(WIDTH, HEIGHT, QImage.Format.Format_Grayscale8)
     image.fill(0)
