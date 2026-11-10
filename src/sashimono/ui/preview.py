@@ -89,6 +89,7 @@ from sashimono.ui.theme import Colors, theme_signals
 __all__ = [
     "BACKDROP_NOTE",
     "GRIP_SIZE",
+    "HOLD_AFTER_INPUT_MS",
     "KNOB_LENGTH",
     "ROTATE_REACH",
     "SLOW_FRAME_MS",
@@ -172,6 +173,10 @@ IMAGE_WATCH_MS = 1000
 
 #: 何も描いていない所の地を黒以外にしたとき、プレビューの隅に出す印（#456）
 BACKDROP_NOTE = "何も無い所は書き出しでは黒"
+#: 操作が止まってから先読みへ戻るまでの長さ（ミリ秒 #442 C） クリックを続けて押す間や、
+#: ドラッグの途中で手が少し止まる間に貯め始めないように、人の操作の間より少し長くする
+#: 長すぎると、手を離してから先読みが効き始めるまでが遅れる
+HOLD_AFTER_INPUT_MS = 300
 
 
 class PreviewWidget(QOpenGLWidget):
@@ -221,6 +226,15 @@ class PreviewWidget(QOpenGLWidget):
         #: 再生中は先読みを止める 出す側と同じ GPU を奪い合って、
         #: いま出すべきコマが遅れる
         self._playing = False
+        #: 操作している間は先読みを止めるか（設定 #442 C）
+        self._yield_to_input = True
+        #: 操作が続いている間 立っている間は先読みを止めておく
+        self._holding = False
+        #: 最後の操作から :data:`HOLD_AFTER_INPUT_MS` 何も来なければ先読みへ戻す
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.setInterval(HOLD_AFTER_INPUT_MS)
+        self._hold_timer.timeout.connect(self._release_hold)
         self._image_watch = QTimer(self)
         self._image_watch.setInterval(IMAGE_WATCH_MS)
         self._image_watch.timeout.connect(self.check_images)
@@ -1341,16 +1355,53 @@ class PreviewWidget(QOpenGLWidget):
         if self._cache is not None:
             self._cache.invalidate(invalidation)
 
+    def set_prefetch_yield(self, enabled: bool) -> None:
+        """操作している間は先読みを止めるか（設定 #442 C） 切ったらすぐ止めるのをやめる"""
+        self._yield_to_input = enabled
+        if not enabled and self._holding:
+            self._hold_timer.stop()
+            self._release_hold()
+
+    def hold_prefetch(self) -> None:
+        """操作が来た 手が止まるまで先読みを止める
+
+        先読みの走り係は別のスレッドでも Python を動かすので、Python の切り替え（既定 5ms）の
+        たびに画面のスレッドが待たされる 選ぶ・動かす最中は貯めず、手が止まってから貯める
+        描いている最中の 1 コマは描き終えるまで止まらない（合成は途中で抜けられない）
+        """
+        if not self._yield_to_input:
+            return
+        self._hold_timer.start()
+        if self._holding:
+            return
+        self._holding = True
+        self._idle.stop()
+        if self._background is not None:
+            self._background.set_paused(True)
+
+    @property
+    def holding_prefetch(self) -> bool:
+        """操作のために先読みを止めている最中か"""
+        return self._holding
+
+    def _release_hold(self) -> None:
+        self._holding = False
+        self._restart_prefetch()
+
     def _restart_prefetch(self) -> None:
         """先読みを動かし直す 何か変わるたびに呼ぶ
 
         止まったままにしない 再生ヘッドが動けば、次に貯める先も変わっている
+        操作の最中（:meth:`hold_prefetch`）は止めたまま、貯める先だけ渡しておく
         """
         if self._background is not None:
             # 走り係は自分で回る 再生ヘッドと、再生中かどうかを渡すだけ
             self._idle.stop()
-            self._background.set_paused(self._playing)
+            self._background.set_paused(self._playing or self._holding)
             self._background.set_playhead(self._frame)
+            return
+        if self._holding:
+            self._idle.stop()
             return
         if self._playing:
             self._idle.stop()
@@ -1451,9 +1502,9 @@ class PreviewWidget(QOpenGLWidget):
         描けなくなったら止める 止めないと、貯まりきった後も空き時間の
         たびに「次はどれか」を数え続ける
         """
-        if self._playing or self._cache is None:
+        if self._playing or self._holding or self._cache is None:
             # タイマーを止めても、すでに積まれた合図は届く 再生が始まった後に
-            # 1 コマ描くと、出す側と GL を奪い合う
+            # 1 コマ描くと、出す側と GL を奪い合う 操作の最中も描かない
             self._idle.stop()
             return
         if self._background is not None:

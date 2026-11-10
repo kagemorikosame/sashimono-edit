@@ -415,6 +415,73 @@ class TestAnotherClip:
         finally:
             window.close()
 
+    def test_focus_follows_to_a_clip_with_other_fields(self, qt_application: QApplication) -> None:
+        """壊れると、打っている最中に AI が構成の違うクリップ（エフェクトの付いた文字）を
+        選んだとき、欄を取っておく間にフォーカスが外れ、共通の本文の欄へ打ち続けられない
+        """
+        del qt_application
+        base = _project(clips=2)
+        video, audio = base.timeline.tracks
+        plain, other = video.clips
+        blurred = replace(other, effects=(registry.require("blur").create(),))
+        tracks = (video.with_clips((plain, blurred)), audio)
+        project = base.with_timeline(replace(base.timeline, tracks=tracks))
+        window = _shown(MainWindow(project, confirm_unsaved=False))
+        try:
+            first, second = _clip_ids(window)
+            window._timeline.select(first)
+            _flush()
+            area = _editor(window, "text").findChild(QPlainTextEdit)
+            assert area is not None
+            _focus_end(window, area)
+            window._timeline.select(second)
+            _flush()
+            focused = _focused(window)
+            assert isinstance(focused, QPlainTextEdit), "選び替えでフォーカスが外れた"
+            assert _editor(window, "text").isAncestorOf(focused)
+            # 取っておいた欄を出し直す道（構成が前と同じクリップへ戻る）でも戻す
+            window._timeline.select(first)
+            _flush()
+            focused = _focused(window)
+            assert isinstance(focused, QPlainTextEdit), "取っておいた欄へ戻るとフォーカスが外れた"
+            assert _editor(window, "text").isAncestorOf(focused)
+        finally:
+            window.close()
+
+    def test_focus_follows_an_effect_to_a_clip_with_more_effects(
+        self, qt_application: QApplication
+    ) -> None:
+        """壊れると、エフェクトの欄へ打っている最中に、同じ種類のエフェクトを持つがエフェクトの
+        数が違うクリップが選ばれたとき、欄の鍵が元のクリップの ID のままでフォーカスを見失う
+        """
+        del qt_application
+        base = _project(clips=2)
+        video, audio = base.timeline.tracks
+        first_clip, second_clip = video.clips
+        blur = registry.require("blur")
+        one = replace(first_clip, effects=(blur.create(),))
+        two = replace(second_clip, effects=(blur.create(), registry.require("mosaic").create()))
+        tracks = (video.with_clips((one, two)), audio)
+        project = base.with_timeline(replace(base.timeline, tracks=tracks))
+        window = _shown(MainWindow(project, confirm_unsaved=False))
+        try:
+            first, second = _clip_ids(window)
+            window._timeline.select(first)
+            _flush()
+            editor = window._inspector._editors[(str(one.effects[0].id), "radius")]
+            field = editor.findChild(QDoubleSpinBox)
+            assert field is not None
+            _focus_end(window, field)
+            window._timeline.select(second)
+            _flush()
+            focused = _focused(window)
+            target = window._inspector._editors[(str(two.effects[0].id), "radius")]
+            assert focused is not None and target.isAncestorOf(focused), (
+                "エフェクトの数が違うクリップへ選び替えると、同じ種類の欄へフォーカスが移らない"
+            )
+        finally:
+            window.close()
+
     def test_changing_the_other_clips_starts_a_new_step(self, qt_application: QApplication) -> None:
         # 主のクリップが同じでも、まとめて当てるほかのクリップが変わったら（(A, B) から
         # (A, C)）引き継がない 引き継ぐと、B へ打った段と C へ打った分が 1 段にまとまり、
