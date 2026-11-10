@@ -33,6 +33,7 @@ import ast
 import io
 import sys
 import tokenize
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,7 +89,7 @@ class Hit:
         return f"{self.path.relative_to(ROOT).as_posix()}:{self.line}:{self.column + 1}"
 
 
-def _replacement(text: str, index: int) -> str:
+def _replacement(text: str, index: int, keep: Sequence[tuple[int, int]] = ()) -> str:
     following = text[index + 1] if index + 1 < len(text) else "\n"
     for mark in ("**", "`"):
         if text.startswith(mark, index + 1):
@@ -97,9 +98,24 @@ def _replacement(text: str, index: int) -> str:
             # 詰まって読めない 両方とも一度そうなった
             # 段落の頭からここまでに出た数が奇数なら、いまは記号の中（= 閉じ）
             # 行の頭から数えると、行をまたぐ太字で閉じを開きと取り違える
-            inside = text.count(mark, _paragraph_start(text, index), index) % 2 == 1
-            return "" if inside else " "
+            # 残す範囲（コードなど）の中の記号は数えない 数えると「`**`」のような
+            # コードの中の記号で開きと閉じが入れ替わり、区切りの空白を入れ損なう
+            count = _count_outside(text, mark, _paragraph_start(text, index), index, keep)
+            return "" if count % 2 == 1 else " "
     return "" if following in _CLOSERS else " "
+
+
+def _count_outside(
+    text: str, mark: str, start: int, end: int, keep: Sequence[tuple[int, int]]
+) -> int:
+    """start から end までに、残す範囲の外で mark が出た数（重ならずに数える）"""
+    count = 0
+    index = text.find(mark, start, end)
+    while index != -1:
+        if not any(low <= index < high for low, high in keep):
+            count += 1
+        index = text.find(mark, index + len(mark), end)
+    return count
 
 
 def _paragraph_start(text: str, index: int) -> int:
@@ -243,6 +259,49 @@ def targets(root: Path = ROOT) -> list[Path]:
 
 def scan(path: Path) -> list[Hit]:
     return scan_python(path) if path.suffix == ".py" else scan_text(path)
+
+
+#: 文字の範囲（始まりを含み、終わりを含まない）
+type Spans = Sequence[tuple[int, int]]
+
+
+def _prose_marks(text: str, keep: Spans) -> list[int]:
+    """句点の位置のうち、残す範囲（貼ったログやコードなどのデータ）の外の物"""
+    return [
+        index
+        for index, character in enumerate(text)
+        if character == MARU and not any(start <= index < end for start, end in keep)
+    ]
+
+
+def find_in_text(text: str, keep: Spans = ()) -> list[tuple[int, int]]:
+    """リポジトリの外の文章（Issue の本文など）にある句点の行と桁（どちらも 1 から）
+
+    ファイルを介さずに見る口 ``tools/new_issue.py`` が送る前の本文を見る
+    Issue の本文は送ってしまうとこの検査の外になり、混ざっても誰も気付かない（#376）
+    ``keep`` の中はデータとして見ない 字幕整形の不具合の再現に貼った文から句点を
+    消すと、再現できない報告になる 行は LF だけで数える（行の頭も同じ決まりで探す
+    splitlines は垂直タブなどでも割るので、行と桁が食い違う）
+    """
+    found: list[tuple[int, int]] = []
+    for index in _prose_marks(text, keep):
+        line = text.count("\n", 0, index) + 1
+        found.append((line, index - (text.rfind("\n", 0, index) + 1) + 1))
+    return found
+
+
+def fix_text(text: str, keep: Spans = ()) -> str:
+    """文章の句点を、ファイルの書き換えと同じ決まりで消すか半角空白にする
+
+    決まりを 2 か所に持つと、Issue の本文とリポジトリの中で直り方が食い違う
+    ``keep`` の中は直さない（find_in_text と同じ）
+    """
+    # 置き換え先は元の文で先に決める（fix と同じ） 書き換えながら決めると、
+    # 続いた句点の扱いが前の書き換えに引きずられる
+    original = text
+    for index in reversed(_prose_marks(original, keep)):
+        text = text[:index] + _replacement(original, index, keep) + text[index + 1 :]
+    return text
 
 
 def fix(path: Path, hits: list[Hit]) -> None:
