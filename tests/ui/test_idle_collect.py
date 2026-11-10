@@ -10,7 +10,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from sashimono.gc_policy import FullCollectPolicy
+from sashimono.gc_policy import NEVER, FullCollectPolicy
 from sashimono.ui.idle_collect import IdleCollect
 
 
@@ -64,6 +64,6 @@ def test_closing_returns_to_automatic(qt_application: object) -> None:
     """壊れると、窓を閉じた後も自動の全体回が止まったまま、同じプロセスのほかの窓のメモリが増える"""
     collector = _collector([False], list[int]())
     collector.set_manual(True)
-    assert gc.get_threshold()[2] == 0
+    assert gc.get_threshold()[2] == NEVER
     collector.close()
-    assert gc.get_threshold()[2] > 0
+    assert gc.get_threshold()[2] < NEVER

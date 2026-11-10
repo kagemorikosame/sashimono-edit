@@ -97,13 +97,18 @@ class Summary:
     busy_threads: Counter[str] = field(default_factory=Counter)
 
 
-def read(paths: Iterable[Path]) -> list[dict[str, Any]]:
-    """記録を読む 壊れた行（書いている最中に落ちた等）は飛ばす"""
+def read(paths: Iterable[Path], *, unread: list[Path] | None = None) -> list[dict[str, Any]]:
+    """記録を読む 壊れた行（書いている最中に落ちた等）は飛ばす
+
+    読めなかったファイルは ``unread`` へ足す
+    """
     records: list[dict[str, Any]] = []
     for path in paths:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
+            if unread is not None:
+                unread.append(path)
             continue
         for line in text.splitlines():
             try:
@@ -166,7 +171,9 @@ def busy_threads(stall: Stall) -> list[str]:
     for name, lines in stall.threads.items():
         if name == "MainThread" or not lines:
             continue
-        if _file(lines[-1]) in _WAITING:
+        # 名前だけで見る 本体の stall_watch.py は置き場ごと書かれ、Python の置き場の下に
+        # sashimono という名前のフォルダがある機械では threading.py も置き場ごと書かれる
+        if _file(lines[-1]).rsplit("/", 1)[-1] in _WAITING:
             continue
         found.append(name.split(" #", 1)[0])
     return found
@@ -277,12 +284,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top", type=int, default=10, help="場所とスレッドを何件まで出すか")
     args = parser.parse_args(argv)
     paths = args.paths or default_paths()
+    unread: list[Path] = []
     records = [
         record
-        for record in read(paths)
+        for record in read(paths, unread=unread)
         if float(record["stall_ms"]) >= args.min_ms
         and (args.since is None or str(record.get("time", "")) >= args.since)
     ]
+    if args.paths:
+        # 渡されたファイルが読めないのを黙ると「記録を取ったか確かめる」とだけ出て、打ち間違いに
+        # 気付けない 既定の場所の .1 は無いのが普通なので、そちらは黙る
+        for path in unread:
+            print(f"読めなかった: {path}", file=sys.stderr)
     print(report(summarize(records), top=args.top))
     return 0
 

@@ -5,7 +5,7 @@ Python は世代 1 の回が決まった数（既定 10 回）たまると、全
 1〜2 コマ止まる 開いたプロジェクトは :func:`gc.freeze` で外してある（#452）が、編集で
 作り直したモデルは外れたまま積もる
 
-手で回す形にすると、自動の全体回を止め（世代 2 の数を 0 にする）、手が止まったときに
+手で回す形にすると、自動の全体回を止め（世代 2 の数を :data:`NEVER` にする）、手が止まったときに
 :meth:`FullCollectPolicy.collect_if_due` で回す ずっと手が止まらない人のために、
 :data:`MAX_DEFER_S` を過ぎたら操作の最中でも回す 回さないと、循環した物が溜まり続けて
 メモリが増える
@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-__all__ = ["IDLE_S", "MAX_DEFER_S", "CollectRecord", "FullCollectPolicy"]
+__all__ = ["IDLE_S", "MAX_DEFER_S", "NEVER", "CollectRecord", "FullCollectPolicy"]
 
 #: 最後の操作からこの長さ（秒）たったら手が止まったと見る 先読みの止めの解き（300ms）より
 #: 長くする 短いと、次のクリックまでの短い間に全体回が当たり、手で回す意味が無くなる
@@ -29,6 +29,11 @@ IDLE_S = 1.5
 #: 全体回をこれより長く（秒）は延ばさない 操作し続けている人でも、この間隔で 1 回は回す
 #: 自動の全体回は編集の続く間なら数秒〜数十秒に 1 回なので、それより十分に長く取る
 MAX_DEFER_S = 120.0
+
+#: 手で回すあいだの世代 2 の数 自動の全体回は「世代 1 の回の数がこれを超えたら」走るので、
+#: 届かない大きさにすれば止まる 0 では止まらない（3.12 も 3.14 も、0 を超えた所で毎回
+#: 判定に入り、既定と同じかそれより早く全体回が走る） C の int に収まる大きさにする
+NEVER = 1_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,12 +80,14 @@ class FullCollectPolicy:
         first, second, third = gc.get_threshold()
         if manual:
             self._saved_threshold = third
-            # 世代 2 の数を 0 にすると、自動の全体回だけが止まる 世代 0 と 1 は今まで通り回る
-            # （短い命の物は今まで通りすぐ集まり、メモリの増え方は変わらない）
-            gc.set_threshold(first, second, 0)
+            # 世代 2 の数だけを届かない大きさにすると、自動の全体回だけが止まる 世代 0 と 1 は
+            # 今まで通り回る（短い命の物は今まで通りすぐ集まり、メモリの増え方は変わらない）
+            gc.set_threshold(first, second, NEVER)
             self._last_full = self._clock()
         else:
-            gc.set_threshold(first, second, self._saved_threshold or third or 10)
+            # 0 も人が決めた値として戻す（偽として扱うと既定の 10 に書き換わる）
+            saved = self._saved_threshold
+            gc.set_threshold(first, second, 10 if saved is None else saved)
             self._saved_threshold = None
         self._manual = manual
 

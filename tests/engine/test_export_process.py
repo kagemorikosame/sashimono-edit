@@ -127,3 +127,20 @@ def test_cancelling_in_the_child_reads_as_cancelled(
     monkeypatch.setattr(job_module, "run_in_process", _fake_run(None))
     with pytest.raises(ExportError, match="中止"):
         export_anywhere(project, ExportSettings(path=tmp_path / "x.mp4"), separate_process=True)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [WorkerCrashedError("落ちた"), None],
+    ids=["落ちた子", "止めた子"],
+)
+def test_a_half_written_file_is_removed_when_the_child_could_not(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: object
+) -> None:
+    """壊れると、子が落ちた・猶予を過ぎて止めたとき、利用者が選んだ場所に途中で切れた動画が残る"""
+    target = tmp_path / "x.mp4"
+    target.write_bytes(b"half")
+    monkeypatch.setattr(job_module, "run_in_process", _fake_run(result))
+    with pytest.raises(ExportError):
+        export_anywhere(project, ExportSettings(path=target), separate_process=True)
+    assert not target.exists()

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import av
 
 from sashimono.engine.cache.proxy import proxy_codecs, proxy_job, working_path
-from sashimono.engine.worker import run_in_process
+from sashimono.engine.worker import WorkerUnavailableError, run_in_process
 
 
 def decode_speed(path: Path, seconds: float, hwaccel: str | None) -> tuple[float, int] | None:
@@ -81,36 +81,45 @@ def proxy_speed(path: Path, seconds: float) -> float | None:
     with tempfile.TemporaryDirectory(prefix="sashimono-decode-bench-") as folder:
         clip = Path(folder) / "clip.mp4"
         # 頭だけを写して切り出す（符号化し直さない） 長い録画の控えを全部作ると何十分もかかる
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(path),
-                "-t",
-                str(seconds),
-                "-c",
-                "copy",
-                str(clip),
-            ],
-            check=True,
-        )
+        try:
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-t",
+                    str(seconds),
+                    "-c",
+                    "copy",
+                    str(clip),
+                ],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # 先に測った読む速さを捨てないよう、ここで止めずに表の残りを出す
+            print(f"  素材の頭を切り出せなかった {exc}")
+            return None
         target = Path(folder) / "proxy.mp4"
         began = time.perf_counter()
-        made = run_in_process(
-            proxy_job,
-            {
-                "source": str(clip),
-                "target": str(target),
-                "working": str(working_path(target)),
-                "height": 540,
-                "stream_index": None,
-                "codecs": tuple(proxy_codecs()),
-            },
-        )
+        try:
+            made = run_in_process(
+                proxy_job,
+                {
+                    "source": str(clip),
+                    "target": str(target),
+                    "working": str(working_path(target)),
+                    "height": 540,
+                    "stream_index": None,
+                    "codecs": tuple(proxy_codecs()),
+                },
+            )
+        except WorkerUnavailableError as exc:
+            print(f"  別のプロセスを起こせなかった {exc}")
+            return None
         elapsed = time.perf_counter() - began
     if made is None:
         print("  控えを作れなかった")
@@ -133,13 +142,21 @@ def main(argv: list[str] | None = None) -> int:
             f"{float(stream.average_rate or 0):.0f}fps 頭から {args.seconds:g} 秒"
         )
     results: list[tuple[str, str]] = []
+    cpu_speed: float | None = None
     for accel in [None, *args.hwaccel]:
         found = decode_speed(args.source, args.seconds, accel)
         if found is not None:
+            if accel is None:
+                cpu_speed = found[0]
             results.append((f"読むだけ {accel or 'cpu'}", f"{found[0]:.1f} 倍速（{found[1]} 枚）"))
     speed = proxy_speed(args.source, args.seconds)
     if speed is not None:
         results.append(("控えの作成（別のプロセス）", f"{speed:.1f} 倍速"))
+        if cpu_speed:
+            # 読む時間は 秒数 / cpu_speed 全体は 秒数 / speed なので、読む分の割合は速さの比
+            # （控えは別のプロセスで縮めながら読むので、読みと変換が重なる分だけ大きめに出る）
+            share = min(speed / cpu_speed, 1.0)
+            results.append(("控えの作成のうち読む分（見積もり）", f"{share:.0%}"))
     print()
     print("| 測った物 | 速さ |")
     print("|---|---|")

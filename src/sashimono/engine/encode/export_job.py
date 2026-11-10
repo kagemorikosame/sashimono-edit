@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -104,6 +105,19 @@ def is_gl_unavailable(reason: str) -> bool:
     return GL_UNAVAILABLE_MARK in reason
 
 
+def _discard(path: Path) -> None:
+    """子が後片付けをせずに終わったときの書きかけを消す
+
+    スレッドで書く道（:func:`export_project`）は失敗すると書き出し先を消す 落ちた子・猶予を
+    過ぎて止めた子はそれをしないので、親が代わりに消す 消さないと、窓の書き出しは利用者が
+    選んだ場所へ直に書くので、途中で切れた動画がそこに残る ``run_in_process`` は子が終わる
+    まで待ってから戻るので、ここではもう子がファイルを掴んでいない 消せなくても元の失敗を
+    隠さない
+    """
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
 def export_anywhere(
     project: Project,
     settings: ExportSettings,
@@ -136,9 +150,12 @@ def export_anywhere(
                 raise ExportError(reason.removeprefix(_EXPORT_ERROR_PREFIX)) from exc
             _log.warning("子のプロセスで GL を作れないので、スレッドで書き出す: %s", reason)
         except WorkerCrashedError as exc:
+            _discard(settings.path)
             raise ExportError(f"書き出しの途中で別のプロセスが落ちた: {exc}") from exc
         else:
             if outcome is None:
+                # 取り消しの猶予を過ぎて子を止めたときは、子の中の後片付けが走っていない
+                _discard(settings.path)
                 # 取り消した 同じプロセスで書いたときと同じ文で返す（呼ぶ側は中止の印で見分ける）
                 raise ExportError("書き出しを中止した")
             if notice is not None:

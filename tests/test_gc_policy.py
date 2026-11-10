@@ -7,11 +7,17 @@ gc の世代ごとの数（しきい値）は本物を書き換えるので、�
 from __future__ import annotations
 
 import gc
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
-from sashimono.gc_policy import MAX_DEFER_S, FullCollectPolicy
+from sashimono.gc_policy import MAX_DEFER_S, NEVER, FullCollectPolicy
+
+SRC = Path(__file__).resolve().parent.parent / "src"
 
 
 class Clock:
@@ -47,9 +53,50 @@ def test_manual_mode_stops_only_the_automatic_full_collection() -> None:
     first, second, _third = gc.get_threshold()
     policy = _policy(Clock(), [])
     policy.set_manual(True)
-    assert gc.get_threshold() == (first, second, 0)
+    assert gc.get_threshold() == (first, second, NEVER)
     policy.set_manual(False)
-    assert gc.get_threshold()[2] > 0
+    assert gc.get_threshold()[2] < NEVER
+
+
+#: 循環した物を作り続け、そのあいだに自動で走った全体回の数を出す 手で回す形なら先に入れる
+#: まっさらなプロセスで数える ほかの試験が gc を止めたり積もらせたりした後だと、自動の側でも
+#: 全体回が走らず、比べられない
+_PROBE = """
+import gc, sys
+from sashimono.gc_policy import FullCollectPolicy
+gc.set_threshold(700, 10, 10)
+policy = FullCollectPolicy()
+policy.set_manual(sys.argv[1] == "manual")
+started = []
+gc.callbacks.append(lambda phase, info: phase == "start" and info["generation"] == 2
+                    and started.append(1))
+kept = []
+for index in range(400_000):
+    loop = [index]
+    loop.append(loop)
+    if index % 3 == 0:
+        kept.append({"at": index})
+print(len(started))
+"""
+
+
+def _automatic_full_collections(mode: str) -> int:
+    env = {**os.environ, "PYTHONPATH": str(SRC)}
+    # 固定の文字列を、今の Python へ list で渡すだけ（shell は通さない）
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+    done = subprocess.run(
+        [sys.executable, "-c", _PROBE, mode], env=env, capture_output=True, text=True, check=True
+    )
+    return int(done.stdout.strip())
+
+
+def test_manual_mode_really_stops_the_automatic_full_collection() -> None:
+    """壊れると、設定を入れても操作の最中に全体回が走り続ける
+
+    世代 2 の数を 0 にした前の作りがそうだった
+    """
+    assert _automatic_full_collections("auto") > 0
+    assert _automatic_full_collections("manual") == 0
 
 
 def test_turning_manual_off_restores_the_previous_threshold() -> None:

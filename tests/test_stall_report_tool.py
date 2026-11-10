@@ -101,6 +101,33 @@ def test_waiting_in_the_event_loop_while_a_worker_runs_is_background(tool: Modul
     assert tool.busy_threads(stall) == ["sashimono-prefetch"]
 
 
+def test_waiting_frames_written_with_a_folder_are_still_waiting(tool: ModuleType) -> None:
+    """壊れると、置き場ごと書かれた待ちのフレームにいるスレッドが、裏の取り合いに数えられる
+
+    本体の見張り（stall_watch.py）と、置き場付きで書かれた threading.py の 2 つ
+    """
+    record = _record(
+        80,
+        LOOP,
+        others={
+            "sashimono-stall-watch": ["threading.py:1012 run", "sashimono/stall_watch.py:200 _run"],
+            "worker": [
+                "sashimono/Lib/threading.py:1012 run",
+                "sashimono/Lib/threading.py:300 wait",
+            ],
+        },
+    )
+    assert tool.busy_threads(tool.parse(record)) == []
+
+
+def test_a_path_that_cannot_be_read_is_told(
+    tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """壊れると、受け取ったファイルの名前を打ち間違えても「記録を取ったか確かめる」とだけ出る"""
+    assert tool.main([str(tmp_path / "無い.jsonl")]) == 0
+    assert "読めなかった" in capsys.readouterr().err
+
+
 def test_a_stall_without_samples_is_counted_on_its_own(tool: ModuleType) -> None:
     """壊れると、線を少し超えただけの止まりが原因の分かった止まりに混ざる"""
     assert tool.classify(tool.parse(_record(31, None))) == tool.UNSAMPLED
