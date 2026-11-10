@@ -35,7 +35,7 @@ from sashimono.engine.gpu import GLContextError
 from sashimono.engine.render import Invalidation, PreviewCache, RenderQuality
 from sashimono.engine.render.background import WAIT_FOR_WORKER_S, BackgroundPrefetch
 from sashimono.engine.render.prefetch import CacheSurface
-from sashimono.ui.preview import PreviewWidget
+from sashimono.ui.preview import HOLD_AFTER_INPUT_MS, PreviewWidget
 from tests.ui.test_preview_prefetch import StubCache, StubRenderer, _project
 
 
@@ -695,3 +695,93 @@ class TestTheScreenKeepsAnswering:
         )
         assert background, "別のスレッドで先読みしていない"
         assert stored, "動かした先を貯めていない（遅くした道を通っていない）"
+
+
+class TestHoldWhileOperating:
+    """操作している間は先読みを止める（#442 C）"""
+
+    def test_an_operation_pauses_the_worker(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """壊れると、選ぶ・動かす最中も走り係が Python を動かし、クリックの応答が遅れる"""
+        widget, _, background = running
+        background.calls.clear()
+        widget.hold_prefetch()
+        assert background.named("pause") == [True]
+        assert widget.holding_prefetch
+
+    def test_a_change_while_holding_keeps_it_paused(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """壊れると、操作の最中の編集（動かした・選んだ）で先読みが動き出す"""
+        widget, _, background = running
+        widget.hold_prefetch()
+        background.calls.clear()
+        widget.set_frame(40)
+        assert background.named("pause") and all(background.named("pause"))
+
+    def test_it_resumes_after_the_hands_stop(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """壊れると、操作を止めた後もずっと先読みが貯まらない"""
+        widget, _, background = running
+        widget.hold_prefetch()
+        background.calls.clear()
+        widget._hold_timer.timeout.emit()
+        assert background.named("pause") == [False]
+        assert not widget.holding_prefetch
+
+    def test_the_wait_starts_over_with_each_operation(
+        self,
+        running: tuple[PreviewWidget, StubCache, StubBackground],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """壊れると、操作を続けている最中に最初の操作から数えて先読みが動き出すか、
+        手を止めても待ちが始まらず先読みが戻らない
+        """
+        widget, _, background = running
+        timer = widget._hold_timer
+        # 数え直しは、残りの時間を比べず、毎回の操作で掛け直したかで見る 残りの時間は
+        # CI が重いと読むのが遅れ、正しく掛け直していても比べ損なう
+        starts: list[None] = []
+        real_start = timer.start
+
+        def counted_start() -> None:
+            starts.append(None)
+            real_start()
+
+        monkeypatch.setattr(timer, "start", counted_start)
+        widget.hold_prefetch()
+        assert timer.isActive()
+        assert timer.interval() == HOLD_AFTER_INPUT_MS
+        widget.hold_prefetch()
+        assert len(starts) == 2, "続けた操作で待ちが数え直されない"
+        assert timer.isSingleShot() and timer.isActive()
+        background.calls.clear()
+        deadline = time.monotonic() + 5.0
+        while widget.holding_prefetch and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        assert not widget.holding_prefetch
+        assert background.named("pause") == [False]
+
+    def test_switched_off_it_never_pauses(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """設定で切った人の所では、操作しても先読みは止まらない"""
+        widget, _, background = running
+        widget.set_prefetch_yield(False)
+        background.calls.clear()
+        widget.hold_prefetch()
+        assert background.named("pause") == []
+        assert not widget.holding_prefetch
+
+    def test_switching_off_while_holding_resumes(
+        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+    ) -> None:
+        """壊れると、止めている最中に設定を切った所で、次の操作まで先読みが止まったまま"""
+        widget, _, background = running
+        widget.hold_prefetch()
+        background.calls.clear()
+        widget.set_prefetch_yield(False)
+        assert background.named("pause") == [False]
