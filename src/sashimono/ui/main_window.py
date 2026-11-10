@@ -542,10 +542,11 @@ class MainWindow(QMainWindow):
             encoder_priority=self._preferences.encoder_priority,
             separate_process=self._preferences.proxy_process,
         )
-        #: 控えを作る順を最後に渡したときの（作品, 開いていたタイムライン, 再生位置, 時刻）
-        #: 変わったときだけ求め直す タイムラインも見るのは、再生位置が同じままシーンを
-        #: 開き替えたときも、新しく開いた方の素材を先にするため
-        self._proxy_order_seen: tuple[Project | None, object, int, float] = (
+        #: 控えを作る順を最後に渡したときの（作品, 開いていたタイムライン, 開いていたシーン,
+        #: 再生位置, 時刻） 変わったときだけ求め直す タイムラインも見るのは、再生位置が
+        #: 同じままシーンを開き替えたときも、新しく開いた方の素材を先にするため
+        self._proxy_order_seen: tuple[Project | None, object, SceneId | None, int, float] = (
+            None,
             None,
             None,
             -1,
@@ -1207,7 +1208,7 @@ class MainWindow(QMainWindow):
                 encoder_priority=preferences.encoder_priority,
                 separate_process=preferences.proxy_process,
             )
-            self._proxy_order_seen = (None, None, -1, 0.0)
+            self._proxy_order_seen = (None, None, None, -1, 0.0)
             # 新しい係はまだ何も頼まれていない
             self._used_requested = None
             self._proxy_asked.clear()
@@ -2504,10 +2505,22 @@ class MainWindow(QMainWindow):
         if self._used_requested is root:
             return
         used = self._used_media()
-        for media in root.media:
-            if media.id in used and media.id not in self._proxy_asked:
-                self._proxy_asked.add(media.id)
-                self._proxies.request(media, on_ready=self._on_proxy_ready)
+        fresh = [
+            media for media in root.media if media.id in used and media.id not in self._proxy_asked
+        ]
+        if len(fresh) > 1:
+            # 作る順に頼む 1 本目は係が空いていればすぐ走るので、素材一覧の並びで頼むと、
+            # 一覧の先頭にある長い動画から作り始め、再生位置で見ている素材が待たされる
+            rank = {
+                media_id: index
+                for index, media_id in enumerate(
+                    proxy_order(root, self._timeline.playhead, self.view_project.timeline)
+                )
+            }
+            fresh.sort(key=lambda media: rank.get(media.id, len(rank)))
+        for media in fresh:
+            self._proxy_asked.add(media.id)
+            self._proxies.request(media, on_ready=self._on_proxy_ready)
         self._used_requested = root
 
     def _order_proxies(self, *, force: bool = False) -> list[MediaId]:
@@ -2522,14 +2535,20 @@ class MainWindow(QMainWindow):
         root = self._document.project
         active = self.view_project.timeline
         playhead = self._timeline.playhead
-        seen, opened, frame, at = self._proxy_order_seen
+        seen, opened, scene, frame, at = self._proxy_order_seen
         now = time.monotonic()
-        if not force and (
-            (seen is root and opened is active and frame == playhead)
-            or now - at < PROXY_ORDER_INTERVAL_S
+        # シーンを開き替えたときは間隔を待たない 待つと、その間に今の変換が終わり、前に
+        # 開いていた所の順で次の素材を作り始める 開き替えは打つほど続かないので重くならない
+        if (
+            not force
+            and scene == self._active_scene
+            and (
+                (seen is root and opened is active and frame == playhead)
+                or now - at < PROXY_ORDER_INTERVAL_S
+            )
         ):
             return []
-        self._proxy_order_seen = (root, active, playhead, now)
+        self._proxy_order_seen = (root, active, self._active_scene, playhead, now)
         order = proxy_order(root, playhead, active)
         self._proxies.set_order(order)
         return order

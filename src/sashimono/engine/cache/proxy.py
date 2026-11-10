@@ -114,6 +114,7 @@ import os
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
@@ -268,10 +269,40 @@ def needs_keyframe_check(media: MediaItem) -> bool:
 _OTHER_SCENE = 1 << 40
 
 
-#: 一度たどったシーンの起点 シーンの ID・中の再生位置・外の時間への縮み → いちばん小さい下駄
-#: 同じ起点なら中の距離は同じなので、下駄が大きい再訪は何も縮めない 覚えずに毎回たどると、
-#: 同じシーンを何か所にも置いて入れ子にした作品で、たどる数が段の数の指数で増える
-_Seen = dict[tuple[SceneId, int, Fraction], Fraction]
+#: 置いたシーンの中へ入る回数の上限 入れ子のシーンをいくつもの速さで何か所にも置いた作品
+#: では、起点の組み合わせが段の数の指数で増え、先回りの枝切りでも減らないことがある
+#: 越えた先は中へ入らず、ほかのタイムラインとして後ろへ並べる 順が少し粗くなるだけで、
+#: 作品を開くたびに画面が長く止まるよりよい
+MAX_SCENE_VISITS = 4096
+
+
+@dataclass
+class _Walk:
+    """シーンの中をたどる間の覚え
+
+    ``seen`` はシーンの ID と中の再生位置ごとに、たどった（下駄, 縮み）の組 中の距離は
+    下駄 + 中のコマ数 × 縮み なので、下駄も縮みも前の組以上なら何も縮めず、たどらずに済む
+    """
+
+    seen: dict[tuple[SceneId, int], list[tuple[Fraction, Fraction]]] = field(default_factory=dict)
+    visits: int = 0
+
+    def enter(self, scene: SceneId, inner: int, base: Fraction, scale: Fraction) -> bool:
+        """この起点から中へ入るか 入るなら覚える"""
+        if self.visits >= MAX_SCENE_VISITS:
+            return False
+        known = self.seen.setdefault((scene, inner), [])
+        if any(old_base <= base and old_scale <= scale for old_base, old_scale in known):
+            return False
+        # 今度の組に負ける組は捨てる 残すと比べる数が増えるだけ
+        known[:] = [
+            (old_base, old_scale)
+            for old_base, old_scale in known
+            if not (base <= old_base and scale <= old_scale)
+        ]
+        known.append((base, scale))
+        self.visits += 1
+        return True
 
 
 def _distances(
@@ -284,7 +315,7 @@ def _distances(
     deep: bool = True,
     scale: Fraction = Fraction(1),
     inside: frozenset[SceneId] = frozenset(),
-    seen: _Seen | None = None,
+    walk: _Walk | None = None,
 ) -> None:
     """``timeline`` の素材の、再生位置からの距離（いちばん外の時間軸のコマ数）を ``found`` へ入れる
 
@@ -293,8 +324,8 @@ def _distances(
     ``deep`` が偽なら置いたシーンの中へ入らない どのタイムラインもそれぞれ 1 度ずつ数える
     呼び方（使っている素材を集めるとき）で、中へ入ると同じシーンを何度も数えることになる
     """
-    if seen is None:
-        seen = {}
+    if walk is None:
+        walk = _Walk()
     for track in timeline.tracks:
         for clip in track.clips:
             if clip.media_id is None and clip.scene_id is None:
@@ -317,11 +348,8 @@ def _distances(
                 rate = timeline.rate
                 inner = int(clip.picture_time(local, rate) / rate.frame_duration)
                 inner_scale = scale / clip.speed
-                key = (scene.id, inner, inner_scale)
-                best = seen.get(key)
-                if best is not None and best <= reach:
+                if not walk.enter(scene.id, inner, reach, inner_scale):
                     continue
-                seen[key] = reach
                 _distances(
                     project,
                     scene.timeline,
@@ -330,7 +358,7 @@ def _distances(
                     found,
                     scale=inner_scale,
                     inside=inside | {scene.id},
-                    seen=seen,
+                    walk=walk,
                 )
                 continue
             assert clip.media_id is not None

@@ -480,6 +480,8 @@ class InspectorPanel(QWidget):
         # 組み直しの側（:meth:`_rebuild`）では戻す先を見失う 打っている最中に AI が構成の
         # 違うクリップを選ぶと、共通の欄（名前など）へ打ち続けられなくなる
         place = self._focused_place()
+        if place is not None and primary is not None:
+            place = replace(place, key=self._carried_key(place.key, primary))
         if primary is not None and self._unpark():
             if place is not None:
                 self._restore_focus(place)
@@ -897,6 +899,35 @@ class InspectorPanel(QWidget):
                 self._real_key(key), kind, index, cursor, typing, self._shown_selection
             )
         return None
+
+    def _carried_key(self, key: tuple[str, str], primary: ClipId) -> tuple[str, str]:
+        """選び替えた先のクリップで、同じ働きのエフェクトの欄の鍵
+
+        エフェクトの数が違うクリップへ選び替えると、入れ替えの組（:class:`IdSwap`）が
+        作れず、鍵は欄を組んだクリップのエフェクトの ID のまま残る 種類と、同じ種類の中の
+        何番目かで選び替えた先のエフェクトへ対応付ける そうしないと、エフェクトの文字の欄へ
+        打っている最中に別のクリップが選ばれたとき、同じ種類の欄があってもフォーカスを見失う
+        """
+        owner, name = key
+        real = self._real_project
+        built = self._built
+        located = real.timeline.locate_clip(primary) if real is not None else None
+        if built is None or located is None:
+            return key
+        after = located[1]
+        for mine, theirs in (
+            (built.effects, after.effects),
+            (built.after_effects, after.after_effects),
+        ):
+            if any(effect.id == owner for effect in theirs):
+                return key
+            found = next((effect for effect in mine if effect.id == owner), None)
+            if found is None:
+                continue
+            nth = [effect.id for effect in mine if effect.kind == found.kind].index(found.id)
+            same = [effect.id for effect in theirs if effect.kind == found.kind]
+            return (str(same[nth]), name) if nth < len(same) else key
+        return key
 
     def _real_key(self, key: tuple[str, str]) -> tuple[str, str]:
         """欄の鍵（:func:`_editor_key`）の持ち主を、今のクリップの ID へ戻す"""
