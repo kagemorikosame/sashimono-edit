@@ -34,6 +34,7 @@ from sashimono.ai.outbound import (
     sendable_now,
     text_sample,
 )
+from sashimono.ai.plan import plan_for
 from sashimono.ai.send_log import KEEP_DAYS, SendLog, SendLogStore, SentEntry, SentKind
 from sashimono.core.commands import ParamPath, SetParam
 from sashimono.core.model import MediaItem, Transcript
@@ -455,6 +456,20 @@ class TestFromTheReview:
         answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
         assert box.get("result") == {"params": {"caption": "値に入った本文"}}
         assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("値に入った本文",)
+
+    def test_plan_text_is_logged_once_allowed(self, host: FakeHost) -> None:
+        # 壊れると、字幕と文字を許して計画を読ませても、目標や手順の文が記録と最後に送った物に
+        # 載らない（Codex の指摘 #450）
+        plan = plan_for(host.document)
+        plan.begin_turn("字幕を直して")
+        plan.make("字幕を整える", ["話者を分ける", "誤字を直す"])
+        bridge = EditorBridge(host)
+        bridge.set_send_choices({**bridge.send_choices, Outbound.TEXT: SendChoice.ALLOW})
+        done, box = call_in_thread(bridge, _operation("get_plan"), {})
+        answer_sends(bridge, done, lambda _request: SendAnswer.DENY)
+        assert isinstance(box.get("result"), dict)
+        lines = bridge.send_log.last()[Outbound.TEXT].sample.lines
+        assert set(lines) == {"字幕を整える", "字幕を直して", "話者を分ける", "誤字を直す"}
 
     def test_closing_the_window_does_not_run_the_check(self, host: FakeHost) -> None:
         # 壊れると、確かめの窓を閉じただけで検査が頼まれ、直しの回数と区切り（#339）が進む
