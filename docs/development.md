@@ -4412,7 +4412,8 @@ GitHub の Issue フォーム（`.yml`）を使わないのも同じ理由
   `gh issue list --repo kagemorikosame/sashimono-edit --author @me --state all --limit 20` で確かめ
   （閉じられた物も出す 見つからなければ `--limit` を増やす）、作られていれば `.venv\Scripts\python.exe tools\new_issue.py register <番号>` で登録だけを行う
   `--parent` で作った子なら親に付いているかも見て、付いていなければ GitHub の画面で親に付ける
-  `create` は打ち直さない
+  作られたか分からない間は `create` を打ち直さない（同じ Issue が 2 つできる）
+  一覧に無く、作られていないと確かめられたら、原因を直してから `create` を打ち直す
 - **5 で止まった**（`gh` に `project` の権限が無いなど） `gh auth refresh -s project` を打ってから
   `.venv\Scripts\python.exe tools\new_issue.py register <番号>` でやり直す
   `GH_TOKEN` か `GITHUB_TOKEN` を使っているときは `gh auth refresh` ではそのトークンが変わらない

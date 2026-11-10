@@ -43,5 +43,5 @@
 
 ## 子の Issue
 
-<!-- tools\new_issue.py --parent <この Issue の番号> で作った子の一覧 -->
+<!-- .venv\Scripts\python.exe tools\new_issue.py create <種類> ... --parent <この Issue の番号> で作った子の一覧 要る引数は docs/development.md の「Issue の書き方」を見る -->
 
