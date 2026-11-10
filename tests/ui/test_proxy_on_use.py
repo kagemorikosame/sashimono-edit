@@ -109,6 +109,24 @@ def test_a_failed_proxy_is_not_asked_again_on_every_edit(
     assert asked == [item.id]
 
 
+def test_removed_and_returned_media_are_asked_again(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、作っている途中に外して取り消しで戻した素材の控えを、また使い始めても頼まない"""
+    asked: list[MediaId] = []
+    monkeypatch.setattr(window._proxies, "request", lambda media, **_kwargs: asked.append(media.id))
+    monkeypatch.setattr(window._proxies, "forget", lambda _media_id: None)
+    item = _media("returned")
+    _placed(window, item)
+    window._request_newly_used()
+    assert asked == [item.id]
+    window._forget_media([item.id])
+    # 戻した作品は前と別の物 同じ物を渡すと、見直し済みとして何もしない
+    window._document.reset(replace(window._document.project))
+    window._request_newly_used()
+    assert asked == [item.id, item.id]
+
+
 def test_unused_media_are_not_requested(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -162,3 +180,50 @@ def test_the_first_requests_follow_the_order(
         assert asked[:2] == ["used", "unused"]
     finally:
         created.close()
+
+
+def test_newly_used_media_are_asked_in_the_order(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、置いたときに作る設定で何本も置いたとき、素材一覧の先頭の素材から作り始め、
+    再生位置で見ている素材の控えがその変換の後まで待たされる
+    """
+    asked: list[str] = []
+    monkeypatch.setattr(
+        window._proxies, "request", lambda media, **_kwargs: asked.append(media.path.stem)
+    )
+    far, near = _media("far"), _media("near")
+    project = window._document.project
+    for item in (far, near):
+        project = AddMedia(item).apply(project)
+    track = Track(TrackKind.VIDEO, "V9")
+    project = AddTrack(track).apply(project)
+    for start, item in ((300, far), (0, near)):
+        project = AddClip(
+            track.id, Clip(timeline_start=start, duration=30, media_id=item.id)
+        ).apply(project)
+    window._document.reset(project)
+    window._request_newly_used()
+    assert asked == ["near", "far"]
+
+
+def test_opening_a_scene_reorders_without_waiting(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、順を求めてから 1 秒たたずにシーンを開き替えたとき、前に開いていた所の順の
+    まま次の素材を作り始める
+    """
+    orders: list[list[MediaId]] = []
+    monkeypatch.setattr(window._proxies, "waiting", lambda: 2)
+    monkeypatch.setattr(window._proxies, "set_order", orders.append)
+    scene = window.create_scene("場面")
+    assert scene is not None
+    window.open_scene(None)
+    # 開き替えの道もここを通るので、いま求めた直後という形にそろえる
+    window._proxy_order_seen = (None, None, None, -1, 0.0)
+    orders.clear()
+    window._order_proxies()
+    assert len(orders) == 1
+    window.open_scene(scene)
+    window._order_proxies()
+    assert len(orders) >= 2, "シーンを開き替えても間隔を待って順を求め直さない"

@@ -6,6 +6,7 @@ import threading
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -100,6 +101,148 @@ class TestOrder:
         project = replace(base, media=tuple(media), scenes=(scene,)).with_timeline(main)
         # 再生位置 510 はシーンの中の 510 コマ目（b の上） c はシーンの頭で 481 コマ離れる
         assert proxy_order(project, 510) == [media[1].id, media[2].id, media[0].id]
+
+    def test_a_fast_scene_counts_in_outer_frames(self) -> None:
+        """壊れると、10 倍速で置いたシーンの中の素材を外の 10 倍遠くに数え、外ですぐ先に見える
+        素材の控えが、外のもっと先の素材より後へ回る
+        """
+        media = [_media(name) for name in "ab"]
+        base = Project.create()
+        inner = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S1",
+                    (Clip(timeline_start=500, duration=30, media_id=media[0].id),),
+                ),
+            ),
+        )
+        scene = Scene("場面", inner)
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (
+                        Clip(
+                            timeline_start=0,
+                            duration=100,
+                            scene_id=scene.id,
+                            speed=Fraction(10),
+                        ),
+                        Clip(timeline_start=160, duration=30, media_id=media[1].id),
+                    ),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=(scene,)).with_timeline(main)
+        # a はシーンの中で 500 コマ先 10 倍速なので外では 50 コマ先 b は 160 コマ先
+        assert proxy_order(project, 0) == [media[0].id, media[1].id]
+
+    def test_a_scene_placed_twice_at_every_depth_is_walked_once(self) -> None:
+        """壊れると、同じシーンを 2 か所に置いて入れ子にした作品で、たどる数が段の数の指数で
+        増え、作品を開くたびに画面が長く止まる
+        """
+        media = [_media("a")]
+        base = Project.create()
+        leaf = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S",
+                    (Clip(timeline_start=0, duration=30, media_id=media[0].id),),
+                ),
+            ),
+        )
+        scenes = [Scene("0", leaf)]
+        for depth in range(1, 40):
+            below = scenes[-1].id
+            timeline = replace(
+                base.timeline,
+                tracks=(
+                    Track(
+                        TrackKind.VIDEO,
+                        "S",
+                        (
+                            Clip(timeline_start=0, duration=30, scene_id=below),
+                            Clip(timeline_start=100, duration=30, scene_id=below),
+                        ),
+                    ),
+                ),
+            )
+            scenes.append(Scene(str(depth), timeline))
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (Clip(timeline_start=0, duration=30, scene_id=scenes[-1].id),),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=tuple(scenes)).with_timeline(main)
+        # 覚えずにたどると 2 の 40 乗で終わらない
+        assert proxy_order(project, 0) == [media[0].id]
+        assert used_media(project) == {media[0].id}
+
+    def test_a_scene_placed_at_many_speeds_stays_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、同じシーンを段ごとに違う速さで 2 か所に置いた作品で、起点の縮みが
+        全部違うので覚えても減らず、たどる数が段の数の指数で増える（#452 の指摘）
+        """
+        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61]
+        media = [_media("a")]
+        base = Project.create()
+        leaf = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "S",
+                    (Clip(timeline_start=0, duration=30, media_id=media[0].id),),
+                ),
+            ),
+        )
+        scenes = [Scene("0", leaf)]
+        for prime in primes:
+            below = scenes[-1].id
+            # 遅い方（中が外で長く見える方）を先に置く 速い方が先だと、枝切りだけで済んでしまう
+            tracks = tuple(
+                Track(
+                    TrackKind.VIDEO,
+                    f"S{index}",
+                    (Clip(timeline_start=0, duration=30, scene_id=below, speed=speed),),
+                )
+                for index, speed in enumerate((Fraction(prime, 100), Fraction(1)))
+            )
+            scenes.append(Scene(str(prime), replace(base.timeline, tracks=tracks)))
+        main = replace(
+            base.timeline,
+            tracks=(
+                Track(
+                    TrackKind.VIDEO,
+                    "V1",
+                    (Clip(timeline_start=0, duration=30, scene_id=scenes[-1].id),),
+                ),
+            ),
+        )
+        project = replace(base, media=tuple(media), scenes=tuple(scenes)).with_timeline(main)
+        calls = [0]
+        real = proxy_module._distances
+
+        def counted(*args: Any, **kwargs: Any) -> None:
+            calls[0] += 1
+            real(*args, **kwargs)
+
+        monkeypatch.setattr(proxy_module, "_distances", counted)
+        assert proxy_order(project, 0) == [media[0].id]
+        # 中へ入るのは上限まで ほかのタイムラインを並べる分（シーンの数 + メイン）が加わる
+        assert calls[0] <= proxy_module.MAX_SCENE_VISITS + len(scenes) + 2
 
     def test_used_media(self) -> None:
         """壊れると、置いたときに作る設定で、使い始めた素材の控えが頼まれない"""

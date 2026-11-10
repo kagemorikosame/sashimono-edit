@@ -10,6 +10,7 @@ import time
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,6 +128,27 @@ class TestRunInProcess:
             run_in_process(probe_job, {}, start_timeout_s=0.0)
         assert time.monotonic() - began < 10.0
         assert not list(worker_module._LIVE), "起きなかった子が残っている"
+
+    def test_the_start_limit_does_not_cut_a_long_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """壊れると、起きた後も起動の期限を当て、期限より長い変換（長い素材の控え）を途中で
+        打ち切ってスレッドで作り直す
+        """
+        # 時計は子の知らせ（起きた後にしか来ない）で期限の何倍も先へ飛ばす 本当に待つと、
+        # 試験が期限の分だけ遅くなる
+        offset = [0.0]
+
+        def clock() -> float:
+            return time.monotonic() + offset[0]
+
+        def jump(_fraction: float) -> None:
+            offset[0] += 1000.0
+
+        monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=clock))
+        result = run_in_process(
+            probe_job, {"value": "長い", "steps": 3}, progress=jump, start_timeout_s=30.0
+        )
+        assert result == "長い"
+        assert offset[0] >= 1000.0, "期限を越える前に終わっていて、確かめになっていない"
 
     def test_a_crash_after_starting_is_a_crash(self) -> None:
         """壊れると、素材のせいで落ちた子を「起こせなかった」と取り違え、同じ素材をアプリの中で

@@ -314,17 +314,18 @@ class StallWatch:
         thread, self._thread = self._thread, None
         if thread is None:
             return
-        self._stop.set()
-        thread.join(timeout=1.0)
-        with contextlib.suppress(ValueError):
-            gc.callbacks.remove(self._on_gc)
         # 止まっている最中に止められた分（閉じる処理そのものが重かった等）も書く
-        # 書かないと、写したはずの並びが次の打ちを待たずに捨てられる
+        # 書かないと、写したはずの並びが次の打ちを待たずに捨てられる 止める合図より前に
+        # 待ちの列へ入れ、見張りのスレッドが最後に書く ここで書くと、書き込みが 1 秒を
+        # 超えて見張りが残ったとき、2 つのスレッドが同じ列から取り合って記録の順が入れ替わる
         with self._lock:
             stall, self._stall = self._stall, None
         if stall is not None:
             self._pending.append((stall, self._clock()))
-        self.flush()
+        self._stop.set()
+        thread.join(timeout=1.0)
+        with contextlib.suppress(ValueError):
+            gc.callbacks.remove(self._on_gc)
 
     @property
     def running(self) -> bool:

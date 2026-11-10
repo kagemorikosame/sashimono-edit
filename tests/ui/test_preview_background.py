@@ -732,19 +732,31 @@ class TestHoldWhileOperating:
         assert not widget.holding_prefetch
 
     def test_the_wait_starts_over_with_each_operation(
-        self, running: tuple[PreviewWidget, StubCache, StubBackground]
+        self,
+        running: tuple[PreviewWidget, StubCache, StubBackground],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """壊れると、操作を続けている最中に最初の操作から数えて先読みが動き出すか、
         手を止めても待ちが始まらず先読みが戻らない
         """
         widget, _, background = running
+        timer = widget._hold_timer
+        # 数え直しは、残りの時間を比べず、毎回の操作で掛け直したかで見る 残りの時間は
+        # CI が重いと読むのが遅れ、正しく掛け直していても比べ損なう
+        starts: list[None] = []
+        real_start = timer.start
+
+        def counted_start() -> None:
+            starts.append(None)
+            real_start()
+
+        monkeypatch.setattr(timer, "start", counted_start)
         widget.hold_prefetch()
-        assert widget._hold_timer.isActive()
-        assert widget._hold_timer.interval() == HOLD_AFTER_INPUT_MS
-        time.sleep(0.15)
-        before = widget._hold_timer.remainingTime()
+        assert timer.isActive()
+        assert timer.interval() == HOLD_AFTER_INPUT_MS
         widget.hold_prefetch()
-        assert widget._hold_timer.remainingTime() > before, "続けた操作で待ちが数え直されない"
+        assert len(starts) == 2, "続けた操作で待ちが数え直されない"
+        assert timer.isSingleShot() and timer.isActive()
         background.calls.clear()
         deadline = time.monotonic() + 5.0
         while widget.holding_prefetch and time.monotonic() < deadline:
