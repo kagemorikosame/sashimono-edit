@@ -111,14 +111,23 @@ void main() {
 
 
 #: 1 色で塗る 背景を敷くときに使う（色は事前乗算で渡す）
+#: ``u_cell`` が 0 より大きければ ``u_color`` と ``u_second`` の市松にする（プレビューの地 #456）
+#: 目は描く先の画素で数える 合成先の左下から数えるので、どのコマでも同じ所に目が来る
 _FILL_FRAGMENT_SHADER = """
 #version 430 core
 in vec2 v_uv;
 out vec4 frag_color;
 uniform vec4 u_color;
+uniform vec4 u_second;
+uniform int u_cell;
 
 void main() {
-    frag_color = u_color;
+    if (u_cell > 0) {
+        ivec2 cell = ivec2(floor(gl_FragCoord.xy / float(u_cell)));
+        frag_color = ((cell.x + cell.y) & 1) == 0 ? u_color : u_second;
+    } else {
+        frag_color = u_color;
+    }
 }
 """
 
@@ -531,6 +540,9 @@ class Compositor:
         self._extent_program: Program | None = None
         self._columns: Framebuffer | None = None
         self._rows: Framebuffer | None = None
+        #: :meth:`present` と :meth:`show` が画面の外の余白を塗る色（sRGB の 0..1 #456）
+        #: 書き出しは余白を作らないので、変えるのはプレビューだけ
+        self.margin: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @property
     def width(self) -> int:
@@ -571,12 +583,16 @@ class Compositor:
         self,
         color: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
         target: Framebuffer | None = None,
+        *,
+        second: tuple[float, float, float, float] | None = None,
+        cell: int = 0,
     ) -> None:
         """重ね終わった絵の下へ色を敷く 透明な所だけがその色になる（リニア値）
 
         合成は透明な下地の上で行い、最後に背景を敷く 不透明な黒の上で合成すると、
         乗算などが下に何も無い所でも黒と混ざり、YMM4 と見え方が変わる
         ``target`` を渡すと、キャンバスの代わりにそのバッファ（事前乗算アルファ）へ敷く
+        ``second`` と ``cell``（1 目の画素）を渡すと、``color`` との市松を敷く
         """
         (target or self._canvas).bind()
         GL.glEnable(GL.GL_BLEND)
@@ -586,10 +602,22 @@ class Compositor:
         self._fill_program.use()
         self._fill_program.set_vec4("u_rect", FULL_RECT)
         self._fill_program.set_bool("u_flip", False)
-        red, green, blue, alpha = self._canvas_color(color)
-        self._fill_program.set_vec4("u_color", (red * alpha, green * alpha, blue * alpha, alpha))
+        self._fill_program.set_vec4("u_color", self._premultiplied(color))
+        checker = second is not None and cell > 0
+        # 市松でないときも毎回 0 を入れ直す 前に市松を敷いたプログラムの値が残ると、
+        # 書き出しの黒まで市松になる
+        self._fill_program.set_vec4(
+            "u_second", self._premultiplied(second if second is not None else color)
+        )
+        self._fill_program.set_int("u_cell", cell if checker else 0)
         self._quad.draw()
         self._set_blend(BlendMode.NORMAL)
+
+    def _premultiplied(
+        self, color: tuple[float, float, float, float]
+    ) -> tuple[float, float, float, float]:
+        red, green, blue, alpha = self._canvas_color(color)
+        return (red * alpha, green * alpha, blue * alpha, alpha)
 
     def begin(self, background: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)) -> None:
         """合成を始める 背景色はリニア値で指定する"""
@@ -885,11 +913,14 @@ class Compositor:
         )
 
     def _clear_for(self, framebuffer: int, viewport: tuple[int, int, int, int]) -> None:
-        """出す先を黒で塗る 余白に前のコマが残らないようにする"""
+        """出す先を :attr:`margin` で塗る 余白に前のコマが残らないようにする
+
+        出す先は符号化済みの値を溜めるので、sRGB の値をそのまま入れる
+        """
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, framebuffer)
         GL.glViewport(*viewport)
         GL.glDisable(GL.GL_BLEND)
-        GL.glClearColor(0.0, 0.0, 0.0, 1.0)
+        GL.glClearColor(*self.margin, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
 
     def release(self) -> None:

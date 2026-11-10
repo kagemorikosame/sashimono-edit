@@ -107,6 +107,7 @@ from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
 from sashimono.engine.encoders import ENCODER_PRIORITIES, PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
+from sashimono.engine.render.backdrop import FILL_BLACK, FILL_MODES, MARGIN_GRAY, MARGIN_MODES
 from sashimono.engine.vision.parts import OCR_ENGINES, OCR_WINDOWS
 from sashimono.ui.library_thumbnails import THUMBNAIL_MODES, THUMBNAILS_FULL
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryOptions
@@ -520,6 +521,13 @@ class Preferences:
     #: 既定は入 数を打つより早く、枠が無いと絵がどこまであるのか分からない 枠が絵の
     #: 確認の邪魔になる人は切れるようにする
     preview_handles: bool = True
+    #: プレビューで、画面の中の何も描いていない所に敷く地（#456） 既定は黒（書き出しと同じ）
+    #: 黒い映像と見分けたい人は市松・暗い地・明るい地にする 書き出しとスナップショットは
+    #: どれを選んでも黒 既定を変えると今までの見え方と書き出しの見え方が食い違うので、黒のまま
+    preview_fill: str = FILL_BLACK
+    #: プレビューで、画面（作品の枠）の外の余白の塗り方（#456） 既定は暗い灰色
+    #: 黒だと黒い映像の端がどこか分からない 余白は書き出しに入らないので、変えても出力は同じ
+    preview_margin: str = MARGIN_GRAY
     #: キーフレームのある値をプレビューで動かしたとき 再生ヘッドの所へ点を打つ（既定
     #: 利用者の決定 その時刻の絵だけが変わる）か、全部の点を同じだけずらすか
     keyframe_drag: str = KEYFRAME_DRAG_AT_PLAYHEAD
@@ -1133,6 +1141,8 @@ class PreferenceStore:
             match_video=_choice(data.get("match_video"), MATCH_MODES, plain.match_video),
             dock_tabs=_choice(data.get("dock_tabs"), DOCK_TAB_POSITIONS, plain.dock_tabs),
             preview_handles=_flag(data.get("preview_handles"), plain.preview_handles),
+            preview_fill=_choice(data.get("preview_fill"), FILL_MODES, plain.preview_fill),
+            preview_margin=_choice(data.get("preview_margin"), MARGIN_MODES, plain.preview_margin),
             keyframe_drag=_choice(
                 data.get("keyframe_drag"), KEYFRAME_DRAG_MODES, plain.keyframe_drag
             ),
