@@ -314,6 +314,10 @@ class InspectorPanel(QWidget):
         #: スライダーを押している最中に更新が来た 構成が変わるなら作り直しを、変わらない
         #: なら押している欄への値の入れ直しを、離すまで待っている
         self._update_pending = False
+        #: 選び替えで外した、組んである欄（新しい順 #442 A） 同じ構成のクリップを選び直したら
+        #: 組み直さずにこれを出して向け直す 何も選ばない所を挟んだり、映像と文字を行き来
+        #: したりするたびに組み直すと、1 回 16〜23ms かかっていた
+        self._parked: list[_Parked] = []
 
         #: 何のクリップの設定を見ているか（種類・名前・トラック）
         self._title = ClipHeader(self)
@@ -472,7 +476,125 @@ class InspectorPanel(QWidget):
             # 同じ構成の欄がもう出ている（主が同じか、構成が同じクリップへの選び替え）
             self._retarget_others()
             return
+        # フォーカスのある欄は、取っておく前に覚える 取っておくと欄が隠れてフォーカスが外れ、
+        # 組み直しの側（:meth:`_rebuild`）では戻す先を見失う 打っている最中に AI が構成の
+        # 違うクリップを選ぶと、共通の欄（名前など）へ打ち続けられなくなる
+        place = self._focused_place()
+        if place is not None and primary is not None:
+            place = replace(place, key=self._carried_key(place.key, primary))
+        if primary is not None and self._unpark():
+            if place is not None:
+                self._restore_focus(place)
+            return
+        # 今の欄は捨てずに取っておく 空いた所を押して選びを外し、また同じ種類のクリップを
+        # 選ぶと、外したときと選んだときで 2 回組み直していた（#442 A）
+        self._park()
         self._rebuild()
+        if place is not None:
+            self._restore_focus(place)
+
+    def _park(self) -> None:
+        """出している欄を外して取っておく 代わりに空の中身を出す
+
+        取っておくのは :data:`PARKED_PANELS` 個まで 古い物から捨てる 組んだ欄は部品を
+        たくさん抱えるので、構成の数だけ溜めるとメモリと、隠れた部品の後片付けが増える
+        """
+        if self._shown_layout is None or self._built is None:
+            return
+        self._parked.insert(
+            0,
+            _Parked(
+                content=self._content,
+                body_layout=self._body_layout,
+                built=self._built,
+                layout=self._shown_layout,
+                editors=self._editors,
+                key_controls=self._key_controls,
+                virtual=self._virtual,
+                virtual_strokes=self._virtual_strokes,
+                focus_owners=self._focus_owners,
+                refreshers=self._refreshers,
+            ),
+        )
+        for dropped in self._parked[PARKED_PANELS:]:
+            dropped.content.setParent(None)
+            dropped.content.deleteLater()
+        del self._parked[PARKED_PANELS:]
+        # 新しい入れ物にする 取っておいた欄の表は、出し直すときにそのまま戻す
+        # （:meth:`_rebuild` は今の表を空にするので、同じ物を渡したままにすると消える）
+        self._editors = {}
+        self._key_controls = {}
+        self._virtual = {}
+        self._virtual_strokes = {}
+        self._focus_owners = {}
+        self._refreshers = []
+        empty, layout = _new_content()
+        layout.addStretch(1)
+        self._swap_content(empty, layout, keep_old=True)
+        self._built = None
+        self._shown_layout = None
+
+    def _unpark(self) -> bool:
+        """取っておいた欄のうち、今の主のクリップと同じ構成の物があれば出す 出したら真
+
+        構成は、取っておいた欄を組んだクリップを元にした入れ替え（:attr:`_swap`）を当てて
+        比べる 欄を向け直すとき（:meth:`_retarget_others`）と同じ比べ方
+        """
+        current = self._built
+        found: _Parked | None = None
+        for entry in self._parked:
+            self._built = entry.built
+            self._point_at_current()
+            if self._layout_key() == entry.layout:
+                found = entry
+                break
+        self._built = current
+        self._point_at_current()
+        if found is None:
+            return False
+        self._parked.remove(found)
+        self._park()
+        self._swap_content(found.content, found.body_layout, keep_old=False)
+        self._editors = found.editors
+        self._key_controls = found.key_controls
+        self._virtual = found.virtual
+        self._virtual_strokes = found.virtual_strokes
+        self._focus_owners = found.focus_owners
+        self._refreshers = found.refreshers
+        self._built = found.built
+        self._point_at_current()
+        self._shown_layout = found.layout
+        self._shown_selection = self._selection_key()
+        # 前に出していたときの打ち続けは区切る 続けると、1 回の取り消しで別のクリップの
+        # 編集まで戻る（:meth:`_retarget_others` と同じ）
+        for owner in self._focus_owners.values():
+            if isinstance(owner, TextEditor):
+                owner.forget_typing()
+        self._add_button.setEnabled(True)
+        self._preset_button.setEnabled(True)
+        # 値は全部入れ直す 取っておいた間に別のクリップの値のまま残っている
+        self._refresh_values()
+        self._fit_width()
+        return True
+
+    def _swap_content(self, content: QWidget, layout: QVBoxLayout, *, keep_old: bool) -> None:
+        """台の中身を ``content`` に替える ``keep_old`` なら前の中身を隠して取っておく
+
+        替える間は描き直しを止める（#442 A の 3） 止めないと、外した直後の空の台と、
+        入れた直後の幅の合わない中身が 1 度ずつ描かれる
+        """
+        old = self._content
+        self._body.setUpdatesEnabled(False)
+        try:
+            self._holder.replaceWidget(old, content)
+            self._content, self._body_layout = content, layout
+            content.show()
+            old.hide()
+            if not keep_old:
+                old.setParent(None)
+                old.deleteLater()
+        finally:
+            self._body.setUpdatesEnabled(True)
 
     def _commit_typing(self) -> None:
         """打ちかけて確定していない欄（数の欄・ファイルの欄）を、今の選びのうちに確定する
@@ -728,15 +850,20 @@ class InspectorPanel(QWidget):
         self._shown_values = self._values_key()
         # 台は入れ替えず中身だけを入れ替える 台ごと入れ替えると送りの位置が頭へ戻り、
         # 下の方のエフェクトを足した・触ったときに触っていた所が見えなくなる
-        self._holder.replaceWidget(old, self._content)
-        # すぐに出す 待つと、出す前の（隠れた）欄では中身の幅が測れない
-        self._content.show()
-        # すぐには消さない 欄の知らせ（選び替えなど）の途中から作り直しに来ることがあり、
-        # 知らせを出している部品をその場で消すと、戻った先で消えた部品を触って落ちる
-        # 台から外しておく 残すと、消えるまでの間は古い欄も台の子として探される
-        old.hide()
-        old.setParent(None)
-        old.deleteLater()
+        # 替える間は描き直しを止める（#442 A の 3）
+        self._body.setUpdatesEnabled(False)
+        try:
+            self._holder.replaceWidget(old, self._content)
+            # すぐに出す 待つと、出す前の（隠れた）欄では中身の幅が測れない
+            self._content.show()
+            # すぐには消さない 欄の知らせ（選び替えなど）の途中から作り直しに来ることがあり、
+            # 知らせを出している部品をその場で消すと、戻った先で消えた部品を触って落ちる
+            # 台から外しておく 残すと、消えるまでの間は古い欄も台の子として探される
+            old.hide()
+            old.setParent(None)
+            old.deleteLater()
+        finally:
+            self._body.setUpdatesEnabled(True)
         # 中身の幅は画面に出して見た目が当たってから測る 出す前は字の大きさが違う
         self._fit_width()
         if focus is not None:
@@ -773,6 +900,35 @@ class InspectorPanel(QWidget):
             )
         return None
 
+    def _carried_key(self, key: tuple[str, str], primary: ClipId) -> tuple[str, str]:
+        """選び替えた先のクリップで、同じ働きのエフェクトの欄の鍵
+
+        エフェクトの数が違うクリップへ選び替えると、入れ替えの組（:class:`IdSwap`）が
+        作れず、鍵は欄を組んだクリップのエフェクトの ID のまま残る 種類と、同じ種類の中の
+        何番目かで選び替えた先のエフェクトへ対応付ける そうしないと、エフェクトの文字の欄へ
+        打っている最中に別のクリップが選ばれたとき、同じ種類の欄があってもフォーカスを見失う
+        """
+        owner, name = key
+        real = self._real_project
+        built = self._built
+        located = real.timeline.locate_clip(primary) if real is not None else None
+        if built is None or located is None:
+            return key
+        after = located[1]
+        for mine, theirs in (
+            (built.effects, after.effects),
+            (built.after_effects, after.after_effects),
+        ):
+            if any(effect.id == owner for effect in theirs):
+                return key
+            found = next((effect for effect in mine if effect.id == owner), None)
+            if found is None:
+                continue
+            nth = [effect.id for effect in mine if effect.kind == found.kind].index(found.id)
+            same = [effect.id for effect in theirs if effect.kind == found.kind]
+            return (str(same[nth]), name) if nth < len(same) else key
+        return key
+
     def _real_key(self, key: tuple[str, str]) -> tuple[str, str]:
         """欄の鍵（:func:`_editor_key`）の持ち主を、今のクリップの ID へ戻す"""
         owner, name = key
@@ -782,7 +938,10 @@ class InspectorPanel(QWidget):
 
     def _restore_focus(self, place: _FocusPlace) -> None:
         """作り直した後、同じ値の欄の同じ部品へフォーカスを戻す 欄が消えていれば戻さない"""
-        owner = self._focus_owners.get(place.key)
+        # 覚えた鍵は本当の ID 取っておいた欄を出し直したときは、欄が組んだクリップの ID で
+        # 引くので、入れ替えの組で戻す（組は両向きなので同じ :meth:`_real_key` で戻る）
+        # 戻さないと、エフェクトの文字の欄へ打っていたときにフォーカスを見失う
+        owner = self._focus_owners.get(self._real_key(place.key))
         if owner is None:
             return
         target: QWidget | None = owner
@@ -2319,6 +2478,29 @@ def _fraction(value: ParamValue, scale: int) -> Fraction:
     """
     number = value.static if isinstance(value, AnimatedValue) else 0.0
     return Fraction(number).limit_denominator(1_000_000) / scale
+
+
+#: 選び替えで外した欄を、いくつまで取っておくか（#442 A の 2） 映像・文字・音のように
+#: よく行き来する構成が 3 つほど入る数 増やすと隠れた部品が増え、窓を閉じるまで残る
+PARKED_PANELS = 3
+
+
+@dataclass(slots=True)
+class _Parked:
+    """選び替えで外して取っておいた欄 出し直すときに表ごと戻す"""
+
+    content: QWidget
+    body_layout: QVBoxLayout
+    #: 欄を組んだクリップ 出し直すときの入れ替え（:attr:`InspectorPanel._swap`）の元
+    built: Clip
+    #: 組んだときの構成の指紋（:meth:`InspectorPanel._layout_key`）
+    layout: object
+    editors: dict[tuple[str, str], ParameterEditor]
+    key_controls: dict[tuple[str, str], KeyframeControls]
+    virtual: dict[EffectId, tuple[ClipId, Effect]]
+    virtual_strokes: dict[StrokeId, ClipId]
+    focus_owners: dict[tuple[str, str], QWidget]
+    refreshers: list[Callable[[Clip], None]]
 
 
 def _new_content() -> tuple[QWidget, QVBoxLayout]:

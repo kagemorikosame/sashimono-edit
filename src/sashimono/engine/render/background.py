@@ -52,6 +52,7 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal
 
 from sashimono.core.model import MediaId, Project
 from sashimono.engine.gpu import OffscreenGLContext
+from sashimono.engine.render.backdrop import BLACK, Backdrop
 from sashimono.engine.render.invalidate import Invalidation
 from sashimono.engine.render.prefetch import CacheSurface, PreviewCache
 from sashimono.engine.render.renderer import FrameRenderer, RenderQuality
@@ -136,6 +137,7 @@ class BackgroundPrefetch(QObject):
         decode_threads: int,
         budget_bytes: int,
         playhead: int,
+        backdrop: Backdrop = BLACK,
     ) -> None:
         super().__init__()
         self._shelf = _Shelf()
@@ -155,6 +157,7 @@ class BackgroundPrefetch(QObject):
                 decode_threads=decode_threads,
                 budget_bytes=budget_bytes,
                 playhead=playhead,
+                backdrop=backdrop,
                 failed=lambda reason: self.failed.emit(self, reason),
                 ended=lambda reason: self.ended.emit(self, reason),
             )
@@ -204,6 +207,14 @@ class BackgroundPrefetch(QObject):
 
     def set_budget(self, budget_bytes: int, playhead: int) -> None:
         self._send("budget", budget_bytes, playhead)
+
+    def set_backdrop(self, backdrop: Backdrop) -> None:
+        """何も描いていない所に敷く地を変える（#456）
+
+        貯めた絵には地が焼き込まれているので、全部をその場で出さなくする
+        外さないと、走り係が描き直すまでの間、前の地の絵が出る
+        """
+        self._send("backdrop", backdrop, invalidation=Invalidation.all())
 
     def set_decode_threads(self, threads: int) -> None:
         self._send("threads", threads)
@@ -304,6 +315,7 @@ class _Worker(QThread):
         decode_threads: int,
         budget_bytes: int,
         playhead: int,
+        backdrop: Backdrop,
         failed: Callable[[str], None],
         ended: Callable[[str], None],
     ) -> None:
@@ -317,6 +329,7 @@ class _Worker(QThread):
         self._decode_threads = decode_threads
         self._budget = budget_bytes
         self._playhead = playhead
+        self._backdrop = backdrop
         self._failed = failed
         self._ended = ended
         #: いま描いている頼みの代 一覧の代と同じときだけ載せる
@@ -343,7 +356,12 @@ class _Worker(QThread):
                 proxies=self._proxies,
                 decode_threads=self._decode_threads,
             )
-            cache = PreviewCache(renderer, budget_bytes=self._budget, forget=self._unpublish)
+            cache = PreviewCache(
+                renderer,
+                budget_bytes=self._budget,
+                forget=self._unpublish,
+                backdrop=self._backdrop,
+            )
             self._loop(renderer, cache)
         except BaseException as exc:
             # **黙って消えない** 走り係が消えたのに気付かないと、先読みが
@@ -463,6 +481,10 @@ class _Worker(QThread):
             budget, playhead = args
             assert isinstance(budget, int) and isinstance(playhead, int)
             cache.set_budget(budget, playhead)
+        elif name == "backdrop":
+            (backdrop,) = args
+            assert isinstance(backdrop, Backdrop)
+            cache.set_backdrop(backdrop)
         elif name == "threads":
             (threads,) = args
             assert isinstance(threads, int)
