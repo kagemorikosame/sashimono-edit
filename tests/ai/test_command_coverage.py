@@ -422,6 +422,13 @@ def _open_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return _saved_host(material), "open_project", {"path": "第二稿.sme"}
 
 
+def _open_package(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    """持ち出し用パッケージを開く（#423） 偽のホストは展開しないので中身は空でよい"""
+    host = _saved_host(material)
+    (material.tmp_path / "持ち出し.smex").write_bytes(b"")
+    return host, "open_package", {"path": "持ち出し.smex"}
+
+
 def _new_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return _saved_host(material), "new_project", {"width": 1280, "height": 720}
 
@@ -503,6 +510,7 @@ EXAMPLES: dict[str, Example] = {
     "clear_keyframes": _with_keyframes("clear_keyframes"),
     "split_subtitle": _split_subtitle,
     "open_project": _open_project,
+    "open_package": _open_package,
     "new_project": _new_project,
     "add_custom_object": _custom_object,
     "align_clip": _align,

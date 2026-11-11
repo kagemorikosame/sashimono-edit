@@ -563,6 +563,9 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 開く・新規（#349） 試験の作品は変えてあるので、どちらも保存していない変更で断る
     "open_project": lambda _ids: {"path": "第二稿.sme"},
     "new_project": lambda _ids: {"width": 1280, "height": 720},
+    # 持ち出し用パッケージ（#423） 書き出しは作品のフォルダへ頼み、開くは保存していない変更で断る
+    "export_package": lambda _ids: {"path": "持ち出し.smex"},
+    "open_package": lambda _ids: {"path": "持ち出し.smex"},
     # 作品の設定・置き方の方式・置く・揃える（#349） 無いカスタムオブジェクトは置き場の名前を
     # 並べて断る 揃える枠は偽のホストに無いので断る
     "switch_layer_mode": lambda _ids: {"convert": True},

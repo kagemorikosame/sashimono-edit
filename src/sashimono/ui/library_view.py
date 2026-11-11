@@ -16,6 +16,7 @@ from PySide6.QtCore import QCoreApplication, QPoint, QRect, QSize
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QListView
 
+from sashimono.engine.render.backdrop import CHECKER_COLORS, DARK_COLOR, LIGHT_COLOR
 from sashimono.ui.library_thumbnails import THUMBNAIL_SIZE, THUMBNAILS_FULL, LookThumbnails
 
 __all__ = [
@@ -46,9 +47,11 @@ BACKDROP_MODES = (BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT)
 
 #: 地の色 画面のテーマでは変えない 見本は映像の上に重ねる物の絵で、地は映像の代わり
 #: テーマに合わせると、明るいテーマで白い字幕のプリセットが見えなくなる
-_DARK = QColor("#202020")
-_LIGHT = QColor("#f2f2f2")
-_CHECKER = (QColor("#9a9a9a"), QColor("#6e6e6e"))
+#: 値はプレビューの地（#456 ``engine/render/backdrop.py``）と同じ物を使う 同じ「市松」を
+#: 選んで所によって色が違うと、同じ設定に見えない
+_DARK = QColor(DARK_COLOR)
+_LIGHT = QColor(LIGHT_COLOR)
+_CHECKER = (QColor(CHECKER_COLORS[0]), QColor(CHECKER_COLORS[1]))
 #: 読めなかった配布物の印の色 暗い地の上で目立つ赤
 _FAILED = QColor("#e05a5a")
 #: 市松の 1 目の大きさ（置いておく絵の画素）

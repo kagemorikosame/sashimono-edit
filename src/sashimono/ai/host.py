@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
@@ -47,6 +48,7 @@ __all__ = [
     "CompatReport",
     "EditorHost",
     "ExportRequest",
+    "PackageRequest",
     "SheetCanvas",
     "ToolError",
     "ViewState",
@@ -85,6 +87,22 @@ class ExportRequest:
     #: 置いた素材に合わせた値を、書き出すスレッドで求めるか（#414） 素材のファイルの大きさを
     #: 読むので、許す前の画面のスレッドで求めると、応えないネットワークの共有で画面が固まる
     match_bitrate: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PackageRequest:
+    """AI が頼んだ持ち出し用パッケージの書き出し（#423） 選べる物は画面の窓と同じ"""
+
+    #: 確かめ済みの書き出し先（リンクを辿った後の場所）
+    path: Path
+    #: 素材をまるごと入れる（偽なら使っている範囲だけ）
+    whole: bool
+    #: 使う範囲の前後に足す余裕（秒）
+    margin: Fraction
+    #: 撮った場所などの付け足しの情報を残す
+    keep_metadata: bool
+    #: 許したときの書き出し先の身元（:attr:`ExportRequest.expect` と同じ）
+    expect: Expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -767,6 +785,30 @@ class EditorHost(Protocol):
 
     def cancel_export(self) -> bool:
         """走っている書き出しを止める 止めるよう頼めたら真"""
+        ...
+
+    def start_package_export(self, request: PackageRequest) -> None:
+        """持ち出し用パッケージ（#423）の書き出しを裏で始める 画面の〔持ち出し用に書き出す…〕と
+        同じ処理を通す すぐ戻る 様子は :meth:`package_status` すでに走っていれば :class:`ToolError`
+        """
+        ...
+
+    def start_package_open(self, path: Path) -> None:
+        """持ち出し用パッケージを展開し、終わったら作品へ差し替える（画面の〔持ち出し用パッケージを
+        開く…〕と同じ） すぐ戻る 保存していない変更があれば :data:`UNSAVED_REFUSAL` で断る
+        """
+        ...
+
+    def package_status(self) -> dict[str, object]:
+        """パッケージの書き出しか展開の様子 ``state`` は ``idle``・``working``・``done``・
+        ``failed``・``cancelled`` のどれか ``message`` に入れなかった物・足りない物の一覧が入る
+        """
+        ...
+
+    def package_waiter(self) -> Callable[[float], bool]:
+        """パッケージの書き出しか展開が終わるまで、最長で引数の秒だけ待つ関数
+        （:meth:`export_waiter` と同じく AI のスレッドから呼ばれる）
+        """
         ...
 
     def remembered_names(self) -> tuple[str, ...]:

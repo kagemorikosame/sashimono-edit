@@ -37,6 +37,15 @@ from sashimono.engine.render import (
     changed_spans,
     image_spans,
 )
+from sashimono.engine.render.backdrop import (
+    BLACK,
+    MARGIN_BLACK,
+    MARGIN_GRAY,
+    MARGIN_GRAY_COLOR,
+    MARGIN_THEME,
+    Backdrop,
+    hex_rgb,
+)
 from sashimono.engine.render.background import BackgroundPrefetch
 from sashimono.engine.render.groups import grouped
 from sashimono.engine.render.outline import (
@@ -75,8 +84,17 @@ from sashimono.ui.region_handles import (
     region_hit_test,
     region_turn,
 )
+from sashimono.ui.theme import Colors, theme_signals
 
-__all__ = ["GRIP_SIZE", "KNOB_LENGTH", "ROTATE_REACH", "SLOW_FRAME_MS", "PreviewWidget"]
+__all__ = [
+    "BACKDROP_NOTE",
+    "GRIP_SIZE",
+    "HOLD_AFTER_INPUT_MS",
+    "KNOB_LENGTH",
+    "ROTATE_REACH",
+    "SLOW_FRAME_MS",
+    "PreviewWidget",
+]
 
 #: 角の掴み所の大きさ（画面の画素） 掴める半径もこれ 合成の画素で数えると、
 #: プレビューを小さくしたときに掴めなくなる
@@ -153,6 +171,13 @@ SLOW_FRAME_MS = 200.0
 #: 戻ってくるまでの間には気付ける
 IMAGE_WATCH_MS = 1000
 
+#: 何も描いていない所の地を黒以外にしたとき、プレビューの隅に出す印（#456）
+BACKDROP_NOTE = "何も無い所は書き出しでは黒"
+#: 操作が止まってから先読みへ戻るまでの長さ（ミリ秒 #442 C） クリックを続けて押す間や、
+#: ドラッグの途中で手が少し止まる間に貯め始めないように、人の操作の間より少し長くする
+#: 長すぎると、手を離してから先読みが効き始めるまでが遅れる
+HOLD_AFTER_INPUT_MS = 300
+
 
 class PreviewWidget(QOpenGLWidget):
     """タイムラインの指定フレームを映す"""
@@ -201,6 +226,15 @@ class PreviewWidget(QOpenGLWidget):
         #: 再生中は先読みを止める 出す側と同じ GPU を奪い合って、
         #: いま出すべきコマが遅れる
         self._playing = False
+        #: 操作している間は先読みを止めるか（設定 #442 C）
+        self._yield_to_input = True
+        #: 操作が続いている間 立っている間は先読みを止めておく
+        self._holding = False
+        #: 最後の操作から :data:`HOLD_AFTER_INPUT_MS` 何も来なければ先読みへ戻す
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.setInterval(HOLD_AFTER_INPUT_MS)
+        self._hold_timer.timeout.connect(self._release_hold)
         self._image_watch = QTimer(self)
         self._image_watch.setInterval(IMAGE_WATCH_MS)
         self._image_watch.timeout.connect(self.check_images)
@@ -237,6 +271,12 @@ class PreviewWidget(QOpenGLWidget):
         self._snap_distance = 8
         #: 吸い付いた所に引く線 動かしている間だけ出す
         self._guides: list[Guide] = []
+        #: 画面の中で何も描いていない所に敷く地（設定 #456） 書き出しには渡さない
+        self._backdrop = BLACK
+        #: 画面の外の余白の塗り方（設定 #456 ``MARGIN_MODES`` のどれか）
+        self._margin = MARGIN_GRAY
+        # テーマに合わせた余白は描くたびに色を読むので、切り替えたら描き直すだけでよい
+        theme_signals().changed.connect(self._theme_changed)
         # 押していない間も矢印の形を変えるため 掴める所が見えるように
         self.setMouseTracking(True)
         # 押してもフォーカスを取らない 取ると、プレビューで選んだ後のコマ送りや削除の
@@ -341,6 +381,45 @@ class PreviewWidget(QOpenGLWidget):
             self._background.set_quality(quality)
         self.update()
         self._restart_prefetch()
+
+    def set_backdrop(self, backdrop: Backdrop, margin: str) -> None:
+        """何も描いていない所の地と、画面の外の余白の塗り方を変える（設定 #456）
+
+        地は貯めた絵に焼き込まれているので、変わったら貯めを捨てる 余白は出すたびに
+        塗るので、描き直すだけで済む
+        """
+        changed = backdrop != self._backdrop
+        self._backdrop = backdrop
+        self._margin = margin
+        if changed:
+            # 貯めの置き場は GL を触らずに捨てる（:meth:`PreviewCache.set_backdrop`）
+            if self._cache is not None:
+                self._cache.set_backdrop(backdrop)
+            if self._background is not None:
+                self._background.set_backdrop(backdrop)
+            self._restart_prefetch()
+        self.update()
+
+    @property
+    def backdrop(self) -> Backdrop:
+        return self._backdrop
+
+    @property
+    def margin(self) -> str:
+        return self._margin
+
+    def margin_color(self) -> tuple[float, float, float]:
+        """いまの余白の色（sRGB の 0..1） テーマに合わせるときは描くたびに読む"""
+        if self._margin == MARGIN_BLACK:
+            return (0.0, 0.0, 0.0)
+        if self._margin == MARGIN_THEME:
+            color = Colors.VIEWER_BACKGROUND
+            return (color.redF(), color.greenF(), color.blueF())
+        return hex_rgb(MARGIN_GRAY_COLOR)
+
+    def _theme_changed(self) -> None:
+        if self._margin == MARGIN_THEME:
+            self.update()
 
     def refresh_all(self) -> None:
         """取ってある絵を全部捨てて描き直す 絵の出方を変える設定を切り替えたとき
@@ -518,7 +597,9 @@ class PreviewWidget(QOpenGLWidget):
             proxies=self._proxies,
             decode_threads=self._decode_threads,
         )
-        self._cache = PreviewCache(self._renderer, budget_bytes=self._prefetch_bytes)
+        self._cache = PreviewCache(
+            self._renderer, budget_bytes=self._prefetch_bytes, backdrop=self._backdrop
+        )
         self._image_watch.start()
         self.ready.emit()
         self._restart_prefetch()
@@ -537,11 +618,14 @@ class PreviewWidget(QOpenGLWidget):
         # 道ごとに描くと、先読みが当たったコマだけ枠が消える
         self._paint_overlay()
         self._paint_region()
+        self._paint_backdrop_note()
 
     def _paint_picture(self, width: int, height: int) -> None:
         """絵を出す **コンテキストが current な所（paintGL）で呼ぶこと**"""
         assert self._renderer is not None
         target = self.defaultFramebufferObject()
+        # 余白は出すたびに塗る 走り係の絵も貯めた絵も、出すのはこの合成器
+        self._renderer.compositor.margin = self.margin_color()
         if self._background is not None:
             # 走り係の絵を出すだけ 外れたらこちらで描くが、取ってはおかない
             # 取っておくと画面の側にも描画先を持つことになり、同じメモリで
@@ -554,7 +638,7 @@ class PreviewWidget(QOpenGLWidget):
             # 走り係も描くと、GIL と GPU を取り合って両方が遅くなり、再生ヘッドを
             # 送り続ける間は走り係がいつまでも追い付けない
             self._background.set_playhead(self._frame + 1)
-            self._renderer.compose(self._frame)
+            self._renderer.compose(self._frame, backdrop=self._backdrop)
             self._renderer.compositor.present(target, (0, 0, width, height))
             if self._prime_after_paint:
                 self._prime_after_paint = False
@@ -563,8 +647,38 @@ class PreviewWidget(QOpenGLWidget):
         if self._cache is not None and self._cache.enabled:
             self._cache.draw(self._frame, target, (0, 0, width, height))
             return
-        self._renderer.compose(self._frame)
+        self._renderer.compose(self._frame, backdrop=self._backdrop)
         self._renderer.compositor.present(target, (0, 0, width, height))
+
+    def _paint_backdrop_note(self) -> None:
+        """地が黒でないとき、書き出しでは黒になることを隅に出す（再生中は描かない）
+
+        プレビューだけ地を変えるので、市松に見えた所が書き出しでは黒になる
+        印が無いと、透けたまま書き出せると思い込む
+        """
+        if self._backdrop.black or self._playing:
+            return
+        painter = QPainter(self)
+        try:
+            font = painter.font()
+            font.setPointSizeF(max(7.0, font.pointSizeF() * 0.85))
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            text = BACKDROP_NOTE
+            padding = 4
+            box = QRectF(
+                6.0,
+                self.height() - metrics.height() - padding * 2 - 6.0,
+                metrics.horizontalAdvance(text) + padding * 2,
+                metrics.height() + padding * 2,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.drawRoundedRect(box, 3.0, 3.0)
+            painter.setPen(QColor(235, 235, 235))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        finally:
+            painter.end()
 
     # --- 外枠と直接の操作 ---
 
@@ -1241,16 +1355,53 @@ class PreviewWidget(QOpenGLWidget):
         if self._cache is not None:
             self._cache.invalidate(invalidation)
 
+    def set_prefetch_yield(self, enabled: bool) -> None:
+        """操作している間は先読みを止めるか（設定 #442 C） 切ったらすぐ止めるのをやめる"""
+        self._yield_to_input = enabled
+        if not enabled and self._holding:
+            self._hold_timer.stop()
+            self._release_hold()
+
+    def hold_prefetch(self) -> None:
+        """操作が来た 手が止まるまで先読みを止める
+
+        先読みの走り係は別のスレッドでも Python を動かすので、Python の切り替え（既定 5ms）の
+        たびに画面のスレッドが待たされる 選ぶ・動かす最中は貯めず、手が止まってから貯める
+        描いている最中の 1 コマは描き終えるまで止まらない（合成は途中で抜けられない）
+        """
+        if not self._yield_to_input:
+            return
+        self._hold_timer.start()
+        if self._holding:
+            return
+        self._holding = True
+        self._idle.stop()
+        if self._background is not None:
+            self._background.set_paused(True)
+
+    @property
+    def holding_prefetch(self) -> bool:
+        """操作のために先読みを止めている最中か"""
+        return self._holding
+
+    def _release_hold(self) -> None:
+        self._holding = False
+        self._restart_prefetch()
+
     def _restart_prefetch(self) -> None:
         """先読みを動かし直す 何か変わるたびに呼ぶ
 
         止まったままにしない 再生ヘッドが動けば、次に貯める先も変わっている
+        操作の最中（:meth:`hold_prefetch`）は止めたまま、貯める先だけ渡しておく
         """
         if self._background is not None:
             # 走り係は自分で回る 再生ヘッドと、再生中かどうかを渡すだけ
             self._idle.stop()
-            self._background.set_paused(self._playing)
+            self._background.set_paused(self._playing or self._holding)
             self._background.set_playhead(self._frame)
+            return
+        if self._holding:
+            self._idle.stop()
             return
         if self._playing:
             self._idle.stop()
@@ -1303,6 +1454,7 @@ class PreviewWidget(QOpenGLWidget):
                 decode_threads=self._decode_threads,
                 budget_bytes=self._prefetch_bytes,
                 playhead=self._frame,
+                backdrop=self._backdrop,
             )
         except Exception as exc:
             # 共有したコンテキストを作れないドライバや、GL の版が足りない環境がある
@@ -1350,9 +1502,9 @@ class PreviewWidget(QOpenGLWidget):
         描けなくなったら止める 止めないと、貯まりきった後も空き時間の
         たびに「次はどれか」を数え続ける
         """
-        if self._playing or self._cache is None:
+        if self._playing or self._holding or self._cache is None:
             # タイマーを止めても、すでに積まれた合図は届く 再生が始まった後に
-            # 1 コマ描くと、出す側と GL を奪い合う
+            # 1 コマ描くと、出す側と GL を奪い合う 操作の最中も描かない
             self._idle.stop()
             return
         if self._background is not None:
