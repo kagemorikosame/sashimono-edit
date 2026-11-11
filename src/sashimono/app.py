@@ -124,6 +124,13 @@ def refuse_script(script: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 別のプロセスの子（控えの作成など #440）として起こされたときは、ここで子の役をして終わる
+    # 何より先に行う 配布版は子も同じ exe で、下の引数の読み分けや編集画面の起動に進むと、
+    # 子のつもりの exe が窓をもう 1 つ出す 開発の環境では Python が子を起こすので何もしない
+    if argv is None:
+        import multiprocessing
+
+        multiprocessing.freeze_support()
     arguments = sys.argv if argv is None else argv
 
     # 配布版は自分自身が pip の代わりになる 導入ボタンと --add-on-check はもう子を起こさず

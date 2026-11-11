@@ -197,7 +197,9 @@ class TestProxyRequestWhileCancelling:
             builder.forget(video_media.id)
             builder.request(video_media)
             gate.set()
-            assert _wait_for(lambda: len(calls) >= 2 and not builder._running)
+            # 作り直しは取り掛かる前に取り消しを見るので、作る手を呼ぶ所まで行かない
+            assert _wait_for(lambda: not builder._running)
+            assert len(calls) == 1, "外した素材の作り直しを始めた"
             assert builder.store.find(video_media) is None
         finally:
             gate.set()

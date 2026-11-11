@@ -216,3 +216,74 @@ def test_another_work_opened_while_unpacking_stays_open(
     _wait_package(window)
     assert window.project_path == other
     assert "別の作品を開いた" in str(window.package_status()["message"])
+
+
+def test_a_file_that_appears_while_writing_is_not_replaced(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """無かった書き出し先へ書いている数分の間に別のアプリが同じ名前を置くと、許していない物を潰す"""
+    target = tmp_path / f"人の持ち出し{PACKAGE_SUFFIX}"
+    real = vars(main_window_module)["write_package"]
+
+    def appears(*args: object, **kwargs: object) -> object:
+        target.write_bytes("別のアプリ".encode())
+        return real(*args, **kwargs)
+
+    def accept(dialog: PackageExportDialog) -> int:
+        dialog._path.setText(str(tmp_path / "人の持ち出し"))
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "write_package", appears)
+    monkeypatch.setattr(PackageExportDialog, "exec", accept)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
+    monkeypatch.setattr(window, "_remember_preferences", lambda _chosen: None)
+    window.export_package()
+    _wait_package(window)
+    assert window.package_status()["state"] == "failed"
+    assert target.read_bytes() == "別のアプリ".encode()
+
+
+@WINDOWS_WRITES
+def test_a_package_swapped_after_choosing_is_not_unpacked(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """選んでから裏で開くまでに差し替えられると、人が選んでいない物を展開する"""
+    call_tool(
+        window, "export_package", {"path": f"持ち出し{PACKAGE_SUFFIX}"}, allow_irreversible=True
+    )
+    _wait_package(window)
+    package = window.project_path.parent / f"持ち出し{PACKAGE_SUFFIX}"  # type: ignore[union-attr]
+    release = _held_open(monkeypatch)
+    before = window.project_path
+    call_tool(window, "open_package", {"path": package.name}, allow_irreversible=True)
+    with package.open("ab") as handle:
+        handle.write(b"\0")
+    release.set()
+    _wait_package(window)
+    status = window.package_status()
+    assert status["state"] == "failed", status
+    assert "選んだ後に変わった" in str(status["message"])
+    assert window.project_path == before
+
+
+def test_names_in_the_export_notice_are_hidden_from_the_assistant(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """知らせに並ぶスクリプトとファイルの名前は作品の外の名前 様子で AI へ渡るので伏せ字に入れる"""
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+    result = PackResult(
+        path=tmp_path / f"p{PACKAGE_SUFFIX}",
+        size=0,
+        media_count=0,
+        file_count=0,
+        fonts=(),
+        scripts=("秘密の人/効果.anm",),
+        metadata_kept=("秘密の声.wav",),
+        whole_instead=(),
+        missing_files=("秘密の絵.png",),
+        unused_media=("秘密の素材.mp4",),
+    )
+    window._package_ended("export", result)
+    names = window.remembered_names()
+    for name in ("秘密の人/効果.anm", "秘密の声.wav", "秘密の絵.png", "秘密の素材.mp4"):
+        assert name in names

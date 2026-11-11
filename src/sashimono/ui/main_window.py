@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import gc
 import math
 import os
 import platform
@@ -23,7 +24,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice, QPoint, QSize, Qt, QTimer, QUrl, Signal, qVersion
+from PySide6.QtCore import (
+    QBuffer,
+    QEvent,
+    QIODevice,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+    qVersion,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -31,6 +44,7 @@ from PySide6.QtGui import (
     QImage,
     QImageWriter,
     QKeySequence,
+    QMouseEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -131,7 +145,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
-from sashimono.core.io.atomic import Expected, write_atomic_bytes
+from sashimono.core.io.atomic import Expected, expect_now, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
@@ -188,7 +202,7 @@ from sashimono.engine.cache import (
     ScreenState,
     scenes_from,
 )
-from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore
+from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore, proxy_order, used_media
 from sashimono.engine.cache.scene_notes import SceneNoteStore
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
@@ -219,8 +233,12 @@ from sashimono.engine.reframe import (
 )
 from sashimono.engine.relink_check import plan_relink
 from sashimono.engine.render import FrameRenderer, RenderQuality
+from sashimono.engine.render.backdrop import fill_backdrop
 from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
+from sashimono.engine.worker import stop_all as stop_workers
 from sashimono.links import MANUAL_URL, REPORT_URL
+from sashimono.stall_watch import DEFAULT_THRESHOLD_MS as DEFAULT_STALL_THRESHOLD_MS
+from sashimono.stall_watch import threshold_from_env
 from sashimono.ui import hdr_notice, media_match
 from sashimono.ui.ai_export import AssistantExport
 from sashimono.ui.ai_sheet import AiSheet
@@ -265,6 +283,7 @@ from sashimono.ui.progress_display import (
 from sashimono.ui.reframe_dialog import ask_reframe
 from sashimono.ui.scene_bar import SceneBar
 from sashimono.ui.seam_dialogs import ask_seams, ask_speed
+from sashimono.ui.stall_monitor import StallMonitor
 from sashimono.ui.subtitle import SubtitlePanel
 from sashimono.ui.system_clipboard import copy_text as copy_text_to_clipboard
 from sashimono.ui.text_keys import install_text_field_keys
@@ -277,6 +296,7 @@ from sashimono.ui.transport import TransportBar
 from sashimono.ui.updates import UpdateController
 from sashimono.ui.workspace import (
     LAYOUT_VERSION,
+    PROXY_UNUSED_ON_USE,
     SCENES_ALWAYS,
     SCENES_WITH_AI,
     SCREEN_ON_IMPORT,
@@ -285,6 +305,7 @@ from sashimono.ui.workspace import (
     ShortcutStore,
     Workspace,
     apply_dock_tabs,
+    apply_switch_interval,
 )
 
 if TYPE_CHECKING:
@@ -303,6 +324,11 @@ ANALYSIS_REFRESH_MS = 250
 #: 最大 250ms 待たされる 前は 55ms ほどで置かれていたので、遅く感じる
 #: 走っている間しか回さないので、短くしても手の空いた時の重さは変わらない
 IMPORT_POLL_MS = 30
+
+#: 控えを作る順（#441）を求め直す最短の間隔（秒） 再生位置が動くたびに求めると、
+#: クリップの多いプロジェクトでは数 ms ずつ画面のスレッドを使う 順が少し古くても、
+#: 次の 1 本を選ぶまでには直っていればよい
+PROXY_ORDER_INTERVAL_S = 1.0
 
 _PORTABLE = QKeySequence.SequenceFormat.PortableText
 
@@ -412,6 +438,44 @@ class _DropTarget:
     rate: FrameRate
 
 
+class _InputHold(QObject):
+    """タイムラインとプレビューへの操作を見て、先読みを止めさせる（#442 C）
+
+    アプリ全体ではなく、この 2 つの部品にだけ付ける アプリ全体に付けると、すべての部品の
+    すべての出来事が Python を通り、それ自体が画面のスレッドの重さになる
+    """
+
+    #: 操作として数える出来事 ただ指を動かしただけ（押していない移動）は数えない
+    #: 数えると、タイムラインの上に指を置いているだけで先読みが貯まらない
+    KINDS = frozenset(
+        {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.Wheel,
+            QEvent.Type.KeyPress,
+            # 素材一覧からの引き込みも操作のうち 落とす所を探している間に先読みが
+            # 走ると、置き場の印の描き直しが遅れる
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.Drop,
+        }
+    )
+
+    def __init__(self, hold: Callable[[], None], parent: QObject) -> None:
+        super().__init__(parent)
+        self._hold = hold
+
+    def eventFilter(self, _watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt の命名規約
+        kind = event.type()
+        if kind in self.KINDS or (
+            kind == QEvent.Type.MouseMove
+            and isinstance(event, QMouseEvent)
+            and event.buttons() != Qt.MouseButton.NoButton
+        ):
+            self._hold()
+        return False
+
+
 class MainWindow(QMainWindow):
     """編集画面"""
 
@@ -505,7 +569,34 @@ class MainWindow(QMainWindow):
                 long_gop=self._preferences.proxy_long_gop,
             ),
             encoder_priority=self._preferences.encoder_priority,
+            separate_process=self._preferences.proxy_process,
         )
+        #: 控えを作る順を最後に渡したときの（作品, 開いていたタイムライン, 開いていたシーン,
+        #: 再生位置, 時刻） 変わったときだけ求め直す タイムラインも見るのは、再生位置が
+        #: 同じままシーンを開き替えたときも、新しく開いた方の素材を先にするため
+        self._proxy_order_seen: tuple[Project | None, object, SceneId | None, int, float] = (
+            None,
+            None,
+            None,
+            -1,
+            0.0,
+        )
+        #: タイムラインで使っている素材（:func:`used_media`）を求めたときの作品と答え
+        #: 素材を頼む道は素材の数だけ回るので、作品が同じ間は使い回す
+        self._used_cache: tuple[Project | None, set[MediaId]] = (None, set())
+        #: 使っている素材の控えを全部頼み終えた作品（置いたときに作る設定 #441）
+        #: 上の使い回しとは分けて持つ 素材を 1 本だけ頼む道（テンプレートを置く等）も
+        #: 上を求め直すので、同じ印にすると、その作品で使い始めたほかの素材を頼み損ねる
+        self._used_requested: Project | None = None
+        #: 置いたときに作る設定で、もう頼んだ素材 作れずに失敗した素材を、関わりの無い
+        #: 編集のたびに頼み直して失敗の知らせを出し続けないため 係を作り直したとき・
+        #: 設定を替えたとき・作品を開いたときに空にする 素材を戻す道は
+        #: :meth:`_request_proxy` から直に頼むので、ここに載っていても頼み直せる
+        self._proxy_asked: set[MediaId] = set()
+        #: 画面の止まりの見張り（#442 の 0 番） 設定か環境変数で入れたときだけ動く
+        self._stall_monitor = StallMonitor(self)
+        self._apply_stall_watch(self._preferences)
+        apply_switch_interval(self._preferences)
         self._analysis_dirty = False
         #: 解析ができた素材 次の間隔でタイムラインの細い帯の目安を求め直させる
         #: ワーカースレッドが足し、画面のスレッドが取り出すので錠で守る（``_proxied`` と同じ）
@@ -558,6 +649,16 @@ class MainWindow(QMainWindow):
         self._connect()
         self._connect_drops()
         self._connect_preview_menu()
+        self._input_hold = _InputHold(self._preview.hold_prefetch, self)
+        # スクロールバーはタイムラインの外に並ぶ別の部品で、ビューに付けた見張りには
+        # 届かない 付けないと、つまみの端を引いて拡大している間も先読みが走り続ける
+        for watched in (
+            self._timeline,
+            self._timeline.horizontal_scroll_bar,
+            self._timeline.vertical_scroll_bar,
+            self._preview,
+        ):
+            watched.installEventFilter(self._input_hold)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(ANALYSIS_REFRESH_MS)
@@ -584,9 +685,11 @@ class MainWindow(QMainWindow):
         # 渡されたプロジェクトの素材にも効かせる コマンドラインや関連付けから
         # 開く道はここを通るだけで、_on_project_changed を通らない
         # 抜けると、4K のプロジェクトを開いても最初の 1 回だけ等倍のまま重い
-        for media in self.view_project.media:
-            self._request_proxy(media)
+        self._request_all_proxies()
         self._apply_auto_quality()
+        # 起動で読み込んだ物（部品・モジュール・開いたプロジェクト）を、自動のごみ集めから外す
+        # 窓を出し終えてからにする 組み立ての途中の一時的な物まで外さないため
+        QTimer.singleShot(0, self, self._freeze_long_lived)
 
         self._update_title()
         if self._state_fallback_message:
@@ -605,7 +708,11 @@ class MainWindow(QMainWindow):
             decode_threads=self._preferences.decode_threads,
             prefetch_thread=self._preferences.prefetch_thread,
         )
+        self._preview.set_prefetch_yield(self._preferences.prefetch_yield)
         self._preview.set_handles_enabled(self._preferences.preview_handles)
+        self._preview.set_backdrop(
+            fill_backdrop(self._preferences.preview_fill), self._preferences.preview_margin
+        )
         self._preview.set_keyframe_drag(self._preferences.keyframe_drag)
         self._preview.set_snap(self._preferences.preview_snap, self._preferences.snap_distance)
         self._transport = TransportBar(project.rate, self)
@@ -1126,6 +1233,9 @@ class MainWindow(QMainWindow):
         resized = preferences.proxy_height != self._preferences.proxy_height
         stopped = self._preferences.use_proxy and not preferences.use_proxy
         reencoded = preferences.encoder_priority != self._preferences.encoder_priority
+        # 別のプロセスで作るかを替えたときも作り直す 係が作り方を持っているので、作り直さないと
+        # 次に起動し直すまで効かない 走っている変換は止まって、新しい係で最初から作る
+        reprocessed = preferences.proxy_process != self._preferences.proxy_process
         previous = self._preferences
         scenes_before = self._scenes_on_import()
         screen_before = self._screen_on_import()
@@ -1140,14 +1250,30 @@ class MainWindow(QMainWindow):
         # 予約を今の好みにそろえる 決まりは起動の頭と同じ（update.flow.reconcile）
         self._updates.apply_preferences(preferences)
 
-        if resized or stopped or reencoded:
+        if resized or stopped or reencoded or reprocessed:
             self._proxies.close()
             self._proxies = ProxyBuilder(
                 ProxyStore(height=preferences.proxy_height, long_gop=preferences.proxy_long_gop),
                 encoder_priority=preferences.encoder_priority,
+                separate_process=preferences.proxy_process,
             )
+            self._proxy_order_seen = (None, None, None, -1, 0.0)
+            # 新しい係はまだ何も頼まれていない
+            self._used_requested = None
+            self._proxy_asked.clear()
             # 止めた変換は終わっていない 「終わった」と知らせない
             self._background_shown = False
+        if preferences.proxy_unused != previous.proxy_unused:
+            self._used_requested = None
+            self._proxy_asked.clear()
+            if preferences.proxy_unused == PROXY_UNUSED_ON_USE:
+                # 待っている使っていない素材の控えを取り消す 残すと、置いたときに作ると
+                # 選んだ後も読み込んだだけの素材を作り続け、CPU と GPU と置き場を使う
+                # 後で置けば :meth:`_request_newly_used` がまた頼む
+                used = self._used_media()
+                for media in self.view_project.media:
+                    if media.id not in used:
+                        self._proxies.forget(media.id)
         # 間隔の長い素材への控え（#430）は係を作り直さずに切り替える 作り直すと走っている
         # 4K の変換まで止まる 係は置き場を替え、切ったときは小さい素材の変換だけを止める
         # 入れたときは下で全部の素材を頼み直すので、間隔を調べ直して作る
@@ -1183,8 +1309,14 @@ class MainWindow(QMainWindow):
         self._preview.set_proxies(self._proxies.store if preferences.use_proxy else None)
         self._preview.set_prefetch_bytes(preferences.prefetch_bytes())
         self._preview.set_prefetch_thread(preferences.prefetch_thread)
+        self._preview.set_prefetch_yield(preferences.prefetch_yield)
+        self._apply_stall_watch(preferences)
+        apply_switch_interval(preferences)
         self._preview.set_decode_threads(preferences.decode_threads)
         self._preview.set_handles_enabled(preferences.preview_handles)
+        self._preview.set_backdrop(
+            fill_backdrop(preferences.preview_fill), preferences.preview_margin
+        )
         self._preview.set_keyframe_drag(preferences.keyframe_drag)
         self._preview.set_snap(preferences.preview_snap, preferences.snap_distance)
         if native.enabled() != preferences.native_modules:
@@ -1198,8 +1330,7 @@ class MainWindow(QMainWindow):
             # 探す範囲が変わると、見つかるモジュールが変わって絵が変わる
             plugin.set_scan_all(preferences.all_aviutl_plugins)
             self._preview.refresh_all()
-        for media in self.view_project.media:
-            self._request_proxy(media)
+        self._request_all_proxies()
         self._apply_auto_quality()
         self._apply_autosave_timer(preferences)
         if state_root_for(preferences) != state_root_for(previous):
@@ -2103,6 +2234,9 @@ class MainWindow(QMainWindow):
             self._analyzer.forget(target)
             self._screen.forget(target)
             self._proxies.forget(target)
+            # 頼んだ印も消す 残すと、使い始めたときに作る設定で、作っている途中に外して
+            # 取り消しで戻した素材の控えを、使い始めても二度と頼まない
+            self._proxy_asked.discard(target)
             # 取り消しで戻ったときに頼み直す（:meth:`_reanalyze_returned`）
             self._forgotten.add(target)
 
@@ -2369,6 +2503,19 @@ class MainWindow(QMainWindow):
 
         return runtime_status().installed
 
+    def _request_all_proxies(self) -> None:
+        """今の作品の素材をすべて、作る順（:func:`proxy_order`）に頼む
+
+        先に順を渡し、頼むのもその順にする 1 本目は係が空いていればすぐ走るので、
+        素材一覧の並びで頼むと、先頭にある使っていない長い動画から作り始め、
+        プレビューで見ている素材の控えがその後になる
+        """
+        ranked = self._order_proxies(force=True)
+        order = {media_id: index for index, media_id in enumerate(ranked)}
+        last = len(order)
+        for media in sorted(self.view_project.media, key=lambda item: order.get(item.id, last)):
+            self._request_proxy(media)
+
     def _request_proxy(self, media: MediaItem) -> None:
         """控えを作るよう頼む 設定で切っていれば何もしない
 
@@ -2376,8 +2523,106 @@ class MainWindow(QMainWindow):
         取り込む・AI から） ここを 1 つにまとめておかないと、道ごとに
         書き分けることになる
         """
-        if self._preferences.use_proxy:
+        if not self._preferences.use_proxy:
+            return
+        if (
+            self._preferences.proxy_unused == PROXY_UNUSED_ON_USE
+            and media.id not in self._used_media()
+        ):
+            # 使い始めたときに作る（#441） 置いたときは :meth:`_request_newly_used` が頼む
+            return
+        self._proxy_asked.add(media.id)
+        self._proxies.request(media, on_ready=self._on_proxy_ready)
+
+    def _used_media(self) -> set[MediaId]:
+        """どこかのタイムラインで使っている素材 作品が同じ間は前の答えを使い回す"""
+        root = self._document.project
+        seen, used = self._used_cache
+        if seen is not root:
+            used = used_media(root)
+            self._used_cache = (root, used)
+        return used
+
+    def _request_newly_used(self) -> None:
+        """使い始めた素材の控えを頼む（使い始めたときに作る設定のときだけ #441）
+
+        頼む道（置く・貼る・AI・取り消し）は何本もあるので、編集のたびに使っている素材を
+        見直して、まだ頼んでいない物を頼む すでにある・作っている素材は係が何もしない
+        """
+        if not self._preferences.use_proxy or self._preferences.proxy_unused != (
+            PROXY_UNUSED_ON_USE
+        ):
+            return
+        root = self._document.project
+        if self._used_requested is root:
+            return
+        used = self._used_media()
+        fresh = [
+            media for media in root.media if media.id in used and media.id not in self._proxy_asked
+        ]
+        if len(fresh) > 1:
+            # 作る順に頼む 1 本目は係が空いていればすぐ走るので、素材一覧の並びで頼むと、
+            # 一覧の先頭にある長い動画から作り始め、再生位置で見ている素材が待たされる
+            rank = {
+                media_id: index
+                for index, media_id in enumerate(
+                    proxy_order(root, self._timeline.playhead, self.view_project.timeline)
+                )
+            }
+            fresh.sort(key=lambda media: rank.get(media.id, len(rank)))
+        for media in fresh:
+            self._proxy_asked.add(media.id)
             self._proxies.request(media, on_ready=self._on_proxy_ready)
+        self._used_requested = root
+
+    def _order_proxies(self, *, force: bool = False) -> list[MediaId]:
+        """控えを作る順を係へ渡す（#441） 待っている物が 2 本以上あるときだけ求める
+
+        使っている素材を再生位置に近い順に、その後に使っていない素材 作品か再生位置が
+        変わったときだけ、:data:`PROXY_ORDER_INTERVAL_S` に 1 回まで求め直す
+        求めた順を返す 求めなかったときは空（頼む道が同じ順を 2 度求めないため）
+        """
+        if not force and self._proxies.waiting() < 2:
+            return []
+        root = self._document.project
+        active = self.view_project.timeline
+        playhead = self._timeline.playhead
+        seen, opened, scene, frame, at = self._proxy_order_seen
+        now = time.monotonic()
+        # シーンを開き替えたときは間隔を待たない 待つと、その間に今の変換が終わり、前に
+        # 開いていた所の順で次の素材を作り始める 開き替えは打つほど続かないので重くならない
+        if (
+            not force
+            and scene == self._active_scene
+            and (
+                (seen is root and opened is active and frame == playhead)
+                or now - at < PROXY_ORDER_INTERVAL_S
+            )
+        ):
+            return []
+        self._proxy_order_seen = (root, active, self._active_scene, playhead, now)
+        order = proxy_order(root, playhead, active)
+        self._proxies.set_order(order)
+        return order
+
+    def _freeze_long_lived(self) -> None:
+        """今あるオブジェクトを、自動のごみ集めの対象から外す（#442 B）
+
+        開いたプロジェクトと画面の部品は長く生きるのに、自動の全体回のたびに全部を辿られる
+        読み込んだ実プロジェクトで全体回は 1 回 36ms ほどで、選ぶ・動かすの最中に当たると
+        1〜2 コマ止まる 外す前に前のプロジェクトの分を戻して集める 戻さないと、閉じた
+        プロジェクトの循環した物がずっと残る 開く操作はもともと待つ所なので、ここで払う
+        """
+        gc.unfreeze()
+        gc.collect()
+        gc.freeze()
+
+    def _apply_stall_watch(self, preferences: Preferences) -> None:
+        """画面の止まりの見張りを、設定と環境変数に合わせて入り切りする"""
+        threshold = threshold_from_env()
+        if threshold is None and preferences.stall_watch:
+            threshold = DEFAULT_STALL_THRESHOLD_MS
+        self._stall_monitor.set_threshold(threshold)
 
     def _on_proxy_ready(self, media_id: MediaId) -> None:
         """控えができた ワーカースレッドから呼ばれる
@@ -2431,6 +2676,8 @@ class MainWindow(QMainWindow):
         ひと続きの数を 0 へ戻すのもここ 控えと解析の**両方**が止まってから戻す
         片方ずつ戻すと、解析が走っている間に控えの失敗の数が消え、全体の割合も巻き戻る
         """
+        self._request_newly_used()
+        self._order_proxies()
         proxy = self._proxies.poll()
         analysis = self._analyzer.poll()
         self._media_pool.set_progress(
@@ -2669,9 +2916,11 @@ class MainWindow(QMainWindow):
         self._mark_saved()
         self._on_project_changed()
         self._seek(0)
+        self._proxy_asked.clear()
         for media in project.media:
             self._request_analysis(media)
-            self._request_proxy(media)
+        self._request_all_proxies()
+        self._freeze_long_lived()
         if notice:
             self.show_missing_media(only_if_missing=True)
 
@@ -3223,9 +3472,11 @@ class MainWindow(QMainWindow):
         self._saved = None
         self._on_project_changed()
         self._seek(0)
+        self._proxy_asked.clear()
         for media in project.media:
             self._request_analysis(media)
-            self._request_proxy(media)
+        self._request_all_proxies()
+        self._freeze_long_lived()
 
         self.autosave()
         note = ""
@@ -3307,7 +3558,11 @@ class MainWindow(QMainWindow):
             target, options = dialog.target(), dialog.options()
         finally:
             dialog.deleteLater()
-        if target.exists():
+        # 確かめたときの書き出し先を覚え、書き終えて名前を付ける所で照らす 書いている数分の間に
+        # 同じ名前が現れたり置き換えを許したファイルが差し替わったりすると、許していない物を
+        # 置き換える（作品の保存と同じ #449 の CodeRabbit の指摘）
+        approved = expect_now(target)
+        if approved.identity is not None:
             answer = QMessageBox.question(
                 self,
                 "持ち出し用に書き出す",
@@ -3315,7 +3570,13 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self._start_package_export(project, target, options, expect=None, check=None)
+        self._start_package_export(
+            project,
+            target,
+            options,
+            expect=replace(approved, keep=self._preferences.backup_generations),
+            check=None,
+        )
 
     def open_package(self) -> None:
         """〔持ち出し用パッケージを開く…〕 作業用のフォルダへ展開して普段の作品として開く"""
@@ -3381,9 +3642,14 @@ class MainWindow(QMainWindow):
         root = package_root(self._preferences)
         # 始めたときに開いていた作品 展開している間に別の作品を開いたら、終わっても差し替えない
         self._package_from = self._document.generation
+        # 選んだときのパッケージの身元 展開では開いた物をこれと照らし、違えば開かない
+        # 選んでから裏で開くまでに差し替えられると、人が選んでいない物を展開する
+        chosen = expect_now(package)
 
         def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
-            return unpack_package(package, root, progress=progress, cancelled=cancelled)
+            return unpack_package(
+                package, root, progress=progress, cancelled=cancelled, expect=chosen
+            )
 
         self._package.start("open", package, work, by_assistant=by_assistant)
 
@@ -3397,6 +3663,16 @@ class MainWindow(QMainWindow):
             return
         if kind == "export" and isinstance(result, PackResult):
             summary = packed_summary(result)
+            # 知らせに並ぶスクリプトとファイルの名前は、作品の外の名前（元の PC のフォルダの
+            # 名前やユーザー名を含みうる） 様子（package_status）で AI へ渡るので、名前を送らない
+            # と決めた人の所では伏せ字の表に入れて伏せる（#342 #449 の CodeRabbit の指摘）
+            job.remember(
+                *result.scripts,
+                *result.metadata_kept,
+                *result.whole_instead,
+                *result.missing_files,
+                *result.unused_media,
+            )
             job.note(summary)
             if not job.by_assistant:
                 QMessageBox.information(self, "持ち出し用に書き出しました", summary)
@@ -5104,6 +5380,10 @@ class MainWindow(QMainWindow):
         self._screen.close()
         self._analyzer.close()
         self._proxies.close()
+        # 取り消しの届かない子（係のスレッドが待っている途中の物）も止める 残すと、窓を
+        # 閉じた後も控えを作り続ける子がタスクマネージャーに残る
+        stop_workers()
+        self._stall_monitor.stop()
         self._preview.shutdown()
         super().closeEvent(event)
 

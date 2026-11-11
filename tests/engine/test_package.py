@@ -12,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import zipfile
+from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -304,6 +305,22 @@ class TestCut:
         assert not remux._same_sound(paths[0], paths[1], stream.index, stream.sample_rate, 6,
                                      span, lambda: False)  # fmt: skip
 
+    def test_the_video_decoder_remembers_why_it_stopped(self, media_dir: Path) -> None:
+        """読めない所で黙って終わると、終端と見分けられず、確かめが絵の無いまま通る"""
+        decoder = VideoDecoder(_video(media_dir))
+        try:
+            assert decoder.decode_error is None
+
+            def broken() -> Iterator[av.VideoFrame]:
+                raise av.error.InvalidDataError(1094995529, "壊れた")
+                yield
+
+            decoder._frames = broken()
+            assert decoder._read_next() is None
+            assert decoder.decode_error is not None and "壊れた" in decoder.decode_error
+        finally:
+            decoder.close()
+
     def test_unreadable_pictures_are_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -461,12 +478,13 @@ class TestRoundTrip:
                     "f": "files/0002.png",
                     "g": "C:/Users/秘密/y.png",
                     "u": r"\\attacker\z",
+                    "h": "D:/秘密/h.png",
                     "n": "files/0001.png",
                     "t": "/字幕",
                 },
             }
             # 書き出した側が g をファイルの欄と記した（スクリプトの無い PC でも付け替える）
-            # u は記さずに共有のフォルダを指させる（細工したパッケージ）
+            # u と h は記さずに共有のフォルダと手元の場所を指させる（細工したパッケージ）
             fields = manifest["file_fields"]
             assert isinstance(fields, list)
             fields.append(f"source:aviutl:無い/無い.anm:無い:{clips[0]['id']}/g")
@@ -479,6 +497,8 @@ class TestRoundTrip:
         assert clip.source is not None
         assert "attacker" not in str(clip.source)
         assert Path(str(clip.source.params["g"])) == opened.folder / "missing" / "y.png"
+        # 記していなくても、手元の場所を指す文字は外を指さない場所へ置き換える
+        assert Path(str(clip.source.params["h"])) == opened.folder / "missing" / "h.png"
         # ファイルの欄と記していない文字は、場所に見えても、中の名前と同じでも文のまま残す
         assert clip.source.params["t"] == "/字幕"
         assert clip.source.params["n"] == "files/0001.png"
@@ -501,6 +521,62 @@ class TestRoundTrip:
         with pytest.raises(PackageError, match="フォルダを指すエフェクト"):
             write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
         assert not package.exists()
+
+    def test_a_folder_field_stops_the_open(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """フォルダの欄に値があるのは細工したパッケージ 描くたびに置いた場所を読みに行く"""
+        item = probe_media(_video(media_dir))
+        blend = Effect(kind="image_blend", params={"image_file": str(_picture(tmp_path))})
+        clip = replace(_clip(item, 0, 30, Fraction(1)), effects=(blend,))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(_project([item], [clip]), package, PackOptions(), scratch=tmp_path / "s")
+
+        def point_outside(_manifest: dict[str, object], project: dict[str, object]) -> None:
+            clips = project["timeline"]["tracks"][0]["clips"]  # type: ignore[index]
+            clips[0]["effects"][0]["params"]["image_file"] = r"\\attacker\share"
+
+        _rewrite(package, point_outside)
+        # 開く PC では、この欄がフォルダを指す（書き出しでは断るので、細工しないと値は入らない）
+        folder = (FileSpec("image_file", "フォルダ", directory=True, texture=True),)
+        real = plan._specs_of
+        monkeypatch.setattr(
+            plan,
+            "_specs_of",
+            lambda kind, *, source: folder if kind == "image_blend" else real(kind, source=source),
+        )
+        with pytest.raises(PackageError, match="フォルダを指すエフェクト"):
+            open_package(package, tmp_path / "opened")
+        assert not any((tmp_path / "opened").iterdir())
+
+    @pytest.mark.parametrize("limit", ["_MANIFEST_LIMIT", "_PROJECT_LIMIT"])
+    def test_a_huge_manifest_or_project_is_refused(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str
+    ) -> None:
+        """目録と作品はまるごと読む 巨大な物を置かれると、開くだけでメモリを使い切って落ちる"""
+        item = probe_media(_video(media_dir))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [_clip(item, 0, 30, Fraction(1))]),
+            package,
+            PackOptions(),
+            scratch=tmp_path / "s",
+        )
+        monkeypatch.setattr(archive, limit, 16)
+        with pytest.raises(PackageError, match="大きすぎます"):
+            open_package(package, tmp_path / "opened")
+        opened = tmp_path / "opened"
+        assert not opened.exists() or not any(opened.iterdir())
+
+    def test_a_lying_size_does_not_read_past_the_limit(self, tmp_path: Path) -> None:
+        """中の見出しの大きさは偽れる 見出しを信じず、読むときも上限の先は手元に置かない"""
+        package = tmp_path / "lie.zip"
+        with zipfile.ZipFile(package, "w") as zipped:
+            zipped.writestr("big.json", b"x" * 64)
+        with zipfile.ZipFile(package) as zipped:
+            zipped.getinfo("big.json").file_size = 8
+            with pytest.raises((PackageError, zipfile.BadZipFile)):
+                archive._bounded_read(zipped, "big.json", 16, "目録")
 
     def test_a_file_for_a_missing_script_is_moved_too(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -62,6 +62,7 @@ from sashimono.engine.gpu import (
 )
 from sashimono.engine.gpu.projection import project
 from sashimono.engine.motion_shapes import TrailPaths
+from sashimono.engine.render.backdrop import BLACK, CHECKER_ROWS, Backdrop
 from sashimono.engine.render.groups import grouped
 from sashimono.engine.render.invalidate import image_paths
 from sashimono.engine.render.moving_text import MAX_SPRITE_SCREENS, Sprite, SpriteShelf, spot_of
@@ -713,11 +714,13 @@ class FrameRenderer:
         """
         return self._context
 
-    def compose(self, frame: int, *, underlay: bool = True) -> None:
+    def compose(self, frame: int, *, underlay: bool = True, backdrop: Backdrop = BLACK) -> None:
         """``frame`` を合成する 結果は CPU へ戻さず GPU 上に残る
 
         画面に出すだけなら往復が要らない :meth:`render` はこれを呼んでから
         読み出しているだけ ``underlay`` が偽なら最後の黒を敷かず、透けたまま残す
+        ``backdrop`` は黒の代わりに敷く地 プレビューだけが渡す（#456） 書き出しと
+        スナップショットは渡さないので、何も映らない所は今まで通り黒で出る
         """
         if self._closed:
             raise RuntimeError("閉じたレンダラは使えない")
@@ -737,7 +740,13 @@ class FrameRenderer:
         # 同じデコーダへ頼んだときに前の走りと重なり、例外も誰も受け取らない
         self._drain_decodes()
         if underlay:
-            self._compositor.underlay((0.0, 0.0, 0.0, 1.0))
+            self._compositor.underlay(
+                backdrop.color,
+                second=backdrop.second,
+                # 1 目は合成先の高さで決める 画質を下げて小さく描いても、画面の上では
+                # 同じ大きさの目に見える
+                cell=max(1, round(self._compositor.height / CHECKER_ROWS)),
+            )
 
     def _compose_timeline(self, timeline: Timeline, frame: int, *, depth: int) -> None:
         """1 本のタイムラインを、いまの合成先へ重ねる シーンの入れ子でも同じ道を通る
