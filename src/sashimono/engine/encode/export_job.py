@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,11 +40,12 @@ _log = logging.getLogger(__name__)
 
 #: 先読みを回しながら画面を操作している所で書き出した速さ（倍速）
 #: アプリの中のスレッド / 別のプロセス
-#: ``tools/bench_contention.py --onscreen --prefetch``（2026-11-09 1080p60 60 秒 RTX 5060 Ti）
-#: 単体ではスレッド 1.7 倍速・別のプロセス 2.3 倍速 Python を回し続けるスレッドが重なると、
+#: ``tools/bench_contention.py --onscreen --prefetch``（2026-11-11 1080p60 60 秒 RTX 5060 Ti
+#: 先読みは 3 枚をそれぞれ別の素材として読む） 単体ではスレッド 2.5 倍速・別のプロセス 2.7 倍速
+#: Python を回し続けるスレッドが重なると、
 #: スレッドの書き出しは 0.1 倍速まで落ちた 子の起動（部品を読む分を含めて 1 秒前後）は
 #: 書き出し 1 本に 1 回なので、長さで分けずにいつも寄せる 設定の画面がここから文言を作る
-MEASURED_EXPORT_SPEED = (1.0, 1.8)
+MEASURED_EXPORT_SPEED = (1.1, 2.2)
 
 #: 子の失敗の文の頭に付く例外の名前（:mod:`sashimono.engine.worker` が ``型: 文`` で渡す）
 #: 書き出しの失敗は利用者にそのまま見せる文なので、型の名前は外す
@@ -106,16 +109,22 @@ def is_gl_unavailable(reason: str) -> bool:
 
 
 def _discard(path: Path) -> None:
-    """子が後片付けをせずに終わったときの書きかけを消す
-
-    スレッドで書く道（:func:`export_project`）は失敗すると書き出し先を消す 落ちた子・猶予を
-    過ぎて止めた子はそれをしないので、親が代わりに消す 消さないと、窓の書き出しは利用者が
-    選んだ場所へ直に書くので、途中で切れた動画がそこに残る ``run_in_process`` は子が終わる
-    まで待ってから戻るので、ここではもう子がファイルを掴んでいない 消せなくても元の失敗を
-    隠さない
-    """
+    """子の仮のファイルを消す 消せなくても元の失敗を隠さない"""
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
+
+
+def _scratch_for(target: Path) -> Path:
+    """子が書く仮のファイル 書き出し先と同じフォルダに、同じ拡張子で置く
+
+    子は書き出し先へ直には書かない 子が落ちた・取り消しの猶予を過ぎて止めたときは子の中の
+    後片付けが走らないので、直に書くと途中で切れた動画が利用者の選んだ場所に残る 親が
+    書き出し先を消せば、まだ書き始めてもいないのに前からあったファイルまで消える 仮の
+    ファイルに書かせて、終わったときだけ置き換える
+    同じフォルダに置くのは、置き換えをドライブを跨がない名前の付け替えで済ませるため
+    拡張子を残すのは、入れ物の形とチャプターを埋めるかを拡張子で決めているため
+    """
+    return target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
 
 
 def export_anywhere(
@@ -134,34 +143,48 @@ def export_anywhere(
     アプリごと落ちる）
     """
     if separate_process:
+        target = settings.path
+        scratch = _scratch_for(target)
         try:
             outcome = run_in_process(
                 export_job,
-                {"project": project, "settings": settings},
+                {"project": project, "settings": dataclasses.replace(settings, path=scratch)},
                 progress=progress,
                 should_cancel=should_cancel,
                 name="sashimono-export",
             )
         except WorkerUnavailableError as exc:
+            _discard(scratch)
             _log.warning("書き出しを別のプロセスで走らせられないので、スレッドで書く: %s", exc)
         except WorkerFailedError as exc:
+            _discard(scratch)
             reason = str(exc)
             if not is_gl_unavailable(reason):
                 raise ExportError(reason.removeprefix(_EXPORT_ERROR_PREFIX)) from exc
             _log.warning("子のプロセスで GL を作れないので、スレッドで書き出す: %s", reason)
         except WorkerCrashedError as exc:
-            _discard(settings.path)
+            _discard(scratch)
             raise ExportError(f"書き出しの途中で別のプロセスが落ちた: {exc}") from exc
+        except BaseException:
+            _discard(scratch)
+            raise
         else:
             if outcome is None:
-                # 取り消しの猶予を過ぎて子を止めたときは、子の中の後片付けが走っていない
-                _discard(settings.path)
+                _discard(scratch)
                 # 取り消した 同じプロセスで書いたときと同じ文で返す（呼ぶ側は中止の印で見分ける）
                 raise ExportError("書き出しを中止した")
+            try:
+                # run_in_process は子が終わるまで待ってから戻るので、子はもうファイルを掴んでいない
+                scratch.replace(target)
+            except OSError as exc:
+                _discard(scratch)
+                raise ExportError(
+                    f"書き出したファイルを置き換えられない: {target} ({exc})"
+                ) from exc
             if notice is not None:
                 for note in outcome.notes:
                     notice(note)
-            return Path(outcome.path)
+            return target
     return export_project(
         project, settings, progress=progress, should_cancel=should_cancel, notice=notice
     )

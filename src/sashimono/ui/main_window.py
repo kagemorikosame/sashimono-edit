@@ -627,6 +627,14 @@ class MainWindow(QMainWindow):
         self._connect_drops()
         self._connect_preview_menu()
         self._input_hold = _InputHold(self._on_input, self)
+        # 設定パネルには見張りを付けていない（先読みは止めなくてよい）が、値を続けて動かして
+        # いる間は手が止まっていない 送られてくる命令を操作として数え、全体回を待たせる
+        for request in (
+            self._inspector.commands_requested,
+            self._inspector.commands_continued,
+            self._inspector.preview_requested,
+        ):
+            request.connect(lambda *_: self._idle_collect.poke())
         # スクロールバーはタイムラインの外に並ぶ別の部品で、ビューに付けた見張りには
         # 届かない 付けないと、つまみの端を引いて拡大している間も先読みが走り続ける
         for watched in (

@@ -100,6 +100,7 @@ from sashimono.core.model import (  # noqa: E402
     ProjectSettings,
     Track,
     TrackKind,
+    new_media_id,
 )
 from sashimono.core.timebase import FrameRate  # noqa: E402
 from sashimono.effects.sources import TEXT  # noqa: E402
@@ -391,15 +392,18 @@ class Prefetcher:
         rate = media.video_streams[0].frame_rate if media.video_streams else FrameRate(60)
         frames = int(media.duration * rate.fps)
         project = Project.create(ProjectSettings(width=1920, height=1080, frame_rate=rate))
-        project = AddMedia(media).apply(project)
         for index in range(self._layers):
+            # 層ごとに別の素材にする 描く側は（素材, ストリーム）ごとに読み手を 1 つ持つので、
+            # 同じ素材を重ねると読み手を分け合い、層の数だけのデコードの取り合いにならない
+            layer_media = replace(media, id=new_media_id())
+            project = AddMedia(layer_media).apply(project)
             track = Track(kind=TrackKind.VIDEO, name=f"V{index + 1}")
             project = AddTrack(track).apply(project)
             # 半透明にする 不透明だと上の 1 枚で下が隠れ、重ねた分を描かずに済ます道に入りうる
             clip = Clip(
                 timeline_start=0,
                 duration=frames,
-                media_id=media.id,
+                media_id=layer_media.id,
                 opacity=AnimatedValue(0.5),
             )
             project = AddClip(track.id, clip).apply(project)

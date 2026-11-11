@@ -178,3 +178,25 @@ def test_options_narrow_what_is_counted(
     )
     assert tool.main([str(log), "--since", "2026-11-10", "--min-ms", "50"]) == 0
     assert "止まり 1 回 合計 70 ms" in capsys.readouterr().out
+
+
+def test_a_cut_character_at_the_end_drops_only_that_line(tool: ModuleType, tmp_path: Path) -> None:
+    """壊れると、書いている最中に文字の途中で切れた最後の行のせいで、前の正しい記録まで読めない"""
+    log = tmp_path / "stalls.jsonl"
+    whole = json.dumps(_record(50, LOOP), ensure_ascii=False).encode("utf-8")
+    log.write_bytes(whole + b"\n" + '{"stall_ms": 40, "x": "設'.encode()[:-1])
+    assert [record["stall_ms"] for record in tool.read([log])] == [50]
+
+
+def test_the_default_place_follows_the_recorder_without_localappdata(
+    tool: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、LOCALAPPDATA の無い機械で、記録があるのに引数なしでは「記録が無い」と出る"""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    from sashimono.stall_watch import default_log_path
+
+    paths = tool.default_paths()
+    assert paths[-1] == default_log_path()
+    assert paths[-1].is_relative_to(tmp_path)
+    assert paths[0].name == paths[-1].name + ".1"

@@ -103,6 +103,10 @@ def proxy_speed(path: Path, seconds: float) -> float | None:
             # 先に測った読む速さを捨てないよう、ここで止めずに表の残りを出す
             print(f"  素材の頭を切り出せなかった {exc}")
             return None
+        # 倍速の分子は切り出せた長さ 素材が --seconds より短いと、指定の秒数で割ると速さを
+        # 何倍にも大きく見積もる
+        with av.open(str(clip)) as cut:
+            length = float(cut.duration / av.time_base) if cut.duration else seconds
         target = Path(folder) / "proxy.mp4"
         began = time.perf_counter()
         try:
@@ -124,7 +128,7 @@ def proxy_speed(path: Path, seconds: float) -> float | None:
     if made is None:
         print("  控えを作れなかった")
         return None
-    return seconds / elapsed
+    return length / elapsed
 
 
 def main(argv: list[str] | None = None) -> int:

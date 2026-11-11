@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import os
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -37,6 +36,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from sashimono.stall_watch import default_log_path
 
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -105,15 +108,17 @@ def read(paths: Iterable[Path], *, unread: list[Path] | None = None) -> list[dic
     records: list[dict[str, Any]] = []
     for path in paths:
         try:
-            text = path.read_text(encoding="utf-8")
+            data = path.read_bytes()
         except OSError:
             if unread is not None:
                 unread.append(path)
             continue
-        for line in text.splitlines():
+        # 行ごとに文字へ戻す まとめて戻すと、書いている最中に落ちて文字の途中で切れた最後の
+        # 行のせいで、前の正しい記録まで読めなくなる
+        for raw in data.splitlines():
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if isinstance(record, dict) and "stall_ms" in record:
                 records.append(record)
@@ -268,10 +273,9 @@ def report(summary: Summary, *, top: int = 10) -> str:
 
 
 def default_paths() -> list[Path]:
-    root = os.environ.get("LOCALAPPDATA")
-    if not root:
-        return []
-    log = Path(root) / "Sashimono" / "diagnostics" / "stalls.jsonl"
+    # 記録する側と同じ置き場を使う 自分で組み立てると、LOCALAPPDATA の無い機械
+    # （XDG_STATE_HOME やホームの下へ書く）で、記録があるのに「無い」と出る
+    log = default_log_path()
     # 古い世代から読む 時刻で並べ直すので順は結果に響かないが、読む人が追いやすい
     return [log.with_suffix(".jsonl.1"), log]
 

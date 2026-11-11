@@ -64,8 +64,9 @@ DEFAULT_SCENE_THREADS = 2
 
 #: 先読みを回しながら画面を操作している所で、場面を解析した速さ（倍速）
 #: アプリの中のスレッド / 別のプロセス 設定の画面がここから文言を作る
-#: ``tools/bench_contention.py --onscreen --prefetch``（2026-11-09 1080p60 60 秒 RTX 5060 Ti）
-MEASURED_ANALYSIS = (5.2, 6.0)
+#: ``tools/bench_contention.py --onscreen --prefetch``（2026-11-11 1080p60 60 秒 RTX 5060 Ti
+#: 先読みは 3 枚をそれぞれ別の素材として読む）
+MEASURED_ANALYSIS = (6.8, 8.9)
 
 #: 別のプロセスへ寄せる素材の長さの下限（秒） 種類 → 秒 表に無い種類はいつもスレッドで読む
 #:
@@ -75,16 +76,17 @@ MEASURED_ANALYSIS = (5.2, 6.0)
 #: ========  =================  ==================
 #: 種類      スレッド           別のプロセス
 #: ========  =================  ==================
-#: 場面      8.8 → 5.2          5.7 → 6.0
-#: サムネ    22.4 → 24.5        17.9 → 17.1
-#: 波形      105.4 → 68.7       27.9 → 30.4
+#: 場面      9.7 → 6.8          8.9 → 8.9
+#: サムネ    33.0 → 26.9        21.2 → 22.3
+#: 波形      153.7 → 102.6      40.4 → 43.4
 #: ========  =================  ==================
 #:
-#: - 場面は 1 コマごとに Python で差を求めるので、取り合うとスレッドは単体の 6 割まで落ちる
+#: - 場面は 1 コマごとに Python で差を求めるので、取り合うとスレッドは単体の 7 割まで落ちる
 #:   Python を回し続けるスレッドが重なると 1.6 倍速まで落ちた 起動の分を払っても寄せる
 #:   短い素材は起動の分が勝つので、30 秒より短い物はスレッドで読む
-#: - サムネイルは飛び飛びに読むだけで Python をほとんど動かさず、取り合っても落ちない 寄せない
-#: - 波形はスレッドでも十分に速く、60 秒の素材では起動の分の方が重い 取り合いで 65% に落ちる分と
+#: - サムネイルは飛び飛びに読むだけで Python をほとんど動かさず、取り合っても 8 割を保ち、
+#:   別のプロセスより速いまま 寄せない
+#: - 波形はスレッドでも十分に速く、60 秒の素材では起動の分の方が重い 取り合いで 67% に落ちる分と
 #:   起動の 0.9 秒が釣り合うのが 5 分前後なので、それより長い物（長い録画）だけ寄せる
 PROCESS_MIN_SECONDS: dict[str, float] = {"scenes": 30.0, "waveform": 300.0}
 
@@ -301,7 +303,14 @@ class MediaAnalyzer:
         return self._separate_process and not self._process_broken
 
     def set_separate_process(self, enabled: bool) -> None:
-        """読む仕事を別のプロセスで走らせるか 次に始める仕事から効く"""
+        """読む仕事を別のプロセスで走らせるか 次に始める仕事から効く
+
+        切った設定を入れ直したときは、前に子を起こせなかった印も外す 外さないと、一時の失敗
+        （ウイルス対策の検査で起動が間に合わなかった等）の後で入れ直しても、その窓ではずっと
+        スレッドのまま
+        """
+        if enabled and not self._separate_process:
+            self._process_broken = False
         self._separate_process = enabled
 
     def set_scene_threads(self, threads: int) -> None:
@@ -369,6 +378,9 @@ class MediaAnalyzer:
             self._scenes.pop(media_id, None)
             self._scene_failures.pop(media_id, None)
             self._halted.pop(media_id, None)
+            # 子から届いた途中の場面も捨てる 残すと、取り消しで同じ素材を戻したときに、外す前の
+            # 途中の並びが解析中の結果として読める
+            self._partials.pop(media_id, None)
             self._cancelled.update(key for key in self._running if key[1] == media_id)
             # 走らせ直す約束も捨てる 外した素材を、取り消し中の仕事が終わった後に解析し直さない
             for job in [key for key in self._again if key[1] == media_id]:

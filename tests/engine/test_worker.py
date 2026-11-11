@@ -190,6 +190,30 @@ class TestProxyInAnotherProcess:
         finally:
             builder.close()
 
+    def test_forgetting_media_drops_partial_scenes(self, tmp_path: Path) -> None:
+        """壊れると、外した素材を取り消しで戻したとき、外す前の途中の場面が解析中の結果として読める"""
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media_id = MediaId("m")
+        with analyzer._lock:
+            analyzer._partials[media_id] = SceneSignal.empty(stream=0)
+        try:
+            analyzer.forget(media_id)
+            assert media_id not in analyzer._partials
+        finally:
+            analyzer.close()
+
+    def test_turning_the_setting_back_on_tries_a_child_again(self, tmp_path: Path) -> None:
+        """壊れると、一度子を起こせなかった窓では、設定を入れ直しても別のプロセスへ戻らない"""
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        analyzer._process_broken = True
+        try:
+            assert not analyzer.separate_process
+            analyzer.set_separate_process(False)
+            analyzer.set_separate_process(True)
+            assert analyzer.separate_process
+        finally:
+            analyzer.close()
+
     def test_it_falls_back_to_a_thread(
         self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
     ) -> None:

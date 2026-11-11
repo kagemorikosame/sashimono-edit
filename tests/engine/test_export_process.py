@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -52,8 +53,12 @@ def test_a_child_writes_the_file(project: Project, tmp_path: Path) -> None:
     assert seen and seen[-1] == pytest.approx(1.0)
 
 
-def _fake_run(outcome: object) -> object:
-    def run(*_args: object, **_kwargs: object) -> object:
+def _fake_run(outcome: object, *, write: bytes | None = None) -> object:
+    """子の代わり ``write`` を渡すと、子が書いたように渡された書き出し先へ書く"""
+
+    def run(_job: object, options: dict[str, Any], **_kwargs: object) -> object:
+        if write is not None:
+            Path(options["settings"].path).write_bytes(write)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -111,7 +116,7 @@ def test_notes_from_the_child_reach_the_caller(
     monkeypatch.setattr(
         job_module,
         "run_in_process",
-        _fake_run(ExportOutcome(path=str(tmp_path / "x.mp4"), notes=("CPU で書いた",))),
+        _fake_run(ExportOutcome(path="", notes=("CPU で書いた",)), write=b"done"),
     )
     notes: list[str] = []
     export_anywhere(
@@ -134,13 +139,29 @@ def test_cancelling_in_the_child_reads_as_cancelled(
     [WorkerCrashedError("落ちた"), None],
     ids=["落ちた子", "止めた子"],
 )
-def test_a_half_written_file_is_removed_when_the_child_could_not(
+def test_a_child_that_did_not_finish_leaves_the_target_as_it_was(
     project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: object
 ) -> None:
-    """壊れると、子が落ちた・猶予を過ぎて止めたとき、利用者が選んだ場所に途中で切れた動画が残る"""
+    """壊れると、子が落ちた・猶予を過ぎて止めたとき、途中で切れた動画が残るか、前からあった
+    ファイルまで消える"""
     target = tmp_path / "x.mp4"
-    target.write_bytes(b"half")
-    monkeypatch.setattr(job_module, "run_in_process", _fake_run(result))
+    target.write_bytes(b"before")
+    monkeypatch.setattr(job_module, "run_in_process", _fake_run(result, write=b"half"))
     with pytest.raises(ExportError):
         export_anywhere(project, ExportSettings(path=target), separate_process=True)
-    assert not target.exists()
+    assert target.read_bytes() == b"before"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["x.mp4"]
+
+
+def test_a_finished_child_replaces_the_target(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、子が書き終えても書き出し先が前のままか、仮のファイルが横に残る"""
+    target = tmp_path / "x.mp4"
+    target.write_bytes(b"before")
+    monkeypatch.setattr(
+        job_module, "run_in_process", _fake_run(ExportOutcome(path="", notes=()), write=b"new")
+    )
+    assert export_anywhere(project, ExportSettings(path=target), separate_process=True) == target
+    assert target.read_bytes() == b"new"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["x.mp4"]
