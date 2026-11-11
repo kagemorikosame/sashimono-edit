@@ -1514,8 +1514,8 @@ class ChatPanel(QWidget):
     def _answer(self, allowed: bool, *, always: bool = False, turn: bool = False) -> None:
         """画面の確かめへの答えをブリッジへ渡す
 
-        先に許してから以降を許す印を付けるのは、時間切れで畳んだ確かめに印だけが付くのを防ぐため
-        付くと、次の指示の編集が確かめずに通る
+        以降を許す印は、許すのが決まった所で AI を起こす前に付ける 時間切れで畳んだ確かめに印だけが
+        付くと次の指示の編集が確かめずに通り、起こした後に付けると次の編集をもう 1 度尋ねる
         """
         approval = self._approval
         if approval is None:
@@ -1523,13 +1523,14 @@ class ChatPanel(QWidget):
         self._approval = None
         self._approval_box.setVisible(False)
         if allowed:
-            # 先に許す 時間切れや中断で畳んだ後の確かめなら、以降を許す印も付けない
-            # 付けると、次の指示の編集が確かめずに通る
-            if approval.allow():
+
+            def granted() -> None:
                 if always and not approval.irreversible:
                     self._bridge.allow_always(approval.tool)
                 if turn and not approval.irreversible:
                     self._bridge.allow_turn()
+
+            approval.allow(granted)
         elif approval.deny():
             self._record.refused(f"{approval.tool}（許可しませんでした）")
         self._refresh_status()

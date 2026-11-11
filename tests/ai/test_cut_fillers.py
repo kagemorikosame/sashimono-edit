@@ -102,6 +102,11 @@ class TestFindingFillers:
         line = _line(1.0, 2.0, ("あ", 1.0, 1.2), ("の", 1.2, 1.4), ("人", 1.4, 1.8))
         assert filler_spans(Transcript((line,), language="ja")) == []
 
+    def test_a_kanji_one_after_ano_is_kept(self) -> None:
+        """「あの一つ」の「一」は数 伸ばす記号と読み違えた形まで既定で切ると、話の言葉が欠ける"""
+        line = _line(1.0, 2.0, ("あの", 1.0, 1.3), ("一", 1.3, 1.5), ("つ", 1.5, 1.7))
+        assert filler_spans(Transcript((line,), language="ja")) == []
+
     def test_a_surprised_voice_is_kept_by_default(self) -> None:
         """驚きの「えっ」は反応の声 字幕の整形とは違い、音からは既定で切らない"""
         line = _line(1.0, 2.0, ("えっ", 1.0, 1.3), ("本", 1.4, 1.8))

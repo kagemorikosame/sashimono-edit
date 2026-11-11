@@ -735,13 +735,15 @@ def grouped_project(media_path: Path, material: str) -> Document:
     return document
 
 
-def group_metrics(project: Project) -> dict[str, float | int]:
+def group_metrics(project: Project) -> dict[str, float | int | None]:
     """カットの後にグループが残っているか
 
     ``kept_share`` は、時刻の重なる別のトラックのクリップの組のうち、同じグループに居る組の割合
     前半と後半のグループは時刻で分かれているので、重なる組はどれも同じグループの仲間だった物
     解かれると 1.0 より下がる 割った後ろの片割れが 1 本だけになった物（#427 の決まりで
     グループから外れる）は、重なる相手が居ないので数に入らない
+    比べる組が 1 つも無い（全部を切った）ときは ``None``（測れない） 1.0 と書くと、何も残らなかった
+    回を保てた回と並べる
     """
     clips = [
         (index, clip) for index, track in enumerate(project.timeline.tracks) for clip in track.clips
@@ -770,7 +772,7 @@ def group_metrics(project: Project) -> dict[str, float | int]:
     first, *rest = titles.values()
     merged = int(bool(first.intersection(*rest)))
     return {
-        "kept_share": 0.0 if merged else (round(same / pairs, 4) if pairs else 1.0),
+        "kept_share": 0.0 if merged else (round(same / pairs, 4) if pairs else None),
         "merged": merged,
         "pairs": pairs,
         "groups": len(groups),
@@ -779,7 +781,7 @@ def group_metrics(project: Project) -> dict[str, float | int]:
     }
 
 
-def cut_groups_with_tools(path: Path, params: ToolParams) -> dict[str, float | int]:
+def cut_groups_with_tools(path: Path, params: ToolParams) -> dict[str, float | int | None]:
     """道具の段 無音カット（``jet_cut`` と同じ命令）をグループの作品に掛けて数える"""
     document = grouped_project(path, "tools")
     media = document.project.media[0]
@@ -931,7 +933,7 @@ def run_ai_groups(
     session_factory: SessionFactory,
     *,
     timeout: float = AI_TIMEOUT_SECONDS,
-) -> tuple[AiRun, dict[str, float | int]]:
+) -> tuple[AiRun, dict[str, float | int | None]]:
     """AI の段のグループの課題 グループの作品を本物の編集画面で開き、AI にカットを頼む
 
     作品は外のフォルダの ``drafts`` に置く（AI が書ける場所を作品のフォルダに限るため）
@@ -1017,6 +1019,8 @@ def range_scores(
 
     見どころは区間の数が少なく、端の位置より「その場面を選んだか」が大事 正解の区間に 1 つでも
     重なる道具の区間があれば当たり（再現率）、道具の区間が正解のどれかに重なれば当たり（適合率）
+    表の主な数（``f1_iou``）は当たりの f1 に時間の重なり（iou）を掛けた物 当たりだけだと、素材の
+    全体を 1 つの区間で選んでも満点になる（PR #451 の CodeRabbit の指摘）
     """
     scores: dict[str, float | None] = dict(interval_scores(predicted, answer, duration))
 
@@ -1036,6 +1040,7 @@ def range_scores(
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),
+        "f1_iou": round(f1 * float(scores["iou"] or 0.0), 4),
         "predicted": len(predicted),
         "answer": len(answer),
     }
@@ -1886,7 +1891,7 @@ def command_ai_run(
     model: str | None = None,
     timeout: float = AI_TIMEOUT_SECONDS,
     commit: str | None = None,
-    runner: Callable[..., tuple[AiRun, dict[str, float | int]]] | None = None,
+    runner: Callable[..., tuple[AiRun, dict[str, float | int | None]]] | None = None,
 ) -> list[dict[str, object]]:
     """AI の段を回して結果を足す 今あるのはグループの課題だけ（#437）
 
@@ -1931,8 +1936,15 @@ def command_ai_run(
                 records.append(record)
                 continue
             if run.failed or not run.finished:
-                record.update(status="failed", reason="ai-error" if run.failed else "ai-timeout")
-            elif float(metrics.get("removed_seconds", 0.0)) <= 0.0:
+                # 途中まで数えた回数（グループを解いた・尋ねた）も残す 捨てると、解いてから落ちた
+                # 回を結果から読めず、モデルごとの比べからも外れる
+                record.update(
+                    status="failed",
+                    reason="ai-error" if run.failed else "ai-timeout",
+                    metrics=finite_metrics({**metrics, **run.metrics()}),
+                    params={"model": model or "default"},
+                )
+            elif float(metrics.get("removed_seconds") or 0.0) <= 0.0:
                 # 切らずに終えた グループが残ったのは切っていないから 成功と並べない
                 record.update(
                     status="failed",
@@ -1960,9 +1972,23 @@ HEADLINE = {
     TALK: "f1",
     SUBTITLES: "cer",
     EXPORT: "problems",
-    HIGHLIGHTS: "f1",
+    HIGHLIGHTS: "f1_iou",
     GROUPS: "kept_share",
 }
+
+
+def _headline(row: Mapping[str, Any], name: str) -> float | None:
+    """行の主な数 測れなかった（``None``）・前の版で書いて無い物は ``None``
+
+    ``float()`` へそのまま渡すと、全部を切った回が 1 行あるだけで表が出せない
+    """
+    value = row.get("metrics", {}).get(name)
+    return None if value is None else float(value)
+
+
+def _shown(value: float | None) -> str:
+    """表に出す数 測れない物を 0 と書くと、悪い結果と見分けられない"""
+    return "未測定" if value is None else f"{value:.4f}"
 
 
 def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -1987,10 +2013,11 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
             continue
         name = HEADLINE[task]
         now = history[-1]
-        value = float(now["metrics"][name])
+        value = _headline(now, name)
         previous = history[-2] if len(history) > 1 else None
-        before = None if previous is None else float(previous["metrics"][name])
-        change = "" if before is None else f"{value - before:+.4f}"
+        # 前の版で書いた行には今の主な数が無いことがある（見どころの f1_iou） 差を出さずに並べる
+        before = None if previous is None else _headline(previous, name)
+        change = "" if value is None or before is None else f"{value - before:+.4f}"
         # 書き出しの課題は正解を持たないので、仮も人も付けない
         mark = "-" if "provisional" not in now else ("仮" if now["provisional"] else "人")
         # 道具の値を変えて回した差と、コードを変えた差を取り違えないように印を付ける
@@ -2001,7 +2028,7 @@ def report_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         if previous is not None and previous.get("provisional") != now.get("provisional"):
             notes.append("正解が変わった")
         lines.append(
-            f"{stage:6} {material:4} {task:10} {name}={value:<6.4f} "
+            f"{stage:6} {material:4} {task:10} {name}={_shown(value):<6} "
             f"{'' if before is None else f'{before:.4f}':7} {change:7} "
             f"{float(now.get('seconds', 0)):6.1f} {mark} {' '.join(notes)}".rstrip()
         )

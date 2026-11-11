@@ -199,6 +199,22 @@ class TestApproval:
         assert approval.allow() is False
         assert approval.allowed is False
 
+    def test_the_grant_lands_before_the_ai_wakes(self) -> None:
+        """壊れると、AI が起きて次の編集へ進んだ後に「この指示の間は許可」が付き、もう 1 度尋ねる"""
+        approval = Approval(tool="split_clip", summary="", arguments={})
+        seen: list[bool] = []
+        assert approval.allow(lambda: seen.append(approval.done.is_set())) is True
+        assert seen == [False]
+        assert approval.done.is_set()
+
+    def test_a_late_answer_grants_nothing(self) -> None:
+        # 壊れると、畳んだ確かめに後から押した〔この指示の間は許可〕で次の指示まで黙って通る
+        approval = Approval(tool="split_clip", summary="", arguments={})
+        approval.deny("中断されました")
+        granted: list[int] = []
+        assert approval.allow(lambda: granted.append(1)) is False
+        assert granted == []
+
     def test_forgetting_always_brings_the_question_back(self, host: FakeHost) -> None:
         # 〔常に許可〕を取り消しても効いたままだと、利用者の知らないうちに AI が編集を続ける
         bridge = EditorBridge(host)

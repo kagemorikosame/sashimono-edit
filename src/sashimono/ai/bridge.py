@@ -123,11 +123,18 @@ class Approval:
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def allow(self) -> bool:
-        """許す すでに畳まれていたら何もせず偽を返す"""
+    def allow(self, granted: Callable[[], None] | None = None) -> bool:
+        """許す すでに畳まれていたら何もせず偽を返す
+
+        ``granted`` は AI のスレッドを起こす前に呼ぶ（以降を許す印を付ける所） 起こしてから
+        付けると、AI が先に次の編集へ進み、選んだ「この指示の間は許可」が効く前にもう 1 度尋ねる
+        （PR #451 の CodeRabbit の指摘） 畳まれていたら呼ばない
+        """
         with self._lock:
             if self.done.is_set():
                 return False
+            if granted is not None:
+                granted()
             self.allowed = True
             self.done.set()
             return True

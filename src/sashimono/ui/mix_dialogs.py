@@ -159,7 +159,10 @@ class LoudnessDialog(QDialog):
         self.limiter_box.setToolTip(
             "山が上限に当たって基準に届かないとき、選んだクリップの最後にリミッターを積んで山を"
             f" {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げます"
-            " 話し声の大きさはほとんど変わりません"
+            " 一瞬の山だけなら話し声の大きさはほぼ変わりませんが、上限を越える音が続く所は"
+            "その間も抑えるので、全体の音量が少し下がることがあります"
+            " 前に積んだリミッターがあるクリップには重ねて積みません"
+            " そろえた後に AI の check_output か書き出しで音量を確かめてください"
         )
         form.addRow(self.limiter_box)
         buttons = QDialogButtonBox(

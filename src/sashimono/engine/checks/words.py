@@ -453,24 +453,25 @@ def _shown_lines(project: Project, start: int, end: int) -> dict[tuple[MediaId, 
     burned: dict[tuple[MediaId, int], list[_Shown]] = {}
     # 素材・音・行ごとの、いちばん後に足した所 長いタイムラインで、行ごとに前の全部を探さない
     latest: dict[tuple[tuple[MediaId, int], str], _Shown] = {}
+    #: 焼き込んだ文字を元の行ごとに引く 素材ごとの全部を行ごとに見比べると、行の数の 2 乗になり、
+    #: 長い作品で検査の結果を返すのが待たされる（PR #451 の CodeRabbit の指摘）
+    by_line: dict[tuple[tuple[MediaId, int], str], list[_Shown]] = {}
     for item in burned_subtitles(project):
         origin = item.origin
         media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
         if media_id is None:
             continue
-        burned.setdefault((media_id, origin.stream), []).append(
-            _Shown(str(origin.segment_id), item.start, item.end, [str(item.clip_id)], True)
-        )
+        copy = _Shown(str(origin.segment_id), item.start, item.end, [str(item.clip_id)], True)
+        burned.setdefault((media_id, origin.stream), []).append(copy)
+        by_line.setdefault(((media_id, origin.stream), copy.segment_id), []).append(copy)
     for subtitle in heard_timeline(project):
         if subtitle.media_id is None:
             continue
         key = (subtitle.media_id, subtitle.stream)
         segment = str(subtitle.segment.id)
         if any(
-            copy.segment_id == segment
-            and copy.start < subtitle.end_frame
-            and subtitle.start_frame < copy.end
-            for copy in burned.get(key, [])
+            copy.start < subtitle.end_frame and subtitle.start_frame < copy.end
+            for copy in by_line.get((key, segment), [])
         ):
             continue
         # 開始位置の順に来るので、続けて映る所は直前の同じ行へ足す

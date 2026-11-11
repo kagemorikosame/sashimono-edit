@@ -64,6 +64,15 @@ def test_range_scores_count_chosen_scenes(tool: ModuleType) -> None:
     assert tool.range_scores([], [], 30.0)["f1"] == 1.0
 
 
+def test_choosing_the_whole_material_is_not_full_marks(tool: ModuleType) -> None:
+    """壊れると、素材の全体を 1 つの区間で選んだ道具が、見どころの表で満点になる"""
+    scores = tool.range_scores([[0.0, 60.0]], [[10.0, 11.0]], 60.0)
+    # 場面を選んだかの数は残す
+    assert scores["f1"] == 1.0
+    assert scores["f1_iou"] < 0.1
+    assert tool.HEADLINE[tool.HIGHLIGHTS] == "f1_iou"
+
+
 def test_highlights_are_answered_from_scratch(
     folder: tuple[ModuleType, Any, Any], tmp_path: Path
 ) -> None:
@@ -153,6 +162,27 @@ def test_group_metrics_notice_merged_groups(tool: ModuleType, tmp_path: Path) ->
     assert tool.group_metrics(tool.grouped_project(audio, "E02").project)["merged"] == 0
 
 
+def test_nothing_left_is_not_counted_as_kept(tool: ModuleType, tmp_path: Path) -> None:
+    """壊れると、全部を切って比べる組が無くなった回を、グループを保てた 1.0 と書く"""
+    from sashimono.core.commands import RemoveClips
+
+    audio = _write_talk(tmp_path / "talk.wav")
+    document = tool.grouped_project(audio, "E02")
+    every = tuple(clip.id for track in document.project.timeline.tracks for clip in track.clips)
+    document.execute(RemoveClips(every))
+    empty = tool.group_metrics(document.project)
+    assert (empty["pairs"], empty["kept_share"]) == (0, None)
+    row = {
+        "stage": "tools",
+        "material": "E02",
+        "task": tool.GROUPS,
+        "status": "ok",
+        "metrics": empty,
+    }
+    [_, line] = tool.report_lines([row, row])
+    assert "未測定" in line
+
+
 def test_group_metrics_see_merged_fragments_after_a_split(tool: ModuleType, tmp_path: Path) -> None:
     """まとめた後に前半を割ると、後ろの片割れは新しいグループへ移る 最後の断片だけで決めると
     前の断片のまとまりを見落とし、merged が 0 になる（PR #451 の CodeRabbit の指摘）
@@ -219,6 +249,23 @@ def test_the_ai_stage_writes_its_counts(
         eval_dir, book, [], allow_send=True, results=results, runner=timed_out, commit=""
     )
     assert record["reason"] == "ai-timeout"
+
+    def ungrouped_then_failed(*_args: object, **_kwargs: object) -> tuple[Any, dict[str, Any]]:
+        return tool.AiRun(ungroup_calls=1, failed=True), {"kept_share": 0.5}
+
+    # 解いてから落ちた回も、解いた回数とモデルを残す 捨てるとどのモデルが解いたか読めない
+    [record] = tool.command_ai_run(
+        eval_dir,
+        book,
+        [],
+        allow_send=True,
+        results=results,
+        runner=ungrouped_then_failed,
+        commit="",
+    )
+    assert record["reason"] == "ai-error"
+    assert record["metrics"]["ungroup_calls"] == 1
+    assert record["params"] == {"model": "default"}
 
     def untouched(*_args: object, **_kwargs: object) -> tuple[Any, dict[str, float | int]]:
         return tool.AiRun(tool_calls=1, finished=True), {"kept_share": 1.0, "removed_seconds": 0}
