@@ -9,6 +9,10 @@ Sashimono はまだ **β 版**です 作りが大きく変わることがあり�
   - 使い方・どちらとも言えないこと → 「質問」
 - **Issue** は開発者が直す作業を管理する置き場です Discussions で確かめた報告を、開発者が Issue に起こします
   （Issue を作る画面を開くと、Discussions のカテゴリへ案内されます）
+  - 開発者が Issue を作るときは、`docs/issue-templates/` の雛形（新機能・不具合・調査）を埋めて
+    `tools\new_issue.py` で作ります 必須の節と句点を確かめ、ラベル・マイルストーン・
+    ロードマップへの登録までを一度に行います 書き方とラベルの決まりは
+    [docs/development.md](docs/development.md) の「Issue の書き方」にあります
 - **コードを書く** → 以下
 
 **開発ルールの大本は [docs/development.md](docs/development.md)** ここは手順だけ

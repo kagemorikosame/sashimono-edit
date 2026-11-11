@@ -49,6 +49,19 @@ Dependabot の PR は CodeRabbit が審査しない（ボットに席が付か�
 CI がすべて通る・変わったのが版の数字（とロック）だけ・大きな版上げなら部品の変更点に使い方が変わる所が無い
 大きな版上げのときだけ `@codex review` を 1 回頼む
 
+## Issue の作り方
+
+Issue は白紙から `gh issue create` で作らず、`docs/issue-templates/` の雛形を埋めて `tools\new_issue.py` で作る
+（新機能 `feature`・不具合 `bug`・調査と親 `investigation`）
+```
+.venv\Scripts\python.exe tools\new_issue.py draft bug .work\issue.md
+.venv\Scripts\python.exe tools\new_issue.py create bug --title "題" --area 編集の土台 --size 小 --milestone 0.2.6 --body-file .work\issue.md
+```
+必須の節・句点・ラベル（種類・分野・大きさ・状態）・マイルストーン・ロードマップへの「未着手」での登録を一度に確かめる
+分野と大きさは省けない（当たる分野が無ければ `--area なし`） 「大」は親と子に分ける（子は `--parent <番号>`）
+`.github/ISSUE_TEMPLATE/` に雛形を置かない（使う人が Discussions を通らずに Issue を作れてしまう）
+詳しくは [docs/development.md](docs/development.md) の「Issue の書き方」
+
 ## 覚えておくと早いこと
 
 - 版の出どころは `src/sashimono/__init__.py` の `__version__` 1 か所だけ

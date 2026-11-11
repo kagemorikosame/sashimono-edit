@@ -89,6 +89,7 @@ def run_self_check() -> list[CheckResult]:
         ("スクリプト置き場", _script_roots, False),
         ("同梱の絵（アイコン・ボタンの印）", _bundled_files, False),
         ("追加機能の導入（pip）", _pip, False),
+        (WORKER_CHECK_NAME, _worker, False),
         (UPDATE_CHECK_NAME, _update, False),
         # 最後に置く ほかの項目が Qt・FFmpeg・Lua の DLL を読み終えてから数えないと、
         # まだ読んでいない部品の分を見逃す
@@ -460,6 +461,26 @@ def _pip() -> str:
     from pip import __version__ as pip_version
 
     return f"pip {pip_version}"
+
+
+#: 別のプロセスの項目の名前（#440）
+WORKER_CHECK_NAME = "別のプロセスで走らせる（控えの作成）"
+
+
+def _worker() -> str:
+    """裏の処理を走らせる子のプロセスを、この exe で起こせるか
+
+    配布版では子も同じ exe で、``app.main`` の頭の ``freeze_support`` が子の役へ回す
+    組み立てでそこが抜けると、控えを作るたびに編集画面がもう 1 つ立ち上がる 起動の途中で
+    Defender に止められる機械も、ここで分かる（控えはスレッドへ戻して作れるが遅い）
+    """
+    from sashimono.engine.worker import probe_job, run_in_process
+
+    seen: list[float] = []
+    answer = run_in_process(probe_job, {"value": "子が答えた"}, progress=seen.append)
+    if answer != "子が答えた" or not seen:
+        raise RuntimeError(f"子から答えが返らなかった（{answer!r} 進み具合 {len(seen)} 回）")
+    return f"{answer}（進み具合 {len(seen)} 回）"
 
 
 #: 自動更新の項目の名前 配る zip を組み立てる道具が、この項目が通ったかを見る
