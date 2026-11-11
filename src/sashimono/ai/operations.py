@@ -13346,6 +13346,7 @@ OPERATIONS: tuple[Operation, ...] = (
         # 結果は書き出し先の場所 待ったときは様子（場所と、入れなかった書体・スクリプト・
         # 素材の名前の一覧）
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"started"}),
     ),
     Operation(
@@ -13376,6 +13377,7 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_package_open_consent,
         # 開いたパッケージの場所 待ったときは様子（展開した作品の場所と足りない書体の名前）
         sends=_WITH_FILES,
+        preview=from_arguments(),
         name_keys=frozenset({"started"}),
     ),
     Operation(
@@ -13396,6 +13398,7 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_package_status,
         # 様子には書き出し先・展開した作品の場所と、素材の名前・書体の名前が入る
         sends=_WITH_FILES,
+        preview=from_result(),
     ),
     Operation(
         name="export_status",
