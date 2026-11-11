@@ -8,18 +8,20 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
+import numpy as np
+
+from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, TranscriptSegment, Word
 from sashimono.core.projection import (
     HeardPiece,
     burned_subtitles,
     heard_pieces,
     heard_timeline,
 )
-from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming, shifted
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -32,7 +34,12 @@ from sashimono.core.words import (
     phrases,
     split_seam,
 )
-from sashimono.engine.audio.voice_edges import REACH, loudness_of_waveform, retime
+from sashimono.engine.audio.voice_edges import (
+    REACH,
+    fit_to_voice,
+    found_edges,
+    loudness_of_waveform,
+)
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
     JOINED,
@@ -561,6 +568,44 @@ def _timing_problem(
     )
 
 
+def _expected_edges(
+    segments: Sequence[TranscriptSegment], timing: SubtitleTiming, loudness: np.ndarray
+) -> dict[str, tuple[Fraction, Fraction]]:
+    """行ごとに、声へ寄せて設定のずらしを足した（あるべき）頭と終わり 行の ID で引く
+
+    行の時刻に設定のずらしが足してあるか（起こしたときや合わせ直したときに足した）どうかは、
+    行を見ても分からない 足してあると決めて足したまま寄せると、ずらしが寄せる幅
+    （``voice_edges.REACH``）を越えた端は声を見つけられずに残り、もう 1 度ずらしを足して比べる先が
+    倍ずれる（PR #451 の Codex の指摘） 足していないと決めて外してから寄せると、足していない行では
+    外した先から寄せ直すのでずれの幅が小さく出る
+    そこで端ごとに、外した位置と外さない位置の両方から寄せ、声の境目が見つかった方を採る 両方で
+    見つかれば動きの小さい方（境目のすぐそばにいた方） どちらも見つからなければ、起こしたときに
+    足すのが普通なので外した方を採る
+    """
+    ordered = sorted(segments, key=lambda s: (s.start, s.end))
+    raw = [(s.start, s.end) for s in ordered]
+    seeds = [shifted(raw, -timing.start_offset, -timing.end_offset), raw]
+    if not (timing.start_offset_ms or timing.end_offset_ms):
+        seeds = [raw]
+    guesses = []
+    for times in seeds:
+        fitted = fit_to_voice(times, loudness)
+        expected = shifted(fitted, timing.start_offset, timing.end_offset)
+        found = found_edges(times, loudness)
+        guesses.append(list(zip(times, fitted, expected, found, strict=True)))
+    out: dict[str, tuple[Fraction, Fraction]] = {}
+    for index, segment in enumerate(ordered):
+        edges = []
+        for side in (0, 1):
+            choices = [
+                (not found[side], abs(fit[side] - seed[side]), order, expected[side])
+                for order, (seed, fit, expected, found) in enumerate(g[index] for g in guesses)
+            ]
+            edges.append(min(choices)[3])
+        out[str(segment.id)] = (edges[0], edges[1])
+    return out
+
+
 def _subtitle_timing(
     project: Project, start: int, end: int, waveform_of: WaveformOf, timing: SubtitleTiming
 ) -> tuple[list[Problem], int, int]:
@@ -573,7 +618,6 @@ def _subtitle_timing(
     """
     problems: list[Problem] = []
     unknown = unplaced = 0
-    wanted = SubtitleTiming(True, timing.start_offset_ms, timing.end_offset_ms)
     frame = project.rate.frame_duration
     pieces = heard_pieces(project)
     for key, lines in _shown_lines(project, start, end).items():
@@ -586,10 +630,7 @@ def _subtitle_timing(
         if waveform is None:
             unknown += len(lines)
             continue
-        fitted = {
-            str(s.id): s
-            for s in retime(transcript.segments, wanted, loudness_of_waveform(waveform))
-        }
+        fitted = _expected_edges(transcript.segments, timing, loudness_of_waveform(waveform))
         known = [s.index for s in media.audio_streams]
         common: dict[str, float | int | str | bool] = {
             "media_id": str(media_id),
@@ -605,8 +646,8 @@ def _subtitle_timing(
             if target is None:
                 continue
             placed = _placed_with(heard, line)
-            head = _projected(placed, target.start, line.start, project)
-            tail = _projected(placed, target.end, line.end, project)
+            head = _projected(placed, target[0], line.start, project)
+            tail = _projected(placed, target[1], line.end, project)
             if head is None or tail is None:
                 # 寄せた端を切って鳴らない 比べられない端を、合っていると読まない 片端でも数える
                 # （残った端が合っていても、切った側の字幕が声の無い所に映っているかもしれない）

@@ -90,6 +90,25 @@ def test_the_preferred_offset_is_not_a_problem(video_media: MediaItem) -> None:
     assert _check(_media(video_media, (early, float(end)))).problems != ()
 
 
+def test_an_offset_beyond_the_reach_is_not_doubled(video_media: MediaItem) -> None:
+    """終わりを +2 秒にした人の字幕
+
+    壊れると、寄せる幅を越えた端へずらしを 2 回足して、正しい字幕を 2 秒早いと読む
+    """
+    ((start, end),) = _fitted((1.0, 2.6))
+    timing = SubtitleTiming(end_offset_ms=2000)
+    later = _media(video_media, (float(start), float(end) + 2.0))
+    assert _check(later, timing=timing).problems == ()
+    # 設定のずらしが足されていない行は、設定より 2 秒早く消える 外した位置からだけ寄せると、外した
+    # 先から寄せ直して幅を小さく（0.5 秒と）読む
+    (problem,) = _check(_media(video_media, (float(start), float(end))), timing=timing).problems
+    assert float(problem.measure["end_offset_seconds"]) == pytest.approx(-2.0, abs=0.05)
+    assert (
+        "start_offset_seconds" not in problem.measure
+        or abs(float(problem.measure["start_offset_seconds"])) < 0.05
+    )
+
+
 def test_without_a_waveform_it_is_not_counted_as_checked(video_media: MediaItem) -> None:
     """比べられなかった行を問題 0 件と読むと、ずれは無いと AI に言うことになる"""
     report = _check(_media(video_media, (0.6, 2.6)), sound=None)
