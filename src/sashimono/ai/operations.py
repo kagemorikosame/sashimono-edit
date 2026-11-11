@@ -54,6 +54,7 @@ from sashimono.ai.host import (
     UNSAVED_REFUSAL,
     EditorHost,
     ExportRequest,
+    PackageRequest,
     SheetCanvas,
     ToolError,
 )
@@ -482,6 +483,7 @@ from sashimono.engine.highlights import (
 from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
+from sashimono.engine.package.archive import PACKAGE_SUFFIX, RIGHTS_NOTE
 from sashimono.engine.reframe import (
     FaceSummary,
     GatheredFaces,
@@ -8861,6 +8863,140 @@ def _open_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
     }
 
 
+# --- 持ち出し用パッケージ（#423 取り消せない操作） ---
+#
+# 書き出しは画面の〔持ち出し用に書き出す…〕、開くは〔持ち出し用パッケージを開く…〕と同じ処理を
+# ホストに頼む（道具はファイルを書かない） 書く場所と開ける場所は作品の保存・開くと同じ決まり
+# どちらも数分かかるので裏で進め、終わりを待つのは書き出し（export_video）と同じ Pending
+
+#: 使う範囲の前後の余裕（秒）の範囲 画面の窓（``Preferences.package_margin_seconds``）と同じ
+_PACKAGE_MARGIN_RANGE = (0, 60)
+#: 余裕の既定 画面の窓の既定と同じ
+_PACKAGE_MARGIN_DEFAULT = 1
+
+
+def _package_flag(arguments: dict[str, Any], name: str) -> bool:
+    raw = arguments.get(name, False)
+    if not isinstance(raw, bool):
+        raise ToolError(f"{name} は true か false で渡してください")
+    return raw
+
+
+def _refuse_running_package(host: EditorHost) -> None:
+    if host.package_status().get("state") == "working":
+        raise ToolError(
+            "持ち出し用パッケージの書き出しか展開がもう走っています package_status で"
+            "終わるのを待ってから始めてください"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PackagePlan:
+    request: PackageRequest
+    detail: str
+
+
+def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
+    """書き出しの引数を画面の窓と同じ選び方で確かめる（確かめと実行の 2 度呼ぶ）"""
+    raw = arguments.get("path")
+    _require_suffix(raw, (PACKAGE_SUFFIX,), "持ち出し用パッケージ")
+    _wait_seconds(arguments)
+    whole = _package_flag(arguments, "whole")
+    keep = _package_flag(arguments, "keep_metadata")
+    margin = arguments.get("margin_seconds", _PACKAGE_MARGIN_DEFAULT)
+    low, high = _PACKAGE_MARGIN_RANGE
+    if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
+        raise ToolError(f"margin_seconds は {low}〜{high} の整数で渡してください")
+    _refuse_running_package(host)
+    path = _write_target(host, raw)
+    media = len(host.document.project.media)
+    parts = [
+        f"素材 {media} 本の"
+        + ("全体を入れます" if whole else f"使っている範囲だけ（前後 {margin} 秒）を入れます"),
+        "撮った場所などの付け足しの情報を"
+        + ("残します" if keep else "取り除きます（回転と色の情報は残ります）"),
+        "画質と音質は元のまま 書体と AviUtl のスクリプトは入れません",
+        RIGHTS_NOTE,
+        _replacing(path, "ファイル"),
+    ]
+    request = PackageRequest(
+        path=path,
+        whole=whole,
+        margin=Fraction(margin),
+        keep_metadata=keep,
+        expect=expect_now(path),
+    )
+    _refuse_elsewhere()
+    return _PackagePlan(request=request, detail="\n".join(part for part in parts if part))
+
+
+def _package_export_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    plan = _package_plan(host, arguments)
+    return Consent(
+        action="持ち出し用パッケージを書き出します",
+        target=str(plan.request.path),
+        detail=plan.detail,
+        basis=plan.request.expect,
+    )
+
+
+def _awaiting_package(host: EditorHost, seconds: float) -> Pending:
+    return Pending(wait=host.package_waiter(), seconds=seconds, then=host.package_status)
+
+
+def _export_package(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    wait = _wait_seconds(arguments)
+    plan = _package_plan(host, arguments)
+    host.start_package_export(replace(plan.request, expect=_basis(consent)))
+    if wait > 0:
+        return _awaiting_package(host, wait)
+    return {
+        "started": str(plan.request.path),
+        "next": "書き出しは裏で進みます package_status で進み具合と、入れなかった物の一覧を"
+        "読めます（wait_seconds を付けると、その秒数まで終わるのを待ちます）",
+    }
+
+
+def _package_open_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    raw = arguments.get("path")
+    _require_suffix(raw, (PACKAGE_SUFFIX,), "持ち出し用パッケージ")
+    _wait_seconds(arguments)
+    _refuse_unsaved(host)
+    _refuse_running_package(host)
+    path = openable_project(host, raw)
+    status = path.stat()
+    when = datetime.fromtimestamp(status.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return Consent(
+        action="持ち出し用パッケージを開きます",
+        target=str(path),
+        detail=(
+            f"パッケージは {status.st_size:,} バイト {when} 更新 作業用のフォルダへ素材ごと"
+            f"展開してから開きます {_CLOSING_NOTE}"
+        ),
+        basis=expect_now(path),
+    )
+
+
+def _open_package(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    wait = _wait_seconds(arguments)
+    # 開くのは人が許した場所（:func:`_open_project` と同じ訳）
+    host.start_package_open(Path(consent.target))
+    if wait > 0:
+        return _awaiting_package(host, wait)
+    return {
+        "started": str(consent.target),
+        "next": "展開は裏で進みます 終われば作品を開きます package_status で様子を読めます"
+        " この指示の中では、開いた作品をもう編集しません",
+    }
+
+
+def _package_status(host: EditorHost, arguments: dict[str, Any]) -> object:
+    wait = _wait_seconds(arguments)
+    if wait > 0 and host.package_status().get("state") == "working":
+        return _awaiting_package(host, wait)
+    return host.package_status()
+
+
 def _new_settings(arguments: dict[str, Any]) -> tuple[tuple[int, int] | None, FrameRate | None]:
     """新しい作品の解像度とフレームレート 省けば本人の「新しい作品」の設定のまま"""
     resolution: tuple[int, int] | None = None
@@ -13166,6 +13302,100 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
         preview=from_arguments(),
         name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="export_package",
+        description=(
+            "作品と素材を 1 つのファイル（"
+            + PACKAGE_SUFFIX
+            + "）にまとめて、素材の無い別の PC でも"
+            "開いて編集・書き出しできるようにする（画面の〔持ち出し用に書き出す…〕と同じ）"
+            " 毎回ユーザーに確かめる 画質と音質は元のまま（再エンコードしない） 既定は使っている"
+            "範囲だけを入れ、撮った場所などの付け足しの情報を取り除く 書体と AviUtl のスクリプトは"
+            "入れない 書き出しは裏で進み、すぐ戻る 様子は package_status で読む 書けるのは今の"
+            "作品のフォルダと、書き出しの窓で前に選んだフォルダの中だけ"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    f"書き出し先（{PACKAGE_SUFFIX} で終える） "
+                    "相対の場所は今の作品のフォルダから読む"
+                ),
+                "whole": _boolean(
+                    "素材の全体を入れる（既定 false は使っている範囲だけ 全体なら範囲の外へも"
+                    "トリムを伸ばせるが大きくなる）"
+                ),
+                "margin_seconds": _integer(
+                    f"使っている範囲の前後に足す秒（{_PACKAGE_MARGIN_RANGE[0]}〜"
+                    f"{_PACKAGE_MARGIN_RANGE[1]}、既定 {_PACKAGE_MARGIN_DEFAULT}）"
+                ),
+                "keep_metadata": _boolean(
+                    "撮った場所・機器の名前などを残す（既定 false は取り除く 回転と色は残る）"
+                ),
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
+                ),
+            },
+            ["path"],
+        ),
+        handler=_consented(_export_package, _package_export_consent),
+        approved=_export_package,
+        writes=True,
+        irreversible=True,
+        consent=_package_export_consent,
+        # 結果は書き出し先の場所 待ったときは様子（場所と、入れなかった書体・スクリプト・
+        # 素材の名前の一覧）
+        sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="open_package",
+        description=(
+            "持ち出し用パッケージ（" + PACKAGE_SUFFIX + "）を作業用のフォルダへ展開し、今の作品と"
+            "差し替える（画面の〔持ち出し用パッケージを開く…〕と同じ） 毎回ユーザーに確かめる"
+            " 中身は SHA-256 で確かめ、壊れていれば開かない 展開は裏で進み、すぐ戻る 様子は "
+            "package_status で読む 開けるのは今の作品のフォルダと、書き出しの窓で前に選んだ"
+            "フォルダの中だけ 保存していない変更があれば断る 開いた後、この指示の中では編集の"
+            "道具を使えない"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    f"開くパッケージ（{PACKAGE_SUFFIX}） 相対の場所は今の作品のフォルダから読む"
+                ),
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
+                ),
+            },
+            ["path"],
+        ),
+        handler=_consented(_open_package, _package_open_consent),
+        approved=_open_package,
+        writes=True,
+        irreversible=True,
+        consent=_package_open_consent,
+        # 開いたパッケージの場所 待ったときは様子（展開した作品の場所と足りない書体の名前）
+        sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="package_status",
+        description=(
+            "持ち出し用パッケージの書き出しか展開の様子を読む kind は export / open、state は "
+            "idle / working / done / failed / cancelled message に入れなかった物（書き出し）や"
+            "この PC に足りない書体とスクリプト（展開）の一覧が入る wait_seconds を付けると、"
+            "終わるかその秒数まで待ってから返す"
+        ),
+        schema=_schema(
+            {
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は今の様子をすぐ返す）"
+                )
+            }
+        ),
+        handler=_package_status,
+        # 様子には書き出し先・展開した作品の場所と、素材の名前・書体の名前が入る
+        sends=_WITH_FILES,
     ),
     Operation(
         name="export_status",

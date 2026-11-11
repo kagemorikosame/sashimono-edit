@@ -31,6 +31,7 @@ __all__ = [
     "TargetChangedError",
     "copy_atomic",
     "expect_now",
+    "fill_atomic",
     "held_for_update",
     "write_atomic",
     "write_atomic_bytes",
@@ -115,6 +116,23 @@ def copy_atomic(
             durable,
             expect,
         )
+
+
+def fill_atomic(
+    path: Path,
+    fill: Callable[[BinaryIO], object],
+    *,
+    durable: bool = False,
+    expect: Expected | None = None,
+) -> os.stat_result:
+    """新しく作った仮のファイルを ``fill`` で埋めてから ``path`` の名前を付ける
+
+    仮のファイルの名前・片付け・置き換えの決まりは :func:`write_atomic` と同じ 持ち出し用の
+    パッケージ（#423）のように、手元に丸ごと抱えられない大きな物を少しずつ書くのに使う
+    ``fill`` が投げたら仮のファイルを片付けて上げ直す（前のファイルは無傷で残る）
+    書いた仮のファイルの身元を返す（:func:`copy_atomic` と同じ）
+    """
+    return _fill(Path(path), fill, durable, expect)
 
 
 #: 置き換えた前のファイルを残す世代の既定 画面の設定のバックアップの世代数の既定と同じ

@@ -133,6 +133,7 @@ __all__ = [
     "MEDIA_SPLIT_MODES",
     "MEDIA_TOGETHER",
     "MIN_PREFETCH_MB",
+    "PACKAGE_MARGINS",
     "PROXY_UNUSED_LATER",
     "PROXY_UNUSED_MODES",
     "PROXY_UNUSED_ON_USE",
@@ -296,6 +297,8 @@ LIMIT_ACTIONS = tuple(action.value for action in LimitAction)
 AI_TOKEN_LIMITS = (0, 1_000_000_000)
 AI_IMAGE_LIMITS = (0, 10_000)
 AI_MINUTE_LIMITS = (0, 1440)
+#: 持ち出し用パッケージの、使う範囲の前後の余裕（秒）の範囲 長すぎると範囲だけ入れる意味が無い
+PACKAGE_MARGINS = (0, 60)
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -872,6 +875,18 @@ class Preferences:
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
     #: 窓で選んで書き出した所だけ 2026-10-14 利用者の決定 #350）
     export_folder: str = ""
+    #: 持ち出し用パッケージ（#423）を開くときに展開するフォルダ 空は既定
+    #: （``%LOCALAPPDATA%\Sashimono\packages``） 素材ごと取り出すので数十 GB になりうる
+    #: 空きのある別のドライブへ移したい人がいるので、設定画面で選べるようにする
+    package_folder: str = ""
+    #: 持ち出し用に書き出す窓で前に選んだ物 好みではなく覚えている物なので設定画面には出さない
+    #: 窓の既定は知らない人が困らない側（使う範囲だけ・前後 1 秒・付け足しの情報を取り除く）
+    #: 素材をまるごと入れる
+    package_whole: bool = False
+    #: 使う範囲の前後に足す余裕（秒）
+    package_margin_seconds: int = 1
+    #: 撮った場所などの付け足しの情報を残す
+    package_keep_metadata: bool = False
     #: AI アシスタントが外（Anthropic）へ送る物ごとに、送る前に尋ねる（``ask``）・尋ねずに
     #: 送る（``allow``）・送らない（``deny``）（#342 :mod:`sashimono.ai.outbound`）
     #: 既定は尋ねる 何が外へ出るかを知らないまま、映像の絵や字幕の文が送られるのは困る
@@ -1353,6 +1368,14 @@ class PreferenceStore:
             ),
             ocr_engine=_choice(data.get("ocr_engine"), OCR_ENGINES, plain.ocr_engine),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
+            package_folder=_folder(data.get("package_folder"), plain.package_folder),
+            package_whole=_flag(data.get("package_whole"), plain.package_whole),
+            package_margin_seconds=_within(
+                data.get("package_margin_seconds"), PACKAGE_MARGINS, plain.package_margin_seconds
+            ),
+            package_keep_metadata=_flag(
+                data.get("package_keep_metadata"), plain.package_keep_metadata
+            ),
             ai_send_frames=_choice(data.get("ai_send_frames"), SEND_MODES, plain.ai_send_frames),
             ai_send_text=_choice(data.get("ai_send_text"), SEND_MODES, plain.ai_send_text),
             ai_send_files=_choice(data.get("ai_send_files"), SEND_MODES, plain.ai_send_files),
