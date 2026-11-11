@@ -145,7 +145,7 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
-from sashimono.core.io.atomic import Expected, write_atomic_bytes
+from sashimono.core.io.atomic import Expected, expect_now, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
@@ -3491,7 +3491,11 @@ class MainWindow(QMainWindow):
             target, options = dialog.target(), dialog.options()
         finally:
             dialog.deleteLater()
-        if target.exists():
+        # 確かめたときの書き出し先を覚え、書き終えて名前を付ける所で照らす 書いている数分の間に
+        # 同じ名前が現れたり置き換えを許したファイルが差し替わったりすると、許していない物を
+        # 置き換える（作品の保存と同じ #449 の CodeRabbit の指摘）
+        approved = expect_now(target)
+        if approved.identity is not None:
             answer = QMessageBox.question(
                 self,
                 "持ち出し用に書き出す",
@@ -3499,7 +3503,13 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self._start_package_export(project, target, options, expect=None, check=None)
+        self._start_package_export(
+            project,
+            target,
+            options,
+            expect=replace(approved, keep=self._preferences.backup_generations),
+            check=None,
+        )
 
     def open_package(self) -> None:
         """〔持ち出し用パッケージを開く…〕 作業用のフォルダへ展開して普段の作品として開く"""
@@ -3565,9 +3575,14 @@ class MainWindow(QMainWindow):
         root = package_root(self._preferences)
         # 始めたときに開いていた作品 展開している間に別の作品を開いたら、終わっても差し替えない
         self._package_from = self._document.generation
+        # 選んだときのパッケージの身元 展開では開いた物をこれと照らし、違えば開かない
+        # 選んでから裏で開くまでに差し替えられると、人が選んでいない物を展開する
+        chosen = expect_now(package)
 
         def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
-            return unpack_package(package, root, progress=progress, cancelled=cancelled)
+            return unpack_package(
+                package, root, progress=progress, cancelled=cancelled, expect=chosen
+            )
 
         self._package.start("open", package, work, by_assistant=by_assistant)
 
@@ -3581,6 +3596,16 @@ class MainWindow(QMainWindow):
             return
         if kind == "export" and isinstance(result, PackResult):
             summary = packed_summary(result)
+            # 知らせに並ぶスクリプトとファイルの名前は、作品の外の名前（元の PC のフォルダの
+            # 名前やユーザー名を含みうる） 様子（package_status）で AI へ渡るので、名前を送らない
+            # と決めた人の所では伏せ字の表に入れて伏せる（#342 #449 の CodeRabbit の指摘）
+            job.remember(
+                *result.scripts,
+                *result.metadata_kept,
+                *result.whole_instead,
+                *result.missing_files,
+                *result.unused_media,
+            )
             job.note(summary)
             if not job.by_assistant:
                 QMessageBox.information(self, "持ち出し用に書き出しました", summary)
