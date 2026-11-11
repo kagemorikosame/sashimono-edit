@@ -186,12 +186,16 @@ FILE_WRITING_TOOLS = frozenset(
         "save_snapshot",
         # ナレーション（#335） 作品のフォルダの narration へ新しい名前の WAV を書く
         "generate_narration",
+        # 持ち出し用パッケージ（#423） 書き出し先のフォルダを持ったまま書く（ui/main_window.py
+        # の _start_package_export が pinned に通す）
+        "export_package",
     }
 )
 
 #: 今の作品を閉じて差し替える道具（#349 開く・新規） ファイルは書かず読むだけだが、
 #: 取り消しで前の作品へ戻れないので取り消せない操作 毎回確かめる（2026-10-20 利用者の決定）
-PROJECT_REPLACING_TOOLS = frozenset({"open_project", "new_project"})
+#: 持ち出し用パッケージを開く（#423）も、展開した作品へ差し替えるのでここに入る
+PROJECT_REPLACING_TOOLS = frozenset({"open_project", "new_project", "open_package"})
 
 #: 道具のコードがホストに書かせる口と、それを呼んでよい道具の関数
 #: 道具の関数の外（読む道具・編集の道具）から呼ぶと、確かめを通らずにファイルを書く
@@ -199,6 +203,7 @@ _HOST_WRITERS = {
     "_save_project": {"write_project"},
     "_save_project_as": {"write_project"},
     "_export_video": {"start_export"},
+    "_export_package": {"start_package_export"},
     "_export_subtitles": {"write_subtitles"},
     "_save_snapshot": {"write_snapshot"},
     # ナレーション（#335） 声を作り終えてから書く所 AI の道具と人の窓が同じ関数を通る
