@@ -109,6 +109,17 @@ def test_an_offset_beyond_the_reach_is_not_doubled(video_media: MediaItem) -> No
     )
 
 
+def test_a_line_far_from_any_voice_is_not_counted_as_checked(video_media: MediaItem) -> None:
+    """声の境目が近くに無い字幕
+
+    壊れると、元の時刻をあるべき時刻にして差 0 と読み、声の無い所の字幕を通す
+    """
+    report = _check(_media(video_media, (0.1, 0.5)))
+    assert report.problems == ()
+    assert SUBTITLE_TIMING in report.skipped
+    assert any("声の出だしや終わりが見つからない" in note for note in report.notes)
+
+
 def test_without_a_waveform_it_is_not_counted_as_checked(video_media: MediaItem) -> None:
     """比べられなかった行を問題 0 件と読むと、ずれは無いと AI に言うことになる"""
     report = _check(_media(video_media, (0.6, 2.6)), sound=None)

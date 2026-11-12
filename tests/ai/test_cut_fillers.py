@@ -12,6 +12,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.core.fillers import filler_key, filler_spans
 from sashimono.core.model import (
+    AudioStreamInfo,
     Clip,
     GeneratedSource,
     MediaItem,
@@ -238,3 +239,30 @@ class TestReviewFixes:
         result = _run(host, media_id=str(project.media[0].id))
         assert result["tracks_left"] == [str(locked.id)]
         assert "tracks_left" in result["note"]
+
+    def test_a_locked_voice_is_refused_without_cutting(self, video_media: MediaItem) -> None:
+        """声を鳴らすトラックがロック
+
+        壊れると、声は残ったまま映像と字幕だけが詰まり、切った量も大きく返す
+        """
+        project = make_loaded(video_media, SPOKEN)
+        tracks = tuple(replace(track, locked=True) for track in project.timeline.tracks)
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        host = FakeHost(project)
+        with pytest.raises(ToolError, match="どれもロックしたトラック"):
+            _run(host, media_id=str(project.media[0].id))
+        assert host.document.project == project
+
+    def test_a_voice_not_on_the_timeline_is_refused(self, video_media: MediaItem) -> None:
+        """字幕の音声 2 を鳴らすクリップが無い 壊れると、音声 2 の時刻で音声 1 の話を切る"""
+        second = AudioStreamInfo(
+            index=2, sample_rate=48000, channels=2, time_base=F(1, 48000), codec="aac"
+        )
+        two = replace(video_media, audio_streams=(*video_media.audio_streams, second))
+        project = make_loaded(two, Transcript(segments=(), language="ja"))
+        media = project.media[0].with_transcript(SPOKEN, stream=2)
+        project = replace(project, media=(media,))
+        host = FakeHost(project)
+        with pytest.raises(ToolError, match="鳴らすクリップ"):
+            _run(host, media_id=str(media.id), audio=2)
+        assert host.document.project == project

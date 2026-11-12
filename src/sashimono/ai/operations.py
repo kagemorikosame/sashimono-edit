@@ -319,6 +319,7 @@ from sashimono.core.projection import (
     project_timeline,
     source_seconds_at,
     subtitle_stream,
+    subtitle_voice,
 )
 from sashimono.core.reframe import (
     CENTER,
@@ -6525,12 +6526,28 @@ def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
             "字幕の語に言いよどみが見つかりません 字幕起こしは言いよどみを書かずに返すことが多く、"
             "書かなかった言いよどみは探せません 間の長い所は jet_cut で詰められます"
         )
-    ranges = plan_cuts(
-        project,
-        media.id,
-        [(span.start, span.end) for span in spans],
-        stream=media.transcript_stream(stream),
-    )
+    voice = media.transcript_stream(stream)
+    # plan_cuts はこの音声を鳴らすクリップが無いと素材の全クリップへ戻す（無音カットが映像だけの
+    # クリップも切れるように） 言いよどみは音声ごとの時刻なので、戻すと別の音声の話を切る
+    hearing = [
+        track
+        for track in project.timeline.tracks
+        for clip in track.clips
+        if clip.media_id == media.id and subtitle_voice(project, track, clip, media) == voice
+    ]
+    if not hearing:
+        raise ToolError(
+            f"{media.name} のこの音声を鳴らすクリップがタイムラインにありません 別の音声の話を"
+            "切らないよう止めました audio で鳴らしている音声を選んでください"
+        )
+    if all(track.locked for track in hearing):
+        # RippleCut はロックしたトラックを切らないが、ほかのトラックと目印は同じ幅で詰める 声は
+        # 残ったまま映像と字幕だけがずれ、切った量も実際より大きく返すことになる
+        raise ToolError(
+            "言いよどみの音を鳴らすクリップがどれもロックしたトラックにあります ロックを"
+            "外してから頼んでください"
+        )
+    ranges = plan_cuts(project, media.id, [(span.start, span.end) for span in spans], stream=voice)
     if not ranges:
         raise ToolError(
             f"言いよどみが {len(spans)} か所ありましたが、どれもタイムラインに置いた範囲の外です"
@@ -6561,12 +6578,7 @@ def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 声だけが詰まって、ロックした映像や字幕が後ろでずれる 黙ると同期が崩れたまま進む
         result["tracks_left"] = left
         notes.append("tracks_left のトラックはロックしているので切っていません")
-    asked = cut_targets(
-        project,
-        media.id,
-        [(span.start, span.end) for span in spans],
-        stream=media.transcript_stream(stream),
-    )
+    asked = cut_targets(project, media.id, [(span.start, span.end) for span in spans], stream=voice)
     notes.extend(_lost_clips(project, _project(host), asked, result))
     result["note"] = " ".join(notes)
     return result
