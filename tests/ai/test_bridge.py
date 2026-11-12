@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from sashimono.ai.bridge import EditorBridge, describe_call
+from sashimono.ai.bridge import Approval, EditorBridge, describe_call
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import Operation, find_operation
 from tests.ai.conftest import FakeHost
@@ -159,6 +159,61 @@ class TestApproval:
         done, _ = call_in_thread(bridge, WRITE, {"clip_id": clip, "frame": 100})
         pump_until(bridge, done)
         assert bridge.take_approval() is None
+
+    def test_allowing_the_turn_covers_every_tool_until_it_ends(self, host: FakeHost) -> None:
+        """〔この指示の間は許可〕（#414） 1 本の編集で確かめが 41〜75 回出て、人が張り付いた
+
+        壊れると、道具の種類の数だけ押すことになるか、次の指示まで黙って編集が進む
+        """
+        clip = str(host.document.project.timeline.tracks[0].clips[0].id)
+        bridge = EditorBridge(host)
+        bridge.begin_turn()
+        bridge.allow_turn()
+        done, _ = call_in_thread(bridge, WRITE, {"clip_id": clip, "frame": 100})
+        pump_until(bridge, done)
+        assert bridge.take_approval() is None
+        bridge.end_turn()
+        bridge.begin_turn()
+        before = len(host.document.project.timeline.tracks[0].clips)
+        done, box = call_in_thread(bridge, WRITE, {"clip_id": clip, "frame": 50})
+        approval = None
+        deadline = time.monotonic() + 5.0
+        while approval is None and time.monotonic() < deadline:
+            bridge.pump()
+            approval = bridge.take_approval()
+            time.sleep(0.005)
+        # 尋ねずに通すと、次の指示まで許したまま黙って編集する
+        assert approval is not None, "次の指示で確かめが出なかった"
+        approval.deny()
+        pump_until(bridge, done)
+        assert isinstance(box.get("error"), ToolError)
+        assert len(host.document.project.timeline.tracks[0].clips) == before
+
+    def test_a_late_answer_does_not_allow_the_next_turn(self) -> None:
+        """時間切れで畳んだ確かめへ後から押した許可は効かない（PR #451 の CodeRabbit の指摘）
+
+        効くと、次の指示に「この指示の間は許可」が付き、確かめずに編集が進む
+        """
+        approval = Approval(tool="split_clip", summary="", arguments={})
+        assert approval.deny("確認の返事がありませんでした") is True
+        assert approval.allow() is False
+        assert approval.allowed is False
+
+    def test_the_grant_lands_before_the_ai_wakes(self) -> None:
+        """壊れると、AI が起きて次の編集へ進んだ後に「この指示の間は許可」が付き、もう 1 度尋ねる"""
+        approval = Approval(tool="split_clip", summary="", arguments={})
+        seen: list[bool] = []
+        assert approval.allow(lambda: seen.append(approval.done.is_set())) is True
+        assert seen == [False]
+        assert approval.done.is_set()
+
+    def test_a_late_answer_grants_nothing(self) -> None:
+        # 壊れると、畳んだ確かめに後から押した〔この指示の間は許可〕で次の指示まで黙って通る
+        approval = Approval(tool="split_clip", summary="", arguments={})
+        approval.deny("中断されました")
+        granted: list[int] = []
+        assert approval.allow(lambda: granted.append(1)) is False
+        assert granted == []
 
     def test_forgetting_always_brings_the_question_back(self, host: FakeHost) -> None:
         # 〔常に許可〕を取り消しても効いたままだと、利用者の知らないうちに AI が編集を続ける

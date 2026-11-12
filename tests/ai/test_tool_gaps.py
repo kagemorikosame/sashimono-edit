@@ -69,6 +69,8 @@ class TestNormalizeTellsTheTruth:
 
         壊れると「すでに基準に合っています」と返り、基準に届いていないのに AI は直ったと読む
         """
+        # リミッターを切った人の形（積むと山を抑えて上げる 試験は test_loudness_limiter）
+        work.host.limiter = False
         _run(work.host, "normalize_loudness", wait_seconds=0)
         _measured(work.host, -20.3, -1.0)
         result = _run(work.host, "normalize_loudness", wait_seconds=0)
@@ -80,6 +82,7 @@ class TestNormalizeTellsTheTruth:
 
     def test_a_small_rise_also_says_how_far_it_stopped(self, work: _Work) -> None:
         """壊れると、途中で止まったときの足りない量が AI に見えず、また同じ道具を呼ぶ"""
+        work.host.limiter = False
         _run(work.host, "normalize_loudness", wait_seconds=0)
         _measured(work.host, -31.3, -12.0)
         result = _run(work.host, "normalize_loudness", wait_seconds=0)
@@ -118,6 +121,8 @@ class TestCheckStopsRecommendingTheSameTool:
 
     def test_the_check_result_uses_the_measured_peak(self, work: _Work) -> None:
         """壊れると、表だけ直って check_output は auto を返し続ける"""
+        # リミッターを切った人は、天井に当たった音量を尋ねる側（積める人は test_loudness_limiter）
+        work.host.limiter = False
         _run(work.host, "check_output", wait_seconds=0)
         request: CheckRequest = work.host.check_requests[-1]
         end = request.end or 300

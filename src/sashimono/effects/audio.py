@@ -20,6 +20,7 @@ from functools import lru_cache
 
 import numpy as np
 
+from sashimono.core.commands.fixed import LIMITER_EFFECT_KIND
 from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.denoise import (
     DEFAULT_REDUCTION_DB,
@@ -29,12 +30,23 @@ from sashimono.effects.denoise import (
     denoise,
     denoise_history,
 )
+from sashimono.effects.limiter import (
+    CEILING_DB_RANGE,
+    DEFAULT_CEILING_DB,
+    DEFAULT_RELEASE_MS,
+    RELEASE_MS_RANGE,
+    limit,
+    limiter_history,
+)
 from sashimono.effects.spec import TrackSpec
 
-__all__ = ["DENOISE_KIND", "AudioContext", "register_audio_effects"]
+__all__ = ["DENOISE_KIND", "LIMITER_KIND", "AudioContext", "register_audio_effects"]
 
 #: ノイズ除去の種類（#336） AI の道具が同じクリップに掛け直すとき、前の物を探すのに使う
 DENOISE_KIND = "audio_denoise"
+#: リミッター（#414） 音量をそろえる道具が山を抑えるときに積む 種類の名前はコアの
+#: :data:`~sashimono.core.commands.fixed.LIMITER_EFFECT_KIND` と同じ（積む位置をコアが決める）
+LIMITER_KIND = LIMITER_EFFECT_KIND
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +401,27 @@ def register_audio_effects() -> None:
             ),
             audio_process=denoise,
             audio_history=denoise_history,
+        ),
+        # #414 音の山を上限で抑える 音量と音量フェードの後（一番最後）に積む（AddEffect が決める）
+        EffectDefinition(
+            kind=LIMITER_KIND,
+            label="リミッター",
+            category="音",
+            parameters=(
+                TrackSpec(
+                    "ceiling", "上限", *CEILING_DB_RANGE, DEFAULT_CEILING_DB, step=0.1, unit="dB"
+                ),
+                TrackSpec(
+                    "release",
+                    "戻る速さ",
+                    *RELEASE_MS_RANGE,
+                    DEFAULT_RELEASE_MS,
+                    step=1,
+                    unit="ミリ秒",
+                ),
+            ),
+            audio_process=limit,
+            audio_history=limiter_history,
         ),
     )
     for definition in definitions:

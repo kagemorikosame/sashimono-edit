@@ -101,7 +101,12 @@ class _Work:
 
 @dataclass(slots=True)
 class Approval:
-    """確認待ちの 1 件"""
+    """確認待ちの 1 件
+
+    答えるのは画面のスレッド、時間切れと中断で畳むのは AI のスレッド 先に決まった方だけを残す
+    畳んだ後に押された許可を通すと、次の指示に「この指示の間は許可」が付き、確かめずに編集する
+    （PR #451 の CodeRabbit の指摘）
+    """
 
     tool: str
     summary: str
@@ -116,14 +121,33 @@ class Approval:
     def irreversible(self) -> bool:
         return self.consent is not None
 
-    def allow(self) -> None:
-        self.allowed = True
-        self.done.set()
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def deny(self, reason: str = "ユーザーが許可しませんでした") -> None:
-        self.allowed = False
-        self.reason = reason
-        self.done.set()
+    def allow(self, granted: Callable[[], None] | None = None) -> bool:
+        """許す すでに畳まれていたら何もせず偽を返す
+
+        ``granted`` は AI のスレッドを起こす前に呼ぶ（以降を許す印を付ける所） 起こしてから
+        付けると、AI が先に次の編集へ進み、選んだ「この指示の間は許可」が効く前にもう 1 度尋ねる
+        （PR #451 の CodeRabbit の指摘） 畳まれていたら呼ばない
+        """
+        with self._lock:
+            if self.done.is_set():
+                return False
+            if granted is not None:
+                granted()
+            self.allowed = True
+            self.done.set()
+            return True
+
+    def deny(self, reason: str = "ユーザーが許可しませんでした") -> bool:
+        """断る すでに決まっていたら何もせず偽を返す（先に押された許可を消さない）"""
+        with self._lock:
+            if self.done.is_set():
+                return False
+            self.allowed = False
+            self.reason = reason
+            self.done.set()
+            return True
 
 
 @dataclass(slots=True)
@@ -249,6 +273,9 @@ class EditorBridge:
         self.ask_first = True
         #: 「このツールは以降ずっと許可」と言われたもの
         self._always: set[str] = set()
+        #: 「この指示の間は許可」と言われた（#414） 取り消せる編集を指示 1 回分だけ確かめない
+        #: 指示の始まりと終わりで下ろす 次の指示まで持ち越すと、別の頼みの編集まで黙って進む
+        self._turn_allowed = False
         #: UI が取り出して、まだ返事をもらっていない確認 中断のときに畳む
         self._outstanding: Approval | None = None
         self._questions: queue.Queue[Question] = queue.Queue()
@@ -523,11 +550,13 @@ class EditorBridge:
     def begin_turn(self) -> None:
         """指示に取りかかった 量を数え直す 画面のスレッドから呼ぶ"""
         self._refused_after_stop = 0
+        self._turn_allowed = False
         self.usage.begin_turn()
 
     def end_turn(self) -> None:
         """指示が終わった 量を 1 日の分へ足す 画面のスレッドから呼ぶ"""
         self._refused_after_stop = 0
+        self._turn_allowed = False
         self.usage.end_turn()
 
     def take_budget_request(self) -> BudgetRequest | None:
@@ -733,7 +762,11 @@ class EditorBridge:
         )
 
     def _approved(self, operation: Operation, arguments: dict[str, Any]) -> bool:
-        if self.auto_approve or operation.name in self._always:
+        """確かめずに通すのは、自動の承認・この指示の間は許す・以降も許す、のどれかのときだけ
+
+        それ以外は画面の確かめを待つ 待つ間は AI のスレッドが止まるので、画面のスレッドでは呼ばない
+        """
+        if self.auto_approve or self._turn_allowed or operation.name in self._always:
             return True
 
         approval = Approval(
@@ -880,6 +913,14 @@ class EditorBridge:
 
     def forget_always(self) -> None:
         self._always.clear()
+        self._turn_allowed = False
+
+    def allow_turn(self) -> None:
+        """今の指示が終わるまで、取り消せる編集を確かめずに通す（#414）
+
+        取り消せない操作・外へ送る物・グループを解く前の問いは、これまでどおり尋ねる
+        """
+        self._turn_allowed = True
 
 
 def _stop_message(overrun: Overrun) -> str:

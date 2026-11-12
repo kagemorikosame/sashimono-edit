@@ -28,6 +28,7 @@ from sashimono.core.projection import HeardPiece, heard_pieces
 __all__ = [
     "CUT_IN",
     "CUT_OUT",
+    "PHRASE_GAP",
     "WORD_MARGIN",
     "CutEdge",
     "HeardWord",
@@ -53,7 +54,7 @@ CUT_OUT = "out"
 WORD_MARGIN = Fraction(8, 100)
 #: 語の間がこれより空いていれば、字の種類によらず区切る 息継ぎより短く、語の中の促音（「っ」の
 #: 詰まり）より長い
-_PHRASE_GAP = Fraction(12, 100)
+PHRASE_GAP = Fraction(12, 100)
 #: 後ろの語に付く頭の 1 字 ここで区切ると「お|茶」の間を語の境目として勧める
 _PREFIXES = frozenset("おご御")
 #: 文の終わりの形 ひらがなが続くと字の種類では区切れない所
@@ -92,7 +93,7 @@ def _letter_kind(letter: str) -> int:
 
 def _breaks(so_far: str, word: Word, following: Word, later: Word | None) -> bool:
     """語 ``word`` と次の語の間で区切るか ``so_far`` は今の束の文字 ``later`` は次の次の語"""
-    if following.start - word.end >= _PHRASE_GAP:
+    if following.start - word.end >= PHRASE_GAP:
         return True
     if not word.text or not following.text:
         return False

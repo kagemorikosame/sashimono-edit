@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.model_files import missing_files
 from sashimono.package_index import Latest, latest_release
 from sashimono.runtime import (
     LEFT_RUNNING_NOTE,
@@ -42,6 +43,7 @@ from sashimono.runtime import (
     refresh_runtime,
     restart_note,
     snapshot_runtime_modules,
+    stale_runtime,
 )
 from sashimono.ui.theme import Colors, themed_style
 
@@ -161,7 +163,18 @@ class SetupSection(QWidget):
         """導入状況を見直して表示を作り直す"""
         status = self.status
         self._button.setText("環境を更新" if status.installed else "環境を導入")
-        self._extra.setEnabled(not status.extra_installed and not self.busy)
+        companion = self._pack.extra_pack
+        # 追加分の包みが入っていても、その機能の落とす物（モデル）が無ければまだ選べる
+        # 選べないまま印が付いていると、本人が選ばずに落とし始める（PR #451 の CodeRabbit の指摘）
+        # 見るのは包みが入った後か、印を付けて一緒に入れるときだけ 初めて入れるときも落とす物の
+        # 取得元と大きさを先に見せる（PR #451 の CodeRabbit の指摘） どちらでもないときは見ず、
+        # 窓を開くたびのファイルの確かめを増やさない
+        extra_files = (
+            missing_files(companion.files)
+            if companion is not None and (status.extra_installed or self.extra)
+            else ()
+        )
+        self._extra.setEnabled((not status.extra_installed or bool(extra_files)) and not self.busy)
 
         lines = [status.summary()]
         if not status.installed:
@@ -174,6 +187,14 @@ class SetupSection(QWidget):
             # pip の外で落とす物は、取得元まで見せる 何がどこから来るのか分からないまま
             # 落とし始めるのは不安が大きい（コマンドを先に見せるのと同じ理由）
             for file in status.missing_files:
+                host = urlsplit(file.url).hostname or file.url
+                lines.append(
+                    f"pip の後に落とすもの: {file.label or file.name}"
+                    f"（{max(1, file.size // 1024)} KB {host} から 中身を sha256 で確かめる）"
+                )
+        if self.extra:
+            # 一緒に入れる機能の落とす物も、落とす前に取得元と大きさを見せる
+            for file in extra_files:
                 host = urlsplit(file.url).hostname or file.url
                 lines.append(
                     f"pip の後に落とすもの: {file.label or file.name}"
@@ -287,6 +308,7 @@ class SetupSection(QWidget):
         if upgrade:
             self._force_upgrade = True
         argv = self._command()
+        extra = self.extra
         # pip が上書きする前の読み込み済みの物を、この導入の分として控える
         self._before = snapshot_runtime_modules()
         self._log.setVisible(True)
@@ -307,6 +329,7 @@ class SetupSection(QWidget):
         self._code = -1
 
         def run() -> None:
+            """導入を別のスレッドで走らせる 窓のスレッドで pip を待つと、終わるまで画面が固まる"""
             # 同じく終わった印は finally で立てる 立たないと導入中のまま押せなくなる
             code = 1
             try:
@@ -314,6 +337,8 @@ class SetupSection(QWidget):
                     before()
                 code = install_runtime(
                     pack=self._pack,
+                    # 追加分と一緒に入れる機能（AI 連携の画面の解析 #414）の後始末に要る
+                    extra=extra,
                     command=argv,
                     on_output=self._log_queue.put,
                     should_cancel=cancel.is_set,
@@ -379,7 +404,17 @@ class SetupSection(QWidget):
         self.finished.emit(succeeded)
 
     def _command(self) -> list[str]:
-        upgrade = self.status.needs_upgrade or self._force_upgrade
+        """pip に渡す導入の命令 一緒に入れる機能が前の Python 向けなら入れ直しを付ける
+
+        付けないと pip は入っている物を残し、読めない拡張が残ったまま入れたと読む
+        """
+        companion = self._pack.extra_pack
+        # 一緒に入れる機能（AI 連携の画面の解析）だけが前の Python 向けでも入れ直す 入れ直さないと、
+        # 読めない拡張が残ったまま文字を読めない
+        stale_extra = (
+            self.extra and companion is not None and stale_runtime(companion.key) is not None
+        )
+        upgrade = self.status.needs_upgrade or self._force_upgrade or stale_extra
         return install_command(self._pack, extra=self.extra, upgrade=upgrade)
 
 

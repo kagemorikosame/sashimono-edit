@@ -25,7 +25,14 @@ from sashimono.core.model import (
 )
 from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.report import assemble
-from sashimono.engine.checks.scan import BLACK, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS, Run
+from sashimono.engine.checks.scan import (
+    BLACK,
+    SUBTITLE_TIMING,
+    SUBTITLE_WORDS,
+    WORD_CUT,
+    WORD_KINDS,
+    Run,
+)
 from tests.ai.conftest import FakeHost
 from tests.words_helpers import in_scene, placed, sample_transcript, spoken, wave
 
@@ -487,7 +494,10 @@ class TestCheckOutput:
         assert cut["clip_ids"] == [str(clip.id)]
         assert cut["fix"]["action"] == "auto"
         assert "trim_clip" in cut["fix"]["tools"]
-        assert set(result["checks"]) == WORD_KINDS
+        assert set(result["checks"]) == WORD_KINDS - {SUBTITLE_TIMING}
+        # 12 コマで切ったので、行の終わりの声が鳴らない 切った端は比べず、調べたとは言わない
+        assert result["skipped_checks"] == [SUBTITLE_TIMING]
+        assert "頭か終わり" in result["note"]
 
     def test_the_tail_delta_goes_straight_to_trim_clip(self, media: MediaItem) -> None:
         """返した量を trim_clip へ渡すと、調べ直して切れ目が消える"""
