@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -357,23 +358,39 @@ def _steady(stream: av.stream.Stream, muxer: str) -> bool:
     )
 
 
+#: PCM の形ごとの 1 標本のバイト数 名前の数字（s16 なら 16 ビット）から読む 数字を持たない
+#: a-law と μ-law は 8 ビット
+_PCM_BYTES = {name: int(re.sub(r"\D", "", name) or 8) // 8 for name in _PCM_SILENCE}
+
+
 def _hush(packet: av.Packet[Any], spans: list[Span], origin: Fraction) -> av.Packet[Any]:
-    """区間（と前後の余り :data:`_TAIL_PAD`）に掛からない PCM のパケットを無音に置き換える
+    """区間の外にある PCM の標本を無音に置き換える（パケットの中でも標本ごと）
 
     続けて写すと区間の間の音も入る 使っていない所の声や会話を持ち出すと、範囲だけを入れると
-    約束したパッケージから、渡した人の知らない音が漏れる 長さと時刻はそのまま（ずらさない）
+    約束したパッケージから、渡した人の知らない音が漏れる 区間に掛かるパケットも丸ごと残すと、
+    区間の終わりの直後の言葉が入る 長さと時刻はそのまま（ずらさない）
+    区間には書き出しの余裕（:attr:`PackageOptions.margin`）が足してあるので、ここで足さない
     """
     shown = _seconds(packet)
-    if shown is None:
+    codec = packet.stream.codec_context
+    name = str(codec.name)
+    rate = int(codec.sample_rate or 0)
+    width = _PCM_BYTES[name] * int(codec.channels or 0)
+    if shown is None or rate <= 0 or width <= 0:
         return packet
-    base = as_fraction(packet.time_base) if packet.time_base else Fraction(0)
-    length = Fraction(packet.duration or 0) * base
-    if any(
-        shown + length + _TAIL_PAD >= origin + span.start and shown <= origin + span.end + _TAIL_PAD
-        for span in spans
-    ):
+    data = bytes(packet)
+    count = len(data) // width
+    fill = _PCM_SILENCE[name]
+    kept = bytearray([fill]) * len(data)
+    for span in spans:
+        # 標本 i は shown + i / rate に鳴る 区間に入る標本の番号の範囲を求めて元の音を戻す
+        first = max(0, math.ceil((origin + span.start - shown) * rate))
+        last = min(count, math.floor((origin + span.end - shown) * rate) + 1)
+        if first < last:
+            kept[first * width : last * width] = data[first * width : last * width]
+    if kept == data:
         return packet
-    quiet = av.Packet(bytes([_PCM_SILENCE[str(packet.stream.codec_context.name)]]) * packet.size)
+    quiet = av.Packet(bytes(kept))
     quiet.pts = packet.pts
     quiet.dts = packet.dts
     quiet.duration = packet.duration

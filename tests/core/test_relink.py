@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+
+import pytest
 
 from sashimono.core.commands import Document
 from sashimono.core.io.recovery import RecoverySession
@@ -102,6 +105,18 @@ class TestRelinkCommand:
 
     def test_choosing_the_same_packed_file_keeps_its_range(self) -> None:
         """範囲だけのファイルを選び直しただけで範囲を外すと、無い所を読む編集が通る"""
+        item = MediaItem(
+            path=Path("D:/展開/media/0001.mp4"),
+            duration=Fraction(5),
+            packed=(PackedSpan(Fraction(1), Fraction(2)),),
+        )
+        project = Project.create(media=(item,))
+        again = RelinkMedia(((item.id, item.path),)).apply(project)
+        assert again is project
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="大小文字を同じと見るのは Windows だけ")
+    def test_the_same_file_written_in_other_case_keeps_its_range(self) -> None:
+        """Windows では大小文字だけ違う書き方も同じファイル 別と見ると範囲を外してしまう"""
         item = MediaItem(
             path=Path("D:/展開/media/0001.mp4"),
             duration=Fraction(5),

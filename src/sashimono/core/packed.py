@@ -42,13 +42,15 @@ def read_window(
     ずれると、展開した先でディレイを長くしても断られず、響きの頭が無音になる
     """
     start = clip.source_in
-    if clip.hold_at is not None:
-        start = min(start, clip.hold_at)
     if history is not None:
         seconds = history(clip, timeline.rate, sample_rate)
         if seconds > 0:
             lookback = Fraction(seconds).limit_denominator(sample_rate)
             start = max(Fraction(0), start - lookback * clip.speed)
+    # 前の音は頭（source_in）から数える hold_at は絵だけを止めるので、そこから引くと
+    # 止めた絵より前の要らない音まで読むことになり、入っている範囲の中の編集まで断る
+    if clip.hold_at is not None:
+        start = min(start, clip.hold_at)
     return start, clip.source_out(timeline.rate)
 
 

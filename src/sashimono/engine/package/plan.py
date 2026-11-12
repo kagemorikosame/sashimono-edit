@@ -199,15 +199,13 @@ def editing_media(project: Project) -> tuple[str, ...]:
     for item in project.media:
         if item.id not in used:
             continue
-        # し直せない形（透明を持つ ProRes 4444・RGB・12bit 以上）だけの素材は並べない 並べると、
-        # 選んでも元のまま入って「小さくなる」と読んだ人の見込みが外れる
-        codecs = [
-            stream.codec
-            for stream in item.video_streams
-            if stream.codec in EDITING_CODECS and reencodable(stream.pixel_format)
-        ]
-        if len(codecs) == 1:
-            found.append(f"{item.name}（{EDITING_NAMES.get(codecs[0], codecs[0])}）")
+        # し直せない素材は並べない 並べると、選んでも元のまま入って「小さくなる」と読んだ人の
+        # 見込みが外れる 編集用の映像が 2 本ある素材は、片方がし直せない形（透明を持つ
+        # ProRes 4444・RGB・12bit 以上）でも、し直す側（reencode_media）が 2 本と数えて断る
+        streams = [stream for stream in item.video_streams if stream.codec in EDITING_CODECS]
+        if len(streams) == 1 and reencodable(streams[0].pixel_format):
+            codec = streams[0].codec
+            found.append(f"{item.name}（{EDITING_NAMES.get(codec, codec)}）")
     return tuple(found)
 
 

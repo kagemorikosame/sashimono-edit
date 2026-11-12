@@ -131,6 +131,29 @@ def test_only_formats_kept_as_they_are_are_offered(pixel_format: str, expected: 
     assert bool(editing_media(_project(item, clip))) is expected
 
 
+def test_two_editing_streams_are_not_offered() -> None:
+    """片方がし直せない形でも、し直す側は 2 本と数えて断る 並べると選んでも元のまま入る"""
+
+    def stream(index: int, pixel_format: str) -> VideoStreamInfo:
+        return VideoStreamInfo(
+            index=index,
+            width=64,
+            height=36,
+            frame_rate=FrameRate(25, 1),
+            time_base=Fraction(1, 25),
+            codec="prores",
+            pixel_format=pixel_format,
+        )
+
+    item = MediaItem(
+        path=Path("D:/a.mov"),
+        duration=Fraction(4),
+        video_streams=(stream(0, "yuv422p10le"), stream(1, "yuva444p10le")),
+    )
+    clip = Clip(timeline_start=0, duration=25, media_id=item.id, source_in=Fraction(0))
+    assert editing_media(_project(item, clip)) == ()
+
+
 class TestReencode:
     @pytest.mark.parametrize("name", ["prores.mov", "dnxhr.mov", "raw.mov"])
     def test_the_same_time_shows_nearly_the_same_picture(
@@ -193,9 +216,16 @@ class TestReencode:
             a = old.read_seconds(second.start, Fraction(1, 2))
             b = new.read_seconds(second.start, Fraction(1, 2))
             assert a.shape == b.shape and float(abs(a - b).max()) < 1e-4
-            # 区間の間（前後の余りの外）は無音
+            # 区間の間は無音
             gap = new.read_seconds(Fraction(2), Fraction(1, 2))
             assert float(abs(gap).max()) < 1e-6
+            # 区間の終わりの直後も無音 区間に掛かるパケットを丸ごと残すと、続きの言葉が入る
+            after = new.read_seconds(first.end + Fraction(1, 20), Fraction(2, 5))
+            assert float(abs(after).max()) < 1e-6
+            assert (
+                float(abs(old.read_seconds(first.end + Fraction(1, 20), Fraction(2, 5))).max())
+                > 0.1
+            )
             assert float(abs(old.read_seconds(Fraction(2), Fraction(1, 2))).max()) > 0.1
 
     def test_transparent_pictures_are_left_as_they_are(
