@@ -25,6 +25,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from sashimono import runtime
+from sashimono.model_files import RemoteFile
 from sashimono.runtime import (
     LEFT_RUNNING_NOTE,
     PIP_LEFT_RUNNING,
@@ -268,11 +269,12 @@ def _fake_installer(write: Callable[[], object], code: int = 0) -> Callable[...,
     def install(
         *,
         pack: object = None,
+        extra: bool = True,
         command: Sequence[str],
         on_output: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> int:
-        del pack, command, should_cancel
+        del pack, extra, command, should_cancel
         if on_output is not None:
             on_output("Successfully installed")
         if code == 0:
@@ -292,11 +294,12 @@ def _slow_cancelled_installer() -> Callable[..., int]:
     def install(
         *,
         pack: object = None,
+        extra: bool = True,
         command: Sequence[str],
         on_output: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> int:
-        del pack, command, on_output
+        del pack, extra, command, on_output
         assert should_cancel is not None
         for _ in range(500):
             if should_cancel():
@@ -485,3 +488,71 @@ class TestSetupSection:
         assert results == [False]
         assert "導入が終わりました" not in section._status.text()
         section.deleteLater()
+
+
+class TestTheExtraPack:
+    """AI 連携と一緒に入れる画面の解析（#414 PR #451 の CodeRabbit の指摘）"""
+
+    @staticmethod
+    def _pack(dist: str) -> FeaturePack:
+        model = RemoteFile(
+            name=f"{dist}.onnx",
+            url="https://models.example.invalid/face.onnx",
+            sha256="0" * 64,
+            size=300 * 1024,
+            label="試験の顔のモデル",
+        )
+        companion = FeaturePack(key="companion", label="画面", required=(), files=(model,))
+        return FeaturePack(
+            key="fake",
+            label="偽物",
+            required=(dist,),
+            extra=(dist,),
+            extra_pack=companion,
+        )
+
+    def test_an_unchecked_extra_is_not_installed(
+        self, frozen: Path, monkeypatch: pytest.MonkeyPatch, qt_application: QApplication
+    ) -> None:
+        """外した印のまま始めると、本人が断った部品まで入れて落とす"""
+        from sashimono.ui import setup
+
+        dist, module = _unique()
+        asked: list[bool] = []
+
+        def install(*, extra: bool = True, **options: object) -> int:
+            asked.append(extra)
+            write_distribution(frozen, dist, module)
+            return 0
+
+        monkeypatch.setattr(setup, "install_runtime", install)
+        section = setup.SetupSection(self._pack(dist))
+        results: list[bool] = []
+        section.finished.connect(results.append)
+        try:
+            section._extra.setChecked(False)
+            section.start()
+            _wait_for(lambda: bool(results), qt_application)
+            assert asked == [False]
+        finally:
+            section.deleteLater()
+
+    def test_the_extra_models_are_shown_and_can_be_declined(
+        self, frozen: Path, qt_application: QApplication
+    ) -> None:
+        """包みが入っていてもモデルが無ければ選べる 落とす前に取得元と大きさを見せる"""
+        from sashimono.ui import setup
+
+        del qt_application
+        dist, module = _unique()
+        write_distribution(frozen, dist, module)
+        refresh_runtime()
+        section = setup.SetupSection(self._pack(dist))
+        try:
+            section.refresh()
+            assert section._extra.isEnabled()
+            assert "models.example.invalid" in section._status.text()
+            section._extra.setChecked(False)
+            assert "models.example.invalid" not in section._status.text()
+        finally:
+            section.deleteLater()

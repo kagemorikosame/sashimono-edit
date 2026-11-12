@@ -190,6 +190,38 @@ class TestInstall:
         assert code == 3
         assert asked == []
 
+    def test_the_extra_pack_is_finished_with_the_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AI 連携の導入で画面の解析も入れたら、顔のモデルも落とす（#414）
+
+        壊れると、包みは入ったのに画面の解析が「使えない」のまま残り、AI が画面の文字を読めない
+        追加分を外した導入では落とさない（使わない人に負わせない）
+        """
+        asked: list[tuple[RemoteFile, ...]] = []
+
+        def fetch(files: tuple[RemoteFile, ...], **_options: object) -> int:
+            asked.append(files)
+            return 0
+
+        monkeypatch.setattr(runtime, "fetch_files", fetch)
+        companion = FeaturePack(key="y", label="y", required=("pip",), files=(_file(),))
+        pack = FeaturePack(key="x", label="x", required=("pip",), extra_pack=companion)
+        command = [sys.executable, "-c", "pass"]
+        assert install_runtime(pack, extra=False, command=command) == 0
+        assert asked == []
+        assert install_runtime(pack, extra=True, command=command) == 0
+        assert asked == [companion.files]
+
+    def test_the_ai_install_brings_the_screen_parts(self) -> None:
+        """壊れると、AI 連携だけを入れた人の AI が画面の文字を読もうとして部品が無いと断る"""
+        from sashimono.ai.environment import AI_PACK
+        from sashimono.engine.vision.parts import VISION_PACK
+
+        assert AI_PACK.extra_pack is VISION_PACK
+        assert set(VISION_PACK.required) <= set(AI_PACK.requirements(extra=True))
+        assert not set(VISION_PACK.required) & set(AI_PACK.requirements(extra=False))
+
     def test_a_failed_fetch_fails_the_install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # 壊れると、モデルを落とせなかったのに「導入が完了しました」と出る
         monkeypatch.setattr(runtime, "fetch_files", lambda *_a, **_k: 1)
