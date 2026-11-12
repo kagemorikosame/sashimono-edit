@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 from sashimono.core.userdirs import state_root
+from sashimono.engine.vision.parts import VISION_PACK
 from sashimono.runtime import FeaturePack, PackStatus
 from sashimono.runtime import install_command as _install_command
 
@@ -184,6 +185,13 @@ AI_PACK = FeaturePack(
     key="ai",
     label="AI 連携",
     required=REQUIRED_PACKAGES,
+    # 画面の解析（文字と顔 #324）も既定で一緒に入れる（#414） 通しの確かめで、AI が画面の文字を
+    # 読もうとして部品が無く、人が設定の窓を探して入れ直すことになった 25 MB ほどで、外すことも
+    # できる（導入の欄の印）
+    extra=VISION_PACK.required,
+    extra_label="画面の文字と顔を読む部品（画面の解析）",
+    extra_size_mb=VISION_PACK.size_mb,
+    extra_pack=VISION_PACK,
     # SDK が Claude Code 本体（0.2.152 で約 220 MB）を同梱しているぶんを含める
     size_mb=250,
     commands=("claude",),

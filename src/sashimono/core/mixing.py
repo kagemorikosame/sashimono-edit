@@ -40,6 +40,7 @@ __all__ = [
     "DUCK_ATTACK_MS_RANGE",
     "DUCK_DEPTH_DB_RANGE",
     "DUCK_RELEASE_MS_RANGE",
+    "MAX_LIMITER_DB",
     "VOLUME_LIMIT",
     "DuckPlan",
     "DuckShape",
@@ -284,6 +285,9 @@ def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
 #: 音の山の上限の既定（dBFS） 配信の多くが求める -1 dBTP に合わせる 窓と AI の道具と
 #: 検査の直し方が同じ値を見る
 DEFAULT_PEAK_CEILING_DB = -1.0
+#: リミッターで抑えてよい山の量の上限（dB #414） 通しの確かめで届かなかった 3.8〜6 LU を覆う
+#: これより絞ると、話し声の子音の立ち上がりまで潰れて平たく聞こえる
+MAX_LIMITER_DB = 6.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +297,8 @@ class LoudnessGain:
     gain_db: float
     #: 基準の手前で止めた訳 ``peak``（音の山が天井を超える）と ``volume_limit``（欄の上限）
     limited_by: tuple[str, ...] = ()
+    #: 掛けた後に山が天井を越える量（dB） リミッターで抑える分 0 なら抑えなくてよい
+    squeeze_db: float = 0.0
 
 
 def loudness_gain(
@@ -302,23 +308,40 @@ def loudness_gain(
     peak_db: float | None,
     target: float,
     ceiling: float,
+    squeeze: float = 0.0,
+    raise_ceiling: float | None = None,
 ) -> LoudnessGain:
     """測った積分ラウドネス ``measured`` を ``target`` へ寄せる量（dB）
 
     上げすぎると音が割れるので、山 ``peak_db`` が天井 ``ceiling`` に当たる所で止める
+    ``squeeze`` はリミッターで抑えてよい量（dB） 山が天井をその分だけ越える所まで上げる
     どれかのクリップの線が欄の上限を超える所でも止める 超えた分は鳴らないので、そろえた
     つもりの音量にならない
+    ``raise_ceiling`` は前に積んだリミッターが山を止める所 そこより上へは上げないが、下げる
+    理由にはしない 測った山は混ぜた音の物で、どのクリップの山かは分からない 静かなクリップの
+    低い上限で全体を下げると、そろえるはずの音量が大きく下がる（PR #451 の CodeRabbit の指摘）
     """
     gain = target - measured
     limited: list[str] = []
-    if peak_db is not None and peak_db + gain > ceiling:
-        gain = ceiling - peak_db
+    room = max(0.0, squeeze)
+    if peak_db is not None and peak_db + gain > ceiling + room:
+        gain = ceiling + room - peak_db
         limited.append("peak")
+    if (
+        raise_ceiling is not None
+        and peak_db is not None
+        and gain > 0
+        and peak_db + gain > raise_ceiling
+    ):
+        gain = max(0.0, raise_ceiling - peak_db)
+        if "peak" not in limited:
+            limited.append("peak")
     top = max((loudest(clip_volume(clip)) for clip in clips), default=0.0)
     if top > 0 and top * db_to_ratio(gain) > VOLUME_LIMIT:
         gain = ratio_to_db(VOLUME_LIMIT / top)
         limited.append("volume_limit")
-    return LoudnessGain(gain, tuple(limited))
+    over = 0.0 if peak_db is None else max(0.0, peak_db + gain - ceiling)
+    return LoudnessGain(gain, tuple(limited), over)
 
 
 def gain_commands(clips: Sequence[Clip], gain_db: float) -> list[Command]:

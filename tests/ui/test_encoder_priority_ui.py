@@ -160,7 +160,7 @@ def test_the_assistant_export_follows_the_priority(
     monkeypatch.setattr(
         window._assistant_export,
         "start",
-        lambda _project, settings, _check, _expect=None: started.append(settings),
+        lambda _project, settings, _check, _expect=None, **_kw: started.append(settings),
     )
     clip = Clip(timeline_start=0, duration=30, source=TEXT.create())
     track = Track(TrackKind.VIDEO, "V1")

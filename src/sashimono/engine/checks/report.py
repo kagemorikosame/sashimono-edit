@@ -33,6 +33,7 @@ from sashimono.engine.checks.scan import (
     LENGTH,
     LOUDNESS,
     SILENCE,
+    SUBTITLE_TIMING,
     SUBTITLE_WORDS,
     TEXT_OVERFLOW,
     WORD_CUT,
@@ -346,4 +347,5 @@ KIND_NAMES: Mapping[str, str] = {
     LENGTH: "長さ",
     WORD_CUT: "言葉の途中の切れ目",
     SUBTITLE_WORDS: "字幕と音の食い違い",
+    SUBTITLE_TIMING: "字幕の時刻のずれ",
 }

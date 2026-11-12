@@ -11,7 +11,9 @@ AI の ``auto_color`` ``reduce_noise`` と、人の〔色を自動で整える�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Any, Protocol
 
 import numpy as np
@@ -21,6 +23,7 @@ from sashimono.core.commands import (
     AddEffect,
     Command,
     ParamPath,
+    RemoveEffect,
     SetEffectEnabled,
     SetParam,
 )
@@ -33,10 +36,12 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     Track,
+    TrackKind,
     heard_stream,
 )
 from sashimono.effects import registry
-from sashimono.effects.audio import DENOISE_KIND
+from sashimono.effects.audio import DENOISE_KIND, LIMITER_KIND
+from sashimono.effects.limiter import CEILING_DB_RANGE, DEFAULT_CEILING_DB
 from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import (
@@ -58,10 +63,173 @@ __all__ = [
     "NoiseFix",
     "NoiseRequest",
     "can_auto_color",
+    "clips_overlap",
+    "has_limiter",
+    "limited_ceiling",
+    "limited_peak",
+    "limiter_ceiling",
+    "limiter_commands",
     "picture_clip",
     "plan_color_fix",
     "plan_noise_fix",
+    "raise_cap",
+    "track_gain_db",
 ]
+
+
+def has_limiter(clip: Clip) -> bool:
+    """リミッターが効いているクリップか（#414）"""
+    return any(effect.kind == LIMITER_KIND and effect.enabled for effect in clip.effects)
+
+
+def clips_overlap(clips: Sequence[Clip]) -> bool:
+    """同じ時刻に 2 本以上が鳴るか（トラックをまたいで見る）
+
+    リミッターはクリップごとに掛かるので、重なって鳴る音の和は上限を越えうる AI の道具と
+    人の〔音量を基準にそろえる…〕が同じここで見て、確かめ直すよう伝える
+    """
+    spans = sorted((clip.timeline_start, clip.timeline_end) for clip in clips)
+    reach = None
+    for begin, finish in spans:
+        if reach is not None and begin < reach:
+            return True
+        reach = finish if reach is None else max(reach, finish)
+    return False
+
+
+#: 補間の行き過ぎ（back・elastic）を拾うため、キーフレームの間を何点で見るか 上限の山と谷は
+#: 区間の 1/32 より細かくは動かない
+_CURVE_SAMPLES = 32
+
+
+def track_gain_db(track: Track) -> float:
+    """クリップのエフェクトの後に掛かる、トラックの音量と定位のいちばん大きい倍率（dB）
+
+    リミッターはクリップのエフェクトなので、その後のトラックの音量が山を動かす +6 dB のトラックで
+    上限 -1 dBFS に抑えても書き出しは +5 dBFS になる（PR #451 の CodeRabbit の指摘）
+    映像トラックは音量と定位を使わない（ミキサと同じ決まり）
+    """
+    if track.kind is TrackKind.VIDEO:
+        return 0.0
+    pan = float(np.clip(track.pan, -1.0, 1.0))
+    angle = (pan + 1.0) * np.pi / 4.0
+    # 定電力パンは片側を最大 √2 倍（+3 dB）にする 中央の 0 では倍率 1
+    panned = 1.0 if pan == 0.0 else float(np.sqrt(2.0) * max(np.cos(angle), np.sin(angle)))
+    return track.volume_db + 20.0 * float(np.log10(panned))
+
+
+def _lowest_ceiling(effect: Effect) -> float:
+    """リミッターが実際に使う上限のいちばん低い所（dBFS） 省いた欄は既定、範囲の外は範囲に収める
+
+    リミッターと同じ読み方をしないと、省いた上限（-1 dBFS）や補間で下へ行き過ぎた所で潰れるのに、
+    基準に届いたと答える（PR #451 の CodeRabbit の指摘）
+    """
+    value = effect.params.get("ceiling", DEFAULT_CEILING_DB)
+    if isinstance(value, AnimatedValue):
+        if value.is_animated:
+            keys = value.keyframes
+            points = [k.value for k in keys]
+            for left, right in pairwise(keys):
+                span = right.frame - left.frame
+                points += [
+                    value.at(left.frame + span * step / _CURVE_SAMPLES)
+                    for step in range(1, _CURVE_SAMPLES)
+                ]
+        else:
+            points = [value.static]
+    elif isinstance(value, int | float):
+        points = [float(value)]
+    else:
+        points = [DEFAULT_CEILING_DB]
+    low, high = CEILING_DB_RANGE
+    return float(np.clip(min(points), low, high))
+
+
+def limited_ceiling(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:
+    """``ceiling`` と、効いているリミッターが書き出しで止める所の低い方 上げる量の上限に使う
+
+    :func:`~sashimono.core.mixing.loudness_gain` の ``raise_ceiling`` へ渡す 上げる量だけを
+    止め、下げる理由にはしない
+
+    音量の欄はリミッターの前に掛かる 上限より上へ上げた分はリミッターが潰すので、測った音量より
+    上がらないのに基準に届いたと答える（PR #451 の CodeRabbit の指摘） 測った山はトラックの音量の
+    後の値なので、リミッターの上限にもトラックの倍率を足して同じ所で比べる
+    """
+    lowest = ceiling
+    for track, clip in targets:
+        for effect in clip.effects:
+            if effect.kind == LIMITER_KIND and effect.enabled:
+                lowest = min(lowest, _lowest_ceiling(effect) + track_gain_db(track))
+    return lowest
+
+
+def raise_cap(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float | None:
+    """:func:`~sashimono.core.mixing.loudness_gain` の ``raise_ceiling`` に渡す値
+
+    前に積んだリミッターが ``ceiling`` より下で止めるときだけ、その所を返す それ以外は None
+    ``ceiling`` を渡すと、新しく積むリミッターで山を抑えて（squeeze）上げる分まで止め、
+    設定でリミッターを入れても基準に届かない 画面と AI の両方がここを通る（PR #451 の CodeRabbit）
+    """
+    cap = limited_ceiling(targets, ceiling)
+    return cap if cap < ceiling else None
+
+
+def limiter_ceiling(track: Track, ceiling: float) -> float:
+    """書き出しの山を ``ceiling`` dBFS に収めるため、``track`` のクリップのリミッターに置く上限
+
+    トラックの倍率の分だけ下げる 範囲（-20〜0 dBFS）を越える分は収め切れないので、
+    :func:`limited_peak` で書き出しの山を言い直す
+    """
+    low, high = CEILING_DB_RANGE
+    return float(np.clip(ceiling - track_gain_db(track), low, high))
+
+
+def limited_peak(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:
+    """:func:`limiter_commands` で積んだリミッターが、書き出しで山を止める所の一番高い所（dBFS）
+
+    トラックの倍率が大きすぎて上限の範囲で収め切れないと ``ceiling`` より高くなる
+    """
+    return max(
+        (limiter_ceiling(track, ceiling) + track_gain_db(track) for track, _ in targets),
+        default=ceiling,
+    )
+
+
+def limiter_commands(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> list[Command]:
+    """どのクリップにもリミッターを積む もうあれば上限だけを置き換える（重ねて掛けない #414）
+
+    AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕が同じここを通る 積む位置は
+    音量とフェードの後（``AddEffect`` が決める） 上限はトラックの倍率を引いた値
+    （:func:`limiter_ceiling`）
+    """
+    commands: list[Command] = []
+    for track, clip in targets:
+        local = limiter_ceiling(track, ceiling)
+        found = next((effect for effect in clip.effects if effect.kind == LIMITER_KIND), None)
+        if found is None:
+            effect = registry.require(LIMITER_KIND).create(ceiling=local)
+            commands.append(AddEffect(clip.id, effect))
+            continue
+        value = found.params.get("ceiling")
+        if isinstance(value, AnimatedValue) and value.is_animated:
+            # 人が付けた動きを 1 つの値で黙って消さない（ノイズ除去の掛け直しと同じ）
+            raise ToolError(
+                f"{clip.id} のリミッターは上限をキーフレームで動かしています 置き換えると動きが"
+                "消えるので触りません limiter を false にして呼び直すか、設定パネルで直してください"
+            )
+        if found is not clip.effects[-1]:
+            # 読み込んだファイルでは、無効のリミッターが音量の欄やほかの音のエフェクトより前に
+            # あることがある そのまま有効にすると、後で上げた音量の山を抑えない 末尾へ積み直す
+            # （固定の欄はまたいで動かせないので、動かすのでなく外して足す）
+            effect = registry.require(LIMITER_KIND).create(ceiling=local)
+            commands += [RemoveEffect(clip.id, found.id), AddEffect(clip.id, effect)]
+            continue
+        path = ParamPath.of_effect(clip.id, found.id, "ceiling")
+        commands.append(SetParam(path, AnimatedValue(static=local)))
+        if not found.enabled:
+            commands.append(SetEffectEnabled(clip.id, found.id, True))
+    return commands
+
 
 #: 色を測るのに使うサムネイルの枚数の上限 0.5 秒ごとの絵なので、長いクリップでも
 #: 等間隔に間引いてこれだけを見る 明るさの分布と色の平均はこの数で落ち着く

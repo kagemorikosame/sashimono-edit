@@ -82,6 +82,8 @@ from sashimono.engine.cache.proxy import (
 )
 from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import (
+    BITRATE_RANGE_MBPS,
+    MATCH_HEADROOM,
     MEASURED_DECODE_MS,
     MEASURED_EXPORT_MS,
     MEASURED_EXPORT_TOTAL_MS,
@@ -507,6 +509,28 @@ class PreferencesDialog(QDialog):
             "効くのは mp4・mov・mkv だけ 書き出しの窓でも替えられ、替えた値はここに残る"
         )
         form.addRow(self._export_chapters)
+
+        # 書き出しのビットレート（#414） 大きさと画質の釣り合いは人と作品で違う
+        self._export_bitrate_auto = QCheckBox("書き出しのビットレートを素材に合わせる", self)
+        self._export_bitrate_auto.setChecked(preferences.export_bitrate_auto)
+        self._export_bitrate_auto.setToolTip(
+            "書き出しの窓と AI の書き出しのビットレートの初めの値を、置いた素材のビットレート"
+            f"（作品の大きさと fps に直して {MATCH_HEADROOM:g} 倍）にする 下の値を上限にする "
+            "書き出すたびに圧縮し直すので、素材より少し高い値にしておくと崩れを抑えられる "
+            "それより上げても見た目はほとんど変わらず、ファイルだけが大きくなる "
+            "色を大きく変える・細かい図形を重ねるなど、素材より細かい絵を書き出すときや、"
+            "大きさより画質を取りたいときは切る"
+        )
+        form.addRow(self._export_bitrate_auto)
+        self._export_bitrate = QSpinBox(self)
+        self._export_bitrate.setRange(*BITRATE_RANGE_MBPS)
+        self._export_bitrate.setSuffix(" Mbps")
+        self._export_bitrate.setValue(preferences.export_bitrate_mbps)
+        self._export_bitrate.setToolTip(
+            "素材に合わせるときは上限、合わせないときはこの値で書き出す "
+            "1080p の 30fps なら 8〜12 Mbps で、配信の多くが勧める範囲に入る"
+        )
+        form.addRow("書き出しのビットレート", self._export_bitrate)
 
         self._encoder_priority = QComboBox(self)
         for label, value in ENCODER_PRIORITY_CHOICES:
@@ -1133,6 +1157,16 @@ class PreferencesDialog(QDialog):
             "残したまま続ける 切ると、ほかの編集と同じ許可の確かめだけになる"
         )
         form.addRow(self._ai_ask_before_ungroup)
+
+        self._ai_auto_approve = QCheckBox("〔変更を自動で承認〕を入れた状態で始める", self)
+        self._ai_auto_approve.setChecked(preferences.ai_auto_approve)
+        self._ai_auto_approve.setToolTip(
+            "AI のパネルの〔変更を自動で承認〕を、起動したときから入れておく 取り消せる編集を"
+            "1 つずつ確かめずに進める 保存・書き出しなど取り消せない操作と、AI へ送る物の"
+            "確かめは入れていても出る 確かめの箱の〔この指示の間は許可〕で、指示 1 回分だけ"
+            "任せることもできる"
+        )
+        form.addRow(self._ai_auto_approve)
         self._check_loudness = QComboBox(self)
         for target, name in LOUDNESS_TARGETS:
             self._check_loudness.addItem(name, target)
@@ -1146,6 +1180,20 @@ class PreferencesDialog(QDialog):
             " 基準から 1 LU を超えて外れると知らせる AI に別の基準を頼めばその値で調べる"
         )
         form.addRow("仕上がりを調べる音量の基準", self._check_loudness)
+        # 山を抑えるか（#414） 山の立ち上がりを残したい作品（音楽・効果音）もある
+        self._loudness_limiter = QCheckBox(
+            "音量をそろえるとき、届かなければ山をリミッターで抑える", self
+        )
+        self._loudness_limiter.setChecked(preferences.loudness_limiter)
+        self._loudness_limiter.setToolTip(
+            "AI アシスタントが全体の音量を基準へそろえるとき、一瞬の山が上限（-1 dBFS）に当たって"
+            "基準に届かなければ、音のクリップの最後にリミッターを積んで山だけを抑え、基準まで上げる"
+            " 抑える量は 6 dB まで それでも届かなければ届かないことを伝える 前に積んだ"
+            "リミッターがあるクリップには重ねて積まず、その上限より上へは上げない 上限を越える音が"
+            "続く所はその間も抑えるので、全体の音量が少し下がることがある 切ると山の手前で止め、"
+            "届かないことを伝える リミッターは設定パネルの「リミッター」で直せる"
+        )
+        form.addRow(self._loudness_limiter)
         # 語の時刻（#420） 起こす時間と切る位置の確かさの釣り合いは人で違う
         self._word_timestamps = QCheckBox("字幕起こしで語の時刻も取る", self)
         self._word_timestamps.setChecked(preferences.word_timestamps)
@@ -1439,6 +1487,8 @@ class PreferencesDialog(QDialog):
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_gpu_color=self._export_gpu_color.isChecked(),
             export_chapters=self._export_chapters.isChecked(),
+            export_bitrate_auto=self._export_bitrate_auto.isChecked(),
+            export_bitrate_mbps=self._export_bitrate.value(),
             encoder_priority=str(self._encoder_priority.currentData()),
             decode_threads=int(self._decode_threads.currentData()),
             smooth_audio_motion=self._smooth_audio_motion.isChecked(),
@@ -1508,6 +1558,7 @@ class PreferencesDialog(QDialog):
             ai_ask_questions=self._ai_ask_questions.isChecked(),
             ai_plan_first=self._ai_plan_first.isChecked(),
             ai_ask_before_ungroup=self._ai_ask_before_ungroup.isChecked(),
+            ai_auto_approve=self._ai_auto_approve.isChecked(),
             ripple_playhead=self._ripple_playhead.isChecked(),
             ripple_layers=self._ripple_layers.isChecked(),
             ai_send_frames=self._send_value(Outbound.FRAMES),
@@ -1523,6 +1574,7 @@ class PreferencesDialog(QDialog):
             ai_limit_action=str(self._limit_action.currentData()),
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
+            loudness_limiter=self._loudness_limiter.isChecked(),
             word_timestamps=self._word_timestamps.isChecked(),
             subtitle_fit_voice=self._subtitle_fit_voice.isChecked(),
             subtitle_start_offset_ms=self._subtitle_start_offset.value(),

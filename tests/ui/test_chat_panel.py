@@ -198,6 +198,54 @@ class TestApproval:
         assert approval.allowed is True
         assert "split_clip" in widget._bridge._always
 
+    def test_allowing_the_turn_is_offered_and_remembered_for_the_turn(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、確かめの箱にまとめて許す口が無く、1 本の編集で何十回も押すことになる（#414）
+        widget, _ = panel
+        approval = self._pending(widget)
+        assert widget._approval_turn.isHidden() is False
+        widget._answer(True, turn=True)
+        assert approval.allowed is True
+        assert widget._bridge._turn_allowed is True
+        widget._bridge.end_turn()
+        assert widget._bridge._turn_allowed is False
+
+    def test_a_settled_request_gives_no_turn_allowance(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 時間切れで畳んだ後に押すと、次の指示まで確かめずに編集が進む（PR #451 の CodeRabbit）
+        widget, _ = panel
+        approval = self._pending(widget)
+        approval.deny("確認の返事がありませんでした")
+        widget._answer(True, turn=True, always=True)
+        assert approval.allowed is False
+        assert widget._bridge._turn_allowed is False
+        assert "split_clip" not in widget._bridge._always
+
+    def test_an_irreversible_request_offers_no_turn_allowance(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、指示の間を許した人の上書き保存が、次から黙って走るように見える
+        widget, _ = panel
+        approval = self._irreversible(widget)
+        assert widget._approval_turn.isHidden() is True
+        widget._answer(True, turn=True)
+        assert approval.allowed is True
+        assert widget._bridge._turn_allowed is False
+
+    def test_the_preference_starts_with_auto_approve(
+        self, panel: tuple[ChatPanel, FakeHost]
+    ) -> None:
+        # 壊れると、いつも任せる人が起動のたびに〔変更を自動で承認〕を入れ直す（#414）
+        # 設定に関係の無い変更で、パネルで切った選びが戻っても困る
+        widget, _ = panel
+        widget.apply_preferences(Preferences(ai_auto_approve=True))
+        assert widget._auto.isChecked() is True
+        widget._auto.setChecked(False)
+        widget.apply_preferences(Preferences(ai_auto_approve=True, ai_fix_rounds=2))
+        assert widget._auto.isChecked() is False
+
     def test_auto_approve_is_off_by_default(self, panel: tuple[ChatPanel, FakeHost]) -> None:
         # 既定で入っていると、知らずに使い始めた人の作品を AI が確かめ無しに書き換える
         widget, _ = panel
