@@ -9,6 +9,8 @@
 互換性の記録（AviUtl スクリプトの未対応 API や失敗）も同じで、子の ``global_report`` に
 溜まった物は子が終わると消える 失敗・取り消しのときも含めて写しを返し、親が自分の記録へ
 足し込む
+AviUtl の実行の設定（DLL を読むか・汎用プラグインを全部読んで探すか）はプロセスごとの値で、
+子は spawn で起こすので既定へ戻る 親の値を写して渡し、子で描き始める前に当てる
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from sashimono.compat.aviutl import native, plugin
+from sashimono.compat.aviutl.catalog import script_catalog
 from sashimono.compat.aviutl.report import NO_RECORDS, ReportRecords, global_report
 from sashimono.core.model import Project
 from sashimono.engine.encode.exporter import ExportError, ExportSettings, export_project
@@ -34,6 +38,7 @@ from sashimono.engine.worker import (
 __all__ = [
     "GL_UNAVAILABLE_MARK",
     "MEASURED_EXPORT_SPEED",
+    "AviUtlRuntime",
     "ExportOutcome",
     "export_anywhere",
     "export_job",
@@ -61,6 +66,39 @@ GL_UNAVAILABLE_MARK = "子のプロセスで GL を作れない"
 
 
 @dataclass(frozen=True, slots=True)
+class AviUtlRuntime:
+    """書き出しの絵を変える値のうち、プロセスごとに持つ物の写し（子へ渡す物の一覧はここだけ）
+
+    子は spawn で起こすので、親で設定画面から変えた値は子に届かない 届かないと、本人が
+    DLL を読むのを切っていても子では読んで走らせ（既定が入）、プレビューとも絵が変わる
+    書き出しの設定（:class:`ExportSettings`）に入る物と環境変数（子が起きたときに写る）は
+    ここに要らない 設定の項目とモジュールの大域の値は、どれを渡すかを試験が 1 つずつ確かめる
+    （``tests/engine/test_export_child_state.py``） 足したのに決めていないと落ちる
+    """
+
+    #: DLL を読むか（:func:`native.enabled`）
+    native_modules: bool
+    #: ``Plugin`` フォルダの汎用プラグインを全部読んで探すか（:func:`plugin.scan_all`）
+    all_plugins: bool
+
+    @classmethod
+    def capture(cls) -> AviUtlRuntime:
+        """このプロセスの今の値を写す"""
+        return cls(native_modules=native.enabled(), all_plugins=plugin.scan_all())
+
+    def apply(self) -> None:
+        """このプロセスへ当てる
+
+        スクリプトの一覧もここで読む 親は起動したときに読んでエフェクトの登録簿へ入れて
+        いるが、子では一覧を初めて引いたときに入る それより先に登録簿を引く所があると、
+        子だけスクリプトのエフェクトを知らないまま描く
+        """
+        native.set_enabled(self.native_modules)
+        plugin.set_scan_all(self.all_plugins)
+        script_catalog()
+
+
+@dataclass(frozen=True, slots=True)
 class ExportOutcome:
     """子の書き出しの結果"""
 
@@ -83,6 +121,7 @@ def export_job(
     should_cancel: Callable[[], bool],
     project: Project,
     settings: ExportSettings,
+    runtime: AviUtlRuntime,
 ) -> ExportOutcome | None:
     """子のプロセスで書き出す
 
@@ -91,7 +130,9 @@ def export_job(
     書き出しの失敗（:class:`ExportError`）は文のまま親へ渡り、親が同じ文で利用者に出す
     やめたときも書き出しは :class:`ExportError` を投げる（書きかけを消してから）ので、
     ここで取り消しへ直す 直さないと、取り消しが失敗として画面に出る
+    ``runtime`` は省けない 省けると、渡し忘れた呼び出しで本人が切った DLL を子が読む
     """
+    runtime.apply()
     # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
     # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
     from sashimono.engine.gpu import GLContextError, OffscreenGLContext
@@ -166,7 +207,11 @@ def export_anywhere(
         try:
             outcome = run_in_process(
                 export_job,
-                {"project": project, "settings": dataclasses.replace(settings, path=scratch)},
+                {
+                    "project": project,
+                    "settings": dataclasses.replace(settings, path=scratch),
+                    "runtime": AviUtlRuntime.capture(),
+                },
                 progress=progress,
                 should_cancel=should_cancel,
                 name="sashimono-export",

@@ -500,7 +500,7 @@ def _worker_export() -> str:
 
     from sashimono.core.model import Project
     from sashimono.engine.encode import ExportSettings
-    from sashimono.engine.encode.export_job import ExportOutcome, export_job
+    from sashimono.engine.encode.export_job import AviUtlRuntime, ExportOutcome, export_job
     from sashimono.engine.worker import run_in_process
 
     project = _sample_project()
@@ -510,10 +510,18 @@ def _worker_export() -> str:
         target.parent.mkdir()
         outcome = run_in_process(
             export_job,
-            {"project": project, "settings": ExportSettings(path=target, video_codec=CPU_CODEC)},
+            {
+                "project": project,
+                "settings": ExportSettings(path=target, video_codec=CPU_CODEC),
+                "runtime": AviUtlRuntime.capture(),
+            },
         )
         if not isinstance(outcome, ExportOutcome):
             raise RuntimeError(f"子から結果が返らなかった（{outcome!r}）")
+        # 子は書き出しの失敗を例外にせず結果で返す（互換性の記録を一緒に返すため）
+        # 見ないと、書けなかった子を通ったと数え、無いファイルを開いて訳の分からない文で落ちる
+        if outcome.error is not None:
+            raise RuntimeError(f"子が書き出せなかった: {outcome.error}")
         with av.open(outcome.path) as container:
             frames = sum(1 for _ in container.decode(video=0))
     if frames != project.duration:

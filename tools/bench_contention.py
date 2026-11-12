@@ -270,9 +270,16 @@ def _waveform_process(source: Path, _scratch: Path, stop: Callable[[], bool]) ->
 
 
 def _done(result: object) -> None:
-    """子が何も返さなかったら投げる（:func:`_made` と同じ理由）"""
+    """子が何も返さなかったら投げる（:func:`_made` と同じ理由）
+
+    書き出しの子は失敗を例外にせず結果の ``error`` で返すので、それも投げる 見ないと、
+    書けなかった書き出しの速さを測れたものとして表に載せる
+    """
     if result is None:
         raise RuntimeError("別のプロセスの処理が結果を返さなかった")
+    error = getattr(result, "error", None)
+    if error is not None:
+        raise RuntimeError(f"別のプロセスの書き出しが失敗した: {error}")
 
 
 def _export_project(source: Path) -> tuple[Project, float]:
@@ -290,7 +297,7 @@ def _export_project(source: Path) -> tuple[Project, float]:
 
 
 def _export_process(source: Path, scratch: Path, stop: Callable[[], bool]) -> float:
-    from sashimono.engine.encode.export_job import export_job
+    from sashimono.engine.encode.export_job import AviUtlRuntime, export_job
     from sashimono.engine.encode.exporter import ExportSettings
 
     project, seconds = _export_project(source)
@@ -300,6 +307,7 @@ def _export_process(source: Path, scratch: Path, stop: Callable[[], bool]) -> fl
             {
                 "project": project,
                 "settings": ExportSettings(path=scratch / f"export-{time.perf_counter_ns()}.mp4"),
+                "runtime": AviUtlRuntime.capture(),
             },
             should_cancel=stop,
         )

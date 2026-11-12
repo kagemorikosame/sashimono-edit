@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.core.commands import Document, insert_media
 from sashimono.core.model import Project, ProjectSettings
@@ -20,6 +21,7 @@ from sashimono.engine.encode import ExportError, ExportSettings
 from sashimono.engine.encode import export_job as job_module
 from sashimono.engine.encode.export_job import (
     GL_UNAVAILABLE_MARK,
+    AviUtlRuntime,
     ExportOutcome,
     export_anywhere,
 )
@@ -242,6 +244,7 @@ def test_the_child_returns_a_failure_with_its_records(
         should_cancel=lambda: False,
         project=project,
         settings=ExportSettings(path=tmp_path / "x.mp4"),
+        runtime=AviUtlRuntime.capture(),
     )
     assert outcome is not None
     assert outcome.error == reason and not outcome.cancelled
@@ -264,7 +267,67 @@ def test_the_child_returns_a_cancel_with_its_records(
         should_cancel=lambda: True,
         project=project,
         settings=ExportSettings(path=tmp_path / "x.mp4"),
+        runtime=AviUtlRuntime.capture(),
     )
     assert outcome is not None
     assert outcome.cancelled and outcome.error is None
     assert outcome.records == child.records()
+
+
+@pytest.fixture
+def runtime_restored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """プロセスごとの設定を試験の後で戻す（ほかの試験へ持ち越さない）"""
+    monkeypatch.setattr(native, "_enabled", native.enabled())
+    monkeypatch.setattr(plugin, "_scan_all", plugin.scan_all())
+
+
+@pytest.mark.usefixtures("runtime_restored")
+@pytest.mark.parametrize(
+    "runtime",
+    [AviUtlRuntime(native_modules=False, all_plugins=True), AviUtlRuntime(True, False)],
+    ids=["DLL を切り全部探す", "既定"],
+)
+def test_the_child_gets_the_aviutl_settings_of_this_process(
+    project: Project,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: AviUtlRuntime,
+) -> None:
+    """壊れると、本人が DLL を読むのを切っていても、別のプロセスの書き出しでは読んで走らせる
+    子は spawn で起こすので、渡さないとプロセスごとの値が既定へ戻る"""
+    native.set_enabled(runtime.native_modules)
+    plugin.set_scan_all(runtime.all_plugins)
+    sent: list[object] = []
+
+    def run(_job: object, options: dict[str, Any], **_kwargs: object) -> object:
+        sent.append(options["runtime"])
+        Path(options["settings"].path).write_bytes(b"done")
+        return ExportOutcome(path="", notes=())
+
+    monkeypatch.setattr(job_module, "run_in_process", run)
+    export_anywhere(project, ExportSettings(path=tmp_path / "x.mp4"), separate_process=True)
+    assert sent == [runtime]
+
+
+@pytest.mark.usefixtures("runtime_restored")
+def test_the_child_applies_the_settings_before_drawing(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、子が親の設定を受け取っても既定のまま描き、切った DLL を読む"""
+    native.set_enabled(True)
+    plugin.set_scan_all(False)
+    seen: list[tuple[bool, bool]] = []
+
+    def draw(*_args: object, **_kwargs: object) -> Path:
+        seen.append((native.enabled(), plugin.scan_all()))
+        return tmp_path / "x.mp4"
+
+    monkeypatch.setattr(job_module, "export_project", draw)
+    job_module.export_job(
+        progress=lambda _value: None,
+        should_cancel=lambda: False,
+        project=project,
+        settings=ExportSettings(path=tmp_path / "x.mp4"),
+        runtime=AviUtlRuntime(native_modules=False, all_plugins=True),
+    )
+    assert seen == [(False, True)]
