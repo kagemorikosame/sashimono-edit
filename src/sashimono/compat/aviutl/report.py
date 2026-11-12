@@ -17,11 +17,23 @@ from dataclasses import dataclass, field
 __all__ = [
     "AVIUTL_OBJ_NAMES",
     "KNOWN_RECORDS",
+    "NO_RECORDS",
     "CompatibilityReport",
+    "ReportRecords",
     "ScriptFailure",
     "global_report",
     "is_known_record",
 ]
+
+
+#: :meth:`CompatibilityReport.records` の写し（未実装の API・制御文字・失敗）
+#: 管を越えて渡せる形（文字と数だけ）にしてある
+ReportRecords = tuple[
+    tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], tuple[tuple[str, str], ...]
+]
+
+#: 記録が無いときの写し
+NO_RECORDS: ReportRecords = ((), (), ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +98,23 @@ class CompatibilityReport:
             parts.append(f"失敗 {len(self.failures)} 件")
         return "、".join(parts)
 
-    def records(
-        self,
-    ) -> tuple[
-        tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], tuple[tuple[str, str], ...]
-    ]:
+    def merge(self, records: ReportRecords) -> None:
+        """:meth:`records` の写しを足し込む
+
+        別のプロセスで書き出した子の記録を親へ戻すのに使う（#453） 子の記録は子が終わると
+        消えるので、足し込まないと書き出しで素通しになった効果の原因が親の一覧に残らない
+        上限（:data:`MAX_KINDS`）はここでも守る 子と親の種類を合わせると上限を超えうる
+        """
+        missing, controls, failures = records
+        with self._lock:
+            for name, count in missing:
+                self.missing[_bounded(self.missing, name)] += count
+            for line, count in controls:
+                self.controls[_bounded(self.controls, line)] += count
+            for script, message in failures:
+                self.failures.setdefault(script, ScriptFailure(script, message))
+
+    def records(self) -> ReportRecords:
         """記録の写し（未実装の API・制御文字は多い順、失敗はスクリプトと文）
 
         AI が読む口（#352）が使う 3 つを同じ錠の中で写す 錠の外で辞書を辿ると、描く裏の

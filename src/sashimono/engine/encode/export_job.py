@@ -6,6 +6,9 @@
 
 書き出し側からの知らせ（次の候補のエンコーダで書き直した #365）は、知らせの関数を管で
 渡せないので、終わったときに結果と一緒に返す
+互換性の記録（AviUtl スクリプトの未対応 API や失敗）も同じで、子の ``global_report`` に
+溜まった物は子が終わると消える 失敗・取り消しのときも含めて写しを返し、親が自分の記録へ
+足し込む
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from sashimono.compat.aviutl.report import NO_RECORDS, ReportRecords, global_report
 from sashimono.core.model import Project
 from sashimono.engine.encode.exporter import ExportError, ExportSettings, export_project
 from sashimono.engine.worker import (
@@ -64,6 +68,13 @@ class ExportOutcome:
     path: str
     #: 書き出しの間に出た知らせ 親で画面へ出す
     notes: tuple[str, ...]
+    #: 子で溜まった互換性の記録の写し 親の ``global_report`` へ足し込む
+    records: ReportRecords = NO_RECORDS
+    #: 書き出しの失敗の文 失敗を例外で投げると管の向こうで記録の写しを返せないので、
+    #: 結果として返す（例外のときの ``型: 文`` と同じ形 :class:`ExportError` だけは文のまま）
+    error: str | None = None
+    #: 取り消した
+    cancelled: bool = False
 
 
 def export_job(
@@ -73,11 +84,13 @@ def export_job(
     project: Project,
     settings: ExportSettings,
 ) -> ExportOutcome | None:
-    """子のプロセスで書き出す やめたときは ``None``
+    """子のプロセスで書き出す
 
+    失敗と取り消しも例外にせず結果で返す（:attr:`ExportOutcome.error` と
+    :attr:`ExportOutcome.cancelled`） 例外で返すと互換性の記録の写しを一緒に渡せない
     書き出しの失敗（:class:`ExportError`）は文のまま親へ渡り、親が同じ文で利用者に出す
     やめたときも書き出しは :class:`ExportError` を投げる（書きかけを消してから）ので、
-    ここで ``None`` へ直す 直さないと、取り消しが失敗として画面に出る
+    ここで取り消しへ直す 直さないと、取り消しが失敗として画面に出る
     """
     # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
     # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
@@ -96,11 +109,16 @@ def export_job(
             should_cancel=should_cancel,
             notice=notes.append,
         )
-    except ExportError:
-        if should_cancel():
-            return None
-        raise
-    return ExportOutcome(path=str(path), notes=tuple(notes))
+    except Exception as exc:
+        records = global_report.records()
+        if isinstance(exc, ExportError):
+            if should_cancel():
+                return ExportOutcome(path="", notes=tuple(notes), records=records, cancelled=True)
+            reason = str(exc)
+        else:
+            reason = f"{type(exc).__name__}: {exc}"
+        return ExportOutcome(path="", notes=tuple(notes), records=records, error=reason)
+    return ExportOutcome(path=str(path), notes=tuple(notes), records=global_report.records())
 
 
 def is_gl_unavailable(reason: str) -> bool:
@@ -169,10 +187,17 @@ def export_anywhere(
             _discard(scratch)
             raise
         else:
-            if outcome is None:
+            if outcome is not None:
+                # 成否より先に足し込む 失敗した書き出しこそ、どの効果で躓いたかを見たい
+                global_report.merge(outcome.records)
+            if outcome is None or outcome.cancelled:
                 _discard(scratch)
                 # 取り消した 同じプロセスで書いたときと同じ文で返す（呼ぶ側は中止の印で見分ける）
+                # None は猶予を過ぎて子を止めたとき（記録の写しは返ってこない）
                 raise ExportError("書き出しを中止した")
+            if outcome.error is not None:
+                _discard(scratch)
+                raise ExportError(outcome.error)
             try:
                 # run_in_process は子が終わるまで待ってから戻るので、子はもうファイルを掴んでいない
                 scratch.replace(target)

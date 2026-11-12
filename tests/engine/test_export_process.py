@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.core.commands import Document, insert_media
 from sashimono.core.model import Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
@@ -165,3 +166,105 @@ def test_a_finished_child_replaces_the_target(
     assert export_anywhere(project, ExportSettings(path=target), separate_process=True) == target
     assert target.read_bytes() == b"new"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["x.mp4"]
+
+
+def _child_records() -> CompatibilityReport:
+    """子の中で溜まった記録の代わり"""
+    child = CompatibilityReport()
+    child.note_missing("obj.getpixeldata")
+    child.note_control("<#zz>")
+    child.note_failure("ぼかし.anm", "壊れた")
+    return child
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ExportOutcome(path="", notes=()),
+        ExportOutcome(path="", notes=(), error="書けない"),
+        ExportOutcome(path="", notes=(), cancelled=True),
+    ],
+    ids=["書けた", "失敗した", "取り消した"],
+)
+def test_compat_records_from_the_child_reach_this_process(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: ExportOutcome
+) -> None:
+    """壊れると、別のプロセスで書き出したときに AviUtl スクリプトの未対応 API や失敗が子と一緒に
+    消え、書き出しで効果が素通しになった訳を互換性の一覧から辿れない"""
+    parent = CompatibilityReport()
+    parent.note_missing("obj.getpixeldata")
+    monkeypatch.setattr(job_module, "global_report", parent)
+    sent = ExportOutcome(
+        path=outcome.path,
+        notes=outcome.notes,
+        records=_child_records().records(),
+        error=outcome.error,
+        cancelled=outcome.cancelled,
+    )
+    monkeypatch.setattr(job_module, "run_in_process", _fake_run(sent, write=b"done"))
+    settings = ExportSettings(path=tmp_path / "x.mp4")
+    if outcome.error is None and not outcome.cancelled:
+        export_anywhere(project, settings, separate_process=True)
+    else:
+        with pytest.raises(ExportError, match="書けない" if outcome.error else "中止"):
+            export_anywhere(project, settings, separate_process=True)
+    missing, controls, failures = parent.records()
+    assert missing == (("obj.getpixeldata", 2),)
+    assert controls == (("<#zz>", 1),)
+    assert failures == (("ぼかし.anm", "壊れた"),)
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        (ExportError("書けない"), "書けない"),
+        (ValueError("妙な値"), "ValueError: 妙な値"),
+    ],
+)
+def test_the_child_returns_a_failure_with_its_records(
+    project: Project,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+    reason: str,
+) -> None:
+    """壊れると、子で書き出しが失敗したときに例外だけが管を渡り、互換性の記録が子と一緒に消える
+    失敗の文の形（書き出しの失敗はそのまま・ほかは ``型: 文``）が変わると、利用者に出る文が変わる"""
+    child = _child_records()
+    monkeypatch.setattr(job_module, "global_report", child)
+
+    def fail(*_args: object, **_kwargs: object) -> Path:
+        raise raised
+
+    monkeypatch.setattr(job_module, "export_project", fail)
+    outcome = job_module.export_job(
+        progress=lambda _value: None,
+        should_cancel=lambda: False,
+        project=project,
+        settings=ExportSettings(path=tmp_path / "x.mp4"),
+    )
+    assert outcome is not None
+    assert outcome.error == reason and not outcome.cancelled
+    assert outcome.records == child.records()
+
+
+def test_the_child_returns_a_cancel_with_its_records(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、取り消した書き出しが失敗として画面に出るか、取り消すまでの記録が消える"""
+    child = _child_records()
+    monkeypatch.setattr(job_module, "global_report", child)
+
+    def cancelled(*_args: object, **_kwargs: object) -> Path:
+        raise ExportError("書き出しを中止した")
+
+    monkeypatch.setattr(job_module, "export_project", cancelled)
+    outcome = job_module.export_job(
+        progress=lambda _value: None,
+        should_cancel=lambda: True,
+        project=project,
+        settings=ExportSettings(path=tmp_path / "x.mp4"),
+    )
+    assert outcome is not None
+    assert outcome.cancelled and outcome.error is None
+    assert outcome.records == child.records()
